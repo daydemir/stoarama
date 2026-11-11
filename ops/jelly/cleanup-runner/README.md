@@ -12,13 +12,26 @@ Owner approval (Deniz, 2026-11-11), verbatim conditions:
 
 The runner:
 
-- Takes an exclusive local lock. Refuses enabled foreign plans or batches.
-  Persists its current plan before enable, so restart monitors/reconciles that
-  plan before doing more work. Never calls the pause control.
-- Forces the master OFF through a single-key Render env edit and an explicit
-  redeploy of the **current live SHA**, never HEAD. Rejects concurrent deploys,
-  waits for live, and checks the API master when a plan is selected. Repeats
-  this OFF transition after completion or pause.
+- Takes an exclusive local lock. On startup, first reads active execution.
+  With **no enabled plan**, forces master OFF as a barrier before policy loading,
+  email checks, progress, or other work (including a latched failure). With an
+  enabled plan matching the persisted `current_plan`, resumes monitoring **without
+  toggling master** only if approval is still in the future, the plan is enabled,
+  master is ON, no anomalous item states exist, and no failure is latched.
+  An unknown/unhealthy enabled plan, enabled batch, or dry-run takeover forces
+  OFF, alerts the owner, and stops. Never pauses a healthy plan on restart:
+  toggling OFF would expire its leases and force replanning.
+- Forces master OFF through a single-key Render env edit, cancels any in-progress
+  deploys, then explicitly redeploys the **current live SHA**, never HEAD. OFF
+  bypasses the normal concurrent-deploy rejection and needs no successful disk
+  write. Confirms its newly created deploy (after the OFF env edit) is live,
+  configured env is false, and the live API reports master false; rechecks live
+  deploy identity after that report. With no saved plan, reads the latest existing
+  account-47/connection-13 plan report for this runtime check. Missing reports
+  cannot confirm OFF. Failed/canceled/timed-out deploys, concurrent deploys, API
+  failures, or a runtime master mismatch trigger loud stderr + owner email alerts
+  and retries forever with 15-second exponential backoff capped at five minutes.
+  ON still rejects concurrent deploys. Repeats OFF after completion or pause.
 - Uses a complete fresh dry run or invokes `prepare_keep28_plans.py --submit`
   for one stream, at most one <=100 GB plan. Unique `k28auto-YYYYMMDD-HHMMSS`
   prefixes avoid immutable-label reuse. Admission rejection is a stop.
@@ -34,8 +47,10 @@ The runner:
 - Enables only the exact plan SHA with the dated standing approval and a 24h
   approval. Monitors for completion, expiry, anomalies and live-commit changes.
   OFF, drain outstanding receipts/leases, then recovery verification precede
-  close. Only exact backend lease/approval expiry reasons may close never-issued
-  remainder. Anomalies and uncertain issued receipts stop for the owner.
+  close. Reclassifies the final report after drain/re-read: only exact backend
+  lease/approval expiry reasons may close never-issued remainder. A concurrent
+  manual/non-expiry pause, anomalies, and uncertain issued receipts stop for the
+  owner without closing or replanning.
 - Invokes the existing `verify-recovery` CLI because this API revision has no
   recovery route; checks plan identity, issued/verified counts and zero problems.
   This CLI GETs the report and HEAD-verifies every ever-issued R2 copy. It uses
@@ -50,17 +65,22 @@ The runner:
 append-only. Totals and per-stream confirmed deletion progress come from the DB,
 so restart does not double-count. A short daily UTC progress email goes to
 `CLEANUP_OWNER_EMAIL` via the existing Resend credentials; an initial accepted
-email is required before enabling deletion. Errors email immediately, latch
-`last_error`, create STOP, and attempt OFF + recovery independently. HTTP response
-bodies, subprocess output and credential values never enter logs or emails.
-If email/OFF/recovery fails, its failure flag remains in status for supervision.
+email is required before enabling deletion. Failure handling first confirms OFF,
+then alerts the owner, attempts recovery, and independently attempts state and
+STOP writes. Disk-full or other write errors cannot skip shutdown or notification;
+write failures also emit loud stderr messages. While OFF is unconfirmed, shutdown
+keeps retrying and alerting rather than exiting. Email/recovery failure flags stay
+in memory and are persisted if storage works; no disk write is required to alert.
+HTTP response bodies, subprocess output and credential values never enter logs or
+emails.
 A delivery acknowledgment means Resend accepted the email, not that it was read.
 
 `STOP` or SIGTERM prevents new enables and naturally drains a currently enabled
 plan to completion/expiry before OFF/recovery. It never pauses a plan to deploy.
 The plist has no automatic restart after failure and no forced exit timeout.
 Do not force-kill a draining runner. A process crash can leave the master ON until
-restart; its persisted current plan and backend approval expiry bound recovery.
+restart; restart applies the active-plan policy above, and backend approval expiry
+bounds deletion. Do not force-kill an OFF retry loop.
 
 ## Later installation on Jelly (not performed by this PR)
 

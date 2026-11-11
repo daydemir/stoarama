@@ -24,6 +24,7 @@ POLICY_SHA = '060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811'
 DAY_CAP = 5_000_000_000_000
 PLAN_CAP = 100_000_000_000
 RECOVERY = {'r2_sha_verified', 'r2_md5_etag_matched'}
+DEPLOY_TERMINAL = {'live', 'deactivated', 'canceled', 'build_failed', 'update_failed', 'pre_deploy_failed'}
 REASON = ('Deniz standing approval 2026-11-11: NAS files outside pinned keep28 only; '
           'server dry run + independent verification PASS; verified R2 copies retained; '
           '5 TB/24h; one plan; master OFF between batches.')
@@ -36,6 +37,13 @@ class Halt(Exception):
 def require(ok, message):
     if not ok:
         raise Halt(message)
+
+
+def critical(message):
+    try:
+        print('CRITICAL: ' + message, file=sys.stderr, flush=True)
+    except OSError:
+        pass  # A broken log sink must not prevent shutdown or email.
 
 
 def utcnow():
@@ -103,8 +111,11 @@ def verify(plan, catalog, windows, now):
         streams.add(sid)
         require(outside(sid, current['start_at'], current['end_at'], windows), 'file intersects keep28')
         sources = current['sources']
-        require(sources and sorted(c['source_id'] for c in sources) == sorted(item['source_ids']),
-                'source catalog incomplete')
+        expected = set(item['source_ids']) | set(current['source_ids'])
+        resolved = [c['source_id'] for c in sources or []]
+        require(expected and sorted(resolved) == sorted(expected)
+                and sorted(item['source_ids']) == sorted(current['source_ids']),
+                'source catalog incomplete or duplicated')
         for clip in sources:
             require(clip['stream_id'] == sid and clip['bucket'] == item['bucket']
                     and outside(sid, clip['start_at'], clip['end_at'], windows), 'source intersects keep28 or is uncertain')
@@ -187,9 +198,6 @@ class Runner:
 
     def load_policy(self):
         repo = self.repo
-        spec = importlib.util.spec_from_file_location('prepare_keep28', repo / 'backend/scripts/nas-cleanup/prepare_keep28_plans.py')
-        self.prepare = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(self.prepare)
         raw = command(['git', '-C', str(repo), 'show', 'origin/main:' + POLICY])
         require(hashlib.sha256(raw).hexdigest() == POLICY_SHA, 'origin/main keep28 policy differs')
         self.windows = {r['stream_id']: (timestamp(r['keep_start_utc']), timestamp(r['keep_end_utc'])) for r in json.loads(raw)}
@@ -216,6 +224,10 @@ class Runner:
 
     def query(self, sql):
         try:
+            if not hasattr(self, 'prepare'):
+                spec = importlib.util.spec_from_file_location('prepare_keep28', self.repo / 'backend/scripts/nas-cleanup/prepare_keep28_plans.py')
+                self.prepare = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(self.prepare)
             return self.prepare.query(sql, 'psql')
         except Exception:
             raise Halt('read-only catalog query failed') from None
@@ -242,19 +254,72 @@ class Runner:
     def live(self):
         rows = self.render('GET', '/deploys?limit=100')
         deploys = [r['deploy'] for r in rows]
-        require(all(d['status'] in {'live', 'deactivated', 'canceled', 'build_failed', 'update_failed', 'pre_deploy_failed'} for d in deploys),
+        require(all(d['status'] in DEPLOY_TERMINAL for d in deploys),
                 'another Render deployment is in progress')
         live = [d for d in deploys if d['status'] == 'live']
         require(len(live) == 1 and re.fullmatch('[a-f0-9]{40}', live[0]['commit']['id']), 'current live commit unavailable')
         return live[0]
 
+    def alert(self, subject):
+        # Must work even when state storage or email delivery is broken.
+        critical(subject)
+        try:
+            self.notify(subject)
+        except Exception:
+            self.status['owner_notification_failed'] = True
+            critical('owner email failed; operator intervention required')
+
+    def off(self):
+        delay = 15
+        while True:
+            try:
+                # This PUT must precede every other dependency, including state writes.
+                self.render('PUT', '/env-vars/NAS_CLEANUP_DELETION_ENABLED', {'value': 'false'})
+                deploys = [r['deploy'] for r in self.render('GET', '/deploys?limit=100')]
+                live = [d for d in deploys if d['status'] == 'live']
+                require(len(live) == 1 and re.fullmatch('[a-f0-9]{40}', live[0]['commit']['id']),
+                        'current live commit unavailable')
+                commit = live[0]['commit']['id']
+                for d in deploys:
+                    if d['status'] not in DEPLOY_TERMINAL:
+                        self.render('POST', '/deploys/' + d['id'] + '/cancel')
+                dep = self.render('POST', '/deploys', {'commitId': commit, 'clearCache': 'do_not_clear'})
+                # Only our new deploy, created AFTER the successful env PUT, can confirm OFF.
+                require(dep['id'] not in {d['id'] for d in deploys}, 'OFF deploy was not newly created')
+                deadline = time.monotonic() + 1800
+                while True:
+                    d = self.render('GET', '/deploys/' + dep['id'])
+                    if d['status'] == 'live':
+                        require(d['commit']['id'] == commit, 'Render deployed a different commit')
+                        break
+                    require(d['status'] not in DEPLOY_TERMINAL, 'OFF redeploy failed')
+                    require(time.monotonic() < deadline, 'OFF redeploy timed out')
+                    time.sleep(15)
+                require(self.live()['id'] == dep['id'], 'live deployment changed concurrently')
+                env = self.render('GET', '/env-vars/NAS_CLEANUP_DELETION_ENABLED')
+                require(env['value'] == 'false', 'Render master env differs')
+                pid = self.status['current_plan'] or self.query(
+                    'SELECT id FROM nas_cleanup_plans WHERE account_id=47 AND connection_id=13 ORDER BY id DESC LIMIT 1')
+                require(pid and self.plan(pid)['master_deletion_enabled'] is False, 'live API master OFF not confirmed')
+                require(self.live()['id'] == dep['id'], 'live deployment changed during OFF verification')
+                break
+            except Exception:
+                self.status['shutdown_or_recovery_failed'] = True
+                self.alert('MASTER OFF NOT CONFIRMED; retrying shutdown')
+                time.sleep(delay)
+                delay = min(delay * 2, 300)
+        # A disk error must not invalidate a confirmed OFF or block failure notification.
+        self.status.update(phase='master_false', live_commit=commit)
+
     def master(self, enabled, emergency=False):
-        if not emergency:
-            self.idle()
+        if not enabled:
+            self.off()
+            return
+        require(not emergency, 'emergency enable forbidden')
+        self.idle()
         live = self.live()
-        value = 'true' if enabled else 'false'
-        self.save('master_' + value + '_requested', live_commit=live['commit']['id'])
-        self.render('PUT', '/env-vars/NAS_CLEANUP_DELETION_ENABLED', {'value': value})
+        self.save('master_true_requested', live_commit=live['commit']['id'])
+        self.render('PUT', '/env-vars/NAS_CLEANUP_DELETION_ENABLED', {'value': 'true'})
         # Never deploy HEAD, origin/main, or a fix: redeploy exactly the live SHA.
         dep = self.render('POST', '/deploys', {'commitId': live['commit']['id'], 'clearCache': 'do_not_clear'})
         deadline = time.monotonic() + 1800
@@ -268,11 +333,11 @@ class Runner:
             time.sleep(15)
         require(self.live()['id'] == dep['id'], 'live deployment changed concurrently')
         env = self.render('GET', '/env-vars/NAS_CLEANUP_DELETION_ENABLED')
-        require(env['value'] == value, 'Render master env differs')
+        require(env['value'] == 'true', 'Render master env differs')
         pid = self.status['current_plan']
         if pid:
-            require(self.plan(pid)['master_deletion_enabled'] is enabled, 'live API master differs')
-        self.save('master_' + value)
+            require(self.plan(pid)['master_deletion_enabled'] is True, 'live API master differs')
+        self.save('master_true')
 
     def stopped(self):
         return self.stopping or (self.root / 'STOP').exists()
@@ -427,13 +492,14 @@ class Runner:
             self.progress()
             time.sleep(30)
 
-    def finish(self, plan, state):
+    def finish(self, plan):
         self.master(False, emergency=True)
         self.drain(plan['id'])
         plan = self.plan(plan['id'])
         self.recovery(plan)
-        # An anomaly is never made schedulable by close/replan.
-        require(state != 'anomaly', 'plan paused for a non-expiry reason')
+        # OFF/drain can race a manual pause: classify the final report, never the input.
+        state = execution_state(plan)
+        require(state in {'done', 'expired'}, 'plan paused for a non-expiry reason')
         require(not any(r['state'] in {'delete_issued', 'unverified', 'media_deleted_sidecar_failed', 'conflict', 'missing', 'keep'}
                         for r in results(plan)), 'uncertain execution receipt requires owner')
         if state == 'expired' and any(not r['delete_ever_issued'] for r in results(plan)):
@@ -448,7 +514,7 @@ class Runner:
             p = self.plan(pid)
             state = execution_state(p)
             if state != 'running':
-                self.finish(p, state)
+                self.finish(p)
                 return
             active = self.active()
             require(active['plans'] == [pid] and active['batches'] == 0, 'concurrent cleanup execution')
@@ -458,20 +524,34 @@ class Runner:
             time.sleep(60)
 
     def run(self):
+        # Owner policy: OFF is the first barrier unless resuming our healthy execution.
+        active = self.active()
+        pid = self.status['current_plan']
+        if not active['plans']:
+            self.master(False, emergency=True)
+            require(active['batches'] == 0, 'another batch is enabled')
+        else:
+            require(active['plans'] == [pid] and active['batches'] == 0,
+                    'unknown enabled plan or batch; owner review required')
+            require(not self.dry_run and not self.status.get('last_error'),
+                    'enabled plan cannot be resumed by this runner')
+            p = self.plan(pid)
+            require(p['mode'] == 'enabled' and execution_state(p) == 'running'
+                    and timestamp(p['approved_until']) > utcnow()
+                    and p['master_deletion_enabled'] is True,
+                    'saved enabled plan is unhealthy; owner review required')
         require(not self.status.get('last_error'), 'failure is latched; owner must review before restart')
         self.load_policy()
         self.check_delivery()
-        pid = self.status['current_plan']
-        if pid:
+        if active['plans']:
+            self.monitor(pid)
+        elif pid:
             p = self.plan(pid)
-            if p['mode'] == 'enabled':
-                require(not self.dry_run, 'dry-run cannot take over an enabled plan')
-                self.monitor(pid)
-            elif p['mode'] == 'paused':
+            require(p['mode'] != 'enabled', 'plan became enabled during startup')
+            if p['mode'] == 'paused':
                 require(not self.dry_run, 'dry-run cannot reconcile an interrupted execution')
-                self.finish(p, execution_state(p))
+                self.finish(p)
         self.idle()
-        self.master(False)
         self.progress()  # Accepted owner delivery before any deletion is enabled.
         while not self.stopped():
             pid = self.status['current_plan'] or self.pick()
@@ -514,20 +594,24 @@ class Runner:
         self.save('stopped')
 
     def fail(self, error):
-        self.save('failed', last_error=error)
-        (self.root / 'STOP').touch(mode=0o600)
+        self.status.update(phase='failed', last_error=error)
+        self.master(False, emergency=True)  # Retries with alerts until OFF is confirmed.
+        self.alert('STOPPED: owner review required')
         try:
-            self.notify('STOPPED: owner review required')
+            if self.status['current_plan']:
+                self.recovery(self.plan(self.status['current_plan']))
         except Exception:
-            self.save('failed', owner_notification_failed=True)
-        # Best effort independent shutdown and recovery; keep the failure latched.
-        for action in (lambda: self.master(False, emergency=True),
-                       lambda: self.recovery(self.plan(self.status['current_plan'])) if self.status['current_plan'] else None):
-            try:
-                action()
-            except Exception:
-                self.save('failed', shutdown_or_recovery_failed=True)
-        self.save('failed')
+            self.status['shutdown_or_recovery_failed'] = True
+            self.alert('Recovery verification failed; owner review required')
+        # Independent best-effort writes: neither can prevent OFF or owner notification.
+        try:
+            self.save('failed')
+        except Exception:
+            critical('failure state write failed')
+        try:
+            (self.root / 'STOP').touch(mode=0o600)
+        except Exception:
+            critical('STOP write failed')
 
 
 def main():
