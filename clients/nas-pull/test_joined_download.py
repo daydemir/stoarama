@@ -1747,6 +1747,117 @@ class JoinedDownloadTests(unittest.TestCase):
     def quarantine_records(self, cfg):
         return [json.loads(line) for line in (cfg.state_dir / "joined-alias-quarantine.jsonl").read_text().splitlines()]
 
+    def test_torn_ledger_restart_then_alias_rename_crash_retains_mapping(self):
+        class Crash(BaseException): pass
+        item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
+            directory_fd, _, part, marker = self.names(cfg, item)
+            parent = pull.joined_output_path(cfg, item).parent
+            ledger = cfg.state_dir / "joined-alias-quarantine.jsonl"
+            torn = b'{"operation": "alias_move", "old_path": "torn'
+            ledger.write_bytes(torn)
+            try:
+                _, stage = self.crash_marker_publication(cfg, runtime, directory_fd, marker, expected)
+                self.write_entry(directory_fd, part, b"preserved partial")
+                with mock.patch.object(pull, "log") as warnings:
+                    restarted = self.runtime(cfg)
+                self.assertIn("malformed line 1", str(warnings.call_args_list))
+                real_rename = os.rename
+                def crash_after_rename(*args, **kwargs):
+                    real_rename(*args, **kwargs)
+                    raise Crash()
+                with mock.patch.object(pull.os, "rename", side_effect=crash_after_rename), self.assertRaises(Crash):
+                    pull.ensure_owned_joined_partial(cfg, restarted, directory_fd, part, marker, expected, threading.Event())
+                lines = ledger.read_bytes().splitlines()
+                self.assertEqual(lines[0], torn)
+                records = [json.loads(line) for line in lines[1:]]
+                self.assertEqual([r["operation"] for r in records], ["torn_tail_recovered", "alias_move"])
+                move = records[-1]
+                self.assertEqual(move["state"], "intent")
+                self.assertEqual(move["old_path"], str(parent / stage))
+                quarantined = Path(move["new_path"])
+                self.assertEqual(quarantined.read_bytes(), expected)
+                self.assertFalse((parent / stage).exists())
+                with mock.patch.object(pull, "log") as warnings:
+                    restarted = self.runtime(cfg)
+                messages = str(warnings.call_args_list)
+                self.assertIn(move["old_path"], messages)
+                self.assertIn(move["new_path"], messages)
+                self.assertIn("ledger replay", restarted.heartbeat_payload(None)["client_last_error"])
+                self.assertNotIn("unrecorded", messages)
+                self.assertEqual((parent / part).read_bytes(), b"preserved partial")
+                self.assertEqual(quarantined.read_bytes(), expected)
+            finally:
+                os.close(directory_fd)
+
+    def test_quarantine_ledger_partial_write_and_enospc_are_framed_on_retry(self):
+        for failure in ("short", "zero", "enospc"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as raw:
+                cfg = self.config(Path(raw))
+                record = {"operation": "alias_move", "old_path": "/old", "new_path": "/new", "state": "intent"}
+                real_write = os.write
+                attempts = []
+                def partial_write(descriptor, data):
+                    attempts.append(data)
+                    self.assertEqual(len(attempts), 1, "a short ledger write must never be resumed")
+                    self.assertTrue(data.endswith(b"\n"))
+                    written = real_write(descriptor, data[:17]) if failure != "zero" else 0
+                    if failure == "enospc":
+                        raise OSError(errno.ENOSPC, "no space left")
+                    return written
+                with mock.patch.object(pull.os, "write", side_effect=partial_write) as writes, self.assertRaises(OSError) as error:
+                    pull.append_joined_quarantine_ledger(cfg, record)
+                self.assertEqual(writes.call_count, 1)
+                self.assertEqual(error.exception.errno, errno.ENOSPC if failure == "enospc" else errno.EIO)
+                ledger = cfg.state_dir / "joined-alias-quarantine.jsonl"
+                torn = ledger.read_bytes()
+                with mock.patch.object(pull, "log") as warnings:
+                    self.runtime(cfg)
+                self.assertEqual("malformed line 1" in str(warnings.call_args_list), failure != "zero")
+                with mock.patch.object(pull.os, "write", wraps=real_write) as writes, mock.patch.object(pull.os, "fsync", wraps=os.fsync) as syncs:
+                    pull.append_joined_quarantine_ledger(cfg, record)
+                self.assertEqual(writes.call_count, 1 if failure == "zero" else 3)
+                self.assertEqual(syncs.call_count, writes.call_count + 1)  # Every write plus state directory.
+                if failure != "zero":
+                    self.assertTrue(ledger.read_bytes().startswith(torn + b"\n"))
+                    self.assertEqual(writes.call_args_list[0].args[1], b"\n")
+                    self.assertEqual(json.loads(writes.call_args_list[1].args[1])["operation"], "torn_tail_recovered")
+                complete = json.loads(ledger.read_bytes().splitlines()[-1])
+                self.assertEqual({key: complete[key] for key in record}, record)
+
+    def test_quarantine_scan_reports_unrecorded_aliases_without_mutation(self):
+        for ledger_kind in ("missing", "malformed", "old_record"):
+            with self.subTest(ledger_kind=ledger_kind), tempfile.TemporaryDirectory() as raw:
+                cfg = self.config(Path(raw))
+                qroot = cfg.output_dir / ".stoarama-quarantine" / "aliases"
+                qroot.mkdir(parents=True)
+                known, first, second = [qroot / name for name in ("known", "unrecorded-1", "unrecorded-2")]
+                for alias in (known, first, second):
+                    alias.write_bytes(b"preserve " + alias.name.encode())
+                before = {p.name: self.entry_snapshot(p) for p in qroot.iterdir()}
+                ledger = cfg.state_dir / "joined-alias-quarantine.jsonl"
+                if ledger_kind == "malformed":
+                    ledger.write_bytes(b'bad json\n[]\n{"operation": "alias_move"}\xff\n{"operation": "torn')
+                elif ledger_kind == "old_record":
+                    pull.append_joined_quarantine_ledger(cfg, {"operation": "alias_move", "new_path": str(known), "state": "intent"})
+                    with ledger.open("ab") as output:
+                        output.write((b'{"operation": "torn_tail_recovered"}\n' * 3000) + b'bad json\n')
+                    self.assertGreater(ledger.stat().st_size, 65536)
+                ledger_before = ledger.read_bytes() if ledger.exists() else None
+                with mock.patch.object(pull, "log") as warnings:
+                    runtime = self.runtime(cfg)
+                messages = "\n".join(call.args[1] for call in warnings.call_args_list)
+                self.assertIn("unrecorded alias: " + str(first), messages)
+                self.assertIn("unrecorded alias: " + str(second), messages)
+                self.assertEqual("unrecorded alias: " + str(known) in messages, ledger_kind != "old_record")
+                if ledger_kind != "missing":
+                    self.assertIn("malformed line", messages)
+                self.assertIn("unrecorded aliases=", runtime.heartbeat_payload(None)["client_last_error"])
+                self.assertEqual(before, {p.name: self.entry_snapshot(p) for p in qroot.iterdir()})
+                self.assertEqual(ledger.exists(), ledger_kind != "missing")
+                self.assertEqual(ledger.read_bytes() if ledger.exists() else None, ledger_before)
+
     def test_foreign_alias_after_crash_and_inode_reuse_are_quarantined_and_delivered(self):
         for reused_inode in (False, True):
             with self.subTest(reused_inode=reused_inode), tempfile.TemporaryDirectory() as raw:

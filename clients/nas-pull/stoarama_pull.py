@@ -7373,47 +7373,100 @@ def joined_sidecar_intent(cfg, directory_fd, name, content):
 
 
 def latest_joined_quarantine_notice(cfg):
-    # A crash may follow the NAS rename but precede its upload. Replay a bounded
-    # ledger tail as diagnostics only; it never grants filesystem authority.
+    # Replay diagnostics only; neither the ledger nor this scan grants authority
+    # to mutate NAS files. Scan the whole ledger to match older quarantined names.
     path = cfg.state_dir / "joined-alias-quarantine.jsonl"
+    latest = None
+    recorded_paths = set()
+    problems = []
+    malformed = 0
     try:
         descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except FileNotFoundError:
-        return "", None
-    except OSError as exc:
-        return "joined quarantine ledger unreadable: %s" % exc, utc_now()
-    try:
-        current = os.fstat(descriptor)
-        if not stat_module.S_ISREG(current.st_mode) or current.st_nlink != 1:
-            return "joined quarantine ledger is not exclusively owned", utc_now()
-        os.lseek(descriptor, max(0, current.st_size - 65536), os.SEEK_SET)
-        tail = os.read(descriptor, 65536)
-    finally:
-        os.close(descriptor)
-    for line in reversed(tail.splitlines()):
         try:
-            record = json.loads(line)
-        except ValueError:
-            continue  # A crash can leave a partial final append.
-        if isinstance(record, dict) and record.get("operation") in ("alias_move", "canonical_copy"):
-            return "joined quarantine ledger replay: " + json.dumps(record, sort_keys=True)[:940], record.get("recorded_at")
-    return "", None
+            current = os.fstat(descriptor)
+            if not stat_module.S_ISREG(current.st_mode) or current.st_nlink != 1:
+                raise ExistingFileMismatch("joined quarantine ledger is not exclusively owned")
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
+            with os.fdopen(descriptor, "rb", closefd=False) as ledger:
+                for number, line in enumerate(ledger, 1):
+                    try:
+                        record = json.loads(line)
+                        if not line.endswith(b"\n") or not isinstance(record, dict) or not isinstance(record.get("operation"), str):
+                            raise ValueError("incomplete or invalid record")
+                    except ValueError as exc:
+                        malformed += 1
+                        log("WARN", "joined quarantine ledger malformed line %d: %s" % (number, exc))
+                        continue
+                    if record.get("operation") == "alias_move" and isinstance(record.get("new_path"), str):
+                        recorded_paths.add(record["new_path"])
+                    if record.get("operation") in ("alias_move", "canonical_copy"):
+                        latest = record
+        finally:
+            os.close(descriptor)
+    except FileNotFoundError:
+        pass  # Still inspect quarantine when the ledger is missing.
+    except (OSError, ExistingFileMismatch) as exc:
+        problems.append("joined quarantine ledger unreadable: %s" % exc)
+    if malformed:
+        problems.append("joined quarantine ledger malformed lines=%d" % malformed)
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = None
+    unrecorded = 0
+    try:
+        descriptor = os.open(str(cfg.output_dir), flags)
+        for part in (".stoarama-quarantine", "aliases"):
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        qroot = cfg.output_dir.absolute() / ".stoarama-quarantine" / "aliases"
+        for entry in sorted(os.listdir(descriptor)):
+            alias = str(qroot / entry)
+            if alias not in recorded_paths:
+                unrecorded += 1
+                message = "joined quarantine unrecorded alias: " + alias
+                log("WARN", message)
+                if unrecorded == 1:
+                    problems.append(message)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        problems.append("joined quarantine directory unreadable: %s" % exc)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if unrecorded:
+        problems.insert(0, "joined quarantine unrecorded aliases=%d" % unrecorded)
+    if latest:
+        problems.append("joined quarantine ledger replay: " + json.dumps(latest, sort_keys=True))
+    notice = "; ".join(problems)[:1000]
+    return notice, (utc_now() if problems else None)
 
 
 def append_joined_quarantine_ledger(cfg, record):
     """Fsync intent before NAS mutations, and completion afterwards; never rewrite."""
     path = cfg.state_dir / "joined-alias-quarantine.jsonl"
-    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(str(path), flags, 0o600)
     try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
         current = os.fstat(descriptor)
         if not stat_module.S_ISREG(current.st_mode) or current.st_nlink != 1:
             raise ExistingFileMismatch("joined quarantine ledger is not exclusively owned")
+
+        def write_line(data):
+            # Never resume a short write: it is a torn record, and the next
+            # append must frame it off before any new intent can authorize a move.
+            if os.write(descriptor, data) != len(data):
+                raise OSError(errno.EIO, "short joined quarantine ledger write")
+            os.fsync(descriptor)
+
+        if current.st_size and os.pread(descriptor, 1, current.st_size - 1) != b"\n":
+            write_line(b"\n")
+            recovery = {"operation": "torn_tail_recovered", "recorded_at": utc_now()}
+            write_line((json.dumps(recovery, sort_keys=True) + "\n").encode("utf-8"))
         data = (json.dumps(dict(record, recorded_at=utc_now()), sort_keys=True) + "\n").encode("utf-8")
-        offset = 0
-        while offset < len(data):
-            offset += os.write(descriptor, data[offset:])
-        os.fsync(descriptor)
+        write_line(data)
     finally:
         os.close(descriptor)
     fsync_dir(cfg.state_dir)
