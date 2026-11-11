@@ -1503,6 +1503,10 @@ class Runtime:
         self.joined_protocol_version = 0
         self.joined_protocol_generation = 0
         self.joined_delivery = None
+        self.joined_delivery_error = ""
+        self.joined_quarantine_notice, self.joined_quarantine_notice_at, self.joined_quarantine_status = joined_quarantine_startup_status(cfg)
+        if self.joined_quarantine_notice:
+            log("WARN", self.joined_quarantine_notice)
         self.joined_transfer = None
         self.joined_raw_priority_polled_at = 0.0
         self.joined_raw_priority_pending = False
@@ -1671,10 +1675,11 @@ class Runtime:
             operation()
             return True
 
-    def set_joined_delivery_error(self, artifact_id, blocker, retry_sec):
+    def set_joined_delivery_error(self, artifact_id, blocker, retry_sec, message=""):
         attempted = datetime.datetime.now(datetime.timezone.utc)
         retry = attempted + datetime.timedelta(seconds=retry_sec)
         with self.lock:
+            self.joined_delivery_error = str(message)[:1000]
             self.joined_delivery = {
                 "artifact_id": artifact_id,
                 "blocker": blocker,
@@ -1685,6 +1690,7 @@ class Runtime:
     def clear_joined_delivery_error(self):
         with self.lock:
             self.joined_delivery = None
+            self.joined_delivery_error = ""
 
     def set_joined_transfer(self, artifact_id, offset_bytes, operation):
         with self.lock:
@@ -1773,6 +1779,12 @@ class Runtime:
                 "capacity_blocked": self.capacity_blocked,
                 "joined_protocol_version": self.joined_protocol_version,
             }
+            if self.joined_delivery_error and not payload["client_last_error"]:
+                payload["client_last_error"] = self.joined_delivery_error
+                payload["client_last_error_at"] = self.joined_delivery["attempted_at"]
+            if self.joined_quarantine_notice and not payload["client_last_error"]:
+                payload["client_last_error"] = self.joined_quarantine_notice
+                payload["client_last_error_at"] = self.joined_quarantine_notice_at
             release = {"candidate": self.release_candidate_at_start and not self.stable_marked,
                        "stable": self.stable_marked}
             storage = self.storage.copy() if self.storage is not None else None
@@ -1796,6 +1808,8 @@ class Runtime:
         cleanup, cleanup_error, cleanup_error_at = CLEANUP_STATUS.snapshot()
         if self.inventory is not None:
             cleanup.update(cleanup_quarantine_status(self.inventory))
+        if self.joined_quarantine_status:
+            cleanup["joined_quarantine"] = self.joined_quarantine_status
         if cleanup:
             payload["cleanup"] = redact_diagnostics(cleanup)
         if cleanup_error and not payload["client_last_error"]:
@@ -7339,72 +7353,420 @@ def write_joined_stage(directory_fd, name, content):
         while offset < len(content):
             offset += os.write(descriptor, content[offset:])
         os.fsync(descriptor)
+        current = os.fstat(descriptor)
     finally:
         os.close(descriptor)
     os.fsync(directory_fd)
+    return current
 
 
-def linked_joined_stage(directory_fd, marker_name, marker_stat):
-    prefix = marker_name + ".stage-"
-    matches = []
-    for candidate in os.listdir(directory_fd):
-        if not candidate.startswith(prefix) or not re.fullmatch(r"[0-9a-f]{32}", candidate[len(prefix):]):
-            continue
+def joined_sidecar_intent(cfg, directory_fd, name, content):
+    artifact = json.loads(content)
+    marker_path = joined_output_path(cfg, artifact).with_name(name).absolute()
+    parent = os.fstat(directory_fd)
+    identity = {
+        "schema_version": 1, "artifact_id": artifact["id"],
+        "marker_path": str(marker_path), "directory_device": parent.st_dev,
+        "directory_inode": parent.st_ino, "size_bytes": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+    key = hashlib.sha256(str(marker_path).encode("utf-8")).hexdigest()
+    return cfg.state_dir / ("joined-sidecar-intent-" + key + ".json"), identity
+
+
+def joined_quarantine_startup_status(cfg):
+    # Replay diagnostics only; neither the ledger nor this scan grants authority
+    # to mutate NAS files. Scan the whole ledger to match older quarantined names.
+    path = cfg.state_dir / "joined-alias-quarantine.jsonl"
+    recorded_paths = {}
+    unfinished = {}
+    problems = []
+    malformed = 0
+    try:
+        descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         try:
-            candidate_stat = os.stat(candidate, dir_fd=directory_fd, follow_symlinks=False)
-        except FileNotFoundError:
+            current = os.fstat(descriptor)
+            if not stat_module.S_ISREG(current.st_mode) or current.st_nlink != 1:
+                raise ExistingFileMismatch("joined quarantine ledger is not exclusively owned")
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
+            with os.fdopen(descriptor, "rb", closefd=False) as ledger:
+                for number, line in enumerate(ledger, 1):
+                    try:
+                        record = json.loads(line)
+                        if not line.endswith(b"\n") or not isinstance(record, dict) or not isinstance(record.get("operation"), str):
+                            raise ValueError("incomplete or invalid record")
+                    except ValueError as exc:
+                        malformed += 1
+                        if malformed <= 5:
+                            log("WARN", "joined quarantine ledger malformed line %d: %s" % (number, exc))
+                        continue
+                    if record.get("operation") == "alias_move" and isinstance(record.get("new_path"), str):
+                        recorded_paths[record["new_path"]] = record
+                    if record.get("operation") in ("alias_move", "canonical_copy"):
+                        key = json.dumps([
+                            record["operation"], record.get("new_path"),
+                            record.get("canonical_path"), record.get("temporary_path"),
+                        ], sort_keys=True)
+                        if record.get("state") == "intent":
+                            unfinished[key] = record
+                        elif record.get("state") == "complete":
+                            unfinished.pop(key, None)
+        finally:
+            os.close(descriptor)
+    except FileNotFoundError:
+        pass  # Still inspect quarantine when the ledger is missing.
+    except (OSError, ExistingFileMismatch) as exc:
+        problems.append("joined quarantine ledger unreadable: %s" % exc)
+    if malformed:
+        problems.append("joined quarantine ledger malformed lines=%d" % malformed)
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = None
+    unrecorded = total = 0
+    status = {"aliases": [], "pending_recoveries": []}
+    detail_bytes = 0
+
+    def add_detail(category, message):
+        # Share a byte budget so the complete heartbeat cleanup object stays
+        # below the server's 8 KiB limit, even with long paths. Each selected
+        # detail also fits one uploaded log line. Counts include omitted items.
+        nonlocal detail_bytes
+        size = len(json.dumps(message).encode("utf-8"))
+        if len(status[category]) < 5 and size <= 1900 and detail_bytes + size <= 5000:
+            status[category].append(message)
+            detail_bytes += size
+            log("WARN", message)
+
+    try:
+        descriptor = os.open(str(cfg.output_dir), flags)
+        for part in (".stoarama-quarantine", "aliases"):
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        qroot = cfg.output_dir.absolute() / ".stoarama-quarantine" / "aliases"
+        for entry in sorted(os.listdir(descriptor)):
+            alias = str(qroot / entry)
+            total += 1
+            record = recorded_paths.get(alias)
+            if record is None:
+                unrecorded += 1
+                message = "joined quarantine unrecorded alias: " + alias
+            else:
+                message = "joined quarantine alias: %s -> %s inode=%s size=%s reason=%s" % (
+                    record.get("old_path", "unknown"), alias, record.get("inode", "unknown"),
+                    record.get("size_bytes", "unknown"), record.get("reason", "unknown"),
+                )
+            add_detail("aliases", message)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        problems.append("joined quarantine directory unreadable: %s" % exc)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    pending = 0
+    for record in unfinished.values():
+        pending += 1
+        add_detail("pending_recoveries", "joined quarantine pending recovery: " + json.dumps(record, sort_keys=True))
+    for journal in sorted(cfg.state_dir.glob("joined-sidecar-intent-*.json")):
+        pending += 1
+        add_detail("pending_recoveries", "joined sidecar pending recovery: " + journal.name)
+    if not (total or pending or problems):
+        return "", None, {}
+    status.update(alias_count=total, unrecorded_count=unrecorded, pending_recovery_count=pending,
+                  aliases_omitted=total - len(status["aliases"]),
+                  pending_recoveries_omitted=pending - len(status["pending_recoveries"]))
+    summary = "joined quarantine ledger replay: aliases=%d pending recoveries=%d" % (total, pending)
+    if unrecorded:
+        summary += " unrecorded aliases=%d" % unrecorded
+    summary += "; listed aliases=%d pending=%d; omitted aliases=%d pending=%d (up to 5 each, byte bounded)" % (
+        len(status["aliases"]), len(status["pending_recoveries"]),
+        status["aliases_omitted"], status["pending_recoveries_omitted"],
+    )
+    # The short error directs operators to the complete bounded detail lists.
+    notice = "; ".join([summary] + problems)
+    suffix = "; details in heartbeat cleanup.joined_quarantine and uploaded log"
+    notice = notice.encode("utf-8")[:1000 - len(suffix)].decode("utf-8", "ignore") + suffix
+    return notice, utc_now(), status
+
+
+def append_joined_quarantine_ledger(cfg, record):
+    """Fsync intent before NAS mutations, and completion afterwards; never rewrite."""
+    path = cfg.state_dir / "joined-alias-quarantine.jsonl"
+    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(str(path), flags, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        current = os.fstat(descriptor)
+        if not stat_module.S_ISREG(current.st_mode) or current.st_nlink != 1:
+            raise ExistingFileMismatch("joined quarantine ledger is not exclusively owned")
+
+        def write_line(data):
+            # Never resume a short write: it is a torn record, and the next
+            # append must frame it off before any new intent can authorize a move.
+            if os.write(descriptor, data) != len(data):
+                raise OSError(errno.EIO, "short joined quarantine ledger write")
+            os.fsync(descriptor)
+
+        if current.st_size and os.pread(descriptor, 1, current.st_size - 1) != b"\n":
+            write_line(b"\n")
+            recovery = {"operation": "torn_tail_recovered", "recorded_at": utc_now()}
+            write_line((json.dumps(recovery, sort_keys=True) + "\n").encode("utf-8"))
+        data = (json.dumps(dict(record, recorded_at=utc_now()), sort_keys=True) + "\n").encode("utf-8")
+        write_line(data)
+    finally:
+        os.close(descriptor)
+    fsync_dir(cfg.state_dir)
+
+
+def report_joined_quarantine(runtime, message):
+    # Keep the notice visible after successful joined/raw delivery clears errors.
+    with runtime.lock:
+        runtime.joined_quarantine_notice = message[:1000]
+        runtime.joined_quarantine_notice_at = utc_now()
+    log("WARN", message)
+
+
+def open_joined_quarantine(cfg, directory_fd):
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(str(cfg.output_dir), flags)
+    device = os.fstat(directory_fd).st_dev
+    try:
+        if os.fstat(descriptor).st_dev != device:
+            raise ExistingFileMismatch("joined quarantine crosses filesystem")
+        for part in (".stoarama-quarantine", "aliases"):
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                os.fsync(descriptor)
+                child = os.open(part, flags, dir_fd=descriptor)
+            if os.fstat(child).st_dev != device:
+                os.close(child)
+                raise ExistingFileMismatch("joined quarantine crosses filesystem")
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def joined_alias_is_canonical(name):
+    # All joined media/manifests and every transfer's partial/marker are protected.
+    return name.lower().endswith((".mp4", ".json")) or re.search(r"\.joined-[0-9]+\.part$", name) is not None
+
+
+def copy_joined_canonical(directory_fd, name, current, cfg, stop_event):
+    """Read the canonical bytes once; independently hash the fsynced private copy."""
+    volume = os.fstatvfs(directory_fd)
+    if volume.f_bavail * (volume.f_frsize or volume.f_bsize) < current.st_size + cfg.min_free_bytes:
+        raise ExistingFileMismatch("joined quarantine copy has insufficient NAS free space")
+    flags = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    source = os.open(name, os.O_RDONLY | flags, dir_fd=directory_fd)
+    temporary = ".stoarama-copy-" + os.urandom(16).hex()
+    target = None
+    try:
+        if certification_identity(os.fstat(source)) != certification_identity(current):
+            raise ExistingFileMismatch("joined canonical changed before quarantine copy")
+        target = os.open(temporary, os.O_RDWR | os.O_CREAT | os.O_EXCL | flags, 0o600, dir_fd=directory_fd)
+        if os.fstat(target).st_nlink != 1:
+            raise ExistingFileMismatch("joined quarantine copy is not private")
+        source_hash = hashlib.sha256()
+        copied = 0
+        while True:
+            if stop_event.is_set():
+                raise JoinedDownloadYield("joined quarantine copy stopped at a read boundary")
+            block = os.read(source, JOINED_RANGE_BYTES)
+            if not block:
+                break
+            source_hash.update(block)
+            copied += len(block)
+            offset = 0
+            while offset < len(block):
+                offset += os.write(target, block[offset:])
+        os.fsync(target)
+        os.lseek(target, 0, os.SEEK_SET)
+        copy_hash = hashlib.sha256()
+        while True:
+            block = os.read(target, JOINED_RANGE_BYTES)
+            if not block:
+                break
+            copy_hash.update(block)
+        fresh = os.fstat(target)
+        canonical_after = joined_entry_stat(directory_fd, name)
+        if (
+            copied != current.st_size or fresh.st_size != copied or fresh.st_nlink != 1
+            or source_hash.digest() != copy_hash.digest()
+            or certification_identity(os.fstat(source)) != certification_identity(current)
+            or canonical_after is None or certification_identity(canonical_after) != certification_identity(current)
+        ):
+            raise ExistingFileMismatch("joined quarantine copy size/hash or canonical identity changed")
+        os.fsync(directory_fd)
+        return temporary, fresh, source_hash.hexdigest()
+    finally:
+        os.close(source)
+        if target is not None:
+            os.close(target)
+        # Failed/interrupted private copies are preserved, never treated as aliases.
+
+
+def quarantine_joined_aliases(cfg, runtime, directory_fd, name, artifact, stop_event, hinted_stage=None):
+    """Move only non-canonical names, then detach the canonical inode by copying."""
+    current = joined_entry_stat(directory_fd, name)
+    if current is None:
+        raise ExistingFileMismatch("joined canonical path is missing")
+    aliases = []
+    for entry in sorted(os.listdir(directory_fd)):
+        if entry == name:
             continue
-        if stat_module.S_ISREG(candidate_stat.st_mode) and same_joined_inode(marker_stat, candidate_stat):
-            matches.append((candidate, candidate_stat))
-    if len(matches) != 1:
-        raise ExistingFileMismatch("joined marker has an unknown hardlink")
-    stage_name, stage_stat = matches[0]
-    if marker_stat.st_nlink != 2 or stage_stat.st_nlink != 2:
-        raise ExistingFileMismatch("joined sidecar staging link count is invalid")
-    return stage_name
+        candidate = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+        if same_joined_inode(current, candidate) or entry == hinted_stage:
+            if joined_alias_is_canonical(entry) or not stat_module.S_ISREG(candidate.st_mode):
+                raise ExistingFileMismatch("joined canonical ambiguity: %s and %s" % (name, entry))
+            aliases.append((entry, candidate))
+    if current.st_nlink == 1 and not aliases:
+        return
+    quarantine_fd = open_joined_quarantine(cfg, directory_fd)
+    try:
+        quarantined_links = sum(
+            same_joined_inode(current, os.stat(entry, dir_fd=quarantine_fd, follow_symlinks=False))
+            for entry in os.listdir(quarantine_fd)
+        )
+        found_links = sum(same_joined_inode(current, candidate) for _, candidate in aliases)
+        if current.st_nlink != 1 + found_links + quarantined_links:
+            raise ExistingFileMismatch("joined unknown hardlink outside inspected directory; refusing quarantine")
+        # Complete every copy check before moving any source name.
+        copied = copy_joined_canonical(directory_fd, name, current, cfg, stop_event) if current.st_nlink > 1 else None
+        parent = joined_output_path(cfg, artifact).parent.absolute()
+        qroot = cfg.output_dir.absolute() / ".stoarama-quarantine" / "aliases"
+        reason = "extra joined hardlink or interrupted sidecar stage"
+        for entry, candidate in aliases:
+            destination = "%s-%d-%s-%s" % (
+                time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), artifact["id"], os.urandom(16).hex(), entry[-120:],
+            )
+            record = {
+                "operation": "alias_move", "artifact_id": artifact["id"], "old_path": str(parent / entry),
+                "new_path": str(qroot / destination), "device": candidate.st_dev, "inode": candidate.st_ino,
+                "size_bytes": candidate.st_size, "link_count": candidate.st_nlink, "reason": reason,
+            }
+            append_joined_quarantine_ledger(cfg, dict(record, state="intent"))
+            observed = joined_entry_stat(directory_fd, entry)
+            if observed is None or (
+                observed.st_mode, observed.st_dev, observed.st_ino, observed.st_size, observed.st_mtime_ns, observed.st_nlink
+            ) != (candidate.st_mode, candidate.st_dev, candidate.st_ino, candidate.st_size, candidate.st_mtime_ns, candidate.st_nlink):
+                raise ExistingFileMismatch("joined alias changed before quarantine rename")
+            if joined_entry_stat(quarantine_fd, destination) is not None:
+                raise ExistingFileMismatch("joined quarantine destination already exists")
+            os.rename(entry, destination, src_dir_fd=directory_fd, dst_dir_fd=quarantine_fd)
+            os.fsync(directory_fd)
+            os.fsync(quarantine_fd)
+            append_joined_quarantine_ledger(cfg, dict(record, state="complete"))
+            report_joined_quarantine(runtime, "joined quarantine artifact_id=%d old=%s new=%s inode=%d links=%d size=%d" % (
+                artifact["id"], record["old_path"], record["new_path"], candidate.st_ino, candidate.st_nlink, candidate.st_size))
+        if copied is not None:
+            temporary, fresh, digest = copied
+            observed = joined_entry_stat(directory_fd, name)
+            # Renaming an alias can change ctime. Bytes, inode, size and mtime
+            # must still match; link count must not change during the moves.
+            if observed is None or (
+                observed.st_dev, observed.st_ino, observed.st_size, observed.st_mtime_ns, observed.st_nlink
+            ) != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_nlink):
+                raise ExistingFileMismatch("joined canonical changed before copy replacement")
+            temp_stat = joined_entry_stat(directory_fd, temporary)
+            if temp_stat is None or certification_identity(temp_stat) != certification_identity(fresh) or temp_stat.st_nlink != 1:
+                raise ExistingFileMismatch("joined private copy changed before replacement")
+            record = {
+                "operation": "canonical_copy", "artifact_id": artifact["id"], "canonical_path": str(parent / name),
+                "temporary_path": str(parent / temporary), "device": current.st_dev, "old_inode": current.st_ino,
+                "new_inode": fresh.st_ino, "size_bytes": fresh.st_size, "sha256": digest, "reason": reason,
+            }
+            append_joined_quarantine_ledger(cfg, dict(record, state="intent"))
+            final_source = joined_entry_stat(directory_fd, name)
+            final_copy = joined_entry_stat(directory_fd, temporary)
+            if (
+                final_source is None or certification_identity(final_source) != certification_identity(observed)
+                or final_copy is None or certification_identity(final_copy) != certification_identity(fresh)
+                or final_copy.st_nlink != 1
+            ):
+                raise ExistingFileMismatch("joined canonical or private copy changed during ledger sync")
+            os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            os.fsync(directory_fd)
+            append_joined_quarantine_ledger(cfg, dict(record, state="complete"))
+            report_joined_quarantine(runtime, "joined quarantine detached artifact_id=%d path=%s old_inode=%d new_inode=%d size=%d sha256=%s" % (
+                artifact["id"], record["canonical_path"], current.st_ino, fresh.st_ino, fresh.st_size, digest))
+    except OSError as exc:
+        raise ExistingFileMismatch("joined quarantine failed: %s" % exc) from exc
+    finally:
+        os.close(quarantine_fd)
+
+
+def recover_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event, journal, identity, record):
+    # The journal is only a path hint. Recorded device/inode never authorizes
+    # deletion or establishes provenance (inodes can be reused after a crash).
+    stage = record.get("stage_name") if isinstance(record, dict) else None
+    if (
+        not isinstance(stage, str) or not stage.startswith(name + ".stage-")
+        or re.fullmatch(r"[0-9a-f]{32}", stage[len(name + ".stage-"):]) is None
+        or any(record.get(key) != identity[key] for key in ("artifact_id", "marker_path"))
+    ):
+        raise ExistingFileMismatch("joined sidecar durable intent has an invalid path hint")
+    marker_stat = joined_entry_stat(directory_fd, name)
+    if marker_stat is None:
+        stage_stat = joined_entry_stat(directory_fd, stage)
+        if stage_stat is None or stage_stat.st_nlink != 1 or not verify_joined_sidecar(
+            cfg, runtime, directory_fd, stage, content, stop_event,
+        ):
+            raise ExistingFileMismatch("joined sidecar durable intent has no unambiguous complete stage")
+        # Link publication cannot overwrite a concurrently created canonical
+        # path. Its extra staging alias follows the same preservation path.
+        os.link(stage, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+        os.fsync(directory_fd)
+    if not verify_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
+        raise ExistingFileMismatch("joined partial ownership marker conflicts")
+    quarantine_joined_aliases(cfg, runtime, directory_fd, name, json.loads(content), stop_event, stage)
+    os.fsync(directory_fd)
+    journal.unlink()
+    fsync_dir(journal.parent)
 
 
 def publish_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
-    marker_stat = joined_entry_stat(directory_fd, name)
-    if marker_stat is not None:
-        if not verify_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
-            raise ExistingFileMismatch("joined partial ownership marker conflicts")
-        marker_stat = joined_entry_stat(directory_fd, name)
-        if marker_stat.st_nlink == 2:
-            stage_name = linked_joined_stage(directory_fd, name, marker_stat)
-            os.unlink(stage_name, dir_fd=directory_fd)
-            os.fsync(directory_fd)
-        elif marker_stat.st_nlink != 1:
-            raise ExistingFileMismatch("joined marker has an unknown hardlink")
-        if joined_entry_stat(directory_fd, name).st_nlink != 1:
-            raise ExistingFileMismatch("joined marker has an unknown hardlink")
-        return
-    for _attempt in range(8):
-        stage_name = name + ".stage-" + os.urandom(16).hex()
-        try:
-            write_joined_stage(directory_fd, stage_name, content)
-            break
-        except FileExistsError:
-            continue
-    else:
-        raise ExistingFileMismatch("could not allocate a private joined sidecar stage")
+    journal, identity = joined_sidecar_intent(cfg, directory_fd, name, content)
     try:
-        os.link(stage_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
-    except FileExistsError:
-        # Another publisher won. Our private, unlinked stage is left untouched;
-        # only an exact same-inode link is ever removed below or on restart.
-        raise ExistingFileMismatch("joined marker appeared during publication")
-    os.fsync(directory_fd)
-    marker_stat = joined_entry_stat(directory_fd, name)
-    stage_stat = joined_entry_stat(directory_fd, stage_name)
-    if marker_stat.st_nlink != 2 or stage_stat.st_nlink != 2 or not same_joined_inode(marker_stat, stage_stat):
-        raise ExistingFileMismatch("joined sidecar staging link count is invalid")
-    if not verify_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
-        raise ExistingFileMismatch("joined sidecar stage changed during publication")
-    os.unlink(stage_name, dir_fd=directory_fd)
-    os.fsync(directory_fd)
-    if joined_entry_stat(directory_fd, name).st_nlink != 1:
-        raise ExistingFileMismatch("joined marker has an unknown hardlink")
+        try:
+            encoded = journal.read_bytes()
+        except FileNotFoundError:
+            pass
+        else:
+            try:
+                record = json.loads(encoded)
+            except ValueError as exc:
+                raise ExistingFileMismatch("joined sidecar durable intent is invalid") from exc
+            recover_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event, journal, identity, record)
+            return
+        if joined_entry_stat(directory_fd, name) is not None:
+            if not verify_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
+                raise ExistingFileMismatch("joined partial ownership marker conflicts")
+            quarantine_joined_aliases(cfg, runtime, directory_fd, name, json.loads(content), stop_event)
+            return
+        for _attempt in range(8):
+            stage = name + ".stage-" + os.urandom(16).hex()
+            try:
+                current = write_joined_stage(directory_fd, stage, content)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise ExistingFileMismatch("could not allocate a private joined sidecar stage")
+        record = dict(identity, stage_name=stage,
+                      stage_path=str(Path(identity["marker_path"]).with_name(stage)),
+                      device=current.st_dev, inode=current.st_ino)
+        atomic_write(journal, json.dumps(record, sort_keys=True).encode("utf-8"))
+        recover_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event, journal, identity, record)
+    except (ExistingFileMismatch, OSError) as exc:
+        message = "joined marker=%s artifact_id=%d: %s" % (identity["marker_path"], identity["artifact_id"], exc)
+        report_joined_quarantine(runtime, message)
+        raise ExistingFileMismatch(message) from exc
 
 
 def same_joined_inode(left, right):
@@ -7414,14 +7776,18 @@ def same_joined_inode(left, right):
 def ensure_owned_joined_partial(cfg, runtime, directory_fd, part_name, marker_name, sidecar, stop_event):
     part_stat = joined_entry_stat(directory_fd, part_name)
     marker_stat = joined_entry_stat(directory_fd, marker_name)
-    if marker_stat is None:
-        if part_stat is not None:
-            raise ExistingFileMismatch("joined partial has no ownership marker")
-        publish_joined_sidecar(cfg, runtime, directory_fd, marker_name, sidecar, stop_event)
-        marker_stat = joined_entry_stat(directory_fd, marker_name)
-    elif not verify_joined_sidecar(cfg, runtime, directory_fd, marker_name, sidecar, stop_event):
-        raise ExistingFileMismatch("joined partial ownership marker conflicts")
+    if marker_stat is None and part_stat is not None:
+        raise ExistingFileMismatch("joined partial has no ownership marker")
+    # Recover by preserving aliases and detaching canonical files before writes.
+    publish_joined_sidecar(cfg, runtime, directory_fd, marker_name, sidecar, stop_event)
     marker_stat = joined_entry_stat(directory_fd, marker_name)
+    if part_stat is not None and part_stat.st_nlink != 1:
+        try:
+            quarantine_joined_aliases(cfg, runtime, directory_fd, part_name, json.loads(sidecar), stop_event)
+        except (ExistingFileMismatch, OSError) as exc:
+            report_joined_quarantine(runtime, "joined partial quarantine refused: %s" % exc)
+            raise
+        part_stat = joined_entry_stat(directory_fd, part_name)
     if part_stat is None:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(part_name, flags, 0o600, dir_fd=directory_fd)
@@ -7647,10 +8013,9 @@ def complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, st
             raise ExistingFileMismatch("joined final has an unknown hardlink")
     elif final_stat.st_nlink != 2 or part_stat.st_nlink != 2 or not same_joined_inode(final_stat, part_stat):
         raise ExistingFileMismatch("joined partial conflicts with final")
-    if marker_stat is not None and not verify_joined_sidecar(
-        cfg, runtime, directory_fd, marker_name, marker, stop_event,
-    ):
-        raise ExistingFileMismatch("joined partial ownership marker conflicts")
+    if marker_stat is not None:
+        # Refuse unknown marker aliases before removing even transfer scratch.
+        publish_joined_sidecar(cfg, runtime, directory_fd, marker_name, marker, stop_event)
     if part_stat is not None and marker_stat is None:
         raise ExistingFileMismatch("joined published partial has no ownership marker")
     validate_joined_artifact(cfg, runtime, directory_fd, final_name, item, stop_event)
@@ -7877,7 +8242,9 @@ def drain_joined(cfg, runtime, stop_event, report_phase=True):
         runtime.set_joined_transfer_error(item["id"], exc)
         runtime.set_joined_delivery_error(
             item["id"], classify_joined_delivery_error(exc), min(getattr(cfg, "poll_interval_sec", 60), 10),
+            "joined artifact_id=%d: %s" % (item["id"], exc),
         )
+        log("ERROR", "joined artifact_id=%d failed: %s" % (item["id"], exc))
         raise
     runtime.clear_joined_delivery_error()
     runtime.clear_joined_transfer()
