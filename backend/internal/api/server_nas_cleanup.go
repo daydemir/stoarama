@@ -60,8 +60,14 @@ const (
 	// Wire hint retained for compatibility; never grants execution authority.
 	nasCleanupReconciliationProtocol = 1
 	// Exact reviewed release allowlist; git hashes have no sortable version order.
-	// be17fd73 is this PR's reconciliation-only client release.
-	nasCleanupExecutionClientVersion = "be17fd73"
+	// Retain reviewed predecessors. Stage this fix only with explicit
+	// NAS_VERSION=joined-marker-recovery-v1; never reuse a predecessor version.
+	nasCleanupExecutionClientVersion          = "be17fd73"
+	nasCleanupSerialExecutionClientVersion    = "94d39bff"
+	nasCleanupDedicatedExecutionClientVersion = "523b70ff"
+	nasCleanupRawCreditDrainClientVersion     = "raw-credit-drain-v1"
+	nasCleanupFenceProgressClientVersion      = "fence-progress-v1"
+	nasCleanupJoinedMarkerClientVersion       = "joined-marker-recovery-v1"
 	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
 	// item limit only keeps one admission request bounded.
 	nasCleanupMaxPlanItems = 10000
@@ -359,12 +365,18 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 		return
 	}
 	ctx := r.Context()
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.pool.BeginTx(ctx, nasCleanupAdmissionOptions)
 	if err != nil {
 		util.WriteError(w, 500, "begin cleanup control failed")
 		return
 	}
-	defer tx.Rollback(ctx)
+	var releaseFreeze func()
+	defer func() {
+		tx.Rollback(ctx)
+		if releaseFreeze != nil {
+			releaseFreeze()
+		}
+	}()
 	if req.Mode == "enabled" {
 		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
 			util.WriteError(w, 500, "public cleanup fence failed")
@@ -428,13 +440,15 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 			util.WriteJSON(w, status, body)
 			return
 		}
+		releaseFreeze, err = s.cleanupActivateRankings(ctx, tx, id)
+		if err != nil {
+			util.WriteError(w, 409, "cleanup freeze/replay failed: "+err.Error())
+			return
+		}
 	}
 	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode=$2,allow_nas_only=false,approval_reason=$3,approved_until=CASE WHEN $2='enabled' THEN now()+$5::bigint*interval '1 second' END,priority=coalesce($4,priority) WHERE id=$1`, id, req.Mode, req.Reason, req.Priority, int64(approval/time.Second))
 	if err == nil && req.Mode == "enabled" {
 		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='pending',lease_expires_at=NULL WHERE plan_id=$1`, id)
-		if err == nil {
-			err = cleanupActivateRankings(ctx, tx, id)
-		}
 	}
 	if err == nil && req.Mode != "enabled" {
 		// Pausing (or resuming the dry run of) a plan stops any enabled batch
@@ -537,7 +551,7 @@ func cleanupRequestSession(r *http.Request) cleanupClientSession {
 }
 
 func cleanupSessionDeadline(ctx context.Context, tx pgx.Tx, cid int64, session cleanupClientSession) (time.Time, error) {
-	if session.boot == "" || session.boot == "unknown" || session.version != nasCleanupExecutionClientVersion {
+	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion) {
 		return time.Time{}, nil
 	}
 	var seen *time.Time
@@ -573,6 +587,8 @@ type cleanupObserve struct {
 	// MD5 of the media bytes (protocol 2, lease advertises recovery_md5),
 	// computed by the client in the same read as the proof's SHA-256.
 	MD5 string `json:"md5,omitempty"`
+	// ReturnLease is reconciliation-only, before any permit request.
+	ReturnLease bool `json:"return_lease,omitempty"`
 }
 
 // Prefer the least-leased pending item so unresolved client journals cannot
@@ -1008,6 +1024,13 @@ func cleanupObserveReconcile(id int64, attempt int, sha string, proof json.RawMe
 // whether it earns a single-use deletion permit. Both the single-item and the
 // batched endpoint use it; a batch runs each call in its own savepoint.
 func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64, req cleanupObserve, env *cleanupObserveEnv) cleanupObserveResult {
+	if req.ReturnLease {
+		return cleanupObserveError(400, "lease returns require reconciliation")
+	}
+	permitDeadline := time.Now().Add(nasCleanupExecutionBudget)
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(permitDeadline) {
+		permitDeadline = deadline
+	}
 	sessionDeadline, err := cleanupSessionDeadline(ctx, tx, cid, env.session)
 	if err != nil {
 		return cleanupObserveError(503, "cleanup client identity unavailable")
@@ -1049,6 +1072,11 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	if mode == "enabled" && fencedPlan != planID {
 		// The plan was enabled between the two reads; retry under the fence.
 		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true}}
+	}
+	if mode == "enabled" {
+		if err := cleanupMaintenanceCheck(ctx, tx); err != nil {
+			return cleanupObserveError(503, "cleanup maintenance gate unavailable or active")
+		}
 	}
 	if mode == "enabled" || state == "delete_issued" {
 		var bound bool
@@ -1137,8 +1165,14 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		} else if e != nil || !bytes.Equal(a, b) {
 			action = "conflict"
 		} else {
+			var freezeGeneration int64
+			if mode == "enabled" {
+				if err := tx.QueryRow(ctx, cleanupRankingsFreezeSQL, planID, item.StreamID).Scan(&freezeGeneration); err != nil {
+					return cleanupObserveError(503, "cleanup source freeze unavailable")
+				}
+			}
 			policyStarted := time.Now()
-			e = s.cleanupCurrentPolicyCheck(ctx, tx, item, mode == "dry_run", stageTimings, env.rankingsUnchanged(ctx, tx, mode, rankings))
+			e = s.cleanupCurrentPolicyCheck(ctx, tx, item, mode == "dry_run", stageTimings, s.cleanupExecutionRankingsUnchanged(ctx, tx, planID, freezeGeneration, mode, rankings, stageTimings))
 			stageTimings["policy_ms"] = time.Since(policyStarted).Milliseconds()
 			if e != nil {
 				action = "keep"
@@ -1199,10 +1233,15 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	stages, _ := json.Marshal(stageTimings)
 	// Dry runs replace the recovery evidence (or clear it when the copy was not
 	// verified); executions only ever add evidence from a full verification.
-	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state=$2,delete_ever_issued=delete_ever_issued OR $2='delete_issued',lease_expires_at=NULL,proof=$3::jsonb,proof_sha256=$4,recovery=$5,outcome=$6::jsonb,policy_reason=$7,stage_timings=$8::jsonb,
+	// Check at the actual write too: a statement can wait after Go's last
+	// expiry check. A late UPDATE must never record deletion authority.
+	updated, err := tx.Exec(ctx, `UPDATE nas_cleanup_items SET state=$2,delete_ever_issued=delete_ever_issued OR $2='delete_issued',lease_expires_at=NULL,proof=$3::jsonb,proof_sha256=$4,recovery=$5,outcome=$6::jsonb,policy_reason=$7,stage_timings=$8::jsonb,
  recovery_evidence=CASE WHEN $9::boolean THEN $10::jsonb ELSE coalesce($10::jsonb,recovery_evidence) END,
- permit_expires_at=CASE WHEN $2='delete_issued' THEN $11::timestamptz ELSE permit_expires_at END,updated_at=now() WHERE id=$1`,
-		id, action, proof, cleanupSHA(req.Proof), recovery, string(observed), policyReason, string(stages), mode == "dry_run", evidenceJSON, expires)
+ permit_expires_at=CASE WHEN $2='delete_issued' THEN $11::timestamptz ELSE permit_expires_at END,updated_at=now() WHERE id=$1 AND ($2<>'delete_issued' OR clock_timestamp()<$12::timestamptz)`,
+		id, action, proof, cleanupSHA(req.Proof), recovery, string(observed), policyReason, string(stages), mode == "dry_run", evidenceJSON, expires, permitDeadline)
+	if err == nil && updated.RowsAffected() != 1 {
+		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup observation deadline exceeded; retry", "retryable": true}}
+	}
 	// During execution every healthy observation becomes a permit. Anything
 	// else (unverified, conflict, missing, client error, policy or recovery
 	// mismatch, budget) pauses the whole plan in the same transaction.

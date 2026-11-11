@@ -13,11 +13,14 @@ func TestNASCleanupPriorityAndReadOnlyResume(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
 	s := &Server{pool: pool}
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_frozen_streams(plan_id,stream_id,validated) VALUES(4,3,true)`); err != nil {
+		t.Fatal(err)
+	}
 	_, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode,approved_until,approval_reason,priority) VALUES
  (1,47,13,'bulk','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":1},{"kind":"raw","source_id":2}]',repeat('b',64),'dry_run',NULL,'',0),
  (2,47,13,'pilot','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":3}]',repeat('b',64),'dry_run',NULL,'',0),
  (3,47,13,'paused','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":4}]',repeat('b',64),'paused',NULL,'',100),
- (4,47,13,'master-fenced','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":5}]',repeat('b',64),'enabled',now()+interval '1 hour','fixture',100),
+ (4,47,13,'master-fenced','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":5,"stream_id":3}]',repeat('b',64),'enabled',now()+interval '1 hour','fixture',100),
  (5,48,14,'foreign','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":6}]',repeat('b',64),'dry_run',NULL,'',100);
  INSERT INTO nas_cleanup_items(id,plan_id,ordinal) VALUES(1,1,1),(2,1,2),(100,2,1),(200,3,1),(300,4,1),(400,5,1);`)
 	if err != nil {
@@ -162,12 +165,13 @@ func TestNASCleanupSupersededPlansAreInertAndRetire(t *testing.T) {
 	s := &Server{pool: pool}
 	s.cfg.NASCleanupDeletionEnabled = true
 	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');
+ INSERT INTO nas_cleanup_frozen_streams(plan_id,stream_id,validated) VALUES(5,3,true);
  INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode,approved_until,approval_reason) VALUES
  (1,47,13,'old-dry',repeat('a',64),'[{"kind":"raw","source_id":1,"stream_id":3}]',repeat('b',64),'dry_run',NULL,''),
  (2,47,13,'old-paused',repeat('a',64),'[{"kind":"raw","source_id":2}]',repeat('b',64),'paused',NULL,''),
  (3,47,13,'current','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":3}]',repeat('b',64),'dry_run',NULL,''),
  (4,47,13,'old-issued',repeat('a',64),'[{"kind":"raw","source_id":4}]',repeat('b',64),'paused',NULL,''),
- (5,47,13,'old-enabled',repeat('a',64),'[{"kind":"raw","source_id":5}]',repeat('b',64),'enabled',now()+interval '1 hour','fixture');
+ (5,47,13,'old-enabled',repeat('a',64),'[{"kind":"raw","source_id":5,"stream_id":3}]',repeat('b',64),'enabled',now()+interval '1 hour','fixture');
  INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state) VALUES(1,1,1,'pending'),(2,2,1,'would_delete'),(3,3,1,'pending'),(5,5,1,'pending');
  INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state,delete_ever_issued) VALUES(4,4,1,'unverified',true);
  INSERT INTO nas_cleanup_source_holds VALUES(1,1);`)

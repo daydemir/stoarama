@@ -1,6 +1,6 @@
 # Jelly-hosted Stoarama services
 
-Jelly (`jellys-mac-mini`) runs two small Stoarama services as plain user launchd jobs.
+Jelly (`jellys-mac-mini`) runs small Stoarama services as plain user launchd jobs.
 They do not depend on Muavin.
 
 | Job | What it serves | Code | Data/state |
@@ -30,3 +30,10 @@ Migrated from Mooney to Jelly on 2026-11-10. Mooney's run was drained with a STO
 - Resume: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.stoarama.repair.plist`
 
 The job is resumable and idempotent: in-flight rows reset to pending on start, and existing `repaired/` objects are HEAD-checked before each PUT.
+
+## Cleanup runner (not installed by this change)
+
+`cleanup-runner/README.md` documents the supervised standing-approval NAS cleanup
+job, offline tests, owner delivery, dry-run effects, and stop/drain procedure. Its
+launchd definition is `launchd/com.stoarama.cleanup-runner.plist`. Install separately
+only between batches with no enabled plan and master OFF.

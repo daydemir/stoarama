@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// Advisory preflight only. Enabled observations always replay live rankings.
+// Advisory preflight only. Enabled observations use a frozen replay verdict.
 // Keep expensive read-only sensitivity selection bounded to five minutes;
 // exact source metadata and protected-window checks still run per file.
 const cleanupDryRunRankingTTL = 5 * time.Minute

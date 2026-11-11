@@ -19,13 +19,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Delay the real policy fingerprint query while the actual plan fence is
+// Delay the real policy cache lookup while the actual plan fence is
 // held. Sixteen simultaneous requests would need >15 s to drain that lock.
 // No production hook or deadline change is used by this harness.
 type cleanupSlowPolicyTracer struct{ calls atomic.Int32 }
 
 func (t *cleanupSlowPolicyTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
-	if data.SQL == cleanupRankingsFingerprintSQL {
+	if data.SQL == cleanupRankingsCacheLoadSQL {
 		t.calls.Add(1)
 		select {
 		case <-time.After(1100 * time.Millisecond):
@@ -37,7 +37,31 @@ func (t *cleanupSlowPolicyTracer) TraceQueryStart(ctx context.Context, _ *pgx.Co
 func (*cleanupSlowPolicyTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 func TestNASCleanupSixteenContendingWorkersSlowPolicyClientServer(t *testing.T) {
+	testNASCleanupSerialClientServer(t, 0)
+}
+
+func TestNASCleanupDedicatedLaneWithSlowJoinedDeliveryClientServer(t *testing.T) {
+	testNASCleanupSerialClientServer(t, 5)
+}
+
+// Production plan 1394 stalled after its first execution window. Keep the
+// real 15 s drain and 2 s retry; long joined writers require raw credits while
+// the raw listing initially returns 502s. Every file must still be deleted.
+func TestNASCleanupDrainTimeoutRecoveryClientServer(t *testing.T) {
+	testNASCleanupSerialClientServer(t, 35)
+}
+
+func testNASCleanupSerialClientServer(t *testing.T, joinedSeconds int) {
+	slowJoined := joinedSeconds > 0
+	drainRecovery := joinedSeconds > 15
 	f := newCleanupFixture(t, 24)
+	version := nasCleanupExecutionClientVersion
+	if slowJoined {
+		version = nasCleanupFenceProgressClientVersion
+		if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, version); err != nil {
+			t.Fatal(err)
+		}
+	}
 	python := os.Getenv("STOARAMA_TEST_PYTHON")
 	if python == "" {
 		python = "python3"
@@ -71,6 +95,15 @@ func TestNASCleanupSixteenContendingWorkersSlowPolicyClientServer(t *testing.T) 
 			next.ServeHTTP(w, r)
 		})
 	})
+	var listCalls atomic.Int32
+	router.Get("/account/clips", func(w http.ResponseWriter, r *http.Request) {
+		if listCalls.Add(1) <= 2 {
+			w.WriteHeader(502)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"clips":[]}`))
+	})
 	router.Post("/account/connections/cleanup/lease", f.s.handleAccountNASCleanupLease)
 	router.Post("/account/connections/cleanup/{itemId}/observe", f.s.handleAccountNASCleanupObserve)
 	router.Post("/account/connections/cleanup/{itemId}/reconcile", f.s.handleAccountNASCleanupReconcile)
@@ -83,9 +116,15 @@ func TestNASCleanupSixteenContendingWorkersSlowPolicyClientServer(t *testing.T) 
 		// between dry run and execution; keep-alive handlers may still unwind.
 		srv := httptest.NewServer(router)
 		defer srv.Close()
-		args := []string{script, "run", "--api", srv.URL, "--root", root, "--state", state, "--protocol", "2"}
+		args := []string{script, "run", "--api", srv.URL, "--root", root, "--state", state, "--protocol", "2", "--client-version", version}
 		if concurrent {
 			args = append(args, "--simultaneous-tasks", "16", "--max-seconds", "90")
+		}
+		if slowJoined && f.s.cfg.NASCleanupDeletionEnabled {
+			args = append(args, "--slow-joined-seconds", fmt.Sprint(joinedSeconds))
+			if drainRecovery {
+				args = append(args, "--drain-timeout-recovery", "--max-seconds", "90")
+			}
 		}
 		raw, err := exec.Command(python, args...).CombinedOutput()
 		if err != nil {
@@ -119,7 +158,7 @@ func TestNASCleanupSixteenContendingWorkersSlowPolicyClientServer(t *testing.T) 
 	}
 	defer slowPool.Close()
 	f.s.pool = slowPool
-	result := run(true)
+	result := run(!slowJoined)
 	if len(result.Errors) != 0 || result.Deleted != 16 || result.Unlinks != 32 || len(result.Outcomes) != 16 {
 		t.Fatalf("execution: %+v", result)
 	}
@@ -138,5 +177,21 @@ func TestNASCleanupSixteenContendingWorkersSlowPolicyClientServer(t *testing.T) 
 	if deleted != 16 || unverified != 0 || slowPolicy != 16 {
 		t.Fatalf("deleted=%d unverified=%d slow-policy=%d", deleted, unverified, slowPolicy)
 	}
-	t.Logf("16 contending lease workers, 1.1 s policy each: %s, peak requests=%d", fmt.Sprint(result.Seconds), peak.Load())
+	rate := 60 * 16 / result.Seconds
+	if slowJoined && ((!drainRecovery && rate < 15) || result.JoinedCalls < 2 || result.JoinedCalls > 4 || result.RawCalls == 0) {
+		t.Fatalf("slow joined work interleaved between executions: rate=%.1f/min joined_calls=%d result=%+v", rate, result.JoinedCalls, result)
+	}
+	if drainRecovery {
+		var returned, busy int
+		if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM nas_cleanup_reconciliations WHERE observation->>'return_lease'='true' AND action='pending'`).Scan(&returned); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM nas_cleanup_items WHERE plan_id=$1 AND state IN ('leased','delete_issued')`, id).Scan(&busy); err != nil {
+			t.Fatal(err)
+		}
+		if result.DrainTimeouts < 1 || returned < 1 || busy != 0 || listCalls.Load() < 3 || result.Seconds >= 90 {
+			t.Fatalf("no sustained recovery: returned=%d busy=%d list_calls=%d result=%+v", returned, busy, listCalls.Load(), result)
+		}
+	}
+	t.Logf("16 files, slow joined=%t, 1.1 s policy each: %.3f s, %.1f files/min, joined calls=%d, raw calls=%d, peak requests=%d", slowJoined, result.Seconds, rate, result.JoinedCalls, result.RawCalls, peak.Load())
 }

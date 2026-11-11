@@ -1215,6 +1215,22 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             self.assertLessEqual(len(commits), 15)
             inventory.close()
 
+    def test_drain_list_502_retries_with_backoff_before_delivering_page(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
+            clip = {"clip_id": 1, "recording_id": 3, "size_bytes": 10}
+            error = urllib.error.HTTPError('https://example.test', 502, 'Bad Gateway', {}, None)
+            with mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**12, "free_bytes": 10**12}), \
+                    mock.patch.object(pull, "request_json", side_effect=[error, error, {"clips": [clip]}]) as api, \
+                    mock.patch.object(pull, "process_clip", return_value=(1, 10, 10, 0)), \
+                    mock.patch.object(pull, "release_clips", return_value={}), mock.patch.object(pull.time, "sleep") as sleep:
+                self.assertTrue(pull.drain_page(cfg, runtime))
+            self.assertEqual(api.call_count, 3)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+            self.assertEqual(runtime.cursor_id, 1)
+            self.assertEqual(runtime.batch['retries'], 2)
+
     def test_inventory_is_synced_before_release_and_sync_failure_keeps_cursor(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
@@ -1263,6 +1279,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
     def test_storage_status_only_reports_real_mount(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
             opened = SimpleNamespace(st_dev=1, st_ino=2)
             usage = SimpleNamespace(f_frsize=1, f_bsize=1, f_blocks=1000, f_bavail=250)
             with mock.patch.object(pull.os, "open", return_value=9), mock.patch.object(
@@ -1274,7 +1291,6 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             ):
                 status = {"available": True, "total_bytes": 1000, "free_bytes": 250}
                 self.assertEqual(pull.storage_status(cfg), status)
-                runtime = pull.Runtime(cfg)
                 runtime.set_storage(status)
                 self.assertEqual(runtime.heartbeat_payload(None)["storage"], status)
                 outage = {"class": "timeout", "started_at": pull.utc_now(), "failure_count": 1}
@@ -2230,9 +2246,14 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                     raise download_error
                 return 1, 10, 10, 0
 
+            def retry(operation, clip_id, phase):
+                if phase == "drain-list":
+                    return operation(), 0
+                raise release_error
+
             with mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**12, "free_bytes": 10**12}), mock.patch.object(pull, "request_json", return_value={"clips": clips}), mock.patch.object(
                 pull, "process_clip", side_effect=process
-            ), mock.patch.object(pull, "retry_transient", side_effect=release_error):
+            ), mock.patch.object(pull, "retry_transient", side_effect=retry):
                 self.assertFalse(pull.drain_page(cfg, runtime))
             self.assertEqual(runtime.batch["retries"], 4)
             self.assertEqual(runtime.batch["failures"], 2)

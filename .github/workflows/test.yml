@@ -28,6 +28,8 @@ jobs:
         run: python -m unittest discover -s backend/scripts/nas-storage-dashboard -p 'test_*.py' -q
       - name: Test NAS full-manifest timestamp parsing on Python 3.9
         run: python -m unittest discover -s backend/scripts/nas-cleanup -p 'test_*.py' -q
+      - name: Test supervised Jelly cleanup runner without production access
+        run: python -m unittest discover -s ops/jelly/cleanup-runner -p 'test_*.py' -q
       - name: Test finite capability staging on the control host Python version
         run: python -m unittest discover -s infra/collation-v2 -p 'test_*.py' -q
 

@@ -247,6 +247,153 @@ class CleanupTests(unittest.TestCase):
         release.set();thread.join(1)
         fence.acquire_cleanup(threading.Event(),time.monotonic()+1);fence.release_cleanup()
 
+    def test_execution_lane_reserves_io_until_idle_and_yields_for_maintenance(self):
+        fence = pull.NASMediaFence()
+        stop = threading.Event()
+        entered = threading.Event()
+        reader = threading.Event()
+        @fence.delivery
+        def writer():
+            entered.set()
+        def inventory():
+            if fence.wait_maintenance(stop):
+                reader.set()
+        with mock.patch.object(pull, 'NAS_MEDIA_FENCE', fence):
+            lane = pull.CleanupExecutionLane(stop)
+            try:
+                lane.run(lambda: None)
+                threads = [threading.Thread(target=writer), threading.Thread(target=inventory)]
+                for worker in threads:
+                    worker.start()
+                self.assertFalse(entered.wait(0.05))
+                self.assertFalse(reader.is_set())
+                # Nested per-file fences admit the lane owner even with a
+                # delivery writer queued; no work slips between receipts.
+                for _ in range(3):
+                    fence.acquire_cleanup(stop, time.monotonic()+1)
+                    fence.release_cleanup()
+                    lane.before_lease()
+                    self.assertFalse(entered.is_set())
+                with mock.patch.object(pull.time, 'monotonic', return_value=lane.started+301), \
+                        mock.patch.object(stop, 'wait', side_effect=lambda seconds: not entered.wait(1)) as wait:
+                    lane.before_lease()
+                wait.assert_called_once_with(pull.CLEANUP_MAINTENANCE_WINDOW_SEC)
+                self.assertIsNone(lane.started)
+                self.assertTrue(reader.wait(1))
+            finally:
+                lane.close()
+                for worker in threads:
+                    worker.join(1)
+        self.assertEqual(fence.cleaners, 0)
+        self.assertIsNone(fence.execution_owner)
+
+    def test_execution_lane_cancellation_releases_waiting_delivery(self):
+        fence = pull.NASMediaFence()
+        stop = threading.Event()
+        with mock.patch.object(pull, 'NAS_MEDIA_FENCE', fence):
+            lane = pull.CleanupExecutionLane(stop)
+            try:
+                lane.run(lambda: None)
+                stop.set()
+                with mock.patch.object(pull.time, 'monotonic', return_value=lane.started+301):
+                    with self.assertRaises(pull.CleanupInterrupted):
+                        lane.before_lease()
+            finally:
+                lane.close()
+        self.assertEqual(fence.cleaners, 0)
+        self.assertIsNone(fence.execution_owner)
+
+    def test_execution_drain_timeout_reopens_background_work_for_maintenance(self):
+        fence, stop = pull.NASMediaFence(), threading.Event()
+        active, release, resumed, next_joined = (threading.Event() for _ in range(4))
+        @fence.background_delivery
+        def joined():
+            active.set()
+            release.wait(2)
+        def inventory():
+            if fence.wait_maintenance(stop):
+                resumed.set()
+        worker = threading.Thread(target=joined)
+        worker.start()
+        self.assertTrue(active.wait(1))
+        reader = threading.Thread(target=inventory)
+        queued = threading.Thread(target=fence.background_delivery(next_joined.set))
+        acquire = fence.acquire_cleanup
+        def drain(*args):
+            reader.start()
+            queued.start()
+            self.assertFalse(resumed.wait(.02))
+            self.assertFalse(next_joined.is_set(), 'new joined writer entered during drain')
+            return acquire(*args)
+        with mock.patch.object(pull, 'NAS_MEDIA_FENCE', fence), \
+                mock.patch.object(pull, 'CLEANUP_EXECUTION_DRAIN_SEC', .1), \
+                mock.patch.object(fence, 'acquire_cleanup', side_effect=drain):
+            lane = pull.CleanupExecutionLane(stop)
+            try:
+                with self.assertRaises(pull.CleanupInterrupted):
+                    lane.run(lambda: self.fail('execution ran beside joined writer'))
+                self.assertTrue(resumed.wait(1), 'maintenance remained fenced after drain timeout')
+                self.assertTrue(next_joined.wait(1), 'joined admission remained fenced after drain timeout')
+                self.assertIsNone(lane.started)
+                self.assertTrue(fence.execution_lock.acquire(blocking=False))
+                fence.execution_lock.release()
+            finally:
+                release.set()
+                lane.close()
+                worker.join(1)
+                reader.join(1)
+                queued.join(1)
+        self.assertIsNone(fence.execution_owner)
+        self.assertEqual(fence.cleaners, 0)
+
+    def test_unused_execution_lease_return_is_durable_and_replays_only_reconcile(self):
+        with self.opened() as current:
+            self.task['approved_proof'] = current.proof()
+        lane = mock.Mock()
+        lane.run.side_effect = pull.CleanupDrainTimeout('long joined download')
+        import urllib.error
+        error = urllib.error.HTTPError('https://example.test', 502, 'Bad Gateway', {}, None)
+        with mock.patch.object(pull, 'restore_api', side_effect=error) as api, \
+                mock.patch.object(pull.time, 'sleep'), mock.patch.object(pull.os, 'unlink') as unlink:
+            with self.assertRaises(urllib.error.HTTPError):
+                pull.cleanup_process_task(self.cfg, self.inventory, threading.Event(), self.task, lane=lane)
+        unlink.assert_not_called()
+        self.assertTrue(all(call.args[1].endswith('/reconcile') for call in api.call_args_list))
+        journal = pull.cleanup_journal(self.inventory)
+        self.assertEqual(len(journal), 1)
+        self.assertEqual(journal[0][1], 'observe')
+        body = json.loads(journal[0][2])
+        self.assertTrue(body['return_lease'])
+        self.assertIsNone(body['proof'])
+        with mock.patch.object(pull, 'restore_api', side_effect=lambda cfg, path, body: fixture_ack(body, action='pending', delete=False)) as replay:
+            pull.cleanup_replay_receipts(self.cfg, self.inventory)
+        self.assertTrue(replay.call_args.args[1].endswith('/reconcile'))
+        self.assertFalse(pull.cleanup_journal(self.inventory))
+        self.assertTrue(self.path.exists())
+        self.assertTrue(self.sidecar.exists())
+
+    def test_interrupted_uncertain_observation_never_returns_execution_lease(self):
+        with self.opened() as current:
+            self.task['approved_proof'] = current.proof()
+        with mock.patch.object(pull, 'restore_api', side_effect=pull.CleanupInterrupted('transport interrupted')) as api:
+            with self.assertRaises(pull.CleanupInterrupted):
+                pull.cleanup_process_task(self.cfg, self.inventory, threading.Event(), self.task)
+        self.assertEqual(api.call_count, 1)
+        self.assertTrue(api.call_args.args[1].endswith('/observe'))
+        body = json.loads(pull.cleanup_journal(self.inventory)[0][2])
+        self.assertNotIn('return_lease', body)
+        self.assertTrue(self.path.exists())
+
+    def test_cleanup_loop_retries_writer_drain_within_seconds(self):
+        stop = mock.Mock()
+        stop.wait.side_effect = [False, False, True]
+        with mock.patch.object(pull, 'CleanupBatchAPI') as api, \
+                mock.patch.object(pull, 'cleanup_batch_v2', side_effect=[pull.CleanupDrainTimeout('long delivery'), 120]), \
+                mock.patch.object(pull, 'restore_wait', return_value=120):
+            pull.cleanup_loop(self.cfg, self.inventory, stop)
+        self.assertEqual([call.args[0] for call in stop.wait.call_args_list], [15, 2, 120])
+        api.return_value.close.assert_called_once()
+
     def test_stale_observe_and_result_receipts_are_archived_without_blocking(self):
         import urllib.error
         for phase in ('observe','result'):
@@ -335,6 +482,17 @@ class CleanupTests(unittest.TestCase):
         self.assertFalse(outcome['unlink_attempted'])
         self.assertIsInstance(outcome['observe_elapsed_ms'], int)
         self.assertGreaterEqual(outcome['execution_elapsed_ms'], outcome['observe_elapsed_ms'])
+        self.assertTrue(self.path.exists()); self.assertTrue(self.sidecar.exists())
+
+    def test_eighteen_second_observe_never_unlinks(self):
+        with self.opened() as current:
+            self.task['approved_proof'] = proof = current.proof()
+        decision = fixture_ack({'attempt': 1, 'plan_sha256': 'a'*64, 'proof': proof},
+                               action='delete_issued', delete=True,
+                               expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
+        with self.assertRaises(pull.CleanupPermitRefused) as refused:
+            pull.cleanup_check_permit(self.cfg, True, self.task, proof, decision, time.monotonic()-18.3)
+        self.assertEqual(refused.exception.reason, 'deadline_exceeded')
         self.assertTrue(self.path.exists()); self.assertTrue(self.sidecar.exists())
 
     def test_permit_deadline_checked_after_slow_final_directory_walk(self):
@@ -431,10 +589,11 @@ class CleanupTests(unittest.TestCase):
         order=[];counter=[0]
         def api(cfg,path,body, **kwargs):
             counter[0]+=1
+            if counter[0] == 3: return dict(tasks=[], retry_after_sec=120)
             task=dict(self.task,item_id=counter[0])
             if counter[0]==2:task["approved_proof"]={}
             return dict(tasks=[task],retry_after_sec=0)
-        def process(cfg,inventory,stop,task):
+        def process(cfg,inventory,stop,task, lane=None):
             if task.get("approved_proof") is not None:
                 order.append("execute")
             else:
@@ -443,7 +602,7 @@ class CleanupTests(unittest.TestCase):
             with mock.patch.object(pull,"restore_api",side_effect=api),mock.patch.object(pull,"cleanup_process_task",side_effect=process):
                 pull.cleanup_batch(self.cfg,self.inventory,threading.Event(),executor)
         self.assertEqual(order,["preflight_start","preflight_end","execute"])
-        self.assertEqual(counter[0],2)
+        self.assertEqual(counter[0],3)
 
     def test_lease_failure_drains_workers_before_next_receipt_replay(self):
         finished=threading.Event();counter=[0]
@@ -1042,6 +1201,52 @@ class CleanupProtocol2Tests(unittest.TestCase):
         self.assertEqual(pull.cleanup_journal(self.inventory), [])
         rows = self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0]
         self.assertEqual(rows, 24)
+
+    def test_execution_loop_refills_immediately_and_waits_only_after_empty_lease(self):
+        tasks, paths = self.execution_tasks(3)
+        api, state = self.fake_server(tasks)
+        waits = []
+        class Stop:
+            def is_set(self):
+                return False
+            def wait(self, seconds):
+                waits.append(seconds)
+                if len(waits) == 1:
+                    return False  # initial startup wait
+                self.assert_completed()
+                return True  # stop after the empty lease, before polling again
+            def assert_completed(self):
+                assert state['leased'] == 3
+                assert sum(p.endswith('/result-batch') for p in state['calls']) == 3
+                assert all(not path.exists() for path, _ in paths)
+        with mock.patch.object(pull, 'restore_api', side_effect=api):
+            pull.cleanup_loop(self.cfg, self.inventory, Stop())
+        self.assertEqual(len(waits), 2, 'a poll wait interrupted serial execution')
+        self.assertGreater(waits[-1], 0, 'empty leases must back off')
+        calls = [p.rsplit('/', 1)[-1] for p in state['calls']]
+        self.assertEqual(calls, ['lease', 'observe', 'result-batch'] * 3 + ['lease'])
+
+    def test_direct_execution_callers_hold_one_slot_through_the_entire_lifecycle(self):
+        tasks, _ = self.execution_tasks(8)
+        active = dict(now=0, peak=0, completed=0)
+        lock = threading.Lock()
+        start = threading.Barrier(len(tasks))
+        def lifecycle(*args):
+            with lock:
+                active['now'] += 1
+                active['peak'] = max(active['peak'], active['now'])
+            time.sleep(0.01)  # observation through acknowledged receipt
+            with lock:
+                active['now'] -= 1
+                active['completed'] += 1
+        def execute(task):
+            start.wait(timeout=5)
+            pull.cleanup_process_task(self.cfg, self.inventory, threading.Event(), task)
+        with mock.patch.object(pull, '_cleanup_process_task', side_effect=lifecycle):
+            with pull.concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+                list(executor.map(execute, tasks))
+        self.assertEqual(active, dict(now=0, peak=1, completed=8))
+        self.assertEqual(self.inventory.cleanup_claims, {})
 
     def test_foreign_change_in_a_shared_folder_still_refuses(self):
         tasks, paths = self.execution_tasks(2)

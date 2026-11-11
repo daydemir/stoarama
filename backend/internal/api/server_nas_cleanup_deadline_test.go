@@ -87,11 +87,14 @@ CREATE TABLE account_api_keys(id bigint PRIMARY KEY,account_id bigint,secret_has
 }
 
 type cleanupDeadlineClientResult struct {
-	Seconds  float64  `json:"seconds"`
-	Unlinks  int      `json:"unlink_calls"`
-	Deleted  int      `json:"ledger_deleted"`
-	Errors   []string `json:"errors"`
-	Outcomes []struct {
+	Seconds       float64  `json:"seconds"`
+	Unlinks       int      `json:"unlink_calls"`
+	Deleted       int      `json:"ledger_deleted"`
+	JoinedCalls   int      `json:"joined_calls"`
+	RawCalls      int      `json:"raw_calls"`
+	DrainTimeouts int      `json:"drain_timeouts"`
+	Errors        []string `json:"errors"`
+	Outcomes      []struct {
 		ObserveMS   int64 `json:"observe_elapsed_ms"`
 		ExecutionMS int64 `json:"execution_elapsed_ms"`
 		Unlink      bool  `json:"unlink_attempted"`
