@@ -1832,10 +1832,14 @@ class Runtime:
     def apply_joined_protocol_response(self, response):
         version = response.get("joined_protocol_version") if isinstance(response, dict) else None
         generation = response.get("joined_protocol_generation") if isinstance(response, dict) else None
+        required = {"ok", "joined_delivery_accepted", "joined_protocol_version", "joined_protocol_generation"}
+        switches = {"listing_enabled", "stitch_enabled", "stitch_deletion_enabled"}
         valid = (
-            isinstance(response, dict) and set(response) == {
-                "ok", "joined_delivery_accepted", "joined_protocol_version", "joined_protocol_generation",
-            }
+            isinstance(response, dict) and required <= set(response)
+            and set(response) <= required | switches | {"cleanup_release_generation"}
+            and all(type(response[k]) is bool for k in switches if k in response)
+            and ("cleanup_release_generation" not in response or
+                 type(response["cleanup_release_generation"]) is int and 0 <= response["cleanup_release_generation"] <= 0x7fffffffffffffff)
             and response.get("ok") is True and type(response.get("joined_delivery_accepted")) is bool
             and type(version) is int and version in (0, JOINED_PROTOCOL_VERSION)
             and type(generation) is int and 0 <= generation <= 0x7fffffffffffffff

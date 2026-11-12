@@ -47,6 +47,7 @@ class NASPullTests(unittest.TestCase):
             outage_file=state / "outage.json",
             capacity_file=state / "capacity.json",
             inventory_file=state / "inventory.sqlite3",
+            listing_enabled=threading.Event(),
             current_file=state / "stoarama_pull.py",
             candidate_file=state / "stoarama_pull.candidate.py",
             previous_file=state / "stoarama_pull.previous.py",
@@ -1728,13 +1729,16 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 if len(payloads) == 2:
                     stop_event.set()
                 return {"ok": True, "joined_delivery_accepted": True,
-                        "joined_protocol_version": 1, "joined_protocol_generation": 3}
+                        "joined_protocol_version": 1, "joined_protocol_generation": 3,
+                        "listing_enabled": True, "stitch_enabled": False,
+                        "stitch_deletion_enabled": False, "cleanup_release_generation": 1}
 
             with mock.patch.object(pull, "request_json", side_effect=heartbeat), \
                  mock.patch.object(pull, "HEARTBEAT_INTERVAL_SEC", 0):
                 pull.heartbeat_loop(cfg, runtime, stop_event)
 
             self.assertEqual([body["joined_protocol_version"] for body in payloads], [0, 1])
+            self.assertTrue(cfg.listing_enabled.is_set())
             self.assertEqual(payloads[0]["cursor_id"], payloads[1]["cursor_id"])
             self.assertEqual(payloads[0]["clips_pulled"], payloads[1]["clips_pulled"])
 
@@ -1888,7 +1892,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 def __init__(self, target, args=(), **_kwargs):
                     self.target = target
                     self.args = args
-                    self.alive = target not in (pull.inventory_loop, pull.joined_loop, pull.cleanup_loop, pull.stitch_loop)
+                    self.alive = target not in (pull.inventory_loop, pull.listing_proof_loop, pull.joined_loop, pull.cleanup_loop, pull.stitch_loop)
 
                 def start(self):
                     started.append(self.target)
@@ -1985,7 +1989,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
 
             class FakeThread:
                 background_targets = {
-                    pull.heartbeat_loop, pull.storage_probe_loop, pull.update_loop, pull.inventory_loop,
+                    pull.heartbeat_loop, pull.storage_probe_loop, pull.update_loop, pull.inventory_loop, pull.listing_proof_loop,
                 }
 
                 def __init__(self, target, args=(), **kwargs):
@@ -2073,7 +2077,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
 
             class FakeThread:
                 background_targets = {
-                    pull.heartbeat_loop, pull.storage_probe_loop, pull.update_loop, pull.inventory_loop,
+                    pull.heartbeat_loop, pull.storage_probe_loop, pull.update_loop, pull.inventory_loop, pull.listing_proof_loop,
                 }
                 def __init__(self, target, args=(), **_kwargs):
                     self.target, self.args, self.worker, self.alive = target, args, None, True
