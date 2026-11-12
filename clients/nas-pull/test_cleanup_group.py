@@ -56,7 +56,7 @@ class CleanupGroupTests(unittest.TestCase):
                 self.assertTrue({'lease_ms', 'open_ms', 'proof_ms', 'guard_ms', 'fence_ms', 'observe_journal_ms', 'caps_ms'} <= set(stage['stage_timings']))
             rows = {n: phase for n, phase, _ in pull.cleanup_journal(self.inventory)}
             self.assertTrue(all(rows[b['item_id']] == 'observe' for b in body['observations']))
-            return {'results': [fixture_ack(b, b['item_id'], status=200, action='delete_issued', delete=True,
+            return {'results': [fixture_ack(b, b['item_id'], status=200, delivery_keep_checked=True, action='delete_issued', delete=True,
                 plan_paused=False, expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
                 for b in body['observations']]}
         self.assertTrue(path.endswith('/result-batch'), path)
@@ -365,7 +365,7 @@ class CleanupGroupTests(unittest.TestCase):
                 self.assertEqual(len(body['observations']), 1)
                 observed.append(body['observations'][0]['item_id'])
                 return {'results': [fixture_ack(body['observations'][0], observed[-1], status=200,
-                    action='delete_issued', delete=True, plan_paused=False,
+                    delivery_keep_checked=True, action='delete_issued', delete=True, plan_paused=False,
                     expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())]}
             batches.append(body['receipts'])
             return {'results': [fixture_ack(b, b['item_id'], status=200, ok=True) for b in body['receipts']]}

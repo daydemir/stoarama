@@ -747,3 +747,31 @@ func (c *Client) EndpointSHA256() string {
 	sum := sha256.Sum256([]byte(strings.TrimRight(aws.ToString(c.s3.Options().BaseEndpoint), "/")))
 	return hex.EncodeToString(sum[:])
 }
+
+// ListRoots discovers the complete bucket partition, including keys stored at
+// its root. Callers can list the disjoint prefixes concurrently without making
+// assumptions about which historical or operator namespaces exist.
+func (c *Client) ListRoots(ctx context.Context) ([]string, []ObjectInfo, error) {
+	var token *string
+	var prefixes []string
+	var objects []ObjectInfo
+	for {
+		out, err := c.s3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(c.bucket), Delimiter: aws.String("/"), ContinuationToken: token})
+		if err != nil {
+			return nil, nil, fmt.Errorf("discover bucket roots: %w", err)
+		}
+		for _, p := range out.CommonPrefixes {
+			prefixes = append(prefixes, aws.ToString(p.Prefix))
+		}
+		for _, o := range out.Contents {
+			objects = append(objects, ObjectInfo{Key: aws.ToString(o.Key), ETag: cleanETag(aws.ToString(o.ETag)), SizeBytes: aws.ToInt64(o.Size), LastModified: aws.ToTime(o.LastModified)})
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			return prefixes, objects, nil
+		}
+		if out.NextContinuationToken == nil {
+			return nil, nil, errors.New("truncated root listing has no continuation token")
+		}
+		token = out.NextContinuationToken
+	}
+}

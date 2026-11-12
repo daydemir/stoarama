@@ -787,6 +787,9 @@ func (s *Server) stitchInclusionCurrent(ctx context.Context, q interface {
 	if err != nil {
 		return err
 	}
+	if err := deliveryNASUnheld(ctx, q, i); err != nil {
+		return err
+	}
 	for _, c := range items {
 		if c.SourceID == i.SourceID && c.SHA256 == i.SHA256 && c.SizeBytes == i.SizeBytes && c.StitchOutputSHA == i.StitchOutputSHA && c.StitchOutputPath == i.StitchOutputPath && c.StreamID == i.StreamID && c.RelativePath == i.RelativePath {
 			return nil

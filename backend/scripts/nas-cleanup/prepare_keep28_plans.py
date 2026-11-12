@@ -162,7 +162,7 @@ def stream_candidates(w, bucket, psql):
 )
 SELECT coalesce(json_agg(x ORDER BY x.stream_id,x.kind DESC,x.r2_purged,x.path),'[]') FROM (
  SELECT * FROM raw UNION ALL SELECT * FROM col
-) x WHERE NOT EXISTS (SELECT 1 FROM planned p WHERE p.kind=x.kind AND p.source_id=x.source_id)""", psql)
+) x WHERE NOT delivery_nas_held(x.kind,x.source_id,x.path,'',x.size_bytes) AND NOT EXISTS (SELECT 1 FROM planned p WHERE p.kind=x.kind AND p.source_id=x.source_id)""", psql)
 
 
 def batches(rows, prefix, max_items, max_bytes):

@@ -198,6 +198,22 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 				return nil, errors.New("private asset in public dataset")
 			}
 		}
+		keep := DeliveryKeepSnapshot{Objects: map[string]DeliveryKeepIdentity{}}
+		for _, o := range result.Assets {
+			if err := keep.add(o, "asset"); err != nil {
+				return nil, err
+			}
+		}
+		for _, o := range result.Files {
+			if err := keep.add(o, "live_file"); err != nil {
+				return nil, err
+			}
+		}
+		if s.pool != nil {
+			if err := RequireDeliveryKeep(ctx, s.pool, keep); err != nil {
+				return nil, err
+			}
+		}
 		if generation != "" {
 			s.publicPinnedDeliveryRegistry = &result
 		} else {

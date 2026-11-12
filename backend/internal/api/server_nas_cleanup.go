@@ -1121,6 +1121,9 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	if json.Unmarshal(raw, &item) != nil {
 		return cleanupObserveError(500, "invalid cleanup manifest")
 	}
+	if err := deliveryNASUnheld(ctx, tx, item); err != nil {
+		return cleanupObserveError(409, err.Error())
+	}
 	// A repeated dry-run observation is idempotent; a delete permit is never
 	// reissued after a lost response. Such a task requires operator reconciliation.
 	if state != "leased" {
@@ -1133,7 +1136,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		// non-deleting reconcile answer below.
 		if state == "delete_issued" && req.RequestID != "" && req.Outcome == "match" && permitUntil != nil && permitUntil.After(time.Now()) && nasSpaceAuditJSONEqual(oldOutcome, retryBody) &&
 			mode == "enabled" && until != nil && until.After(time.Now()) && s.stitchDeletionMaster(item) && (item.PermitReason == "" || s.stitchInclusionCurrent(ctx, tx, item) == nil) {
-			return cleanupObserveResult{status: 200, body: map[string]any{"action": "delete_issued", "delete": true, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": oldRecovery, "expires_at": permitUntil.UTC(), "plan_paused": false, "replayed": true}}
+			return cleanupObserveResult{status: 200, body: map[string]any{"delivery_keep_checked": true, "action": "delete_issued", "delete": true, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": oldRecovery, "expires_at": permitUntil.UTC(), "plan_paused": false, "replayed": true}}
 		}
 		if state != "delete_issued" && state != "deleted" && nasSpaceAuditJSONEqual(oldOutcome, retryBody) {
 			if mode == "dry_run" && state == "would_delete" && oldRecovery == "r2_present_unverified" {
@@ -1321,7 +1324,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	if err != nil {
 		return cleanupObserveError(500, "cleanup observation save failed")
 	}
-	return cleanupObserveResult{status: 200, write: true, body: map[string]any{"action": action, "delete": deletion, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": recovery, "expires_at": expires, "plan_paused": paused}}
+	return cleanupObserveResult{status: 200, write: true, body: map[string]any{"delivery_keep_checked": true, "action": action, "delete": deletion, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": recovery, "expires_at": expires, "plan_paused": paused}}
 }
 
 const nasCleanupRefusalProtocol = 1
@@ -1488,6 +1491,11 @@ func persistNASCleanupPlan(ctx context.Context, tx pgx.Tx, label string, items [
 	stage := "admission_fence"
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupAdmissionLock); err != nil {
 		return 0, "", &cleanupPersistFailure{stage: stage, err: err}
+	}
+	for _, item := range items {
+		if err := deliveryNASUnheld(ctx, tx, item); err != nil {
+			return 0, "", &cleanupPersistFailure{stage: "delivery_keep_hold", err: err}
+		}
 	}
 	// Same-label retries still return the immutable original plan. A different
 	// label must never admit an issued file, even from an old policy or retired

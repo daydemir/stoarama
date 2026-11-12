@@ -286,7 +286,7 @@ class StitchIntegrationTests(unittest.TestCase):
 
     def cleanup_task(self,result,index=0):
         proof=result['outputs'][0]['inputs'][index]
-        item=dict(self.clips[index],permit_reason='stitched_included',stitch_task_id=7,
+        item=dict(self.clips[index],object_key='test/stitch/%d' % index,permit_reason='stitched_included',stitch_task_id=7,
                   stitch_output_path=result['outputs'][0]['relative_path'],stitch_output_sha256=result['outputs'][0]['sha256'],
                   stitch_output_size_bytes=result['outputs'][0]['size_bytes'],frozen_identity=proof['raw_proof']['identity'],
                   frozen_sidecar_identity=proof['raw_proof']['sidecar']['identity'])
@@ -303,7 +303,7 @@ class StitchIntegrationTests(unittest.TestCase):
             if body['outcome']!='match':
                 return dict(ack,action='conflict',delete=False)
             self.assertEqual(timeout,pull.CLEANUP_EXECUTION_OBSERVE_SEC)
-            return dict(ack,action='delete_issued',delete=True,expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
+            return dict(ack,delivery_keep_checked=True,action='delete_issued',delete=True,expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
         return dict(ack,ok=True)
 
     def test_stitch_register_then_delete_only_fully_included(self):

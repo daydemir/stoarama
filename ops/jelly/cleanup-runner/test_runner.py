@@ -32,7 +32,7 @@ def fixture():
              master_deletion_enabled=False, approval_reason='', approved_until=(NOW+timedelta(hours=24)).isoformat())
     c = copy.deepcopy(item)
     c['sources'] = [dict(source_id=1, stream_id=3, bucket='stoarama', start_at=item['start_at'], end_at=item['end_at'])]
-    return p, dict(items=[c], protected_overlap=0)
+    return p, dict(items=[c], protected_overlap=0,delivery_keep_overlap=0)
 
 
 def refused(row):
@@ -79,6 +79,7 @@ class DecisionTests(unittest.TestCase):
             lambda p,c: p.update(policy_sha256='c'*64),
             lambda p,c: p.update(allow_nas_only=True),
             lambda p,c: c.update(protected_overlap=1),
+            lambda p,c: c.update(delivery_keep_overlap=1),
             lambda p,c: c.update(items=[]),
             lambda p,c: c['items'][0].update(sha256='c'*64),
             lambda p,c: c['items'][0].update(sources=[]),

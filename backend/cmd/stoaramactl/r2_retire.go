@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -45,7 +46,7 @@ import (
 
 const (
 	r2RetireAppName         = "stoarama-r2-retire"
-	r2RetireManifestVersion = 1
+	r2RetireManifestVersion = 2
 	r2RetireAdvisoryLockKey = int64(7343226011173)
 	r2RetireFinishTimeout   = 2 * time.Minute
 	r2RetireManifestName    = "manifest.jsonl"
@@ -54,25 +55,27 @@ const (
 )
 
 type r2RetireHeader struct {
-	Class           r2RetireClass     `json:"retirement_class,omitempty"`
-	R2ListingSHA256 string            `json:"r2_listing_sha256,omitempty"`
-	NASBacked       bool              `json:"nas_backed,omitempty"`
-	Phase           r2RetirePhase     `json:"phase,omitempty"`
-	Version         int               `json:"version"`
-	Tool            string            `json:"tool"`
-	Reason          string            `json:"reason"`
-	CreatedAt       time.Time         `json:"created_at"`
-	PolicySHA256    string            `json:"policy_sha256"`
-	PicksPath       string            `json:"picks_path"`
-	PicksSHA256     string            `json:"picks_sha256"`
-	PicksSavedAt    string            `json:"picks_saved_at"`
-	Choices         map[string]string `json:"choices"`
-	Bucket          string            `json:"bucket"`
-	AccountID       int64             `json:"account_id"`
-	ConnectionID    int64             `json:"connection_id"`
-	GraceSeconds    int64             `json:"grace_seconds"`
-	Items           int64             `json:"items"`
-	Bytes           int64             `json:"bytes"`
+	DeliveryKeepSHA256 string            `json:"delivery_keep_sha256"`
+	PreviewOnly        bool              `json:"preview_only,omitempty"`
+	Class              r2RetireClass     `json:"retirement_class,omitempty"`
+	R2ListingSHA256    string            `json:"r2_listing_sha256,omitempty"`
+	NASBacked          bool              `json:"nas_backed,omitempty"`
+	Phase              r2RetirePhase     `json:"phase,omitempty"`
+	Version            int               `json:"version"`
+	Tool               string            `json:"tool"`
+	Reason             string            `json:"reason"`
+	CreatedAt          time.Time         `json:"created_at"`
+	PolicySHA256       string            `json:"policy_sha256"`
+	PicksPath          string            `json:"picks_path"`
+	PicksSHA256        string            `json:"picks_sha256"`
+	PicksSavedAt       string            `json:"picks_saved_at"`
+	Choices            map[string]string `json:"choices"`
+	Bucket             string            `json:"bucket"`
+	AccountID          int64             `json:"account_id"`
+	ConnectionID       int64             `json:"connection_id"`
+	GraceSeconds       int64             `json:"grace_seconds"`
+	Items              int64             `json:"items"`
+	Bytes              int64             `json:"bytes"`
 }
 
 type r2RetireItem struct {
@@ -143,6 +146,8 @@ var _ r2RetireStore = (*r2.Client)(nil)
 // ---------------------------------------------------------------- plan
 
 type r2RetirePlanOptions struct {
+	Delivery            api.DeliveryKeepSnapshot
+	DeliveryPreview     bool
 	HeadGuardCompatible bool
 	Projection          *r2RetireProjection
 	LiveObjects         map[string]r2.ObjectInfo
@@ -158,6 +163,14 @@ type r2RetirePlanOptions struct {
 // and returns the summary and the sorted manifest items.
 func r2RetirePlanRun(ctx context.Context, q r2RetireQuerier, opts r2RetirePlanOptions, policySHA string, windows map[int64]api.Keep28Window) (r2RetirePlanSummary, []r2RetireItem, error) {
 	started := time.Now()
+	if len(opts.Delivery.Objects) == 0 {
+		return r2RetirePlanSummary{}, nil, errors.New("live delivery keep snapshot required")
+	}
+	if !opts.DeliveryPreview {
+		if err := api.RequireDeliveryKeep(ctx, q, opts.Delivery); err != nil {
+			return r2RetirePlanSummary{}, nil, err
+		}
+	}
 	var catalogETags map[string]string
 	if opts.HeadGuardCompatible {
 		if !opts.Scope.NASBacked {
@@ -176,7 +189,7 @@ func r2RetirePlanRun(ctx context.Context, q r2RetireQuerier, opts r2RetirePlanOp
 	if !opts.Scope.Class.valid() {
 		return r2RetirePlanSummary{}, nil, errors.New("unknown retirement class")
 	}
-	if opts.Scope.Class == r2RetireOwnerAccepted {
+	if opts.Scope.Class.owner() {
 		if err := sets.loadOwnerProtections(ctx, q, opts.Scope, windows, opts.Picks.Choices); err != nil {
 			return r2RetirePlanSummary{}, nil, err
 		}
@@ -192,6 +205,9 @@ func r2RetirePlanRun(ctx context.Context, q r2RetireQuerier, opts r2RetirePlanOp
 		return sum, nil, errors.New("hold-release preview class differs")
 	}
 	sum.Projection = opts.Projection
+	for key := range opts.Delivery.Objects {
+		sets.DeliveryKeys[r2RetireObjectKey{opts.Scope.Bucket, key}] = true
+	}
 	seenKeys := map[string]bool{}
 	var items []r2RetireItem
 	streams := map[int64]*r2RetireStreamStat{}
@@ -219,6 +235,9 @@ func r2RetirePlanRun(ctx context.Context, q r2RetireQuerier, opts r2RetirePlanOp
 				}
 			}
 			reason, choice, ok := r2RetireDecideForScope(c, opts.Scope, windows, opts.Picks.Choices)
+			if strings.HasPrefix(c.ObjectKey, "staging/") && !c.Facts.DeliveryHeld && !c.Facts.JoinedRef && !c.Facts.SharedKey {
+				reason, ok = "staging_owner_visibility", false
+			}
 			if opts.HeadGuardCompatible && ok {
 				if guardReason := r2RetireGuardCatalogReason(c, catalogETags); guardReason != "" {
 					reason, ok = guardReason, false
@@ -271,14 +290,23 @@ func r2RetirePlanRun(ctx context.Context, q r2RetireQuerier, opts r2RetirePlanOp
 			}
 		}
 	}
+	if opts.Scope.Class == r2RetireDeliveryOnly {
+		choices = r2RetireDeliveryChoices(opts.Picks.Choices, windows)
+	}
 	if sum.Phases != nil {
 		for key, o := range opts.LiveObjects {
 			if !seenKeys[key] {
-				sum.Phases.add(r2RetireCandidate{Bucket: opts.Scope.Bucket, ObjectKey: key, SizeBytes: o.SizeBytes, ETag: o.ETag}, "uncatalogued_or_purged", "", false)
+				reason := "uncatalogued_or_purged"
+				if _, held := opts.Delivery.Objects[key]; held {
+					reason = "delivery_keep_hold"
+				} else if strings.HasPrefix(key, "staging/") && !sets.ArtifactKeys[key] && sets.OutputKeyCount[key] == 0 {
+					reason = "staging_owner_visibility"
+				}
+				sum.Phases.add(r2RetireCandidate{Bucket: opts.Scope.Bucket, ObjectKey: key, SizeBytes: o.SizeBytes, ETag: o.ETag}, reason, "", false)
 			}
 		}
 	}
-	sum.Header = r2RetireHeader{Class: opts.Scope.Class, NASBacked: opts.Scope.NASBacked, Version: r2RetireManifestVersion, Tool: "stoaramactl r2-retire", Reason: r2RetireReason, CreatedAt: opts.Now.UTC(),
+	sum.Header = r2RetireHeader{DeliveryKeepSHA256: opts.Delivery.SHA256, PreviewOnly: opts.DeliveryPreview || opts.Scope.Class == r2RetireDeliveryOnly, Class: opts.Scope.Class, NASBacked: opts.Scope.NASBacked, Version: r2RetireManifestVersion, Tool: "stoaramactl r2-retire", Reason: r2RetireReason, CreatedAt: opts.Now.UTC(),
 		PolicySHA256: policySHA, PicksPath: opts.Picks.Path, PicksSHA256: opts.Picks.SHA256, PicksSavedAt: opts.Picks.SavedAt, Choices: choices,
 		Bucket: opts.Scope.Bucket, AccountID: opts.Scope.AccountID, ConnectionID: opts.Scope.ConnectionID, GraceSeconds: int64(opts.Scope.Grace / time.Second)}
 	for _, it := range items {
@@ -366,7 +394,13 @@ func writeR2RetireManifest(path string, h r2RetireHeader, items []r2RetireItem) 
 	}
 	defer os.Remove(tmp)
 	hash := sha256.New()
-	w := bufio.NewWriterSize(io.MultiWriter(f, hash), 1<<20)
+	var sink io.Writer = io.MultiWriter(f, hash)
+	var compressed *gzip.Writer
+	if strings.HasSuffix(path, ".gz") {
+		compressed = gzip.NewWriter(sink)
+		sink = compressed
+	}
+	w := bufio.NewWriterSize(sink, 1<<20)
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(map[string]any{"header": h}); err != nil {
@@ -382,6 +416,12 @@ func writeR2RetireManifest(path string, h r2RetireHeader, items []r2RetireItem) 
 	if err := w.Flush(); err != nil {
 		f.Close()
 		return "", err
+	}
+	if compressed != nil {
+		if err := compressed.Close(); err != nil {
+			f.Close()
+			return "", err
+		}
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
@@ -415,7 +455,7 @@ func readR2RetireManifest(path string) (r2RetireHeader, []r2RetireItem, string, 
 		return r2RetireHeader{}, nil, digest, errors.New("manifest has no header line")
 	}
 	h := *first.Header
-	if !h.Class.valid() || (h.Class != "" && !h.NASBacked) || h.Version != r2RetireManifestVersion || h.Reason != r2RetireReason || (h.Phase != "" && h.Phase != r2RetireNow) {
+	if !h.Class.valid() || (h.Class != "" && !h.NASBacked) || h.Version != r2RetireManifestVersion || !r2RetireLowerHex64(h.DeliveryKeepSHA256) || h.PreviewOnly || h.Class == r2RetireDeliveryOnly || h.Reason != r2RetireReason || (h.Phase != "" && h.Phase != r2RetireNow) {
 		return h, nil, digest, fmt.Errorf("unsupported manifest version %d / reason %q", h.Version, h.Reason)
 	}
 	items := make([]r2RetireItem, 0, len(lines)-1)
@@ -429,7 +469,7 @@ func readR2RetireManifest(path string) (r2RetireHeader, []r2RetireItem, string, 
 			return h, nil, digest, fmt.Errorf("manifest line %d: %w", n+2, err)
 		}
 		src := it.Kind + ":" + strconv.FormatInt(it.SourceID, 10)
-		if (it.Kind != "raw" && it.Kind != "collated") || it.SourceID <= 0 || (h.Class == r2RetireOwnerAccepted && it.Reason != string(h.Class)) || (h.Class == "" && it.Reason != r2RetireReason && !(h.NASBacked && it.Reason == r2RetireNASReason)) || (h.NASBacked && it.ETag == "") || seenSource[src] || seenKey[it.ObjectKey] ||
+		if (it.Kind != "raw" && it.Kind != "collated") || it.SourceID <= 0 || (h.Class == r2RetireOwnerAccepted && it.Reason != string(h.Class)) || ((h.Class == "" || h.Class == r2RetireDeliveryOnly) && it.Reason != r2RetireReason && !(h.NASBacked && it.Reason == r2RetireNASReason)) || (h.NASBacked && it.ETag == "") || seenSource[src] || seenKey[it.ObjectKey] ||
 			it.Choice != h.Choices[strconv.FormatInt(it.StreamID, 10)] || it.Bucket != h.Bucket || it.SizeBytes <= 0 {
 			return h, nil, digest, fmt.Errorf("manifest line %d: invalid or duplicate item", n+2)
 		}
@@ -547,6 +587,7 @@ func (l *r2RetireLedger) Close() error { return l.f.Close() }
 // ---------------------------------------------------------------- apply
 
 type r2RetireApplyOptions struct {
+	Delivery                       api.DeliveryKeepSnapshot
 	AcceptOperatorCredentialRisk   string
 	ProviderUnconditionalHeadGuard bool
 	MinObjectAge                   time.Duration
@@ -647,6 +688,17 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 	if err != nil {
 		return sum, err
 	}
+	if opts.Delivery.SHA256 != h.DeliveryKeepSHA256 {
+		return sum, errors.New("delivery policy changed or unchecked; re-plan")
+	}
+	if err := api.RequireDeliveryKeep(ctx, pool, opts.Delivery); err != nil {
+		return sum, err
+	}
+	for _, it := range items {
+		if err := r2RetireDeliveryHeld(ctx, pool, it.Bucket, it.ObjectKey); err != nil {
+			return sum, err
+		}
+	}
 	sum.ManifestItems = int64(len(items))
 	if opts.ProviderUnconditionalHeadGuard {
 		for _, it := range items {
@@ -682,7 +734,7 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 		}
 	}
 	switch {
-	case h.Class == r2RetireOwnerAccepted && opts.Budget24h > 5e12:
+	case h.Class.owner() && opts.Budget24h > 5e12:
 		return sum, errors.New("owner-accepted retirement cannot exceed 5 TB/24h")
 	case h.NASBacked && (h.ConnectionID != 13 || h.AccountID != 47):
 		return sum, errors.New("NAS-backed retirement requires account 47 connection 13")
@@ -713,7 +765,12 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 			return sum, r2RetireAnomalyf("stream %d has no keep window", it.StreamID)
 		}
 		p, has := picks.Choices[it.StreamID]
-		if got := r2RetireEffectiveChoice(p, has, w); got != it.Choice {
+		if got := func() string {
+			if h.Class == r2RetireDeliveryOnly {
+				return r2RetireDeliveryChoices(picks.Choices, windows)[fmt.Sprint(it.StreamID)]
+			}
+			return r2RetireEffectiveChoice(p, has, w)
+		}(); got != it.Choice {
 			return sum, r2RetireAnomalyf("stream %d pick changed from %q to %q since the plan; re-plan", it.StreamID, it.Choice, got)
 		}
 	}
@@ -778,11 +835,16 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 		}
 	}
 	a := &r2RetireApplier{pool: pool, store: store, opts: opts, header: h, digest: digest, picks: picks, windows: windows, policySH: policySHA, ledger: ledger,
-		scope: r2RetireScope{Class: h.Class, OwnerPolicy: r2RetireOwnerPolicy(windows, picks.Choices), AccountID: h.AccountID, ConnectionID: h.ConnectionID, Bucket: h.Bucket, Grace: time.Duration(h.GraceSeconds) * time.Second, HasRetirements: true, NASBacked: h.NASBacked}}
+		scope: r2RetireScope{Class: h.Class, OwnerPolicy: func() []byte {
+			if h.Class == r2RetireDeliveryOnly {
+				return r2RetireDeliveryPolicy(windows, picks.Choices)
+			}
+			return r2RetireOwnerPolicy(windows, picks.Choices)
+		}(), AccountID: h.AccountID, ConnectionID: h.ConnectionID, Bucket: h.Bucket, Grace: time.Duration(h.GraceSeconds) * time.Second, HasRetirements: true, NASBacked: h.NASBacked}}
 	if a.sets, err = loadR2RetireSets(ctx, pool, digest, h.NASBacked, h.Class); err != nil {
 		return sum, err
 	}
-	if h.Class == r2RetireOwnerAccepted && !a.sets.OwnerSchema {
+	if h.Class.owner() && !a.sets.OwnerSchema {
 		return sum, errors.New("migration 0186 is required before owner-accepted apply")
 	}
 	if a.fp, err = r2RetireFingerprint(ctx, pool); err != nil {
@@ -912,12 +974,18 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 			return "", "", err
 		}
 	}
-	if a.scope.NASBacked {
+	{
 		// Admission takes this fence before catalog locks. Public fencing also
 		// excludes new activation/references while this exact R2 delete finishes.
 		if err := api.LockNASCleanupR2Retirement(ctx, tx); err != nil {
 			return "", "", err
 		}
+	}
+	if err := r2RetireDeliveryHeld(ctx, tx, it.Bucket, it.ObjectKey); err != nil {
+		return "", "", err
+	}
+	if err := r2RetireDeliveryRegistryUnchanged(ctx, a.store, a.opts.Delivery); err != nil {
+		return "", "", err
 	}
 	if ids, err := r2RetireEnabledPlans(ctx, tx); err != nil {
 		return "", "", err
@@ -1000,6 +1068,12 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 	case head.SHA256Metadata != "" && !strings.EqualFold(head.SHA256Metadata, it.SHA256):
 		return "", "", r2RetireAnomalyf("R2 sha256 metadata differs from the catalog")
 	}
+	if err := r2RetireDeliveryHeld(ctx, tx, it.Bucket, it.ObjectKey); err != nil {
+		return "", "", err
+	}
+	if err := r2RetireDeliveryRegistryUnchanged(ctx, a.store, a.opts.Delivery); err != nil {
+		return "", "", err
+	}
 	if a.scope.NASBacked {
 		// HEAD may wait on the network; an owner pick changed during that
 		// interval revokes this item before any intent or lifecycle write.
@@ -1012,7 +1086,7 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 		}
 	}
 
-	if a.scope.Class == r2RetireOwnerAccepted {
+	if a.scope.Class.owner() {
 		if err := a.reserve(ctx, it); err != nil {
 			return "", "", err
 		}
@@ -1216,7 +1290,9 @@ func runR2Retire(ctx context.Context, cfg config.Config, args []string) {
 
 func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usage, policySHA string, windows map[int64]api.Keep28Window) {
 	fs := flag.NewFlagSet("r2-retire plan", flag.ContinueOnError)
-	class := fs.String("class", "", "explicit retirement class: owner_accepted_outside_window")
+	class := fs.String("class", "", "retirement class: owner_accepted_outside_window or owner_r2_delivery_only")
+	deliveryPreview := fs.String("delivery-keep-preview", "", "exact keep JSONL for NONEXECUTABLE pre-migration preview")
+	deliveryPreviewSHA := fs.String("expected-delivery-keep-sha256", "", "digest of delivery keep preview")
 	picksPath := fs.String("picks", "", "owner's R2 picks (r2-picks.json)")
 	releasePreview := fs.String("hold-release-preview", "", "dry-run hold-release manifest for non-executable projections")
 	releasePreviewSHA := fs.String("expected-hold-release-sha256", "", "hold-release preview digest")
@@ -1237,7 +1313,7 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 	if !retirementClass.valid() {
 		log.Fatal("unknown retirement class")
 	}
-	if retirementClass == r2RetireOwnerAccepted || *headGuardCompatible {
+	if retirementClass.owner() || *headGuardCompatible {
 		*nasBacked = true
 	}
 	if *grace < 24*time.Hour || *pageSize < 1 || *pageSize > 20000 || *sample < 0 {
@@ -1252,6 +1328,11 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 	}
 	if err := cfg.ValidateR2(); err != nil {
 		log.Fatalf("r2-retire plan: R2 config required: %v", err)
+	}
+	if retirementClass == r2RetireDeliveryOnly && *listingPath != "" {
+		if err := r2RetireRequireWholeListing(*listingPath); err != nil {
+			log.Fatal(err)
+		}
 	}
 	if (*listingPath != "" || *listingSHA != "") && !*nasBacked {
 		log.Fatal("--r2-listing requires --nas-backed")
@@ -1293,16 +1374,42 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 	}
 	opts := r2RetirePlanOptions{HeadGuardCompatible: *headGuardCompatible, Picks: picks, PageSize: *pageSize, Now: time.Now(),
 		Scope: r2RetireScope{Class: retirementClass, AccountID: accountID, ConnectionID: conn, Bucket: cfg.R2Bucket, Grace: *grace, HasRetirements: hasRet, NASBacked: *nasBacked}}
+	opts.Delivery, err = api.ReadPublicDeliveryKeep(ctx, mustArchiveR2Client(ctx, cfg, pool))
+	if err != nil {
+		log.Fatal(err)
+	}
+	if *deliveryPreview != "" {
+		if err := r2RetireDeliveryPreview(*deliveryPreview, *deliveryPreviewSHA, opts.Delivery); err != nil {
+			log.Fatal(err)
+		}
+		opts.DeliveryPreview = true
+	}
 	if *nasBacked {
 		log.Print("r2-retire: listing catalog folder/version prefixes in R2 (read-only, 8 workers)")
 		if *listingPath != "" {
 			opts.LiveObjects, err = readR2RetireListing(*listingPath, *listingSHA, cfg.R2Bucket)
 		} else {
 			prefixes, prefixErr := r2RetirePrefixes(ctx, pool, accountID, cfg.R2Bucket)
+
 			if prefixErr != nil {
 				log.Fatal(prefixErr)
 			}
-			opts.LiveObjects, err = r2RetireLiveObjects(ctx, mustArchiveR2Client(ctx, cfg, pool), prefixes)
+			store := mustArchiveR2Client(ctx, cfg, pool)
+			var rootObjects []r2.ObjectInfo
+			if retirementClass == r2RetireDeliveryOnly {
+				prefixes, rootObjects, err = store.ListRoots(ctx)
+				if err != nil {
+					log.Fatal(err)
+				}
+			}
+			opts.LiveObjects, err = r2RetireLiveObjects(ctx, store, prefixes)
+			for _, o := range rootObjects {
+				opts.LiveObjects[o.Key] = o
+			}
+			if retirementClass == r2RetireDeliveryOnly {
+				prefixes = []string{""}
+			}
+
 			if err == nil {
 				*listingSHA, err = writeR2RetireListing(filepath.Join(*out, "r2-listing.jsonl"), cfg.R2Bucket, prefixes, opts.LiveObjects)
 			}
@@ -1442,6 +1549,10 @@ func runR2RetireApply(ctx context.Context, cfg config.Config, args []string, usa
 	}
 	defer pool.Close()
 	store := mustArchiveR2Client(ctx, cfg, pool)
+	opts.Delivery, err = api.ReadPublicDeliveryKeep(ctx, mustArchiveR2Client(ctx, cfg, pool))
+	if err != nil {
+		log.Fatal(err)
+	}
 	sum, err := r2RetireApply(ctx, pool, store, opts, policySHA, windows)
 	if *asJSON {
 		b, _ := json.MarshalIndent(sum, "", "  ")
