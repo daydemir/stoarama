@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -158,10 +159,13 @@ func storeNASListing(r *http.Request, tx pgx.Tx, cid int64, req nasListingReques
 		return errors.New("folder is complete, empty page or page gap")
 	}
 	for _, f := range req.Files {
-		if _, err := tx.Exec(ctx, `INSERT INTO nas_listing_files(connection_id,generation,folder,relative_path,size_bytes,mtime_ns,inode,device,ctime_ns) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, cid, req.Generation, req.Folder, f.Path, f.Size, f.MtimeNS, f.Inode, f.Device, f.CtimeNS); err != nil {
-			return err
-		}
 		bytes += f.Size
+	}
+	// One bounded insert, not one API-to-database round trip per file.
+	if _, err := tx.Exec(ctx, `INSERT INTO nas_listing_files(connection_id,generation,folder,relative_path,size_bytes,mtime_ns,inode,device,ctime_ns)
+ SELECT $1,$2,$3,f.path,f.size,f.mtime_ns,f.inode,f.device,f.ctime_ns
+ FROM jsonb_to_recordset($4::jsonb) AS f(path text,size bigint,mtime_ns bigint,inode bigint,device bigint,ctime_ns bigint)`, cid, req.Generation, req.Folder, raw); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO nas_listing_pages VALUES($1,$2,$3,$4,$5)`, cid, req.Generation, req.Folder, req.Page, digest); err != nil {
 		return err
@@ -169,6 +173,13 @@ func storeNASListing(r *http.Request, tx pgx.Tx, cid int64, req nasListingReques
 	_, err := tx.Exec(ctx, `UPDATE nas_listing_folders SET next_page=next_page+1,file_count=file_count+$4,total_bytes=$5 WHERE connection_id=$1 AND generation=$2 AND folder=$3`, cid, req.Generation, req.Folder, len(req.Files), bytes)
 	return err
 }
+
+// Publishers take the public fence before connection/catalog row locks.
+func lockNASRetirementPublisher(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, nasCleanupPublicFence)
+	return err
+}
+
 func (s *Server) handleAccountConnectionListing(w http.ResponseWriter, r *http.Request) {
 	cid, ok := s.nasRestoreConnection(r.Context(), w, r)
 	if !ok {

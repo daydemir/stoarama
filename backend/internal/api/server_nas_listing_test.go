@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
 )
 
 func TestNASListingCompleteBoundedAndResumable(t *testing.T) {
@@ -60,6 +61,56 @@ func TestNASListingCompleteBoundedAndResumable(t *testing.T) {
 	}
 	if send("complete", "", 0, nil, 0, 0) != 200 || send("complete", "", 0, nil, 0, 0) != 200 {
 		t.Fatal("completion/retry failed")
+	}
+	// A publisher waiting on the public fence must not already hold the
+	// inventory row that retirement is about to lock (the former inversion).
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files VALUES(1)`); err != nil {
+		t.Fatal(err)
+	}
+	retire, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer retire.Rollback(ctx)
+	if err := LockNASCleanupR2Retirement(ctx, retire); err != nil {
+		t.Fatal(err)
+	}
+	publish, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publish.Rollback(ctx)
+	var publisher int
+	if err := publish.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&publisher); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := publish.Exec(ctx, `UPDATE nas_inventory_files SET id=id WHERE id=1`); done <- err }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var waiting bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND NOT granted)`, publisher).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("publisher did not reach public fence")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := retire.Exec(ctx, `SET LOCAL lock_timeout='100ms';SELECT id FROM nas_inventory_files WHERE id=1 FOR UPDATE`); err != nil {
+		t.Fatal("publisher inverted row/public-fence lock order", err)
+	}
+	if err := retire.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := publish.Rollback(ctx); err != nil {
+		t.Fatal(err)
 	}
 	var enabled bool
 	if err := pool.QueryRow(ctx, `SELECT nas_listing_enabled FROM connections WHERE id=13`).Scan(&enabled); err != nil || enabled {

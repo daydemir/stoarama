@@ -32,27 +32,25 @@ CREATE TABLE nas_listing_files (
 );
 CREATE INDEX nas_listing_path ON nas_listing_files(connection_id,relative_path,generation);
 -- Evidence and writer-watermark publication share retirement's final fence.
+-- Statement triggers acquire it BEFORE row locks, matching retirement order.
 CREATE FUNCTION fence_nas_listing_evidence() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
- PERFORM pg_advisory_xact_lock_shared(7343226011101);RETURN NEW;
+ PERFORM pg_advisory_xact_lock_shared(7343226011101);RETURN NULL;
 END $$;
 CREATE TRIGGER nas_listing_evidence_fence BEFORE INSERT OR UPDATE ON nas_listing_generations
- FOR EACH ROW EXECUTE FUNCTION fence_nas_listing_evidence();
+ FOR EACH STATEMENT EXECUTE FUNCTION fence_nas_listing_evidence();
 CREATE TRIGGER nas_listing_presence_fence BEFORE INSERT ON nas_listing_files
- FOR EACH ROW EXECUTE FUNCTION fence_nas_listing_evidence();
+ FOR EACH STATEMENT EXECUTE FUNCTION fence_nas_listing_evidence();
 CREATE TRIGGER nas_inventory_retire_fence BEFORE INSERT OR UPDATE ON nas_inventory_files
- FOR EACH ROW EXECUTE FUNCTION fence_nas_listing_evidence();
+ FOR EACH STATEMENT EXECUTE FUNCTION fence_nas_listing_evidence();
 CREATE TRIGGER nas_unmatched_retire_fence BEFORE INSERT OR UPDATE ON nas_inventory_unmatched_files
- FOR EACH ROW EXECUTE FUNCTION fence_nas_listing_evidence();
+ FOR EACH STATEMENT EXECUTE FUNCTION fence_nas_listing_evidence();
 CREATE TRIGGER nas_collated_ack_retire_fence BEFORE INSERT ON recording_collation_output_acks
- FOR EACH ROW EXECUTE FUNCTION fence_nas_listing_evidence();
-CREATE FUNCTION fence_nas_listing_cursor() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
- IF NEW.nas_listing_cursor_at IS DISTINCT FROM OLD.nas_listing_cursor_at THEN
- PERFORM pg_advisory_xact_lock_shared(7343226011101);END IF;RETURN NEW;
-END $$;
-CREATE TRIGGER nas_listing_cursor_fence BEFORE UPDATE ON connections
- FOR EACH ROW EXECUTE FUNCTION fence_nas_listing_cursor();
--- A new/reused catalog path is a possible future write, even before ACK.
-CREATE TRIGGER nas_listing_raw_writer_fence BEFORE INSERT OR UPDATE OF display_path,released_at ON recording_clips
- FOR EACH ROW EXECUTE FUNCTION fence_nas_listing_evidence();
-CREATE TRIGGER nas_listing_collated_writer_fence BEFORE INSERT OR UPDATE ON recording_collation_outputs
- FOR EACH ROW EXECUTE FUNCTION fence_nas_listing_evidence();
+ FOR EACH STATEMENT EXECUTE FUNCTION fence_nas_listing_evidence();
+CREATE TRIGGER nas_listing_cursor_fence BEFORE UPDATE OF nas_listing_cursor_at ON connections
+ FOR EACH STATEMENT EXECUTE FUNCTION fence_nas_listing_evidence();
+-- New catalog paths are possible future writes, even before ACK. Existing
+-- source identity updates already serialize on retirement's catalog row lock.
+CREATE TRIGGER nas_listing_raw_writer_fence BEFORE INSERT ON recording_clips
+ FOR EACH STATEMENT EXECUTE FUNCTION fence_nas_listing_evidence();
+CREATE TRIGGER nas_listing_collated_writer_fence BEFORE INSERT ON recording_collation_outputs
+ FOR EACH STATEMENT EXECUTE FUNCTION fence_nas_listing_evidence();
