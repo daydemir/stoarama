@@ -95,9 +95,10 @@ type cleanupDeadlineClientResult struct {
 	DrainTimeouts int      `json:"drain_timeouts"`
 	Errors        []string `json:"errors"`
 	Outcomes      []struct {
-		ObserveMS   int64 `json:"observe_elapsed_ms"`
-		ExecutionMS int64 `json:"execution_elapsed_ms"`
-		Unlink      bool  `json:"unlink_attempted"`
+		ObserveMS    int64  `json:"observe_elapsed_ms"`
+		ExecutionMS  int64  `json:"execution_elapsed_ms"`
+		Unlink       bool   `json:"unlink_attempted"`
+		JournalPhase string `json:"journal_phase"`
 	} `json:"execution_outcomes"`
 }
 

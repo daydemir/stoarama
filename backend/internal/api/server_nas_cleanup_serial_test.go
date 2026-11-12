@@ -37,27 +37,38 @@ func (t *cleanupSlowPolicyTracer) TraceQueryStart(ctx context.Context, _ *pgx.Co
 func (*cleanupSlowPolicyTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 func TestNASCleanupSixteenContendingWorkersSlowPolicyClientServer(t *testing.T) {
-	testNASCleanupSerialClientServer(t, 0)
+	testNASCleanupSerialClientServer(t, 0, false)
 }
 
 func TestNASCleanupDedicatedLaneWithSlowJoinedDeliveryClientServer(t *testing.T) {
-	testNASCleanupSerialClientServer(t, 5)
+	testNASCleanupSerialClientServer(t, 5, false)
 }
 
 // Production plan 1394 stalled after its first execution window. Keep the
 // real 15 s drain and 2 s retry; long joined writers require raw credits while
 // the raw listing initially returns 502s. Every file must still be deleted.
 func TestNASCleanupDrainTimeoutRecoveryClientServer(t *testing.T) {
-	testNASCleanupSerialClientServer(t, 35)
+	testNASCleanupSerialClientServer(t, 35, false)
 }
 
-func testNASCleanupSerialClientServer(t *testing.T, joinedSeconds int) {
+// Plan 1404: a singleton execution_batch lease must survive the real 15 s
+// writer drain timeout by returning its unissued work, then finishing on retry.
+func TestNASCleanupGroupDrainTimeoutRecoveryClientServer(t *testing.T) {
+	testNASCleanupSerialClientServer(t, 35, true)
+}
+
+func testNASCleanupSerialClientServer(t *testing.T, joinedSeconds int, grouped bool) {
 	slowJoined := joinedSeconds > 0
 	drainRecovery := joinedSeconds > 15
 	f := newCleanupFixture(t, 24)
 	version := nasCleanupExecutionClientVersion
+	count := 16
 	if slowJoined {
 		version = nasCleanupFenceProgressClientVersion
+		if grouped {
+			version = nasCleanupSerialGroupClientVersion
+			count = 1
+		}
 		if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, version); err != nil {
 			t.Fatal(err)
 		}
@@ -68,7 +79,7 @@ func testNASCleanupSerialClientServer(t *testing.T, joinedSeconds int) {
 	}
 	script, _ := filepath.Abs("../../../clients/nas-pull/bench_cleanup.py")
 	root, state := filepath.Join(t.TempDir(), "nas"), filepath.Join(t.TempDir(), "state")
-	raw, err := exec.Command(python, script, "prepare", "--root", root, "--count", "16", "--size", "4096", "--first-clip", "100000").CombinedOutput()
+	raw, err := exec.Command(python, script, "prepare", "--root", root, "--count", fmt.Sprint(count), "--size", "4096", "--first-clip", "100000").CombinedOutput()
 	if err != nil {
 		t.Fatalf("prepare: %v %s", err, raw)
 	}
@@ -83,7 +94,7 @@ func testNASCleanupSerialClientServer(t *testing.T, joinedSeconds int) {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			key := int64(5)
 			r = r.WithContext(context.WithValue(r.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: 47, APIKeyID: &key}))
-			if f.s.cfg.NASCleanupDeletionEnabled && strings.HasSuffix(r.URL.Path, "/observe") {
+			if f.s.cfg.NASCleanupDeletionEnabled && (strings.HasSuffix(r.URL.Path, "/observe") || strings.HasSuffix(r.URL.Path, "/observe-batch")) {
 				n := active.Add(1)
 				defer active.Add(-1)
 				for old := peak.Load(); n > old; old = peak.Load() {
@@ -159,25 +170,33 @@ func testNASCleanupSerialClientServer(t *testing.T, joinedSeconds int) {
 	defer slowPool.Close()
 	f.s.pool = slowPool
 	result := run(!slowJoined)
-	if len(result.Errors) != 0 || result.Deleted != 16 || result.Unlinks != 32 || len(result.Outcomes) != 16 {
+	if len(result.Errors) != 0 || result.Deleted != count || result.Unlinks != 2*count || (!grouped && len(result.Outcomes) != count) {
 		t.Fatalf("execution: %+v", result)
 	}
+	returnedOutcomes := 0
 	for _, o := range result.Outcomes {
+		if grouped && o.JournalPhase == "returned" && !o.Unlink {
+			returnedOutcomes++
+			continue
+		}
 		if !o.Unlink || o.ObserveMS >= 15000 {
 			t.Fatalf("late/unverified result: %+v", o)
 		}
 	}
-	if tracer.calls.Load() != 16 || peak.Load() != 1 {
+	if grouped && (returnedOutcomes < 1 || len(result.Outcomes) != count+returnedOutcomes) {
+		t.Fatalf("missing durable return diagnostics: %+v", result)
+	}
+	if tracer.calls.Load() != int32(count) || peak.Load() != 1 {
 		t.Fatalf("policy calls=%d execution peak=%d", tracer.calls.Load(), peak.Load())
 	}
 	var deleted, unverified, slowPolicy int
 	if err = f.pool.QueryRow(f.ctx, `SELECT count(*) FILTER(WHERE state='deleted'),count(*) FILTER(WHERE state='unverified'),count(*) FILTER(WHERE (stage_timings->>'policy_ms')::int>=1000) FROM nas_cleanup_items WHERE plan_id=$1`, id).Scan(&deleted, &unverified, &slowPolicy); err != nil {
 		t.Fatal(err)
 	}
-	if deleted != 16 || unverified != 0 || slowPolicy != 16 {
+	if deleted != count || unverified != 0 || slowPolicy != count {
 		t.Fatalf("deleted=%d unverified=%d slow-policy=%d", deleted, unverified, slowPolicy)
 	}
-	rate := 60 * 16 / result.Seconds
+	rate := 60 * float64(count) / result.Seconds
 	if slowJoined && ((!drainRecovery && rate < 15) || result.JoinedCalls < 2 || result.JoinedCalls > 4 || result.RawCalls == 0) {
 		t.Fatalf("slow joined work interleaved between executions: rate=%.1f/min joined_calls=%d result=%+v", rate, result.JoinedCalls, result)
 	}
@@ -193,5 +212,5 @@ func testNASCleanupSerialClientServer(t *testing.T, joinedSeconds int) {
 			t.Fatalf("no sustained recovery: returned=%d busy=%d list_calls=%d result=%+v", returned, busy, listCalls.Load(), result)
 		}
 	}
-	t.Logf("16 files, slow joined=%t, 1.1 s policy each: %.3f s, %.1f files/min, joined calls=%d, raw calls=%d, peak requests=%d", slowJoined, result.Seconds, rate, result.JoinedCalls, result.RawCalls, peak.Load())
+	t.Logf("%d files, slow joined=%t, 1.1 s policy each: %.3f s, %.1f files/min, joined calls=%d, raw calls=%d, peak requests=%d", count, slowJoined, result.Seconds, rate, result.JoinedCalls, result.RawCalls, peak.Load())
 }
