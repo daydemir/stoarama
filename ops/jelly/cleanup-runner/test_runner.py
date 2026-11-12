@@ -1252,6 +1252,51 @@ class ReadRetryTests(unittest.TestCase):
         job.prepare = SimpleNamespace(pg_env=lambda: {'PGOPTIONS': '-c default_transaction_read_only=on'})
         return job
 
+    def test_plan_report_get_retries_without_latching(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = self.job(root)
+            plan, _ = fixture()
+            with patch.dict(os.environ, SERVICE_TOKEN='fixture'), \
+                    patch.object(r, 'request', side_effect=[r.ReadFailure('HTTP request failed (GET)'), plan]) as request, \
+                    patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
+                self.assertEqual(job.plan(42), plan)
+            self.assertEqual(request.call_count, 2)
+            sleep.assert_called_once_with(5)
+            self.assertIn('plan report GET', (Path(root) / 'runner.jsonl').read_text())
+            self.assertIsNone(job.status['last_error'])
+
+    def test_live_deploy_get_retries_without_latching(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = self.job(root)
+            live = dict(id='live', status='live', commit={'id': 'd' * 40})
+            with patch.object(r, 'render_key', return_value='fixture'), \
+                    patch.object(r, 'request', side_effect=[r.ReadFailure('HTTP request failed (GET)'), [{'deploy': live}]]) as request, \
+                    patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
+                self.assertEqual(job.live(), live)
+            self.assertEqual(request.call_count, 2)
+            sleep.assert_called_once_with(5)
+            self.assertIn('live deploy list GET', (Path(root) / 'runner.jsonl').read_text())
+            self.assertIsNone(job.status['last_error'])
+
+    def check_render_get_retry(self, path, value, step):
+        with tempfile.TemporaryDirectory() as root:
+            job = self.job(root)
+            with patch.object(r, 'render_key', return_value='fixture'), \
+                    patch.object(r, 'request', side_effect=[r.ReadFailure('HTTP request failed (GET)'), value]) as request, \
+                    patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
+                self.assertEqual(job.render('GET', path), value)
+            self.assertEqual(request.call_count, 2)
+            sleep.assert_called_once_with(5)
+            self.assertIn(step, (Path(root) / 'runner.jsonl').read_text())
+            self.assertIsNone(job.status['last_error'])
+
+    def test_render_env_get_retries_without_latching(self):
+        self.check_render_get_retry('/env-vars/NAS_CLEANUP_DELETION_ENABLED',
+                                    {'value': 'true'}, 'Render env GET')
+
+    def test_render_deploy_status_get_retries_without_latching(self):
+        self.check_render_get_retry('/deploys/fixture', {'status': 'live'}, 'Render deploy status GET')
+
     def test_query_retries_timeout_connection_and_serialization_but_not_sql_errors(self):
         for code in ('57014', '08006', '53300', '57P03', '40001', '40P01', '55P03', '42601'):
             with self.subTest(code=code), tempfile.TemporaryDirectory() as root:
