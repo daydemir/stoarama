@@ -542,8 +542,6 @@ func (l *r2RetireLedger) Close() error { return l.f.Close() }
 type r2RetireApplyOptions struct {
 	ProviderUnconditionalHeadGuard bool
 	MinObjectAge                   time.Duration
-	WriterProofPath                string
-	WriterProofSHA256              string
 	DeleteProofPath                string
 	DeleteProofSHA256              string
 	ManifestPath                   string
@@ -656,7 +654,15 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 		if _, ok := store.(r2RetireSingleDeleteStore); !ok {
 			return sum, errors.New("HEAD-guard mode requires a single-attempt DELETE transport")
 		}
-		if err := checkR2RetireWriterProof(opts, h, digest, store.EndpointSHA256(), ""); err != nil {
+		for _, it := range items {
+			if err := r2RetireCheckUngatedPrefix(it.ObjectKey); err != nil {
+				return sum, err
+			}
+		}
+		if err := r2RetireCheckWriterFence(ctx, pool, h.Bucket, store.EndpointSHA256()); err != nil {
+			return sum, err
+		}
+		if err := r2RetireCheckMultipart(ctx, store); err != nil {
 			return sum, err
 		}
 	}
@@ -735,6 +741,15 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 			return sum, errors.New("migration 0182 is required before NAS-backed apply")
 		}
 	}
+	if opts.ProviderUnconditionalHeadGuard {
+		if err := r2RetireCheckWriterFence(ctx, pool, h.Bucket, store.EndpointSHA256()); err != nil {
+			return sum, err
+		}
+		if err := r2RetireCheckMultipart(ctx, store); err != nil {
+			return sum, err
+		}
+	}
+
 	ledger, err := openR2RetireLedger(opts.LedgerPath)
 	if err != nil {
 		return sum, err
@@ -775,7 +790,7 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 		return sum, err
 	}
 	if err := ledger.write(r2RetireLedgerLine{Event: "run_start", ManifestSHA256: digest,
-		Detail: fmt.Sprintf("items=%d max_bytes=%d budget_24h=%d used_24h=%d head_guard=%t residual_toctou=%t min_object_age=%s delete_proof_sha256=%s writer_proof_sha256=%s", len(items), opts.MaxBytes, opts.Budget24h, sum.Used24hBefore, opts.ProviderUnconditionalHeadGuard, opts.ProviderUnconditionalHeadGuard, opts.MinObjectAge, opts.DeleteProofSHA256, opts.WriterProofSHA256)}); err != nil {
+		Detail: fmt.Sprintf("items=%d max_bytes=%d budget_24h=%d used_24h=%d head_guard=%t residual_toctou=%t min_object_age=%s delete_proof_sha256=%s", len(items), opts.MaxBytes, opts.Budget24h, sum.Used24hBefore, opts.ProviderUnconditionalHeadGuard, opts.ProviderUnconditionalHeadGuard, opts.MinObjectAge, opts.DeleteProofSHA256)}); err != nil {
 		return sum, err
 	}
 	defer func() {
@@ -1145,6 +1160,8 @@ func r2RetireDefaultLedger() string {
 
 func runR2Retire(ctx context.Context, cfg config.Config, args []string) {
 	const usage = `usage:
+  stoaramactl r2-retire writer-fence --activate --all-writers-gated
+  stoaramactl r2-retire writer-fence --deactivate
   stoaramactl r2-retire delivery-fence --activate --all-api-instances-gated
   stoaramactl r2-retire delivery-fence --settle-drain-acknowledgment EVIDENCE
   stoaramactl r2-retire plan --picks FILE --out DIR [--sample 200 --grace 168h --connection-id N --page-size 5000 --json]
@@ -1160,6 +1177,8 @@ func runR2Retire(ctx context.Context, cfg config.Config, args []string) {
 		log.Fatalf("r2-retire: keep28 policy unavailable (keep everything): %v", err)
 	}
 	switch args[0] {
+	case "writer-fence":
+		runR2WriterFence(ctx, cfg, args[1:])
 	case "delivery-fence":
 		runR2DeliveryFence(ctx, cfg, args[1:])
 	case "release-holds":
@@ -1261,7 +1280,7 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 			if prefixErr != nil {
 				log.Fatal(prefixErr)
 			}
-			opts.LiveObjects, err = r2RetireLiveObjects(ctx, mustArchiveR2Client(ctx, cfg), prefixes)
+			opts.LiveObjects, err = r2RetireLiveObjects(ctx, mustArchiveR2Client(ctx, cfg, pool), prefixes)
 			if err == nil {
 				*listingSHA, err = writeR2RetireListing(filepath.Join(*out, "r2-listing.jsonl"), cfg.R2Bucket, prefixes, opts.LiveObjects)
 			}
@@ -1303,7 +1322,7 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 	}
 	sum.Header.R2ListingSHA256 = *listingSHA
 	if *sample > 0 {
-		store := mustArchiveR2Client(ctx, cfg)
+		store := mustArchiveR2Client(ctx, cfg, pool)
 		hs := r2RetireHeadSampleRun(ctx, store, items, *sample, 8, time.Now().UnixNano())
 		sum.HeadSample = &hs
 	}
@@ -1372,10 +1391,8 @@ func printR2RetirePlan(w io.Writer, sum r2RetirePlanSummary) {
 func runR2RetireApply(ctx context.Context, cfg config.Config, args []string, usage, policySHA string, windows map[int64]api.Keep28Window) {
 	fs := flag.NewFlagSet("r2-retire apply", flag.ContinueOnError)
 	var opts r2RetireApplyOptions
-	fs.BoolVar(&opts.ProviderUnconditionalHeadGuard, "provider-unconditional-delete-with-head-guard", false, "explicit residual TOCTOU acceptance; requires unsupported-provider probe and drained-writer evidence")
+	fs.BoolVar(&opts.ProviderUnconditionalHeadGuard, "provider-unconditional-delete-with-head-guard", false, "explicit residual TOCTOU acceptance; requires unsupported-provider probe, durable writer fence and real multipart inventory")
 	fs.DurationVar(&opts.MinObjectAge, "min-object-age", 7*24*time.Hour, "HEAD LastModified minimum age in HEAD-guard mode (minimum 168h)")
-	fs.StringVar(&opts.WriterProofPath, "writer-quiescence-proof", "", "reviewed per-writer shutdown, capability and multipart drain evidence")
-	fs.StringVar(&opts.WriterProofSHA256, "expected-writer-proof-sha256", "", "approved SHA-256 of writer quiescence evidence")
 	fs.StringVar(&opts.DeleteProofPath, "conditional-delete-proof", "", "operator provider-capability probe (required for NAS-backed apply; HEAD-guard mode requires unsupported result)")
 	fs.StringVar(&opts.DeleteProofSHA256, "expected-delete-proof-sha256", "", "approved SHA-256 of the conditional-delete proof")
 	fs.StringVar(&opts.ManifestPath, "manifest", "", "manifest.jsonl from r2-retire plan")
@@ -1401,7 +1418,7 @@ func runR2RetireApply(ctx context.Context, cfg config.Config, args []string, usa
 		log.Fatalf("connect database: %v", err)
 	}
 	defer pool.Close()
-	store := mustArchiveR2Client(ctx, cfg)
+	store := mustArchiveR2Client(ctx, cfg, pool)
 	sum, err := r2RetireApply(ctx, pool, store, opts, policySHA, windows)
 	if *asJSON {
 		b, _ := json.MarshalIndent(sum, "", "  ")

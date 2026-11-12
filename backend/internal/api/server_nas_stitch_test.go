@@ -368,7 +368,7 @@ func TestNASStitchToolCapabilityIsDefaultOffScopedAndExact(t *testing.T) {
 		w.Header().Set("ETag", "\"immutable-tool\"")
 	}))
 	defer server.Close()
-	store, err := r2.New(context.Background(), r2.Config{AccessKey: "fake-key", SecretKey: "fake-secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	store, err := r2.New(context.Background(), r2.Config{UngatedWriter: true, AccessKey: "fake-key", SecretKey: "fake-secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
 	if err != nil {
 		t.Fatal(err)
 	}

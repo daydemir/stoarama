@@ -100,7 +100,9 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 		if *worklist == "" || *scratch == "" || *results == "" || *hourWorkers < 1 || *cpu < 1 || *net < 1 {
 			log.Fatal(collationV2Usage)
 		}
-		client := mustArchiveR2Client(ctx, cfg)
+		pool := mustCollationPool(ctx, cfg)
+		defer pool.Close()
+		client := mustArchiveR2Client(ctx, cfg, pool)
 		store := collation.R2Store{Client: client}
 		work, err := loadWorklist(ctx, store, *worklist)
 		if err != nil {
@@ -137,14 +139,14 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 		if *worklist == "" {
 			log.Fatal(collationV2Usage)
 		}
-		client := mustArchiveR2Client(ctx, cfg)
+		pool := mustCollationPool(ctx, cfg)
+		defer pool.Close()
+		client := mustArchiveR2Client(ctx, cfg, pool)
 		store := collation.R2Store{Client: client}
 		work, err := loadWorklist(ctx, store, *worklist)
 		if err != nil {
 			log.Fatal(err)
 		}
-		pool := mustCollationPool(ctx, cfg)
-		defer pool.Close()
 		summary, err := registerCollation(ctx, pool, store, work, *dryRun)
 		out, _ := json.Marshal(summary)
 		fmt.Println(string(out))
@@ -162,7 +164,9 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		client := mustArchiveR2Client(ctx, cfg)
+		pool := mustCollationPool(ctx, cfg)
+		defer pool.Close()
+		client := mustArchiveR2Client(ctx, cfg, pool)
 		if _, err := client.PutBytes(ctx, *key, "application/x-ndjson", body); err != nil {
 			log.Fatal(err)
 		}

@@ -110,7 +110,7 @@ func runSurveyDownloadModel(ctx context.Context, cfg config.Config, args []strin
 	if strings.TrimSpace(*key) == "" || strings.TrimSpace(*sha) == "" || strings.TrimSpace(*out) == "" {
 		log.Fatalf("--key, --sha256, --out are all required (or set SURVEY_MODEL_KEY/SHA256/PATH)")
 	}
-	r2c := mustArchiveR2Client(ctx, cfg)
+	r2c := mustArchiveR2Client(ctx, cfg, nil)
 	b, err := r2c.Get(ctx, *key)
 	if err != nil {
 		log.Fatalf("download model %s: %v", *key, err)

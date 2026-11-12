@@ -192,7 +192,7 @@ func (s *Server) handleAccountStorageDestinationsCreate(w http.ResponseWriter, r
 	// a full PutObject -> HeadObject -> DeleteObject roundtrip against the user's bucket.
 	verifyCtx, cancel := context.WithTimeout(r.Context(), storageVerifyTimeout)
 	defer cancel()
-	if err := verifyStorageDestination(verifyCtx, r2.Config{
+	if err := verifyStorageDestination(verifyCtx, r2.Config{WriterDB: s.pool,
 		AccessKey: accessKeyID,
 		SecretKey: secret,
 		Region:    region,

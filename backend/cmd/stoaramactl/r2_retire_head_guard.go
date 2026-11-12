@@ -1,15 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"strings"
 	"time"
 
@@ -21,109 +15,63 @@ type r2RetireSingleDeleteStore interface {
 	DeleteObjectOnce(context.Context, string) error
 }
 
-// Must stay in sync with ops/jelly/r2-retire/HEAD-GUARD.md. Direct credential
-// holders are outside the DB fence: an operator must stop and drain them.
-var r2RetireWriterInventory = [...]string{
-	"recorder", "capture", "collation", "joined-publish", "v85r-stitch",
-	"repair", "nas-restore-redownload", "r2-select", "thumbnails",
-	"transfer", "frames-inference-survey-import", "exports", "releases-probes",
-	"operator-cli",
-}
-
-type r2RetireWriterDrain struct {
-	StoppedAt               time.Time `json:"stopped_at"`
-	DrainedAt               time.Time `json:"drained_at"`
-	CapabilitiesExpiredAt   time.Time `json:"capabilities_expired_at"`
-	MultipartUploadsDrained bool      `json:"multipart_uploads_drained"`
-	DeployedRevision        string    `json:"deployed_revision"`
-	Evidence                string    `json:"evidence"`
-}
-
-type r2RetireWriterProof struct {
-	Bucket         string    `json:"bucket"`
-	EndpointSHA256 string    `json:"endpoint_sha256"`
-	ManifestSHA256 string    `json:"manifest_sha256"`
-	CreatedAt      time.Time `json:"created_at"`
-	ExpiresAt      time.Time `json:"expires_at"`
-	// Explicit operator commitment to keep all inventoried writers stopped
-	// through the run. This cannot fence a direct credential holder atomically.
-	KeepStoppedThroughExpiry bool                           `json:"keep_stopped_through_expiry"`
-	ActiveWriterPrefixes     []string                       `json:"active_writer_prefixes"`
-	Writers                  map[string]r2RetireWriterDrain `json:"writers"`
-}
-
-func checkR2RetireWriterProof(opts r2RetireApplyOptions, h r2RetireHeader, digest, endpoint, key string) error {
-	if !r2RetireLowerHex64(opts.WriterProofSHA256) {
-		return errors.New("HEAD-guard mode requires --writer-quiescence-proof and --expected-writer-proof-sha256")
+// These writers hold credentials outside database admission. Prefixes are code
+// inventory, never operator-supplied evidence. Empty means bucket-wide authority.
+// Until operator/release credentials are provider-confined, ALL keys overlap;
+// stopping a process or submitting an attestation cannot narrow that authority.
+func r2RetireCheckUngatedPrefix(key string) error {
+	writers := [...]struct{ family, prefix string }{
+		{"repair", "repaired/"},
+		{"releases-probes", ""}, // configurable release/probe destinations
+		{"operator-cli", ""},    // AWS CLI/curl/rclone and untracked credential holders
 	}
-	raw, err := os.ReadFile(opts.WriterProofPath)
-	if err != nil {
-		return errors.New("writer quiescence evidence unavailable")
-	}
-	sum := sha256.Sum256(raw)
-	if hex.EncodeToString(sum[:]) != opts.WriterProofSHA256 {
-		return errors.New("writer quiescence evidence changed; stop and review again")
-	}
-	var p r2RetireWriterProof
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&p); err != nil {
-		return errors.New("invalid writer quiescence evidence")
-	}
-	if dec.Decode(new(any)) != io.EOF {
-		return errors.New("invalid trailing writer evidence")
-	}
-	now := time.Now()
-	if p.Bucket != h.Bucket || p.EndpointSHA256 != endpoint || p.ManifestSHA256 != digest ||
-		p.CreatedAt.IsZero() || p.CreatedAt.After(now) || now.Sub(p.CreatedAt) > 24*time.Hour ||
-		!p.ExpiresAt.After(now) || p.ExpiresAt.After(p.CreatedAt.Add(24*time.Hour)) ||
-		!p.KeepStoppedThroughExpiry || p.ActiveWriterPrefixes == nil || len(p.Writers) != len(r2RetireWriterInventory) {
-		return errors.New("writer evidence scope/age/inventory/stop commitment differs")
-	}
-	for _, name := range r2RetireWriterInventory {
-		w, ok := p.Writers[name]
-		if !ok || w.StoppedAt.IsZero() || w.DrainedAt.Before(w.StoppedAt) || w.DrainedAt.After(p.CreatedAt) ||
-			w.CapabilitiesExpiredAt.IsZero() || w.CapabilitiesExpiredAt.After(w.DrainedAt) ||
-			!w.MultipartUploadsDrained || strings.TrimSpace(w.DeployedRevision) == "" || strings.TrimSpace(w.Evidence) == "" {
-			return fmt.Errorf("writer %s lacks stopped/drained capability and multipart evidence", name)
-		}
-	}
-	for _, prefix := range p.ActiveWriterPrefixes {
-		if prefix == "" || strings.TrimSpace(prefix) != prefix {
-			return errors.New("invalid active writer prefix")
-		}
-		// Literal byte prefixes (including partial path components) fail closed.
-		if key != "" && strings.HasPrefix(key, prefix) {
-			return errors.New("key overlaps an active writer prefix")
+	for _, w := range writers {
+		if strings.HasPrefix(key, w.prefix) {
+			return fmt.Errorf("key overlaps ungated %s writer authority; provider prefix confinement required", w.family)
 		}
 	}
 	return nil
 }
 
-// SHARE conflicts with INSERT/UPDATE/DELETE (including admissions and presign
-// intent creation). Hold these locks until the guarded DELETE and receipt commit.
-// A consumed URL can still overwrite, so expiry is checked regardless of status.
+type r2RetireMultipartInventory interface{ RequireNoMultipartUploads(context.Context) error }
+
+func r2RetireCheckMultipart(ctx context.Context, store r2RetireStore) error {
+	inventory, ok := store.(r2RetireMultipartInventory)
+	if !ok {
+		return errors.New("HEAD-guard mode requires live ListMultipartUploads inventory")
+	}
+	return inventory.RequireNoMultipartUploads(ctx)
+}
+
+func r2RetireCheckWriterFence(ctx context.Context, q r2RetireQuerier, bucket, endpoint string) error {
+	var fenced bool
+	err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_retirement_writer_fences
+ WHERE bucket=$1 AND endpoint_sha256=$2 AND drain_not_before<clock_timestamp())`, bucket, endpoint).Scan(&fenced)
+	if err != nil {
+		return fmt.Errorf("R2 writer fence unavailable (migration 0187 required): %w", err)
+	}
+	if !fenced {
+		return errors.New("R2 writer fence missing, scope differs or legacy capabilities have not drained")
+	}
+	return r2RetireCheckStoppedWriters(ctx, q, bucket)
+}
+
 func r2RetireLockStoppedWriters(ctx context.Context, tx pgx.Tx, bucket string) error {
-	if _, err := tx.Exec(ctx, `LOCK TABLE recordings,recording_jobs,streams,capture_session_leases,recording_upload_intents,upload_intents IN SHARE MODE`); err != nil {
-		return fmt.Errorf("lock recording/capture/upload admissions: %w", err)
+	// A durable fence survives transaction failures and crashes. The apply session
+	// lock also prevents explicit deactivation through its SQL transition trigger.
+	if _, err := tx.Exec(ctx, `SELECT singleton FROM r2_retirement_writer_fences FOR SHARE`); err != nil {
+		return err
 	}
 	return r2RetireCheckStoppedWriters(ctx, tx, bucket)
 }
 
 func r2RetireCheckStoppedWriters(ctx context.Context, q r2RetireQuerier, bucket string) error {
-	var active bool
-	err := q.QueryRow(ctx, `SELECT
- EXISTS(SELECT 1 FROM recordings WHERE status='active')
- OR EXISTS(SELECT 1 FROM recording_jobs WHERE status IN ('pending','leased'))
- OR EXISTS(SELECT 1 FROM streams WHERE recording_enabled)
- OR EXISTS(SELECT 1 FROM capture_session_leases WHERE lease_expires_at>clock_timestamp())
- OR EXISTS(SELECT 1 FROM recording_upload_intents WHERE bucket=$1 AND expires_at>clock_timestamp())
- OR EXISTS(SELECT 1 FROM upload_intents WHERE bucket=$1 AND expires_at>clock_timestamp())`, bucket).Scan(&active)
-	if err != nil {
-		return fmt.Errorf("check stopped recording/capture/upload state: %w", err)
+	var drained bool
+	if err := q.QueryRow(ctx, `SELECT r2_retirement_writers_drained($1)`, bucket).Scan(&drained); err != nil {
+		return fmt.Errorf("check all R2 writer queues and capabilities: %w", err)
 	}
-	if active {
-		return errors.New("HEAD-guard mode requires stopped recordings, capture and expired upload capabilities")
+	if !drained {
+		return errors.New("R2 writers have active/queued work or unexpired PUT capabilities (including transfer/stitch/joined jobs)")
 	}
 	return nil
 }
@@ -145,12 +93,12 @@ func r2RetireValidateGuardHead(h r2.ObjectHead, it r2RetireItem, catalogETag str
 
 // This runs AFTER the reservation and fsynced intent, immediately before the
 // single wire DELETE. HEAD and live vetoes are observations, not a provider
-// compare-and-delete: a writer ignoring the shutdown commitment can still race.
+// compare-and-delete: an ungated credential holder can still race.
 func (a *r2RetireApplier) headGuard(ctx context.Context, tx pgx.Tx, it r2RetireItem) error {
 	if err := checkR2RetireDeleteProofMode(a.opts.DeleteProofPath, a.opts.DeleteProofSHA256, a.header.Bucket, a.store.EndpointSHA256(), true); err != nil {
 		return err
 	}
-	if err := checkR2RetireWriterProof(a.opts, a.header, a.digest, a.store.EndpointSHA256(), it.ObjectKey); err != nil {
+	if err := a.checkWriterState(ctx, tx, it.ObjectKey); err != nil {
 		return err
 	}
 	// Collated catalog currently stores only size and SHA. Do not manufacture
@@ -204,7 +152,7 @@ func (a *r2RetireApplier) headGuard(ctx context.Context, tx pgx.Tx, it r2RetireI
 	if err := checkR2RetireDeleteProofMode(a.opts.DeleteProofPath, a.opts.DeleteProofSHA256, a.header.Bucket, a.store.EndpointSHA256(), true); err != nil {
 		return err
 	}
-	if err := checkR2RetireWriterProof(a.opts, a.header, a.digest, a.store.EndpointSHA256(), it.ObjectKey); err != nil {
+	if err := a.checkWriterState(ctx, tx, it.ObjectKey); err != nil {
 		return err
 	}
 	return nil
@@ -237,4 +185,14 @@ func r2RetireGuardCatalogReason(it r2RetireCandidate, etags map[string]string) s
 		return "catalog_etag_mismatch"
 	}
 	return ""
+}
+
+func (a *r2RetireApplier) checkWriterState(ctx context.Context, q r2RetireQuerier, key string) error {
+	if err := r2RetireCheckWriterFence(ctx, q, a.header.Bucket, a.store.EndpointSHA256()); err != nil {
+		return err
+	}
+	if err := r2RetireCheckMultipart(ctx, a.store); err != nil {
+		return err
+	}
+	return r2RetireCheckUngatedPrefix(key)
 }

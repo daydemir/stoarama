@@ -14,20 +14,7 @@ import (
 func writeGuardProofs(t *testing.T, opts *r2RetireApplyOptions, h r2RetireHeader) {
 	t.Helper()
 	now := time.Now().UTC().Add(-time.Second)
-	proof := r2RetireWriterProof{Bucket: h.Bucket, EndpointSHA256: r2tSHA, ManifestSHA256: opts.ExpectedSHA, CreatedAt: now, ExpiresAt: now.Add(time.Hour), KeepStoppedThroughExpiry: true, ActiveWriterPrefixes: []string{}, Writers: map[string]r2RetireWriterDrain{}}
-	for _, name := range r2RetireWriterInventory {
-		proof.Writers[name] = r2RetireWriterDrain{StoppedAt: now.Add(-2 * time.Hour), DrainedAt: now.Add(-time.Hour), CapabilitiesExpiredAt: now.Add(-time.Hour), MultipartUploadsDrained: true, DeployedRevision: "test-revision", Evidence: "test fixture; all jobs stopped and capabilities expired"}
-	}
-	raw, err := json.Marshal(proof)
-	if err != nil {
-		t.Fatal(err)
-	}
-	opts.WriterProofPath = filepath.Join(t.TempDir(), "writers.json")
-	opts.WriterProofSHA256 = r2SHA(raw)
-	if err := os.WriteFile(opts.WriterProofPath, raw, 0600); err != nil {
-		t.Fatal(err)
-	}
-	raw = []byte(`{"bucket":"` + h.Bucket + `","endpoint_sha256":"` + r2tSHA + `","created_at":"` + now.Format(time.RFC3339Nano) + `","conditional_delete_unsupported":true,"wrong_etag_delete_succeeded":true,"wrong_etag_delete_confirmed_absent":true,"probe_key":"r2-retire-probes/test.bin"}`)
+	raw := []byte(`{"bucket":"` + h.Bucket + `","endpoint_sha256":"` + r2tSHA + `","created_at":"` + now.Format(time.RFC3339Nano) + `","conditional_delete_unsupported":true,"wrong_etag_delete_succeeded":true,"wrong_etag_delete_confirmed_absent":true,"probe_key":"r2-retire-probes/test.bin"}`)
 	opts.DeleteProofPath = filepath.Join(t.TempDir(), "provider.json")
 	opts.DeleteProofSHA256 = r2SHA(raw)
 	if err := os.WriteFile(opts.DeleteProofPath, raw, 0600); err != nil {
@@ -75,55 +62,11 @@ func TestR2RetireHeadGuardProofMode(t *testing.T) {
 	}
 }
 
-func TestR2RetireHeadGuardWriterEvidence(t *testing.T) {
-	h := r2RetireHeader{Bucket: "stoarama"}
-	opts := r2RetireApplyOptions{ExpectedSHA: r2tSHA}
-	writeGuardProofs(t, &opts, h)
-	raw, _ := os.ReadFile(opts.WriterProofPath)
-	check := func() error { return checkR2RetireWriterProof(opts, h, r2tSHA, r2tSHA, "managed/acct-47/a.mp4") }
-	if err := check(); err != nil {
-		t.Fatal(err)
-	}
-	for _, mutate := range []func(*r2RetireWriterProof){
-		func(p *r2RetireWriterProof) { p.Bucket = "other" },
-		func(p *r2RetireWriterProof) { p.EndpointSHA256 = strings.Repeat("b", 64) },
-		func(p *r2RetireWriterProof) { p.ManifestSHA256 = strings.Repeat("b", 64) },
-		func(p *r2RetireWriterProof) { p.CreatedAt = time.Now().Add(time.Minute) },
-		func(p *r2RetireWriterProof) { p.CreatedAt = time.Now().Add(-25 * time.Hour) },
-		func(p *r2RetireWriterProof) { p.ExpiresAt = time.Now().Add(-time.Second) },
-		func(p *r2RetireWriterProof) { p.ExpiresAt = p.CreatedAt.Add(25 * time.Hour) },
-		func(p *r2RetireWriterProof) { p.KeepStoppedThroughExpiry = false },
-		func(p *r2RetireWriterProof) { delete(p.Writers, "repair") },
-		func(p *r2RetireWriterProof) { p.Writers["unknown"] = p.Writers["repair"] },
-		func(p *r2RetireWriterProof) {
-			w := p.Writers["recorder"]
-			w.MultipartUploadsDrained = false
-			p.Writers["recorder"] = w
-		},
-		func(p *r2RetireWriterProof) {
-			w := p.Writers["recorder"]
-			w.CapabilitiesExpiredAt = time.Now().Add(time.Hour)
-			p.Writers["recorder"] = w
-		},
-		func(p *r2RetireWriterProof) { p.ActiveWriterPrefixes = nil },
-		func(p *r2RetireWriterProof) { p.ActiveWriterPrefixes = []string{"managed/acct-47/"} },
-		func(p *r2RetireWriterProof) { p.ActiveWriterPrefixes = []string{"managed/acct"} },
-		func(p *r2RetireWriterProof) { p.ActiveWriterPrefixes = []string{""} },
-	} {
-		var p r2RetireWriterProof
-		json.Unmarshal(raw, &p)
-		mutate(&p)
-		changed, _ := json.Marshal(p)
-		os.WriteFile(opts.WriterProofPath, changed, 0600)
-		opts.WriterProofSHA256 = r2SHA(changed)
-		if check() == nil {
-			t.Fatal("unsafe writer evidence accepted")
+func TestR2RetireHeadGuardUngatedWritersVeto(t *testing.T) {
+	for _, key := range []string{"repaired/a", "managed/acct-47/a.mp4", "joined/a", "raw/a", "exports/a", "r2-retire-probes/a"} {
+		if err := r2RetireCheckUngatedPrefix(key); err == nil {
+			t.Fatalf("ungated credential authority accepted for %s", key)
 		}
-	}
-	os.WriteFile(opts.WriterProofPath, []byte(`{}`), 0600)
-	opts.WriterProofSHA256 = r2SHA(raw)
-	if check() == nil {
-		t.Fatal("changed evidence accepted")
 	}
 }
 

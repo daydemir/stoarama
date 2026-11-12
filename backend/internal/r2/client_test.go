@@ -17,7 +17,7 @@ import (
 )
 
 func TestPresignGetExactBindsConditionalGenerationIdentity(t *testing.T) {
-	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
+	client, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestPresignGetExactBindsConditionalGenerationIdentity(t *testing.T) {
 }
 
 func TestPresignedExactCapabilitiesBindMethodAuthorityKeyAndHeaders(t *testing.T) {
-	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
+	client, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestOpenExactSendsConditionalGenerationIdentity(t *testing.T) {
 		_, _ = io.WriteString(w, "clip")
 	}))
 	defer server.Close()
-	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	client, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestOpenExactRangeSendsConditionalGenerationAndByteRange(t *testing.T) {
 		_, _ = io.WriteString(w, "clip")
 	}))
 	defer server.Close()
-	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	client, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestOpenExactRangeSendsConditionalGenerationAndByteRange(t *testing.T) {
 }
 
 func TestOpenExactMethodsRejectMissingIdentityAndInvalidRange(t *testing.T) {
-	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
+	client, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +228,7 @@ func TestPutReaderIfAbsentVerifiedCreatesAndRereadsExactObject(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	client, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +265,7 @@ func TestPutReaderIfAbsentVerifiedReconcilesOnlyExactExistingObject(t *testing.T
 		}
 	}))
 	defer server.Close()
-	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	client, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +288,7 @@ func TestPutReaderIfAbsentVerifiedRejectsUnconditionalPutCeiling(t *testing.T) {
 }
 
 func TestPresignPutSizedRequestSignsExactLength(t *testing.T) {
-	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
+	client, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +315,7 @@ func TestDeleteObjectsEachReportsPerKeyFailures(t *testing.T) {
 			`<Error><Key>b.mp4</Key><Code>InternalError</Code><Message>try again</Message></Error></DeleteResult>`)
 	}))
 	defer server.Close()
-	c, err := New(context.Background(), Config{AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	c, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +343,7 @@ func TestNASSpaceAuditMetadataPresignAndHead(t *testing.T) {
 		w.Header().Set("X-Amz-Meta-Sha256", sha)
 	}))
 	defer fake.Close()
-	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: fake.URL})
+	client, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: fake.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,7 +375,7 @@ func TestDeleteObjectExactUsesConditionalSingleKey(t *testing.T) {
 		w.WriteHeader(412)
 	}))
 	defer server.Close()
-	c, err := New(context.Background(), Config{AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	c, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,7 +392,7 @@ func TestDeleteObjectExactUsesConditionalSingleKey(t *testing.T) {
 
 func TestEndpointProofIdentityUsesConfiguredEndpoint(t *testing.T) {
 	endpoint := "https://account.r2.cloudflarestorage.com/"
-	c, err := New(context.Background(), Config{AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: endpoint})
+	c, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: endpoint})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +423,7 @@ func TestDeleteObjectOnceNeverRetriesAmbiguousResult(t *testing.T) {
 				w.WriteHeader(http.StatusServiceUnavailable)
 			}))
 			defer server.Close()
-			c, err := New(context.Background(), Config{AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+			c, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -445,7 +445,7 @@ func TestHeadExposesProviderLastModified(t *testing.T) {
 		w.Header().Set("Content-Length", "100")
 	}))
 	defer server.Close()
-	c, err := New(context.Background(), Config{AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	c, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
 	if err != nil {
 		t.Fatal(err)
 	}

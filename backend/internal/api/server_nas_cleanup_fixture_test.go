@@ -151,7 +151,7 @@ func newCleanupFixture(t *testing.T, seedPerDay int) *cleanupFixture {
 	bucket := &fakeCleanupBucket{objects: map[string][]byte{}}
 	srv := httptest.NewServer(bucket)
 	t.Cleanup(srv.Close)
-	client, err := r2.New(ctx, r2.Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: srv.URL})
+	client, err := r2.New(ctx, r2.Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: srv.URL})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2578,7 +2578,7 @@ func runMedia(ctx context.Context, cfg config.Config, args []string) {
 
 	var r2c *r2.Client
 	if !*dryRun {
-		r2c, err = r2.New(ctx, r2.Config{
+		r2c, err = r2.New(ctx, r2.Config{WriterDB: pool,
 			AccountID: cfg.R2AccountID,
 			AccessKey: cfg.R2AccessKeyID,
 			SecretKey: cfg.R2SecretAccessKey,

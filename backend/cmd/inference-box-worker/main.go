@@ -56,7 +56,7 @@ func main() {
 		}
 	}
 
-	r2c, err := r2.New(ctx, r2.Config{
+	r2c, err := r2.New(ctx, r2.Config{WriterDB: pool,
 		AccountID: cfg.R2AccountID,
 		AccessKey: cfg.R2AccessKeyID,
 		SecretKey: cfg.R2SecretAccessKey,
