@@ -130,6 +130,7 @@ def run(args):
             mock.patch.object(pull.os, "unlink", wraps=os.unlink) as unlink, \
             concurrent.futures.ThreadPoolExecutor(max_workers=pull.CLEANUP_V2_WORKERS, thread_name_prefix="nas-cleanup") as executor:
         api = pull.CleanupBatchAPI(cfg) if args.protocol == 2 else None
+        preflight = pull.CleanupPreflight(cfg, inventory, stop) if args.pipeline else None
         for worker in maintenance_threads:
             worker.start()
         try:
@@ -139,7 +140,7 @@ def run(args):
                     nonlocal cycles
                     cycles += 1
                     retry = batch(*batch_args, **kwargs)
-                    if retry:
+                    if retry and not kwargs.get("dry_run_only"):
                         stop.set()
                     return retry
                 watchdog = threading.Timer(args.max_seconds, stop.set)
@@ -190,7 +191,7 @@ def run(args):
                                 errors.append(str(exc))
                         break
                     if args.protocol == 2:
-                        retry = pull.cleanup_batch_v2(cfg, inventory, stop, executor, api)
+                        retry = pull.cleanup_batch_v2(cfg, inventory, stop, executor, api, preflight=preflight)
                     else:
                         retry = pull.cleanup_batch(cfg, inventory, stop, executor)
                     if retry:
@@ -199,8 +200,12 @@ def run(args):
             maintenance_stop.set()
             for worker in maintenance_threads:
                 worker.join(timeout=5)
-            if api is not None:
-                api.close()
+            try:
+                if preflight is not None:
+                    preflight.close()
+            finally:
+                if api is not None:
+                    api.close()
     elapsed = time.monotonic() - started
     ledger = state / pull.CLEANUP_LEDGER_NAME
     deleted = 0
@@ -232,6 +237,7 @@ def main():
     r.add_argument("--state", required=True)
     r.add_argument("--client-version", default="be17fd73", help="reviewed execution release in the fixture heartbeat")
     r.add_argument("--boot-id", default="fixture-boot", help="live process identity in the fixture heartbeat")
+    r.add_argument("--pipeline", action="store_true", help="overlap two successor dry-run workers with serial execution")
     r.add_argument("--protocol", type=int, choices=(1, 2), default=2)
     r.add_argument("--max-seconds", type=float, default=1800)
     r.add_argument("--simultaneous-tasks", type=int, default=0, help="contend for execution leases with this many workers (regression harness only)")

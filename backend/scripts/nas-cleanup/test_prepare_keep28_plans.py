@@ -1,5 +1,6 @@
 import unittest
 import tempfile
+import urllib.error
 from unittest.mock import patch
 
 import prepare_keep28_plans as k
@@ -10,6 +11,11 @@ def row(sid, kind, n, size=1, purged=False):
 
 
 class Keep28PlanTests(unittest.TestCase):
+    def test_atomic_admission_never_splits_an_uncertain_proposal(self):
+        with patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', 409, 'conflict', {}, None)) as call:
+            with self.assertRaisesRegex(RuntimeError, 'atomic admission rejected'):
+                k.submit('https://example.invalid', 'lookahead', [row(3, 'raw', 1), row(3, 'raw', 2)], [], [], atomic=True)
+            self.assertEqual(call.call_count, 1)
     def test_policy_is_pinned_and_complete(self):
         policy = k.load_policy(k.POLICY_PATH)
         self.assertEqual(len(policy), 109)

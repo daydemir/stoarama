@@ -60,7 +60,7 @@ const (
 	nasCleanupReconciliationProtocol = 1
 	// Exact reviewed release allowlist; git hashes have no sortable version order.
 	// Retain reviewed predecessors. Stage this fix only with explicit
-	// NAS_VERSION=listing-fence-v1 from merged main; never reuse a predecessor version.
+	// NAS_VERSION=cleanup-pipeline-v1 from merged main; never reuse a predecessor version.
 	nasCleanupExecutionClientVersion          = "be17fd73"
 	nasCleanupSerialExecutionClientVersion    = "94d39bff"
 	nasCleanupDedicatedExecutionClientVersion = "523b70ff"
@@ -73,6 +73,7 @@ const (
 	nasCleanupRefusalClientVersion            = "cleanup-refusals-v1"
 	nasCleanupListingProofClientVersion       = "listing-proof-v1"
 	nasCleanupListingFenceClientVersion       = "listing-fence-v1"
+	nasCleanupPipelineClientVersion           = "cleanup-pipeline-v1"
 	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
 	// item limit only keeps one admission request bounded.
 	nasCleanupMaxPlanItems = 10000
@@ -564,7 +565,7 @@ func cleanupRequestSession(r *http.Request) cleanupClientSession {
 }
 
 func cleanupSessionDeadline(ctx context.Context, tx pgx.Tx, cid int64, session cleanupClientSession) (time.Time, error) {
-	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion && session.version != nasCleanupV85RClientVersion && session.version != nasCleanupV85RServerSwitchClientVersion && session.version != nasCleanupV85RCorpusUAClientVersion && session.version != nasCleanupRefusalClientVersion && session.version != nasCleanupListingProofClientVersion && session.version != nasCleanupListingFenceClientVersion) {
+	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion && session.version != nasCleanupV85RClientVersion && session.version != nasCleanupV85RServerSwitchClientVersion && session.version != nasCleanupV85RCorpusUAClientVersion && session.version != nasCleanupRefusalClientVersion && session.version != nasCleanupListingProofClientVersion && session.version != nasCleanupListingFenceClientVersion && session.version != nasCleanupPipelineClientVersion) {
 		return time.Time{}, nil
 	}
 	var seen *time.Time
@@ -619,7 +620,7 @@ JOIN LATERAL (
 WHERE p.connection_id=$1 AND p.report_sha256=$3 AND p.id=ANY($4)
  AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $2
  AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.state IN ('leased','delete_issued'))))
-ORDER BY i.attempt,p.priority DESC,p.id LIMIT 1`
+ORDER BY (p.mode='enabled') DESC,i.attempt,p.priority DESC,p.id LIMIT 1`
 
 // Bytes of execution work already leased but not yet observed. Counted with
 // the issued bytes so a lease never hands out work the budget cannot permit.
@@ -1327,12 +1328,12 @@ func validCleanupReceiptEvidence(req cleanupReceipt) bool {
 	if req.RefusalProtocol != 0 && (req.RefusalProtocol != nasCleanupRefusalProtocol || req.RefusalReason == "") {
 		return false
 	}
-	if len(req.StageTimings) > 13 {
+	if len(req.StageTimings) > 14 {
 		return false
 	}
 	for name, elapsed := range req.StageTimings {
 		switch name {
-		case "queue_ms", "lane_ms", "fence_ms", "open_ms", "proof_ms", "guard_ms", "observe_journal_ms", "observe_ms", "intent_journal_ms", "caps_ms", "ledger_intent_ms", "delete_ms", "ledger_result_ms":
+		case "lease_ms", "queue_ms", "lane_ms", "fence_ms", "open_ms", "proof_ms", "guard_ms", "observe_journal_ms", "observe_ms", "intent_journal_ms", "caps_ms", "ledger_intent_ms", "delete_ms", "ledger_result_ms":
 		default:
 			return false
 		}

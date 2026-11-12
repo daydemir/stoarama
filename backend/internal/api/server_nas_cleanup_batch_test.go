@@ -58,16 +58,20 @@ func TestNASCleanupBatchLeaseBoundAndExecutionIsolation(t *testing.T) {
 		seen[task.ItemID] = true
 	}
 	s.cfg.NASCleanupDeletionEnabled = true
-	if tasks := lease(8); len(tasks) != 1 || tasks[0].ItemID != 10 || len(tasks[0].ApprovedProof) != 0 {
-		t.Fatal("mixed execution and preflight lease")
-	}
 	for _, id := range []int64{11, 12} {
 		tasks := lease(8)
 		if len(tasks) != 1 || tasks[0].ItemID != id || len(tasks[0].ApprovedProof) == 0 {
 			t.Fatal("execution batch was not serial")
 		}
-		if got := lease(8); len(got) != 0 {
-			t.Fatal("leased beside outstanding execution")
+		// Enabled work wins over the last fresh preflight. While its permit
+		// slot is occupied only dry work may be leased, never more execution.
+		got := lease(8)
+		if id == 11 {
+			if len(got) != 1 || got[0].ItemID != 10 || len(got[0].ApprovedProof) != 0 {
+				t.Fatal("execution mixed with successor preflight", got)
+			}
+		} else if len(got) != 0 {
+			t.Fatal("leased execution beside outstanding execution", got)
 		}
 		// Simulate a completed lifecycle; this fixture tests lease selection only.
 		if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='keep' WHERE id=$1`, id); err != nil {

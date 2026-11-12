@@ -3381,7 +3381,7 @@ def cleanup_timed(timings, stage, fn, *args, **kwargs):
 
 def cleanup_process_task(cfg, inventory, stop_event, task, api=None, lane=None):
     execution_started = time.monotonic()
-    timings = {}
+    timings = {"lease_ms": task["_lease_elapsed_ms"]} if "_lease_elapsed_ms" in task else {}
     # Both protocols and direct callers reserve before any filesystem/API work.
     owner = cleanup_reserve_item(inventory, task["item_id"])
     if owner is None:
@@ -3402,7 +3402,7 @@ def cleanup_process_task(cfg, inventory, stop_event, task, api=None, lane=None):
     except CleanupInterrupted as exc:
         # An observe checkpoint precedes every permit request. Never return a
         # task with uncertain authority; those checkpoints reconcile normally.
-        if executing and not any(row[0] == task["item_id"] for row in cleanup_journal(inventory)):
+        if not any(row[0] == task["item_id"] for row in cleanup_journal(inventory)):
             body = {"attempt": task["attempt"], "plan_sha256": task["plan_sha256"],
                     "outcome": "unverified", "proof": None, "error": str(exc)[:500],
                     "client_version": CLIENT_VERSION, "return_lease": True,
@@ -3537,10 +3537,10 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner, timings,
                     receipt["refusal_protocol"] = CLEANUP_REFUSAL_PROTOCOL
                 receipt.update(execution_elapsed_ms=round((time.monotonic() - execution_started) * 1000),
                                stage_timings=dict(timings))
-                cleanup_journal(inventory, item_id, "result", receipt, owner=owner)
-                response = api.result(cfg, item_id, receipt)
+                cleanup_timed(timings, "result_journal_ms", cleanup_journal, inventory, item_id, "result", receipt, owner=owner)
+                response = cleanup_timed(timings, "receipt_ms", api.result, cfg, item_id, receipt)
                 cleanup_validate_ack(item_id, "result", receipt, response)
-            cleanup_journal(inventory, item_id, owner=owner)
+            cleanup_timed(timings, "clear_journal_ms", cleanup_journal, inventory, item_id, owner=owner)
             return cleanup_verified_ack(task, proof, decision)
     except Exception as exc:
         execution_outcome["error"] = str(exc)[:500]
@@ -3911,6 +3911,7 @@ def cleanup_local_headroom(inventory):
 
 
 def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes):
+    started = time.monotonic()
     if type(limit) is not int or not 1 <= limit <= CLEANUP_V2_LEASE:
         raise ValueError("invalid cleanup lease bound")
     execution_files = max(0, min(int(execution_files), CLEANUP_V2_LEASE))
@@ -3939,11 +3940,15 @@ def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes):
     sizes = [task["item"].get("size_bytes") for task in executing]
     if any(type(size) is not int or size <= 0 for size in sizes) or len(executing) > execution_files or sum(sizes) > execution_bytes:
         raise RuntimeError("execution lease exceeds the client's local caps")
+    elapsed = round((time.monotonic() - started) * 1000)
+    for task in tasks:
+        task["_lease_elapsed_ms"] = elapsed  # Local diagnostics, never authority.
     return lease
 
 
 def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=None,
-                     inflight=CLEANUP_V2_INFLIGHT, task_limit=CLEANUP_V2_CYCLE_TASKS):
+                     inflight=CLEANUP_V2_INFLIGHT, task_limit=CLEANUP_V2_CYCLE_TASKS,
+                     preflight=None, dry_run_only=False, active=None):
     """Protocol 2 coordinator: rolling window of leased tasks on the executor.
 
     Execution has one leased/running task; dry runs retain their rolling
@@ -3953,7 +3958,10 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
     Replay is bounded (CLEANUP_REPLAY_BUDGET_SEC) and its failures never stop
     new work from being leased; a leased task whose item still has a journal
     or quarantine entry is left unprocessed (its lease simply expires)."""
-    replay = cleanup_replay_receipts(cfg, inventory, api, budget=CLEANUP_REPLAY_BUDGET_SEC)
+    if preflight is not None:
+        preflight.pause()  # No worker may own a checkpoint while replay starts.
+    replay = (dict(failed=0) if dry_run_only else
+              cleanup_replay_receipts(cfg, inventory, api, budget=CLEANUP_REPLAY_BUDGET_SEC))
     pins, pins_error = cleanup_pins()
     pending = {}
     leased = 0
@@ -3967,17 +3975,18 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
         if future.result() is True and verified_event is not None:
             verified_event.set()
     try:
-        while not stop_event.is_set():
-            while not exhausted and not stop_event.is_set() and error is None and len(pending) < inflight and leased < task_limit:
+        while not stop_event.is_set() and (active is None or active.is_set()):
+            while not exhausted and not stop_event.is_set() and (active is None or active.is_set()) and error is None and len(pending) < inflight and leased < task_limit:
                 lane.before_lease()
                 room = min(CLEANUP_V2_LEASE, inflight - len(pending), task_limit - leased)
-                files_left, bytes_left = cleanup_local_headroom(inventory)
+                files_left, bytes_left = (0, 0) if dry_run_only else cleanup_local_headroom(inventory)
                 files_left = min(files_left, CLEANUP_EXECUTION_INFLIGHT)
                 if pins_error is not None:
                     files_left = bytes_left = 0  # every deletion would be refused
                 lease = cleanup_lease_v2(cfg, room, files_left, bytes_left)
                 retry = lease.get("retry_after_sec", 120)
-                CLEANUP_STATUS.update(last_lease_at=utc_now(), last_lease_tasks=len(lease["tasks"]))
+                if not dry_run_only:
+                    CLEANUP_STATUS.update(last_lease_at=utc_now(), last_lease_tasks=len(lease["tasks"]))
                 if not lease["tasks"]:
                     exhausted = True
                     break
@@ -3993,15 +4002,21 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                     task["_recovery_md5"] = lease.get("recovery_md5") is True  # local only, never sent
                     processed += 1
                     if task.get("approved_proof") is not None:
+                        if dry_run_only:
+                            raise CleanupResponseError("execution task in dry-only pipeline")
                         # Drain dry runs, then finish observation, unlink and
                         # acknowledged receipt inline. The next iteration leases
                         # immediately, without an executor/cycle/poll handoff.
                         for future in pending:
                             completed(future)
                         pending.clear()
+                        if preflight is not None:
+                            preflight.start()
                         cleanup_process_task(cfg, inventory, stop_event, task, api, lane=lane)
                         continue
                     lane.close()
+                    if preflight is not None:
+                        preflight.pause()
                     pending[executor.submit(cleanup_process_task, cfg, inventory, stop_event, task, api)] = task
             if not pending or error is not None:
                 break
@@ -4024,17 +4039,70 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
             except Exception as exc:
                 if error is None:
                     error = exc
+        if preflight is not None:
+            try:
+                preflight.pause()
+            except Exception as exc:
+                if error is None:
+                    error = exc
     if error is not None:
         raise error
-    if not replay["failed"]:
+    if not dry_run_only and not replay["failed"]:
         CLEANUP_STATUS.clear_error()
     return max(1, retry) if exhausted or not processed else 0
+
+
+class CleanupPreflight:
+    """Two read-only workers alongside the dedicated serial execution lane.
+
+    The primary coordinator drains this lane before any replay. No background
+    worker may lease execution or replay a saved observation into authority.
+    """
+    def __init__(self, cfg, inventory, stop_event):
+        self.cfg, self.inventory, self.stop_event = cfg, inventory, stop_event
+        self.active = threading.Event()
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="cleanup-lookahead")
+        self.future = None
+
+    def start(self):
+        if self.future is None:
+            self.active.set()
+            self.future = self.pool.submit(self.run)
+
+    def pause(self):
+        self.active.clear()
+        if self.future is not None:
+            future, self.future = self.future, None
+            future.result()  # Every leased task/checkpoint drains before replay.
+
+    def run(self):
+        api = CleanupBatchAPI(self.cfg)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="cleanup-dry") as executor:
+                while self.active.is_set() and not self.stop_event.is_set():
+                    retry = cleanup_batch_v2(self.cfg, self.inventory, self.stop_event, executor, api,
+                        inflight=2, task_limit=128, dry_run_only=True, active=self.active)
+                    if retry:
+                        # Poll the active flag promptly; never keep pause() in
+                        # the normal empty-queue two-minute sleep.
+                        for _ in range(min(retry, 5) * 10):
+                            if not self.active.is_set() or self.stop_event.wait(0.1):
+                                return
+        finally:
+            api.close()
+
+    def close(self):
+        try:
+            self.pause()
+        finally:
+            self.pool.shutdown(wait=True)
 
 
 def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
     wait = 15
     v2_after = 0.0
     api = None
+    preflight = CleanupPreflight(cfg, inventory, stop_event)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(CLEANUP_PREFLIGHT_WORKERS, CLEANUP_V2_WORKERS), thread_name_prefix="nas-cleanup") as executor:
         try:
             while not stop_event.wait(wait):
@@ -4045,7 +4113,7 @@ def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
                         if api is None:
                             api = CleanupBatchAPI(cfg)
                         try:
-                            retry = cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=verified_event)
+                            retry = cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=verified_event, preflight=preflight)
                         except CleanupProtocolUnsupported as exc:
                             log("INFO", "NAS cleanup using protocol 1: %s" % exc)
                             v2_after, v2 = time.monotonic() + CLEANUP_V2_FALLBACK_SEC, False
@@ -4062,8 +4130,11 @@ def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
                     CLEANUP_STATUS.add("cycle_errors")
                     wait = restore_wait(CLEANUP_V2_ERROR_WAIT_SEC if v2 else min(60, RESTORE_ERROR_WAIT_SEC))
         finally:
-            if api is not None:
-                api.close()
+            try:
+                preflight.close()
+            finally:
+                if api is not None:
+                    api.close()
 
 
 def prepare_clip_with_capacity(cfg, runtime, clip):

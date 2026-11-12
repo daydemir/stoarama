@@ -329,6 +329,8 @@ class Runner:
             status = json.loads(raw)
             require(isinstance(status, dict)
                     and (status['current_plan'] is None or type(status['current_plan']) is int and status['current_plan'] > 0)
+                    and (status.get('next_plan') is None or type(status['next_plan']) is int
+                         and status['next_plan'] > 0 and status['next_plan'] != status['current_plan'])
                     and (status['last_error'] is None or isinstance(status['last_error'], str)),
                     'invalid ownership state')
         except Exception:
@@ -719,9 +721,10 @@ class Runner:
             self.progress()
             time.sleep(60)
 
-    def pick(self):
+    def pick(self, lookahead=False):
         ids = self.query("""SELECT coalesce(json_agg(id ORDER BY id),'[]') FROM nas_cleanup_plans p
           WHERE account_id=47 AND connection_id=13 AND mode='dry_run'
+          AND id<>""" + str(self.status['current_plan'] or 0) + """
           AND report_sha256='""" + POLICY_SHA + """' AND EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=p.id)
           AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=p.id
             AND (state<>'would_delete' OR delete_ever_issued OR updated_at<=now()-interval '20 hours'))""")
@@ -735,11 +738,15 @@ class Runner:
             out = self.root / 'plans' / (prefix + '-s' + str(sid))
             command([sys.executable, str(self.repo / 'backend/scripts/nas-cleanup/prepare_keep28_plans.py'),
                 '--stream', str(sid), '--max-bytes', str(PLAN_CAP), '--max-plans', '1',
-                '--label-prefix', prefix, '--out', str(out), '--api', API, '--submit'], env=os.environ.copy())
+                '--label-prefix', prefix, '--out', str(out), '--api', API, '--submit',
+                '--atomic-admission'], env=os.environ.copy())
             summary = json.loads((out / 'summary.json').read_text())
             require(not summary['rejected_at_admission'], 'preparer rejected an uncertain file')
             if summary['receipts']:
+                require(len(summary['receipts']) == 1, 'preparer admitted more than one plan')
                 return summary['receipts'][0]['id']
+        if lookahead:
+            return None  # Current/reserved work is expected; never claim completion here.
         # The preparer excludes reserved files. Never call that a completed cleanup.
         pending = self.query("""SELECT count(*) FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id
           WHERE p.account_id=47 AND p.connection_id=13 AND i.state<>'deleted'
@@ -870,6 +877,8 @@ class Runner:
             active = self.active()
             require(active['plans'] == [pid] and active['batches'] == 0, 'concurrent cleanup execution')
             require(self.live()['commit']['id'] == self.status['live_commit'], 'live commit changed during execution')
+            if self.status.get('next_plan') is not None:
+                dry_state(self.plan(self.status['next_plan']))  # A failed lookahead stops and alerts too.
             # STOP/SIGTERM drains the active plan naturally; never pause it for deployment.
             self.progress()
             time.sleep(60)
@@ -893,6 +902,7 @@ class Runner:
                     and p['master_deletion_enabled'] is True,
                     'saved enabled plan is unhealthy; owner review required')
         require(not self.status.get('last_error'), 'failure is latched; owner must review before restart')
+        require(not self.status.get('lookahead_pending'), 'lookahead admission interrupted; owner must reconcile its label before restart')
         self.load_policy()
         self.check_delivery()
         if active['plans']:
@@ -906,11 +916,11 @@ class Runner:
         self.idle()
         self.progress()  # Accepted owner delivery before any deletion is enabled.
         while not self.stopped():
-            pid = self.status['current_plan'] or self.pick()
+            pid = self.status['current_plan'] or self.status.get('next_plan') or self.pick()
             if pid is None:
                 self.save('stopped' if self.stopped() else 'complete', current_plan=None)
                 return
-            self.save('dry_run', current_plan=pid)
+            self.save('dry_run', current_plan=pid, next_plan=None if pid == self.status.get('next_plan') else self.status.get('next_plan'))
             p = self.await_dry(pid)
             if p is None:
                 break
@@ -925,6 +935,15 @@ class Runner:
                 return
             if self.stopped():
                 break
+            # Admission is read-only on the NAS and still happens with master
+            # OFF. Never prepare more than one successor. Its own independent
+            # verification and every enable gate run after this plan closes.
+            if self.status.get('next_plan') is None:
+                # A lost response/crash must not silently admit another plan
+                # on restart. Ambiguous admission requires owner reconciliation.
+                self.save('dry_run', lookahead_pending=True)
+                successor = self.pick(lookahead=True)
+                self.save('dry_run', next_plan=successor, lookahead_pending=False)
             self.idle()
             self.master(True)
             if self.stopped():

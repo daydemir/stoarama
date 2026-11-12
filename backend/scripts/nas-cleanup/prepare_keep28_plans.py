@@ -201,18 +201,20 @@ def service(api, method, path, body=None):
         return json.loads(response.read(16 << 20))
 
 
-def submit(api, label, rows, receipts, rejected):
+def submit(api, label, rows, receipts, rejected, atomic=False):
     try:
         result = service(api, 'POST', 'plans', {'label': label, 'items': [{'kind': r['kind'], 'source_id': r['source_id']} for r in rows]})
     except urllib.error.HTTPError as exc:
         if exc.code != 409:
             raise RuntimeError(f'admission not confirmed for {label}: HTTP {exc.code}; inspect the label before retrying')
+        if atomic:
+            raise RuntimeError(f'atomic admission rejected for {label}; inspect the label before retrying') from None
         if len(rows) == 1:
             rejected.append({'label': label, 'kind': rows[0]['kind'], 'source_id': rows[0]['source_id'], 'path': rows[0]['path'], 'reason': exc.read(2000).decode(errors='replace')})
             return
         mid = len(rows) // 2
-        submit(api, label + 'a', rows[:mid], receipts, rejected)
-        submit(api, label + 'b', rows[mid:], receipts, rejected)
+        submit(api, label + 'a', rows[:mid], receipts, rejected, atomic=atomic)
+        submit(api, label + 'b', rows[mid:], receipts, rejected, atomic=atomic)
         return
     detail = service(api, 'GET', 'plans/' + str(result['id']))
     assert detail['mode'] == 'dry_run' and detail['master_deletion_enabled'] is False and detail['policy_current'] is True
@@ -235,6 +237,7 @@ def main():
     ap.add_argument('--psql', default='psql')
     ap.add_argument('--out', required=True, help='directory for plan inputs and the summary')
     ap.add_argument('--submit', action='store_true', help='admit plans as read-only dry runs via the service API')
+    ap.add_argument('--atomic-admission', action='store_true', help='stop on admission rejection; never split one proposal into several plans')
     ap.add_argument('--api', default='https://stoarama.com')
     a = ap.parse_args()
     if not 1 <= a.max_items <= MAX_PLAN_ITEMS or not 0 < a.max_bytes <= MAX_PLAN_BYTES or a.max_plans < 0 or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,39}', a.label_prefix):
@@ -259,7 +262,7 @@ def main():
     receipts, rejected = [], []
     if a.submit:
         for label, items in plans:
-            submit(a.api, label, items, receipts, rejected)
+            submit(a.api, label, items, receipts, rejected, atomic=a.atomic_admission)
         summary.update(receipts=receipts, rejected_at_admission=rejected)
         batch_list = batch_manifests(receipts, a.label_prefix, a.batch_by)
         for b in batch_list:
