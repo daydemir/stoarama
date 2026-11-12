@@ -2100,6 +2100,7 @@ const accountClipsCursorSQL = `
 	JOIN recordings r ON r.id = c.recording_id
 	WHERE r.account_id = $1 AND c.purged_at IS NULL AND c.released_at IS NULL
 	  AND r.delivery = 'nas_pull'
+	  AND nas_delivery_allowed(CASE WHEN r.account_id=47 THEN 13 ELSE 0 END,'raw',c.id)
 	  -- Retain zero-byte rows for audit, but never let one poison the forward
 	  -- cursor page and block every later valid clip.
 	  AND c.size_bytes > 0

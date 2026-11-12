@@ -234,7 +234,8 @@ folders (and the root-files folder) completed with consistent stored counts.
 Retirement accepts absence only from a generation **started within 24 hours**
 and strictly after the path's latest known possible delivery/cursor write.
 Cursor advance time is recorded by the server after migration; unknown writer
-watermarks remain blocked. Collated outputs need their delivery ACK time.
+watermarks remain blocked unless the delivery-retirement fence below is settled.
+Collated outputs need their delivery ACK time or that settled fence.
 Any matching catalog path or known inventory alias (including keep28 paths)
 in that generation or a later partial generation vetoes
 retirement regardless of file size. A complete newer namespace proof can
@@ -298,3 +299,60 @@ not a prediction of what the NAS listing will contain. Both carry
 `phase1.jsonl` remains governed by production evidence. The agent ran only
 read-only planning; no production migrations, releases, copies, deletes, client
 updates or deployments were performed.
+
+## Connection 13 delivery-retirement fence
+
+Migration **0185 is additive and does not activate the fence**. Activation is
+irreversible and separately authorized; this implementation task performs no
+production transitions. Deploy the new admission middleware to **every API
+instance**, retire all old instances and requests, then use:
+
+```sh
+stoaramactl r2-retire delivery-fence --activate --all-api-instances-gated
+```
+
+This records the effective timestamp, exact policy bytes and SHA
+`060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811`, and immutable
+per-stream UTC windows. Raw feeds/downloads, collated feeds/downloads, joined
+feeds/downloads, and NAS restore lease/result paths refuse outside-window or
+unknown media identities. Kept-window delivery and the reviewed kept-window
+redownload remain available. The connection key is confined to the existing
+pull route allowlist even if its key scopes change; browser/global/producer
+capability routes cannot bypass the fence. NAS stitch tool downloads contain
+pinned ffmpeg/ffprobe executables, not recording media. Other stitch/verify/
+benchmark endpoints do not issue recording download capabilities.
+
+Admission and activation serialize through one advisory lock. Before activation,
+capability responses require a committed download lease covering seven days
+(the maximum S3 URL lifetime), plus the two-minute bounded API request. Existing
+untracked legacy URLs require at least seven days after activation. Settlement
+refuses while either barrier or any recorded lease remains live. Expiry does
+**not** stop an already-running GET: after all capabilities expire, stop/restart
+the NAS download workers, wait for every transfer to finish or terminate, and
+record the concrete drain evidence with the operator CLI:
+
+```sh
+stoaramactl r2-retire delivery-fence \
+  --settle-drain-acknowledgment 'exact NAS worker shutdown/wait evidence and time'
+```
+
+Do not make that acknowledgment while a transfer can still write a media file.
+It is a durable operator attestation, never an automatic inference from expiry.
+Fence, windows, leases and settlement records are immutable. A fresh complete
+listing must **start strictly after settlement**; a listing that finishes after
+settlement but started earlier provides no fence authority. The listing must
+include each candidate's top-level folder, `joined/` where applicable, and known
+inventory alias folders. Later partial listings still veto presence. A kept or
+unknown writer sharing a path prevents fence-based absence. All existing R2
+retirement vetoes, recovery holds, incident identities, joined references, owner
+`all` picks, shared keys and kept-window rules remain independent checks.
+
+Planning with `--hold-release-preview` now also writes
+`after-fence-and-listing-upper-bound.jsonl`. This is the conditional upper bound
+after fence settlement and an adequately scoped fresh listing confirming
+absence, including objects without release/cursor/ACK history. It overlaps
+`listing-absence-upper-bound.jsonl`; do **not** add those two forecasts together.
+It is additional to `after-hold-release.jsonl` and actual eligibility. Its
+`phase=blocked` projection header cannot authorize deletion. Neither activation
+nor any fabricated listing/settlement is needed to produce these read-only
+forecasts on the current production schema.

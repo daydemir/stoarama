@@ -1227,6 +1227,9 @@ func leaseRecordingJob(pool *pgxpool.Pool, principal nodePrincipal) (*recordingL
 func TestAccountClipsFeedPreservesTimestampContractTriState(t *testing.T) {
 	pool, cleanup := testRecordingLeasePool(t)
 	defer cleanup()
+	if _, err := pool.Exec(context.Background(), `CREATE TABLE connections(id bigint PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
 	for _, ddl := range []string{
 		`ALTER TABLE recordings ADD COLUMN delivery text NOT NULL DEFAULT 'nas_pull'`,
@@ -1236,6 +1239,7 @@ func TestAccountClipsFeedPreservesTimestampContractTriState(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	installDeliveryFenceTestSchema(t, pool)
 	raw, err := os.ReadFile("../../../infra/sql/migrations/0132_recording_clip_timestamp_contract.sql")
 	if err != nil {
 		t.Fatal(err)

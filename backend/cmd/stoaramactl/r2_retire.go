@@ -1060,6 +1060,8 @@ func r2RetireDefaultLedger() string {
 
 func runR2Retire(ctx context.Context, cfg config.Config, args []string) {
 	const usage = `usage:
+  stoaramactl r2-retire delivery-fence --activate --all-api-instances-gated
+  stoaramactl r2-retire delivery-fence --settle-drain-acknowledgment EVIDENCE
   stoaramactl r2-retire plan --picks FILE --out DIR [--sample 200 --grace 168h --connection-id N --page-size 5000 --json]
   stoaramactl r2-retire apply --manifest FILE --expected-sha256 SHA --max-bytes N [--budget-24h-bytes N --picks FILE
       --ledger PATH --rate 10 --max-items N --max-manifest-age 72h --skip-ineligible --record-already-absent --json]`
@@ -1073,6 +1075,8 @@ func runR2Retire(ctx context.Context, cfg config.Config, args []string) {
 		log.Fatalf("r2-retire: keep28 policy unavailable (keep everything): %v", err)
 	}
 	switch args[0] {
+	case "delivery-fence":
+		runR2DeliveryFence(ctx, cfg, args[1:])
 	case "release-holds":
 		runR2HoldReleases(ctx, cfg, args[1:], policySHA, windows)
 	case "plan":
