@@ -776,8 +776,8 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if err != nil || !c.Facts.NASCopy {
 			t.Fatal("replayed old receipt masked later presence", err)
 		}
-		// A complete fresh listing started after delivery proves a separate raw's
-		// absence. Bare missing/no-history and incomplete/stale generations do not.
+		// Delivery watermarks alone cannot prove absence, even with a fresh
+		// complete listing. Cleanup receipts remain independent authority.
 		clip(407, 30, outside)
 		exec(`UPDATE recording_clips SET released_at=created_at WHERE id=407;
  INSERT INTO nas_listing_generations(connection_id,generation,started_at,completed_at,folders) VALUES(13,repeat('a',32),now()-interval '1 hour',now(),ARRAY['.','p']);`)
@@ -786,8 +786,8 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			t.Fatal(err)
 		}
 		c, err = r2RetireLoadOne(ctx, pool, "raw", 407, scope, sets)
-		if err != nil || !c.Facts.NASAbsent {
-			t.Fatal("valid listing absence rejected", err)
+		if err != nil || c.Facts.NASAbsent {
+			t.Fatal("unfenced listing accepted as absence", err)
 		}
 		exec(`UPDATE recording_clips SET released_at=now() WHERE id=407`)
 		c, err = r2RetireLoadOne(ctx, pool, "raw", 407, scope, sets)
@@ -884,6 +884,14 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		exec(string(raw))
 		exec(`INSERT INTO recording_clips(id,recording_id,bucket,object_key,size_bytes,sha256,display_path,clip_start_at,clip_end_at,created_at) VALUES(10000001,30,'stoarama','managed/fenced',1000,$1,'p/fenced.mp4','2026-08-01','2026-08-01 00:01:00','2026-08-01')`, r2tSHA)
 		exec(`INSERT INTO recording_collation_outputs VALUES(10000002,900,'joined/nightly-collation-v2/fenced','f/fenced.mp4',2000,$1,'2026-08-01','2026-08-01 01:00:00',ARRAY[10000001]::bigint[],'2026-08-01')`, r2tSHA)
+		// Council probe: released raw, cursor-delivered raw and ACKed collated
+		// identities all have old watermarks and a complete pre-settlement listing.
+		exec(`UPDATE recording_clips SET released_at=created_at WHERE id=10000001`)
+		exec(`INSERT INTO recording_clips(id,recording_id,bucket,object_key,size_bytes,sha256,display_path,clip_start_at,clip_end_at,created_at) VALUES(10000004,30,'stoarama','managed/cursor-fenced',1000,$1,'p/cursor-fenced.mp4','2026-08-01','2026-08-01 00:01:00','2026-08-01')`, r2tSHA)
+		exec(`UPDATE connections SET last_cursor_id=10000004,nas_listing_cursor_at=now()-interval '2 hours';
+ INSERT INTO recording_collation_output_acks(output_id,connection_id,verified_at) VALUES(10000002,13,now()-interval '2 hours');
+ UPDATE nas_listing_generations SET completed_at=NULL;
+ INSERT INTO nas_listing_generations(connection_id,generation,started_at,completed_at,folders) VALUES(13,repeat('0',32),now()-interval '1 hour',now(),ARRAY['.','p','f','joined']);`)
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -907,19 +915,29 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			for _, identity := range []struct {
 				kind string
 				id   int64
-			}{{"raw", 10000001}, {"collated", 10000002}} {
+			}{{"raw", 10000001}, {"raw", 10000004}, {"collated", 10000002}} {
 				c, err := r2RetireLoadOne(ctx, pool, identity.kind, identity.id, scope, sets)
 				if err != nil || c.Facts.NASAbsent != want {
 					t.Fatal(identity, "live absence", c.Facts.NASAbsent, want, err)
+				}
+				if reason, _, eligible := r2RetireDecideForScope(c, scope, windows, picks.Choices); eligible != want {
+					t.Fatal(identity, "live retirementEligible", eligible, want, reason)
 				}
 				c.Facts.NASAbsent = false
 				sets.Evidence.apply(&c)
 				if c.Facts.NASAbsent != want {
 					t.Fatal(identity, "bulk absence", c.Facts.NASAbsent, want)
 				}
+				if reason, _, eligible := r2RetireDecideForScope(c, scope, windows, picks.Choices); eligible != want {
+					t.Fatal(identity, "bulk retirementEligible", eligible, want, reason)
+				}
 			}
 		}
 		check(false) // completed listing started before durable fence settlement.
+		exec(`INSERT INTO nas_listing_generations(connection_id,generation,started_at,completed_at,folders) SELECT 13,repeat('1',32),settled_at,clock_timestamp(),ARRAY['.','p','f','joined'] FROM nas_delivery_retirement_settlements WHERE connection_id=13`)
+		check(false) // equality is insufficient: the walk must start strictly later.
+		exec(`INSERT INTO nas_listing_generations(connection_id,generation,folders) VALUES(13,repeat('2',32),ARRAY['.','p','f','joined'])`)
+		check(false) // a post-settlement partial generation cannot prove absence.
 		exec(`INSERT INTO nas_listing_generations(connection_id,generation,folders,completed_at) VALUES(13,repeat('d',32),ARRAY['.'],now())`)
 		check(false) // complete but missing the candidate folders.
 		exec(`INSERT INTO nas_listing_generations(connection_id,generation,folders,completed_at) VALUES(13,repeat('e',32),ARRAY['.','p','f','joined'],now())`)

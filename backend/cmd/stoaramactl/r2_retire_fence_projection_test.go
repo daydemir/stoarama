@@ -43,7 +43,7 @@ func TestR2FenceProjectionPreservesVetoesAndCannotExecute(t *testing.T) {
 	}
 	p := &r2RetireProjection{}
 	p.add(base, scope, picks, windows, false)
-	if p.FenceListingPotential.Objects != 1 || p.ListingPotential.Objects != 0 {
+	if p.FenceListingPotential.Objects != 1 {
 		t.Fatal("unsettled delivery was not projected only under fence")
 	}
 	path := t.TempDir()

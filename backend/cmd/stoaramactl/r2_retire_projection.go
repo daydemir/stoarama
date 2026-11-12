@@ -15,19 +15,15 @@ import (
 // after explicit releases, and the conditional upper bound if a future fresh
 // complete listing confirms absence. They never manufacture production proof.
 type r2RetireProjection struct {
-	AfterRelease               r2RetireStat `json:"after_hold_release"`
-	FenceListingPotential      r2RetireStat `json:"after_fence_and_listing_upper_bound"`
-	FenceListingSHA            string       `json:"after_fence_and_listing_sha256"`
-	fenceItems                 []r2RetireItem
-	ListingPotential           r2RetireStat `json:"listing_absence_upper_bound"`
-	AfterReleaseSHA            string       `json:"after_hold_release_sha256"`
-	ListingSHA                 string       `json:"listing_absence_upper_bound_sha256"`
-	release                    map[string]bool
-	held                       map[string]bool
-	delivery                   map[string]bool
-	unsafePaths                map[string]bool
-	rawAliases                 map[int64]string
-	releaseItems, listingItems []r2RetireItem
+	AfterRelease          r2RetireStat `json:"after_hold_release"`
+	AfterReleaseSHA       string       `json:"after_hold_release_sha256"`
+	FenceListingPotential r2RetireStat `json:"after_fence_and_listing_upper_bound"`
+	FenceListingSHA       string       `json:"after_fence_and_listing_sha256"`
+
+	fenceItems, releaseItems []r2RetireItem
+	release, held            map[string]bool
+	unsafePaths              map[string]bool
+	rawAliases               map[int64]string
 }
 
 func loadR2RetireProjection(ctx context.Context, q r2RetireQuerier, path, digest string, picks r2RetirePicks, policy string) (*r2RetireProjection, error) {
@@ -42,7 +38,7 @@ func loadR2RetireProjection(ctx context.Context, q r2RetireQuerier, path, digest
 	if json.Unmarshal(raw, &m) != nil || m.Tool != "r2-retire release-holds" || m.Version != 1 || m.PolicySHA != policy || m.PicksSHA != picks.SHA256 || time.Since(m.CreatedAt) > 24*time.Hour {
 		return nil, errors.New("hold release preview authority differs")
 	}
-	p := &r2RetireProjection{release: map[string]bool{}, held: map[string]bool{}, delivery: map[string]bool{}}
+	p := &r2RetireProjection{release: map[string]bool{}, held: map[string]bool{}}
 	itemIDs := []int64{}
 	for _, i := range m.Items {
 		p.release[retireIdentity(i.Candidate.Kind, i.Candidate.SourceID)] = true
@@ -129,38 +125,6 @@ func loadR2RetireProjection(ctx context.Context, q r2RetireQuerier, path, digest
 	for _, id := range r2RetireIncidentSources {
 		p.held[retireIdentity("raw", id)] = true
 	}
-	rows, err = q.Query(ctx, `SELECT c.id FROM recording_clips c JOIN recordings r ON r.id=c.recording_id JOIN connections n ON n.id=13 AND n.account_id=r.account_id WHERE r.account_id=47 AND c.purged_at IS NULL AND (c.released_at IS NOT NULL OR c.id<=n.last_cursor_id)`)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		p.delivery[retireIdentity("raw", id)] = true
-	}
-	rows.Close()
-	if rows.Err() != nil {
-		return nil, rows.Err()
-	}
-	rows, err = q.Query(ctx, `SELECT output_id FROM recording_collation_output_acks WHERE connection_id=13`)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		p.delivery[retireIdentity("collated", id)] = true
-	}
-	rows.Close()
-	if rows.Err() != nil {
-		return nil, rows.Err()
-	}
 	if err := p.loadFenceWriters(ctx, q); err != nil {
 		return nil, err
 	}
@@ -194,14 +158,6 @@ func (p *r2RetireProjection) add(c r2RetireCandidate, scope r2RetireScope, picks
 			p.fenceItems = append(p.fenceItems, r2RetireItem{r2RetireCandidate: c, Reason: "conditional_on_delivery_fence_settlement_and_future_complete_listing_absence", Choice: choice})
 		}
 	}
-	if reason != "nas_absence_unproven" || !p.delivery[key] {
-		return
-	}
-	c.Facts.NASAbsent = true
-	if _, _, ok := r2RetireDecideForScope(c, scope, windows, picks.Choices); ok {
-		p.ListingPotential.add(c.SizeBytes)
-		p.listingItems = append(p.listingItems, r2RetireItem{r2RetireCandidate: c, Reason: "conditional_on_future_complete_listing_absence", Choice: choice})
-	}
 }
 func (p *r2RetireProjection) write(dir string, h r2RetireHeader) error {
 	h.Phase = r2RetireBlocked
@@ -210,12 +166,6 @@ func (p *r2RetireProjection) write(dir string, h r2RetireHeader) error {
 	h.Bytes = p.AfterRelease.Bytes
 	var err error
 	p.AfterReleaseSHA, err = writeR2RetireManifest(filepath.Join(dir, "after-hold-release.jsonl"), h, p.releaseItems)
-	if err != nil {
-		return err
-	}
-	h.Items = p.ListingPotential.Objects
-	h.Bytes = p.ListingPotential.Bytes
-	p.ListingSHA, err = writeR2RetireManifest(filepath.Join(dir, "listing-absence-upper-bound.jsonl"), h, p.listingItems)
 	if err != nil {
 		return err
 	}

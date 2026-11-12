@@ -231,11 +231,11 @@ The API assigns the start timestamp before walking begins. It validates page
 sequence/replay digests, unique canonical paths, and per-folder file/byte
 counts. It marks a generation complete only when **all** declared top-level
 folders (and the root-files folder) completed with consistent stored counts.
-Retirement accepts absence only from a generation **started within 24 hours**
-and strictly after the path's latest known possible delivery/cursor write.
-Cursor advance time is recorded by the server after migration; unknown writer
-watermarks remain blocked unless the delivery-retirement fence below is settled.
-Collated outputs need their delivery ACK time or that settled fence.
+Listing-derived absence requires a settled delivery-retirement fence covering
+that object and a complete generation **started within 24 hours and strictly
+after settlement**. Release times, cursor watermarks and delivery ACKs alone
+never establish listing absence. Effective cleanup deletion receipts remain
+an independent positive evidence class.
 Any matching catalog path or known inventory alias (including keep28 paths)
 in that generation or a later partial generation vetoes
 retirement regardless of file size. A complete newer namespace proof can
@@ -291,16 +291,32 @@ stoaramactl r2-retire plan --nas-backed --connection-id 13 --sample 0 \
 ```
 
 `after-hold-release.jsonl` estimates additional live-key eligibility after that
-exact release. `listing-absence-upper-bound.jsonl` is the **additional conditional
-upper bound** currently blocked solely by unproven absence, with known delivery
-history, if a future fresh complete listing confirms those paths absent. It is
-not a prediction of what the NAS listing will contain. Both carry
+exact release. The fence-and-listing projection below is the additional
+conditional upper bound if a future fresh complete listing started after
+fence settlement confirms absence. These forecasts carry
 `phase=blocked` and a projection-only header that `apply` rejects. Actual
 `phase1.jsonl` remains governed by production evidence. The agent ran only
 read-only planning; no production migrations, releases, copies, deletes, client
 updates or deployments were performed.
 
 ## Connection 13 delivery-retirement fence
+
+Before applying migration 0185 to a populated database, a separately authorized
+operator must run this standalone statement **outside a transaction**:
+
+```sql
+CREATE INDEX CONCURRENTLY nas_delivery_raw_writer_path
+  ON recording_clips(display_path) WHERE display_path<>'';
+```
+
+Following migration 0149, migration 0185 refuses to build the missing index when
+`pg_relation_size(recording_clips)` exceeds 128 MiB. Small/fresh databases build
+it transactionally. An existing index is accepted only if it is valid, ready,
+nonunique, and exactly matches the btree key, default opclass/collation/order,
+no included columns, and predicate above. A failed concurrent build can leave
+an invalid index: inspect and repair it before retrying; migration 0185 rejects
+invalid or mismatched indexes rather than silently accepting their names.
+This implementation task does not execute the operator statement in production.
 
 Migration **0185 is additive and does not activate the fence**. Activation is
 irreversible and separately authorized; this implementation task performs no
@@ -350,8 +366,8 @@ retirement vetoes, recovery holds, incident identities, joined references, owner
 Planning with `--hold-release-preview` now also writes
 `after-fence-and-listing-upper-bound.jsonl`. This is the conditional upper bound
 after fence settlement and an adequately scoped fresh listing confirming
-absence, including objects without release/cursor/ACK history. It overlaps
-`listing-absence-upper-bound.jsonl`; do **not** add those two forecasts together.
+absence, regardless of release/cursor/ACK history. The obsolete listing-only
+watermark forecast is no longer emitted.
 It is additional to `after-hold-release.jsonl` and actual eligibility. Its
 `phase=blocked` projection header cannot authorize deletion. Neither activation
 nor any fabricated listing/settlement is needed to produce these read-only

@@ -95,7 +95,38 @@ CREATE FUNCTION nas_delivery_fence_coverage() RETURNS TABLE(kind text,source_id 
  blocked AS (SELECT DISTINCT p FROM paths WHERE NOT outside)
  SELECT o.kind,o.source_id,o.outside AND NOT EXISTS(SELECT 1 FROM paths p JOIN blocked b USING(p) WHERE p.kind=o.kind AND p.source_id=o.source_id) covered FROM objects o; END $$;
 
-CREATE INDEX nas_delivery_raw_writer_path ON recording_clips(display_path) WHERE display_path<>'';
+-- Follow 0149: never build a write-blocking index on a large live table.
+-- Precreate the exact index CONCURRENTLY outside the migration transaction.
+DO $$
+DECLARE
+ table_oid REGCLASS := 'recording_clips'::regclass;
+ index_oid REGCLASS := to_regclass('nas_delivery_raw_writer_path');
+ index_ok BOOLEAN;
+BEGIN
+ IF index_oid IS NULL THEN
+  IF pg_relation_size(table_oid)>134217728 THEN
+   RAISE EXCEPTION 'precreate nas_delivery_raw_writer_path with CREATE INDEX CONCURRENTLY ON recording_clips(display_path) WHERE display_path<>'''' before migration';
+  END IF;
+  CREATE INDEX nas_delivery_raw_writer_path ON recording_clips(display_path) WHERE display_path<>'';
+ ELSE
+  SELECT i.indisvalid AND i.indisready AND NOT i.indisunique
+   AND i.indrelid=table_oid AND i.indnkeyatts=1 AND i.indnatts=1
+   AND a.amname='btree' AND i.indoption[0]=0
+   AND i.indcollation[0]=c.attcollation
+   AND o.opcdefault AND o.opcintype=c.atttypid
+   AND pg_get_indexdef(i.indexrelid,1,false)='display_path'
+   AND pg_get_expr(i.indpred,i.indrelid)='(display_path <> ''''::text)'
+  INTO index_ok
+  FROM pg_index i JOIN pg_class x ON x.oid=i.indexrelid
+  JOIN pg_am a ON a.oid=x.relam
+  JOIN pg_attribute c ON c.attrelid=table_oid AND c.attname='display_path'
+  JOIN pg_opclass o ON o.oid=i.indclass[0]
+  WHERE i.indexrelid=index_oid;
+  IF index_ok IS DISTINCT FROM true THEN
+   RAISE EXCEPTION 'nas_delivery_raw_writer_path exists but is not the valid exact delivery writer index';
+  END IF;
+ END IF;
+END $$;
 CREATE FUNCTION nas_delivery_fence_object_covered(k text,i bigint) RETURNS boolean LANGUAGE plpgsql STABLE AS $$ BEGIN
  IF nas_delivery_object_span(k,i)<>-1 THEN RETURN false; END IF;
  RETURN NOT EXISTS(SELECT 1 FROM nas_delivery_object_paths(k,i) p WHERE
