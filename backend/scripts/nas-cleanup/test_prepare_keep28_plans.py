@@ -19,7 +19,7 @@ class Keep28PlanTests(unittest.TestCase):
     def test_preparer_requires_current_delivery_hold_check(self):
         with patch.object(k, 'query', return_value=[]) as query:
             k.stream_candidates(k.load_policy(k.POLICY_PATH)[3], 'stoarama', 'psql')
-        self.assertIn("NOT delivery_nas_held(x.kind,x.source_id,x.path,'',x.size_bytes)", query.call_args.args[0])
+        self.assertIn("NOT delivery_nas_held(x.kind,x.source_id,x.path,x.sha256,x.size_bytes)", query.call_args.args[0])
 
     def test_policy_is_pinned_and_complete(self):
         policy = k.load_policy(k.POLICY_PATH)
