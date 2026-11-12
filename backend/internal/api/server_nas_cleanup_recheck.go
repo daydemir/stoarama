@@ -39,8 +39,12 @@ func (s *Server) handleAdminNASCleanupRecheck(w http.ResponseWriter, r *http.Req
 		return
 	}
 	defer tx.Rollback(ctx)
-	// Same identity/mode fence as plan control. Observations hold FOR SHARE
-	// of the plan, so an in-flight observation must drain before this reset.
+	// Same canonical scope as plan control: drain in-flight observations
+	// before resetting any item evidence.
+	if err = cleanupLockPlans(ctx, tx, []int64{id}); err != nil {
+		util.WriteError(w, 409, "cleanup recheck fence unavailable")
+		return
+	}
 	var sha, mode, binding string
 	if err = tx.QueryRow(ctx, `SELECT plan_sha256,mode,report_sha256 FROM nas_cleanup_plans WHERE id=$1 AND account_id=47 AND connection_id=13 FOR UPDATE`, id).Scan(&sha, &mode, &binding); err != nil || sha != req.PlanSHA {
 		util.WriteError(w, 409, "plan identity differs")

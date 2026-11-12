@@ -1567,6 +1567,32 @@ class CleanupProtocol2Tests(unittest.TestCase):
     def journal_observe(self, item_id, **extra):
         pull.cleanup_journal(self.inventory, item_id, 'observe', dict(attempt=1, plan_sha256='a'*64, outcome='conflict', proof=None, error='x', request_id='%032x' % item_id, **extra))
 
+    def test_result_transaction_failure_retains_exact_receipt_for_replay(self):
+        receipt = dict(attempt=1, plan_sha256='a'*64, proof_sha256='b'*64,
+                       outcome='deleted', unlink_attempted=True)
+        pull.cleanup_journal(self.inventory, 900, 'result', receipt)
+        checkpoint = pull.cleanup_journal(self.inventory)
+        # Even repeated failures over hours must stay replayable, never quarantine.
+        def unavailable(cfg, path, body, **kwargs):
+            self.assertTrue(path.endswith('/900/result'))
+            self.assertEqual(body, receipt)
+            raise pull.urllib.error.HTTPError(path, 503, 'replay required', {}, None)
+        with mock.patch.object(pull, 'restore_api', side_effect=unavailable), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('receipt replay must not unlink')):
+            for cycle in range(pull.CLEANUP_REPLAY_QUARANTINE_AFTER + 1):
+                with mock.patch.object(pull.time, 'time', return_value=10000 + cycle*901):
+                    pull.cleanup_replay_receipts(self.cfg, self.inventory)
+                self.assertEqual(pull.cleanup_journal(self.inventory), checkpoint)
+        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_quarantine').fetchone()[0], 0)
+        # A committed contradiction is a 409; its server evidence is durable.
+        def committed(cfg, path, body, **kwargs):
+            self.assertEqual(body, receipt)
+            raise pull.urllib.error.HTTPError(path, 409, 'committed contradiction', {}, None)
+        with mock.patch.object(pull, 'restore_api', side_effect=committed):
+            pull.cleanup_replay_receipts(self.cfg, self.inventory)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+        archived = self.inventory.db.execute('SELECT item_id,phase,body FROM cleanup_rejected_receipts').fetchone()
+        self.assertEqual((archived[0], archived[1], json.loads(archived[2])), (900, 'result', receipt))
+
     def test_failing_replay_never_blocks_leasing_and_is_quarantined_not_dropped(self):
         pull.CLEANUP_STATUS.__init__()
         self.journal_observe(900)

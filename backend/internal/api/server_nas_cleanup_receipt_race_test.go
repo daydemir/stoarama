@@ -133,8 +133,7 @@ func TestNASCleanupContradictionRacingAdvancePausesSuccessor(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer pool.Close()
-			advanceServer := *f.s
-			advanceServer.pool = pool
+			advanceServer := &Server{pool: pool, r2: f.s.r2, cfg: f.s.cfg}
 			ctx, cancel := context.WithTimeout(f.ctx, 10*time.Second)
 			defer cancel()
 			advanced := make(chan error, 1)

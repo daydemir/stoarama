@@ -88,6 +88,10 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/api ./cmd/stoaramactl ./internal/db -run '^Test(NASSelectedVerify|OriginalWitness|NASCleanup|NASStitch|NASClient|NASDiagnostics)' -count=1 -v
+      - name: Test cleanup receipt lock order and transaction replay under race detector
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/api -run '^TestNASCleanup(ReceiptLockOrder|ReceiptTransactionRetry|CloseRacingContradictoryReceiptRefuses|ContradictionRacingAdvancePausesSuccessor)$' -race -count=5
       - name: NAS cleanup exact-file dry run and failure recovery
         working-directory: .
         run: python3 -m unittest discover -s clients/nas-pull -p test_cleanup.py -v

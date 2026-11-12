@@ -88,7 +88,8 @@ func cleanupObservationFailure(w http.ResponseWriter, ctx context.Context, statu
 // cleanupObserveEnv carries per-transaction caches for a batch of
 // observations. The zero value (single-item endpoint) caches nothing.
 type cleanupObserveEnv struct {
-	session cleanupClientSession
+	scopeLocked bool
+	session     cleanupClientSession
 	// Refuse an enable racing the initial mode lookup under the dry-run context.
 	dryRunOnly    bool
 	freshRequests map[int64]bool
@@ -99,9 +100,6 @@ type cleanupObserveEnv struct {
 	budgetHeld bool
 	issued     int64
 	prefetched map[int64]cleanupPrefetchedRecovery
-	// Enabled plans whose execution fence was taken at top level before the
-	// budget lock (batch path); see cleanupObserveOne.
-	lockedPlans map[int64]bool
 }
 
 // cleanupRecoveryPermits: a permit needs a full streamed-SHA verification
@@ -118,7 +116,7 @@ func cleanupRecoveryPermits(mode, recovery string) bool {
 // cleanupExpireLeasesSQL returns expired leases of a connection to pending
 // (or unverified after 3 attempts). An expired execution lease is an anomaly
 // and pauses its enabled plan and batch in the same statement.
-const cleanupExpireLeasesSQL = `WITH expired AS (UPDATE nas_cleanup_items i SET state=CASE WHEN attempt-recheck_attempt_base>=3 THEN 'unverified' ELSE 'pending' END,lease_expires_at=NULL,updated_at=now() FROM nas_cleanup_plans p WHERE p.id=i.plan_id AND p.connection_id=$1 AND i.state='leased' AND i.lease_expires_at<now() RETURNING i.plan_id),
+const cleanupExpireLeasesSQL = `WITH expired AS (UPDATE nas_cleanup_items i SET state=CASE WHEN attempt-recheck_attempt_base>=3 THEN 'unverified' ELSE 'pending' END,lease_expires_at=NULL,updated_at=now() FROM nas_cleanup_plans p WHERE p.id=i.plan_id AND p.connection_id=$1 AND p.id=ANY($3) AND i.state='leased' AND i.lease_expires_at<now() RETURNING i.plan_id),
 pz AS (UPDATE nas_cleanup_plans SET ` + cleanupAutoPauseSet + ` WHERE mode='enabled' AND id IN (SELECT plan_id FROM expired) RETURNING id)
 UPDATE nas_cleanup_batches SET ` + cleanupAutoPauseSet + ` WHERE mode='enabled' AND plan_ids && ARRAY(SELECT id FROM pz)`
 
@@ -130,7 +128,7 @@ func (s *Server) cleanupHousekeeping(ctx context.Context, cid int64) {
 	if s.pool == nil {
 		return
 	}
-	if _, err := s.pool.Exec(ctx, cleanupExpireLeasesSQL, cid, "execution lease expired without a report"); err != nil {
+	if err := s.cleanupExpireLeases(ctx, cid); err != nil {
 		log.Printf("nas cleanup lease expiry deferred: %v", err)
 	}
 	s.cleanupExpireApprovals(ctx)
@@ -140,6 +138,29 @@ func (s *Server) cleanupHousekeeping(ctx context.Context, cid int64) {
 	if _, err := s.pool.Exec(ctx, cleanupPruneObservationRequestsSQL); err != nil {
 		log.Printf("nas cleanup request retention deferred: %v", err)
 	}
+}
+
+func (s *Server) cleanupExpireLeases(ctx context.Context, cid int64) error {
+	var pending bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE p.connection_id=$1 AND i.state='leased' AND i.lease_expires_at<now())`, cid).Scan(&pending); err != nil {
+		return err
+	}
+	if !pending {
+		return nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	plans, err := cleanupLockConnection(ctx, tx, cid)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, cleanupExpireLeasesSQL, cid, "execution lease expired without a report", plans); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // IDs for ever-authorized items remain permanent. Old unissued IDs may expire:
@@ -192,8 +213,39 @@ func (s *Server) cleanupExpireApprovals(ctx context.Context) {
 	if s.pool == nil {
 		return
 	}
-	_, err := s.pool.Exec(ctx, `WITH pz AS (UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: approval expired; '||approval_reason,500) WHERE mode='enabled' AND (approved_until IS NULL OR approved_until<=now()) RETURNING id)
+	var pending bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_plans WHERE mode='enabled' AND (approved_until IS NULL OR approved_until<=now())) OR EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled' AND approved_until<=now())`).Scan(&pending); err != nil {
+		log.Printf("nas cleanup approval expiry deferred: %v", err)
+		return
+	}
+	if !pending {
+		return
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		log.Printf("nas cleanup approval expiry deferred: %v", err)
+		return
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, nasCleanupPublicFence); err != nil {
+		log.Printf("nas cleanup approval expiry deferred: %v", err)
+		return
+	}
+	var plans []int64
+	if err = tx.QueryRow(ctx, `SELECT coalesce(array_agg(id ORDER BY id),'{}') FROM (
+ SELECT id FROM nas_cleanup_plans WHERE mode='enabled' UNION SELECT unnest(plan_ids) FROM nas_cleanup_batches WHERE mode='enabled') scope`).Scan(&plans); err != nil {
+		log.Printf("nas cleanup approval expiry deferred: %v", err)
+		return
+	}
+	if err = cleanupLockPlans(ctx, tx, plans); err != nil {
+		log.Printf("nas cleanup approval expiry deferred: %v", err)
+		return
+	}
+	_, err = tx.Exec(ctx, `WITH pz AS (UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: approval expired; '||approval_reason,500) WHERE mode='enabled' AND (approved_until IS NULL OR approved_until<=now()) RETURNING id)
 UPDATE nas_cleanup_batches SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: approval expired; '||approval_reason,500) WHERE mode='enabled' AND (approved_until<=now() OR plan_ids && ARRAY(SELECT id FROM pz))`)
+	if err == nil {
+		err = tx.Commit(ctx)
+	}
 	if err != nil {
 		log.Printf("nas cleanup approval expiry deferred: %v", err)
 	}
@@ -758,6 +810,17 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		return
 	}
 	defer tx.Rollback(ctx)
+	itemIDs := make([]int64, 0, len(req.Observations))
+	for n, o := range req.Observations {
+		if valid[n] {
+			itemIDs = append(itemIDs, o.ItemID)
+		}
+	}
+	if err = cleanupLockItems(ctx, tx, cid, itemIDs); err != nil {
+		cleanupObservationFailure(w, ctx, 503, "cleanup observation fence unavailable")
+		return
+	}
+	env.scopeLocked = true
 	var anyEnabled bool
 	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2 AND p.mode='enabled')`, ids, cid).Scan(&anyEnabled); err != nil {
 		cleanupObservationFailure(w, ctx, 500, "cleanup observation begin failed")
@@ -769,22 +832,6 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		return
 	}
 	if anyEnabled && s.cfg.NASCleanupDeletionEnabled {
-		// Same lock order as the single-item path: every enabled plan's
-		// execution fence (ascending id), then the budget lock, taken once at
-		// top level with an exact running total until commit.
-		env.lockedPlans = map[int64]bool{}
-		var plans []int64
-		if err = tx.QueryRow(ctx, `SELECT coalesce(array_agg(DISTINCT p.id ORDER BY p.id),'{}') FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2 AND p.mode='enabled'`, ids, cid).Scan(&plans); err != nil {
-			cleanupObservationFailure(w, ctx, 500, "cleanup plan execution fence failed")
-			return
-		}
-		for _, plan := range plans {
-			if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPlanLockBase+plan); err != nil {
-				cleanupObservationFailure(w, ctx, 500, "cleanup plan execution fence failed")
-				return
-			}
-			env.lockedPlans[plan] = true
-		}
 		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupBudgetLock); err == nil {
 			err = tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&env.issued)
 		}
@@ -946,24 +993,66 @@ func (s *Server) handleAccountNASCleanupResultBatch(w http.ResponseWriter, r *ht
 		return
 	}
 	s.cleanupHousekeeping(ctx, cid)
-	tx, err := s.pool.Begin(ctx)
+	results, advance, err := s.cleanupSaveReceipts(ctx, cid, req.Receipts)
 	if err != nil {
-		cleanupBatchError(w, 500, "cleanup receipt save failed")
+		w.Header().Set("Retry-After", "1")
+		cleanupBatchError(w, 503, "cleanup receipt save failed; replay required")
 		return
 	}
+	for planID := range advance {
+		s.cleanupAdvanceBatchAfter(ctx, planID)
+	}
+	rows := make([]map[string]any, 0, len(results))
+	for _, result := range results {
+		result.body["status"] = result.status
+		rows = append(rows, result.body)
+	}
+	logCleanupBatchOutcome("result-batch", cid, rows)
+	util.WriteJSON(w, 200, map[string]any{"results": rows})
+}
+
+// Retry the whole transaction, including fencing and commit, for ANY database
+// failure. Never turn rolled-back evidence into a terminal 409. After bounded
+// retries a 503 leaves the client's durable result journal eligible for replay.
+// A 400/409 below therefore means the evidence transaction DID commit.
+type cleanupReceiptResult struct {
+	status int
+	body   map[string]any
+}
+
+func (s *Server) cleanupSaveReceipts(ctx context.Context, cid int64, receipts []cleanupReceipt) ([]cleanupReceiptResult, map[int64]bool, error) {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		var results []cleanupReceiptResult
+		var advance map[int64]bool
+		results, advance, err = s.cleanupSaveReceiptsOnce(ctx, cid, receipts)
+		if err == nil {
+			return results, advance, nil
+		}
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
+	}
+	return nil, nil, err
+}
+
+func (s *Server) cleanupSaveReceiptsOnce(ctx context.Context, cid int64, receipts []cleanupReceipt) ([]cleanupReceiptResult, map[int64]bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	defer tx.Rollback(ctx)
-	itemIDs := make([]int64, 0, len(req.Receipts))
-	for _, receipt := range req.Receipts {
+	itemIDs := make([]int64, 0, len(receipts))
+	for _, receipt := range receipts {
 		itemIDs = append(itemIDs, receipt.ItemID)
 	}
 	if err = cleanupReceiptFence(ctx, tx, cid, itemIDs); err != nil {
-		cleanupBatchError(w, 500, "cleanup receipt fence failed")
-		return
+		return nil, nil, err
 	}
-	results := make([]map[string]any, 0, len(req.Receipts))
+	results := make([]cleanupReceiptResult, 0, len(receipts))
 	advance := map[int64]bool{}
 	firstReceipt := map[int64][]byte{}
-	for _, receipt := range req.Receipts {
+	for _, receipt := range receipts {
 		id := receipt.ItemID
 		payload, _ := json.Marshal(receipt)
 		if prior, ok := firstReceipt[id]; ok && string(prior) != string(payload) {
@@ -972,8 +1061,7 @@ func (s *Server) handleAccountNASCleanupResultBatch(w http.ResponseWriter, r *ht
 			// Apply bound evidence first so an accepted refusal becomes uncertain.
 			_, evidencePaused, _, err := cleanupApplyReceipt(ctx, tx, cid, id, receipt)
 			if err != nil {
-				cleanupBatchError(w, 500, "cleanup receipt save failed")
-				return
+				return nil, nil, err
 			}
 			reason := "item " + strconv.FormatInt(id, 10) + " conflicting duplicate deletion receipts"
 			var pausedPlans int
@@ -982,43 +1070,35 @@ func (s *Server) handleAccountNASCleanupResultBatch(w http.ResponseWriter, r *ht
  pz AS (UPDATE nas_cleanup_plans SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND (id IN (SELECT plan_id FROM source) OR id IN (SELECT unnest(plan_ids) FROM batches)) RETURNING id),
  bz AS (UPDATE nas_cleanup_batches SET `+cleanupAutoPauseSet+` WHERE id IN (SELECT id FROM batches) RETURNING id)
  SELECT (SELECT count(*) FROM pz)::int+(SELECT count(*) FROM bz)::int`, id, reason, cid).Scan(&pausedPlans); err != nil {
-				cleanupBatchError(w, 500, "cleanup receipt save failed")
-				return
+				return nil, nil, err
 			}
-			results = append(results, map[string]any{"item_id": id, "status": 409, "error": "conflicting duplicate receipt for this item in one request", "plan_paused": evidencePaused || pausedPlans > 0})
+			results = append(results, cleanupReceiptResult{409, map[string]any{"item_id": id, "error": "conflicting duplicate receipt for this item in one request", "plan_paused": evidencePaused || pausedPlans > 0}})
 			continue
 		} else if !ok {
 			firstReceipt[id] = payload
 		}
 		updated, paused, planID, err := cleanupApplyReceipt(ctx, tx, cid, id, receipt)
 		if err != nil {
-			cleanupBatchError(w, 500, "cleanup receipt save failed")
-			return
+			return nil, nil, err
 		}
 		if !validCleanupReceipt(receipt) {
-			results = append(results, map[string]any{"item_id": id, "status": 400, "error": "invalid cleanup deletion receipt", "plan_paused": paused})
+			results = append(results, cleanupReceiptResult{400, map[string]any{"item_id": id, "error": "invalid cleanup deletion receipt", "plan_paused": paused}})
 			continue
 		}
 		if updated != 1 {
-			results = append(results, map[string]any{"item_id": id, "status": 409, "error": "cleanup receipt differs or task is not deletion-issued", "plan_paused": paused})
+			results = append(results, cleanupReceiptResult{409, map[string]any{"item_id": id, "error": "cleanup receipt differs or task is not deletion-issued", "plan_paused": paused}})
 			continue
 		}
 		if state := cleanupReceiptState(receipt); state == "deleted" || state == "keep" {
 			advance[planID] = true
 		}
 		ack := cleanupReceiptAck(id, receipt, paused)
-		ack["status"] = 200
-		results = append(results, ack)
+		results = append(results, cleanupReceiptResult{200, ack})
 	}
 	if err = tx.Commit(ctx); err != nil {
-		cleanupBatchError(w, 500, "cleanup receipt save failed")
-		return
+		return nil, nil, err
 	}
-	for planID := range advance {
-		s.cleanupAdvanceBatchAfter(ctx, planID)
-	}
-	logCleanupBatchOutcome("result-batch", cid, results)
-	util.WriteJSON(w, 200, map[string]any{"results": results})
+	return results, advance, nil
 }
 
 // cleanupAdvanceBatchAfter advances an enabled batch when a terminal
@@ -1091,6 +1171,16 @@ func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
 	var shas []string
 	var reason string
 	var until *time.Time
+	err = tx.QueryRow(ctx, `SELECT plan_ids FROM nas_cleanup_batches WHERE mode='enabled' AND account_id=47 AND connection_id=13`).Scan(&ids)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err = cleanupLockPlans(ctx, tx, ids); err != nil {
+		return err
+	}
 	err = tx.QueryRow(ctx, `SELECT id,plan_ids,plan_sha256s,approval_reason,approved_until FROM nas_cleanup_batches WHERE mode='enabled' AND account_id=47 AND connection_id=13 FOR UPDATE`).Scan(&batchID, &ids, &shas, &reason, &until)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
@@ -1218,6 +1308,10 @@ func (s *Server) handleAdminNASCleanupBatchEnable(w http.ResponseWriter, r *http
 		util.WriteError(w, 409, "another cleanup plan or batch is enabled; pause it first")
 		return
 	}
+	if err = cleanupLockPlans(ctx, tx, req.PlanIDs); err != nil {
+		util.WriteError(w, 500, "cleanup batch fence failed")
+		return
+	}
 	shas := make([]string, len(req.PlanIDs))
 	var total int64
 	for n, id := range req.PlanIDs {
@@ -1291,6 +1385,14 @@ func (s *Server) handleAdminNASCleanupBatchControl(w http.ResponseWriter, r *htt
 	defer tx.Rollback(ctx)
 	var sha, mode string
 	var ids []int64
+	if err = tx.QueryRow(ctx, `SELECT plan_ids FROM nas_cleanup_batches WHERE id=$1 AND account_id=47 AND connection_id=13`, id).Scan(&ids); err != nil {
+		util.WriteError(w, 409, "batch identity differs")
+		return
+	}
+	if err = cleanupLockPlans(ctx, tx, ids); err != nil {
+		util.WriteError(w, 500, "cleanup batch control fence failed")
+		return
+	}
 	if err = tx.QueryRow(ctx, `SELECT batch_sha256,mode,plan_ids FROM nas_cleanup_batches WHERE id=$1 AND account_id=47 AND connection_id=13 FOR UPDATE`, id).Scan(&sha, &mode, &ids); err != nil || sha != req.BatchSHA {
 		util.WriteError(w, 409, "batch identity differs")
 		return

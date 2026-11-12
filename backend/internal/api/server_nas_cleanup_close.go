@@ -32,10 +32,10 @@ func (s *Server) handleAdminNASCleanupClose(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	defer tx.Rollback(ctx)
-	// Match enable/batch order: public fence before plan locks. Observations
-	// take the per-plan fence before any row lock; close drains those too.
+	// Match enable/advance and drain receipt/observation writers before
+	// inspecting committed evidence in canonical plan -> batch -> item order.
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err == nil {
-		_, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPlanLockBase+id)
+		err = cleanupLockPlans(ctx, tx, []int64{id})
 	}
 	if err != nil {
 		util.WriteError(w, 409, "cleanup close fence unavailable")
@@ -52,8 +52,8 @@ func (s *Server) handleAdminNASCleanupClose(w http.ResponseWriter, r *http.Reque
 	}
 	var busy, uncertain bool
 	var issued, released int
-	// Drain item writes too: lease issuance locks items without locking the
-	// plan. Paused plans cannot acquire new work. Re-read the busy evidence
+	// Drain item writes too, including previously in-flight lease issuance.
+	// Paused plans cannot acquire new work. Re-read the busy evidence
 	// after those transactions commit; a newly committed live lease refuses
 	// close. No item evidence is rewritten.
 	rows, err := tx.Query(ctx, `SELECT id FROM nas_cleanup_items WHERE plan_id=$1 ORDER BY id FOR UPDATE`, id)

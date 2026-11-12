@@ -43,8 +43,12 @@ func (s *Server) handleAccountNASCleanupReconcile(w http.ResponseWriter, r *http
 		return
 	}
 	defer tx.Rollback(ctx)
+	if err = cleanupLockItems(ctx, tx, cid, []int64{id}); err != nil {
+		cleanupObservationFailure(w, ctx, 503, "cleanup reconciliation fence unavailable")
+		return
+	}
 	// A return uses the live transport session, never an identity saved in a
-	// journal. Lock the heartbeat before the plan/item, as permit issuance does.
+	// journal. The canonical cleanup scope is already locked, as in issuance.
 	session := cleanupRequestSession(r)
 	if req.ReturnLease {
 		deadline, err := cleanupSessionDeadline(ctx, tx, cid, session)
@@ -57,27 +61,16 @@ func (s *Server) handleAccountNASCleanupReconcile(w http.ResponseWriter, r *http
 			return
 		}
 	}
-	var planID int64
-	if err = tx.QueryRow(ctx, `SELECT i.plan_id FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2`, id, cid).Scan(&planID); err != nil {
-		status := 503
-		if errors.Is(err, pgx.ErrNoRows) {
-			status = 409
-		}
-		cleanupObservationFailure(w, ctx, status, "cleanup reconciliation identity unavailable")
-		return
-	}
-	// Same lock order as issuance/close. A request still in flight must commit
-	// or roll back before deciding that no permit was ever issued.
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPlanLockBase+planID); err != nil {
-		cleanupObservationFailure(w, ctx, 503, "cleanup reconciliation fence unavailable")
-		return
-	}
 	var sha, state string
 	var attempt int
 	var issued bool
 	var oldProof []byte
 	if err = tx.QueryRow(ctx, `SELECT p.plan_sha256,i.attempt,i.state,i.delete_ever_issued,i.proof FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2 FOR UPDATE OF i FOR SHARE OF p`, id, cid).Scan(&sha, &attempt, &state, &issued, &oldProof); err != nil {
-		cleanupObservationFailure(w, ctx, 503, "cleanup reconciliation state unavailable")
+		status := 503
+		if errors.Is(err, pgx.ErrNoRows) {
+			status = 409
+		}
+		cleanupObservationFailure(w, ctx, status, "cleanup reconciliation state unavailable")
 		return
 	}
 	if sha != req.PlanSHA || attempt != req.Attempt {

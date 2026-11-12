@@ -45,9 +45,8 @@ const (
 	nasCleanupMaxIssuedBytes24h int64 = 5_000_000_000_000 // 5 TB
 	// Serializes the budget check-and-issue step across observations.
 	nasCleanupBudgetLock int64 = 7343226011102
-	// Per-plan execution lock base (key = base + plan id). Observations of an
-	// enabled plan take it before any row lock so they can auto-pause the plan
-	// without two FOR SHARE holders deadlocking on the plan row.
+	// Per-plan lock base (key = base + plan id). All cleanup writers take
+	// the canonical scope fences before row locks; see cleanupLockPlans.
 	nasCleanupPlanLockBase int64 = 7343226100000000
 	// Public cleanup fence: enabling a plan or batch, batch advance and new
 	// source references serialize on it (see migration 0167).
@@ -387,6 +386,10 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 			return
 		}
 	}
+	if err = cleanupLockPlans(ctx, tx, []int64{id}); err != nil {
+		util.WriteError(w, 500, "cleanup control fence failed")
+		return
+	}
 	var current, currentMode, binding string
 	if err = tx.QueryRow(ctx, `SELECT plan_sha256,mode,report_sha256 FROM nas_cleanup_plans WHERE id=$1 AND account_id=47 AND connection_id=13 FOR UPDATE`, id).Scan(&current, &currentMode, &binding); err != nil || current != req.PlanSHA {
 		util.WriteError(w, 409, "plan identity differs")
@@ -488,6 +491,10 @@ func (s *Server) handleAdminNASCleanupRetireSuperseded(w http.ResponseWriter, r 
 		return
 	}
 	defer tx.Rollback(ctx)
+	if _, err = cleanupLockConnection(ctx, tx, 13); err != nil {
+		util.WriteError(w, 500, "cleanup retirement fence failed")
+		return
+	}
 	rows, err := tx.Query(ctx, `SELECT id FROM nas_cleanup_plans p WHERE account_id=47 AND connection_id=13 AND report_sha256<>$1 AND mode IN ('dry_run','paused') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued) ORDER BY id FOR UPDATE`, cleanupPolicySHA)
 	if err != nil {
 		util.WriteError(w, 500, "superseded cleanup plans unavailable")
@@ -607,7 +614,7 @@ JOIN LATERAL (
  WHERE candidate.plan_id=p.id AND candidate.state='pending'
  ORDER BY candidate.attempt,candidate.id LIMIT 1 FOR UPDATE SKIP LOCKED
 ) i ON true
-WHERE p.connection_id=$1 AND p.report_sha256=$3
+WHERE p.connection_id=$1 AND p.report_sha256=$3 AND p.id=ANY($4)
  AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $2
  AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.state IN ('leased','delete_issued'))))
 ORDER BY i.attempt,p.priority DESC,p.id LIMIT 1`
@@ -672,6 +679,11 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		return
 	}
 	defer tx.Rollback(ctx)
+	plans, err := cleanupLockConnection(ctx, tx, cid)
+	if err != nil {
+		util.WriteError(w, 500, "cleanup lease scope unavailable")
+		return
+	}
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupLeaseLock); err != nil {
 		util.WriteError(w, 500, "cleanup lease fence unavailable")
 		return
@@ -685,14 +697,14 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	allowExecution := sessionDeadline.After(time.Now()) && s.cfg.NASCleanupDeletionEnabled && (req.Protocol == 1 || *req.ExecutionFiles > 0)
 	// An execution lease that expires without a report is an execution
 	// anomaly: its enabled plan (and its batch) is paused in the same statement.
-	_, err = tx.Exec(ctx, cleanupExpireLeasesSQL, cid, "execution lease expired without a report")
+	_, err = tx.Exec(ctx, cleanupExpireLeasesSQL, cid, "execution lease expired without a report", plans)
 	if err != nil {
 		util.WriteError(w, 500, "cleanup lease expiry failed")
 		return
 	}
 	tasks := make([]cleanupTask, 0, req.Limit)
 	if req.RequestID != "" {
-		replayed, err := cleanupLeaseReplay(ctx, tx, cid, req.RequestID, allowExecution, session.boot, session.version, sessionDeadline)
+		replayed, err := cleanupLeaseReplay(ctx, tx, cid, req.RequestID, allowExecution, session.boot, session.version, sessionDeadline, plans)
 		if err != nil {
 			util.WriteError(w, 500, "cleanup lease load failed")
 			return
@@ -706,7 +718,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		var task cleanupTask
 		var raw, approved []byte
 		var mode string
-		err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, allowExecution, cleanupPolicySHA).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode)
+		err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, allowExecution, cleanupPolicySHA, plans).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode)
 		if errors.Is(err, pgx.ErrNoRows) {
 			break
 		}
@@ -783,8 +795,8 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 // cleanupLeaseReplay returns the still-leased, unexpired tasks of an earlier
 // identical lease request (its response was lost), with the same attempt and
 // expiry. Nothing is leased again and no lease is extended.
-func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID string, executionCapable bool, boot, version string, sessionDeadline time.Time) ([]cleanupTask, error) {
-	rows, err := tx.Query(ctx, `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode,i.lease_expires_at FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.lease_request_id=$1 AND i.state='leased' AND i.lease_expires_at>now() AND p.connection_id=$2 AND p.report_sha256=$3 AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $4 AND i.lease_connection_id=$2 AND i.lease_client_boot_id=$5 AND i.lease_client_version=$6 AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.id<>i.id AND busy.state IN ('leased','delete_issued')))) ORDER BY i.id FOR UPDATE OF i`, requestID, cid, cleanupPolicySHA, executionCapable, boot, version)
+func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID string, executionCapable bool, boot, version string, sessionDeadline time.Time, plans []int64) ([]cleanupTask, error) {
+	rows, err := tx.Query(ctx, `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode,i.lease_expires_at FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.lease_request_id=$1 AND p.id=ANY($7) AND i.state='leased' AND i.lease_expires_at>now() AND p.connection_id=$2 AND p.report_sha256=$3 AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $4 AND i.lease_connection_id=$2 AND i.lease_client_boot_id=$5 AND i.lease_client_version=$6 AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.id<>i.id AND busy.state IN ('leased','delete_issued')))) ORDER BY i.id FOR UPDATE OF i`, requestID, cid, cleanupPolicySHA, executionCapable, boot, version, plans)
 	if err != nil {
 		return nil, err
 	}
@@ -1035,6 +1047,11 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	if deadline, ok := ctx.Deadline(); ok && deadline.Before(permitDeadline) {
 		permitDeadline = deadline
 	}
+	if !env.scopeLocked {
+		if err := cleanupLockItems(ctx, tx, cid, []int64{id}); err != nil {
+			return cleanupObserveError(503, "cleanup observation fence unavailable")
+		}
+	}
 	sessionDeadline, err := cleanupSessionDeadline(ctx, tx, cid, env.session)
 	if err != nil {
 		return cleanupObserveError(503, "cleanup client identity unavailable")
@@ -1044,37 +1061,12 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	var until, permitUntil *time.Time
 	var attempt int
 	var lease *time.Time
-	var planID, fencedPlan int64
-	// Enabled-plan observations may UPDATE the plan row (auto-pause). Serialize
-	// them per plan with an advisory lock taken before any row lock, so two
-	// concurrent observations never both hold FOR SHARE and then wait on each
-	// other's UPDATE. Dry-run observations stay fully parallel.
-	var preMode string
-	if err := tx.QueryRow(ctx, `SELECT i.plan_id,p.mode FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2`, id, cid).Scan(&fencedPlan, &preMode); err != nil {
-		return cleanupObserveError(409, "cleanup task identity differs")
-	}
-	if preMode == "enabled" && env.dryRunOnly {
-		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true}}
-	}
-	if preMode == "enabled" && env.budgetHeld && !env.lockedPlans[fencedPlan] {
-		// Lock order is always plan fence(s) before the budget lock. A batch that
-		// already holds the budget lock must not take a plan fence it did not
-		// take up front (the plan became enabled meanwhile): retry instead.
-		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true}}
-	}
-	if preMode == "enabled" {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPlanLockBase+fencedPlan); err != nil {
-			return cleanupObserveError(500, "cleanup plan execution fence failed")
-		}
-	} else {
-		fencedPlan = 0
-	}
+	var planID int64
 	err = tx.QueryRow(ctx, cleanupObservationLoadSQL, id, cid).Scan(&raw, &mode, &state, &sha, &until, &attempt, &lease, &oldProof, &planID, &oldOutcome, &binding, &evidence, &rankings, &permitUntil, &oldRecovery)
 	if err != nil || sha != req.PlanSHA || attempt != req.Attempt {
 		return cleanupObserveError(409, "cleanup task identity differs")
 	}
-	if mode == "enabled" && fencedPlan != planID {
-		// The plan was enabled between the two reads; retry under the fence.
+	if mode == "enabled" && env.dryRunOnly {
 		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true}}
 	}
 	if mode == "enabled" {
@@ -1371,34 +1363,14 @@ func cleanupReceiptState(req cleanupReceipt) string {
 	return req.Outcome
 }
 
-// Receipt writes share advance/close's public fence, then acquire execution
-// fences in ascending order and batch rows before any plan/item writes. Take
-// every request's fences up front, including successor plans: observations can
-// auto-pause batches too. A fresh statement snapshot after these locks sees any
-// successor enabled by an advance that committed while we waited.
+// Receipts also fence advance/close, including already completed batches whose
+// successor may have been enabled. Mutable receipt evidence is read only after
+// cleanupLockItems has acquired plans, batches and items in canonical order.
 func cleanupReceiptFence(ctx context.Context, tx pgx.Tx, cid int64, itemIDs []int64) error {
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
 		return err
 	}
-	var plans []int64
-	if err := tx.QueryRow(ctx, `WITH source AS (SELECT DISTINCT i.plan_id FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2),
- scope AS (SELECT plan_id FROM source UNION SELECT unnest(plan_ids) FROM nas_cleanup_batches WHERE plan_ids && ARRAY(SELECT plan_id FROM source))
- SELECT coalesce(array_agg(plan_id ORDER BY plan_id),'{}') FROM scope`, itemIDs, cid).Scan(&plans); err != nil {
-		return err
-	}
-	for _, plan := range plans {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPlanLockBase+plan); err != nil {
-			return err
-		}
-	}
-	rows, err := tx.Query(ctx, `SELECT id FROM nas_cleanup_batches WHERE plan_ids && $1 ORDER BY id FOR UPDATE`, plans)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-	}
-	return rows.Err()
+	return cleanupLockItems(ctx, tx, cid, itemIDs)
 }
 
 // cleanupApplyReceipt records one deletion receipt. Genuine uncertainty pauses
@@ -1449,32 +1421,18 @@ func (s *Server) handleAccountNASCleanupResult(w http.ResponseWriter, r *http.Re
 		return
 	}
 	ctx := r.Context()
-	tx, err := s.pool.Begin(ctx)
+	req.ItemID = id
+	results, advance, err := s.cleanupSaveReceipts(ctx, cid, []cleanupReceipt{req})
 	if err != nil {
-		util.WriteError(w, 500, "cleanup receipt save failed")
+		w.Header().Set("Retry-After", "1")
+		util.WriteError(w, 503, "cleanup receipt save failed; replay required")
 		return
 	}
-	defer tx.Rollback(ctx)
-	if err = cleanupReceiptFence(ctx, tx, cid, []int64{id}); err != nil {
-		util.WriteError(w, 500, "cleanup receipt fence failed")
-		return
+	for planID := range advance {
+		s.cleanupAdvanceBatchAfter(ctx, planID)
 	}
-	updated, paused, planID, err := cleanupApplyReceipt(ctx, tx, cid, id, req)
-	if err == nil {
-		err = tx.Commit(ctx)
-	}
-	if err == nil && !validCleanupReceipt(req) {
-		util.WriteError(w, 400, "invalid cleanup deletion receipt")
-		return
-	}
-	if err != nil || updated != 1 {
-		util.WriteError(w, 409, "cleanup receipt differs or task is not deletion-issued")
-		return
-	}
-	if state := cleanupReceiptState(req); state == "deleted" || state == "keep" {
-		s.cleanupAdvanceBatchAfter(r.Context(), planID)
-	}
-	util.WriteJSON(w, 200, cleanupReceiptAck(id, req, paused))
+	result := results[0]
+	util.WriteJSON(w, result.status, result.body)
 }
 
 // Each file is the destructive scope. Sibling membership may change after a
