@@ -114,6 +114,10 @@ func (s *Server) writeRecordingClipDownload(w http.ResponseWriter, r *http.Reque
 		util.WriteError(w, http.StatusGone, "clip is no longer available")
 		return
 	}
+	if s.cfg.R2SignGetTTL <= 0 || s.cfg.R2SignGetTTL > 7*24*time.Hour {
+		util.WriteError(w, http.StatusServiceUnavailable, "download lifetime is outside the delivery lease bound")
+		return
+	}
 	if err := validateStorageEndpointHTTPS(d.endpoint); err != nil {
 		util.WriteError(w, http.StatusBadGateway, err.Error())
 		return
@@ -130,14 +134,14 @@ func (s *Server) writeRecordingClipDownload(w http.ResponseWriter, r *http.Reque
 	// new tab.
 	var url string
 	if strings.TrimSpace(r.URL.Query().Get("disposition")) == "inline" {
-		url, err = client.PresignGet(r.Context(), d.objectKey, nasDeliveryTTL(s.cfg.R2SignGetTTL))
+		url, err = client.PresignGet(r.Context(), d.objectKey, s.cfg.R2SignGetTTL)
 	} else {
 		filename := clipDownloadFilename(recordingNm, recordingID, clipStartAt, d.objectKey, displayPath, namingProf, folderName)
 		if filename == "" {
 			util.WriteError(w, http.StatusInternalServerError, "clip download filename is empty")
 			return
 		}
-		url, err = client.PresignGetDownload(r.Context(), d.objectKey, filename, nasDeliveryTTL(s.cfg.R2SignGetTTL))
+		url, err = client.PresignGetDownload(r.Context(), d.objectKey, filename, s.cfg.R2SignGetTTL)
 	}
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("presign download: %v", err))
