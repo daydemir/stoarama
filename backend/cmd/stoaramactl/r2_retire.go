@@ -109,6 +109,7 @@ type r2RetireHeadSample struct {
 }
 
 type r2RetirePlanSummary struct {
+	Projection       *r2RetireProjection                `json:"evidence_projection,omitempty"`
 	Phases           *r2RetirePhaseSummary              `json:"phases,omitempty"`
 	Header           r2RetireHeader                     `json:"header"`
 	ManifestPath     string                             `json:"manifest_path"`
@@ -141,6 +142,7 @@ var _ r2RetireStore = (*r2.Client)(nil)
 // ---------------------------------------------------------------- plan
 
 type r2RetirePlanOptions struct {
+	Projection   *r2RetireProjection
 	LiveObjects  map[string]r2.ObjectInfo
 	Picks        r2RetirePicks
 	Scope        r2RetireScope
@@ -165,6 +167,7 @@ func r2RetirePlanRun(ctx context.Context, q r2RetireQuerier, opts r2RetirePlanOp
 		}
 		sum.Phases = newR2RetirePhases()
 	}
+	sum.Projection = opts.Projection
 	seenKeys := map[string]bool{}
 	var items []r2RetireItem
 	streams := map[int64]*r2RetireStreamStat{}
@@ -192,6 +195,9 @@ func r2RetirePlanRun(ctx context.Context, q r2RetireQuerier, opts r2RetirePlanOp
 				}
 			}
 			reason, choice, ok := r2RetireDecideForScope(c, opts.Scope, windows, opts.Picks.Choices)
+			if opts.Projection != nil {
+				opts.Projection.add(c, opts.Scope, opts.Picks, windows, ok)
+			}
 			if sum.Phases != nil {
 				sum.Phases.add(c, reason, choice, ok)
 			}
@@ -1067,6 +1073,8 @@ func runR2Retire(ctx context.Context, cfg config.Config, args []string) {
 		log.Fatalf("r2-retire: keep28 policy unavailable (keep everything): %v", err)
 	}
 	switch args[0] {
+	case "release-holds":
+		runR2HoldReleases(ctx, cfg, args[1:], policySHA, windows)
 	case "plan":
 		runR2RetirePlan(ctx, cfg, args[1:], usage, policySHA, windows)
 	case "apply":
@@ -1079,6 +1087,8 @@ func runR2Retire(ctx context.Context, cfg config.Config, args []string) {
 func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usage, policySHA string, windows map[int64]api.Keep28Window) {
 	fs := flag.NewFlagSet("r2-retire plan", flag.ContinueOnError)
 	picksPath := fs.String("picks", "", "owner's R2 picks (r2-picks.json)")
+	releasePreview := fs.String("hold-release-preview", "", "dry-run hold-release manifest for non-executable projections")
+	releasePreviewSHA := fs.String("expected-hold-release-sha256", "", "hold-release preview digest")
 	out := fs.String("out", "", "output directory (manifest.jsonl, summary.json)")
 	sample := fs.Int("sample", 200, "HEAD this many random manifest items (0 = none)")
 	listingPath := fs.String("r2-listing", "", "reuse a complete checksummed R2 listing no older than 2 hours")
@@ -1165,6 +1175,33 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 	if *nasBacked {
 		log.Printf("r2-retire: live listing complete (%d objects); scanning catalog", len(opts.LiveObjects))
 	}
+	if *releasePreview != "" {
+		if !*nasBacked {
+			log.Fatal("hold-release preview requires --nas-backed")
+		}
+		opts.Projection, err = loadR2RetireProjection(ctx, pool, *releasePreview, *releasePreviewSHA, picks, policySHA)
+		if err != nil {
+			log.Fatal(err)
+		}
+		live, releaseErr := r2HoldReleasePlan(ctx, pool, picks, policySHA, windows)
+		if releaseErr != nil {
+			log.Fatal(releaseErr)
+		}
+		data, readErr := os.ReadFile(*releasePreview)
+		if readErr != nil {
+			log.Fatal(readErr)
+		}
+		var preview r2HoldReleaseManifest
+		if json.Unmarshal(data, &preview) != nil {
+			log.Fatal("invalid preview")
+		}
+		live.CreatedAt = preview.CreatedAt
+		a, _ := json.Marshal(live)
+		b, _ := json.Marshal(preview)
+		if !bytes.Equal(a, b) {
+			log.Fatal("hold-release preview no longer matches live receipts")
+		}
+	}
 	sum, items, err := r2RetirePlanRun(ctx, pool, opts, policySHA, windows)
 	if err != nil {
 		log.Fatalf("r2-retire plan: %v", err)
@@ -1184,6 +1221,11 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 			log.Fatal(err)
 		}
 		sum.Header.Phase = r2RetireNow
+	}
+	if sum.Projection != nil {
+		if err := sum.Projection.write(*out, sum.Header); err != nil {
+			log.Fatal(err)
+		}
 	}
 	sum.ManifestPath = filepath.Join(*out, r2RetireManifestName)
 	if sum.ManifestSHA256, err = writeR2RetireManifest(sum.ManifestPath, sum.Header, items); err != nil {

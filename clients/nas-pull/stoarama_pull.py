@@ -669,6 +669,7 @@ class Config:
         self.outage_file = self.state_dir / "outage.json"
         self.capacity_file = self.state_dir / "capacity.json"
         self.inventory_file = self.state_dir / "inventory.sqlite3"
+        self.listing_enabled = threading.Event()
         self.current_file = self.state_dir / "stoarama_pull.py"
         self.candidate_file = self.state_dir / "stoarama_pull.candidate.py"
         self.previous_file = self.state_dir / "stoarama_pull.previous.py"
@@ -1484,6 +1485,150 @@ class Inventory:
             "unmatched": str(unmatched),
         })
         log("INFO", "inventory scan complete generation=%s clips=%d bytes=%d mismatches=%d unmatched=%d" % (generation, clips, total_bytes, mismatches, unmatched))
+
+
+# Independent metadata-only proof. It never opens media for reading or shares
+# the hashing inventory's activity lock. Failed/changing scans never complete.
+class ListingChanged(RuntimeError):
+    pass
+
+
+def listing_identity(path):
+    st = path.lstat()
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def listing_proof_once(cfg, stop_event):
+    filename = cfg.state_dir / "listing-proof.sqlite3"
+    db = sqlite3.connect(str(filename))
+    db.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS dirs(path TEXT PRIMARY KEY,identity TEXT NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,folder TEXT NOT NULL,size INTEGER,mtime_ns INTEGER,inode INTEGER,device INTEGER)")
+    db.execute("CREATE TABLE IF NOT EXISTS uploaded(folder TEXT PRIMARY KEY,page INTEGER NOT NULL,last_path TEXT NOT NULL)")
+    db.execute("CREATE INDEX IF NOT EXISTS listing_folder_path ON files(folder,path)")
+    def get(key):
+        row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+    def put(key, value):
+        db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, value))
+        db.commit()
+    def post(body):
+        if stop_event.is_set():
+            raise InterruptedError("listing stopped")
+        return request_json(cfg, "POST", "/account/connections/listing", body=dict(body, generation=generation))
+    def stable(path, identity):
+        if listing_identity(path) != tuple(identity):
+            raise ListingChanged("directory membership changed during listing")
+    try:
+        generation = get("generation")
+        if generation is None:
+            root_identity = listing_identity(cfg.output_dir)
+            folders = ["."]
+            for p in cfg.output_dir.iterdir():
+                if p.is_symlink():
+                    raise ListingChanged("symlink in listing root")
+                if p.is_dir():
+                    folders.append(p.name)
+            folders.sort()
+            stable(cfg.output_dir, root_identity)
+            generation = uuid.uuid4().hex
+            # Persist before start, so a lost start response cannot change its
+            # start marker. No walk begins until the server acknowledged start.
+            db.executemany("INSERT OR REPLACE INTO meta VALUES(?,?)", [("generation", generation), ("folders", json.dumps(folders)), ("root_identity", json.dumps(root_identity))])
+            db.commit()
+        folders = json.loads(get("folders"))
+        stable(cfg.output_dir, json.loads(get("root_identity")))
+        response = post({"action": "start", "folders": folders})
+        if response.get("complete") is True:
+            for table in ("meta", "dirs", "files", "uploaded"):
+                db.execute("DELETE FROM " + table)
+            db.commit()
+            return True
+        if get("scanned") is None:
+            # A restart rewalks metadata, validating all prior directory stamps.
+            # It cannot silently reuse an incomplete walk as absence evidence.
+            def walk(directory):
+                if stop_event.is_set():
+                    raise InterruptedError("listing stopped")
+                if directory.is_symlink():
+                    raise ListingChanged("symlink directory")
+                rel = str(directory.relative_to(cfg.output_dir))
+                identity = listing_identity(directory)
+                encoded = json.dumps(identity)
+                old = db.execute("SELECT identity FROM dirs WHERE path=?", (rel,)).fetchone()
+                if old and old[0] != encoded:
+                    raise ListingChanged("directory changed since listing checkpoint")
+                db.execute("INSERT OR IGNORE INTO dirs VALUES(?,?)", (rel, encoded))
+                db.commit()
+                # scandir is a full enumeration; every lstat failure aborts.
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        st = entry.stat(follow_symlinks=False)
+                        if stat_module.S_ISDIR(st.st_mode):
+                            walk(Path(entry.path))
+                        elif stat_module.S_ISREG(st.st_mode):
+                            p = str(Path(entry.path).relative_to(cfg.output_dir))
+                            folder = p.split("/", 1)[0] if "/" in p else "."
+                            db.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?)", (p, folder, st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev))
+                        else:
+                            raise ListingChanged("non-regular entry prevents complete listing")
+                stable(directory, identity)
+                db.commit()
+                # Yield between directories; never throttle by media byte size.
+                if stop_event.wait(0.002):
+                    raise InterruptedError("listing stopped")
+            walk(cfg.output_dir)
+            put("scanned", "1")
+        def verify_directories():
+            for rel, identity in db.execute("SELECT path,identity FROM dirs"):
+                stable(cfg.output_dir / rel, json.loads(identity))
+        verify_directories()
+        for folder in folders:
+            old = db.execute("SELECT page,last_path FROM uploaded WHERE folder=?", (folder,)).fetchone()
+            page, last_path = old if old else (0, "")
+            count, total = db.execute("SELECT count(*),coalesce(sum(size),0) FROM files WHERE folder=?", (folder,)).fetchone()
+            while page * 200 < count:
+                rows = db.execute("SELECT path,size,mtime_ns,inode,device FROM files WHERE folder=? AND path>? ORDER BY path LIMIT 200", (folder, last_path)).fetchall()
+                post({"action": "page", "folder": folder, "page": page,
+                      "files": [dict(zip(("path", "size", "mtime_ns", "inode", "device"), row)) for row in rows]})
+                page += 1
+                last_path = rows[-1][0]
+                db.execute("INSERT OR REPLACE INTO uploaded VALUES(?,?,?)", (folder, page, last_path))
+                db.commit()
+                if stop_event.wait(0.05):
+                    raise InterruptedError("listing stopped")
+            post({"action": "folder_complete", "folder": folder, "page": page, "count": count, "bytes": total})
+        verify_directories()
+        post({"action": "complete"})
+        log("INFO", "hash-free listing completed generation=%s" % generation)
+        for table in ("meta", "dirs", "files", "uploaded"):
+            db.execute("DELETE FROM " + table)
+        db.commit()
+        return True
+    except ListingChanged:
+        # Retain the server's incomplete evidence as a presence veto; restart
+        # from a new start marker instead of completing a changed namespace.
+        for table in ("meta", "dirs", "files", "uploaded"):
+            db.execute("DELETE FROM " + table)
+        db.commit()
+        raise
+    finally:
+        db.close()
+
+
+def listing_proof_loop(cfg, stop_event):
+    if stop_event.wait(15):
+        return
+    while not stop_event.is_set():
+        try:
+            if cfg.listing_enabled.is_set() and NAS_MEDIA_FENCE.wait_maintenance(stop_event):
+                listing_proof_once(cfg, stop_event)
+                stop_event.wait(6 * 60 * 60)
+            else:
+                stop_event.wait(30)
+        except Exception as exc:
+            log("WARN", "hash-free listing incomplete: %s" % type(exc).__name__)
+            stop_event.wait(60)
 
 
 def inventory_loop(cfg, inventory, stop_event):
@@ -9585,6 +9730,7 @@ def heartbeat_loop(cfg, runtime, stop_event):
         try:
             response = send_heartbeat(cfg, runtime, outage)
             cfg.stitch_switches.apply(response)
+            cfg.listing_enabled.set() if response.get("listing_enabled") is True else cfg.listing_enabled.clear()
             runtime.stitch_enabled = cfg.stitch_enabled
             runtime.apply_joined_protocol_response(response)
             if runtime.inventory is not None:
@@ -9594,6 +9740,7 @@ def heartbeat_loop(cfg, runtime, stop_event):
                 outage["recovered_at"] = utc_now()
                 response = send_heartbeat(cfg, runtime, outage)
                 cfg.stitch_switches.apply(response)
+                cfg.listing_enabled.set() if response.get("listing_enabled") is True else cfg.listing_enabled.clear()
                 runtime.stitch_enabled = cfg.stitch_enabled
                 runtime.apply_joined_protocol_response(response)
                 outage = None
@@ -33645,6 +33792,8 @@ def run(cfg):
         daemon=True,
     )
     updater.start()
+    listing_worker = threading.Thread(target=listing_proof_loop, args=(cfg, inventory_stop_event), daemon=True, name="nas-listing-proof")
+    listing_worker.start()
     inventory_worker = threading.Thread(
         target=inventory_loop, args=(cfg, inventory, inventory_stop_event), daemon=True,
     )
@@ -33739,6 +33888,7 @@ def run(cfg):
         heartbeat.join(timeout=HEARTBEAT_TIMEOUT_SEC + 1)
         storage_probe.join(timeout=1)
         inventory_worker.join(timeout=INVENTORY_SHUTDOWN_TIMEOUT_SEC)
+        listing_worker.join(timeout=HTTP_TIMEOUT_SEC + 1)
         joined_worker.join(timeout=HTTP_TIMEOUT_SEC + 1)
         if benchmark_worker is not None:
             # The watchdog kills benchmark children within a second of stop;
@@ -33750,7 +33900,7 @@ def run(cfg):
             cleanup_worker.join(timeout=HTTP_TIMEOUT_SEC + 5)
         cleanup_stuck = cleanup_worker is not None and cleanup_worker.is_alive()
         stitch_stuck = stitch_worker is not None and stitch_worker.is_alive()
-        joined_stuck = joined_worker.is_alive() or cleanup_stuck or stitch_stuck
+        joined_stuck = joined_worker.is_alive() or cleanup_stuck or stitch_stuck or listing_worker.is_alive()
         if joined_stuck:
             log("ERROR", "joined delivery worker did not stop; process must exit unclean")
             mark_runtime(cfg, runtime, PreviousExit.UNCLEAN_PROCESS.value)
