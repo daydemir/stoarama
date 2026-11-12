@@ -96,7 +96,7 @@ jobs:
         run: go test ./internal/api -run '^TestNASCleanup(ReceiptLockOrder|ReceiptTransactionRetry|CloseRacingContradictoryReceiptRefuses|ContradictionRacingAdvancePausesSuccessor)$' -race -count=5
       - name: NAS cleanup exact-file dry run and failure recovery
         working-directory: .
-        run: python3 -m unittest discover -s clients/nas-pull -p test_cleanup.py -v
+        run: python3 -m unittest discover -s clients/nas-pull -p 'test_cleanup*.py' -v
       - name: Hash-free listing completeness and resumable metadata uploads
         working-directory: .
         run: python3 -m unittest discover -s clients/nas-pull -p test_listing_proof.py -v

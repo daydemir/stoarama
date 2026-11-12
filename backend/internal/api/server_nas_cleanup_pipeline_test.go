@@ -18,10 +18,25 @@ import (
 )
 
 func TestNASCleanupSuccessorPipelineClientServer(t *testing.T) {
+	testNASCleanupPipelineClientServer(t, false)
+}
+
+func TestNASCleanupExecutionGroupClientServer(t *testing.T) {
+	testNASCleanupPipelineClientServer(t, true)
+}
+
+func testNASCleanupPipelineClientServer(t *testing.T, grouped bool) {
 	for _, pipeline := range []bool{false, true} {
 		t.Run(fmt.Sprint(pipeline), func(t *testing.T) {
 			f := newCleanupFixture(t, 24)
 			version := nasCleanupPipelineClientVersion
+			apiDelay, headDelay := 40*time.Millisecond, 80*time.Millisecond
+			if grouped {
+				apiDelay, headDelay = 200*time.Millisecond, 200*time.Millisecond
+				if pipeline {
+					version = nasCleanupGroupClientVersion
+				}
+			}
 			if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, version); err != nil {
 				t.Fatal(err)
 			}
@@ -46,7 +61,7 @@ func TestNASCleanupSuccessorPipelineClientServer(t *testing.T) {
 			router := chi.NewRouter()
 			router.Use(func(next http.Handler) http.Handler {
 				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					time.Sleep(40 * time.Millisecond)
+					time.Sleep(apiDelay)
 					key := int64(5)
 					r = r.WithContext(context.WithValue(r.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: 47, APIKeyID: &key}))
 					if strings.HasSuffix(r.URL.Path, "/observe") && f.s.cfg.NASCleanupDeletionEnabled {
@@ -80,6 +95,9 @@ func TestNASCleanupSuccessorPipelineClientServer(t *testing.T) {
 				srv := httptest.NewServer(router)
 				defer srv.Close()
 				args := []string{script, "run", "--api", srv.URL, "--root", root, "--state", state, "--client-version", version, "--max-seconds", "60"}
+				if grouped {
+					args = append(args, "--proof-delay-ms", "180", "--fsync-delay-ms", "100")
+				}
 				if pipelined {
 					args = append(args, "--pipeline")
 				}
@@ -104,13 +122,17 @@ func TestNASCleanupSuccessorPipelineClientServer(t *testing.T) {
 			}
 			run(false) // Real NAS proof, journal and R2 evidence for the current plan.
 			successor, _, _ := f.admit("pipeline-next", files[count:])
-			f.bucket.headDelay = 80 * time.Millisecond
+			f.bucket.headDelay = headDelay
 			f.s.cfg.NASCleanupDeletionEnabled = true
 			if code, body := safeguardControl(t, f.s, current, "enabled", map[string]any{"plan_sha256": sha}); code != 200 {
 				t.Fatalf("enable: %d %s", code, body)
 			}
 			seconds := run(pipeline)
-			if peak.Load() != 1 || overlap.Load() != pipeline {
+			expectedPeak := int32(1)
+			if grouped && pipeline {
+				expectedPeak = 0
+			}
+			if peak.Load() != expectedPeak || overlap.Load() != pipeline {
 				t.Fatalf("execution peak %d, dry-run overlap %t", peak.Load(), overlap.Load())
 			}
 			var deleted, checked, issued int
@@ -123,7 +145,7 @@ func TestNASCleanupSuccessorPipelineClientServer(t *testing.T) {
 					t.Fatalf("file %d existence: %v", n, err)
 				}
 			}
-			t.Logf("pipeline=%t: %d serial deletions + %d successor dry runs in %.3fs; execution peak=1", pipeline, count, count, seconds)
+			t.Logf("grouped=%t pipeline=%t: %d serial deletions + %d successor dry runs in %.3fs; execution observation peak=%d", grouped, pipeline, count, count, seconds, peak.Load())
 		})
 	}
 }
