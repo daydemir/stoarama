@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -60,6 +61,18 @@ func TestNASDeliveryFenceRefusesOutsideAndDrains(t *testing.T) {
 	}
 	if response := call(901); response.Code != 409 {
 		t.Fatal("outside delivery allowed", response.Code, response.Body.String())
+	}
+	// Exercise the actual raw download handler too: no storage credential or
+	// signer is reached when a stale feed URL names a fenced object.
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings/2/clips/901/download", nil)
+	route := chi.NewRouteContext()
+	route.URLParams.Add("id", "2")
+	route.URLParams.Add("clipId", "901")
+	request = request.WithContext(context.WithValue(context.WithValue(request.Context(), chi.RouteCtxKey, route), accountPrincipalContextKey, accountPrincipal{AccountID: 47, APIKeyID: ptrInt64(5)}))
+	response := httptest.NewRecorder()
+	f.s.fenceNASDelivery(http.HandlerFunc(f.s.handleAccountRecordingClipDownload)).ServeHTTP(response, request)
+	if response.Code != 409 {
+		t.Fatal("raw issuer bypassed fence", response.Code, response.Body.String())
 	}
 	if response := call(902); response.Code != 200 {
 		t.Fatal("kept delivery refused", response.Body.String())
