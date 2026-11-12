@@ -139,6 +139,38 @@ a failed check, review `last_error` and recovery/shutdown flags with Deniz; reso
 the cause, clear `last_error` in status, then remove STOP and restart. Never clear
 the persisted `current_plan` to bypass recovery. No automatic retry clears a latch.
 
+## Read failures and the November 11 incident
+
+Monitoring retries transient database reads and HTTP GETs with delays of 5, 10,
+20, 30, 30 and 25 seconds. Each read keeps its I/O timeout. SQL rejection,
+malformed reports, identity changes, concurrent execution and other safety
+violations fail immediately. Mutations are never replayed by this retry loop.
+Exhausted reads still enter the existing latched failure / confirmed OFF path.
+Diagnostics contain fixed step names and error categories, never SQL or stderr.
+
+Read-only investigation on Jelly reproduced the original progress aggregation
+in **266.1 seconds**; the preparer sets PostgreSQL `statement_timeout=300000`
+and a 330-second subprocess limit. The query repeatedly extracted ordinals from
+large compressed JSON manifests for each receipt and aggregate. The replacement
+expands each relevant plan's immutable manifest once: **2.9 seconds** for progress
+and **1.8 seconds** for recent permit bytes on the same production catalog.
+It preserves legacy manifests and the existing global ever-issued daily budget.
+The health query took **1.0 second**, with **17/103** connections in use. These
+measurements strongly implicate the progress query reaching its statement timeout;
+the incident's generic error discarded the original query and stderr, so its
+exact failure cannot be proved retrospectively.
+
+Recovery failed **369 seconds** after the 23:39:46 UTC stopped note, consistent
+with fetching the report and then hitting the old **360-second** command limit
+while serially HEADing 2,873 issued objects. Manual verification subsequently
+reported 2,873 verified, zero problems. The old failure path also skipped receipt
+drain before taking its reference report. Both normal completion and failed
+execution now drain before reading the reference report. Recovery has a separate
+30-minute subprocess limit and retries command read failures/timeouts and
+HEAD-only errors. Missing objects, size/identity mismatches and mixed problems
+still stop immediately. Exhaustion preserves the original latch and records a
+separate sanitized recovery error. No production state was changed for this fix.
+
 ## Offline checks
 
 ```sh
