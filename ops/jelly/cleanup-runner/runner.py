@@ -283,10 +283,31 @@ def request(url, token, method='GET', body=None):
         raise Halt('HTTP request failed (' + method + ')') from None
 
 
-def command(argv, **kwargs):
+COMMAND_TIMEOUT_SEC = 360
+PREPARE_TIMEOUT_SEC = 1800  # keep28 preparation on large streams exceeds six minutes
+COMMAND_FAILURE_LOG = Path.home() / 'stoarama-cleanup-runner' / 'command-failures.log'
+
+
+def command(argv, timeout=COMMAND_TIMEOUT_SEC, **kwargs):
     try:
-        return subprocess.run(argv, capture_output=True, check=True, timeout=360, **kwargs).stdout
-    except Exception:
+        return subprocess.run(argv, capture_output=True, check=True, timeout=timeout, **kwargs).stdout
+    except Exception as exc:
+        # Private diagnostics only (mode 600, never emailed/printed): which command, how it
+        # failed, and the stderr tail. Credentials are passed via env, never argv.
+        try:
+            tail = getattr(exc, 'stderr', None) or b''
+            if isinstance(tail, str):
+                tail = tail.encode()
+            entry = json.dumps({'at': utcnow().isoformat(), 'command': os.path.basename(str(argv[1] if len(argv) > 1 and argv[0] == sys.executable else argv[0])),
+                                'error': type(exc).__name__, 'returncode': getattr(exc, 'returncode', None),
+                                'stderr_tail': tail[-2000:].decode('utf-8', 'replace')}) + '\n'
+            fd = os.open(COMMAND_FAILURE_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.write(fd, entry.encode())
+            finally:
+                os.close(fd)
+        except Exception:
+            pass
         raise Halt('local command failed; inspect privately') from None
 
 
@@ -767,7 +788,7 @@ class Runner:
             command([sys.executable, str(self.repo / 'backend/scripts/nas-cleanup/prepare_keep28_plans.py'),
                 '--stream', str(sid), '--max-bytes', str(PLAN_CAP), '--max-plans', '1',
                 '--label-prefix', prefix, '--out', str(out), '--api', API, '--submit',
-                '--atomic-admission'], env=os.environ.copy())
+                '--atomic-admission'], env=os.environ.copy(), timeout=PREPARE_TIMEOUT_SEC)
             summary = json.loads((out / 'summary.json').read_text())
             require(not summary['rejected_at_admission'], 'preparer rejected an uncertain file')
             if summary['receipts']:
