@@ -520,7 +520,8 @@ class CleanupTests(unittest.TestCase):
         decision = fixture_ack(dict(attempt=1, plan_sha256='a'*64, proof=proof), delivery_keep_checked=True, action='delete_issued', delete=True,
                                expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
         expired = dict(decision, expires_at=(datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(seconds=1)).isoformat())
-        for response, reason in ((dict(decision, proof_sha256='b'*64), 'proof_mismatch'), (expired, 'permit_expired')):
+        for response, reason in ((dict(decision, proof_sha256='b'*64), 'proof_mismatch'), (expired, 'permit_expired'), (dict(decision, delivery_keep_checked=False), 'local_guard'),
+                                 (dict(decision, delivery_keep_checked=None), 'local_guard')):
             with self.subTest(reason=reason), self.assertRaises(pull.CleanupPermitRefused) as caught:
                 pull.cleanup_check_permit(self.cfg, True, self.task, proof, response, time.monotonic())
             self.assertEqual(caught.exception.reason, reason)
