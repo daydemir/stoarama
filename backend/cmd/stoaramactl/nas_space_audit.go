@@ -118,7 +118,7 @@ func runNASSpaceAudit(ctx context.Context, cfg config.Config, args []string) {
 		}
 		downloadCtx, stop := context.WithTimeout(ctx, 10*time.Minute)
 		defer stop()
-		rawURL, err := mustArchiveR2Client(downloadCtx, cfg).PresignGet(downloadCtx, row.ArtifactObjectKey, 15*time.Minute)
+		rawURL, err := mustArchiveR2Client(downloadCtx, cfg, pool).PresignGet(downloadCtx, row.ArtifactObjectKey, 15*time.Minute)
 		if err != nil {
 			log.Fatal("sign audit artifact download failed")
 		}

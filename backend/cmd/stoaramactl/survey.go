@@ -209,7 +209,7 @@ func runSurveyRunOnce(ctx context.Context, cfg config.Config, args []string) {
 	}
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
-	r2c := mustArchiveR2Client(ctx, cfg)
+	r2c := mustArchiveR2Client(ctx, cfg, pool)
 
 	// Load the yolo11x ONNX detector ONCE and reuse it across the whole sweep.
 	// Fail-fast: with --detect set, a missing model or onnxruntime library aborts
@@ -337,7 +337,7 @@ func runSurveyDeleteStreamCaptures(ctx context.Context, cfg config.Config, args 
 	}
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
-	r2c := mustArchiveR2Client(ctx, cfg)
+	r2c := mustArchiveR2Client(ctx, cfg, pool)
 	deleted, err := survey.DeleteStreamCaptures(ctx, pool, r2c, *id)
 	if err != nil {
 		log.Fatalf("delete survey captures for stream %d: %v", *id, err)

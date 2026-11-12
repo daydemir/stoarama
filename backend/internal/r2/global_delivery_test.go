@@ -9,7 +9,7 @@ import (
 )
 
 func TestPresignGlobalDeliveryDownloadRetainsIdentityAndUnicodeName(t *testing.T) {
-	c, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
+	c, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
 	if err != nil {
 		t.Fatal(err)
 	}

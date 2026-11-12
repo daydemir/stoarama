@@ -19,7 +19,8 @@ def main():
     if target.exists():
         raise SystemExit("proof path already exists")
     env = dict(os.environ, AWS_ACCESS_KEY_ID=os.environ["R2_ACCESS_KEY_ID"],
-               AWS_SECRET_ACCESS_KEY=os.environ["R2_SECRET_ACCESS_KEY"], AWS_DEFAULT_REGION="auto")
+               AWS_SECRET_ACCESS_KEY=os.environ["R2_SECRET_ACCESS_KEY"], AWS_DEFAULT_REGION="auto",
+               AWS_MAX_ATTEMPTS="1", AWS_RETRY_MODE="standard")
     bucket = os.environ["R2_BUCKET"]
     endpoint = os.environ.get("R2_ENDPOINT") or "https://%s.r2.cloudflarestorage.com" % os.environ["R2_ACCOUNT_ID"]
     aws = str(Path.home() / ".local/bin/aws")
@@ -39,20 +40,30 @@ def main():
             raise SystemExit("create-only probe PUT failed; no proof written")
         etag = json.loads(put.stdout)["ETag"]
         print("Probe key (only this new object is touched): " + key)
+        if etag.strip('"') == "00000000000000000000000000000000":
+            raise SystemExit("probe ETag equals test mismatch; no proof written")
         wrong = call("delete-object", "--if-match", '"00000000000000000000000000000000"')
-        if wrong.returncode == 0 or "(PreconditionFailed)" not in wrong.stderr:
-            raise SystemExit("R2 did not prove conditional delete rejection; apply must remain blocked; inspect " + key)
-        restored = Path(directory) / "readback.bin"
-        get = call("get-object", str(restored))
-        if get.returncode or restored.read_bytes() != body:
-            raise SystemExit("probe bytes were not preserved after rejected delete; no proof written")
-        matched = call("delete-object", "--if-match", etag)
-        head = call("head-object")
-        if matched.returncode or head.returncode == 0 or not any(code in head.stderr for code in ("(404)", "(NotFound)", "(NoSuchKey)")):
-            raise SystemExit("matching delete was not confirmed; no proof written; inspect " + key)
-    proof = {"bucket": bucket, "endpoint_sha256": hashlib.sha256(endpoint.rstrip("/").encode()).hexdigest(), "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-             "wrong_etag_rejected": True, "object_preserved": True, "matching_delete_confirmed": True,
-             "probe_key": key}
+        proof = {"bucket": bucket, "endpoint_sha256": hashlib.sha256(endpoint.rstrip("/").encode()).hexdigest(),
+                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "probe_key": key}
+        if wrong.returncode == 0:
+            head = call("head-object")
+            if head.returncode == 0 or not any(code in head.stderr for code in ("(404)", "(NotFound)", "(NoSuchKey)")):
+                raise SystemExit("wrong-ETag DELETE absence unconfirmed; no proof written; inspect " + key)
+            proof.update(conditional_delete_unsupported=True, wrong_etag_delete_succeeded=True,
+                         wrong_etag_delete_confirmed_absent=True,
+                         wrong_etag_rejected=False, object_preserved=False, matching_delete_confirmed=False)
+        else:
+            if "(PreconditionFailed)" not in wrong.stderr:
+                raise SystemExit("conditional DELETE result ambiguous; no proof written; inspect " + key)
+            restored = Path(directory) / "readback.bin"
+            get = call("get-object", str(restored))
+            if get.returncode or restored.read_bytes() != body:
+                raise SystemExit("probe bytes were not preserved after rejected delete; no proof written")
+            matched = call("delete-object", "--if-match", etag)
+            head = call("head-object")
+            if matched.returncode or head.returncode == 0 or not any(code in head.stderr for code in ("(404)", "(NotFound)", "(NoSuchKey)")):
+                raise SystemExit("matching delete was not confirmed; no proof written; inspect " + key)
+            proof.update(wrong_etag_rejected=True, object_preserved=True, matching_delete_confirmed=True)
     raw = (json.dumps(proof, sort_keys=True, separators=(",", ":")) + "\n").encode()
     with target.open("xb") as output:
         os.chmod(target, 0o600)

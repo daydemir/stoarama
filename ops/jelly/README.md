@@ -116,3 +116,5 @@ changed since load. This is an advisory conflict check, not an atomic multiwrite
 lock. Verify successful saves in a temporary copy seeded from existing picks;
 do not write test picks into the owner's live file. On 2026-11-11 that file was
 absent, so preserve absence and use an isolated Jelly handler for the round-trip.
+
+R2 retirement on providers without conditional DELETE: see [HEAD-guard authority, writer inventory and residual race](r2-retire/HEAD-GUARD.md). Planning, probe evidence and writer drain must be reviewed separately; this runbook does not authorize production deletes.

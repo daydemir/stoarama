@@ -23,6 +23,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // MaxConditionalPutBytes is R2's exact single-part PUT ceiling: 5 GiB minus
@@ -32,21 +33,29 @@ import (
 const MaxConditionalPutBytes int64 = 5*1024*1024*1024 - 5*1024*1024
 
 type Client struct {
-	bucket    string
-	s3        *s3.Client
-	presigner *s3.PresignClient
+	bucket        string
+	s3            *s3.Client
+	presigner     *s3.PresignClient
+	writerDB      *pgxpool.Pool
+	ungatedWriter bool
 }
 
 type Config struct {
-	AccountID string
-	AccessKey string
-	SecretKey string
-	Region    string
-	Bucket    string
-	Endpoint  string
+	// Required for database-driven writers. Missing admission fails writes closed.
+	WriterDB *pgxpool.Pool
+	// Explicit standalone credential holder; cannot establish retirement safety.
+	// Without a DB or this explicit choice, the client is read-only.
+	UngatedWriter bool
+	AccountID     string
+	AccessKey     string
+	SecretKey     string
+	Region        string
+	Bucket        string
+	Endpoint      string
 }
 
 type ObjectHead struct {
+	LastModified   time.Time
 	SHA256Metadata string
 	ETag           string
 	SizeBytes      int64
@@ -88,9 +97,11 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	})
 
 	return &Client{
-		bucket:    cfg.Bucket,
-		s3:        client,
-		presigner: s3.NewPresignClient(client),
+		bucket:        cfg.Bucket,
+		writerDB:      cfg.WriterDB,
+		ungatedWriter: cfg.UngatedWriter,
+		s3:            client,
+		presigner:     s3.NewPresignClient(client),
 	}, nil
 }
 
@@ -209,6 +220,11 @@ func (c *Client) PresignPutCreateOnlyMetadataRequest(ctx context.Context, key, c
 }
 
 func (c *Client) presignPutCreateOnly(ctx context.Context, key, contentType string, sizeBytes int64, sha256Hex string, ttl time.Duration, metadata bool) (PresignedRequest, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	if ttl <= 0 {
+		return PresignedRequest{}, errors.New("PUT capability requires positive TTL")
+	}
 	if sizeBytes <= 0 {
 		return PresignedRequest{}, errors.New("presign create-only put: size must be positive")
 	}
@@ -216,6 +232,11 @@ func (c *Client) presignPutCreateOnly(ctx context.Context, key, contentType stri
 	if err != nil || len(digest) != 32 {
 		return PresignedRequest{}, errors.New("presign create-only put: sha256 must be 64 lowercase hex characters")
 	}
+	release, _, err := c.admitWrite(ctx, ttl)
+	if err != nil {
+		return PresignedRequest{}, err
+	}
+	defer release()
 	in := &s3.PutObjectInput{
 		Bucket:         aws.String(c.bucket),
 		Key:            aws.String(key),
@@ -231,6 +252,9 @@ func (c *Client) presignPutCreateOnly(ctx context.Context, key, contentType stri
 	if err != nil {
 		return PresignedRequest{}, fmt.Errorf("presign create-only put %s: %w", key, err)
 	}
+	if ctx.Err() != nil {
+		return PresignedRequest{}, errors.New("PUT capability signing expired")
+	}
 	return PresignedRequest{URL: out.URL, Method: out.Method, Headers: out.SignedHeader.Clone()}, nil
 }
 
@@ -238,9 +262,19 @@ func (c *Client) presignPutCreateOnly(ctx context.Context, key, contentType stri
 // length is signed, so the holder cannot stretch the capability into a larger
 // upload. Used for disposable objects such as NAS upload speed probes.
 func (c *Client) PresignPutSizedRequest(ctx context.Context, key, contentType string, sizeBytes int64, ttl time.Duration) (PresignedRequest, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	if ttl <= 0 {
+		return PresignedRequest{}, errors.New("PUT capability requires positive TTL")
+	}
 	if sizeBytes <= 0 {
 		return PresignedRequest{}, errors.New("presign sized put: size must be positive")
 	}
+	release, _, err := c.admitWrite(ctx, ttl)
+	if err != nil {
+		return PresignedRequest{}, err
+	}
+	defer release()
 	in := &s3.PutObjectInput{
 		Bucket:        aws.String(c.bucket),
 		Key:           aws.String(key),
@@ -250,6 +284,9 @@ func (c *Client) PresignPutSizedRequest(ctx context.Context, key, contentType st
 	out, err := c.presigner.PresignPutObject(ctx, in, s3.WithPresignExpires(ttl))
 	if err != nil {
 		return PresignedRequest{}, fmt.Errorf("presign sized put %s: %w", key, err)
+	}
+	if ctx.Err() != nil {
+		return PresignedRequest{}, errors.New("PUT capability signing expired")
 	}
 	return PresignedRequest{URL: out.URL, Method: out.Method, Headers: out.SignedHeader.Clone()}, nil
 }
@@ -272,6 +309,16 @@ func (c *Client) PresignGetDownload(ctx context.Context, key, filename string, t
 }
 
 func (c *Client) PresignPut(ctx context.Context, key, contentType string, ttl time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	if ttl <= 0 {
+		return "", errors.New("PUT capability requires positive TTL")
+	}
+	release, _, err := c.admitWrite(ctx, ttl)
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	in := &s3.PutObjectInput{
 		Bucket: aws.String(c.bucket),
 		Key:    aws.String(key),
@@ -283,10 +330,18 @@ func (c *Client) PresignPut(ctx context.Context, key, contentType string, ttl ti
 	if err != nil {
 		return "", fmt.Errorf("presign put %s: %w", key, err)
 	}
+	if ctx.Err() != nil {
+		return "", errors.New("PUT capability signing expired")
+	}
 	return out.URL, nil
 }
 
 func (c *Client) PutBytes(ctx context.Context, key, contentType string, body []byte) (string, error) {
+	release, complete, err := c.admitWrite(ctx, 0)
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	in := &s3.PutObjectInput{
 		Bucket: aws.String(c.bucket),
 		Key:    aws.String(key),
@@ -299,10 +354,18 @@ func (c *Client) PutBytes(ctx context.Context, key, contentType string, body []b
 	if err != nil {
 		return "", fmt.Errorf("put object %s: %w", key, err)
 	}
+	if err := complete(); err != nil {
+		return "", err
+	}
 	return cleanETag(aws.ToString(out.ETag)), nil
 }
 
 func (c *Client) PutReader(ctx context.Context, key, contentType string, body io.Reader) (string, error) {
+	release, complete, err := c.admitWrite(ctx, 0)
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	in := &s3.PutObjectInput{
 		Bucket: aws.String(c.bucket),
 		Key:    aws.String(key),
@@ -315,6 +378,9 @@ func (c *Client) PutReader(ctx context.Context, key, contentType string, body io
 	if err != nil {
 		return "", fmt.Errorf("put object %s: %w", key, err)
 	}
+	if err := complete(); err != nil {
+		return "", err
+	}
 	return cleanETag(aws.ToString(out.ETag)), nil
 }
 
@@ -326,6 +392,11 @@ func (c *Client) PutReaderIfAbsentVerified(ctx context.Context, key, contentType
 	if expectedSize <= 0 || expectedSize > MaxConditionalPutBytes || !isLowerHexSHA256(expectedSHA256) {
 		return ObjectHead{}, false, fmt.Errorf("invalid bounded immutable object identity")
 	}
+	release, complete, err := c.admitWrite(ctx, 0)
+	if err != nil {
+		return ObjectHead{}, false, err
+	}
+	defer release()
 	in := &s3.PutObjectInput{
 		Bucket:        aws.String(c.bucket),
 		Key:           aws.String(key),
@@ -367,6 +438,9 @@ func (c *Client) PutReaderIfAbsentVerified(ctx context.Context, key, contentType
 	if n != expectedSize || gotSHA != expectedSHA256 {
 		return ObjectHead{}, false, fmt.Errorf("immutable object %s content mismatch", key)
 	}
+	if err := complete(); err != nil {
+		return ObjectHead{}, false, err
+	}
 	return head, created, nil
 }
 
@@ -399,6 +473,11 @@ func isPreconditionFailed(err error) bool {
 // total object size. Use for multi-GB objects on small instances, where a
 // single PutObject of the whole body can exhaust memory. R2 is multipart-compatible.
 func (c *Client) PutMultipart(ctx context.Context, key, contentType string, body io.Reader) (string, error) {
+	release, complete, err := c.admitWrite(ctx, 0)
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	uploader := manager.NewUploader(c.s3, func(u *manager.Uploader) {
 		u.PartSize = 16 * 1024 * 1024 // 16 MiB per part
 		u.Concurrency = 2             // ~32 MiB peak buffered
@@ -415,6 +494,9 @@ func (c *Client) PutMultipart(ctx context.Context, key, contentType string, body
 	if err != nil {
 		return "", fmt.Errorf("multipart put %s: %w", key, err)
 	}
+	if err := complete(); err != nil {
+		return "", err
+	}
 	return cleanETag(aws.ToString(out.ETag)), nil
 }
 
@@ -426,7 +508,7 @@ func (c *Client) Head(ctx context.Context, key string) (ObjectHead, error) {
 	if err != nil {
 		return ObjectHead{}, fmt.Errorf("head object %s: %w", key, err)
 	}
-	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId)), SHA256Metadata: strings.TrimSpace(out.Metadata["sha256"])}, nil
+	return ObjectHead{LastModified: aws.ToTime(out.LastModified), ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId)), SHA256Metadata: strings.TrimSpace(out.Metadata["sha256"])}, nil
 }
 
 // HeadExact resolves one immutable generation and refuses a changed ETag.
@@ -443,7 +525,7 @@ func (c *Client) HeadExact(ctx context.Context, key, etag, versionID string) (Ob
 	if err != nil {
 		return ObjectHead{}, fmt.Errorf("head exact object %s: %w", key, err)
 	}
-	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId)), SHA256Metadata: strings.TrimSpace(out.Metadata["sha256"])}, nil
+	return ObjectHead{LastModified: aws.ToTime(out.LastModified), ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId)), SHA256Metadata: strings.TrimSpace(out.Metadata["sha256"])}, nil
 }
 
 // OpenExact returns the exact object generation observed by Head. If the store
@@ -595,6 +677,18 @@ func (c *Client) DeleteObject(ctx context.Context, key string) error {
 		return fmt.Errorf("delete object %s: %w", key, err)
 	}
 	return nil
+}
+
+// DeleteObjectOnce performs exactly one unconditional wire attempt. A lost
+// response is ambiguous: retirement must retain its intent and re-HEAD on resume.
+func (c *Client) DeleteObjectOnce(ctx context.Context, key string) error {
+	if key == "" || strings.TrimSpace(key) != key {
+		return errors.New("single-attempt delete requires an exact key")
+	}
+	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)}, func(o *s3.Options) {
+		o.Retryer = aws.NopRetryer{}
+	})
+	return err
 }
 
 // MaxDeleteBatch is the S3/R2 multi-object delete limit per request.

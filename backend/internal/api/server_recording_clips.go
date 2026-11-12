@@ -772,7 +772,7 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("decrypt destination secret: %v", err))
 		return
 	}
-	client, err := r2.New(r.Context(), r2.Config{
+	client, err := r2.New(r.Context(), r2.Config{WriterDB: s.pool,
 		AccessKey: accessKeyID,
 		SecretKey: string(secret),
 		Region:    region,
@@ -1204,7 +1204,7 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("decrypt destination secret: %v", err))
 		return
 	}
-	client, err := r2.New(r.Context(), r2.Config{
+	client, err := r2.New(r.Context(), r2.Config{WriterDB: s.pool,
 		AccessKey: accessKeyID,
 		SecretKey: string(secret),
 		Region:    region,

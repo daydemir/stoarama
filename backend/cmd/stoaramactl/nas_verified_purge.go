@@ -995,7 +995,7 @@ func runNASVerifiedPurge(ctx context.Context, cfg config.Config, args []string) 
 	if opts.protections, err = loadNASPurgeProtections(ctx, pool, opts.connectionID, opts.excludeRecs, time.Now().UTC()); err != nil {
 		log.Fatalf("nas-verified-purge: %v", err)
 	}
-	store := mustArchiveR2Client(ctx, cfg)
+	store := mustArchiveR2Client(ctx, cfg, pool)
 	var logw io.Writer
 	if opts.logPath != "none" {
 		logFile, err := openJoinedPurgeLog(opts.logPath)

@@ -209,7 +209,7 @@ func runJoinedSourcePurge(ctx context.Context, cfg config.Config, args []string)
 		}
 		pool := mustJoinedPurgePool(ctx, cfg)
 		defer pool.Close()
-		store := mustArchiveR2Client(ctx, cfg)
+		store := mustArchiveR2Client(ctx, cfg, pool)
 		logFile, err := openJoinedPurgeLog(opts.logPath)
 		if err != nil {
 			log.Fatal(err)

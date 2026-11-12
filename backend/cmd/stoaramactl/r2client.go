@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"log"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
@@ -11,11 +12,11 @@ import (
 // mustArchiveR2Client builds an R2 client from the process config, exiting on a
 // missing/invalid R2 configuration. Used by the survey commands to read and
 // delete survey objects.
-func mustArchiveR2Client(ctx context.Context, cfg config.Config) *r2.Client {
+func mustArchiveR2Client(ctx context.Context, cfg config.Config, pool *pgxpool.Pool) *r2.Client {
 	if err := cfg.ValidateR2(); err != nil {
 		log.Fatalf("R2 config required: %v", err)
 	}
-	r2c, err := r2.New(ctx, r2.Config{
+	r2c, err := r2.New(ctx, r2.Config{WriterDB: pool,
 		AccountID: cfg.R2AccountID,
 		AccessKey: cfg.R2AccessKeyID,
 		SecretKey: cfg.R2SecretAccessKey,
