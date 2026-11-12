@@ -1,5 +1,6 @@
 """Crash windows of bounded execution groups, against real disposable files/SQLite."""
 import copy
+import concurrent.futures
 import datetime
 import hashlib
 import json
@@ -42,6 +43,11 @@ class CleanupGroupTests(unittest.TestCase):
 
     def api(self, cfg, path, body, **kwargs):
         if path.endswith('/observe-batch'):
+            ready = [json.loads(message.split('cleanup pre-permit ', 1)[1])
+                     for _, message in self.logs if message.startswith('cleanup pre-permit ')]
+            for observation in body['observations']:
+                stage = next(s for s in ready if s.get('item_id') == observation['item_id'] and s['stage'] == 'proof_ready')
+                self.assertTrue({'lease_ms', 'open_ms', 'proof_ms', 'guard_ms', 'fence_ms'} <= set(stage['stage_timings']))
             rows = {n: phase for n, phase, _ in pull.cleanup_journal(self.inventory)}
             self.assertTrue(all(rows[b['item_id']] == 'observe' for b in body['observations']))
             return {'results': [fixture_ack(b, b['item_id'], status=200, action='delete_issued', delete=True,
@@ -55,6 +61,132 @@ class CleanupGroupTests(unittest.TestCase):
     def run_group(self, tasks):
         with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_GROUP_VERSION), mock.patch.object(pull, 'restore_api', side_effect=self.api):
             pull.cleanup_process_group(self.cfg, self.inventory, threading.Event(), tasks)
+
+    def cycle(self, tasks):
+        """Use the real v2 lease parser/coordinator and execution lane."""
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            return pull.cleanup_batch_v2(self.cfg, self.inventory, threading.Event(), executor, None,
+                                         task_limit=len(tasks))
+
+    def test_production_singleton_lease_drain_timeout_returns_before_expiry_then_retries(self):
+        tasks = self.group(1)
+        fence, clock = pull.NASMediaFence(), time.monotonic
+        offset, returned, requests = [0], [], []
+        def api(cfg, path, body, **kwargs):
+            requests.append(path)
+            if path.endswith('/lease'):
+                self.assertTrue(body['execution_batch'])
+                return dict(tasks=tasks)
+            if path.endswith('/reconcile'):
+                self.assertTrue(body['return_lease'])
+                self.assertIsNone(body['proof'])
+                self.assertLess(offset[0], 1800)
+                self.assertEqual(pull.cleanup_journal(self.inventory)[0][1], 'observe')
+                returned.append(body)
+                return fixture_ack(body, action='pending', delete=False)
+            return self.api(cfg, path, body, **kwargs)
+        def drain(timeout):
+            offset[0] += timeout  # Exercise the real 15s drain without sleeping.
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_GROUP_VERSION), \
+                mock.patch.object(pull, 'NAS_MEDIA_FENCE', fence), \
+                mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock()+offset[0]), \
+                mock.patch.object(fence.condition, 'wait', side_effect=drain), \
+                mock.patch.object(pull, 'restore_api', side_effect=api), \
+                mock.patch.object(pull.CleanupFile, 'proof', wraps=pull.CleanupFile.proof) as proof:
+            fence.writers = 1
+            with self.assertRaises(pull.CleanupDrainTimeout):
+                self.cycle(tasks)
+            proof.assert_not_called()
+            self.assertEqual(len(returned), 1)
+            self.assertEqual(len(requests), 2)  # lease then reconcile, no permit
+            self.assertFalse(pull.cleanup_journal(self.inventory))
+            self.assertFalse(self.inventory.cleanup_claims)
+            self.assertIsNone(fence.execution_owner)
+            self.assertEqual(fence.cleaners, 0)
+            self.assertFalse(fence.execution_lock.locked())
+        fence.writers = 0
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_GROUP_VERSION), \
+                mock.patch.object(pull, 'NAS_MEDIA_FENCE', fence), \
+                mock.patch.object(pull, 'restore_api', side_effect=api):
+            self.cycle(tasks)
+        self.assertFalse((self.cfg.output_dir/tasks[0]['item']['relative_path']).exists())
+        self.assertFalse(pull.cleanup_journal(self.inventory))
+        stages = [json.loads(message.split('cleanup pre-permit ', 1)[1])
+                  for _, message in self.logs if message.startswith('cleanup pre-permit ')]
+        ended = next(s for s in stages if s['stage'] == 'lane_end')
+        self.assertGreaterEqual(ended['stage_timings']['lane_ms'], 15000)
+
+    def test_slow_real_proofs_return_entire_lease_before_expiry(self):
+        tasks = self.group(2)
+        for task in tasks:
+            task['expires_at'] = (datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=150)).isoformat()
+        read, clock, real_datetime = pull.os.read, time.monotonic, datetime.datetime
+        offset, returned = [0], []
+        class Clock(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return real_datetime.now(tz)+datetime.timedelta(seconds=offset[0])
+        def slow_read(*args):
+            offset[0] += 10
+            return read(*args)
+        def api(cfg, path, body, **kwargs):
+            if path.endswith('/lease'): return dict(tasks=tasks)
+            self.assertTrue(path.endswith('/reconcile'), path)
+            self.assertTrue(body['return_lease'])
+            self.assertLess(offset[0], 150)
+            returned.append(int(path.split('/')[-2]))
+            return fixture_ack(body, returned[-1], action='pending', delete=False)
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_GROUP_VERSION), \
+                mock.patch.object(pull.datetime, 'datetime', Clock), \
+                mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock()+offset[0]), \
+                mock.patch.object(pull.os, 'read', side_effect=slow_read), \
+                mock.patch.object(pull, 'restore_api', side_effect=api), \
+                mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('slow proof cannot unlink')):
+            with self.assertRaises(pull.CleanupInterrupted): self.cycle(tasks)
+        self.assertEqual(returned, [1, 2])
+        self.assertFalse(pull.cleanup_journal(self.inventory))
+        self.assertTrue(all((self.cfg.output_dir/t['item']['relative_path']).exists() for t in tasks))
+        self.assertTrue(any('proof_end' in m and 'proof_ms' in m for _, m in self.logs))
+
+    def test_prepermit_exception_returns_all_unused_work(self):
+        tasks = self.group()
+        returned = []
+        def api(cfg, path, body, **kwargs):
+            if path.endswith('/lease'): return dict(tasks=tasks)
+            self.assertTrue(path.endswith('/reconcile'), path)
+            returned.append(int(path.split('/')[-2]))
+            return fixture_ack(body, returned[-1], action='pending', delete=False)
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_GROUP_VERSION), \
+                mock.patch.object(pull.CleanupFile, 'proof', side_effect=OSError('NAS read failed')), \
+                mock.patch.object(pull, 'restore_api', side_effect=api):
+            with self.assertRaisesRegex(OSError, 'NAS read failed'): self.cycle(tasks)
+        self.assertEqual(returned, [1, 2, 3])
+        self.assertFalse(pull.cleanup_journal(self.inventory))
+
+    def test_lost_unused_return_ack_replays_only_reconciliation(self):
+        tasks = self.group(1)
+        saved = []
+        def api(cfg, path, body, **kwargs):
+            if path.endswith('/lease'): return dict(tasks=tasks)
+            self.assertTrue(path.endswith('/reconcile'), path)
+            saved.append(dict(body))
+            raise TimeoutError('lost return acknowledgment')
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_GROUP_VERSION), \
+                mock.patch.object(pull.CleanupFile, 'proof', side_effect=OSError('NAS read failed')), \
+                mock.patch.object(pull, 'restore_api', side_effect=api):
+            with self.assertRaises(OSError): self.cycle(tasks)
+        row = pull.cleanup_journal(self.inventory)[0]
+        self.assertEqual(row[1], 'observe')
+        self.assertEqual(json.loads(row[2]), saved[0])
+        def replay(cfg, path, body, **kwargs):
+            self.assertTrue(path.endswith('/reconcile'), path)
+            self.assertEqual(body, saved[0])
+            return fixture_ack(body, action='pending', delete=False)
+        with mock.patch.object(pull, 'restore_api', side_effect=replay), \
+                mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('return replay cannot unlink')):
+            result = pull.cleanup_replay_receipts(self.cfg, self.inventory)
+        self.assertEqual(result['failed'], 0)
+        self.assertFalse(pull.cleanup_journal(self.inventory))
 
     def test_group_commits_intents_before_sequential_unlinks(self):
         tasks = self.group()
@@ -336,7 +468,7 @@ class CleanupGroupTests(unittest.TestCase):
             task['expires_at'] = (datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=40)).isoformat()
         with mock.patch.object(pull, 'restore_api', side_effect=AssertionError('insufficient lease budget')):
             with self.assertRaises(pull.CleanupInterrupted): self.run_group(tasks)
-        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 0)
+        self.assertEqual(pull.cleanup_local_headroom(self.inventory)[0], pull.CLEANUP_MAX_FILES_24H)
         self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'observe'})
 
     def test_replaced_path_after_durable_marker_is_preserved(self):
@@ -394,13 +526,16 @@ class CleanupGroupTests(unittest.TestCase):
         ring = pull.ClientLogRing()
         for level, message in self.logs: ring.record(level, message)
         entries, _ = ring.since(0)
-        self.assertEqual(len(entries), 3)
+        self.assertGreater(len(entries), 3)
         uploaded = []
         with mock.patch.object(pull, 'CLIENT_LOG_RING', ring), \
                 mock.patch.object(pull, 'request_json', side_effect=lambda *a, **kw: uploaded.extend(kw['body']['lines'])):
             pull.client_log_upload_once(self.cfg, type('Runtime', (), {'boot_id': 'fixture'})(), self.inventory, 0)
         self.assertEqual(uploaded, entries)
         for entry in uploaded:
+            if entry['message'].startswith('cleanup pre-permit '):
+                self.assertLess(len(entry['message']), pull.CLIENT_LOG_LINE_MAX)
+                continue
             body = json.loads(entry['message'].split('cleanup execution ', 1)[1])
             self.assertEqual(body['journal_phase'], 'acknowledged')
             self.assertTrue(body['media_unlinked'] and body['sidecar_unlinked'])
