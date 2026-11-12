@@ -1483,6 +1483,27 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		exec(string(migration))
 		key := "managed/acct-47/delivery-held.mp4"
 		exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'e',100,'metadata')`, key)
+		// Delivery-only admits kept footage, so unlike the outside-only
+		// owner class it must load physical-listing mismatch evidence.
+		clip(999997, 30, inside)
+		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state,size_bytes,sha256,verified_at,server_received_at,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256,file_mtime_ns,file_ctime_ns,file_inode,file_device)
+ VALUES(13,999997,'p/999997.mp4','present',1000997,$1,now(),now(),'p/999997.mp4.stoarama.json',100,$1,11,12,13,14)`, r2tSHA)
+		exec(`INSERT INTO nas_listing_generations(connection_id,generation,folders,completed_at) VALUES(13,'9876543210abcdef9876543210abcdef',ARRAY['p'],now());
+ INSERT INTO nas_listing_folders(connection_id,generation,folder) VALUES(13,'9876543210abcdef9876543210abcdef','p');
+ INSERT INTO nas_listing_files VALUES(13,'9876543210abcdef9876543210abcdef','p','p/999997.mp4',0,11,12,13,14)`)
+		deliverySets, err := loadR2RetireSets(ctx, pool, "", true, r2RetireDeliveryOnly)
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidate := r2RetireCandidate{Kind: "raw", SourceID: 999997, RelativePath: "p/999997.mp4", SHA256: r2tSHA, SizeBytes: 1000997}
+		deliverySets.applyPlanNAS(&candidate)
+		if !candidate.Facts.ExactNAS {
+			t.Fatal("fixture exact NAS identity missing")
+		}
+		deliverySets.Evidence.apply(&candidate)
+		if candidate.Facts.ExactNAS {
+			t.Fatal("delivery class trusted fresh hash after physical listing changed")
+		}
 		before := len(store.deleted)
 		for _, class := range []r2RetireClass{"", r2RetireOwnerAccepted, r2RetireDeliveryOnly} {
 			h := r2RetireHeader{DeliveryKeepSHA256: r2tSHA, Version: r2RetireManifestVersion, Class: class, NASBacked: true, Reason: r2RetireReason, Bucket: "stoarama", Choices: map[string]string{"3": "none"}, Items: 1, Bytes: 100}
