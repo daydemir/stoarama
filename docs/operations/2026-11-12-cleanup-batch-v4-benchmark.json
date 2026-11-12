@@ -1,0 +1,134 @@
+{
+  "before-native": {
+    "client": "cleanup-batch-v3",
+    "files_per_group": 8,
+    "sync_delay_ms": 0,
+    "permit_delay_ms": 0,
+    "proof_delay_ms": 0,
+    "lease_delay_ms": 0,
+    "samples": [
+      {
+        "seconds": 0.012128,
+        "fsyncs": 67,
+        "sqlite_commits": 43
+      },
+      {
+        "seconds": 0.011339,
+        "fsyncs": 67,
+        "sqlite_commits": 43
+      },
+      {
+        "seconds": 0.008789,
+        "fsyncs": 67,
+        "sqlite_commits": 43
+      },
+      {
+        "seconds": 0.008245,
+        "fsyncs": 67,
+        "sqlite_commits": 43
+      },
+      {
+        "seconds": 0.008315,
+        "fsyncs": 67,
+        "sqlite_commits": 43
+      }
+    ],
+    "median_group_seconds": 0.008789,
+    "projected_files_per_minute": 54613.72,
+    "fsyncs_per_file": 8.375
+  },
+  "after-native": {
+    "client": "cleanup-batch-v4",
+    "files_per_group": 8,
+    "sync_delay_ms": 0,
+    "permit_delay_ms": 0,
+    "proof_delay_ms": 0,
+    "lease_delay_ms": 0,
+    "samples": [
+      {
+        "seconds": 0.008472,
+        "fsyncs": 45,
+        "sqlite_commits": 21
+      },
+      {
+        "seconds": 0.007622,
+        "fsyncs": 45,
+        "sqlite_commits": 21
+      },
+      {
+        "seconds": 0.009506,
+        "fsyncs": 45,
+        "sqlite_commits": 21
+      },
+      {
+        "seconds": 0.007077,
+        "fsyncs": 45,
+        "sqlite_commits": 21
+      },
+      {
+        "seconds": 0.007469,
+        "fsyncs": 45,
+        "sqlite_commits": 21
+      }
+    ],
+    "median_group_seconds": 0.007622,
+    "projected_files_per_minute": 62975.6,
+    "fsyncs_per_file": 5.625
+  },
+  "before-latency": {
+    "client": "cleanup-batch-v3",
+    "files_per_group": 8,
+    "sync_delay_ms": 385.0,
+    "permit_delay_ms": 779.0,
+    "proof_delay_ms": 255.0,
+    "lease_delay_ms": 1952.0,
+    "samples": [
+      {
+        "seconds": 36.525395,
+        "fsyncs": 67,
+        "sqlite_commits": 43
+      },
+      {
+        "seconds": 36.524382,
+        "fsyncs": 67,
+        "sqlite_commits": 43
+      },
+      {
+        "seconds": 36.597272,
+        "fsyncs": 67,
+        "sqlite_commits": 43
+      }
+    ],
+    "median_group_seconds": 36.525395,
+    "projected_files_per_minute": 13.14,
+    "fsyncs_per_file": 8.375
+  },
+  "after-latency": {
+    "client": "cleanup-batch-v4",
+    "files_per_group": 8,
+    "sync_delay_ms": 385.0,
+    "permit_delay_ms": 779.0,
+    "proof_delay_ms": 255.0,
+    "lease_delay_ms": 1952.0,
+    "samples": [
+      {
+        "seconds": 27.934075,
+        "fsyncs": 45,
+        "sqlite_commits": 21
+      },
+      {
+        "seconds": 27.959324,
+        "fsyncs": 45,
+        "sqlite_commits": 21
+      },
+      {
+        "seconds": 27.936836,
+        "fsyncs": 45,
+        "sqlite_commits": 21
+      }
+    ],
+    "median_group_seconds": 27.936836,
+    "projected_files_per_minute": 17.18,
+    "fsyncs_per_file": 5.625
+  }
+}

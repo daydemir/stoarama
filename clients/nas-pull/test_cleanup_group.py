@@ -354,8 +354,9 @@ class CleanupGroupTests(unittest.TestCase):
         clock, delete, caps = time.monotonic, pull.CleanupFile.delete_exact, pull.cleanup_reserve_group_caps
         offset, observed, batches = [0], [], []
         def slow_caps(*args):
-            caps(*args)
+            reservations = caps(*args)
             offset[0] += 20  # NAS durability before authority must not age a permit.
+            return reservations
         def slow_delete(current, proof):
             offset[0] += 4  # Whole lease takes >30s; each permit remains fresh.
             return delete(current, proof)
@@ -425,7 +426,7 @@ class CleanupGroupTests(unittest.TestCase):
         self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'observe'})
         self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 0)
 
-    def test_partial_ledger_intent_write_preserves_issued_intent_without_unlink(self):
+    def test_partial_ledger_intent_write_preserves_observation_without_unlink(self):
         tasks = self.group()
         real = pull.cleanup_ledger_append_many
         def partial(cfg, rows):
@@ -433,7 +434,7 @@ class CleanupGroupTests(unittest.TestCase):
             raise OSError('partial append')
         with mock.patch.object(pull, 'cleanup_ledger_append_many', side_effect=partial), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('must not unlink')):
             with self.assertRaises(OSError): self.run_group(tasks)
-        self.assertEqual([r[1] for r in pull.cleanup_journal(self.inventory)], ['intent', 'observe', 'observe'])
+        self.assertEqual([r[1] for r in pull.cleanup_journal(self.inventory)], ['observe', 'observe', 'observe'])
 
     def test_partial_ledger_results_leave_issued_file_uncertain(self):
         tasks = self.group()
@@ -539,6 +540,84 @@ class CleanupGroupTests(unittest.TestCase):
                 self.assertNotIn('refusal_protocol', uncertain)
             finally: case.doCleanups()
 
+    def test_sigkill_around_attempt_and_result_replays_without_refusal_or_unlink(self):
+        for cut in ('ledger_intent', 'marker', 'media', 'sidecar', 'result'):
+            case = CleanupGroupTests('test_group_commits_intents_before_sequential_unlinks')
+            case.setUp()
+            try:
+                tasks = case.group(8)
+                script = textwrap.dedent("""
+                    import json, sys, threading
+                    from pathlib import Path
+                    from types import SimpleNamespace
+                    from unittest import mock
+                    import test_cleanup_group as fixtures
+                    pull = fixtures.pull
+                    root, cut, encoded = sys.argv[1:]
+                    case = fixtures.CleanupGroupTests('test_group_commits_intents_before_sequential_unlinks')
+                    case.cfg = SimpleNamespace(output_dir=Path(root)/'clips', state_dir=Path(root)/'state',
+                        inventory_file=Path(root)/'state'/'inventory.sqlite3', dry_run=False)
+                    case.inventory, case.logs = pull.Inventory(case.cfg), []
+                    ledger, journal, unlink = pull.cleanup_ledger_append_many, pull.cleanup_journal_group, pull.os.unlink
+                    def halt():
+                        print('ready', flush=True)
+                        sys.stdin.read()
+                        raise AssertionError('parent must SIGKILL')
+                    def append(cfg, records):
+                        ledger(cfg, records)
+                        if cut == 'ledger_intent' and records[0]['event'] == 'intent': halt()
+                    def checkpoint(inventory, entries):
+                        journal(inventory, entries)
+                        if (cut == 'marker' and entries[0][2] == 'intent'
+                                or cut == 'result' and entries[0][2] == 'result'): halt()
+                    def remove(name, **kwargs):
+                        unlink(name, **kwargs)
+                        if cut == ('sidecar' if name.endswith('.json') else 'media'): halt()
+                    with mock.patch.object(pull.os.path, 'ismount', return_value=True), \
+                            mock.patch.object(pull, 'cleanup_pins', return_value=case.fixture_pins(
+                                '2027-01-01T00:00:00+00:00', '2027-01-29T00:00:00+00:00')), \
+                            mock.patch.object(pull, 'log', side_effect=lambda l,m: case.logs.append((l,m))), \
+                            mock.patch.object(pull, 'cleanup_ledger_append_many', side_effect=append), \
+                            mock.patch.object(pull, 'cleanup_journal_group', side_effect=checkpoint), \
+                            mock.patch.object(pull.os, 'unlink', side_effect=remove):
+                        case.run_group(json.loads(encoded))
+                """)
+                child = subprocess.Popen([sys.executable, '-c', script, str(case.root), cut, json.dumps(tasks)],
+                    cwd=str(Path(__file__).parent), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    self.assertTrue(select.select([child.stdout], [], [], 15)[0], 'child did not reach crash window')
+                    self.assertEqual(child.stdout.readline().strip(), 'ready')
+                finally:
+                    child.kill()
+                    _, errors = child.communicate(timeout=10)
+                self.assertFalse(errors, errors)
+                restarted = pull.Inventory(case.cfg)
+                try:
+                    rows = pull.cleanup_journal(restarted)
+                    expected = 'observe' if cut == 'ledger_intent' else 'result' if cut == 'result' else 'intent'
+                    self.assertEqual(rows[0][1], expected)
+                    self.assertNotIn('refusal_protocol', json.loads(rows[0][2]))
+                    # SIGKILL runs no finally: all eight conservative cap charges survive.
+                    self.assertEqual(restarted.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 8)
+                    replayed = []
+                    def replay(cfg, path, body, **kwargs):
+                        item_id = int(path.split('/')[-2])
+                        if path.endswith('/reconcile'):
+                            return fixture_ack(body, item_id, action='reconcile' if item_id == 1 else 'pending', delete=False)
+                        replayed.append(body)
+                        return fixture_ack(body, item_id, ok=True)
+                    with mock.patch.object(pull, 'restore_api', side_effect=replay), \
+                            mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('replay cannot unlink')):
+                        report = pull.cleanup_replay_receipts(case.cfg, restarted)
+                    self.assertEqual(report['failed'], 0)
+                    self.assertFalse(pull.cleanup_journal(restarted))
+                    self.assertEqual(replayed[0]['outcome'], 'deleted' if cut == 'result' else 'unverified')
+                    self.assertNotIn('refusal_protocol', replayed[0])
+                finally:
+                    restarted.close()
+            finally:
+                case.doCleanups()
+
     def test_one_refused_permit_prevents_every_unlink(self):
         tasks = self.group()
         real_api = self.api
@@ -550,12 +629,51 @@ class CleanupGroupTests(unittest.TestCase):
             with self.assertRaises(pull.CleanupResponseError): self.run_group(tasks)
         self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'observe'})
 
-    def test_local_cap_counts_attempts_once_and_stops_before_excess_permit(self):
+    def test_local_cap_reserves_whole_group_or_stops_before_every_permit(self):
         tasks = self.group()
-        with mock.patch.object(pull, 'CLEANUP_MAX_FILES_24H', 2):
+        with mock.patch.object(pull, 'CLEANUP_MAX_FILES_24H', 2), \
+                mock.patch.object(pull, 'restore_api', side_effect=AssertionError('no partial reservation')):
             with self.assertRaises(pull.CleanupPermitRefused): self.run_group(tasks)
-        self.assertEqual([r[1] for r in pull.cleanup_journal(self.inventory)], ['result', 'result', 'observe'])
-        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 2)
+        self.assertEqual([r[1] for r in pull.cleanup_journal(self.inventory)], ['observe']*3)
+        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 0)
+
+    def test_caps_and_diagnostics_each_commit_once_for_eight_members(self):
+        tasks = self.group(8)
+        statements = []
+        self.inventory.db.set_trace_callback(statements.append)
+        with mock.patch.object(pull, 'cleanup_reserve_group_caps', wraps=pull.cleanup_reserve_group_caps) as caps, \
+                mock.patch.object(pull, 'cleanup_execution_outcomes', wraps=pull.cleanup_execution_outcomes) as diagnostics:
+            self.run_group(tasks)
+        self.inventory.db.set_trace_callback(None)
+        self.assertEqual(caps.call_count, 1)
+        self.assertEqual(len(caps.call_args.args[1]), 8)
+        self.assertEqual(diagnostics.call_count, 1)
+        self.assertEqual(len(diagnostics.call_args.args[1]), 8)
+        # All cap INSERTs have the same enclosing transaction.
+        charge_positions = [n for n, sql in enumerate(statements) if sql.startswith('INSERT INTO cleanup_local_deletions')]
+        self.assertEqual(len(charge_positions), 8)
+        self.assertFalse(any(sql == 'COMMIT' for sql in statements[charge_positions[0]:charge_positions[-1]]))
+
+    def test_abort_releases_exact_unattempted_rows_including_unvisited_members(self):
+        tasks = self.group(8)
+        historic = pull.cleanup_reserve_group_caps(self.inventory, tasks)
+        api = self.api
+        def fail(cfg, path, body, **kwargs):
+            if path.endswith('/observe-batch') and body['observations'][0]['item_id'] == 3:
+                raise TimeoutError('third permit response lost')
+            return api(cfg, path, body, **kwargs)
+        with mock.patch.object(self, 'api', side_effect=fail):
+            with self.assertRaises(TimeoutError): self.run_group(tasks)
+        rows = self.inventory.db.execute('SELECT id,item_id FROM cleanup_local_deletions ORDER BY id').fetchall()
+        self.assertEqual([r[0] for r in rows[:8]], historic)
+        self.assertEqual([r[1] for r in rows[8:]], [1, 2])
+
+    def test_group_cap_insert_failure_rolls_back_every_charge(self):
+        tasks = self.group(8)
+        self.inventory.db.execute("CREATE TRIGGER reject_third_cap BEFORE INSERT ON cleanup_local_deletions WHEN new.item_id=3 BEGIN SELECT RAISE(ABORT,'injected cap failure'); END")
+        with self.assertRaisesRegex(Exception, 'injected cap failure'):
+            pull.cleanup_reserve_group_caps(self.inventory, tasks)
+        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 0)
 
     def test_slow_group_barriers_expire_before_unlink(self):
         tasks = self.group()
