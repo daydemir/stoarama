@@ -206,7 +206,7 @@ func TestNASCleanupExecutionDeadlineClientServer(t *testing.T) {
 					if err := f.pool.QueryRow(f.ctx, `SELECT state,delete_ever_issued,outcome FROM nas_cleanup_items WHERE plan_id=$1`, id).Scan(&itemState, &issued, &receipt); err != nil {
 						t.Fatal(err)
 					}
-					if itemState != "unverified" || !issued || !strings.Contains(string(receipt), `"unlink_attempted": false`) {
+					if itemState != "keep" || !issued || !strings.Contains(string(receipt), `"unlink_attempted": false`) {
 						t.Fatalf("reconciliation lost safe classification: %s %t %s", itemState, issued, receipt)
 					}
 				} else if slow {
@@ -323,7 +323,7 @@ func TestNASCleanupNeverAttemptedReceiptPreservesSafetyAndDiagnostics(t *testing
 		t.Fatalf("receipt lost evidence: %s issued=%t", saved, issued)
 	}
 	if mode, _ := f.planMode(id); mode != "paused" {
-		t.Fatalf("refusal bypassed safety pause: %s", mode)
+		t.Fatalf("legacy refusal bypassed safety pause: %s", mode)
 	}
 	body["outcome"] = "deleted"
 	w := cleanupCall(t, f.s.handleAccountNASCleanupResult, 47, 5, "itemId", fmt.Sprint(task.ItemID), body)

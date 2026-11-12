@@ -1114,49 +1114,53 @@ class Inventory:
         return None
 
     def _linked_scan_row_is_current(self, clip, generation, scan_pass, path, sidecar_evidence):
-        with self.lock:
-            row = self.db.execute(
-                """SELECT recording_id,relative_path,size_bytes,sha256,state,file_mtime_ns,seen_generation,
+        # NAS I/O must never hold the receipt journal mutex.
+        query = """SELECT recording_id,relative_path,size_bytes,sha256,state,file_mtime_ns,seen_generation,
                           file_ctime_ns,file_inode,file_device,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256,
                           clip_start_us,clip_end_us,verified_at
-                   FROM files WHERE clip_id=?""",
-                (int(clip["clip_id"]),),
-            ).fetchone()
-            if row is None:
-                return False
-            different_generation = row[6] != generation
-            if different_generation:
-                if (row[4] != "present" or not re.fullmatch(r"[0-9a-f]{64}", row[3])
-                        or row[13] <= 0 or row[14] <= row[13]):
-                    return False
-                try:
-                    verified = parse_certification_timestamp(row[15], "inventory verified_at")
-                except (ValueError, MediaCertificationError):
-                    return False
-                if verified > datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5):
-                    return False
-            if row[0] != int(clip["recording_id"]) or row[1] != str(clip["relative_path"]):
-                return False
-            if row[2] != int(clip["size_bytes"]) or row[3] != str(clip["sha256"]).lower():
+                   FROM files WHERE clip_id=?"""
+        params = (int(clip["clip_id"]),)
+        with self.lock:
+            row = self.db.execute(query, params).fetchone()
+        if row is None:
+            return False
+        different_generation = row[6] != generation
+        if different_generation:
+            if (row[4] != "present" or not re.fullmatch(r"[0-9a-f]{64}", row[3])
+                    or row[13] <= 0 or row[14] <= row[13]):
                 return False
             try:
-                stat = self._cached_regular_stat(str(clip["relative_path"])) if different_generation else path.stat()
-            except FileNotFoundError:
-                stat = None
-            if stat is None:
-                current = row[4] == "missing" and row[5] == 0
-            else:
-                current = (
-                    row[4] in ("present", "mismatch") and row[5] == stat.st_mtime_ns
-                    and row[7] != 0 and row[7] == stat.st_ctime_ns
-                    and row[8] != 0 and row[8] == stat.st_ino
-                    and row[9] != 0 and row[9] == stat.st_dev
-                    and stat.st_size == int(clip["size_bytes"])
-                    and tuple(row[10:13]) == tuple(sidecar_evidence)
-                    and row[13] == optional_certification_timestamp_microseconds(clip.get("clip_start_at"), "clip_start_at")
-                    and row[14] == optional_certification_timestamp_microseconds(clip.get("clip_end_at"), "clip_end_at")
-                )
-            if current:
+                verified = parse_certification_timestamp(row[15], "inventory verified_at")
+            except (ValueError, MediaCertificationError):
+                return False
+            if verified > datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5):
+                return False
+        if row[0] != int(clip["recording_id"]) or row[1] != str(clip["relative_path"]):
+            return False
+        if row[2] != int(clip["size_bytes"]) or row[3] != str(clip["sha256"]).lower():
+            return False
+        try:
+            stat = self._cached_regular_stat(str(clip["relative_path"])) if different_generation else path.stat()
+        except FileNotFoundError:
+            stat = None
+        if stat is None:
+            current = row[4] == "missing" and row[5] == 0
+        else:
+            current = (
+                row[4] in ("present", "mismatch") and row[5] == stat.st_mtime_ns
+                and row[7] != 0 and row[7] == stat.st_ctime_ns
+                and row[8] != 0 and row[8] == stat.st_ino
+                and row[9] != 0 and row[9] == stat.st_dev
+                and stat.st_size == int(clip["size_bytes"])
+                and tuple(row[10:13]) == tuple(sidecar_evidence)
+                and row[13] == optional_certification_timestamp_microseconds(clip.get("clip_start_at"), "clip_start_at")
+                and row[14] == optional_certification_timestamp_microseconds(clip.get("clip_end_at"), "clip_end_at")
+            )
+        if current:
+            with self.lock:
+                latest = self.db.execute(query, params).fetchone()
+                if latest != row:
+                    return False
                 if different_generation:
                     # A scope/generation change does not change immutable file
                     # identity. Publish the observation in this generation but
@@ -1168,7 +1172,7 @@ class Inventory:
                     )
                 else:
                     self.db.execute("UPDATE files SET scan_pass=? WHERE clip_id=?", (scan_pass, int(clip["clip_id"])))
-            return current
+        return current
 
     def _cached_regular_stat(self, relative_path):
         parts = Path(relative_path).parts
@@ -1191,24 +1195,28 @@ class Inventory:
         return None
 
     def _unmatched_scan_row_is_current(self, relative_path, generation, scan_pass, stat):
+        # NAS I/O must never hold the receipt journal mutex.
+        query = """SELECT size_bytes,state,file_mtime_ns,seen_generation,file_ctime_ns,file_inode,file_device,sha256
+                   FROM unmatched_files WHERE relative_path=?"""
+        params = (relative_path,)
         with self.lock:
-            row = self.db.execute(
-                """SELECT size_bytes,state,file_mtime_ns,seen_generation,file_ctime_ns,file_inode,file_device,sha256
-                   FROM unmatched_files WHERE relative_path=?""",
-                (relative_path,),
-            ).fetchone()
-            different_generation = row is not None and row[3] != generation
-            if different_generation:
-                stat = self._cached_regular_stat(relative_path)
-            current = (
-                row is not None and stat is not None and row[1] == "present"
-                and re.fullmatch(r"[0-9a-f]{64}", row[7]) is not None
-                and row[0] == stat.st_size and row[2] == stat.st_mtime_ns
-                and row[4] != 0 and row[4] == stat.st_ctime_ns
-                and row[5] != 0 and row[5] == stat.st_ino
-                and row[6] != 0 and row[6] == stat.st_dev
-            )
-            if current:
+            row = self.db.execute(query, params).fetchone()
+        different_generation = row is not None and row[3] != generation
+        if different_generation:
+            stat = self._cached_regular_stat(relative_path)
+        current = (
+            row is not None and stat is not None and row[1] == "present"
+            and re.fullmatch(r"[0-9a-f]{64}", row[7]) is not None
+            and row[0] == stat.st_size and row[2] == stat.st_mtime_ns
+            and row[4] != 0 and row[4] == stat.st_ctime_ns
+            and row[5] != 0 and row[5] == stat.st_ino
+            and row[6] != 0 and row[6] == stat.st_dev
+        )
+        if current:
+            with self.lock:
+                latest = self.db.execute(query, params).fetchone()
+                if latest != row:
+                    return False
                 if different_generation:
                     self.db.execute(
                         "UPDATE unmatched_files SET seen_generation=?,scan_pass=?,client_updated_at=?,dirty=1 WHERE relative_path=?",
@@ -1216,7 +1224,7 @@ class Inventory:
                     )
                 else:
                     self.db.execute("UPDATE unmatched_files SET scan_pass=? WHERE relative_path=?", (scan_pass, relative_path))
-            return current
+        return current
 
     def _retire_unmatched_linked_path(self, relative_path, generation, scan_pass):
         with self.lock:
@@ -2016,7 +2024,7 @@ class NASMediaFence:
         # Inventory and other background readers pause at safe checkpoints.
         # Heartbeats, updates and reconciliation remain independent.
         with self.condition:
-            while self.execution_owner is not None:
+            while self.execution_owner is not None or self.cleaners:
                 if stop_event.is_set():
                     return False
                 self.condition.wait(0.2)
@@ -3065,7 +3073,7 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
         if phase == "observe" and response.get("action") == "reconcile":
             body = {"attempt": body["attempt"], "plan_sha256": body["plan_sha256"], "proof_sha256": response["proof_sha256"],
                     "outcome": "unverified", "error": "recovered observation permit was not executed",
-                    "unlink_attempted": False, "refusal_reason": "observation_replayed"}
+                    "unlink_attempted": False, "refusal_reason": "observation_replayed", "refusal_protocol": 1}
             cleanup_journal(inventory, item_id, "result", body, owner=owner)
             result = replay(item_id, "result", body, owner)
             if result is None and any(row[0] == item_id for row in cleanup_journal(inventory)):
@@ -3204,7 +3212,17 @@ class CleanupSingleAPI:
 CLEANUP_SINGLE_API = CleanupSingleAPI()
 
 
+def cleanup_timed(timings, stage, fn, *args, **kwargs):
+    started = time.monotonic()
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        timings[stage] = timings.get(stage, 0) + round((time.monotonic() - started) * 1000)
+
+
 def cleanup_process_task(cfg, inventory, stop_event, task, api=None, lane=None):
+    execution_started = time.monotonic()
+    timings = {}
     # Both protocols and direct callers reserve before any filesystem/API work.
     owner = cleanup_reserve_item(inventory, task["item_id"])
     if owner is None:
@@ -3217,9 +3235,11 @@ def cleanup_process_task(cfg, inventory, stop_event, task, api=None, lane=None):
                 if stop_event.is_set():
                     raise CleanupInterrupted("cleanup execution cancelled while queued")
                 acquired = inventory.cleanup_execution_lock.acquire(timeout=0.2)
+        timings["queue_ms"] = round((time.monotonic() - execution_started) * 1000)
         if lane is not None:
-            return lane.run(_cleanup_process_task, cfg, inventory, stop_event, task, api, owner)
-        return _cleanup_process_task(cfg, inventory, stop_event, task, api, owner)
+            return lane.run(_cleanup_process_task, cfg, inventory, stop_event, task, api, owner,
+                            timings, execution_started, time.monotonic())
+        return _cleanup_process_task(cfg, inventory, stop_event, task, api, owner, timings, execution_started)
     except CleanupInterrupted as exc:
         # An observe checkpoint precedes every permit request. Never return a
         # task with uncertain authority; those checkpoints reconcile normally.
@@ -3244,7 +3264,9 @@ def cleanup_process_task(cfg, inventory, stop_event, task, api=None, lane=None):
             inventory.cleanup_claims.pop(task["item_id"], None)
 
 
-def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
+def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner, timings, execution_started, lane_started=None):
+    if lane_started is not None:
+        timings["lane_ms"] = round((time.monotonic() - lane_started) * 1000)
     api = api or CLEANUP_SINGLE_API
     item_id, attempt = task["item_id"], task["attempt"]
     if type(item_id) is not int or item_id <= 0 or type(attempt) is not int or attempt <= 0:
@@ -3257,7 +3279,6 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
         # gets the same recorded decision (or the same single permit) back.
         body["request_id"] = uuid.uuid4().hex
     fenced = False
-    execution_started = time.monotonic()
     permit_request_started = None
     observe_elapsed_ms = None
     receipt = None
@@ -3267,37 +3288,41 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
         # A previously approved proof marks the execution phase. Dry runs
         # never acquire the write fence and do not impede clip delivery.
         if task.get("approved_proof") is not None:
-            NAS_MEDIA_FENCE.acquire_cleanup(stop_event, min(deadline, time.monotonic() + CLEANUP_EXECUTION_DRAIN_SEC))
+            cleanup_timed(timings, "fence_ms", NAS_MEDIA_FENCE.acquire_cleanup,
+                          stop_event, min(deadline, time.monotonic() + CLEANUP_EXECUTION_DRAIN_SEC))
             fenced = True
+        open_started = time.monotonic()
         with CleanupFile(cfg, task["item"], stop_event, deadline) as current:
-            proof = current.proof()
+            timings["open_ms"] = round((time.monotonic() - open_started) * 1000)
+            proof = cleanup_timed(timings, "proof_ms", current.proof)
             if task.get("approved_proof") is not None and {k:v for k,v in proof.items() if k != "parent_members_sha256"} != {k:v for k,v in task["approved_proof"].items() if k != "parent_members_sha256"}:
                 raise RuntimeError("cleanup dry-run proof changed; KEEP")
             # Independent client guard, in dry runs too: a refused item is
             # reported as a conflict observation (an outcome every server
             # accepts), never would_delete, so enabling its plan fails up front
             # instead of pausing mid-run. Local caps apply to execution only.
-            refusal = cleanup_guard_refusal(task, proof, cfg)
+            refusal = cleanup_timed(timings, "guard_ms", cleanup_guard_refusal, task, proof, cfg)
             if refusal is None and task.get("approved_proof") is not None:
-                refusal = cleanup_local_caps(inventory, task["item"].get("size_bytes"))
+                refusal = cleanup_timed(timings, "caps_ms", cleanup_local_caps, inventory, task["item"].get("size_bytes"))
             if refusal:
                 raise RuntimeError("client deletion guard refused; KEEP: " + refusal)
             body.update(outcome="match", proof=proof, timings=dict(current.stage_timings))
             # Only for tasks from a lease that advertised recovery_md5.
             if api.request_ids and task.get("_recovery_md5") is True and current.media_md5:
                 body["md5"] = current.media_md5
-            cleanup_journal(inventory, item_id, "observe", body, owner=owner)
+            cleanup_timed(timings, "observe_journal_ms", cleanup_journal, inventory, item_id, "observe", body, owner=owner)
             permit_request_started = time.monotonic()
             try:
                 decision = (api.observe(cfg, item_id, body, execution=True) if fenced
                             else api.observe(cfg, item_id, body))
             finally:
                 observe_elapsed_ms = round((time.monotonic() - permit_request_started) * 1000)
+                timings["observe_ms"] = observe_elapsed_ms
             cleanup_validate_ack(item_id, "observe", body, decision)
             execution_outcome["outcome"] = decision["action"]
             if decision.get("delete") is True:
                 receipt = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "proof_sha256": decision.get("proof_sha256"), "outcome": "unverified", "error": "", "observe_elapsed_ms": observe_elapsed_ms}
-                cleanup_journal(inventory, item_id, "intent", receipt, owner=owner)
+                cleanup_timed(timings, "intent_journal_ms", cleanup_journal, inventory, item_id, "intent", receipt, owner=owner)
                 ledger = None
                 try:
                     permit_expiry = cleanup_check_permit(cfg, fenced, task, proof, decision, permit_request_started)
@@ -3308,8 +3333,8 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
                     # Re-check immediately before unlink, reserve one deletion
                     # against the local caps, then write the durable intent line.
                     # Any failure here leaves the files untouched.
-                    refusal = cleanup_guard_refusal(task, proof, cfg) or cleanup_local_caps(
-                        inventory, item.get("size_bytes"), {"item_id": item_id, "plan_sha256": task["plan_sha256"], "relative_path": item["relative_path"]})
+                    refusal = cleanup_timed(timings, "guard_ms", cleanup_guard_refusal, task, proof, cfg) or cleanup_timed(
+                        timings, "caps_ms", cleanup_local_caps, inventory, item.get("size_bytes"), {"item_id": item_id, "plan_sha256": task["plan_sha256"], "relative_path": item["relative_path"]})
                     if refusal:
                         raise CleanupPermitRefused("local_guard", "client deletion guard refused; not unlinked: " + refusal)
                     if item.get("permit_reason"):
@@ -3322,8 +3347,8 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
                               "sidecar_relative_path": item["relative_path"] + ".stoarama.json" if item.get("sidecar_required") else None,
                               "size_bytes": item.get("size_bytes"), "sha256": proof["sha256"], "kind": item.get("kind"),
                               "stream_id": item.get("stream_id"), "client_version": CLIENT_VERSION}
-                    cleanup_ledger_append(cfg, dict(ledger, event="intent", at=utc_now_precise()))
-                    current.delete_exact(proof)
+                    cleanup_timed(timings, "ledger_intent_ms", cleanup_ledger_append, cfg, dict(ledger, event="intent", at=utc_now_precise()))
+                    cleanup_timed(timings, "delete_ms", current.delete_exact, proof)
                     receipt["outcome"] = "deleted"
                 except Exception as exc:
                     receipt["error"] = str(exc)[:500]
@@ -3331,15 +3356,28 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
                         receipt["refusal_reason"] = exc.reason if isinstance(exc, CleanupPermitRefused) else "pre_unlink_failure"
                     if current.media_unlinked and task["item"].get("sidecar_required") and not current.sidecar_unlinked:
                         receipt["outcome"] = "media_deleted_sidecar_failed"
-                receipt.update(unlink_attempted=current.unlink_attempted,
-                               execution_elapsed_ms=round((time.monotonic() - execution_started) * 1000))
+                receipt["unlink_attempted"] = current.unlink_attempted
                 if ledger is not None:
                     try:
-                        cleanup_ledger_append(cfg, dict(ledger, event="result", at=utc_now_precise(), outcome=receipt["outcome"],
+                        cleanup_timed(timings, "ledger_result_ms", cleanup_ledger_append, cfg, dict(ledger, event="result", at=utc_now_precise(), outcome=receipt["outcome"],
                                                         media_unlinked=current.media_unlinked, sidecar_unlinked=current.sidecar_unlinked,
                                                         error=receipt["error"]))
                     except Exception as exc:
                         log("ERROR", "cleanup item=%d deletion ledger result append failed: %s" % (item_id, exc))
+                        # An unresolved ledger intent remains uncertain even if
+                        # this process knows it stopped before the unlink.
+                        if receipt["outcome"] != "media_deleted_sidecar_failed":
+                            receipt["outcome"] = "unverified"
+                        receipt["error"] = "deletion ledger result append failed: " + str(exc)[:400]
+                        if not current.unlink_attempted:
+                            receipt.pop("unlink_attempted", None)
+                            receipt.pop("refusal_reason", None)
+                # Only the owned, durable result may certify a pre-unlink
+                # refusal. Never put this marker in an intent checkpoint.
+                if receipt.get("unlink_attempted") is False and receipt.get("refusal_reason"):
+                    receipt["refusal_protocol"] = 1
+                receipt.update(execution_elapsed_ms=round((time.monotonic() - execution_started) * 1000),
+                               stage_timings=dict(timings))
                 cleanup_journal(inventory, item_id, "result", receipt, owner=owner)
                 response = api.result(cfg, item_id, receipt)
                 cleanup_validate_ack(item_id, "result", receipt, response)
@@ -3364,9 +3402,10 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
             NAS_MEDIA_FENCE.release_cleanup()
         if task.get("approved_proof") is not None:
             outcome = dict(receipt or execution_outcome)
-            outcome.update(observe_elapsed_ms=observe_elapsed_ms,
-                           execution_elapsed_ms=round((time.monotonic() - execution_started) * 1000),
-                           unlink_attempted=bool(current and current.unlink_attempted))
+            outcome.update(observe_elapsed_ms=observe_elapsed_ms, stage_timings=dict(timings),
+                           execution_elapsed_ms=round((time.monotonic() - execution_started) * 1000))
+            if receipt is None:
+                outcome["unlink_attempted"] = bool(current and current.unlink_attempted)
             try:
                 cleanup_execution_outcome(inventory, item_id, attempt, outcome)
             except Exception as exc:
@@ -3941,7 +3980,9 @@ def sha256_file_throttled(path, megabytes_per_sec, stop_event):
     target_bytes_per_sec = megabytes_per_sec * 1024 * 1024
     with open(path, "rb") as source:
         while True:
-            if stop_event.is_set():
+            # A scan may already be hashing a multi-GB file when cleanup
+            # reserves the lane; yield between reads, not just between files.
+            if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
                 raise InventoryScanStopped("inventory scan stopped")
             started = time.monotonic()
             chunk = source.read(1024 * 1024)

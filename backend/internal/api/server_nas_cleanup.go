@@ -1298,21 +1298,39 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 }
 
 type cleanupReceipt struct {
-	ItemID             int64  `json:"item_id,omitempty"`
-	Attempt            int    `json:"attempt"`
-	PlanSHA            string `json:"plan_sha256"`
-	ProofSHA           string `json:"proof_sha256"`
-	Outcome            string `json:"outcome"`
-	Error              string `json:"error"`
-	ObserveElapsedMS   *int64 `json:"observe_elapsed_ms,omitempty"`
-	ExecutionElapsedMS *int64 `json:"execution_elapsed_ms,omitempty"`
-	UnlinkAttempted    *bool  `json:"unlink_attempted,omitempty"`
-	RefusalReason      string `json:"refusal_reason,omitempty"`
+	ItemID             int64            `json:"item_id,omitempty"`
+	Attempt            int              `json:"attempt"`
+	PlanSHA            string           `json:"plan_sha256"`
+	ProofSHA           string           `json:"proof_sha256"`
+	Outcome            string           `json:"outcome"`
+	Error              string           `json:"error"`
+	ObserveElapsedMS   *int64           `json:"observe_elapsed_ms,omitempty"`
+	ExecutionElapsedMS *int64           `json:"execution_elapsed_ms,omitempty"`
+	UnlinkAttempted    *bool            `json:"unlink_attempted,omitempty"`
+	RefusalReason      string           `json:"refusal_reason,omitempty"`
+	RefusalProtocol    int              `json:"refusal_protocol,omitempty"`
+	StageTimings       map[string]int64 `json:"stage_timings,omitempty"`
 }
 
 // media_deleted_sidecar_failed is the honest receipt for a media unlink whose
 // sidecar step then failed (clients from 2026-11 on).
 func validCleanupReceipt(req cleanupReceipt) bool {
+	if req.RefusalProtocol != 0 && (req.RefusalProtocol != 1 || req.RefusalReason == "") {
+		return false
+	}
+	if len(req.StageTimings) > 13 {
+		return false
+	}
+	for name, elapsed := range req.StageTimings {
+		switch name {
+		case "queue_ms", "lane_ms", "fence_ms", "open_ms", "proof_ms", "guard_ms", "observe_journal_ms", "observe_ms", "intent_journal_ms", "caps_ms", "ledger_intent_ms", "delete_ms", "ledger_result_ms":
+		default:
+			return false
+		}
+		if elapsed < 0 {
+			return false
+		}
+	}
 	if (req.ObserveElapsedMS != nil && *req.ObserveElapsedMS < 0) || (req.ExecutionElapsedMS != nil && *req.ExecutionElapsedMS < 0) {
 		return false
 	}
@@ -1330,9 +1348,21 @@ func validCleanupReceipt(req cleanupReceipt) bool {
 	return req.Attempt >= 1 && len(req.PlanSHA) == 64 && len(req.ProofSHA) == 64 && (req.Outcome == "deleted" || req.Outcome == "unverified" || req.Outcome == "media_deleted_sidecar_failed") && len(req.Error) <= 500
 }
 
-// cleanupApplyReceipt records one deletion receipt. Any receipt other than a
-// clean deletion pauses its enabled plan (and its batch) in the same
-// statement. A replay of the identical receipt is idempotent.
+// A durable refusal is written only after the client exits its unlink path.
+// It sets unlink_attempted before calling unlink; interrupted intents replay
+// with no such assertion. Protocol 1 also guarantees journal ownership across
+// observation, intent and result; older stale observation checkpoints could
+// claim false after deletion (#448). Keep only protocol-1 refusals, preserving
+// reservations and delete_ever_issued. Legacy/unknown attempts stay uncertain.
+func cleanupReceiptState(req cleanupReceipt) string {
+	if req.RefusalProtocol == 1 && req.Outcome == "unverified" && req.UnlinkAttempted != nil && !*req.UnlinkAttempted && req.RefusalReason != "" {
+		return "keep"
+	}
+	return req.Outcome
+}
+
+// cleanupApplyReceipt records one deletion receipt. Genuine uncertainty pauses
+// the plan and batch atomically. An identical receipt replay is idempotent.
 func cleanupApplyReceipt(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, cid, id int64, req cleanupReceipt) (updated int, paused bool, planID int64, err error) {
@@ -1341,9 +1371,9 @@ func cleanupApplyReceipt(ctx context.Context, q interface {
 	var pausedPlans int
 	var plan *int64
 	err = q.QueryRow(ctx, `WITH u AS (UPDATE nas_cleanup_items i SET state=$6,outcome=$7::jsonb,updated_at=now() FROM nas_cleanup_plans p WHERE i.id=$1 AND p.id=i.plan_id AND p.connection_id=$2 AND p.plan_sha256=$3 AND i.attempt=$4 AND i.proof_sha256=$5 AND (i.state='delete_issued' OR (i.state=$6 AND i.outcome=$7::jsonb)) RETURNING i.plan_id),
-pz AS (UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$8::text,500) WHERE id IN (SELECT plan_id FROM u) AND mode='enabled' AND $6<>'deleted' RETURNING id),
-bz AS (UPDATE nas_cleanup_batches SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$8::text,500) WHERE mode='enabled' AND $6<>'deleted' AND plan_ids && ARRAY(SELECT plan_id FROM u) RETURNING id)
-SELECT (SELECT count(*) FROM u)::int, (SELECT count(*) FROM pz)::int+(SELECT count(*) FROM bz)::int, (SELECT min(plan_id) FROM u)`, id, cid, req.PlanSHA, req.Attempt, req.ProofSHA, req.Outcome, string(body), "item "+strconv.FormatInt(id, 10)+" deletion receipt "+req.Outcome).Scan(&updated, &pausedPlans, &plan)
+pz AS (UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$8::text,500) WHERE id IN (SELECT plan_id FROM u) AND mode='enabled' AND $6 NOT IN ('deleted','keep') RETURNING id),
+bz AS (UPDATE nas_cleanup_batches SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$8::text,500) WHERE mode='enabled' AND $6 NOT IN ('deleted','keep') AND plan_ids && ARRAY(SELECT plan_id FROM u) RETURNING id)
+SELECT (SELECT count(*) FROM u)::int, (SELECT count(*) FROM pz)::int+(SELECT count(*) FROM bz)::int, (SELECT min(plan_id) FROM u)`, id, cid, req.PlanSHA, req.Attempt, req.ProofSHA, cleanupReceiptState(req), string(body), "item "+strconv.FormatInt(id, 10)+" deletion receipt "+req.Outcome).Scan(&updated, &pausedPlans, &plan)
 	if plan != nil {
 		planID = *plan
 	}
@@ -1353,7 +1383,7 @@ SELECT (SELECT count(*) FROM u)::int, (SELECT count(*) FROM pz)::int+(SELECT cou
 // Echo only after the exact item/attempt/plan/proof receipt was accepted.
 func cleanupReceiptAck(id int64, req cleanupReceipt, paused bool) map[string]any {
 	return map[string]any{"ok": true, "item_id": id, "attempt": req.Attempt, "plan_sha256": req.PlanSHA,
-		"proof_sha256": req.ProofSHA, "state": req.Outcome, "plan_paused": paused}
+		"proof_sha256": req.ProofSHA, "state": cleanupReceiptState(req), "plan_paused": paused}
 }
 
 func (s *Server) handleAccountNASCleanupResult(w http.ResponseWriter, r *http.Request) {
