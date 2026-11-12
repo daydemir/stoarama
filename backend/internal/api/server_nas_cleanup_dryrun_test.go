@@ -293,3 +293,169 @@ func TestNASCleanupClientStatusIsRecordedBestEffort(t *testing.T) {
 		t.Fatalf("invalid status replaced a valid one: %q %v", status, err)
 	}
 }
+
+// An inconclusive audit is neither a successful MD5-only verdict nor a terminal
+// would_delete. Retry the exact generation, then let the client retry if needed.
+func TestNASCleanupDryRunIncompleteAuditRetries(t *testing.T) {
+	old := cleanupMD5AuditRate
+	cleanupMD5AuditRate = 1
+	t.Cleanup(func() { cleanupMD5AuditRate = old })
+	for _, failure := range []string{"get", "short_read", "persistent"} {
+		t.Run(failure, func(t *testing.T) {
+			f := newCleanupFixture(t, 24)
+			f.admit("audit-retry", syntheticFiles(100, 1, 10))
+			tasks := f.leaseV2(1, 0, 0, "")
+			md5s := map[int64]string{tasks[0].ItemID: fixtureMD5(f, tasks[0].Item.ObjectKey)}
+			switch failure {
+			case "get":
+				f.bucket.getFailures = 1
+			case "short_read":
+				f.bucket.getShortReads = 1
+			case "persistent":
+				f.bucket.getFailures = -1
+			}
+			result := f.observeMD5(tasks, nil, md5s)[0]
+			if failure == "persistent" {
+				if result.Status != 503 || result.Delete {
+					t.Fatalf("incomplete audit: %+v", result)
+				}
+				var untouched bool
+				if err := f.pool.QueryRow(f.ctx, `SELECT state='leased' AND outcome IS NULL AND proof IS NULL AND recovery_evidence IS NULL AND NOT delete_ever_issued FROM nas_cleanup_items WHERE id=$1`, tasks[0].ItemID).Scan(&untouched); err != nil || !untouched {
+					t.Fatalf("failed audit was recorded: %v %v", untouched, err)
+				}
+				f.bucket.mu.Lock()
+				f.bucket.getFailures = 0
+				f.bucket.mu.Unlock()
+				result = f.observeMD5(tasks, nil, md5s)[0]
+			}
+			if result.Status != 200 || result.Delete || result.Recovery != "r2_sha_verified" {
+				t.Fatalf("recovered audit: %+v", result)
+			}
+			if gets, _ := f.bucket.counts(); gets < 2 {
+				t.Fatalf("audit did not retry: %d", gets)
+			}
+		})
+	}
+}
+
+func TestNASCleanupDryRunRecoveryReplayUpgradesWithoutRenewingProof(t *testing.T) {
+	old := cleanupMD5AuditRate
+	cleanupMD5AuditRate = 0
+	t.Cleanup(func() { cleanupMD5AuditRate = old })
+	f := newCleanupFixture(t, 24)
+	f.admit("old-audit", syntheticFiles(100, 1, 10))
+	tasks := f.leaseV2(1, 0, 0, "")
+	id := tasks[0].ItemID
+	md5s := map[int64]string{id: fixtureMD5(f, tasks[0].Item.ObjectKey)}
+	if result := f.observeMD5(tasks, nil, md5s)[0]; result.Status != 200 {
+		t.Fatal(result)
+	}
+	// Reproduce plan 1399's stored failed audit without touching production.
+	_, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET recovery='r2_present_unverified',recovery_evidence=NULL,stage_timings='{"recovery_mode":"md5_etag+full_sha_audit"}',updated_at=now()-interval '2 hours' WHERE id=$1`, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before time.Time
+	if err := f.pool.QueryRow(f.ctx, `SELECT updated_at FROM nas_cleanup_items WHERE id=$1`, id).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	// Same physical proof but changed MD5/body cannot upgrade the old verdict.
+	f.observeMD5(tasks, nil, map[int64]string{id: strings.Repeat("0", 32)})
+	if recovery, _, _ := f.recoveryOf(id); recovery != "r2_present_unverified" {
+		t.Fatal("changed replay upgraded recovery")
+	}
+	// A failed recheck remains retryable and does not clear the original proof.
+	f.bucket.mu.Lock()
+	f.bucket.getShortReads = -1
+	f.bucket.mu.Unlock()
+	if result := f.observeMD5(tasks, nil, md5s)[0]; result.Status != 503 || result.Delete {
+		t.Fatalf("incomplete recheck: %+v", result)
+	}
+	f.bucket.mu.Lock()
+	f.bucket.getShortReads = 0
+	f.bucket.mu.Unlock()
+	if result := f.observeMD5(tasks, nil, md5s)[0]; result.Status != 200 || result.Delete || result.Recovery != "r2_sha_verified" {
+		t.Fatalf("replay recheck: %+v", result)
+	}
+	var unchanged bool
+	if err := f.pool.QueryRow(f.ctx, `SELECT updated_at=$2 AND state='would_delete' AND NOT delete_ever_issued AND permit_expires_at IS NULL AND recovery_evidence->>'sha256'=item->>'sha256' FROM nas_cleanup_items WHERE id=$1`, id, before).Scan(&unchanged); err != nil || !unchanged {
+		t.Fatalf("recheck renewed proof or authority: %v %v", unchanged, err)
+	}
+	if recovery, method, _ := f.recoveryOf(id); recovery != "r2_sha_verified" || method != "full_sha_recheck" {
+		t.Fatalf("recheck: %s %s", recovery, method)
+	}
+}
+
+func TestNASCleanupDryRunRecoveryRecheckFencesChanges(t *testing.T) {
+	old := cleanupMD5AuditRate
+	cleanupMD5AuditRate = 0
+	t.Cleanup(func() { cleanupMD5AuditRate = old })
+	for _, change := range []string{"paused", "hash", "conflict"} {
+		t.Run(change, func(t *testing.T) {
+			f := newCleanupFixture(t, 24)
+			pid, _, _ := f.admit("recheck-fence", syntheticFiles(100, 1, 10))
+			tasks := f.leaseV2(1, 0, 0, "")
+			id := tasks[0].ItemID
+			md5s := map[int64]string{id: fixtureMD5(f, tasks[0].Item.ObjectKey)}
+			f.observeMD5(tasks, nil, md5s)
+			if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET recovery='r2_present_unverified',recovery_evidence=NULL WHERE id=$1`, id); err != nil {
+				t.Fatal(err)
+			}
+			if change == "conflict" {
+				f.bucket.put(tasks[0].Item.ObjectKey, []byte(strings.Repeat("x", int(tasks[0].Item.SizeBytes))))
+			}
+			env := &cleanupObserveEnv{prefetched: f.s.cleanupPrefetchRecovery(f.ctx, 13, md5s)}
+			var req cleanupObserve
+			var raw []byte
+			if err := f.pool.QueryRow(f.ctx, `SELECT outcome FROM nas_cleanup_items WHERE id=$1`, id).Scan(&raw); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(raw, &req); err != nil {
+				t.Fatal(err)
+			}
+			switch change {
+			case "paused":
+				if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_plans SET mode='paused' WHERE id=$1`, pid); err != nil {
+					t.Fatal(err)
+				}
+			case "hash":
+				pre := env.prefetched[id]
+				pre.sha256 = strings.Repeat("0", 64)
+				env.prefetched[id] = pre
+			}
+			tx, err := f.pool.Begin(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := f.s.cleanupObserveOne(f.ctx, tx, 13, id, req, env)
+			if result.write || result.body["delete"] == true {
+				t.Fatalf("changed evidence used: %+v", result)
+			}
+			tx.Rollback(f.ctx)
+			if recovery, _, _ := f.recoveryOf(id); recovery != "r2_present_unverified" {
+				t.Fatal("recovery upgraded across change")
+			}
+		})
+	}
+}
+
+func TestNASCleanupAuditSampleStableAcrossAttempts(t *testing.T) {
+	old := cleanupMD5AuditRate
+	t.Cleanup(func() { cleanupMD5AuditRate = old })
+	i := nasCleanupItem{ObjectKey: "clip/279202", SHA256: strings.Repeat("a", 64)}
+	cleanupMD5AuditRate = 0
+	if cleanupAuditSelected(i) {
+		t.Fatal("zero audit rate")
+	}
+	cleanupMD5AuditRate = 1
+	if !cleanupAuditSelected(i) {
+		t.Fatal("full audit rate")
+	}
+	cleanupMD5AuditRate = 0.01
+	selected := cleanupAuditSelected(i)
+	for n := 0; n < 100; n++ {
+		if cleanupAuditSelected(i) != selected {
+			t.Fatal("audit selection changed")
+		}
+	}
+}

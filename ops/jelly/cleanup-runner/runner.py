@@ -92,9 +92,12 @@ def dry_state(plan):
     require(not any(r['delete_ever_issued'] for r in rows), 'dry run has issued deletions')
     require(all(r['state'] in {'pending', 'leased', 'would_delete'} for r in rows),
             'dry run contains a non-permitting item')
-    require(all(r['recovery'] in RECOVERY for r in rows if r['state'] == 'would_delete'),
+    complete = all(r['state'] == 'would_delete' for r in rows)
+    require(all(r['recovery'] in RECOVERY or
+                (not complete and r['recovery'] == 'r2_present_unverified')
+                for r in rows if r['state'] == 'would_delete'),
             'dry run recovery is not verified')
-    return all(r['state'] == 'would_delete' for r in rows)
+    return complete
 
 
 def verify(plan, catalog, windows, now):
