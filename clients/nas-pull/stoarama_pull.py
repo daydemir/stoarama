@@ -34210,6 +34210,11 @@ def copy_r2_manifest(cfg, filename, expected_sha, max_bytes):
                     if path.is_symlink():
                         raise RuntimeError("copy path contains a symlink")
                 exists = verified_file(final, item["size_bytes"], item["sha256"])
+                sidecar = stitch_sidecar_path(final)
+                if sidecar.exists() or sidecar.is_symlink():
+                    existing_sidecar, _ = stable_regular_file_bytes(sidecar, 65536)
+                    if json.loads(existing_sidecar) != stitch_provenance(clip):
+                        raise RuntimeError("existing sidecar conflicts with copy source; preserved")
                 additional = 0 if exists else item["size_bytes"]
                 if copied + additional > max_bytes:
                     break

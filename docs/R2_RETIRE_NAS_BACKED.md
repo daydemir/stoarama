@@ -123,7 +123,8 @@ settings are known. No lifecycle rule or versioned object deletion is performed.
 reuses `process_clip(release=False)`, `download_verified`, the atomic media rename,
 fsynced deterministic sidecar writer and durable SQLite inventory/sync path.
 It never advances the pull cursor or calls release/purge. Existing conflicting
-files are preserved and fail the copy rather than being quarantined/overwritten.
+media or sidecars are preserved and fail the copy rather than being quarantined
+or overwritten.
 
 `POST /account/connections/redownload` requires the authenticated **connection 13**
 NAS pull key, even if another account key has the NAS scope. The server derives

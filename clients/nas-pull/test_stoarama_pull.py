@@ -1,4 +1,5 @@
 import importlib.util
+import contextlib
 import gzip
 import hashlib
 import io
@@ -5506,7 +5507,7 @@ class R2RetireCopyTests(unittest.TestCase):
             self.assertEqual((cfg.output_dir / "p/a.mp4").read_bytes(), body)
             sidecar = cfg.output_dir / "p/a.mp4.stoarama.json"
             self.assertEqual(json.loads(sidecar.read_bytes()), pull.stitch_provenance(clip))
-            with sqlite3.connect(cfg.inventory_file) as db:
+            with contextlib.closing(sqlite3.connect(cfg.inventory_file)) as db:
                 row = db.execute("SELECT state,sha256,size_bytes,sidecar_sha256,sidecar_size_bytes,dirty FROM files WHERE clip_id=901").fetchone()
             self.assertEqual(row[:3], ("present", clip["sha256"], len(body)))
             self.assertEqual(row[3:5], (hashlib.sha256(sidecar.read_bytes()).hexdigest(), sidecar.stat().st_size))
@@ -5533,6 +5534,22 @@ class R2RetireCopyTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"source data must survive")
             self.assertFalse(pull.stitch_sidecar_path(target).exists())
 
+    def test_existing_sidecar_conflict_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg, body, manifest, digest, clip = self.fixture(Path(temp))
+            target = cfg.output_dir / "p/a.mp4"
+            target.parent.mkdir()
+            target.write_bytes(body)
+            sidecar = pull.stitch_sidecar_path(target)
+            source = b'{"clip_id":123,"source_note":"preserve"}'
+            sidecar.write_bytes(source)
+            response = {"policy_sha256": pull.R2_RETIRE_COPY_POLICY, "clip": clip,
+                        "url": "https://r2.test/exact", "headers": {"If-Match": ['"etag"']}}
+            with mock.patch.object(pull, "request_json", return_value=response), self.assertRaises(RuntimeError):
+                pull.copy_r2_manifest(cfg, str(manifest), digest, 100)
+            self.assertEqual(sidecar.read_bytes(), source)
+            self.assertEqual(target.read_bytes(), body)
+
     def test_running_client_and_capacity_reserve_block_copy(self):
         with tempfile.TemporaryDirectory() as temp:
             cfg, body, manifest, digest, clip = self.fixture(Path(temp))
@@ -5558,7 +5575,7 @@ class R2RetireCopyTests(unittest.TestCase):
                 pull.copy_r2_manifest(cfg, str(manifest), digest, 100)
             sync.assert_not_called()
             self.assertEqual((cfg.output_dir / "p/a.mp4").read_bytes(), body)
-            with sqlite3.connect(cfg.inventory_file) as db:
+            with contextlib.closing(sqlite3.connect(cfg.inventory_file)) as db:
                 self.assertEqual(db.execute("SELECT count(*) FROM files").fetchone()[0], 0)
 
 
