@@ -377,7 +377,7 @@ func readR2RetireListing(path, want, bucket string) (map[string]r2.ObjectInfo, e
 // R2's compatibility docs do not promise If-Match on DeleteObject. A unit
 // fake only proves we send the header. Require an operator's live scratch-key
 // probe rather than silently relying on a header the provider might ignore.
-func checkR2RetireDeleteProof(path, want, bucket string) error {
+func checkR2RetireDeleteProof(path, want, bucket, endpointSHA string) error {
 	if !r2RetireLowerHex64(want) {
 		return fmt.Errorf("NAS-backed apply requires --conditional-delete-proof and --expected-delete-proof-sha256; run the operator-only probe first")
 	}
@@ -390,17 +390,18 @@ func checkR2RetireDeleteProof(path, want, bucket string) error {
 		return fmt.Errorf("conditional-delete proof digest differs")
 	}
 	var p struct {
-		Bucket    string    `json:"bucket"`
-		CreatedAt time.Time `json:"created_at"`
-		Rejected  bool      `json:"wrong_etag_rejected"`
-		Preserved bool      `json:"object_preserved"`
-		Confirmed bool      `json:"matching_delete_confirmed"`
+		Bucket         string    `json:"bucket"`
+		EndpointSHA256 string    `json:"endpoint_sha256"`
+		CreatedAt      time.Time `json:"created_at"`
+		Rejected       bool      `json:"wrong_etag_rejected"`
+		Preserved      bool      `json:"object_preserved"`
+		Confirmed      bool      `json:"matching_delete_confirmed"`
 	}
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return err
 	}
-	if p.Bucket != bucket || !p.Rejected || !p.Preserved || !p.Confirmed || time.Since(p.CreatedAt) > 24*time.Hour || p.CreatedAt.After(time.Now().Add(time.Minute)) {
-		return fmt.Errorf("conditional-delete proof bucket/results/age differ; run the operator-only probe again")
+	if p.Bucket != bucket || p.EndpointSHA256 != endpointSHA || !p.Rejected || !p.Preserved || !p.Confirmed || time.Since(p.CreatedAt) > 24*time.Hour || p.CreatedAt.After(time.Now().Add(time.Minute)) {
+		return fmt.Errorf("conditional-delete proof bucket/endpoint/results/age differ; run the operator-only probe again")
 	}
 	return nil
 }

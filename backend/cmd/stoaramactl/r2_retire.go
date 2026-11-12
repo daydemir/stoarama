@@ -133,6 +133,7 @@ type r2RetireHeadStore interface {
 type r2RetireStore interface {
 	r2RetireHeadStore
 	DeleteObject(ctx context.Context, key string) error
+	EndpointSHA256() string
 }
 
 var _ r2RetireStore = (*r2.Client)(nil)
@@ -650,7 +651,7 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 		_, _ = lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, r2RetireAdvisoryLockKey)
 	}()
 	if h.NASBacked {
-		if err := checkR2RetireDeleteProof(opts.DeleteProofPath, opts.DeleteProofSHA256, h.Bucket); err != nil {
+		if err := checkR2RetireDeleteProof(opts.DeleteProofPath, opts.DeleteProofSHA256, h.Bucket, store.EndpointSHA256()); err != nil {
 			return sum, err
 		}
 		var has bool

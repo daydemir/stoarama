@@ -50,7 +50,7 @@ def main():
         head = call("head-object")
         if matched.returncode or head.returncode == 0 or not any(code in head.stderr for code in ("(404)", "(NotFound)", "(NoSuchKey)")):
             raise SystemExit("matching delete was not confirmed; no proof written; inspect " + key)
-    proof = {"bucket": bucket, "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    proof = {"bucket": bucket, "endpoint_sha256": hashlib.sha256(endpoint.rstrip("/").encode()).hexdigest(), "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
              "wrong_etag_rejected": True, "object_preserved": True, "matching_delete_confirmed": True,
              "probe_key": key}
     raw = (json.dumps(proof, sort_keys=True, separators=(",", ":")) + "\n").encode()

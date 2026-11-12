@@ -80,7 +80,7 @@ The existing fsynced intent/done ledger, DB receipts and byte budgets remain.
 Cloudflare's [compatibility table](https://developers.cloudflare.com/r2/api/s3/api/)
 and [conditional-write documentation](https://developers.cloudflare.com/r2/api/s3/conditional-operations/)
 do not document conditional `DeleteObject`. NAS-backed apply therefore also
-requires a checksummed proof from the **operator-only**
+requires a checksummed, bucket-and-endpoint-bound proof from the **operator-only**
 `ops/jelly/r2-retire/verify_conditional_delete.py` probe, no older than 24 hours.
 It creates one random 64-byte scratch key, requires a wrong ETag delete to return
 `PreconditionFailed` with identical bytes still readable, then confirms a matching
