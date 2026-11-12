@@ -947,16 +947,16 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			t.Fatal(err)
 		}
 		scope := r2RetireScope{Class: r2RetireOwnerAccepted, AccountID: 47, ConnectionID: 13, Bucket: "stoarama", Grace: 7 * 24 * time.Hour, HasRetirements: true, NASBacked: true, OwnerPolicy: r2RetireOwnerPolicy(windows, picks.Choices)}
-		for _, id := range []int64{701, 702, 703, 704, 705, 706, 707, 708, 709} {
+		for _, id := range []int64{701, 702, 703, 704, 705, 706, 707, 708, 709, 711} {
 			clip(id, 30, outside)
 		}
-		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state) VALUES(13,702,'p/702.mp4','unknown'),(13,703,'p/703.mp4','missing')`)
+		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state) VALUES(13,702,'p/702.mp4','unknown'),(13,703,'p/703.mp4','missing'),(13,711,'p/711.mp4','present')`)
 		// A kept cross-catalog alias makes an outside raw key protected.
 		output(2704, "managed/acct-47/708.mp4", inside, "{708}")
 		output(2701, "joined/nightly-collation-v2/o/2701.mp4", inside, "{707}")
 		output(2702, "joined/nightly-collation-v2/o/2702.mp4", outside, "{104}") // own window outside, source stream is all
 		output(2703, "joined/nightly-collation-v2/o/2703.mp4", outside, "{701}")
-		for n, id := range []int64{704, 705, 706} {
+		for n, id := range []int64{704, 705, 706, 711} {
 			sets, err := loadR2RetireSets(ctx, pool, "", true, scope.Class)
 			if err != nil {
 				t.Fatal(err)
@@ -1012,15 +1012,15 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			if i.Candidate.SourceID == 704 || i.Candidate.SourceID == 706 {
 				t.Fatal("active/uncertain release", i)
 			}
-			if i.Candidate.SourceID == 705 {
+			if i.Candidate.SourceID == 705 || i.Candidate.SourceID == 711 {
 				selected = append(selected, i)
 			}
 		}
-		if len(selected) != 1 {
+		if len(selected) != 2 {
 			t.Fatalf("verified receipt was not releasable: %+v", releases.Items)
 		}
 		releases.Items = selected
-		releases.Bytes = selected[0].Candidate.SizeBytes
+		releases.Bytes = selected[0].Candidate.SizeBytes + selected[1].Candidate.SizeBytes
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -1033,6 +1033,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			t.Fatal(err)
 		}
 		check(705, "raw", true)
+		check(711, "raw", false) // Releasing a receipt never waives positive NAS inventory.
 		var legacyHeld, ownerHeld bool
 		if err = pool.QueryRow(ctx, `SELECT nas_cleanup_clip_held(705),nas_cleanup_owner_clip_held(705)`).Scan(&legacyHeld, &ownerHeld); err != nil || !legacyHeld || ownerHeld {
 			t.Fatal("class isolation", legacyHeld, ownerHeld, err)

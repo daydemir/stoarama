@@ -397,7 +397,9 @@ NAS-only evidence with no R2 object key; they are not R2 deletion candidates.
 Migration **0186** is required before either owner-class hold release or apply;
 planning works read-only without it. `release-holds --class
 owner_accepted_outside_window` previews only exact deleted, recovery-verified
-receipts from **retired** plans. Active/dry-run/paused plans, uncertain receipts,
+receipts from **retired** plans. A release only supersedes that receipt's
+recovery hold: positive NAS inventory remains a retirement veto, including when
+its last observation predates the receipt. Active/dry-run/paused plans, uncertain receipts,
 unmapped source holds, reservations and all 28 incident identities (including
 collated descendants) remain protected. The existing receipt guard validates
 identity and receipt/recovery hashes. Owner release records are excluded from

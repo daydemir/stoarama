@@ -208,7 +208,15 @@ func r2HoldReleasePlan(ctx context.Context, q r2RetireQuerier, picks r2RetirePic
 		} else {
 			c.Facts = r2RetireFacts{Purged: c.Facts.Purged, Retired: c.Facts.Retired, NASAbsent: true}
 		}
-		reason, choice, eligible := r2RetireDecideForScope(c, scope, windows, picks.Choices)
+		releaseCandidate := c
+		if m.Class == r2RetireOwnerAccepted {
+			// Release this completed receipt's recovery hold, not its NAS
+			// presence veto. Inventory still blocks retirement and projections.
+			releaseCandidate.Facts.NASCopy = false
+			releaseCandidate.Facts.ExactNAS = false
+			releaseCandidate.Facts.ListingPresence = false
+		}
+		reason, choice, eligible := r2RetireDecideForScope(releaseCandidate, scope, windows, picks.Choices)
 		if !eligible || (m.Class == "" && reason != r2RetireReason) {
 			continue
 		}
