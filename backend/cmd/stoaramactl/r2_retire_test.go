@@ -634,7 +634,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 	t.Run("NASBackedReservationsAndFreshness", func(t *testing.T) {
 		exec(`ALTER TABLE nas_inventory_files ADD COLUMN size_bytes bigint, ADD COLUMN sha256 text,
     ADD COLUMN verified_at timestamptz, ADD COLUMN server_received_at timestamptz,
-    ADD COLUMN sidecar_size_bytes bigint, ADD COLUMN sidecar_sha256 text`)
+    ADD COLUMN sidecar_size_bytes bigint, ADD COLUMN sidecar_sha256 text, ADD COLUMN sidecar_relative_path text`)
 		for _, m := range []string{"0177_nas_cleanup_reserved_files.sql", "0182_r2_retirement_reservations.sql"} {
 			body, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), m))
 			if err != nil {
@@ -654,7 +654,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		}
 		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state,size_bytes,sha256,verified_at,server_received_at,sidecar_size_bytes,sidecar_sha256)
    SELECT 13,id,'p/'||id||'.mp4','present',100,$1,CASE WHEN id=303 THEN now()-interval '2 days' ELSE now() END,now(),100,$1 FROM unnest(ARRAY[301,303,304]) id`, r2tSHA)
-		exec(`UPDATE nas_inventory_files SET sha256=repeat('a',64) WHERE clip_id=304`)
+		exec(`UPDATE nas_inventory_files SET sidecar_relative_path=relative_path||'.stoarama.json';UPDATE nas_inventory_files SET sha256=repeat('a',64) WHERE clip_id=304`)
 		exec(`INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode,approval_reason,approved_until) VALUES
    (4,47,13,'unrelated-enabled',repeat('a',64),'[{"kind":"raw","source_id":306,"source_ids":[306]}]',repeat('e',64),'enabled','x',now()+interval '1 hour')`)
 		// A retired legacy plan with no item row is uncertain, even with no
@@ -709,7 +709,11 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if _, err := apply(o); err == nil {
 			t.Fatal("stale NAS proof accepted")
 		}
-		exec(`UPDATE nas_inventory_files SET verified_at=now() WHERE clip_id=301`)
+		exec(`UPDATE nas_inventory_files SET verified_at=now(),sidecar_relative_path='wrong.stoarama.json' WHERE clip_id=301`)
+		if _, err := apply(o); err == nil {
+			t.Fatal("wrong sidecar path accepted")
+		}
+		exec(`UPDATE nas_inventory_files SET sidecar_relative_path=relative_path||'.stoarama.json' WHERE clip_id=301`)
 		store.beforeHead = func(key string) {
 			if key == "managed/acct-47/301.mp4" {
 				writePicks("all")

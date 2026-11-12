@@ -318,7 +318,7 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 		s.ExactRaw = map[int64]r2RetireNASIdentity{}
 		s.ExactPaths = map[r2RetireNASIdentity]bool{}
 		rows, err := q.Query(ctx, `SELECT clip_id,relative_path,sha256,size_bytes,
- coalesce(sidecar_size_bytes>0 AND sidecar_sha256 ~ '^[a-f0-9]{64}$',false)
+ coalesce(sidecar_relative_path=relative_path||'.stoarama.json' AND sidecar_size_bytes>0 AND sidecar_sha256 ~ '^[a-f0-9]{64}$',false)
  FROM nas_inventory_files WHERE connection_id=13 AND state='present'
  AND verified_at BETWEEN now()-interval '24 hours' AND now()+interval '5 minutes'
  AND server_received_at>=now()-interval '24 hours'`)
@@ -451,7 +451,7 @@ const r2RetireRawExactSQL = `,
  EXISTS(SELECT 1 FROM nas_inventory_files n WHERE n.connection_id=$2 AND n.clip_id=c.id
    AND n.relative_path=c.display_path AND n.state='present' AND n.sha256=lower(c.sha256) AND n.size_bytes=c.size_bytes
    AND n.verified_at BETWEEN now()-interval '24 hours' AND now()+interval '5 minutes'
-   AND n.server_received_at>=now()-interval '24 hours' AND n.sidecar_size_bytes>0 AND n.sidecar_sha256 ~ '^[a-f0-9]{64}$'),
+   AND n.server_received_at>=now()-interval '24 hours' AND n.sidecar_relative_path=c.display_path||'.stoarama.json' AND n.sidecar_size_bytes>0 AND n.sidecar_sha256 ~ '^[a-f0-9]{64}$'),
  coalesce(c.display_path,'')
 `
 const r2RetireCollatedExactSQL = `,
