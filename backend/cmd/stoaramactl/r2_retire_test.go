@@ -844,6 +844,25 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if !c.Facts.ListingPresence || c.Facts.NASAbsent {
 			t.Fatal("planning lost known keep28 alias")
 		}
+		// Proof age must advance during an apply transaction, including time
+		// spent waiting on an R2 HEAD. PostgreSQL now() is frozen at BEGIN.
+		clip(410, 30, outside)
+		exec(`UPDATE recording_clips SET released_at=created_at WHERE id=410`)
+		ageTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ageTx.Rollback(ctx)
+		if _, err := ageTx.Exec(ctx, `UPDATE nas_listing_generations SET completed_at=NULL;INSERT INTO nas_listing_generations(connection_id,generation,folders,started_at,completed_at) VALUES(13,repeat('c',32),ARRAY['.'],now()-interval '24 hours'+interval '100 milliseconds',now());SELECT pg_sleep(0.2)`); err != nil {
+			t.Fatal(err)
+		}
+		c, err = r2RetireLoadOne(ctx, ageTx, "raw", 410, scope, sets)
+		if err != nil || c.Facts.NASAbsent {
+			t.Fatal("listing aged out during transaction but remained eligible", err)
+		}
+		if err := ageTx.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
 		// Even if an incident receipt later becomes clean, it stays held forever.
 		exec(`UPDATE nas_cleanup_items SET state='deleted',outcome='{"outcome":"deleted"}' WHERE id=2406`)
 		m, err = r2HoldReleasePlan(ctx, pool, picks, r2tPolicy, windows)

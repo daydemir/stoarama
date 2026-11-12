@@ -126,7 +126,7 @@ func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier) (*r2RetireEvid
 	if !e.ListingSchema {
 		return e, nil
 	}
-	err = q.QueryRow(ctx, `SELECT started_at FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL AND started_at>now()-interval '24 hours' ORDER BY started_at DESC LIMIT 1`).Scan(&e.Start)
+	err = q.QueryRow(ctx, `SELECT started_at FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL AND started_at>clock_timestamp()-interval '24 hours' ORDER BY started_at DESC LIMIT 1`).Scan(&e.Start)
 	if err == pgx.ErrNoRows {
 		err = nil
 	}
@@ -265,7 +265,7 @@ func r2RetireLiveEvidence(ctx context.Context, q r2RetireQuerier, c *r2RetireCan
 			paths = append(paths, "joined/"+c.RelativePath)
 			watermark = `SELECT max(greatest(x.created_at,a.verified_at)) at FROM recording_collation_outputs x LEFT JOIN recording_collation_output_acks a ON a.output_id=x.id AND a.connection_id=13 WHERE x.nas_relative_path=(SELECT nas_relative_path FROM recording_collation_outputs WHERE id=$1) HAVING bool_and(a.output_id IS NOT NULL)`
 		}
-		err := q.QueryRow(ctx, `WITH g AS (SELECT started_at FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL AND started_at>now()-interval '24 hours' ORDER BY started_at DESC LIMIT 1),w AS (`+watermark+`) SELECT coalesce((SELECT g.started_at>w.at FROM g,w),false),EXISTS(SELECT 1 FROM nas_listing_files f JOIN nas_listing_generations n USING(connection_id,generation) WHERE f.connection_id=13 AND (f.relative_path=ANY($2) OR ($3::text='raw' AND EXISTS(SELECT 1 FROM nas_inventory_files known WHERE known.connection_id=13 AND known.clip_id=$1 AND known.relative_path=f.relative_path))) AND n.started_at>=coalesce((SELECT started_at FROM g),'-infinity'))`, c.SourceID, paths, c.Kind).Scan(&absent, &present)
+		err := q.QueryRow(ctx, `WITH g AS (SELECT started_at FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL AND started_at>clock_timestamp()-interval '24 hours' ORDER BY started_at DESC LIMIT 1),w AS (`+watermark+`) SELECT coalesce((SELECT g.started_at>w.at FROM g,w),false),EXISTS(SELECT 1 FROM nas_listing_files f JOIN nas_listing_generations n USING(connection_id,generation) WHERE f.connection_id=13 AND (f.relative_path=ANY($2) OR ($3::text='raw' AND EXISTS(SELECT 1 FROM nas_inventory_files known WHERE known.connection_id=13 AND known.clip_id=$1 AND known.relative_path=f.relative_path))) AND n.started_at>=coalesce((SELECT started_at FROM g),'-infinity'))`, c.SourceID, paths, c.Kind).Scan(&absent, &present)
 		if err != nil {
 			return err
 		}
@@ -276,7 +276,7 @@ func r2RetireLiveEvidence(ctx context.Context, q r2RetireQuerier, c *r2RetireCan
 			paths = append(paths, "joined/"+c.RelativePath)
 		}
 		var mismatch bool
-		if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_inventory_files n JOIN nas_listing_files f ON f.connection_id=13 AND f.relative_path=n.relative_path JOIN nas_listing_generations g ON g.connection_id=f.connection_id AND g.generation=f.generation WHERE n.connection_id=13 AND n.state='present' AND n.relative_path=ANY($3) AND n.sha256=$4 AND n.size_bytes=$5 AND ($1='collated' OR n.clip_id=$2) AND g.started_at>=coalesce((SELECT max(started_at) FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL AND started_at>now()-interval '24 hours'),'-infinity') AND ROW(f.size_bytes,f.mtime_ns,f.ctime_ns,f.inode,f.device) IS DISTINCT FROM ROW(n.size_bytes,n.file_mtime_ns,n.file_ctime_ns,n.file_inode,n.file_device))`, c.Kind, c.SourceID, paths, c.SHA256, c.SizeBytes).Scan(&mismatch); err != nil {
+		if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_inventory_files n JOIN nas_listing_files f ON f.connection_id=13 AND f.relative_path=n.relative_path JOIN nas_listing_generations g ON g.connection_id=f.connection_id AND g.generation=f.generation WHERE n.connection_id=13 AND n.state='present' AND n.relative_path=ANY($3) AND n.sha256=$4 AND n.size_bytes=$5 AND ($1='collated' OR n.clip_id=$2) AND g.started_at>=coalesce((SELECT max(started_at) FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL AND started_at>clock_timestamp()-interval '24 hours'),'-infinity') AND ROW(f.size_bytes,f.mtime_ns,f.ctime_ns,f.inode,f.device) IS DISTINCT FROM ROW(n.size_bytes,n.file_mtime_ns,n.file_ctime_ns,n.file_inode,n.file_device))`, c.Kind, c.SourceID, paths, c.SHA256, c.SizeBytes).Scan(&mismatch); err != nil {
 			return err
 		}
 		if mismatch {
@@ -301,7 +301,7 @@ func r2RetireLiveEvidence(ctx context.Context, q r2RetireQuerier, c *r2RetireCan
 		}
 		listingSQL := "NULL::timestamptz"
 		if e.ListingSchema {
-			listingSQL = `(SELECT max(started_at) FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL AND started_at>now()-interval '24 hours')`
+			listingSQL = `(SELECT max(started_at) FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL AND started_at>clock_timestamp()-interval '24 hours')`
 		}
 		if err := q.QueryRow(ctx, `SELECT greatest(`+receiptSQL+`,`+listingSQL+`) WHERE $1::text<>'' AND $2::bigint>0`, c.Kind, c.SourceID).Scan(&cutoff); err != nil {
 			return err
