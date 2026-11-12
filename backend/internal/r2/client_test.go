@@ -387,3 +387,15 @@ func TestDeleteObjectExactUsesConditionalSingleKey(t *testing.T) {
 		t.Fatal("empty ETag accepted")
 	}
 }
+
+func TestEndpointProofIdentityUsesConfiguredEndpoint(t *testing.T) {
+	endpoint := "https://account.r2.cloudflarestorage.com/"
+	c, err := New(context.Background(), Config{AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: endpoint})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(strings.TrimRight(endpoint, "/")))
+	if c.EndpointSHA256() != hex.EncodeToString(sum[:]) {
+		t.Fatal("proof endpoint identity differs from configured storage")
+	}
+}

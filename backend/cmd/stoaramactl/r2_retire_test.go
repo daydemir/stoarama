@@ -274,7 +274,8 @@ type fakeR2RetireStore struct {
 	deleteErr  error
 }
 
-func (f *fakeR2RetireStore) Bucket() string { return "stoarama" }
+func (f *fakeR2RetireStore) Bucket() string         { return "stoarama" }
+func (f *fakeR2RetireStore) EndpointSHA256() string { return r2tSHA }
 
 func (f *fakeR2RetireStore) Head(_ context.Context, key string) (r2.ObjectHead, error) {
 	if f.beforeHead != nil {
@@ -693,7 +694,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			t.Fatal(err)
 		}
 		o := opts
-		proofRaw := []byte(fmt.Sprintf(`{"bucket":"stoarama","created_at":%q,"wrong_etag_rejected":true,"object_preserved":true,"matching_delete_confirmed":true}`, time.Now().Format(time.RFC3339)))
+		proofRaw := []byte(fmt.Sprintf(`{"bucket":"stoarama","endpoint_sha256":%q,"created_at":%q,"wrong_etag_rejected":true,"object_preserved":true,"matching_delete_confirmed":true}`, r2tSHA, time.Now().Format(time.RFC3339)))
 		proofPath := filepath.Join(t.TempDir(), "proof.json")
 		if err := os.WriteFile(proofPath, proofRaw, 0600); err != nil {
 			t.Fatal(err)

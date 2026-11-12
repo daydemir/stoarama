@@ -646,3 +646,10 @@ func (c *Client) DeleteObjectExact(ctx context.Context, key, etag string) error 
 	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key), IfMatch: aws.String(`"` + cleanETag(etag) + `"`)})
 	return err
 }
+
+// EndpointSHA256 binds an operator capability proof without recording account
+// identifiers from the credential-backed endpoint in logs or manifests.
+func (c *Client) EndpointSHA256() string {
+	sum := sha256.Sum256([]byte(strings.TrimRight(aws.ToString(c.s3.Options().BaseEndpoint), "/")))
+	return hex.EncodeToString(sum[:])
+}

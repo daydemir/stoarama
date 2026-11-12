@@ -96,3 +96,19 @@ func TestR2RetireParallelListingFailsClosed(t *testing.T) {
 		t.Fatal("partial listing accepted")
 	}
 }
+
+func TestR2RetireDeleteProofCannotCrossEndpoints(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "proof.json")
+	raw := []byte(fmt.Sprintf(`{"bucket":"stoarama","endpoint_sha256":%q,"created_at":%q,"wrong_etag_rejected":true,"object_preserved":true,"matching_delete_confirmed":true}`, r2tSHA, time.Now().Format(time.RFC3339)))
+	if err := os.WriteFile(file, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	digest := hex.EncodeToString(sum[:])
+	if err := checkR2RetireDeleteProof(file, digest, "stoarama", r2tSHA); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkR2RetireDeleteProof(file, digest, "stoarama", r2tPolicy); err == nil {
+		t.Fatal("proof from another endpoint accepted")
+	}
+}
