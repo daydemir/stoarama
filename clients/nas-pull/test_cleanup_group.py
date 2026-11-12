@@ -371,6 +371,23 @@ class CleanupGroupTests(unittest.TestCase):
         outcomes = [json.loads(r[0]) for r in self.inventory.db.execute('SELECT body FROM cleanup_execution_outcomes')]
         self.assertTrue(all(r['refusal_reason']=='deadline_exceeded' and r['refusal_protocol']==1 for r in outcomes))
 
+    def test_failed_refusal_checkpoint_cannot_certify_an_intent(self):
+        tasks = self.group()
+        journal, clock, offset = pull.cleanup_journal_group, time.monotonic, [0]
+        def fail(inventory, entries):
+            if entries[0][2] == 'result':
+                raise OSError('refusal result is not durable')
+            journal(inventory, entries)
+            if entries[0][2] == 'intent': offset[0] += 40
+        with mock.patch.object(pull, 'cleanup_journal_group', side_effect=fail), \
+                mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock()+offset[0]), \
+                mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('expired permit')):
+            with self.assertRaises(OSError): self.run_group(tasks)
+        rows = pull.cleanup_journal(self.inventory)
+        self.assertEqual([row[1] for row in rows], ['intent', 'observe', 'observe'])
+        self.assertNotIn('refusal_protocol', json.loads(rows[0][2]))
+        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 0)
+
     def test_per_file_outcomes_and_timings_survive_uploaded_log_redaction(self):
         tasks = self.group()
         self.run_group(tasks)
