@@ -26,7 +26,7 @@ class CoverageTests(unittest.TestCase):
                        keep_end_excl='2026-10-30', best_start='2026-10-09')]
         catalog = [dict(stream_id=1, tz='UTC', thumbs=['thumbs/1-0.jpg'])]
         data = dict(stream_id=1, tz='Asia/Tokyo', name='Tokyo', city='',country='',
-                    days={'2026-10-01':86400,'2026-10-03':43200}, raw_bytes=100,
+                    scheduled={'2026-10-01':86400,'2026-10-02':86400,'2026-10-03':86400},windows=[['00:00','00:00']], days={'2026-10-01':86400,'2026-10-03':43200}, raw_bytes=100,
                     raw_keep=40, stitched_bytes=20,stitched_keep=10)
         snapshot = dict(generated_at='now',streams=[data])
         before = copy.deepcopy((policy,catalog,snapshot))
@@ -39,8 +39,19 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(row['thumbs'],['thumbs/1-0.jpg'])
         self.assertEqual((policy,catalog,snapshot),before)
 
+    def test_scheduled_percentages_drive_summary(self):
+        data = dict(stream_id=1,tz='UTC',name='Window',city='',country='',
+                    days={'2026-10-01':43200,'2026-10-02':6480},
+                    scheduled={'2026-10-01':43200,'2026-10-02':7200,'2026-10-03':7200},
+                    windows=[['08:00','20:00']],first_day='2026-10-01',last_day='2026-10-03',
+                    raw_bytes=0,raw_keep=0,stitched_bytes=0,stitched_keep=0)
+        row = coverage.build(dict(generated_at='now',streams=[data]),[],[])['streams'][0]
+        self.assertAlmostEqual(row['avg_coverage'],190/3)
+        self.assertEqual(row['days90'],2)
+        self.assertEqual(row['scheduled_seconds'],[43200,7200,7200])
+
     def test_empty_r2_and_nonpolicy_streams(self):
-        base = dict(name='Name',city='',country='',tz='UTC',days={},first_day='2026-11-01',last_day='2026-11-03',raw_bytes=0,
+        base = dict(name='Name',city='',country='',tz='UTC',scheduled={f'2026-11-0{i}':86400 for i in range(1,4)},windows=[['00:00','00:00']],days={},first_day='2026-11-01',last_day='2026-11-03',raw_bytes=0,
                     raw_keep=0,stitched_bytes=0,stitched_keep=0)
         snapshot = dict(generated_at='now',streams=[dict(base,stream_id=1),dict(base,stream_id=2)])
         rows = coverage.build(snapshot,[dict(stream_id=1,tz='UTC')],[])['streams']

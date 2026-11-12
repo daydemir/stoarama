@@ -31759,6 +31759,7 @@ def stitch_corpus(cfg, inventory):
         if inventory.db.execute("SELECT 1 FROM v85r_stitch_corpus_meta WHERE sha=?", (STITCH_CORPUS_SHA,)).fetchone():
             return
     req = urllib.request.Request(cfg.api_base + "/account/connections/stitch/corpus")
+    req.add_header("User-Agent", USER_AGENT)
     req.add_header("Authorization", "Bearer " + cfg.api_key)
     digest, count, nominees, size = hashlib.sha256(), 0, 0, 0
     # Import in a separate DB connection/transaction. Inventory heartbeats keep

@@ -5,6 +5,7 @@ import base64
 import fcntl
 import hashlib
 import html
+import http.client
 import importlib.util
 import json
 import os
@@ -33,6 +34,10 @@ REASON = ('Deniz standing approval 2026-11-11: NAS files outside pinned keep28 o
 
 class Halt(Exception):
     """Only fixed, credential-free messages may enter the log or owner email."""
+
+
+class ReadFailure(Halt):
+    """A transient read error with a fixed, credential-free reason."""
 
 
 class LockHeld(Exception):
@@ -87,9 +92,12 @@ def dry_state(plan):
     require(not any(r['delete_ever_issued'] for r in rows), 'dry run has issued deletions')
     require(all(r['state'] in {'pending', 'leased', 'would_delete'} for r in rows),
             'dry run contains a non-permitting item')
-    require(all(r['recovery'] in RECOVERY for r in rows if r['state'] == 'would_delete'),
+    complete = all(r['state'] == 'would_delete' for r in rows)
+    require(all(r['recovery'] in RECOVERY or
+                (not complete and r['recovery'] == 'r2_present_unverified')
+                for r in rows if r['state'] == 'would_delete'),
             'dry run recovery is not verified')
-    return all(r['state'] == 'would_delete' for r in rows)
+    return complete
 
 
 def verify(plan, catalog, windows, now):
@@ -234,6 +242,14 @@ def request(url, token, method='GET', body=None):
         with urllib.request.build_opener(NoRedirect()).open(req, timeout=120) as response:
             raw = response.read(32 << 20)
             return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        retry = exc.code in {408, 429, 500, 502, 503, 504}
+        exc.close()
+        error = ReadFailure if retry and method == 'GET' else Halt
+        raise error('HTTP request failed (' + method + ')') from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead):
+        error = ReadFailure if method == 'GET' else Halt
+        raise error('HTTP transport failed (' + method + ')') from None
     except Exception:
         # HTTP bodies, subprocess stderr and exception strings can contain credentials.
         raise Halt('HTTP request failed (' + method + ')') from None
@@ -320,18 +336,41 @@ class Runner:
             f.flush()
             os.fsync(f.fileno())
 
-    def query(self, sql):
-        try:
-            if not hasattr(self, 'prepare'):
-                spec = importlib.util.spec_from_file_location('prepare_keep28', self.repo / 'backend/scripts/nas-cleanup/prepare_keep28_plans.py')
-                self.prepare = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(self.prepare)
-            return self.prepare.query(sql, 'psql')
-        except Exception:
-            raise Halt('read-only catalog query failed') from None
+    def query(self, sql, step='catalog query'):
+        if not hasattr(self, 'prepare'):
+            spec = importlib.util.spec_from_file_location('prepare_keep28', self.repo / 'backend/scripts/nas-cleanup/prepare_keep28_plans.py')
+            self.prepare = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(self.prepare)
+
+        def execute():
+            try:
+                proc = subprocess.run(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=sqlstate'],
+                    input=('BEGIN READ ONLY;' + sql + ';ROLLBACK;').encode(),
+                    env=self.prepare.pg_env(), capture_output=True, timeout=330)
+            except subprocess.TimeoutExpired:
+                raise ReadFailure('psql process timeout') from None
+            except OSError:
+                raise Halt(step + ': psql unavailable') from None
+            if proc.returncode:
+                # Never emit SQL, connection strings, stderr, or exception text.
+                err = proc.stderr.decode(errors='replace')
+                code = re.search(r'(?:ERROR|FATAL):\s+([0-9A-Z]{5})\b', err)
+                code = code[1] if code else None
+                if code == '57014':
+                    raise ReadFailure('statement timeout')
+                if (code and (code.startswith('08') or code in {'53300', '57P01', '57P02', '57P03', '40001', '40P01', '55P03'})
+                        or not code and any(x in err for x in ('connection to server', 'server closed the connection', 'SSL SYSCALL'))):
+                    raise ReadFailure('database connection or transaction unavailable')
+                raise Halt(step + ': database query rejected')
+            try:
+                return json.loads(proc.stdout)
+            except (ValueError, UnicodeError):
+                raise Halt(step + ': invalid database response') from None
+        return self.read(step, execute)
 
     def api(self, method, path, body=None):
-        return request(API + '/api/v1/service/nas-cleanup/' + path, os.environ['SERVICE_TOKEN'], method, body)
+        action = lambda: request(API + '/api/v1/service/nas-cleanup/' + path, os.environ['SERVICE_TOKEN'], method, body)
+        return self.read('cleanup API GET', action) if method == 'GET' else action()
 
     def plan(self, pid):
         p = self.api('GET', 'plans/' + str(int(pid)))
@@ -340,14 +379,15 @@ class Runner:
         return p
 
     def active(self):
-        return self.query("SELECT json_build_object('plans', (SELECT coalesce(json_agg(id),'[]') FROM nas_cleanup_plans WHERE mode='enabled'), 'batches', (SELECT count(*) FROM nas_cleanup_batches WHERE mode='enabled'))")
+        return self.query("SELECT json_build_object('plans', (SELECT coalesce(json_agg(id),'[]') FROM nas_cleanup_plans WHERE mode='enabled'), 'batches', (SELECT count(*) FROM nas_cleanup_batches WHERE mode='enabled'))", 'active execution query')
 
     def idle(self):
         active = self.active()
         require(not active['plans'] and active['batches'] == 0, 'another plan or batch is enabled')
 
     def render(self, method, path, body=None):
-        return request('https://api.render.com/v1/services/' + SERVICE + path, render_key(), method, body)
+        action = lambda: request('https://api.render.com/v1/services/' + SERVICE + path, render_key(), method, body)
+        return self.read('Render GET', action) if method == 'GET' else action()
 
     def live(self):
         rows = self.render('GET', '/deploys?limit=100')
@@ -367,25 +407,34 @@ class Runner:
             self.status['owner_notification_failed'] = True
             critical('owner email failed; operator intervention required')
 
-    def step_failed(self, step):
+    def step_failed(self, step, reason=None):
         # Callers supply fixed step names, never URLs, SQL, or exception text.
         critical('STEP FAILED: ' + step)
         try:
             with (self.root / 'runner.jsonl').open('a') as f:
-                f.write(json.dumps({'at': utcnow().isoformat(), 'phase': 'step_failed', 'step': step}) + '\n')
+                f.write(json.dumps({'at': utcnow().isoformat(), 'phase': 'step_failed', 'step': step, **({'reason': reason} if reason else {})}) + '\n')
         except Exception:
             pass  # Diagnostics must never block shutdown, even before initialize().
 
     def read(self, step, action):
-        # Retry only reads. Bound the added backoff to two minutes; each I/O also
-        # retains its existing timeout. Mutations must not be blindly replayed.
+        # Retry transient reads only, with two minutes of added backoff. Exhaustion
+        # becomes a terminal Halt so enclosing OFF/ON reads cannot multiply retries.
+        # Every I/O retains its own timeout; mutations are never replayed.
         for delay in (5, 10, 20, 30, 30, 25, None):
             try:
                 return action()
-            except Exception:
+            except Exception as exc:
+                transient = isinstance(exc, (ReadFailure, TimeoutError, ConnectionError, urllib.error.URLError))
+                if isinstance(exc, urllib.error.HTTPError):
+                    transient = exc.code in {408, 429, 500, 502, 503, 504}
+                if not transient:
+                    raise
                 if delay is None:
-                    raise  # The enclosing OFF/ON handler logs the exhausted step.
-                self.step_failed(step)
+                    if isinstance(exc, ReadFailure):
+                        self.step_failed(step, str(exc))
+                        raise Halt(step + ': ' + str(exc)) from None
+                    raise
+                self.step_failed(step, str(exc) if isinstance(exc, ReadFailure) else None)
                 time.sleep(delay)
 
     def off(self):
@@ -554,14 +603,22 @@ class Runner:
         require(written, 'owner note write failed')
 
     def progress(self):
-        rows = self.query("""SELECT coalesce(json_agg(x),'[]') FROM (
-          SELECT (p.manifest->(i.ordinal-1)->>'stream_id')::bigint stream_id,
-            count(*) files,sum((p.manifest->(i.ordinal-1)->>'size_bytes')::bigint) bytes,
+        # Expand each relevant immutable manifest once, including legacy item rows.
+        rows = self.query("""WITH receipts AS MATERIALIZED (
+          SELECT i.plan_id,i.ordinal,i.updated_at FROM nas_cleanup_items i
+          JOIN nas_cleanup_plans p ON p.id=i.plan_id
+          WHERE p.account_id=47 AND p.connection_id=13 AND i.state='deleted' AND i.delete_ever_issued),
+          facts AS MATERIALIZED (
+          SELECT p.id,m.ordinal,(m.item->>'stream_id')::bigint stream_id,
+            (m.item->>'size_bytes')::bigint size_bytes
+          FROM (SELECT DISTINCT plan_id FROM receipts) r JOIN nas_cleanup_plans p ON p.id=r.plan_id
+          CROSS JOIN LATERAL jsonb_array_elements(p.manifest) WITH ORDINALITY m(item,ordinal))
+          SELECT coalesce(json_agg(x),'[]') FROM (
+          SELECT f.stream_id,count(*) files,sum(f.size_bytes) bytes,
             count(*) FILTER (WHERE i.updated_at>now()-interval '24 hours') recent_files,
-            coalesce(sum((p.manifest->(i.ordinal-1)->>'size_bytes')::bigint)
-              FILTER (WHERE i.updated_at>now()-interval '24 hours'),0) recent_bytes
-          FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id
-          WHERE p.account_id=47 AND p.connection_id=13 AND i.state='deleted' AND i.delete_ever_issued GROUP BY 1 ORDER BY 1) x""")
+            coalesce(sum(f.size_bytes) FILTER (WHERE i.updated_at>now()-interval '24 hours'),0) recent_bytes
+          FROM receipts i JOIN facts f ON f.id=i.plan_id AND f.ordinal=i.ordinal
+          GROUP BY 1 ORDER BY 1) x""", 'progress query')
         self.add_stream_names(rows)
         self.save(self.status.get('phase', 'starting'), deleted_files=sum(r['files'] for r in rows),
                   deleted_bytes=sum(r['bytes'] for r in rows), per_stream=rows,
@@ -591,9 +648,15 @@ class Runner:
 
     def recent_bytes(self):
         # Count ever-issued permits, including uncertain receipts: stricter than deleted bytes.
-        return self.query("""SELECT coalesce(sum((p.manifest->(i.ordinal-1)->>'size_bytes')::bigint),0)
-          FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id
-          WHERE i.delete_ever_issued AND i.updated_at>now()-interval '24 hours'""")
+        return self.query("""WITH receipts AS MATERIALIZED (
+          SELECT plan_id,ordinal FROM nas_cleanup_items
+          WHERE delete_ever_issued AND updated_at>now()-interval '24 hours'),
+          facts AS MATERIALIZED (
+          SELECT p.id,m.ordinal,(m.item->>'size_bytes')::bigint size_bytes
+          FROM (SELECT DISTINCT plan_id FROM receipts) r JOIN nas_cleanup_plans p ON p.id=r.plan_id
+          CROSS JOIN LATERAL jsonb_array_elements(p.manifest) WITH ORDINALITY m(item,ordinal))
+          SELECT coalesce(sum(f.size_bytes),0) FROM receipts i
+          JOIN facts f ON f.id=i.plan_id AND f.ordinal=i.ordinal""", 'daily permit bytes query')
 
     def catalog(self, plan):
         encoded = base64.b64encode(json.dumps(plan['items']).encode()).decode()
@@ -695,19 +758,42 @@ class Runner:
 
     def recovery(self, plan):
         # No API route exists at this revision. CLI GETs the plan and HEADs every issued R2 object.
-        raw = command(['/Users/jelly/tmp-safeguards/stoaramactl', 'nas-cleanup', 'verify-recovery',
-                       '--plan-id', str(plan['id']), '--backend-api-url', API], env=os.environ.copy())
-        r = json.loads(raw)
         issued = sum(x['delete_ever_issued'] for x in results(plan))
-        require(r['plan_id'] == plan['id'] and r['plan_sha256'] == plan['plan_sha256']
-                and r['items'] == len(plan['items']) and r['delete_ever_issued'] == issued
-                and r['verified'] == issued and r['problems'] == 0, 'R2 recovery verification failed')
+
+        def check():
+            try:
+                proc = subprocess.run(['/Users/jelly/tmp-safeguards/stoaramactl', 'nas-cleanup', 'verify-recovery',
+                    '--plan-id', str(plan['id']), '--backend-api-url', API],
+                    env=os.environ.copy(), capture_output=True, timeout=1800)
+            except subprocess.TimeoutExpired:
+                raise ReadFailure('recovery CLI timeout') from None
+            except OSError:
+                raise Halt('recovery CLI unavailable') from None
+            try:
+                summary = json.loads(proc.stdout)
+            except (ValueError, UnicodeError):
+                # A failed CLI GET has no JSON summary; never log its stderr.
+                if proc.returncode:
+                    raise ReadFailure('recovery CLI read failed') from None
+                raise Halt('invalid recovery summary') from None
+            require(summary['plan_id'] == plan['id'] and summary['plan_sha256'] == plan['plan_sha256']
+                    and summary['items'] == len(plan['items']) and summary['delete_ever_issued'] == issued,
+                    'R2 recovery report identity differs')
+            problems = summary.get('problems')
+            if (problems and summary.get('by_status', {}).get('head_error') == problems
+                    and len(summary.get('problem_items', [])) == problems
+                    and all(x.get('status') == 'head_error' for x in summary['problem_items'])):
+                raise ReadFailure('recovery object HEAD failed')
+            require(proc.returncode == 0, 'recovery CLI failed')
+            return summary
+        r = self.read('recovery verification', check)
+        require(r['verified'] == issued and r['problems'] == 0, 'R2 recovery verification failed')
         self.save('recovery_verified', recovery_issued=issued)
 
     def drain(self, pid):
         deadline = time.monotonic() + 900
         while self.query("SELECT count(*) FROM nas_cleanup_items WHERE plan_id=" + str(int(pid))
-                        + " AND (state='delete_issued' OR (state='leased' AND lease_expires_at>now()))"):
+                        + " AND (state='delete_issued' OR (state='leased' AND lease_expires_at>now()))", 'receipt drain query'):
             require(time.monotonic() < deadline, 'execution receipts did not drain; owner reconciliation needed')
             self.progress()
             time.sleep(30)
@@ -737,6 +823,8 @@ class Runner:
             if state != 'running':
                 self.finish(p)
                 return
+            # A running plan we own must still see the master ON; anything else is a mismatch.
+            require(p.get('master_deletion_enabled') is True, 'master switch mismatch during execution')
             active = self.active()
             require(active['plans'] == [pid] and active['batches'] == 0, 'concurrent cleanup execution')
             require(self.live()['commit']['id'] == self.status['live_commit'], 'live commit changed during execution')
@@ -821,9 +909,12 @@ class Runner:
         self.alert('STOPPED: owner review required')
         try:
             if self.status['current_plan']:
+                self.drain(self.status['current_plan'])
                 self.recovery(self.plan(self.status['current_plan']))
-        except Exception:
+        except Exception as exc:
             self.status['shutdown_or_recovery_failed'] = True
+            self.status['recovery_error'] = str(exc) if isinstance(exc, Halt) else 'unexpected recovery verification failure'
+            self.step_failed('recovery verification')
             self.alert('Recovery verification failed; owner review required')
         # Independent best-effort writes: neither can prevent OFF or owner notification.
         try:

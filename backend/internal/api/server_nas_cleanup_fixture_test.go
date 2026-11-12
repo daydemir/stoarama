@@ -27,12 +27,14 @@ const cleanupFixtureFolder = "99991_asia_japan_tokyo_shinjuku9"
 // fakeCleanupBucket is a minimal path-style S3 endpoint with content-derived
 // ETags (MD5, like a single-part R2 upload), If-Match and optional latency.
 type fakeCleanupBucket struct {
-	mu        sync.Mutex
-	objects   map[string][]byte
-	gets      int
-	heads     int
-	headDelay time.Duration
-	getDelay  time.Duration
+	mu            sync.Mutex
+	objects       map[string][]byte
+	gets          int
+	heads         int
+	headDelay     time.Duration
+	getDelay      time.Duration
+	getFailures   int
+	getShortReads int
 	// etags overrides the reported ETag of a key (multipart-style or a lying
 	// store) while the body stays as stored.
 	etags map[string]string
@@ -43,9 +45,17 @@ func (b *fakeCleanupBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	body, ok := b.objects[key]
 	delay := b.headDelay
+	fail, short := false, false
 	if r.Method == http.MethodGet {
 		b.gets++
 		delay = b.getDelay
+		fail, short = b.getFailures != 0, b.getShortReads != 0
+		if b.getFailures > 0 {
+			b.getFailures--
+		}
+		if b.getShortReads > 0 {
+			b.getShortReads--
+		}
 	} else {
 		b.heads++
 	}
@@ -57,6 +67,10 @@ func (b *fakeCleanupBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if fail {
+		w.WriteHeader(http.StatusForbidden)
 		return
 	}
 	sum := md5.Sum(body)
@@ -74,6 +88,9 @@ func (b *fakeCleanupBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 	w.Header().Set("Last-Modified", time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC).Format(http.TimeFormat))
 	if r.Method == http.MethodGet {
+		if short {
+			body = body[:len(body)/2]
+		}
 		_, _ = w.Write(body)
 	}
 }

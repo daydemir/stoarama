@@ -6,12 +6,12 @@ import os
 from pathlib import Path
 import subprocess
 
-DEFINITION = ('Union of catalogued R2 recording_clips intervals, split at stream-local '
-              'midnight, divided by 86400 seconds. Excludes purged clips and R2 '
-              'retirements; requires an R2 endpoint, bucket and object key. '
-              'The span includes historical catalogued clips; missing R2 days show zero. '
-              'Catalog presence, not a fresh R2 HEAD check; stitched outputs are '
-              'not used to infer missing raw coverage. DST days still divide by 86400.')
+DEFINITION = ('Union of catalogued R2 clip seconds inside the stream’s scheduled daily '
+              'windows, divided by the union of scheduled seconds for each local day. '
+              'Overlapping windows and clips count once; overnight windows split at local '
+              'midnight. Timezone boundaries account for DST. Gap days count as zero. '
+              'Excludes purged clips and R2 retirements; catalog presence, not a fresh '
+              'R2 HEAD check. Stitched outputs do not fill raw coverage gaps.')
 
 
 def query(policy):
@@ -31,17 +31,50 @@ WITH policy AS (
  AND c.clip_end_at>c.clip_start_at
  AND NOT EXISTS (SELECT 1 FROM r2_object_retirements x
    WHERE (x.kind='raw' AND x.source_id=c.id) OR (x.bucket=c.bucket AND x.object_key=c.object_key))
+), history AS (
+ SELECT r.stream_id,
+   min((c.clip_start_at AT TIME ZONE coalesce(p.tz,nullif(s.local_timezone,'')))::date) first_day,
+   max(((c.clip_end_at-interval '1 microsecond') AT TIME ZONE coalesce(p.tz,nullif(s.local_timezone,'')))::date) last_day
+ FROM recording_clips c JOIN recordings r ON r.id=c.recording_id
+ JOIN streams s ON s.id=r.stream_id LEFT JOIN policy p ON p.stream_id=s.id
+ WHERE r.account_id=47 AND c.clip_end_at>c.clip_start_at
+ AND c.endpoint LIKE '%%.r2.cloudflarestorage.com'
+ GROUP BY r.stream_id
+), schedules AS (
+ SELECT DISTINCT r.stream_id, r.daily_window_start ws, r.daily_window_end we,
+ coalesce(p.tz,nullif(s.local_timezone,'')) tz
+ FROM recordings r JOIN streams s ON s.id=r.stream_id
+ LEFT JOIN policy p ON p.stream_id=s.id WHERE r.account_id=47
+), window_spans AS (
+ SELECT sc.stream_id, d::date local_day,
+ tstzrange(d::date::timestamp AT TIME ZONE sc.tz,
+ (d::date+1)::timestamp AT TIME ZONE sc.tz,'[)') *
+ tstzrange((base::date+ws) AT TIME ZONE sc.tz,
+ (base::date+we+
+ CASE WHEN we<=ws THEN interval '1 day' ELSE interval '0 day' END)
+ AT TIME ZONE sc.tz,'[)') span
+ FROM schedules sc JOIN history h ON h.stream_id=sc.stream_id
+ CROSS JOIN LATERAL generate_series(h.first_day::timestamp,h.last_day::timestamp,interval '1 day') d
+ CROSS JOIN LATERAL generate_series(d-interval '1 day',d,interval '1 day') base
+), windows AS (
+ SELECT stream_id,local_day,unnest(range_agg(span)) span
+ FROM window_spans WHERE NOT isempty(span) GROUP BY stream_id,local_day
+), scheduled AS (
+ SELECT stream_id,jsonb_object_agg(local_day,seconds) scheduled
+ FROM (SELECT stream_id,local_day,sum(extract(epoch FROM upper(span)-lower(span))) seconds
+ FROM windows GROUP BY stream_id,local_day) t GROUP BY stream_id
+), labels AS (
+ SELECT stream_id,jsonb_agg(jsonb_build_array(to_char(ws,'HH24:MI'),
+ to_char(we,'HH24:MI')) ORDER BY ws,we) windows
+ FROM schedules GROUP BY stream_id
 ), spans AS (
  SELECT stream_id, tz, unnest(range_agg(tstzrange(a,b,'[)'))) span
  FROM clips GROUP BY stream_id,tz
 ), days AS (
- SELECT stream_id, d::date AS local_day,
- sum(extract(epoch FROM least(upper(span),(d::date+1)::timestamp AT TIME ZONE tz)
-     - greatest(lower(span),d::date::timestamp AT TIME ZONE tz))) seconds
- FROM spans CROSS JOIN LATERAL generate_series(
-   (lower(span) AT TIME ZONE tz)::date::timestamp,
-   ((upper(span)-interval '1 microsecond') AT TIME ZONE tz)::date::timestamp,
-   interval '1 day') d GROUP BY stream_id,d::date
+ SELECT w.stream_id,w.local_day,
+ sum(extract(epoch FROM upper(w.span * s.span)-lower(w.span * s.span))) seconds
+ FROM windows w JOIN spans s ON s.stream_id=w.stream_id AND w.span && s.span
+ GROUP BY w.stream_id,w.local_day
 ), daily AS (
  SELECT stream_id,jsonb_object_agg(local_day,seconds) days FROM days GROUP BY stream_id
 ), sizes AS (
@@ -60,24 +93,17 @@ WITH policy AS (
    (x.kind='collated' AND x.source_id=o.id) OR x.object_key=o.object_key)
  AND NOT EXISTS (SELECT 1 FROM clips c WHERE c.object_key=o.object_key)
  GROUP BY r.stream_id
-), history AS (
- SELECT r.stream_id,
-   min((c.clip_start_at AT TIME ZONE coalesce(p.tz,nullif(s.local_timezone,'')))::date) first_day,
-   max(((c.clip_end_at-interval '1 microsecond') AT TIME ZONE coalesce(p.tz,nullif(s.local_timezone,'')))::date) last_day
- FROM recording_clips c JOIN recordings r ON r.id=c.recording_id
- JOIN streams s ON s.id=r.stream_id LEFT JOIN policy p ON p.stream_id=s.id
- WHERE r.account_id=47 AND c.clip_end_at>c.clip_start_at
- AND c.endpoint LIKE '%%.r2.cloudflarestorage.com'
- GROUP BY r.stream_id
 ), ids AS (
  SELECT stream_id FROM policy UNION SELECT stream_id FROM clips UNION SELECT stream_id FROM stitched
 )
 SELECT jsonb_build_object('generated_at',now(),'streams',jsonb_agg(jsonb_build_object(
  'stream_id',s.id,'name',s.name,'city',s.location_city,'country',s.location_country,
  'tz',coalesce(p.tz,nullif(s.local_timezone,'')), 'first_day',hist.first_day,'last_day',hist.last_day, 'days',coalesce(d.days,'{}'::jsonb),
+ 'scheduled',coalesce(sc.scheduled,'{}'::jsonb),'windows',lb.windows,
  'raw_bytes',coalesce(z.raw_bytes,0),'raw_keep',coalesce(z.raw_keep,0),
  'stitched_bytes',coalesce(st.stitched_bytes,0),'stitched_keep',coalesce(st.stitched_keep,0)) ORDER BY s.id))
 FROM ids JOIN streams s ON s.id=ids.stream_id LEFT JOIN policy p ON p.stream_id=s.id
+LEFT JOIN scheduled sc ON sc.stream_id=s.id LEFT JOIN labels lb ON lb.stream_id=s.id
 LEFT JOIN daily d ON d.stream_id=s.id LEFT JOIN sizes z ON z.stream_id=s.id
 LEFT JOIN stitched st ON st.stream_id=s.id LEFT JOIN history hist ON hist.stream_id=s.id;
 """ % literal
@@ -95,21 +121,26 @@ def build(result, policy, catalog):
         row.update({k: data[k] for k in ('stream_id', 'name', 'city', 'country', 'tz')})
         if not row['tz']:
             raise ValueError('Missing stream timezone: %s' % sid)
+        if not data['windows'] or any(a is None or b is None for a, b in data['windows']):
+            raise ValueError('Missing daily recording window: %s' % sid)
         days = data['days']
         dates = sorted(days)
         first = data.get('first_day') or (dates[0] if dates else None)
         last = data.get('last_day') or (dates[-1] if dates else None)
         seconds = []
+        scheduled = []
         if first and last:
             date = dt.date.fromisoformat(first)
             while date <= dt.date.fromisoformat(last):
+                scheduled.append(float(data['scheduled'][str(date)]))
                 seconds.append(round(float(days.get(str(date), 0)), 6))
                 date += dt.timedelta(days=1)
-        row.update(first_day=first, last_day=last, seconds=seconds,
+        percentages = [s / w * 100 for s, w in zip(seconds, scheduled)]
+        row.update(scheduled_seconds=scheduled, windows=data['windows'], first_day=first, last_day=last, seconds=seconds,
                    days_recorded=sum(s > 0 for s in seconds),
                    total_hours=round(sum(seconds)/3600, 2),
-                   avg_coverage=sum(seconds)/86400/len(seconds)*100 if seconds else 0,
-                   days90=sum(s >= 77760 for s in seconds),
+                   avg_coverage=sum(percentages)/len(percentages) if percentages else 0,
+                   days90=sum(p >= 90 for p in percentages),
                    r2_raw_keep=data['raw_keep'], r2_raw_out=data['raw_bytes']-data['raw_keep'],
                    r2_st_keep=data['stitched_keep'], r2_st_out=data['stitched_bytes']-data['stitched_keep'])
         rows.append(row)

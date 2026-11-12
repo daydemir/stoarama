@@ -16,7 +16,7 @@ const {chromium}=require('playwright');
  const data=await page.evaluate(()=>fetch('coverage.json').then(r=>r.json()));
  assert.equal(await page.locator('.stream').count(),data.streams.length);
  assert.equal(await page.locator('.day').count(),data.streams.reduce((n,r)=>n+r.seconds.length,0));
- assert.deepEqual(await page.evaluate(()=>[0,60479,60480,77760,77761].map(grade)),['zero','red','yellow','yellow','green']);
+ assert.deepEqual(await page.evaluate(()=>[0,69.99,70,90,90.01].map(grade)),['zero','red','yellow','yellow','green']);
  for(const key of ['total_hours','avg_coverage','days90','days_recorded','all']){
   await page.selectOption('#sort',key);
   const expected=[...data.streams].sort((a,b)=>(key==='all'?(b.r2_raw_keep+b.r2_raw_out+b.r2_st_keep+b.r2_st_out)-(a.r2_raw_keep+a.r2_raw_out+a.r2_st_keep+a.r2_st_out):b[key]-a[key])||a.stream_id-b.stream_id)[0].stream_id;
