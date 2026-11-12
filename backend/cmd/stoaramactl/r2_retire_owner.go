@@ -49,7 +49,10 @@ const r2OwnerPolicySQL = `WITH policy AS (SELECT * FROM jsonb_to_recordset($1::j
 // Bulk planning joins source membership once. The live query keeps indexed,
 // per-object lookups instead of rebuilding coverage for the entire catalog.
 func r2RetireOwnerPlanSQL() string {
-	sql := strings.Replace(r2OwnerPolicySQL, "unsafe_outputs AS (", `source_coverage AS MATERIALIZED (
+	sql := strings.Replace(r2OwnerPolicySQL, "safe_raw AS (", `catalog_raw AS MATERIALIZED (
+        SELECT id,recording_id,clip_start_at,clip_end_at FROM recording_clips), safe_raw AS (`, 1)
+	sql = strings.Replace(sql, "FROM recording_clips c JOIN recordings r", "FROM catalog_raw c JOIN recordings r", 1)
+	sql = strings.Replace(sql, "unsafe_outputs AS (", `source_coverage AS MATERIALIZED (
         SELECT o.id,bool_and(s.id IS NOT NULL) safe FROM recording_collation_outputs o
         CROSS JOIN LATERAL unnest(o.source_clip_ids) source
         LEFT JOIN safe_raw s ON s.id=source GROUP BY o.id),
