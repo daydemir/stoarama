@@ -22,12 +22,17 @@ import (
 // exact present inventory. Cleanup holds, references and unknowns always veto.
 
 const (
-	r2RetireNASReason  = "kept_none_exact_nas_copy"
-	r2RetireReason     = "outside_keep28_no_nas_copy"
-	r2RetireRawPrefix  = "managed/"
-	r2RetireUSDPerTB   = 15.0
-	r2RetireBytesPerTB = 1e12
+	r2RetireOwnerAccepted r2RetireClass = "owner_accepted_outside_window"
+	r2RetireNASReason                   = "kept_none_exact_nas_copy"
+	r2RetireReason                      = "outside_keep28_no_nas_copy"
+	r2RetireRawPrefix                   = "managed/"
+	r2RetireUSDPerTB                    = 15.0
+	r2RetireBytesPerTB                  = 1e12
 )
+
+type r2RetireClass string
+
+func (c r2RetireClass) valid() bool { return c == "" || c == r2RetireOwnerAccepted }
 
 // r2RetireProtectedPrefixes are never retired, whatever the database says.
 // joined/best14-20261021/ holds the V85 best14 outputs, tracked only in a

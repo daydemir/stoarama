@@ -19,10 +19,14 @@ type r2RetireQuerier interface {
 
 // r2RetireScope is what every catalog query is bound to.
 type r2RetireScope struct {
-	AccountID    int64
-	ConnectionID int64
-	Bucket       string
-	Grace        time.Duration
+	Class         r2RetireClass
+	OwnerSchema   bool
+	OwnerPlanning bool
+	OwnerPolicy   []byte
+	AccountID     int64
+	ConnectionID  int64
+	Bucket        string
+	Grace         time.Duration
 	// HasRetirements is false only before migration 0174 is applied (plan only).
 	HasRetirements bool
 	NASBacked      bool
@@ -98,10 +102,35 @@ func r2RetireSQL(kind string, scope r2RetireScope, single bool) string {
 		retired = "false"
 	}
 	sel = strings.Replace(sel, "{RETIRED}", retired, 1)
-	if scope.ReleaseSchema && kind == "raw" {
+	ownerSnapshot := scope.Class == r2RetireOwnerAccepted && (!single || scope.OwnerPlanning)
+	if kind == "raw" && (scope.ReleaseSchema || ownerSnapshot) {
 		start := strings.Index(sel, "  EXISTS(SELECT 1 FROM nas_cleanup_source_holds")
 		end := strings.Index(sel[start:], "\n  (EXISTS(SELECT 1 FROM recording_joined_source_snapshots") + start
-		sel = sel[:start] + "  nas_cleanup_clip_held(c.id)," + sel[end:]
+		held := "nas_cleanup_clip_held(c.id)"
+		if ownerSnapshot {
+			held = "false"
+		} // Exact item/source holds are materialized once below.
+		sel = sel[:start] + "  " + held + "," + sel[end:]
+	}
+	if scope.Class == r2RetireOwnerAccepted {
+		sel = strings.Replace(sel, "r.account_id=$1", "r.account_id=$1 AND $2::bigint>0", 1)
+		start := strings.Index(sel, "  (EXISTS(")
+		end := start + strings.Index(sel[start:], "),\n") + 2
+		presence := `  (EXISTS(SELECT 1 FROM nas_inventory_files n WHERE n.state<>'missing' AND
+          (n.clip_id=c.id OR n.relative_path=c.display_path OR (n.sha256=lower(c.sha256) AND n.size_bytes=c.size_bytes)))
+          OR EXISTS(SELECT 1 FROM nas_inventory_unmatched_files n WHERE n.state<>'missing' AND n.relative_path=c.display_path)),`
+		if kind == "collated" {
+			presence = `  (EXISTS(SELECT 1 FROM nas_inventory_files n WHERE n.state<>'missing' AND
+          (n.relative_path IN (o.nas_relative_path,'joined/'||o.nas_relative_path) OR (n.sha256=lower(o.sha256) AND n.size_bytes=o.size_bytes)))
+          OR EXISTS(SELECT 1 FROM nas_inventory_unmatched_files n WHERE n.state<>'missing' AND n.relative_path IN (o.nas_relative_path,'joined/'||o.nas_relative_path))),`
+		}
+		if !single || scope.OwnerPlanning {
+			presence = "  false,"
+		}
+		sel = sel[:start] + presence + sel[end:]
+	}
+	if scope.Class == r2RetireOwnerAccepted && scope.OwnerSchema {
+		sel = strings.Replace(sel, "nas_cleanup_clip_held(c.id)", "nas_cleanup_owner_clip_held(c.id)", 1)
 	}
 	if scope.NASBacked {
 		// Preserve the legacy query for old manifests. New plans require exact
@@ -110,7 +139,7 @@ func r2RetireSQL(kind string, scope r2RetireScope, single bool) string {
 		if kind == "collated" {
 			extra = r2RetireCollatedExactSQL
 		}
-		if !single {
+		if !single || scope.OwnerPlanning {
 			path := "c.display_path"
 			if kind == "collated" {
 				path = "o.nas_relative_path"
@@ -172,17 +201,41 @@ type r2RetireNASIdentity struct {
 
 // r2RetireSets binds cleanup protections, shared/reference keys and the exact
 // NAS planning snapshot. Apply always reads NAS identity and freshness live.
+type r2RetireObjectKey struct{ Bucket, Key string }
+
 type r2RetireSets struct {
-	Evidence       *r2RetireEvidence
-	ExactRaw       map[int64]r2RetireNASIdentity
-	ExactPaths     map[r2RetireNASIdentity]bool
-	HeldRaw        map[int64]bool
-	HeldCollated   map[int64]bool
-	ArtifactKeys   map[string]bool
-	OutputKeyCount map[string]int
+	HeldKeys          map[r2RetireObjectKey]bool
+	PresentRaw        map[int64]bool
+	PresentPaths      map[string]bool
+	PresentContent    map[r2RetireNASIdentity]bool
+	OwnerSchema       bool
+	Class             r2RetireClass
+	ProtectedRaw      map[int64]bool
+	ProtectedCollated map[int64]bool
+	Evidence          *r2RetireEvidence
+	ExactRaw          map[int64]r2RetireNASIdentity
+	ExactPaths        map[r2RetireNASIdentity]bool
+	HeldRaw           map[int64]bool
+	HeldCollated      map[int64]bool
+	ArtifactKeys      map[string]bool
+	OutputKeyCount    map[string]int
 }
 
 func (s r2RetireSets) apply(c *r2RetireCandidate) {
+	if s.HeldKeys[r2RetireObjectKey{c.Bucket, c.ObjectKey}] {
+		c.Facts.Held = true
+	}
+	if s.Class == r2RetireOwnerAccepted {
+		c.Facts.NASCopy = c.Facts.NASCopy || s.PresentPaths[c.RelativePath] || s.PresentContent[r2RetireNASIdentity{"", c.SHA256, c.SizeBytes}]
+		if c.Kind == "raw" {
+			c.Facts.NASCopy = c.Facts.NASCopy || s.PresentRaw[c.SourceID]
+		} else {
+			c.Facts.NASCopy = c.Facts.NASCopy || s.PresentPaths["joined/"+c.RelativePath]
+		}
+	}
+	if s.ProtectedRaw[c.SourceID] && c.Kind == "raw" || s.ProtectedCollated[c.SourceID] && c.Kind == "collated" {
+		c.Facts.JoinedRef = true
+	}
 	switch c.Kind {
 	case "raw":
 		if s.HeldRaw[c.SourceID] {
@@ -230,16 +283,36 @@ SELECT md5(coalesce((SELECT string_agg(id||':'||mode, ',' ORDER BY id) FROM nas_
   ||'|'||(SELECT count(*)||':'||coalesce(max(id),0) FROM recording_joined_artifacts)
   ||'|'||(SELECT count(*)||':'||coalesce(max(id),0) FROM recording_collation_outputs))`
 
-func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, nasBacked bool) (r2RetireSets, error) {
-	s := r2RetireSets{HeldRaw: map[int64]bool{}, HeldCollated: map[int64]bool{}, ArtifactKeys: map[string]bool{}, OutputKeyCount: map[string]int{}}
+func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, nasBacked bool, classes ...r2RetireClass) (r2RetireSets, error) {
+	s := r2RetireSets{HeldKeys: map[r2RetireObjectKey]bool{}, HeldRaw: map[int64]bool{}, HeldCollated: map[int64]bool{}, ArtifactKeys: map[string]bool{}, OutputKeyCount: map[string]int{}}
+	if len(classes) > 0 {
+		s.Class = classes[0]
+	}
 	var err error
-	s.Evidence, err = loadR2RetireEvidence(ctx, q)
+	s.Evidence, err = loadR2RetireEvidence(ctx, q, s.Class)
 	if err != nil {
+		return s, err
+	}
+	if err := q.QueryRow(ctx, `SELECT to_regprocedure('nas_cleanup_owner_clip_held(bigint)') IS NOT NULL`).Scan(&s.OwnerSchema); err != nil {
 		return s, err
 	}
 	manifestSQL := r2RetirePlanManifestSQL
 	if s.Evidence.ReleaseSchema {
 		manifestSQL = `SELECT e.value FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) WITH ORDINALITY e(value,n) LEFT JOIN nas_cleanup_items i ON i.plan_id=p.id AND i.ordinal=e.n WHERE (p.mode<>'retired' OR i.delete_ever_issued OR i.id IS NULL) AND NOT EXISTS(SELECT 1 FROM nas_cleanup_r2_effective_releases x WHERE x.item_id=i.id)`
+	}
+	mappedSources := map[int64]map[int64]bool{}
+	if s.Class == r2RetireOwnerAccepted {
+		held := `(p.mode<>'retired' OR i.delete_ever_issued OR i.id IS NULL OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed'))`
+		releaseView := "nas_cleanup_r2_effective_releases"
+		if s.OwnerSchema {
+			releaseView = "nas_cleanup_owner_effective_releases"
+		}
+		if s.Evidence.ReleaseSchema {
+			held += ` AND (p.mode<>'retired' OR NOT EXISTS(SELECT 1 FROM ` + releaseView + ` x WHERE x.item_id=i.id))`
+		}
+		manifestSQL = `SELECT p.id,e.value,(` + held + `) FROM nas_cleanup_plans p
+        CROSS JOIN LATERAL jsonb_array_elements(p.manifest) WITH ORDINALITY e(value,n)
+        LEFT JOIN nas_cleanup_items i ON i.plan_id=p.id AND i.ordinal=e.n`
 	}
 	rows, err := q.Query(ctx, manifestSQL)
 	if err != nil {
@@ -247,10 +320,19 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 	}
 	for rows.Next() {
 		var raw []byte
-		if err := rows.Scan(&raw); err != nil {
-			rows.Close()
-			return s, err
+		var planID int64
+		held := true
+		var scanErr error
+		if s.Class == r2RetireOwnerAccepted {
+			scanErr = rows.Scan(&planID, &raw, &held)
+		} else {
+			scanErr = rows.Scan(&raw)
 		}
+		if scanErr != nil {
+			rows.Close()
+			return s, scanErr
+		}
+
 		var item struct {
 			Kind      string  `json:"kind"`
 			SourceID  int64   `json:"source_id"`
@@ -259,6 +341,24 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 		if err := json.Unmarshal(raw, &item); err != nil || item.SourceID <= 0 {
 			rows.Close()
 			return s, errors.New("unreadable NAS cleanup plan item; refusing (fail closed)")
+		}
+		if item.Kind != "raw" && item.Kind != "collated" {
+			rows.Close()
+			return s, fmt.Errorf("unknown NAS cleanup plan item kind %q", item.Kind)
+		}
+		if s.Class == r2RetireOwnerAccepted {
+			if mappedSources[planID] == nil {
+				mappedSources[planID] = map[int64]bool{}
+			}
+			if item.Kind == "raw" {
+				mappedSources[planID][item.SourceID] = true
+			}
+			for _, id := range item.SourceIDs {
+				mappedSources[planID][id] = true
+			}
+			if !held {
+				continue
+			}
 		}
 		switch item.Kind {
 		case "raw":
@@ -277,6 +377,29 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 	if err := rows.Err(); err != nil {
 		return s, err
 	}
+	if s.Class == r2RetireOwnerAccepted {
+		rows, err := q.Query(ctx, `SELECT h.plan_id,h.clip_id FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id
+        WHERE p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id
+        AND (i.delete_ever_issued OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed')))`)
+		if err != nil {
+			return s, err
+		}
+		for rows.Next() {
+			var planID, id int64
+			if err := rows.Scan(&planID, &id); err != nil {
+				rows.Close()
+				return s, err
+			}
+			if !mappedSources[planID][id] {
+				s.HeldRaw[id] = true
+			}
+		}
+		rows.Close()
+		if rows.Err() != nil {
+			return s, rows.Err()
+		}
+	}
+
 	for _, spec := range []struct {
 		sql string
 		fn  func(string)
@@ -307,6 +430,9 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 		reservedView := "nas_cleanup_reserved_files"
 		if s.Evidence.ReleaseSchema {
 			reservedView = "nas_cleanup_r2_reserved_files"
+		}
+		if s.Class == r2RetireOwnerAccepted && s.OwnerSchema {
+			reservedView = "nas_cleanup_owner_reserved_files"
 		}
 		rows, err := q.Query(ctx, `SELECT DISTINCT kind,source_id FROM `+reservedView)
 		if err != nil {
@@ -372,17 +498,19 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 	}
 	if has {
 		exclude := manifest
-		rows, err := q.Query(ctx, `SELECT kind,source_id FROM r2_retirement_reservations WHERE manifest_sha256<>$1`, exclude)
+		rows, err := q.Query(ctx, `SELECT kind,source_id,bucket,object_key FROM r2_retirement_reservations WHERE manifest_sha256<>$1`, exclude)
 		if err != nil {
 			return s, err
 		}
 		for rows.Next() {
 			var kind string
 			var id int64
-			if err := rows.Scan(&kind, &id); err != nil {
+			var key r2RetireObjectKey
+			if err := rows.Scan(&kind, &id, &key.Bucket, &key.Key); err != nil {
 				rows.Close()
 				return s, err
 			}
+			s.HeldKeys[key] = true
 			if kind == "raw" {
 				s.HeldRaw[id] = true
 			} else {
@@ -433,6 +561,7 @@ func r2RetireHasRetirementsTable(ctx context.Context, q r2RetireQuerier) (bool, 
 // r2RetireScan pages through one kind and calls fn for every candidate.
 func r2RetireScan(ctx context.Context, q r2RetireQuerier, kind string, scope r2RetireScope, sets r2RetireSets, pageSize int, fn func(r2RetireCandidate) error) error {
 	scope.ReleaseSchema = sets.Evidence != nil && sets.Evidence.ReleaseSchema
+	scope.OwnerSchema = sets.OwnerSchema
 	sql := r2RetireSQL(kind, scope, false)
 	after := int64(0)
 	for {
@@ -460,7 +589,11 @@ func r2RetireScan(ctx context.Context, q r2RetireQuerier, kind string, scope r2R
 			if scope.NASBacked {
 				sets.applyPlanNAS(&page[i])
 			}
-			sets.Evidence.apply(&page[i])
+			if scope.Class != r2RetireOwnerAccepted {
+				sets.Evidence.apply(&page[i])
+			} else {
+				sets.Evidence.applyOwner(&page[i])
+			}
 			if err := fn(page[i]); err != nil {
 				return err
 			}
@@ -475,12 +608,20 @@ func r2RetireScan(ctx context.Context, q r2RetireQuerier, kind string, scope r2R
 // r2RetireLoadOne re-reads one catalog row (purged or not) for apply.
 func r2RetireLoadOne(ctx context.Context, q r2RetireQuerier, kind string, id int64, scope r2RetireScope, sets r2RetireSets) (r2RetireCandidate, error) {
 	scope.ReleaseSchema = sets.Evidence != nil && sets.Evidence.ReleaseSchema
+	scope.OwnerSchema = sets.OwnerSchema
 	row := q.QueryRow(ctx, r2RetireSQL(kind, scope, true), scope.AccountID, scope.ConnectionID, scope.Bucket, int64(scope.Grace/time.Second), id)
 	c, err := r2RetireScanCandidate(kind, row, scope.NASBacked)
 	if err != nil {
 		return c, err
 	}
 	sets.apply(&c)
+	if scope.Class == r2RetireOwnerAccepted {
+		if err := r2RetireOwnerLive(ctx, q, &c, scope); err != nil {
+			return c, err
+		}
+		err = r2RetireOwnerLiveEvidence(ctx, q, &c, sets.Evidence)
+		return c, err
+	}
 	if err := r2RetireLiveEvidence(ctx, q, &c, sets.Evidence); err != nil {
 		return c, err
 	}

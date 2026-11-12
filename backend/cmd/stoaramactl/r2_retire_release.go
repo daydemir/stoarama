@@ -34,6 +34,7 @@ type r2HoldReleaseItem struct {
 	Window      api.Keep28Window `json:"keep28"`
 }
 type r2HoldReleaseManifest struct {
+	Class     r2RetireClass       `json:"retirement_class,omitempty"`
 	Version   int                 `json:"version"`
 	Tool      string              `json:"tool"`
 	CreatedAt time.Time           `json:"created_at"`
@@ -62,9 +63,19 @@ type r2ReleaseReceipt struct {
 	id               int64
 }
 
-func r2HoldReleasePlan(ctx context.Context, q r2RetireQuerier, picks r2RetirePicks, policy string, windows map[int64]api.Keep28Window) (r2HoldReleaseManifest, error) {
+func r2HoldReleasePlan(ctx context.Context, q r2RetireQuerier, picks r2RetirePicks, policy string, windows map[int64]api.Keep28Window, classes ...r2RetireClass) (r2HoldReleaseManifest, error) {
 	m := r2HoldReleaseManifest{Version: 1, Tool: "r2-retire release-holds", CreatedAt: time.Now().UTC(), PicksSHA: picks.SHA256, PolicySHA: policy}
-	rows, err := q.Query(ctx, r2ReleaseReceiptsSQL)
+	if len(classes) > 0 {
+		m.Class = classes[0]
+	}
+	if !m.Class.valid() {
+		return m, errors.New("unknown release class")
+	}
+	receiptsSQL := r2ReleaseReceiptsSQL
+	if m.Class == r2RetireOwnerAccepted {
+		receiptsSQL = strings.Replace(receiptsSQL, "ORDER BY i.id", "AND p.mode='retired' ORDER BY i.id", 1)
+	}
+	rows, err := q.Query(ctx, receiptsSQL)
 	if err != nil {
 		return m, err
 	}
@@ -105,12 +116,25 @@ func r2HoldReleasePlan(ctx context.Context, q r2RetireQuerier, picks r2RetirePic
 		return m, rows.Err()
 	}
 	candidates := map[string]r2RetireCandidate{}
-	scope := r2RetireScope{AccountID: 47, ConnectionID: 13, Bucket: "stoarama", Grace: 7 * 24 * time.Hour, NASBacked: true}
+	scope := r2RetireScope{Class: m.Class, AccountID: 47, ConnectionID: 13, Bucket: "stoarama", Grace: 7 * 24 * time.Hour, NASBacked: true}
 	has, err := r2RetireHasRetirementsTable(ctx, q)
 	if err != nil {
 		return m, err
 	}
 	scope.HasRetirements = has
+	var ownerSets r2RetireSets
+	if m.Class == r2RetireOwnerAccepted {
+		ownerSets, err = loadR2RetireSets(ctx, q, "", false, m.Class)
+		if err != nil {
+			return m, err
+		}
+		scope.OwnerPlanning = true
+		scope.ReleaseSchema = ownerSets.Evidence.ReleaseSchema
+		scope.OwnerSchema = ownerSets.OwnerSchema
+		if err = ownerSets.loadOwnerProtections(ctx, q, scope, windows, picks.Choices); err != nil {
+			return m, err
+		}
+	}
 	for _, kind := range []string{"raw", "collated"} {
 		if len(ids[kind]) == 0 {
 			continue
@@ -178,9 +202,22 @@ func r2HoldReleasePlan(ctx context.Context, q r2RetireQuerier, picks r2RetirePic
 		if !ok || !r2RetireOutside(w, c.StartAt, c.EndAt) || !r2RetireOutside(w, c.SourceStart, c.SourceEnd) {
 			continue
 		}
-		c.Facts = r2RetireFacts{Purged: c.Facts.Purged, Retired: c.Facts.Retired, NASAbsent: true}
-		reason, choice, eligible := r2RetireDecideMode(c, scope.Bucket, windows, picks.Choices, true)
-		if !eligible || reason != r2RetireReason {
+		if m.Class == r2RetireOwnerAccepted {
+			ownerSets.apply(&c)
+			c.Facts.Held = false // Exempt this exact receipt only; other holds still veto retirement.
+		} else {
+			c.Facts = r2RetireFacts{Purged: c.Facts.Purged, Retired: c.Facts.Retired, NASAbsent: true}
+		}
+		releaseCandidate := c
+		if m.Class == r2RetireOwnerAccepted {
+			// Release this completed receipt's recovery hold, not its NAS
+			// presence veto. Inventory still blocks retirement and projections.
+			releaseCandidate.Facts.NASCopy = false
+			releaseCandidate.Facts.ExactNAS = false
+			releaseCandidate.Facts.ListingPresence = false
+		}
+		reason, choice, eligible := r2RetireDecideForScope(releaseCandidate, scope, windows, picks.Choices)
+		if !eligible || (m.Class == "" && reason != r2RetireReason) {
 			continue
 		}
 		m.Items = append(m.Items, r2HoldReleaseItem{ItemID: r.itemID, PlanID: r.planID, PlanSHA: r.planSHA, Recovery: r.recovery, RecoverySHA: r2SHA(r.recoveryEvidence), ReceiptSHA: r2SHA(r.outcome), ItemSHA: r2SHA(r.item), Candidate: r2RetireItem{r2RetireCandidate: c, Reason: reason, Choice: choice}, Window: w})
@@ -212,8 +249,17 @@ func validateR2HoldReleaseItems(m, live r2HoldReleaseManifest) error {
 }
 
 func applyR2HoldReleases(ctx context.Context, tx pgx.Tx, m r2HoldReleaseManifest, picks r2RetirePicks, policy, digest, reason string, windows map[int64]api.Keep28Window) error {
-	if m.Version != 1 || m.Tool != "r2-retire release-holds" || m.PolicySHA != policy || m.PicksSHA != picks.SHA256 || m.CreatedAt.After(time.Now().Add(time.Minute)) || time.Since(m.CreatedAt) > 24*time.Hour || strings.TrimSpace(reason) == "" {
+	if !m.Class.valid() || m.Version != 1 || m.Tool != "r2-retire release-holds" || m.PolicySHA != policy || m.PicksSHA != picks.SHA256 || m.CreatedAt.After(time.Now().Add(time.Minute)) || time.Since(m.CreatedAt) > 24*time.Hour || strings.TrimSpace(reason) == "" {
 		return errors.New("release authority differs or expired")
+	}
+	if m.Class == r2RetireOwnerAccepted {
+		var has bool
+		if err := tx.QueryRow(ctx, `SELECT to_regclass('nas_cleanup_owner_effective_releases') IS NOT NULL`).Scan(&has); err != nil {
+			return err
+		}
+		if !has {
+			return errors.New("migration 0186 is required before owner hold releases")
+		}
 	}
 	if err := api.LockNASCleanupR2Retirement(ctx, tx); err != nil {
 		return err
@@ -237,7 +283,7 @@ func applyR2HoldReleases(ctx context.Context, tx pgx.Tx, m r2HoldReleaseManifest
 	if rows.Err() != nil {
 		return rows.Err()
 	}
-	live, err := r2HoldReleasePlan(ctx, tx, picks, policy, windows)
+	live, err := r2HoldReleasePlan(ctx, tx, picks, policy, windows, m.Class)
 	if err != nil {
 		return err
 	}
@@ -269,6 +315,7 @@ func applyR2HoldReleases(ctx context.Context, tx pgx.Tx, m r2HoldReleaseManifest
 }
 func runR2HoldReleases(ctx context.Context, cfg config.Config, args []string, policy string, windows map[int64]api.Keep28Window) {
 	fs := flag.NewFlagSet("r2-retire release-holds", flag.ExitOnError)
+	class := fs.String("class", "", "explicit hold-release class: owner_accepted_outside_window")
 	picksPath := fs.String("picks", "", "saved owner picks")
 	out := fs.String("out", "", "new dry-run manifest path")
 	manifest := fs.String("manifest", "", "apply exact release manifest")
@@ -278,6 +325,9 @@ func runR2HoldReleases(ctx context.Context, cfg config.Config, args []string, po
 	fs.Parse(args)
 	if fs.NArg() != 0 || *picksPath == "" || (!*apply && *out == "") || (*apply && (*manifest == "" || !r2RetireLowerHex64(*digest) || *reason == "")) {
 		log.Fatal("release-holds requires --picks and --out; apply requires --apply --manifest --expected-sha256 --reason")
+	}
+	if !r2RetireClass(*class).valid() {
+		log.Fatal("unknown hold-release class")
 	}
 	picks, err := loadR2RetirePicks(*picksPath)
 	if err != nil {
@@ -294,7 +344,7 @@ func runR2HoldReleases(ctx context.Context, cfg config.Config, args []string, po
 			log.Fatal(err)
 		}
 		defer tx.Rollback(ctx)
-		m, err := r2HoldReleasePlan(ctx, tx, picks, policy, windows)
+		m, err := r2HoldReleasePlan(ctx, tx, picks, policy, windows, r2RetireClass(*class))
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -323,6 +373,9 @@ func runR2HoldReleases(ctx context.Context, cfg config.Config, args []string, po
 	decoder.DisallowUnknownFields()
 	if err = decoder.Decode(&m); err != nil {
 		log.Fatal(err)
+	}
+	if m.Class != r2RetireClass(*class) {
+		log.Fatal("release class differs")
 	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
