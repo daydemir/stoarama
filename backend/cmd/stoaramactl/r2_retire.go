@@ -922,6 +922,11 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 			return "", "", err
 		}
 	}
+	if _, err := tx.Exec(ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256,already_absent)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		it.Kind, it.SourceID, it.StreamID, it.Bucket, it.ObjectKey, it.SizeBytes, it.SHA256, it.Reason, it.Choice, a.digest, a.policySH, absent); err != nil {
+		return "", "", r2RetireAnomalyf("record retirement: %v", err)
+	}
 	if it.Kind == "raw" {
 		// The NAS cleanup hold and joined retention triggers veto here, before
 		// anything is deleted.
@@ -932,11 +937,6 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 		if tag.RowsAffected() != 1 {
 			return "", "", r2RetireAnomalyf("purged_at updated %d rows", tag.RowsAffected())
 		}
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256,already_absent)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-		it.Kind, it.SourceID, it.StreamID, it.Bucket, it.ObjectKey, it.SizeBytes, it.SHA256, it.Reason, it.Choice, a.digest, a.policySH, absent); err != nil {
-		return "", "", r2RetireAnomalyf("record retirement: %v", err)
 	}
 	if a.scope.NASBacked {
 		// Lock the actual matching inventory row through R2 deletion/commit.

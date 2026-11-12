@@ -403,8 +403,8 @@ its last observation predates the receipt. Active/dry-run/paused plans, uncertai
 unmapped source holds, reservations and all 28 incident identities (including
 collated descendants) remain protected. The existing receipt guard validates
 identity and receipt/recovery hashes. Owner release records are excluded from
-the legacy effective-release view. Only an owner-class durable reservation can
-consume them, and only a `purged_at` transition may use that exception; other
+the legacy effective-release view. Only an owner-class durable reservation plus its matching retirement record in
+the deletion transaction can consume them. Only a `purged_at` transition may use that exception; other
 source mutations and classes retain their holds.
 
 Review and commit the exact hold-release manifest separately, before retirement.

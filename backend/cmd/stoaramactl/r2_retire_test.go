@@ -1038,6 +1038,13 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if err = pool.QueryRow(ctx, `SELECT nas_cleanup_clip_held(705),nas_cleanup_owner_clip_held(705)`).Scan(&legacyHeld, &ownerHeld); err != nil || !legacyHeld || ownerHeld {
 			t.Fatal("class isolation", legacyHeld, ownerHeld, err)
 		}
+		// An owner reservation alone cannot lend its exception to another
+		// purge path. The owner retirement record must be in the same tx.
+		exec(`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class)
+         SELECT 'raw',id,bucket,object_key,size_bytes,sha256,repeat('c',64),'owner_accepted_outside_window' FROM recording_clips WHERE id=711`)
+		if _, err = pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=711`); err == nil {
+			t.Fatal("reservation alone waived a legacy hold")
+		}
 		// Legacy reservations and direct purge retain their recovery hold.
 		if _, err = pool.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) SELECT 'raw',id,bucket,object_key,size_bytes,sha256,repeat('a',64) FROM recording_clips WHERE id=705`); err == nil {
 			t.Fatal("legacy consumed owner release")

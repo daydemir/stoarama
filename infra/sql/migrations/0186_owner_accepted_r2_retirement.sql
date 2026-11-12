@@ -69,14 +69,18 @@ BEGIN
 END $$;
 
 -- Only purged_at can change under class-specific authority, and only after
--- the independent durable reservation commits. No GUC bypass or global release.
+-- the independent durable reservation commits AND this transaction records
+-- owner-class retirement. Reservation alone cannot authorize a generic purge.
 CREATE OR REPLACE FUNCTION guard_nas_cleanup_source() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
  IF TG_OP='UPDATE' AND OLD.purged_at IS NULL AND NEW.purged_at IS NOT NULL
  AND (to_jsonb(OLD)-'purged_at')=(to_jsonb(NEW)-'purged_at')
  AND NOT nas_cleanup_owner_clip_held(OLD.id)
  AND EXISTS(SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='raw' AND x.source_id=OLD.id
  AND x.retirement_class='owner_accepted_outside_window' AND x.bucket=OLD.bucket AND x.object_key=OLD.object_key
- AND x.size_bytes=OLD.size_bytes AND x.sha256=lower(OLD.sha256)) THEN RETURN NEW; END IF;
+ AND x.size_bytes=OLD.size_bytes AND x.sha256=lower(OLD.sha256)
+ AND EXISTS(SELECT 1 FROM r2_object_retirements r WHERE r.kind=x.kind AND r.source_id=x.source_id
+ AND r.reason='owner_accepted_outside_window' AND r.manifest_sha256=x.manifest_sha256
+ AND r.bucket=x.bucket AND r.object_key=x.object_key AND r.size_bytes=x.size_bytes AND r.sha256=x.sha256)) THEN RETURN NEW; END IF;
  IF nas_cleanup_clip_held(OLD.id) AND (TG_OP='DELETE' OR ROW(NEW.purged_at,NEW.bucket,NEW.object_key,NEW.sha256,NEW.size_bytes,NEW.display_path,NEW.clip_start_at,NEW.clip_end_at,NEW.recording_id)
  IS DISTINCT FROM ROW(OLD.purged_at,OLD.bucket,OLD.object_key,OLD.sha256,OLD.size_bytes,OLD.display_path,OLD.clip_start_at,OLD.clip_end_at,OLD.recording_id)) THEN
  RAISE EXCEPTION 'retention protected: NAS cleanup source/recovery hold'; END IF;
