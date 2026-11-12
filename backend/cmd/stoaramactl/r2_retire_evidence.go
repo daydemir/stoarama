@@ -172,6 +172,11 @@ func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier, class r2Retire
 		return nil, rows.Err()
 	}
 
+	if class == r2RetireOwnerAccepted {
+		// Owner retirement never authorizes kept media from exact inventory.
+		// Its broad listing veto needs no content/namespace identity join.
+		return e, loadR2FenceEvidence(ctx, q, e)
+	}
 	rows, err = q.Query(ctx, `SELECT n.clip_id,n.relative_path,n.sha256,n.size_bytes FROM nas_inventory_files n WHERE n.connection_id=13 AND n.state='present' AND n.verified_at>now()-interval '24 hours' AND n.server_received_at>now()-interval '24 hours' AND EXISTS(SELECT 1 FROM nas_listing_files f JOIN nas_listing_generations g USING(connection_id,generation) WHERE f.connection_id=13 AND f.relative_path=n.relative_path AND g.started_at>=$1 AND ROW(f.size_bytes,f.mtime_ns,f.ctime_ns,f.inode,f.device) IS DISTINCT FROM ROW(n.size_bytes,n.file_mtime_ns,n.file_ctime_ns,n.file_inode,n.file_device))`, e.Start)
 	if err != nil {
 		return nil, err
