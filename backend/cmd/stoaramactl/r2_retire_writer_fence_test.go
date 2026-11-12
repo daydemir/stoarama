@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -134,13 +135,20 @@ func TestR2WriterFenceWireAndCapabilityDrain(t *testing.T) {
 		case req.Method == "POST" && req.URL.Query().Has("uploads"):
 			fmt.Fprint(w, `<InitiateMultipartUploadResult><UploadId>test-upload</UploadId></InitiateMultipartUploadResult>`)
 		case req.Method == "PUT" && req.URL.Query().Get("uploadId") == "test-upload":
+			// Acknowledge the part only after receiving it. An early response
+			// can close HTTP/1 before the large request finishes on the wire.
+			if _, err := io.Copy(io.Discard, req.Body); err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
 			w.Header().Set("ETag", `"part"`)
 		case req.Method == "POST" && req.URL.Query().Get("uploadId") == "test-upload":
 			close(started)
 			<-finish
 			fmt.Fprint(w, `<CompleteMultipartUploadResult><ETag>"e"</ETag></CompleteMultipartUploadResult>`)
 		default:
-			t.Error("unexpected provider write")
+			t.Errorf("unexpected provider write: %s %s", req.Method, req.URL)
 			w.WriteHeader(400)
 		}
 	}))
@@ -157,6 +165,8 @@ func TestR2WriterFenceWireAndCapabilityDrain(t *testing.T) {
 	}()
 	select {
 	case <-started:
+	case err := <-done:
+		t.Fatalf("multipart upload ended before completion request: %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("wire PUT did not start")
 	}
