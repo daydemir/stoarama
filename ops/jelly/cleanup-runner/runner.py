@@ -753,7 +753,7 @@ class Runner:
         ids = self.query("""SELECT coalesce(json_agg(id ORDER BY id),'[]') FROM nas_cleanup_plans p
           WHERE account_id=47 AND connection_id=13 AND mode='dry_run'
           AND id<>""" + str(self.status['current_plan'] or 0) + """
-          AND report_sha256='""" + POLICY_SHA + """' AND EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=p.id)
+          AND report_sha256='""" + POLICY_SHA + """' AND label NOT LIKE '%-nasonly-%' AND EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=p.id)
           AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=p.id
             AND (state<>'would_delete' OR delete_ever_issued OR updated_at<=now()-interval '20 hours'))""")
         if ids:
@@ -772,7 +772,12 @@ class Runner:
             require(not summary['rejected_at_admission'], 'preparer rejected an uncertain file')
             if summary['receipts']:
                 require(len(summary['receipts']) == 1, 'preparer admitted more than one plan')
-                return summary['receipts'][0]['id']
+                receipt = summary['receipts'][0]
+                if '-nasonly-' in receipt.get('label', ''):
+                    # No R2 copy: the standing approval can never enable it. Leave it parked
+                    # in dry run (its items stay reserved) and move on to the next stream.
+                    continue
+                return receipt['id']
         if lookahead:
             return None  # Current/reserved work is expected; never claim completion here.
         # The preparer excludes reserved files. Never call that a completed cleanup.

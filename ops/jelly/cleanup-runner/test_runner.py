@@ -311,6 +311,25 @@ class LoopTests(unittest.TestCase):
             self.assertIn('id<>42', queries[0])
             self.assertTrue(all('--atomic-admission' in args for args in commands))
 
+    def test_pick_skips_nasonly_plans(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            job.repo = Path(root)
+            job.windows = {3: None, 4: None}
+            job.status['current_plan'] = None
+            queries = []
+            job.query = lambda sql: queries.append(sql) or []
+            labels = iter(['k28auto-x-s3-raw-nasonly-0001', 'k28auto-x-s4-raw-0001'])
+            ids = iter([1405, 1406])
+            def command(args, **kwargs):
+                out = Path(args[args.index('--out') + 1])
+                out.mkdir(parents=True)
+                (out / 'summary.json').write_text(json.dumps(dict(
+                    receipts=[dict(id=next(ids), label=next(labels))], rejected_at_admission=[])))
+            with patch.object(r, 'command', side_effect=command):
+                self.assertEqual(r.Runner.pick(job, lookahead=True), 1406)
+            self.assertIn("NOT LIKE '%-nasonly-%'", queries[0])
+
     def test_batch_order_and_approval_digest(self):
         with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
             job = FakeRunner(root)
