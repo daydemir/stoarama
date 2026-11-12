@@ -231,7 +231,8 @@ Any matching path in that generation or a later partial generation vetoes
 retirement regardless of file size. A complete newer namespace proof can
 supersede older hash inventory/ACK observations; observations at/after the proof
 or from another connection continue to veto. A stale exact hash observation
-cannot authorize kept footage after a newer listing reports its path absent.
+cannot authorize kept footage after a newer listing reports its path absent or
+a different size/mtime/ctime/inode/device identity.
 Evidence publication and cursor advances share the retirement transaction's
 public fence; apply rereads freshness, writer time, presence and protections.
 

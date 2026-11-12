@@ -8,9 +8,9 @@ import (
 	"time"
 )
 
-const r2RetireListingMaxAge = 24 * time.Hour
-
 type r2RetireEvidence struct {
+	MismatchRaw                  map[int64]bool
+	MismatchPaths                map[r2RetireNASIdentity]bool
 	ObservedRaw                  map[int64]time.Time
 	ObservedPaths                map[string]time.Time
 	ForeignRaw                   map[int64]bool
@@ -23,7 +23,7 @@ type r2RetireEvidence struct {
 
 func retireIdentity(kind string, id int64) string { return fmt.Sprintf("%s:%d", kind, id) }
 func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier) (*r2RetireEvidence, error) {
-	e := &r2RetireEvidence{ObservedRaw: map[int64]time.Time{}, ObservedPaths: map[string]time.Time{}, ForeignRaw: map[int64]bool{}, Paths: map[string]bool{}, AbsentRaw: map[int64]bool{}, AbsentCollated: map[int64]bool{}, Receipts: map[string]time.Time{}}
+	e := &r2RetireEvidence{MismatchRaw: map[int64]bool{}, MismatchPaths: map[r2RetireNASIdentity]bool{}, ObservedRaw: map[int64]time.Time{}, ObservedPaths: map[string]time.Time{}, ForeignRaw: map[int64]bool{}, Paths: map[string]bool{}, AbsentRaw: map[int64]bool{}, AbsentCollated: map[int64]bool{}, Receipts: map[string]time.Time{}}
 	if err := q.QueryRow(ctx, `SELECT to_regclass('nas_listing_generations') IS NOT NULL,to_regclass('nas_cleanup_r2_effective_releases') IS NOT NULL`).Scan(&e.ListingSchema, &e.ReleaseSchema); err != nil {
 		return nil, err
 	}
@@ -141,11 +141,30 @@ func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier) (*r2RetireEvid
 	if rows.Err() != nil {
 		return nil, rows.Err()
 	}
+
+	rows, err = q.Query(ctx, `SELECT n.clip_id,n.relative_path,n.sha256,n.size_bytes FROM nas_inventory_files n WHERE n.connection_id=13 AND n.state='present' AND n.verified_at>now()-interval '24 hours' AND n.server_received_at>now()-interval '24 hours' AND EXISTS(SELECT 1 FROM nas_listing_files f JOIN nas_listing_generations g USING(connection_id,generation) WHERE f.connection_id=13 AND f.relative_path=n.relative_path AND g.started_at>=$1 AND ROW(f.size_bytes,f.mtime_ns,f.ctime_ns,f.inode,f.device) IS DISTINCT FROM ROW(n.size_bytes,n.file_mtime_ns,n.file_ctime_ns,n.file_inode,n.file_device))`, e.Start)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id int64
+		var identity r2RetireNASIdentity
+		if err := rows.Scan(&id, &identity.Path, &identity.SHA256, &identity.SizeBytes); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		e.MismatchRaw[id] = true
+		e.MismatchPaths[identity] = true
+	}
+	rows.Close()
+	if rows.Err() != nil {
+		return nil, rows.Err()
+	}
 	if e.Start.IsZero() {
 		return e, nil
 	}
 
-	rows, err = q.Query(ctx, `SELECT c.id,c.display_path,greatest(c.created_at,c.released_at,n.nas_listing_cursor_at),n.nas_listing_cursor_at IS NOT NULL AND (c.released_at IS NOT NULL OR c.id<=n.last_cursor_id) FROM recording_clips c JOIN recordings r ON r.id=c.recording_id JOIN connections n ON n.id=13 AND n.account_id=r.account_id WHERE r.account_id=47 AND c.purged_at IS NULL AND c.display_path<>''`)
+	rows, err = q.Query(ctx, `SELECT c.id,c.display_path,greatest(c.created_at,coalesce(c.released_at,n.nas_listing_cursor_at)),(c.released_at IS NOT NULL OR (n.nas_listing_cursor_at IS NOT NULL AND c.id<=n.last_cursor_id)) FROM recording_clips c JOIN recordings r ON r.id=c.recording_id JOIN connections n ON n.id=13 AND n.account_id=r.account_id WHERE r.account_id=47 AND c.purged_at IS NULL AND c.display_path<>''`)
 	if err != nil {
 		return nil, err
 	}
@@ -202,6 +221,9 @@ func (e *r2RetireEvidence) apply(c *r2RetireCandidate) {
 		return
 	}
 	presence := e.Paths[c.RelativePath] || (c.Kind == "collated" && e.Paths["joined/"+c.RelativePath])
+	if c.Kind == "raw" && e.MismatchRaw[c.SourceID] || c.Kind == "collated" && (e.MismatchPaths[r2RetireNASIdentity{c.RelativePath, c.SHA256, c.SizeBytes}] || e.MismatchPaths[r2RetireNASIdentity{"joined/" + c.RelativePath, c.SHA256, c.SizeBytes}]) {
+		c.Facts.ExactNAS = false
+	}
 	c.Facts.ListingPresence = presence
 	c.Facts.NASAbsent = !presence && ((e.AbsentRaw[c.SourceID] && c.Kind == "raw") || (e.AbsentCollated[c.SourceID] && c.Kind == "collated") || !e.Receipts[retireIdentity(c.Kind, c.SourceID)].IsZero())
 	cutoff := e.Start
@@ -229,7 +251,7 @@ func r2RetireLiveEvidence(ctx context.Context, q r2RetireQuerier, c *r2RetireCan
 	}
 	var absent, present bool
 	if e.ListingSchema {
-		watermark := `SELECT max(greatest(x.created_at,x.released_at,n.nas_listing_cursor_at)) at FROM recording_clips x JOIN recordings r ON r.id=x.recording_id JOIN connections n ON n.id=13 AND n.account_id=r.account_id WHERE x.display_path=(SELECT display_path FROM recording_clips WHERE id=$1) HAVING bool_and(n.nas_listing_cursor_at IS NOT NULL AND (x.released_at IS NOT NULL OR x.id<=n.last_cursor_id))`
+		watermark := `SELECT max(greatest(x.created_at,coalesce(x.released_at,n.nas_listing_cursor_at))) at FROM recording_clips x JOIN recordings r ON r.id=x.recording_id JOIN connections n ON n.id=13 AND n.account_id=r.account_id WHERE x.display_path=(SELECT display_path FROM recording_clips WHERE id=$1) HAVING bool_and(x.released_at IS NOT NULL OR (n.nas_listing_cursor_at IS NOT NULL AND x.id<=n.last_cursor_id))`
 		paths := []string{c.RelativePath}
 		if c.Kind == "collated" {
 			paths = append(paths, "joined/"+c.RelativePath)
@@ -238,6 +260,19 @@ func r2RetireLiveEvidence(ctx context.Context, q r2RetireQuerier, c *r2RetireCan
 		err := q.QueryRow(ctx, `WITH g AS (SELECT started_at FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL AND started_at>now()-interval '24 hours' ORDER BY started_at DESC LIMIT 1),w AS (`+watermark+`) SELECT coalesce((SELECT g.started_at>w.at FROM g,w),false),EXISTS(SELECT 1 FROM nas_listing_files f JOIN nas_listing_generations n USING(connection_id,generation) WHERE f.connection_id=13 AND f.relative_path=ANY($2) AND n.started_at>=coalesce((SELECT started_at FROM g),'-infinity'))`, c.SourceID, paths).Scan(&absent, &present)
 		if err != nil {
 			return err
+		}
+	}
+	if e.ListingSchema && present && c.Facts.ExactNAS {
+		paths := []string{c.RelativePath}
+		if c.Kind == "collated" {
+			paths = append(paths, "joined/"+c.RelativePath)
+		}
+		var mismatch bool
+		if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_inventory_files n JOIN nas_listing_files f ON f.connection_id=13 AND f.relative_path=n.relative_path JOIN nas_listing_generations g ON g.connection_id=f.connection_id AND g.generation=f.generation WHERE n.connection_id=13 AND n.state='present' AND n.relative_path=ANY($3) AND n.sha256=$4 AND n.size_bytes=$5 AND ($1='collated' OR n.clip_id=$2) AND g.started_at>=coalesce((SELECT max(started_at) FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL AND started_at>now()-interval '24 hours'),'-infinity') AND ROW(f.size_bytes,f.mtime_ns,f.ctime_ns,f.inode,f.device) IS DISTINCT FROM ROW(n.size_bytes,n.file_mtime_ns,n.file_ctime_ns,n.file_inode,n.file_device))`, c.Kind, c.SourceID, paths, c.SHA256, c.SizeBytes).Scan(&mismatch); err != nil {
+			return err
+		}
+		if mismatch {
+			c.Facts.ExactNAS = false
 		}
 	}
 	c.Facts.ListingPresence = present

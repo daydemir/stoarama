@@ -1514,7 +1514,7 @@ def listing_proof_once(cfg, stop_event):
     db = sqlite3.connect(str(filename))
     db.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
     db.execute("CREATE TABLE IF NOT EXISTS dirs(path TEXT PRIMARY KEY,identity TEXT NOT NULL)")
-    db.execute("CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,folder TEXT NOT NULL,size INTEGER,mtime_ns INTEGER,inode INTEGER,device INTEGER)")
+    db.execute("CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,folder TEXT NOT NULL,size INTEGER,mtime_ns INTEGER,inode INTEGER,device INTEGER,ctime_ns INTEGER)")
     db.execute("CREATE TABLE IF NOT EXISTS uploaded(folder TEXT PRIMARY KEY,page INTEGER NOT NULL,last_path TEXT NOT NULL)")
     db.execute("CREATE INDEX IF NOT EXISTS listing_folder_path ON files(folder,path)")
     def get(key):
@@ -1580,7 +1580,7 @@ def listing_proof_once(cfg, stop_event):
                         elif stat_module.S_ISREG(st.st_mode):
                             p = str(Path(entry.path).relative_to(cfg.output_dir))
                             folder = p.split("/", 1)[0] if "/" in p else "."
-                            db.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?)", (p, folder, st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev))
+                            db.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?)", (p, folder, st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev,st.st_ctime_ns))
                         else:
                             raise ListingChanged("non-regular entry prevents complete listing")
                 stable(directory, identity)
@@ -1601,9 +1601,9 @@ def listing_proof_once(cfg, stop_event):
             page, last_path = old if old else (0, "")
             count, total = db.execute("SELECT count(*),coalesce(sum(size),0) FROM files WHERE folder=?", (folder,)).fetchone()
             while page * 200 < count:
-                rows = db.execute("SELECT path,size,mtime_ns,inode,device FROM files WHERE folder=? AND path>? ORDER BY path LIMIT 200", (folder, last_path)).fetchall()
+                rows = db.execute("SELECT path,size,mtime_ns,inode,device,ctime_ns FROM files WHERE folder=? AND path>? ORDER BY path LIMIT 200", (folder, last_path)).fetchall()
                 post({"action": "page", "folder": folder, "page": page,
-                      "files": [dict(zip(("path", "size", "mtime_ns", "inode", "device"), row)) for row in rows]})
+                      "files": [dict(zip(("path", "size", "mtime_ns", "inode", "device", "ctime_ns"), row)) for row in rows]})
                 page += 1
                 last_path = rows[-1][0]
                 db.execute("INSERT OR REPLACE INTO uploaded VALUES(?,?,?)", (folder, page, last_path))

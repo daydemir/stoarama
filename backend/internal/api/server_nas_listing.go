@@ -26,6 +26,7 @@ const (
 type nasListingFile struct {
 	Path    string `json:"path"`
 	Size    int64  `json:"size"`
+	CtimeNS int64  `json:"ctime_ns"`
 	MtimeNS int64  `json:"mtime_ns"`
 	Inode   int64  `json:"inode"`
 	Device  int64  `json:"device"`
@@ -157,7 +158,7 @@ func storeNASListing(r *http.Request, tx pgx.Tx, cid int64, req nasListingReques
 		return errors.New("folder is complete, empty page or page gap")
 	}
 	for _, f := range req.Files {
-		if _, err := tx.Exec(ctx, `INSERT INTO nas_listing_files(connection_id,generation,folder,relative_path,size_bytes,mtime_ns,inode,device) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, cid, req.Generation, req.Folder, f.Path, f.Size, f.MtimeNS, f.Inode, f.Device); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO nas_listing_files(connection_id,generation,folder,relative_path,size_bytes,mtime_ns,inode,device,ctime_ns) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, cid, req.Generation, req.Folder, f.Path, f.Size, f.MtimeNS, f.Inode, f.Device, f.CtimeNS); err != nil {
 			return err
 		}
 		bytes += f.Size

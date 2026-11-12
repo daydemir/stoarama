@@ -21,7 +21,6 @@ type r2RetireProjection struct {
 	release                    map[string]bool
 	held                       map[string]bool
 	delivery                   map[string]bool
-	receiptAt                  map[string]time.Time
 	releaseItems, listingItems []r2RetireItem
 }
 
@@ -37,7 +36,7 @@ func loadR2RetireProjection(ctx context.Context, q r2RetireQuerier, path, digest
 	if json.Unmarshal(raw, &m) != nil || m.Tool != "r2-retire release-holds" || m.Version != 1 || m.PolicySHA != policy || m.PicksSHA != picks.SHA256 || time.Since(m.CreatedAt) > 24*time.Hour {
 		return nil, errors.New("hold release preview authority differs")
 	}
-	p := &r2RetireProjection{release: map[string]bool{}, held: map[string]bool{}, delivery: map[string]bool{}, receiptAt: map[string]time.Time{}}
+	p := &r2RetireProjection{release: map[string]bool{}, held: map[string]bool{}, delivery: map[string]bool{}}
 	itemIDs := []int64{}
 	for _, i := range m.Items {
 		p.release[retireIdentity(i.Candidate.Kind, i.Candidate.SourceID)] = true
@@ -45,7 +44,7 @@ func loadR2RetireProjection(ctx context.Context, q r2RetireQuerier, path, digest
 	}
 	// Materialize protections after exactly these proposed item releases. Never
 	// assume completion frees the rest of a plan or any incident identity.
-	rows, err := q.Query(ctx, `SELECT e.value,i.id,i.updated_at FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) WITH ORDINALITY e(value,n) LEFT JOIN nas_cleanup_items i ON i.plan_id=p.id AND i.ordinal=e.n WHERE p.mode<>'retired' OR i.delete_ever_issued OR i.id IS NULL`)
+	rows, err := q.Query(ctx, `SELECT e.value,i.id FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) WITH ORDINALITY e(value,n) LEFT JOIN nas_cleanup_items i ON i.plan_id=p.id AND i.ordinal=e.n WHERE p.mode<>'retired' OR i.delete_ever_issued OR i.id IS NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -56,8 +55,7 @@ func loadR2RetireProjection(ctx context.Context, q r2RetireQuerier, path, digest
 	for rows.Next() {
 		var raw []byte
 		var itemID *int64
-		var at *time.Time
-		if err := rows.Scan(&raw, &itemID, &at); err != nil {
+		if err := rows.Scan(&raw, &itemID); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -72,9 +70,6 @@ func loadR2RetireProjection(ctx context.Context, q r2RetireQuerier, path, digest
 		}
 		key := retireIdentity(i.Kind, i.ID)
 		if itemID != nil && proposed[*itemID] {
-			if at != nil {
-				p.receiptAt[key] = *at
-			}
 			continue
 		}
 		p.held[key] = true
@@ -85,6 +80,45 @@ func loadR2RetireProjection(ctx context.Context, q r2RetireQuerier, path, digest
 	rows.Close()
 	if rows.Err() != nil {
 		return nil, rows.Err()
+	}
+	rows, err = q.Query(ctx, `SELECT DISTINCT h.clip_id FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id WHERE (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued)) AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(p.manifest) e WHERE (e->'source_ids') @> to_jsonb(ARRAY[h.clip_id]) OR (e->>'kind'='raw' AND (e->>'source_id')::bigint=h.clip_id))`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		p.held[retireIdentity("raw", id)] = true
+	}
+	rows.Close()
+	if rows.Err() != nil {
+		return nil, rows.Err()
+	}
+	var reservations bool
+	if err := q.QueryRow(ctx, `SELECT to_regclass('r2_retirement_reservations') IS NOT NULL`).Scan(&reservations); err != nil {
+		return nil, err
+	}
+	if reservations {
+		rows, err = q.Query(ctx, `SELECT kind,source_id FROM r2_retirement_reservations`)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var kind string
+			var id int64
+			if err := rows.Scan(&kind, &id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			p.held[retireIdentity(kind, id)] = true
+		}
+		rows.Close()
+		if rows.Err() != nil {
+			return nil, rows.Err()
+		}
 	}
 	for _, id := range r2RetireIncidentSources {
 		p.held[retireIdentity("raw", id)] = true
