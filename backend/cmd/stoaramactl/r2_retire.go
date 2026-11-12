@@ -1195,11 +1195,8 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 		if json.Unmarshal(data, &preview) != nil {
 			log.Fatal("invalid preview")
 		}
-		live.CreatedAt = preview.CreatedAt
-		a, _ := json.Marshal(live)
-		b, _ := json.Marshal(preview)
-		if !bytes.Equal(a, b) {
-			log.Fatal("hold-release preview no longer matches live receipts")
+		if err := validateR2HoldReleaseItems(preview, live); err != nil {
+			log.Fatal(err)
 		}
 	}
 	sum, items, err := r2RetirePlanRun(ctx, pool, opts, policySHA, windows)

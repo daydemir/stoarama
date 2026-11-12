@@ -938,3 +938,23 @@ func TestR2RetireInvalidEvidencePathCannotAuthorize(t *testing.T) {
 		}
 	}
 }
+
+func TestR2RetirePreviewAllowsAdditionalReceiptsButRechecksEverySelectedItem(t *testing.T) {
+	item := r2HoldReleaseItem{ItemID: 1, Candidate: r2RetireItem{r2RetireCandidate: r2RetireCandidate{Kind: "raw", SourceID: 1, SizeBytes: 10}}}
+	expected := r2HoldReleaseManifest{Items: []r2HoldReleaseItem{item}, Bytes: 10}
+	extra := item
+	extra.ItemID = 2
+	extra.Candidate.SourceID = 2
+	live := r2HoldReleaseManifest{Items: []r2HoldReleaseItem{item, extra}, Bytes: 20}
+	if err := validateR2HoldReleaseItems(expected, live); err != nil {
+		t.Fatal("new background receipt invalidated reviewed set", err)
+	}
+	live.Items[0].ReceiptSHA = "changed"
+	if err := validateR2HoldReleaseItems(expected, live); err == nil {
+		t.Fatal("changed reviewed receipt accepted")
+	}
+	live.Items = live.Items[1:]
+	if err := validateR2HoldReleaseItems(expected, live); err == nil {
+		t.Fatal("missing reviewed receipt accepted")
+	}
+}

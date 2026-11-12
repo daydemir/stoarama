@@ -189,6 +189,28 @@ func r2HoldReleasePlan(ctx context.Context, q r2RetireQuerier, picks r2RetirePic
 	return m, nil
 }
 
+func validateR2HoldReleaseItems(m, live r2HoldReleaseManifest) error {
+	byID := map[int64]r2HoldReleaseItem{}
+	for _, i := range live.Items {
+		byID[i.ItemID] = i
+	}
+	seen := map[int64]bool{}
+	var total int64
+	for _, item := range m.Items {
+		want, _ := json.Marshal(item)
+		got, _ := json.Marshal(byID[item.ItemID])
+		if seen[item.ItemID] || !bytes.Equal(want, got) {
+			return fmt.Errorf("release item %d changed or is protected", item.ItemID)
+		}
+		seen[item.ItemID] = true
+		total += item.Candidate.SizeBytes
+	}
+	if total != m.Bytes {
+		return errors.New("release totals differ")
+	}
+	return nil
+}
+
 func applyR2HoldReleases(ctx context.Context, tx pgx.Tx, m r2HoldReleaseManifest, picks r2RetirePicks, policy, digest, reason string, windows map[int64]api.Keep28Window) error {
 	if m.Version != 1 || m.Tool != "r2-retire release-holds" || m.PolicySHA != policy || m.PicksSHA != picks.SHA256 || m.CreatedAt.After(time.Now().Add(time.Minute)) || time.Since(m.CreatedAt) > 24*time.Hour || strings.TrimSpace(reason) == "" {
 		return errors.New("release authority differs or expired")
@@ -215,24 +237,10 @@ func applyR2HoldReleases(ctx context.Context, tx pgx.Tx, m r2HoldReleaseManifest
 	if err != nil {
 		return err
 	}
-	byID := map[int64]r2HoldReleaseItem{}
-	for _, i := range live.Items {
-		byID[i.ItemID] = i
+	if err := validateR2HoldReleaseItems(m, live); err != nil {
+		return err
 	}
-	seen := map[int64]bool{}
-	var total int64
-	for _, item := range m.Items {
-		want, _ := json.Marshal(item)
-		got, _ := json.Marshal(byID[item.ItemID])
-		if seen[item.ItemID] || !bytes.Equal(want, got) {
-			return fmt.Errorf("release item %d changed or is protected", item.ItemID)
-		}
-		seen[item.ItemID] = true
-		total += item.Candidate.SizeBytes
-	}
-	if total != m.Bytes {
-		return errors.New("release totals differ")
-	}
+
 	// File content is also re-read inside the transaction, immediately before
 	// committing authority. A changed pick invalidates the entire operation.
 	latest, err := loadR2RetirePicks(picks.Path)
