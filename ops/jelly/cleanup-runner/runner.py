@@ -666,7 +666,25 @@ class Runner:
             self.notify('daily progress ' + today)
             self.save(self.status['phase'], last_note_day=today, daily_note={
                 'files': self.status['deleted_files'], 'bytes': self.status['deleted_bytes'],
-                'current_plan': self.status['current_plan']})
+                'current_plan': self.status['current_plan'],
+                'certified_refusals': self.status.get('certified_refusals')})
+
+    def record_refusals(self, plan):
+        rows = sorted(results(plan), key=lambda row: row['ordinal'])
+        refused = [row for row in rows if certified_refusal(row)]
+        if not refused:
+            return
+        streak = longest = 0
+        for row in rows:
+            streak = streak + 1 if certified_refusal(row) else 0
+            longest = max(longest, streak)
+        summary = {'plan_id': plan['id'], 'files': len(refused), 'plan_files': len(plan['items']),
+                   'consecutive': longest, 'ordinals': [row['ordinal'] for row in refused[:20]]}
+        if self.status.get('certified_refusals') != summary:
+            self.save(self.status.get('phase', 'monitoring'), certified_refusals=summary)
+            require(self.write_note('Certified cleanup refusals', json.dumps(summary)), 'owner refusal note write failed')
+        require(len(refused) * 100 <= len(plan['items']) and longest <= 5,
+                'certified refusals exceed 1% of plan or five consecutive files; owner review required')
 
     def add_stream_names(self, rows):
         # Cosmetic only: a failed name lookup must never block progress or alerts.
@@ -847,6 +865,7 @@ class Runner:
         self.recovery(plan)
         # Verification can race a manual pause: classify a fresh report before close.
         plan = self.plan(plan['id'])
+        self.record_refusals(plan)
         state = execution_state(plan)
         require(state in {'done', 'expired'}, 'plan paused for a non-expiry reason')
         require_certain_receipts(plan)
@@ -878,6 +897,7 @@ class Runner:
     def monitor(self, pid):
         while True:
             p = self.plan(pid)
+            self.record_refusals(p)
             state = execution_state(p)
             if state != 'running':
                 self.finish(p)

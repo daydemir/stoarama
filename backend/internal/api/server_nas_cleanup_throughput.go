@@ -729,6 +729,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 	}
 	var req struct {
 		ExecutionBatch bool                      `json:"execution_batch,omitempty"`
+		ExecutionGroup []int64                   `json:"execution_group,omitempty"`
 		ClientVersion  string                    `json:"client_version"`
 		Observations   []cleanupBatchObservation `json:"observations"`
 	}
@@ -818,27 +819,55 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 			itemIDs = append(itemIDs, o.ItemID)
 		}
 	}
-	if err = cleanupLockItems(ctx, tx, cid, itemIDs); err != nil {
+	groupIDs := itemIDs
+	serial := req.ClientVersion == nasCleanupSerialGroupClientVersion
+	if serial && req.ExecutionBatch {
+		// The full lease roster still owns the execution slot. Only the current
+		// file requests fresh authority; earlier results may await one batch ack.
+		if len(itemIDs) != 1 || len(req.Observations) != 1 || len(req.ExecutionGroup) < 1 || len(req.ExecutionGroup) > nasCleanupExecutionGroupMax {
+			cleanupObservationFailure(w, ctx, 409, "one observation and complete bounded lease roster required")
+			return
+		}
+		seen, includes := map[int64]bool{}, false
+		for _, id := range req.ExecutionGroup {
+			if id <= 0 || seen[id] {
+				cleanupObservationFailure(w, ctx, 409, "invalid cleanup lease roster")
+				return
+			}
+			seen[id] = true
+			includes = includes || id == itemIDs[0]
+		}
+		if !includes {
+			cleanupObservationFailure(w, ctx, 409, "observation outside cleanup lease roster")
+			return
+		}
+		groupIDs = req.ExecutionGroup
+	} else if len(req.ExecutionGroup) != 0 {
+		cleanupObservationFailure(w, ctx, 409, "serial group client required for lease roster")
+		return
+	}
+	if err = cleanupLockItems(ctx, tx, cid, groupIDs); err != nil {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation fence unavailable")
 		return
 	}
 	if req.ExecutionBatch {
 		// Exempt only the complete group issued by ONE lease request, with the
 		// live reviewed session. Unrelated/uncertain work always blocks it.
-		if env.session.version != nasCleanupGroupClientVersion || req.ClientVersion != nasCleanupGroupClientVersion || len(itemIDs) != len(req.Observations) || len(itemIDs) > nasCleanupExecutionGroupMax {
+		if env.session.version != req.ClientVersion || (!serial && req.ClientVersion != nasCleanupGroupClientVersion) || len(itemIDs) != len(req.Observations) || len(groupIDs) > nasCleanupExecutionGroupMax {
 			cleanupObservationFailure(w, ctx, 409, "invalid cleanup execution group")
 			return
 		}
 		var complete bool
 		err = tx.QueryRow(ctx, `SELECT count(*)=$3 AND count(DISTINCT i.plan_id)=1 AND count(DISTINCT i.lease_request_id)=1
-          AND bool_and(i.lease_request_id IS NOT NULL AND i.lease_client_boot_id=$4 AND i.lease_client_version=$5 AND i.state='leased' AND p.mode='enabled')
+          AND bool_and(i.lease_request_id IS NOT NULL AND i.lease_client_boot_id=$4 AND i.lease_client_version=$5
+            AND (i.state='leased' OR ($6 AND i.state='delete_issued')) AND p.mode='enabled')
           AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id IN (SELECT plan_id FROM nas_cleanup_items WHERE id=ANY($1)) AND busy.state IN ('leased','delete_issued') AND NOT (busy.id=ANY($1)))
-          FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2`, itemIDs, cid, len(itemIDs), env.session.boot, env.session.version).Scan(&complete)
+          FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2`, groupIDs, cid, len(groupIDs), env.session.boot, env.session.version, serial).Scan(&complete)
 		if err != nil || !complete {
 			cleanupObservationFailure(w, ctx, 409, "cleanup execution group differs or is incomplete")
 			return
 		}
-		env.executionGroup = itemIDs
+		env.executionGroup = groupIDs
 	}
 	env.scopeLocked = true
 	var anyEnabled bool

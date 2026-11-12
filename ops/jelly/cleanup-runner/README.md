@@ -10,6 +10,13 @@ Owner approval (Deniz, 2026-11-11), verbatim conditions:
 
 > delete everything on the NAS outside each stream's pinned keep28 period (raw clips and old stitched files), without asking per batch, provided every batch passes: (1) the server's dry run AND an independent check that every file is outside its stream's kept period; (2) a verified R2 copy for every file (R2 copies stay); (3) no protected or uncertain files; (4) the 5 TB/day cap, one plan at a time; deletion master switch OFF between batches; fixes deployed only between batches (never pause an enabled plan to deploy); a short daily progress note; any failed check stops the run and goes to the owner.
 
+Certified non-unlink refusals remain visible in `certified_refusals` status,
+progress and owner notes. The runner stops through its existing master-OFF,
+STOP and owner-alert path when refusals exceed 1% of a plan's item count or five
+consecutive ordinals. It evaluates the full report on every execution poll and
+again before closing a plan; restarting cannot reset either bound. Uncertain
+receipts still stop immediately.
+
 The runner:
 
 - Takes an exclusive local lock. On startup, first reads active execution.

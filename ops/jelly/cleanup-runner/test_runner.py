@@ -41,6 +41,14 @@ def refused(row):
         'refusal_protocol': 1, 'refusal_reason': 'local_guard'})
 
 
+def plan_with_refusals(plan, total, ordinals):
+    item, row = plan['items'][0], plan['results'][0]
+    plan['items'] = [dict(item, source_id=n) for n in range(1, total+1)]
+    plan['results'] = [dict(copy.deepcopy(row), ordinal=n, state='deleted', delete_ever_issued=True, outcome={})
+                       for n in range(1, total+1)]
+    for n in ordinals: refused(plan['results'][n-1])
+
+
 class DecisionTests(unittest.TestCase):
     def test_budget_boundaries_and_invalid_values(self):
         self.assertTrue(r.budget_permits(r.DAY_CAP - r.PLAN_CAP, r.PLAN_CAP))
@@ -370,12 +378,12 @@ class LoopTests(unittest.TestCase):
             with self.subTest(expiry=expiry), tempfile.TemporaryDirectory() as root:
                 job = FakeRunner(root)
                 job.status['current_plan'] = 42
-                refused(job.p['results'][0])
+                plan_with_refusals(job.p, 100, [1])
                 job.p.update(mode='paused', approval_reason='completed: all items deleted or kept')
                 if expiry:
                     job.p['approval_reason'] = 'auto-paused: approval expired; prior approval'
                     job.p['items'].append(dict(job.p['items'][0], source_id=2))
-                    job.p['results'].append(dict(ordinal=2, state='pending', delete_ever_issued=False))
+                    job.p['results'].append(dict(ordinal=101, state='pending', delete_ever_issued=False))
                 before = copy.deepcopy(job.p['results'])
                 job.finish(job.p)
                 self.assertEqual(job.events, ['OFF', 'recovery', 'plans/42/close'])
@@ -419,11 +427,63 @@ class LoopTests(unittest.TestCase):
                 self.assertIn('notify', job.events)
                 self.assertEqual(job.picks, [42, None])
 
+    def test_refusals_are_noted_once_and_visible_in_progress(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            plan_with_refusals(job.p, 100, [1])
+            job.record_refusals(job.p)
+            job.record_refusals(job.p)
+            summary = job.status['certified_refusals']
+            self.assertEqual(summary['files'], 1)
+            self.assertEqual(summary['plan_files'], 100)
+            notes = (Path(root)/'notes.jsonl').read_text().splitlines()
+            self.assertEqual(len(notes), 1)
+            self.assertEqual(json.loads(json.loads(notes[0])['text']), summary)
+
+    def test_refusal_percentage_and_streak_stop_before_close(self):
+        for total, ordinals in [(100, [1, 3]), (1000, list(range(1, 7))), (1, [1])]:
+            with self.subTest(total=total, ordinals=ordinals), tempfile.TemporaryDirectory() as root:
+                job = FakeRunner(root)
+                job.status['current_plan'] = 42
+                plan_with_refusals(job.p, total, ordinals)
+                job.p.update(mode='enabled', master_deletion_enabled=True)
+                monitor = r.Runner.monitor
+                job.run = lambda: monitor(job, 42)
+                with patch.object(r, 'Runner', return_value=job), patch.object(r.sys, 'argv', ['runner']), \
+                        patch.object(r.signal, 'signal'):
+                    self.assertEqual(r.main(), 1)
+                self.assertEqual(job.status['phase'], 'failed')
+                self.assertIn('owner review', job.status['last_error'])
+                self.assertTrue((Path(root)/'STOP').exists())
+                self.assertEqual(job.events[0], 'OFF')
+                self.assertIn('notify', job.events)
+                self.assertNotIn('plans/42/close', job.events)
+                self.assertTrue((Path(root)/'notes.jsonl').exists())
+
+    def test_five_consecutive_refusals_at_one_percent_are_within_bound(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            plan_with_refusals(job.p, 500, list(range(1, 6)))
+            job.record_refusals(job.p)
+            self.assertEqual(job.status['certified_refusals']['consecutive'], 5)
+
+    def test_refusal_bounds_cannot_reset_on_restart_or_block_plan_finish_bypass(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            plan_with_refusals(job.p, 100, [1, 2])
+            job.p.update(mode='paused', approval_reason='completed: all items deleted or kept')
+            # New process/status still derives the full count from durable receipts.
+            self.assertNotIn('certified_refusals', job.status)
+            with self.assertRaisesRegex(r.Halt, 'owner review'):
+                job.finish(job.p)
+            self.assertEqual(job.status['certified_refusals']['files'], 2)
+            self.assertNotIn('plans/42/close', job.events)
+
     def test_close_409_latches_owner_stop_with_current_plan(self):
         with tempfile.TemporaryDirectory() as root:
             job = FakeRunner(root)
             job.status.update(current_plan=42, started_plan_sha256='b'*64)
-            refused(job.p['results'][0])
+            plan_with_refusals(job.p, 100, [1])
             job.p.update(mode='paused', approval_reason='completed: all items deleted or kept')
             job.api = lambda method, path, body: r.request('https://invalid/' + path, 'fixture', method, body)
             job.run = lambda: job.finish(copy.deepcopy(job.p))
@@ -458,7 +518,7 @@ class LoopTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             job = FakeRunner(root)
             job.p['mode'] = 'enabled'
-            refused(job.p['results'][0])
+            plan_with_refusals(job.p, 100, [1])
             job.finish(job.p)
             self.assertEqual(job.events, ['OFF', 'recovery', 'plans/42/control', 'plans/42/close'])
 
