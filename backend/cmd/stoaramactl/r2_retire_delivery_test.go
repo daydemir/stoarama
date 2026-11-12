@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"github.com/daydemir/stoarama/backend/internal/api"
 	"os"
 	"path/filepath"
@@ -79,5 +80,17 @@ func TestR2RetireDeliveryPreviewExactIdentity(t *testing.T) {
 	// Malformed digests never produce preview authority.
 	if err := r2RetireDeliveryPreview(path, strings.Repeat("0", 64), snapshot); err == nil {
 		t.Fatal("bad checksum accepted")
+	}
+}
+
+func TestR2RetireDeliveryClassCannotReleaseHolds(t *testing.T) {
+	ctx := context.Background()
+	picks := r2RetirePicks{SHA256: r2tSHA}
+	if _, err := r2HoldReleasePlan(ctx, nil, picks, r2tPolicy, nil, r2RetireDeliveryOnly); err == nil {
+		t.Fatal("planning-only class created hold-release authority")
+	}
+	m := r2HoldReleaseManifest{Class: r2RetireDeliveryOnly, Version: 1, Tool: "r2-retire release-holds", PolicySHA: r2tPolicy, PicksSHA: r2tSHA, CreatedAt: time.Now().UTC()}
+	if err := applyR2HoldReleases(ctx, nil, m, picks, r2tPolicy, r2tSHA, "reviewed", nil); err == nil {
+		t.Fatal("planning-only class applied hold releases")
 	}
 }

@@ -140,3 +140,6 @@ func r2RetireRequireWholeListing(path string) error {
 	}
 	return nil
 }
+
+// A planning-only class cannot inherit hold-release authority.
+func (c r2RetireClass) releaseValid() bool { return c == "" || c == r2RetireOwnerAccepted }

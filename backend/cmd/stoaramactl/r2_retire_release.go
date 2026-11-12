@@ -68,7 +68,7 @@ func r2HoldReleasePlan(ctx context.Context, q r2RetireQuerier, picks r2RetirePic
 	if len(classes) > 0 {
 		m.Class = classes[0]
 	}
-	if !m.Class.valid() {
+	if !m.Class.releaseValid() {
 		return m, errors.New("unknown release class")
 	}
 	receiptsSQL := r2ReleaseReceiptsSQL
@@ -249,7 +249,7 @@ func validateR2HoldReleaseItems(m, live r2HoldReleaseManifest) error {
 }
 
 func applyR2HoldReleases(ctx context.Context, tx pgx.Tx, m r2HoldReleaseManifest, picks r2RetirePicks, policy, digest, reason string, windows map[int64]api.Keep28Window) error {
-	if !m.Class.valid() || m.Version != 1 || m.Tool != "r2-retire release-holds" || m.PolicySHA != policy || m.PicksSHA != picks.SHA256 || m.CreatedAt.After(time.Now().Add(time.Minute)) || time.Since(m.CreatedAt) > 24*time.Hour || strings.TrimSpace(reason) == "" {
+	if !m.Class.releaseValid() || m.Version != 1 || m.Tool != "r2-retire release-holds" || m.PolicySHA != policy || m.PicksSHA != picks.SHA256 || m.CreatedAt.After(time.Now().Add(time.Minute)) || time.Since(m.CreatedAt) > 24*time.Hour || strings.TrimSpace(reason) == "" {
 		return errors.New("release authority differs or expired")
 	}
 	if m.Class == r2RetireOwnerAccepted {
