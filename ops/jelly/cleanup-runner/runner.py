@@ -820,6 +820,8 @@ class Runner:
             if state != 'running':
                 self.finish(p)
                 return
+            # A running plan we own must still see the master ON; anything else is a mismatch.
+            require(p.get('master_deletion_enabled') is True, 'master switch mismatch during execution')
             active = self.active()
             require(active['plans'] == [pid] and active['batches'] == 0, 'concurrent cleanup execution')
             require(self.live()['commit']['id'] == self.status['live_commit'], 'live commit changed during execution')

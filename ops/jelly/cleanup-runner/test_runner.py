@@ -262,6 +262,7 @@ class LoopTests(unittest.TestCase):
             job.stopping = True
             job.status.update(current_plan=42, live_commit='d'*40)
             job.p['mode'] = 'enabled'
+            job.p['master_deletion_enabled'] = True
             job.active = lambda: {'plans': [42], 'batches': 0}
             job.live = lambda: {'commit': {'id': 'd'*40}}
             def complete(_):
@@ -1067,6 +1068,20 @@ class ReadRetryTests(unittest.TestCase):
             sleep.assert_called_once_with(5)
             finish.assert_not_called()
             progress.assert_not_called()
+
+    def test_monitor_latches_when_running_plan_reports_master_off(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = self.job(root)
+            plan,_ = fixture()
+            plan.update(mode='enabled', master_deletion_enabled=False)
+            job.status.update(live_commit='d'*40)
+            with patch.dict(os.environ,SERVICE_TOKEN='fake-test-token'), \
+                    patch.object(r,'request',return_value=plan), \
+                    patch.object(job,'active',return_value={'plans':[42],'batches':0}), \
+                    patch.object(job,'finish') as finish, patch.object(job,'progress') as progress, \
+                    patch.object(r.time,'sleep') as sleep:
+                with self.assertRaisesRegex(r.Halt,'master switch mismatch'): job.monitor(42)
+            finish.assert_not_called(); progress.assert_not_called(); sleep.assert_not_called()
 
     def test_monitor_retries_active_and_progress_queries_then_finishes_without_latching(self):
         with tempfile.TemporaryDirectory() as root:
