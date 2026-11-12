@@ -906,6 +906,20 @@ func TestRecordingUploadIntentReplaysPendingAndConsumedSegment(t *testing.T) {
 	pool, cleanup := testRecordingLeasePool(t)
 	defer cleanup()
 
+	// This reduced recorder fixture needs the real wire-admission schema; the
+	// full migration/queue triggers are exercised by the retirement regressions.
+	migration, err := os.ReadFile("../../../infra/sql/migrations/0187_r2_writer_admission_fence.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission, _, ok := strings.Cut(string(migration), "-- SQL admissions")
+	if !ok {
+		t.Fatal("wire-admission migration boundary missing")
+	}
+	if _, err := pool.Exec(context.Background(), admission); err != nil {
+		t.Fatal(err)
+	}
+
 	secrets, err := secretbox.NewFromBase64Key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {
 		t.Fatal(err)
