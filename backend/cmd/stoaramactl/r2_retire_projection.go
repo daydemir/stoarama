@@ -88,7 +88,18 @@ func loadR2RetireProjection(ctx context.Context, q r2RetireQuerier, path, digest
 	if rows.Err() != nil {
 		return nil, rows.Err()
 	}
-	rows, err = q.Query(ctx, `SELECT DISTINCT h.clip_id FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id WHERE (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND (i.delete_ever_issued OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed')))) AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(p.manifest) e WHERE (e->'source_ids') @> to_jsonb(ARRAY[h.clip_id]) OR (e->>'kind'='raw' AND (e->>'source_id')::bigint=h.clip_id))`)
+	rows, err = q.Query(ctx, `WITH items AS MATERIALIZED (
+ SELECT p.id plan_id,e->>'kind' kind,e->>'source_id' source_id,
+ coalesce(nullif(e->'source_ids','null'::jsonb),'[]'::jsonb) sources
+ FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) e
+), membership AS MATERIALIZED (
+ SELECT plan_id,source_id::bigint clip_id FROM items WHERE kind='raw'
+ UNION SELECT plan_id,(source.value)::bigint FROM items CROSS JOIN LATERAL jsonb_array_elements_text(sources) source
+)
+SELECT DISTINCT h.clip_id FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id
+LEFT JOIN membership m ON m.plan_id=h.plan_id AND m.clip_id=h.clip_id
+WHERE m.clip_id IS NULL AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id
+ AND (i.delete_ever_issued OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed'))))`)
 	if err != nil {
 		return nil, err
 	}
