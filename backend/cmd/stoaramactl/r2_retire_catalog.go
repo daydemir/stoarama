@@ -67,6 +67,8 @@ SELECT o.id, h.recording_id, coalesce(r.stream_id,0), $3::text, coalesce(o.objec
   false,
   {RETIRED},
   (EXISTS(SELECT 1 FROM recording_collation_output_acks a WHERE a.output_id=o.id)
+   OR EXISTS(SELECT 1 FROM nas_inventory_files n WHERE n.connection_id=$2
+     AND n.relative_path IN (o.nas_relative_path, 'joined/'||o.nas_relative_path) AND n.state<>'missing')
    OR EXISTS(SELECT 1 FROM nas_inventory_unmatched_files u WHERE u.connection_id=$2
      AND u.relative_path IN (o.nas_relative_path, 'joined/'||o.nas_relative_path) AND u.state<>'missing')),
   false,

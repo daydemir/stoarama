@@ -16,7 +16,8 @@ import (
 
 // r2-retire selection: pure decision logic, shared by plan and apply.
 //
-// Legacy selection and phase 1 retire outside-window objects absent from NAS.
+// Outside-window retirement is blocked until positive NAS absence evidence
+// can be admitted without overriding cleanup recovery holds.
 // NAS-backed plans additionally admit kept-window "none" objects with fresh,
 // exact present inventory. Cleanup holds, references and unknowns always veto.
 
@@ -302,7 +303,7 @@ func r2RetireDecideMode(c r2RetireCandidate, bucket string, windows map[int64]ap
 				if c.Facts.NASCopy || c.Facts.ExactNAS {
 					return "after_nas_cleanup", choice, false
 				}
-				return r2RetireReason, choice, true
+				return "nas_absence_unproven", choice, false
 			}
 			if choice != "none" {
 				return "inside_keep_window", choice, false
@@ -318,11 +319,11 @@ func r2RetireDecideMode(c r2RetireCandidate, bucket string, windows map[int64]ap
 			}
 			return "copy_to_nas", choice, false
 		}
-		// Per the owner's picks page, none/st/keep all drop everything outside
-		// the kept period; they differ only inside it (none: nothing, st:
-		// stitched only, keep: raw + stitched). Phase 1 only touches footage
-		// outside the period, so the three are equivalent here.
-		return r2RetireReason, choice, true
+		// No-history and state=missing rows are not positive absence proofs.
+		// This also revokes pre-fix legacy manifests at apply time. Accepted
+		// cleanup deletion receipts remain protected by permanent recovery
+		// holds; releasing those holds requires separate reviewed tooling.
+		return "nas_absence_unproven", choice, false
 	}
 	return "invalid_pick", "", false
 }

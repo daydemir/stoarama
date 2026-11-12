@@ -678,7 +678,7 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 	if a.scope.NASBacked {
 		a.fp = ""
 	} // First item reloads sets under the cleanup fences.
-	if err := pool.QueryRow(ctx, `SELECT coalesce(sum(size_bytes),0) FROM r2_object_retirements WHERE retired_at>now()-interval '24 hours'`).Scan(&sum.Used24hBefore); err != nil {
+	if err := r2RetireUsedBudget(ctx, pool, &sum.Used24hBefore); err != nil {
 		return sum, err
 	}
 	done := map[string]bool{}
@@ -766,6 +766,23 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 		}
 	}
 	return sum, nil
+}
+
+// Charge all unresolved intents indefinitely: a successful DELETE followed by
+// a failed DB commit must not free budget on restart or in a different manifest.
+// Resolved reservations are charged only by their receipt's retirement time.
+func r2RetireUsedBudget(ctx context.Context, q r2RetireQuerier, used *int64) error {
+	var hasReservations bool
+	if err := q.QueryRow(ctx, `SELECT to_regclass('r2_retirement_reservations') IS NOT NULL`).Scan(&hasReservations); err != nil {
+		return err
+	}
+	sql := `SELECT coalesce(sum(size_bytes),0) FROM r2_object_retirements WHERE retired_at>now()-interval '24 hours'`
+	if hasReservations {
+		sql = `SELECT (` + sql + `) + coalesce((SELECT sum(x.size_bytes) FROM r2_retirement_reservations x
+ WHERE NOT EXISTS(SELECT 1 FROM r2_object_retirements r
+   WHERE (r.kind=x.kind AND r.source_id=x.source_id) OR (r.bucket=x.bucket AND r.object_key=x.object_key))),0)`
+	}
+	return q.QueryRow(ctx, sql).Scan(used)
 }
 
 // applyOne re-validates and retires exactly one object. Returned outcomes:
@@ -992,7 +1009,9 @@ func r2RetireNASCopyNow(ctx context.Context, q r2RetireQuerier, kind string, id,
 FROM recording_clips c WHERE c.id=$1`
 	if kind == "collated" {
 		sql = `SELECT EXISTS(SELECT 1 FROM recording_collation_output_acks a WHERE a.output_id=o.id)
-  OR EXISTS(SELECT 1 FROM nas_inventory_unmatched_files u WHERE u.connection_id=$2
+  OR EXISTS(SELECT 1 FROM nas_inventory_files n WHERE n.connection_id=$2
+     AND n.relative_path IN (o.nas_relative_path, 'joined/'||o.nas_relative_path) AND n.state<>'missing')
+   OR EXISTS(SELECT 1 FROM nas_inventory_unmatched_files u WHERE u.connection_id=$2
     AND u.relative_path IN (o.nas_relative_path, 'joined/'||o.nas_relative_path) AND u.state<>'missing')
 FROM recording_collation_outputs o WHERE o.id=$1`
 	}
