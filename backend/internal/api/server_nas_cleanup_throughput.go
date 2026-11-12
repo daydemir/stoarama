@@ -923,8 +923,8 @@ func (s *Server) cleanupPrefetchRecovery(ctx context.Context, cid int64, md5s ma
 }
 
 // handleAccountNASCleanupResultBatch records up to 64 deletion receipts with
-// exactly the single-receipt rules (idempotent replays; anything but a clean
-// deletion pauses the plan and its batch).
+// exactly the single-receipt rules (idempotent replays; uncertainty pauses
+// the plan and its batch; certified refusals keep their reservations).
 func (s *Server) handleAccountNASCleanupResultBatch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ClientVersion string           `json:"client_version"`
@@ -935,7 +935,7 @@ func (s *Server) handleAccountNASCleanupResultBatch(w http.ResponseWriter, r *ht
 		return
 	}
 	for _, receipt := range req.Receipts {
-		if receipt.ItemID <= 0 || !validCleanupReceipt(receipt) {
+		if receipt.ItemID <= 0 || !validCleanupReceiptEvidence(receipt) {
 			cleanupBatchError(w, 400, "invalid cleanup deletion receipt")
 			return
 		}
@@ -961,6 +961,12 @@ func (s *Server) handleAccountNASCleanupResultBatch(w http.ResponseWriter, r *ht
 		if prior, ok := firstReceipt[id]; ok && string(prior) != string(payload) {
 			// Two different receipts for one deletion: never first-wins. The
 			// copy gets 409 and the item's enabled plan (and batch) is paused.
+			// Apply bound evidence first so an accepted refusal becomes uncertain.
+			_, evidencePaused, _, err := cleanupApplyReceipt(ctx, tx, cid, id, receipt)
+			if err != nil {
+				cleanupBatchError(w, 500, "cleanup receipt save failed")
+				return
+			}
 			reason := "item " + strconv.FormatInt(id, 10) + " conflicting duplicate deletion receipts"
 			var pausedPlans int
 			if err := tx.QueryRow(ctx, `WITH pz AS (UPDATE nas_cleanup_plans SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND id=(SELECT i.plan_id FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$3) RETURNING id),
@@ -969,7 +975,7 @@ SELECT (SELECT count(*) FROM pz)::int`, id, reason, cid).Scan(&pausedPlans); err
 				cleanupBatchError(w, 500, "cleanup receipt save failed")
 				return
 			}
-			results = append(results, map[string]any{"item_id": id, "status": 409, "error": "conflicting duplicate receipt for this item in one request", "plan_paused": pausedPlans > 0})
+			results = append(results, map[string]any{"item_id": id, "status": 409, "error": "conflicting duplicate receipt for this item in one request", "plan_paused": evidencePaused || pausedPlans > 0})
 			continue
 		} else if !ok {
 			firstReceipt[id] = payload
@@ -979,11 +985,15 @@ SELECT (SELECT count(*) FROM pz)::int`, id, reason, cid).Scan(&pausedPlans); err
 			cleanupBatchError(w, 500, "cleanup receipt save failed")
 			return
 		}
-		if updated != 1 {
-			results = append(results, map[string]any{"item_id": id, "status": 409, "error": "cleanup receipt differs or task is not deletion-issued"})
+		if !validCleanupReceipt(receipt) {
+			results = append(results, map[string]any{"item_id": id, "status": 400, "error": "invalid cleanup deletion receipt", "plan_paused": paused})
 			continue
 		}
-		if receipt.Outcome == "deleted" {
+		if updated != 1 {
+			results = append(results, map[string]any{"item_id": id, "status": 409, "error": "cleanup receipt differs or task is not deletion-issued", "plan_paused": paused})
+			continue
+		}
+		if state := cleanupReceiptState(receipt); state == "deleted" || state == "keep" {
 			advance[planID] = true
 		}
 		ack := cleanupReceiptAck(id, receipt, paused)
@@ -1001,7 +1011,7 @@ SELECT (SELECT count(*) FROM pz)::int`, id, reason, cid).Scan(&pausedPlans); err
 	util.WriteJSON(w, 200, map[string]any{"results": results})
 }
 
-// cleanupAdvanceBatchAfter advances an enabled batch when a clean deletion
+// cleanupAdvanceBatchAfter advances an enabled batch when a terminal
 // receipt may have completed its current plan. Errors only delay advance.
 func (s *Server) cleanupAdvanceBatchAfter(ctx context.Context, planID int64) {
 	if planID <= 0 || s.pool == nil {
@@ -1009,11 +1019,11 @@ func (s *Server) cleanupAdvanceBatchAfter(ctx context.Context, planID int64) {
 	}
 	var remaining int
 	var inBatch bool
-	if err := s.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM nas_cleanup_items WHERE plan_id=$1 AND state<>'deleted'),EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled' AND $1=ANY(plan_ids))`, planID).Scan(&remaining, &inBatch); err != nil || remaining != 0 {
+	if err := s.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM nas_cleanup_items WHERE plan_id=$1 AND state NOT IN ('deleted','keep')),EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled' AND $1=ANY(plan_ids))`, planID).Scan(&remaining, &inBatch); err != nil || remaining != 0 {
 		return
 	}
 	if !inBatch {
-		if _, err := s.pool.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason='completed: all items deleted' WHERE id=$1 AND mode='enabled' AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=$1 AND state<>'deleted')`, planID); err != nil {
+		if _, err := s.pool.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason='completed: all items deleted or kept' WHERE id=$1 AND mode='enabled' AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=$1 AND state NOT IN ('deleted','keep'))`, planID); err != nil {
 			log.Printf("nas cleanup completion deferred: %v", err)
 		}
 		return
@@ -1042,7 +1052,7 @@ const cleanupBatchAutoPauseSQL = `UPDATE nas_cleanup_batches SET mode='paused',a
 
 // cleanupAdvanceBatch moves the enabled batch forward by at most one plan.
 // Under the public cleanup fence it walks the batch in order:
-//   - a plan whose items are all 'deleted' is complete (an enabled one is
+//   - a plan whose items are all 'deleted' or 'keep' is complete (an enabled one is
 //     closed as paused with reason "batch-completed", keeping its holds);
 //   - the first plan that is not complete is the current plan. If it is
 //     enabled, nothing happens. If it is in dry_run with no issued deletion,
@@ -1087,16 +1097,16 @@ func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
 	current := int64(0)
 	for n, id := range ids {
 		var mode, sha, binding string
-		var total, notDeleted int
+		var total, remaining int
 		var issued bool
-		err = tx.QueryRow(ctx, `SELECT mode,plan_sha256,report_sha256,(SELECT count(*) FROM nas_cleanup_items WHERE plan_id=p.id),(SELECT count(*) FROM nas_cleanup_items WHERE plan_id=p.id AND state<>'deleted'),EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=p.id AND delete_ever_issued) FROM nas_cleanup_plans p WHERE id=$1 AND account_id=47 AND connection_id=13 FOR UPDATE`, id).Scan(&mode, &sha, &binding, &total, &notDeleted, &issued)
+		err = tx.QueryRow(ctx, `SELECT mode,plan_sha256,report_sha256,(SELECT count(*) FROM nas_cleanup_items WHERE plan_id=p.id),(SELECT count(*) FROM nas_cleanup_items WHERE plan_id=p.id AND state NOT IN ('deleted','keep')),EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=p.id AND delete_ever_issued) FROM nas_cleanup_plans p WHERE id=$1 AND account_id=47 AND connection_id=13 FOR UPDATE`, id).Scan(&mode, &sha, &binding, &total, &remaining, &issued)
 		if err != nil {
 			return pause("plan " + strconv.FormatInt(id, 10) + " unavailable")
 		}
 		if sha != shas[n] || binding != cleanupPolicySHA {
 			return pause("plan " + strconv.FormatInt(id, 10) + " identity or policy differs from the approved batch")
 		}
-		if total > 0 && notDeleted == 0 {
+		if total > 0 && remaining == 0 {
 			if mode == "enabled" {
 				if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason=left('batch-completed: batch '||$2::text||' plan finished cleanly',500) WHERE id=$1`, id, strconv.FormatInt(batchID, 10)); err != nil {
 					return err

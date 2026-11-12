@@ -139,20 +139,32 @@ def verify(plan, catalog, windows, now):
     return size
 
 
+def certified_refusal(row):
+    receipt = row.get('outcome')
+    return (row['state'] == 'keep' and row['delete_ever_issued']
+            and isinstance(receipt, dict) and receipt.get('outcome') == 'unverified'
+            and receipt.get('refusal_protocol') == 1 and receipt.get('unlink_attempted') is False
+            and receipt.get('refusal_reason') in {'deadline_exceeded', 'proof_mismatch', 'permit_expired',
+                                                 'execution_disabled', 'local_guard', 'pre_unlink_failure'})
+
+
 def execution_state(plan):
     rows = results(plan)
     reason = plan['approval_reason']
     expired = (reason.startswith('auto-paused: approval expired; ')
                or reason == 'auto-paused: execution lease expired without a report')
-    if all(r['state'] == 'deleted' and r['delete_ever_issued'] for r in rows):
+    if all((r['state'] == 'deleted' and r['delete_ever_issued']) or certified_refusal(r) for r in rows):
         require(plan['mode'] in {'enabled', 'paused'}, 'unexpected completed plan mode')
-        if plan['mode'] == 'paused' and not (expired or reason == 'completed: all items deleted'):
+        if plan['mode'] == 'paused' and not (expired or reason in {
+                'completed: all items deleted', 'completed: all items deleted or kept'}
+                or reason.startswith('batch-completed: ')):
             return 'anomaly'
         return 'done'
     if plan['mode'] == 'paused':
         return 'expired' if expired else 'anomaly'
     require(plan['mode'] == 'enabled', 'execution left enabled mode unexpectedly')
-    require(all(r['state'] in {'pending', 'leased', 'would_delete', 'delete_issued', 'deleted'} for r in rows),
+    require(all(r['state'] in {'pending', 'leased', 'would_delete', 'delete_issued', 'deleted'}
+                or certified_refusal(r) for r in rows),
             'execution contains an anomalous item')
     return 'running'
 
@@ -807,11 +819,20 @@ class Runner:
         plan = self.plan(plan['id'])
         state = execution_state(plan)
         require(state in {'done', 'expired'}, 'plan paused for a non-expiry reason')
-        require(not any(r['state'] in {'delete_issued', 'unverified', 'media_deleted_sidecar_failed', 'conflict', 'missing', 'keep'}
+        require(not any(r['state'] in {'delete_issued', 'unverified', 'media_deleted_sidecar_failed', 'conflict', 'missing'}
+                        or (r['state'] == 'keep' and not certified_refusal(r))
                         for r in results(plan)), 'uncertain execution receipt requires owner')
-        if state == 'expired' and any(not r['delete_ever_issued'] for r in results(plan)):
+        if state == 'done' or any(not r['delete_ever_issued'] for r in results(plan)):
+            if plan['mode'] == 'enabled':
+                self.api('POST', 'plans/' + str(plan['id']) + '/control', {
+                    'plan_sha256': plan['plan_sha256'], 'mode': 'paused',
+                    'reason': 'completed: all items deleted or kept'})
+                plan = self.plan(plan['id'])
+                require(plan['mode'] == 'paused' and execution_state(plan) == 'done',
+                        'completion pause was not confirmed')
             closed = self.api('POST', 'plans/' + str(plan['id']) + '/close', {
-                'expected_plan_sha256': plan['plan_sha256'], 'reason': 'Standing approval: expiry; retain issued R2 holds and replan never-issued remainder.'})
+                'expected_plan_sha256': plan['plan_sha256'], 'reason': 'Standing approval: ' + state +
+                '; retain issued R2 holds and replan never-issued remainder.'})
             require(closed['mode'] == 'retired', 'close was not confirmed')
         self.save('batch_complete', current_plan=None, started_plan_sha256=None)
         self.progress()

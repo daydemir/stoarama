@@ -1318,6 +1318,18 @@ type cleanupReceipt struct {
 // media_deleted_sidecar_failed is the honest receipt for a media unlink whose
 // sidecar step then failed (clients from 2026-11 on).
 func validCleanupReceipt(req cleanupReceipt) bool {
+	if !validCleanupReceiptEvidence(req) {
+		return false
+	}
+	if req.RefusalReason != "" && (req.Outcome != "unverified" || req.UnlinkAttempted == nil || *req.UnlinkAttempted) {
+		return false
+	}
+	return req.UnlinkAttempted == nil || *req.UnlinkAttempted || req.Outcome == "unverified"
+}
+
+// Even an internally contradictory claim is evidence against an earlier
+// certified refusal when its item/attempt/plan/proof binding matches.
+func validCleanupReceiptEvidence(req cleanupReceipt) bool {
 	if req.RefusalProtocol != 0 && (req.RefusalProtocol != nasCleanupRefusalProtocol || req.RefusalReason == "") {
 		return false
 	}
@@ -1342,12 +1354,6 @@ func validCleanupReceipt(req cleanupReceipt) bool {
 	default:
 		return false
 	}
-	if req.RefusalReason != "" && (req.Outcome != "unverified" || req.UnlinkAttempted == nil || *req.UnlinkAttempted) {
-		return false
-	}
-	if req.UnlinkAttempted != nil && !*req.UnlinkAttempted && req.Outcome != "unverified" {
-		return false
-	}
 	return req.Attempt >= 1 && len(req.PlanSHA) == 64 && len(req.ProofSHA) == 64 && (req.Outcome == "deleted" || req.Outcome == "unverified" || req.Outcome == "media_deleted_sidecar_failed") && len(req.Error) <= 500
 }
 
@@ -1367,6 +1373,8 @@ func cleanupReceiptState(req cleanupReceipt) string {
 
 // cleanupApplyReceipt records one deletion receipt. Genuine uncertainty pauses
 // the plan and batch atomically. An identical receipt replay is idempotent.
+// Contradicting a certified refusal permanently restores uncertainty, retaining
+// both receipts. Rejection of the new claim does not discard its evidence.
 func cleanupApplyReceipt(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, cid, id int64, req cleanupReceipt) (updated int, paused bool, planID int64, err error) {
@@ -1374,10 +1382,18 @@ func cleanupApplyReceipt(ctx context.Context, q interface {
 	body, _ := json.Marshal(req)
 	var pausedPlans int
 	var plan *int64
-	err = q.QueryRow(ctx, `WITH u AS (UPDATE nas_cleanup_items i SET state=$6,outcome=$7::jsonb,updated_at=now() FROM nas_cleanup_plans p WHERE i.id=$1 AND p.id=i.plan_id AND p.connection_id=$2 AND p.plan_sha256=$3 AND i.attempt=$4 AND i.proof_sha256=$5 AND (i.state='delete_issued' OR (i.state=$6 AND i.outcome=$7::jsonb)) RETURNING i.plan_id),
-pz AS (UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$8::text,500) WHERE id IN (SELECT plan_id FROM u) AND mode='enabled' AND $6 NOT IN ('deleted','keep') RETURNING id),
-bz AS (UPDATE nas_cleanup_batches SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$8::text,500) WHERE mode='enabled' AND $6 NOT IN ('deleted','keep') AND plan_ids && ARRAY(SELECT plan_id FROM u) RETURNING id)
-SELECT (SELECT count(*) FROM u)::int, (SELECT count(*) FROM pz)::int+(SELECT count(*) FROM bz)::int, (SELECT min(plan_id) FROM u)`, id, cid, req.PlanSHA, req.Attempt, req.ProofSHA, cleanupReceiptState(req), string(body), "item "+strconv.FormatInt(id, 10)+" deletion receipt "+req.Outcome).Scan(&updated, &pausedPlans, &plan)
+	err = q.QueryRow(ctx, `WITH u AS (UPDATE nas_cleanup_items i SET
+ state=CASE WHEN i.state='keep' AND i.outcome<>$7::jsonb THEN 'unverified' ELSE $6 END,
+ outcome=CASE WHEN i.state='keep' AND i.outcome<>$7::jsonb THEN jsonb_build_object('certified_refusal',i.outcome,'contradictory_receipt',$7::jsonb) ELSE $7::jsonb END,updated_at=now()
+ FROM nas_cleanup_plans p WHERE i.id=$1 AND p.id=i.plan_id AND p.connection_id=$2 AND p.plan_sha256=$3 AND i.attempt=$4 AND i.proof_sha256=$5
+ AND ($9::boolean AND (i.state='delete_issued' OR (i.state=$6 AND i.outcome=$7::jsonb)) OR (i.state='keep' AND i.delete_ever_issued AND i.outcome->>'refusal_protocol'='1'))
+ RETURNING i.plan_id,i.state,i.outcome=$7::jsonb AND $9::boolean AS accepted),
+ uncertain AS (SELECT plan_id FROM u WHERE state NOT IN ('deleted','keep')),
+ batches AS MATERIALIZED (SELECT id,plan_ids FROM nas_cleanup_batches WHERE mode IN ('enabled','completed') AND plan_ids && ARRAY(SELECT plan_id FROM uncertain)),
+ pz AS (UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$8::text,500)
+ WHERE mode IN ('enabled','paused') AND (id IN (SELECT plan_id FROM uncertain) OR (mode='enabled' AND id IN (SELECT unnest(plan_ids) FROM batches))) RETURNING id),
+ bz AS (UPDATE nas_cleanup_batches SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$8::text,500) WHERE id IN (SELECT id FROM batches) RETURNING id)
+ SELECT (SELECT count(*) FROM u WHERE accepted)::int, (SELECT count(*) FROM pz)::int+(SELECT count(*) FROM bz)::int, (SELECT min(plan_id) FROM u)`, id, cid, req.PlanSHA, req.Attempt, req.ProofSHA, cleanupReceiptState(req), string(body), "item "+strconv.FormatInt(id, 10)+" uncertain or contradictory deletion receipt "+req.Outcome, validCleanupReceipt(req)).Scan(&updated, &pausedPlans, &plan)
 	if plan != nil {
 		planID = *plan
 	}
@@ -1396,7 +1412,7 @@ func (s *Server) handleAccountNASCleanupResult(w http.ResponseWriter, r *http.Re
 		return
 	}
 	var req cleanupReceipt
-	if util.DecodeJSON(r, &req) != nil || req.ItemID != 0 || !validCleanupReceipt(req) {
+	if util.DecodeJSON(r, &req) != nil || req.ItemID != 0 || !validCleanupReceiptEvidence(req) {
 		util.WriteError(w, 400, "invalid cleanup deletion receipt")
 		return
 	}
@@ -1405,11 +1421,15 @@ func (s *Server) handleAccountNASCleanupResult(w http.ResponseWriter, r *http.Re
 		return
 	}
 	updated, paused, planID, err := cleanupApplyReceipt(r.Context(), s.pool, cid, id, req)
+	if err == nil && !validCleanupReceipt(req) {
+		util.WriteError(w, 400, "invalid cleanup deletion receipt")
+		return
+	}
 	if err != nil || updated != 1 {
 		util.WriteError(w, 409, "cleanup receipt differs or task is not deletion-issued")
 		return
 	}
-	if req.Outcome == "deleted" {
+	if state := cleanupReceiptState(req); state == "deleted" || state == "keep" {
 		s.cleanupAdvanceBatchAfter(r.Context(), planID)
 	}
 	util.WriteJSON(w, 200, cleanupReceiptAck(id, req, paused))
