@@ -289,7 +289,14 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 		s.Class = classes[0]
 	}
 	var err error
-	s.Evidence, err = loadR2RetireEvidence(ctx, q)
+	if s.Class == r2RetireOwnerAccepted {
+		// Owner disposal does not consume listing/receipt absence evidence.
+		// Load only schema metadata here; broad presence is read separately.
+		s.Evidence = &r2RetireEvidence{}
+		err = q.QueryRow(ctx, `SELECT to_regclass('nas_cleanup_r2_effective_releases') IS NOT NULL`).Scan(&s.Evidence.ReleaseSchema)
+	} else {
+		s.Evidence, err = loadR2RetireEvidence(ctx, q)
+	}
 	if err != nil {
 		return s, err
 	}
