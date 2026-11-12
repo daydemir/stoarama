@@ -239,12 +239,20 @@ func applyR2HoldReleases(ctx context.Context, tx pgx.Tx, m r2HoldReleaseManifest
 	if err != nil || latest.SHA256 != m.PicksSHA {
 		return errors.New("picks changed during release")
 	}
-	for _, item := range m.Items {
-		authority, _ := json.Marshal(item)
-		if _, err := tx.Exec(ctx, `INSERT INTO nas_cleanup_r2_releases(item_id,manifest_sha256,picks_sha256,policy_sha256,authority,reason) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, item.ItemID, digest, picks.SHA256, policy, authority, reason); err != nil {
+	if len(m.Items) > 0 {
+		// Commit the reviewed set in one statement: thousands of remote round
+		// trips must not hold the public fence and starve NAS heartbeats.
+		authority, _ := json.Marshal(m.Items)
+		if _, err := tx.Exec(ctx, `INSERT INTO nas_cleanup_r2_releases(item_id,manifest_sha256,picks_sha256,policy_sha256,authority,reason)
+ SELECT (i->>'item_id')::bigint,$2,$3,$4,i,$5 FROM jsonb_array_elements($1::jsonb) i ON CONFLICT DO NOTHING`, authority, digest, picks.SHA256, policy, reason); err != nil {
 			return err
 		}
 	}
+	latest, err = loadR2RetirePicks(picks.Path)
+	if err != nil || latest.SHA256 != m.PicksSHA {
+		return errors.New("picks changed before release commit")
+	}
+
 	return nil
 }
 func runR2HoldReleases(ctx context.Context, cfg config.Config, args []string, policy string, windows map[int64]api.Keep28Window) {
