@@ -616,6 +616,9 @@ func r2RetireScan(ctx context.Context, q r2RetireQuerier, kind string, scope r2R
 			}
 			if scope.Class != r2RetireOwnerAccepted {
 				sets.Evidence.apply(&page[i])
+				if scope.Class == r2RetireDeliveryOnly {
+					sets.Evidence.applyOwner(&page[i])
+				}
 			} else {
 				sets.Evidence.applyOwner(&page[i])
 			}

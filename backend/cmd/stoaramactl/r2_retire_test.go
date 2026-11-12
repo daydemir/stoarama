@@ -1491,9 +1491,15 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		exec(`INSERT INTO nas_listing_generations(connection_id,generation,folders,completed_at) VALUES(13,'9876543210abcdef9876543210abcdef',ARRAY['p'],now());
  INSERT INTO nas_listing_folders(connection_id,generation,folder) VALUES(13,'9876543210abcdef9876543210abcdef','p');
  INSERT INTO nas_listing_files VALUES(13,'9876543210abcdef9876543210abcdef','p','p/999997.mp4',0,11,12,13,14)`)
+		exec(`INSERT INTO nas_listing_generations(connection_id,generation,started_at,folders,completed_at) VALUES(13,'0123456789abcdef0123456789abcdef',now()-interval '2 hours',ARRAY['p'],now()-interval '1 hour');
+ INSERT INTO nas_listing_folders(connection_id,generation,folder) VALUES(13,'0123456789abcdef0123456789abcdef','p');
+ INSERT INTO nas_listing_files VALUES(13,'0123456789abcdef0123456789abcdef','p','p/old-observation.mp4',1,1,1,1,1)`)
 		deliverySets, err := loadR2RetireSets(ctx, pool, "", true, r2RetireDeliveryOnly)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if deliverySets.Evidence.Paths["p/old-observation.mp4"] {
+			t.Fatal("historical presence survived a newer complete walk")
 		}
 		candidate := r2RetireCandidate{Kind: "raw", SourceID: 999997, RelativePath: "p/999997.mp4", SHA256: r2tSHA, SizeBytes: 1000997}
 		deliverySets.applyPlanNAS(&candidate)

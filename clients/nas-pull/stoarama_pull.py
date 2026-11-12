@@ -16926,10 +16926,13 @@ DELIVERY_KEEP_KEYS_B64 = (
     "l4vVkMFeC+qR5EQy/oJ63TZ0IiNnb1s1/g=="
  )
 
+DELIVERY_KEEP_PACKED = base64.b64decode("".join(DELIVERY_KEEP_KEYS_B64))
+if len(DELIVERY_KEEP_PACKED) != 32825 * 32 or hashlib.sha256(DELIVERY_KEEP_PACKED).hexdigest() != DELIVERY_KEEP_DIGEST:
+    raise RuntimeError("delivery keep key pin differs; KEEP")
+
+
 def delivery_keep_key_held(key):
-    packed = base64.b64decode("".join(DELIVERY_KEEP_KEYS_B64))
-    if len(packed) != 32825 * 32 or hashlib.sha256(packed).hexdigest() != DELIVERY_KEEP_DIGEST:
-        raise RuntimeError("delivery keep key pin differs; KEEP")
+    packed = DELIVERY_KEEP_PACKED
     if not isinstance(key, str) or not key:
         raise RuntimeError("delivery keep key identity unavailable; KEEP")
     wanted = hashlib.sha256(key.encode("utf-8")).digest()
