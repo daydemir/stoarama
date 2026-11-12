@@ -17,6 +17,11 @@ func closeCall(t *testing.T, s *Server, id int64, sha string) *httptest.Response
 	return cleanupCall(t, s.handleAdminNASCleanupClose, 47, 5, "id", fmt.Sprint(id), map[string]any{"expected_plan_sha256": sha, "reason": "split never-issued remainder"})
 }
 
+func closeOverrideCall(t *testing.T, s *Server, id int64, sha string) *httptest.ResponseRecorder {
+	t.Helper()
+	return cleanupCall(t, s.handleAdminNASCleanupClose, 47, 5, "id", fmt.Sprint(id), map[string]any{"expected_plan_sha256": sha, "reason": "split never-issued remainder", "operator_override": true})
+}
+
 func TestNASCleanupCloseRetainsRecoveryAndReplansOnlyNeverIssued(t *testing.T) {
 	f := newCleanupFixture(t, 1)
 	id, sha, _ := f.admit("close-original", syntheticFiles(100, 4, 4))
@@ -31,18 +36,18 @@ func TestNASCleanupCloseRetainsRecoveryAndReplansOnlyNeverIssued(t *testing.T) {
 	if err := f.pool.QueryRow(f.ctx, snapshot, id).Scan(&before); err != nil {
 		t.Fatal(err)
 	}
-	w := closeCall(t, f.s, id, sha)
+	w := closeOverrideCall(t, f.s, id, sha)
 	if w.Code != 200 {
 		t.Fatalf("close: %d %s", w.Code, w.Body.String())
 	}
-	if mode, reason := f.planMode(id); mode != "retired" || reason != "split never-issued remainder" {
+	if mode, reason := f.planMode(id); mode != "retired" || reason != "operator override: split never-issued remainder" {
 		t.Fatalf("mode/reason: %s %s", mode, reason)
 	}
 	if err := f.pool.QueryRow(f.ctx, snapshot, id).Scan(&after); err != nil || before != after {
 		t.Fatalf("item evidence changed: %v", err)
 	}
 	// Lost-response retry preserves the original reason, approval and evidence.
-	if w2 := closeCall(t, f.s, id, sha); w2.Code != 200 || w2.Body.String() != w.Body.String() {
+	if w2 := closeOverrideCall(t, f.s, id, sha); w2.Code != 200 || w2.Body.String() != w.Body.String() {
 		t.Fatalf("non-idempotent close: %s", w2.Body.String())
 	}
 	for _, clip := range []int64{100, 101, 102, 103} {
@@ -299,7 +304,10 @@ k.stream_candidates(k.load_policy(k.POLICY_PATH)[3], 'bucket', 'unused')`)
 	if rows := list(); len(rows) != 0 {
 		t.Fatalf("paused plan re-included before close: %v", rows)
 	}
-	if w := closeCall(t, f.s, id, sha); w.Code != 200 {
+	if w := closeCall(t, f.s, id, sha); w.Code != 409 {
+		t.Fatalf("uncertain producer plan closed without owner: %d", w.Code)
+	}
+	if w := closeOverrideCall(t, f.s, id, sha); w.Code != 200 {
 		t.Fatal(w.Body.String())
 	}
 	rows := list()
@@ -376,5 +384,67 @@ func TestNASCleanupAdmissionReservationFence(t *testing.T) {
 	defer retry.Rollback(ctx)
 	if _, _, err = persistNASCleanupPlan(ctx, retry, "second", items); err == nil || !strings.Contains(err.Error(), "already reserved") {
 		t.Fatalf("duplicate admitted after fence: %v", err)
+	}
+}
+
+func TestNASCleanupCloseUncertaintyRequiresOperatorOverride(t *testing.T) {
+	for _, tc := range []struct{ name, state, outcome string }{
+		{"unknown result", "unverified", `{}`},
+		{"sidecar failure", "media_deleted_sidecar_failed", `{}`},
+		{"unresolved permit", "delete_issued", `{}`},
+		{"conflict", "conflict", `{}`},
+		{"missing", "missing", `{}`},
+		{"uncertified keep", "keep", `{}`},
+		{"contradicted keep", "keep", `{"certified_refusal":{},"contradictory_receipt":{"outcome":"deleted"}}`},
+		{"contradicted deleted", "deleted", `{"contradictory_receipt":{"outcome":"unverified"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCleanupFixture(t, 1)
+			id, sha, _ := f.admit("uncertain-close", syntheticFiles(100, 1, 1))
+			if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_plans SET mode='paused' WHERE id=$1`, id); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET state=$2,outcome=$3::jsonb,delete_ever_issued=true WHERE plan_id=$1`, id, tc.state, tc.outcome); err != nil {
+				t.Fatal(err)
+			}
+			var before, after string
+			const snapshot = `SELECT jsonb_agg(to_jsonb(i))::text FROM nas_cleanup_items i WHERE plan_id=$1`
+			if err := f.pool.QueryRow(f.ctx, snapshot, id).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			if w := closeCall(t, f.s, id, sha); w.Code != 409 {
+				t.Fatalf("close: %d %s", w.Code, w.Body.String())
+			}
+			if mode, _ := f.planMode(id); mode != "paused" {
+				t.Fatalf("refusal changed mode: %s", mode)
+			}
+			if w := closeOverrideCall(t, f.s, id, sha); w.Code != 200 {
+				t.Fatalf("override: %d %s", w.Code, w.Body.String())
+			}
+			if mode, reason := f.planMode(id); mode != "retired" || !strings.HasPrefix(reason, "operator override: ") {
+				t.Fatalf("override not audited: %s %s", mode, reason)
+			}
+			if err := f.pool.QueryRow(f.ctx, snapshot, id).Scan(&after); err != nil || before != after {
+				t.Fatalf("evidence changed: %v", err)
+			}
+			var held bool
+			if err := f.pool.QueryRow(f.ctx, `SELECT nas_cleanup_clip_held(100)`).Scan(&held); err != nil || !held {
+				t.Fatalf("issued recovery hold lost: %v", err)
+			}
+		})
+	}
+}
+
+func TestNASCleanupCloseOverrideCannotBypassLiveLease(t *testing.T) {
+	f := newCleanupFixture(t, 1)
+	id, sha, _ := f.admit("live-lease-close", syntheticFiles(100, 1, 1))
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_plans SET mode='paused' WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET state='leased',lease_expires_at=now()+interval '1 hour' WHERE plan_id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if w := closeOverrideCall(t, f.s, id, sha); w.Code != 409 {
+		t.Fatalf("live lease overridden: %d %s", w.Code, w.Body.String())
 	}
 }

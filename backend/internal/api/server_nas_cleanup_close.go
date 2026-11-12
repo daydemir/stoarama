@@ -17,8 +17,9 @@ func (s *Server) handleAdminNASCleanupClose(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var req struct {
-		PlanSHA string `json:"expected_plan_sha256"`
-		Reason  string `json:"reason"`
+		PlanSHA          string `json:"expected_plan_sha256"`
+		Reason           string `json:"reason"`
+		OperatorOverride bool   `json:"operator_override"`
 	}
 	if util.DecodeJSON(r, &req) != nil || len(req.PlanSHA) != 64 || !lowerHex(req.PlanSHA) || strings.TrimSpace(req.Reason) == "" || len(req.Reason) > 500 {
 		util.WriteError(w, 400, "exact expected_plan_sha256 and reason (1..500 bytes) required")
@@ -49,7 +50,7 @@ func (s *Server) handleAdminNASCleanupClose(w http.ResponseWriter, r *http.Reque
 		util.WriteError(w, 409, "close requires a paused plan")
 		return
 	}
-	var busy bool
+	var busy, uncertain bool
 	var issued, released int
 	// Drain item writes too: lease issuance locks items without locking the
 	// plan. Paused plans cannot acquire new work. Re-read the busy evidence
@@ -68,18 +69,34 @@ func (s *Server) handleAdminNASCleanupClose(w http.ResponseWriter, r *http.Reque
 		util.WriteError(w, 409, "cleanup close item fence unavailable")
 		return
 	}
-	// Expired permits do not prove unlink did not happen: delete_issued always
-	// blocks, and unverified stays unverified (held forever).
-	err = tx.QueryRow(ctx, `SELECT coalesce(bool_or(state='delete_issued' OR (state='leased' AND lease_expires_at>now())),false),count(*) FILTER(WHERE delete_ever_issued),count(*) FILTER(WHERE NOT delete_ever_issued) FROM nas_cleanup_items WHERE plan_id=$1`, id).Scan(&busy, &issued, &released)
+	// Inspect committed evidence only after draining item writers. Expired
+	// permits and contradicted refusals require explicit operator review too.
+	err = tx.QueryRow(ctx, `SELECT
+ coalesce(bool_or(state='leased' AND lease_expires_at>now()),false),
+ coalesce(bool_or(state IN ('delete_issued','unverified','media_deleted_sidecar_failed','conflict','missing')
+  OR (delete_ever_issued AND state NOT IN ('deleted','keep'))
+  OR outcome ? 'contradictory_receipt' OR outcome ? 'certified_refusal'
+  OR (state='keep' AND delete_ever_issued AND NOT coalesce(
+   outcome @> '{"outcome":"unverified","refusal_protocol":1,"unlink_attempted":false}'::jsonb
+   AND outcome->>'refusal_reason' IN ('deadline_exceeded','proof_mismatch','permit_expired','execution_disabled','local_guard','pre_unlink_failure'),false))),false),
+ count(*) FILTER(WHERE delete_ever_issued),count(*) FILTER(WHERE NOT delete_ever_issued)
+ FROM nas_cleanup_items WHERE plan_id=$1`, id).Scan(&busy, &uncertain, &issued, &released)
 	if err != nil {
 		util.WriteError(w, 500, "cleanup close evidence unavailable")
 		return
 	}
 	if busy {
-		util.WriteError(w, 409, "outstanding lease or delete_issued item; wait for leases and resolve receipts before close")
+		util.WriteError(w, 409, "outstanding lease; wait for leases before close")
+		return
+	}
+	if uncertain && !req.OperatorOverride {
+		util.WriteError(w, 409, "uncertain execution receipt; owner review and explicit operator_override required before close")
 		return
 	}
 	if mode == "paused" {
+		if req.OperatorOverride {
+			req.Reason = "operator override: " + req.Reason
+		}
 		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='retired',approved_until=NULL,allow_nas_only=false,approval_reason=$2 WHERE id=$1`, id, req.Reason)
 		if err == nil {
 			_, err = tx.Exec(ctx, `UPDATE nas_cleanup_batches SET mode='paused',approved_until=NULL,approval_reason=left('closed plan '||$1::text||': '||$2::text,500) WHERE mode='enabled' AND $1::bigint=ANY(plan_ids)`, id, req.Reason)

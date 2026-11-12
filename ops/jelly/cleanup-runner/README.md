@@ -63,7 +63,14 @@ The runner:
   close. Re-reads and reclassifies the final report after recovery verification:
   only exact backend lease/approval expiry reasons may close never-issued
   remainder. A concurrent manual/non-expiry pause, anomalies, and uncertain issued
-  receipts stop for the owner without closing or replanning.
+  receipts stop for the owner without closing or replanning. Close atomically
+  refuses uncertain evidence with HTTP 409; the runner latches failure and retains
+  `current_plan`. It then re-reads successful closes to verify the retired plan
+  identity and receipt certainty before releasing ownership. The runner never
+  sends `operator_override`; an owner-reviewed manual close can use
+  `stoaramactl nas-cleanup close --operator-override` with the exact digest and
+  reason. This override is audited and preserves all issued recovery holds; it
+  cannot bypass a live lease.
 - Invokes the existing `verify-recovery` CLI because this API revision has no
   recovery route; checks plan identity, issued/verified counts and zero problems.
   This CLI GETs the report and HEAD-verifies every ever-issued R2 copy. It uses

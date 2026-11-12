@@ -952,6 +952,14 @@ func (s *Server) handleAccountNASCleanupResultBatch(w http.ResponseWriter, r *ht
 		return
 	}
 	defer tx.Rollback(ctx)
+	itemIDs := make([]int64, 0, len(req.Receipts))
+	for _, receipt := range req.Receipts {
+		itemIDs = append(itemIDs, receipt.ItemID)
+	}
+	if err = cleanupReceiptFence(ctx, tx, cid, itemIDs); err != nil {
+		cleanupBatchError(w, 500, "cleanup receipt fence failed")
+		return
+	}
 	results := make([]map[string]any, 0, len(req.Receipts))
 	advance := map[int64]bool{}
 	firstReceipt := map[int64][]byte{}
@@ -969,9 +977,11 @@ func (s *Server) handleAccountNASCleanupResultBatch(w http.ResponseWriter, r *ht
 			}
 			reason := "item " + strconv.FormatInt(id, 10) + " conflicting duplicate deletion receipts"
 			var pausedPlans int
-			if err := tx.QueryRow(ctx, `WITH pz AS (UPDATE nas_cleanup_plans SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND id=(SELECT i.plan_id FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$3) RETURNING id),
-bz AS (UPDATE nas_cleanup_batches SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND plan_ids && ARRAY(SELECT id FROM pz) RETURNING id)
-SELECT (SELECT count(*) FROM pz)::int`, id, reason, cid).Scan(&pausedPlans); err != nil {
+			if err := tx.QueryRow(ctx, `WITH source AS (SELECT i.plan_id FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$3),
+ batches AS MATERIALIZED (SELECT id,plan_ids FROM nas_cleanup_batches WHERE plan_ids && ARRAY(SELECT plan_id FROM source)),
+ pz AS (UPDATE nas_cleanup_plans SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND (id IN (SELECT plan_id FROM source) OR id IN (SELECT unnest(plan_ids) FROM batches)) RETURNING id),
+ bz AS (UPDATE nas_cleanup_batches SET `+cleanupAutoPauseSet+` WHERE id IN (SELECT id FROM batches) RETURNING id)
+ SELECT (SELECT count(*) FROM pz)::int+(SELECT count(*) FROM bz)::int`, id, reason, cid).Scan(&pausedPlans); err != nil {
 				cleanupBatchError(w, 500, "cleanup receipt save failed")
 				return
 			}

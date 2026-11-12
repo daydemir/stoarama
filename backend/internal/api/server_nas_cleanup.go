@@ -1371,13 +1371,41 @@ func cleanupReceiptState(req cleanupReceipt) string {
 	return req.Outcome
 }
 
+// Receipt writes share advance/close's public fence, then acquire execution
+// fences in ascending order and batch rows before any plan/item writes. Take
+// every request's fences up front, including successor plans: observations can
+// auto-pause batches too. A fresh statement snapshot after these locks sees any
+// successor enabled by an advance that committed while we waited.
+func cleanupReceiptFence(ctx context.Context, tx pgx.Tx, cid int64, itemIDs []int64) error {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
+		return err
+	}
+	var plans []int64
+	if err := tx.QueryRow(ctx, `WITH source AS (SELECT DISTINCT i.plan_id FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2),
+ scope AS (SELECT plan_id FROM source UNION SELECT unnest(plan_ids) FROM nas_cleanup_batches WHERE plan_ids && ARRAY(SELECT plan_id FROM source))
+ SELECT coalesce(array_agg(plan_id ORDER BY plan_id),'{}') FROM scope`, itemIDs, cid).Scan(&plans); err != nil {
+		return err
+	}
+	for _, plan := range plans {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPlanLockBase+plan); err != nil {
+			return err
+		}
+	}
+	rows, err := tx.Query(ctx, `SELECT id FROM nas_cleanup_batches WHERE plan_ids && $1 ORDER BY id FOR UPDATE`, plans)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+	}
+	return rows.Err()
+}
+
 // cleanupApplyReceipt records one deletion receipt. Genuine uncertainty pauses
 // the plan and batch atomically. An identical receipt replay is idempotent.
 // Contradicting a certified refusal permanently restores uncertainty, retaining
 // both receipts. Rejection of the new claim does not discard its evidence.
-func cleanupApplyReceipt(ctx context.Context, q interface {
-	QueryRow(context.Context, string, ...any) pgx.Row
-}, cid, id int64, req cleanupReceipt) (updated int, paused bool, planID int64, err error) {
+func cleanupApplyReceipt(ctx context.Context, q pgx.Tx, cid, id int64, req cleanupReceipt) (updated int, paused bool, planID int64, err error) {
 	req.ItemID = 0
 	body, _ := json.Marshal(req)
 	var pausedPlans int
@@ -1389,7 +1417,7 @@ func cleanupApplyReceipt(ctx context.Context, q interface {
  AND ($9::boolean AND (i.state='delete_issued' OR (i.state=$6 AND i.outcome=$7::jsonb)) OR (i.state='keep' AND i.delete_ever_issued AND i.outcome->>'refusal_protocol'='1'))
  RETURNING i.plan_id,i.state,i.outcome=$7::jsonb AND $9::boolean AS accepted),
  uncertain AS (SELECT plan_id FROM u WHERE state NOT IN ('deleted','keep')),
- batches AS MATERIALIZED (SELECT id,plan_ids FROM nas_cleanup_batches WHERE mode IN ('enabled','completed') AND plan_ids && ARRAY(SELECT plan_id FROM uncertain)),
+ batches AS MATERIALIZED (SELECT id,plan_ids FROM nas_cleanup_batches WHERE plan_ids && ARRAY(SELECT plan_id FROM uncertain)),
  pz AS (UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$8::text,500)
  WHERE mode IN ('enabled','paused') AND (id IN (SELECT plan_id FROM uncertain) OR (mode='enabled' AND id IN (SELECT unnest(plan_ids) FROM batches))) RETURNING id),
  bz AS (UPDATE nas_cleanup_batches SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$8::text,500) WHERE id IN (SELECT id FROM batches) RETURNING id)
@@ -1420,7 +1448,21 @@ func (s *Server) handleAccountNASCleanupResult(w http.ResponseWriter, r *http.Re
 	if !ok {
 		return
 	}
-	updated, paused, planID, err := cleanupApplyReceipt(r.Context(), s.pool, cid, id, req)
+	ctx := r.Context()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		util.WriteError(w, 500, "cleanup receipt save failed")
+		return
+	}
+	defer tx.Rollback(ctx)
+	if err = cleanupReceiptFence(ctx, tx, cid, []int64{id}); err != nil {
+		util.WriteError(w, 500, "cleanup receipt fence failed")
+		return
+	}
+	updated, paused, planID, err := cleanupApplyReceipt(ctx, tx, cid, id, req)
+	if err == nil {
+		err = tx.Commit(ctx)
+	}
 	if err == nil && !validCleanupReceipt(req) {
 		util.WriteError(w, 400, "invalid cleanup deletion receipt")
 		return

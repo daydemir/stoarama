@@ -31,6 +31,7 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 	id := fs.Int64("plan-id", 0, "exact plan id")
 	sha := fs.String("expected-plan-sha256", "", "exact plan digest; control/recheck only")
 	reason := fs.String("reason", "", "audited control/recheck reason")
+	operatorOverride := fs.Bool("operator-override", false, "close only: explicitly accept uncertain receipts after owner review; recovery holds remain")
 	all := fs.Bool("all", false, "recheck only: refresh every would_delete item as well as unverified items")
 	priority := fs.Int("priority", 0, "-100..100 scheduling priority; resume-dry-run only, no deletion authority")
 	expectedPlans := fs.Int("expected-plans", 0, "retire-superseded only: exact count from the preview; 0 previews without changes")
@@ -57,12 +58,19 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 	if *all && args[0] != "recheck" {
 		log.Fatal("--all requires recheck")
 	}
+	if *operatorOverride && args[0] != "close" {
+		log.Fatal("--operator-override requires close")
+	}
 	switch args[0] {
 	case "close":
 		if *id <= 0 || len(*sha) != 64 || strings.TrimSpace(*reason) == "" {
 			log.Fatal(args[0] + " requires --plan-id, --expected-plan-sha256 and --reason")
 		}
-		printJSON(mustAPIRequest(ctx, http.MethodPost, *base, *token, fmt.Sprintf("/api/v1/service/nas-cleanup/plans/%d/%s", *id, args[0]), map[string]any{"expected_plan_sha256": *sha, "reason": *reason}))
+		body := map[string]any{"expected_plan_sha256": *sha, "reason": *reason}
+		if *operatorOverride {
+			body["operator_override"] = true
+		}
+		printJSON(mustAPIRequest(ctx, http.MethodPost, *base, *token, fmt.Sprintf("/api/v1/service/nas-cleanup/plans/%d/%s", *id, args[0]), body))
 	case "recheck":
 		if *id <= 0 || len(*sha) != 64 || strings.TrimSpace(*reason) == "" {
 			log.Fatal("recheck requires --plan-id, --expected-plan-sha256 and --reason")

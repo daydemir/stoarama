@@ -217,7 +217,9 @@ class FakeRunner(r.Runner):
         if path.endswith('/control'):
             self.assert_enable = body
             self.p.update(mode=body['mode'], approval_reason=body['reason'])
-        return {'mode': 'retired'}
+        if path.endswith('/close'):
+            self.p['mode'] = 'retired'
+        return {'id': self.p['id'], 'plan_sha256': self.p['plan_sha256'], 'mode': 'retired'}
     def monitor(self, pid):
         self.events.append('monitor')
         self.p['mode'] = 'paused'
@@ -310,6 +312,64 @@ class LoopTests(unittest.TestCase):
                 self.assertIsNone(job.status['current_plan'])
                 self.assertEqual(job.status['phase'], 'batch_complete')
                 self.assertEqual(job.picks, [42, None])
+
+    def test_finish_rereads_close_before_releasing_ownership(self):
+        for change in ('contradiction', 'not_retired', 'identity', 'contradicted_deleted'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as root:
+                job = FakeRunner(root)
+                job.status.update(current_plan=42, started_plan_sha256='b'*64)
+                refused(job.p['results'][0])
+                job.p.update(mode='paused', approval_reason='completed: all items deleted or kept')
+                api = job.api
+                def race(method, path, body=None):
+                    self.assertNotIn('operator_override', body or {})
+                    result = api(method, path, body)
+                    job.p = copy.deepcopy(job.p)
+                    if change in ('contradiction', 'contradicted_deleted'):
+                        job.p['results'][0].update(state='unverified' if change == 'contradiction' else 'deleted', outcome={
+                            'certified_refusal': job.p['results'][0]['outcome'],
+                            'contradictory_receipt': {'outcome': 'deleted'}})
+                    elif change == 'not_retired':
+                        job.p['mode'] = 'paused'
+                    else:
+                        job.p['plan_sha256'] = 'c'*64
+                    return result
+                job.api = race
+                job.run = lambda: job.finish(copy.deepcopy(job.p))
+                with patch.object(r, 'Runner', return_value=job), \
+                        patch.object(r.sys, 'argv', ['runner']), patch.object(r.signal, 'signal'):
+                    self.assertEqual(r.main(), 1)
+                self.assertEqual(job.status['current_plan'], 42)
+                self.assertEqual(job.status['started_plan_sha256'], 'b'*64)
+                self.assertEqual(job.status['phase'], 'failed')
+                self.assertTrue(job.status['last_error'])
+                self.assertTrue((job.root / 'STOP').exists())
+                self.assertNotIn('ON', job.events)
+                self.assertIn('notify', job.events)
+                self.assertEqual(job.picks, [42, None])
+
+    def test_close_409_latches_owner_stop_with_current_plan(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            job.status.update(current_plan=42, started_plan_sha256='b'*64)
+            refused(job.p['results'][0])
+            job.p.update(mode='paused', approval_reason='completed: all items deleted or kept')
+            job.api = lambda method, path, body: r.request('https://invalid/' + path, 'fixture', method, body)
+            job.run = lambda: job.finish(copy.deepcopy(job.p))
+            error = r.urllib.error.HTTPError('https://invalid', 409, 'private-body', {}, io.BytesIO(b'private-body'))
+            opener = SimpleNamespace(open=unittest.mock.Mock(side_effect=error))
+            with patch.object(r.urllib.request, 'build_opener', return_value=opener), \
+                    patch.object(r, 'Runner', return_value=job), patch.object(r.sys, 'argv', ['runner']), \
+                    patch.object(r.signal, 'signal'):
+                self.assertEqual(r.main(), 1)
+            self.assertEqual(job.status['current_plan'], 42)
+            self.assertEqual(job.status['started_plan_sha256'], 'b'*64)
+            self.assertIn('owner', job.status['last_error'])
+            self.assertNotIn('private-body', json.dumps(job.status))
+            self.assertTrue((job.root / 'STOP').exists())
+            self.assertEqual(job.events[0], 'OFF')
+            self.assertNotIn('ON', job.events)
+            self.assertEqual(opener.open.call_count, 1)
 
     def test_finish_never_closes_uncertain_receipts_even_after_expiry(self):
         for state in ('unverified', 'media_deleted_sidecar_failed', 'conflict', 'missing', 'keep'):
