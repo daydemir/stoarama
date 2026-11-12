@@ -9,6 +9,7 @@ import (
 )
 
 type r2RetireEvidence struct {
+	RawPaths                     map[int64]string
 	MismatchRaw                  map[int64]bool
 	MismatchPaths                map[r2RetireNASIdentity]bool
 	ObservedRaw                  map[int64]time.Time
@@ -23,7 +24,7 @@ type r2RetireEvidence struct {
 
 func retireIdentity(kind string, id int64) string { return fmt.Sprintf("%s:%d", kind, id) }
 func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier) (*r2RetireEvidence, error) {
-	e := &r2RetireEvidence{MismatchRaw: map[int64]bool{}, MismatchPaths: map[r2RetireNASIdentity]bool{}, ObservedRaw: map[int64]time.Time{}, ObservedPaths: map[string]time.Time{}, ForeignRaw: map[int64]bool{}, Paths: map[string]bool{}, AbsentRaw: map[int64]bool{}, AbsentCollated: map[int64]bool{}, Receipts: map[string]time.Time{}}
+	e := &r2RetireEvidence{RawPaths: map[int64]string{}, MismatchRaw: map[int64]bool{}, MismatchPaths: map[r2RetireNASIdentity]bool{}, ObservedRaw: map[int64]time.Time{}, ObservedPaths: map[string]time.Time{}, ForeignRaw: map[int64]bool{}, Paths: map[string]bool{}, AbsentRaw: map[int64]bool{}, AbsentCollated: map[int64]bool{}, Receipts: map[string]time.Time{}}
 	if err := q.QueryRow(ctx, `SELECT to_regclass('nas_listing_generations') IS NOT NULL,to_regclass('nas_cleanup_r2_effective_releases') IS NOT NULL`).Scan(&e.ListingSchema, &e.ReleaseSchema); err != nil {
 		return nil, err
 	}
@@ -50,7 +51,7 @@ func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier) (*r2RetireEvid
 	if !e.ListingSchema && !e.ReleaseSchema {
 		return e, nil
 	}
-	rows, err := q.Query(ctx, `SELECT clip_id,relative_path,coalesce(server_received_at,'9999-12-31'::timestamptz),connection_id FROM nas_inventory_files WHERE state<>'missing'`)
+	rows, err := q.Query(ctx, `SELECT clip_id,relative_path,coalesce(server_received_at,'9999-12-31'::timestamptz),connection_id,state FROM nas_inventory_files`)
 	if err != nil {
 		return nil, err
 	}
@@ -58,9 +59,16 @@ func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier) (*r2RetireEvid
 		var id, cid int64
 		var p string
 		var at time.Time
-		if err := rows.Scan(&id, &p, &at, &cid); err != nil {
+		var state string
+		if err := rows.Scan(&id, &p, &at, &cid, &state); err != nil {
 			rows.Close()
 			return nil, err
+		}
+		if cid == 13 {
+			e.RawPaths[id] = p
+		}
+		if state == "missing" {
+			continue
 		}
 		if cid != 13 {
 			e.ForeignRaw[id] = true
@@ -220,7 +228,7 @@ func (e *r2RetireEvidence) apply(c *r2RetireCandidate) {
 		c.Facts.ExactNAS = false
 		return
 	}
-	presence := e.Paths[c.RelativePath] || (c.Kind == "collated" && e.Paths["joined/"+c.RelativePath])
+	presence := e.Paths[c.RelativePath] || (c.Kind == "raw" && e.Paths[e.RawPaths[c.SourceID]]) || (c.Kind == "collated" && e.Paths["joined/"+c.RelativePath])
 	if c.Kind == "raw" && e.MismatchRaw[c.SourceID] || c.Kind == "collated" && (e.MismatchPaths[r2RetireNASIdentity{c.RelativePath, c.SHA256, c.SizeBytes}] || e.MismatchPaths[r2RetireNASIdentity{"joined/" + c.RelativePath, c.SHA256, c.SizeBytes}]) {
 		c.Facts.ExactNAS = false
 	}
@@ -257,7 +265,7 @@ func r2RetireLiveEvidence(ctx context.Context, q r2RetireQuerier, c *r2RetireCan
 			paths = append(paths, "joined/"+c.RelativePath)
 			watermark = `SELECT max(greatest(x.created_at,a.verified_at)) at FROM recording_collation_outputs x LEFT JOIN recording_collation_output_acks a ON a.output_id=x.id AND a.connection_id=13 WHERE x.nas_relative_path=(SELECT nas_relative_path FROM recording_collation_outputs WHERE id=$1) HAVING bool_and(a.output_id IS NOT NULL)`
 		}
-		err := q.QueryRow(ctx, `WITH g AS (SELECT started_at FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL AND started_at>now()-interval '24 hours' ORDER BY started_at DESC LIMIT 1),w AS (`+watermark+`) SELECT coalesce((SELECT g.started_at>w.at FROM g,w),false),EXISTS(SELECT 1 FROM nas_listing_files f JOIN nas_listing_generations n USING(connection_id,generation) WHERE f.connection_id=13 AND f.relative_path=ANY($2) AND n.started_at>=coalesce((SELECT started_at FROM g),'-infinity'))`, c.SourceID, paths).Scan(&absent, &present)
+		err := q.QueryRow(ctx, `WITH g AS (SELECT started_at FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL AND started_at>now()-interval '24 hours' ORDER BY started_at DESC LIMIT 1),w AS (`+watermark+`) SELECT coalesce((SELECT g.started_at>w.at FROM g,w),false),EXISTS(SELECT 1 FROM nas_listing_files f JOIN nas_listing_generations n USING(connection_id,generation) WHERE f.connection_id=13 AND (f.relative_path=ANY($2) OR ($3::text='raw' AND EXISTS(SELECT 1 FROM nas_inventory_files known WHERE known.connection_id=13 AND known.clip_id=$1 AND known.relative_path=f.relative_path))) AND n.started_at>=coalesce((SELECT started_at FROM g),'-infinity'))`, c.SourceID, paths, c.Kind).Scan(&absent, &present)
 		if err != nil {
 			return err
 		}

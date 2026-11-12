@@ -174,18 +174,20 @@ func (s *Server) handleAccountConnectionListing(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
+	var req nasListingRequest
+	if util.DecodeJSON(r, &req) != nil || validateNASListing(req) != nil {
+		util.WriteError(w, 400, "invalid listing request")
+		return
+	}
 	var enabled bool
-	if err := s.pool.QueryRow(r.Context(), `SELECT nas_listing_enabled FROM connections WHERE id=$1`, cid).Scan(&enabled); err != nil {
+	// Completed starts/markers remain replayable after this one-shot job
+	// disarms, including a lost completion response across client restarts.
+	if err := s.pool.QueryRow(r.Context(), `SELECT nas_listing_enabled OR ($3::text IN ('start','complete') AND EXISTS(SELECT 1 FROM nas_listing_generations g WHERE g.connection_id=$1 AND g.generation=$2 AND g.completed_at IS NOT NULL)) FROM connections WHERE id=$1`, cid, req.Generation, string(req.Action)).Scan(&enabled); err != nil {
 		util.WriteError(w, 503, "listing policy unavailable")
 		return
 	}
 	if cid != 13 || !enabled {
 		util.WriteError(w, 403, "listing is disabled")
-		return
-	}
-	var req nasListingRequest
-	if util.DecodeJSON(r, &req) != nil || validateNASListing(req) != nil {
-		util.WriteError(w, 400, "invalid listing request")
 		return
 	}
 	tx, err := s.pool.Begin(r.Context())
@@ -206,6 +208,14 @@ func (s *Server) handleAccountConnectionListing(w http.ResponseWriter, r *http.R
 	if err = tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, 503, "listing commit failed")
 		return
+	}
+	if req.Action == nasListingComplete {
+		// After commit: do not invert the heartbeat connection/public-fence lock
+		// order. The immutable completed proof remains even if the response is lost.
+		if _, err := s.pool.Exec(r.Context(), `UPDATE connections SET nas_listing_enabled=false WHERE id=$1`, cid); err != nil {
+			util.WriteError(w, 503, "listing disarm failed; retry completion")
+			return
+		}
 	}
 	util.WriteJSON(w, 200, map[string]any{"ok": true, "complete": complete})
 }

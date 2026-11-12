@@ -55,15 +55,17 @@ class ListingProofTests(unittest.TestCase):
         pages = [c for c in self.calls if c['action'] == 'page']
         self.assertEqual(pages[0], pages[1])
     def test_directory_change_never_completes(self):
-        def request(*args, **kwargs):
-            body = kwargs['body']
-            self.calls.append(body)
-            if body['action'] == 'page':
-                p = self.cfg.output_dir / 'raw/a.mp4'
-                if p.exists():
-                    p.rename(p.with_name('renamed.mp4'))
-            return {'ok': True}
-        with mock.patch.object(pull, 'request_json', side_effect=request):
+        identity = pull.listing_identity
+        calls = 0
+        def changing(path):
+            nonlocal calls
+            if path == self.cfg.output_dir / 'raw':
+                calls += 1
+                if calls == 2:
+                    source = path / 'a.mp4'
+                    source.rename(path / 'renamed.mp4')
+            return identity(path)
+        with mock.patch.object(pull, 'listing_identity', side_effect=changing), mock.patch.object(pull, 'request_json', side_effect=self.request):
             with self.assertRaises(pull.ListingChanged):
                 pull.listing_proof_once(self.cfg, threading.Event())
         self.assertFalse(any(c['action'] == 'complete' for c in self.calls))
@@ -79,3 +81,17 @@ class ListingProofTests(unittest.TestCase):
             with self.assertRaises(pull.ListingChanged):
                 pull.listing_proof_once(self.cfg, threading.Event())
         self.assertEqual(self.calls, [])
+
+    def test_completed_snapshot_does_not_rewalk_during_upload(self):
+        def request(*args, **kwargs):
+            body = kwargs['body']
+            self.calls.append(body)
+            if body['action'] == 'page':
+                path = self.cfg.output_dir / 'raw/a.mp4'
+                if path.exists():
+                    path.rename(path.with_name('later.mp4'))
+            return {'ok': True}
+        with mock.patch.object(pull, 'request_json', side_effect=request):
+            self.assertTrue(pull.listing_proof_once(self.cfg, threading.Event()))
+        self.assertEqual(self.calls[-1]['action'], 'complete')
+        self.assertIn('raw/a.mp4', {f['path'] for c in self.calls for f in c.get('files', [])})

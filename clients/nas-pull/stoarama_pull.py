@@ -1548,7 +1548,8 @@ def listing_proof_once(cfg, stop_event):
             db.executemany("INSERT OR REPLACE INTO meta VALUES(?,?)", [("generation", generation), ("folders", json.dumps(folders)), ("root_identity", json.dumps(root_identity))])
             db.commit()
         folders = json.loads(get("folders"))
-        stable(cfg.output_dir, json.loads(get("root_identity")))
+        if get("scanned") is None:
+            stable(cfg.output_dir, json.loads(get("root_identity")))
         response = post({"action": "start", "folders": folders})
         if response.get("complete") is True:
             for table in ("meta", "dirs", "files", "uploaded"):
@@ -1556,6 +1557,7 @@ def listing_proof_once(cfg, stop_event):
             db.commit()
             return True
         if get("scanned") is None:
+            stable(cfg.output_dir, json.loads(get("root_identity")))
             # A restart rewalks metadata, validating all prior directory stamps.
             # It cannot silently reuse an incomplete walk as absence evidence.
             def walk(directory):
@@ -1590,12 +1592,13 @@ def listing_proof_once(cfg, stop_event):
                     raise InterruptedError("listing stopped")
             walk(cfg.output_dir)
             put("scanned", "1")
-        def verify_directories():
-            if not os.path.ismount(str(cfg.output_dir)):
-                raise ListingChanged("listing clips mount disappeared")
-            for rel, identity in db.execute("SELECT path,identity FROM dirs"):
-                stable(cfg.output_dir / rel, json.loads(identity))
-        verify_directories()
+        def verify_mount():
+            if not os.path.ismount(str(cfg.output_dir)) or listing_identity(cfg.output_dir)[:2] != tuple(json.loads(get("root_identity")))[:2]:
+                raise ListingChanged("listing clips mount disappeared or changed")
+        # This is an immutable local snapshot. Every directory was stable
+        # around its enumeration; later managed writes are excluded by the
+        # server's per-path generation-start watermark, not upload duration.
+        verify_mount()
         for folder in folders:
             old = db.execute("SELECT page,last_path FROM uploaded WHERE folder=?", (folder,)).fetchone()
             page, last_path = old if old else (0, "")
@@ -1611,7 +1614,7 @@ def listing_proof_once(cfg, stop_event):
                 if stop_event.wait(0.05):
                     raise InterruptedError("listing stopped")
             post({"action": "folder_complete", "folder": folder, "page": page, "count": count, "bytes": total})
-        verify_directories()
+        verify_mount()
         post({"action": "complete"})
         log("INFO", "hash-free listing completed generation=%s" % generation)
         for table in ("meta", "dirs", "files", "uploaded"):
@@ -1636,7 +1639,7 @@ def listing_proof_loop(cfg, stop_event):
         try:
             if cfg.listing_enabled.is_set() and NAS_MEDIA_FENCE.wait_maintenance(stop_event):
                 listing_proof_once(cfg, stop_event)
-                stop_event.wait(6 * 60 * 60)
+                stop_event.wait(30)
             else:
                 stop_event.wait(30)
         except Exception as exc:
