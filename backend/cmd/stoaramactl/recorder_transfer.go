@@ -131,7 +131,7 @@ func transferOneClip(ctx context.Context, pool *pgxpool.Pool, cipher *secretbox.
 		return false, nil
 	}
 
-	n, copyErr := copyClip(ctx, cipher, job)
+	n, copyErr := copyClip(ctx, pool, cipher, job)
 	if copyErr != nil {
 		if ctx.Err() != nil {
 			return true, nil
@@ -244,12 +244,12 @@ func leaseClipTransferJob(ctx context.Context, pool *pgxpool.Pool) (clipTransfer
 // size, not a row estimate). The source object is never deleted (release-only
 // policy): a delivered clip is released, not purged, and the caller does not touch
 // the source client.
-func copyClip(ctx context.Context, cipher *secretbox.Cipher, job clipTransferJob) (int64, error) {
+func copyClip(ctx context.Context, pool *pgxpool.Pool, cipher *secretbox.Cipher, job clipTransferJob) (int64, error) {
 	srcSecret, err := cipher.Decrypt(job.srcSecretEnc)
 	if err != nil {
 		return 0, fmt.Errorf("decrypt source secret: %w", err)
 	}
-	source, err := r2.New(ctx, r2.Config{
+	source, err := r2.New(ctx, r2.Config{WriterDB: pool,
 		AccessKey: job.srcAccessKeyID,
 		SecretKey: string(srcSecret),
 		Region:    job.srcRegion,
@@ -260,7 +260,7 @@ func copyClip(ctx context.Context, cipher *secretbox.Cipher, job clipTransferJob
 		return 0, fmt.Errorf("build source client: %w", err)
 	}
 
-	target, err := buildTargetStore(ctx, cipher, job)
+	target, err := buildTargetStore(ctx, pool, cipher, job)
 	if err != nil {
 		return 0, err
 	}
@@ -293,7 +293,7 @@ func copyClip(ctx context.Context, cipher *secretbox.Cipher, job clipTransferJob
 // so the WebDAV base path is left empty here); every other provider
 // (s3_compatible/r2_managed) builds an r2 client exactly as before. This is the
 // only place the target transport forks; the rest of copyClip is provider-agnostic.
-func buildTargetStore(ctx context.Context, cipher *secretbox.Cipher, job clipTransferJob) (objectStore, error) {
+func buildTargetStore(ctx context.Context, pool *pgxpool.Pool, cipher *secretbox.Cipher, job clipTransferJob) (objectStore, error) {
 	dstSecret, err := cipher.Decrypt(job.dstSecretEnc)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt target secret: %w", err)
@@ -313,7 +313,7 @@ func buildTargetStore(ctx context.Context, cipher *secretbox.Cipher, job clipTra
 		}
 		return webdavStore{c: c}, nil
 	}
-	c, err := r2.New(ctx, r2.Config{
+	c, err := r2.New(ctx, r2.Config{WriterDB: pool,
 		AccessKey: job.dstAccessKeyID,
 		SecretKey: string(dstSecret),
 		Region:    job.dstRegion,

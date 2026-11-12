@@ -156,7 +156,7 @@ func TestNASUploadProbeLifecycle(t *testing.T) {
 	bucket := &fakeProbeBucket{}
 	server := httptest.NewServer(bucket)
 	defer server.Close()
-	client, err := r2.New(ctx, r2.Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	client, err := r2.New(ctx, r2.Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
 	if err != nil {
 		t.Fatal(err)
 	}

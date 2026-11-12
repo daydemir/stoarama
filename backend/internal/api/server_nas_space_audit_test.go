@@ -132,7 +132,7 @@ func TestNASSpaceAuditLifecycle(t *testing.T) {
 		w.Header().Set("X-Amz-Meta-Sha256", headSHA)
 	}))
 	defer bucket.Close()
-	storage, err := r2.New(ctx, r2.Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: bucket.URL})
+	storage, err := r2.New(ctx, r2.Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: bucket.URL})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -701,7 +701,7 @@ func (s *Server) buildClipClientCtx(ctx context.Context, d clipDestination) (*r2
 	if err != nil {
 		return nil, fmt.Errorf("decrypt destination secret: %w", err)
 	}
-	return r2.New(ctx, r2.Config{
+	return r2.New(ctx, r2.Config{WriterDB: s.pool,
 		AccessKey: d.accessKeyID,
 		SecretKey: string(secret),
 		Region:    d.region,

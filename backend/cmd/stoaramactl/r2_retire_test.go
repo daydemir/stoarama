@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -265,13 +266,19 @@ func TestR2RetireManifestRoundTripAndTamper(t *testing.T) {
 // ---------------------------------------------------------------- Postgres
 
 type fakeR2RetireStore struct {
-	mu         sync.Mutex
-	objects    map[string]int64
-	deleted    []string
-	heads      int
-	beforeHead func(key string)
-	deleteErr  error
+	mu             sync.Mutex
+	objects        map[string]int64
+	deleted        []string
+	heads          int
+	beforeHead     func(key string)
+	deleteErr      error
+	headOverride   func(r2.ObjectHead) r2.ObjectHead
+	multipartErr   error
+	onceCalls      int
+	retainOnDelete bool
 }
+
+func (f *fakeR2RetireStore) RequireNoMultipartUploads(context.Context) error { return f.multipartErr }
 
 func (f *fakeR2RetireStore) Bucket() string         { return "stoarama" }
 func (f *fakeR2RetireStore) EndpointSHA256() string { return r2tSHA }
@@ -287,7 +294,11 @@ func (f *fakeR2RetireStore) Head(_ context.Context, key string) (r2.ObjectHead, 
 	if !ok {
 		return r2.ObjectHead{}, &smithy.GenericAPIError{Code: "NotFound"}
 	}
-	return r2.ObjectHead{ETag: "e", SizeBytes: n}, nil
+	h := r2.ObjectHead{ETag: "e", SizeBytes: n, LastModified: time.Now().Add(-30 * 24 * time.Hour)}
+	if f.headOverride != nil {
+		h = f.headOverride(h)
+	}
+	return h, nil
 }
 
 func (f *fakeR2RetireStore) DeleteObject(_ context.Context, key string) error {
@@ -296,7 +307,9 @@ func (f *fakeR2RetireStore) DeleteObject(_ context.Context, key string) error {
 	if f.deleteErr != nil {
 		return f.deleteErr
 	}
-	delete(f.objects, key)
+	if !f.retainOnDelete {
+		delete(f.objects, key)
+	}
 	f.deleted = append(f.deleted, key)
 	return nil
 }
@@ -1133,6 +1146,140 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if _, exists := store.objects["managed/acct-47/709.mp4"]; !exists {
 			t.Fatal("NAS presence did not revoke deletion")
 		}
+		t.Run("HeadGuard", func(t *testing.T) {
+			exec(`ALTER TABLE recordings ADD COLUMN status text NOT NULL DEFAULT 'paused';
+            ALTER TABLE streams ADD COLUMN recording_enabled boolean NOT NULL DEFAULT false;
+            ALTER TABLE recording_clips ADD COLUMN etag text NOT NULL DEFAULT 'e';
+            CREATE TABLE recording_jobs(recording_id bigint,status text);
+            CREATE TABLE capture_session_leases(lease_expires_at timestamptz);
+            CREATE TABLE recording_upload_intents(bucket text,status text,expires_at timestamptz);
+            CREATE TABLE upload_intents(bucket text,status text,expires_at timestamptz)`)
+			clip(712, 30, outside)
+			sets, err := loadR2RetireSets(ctx, pool, "", true, scope.Class)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c, err := r2RetireLoadOne(ctx, pool, "raw", 712, scope, sets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.ETag = "e"
+			item := r2RetireItem{r2RetireCandidate: c, Choice: "none", Reason: string(scope.Class)}
+			h := sum.Header
+			h.Items = 1
+			h.Bytes = c.SizeBytes
+			guarded := o
+			guarded.ManifestPath = filepath.Join(t.TempDir(), "manifest.jsonl")
+			guarded.ExpectedSHA, err = writeR2RetireManifest(guarded.ManifestPath, h, []r2RetireItem{item})
+			if err != nil {
+				t.Fatal(err)
+			}
+			guarded.ProviderUnconditionalHeadGuard = true
+			guarded.MinObjectAge = 7 * 24 * time.Hour
+			guarded.LedgerPath = filepath.Join(t.TempDir(), "ledger.jsonl")
+			writeGuardProofs(t, &guarded, h)
+			// Real migrated schema has no capture_jobs table. Planning excludes
+			// collated output before review instead of reserving unsupported keys.
+			live := map[string]r2.ObjectInfo{}
+			for key, n := range store.objects {
+				live[key] = r2.ObjectInfo{Key: key, SizeBytes: n, ETag: "e"}
+			}
+			compatible, compatibleItems, err := r2RetirePlanRun(ctx, pool, r2RetirePlanOptions{HeadGuardCompatible: true, Scope: scope, Picks: picks, PageSize: 500, Now: time.Now(), LiveObjects: live}, r2tPolicy, windows)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, it := range compatibleItems {
+				if it.Kind != "raw" || it.ETag != "e" {
+					t.Fatal("non-authorized identity planned", it)
+				}
+				found = found || it.SourceID == 712
+			}
+			if !found || compatible.Kept["collated"]["catalog_etag_unavailable"].Objects == 0 {
+				t.Fatal("HEAD-guard planning filter missing", compatible.Kept)
+			}
+			mixed := guarded
+			mixed.ManifestPath = filepath.Join(t.TempDir(), "mixed.jsonl")
+			mixed.LedgerPath = filepath.Join(t.TempDir(), "mixed-ledger.jsonl")
+			collated := item
+			collated.Kind = "collated"
+			collated.SourceID = 2703
+			collated.ObjectKey = "joined/nightly-collation-v2/o/2703.mp4"
+			mixed.ExpectedSHA, err = writeR2RetireManifest(mixed.ManifestPath, h, []r2RetireItem{collated})
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeGuardProofs(t, &mixed, h)
+			if _, err := r2RetireApply(ctx, pool, store, mixed, r2tPolicy, windows); err == nil {
+				t.Fatal("collated manifest accepted")
+			}
+			var reserved int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_retirement_reservations WHERE kind='collated' AND source_id=2703`).Scan(&reserved); err != nil || reserved != 0 {
+				t.Fatal("unsupported item created durable reservation", reserved, err)
+			}
+			if _, err := os.Stat(mixed.LedgerPath); !os.IsNotExist(err) {
+				t.Fatal("unsupported item opened ledger", err)
+			}
+			_, err = r2RetireApply(ctx, pool, store, guarded, r2tPolicy, windows)
+			if err == nil || !strings.Contains(err.Error(), "--accept-operator-credential-risk") || store.onceCalls != 0 {
+				t.Fatal("ungated writer authority did not veto before DELETE", err, store.onceCalls)
+			}
+			if _, err := os.Stat(guarded.LedgerPath); !os.IsNotExist(err) {
+				t.Fatal("veto opened ledger", err)
+			}
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_retirement_reservations WHERE source_id=712`).Scan(&reserved); err != nil || reserved != 0 {
+				t.Fatal("veto reserved", reserved, err)
+			}
+			guarded.AcceptOperatorCredentialRisk = "Deniz 2026-11-12: Accept our own keys (Recommended)"
+			// The acknowledgment cannot substitute for durable admission state.
+			if _, err := r2RetireApply(ctx, pool, store, guarded, r2tPolicy, windows); err == nil || !strings.Contains(err.Error(), "writer fence unavailable") {
+				t.Fatal(err)
+			}
+			exec(`ALTER TABLE streams ADD COLUMN recording_state text;
+             ALTER TABLE nas_restore_requests ADD COLUMN put_expires_at timestamptz;
+             ALTER TABLE recording_joined_artifacts ADD COLUMN publication_state text;
+             CREATE TABLE stream_capture_runtime(status text);
+             CREATE TABLE clip_transfer_jobs(status text); CREATE TABLE inference_box_jobs(status text);
+             CREATE TABLE nas_stitch_tasks(state text); CREATE TABLE recording_native_stitch_tasks(state text);
+             CREATE TABLE recording_presentation_v2_probe_tasks(state text);
+             CREATE TABLE recording_joined_hours(state text); CREATE TABLE recording_joined_stream_days(state text);
+             CREATE TABLE nas_stitch_outputs(id bigint); CREATE TABLE recording_native_stitch_certifications(id bigint);
+             CREATE TABLE media_objects(id bigint); CREATE TABLE frames(id bigint)`)
+			migration, err := os.ReadFile("../../../infra/sql/migrations/0187_r2_writer_admission_fence.sql")
+			if err != nil {
+				t.Fatal(err)
+			}
+			exec(string(migration))
+			exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama','` + r2tSHA + `');
+             SET session_replication_role=replica;
+             UPDATE r2_retirement_writer_fences SET drain_not_before=now()-interval '1 second';
+             RESET session_replication_role`)
+			defer exec(`DELETE FROM r2_retirement_writer_fences`)
+			store.multipartErr = errors.New("multipart inventory refused")
+			if _, err := r2RetireApply(ctx, pool, store, guarded, r2tPolicy, windows); err == nil || !strings.Contains(err.Error(), "multipart inventory refused") {
+				t.Fatal(err)
+			}
+			store.multipartErr = nil
+			result, err := r2RetireApply(ctx, pool, store, guarded, r2tPolicy, windows)
+			if err != nil || result.Retired != 1 || store.onceCalls != 1 || result.OperatorCredentialRisk == nil {
+				t.Fatalf("guarded apply: %+v %v calls=%d", result, err, store.onceCalls)
+			}
+			ledger, err := os.ReadFile(guarded.LedgerPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, line := range bytes.Split(bytes.TrimSpace(ledger), []byte("\n")) {
+				var receipt r2RetireLedgerLine
+				if err := json.Unmarshal(line, &receipt); err != nil {
+					t.Fatal(err)
+				}
+				if receipt.OperatorCredentialRisk == nil || *receipt.OperatorCredentialRisk != *result.OperatorCredentialRisk {
+					t.Fatalf("acknowledgment missing from receipt: %s", line)
+				}
+			}
+
+		})
+
 		o.Budget24h = 5e12 + 1
 		if _, err = r2RetireApply(ctx, pool, store, o, r2tPolicy, windows); err == nil {
 			t.Fatal("owner budget exceeded 5TB")
@@ -1467,4 +1614,9 @@ func TestR2RetireOwnerAcceptedClass(t *testing.T) {
 			t.Fatal("unapproved choice", choice)
 		}
 	}
+}
+
+func (f *fakeR2RetireStore) DeleteObjectOnce(ctx context.Context, key string) error {
+	f.onceCalls++
+	return f.DeleteObject(ctx, key)
 }

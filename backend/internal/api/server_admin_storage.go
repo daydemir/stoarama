@@ -116,7 +116,7 @@ func (s *Server) handleAdminStorageDestinationCreate(w http.ResponseWriter, r *h
 			return
 		}
 	} else {
-		if err := verifyStorageDestination(verifyCtx, r2.Config{
+		if err := verifyStorageDestination(verifyCtx, r2.Config{WriterDB: s.pool,
 			AccessKey: accessKeyID,
 			SecretKey: secret,
 			Region:    region,

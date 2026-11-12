@@ -123,7 +123,7 @@ func runNASCleanupVerifyRecovery(ctx context.Context, cfg config.Config, args []
 		log.Fatal("usage: nas-cleanup verify-recovery --plan-id ID")
 	}
 	report := mustAPIGet(ctx, *base, *token, fmt.Sprintf("/api/v1/service/nas-cleanup/plans/%d", *id))
-	summary, err := verifyNASCleanupRecovery(ctx, report, mustArchiveR2Client(ctx, cfg))
+	summary, err := verifyNASCleanupRecovery(ctx, report, mustArchiveR2Client(ctx, cfg, nil))
 	printJSON(summary)
 	if err != nil {
 		log.Fatalf("verify-recovery: %v", err)
