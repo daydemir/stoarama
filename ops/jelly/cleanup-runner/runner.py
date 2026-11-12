@@ -398,7 +398,7 @@ class Runner:
 
     def api(self, method, path, body=None):
         action = lambda: request(API + '/api/v1/service/nas-cleanup/' + path, os.environ['SERVICE_TOKEN'], method, body)
-        return self.read('cleanup API GET', action) if method == 'GET' else action()
+        return self.read('plan report GET', action) if method == 'GET' else action()
 
     def plan(self, pid):
         p = self.api('GET', 'plans/' + str(int(pid)))
@@ -415,7 +415,9 @@ class Runner:
 
     def render(self, method, path, body=None):
         action = lambda: request('https://api.render.com/v1/services/' + SERVICE + path, render_key(), method, body)
-        return self.read('Render GET', action) if method == 'GET' else action()
+        step = ('live deploy list GET' if path == '/deploys?limit=100' else
+                'Render env GET' if path.startswith('/env-vars/') else 'Render deploy status GET')
+        return self.read(step, action) if method == 'GET' else action()
 
     def live(self):
         rows = self.render('GET', '/deploys?limit=100')
