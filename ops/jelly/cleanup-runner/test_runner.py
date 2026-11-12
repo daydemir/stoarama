@@ -952,6 +952,36 @@ class RenderOffTests(unittest.TestCase):
                     self.assertEqual(self.deploys[self.created[0]]['env'], 'true')
                     self.assertIn('STEP FAILED: ON', stderr.getvalue())
 
+    def test_on_waits_for_runtime_switchover_then_confirms(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            self.make_render(job, enabled=True)
+            stale = [False, False]
+            real_plan = job.plan
+            def plan(pid):
+                p = real_plan(pid)
+                if stale:
+                    stale.pop(0)
+                    return dict(p, master_deletion_enabled=False)  # old instance still answering
+                return p
+            job.plan = plan
+            with patch.object(r.time, 'sleep') as sleep:
+                r.Runner.master(job, True)
+            self.assertEqual(job.status['phase'], 'master_true')
+            self.assertEqual([c.args[0] for c in sleep.call_args_list if c.args[0] == 10], [10, 10])
+            self.assertEqual(len(self.created), 1)
+
+    def test_on_runtime_mismatch_persisting_past_wait_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            self.make_render(job, enabled=True)
+            real_plan = job.plan
+            job.plan = lambda pid: dict(real_plan(pid), master_deletion_enabled=False)
+            clock = iter(range(0, 100000, 61))
+            with patch.object(r.time, 'sleep'), patch.object(r.time, 'monotonic', side_effect=lambda: next(clock)):
+                with self.assertRaisesRegex(r.Halt, 'live API master differs'):
+                    r.Runner.master(job, True)
+
     def test_persistent_on_read_failure_propagates_without_recreating_deploy(self):
         with tempfile.TemporaryDirectory() as root:
             job = FakeRunner(root)

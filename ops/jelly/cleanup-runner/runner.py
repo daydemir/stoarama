@@ -48,6 +48,9 @@ class LockHeld(Exception):
     """Another runner owns the master switch; leave it alone."""
 
 
+ON_CONFIRM_WAIT_SEC = 300
+
+
 def require(ok, message):
     if not ok:
         raise Halt(message)
@@ -569,7 +572,12 @@ class Runner:
             pid = self.status['current_plan']
             if pid:
                 step = 'ON runtime plan GET'
-                require(self.read(step, lambda: self.plan(pid))['master_deletion_enabled'] is True, 'live API master differs')
+                # Render reports "live" while the previous instance can still answer briefly:
+                # wait (bounded) for the new runtime to report ON before declaring a mismatch.
+                confirm_deadline = time.monotonic() + ON_CONFIRM_WAIT_SEC
+                while self.read(step, lambda: self.plan(pid))['master_deletion_enabled'] is not True:
+                    require(time.monotonic() < confirm_deadline, 'live API master differs')
+                    time.sleep(10)
             step = 'ON state write'
             self.save('master_true')
         except Exception:
