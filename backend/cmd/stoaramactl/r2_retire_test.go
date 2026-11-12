@@ -668,6 +668,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 	t.Run("ListingProofAndOwnerHoldRelease", func(t *testing.T) {
 		exec(`ALTER TABLE connections ADD COLUMN last_cursor_id bigint NOT NULL DEFAULT 9999999;
  ALTER TABLE recording_clips ADD COLUMN released_at timestamptz;
+ ALTER TABLE nas_inventory_files ADD COLUMN file_mtime_ns bigint,ADD COLUMN file_ctime_ns bigint,ADD COLUMN file_inode bigint,ADD COLUMN file_device bigint;
  ALTER TABLE nas_inventory_unmatched_files ADD COLUMN server_received_at timestamptz NOT NULL DEFAULT now();
  ALTER TABLE recording_collation_output_acks ADD COLUMN verified_at timestamptz NOT NULL DEFAULT now();`)
 		for _, name := range []string{"0173_nas_cleanup_throughput.sql", "0183_nas_listing_proof.sql", "0184_r2_recovery_hold_releases.sql"} {
@@ -788,7 +789,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if err != nil || !c.Facts.NASAbsent {
 			t.Fatal("valid listing absence rejected", err)
 		}
-		exec(`INSERT INTO nas_listing_folders(connection_id,generation,folder) VALUES(13,repeat('a',32),'p');INSERT INTO nas_listing_files VALUES(13,repeat('a',32),'p','p/407.mp4',0,1,2,3)`)
+		exec(`INSERT INTO nas_listing_folders(connection_id,generation,folder) VALUES(13,repeat('a',32),'p');INSERT INTO nas_listing_files VALUES(13,repeat('a',32),'p','p/407.mp4',0,1,2,3,4)`)
 		c, err = r2RetireLoadOne(ctx, pool, "raw", 407, scope, sets)
 		if err != nil || c.Facts.NASAbsent || !c.Facts.ListingPresence {
 			t.Fatal("zero-size presence failed veto", err)
@@ -802,6 +803,24 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		c, err = r2RetireLoadOne(ctx, pool, "raw", 407, scope, sets)
 		if err != nil || c.Facts.NASAbsent {
 			t.Fatal("stale listing accepted", err)
+		}
+		// Fresh hash evidence cannot authorize kept footage after a listing
+		// reports a changed/truncated file identity at that same path.
+		clip(409, 30, inside)
+		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state,size_bytes,sha256,verified_at,server_received_at,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256,file_mtime_ns,file_ctime_ns,file_inode,file_device) VALUES(13,409,'p/409.mp4','present',1409,$1,now(),now(),'p/409.mp4.stoarama.json',100,$1,11,12,13,14)`, r2tSHA)
+		exec(`INSERT INTO nas_listing_generations(connection_id,generation,folders,completed_at) VALUES(13,repeat('b',32),ARRAY['p'],now());INSERT INTO nas_listing_folders(connection_id,generation,folder) VALUES(13,repeat('b',32),'p');INSERT INTO nas_listing_files VALUES(13,repeat('b',32),'p','p/409.mp4',0,11,13,14,12)`)
+		c, err = r2RetireLoadOne(ctx, pool, "raw", 409, scope, sets)
+		if err != nil || c.Facts.ExactNAS || !c.Facts.ListingPresence {
+			t.Fatal("changed listed identity authorized kept retirement", err)
+		}
+		sets, err = loadR2RetireSets(ctx, pool, "", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Facts.ExactNAS = true
+		sets.Evidence.apply(&c)
+		if c.Facts.ExactNAS {
+			t.Fatal("planning accepted changed listed identity")
 		}
 		// Even if an incident receipt later becomes clean, it stays held forever.
 		exec(`UPDATE nas_cleanup_items SET state='deleted',outcome='{"outcome":"deleted"}' WHERE id=2406`)

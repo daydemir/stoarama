@@ -26,7 +26,7 @@ CREATE TABLE nas_listing_pages (
 CREATE TABLE nas_listing_files (
  connection_id bigint NOT NULL, generation text NOT NULL, folder text NOT NULL,
  relative_path text NOT NULL, size_bytes bigint NOT NULL CHECK(size_bytes>=0),
- mtime_ns bigint NOT NULL, inode bigint NOT NULL, device bigint NOT NULL,
+ mtime_ns bigint NOT NULL, inode bigint NOT NULL, device bigint NOT NULL, ctime_ns bigint NOT NULL,
  PRIMARY KEY(connection_id,generation,relative_path),
  FOREIGN KEY(connection_id,generation,folder) REFERENCES nas_listing_folders
 );
