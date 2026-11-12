@@ -861,8 +861,12 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		err = tx.QueryRow(ctx, `SELECT count(*)=$3 AND count(DISTINCT i.plan_id)=1 AND count(DISTINCT i.lease_request_id)=1
           AND bool_and(i.lease_request_id IS NOT NULL AND i.lease_client_boot_id=$4 AND i.lease_client_version=$5
             AND (i.state='leased' OR ($6 AND i.state='delete_issued')) AND p.mode='enabled')
+          AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items member WHERE $6
+            AND member.plan_id IN (SELECT plan_id FROM nas_cleanup_items WHERE id=ANY($1))
+            AND member.lease_request_id=(SELECT lease_request_id FROM nas_cleanup_items WHERE id=$7)
+            AND NOT (member.id=ANY($1)))
           AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id IN (SELECT plan_id FROM nas_cleanup_items WHERE id=ANY($1)) AND busy.state IN ('leased','delete_issued') AND NOT (busy.id=ANY($1)))
-          FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2`, groupIDs, cid, len(groupIDs), env.session.boot, env.session.version, serial).Scan(&complete)
+          FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2`, groupIDs, cid, len(groupIDs), env.session.boot, env.session.version, serial, itemIDs[0]).Scan(&complete)
 		if err != nil || !complete {
 			cleanupObservationFailure(w, ctx, 409, "cleanup execution group differs or is incomplete")
 			return

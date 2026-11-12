@@ -82,6 +82,17 @@ func TestNASCleanupSerialGroupRosterAndReplay(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// A member that ceased to be busy still belongs to this exact lease. Its
+	// omission cannot turn an incomplete roster into a new execution group.
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET state='pending' WHERE id=$1`, tasks[7].ItemID); err != nil {
+		t.Fatal(err)
+	}
+	if w := observe(tasks[0], roster[:7]); w.Code != 409 {
+		t.Fatalf("omitted non-busy member: %d %s", w.Code, w.Body.String())
+	}
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET state='leased' WHERE id=$1`, tasks[7].ItemID); err != nil {
+		t.Fatal(err)
+	}
 	receipts := []cleanupReceipt{}
 	attempted := true
 	for n, task := range tasks {
