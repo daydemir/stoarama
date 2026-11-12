@@ -936,6 +936,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 	})
 
 	t.Run("OwnerAcceptedOutsideWindow", func(t *testing.T) {
+		exec(`UPDATE connections SET last_cursor_id=0`)
 		body, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), "0186_owner_accepted_r2_retirement.sql"))
 		if err != nil {
 			t.Fatal(err)
@@ -950,6 +951,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		for _, id := range []int64{701, 702, 703, 704, 705, 706, 707, 708, 709, 711} {
 			clip(id, 30, outside)
 		}
+		exec(`UPDATE recording_clips SET released_at=created_at WHERE id=705`)
 		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state) VALUES(13,702,'p/702.mp4','unknown'),(13,703,'p/703.mp4','missing'),(13,711,'p/711.mp4','present')`)
 		// A kept cross-catalog alias makes an outside raw key protected.
 		output(2704, "managed/acct-47/708.mp4", inside, "{708}")
@@ -1137,6 +1139,92 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		}
 	})
 
+	t.Run("OwnerListingAndDeliveryVetoes", func(t *testing.T) {
+		writePicks("none")
+		picks, err := loadR2RetirePicks(picksPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scope := r2RetireScope{Class: r2RetireOwnerAccepted, AccountID: 47, ConnectionID: 13, Bucket: "stoarama", Grace: 7 * 24 * time.Hour, HasRetirements: true, NASBacked: true, OwnerPolicy: r2RetireOwnerPolicy(windows, picks.Choices)}
+		for _, test := range []struct {
+			name     string
+			id       int64
+			evidence string
+		}{
+			{"partial listing raw alias", 800, `INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state) VALUES(13,800,'alias/800.mp4','missing'); INSERT INTO nas_listing_files SELECT 13,repeat('8',32),'p','alias/800.mp4',1,1,1,1,1`},
+			{"complete listing joined alias", 801, `INSERT INTO nas_listing_files SELECT 13,repeat('9',32),'p','joined/j/2801.mp4',1,1,1,1,1`},
+			{"fresh output ACK", 802, `INSERT INTO recording_collation_output_acks VALUES(2802,13,clock_timestamp())`},
+			{"released raw", 803, `UPDATE recording_clips SET released_at=clock_timestamp() WHERE id=803`},
+			{"cursor delivered raw", 804, `UPDATE connections SET last_cursor_id=804,nas_listing_cursor_at=clock_timestamp() WHERE id=13`},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				exec(`UPDATE connections SET last_cursor_id=0`)
+				clip(test.id, 30, outside)
+				kind, id := "raw", test.id
+				if test.id == 801 || test.id == 802 {
+					kind, id = "collated", test.id+2000
+					output(id, fmt.Sprintf("joined/nightly-collation-v2/o/%d.mp4", id), outside, fmt.Sprintf("{%d}", test.id))
+				}
+				live := map[string]r2.ObjectInfo{}
+				for key, size := range store.objects {
+					live[key] = r2.ObjectInfo{Key: key, SizeBytes: size, ETag: "e"}
+				}
+				plan := func() (r2RetirePlanSummary, []r2RetireItem) {
+					t.Helper()
+					sum, items, err := r2RetirePlanRun(ctx, pool, r2RetirePlanOptions{Scope: scope, Picks: picks, PageSize: 500, Now: time.Now(), LiveObjects: live}, r2tPolicy, windows)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var selected []r2RetireItem
+					for _, item := range items {
+						if item.Kind == kind && item.SourceID == id {
+							selected = append(selected, item)
+						}
+					}
+					return sum, selected
+				}
+				sum, selected := plan()
+				if len(selected) != 1 {
+					t.Fatal("fixture not initially eligible", selected)
+				}
+				sum.Header.Items, sum.Header.Bytes = 1, selected[0].SizeBytes
+				path := filepath.Join(t.TempDir(), "owner.jsonl")
+				digest, err := writeR2RetireManifest(path, sum.Header, selected)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if test.id == 800 {
+					exec(`INSERT INTO nas_listing_generations(connection_id,generation,folders) VALUES(13,repeat('8',32),ARRAY['p']); INSERT INTO nas_listing_folders(connection_id,generation,folder) VALUES(13,repeat('8',32),'p')`)
+				}
+				if test.id == 801 {
+					exec(`INSERT INTO nas_listing_generations(connection_id,generation,started_at,completed_at,folders) VALUES(13,repeat('9',32),now()-interval '2 days',now()-interval '2 days',ARRAY['p']); INSERT INTO nas_listing_folders(connection_id,generation,folder) VALUES(13,repeat('9',32),'p')`)
+				}
+				exec(test.evidence)
+				_, selectedAfter := plan()
+				if len(selectedAfter) != 0 {
+					t.Error("NAS evidence did not veto planning", selectedAfter)
+				}
+				o := opts
+				o.ManifestPath, o.ExpectedSHA, o.LedgerPath = path, digest, filepath.Join(t.TempDir(), "ledger.jsonl")
+				o.SkipIneligible = true
+				proof := []byte(fmt.Sprintf(`{"bucket":"stoarama","endpoint_sha256":%q,"created_at":%q,"wrong_etag_rejected":true,"object_preserved":true,"matching_delete_confirmed":true}`, r2tSHA, time.Now().Format(time.RFC3339)))
+				o.DeleteProofPath = filepath.Join(t.TempDir(), "proof.json")
+				if err := os.WriteFile(o.DeleteProofPath, proof, 0600); err != nil {
+					t.Fatal(err)
+				}
+				o.DeleteProofSHA256 = r2SHA(proof)
+				result, err := r2RetireApply(ctx, pool, store, o, r2tPolicy, windows)
+				if err != nil || result.Retired != 0 {
+					t.Errorf("NAS evidence did not veto apply: %+v %v", result, err)
+				}
+				if _, ok := store.objects[selected[0].ObjectKey]; !ok {
+					t.Error("NAS-dependent R2 object deleted")
+				}
+			})
+		}
+		exec(`UPDATE connections SET last_cursor_id=0`)
+	})
+
 	t.Run("DeliveryFenceRequiresPostSettlementScopedListing", func(t *testing.T) {
 		raw, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), "0185_nas_delivery_retirement_fence.sql"))
 		if err != nil {
@@ -1191,6 +1279,25 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 				}
 				if reason, _, eligible := r2RetireDecideForScope(c, scope, windows, picks.Choices); eligible != want {
 					t.Fatal(identity, "bulk retirementEligible", eligible, want, reason)
+				}
+				ownerScope := scope
+				ownerScope.Class = r2RetireOwnerAccepted
+				ownerScope.OwnerPolicy = r2RetireOwnerPolicy(windows, picks.Choices)
+				ownerSets, err := loadR2RetireSets(ctx, pool, "", true, ownerScope.Class)
+				if err != nil {
+					t.Fatal(err)
+				}
+				owner, err := r2RetireLoadOne(ctx, pool, identity.kind, identity.id, ownerScope, ownerSets)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if reason, _, eligible := r2RetireDecideForScope(owner, ownerScope, windows, picks.Choices); eligible != want {
+					t.Fatal(identity, "owner live eligibility", eligible, want, reason)
+				}
+				owner.Facts.NASCopy = false
+				ownerSets.Evidence.applyOwner(&owner)
+				if reason, _, eligible := r2RetireDecideForScope(owner, ownerScope, windows, picks.Choices); eligible != want {
+					t.Fatal(identity, "owner bulk eligibility", eligible, want, reason)
 				}
 			}
 		}

@@ -289,14 +289,7 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 		s.Class = classes[0]
 	}
 	var err error
-	if s.Class == r2RetireOwnerAccepted {
-		// Owner disposal does not consume listing/receipt absence evidence.
-		// Load only schema metadata here; broad presence is read separately.
-		s.Evidence = &r2RetireEvidence{}
-		err = q.QueryRow(ctx, `SELECT to_regclass('nas_cleanup_r2_effective_releases') IS NOT NULL`).Scan(&s.Evidence.ReleaseSchema)
-	} else {
-		s.Evidence, err = loadR2RetireEvidence(ctx, q)
-	}
+	s.Evidence, err = loadR2RetireEvidence(ctx, q, s.Class)
 	if err != nil {
 		return s, err
 	}
@@ -598,6 +591,8 @@ func r2RetireScan(ctx context.Context, q r2RetireQuerier, kind string, scope r2R
 			}
 			if scope.Class != r2RetireOwnerAccepted {
 				sets.Evidence.apply(&page[i])
+			} else {
+				sets.Evidence.applyOwner(&page[i])
 			}
 			if err := fn(page[i]); err != nil {
 				return err
@@ -624,7 +619,8 @@ func r2RetireLoadOne(ctx context.Context, q r2RetireQuerier, kind string, id int
 		if err := r2RetireOwnerLive(ctx, q, &c, scope); err != nil {
 			return c, err
 		}
-		return c, nil
+		err = r2RetireOwnerLiveEvidence(ctx, q, &c, sets.Evidence)
+		return c, err
 	}
 	if err := r2RetireLiveEvidence(ctx, q, &c, sets.Evidence); err != nil {
 		return c, err

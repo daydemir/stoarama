@@ -23,16 +23,31 @@ type r2RetireEvidence struct {
 	Start                        time.Time
 	Paths                        map[string]bool
 	Receipts                     map[string]time.Time
+	Delivered                    map[string]time.Time
+	ReceiptView                  string
 }
 
 func retireIdentity(kind string, id int64) string { return fmt.Sprintf("%s:%d", kind, id) }
-func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier) (*r2RetireEvidence, error) {
+func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier, class r2RetireClass) (*r2RetireEvidence, error) {
 	e := &r2RetireEvidence{RawPaths: map[int64]string{}, MismatchRaw: map[int64]bool{}, MismatchPaths: map[r2RetireNASIdentity]bool{}, ObservedRaw: map[int64]time.Time{}, ObservedPaths: map[string]time.Time{}, ForeignRaw: map[int64]bool{}, Paths: map[string]bool{}, Receipts: map[string]time.Time{}}
 	if err := q.QueryRow(ctx, `SELECT to_regclass('nas_listing_generations') IS NOT NULL,to_regclass('nas_cleanup_r2_effective_releases') IS NOT NULL,to_regclass('nas_delivery_retirement_fences') IS NOT NULL`).Scan(&e.ListingSchema, &e.ReleaseSchema, &e.FenceSchema); err != nil {
 		return nil, err
 	}
+	e.ReceiptView = "nas_cleanup_r2_effective_releases"
+	if class == r2RetireOwnerAccepted {
+		var ownerSchema bool
+		if err := q.QueryRow(ctx, `SELECT to_regclass('nas_cleanup_owner_effective_releases') IS NOT NULL`).Scan(&ownerSchema); err != nil {
+			return nil, err
+		}
+		if ownerSchema {
+			e.ReceiptView = "nas_cleanup_owner_effective_releases"
+		}
+		if err := e.loadOwnerDeliveries(ctx, q); err != nil {
+			return nil, err
+		}
+	}
 	if e.ReleaseSchema {
-		rows, err := q.Query(ctx, `SELECT coalesce(i.item,p.manifest->(i.ordinal-1))->>'kind',(coalesce(i.item,p.manifest->(i.ordinal-1))->>'source_id')::bigint,coalesce(i.permit_expires_at-interval '30 seconds',p.created_at) FROM nas_cleanup_r2_effective_releases x JOIN nas_cleanup_items i ON i.id=x.item_id JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE p.connection_id=13 AND p.account_id=47`)
+		rows, err := q.Query(ctx, `SELECT coalesce(i.item,p.manifest->(i.ordinal-1))->>'kind',(coalesce(i.item,p.manifest->(i.ordinal-1))->>'source_id')::bigint,coalesce(i.permit_expires_at-interval '30 seconds',p.created_at) FROM `+e.ReceiptView+` x JOIN nas_cleanup_items i ON i.id=x.item_id JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE p.connection_id=13 AND p.account_id=47`)
 		if err != nil {
 			return nil, err
 		}
@@ -44,7 +59,10 @@ func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier) (*r2RetireEvid
 				rows.Close()
 				return nil, err
 			}
-			e.Receipts[retireIdentity(kind, id)] = at
+			key := retireIdentity(kind, id)
+			if at.After(e.Receipts[key]) {
+				e.Receipts[key] = at
+			}
 		}
 		rows.Close()
 		if rows.Err() != nil {
@@ -136,7 +154,8 @@ func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier) (*r2RetireEvid
 	if err != nil {
 		return nil, err
 	}
-	rows, err = q.Query(ctx, `SELECT DISTINCT f.relative_path FROM nas_listing_files f JOIN nas_listing_generations g USING(connection_id,generation) WHERE f.connection_id=13 AND g.started_at>=$1`, e.Start)
+	listingSQL := `SELECT DISTINCT f.relative_path FROM nas_listing_files f JOIN nas_listing_generations g USING(connection_id,generation) WHERE f.connection_id=13 AND (g.started_at>=$1 OR $2)`
+	rows, err = q.Query(ctx, listingSQL, e.Start, class == r2RetireOwnerAccepted)
 	if err != nil {
 		return nil, err
 	}
