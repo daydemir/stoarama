@@ -190,3 +190,99 @@ rehashed/reported and consume no transfer budget. Continue subsequent batches
 only while free-space reserve allows. Generate a **new** R2 retirement plan
 after the server shows exact fresh present copies; the copy manifest grants no
 R2 deletion authority. Publishing client/API changes is a separate operator step.
+
+## Listing proof and owner-authorized recovery hold releases
+
+The saved owner picks supersede the old "R2 copies stay" rule for explicitly
+selected non-`all` streams outside keep28. This does not authorize deleting the
+last copy of kept footage. Incident raw sources from the 28 uncertain receipts
+in plans 1390/1391 are pinned by identity in migration 0184, independently of
+subsequent item state or plan admission. Other uncertain receipts, including
+`media_deleted_sidecar_failed`, never confer release authority.
+
+Migration 0183 adds a separate hash-free namespace protocol. The existing
+client's normal server-directed self-update mechanism should publish these
+bytes with **`NAS_VERSION=listing-proof-v1`**, after API rollout; the source keeps
+its `development` placeholder for the release script. The cleanup execution
+allowlist explicitly includes the release. No Compose/container environment
+change or manual NAS access is needed. The migration enables listing only for
+existing connection 13/account 47; the heartbeat's `listing_enabled` switch and
+`connections.nas_listing_enabled` remain server-controlled.
+
+The independent worker scans every top-level directory and root file, including
+`joined/`, `_V85r_keep28` trees and hidden directories. It reads directory
+entries and file stat metadata only, never media bytes. A separate SQLite
+checkpoint survives process restarts; uploads are keyset-paged in batches of
+200 with a small background yield. Every directory's device/inode/mtime/ctime
+must remain stable across the scan and the final validation. Missing mounts,
+I/O failures, symlinks and concurrent membership changes prevent completion.
+An interrupted upload replays identical pages; a changed namespace restarts
+under a new generation. Partial generations only supply presence vetoes.
+
+The API assigns the start timestamp before walking begins. It validates page
+sequence/replay digests, unique canonical paths, and per-folder file/byte
+counts. It marks a generation complete only when **all** declared top-level
+folders (and the root-files folder) completed with consistent stored counts.
+Retirement accepts absence only from a generation **started within 24 hours**
+and strictly after the path's latest known possible delivery/cursor write.
+Cursor advance time is recorded by the server after migration; unknown writer
+watermarks remain blocked. Collated outputs need their delivery ACK time.
+Any matching path in that generation or a later partial generation vetoes
+retirement regardless of file size. A complete newer namespace proof can
+supersede older hash inventory/ACK observations; observations at/after the proof
+or from another connection continue to veto. A stale exact hash observation
+cannot authorize kept footage after a newer listing reports its path absent.
+Evidence publication and cursor advances share the retirement transaction's
+public fence; apply rereads freshness, writer time, presence and protections.
+
+Hold release is a separate, operator-only CLI. Dry-run needs no new schema and
+uses a repeatable-read, read-only transaction:
+
+```sh
+stoaramactl r2-retire release-holds --picks "$HOME/stoarama-r2-select/r2-picks.json" \
+  --out /new/path/hold-release.json
+```
+
+The manifest binds the exact picks digest, pinned keep28 policy/boundaries,
+plan/item identity, recovery evidence and accepted deletion receipt. Only
+`deleted` + `delete_ever_issued` + `r2_sha_verified` or exact-identity
+`r2_etag_bound` recovery can qualify. Missing/unknown picks, `all`, changed
+windows/timezones, kept or unknown source timing and incident sources remain
+held. Existing source/reference protections still independently govern R2
+retirement. Review the exact file and digest, then, **only as an explicitly
+authorized operator action after migration 0184**, release with:
+
+```sh
+stoaramactl r2-retire release-holds --apply --picks "$HOME/stoarama-r2-select/r2-picks.json" \
+  --manifest /new/path/hold-release.json --expected-sha256 SHA256 \
+  --reason 'owner saved non-all picks; outside keep28'
+```
+
+Apply takes the cleanup admission/public fences and item locks, revalidates live
+identity/receipt/evidence and rereads the picks before committing append-only
+authority records. Every action logs its digest and reason. It never deletes
+NAS or R2 objects. Original cleanup reservations stay intact; a separate R2
+reservation view and source-hold predicate recognize valid explicit releases.
+Unreleased siblings, missing item rows and incident sources stay held. Changed
+receipt/recovery state invalidates release effectiveness. Generate a **new**
+normal retirement manifest after release; its existing conditional-delete
+capability proof, reservation ledger and byte budgets are still mandatory.
+
+Planning may include a release preview:
+
+```sh
+stoaramactl r2-retire plan --nas-backed --connection-id 13 --sample 0 \
+  --picks "$HOME/stoarama-r2-select/r2-picks.json" --out /new/retirement/dir \
+  --hold-release-preview /new/path/hold-release.json \
+  --expected-hold-release-sha256 SHA256
+```
+
+`after-hold-release.jsonl` estimates additional live-key eligibility after that
+exact release. `listing-absence-upper-bound.jsonl` is the **additional conditional
+upper bound** currently blocked solely by unproven absence, with known delivery
+history, if a future fresh complete listing confirms those paths absent. It is
+not a prediction of what the NAS listing will contain. Both carry
+`phase=blocked` and a projection-only header that `apply` rejects. Actual
+`phase1.jsonl` remains governed by production evidence. The agent ran only
+read-only planning; no production migrations, releases, copies, deletes, client
+updates or deployments were performed.

@@ -350,6 +350,7 @@ func (s *Server) router() http.Handler {
 			// in the key-OR-session group and is allowlisted in pullPathAllowed.
 			account.Post("/connections/heartbeat", s.handleAccountConnectionHeartbeat)
 			account.Post("/connections/inventory", s.handleAccountConnectionInventorySync)
+			account.Post("/connections/listing", s.handleAccountConnectionListing)
 			account.Post("/connections/stitch-certifications/claim", s.handleAccountNativeStitchClaim)
 			account.Post("/connections/stitch-certifications/complete", s.handleAccountNativeStitchComplete)
 			account.Post("/connections/space-audit", s.handleAccountConnectionSpaceAudit)

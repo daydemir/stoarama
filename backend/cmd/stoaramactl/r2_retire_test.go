@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -661,6 +662,150 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		}
 		if _, err := pool.Exec(ctx, `DELETE FROM r2_retirement_reservations`); err == nil {
 			t.Fatal("reservation mutable")
+		}
+	})
+
+	t.Run("ListingProofAndOwnerHoldRelease", func(t *testing.T) {
+		exec(`ALTER TABLE connections ADD COLUMN last_cursor_id bigint NOT NULL DEFAULT 9999999;
+ ALTER TABLE recording_clips ADD COLUMN released_at timestamptz;
+ ALTER TABLE nas_inventory_unmatched_files ADD COLUMN server_received_at timestamptz NOT NULL DEFAULT now();
+ ALTER TABLE recording_collation_output_acks ADD COLUMN verified_at timestamptz NOT NULL DEFAULT now();`)
+		for _, name := range []string{"0173_nas_cleanup_throughput.sql", "0183_nas_listing_proof.sql", "0184_r2_recovery_hold_releases.sql"} {
+			raw, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			exec(string(raw))
+		}
+		exec(`UPDATE connections SET nas_listing_cursor_at=now()-interval '2 hours';UPDATE recording_clips SET released_at=created_at`)
+		for n, id := range []int64{401, 402, 403, 404, 405, 406, 296368} {
+			at := outside
+			rec := int64(30)
+			state := "deleted"
+			outcome := "deleted"
+			if id == 402 {
+				at = inside
+			}
+			if id == 405 {
+				rec = 40
+			}
+			if id == 403 {
+				state = "unverified"
+				outcome = "unverified"
+			}
+			if id == 404 {
+				state = "unverified"
+				outcome = "media_deleted_sidecar_failed"
+			}
+			clip(id, rec, at)
+			c, err := r2RetireLoadOne(ctx, pool, "raw", id, r2RetireScope{AccountID: 47, ConnectionID: 13, Bucket: "stoarama", Grace: 7 * 24 * time.Hour, HasRetirements: true, NASBacked: true}, r2RetireSets{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			item, _ := json.Marshal(c)
+			exec(`INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode) VALUES($1,47,13,$2,repeat('a',64),jsonb_build_array($3::jsonb),repeat('b',64),'retired')`, 1400+n, fmt.Sprint("release-", n), item)
+			exec(`INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state,delete_ever_issued,recovery,item,outcome) VALUES($1,$2,1,$3,true,'r2_sha_verified',$4,$5::jsonb)`, 2400+n, 1400+n, state, item, fmt.Sprintf(`{"outcome":%q}`, outcome))
+			exec(`INSERT INTO nas_cleanup_source_holds VALUES($1,$2)`, 1400+n, id)
+		}
+		// 406 has no receipt authority; only listing proof can authorize it.
+		exec(`UPDATE nas_cleanup_items SET recovery='unchecked' WHERE id=2405`)
+		picks := r2RetirePicks{Path: filepath.Join(t.TempDir(), "picks.json"), Choices: map[int64]r2RetirePick{3: {Choice: "none", KeepStartUTC: windows[3].Start.Format(time.RFC3339), KeepEndUTC: windows[3].End.Format(time.RFC3339)}, 4: {Choice: "all", KeepStartUTC: windows[4].Start.Format(time.RFC3339), KeepEndUTC: windows[4].End.Format(time.RFC3339)}}}
+		raw, _ := json.Marshal(map[string]any{"choices": map[string]r2RetirePick{"3": picks.Choices[3], "4": picks.Choices[4]}})
+		if err := os.WriteFile(picks.Path, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+		picks, err = loadR2RetirePicks(picks.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := r2HoldReleasePlan(ctx, pool, picks, r2tPolicy, windows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(m.Items) != 1 || m.Items[0].Candidate.SourceID != 401 {
+			t.Fatalf("unsafe release set %+v", m.Items)
+		}
+		// A changed choice aborts before recording authority.
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		changed := picks
+		changed.SHA256 = strings.Repeat("a", 64)
+		if err := applyR2HoldReleases(ctx, tx, m, changed, r2tPolicy, r2tSHA, "test", windows); err == nil {
+			t.Fatal("changed picks accepted")
+		}
+		tx.Rollback(ctx)
+		tx, err = pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := applyR2HoldReleases(ctx, tx, m, picks, r2tPolicy, r2tSHA, "owner selected none", windows); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		var held bool
+		if err := pool.QueryRow(ctx, `SELECT nas_cleanup_clip_held(401)`).Scan(&held); err != nil || held {
+			t.Fatal("released source still held", err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_r2_releases(item_id,manifest_sha256,picks_sha256,policy_sha256,authority,reason) VALUES(2406,$1,$1,$1,'{}','test')`, r2tSHA); err == nil {
+			t.Fatal("incident identity released")
+		}
+		if _, err := pool.Exec(ctx, `DELETE FROM nas_cleanup_r2_releases`); err == nil {
+			t.Fatal("authority mutable")
+		}
+		scope := r2RetireScope{AccountID: 47, ConnectionID: 13, Bucket: "stoarama", Grace: 7 * 24 * time.Hour, HasRetirements: true, NASBacked: true}
+		sets, err := loadR2RetireSets(ctx, pool, "", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := r2RetireLoadOne(ctx, pool, "raw", 401, scope, sets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reason, _, ok := r2RetireDecideForScope(c, scope, windows, picks.Choices); !ok {
+			t.Fatal("receipt release did not enable retirement", reason)
+		}
+		// A complete fresh listing started after delivery proves a separate raw's
+		// absence. Bare missing/no-history and incomplete/stale generations do not.
+		clip(407, 30, outside)
+		exec(`UPDATE recording_clips SET released_at=created_at WHERE id=407;
+ INSERT INTO nas_listing_generations(connection_id,generation,started_at,completed_at,folders) VALUES(13,repeat('a',32),now()-interval '1 hour',now(),ARRAY['.']);`)
+		sets, err = loadR2RetireSets(ctx, pool, "", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err = r2RetireLoadOne(ctx, pool, "raw", 407, scope, sets)
+		if err != nil || !c.Facts.NASAbsent {
+			t.Fatal("valid listing absence rejected", err)
+		}
+		exec(`INSERT INTO nas_listing_folders(connection_id,generation,folder) VALUES(13,repeat('a',32),'p');INSERT INTO nas_listing_files VALUES(13,repeat('a',32),'p','p/407.mp4',0,1,2,3)`)
+		c, err = r2RetireLoadOne(ctx, pool, "raw", 407, scope, sets)
+		if err != nil || c.Facts.NASAbsent || !c.Facts.ListingPresence {
+			t.Fatal("zero-size presence failed veto", err)
+		}
+		exec(`UPDATE connections SET nas_listing_cursor_at=now()`)
+		c, err = r2RetireLoadOne(ctx, pool, "raw", 401, scope, sets)
+		if err != nil {
+			t.Fatal(err)
+		} // receipt still valid independently.
+		exec(`UPDATE nas_listing_generations SET started_at=now()-interval '25 hours'`)
+		c, err = r2RetireLoadOne(ctx, pool, "raw", 407, scope, sets)
+		if err != nil || c.Facts.NASAbsent {
+			t.Fatal("stale listing accepted", err)
+		}
+		// Even if an incident receipt later becomes clean, it stays held forever.
+		exec(`UPDATE nas_cleanup_items SET state='deleted',outcome='{"outcome":"deleted"}' WHERE id=2406`)
+		m, err = r2HoldReleasePlan(ctx, pool, picks, r2tPolicy, windows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, i := range m.Items {
+			if i.Candidate.SourceID == 296368 {
+				t.Fatal("incident lost permanent protection")
+			}
 		}
 	})
 

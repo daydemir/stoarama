@@ -54,7 +54,7 @@ func pullPathAllowed(method, path string) bool {
 		return true
 	case method == http.MethodPost && (path == "/api/v1/account/connections/heartbeat" || path == "/api/v1/account/connections/client-logs"):
 		return true
-	case method == http.MethodPost && path == "/api/v1/account/connections/inventory":
+	case method == http.MethodPost && (path == "/api/v1/account/connections/inventory" || path == "/api/v1/account/connections/listing"):
 		return true
 	case method == http.MethodPost && path == "/api/v1/account/connections/stitch-certifications/claim":
 		return true
@@ -697,6 +697,7 @@ type connectionHeartbeatRequest struct {
 }
 
 type connectionHeartbeatResponse struct {
+	ListingEnabled           bool  `json:"listing_enabled"`
 	StitchEnabled            bool  `json:"stitch_enabled"`
 	StitchDeletionEnabled    bool  `json:"stitch_deletion_enabled"`
 	CleanupReleaseGeneration int64 `json:"cleanup_release_generation,omitempty"`
@@ -995,6 +996,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 	ct, err := tx.Exec(r.Context(), `
 		UPDATE connections
 		SET last_seen_at=now(),
+		    nas_listing_cursor_at=CASE WHEN $1>last_cursor_id OR nas_listing_cursor_at IS NULL THEN now() ELSE nas_listing_cursor_at END,
 		    last_cursor_id=GREATEST(last_cursor_id, $1),
 		    clips_pulled=GREATEST(clips_pulled, $2),
 		    bytes_pulled=GREATEST(bytes_pulled, $3),
@@ -1160,7 +1162,13 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 	s.cleanupHousekeeping(r.Context(), connectionID)
 	s.recordNASCleanupStatus(r.Context(), connectionID, req.Cleanup)
 	s.recordNASStitchStatus(r.Context(), connectionID, req.Stitch)
+	var listingEnabled bool
+	if err := s.pool.QueryRow(r.Context(), `SELECT nas_listing_enabled FROM connections WHERE id=$1`, connectionID).Scan(&listingEnabled); err != nil {
+		util.WriteError(w, 503, "listing policy unavailable")
+		return
+	}
 	util.WriteJSON(w, http.StatusOK, connectionHeartbeatResponse{
+		ListingEnabled:        connectionID == 13 && listingEnabled,
 		StitchEnabled:         connectionID == 13 && s.cfg.NASStitchEnabled,
 		StitchDeletionEnabled: connectionID == 13 && s.cfg.NASStitchDeletionEnabled,
 		OK:                    true, JoinedDeliveryAccepted: joinedDeliveryAccepted, CleanupReleaseGeneration: cleanupReleaseGeneration,

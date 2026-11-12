@@ -16,8 +16,8 @@ import (
 
 // r2-retire selection: pure decision logic, shared by plan and apply.
 //
-// Outside-window retirement is blocked until positive NAS absence evidence
-// can be admitted without overriding cleanup recovery holds.
+// Outside-window retirement requires positive listing or explicitly released
+// cleanup-receipt absence evidence; all remaining recovery holds still veto.
 // NAS-backed plans additionally admit kept-window "none" objects with fresh,
 // exact present inventory. Cleanup holds, references and unknowns always veto.
 
@@ -144,15 +144,17 @@ func r2RetireParsePickTime(raw string) (time.Time, bool) {
 // r2RetireFacts are protection and verified NAS identity observations used
 // by both legacy and NAS-backed selection.
 type r2RetireFacts struct {
-	Purged         bool // raw: purged_at already set
-	Retired        bool // already in r2_object_retirements
-	NASCopy        bool // any NAS inventory/ack/unmatched evidence
-	ExactNAS       bool // connection inventory state present, exact path/SHA/size
-	Held           bool // any NAS cleanup plan item, hold, or delete-issued plan
-	JoinedRef      bool // joined snapshot/source/scope/artifact reference
-	RestorePending bool // NAS restore queued or running
-	SharedKey      bool // the object key is referenced by another catalog row
-	Recent         bool // ended or registered within the grace period
+	NASAbsent       bool
+	ListingPresence bool
+	Purged          bool // raw: purged_at already set
+	Retired         bool // already in r2_object_retirements
+	NASCopy         bool // any NAS inventory/ack/unmatched evidence
+	ExactNAS        bool // connection inventory state present, exact path/SHA/size
+	Held            bool // any NAS cleanup plan item, hold, or delete-issued plan
+	JoinedRef       bool // joined snapshot/source/scope/artifact reference
+	RestorePending  bool // NAS restore queued or running
+	SharedKey       bool // the object key is referenced by another catalog row
+	Recent          bool // ended or registered within the grace period
 }
 
 // r2RetireCandidate is one catalog row (raw clip or stitched output).
@@ -300,8 +302,11 @@ func r2RetireDecideMode(c r2RetireCandidate, bucket string, windows map[int64]ap
 	case "none", "st", "keep":
 		if nasBacked {
 			if outside {
-				if c.Facts.NASCopy || c.Facts.ExactNAS {
+				if c.Facts.NASCopy || c.Facts.ExactNAS || c.Facts.ListingPresence {
 					return "after_nas_cleanup", choice, false
+				}
+				if c.Facts.NASAbsent {
+					return r2RetireReason, choice, true
 				}
 				return "nas_absence_unproven", choice, false
 			}

@@ -26,6 +26,7 @@ type r2RetireScope struct {
 	// HasRetirements is false only before migration 0174 is applied (plan only).
 	HasRetirements bool
 	NASBacked      bool
+	ReleaseSchema  bool
 }
 
 // Raw clip facts. $1 account, $2 NAS connection, $3 bucket, $4 grace seconds.
@@ -97,6 +98,11 @@ func r2RetireSQL(kind string, scope r2RetireScope, single bool) string {
 		retired = "false"
 	}
 	sel = strings.Replace(sel, "{RETIRED}", retired, 1)
+	if scope.ReleaseSchema && kind == "raw" {
+		start := strings.Index(sel, "  EXISTS(SELECT 1 FROM nas_cleanup_source_holds")
+		end := strings.Index(sel[start:], "\n  (EXISTS(SELECT 1 FROM recording_joined_source_snapshots") + start
+		sel = sel[:start] + "  nas_cleanup_clip_held(c.id)," + sel[end:]
+	}
 	if scope.NASBacked {
 		// Preserve the legacy query for old manifests. New plans require exact
 		// inventory identities and the shared reservation view, never ACK alone.
@@ -167,6 +173,7 @@ type r2RetireNASIdentity struct {
 // r2RetireSets binds cleanup protections, shared/reference keys and the exact
 // NAS planning snapshot. Apply always reads NAS identity and freshness live.
 type r2RetireSets struct {
+	Evidence       *r2RetireEvidence
 	ExactRaw       map[int64]r2RetireNASIdentity
 	ExactPaths     map[r2RetireNASIdentity]bool
 	HeldRaw        map[int64]bool
@@ -225,7 +232,16 @@ SELECT md5(coalesce((SELECT string_agg(id||':'||mode, ',' ORDER BY id) FROM nas_
 
 func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, nasBacked bool) (r2RetireSets, error) {
 	s := r2RetireSets{HeldRaw: map[int64]bool{}, HeldCollated: map[int64]bool{}, ArtifactKeys: map[string]bool{}, OutputKeyCount: map[string]int{}}
-	rows, err := q.Query(ctx, r2RetirePlanManifestSQL)
+	var err error
+	s.Evidence, err = loadR2RetireEvidence(ctx, q)
+	if err != nil {
+		return s, err
+	}
+	manifestSQL := r2RetirePlanManifestSQL
+	if s.Evidence.ReleaseSchema {
+		manifestSQL = `SELECT e.value FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) WITH ORDINALITY e(value,n) LEFT JOIN nas_cleanup_items i ON i.plan_id=p.id AND i.ordinal=e.n WHERE (p.mode<>'retired' OR i.delete_ever_issued OR i.id IS NULL) AND NOT EXISTS(SELECT 1 FROM nas_cleanup_r2_effective_releases x WHERE x.item_id=i.id)`
+	}
+	rows, err := q.Query(ctx, manifestSQL)
 	if err != nil {
 		return s, fmt.Errorf("load NAS cleanup plan manifests: %w", err)
 	}
@@ -288,7 +304,11 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 	if nasBacked {
 		// Materialize this shared view once, not again for every catalog page.
 		// It includes retired legacy items whose issuance state is uncertain.
-		rows, err := q.Query(ctx, `SELECT DISTINCT kind,source_id FROM nas_cleanup_reserved_files`)
+		reservedView := "nas_cleanup_reserved_files"
+		if s.Evidence.ReleaseSchema {
+			reservedView = "nas_cleanup_r2_reserved_files"
+		}
+		rows, err := q.Query(ctx, `SELECT DISTINCT kind,source_id FROM `+reservedView)
 		if err != nil {
 			return s, err
 		}
@@ -381,6 +401,20 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 func r2RetireFingerprint(ctx context.Context, q r2RetireQuerier) (string, error) {
 	var fp string
 	err := q.QueryRow(ctx, r2RetireFingerprintSQL).Scan(&fp)
+	if err != nil {
+		return fp, err
+	}
+	var has bool
+	if err = q.QueryRow(ctx, `SELECT to_regclass('nas_cleanup_r2_releases') IS NOT NULL`).Scan(&has); err != nil {
+		return fp, err
+	}
+	if has {
+		var released string
+		if err = q.QueryRow(ctx, `SELECT md5(coalesce(string_agg(item_id::text,',' ORDER BY item_id),'')) FROM nas_cleanup_r2_effective_releases`).Scan(&released); err != nil {
+			return fp, err
+		}
+		fp += ":" + released
+	}
 	return fp, err
 }
 
@@ -398,6 +432,7 @@ func r2RetireHasRetirementsTable(ctx context.Context, q r2RetireQuerier) (bool, 
 
 // r2RetireScan pages through one kind and calls fn for every candidate.
 func r2RetireScan(ctx context.Context, q r2RetireQuerier, kind string, scope r2RetireScope, sets r2RetireSets, pageSize int, fn func(r2RetireCandidate) error) error {
+	scope.ReleaseSchema = sets.Evidence != nil && sets.Evidence.ReleaseSchema
 	sql := r2RetireSQL(kind, scope, false)
 	after := int64(0)
 	for {
@@ -425,6 +460,7 @@ func r2RetireScan(ctx context.Context, q r2RetireQuerier, kind string, scope r2R
 			if scope.NASBacked {
 				sets.applyPlanNAS(&page[i])
 			}
+			sets.Evidence.apply(&page[i])
 			if err := fn(page[i]); err != nil {
 				return err
 			}
@@ -438,12 +474,16 @@ func r2RetireScan(ctx context.Context, q r2RetireQuerier, kind string, scope r2R
 
 // r2RetireLoadOne re-reads one catalog row (purged or not) for apply.
 func r2RetireLoadOne(ctx context.Context, q r2RetireQuerier, kind string, id int64, scope r2RetireScope, sets r2RetireSets) (r2RetireCandidate, error) {
+	scope.ReleaseSchema = sets.Evidence != nil && sets.Evidence.ReleaseSchema
 	row := q.QueryRow(ctx, r2RetireSQL(kind, scope, true), scope.AccountID, scope.ConnectionID, scope.Bucket, int64(scope.Grace/time.Second), id)
 	c, err := r2RetireScanCandidate(kind, row, scope.NASBacked)
 	if err != nil {
 		return c, err
 	}
 	sets.apply(&c)
+	if err := r2RetireLiveEvidence(ctx, q, &c, sets.Evidence); err != nil {
+		return c, err
+	}
 	return c, nil
 }
 
