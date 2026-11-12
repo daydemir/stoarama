@@ -1386,7 +1386,7 @@ func cleanupApplyReceipt(ctx context.Context, q pgx.Tx, cid, id int64, req clean
 	var plan *int64
 	err = q.QueryRow(ctx, `WITH u AS (UPDATE nas_cleanup_items i SET
  state=CASE WHEN i.state='keep' AND i.outcome<>$7::jsonb THEN 'unverified' ELSE $6 END,
- outcome=CASE WHEN i.state='keep' AND i.outcome<>$7::jsonb THEN jsonb_build_object('certified_refusal',i.outcome,'contradictory_receipt',$7::jsonb) ELSE $7::jsonb END,updated_at=now()
+ outcome=CASE WHEN i.state='keep' AND i.outcome<>$7::jsonb THEN jsonb_build_object('certified_refusal',i.outcome,'contradictory_receipt',$7::jsonb) ELSE $7::jsonb END,updated_at=CASE WHEN i.state='delete_issued' OR i.outcome<>$7::jsonb THEN now() ELSE i.updated_at END
  FROM nas_cleanup_plans p WHERE i.id=$1 AND p.id=i.plan_id AND p.connection_id=$2 AND p.plan_sha256=$3 AND i.attempt=$4 AND i.proof_sha256=$5
  AND ($9::boolean AND (i.state='delete_issued' OR (i.state=$6 AND i.outcome=$7::jsonb)) OR (i.state='keep' AND i.delete_ever_issued AND i.outcome->>'refusal_protocol'='1'))
  RETURNING i.plan_id,i.state,i.outcome=$7::jsonb AND $9::boolean AS accepted),

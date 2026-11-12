@@ -27,7 +27,7 @@ func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier) (*r2RetireEvid
 		return nil, err
 	}
 	if e.ReleaseSchema {
-		rows, err := q.Query(ctx, `SELECT coalesce(i.item,p.manifest->(i.ordinal-1))->>'kind',(coalesce(i.item,p.manifest->(i.ordinal-1))->>'source_id')::bigint,i.updated_at FROM nas_cleanup_r2_effective_releases x JOIN nas_cleanup_items i ON i.id=x.item_id JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE p.connection_id=13 AND p.account_id=47`)
+		rows, err := q.Query(ctx, `SELECT coalesce(i.item,p.manifest->(i.ordinal-1))->>'kind',(coalesce(i.item,p.manifest->(i.ordinal-1))->>'source_id')::bigint,coalesce(i.permit_expires_at-interval '30 seconds',p.created_at) FROM nas_cleanup_r2_effective_releases x JOIN nas_cleanup_items i ON i.id=x.item_id JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE p.connection_id=13 AND p.account_id=47`)
 		if err != nil {
 			return nil, err
 		}
@@ -243,7 +243,7 @@ func r2RetireLiveEvidence(ctx context.Context, q r2RetireQuerier, c *r2RetireCan
 		var cutoff *time.Time
 		receiptSQL := "NULL::timestamptz"
 		if e.ReleaseSchema {
-			receiptSQL = `(SELECT max(i.updated_at) FROM nas_cleanup_r2_effective_releases x JOIN nas_cleanup_items i ON i.id=x.item_id JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE p.connection_id=13 AND coalesce(i.item,p.manifest->(i.ordinal-1))->>'kind'=$1 AND (coalesce(i.item,p.manifest->(i.ordinal-1))->>'source_id')::bigint=$2)`
+			receiptSQL = `(SELECT max(coalesce(i.permit_expires_at-interval '30 seconds',p.created_at)) FROM nas_cleanup_r2_effective_releases x JOIN nas_cleanup_items i ON i.id=x.item_id JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE p.connection_id=13 AND coalesce(i.item,p.manifest->(i.ordinal-1))->>'kind'=$1 AND (coalesce(i.item,p.manifest->(i.ordinal-1))->>'source_id')::bigint=$2)`
 		}
 		listingSQL := "NULL::timestamptz"
 		if e.ListingSchema {

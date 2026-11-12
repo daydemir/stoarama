@@ -768,6 +768,13 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if reason, _, ok := r2RetireDecideForScope(c, scope, windows, picks.Choices); !ok {
 			t.Fatal("receipt release did not enable retirement", reason)
 		}
+		// A replayed receipt must never look newer than later NAS presence.
+		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state,size_bytes,sha256,verified_at,server_received_at) VALUES(13,401,'p/401.mp4','present',1401,$1,now(),now())`, r2tSHA)
+		exec(`UPDATE nas_cleanup_items SET updated_at=now()+interval '1 day' WHERE id=2400`)
+		c, err = r2RetireLoadOne(ctx, pool, "raw", 401, scope, sets)
+		if err != nil || !c.Facts.NASCopy {
+			t.Fatal("replayed old receipt masked later presence", err)
+		}
 		// A complete fresh listing started after delivery proves a separate raw's
 		// absence. Bare missing/no-history and incomplete/stale generations do not.
 		clip(407, 30, outside)
