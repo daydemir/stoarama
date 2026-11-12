@@ -69,7 +69,8 @@ the same manifest after investigation. Never delete a reservation to retry.
 
 For kept footage, NAS `verified_at` must be within 24 hours (maximum 5 minutes
 future skew), the server must have received the evidence within 24 hours, and
-raw files must include sidecar SHA/size. Apply rechecks these limits and locks the
+raw files must include SHA/size evidence for the canonical
+`<media-path>.stoarama.json` sidecar. Apply rechecks these limits and locks the
 matching inventory row through deletion/commit. A recent heartbeat that merely
 re-sends an old payload hash does not refresh `verified_at`. Rehash/copy and
 report again when stale. Each R2 delete uses `If-Match` on the manifest ETag,
