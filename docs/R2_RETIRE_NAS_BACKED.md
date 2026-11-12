@@ -22,11 +22,11 @@ reason, plus a SHA-256 in `summary.json`. `streams.tsv` includes all observed
 streams and their phase totals. Only `manifest.jsonl` and `phase1.jsonl` are
 executable. Later/copy/blocked manifests cannot be passed to `apply`.
 
-- `phase1.jsonl`: outside both the file and full source-hull windows, no
-  non-missing NAS inventory/unmatched evidence or output ACK, non-`all` pick,
-  no cleanup reservation/hold, pipeline reference, restore, identity uncertainty
-  or grace-period conflict. This is the first operator execution set.
-- `manifest.jsonl` / `now`: phase 1 plus kept-window `none` footage whose **same
+- `phase1.jsonl`: currently empty. Outside-window objects lacking positive
+  NAS absence evidence are blocked as `nas_absence_unproven`. A missing inventory
+  record, an old `present` verification, or a `missing` row alone never authorizes
+  retirement. Old manifests are revalidated by the same rule during apply.
+- `manifest.jsonl` / `now`: kept-window `none` footage whose **same
   file bytes** have exact, fresh present NAS inventory. Timeline overlap with a
   different stitched file never substitutes for identity.
 - `later.jsonl`: outside-window footage still present on NAS, otherwise eligible.
@@ -75,7 +75,14 @@ matching inventory row through deletion/commit. A recent heartbeat that merely
 re-sends an old payload hash does not refresh `verified_at`. Rehash/copy and
 report again when stale. Each R2 delete uses `If-Match` on the manifest ETag,
 rechecks HEAD size/SHA metadata, and requires a missing-object HEAD afterward.
-The existing fsynced intent/done ledger, DB receipts and byte budgets remain.
+The existing fsynced intent/done ledger and DB receipts remain. The rolling
+budget charges retirement receipts from the last 24 hours plus **all unresolved
+reservations, regardless of age or manifest**. A successful R2 DELETE followed
+by a failed DB commit therefore cannot restore deletion budget. A reservation
+with a matching completed retirement is charged once, by the receipt timestamp;
+unresolved reservations never expire automatically. Retries may conservatively
+charge their reserved bytes again against the proposed run; investigate rather
+than deleting reservations to obtain budget.
 
 Cloudflare's [compatibility table](https://developers.cloudflare.com/r2/api/s3/api/)
 and [conditional-write documentation](https://developers.cloudflare.com/r2/api/s3/conditional-operations/)
@@ -88,34 +95,51 @@ ETag delete. If unsupported or ignored, it writes no proof and apply stays
 blocked. Never remove the precondition or substitute an unconditional delete.
 The implementation agent does not run this probe or any DELETE.
 
-## Operator phase 1
+## Phase-1 evidence audit (2026-11-12 UTC)
 
-On Jelly, use the reviewed binary and plan paths in the delivered `OPERATOR.md`.
-Load the existing credentials locally; do not copy environment files:
+Read-only SQL on Jelly found connection 13 still advertising incomplete
+`scan-20261030T171934-b238fad7`, started October 30 at 17:19:34 UTC, with
+`inventory_scan_completed_at IS NULL`. Its latest pass began November 12 at
+00:06:09 UTC and reported 28,800 visited rows, zero skips, at 01:00 UTC;
+`client_previous_exit=self_update`. These are progress reports, not a completed
+full scan. Historical interruptions cannot be attributed conclusively from this
+single telemetry snapshot.
 
-```sh
-set -a
-. ~/Build/stoarama/local/recording-supervisor.env
-. ~/Build/stoarama/local/render.env
-set +a
-unset PGOPTIONS
-# Apply the reviewed migrations through the normal migration runner first.
-stoaramactl migrate up --dir /path/to/reviewed/infra/sql/migrations
-stoaramactl r2-retire apply \
-  --manifest ~/r2-retire-plans/RUN/phase1.jsonl \
-  --expected-sha256 PHASE1_SHA256 --max-bytes PHASE1_BYTES \
-  --conditional-delete-proof ~/r2-retire-plans/RUN/delete-proof.json \
-  --expected-delete-proof-sha256 DELETE_PROOF_SHA256 \
-  --budget-24h-bytes 5000000000000 --rate 10 \
-  --ledger ~/r2-retire-plans/RUN/phase1-receipts.jsonl --json
-```
+The completion path exists: `Inventory._full_scan_locked` resumes incomplete
+metadata, starts a new pass, traverses the dataset, flushes dirty rows, refuses
+completion on skips/interruption, posts `complete=true`, then saves completion
+locally only after acceptance. Server inventory completion persists the timestamp
+and clears the in-progress generation; heartbeat also accepts a non-null completion
+from the client. A heartbeat or partial page cannot manufacture it. Client
+self-updates restart a pass, and the cleanup execution lane pauses inventory at
+maintenance checkpoints. The evidence establishes that no completion was published,
+not which historical interruption prevented each pass. No production scan,
+restart, deployment or metadata repair was performed for this audit.
 
-The rolling 5 TB cap can require subsequent runs of the same approved manifest.
-A new NAS presence or hold stops the run by default. Review and re-plan; do not
-relax the rules. Manifest maximum age remains seven days (default three).
-A versioning/lifecycle read denied by R2 must be reported as **unverified**;
-logical deleted bytes are not a verified billing reduction until bucket retention
-settings are known. No lifecycle rule or versioned object deletion is performed.
+Furthermore, `raw-dataset-v2` explicitly excludes `joined/` and `#recycle/`.
+Even a completed raw scan would not prove collated-path absence. A scan begun
+before a later possible delivery also cannot prove that delivery absent. No
+fresh exact-path non-existence attestation is currently supplied to this tool.
+`last_cursor_id` is delivery progress, not a complete delivery ledger; released
+clips were acknowledged after delivery, and an unreleased clip may have been
+written before acknowledgement failed. Neither state proves a file was never
+on disk. These classes remain blocked, including rows with no inventory history.
+
+The strongest available positive evidence is an accepted exact cleanup deletion
+receipt: 8,714 `deleted` items with issued permits and verified R2 recovery
+(`r2_sha_verified` or `r2_etag_bound`). However, **every one remains reserved**
+by `nas_cleanup_reserved_files`; issued plans also preserve their whole-plan R2
+source/recovery holds. This patch deliberately preserves those protections.
+Receipt presence alone grants no R2 deletion authority. A future workflow must
+resolve recovery obligations explicitly before admitting this class; this tool
+neither releases holds nor infers that completion releases them. Consequently no
+currently evidenced class qualifies for phase 1.
+
+Any non-missing linked or unmatched inventory at a candidate path vetoes phase 1
+at any age; collated presence now checks `nas_inventory_files` as well as output
+ACKs and unmatched files. Exact-present freshness remains relevant only to
+kept-window `none` retirement. The new `*-v2` plan is the reviewable result;
+previous `20261111-final/phase1.jsonl` must not be executed.
 
 ## Operator copy step (after reviewed API/client deployment)
 

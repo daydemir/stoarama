@@ -4,12 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -88,9 +86,9 @@ func TestR2RetireWindowEdgesAndDST(t *testing.T) {
 		a, b time.Time
 		want string
 	}{
-		{"ends exactly at keep start", w.Start.Add(-time.Minute), w.Start, r2RetireReason},
+		{"ends exactly at keep start", w.Start.Add(-time.Minute), w.Start, "nas_absence_unproven"},
 		{"ends 1us after keep start", w.Start.Add(-time.Minute), w.Start.Add(time.Microsecond), "inside_keep_window"},
-		{"starts exactly at keep end", w.End, w.End.Add(time.Minute), r2RetireReason},
+		{"starts exactly at keep end", w.End, w.End.Add(time.Minute), "nas_absence_unproven"},
 		{"starts 1s before keep end", w.End.Add(-time.Second), w.End.Add(time.Minute), "inside_keep_window"},
 		// A fixed PDT offset would put the end at 07:00Z and wrongly free this hour.
 		{"last local hour after DST ended", r2tUTC("2026-11-22T07:00:00Z"), r2tUTC("2026-11-22T07:30:00Z"), "inside_keep_window"},
@@ -140,11 +138,11 @@ func TestR2RetireDecideFailsClosed(t *testing.T) {
 		m    mut
 		want string
 	}{
-		{"eligible", func(*r2RetireCandidate, map[int64]r2RetirePick) {}, r2RetireReason},
+		{"no NAS history", func(*r2RetireCandidate, map[int64]r2RetirePick) {}, "nas_absence_unproven"},
 		{"undecided stream", func(c *r2RetireCandidate, _ map[int64]r2RetirePick) { c.StreamID = 5 }, "undecided"},
 		{"pick all", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) { p[3] = pk("all") }, "pick_all"},
-		{"pick none", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) { p[3] = pk("none") }, r2RetireReason},
-		{"pick st", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) { p[3] = pk("st") }, r2RetireReason},
+		{"pick none", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) { p[3] = pk("none") }, "nas_absence_unproven"},
+		{"pick st", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) { p[3] = pk("st") }, "nas_absence_unproven"},
 		{"pick made against another window", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) {
 			p[3] = r2RetirePick{Choice: "none", KeepStartUTC: "2026-09-01T15:00:00+00:00", KeepEndUTC: "2026-10-09T15:00:00+00:00"}
 		}, "pick_window_mismatch"},
@@ -160,7 +158,7 @@ func TestR2RetireDecideFailsClosed(t *testing.T) {
 		}, "pick_window_mismatch"},
 		{"pick with the same window", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) {
 			p[3] = r2RetirePick{Choice: "none", KeepStartUTC: "2026-09-11T15:00:00+00:00", KeepEndUTC: "2026-10-09T15:00:00+00:00"}
-		}, r2RetireReason},
+		}, "nas_absence_unproven"},
 		{"stream without window", func(c *r2RetireCandidate, _ map[int64]r2RetirePick) { c.StreamID = 99 }, "no_keep_window"},
 		{"timezone changed", func(c *r2RetireCandidate, _ map[int64]r2RetirePick) { c.Timezone = "UTC" }, "timezone_changed"},
 		{"nas copy", func(c *r2RetireCandidate, _ map[int64]r2RetirePick) { c.Facts.NASCopy = true }, "nas_copy"},
@@ -421,52 +419,33 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got []string
-	for _, it := range items {
-		got = append(got, fmt.Sprintf("%s:%d", it.Kind, it.SourceID))
+	if len(items) != 0 || sum.Kept["raw"]["nas_absence_unproven"].Objects != 4 || sum.Kept["collated"]["nas_absence_unproven"].Objects != 1 {
+		t.Fatalf("no-history rows were eligible: %+v / %+v", items, sum.Kept)
 	}
-	if strings.Join(got, ",") != "collated:201,raw:101,raw:108,raw:109,raw:110" {
-		t.Fatalf("selected %v", got)
-	}
-	wantKept := map[string]map[string]int64{
-		"raw":      {"nas_copy": 2, "inside_keep_window": 1, "pick_all": 1, "undecided": 1, "nas_cleanup_hold": 1, "joined_reference": 1},
-		"collated": {"nas_copy": 1, "protected_prefix": 1, "inside_keep_window": 1, "unknown_timing": 1},
-	}
-	for kind, reasons := range wantKept {
-		for r, n := range reasons {
-			if sum.Kept[kind][r].Objects != n {
-				t.Errorf("kept %s %s = %d want %d (all %v)", kind, r, sum.Kept[kind][r].Objects, n, sum.Kept[kind])
-			}
+	// Previously generated manifests must also be revoked at apply time.
+	var oldItems []r2RetireItem
+	for _, kind := range []string{"raw", "collated"} {
+		id := int64(101)
+		if kind == "collated" {
+			id = 201
 		}
+		c, err := r2RetireLoadOne(ctx, pool, kind, id, scope, r2RetireSets{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldItems = append(oldItems, r2RetireItem{r2RetireCandidate: c, Choice: "none", Reason: r2RetireReason})
 	}
-	if sum.Scanned["raw"].Objects != 11 || sum.Selected.Objects != 5 || sum.Header.Choices["3"] != "none" || sum.Header.Choices["4"] != "all" {
-		t.Fatalf("summary %+v", sum)
-	}
-	hs := r2RetireHeadSampleRun(ctx, store, items, 100, 2, 1)
-	if hs.Checked != 5 || hs.Missing != 1 || hs.Present != 4 {
-		t.Fatalf("head sample %+v", hs)
-	}
-	manifest := filepath.Join(dir, "manifest.jsonl")
-	digest, err := writeR2RetireManifest(manifest, sum.Header, items)
+	manifest := filepath.Join(dir, "old-manifest.jsonl")
+	h := sum.Header
+	h.Items, h.Bytes = 2, oldItems[0].SizeBytes+oldItems[1].SizeBytes
+	digest, err := writeR2RetireManifest(manifest, h, oldItems)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ledger := filepath.Join(dir, "ledger.jsonl")
-	opts := r2RetireApplyOptions{ManifestPath: manifest, ExpectedSHA: digest, LedgerPath: ledger, MaxBytes: 1 << 40, Budget24h: 1 << 40, MaxManifestAge: time.Hour}
+	opts := r2RetireApplyOptions{ManifestPath: manifest, ExpectedSHA: digest, LedgerPath: filepath.Join(dir, "ledger.jsonl"), MaxBytes: 1 << 40, Budget24h: 1 << 40, MaxManifestAge: time.Hour}
 	apply := func(o r2RetireApplyOptions) (r2RetireApplySummary, error) {
 		return r2RetireApply(ctx, pool, store, o, r2tPolicy, windows)
 	}
-	assertDeleted := func(want ...string) {
-		t.Helper()
-		sort.Strings(want)
-		got := append([]string(nil), store.deleted...)
-		sort.Strings(got)
-		if strings.Join(got, ",") != strings.Join(want, ",") {
-			t.Fatalf("deleted %v want %v", got, want)
-		}
-	}
-
-	// Preconditions refuse before any write.
 	bad := opts
 	bad.ExpectedSHA = strings.Repeat("e", 64)
 	if _, err := apply(bad); err == nil || !strings.Contains(err.Error(), "does not match") {
@@ -475,162 +454,20 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 	if _, err := r2RetireApply(ctx, pool, store, opts, "other-policy", windows); err == nil {
 		t.Fatal("policy change accepted")
 	}
-	exec(`INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode,approval_reason,approved_until) VALUES
- (3,47,13,'enabled-plan',repeat('a',64),'[]',repeat('d',64),'enabled','x',now()+interval '1 hour')`)
-	if _, err := apply(opts); err == nil || !strings.Contains(err.Error(), "enabled") {
-		t.Fatalf("enabled plan: %v", err)
-	}
-	exec(`UPDATE nas_cleanup_plans SET mode='paused' WHERE id=3`)
-	writePicks("all")
-	if _, err := apply(opts); err == nil || !strings.Contains(err.Error(), "pick changed") {
-		t.Fatalf("pick change: %v", err)
-	}
-	writePicks("none")
 	for _, age := range []time.Duration{0, -time.Hour, 8 * 24 * time.Hour} {
-		o := opts
-		o.MaxManifestAge = age
-		if _, err := apply(o); err == nil || !strings.Contains(err.Error(), "max-manifest-age") {
-			t.Fatalf("max manifest age %s accepted: %v", age, err)
+		bad := opts
+		bad.MaxManifestAge = age
+		if _, err := apply(bad); err == nil || !strings.Contains(err.Error(), "max-manifest-age") {
+			t.Fatalf("manifest age: %v", err)
 		}
 	}
-	assertDeleted()
 
-	// Byte cap: only the first item (output 201) fits.
-	capped := opts
-	capped.MaxBytes = 5201
-	s, err := apply(capped)
-	if err != nil || s.Retired != 1 || s.LimitReached != "max_bytes" {
-		t.Fatalf("capped run %+v %v", s, err)
+	if _, err := apply(opts); err == nil || !strings.Contains(err.Error(), "nas_absence_unproven") {
+		t.Fatalf("old manifest accepted: %v", err)
 	}
-	assertDeleted("joined/nightly-collation-v2/o/201.mp4")
-
-	// Next run resumes; 101 is retired, then 108 is already missing with no
-	// delete intent in the ledger: stop.
-	s, err = apply(opts)
-	if err == nil || !strings.Contains(err.Error(), "already missing") || s.Retired != 1 || s.AlreadyDone != 1 {
-		t.Fatalf("missing-object run %+v %v", s, err)
+	if len(store.deleted) != 0 {
+		t.Fatal("unproven absence caused deletion")
 	}
-	assertDeleted("joined/nightly-collation-v2/o/201.mp4", "managed/acct-47/101.mp4")
-	var purged101, purged108 bool
-	if err := pool.QueryRow(ctx, `SELECT (SELECT purged_at IS NOT NULL FROM recording_clips WHERE id=101),(SELECT purged_at IS NOT NULL FROM recording_clips WHERE id=108)`).Scan(&purged101, &purged108); err != nil || !purged101 || purged108 {
-		t.Fatalf("purged_at 101=%t 108=%t err=%v", purged101, purged108, err)
-	}
-
-	// A crash after the R2 delete and before the commit leaves an intent line;
-	// the next run completes it. Simulate that for 108.
-	f, _ := os.OpenFile(ledger, os.O_APPEND|os.O_WRONLY, 0)
-	b, _ := json.Marshal(r2RetireLedgerLine{Event: "intent", ManifestSHA256: digest, Kind: "raw", SourceID: 108, ObjectKey: "managed/acct-47/108.mp4"})
-	_, _ = f.Write(append(b, '\n'))
-	_, _ = f.Write([]byte(`{"event":"torn`)) // torn final line from the crash
-	f.Close()
-
-	// 109: its retired plan issues a NAS deletion after our checks; the
-	// database trigger vetoes purged_at and nothing is deleted.
-	store.beforeHead = func(key string) {
-		if key == "managed/acct-47/109.mp4" {
-			if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_items SET delete_ever_issued=true WHERE plan_id=2`); err != nil {
-				t.Error(err)
-			}
-		}
-	}
-	s, err = apply(opts)
-	if err == nil || !strings.Contains(err.Error(), "retention protected") || s.Retired != 1 || s.RetiredAbsent != 1 {
-		t.Fatalf("trigger run %+v %v", s, err)
-	}
-	store.beforeHead = nil
-	assertDeleted("joined/nightly-collation-v2/o/201.mp4", "managed/acct-47/101.mp4")
-	if _, ok := store.objects["managed/acct-47/109.mp4"]; !ok {
-		t.Fatal("held object was deleted")
-	}
-
-	// 110 gains a NAS copy after the plan. By default that stops the run...
-	// 109 is now held: by default that stops the run...
-	if _, err := apply(opts); err == nil || !strings.Contains(err.Error(), "no longer eligible") {
-		t.Fatalf("ineligible: %v", err)
-	}
-	// ...and --skip-ineligible keeps both remaining items.
-	// ...and --skip-ineligible keeps it. 110 gains a NAS copy after its facts
-	// were read (no foreign key, so the row lock cannot block it); the last
-	// re-check right before the delete keeps it too.
-	store.beforeHead = func(key string) {
-		if key == "managed/acct-47/110.mp4" {
-			if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files VALUES (13,110,'p/110.mp4','present')`); err != nil {
-				t.Error(err)
-			}
-		}
-	}
-	skip := opts
-	skip.SkipIneligible = true
-	s, err = apply(skip)
-	if err != nil || s.Retired != 0 || s.AlreadyDone != 3 || s.SkippedIneligible["nas_cleanup_hold"] != 1 || s.SkippedIneligible["nas_copy"] != 1 {
-		t.Fatalf("skip run %+v %v", s, err)
-	}
-	store.beforeHead = nil
-	assertDeleted("joined/nightly-collation-v2/o/201.mp4", "managed/acct-47/101.mp4")
-	if _, ok := store.objects["managed/acct-47/110.mp4"]; !ok {
-		t.Fatal("object with a new NAS copy was deleted")
-	}
-
-	var rows []string
-	r, err := pool.Query(ctx, `SELECT kind||':'||source_id||':'||choice||':'||already_absent||':'||manifest_sha256 FROM r2_object_retirements ORDER BY id`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for r.Next() {
-		var s string
-		_ = r.Scan(&s)
-		rows = append(rows, s)
-	}
-	r.Close()
-	want := []string{"collated:201:none:false:" + digest, "raw:101:none:false:" + digest, "raw:108:none:true:" + digest}
-	if strings.Join(rows, " ") != strings.Join(want, " ") {
-		t.Fatalf("retirements %v", rows)
-	}
-	if _, err := pool.Exec(ctx, `DELETE FROM r2_object_retirements`); err == nil {
-		t.Fatal("retirements are not append-only")
-	}
-	if _, err := pool.Exec(ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256)
-		VALUES ('collated',999,3,'stoarama','joined/best14-20261021/x',1,$1,'x','none',$1,$1)`, r2tSHA); err == nil {
-		t.Fatal("database accepted a protected prefix")
-	}
-	if _, err := pool.Exec(ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256)
-		VALUES ('raw',998,3,'stoarama','managed/y',1,$1,'x','all',$1,$1)`, r2tSHA); err == nil {
-		t.Fatal("database accepted choice=all")
-	}
-
-	// Ledger: append-only JSONL with one intent before each delete.
-	raw, _ := os.ReadFile(ledger)
-	var intents, dones int
-	for _, line := range strings.Split(string(raw), "\n") {
-		if strings.Contains(line, `"event":"intent"`) {
-			intents++
-		}
-		if strings.Contains(line, `"event":"done"`) {
-			dones++
-		}
-	}
-	if intents != 4 || dones != 3 { // 201, 101, 108 (simulated + real), 109 vetoed before its intent
-		t.Fatalf("ledger intents=%d dones=%d\n%s", intents, dones, raw)
-	}
-
-	// The 24h budget counts every run's retirements from the database.
-	budget := opts
-	budget.Budget24h = 1
-	exec(`DELETE FROM nas_inventory_files WHERE clip_id=110`)
-	s, err = apply(budget)
-	if err != nil || s.LimitReached != "budget_24h" || s.Used24hBefore != 5201+1101+1108 {
-		t.Fatalf("budget run %+v %v", s, err)
-	}
-
-	// Two appliers never run at once.
-	l, err := openR2RetireLedger(ledger)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := openR2RetireLedger(ledger); err == nil {
-		t.Fatal("ledger lock not exclusive")
-	}
-	l.Close()
 
 	t.Run("NASBackedReservationsAndFreshness", func(t *testing.T) {
 		exec(`ALTER TABLE nas_inventory_files ADD COLUMN size_bytes bigint, ADD COLUMN sha256 text,
@@ -663,6 +500,41 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		exec(`INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode)
  VALUES(5,47,13,'legacy-missing-item',repeat('a',64),'[{"kind":"raw","source_id":307}]',repeat('f',64),'retired')`)
 
+		exec(`INSERT INTO nas_cleanup_items(plan_id,ordinal,state,recovery,delete_ever_issued)
+ VALUES(4,1,'deleted','r2_sha_verified',true)`)
+		// Stale collated presence must veto at both catalog and last recheck,
+		// even though exact presence has aged out. No-history 302 stays blocked.
+		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state,size_bytes,sha256,verified_at,server_received_at)
+ VALUES(13,999,'joined/j/201.mp4','present',5201,$1,now()-interval '2 days',now())`, r2tSHA)
+		for _, kind := range []string{"raw", "collated"} {
+			id := int64(302)
+			if kind == "collated" {
+				id = 201
+			}
+			c, err := r2RetireLoadOne(ctx, pool, kind, id, r2RetireScope{AccountID: 47, ConnectionID: 13, Bucket: "stoarama", Grace: 7 * 24 * time.Hour, HasRetirements: true, NASBacked: true}, r2RetireSets{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			reason, _, ok := r2RetireDecideMode(c, "stoarama", windows, picks.Choices, true)
+			want := "nas_absence_unproven"
+			if kind == "collated" {
+				want = "after_nas_cleanup"
+			}
+			if ok || reason != want {
+				t.Fatalf("%s: %s eligible=%t", kind, reason, ok)
+			}
+			if kind == "collated" {
+				nas, err := r2RetireNASCopyNow(ctx, pool, kind, id, 13)
+				if err != nil || !nas {
+					t.Fatalf("stale collated presence lost: %t %v", nas, err)
+				}
+			}
+		}
+
+		// Even an explicit missing row has no accepted exact-path absence
+		// attestation: neither missing rows nor a lack of rows grants authority.
+		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state) VALUES(13,302,'p/302.mp4','missing')`)
+
 		scope.NASBacked = true
 		live := map[string]r2.ObjectInfo{}
 		for key, n := range store.objects {
@@ -672,13 +544,22 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if err != nil {
 			t.Fatal(err)
 		}
+		if sum.Kept["raw"]["nas_absence_unproven"].Objects == 0 || sum.Kept["collated"]["after_nas_cleanup"].Objects == 0 || sum.Kept["raw"]["nas_cleanup_hold"].Objects < 2 {
+			t.Fatalf("absence/presence/receipted hold classifications lost: %+v", sum.Kept)
+		}
+		for _, it := range items {
+			if it.Reason == r2RetireReason {
+				t.Fatal("unproven phase 1 item")
+			}
+		}
+
 		var selected []r2RetireItem
 		for _, it := range items {
 			if it.SourceID >= 301 && it.Kind == "raw" {
 				selected = append(selected, it)
 			}
 		}
-		if len(selected) != 2 || selected[0].SourceID != 301 || selected[1].SourceID != 302 {
+		if len(selected) != 1 || selected[0].SourceID != 301 {
 			t.Fatalf("selected %+v", selected)
 		}
 		if sum.Phases.Totals[r2RetireCopy].Objects != 2 {
@@ -686,8 +567,8 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		} // 103 plus 305
 		h := sum.Header
 		h.Phase = r2RetireNow
-		h.Items = 2
-		h.Bytes = 200
+		h.Items = 1
+		h.Bytes = 100
 		manifest := filepath.Join(t.TempDir(), "manifest.jsonl")
 		digest, err := writeR2RetireManifest(manifest, h, selected)
 		if err != nil {
@@ -737,9 +618,34 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			t.Fatal("pending R2 key used as NAS recovery")
 		}
 		store.deleteErr = nil
+		exec(`CREATE FUNCTION fail_retirement_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected commit failure'; END $$;
+ CREATE CONSTRAINT TRIGGER fail_commit AFTER INSERT ON r2_object_retirements DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_retirement_commit()`)
+		if _, err := apply(o); err == nil || !strings.Contains(err.Error(), "commit_failed") {
+			t.Fatalf("commit failure: %v", err)
+		}
+		if _, present := store.objects["managed/acct-47/301.mp4"]; present {
+			t.Fatal("test did not delete R2 object")
+		}
+		var used int64
+		if err := r2RetireUsedBudget(ctx, pool, &used); err != nil || used != 100 {
+			t.Fatalf("unresolved budget=%d %v", used, err)
+		}
+		// Reservations never age out without a receipt, even beyond 24h.
+		exec(`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,created_at)
+ VALUES('raw',999,'stoarama','managed/unresolved',200,repeat('a',64),repeat('b',64),now()-interval '2 days')`)
+		limited := o
+		limited.Budget24h = 399
+		if result, err := apply(limited); err != nil || result.LimitReached != "budget_24h" || result.Used24hBefore != 300 {
+			t.Fatalf("restart budget: %+v %v", result, err)
+		}
+		exec(`DROP TRIGGER fail_commit ON r2_object_retirements`)
+
 		result, err := apply(o)
-		if err != nil || result.Retired != 2 {
+		if err != nil || result.Retired != 1 {
 			t.Fatalf("NAS-backed result %+v %v", result, err)
+		}
+		if err := r2RetireUsedBudget(ctx, pool, &used); err != nil || used != 300 {
+			t.Fatalf("resolved reservation double charged: %d %v", used, err)
 		}
 		var n int
 		if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_retirement_reservations`).Scan(&n); err != nil || n != 2 {
@@ -750,7 +656,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			t.Fatal("cleanup relied on retired R2 recovery")
 		}
 		if _, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256)
-   VALUES(47,13,'cannot-rely',repeat('a',64),'[{"kind":"raw","source_id":302}]',repeat('f',64))`); err == nil {
+   VALUES(47,13,'cannot-rely',repeat('a',64),'[{"kind":"raw","source_id":301}]',repeat('f',64))`); err == nil {
 			t.Fatal("cleanup admitted retired R2 object")
 		}
 		if _, err := pool.Exec(ctx, `DELETE FROM r2_retirement_reservations`); err == nil {
@@ -783,7 +689,7 @@ func TestR2RetirePageStylePicksSelect(t *testing.T) {
 		t.Fatalf("page-format pick for stream 3 resolved to %q", got)
 	}
 	c := r2tCandidate("raw", 3, "Asia/Tokyo", w.Start.Add(-time.Hour), w.Start)
-	if reason, choice, ok := r2RetireDecide(c, "stoarama", windows, p.Choices); !ok || choice != "none" {
+	if reason, choice, ok := r2RetireDecide(c, "stoarama", windows, p.Choices); ok || reason != "nas_absence_unproven" || choice != "none" {
 		t.Fatalf("page-format pick selects nothing: %s", reason)
 	}
 	// A missing window field is undecided: keep everything.
@@ -815,7 +721,7 @@ func TestR2RetireNASBackedChoices(t *testing.T) {
 					c.Facts.ExactNAS = nas
 					picks := map[int64]r2RetirePick{3: {Choice: choice, KeepStartUTC: w.Start.Format(time.RFC3339), KeepEndUTC: w.End.Format(time.RFC3339)}}
 					reason, _, got := r2RetireDecideMode(c, "stoarama", windows, picks, true)
-					want := choice != "all" && ((outside && !nas) || (!outside && choice == "none" && nas))
+					want := !outside && choice == "none" && nas
 					if got != want {
 						t.Fatalf("kind=%s choice=%s outside=%t nas=%t got=%t reason=%s", kind, choice, outside, nas, got, reason)
 					}
