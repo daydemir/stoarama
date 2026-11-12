@@ -1522,8 +1522,22 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !deliverySets.Evidence.Paths["p/old-observation.mp4"] {
+		if !deliverySets.Evidence.OwnerPaths["p/old-observation.mp4"] {
 			t.Fatal("owner delivery class lost historical NAS presence")
+		}
+		if deliverySets.Evidence.Paths["p/old-observation.mp4"] {
+			t.Fatal("historical presence overrode newer physical absence")
+		}
+		kept := r2tCandidate("raw", 3, windows[3].Timezone, inside, inside.Add(time.Minute))
+		kept.RelativePath = "p/old-observation.mp4"
+		kept.Facts = r2RetireFacts{ExactNAS: true, NASCopy: true}
+		deliverySets.Evidence.apply(&kept)
+		deliverySets.Evidence.applyOwner(&kept)
+		if kept.Facts.ExactNAS || !kept.Facts.ListingPresence {
+			t.Fatal("old listing authorized kept footage instead of only vetoing outside retirement", kept.Facts)
+		}
+		if reason, _, eligible := r2RetireDecideForScope(kept, r2RetireScope{Class: r2RetireDeliveryOnly, Bucket: "stoarama", NASBacked: true}, windows, nil); eligible || reason != "copy_to_nas" {
+			t.Fatal("kept footage bypassed copy-first after newer physical absence", reason, eligible)
 		}
 		candidate := r2RetireCandidate{Kind: "raw", SourceID: 999997, RelativePath: "p/999997.mp4", SHA256: r2tSHA, SizeBytes: 1000997}
 		deliverySets.applyPlanNAS(&candidate)

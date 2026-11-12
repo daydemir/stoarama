@@ -22,6 +22,7 @@ type r2RetireEvidence struct {
 	FenceSettled                 *time.Time
 	Start                        time.Time
 	Paths                        map[string]bool
+	OwnerPaths                   map[string]bool
 	Receipts                     map[string]time.Time
 	Delivered                    map[string]time.Time
 	ReceiptView                  string
@@ -29,7 +30,7 @@ type r2RetireEvidence struct {
 
 func retireIdentity(kind string, id int64) string { return fmt.Sprintf("%s:%d", kind, id) }
 func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier, class r2RetireClass) (*r2RetireEvidence, error) {
-	e := &r2RetireEvidence{RawPaths: map[int64]string{}, MismatchRaw: map[int64]bool{}, MismatchPaths: map[r2RetireNASIdentity]bool{}, ObservedRaw: map[int64]time.Time{}, ObservedPaths: map[string]time.Time{}, ForeignRaw: map[int64]bool{}, Paths: map[string]bool{}, Receipts: map[string]time.Time{}}
+	e := &r2RetireEvidence{RawPaths: map[int64]string{}, MismatchRaw: map[int64]bool{}, MismatchPaths: map[r2RetireNASIdentity]bool{}, ObservedRaw: map[int64]time.Time{}, ObservedPaths: map[string]time.Time{}, ForeignRaw: map[int64]bool{}, Paths: map[string]bool{}, OwnerPaths: map[string]bool{}, Receipts: map[string]time.Time{}}
 	if err := q.QueryRow(ctx, `SELECT to_regclass('nas_listing_generations') IS NOT NULL,to_regclass('nas_cleanup_r2_effective_releases') IS NOT NULL,to_regclass('nas_delivery_retirement_fences') IS NOT NULL`).Scan(&e.ListingSchema, &e.ReleaseSchema, &e.FenceSchema); err != nil {
 		return nil, err
 	}
@@ -154,18 +155,24 @@ func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier, class r2Retire
 	if err != nil {
 		return nil, err
 	}
-	listingSQL := `SELECT DISTINCT f.relative_path FROM nas_listing_files f JOIN nas_listing_generations g USING(connection_id,generation) WHERE f.connection_id=13 AND (g.started_at>=$1 OR $2)`
+	listingSQL := `SELECT f.relative_path,bool_or(g.started_at>=$1) FROM nas_listing_files f JOIN nas_listing_generations g USING(connection_id,generation) WHERE f.connection_id=13 AND (g.started_at>=$1 OR $2) GROUP BY f.relative_path`
 	rows, err = q.Query(ctx, listingSQL, e.Start, class.owner())
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var p string
-		if err := rows.Scan(&p); err != nil {
+		var recent bool
+		if err := rows.Scan(&p, &recent); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		e.Paths[p] = true
+		e.OwnerPaths[p] = true
+		// Outside owner selection sees every generation. Kept-window exact
+		// copy checks must still respect absence from a newer physical walk.
+		if recent || class == r2RetireOwnerAccepted {
+			e.Paths[p] = true
+		}
 	}
 	rows.Close()
 	if rows.Err() != nil {
