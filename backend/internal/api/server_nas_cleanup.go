@@ -71,8 +71,8 @@ const (
 	nasCleanupV85RServerSwitchClientVersion   = "v85r-server-switch-v1"
 	nasCleanupV85RCorpusUAClientVersion       = "v85r-corpus-ua-v1"
 	nasCleanupRefusalClientVersion            = "cleanup-refusals-v1"
-	nasCleanupListingProofClientVersion = "listing-proof-v1"
-	nasCleanupListingFenceClientVersion = "listing-fence-v1"
+	nasCleanupListingProofClientVersion       = "listing-proof-v1"
+	nasCleanupListingFenceClientVersion       = "listing-fence-v1"
 	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
 	// item limit only keeps one admission request bounded.
 	nasCleanupMaxPlanItems = 10000

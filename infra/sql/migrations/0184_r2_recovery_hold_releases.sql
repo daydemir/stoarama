@@ -17,11 +17,30 @@ CREATE VIEW nas_cleanup_incident_files AS
  297109,297152,297204,297248,297292,297335,297379,297419,297469,297516,297559,297602,
  297638,297684,297734,297859]::bigint[]) source_id;
 CREATE VIEW nas_cleanup_incident_sources AS SELECT source_id clip_id FROM nas_cleanup_incident_files;
+-- Hold release shares the cleanup canonical order, including direct SQL
+-- inserts. Lock the full cleanup scope before any item: a multi-item
+-- release must never acquire another parent while already holding a child.
+CREATE FUNCTION lock_nas_cleanup_r2_release_scope() RETURNS void LANGUAGE plpgsql AS $$
+DECLARE plans bigint[];
+BEGIN
+ -- Admission stabilizes new identities before the canonical cleanup scope.
+ PERFORM pg_advisory_xact_lock(7343226011103);
+ PERFORM pg_advisory_xact_lock(7343226011101);
+ SELECT coalesce(array_agg(id ORDER BY id),'{}') INTO plans FROM nas_cleanup_plans;
+ PERFORM pg_advisory_xact_lock(7343226100000000+id) FROM unnest(plans) id ORDER BY id;
+ PERFORM id FROM nas_cleanup_plans WHERE id=ANY(plans) ORDER BY id FOR UPDATE;
+ PERFORM id FROM nas_cleanup_batches ORDER BY id FOR UPDATE;
+END $$;
+CREATE FUNCTION fence_nas_cleanup_r2_release() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ PERFORM lock_nas_cleanup_r2_release_scope(); RETURN NULL;
+END $$;
+CREATE TRIGGER nas_cleanup_r2_release_fence BEFORE INSERT ON nas_cleanup_r2_releases
+ FOR EACH STATEMENT EXECUTE FUNCTION fence_nas_cleanup_r2_release();
 CREATE FUNCTION guard_nas_cleanup_r2_release() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE e jsonb; i nas_cleanup_items; p nas_cleanup_plans;
 BEGIN
  SELECT * INTO STRICT i FROM nas_cleanup_items WHERE id=NEW.item_id FOR UPDATE;
- SELECT * INTO STRICT p FROM nas_cleanup_plans WHERE id=i.plan_id FOR SHARE;
+ SELECT * INTO STRICT p FROM nas_cleanup_plans WHERE id=i.plan_id;
  e:=coalesce(i.item,p.manifest->(i.ordinal-1));
  IF i.state<>'deleted' OR NOT i.delete_ever_issued OR i.recovery NOT IN ('r2_sha_verified','r2_etag_bound')
  OR coalesce(i.outcome->>'outcome','')<>'deleted'

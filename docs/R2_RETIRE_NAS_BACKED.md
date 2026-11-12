@@ -202,9 +202,12 @@ subsequent item state or plan admission. Other uncertain receipts, including
 
 Migration 0183 adds a separate hash-free namespace protocol. The existing
 client's normal server-directed self-update mechanism should publish these
-bytes with **`NAS_VERSION=listing-proof-v1`**, after API rollout; the source keeps
+bytes with **`NAS_VERSION=listing-fence-v1`**, after API rollout; the source keeps
 its `development` placeholder for the release script. The cleanup execution
-allowlist explicitly includes the release. No Compose/container environment
+allowlist explicitly includes the release and retains `cleanup-refusals-v1`,
+`listing-proof-v1`, and all reviewed predecessors. The new release includes
+certified cleanup refusals and receipt replay together with listing proof and
+the delivery fence. No Compose/container environment
 change or manual NAS access is needed. The migration enables listing only for
 existing connection 13/account 47; the heartbeat's `listing_enabled` switch and
 `connections.nas_listing_enabled` remain server-controlled.

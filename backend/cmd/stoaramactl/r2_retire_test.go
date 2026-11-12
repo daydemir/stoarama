@@ -726,6 +726,65 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if len(m.Items) != 1 || m.Items[0].Candidate.SourceID != 401 {
 			t.Fatalf("unsafe release set %+v", m.Items)
 		}
+		// Both the CLI and direct inserts must take every plan fence before
+		// touching an item. Hold the last fence and prove earlier rows remain
+		// available while release waits, rather than allowing a child/parent
+		// inversion against a receipt or operator control.
+		for _, direct := range []bool{false, true} {
+			t.Run(fmt.Sprintf("HoldReleaseLockOrder/direct=%t", direct), func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				blocker, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer blocker.Rollback(context.Background())
+				if _, err := blocker.Exec(ctx, `SELECT pg_advisory_xact_lock(7343226100001406)`); err != nil {
+					t.Fatal(err)
+				}
+				worker, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer worker.Rollback(context.Background())
+				workerPID := worker.Conn().PgConn().PID()
+				done := make(chan error, 1)
+				go func() {
+					if direct {
+						authority, _ := json.Marshal(m.Items[0])
+						_, err := worker.Exec(ctx, `INSERT INTO nas_cleanup_r2_releases(item_id,manifest_sha256,picks_sha256,policy_sha256,authority,reason) VALUES($1,$2,$3,$4,$5,'lock probe')`, m.Items[0].ItemID, r2tSHA, picks.SHA256, r2tPolicy, authority)
+						done <- err
+					} else {
+						done <- applyR2HoldReleases(ctx, worker, m, picks, r2tPolicy, r2tSHA, "lock probe", windows)
+					}
+				}()
+				for {
+					var blocked bool
+					if err := pool.QueryRow(ctx, `SELECT $1::integer=ANY(pg_blocking_pids($2))`, blocker.Conn().PgConn().PID(), workerPID).Scan(&blocked); err != nil {
+						t.Fatal(err)
+					}
+					if blocked {
+						break
+					}
+					select {
+					case err := <-done:
+						t.Fatalf("release bypassed plan fence: %v", err)
+					case <-ctx.Done():
+						t.Fatal(ctx.Err())
+					case <-time.After(time.Millisecond):
+					}
+				}
+				if _, err := blocker.Exec(ctx, `SELECT id FROM nas_cleanup_plans WHERE id=1400 FOR UPDATE NOWAIT; SELECT id FROM nas_cleanup_items WHERE id=2400 FOR UPDATE NOWAIT`); err != nil {
+					t.Fatal("release locked a row before all plan fences", err)
+				}
+				if err := blocker.Rollback(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
 		// A changed choice aborts before recording authority.
 		tx, err := pool.Begin(ctx)
 		if err != nil {

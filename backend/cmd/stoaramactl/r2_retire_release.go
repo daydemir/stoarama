@@ -218,6 +218,10 @@ func applyR2HoldReleases(ctx context.Context, tx pgx.Tx, m r2HoldReleaseManifest
 	if err := api.LockNASCleanupR2Retirement(ctx, tx); err != nil {
 		return err
 	}
+	// The database guard uses the same scope fence for direct inserts.
+	if _, err := tx.Exec(ctx, `SELECT lock_nas_cleanup_r2_release_scope()`); err != nil {
+		return err
+	}
 	ids := make([]int64, 0, len(m.Items))
 	for _, i := range m.Items {
 		ids = append(ids, i.ItemID)
