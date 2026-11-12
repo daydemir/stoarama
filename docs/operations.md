@@ -163,3 +163,19 @@ separately reviewed command/migration proving verified NAS copies, completed
 stitching and the page serving correctly from NAS (including Range, HEAD and
 existing downloader links). Creating a PR or a dry-run manifest installs none
 of these changes in production.
+
+### NAS client cleanup-batch-v5 delivery guard
+
+`cleanup-batch-v5` selects the eight-file serial cleanup group with the exact
+delivery-key/dependency guard and requires `delivery_keep_checked=true` on every
+unlink permit. The server accepts v5 for execution and grouped observation while
+retaining every predecessor. This carries forward v4's grouped cap transaction,
+batched diagnostics, durability ordering, and steady eight-file budget of 21
+SQLite commits / 45 fsyncs. Release with the existing NAS client release procedure;
+this change does not publish or deploy a client.
+
+The delivery migrations are `0189_delivery_keep_holds.sql` and
+`0190_delivery_r2_retirement_guards.sql`, following main's
+`0188_nas_cleanup_leased_index.sql`. Migration identities use full filenames.
+The upgrade regression applies main first, then both delivery migrations, checks
+the exact seed and R2 veto, and replays migration discovery without duplication.

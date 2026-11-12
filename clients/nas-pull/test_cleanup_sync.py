@@ -21,7 +21,7 @@ class CleanupSyncTests(unittest.TestCase):
                 env=dict(os.environ, **{('DYLD_INSERT_LIBRARIES' if mac else 'LD_PRELOAD'): library}),
                 capture_output=True, text=True, check=True)
             measured = json.loads(result.stdout)
-            self.assertEqual(measured['client'], 'cleanup-batch-v4')
+            self.assertEqual(measured['client'], 'cleanup-batch-v5')
             for sample in measured['samples']:
                 self.assertEqual(sample['sqlite_commits'], 21)
                 # 21 FULL-WAL syncs, 16 ledger syncs, 8 media-directory syncs.

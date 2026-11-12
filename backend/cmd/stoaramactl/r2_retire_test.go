@@ -348,7 +348,7 @@ INSERT INTO streams VALUES (3,'Asia/Tokyo'),(4,'America/Los_Angeles'),(5,'Asia/T
 INSERT INTO recordings VALUES (30,47,3,'UTC'),(40,47,4,'UTC'),(50,47,5,'UTC'),(60,48,3,'UTC');
 `)
 	for _, m := range []string{"0167_nas_cleanup_dryruns.sql", "0168_nas_cleanup_stage_timings.sql", "0169_nas_cleanup_queue_priority.sql",
-		"0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql", "0172_nas_cleanup_safeguards_validate.sql", "0174_r2_object_retirements.sql", "0173_nas_cleanup_throughput.sql", "0188_delivery_keep_holds.sql"} {
+		"0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql", "0172_nas_cleanup_safeguards_validate.sql", "0174_r2_object_retirements.sql", "0173_nas_cleanup_throughput.sql", "0189_delivery_keep_holds.sql"} {
 		body, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), m))
 		if err != nil {
 			t.Fatal(err)
@@ -1500,7 +1500,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 	})
 
 	t.Run("DeliveryHoldsVetoEveryClassBeforeAnyDelete", func(t *testing.T) {
-		migration, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), "0189_delivery_r2_retirement_guards.sql"))
+		migration, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), "0190_delivery_r2_retirement_guards.sql"))
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -56,7 +56,7 @@ func TestDeliveryKeepRegistryClosureAndDisagreement(t *testing.T) {
 func TestDeliveryKeepExactSeedAndNASDependencies(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
-	migration, err := os.ReadFile("../../../infra/sql/migrations/0188_delivery_keep_holds.sql")
+	migration, err := os.ReadFile("../../../infra/sql/migrations/0189_delivery_keep_holds.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
