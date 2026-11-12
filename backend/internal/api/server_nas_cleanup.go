@@ -60,7 +60,7 @@ const (
 	nasCleanupReconciliationProtocol = 1
 	// Exact reviewed release allowlist; git hashes have no sortable version order.
 	// Retain reviewed predecessors. Stage this fix only with explicit
-	// NAS_VERSION=cleanup-refusals-v1 from merged main; never reuse a predecessor version.
+	// NAS_VERSION=listing-fence-v1 from merged main; never reuse a predecessor version.
 	nasCleanupExecutionClientVersion          = "be17fd73"
 	nasCleanupSerialExecutionClientVersion    = "94d39bff"
 	nasCleanupDedicatedExecutionClientVersion = "523b70ff"
@@ -71,6 +71,8 @@ const (
 	nasCleanupV85RServerSwitchClientVersion   = "v85r-server-switch-v1"
 	nasCleanupV85RCorpusUAClientVersion       = "v85r-corpus-ua-v1"
 	nasCleanupRefusalClientVersion            = "cleanup-refusals-v1"
+	nasCleanupListingProofClientVersion       = "listing-proof-v1"
+	nasCleanupListingFenceClientVersion       = "listing-fence-v1"
 	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
 	// item limit only keeps one admission request bounded.
 	nasCleanupMaxPlanItems = 10000
@@ -562,7 +564,7 @@ func cleanupRequestSession(r *http.Request) cleanupClientSession {
 }
 
 func cleanupSessionDeadline(ctx context.Context, tx pgx.Tx, cid int64, session cleanupClientSession) (time.Time, error) {
-	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion && session.version != nasCleanupV85RClientVersion && session.version != nasCleanupV85RServerSwitchClientVersion && session.version != nasCleanupV85RCorpusUAClientVersion && session.version != nasCleanupRefusalClientVersion) {
+	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion && session.version != nasCleanupV85RClientVersion && session.version != nasCleanupV85RServerSwitchClientVersion && session.version != nasCleanupV85RCorpusUAClientVersion && session.version != nasCleanupRefusalClientVersion && session.version != nasCleanupListingProofClientVersion && session.version != nasCleanupListingFenceClientVersion) {
 		return time.Time{}, nil
 	}
 	var seen *time.Time
@@ -1384,7 +1386,7 @@ func cleanupApplyReceipt(ctx context.Context, q pgx.Tx, cid, id int64, req clean
 	var plan *int64
 	err = q.QueryRow(ctx, `WITH u AS (UPDATE nas_cleanup_items i SET
  state=CASE WHEN i.state='keep' AND i.outcome<>$7::jsonb THEN 'unverified' ELSE $6 END,
- outcome=CASE WHEN i.state='keep' AND i.outcome<>$7::jsonb THEN jsonb_build_object('certified_refusal',i.outcome,'contradictory_receipt',$7::jsonb) ELSE $7::jsonb END,updated_at=now()
+ outcome=CASE WHEN i.state='keep' AND i.outcome<>$7::jsonb THEN jsonb_build_object('certified_refusal',i.outcome,'contradictory_receipt',$7::jsonb) ELSE $7::jsonb END,updated_at=CASE WHEN i.state='delete_issued' OR i.outcome<>$7::jsonb THEN now() ELSE i.updated_at END
  FROM nas_cleanup_plans p WHERE i.id=$1 AND p.id=i.plan_id AND p.connection_id=$2 AND p.plan_sha256=$3 AND i.attempt=$4 AND i.proof_sha256=$5
  AND ($9::boolean AND (i.state='delete_issued' OR (i.state=$6 AND i.outcome=$7::jsonb)) OR (i.state='keep' AND i.delete_ever_issued AND i.outcome->>'refusal_protocol'='1'))
  RETURNING i.plan_id,i.state,i.outcome=$7::jsonb AND $9::boolean AS accepted),

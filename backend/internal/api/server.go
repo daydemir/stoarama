@@ -304,6 +304,7 @@ func (s *Server) router() http.Handler {
 			// so the principal is in context. Default-DENY: any non-pull account
 			// route 403s a pull key.
 			account.Use(s.confineAccountScope)
+			account.Use(s.fenceNASDelivery)
 			account.Get("/me", s.handleAccountMe)
 			account.Get("/global-street-scores-delivery/asset", s.handleGlobalDeliveryAsset)
 			account.Get("/global-street-scores-delivery/metadata", s.handleGlobalDeliveryAsset)
@@ -350,11 +351,13 @@ func (s *Server) router() http.Handler {
 			// in the key-OR-session group and is allowlisted in pullPathAllowed.
 			account.Post("/connections/heartbeat", s.handleAccountConnectionHeartbeat)
 			account.Post("/connections/inventory", s.handleAccountConnectionInventorySync)
+			account.Post("/connections/listing", s.handleAccountConnectionListing)
 			account.Post("/connections/stitch-certifications/claim", s.handleAccountNativeStitchClaim)
 			account.Post("/connections/stitch-certifications/complete", s.handleAccountNativeStitchComplete)
 			account.Post("/connections/space-audit", s.handleAccountConnectionSpaceAudit)
 			account.Post("/connections/upload-probe", s.handleAccountConnectionUploadProbe)
 			account.Post("/connections/upload-probe/{probeId}/result", s.handleAccountConnectionUploadProbeResult)
+			account.Post("/connections/redownload", s.handleAccountConnectionRedownload)
 			account.Post("/connections/nas-restore/lease", s.handleAccountConnectionRestoreLease)
 			account.Post("/connections/nas-restore/{taskId}/result", s.handleAccountConnectionRestoreResult)
 			account.Post("/connections/stitch/lease", s.handleAccountNASStitchLease)

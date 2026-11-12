@@ -670,6 +670,7 @@ class Config:
         self.outage_file = self.state_dir / "outage.json"
         self.capacity_file = self.state_dir / "capacity.json"
         self.inventory_file = self.state_dir / "inventory.sqlite3"
+        self.listing_enabled = threading.Event()
         self.current_file = self.state_dir / "stoarama_pull.py"
         self.candidate_file = self.state_dir / "stoarama_pull.candidate.py"
         self.previous_file = self.state_dir / "stoarama_pull.previous.py"
@@ -1495,6 +1496,157 @@ class Inventory:
         log("INFO", "inventory scan complete generation=%s clips=%d bytes=%d mismatches=%d unmatched=%d" % (generation, clips, total_bytes, mismatches, unmatched))
 
 
+# Independent metadata-only proof. It never opens media for reading or shares
+# the hashing inventory's activity lock. Failed/changing scans never complete.
+class ListingChanged(RuntimeError):
+    pass
+
+
+def listing_identity(path):
+    st = path.lstat()
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def listing_proof_once(cfg, stop_event):
+    if not os.path.ismount(str(cfg.output_dir)):
+        raise ListingChanged("listing clips mount is unavailable")
+    filename = cfg.state_dir / "listing-proof.sqlite3"
+    db = sqlite3.connect(str(filename))
+    db.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS dirs(path TEXT PRIMARY KEY,identity TEXT NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,folder TEXT NOT NULL,size INTEGER,mtime_ns INTEGER,inode INTEGER,device INTEGER,ctime_ns INTEGER)")
+    db.execute("CREATE TABLE IF NOT EXISTS uploaded(folder TEXT PRIMARY KEY,page INTEGER NOT NULL,last_path TEXT NOT NULL)")
+    db.execute("CREATE INDEX IF NOT EXISTS listing_folder_path ON files(folder,path)")
+    def get(key):
+        row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+    def put(key, value):
+        db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, value))
+        db.commit()
+    def post(body):
+        if stop_event.is_set():
+            raise InterruptedError("listing stopped")
+        return request_json(cfg, "POST", "/account/connections/listing", body=dict(body, generation=generation))
+    def stable(path, identity):
+        if listing_identity(path) != tuple(identity):
+            raise ListingChanged("directory membership changed during listing")
+    try:
+        generation = get("generation")
+        if generation is None:
+            root_identity = listing_identity(cfg.output_dir)
+            folders = ["."]
+            for p in cfg.output_dir.iterdir():
+                if p.is_symlink():
+                    raise ListingChanged("symlink in listing root")
+                if p.is_dir():
+                    folders.append(p.name)
+            folders.sort()
+            stable(cfg.output_dir, root_identity)
+            generation = uuid.uuid4().hex
+            # Persist before start, so a lost start response cannot change its
+            # start marker. No walk begins until the server acknowledged start.
+            db.executemany("INSERT OR REPLACE INTO meta VALUES(?,?)", [("generation", generation), ("folders", json.dumps(folders)), ("root_identity", json.dumps(root_identity))])
+            db.commit()
+        folders = json.loads(get("folders"))
+        if get("scanned") is None:
+            stable(cfg.output_dir, json.loads(get("root_identity")))
+        response = post({"action": "start", "folders": folders})
+        if response.get("complete") is True:
+            for table in ("meta", "dirs", "files", "uploaded"):
+                db.execute("DELETE FROM " + table)
+            db.commit()
+            return True
+        if get("scanned") is None:
+            stable(cfg.output_dir, json.loads(get("root_identity")))
+            # A restart rewalks metadata, validating all prior directory stamps.
+            # It cannot silently reuse an incomplete walk as absence evidence.
+            def walk(directory):
+                if stop_event.is_set():
+                    raise InterruptedError("listing stopped")
+                if directory.is_symlink():
+                    raise ListingChanged("symlink directory")
+                rel = str(directory.relative_to(cfg.output_dir))
+                identity = listing_identity(directory)
+                encoded = json.dumps(identity)
+                old = db.execute("SELECT identity FROM dirs WHERE path=?", (rel,)).fetchone()
+                if old and old[0] != encoded:
+                    raise ListingChanged("directory changed since listing checkpoint")
+                db.execute("INSERT OR IGNORE INTO dirs VALUES(?,?)", (rel, encoded))
+                db.commit()
+                # scandir is a full enumeration; every lstat failure aborts.
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        st = entry.stat(follow_symlinks=False)
+                        if stat_module.S_ISDIR(st.st_mode):
+                            walk(Path(entry.path))
+                        elif stat_module.S_ISREG(st.st_mode):
+                            p = str(Path(entry.path).relative_to(cfg.output_dir))
+                            folder = p.split("/", 1)[0] if "/" in p else "."
+                            db.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?)", (p, folder, st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev,st.st_ctime_ns))
+                        else:
+                            raise ListingChanged("non-regular entry prevents complete listing")
+                stable(directory, identity)
+                db.commit()
+                # Yield between directories; never throttle by media byte size.
+                if stop_event.wait(0.002):
+                    raise InterruptedError("listing stopped")
+            walk(cfg.output_dir)
+            put("scanned", "1")
+        def verify_mount():
+            if not os.path.ismount(str(cfg.output_dir)) or listing_identity(cfg.output_dir)[:2] != tuple(json.loads(get("root_identity")))[:2]:
+                raise ListingChanged("listing clips mount disappeared or changed")
+        # This is an immutable local snapshot. Every directory was stable
+        # around its enumeration; later managed writes are excluded by the
+        # server's per-path generation-start watermark, not upload duration.
+        verify_mount()
+        for folder in folders:
+            old = db.execute("SELECT page,last_path FROM uploaded WHERE folder=?", (folder,)).fetchone()
+            page, last_path = old if old else (0, "")
+            count, total = db.execute("SELECT count(*),coalesce(sum(size),0) FROM files WHERE folder=?", (folder,)).fetchone()
+            while page * 200 < count:
+                rows = db.execute("SELECT path,size,mtime_ns,inode,device,ctime_ns FROM files WHERE folder=? AND path>? ORDER BY path LIMIT 200", (folder, last_path)).fetchall()
+                post({"action": "page", "folder": folder, "page": page,
+                      "files": [dict(zip(("path", "size", "mtime_ns", "inode", "device", "ctime_ns"), row)) for row in rows]})
+                page += 1
+                last_path = rows[-1][0]
+                db.execute("INSERT OR REPLACE INTO uploaded VALUES(?,?,?)", (folder, page, last_path))
+                db.commit()
+                if stop_event.wait(0.05):
+                    raise InterruptedError("listing stopped")
+            post({"action": "folder_complete", "folder": folder, "page": page, "count": count, "bytes": total})
+        verify_mount()
+        post({"action": "complete"})
+        log("INFO", "hash-free listing completed generation=%s" % generation)
+        for table in ("meta", "dirs", "files", "uploaded"):
+            db.execute("DELETE FROM " + table)
+        db.commit()
+        return True
+    except ListingChanged:
+        # Retain the server's incomplete evidence as a presence veto; restart
+        # from a new start marker instead of completing a changed namespace.
+        for table in ("meta", "dirs", "files", "uploaded"):
+            db.execute("DELETE FROM " + table)
+        db.commit()
+        raise
+    finally:
+        db.close()
+
+
+def listing_proof_loop(cfg, stop_event):
+    if stop_event.wait(15):
+        return
+    while not stop_event.is_set():
+        try:
+            if cfg.listing_enabled.is_set() and NAS_MEDIA_FENCE.wait_maintenance(stop_event):
+                listing_proof_once(cfg, stop_event)
+                stop_event.wait(30)
+            else:
+                stop_event.wait(30)
+        except Exception as exc:
+            log("WARN", "hash-free listing incomplete: %s" % type(exc).__name__)
+            stop_event.wait(60)
+
+
 def inventory_loop(cfg, inventory, stop_event):
     # Let the main drain establish connectivity first; inventory is deliberately
     # background work and never blocks incoming clip delivery.
@@ -1680,10 +1832,14 @@ class Runtime:
     def apply_joined_protocol_response(self, response):
         version = response.get("joined_protocol_version") if isinstance(response, dict) else None
         generation = response.get("joined_protocol_generation") if isinstance(response, dict) else None
+        required = {"ok", "joined_delivery_accepted", "joined_protocol_version", "joined_protocol_generation"}
+        switches = {"listing_enabled", "stitch_enabled", "stitch_deletion_enabled"}
         valid = (
-            isinstance(response, dict) and set(response) == {
-                "ok", "joined_delivery_accepted", "joined_protocol_version", "joined_protocol_generation",
-            }
+            isinstance(response, dict) and required <= set(response)
+            and set(response) <= required | switches | {"cleanup_release_generation"}
+            and all(type(response[k]) is bool for k in switches if k in response)
+            and ("cleanup_release_generation" not in response or
+                 type(response["cleanup_release_generation"]) is int and 0 <= response["cleanup_release_generation"] <= 0x7fffffffffffffff)
             and response.get("ok") is True and type(response.get("joined_delivery_accepted")) is bool
             and type(version) is int and version in (0, JOINED_PROTOCOL_VERSION)
             and type(generation) is int and 0 <= generation <= 0x7fffffffffffffff
@@ -5138,10 +5294,10 @@ def native_stitch_manifest_hash(clips):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def download_verified(url, temp_path, expected_bytes, expected_sha):
+def download_verified(url, temp_path, expected_bytes, expected_sha, headers=None):
     digest = hashlib.sha256()
     written = 0
-    req = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT, **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as response, open(temp_path, "wb") as out:
             remember_response_secrets(response)
@@ -8826,7 +8982,7 @@ def write_stitch_sidecar(clip_path, clip):
 
 
 @NAS_MEDIA_FENCE.delivery
-def process_clip(cfg, clip, release=True):
+def process_clip(cfg, clip, release=True, prepare_download=None):
     clip_id = int(clip["clip_id"])
     recording_id = int(clip["recording_id"])
     expected_bytes = int(clip["size_bytes"])
@@ -8851,11 +9007,11 @@ def process_clip(cfg, clip, release=True):
         temp_path = final_path.with_name(final_path.name + ".part-%d" % clip_id)
 
         def download():
-            presigned = request_json(cfg, "GET", str(clip["download_path"]), base=cfg.origin)
+            presigned = prepare_download() if prepare_download else request_json(cfg, "GET", str(clip["download_path"]), base=cfg.origin)
             url = str(presigned.get("url", ""))
             if not url:
                 raise RuntimeError("clip %d presign returned no URL" % clip_id)
-            download_verified(url, temp_path, expected_bytes, expected_sha)
+            download_verified(url, temp_path, expected_bytes, expected_sha, presigned.get("headers"))
 
         _, retries = retry_transient(download, clip_id, "download")
         os.replace(str(temp_path), str(final_path))
@@ -9629,6 +9785,7 @@ def heartbeat_loop(cfg, runtime, stop_event):
         try:
             response = send_heartbeat(cfg, runtime, outage)
             cfg.stitch_switches.apply(response)
+            cfg.listing_enabled.set() if response.get("listing_enabled") is True else cfg.listing_enabled.clear()
             runtime.stitch_enabled = cfg.stitch_enabled
             runtime.apply_joined_protocol_response(response)
             if runtime.inventory is not None:
@@ -9638,6 +9795,7 @@ def heartbeat_loop(cfg, runtime, stop_event):
                 outage["recovered_at"] = utc_now()
                 response = send_heartbeat(cfg, runtime, outage)
                 cfg.stitch_switches.apply(response)
+                cfg.listing_enabled.set() if response.get("listing_enabled") is True else cfg.listing_enabled.clear()
                 runtime.stitch_enabled = cfg.stitch_enabled
                 runtime.apply_joined_protocol_response(response)
                 outage = None
@@ -33690,6 +33848,8 @@ def run(cfg):
         daemon=True,
     )
     updater.start()
+    listing_worker = threading.Thread(target=listing_proof_loop, args=(cfg, inventory_stop_event), daemon=True, name="nas-listing-proof")
+    listing_worker.start()
     inventory_worker = threading.Thread(
         target=inventory_loop, args=(cfg, inventory, inventory_stop_event), daemon=True,
     )
@@ -33784,6 +33944,7 @@ def run(cfg):
         heartbeat.join(timeout=HEARTBEAT_TIMEOUT_SEC + 1)
         storage_probe.join(timeout=1)
         inventory_worker.join(timeout=INVENTORY_SHUTDOWN_TIMEOUT_SEC)
+        listing_worker.join(timeout=HTTP_TIMEOUT_SEC + 1)
         joined_worker.join(timeout=HTTP_TIMEOUT_SEC + 1)
         if benchmark_worker is not None:
             # The watchdog kills benchmark children within a second of stop;
@@ -33795,7 +33956,7 @@ def run(cfg):
             cleanup_worker.join(timeout=HTTP_TIMEOUT_SEC + 5)
         cleanup_stuck = cleanup_worker is not None and cleanup_worker.is_alive()
         stitch_stuck = stitch_worker is not None and stitch_worker.is_alive()
-        joined_stuck = joined_worker.is_alive() or cleanup_stuck or stitch_stuck
+        joined_stuck = joined_worker.is_alive() or cleanup_stuck or stitch_stuck or listing_worker.is_alive()
         if joined_stuck:
             log("ERROR", "joined delivery worker did not stop; process must exit unclean")
             mark_runtime(cfg, runtime, PreviousExit.UNCLEAN_PROCESS.value)
@@ -34188,9 +34349,112 @@ def certify_media_canary_locked(cfg, recording_id, window_start, window_end, lim
     return report
 
 
+R2_RETIRE_COPY_POLICY = "060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811"
+
+
+def read_r2_copy_manifest(filename, expected_sha):
+    if Path(filename).stat().st_size > 16 * 1024 * 1024:
+        raise ValueError("use a bounded copy-batches manifest, at most 16 MiB")
+    raw = Path(filename).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha or not raw.endswith(b"\n"):
+        raise ValueError("copy manifest digest differs or file is truncated")
+    lines = raw.splitlines()
+    header = json.loads(lines[0])["header"]
+    if (header.get("phase") != "copy" or header.get("connection_id") != 13
+            or header.get("policy_sha256") != R2_RETIRE_COPY_POLICY or not header.get("nas_backed")):
+        raise ValueError("copy manifest policy/connection/phase differs")
+    items = [json.loads(line) for line in lines[1:]]
+    ids, paths = set(), set()
+    for item in items:
+        path = item.get("relative_path", "")
+        if (item.get("kind") != "raw" or item.get("choice") != "none" or item.get("reason") != "copy_to_nas"
+                or item.get("source_id", 0) <= 0 or item["source_id"] in ids or path in paths
+                or item.get("bucket") != header.get("bucket") or item.get("size_bytes", 0) <= 0
+                or not re.fullmatch(r"[a-f0-9]{64}", item.get("sha256", ""))):
+            raise ValueError("invalid or duplicate copy item")
+        if str(valid_relative_path({"clip_id": item["source_id"], "relative_path": path})) != path:
+            raise ValueError("non-canonical copy path")
+        ids.add(item["source_id"])
+        paths.add(path)
+    if len(items) > 5000 or len(items) != header["items"] or sum(i["size_bytes"] for i in items) != header["bytes"]:
+        raise ValueError("copy manifest totals differ")
+    return header, items
+
+
+def copy_r2_manifest(cfg, filename, expected_sha, max_bytes):
+    header, items = read_r2_copy_manifest(filename, expected_sha)
+    if max_bytes <= 0 or cfg.dry_run:
+        raise ValueError("copy requires a positive byte cap and non-dry-run NAS config")
+    cfg.validate()
+    # Same exclusive process lock as normal pull, inventory, cleanup and stitch.
+    # Operator stops the normal client first; an active client fails immediately.
+    with acquire_lock(cfg):
+        check_storage(cfg)
+        inventory = Inventory(cfg)
+        copied = 0
+        try:
+            for item in items:
+                body = {"clip_id": item["source_id"], "sha256": item["sha256"],
+                        "size_bytes": item["size_bytes"], "policy_sha256": header["policy_sha256"]}
+                def prepare():
+                    response = request_json(cfg, "POST", "/account/connections/redownload", body=body)
+                    clip = response.get("clip", {})
+                    if (response.get("policy_sha256") != R2_RETIRE_COPY_POLICY
+                            or clip.get("clip_id") != item["source_id"] or clip.get("recording_id") != item["recording_id"]
+                            or clip.get("sha256") != item["sha256"] or clip.get("size_bytes") != item["size_bytes"]
+                            or clip.get("relative_path") != item["relative_path"]):
+                        raise RuntimeError("copy source identity/policy changed")
+                    response["headers"] = {k: v[0] for k, v in response["headers"].items()}
+                    return response
+                response = prepare()
+                clip = response["clip"]
+                # Reject existing conflicts before process_clip can quarantine one.
+                final = cfg.output_dir / valid_relative_path(clip)
+                for path in [final, *final.parents]:
+                    if path == cfg.output_dir.parent:
+                        break
+                    if path.is_symlink():
+                        raise RuntimeError("copy path contains a symlink")
+                exists = verified_file(final, item["size_bytes"], item["sha256"])
+                sidecar = stitch_sidecar_path(final)
+                if sidecar.exists() or sidecar.is_symlink():
+                    existing_sidecar, _ = stable_regular_file_bytes(sidecar, 65536)
+                    if json.loads(existing_sidecar) != stitch_provenance(clip):
+                        raise RuntimeError("existing sidecar conflicts with copy source; preserved")
+                additional = 0 if exists else item["size_bytes"]
+                if copied + additional > max_bytes:
+                    break
+                capacity = storage_status(cfg)
+                if not capacity.get("available") or capacity["free_bytes"] < cfg.min_free_bytes + additional:
+                    raise RuntimeError("copy paused at the NAS free-space reserve")
+                process_clip(cfg, clip, release=False, prepare_download=prepare)
+                prepare()  # Recheck policy/holds before publishing NAS evidence.
+                # Rehash the committed bytes, with stable file identity, and
+                # bind the already-fsynced sidecar before reporting evidence.
+                size, sha, st = sha256_file_throttled_stable(final, cfg.inventory_hash_mbps, threading.Event())
+                if size != item["size_bytes"] or sha != item["sha256"]:
+                    raise RuntimeError("committed copy changed before inventory report")
+                sidecar = stitch_sidecar_path(final)
+                sidecar_bytes, _ = stable_regular_file_bytes(sidecar, 65536)
+                if json.loads(sidecar_bytes) != stitch_provenance(clip):
+                    raise RuntimeError("committed sidecar differs")
+                inventory._upsert(clip, "present", utc_now_precise(), st.st_mtime_ns,
+                                  file_identity=(st.st_ctime_ns, st.st_ino, st.st_dev),
+                                  sidecar_evidence=(str(sidecar.relative_to(cfg.output_dir)), len(sidecar_bytes),
+                                                    hashlib.sha256(sidecar_bytes).hexdigest()))
+                inventory.sync_clip_ids(cfg, [item["source_id"]])
+                copied += additional
+            return {"copied_or_verified_bytes": copied, "policy_sha256": R2_RETIRE_COPY_POLICY}
+        finally:
+            inventory.close()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Stoarama NAS pull client")
-    parser.add_argument("command", nargs="?", choices=("run", "check", "version", "self-update", "certify"), default="run")
+    parser.add_argument("command", nargs="?", choices=("run", "check", "version", "self-update", "certify", "copy-manifest"), default="run")
+    parser.add_argument("--manifest", default="")
+    parser.add_argument("--expected-sha256", default="")
+    parser.add_argument("--max-bytes", type=int, default=0)
     parser.add_argument("--recording-id", type=int, default=0)
     parser.add_argument("--window-start", default="")
     parser.add_argument("--window-end", default="")
@@ -34202,6 +34466,9 @@ def main(argv=None):
         print(CLIENT_VERSION)
         return 0
     cfg = Config()
+    if args.command == "copy-manifest":
+        print(json.dumps(copy_r2_manifest(cfg, args.manifest, args.expected_sha256, args.max_bytes), sort_keys=True))
+        return 0
     if args.command == "check":
         return check(cfg)
     if args.command == "self-update":

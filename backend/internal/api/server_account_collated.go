@@ -86,6 +86,7 @@ const collatedEligibleSQL = `
 	JOIN recordings r ON r.id=h.recording_id
 	JOIN connections conn ON conn.id=$1 AND conn.kind='nas_pull' AND r.account_id=conn.account_id
 	WHERE r.delivery='nas_pull' AND conn.collated_delivery_enabled
+	  AND nas_delivery_allowed(conn.id,'collated',o.id)
 	  -- Scope: only outputs collated from clips held for collated-only delivery
 	  -- (nasdelivery.HoldContractMode). The NAS already has the raw of every other
 	  -- output (e.g. the good+ backfill), so those stay in R2.
@@ -242,6 +243,11 @@ func (s *Server) handleAccountCollatedAck(w http.ResponseWriter, r *http.Request
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if err := lockNASRetirementPublisher(r.Context(), tx); err != nil {
+		util.WriteError(w, 503, "NAS evidence fence unavailable")
+		return
+	}
+
 	var rel, sha string
 	var size int64
 	err = tx.QueryRow(r.Context(), `SELECT o.nas_relative_path,o.size_bytes,o.sha256 FROM recording_collation_outputs o

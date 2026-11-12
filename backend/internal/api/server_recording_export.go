@@ -64,6 +64,9 @@ func (s *Server) handleAccountRecordingClipDownload(w http.ResponseWriter, r *ht
 	if !ok {
 		return
 	}
+	if !s.allowNASDelivery(w, r, "raw", clipID) {
+		return
+	}
 	s.writeRecordingClipDownload(w, r, principal.AccountID, recordingID, clipID, true)
 }
 
@@ -109,6 +112,10 @@ func (s *Server) writeRecordingClipDownload(w http.ResponseWriter, r *http.Reque
 	// for the org's download endpoint.
 	if purgedAt != nil || releasedAt != nil {
 		util.WriteError(w, http.StatusGone, "clip is no longer available")
+		return
+	}
+	if s.cfg.R2SignGetTTL <= 0 || s.cfg.R2SignGetTTL > 7*24*time.Hour {
+		util.WriteError(w, http.StatusServiceUnavailable, "download lifetime is outside the delivery lease bound")
 		return
 	}
 	if err := validateStorageEndpointHTTPS(d.endpoint); err != nil {

@@ -52,6 +52,7 @@ const joinedFeedHeadFromWhere = `
 		LEFT JOIN recording_joined_artifact_acks own_ack ON own_ack.artifact_id=a.id AND own_ack.connection_id=a.connection_id
 		JOIN connections c ON c.id=a.connection_id AND c.joined_protocol_version=1
 		WHERE a.connection_id=$1 AND a.batch_id=$2 AND own_ack.artifact_id IS NULL
+		  AND nas_delivery_allowed(a.connection_id,'joined',a.id)
 		  AND (a.artifact_kind<>'hour_manifest' OR h.source_clip_count>0 OR EXISTS(
 		    SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga WHERE ga.artifact_id=a.id
 		      AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id AND ga.hour_record_id=a.hour_record_id
@@ -226,6 +227,7 @@ func (s *Server) handleAccountJoinedDownload(w http.ResponseWriter, r *http.Requ
 		  AND ledger.stream_day_id=a.stream_day_id AND ledger.artifact_kind='allocation_ledger'
 		JOIN connections c ON c.id=a.connection_id AND c.joined_protocol_version=1
 		WHERE a.id=$1 AND a.connection_id=$2 AND a.account_id=$3 AND a.batch_id=$4
+		  AND nas_delivery_allowed(a.connection_id,'joined',a.id)
 		  AND (a.artifact_kind<>'hour_manifest' OR h.source_clip_count>0 OR EXISTS(SELECT 1
 		    FROM recording_joined_gap_only_scope_authorizations ga WHERE ga.artifact_id=a.id
 		      AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id AND ga.hour_record_id=a.hour_record_id

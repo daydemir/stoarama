@@ -32,6 +32,8 @@ jobs:
         run: python -I ops/jelly/r2-select/test_app.py -q
       - name: Test supervised Jelly cleanup runner without production access
         run: python -m unittest discover -s ops/jelly/cleanup-runner -p 'test_*.py' -q
+      - name: Test operator R2 conditional-delete probe without production access
+        run: python -m unittest discover -s ops/jelly/r2-retire -p 'test_*.py' -q
       - name: Test finite capability staging on the control host Python version
         run: python -m unittest discover -s infra/collation-v2 -p 'test_*.py' -q
 
@@ -87,7 +89,7 @@ jobs:
       - name: Test original NAS presentation witnesses first
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api ./cmd/stoaramactl ./internal/db -run '^Test(NASSelectedVerify|OriginalWitness|NASCleanup|NASStitch|NASClient|NASDiagnostics)' -count=1 -v
+        run: go test ./internal/api ./cmd/stoaramactl ./internal/db -run '^Test(NASDeliveryFence|NASRedownload|NASListing|NASSelectedVerify|OriginalWitness|NASCleanup|NASStitch|NASClient|NASDiagnostics)' -count=1 -v
       - name: Test cleanup receipt lock order and transaction replay under race detector
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
@@ -95,6 +97,9 @@ jobs:
       - name: NAS cleanup exact-file dry run and failure recovery
         working-directory: .
         run: python3 -m unittest discover -s clients/nas-pull -p test_cleanup.py -v
+      - name: Hash-free listing completeness and resumable metadata uploads
+        working-directory: .
+        run: python3 -m unittest discover -s clients/nas-pull -p test_listing_proof.py -v
       - name: Test fresh NAS directory observations first
         working-directory: .
         run: python3 -m unittest -q clients.nas-pull.test_stoarama_pull.SpaceAuditTests
@@ -281,7 +286,7 @@ jobs:
       - name: Test R2 retire selection and apply safety
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./cmd/stoaramactl -run '^Test(R2Retire|ParseR2RetirePicks)' -count=1 -v
+        run: go test ./cmd/stoaramactl -run '^Test(R2Fence|R2Retire|ParseR2RetirePicks)' -race -count=1 -v
       - name: Test selected-file NAS verification
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

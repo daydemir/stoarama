@@ -103,6 +103,7 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 		CREATE TABLE recording_collation_outputs(id BIGINT PRIMARY KEY,collation_hour_id BIGINT NOT NULL REFERENCES recording_collation_hours(id),part INTEGER NOT NULL,
 		  object_key TEXT NOT NULL,nas_relative_path TEXT NOT NULL UNIQUE,size_bytes BIGINT NOT NULL,sha256 TEXT NOT NULL,
 		  source_clip_ids BIGINT[] NOT NULL);
+		CREATE TABLE recording_clips(id bigint PRIMARY KEY,display_path text);
 		CREATE TABLE clip_storage_billing_contracts(clip_id BIGINT PRIMARY KEY,mode TEXT NOT NULL,authoritative BOOLEAN NOT NULL DEFAULT true);
 		INSERT INTO clip_storage_billing_contracts(clip_id,mode) SELECT g,'nas_collated_hold' FROM generate_series(1,1000) g;
 		INSERT INTO clip_storage_billing_contracts(clip_id,mode) VALUES(5000,'nas_pull_monthly');
@@ -125,6 +126,7 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	if _, err := pool.Exec(ctx, string(body)); err != nil {
 		t.Fatalf("apply 0174: %v", err)
 	}
+	installDeliveryFenceTestSchema(t, pool)
 	sha := strings.Repeat("a", 64)
 	dir := "f/July/26-Sunday/01_P_2026_July_W4_Sunday_hour_"
 	for _, o := range []struct {
