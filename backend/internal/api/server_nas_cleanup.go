@@ -1109,6 +1109,23 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 			return cleanupObserveResult{status: 200, body: map[string]any{"action": "delete_issued", "delete": true, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": oldRecovery, "expires_at": permitUntil.UTC(), "plan_paused": false, "replayed": true}}
 		}
 		if state != "delete_issued" && state != "deleted" && nasSpaceAuditJSONEqual(oldOutcome, retryBody) {
+			if mode == "dry_run" && state == "would_delete" && oldRecovery == "r2_present_unverified" {
+				pre, ok := s.cleanupRecoveryFor(id, item, mode, evidence, req.MD5, env)
+				if !ok || pre.recovery != "r2_sha_verified" || pre.out == nil || pre.method != "full_sha_recheck" {
+					return cleanupObserveResult{status: 503, body: map[string]any{"error": "recovery recheck not verified; retry or request a fresh dry run", "retryable": true}}
+				}
+				verified, _ := json.Marshal(pre.out)
+				// The plan/item locks above fence mode, attempt, manifest and
+				// outcome after prefetch. Keep the NAS proof's original freshness:
+				// recovery-only I/O cannot renew updated_at or issue a permit.
+				updated, err := tx.Exec(ctx, `UPDATE nas_cleanup_items SET recovery=$2,recovery_evidence=$3::jsonb,
+ stage_timings=jsonb_set(stage_timings,'{recovery_mode}','"full_sha_recheck"')
+ WHERE id=$1 AND NOT delete_ever_issued`, id, pre.recovery, string(verified))
+				if err != nil || updated.RowsAffected() != 1 {
+					return cleanupObserveError(503, "recovery recheck save failed")
+				}
+				return cleanupObserveResult{status: 200, write: true, body: map[string]any{"action": state, "delete": false, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": pre.recovery}}
+			}
 			return cleanupObserveResult{status: 200, body: map[string]any{"action": state, "delete": false, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof)}}
 		}
 		if state == "delete_issued" && req.Outcome == "match" && nasSpaceAuditJSONEqual(oldProof, req.Proof) {
@@ -1187,6 +1204,12 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 					return cleanupObserveResult{status: 503, body: map[string]any{"error": "recovery check not ready; retry", "retryable": true}}
 				}
 				recovery, recoveryEvidence = pre.recovery, pre.out
+				if mode == "dry_run" && s.r2 != nil && (recovery == "unchecked" || recovery == "r2_present_unverified") {
+					// No terminal acknowledgement for an incomplete R2 check.
+					// The client retains its observation for replay; lease expiry
+					// and the runner deadline bound persistent failures.
+					return cleanupObserveResult{status: 503, body: map[string]any{"error": "recovery check incomplete; retry", "retryable": true}}
+				}
 				stageTimings["recovery_mode"] = pre.method
 				action = "would_delete"
 				if recovery == "conflict" {

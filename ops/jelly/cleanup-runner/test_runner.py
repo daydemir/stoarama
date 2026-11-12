@@ -97,6 +97,41 @@ class DecisionTests(unittest.TestCase):
         p['results'][0]['state'] = 'leased'
         self.assertFalse(r.dry_state(p))
 
+    def test_unverified_recovery_waits_only_while_dry_run_in_progress(self):
+        for state in ('pending', 'leased', 'would_delete', 'conflict'):
+            p, _ = fixture()
+            p['results'][0]['recovery'] = 'r2_present_unverified'
+            p['items'].append(copy.deepcopy(p['items'][0]))
+            p['results'].append(dict(p['results'][0], ordinal=2, state=state,
+                                     recovery='r2_sha_verified'))
+            with self.subTest(state=state):
+                if state in ('pending', 'leased'):
+                    self.assertFalse(r.dry_state(p))
+                else:
+                    with self.assertRaises(r.Halt):
+                        r.dry_state(p)
+
+    def test_other_unverified_recovery_still_fails_during_progress(self):
+        for recovery in ('unchecked', 'nas_only_at_check', 'conflict', 'unknown'):
+            p, _ = fixture()
+            p['results'][0]['recovery'] = recovery
+            p['items'].append(copy.deepcopy(p['items'][0]))
+            p['results'].append(dict(p['results'][0], ordinal=2, state='pending'))
+            with self.subTest(recovery=recovery), self.assertRaises(r.Halt):
+                r.dry_state(p)
+
+    def test_wait_for_recovery_is_bounded_by_dry_run_deadline(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            job.p['results'][0]['recovery'] = 'r2_present_unverified'
+            job.p['items'].append(copy.deepcopy(job.p['items'][0]))
+            job.p['results'].append(dict(job.p['results'][0], ordinal=2, state='pending'))
+            with patch.object(r.time, 'monotonic', side_effect=[0, 1, 20*3600]), \
+                 patch.object(r.time, 'sleep') as sleep, \
+                 self.assertRaisesRegex(r.Halt, 'dry run timed out'):
+                r.Runner.await_dry(job, 42)
+            sleep.assert_called_once_with(60)
+
     def test_only_explicit_expiry_reasons_allow_replanning(self):
         p, _ = fixture()
         p['mode'] = 'paused'

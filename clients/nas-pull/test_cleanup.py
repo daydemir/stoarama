@@ -1378,6 +1378,32 @@ class CleanupProtocol2Tests(unittest.TestCase):
         for recovery, ok in (('r2_sha_verified', True), ('r2_md5_etag_matched', True), ('r2_etag_bound', False), ('unchecked', False)):
             self.assertEqual(pull.cleanup_verified_ack(self.task, proof, dict(decision, recovery=recovery)), ok, recovery)
 
+    def test_incomplete_dry_recovery_retries_identical_observation(self):
+        task = dict(self.task)
+        task.pop('approved_proof', None)
+        sent = []
+        def api(cfg, path, body, **kwargs):
+            self.assertTrue(path.endswith('/observe-batch'), path)
+            observation = body['observations'][0]
+            sent.append(json.loads(json.dumps(observation)))
+            if len(sent) == 1:
+                return dict(results=[dict(item_id=observation['item_id'], status=503,
+                                          error='recovery check incomplete; retry', retryable=True)])
+            return dict(results=[fixture_ack(observation, observation['item_id'], status=200,
+                                             action='would_delete', delete=False, recovery='r2_sha_verified')])
+        with mock.patch.object(pull, 'restore_api', side_effect=api), \
+             mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('dry run must not delete')):
+            batch = pull.CleanupBatchAPI(self.cfg)
+            try:
+                pull.cleanup_process_task(self.cfg, self.inventory, threading.Event(), task, batch)
+            finally:
+                batch.close()
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[0], sent[1])
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+        self.assertTrue(self.path.exists())
+        self.assertTrue(self.sidecar.exists())
+
     def test_batcher_sends_each_item_once_and_withdraws_abandoned_entries(self):
         sent = []
         release = threading.Event()
