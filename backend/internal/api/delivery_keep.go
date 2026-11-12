@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"sort"
 	"strconv"
@@ -186,13 +185,20 @@ func RequireDeliveryKeep(ctx context.Context, q deliveryKeepQuerier, s DeliveryK
 	return nil
 }
 
-func deliveryNASUnheld(ctx context.Context, q deliveryKeepQuerier, i nasCleanupItem) error {
+func deliveryNASHeld(ctx context.Context, q deliveryKeepQuerier, i nasCleanupItem) (bool, error) {
 	var held bool
 	if err := q.QueryRow(ctx, `SELECT delivery_nas_held($1,$2,$3,$4,$5)`, i.Kind, i.SourceID, i.RelativePath, i.SHA256, i.SizeBytes).Scan(&held); err != nil {
-		return errors.New("delivery NAS hold check unavailable; KEEP")
+		return false, errors.New("delivery NAS hold check unavailable; KEEP")
+	}
+	return held, nil
+}
+func deliveryNASUnheld(ctx context.Context, q deliveryKeepQuerier, i nasCleanupItem) error {
+	held, err := deliveryNASHeld(ctx, q, i)
+	if err != nil {
+		return err
 	}
 	if held {
-		return fmt.Errorf("DELIVERY KEEP HOLD: NAS file/dependency must remain")
+		return errors.New("DELIVERY KEEP HOLD: NAS file/dependency must remain")
 	}
 	return nil
 }
