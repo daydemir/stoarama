@@ -15,19 +15,11 @@ type r2RetireSingleDeleteStore interface {
 	DeleteObjectOnce(context.Context, string) error
 }
 
-// These writers hold credentials outside database admission. Prefixes are code
-// inventory, never operator-supplied evidence. Empty means bucket-wide authority.
-// Until operator/release credentials are provider-confined, ALL keys overlap;
-// stopping a process or submitting an attestation cannot narrow that authority.
+// Operator acknowledgment never waives these known writer destinations.
 func r2RetireCheckUngatedPrefix(key string) error {
-	writers := [...]struct{ family, prefix string }{
-		{"repair", "repaired/"},
-		{"releases-probes", ""}, // configurable release/probe destinations
-		{"operator-cli", ""},    // AWS CLI/curl/rclone and untracked credential holders
-	}
-	for _, w := range writers {
-		if strings.HasPrefix(key, w.prefix) {
-			return fmt.Errorf("key overlaps ungated %s writer authority; provider prefix confinement required", w.family)
+	for _, prefix := range []string{"repaired/", "nas-releases/", "relay-releases/", "staging/", "nas-probes/", "nas-space-audits/", ".stoarama-verify/", "r2-retire-probes/"} {
+		if strings.HasPrefix(key, prefix) {
+			return fmt.Errorf("key overlaps ungated writer prefix %s; acknowledgment cannot waive prefix exclusion", prefix)
 		}
 	}
 	return nil

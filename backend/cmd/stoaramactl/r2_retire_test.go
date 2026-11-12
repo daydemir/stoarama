@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -272,9 +273,12 @@ type fakeR2RetireStore struct {
 	beforeHead     func(key string)
 	deleteErr      error
 	headOverride   func(r2.ObjectHead) r2.ObjectHead
+	multipartErr   error
 	onceCalls      int
 	retainOnDelete bool
 }
+
+func (f *fakeR2RetireStore) RequireNoMultipartUploads(context.Context) error { return f.multipartErr }
 
 func (f *fakeR2RetireStore) Bucket() string         { return "stoarama" }
 func (f *fakeR2RetireStore) EndpointSHA256() string { return r2tSHA }
@@ -1217,7 +1221,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 				t.Fatal("unsupported item opened ledger", err)
 			}
 			_, err = r2RetireApply(ctx, pool, store, guarded, r2tPolicy, windows)
-			if err == nil || !strings.Contains(err.Error(), "ungated") || store.onceCalls != 0 {
+			if err == nil || !strings.Contains(err.Error(), "--accept-operator-credential-risk") || store.onceCalls != 0 {
 				t.Fatal("ungated writer authority did not veto before DELETE", err, store.onceCalls)
 			}
 			if _, err := os.Stat(guarded.LedgerPath); !os.IsNotExist(err) {
@@ -1225,6 +1229,53 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			}
 			if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_retirement_reservations WHERE source_id=712`).Scan(&reserved); err != nil || reserved != 0 {
 				t.Fatal("veto reserved", reserved, err)
+			}
+			guarded.AcceptOperatorCredentialRisk = "Deniz 2026-11-12: Accept our own keys (Recommended)"
+			// The acknowledgment cannot substitute for durable admission state.
+			if _, err := r2RetireApply(ctx, pool, store, guarded, r2tPolicy, windows); err == nil || !strings.Contains(err.Error(), "writer fence unavailable") {
+				t.Fatal(err)
+			}
+			exec(`ALTER TABLE streams ADD COLUMN recording_state text;
+             ALTER TABLE nas_restore_requests ADD COLUMN put_expires_at timestamptz;
+             ALTER TABLE recording_joined_artifacts ADD COLUMN publication_state text;
+             CREATE TABLE stream_capture_runtime(status text);
+             CREATE TABLE clip_transfer_jobs(status text); CREATE TABLE inference_box_jobs(status text);
+             CREATE TABLE nas_stitch_tasks(state text); CREATE TABLE recording_native_stitch_tasks(state text);
+             CREATE TABLE recording_presentation_v2_probe_tasks(state text);
+             CREATE TABLE recording_joined_hours(state text); CREATE TABLE recording_joined_stream_days(state text);
+             CREATE TABLE nas_stitch_outputs(id bigint); CREATE TABLE recording_native_stitch_certifications(id bigint);
+             CREATE TABLE media_objects(id bigint); CREATE TABLE frames(id bigint)`)
+			migration, err := os.ReadFile("../../../infra/sql/migrations/0187_r2_writer_admission_fence.sql")
+			if err != nil {
+				t.Fatal(err)
+			}
+			exec(string(migration))
+			exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama','` + r2tSHA + `');
+             SET session_replication_role=replica;
+             UPDATE r2_retirement_writer_fences SET drain_not_before=now()-interval '1 second';
+             RESET session_replication_role`)
+			defer exec(`DELETE FROM r2_retirement_writer_fences`)
+			store.multipartErr = errors.New("multipart inventory refused")
+			if _, err := r2RetireApply(ctx, pool, store, guarded, r2tPolicy, windows); err == nil || !strings.Contains(err.Error(), "multipart inventory refused") {
+				t.Fatal(err)
+			}
+			store.multipartErr = nil
+			result, err := r2RetireApply(ctx, pool, store, guarded, r2tPolicy, windows)
+			if err != nil || result.Retired != 1 || store.onceCalls != 1 || result.OperatorCredentialRisk == nil {
+				t.Fatalf("guarded apply: %+v %v calls=%d", result, err, store.onceCalls)
+			}
+			ledger, err := os.ReadFile(guarded.LedgerPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, line := range bytes.Split(bytes.TrimSpace(ledger), []byte("\n")) {
+				var receipt r2RetireLedgerLine
+				if err := json.Unmarshal(line, &receipt); err != nil {
+					t.Fatal(err)
+				}
+				if receipt.OperatorCredentialRisk == nil || *receipt.OperatorCredentialRisk != *result.OperatorCredentialRisk {
+					t.Fatalf("acknowledgment missing from receipt: %s", line)
+				}
 			}
 
 		})

@@ -39,7 +39,7 @@ def run():
     keys = [record["object_key"] for record in records[1:]]
     check_repair_stopped(keys)
     # The Go CLI independently refuses every repaired/ key, even when stopped,
-    # and every key overlapping other ungated writers. No local state waives it.
+    # and known release/probe prefixes. Operator acknowledgment cannot waive these.
     extra = opts.args[1:] if opts.args[:1] == ["--"] else opts.args
     if any(arg.split("=", 1)[0] in ("--manifest", "--expected-sha256") for arg in extra):
         raise RuntimeError("duplicate manifest options refused")

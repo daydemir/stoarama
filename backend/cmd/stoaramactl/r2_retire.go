@@ -448,29 +448,35 @@ func readR2RetireManifest(path string) (r2RetireHeader, []r2RetireItem, string, 
 
 // ---------------------------------------------------------------- ledger
 
+type r2RetireOperatorAcknowledgment struct {
+	DecisionReference string    `json:"decision_reference"`
+	At                time.Time `json:"at"`
+}
 type r2RetireLedgerLine struct {
-	ETag           string    `json:"etag,omitempty"`
-	LastModified   time.Time `json:"last_modified,omitzero"`
-	At             time.Time `json:"at"`
-	Event          string    `json:"event"`
-	ManifestSHA256 string    `json:"manifest_sha256"`
-	Kind           string    `json:"kind,omitempty"`
-	SourceID       int64     `json:"source_id,omitempty"`
-	StreamID       int64     `json:"stream_id,omitempty"`
-	ObjectKey      string    `json:"object_key,omitempty"`
-	SizeBytes      int64     `json:"size_bytes,omitempty"`
-	SHA256         string    `json:"sha256,omitempty"`
-	Detail         string    `json:"detail,omitempty"`
+	OperatorCredentialRisk *r2RetireOperatorAcknowledgment `json:"operator_credential_risk,omitempty"`
+	ETag                   string                          `json:"etag,omitempty"`
+	LastModified           time.Time                       `json:"last_modified,omitzero"`
+	At                     time.Time                       `json:"at"`
+	Event                  string                          `json:"event"`
+	ManifestSHA256         string                          `json:"manifest_sha256"`
+	Kind                   string                          `json:"kind,omitempty"`
+	SourceID               int64                           `json:"source_id,omitempty"`
+	StreamID               int64                           `json:"stream_id,omitempty"`
+	ObjectKey              string                          `json:"object_key,omitempty"`
+	SizeBytes              int64                           `json:"size_bytes,omitempty"`
+	SHA256                 string                          `json:"sha256,omitempty"`
+	Detail                 string                          `json:"detail,omitempty"`
 }
 
 // r2RetireLedger is append-only, exclusively locked, and fsynced per line.
 // An "intent" line is written (and synced) before every R2 delete, so a run
 // that crashed between the delete and the commit can be completed.
 type r2RetireLedger struct {
-	f       *os.File
-	path    string
-	intents map[string]bool
-	torn    int
+	operatorCredentialRisk *r2RetireOperatorAcknowledgment
+	f                      *os.File
+	path                   string
+	intents                map[string]bool
+	torn                   int
 }
 
 func openR2RetireLedger(path string) (*r2RetireLedger, error) {
@@ -519,6 +525,7 @@ func openR2RetireLedger(path string) (*r2RetireLedger, error) {
 
 func (l *r2RetireLedger) write(e r2RetireLedgerLine) error {
 	e.At = time.Now().UTC()
+	e.OperatorCredentialRisk = l.operatorCredentialRisk
 	b, err := json.Marshal(e)
 	if err != nil {
 		return err
@@ -540,6 +547,7 @@ func (l *r2RetireLedger) Close() error { return l.f.Close() }
 // ---------------------------------------------------------------- apply
 
 type r2RetireApplyOptions struct {
+	AcceptOperatorCredentialRisk   string
 	ProviderUnconditionalHeadGuard bool
 	MinObjectAge                   time.Duration
 	DeleteProofPath                string
@@ -558,21 +566,22 @@ type r2RetireApplyOptions struct {
 }
 
 type r2RetireApplySummary struct {
-	ResidualTOCTOU    bool             `json:"residual_toctou"`
-	ManifestSHA256    string           `json:"manifest_sha256"`
-	ManifestItems     int64            `json:"manifest_items"`
-	Retired           int64            `json:"retired"`
-	RetiredBytes      int64            `json:"retired_bytes"`
-	RetiredAbsent     int64            `json:"retired_already_absent"`
-	AlreadyDone       int64            `json:"already_done"`
-	SkippedIneligible map[string]int64 `json:"skipped_ineligible"`
-	Used24hBefore     int64            `json:"used_24h_bytes_before"`
-	LimitReached      string           `json:"limit_reached,omitempty"`
-	Interrupted       bool             `json:"interrupted"`
-	Anomaly           string           `json:"anomaly,omitempty"`
-	LedgerPath        string           `json:"ledger_path"`
-	SavedUSDPerMonth  float64          `json:"saved_usd_per_month"`
-	ElapsedSec        float64          `json:"elapsed_sec"`
+	OperatorCredentialRisk *r2RetireOperatorAcknowledgment `json:"operator_credential_risk,omitempty"`
+	ResidualTOCTOU         bool                            `json:"residual_toctou"`
+	ManifestSHA256         string                          `json:"manifest_sha256"`
+	ManifestItems          int64                           `json:"manifest_items"`
+	Retired                int64                           `json:"retired"`
+	RetiredBytes           int64                           `json:"retired_bytes"`
+	RetiredAbsent          int64                           `json:"retired_already_absent"`
+	AlreadyDone            int64                           `json:"already_done"`
+	SkippedIneligible      map[string]int64                `json:"skipped_ineligible"`
+	Used24hBefore          int64                           `json:"used_24h_bytes_before"`
+	LimitReached           string                          `json:"limit_reached,omitempty"`
+	Interrupted            bool                            `json:"interrupted"`
+	Anomaly                string                          `json:"anomaly,omitempty"`
+	LedgerPath             string                          `json:"ledger_path"`
+	SavedUSDPerMonth       float64                         `json:"saved_usd_per_month"`
+	ElapsedSec             float64                         `json:"elapsed_sec"`
 }
 
 type r2RetireApplier struct {
@@ -615,6 +624,12 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 			sum.Anomaly = a.msg
 		}
 	}()
+	if opts.ProviderUnconditionalHeadGuard && strings.TrimSpace(opts.AcceptOperatorCredentialRisk) == "" {
+		return sum, errors.New("HEAD-guard mode requires --accept-operator-credential-risk with an owner decision reference")
+	}
+	if !opts.ProviderUnconditionalHeadGuard && opts.AcceptOperatorCredentialRisk != "" {
+		return sum, errors.New("--accept-operator-credential-risk requires HEAD-guard mode")
+	}
 	if opts.ProviderUnconditionalHeadGuard && opts.MinObjectAge < 7*24*time.Hour {
 		return sum, errors.New("HEAD-guard mode requires --min-object-age >= 168h")
 	}
@@ -755,6 +770,13 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 		return sum, err
 	}
 	defer ledger.Close()
+	if opts.ProviderUnconditionalHeadGuard {
+		sum.OperatorCredentialRisk = &r2RetireOperatorAcknowledgment{DecisionReference: opts.AcceptOperatorCredentialRisk, At: time.Now().UTC()}
+		ledger.operatorCredentialRisk = sum.OperatorCredentialRisk
+		if err := ledger.write(r2RetireLedgerLine{Event: "operator_credential_risk_accepted", ManifestSHA256: digest, Detail: "operator/release credentials only; no footage writes during run; residual_toctou=true"}); err != nil {
+			return sum, err
+		}
+	}
 	a := &r2RetireApplier{pool: pool, store: store, opts: opts, header: h, digest: digest, picks: picks, windows: windows, policySH: policySHA, ledger: ledger,
 		scope: r2RetireScope{Class: h.Class, OwnerPolicy: r2RetireOwnerPolicy(windows, picks.Choices), AccountID: h.AccountID, ConnectionID: h.ConnectionID, Bucket: h.Bucket, Grace: time.Duration(h.GraceSeconds) * time.Second, HasRetirements: true, NASBacked: h.NASBacked}}
 	if a.sets, err = loadR2RetireSets(ctx, pool, digest, h.NASBacked, h.Class); err != nil {
@@ -1391,6 +1413,7 @@ func printR2RetirePlan(w io.Writer, sum r2RetirePlanSummary) {
 func runR2RetireApply(ctx context.Context, cfg config.Config, args []string, usage, policySHA string, windows map[int64]api.Keep28Window) {
 	fs := flag.NewFlagSet("r2-retire apply", flag.ContinueOnError)
 	var opts r2RetireApplyOptions
+	fs.StringVar(&opts.AcceptOperatorCredentialRisk, "accept-operator-credential-risk", "", "owner decision reference acknowledging operator/release tools will not write footage keys during this run; required in HEAD-guard mode; never waives prefix exclusions or other guards")
 	fs.BoolVar(&opts.ProviderUnconditionalHeadGuard, "provider-unconditional-delete-with-head-guard", false, "explicit residual TOCTOU acceptance; requires unsupported-provider probe, durable writer fence and real multipart inventory")
 	fs.DurationVar(&opts.MinObjectAge, "min-object-age", 7*24*time.Hour, "HEAD LastModified minimum age in HEAD-guard mode (minimum 168h)")
 	fs.StringVar(&opts.DeleteProofPath, "conditional-delete-proof", "", "operator provider-capability probe (required for NAS-backed apply; HEAD-guard mode requires unsupported result)")
@@ -1427,6 +1450,9 @@ func runR2RetireApply(ctx context.Context, cfg config.Config, args []string, usa
 		fmt.Printf("r2-retire apply manifest=%s items=%d retired=%d bytes=%d (already_absent=%d) already_done=%d skipped=%v used_24h_before=%d limit=%s interrupted=%t residual_toctou=%t saved_usd_month=%.2f elapsed=%.0fs ledger=%s\n",
 			sum.ManifestSHA256, sum.ManifestItems, sum.Retired, sum.RetiredBytes, sum.RetiredAbsent, sum.AlreadyDone, sum.SkippedIneligible,
 			sum.Used24hBefore, sum.LimitReached, sum.Interrupted, sum.ResidualTOCTOU, sum.SavedUSDPerMonth, sum.ElapsedSec, sum.LedgerPath)
+	}
+	if !*asJSON && sum.OperatorCredentialRisk != nil {
+		fmt.Printf("operator_credential_risk=%q accepted_at=%s\n", sum.OperatorCredentialRisk.DecisionReference, sum.OperatorCredentialRisk.At.Format(time.RFC3339Nano))
 	}
 	if err != nil {
 		log.Fatalf("r2-retire apply stopped: %v", err)

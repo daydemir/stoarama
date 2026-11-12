@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -63,9 +64,18 @@ func TestR2RetireHeadGuardProofMode(t *testing.T) {
 }
 
 func TestR2RetireHeadGuardUngatedWritersVeto(t *testing.T) {
-	for _, key := range []string{"repaired/a", "managed/acct-47/a.mp4", "joined/a", "raw/a", "exports/a", "r2-retire-probes/a"} {
+	for _, key := range []string{"repaired/a", "nas-releases/a", "relay-releases/a", "staging/a", "nas-probes/a", "nas-space-audits/a", ".stoarama-verify/a", "r2-retire-probes/a"} {
 		if err := r2RetireCheckUngatedPrefix(key); err == nil {
 			t.Fatalf("ungated credential authority accepted for %s", key)
+		}
+	}
+}
+
+func TestR2RetireOperatorAcknowledgmentRequired(t *testing.T) {
+	for _, reference := range []string{"", " ", "\n\t"} {
+		_, err := r2RetireApply(context.Background(), nil, nil, r2RetireApplyOptions{ProviderUnconditionalHeadGuard: true, AcceptOperatorCredentialRisk: reference}, "", nil)
+		if err == nil || !strings.Contains(err.Error(), "--accept-operator-credential-risk") {
+			t.Fatal(err)
 		}
 	}
 }

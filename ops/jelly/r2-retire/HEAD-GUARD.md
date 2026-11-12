@@ -36,9 +36,9 @@ approval to replace v7 or to backfill catalog ETags from unverified HEADs.
 These are all repository R2 write families, including helpers capable of using
 arbitrary destination prefixes. Every DB-driven family is covered by the durable
 SQL/wire admission gate below.
-Ungated credentials are restricted by conservative source prefixes, including
-universal authority where confinement is not established. Paths below are relative
-to the repository root.
+Ungated repair and known release/probe destinations remain prefix-excluded.
+Operator/release bucket-wide authority requires the recorded acknowledgment
+below. Paths below are relative to the repository root.
 
 | Writer family | Entry points / exact key rules | Work/capabilities to drain |
 | --- | --- | --- |
@@ -116,14 +116,24 @@ retirement; it is an inventory operation only.
 
 ## Ungated credentials and Jelly wrapper
 
-**The unconditional mode currently refuses every nonempty manifest.** Operator
-credentials and configurable release/probe tools have bucket-wide writer
-authority. Their inventory prefix is the empty prefix, which overlaps every key.
-The Go preflight refuses it before any ledger or reservation write. There is no
-operator-supplied prefix list, stopped-process claim or evidence digest that can
-waive this. Enabling this mode requires a separately reviewed provider-enforced
-credential confinement change and a corresponding narrowed code inventory.
-Neither stopping tools nor waiting seven days narrows credential authority.
+HEAD-guard apply requires
+`--accept-operator-credential-risk "Deniz 2026-11-12: Accept our own keys (Recommended)"`.
+The owner chose “Accept our own keys (Recommended)” on 2026-11-12:
+operator/release tools must not write footage keys during the run. This accepts
+only residual authority from those credentials; it does not assert provider
+confinement. Release destinations are configurable, so publishing must remain
+paused throughout the run, including custom destinations.
+
+The decision reference and UTC acceptance timestamp are fsynced in a run ledger
+entry before any reservation/delete, attached to every subsequent ledger receipt,
+and printed in the apply summary. A resumed invocation requires acknowledgment
+again and records a new timestamp. Empty/whitespace references fail closed.
+All admission fences, queue/capability drain, multipart inventory, unsupported
+provider proof, exact identities, seven-day age and #469 vetoes remain mandatory.
+Known operator destinations remain excluded regardless of acknowledgment:
+`nas-releases/`, `relay-releases/`, `staging/`, `nas-probes/`,
+`nas-space-audits/`, `.stoarama-verify/`, `r2-retire-probes/` and `repaired/`.
+
 Unbound R2 clients default to read-only. Explicit standalone/ungated synthetic
 clients (used by transport fixtures) establish no DB-fence safety; no production
 writer constructor selects that mode.
@@ -150,4 +160,4 @@ this race. The explicit flag accepts that residual risk only for a provider
 proved unsupported; prefer conditional DELETE whenever available. Run summary,
 run-start ledger and per-object guarded observations record residual TOCTOU;
 the ledger retains the provider proof digest and observed ETag/LastModified.
-Current universal-prefix refusal prevents accepting that residual race at all.
+The recorded operator acknowledgment accepts only the operator/release portion of that residual race.
