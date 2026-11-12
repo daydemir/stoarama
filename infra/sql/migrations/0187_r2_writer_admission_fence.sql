@@ -9,6 +9,11 @@ CREATE TABLE r2_retirement_writer_fences (
  -- plus bounded request time, regardless of job/intent consumption status.
  drain_not_before timestamptz NOT NULL DEFAULT clock_timestamp()+interval '7 days 2 minutes'
 );
+CREATE TABLE r2_retirement_writer_operations (
+ id bigserial PRIMARY KEY, bucket text NOT NULL,
+ started_at timestamptz NOT NULL DEFAULT clock_timestamp(), completed_at timestamptz
+);
+CREATE INDEX r2_retirement_writer_operations_active ON r2_retirement_writer_operations(bucket) WHERE completed_at IS NULL;
 CREATE TABLE r2_retirement_writer_capabilities (
  id bigserial PRIMARY KEY, bucket text NOT NULL, expires_at timestamptz NOT NULL
 );
@@ -28,6 +33,9 @@ CREATE FUNCTION r2_retirement_guard_fence() RETURNS trigger LANGUAGE plpgsql AS 
  END IF;
  IF NOT pg_try_advisory_xact_lock(7343226011173) THEN
   RAISE EXCEPTION 'R2 retirement apply is active';
+ END IF;
+ IF TG_OP='INSERT' AND EXISTS(SELECT 1 FROM r2_retirement_writer_operations WHERE completed_at IS NULL) THEN
+  RAISE EXCEPTION 'R2 durable wire intents have not drained';
  END IF;
  IF TG_OP='UPDATE' THEN RAISE EXCEPTION 'R2 writer fence is immutable'; END IF;
  IF TG_OP='DELETE' THEN RETURN OLD; END IF;
@@ -64,7 +72,7 @@ CREATE TRIGGER r2_writer_joined_publish BEFORE INSERT OR UPDATE ON recording_joi
 DO $$ DECLARE t text; BEGIN
  FOREACH t IN ARRAY ARRAY['recording_clips','recording_collation_hours','recording_collation_outputs',
  'nas_stitch_outputs','recording_native_stitch_certifications','media_objects','frames',
- 'r2_retirement_writer_capabilities'] LOOP
+ 'r2_retirement_writer_operations','r2_retirement_writer_capabilities'] LOOP
   EXECUTE format('CREATE TRIGGER r2_writer_insert BEFORE INSERT ON %I FOR EACH ROW EXECUTE FUNCTION r2_retirement_guard_admission()',t);
  END LOOP;
  FOREACH t IN ARRAY ARRAY['capture_session_leases','recording_upload_intents','upload_intents'] LOOP
@@ -81,6 +89,7 @@ CREATE FUNCTION r2_retirement_writers_drained(b text) RETURNS boolean LANGUAGE s
  OR EXISTS(SELECT 1 FROM capture_session_leases WHERE lease_expires_at>clock_timestamp())
  OR EXISTS(SELECT 1 FROM recording_upload_intents WHERE bucket=b AND expires_at>clock_timestamp())
  OR EXISTS(SELECT 1 FROM upload_intents WHERE bucket=b AND expires_at>clock_timestamp())
+ OR EXISTS(SELECT 1 FROM r2_retirement_writer_operations WHERE completed_at IS NULL)
  OR EXISTS(SELECT 1 FROM r2_retirement_writer_capabilities WHERE bucket=b AND expires_at>clock_timestamp())
  OR EXISTS(SELECT 1 FROM clip_transfer_jobs WHERE status IN ('pending','leased'))
  OR EXISTS(SELECT 1 FROM inference_box_jobs WHERE status IN ('pending','leased'))

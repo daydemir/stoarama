@@ -197,3 +197,30 @@ func TestR2WriterFenceWireAndCapabilityDrain(t *testing.T) {
 		}
 	}
 }
+
+func TestR2WriterFenceAmbiguousWireIntentRemainsAfterLockRelease(t *testing.T) {
+	ctx := context.Background()
+	pool := r2WriterFenceFixture(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(403) }))
+	defer server.Close()
+	client, err := r2.New(ctx, r2.Config{WriterDB: pool, Bucket: "bucket", Endpoint: server.URL, AccessKey: "fake", SecretKey: "fake"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.PutBytes(ctx, "managed/x", "", []byte("x")); err == nil {
+		t.Fatal("failed wire accepted")
+	}
+	var active int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM r2_retirement_writer_operations WHERE completed_at IS NULL`).Scan(&active); err != nil || active != 1 {
+		t.Fatal("durable intent lost", active, err)
+	}
+	if r2RetireCheckStoppedWriters(ctx, pool, "bucket") == nil {
+		t.Fatal("wire error disappeared from drain")
+	}
+	// The deferred DB lock is already released: it is the committed intent, not
+	// connection liveness or a timeout, that must block this activation.
+	_, err = pool.Exec(ctx, `INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('bucket','`+r2tSHA+`')`)
+	if err == nil || !strings.Contains(err.Error(), "durable wire intents") {
+		t.Fatal("unfinished wire intent did not veto", err)
+	}
+}

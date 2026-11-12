@@ -232,7 +232,7 @@ func (c *Client) presignPutCreateOnly(ctx context.Context, key, contentType stri
 	if err != nil || len(digest) != 32 {
 		return PresignedRequest{}, errors.New("presign create-only put: sha256 must be 64 lowercase hex characters")
 	}
-	release, err := c.admitWrite(ctx, ttl)
+	release, _, err := c.admitWrite(ctx, ttl)
 	if err != nil {
 		return PresignedRequest{}, err
 	}
@@ -270,7 +270,7 @@ func (c *Client) PresignPutSizedRequest(ctx context.Context, key, contentType st
 	if sizeBytes <= 0 {
 		return PresignedRequest{}, errors.New("presign sized put: size must be positive")
 	}
-	release, err := c.admitWrite(ctx, ttl)
+	release, _, err := c.admitWrite(ctx, ttl)
 	if err != nil {
 		return PresignedRequest{}, err
 	}
@@ -314,7 +314,7 @@ func (c *Client) PresignPut(ctx context.Context, key, contentType string, ttl ti
 	if ttl <= 0 {
 		return "", errors.New("PUT capability requires positive TTL")
 	}
-	release, err := c.admitWrite(ctx, ttl)
+	release, _, err := c.admitWrite(ctx, ttl)
 	if err != nil {
 		return "", err
 	}
@@ -337,7 +337,7 @@ func (c *Client) PresignPut(ctx context.Context, key, contentType string, ttl ti
 }
 
 func (c *Client) PutBytes(ctx context.Context, key, contentType string, body []byte) (string, error) {
-	release, err := c.admitWrite(ctx, 0)
+	release, complete, err := c.admitWrite(ctx, 0)
 	if err != nil {
 		return "", err
 	}
@@ -354,11 +354,14 @@ func (c *Client) PutBytes(ctx context.Context, key, contentType string, body []b
 	if err != nil {
 		return "", fmt.Errorf("put object %s: %w", key, err)
 	}
+	if err := complete(); err != nil {
+		return "", err
+	}
 	return cleanETag(aws.ToString(out.ETag)), nil
 }
 
 func (c *Client) PutReader(ctx context.Context, key, contentType string, body io.Reader) (string, error) {
-	release, err := c.admitWrite(ctx, 0)
+	release, complete, err := c.admitWrite(ctx, 0)
 	if err != nil {
 		return "", err
 	}
@@ -375,6 +378,9 @@ func (c *Client) PutReader(ctx context.Context, key, contentType string, body io
 	if err != nil {
 		return "", fmt.Errorf("put object %s: %w", key, err)
 	}
+	if err := complete(); err != nil {
+		return "", err
+	}
 	return cleanETag(aws.ToString(out.ETag)), nil
 }
 
@@ -386,7 +392,7 @@ func (c *Client) PutReaderIfAbsentVerified(ctx context.Context, key, contentType
 	if expectedSize <= 0 || expectedSize > MaxConditionalPutBytes || !isLowerHexSHA256(expectedSHA256) {
 		return ObjectHead{}, false, fmt.Errorf("invalid bounded immutable object identity")
 	}
-	release, err := c.admitWrite(ctx, 0)
+	release, complete, err := c.admitWrite(ctx, 0)
 	if err != nil {
 		return ObjectHead{}, false, err
 	}
@@ -432,6 +438,9 @@ func (c *Client) PutReaderIfAbsentVerified(ctx context.Context, key, contentType
 	if n != expectedSize || gotSHA != expectedSHA256 {
 		return ObjectHead{}, false, fmt.Errorf("immutable object %s content mismatch", key)
 	}
+	if err := complete(); err != nil {
+		return ObjectHead{}, false, err
+	}
 	return head, created, nil
 }
 
@@ -464,7 +473,7 @@ func isPreconditionFailed(err error) bool {
 // total object size. Use for multi-GB objects on small instances, where a
 // single PutObject of the whole body can exhaust memory. R2 is multipart-compatible.
 func (c *Client) PutMultipart(ctx context.Context, key, contentType string, body io.Reader) (string, error) {
-	release, err := c.admitWrite(ctx, 0)
+	release, complete, err := c.admitWrite(ctx, 0)
 	if err != nil {
 		return "", err
 	}
@@ -484,6 +493,9 @@ func (c *Client) PutMultipart(ctx context.Context, key, contentType string, body
 	out, err := uploader.Upload(ctx, in)
 	if err != nil {
 		return "", fmt.Errorf("multipart put %s: %w", key, err)
+	}
+	if err := complete(); err != nil {
+		return "", err
 	}
 	return cleanETag(aws.ToString(out.ETag)), nil
 }

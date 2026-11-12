@@ -15,6 +15,7 @@ func TestRequireNoMultipartUploadsUsesLiveBucketInventory(t *testing.T) {
 		status     int
 		allowed    bool
 	}{
+		{"missing completeness", `<ListMultipartUploadsResult/>`, 200, false},
 		{"empty", `<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>`, 200, true},
 		{"unfinished completion", `<ListMultipartUploadsResult><Upload><Key>managed/old.mp4</Key><UploadId>upload</UploadId></Upload><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>`, 200, false},
 		{"truncated", `<ListMultipartUploadsResult><IsTruncated>true</IsTruncated></ListMultipartUploadsResult>`, 200, false},

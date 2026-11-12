@@ -79,7 +79,10 @@ SQL admissions check the durable row under shared advisory lock 7343226011187.
 The R2 client uses the same gate for every single/multipart PUT and every PUT
 presign in DB-driven production constructors, including configurable transfer
 and storage-verification clients. The shared lock spans the entire upload,
-including multipart completion. Activation tries the exclusive lock and refuses
+including multipart completion. A wire intent is also committed before network
+I/O and completed only after success. Lost DB connections, process crashes and
+ambiguous wire errors leave that intent active indefinitely; lock loss, elapsed
+time or an operator attestation cannot establish drain. Activation tries the exclusive lock and refuses
 while any upload/admission is in flight, without queuing behind it. After
 activation, queued/leased jobs must finish or be canceled; they cannot acquire
 new PUT capabilities or start uploads. Terminal job transitions remain available.
