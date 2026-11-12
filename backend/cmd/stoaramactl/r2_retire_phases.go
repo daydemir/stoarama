@@ -322,27 +322,18 @@ func r2RetireLockNASIdentity(ctx context.Context, q r2RetireQuerier, it r2Retire
 }
 
 func (a *r2RetireApplier) reserve(ctx context.Context, it r2RetireItem) error {
+	columns := "kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256"
+	values := "$1,$2,$3,$4,$5,$6,$7"
+	predicate := "kind=$1 AND source_id=$2 AND bucket=$3 AND object_key=$4 AND size_bytes=$5 AND sha256=$6 AND manifest_sha256=$7"
+	args := []any{it.Kind, it.SourceID, it.Bucket, it.ObjectKey, it.SizeBytes, it.SHA256, a.digest}
 	if a.scope.Class == r2RetireOwnerAccepted {
-		tag, err := a.pool.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class)
- VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`, it.Kind, it.SourceID, it.Bucket, it.ObjectKey, it.SizeBytes, it.SHA256, a.digest, a.scope.Class)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 1 {
-			return nil
-		}
-		var same bool
-		err = a.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE kind=$1 AND source_id=$2 AND bucket=$3 AND object_key=$4 AND size_bytes=$5 AND sha256=$6 AND manifest_sha256=$7 AND retirement_class=$8)`, it.Kind, it.SourceID, it.Bucket, it.ObjectKey, it.SizeBytes, it.SHA256, a.digest, a.scope.Class).Scan(&same)
-		if err != nil {
-			return err
-		}
-		if !same {
-			return r2RetireAnomalyf("R2 identity reserved by another manifest or class")
-		}
-		return nil
+		columns += ",retirement_class"
+		values += ",$8"
+		predicate += " AND retirement_class=$8"
+		args = append(args, a.scope.Class)
 	}
-	tag, err := a.pool.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
- VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, it.Kind, it.SourceID, it.Bucket, it.ObjectKey, it.SizeBytes, it.SHA256, a.digest)
+	tag, err := a.pool.Exec(ctx, `INSERT INTO r2_retirement_reservations(`+columns+`) VALUES(`+values+`) ON CONFLICT DO NOTHING`, args...)
+
 	if err != nil {
 		return err
 	}
@@ -350,7 +341,7 @@ func (a *r2RetireApplier) reserve(ctx context.Context, it r2RetireItem) error {
 		return nil
 	}
 	var same bool
-	err = a.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE kind=$1 AND source_id=$2 AND bucket=$3 AND object_key=$4 AND size_bytes=$5 AND sha256=$6 AND manifest_sha256=$7)`, it.Kind, it.SourceID, it.Bucket, it.ObjectKey, it.SizeBytes, it.SHA256, a.digest).Scan(&same)
+	err = a.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE `+predicate+`)`, args...).Scan(&same)
 	if err != nil {
 		return err
 	}
