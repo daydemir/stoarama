@@ -23,6 +23,7 @@ type r2RetireProjection struct {
 
 	fenceItems, releaseItems []r2RetireItem
 	release, held            map[string]bool
+	reservedKeys             map[r2RetireObjectKey]bool
 	unsafePaths              map[string]bool
 	rawAliases               map[int64]string
 }
@@ -39,7 +40,7 @@ func loadR2RetireProjection(ctx context.Context, q r2RetireQuerier, path, digest
 	if json.Unmarshal(raw, &m) != nil || m.Tool != "r2-retire release-holds" || m.Version != 1 || m.PolicySHA != policy || m.PicksSHA != picks.SHA256 || time.Since(m.CreatedAt) > 24*time.Hour {
 		return nil, errors.New("hold release preview authority differs")
 	}
-	p := &r2RetireProjection{Class: m.Class, release: map[string]bool{}, held: map[string]bool{}}
+	p := &r2RetireProjection{Class: m.Class, release: map[string]bool{}, held: map[string]bool{}, reservedKeys: map[r2RetireObjectKey]bool{}}
 	itemIDs := []int64{}
 	for _, i := range m.Items {
 		p.release[retireIdentity(i.Candidate.Kind, i.Candidate.SourceID)] = true
@@ -120,18 +121,20 @@ WHERE m.clip_id IS NULL AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_clean
 		return nil, err
 	}
 	if reservations {
-		rows, err = q.Query(ctx, `SELECT kind,source_id FROM r2_retirement_reservations`)
+		rows, err = q.Query(ctx, `SELECT kind,source_id,bucket,object_key FROM r2_retirement_reservations`)
 		if err != nil {
 			return nil, err
 		}
 		for rows.Next() {
 			var kind string
 			var id int64
-			if err := rows.Scan(&kind, &id); err != nil {
+			var object r2RetireObjectKey
+			if err := rows.Scan(&kind, &id, &object.Bucket, &object.Key); err != nil {
 				rows.Close()
 				return nil, err
 			}
 			p.held[retireIdentity(kind, id)] = true
+			p.reservedKeys[object] = true
 		}
 		rows.Close()
 		if rows.Err() != nil {
@@ -155,7 +158,7 @@ func (p *r2RetireProjection) add(c r2RetireCandidate, scope r2RetireScope, picks
 	}
 	key := retireIdentity(c.Kind, c.SourceID)
 	if p.release[key] {
-		c.Facts.Held = p.held[key]
+		c.Facts.Held = p.held[key] || p.reservedKeys[r2RetireObjectKey{c.Bucket, c.ObjectKey}]
 		if scope.Class != r2RetireOwnerAccepted {
 			c.Facts.NASAbsent = true
 			// The receipt supersedes prior inventory, subject to a live recheck when

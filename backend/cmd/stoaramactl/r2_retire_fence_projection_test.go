@@ -72,3 +72,20 @@ func TestR2FenceProjectionPreservesVetoesAndCannotExecute(t *testing.T) {
 		}
 	}
 }
+
+func TestR2RetireOwnerProjectionKeepsReservedKeysWithOtherSourceIDs(t *testing.T) {
+	_, windows, err := api.Keep28Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := windows[3]
+	c := r2tCandidate("raw", 3, w.Timezone, w.Start.Add(-2*time.Hour), w.Start.Add(-time.Hour))
+	c.RelativePath = "p/outside.mp4"
+	c.Facts.Held = true
+	picks := r2RetirePicks{Choices: map[int64]r2RetirePick{3: {Choice: "none", KeepStartUTC: w.Start.Format(time.RFC3339), KeepEndUTC: w.End.Format(time.RFC3339)}}}
+	p := &r2RetireProjection{Class: r2RetireOwnerAccepted, release: map[string]bool{retireIdentity(c.Kind, c.SourceID): true}, held: map[string]bool{}, reservedKeys: map[r2RetireObjectKey]bool{{c.Bucket, c.ObjectKey}: true}}
+	p.add(c, r2RetireScope{Class: r2RetireOwnerAccepted, Bucket: c.Bucket, NASBacked: true}, picks, windows, false)
+	if p.AfterRelease.Objects != 0 {
+		t.Fatal("projection waived an object-key reservation")
+	}
+}
