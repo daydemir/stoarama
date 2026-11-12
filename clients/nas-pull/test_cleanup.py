@@ -481,9 +481,15 @@ class CleanupTests(unittest.TestCase):
 
     def test_cancelled_lease_is_not_reported_as_file_conflict(self):
         event=threading.Event();event.set()
-        with mock.patch.object(pull,'restore_api',return_value=dict(tasks=[self.task],retry_after_sec=0)) as api:
+        def reply(cfg, path, body, **kwargs):
+            if path.endswith('/lease'):
+                return dict(tasks=[self.task], retry_after_sec=0)
+            self.assertTrue(path.endswith('/reconcile'))
+            self.assertTrue(body['return_lease'])
+            return fixture_ack(body, action='pending', delete=False)
+        with mock.patch.object(pull,'restore_api',side_effect=reply) as api:
             with self.assertRaises(pull.CleanupInterrupted):pull.cleanup_once(self.cfg,self.inventory,event)
-        self.assertEqual(api.call_count,1)
+        self.assertEqual(api.call_count,2)
         self.assertFalse(pull.cleanup_journal(self.inventory));self.assertTrue(self.path.exists())
 
     def test_late_permit_rejected_independently_of_wall_clock(self):
