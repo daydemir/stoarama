@@ -1034,6 +1034,19 @@ class ReadRetryTests(unittest.TestCase):
                             sleep.assert_not_called()
                             self.assertEqual(opener.open.call_count,1)
 
+    def test_http_transport_and_truncated_read_errors_retry_with_sanitized_reasons(self):
+        for error in (TimeoutError('fake-sensitive'),r.urllib.error.URLError('fake-sensitive'),
+                      r.http.client.IncompleteRead(b'fake-sensitive')):
+            with self.subTest(error=type(error).__name__),tempfile.TemporaryDirectory() as root:
+                job=self.job(root)
+                opener=SimpleNamespace(open=unittest.mock.Mock(side_effect=[error,io.BytesIO(b'{}')]))
+                with patch.dict(os.environ,SERVICE_TOKEN='fake-test-token'), \
+                        patch.object(r.urllib.request,'build_opener',return_value=opener), \
+                        patch.object(r.time,'sleep') as sleep,patch.object(r.sys,'stderr',new=io.StringIO()) as stderr:
+                    self.assertEqual(job.api('GET','plans/42'),{})
+                sleep.assert_called_once_with(5)
+                self.assertNotIn('fake-sensitive',stderr.getvalue()+(Path(root)/'runner.jsonl').read_text())
+
     def test_monitor_survives_transient_reads_and_stops_immediately_on_anomaly(self):
         with tempfile.TemporaryDirectory() as root:
             job = self.job(root)
@@ -1146,6 +1159,25 @@ class RecoveryRetryTests(unittest.TestCase):
                 sleep.assert_not_called()
                 self.assertEqual(run.call_count,1)
                 self.assertNotIn('recovery_issued',job.status)
+
+    def test_exhausted_recovery_read_keeps_original_latch_off_and_stop(self):
+        with tempfile.TemporaryDirectory() as root:
+            job=FakeRunner(root)
+            job.status['current_plan']=42
+            job.recovery=lambda plan: r.Runner.recovery(job,plan)
+            failed=SimpleNamespace(returncode=1,stdout=b'',stderr=b'fake-sensitive')
+            with patch.object(r.subprocess,'run',return_value=failed) as run, \
+                    patch.object(r.time,'sleep') as sleep,patch.object(r.sys,'stderr',new=io.StringIO()):
+                job.fail('original failure')
+            self.assertEqual(run.call_count,7)
+            self.assertEqual(sum(c.args[0] for c in sleep.call_args_list),120)
+            self.assertEqual(job.status['last_error'],'original failure')
+            self.assertEqual(job.status['recovery_error'],'recovery verification: recovery CLI read failed')
+            self.assertTrue(job.status['shutdown_or_recovery_failed'])
+            self.assertEqual(job.events[0],'OFF')
+            self.assertTrue((Path(root)/'STOP').exists())
+            self.assertEqual(job.status['phase'],'failed')
+            self.assertNotIn('fake-sensitive',(Path(root)/'runner.jsonl').read_text())
 
     def test_failure_drains_before_fresh_report_and_recovery(self):
         with tempfile.TemporaryDirectory() as root:
