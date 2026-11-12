@@ -72,6 +72,9 @@ func (s *Server) fenceNASDelivery(next http.Handler) http.Handler {
 			util.WriteError(w, 403, "NAS connection is confined to pull delivery paths")
 			return
 		}
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+		defer cancel()
+		r = r.WithContext(ctx)
 		tx, err := s.pool.Begin(r.Context())
 		if err != nil {
 			util.WriteError(w, 503, "delivery admission unavailable")
@@ -94,10 +97,8 @@ func (s *Server) fenceNASDelivery(next http.Handler) http.Handler {
 			util.WriteError(w, 503, "delivery admission commit failed")
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
-		defer cancel()
 		response := &nasDeliveryResponse{header: make(http.Header)}
-		next.ServeHTTP(response, r.WithContext(ctx))
+		next.ServeHTTP(response, r)
 		if ctx.Err() != nil {
 			util.WriteError(w, 503, "delivery admission expired")
 			return
