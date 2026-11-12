@@ -76,6 +76,7 @@ class CleanupGroupTests(unittest.TestCase):
             requests.append(path)
             if path.endswith('/lease'):
                 self.assertTrue(body['execution_batch'])
+                offset[0] += .3
                 return dict(tasks=tasks)
             if path.endswith('/reconcile'):
                 self.assertTrue(body['return_lease'])
@@ -115,6 +116,7 @@ class CleanupGroupTests(unittest.TestCase):
                   for _, message in self.logs if message.startswith('cleanup pre-permit ')]
         ended = next(s for s in stages if s['stage'] == 'lane_end')
         self.assertGreaterEqual(ended['stage_timings']['lane_ms'], 15000)
+        self.assertGreaterEqual(ended['stage_timings']['lease_ms'], 300)
 
     def test_slow_real_proofs_return_entire_lease_before_expiry(self):
         tasks = self.group(2)

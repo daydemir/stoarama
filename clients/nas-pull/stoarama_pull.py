@@ -4169,7 +4169,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None):
     started = time.monotonic()
     owned, opened, observations, receipts, timings = [], [], [], [], []
     returned = set()
-    shared = {}
+    shared = {"lease_ms": max(t.get("_lease_elapsed_ms", 0) for t in tasks)}
     # One deadline for ALL proofs, including queued/fence time. Leave one
     # bounded reconciliation call per member before the earliest lease expiry.
     deadline = started + min(1800, min(
