@@ -66,7 +66,7 @@ func testNASCleanupSerialClientServer(t *testing.T, joinedSeconds int, grouped b
 	if slowJoined {
 		version = nasCleanupFenceProgressClientVersion
 		if grouped {
-			version = nasCleanupDurableGroupClientVersion
+			version = nasCleanupBatchedCapsClientVersion
 			count = 1
 		}
 		if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, version); err != nil {

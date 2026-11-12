@@ -820,7 +820,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		}
 	}
 	groupIDs := itemIDs
-	serial := req.ClientVersion == nasCleanupSerialGroupClientVersion || req.ClientVersion == nasCleanupDurableGroupClientVersion
+	serial := req.ClientVersion == nasCleanupSerialGroupClientVersion || req.ClientVersion == nasCleanupDurableGroupClientVersion || req.ClientVersion == nasCleanupBatchedCapsClientVersion
 	if serial && req.ExecutionBatch {
 		// The full lease roster still owns the execution slot. Only the current
 		// file requests fresh authority; earlier results may await one batch ack.
