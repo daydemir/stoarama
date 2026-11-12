@@ -789,6 +789,12 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if err != nil || !c.Facts.NASAbsent {
 			t.Fatal("valid listing absence rejected", err)
 		}
+		exec(`UPDATE recording_clips SET released_at=now() WHERE id=407`)
+		c, err = r2RetireLoadOne(ctx, pool, "raw", 407, scope, sets)
+		if err != nil || c.Facts.NASAbsent {
+			t.Fatal("write after listing start accepted as absence", err)
+		}
+		exec(`UPDATE recording_clips SET released_at=created_at WHERE id=407`)
 		exec(`INSERT INTO nas_listing_folders(connection_id,generation,folder) VALUES(13,repeat('a',32),'p');INSERT INTO nas_listing_files VALUES(13,repeat('a',32),'p','p/407.mp4',0,1,2,3,4)`)
 		c, err = r2RetireLoadOne(ctx, pool, "raw", 407, scope, sets)
 		if err != nil || c.Facts.NASAbsent || !c.Facts.ListingPresence {
@@ -821,6 +827,22 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		sets.Evidence.apply(&c)
 		if c.Facts.ExactNAS {
 			t.Fatal("planning accepted changed listed identity")
+		}
+		// A known alternate keep28 path is still NAS presence even when the
+		// catalog display path is absent, including bare/mismatched metadata.
+		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state,size_bytes,sha256,verified_at,server_received_at) VALUES(13,407,'_V85r_keep28/407.mp4','missing',1407,$1,now(),now())`, r2tSHA)
+		exec(`INSERT INTO nas_listing_folders(connection_id,generation,folder) VALUES(13,repeat('b',32),'_V85r_keep28');INSERT INTO nas_listing_files VALUES(13,repeat('b',32),'_V85r_keep28','_V85r_keep28/407.mp4',0,1,2,3,4)`)
+		c, err = r2RetireLoadOne(ctx, pool, "raw", 407, scope, sets)
+		if err != nil || !c.Facts.ListingPresence || c.Facts.NASAbsent {
+			t.Fatal("known keep28 alias lost presence veto", err)
+		}
+		sets, err = loadR2RetireSets(ctx, pool, "", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sets.Evidence.apply(&c)
+		if !c.Facts.ListingPresence || c.Facts.NASAbsent {
+			t.Fatal("planning lost known keep28 alias")
 		}
 		// Even if an incident receipt later becomes clean, it stays held forever.
 		exec(`UPDATE nas_cleanup_items SET state='deleted',outcome='{"outcome":"deleted"}' WHERE id=2406`)

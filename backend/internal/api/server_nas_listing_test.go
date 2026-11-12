@@ -61,6 +61,13 @@ func TestNASListingCompleteBoundedAndResumable(t *testing.T) {
 	if send("complete", "", 0, nil, 0, 0) != 200 || send("complete", "", 0, nil, 0, 0) != 200 {
 		t.Fatal("completion/retry failed")
 	}
+	var enabled bool
+	if err := pool.QueryRow(ctx, `SELECT nas_listing_enabled FROM connections WHERE id=13`).Scan(&enabled); err != nil || enabled {
+		t.Fatal("completed listing did not disarm", err)
+	}
+	if send("start", "", 0, nil, 0, 0) != 200 {
+		t.Fatal("lost completion response cannot resume")
+	}
 	var complete bool
 	if err := pool.QueryRow(ctx, `SELECT completed_at>=started_at FROM nas_listing_generations WHERE connection_id=13 AND generation=$1`, g).Scan(&complete); err != nil || !complete {
 		t.Fatal("server completion marker missing", err)
@@ -72,6 +79,7 @@ func TestNASListingCompleteBoundedAndResumable(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_listing_enabled=false WHERE id=13`); err != nil {
 		t.Fatal(err)
 	}
+	g = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	if send("start", "", 0, nil, 0, 0) != 403 {
 		t.Fatal("server OFF ignored")
 	}

@@ -209,12 +209,20 @@ change or manual NAS access is needed. The migration enables listing only for
 existing connection 13/account 47; the heartbeat's `listing_enabled` switch and
 `connections.nas_listing_enabled` remain server-controlled.
 
+The server disarms the listing job after a successful generation, preserving
+the proof and avoiding recurring namespace/database work. Re-enable
+`connections.nas_listing_enabled` server-side when another fresh proof is
+needed; completed-marker retries remain safe. No NAS container change is needed.
+
 The independent worker scans every top-level directory and root file, including
 `joined/`, `_V85r_keep28` trees and hidden directories. It reads directory
 entries and file stat metadata only, never media bytes. A separate SQLite
 checkpoint survives process restarts; uploads are keyset-paged in batches of
 200 with a small background yield. Every directory's device/inode/mtime/ctime
-must remain stable across the scan and the final validation. Missing mounts,
+must remain stable around its enumeration. The completed local snapshot is
+immutable while uploading; later managed writes are excluded by the server's
+generation-start watermark. The clips mount's device/inode must remain stable
+through upload and resume. Missing mounts,
 I/O failures, symlinks and concurrent membership changes prevent completion.
 An interrupted upload replays identical pages; a changed namespace restarts
 under a new generation. Partial generations only supply presence vetoes.
@@ -227,7 +235,8 @@ Retirement accepts absence only from a generation **started within 24 hours**
 and strictly after the path's latest known possible delivery/cursor write.
 Cursor advance time is recorded by the server after migration; unknown writer
 watermarks remain blocked. Collated outputs need their delivery ACK time.
-Any matching path in that generation or a later partial generation vetoes
+Any matching catalog path or known inventory alias (including keep28 paths)
+in that generation or a later partial generation vetoes
 retirement regardless of file size. A complete newer namespace proof can
 supersede older hash inventory/ACK observations; observations at/after the proof
 or from another connection continue to veto. A stale exact hash observation
