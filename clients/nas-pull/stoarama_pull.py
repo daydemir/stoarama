@@ -3397,11 +3397,20 @@ def cleanup_timed(timings, stage, fn, *args, **kwargs):
 
 def cleanup_return_unused(cfg, inventory, task, owner, error):
     """Durably return known unissued work; replay can only reconcile it."""
-    body = {"attempt": task["attempt"], "plan_sha256": task["plan_sha256"],
+    body = cleanup_unused_lease_body(task, error)
+    cleanup_journal(inventory, task["item_id"], "observe", body, owner=owner)
+    cleanup_send_unused(cfg, inventory, task, owner, body)
+
+
+def cleanup_unused_lease_body(task, error):
+    return {"attempt": task["attempt"], "plan_sha256": task["plan_sha256"],
             "outcome": "unverified", "proof": None, "error": str(error)[:500],
             "client_version": CLIENT_VERSION, "return_lease": True,
             "request_id": uuid.uuid4().hex}
-    cleanup_journal(inventory, task["item_id"], "observe", body, owner=owner)
+
+
+def cleanup_send_unused(cfg, inventory, task, owner, body):
+    """One bounded reconciliation attempt; retain the exact checkpoint on failure."""
     remaining = (parse_certification_timestamp(task["expires_at"], "cleanup lease") -
                  datetime.datetime.now(datetime.timezone.utc)).total_seconds()
     response = restore_api(cfg, "/account/connections/cleanup/%d/reconcile" % task["item_id"],
@@ -3708,7 +3717,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
 # protocol 2 reject it with HTTP 400 and the client keeps using protocol 1.
 CLEANUP_V2_LEASE = 64          # tasks per lease request (server maximum)
 CLEANUP_V2_WORKERS = 16        # concurrent dry-run file workers
-CLEANUP_GROUP_VERSION = "cleanup-batch-v2"
+CLEANUP_GROUP_VERSION = "cleanup-batch-v3"
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
 CLEANUP_V2_INFLIGHT = 64       # leased tasks held locally (running + queued)
@@ -4016,21 +4025,28 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                 if not lease["tasks"]:
                     exhausted = True
                     break
-                blocked = cleanup_blocked_items(inventory)
                 group = [t for t in lease["tasks"] if t.get("execution_batch") is True]
                 if group:
-                    if (CLIENT_VERSION != CLEANUP_GROUP_VERSION or len(group) != len(lease["tasks"])
-                            or any(t["item_id"] in blocked or t.get("approved_proof") is None for t in group)):
+                    if len(group) != len(lease["tasks"]):
                         raise CleanupResponseError("unsafe cleanup execution group")
-                    for future in pending:
-                        completed(future)
-                    pending.clear()
-                    if preflight is not None:
-                        preflight.start()
-                    cleanup_process_group(cfg, inventory, stop_event, group, lane=lane)
+                    # Receipt ownership is durable before draining prior workers,
+                    # starting lookahead, waiting for the lane or proving files.
+                    owned = cleanup_own_group(inventory, group)
+                    try:
+                        for future in pending:
+                            completed(future)
+                        pending.clear()
+                        if preflight is not None:
+                            preflight.start()
+                        cleanup_process_group(cfg, inventory, stop_event, group, lane=lane, owned=owned)
+                    finally:
+                        with inventory.lock:
+                            for task, owner in owned:
+                                inventory.cleanup_claims.pop(task["item_id"], None)
                     leased += len(group)
                     processed += len(group)
                     continue
+                blocked = cleanup_blocked_items(inventory)
                 for task in lease["tasks"]:
                     leased += 1
                     if task["item_id"] in blocked:
@@ -4154,28 +4170,50 @@ def cleanup_group_response(response, tasks):
     return {result["item_id"]: result for result in results}
 
 
-def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None):
-    """Prove a bounded lease, use fresh serial permits, batch durable receipts.
-
-    Only a live owned result certifies a refusal. An interrupted intent remains
-    uncertain, including a crash after unlink but before the result checkpoint.
-    """
-    import contextlib
+def cleanup_own_group(inventory, tasks):
+    """Journal every unused member atomically before any drain or proof."""
     if (CLIENT_VERSION != CLEANUP_GROUP_VERSION or not 1 <= len(tasks) <= CLEANUP_EXECUTION_GROUP
             or len({t["item_id"] for t in tasks}) != len(tasks)
             or len({t["plan_sha256"] for t in tasks}) != 1
             or any(t.get("execution_batch") is not True or t.get("approved_proof") is None for t in tasks)):
         raise CleanupResponseError("invalid cleanup execution group")
+    owned = []
+    with inventory.lock:
+        try:
+            for task in tasks:
+                owner = cleanup_reserve_item(inventory, task["item_id"])
+                if owner is None:
+                    raise CleanupResponseError("cleanup group has an unresolved checkpoint")
+                owned.append((task, owner))
+            cleanup_journal_group(inventory, [(task, owner, "observe",
+                cleanup_unused_lease_body(task, "client interrupted before cleanup observation"))
+                for task, owner in owned])
+        except BaseException:
+            for task, owner in owned:
+                inventory.cleanup_claims.pop(task["item_id"], None)
+            raise
+    return owned
+
+
+def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=None):
+    """Prove a durably owned lease, use fresh serial permits, batch receipts.
+
+    Only a live owned result certifies a refusal. An interrupted intent remains
+    uncertain, including a crash after unlink but before the result checkpoint.
+    """
+    import contextlib
+    release_owned = owned is None
+    owned = cleanup_own_group(inventory, tasks) if release_owned else owned
     started = time.monotonic()
-    owned, opened, observations, receipts, timings = [], [], [], [], []
+    opened, observations, receipts, timings = [], [], [], []
     returned = set()
     shared = {"lease_ms": max(t.get("_lease_elapsed_ms", 0) for t in tasks)}
     # One deadline for ALL proofs, including queued/fence time. Leave one
-    # bounded reconciliation call per member before the earliest lease expiry.
+    # bounded parallel reconciliation round before the earliest lease expiry.
     deadline = started + min(1800, min(
         (parse_certification_timestamp(t["expires_at"], "cleanup lease") -
          datetime.datetime.now(datetime.timezone.utc)).total_seconds() for t in tasks
-    ) - 20 - len(tasks) * CLEANUP_EXECUTION_OBSERVE_SEC)
+    ) - 20 - CLEANUP_EXECUTION_OBSERVE_SEC)
 
     def progress(stage, task=None, timing=None):
         facts = dict(stage=stage, item_ids=[t["item_id"] for t in tasks],
@@ -4190,11 +4228,6 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None):
     error = None
     with inventory.cleanup_execution_lock:
         try:
-            for task in tasks:
-                owner = cleanup_reserve_item(inventory, task["item_id"])
-                if owner is None:
-                    raise CleanupResponseError("cleanup group has an unresolved checkpoint")
-                owned.append((task, owner))
             progress("lane_start")
             if lane is not None:
                 try:
@@ -4319,15 +4352,20 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None):
         except BaseException as exc:
             error = str(exc)[:500]
             progress("aborted")
-            # No checkpoint means no permit request could have been sent.
-            # Once observations/intents/results exist, keep their exact bodies
-            # for reconciliation; never turn uncertain authority into a return.
+            # Only the initial unused-lease checkpoints may be returned.
+            # Preserve uncertain observations/intents/results byte for byte.
+            # All members are durable before transport; eight socket timeouts
+            # consume one 25s round, within the 125s shutdown join.
             if isinstance(exc, Exception):
-                checkpointed = {row[0] for row in cleanup_journal(inventory)}
-                for task, owner in owned:
-                    if task["item_id"] not in checkpointed:
+                unused = {item_id: json.loads(body) for item_id, phase, body in cleanup_journal(inventory)
+                          if phase == "observe" and json.loads(body).get("return_lease") is True}
+                with concurrent.futures.ThreadPoolExecutor(max_workers=CLEANUP_EXECUTION_GROUP,
+                        thread_name_prefix="cleanup-return") as returns:
+                    pending_returns = {returns.submit(cleanup_send_unused, cfg, inventory, task, owner,
+                        unused[task["item_id"]]): task for task, owner in owned if task["item_id"] in unused}
+                    for future, task in pending_returns.items():
                         try:
-                            cleanup_return_unused(cfg, inventory, task, owner, exc)
+                            future.result()
                             returned.add(task["item_id"])
                         except Exception as return_error:
                             log("ERROR", "cleanup item=%d unused lease return deferred: %s" %
@@ -4358,9 +4396,10 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None):
                 except Exception:
                     log("ERROR", "cleanup group execution diagnostics could not be stored")
                 log("INFO", "cleanup execution " + cleanup_json_bytes(outcome).decode())
-            with inventory.lock:
-                for task, owner in owned:
-                    inventory.cleanup_claims.pop(task["item_id"], None)
+            if release_owned:
+                with inventory.lock:
+                    for task, owner in owned:
+                        inventory.cleanup_claims.pop(task["item_id"], None)
 
 
 class CleanupPreflight:

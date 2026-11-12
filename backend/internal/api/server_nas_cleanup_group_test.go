@@ -26,10 +26,15 @@ func groupLease(t *testing.T, f *cleanupFixture, request string, versions ...str
 }
 
 func TestNASCleanupSerialGroupRosterAndReplay(t *testing.T) {
+	for _, version := range []string{nasCleanupSerialGroupClientVersion, nasCleanupDurableGroupClientVersion} {
+		t.Run(version, func(t *testing.T) { testNASCleanupSerialGroupRosterAndReplay(t, version) })
+	}
+}
+
+func testNASCleanupSerialGroupRosterAndReplay(t *testing.T, version string) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("serial-group", syntheticFiles(100, 20, 20))
 	f.dryRun()
-	version := nasCleanupSerialGroupClientVersion
 	if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, version); err != nil {
 		t.Fatal(err)
 	}
