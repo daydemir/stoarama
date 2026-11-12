@@ -321,6 +321,11 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if err := lockNASRetirementPublisher(r.Context(), tx); err != nil {
+		util.WriteError(w, 503, "NAS evidence fence unavailable")
+		return
+	}
+
 	var connectionID int64
 	var existingCompletedAt *time.Time
 	var activeGeneration, activeDatasetSchema string

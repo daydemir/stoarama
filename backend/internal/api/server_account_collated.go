@@ -242,6 +242,11 @@ func (s *Server) handleAccountCollatedAck(w http.ResponseWriter, r *http.Request
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if err := lockNASRetirementPublisher(r.Context(), tx); err != nil {
+		util.WriteError(w, 503, "NAS evidence fence unavailable")
+		return
+	}
+
 	var rel, sha string
 	var size int64
 	err = tx.QueryRow(r.Context(), `SELECT o.nas_relative_path,o.size_bytes,o.sha256 FROM recording_collation_outputs o

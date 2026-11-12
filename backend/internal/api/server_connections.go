@@ -978,6 +978,11 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if err := lockNASRetirementPublisher(r.Context(), tx); err != nil {
+		util.WriteError(w, 503, "NAS evidence fence unavailable")
+		return
+	}
+
 	var connectionID, cleanupReleaseGeneration int64
 	if err := tx.QueryRow(r.Context(), `SELECT id,coalesce(nas_cleanup_release_generation,0) FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`,
 		*principal.APIKeyID, principal.AccountID).Scan(&connectionID, &cleanupReleaseGeneration); err != nil {
