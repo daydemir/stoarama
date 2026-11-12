@@ -88,8 +88,9 @@ func cleanupObservationFailure(w http.ResponseWriter, ctx context.Context, statu
 // cleanupObserveEnv carries per-transaction caches for a batch of
 // observations. The zero value (single-item endpoint) caches nothing.
 type cleanupObserveEnv struct {
-	scopeLocked bool
-	session     cleanupClientSession
+	executionGroup []int64
+	scopeLocked    bool
+	session        cleanupClientSession
 	// Refuse an enable racing the initial mode lookup under the dry-run context.
 	dryRunOnly    bool
 	freshRequests map[int64]bool
@@ -727,8 +728,9 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		return
 	}
 	var req struct {
-		ClientVersion string                    `json:"client_version"`
-		Observations  []cleanupBatchObservation `json:"observations"`
+		ExecutionBatch bool                      `json:"execution_batch,omitempty"`
+		ClientVersion  string                    `json:"client_version"`
+		Observations   []cleanupBatchObservation `json:"observations"`
 	}
 	if util.DecodeJSON(r, &req) != nil || len(req.ClientVersion) == 0 || len(req.ClientVersion) > 64 || len(req.Observations) < 1 || len(req.Observations) > nasCleanupBatchItemsMax {
 		cleanupObservationFailure(w, ctx, 400, "client version and 1 to 64 observations required")
@@ -819,6 +821,24 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 	if err = cleanupLockItems(ctx, tx, cid, itemIDs); err != nil {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation fence unavailable")
 		return
+	}
+	if req.ExecutionBatch {
+		// Exempt only the complete group issued by ONE lease request, with the
+		// live reviewed session. Unrelated/uncertain work always blocks it.
+		if env.session.version != nasCleanupGroupClientVersion || req.ClientVersion != nasCleanupGroupClientVersion || len(itemIDs) != len(req.Observations) || len(itemIDs) > nasCleanupExecutionGroupMax {
+			cleanupObservationFailure(w, ctx, 409, "invalid cleanup execution group")
+			return
+		}
+		var complete bool
+		err = tx.QueryRow(ctx, `SELECT count(*)=$3 AND count(DISTINCT i.plan_id)=1 AND count(DISTINCT i.lease_request_id)=1
+          AND bool_and(i.lease_request_id IS NOT NULL AND i.lease_client_boot_id=$4 AND i.lease_client_version=$5 AND i.state='leased' AND p.mode='enabled')
+          AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id IN (SELECT plan_id FROM nas_cleanup_items WHERE id=ANY($1)) AND busy.state IN ('leased','delete_issued') AND NOT (busy.id=ANY($1)))
+          FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2`, itemIDs, cid, len(itemIDs), env.session.boot, env.session.version).Scan(&complete)
+		if err != nil || !complete {
+			cleanupObservationFailure(w, ctx, 409, "cleanup execution group differs or is incomplete")
+			return
+		}
+		env.executionGroup = itemIDs
 	}
 	env.scopeLocked = true
 	var anyEnabled bool
