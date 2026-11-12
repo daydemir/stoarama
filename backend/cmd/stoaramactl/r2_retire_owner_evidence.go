@@ -68,8 +68,8 @@ func r2RetireOwnerLiveEvidence(ctx context.Context, q r2RetireQuerier, c *r2Reti
 	}
 	if e.ListingSchema {
 		// Every generation counts, including partial and older completed walks.
-		if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_listing_files f WHERE f.connection_id=13 AND
- (f.relative_path=ANY($1) OR ($2='raw' AND EXISTS(SELECT 1 FROM nas_inventory_files n WHERE n.connection_id=13 AND n.clip_id=$3 AND n.relative_path=f.relative_path))))`, paths, c.Kind, c.SourceID).Scan(&c.Facts.ListingPresence); err != nil {
+		if err := q.QueryRow(ctx, `WITH paths AS (SELECT unnest($1::text[]) path UNION ALL SELECT relative_path FROM nas_inventory_files WHERE $2='raw' AND connection_id=13 AND clip_id=$3)
+ SELECT EXISTS(SELECT 1 FROM paths p CROSS JOIN LATERAL (SELECT 1 FROM nas_listing_files f WHERE f.connection_id=13 AND f.relative_path=p.path LIMIT 1) found)`, paths, c.Kind, c.SourceID).Scan(&c.Facts.ListingPresence); err != nil {
 			return err
 		}
 	}
