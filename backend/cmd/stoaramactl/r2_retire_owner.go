@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/api"
@@ -44,6 +45,18 @@ const r2OwnerPolicySQL = `WITH policy AS (SELECT * FROM jsonb_to_recordset($1::j
  AND o.start_at>='2020-01-01' AND o.end_at<'2028-01-01' AND o.end_at>o.start_at
  AND (o.end_at<=p.start OR o.start_at>=p."end") AND cardinality(o.source_clip_ids)>0
  AND NOT EXISTS(SELECT 1 FROM unnest(o.source_clip_ids) source WHERE NOT EXISTS(SELECT 1 FROM safe_raw s WHERE s.id=source)),false)) `
+
+// Bulk planning joins source membership once. The live query keeps indexed,
+// per-object lookups instead of rebuilding coverage for the entire catalog.
+func r2RetireOwnerPlanSQL() string {
+	sql := strings.Replace(r2OwnerPolicySQL, "unsafe_outputs AS (", `source_coverage AS MATERIALIZED (
+        SELECT o.id,bool_and(s.id IS NOT NULL) safe FROM recording_collation_outputs o
+        CROSS JOIN LATERAL unnest(o.source_clip_ids) source
+        LEFT JOIN safe_raw s ON s.id=source GROUP BY o.id),
+        unsafe_outputs AS (`, 1)
+	sql = strings.Replace(sql, "LEFT JOIN policy p ON p.stream=r.stream_id\n WHERE NOT", "LEFT JOIN policy p ON p.stream=r.stream_id LEFT JOIN source_coverage coverage ON coverage.id=o.id\n WHERE NOT", 1)
+	return strings.Replace(sql, `NOT EXISTS(SELECT 1 FROM unnest(o.source_clip_ids) source WHERE NOT EXISTS(SELECT 1 FROM safe_raw s WHERE s.id=source))`, "coalesce(coverage.safe,false)", 1)
+}
 
 func (s *r2RetireSets) loadOwnerProtections(ctx context.Context, q r2RetireQuerier, scope r2RetireScope, windows map[int64]api.Keep28Window, picks map[int64]r2RetirePick) error {
 	s.PresentRaw = map[int64]bool{}
@@ -90,7 +103,7 @@ func (s *r2RetireSets) loadOwnerProtections(ctx context.Context, q r2RetireQueri
 	s.ProtectedRaw = map[int64]bool{}
 	s.ProtectedCollated = map[int64]bool{}
 	s.SharedRawKeys = map[string]bool{}
-	rows, err := q.Query(ctx, r2OwnerPolicySQL+`SELECT id,source_clip_ids FROM unsafe_outputs`, r2RetireOwnerPolicy(windows, picks), scope.AccountID)
+	rows, err := q.Query(ctx, r2RetireOwnerPlanSQL()+`SELECT id,source_clip_ids FROM unsafe_outputs`, r2RetireOwnerPolicy(windows, picks), scope.AccountID)
 	if err != nil {
 		return err
 	}
