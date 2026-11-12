@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/daydemir/stoarama/backend/internal/api"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/api"
 )
 
 // These manifests are deliberately non-executable. They explain the delta
@@ -15,12 +16,17 @@ import (
 // complete listing confirms absence. They never manufacture production proof.
 type r2RetireProjection struct {
 	AfterRelease               r2RetireStat `json:"after_hold_release"`
+	FenceListingPotential      r2RetireStat `json:"after_fence_and_listing_upper_bound"`
+	FenceListingSHA            string       `json:"after_fence_and_listing_sha256"`
+	fenceItems                 []r2RetireItem
 	ListingPotential           r2RetireStat `json:"listing_absence_upper_bound"`
 	AfterReleaseSHA            string       `json:"after_hold_release_sha256"`
 	ListingSHA                 string       `json:"listing_absence_upper_bound_sha256"`
 	release                    map[string]bool
 	held                       map[string]bool
 	delivery                   map[string]bool
+	unsafePaths                map[string]bool
+	rawAliases                 map[int64]string
 	releaseItems, listingItems []r2RetireItem
 }
 
@@ -152,7 +158,13 @@ func loadR2RetireProjection(ctx context.Context, q r2RetireQuerier, path, digest
 		p.delivery[retireIdentity("collated", id)] = true
 	}
 	rows.Close()
-	return p, rows.Err()
+	if rows.Err() != nil {
+		return nil, rows.Err()
+	}
+	if err := p.loadFenceWriters(ctx, q); err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 func (p *r2RetireProjection) add(c r2RetireCandidate, scope r2RetireScope, picks r2RetirePicks, windows map[int64]api.Keep28Window, actualEligible bool) {
 	if actualEligible || !api.NASListingPathValid(c.RelativePath) {
@@ -174,6 +186,14 @@ func (p *r2RetireProjection) add(c r2RetireCandidate, scope r2RetireScope, picks
 		}
 	}
 	reason, choice, _ := r2RetireDecideForScope(c, scope, windows, picks.Choices)
+	if reason == "nas_absence_unproven" && !p.unsafePaths[c.RelativePath] && !(c.Kind == "raw" && p.unsafePaths[p.rawAliases[c.SourceID]]) && !(c.Kind == "collated" && p.unsafePaths["joined/"+c.RelativePath]) {
+		projected := c
+		projected.Facts.NASAbsent = true
+		if _, _, ok := r2RetireDecideForScope(projected, scope, windows, picks.Choices); ok {
+			p.FenceListingPotential.add(c.SizeBytes)
+			p.fenceItems = append(p.fenceItems, r2RetireItem{r2RetireCandidate: c, Reason: "conditional_on_delivery_fence_settlement_and_future_complete_listing_absence", Choice: choice})
+		}
+	}
 	if reason != "nas_absence_unproven" || !p.delivery[key] {
 		return
 	}
@@ -196,5 +216,11 @@ func (p *r2RetireProjection) write(dir string, h r2RetireHeader) error {
 	h.Items = p.ListingPotential.Objects
 	h.Bytes = p.ListingPotential.Bytes
 	p.ListingSHA, err = writeR2RetireManifest(filepath.Join(dir, "listing-absence-upper-bound.jsonl"), h, p.listingItems)
+	if err != nil {
+		return err
+	}
+	h.Items = p.FenceListingPotential.Objects
+	h.Bytes = p.FenceListingPotential.Bytes
+	p.FenceListingSHA, err = writeR2RetireManifest(filepath.Join(dir, "after-fence-and-listing-upper-bound.jsonl"), h, p.fenceItems)
 	return err
 }

@@ -304,6 +304,7 @@ func (s *Server) router() http.Handler {
 			// so the principal is in context. Default-DENY: any non-pull account
 			// route 403s a pull key.
 			account.Use(s.confineAccountScope)
+			account.Use(s.fenceNASDelivery)
 			account.Get("/me", s.handleAccountMe)
 			account.Get("/global-street-scores-delivery/asset", s.handleGlobalDeliveryAsset)
 			account.Get("/global-street-scores-delivery/metadata", s.handleGlobalDeliveryAsset)

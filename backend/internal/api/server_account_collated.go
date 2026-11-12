@@ -86,6 +86,7 @@ const collatedEligibleSQL = `
 	JOIN recordings r ON r.id=h.recording_id
 	JOIN connections conn ON conn.id=$1 AND conn.kind='nas_pull' AND r.account_id=conn.account_id
 	WHERE r.delivery='nas_pull' AND conn.collated_delivery_enabled
+	  AND nas_delivery_allowed(conn.id,'collated',o.id)
 	  -- Scope: only outputs collated from clips held for collated-only delivery
 	  -- (nasdelivery.HoldContractMode). The NAS already has the raw of every other
 	  -- output (e.g. the good+ backfill), so those stay in R2.

@@ -16,6 +16,10 @@ type r2RetireEvidence struct {
 	ObservedPaths                map[string]time.Time
 	ForeignRaw                   map[int64]bool
 	ListingSchema, ReleaseSchema bool
+	FenceSchema                  bool
+	FencedRaw, FencedCollated    map[int64]bool
+	Folders                      []string
+	FenceSettled                 *time.Time
 	Start                        time.Time
 	Paths                        map[string]bool
 	AbsentRaw, AbsentCollated    map[int64]bool
@@ -25,7 +29,7 @@ type r2RetireEvidence struct {
 func retireIdentity(kind string, id int64) string { return fmt.Sprintf("%s:%d", kind, id) }
 func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier) (*r2RetireEvidence, error) {
 	e := &r2RetireEvidence{RawPaths: map[int64]string{}, MismatchRaw: map[int64]bool{}, MismatchPaths: map[r2RetireNASIdentity]bool{}, ObservedRaw: map[int64]time.Time{}, ObservedPaths: map[string]time.Time{}, ForeignRaw: map[int64]bool{}, Paths: map[string]bool{}, AbsentRaw: map[int64]bool{}, AbsentCollated: map[int64]bool{}, Receipts: map[string]time.Time{}}
-	if err := q.QueryRow(ctx, `SELECT to_regclass('nas_listing_generations') IS NOT NULL,to_regclass('nas_cleanup_r2_effective_releases') IS NOT NULL`).Scan(&e.ListingSchema, &e.ReleaseSchema); err != nil {
+	if err := q.QueryRow(ctx, `SELECT to_regclass('nas_listing_generations') IS NOT NULL,to_regclass('nas_cleanup_r2_effective_releases') IS NOT NULL,to_regclass('nas_delivery_retirement_fences') IS NOT NULL`).Scan(&e.ListingSchema, &e.ReleaseSchema, &e.FenceSchema); err != nil {
 		return nil, err
 	}
 	if e.ReleaseSchema {
@@ -126,7 +130,7 @@ func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier) (*r2RetireEvid
 	if !e.ListingSchema {
 		return e, nil
 	}
-	err = q.QueryRow(ctx, `SELECT started_at FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL AND started_at>clock_timestamp()-interval '24 hours' ORDER BY started_at DESC LIMIT 1`).Scan(&e.Start)
+	err = q.QueryRow(ctx, `SELECT started_at,folders FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL AND started_at>clock_timestamp()-interval '24 hours' ORDER BY started_at DESC LIMIT 1`).Scan(&e.Start, &e.Folders)
 	if err == pgx.ErrNoRows {
 		err = nil
 	}
@@ -217,7 +221,13 @@ func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier) (*r2RetireEvid
 		e.AbsentCollated[id] = true
 	}
 	rows.Close()
-	return e, rows.Err()
+	if rows.Err() != nil {
+		return nil, rows.Err()
+	}
+	if err := loadR2FenceEvidence(ctx, q, e); err != nil {
+		return nil, err
+	}
+	return e, nil
 }
 func (e *r2RetireEvidence) apply(c *r2RetireCandidate) {
 	if e == nil {
@@ -233,7 +243,8 @@ func (e *r2RetireEvidence) apply(c *r2RetireCandidate) {
 		c.Facts.ExactNAS = false
 	}
 	c.Facts.ListingPresence = presence
-	c.Facts.NASAbsent = !presence && ((e.AbsentRaw[c.SourceID] && c.Kind == "raw") || (e.AbsentCollated[c.SourceID] && c.Kind == "collated") || !e.Receipts[retireIdentity(c.Kind, c.SourceID)].IsZero())
+	fenced := e.FenceSettled != nil && e.Start.After(*e.FenceSettled) && e.foldersCover(c) && ((c.Kind == "raw" && e.FencedRaw[c.SourceID]) || (c.Kind == "collated" && e.FencedCollated[c.SourceID]))
+	c.Facts.NASAbsent = !presence && (fenced || (e.foldersCover(c) && ((e.AbsentRaw[c.SourceID] && c.Kind == "raw") || (e.AbsentCollated[c.SourceID] && c.Kind == "collated"))) || !e.Receipts[retireIdentity(c.Kind, c.SourceID)].IsZero())
 	cutoff := e.Start
 	receipt := e.Receipts[retireIdentity(c.Kind, c.SourceID)]
 	if receipt.After(cutoff) {
@@ -265,7 +276,7 @@ func r2RetireLiveEvidence(ctx context.Context, q r2RetireQuerier, c *r2RetireCan
 			paths = append(paths, "joined/"+c.RelativePath)
 			watermark = `SELECT max(greatest(x.created_at,a.verified_at)) at FROM recording_collation_outputs x LEFT JOIN recording_collation_output_acks a ON a.output_id=x.id AND a.connection_id=13 WHERE x.nas_relative_path=(SELECT nas_relative_path FROM recording_collation_outputs WHERE id=$1) HAVING bool_and(a.output_id IS NOT NULL)`
 		}
-		err := q.QueryRow(ctx, `WITH g AS (SELECT started_at FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL AND started_at>clock_timestamp()-interval '24 hours' ORDER BY started_at DESC LIMIT 1),w AS (`+watermark+`) SELECT coalesce((SELECT g.started_at>w.at FROM g,w),false),EXISTS(SELECT 1 FROM nas_listing_files f JOIN nas_listing_generations n USING(connection_id,generation) WHERE f.connection_id=13 AND (f.relative_path=ANY($2) OR ($3::text='raw' AND EXISTS(SELECT 1 FROM nas_inventory_files known WHERE known.connection_id=13 AND known.clip_id=$1 AND known.relative_path=f.relative_path))) AND n.started_at>=coalesce((SELECT started_at FROM g),'-infinity'))`, c.SourceID, paths, c.Kind).Scan(&absent, &present)
+		err := q.QueryRow(ctx, `WITH g AS (SELECT started_at,folders FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL AND started_at>clock_timestamp()-interval '24 hours' ORDER BY started_at DESC LIMIT 1),w AS (`+watermark+`) SELECT coalesce((SELECT g.started_at>w.at AND NOT EXISTS(SELECT 1 FROM unnest($2::text[]) p WHERE NOT coalesce((CASE WHEN position('/' in p)>0 THEN split_part(p,'/',1) ELSE '.' END)=ANY(g.folders),false)) AND NOT EXISTS(SELECT 1 FROM nas_inventory_files known WHERE $3='raw' AND known.connection_id=13 AND known.clip_id=$1 AND NOT coalesce((CASE WHEN position('/' in known.relative_path)>0 THEN split_part(known.relative_path,'/',1) ELSE '.' END)=ANY(g.folders),false)) FROM g,w),false),EXISTS(SELECT 1 FROM nas_listing_files f JOIN nas_listing_generations n USING(connection_id,generation) WHERE f.connection_id=13 AND (f.relative_path=ANY($2) OR ($3::text='raw' AND EXISTS(SELECT 1 FROM nas_inventory_files known WHERE known.connection_id=13 AND known.clip_id=$1 AND known.relative_path=f.relative_path))) AND n.started_at>=coalesce((SELECT started_at FROM g),'-infinity'))`, c.SourceID, paths, c.Kind).Scan(&absent, &present)
 		if err != nil {
 			return err
 		}
@@ -282,6 +293,13 @@ func r2RetireLiveEvidence(ctx context.Context, q r2RetireQuerier, c *r2RetireCan
 		if mismatch {
 			c.Facts.ExactNAS = false
 		}
+	}
+	if e.FenceSchema {
+		var fenced bool
+		if err := q.QueryRow(ctx, r2FenceLiveAbsenceSQL, c.Kind, c.SourceID).Scan(&fenced); err != nil {
+			return err
+		}
+		absent = absent || fenced
 	}
 	c.Facts.ListingPresence = present
 	c.Facts.NASAbsent = absent && !present

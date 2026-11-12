@@ -780,7 +780,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		// absence. Bare missing/no-history and incomplete/stale generations do not.
 		clip(407, 30, outside)
 		exec(`UPDATE recording_clips SET released_at=created_at WHERE id=407;
- INSERT INTO nas_listing_generations(connection_id,generation,started_at,completed_at,folders) VALUES(13,repeat('a',32),now()-interval '1 hour',now(),ARRAY['.']);`)
+ INSERT INTO nas_listing_generations(connection_id,generation,started_at,completed_at,folders) VALUES(13,repeat('a',32),now()-interval '1 hour',now(),ARRAY['.','p']);`)
 		sets, err = loadR2RetireSets(ctx, pool, "", true)
 		if err != nil {
 			t.Fatal(err)
@@ -873,6 +873,71 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			if i.Candidate.SourceID == 296368 {
 				t.Fatal("incident lost permanent protection")
 			}
+		}
+	})
+
+	t.Run("DeliveryFenceRequiresPostSettlementScopedListing", func(t *testing.T) {
+		raw, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), "0185_nas_delivery_retirement_fence.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		exec(string(raw))
+		exec(`INSERT INTO recording_clips(id,recording_id,bucket,object_key,size_bytes,sha256,display_path,clip_start_at,clip_end_at,created_at) VALUES(10000001,30,'stoarama','managed/fenced',1000,$1,'p/fenced.mp4','2026-08-01','2026-08-01 00:01:00','2026-08-01')`, r2tSHA)
+		exec(`INSERT INTO recording_collation_outputs VALUES(10000002,900,'joined/nightly-collation-v2/fenced','f/fenced.mp4',2000,$1,'2026-08-01','2026-08-01 01:00:00',ARRAY[10000001]::bigint[],'2026-08-01')`, r2tSHA)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = api.ActivateNASDeliveryFence(ctx, tx); err != nil {
+			t.Fatal(err)
+		}
+		if err = tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		// Disposable test clock travel; no operator path can bypass expiry in production.
+		exec(`SET session_replication_role=replica;UPDATE nas_delivery_retirement_fences SET effective_at=now()-interval '9 days',legacy_expires_at=now()-interval '2 days';RESET session_replication_role`)
+		exec(`INSERT INTO nas_delivery_retirement_settlements(connection_id,drain_acknowledgment) VALUES(13,'NAS stopped and active transfers waited')`)
+		scope := r2RetireScope{AccountID: 47, ConnectionID: 13, Bucket: "stoarama", Grace: 7 * 24 * time.Hour, HasRetirements: true, NASBacked: true}
+		check := func(want bool) {
+			t.Helper()
+			sets, err := loadR2RetireSets(ctx, pool, "", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, identity := range []struct {
+				kind string
+				id   int64
+			}{{"raw", 10000001}, {"collated", 10000002}} {
+				c, err := r2RetireLoadOne(ctx, pool, identity.kind, identity.id, scope, sets)
+				if err != nil || c.Facts.NASAbsent != want {
+					t.Fatal(identity, "live absence", c.Facts.NASAbsent, want, err)
+				}
+				c.Facts.NASAbsent = false
+				sets.Evidence.apply(&c)
+				if c.Facts.NASAbsent != want {
+					t.Fatal(identity, "bulk absence", c.Facts.NASAbsent, want)
+				}
+			}
+		}
+		check(false) // completed listing started before durable fence settlement.
+		exec(`INSERT INTO nas_listing_generations(connection_id,generation,folders,completed_at) VALUES(13,repeat('d',32),ARRAY['.'],now())`)
+		check(false) // complete but missing the candidate folders.
+		exec(`INSERT INTO nas_listing_generations(connection_id,generation,folders,completed_at) VALUES(13,repeat('e',32),ARRAY['.','p','f','joined'],now())`)
+		check(true)
+		// A kept writer alias must revoke both identities' fence proof.
+		exec(`INSERT INTO recording_clips(id,recording_id,bucket,object_key,size_bytes,sha256,display_path,clip_start_at,clip_end_at,created_at) VALUES(10000003,30,'stoarama','managed/kept-alias',1000,$1,'p/fenced.mp4',$2,$2::timestamptz+interval '1 minute','2026-08-01')`, r2tSHA, windows[3].Start)
+		sets, err := loadR2RetireSets(ctx, pool, "", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := r2RetireLoadOne(ctx, pool, "raw", 10000001, scope, sets)
+		if err != nil || c.Facts.NASAbsent {
+			t.Fatal("kept path writer bypassed", err)
+		}
+		c.Facts.NASAbsent = false
+		sets.Evidence.apply(&c)
+		if c.Facts.NASAbsent {
+			t.Fatal("bulk kept path writer bypassed")
 		}
 	})
 

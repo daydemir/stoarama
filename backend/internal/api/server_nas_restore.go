@@ -205,7 +205,7 @@ func (s *Server) handleAccountConnectionRestoreLease(w http.ResponseWriter, r *h
 	rows, err := tx.Query(ctx, `
 		WITH picked AS (
 		  SELECT id FROM nas_restore_requests
-		  WHERE connection_id=$1 AND state='pending'
+		  WHERE connection_id=$1 AND state='pending' AND nas_delivery_allowed(connection_id,'raw',clip_id)
 		  ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED)
 		UPDATE nas_restore_requests q SET state='leased', attempts=q.attempts+1, leased_at=now(),
 		  first_leased_at=COALESCE(q.first_leased_at, now()),
@@ -346,6 +346,9 @@ func (s *Server) handleAccountConnectionRestoreResult(w http.ResponseWriter, r *
 	}
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "load restore failed")
+		return
+	}
+	if !s.allowNASDelivery(w, r, "raw", row.ClipID) {
 		return
 	}
 	if err := validateNASRestoreResult(req, row.SizeBytes, now); err != nil {

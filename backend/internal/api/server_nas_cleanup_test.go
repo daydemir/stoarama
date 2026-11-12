@@ -95,6 +95,7 @@ func cleanupTestPool(t *testing.T) *pgxpool.Pool {
 			t.Fatalf("%s: %v", name, err)
 		}
 	}
+	installDeliveryFenceTestSchema(t, pool)
 	return pool
 }
 func cleanupCall(t *testing.T, h http.HandlerFunc, account, key int64, idParam, id string, body any, session ...string) *httptest.ResponseRecorder {

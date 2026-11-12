@@ -60,6 +60,16 @@ func TestNASRedownloadPolicyAuthHoldsAndReadOnly(t *testing.T) {
 			t.Fatal("bad identity/key/policy accepted")
 		}
 	}
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = ActivateNASDeliveryFence(f.ctx, tx); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(f.ctx); err != nil {
+		t.Fatal(err)
+	}
 	out := call(47, ptrInt64(5), req)
 	if out.Code != 200 {
 		t.Fatalf("copy code=%d body=%s", out.Code, out.Body)

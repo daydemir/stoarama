@@ -594,6 +594,7 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 		}
 	}
 
+	installDeliveryFenceTestSchema(t, pool)
 	return pool, func() {
 		pool.Close()
 		_, _ = admin.Exec(context.Background(), fmt.Sprintf(`DROP SCHEMA %s CASCADE`, schema))
