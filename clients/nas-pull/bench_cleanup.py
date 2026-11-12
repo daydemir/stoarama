@@ -125,7 +125,16 @@ def run(args):
         # each active writer. Only a bounded execution window can pause raw.
         maintenance_threads = [threading.Thread(target=target, daemon=True)
                                for target in (delivery, delivery, raw_delivery)]
+    real_proof, real_fsync = pull.CleanupFile.proof, os.fsync
+    def delayed_proof(current):
+        time.sleep(args.proof_delay_ms / 1000)
+        return real_proof(current)
+    def delayed_fsync(fd):
+        time.sleep(args.fsync_delay_ms / 1000)
+        return real_fsync(fd)
     with mock.patch.object(pull, "poll_raw_pending_cached", return_value=True), \
+            mock.patch.object(pull.CleanupFile, "proof", delayed_proof), \
+            mock.patch.object(pull.os, "fsync", delayed_fsync), \
             mock.patch.object(pull.os.path, "ismount", side_effect=lambda p: str(p) == root or real_ismount(p)), \
             mock.patch.object(pull.os, "unlink", wraps=os.unlink) as unlink, \
             concurrent.futures.ThreadPoolExecutor(max_workers=pull.CLEANUP_V2_WORKERS, thread_name_prefix="nas-cleanup") as executor:
@@ -237,6 +246,8 @@ def main():
     r.add_argument("--state", required=True)
     r.add_argument("--client-version", default="be17fd73", help="reviewed execution release in the fixture heartbeat")
     r.add_argument("--boot-id", default="fixture-boot", help="live process identity in the fixture heartbeat")
+    r.add_argument("--proof-delay-ms", type=float, default=0, help="test-only fixed NAS proof latency")
+    r.add_argument("--fsync-delay-ms", type=float, default=0, help="test-only latency for each real fsync")
     r.add_argument("--pipeline", action="store_true", help="overlap two successor dry-run workers with serial execution")
     r.add_argument("--protocol", type=int, choices=(1, 2), default=2)
     r.add_argument("--max-seconds", type=float, default=1800)
