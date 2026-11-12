@@ -4244,6 +4244,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None):
                         current.check_active()
                         if current.deadline - time.monotonic() <= CLEANUP_EXECUTION_OBSERVE_SEC:
                             raise CleanupInterrupted("cleanup lease has insufficient time for another permit")
+                        progress("permit_start", task, timing)
                         permit_started = time.monotonic()
                         try:
                             # No retries/splitting after uncertainty. One file's

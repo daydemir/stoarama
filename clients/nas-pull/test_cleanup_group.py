@@ -46,8 +46,8 @@ class CleanupGroupTests(unittest.TestCase):
             ready = [json.loads(message.split('cleanup pre-permit ', 1)[1])
                      for _, message in self.logs if message.startswith('cleanup pre-permit ')]
             for observation in body['observations']:
-                stage = next(s for s in ready if s.get('item_id') == observation['item_id'] and s['stage'] == 'proof_ready')
-                self.assertTrue({'lease_ms', 'open_ms', 'proof_ms', 'guard_ms', 'fence_ms'} <= set(stage['stage_timings']))
+                stage = next(s for s in ready if s.get('item_id') == observation['item_id'] and s['stage'] == 'permit_start')
+                self.assertTrue({'lease_ms', 'open_ms', 'proof_ms', 'guard_ms', 'fence_ms', 'observe_journal_ms', 'caps_ms'} <= set(stage['stage_timings']))
             rows = {n: phase for n, phase, _ in pull.cleanup_journal(self.inventory)}
             self.assertTrue(all(rows[b['item_id']] == 'observe' for b in body['observations']))
             return {'results': [fixture_ack(b, b['item_id'], status=200, action='delete_issued', delete=True,
