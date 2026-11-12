@@ -26,7 +26,7 @@ func groupLease(t *testing.T, f *cleanupFixture, request string, versions ...str
 }
 
 func TestNASCleanupSerialGroupRosterAndReplay(t *testing.T) {
-	for _, version := range []string{nasCleanupSerialGroupClientVersion, nasCleanupDurableGroupClientVersion, nasCleanupBatchedCapsClientVersion} {
+	for _, version := range []string{nasCleanupSerialGroupClientVersion, nasCleanupDurableGroupClientVersion, nasCleanupBatchedCapsClientVersion, nasCleanupDeliveryHoldClientVersion} {
 		t.Run(version, func(t *testing.T) { testNASCleanupSerialGroupRosterAndReplay(t, version) })
 	}
 }

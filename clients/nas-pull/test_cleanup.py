@@ -19,7 +19,7 @@ spec.loader.exec_module(pull)
 
 
 def fixture_ack(body, item_id=1, **fields):
-    ack = dict(item_id=item_id, attempt=body['attempt'], plan_sha256=body['plan_sha256'],
+    ack = dict(delivery_keep_checked=True,item_id=item_id, attempt=body['attempt'], plan_sha256=body['plan_sha256'],
                proof_sha256=(hashlib.sha256(json.dumps(body.get('proof')).encode()).hexdigest()
                              if 'proof_sha256' not in body else body['proof_sha256']))
     ack.update(fields)
@@ -127,7 +127,7 @@ class CleanupTests(unittest.TestCase):
         def api(cfg,path,body, **kwargs):
             if path.endswith('/lease'):return dict(tasks=[self.task],retry_after_sec=0)
             if path.endswith('/observe'):
-                return dict(action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
+                return dict(delivery_keep_checked=True,action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
                             proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
                             expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
             self.assertEqual(body['outcome'],'deleted');return fixture_ack(body, int(path.split("/")[-2]), ok=True)
@@ -226,7 +226,7 @@ class CleanupTests(unittest.TestCase):
         body = dict(attempt=1, plan_sha256='a'*64, outcome='match', proof=None, error='')
         pull.cleanup_journal(self.inventory, 1, 'observe', body)
         original = pull.cleanup_journal(self.inventory)
-        with mock.patch.object(pull, 'restore_api', return_value=fixture_ack(body, action='delete_issued', delete=True)) as api:
+        with mock.patch.object(pull, 'restore_api', return_value=fixture_ack(body, delivery_keep_checked=True, action='delete_issued', delete=True)) as api:
             counts = pull.cleanup_replay_receipts(self.cfg, self.inventory)
         self.assertEqual(counts['failed'], 1)
         self.assertEqual(api.call_count, 1)
@@ -499,7 +499,7 @@ class CleanupTests(unittest.TestCase):
             if path.endswith('/lease'):return dict(tasks=[self.task],retry_after_sec=0)
             if path.endswith('/observe'):
                 offset[0]=35
-                return dict(action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
+                return dict(delivery_keep_checked=True,action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
                             proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
                             expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
             self.assertEqual(body['outcome'], 'unverified')
@@ -517,10 +517,11 @@ class CleanupTests(unittest.TestCase):
     def test_permit_refusal_reasons_are_distinct(self):
         with self.opened() as current:
             proof = current.proof()
-        decision = fixture_ack(dict(attempt=1, plan_sha256='a'*64, proof=proof), action='delete_issued', delete=True,
+        decision = fixture_ack(dict(attempt=1, plan_sha256='a'*64, proof=proof), delivery_keep_checked=True, action='delete_issued', delete=True,
                                expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
         expired = dict(decision, expires_at=(datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(seconds=1)).isoformat())
-        for response, reason in ((dict(decision, proof_sha256='b'*64), 'proof_mismatch'), (expired, 'permit_expired')):
+        for response, reason in ((dict(decision, proof_sha256='b'*64), 'proof_mismatch'), (expired, 'permit_expired'), (dict(decision, delivery_keep_checked=False), 'local_guard'),
+                                 (dict(decision, delivery_keep_checked=None), 'local_guard')):
             with self.subTest(reason=reason), self.assertRaises(pull.CleanupPermitRefused) as caught:
                 pull.cleanup_check_permit(self.cfg, True, self.task, proof, response, time.monotonic())
             self.assertEqual(caught.exception.reason, reason)
@@ -531,7 +532,7 @@ class CleanupTests(unittest.TestCase):
         receipts = []
         def api(cfg, path, body, **kwargs):
             if path.endswith('/observe'):
-                return fixture_ack(body, action='delete_issued', delete=True,
+                return fixture_ack(body, delivery_keep_checked=True, action='delete_issued', delete=True,
                                    expires_at=(datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(seconds=1)).isoformat())
             receipts.append(body)
             return fixture_ack(body, ok=True)
@@ -555,7 +556,7 @@ class CleanupTests(unittest.TestCase):
             return journal(inventory, item_id, phase, body, owner)
         def api(cfg, path, body, **kwargs):
             if path.endswith('/observe'):
-                return fixture_ack(body, action='delete_issued', delete=True,
+                return fixture_ack(body, delivery_keep_checked=True, action='delete_issued', delete=True,
                                    expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
             receipts.append(body)
             return fixture_ack(body, ok=True)
@@ -595,7 +596,7 @@ class CleanupTests(unittest.TestCase):
         with self.opened() as current:
             self.task['approved_proof'] = proof = current.proof()
         decision = fixture_ack({'attempt': 1, 'plan_sha256': 'a'*64, 'proof': proof},
-                               action='delete_issued', delete=True,
+                               delivery_keep_checked=True, action='delete_issued', delete=True,
                                expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
         with self.assertRaises(pull.CleanupPermitRefused) as refused:
             pull.cleanup_check_permit(self.cfg, True, self.task, proof, decision, time.monotonic()-18.3)
@@ -614,7 +615,7 @@ class CleanupTests(unittest.TestCase):
             if path.endswith('/lease'):return dict(tasks=[self.task],retry_after_sec=0)
             if path.endswith('/observe'):
                 permit_seen[0]=True
-                return dict(action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
+                return dict(delivery_keep_checked=True,action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
                             proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
                             expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
             self.assertEqual(body['outcome'], 'unverified')
@@ -999,7 +1000,7 @@ def approve_api(test, calls, receipt_reply=None):
         if path.endswith('/observe'):
             if body['outcome'] != 'match':
                 return fixture_ack(body, action=body['outcome'], delete=False)
-            return dict(action='delete_issued', delete=True, item_id=1, attempt=1, plan_sha256='a'*64,
+            return dict(delivery_keep_checked=True, action='delete_issued', delete=True, item_id=1, attempt=1, plan_sha256='a'*64,
                         proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
                         expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
         if receipt_reply is not None:
@@ -1103,12 +1104,22 @@ class CleanupGuardTests(unittest.TestCase):
         del proof['sidecar']
         self.assertIn('no physical sidecar binding', pull.cleanup_guard_refusal(self.task, proof))
 
+    def test_delivery_hold_precedes_windows_and_stitch_inclusion(self):
+        for key in (
+            'joined/goodplus-20260821-generation-1/objects/813b40a60f9a676c5c6e8a5674f59eb6ebab357dd43c41ec680ee48cf9ba0be6.mp4',
+            'datasets/global-street-scores-delivery/47/public/current.json',
+            'experimental/v85-retired-WORK-custody/20261013/a2b4891fa5937f63a0d1885ab3afae0690f08c6b450caa22615443445c8cc23b.bin',
+        ):
+            task = dict(item=dict(object_key=key, permit_reason='stitched_included'))
+            self.assertIn('DELIVERY KEEP HOLD', pull.cleanup_guard_refusal(task, {}))
+        self.assertFalse(pull.delivery_keep_key_held('staging/not-a-delivery-key'))
+
     def test_collated_bounds_must_match_the_dated_path(self):
         pins = self.fixture_pins('2026-07-01T00:00:00+00:00', '2026-07-29T00:00:00+00:00', folders={'03_Plac': 33})
         pins[0]['windows'][33] = pins[0]['windows'][33][:2] + ('Europe/Warsaw',)
         self.pins = pins
         rel = 'joined/03_Plac/July/24-Friday/03_Plac_2026_July_W4_Friday_hour_08_part_01_080013-080114.mp4'
-        task = dict(item=dict(kind='collated', stream_id=33, relative_path=rel, sidecar_required=False,
+        task = dict(item=dict(object_key='test/collated', kind='collated', stream_id=33, relative_path=rel, sidecar_required=False,
                               start_at='2026-07-24T06:00:13Z', end_at='2026-07-24T06:01:14.373Z'))
         self.assertIn('overlaps', pull.cleanup_guard_refusal(task, {}))
         self.pins = self.fixture_pins('2026-08-01T00:00:00+00:00', '2026-08-29T00:00:00+00:00', folders={'03_Plac': 33})
@@ -1292,7 +1303,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
             if path.endswith('/observe'):
                 self.assertEqual(kwargs.get('timeout'), pull.CLEANUP_EXECUTION_OBSERVE_SEC)
                 self.assertFalse(retry_stale)
-                return fixture_ack(body, int(path.split('/')[-2]), action='delete_issued', delete=True,
+                return fixture_ack(body, int(path.split('/')[-2]), delivery_keep_checked=True, action='delete_issued', delete=True,
                                    expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
             if path.endswith('/observe-batch'):
                 with lock:
@@ -1300,7 +1311,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
                 results = []
                 for o in body['observations']:
                     self.assertEqual(len(o['request_id']), 32)
-                    results.append(dict(item_id=o['item_id'], status=200, action='delete_issued', delete=True, attempt=o['attempt'], plan_sha256='a'*64,
+                    results.append(dict(item_id=o['item_id'], status=200, delivery_keep_checked=True, action='delete_issued', delete=True, attempt=o['attempt'], plan_sha256='a'*64,
                                         proof_sha256=hashlib.sha256(json.dumps(o['proof']).encode()).hexdigest(),
                                         expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat()))
                 return dict(results=results)
@@ -2314,7 +2325,7 @@ class CleanupAcknowledgementTests(unittest.TestCase):
                     calls = []
                     def observe(cfg, item_id, body, **kwargs):
                         calls.append('observe')
-                        return fixture_ack(body, action='delete_issued', delete=True,
+                        return fixture_ack(body, delivery_keep_checked=True, action='delete_issued', delete=True,
                                            expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
                     def result(cfg, item_id, body):
                         calls.append('result')

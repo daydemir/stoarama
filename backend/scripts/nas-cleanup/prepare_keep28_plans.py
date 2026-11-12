@@ -144,14 +144,14 @@ def stream_candidates(w, bucket, psql):
  SELECT DISTINCT kind,source_id FROM nas_cleanup_reserved_files
  WHERE account_id=47 AND connection_id=13
 ), raw AS (
- SELECT 'raw' kind,c.id source_id,r.stream_id,c.display_path path,c.size_bytes,(c.purged_at IS NOT NULL) r2_purged
+ SELECT 'raw' kind,c.id source_id,r.stream_id,c.display_path path,c.size_bytes,lower(c.sha256) sha256,(c.purged_at IS NOT NULL) r2_purged
  FROM nas_inventory_files f JOIN recording_clips c ON c.id=f.clip_id JOIN recordings r ON r.id=c.recording_id JOIN w ON w.stream_id=r.stream_id
  WHERE f.connection_id=13 AND f.state='present' AND f.relative_path=c.display_path AND f.sha256=lower(c.sha256) AND f.size_bytes=c.size_bytes
   AND r.account_id=47 AND c.bucket=""" + bucket_literal + """ AND c.size_bytes>0
   AND c.clip_end_at>c.clip_start_at AND c.clip_start_at>='2020-01-01' AND c.clip_end_at<'2028-01-01'
   AND NOT (c.clip_start_at<w.e AND c.clip_end_at>w.s)
 ), col AS (
- SELECT 'collated' kind,o.id source_id,r.stream_id,'joined/'||o.nas_relative_path path,o.size_bytes,false r2_purged
+ SELECT 'collated' kind,o.id source_id,r.stream_id,'joined/'||o.nas_relative_path path,o.size_bytes,lower(o.sha256) sha256,false r2_purged
  FROM recording_collation_outputs o JOIN recording_collation_output_acks a ON a.output_id=o.id AND a.connection_id=13 AND a.sha256=lower(o.sha256) AND a.size_bytes=o.size_bytes
  JOIN recording_collation_hours h ON h.id=o.collation_hour_id JOIN recordings r ON r.id=h.recording_id JOIN w ON w.stream_id=r.stream_id
  WHERE r.account_id=47 AND o.end_at>o.start_at AND o.start_at>='2020-01-01' AND o.end_at<'2028-01-01' AND NOT (o.start_at<w.e AND o.end_at>w.s)
@@ -162,7 +162,7 @@ def stream_candidates(w, bucket, psql):
 )
 SELECT coalesce(json_agg(x ORDER BY x.stream_id,x.kind DESC,x.r2_purged,x.path),'[]') FROM (
  SELECT * FROM raw UNION ALL SELECT * FROM col
-) x WHERE NOT EXISTS (SELECT 1 FROM planned p WHERE p.kind=x.kind AND p.source_id=x.source_id)""", psql)
+) x WHERE NOT delivery_nas_held(x.kind,x.source_id,x.path,x.sha256,x.size_bytes) AND NOT EXISTS (SELECT 1 FROM planned p WHERE p.kind=x.kind AND p.source_id=x.source_id)""", psql)
 
 
 def batches(rows, prefix, max_items, max_bytes):

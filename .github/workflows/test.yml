@@ -90,6 +90,10 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/api ./cmd/stoaramactl ./internal/db -run '^Test(NASDeliveryFence|NASRedownload|NASListing|NASSelectedVerify|OriginalWitness|NASCleanup|NASStitch|NASClient|NASDiagnostics)' -count=1 -v
+      - name: Test delivery keep holds and unexecutable R2 previews
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/api ./cmd/stoaramactl ./internal/db -run '^(TestDeliveryKeep.*|TestR2Retire.*)$' -race -count=1 -v
       - name: Test cleanup receipt lock order and transaction replay under race detector
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

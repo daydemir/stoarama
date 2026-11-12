@@ -787,6 +787,9 @@ func (s *Server) stitchInclusionCurrent(ctx context.Context, q interface {
 	if err != nil {
 		return err
 	}
+	if err := deliveryNASUnheld(ctx, q, i); err != nil {
+		return err
+	}
 	for _, c := range items {
 		if c.SourceID == i.SourceID && c.SHA256 == i.SHA256 && c.SizeBytes == i.SizeBytes && c.StitchOutputSHA == i.StitchOutputSHA && c.StitchOutputPath == i.StitchOutputPath && c.StreamID == i.StreamID && c.RelativePath == i.RelativePath {
 			return nil
@@ -858,6 +861,21 @@ func (s *Server) handleAccountNASStitchReady(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, 409, err.Error())
 		return
 	}
+	// Holds can arrive after the immutable stitch plan/result. Retain those
+	// sources while accepting the verified outputs and releasing the lane;
+	// they must not strand every later stitch task at readiness.
+	retire := items[:0]
+	for _, item := range items {
+		held, err := deliveryNASHeld(ctx, tx, item)
+		if err != nil {
+			util.WriteError(w, 503, err.Error())
+			return
+		}
+		if !held {
+			retire = append(retire, item)
+		}
+	}
+	items = retire
 	if len(items) == 0 {
 		// Finishing without retirement grants no deletion authority. A scope
 		// pause must not strand durable outputs in the shared media lane.

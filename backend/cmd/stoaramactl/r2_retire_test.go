@@ -230,7 +230,7 @@ func TestParseR2RetirePicks(t *testing.T) {
 
 func TestR2RetireManifestRoundTripAndTamper(t *testing.T) {
 	dir := t.TempDir()
-	h := r2RetireHeader{Version: r2RetireManifestVersion, Reason: r2RetireReason, Bucket: "stoarama", Choices: map[string]string{"3": "none"}, GraceSeconds: 604800}
+	h := r2RetireHeader{DeliveryKeepSHA256: r2tSHA, Version: r2RetireManifestVersion, Reason: r2RetireReason, Bucket: "stoarama", Choices: map[string]string{"3": "none"}, GraceSeconds: 604800}
 	items := []r2RetireItem{
 		{r2RetireCandidate: r2RetireCandidate{Kind: "raw", SourceID: 7, StreamID: 3, Bucket: "stoarama", ObjectKey: "managed/a.mp4", SizeBytes: 10, SHA256: r2tSHA,
 			StartAt: r2tUTC("2026-08-01T00:00:00Z").Add(123456 * time.Microsecond), EndAt: r2tUTC("2026-08-01T00:01:00Z")}, Choice: "none", Reason: r2RetireReason},
@@ -348,13 +348,14 @@ INSERT INTO streams VALUES (3,'Asia/Tokyo'),(4,'America/Los_Angeles'),(5,'Asia/T
 INSERT INTO recordings VALUES (30,47,3,'UTC'),(40,47,4,'UTC'),(50,47,5,'UTC'),(60,48,3,'UTC');
 `)
 	for _, m := range []string{"0167_nas_cleanup_dryruns.sql", "0168_nas_cleanup_stage_timings.sql", "0169_nas_cleanup_queue_priority.sql",
-		"0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql", "0172_nas_cleanup_safeguards_validate.sql", "0174_r2_object_retirements.sql"} {
+		"0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql", "0172_nas_cleanup_safeguards_validate.sql", "0174_r2_object_retirements.sql", "0173_nas_cleanup_throughput.sql", "0189_delivery_keep_holds.sql"} {
 		body, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), m))
 		if err != nil {
 			t.Fatal(err)
 		}
 		exec(string(body))
 	}
+	exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama','test/delivery-hold','test-etag',5,'metadata')`)
 	windows := map[int64]api.Keep28Window{
 		3: r2tWindow(t, 3, "Asia/Tokyo", "2026-09-12", "2026-10-10"),
 		4: r2tWindow(t, 4, "America/Los_Angeles", "2026-09-12", "2026-10-10"),
@@ -429,7 +430,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		t.Fatal(err)
 	}
 	scope := r2RetireScope{AccountID: 47, ConnectionID: 13, Bucket: "stoarama", Grace: 7 * 24 * time.Hour, HasRetirements: true}
-	sum, items, err := r2RetirePlanRun(ctx, pool, r2RetirePlanOptions{Picks: picks, Scope: scope, PageSize: 3, Now: time.Now()}, r2tPolicy, windows)
+	sum, items, err := r2RetirePlanRun(ctx, pool, r2RetirePlanOptions{Delivery: r2tDelivery(), Picks: picks, Scope: scope, PageSize: 3, Now: time.Now()}, r2tPolicy, windows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -456,7 +457,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 	if err != nil {
 		t.Fatal(err)
 	}
-	opts := r2RetireApplyOptions{ManifestPath: manifest, ExpectedSHA: digest, LedgerPath: filepath.Join(dir, "ledger.jsonl"), MaxBytes: 1 << 40, Budget24h: 1 << 40, MaxManifestAge: time.Hour}
+	opts := r2RetireApplyOptions{Delivery: r2tDelivery(), ManifestPath: manifest, ExpectedSHA: digest, LedgerPath: filepath.Join(dir, "ledger.jsonl"), MaxBytes: 1 << 40, Budget24h: 1 << 40, MaxManifestAge: time.Hour}
 	apply := func(o r2RetireApplyOptions) (r2RetireApplySummary, error) {
 		return r2RetireApply(ctx, pool, store, o, r2tPolicy, windows)
 	}
@@ -554,7 +555,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		for key, n := range store.objects {
 			live[key] = r2.ObjectInfo{Key: key, SizeBytes: n, ETag: "e"}
 		}
-		sum, items, err := r2RetirePlanRun(ctx, pool, r2RetirePlanOptions{Picks: picks, Scope: scope, PageSize: 3, Now: time.Now(), LiveObjects: live}, r2tPolicy, windows)
+		sum, items, err := r2RetirePlanRun(ctx, pool, r2RetirePlanOptions{Delivery: r2tDelivery(), Picks: picks, Scope: scope, PageSize: 3, Now: time.Now(), LiveObjects: live}, r2tPolicy, windows)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -684,7 +685,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
  ALTER TABLE nas_inventory_files ADD COLUMN file_mtime_ns bigint,ADD COLUMN file_ctime_ns bigint,ADD COLUMN file_inode bigint,ADD COLUMN file_device bigint;
  ALTER TABLE nas_inventory_unmatched_files ADD COLUMN server_received_at timestamptz NOT NULL DEFAULT now();
  ALTER TABLE recording_collation_output_acks ADD COLUMN verified_at timestamptz NOT NULL DEFAULT now();`)
-		for _, name := range []string{"0173_nas_cleanup_throughput.sql", "0183_nas_listing_proof.sql", "0184_r2_recovery_hold_releases.sql"} {
+		for _, name := range []string{"0183_nas_listing_proof.sql", "0184_r2_recovery_hold_releases.sql"} {
 			raw, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), name))
 			if err != nil {
 				t.Fatal(err)
@@ -1102,7 +1103,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		for k, n := range store.objects {
 			live[k] = r2.ObjectInfo{Key: k, SizeBytes: n, ETag: "e"}
 		}
-		sum, items, err := r2RetirePlanRun(ctx, pool, r2RetirePlanOptions{Scope: scope, Picks: picks, PageSize: 500, Now: time.Now(), LiveObjects: live}, r2tPolicy, windows)
+		sum, items, err := r2RetirePlanRun(ctx, pool, r2RetirePlanOptions{Delivery: r2tDelivery(), Scope: scope, Picks: picks, PageSize: 500, Now: time.Now(), LiveObjects: live}, r2tPolicy, windows)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1184,7 +1185,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			for key, n := range store.objects {
 				live[key] = r2.ObjectInfo{Key: key, SizeBytes: n, ETag: "e"}
 			}
-			compatible, compatibleItems, err := r2RetirePlanRun(ctx, pool, r2RetirePlanOptions{HeadGuardCompatible: true, Scope: scope, Picks: picks, PageSize: 500, Now: time.Now(), LiveObjects: live}, r2tPolicy, windows)
+			compatible, compatibleItems, err := r2RetirePlanRun(ctx, pool, r2RetirePlanOptions{Delivery: r2tDelivery(), HeadGuardCompatible: true, Scope: scope, Picks: picks, PageSize: 500, Now: time.Now(), LiveObjects: live}, r2tPolicy, windows)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1303,6 +1304,8 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			{"fresh output ACK", 802, `INSERT INTO recording_collation_output_acks VALUES(2802,13,clock_timestamp())`},
 			{"released raw", 803, `UPDATE recording_clips SET released_at=clock_timestamp() WHERE id=803`},
 			{"cursor delivered raw", 804, `UPDATE connections SET last_cursor_id=804,nas_listing_cursor_at=clock_timestamp() WHERE id=13`},
+			{"present inventory", 805, `INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state,verified_at) VALUES(13,805,'p/805.mp4','present',now()-interval '3 days')`},
+			{"unknown inventory", 806, `INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state,verified_at) VALUES(13,806,'p/806.mp4','unknown',now()-interval '3 days')`},
 		} {
 			t.Run(test.name, func(t *testing.T) {
 				exec(`UPDATE connections SET last_cursor_id=0`)
@@ -1316,9 +1319,9 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 				for key, size := range store.objects {
 					live[key] = r2.ObjectInfo{Key: key, SizeBytes: size, ETag: "e"}
 				}
-				plan := func() (r2RetirePlanSummary, []r2RetireItem) {
+				plan := func(scope r2RetireScope) (r2RetirePlanSummary, []r2RetireItem) {
 					t.Helper()
-					sum, items, err := r2RetirePlanRun(ctx, pool, r2RetirePlanOptions{Scope: scope, Picks: picks, PageSize: 500, Now: time.Now(), LiveObjects: live}, r2tPolicy, windows)
+					sum, items, err := r2RetirePlanRun(ctx, pool, r2RetirePlanOptions{Delivery: r2tDelivery(), Scope: scope, Picks: picks, PageSize: 500, Now: time.Now(), LiveObjects: live}, r2tPolicy, windows)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -1330,7 +1333,14 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 					}
 					return sum, selected
 				}
-				sum, selected := plan()
+				deliveryScope := scope
+				deliveryScope.Class = r2RetireDeliveryOnly
+				deliveryScope.OwnerPolicy = r2RetireDeliveryPolicy(windows, picks.Choices)
+				_, deliverySelected := plan(deliveryScope)
+				if len(deliverySelected) != 1 {
+					t.Fatal("no-evidence delivery preview not eligible now", deliverySelected)
+				}
+				sum, selected := plan(scope)
 				if len(selected) != 1 {
 					t.Fatal("fixture not initially eligible", selected)
 				}
@@ -1347,7 +1357,22 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 					exec(`INSERT INTO nas_listing_generations(connection_id,generation,started_at,completed_at,folders) VALUES(13,repeat('9',32),now()-interval '2 days',now()-interval '2 days',ARRAY['p']); INSERT INTO nas_listing_folders(connection_id,generation,folder) VALUES(13,repeat('9',32),'p')`)
 				}
 				exec(test.evidence)
-				_, selectedAfter := plan()
+				deliverySum, deliveryAfter := plan(deliveryScope)
+				if len(deliveryAfter) != 0 || deliverySum.Kept[kind]["after_nas_cleanup"].Objects == 0 {
+					t.Fatal("delivery preview did not defer NAS evidence", deliveryAfter, deliverySum.Kept)
+				}
+				deliverySets, err := loadR2RetireSets(ctx, pool, "", true, r2RetireDeliveryOnly)
+				if err != nil {
+					t.Fatal(err)
+				}
+				candidate, err := r2RetireLoadOne(ctx, pool, kind, id, deliveryScope, deliverySets)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if reason, _, eligible := r2RetireDecideForScope(candidate, deliveryScope, windows, picks.Choices); eligible || reason != "after_nas_cleanup" {
+					t.Fatal("live delivery check lost NAS evidence", reason, eligible)
+				}
+				_, selectedAfter := plan(scope)
 				if len(selectedAfter) != 0 {
 					t.Error("NAS evidence did not veto planning", selectedAfter)
 				}
@@ -1471,6 +1496,89 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		sets.Evidence.apply(&c)
 		if c.Facts.NASAbsent {
 			t.Fatal("bulk kept path writer bypassed")
+		}
+	})
+
+	t.Run("DeliveryHoldsVetoEveryClassBeforeAnyDelete", func(t *testing.T) {
+		migration, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), "0190_delivery_r2_retirement_guards.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		exec(string(migration))
+		key := "managed/acct-47/delivery-held.mp4"
+		exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'e',100,'metadata')`, key)
+		// Delivery-only admits kept footage, so unlike the outside-only
+		// owner class it must load physical-listing mismatch evidence.
+		clip(999997, 30, inside)
+		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state,size_bytes,sha256,verified_at,server_received_at,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256,file_mtime_ns,file_ctime_ns,file_inode,file_device)
+ VALUES(13,999997,'p/999997.mp4','present',1000997,$1,now(),now(),'p/999997.mp4.stoarama.json',100,$1,11,12,13,14)`, r2tSHA)
+		exec(`INSERT INTO nas_listing_generations(connection_id,generation,folders,completed_at) VALUES(13,'9876543210abcdef9876543210abcdef',ARRAY['p'],now());
+ INSERT INTO nas_listing_folders(connection_id,generation,folder) VALUES(13,'9876543210abcdef9876543210abcdef','p');
+ INSERT INTO nas_listing_files VALUES(13,'9876543210abcdef9876543210abcdef','p','p/999997.mp4',0,11,12,13,14)`)
+		exec(`INSERT INTO nas_listing_generations(connection_id,generation,started_at,folders,completed_at) VALUES(13,'0123456789abcdef0123456789abcdef',now()-interval '2 hours',ARRAY['p'],now()-interval '1 hour');
+ INSERT INTO nas_listing_folders(connection_id,generation,folder) VALUES(13,'0123456789abcdef0123456789abcdef','p');
+ INSERT INTO nas_listing_files VALUES(13,'0123456789abcdef0123456789abcdef','p','p/old-observation.mp4',1,1,1,1,1)`)
+		deliverySets, err := loadR2RetireSets(ctx, pool, "", true, r2RetireDeliveryOnly)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !deliverySets.Evidence.OwnerPaths["p/old-observation.mp4"] {
+			t.Fatal("owner delivery class lost historical NAS presence")
+		}
+		if deliverySets.Evidence.Paths["p/old-observation.mp4"] {
+			t.Fatal("historical presence overrode newer physical absence")
+		}
+		kept := r2tCandidate("raw", 3, windows[3].Timezone, inside, inside.Add(time.Minute))
+		kept.RelativePath = "p/old-observation.mp4"
+		kept.Facts = r2RetireFacts{ExactNAS: true, NASCopy: true}
+		deliverySets.Evidence.apply(&kept)
+		deliverySets.Evidence.applyOwner(&kept)
+		if kept.Facts.ExactNAS || !kept.Facts.ListingPresence {
+			t.Fatal("old listing authorized kept footage instead of only vetoing outside retirement", kept.Facts)
+		}
+		if reason, _, eligible := r2RetireDecideForScope(kept, r2RetireScope{Class: r2RetireDeliveryOnly, Bucket: "stoarama", NASBacked: true}, windows, nil); eligible || reason != "copy_to_nas" {
+			t.Fatal("kept footage bypassed copy-first after newer physical absence", reason, eligible)
+		}
+		candidate := r2RetireCandidate{Kind: "raw", SourceID: 999997, RelativePath: "p/999997.mp4", SHA256: r2tSHA, SizeBytes: 1000997}
+		deliverySets.applyPlanNAS(&candidate)
+		if !candidate.Facts.ExactNAS {
+			t.Fatal("fixture exact NAS identity missing")
+		}
+		deliverySets.Evidence.apply(&candidate)
+		if candidate.Facts.ExactNAS {
+			t.Fatal("delivery class trusted fresh hash after physical listing changed")
+		}
+		before := len(store.deleted)
+		for _, class := range []r2RetireClass{"", r2RetireOwnerAccepted, r2RetireDeliveryOnly} {
+			h := r2RetireHeader{DeliveryKeepSHA256: r2tSHA, Version: r2RetireManifestVersion, Class: class, NASBacked: true, Reason: r2RetireReason, Bucket: "stoarama", Choices: map[string]string{"3": "none"}, Items: 1, Bytes: 100}
+			c := r2tCandidate("raw", 3, "Asia/Tokyo", outside, outside.Add(time.Minute))
+			c.ObjectKey = key
+			c.ETag = "e"
+			reason := r2RetireReason
+			if class == r2RetireOwnerAccepted {
+				reason = string(class)
+			}
+			path := filepath.Join(t.TempDir(), "manifest.jsonl")
+			digest, err := writeR2RetireManifest(path, h, []r2RetireItem{{r2RetireCandidate: c, Choice: "none", Reason: reason}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			attempt := opts
+			attempt.Delivery = r2tDelivery()
+			attempt.ManifestPath = path
+			attempt.ExpectedSHA = digest
+			if _, err := r2RetireApply(ctx, pool, store, attempt, r2tPolicy, windows); err == nil {
+				t.Fatal("held/disabled class applied", class)
+			}
+		}
+		if len(store.deleted) != before {
+			t.Fatal("preflight issued a delete before finding held keys")
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) VALUES('raw',9999999,'stoarama',$1,100,$2,$2)`, key, r2tSHA); err == nil {
+			t.Fatal("legacy reservation bypassed durable hold")
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256) VALUES('raw',9999999,3,'stoarama',$1,100,$2,'outside_keep28_no_nas_copy','none',$2,$2)`, key, r2tSHA); err == nil {
+			t.Fatal("legacy retirement bypassed durable hold")
 		}
 	})
 
@@ -1619,4 +1727,8 @@ func TestR2RetireOwnerAcceptedClass(t *testing.T) {
 func (f *fakeR2RetireStore) DeleteObjectOnce(ctx context.Context, key string) error {
 	f.onceCalls++
 	return f.DeleteObject(ctx, key)
+}
+
+func r2tDelivery() api.DeliveryKeepSnapshot {
+	return api.DeliveryKeepSnapshot{SHA256: r2tSHA, Objects: map[string]api.DeliveryKeepIdentity{"test/delivery-hold": {Key: "test/delivery-hold", ETag: "test-etag", Size: 5, Kind: "asset"}}}
 }

@@ -102,7 +102,7 @@ func r2RetireSQL(kind string, scope r2RetireScope, single bool) string {
 		retired = "false"
 	}
 	sel = strings.Replace(sel, "{RETIRED}", retired, 1)
-	ownerSnapshot := scope.Class == r2RetireOwnerAccepted && (!single || scope.OwnerPlanning)
+	ownerSnapshot := scope.Class.owner() && (!single || scope.OwnerPlanning)
 	if kind == "raw" && (scope.ReleaseSchema || ownerSnapshot) {
 		start := strings.Index(sel, "  EXISTS(SELECT 1 FROM nas_cleanup_source_holds")
 		end := strings.Index(sel[start:], "\n  (EXISTS(SELECT 1 FROM recording_joined_source_snapshots") + start
@@ -112,7 +112,7 @@ func r2RetireSQL(kind string, scope r2RetireScope, single bool) string {
 		} // Exact item/source holds are materialized once below.
 		sel = sel[:start] + "  " + held + "," + sel[end:]
 	}
-	if scope.Class == r2RetireOwnerAccepted {
+	if scope.Class.owner() {
 		sel = strings.Replace(sel, "r.account_id=$1", "r.account_id=$1 AND $2::bigint>0", 1)
 		start := strings.Index(sel, "  (EXISTS(")
 		end := start + strings.Index(sel[start:], "),\n") + 2
@@ -129,7 +129,7 @@ func r2RetireSQL(kind string, scope r2RetireScope, single bool) string {
 		}
 		sel = sel[:start] + presence + sel[end:]
 	}
-	if scope.Class == r2RetireOwnerAccepted && scope.OwnerSchema {
+	if scope.Class.owner() && scope.OwnerSchema {
 		sel = strings.Replace(sel, "nas_cleanup_clip_held(c.id)", "nas_cleanup_owner_clip_held(c.id)", 1)
 	}
 	if scope.NASBacked {
@@ -204,6 +204,7 @@ type r2RetireNASIdentity struct {
 type r2RetireObjectKey struct{ Bucket, Key string }
 
 type r2RetireSets struct {
+	DeliveryKeys      map[r2RetireObjectKey]bool
 	HeldKeys          map[r2RetireObjectKey]bool
 	PresentRaw        map[int64]bool
 	PresentPaths      map[string]bool
@@ -222,10 +223,11 @@ type r2RetireSets struct {
 }
 
 func (s r2RetireSets) apply(c *r2RetireCandidate) {
+	c.Facts.DeliveryHeld = s.DeliveryKeys[r2RetireObjectKey{c.Bucket, c.ObjectKey}]
 	if s.HeldKeys[r2RetireObjectKey{c.Bucket, c.ObjectKey}] {
 		c.Facts.Held = true
 	}
-	if s.Class == r2RetireOwnerAccepted {
+	if s.Class.owner() {
 		c.Facts.NASCopy = c.Facts.NASCopy || s.PresentPaths[c.RelativePath] || s.PresentContent[r2RetireNASIdentity{"", c.SHA256, c.SizeBytes}]
 		if c.Kind == "raw" {
 			c.Facts.NASCopy = c.Facts.NASCopy || s.PresentRaw[c.SourceID]
@@ -301,7 +303,7 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 		manifestSQL = `SELECT e.value FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) WITH ORDINALITY e(value,n) LEFT JOIN nas_cleanup_items i ON i.plan_id=p.id AND i.ordinal=e.n WHERE (p.mode<>'retired' OR i.delete_ever_issued OR i.id IS NULL) AND NOT EXISTS(SELECT 1 FROM nas_cleanup_r2_effective_releases x WHERE x.item_id=i.id)`
 	}
 	mappedSources := map[int64]map[int64]bool{}
-	if s.Class == r2RetireOwnerAccepted {
+	if s.Class.owner() {
 		held := `(p.mode<>'retired' OR i.delete_ever_issued OR i.id IS NULL OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed'))`
 		releaseView := "nas_cleanup_r2_effective_releases"
 		if s.OwnerSchema {
@@ -323,7 +325,7 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 		var planID int64
 		held := true
 		var scanErr error
-		if s.Class == r2RetireOwnerAccepted {
+		if s.Class.owner() {
 			scanErr = rows.Scan(&planID, &raw, &held)
 		} else {
 			scanErr = rows.Scan(&raw)
@@ -346,7 +348,7 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 			rows.Close()
 			return s, fmt.Errorf("unknown NAS cleanup plan item kind %q", item.Kind)
 		}
-		if s.Class == r2RetireOwnerAccepted {
+		if s.Class.owner() {
 			if mappedSources[planID] == nil {
 				mappedSources[planID] = map[int64]bool{}
 			}
@@ -377,7 +379,7 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 	if err := rows.Err(); err != nil {
 		return s, err
 	}
-	if s.Class == r2RetireOwnerAccepted {
+	if s.Class.owner() {
 		rows, err := q.Query(ctx, `SELECT h.plan_id,h.clip_id FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id
         WHERE p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id
         AND (i.delete_ever_issued OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed')))`)
@@ -431,7 +433,7 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 		if s.Evidence.ReleaseSchema {
 			reservedView = "nas_cleanup_r2_reserved_files"
 		}
-		if s.Class == r2RetireOwnerAccepted && s.OwnerSchema {
+		if s.Class.owner() && s.OwnerSchema {
 			reservedView = "nas_cleanup_owner_reserved_files"
 		}
 		rows, err := q.Query(ctx, `SELECT DISTINCT kind,source_id FROM `+reservedView)
@@ -492,6 +494,29 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 		}
 	}
 
+	s.DeliveryKeys = map[r2RetireObjectKey]bool{}
+	var holdsInstalled bool
+	if err := q.QueryRow(ctx, `SELECT to_regclass('delivery_keep_holds') IS NOT NULL`).Scan(&holdsInstalled); err != nil {
+		return s, err
+	}
+	if holdsInstalled {
+		rows, err := q.Query(ctx, `SELECT bucket,object_key FROM delivery_keep_holds`)
+		if err != nil {
+			return s, err
+		}
+		for rows.Next() {
+			var key r2RetireObjectKey
+			if err := rows.Scan(&key.Bucket, &key.Key); err != nil {
+				rows.Close()
+				return s, err
+			}
+			s.DeliveryKeys[key] = true
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return s, err
+		}
+	}
 	var has bool
 	if err := q.QueryRow(ctx, `SELECT to_regclass('r2_retirement_reservations') IS NOT NULL`).Scan(&has); err != nil {
 		return s, err
@@ -590,7 +615,13 @@ func r2RetireScan(ctx context.Context, q r2RetireQuerier, kind string, scope r2R
 				sets.applyPlanNAS(&page[i])
 			}
 			if scope.Class != r2RetireOwnerAccepted {
+				presence := page[i].Facts.NASCopy
 				sets.Evidence.apply(&page[i])
+				if scope.Class == r2RetireDeliveryOnly {
+					// Ordinary listing absence cannot clear broad owner inventory.
+					page[i].Facts.NASCopy = page[i].Facts.NASCopy || presence
+					sets.Evidence.applyOwner(&page[i])
+				}
 			} else {
 				sets.Evidence.applyOwner(&page[i])
 			}
@@ -615,7 +646,14 @@ func r2RetireLoadOne(ctx context.Context, q r2RetireQuerier, kind string, id int
 		return c, err
 	}
 	sets.apply(&c)
-	if scope.Class == r2RetireOwnerAccepted {
+	if scope.Class.owner() {
+		if scope.Class == r2RetireDeliveryOnly {
+			presence := c.Facts.NASCopy
+			if err := r2RetireLiveEvidence(ctx, q, &c, sets.Evidence); err != nil {
+				return c, err
+			}
+			c.Facts.NASCopy = c.Facts.NASCopy || presence
+		}
 		if err := r2RetireOwnerLive(ctx, q, &c, scope); err != nil {
 			return c, err
 		}

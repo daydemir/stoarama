@@ -109,7 +109,12 @@ func (s *r2RetireSets) loadOwnerProtections(ctx context.Context, q r2RetireQueri
 	}
 	s.ProtectedRaw = map[int64]bool{}
 	s.ProtectedCollated = map[int64]bool{}
-	rows, err := q.Query(ctx, r2RetireOwnerPlanSQL()+`SELECT id,source_clip_ids FROM unsafe_outputs`, r2RetireOwnerPolicy(windows, picks), scope.AccountID)
+	sql, policy := r2RetireOwnerPlanSQL(), r2RetireOwnerPolicy(windows, picks)
+	if scope.Class == r2RetireDeliveryOnly {
+		sql = r2RetireDeliverySourceSQL(sql)
+		policy = r2RetireDeliveryPolicy(windows, picks)
+	}
+	rows, err := q.Query(ctx, sql+`SELECT id,source_clip_ids FROM unsafe_outputs`, policy, scope.AccountID)
 	if err != nil {
 		return err
 	}
@@ -163,6 +168,9 @@ func r2RetireOwnerLive(ctx context.Context, q r2RetireQuerier, c *r2RetireCandid
  (SELECT count(*) FROM recording_clips WHERE bucket=$5 AND object_key=$6)>CASE WHEN $3='raw' THEN 1 ELSE 0 END
  OR (SELECT count(*) FROM recording_collation_outputs WHERE object_key=$6)>CASE WHEN $3='collated' THEN 1 ELSE 0 END,
  ($3='raw' AND $4=ANY($7::bigint[])) OR ($3='collated' AND EXISTS(SELECT 1 FROM recording_collation_outputs WHERE id=$4 AND source_clip_ids && $7::bigint[]))`
+	if scope.Class == r2RetireDeliveryOnly {
+		query = r2RetireDeliverySourceSQL(query)
+	}
 	if err := q.QueryRow(ctx, query, scope.OwnerPolicy, scope.AccountID, c.Kind, c.SourceID, c.Bucket, c.ObjectKey, r2RetireIncidentSources).Scan(&protected, &shared, &incident); err != nil {
 		return err
 	}

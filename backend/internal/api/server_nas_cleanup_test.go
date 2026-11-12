@@ -86,10 +86,16 @@ func cleanupTestPool(t *testing.T) *pgxpool.Pool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"0167_nas_cleanup_dryruns.sql", "0168_nas_cleanup_stage_timings.sql", "0169_nas_cleanup_queue_priority.sql", "0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql", "0172_nas_cleanup_safeguards_validate.sql", "0173_nas_cleanup_throughput.sql", "0175_nas_cleanup_client_status.sql", "0176_nas_cleanup_recheck.sql", "0177_nas_cleanup_reserved_files.sql", "0178_nas_cleanup_reconciliation.sql", "0180_nas_cleanup_source_freeze.sql", "0181_nas_cleanup_freeze_recovery.sql"} {
+	for _, name := range []string{"0167_nas_cleanup_dryruns.sql", "0168_nas_cleanup_stage_timings.sql", "0169_nas_cleanup_queue_priority.sql", "0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql", "0172_nas_cleanup_safeguards_validate.sql", "0173_nas_cleanup_throughput.sql", "0175_nas_cleanup_client_status.sql", "0176_nas_cleanup_recheck.sql", "0177_nas_cleanup_reserved_files.sql", "0178_nas_cleanup_reconciliation.sql", "0180_nas_cleanup_source_freeze.sql", "0181_nas_cleanup_freeze_recovery.sql", "0189_delivery_keep_holds.sql"} {
 		migration, err := os.ReadFile("../../../infra/sql/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
+		}
+		// Most cleanup witnesses need the protection schema, not 92,626
+		// production seed rows in every disposable schema. The dedicated
+		// seed test below executes both exact inserts and verifies totals.
+		if name == "0189_delivery_keep_holds.sql" {
+			migration = deliveryHoldSchemaOnly(migration)
 		}
 		if _, err = pool.Exec(ctx, string(migration)); err != nil {
 			t.Fatalf("%s: %v", name, err)
@@ -561,4 +567,20 @@ func TestNASCleanupDryRunCacheCannotAuthorizeEnabledPolicy(t *testing.T) {
 	if err != nil || !bytes.Equal(refreshed, fresh) {
 		t.Fatal("expired preflight snapshot did not refresh")
 	}
+}
+
+func deliveryHoldSchemaOnly(raw []byte) []byte {
+	text := string(raw)
+	for _, table := range []string{"delivery_keep_holds", "delivery_keep_output_dependencies"} {
+		start := strings.Index(text, "INSERT INTO "+table+"(")
+		if start < 0 {
+			panic("delivery seed insert missing")
+		}
+		end := strings.Index(text[start:], ";\n")
+		if end < 0 {
+			panic("delivery seed insert incomplete")
+		}
+		text = text[:start] + text[start+end+2:]
+	}
+	return []byte(text)
 }

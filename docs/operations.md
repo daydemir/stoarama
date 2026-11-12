@@ -117,3 +117,65 @@ The DO token lives on Render as `DO_API_TOKEN`: on `stoarama-recorder-control` (
 `AUTO_MIGRATE=true` on `stoarama-api`, so a deploy runs migrations on boot. Before deploying, confirm `origin/main` matches the live commit and that no migration is unapplied, or you will ship more than the env change.
 
 `.api.key` is short-lived; `expires_at` sits beside it in the same file, so check there rather than trusting a date written down here. Re-read it from the file on each use rather than caching it; on a 401 refresh it with the CLI instead of asking Deniz for a dashboard value.
+
+## Delivery keep holds and R2 retirement previews
+
+The 2026-11-12 owner decision keeps the public delivery set and the 21 `all`
+streams in R2 for now. NAS keeps keep28 **plus** delivery files and their required
+source dependencies, including delivery dates outside keep28. R2 delivery is a
+holdover until NAS copying, stitching, and the serving cutover are validated.
+
+Migrations 0188/0189 add the exact 32,825-key hold seed (key, ETag, size, SHA and
+presentation path), the 59,801 public assembly input identities from the
+SHA-verified growth representation, and durable raw-source dependency closure.
+Holds veto NAS preparation, admission, enable, first/replayed permits, local
+client guards and V85r retirement; database triggers also fence older callers.
+Deploy the migrations before the new API/client. An outstanding protected NAS
+permit or R2 intent requires drain/reconciliation before migration/import.
+The migrations are additive; they neither delete media nor release old holds.
+
+`stoaramactl delivery-keep --keep-file FILE --expected-sha256 SHA --out NEW_DIR`
+checks the exact file against the live current/pinned public registry and emits
+a future copy/verify queue. ACKs are not fresh verified copies. `--import` only
+adds or enriches holds under admission/public locks; it cannot release them.
+
+`r2-retire plan --class owner_r2_delivery_only --head-guard-compatible ...`
+enumerates the whole bucket and reports now/later/copy/blocked. The class is
+**planning-only**. Outside-window objects without NAS presence evidence qualify
+now; any inventory, listing (including partial generations/aliases), ACK or raw
+delivery evidence waits for NAS cleanup under the owner rules. Verified cleanup
+receipts supersede delivery evidence under the existing recovery-hold rules;
+keep28 media requires fresh exact NAS identity or enters copy-first. Existing
+incidents, references, shared keys, reservations and protected/operator prefixes
+still veto. Unmapped keys stay blocked; unreferenced staging is separately
+reported for owner visibility. Collated objects lacking catalog ETags cannot
+enter a HEAD-guard-compatible retirement manifest.
+
+Every executable retirement manifest requires version 2 and a live delivery
+hold digest. Apply preflights every selected key, rechecks holds and the public
+registry under the common fences before and after HEAD, and refuses v7/unchecked
+manifests. `--delivery-keep-preview FILE --expected-delivery-keep-sha256 SHA`
+allows a read-only pre-migration preview; these manifests are unexecutable.
+Large classification files are written directly as gzip with exact file digests.
+
+No delivery-hold release operation ships here. Eventual R2 removal requires a
+separately reviewed command/migration proving verified NAS copies, completed
+stitching and the page serving correctly from NAS (including Range, HEAD and
+existing downloader links). Creating a PR or a dry-run manifest installs none
+of these changes in production.
+
+### NAS client cleanup-batch-v5 delivery guard
+
+`cleanup-batch-v5` selects the eight-file serial cleanup group with the exact
+delivery-key/dependency guard and requires `delivery_keep_checked=true` on every
+unlink permit. The server accepts v5 for execution and grouped observation while
+retaining every predecessor. This carries forward v4's grouped cap transaction,
+batched diagnostics, durability ordering, and steady eight-file budget of 21
+SQLite commits / 45 fsyncs. Release with the existing NAS client release procedure;
+this change does not publish or deploy a client.
+
+The delivery migrations are `0189_delivery_keep_holds.sql` and
+`0190_delivery_r2_retirement_guards.sql`, following main's
+`0188_nas_cleanup_leased_index.sql`. Migration identities use full filenames.
+The upgrade regression applies main first, then both delivery migrations, checks
+the exact seed and R2 veto, and replays migration discovery without duplication.

@@ -22,6 +22,7 @@ import (
 // exact present inventory. Cleanup holds, references and unknowns always veto.
 
 const (
+	r2RetireDeliveryOnly  r2RetireClass = "owner_r2_delivery_only"
 	r2RetireOwnerAccepted r2RetireClass = "owner_accepted_outside_window"
 	r2RetireNASReason                   = "kept_none_exact_nas_copy"
 	r2RetireReason                      = "outside_keep28_no_nas_copy"
@@ -32,7 +33,7 @@ const (
 
 type r2RetireClass string
 
-func (c r2RetireClass) valid() bool { return c == "" || c == r2RetireOwnerAccepted }
+func (c r2RetireClass) valid() bool { return c == "" || c.owner() }
 
 // r2RetireProtectedPrefixes are never retired, whatever the database says.
 // joined/best14-20261021/ holds the V85 best14 outputs, tracked only in a
@@ -149,6 +150,7 @@ func r2RetireParsePickTime(raw string) (time.Time, bool) {
 // r2RetireFacts are protection and verified NAS identity observations used
 // by both legacy and NAS-backed selection.
 type r2RetireFacts struct {
+	DeliveryHeld    bool
 	NASAbsent       bool
 	ListingPresence bool
 	Purged          bool // raw: purged_at already set
@@ -254,6 +256,9 @@ func r2RetireDecide(c r2RetireCandidate, bucket string, windows map[int64]api.Ke
 }
 
 func r2RetireDecideMode(c r2RetireCandidate, bucket string, windows map[int64]api.Keep28Window, picks map[int64]r2RetirePick, nasBacked bool) (string, string, bool) {
+	if c.Facts.DeliveryHeld {
+		return "delivery_keep_hold", "", false
+	}
 	if r := r2RetireKeyProtection(c.Kind, c.Bucket, c.ObjectKey, bucket); r != "" {
 		return r, "", false
 	}

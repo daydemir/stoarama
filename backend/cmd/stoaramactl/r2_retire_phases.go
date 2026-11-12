@@ -97,7 +97,7 @@ func (p *r2RetirePhaseSummary) write(out string, h r2RetireHeader) error {
 		h.Phase = phase
 		h.Items = int64(len(p.items[phase]))
 		h.Bytes = p.Totals[phase].Bytes
-		name := string(phase) + ".jsonl"
+		name := string(phase) + ".jsonl.gz"
 		if phase == r2RetireNow {
 			name = r2RetireManifestName
 		}
@@ -282,6 +282,9 @@ func writeR2RetireListing(path, bucket string, prefixes []string, objects map[st
 // A planning manifest is not deletion authority. Every item is reselected under
 // the cleanup admission/public fences and matching inventory rows are locked.
 func r2RetireDecideForScope(c r2RetireCandidate, scope r2RetireScope, windows map[int64]api.Keep28Window, picks map[int64]r2RetirePick) (string, string, bool) {
+	if scope.Class == r2RetireDeliveryOnly {
+		return r2RetireDeliveryDecide(c, scope, windows, picks)
+	}
 	if scope.Class == r2RetireOwnerAccepted {
 		if !scope.NASBacked {
 			return "owner_class_requires_conditional_safety", "", false
@@ -326,7 +329,7 @@ func (a *r2RetireApplier) reserve(ctx context.Context, it r2RetireItem) error {
 	values := "$1,$2,$3,$4,$5,$6,$7"
 	predicate := "kind=$1 AND source_id=$2 AND bucket=$3 AND object_key=$4 AND size_bytes=$5 AND sha256=$6 AND manifest_sha256=$7"
 	args := []any{it.Kind, it.SourceID, it.Bucket, it.ObjectKey, it.SizeBytes, it.SHA256, a.digest}
-	if a.scope.Class == r2RetireOwnerAccepted {
+	if a.scope.Class.owner() {
 		columns += ",retirement_class"
 		values += ",$8"
 		predicate += " AND retirement_class=$8"

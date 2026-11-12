@@ -29,7 +29,7 @@ func TestR2RetirePhasesCannotExecuteCopyOrLater(t *testing.T) {
 	c.ObjectKey = "managed/4.mp4"
 	p.add(c, "after_nas_cleanup", "none", false)
 	dir := t.TempDir()
-	h := r2RetireHeader{Version: r2RetireManifestVersion, NASBacked: true, Reason: r2RetireReason, Bucket: "stoarama", Choices: map[string]string{"3": "none"}, PolicySHA256: r2tPolicy, CreatedAt: time.Now()}
+	h := r2RetireHeader{DeliveryKeepSHA256: r2tSHA, Version: r2RetireManifestVersion, NASBacked: true, Reason: r2RetireReason, Bucket: "stoarama", Choices: map[string]string{"3": "none"}, PolicySHA256: r2tPolicy, CreatedAt: time.Now()}
 	if err := p.write(dir, h); err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestR2RetirePhasesCannotExecuteCopyOrLater(t *testing.T) {
 	if err != nil || len(items) != 1 || sha != p.Phase1SHA256 {
 		t.Fatalf("phase1 %v %s %v", items, sha, err)
 	}
-	for _, name := range []string{"later.jsonl", "copy.jsonl", "blocked.jsonl", "copy-batches/0000.jsonl"} {
+	for _, name := range []string{"later.jsonl.gz", "copy.jsonl.gz", "blocked.jsonl.gz", "copy-batches/0000.jsonl"} {
 		if _, _, _, err := readR2RetireManifest(filepath.Join(dir, name)); err == nil {
 			t.Fatalf("planning-only %s accepted for deletion", name)
 		}

@@ -133,6 +133,8 @@ func main() {
 		runNASSelectedVerify(ctx, cfg, os.Args[2:])
 	case "nas-verified-purge":
 		runNASVerifiedPurge(ctx, cfg, os.Args[2:])
+	case "delivery-keep":
+		runDeliveryKeep(ctx, cfg, os.Args[2:])
 	case "r2-retire":
 		runR2Retire(ctx, cfg, os.Args[2:])
 	case "collation-v2":

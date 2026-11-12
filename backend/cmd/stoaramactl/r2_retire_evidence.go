@@ -22,6 +22,7 @@ type r2RetireEvidence struct {
 	FenceSettled                 *time.Time
 	Start                        time.Time
 	Paths                        map[string]bool
+	OwnerPaths                   map[string]bool
 	Receipts                     map[string]time.Time
 	Delivered                    map[string]time.Time
 	ReceiptView                  string
@@ -29,12 +30,12 @@ type r2RetireEvidence struct {
 
 func retireIdentity(kind string, id int64) string { return fmt.Sprintf("%s:%d", kind, id) }
 func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier, class r2RetireClass) (*r2RetireEvidence, error) {
-	e := &r2RetireEvidence{RawPaths: map[int64]string{}, MismatchRaw: map[int64]bool{}, MismatchPaths: map[r2RetireNASIdentity]bool{}, ObservedRaw: map[int64]time.Time{}, ObservedPaths: map[string]time.Time{}, ForeignRaw: map[int64]bool{}, Paths: map[string]bool{}, Receipts: map[string]time.Time{}}
+	e := &r2RetireEvidence{RawPaths: map[int64]string{}, MismatchRaw: map[int64]bool{}, MismatchPaths: map[r2RetireNASIdentity]bool{}, ObservedRaw: map[int64]time.Time{}, ObservedPaths: map[string]time.Time{}, ForeignRaw: map[int64]bool{}, Paths: map[string]bool{}, OwnerPaths: map[string]bool{}, Receipts: map[string]time.Time{}}
 	if err := q.QueryRow(ctx, `SELECT to_regclass('nas_listing_generations') IS NOT NULL,to_regclass('nas_cleanup_r2_effective_releases') IS NOT NULL,to_regclass('nas_delivery_retirement_fences') IS NOT NULL`).Scan(&e.ListingSchema, &e.ReleaseSchema, &e.FenceSchema); err != nil {
 		return nil, err
 	}
 	e.ReceiptView = "nas_cleanup_r2_effective_releases"
-	if class == r2RetireOwnerAccepted {
+	if class.owner() {
 		var ownerSchema bool
 		if err := q.QueryRow(ctx, `SELECT to_regclass('nas_cleanup_owner_effective_releases') IS NOT NULL`).Scan(&ownerSchema); err != nil {
 			return nil, err
@@ -154,18 +155,24 @@ func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier, class r2Retire
 	if err != nil {
 		return nil, err
 	}
-	listingSQL := `SELECT DISTINCT f.relative_path FROM nas_listing_files f JOIN nas_listing_generations g USING(connection_id,generation) WHERE f.connection_id=13 AND (g.started_at>=$1 OR $2)`
-	rows, err = q.Query(ctx, listingSQL, e.Start, class == r2RetireOwnerAccepted)
+	listingSQL := `SELECT f.relative_path,bool_or(g.started_at>=$1) FROM nas_listing_files f JOIN nas_listing_generations g USING(connection_id,generation) WHERE f.connection_id=13 AND (g.started_at>=$1 OR $2) GROUP BY f.relative_path`
+	rows, err = q.Query(ctx, listingSQL, e.Start, class.owner())
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var p string
-		if err := rows.Scan(&p); err != nil {
+		var recent bool
+		if err := rows.Scan(&p, &recent); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		e.Paths[p] = true
+		e.OwnerPaths[p] = true
+		// Outside owner selection sees every generation. Kept-window exact
+		// copy checks must still respect absence from a newer physical walk.
+		if recent || class == r2RetireOwnerAccepted {
+			e.Paths[p] = true
+		}
 	}
 	rows.Close()
 	if rows.Err() != nil {
@@ -173,8 +180,9 @@ func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier, class r2Retire
 	}
 
 	if class == r2RetireOwnerAccepted {
-		// Owner retirement never authorizes kept media from exact inventory.
-		// Its broad listing veto needs no content/namespace identity join.
+		// Only the outside-only class can skip physical NAS mismatch evidence.
+		// Delivery-only also admits kept footage, so it must run the exact
+		// inventory/listing identity check below before classifying it.
 		return e, loadR2FenceEvidence(ctx, q, e)
 	}
 	rows, err = q.Query(ctx, `SELECT n.clip_id,n.relative_path,n.sha256,n.size_bytes FROM nas_inventory_files n WHERE n.connection_id=13 AND n.state='present' AND n.verified_at>now()-interval '24 hours' AND n.server_received_at>now()-interval '24 hours' AND EXISTS(SELECT 1 FROM nas_listing_files f JOIN nas_listing_generations g USING(connection_id,generation) WHERE f.connection_id=13 AND f.relative_path=n.relative_path AND g.started_at>=$1 AND ROW(f.size_bytes,f.mtime_ns,f.ctime_ns,f.inode,f.device) IS DISTINCT FROM ROW(n.size_bytes,n.file_mtime_ns,n.file_ctime_ns,n.file_inode,n.file_device))`, e.Start)

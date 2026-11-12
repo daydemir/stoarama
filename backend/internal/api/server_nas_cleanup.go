@@ -78,6 +78,7 @@ const (
 	nasCleanupSerialGroupClientVersion        = "cleanup-batch-v2"
 	nasCleanupDurableGroupClientVersion       = "cleanup-batch-v3"
 	nasCleanupBatchedCapsClientVersion        = "cleanup-batch-v4"
+	nasCleanupDeliveryHoldClientVersion       = "cleanup-batch-v5"
 	nasCleanupExecutionGroupMax               = 8
 	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
 	// item limit only keeps one admission request bounded.
@@ -570,7 +571,7 @@ func cleanupRequestSession(r *http.Request) cleanupClientSession {
 }
 
 func cleanupSessionDeadline(ctx context.Context, tx pgx.Tx, cid int64, session cleanupClientSession) (time.Time, error) {
-	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion && session.version != nasCleanupV85RClientVersion && session.version != nasCleanupV85RServerSwitchClientVersion && session.version != nasCleanupV85RCorpusUAClientVersion && session.version != nasCleanupRefusalClientVersion && session.version != nasCleanupListingProofClientVersion && session.version != nasCleanupListingFenceClientVersion && session.version != nasCleanupPipelineClientVersion && session.version != nasCleanupGroupClientVersion && session.version != nasCleanupSerialGroupClientVersion && session.version != nasCleanupDurableGroupClientVersion && session.version != nasCleanupBatchedCapsClientVersion) {
+	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion && session.version != nasCleanupV85RClientVersion && session.version != nasCleanupV85RServerSwitchClientVersion && session.version != nasCleanupV85RCorpusUAClientVersion && session.version != nasCleanupRefusalClientVersion && session.version != nasCleanupListingProofClientVersion && session.version != nasCleanupListingFenceClientVersion && session.version != nasCleanupPipelineClientVersion && session.version != nasCleanupGroupClientVersion && session.version != nasCleanupSerialGroupClientVersion && session.version != nasCleanupDurableGroupClientVersion && session.version != nasCleanupBatchedCapsClientVersion && session.version != nasCleanupDeliveryHoldClientVersion) {
 		return time.Time{}, nil
 	}
 	var seen *time.Time
@@ -671,7 +672,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, 400, "cleanup protocol1, client version and bounded limit required")
 		return
 	}
-	if req.ExecutionBatch && (req.Protocol != 2 || (req.ClientVersion != nasCleanupGroupClientVersion && req.ClientVersion != nasCleanupSerialGroupClientVersion && req.ClientVersion != nasCleanupDurableGroupClientVersion && req.ClientVersion != nasCleanupBatchedCapsClientVersion) || req.RequestID == "") {
+	if req.ExecutionBatch && (req.Protocol != 2 || (req.ClientVersion != nasCleanupGroupClientVersion && req.ClientVersion != nasCleanupSerialGroupClientVersion && req.ClientVersion != nasCleanupDurableGroupClientVersion && req.ClientVersion != nasCleanupBatchedCapsClientVersion && req.ClientVersion != nasCleanupDeliveryHoldClientVersion) || req.RequestID == "") {
 		util.WriteError(w, 400, "reviewed group client and protocol2 request identity required")
 		return
 	}
@@ -703,7 +704,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		return
 	}
 	session := cleanupRequestSession(r)
-	group := req.ExecutionBatch && (session.version == nasCleanupGroupClientVersion || session.version == nasCleanupSerialGroupClientVersion || session.version == nasCleanupDurableGroupClientVersion || session.version == nasCleanupBatchedCapsClientVersion)
+	group := req.ExecutionBatch && (session.version == nasCleanupGroupClientVersion || session.version == nasCleanupSerialGroupClientVersion || session.version == nasCleanupDurableGroupClientVersion || session.version == nasCleanupBatchedCapsClientVersion || session.version == nasCleanupDeliveryHoldClientVersion)
 	groupIDs := []int64{}
 	var budgetLeft *int64
 	sessionDeadline, err := cleanupSessionDeadline(ctx, tx, cid, session)
@@ -1121,6 +1122,9 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	if json.Unmarshal(raw, &item) != nil {
 		return cleanupObserveError(500, "invalid cleanup manifest")
 	}
+	if err := deliveryNASUnheld(ctx, tx, item); err != nil {
+		return cleanupObserveError(409, err.Error())
+	}
 	// A repeated dry-run observation is idempotent; a delete permit is never
 	// reissued after a lost response. Such a task requires operator reconciliation.
 	if state != "leased" {
@@ -1133,7 +1137,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		// non-deleting reconcile answer below.
 		if state == "delete_issued" && req.RequestID != "" && req.Outcome == "match" && permitUntil != nil && permitUntil.After(time.Now()) && nasSpaceAuditJSONEqual(oldOutcome, retryBody) &&
 			mode == "enabled" && until != nil && until.After(time.Now()) && s.stitchDeletionMaster(item) && (item.PermitReason == "" || s.stitchInclusionCurrent(ctx, tx, item) == nil) {
-			return cleanupObserveResult{status: 200, body: map[string]any{"action": "delete_issued", "delete": true, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": oldRecovery, "expires_at": permitUntil.UTC(), "plan_paused": false, "replayed": true}}
+			return cleanupObserveResult{status: 200, body: map[string]any{"delivery_keep_checked": true, "action": "delete_issued", "delete": true, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": oldRecovery, "expires_at": permitUntil.UTC(), "plan_paused": false, "replayed": true}}
 		}
 		if state != "delete_issued" && state != "deleted" && nasSpaceAuditJSONEqual(oldOutcome, retryBody) {
 			if mode == "dry_run" && state == "would_delete" && oldRecovery == "r2_present_unverified" {
@@ -1321,7 +1325,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	if err != nil {
 		return cleanupObserveError(500, "cleanup observation save failed")
 	}
-	return cleanupObserveResult{status: 200, write: true, body: map[string]any{"action": action, "delete": deletion, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": recovery, "expires_at": expires, "plan_paused": paused}}
+	return cleanupObserveResult{status: 200, write: true, body: map[string]any{"delivery_keep_checked": true, "action": action, "delete": deletion, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": recovery, "expires_at": expires, "plan_paused": paused}}
 }
 
 const nasCleanupRefusalProtocol = 1
@@ -1488,6 +1492,11 @@ func persistNASCleanupPlan(ctx context.Context, tx pgx.Tx, label string, items [
 	stage := "admission_fence"
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupAdmissionLock); err != nil {
 		return 0, "", &cleanupPersistFailure{stage: stage, err: err}
+	}
+	for _, item := range items {
+		if err := deliveryNASUnheld(ctx, tx, item); err != nil {
+			return 0, "", &cleanupPersistFailure{stage: "delivery_keep_hold", err: err}
+		}
 	}
 	// Same-label retries still return the immutable original plan. A different
 	// label must never admit an issued file, even from an old policy or retired

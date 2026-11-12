@@ -113,6 +113,7 @@ def verify(plan, catalog, windows, now):
             'plan policy differs from pinned policy')
     require(plan['allow_nas_only'] is False, 'NAS-only deletion forbidden')
     require(catalog['protected_overlap'] == 0, 'protected identity overlap')
+    require(catalog['delivery_keep_overlap'] == 0, 'delivery keep hold overlap')
     identities = {(c['kind'], c['source_id']): c for c in catalog['items']}
     require(len(identities) == len(plan['items']), 'catalog row missing or duplicated')
     streams, seen = set(), set()
@@ -733,6 +734,7 @@ class Runner:
               'start_at',c.clip_start_at,'end_at',c.clip_end_at,'bucket',c.bucket))
               FROM recording_clips c JOIN recordings r ON r.id=c.recording_id
               WHERE r.account_id=47 AND c.id=ANY(cat.source_ids)) sources FROM cat) x),
+            'delivery_keep_overlap',(SELECT count(*) FROM cat WHERE delivery_nas_held(kind,source_id,relative_path,sha256,size_bytes)),
             'protected_overlap',(SELECT count(*) FROM nas_cleanup_reserved_files f JOIN wanted w USING(kind,source_id)
               WHERE f.account_id=47 AND f.connection_id=13 AND f.label<>(SELECT label FROM nas_cleanup_plans WHERE id=""" + str(pid) + ")))")
 

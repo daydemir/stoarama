@@ -56,7 +56,7 @@ class CleanupGroupTests(unittest.TestCase):
                 self.assertTrue({'lease_ms', 'open_ms', 'proof_ms', 'guard_ms', 'fence_ms', 'observe_journal_ms', 'caps_ms'} <= set(stage['stage_timings']))
             rows = {n: phase for n, phase, _ in pull.cleanup_journal(self.inventory)}
             self.assertTrue(all(rows[b['item_id']] == 'observe' for b in body['observations']))
-            return {'results': [fixture_ack(b, b['item_id'], status=200, action='delete_issued', delete=True,
+            return {'results': [fixture_ack(b, b['item_id'], status=200, delivery_keep_checked=True, action='delete_issued', delete=True,
                 plan_paused=False, expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
                 for b in body['observations']]}
         self.assertTrue(path.endswith('/result-batch'), path)
@@ -67,6 +67,20 @@ class CleanupGroupTests(unittest.TestCase):
     def run_group(self, tasks):
         with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_GROUP_VERSION), mock.patch.object(pull, 'restore_api', side_effect=self.api):
             pull.cleanup_process_group(self.cfg, self.inventory, threading.Event(), tasks)
+
+    def test_v5_group_rejects_permit_without_delivery_hold_check(self):
+        tasks = self.group(1)
+        api = self.api
+        def unchecked(cfg, path, body, **kwargs):
+            response = api(cfg, path, body, **kwargs)
+            if path.endswith('/observe-batch'):
+                response['results'][0].pop('delivery_keep_checked')
+            return response
+        with mock.patch.object(self, 'api', side_effect=unchecked), \
+                mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('unchecked hold permit')):
+            self.run_group(tasks)
+        self.assertTrue((self.cfg.output_dir/tasks[0]['item']['relative_path']).exists())
+        self.assertFalse(pull.cleanup_journal(self.inventory))
 
     def cycle(self, tasks):
         """Use the real v2 lease parser/coordinator and execution lane."""
@@ -365,7 +379,7 @@ class CleanupGroupTests(unittest.TestCase):
                 self.assertEqual(len(body['observations']), 1)
                 observed.append(body['observations'][0]['item_id'])
                 return {'results': [fixture_ack(body['observations'][0], observed[-1], status=200,
-                    action='delete_issued', delete=True, plan_paused=False,
+                    delivery_keep_checked=True, action='delete_issued', delete=True, plan_paused=False,
                     expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())]}
             batches.append(body['receipts'])
             return {'results': [fixture_ack(b, b['item_id'], status=200, ok=True) for b in body['receipts']]}

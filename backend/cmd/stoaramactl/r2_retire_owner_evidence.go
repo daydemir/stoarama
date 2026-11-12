@@ -43,9 +43,9 @@ func (e *r2RetireEvidence) loadOwnerDeliveries(ctx context.Context, q r2RetireQu
 
 func (e *r2RetireEvidence) applyOwner(c *r2RetireCandidate) {
 	identity := retireIdentity(c.Kind, c.SourceID)
-	c.Facts.ListingPresence = e.Paths[c.RelativePath] ||
-		(c.Kind == "raw" && e.Paths[e.RawPaths[c.SourceID]]) ||
-		(c.Kind == "collated" && e.Paths["joined/"+c.RelativePath])
+	c.Facts.ListingPresence = e.OwnerPaths[c.RelativePath] ||
+		(c.Kind == "raw" && e.OwnerPaths[e.RawPaths[c.SourceID]]) ||
+		(c.Kind == "collated" && e.OwnerPaths["joined/"+c.RelativePath])
 	cutoff := e.Receipts[identity]
 	if e.FenceSettled != nil && e.Start.After(*e.FenceSettled) && e.foldersCover(c) &&
 		((c.Kind == "raw" && e.FencedRaw[c.SourceID]) || (c.Kind == "collated" && e.FencedCollated[c.SourceID])) && e.Start.After(cutoff) {
