@@ -264,7 +264,9 @@ authority records. Every action logs its digest and reason. It never deletes
 NAS or R2 objects. Original cleanup reservations stay intact; a separate R2
 reservation view and source-hold predicate recognize valid explicit releases.
 Unreleased siblings, missing item rows and incident sources stay held. Changed
-receipt/recovery state invalidates release effectiveness. Generate a **new**
+receipt/recovery state invalidates release effectiveness. Receipt evidence uses
+the immutable permit start (or the earlier immutable plan creation time for
+legacy rows), so replaying a receipt cannot hide later NAS presence. Generate a **new**
 normal retirement manifest after release; its existing conditional-delete
 capability proof, reservation ledger and byte budgets are still mandatory.
 

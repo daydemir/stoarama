@@ -71,7 +71,6 @@ const (
 	nasCleanupV85RClientVersion               = "v85r-fence-progress-v1"
 	nasCleanupV85RServerSwitchClientVersion   = "v85r-server-switch-v1"
 	nasCleanupListingProofClientVersion       = "listing-proof-v1"
-	nasCleanupCorpusUAClientVersion           = "v85r-corpus-ua-v1"
 	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
 	// item limit only keeps one admission request bounded.
 	nasCleanupMaxPlanItems = 10000
@@ -555,7 +554,7 @@ func cleanupRequestSession(r *http.Request) cleanupClientSession {
 }
 
 func cleanupSessionDeadline(ctx context.Context, tx pgx.Tx, cid int64, session cleanupClientSession) (time.Time, error) {
-	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion && session.version != nasCleanupV85RClientVersion && session.version != nasCleanupV85RServerSwitchClientVersion && session.version != nasCleanupListingProofClientVersion && session.version != nasCleanupCorpusUAClientVersion) {
+	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion && session.version != nasCleanupV85RClientVersion && session.version != nasCleanupV85RServerSwitchClientVersion && session.version != nasCleanupListingProofClientVersion) {
 		return time.Time{}, nil
 	}
 	var seen *time.Time
@@ -1318,7 +1317,7 @@ func cleanupApplyReceipt(ctx context.Context, q interface {
 	body, _ := json.Marshal(req)
 	var pausedPlans int
 	var plan *int64
-	err = q.QueryRow(ctx, `WITH u AS (UPDATE nas_cleanup_items i SET state=$6,outcome=$7::jsonb,updated_at=now() FROM nas_cleanup_plans p WHERE i.id=$1 AND p.id=i.plan_id AND p.connection_id=$2 AND p.plan_sha256=$3 AND i.attempt=$4 AND i.proof_sha256=$5 AND (i.state='delete_issued' OR (i.state=$6 AND i.outcome=$7::jsonb)) RETURNING i.plan_id),
+	err = q.QueryRow(ctx, `WITH u AS (UPDATE nas_cleanup_items i SET state=$6,outcome=$7::jsonb,updated_at=CASE WHEN i.state='delete_issued' THEN now() ELSE i.updated_at END FROM nas_cleanup_plans p WHERE i.id=$1 AND p.id=i.plan_id AND p.connection_id=$2 AND p.plan_sha256=$3 AND i.attempt=$4 AND i.proof_sha256=$5 AND (i.state='delete_issued' OR (i.state=$6 AND i.outcome=$7::jsonb)) RETURNING i.plan_id),
 pz AS (UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$8::text,500) WHERE id IN (SELECT plan_id FROM u) AND mode='enabled' AND $6<>'deleted' RETURNING id),
 bz AS (UPDATE nas_cleanup_batches SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$8::text,500) WHERE mode='enabled' AND $6<>'deleted' AND plan_ids && ARRAY(SELECT plan_id FROM u) RETURNING id)
 SELECT (SELECT count(*) FROM u)::int, (SELECT count(*) FROM pz)::int+(SELECT count(*) FROM bz)::int, (SELECT min(plan_id) FROM u)`, id, cid, req.PlanSHA, req.Attempt, req.ProofSHA, req.Outcome, string(body), "item "+strconv.FormatInt(id, 10)+" deletion receipt "+req.Outcome).Scan(&updated, &pausedPlans, &plan)

@@ -10,7 +10,7 @@ import (
 )
 
 func TestNASCleanupSerialReleaseUsesSameSessionAndExecutionGates(t *testing.T) {
-	for _, version := range []string{nasCleanupSerialExecutionClientVersion, nasCleanupDedicatedExecutionClientVersion, nasCleanupRawCreditDrainClientVersion, nasCleanupFenceProgressClientVersion, nasCleanupJoinedMarkerClientVersion, nasCleanupV85RClientVersion, nasCleanupV85RServerSwitchClientVersion, nasCleanupListingProofClientVersion, nasCleanupCorpusUAClientVersion} {
+	for _, version := range []string{nasCleanupSerialExecutionClientVersion, nasCleanupDedicatedExecutionClientVersion, nasCleanupRawCreditDrainClientVersion, nasCleanupFenceProgressClientVersion, nasCleanupJoinedMarkerClientVersion, nasCleanupV85RClientVersion, nasCleanupV85RServerSwitchClientVersion, nasCleanupListingProofClientVersion} {
 		t.Run(version, func(t *testing.T) { testNASCleanupReviewedReleaseGates(t, version) })
 	}
 }
