@@ -60,7 +60,7 @@ func joinedDeliveryStatusTestPool(t *testing.T) (*pgxpool.Pool, func()) {
 		 joined_transfer_reset_count bigint NOT NULL DEFAULT 0);
 		CREATE TABLE recordings(id bigint PRIMARY KEY,account_id bigint NOT NULL,delivery text NOT NULL);
 		CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint NOT NULL,size_bytes bigint NOT NULL,
-		 created_at timestamptz NOT NULL,purged_at timestamptz,released_at timestamptz);
+		 created_at timestamptz NOT NULL,purged_at timestamptz,released_at timestamptz,display_path text NOT NULL DEFAULT '');
 		CREATE TABLE clip_storage_billing_contracts(clip_id bigint PRIMARY KEY,mode text NOT NULL,authoritative boolean NOT NULL DEFAULT true);
 		CREATE TABLE recording_joined_batches(id bigint PRIMARY KEY,batch_id text NOT NULL,connection_id bigint NOT NULL);
 		CREATE TABLE recording_joined_hours(id bigint PRIMARY KEY,batch_record_id bigint NOT NULL,hour_id text NOT NULL,
@@ -89,6 +89,7 @@ func joinedDeliveryStatusTestPool(t *testing.T) (*pgxpool.Pool, func()) {
 		_, _ = admin.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+pgx.Identifier{schema}.Sanitize()+` CASCADE`)
 		admin.Close()
 	}
+	installDeliveryFenceTestSchema(t, pool)
 	return pool, cleanup
 }
 
