@@ -204,7 +204,6 @@ type r2RetireSets struct {
 	Class             r2RetireClass
 	ProtectedRaw      map[int64]bool
 	ProtectedCollated map[int64]bool
-	SharedRawKeys     map[string]bool
 	Evidence          *r2RetireEvidence
 	ExactRaw          map[int64]r2RetireNASIdentity
 	ExactPaths        map[r2RetireNASIdentity]bool
@@ -225,9 +224,6 @@ func (s r2RetireSets) apply(c *r2RetireCandidate) {
 	}
 	if s.ProtectedRaw[c.SourceID] && c.Kind == "raw" || s.ProtectedCollated[c.SourceID] && c.Kind == "collated" {
 		c.Facts.JoinedRef = true
-	}
-	if s.SharedRawKeys[c.ObjectKey] {
-		c.Facts.SharedKey = true
 	}
 	switch c.Kind {
 	case "raw":

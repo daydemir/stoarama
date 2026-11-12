@@ -105,7 +105,6 @@ func (s *r2RetireSets) loadOwnerProtections(ctx context.Context, q r2RetireQueri
 	}
 	s.ProtectedRaw = map[int64]bool{}
 	s.ProtectedCollated = map[int64]bool{}
-	s.SharedRawKeys = map[string]bool{}
 	rows, err := q.Query(ctx, r2RetireOwnerPlanSQL()+`SELECT id,source_clip_ids FROM unsafe_outputs`, r2RetireOwnerPolicy(windows, picks), scope.AccountID)
 	if err != nil {
 		return err
@@ -146,20 +145,9 @@ func (s *r2RetireSets) loadOwnerProtections(ctx context.Context, q r2RetireQueri
 	if rows.Err() != nil {
 		return rows.Err()
 	}
-	rows, err = q.Query(ctx, `SELECT object_key FROM recording_clips WHERE bucket=$1 GROUP BY object_key HAVING count(*)>1`, scope.Bucket)
-	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			rows.Close()
-			return err
-		}
-		s.SharedRawKeys[key] = true
-	}
-	rows.Close()
-	return rows.Err()
+	// recording_clips has UNIQUE(bucket,object_key). Cross-catalog aliases
+	// are protected by OutputKeyCount/ArtifactKeys and rechecked live.
+	return nil
 }
 
 // Reselect source windows/picks, references, key aliases and incidents live,

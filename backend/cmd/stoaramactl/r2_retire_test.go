@@ -951,9 +951,8 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			clip(id, 30, outside)
 		}
 		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state) VALUES(13,702,'p/702.mp4','unknown'),(13,703,'p/703.mp4','missing')`)
-		// A kept alias makes an otherwise outside key protected.
-		exec(`INSERT INTO recording_clips(id,recording_id,recording_job_id,bucket,object_key,size_bytes,sha256,display_path,clip_start_at,clip_end_at,created_at)
-         SELECT 710,30,1,bucket,object_key,size_bytes,sha256,'p/alias.mp4',$1::timestamptz,$1::timestamptz+interval '1 minute','2026-08-01' FROM recording_clips WHERE id=708`, inside)
+		// A kept cross-catalog alias makes an outside raw key protected.
+		output(2704, "managed/acct-47/708.mp4", inside, "{708}")
 		output(2701, "joined/nightly-collation-v2/o/2701.mp4", inside, "{707}")
 		output(2702, "joined/nightly-collation-v2/o/2702.mp4", outside, "{104}") // own window outside, source stream is all
 		output(2703, "joined/nightly-collation-v2/o/2703.mp4", outside, "{701}")
@@ -999,7 +998,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		check(701, "raw", true)
 		check(702, "raw", false)
 		check(703, "raw", true)
-		for _, id := range []int64{704, 705, 706, 707, 708, 709, 710} {
+		for _, id := range []int64{704, 705, 706, 707, 708, 709} {
 			check(id, "raw", id == 709)
 		}
 		check(2702, "collated", false)
