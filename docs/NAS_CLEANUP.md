@@ -506,6 +506,48 @@ New observation journals preserve proof key order as submitted: sorting the
 proof before replay would change the byte SHA and prevent receipt acceptance.
 Already-written journals with a different proof serialization remain subject
 to the existing exact-binding checks; this change does not rewrite them.
+
+### Serial permits within an execution lease (`cleanup-batch-v2`)
+
+The eight-file lease and batched receipt acknowledgement remain, but each file
+gets a separate permit immediately before its own critical section. All proofs
+and the observation journal precede authority; one provisional local cap charge
+also precedes that file's permit. Each request carries the complete lease roster.
+The server locks and verifies the entire roster: one plan, one lease request,
+the live reviewed session, no unrelated outstanding work, and no uncertain member.
+Only the requested file receives authority. The existing 15-second client check,
+30-second absolute permit expiry, proof binding, lease deadline and writer fence
+remain. A new permit needs room for its socket budget before the lease margin.
+
+Before unlink, the client durably marks the owned intent as attempted, then
+rechecks the live pathname, identity and deadlines after that blocking write.
+An exception before an actual syscall can produce a certified refusal only in
+the live owned path, after ledger/result durability. Successful files and safe
+refusals have individual durable results before the next permit. An attempted
+unlink failure stops further grants. Crashes between unlink and a durable result
+retain an uncertain intent; replay never upgrades that intent into a refusal.
+Result replay is idempotent even after the lease and permit expire.
+
+Only one provisional local cap charge is held at a time. Every live exit before
+an unlink attempt releases its exact row ID. Attempted operations retain their
+charge once; crash-abandoned charges age out of the existing rolling 24-hour
+window. No abandoned charge can permanently starve execution.
+
+Every group member emits a redacted `cleanup execution` client-log line with its
+item/attempt, actual media/sidecar flags, durable journal phase, outcome, error
+and stage timings. These use the existing bounded upload ring, including when
+SQLite diagnostic storage fails. Ledger/result write failures remain visible as
+intent phases, rather than implying that an in-memory refusal was certified.
+
+The Jelly runner records certified refusal counts and ordinals in status/progress
+and owner notes. More than 1% of a plan, or more than five consecutive refused
+ordinals, invokes its existing OFF/STOP/owner-alert path before plan completion
+or successor enablement. Counts come from the full plan report on every poll,
+so restart and repeated polls cannot reset or double-count the limit.
+
+Deploy the server and runner between batches with master OFF, then release the
+new client as `cleanup-batch-v2`. The server retains `cleanup-batch-v1` support;
+this source change neither releases a client nor changes production state.
 If the state volume cannot store this diagnostic, the client logs that failure;
 the existing durable journal and deletion ledger remain the safety evidence.
 

@@ -14,12 +14,18 @@ fixture_ack = fixtures.fixture_ack
 
 
 class CleanupGroupTests(unittest.TestCase):
-    setUp = fixtures.CleanupTests.setUp
     fixture_pins = fixtures.CleanupTests.fixture_pins
 
-    def group(self):
+    def setUp(self):
+        fixtures.CleanupTests.setUp(self)
+        self.logs = []
+        logger = mock.patch.object(pull, 'log', side_effect=lambda level, message: self.logs.append((level, message)))
+        logger.start()
+        self.addCleanup(logger.stop)
+
+    def group(self, size=3):
         tasks = []
-        for n in range(3):
+        for n in range(size):
             item = copy.deepcopy(self.item)
             item.update(source_id=11+n, relative_path='stream/day/%d.mp4' % n)
             path = self.cfg.output_dir / item['relative_path']
@@ -36,7 +42,8 @@ class CleanupGroupTests(unittest.TestCase):
 
     def api(self, cfg, path, body, **kwargs):
         if path.endswith('/observe-batch'):
-            self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'observe'})
+            rows = {n: phase for n, phase, _ in pull.cleanup_journal(self.inventory)}
+            self.assertTrue(all(rows[b['item_id']] == 'observe' for b in body['observations']))
             return {'results': [fixture_ack(b, b['item_id'], status=200, action='delete_issued', delete=True,
                 plan_paused=False, expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
                 for b in body['observations']]}
@@ -54,16 +61,84 @@ class CleanupGroupTests(unittest.TestCase):
         real_unlink = pull.os.unlink
         order = []
         def unlink(name, **kwargs):
-            self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'intent'})
+            rows = {n: (phase, json.loads(body)) for n, phase, body in pull.cleanup_journal(self.inventory)}
+            item_id = int(name.split('.')[0])+1
+            self.assertEqual(rows[item_id][0], 'intent')
+            self.assertIs(rows[item_id][1]['unlink_attempted'], True)
             ledger = [json.loads(line) for line in (self.cfg.state_dir/pull.CLEANUP_LEDGER_NAME).read_text().splitlines()]
-            self.assertEqual([row['event'] for row in ledger], ['intent']*3)
+            self.assertEqual(ledger[-1]['event'], 'intent')
+            self.assertEqual(ledger[-1]['item_id'], item_id)
             order.append(name)
             return real_unlink(name, **kwargs)
         with mock.patch.object(pull.os, 'unlink', side_effect=unlink), mock.patch.object(pull, 'cleanup_ledger_append_many', wraps=pull.cleanup_ledger_append_many) as ledger:
             self.run_group(tasks)
-        self.assertEqual(ledger.call_count, 2)
+        self.assertEqual(ledger.call_count, 6)
         self.assertEqual(order, ['0.mp4', '0.mp4.stoarama.json', '1.mp4', '1.mp4.stoarama.json', '2.mp4', '2.mp4.stoarama.json'])
         self.assertEqual(pull.cleanup_journal(self.inventory), [])
+
+    def test_eight_slow_files_get_fresh_per_file_permits_and_one_receipt_batch(self):
+        tasks = self.group(8)
+        clock, delete, caps = time.monotonic, pull.CleanupFile.delete_exact, pull.cleanup_reserve_group_caps
+        offset, observed, batches = [0], [], []
+        def slow_caps(*args):
+            caps(*args)
+            offset[0] += 20  # NAS durability before authority must not age a permit.
+        def slow_delete(current, proof):
+            offset[0] += 4  # Whole lease takes >30s; each permit remains fresh.
+            return delete(current, proof)
+        def api(cfg, path, body, **kwargs):
+            if path.endswith('/observe-batch'):
+                self.assertEqual(len(body['observations']), 1)
+                observed.append(body['observations'][0]['item_id'])
+                return {'results': [fixture_ack(body['observations'][0], observed[-1], status=200,
+                    action='delete_issued', delete=True, plan_paused=False,
+                    expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())]}
+            batches.append(body['receipts'])
+            return {'results': [fixture_ack(b, b['item_id'], status=200, ok=True) for b in body['receipts']]}
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_GROUP_VERSION), \
+                mock.patch.object(pull, 'restore_api', side_effect=api), \
+                mock.patch.object(pull, 'cleanup_reserve_group_caps', side_effect=slow_caps), \
+                mock.patch.object(pull.CleanupFile, 'delete_exact', slow_delete), \
+                mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock()+offset[0]):
+            pull.cleanup_process_group(self.cfg, self.inventory, threading.Event(), tasks)
+        self.assertEqual(observed, list(range(1, 9)))
+        self.assertEqual(len(batches), 1)
+        self.assertEqual([b['outcome'] for b in batches[0]], ['deleted']*8)
+        self.assertFalse(pull.cleanup_journal(self.inventory))
+
+    def test_slow_intents_save_certified_refusals_and_replay_exact_results(self):
+        tasks = self.group(8)
+        clock, journal = time.monotonic, pull.cleanup_journal_group
+        offset = [0]
+        def slow(inventory, entries):
+            journal(inventory, entries)
+            if entries[0][2] == 'intent': offset[0] += 40
+        with mock.patch.object(pull, 'cleanup_journal_group', side_effect=slow), \
+                mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock()+offset[0]), \
+                mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('late permit must not unlink')), \
+                mock.patch.object(pull, 'cleanup_api_retry', side_effect=TimeoutError('lost receipt ack')):
+            with self.assertRaises(TimeoutError): self.run_group(tasks)
+        saved = {item_id: json.loads(body) for item_id, phase, body in pull.cleanup_journal(self.inventory)
+                 if phase == 'result'}
+        self.assertEqual(len(saved), 8)
+        for receipt in saved.values():
+            self.assertEqual(receipt['outcome'], 'unverified')
+            self.assertEqual(receipt['refusal_reason'], 'deadline_exceeded')
+            self.assertEqual(receipt['refusal_protocol'], pull.CLEANUP_REFUSAL_PROTOCOL)
+            self.assertIs(receipt['unlink_attempted'], False)
+            self.assertGreaterEqual(receipt['stage_timings']['intent_journal_ms'], 40000)
+        replayed = {}
+        def replay(cfg, path, body, **kwargs):
+            self.assertTrue(path.endswith('/result'), path)
+            item_id = int(path.split('/')[-2])
+            replayed[item_id] = body
+            return fixture_ack(body, item_id, ok=True)
+        with mock.patch.object(pull, 'restore_api', side_effect=replay), \
+                mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('replay cannot unlink')):
+            result = pull.cleanup_replay_receipts(self.cfg, self.inventory)
+        self.assertEqual(result['failed'], 0)
+        self.assertEqual(replayed, saved)
+        self.assertFalse(pull.cleanup_journal(self.inventory))
 
     def test_lost_permit_response_never_unlinks_or_repermits(self):
         tasks = self.group()
@@ -75,8 +150,9 @@ class CleanupGroupTests(unittest.TestCase):
                 pull.cleanup_process_group(self.cfg, self.inventory, threading.Event(), tasks)
         self.assertEqual(transport.call_count, 1)
         self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'observe'})
+        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 0)
 
-    def test_partial_ledger_intent_write_preserves_all_intents_without_unlink(self):
+    def test_partial_ledger_intent_write_preserves_issued_intent_without_unlink(self):
         tasks = self.group()
         real = pull.cleanup_ledger_append_many
         def partial(cfg, rows):
@@ -84,9 +160,9 @@ class CleanupGroupTests(unittest.TestCase):
             raise OSError('partial append')
         with mock.patch.object(pull, 'cleanup_ledger_append_many', side_effect=partial), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('must not unlink')):
             with self.assertRaises(OSError): self.run_group(tasks)
-        self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'intent'})
+        self.assertEqual([r[1] for r in pull.cleanup_journal(self.inventory)], ['intent', 'observe', 'observe'])
 
-    def test_partial_ledger_results_leave_every_file_uncertain(self):
+    def test_partial_ledger_results_leave_issued_file_uncertain(self):
         tasks = self.group()
         real = pull.cleanup_ledger_append_many
         def partial(cfg, rows):
@@ -96,8 +172,9 @@ class CleanupGroupTests(unittest.TestCase):
             real(cfg, rows)
         with mock.patch.object(pull, 'cleanup_ledger_append_many', side_effect=partial):
             with self.assertRaises(OSError): self.run_group(tasks)
-        self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'intent'})
-        for task in tasks: self.assertFalse((self.cfg.output_dir/task['item']['relative_path']).exists())
+        self.assertEqual([r[1] for r in pull.cleanup_journal(self.inventory)], ['intent', 'observe', 'observe'])
+        self.assertFalse((self.cfg.output_dir/tasks[0]['item']['relative_path']).exists())
+        self.assertTrue((self.cfg.output_dir/tasks[1]['item']['relative_path']).exists())
 
     def test_group_sqlite_commit_failure_rolls_back_claims_and_rows(self):
         tasks = self.group()
@@ -128,16 +205,23 @@ class CleanupGroupTests(unittest.TestCase):
         self.assertEqual({r[1] for r in rows}, {'result'})
         self.assertTrue(all(json.loads(r[2])['outcome']=='deleted' for r in rows))
 
-    def test_directory_fsync_failure_stops_before_next_file(self):
+    def test_directory_fsync_failure_records_attempt_without_certifying_refusal(self):
         tasks = self.group()
         real_delete = pull.CleanupFile.delete_exact
+        fsync = pull.os.fsync
         def fail(current, proof):
-            with mock.patch.object(pull.os, 'fsync', side_effect=OSError('directory fsync failed')):
+            def sync(fd):
+                if fd == current.fds[-1]: raise OSError('directory fsync failed')
+                return fsync(fd)
+            with mock.patch.object(pull.os, 'fsync', side_effect=sync):
                 return real_delete(current, proof)
         with mock.patch.object(pull.CleanupFile, 'delete_exact', fail):
             with self.assertRaises(OSError): self.run_group(tasks)
-        self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'intent'})
-        self.assertFalse((self.cfg.output_dir/tasks[0]['item']['relative_path']).exists())
+        outcomes = [json.loads(r[0]) for r in self.inventory.db.execute('SELECT body FROM cleanup_execution_outcomes')]
+        self.assertTrue(outcomes[0]['unlink_attempted'])
+        self.assertEqual(outcomes[0]['outcome'], 'unverified')
+        self.assertNotIn('refusal_protocol', outcomes[0])
+        self.assertEqual([r[1] for r in pull.cleanup_journal(self.inventory)], ['result', 'observe', 'observe'])
         self.assertTrue((self.cfg.output_dir/tasks[1]['item']['relative_path']).exists())
 
     def test_crash_after_each_unlink_retains_intents(self):
@@ -156,8 +240,30 @@ class CleanupGroupTests(unittest.TestCase):
                     return result
                 with mock.patch.object(pull.os, 'unlink', side_effect=crash):
                     with self.assertRaises(SystemExit): case.run_group(tasks)
-                self.assertEqual({r[1] for r in pull.cleanup_journal(case.inventory)}, {'intent'})
-                self.assertTrue(all('unlink_attempted' not in json.loads(r[2]) for r in pull.cleanup_journal(case.inventory)))
+                rows = pull.cleanup_journal(case.inventory)
+                crashed = (cut-1)//2
+                self.assertEqual([r[1] for r in rows], ['result']*crashed + ['intent'] + ['observe']*(2-crashed))
+                self.assertIs(json.loads(rows[crashed][2])['unlink_attempted'], True)
+                self.assertNotIn('refusal_protocol', json.loads(rows[crashed][2]))
+                replayed = {}
+                def replay(cfg, path, body, **kwargs):
+                    item_id = int(path.split('/')[-2])
+                    if path.endswith('/reconcile'):
+                        return fixture_ack(body, item_id, action='pending', delete=False)
+                    self.assertTrue(path.endswith('/result'), path)
+                    replayed[item_id] = body
+                    return fixture_ack(body, item_id, ok=True)
+                # Receipts remain valid after the original lease/permit expires.
+                with mock.patch.object(pull, 'restore_api', side_effect=replay), \
+                        mock.patch.object(pull.time, 'time', return_value=time.time()+3600), \
+                        mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('replay cannot unlink')):
+                    replay_result = pull.cleanup_replay_receipts(case.cfg, case.inventory)
+                self.assertEqual(replay_result['failed'], 0)
+                self.assertFalse(pull.cleanup_journal(case.inventory))
+                self.assertTrue(all(replayed[n+1]['outcome']=='deleted' for n in range(crashed)))
+                uncertain = replayed[crashed+1]
+                self.assertEqual(uncertain['outcome'], 'unverified')
+                self.assertNotIn('refusal_protocol', uncertain)
             finally: case.doCleanups()
 
     def test_one_refused_permit_prevents_every_unlink(self):
@@ -165,18 +271,18 @@ class CleanupGroupTests(unittest.TestCase):
         real_api = self.api
         def refused(cfg, path, body, **kwargs):
             result = real_api(cfg, path, body, **kwargs)
-            result['results'][1].update(action='keep', delete=False, plan_paused=True)
+            result['results'][0].update(action='keep', delete=False, plan_paused=True)
             return result
         with mock.patch.object(self, 'api', side_effect=refused), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('must not unlink')):
             with self.assertRaises(pull.CleanupResponseError): self.run_group(tasks)
         self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'observe'})
 
-    def test_local_cap_is_reserved_for_whole_group_before_unlink(self):
+    def test_local_cap_counts_attempts_once_and_stops_before_excess_permit(self):
         tasks = self.group()
-        with mock.patch.object(pull, 'CLEANUP_MAX_FILES_24H', 2), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('must not unlink')):
+        with mock.patch.object(pull, 'CLEANUP_MAX_FILES_24H', 2):
             with self.assertRaises(pull.CleanupPermitRefused): self.run_group(tasks)
-        self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'intent'})
-        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 0)
+        self.assertEqual([r[1] for r in pull.cleanup_journal(self.inventory)], ['result', 'result', 'observe'])
+        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 2)
 
     def test_slow_group_barriers_expire_before_unlink(self):
         tasks = self.group()
@@ -184,10 +290,22 @@ class CleanupGroupTests(unittest.TestCase):
         offset = [0]
         def slow(cfg, rows):
             real_append(cfg, rows)
-            if rows[0]['event']=='intent': offset[0] = 20
+            if rows[0]['event']=='intent': offset[0] += 20
         with mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock()+offset[0]), mock.patch.object(pull, 'cleanup_ledger_append_many', side_effect=slow), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('must not unlink')):
-            with self.assertRaises(pull.CleanupPermitRefused): self.run_group(tasks)
-        self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'intent'})
+            self.run_group(tasks)
+        outcomes = [json.loads(r[0]) for r in self.inventory.db.execute('SELECT body FROM cleanup_execution_outcomes')]
+        self.assertTrue(all(r['refusal_reason']=='deadline_exceeded' and r['refusal_protocol']==1 for r in outcomes))
+        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 0)
+
+    def test_unused_cap_release_preserves_other_charges_and_crash_charge_expires(self):
+        tasks = self.group()
+        charged = pull.cleanup_reserve_group_caps(self.inventory, tasks[:1])
+        provisional = pull.cleanup_reserve_group_caps(self.inventory, tasks[1:2])
+        pull.cleanup_release_caps(self.inventory, provisional)
+        self.assertEqual([r[0] for r in self.inventory.db.execute('SELECT id FROM cleanup_local_deletions')], charged)
+        self.assertEqual(pull.cleanup_local_headroom(self.inventory)[0], pull.CLEANUP_MAX_FILES_24H-1)
+        with mock.patch.object(pull.time, 'time', return_value=time.time()+86401):
+            self.assertEqual(pull.cleanup_local_headroom(self.inventory)[0], pull.CLEANUP_MAX_FILES_24H)
 
     def test_external_namespace_change_is_not_a_group_unlink(self):
         tasks = self.group()
@@ -197,8 +315,9 @@ class CleanupGroupTests(unittest.TestCase):
             (self.path.parent/'external').write_text('external')
             return result
         with mock.patch.object(self, 'api', side_effect=mutate), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('must not unlink')):
-            with self.assertRaisesRegex(RuntimeError, 'membership changed'): self.run_group(tasks)
-        self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'intent'})
+            self.run_group(tasks)
+        outcomes = [json.loads(r[0]) for r in self.inventory.db.execute('SELECT body FROM cleanup_execution_outcomes')]
+        self.assertTrue(all(r['refusal_reason']=='pre_unlink_failure' and not r['unlink_attempted'] for r in outcomes))
 
     def test_mismatched_result_ack_keeps_all_exact_results(self):
         tasks = self.group()
@@ -210,3 +329,81 @@ class CleanupGroupTests(unittest.TestCase):
         with mock.patch.object(self, 'api', side_effect=wrong):
             with self.assertRaises(pull.CleanupResponseError): self.run_group(tasks)
         self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'result'})
+
+    def test_lease_margin_prevents_another_permit_and_releases_reservation(self):
+        tasks = self.group()
+        for task in tasks:
+            task['expires_at'] = (datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=40)).isoformat()
+        with mock.patch.object(pull, 'restore_api', side_effect=AssertionError('insufficient lease budget')):
+            with self.assertRaises(pull.CleanupInterrupted): self.run_group(tasks)
+        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 0)
+        self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'observe'})
+
+    def test_replaced_path_after_durable_marker_is_preserved(self):
+        tasks = self.group(1)
+        path = self.cfg.output_dir/tasks[0]['item']['relative_path']
+        journal = pull.cleanup_journal_group
+        def replace(inventory, entries):
+            journal(inventory, entries)
+            if entries[0][2] == 'intent' and entries[0][3].get('unlink_attempted') is True:
+                replacement = path.with_name('replacement')
+                replacement.write_bytes(b'replaced source')
+                replacement.replace(path)
+        with mock.patch.object(pull, 'cleanup_journal_group', side_effect=replace), \
+                mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('cannot delete replaced path')):
+            self.run_group(tasks)
+        self.assertEqual(path.read_bytes(), b'replaced source')
+        outcome = json.loads(self.inventory.db.execute('SELECT body FROM cleanup_execution_outcomes').fetchone()[0])
+        self.assertEqual(outcome['refusal_reason'], 'pre_unlink_failure')
+        self.assertIs(outcome['unlink_attempted'], False)
+
+    def test_slow_attempt_marker_rechecks_deadline_before_syscall(self):
+        tasks = self.group()
+        journal, clock, offset = pull.cleanup_journal_group, time.monotonic, [0]
+        def slow(inventory, entries):
+            journal(inventory, entries)
+            if entries[0][2] == 'intent' and entries[0][3].get('unlink_attempted') is True:
+                offset[0] += 20
+        with mock.patch.object(pull, 'cleanup_journal_group', side_effect=slow), \
+                mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock()+offset[0]), \
+                mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('deadline crossed during fsync')):
+            self.run_group(tasks)
+        outcomes = [json.loads(r[0]) for r in self.inventory.db.execute('SELECT body FROM cleanup_execution_outcomes')]
+        self.assertTrue(all(r['refusal_reason']=='deadline_exceeded' and r['refusal_protocol']==1 for r in outcomes))
+
+    def test_failed_refusal_checkpoint_cannot_certify_an_intent(self):
+        tasks = self.group()
+        journal, clock, offset = pull.cleanup_journal_group, time.monotonic, [0]
+        def fail(inventory, entries):
+            if entries[0][2] == 'result':
+                raise OSError('refusal result is not durable')
+            journal(inventory, entries)
+            if entries[0][2] == 'intent': offset[0] += 40
+        with mock.patch.object(pull, 'cleanup_journal_group', side_effect=fail), \
+                mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock()+offset[0]), \
+                mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('expired permit')):
+            with self.assertRaises(OSError): self.run_group(tasks)
+        rows = pull.cleanup_journal(self.inventory)
+        self.assertEqual([row[1] for row in rows], ['intent', 'observe', 'observe'])
+        self.assertNotIn('refusal_protocol', json.loads(rows[0][2]))
+        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 0)
+
+    def test_per_file_outcomes_and_timings_survive_uploaded_log_redaction(self):
+        tasks = self.group()
+        self.run_group(tasks)
+        ring = pull.ClientLogRing()
+        for level, message in self.logs: ring.record(level, message)
+        entries, _ = ring.since(0)
+        self.assertEqual(len(entries), 3)
+        uploaded = []
+        with mock.patch.object(pull, 'CLIENT_LOG_RING', ring), \
+                mock.patch.object(pull, 'request_json', side_effect=lambda *a, **kw: uploaded.extend(kw['body']['lines'])):
+            pull.client_log_upload_once(self.cfg, type('Runtime', (), {'boot_id': 'fixture'})(), self.inventory, 0)
+        self.assertEqual(uploaded, entries)
+        for entry in uploaded:
+            body = json.loads(entry['message'].split('cleanup execution ', 1)[1])
+            self.assertEqual(body['journal_phase'], 'acknowledged')
+            self.assertTrue(body['media_unlinked'] and body['sidecar_unlinked'])
+            self.assertIn('ledger_result_ms', body['stage_timings'])
+            self.assertIn('proof_ms', body['stage_timings'])
+            self.assertLess(len(entry['message']), pull.CLIENT_LOG_LINE_MAX)
