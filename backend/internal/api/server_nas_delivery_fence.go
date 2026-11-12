@@ -141,11 +141,3 @@ func (s *Server) allowNASDelivery(w http.ResponseWriter, r *http.Request, kind s
 	}
 	return true
 }
-
-// NAS presigns must fit the S3 maximum covered by the legacy drain barrier.
-func nasDeliveryTTL(ttl time.Duration) time.Duration {
-	if ttl <= 0 || ttl > 7*24*time.Hour {
-		return time.Hour
-	}
-	return ttl
-}
