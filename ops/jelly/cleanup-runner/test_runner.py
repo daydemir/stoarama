@@ -35,6 +35,12 @@ def fixture():
     return p, dict(items=[c], protected_overlap=0)
 
 
+def refused(row):
+    row.update(state='keep', delete_ever_issued=True, outcome={
+        'outcome': 'unverified', 'unlink_attempted': False,
+        'refusal_protocol': 1, 'refusal_reason': 'local_guard'})
+
+
 class DecisionTests(unittest.TestCase):
     def test_budget_boundaries_and_invalid_values(self):
         self.assertTrue(r.budget_permits(r.DAY_CAP - r.PLAN_CAP, r.PLAN_CAP))
@@ -151,6 +157,33 @@ class DecisionTests(unittest.TestCase):
         with self.assertRaises(r.Halt):
             r.execution_state(p)
 
+    def test_certified_refusal_runs_with_remainder_and_completes_with_deletions(self):
+        p, _ = fixture()
+        p.update(mode='enabled')
+        refused(p['results'][0])
+        p['results'].append(dict(ordinal=2, state='pending', delete_ever_issued=False))
+        p['items'].append(dict(p['items'][0], source_id=2))
+        self.assertEqual(r.execution_state(p), 'running')
+        p['results'][1].update(state='deleted', delete_ever_issued=True)
+        self.assertEqual(r.execution_state(p), 'done')
+        p['mode'] = 'paused'
+        for reason in ('completed: all items deleted or kept',
+                       'batch-completed: batch 12 plan finished cleanly'):
+            p['approval_reason'] = reason
+            self.assertEqual(r.execution_state(p), 'done')
+        p['approval_reason'] = 'auto-paused: contradictory receipt'
+        self.assertEqual(r.execution_state(p), 'anomaly')
+
+    def test_keep_requires_certified_non_unlink_evidence(self):
+        for change in ({'refusal_protocol': 0}, {'unlink_attempted': True},
+                       {'outcome': 'deleted'}, {'refusal_reason': 'observation_replayed'}):
+            p, _ = fixture()
+            p['mode'] = 'enabled'
+            refused(p['results'][0])
+            p['results'][0]['outcome'].update(change)
+            with self.subTest(change=change), self.assertRaises(r.Halt):
+                r.execution_state(p)
+
 
 class FakeRunner(r.Runner):
     """Exercise orchestration without any network, DB or subprocess access."""
@@ -183,8 +216,10 @@ class FakeRunner(r.Runner):
         self.events.append(path)
         if path.endswith('/control'):
             self.assert_enable = body
-            self.p['mode'] = 'enabled'
-        return {'mode': 'retired'}
+            self.p.update(mode=body['mode'], approval_reason=body['reason'])
+        if path.endswith('/close'):
+            self.p['mode'] = 'retired'
+        return {'id': self.p['id'], 'plan_sha256': self.p['plan_sha256'], 'mode': 'retired'}
     def monitor(self, pid):
         self.events.append('monitor')
         self.p['mode'] = 'paused'
@@ -201,7 +236,7 @@ class LoopTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
             job = FakeRunner(root)
             job.run()
-            self.assertEqual([e for e in job.events if e != 'idle'], ['OFF', 'ON', 'plans/42/control', 'monitor', 'OFF', 'recovery'])
+            self.assertEqual([e for e in job.events if e != 'idle'], ['OFF', 'ON', 'plans/42/control', 'monitor', 'OFF', 'recovery', 'plans/42/close'])
             self.assertEqual(job.assert_enable['plan_sha256'], 'b'*64)
             self.assertEqual(job.assert_enable['approval_hours'], 24)
             self.assertTrue(job.assert_enable['allow_long_approval'])
@@ -259,6 +294,103 @@ class LoopTests(unittest.TestCase):
             job.finish(job.p)
             self.assertEqual(job.events, ['OFF', 'recovery', 'plans/42/close'])
 
+    def test_finish_closes_certified_refusals_and_replans_only_never_issued(self):
+        for expiry in (False, True):
+            with self.subTest(expiry=expiry), tempfile.TemporaryDirectory() as root:
+                job = FakeRunner(root)
+                job.status['current_plan'] = 42
+                refused(job.p['results'][0])
+                job.p.update(mode='paused', approval_reason='completed: all items deleted or kept')
+                if expiry:
+                    job.p['approval_reason'] = 'auto-paused: approval expired; prior approval'
+                    job.p['items'].append(dict(job.p['items'][0], source_id=2))
+                    job.p['results'].append(dict(ordinal=2, state='pending', delete_ever_issued=False))
+                before = copy.deepcopy(job.p['results'])
+                job.finish(job.p)
+                self.assertEqual(job.events, ['OFF', 'recovery', 'plans/42/close'])
+                self.assertEqual(job.p['results'], before)
+                self.assertIsNone(job.status['current_plan'])
+                self.assertEqual(job.status['phase'], 'batch_complete')
+                self.assertEqual(job.picks, [42, None])
+
+    def test_finish_rereads_close_before_releasing_ownership(self):
+        for change in ('contradiction', 'not_retired', 'identity', 'contradicted_deleted'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as root:
+                job = FakeRunner(root)
+                job.status.update(current_plan=42, started_plan_sha256='b'*64)
+                refused(job.p['results'][0])
+                job.p.update(mode='paused', approval_reason='completed: all items deleted or kept')
+                api = job.api
+                def race(method, path, body=None):
+                    self.assertNotIn('operator_override', body or {})
+                    result = api(method, path, body)
+                    job.p = copy.deepcopy(job.p)
+                    if change in ('contradiction', 'contradicted_deleted'):
+                        job.p['results'][0].update(state='unverified' if change == 'contradiction' else 'deleted', outcome={
+                            'certified_refusal': job.p['results'][0]['outcome'],
+                            'contradictory_receipt': {'outcome': 'deleted'}})
+                    elif change == 'not_retired':
+                        job.p['mode'] = 'paused'
+                    else:
+                        job.p['plan_sha256'] = 'c'*64
+                    return result
+                job.api = race
+                job.run = lambda: job.finish(copy.deepcopy(job.p))
+                with patch.object(r, 'Runner', return_value=job), \
+                        patch.object(r.sys, 'argv', ['runner']), patch.object(r.signal, 'signal'):
+                    self.assertEqual(r.main(), 1)
+                self.assertEqual(job.status['current_plan'], 42)
+                self.assertEqual(job.status['started_plan_sha256'], 'b'*64)
+                self.assertEqual(job.status['phase'], 'failed')
+                self.assertTrue(job.status['last_error'])
+                self.assertTrue((job.root / 'STOP').exists())
+                self.assertNotIn('ON', job.events)
+                self.assertIn('notify', job.events)
+                self.assertEqual(job.picks, [42, None])
+
+    def test_close_409_latches_owner_stop_with_current_plan(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            job.status.update(current_plan=42, started_plan_sha256='b'*64)
+            refused(job.p['results'][0])
+            job.p.update(mode='paused', approval_reason='completed: all items deleted or kept')
+            job.api = lambda method, path, body: r.request('https://invalid/' + path, 'fixture', method, body)
+            job.run = lambda: job.finish(copy.deepcopy(job.p))
+            error = r.urllib.error.HTTPError('https://invalid', 409, 'private-body', {}, io.BytesIO(b'private-body'))
+            opener = SimpleNamespace(open=unittest.mock.Mock(side_effect=error))
+            with patch.object(r.urllib.request, 'build_opener', return_value=opener), \
+                    patch.object(r, 'Runner', return_value=job), patch.object(r.sys, 'argv', ['runner']), \
+                    patch.object(r.signal, 'signal'):
+                self.assertEqual(r.main(), 1)
+            self.assertEqual(job.status['current_plan'], 42)
+            self.assertEqual(job.status['started_plan_sha256'], 'b'*64)
+            self.assertIn('owner', job.status['last_error'])
+            self.assertNotIn('private-body', json.dumps(job.status))
+            self.assertTrue((job.root / 'STOP').exists())
+            self.assertEqual(job.events[0], 'OFF')
+            self.assertNotIn('ON', job.events)
+            self.assertEqual(opener.open.call_count, 1)
+
+    def test_finish_never_closes_uncertain_receipts_even_after_expiry(self):
+        for state in ('unverified', 'media_deleted_sidecar_failed', 'conflict', 'missing', 'keep'):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as root:
+                job = FakeRunner(root)
+                job.status['current_plan'] = 42
+                job.p.update(mode='paused', approval_reason='auto-paused: approval expired; prior approval')
+                job.p['results'][0].update(state=state, delete_ever_issued=True)
+                with self.assertRaises(r.Halt):
+                    job.finish(job.p)
+                self.assertEqual(job.events, ['OFF', 'recovery'])
+                self.assertEqual(job.status['current_plan'], 42)
+
+    def test_finish_pauses_terminal_enabled_plan_before_close(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            job.p['mode'] = 'enabled'
+            refused(job.p['results'][0])
+            job.finish(job.p)
+            self.assertEqual(job.events, ['OFF', 'recovery', 'plans/42/control', 'plans/42/close'])
+
     def test_anomaly_never_closes_or_replans(self):
         with tempfile.TemporaryDirectory() as root:
             job = FakeRunner(root)
@@ -306,7 +438,7 @@ class LoopTests(unittest.TestCase):
                 job.p['results'][0].update(state='deleted', delete_ever_issued=True)
             with patch.object(r.time, 'sleep', side_effect=complete):
                 r.Runner.monitor(job, 42)
-            self.assertEqual(job.events, ['OFF', 'recovery'])
+            self.assertEqual(job.events, ['OFF', 'recovery', 'plans/42/close'])
 
     def test_deleted_anomalous_pause_still_stops(self):
         p, _ = fixture()

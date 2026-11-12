@@ -40,6 +40,10 @@ class ReadFailure(Halt):
     """A transient read error with a fixed, credential-free reason."""
 
 
+class RequestConflict(Halt):
+    """The server refused a mutation with HTTP 409."""
+
+
 class LockHeld(Exception):
     """Another runner owns the master switch; leave it alone."""
 
@@ -139,20 +143,41 @@ def verify(plan, catalog, windows, now):
     return size
 
 
+def certified_refusal(row):
+    receipt = row.get('outcome')
+    return (row['state'] == 'keep' and row['delete_ever_issued']
+            and isinstance(receipt, dict) and receipt.get('outcome') == 'unverified'
+            and receipt.get('refusal_protocol') == 1 and receipt.get('unlink_attempted') is False
+            and receipt.get('refusal_reason') in {'deadline_exceeded', 'proof_mismatch', 'permit_expired',
+                                                 'execution_disabled', 'local_guard', 'pre_unlink_failure'})
+
+
+def require_certain_receipts(plan):
+    require(not any(row['state'] in {'unverified', 'media_deleted_sidecar_failed', 'conflict', 'missing'}
+                    or (row['delete_ever_issued'] and row['state'] != 'deleted' and not certified_refusal(row))
+                    or (row['state'] == 'keep' and not certified_refusal(row))
+                    or (isinstance(row.get('outcome'), dict)
+                        and ('contradictory_receipt' in row['outcome'] or 'certified_refusal' in row['outcome']))
+                    for row in results(plan)), 'uncertain execution receipt requires owner')
+
+
 def execution_state(plan):
     rows = results(plan)
     reason = plan['approval_reason']
     expired = (reason.startswith('auto-paused: approval expired; ')
                or reason == 'auto-paused: execution lease expired without a report')
-    if all(r['state'] == 'deleted' and r['delete_ever_issued'] for r in rows):
+    if all((r['state'] == 'deleted' and r['delete_ever_issued']) or certified_refusal(r) for r in rows):
         require(plan['mode'] in {'enabled', 'paused'}, 'unexpected completed plan mode')
-        if plan['mode'] == 'paused' and not (expired or reason == 'completed: all items deleted'):
+        if plan['mode'] == 'paused' and not (expired or reason in {
+                'completed: all items deleted', 'completed: all items deleted or kept'}
+                or reason.startswith('batch-completed: ')):
             return 'anomaly'
         return 'done'
     if plan['mode'] == 'paused':
         return 'expired' if expired else 'anomaly'
     require(plan['mode'] == 'enabled', 'execution left enabled mode unexpectedly')
-    require(all(r['state'] in {'pending', 'leased', 'would_delete', 'delete_issued', 'deleted'} for r in rows),
+    require(all(r['state'] in {'pending', 'leased', 'would_delete', 'delete_issued', 'deleted'}
+                or certified_refusal(r) for r in rows),
             'execution contains an anomalous item')
     return 'running'
 
@@ -245,7 +270,7 @@ def request(url, token, method='GET', body=None):
     except urllib.error.HTTPError as exc:
         retry = exc.code in {408, 429, 500, 502, 503, 504}
         exc.close()
-        error = ReadFailure if retry and method == 'GET' else Halt
+        error = RequestConflict if exc.code == 409 else ReadFailure if retry and method == 'GET' else Halt
         raise error('HTTP request failed (' + method + ')') from None
     except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead):
         error = ReadFailure if method == 'GET' else Halt
@@ -807,12 +832,29 @@ class Runner:
         plan = self.plan(plan['id'])
         state = execution_state(plan)
         require(state in {'done', 'expired'}, 'plan paused for a non-expiry reason')
-        require(not any(r['state'] in {'delete_issued', 'unverified', 'media_deleted_sidecar_failed', 'conflict', 'missing', 'keep'}
-                        for r in results(plan)), 'uncertain execution receipt requires owner')
-        if state == 'expired' and any(not r['delete_ever_issued'] for r in results(plan)):
-            closed = self.api('POST', 'plans/' + str(plan['id']) + '/close', {
-                'expected_plan_sha256': plan['plan_sha256'], 'reason': 'Standing approval: expiry; retain issued R2 holds and replan never-issued remainder.'})
-            require(closed['mode'] == 'retired', 'close was not confirmed')
+        require_certain_receipts(plan)
+        if state == 'done' or any(not r['delete_ever_issued'] for r in results(plan)):
+            if plan['mode'] == 'enabled':
+                self.api('POST', 'plans/' + str(plan['id']) + '/control', {
+                    'plan_sha256': plan['plan_sha256'], 'mode': 'paused',
+                    'reason': 'completed: all items deleted or kept'})
+                plan = self.plan(plan['id'])
+                require(plan['mode'] == 'paused' and execution_state(plan) == 'done',
+                        'completion pause was not confirmed')
+            try:
+                closed = self.api('POST', 'plans/' + str(plan['id']) + '/close', {
+                    'expected_plan_sha256': plan['plan_sha256'], 'reason': 'Standing approval: ' + state +
+                    '; retain issued R2 holds and replan never-issued remainder.'})
+            except RequestConflict:
+                raise Halt('cleanup close refused; owner review required') from None
+            require(closed['id'] == plan['id'] and closed['plan_sha256'] == plan['plan_sha256']
+                    and closed['mode'] == 'retired', 'close was not confirmed')
+            # A late receipt can contradict the last pre-close report. Keep
+            # ownership until the server's committed state and evidence agree.
+            final = self.plan(plan['id'])
+            require(final['plan_sha256'] == plan['plan_sha256'] and final['mode'] == 'retired',
+                    'closed plan identity or mode differs; owner review required')
+            require_certain_receipts(final)
         self.save('batch_complete', current_plan=None, started_plan_sha256=None)
         self.progress()
 

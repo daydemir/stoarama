@@ -45,6 +45,62 @@ class InventoryGenerationCacheTests(unittest.TestCase):
         return self.inventory._linked_scan_row_is_current(
             clip or self.clip, "scan-new", "new-pass", self.path, sidecar or self.sidecar)
 
+    def test_stalled_nas_stat_does_not_block_durable_receipts(self):
+        for linked in (True, False):
+            with self.subTest(linked=linked):
+                if not linked:
+                    stat = self.path.stat()
+                    self.inventory.db.execute("INSERT OR REPLACE INTO unmatched_files(relative_path,size_bytes,sha256,state,file_mtime_ns,seen_generation,file_ctime_ns,file_inode,file_device,client_updated_at) VALUES(?,?,?,'present',?,'scan-old',?,?,?,?)",
+                                              ("other.mp4", stat.st_size, self.clip['sha256'], stat.st_mtime_ns,
+                                               stat.st_ctime_ns, stat.st_ino, stat.st_dev, self.old_verified))
+                    self.inventory.db.commit()
+                entered, release, committed = (threading.Event() for _ in range(3))
+                errors = []
+                def slow_stat(_path):
+                    entered.set()
+                    if not release.wait(3):
+                        raise AssertionError('receipt was blocked behind NAS I/O')
+                    return self.path.stat()
+                def scan():
+                    try:
+                        if linked:
+                            self.current()
+                        else:
+                            self.inventory._unmatched_scan_row_is_current('other.mp4', 'scan-new', 'new-pass', None)
+                    except Exception as exc:
+                        errors.append(exc)
+                def receipt():
+                    try:
+                        pull.cleanup_journal(self.inventory, 900, 'intent', {'attempt': 1})
+                        committed.set()
+                    except Exception as exc:
+                        errors.append(exc)
+                with mock.patch.object(self.inventory, '_cached_regular_stat', side_effect=slow_stat):
+                    worker = threading.Thread(target=scan)
+                    writer = threading.Thread(target=receipt)
+                    worker.start()
+                    try:
+                        self.assertTrue(entered.wait(1))
+                        writer.start()
+                        self.assertTrue(committed.wait(1), 'receipt mutex held across NAS stat')
+                    finally:
+                        release.set()
+                        worker.join(4)
+                        if writer.ident is not None:
+                            writer.join(4)
+                self.assertEqual(errors, [])
+
+    def test_concurrent_row_change_prevents_cached_hash_reuse(self):
+        def changed(_path):
+            with self.inventory.lock:
+                self.inventory.db.execute("UPDATE files SET state='mismatch' WHERE clip_id=1")
+                self.inventory.db.commit()
+            return self.path.stat()
+        with mock.patch.object(self.inventory, '_cached_regular_stat', side_effect=changed):
+            self.assertFalse(self.current())
+        self.assertEqual(self.inventory.db.execute('SELECT state,seen_generation FROM files WHERE clip_id=1').fetchone(),
+                         ('mismatch', 'scan-old'))
+
     def test_new_generation_publishes_unchanged_rows_and_preserves_actual_hash_time(self):
         self.assertTrue(self.current())
         row = self.inventory.db.execute("SELECT seen_generation,scan_pass,dirty,verified_at FROM files WHERE clip_id=1").fetchone()

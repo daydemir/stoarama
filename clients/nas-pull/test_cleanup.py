@@ -237,6 +237,43 @@ class CleanupTests(unittest.TestCase):
         with mock.patch.object(pull,'restore_api',side_effect=lambda cfg, path, body: fixture_ack(body, ok=True)) as api:
             pull.cleanup_replay_receipts(self.cfg,self.inventory)
         self.assertEqual(api.call_args.args[2]['outcome'],'unverified');self.assertTrue(self.path.exists())
+        self.assertNotIn('unlink_attempted', api.call_args.args[2])
+        self.assertNotIn('refusal_reason', api.call_args.args[2])
+        self.assertNotIn('refusal_protocol', api.call_args.args[2])
+
+    def test_inventory_hash_yields_between_chunks_and_cancels_while_paused(self):
+        body = b'x' * (3 * 1024 * 1024)
+        self.path.write_bytes(body)
+        stop = threading.Event()
+        fence = pull.NASMediaFence()
+        reached, release = threading.Event(), threading.Event()
+        reads = []
+        results = []
+        original_wait = fence.wait_maintenance
+        def checkpoint(event):
+            reads.append(True)
+            if len(reads) == 2:
+                reached.set()
+                release.wait(2)
+            return original_wait(event)
+        def hash_file():
+            try:
+                results.append(pull.sha256_file_throttled(self.path, 1000, stop))
+            except pull.InventoryScanStopped:
+                results.append('stopped')
+        with mock.patch.object(pull, 'NAS_MEDIA_FENCE', fence), mock.patch.object(fence, 'wait_maintenance', side_effect=checkpoint):
+            thread = threading.Thread(target=hash_file)
+            thread.start()
+            self.assertTrue(reached.wait(1))
+            with fence.condition:
+                fence.execution_owner = threading.get_ident()
+            release.set()
+            thread.join(.05)
+            self.assertTrue(thread.is_alive(), 'in-flight inventory hash ignored cleanup lane')
+            stop.set()
+            thread.join(2)
+        self.assertEqual(results, ['stopped'])
+        self.assertEqual(len(reads), 2)
 
     def test_writer_fence_waits_for_delivery_without_serializing_deliveries(self):
         fence=pull.NASMediaFence();entered=threading.Event();release=threading.Event()
@@ -464,6 +501,36 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(receipts[0]['refusal_reason'], 'permit_expired')
         self.assertFalse(receipts[0]['unlink_attempted'])
         self.assertIn('permit expired', receipts[0]['error'])
+
+    def test_slow_intent_journal_is_timed_and_never_unlinks(self):
+        with self.opened() as current:
+            self.task['approved_proof'] = current.proof()
+        clock, journal = time.monotonic, pull.cleanup_journal
+        offset = [0]
+        receipts = []
+        def slow_journal(inventory, item_id=None, phase=None, body=None, owner=None):
+            if phase == 'intent':
+                self.assertNotIn('unlink_attempted', body)
+                offset[0] += 40
+            return journal(inventory, item_id, phase, body, owner)
+        def api(cfg, path, body, **kwargs):
+            if path.endswith('/observe'):
+                return fixture_ack(body, action='delete_issued', delete=True,
+                                   expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
+            receipts.append(body)
+            return fixture_ack(body, ok=True)
+        with mock.patch.object(pull, 'restore_api', side_effect=api), \
+                mock.patch.object(pull, 'cleanup_journal', side_effect=slow_journal), \
+                mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock()+offset[0]), \
+                mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('late permit must not unlink')):
+            pull.cleanup_process_task(self.cfg, self.inventory, threading.Event(), self.task)
+        receipt = receipts[0]
+        self.assertEqual(receipt['refusal_reason'], 'deadline_exceeded')
+        self.assertFalse(receipt['unlink_attempted'])
+        self.assertEqual(receipt['refusal_protocol'], 1)
+        self.assertGreaterEqual(receipt['stage_timings']['intent_journal_ms'], 40000)
+        self.assertGreaterEqual(receipt['execution_elapsed_ms'], 40000)
+        self.assertTrue(self.path.exists()); self.assertTrue(self.sidecar.exists())
 
     def test_execution_transport_failure_is_not_retried_or_unlinked(self):
         with self.opened() as current:
@@ -1067,6 +1134,51 @@ class CleanupGuardTests(unittest.TestCase):
         receipts = [b for p, b in calls if p.endswith('/result')]
         self.assertEqual(receipts[0]['outcome'], 'unverified'); self.assertIn('state volume full', receipts[0]['error'])
 
+    def test_ledger_result_failure_does_not_certify_a_refusal(self):
+        self.approve()
+        append = pull.cleanup_ledger_append
+        def ledger(cfg, record):
+            if record['event'] == 'result':
+                raise OSError('result fsync failed')
+            return append(cfg, record)
+        with mock.patch.object(pull, 'cleanup_ledger_append', side_effect=ledger), \
+                mock.patch.object(pull.CleanupFile, 'delete_exact', side_effect=pull.CleanupPermitRefused('deadline_exceeded', 'too late')):
+            calls = self.run_execution()
+        receipt = [b for p, b in calls if p.endswith('/result')][0]
+        self.assertEqual(receipt['outcome'], 'unverified')
+        self.assertNotIn('unlink_attempted', receipt)
+        self.assertNotIn('refusal_reason', receipt)
+        self.assertNotIn('refusal_protocol', receipt)
+        self.assertTrue(self.path.exists()); self.assertTrue(self.sidecar.exists())
+        self.assertEqual([row['event'] for row in self.ledger()], ['intent'])
+
+    def test_crash_around_unlink_replays_unknown_intent(self):
+        self.approve()
+        unlink = pull.os.unlink
+        for after_unlink in (False, True):
+            if after_unlink:
+                self.path.write_bytes(b'fixture media')
+                self.item['frozen_identity'] = pull.cleanup_identity(self.path.stat())
+                self.approve()
+            def crash(name, *args, **kwargs):
+                if after_unlink:
+                    unlink(name, *args, **kwargs)
+                raise SystemExit('process died at unlink')
+            with mock.patch.object(pull.os, 'unlink', side_effect=crash), self.assertRaises(SystemExit):
+                self.run_execution()
+            checkpoint = pull.cleanup_journal(self.inventory)[0]
+            self.assertEqual(checkpoint[1], 'intent')
+            body = json.loads(checkpoint[2])
+            self.assertNotIn('unlink_attempted', body)
+            self.assertNotIn('refusal_reason', body)
+            self.assertNotIn('refusal_protocol', body)
+            self.assertEqual(self.path.exists(), not after_unlink)
+            with mock.patch.object(pull, 'restore_api', side_effect=lambda cfg, path, body: fixture_ack(body, ok=True)) as api, \
+                    mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('replay must not unlink')):
+                pull.cleanup_replay_receipts(self.cfg, self.inventory)
+            self.assertNotIn('unlink_attempted', api.call_args.args[2])
+            self.assertEqual(api.call_args.args[2]['outcome'], 'unverified')
+
     def test_media_deleted_sidecar_failed_is_reported_honestly_with_legacy_fallback(self):
         original_unlink = pull.os.unlink
         def unlink(name, *args, **kwargs):
@@ -1454,6 +1566,32 @@ class CleanupProtocol2Tests(unittest.TestCase):
 
     def journal_observe(self, item_id, **extra):
         pull.cleanup_journal(self.inventory, item_id, 'observe', dict(attempt=1, plan_sha256='a'*64, outcome='conflict', proof=None, error='x', request_id='%032x' % item_id, **extra))
+
+    def test_result_transaction_failure_retains_exact_receipt_for_replay(self):
+        receipt = dict(attempt=1, plan_sha256='a'*64, proof_sha256='b'*64,
+                       outcome='deleted', unlink_attempted=True)
+        pull.cleanup_journal(self.inventory, 900, 'result', receipt)
+        checkpoint = pull.cleanup_journal(self.inventory)
+        # Even repeated failures over hours must stay replayable, never quarantine.
+        def unavailable(cfg, path, body, **kwargs):
+            self.assertTrue(path.endswith('/900/result'))
+            self.assertEqual(body, receipt)
+            raise pull.urllib.error.HTTPError(path, 503, 'replay required', {}, None)
+        with mock.patch.object(pull, 'restore_api', side_effect=unavailable), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('receipt replay must not unlink')):
+            for cycle in range(pull.CLEANUP_REPLAY_QUARANTINE_AFTER + 1):
+                with mock.patch.object(pull.time, 'time', return_value=10000 + cycle*901):
+                    pull.cleanup_replay_receipts(self.cfg, self.inventory)
+                self.assertEqual(pull.cleanup_journal(self.inventory), checkpoint)
+        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_quarantine').fetchone()[0], 0)
+        # A committed contradiction is a 409; its server evidence is durable.
+        def committed(cfg, path, body, **kwargs):
+            self.assertEqual(body, receipt)
+            raise pull.urllib.error.HTTPError(path, 409, 'committed contradiction', {}, None)
+        with mock.patch.object(pull, 'restore_api', side_effect=committed):
+            pull.cleanup_replay_receipts(self.cfg, self.inventory)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+        archived = self.inventory.db.execute('SELECT item_id,phase,body FROM cleanup_rejected_receipts').fetchone()
+        self.assertEqual((archived[0], archived[1], json.loads(archived[2])), (900, 'result', receipt))
 
     def test_failing_replay_never_blocks_leasing_and_is_quarantined_not_dropped(self):
         pull.CLEANUP_STATUS.__init__()

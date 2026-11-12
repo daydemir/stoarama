@@ -725,6 +725,9 @@ func (s *Server) stitchAdvanceRetirement(ctx context.Context, tx pgx.Tx) (func()
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
 		return nil, err
 	}
+	if _, err := cleanupLockConnection(ctx, tx, 13); err != nil {
+		return nil, err
+	}
 	// Close only this lane's cleanly completed plan so the shared one-plan
 	// cap permits its successor. Issued R2 recovery holds remain permanent.
 	if _, err := tx.Exec(ctx, `UPDATE nas_cleanup_plans p SET mode='paused',approved_until=NULL,approval_reason='stitch retirement complete'

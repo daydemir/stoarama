@@ -52,7 +52,10 @@ func TestNASCleanupAllIncidentItemsRemainPermanentlyReserved(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if w := closeCall(t, f.s, planID, sha); w.Code != 200 {
+		if w := closeCall(t, f.s, planID, sha); w.Code != 409 {
+			t.Fatalf("incident uncertainty bypassed owner: %d %s", w.Code, w.Body.String())
+		}
+		if w := closeOverrideCall(t, f.s, planID, sha); w.Code != 200 {
 			t.Fatalf("close: %d %s", w.Code, w.Body.String())
 		}
 		var protected int

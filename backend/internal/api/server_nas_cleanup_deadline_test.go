@@ -323,7 +323,7 @@ func TestNASCleanupNeverAttemptedReceiptPreservesSafetyAndDiagnostics(t *testing
 		t.Fatalf("receipt lost evidence: %s issued=%t", saved, issued)
 	}
 	if mode, _ := f.planMode(id); mode != "paused" {
-		t.Fatalf("refusal bypassed safety pause: %s", mode)
+		t.Fatalf("legacy refusal bypassed safety pause: %s", mode)
 	}
 	body["outcome"] = "deleted"
 	w := cleanupCall(t, f.s.handleAccountNASCleanupResult, 47, 5, "itemId", fmt.Sprint(task.ItemID), body)
