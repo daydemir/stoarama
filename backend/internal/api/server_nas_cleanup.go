@@ -60,7 +60,7 @@ const (
 	nasCleanupReconciliationProtocol = 1
 	// Exact reviewed release allowlist; git hashes have no sortable version order.
 	// Retain reviewed predecessors. Stage this fix only with explicit
-	// NAS_VERSION=listing-fence-v1 from merged main; never reuse a predecessor version.
+	// NAS_VERSION=cleanup-pipeline-v1 from merged main; never reuse a predecessor version.
 	nasCleanupExecutionClientVersion          = "be17fd73"
 	nasCleanupSerialExecutionClientVersion    = "94d39bff"
 	nasCleanupDedicatedExecutionClientVersion = "523b70ff"
@@ -73,6 +73,9 @@ const (
 	nasCleanupRefusalClientVersion            = "cleanup-refusals-v1"
 	nasCleanupListingProofClientVersion       = "listing-proof-v1"
 	nasCleanupListingFenceClientVersion       = "listing-fence-v1"
+	nasCleanupPipelineClientVersion           = "cleanup-pipeline-v1"
+	nasCleanupGroupClientVersion              = "cleanup-batch-v1"
+	nasCleanupExecutionGroupMax               = 8
 	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
 	// item limit only keeps one admission request bounded.
 	nasCleanupMaxPlanItems = 10000
@@ -564,7 +567,7 @@ func cleanupRequestSession(r *http.Request) cleanupClientSession {
 }
 
 func cleanupSessionDeadline(ctx context.Context, tx pgx.Tx, cid int64, session cleanupClientSession) (time.Time, error) {
-	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion && session.version != nasCleanupV85RClientVersion && session.version != nasCleanupV85RServerSwitchClientVersion && session.version != nasCleanupV85RCorpusUAClientVersion && session.version != nasCleanupRefusalClientVersion && session.version != nasCleanupListingProofClientVersion && session.version != nasCleanupListingFenceClientVersion) {
+	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion && session.version != nasCleanupV85RClientVersion && session.version != nasCleanupV85RServerSwitchClientVersion && session.version != nasCleanupV85RCorpusUAClientVersion && session.version != nasCleanupRefusalClientVersion && session.version != nasCleanupListingProofClientVersion && session.version != nasCleanupListingFenceClientVersion && session.version != nasCleanupPipelineClientVersion && session.version != nasCleanupGroupClientVersion) {
 		return time.Time{}, nil
 	}
 	var seen *time.Time
@@ -578,12 +581,13 @@ func cleanupSessionDeadline(ctx context.Context, tx pgx.Tx, cid int64, session c
 }
 
 type cleanupTask struct {
-	ItemID        int64           `json:"item_id"`
-	Attempt       int             `json:"attempt"`
-	PlanSHA       string          `json:"plan_sha256"`
-	ExpiresAt     time.Time       `json:"expires_at"`
-	Item          nasCleanupItem  `json:"item"`
-	ApprovedProof json.RawMessage `json:"approved_proof,omitempty"`
+	ItemID         int64           `json:"item_id"`
+	Attempt        int             `json:"attempt"`
+	PlanSHA        string          `json:"plan_sha256"`
+	ExpiresAt      time.Time       `json:"expires_at"`
+	Item           nasCleanupItem  `json:"item"`
+	ApprovedProof  json.RawMessage `json:"approved_proof,omitempty"`
+	ExecutionBatch bool            `json:"execution_batch,omitempty"`
 }
 type cleanupObserve struct {
 	ReconciliationProtocol int                `json:"reconciliation_protocol,omitempty"`
@@ -618,8 +622,8 @@ JOIN LATERAL (
 ) i ON true
 WHERE p.connection_id=$1 AND p.report_sha256=$3 AND p.id=ANY($4)
  AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $2
- AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.state IN ('leased','delete_issued'))))
-ORDER BY i.attempt,p.priority DESC,p.id LIMIT 1`
+ AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.state IN ('leased','delete_issued') AND NOT (busy.id=ANY($5::bigint[])))))
+ORDER BY (p.mode='enabled') DESC,i.attempt,p.priority DESC,p.id LIMIT 1`
 
 // Bytes of execution work already leased but not yet observed. Counted with
 // the issued bytes so a lease never hands out work the budget cannot permit.
@@ -639,6 +643,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		ClientVersion          string `json:"client_version"`
 		Protocol               int    `json:"protocol"`
 		Limit                  int    `json:"limit"`
+		ExecutionBatch         bool   `json:"execution_batch,omitempty"`
 		ExecutionFiles         *int   `json:"execution_files,omitempty"`
 		ExecutionBytes         *int64 `json:"execution_bytes,omitempty"`
 		// Protocol 2: a retried request returns the tasks it already leased.
@@ -661,6 +666,10 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		}
 	default:
 		util.WriteError(w, 400, "cleanup protocol1, client version and bounded limit required")
+		return
+	}
+	if req.ExecutionBatch && (req.Protocol != 2 || req.ClientVersion != nasCleanupGroupClientVersion || req.RequestID == "") {
+		util.WriteError(w, 400, "reviewed group client and protocol2 request identity required")
 		return
 	}
 	if req.Limit == 0 {
@@ -691,6 +700,9 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		return
 	}
 	session := cleanupRequestSession(r)
+	group := req.ExecutionBatch && session.version == nasCleanupGroupClientVersion
+	groupIDs := []int64{}
+	var budgetLeft *int64
 	sessionDeadline, err := cleanupSessionDeadline(ctx, tx, cid, session)
 	if err != nil {
 		util.WriteError(w, 500, "cleanup client identity unavailable")
@@ -706,7 +718,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	}
 	tasks := make([]cleanupTask, 0, req.Limit)
 	if req.RequestID != "" {
-		replayed, err := cleanupLeaseReplay(ctx, tx, cid, req.RequestID, allowExecution, session.boot, session.version, sessionDeadline, plans)
+		replayed, err := cleanupLeaseReplay(ctx, tx, cid, req.RequestID, allowExecution, session.boot, session.version, sessionDeadline, plans, group)
 		if err != nil {
 			util.WriteError(w, 500, "cleanup lease load failed")
 			return
@@ -720,7 +732,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		var task cleanupTask
 		var raw, approved []byte
 		var mode string
-		err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, allowExecution, cleanupPolicySHA, plans).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode)
+		err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, allowExecution, cleanupPolicySHA, plans, groupIDs).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode)
 		if errors.Is(err, pgx.ErrNoRows) {
 			break
 		}
@@ -728,26 +740,32 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 			util.WriteError(w, 500, "cleanup lease load failed")
 			return
 		}
+		if len(groupIDs) != 0 && mode != "enabled" {
+			break
+		}
 		if mode == "enabled" {
-			// Execution is always alone, for every client and protocol.
-			if len(tasks) != 0 {
+			// A single bounded group owns execution until every receipt resolves.
+			if len(tasks) != 0 && (!group || tasks[0].ApprovedProof == nil) {
 				break
 			}
-			var issued, leased int64
-			if err = tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&issued); err == nil {
-				err = tx.QueryRow(ctx, cleanupLeasedExecutionBytesSQL).Scan(&leased)
+			if budgetLeft == nil {
+				var issued, leased int64
+				if err = tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&issued); err == nil {
+					err = tx.QueryRow(ctx, cleanupLeasedExecutionBytesSQL).Scan(&leased)
+				}
+				if err != nil {
+					util.WriteError(w, 500, "cleanup deletion budget unavailable")
+					return
+				}
+				left := nasCleanupMaxIssuedBytes24h - issued - leased
+				budgetLeft = &left
 			}
-			if err != nil {
-				util.WriteError(w, 500, "cleanup deletion budget unavailable")
-				return
-			}
-			budgetLeft := nasCleanupMaxIssuedBytes24h - issued - leased
 			// Never lease execution work the rolling budget (or, protocol 2, the
 			// client's own remaining local caps) could not permit: it would only
 			// turn into a budget refusal that auto-pauses the plan.
 			// (An invalid size is still leased and then refused, and auto-paused,
 			// by the permit check itself.)
-			if (task.Item.SizeBytes > 0 && task.Item.SizeBytes > budgetLeft) ||
+			if (task.Item.SizeBytes > 0 && task.Item.SizeBytes > *budgetLeft) ||
 				(req.Protocol == 2 && (*req.ExecutionFiles < 1 || task.Item.SizeBytes > *req.ExecutionBytes)) {
 				allowExecution = false
 				continue
@@ -763,6 +781,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 				continue
 			}
 			task.ApprovedProof = approved
+			task.ExecutionBatch = group
 		}
 		var requestID any
 		if req.RequestID != "" {
@@ -775,7 +794,16 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		}
 		tasks = append(tasks, task)
 		if mode == "enabled" {
-			break
+			if !group {
+				break
+			}
+			groupIDs = append(groupIDs, task.ItemID)
+			*budgetLeft -= task.Item.SizeBytes
+			*req.ExecutionFiles--
+			*req.ExecutionBytes -= task.Item.SizeBytes
+			if len(groupIDs) >= nasCleanupExecutionGroupMax || *req.ExecutionFiles <= 0 {
+				break
+			}
 		}
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -797,8 +825,8 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 // cleanupLeaseReplay returns the still-leased, unexpired tasks of an earlier
 // identical lease request (its response was lost), with the same attempt and
 // expiry. Nothing is leased again and no lease is extended.
-func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID string, executionCapable bool, boot, version string, sessionDeadline time.Time, plans []int64) ([]cleanupTask, error) {
-	rows, err := tx.Query(ctx, `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode,i.lease_expires_at FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.lease_request_id=$1 AND p.id=ANY($7) AND i.state='leased' AND i.lease_expires_at>now() AND p.connection_id=$2 AND p.report_sha256=$3 AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $4 AND i.lease_connection_id=$2 AND i.lease_client_boot_id=$5 AND i.lease_client_version=$6 AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.id<>i.id AND busy.state IN ('leased','delete_issued')))) ORDER BY i.id FOR UPDATE OF i`, requestID, cid, cleanupPolicySHA, executionCapable, boot, version, plans)
+func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID string, executionCapable bool, boot, version string, sessionDeadline time.Time, plans []int64, group bool) ([]cleanupTask, error) {
+	rows, err := tx.Query(ctx, `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode,i.lease_expires_at FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.lease_request_id=$1 AND p.id=ANY($7) AND i.state='leased' AND i.lease_expires_at>now() AND p.connection_id=$2 AND p.report_sha256=$3 AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $4 AND i.lease_connection_id=$2 AND i.lease_client_boot_id=$5 AND i.lease_client_version=$6 AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.id<>i.id AND busy.state IN ('leased','delete_issued') AND NOT coalesce(($8 AND busy.lease_request_id=$1 AND busy.lease_client_boot_id=$5 AND busy.lease_client_version=$6),false)))) ORDER BY i.id FOR UPDATE OF i`, requestID, cid, cleanupPolicySHA, executionCapable, boot, version, plans, group)
 	if err != nil {
 		return nil, err
 	}
@@ -819,6 +847,7 @@ func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID str
 				continue
 			}
 			task.ApprovedProof = approved
+			task.ExecutionBatch = group
 		} else if mode != "dry_run" {
 			continue
 		}
@@ -1141,7 +1170,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	}
 	if mode == "enabled" && req.Outcome == "match" {
 		var busy bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=$1 AND id<>$2 AND state IN ('leased','delete_issued'))`, planID, id).Scan(&busy); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=$1 AND id<>$2 AND state IN ('leased','delete_issued') AND NOT coalesce(id=ANY($3::bigint[]),false))`, planID, id, env.executionGroup).Scan(&busy); err != nil {
 			return cleanupObserveError(500, "cleanup execution occupancy unavailable")
 		}
 		if busy {
@@ -1327,12 +1356,12 @@ func validCleanupReceiptEvidence(req cleanupReceipt) bool {
 	if req.RefusalProtocol != 0 && (req.RefusalProtocol != nasCleanupRefusalProtocol || req.RefusalReason == "") {
 		return false
 	}
-	if len(req.StageTimings) > 13 {
+	if len(req.StageTimings) > 14 {
 		return false
 	}
 	for name, elapsed := range req.StageTimings {
 		switch name {
-		case "queue_ms", "lane_ms", "fence_ms", "open_ms", "proof_ms", "guard_ms", "observe_journal_ms", "observe_ms", "intent_journal_ms", "caps_ms", "ledger_intent_ms", "delete_ms", "ledger_result_ms":
+		case "lease_ms", "queue_ms", "lane_ms", "fence_ms", "open_ms", "proof_ms", "guard_ms", "observe_journal_ms", "observe_ms", "intent_journal_ms", "caps_ms", "ledger_intent_ms", "delete_ms", "ledger_result_ms":
 		default:
 			return false
 		}

@@ -51,7 +51,13 @@ func cleanupLockConnection(ctx context.Context, tx pgx.Tx, cid int64) ([]int64, 
 		return nil, err
 	}
 	var plans []int64
-	if err := tx.QueryRow(ctx, `SELECT coalesce(array_agg(id ORDER BY id),'{}') FROM nas_cleanup_plans WHERE connection_id=$1`, cid).Scan(&plans); err != nil {
+	// Retired is terminal: without an outstanding lease it has no queue or
+	// expiry work. Locking that entire immutable history on every serial lease
+	// made cleanup progressively slower. Keep paused plans for resume/retirement
+	// and every leased item for expiry, regardless of mode or policy. Batch
+	// membership is still expanded by cleanupLockPlans before taking any rows.
+	if err := tx.QueryRow(ctx, `SELECT coalesce(array_agg(p.id ORDER BY p.id),'{}') FROM nas_cleanup_plans p WHERE connection_id=$1
+ AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.state='leased'))`, cid).Scan(&plans); err != nil {
 		return nil, err
 	}
 	return plans, cleanupLockPlans(ctx, tx, plans)

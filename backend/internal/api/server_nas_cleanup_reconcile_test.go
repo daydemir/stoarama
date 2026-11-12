@@ -7,6 +7,29 @@ import (
 	"testing"
 )
 
+func TestNASCleanupReturnDryLeaseBeforeObservation(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	id, sha, _ := f.admit("return-dry-lease", syntheticFiles(100, 1, 1))
+	task := f.leaseV2(1, 0, 0, "")[0]
+	body := cleanupObserve{Attempt: task.Attempt, PlanSHA: sha, Outcome: "unverified", Proof: json.RawMessage("null"), ReturnLease: true}
+	for n := 0; n < 2; n++ {
+		w := cleanupCall(t, f.s.handleAccountNASCleanupReconcile, 47, 5, "itemId", fmt.Sprint(task.ItemID), body)
+		if w.Code != 200 || !strings.Contains(w.Body.String(), `"delete":false`) || !strings.Contains(w.Body.String(), `"action":"pending"`) {
+			t.Fatalf("dry return: %d %s", w.Code, w.Body.String())
+		}
+	}
+	if mode, _ := f.planMode(id); mode != "dry_run" {
+		t.Fatalf("dry return changed mode: %s", mode)
+	}
+	next := f.leaseV2(1, 0, 0, "")[0]
+	if next.Attempt != task.Attempt+1 || len(next.ApprovedProof) != 0 {
+		t.Fatal("dry return changed execution authority or attempt fencing")
+	}
+	if w := cleanupCall(t, f.s.handleAccountNASCleanupReconcile, 47, 5, "itemId", fmt.Sprint(task.ItemID), body); w.Code != 409 {
+		t.Fatalf("old dry return affected new attempt: %d", w.Code)
+	}
+}
+
 func TestNASCleanupReconciliationCannotMintFirstPermit(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("reconcile", syntheticFiles(100, 1, 1))

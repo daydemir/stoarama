@@ -421,6 +421,40 @@ class CleanupTests(unittest.TestCase):
         self.assertNotIn('return_lease', body)
         self.assertTrue(self.path.exists())
 
+    def test_interrupted_dry_lease_returns_durably_and_lost_ack_only_reconciles(self):
+        stop = threading.Event(); stop.set()
+        sent = []
+        def lost(cfg, path, body, **kwargs):
+            sent.append((path, json.dumps(body, sort_keys=True)))
+            raise pull.urllib.error.HTTPError(path, 502, 'lost return acknowledgement', {}, None)
+        with mock.patch.object(pull, 'restore_api', side_effect=lost), mock.patch.object(pull.time, 'sleep'):
+            with self.assertRaises(pull.urllib.error.HTTPError):
+                pull.cleanup_process_task(self.cfg, self.inventory, stop, self.task)
+        journal = pull.cleanup_journal(self.inventory)
+        self.assertEqual(len(journal), 1)
+        body = json.loads(journal[0][2])
+        self.assertTrue(body['return_lease'])
+        self.assertIsNone(body['proof'])
+        self.assertTrue(all(path.endswith('/reconcile') for path, _ in sent))
+        self.assertEqual(len({encoded for _, encoded in sent}), 1)
+        with mock.patch.object(pull, 'restore_api', side_effect=lambda cfg, path, body: fixture_ack(body, action='pending', delete=False)) as replay:
+            pull.cleanup_replay_receipts(self.cfg, self.inventory)
+        self.assertTrue(replay.call_args.args[1].endswith('/reconcile'))
+        self.assertEqual(replay.call_args.args[2], body)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+        self.assertTrue(self.path.exists())
+        self.assertTrue(self.sidecar.exists())
+
+    def test_interrupted_dry_observation_keeps_its_existing_checkpoint(self):
+        with mock.patch.object(pull, 'restore_api', side_effect=pull.CleanupInterrupted('transport interrupted')) as api:
+            with self.assertRaises(pull.CleanupInterrupted):
+                pull.cleanup_process_task(self.cfg, self.inventory, threading.Event(), self.task)
+        self.assertEqual(api.call_count, 1)
+        self.assertTrue(api.call_args.args[1].endswith('/observe'))
+        body = json.loads(pull.cleanup_journal(self.inventory)[0][2])
+        self.assertNotIn('return_lease', body)
+        self.assertTrue(self.path.exists())
+
     def test_cleanup_loop_retries_writer_drain_within_seconds(self):
         stop = mock.Mock()
         stop.wait.side_effect = [False, False, True]
@@ -447,9 +481,15 @@ class CleanupTests(unittest.TestCase):
 
     def test_cancelled_lease_is_not_reported_as_file_conflict(self):
         event=threading.Event();event.set()
-        with mock.patch.object(pull,'restore_api',return_value=dict(tasks=[self.task],retry_after_sec=0)) as api:
+        def reply(cfg, path, body, **kwargs):
+            if path.endswith('/lease'):
+                return dict(tasks=[self.task], retry_after_sec=0)
+            self.assertTrue(path.endswith('/reconcile'))
+            self.assertTrue(body['return_lease'])
+            return fixture_ack(body, action='pending', delete=False)
+        with mock.patch.object(pull,'restore_api',side_effect=reply) as api:
             with self.assertRaises(pull.CleanupInterrupted):pull.cleanup_once(self.cfg,self.inventory,event)
-        self.assertEqual(api.call_count,1)
+        self.assertEqual(api.call_count,2)
         self.assertFalse(pull.cleanup_journal(self.inventory));self.assertTrue(self.path.exists())
 
     def test_late_permit_rejected_independently_of_wall_clock(self):
@@ -1331,12 +1371,116 @@ class CleanupProtocol2Tests(unittest.TestCase):
                 assert state['leased'] == 3
                 assert sum(p.endswith('/result-batch') for p in state['calls']) == 3
                 assert all(not path.exists() for path, _ in paths)
-        with mock.patch.object(pull, 'restore_api', side_effect=api):
+        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull, 'CleanupPreflight'):
             pull.cleanup_loop(self.cfg, self.inventory, Stop())
         self.assertEqual(len(waits), 2, 'a poll wait interrupted serial execution')
         self.assertGreater(waits[-1], 0, 'empty leases must back off')
         calls = [p.rsplit('/', 1)[-1] for p in state['calls']]
         self.assertEqual(calls, ['lease', 'observe', 'result-batch'] * 3 + ['lease'])
+
+    def test_pipeline_proves_successor_while_execution_stays_serial(self):
+        tasks, paths = self.execution_tasks(4)
+        execution_api, state = self.fake_server(tasks)
+        dry_seen = threading.Event()
+        dry_leased = False
+        def api(cfg, path, body, **kwargs):
+            nonlocal dry_leased
+            if path.endswith('/lease') and body['execution_files'] == 0:
+                self.assertEqual(body['execution_bytes'], 0)
+                self.assertLessEqual(body['limit'], 2)
+                selected = [] if dry_leased else [dict(self.task)]
+                dry_leased = True
+                return dict(tasks=selected, retry_after_sec=120)
+            if path.endswith('/observe-batch'):
+                self.assertTrue(all(o['item_id'] == 1 for o in body['observations']))
+                dry_seen.set()
+                return dict(results=[fixture_ack(o, o['item_id'], status=200, action='would_delete', delete=False,
+                    recovery='r2_sha_verified') for o in body['observations']])
+            if path.endswith('/observe'):
+                self.assertTrue(dry_seen.wait(5), 'successor dry run did not overlap execution')
+            return execution_api(cfg, path, body, **kwargs)
+        stop = threading.Event()
+        with mock.patch.object(pull, 'restore_api', side_effect=api):
+            batch_api = pull.CleanupBatchAPI(self.cfg)
+            pipeline = pull.CleanupPreflight(self.cfg, self.inventory, stop)
+            try:
+                with pull.concurrent.futures.ThreadPoolExecutor(8) as executor:
+                    pull.cleanup_batch_v2(self.cfg, self.inventory, stop, executor, batch_api, preflight=pipeline)
+            finally:
+                pipeline.close()
+                batch_api.close()
+        self.assertTrue(dry_seen.is_set())
+        self.assertTrue(self.path.exists())
+        self.assertTrue(all(not path.exists() for path, _ in paths))
+        self.assertEqual(state['observe_batches'], 0)
+        self.assertEqual(self.inventory.cleanup_claims, {})
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+
+    def test_pipeline_dry_only_rejects_execution_without_touching_files_or_replaying(self):
+        tasks, paths = self.execution_tasks(1)
+        active = threading.Event(); active.set()
+        with mock.patch.object(pull, 'cleanup_lease_v2', return_value=dict(tasks=tasks)), \
+             mock.patch.object(pull, 'cleanup_replay_receipts', side_effect=AssertionError('background replay')), \
+             mock.patch.object(pull, 'cleanup_process_task', side_effect=AssertionError('execution in preflight')), \
+             pull.concurrent.futures.ThreadPoolExecutor(2) as executor:
+            with self.assertRaises(pull.CleanupResponseError):
+                pull.cleanup_batch_v2(self.cfg, self.inventory, threading.Event(), executor, None,
+                    dry_run_only=True, active=active, inflight=2)
+        self.assertTrue(all(path.exists() for path, _ in paths))
+
+    def test_pipeline_pause_drains_two_workers_before_replay_and_shutdown(self):
+        entered = threading.Barrier(3)
+        release = threading.Event()
+        active = threading.Event(); active.set()
+        tasks = [dict(self.task, item_id=n) for n in range(10, 14)]
+        calls = []
+        def lease(cfg, limit, files, size):
+            self.assertEqual((files, size), (0, 0))
+            self.assertLessEqual(limit, 2)
+            chosen, tasks[:] = tasks[:limit], tasks[limit:]
+            return dict(tasks=chosen, retry_after_sec=120)
+        def worker(*args, **kwargs):
+            calls.append(args[3]['item_id'])
+            entered.wait(5)
+            self.assertTrue(release.wait(5))
+        with mock.patch.object(pull, 'cleanup_lease_v2', side_effect=lease), \
+             mock.patch.object(pull, 'cleanup_process_task', side_effect=worker), \
+             mock.patch.object(pull, 'CleanupBatchAPI'):
+            pipeline = pull.CleanupPreflight(self.cfg, self.inventory, threading.Event())
+            try:
+                pipeline.start()
+                entered.wait(5)
+                pipeline.active.clear()
+                release.set()
+                pipeline.pause()
+                self.assertEqual(len(calls), 2)
+                self.assertIsNone(pipeline.future)
+            finally:
+                release.set()
+                pipeline.close()
+
+    def test_execution_fence_releases_before_slow_pipeline_drain_on_dry_transition(self):
+        tasks, _ = self.execution_tasks(1)
+        replies = [dict(tasks=tasks), dict(tasks=[self.task]), dict(tasks=[], retry_after_sec=120)]
+        executed = threading.Event()
+        paused = []
+        def worker(cfg, inventory, stop, task, api, lane=None):
+            if task.get('approved_proof') is not None:
+                lane.run(lambda: executed.set())
+                self.assertIsNotNone(pull.NAS_MEDIA_FENCE.execution_owner)
+        def pause():
+            if executed.is_set():
+                # A background hash/transport could block here indefinitely.
+                # Delivery must already be free before waiting for that drain.
+                self.assertIsNone(pull.NAS_MEDIA_FENCE.execution_owner)
+                self.assertEqual(pull.NAS_MEDIA_FENCE.cleaners, 0)
+                paused.append(True)
+        preflight = SimpleNamespace(start=lambda: None, pause=pause)
+        with mock.patch.object(pull, 'cleanup_lease_v2', side_effect=replies), \
+             mock.patch.object(pull, 'cleanup_process_task', side_effect=worker), \
+             pull.concurrent.futures.ThreadPoolExecutor(2) as executor:
+            pull.cleanup_batch_v2(self.cfg, self.inventory, threading.Event(), executor, None, preflight=preflight)
+        self.assertTrue(paused)
 
     def test_direct_execution_callers_hold_one_slot_through_the_entire_lifecycle(self):
         tasks, _ = self.execution_tasks(8)

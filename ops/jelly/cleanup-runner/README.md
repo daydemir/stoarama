@@ -48,6 +48,15 @@ The runner:
 - Uses a complete fresh dry run or invokes `prepare_keep28_plans.py --submit`
   for one stream, at most one <=100 GB plan. Unique `k28auto-YYYYMMDD-HHMMSS`
   prefixes avoid immutable-label reuse. Admission rejection is a stop.
+- Before ON, admits at most one successor using atomic admission (no recursive
+  rejection splitting). Two NAS workers can dry-run it during current serial
+  execution; executable work wins queue priority. `next_plan` never owns execution.
+  Its failure stops the runner too. OFF/recovery/close precede promoting it;
+  independent catalog/window checks, budget, freshness and enable rechecks still
+  run normally. An interrupted `lookahead_pending` admission requires owner
+  reconciliation of the saved plan files/label before restart; never clear it
+  blindly or admit another successor. Master remains OFF between every batch.
+  Future client staging requires explicit `NAS_VERSION=cleanup-pipeline-v1`.
 - Independently checks the pinned policy bytes at `origin/main` (no network
   fetch or checkout update), raw/collated catalog identities, all source clips,
   stream/window bounds, other reserved/ever-issued identities, complete result

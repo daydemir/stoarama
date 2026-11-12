@@ -208,7 +208,7 @@ class FakeRunner(r.Runner):
     def recent_bytes(self): return 0
     def catalog(self, plan): return self.cat
     def plan(self, pid): return self.p
-    def pick(self): return self.picks.pop(0)
+    def pick(self, lookahead=False): return self.picks.pop(0) if self.picks else None
     def await_dry(self, pid): return self.p
     def master(self, enabled, emergency=False):
         self.events.append('ON' if enabled else 'OFF')
@@ -232,6 +232,77 @@ class FakeRunner(r.Runner):
 
 
 class LoopTests(unittest.TestCase):
+    def test_lookahead_is_admitted_off_and_never_enabled_before_current_close(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
+            job = FakeRunner(root)
+            successor = copy.deepcopy(job.p)
+            successor['id'] = 43
+            successor['plan_sha256'] = 'c' * 64
+            job.picks = [42, 43]
+            def pick(lookahead=False):
+                if lookahead:
+                    self.assertEqual(job.p['mode'], 'dry_run')
+                    self.assertEqual([e for e in job.events if e in {'ON', 'OFF'}][-1], 'OFF')
+                    self.assertTrue(job.status['lookahead_pending'])
+                return job.picks.pop(0) if job.picks else None
+            job.pick = pick
+            original_monitor = job.monitor
+            def monitor(pid):
+                if pid == 42:
+                    self.assertEqual(job.status['next_plan'], 43)
+                    original_monitor(pid)
+                    self.assertIsNone(job.status['current_plan'])
+                    self.assertIn('plans/42/close', job.events)
+                    job.p = successor
+                else:
+                    self.assertEqual(pid, 43)
+                    original_monitor(pid)
+            job.monitor = monitor
+            job.run()
+            self.assertLess(job.events.index('plans/42/close'), job.events.index('plans/43/control'))
+            self.assertEqual(job.events.count('OFF'), 3)
+            self.assertIsNone(job.status['next_plan'])
+
+    def test_interrupted_lookahead_requires_owner_reconciliation_after_off(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            job.status['lookahead_pending'] = True
+            job.pick = lambda **kw: self.fail('admitted another lookahead after ambiguous admission')
+            with self.assertRaisesRegex(r.Halt, 'lookahead admission interrupted'):
+                job.run()
+            self.assertEqual(job.events, ['OFF'])
+
+    def test_failed_successor_check_stops_monitoring_current_execution(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            job.p.update(mode='enabled', master_deletion_enabled=True)
+            bad = copy.deepcopy(job.p)
+            bad.update(id=43, mode='dry_run')
+            bad['results'][0]['state'] = 'conflict'
+            job.status.update(current_plan=42, next_plan=43, live_commit='a'*40)
+            job.plan = lambda pid: job.p if pid == 42 else bad
+            job.live = lambda: {'commit': {'id': 'a'*40}}
+            with self.assertRaisesRegex(r.Halt, 'non-permitting item'):
+                r.Runner.monitor(job, 42)
+
+    def test_empty_lookahead_keeps_current_reservations_and_uses_atomic_admission(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            job.repo = Path(root)
+            job.status['current_plan'] = 42
+            queries, commands = [], []
+            job.query = lambda sql: queries.append(sql) or []
+            def command(args, **kwargs):
+                commands.append(args)
+                out = Path(args[args.index('--out') + 1])
+                out.mkdir(parents=True)
+                (out / 'summary.json').write_text(json.dumps(dict(receipts=[], rejected_at_admission=[])))
+            with patch.object(r, 'command', side_effect=command):
+                self.assertIsNone(r.Runner.pick(job, lookahead=True))
+            self.assertEqual(len(queries), 1, 'lookahead attempted completion verification with current work reserved')
+            self.assertIn('id<>42', queries[0])
+            self.assertTrue(all('--atomic-admission' in args for args in commands))
+
     def test_batch_order_and_approval_digest(self):
         with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
             job = FakeRunner(root)

@@ -2286,7 +2286,7 @@ def cleanup_json_bytes(payload):
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
-def cleanup_journal(inventory, item_id=None, phase=None, body=None, owner=None):
+def cleanup_journal(inventory, item_id=None, phase=None, body=None, owner=None, *, commit=True):
     with inventory.lock:
         inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_receipts(item_id INTEGER PRIMARY KEY,phase TEXT NOT NULL,body TEXT NOT NULL)")
         try:
@@ -2324,7 +2324,8 @@ def cleanup_journal(inventory, item_id=None, phase=None, body=None, owner=None):
                     inventory.db.execute("DELETE FROM cleanup_receipts WHERE item_id=?", (item_id,))
                 else:
                     inventory.db.execute("INSERT INTO cleanup_receipts VALUES(?,?,?) ON CONFLICT(item_id) DO UPDATE SET phase=excluded.phase,body=excluded.body", (item_id, *next_row))
-            inventory.db.commit()
+            if commit:
+                inventory.db.commit()
             if item_id is not None and owner is not None:
                 inventory.cleanup_claims[item_id] = (owner, next_row)
         except Exception:
@@ -2972,8 +2973,13 @@ _CLEANUP_LEDGER_LOCK = threading.Lock()
 
 def cleanup_ledger_append(cfg, record):
     """Append one fsynced JSON line; the ledger is never truncated or rewritten."""
+    cleanup_ledger_append_many(cfg, [record])
+
+
+def cleanup_ledger_append_many(cfg, records):
+    """One durable append for a bounded group; never acknowledge a partial write."""
     path = Path(cfg.state_dir) / CLEANUP_LEDGER_NAME
-    line = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    line = b"".join(cleanup_json_bytes(record) + b"\n" for record in records)
     with _CLEANUP_LEDGER_LOCK:
         created = not path.exists()
         descriptor = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
@@ -3381,7 +3387,7 @@ def cleanup_timed(timings, stage, fn, *args, **kwargs):
 
 def cleanup_process_task(cfg, inventory, stop_event, task, api=None, lane=None):
     execution_started = time.monotonic()
-    timings = {}
+    timings = {"lease_ms": task["_lease_elapsed_ms"]} if "_lease_elapsed_ms" in task else {}
     # Both protocols and direct callers reserve before any filesystem/API work.
     owner = cleanup_reserve_item(inventory, task["item_id"])
     if owner is None:
@@ -3402,7 +3408,7 @@ def cleanup_process_task(cfg, inventory, stop_event, task, api=None, lane=None):
     except CleanupInterrupted as exc:
         # An observe checkpoint precedes every permit request. Never return a
         # task with uncertain authority; those checkpoints reconcile normally.
-        if executing and not any(row[0] == task["item_id"] for row in cleanup_journal(inventory)):
+        if not any(row[0] == task["item_id"] for row in cleanup_journal(inventory)):
             body = {"attempt": task["attempt"], "plan_sha256": task["plan_sha256"],
                     "outcome": "unverified", "proof": None, "error": str(exc)[:500],
                     "client_version": CLIENT_VERSION, "return_lease": True,
@@ -3537,10 +3543,10 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner, timings,
                     receipt["refusal_protocol"] = CLEANUP_REFUSAL_PROTOCOL
                 receipt.update(execution_elapsed_ms=round((time.monotonic() - execution_started) * 1000),
                                stage_timings=dict(timings))
-                cleanup_journal(inventory, item_id, "result", receipt, owner=owner)
-                response = api.result(cfg, item_id, receipt)
+                cleanup_timed(timings, "result_journal_ms", cleanup_journal, inventory, item_id, "result", receipt, owner=owner)
+                response = cleanup_timed(timings, "receipt_ms", api.result, cfg, item_id, receipt)
                 cleanup_validate_ack(item_id, "result", receipt, response)
-            cleanup_journal(inventory, item_id, owner=owner)
+            cleanup_timed(timings, "clear_journal_ms", cleanup_journal, inventory, item_id, owner=owner)
             return cleanup_verified_ack(task, proof, decision)
     except Exception as exc:
         execution_outcome["error"] = str(exc)[:500]
@@ -3686,6 +3692,8 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
 # protocol 2 reject it with HTTP 400 and the client keeps using protocol 1.
 CLEANUP_V2_LEASE = 64          # tasks per lease request (server maximum)
 CLEANUP_V2_WORKERS = 16        # concurrent dry-run file workers
+CLEANUP_GROUP_VERSION = "cleanup-batch-v1"
+CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
 CLEANUP_V2_INFLIGHT = 64       # leased tasks held locally (running + queued)
 CLEANUP_V2_CYCLE_TASKS = 2048  # tasks per drain/replay cycle
@@ -3911,6 +3919,7 @@ def cleanup_local_headroom(inventory):
 
 
 def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes):
+    started = time.monotonic()
     if type(limit) is not int or not 1 <= limit <= CLEANUP_V2_LEASE:
         raise ValueError("invalid cleanup lease bound")
     execution_files = max(0, min(int(execution_files), CLEANUP_V2_LEASE))
@@ -3918,6 +3927,8 @@ def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes):
     body = {"client_version": CLIENT_VERSION, "protocol": 2, "limit": limit, "execution_files": execution_files,
             "execution_bytes": execution_bytes, "request_id": uuid.uuid4().hex,
             "reconciliation_protocol": CLEANUP_RECONCILIATION_PROTOCOL}
+    if CLIENT_VERSION == CLEANUP_GROUP_VERSION:
+        body["execution_batch"] = True
     try:
         lease = cleanup_api_retry(cfg, "/account/connections/cleanup/lease", body)
     except urllib.error.HTTPError as exc:
@@ -3939,11 +3950,15 @@ def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes):
     sizes = [task["item"].get("size_bytes") for task in executing]
     if any(type(size) is not int or size <= 0 for size in sizes) or len(executing) > execution_files or sum(sizes) > execution_bytes:
         raise RuntimeError("execution lease exceeds the client's local caps")
+    elapsed = round((time.monotonic() - started) * 1000)
+    for task in tasks:
+        task["_lease_elapsed_ms"] = elapsed  # Local diagnostics, never authority.
     return lease
 
 
 def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=None,
-                     inflight=CLEANUP_V2_INFLIGHT, task_limit=CLEANUP_V2_CYCLE_TASKS):
+                     inflight=CLEANUP_V2_INFLIGHT, task_limit=CLEANUP_V2_CYCLE_TASKS,
+                     preflight=None, dry_run_only=False, active=None):
     """Protocol 2 coordinator: rolling window of leased tasks on the executor.
 
     Execution has one leased/running task; dry runs retain their rolling
@@ -3953,7 +3968,10 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
     Replay is bounded (CLEANUP_REPLAY_BUDGET_SEC) and its failures never stop
     new work from being leased; a leased task whose item still has a journal
     or quarantine entry is left unprocessed (its lease simply expires)."""
-    replay = cleanup_replay_receipts(cfg, inventory, api, budget=CLEANUP_REPLAY_BUDGET_SEC)
+    if preflight is not None:
+        preflight.pause()  # No worker may own a checkpoint while replay starts.
+    replay = (dict(failed=0) if dry_run_only else
+              cleanup_replay_receipts(cfg, inventory, api, budget=CLEANUP_REPLAY_BUDGET_SEC))
     pins, pins_error = cleanup_pins()
     pending = {}
     leased = 0
@@ -3967,21 +3985,36 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
         if future.result() is True and verified_event is not None:
             verified_event.set()
     try:
-        while not stop_event.is_set():
-            while not exhausted and not stop_event.is_set() and error is None and len(pending) < inflight and leased < task_limit:
+        while not stop_event.is_set() and (active is None or active.is_set()):
+            while not exhausted and not stop_event.is_set() and (active is None or active.is_set()) and error is None and len(pending) < inflight and leased < task_limit:
                 lane.before_lease()
                 room = min(CLEANUP_V2_LEASE, inflight - len(pending), task_limit - leased)
-                files_left, bytes_left = cleanup_local_headroom(inventory)
-                files_left = min(files_left, CLEANUP_EXECUTION_INFLIGHT)
+                files_left, bytes_left = (0, 0) if dry_run_only else cleanup_local_headroom(inventory)
+                files_left = min(files_left, CLEANUP_EXECUTION_GROUP if CLIENT_VERSION == CLEANUP_GROUP_VERSION else CLEANUP_EXECUTION_INFLIGHT)
                 if pins_error is not None:
                     files_left = bytes_left = 0  # every deletion would be refused
                 lease = cleanup_lease_v2(cfg, room, files_left, bytes_left)
                 retry = lease.get("retry_after_sec", 120)
-                CLEANUP_STATUS.update(last_lease_at=utc_now(), last_lease_tasks=len(lease["tasks"]))
+                if not dry_run_only:
+                    CLEANUP_STATUS.update(last_lease_at=utc_now(), last_lease_tasks=len(lease["tasks"]))
                 if not lease["tasks"]:
                     exhausted = True
                     break
                 blocked = cleanup_blocked_items(inventory)
+                group = [t for t in lease["tasks"] if t.get("execution_batch") is True]
+                if group:
+                    if (CLIENT_VERSION != CLEANUP_GROUP_VERSION or len(group) != len(lease["tasks"])
+                            or any(t["item_id"] in blocked or t.get("approved_proof") is None for t in group)):
+                        raise CleanupResponseError("unsafe cleanup execution group")
+                    for future in pending:
+                        completed(future)
+                    pending.clear()
+                    if preflight is not None:
+                        preflight.start()
+                    lane.run(cleanup_process_group, cfg, inventory, stop_event, group)
+                    leased += len(group)
+                    processed += len(group)
+                    continue
                 for task in lease["tasks"]:
                     leased += 1
                     if task["item_id"] in blocked:
@@ -3993,15 +4026,21 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                     task["_recovery_md5"] = lease.get("recovery_md5") is True  # local only, never sent
                     processed += 1
                     if task.get("approved_proof") is not None:
+                        if dry_run_only:
+                            raise CleanupResponseError("execution task in dry-only pipeline")
                         # Drain dry runs, then finish observation, unlink and
                         # acknowledged receipt inline. The next iteration leases
                         # immediately, without an executor/cycle/poll handoff.
                         for future in pending:
                             completed(future)
                         pending.clear()
+                        if preflight is not None:
+                            preflight.start()
                         cleanup_process_task(cfg, inventory, stop_event, task, api, lane=lane)
                         continue
                     lane.close()
+                    if preflight is not None:
+                        preflight.pause()
                     pending[executor.submit(cleanup_process_task, cfg, inventory, stop_event, task, api)] = task
             if not pending or error is not None:
                 break
@@ -4024,17 +4063,231 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
             except Exception as exc:
                 if error is None:
                     error = exc
+        if preflight is not None:
+            try:
+                preflight.pause()
+            except Exception as exc:
+                if error is None:
+                    error = exc
     if error is not None:
         raise error
-    if not replay["failed"]:
+    if not dry_run_only and not replay["failed"]:
         CLEANUP_STATUS.clear_error()
     return max(1, retry) if exhausted or not processed else 0
+
+
+def cleanup_journal_group(inventory, entries):
+    """Commit owned checkpoints together; publish no in-memory CAS before durability."""
+    with inventory.lock:
+        claims = dict(inventory.cleanup_claims)
+        try:
+            for task, owner, phase, body in entries:
+                cleanup_journal(inventory, task["item_id"], phase, body, owner=owner, commit=False)
+            inventory.db.commit()
+        except BaseException:
+            inventory.db.rollback()
+            inventory.cleanup_claims = claims
+            raise
+
+
+def cleanup_reserve_group_caps(inventory, tasks):
+    cleanup_local_headroom(inventory)  # Ensure the table exists, including on a fresh boot.
+    with inventory.lock:
+        try:
+            files, total = inventory.db.execute(
+                "SELECT count(*),coalesce(sum(size_bytes),0) FROM cleanup_local_deletions WHERE at_epoch>?",
+                (time.time() - 86400,)).fetchone()
+            sizes = [task["item"]["size_bytes"] for task in tasks]
+            if (any(type(size) is not int or size <= 0 for size in sizes)
+                    or files + len(tasks) > CLEANUP_MAX_FILES_24H or total + sum(sizes) > CLEANUP_MAX_BYTES_24H):
+                raise CleanupPermitRefused("local_guard", "local 24h deletion cap reached")
+            inventory.db.executemany(
+                "INSERT INTO cleanup_local_deletions(item_id,plan_sha256,relative_path,size_bytes,at_epoch) VALUES(?,?,?,?,?)",
+                [(task["item_id"], task["plan_sha256"], task["item"]["relative_path"], task["item"]["size_bytes"], time.time()) for task in tasks])
+            inventory.db.commit()
+        except BaseException:
+            inventory.db.rollback()
+            raise
+
+
+def cleanup_group_response(response, tasks):
+    results = response.get("results") if isinstance(response, dict) else None
+    ids = {task["item_id"] for task in tasks}
+    if (not isinstance(results, list) or len(results) != len(tasks)
+            or any(not isinstance(result, dict) or type(result.get("item_id")) is not int for result in results)
+            or {result["item_id"] for result in results} != ids
+            or any(result.get("status") != 200 for result in results)):
+        raise CleanupResponseError("cleanup group response incomplete or refused; reconcile durable checkpoints")
+    return {result["item_id"]: result for result in results}
+
+
+def cleanup_process_group(cfg, inventory, stop_event, tasks):
+    """One bounded permit group, sequential unlinks, then one receipt commit.
+
+    Every checkpoint remains individually replayable by the existing protocol.
+    Any exception leaves the last durable phase intact and stops the group.
+    In particular an intent is never upgraded into a speculative no-unlink claim.
+    """
+    import contextlib
+    if (CLIENT_VERSION != CLEANUP_GROUP_VERSION or not 1 <= len(tasks) <= CLEANUP_EXECUTION_GROUP
+            or len({t["item_id"] for t in tasks}) != len(tasks)
+            or len({t["plan_sha256"] for t in tasks}) != 1
+            or any(t.get("execution_batch") is not True or t.get("approved_proof") is None for t in tasks)):
+        raise CleanupResponseError("invalid cleanup execution group")
+    started = time.monotonic()
+    owned, opened, observations, receipts, ledgers, timings = [], [], [], [], [], []
+    shared = {}
+    fenced = False
+    with inventory.cleanup_execution_lock:
+        try:
+            for task in tasks:
+                owner = cleanup_reserve_item(inventory, task["item_id"])
+                if owner is None:
+                    raise CleanupResponseError("cleanup group has an unresolved checkpoint")
+                owned.append((task, owner))
+            NAS_MEDIA_FENCE.acquire_cleanup(stop_event, time.monotonic() + CLEANUP_EXECUTION_DRAIN_SEC)
+            fenced = True
+            with contextlib.ExitStack() as resources:
+                # Keep every file/parent FD and unlink-log reference alive for the
+                # whole group, so only our own exact sibling unlinks are exempted.
+                for task in tasks:
+                    deadline = time.monotonic() + min(1800, (parse_certification_timestamp(task["expires_at"], "cleanup lease") - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 20)
+                    timing = {"lease_ms": task.get("_lease_elapsed_ms", 0)}
+                    current = cleanup_timed(timing, "open_ms", resources.enter_context,
+                                            CleanupFile(cfg, task["item"], stop_event, deadline))
+                    proof = cleanup_timed(timing, "proof_ms", current.proof)
+                    if {k:v for k,v in proof.items() if k != "parent_members_sha256"} != {k:v for k,v in task["approved_proof"].items() if k != "parent_members_sha256"}:
+                        raise CleanupResponseError("cleanup dry-run proof changed; KEEP")
+                    refusal = cleanup_guard_refusal(task, proof, cfg)
+                    if refusal:
+                        raise CleanupPermitRefused("local_guard", refusal)
+                    body = {"attempt": task["attempt"], "plan_sha256": task["plan_sha256"], "outcome": "match", "proof": proof,
+                            "error": "", "client_version": CLIENT_VERSION, "reconciliation_protocol": CLEANUP_RECONCILIATION_PROTOCOL,
+                            "request_id": uuid.uuid4().hex, "timings": dict(current.stage_timings)}
+                    observations.append(body)
+                    opened.append((current, proof))
+                    timings.append(timing)
+                cleanup_timed(shared, "observe_journal_ms", cleanup_journal_group, inventory, [(t, o, "observe", b) for (t, o), b in zip(owned, observations)])
+                permit_started = time.monotonic()
+                # No retries, queue linger or splitting on execution: an ambiguous
+                # response is reconciliation-only, never a new permit request.
+                response = restore_api(cfg, "/account/connections/cleanup/observe-batch",
+                    {"client_version": CLIENT_VERSION, "execution_batch": True,
+                     "observations": [dict(b, item_id=t["item_id"]) for t, b in zip(tasks, observations)]},
+                    timeout=CLEANUP_EXECUTION_OBSERVE_SEC)
+                decisions = cleanup_group_response(response, tasks)
+                observe_ms = round((time.monotonic() - permit_started) * 1000)
+                for task, body, (current, proof), timing in zip(tasks, observations, opened, timings):
+                    decision = decisions[task["item_id"]]
+                    cleanup_validate_ack(task["item_id"], "observe", body, decision)
+                    if decision.get("delete") is not True or decision.get("plan_paused") is not False:
+                        raise CleanupResponseError("cleanup group did not permit every item")
+                    expiry = cleanup_check_permit(cfg, fenced, task, proof, decision, permit_started)
+                    current.permit_started, current.permit_expiry = permit_started, expiry
+                    current.deadline = min(current.deadline, permit_started + CLEANUP_PERMIT_MAX_AGE_SEC)
+                    timing["observe_ms"] = observe_ms
+                    receipts.append({"attempt": task["attempt"], "plan_sha256": task["plan_sha256"], "proof_sha256": decision["proof_sha256"],
+                                     "outcome": "unverified", "error": "", "observe_elapsed_ms": observe_ms})
+                    item = task["item"]
+                    ledgers.append({"item_id": task["item_id"], "attempt": task["attempt"], "plan_sha256": task["plan_sha256"],
+                        "proof_sha256": decision["proof_sha256"], "relative_path": item["relative_path"],
+                        "sidecar_relative_path": item["relative_path"] + ".stoarama.json" if item["sidecar_required"] else None,
+                        "size_bytes": item["size_bytes"], "sha256": proof["sha256"], "kind": item["kind"],
+                        "stream_id": item["stream_id"], "client_version": CLIENT_VERSION})
+                cleanup_timed(shared, "intent_journal_ms", cleanup_journal_group, inventory, [(t, o, "intent", b) for (t, o), b in zip(owned, receipts)])
+                cleanup_timed(shared, "caps_ms", cleanup_reserve_group_caps, inventory, tasks)
+                cleanup_timed(shared, "ledger_intent_ms", cleanup_ledger_append_many, cfg, [dict(row, event="intent", at=utc_now_precise()) for row in ledgers])
+                for task, (current, proof), receipt, timing in zip(tasks, opened, receipts, timings):
+                    # The per-file deadline is checked again after group durability
+                    # and before each unlink. A slow group can only refuse later files.
+                    cleanup_check_permit(cfg, fenced, task, proof, decisions[task["item_id"]], permit_started)
+                    refusal = cleanup_guard_refusal(task, proof, cfg)
+                    if refusal:
+                        raise CleanupPermitRefused("local_guard", refusal)
+                    cleanup_timed(timing, "delete_ms", current.delete_exact, proof)
+                    receipt.update(outcome="deleted", unlink_attempted=True,
+                        execution_elapsed_ms=round((time.monotonic() - started) * 1000), stage_timings=timing)
+                # If this append/fsync fails, ALL durable intent checkpoints remain
+                # uncertain, including successful unlinks. No receipt certifies them.
+                cleanup_timed(shared, "ledger_result_ms", cleanup_ledger_append_many, cfg, [dict(row, event="result", at=utc_now_precise(), outcome="deleted",
+                    media_unlinked=True, sidecar_unlinked=task["item"]["sidecar_required"], error="") for row, task in zip(ledgers, tasks)])
+                for receipt, timing in zip(receipts, timings):
+                    receipt["stage_timings"] = dict(timing, **shared)
+                cleanup_timed(shared, "result_journal_ms", cleanup_journal_group, inventory, [(t, o, "result", b) for (t, o), b in zip(owned, receipts)])
+                result = cleanup_timed(shared, "receipt_ms", cleanup_api_retry, cfg, "/account/connections/cleanup/result-batch",
+                    {"client_version": CLIENT_VERSION, "receipts": [dict(b, item_id=t["item_id"]) for t, b in zip(tasks, receipts)]})
+                acknowledgments = cleanup_group_response(result, tasks)
+                for task, receipt in zip(tasks, receipts):
+                    cleanup_validate_ack(task["item_id"], "result", receipt, acknowledgments[task["item_id"]])
+                cleanup_timed(shared, "clear_journal_ms", cleanup_journal_group, inventory, [(t, o, None, None) for t, o in owned])
+        finally:
+            if fenced:
+                NAS_MEDIA_FENCE.release_cleanup()
+            with inventory.lock:
+                for task, owner in owned:
+                    inventory.cleanup_claims.pop(task["item_id"], None)
+                try:
+                    inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_execution_outcomes(id INTEGER PRIMARY KEY,item_id INTEGER NOT NULL,attempt INTEGER NOT NULL,at TEXT NOT NULL,body TEXT NOT NULL)")
+                    inventory.db.executemany("INSERT INTO cleanup_execution_outcomes(item_id,attempt,at,body) VALUES(?,?,?,?)",
+                        [(task["item_id"], task["attempt"], utc_now_precise(), cleanup_json_bytes(dict(receipt, stage_timings=dict(timing, **shared))).decode())
+                         for task, receipt, timing in zip(tasks, receipts, timings)])
+                    inventory.db.commit()
+                except Exception:
+                    inventory.db.rollback()
+                    log("ERROR", "cleanup group execution diagnostics could not be stored")
+
+
+class CleanupPreflight:
+    """Two read-only workers alongside the dedicated serial execution lane.
+
+    The primary coordinator drains this lane before any replay. No background
+    worker may lease execution or replay a saved observation into authority.
+    """
+    def __init__(self, cfg, inventory, stop_event):
+        self.cfg, self.inventory, self.stop_event = cfg, inventory, stop_event
+        self.active = threading.Event()
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="cleanup-lookahead")
+        self.future = None
+
+    def start(self):
+        if self.future is None:
+            self.active.set()
+            self.future = self.pool.submit(self.run)
+
+    def pause(self):
+        self.active.clear()
+        if self.future is not None:
+            future, self.future = self.future, None
+            future.result()  # Every leased task/checkpoint drains before replay.
+
+    def run(self):
+        api = CleanupBatchAPI(self.cfg)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="cleanup-dry") as executor:
+                while self.active.is_set() and not self.stop_event.is_set():
+                    retry = cleanup_batch_v2(self.cfg, self.inventory, self.stop_event, executor, api,
+                        inflight=2, task_limit=128, dry_run_only=True, active=self.active)
+                    if retry:
+                        # Poll the active flag promptly; never keep pause() in
+                        # the normal empty-queue two-minute sleep.
+                        for _ in range(min(retry, 5) * 10):
+                            if not self.active.is_set() or self.stop_event.wait(0.1):
+                                return
+        finally:
+            api.close()
+
+    def close(self):
+        try:
+            self.pause()
+        finally:
+            self.pool.shutdown(wait=True)
 
 
 def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
     wait = 15
     v2_after = 0.0
     api = None
+    preflight = CleanupPreflight(cfg, inventory, stop_event)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(CLEANUP_PREFLIGHT_WORKERS, CLEANUP_V2_WORKERS), thread_name_prefix="nas-cleanup") as executor:
         try:
             while not stop_event.wait(wait):
@@ -4045,7 +4298,7 @@ def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
                         if api is None:
                             api = CleanupBatchAPI(cfg)
                         try:
-                            retry = cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=verified_event)
+                            retry = cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=verified_event, preflight=preflight)
                         except CleanupProtocolUnsupported as exc:
                             log("INFO", "NAS cleanup using protocol 1: %s" % exc)
                             v2_after, v2 = time.monotonic() + CLEANUP_V2_FALLBACK_SEC, False
@@ -4062,8 +4315,11 @@ def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
                     CLEANUP_STATUS.add("cycle_errors")
                     wait = restore_wait(CLEANUP_V2_ERROR_WAIT_SEC if v2 else min(60, RESTORE_ERROR_WAIT_SEC))
         finally:
-            if api is not None:
-                api.close()
+            try:
+                preflight.close()
+            finally:
+                if api is not None:
+                    api.close()
 
 
 def prepare_clip_with_capacity(cfg, runtime, clip):
