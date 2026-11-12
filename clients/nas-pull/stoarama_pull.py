@@ -1508,6 +1508,8 @@ def listing_identity(path):
 
 
 def listing_proof_once(cfg, stop_event):
+    if not os.path.ismount(str(cfg.output_dir)):
+        raise ListingChanged("listing clips mount is unavailable")
     filename = cfg.state_dir / "listing-proof.sqlite3"
     db = sqlite3.connect(str(filename))
     db.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
@@ -1589,6 +1591,8 @@ def listing_proof_once(cfg, stop_event):
             walk(cfg.output_dir)
             put("scanned", "1")
         def verify_directories():
+            if not os.path.ismount(str(cfg.output_dir)):
+                raise ListingChanged("listing clips mount disappeared")
             for rel, identity in db.execute("SELECT path,identity FROM dirs"):
                 stable(cfg.output_dir / rel, json.loads(identity))
         verify_directories()

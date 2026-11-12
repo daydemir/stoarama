@@ -886,3 +886,14 @@ func TestR2RetireNASBackedChoices(t *testing.T) {
 		}
 	}
 }
+
+func TestR2RetireInvalidEvidencePathCannotAuthorize(t *testing.T) {
+	for _, path := range []string{"", ".", "../p.mp4", "/p.mp4", "a//b.mp4", "a\\b.mp4"} {
+		c := r2RetireCandidate{Kind: "raw", SourceID: 1, RelativePath: path, Facts: r2RetireFacts{ExactNAS: true}}
+		e := &r2RetireEvidence{ReleaseSchema: true, Receipts: map[string]time.Time{"raw:1": time.Now()}}
+		e.apply(&c)
+		if c.Facts.ExactNAS || c.Facts.NASAbsent {
+			t.Fatalf("invalid path authorized proof %q", path)
+		}
+	}
+}

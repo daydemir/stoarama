@@ -20,6 +20,9 @@ class ListingProofTests(unittest.TestCase):
             p = self.cfg.output_dir / name
             p.parent.mkdir(exist_ok=True)
             p.write_bytes(b'abc')
+        self.mount = mock.patch.object(pull.os.path, "ismount", return_value=True)
+        self.mount.start()
+        self.addCleanup(self.mount.stop)
         self.calls = []
     def request(self, cfg, method, path, body):
         self.calls.append(body)
@@ -70,3 +73,9 @@ class ListingProofTests(unittest.TestCase):
             with self.assertRaises(pull.ListingChanged):
                 pull.listing_proof_once(self.cfg, threading.Event())
         self.assertFalse(any(c['action'] == 'complete' for c in self.calls))
+
+    def test_missing_mount_never_starts_or_completes(self):
+        with mock.patch.object(pull.os.path, 'ismount', return_value=False), mock.patch.object(pull, 'request_json', side_effect=self.request):
+            with self.assertRaises(pull.ListingChanged):
+                pull.listing_proof_once(self.cfg, threading.Event())
+        self.assertEqual(self.calls, [])

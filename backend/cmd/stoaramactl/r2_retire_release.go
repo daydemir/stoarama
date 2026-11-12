@@ -159,7 +159,7 @@ func r2HoldReleasePlan(ctx context.Context, q r2RetireQuerier, picks r2RetirePic
 	}
 	for _, r := range receipts {
 		c, ok := candidates[retireIdentity(r.kind, r.id)]
-		if !ok {
+		if !ok || !api.NASListingPathValid(c.RelativePath) {
 			continue
 		}
 		if c.Kind == "raw" && incident[c.SourceID] || c.Kind == "collated" && collatedIncident[c.SourceID] {
