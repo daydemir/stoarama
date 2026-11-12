@@ -15,10 +15,11 @@ import (
 // after explicit releases, and the conditional upper bound if a future fresh
 // complete listing confirms absence. They never manufacture production proof.
 type r2RetireProjection struct {
-	AfterRelease          r2RetireStat `json:"after_hold_release"`
-	AfterReleaseSHA       string       `json:"after_hold_release_sha256"`
-	FenceListingPotential r2RetireStat `json:"after_fence_and_listing_upper_bound"`
-	FenceListingSHA       string       `json:"after_fence_and_listing_sha256"`
+	Class                 r2RetireClass `json:"retirement_class,omitempty"`
+	AfterRelease          r2RetireStat  `json:"after_hold_release"`
+	AfterReleaseSHA       string        `json:"after_hold_release_sha256"`
+	FenceListingPotential r2RetireStat  `json:"after_fence_and_listing_upper_bound"`
+	FenceListingSHA       string        `json:"after_fence_and_listing_sha256"`
 
 	fenceItems, releaseItems []r2RetireItem
 	release, held            map[string]bool
@@ -38,7 +39,7 @@ func loadR2RetireProjection(ctx context.Context, q r2RetireQuerier, path, digest
 	if json.Unmarshal(raw, &m) != nil || m.Tool != "r2-retire release-holds" || m.Version != 1 || m.PolicySHA != policy || m.PicksSHA != picks.SHA256 || time.Since(m.CreatedAt) > 24*time.Hour {
 		return nil, errors.New("hold release preview authority differs")
 	}
-	p := &r2RetireProjection{release: map[string]bool{}, held: map[string]bool{}}
+	p := &r2RetireProjection{Class: m.Class, release: map[string]bool{}, held: map[string]bool{}}
 	itemIDs := []int64{}
 	for _, i := range m.Items {
 		p.release[retireIdentity(i.Candidate.Kind, i.Candidate.SourceID)] = true
@@ -125,29 +126,37 @@ func loadR2RetireProjection(ctx context.Context, q r2RetireQuerier, path, digest
 	for _, id := range r2RetireIncidentSources {
 		p.held[retireIdentity("raw", id)] = true
 	}
+	if m.Class == r2RetireOwnerAccepted {
+		return p, nil
+	}
 	if err := p.loadFenceWriters(ctx, q); err != nil {
 		return nil, err
 	}
 	return p, nil
 }
 func (p *r2RetireProjection) add(c r2RetireCandidate, scope r2RetireScope, picks r2RetirePicks, windows map[int64]api.Keep28Window, actualEligible bool) {
-	if actualEligible || !api.NASListingPathValid(c.RelativePath) {
+	if p.Class != scope.Class || actualEligible || !api.NASListingPathValid(c.RelativePath) {
 		return
 	}
 	key := retireIdentity(c.Kind, c.SourceID)
 	if p.release[key] {
 		c.Facts.Held = p.held[key]
-		c.Facts.NASAbsent = true
-		// The receipt supersedes prior inventory, subject to a live recheck when
-		// actually applying retirement. The projection is not deletion authority.
-		c.Facts.NASCopy = false
-		c.Facts.ExactNAS = false
+		if scope.Class != r2RetireOwnerAccepted {
+			c.Facts.NASAbsent = true
+			// The receipt supersedes prior inventory, subject to a live recheck when
+			// actually applying retirement. The projection is not deletion authority.
+			c.Facts.NASCopy = false
+			c.Facts.ExactNAS = false
+		}
 		reason, choice, ok := r2RetireDecideForScope(c, scope, windows, picks.Choices)
 		if ok {
 			p.AfterRelease.add(c.SizeBytes)
 			p.releaseItems = append(p.releaseItems, r2RetireItem{r2RetireCandidate: c, Reason: reason, Choice: choice})
 			return
 		}
+	}
+	if scope.Class == r2RetireOwnerAccepted {
+		return
 	}
 	reason, choice, _ := r2RetireDecideForScope(c, scope, windows, picks.Choices)
 	if reason == "nas_absence_unproven" && !p.unsafePaths[c.RelativePath] && !(c.Kind == "raw" && p.unsafePaths[p.rawAliases[c.SourceID]]) && !(c.Kind == "collated" && p.unsafePaths["joined/"+c.RelativePath]) {

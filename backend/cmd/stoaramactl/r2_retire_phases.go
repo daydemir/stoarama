@@ -282,6 +282,23 @@ func writeR2RetireListing(path, bucket string, prefixes []string, objects map[st
 // A planning manifest is not deletion authority. Every item is reselected under
 // the cleanup admission/public fences and matching inventory rows are locked.
 func r2RetireDecideForScope(c r2RetireCandidate, scope r2RetireScope, windows map[int64]api.Keep28Window, picks map[int64]r2RetirePick) (string, string, bool) {
+	if scope.Class == r2RetireOwnerAccepted {
+		if !scope.NASBacked {
+			return "owner_class_requires_conditional_safety", "", false
+		}
+		// Only absence proof is waived. Keep the broad inventory observation,
+		// and never invoke the listing/receipt evidence that can clear it.
+		w, exists := windows[c.StreamID]
+		if !exists || !r2RetireOutside(w, c.StartAt, c.EndAt) || !r2RetireOutside(w, c.SourceStart, c.SourceEnd) {
+			return "inside_keep_window", "", false
+		}
+		c.Facts.NASAbsent = true
+		reason, choice, eligible := r2RetireDecideMode(c, scope.Bucket, windows, picks, true)
+		if eligible {
+			return string(r2RetireOwnerAccepted), choice, true
+		}
+		return reason, choice, false
+	}
 	return r2RetireDecideMode(c, scope.Bucket, windows, picks, scope.NASBacked)
 }
 
@@ -305,6 +322,25 @@ func r2RetireLockNASIdentity(ctx context.Context, q r2RetireQuerier, it r2Retire
 }
 
 func (a *r2RetireApplier) reserve(ctx context.Context, it r2RetireItem) error {
+	if a.scope.Class == r2RetireOwnerAccepted {
+		tag, err := a.pool.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`, it.Kind, it.SourceID, it.Bucket, it.ObjectKey, it.SizeBytes, it.SHA256, a.digest, a.scope.Class)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 1 {
+			return nil
+		}
+		var same bool
+		err = a.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE kind=$1 AND source_id=$2 AND bucket=$3 AND object_key=$4 AND size_bytes=$5 AND sha256=$6 AND manifest_sha256=$7 AND retirement_class=$8)`, it.Kind, it.SourceID, it.Bucket, it.ObjectKey, it.SizeBytes, it.SHA256, a.digest, a.scope.Class).Scan(&same)
+		if err != nil {
+			return err
+		}
+		if !same {
+			return r2RetireAnomalyf("R2 identity reserved by another manifest or class")
+		}
+		return nil
+	}
 	tag, err := a.pool.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
  VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, it.Kind, it.SourceID, it.Bucket, it.ObjectKey, it.SizeBytes, it.SHA256, a.digest)
 	if err != nil {

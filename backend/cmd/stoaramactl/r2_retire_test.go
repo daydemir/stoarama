@@ -935,6 +935,170 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		}
 	})
 
+	t.Run("OwnerAcceptedOutsideWindow", func(t *testing.T) {
+		body, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), "0186_owner_accepted_r2_retirement.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		exec(string(body))
+		writePicks("none")
+		picks, err := loadR2RetirePicks(picksPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scope := r2RetireScope{Class: r2RetireOwnerAccepted, AccountID: 47, ConnectionID: 13, Bucket: "stoarama", Grace: 7 * 24 * time.Hour, HasRetirements: true, NASBacked: true, OwnerPolicy: r2RetireOwnerPolicy(windows, picks.Choices)}
+		for _, id := range []int64{701, 702, 703, 704, 705, 706, 707, 708, 709} {
+			clip(id, 30, outside)
+		}
+		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state) VALUES(13,702,'p/702.mp4','unknown'),(13,703,'p/703.mp4','missing')`)
+		// A kept alias makes an otherwise outside key protected.
+		exec(`INSERT INTO recording_clips(id,recording_id,recording_job_id,bucket,object_key,size_bytes,sha256,display_path,clip_start_at,clip_end_at,created_at)
+         SELECT 710,30,1,bucket,object_key,size_bytes,sha256,'p/alias.mp4',$1::timestamptz,$1::timestamptz+interval '1 minute','2026-08-01' FROM recording_clips WHERE id=708`, inside)
+		output(2701, "joined/nightly-collation-v2/o/2701.mp4", inside, "{707}")
+		output(2702, "joined/nightly-collation-v2/o/2702.mp4", outside, "{104}") // own window outside, source stream is all
+		output(2703, "joined/nightly-collation-v2/o/2703.mp4", outside, "{701}")
+		for n, id := range []int64{704, 705, 706} {
+			sets, err := loadR2RetireSets(ctx, pool, "", true, scope.Class)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c, err := r2RetireLoadOne(ctx, pool, "raw", id, scope, sets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, _ := json.Marshal(c)
+			mode, state, outcome := "retired", "deleted", "deleted"
+			if id == 704 {
+				mode = "paused"
+			}
+			if id == 706 {
+				state = "unverified"
+				outcome = "unverified"
+			}
+			exec(`INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode)
+             VALUES($1,47,13,$2,repeat('a',64),jsonb_build_array($3::jsonb),repeat('b',64),$4)`, 2700+n, fmt.Sprint("owner-", id), raw, mode)
+			exec(`INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state,delete_ever_issued,recovery,item,outcome)
+             VALUES($1,$2,1,$3,true,'r2_sha_verified',$4,jsonb_build_object('outcome',$5::text))`, 3700+n, 2700+n, state, raw, outcome)
+			exec(`INSERT INTO nas_cleanup_source_holds VALUES($1,$2)`, 2700+n, id)
+		}
+		check := func(id int64, kind string, want bool) {
+			t.Helper()
+			sets, err := loadR2RetireSets(ctx, pool, "", true, scope.Class)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c, err := r2RetireLoadOne(ctx, pool, kind, id, scope, sets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reason, _, ok := r2RetireDecideForScope(c, scope, windows, picks.Choices)
+			if ok != want {
+				t.Fatalf("%s/%d eligible=%t want=%t reason=%s facts=%+v", kind, id, ok, want, reason, c.Facts)
+			}
+		}
+		check(701, "raw", true)
+		check(702, "raw", false)
+		check(703, "raw", true)
+		for _, id := range []int64{704, 705, 706, 707, 708, 709, 710} {
+			check(id, "raw", id == 709)
+		}
+		check(2702, "collated", false)
+		check(2703, "collated", true)
+		releases, err := r2HoldReleasePlan(ctx, pool, picks, r2tPolicy, windows, r2RetireOwnerAccepted)
+		if err != nil {
+			t.Fatal(err)
+		}
+		selected := []r2HoldReleaseItem{}
+		for _, i := range releases.Items {
+			if i.Candidate.SourceID == 704 || i.Candidate.SourceID == 706 {
+				t.Fatal("active/uncertain release", i)
+			}
+			if i.Candidate.SourceID == 705 {
+				selected = append(selected, i)
+			}
+		}
+		if len(selected) != 1 {
+			t.Fatalf("verified receipt was not releasable: %+v", releases.Items)
+		}
+		releases.Items = selected
+		releases.Bytes = selected[0].Candidate.SizeBytes
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = applyR2HoldReleases(ctx, tx, releases, picks, r2tPolicy, strings.Repeat("a", 64), "owner-approved outside window", windows); err != nil {
+			tx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if err = tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		check(705, "raw", true)
+		var legacyHeld, ownerHeld bool
+		if err = pool.QueryRow(ctx, `SELECT nas_cleanup_clip_held(705),nas_cleanup_owner_clip_held(705)`).Scan(&legacyHeld, &ownerHeld); err != nil || !legacyHeld || ownerHeld {
+			t.Fatal("class isolation", legacyHeld, ownerHeld, err)
+		}
+		// Legacy reservations and direct purge retain their recovery hold.
+		if _, err = pool.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) SELECT 'raw',id,bucket,object_key,size_bytes,sha256,repeat('a',64) FROM recording_clips WHERE id=705`); err == nil {
+			t.Fatal("legacy consumed owner release")
+		}
+		if _, err = pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=705`); err == nil {
+			t.Fatal("unreserved purge consumed release")
+		}
+		live := map[string]r2.ObjectInfo{}
+		for k, n := range store.objects {
+			live[k] = r2.ObjectInfo{Key: k, SizeBytes: n, ETag: "e"}
+		}
+		sum, items, err := r2RetirePlanRun(ctx, pool, r2RetirePlanOptions{Scope: scope, Picks: picks, PageSize: 500, Now: time.Now(), LiveObjects: live}, r2tPolicy, windows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var chosen []r2RetireItem
+		for _, i := range items {
+			if i.SourceID == 705 || i.SourceID == 709 {
+				chosen = append(chosen, i)
+			}
+		}
+		if len(chosen) != 2 {
+			t.Fatal("missing selected owner items", chosen)
+		}
+		sum.Header.Items = 2
+		sum.Header.Bytes = chosen[0].SizeBytes + chosen[1].SizeBytes
+		path := filepath.Join(t.TempDir(), "owner.jsonl")
+		digest, err := writeR2RetireManifest(path, sum.Header, chosen)
+		if err != nil {
+			t.Fatal(err)
+		}
+		o := opts
+		o.ManifestPath = path
+		o.ExpectedSHA = digest
+		o.LedgerPath = filepath.Join(t.TempDir(), "ledger.jsonl")
+		o.MaxBytes = 100000
+		o.Budget24h = 5e12
+		o.SkipIneligible = true
+		proof := []byte(fmt.Sprintf(`{"bucket":"stoarama","endpoint_sha256":%q,"created_at":%q,"wrong_etag_rejected":true,"object_preserved":true,"matching_delete_confirmed":true}`, r2tSHA, time.Now().Format(time.RFC3339)))
+		o.DeleteProofPath = filepath.Join(t.TempDir(), "proof.json")
+		os.WriteFile(o.DeleteProofPath, proof, 0600)
+		o.DeleteProofSHA256 = r2SHA(proof)
+		// A newly observed NAS identity after planning revokes 709.
+		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state) VALUES(13,709,'p/709.mp4','present')`)
+		result, err := r2RetireApply(ctx, pool, store, o, r2tPolicy, windows)
+		if err != nil || result.Retired != 1 {
+			t.Fatalf("owner apply %+v %v", result, err)
+		}
+		var class string
+		if err = pool.QueryRow(ctx, `SELECT retirement_class FROM r2_retirement_reservations WHERE source_id=705`).Scan(&class); err != nil || class != string(scope.Class) {
+			t.Fatal(class, err)
+		}
+		if _, exists := store.objects["managed/acct-47/709.mp4"]; !exists {
+			t.Fatal("NAS presence did not revoke deletion")
+		}
+		o.Budget24h = 5e12 + 1
+		if _, err = r2RetireApply(ctx, pool, store, o, r2tPolicy, windows); err == nil {
+			t.Fatal("owner budget exceeded 5TB")
+		}
+	})
+
 	t.Run("DeliveryFenceRequiresPostSettlementScopedListing", func(t *testing.T) {
 		raw, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), "0185_nas_delivery_retirement_fence.sql"))
 		if err != nil {
@@ -1117,5 +1281,45 @@ func TestR2RetirePreviewAllowsAdditionalReceiptsButRechecksEverySelectedItem(t *
 	live.Items = live.Items[1:]
 	if err := validateR2HoldReleaseItems(expected, live); err == nil {
 		t.Fatal("missing reviewed receipt accepted")
+	}
+}
+
+func TestR2RetireOwnerAcceptedClass(t *testing.T) {
+	w := r2tWindow(t, 3, "Asia/Tokyo", "2026-09-12", "2026-10-10")
+	windows := map[int64]api.Keep28Window{3: w}
+	picks := map[int64]r2RetirePick{3: {Choice: "none", KeepStartUTC: w.Start.Format(time.RFC3339), KeepEndUTC: w.End.Format(time.RFC3339)}}
+	scope := r2RetireScope{Class: r2RetireOwnerAccepted, Bucket: "stoarama", NASBacked: true}
+	base := r2tCandidate("raw", 3, w.Timezone, w.Start.Add(-2*time.Hour), w.Start.Add(-time.Hour))
+	for name, mutate := range map[string]func(*r2RetireCandidate){
+		"clean":       func(c *r2RetireCandidate) {},
+		"presence":    func(c *r2RetireCandidate) { c.Facts.NASCopy = true },
+		"exact":       func(c *r2RetireCandidate) { c.Facts.ExactNAS = true },
+		"listing":     func(c *r2RetireCandidate) { c.Facts.ListingPresence = true },
+		"hold":        func(c *r2RetireCandidate) { c.Facts.Held = true },
+		"reference":   func(c *r2RetireCandidate) { c.Facts.JoinedRef = true },
+		"shared":      func(c *r2RetireCandidate) { c.Facts.SharedKey = true },
+		"restore":     func(c *r2RetireCandidate) { c.Facts.RestorePending = true },
+		"recent":      func(c *r2RetireCandidate) { c.Facts.Recent = true },
+		"kept":        func(c *r2RetireCandidate) { c.StartAt = w.Start; c.EndAt = w.End },
+		"kept_source": func(c *r2RetireCandidate) { c.SourceStart = w.Start; c.SourceEnd = w.End },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := base
+			mutate(&c)
+			r, _, ok := r2RetireDecideForScope(c, scope, windows, picks)
+			if ok != (name == "clean") {
+				t.Fatal(r, ok)
+			}
+			if name == "clean" && r != string(r2RetireOwnerAccepted) {
+				t.Fatal(r)
+			}
+		})
+	}
+	for _, choice := range []string{"all", ""} {
+		p := picks[3]
+		p.Choice = choice
+		if _, _, ok := r2RetireDecideForScope(base, scope, windows, map[int64]r2RetirePick{3: p}); ok {
+			t.Fatal("unapproved choice", choice)
+		}
 	}
 }

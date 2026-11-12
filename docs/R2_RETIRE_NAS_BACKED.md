@@ -375,3 +375,65 @@ It is additional to `after-hold-release.jsonl` and actual eligibility. Its
 `phase=blocked` projection header cannot authorize deletion. Neither activation
 nor any fabricated listing/settlement is needed to produce these read-only
 forecasts on the current production schema.
+
+## Owner-accepted outside-window retirement
+
+`--class owner_accepted_outside_window` is explicit owner disposal authority,
+separate from both absence-proof retirement and kept-window NAS copying. It
+implies the NAS-backed transport safeguards, but never selects kept-window
+footage. Valid saved non-`all` picks must still match the exact pinned policy.
+No-history and missing inventory may qualify without positive NAS-absence proof.
+Present/unknown inventory (including other connections, aliases, matching
+content, and unmatched paths) remains a veto; historical ACK alone is not current
+inventory. This class never runs the evidence logic that supersedes old presence.
+
+All existing prefix, identity, grace, restore, joined snapshot, artifact and
+shared-key protections remain. Additionally, every collated source must be
+outside its own stream's pinned window under a valid non-`all` pick. Raw sources
+referenced by a kept/`all`/unknown collated output are protected. Uncatalogued
+objects and protected best14 outputs remain blocked. `nas_stitch_outputs` are
+NAS-only evidence with no R2 object key; they are not R2 deletion candidates.
+
+Migration **0186** is required before either owner-class hold release or apply;
+planning works read-only without it. `release-holds --class
+owner_accepted_outside_window` previews only exact deleted, recovery-verified
+receipts from **retired** plans. Active/dry-run/paused plans, uncertain receipts,
+unmapped source holds, reservations and all 28 incident identities (including
+collated descendants) remain protected. The existing receipt guard validates
+identity and receipt/recovery hashes. Owner release records are excluded from
+the legacy effective-release view. Only an owner-class durable reservation can
+consume them, and only a `purged_at` transition may use that exception; other
+source mutations and classes retain their holds.
+
+Review and commit the exact hold-release manifest separately, before retirement.
+This makes authority visible to the independent reservation connection. A
+`--hold-release-preview` with the same class produces a **blocked, non-executable**
+`after-hold-release.jsonl` projection. It preserves presence, references and all
+other holds. Regenerate an ordinary executable manifest after the release; never
+apply the projection. The current ordinary manifest can retire independent,
+unheld objects without releasing any receipts.
+
+```sh
+stoaramactl r2-retire release-holds --class owner_accepted_outside_window \
+  --picks "$HOME/stoarama-r2-select/r2-picks.json" --out hold-release.json
+stoaramactl r2-retire plan --class owner_accepted_outside_window \
+  --picks "$HOME/stoarama-r2-select/r2-picks.json" --connection-id 13 --out plan
+```
+
+Operator execution, after reviewing the manifest digest and supplying a fresh
+approved conditional-delete proof:
+
+```sh
+stoaramactl r2-retire apply --manifest plan/manifest.jsonl \
+  --expected-sha256 REVIEWED_MANIFEST_SHA256 --max-bytes 5000000000000 \
+  --budget-24h-bytes 5000000000000 \
+  --conditional-delete-proof REVIEWED_PROOF_PATH \
+  --expected-delete-proof-sha256 REVIEWED_PROOF_SHA256
+```
+
+The owner class refuses a rolling budget above 5 decimal TB. Each deletion still
+reselects live inventory, cleanup holds, incident identities, own/source windows,
+references, aliases and unchanged picks under the admission/public fences. It
+retains conditional If-Match, post-delete HEAD, durable reservations, fsynced
+ledger, and unresolved-intent budget charging. No production action is needed
+to build or inspect the dry-run artifacts.
