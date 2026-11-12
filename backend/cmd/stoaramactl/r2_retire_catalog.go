@@ -615,8 +615,11 @@ func r2RetireScan(ctx context.Context, q r2RetireQuerier, kind string, scope r2R
 				sets.applyPlanNAS(&page[i])
 			}
 			if scope.Class != r2RetireOwnerAccepted {
+				presence := page[i].Facts.NASCopy
 				sets.Evidence.apply(&page[i])
 				if scope.Class == r2RetireDeliveryOnly {
+					// Ordinary listing absence cannot clear broad owner inventory.
+					page[i].Facts.NASCopy = page[i].Facts.NASCopy || presence
 					sets.Evidence.applyOwner(&page[i])
 				}
 			} else {
@@ -645,9 +648,11 @@ func r2RetireLoadOne(ctx context.Context, q r2RetireQuerier, kind string, id int
 	sets.apply(&c)
 	if scope.Class.owner() {
 		if scope.Class == r2RetireDeliveryOnly {
+			presence := c.Facts.NASCopy
 			if err := r2RetireLiveEvidence(ctx, q, &c, sets.Evidence); err != nil {
 				return c, err
 			}
+			c.Facts.NASCopy = c.Facts.NASCopy || presence
 		}
 		if err := r2RetireOwnerLive(ctx, q, &c, scope); err != nil {
 			return c, err

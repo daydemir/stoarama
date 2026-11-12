@@ -22,14 +22,15 @@ func TestR2RetireDeliveryOnlyOrderingAndAllPicks(t *testing.T) {
 		reason   string
 		eligible bool
 	}{
-		{"unknown outside", false, r2RetireFacts{}, "after_nas_cleanup", false},
+		{"no evidence outside", false, r2RetireFacts{}, r2RetireReason, true},
 		{"present outside", false, r2RetireFacts{NASCopy: true}, "after_nas_cleanup", false},
+		{"listing outside", false, r2RetireFacts{ListingPresence: true}, "after_nas_cleanup", false},
 		{"verified copy outside", false, r2RetireFacts{ExactNAS: true}, "after_nas_cleanup", false},
 		{"completed cleanup", false, r2RetireFacts{NASAbsent: true}, r2RetireReason, true},
 		{"kept missing", true, r2RetireFacts{}, "copy_to_nas", false},
 		{"kept exact", true, r2RetireFacts{ExactNAS: true}, r2RetireNASReason, true},
-		{"held", false, r2RetireFacts{NASAbsent: true, DeliveryHeld: true}, "delivery_keep_hold", false},
-		{"reserved", false, r2RetireFacts{NASAbsent: true, Held: true}, "nas_cleanup_hold", false},
+		{"held without evidence", false, r2RetireFacts{DeliveryHeld: true}, "delivery_keep_hold", false},
+		{"reserved without evidence", false, r2RetireFacts{Held: true}, "nas_cleanup_hold", false},
 		{"referenced", false, r2RetireFacts{NASAbsent: true, JoinedRef: true}, "joined_reference", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -43,12 +44,22 @@ func TestR2RetireDeliveryOnlyOrderingAndAllPicks(t *testing.T) {
 			}
 			for _, choice := range []string{"none", "keep", "st", ""} {
 				picks := map[int64]r2RetirePick{3: {Choice: choice}}
-				reason, _, eligible := r2RetireDecideForScope(c, scope, windows, picks)
-				if reason != tc.reason || eligible != tc.eligible {
+				reason, choice, eligible := r2RetireDecideForScope(c, scope, windows, picks)
+				phases := newR2RetirePhases()
+				phases.add(c, reason, choice, eligible)
+				wantPhase := r2RetireBlocked
+				if tc.eligible {
+					wantPhase = r2RetireNow
+				} else if tc.reason == "after_nas_cleanup" {
+					wantPhase = r2RetireLater
+				} else if tc.reason == "copy_to_nas" {
+					wantPhase = r2RetireCopy
+				}
+				if phases.Totals[wantPhase].Objects != 1 || reason != tc.reason || eligible != tc.eligible {
 					t.Fatal(reason, eligible, tc)
 				}
 			}
-			if _, _, eligible := r2RetireDecideForScope(c, scope, windows, map[int64]r2RetirePick{3: {Choice: "all"}}); eligible {
+			if reason, _, eligible := r2RetireDecideForScope(c, scope, windows, map[int64]r2RetirePick{3: {Choice: "all"}}); eligible || reason != "pick_all" {
 				t.Fatal("all pick lost with stale/missing window")
 			}
 		})

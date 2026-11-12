@@ -141,7 +141,10 @@ adds or enriches holds under admission/public locks; it cannot release them.
 
 `r2-retire plan --class owner_r2_delivery_only --head-guard-compatible ...`
 enumerates the whole bucket and reports now/later/copy/blocked. The class is
-**planning-only**. Outside-window NAS presence/unknown waits for cleanup;
+**planning-only**. Outside-window objects without NAS presence evidence qualify
+now; any inventory, listing (including partial generations/aliases), ACK or raw
+delivery evidence waits for NAS cleanup under the owner rules. Verified cleanup
+receipts supersede delivery evidence under the existing recovery-hold rules;
 keep28 media requires fresh exact NAS identity or enters copy-first. Existing
 incidents, references, shared keys, reservations and protected/operator prefixes
 still veto. Unmapped keys stay blocked; unreferenced staging is separately

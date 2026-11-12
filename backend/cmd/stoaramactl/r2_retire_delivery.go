@@ -68,10 +68,12 @@ func r2RetireDeliveryDecide(c r2RetireCandidate, scope r2RetireScope, windows ma
 	}
 	effective := map[int64]r2RetirePick{c.StreamID: {Choice: "none", KeepStartUTC: w.Start.Format(time.RFC3339), KeepEndUTC: w.End.Format(time.RFC3339)}}
 	outside := r2RetireOutside(w, c.StartAt, c.EndAt) && r2RetireOutside(w, c.SourceStart, c.SourceEnd)
-	reason, choice, eligible := r2RetireDecideMode(c, scope.Bucket, windows, effective, true)
-	if !eligible && outside && reason == "nas_absence_unproven" {
-		reason = "after_nas_cleanup"
+	// The owner waives absence proof outside keep28. Broad NAS presence and
+	// every other veto still win; only kept footage needs a verified copy.
+	if outside {
+		c.Facts.NASAbsent = true
 	}
+	reason, choice, eligible := r2RetireDecideMode(c, scope.Bucket, windows, effective, true)
 	if !eligible && !outside && (reason == "kept_collated_no_exact_inventory" || reason == "nas_identity_unproven") {
 		reason = "copy_to_nas"
 	}

@@ -1304,6 +1304,8 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			{"fresh output ACK", 802, `INSERT INTO recording_collation_output_acks VALUES(2802,13,clock_timestamp())`},
 			{"released raw", 803, `UPDATE recording_clips SET released_at=clock_timestamp() WHERE id=803`},
 			{"cursor delivered raw", 804, `UPDATE connections SET last_cursor_id=804,nas_listing_cursor_at=clock_timestamp() WHERE id=13`},
+			{"present inventory", 805, `INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state,verified_at) VALUES(13,805,'p/805.mp4','present',now()-interval '3 days')`},
+			{"unknown inventory", 806, `INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state,verified_at) VALUES(13,806,'p/806.mp4','unknown',now()-interval '3 days')`},
 		} {
 			t.Run(test.name, func(t *testing.T) {
 				exec(`UPDATE connections SET last_cursor_id=0`)
@@ -1317,7 +1319,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 				for key, size := range store.objects {
 					live[key] = r2.ObjectInfo{Key: key, SizeBytes: size, ETag: "e"}
 				}
-				plan := func() (r2RetirePlanSummary, []r2RetireItem) {
+				plan := func(scope r2RetireScope) (r2RetirePlanSummary, []r2RetireItem) {
 					t.Helper()
 					sum, items, err := r2RetirePlanRun(ctx, pool, r2RetirePlanOptions{Delivery: r2tDelivery(), Scope: scope, Picks: picks, PageSize: 500, Now: time.Now(), LiveObjects: live}, r2tPolicy, windows)
 					if err != nil {
@@ -1331,7 +1333,14 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 					}
 					return sum, selected
 				}
-				sum, selected := plan()
+				deliveryScope := scope
+				deliveryScope.Class = r2RetireDeliveryOnly
+				deliveryScope.OwnerPolicy = r2RetireDeliveryPolicy(windows, picks.Choices)
+				_, deliverySelected := plan(deliveryScope)
+				if len(deliverySelected) != 1 {
+					t.Fatal("no-evidence delivery preview not eligible now", deliverySelected)
+				}
+				sum, selected := plan(scope)
 				if len(selected) != 1 {
 					t.Fatal("fixture not initially eligible", selected)
 				}
@@ -1348,7 +1357,22 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 					exec(`INSERT INTO nas_listing_generations(connection_id,generation,started_at,completed_at,folders) VALUES(13,repeat('9',32),now()-interval '2 days',now()-interval '2 days',ARRAY['p']); INSERT INTO nas_listing_folders(connection_id,generation,folder) VALUES(13,repeat('9',32),'p')`)
 				}
 				exec(test.evidence)
-				_, selectedAfter := plan()
+				deliverySum, deliveryAfter := plan(deliveryScope)
+				if len(deliveryAfter) != 0 || deliverySum.Kept[kind]["after_nas_cleanup"].Objects == 0 {
+					t.Fatal("delivery preview did not defer NAS evidence", deliveryAfter, deliverySum.Kept)
+				}
+				deliverySets, err := loadR2RetireSets(ctx, pool, "", true, r2RetireDeliveryOnly)
+				if err != nil {
+					t.Fatal(err)
+				}
+				candidate, err := r2RetireLoadOne(ctx, pool, kind, id, deliveryScope, deliverySets)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if reason, _, eligible := r2RetireDecideForScope(candidate, deliveryScope, windows, picks.Choices); eligible || reason != "after_nas_cleanup" {
+					t.Fatal("live delivery check lost NAS evidence", reason, eligible)
+				}
+				_, selectedAfter := plan(scope)
 				if len(selectedAfter) != 0 {
 					t.Error("NAS evidence did not veto planning", selectedAfter)
 				}
@@ -1498,8 +1522,8 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if err != nil {
 			t.Fatal(err)
 		}
-		if deliverySets.Evidence.Paths["p/old-observation.mp4"] {
-			t.Fatal("historical presence survived a newer complete walk")
+		if !deliverySets.Evidence.Paths["p/old-observation.mp4"] {
+			t.Fatal("owner delivery class lost historical NAS presence")
 		}
 		candidate := r2RetireCandidate{Kind: "raw", SourceID: 999997, RelativePath: "p/999997.mp4", SHA256: r2tSHA, SizeBytes: 1000997}
 		deliverySets.applyPlanNAS(&candidate)

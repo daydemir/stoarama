@@ -155,7 +155,7 @@ func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier, class r2Retire
 		return nil, err
 	}
 	listingSQL := `SELECT DISTINCT f.relative_path FROM nas_listing_files f JOIN nas_listing_generations g USING(connection_id,generation) WHERE f.connection_id=13 AND (g.started_at>=$1 OR $2)`
-	rows, err = q.Query(ctx, listingSQL, e.Start, class == r2RetireOwnerAccepted)
+	rows, err = q.Query(ctx, listingSQL, e.Start, class.owner())
 	if err != nil {
 		return nil, err
 	}
