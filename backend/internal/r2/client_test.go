@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -397,5 +399,58 @@ func TestEndpointProofIdentityUsesConfiguredEndpoint(t *testing.T) {
 	sum := sha256.Sum256([]byte(strings.TrimRight(endpoint, "/")))
 	if c.EndpointSHA256() != hex.EncodeToString(sum[:]) {
 		t.Fatal("proof endpoint identity differs from configured storage")
+	}
+}
+
+func TestDeleteObjectOnceNeverRetriesAmbiguousResult(t *testing.T) {
+	for _, lostResponse := range []bool{false, true} {
+		t.Run(fmt.Sprint(lostResponse), func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.Method != http.MethodDelete || r.URL.Path != "/bucket/managed/a.mp4" || r.Header.Get("If-Match") != "" {
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+				}
+				if lostResponse {
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					conn.Close()
+					return
+				}
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}))
+			defer server.Close()
+			c, err := New(context.Background(), Config{AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.DeleteObjectOnce(context.Background(), "managed/a.mp4"); err == nil {
+				t.Fatal("ambiguous DELETE accepted")
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("DELETE attempted %d times", calls.Load())
+			}
+		})
+	}
+}
+
+func TestHeadExposesProviderLastModified(t *testing.T) {
+	when := time.Date(2026, 10, 1, 1, 2, 3, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Last-Modified", when.Format(http.TimeFormat))
+		w.Header().Set("ETag", `"e"`)
+		w.Header().Set("Content-Length", "100")
+	}))
+	defer server.Close()
+	c, err := New(context.Background(), Config{AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := c.Head(context.Background(), "managed/a.mp4")
+	if err != nil || !h.LastModified.Equal(when) {
+		t.Fatalf("HEAD=%+v err=%v", h, err)
 	}
 }

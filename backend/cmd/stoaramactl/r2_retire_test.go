@@ -265,12 +265,15 @@ func TestR2RetireManifestRoundTripAndTamper(t *testing.T) {
 // ---------------------------------------------------------------- Postgres
 
 type fakeR2RetireStore struct {
-	mu         sync.Mutex
-	objects    map[string]int64
-	deleted    []string
-	heads      int
-	beforeHead func(key string)
-	deleteErr  error
+	mu             sync.Mutex
+	objects        map[string]int64
+	deleted        []string
+	heads          int
+	beforeHead     func(key string)
+	deleteErr      error
+	headOverride   func(r2.ObjectHead) r2.ObjectHead
+	onceCalls      int
+	retainOnDelete bool
 }
 
 func (f *fakeR2RetireStore) Bucket() string         { return "stoarama" }
@@ -287,7 +290,11 @@ func (f *fakeR2RetireStore) Head(_ context.Context, key string) (r2.ObjectHead, 
 	if !ok {
 		return r2.ObjectHead{}, &smithy.GenericAPIError{Code: "NotFound"}
 	}
-	return r2.ObjectHead{ETag: "e", SizeBytes: n}, nil
+	h := r2.ObjectHead{ETag: "e", SizeBytes: n, LastModified: time.Now().Add(-30 * 24 * time.Hour)}
+	if f.headOverride != nil {
+		h = f.headOverride(h)
+	}
+	return h, nil
 }
 
 func (f *fakeR2RetireStore) DeleteObject(_ context.Context, key string) error {
@@ -296,7 +303,9 @@ func (f *fakeR2RetireStore) DeleteObject(_ context.Context, key string) error {
 	if f.deleteErr != nil {
 		return f.deleteErr
 	}
-	delete(f.objects, key)
+	if !f.retainOnDelete {
+		delete(f.objects, key)
+	}
 	f.deleted = append(f.deleted, key)
 	return nil
 }
@@ -1133,6 +1142,196 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if _, exists := store.objects["managed/acct-47/709.mp4"]; !exists {
 			t.Fatal("NAS presence did not revoke deletion")
 		}
+		t.Run("HeadGuard", func(t *testing.T) {
+			exec(`ALTER TABLE recordings ADD COLUMN status text NOT NULL DEFAULT 'paused';
+            ALTER TABLE streams ADD COLUMN recording_enabled boolean NOT NULL DEFAULT false;
+            ALTER TABLE recording_clips ADD COLUMN etag text NOT NULL DEFAULT 'e';
+            CREATE TABLE recording_jobs(recording_id bigint,status text);
+            CREATE TABLE capture_session_leases(lease_expires_at timestamptz);
+            CREATE TABLE recording_upload_intents(bucket text,status text,expires_at timestamptz);
+            CREATE TABLE upload_intents(bucket text,status text,expires_at timestamptz)`)
+			key := clip(712, 30, outside)
+			sets, err := loadR2RetireSets(ctx, pool, "", true, scope.Class)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c, err := r2RetireLoadOne(ctx, pool, "raw", 712, scope, sets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.ETag = "e"
+			item := r2RetireItem{r2RetireCandidate: c, Choice: "none", Reason: string(scope.Class)}
+			h := sum.Header
+			h.Items = 1
+			h.Bytes = c.SizeBytes
+			guarded := o
+			guarded.ManifestPath = filepath.Join(t.TempDir(), "manifest.jsonl")
+			guarded.ExpectedSHA, err = writeR2RetireManifest(guarded.ManifestPath, h, []r2RetireItem{item})
+			if err != nil {
+				t.Fatal(err)
+			}
+			guarded.ProviderUnconditionalHeadGuard = true
+			guarded.MinObjectAge = 7 * 24 * time.Hour
+			guarded.LedgerPath = filepath.Join(t.TempDir(), "ledger.jsonl")
+			writeGuardProofs(t, &guarded, h)
+			// Real migrated schema has no capture_jobs table. Planning excludes
+			// collated output before review instead of reserving unsupported keys.
+			live := map[string]r2.ObjectInfo{}
+			for key, n := range store.objects {
+				live[key] = r2.ObjectInfo{Key: key, SizeBytes: n, ETag: "e"}
+			}
+			compatible, compatibleItems, err := r2RetirePlanRun(ctx, pool, r2RetirePlanOptions{HeadGuardCompatible: true, Scope: scope, Picks: picks, PageSize: 500, Now: time.Now(), LiveObjects: live}, r2tPolicy, windows)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, it := range compatibleItems {
+				if it.Kind != "raw" || it.ETag != "e" {
+					t.Fatal("non-authorized identity planned", it)
+				}
+				found = found || it.SourceID == 712
+			}
+			if !found || compatible.Kept["collated"]["catalog_etag_unavailable"].Objects == 0 {
+				t.Fatal("HEAD-guard planning filter missing", compatible.Kept)
+			}
+			mixed := guarded
+			mixed.ManifestPath = filepath.Join(t.TempDir(), "mixed.jsonl")
+			mixed.LedgerPath = filepath.Join(t.TempDir(), "mixed-ledger.jsonl")
+			collated := item
+			collated.Kind = "collated"
+			collated.SourceID = 2703
+			collated.ObjectKey = "joined/nightly-collation-v2/o/2703.mp4"
+			mixed.ExpectedSHA, err = writeR2RetireManifest(mixed.ManifestPath, h, []r2RetireItem{collated})
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeGuardProofs(t, &mixed, h)
+			if _, err := r2RetireApply(ctx, pool, store, mixed, r2tPolicy, windows); err == nil {
+				t.Fatal("collated manifest accepted")
+			}
+			var reserved int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_retirement_reservations WHERE kind='collated' AND source_id=2703`).Scan(&reserved); err != nil || reserved != 0 {
+				t.Fatal("unsupported item created durable reservation", reserved, err)
+			}
+			if _, err := os.Stat(mixed.LedgerPath); !os.IsNotExist(err) {
+				t.Fatal("unsupported item opened ledger", err)
+			}
+			run := func() error { _, err := r2RetireApply(ctx, pool, store, guarded, r2tPolicy, windows); return err }
+			noDelete := func(err error) {
+				t.Helper()
+				if err == nil {
+					t.Fatal("guard accepted unsafe deletion")
+				}
+				if store.onceCalls != 0 {
+					t.Fatal("DELETE happened before safety guards")
+				}
+			}
+			for _, test := range []struct{ name, insert, clean string }{
+				{"active recording", `UPDATE recordings SET status='active' WHERE id=30`, `UPDATE recordings SET status='paused' WHERE id=30`},
+				{"another account recording", `UPDATE recordings SET status='active' WHERE id=60`, `UPDATE recordings SET status='paused' WHERE id=60`},
+				{"pending recording job", `INSERT INTO recording_jobs VALUES(30,'pending')`, `DELETE FROM recording_jobs`},
+				{"leased recording job", `INSERT INTO recording_jobs VALUES(30,'leased')`, `DELETE FROM recording_jobs`},
+				{"enabled capture", `UPDATE streams SET recording_enabled=true WHERE id=3`, `UPDATE streams SET recording_enabled=false WHERE id=3`},
+				{"capture lease", `INSERT INTO capture_session_leases VALUES(now()+interval '1 hour')`, `DELETE FROM capture_session_leases`},
+				{"consumed recorder URL", `INSERT INTO recording_upload_intents VALUES('stoarama','consumed',now()+interval '1 hour')`, `DELETE FROM recording_upload_intents`},
+				{"consumed capture URL", `INSERT INTO upload_intents VALUES('stoarama','consumed',now()+interval '1 hour')`, `DELETE FROM upload_intents`},
+				{"catalog ETag changed", `UPDATE recording_clips SET etag='replacement' WHERE id=712`, `UPDATE recording_clips SET etag='e' WHERE id=712`},
+				{"catalog ETag missing", `UPDATE recording_clips SET etag='' WHERE id=712`, `UPDATE recording_clips SET etag='e' WHERE id=712`},
+			} {
+				t.Run(test.name, func(t *testing.T) { exec(test.insert); noDelete(run()); exec(test.clean) })
+			}
+			for _, test := range []struct {
+				name   string
+				mutate func(r2.ObjectHead) r2.ObjectHead
+			}{
+				{"replacement", func(h r2.ObjectHead) r2.ObjectHead { h.ETag = "changed"; return h }},
+				{"size", func(h r2.ObjectHead) r2.ObjectHead { h.SizeBytes++; return h }},
+				{"sha", func(h r2.ObjectHead) r2.ObjectHead { h.SHA256Metadata = strings.Repeat("b", 64); return h }},
+				{"young", func(h r2.ObjectHead) r2.ObjectHead { h.LastModified = time.Now(); return h }},
+				{"unknown age", func(h r2.ObjectHead) r2.ObjectHead { h.LastModified = time.Time{}; return h }},
+			} {
+				t.Run(test.name, func(t *testing.T) { store.headOverride = test.mutate; noDelete(run()); store.headOverride = nil })
+			}
+			for _, revoke := range []string{"picks", "proof"} {
+				t.Run("revoked during final HEAD/"+revoke, func(t *testing.T) {
+					heads := 0
+					store.beforeHead = func(k string) {
+						if k != key {
+							return
+						}
+						heads++
+						if heads != 2 {
+							return
+						}
+						switch revoke {
+						case "picks":
+							writePicks("all")
+						case "proof":
+							os.WriteFile(guarded.WriterProofPath, []byte(`{}`), 0600)
+						}
+					}
+					noDelete(run())
+					store.beforeHead = nil
+					exec(`DELETE FROM nas_inventory_files WHERE clip_id=712`)
+					writePicks("none")
+				})
+				writeGuardProofs(t, &guarded, h)
+			}
+			// A failed or unconfirmed wire attempt stops; the independently
+			// committed reservation survives and the same manifest can retry.
+			store.deleteErr = errors.New("injected ambiguous DELETE")
+			if err := run(); err == nil || !strings.Contains(err.Error(), "delete_error") {
+				t.Fatal("ambiguous DELETE accepted", err)
+			}
+			store.deleteErr = nil
+			store.retainOnDelete = true
+			if err := run(); err == nil || !strings.Contains(err.Error(), "delete_unconfirmed") {
+				t.Fatal("DELETE without 404 accepted", err)
+			}
+			store.retainOnDelete = false
+			if store.onceCalls != 2 {
+				t.Fatal("wire failure retried", store.onceCalls)
+			}
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_retirement_reservations WHERE kind='raw' AND source_id=712`).Scan(&reserved); err != nil || reserved != 1 {
+				t.Fatal("unresolved reservation lost", reserved, err)
+			}
+			// Admissions must be blocked while HEAD is in flight.
+			store.beforeHead = func(k string) {
+				if k != key {
+					return
+				}
+				conn, err := pool.Acquire(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conn.Release()
+				_, err = conn.Exec(ctx, `SET lock_timeout='30ms'`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = conn.Exec(ctx, `INSERT INTO recording_upload_intents VALUES('stoarama','pending',now()+interval '1 hour')`)
+				if err == nil {
+					t.Fatal("upload admission was not fenced")
+				}
+			}
+			result, err := r2RetireApply(ctx, pool, store, guarded, r2tPolicy, windows)
+			store.beforeHead = nil
+			if err != nil || result.Retired != 1 || store.onceCalls != 3 {
+				t.Fatalf("HEAD-guard result=%+v err=%v attempts=%d", result, err, store.onceCalls)
+			}
+			if _, present := store.objects[key]; present {
+				t.Fatal("guarded DELETE was not confirmed")
+			}
+			again, err := r2RetireApply(ctx, pool, store, guarded, r2tPolicy, windows)
+			if err != nil || again.AlreadyDone != 1 || store.onceCalls != 3 {
+				t.Fatal("completed guarded receipt did not resume idempotently", again, err)
+			}
+			ledger, err := os.ReadFile(guarded.LedgerPath)
+			if err != nil || !strings.Contains(string(ledger), "residual_toctou=true") {
+				t.Fatal("residual race missing from ledger", err)
+			}
+		})
+
 		o.Budget24h = 5e12 + 1
 		if _, err = r2RetireApply(ctx, pool, store, o, r2tPolicy, windows); err == nil {
 			t.Fatal("owner budget exceeded 5TB")
@@ -1467,4 +1666,9 @@ func TestR2RetireOwnerAcceptedClass(t *testing.T) {
 			t.Fatal("unapproved choice", choice)
 		}
 	}
+}
+
+func (f *fakeR2RetireStore) DeleteObjectOnce(ctx context.Context, key string) error {
+	f.onceCalls++
+	return f.DeleteObject(ctx, key)
 }

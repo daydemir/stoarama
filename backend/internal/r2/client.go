@@ -47,6 +47,7 @@ type Config struct {
 }
 
 type ObjectHead struct {
+	LastModified   time.Time
 	SHA256Metadata string
 	ETag           string
 	SizeBytes      int64
@@ -426,7 +427,7 @@ func (c *Client) Head(ctx context.Context, key string) (ObjectHead, error) {
 	if err != nil {
 		return ObjectHead{}, fmt.Errorf("head object %s: %w", key, err)
 	}
-	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId)), SHA256Metadata: strings.TrimSpace(out.Metadata["sha256"])}, nil
+	return ObjectHead{LastModified: aws.ToTime(out.LastModified), ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId)), SHA256Metadata: strings.TrimSpace(out.Metadata["sha256"])}, nil
 }
 
 // HeadExact resolves one immutable generation and refuses a changed ETag.
@@ -443,7 +444,7 @@ func (c *Client) HeadExact(ctx context.Context, key, etag, versionID string) (Ob
 	if err != nil {
 		return ObjectHead{}, fmt.Errorf("head exact object %s: %w", key, err)
 	}
-	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId)), SHA256Metadata: strings.TrimSpace(out.Metadata["sha256"])}, nil
+	return ObjectHead{LastModified: aws.ToTime(out.LastModified), ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId)), SHA256Metadata: strings.TrimSpace(out.Metadata["sha256"])}, nil
 }
 
 // OpenExact returns the exact object generation observed by Head. If the store
@@ -595,6 +596,18 @@ func (c *Client) DeleteObject(ctx context.Context, key string) error {
 		return fmt.Errorf("delete object %s: %w", key, err)
 	}
 	return nil
+}
+
+// DeleteObjectOnce performs exactly one unconditional wire attempt. A lost
+// response is ambiguous: retirement must retain its intent and re-HEAD on resume.
+func (c *Client) DeleteObjectOnce(ctx context.Context, key string) error {
+	if key == "" || strings.TrimSpace(key) != key {
+		return errors.New("single-attempt delete requires an exact key")
+	}
+	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)}, func(o *s3.Options) {
+		o.Retryer = aws.NopRetryer{}
+	})
+	return err
 }
 
 // MaxDeleteBatch is the S3/R2 multi-object delete limit per request.

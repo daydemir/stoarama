@@ -286,7 +286,7 @@ jobs:
       - name: Test R2 retire selection and apply safety
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./cmd/stoaramactl -run '^Test(R2Fence|R2Retire|ParseR2RetirePicks)' -race -count=1 -v
+        run: go test ./cmd/stoaramactl ./internal/r2 -run '^Test(R2Fence|R2Retire|ParseR2RetirePicks|DeleteObjectOnce|HeadExposes)' -race -count=1 -v
       - name: Test selected-file NAS verification
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
