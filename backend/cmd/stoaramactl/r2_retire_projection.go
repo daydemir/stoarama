@@ -121,7 +121,7 @@ func loadR2RetireProjection(ctx context.Context, q r2RetireQuerier, path, digest
 	return p, rows.Err()
 }
 func (p *r2RetireProjection) add(c r2RetireCandidate, scope r2RetireScope, picks r2RetirePicks, windows map[int64]api.Keep28Window, actualEligible bool) {
-	if actualEligible {
+	if actualEligible || !api.NASListingPathValid(c.RelativePath) {
 		return
 	}
 	key := retireIdentity(c.Kind, c.SourceID)

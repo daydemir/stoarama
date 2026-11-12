@@ -41,7 +41,8 @@ type nasListingRequest struct {
 	Bytes      int64            `json:"bytes"`
 }
 
-func listingPath(p string) bool {
+// NASListingPathValid is the canonical namespace shared by proof producer and consumer.
+func NASListingPathValid(p string) bool {
 	return p != "" && p != "." && len(p) <= 4096 && path.Clean(p) == p && !strings.HasPrefix(p, "/") && p != ".." && !strings.HasPrefix(p, "../") && !strings.ContainsAny(p, "\\\x00")
 }
 func validateNASListing(req nasListingRequest) error {
@@ -57,7 +58,7 @@ func validateNASListing(req nasListingRequest) error {
 		for i, f := range req.Folders {
 			if f == "." {
 				root = true
-			} else if !listingPath(f) || strings.Contains(f, "/") {
+			} else if !NASListingPathValid(f) || strings.Contains(f, "/") {
 				return errors.New("invalid top-level folder")
 			}
 			if i > 0 && f == req.Folders[i-1] {
@@ -68,12 +69,12 @@ func validateNASListing(req nasListingRequest) error {
 			return errors.New("root files folder required")
 		}
 	case nasListingPage, nasListingFolderComplete:
-		if req.Folder != "." && (!listingPath(req.Folder) || strings.Contains(req.Folder, "/")) {
+		if req.Folder != "." && (!NASListingPathValid(req.Folder) || strings.Contains(req.Folder, "/")) {
 			return errors.New("invalid folder")
 		}
 		seen := map[string]bool{}
 		for _, f := range req.Files {
-			if !listingPath(f.Path) || f.Size < 0 || f.Inode < 0 || f.Device < 0 || seen[f.Path] || (req.Folder == "." && strings.Contains(f.Path, "/")) || (req.Folder != "." && !strings.HasPrefix(f.Path, req.Folder+"/")) {
+			if !NASListingPathValid(f.Path) || f.Size < 0 || f.Inode < 0 || f.Device < 0 || seen[f.Path] || (req.Folder == "." && strings.Contains(f.Path, "/")) || (req.Folder != "." && !strings.HasPrefix(f.Path, req.Folder+"/")) {
 				return errors.New("invalid listing file")
 			}
 			seen[f.Path] = true

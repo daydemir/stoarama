@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/daydemir/stoarama/backend/internal/api"
 	"github.com/jackc/pgx/v5"
 	"time"
 )
@@ -195,6 +196,11 @@ func (e *r2RetireEvidence) apply(c *r2RetireCandidate) {
 	if e == nil {
 		return
 	}
+	if (e.ListingSchema || e.ReleaseSchema) && !api.NASListingPathValid(c.RelativePath) {
+		c.Facts.NASAbsent = false
+		c.Facts.ExactNAS = false
+		return
+	}
 	presence := e.Paths[c.RelativePath] || (c.Kind == "collated" && e.Paths["joined/"+c.RelativePath])
 	c.Facts.ListingPresence = presence
 	c.Facts.NASAbsent = !presence && ((e.AbsentRaw[c.SourceID] && c.Kind == "raw") || (e.AbsentCollated[c.SourceID] && c.Kind == "collated") || !e.Receipts[retireIdentity(c.Kind, c.SourceID)].IsZero())
@@ -214,6 +220,11 @@ func (e *r2RetireEvidence) apply(c *r2RetireCandidate) {
 // Apply rechecks generation/freshness, later partial presence and writer time.
 func r2RetireLiveEvidence(ctx context.Context, q r2RetireQuerier, c *r2RetireCandidate, e *r2RetireEvidence) error {
 	if e == nil {
+		return nil
+	}
+	if (e.ListingSchema || e.ReleaseSchema) && !api.NASListingPathValid(c.RelativePath) {
+		c.Facts.NASAbsent = false
+		c.Facts.ExactNAS = false
 		return nil
 	}
 	var absent, present bool
