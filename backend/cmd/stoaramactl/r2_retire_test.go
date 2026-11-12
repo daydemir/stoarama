@@ -977,7 +977,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			exec(`INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode)
              VALUES($1,47,13,$2,repeat('a',64),jsonb_build_array($3::jsonb),repeat('b',64),$4)`, 2700+n, fmt.Sprint("owner-", id), raw, mode)
 			exec(`INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state,delete_ever_issued,recovery,item,outcome)
-             VALUES($1,$2,1,$3,true,'r2_sha_verified',$4,jsonb_build_object('outcome',$5::text))`, 3700+n, 2700+n, state, raw, outcome)
+             VALUES($1,$2,1,$3,$6,'r2_sha_verified',$4,jsonb_build_object('outcome',$5::text))`, 3700+n, 2700+n, state, raw, outcome, id != 706)
 			exec(`INSERT INTO nas_cleanup_source_holds VALUES($1,$2)`, 2700+n, id)
 		}
 		check := func(id int64, kind string, want bool) {
@@ -1032,6 +1032,34 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if err = tx.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
+		// A legacy release cannot waive this class's active-plan veto.
+		legacyRelease, err := r2HoldReleasePlan(ctx, pool, picks, r2tPolicy, windows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		legacyItems := []r2HoldReleaseItem{}
+		for _, i := range legacyRelease.Items {
+			if i.Candidate.SourceID == 704 {
+				legacyItems = append(legacyItems, i)
+			}
+		}
+		if len(legacyItems) != 1 {
+			t.Fatal("missing legacy active receipt")
+		}
+		legacyRelease.Items = legacyItems
+		legacyRelease.Bytes = legacyItems[0].Candidate.SizeBytes
+		legacyTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = applyR2HoldReleases(ctx, legacyTx, legacyRelease, picks, r2tPolicy, strings.Repeat("f", 64), "legacy receipt fixture", windows); err != nil {
+			legacyTx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if err = legacyTx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		check(704, "raw", false)
 		check(705, "raw", true)
 		check(711, "raw", false) // Releasing a receipt never waives positive NAS inventory.
 		var legacyHeld, ownerHeld bool
@@ -1045,6 +1073,9 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if _, err = pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=711`); err == nil {
 			t.Fatal("reservation alone waived a legacy hold")
 		}
+		exec(`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
+         SELECT 'raw',999999,bucket,object_key,size_bytes,sha256,repeat('d',64) FROM recording_clips WHERE id=701`)
+		check(701, "raw", false) // A stale source ID never frees its reserved object key.
 		// Legacy reservations and direct purge retain their recovery hold.
 		if _, err = pool.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) SELECT 'raw',id,bucket,object_key,size_bytes,sha256,repeat('a',64) FROM recording_clips WHERE id=705`); err == nil {
 			t.Fatal("legacy consumed owner release")

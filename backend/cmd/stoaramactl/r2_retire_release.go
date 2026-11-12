@@ -124,7 +124,7 @@ func r2HoldReleasePlan(ctx context.Context, q r2RetireQuerier, picks r2RetirePic
 	scope.HasRetirements = has
 	var ownerSets r2RetireSets
 	if m.Class == r2RetireOwnerAccepted {
-		ownerSets, err = loadR2RetireSets(ctx, q, "", true, m.Class)
+		ownerSets, err = loadR2RetireSets(ctx, q, "", false, m.Class)
 		if err != nil {
 			return m, err
 		}

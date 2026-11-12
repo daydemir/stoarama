@@ -62,46 +62,50 @@ func r2RetireOwnerPlanSQL() string {
 }
 
 func (s *r2RetireSets) loadOwnerProtections(ctx context.Context, q r2RetireQuerier, scope r2RetireScope, windows map[int64]api.Keep28Window, picks map[int64]r2RetirePick) error {
-	s.PresentRaw = map[int64]bool{}
-	s.PresentPaths = map[string]bool{}
-	s.PresentContent = map[r2RetireNASIdentity]bool{}
-	presence, err := q.Query(ctx, `SELECT clip_id,relative_path,coalesce(sha256,''),coalesce(size_bytes,0) FROM nas_inventory_files WHERE state<>'missing'`)
-	if err != nil {
-		return err
-	}
-	for presence.Next() {
-		var id int64
-		var path, sha string
-		var size int64
-		if err := presence.Scan(&id, &path, &sha, &size); err != nil {
-			presence.Close()
+	// Hold-release approval does not assert absence or select deletions.
+	// Actual retirement planning always materializes broad presence.
+	if !scope.OwnerPlanning {
+		s.PresentRaw = map[int64]bool{}
+		s.PresentPaths = map[string]bool{}
+		s.PresentContent = map[r2RetireNASIdentity]bool{}
+		presence, err := q.Query(ctx, `SELECT clip_id,relative_path,coalesce(sha256,''),coalesce(size_bytes,0) FROM nas_inventory_files WHERE state<>'missing'`)
+		if err != nil {
 			return err
 		}
-		s.PresentRaw[id] = true
-		s.PresentPaths[path] = true
-		if size > 0 && sha != "" {
-			s.PresentContent[r2RetireNASIdentity{"", sha, size}] = true
+		for presence.Next() {
+			var id int64
+			var path, sha string
+			var size int64
+			if err := presence.Scan(&id, &path, &sha, &size); err != nil {
+				presence.Close()
+				return err
+			}
+			s.PresentRaw[id] = true
+			s.PresentPaths[path] = true
+			if size > 0 && sha != "" {
+				s.PresentContent[r2RetireNASIdentity{"", sha, size}] = true
+			}
 		}
-	}
-	presence.Close()
-	if presence.Err() != nil {
-		return presence.Err()
-	}
-	presence, err = q.Query(ctx, `SELECT relative_path FROM nas_inventory_unmatched_files WHERE state<>'missing'`)
-	if err != nil {
-		return err
-	}
-	for presence.Next() {
-		var path string
-		if err := presence.Scan(&path); err != nil {
-			presence.Close()
+		presence.Close()
+		if presence.Err() != nil {
+			return presence.Err()
+		}
+		presence, err = q.Query(ctx, `SELECT relative_path FROM nas_inventory_unmatched_files WHERE state<>'missing'`)
+		if err != nil {
 			return err
 		}
-		s.PresentPaths[path] = true
-	}
-	presence.Close()
-	if presence.Err() != nil {
-		return presence.Err()
+		for presence.Next() {
+			var path string
+			if err := presence.Scan(&path); err != nil {
+				presence.Close()
+				return err
+			}
+			s.PresentPaths[path] = true
+		}
+		presence.Close()
+		if presence.Err() != nil {
+			return presence.Err()
+		}
 	}
 	s.ProtectedRaw = map[int64]bool{}
 	s.ProtectedCollated = map[int64]bool{}

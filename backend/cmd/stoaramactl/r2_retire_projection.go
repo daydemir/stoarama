@@ -47,7 +47,11 @@ func loadR2RetireProjection(ctx context.Context, q r2RetireQuerier, path, digest
 	}
 	// Materialize protections after exactly these proposed item releases. Never
 	// assume completion frees the rest of a plan or any incident identity.
-	rows, err := q.Query(ctx, `SELECT e.value,i.id FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) WITH ORDINALITY e(value,n) LEFT JOIN nas_cleanup_items i ON i.plan_id=p.id AND i.ordinal=e.n WHERE p.mode<>'retired' OR i.delete_ever_issued OR i.id IS NULL`)
+	heldSQL := `SELECT e.value,i.id FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) WITH ORDINALITY e(value,n) LEFT JOIN nas_cleanup_items i ON i.plan_id=p.id AND i.ordinal=e.n WHERE p.mode<>'retired' OR i.delete_ever_issued OR i.id IS NULL`
+	if m.Class == r2RetireOwnerAccepted {
+		heldSQL += ` OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed')`
+	}
+	rows, err := q.Query(ctx, heldSQL)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +88,7 @@ func loadR2RetireProjection(ctx context.Context, q r2RetireQuerier, path, digest
 	if rows.Err() != nil {
 		return nil, rows.Err()
 	}
-	rows, err = q.Query(ctx, `SELECT DISTINCT h.clip_id FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id WHERE (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued)) AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(p.manifest) e WHERE (e->'source_ids') @> to_jsonb(ARRAY[h.clip_id]) OR (e->>'kind'='raw' AND (e->>'source_id')::bigint=h.clip_id))`)
+	rows, err = q.Query(ctx, `SELECT DISTINCT h.clip_id FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id WHERE (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND (i.delete_ever_issued OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed')))) AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(p.manifest) e WHERE (e->'source_ids') @> to_jsonb(ARRAY[h.clip_id]) OR (e->>'kind'='raw' AND (e->>'source_id')::bigint=h.clip_id))`)
 	if err != nil {
 		return nil, err
 	}

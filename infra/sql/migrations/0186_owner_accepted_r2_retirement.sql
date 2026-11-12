@@ -9,8 +9,7 @@ CREATE VIEW nas_cleanup_r2_effective_releases AS
 CREATE VIEW nas_cleanup_owner_effective_releases AS
  SELECT x.* FROM nas_cleanup_all_effective_releases x
  JOIN nas_cleanup_items i ON i.id=x.item_id JOIN nas_cleanup_plans p ON p.id=i.plan_id
- WHERE coalesce(x.authority->'candidate'->>'reason','')<>'owner_accepted_outside_window'
- OR p.mode='retired';
+ WHERE p.mode='retired';
 CREATE OR REPLACE VIEW nas_cleanup_r2_reserved_files AS
  SELECT p.account_id,p.connection_id,p.label,e.value->>'kind' kind,(e.value->>'source_id')::bigint source_id
  FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) WITH ORDINALITY e(value,n)
@@ -22,18 +21,18 @@ CREATE VIEW nas_cleanup_owner_reserved_files AS
  SELECT p.account_id,p.connection_id,p.label,e.value->>'kind' kind,(e.value->>'source_id')::bigint source_id
  FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) WITH ORDINALITY e(value,n)
  LEFT JOIN nas_cleanup_items i ON i.plan_id=p.id AND i.ordinal=e.n
- WHERE (p.mode<>'retired' OR i.delete_ever_issued OR i.id IS NULL)
+ WHERE (p.mode<>'retired' OR i.delete_ever_issued OR i.id IS NULL OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed'))
  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_owner_effective_releases r WHERE r.item_id=i.id);
 
 CREATE OR REPLACE FUNCTION nas_cleanup_owner_clip_held(clip bigint) RETURNS boolean LANGUAGE sql VOLATILE AS $$
  SELECT EXISTS(SELECT 1 FROM nas_cleanup_incident_sources WHERE clip_id=clip)
  OR EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id
- WHERE h.clip_id=clip AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued))
+ WHERE h.clip_id=clip AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND (i.delete_ever_issued OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed'))))
  AND (NOT EXISTS(SELECT 1 FROM jsonb_array_elements(p.manifest) e WHERE (e->'source_ids') @> to_jsonb(ARRAY[clip]) OR (e->>'kind'='raw' AND (e->>'source_id')::bigint=clip))
  OR EXISTS(SELECT 1 FROM jsonb_array_elements(p.manifest) WITH ORDINALITY e(value,n)
  LEFT JOIN nas_cleanup_items i ON i.plan_id=p.id AND i.ordinal=e.n
  WHERE ((e.value->'source_ids') @> to_jsonb(ARRAY[clip]) OR (e.value->>'kind'='raw' AND (e.value->>'source_id')::bigint=clip))
- AND (p.mode<>'retired' OR i.delete_ever_issued OR i.id IS NULL)
+ AND (p.mode<>'retired' OR i.delete_ever_issued OR i.id IS NULL OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed'))
  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_owner_effective_releases r WHERE r.item_id=i.id))))
 $$;
 
