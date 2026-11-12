@@ -20,8 +20,12 @@ func TestNASCleanupDurableRefusalsDoNotPause(t *testing.T) {
 				task := f.leaseV2(1, 1, 1<<30, "")[0]
 				permit := f.observe([]cleanupTask{task}, nil)[0]
 				receipt := map[string]any{"attempt": task.Attempt, "plan_sha256": sha, "proof_sha256": permit.ProofSHA, "outcome": "unverified", "error": "not unlinked", "unlink_attempted": false, "stage_timings": map[string]int64{"intent_journal_ms": 50000}}
-				safe := reason != "" && reason != "attempted" && reason != "unknown" && reason != "sidecar" && reason != "legacy"
+				safe := reason != "" && reason != "attempted" && reason != "unknown" && reason != "sidecar" && reason != "legacy" && reason != "observation_replayed"
 				if safe {
+					receipt["refusal_reason"] = reason
+					receipt["refusal_protocol"] = 1
+				}
+				if reason == "observation_replayed" {
 					receipt["refusal_reason"] = reason
 					receipt["refusal_protocol"] = 1
 				}

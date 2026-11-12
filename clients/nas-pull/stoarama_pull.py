@@ -42,6 +42,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 CLIENT_VERSION = "development"
 CLEANUP_RECONCILIATION_PROTOCOL = 1
+CLEANUP_REFUSAL_PROTOCOL = 1
 CANDIDATE_UPDATE_LOCK = threading.Lock()
 LIST_PAGE_LIMIT = 200
 DEFAULT_DOWNLOAD_WORKERS = 12
@@ -3073,7 +3074,9 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
         if phase == "observe" and response.get("action") == "reconcile":
             body = {"attempt": body["attempt"], "plan_sha256": body["plan_sha256"], "proof_sha256": response["proof_sha256"],
                     "outcome": "unverified", "error": "recovered observation permit was not executed",
-                    "unlink_attempted": False, "refusal_reason": "observation_replayed", "refusal_protocol": 1}
+                    "unlink_attempted": False, "refusal_reason": "observation_replayed"}
+            # A checkpoint inherited from an older client may be stale even
+            # though this replay owns it now (#448). Never certify its refusal.
             cleanup_journal(inventory, item_id, "result", body, owner=owner)
             result = replay(item_id, "result", body, owner)
             if result is None and any(row[0] == item_id for row in cleanup_journal(inventory)):
@@ -3375,7 +3378,7 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner, timings,
                 # Only the owned, durable result may certify a pre-unlink
                 # refusal. Never put this marker in an intent checkpoint.
                 if receipt.get("unlink_attempted") is False and receipt.get("refusal_reason"):
-                    receipt["refusal_protocol"] = 1
+                    receipt["refusal_protocol"] = CLEANUP_REFUSAL_PROTOCOL
                 receipt.update(execution_elapsed_ms=round((time.monotonic() - execution_started) * 1000),
                                stage_timings=dict(timings))
                 cleanup_journal(inventory, item_id, "result", receipt, owner=owner)

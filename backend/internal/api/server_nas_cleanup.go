@@ -1297,6 +1297,8 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	return cleanupObserveResult{status: 200, write: true, body: map[string]any{"action": action, "delete": deletion, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": recovery, "expires_at": expires, "plan_paused": paused}}
 }
 
+const nasCleanupRefusalProtocol = 1
+
 type cleanupReceipt struct {
 	ItemID             int64            `json:"item_id,omitempty"`
 	Attempt            int              `json:"attempt"`
@@ -1315,7 +1317,7 @@ type cleanupReceipt struct {
 // media_deleted_sidecar_failed is the honest receipt for a media unlink whose
 // sidecar step then failed (clients from 2026-11 on).
 func validCleanupReceipt(req cleanupReceipt) bool {
-	if req.RefusalProtocol != 0 && (req.RefusalProtocol != 1 || req.RefusalReason == "") {
+	if req.RefusalProtocol != 0 && (req.RefusalProtocol != nasCleanupRefusalProtocol || req.RefusalReason == "") {
 		return false
 	}
 	if len(req.StageTimings) > 13 {
@@ -1353,9 +1355,10 @@ func validCleanupReceipt(req cleanupReceipt) bool {
 // with no such assertion. Protocol 1 also guarantees journal ownership across
 // observation, intent and result; older stale observation checkpoints could
 // claim false after deletion (#448). Keep only protocol-1 refusals, preserving
-// reservations and delete_ever_issued. Legacy/unknown attempts stay uncertain.
+// reservations and delete_ever_issued. Legacy/unknown attempts and inherited
+// observation replays stay uncertain, including after a client upgrade.
 func cleanupReceiptState(req cleanupReceipt) string {
-	if req.RefusalProtocol == 1 && req.Outcome == "unverified" && req.UnlinkAttempted != nil && !*req.UnlinkAttempted && req.RefusalReason != "" {
+	if req.RefusalProtocol == nasCleanupRefusalProtocol && req.Outcome == "unverified" && req.UnlinkAttempted != nil && !*req.UnlinkAttempted && req.RefusalReason != "" && req.RefusalReason != "observation_replayed" {
 		return "keep"
 	}
 	return req.Outcome

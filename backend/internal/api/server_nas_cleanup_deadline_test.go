@@ -206,7 +206,7 @@ func TestNASCleanupExecutionDeadlineClientServer(t *testing.T) {
 					if err := f.pool.QueryRow(f.ctx, `SELECT state,delete_ever_issued,outcome FROM nas_cleanup_items WHERE plan_id=$1`, id).Scan(&itemState, &issued, &receipt); err != nil {
 						t.Fatal(err)
 					}
-					if itemState != "keep" || !issued || !strings.Contains(string(receipt), `"unlink_attempted": false`) {
+					if itemState != "unverified" || !issued || !strings.Contains(string(receipt), `"unlink_attempted": false`) {
 						t.Fatalf("reconciliation lost safe classification: %s %t %s", itemState, issued, receipt)
 					}
 				} else if slow {
