@@ -4,6 +4,7 @@ import io
 from datetime import timedelta
 import importlib.util
 import json
+import sys
 import os
 import shutil
 import subprocess
@@ -330,6 +331,34 @@ class LoopTests(unittest.TestCase):
             with patch.object(r, 'command', side_effect=command):
                 self.assertEqual(r.Runner.pick(job, lookahead=True), 1406)
             self.assertIn("NOT LIKE '%-nasonly-%'", queries[0])
+
+    def test_command_failure_logs_privately_and_halts(self):
+        with tempfile.TemporaryDirectory() as root:
+            log = Path(root) / 'command-failures.log'
+            with patch.object(r, 'COMMAND_FAILURE_LOG', log):
+                with self.assertRaisesRegex(r.Halt, 'local command failed'):
+                    r.command([sys.executable, '-c', 'import sys; sys.stderr.write("boom-detail"); sys.exit(3)'])
+            row = json.loads(log.read_text().splitlines()[0])
+            self.assertEqual(row['returncode'], 3)
+            self.assertIn('boom-detail', row['stderr_tail'])
+            self.assertEqual(oct(log.stat().st_mode & 0o777), '0o600')
+
+    def test_preparer_gets_long_timeout(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            job.repo = Path(root)
+            job.windows = {3: None}
+            job.status['current_plan'] = None
+            job.query = lambda sql: []
+            seen = []
+            def command(args, **kwargs):
+                seen.append(kwargs.get('timeout'))
+                out = Path(args[args.index('--out') + 1])
+                out.mkdir(parents=True)
+                (out / 'summary.json').write_text(json.dumps(dict(receipts=[], rejected_at_admission=[])))
+            with patch.object(r, 'command', side_effect=command):
+                r.Runner.pick(job, lookahead=True)
+            self.assertEqual(seen, [r.PREPARE_TIMEOUT_SEC])
 
     def test_batch_order_and_approval_digest(self):
         with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
