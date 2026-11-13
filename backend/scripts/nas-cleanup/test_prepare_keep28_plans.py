@@ -29,7 +29,7 @@ class Keep28PlanTests(unittest.TestCase):
     def test_batches_never_mix_streams_kinds_or_recovery_and_cap_items(self):
         rows = [row(3, 'raw', n) for n in range(1, 1202)] + [row(3, 'collated', 5000), row(3, 'raw', 6000, purged=True), row(4, 'raw', 7000)]
         plans = k.batches(rows, 'k28', 500, 0)
-        self.assertEqual([l for l, _ in plans], ['k28-s3-col-0001', 'k28-s3-raw-0001', 'k28-s3-raw-0002', 'k28-s3-raw-0003', 'k28-s3-raw-nasonly-0001', 'k28-s4-raw-0001'])
+        self.assertEqual([l for l, _ in plans], ['k28-s3-col-0001', 'k28-s3-raw-0001', 'k28-s3-raw-0002', 'k28-s3-raw-0003', 'k28-s4-raw-0001', 'k28-s3-raw-nasonly-0001'])
         self.assertTrue(all(1 <= len(items) <= 500 for _, items in plans))
         for _, items in plans:
             self.assertEqual(len({(r['stream_id'], r['kind'], r['r2_purged']) for r in items}), 1)
@@ -68,6 +68,28 @@ class Keep28PlanTests(unittest.TestCase):
     def test_byte_cap_for_pilot(self):
         plans = k.batches([row(3, 'raw', n, size=2_000_000_000) for n in range(1, 6)], 'k28', 500, 5_000_000_000)
         self.assertEqual([len(i) for _, i in plans], [2, 2, 1])
+
+    def test_largest_files_fill_first_plan_independent_of_input_order(self):
+        rows = [row(3, 'raw', 1, size=1), row(3, 'raw', 2, size=80),
+                row(3, 'raw', 3, size=20), row(3, 'raw', 4, size=1)]
+        for inputs in (rows, list(reversed(rows))):
+            plans = k.batches(inputs, 'k28', 100, 100)
+            self.assertEqual([[i['source_id'] for i in items] for _, items in plans], [[2, 3], [1, 4]])
+
+    def test_plan_priority_uses_bytes_per_operation_and_recovery_present(self):
+        rows = [row(3, 'raw', 1, size=10), row(3, 'collated', 2, size=100),
+                row(4, 'raw', 3, size=1000, purged=True)]
+        plans = k.batches(rows, 'k28', 100, 1000)
+        self.assertEqual([p[0] for p in plans], ['k28-s3-col-0001', 'k28-s3-raw-0001', 'k28-s4-raw-nasonly-0001'])
+
+    def test_stream_candidates_fences_hold_checks_after_indexed_stream_scope(self):
+        with patch.object(k, 'query', return_value=[]) as query:
+            k.stream_candidates(k.load_policy(k.POLICY_PATH)[3], 'stoarama', 'psql')
+        sql = query.call_args.args[0]
+        self.assertIn('raw AS MATERIALIZED', sql)
+        self.assertIn('col AS MATERIALIZED', sql)
+        self.assertIn('c.recording_id=r.id OFFSET 0', sql)
+        self.assertIn('f.connection_id=13 AND f.clip_id=c.id OFFSET 0', sql)
 
 
 if __name__ == '__main__':

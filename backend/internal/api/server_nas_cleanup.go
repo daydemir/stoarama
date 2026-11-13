@@ -951,7 +951,7 @@ func (s *Server) cleanupRecovery(ctx context.Context, i nasCleanupItem) string {
 // still requires an exclusive parent lock and cannot overtake observations.
 // New plans read their write-once item copy; legacy rows fall back to the
 // manifest (COALESCE is lazy, so the manifest is only detoasted for them).
-const cleanupObservationLoadSQL = `SELECT coalesce(i.item,p.manifest->(i.ordinal-1)),p.mode,i.state,p.plan_sha256,p.approved_until,i.attempt,i.lease_expires_at,i.proof,i.plan_id,i.outcome,p.report_sha256,i.recovery_evidence,p.execution_rankings,i.permit_expires_at,i.recovery FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2 FOR UPDATE OF i FOR SHARE OF p`
+const cleanupObservationLoadSQL = `SELECT coalesce(i.item,p.manifest->(i.ordinal-1)),p.mode,i.state,p.plan_sha256,p.approved_until,i.attempt,i.lease_expires_at,i.proof,i.plan_id,i.outcome,p.report_sha256,i.recovery_evidence,p.execution_rankings,i.permit_expires_at,i.recovery,i.delete_ever_issued FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2 FOR UPDATE OF i FOR SHARE OF p`
 
 // cleanupObserveRequestError validates one observation; "" means valid.
 func cleanupObserveRequestError(req cleanupObserve) string {
@@ -1097,7 +1097,8 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	var attempt int
 	var lease *time.Time
 	var planID int64
-	err = tx.QueryRow(ctx, cleanupObservationLoadSQL, id, cid).Scan(&raw, &mode, &state, &sha, &until, &attempt, &lease, &oldProof, &planID, &oldOutcome, &binding, &evidence, &rankings, &permitUntil, &oldRecovery)
+	var everIssued bool
+	err = tx.QueryRow(ctx, cleanupObservationLoadSQL, id, cid).Scan(&raw, &mode, &state, &sha, &until, &attempt, &lease, &oldProof, &planID, &oldOutcome, &binding, &evidence, &rankings, &permitUntil, &oldRecovery, &everIssued)
 	if err != nil || sha != req.PlanSHA || attempt != req.Attempt {
 		return cleanupObserveError(409, "cleanup task identity differs")
 	}
@@ -1122,8 +1123,15 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	if json.Unmarshal(raw, &item) != nil {
 		return cleanupObserveError(500, "invalid cleanup manifest")
 	}
-	if err := deliveryNASUnheld(ctx, tx, item); err != nil {
-		return cleanupObserveError(409, err.Error())
+	held, err := deliveryNASHeld(ctx, tx, item)
+	if err != nil {
+		return cleanupObserveError(503, "delivery NAS hold check unavailable; retry")
+	}
+	// An old plan may predate a delivery hold. A confirmed hold is a normal
+	// non-deleting observation, not a transport conflict that replays forever.
+	// Already-issued authority remains uncertain and must only reconcile.
+	if held && everIssued {
+		return cleanupObserveReconcile(id, attempt, sha, req.Proof)
 	}
 	// A repeated dry-run observation is idempotent; a delete permit is never
 	// reissued after a lost response. Such a task requires operator reconciliation.
@@ -1191,7 +1199,10 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	var recoveryEvidence *cleanupRecoveryEvidence
 	recoveryAnomaly := false
 	deletion := false
-	if req.Outcome == "match" {
+	if held {
+		action = "keep"
+		policyReason = "DELIVERY KEEP HOLD: NAS file/dependency must remain"
+	} else if req.Outcome == "match" {
 		if !validCleanupProof(req.Proof, item) {
 			return cleanupObserveError(400, "complete exact physical cleanup proof required")
 		}

@@ -101,6 +101,13 @@ func cleanupTestPool(t *testing.T) *pgxpool.Pool {
 			t.Fatalf("%s: %v", name, err)
 		}
 	}
+	migration, err := os.ReadFile("../../../infra/sql/migrations/0191_nas_cleanup_delivery_lookup.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(migration)); err != nil {
+		t.Fatal(err)
+	}
 	installDeliveryFenceTestSchema(t, pool)
 	return pool
 }

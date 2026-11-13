@@ -55,6 +55,11 @@ The runner:
 - Uses a complete fresh dry run or invokes `prepare_keep28_plans.py --submit`
   for one stream, at most one <=100 GB plan. Unique `k28auto-YYYYMMDD-HHMMSS`
   prefixes avoid immutable-label reuse. Admission rejection is a stop.
+  Stream priority samples the 100 largest acknowledged outside-window collated
+  outputs and excludes delivery holds. Every other pinned stream remains in the
+  search. This is advisory ordering only: preparation, dry run and independent
+  verification still rederive eligibility. Within each stream, files and plans
+  prioritize bytes per operation, with R2-present plans ahead of NAS-only work.
 - Before ON, admits at most one successor using atomic admission (no recursive
   rejection splitting). Two NAS workers can dry-run it during current serial
   execution; executable work wins queue priority. `next_plan` never owns execution.
@@ -161,6 +166,28 @@ and master OFF before changing runner/server code or booting out the job. After
 a failed check, review `last_error` and recovery/shutdown flags with Deniz; resolve
 the cause, clear `last_error` in status, then remove STOP and restart. Never clear
 the persisted `current_plan` to bypass recovery. No automatic retry clears a latch.
+
+An isolated release worktree avoids updating Jelly's working checkout. After
+the same STOP/drain/OFF barrier, fetch the reviewed main commit and create a
+detached worktree at `~/stoarama-cleanup-runner/releases/<full-merge-sha>`.
+Verify its HEAD equals the reviewed merge and its policy matches `origin/main`.
+Point the installed plist's `run.sh` argument and working directory at that
+worktree, then bootstrap the existing job after resolving any saved latch.
+`run.sh` runs its own worktree's runner/preparer/policy and still sources the
+existing credential files in `~/Build/stoarama/local/`; credentials and runner
+state are never copied. Keep prior release worktrees as source, not cache.
+Backend-only changes require no new NAS client artifact or promotion: verify
+the NAS heartbeat still reports the reviewed `cleanup-batch-v5` client.
+
+The November 13 throughput fix classifies a confirmed delivery hold on a
+never-issued leased item as `keep` (HTTP 200). A failed hold lookup retries;
+an already-issued item only reconciles and keeps its original evidence. New
+admission/enable/permit delivery fences remain unchanged. A kept dry-run item
+still fails the runner's independent gate and requires a fresh reviewed plan.
+Migration 0191 adds a path index and splits path/content probes without changing
+the hold predicate. Preparation materializes stream-scoped identity candidates
+before delivery checks and probes reservations only for those candidates;
+both large tables use parameterized indexed reads. NAS fsync ordering is unchanged.
 
 ## Read failures and the November 11 incident
 

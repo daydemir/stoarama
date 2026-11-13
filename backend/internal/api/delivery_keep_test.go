@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 type deliveryRegistryStore struct {
@@ -91,6 +92,35 @@ func TestDeliveryKeepExactSeedAndNASDependencies(t *testing.T) {
 			t.Fatal("stitch inclusion bypassed hold", err)
 		}
 	}
+	// Compare the optimized lookup to the deployed function against the real
+	// 32,825-key seed, raw dependencies, joined aliases and content aliases.
+	start := strings.Index(string(migration), "CREATE FUNCTION delivery_nas_held(")
+	legacy := string(migration)[start:]
+	legacy = legacy[:strings.Index(legacy, "$$;")+3]
+	legacy = strings.Replace(legacy, "delivery_nas_held(", "delivery_nas_held_legacy(", 1)
+	if _, err := pool.Exec(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	var differences int
+	if err := pool.QueryRow(ctx, `WITH h AS MATERIALIZED (SELECT relative_path,sha256,size_bytes FROM delivery_keep_holds ORDER BY object_key LIMIT 5), examples AS (
+ SELECT 'raw'::text k,901::bigint i,'source/raw.mp4'::text p,repeat('a',64) sha,3::bigint n
+ UNION ALL SELECT 'collated',902,'joined/output.mp4',repeat('b',64),3
+ UNION ALL SELECT 'raw',0,relative_path,sha256,size_bytes FROM h
+ UNION ALL SELECT 'collated',0,'joined/'||relative_path,sha256,size_bytes FROM h
+ UNION ALL SELECT 'raw',0,'absent/alias.mp4',sha256,size_bytes FROM h WHERE sha256<>''
+ UNION ALL SELECT 'raw',0,'absent/alias.mp4',repeat('0',64),1
+ ) SELECT count(*) FROM examples x
+ WHERE delivery_nas_held(k,i,p,sha,n) IS DISTINCT FROM delivery_nas_held_legacy(k,i,p,sha,n)`).Scan(&differences); err != nil || differences != 0 {
+		t.Fatal("hold lookup semantics changed", differences, err)
+	}
+	for _, function := range []string{"delivery_nas_held_legacy", "delivery_nas_held"} {
+		started := time.Now()
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM generate_series(1,100) g WHERE `+function+`('raw',0,'absent/'||g,repeat('0',64),1)`).Scan(&count); err != nil || count != 0 {
+			t.Fatal("missing identity classified held", count, err)
+		}
+		t.Logf("%s: 100 absent-file checks over real seed in %s", function, time.Since(started))
+	}
 	for _, sql := range []string{`DELETE FROM delivery_keep_holds`, `DELETE FROM delivery_nas_source_holds`, `DELETE FROM recording_clips WHERE id=901`, `UPDATE recording_clips SET display_path='other' WHERE id=901`} {
 		if _, err := pool.Exec(ctx, sql); err == nil {
 			t.Fatal("hold mutated", sql)
@@ -126,6 +156,92 @@ func TestDeliveryKeepAdmissionAndOldPermitVeto(t *testing.T) {
 	// refuse a first permit and a replay/update of an issued permit.
 	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET state='delete_issued',delete_ever_issued=true WHERE id=$1`, ids[0]); err == nil {
 		t.Fatal("older server minted delivery deletion permit")
+	}
+}
+
+func TestDeliveryKeepOldDryRunClassifiesHeldMemberAndReplays(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	pid, _, ids := f.admit("before-delivery-hold", syntheticFiles(901, 3, 10))
+	tasks := f.leaseV2(3, 0, 0, "")
+	if len(tasks) != 3 {
+		t.Fatal("incomplete lease", len(tasks))
+	}
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO delivery_nas_source_holds(clip_id) VALUES(902)`); err != nil {
+		t.Fatal(err)
+	}
+	for round := 0; round < 2; round++ {
+		for n, result := range f.observe(tasks, nil) {
+			want := "would_delete"
+			if tasks[n].Item.SourceID == 902 {
+				want = "keep"
+			}
+			if result.Status != 200 || result.Action != want || result.Delete {
+				t.Fatalf("round %d: %+v", round, result)
+			}
+		}
+	}
+	if tasks := f.leaseV2(3, 0, 0, ""); len(tasks) != 0 {
+		t.Fatal("terminal hold re-leased", tasks)
+	}
+	var held bool
+	if err := f.pool.QueryRow(f.ctx, `SELECT state='keep' AND NOT delete_ever_issued AND policy_reason LIKE 'DELIVERY KEEP HOLD:%' FROM nas_cleanup_items WHERE id=$1`, ids[1]).Scan(&held); err != nil || !held {
+		t.Fatal("hold classification lost", held, err)
+	}
+	f.s.cfg.NASCleanupDeletionEnabled = true
+	var sha string
+	if err := f.pool.QueryRow(f.ctx, `SELECT plan_sha256 FROM nas_cleanup_plans WHERE id=$1`, pid).Scan(&sha); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := safeguardControl(t, f.s, pid, "enabled", map[string]any{"plan_sha256": sha}); code == 200 {
+		t.Fatal("held plan enabled", body)
+	}
+}
+
+func TestDeliveryKeepCheckFailureCannotClassifyKeep(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	f.admit("hold-check-unavailable", syntheticFiles(901, 1, 10))
+	tasks := f.leaseV2(1, 0, 0, "")
+	if _, err := f.pool.Exec(f.ctx, `ALTER FUNCTION delivery_nas_held(text,bigint,text,text,bigint) RENAME TO hold_check_unavailable`); err != nil {
+		t.Fatal(err)
+	}
+	r := f.observe(tasks, nil)[0]
+	if r.Status != 503 || r.Delete {
+		t.Fatal("unavailable hold check became a terminal decision", r)
+	}
+	var state string
+	if err := f.pool.QueryRow(f.ctx, `SELECT state FROM nas_cleanup_items WHERE id=$1`, tasks[0].ItemID).Scan(&state); err != nil || state != "leased" {
+		t.Fatal("failed hold check modified observation", state, err)
+	}
+}
+
+func TestDeliveryKeepIssuedObservationReconcilesWithoutChangingEvidence(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	pid, sha, _ := f.admit("issued-before-hold", syntheticFiles(901, 1, 10))
+	f.dryRun()
+	f.s.cfg.NASCleanupDeletionEnabled = true
+	if code, body := safeguardControl(t, f.s, pid, "enabled", map[string]any{"plan_sha256": sha}); code != 200 {
+		t.Fatal(code, body)
+	}
+	tasks := f.leaseV2(1, 1, 1<<30, "")
+	requests := map[int64]string{tasks[0].ItemID: strings.Repeat("a", 32)}
+	if r := f.observe(tasks, requests)[0]; r.Status != 200 || !r.Delete {
+		t.Fatal("missing initial permit", r)
+	}
+	var before, after string
+	query := `SELECT to_jsonb(i)::text FROM nas_cleanup_items i WHERE id=$1`
+	if err := f.pool.QueryRow(f.ctx, query, tasks[0].ItemID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	// Model a hold introduced after authority. Import normally fences this;
+	// replay must still never return authority or rewrite the issued receipt.
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO delivery_nas_source_holds(clip_id) VALUES(901)`); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.observe(tasks, requests)[0]; r.Status != 200 || r.Delete || r.Action != "reconcile" {
+		t.Fatal("held authority replayed", r)
+	}
+	if err := f.pool.QueryRow(f.ctx, query, tasks[0].ItemID).Scan(&after); err != nil || before != after {
+		t.Fatal("issued evidence changed", err)
 	}
 }
 func TestDeliveryKeepLiveAgreementFailsClosed(t *testing.T) {
