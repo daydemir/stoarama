@@ -786,6 +786,38 @@ class Runner:
             self.progress()
             time.sleep(60)
 
+    def stream_order(self):
+        # Advisory priority only: bound expensive hold checks to the largest
+        # 100 acknowledged outside-window outputs. The preparer and all normal
+        # admission/dry-run/enable/permit gates still rederive every identity.
+        windows = [{'id': sid, 'a': a.isoformat(), 'b': b.isoformat()}
+                   for sid, (a, b) in self.windows.items()]
+        encoded = base64.b64encode(json.dumps(windows).encode()).decode()
+        ranked = self.query("""WITH w AS (SELECT (x->>'id')::bigint id,
+          (x->>'a')::timestamptz a,(x->>'b')::timestamptz b
+          FROM jsonb_array_elements(convert_from(decode('""" + encoded + """','base64'),'UTF8')::jsonb) x),
+          candidates AS MATERIALIZED (
+          SELECT r.stream_id,o.id,o.nas_relative_path,o.sha256,o.size_bytes
+          FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id
+          JOIN recordings r ON r.id=h.recording_id JOIN w ON w.id=r.stream_id
+          WHERE r.account_id=47 AND o.end_at>o.start_at AND NOT(o.start_at<w.b AND o.end_at>w.a)
+          AND EXISTS(SELECT 1 FROM recording_collation_output_acks a WHERE a.output_id=o.id
+            AND a.connection_id=13 AND a.sha256=lower(o.sha256) AND a.size_bytes=o.size_bytes)
+          ), reserved AS MATERIALIZED (
+          SELECT DISTINCT p.source_id FROM nas_cleanup_reserved_files p
+          JOIN candidates c ON c.id=p.source_id
+          WHERE p.account_id=47 AND p.connection_id=13 AND p.kind='collated'
+          ), largest AS MATERIALIZED (
+          SELECT c.* FROM candidates c WHERE NOT EXISTS(SELECT 1 FROM reserved p WHERE p.source_id=c.id)
+          ORDER BY c.size_bytes DESC,c.id LIMIT 100)
+          SELECT coalesce(json_agg(stream_id ORDER BY bytes DESC,stream_id),'[]') FROM (
+          SELECT stream_id,max(size_bytes) bytes FROM largest
+          WHERE NOT delivery_nas_held('collated',id,'joined/'||nas_relative_path,lower(sha256),size_bytes)
+          GROUP BY stream_id) priority""")
+        require(isinstance(ranked, list) and all(type(sid) is int and sid in self.windows for sid in ranked)
+                and len(ranked) == len(set(ranked)), 'invalid cleanup stream priority')
+        return ranked + sorted(set(self.windows) - set(ranked))
+
     def pick(self, lookahead=False):
         ids = self.query("""SELECT coalesce(json_agg(id ORDER BY id),'[]') FROM nas_cleanup_plans p
           WHERE account_id=47 AND connection_id=13 AND mode='dry_run'
@@ -795,7 +827,7 @@ class Runner:
             AND (state<>'would_delete' OR delete_ever_issued OR updated_at<=now()-interval '20 hours'))""")
         if ids:
             return ids[0]
-        for sid in sorted(self.windows):
+        for sid in self.stream_order():
             if self.stopped():
                 return None
             # A new prefix per admission avoids immutable-label reuse, even on one day.

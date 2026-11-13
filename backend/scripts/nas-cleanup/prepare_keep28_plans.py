@@ -15,9 +15,11 @@ skipped, regardless of policy. Closing a paused plan releases only never-issued
 files for a fresh plan; use a new --label-prefix (labels are immutable). Items are
 grouped per stream, then per kind and recovery class (R2 copy present vs. R2
 purged; NAS-only deletion was removed, so those plans can never be enabled), ordered by
-path, and cut into plans of at most --max-items (<=10000) items and --max-bytes
+descending bytes per file, and cut into plans of at most --max-items (<=10000) items and --max-bytes
 (<=100 GB, the backend's per-plan cap). Labels are deterministic:
 <prefix>-s<stream>-<raw|col>[-nasonly]-<n>.
+R2-present plans precede NAS-only plans; within each class, plans with more
+bytes per file run first. Labels remain bound to their stream/kind/chunk.
 
 With --submit, the admitted plans that can ever be enabled (R2 copy present)
 are also grouped into batch manifests (--batch-by stream: one per stream, or
@@ -134,23 +136,26 @@ def candidates(policy, streams, bucket, psql):
 
 
 def stream_candidates(w, bucket, psql):
+    # Keep the stream estimate at one, fence hold checks behind materialized
+    # identity candidates, and parameterize both large-table reads. Without
+    # these boundaries PostgreSQL pushed delivery_nas_held through the UNION
+    # into whole-catalog scans before restricting the requested stream.
     windows = [{'stream_id': w['stream_id'], 's': w['keep_start_utc'], 'e': w['keep_end_utc']}]
     encoded = base64.b64encode(json.dumps(windows).encode()).decode()
     bucket_literal = "'" + bucket.replace("'", "''") + "'"
     return query("""WITH w AS MATERIALIZED (
  SELECT (x->>'stream_id')::bigint stream_id,(x->>'s')::timestamptz s,(x->>'e')::timestamptz e
- FROM jsonb_array_elements(convert_from(decode('""" + encoded + """','base64'),'UTF8')::jsonb) x
-), planned AS MATERIALIZED (
- SELECT DISTINCT kind,source_id FROM nas_cleanup_reserved_files
- WHERE account_id=47 AND connection_id=13
-), raw AS (
+ FROM jsonb_array_elements(convert_from(decode('""" + encoded + """','base64'),'UTF8')::jsonb) x LIMIT 1
+), raw AS MATERIALIZED (
  SELECT 'raw' kind,c.id source_id,r.stream_id,c.display_path path,c.size_bytes,lower(c.sha256) sha256,(c.purged_at IS NOT NULL) r2_purged
- FROM nas_inventory_files f JOIN recording_clips c ON c.id=f.clip_id JOIN recordings r ON r.id=c.recording_id JOIN w ON w.stream_id=r.stream_id
- WHERE f.connection_id=13 AND f.state='present' AND f.relative_path=c.display_path AND f.sha256=lower(c.sha256) AND f.size_bytes=c.size_bytes
+ FROM w JOIN recordings r ON r.stream_id=w.stream_id
+ CROSS JOIN LATERAL (SELECT c.* FROM recording_clips c WHERE c.recording_id=r.id OFFSET 0) c
+ CROSS JOIN LATERAL (SELECT f.* FROM nas_inventory_files f WHERE f.connection_id=13 AND f.clip_id=c.id OFFSET 0) f
+ WHERE f.state='present' AND f.relative_path=c.display_path AND f.sha256=lower(c.sha256) AND f.size_bytes=c.size_bytes
   AND r.account_id=47 AND c.bucket=""" + bucket_literal + """ AND c.size_bytes>0
   AND c.clip_end_at>c.clip_start_at AND c.clip_start_at>='2020-01-01' AND c.clip_end_at<'2028-01-01'
   AND NOT (c.clip_start_at<w.e AND c.clip_end_at>w.s)
-), col AS (
+), col AS MATERIALIZED (
  SELECT 'collated' kind,o.id source_id,r.stream_id,'joined/'||o.nas_relative_path path,o.size_bytes,lower(o.sha256) sha256,false r2_purged
  FROM recording_collation_outputs o JOIN recording_collation_output_acks a ON a.output_id=o.id AND a.connection_id=13 AND a.sha256=lower(o.sha256) AND a.size_bytes=o.size_bytes
  JOIN recording_collation_hours h ON h.id=o.collation_hour_id JOIN recordings r ON r.id=h.recording_id JOIN w ON w.stream_id=r.stream_id
@@ -159,10 +164,15 @@ def stream_candidates(w, bucket, psql):
   AND NOT EXISTS (SELECT 1 FROM unnest(o.source_clip_ids) sid LEFT JOIN recording_clips c ON c.id=sid LEFT JOIN recordings cr ON cr.id=c.recording_id
    WHERE c.id IS NULL OR cr.stream_id IS DISTINCT FROM r.stream_id OR c.bucket IS DISTINCT FROM """ + bucket_literal + """
     OR NOT (c.clip_end_at>c.clip_start_at) OR (c.clip_start_at<w.e AND c.clip_end_at>w.s))
-)
-SELECT coalesce(json_agg(x ORDER BY x.stream_id,x.kind DESC,x.r2_purged,x.path),'[]') FROM (
+), candidates AS MATERIALIZED (
  SELECT * FROM raw UNION ALL SELECT * FROM col
-) x WHERE NOT delivery_nas_held(x.kind,x.source_id,x.path,x.sha256,x.size_bytes) AND NOT EXISTS (SELECT 1 FROM planned p WHERE p.kind=x.kind AND p.source_id=x.source_id)""", psql)
+), planned AS MATERIALIZED (
+ SELECT DISTINCT p.kind,p.source_id FROM nas_cleanup_reserved_files p
+ JOIN candidates c ON c.kind=p.kind AND c.source_id=p.source_id
+ WHERE p.account_id=47 AND p.connection_id=13
+)
+SELECT coalesce(json_agg(x ORDER BY x.stream_id,x.kind DESC,x.r2_purged,x.size_bytes DESC,x.path),'[]')
+FROM candidates x WHERE NOT delivery_nas_held(x.kind,x.source_id,x.path,x.sha256,x.size_bytes) AND NOT EXISTS (SELECT 1 FROM planned p WHERE p.kind=x.kind AND p.source_id=x.source_id)""", psql)
 
 
 def batches(rows, prefix, max_items, max_bytes):
@@ -173,7 +183,7 @@ def batches(rows, prefix, max_items, max_bytes):
     out = []
     for (sid, kind, purged), items in sorted(groups.items()):
         n, current, size = 0, [], 0
-        for r in items:
+        for r in sorted(items, key=lambda r: (-r['size_bytes'], r['path'])):
             if current and (len(current) >= max_items or (max_bytes and size + r['size_bytes'] > max_bytes)):
                 n += 1
                 out.append((f"{prefix}-s{sid}-{kind}{'-nasonly' if purged else ''}-{n:04d}", current))
@@ -185,7 +195,10 @@ def batches(rows, prefix, max_items, max_bytes):
             out.append((f"{prefix}-s{sid}-{kind}{'-nasonly' if purged else ''}-{n:04d}", current))
     for label, _ in out:
         assert LABEL.match(label), label
-    return out
+    # The fixed per-file durability cost dominates small-file deletion. Prefer
+    # plans reclaiming more bytes per operation; recovery-present work wins.
+    return sorted(out, key=lambda p: (p[1][0]['r2_purged'],
+                  -sum(r['size_bytes'] for r in p[1]) / len(p[1]), p[0]))
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):

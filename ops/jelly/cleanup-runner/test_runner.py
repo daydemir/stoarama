@@ -51,6 +51,17 @@ def plan_with_refusals(plan, total, ordinals):
 
 
 class DecisionTests(unittest.TestCase):
+    def test_stream_priority_promotes_large_outputs_and_keeps_every_stream(self):
+        job = r.Runner.__new__(r.Runner)
+        job.windows = dict(WINDOWS)
+        job.windows.update({4: WINDOWS[3], 5: WINDOWS[3]})
+        sql = []
+        job.query = lambda query: sql.append(query) or [5, 4]
+        self.assertEqual(job.stream_order(), [5, 4, 3])
+        self.assertIn('largest AS MATERIALIZED', sql[0])
+        self.assertIn('LIMIT 100', sql[0])
+        self.assertIn('NOT delivery_nas_held', sql[0])
+
     def test_budget_boundaries_and_invalid_values(self):
         self.assertTrue(r.budget_permits(r.DAY_CAP - r.PLAN_CAP, r.PLAN_CAP))
         for recent, proposed in [(r.DAY_CAP-99, 100), (-1, 100), (0, 0), (0, r.PLAN_CAP+1)]:
@@ -219,6 +230,7 @@ class FakeRunner(r.Runner):
     def catalog(self, plan): return self.cat
     def plan(self, pid): return self.p
     def pick(self, lookahead=False): return self.picks.pop(0) if self.picks else None
+    def stream_order(self): return sorted(self.windows)
     def await_dry(self, pid): return self.p
     def master(self, enabled, emergency=False):
         self.events.append('ON' if enabled else 'OFF')
