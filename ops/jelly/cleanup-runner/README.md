@@ -44,7 +44,7 @@ The runner:
   deploy identity after that report. With no saved plan, reads the latest existing
   account-47/connection-13 plan report for this runtime check. Missing reports
   cannot confirm OFF. OFF and ON retry idempotent reads (deploy status/list,
-  live identity, env, plan, and read-only queries) with at most 120 seconds of
+  live identity, env, plan, and read-only queries) with at most 905 seconds (about 15 minutes) of
   added backoff per read, in addition to existing I/O timeouts. Exhausted reads,
   failed/canceled/timed-out deploys, concurrent deploys, or a runtime master mismatch trigger loud stderr + owner email alerts
   and retries forever with 15-second exponential backoff capped at five minutes.

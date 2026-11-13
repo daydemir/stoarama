@@ -1077,12 +1077,12 @@ class RenderOffTests(unittest.TestCase):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as root:
                 job = FakeRunner(root)
                 self.make_render(job)
-                remaining = self.inject_reads(job, target, [TimeoutError('private')] * 7)
+                remaining = self.inject_reads(job, target, [TimeoutError('private')] * len(r.READ_RETRY_DELAYS))
                 with patch.object(r.time, 'sleep') as sleep, \
                         patch.object(r.sys, 'stderr', new=io.StringIO()):
                     r.Runner.master(job, False)
                 self.assertEqual(remaining, [])
-                self.assertEqual([c.args[0] for c in sleep.call_args_list], [5, 10, 20, 30, 30, 25, 15])
+                self.assertEqual([c.args[0] for c in sleep.call_args_list], [delay for delay in r.READ_RETRY_DELAYS if delay is not None] + [15])
                 self.assertEqual(job.events, ['notify'])
                 self.assertEqual(self.created, ['off-0'])
                 self.assertEqual([c[1] for c in self.calls if c[0] == 'POST' and c[1].endswith('/cancel')], ['/deploys/on/cancel'])
@@ -1094,7 +1094,7 @@ class RenderOffTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             job = FakeRunner(root)
             self.make_render(job)
-            self.inject_reads(job, 'status', [TimeoutError('fake-sensitive')] * 14)
+            self.inject_reads(job, 'status', [TimeoutError('fake-sensitive')] * (2 * len(r.READ_RETRY_DELAYS)))
             def sleep(delay):
                 if job.events.count('notify') == 2:
                     raise EndTest
@@ -1109,7 +1109,7 @@ class RenderOffTests(unittest.TestCase):
             self.assertNotEqual(job.status.get('phase'), 'master_false')
             self.assertEqual([c[1] for c in self.calls if c[0] == 'POST' and c[1].endswith('/cancel')], ['/deploys/on/cancel'])
             rows = [json.loads(line) for line in (Path(root) / 'runner.jsonl').read_text().splitlines()]
-            self.assertEqual(len(rows), 14)
+            self.assertEqual(len(rows), 2 * len(r.READ_RETRY_DELAYS))
             self.assertTrue(all(row['step'] == 'OFF deploy status GET' for row in rows))
             self.assertNotIn('fake-sensitive', stderr.getvalue() + json.dumps(rows))
 
@@ -1166,14 +1166,14 @@ class RenderOffTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             job = FakeRunner(root)
             self.make_render(job, enabled=True)
-            self.inject_reads(job, 'status', [TimeoutError('fake-sensitive')] * 7, enabled=True)
+            self.inject_reads(job, 'status', [TimeoutError('fake-sensitive')] * len(r.READ_RETRY_DELAYS), enabled=True)
             with patch.object(r.time, 'sleep') as sleep, \
                     patch.object(r.sys, 'stderr', new=io.StringIO()) as stderr:
                 with self.assertRaises(TimeoutError):
                     r.Runner.master(job, True)
-            self.assertEqual(sum(c.args[0] for c in sleep.call_args_list), 120)
+            self.assertEqual(sum(c.args[0] for c in sleep.call_args_list), sum(delay for delay in r.READ_RETRY_DELAYS if delay is not None))
             self.assertEqual(len(self.created), 1)
-            self.assertEqual(stderr.getvalue().count('STEP FAILED: ON deploy status GET'), 7)
+            self.assertEqual(stderr.getvalue().count('STEP FAILED: ON deploy status GET'), len(r.READ_RETRY_DELAYS))
             self.assertNotIn('fake-sensitive', stderr.getvalue() + (Path(root) / 'runner.jsonl').read_text())
 
     def test_off_email_and_retry_survive_broken_stderr(self):
@@ -1374,6 +1374,29 @@ class ReadRetryTests(unittest.TestCase):
             self.assertIn('plan report GET', (Path(root) / 'runner.jsonl').read_text())
             self.assertIsNone(job.status['last_error'])
 
+    def test_ten_minute_api_outage_recovers_without_latching(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = self.job(root)
+            plan, _ = fixture()
+            elapsed = 0
+            def request(*args, **kwargs):
+                if elapsed < 600:
+                    raise r.ReadFailure('HTTP request failed (GET)')
+                return plan
+            def sleep(delay):
+                nonlocal elapsed
+                elapsed += delay
+            with patch.dict(os.environ, SERVICE_TOKEN='fixture'), \
+                    patch.object(r, 'request', side_effect=request) as get, \
+                    patch.object(r.time, 'sleep', side_effect=sleep), \
+                    patch.object(r.sys, 'stderr', new=io.StringIO()):
+                self.assertEqual(job.plan(42), plan)
+            self.assertGreaterEqual(elapsed, 600)
+            self.assertLessEqual(elapsed, sum(delay for delay in r.READ_RETRY_DELAYS if delay is not None))
+            self.assertLessEqual(get.call_count, len(r.READ_RETRY_DELAYS))
+            self.assertIsNone(job.status['last_error'])
+            self.assertFalse((Path(root) / 'STOP').exists())
+
     def test_live_deploy_get_retries_without_latching(self):
         with tempfile.TemporaryDirectory() as root:
             job = self.job(root)
@@ -1435,8 +1458,8 @@ class ReadRetryTests(unittest.TestCase):
                     patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
                 with self.assertRaisesRegex(r.Halt, 'progress query: psql process timeout'):
                     job.read('outer', lambda: job.query('SELECT 1','progress query'))
-            self.assertEqual(run.call_count, 7)
-            self.assertEqual([c.args[0] for c in sleep.call_args_list], [5,10,20,30,30,25])
+            self.assertEqual(run.call_count, len(r.READ_RETRY_DELAYS))
+            self.assertEqual([c.args[0] for c in sleep.call_args_list], [delay for delay in r.READ_RETRY_DELAYS if delay is not None])
 
     def test_http_reads_retry_transient_status_and_timeout_without_replaying_writes(self):
         for method in ('GET','POST','PUT'):
@@ -1606,8 +1629,8 @@ class RecoveryRetryTests(unittest.TestCase):
             with patch.object(r.subprocess,'run',return_value=failed) as run, \
                     patch.object(r.time,'sleep') as sleep,patch.object(r.sys,'stderr',new=io.StringIO()):
                 job.fail('original failure')
-            self.assertEqual(run.call_count,7)
-            self.assertEqual(sum(c.args[0] for c in sleep.call_args_list),120)
+            self.assertEqual(run.call_count,len(r.READ_RETRY_DELAYS))
+            self.assertEqual(sum(c.args[0] for c in sleep.call_args_list),sum(delay for delay in r.READ_RETRY_DELAYS if delay is not None))
             self.assertEqual(job.status['last_error'],'original failure')
             self.assertEqual(job.status['recovery_error'],'recovery verification: recovery CLI read failed')
             self.assertTrue(job.status['shutdown_or_recovery_failed'])

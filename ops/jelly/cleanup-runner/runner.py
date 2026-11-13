@@ -284,6 +284,7 @@ def request(url, token, method='GET', body=None):
         raise Halt('HTTP request failed (' + method + ')') from None
 
 
+READ_RETRY_DELAYS = (5, 10, 20, 30, 60, 60, 120, 120, 120, 120, 120, 120, None)  # 905 s
 COMMAND_TIMEOUT_SEC = 360
 PREPARE_TIMEOUT_SEC = 1800  # keep28 preparation on large streams exceeds six minutes
 COMMAND_FAILURE_LOG = Path.home() / 'stoarama-cleanup-runner' / 'command-failures.log'
@@ -471,10 +472,12 @@ class Runner:
             pass  # Diagnostics must never block shutdown, even before initialize().
 
     def read(self, step, action):
-        # Retry transient reads only, with two minutes of added backoff. Exhaustion
-        # becomes a terminal Halt so enclosing OFF/ON reads cannot multiply retries.
-        # Every I/O retains its own timeout; mutations are never replayed.
-        for delay in (5, 10, 20, 30, 30, 25, None):
+        # Retry transient reads only, with ~15 minutes of added backoff (Render API
+        # restarts can exceed two minutes; while the API is down the NAS gets no
+        # permits either). Exhaustion becomes a terminal Halt so enclosing OFF/ON
+        # reads cannot multiply retries. Every I/O keeps its own timeout; mutations
+        # are never replayed.
+        for delay in READ_RETRY_DELAYS:
             try:
                 return action()
             except Exception as exc:
