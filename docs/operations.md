@@ -140,8 +140,12 @@ a future copy/verify queue. ACKs are not fresh verified copies. `--import` only
 adds or enriches holds under admission/public locks; it cannot release them.
 
 `r2-retire plan --class owner_r2_delivery_only --head-guard-compatible ...`
-enumerates the whole bucket and reports now/later/copy/blocked. The class is
-**planning-only**. Outside-window objects without NAS presence evidence qualify
+enumerates the whole bucket and reports now/later/copy/blocked. With migration
+0191, the class can execute only a fresh, non-preview `now`
+manifest carrying `head_guard_compatible=true`, and apply requires
+`--provider-unconditional-delete-with-head-guard` plus the owner credential-risk
+acknowledgment. Other phases and old previews remain unexecutable.
+Outside-window objects without NAS presence evidence qualify
 now; any inventory, listing (including partial generations/aliases), ACK or raw
 delivery evidence waits for NAS cleanup under the owner rules. Verified cleanup
 receipts supersede delivery evidence under the existing recovery-hold rules;
@@ -157,6 +161,28 @@ registry under the common fences before and after HEAD, and refuses v7/unchecked
 manifests. `--delivery-keep-preview FILE --expected-delivery-keep-sha256 SHA`
 allows a read-only pre-migration preview; these manifests are unexecutable.
 Large classification files are written directly as gzip with exact file digests.
+
+Migration `0191_delivery_only_r2_apply.sql` admits only the delivery-only
+reservation class and preserves generic recovery holds; it does not inherit the
+outside-only owner's hold-release/source-purge exception. It also requires
+indexed broad NAS path/content vetoes. Before executable planning, precreate
+the exact indexes outside the migration transaction:
+
+```sql
+CREATE INDEX CONCURRENTLY nas_inventory_r2_owner_path
+ ON nas_inventory_files(relative_path) WHERE state<>'missing';
+CREATE INDEX CONCURRENTLY nas_inventory_r2_owner_content
+ ON nas_inventory_files(sha256,size_bytes) WHERE state<>'missing';
+```
+
+The migration never creates these indexes. Executable planning/apply refuses
+missing or incompatible indexes before catalog enumeration. Planning
+reads inventory/catalog evidence in primary-key pages; delivery-only apply
+rechecks evidence per object under the fences without enumerating inventory.
+The writer drain, multipart-zero inventory, provider proof, minimum age, fresh
+HEAD identity, 5 TB/24h budget and durable ledger remain required. A separately
+authorized writer-fence deadline override is an operator action; this tooling
+does not change or deactivate that fence.
 
 No delivery-hold release operation ships here. Eventual R2 removal requires a
 separately reviewed command/migration proving verified NAS copies, completed

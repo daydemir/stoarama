@@ -329,12 +329,13 @@ CREATE TABLE connections(id bigint PRIMARY KEY, account_id bigint NOT NULL, kind
 CREATE TABLE streams(id bigint PRIMARY KEY, local_timezone text);
 CREATE TABLE recordings(id bigint PRIMARY KEY, account_id bigint NOT NULL, stream_id bigint, cron_timezone text NOT NULL);
 CREATE TABLE recording_clips(id bigint PRIMARY KEY, recording_id bigint NOT NULL, recording_job_id bigint, bucket text, object_key text, size_bytes bigint,
-  sha256 text, display_path text, clip_start_at timestamptz, clip_end_at timestamptz, created_at timestamptz NOT NULL, purged_at timestamptz);
+  sha256 text, display_path text, clip_start_at timestamptz, clip_end_at timestamptz, created_at timestamptz NOT NULL, purged_at timestamptz, UNIQUE(bucket,object_key));
 CREATE TABLE recording_collation_hours(id bigint PRIMARY KEY, recording_id bigint NOT NULL, manifest jsonb NOT NULL DEFAULT '{}');
 CREATE TABLE recording_collation_outputs(id bigint PRIMARY KEY, collation_hour_id bigint NOT NULL REFERENCES recording_collation_hours(id), object_key text,
   nas_relative_path text, size_bytes bigint, sha256 text, start_at timestamptz, end_at timestamptz, source_clip_ids bigint[], created_at timestamptz NOT NULL);
 CREATE TABLE recording_collation_output_acks(output_id bigint NOT NULL REFERENCES recording_collation_outputs(id), connection_id bigint NOT NULL);
-CREATE TABLE nas_inventory_files(connection_id bigint NOT NULL, clip_id bigint NOT NULL, relative_path text, state text NOT NULL); -- no FK, as in production
+CREATE TABLE nas_inventory_files(connection_id bigint NOT NULL, clip_id bigint NOT NULL, relative_path text, state text NOT NULL, PRIMARY KEY(connection_id,clip_id)); -- no FK, as in production
+CREATE INDEX r2_test_inventory_clip ON nas_inventory_files(clip_id);
 CREATE TABLE nas_inventory_unmatched_files(connection_id bigint NOT NULL, relative_path text NOT NULL, state text NOT NULL);
 CREATE TABLE nas_restore_requests(id bigserial PRIMARY KEY, clip_id bigint NOT NULL, state text NOT NULL);
 CREATE TABLE recording_joined_source_snapshots(id bigserial PRIMARY KEY, clip_id bigint NOT NULL);
@@ -1550,7 +1551,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		}
 		before := len(store.deleted)
 		for _, class := range []r2RetireClass{"", r2RetireOwnerAccepted, r2RetireDeliveryOnly} {
-			h := r2RetireHeader{DeliveryKeepSHA256: r2tSHA, Version: r2RetireManifestVersion, Class: class, NASBacked: true, Reason: r2RetireReason, Bucket: "stoarama", Choices: map[string]string{"3": "none"}, Items: 1, Bytes: 100}
+			h := r2RetireHeader{HeadGuardCompatible: true, Phase: r2RetireNow, DeliveryKeepSHA256: r2tSHA, Version: r2RetireManifestVersion, Class: class, NASBacked: true, Reason: r2RetireReason, Bucket: "stoarama", Choices: map[string]string{"3": "none"}, Items: 1, Bytes: 100}
 			c := r2tCandidate("raw", 3, "Asia/Tokyo", outside, outside.Add(time.Minute))
 			c.ObjectKey = key
 			c.ETag = "e"
@@ -1565,10 +1566,13 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			}
 			attempt := opts
 			attempt.Delivery = r2tDelivery()
+			attempt.ProviderUnconditionalHeadGuard = true
+			attempt.MinObjectAge = 7 * 24 * time.Hour
+			attempt.AcceptOperatorCredentialRisk = "Deniz 2026-11-12: Accept our own keys (Recommended)"
 			attempt.ManifestPath = path
 			attempt.ExpectedSHA = digest
-			if _, err := r2RetireApply(ctx, pool, store, attempt, r2tPolicy, windows); err == nil {
-				t.Fatal("held/disabled class applied", class)
+			if _, err := r2RetireApply(ctx, pool, store, attempt, r2tPolicy, windows); err == nil || !strings.Contains(err.Error(), "DELIVERY KEEP HOLD") {
+				t.Fatal("delivery hold did not veto at apply", class, err)
 			}
 		}
 		if len(store.deleted) != before {
@@ -1579,6 +1583,153 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		}
 		if _, err := pool.Exec(ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256) VALUES('raw',9999999,3,'stoarama',$1,100,$2,'outside_keep28_no_nas_copy','none',$2,$2)`, key, r2tSHA); err == nil {
 			t.Fatal("legacy retirement bypassed durable hold")
+		}
+	})
+
+	t.Run("DeliveryOnlyHeadGuardApply", func(t *testing.T) {
+		migration, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), "0191_delivery_only_r2_apply.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		exec(string(migration))
+		if err := r2RetireRequireDeliveryApplySchema(ctx, pool); err == nil || !strings.Contains(err.Error(), "CONCURRENTLY") {
+			t.Fatal("missing indexes accepted", err)
+		}
+		exec(`CREATE INDEX nas_inventory_r2_owner_path ON nas_inventory_files(relative_path DESC) WHERE state<>'missing';
+   CREATE INDEX nas_inventory_r2_owner_content ON nas_inventory_files(sha256,size_bytes) WHERE state<>'missing'`)
+		if err := r2RetireRequireDeliveryApplySchema(ctx, pool); err == nil {
+			t.Fatal("wrong precreated index accepted")
+		}
+		exec(`DROP INDEX nas_inventory_r2_owner_path;
+   CREATE INDEX nas_inventory_r2_owner_path ON nas_inventory_files(relative_path) WHERE state<>'missing'`)
+		if err := r2RetireRequireDeliveryApplySchema(ctx, pool); err != nil {
+			t.Fatal(err)
+		}
+
+		writePicks("none")
+		picks, err := loadR2RetirePicks(picksPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := clip(810, 30, outside)
+		scope := r2RetireScope{Class: r2RetireDeliveryOnly, AccountID: 47, ConnectionID: 13, Bucket: "stoarama", Grace: 7 * 24 * time.Hour, HasRetirements: true, NASBacked: true}
+		live := map[string]r2.ObjectInfo{}
+		for key, n := range store.objects {
+			live[key] = r2.ObjectInfo{Key: key, SizeBytes: n, ETag: "e"}
+		}
+		plan := r2RetirePlanOptions{Delivery: r2tDelivery(), HeadGuardCompatible: true, Scope: scope, Picks: picks, PageSize: 500, Now: time.Now(), LiveObjects: live}
+		// Explain the actual planning queries with index selection enabled even
+		// for this tiny fixture; every protected-table access must have an index path.
+		planTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer planTx.Rollback(ctx)
+		if _, err := planTx.Exec(ctx, `SET LOCAL enable_seqscan=off; SET LOCAL jit=off; SET LOCAL statement_timeout='30s'`); err != nil {
+			t.Fatal(err)
+		}
+		audit := &r2RetireIndexedQueryAudit{r2RetireQuerier: planTx, t: t}
+		summary, items, err := r2RetirePlanRun(ctx, audit, plan, r2tPolicy, windows)
+		planTx.Rollback(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if summary.Header.PreviewOnly || !summary.Header.HeadGuardCompatible || summary.Header.Phase != r2RetireNow {
+			t.Fatal("fresh durable plan is not executable", summary.Header)
+		}
+		var selected r2RetireItem
+		for _, it := range items {
+			if it.ObjectKey == key {
+				selected = it
+			}
+		}
+		if selected.SourceID != 810 {
+			t.Fatal("unheld raw object missing from now plan")
+		}
+		for _, preview := range []r2RetirePlanOptions{
+			{Delivery: r2tDelivery(), DeliveryPreview: true, HeadGuardCompatible: true, Scope: scope, Picks: picks, PageSize: 500, Now: time.Now(), LiveObjects: live},
+			{Delivery: r2tDelivery(), Scope: scope, Picks: picks, PageSize: 500, Now: time.Now(), LiveObjects: live},
+		} {
+			sum, _, err := r2RetirePlanRun(ctx, pool, preview, r2tPolicy, windows)
+			if err != nil || !sum.Header.PreviewOnly {
+				t.Fatal("preview authority escaped", err)
+			}
+		}
+		h := summary.Header
+		h.Items, h.Bytes = 1, selected.SizeBytes
+		applyItem := func(item r2RetireItem, header r2RetireHeader, guard bool) (r2RetireApplySummary, error) {
+			t.Helper()
+			o := opts
+			o.ManifestPath = filepath.Join(t.TempDir(), "manifest.jsonl")
+			o.ExpectedSHA, err = writeR2RetireManifest(o.ManifestPath, header, []r2RetireItem{item})
+			if err != nil {
+				t.Fatal(err)
+			}
+			o.LedgerPath = filepath.Join(t.TempDir(), "ledger.jsonl")
+			o.ProviderUnconditionalHeadGuard = guard
+			o.MinObjectAge = 7 * 24 * time.Hour
+			o.MaxBytes, o.Budget24h = 5e12, 5e12
+			if guard {
+				o.AcceptOperatorCredentialRisk = "Deniz 2026-11-12: Accept our own keys (Recommended)"
+			}
+			writeGuardProofs(t, &o, header)
+			result, err := r2RetireApply(ctx, pool, store, o, r2tPolicy, windows)
+			return result, err
+		}
+		if _, err := applyItem(selected, h, false); err == nil || !strings.Contains(err.Error(), "requires HEAD-guard mode") {
+			t.Fatal(err)
+		}
+		exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama','` + r2tSHA + `');
+   SET session_replication_role=replica; UPDATE r2_retirement_writer_fences SET drain_not_before=now()-interval '1 second'; RESET session_replication_role`)
+		defer exec(`DELETE FROM r2_retirement_writer_fences`)
+		before := store.onceCalls
+		// Inject an all-stream object with forged "none" header/item choices.
+		sets, err := loadR2RetireSets(ctx, pool, r2tSHA, true, r2RetireDeliveryOnly)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := r2RetireLoadOne(ctx, pool, "raw", 104, scope, sets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.ETag = "e"
+		injected := r2RetireItem{r2RetireCandidate: c, Choice: "none", Reason: r2RetireReason}
+		allHeader := h
+		allHeader.Bytes = c.SizeBytes
+		allHeader.Choices = map[string]string{"4": "none"}
+		if _, err := applyItem(injected, allHeader, true); err == nil || !strings.Contains(err.Error(), "pick changed") {
+			t.Fatal("all stream accepted", err)
+		}
+		allHeader.Choices["4"] = "all"
+		injected.Choice = "all"
+		if _, err := applyItem(injected, allHeader, true); err == nil {
+			t.Fatal("explicit all choice accepted")
+		}
+		// 705's retired receipt is owner-class-only. Delivery-only must retain
+		// the generic recovery hold at planning, reservation and live apply.
+		held, err := r2RetireLoadOne(ctx, pool, "raw", 705, scope, sets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held.Facts.Retired = false
+		if !held.Facts.Held {
+			t.Fatal("owner-only receipt released delivery recovery hold")
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class)
+   VALUES('raw',705,'stoarama','managed/held-class-test',1,$1,$1,'owner_r2_delivery_only')`, r2tSHA); err == nil || !strings.Contains(err.Error(), "retention protected") {
+			t.Fatal("SQL recovery hold weakened", err)
+		}
+		if store.onceCalls != before {
+			t.Fatal("veto issued DELETE")
+		}
+		result, err := applyItem(selected, h, true)
+		if err != nil || result.Retired != 1 || result.RetiredBytes != selected.SizeBytes || store.onceCalls != before+1 {
+			t.Fatalf("delivery apply %+v %v", result, err)
+		}
+		var class string
+		var purged bool
+		if err := pool.QueryRow(ctx, `SELECT x.retirement_class,c.purged_at IS NOT NULL FROM r2_retirement_reservations x JOIN recording_clips c ON c.id=x.source_id WHERE x.kind='raw' AND x.source_id=810`).Scan(&class, &purged); err != nil || class != string(r2RetireDeliveryOnly) || !purged {
+			t.Fatal(class, purged, err)
 		}
 	})
 

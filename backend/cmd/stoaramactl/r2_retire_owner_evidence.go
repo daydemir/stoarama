@@ -13,32 +13,51 @@ import (
 const r2OwnerRawDeliveryTimeSQL = `greatest(c.released_at,c.created_at,
  CASE WHEN c.id<=n.last_cursor_id THEN coalesce(n.nas_listing_cursor_at,'9999-12-31'::timestamptz) END)`
 
-const r2OwnerDeliveriesSQL = `
- SELECT 'raw'::text kind,c.id,` + r2OwnerRawDeliveryTimeSQL + ` delivered_at
- FROM recording_clips c JOIN recordings r ON r.id=c.recording_id
- JOIN connections n ON n.id=13 AND n.account_id=r.account_id
- WHERE r.account_id=47 AND (c.released_at IS NOT NULL OR c.id<=n.last_cursor_id)
- UNION ALL
- SELECT 'collated',a.output_id,max(a.verified_at)
- FROM recording_collation_output_acks a WHERE a.connection_id=13 GROUP BY a.output_id`
-
 func (e *r2RetireEvidence) loadOwnerDeliveries(ctx context.Context, q r2RetireQuerier) error {
 	e.Delivered = map[string]time.Time{}
-	rows, err := q.Query(ctx, r2OwnerDeliveriesSQL)
+	var after int64
+	for {
+		rows, err := q.Query(ctx, `SELECT c.id,CASE WHEN r.account_id=47 AND (c.released_at IS NOT NULL OR c.id<=n.last_cursor_id) THEN `+r2OwnerRawDeliveryTimeSQL+` END
+ FROM (SELECT id,recording_id,released_at,created_at FROM recording_clips WHERE id>$1 ORDER BY id LIMIT 5000) c
+ LEFT JOIN recordings r ON r.id=c.recording_id LEFT JOIN connections n ON n.id=13 AND n.account_id=r.account_id ORDER BY c.id`, after)
+		if err != nil {
+			return err
+		}
+		count := 0
+		for rows.Next() {
+			var at *time.Time
+			if err := rows.Scan(&after, &at); err != nil {
+				rows.Close()
+				return err
+			}
+			if at != nil {
+				e.Delivered[retireIdentity("raw", after)] = *at
+			}
+			count++
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if count < r2RetireEvidencePageSize {
+			break
+		}
+	}
+	rows, err := q.Query(ctx, `SELECT output_id,max(verified_at) FROM recording_collation_output_acks WHERE connection_id=13 GROUP BY output_id`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var kind string
 		var id int64
 		var at time.Time
-		if err := rows.Scan(&kind, &id, &at); err != nil {
+		if err := rows.Scan(&id, &at); err != nil {
 			return err
 		}
-		e.Delivered[retireIdentity(kind, id)] = at
+		e.Delivered[retireIdentity("collated", id)] = at
 	}
 	return rows.Err()
+
 }
 
 func (e *r2RetireEvidence) applyOwner(c *r2RetireCandidate) {

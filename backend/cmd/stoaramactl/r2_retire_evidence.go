@@ -29,18 +29,23 @@ type r2RetireEvidence struct {
 }
 
 func retireIdentity(kind string, id int64) string { return fmt.Sprintf("%s:%d", kind, id) }
-func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier, class r2RetireClass) (*r2RetireEvidence, error) {
+func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier, class r2RetireClass, liveOnly bool) (*r2RetireEvidence, error) {
 	e := &r2RetireEvidence{RawPaths: map[int64]string{}, MismatchRaw: map[int64]bool{}, MismatchPaths: map[r2RetireNASIdentity]bool{}, ObservedRaw: map[int64]time.Time{}, ObservedPaths: map[string]time.Time{}, ForeignRaw: map[int64]bool{}, Paths: map[string]bool{}, OwnerPaths: map[string]bool{}, Receipts: map[string]time.Time{}}
 	if err := q.QueryRow(ctx, `SELECT to_regclass('nas_listing_generations') IS NOT NULL,to_regclass('nas_cleanup_r2_effective_releases') IS NOT NULL,to_regclass('nas_delivery_retirement_fences') IS NOT NULL`).Scan(&e.ListingSchema, &e.ReleaseSchema, &e.FenceSchema); err != nil {
 		return nil, err
 	}
 	e.ReceiptView = "nas_cleanup_r2_effective_releases"
+	if liveOnly {
+		// Delivery apply recomputes inventory, listing, receipt and delivery
+		// vetoes with indexed per-object queries under the shared fences.
+		return e, nil
+	}
 	if class.owner() {
 		var ownerSchema bool
 		if err := q.QueryRow(ctx, `SELECT to_regclass('nas_cleanup_owner_effective_releases') IS NOT NULL`).Scan(&ownerSchema); err != nil {
 			return nil, err
 		}
-		if ownerSchema {
+		if ownerSchema && class == r2RetireOwnerAccepted {
 			e.ReceiptView = "nas_cleanup_owner_effective_releases"
 		}
 		if err := e.loadOwnerDeliveries(ctx, q); err != nil {
@@ -73,41 +78,34 @@ func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier, class r2Retire
 	if !e.ListingSchema && !e.ReleaseSchema {
 		return e, nil
 	}
-	rows, err := q.Query(ctx, `SELECT clip_id,relative_path,coalesce(server_received_at,'9999-12-31'::timestamptz),connection_id,state FROM nas_inventory_files`)
+	var id, cid int64
+	var path, state string
+	var at time.Time
+	err := r2RetireInventoryEach(ctx, q, `n.clip_id,n.relative_path,coalesce(n.server_received_at,'9999-12-31'::timestamptz),n.connection_id,n.state`, "true", nil,
+		[]any{&id, &path, &at, &cid, &state}, func() error {
+			if cid == 13 {
+				e.RawPaths[id] = path
+			}
+			if state == "missing" {
+				return nil
+			}
+			if cid != 13 {
+				e.ForeignRaw[id] = true
+				return nil
+			}
+			if at.After(e.ObservedRaw[id]) {
+				e.ObservedRaw[id] = at
+			}
+			if at.After(e.ObservedPaths[path]) {
+				e.ObservedPaths[path] = at
+			}
+			return nil
+		})
 	if err != nil {
 		return nil, err
 	}
-	for rows.Next() {
-		var id, cid int64
-		var p string
-		var at time.Time
-		var state string
-		if err := rows.Scan(&id, &p, &at, &cid, &state); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if cid == 13 {
-			e.RawPaths[id] = p
-		}
-		if state == "missing" {
-			continue
-		}
-		if cid != 13 {
-			e.ForeignRaw[id] = true
-			continue
-		}
-		if at.After(e.ObservedRaw[id]) {
-			e.ObservedRaw[id] = at
-		}
-		if at.After(e.ObservedPaths[p]) {
-			e.ObservedPaths[p] = at
-		}
-	}
-	rows.Close()
-	if rows.Err() != nil {
-		return nil, rows.Err()
-	}
-	rows, err = q.Query(ctx, `SELECT relative_path,coalesce(server_received_at,'9999-12-31'::timestamptz) FROM nas_inventory_unmatched_files WHERE connection_id=13 AND state<>'missing'`)
+
+	rows, err := q.Query(ctx, `SELECT relative_path,coalesce(server_received_at,'9999-12-31'::timestamptz) FROM nas_inventory_unmatched_files WHERE connection_id=13 AND state<>'missing'`)
 	if err != nil {
 		return nil, err
 	}
@@ -183,31 +181,25 @@ func loadR2RetireEvidence(ctx context.Context, q r2RetireQuerier, class r2Retire
 		// Only the outside-only class can skip physical NAS mismatch evidence.
 		// Delivery-only also admits kept footage, so it must run the exact
 		// inventory/listing identity check below before classifying it.
-		return e, loadR2FenceEvidence(ctx, q, e)
+		return e, loadR2FenceEvidence(ctx, q, e, class == r2RetireDeliveryOnly)
 	}
-	rows, err = q.Query(ctx, `SELECT n.clip_id,n.relative_path,n.sha256,n.size_bytes FROM nas_inventory_files n WHERE n.connection_id=13 AND n.state='present' AND n.verified_at>now()-interval '24 hours' AND n.server_received_at>now()-interval '24 hours' AND EXISTS(SELECT 1 FROM nas_listing_files f JOIN nas_listing_generations g USING(connection_id,generation) WHERE f.connection_id=13 AND f.relative_path=n.relative_path AND g.started_at>=$1 AND ROW(f.size_bytes,f.mtime_ns,f.ctime_ns,f.inode,f.device) IS DISTINCT FROM ROW(n.size_bytes,n.file_mtime_ns,n.file_ctime_ns,n.file_inode,n.file_device))`, e.Start)
+	var identity r2RetireNASIdentity
+	err = r2RetireInventoryEach(ctx, q, `n.clip_id,n.relative_path,n.sha256,n.size_bytes`,
+		`n.connection_id=13 AND n.state='present' AND n.verified_at>now()-interval '24 hours' AND n.server_received_at>now()-interval '24 hours' AND EXISTS(SELECT 1 FROM nas_listing_files f JOIN nas_listing_generations g USING(connection_id,generation) WHERE f.connection_id=13 AND f.relative_path=n.relative_path AND g.started_at>=$1 AND ROW(f.size_bytes,f.mtime_ns,f.ctime_ns,f.inode,f.device) IS DISTINCT FROM ROW(n.size_bytes,n.file_mtime_ns,n.file_ctime_ns,n.file_inode,n.file_device))`, []any{e.Start},
+		[]any{&id, &identity.Path, &identity.SHA256, &identity.SizeBytes}, func() error {
+			e.MismatchRaw[id] = true
+			e.MismatchPaths[identity] = true
+			return nil
+		})
 	if err != nil {
 		return nil, err
 	}
-	for rows.Next() {
-		var id int64
-		var identity r2RetireNASIdentity
-		if err := rows.Scan(&id, &identity.Path, &identity.SHA256, &identity.SizeBytes); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		e.MismatchRaw[id] = true
-		e.MismatchPaths[identity] = true
-	}
-	rows.Close()
-	if rows.Err() != nil {
-		return nil, rows.Err()
-	}
+
 	if e.Start.IsZero() {
 		return e, nil
 	}
 
-	if err := loadR2FenceEvidence(ctx, q, e); err != nil {
+	if err := loadR2FenceEvidence(ctx, q, e, class == r2RetireDeliveryOnly); err != nil {
 		return nil, err
 	}
 	return e, nil

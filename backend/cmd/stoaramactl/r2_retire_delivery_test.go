@@ -105,3 +105,43 @@ func TestR2RetireDeliveryClassCannotReleaseHolds(t *testing.T) {
 		t.Fatal("planning-only class applied hold releases")
 	}
 }
+
+func TestR2RetireDeliveryManifestAuthority(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		class          r2RetireClass
+		preview, guard bool
+		phase          r2RetirePhase
+		valid          bool
+	}{
+		{"pre-change delivery preview", r2RetireDeliveryOnly, true, false, "", false},
+		{"preview with new markers", r2RetireDeliveryOnly, true, true, r2RetireNow, false},
+		{"unmarked delivery", r2RetireDeliveryOnly, false, false, r2RetireNow, false},
+		{"missing now phase", r2RetireDeliveryOnly, false, true, "", false},
+		{"copy", r2RetireDeliveryOnly, false, true, r2RetireCopy, false},
+		{"later", r2RetireDeliveryOnly, false, true, r2RetireLater, false},
+		{"blocked", r2RetireDeliveryOnly, false, true, r2RetireBlocked, false},
+		{"fresh delivery now", r2RetireDeliveryOnly, false, true, r2RetireNow, true},
+		{"v7 class unchanged", r2RetireOwnerAccepted, false, false, "", true},
+		{"legacy class unchanged", "", false, false, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := r2RetireHeader{Class: tc.class, NASBacked: true, Version: r2RetireManifestVersion, DeliveryKeepSHA256: r2tSHA, Reason: r2RetireReason, PreviewOnly: tc.preview, HeadGuardCompatible: tc.guard, Phase: tc.phase}
+			path := filepath.Join(t.TempDir(), "manifest.jsonl")
+			digest, err := writeR2RetireManifest(path, h, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, _, err := readR2RetireManifest(path); (err == nil) != tc.valid {
+				t.Fatalf("valid=%t error=%v", tc.valid, err)
+			}
+			if !tc.valid {
+				// Invalid authority must stop at manifest parsing, before a DB is needed.
+				_, err := r2RetireApply(context.Background(), nil, nil, r2RetireApplyOptions{ManifestPath: path, ExpectedSHA: digest, MaxBytes: 1, Budget24h: 1}, r2tPolicy, nil)
+				if err == nil {
+					t.Fatal("preview/phase applied")
+				}
+			}
+		})
+	}
+}

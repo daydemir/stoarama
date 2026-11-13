@@ -55,27 +55,28 @@ const (
 )
 
 type r2RetireHeader struct {
-	DeliveryKeepSHA256 string            `json:"delivery_keep_sha256"`
-	PreviewOnly        bool              `json:"preview_only,omitempty"`
-	Class              r2RetireClass     `json:"retirement_class,omitempty"`
-	R2ListingSHA256    string            `json:"r2_listing_sha256,omitempty"`
-	NASBacked          bool              `json:"nas_backed,omitempty"`
-	Phase              r2RetirePhase     `json:"phase,omitempty"`
-	Version            int               `json:"version"`
-	Tool               string            `json:"tool"`
-	Reason             string            `json:"reason"`
-	CreatedAt          time.Time         `json:"created_at"`
-	PolicySHA256       string            `json:"policy_sha256"`
-	PicksPath          string            `json:"picks_path"`
-	PicksSHA256        string            `json:"picks_sha256"`
-	PicksSavedAt       string            `json:"picks_saved_at"`
-	Choices            map[string]string `json:"choices"`
-	Bucket             string            `json:"bucket"`
-	AccountID          int64             `json:"account_id"`
-	ConnectionID       int64             `json:"connection_id"`
-	GraceSeconds       int64             `json:"grace_seconds"`
-	Items              int64             `json:"items"`
-	Bytes              int64             `json:"bytes"`
+	DeliveryKeepSHA256  string            `json:"delivery_keep_sha256"`
+	HeadGuardCompatible bool              `json:"head_guard_compatible,omitempty"`
+	PreviewOnly         bool              `json:"preview_only,omitempty"`
+	Class               r2RetireClass     `json:"retirement_class,omitempty"`
+	R2ListingSHA256     string            `json:"r2_listing_sha256,omitempty"`
+	NASBacked           bool              `json:"nas_backed,omitempty"`
+	Phase               r2RetirePhase     `json:"phase,omitempty"`
+	Version             int               `json:"version"`
+	Tool                string            `json:"tool"`
+	Reason              string            `json:"reason"`
+	CreatedAt           time.Time         `json:"created_at"`
+	PolicySHA256        string            `json:"policy_sha256"`
+	PicksPath           string            `json:"picks_path"`
+	PicksSHA256         string            `json:"picks_sha256"`
+	PicksSavedAt        string            `json:"picks_saved_at"`
+	Choices             map[string]string `json:"choices"`
+	Bucket              string            `json:"bucket"`
+	AccountID           int64             `json:"account_id"`
+	ConnectionID        int64             `json:"connection_id"`
+	GraceSeconds        int64             `json:"grace_seconds"`
+	Items               int64             `json:"items"`
+	Bytes               int64             `json:"bytes"`
 }
 
 type r2RetireItem struct {
@@ -168,6 +169,11 @@ func r2RetirePlanRun(ctx context.Context, q r2RetireQuerier, opts r2RetirePlanOp
 	}
 	if !opts.DeliveryPreview {
 		if err := api.RequireDeliveryKeep(ctx, q, opts.Delivery); err != nil {
+			return r2RetirePlanSummary{}, nil, err
+		}
+	}
+	if opts.Scope.Class == r2RetireDeliveryOnly && !opts.DeliveryPreview && opts.HeadGuardCompatible {
+		if err := r2RetireRequireDeliveryApplySchema(ctx, q); err != nil {
 			return r2RetirePlanSummary{}, nil, err
 		}
 	}
@@ -306,9 +312,12 @@ func r2RetirePlanRun(ctx context.Context, q r2RetireQuerier, opts r2RetirePlanOp
 			}
 		}
 	}
-	sum.Header = r2RetireHeader{DeliveryKeepSHA256: opts.Delivery.SHA256, PreviewOnly: opts.DeliveryPreview || opts.Scope.Class == r2RetireDeliveryOnly, Class: opts.Scope.Class, NASBacked: opts.Scope.NASBacked, Version: r2RetireManifestVersion, Tool: "stoaramactl r2-retire", Reason: r2RetireReason, CreatedAt: opts.Now.UTC(),
+	sum.Header = r2RetireHeader{DeliveryKeepSHA256: opts.Delivery.SHA256, HeadGuardCompatible: opts.HeadGuardCompatible, PreviewOnly: opts.DeliveryPreview || (opts.Scope.Class == r2RetireDeliveryOnly && !opts.HeadGuardCompatible), Class: opts.Scope.Class, NASBacked: opts.Scope.NASBacked, Version: r2RetireManifestVersion, Tool: "stoaramactl r2-retire", Reason: r2RetireReason, CreatedAt: opts.Now.UTC(),
 		PolicySHA256: policySHA, PicksPath: opts.Picks.Path, PicksSHA256: opts.Picks.SHA256, PicksSavedAt: opts.Picks.SavedAt, Choices: choices,
 		Bucket: opts.Scope.Bucket, AccountID: opts.Scope.AccountID, ConnectionID: opts.Scope.ConnectionID, GraceSeconds: int64(opts.Scope.Grace / time.Second)}
+	if opts.Scope.Class == r2RetireDeliveryOnly {
+		sum.Header.Phase = r2RetireNow
+	}
 	for _, it := range items {
 		sum.Selected.add(it.SizeBytes)
 		k := sum.SelectedByKind[it.Kind]
@@ -455,7 +464,7 @@ func readR2RetireManifest(path string) (r2RetireHeader, []r2RetireItem, string, 
 		return r2RetireHeader{}, nil, digest, errors.New("manifest has no header line")
 	}
 	h := *first.Header
-	if !h.Class.valid() || (h.Class != "" && !h.NASBacked) || h.Version != r2RetireManifestVersion || !r2RetireLowerHex64(h.DeliveryKeepSHA256) || h.PreviewOnly || h.Class == r2RetireDeliveryOnly || h.Reason != r2RetireReason || (h.Phase != "" && h.Phase != r2RetireNow) {
+	if !h.Class.valid() || (h.Class != "" && !h.NASBacked) || h.Version != r2RetireManifestVersion || !r2RetireLowerHex64(h.DeliveryKeepSHA256) || h.PreviewOnly || (h.Class == r2RetireDeliveryOnly && (!h.HeadGuardCompatible || h.Phase != r2RetireNow)) || h.Reason != r2RetireReason || (h.Phase != "" && h.Phase != r2RetireNow) {
 		return h, nil, digest, fmt.Errorf("unsupported manifest version %d / reason %q", h.Version, h.Reason)
 	}
 	items := make([]r2RetireItem, 0, len(lines)-1)
@@ -469,7 +478,7 @@ func readR2RetireManifest(path string) (r2RetireHeader, []r2RetireItem, string, 
 			return h, nil, digest, fmt.Errorf("manifest line %d: %w", n+2, err)
 		}
 		src := it.Kind + ":" + strconv.FormatInt(it.SourceID, 10)
-		if (it.Kind != "raw" && it.Kind != "collated") || it.SourceID <= 0 || (h.Class == r2RetireOwnerAccepted && it.Reason != string(h.Class)) || ((h.Class == "" || h.Class == r2RetireDeliveryOnly) && it.Reason != r2RetireReason && !(h.NASBacked && it.Reason == r2RetireNASReason)) || (h.NASBacked && it.ETag == "") || seenSource[src] || seenKey[it.ObjectKey] ||
+		if (h.Class == r2RetireDeliveryOnly && it.Choice == "all") || (it.Kind != "raw" && it.Kind != "collated") || it.SourceID <= 0 || (h.Class == r2RetireOwnerAccepted && it.Reason != string(h.Class)) || ((h.Class == "" || h.Class == r2RetireDeliveryOnly) && it.Reason != r2RetireReason && !(h.NASBacked && it.Reason == r2RetireNASReason)) || (h.NASBacked && it.ETag == "") || seenSource[src] || seenKey[it.ObjectKey] ||
 			it.Choice != h.Choices[strconv.FormatInt(it.StreamID, 10)] || it.Bucket != h.Bucket || it.SizeBytes <= 0 {
 			return h, nil, digest, fmt.Errorf("manifest line %d: invalid or duplicate item", n+2)
 		}
@@ -688,6 +697,9 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 	if err != nil {
 		return sum, err
 	}
+	if h.Class == r2RetireDeliveryOnly && !opts.ProviderUnconditionalHeadGuard {
+		return sum, errors.New("owner_r2_delivery_only requires HEAD-guard mode")
+	}
 	if opts.Delivery.SHA256 != h.DeliveryKeepSHA256 {
 		return sum, errors.New("delivery policy changed or unchecked; re-plan")
 	}
@@ -696,6 +708,11 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 	}
 	for _, it := range items {
 		if err := r2RetireDeliveryHeld(ctx, pool, it.Bucket, it.ObjectKey); err != nil {
+			return sum, err
+		}
+	}
+	if h.Class == r2RetireDeliveryOnly {
+		if err := r2RetireRequireDeliveryApplySchema(ctx, pool); err != nil {
 			return sum, err
 		}
 	}
@@ -1389,10 +1406,12 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 		if *listingPath != "" {
 			opts.LiveObjects, err = readR2RetireListing(*listingPath, *listingSHA, cfg.R2Bucket)
 		} else {
-			prefixes, prefixErr := r2RetirePrefixes(ctx, pool, accountID, cfg.R2Bucket)
-
-			if prefixErr != nil {
-				log.Fatal(prefixErr)
+			var prefixes []string
+			if retirementClass != r2RetireDeliveryOnly {
+				prefixes, err = r2RetirePrefixes(ctx, pool, accountID, cfg.R2Bucket)
+				if err != nil {
+					log.Fatal(err)
+				}
 			}
 			store := mustArchiveR2Client(ctx, cfg, pool)
 			var rootObjects []r2.ObjectInfo

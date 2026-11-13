@@ -33,7 +33,7 @@ func (e *r2RetireEvidence) foldersCover(c *r2RetireCandidate) bool {
 	return true
 }
 
-func loadR2FenceEvidence(ctx context.Context, q r2RetireQuerier, e *r2RetireEvidence) error {
+func loadR2FenceEvidence(ctx context.Context, q r2RetireQuerier, e *r2RetireEvidence, bounded bool) error {
 	if !e.FenceSchema {
 		return nil
 	}
@@ -49,6 +49,45 @@ func loadR2FenceEvidence(ctx context.Context, q r2RetireQuerier, e *r2RetireEvid
 	}
 	e.FencedRaw = map[int64]bool{}
 	e.FencedCollated = map[int64]bool{}
+	if bounded {
+		for _, kind := range []string{"raw", "collated"} {
+			table := "recording_clips"
+			if kind == "collated" {
+				table = "recording_collation_outputs"
+			}
+			var after int64
+			for {
+				rows, err := q.Query(ctx, `SELECT id,nas_delivery_fence_object_covered($1,id) FROM (SELECT id FROM `+table+` WHERE id>$2 ORDER BY id LIMIT 5000) page ORDER BY id`, kind, after)
+				if err != nil {
+					return err
+				}
+				count := 0
+				for rows.Next() {
+					var covered bool
+					if err := rows.Scan(&after, &covered); err != nil {
+						rows.Close()
+						return err
+					}
+					if covered {
+						if kind == "raw" {
+							e.FencedRaw[after] = true
+						} else {
+							e.FencedCollated[after] = true
+						}
+					}
+					count++
+				}
+				rows.Close()
+				if err := rows.Err(); err != nil {
+					return err
+				}
+				if count < r2RetireEvidencePageSize {
+					break
+				}
+			}
+		}
+		return nil
+	}
 	rows, err := q.Query(ctx, `SELECT kind,source_id FROM nas_delivery_fence_coverage() WHERE covered`)
 	if err != nil {
 		return err

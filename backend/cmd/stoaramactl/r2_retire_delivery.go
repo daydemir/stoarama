@@ -143,5 +143,27 @@ func r2RetireRequireWholeListing(path string) error {
 	return nil
 }
 
-// A planning-only class cannot inherit hold-release authority.
+// Delivery-only selection does not grant hold-release authority.
 func (c r2RetireClass) releaseValid() bool { return c == "" || c == r2RetireOwnerAccepted }
+
+// The class migration and ready presence indexes are both required before
+// executable planning/apply can enumerate the catalog or check live aliases.
+func r2RetireRequireDeliveryApplySchema(ctx context.Context, q r2RetireQuerier) error {
+	var installed bool
+	if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=to_regclass('r2_retirement_reservations')
+ AND conname='r2_retirement_reservations_retirement_class_check' AND contype='c'
+ AND position('owner_r2_delivery_only' in pg_get_constraintdef(oid))>0)`).Scan(&installed); err != nil {
+		return err
+	}
+	if !installed {
+		return errors.New("migration 0191 is required before executable delivery-only planning/apply")
+	}
+	if err := q.QueryRow(ctx, `SELECT r2_retirement_delivery_indexes_ready()`).Scan(&installed); err != nil {
+		return err
+	}
+	if !installed {
+		return errors.New("delivery-only presence indexes are missing or incompatible; precreate exact indexes CONCURRENTLY before executable planning/apply")
+	}
+
+	return nil
+}

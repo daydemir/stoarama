@@ -150,23 +150,39 @@ func (a *r2RetireApplier) headGuard(ctx context.Context, tx pgx.Tx, it r2RetireI
 	return nil
 }
 
-// Raw catalog authority is loaded in one query for planning and preflight.
+// Raw catalog authority is enumerated by its primary key in bounded pages.
 // Collated outputs have no ETag column and cannot authorize this mode.
 func r2RetireCatalogETags(ctx context.Context, q r2RetireQuerier, accountID int64, bucket string) (map[string]string, error) {
-	rows, err := q.Query(ctx, `SELECT c.object_key,c.etag FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE r.account_id=$1 AND c.bucket=$2`, accountID, bucket)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	etags := map[string]string{}
-	for rows.Next() {
-		var key, etag string
-		if err := rows.Scan(&key, &etag); err != nil {
+	var after int64
+	for {
+		rows, err := q.Query(ctx, `SELECT c.id,c.object_key,c.etag,coalesce(r.account_id=$1 AND c.bucket=$2,false) FROM
+ (SELECT id,recording_id,bucket,object_key,etag FROM recording_clips WHERE id>$3 ORDER BY id LIMIT 5000) c
+ LEFT JOIN recordings r ON r.id=c.recording_id ORDER BY c.id`, accountID, bucket, after)
+		if err != nil {
 			return nil, err
 		}
-		etags[key] = strings.Trim(etag, `"`)
+		count := 0
+		for rows.Next() {
+			var key, etag string
+			var included bool
+			if err := rows.Scan(&after, &key, &etag, &included); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if included {
+				etags[key] = strings.Trim(etag, `"`)
+			}
+			count++
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		if count < r2RetireEvidencePageSize {
+			return etags, nil
+		}
 	}
-	return etags, rows.Err()
 }
 
 func r2RetireGuardCatalogReason(it r2RetireCandidate, etags map[string]string) string {
