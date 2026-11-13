@@ -796,14 +796,20 @@ class Runner:
         ranked = self.query("""WITH w AS (SELECT (x->>'id')::bigint id,
           (x->>'a')::timestamptz a,(x->>'b')::timestamptz b
           FROM jsonb_array_elements(convert_from(decode('""" + encoded + """','base64'),'UTF8')::jsonb) x),
-          largest AS MATERIALIZED (
+          candidates AS MATERIALIZED (
           SELECT r.stream_id,o.id,o.nas_relative_path,o.sha256,o.size_bytes
           FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id
           JOIN recordings r ON r.id=h.recording_id JOIN w ON w.id=r.stream_id
           WHERE r.account_id=47 AND o.end_at>o.start_at AND NOT(o.start_at<w.b AND o.end_at>w.a)
           AND EXISTS(SELECT 1 FROM recording_collation_output_acks a WHERE a.output_id=o.id
             AND a.connection_id=13 AND a.sha256=lower(o.sha256) AND a.size_bytes=o.size_bytes)
-          ORDER BY o.size_bytes DESC,o.id LIMIT 100)
+          ), reserved AS MATERIALIZED (
+          SELECT DISTINCT p.source_id FROM nas_cleanup_reserved_files p
+          JOIN candidates c ON c.id=p.source_id
+          WHERE p.account_id=47 AND p.connection_id=13 AND p.kind='collated'
+          ), largest AS MATERIALIZED (
+          SELECT c.* FROM candidates c WHERE NOT EXISTS(SELECT 1 FROM reserved p WHERE p.source_id=c.id)
+          ORDER BY c.size_bytes DESC,c.id LIMIT 100)
           SELECT coalesce(json_agg(stream_id ORDER BY bytes DESC,stream_id),'[]') FROM (
           SELECT stream_id,max(size_bytes) bytes FROM largest
           WHERE NOT delivery_nas_held('collated',id,'joined/'||nas_relative_path,lower(sha256),size_bytes)
