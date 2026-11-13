@@ -284,6 +284,7 @@ def request(url, token, method='GET', body=None):
         raise Halt('HTTP request failed (' + method + ')') from None
 
 
+SHORT_READ_RETRY_DELAYS = (5, 10, 20, 30, 30, 25, None)  # 120 s
 READ_RETRY_DELAYS = (5, 10, 20, 30, 60, 60, 120, 120, 120, 120, 120, 120, None)  # 905 s
 COMMAND_TIMEOUT_SEC = 360
 PREPARE_TIMEOUT_SEC = 1800  # keep28 preparation on large streams exceeds six minutes
@@ -442,7 +443,7 @@ class Runner:
         action = lambda: request('https://api.render.com/v1/services/' + SERVICE + path, render_key(), method, body)
         step = ('live deploy list GET' if path == '/deploys?limit=100' else
                 'Render env GET' if path.startswith('/env-vars/') else 'Render deploy status GET')
-        return self.read(step, action) if method == 'GET' else action()
+        return self.read(step, action, delays=SHORT_READ_RETRY_DELAYS) if method == 'GET' else action()
 
     def live(self):
         rows = self.render('GET', '/deploys?limit=100')
@@ -471,13 +472,14 @@ class Runner:
         except Exception:
             pass  # Diagnostics must never block shutdown, even before initialize().
 
-    def read(self, step, action):
-        # Retry transient reads only, with ~15 minutes of added backoff (Render API
-        # restarts can exceed two minutes; while the API is down the NAS gets no
-        # permits either). Exhaustion becomes a terminal Halt so enclosing OFF/ON
-        # reads cannot multiply retries. Every I/O keeps its own timeout; mutations
-        # are never replayed.
-        for delay in READ_RETRY_DELAYS:
+    def read(self, step, action, delays=READ_RETRY_DELAYS):
+        # Render management outages do not stop permits. OFF and all its nested
+        # API/DB reads must return to the shutdown loop promptly.
+        if getattr(self, 'in_off', False):
+            delays = SHORT_READ_RETRY_DELAYS
+        # Exhaustion is terminal to enclosing read wrappers, avoiding multiplied
+        # retry budgets. Mutations are never replayed here.
+        for delay in delays:
             try:
                 return action()
             except Exception as exc:
@@ -490,11 +492,20 @@ class Runner:
                     if isinstance(exc, ReadFailure):
                         self.step_failed(step, str(exc))
                         raise Halt(step + ': ' + str(exc)) from None
-                    raise
+                    self.step_failed(step)
+                    raise Halt(step + ': transient read retries exhausted') from None
                 self.step_failed(step, str(exc) if isinstance(exc, ReadFailure) else None)
                 time.sleep(delay)
 
     def off(self):
+        previous = getattr(self, 'in_off', False)
+        self.in_off = True
+        try:
+            self._off()
+        finally:
+            self.in_off = previous
+
+    def _off(self):
         delay = 15
         pending = None
         while True:
