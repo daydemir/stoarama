@@ -156,7 +156,7 @@ func r2RetireRequireDeliveryApplySchema(ctx context.Context, q r2RetireQuerier) 
 		return err
 	}
 	if !installed {
-		return errors.New("migration 0191 is required before executable delivery-only planning/apply")
+		return errors.New("migration 0192 is required before executable delivery-only planning/apply")
 	}
 	if err := q.QueryRow(ctx, `SELECT r2_retirement_delivery_indexes_ready()`).Scan(&installed); err != nil {
 		return err

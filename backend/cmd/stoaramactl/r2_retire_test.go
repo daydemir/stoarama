@@ -1587,7 +1587,7 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 	})
 
 	t.Run("DeliveryOnlyHeadGuardApply", func(t *testing.T) {
-		migration, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), "0191_delivery_only_r2_apply.sql"))
+		migration, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), "0192_delivery_only_r2_apply.sql"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1726,6 +1726,44 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if err != nil || result.Retired != 1 || result.RetiredBytes != selected.SizeBytes || store.onceCalls != before+1 {
 			t.Fatalf("delivery apply %+v %v", result, err)
 		}
+		exec(`DELETE FROM r2_retirement_writer_fences`) // The guarded apply has finished.
+		// Purged and foreign-account rows are excluded only inside fixed ID ranges.
+		// Neither a wholly excluded range nor the filters may hide later own rows.
+		exec(`INSERT INTO recording_clips(id,recording_id,bucket,object_key,size_bytes,sha256,display_path,clip_start_at,clip_end_at,created_at,purged_at)
+   SELECT 20000000+i,CASE WHEN i<=25000 OR i>50000 THEN 30 ELSE 60 END,'stoarama','managed/range/'||i,100,repeat('a',64),'range/'||i,
+    '2026-08-01'::timestamptz,'2026-08-01 00:01'::timestamptz,'2026-08-01'::timestamptz,
+    CASE WHEN i<=25000 THEN now() END FROM generate_series(1,50002) i`)
+		scanTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer scanTx.Rollback(ctx)
+		if _, err := scanTx.Exec(ctx, `SET LOCAL enable_seqscan=off; SET LOCAL jit=off; SET LOCAL statement_timeout='30s'`); err != nil {
+			t.Fatal(err)
+		}
+		scanAudit := &r2RetireIndexedQueryAudit{r2RetireQuerier: scanTx, t: t}
+		seen := map[int64]bool{}
+		if err := r2RetireScan(ctx, scanAudit, "raw", scope, sets, 5000, func(c r2RetireCandidate) error {
+			if c.SourceID > 20000000 {
+				seen[c.SourceID] = true
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(seen) != 2 || !seen[20050001] || !seen[20050002] {
+			t.Fatal("purged/foreign page hid later raw candidates", seen)
+		}
+		// The other raw enumerators obey the same bound on this sparse fixture.
+		if _, err := r2RetireCatalogETags(ctx, scanAudit, 47, "stoarama"); err != nil {
+			t.Fatal(err)
+		}
+		deliveries := &r2RetireEvidence{}
+		if err := deliveries.loadOwnerDeliveries(ctx, scanAudit); err != nil {
+			t.Fatal(err)
+		}
+		scanTx.Rollback(ctx)
+
 		var class string
 		var purged bool
 		if err := pool.QueryRow(ctx, `SELECT x.retirement_class,c.purged_at IS NOT NULL FROM r2_retirement_reservations x JOIN recording_clips c ON c.id=x.source_id WHERE x.kind='raw' AND x.source_id=810`).Scan(&class, &purged); err != nil || class != string(r2RetireDeliveryOnly) || !purged {

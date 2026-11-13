@@ -28,10 +28,7 @@ func r2RetireInventoryEach(ctx context.Context, q r2RetireQuerier, columns, pred
 		if err != nil {
 			return err
 		}
-		lastClip := int64(math.MaxInt64)
-		if firstClip <= math.MaxInt64-(r2RetireEvidencePageSize-1) {
-			lastClip = firstClip + r2RetireEvidencePageSize - 1
-		}
+		lastClip := r2RetirePageEnd(firstClip, r2RetireEvidencePageSize)
 		query := fmt.Sprintf(`SELECT n.connection_id,n.clip_id,coalesce((%s),false),%s
  FROM nas_inventory_files n
  WHERE n.connection_id=$%d AND n.clip_id BETWEEN $%d AND $%d
@@ -61,4 +58,36 @@ func r2RetireInventoryEach(ctx context.Context, q r2RetireQuerier, columns, pred
 		}
 		connection, clip = firstConnection, lastClip
 	}
+}
+
+// Range endpoints are chosen before eligibility filters. The primary key makes
+// each query independent of how many purged/foreign rows precede a candidate.
+func r2RetireIDRange(ctx context.Context, q r2RetireQuerier, kind string, after int64, size int) (first, last int64, found bool, err error) {
+	var table string
+	switch kind {
+	case "raw":
+		table = "recording_clips"
+	case "collated":
+		table = "recording_collation_outputs"
+	default:
+		return 0, 0, false, fmt.Errorf("unknown catalog kind %q", kind)
+	}
+	if size < 1 {
+		return 0, 0, false, errors.New("catalog page size must be positive")
+	}
+	size = min(size, r2RetireEvidencePageSize)
+	err = q.QueryRow(ctx, `SELECT id FROM `+table+` WHERE id>$1 ORDER BY id LIMIT 1`, after).Scan(&first)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, 0, false, nil
+	}
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return first, r2RetirePageEnd(first, size), true, nil
+}
+func r2RetirePageEnd(first int64, size int) int64 {
+	if first > math.MaxInt64-int64(size-1) {
+		return math.MaxInt64
+	}
+	return first + int64(size-1)
 }

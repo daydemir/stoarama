@@ -141,7 +141,7 @@ adds or enriches holds under admission/public locks; it cannot release them.
 
 `r2-retire plan --class owner_r2_delivery_only --head-guard-compatible ...`
 enumerates the whole bucket and reports now/later/copy/blocked. With migration
-0191, the class can execute only a fresh, non-preview `now`
+0192, the class can execute only a fresh, non-preview `now`
 manifest carrying `head_guard_compatible=true`, and apply requires
 `--provider-unconditional-delete-with-head-guard` plus the owner credential-risk
 acknowledgment. Other phases and old previews remain unexecutable.
@@ -162,7 +162,7 @@ manifests. `--delivery-keep-preview FILE --expected-delivery-keep-sha256 SHA`
 allows a read-only pre-migration preview; these manifests are unexecutable.
 Large classification files are written directly as gzip with exact file digests.
 
-Migration `0191_delivery_only_r2_apply.sql` admits only the delivery-only
+Migration `0192_delivery_only_r2_apply.sql` admits only the delivery-only
 reservation class and preserves generic recovery holds; it does not inherit the
 outside-only owner's hold-release/source-purge exception. It also requires
 indexed broad NAS path/content vetoes. Before executable planning, precreate

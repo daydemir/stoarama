@@ -17,13 +17,19 @@ func (e *r2RetireEvidence) loadOwnerDeliveries(ctx context.Context, q r2RetireQu
 	e.Delivered = map[string]time.Time{}
 	var after int64
 	for {
-		rows, err := q.Query(ctx, `SELECT c.id,CASE WHEN r.account_id=47 AND (c.released_at IS NOT NULL OR c.id<=n.last_cursor_id) THEN `+r2OwnerRawDeliveryTimeSQL+` END
- FROM (SELECT id,recording_id,released_at,created_at FROM recording_clips WHERE id>$1 ORDER BY id LIMIT 5000) c
- LEFT JOIN recordings r ON r.id=c.recording_id LEFT JOIN connections n ON n.id=13 AND n.account_id=r.account_id ORDER BY c.id`, after)
+		first, last, found, err := r2RetireIDRange(ctx, q, "raw", after, r2RetireEvidencePageSize)
 		if err != nil {
 			return err
 		}
-		count := 0
+		if !found {
+			break
+		}
+		rows, err := q.Query(ctx, `SELECT c.id,CASE WHEN r.account_id=47 AND (c.released_at IS NOT NULL OR c.id<=n.last_cursor_id) THEN `+r2OwnerRawDeliveryTimeSQL+` END
+ FROM recording_clips c LEFT JOIN recordings r ON r.id=c.recording_id
+ LEFT JOIN connections n ON n.id=13 AND n.account_id=r.account_id WHERE c.id BETWEEN $1 AND $2 ORDER BY c.id`, first, last)
+		if err != nil {
+			return err
+		}
 		for rows.Next() {
 			var at *time.Time
 			if err := rows.Scan(&after, &at); err != nil {
@@ -33,15 +39,12 @@ func (e *r2RetireEvidence) loadOwnerDeliveries(ctx context.Context, q r2RetireQu
 			if at != nil {
 				e.Delivered[retireIdentity("raw", after)] = *at
 			}
-			count++
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
 			return err
 		}
-		if count < r2RetireEvidencePageSize {
-			break
-		}
+		after = last
 	}
 	rows, err := q.Query(ctx, `SELECT output_id,max(verified_at) FROM recording_collation_output_acks WHERE connection_id=13 GROUP BY output_id`)
 	if err != nil {

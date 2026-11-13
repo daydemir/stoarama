@@ -110,31 +110,54 @@ func (s *r2RetireSets) loadOwnerProtections(ctx context.Context, q r2RetireQueri
 		sql = strings.Replace(sql, "SELECT 1 FROM safe_raw s WHERE s.id=source", "SELECT 1 FROM LATERAL (SELECT id FROM safe_raw WHERE id=source OFFSET 0) s", 1)
 		policy = r2RetireDeliveryPolicy(windows, picks)
 	}
-	rows, err := q.Query(ctx, sql+`SELECT id,source_clip_ids FROM unsafe_outputs`, policy, scope.AccountID)
-	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		var id int64
-		var sources []int64
-		if err := rows.Scan(&id, &sources); err != nil {
-			rows.Close()
+	var after int64
+	for {
+		query := sql + `SELECT id,source_clip_ids FROM unsafe_outputs`
+		args := []any{policy, scope.AccountID}
+		var last int64
+		if scope.Class == r2RetireDeliveryOnly {
+			first, end, found, err := r2RetireIDRange(ctx, q, "collated", after, r2RetireEvidencePageSize)
+			if err != nil {
+				return err
+			}
+			if !found {
+				break
+			}
+			last = end
+			query += ` WHERE id BETWEEN $3 AND $4`
+			args = append(args, first, last)
+		}
+		rows, err := q.Query(ctx, query, args...)
+		if err != nil {
 			return err
 		}
-		s.ProtectedCollated[id] = true
-		for _, id := range sources {
-			s.ProtectedRaw[id] = true
+		for rows.Next() {
+			var id int64
+			var sources []int64
+			if err := rows.Scan(&id, &sources); err != nil {
+				rows.Close()
+				return err
+			}
+			s.ProtectedCollated[id] = true
+			for _, source := range sources {
+				s.ProtectedRaw[source] = true
+			}
 		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if scope.Class != r2RetireDeliveryOnly {
+			break
+		}
+		after = last
 	}
-	rows.Close()
-	if rows.Err() != nil {
-		return rows.Err()
-	}
+
 	// Incident holds survive every plan/receipt transition.
 	for _, id := range r2RetireIncidentSources {
 		s.HeldRaw[id] = true
 	}
-	rows, err = q.Query(ctx, `SELECT id FROM recording_collation_outputs WHERE source_clip_ids && $1::bigint[]`, r2RetireIncidentSources)
+	rows, err := q.Query(ctx, `SELECT id FROM recording_collation_outputs WHERE source_clip_ids && $1::bigint[]`, r2RetireIncidentSources)
 	if err != nil {
 		return err
 	}

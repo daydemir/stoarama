@@ -20,8 +20,8 @@ func (a *r2RetireIndexedQueryAudit) check(ctx context.Context, sql string, args 
 	a.t.Helper()
 	var plan []byte
 	explain := "EXPLAIN (FORMAT JSON) "
-	inventoryPage := strings.Contains(sql, "FROM nas_inventory_files")
-	if inventoryPage {
+	protectedRead := strings.Contains(sql, "FROM nas_inventory_files") || strings.Contains(sql, "FROM recording_clips")
+	if protectedRead {
 		explain = "EXPLAIN (ANALYZE, FORMAT JSON) "
 	}
 	if err := a.r2RetireQuerier.QueryRow(ctx, explain+sql, args...).Scan(&plan); err != nil {
@@ -35,12 +35,12 @@ func (a *r2RetireIndexedQueryAudit) check(ctx context.Context, sql string, args 
 	walk = func(v any) {
 		switch x := v.(type) {
 		case map[string]any:
-			if inventoryPage && x["Relation Name"] == "nas_inventory_files" {
+			if protectedRead && (x["Relation Name"] == "nas_inventory_files" || x["Relation Name"] == "recording_clips") {
 				rows, _ := x["Actual Rows"].(float64)
 				removed, _ := x["Rows Removed by Filter"].(float64)
 				loops, _ := x["Actual Loops"].(float64)
 				if (rows+removed)*loops > r2RetireEvidencePageSize {
-					a.t.Fatalf("inventory statement examined more than one page: %s", plan)
+					a.t.Fatalf("protected-table statement examined more than one page: %s", plan)
 				}
 			}
 			if x["Node Type"] == "Seq Scan" && (x["Relation Name"] == "recording_clips" || x["Relation Name"] == "nas_inventory_files") {

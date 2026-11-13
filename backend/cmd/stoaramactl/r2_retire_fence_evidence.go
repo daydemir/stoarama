@@ -51,17 +51,23 @@ func loadR2FenceEvidence(ctx context.Context, q r2RetireQuerier, e *r2RetireEvid
 	e.FencedCollated = map[int64]bool{}
 	if bounded {
 		for _, kind := range []string{"raw", "collated"} {
-			table := "recording_clips"
-			if kind == "collated" {
-				table = "recording_collation_outputs"
-			}
 			var after int64
 			for {
-				rows, err := q.Query(ctx, `SELECT id,nas_delivery_fence_object_covered($1,id) FROM (SELECT id FROM `+table+` WHERE id>$2 ORDER BY id LIMIT 5000) page ORDER BY id`, kind, after)
+				first, last, found, err := r2RetireIDRange(ctx, q, kind, after, r2RetireEvidencePageSize)
 				if err != nil {
 					return err
 				}
-				count := 0
+				if !found {
+					break
+				}
+				table := "recording_clips"
+				if kind == "collated" {
+					table = "recording_collation_outputs"
+				}
+				rows, err := q.Query(ctx, `SELECT id,nas_delivery_fence_object_covered($1,id) FROM `+table+` WHERE id BETWEEN $2 AND $3 ORDER BY id`, kind, first, last)
+				if err != nil {
+					return err
+				}
 				for rows.Next() {
 					var covered bool
 					if err := rows.Scan(&after, &covered); err != nil {
@@ -75,15 +81,12 @@ func loadR2FenceEvidence(ctx context.Context, q r2RetireQuerier, e *r2RetireEvid
 							e.FencedCollated[after] = true
 						}
 					}
-					count++
 				}
 				rows.Close()
 				if err := rows.Err(); err != nil {
 					return err
 				}
-				if count < r2RetireEvidencePageSize {
-					break
-				}
+				after = last
 			}
 		}
 		return nil

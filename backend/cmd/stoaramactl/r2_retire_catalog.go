@@ -160,6 +160,13 @@ func r2RetireSQL(kind string, scope r2RetireScope, single bool) string {
 	if single {
 		return sel + "WHERE " + alias + ".id=$5"
 	}
+	if scope.Class == r2RetireDeliveryOnly {
+		where := "WHERE " + alias + ".id BETWEEN $5 AND $6"
+		if kind == "raw" {
+			where += " AND c.purged_at IS NULL"
+		}
+		return sel + where + " ORDER BY " + alias + ".id"
+	}
 	where := "WHERE " + alias + ".id>$5"
 	if kind == "raw" {
 		where += " AND c.purged_at IS NULL"
@@ -587,7 +594,20 @@ func r2RetireScan(ctx context.Context, q r2RetireQuerier, kind string, scope r2R
 	sql := r2RetireSQL(kind, scope, false)
 	after := int64(0)
 	for {
-		rows, err := q.Query(ctx, sql, scope.AccountID, scope.ConnectionID, scope.Bucket, int64(scope.Grace/time.Second), after, pageSize)
+		first, last := after, int64(pageSize)
+		bounded := scope.Class == r2RetireDeliveryOnly
+		if bounded {
+			var found bool
+			var err error
+			first, last, found, err = r2RetireIDRange(ctx, q, kind, after, pageSize)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return nil
+			}
+		}
+		rows, err := q.Query(ctx, sql, scope.AccountID, scope.ConnectionID, scope.Bucket, int64(scope.Grace/time.Second), first, last)
 		if err != nil {
 			return fmt.Errorf("scan %s: %w", kind, err)
 		}
@@ -627,7 +647,9 @@ func r2RetireScan(ctx context.Context, q r2RetireQuerier, kind string, scope r2R
 			}
 			after = page[i].SourceID
 		}
-		if n < pageSize {
+		if bounded {
+			after = last
+		} else if n < pageSize {
 			return nil
 		}
 	}
