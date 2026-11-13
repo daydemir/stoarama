@@ -55,11 +55,9 @@ The runner:
 - Uses a complete fresh dry run or invokes `prepare_keep28_plans.py --submit`
   for one stream, at most one <=100 GB plan. Unique `k28auto-YYYYMMDD-HHMMSS`
   prefixes avoid immutable-label reuse. Admission rejection is a stop.
-  Stream priority samples the 100 largest acknowledged outside-window collated
-  outputs, excluding reserved/already-issued identities before the sample and
-  delivery holds afterwards. Every other pinned stream remains in the
-  search. This is advisory ordering only: preparation, dry run and independent
-  verification still rederive eligibility. Within each stream, files and plans
+  Streams follow pinned stream-ID order without a global catalog query.
+  Preparation, dry run and independent verification rederive eligibility.
+  Within each stream, files and plans
   prioritize bytes per operation, with R2-present plans ahead of NAS-only work.
 - Before ON, admits at most one successor using atomic admission (no recursive
   rejection splitting). Two NAS workers can dry-run it during current serial

@@ -51,16 +51,11 @@ def plan_with_refusals(plan, total, ordinals):
 
 
 class DecisionTests(unittest.TestCase):
-    def test_stream_priority_promotes_large_outputs_and_keeps_every_stream(self):
+    def test_stream_order_covers_pinned_streams_without_catalog_reads(self):
         job = r.Runner.__new__(r.Runner)
-        job.windows = dict(WINDOWS)
-        job.windows.update({4: WINDOWS[3], 5: WINDOWS[3]})
-        sql = []
-        job.query = lambda query: sql.append(query) or [5, 4]
-        self.assertEqual(job.stream_order(), [5, 4, 3])
-        self.assertIn('largest AS MATERIALIZED', sql[0])
-        self.assertIn('LIMIT 100', sql[0])
-        self.assertIn('NOT delivery_nas_held', sql[0])
+        job.windows = {5: WINDOWS[3], 3: WINDOWS[3], 4: WINDOWS[3]}
+        job.query = lambda *_: self.fail('stream ordering must not query the catalog')
+        self.assertEqual(job.stream_order(), [3, 4, 5])
 
     def test_budget_boundaries_and_invalid_values(self):
         self.assertTrue(r.budget_permits(r.DAY_CAP - r.PLAN_CAP, r.PLAN_CAP))
