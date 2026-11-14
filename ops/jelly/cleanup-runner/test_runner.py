@@ -51,11 +51,41 @@ def plan_with_refusals(plan, total, ordinals):
 
 
 class DecisionTests(unittest.TestCase):
-    def test_stream_order_covers_pinned_streams_without_catalog_reads(self):
-        job = r.Runner.__new__(r.Runner)
-        job.windows = {5: WINDOWS[3], 3: WINDOWS[3], 4: WINDOWS[3]}
-        job.query = lambda *_: self.fail('stream ordering must not query the catalog')
-        self.assertEqual(job.stream_order(), [3, 4, 5])
+    def test_stream_order_uses_cached_bytes_per_file_not_stream_id_or_total(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = r.Runner(Path('.'), Path(tmp))
+            job.windows = {5: WINDOWS[3], 3: WINDOWS[3], 4: WINDOWS[3], 6: WINDOWS[3]}
+            job.query = lambda *_: self.fail('stream ordering must not query the catalog')
+            for sid, files, size in [(3, 100, 1000), (4, 2, 100), (5, 1, 50), (6, 0, 0)]:
+                path = job.stream_summary_path(sid)
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps(dict(policy_sha256=r.POLICY_SHA, bucket=os.environ.get('R2_BUCKET', 'stoarama'),
+                    streams=[sid], observed_at_epoch=r.time.time(), recoverable_files=files, recoverable_bytes=size)))
+            with patch.object(r, 'command', side_effect=AssertionError('cache should be reused')):
+                self.assertEqual(job.stream_order(), [4, 5, 3, 6])
+
+    def test_stream_order_refreshes_expired_summaries_one_stream_at_a_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = r.Runner(Path('.'), Path(tmp))
+            job.windows = WINDOWS
+            path = job.stream_summary_path(3)
+            path.parent.mkdir(parents=True)
+            summary = dict(policy_sha256=r.POLICY_SHA, bucket=os.environ.get('R2_BUCKET', 'stoarama'),
+                           streams=[3], observed_at_epoch=0, recoverable_files=1, recoverable_bytes=10)
+            path.write_text(json.dumps(summary))
+            def prepare(argv, **kwargs):
+                self.assertIn('--summary-only', argv)
+                self.assertEqual(argv[argv.index('--stream')+1], '3')
+                self.assertNotIn('--submit', argv)
+                summary['observed_at_epoch'] = r.time.time()
+                path.write_text(json.dumps(summary))
+            with patch.object(r, 'command', side_effect=prepare) as call:
+                self.assertEqual(job.stream_order(), [3])
+                self.assertEqual(call.call_count, 1)
+            summary['recoverable_files'] = True
+            path.write_text(json.dumps(summary))
+            with self.assertRaises(r.Halt):
+                job.stream_order()
 
     def test_budget_boundaries_and_invalid_values(self):
         self.assertTrue(r.budget_permits(r.DAY_CAP - r.PLAN_CAP, r.PLAN_CAP))

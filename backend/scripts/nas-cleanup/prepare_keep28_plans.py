@@ -55,6 +55,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -250,9 +251,12 @@ def main():
     ap.add_argument('--psql', default='psql')
     ap.add_argument('--out', required=True, help='directory for plan inputs and the summary')
     ap.add_argument('--submit', action='store_true', help='admit plans as read-only dry runs via the service API')
+    ap.add_argument('--summary-only', action='store_true', help='write candidate totals only; never admit or write plans')
     ap.add_argument('--atomic-admission', action='store_true', help='stop on admission rejection; never split one proposal into several plans')
     ap.add_argument('--api', default='https://stoarama.com')
     a = ap.parse_args()
+    if a.summary_only and (a.submit or len(a.stream) != 1):
+        raise SystemExit('--summary-only requires exactly one stream and no --submit')
     if not 1 <= a.max_items <= MAX_PLAN_ITEMS or not 0 < a.max_bytes <= MAX_PLAN_BYTES or a.max_plans < 0 or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,39}', a.label_prefix):
         raise SystemExit('invalid batching arguments')
     if a.batch_by == 'all' and not a.i_understand_large_batch:
@@ -262,14 +266,17 @@ def main():
     if unknown:
         raise SystemExit(f'streams without a keep28 window: {sorted(unknown)}')
     rows = candidates(policy, set(a.stream), a.bucket, a.psql)
-    plans = batches(rows, a.label_prefix, a.max_items, int(a.max_bytes))
+    plans = [] if a.summary_only else batches(rows, a.label_prefix, a.max_items, int(a.max_bytes))
     if a.max_plans:
         plans = plans[:a.max_plans]
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     for label, items in plans:
         (out / (label + '.json')).write_text(json.dumps({'label': label, 'items': [{'kind': r['kind'], 'source_id': r['source_id']} for r in items]}))
-    summary = {'policy_sha256': POLICY_SHA, 'candidate_files': len(rows), 'candidate_bytes': sum(r['size_bytes'] for r in rows),
+    recoverable = [r for r in rows if not r['r2_purged']]
+    summary = {'policy_sha256': POLICY_SHA, 'bucket': a.bucket, 'streams': sorted(a.stream or policy), 'observed_at_epoch': time.time(),
+               'recoverable_files': len(recoverable), 'recoverable_bytes': sum(r['size_bytes'] for r in recoverable),
+               'candidate_files': len(rows), 'candidate_bytes': sum(r['size_bytes'] for r in rows),
                'plans': [{'label': l, 'stream_id': i[0]['stream_id'], 'items': len(i), 'bytes': sum(r['size_bytes'] for r in i)} for l, i in plans],
                'deletion_enabled': False}
     receipts, rejected = [], []
@@ -281,7 +288,9 @@ def main():
         for b in batch_list:
             (out / ('batch-%s.json' % b['name'])).write_text(json.dumps(b, indent=1))
         summary['batches'] = [{'name': b['name'], 'plans': len(b['plans']), 'files': b['files'], 'bytes': b['bytes'], 'batch_sha256': b['batch_sha256']} for b in batch_list]
-    (out / 'summary.json').write_text(json.dumps(summary, indent=1))
+    temp = out / 'summary.tmp'
+    temp.write_text(json.dumps(summary, indent=1))
+    temp.replace(out / 'summary.json')
     print(json.dumps({'phase': 'KEEP28_PLANS_SUBMITTED' if a.submit else 'KEEP28_PLANS_PREVIEW', 'candidate_files': summary['candidate_files'],
                       'candidate_bytes': summary['candidate_bytes'], 'plans': len(plans), 'admitted': len(receipts), 'rejected_items': len(rejected),
                       'out': str(out), 'deletion_enabled': False}), flush=True)
