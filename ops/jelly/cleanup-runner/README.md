@@ -55,7 +55,13 @@ The runner:
 - Uses a complete fresh dry run or invokes `prepare_keep28_plans.py --submit`
   for one stream, at most one <=100 GB plan. Unique `k28auto-YYYYMMDD-HHMMSS`
   prefixes avoid immutable-label reuse. Admission rejection is a stop.
-  Streams follow pinned stream-ID order without a global catalog query.
+  Streams rank by R2-present candidate bytes per file, descending (stream ID
+  breaks ties). The preparer's read-only `--summary-only --stream ID` mode
+  supplies one stream at a time, retaining its indexed scope and 300-second SQL
+  cap. Summaries live in `stream-summaries/<policy-and-bucket-digest>/<id>/`
+  beneath the runner state on Jelly, expire after 24 hours, and are invalidated
+  after that stream's admission. The initial cache fill visits all 109 streams;
+  subsequent ranking reuses the cache. These are ranking hints only.
   Preparation, dry run and independent verification rederive eligibility.
   Within each stream, files and plans
   prioritize bytes per operation, with R2-present plans ahead of NAS-only work.

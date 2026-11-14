@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+from fractions import Fraction
 from datetime import datetime, timezone
 import urllib.error
 import urllib.request
@@ -288,6 +289,7 @@ SHORT_READ_RETRY_DELAYS = (5, 10, 20, 30, 30, 25, None)  # 120 s
 READ_RETRY_DELAYS = (5, 10, 20, 30, 60, 60, 120, 120, 120, 120, 120, 120, None)  # 905 s
 COMMAND_TIMEOUT_SEC = 360
 PREPARE_TIMEOUT_SEC = 1800  # keep28 preparation on large streams exceeds six minutes
+STREAM_SUMMARY_TTL_SEC = 24 * 3600
 COMMAND_FAILURE_LOG = Path.home() / 'stoarama-cleanup-runner' / 'command-failures.log'
 
 
@@ -786,11 +788,34 @@ class Runner:
             self.progress()
             time.sleep(60)
 
+    def stream_summary_path(self, sid):
+        bucket = os.environ.get('R2_BUCKET', 'stoarama')
+        key = hashlib.sha256((POLICY_SHA + '\n' + bucket).encode()).hexdigest()
+        return self.root / 'stream-summaries' / key / str(sid) / 'summary.json'
+
     def stream_order(self):
-        # The preparer ranks eligible files by bytes per operation within each
-        # stream. A global ACK sample needlessly expands every plan manifest
-        # before any stream can be prepared.
-        return sorted(self.windows)
+        # Ranking hints only. Each admission still reruns the scoped preparer
+        # query and all dry-run/verification gates. Never query a global catalog.
+        scores = {}
+        for sid in sorted(self.windows):
+            if self.stopped():
+                return []
+            path = self.stream_summary_path(sid)
+            summary = json.loads(path.read_text()) if path.exists() else None
+            if summary is None or not 0 <= time.time() - summary['observed_at_epoch'] < STREAM_SUMMARY_TTL_SEC:
+                command([sys.executable, str(self.repo / 'backend/scripts/nas-cleanup/prepare_keep28_plans.py'),
+                         '--stream', str(sid), '--summary-only', '--out', str(path.parent)],
+                        env=os.environ.copy(), timeout=PREPARE_TIMEOUT_SEC)
+                summary = json.loads(path.read_text())
+            files, size = summary['recoverable_files'], summary['recoverable_bytes']
+            require(summary['policy_sha256'] == POLICY_SHA and summary['streams'] == [sid]
+                    and summary['bucket'] == os.environ.get('R2_BUCKET', 'stoarama')
+                    and type(files) is int and type(size) is int and files >= 0 and size >= files
+                    and (files > 0 or size == 0)
+                    and 0 <= time.time() - summary['observed_at_epoch'] < STREAM_SUMMARY_TTL_SEC,
+                    'invalid stream ranking summary')
+            scores[sid] = Fraction(size, files) if files else Fraction(0)
+        return sorted(scores, key=lambda sid: (-scores[sid], sid))
 
     def pick(self, lookahead=False):
         ids = self.query("""SELECT coalesce(json_agg(id ORDER BY id),'[]') FROM nas_cleanup_plans p
@@ -812,6 +837,9 @@ class Runner:
                 '--label-prefix', prefix, '--out', str(out), '--api', API, '--submit',
                 '--atomic-admission'], env=os.environ.copy(), timeout=PREPARE_TIMEOUT_SEC)
             summary = json.loads((out / 'summary.json').read_text())
+            # Reservations changed eligibility; rank the remainder freshly on
+            # the next pass. A crash can only leave a stale ranking hint.
+            self.stream_summary_path(sid).unlink(missing_ok=True)
             require(not summary['rejected_at_admission'], 'preparer rejected an uncertain file')
             if summary['receipts']:
                 require(len(summary['receipts']) == 1, 'preparer admitted more than one plan')
@@ -821,7 +849,7 @@ class Runner:
                     # in dry run (its items stay reserved) and move on to the next stream.
                     continue
                 return receipt['id']
-        if lookahead:
+        if lookahead or self.stopped():
             return None  # Current/reserved work is expected; never claim completion here.
         # The preparer excludes reserved files. Never call that a completed cleanup.
         pending = self.query("""SELECT count(*) FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id

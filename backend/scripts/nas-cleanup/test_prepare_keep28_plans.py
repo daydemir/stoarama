@@ -1,5 +1,7 @@
 import unittest
 import tempfile
+import json
+from pathlib import Path
 import urllib.error
 from unittest.mock import patch
 
@@ -11,6 +13,19 @@ def row(sid, kind, n, size=1, purged=False):
 
 
 class Keep28PlanTests(unittest.TestCase):
+    def test_summary_only_counts_recoverable_supply_without_admission_or_plan_files(self):
+        rows = [row(3, 'raw', 1, size=10), row(3, 'collated', 2, size=100), row(3, 'raw', 3, size=1000, purged=True)]
+        with tempfile.TemporaryDirectory() as out, \
+             patch('sys.argv', ['prepare', '--stream', '3', '--summary-only', '--out', out]), \
+             patch.object(k, 'candidates', return_value=rows), \
+             patch.object(k, 'submit', side_effect=AssertionError('summary cannot admit')), patch('builtins.print'):
+            k.main()
+            summary = json.loads((Path(out) / 'summary.json').read_text())
+            self.assertEqual((summary['recoverable_files'], summary['recoverable_bytes']), (2, 110))
+            self.assertEqual((summary['candidate_files'], summary['candidate_bytes']), (3, 1110))
+            self.assertEqual(summary['plans'], [])
+            self.assertEqual([p.name for p in Path(out).iterdir()], ['summary.json'])
+
     def test_atomic_admission_never_splits_an_uncertain_proposal(self):
         with patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', 409, 'conflict', {}, None)) as call:
             with self.assertRaisesRegex(RuntimeError, 'atomic admission rejected'):
