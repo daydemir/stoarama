@@ -272,3 +272,27 @@ release scripts, in a naturally idle master-OFF window. Before restart, verify a
 fresh executing heartbeat, stable zero cycle errors, actual inventory completion,
 no inventory mismatch and either zero aliases or complete benign stage proof.
 Do not clear the runner's preparer error or remove STOP until these gates pass.
+
+### NAS client cleanup-batch-v7 grouped durability
+
+The exact `cleanup-batch-v7` release requests up to eight permits together for
+one complete, initially leased roster. The server retains each file's recovery,
+delivery hold, session, proof and budget checks. All unlinks remain serial under
+the media fence. Every member uses the same request-start clock and existing
+15-second permit age limit, including the sidecar syscall.
+
+V7 durably appends all ledger intents, then commits conservative attempt markers
+before the first unlink. It syncs each distinct pinned directory inode after
+all unlinks and before any durable success result. Ledger results and SQLite
+results are then grouped separately. A crash, expired permit, partial write or
+failed directory sync leaves unresolved members uncertain; replay requests no
+new permits and performs no unlinks. Predecessor releases keep their existing
+serial permits and durability ordering.
+
+Real disposable-file/FULL-WAL measurements reduce a steady eight-file group in
+one folder from 45 fsyncs / 21 SQLite commits to 10 fsyncs / 7 commits. With
+explicitly simulated 300 ms sync and 250 ms permit latency, medians were 15.824 s
+(v6.1) and 3.347 s (v7). These are controlled benchmark results, not NAS rates.
+Stage and promote only from reviewed merged source after natural drain, no
+enabled plan or batch, and confirmed master OFF. Keep R2 copying and stitching
+disabled unless separately authorized conditions are met.

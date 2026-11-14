@@ -19,11 +19,13 @@ from pathlib import Path
 from unittest import mock
 
 import test_cleanup_group as fixtures
+import test_cleanup_bulk as bulk_fixtures
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--client', type=Path, default=Path(__file__).with_name('stoarama_pull.py'))
+    parser.add_argument('--version', choices=('cleanup-batch-v6.1', 'cleanup-batch-v7'), default='cleanup-batch-v6.1')
     parser.add_argument('--runs', type=int, default=5)
     parser.add_argument('--sync-delay-ms', type=float, default=0)
     parser.add_argument('--permit-delay-ms', type=float, default=0)
@@ -35,7 +37,7 @@ def main():
     spec = importlib.util.spec_from_file_location('measured_pull', args.client)
     pull = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(pull)
-    fixtures.pull = fixtures.fixtures.pull = pull
+    fixtures.pull = fixtures.fixtures.pull = bulk_fixtures.pull = pull
     library = ctypes.CDLL(None)
     library.cleanup_sync_begin.argtypes = [ctypes.c_long]
     library.cleanup_sync_end.restype = ctypes.c_long
@@ -54,7 +56,9 @@ def main():
         db.close()
     samples = []
     for _ in range(args.runs):
-        case = fixtures.CleanupGroupTests('test_group_commits_intents_before_sequential_unlinks')
+        case = (bulk_fixtures.CleanupBulkTests('test_one_bulk_request_all_intents_before_unlink_all_syncs_before_success')
+                if args.version == 'cleanup-batch-v7' else
+                fixtures.CleanupGroupTests('test_group_commits_intents_before_sequential_unlinks'))
         case.setUp()
         try:
             tasks = case.group(8)
@@ -91,7 +95,7 @@ def main():
         finally:
             case.doCleanups()
     seconds = statistics.median(s['seconds'] for s in samples)
-    print(json.dumps(dict(client=pull.CLEANUP_GROUP_VERSION, files_per_group=8,
+    print(json.dumps(dict(client=args.version, files_per_group=8,
         sync_delay_ms=args.sync_delay_ms, permit_delay_ms=args.permit_delay_ms,
         proof_delay_ms=args.proof_delay_ms, lease_delay_ms=args.lease_delay_ms,
         samples=samples, median_group_seconds=seconds,

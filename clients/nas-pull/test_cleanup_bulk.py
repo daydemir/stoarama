@@ -1,0 +1,226 @@
+"""V7 durability ordering on real files and FULL-WAL SQLite; no NAS access."""
+import datetime
+import json
+import os
+import select
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import test_cleanup_group as fixtures
+pull = fixtures.pull
+
+
+class CleanupBulkTests(unittest.TestCase):
+    setUp = fixtures.CleanupGroupTests.setUp
+    group = fixtures.CleanupGroupTests.group
+    api = fixtures.CleanupGroupTests.api
+    fixture_pins = fixtures.CleanupGroupTests.fixture_pins
+
+    def run_group(self, tasks):
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_BULK_VERSION), \
+                mock.patch.object(pull, 'restore_api', side_effect=self.api):
+            pull.cleanup_process_group(self.cfg, self.inventory, threading.Event(), tasks)
+
+    def phases(self):
+        return [row[1] for row in pull.cleanup_journal(self.inventory)]
+
+    def test_one_bulk_request_all_intents_before_unlink_all_syncs_before_success(self):
+        tasks = self.group(8)
+        calls, dirs, unlinks = [], [], []
+        api, sync, unlink = self.api, pull.os.fsync, pull.os.unlink
+        def transport(cfg, path, body, **kwargs):
+            calls.append((path, len(body.get('observations', []))))
+            return api(cfg, path, body, **kwargs)
+        def remove(name, **kwargs):
+            self.assertEqual(self.phases(), ['intent'] * 8)
+            self.assertTrue(all(json.loads(row[2])['unlink_attempted'] is True for row in pull.cleanup_journal(self.inventory)))
+            unlinks.append(name)
+            return unlink(name, **kwargs)
+        def fsync(fd):
+            import stat
+            if stat.S_ISDIR(os.fstat(fd).st_mode) and unlinks:
+                self.assertEqual(len(unlinks), 16)
+                self.assertEqual(self.phases(), ['intent'] * 8)
+                dirs.append(fd)
+            return sync(fd)
+        with mock.patch.object(self, 'api', side_effect=transport), \
+                mock.patch.object(pull.os, 'unlink', side_effect=remove), \
+                mock.patch.object(pull.os, 'fsync', side_effect=fsync):
+            self.run_group(tasks)
+        self.assertEqual([n for p, n in calls if p.endswith('/observe-batch')], [8])
+        self.assertEqual(len(dirs), 1)
+        self.assertFalse(self.phases())
+
+    def test_no_unlink_on_partial_or_malformed_or_unchecked_bulk_permits(self):
+        for fault in ('partial', 'hold', 'refused', 'identity'):
+            tasks = self.group(3)
+            api = self.api
+            def response(cfg, path, body, **kwargs):
+                result = api(cfg, path, body, **kwargs)
+                if path.endswith('/observe-batch'):
+                    if fault == 'partial': result['results'].pop()
+                    if fault == 'hold': result['results'][2].pop('delivery_keep_checked')
+                    if fault == 'refused': result['results'][2]['delete'] = False
+                    if fault == 'identity': result['results'][2]['attempt'] += 1
+                return result
+            with self.subTest(fault=fault), mock.patch.object(self, 'api', side_effect=response), \
+                    mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('invalid bulk authority')):
+                with self.assertRaises((pull.CleanupResponseError, pull.CleanupPermitRefused)):
+                    self.run_group(tasks)
+            self.assertEqual(self.phases(), ['observe'] * 3)
+            # Fresh fixture: unresolved observations are preserved, never replaced.
+            if fault != 'identity':
+                self.doCleanups()
+                self.setUp()
+
+    def test_shared_request_clock_expires_after_first_file_without_renewal(self):
+        tasks = self.group(3)
+        clock, remove = time.monotonic, pull.os.unlink
+        offset = [0]
+        def unlink(name, **kwargs):
+            result = remove(name, **kwargs)
+            if name.endswith('.json'): offset[0] = 16
+            return result
+        with mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock()+offset[0]), \
+                mock.patch.object(pull.os, 'unlink', side_effect=unlink):
+            with self.assertRaises(pull.CleanupPermitRefused): self.run_group(tasks)
+        self.assertFalse((self.cfg.output_dir/tasks[0]['item']['relative_path']).exists())
+        self.assertTrue((self.cfg.output_dir/tasks[1]['item']['relative_path']).exists())
+        self.assertEqual(self.phases(), ['intent'] * 3)
+        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 1)
+
+    def test_directory_sync_failure_retains_all_uncertain_intents(self):
+        tasks = self.group(3)
+        sync = pull.os.fsync
+        def fail(fd):
+            import stat
+            if stat.S_ISDIR(os.fstat(fd).st_mode) and not (self.cfg.output_dir/tasks[0]['item']['relative_path']).exists():
+                raise OSError('directory sync failed')
+            return sync(fd)
+        with mock.patch.object(pull.os, 'fsync', side_effect=fail):
+            with self.assertRaises(OSError): self.run_group(tasks)
+        self.assertEqual(self.phases(), ['intent'] * 3)
+        self.assertTrue(all(not (self.cfg.output_dir/t['item']['relative_path']).exists() for t in tasks))
+        self.assertTrue(all(json.loads(r[2])['outcome'] == 'unverified' for r in pull.cleanup_journal(self.inventory)))
+
+    def test_sigkill_at_each_durability_boundary_replays_without_permit_or_unlink(self):
+        for cut in ('intent_ledger', 'intent', 'media', 'sidecar', 'directory', 'result_ledger', 'result'):
+            case = CleanupBulkTests('test_one_bulk_request_all_intents_before_unlink_all_syncs_before_success')
+            case.setUp()
+            try:
+                tasks = case.group(3)
+                script = textwrap.dedent('''
+                    import json,sys,threading,stat,os
+                    from pathlib import Path
+                    from types import SimpleNamespace
+                    from unittest import mock
+                    import test_cleanup_bulk as fixtures
+                    pull=fixtures.pull
+                    root,cut,encoded=sys.argv[1:]
+                    case=fixtures.CleanupBulkTests('test_one_bulk_request_all_intents_before_unlink_all_syncs_before_success')
+                    case.cfg=SimpleNamespace(output_dir=Path(root)/'clips',state_dir=Path(root)/'state',
+                        inventory_file=Path(root)/'state'/'inventory.sqlite3',dry_run=False)
+                    case.inventory,case.logs=pull.Inventory(case.cfg),[]
+                    ledger,journal,unlink,sync=pull.cleanup_ledger_append_many,pull.cleanup_journal_group,pull.os.unlink,pull.os.fsync
+                    def halt():
+                        print('ready',flush=True);sys.stdin.read();raise AssertionError('must SIGKILL')
+                    def append(cfg,records):
+                        ledger(cfg,records)
+                        if cut == records[0]['event']+'_ledger': halt()
+                    def checkpoint(inventory,entries):
+                        journal(inventory,entries)
+                        if cut == entries[0][2]: halt()
+                    def remove(name,**kwargs):
+                        unlink(name,**kwargs)
+                        if cut == ('sidecar' if name.endswith('.json') else 'media'): halt()
+                    def fsync(fd):
+                        sync(fd)
+                        if cut=='directory' and stat.S_ISDIR(os.fstat(fd).st_mode) and not (case.cfg.output_dir/json.loads(encoded)[0]['item']['relative_path']).exists(): halt()
+                    with mock.patch.object(pull.os.path,'ismount',return_value=True), \
+                        mock.patch.object(pull,'cleanup_pins',return_value=case.fixture_pins('2027-01-01T00:00:00+00:00','2027-01-29T00:00:00+00:00')), \
+                        mock.patch.object(pull,'log',side_effect=lambda l,m:case.logs.append((l,m))), \
+                        mock.patch.object(pull,'cleanup_ledger_append_many',side_effect=append), \
+                        mock.patch.object(pull,'cleanup_journal_group',side_effect=checkpoint), \
+                        mock.patch.object(pull.os,'unlink',side_effect=remove), \
+                        mock.patch.object(pull.os,'fsync',side_effect=fsync):
+                        case.run_group(json.loads(encoded))
+                ''')
+                child = subprocess.Popen([sys.executable, '-c', script, str(case.root), cut, json.dumps(tasks)],
+                    cwd=str(Path(__file__).parent), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    self.assertTrue(select.select([child.stdout], [], [], 20)[0], 'child never reached '+cut)
+                    line = child.stdout.readline().strip()
+                    self.assertEqual(line, 'ready', child.stderr.read() if child.poll() is not None else cut)
+                finally:
+                    child.kill();child.wait(timeout=5)
+                    child.stdin.close();child.stdout.close();child.stderr.close()
+                rows = pull.cleanup_journal(case.inventory)
+                expected = 'observe' if cut=='intent_ledger' else 'result' if cut=='result' else 'intent'
+                self.assertEqual([r[1] for r in rows], [expected]*3)
+                received = []
+                def replay(cfg,path,body,**kwargs):
+                    item_id=int(path.split('/')[-2])
+                    if path.endswith('/reconcile'):
+                        return fixtures.fixture_ack(body,item_id,action='unverified',delete=False)
+                    self.assertTrue(path.endswith('/result'),path)
+                    received.append(body)
+                    return fixtures.fixture_ack(body,item_id,ok=True)
+                with mock.patch.object(pull,'restore_api',side_effect=replay), \
+                        mock.patch.object(pull.os,'unlink',side_effect=AssertionError('replay cannot unlink')):
+                    result=pull.cleanup_replay_receipts(case.cfg,case.inventory)
+                self.assertEqual(result['failed'],0)
+                if expected=='intent':
+                    self.assertTrue(all(b['outcome']=='unverified' and 'refusal_protocol' not in b for b in received))
+            finally:
+                case.doCleanups()
+
+    def test_last_of_multiple_directory_syncs_fails_without_any_success_checkpoint(self):
+        tasks = self.group(4)
+        # Two separate parent inodes, with exact fresh proofs for both.
+        for task in tasks[2:]:
+            item=task['item']; old=self.cfg.output_dir/item['relative_path']
+            item['relative_path']=item['relative_path'].replace('/day/', '/other-day/')
+            new=self.cfg.output_dir/item['relative_path'];new.parent.mkdir(exist_ok=True)
+            old.rename(new)
+            old_sidecar=Path(str(old)+'.stoarama.json');new_sidecar=Path(str(new)+'.stoarama.json')
+            binding=json.loads(old_sidecar.read_text());binding['relative_path']=item['relative_path']
+            old_sidecar.unlink();new_sidecar.write_text(json.dumps(binding))
+            item.update(frozen_identity=pull.cleanup_identity(new.stat()), frozen_sidecar_identity=pull.cleanup_identity(new_sidecar.stat()))
+        for task in tasks:
+            with pull.CleanupFile(self.cfg,task['item'],threading.Event(),time.monotonic()+60) as current:
+                task['approved_proof']=current.proof()
+        sync=pull.os.fsync;synced=[]
+        def fail_last(fd):
+            import stat
+            if stat.S_ISDIR(os.fstat(fd).st_mode) and not (self.cfg.output_dir/tasks[0]['item']['relative_path']).exists():
+                synced.append((os.fstat(fd).st_dev,os.fstat(fd).st_ino))
+                if len(synced)==2: raise OSError('last directory sync failed')
+            return sync(fd)
+        with mock.patch.object(pull.os,'fsync',side_effect=fail_last):
+            with self.assertRaises(OSError):self.run_group(tasks)
+        self.assertEqual(len(set(synced)),2)
+        self.assertEqual(self.phases(),['intent']*4)
+
+    def test_partial_ledger_append_never_certifies_a_deleted_result(self):
+        for event in ('intent','result'):
+            case=CleanupBulkTests('test_one_bulk_request_all_intents_before_unlink_all_syncs_before_success');case.setUp()
+            try:
+                tasks=case.group(3);append=pull.cleanup_ledger_append_many
+                def partial(cfg,records):
+                    if records[0]['event']!=event:return append(cfg,records)
+                    data=b''.join(pull.cleanup_json_bytes(r)+b'\n' for r in records)
+                    fd=os.open(str(Path(cfg.state_dir)/pull.CLEANUP_LEDGER_NAME),os.O_WRONLY|os.O_APPEND|os.O_CREAT,0o600)
+                    try:os.write(fd,data[:len(data)//2]);os.fsync(fd)
+                    finally:os.close(fd)
+                    raise OSError('partial append')
+                with mock.patch.object(pull,'cleanup_ledger_append_many',side_effect=partial):
+                    with self.assertRaises(OSError):case.run_group(tasks)
+                self.assertEqual(case.phases(),['observe' if event=='intent' else 'intent']*3)
+                self.assertTrue(all(json.loads(r[2]).get('outcome')!='deleted' for r in pull.cleanup_journal(case.inventory)))
+            finally:case.doCleanups()
