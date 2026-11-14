@@ -72,6 +72,14 @@ MAX_BATCH_PLANS = 500
 # A read failed before any submission: nothing was admitted and the runner may
 # retry this stream later. Every other failure stops the runner.
 EXIT_READ_FAILED = 4
+EXIT_ADMISSION_REJECTED = 5
+
+
+class AdmissionRejected(RuntimeError):
+    """A confirmed HTTP 409 from the atomic admission POST, never a later GET."""
+    def __init__(self, label, reason):
+        super().__init__("atomic admission rejected")
+        self.label, self.reason = label, reason
 
 
 def batch_digest(policy_sha, plans):
@@ -248,7 +256,9 @@ def submit(api, label, rows, receipts, rejected, atomic=False):
         if exc.code != 409:
             raise RuntimeError(f'admission not confirmed for {label}: HTTP {exc.code}; inspect the label before retrying')
         if atomic:
-            raise RuntimeError(f'atomic admission rejected for {label}; inspect the label before retrying') from None
+            reason = exc.read(2048).decode(errors='replace')
+            exc.close()
+            raise AdmissionRejected(label, reason) from None
         if len(rows) == 1:
             rejected.append({'label': label, 'kind': rows[0]['kind'], 'source_id': rows[0]['source_id'], 'path': rows[0]['path'], 'reason': exc.read(2000).decode(errors='replace')})
             return
@@ -308,8 +318,24 @@ def main():
                'deletion_enabled': False}
     receipts, rejected = [], []
     if a.submit:
-        for label, items in plans:
-            submit(a.api, label, items, receipts, rejected, atomic=a.atomic_admission)
+        try:
+            for label, items in plans:
+                submit(a.api, label, items, receipts, rejected, atomic=a.atomic_admission)
+        except AdmissionRejected as exc:
+            # Only a single atomic POST with no earlier success proves that
+            # this stream admitted nothing. Partial or ambiguous runs still fail.
+            if len(plans) != 1 or len(a.stream) != 1 or receipts:
+                raise
+            evidence = dict(stream_id=a.stream[0], label=exc.label, http_status=409,
+                            reason=exc.reason, rejected_at_epoch=time.time())
+            with (out / 'admission-rejected.json').open('x') as f:
+                json.dump(evidence, f); f.flush(); os.fsync(f.fileno())
+            directory = os.open(out, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            return EXIT_ADMISSION_REJECTED
         summary.update(receipts=receipts, rejected_at_admission=rejected)
         batch_list = batch_manifests(receipts, a.label_prefix, a.batch_by)
         for b in batch_list:
