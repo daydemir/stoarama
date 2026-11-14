@@ -34,7 +34,7 @@ func testNASCleanupPipelineClientServer(t *testing.T, grouped bool) {
 			if grouped {
 				apiDelay, headDelay = 200*time.Millisecond, 200*time.Millisecond
 				if pipeline {
-					version = nasCleanupRollingCapsClientVersion
+					version = nasCleanupInventoryClientVersion
 				}
 			}
 			if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, version); err != nil {
