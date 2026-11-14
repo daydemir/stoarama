@@ -17915,6 +17915,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
 CLEANUP_V2_LEASE = 64          # tasks per lease request (server maximum)
 CLEANUP_V2_WORKERS = 16        # concurrent dry-run file workers
 CLEANUP_GROUP_VERSION = "cleanup-batch-v6.1"
+CLEANUP_V6_VERSIONS: frozenset[str] = frozenset((CLEANUP_GROUP_VERSION, "r2-copy-v1"))
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
 CLEANUP_V2_INFLIGHT = 64       # leased tasks held locally (running + queued)
@@ -18152,7 +18153,7 @@ def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes):
     body = {"client_version": CLIENT_VERSION, "protocol": 2, "limit": limit, "execution_files": execution_files,
             "execution_bytes": execution_bytes, "request_id": uuid.uuid4().hex,
             "reconciliation_protocol": CLEANUP_RECONCILIATION_PROTOCOL}
-    if CLIENT_VERSION == CLEANUP_GROUP_VERSION:
+    if CLIENT_VERSION in CLEANUP_V6_VERSIONS:
         body["execution_batch"] = True
     try:
         lease = cleanup_api_retry(cfg, "/account/connections/cleanup/lease", body)
@@ -18215,7 +18216,7 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                 lane.before_lease()
                 room = min(CLEANUP_V2_LEASE, inflight - len(pending), task_limit - leased)
                 files_left, bytes_left = (0, 0) if dry_run_only else cleanup_local_headroom(inventory)
-                files_left = min(files_left, CLEANUP_EXECUTION_GROUP if CLIENT_VERSION == CLEANUP_GROUP_VERSION else CLEANUP_EXECUTION_INFLIGHT)
+                files_left = min(files_left, CLEANUP_EXECUTION_GROUP if CLIENT_VERSION in CLEANUP_V6_VERSIONS else CLEANUP_EXECUTION_INFLIGHT)
                 if pins_error is not None:
                     files_left = bytes_left = 0  # every deletion would be refused
                 lease = cleanup_lease_v2(cfg, room, files_left, bytes_left)
@@ -18373,7 +18374,7 @@ def cleanup_own_group(inventory, tasks):
     owned = []
     with inventory.lock:
         try:
-            if (CLIENT_VERSION != CLEANUP_GROUP_VERSION or not 1 <= len(tasks) <= CLEANUP_EXECUTION_GROUP
+            if (CLIENT_VERSION not in CLEANUP_V6_VERSIONS or not 1 <= len(tasks) <= CLEANUP_EXECUTION_GROUP
                     or len({t["item_id"] for t in tasks}) != len(tasks)
                     or len({t["plan_sha256"] for t in tasks}) != 1
                     or any(t.get("execution_batch") is not True or t.get("approved_proof") is None for t in tasks)):
@@ -49456,7 +49457,7 @@ def execute_r2_copy(cfg, runtime, inventory, stop, task):
                     raise R2CopyHold("existing copy final conflicts; preserved")
                 payload = r2_copy_sidecar(parent, name, task["clip"])
                 guard.check(remote=True)
-                current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                _, current = confined_regular_file(cfg.output_dir, item["relative_path"])
                 if cleanup_identity(current) != cleanup_identity(info):
                     raise R2CopyHold("copy final changed before inventory")
                 inventory._upsert(task["clip"], "present", utc_now_precise(), info.st_mtime_ns,

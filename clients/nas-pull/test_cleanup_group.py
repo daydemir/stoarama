@@ -72,6 +72,22 @@ class CleanupGroupTests(unittest.TestCase):
         with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_GROUP_VERSION), mock.patch.object(pull, 'restore_api', side_effect=self.api):
             pull.cleanup_process_group(self.cfg, self.inventory, threading.Event(), tasks)
 
+    def test_r2_copy_release_executes_exact_v6_group_path(self):
+        stages = []
+        for version in sorted(pull.CLEANUP_V6_VERSIONS):
+            with self.subTest(version=version):
+                tasks = self.group(3)
+                calls = []
+                def api(cfg, path, body, **kwargs):
+                    calls.append((path, len(body.get('observations', body.get('receipts', []))), body.get('execution_batch')))
+                    return self.api(cfg, path, body, **kwargs)
+                with mock.patch.object(pull, 'CLIENT_VERSION', version), mock.patch.object(pull, 'restore_api', side_effect=api):
+                    pull.cleanup_process_group(self.cfg, self.inventory, threading.Event(), tasks)
+                self.assertTrue(all(not (self.cfg.output_dir/t['item']['relative_path']).exists() for t in tasks))
+                self.assertFalse(pull.cleanup_journal(self.inventory))
+                stages.append(calls)
+        self.assertEqual(stages[0], stages[1])
+
     def test_v5_group_rejects_permit_without_delivery_hold_check(self):
         tasks = self.group(1)
         api = self.api

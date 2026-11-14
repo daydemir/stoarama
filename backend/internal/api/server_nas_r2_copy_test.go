@@ -254,3 +254,16 @@ func TestNASR2CopyConcurrentGrantsAndStaleCompletion(t *testing.T) {
 		t.Fatal("second GET not charged")
 	}
 }
+
+func TestNASR2CopyCleanupVersionSetIsExact(t *testing.T) {
+	for _, v := range []string{nasCleanupRollingCapsClientVersion, nasCleanupInventoryClientVersion, string(nasCleanupV6R2Copy)} {
+		if !nasCleanupSupportsV6(v) {
+			t.Fatalf("v6 release refused %s", v)
+		}
+	}
+	for _, v := range []string{"", "development", "r2-copy-v2", "cleanup-batch-v5", "cleanup-batch-v6-extra"} {
+		if nasCleanupSupportsV6(v) {
+			t.Fatalf("unreviewed v6 release accepted %s", v)
+		}
+	}
+}
