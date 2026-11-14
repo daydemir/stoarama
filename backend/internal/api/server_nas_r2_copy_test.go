@@ -51,7 +51,11 @@ func copyTestFixture(t *testing.T) (*cleanupFixture, NASR2CopyItem) {
 }
 func copyCall(f *cleanupFixture, action string, id int64, body any) *httptest.ResponseRecorder {
 	data, _ := json.Marshal(body)
-	req := httptest.NewRequest("POST", "/", strings.NewReader(string(data)))
+	path := fmt.Sprintf("/api/v1/account/connections/r2-copy/%d/%s", id, action)
+	if action == "lease" {
+		path = "/api/v1/account/connections/r2-copy/lease"
+	}
+	req := httptest.NewRequest("POST", path, strings.NewReader(string(data)))
 	ctx := context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: 47, APIKeyID: ptrInt64(5), KeyScopes: []string{accountScopePull}})
 	route := chi.NewRouteContext()
 	route.URLParams.Add("id", fmt.Sprint(id))
@@ -59,7 +63,7 @@ func copyCall(f *cleanupFixture, action string, id int64, body any) *httptest.Re
 	req = req.WithContext(ctx)
 	out := httptest.NewRecorder()
 	handlers := map[string]http.HandlerFunc{"lease": f.s.handleNASR2CopyLease, "checkpoint": f.s.handleNASR2CopyCheckpoint, "range": f.s.handleNASR2CopyRange, "result": f.s.handleNASR2CopyResult}
-	handlers[action](out, req)
+	f.s.confineAccountScope(f.s.fenceNASDelivery(handlers[action])).ServeHTTP(out, req)
 	return out
 }
 func copyLease(t *testing.T, f *cleanupFixture) nasR2CopyTask {
@@ -79,7 +83,7 @@ func copyLease(t *testing.T, f *cleanupFixture) nasR2CopyTask {
 func TestNASR2CopyDefaultOffBudgetAndInventory(t *testing.T) {
 	f, i := copyTestFixture(t)
 	if out := copyCall(f, "lease", 0, nasR2CopyControl{FreeBytes: NASR2CopyFloor + 1e9}); out.Code != 409 {
-		t.Fatal("default enabled")
+		t.Fatalf("default-off copy route status=%d body=%s; want 409", out.Code, out.Body)
 	}
 	f.s.cfg.NASR2CopyEnabled = true
 	if out := copyCall(f, "lease", 0, nasR2CopyControl{FreeBytes: NASR2CopyFloor - 1}); out.Code != 409 {
@@ -265,5 +269,35 @@ func TestNASR2CopyCleanupVersionSetIsExact(t *testing.T) {
 		if nasCleanupSupportsV6(v) {
 			t.Fatalf("unreviewed v6 release accepted %s", v)
 		}
+	}
+}
+
+func TestNASR2CopyScopedRouteShapes(t *testing.T) {
+	for _, path := range []string{"/api/v1/account/connections/r2-copy/lease", "/api/v1/account/connections/r2-copy/1/checkpoint", "/api/v1/account/connections/r2-copy/1/range", "/api/v1/account/connections/r2-copy/1/result"} {
+		if !pullPathAllowed(http.MethodPost, path) {
+			t.Errorf("required copy route denied: %s", path)
+		}
+		for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
+			if pullPathAllowed(method, path) {
+				t.Errorf("copy route admits %s %s", method, path)
+			}
+		}
+	}
+	for _, path := range []string{"/api/v1/account/connections/r2-copy/1/delete", "/api/v1/account/connections/r2-copy/1/range/extra", "/api/v1/account/connections/r2-copy/../range", "/api/v1/account/connections/r2-copy/lease/extra", "/api/v1/service/nas-r2-copy", "/api/v1/account/connections/r2-copy/1/range?extra"} {
+		if pullPathAllowed(http.MethodPost, path) {
+			t.Errorf("unexpected copy authority: %s", path)
+		}
+	}
+}
+
+func TestNASR2CopyScopedOtherConnectionDenied(t *testing.T) {
+	f, _ := copyTestFixture(t)
+	f.s.cfg.NASR2CopyEnabled = true
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/r2-copy/lease", strings.NewReader(fmt.Sprintf(`{"free_bytes":%d}`, NASR2CopyFloor+1_000_000_000)))
+	req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: 48, APIKeyID: ptrInt64(6), KeyScopes: []string{accountScopePull}}))
+	out := httptest.NewRecorder()
+	f.s.confineAccountScope(f.s.fenceNASDelivery(http.HandlerFunc(f.s.handleNASR2CopyLease))).ServeHTTP(out, req)
+	if out.Code != 403 || !strings.Contains(out.Body.String(), "connection 13") {
+		t.Fatalf("foreign valid pull key response %d %s", out.Code, out.Body)
 	}
 }
