@@ -477,13 +477,50 @@ class LoopTests(unittest.TestCase):
             try:
                 self.assertFalse(restored.stream_ready(3))
                 restored.windows = job.windows
-                restored.query = lambda *a: []
+                restored.query = lambda sql, *a: 0 if 'count(*)' in sql else []
                 restored.stream_order = lambda: [3]
                 restored.confirm_empty = lambda: self.fail('excluded supply claimed complete')
                 self.assertIsNone(restored.pick())
                 self.assertEqual(restored.status['phase'], 'excluded_streams_remaining')
             finally:
                 restored.lock.close()
+
+    def test_excluded_unenabled_current_or_successor_never_enables_but_issued_stops(self):
+        for saved in ('current_plan', 'next_plan'):
+            with tempfile.TemporaryDirectory() as root:
+                job = FakeRunner(root)
+                job.status.update(excluded_streams={'3': dict(http_status=409, stream_id=3,
+                    reason='protected', label='rejected')}, **{saved: 42})
+                job.picks = [None]
+                job.run()
+                self.assertNotIn('ON', job.events)
+                self.assertEqual(job.status['parked_unenabled_plan'], 42)
+                self.assertEqual(job.status['phase'], 'excluded_streams_remaining')
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            job.status['excluded_streams'] = {'3': {}}
+            job.p['results'][0]['delete_ever_issued'] = True
+            with self.assertRaisesRegex(r.Halt, 'issued deletions'):
+                job.excluded_plan(job.p)
+            self.assertNotIn('parked_unenabled_plan', job.status)
+
+    def test_lookahead_exclusion_prevents_current_enable_and_unrelated_pending_still_stops(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
+            job = FakeRunner(root)
+            def pick(lookahead=False):
+                if lookahead:
+                    job.status['excluded_streams'] = {'3': {}}
+                    return None
+                return None if job.status.get('excluded_streams') else 42
+            job.pick = pick
+            job.run()
+            self.assertNotIn('ON', job.events)
+        with tempfile.TemporaryDirectory() as root:
+            job = self.isolation_job(root, [])
+            job.status['excluded_streams'] = {'3': {}}
+            job.query = lambda sql: 1 if 'count(*)' in sql else []
+            with self.assertRaisesRegex(r.Halt, 'reserved or uncertain'):
+                r.Runner.pick(job)
 
     def test_rejection_without_evidence_or_outside_admission_still_stops(self):
         with tempfile.TemporaryDirectory() as root:
