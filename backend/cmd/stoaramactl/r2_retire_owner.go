@@ -68,29 +68,23 @@ func (s *r2RetireSets) loadOwnerProtections(ctx context.Context, q r2RetireQueri
 		s.PresentRaw = map[int64]bool{}
 		s.PresentPaths = map[string]bool{}
 		s.PresentContent = map[r2RetireNASIdentity]bool{}
-		presence, err := q.Query(ctx, `SELECT clip_id,relative_path,coalesce(sha256,''),coalesce(size_bytes,0) FROM nas_inventory_files WHERE state<>'missing'`)
+		var id int64
+		var path, sha string
+		var size int64
+		err := r2RetireInventoryEach(ctx, q, `n.clip_id,n.relative_path,coalesce(n.sha256,''),coalesce(n.size_bytes,0)`, `n.state<>'missing'`, nil,
+			[]any{&id, &path, &sha, &size}, func() error {
+				s.PresentRaw[id] = true
+				s.PresentPaths[path] = true
+				if size > 0 && sha != "" {
+					s.PresentContent[r2RetireNASIdentity{"", sha, size}] = true
+				}
+				return nil
+			})
 		if err != nil {
 			return err
 		}
-		for presence.Next() {
-			var id int64
-			var path, sha string
-			var size int64
-			if err := presence.Scan(&id, &path, &sha, &size); err != nil {
-				presence.Close()
-				return err
-			}
-			s.PresentRaw[id] = true
-			s.PresentPaths[path] = true
-			if size > 0 && sha != "" {
-				s.PresentContent[r2RetireNASIdentity{"", sha, size}] = true
-			}
-		}
-		presence.Close()
-		if presence.Err() != nil {
-			return presence.Err()
-		}
-		presence, err = q.Query(ctx, `SELECT relative_path FROM nas_inventory_unmatched_files WHERE state<>'missing'`)
+
+		presence, err := q.Query(ctx, `SELECT relative_path FROM nas_inventory_unmatched_files WHERE state<>'missing'`)
 		if err != nil {
 			return err
 		}
@@ -111,34 +105,59 @@ func (s *r2RetireSets) loadOwnerProtections(ctx context.Context, q r2RetireQueri
 	s.ProtectedCollated = map[int64]bool{}
 	sql, policy := r2RetireOwnerPlanSQL(), r2RetireOwnerPolicy(windows, picks)
 	if scope.Class == r2RetireDeliveryOnly {
-		sql = r2RetireDeliverySourceSQL(sql)
+		sql = r2RetireDeliverySourceSQL(r2OwnerPolicySQL)
+		// Keep source membership as indexed, correlated ID lookups.
+		sql = strings.Replace(sql, "SELECT 1 FROM safe_raw s WHERE s.id=source", "SELECT 1 FROM LATERAL (SELECT id FROM safe_raw WHERE id=source OFFSET 0) s", 1)
 		policy = r2RetireDeliveryPolicy(windows, picks)
 	}
-	rows, err := q.Query(ctx, sql+`SELECT id,source_clip_ids FROM unsafe_outputs`, policy, scope.AccountID)
-	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		var id int64
-		var sources []int64
-		if err := rows.Scan(&id, &sources); err != nil {
-			rows.Close()
+	var after int64
+	for {
+		query := sql + `SELECT id,source_clip_ids FROM unsafe_outputs`
+		args := []any{policy, scope.AccountID}
+		var last int64
+		if scope.Class == r2RetireDeliveryOnly {
+			first, end, found, err := r2RetireIDRange(ctx, q, "collated", after, r2RetireEvidencePageSize)
+			if err != nil {
+				return err
+			}
+			if !found {
+				break
+			}
+			last = end
+			query += ` WHERE id BETWEEN $3 AND $4`
+			args = append(args, first, last)
+		}
+		rows, err := q.Query(ctx, query, args...)
+		if err != nil {
 			return err
 		}
-		s.ProtectedCollated[id] = true
-		for _, id := range sources {
-			s.ProtectedRaw[id] = true
+		for rows.Next() {
+			var id int64
+			var sources []int64
+			if err := rows.Scan(&id, &sources); err != nil {
+				rows.Close()
+				return err
+			}
+			s.ProtectedCollated[id] = true
+			for _, source := range sources {
+				s.ProtectedRaw[source] = true
+			}
 		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if scope.Class != r2RetireDeliveryOnly {
+			break
+		}
+		after = last
 	}
-	rows.Close()
-	if rows.Err() != nil {
-		return rows.Err()
-	}
+
 	// Incident holds survive every plan/receipt transition.
 	for _, id := range r2RetireIncidentSources {
 		s.HeldRaw[id] = true
 	}
-	rows, err = q.Query(ctx, `SELECT id FROM recording_collation_outputs WHERE source_clip_ids && $1::bigint[]`, r2RetireIncidentSources)
+	rows, err := q.Query(ctx, `SELECT id FROM recording_collation_outputs WHERE source_clip_ids && $1::bigint[]`, r2RetireIncidentSources)
 	if err != nil {
 		return err
 	}
@@ -170,6 +189,7 @@ func r2RetireOwnerLive(ctx context.Context, q r2RetireQuerier, c *r2RetireCandid
  ($3='raw' AND $4=ANY($7::bigint[])) OR ($3='collated' AND EXISTS(SELECT 1 FROM recording_collation_outputs WHERE id=$4 AND source_clip_ids && $7::bigint[]))`
 	if scope.Class == r2RetireDeliveryOnly {
 		query = r2RetireDeliverySourceSQL(query)
+		query = strings.Replace(query, "SELECT 1 FROM safe_raw s WHERE s.id=source", "SELECT 1 FROM LATERAL (SELECT id FROM safe_raw WHERE id=source OFFSET 0) s", 1)
 	}
 	if err := q.QueryRow(ctx, query, scope.OwnerPolicy, scope.AccountID, c.Kind, c.SourceID, c.Bucket, c.ObjectKey, r2RetireIncidentSources).Scan(&protected, &shared, &incident); err != nil {
 		return err
@@ -179,7 +199,15 @@ func r2RetireOwnerLive(ctx context.Context, q r2RetireQuerier, c *r2RetireCandid
 	c.Facts.Held = c.Facts.Held || incident
 	if scope.OwnerSchema {
 		var held bool
-		if err := q.QueryRow(ctx, `SELECT CASE WHEN $1='raw' THEN nas_cleanup_owner_clip_held($2) ELSE EXISTS(SELECT 1 FROM nas_cleanup_owner_reserved_files WHERE kind=$1 AND source_id=$2) END`, c.Kind, c.SourceID).Scan(&held); err != nil {
+		heldFunction := "nas_cleanup_clip_held"
+		if scope.Class == r2RetireOwnerAccepted {
+			heldFunction = "nas_cleanup_owner_clip_held"
+		}
+		reservedView := "nas_cleanup_r2_reserved_files"
+		if scope.Class == r2RetireOwnerAccepted {
+			reservedView = "nas_cleanup_owner_reserved_files"
+		}
+		if err := q.QueryRow(ctx, `SELECT CASE WHEN $1='raw' THEN `+heldFunction+`($2) ELSE EXISTS(SELECT 1 FROM `+reservedView+` WHERE kind=$1 AND source_id=$2) END`, c.Kind, c.SourceID).Scan(&held); err != nil {
 			return err
 		}
 		c.Facts.Held = c.Facts.Held || held
