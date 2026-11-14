@@ -18170,7 +18170,7 @@ def cleanup_local_headroom(inventory):
     return CLEANUP_MAX_FILES_24H - files, CLEANUP_MAX_BYTES_24H - total
 
 
-def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes):
+def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes, execution_only=False):
     started = time.monotonic()
     if type(limit) is not int or not 1 <= limit <= CLEANUP_V2_LEASE:
         raise ValueError("invalid cleanup lease bound")
@@ -18181,6 +18181,10 @@ def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes):
             "reconciliation_protocol": CLEANUP_RECONCILIATION_PROTOCOL}
     if CLIENT_VERSION in CLEANUP_GROUP_VERSIONS:
         body["execution_batch"] = True
+    if CLIENT_VERSION == CLEANUP_BULK_VERSION:
+        body["dry_run_limit"] = min(2, limit)  # No long local queue ahead of execution.
+    if execution_only:
+        body["execution_only"] = True
     try:
         lease = cleanup_api_retry(cfg, "/account/connections/cleanup/lease", body)
     except urllib.error.HTTPError as exc:
@@ -18197,6 +18201,8 @@ def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes):
     if len({task["item_id"] for task in tasks}) != len(tasks):
         raise RuntimeError("duplicate cleanup task identity")
     executing = [task for task in tasks if task.get("approved_proof") is not None]
+    if execution_only and len(executing) != len(tasks):
+        raise CleanupResponseError("dry-run work in execution-only lease")
     if executing and len(executing) != len(tasks):
         raise RuntimeError("cleanup lease mixes execution and dry-run work")
     sizes = [task["item"].get("size_bytes") for task in executing]
@@ -18238,14 +18244,16 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
             verified_event.set()
     try:
         while not stop_event.is_set() and (active is None or active.is_set()):
-            while not exhausted and not stop_event.is_set() and (active is None or active.is_set()) and error is None and len(pending) < inflight and leased < task_limit:
+            while not exhausted and not stop_event.is_set() and (active is None or active.is_set()) and error is None and (len(pending) < inflight or (pending and not dry_run_only and CLIENT_VERSION == CLEANUP_BULK_VERSION)) and leased < task_limit:
                 lane.before_lease()
-                room = min(CLEANUP_V2_LEASE, inflight - len(pending), task_limit - leased)
+                execution_poll = bool(pending) and not dry_run_only and CLIENT_VERSION == CLEANUP_BULK_VERSION
+                room = min(CLEANUP_EXECUTION_GROUP if execution_poll else min(CLEANUP_V2_LEASE, inflight - len(pending)), task_limit - leased)
                 files_left, bytes_left = (0, 0) if dry_run_only else cleanup_local_headroom(inventory)
                 files_left = min(files_left, CLEANUP_EXECUTION_GROUP if CLIENT_VERSION in CLEANUP_GROUP_VERSIONS else CLEANUP_EXECUTION_INFLIGHT)
                 if pins_error is not None:
                     files_left = bytes_left = 0  # every deletion would be refused
-                lease = cleanup_lease_v2(cfg, room, files_left, bytes_left)
+                lease = (cleanup_lease_v2(cfg, room, files_left, bytes_left, execution_only=True)
+                         if execution_poll else cleanup_lease_v2(cfg, room, files_left, bytes_left))
                 retry = lease.get("retry_after_sec", 120)
                 if not dry_run_only:
                     CLEANUP_STATUS.update(last_lease_at=utc_now(), last_lease_tasks=len(lease["tasks"]))
@@ -18303,7 +18311,13 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                     pending[executor.submit(cleanup_process_task, cfg, inventory, stop_event, task, api)] = task
             if not pending or error is not None:
                 break
-            done, _ = concurrent.futures.wait(list(pending), return_when=concurrent.futures.FIRST_COMPLETED)
+            # An empty execution lease is only a snapshot: the runner can
+            # enable a plan while the at-most-two dry runs are still hashing.
+            poll_execution = not dry_run_only and CLIENT_VERSION == CLEANUP_BULK_VERSION
+            done, _ = concurrent.futures.wait(list(pending), timeout=CLEANUP_DRAIN_RETRY_SEC if poll_execution else None,
+                                               return_when=concurrent.futures.FIRST_COMPLETED)
+            if poll_execution:
+                exhausted = False
             for future in done:
                 pending.pop(future)
                 try:

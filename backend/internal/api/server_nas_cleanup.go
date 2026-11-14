@@ -650,6 +650,8 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		Protocol               int    `json:"protocol"`
 		Limit                  int    `json:"limit"`
 		ExecutionBatch         bool   `json:"execution_batch,omitempty"`
+		ExecutionOnly          bool   `json:"execution_only,omitempty"`
+		DryRunLimit            *int   `json:"dry_run_limit,omitempty"`
 		ExecutionFiles         *int   `json:"execution_files,omitempty"`
 		ExecutionBytes         *int64 `json:"execution_bytes,omitempty"`
 		// Protocol 2: a retried request returns the tasks it already leased.
@@ -661,7 +663,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	}
 	switch req.Protocol {
 	case 1:
-		if req.Limit > nasCleanupLeaseMaxV1 || req.ExecutionFiles != nil || req.ExecutionBytes != nil || req.RequestID != "" {
+		if req.Limit > nasCleanupLeaseMaxV1 || req.ExecutionFiles != nil || req.ExecutionBytes != nil || req.RequestID != "" || req.ExecutionOnly || req.DryRunLimit != nil {
 			util.WriteError(w, 400, "cleanup protocol1, client version and bounded limit required")
 			return
 		}
@@ -672,6 +674,10 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		}
 	default:
 		util.WriteError(w, 400, "cleanup protocol1, client version and bounded limit required")
+		return
+	}
+	if req.DryRunLimit != nil && (*req.DryRunLimit < 0 || *req.DryRunLimit > req.Limit) {
+		util.WriteError(w, 400, "cleanup dry-run limit exceeds lease bound")
 		return
 	}
 	if req.ExecutionBatch && (req.Protocol != 2 || (req.ClientVersion != nasCleanupGroupClientVersion && req.ClientVersion != nasCleanupSerialGroupClientVersion && req.ClientVersion != nasCleanupDurableGroupClientVersion && req.ClientVersion != nasCleanupBatchedCapsClientVersion && req.ClientVersion != nasCleanupDeliveryHoldClientVersion && !nasCleanupSupportsGroupedExecution(req.ClientVersion)) || req.RequestID == "") {
@@ -730,6 +736,12 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 			return
 		}
 		if len(replayed) != 0 {
+			for _, task := range replayed {
+				if req.ExecutionOnly && task.ApprovedProof == nil {
+					util.WriteError(w, 409, "lease replay role differs")
+					return
+				}
+			}
 			util.WriteJSON(w, 200, map[string]any{"tasks": replayed, "retry_after_sec": 0, "replayed": true, "recovery_md5": cleanupLeaseAdvertisesMD5})
 			return
 		}
@@ -745,6 +757,9 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		if err != nil || json.Unmarshal(raw, &task.Item) != nil {
 			util.WriteError(w, 500, "cleanup lease load failed")
 			return
+		}
+		if mode != "enabled" && (req.ExecutionOnly || (req.DryRunLimit != nil && len(tasks) >= *req.DryRunLimit)) {
+			break
 		}
 		if len(groupIDs) != 0 && mode != "enabled" {
 			break
