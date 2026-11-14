@@ -20,6 +20,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/util"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"golang.org/x/sync/semaphore"
 )
 
 // NAS cleanup throughput (2026-11). Nothing here adds deletion authority:
@@ -40,6 +41,19 @@ const (
 // request below. Unfinished recovery never yields a permit. Variables allow
 // tests to shorten the budgets.
 var nasCleanupRecoveryBudget = 40 * time.Second
+
+// Full-object GETs share pressure across ALL requests. Large objects run alone;
+// small audits may overlap. Conditional HEAD/MD5 checks never take these slots.
+var nasCleanupRecoveryReads = semaphore.NewWeighted(nasCleanupRecoveryParallel)
+var nasCleanupFullReadBudget = 35 * time.Second
+
+func cleanupRecoveryReadWeight(size int64) int64 {
+	const chunk int64 = 64 << 20
+	if size <= 0 {
+		return 1
+	}
+	return min(int64(nasCleanupRecoveryParallel), 1+(size-1)/chunk)
+}
 
 // Includes authentication, mode lookup, recovery, lock waits and commit. This
 // must leave ample room inside the client's independent 30 s refusal guard.
@@ -504,8 +518,15 @@ func (s *Server) cleanupRecoveryFullOnce(ctx context.Context, i nasCleanupItem) 
 	if head.ETag == "" {
 		return "r2_present_unverified", nil
 	}
-	// Bounded streaming verification. No media is saved on the backend or Jelly.
-	c, cancel := context.WithTimeout(ctx, 25*time.Second)
+	weight := cleanupRecoveryReadWeight(i.SizeBytes)
+	if err := nasCleanupRecoveryReads.Acquire(ctx, weight); err != nil {
+		return "r2_present_unverified", nil
+	}
+	defer nasCleanupRecoveryReads.Release(weight)
+	// Bounded streaming verification. Keep the existing 40s prefetch budget
+	// and 60s HTTP write limit; an execution context still ends after 15s.
+	// No media is saved on the backend or Jelly.
+	c, cancel := context.WithTimeout(ctx, nasCleanupFullReadBudget)
 	defer cancel()
 	source, err := s.r2.OpenExact(c, i.ObjectKey, head.ETag, head.VersionID)
 	if err != nil {
