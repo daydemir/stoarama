@@ -22291,6 +22291,8 @@ def joined_quarantine_stage_evidence(cfg, directory_fd, entry, record, copies):
                 != (record["device"], record["inode"], record["size_bytes"])):
             return None
         marker = json.loads(content)
+        if not isinstance(marker, dict):
+            return None
         if marker.pop("schema_version") != 3:
             return None
         for key in ("etag", "version_id", "url_scheme", "url_authority", "url_path"):

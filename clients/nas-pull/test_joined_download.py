@@ -1788,6 +1788,15 @@ class JoinedDownloadTests(unittest.TestCase):
             self.assertEqual(status["unknown_alias_count"], 0)
             self.assertEqual(status["stage_evidence"][0]["sha256"], hashlib.sha256(expected).hexdigest())
             self.assertEqual(before, self.entry_snapshot(alias))
+            for value in (None, "foreign marker", 17, True, []):
+                with self.subTest(value=value):
+                    content = json.dumps(value).encode().ljust(len(expected), b" ")
+                    alias.write_bytes(content)
+                    restarted = self.runtime(cfg)
+                    status = restarted.heartbeat_payload(None)["cleanup"]["joined_quarantine"]
+                    self.assertEqual(status["proven_stage_count"], 0)
+                    self.assertEqual(status["unknown_alias_count"], 1)
+                    self.assertEqual(alias.read_bytes(), content)
             alias.write_bytes(b"changed metadata")
             _, _, status = pull.joined_quarantine_startup_status(cfg)
             self.assertEqual(status["proven_stage_count"], 0)
