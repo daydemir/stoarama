@@ -127,13 +127,14 @@ def query(sql, psql):
 
 
 def candidates(policy, streams, bucket, psql):
+    from reviewed_scope import admissible_candidates
     # One bounded read-only query per stream keeps each transaction short.
     rows = []
     for sid in sorted(streams or policy):
         part = stream_candidates(policy[sid], bucket, psql)
         rows += part
         print(json.dumps({'phase': 'listed_stream', 'stream_id': sid, 'files': len(part), 'bytes': sum(r['size_bytes'] for r in part)}), file=sys.stderr, flush=True)
-    return rows
+    return admissible_candidates(rows)
 
 
 def stream_candidates(w, bucket, psql):
@@ -154,6 +155,7 @@ def stream_candidates(w, bucket, psql):
  CROSS JOIN LATERAL (SELECT f.* FROM nas_inventory_files f WHERE f.connection_id=13 AND f.clip_id=c.id OFFSET 0) f
  WHERE f.state='present' AND f.relative_path=c.display_path AND f.sha256=lower(c.sha256) AND f.size_bytes=c.size_bytes
   AND r.account_id=47 AND c.bucket=""" + bucket_literal + """ AND c.size_bytes>0
+  AND c.object_key<>'' AND lower(c.sha256) ~ '^[0-9a-f]{64}$'
   AND c.clip_end_at>c.clip_start_at AND c.clip_start_at>='2020-01-01' AND c.clip_end_at<'2028-01-01'
   AND NOT (c.clip_start_at<w.e AND c.clip_end_at>w.s)
 ), col AS MATERIALIZED (
@@ -161,7 +163,8 @@ def stream_candidates(w, bucket, psql):
  FROM recording_collation_outputs o JOIN recording_collation_output_acks a ON a.output_id=o.id AND a.connection_id=13 AND a.sha256=lower(o.sha256) AND a.size_bytes=o.size_bytes
  JOIN recording_collation_hours h ON h.id=o.collation_hour_id JOIN recordings r ON r.id=h.recording_id JOIN w ON w.stream_id=r.stream_id
  WHERE r.account_id=47 AND o.end_at>o.start_at AND o.start_at>='2020-01-01' AND o.end_at<'2028-01-01' AND NOT (o.start_at<w.e AND o.end_at>w.s)
-  AND cardinality(o.source_clip_ids)>0
+  AND o.size_bytes>0 AND o.object_key<>'' AND lower(o.sha256) ~ '^[0-9a-f]{64}$'
+  AND cardinality(o.source_clip_ids) BETWEEN 1 AND 10000
   AND NOT EXISTS (SELECT 1 FROM unnest(o.source_clip_ids) sid LEFT JOIN recording_clips c ON c.id=sid LEFT JOIN recordings cr ON cr.id=c.recording_id
    WHERE c.id IS NULL OR cr.stream_id IS DISTINCT FROM r.stream_id OR c.bucket IS DISTINCT FROM """ + bucket_literal + """
     OR NOT (c.clip_end_at>c.clip_start_at) OR (c.clip_start_at<w.e AND c.clip_end_at>w.s))

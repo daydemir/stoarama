@@ -30,6 +30,54 @@ class InventoryUploadRecoveryTests(unittest.TestCase):
         pull.write_stitch_sidecar(path, clip)
         return clip
 
+    def test_cleanup_can_check_caps_between_inventory_observations_without_losing_scan(self):
+        cfg, inventory = self.fixture()
+        self.add_clip(cfg, 1)
+        self.add_clip(cfg, 2)
+        hash_file = pull.sha256_file_throttled_stable
+        checks = []
+
+        def hash_with_cleanup(*args, **kwargs):
+            checks.append(pull.cleanup_local_headroom(inventory))
+            return hash_file(*args, **kwargs)
+
+        pages = []
+        with mock.patch.object(pull, "sha256_file_throttled_stable", side_effect=hash_with_cleanup), \
+                mock.patch.object(pull, "request_json", side_effect=lambda *a, **k: pages.append(k["body"]) or {}):
+            inventory.full_scan(cfg, threading.Event())
+        self.assertEqual(len(checks), 2)
+        self.assertEqual(checks, [(pull.CLEANUP_MAX_FILES_24H, pull.CLEANUP_MAX_BYTES_24H)] * 2)
+        self.assertTrue(pages[-1]["complete"])
+        self.assertEqual(inventory.summary()["clips"], 2)
+        self.assertIsNotNone(inventory.summary()["scan_completed_at"])
+
+    def test_cleanup_reservation_is_durable_when_the_inventory_walk_stops(self):
+        cfg, inventory = self.fixture()
+        self.add_clip(cfg, 1)
+        self.add_clip(cfg, 2)
+        stop = threading.Event()
+        hash_file = pull.sha256_file_throttled_stable
+        calls = []
+
+        def reserve_then_stop(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                pull.cleanup_reserve_group_caps(inventory, [dict(item_id=42, plan_sha256="b"*64,
+                    item=dict(relative_path="cleanup/file.mp4", size_bytes=13))])
+            else:
+                stop.set()
+                raise pull.InventoryScanStopped()
+            return hash_file(*args, **kwargs)
+
+        with mock.patch.object(pull, "sha256_file_throttled_stable", side_effect=reserve_then_stop), \
+                mock.patch.object(pull, "request_json", return_value={}):
+            inventory.full_scan(cfg, stop)
+        reopened = pull.Inventory(cfg)
+        self.addCleanup(reopened.close)
+        self.assertEqual(pull.cleanup_local_headroom(reopened),
+                         (pull.CLEANUP_MAX_FILES_24H-1, pull.CLEANUP_MAX_BYTES_24H-13))
+        self.assertIsNone(reopened.summary()["scan_completed_at"])
+
     def test_502_during_walk_retries_page_and_completes_without_rehashing(self):
         cfg, inventory = self.fixture()
         self.add_clip(cfg, 1)

@@ -31,6 +31,11 @@ func TestNASCleanupSerialGroupRosterAndReplay(t *testing.T) {
 	}
 }
 
+func TestNASCleanupInventoryFixReleaseKeepsSessionAndSerialGroupGates(t *testing.T) {
+	t.Run("session", func(t *testing.T) { testNASCleanupReviewedReleaseGates(t, "cleanup-batch-v6.1") })
+	t.Run("group", func(t *testing.T) { testNASCleanupSerialGroupRosterAndReplay(t, "cleanup-batch-v6.1") })
+}
+
 func testNASCleanupSerialGroupRosterAndReplay(t *testing.T, version string) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("serial-group", syntheticFiles(100, 20, 20))

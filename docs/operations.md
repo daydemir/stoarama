@@ -240,3 +240,35 @@ The delivery migrations are `0189_delivery_keep_holds.sql` and
 `0188_nas_cleanup_leased_index.sql`. Migration identities use full filenames.
 The upgrade regression applies main first, then both delivery migrations, checks
 the exact seed and R2 veto, and replays migration discovery without duplication.
+
+### NAS cleanup inventory repair (v6.1)
+
+`cleanup-batch-v6.1` retains v6's execution protocol and durability budget.
+Inventory observations stay in a bounded memory batch until one locked SQLite
+checkpoint commits them. No scan transaction remains open during NAS I/O or
+between journal lock acquisitions, so cleanup cannot roll back scan observations
+or fail its own `BEGIN IMMEDIATE` against them. Completion still requires the
+actual complete scan and acknowledged final publication.
+
+Fresh joined marker publication removes only its own current-call, exclusively
+created temporary hardlink after exact content and namespace checks. Restart
+recovery retains the existing preservation path. Historical aliases are never
+removed by this release. Heartbeat `cleanup.joined_quarantine` keeps the total
+alias count and adds `proven_stage_count`, `unknown_alias_count`,
+`ledger_problem_count` and bounded `stage_evidence` (artifact, inode, size, hash).
+Only a stable single-link marker matching a completed alias move and canonical
+copy, exact artifact identity and copied hash can count as a proven stage.
+Unknown aliases, ledger problems and pending recovery remain release blockers.
+
+The keep28 preparer now reads the unchanged SHA-pinned reviewed report and frozen
+index before proposing files. It excludes unreviewed/wrong-owner parents,
+ambiguous names, missing/changed/linked frozen entries and missing raw sidecars.
+Admission remains authoritative and unchanged. The Jelly ranking cache uses a new
+namespace so catalog-only density estimates, including stream 17234's unreviewed
+September 25 folder, are rebuilt through the same selector.
+
+Stage/promote this version only from reviewed merged main through the existing
+release scripts, in a naturally idle master-OFF window. Before restart, verify a
+fresh executing heartbeat, stable zero cycle errors, actual inventory completion,
+no inventory mismatch and either zero aliases or complete benign stage proof.
+Do not clear the runner's preparer error or remove STOP until these gates pass.
