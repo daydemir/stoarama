@@ -41,6 +41,14 @@ class ReadFailure(Halt):
     """A transient read error with a fixed, credential-free reason."""
 
 
+class CommandFailed(Halt):
+    """A local command failed; returncode is None for a timeout or OS error."""
+
+    def __init__(self, returncode):
+        super().__init__('local command failed; inspect privately')
+        self.returncode = returncode
+
+
 class RequestConflict(Halt):
     """The server refused a mutation with HTTP 409."""
 
@@ -290,6 +298,12 @@ READ_RETRY_DELAYS = (5, 10, 20, 30, 60, 60, 120, 120, 120, 120, 120, 120, None) 
 COMMAND_TIMEOUT_SEC = 360
 PREPARE_TIMEOUT_SEC = 1800  # keep28 preparation on large streams exceeds six minutes
 STREAM_SUMMARY_TTL_SEC = 24 * 3600
+PREPARER = 'backend/scripts/nas-cleanup/prepare_keep28_plans.py'
+# A stream whose read-only preparation failed is retried after this delay; other
+# streams continue. Admission-rejected streams stay out until owner review, and
+# more than this many rejected streams is systemic and stops the runner.
+STREAM_RETRY_SEC = 3600
+MAX_REJECTED_STREAMS = 3
 COMMAND_FAILURE_LOG = Path.home() / 'stoarama-cleanup-runner' / 'command-failures.log'
 
 
@@ -313,7 +327,7 @@ def command(argv, timeout=COMMAND_TIMEOUT_SEC, **kwargs):
                 os.close(fd)
         except Exception:
             pass
-        raise Halt('local command failed; inspect privately') from None
+        raise CommandFailed(getattr(exc, 'returncode', None)) from None
 
 
 def render_key():
@@ -392,11 +406,59 @@ class Runner:
             f.flush()
             os.fsync(f.fileno())
 
-    def query(self, sql, step='catalog query'):
+    def preparer(self):
         if not hasattr(self, 'prepare'):
-            spec = importlib.util.spec_from_file_location('prepare_keep28', self.repo / 'backend/scripts/nas-cleanup/prepare_keep28_plans.py')
-            self.prepare = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(self.prepare)
+            folder = str(self.repo / Path(PREPARER).parent)
+            sys.path.insert(0, folder)  # The preparer imports its reviewed_scope sibling.
+            try:
+                spec = importlib.util.spec_from_file_location('prepare_keep28', self.repo / PREPARER)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            finally:
+                sys.path.remove(folder)
+            self.prepare = module
+        return self.prepare
+
+    def prepare_stream(self, sid, args, submit):
+        """Run the preparer for one stream. False means this stream was set aside
+        with nothing admitted; every other failure, including an ambiguous
+        submission timeout, stops the runner."""
+        try:
+            command([sys.executable, str(self.repo / PREPARER), '--stream', str(sid), *args],
+                    env=os.environ.copy(), timeout=PREPARE_TIMEOUT_SEC)
+        except CommandFailed as exc:
+            codes = self.preparer()
+            if exc.returncode == codes.EXIT_READ_FAILED or (exc.returncode is None and not submit):
+                self.step_failed('stream preparation deferred', reason='stream ' + str(sid))
+                deferred = dict(self.status.get('deferred_streams') or {}, **{str(sid): time.time() + STREAM_RETRY_SEC})
+                self.save(self.status.get('phase', 'dry_run'), deferred_streams=deferred)
+                return False
+            if submit and exc.returncode == codes.EXIT_ADMISSION_REJECTED:
+                rejected = sorted(set(self.status.get('rejected_streams') or []) | {sid})
+                self.save(self.status.get('phase', 'dry_run'), rejected_streams=rejected)
+                self.alert('Stream %d admission rejected; stream excluded until owner review' % sid)
+                require(len(rejected) <= MAX_REJECTED_STREAMS, 'admission rejected for too many streams; owner review required')
+                return False
+            raise
+        deferred = self.status.get('deferred_streams') or {}
+        if str(sid) in deferred:
+            self.save(self.status.get('phase', 'dry_run'),
+                      deferred_streams={k: v for k, v in deferred.items() if k != str(sid)})
+        return True
+
+    def stream_ready(self, sid):
+        return (sid not in (self.status.get('rejected_streams') or [])
+                and (self.status.get('deferred_streams') or {}).get(str(sid), 0) <= time.time())
+
+    def wait_for_deferred_streams(self):
+        # Master is OFF and nothing is enabled here; never call this completion.
+        self.save('waiting_for_stream_retry')
+        while not self.stopped() and min(self.status['deferred_streams'].values()) > time.time():
+            self.progress()
+            time.sleep(60)
+
+    def query(self, sql, step='catalog query'):
+        self.preparer()
 
         def execute():
             try:
@@ -805,12 +867,13 @@ class Runner:
         for sid in sorted(self.windows):
             if self.stopped():
                 return []
+            if not self.stream_ready(sid):
+                continue
             path = self.stream_summary_path(sid)
             summary = json.loads(path.read_text()) if path.exists() else None
             if summary is None or not 0 <= time.time() - summary['observed_at_epoch'] < STREAM_SUMMARY_TTL_SEC:
-                command([sys.executable, str(self.repo / 'backend/scripts/nas-cleanup/prepare_keep28_plans.py'),
-                         '--stream', str(sid), '--summary-only', '--out', str(path.parent)],
-                        env=os.environ.copy(), timeout=PREPARE_TIMEOUT_SEC)
+                if not self.prepare_stream(sid, ['--summary-only', '--out', str(path.parent)], submit=False):
+                    continue
                 summary = json.loads(path.read_text())
             files, size = summary['recoverable_files'], summary['recoverable_bytes']
             require(summary['policy_sha256'] == POLICY_SHA and summary['streams'] == [sid]
@@ -837,10 +900,10 @@ class Runner:
             # A new prefix per admission avoids immutable-label reuse, even on one day.
             prefix = 'k28auto-' + utcnow().strftime('%Y%m%d-%H%M%S')
             out = self.root / 'plans' / (prefix + '-s' + str(sid))
-            command([sys.executable, str(self.repo / 'backend/scripts/nas-cleanup/prepare_keep28_plans.py'),
-                '--stream', str(sid), '--max-bytes', str(PLAN_CAP), '--max-plans', '1',
-                '--label-prefix', prefix, '--out', str(out), '--api', API, '--submit',
-                '--atomic-admission'], env=os.environ.copy(), timeout=PREPARE_TIMEOUT_SEC)
+            if not self.prepare_stream(sid, ['--max-bytes', str(PLAN_CAP), '--max-plans', '1',
+                    '--label-prefix', prefix, '--out', str(out), '--api', API, '--submit',
+                    '--atomic-admission'], submit=True):
+                continue
             summary = json.loads((out / 'summary.json').read_text())
             # Reservations changed eligibility; rank the remainder freshly on
             # the next pass. A crash can only leave a stale ranking hint.
@@ -854,8 +917,8 @@ class Runner:
                     # in dry run (its items stay reserved) and move on to the next stream.
                     continue
                 return receipt['id']
-        if lookahead or self.stopped():
-            return None  # Current/reserved work is expected; never claim completion here.
+        if lookahead or self.stopped() or self.status.get('deferred_streams'):
+            return None  # Current/reserved/deferred work is expected; never claim completion here.
         # The preparer excludes reserved files. Never call that a completed cleanup.
         pending = self.query("""SELECT count(*) FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id
           WHERE p.account_id=47 AND p.connection_id=13 AND i.state<>'deleted'
@@ -1028,6 +1091,9 @@ class Runner:
         self.progress()  # Accepted owner delivery before any deletion is enabled.
         while not self.stopped():
             pid = self.status['current_plan'] or self.status.get('next_plan') or self.pick()
+            if pid is None and self.status.get('deferred_streams') and not self.stopped():
+                self.wait_for_deferred_streams()
+                continue
             if pid is None:
                 self.save('stopped' if self.stopped() else 'complete', current_plan=None)
                 return

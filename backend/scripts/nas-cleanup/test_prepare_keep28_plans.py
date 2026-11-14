@@ -31,6 +31,27 @@ class Keep28PlanTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'atomic admission rejected'):
                 k.submit('https://example.invalid', 'lookahead', [row(3, 'raw', 1), row(3, 'raw', 2)], [], [], atomic=True)
             self.assertEqual(call.call_count, 1)
+    def test_exit_codes_mean_nothing_was_admitted_and_other_failures_stay_ambiguous(self):
+        with patch('traceback.print_exc'):
+            with patch.object(k, 'main', side_effect=k.ReadFailed('timeout')):
+                self.assertEqual(k.entrypoint(), k.EXIT_READ_FAILED)
+            with patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', 409, 'conflict', {}, None)), \
+                 patch.object(k, 'main', side_effect=lambda: k.submit('https://example.invalid', 'x', [row(3, 'raw', 1)], [], [], atomic=True)):
+                self.assertEqual(k.entrypoint(), k.EXIT_ADMISSION_REJECTED)
+            with patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', 502, 'bad gateway', {}, None)), \
+                 patch.object(k, 'main', side_effect=lambda: k.submit('https://example.invalid', 'x', [row(3, 'raw', 1)], [], [], atomic=True)):
+                with self.assertRaisesRegex(RuntimeError, 'admission not confirmed'):
+                    k.entrypoint()
+
+    def test_catalogue_timeout_is_a_read_failure(self):
+        with patch('subprocess.run', side_effect=k.subprocess.TimeoutExpired('psql', 330)), patch.object(k, 'pg_env', return_value={}):
+            with self.assertRaises(k.ReadFailed):
+                k.query('SELECT 1', 'psql')
+        failed = k.subprocess.CompletedProcess([], 1, b'', b'ERROR:  canceling statement due to statement timeout')
+        with patch('subprocess.run', return_value=failed), patch.object(k, 'pg_env', return_value={}):
+            with self.assertRaises(k.ReadFailed):
+                k.query('SELECT 1', 'psql')
+
     def test_preparer_requires_current_delivery_hold_check(self):
         with patch.object(k, 'query', return_value=[]) as query:
             k.stream_candidates(k.load_policy(k.POLICY_PATH)[3], 'stoarama', 'psql')

@@ -8,6 +8,19 @@ import prepare_keep28_plans as plans
 
 
 class ReviewedScopeTests(unittest.TestCase):
+    def test_unreachable_metadata_is_a_read_failure_but_wrong_bytes_are_not(self):
+        env = {'R2_ACCOUNT_ID': 'a', 'R2_BUCKET': 'b'}
+        down = scope.subprocess.CompletedProcess([], 7, b'', b'')
+        wrong = scope.subprocess.CompletedProcess([], 0, b'other', b'')
+        with patch.dict(scope.os.environ, env):
+            with patch('subprocess.run', return_value=down), self.assertRaises(scope.ReadFailed):
+                scope.read_pinned('k', 'a'*64, 100, 100)
+            with patch('subprocess.run', side_effect=scope.subprocess.TimeoutExpired('curl', 50)), self.assertRaises(scope.ReadFailed):
+                scope.read_pinned('k', 'a'*64, 100, 100)
+            with patch('subprocess.run', return_value=wrong), self.assertRaisesRegex(RuntimeError, 'hash differs') as caught:
+                scope.read_pinned('k', 'a'*64, 100, 100)
+            self.assertNotIsInstance(caught.exception, scope.ReadFailed)
+
     def test_selection_requires_frozen_size_single_link_and_raw_sidecar(self):
         rows = [dict(kind='raw', source_id=n, stream_id=3, path='reviewed/%d.mp4' % n,
                      size_bytes=10, sha256='a'*64) for n in range(1, 5)]

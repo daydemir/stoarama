@@ -56,9 +56,12 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from reviewed_scope import ReadFailed, admissible_candidates
 
 POLICY_SHA = '060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811'
 POLICY_PATH = pathlib.Path(__file__).resolve().parents[2] / 'internal/api/nas_cleanup_keep28_policy.json'
@@ -66,6 +69,14 @@ LABEL = re.compile(r'^[a-z0-9][a-z0-9._-]{0,79}$')
 MAX_PLAN_ITEMS = 10000
 MAX_PLAN_BYTES = 100_000_000_000  # backend nasCleanupMaxPlanBytes
 MAX_BATCH_PLANS = 500
+# Exit codes the runner relies on. Both mean nothing was admitted; any other
+# failure (including a lost admission response) stays ambiguous and stops it.
+EXIT_ADMISSION_REJECTED = 3
+EXIT_READ_FAILED = 4
+
+
+class AdmissionRejected(RuntimeError):
+    """The server refused the whole atomic proposal with HTTP 409."""
 
 
 def batch_digest(policy_sha, plans):
@@ -119,15 +130,17 @@ def pg_env():
 
 
 def query(sql, psql):
-    p = subprocess.run([psql, '-XqAt', '-v', 'ON_ERROR_STOP=1'], input=('BEGIN READ ONLY;' + sql + ';ROLLBACK;').encode(),
-                       env=pg_env(), capture_output=True, timeout=330)
+    try:
+        p = subprocess.run([psql, '-XqAt', '-v', 'ON_ERROR_STOP=1'], input=('BEGIN READ ONLY;' + sql + ';ROLLBACK;').encode(),
+                           env=pg_env(), capture_output=True, timeout=330)
+    except subprocess.TimeoutExpired:
+        raise ReadFailed('read-only catalogue query timed out') from None
     if p.returncode:
-        raise RuntimeError('read-only catalogue query failed: ' + p.stderr.decode()[:400])
+        raise ReadFailed('read-only catalogue query failed: ' + p.stderr.decode()[:400])
     return json.loads(p.stdout)
 
 
 def candidates(policy, streams, bucket, psql):
-    from reviewed_scope import admissible_candidates
     # One bounded read-only query per stream keeps each transaction short.
     rows = []
     for sid in sorted(streams or policy):
@@ -225,7 +238,7 @@ def submit(api, label, rows, receipts, rejected, atomic=False):
         if exc.code != 409:
             raise RuntimeError(f'admission not confirmed for {label}: HTTP {exc.code}; inspect the label before retrying')
         if atomic:
-            raise RuntimeError(f'atomic admission rejected for {label}; inspect the label before retrying') from None
+            raise AdmissionRejected(f'atomic admission rejected for {label}; inspect the label before retrying') from None
         if len(rows) == 1:
             rejected.append({'label': label, 'kind': rows[0]['kind'], 'source_id': rows[0]['source_id'], 'path': rows[0]['path'], 'reason': exc.read(2000).decode(errors='replace')})
             return
@@ -299,5 +312,13 @@ def main():
                       'out': str(out), 'deletion_enabled': False}), flush=True)
 
 
+def entrypoint():
+    try:
+        return main()
+    except (ReadFailed, AdmissionRejected) as exc:
+        traceback.print_exc()
+        return EXIT_READ_FAILED if isinstance(exc, ReadFailed) else EXIT_ADMISSION_REJECTED
+
+
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(entrypoint())

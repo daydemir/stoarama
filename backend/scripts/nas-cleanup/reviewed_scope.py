@@ -17,17 +17,26 @@ INDEX_KEY = PREFIX + INDEX_SHA + '/index.json.gz'
 AUDIT_SHA = '480d85a49288d79e201b14405dc72d0f6fc979a0fd06f1b7a95663053583865b'
 
 
+class ReadFailed(RuntimeError):
+    """A read failed before any admission request; nothing was submitted."""
+
+
 def read_pinned(key, sha, compressed_limit, plain_limit):
     url = 'https://' + os.environ['R2_ACCOUNT_ID'] + '.r2.cloudflarestorage.com/' + os.environ['R2_BUCKET'] + '/' + key
-    result = subprocess.run([
-        'curl', '--fail', '--silent', '--show-error', '--connect-timeout', '10', '--max-time', '45',
-        '--max-filesize', str(compressed_limit), '--aws-sigv4', 'aws:amz:auto:s3',
-        '--variable', '%R2_ACCESS_KEY_ID', '--variable', '%R2_SECRET_ACCESS_KEY',
-        '--expand-user', '{{R2_ACCESS_KEY_ID}}:{{R2_SECRET_ACCESS_KEY}}',
-        '--user-agent', 'stoarama-operator/1', url,
-    ], capture_output=True, timeout=50)
-    if result.returncode or len(result.stdout) > compressed_limit or hashlib.sha256(result.stdout).hexdigest() != sha:
-        raise RuntimeError('reviewed cleanup metadata unavailable or hash differs')
+    try:
+        result = subprocess.run([
+            'curl', '--fail', '--silent', '--show-error', '--connect-timeout', '10', '--max-time', '45',
+            '--max-filesize', str(compressed_limit), '--aws-sigv4', 'aws:amz:auto:s3',
+            '--variable', '%R2_ACCESS_KEY_ID', '--variable', '%R2_SECRET_ACCESS_KEY',
+            '--expand-user', '{{R2_ACCESS_KEY_ID}}:{{R2_SECRET_ACCESS_KEY}}',
+            '--user-agent', 'stoarama-operator/1', url,
+        ], capture_output=True, timeout=50)
+    except subprocess.TimeoutExpired:
+        raise ReadFailed('reviewed cleanup metadata read timed out') from None
+    if result.returncode:
+        raise ReadFailed('reviewed cleanup metadata unavailable')
+    if len(result.stdout) > compressed_limit or hashlib.sha256(result.stdout).hexdigest() != sha:
+        raise RuntimeError('reviewed cleanup metadata hash differs')
     with gzip.GzipFile(fileobj=io.BytesIO(result.stdout)) as archive:
         plain = archive.read(plain_limit + 1)
     if len(plain) > plain_limit:
