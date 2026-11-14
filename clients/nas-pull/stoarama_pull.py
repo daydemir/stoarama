@@ -47710,8 +47710,10 @@ def exec_candidate(cfg, runtime):
         raise SelfUpdateExecError("failed to activate staged NAS client") from exc
 
 
-def update_can_exec(update_ready, inventory_worker, stop_event=None, joined_worker=None, cleanup_worker=None):
+def update_can_exec(update_ready, inventory_worker, stop_event=None, joined_worker=None, cleanup_worker=None, copy_worker=None):
     """Process replacement is safe only between delivery pages and scans."""
+    if copy_worker is not None and copy_worker.is_alive():
+        return False
     return (
         update_ready.is_set()
         and (stop_event is None or not stop_event.is_set())
@@ -48556,6 +48558,10 @@ def run(cfg):
         # Verify-only selected manifests are independent from the cursor feed and
         # never write media bytes.
         threading.Thread(target=selected_verify_loop, args=(cfg, stop_event), daemon=True).start()
+    copy_worker = None
+    if not cfg.dry_run:
+        copy_worker = threading.Thread(target=r2_copy_loop, args=(cfg, runtime, inventory, inventory_stop_event), daemon=True, name="nas-r2-copy")
+        copy_worker.start()
     cleanup_worker = None
     if not cfg.dry_run:
         cleanup_worker = threading.Thread(target=cleanup_loop, args=(cfg, inventory, inventory_stop_event, cleanup_verified), daemon=True)
@@ -48596,7 +48602,7 @@ def run(cfg):
             # No delivery page is active at this boundary. A staged candidate
             # may replace the process even when storage/list work is failing,
             # provided the inventory thread has reached its stop checkpoint.
-            if update_can_exec(update_ready, inventory_worker, stop_event, joined_worker, cleanup_worker):
+            if update_can_exec(update_ready, inventory_worker, stop_event, joined_worker, cleanup_worker, copy_worker):
                 runtime.set_phase(Phase.UPDATING)
                 exec_candidate(cfg, runtime)
             if not heartbeat.is_alive():
@@ -48638,7 +48644,7 @@ def run(cfg):
                     # not resurrect the previous client indefinitely.
                     mark_runtime(cfg, runtime, "healthy")
                     runtime.stable_marked = True
-                if update_can_exec(update_ready, inventory_worker, stop_event, joined_worker, cleanup_worker):
+                if update_can_exec(update_ready, inventory_worker, stop_event, joined_worker, cleanup_worker, copy_worker):
                     runtime.set_phase(Phase.UPDATING)
                     exec_candidate(cfg, runtime)
                 set_idle_unless_capacity_blocked(runtime)
@@ -48676,9 +48682,12 @@ def run(cfg):
             stitch_worker.join(timeout=HTTP_TIMEOUT_SEC + 5)
         if cleanup_worker is not None:
             cleanup_worker.join(timeout=HTTP_TIMEOUT_SEC + 5)
+        if copy_worker is not None:
+            copy_worker.join(timeout=10)
+        copy_stuck = copy_worker is not None and copy_worker.is_alive()
         cleanup_stuck = cleanup_worker is not None and cleanup_worker.is_alive()
         stitch_stuck = stitch_worker is not None and stitch_worker.is_alive()
-        joined_stuck = joined_worker.is_alive() or cleanup_stuck or stitch_stuck or listing_worker.is_alive()
+        joined_stuck = copy_stuck or joined_worker.is_alive() or cleanup_stuck or stitch_stuck or listing_worker.is_alive()
         if joined_stuck:
             log("ERROR", "joined delivery worker did not stop; process must exit unclean")
             mark_runtime(cfg, runtime, PreviousExit.UNCLEAN_PROCESS.value)
@@ -49169,6 +49178,326 @@ def copy_r2_manifest(cfg, filename, expected_sha, max_bytes):
             return {"copied_or_verified_bytes": copied, "policy_sha256": R2_RETIRE_COPY_POLICY}
         finally:
             inventory.close()
+
+
+# Server-issued R2 keep28 copies. This worker is intentionally independent of
+# the raw delivery cursor: it neither releases clips nor retires R2 objects.
+R2_COPY_FLOOR = 2_000_000_000_000
+R2_COPY_RATE = 2_000_000
+R2_COPY_RANGE = 8 * 1024 * 1024
+R2_COPY_CHUNK = 256 * 1024
+R2_COPY_TIMEOUT = 2
+
+
+class R2CopyHold(RuntimeError):
+    pass
+
+
+def r2_copy_resources(cfg, runtime, needed=R2_COPY_RANGE):
+    stitch_resources(cfg)  # mounted root, host/cgroup headroom and load
+    _, available = meminfo_bytes(_read_text("/proc/meminfo"))
+    limit = cgroup_memory_limit()
+    if limit is not None:
+        used = _read_text("/sys/fs/cgroup/memory.current")
+        if used is None:
+            used = _read_text("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        if used is None:
+            raise R2CopyHold("copy cgroup memory telemetry unavailable")
+        available = min(available, limit - int(used))
+    if available < 512 * 1024 * 1024:
+        raise R2CopyHold("copy memory headroom")
+    status = storage_status(cfg)
+    with runtime.lock:
+        free = int(status.get("free_bytes", 0)) - runtime.capacity_reserved_bytes
+    if not status.get("available") or free < max(R2_COPY_FLOOR, cfg.min_free_bytes) + needed:
+        raise R2CopyHold("copy free-space floor")
+    return free
+
+
+class R2CopyGuard:
+    def __init__(self, cfg, runtime, stop, task):
+        self.cfg, self.runtime, self.stop, self.task = cfg, runtime, stop, task
+        self.checked = 0.0
+
+    def check(self, remote=False):
+        if self.stop.is_set():
+            raise R2CopyHold("copy stopped")
+        with NAS_MEDIA_FENCE.condition:
+            if NAS_MEDIA_FENCE.execution_owner is not None or NAS_MEDIA_FENCE.cleaners:
+                raise R2CopyHold("copy yields to cleanup")
+        free = r2_copy_resources(self.cfg, self.runtime)
+        if remote or time.monotonic() - self.checked >= 4:
+            request_json(self.cfg, "POST", "/account/connections/r2-copy/%d/checkpoint" % self.task["id"],
+                         body={"token": self.task["token"], "free_bytes": free}, timeout=R2_COPY_TIMEOUT)
+            self.checked = time.monotonic()
+        return free
+
+    def wait(self, seconds):
+        until = time.monotonic() + seconds
+        while time.monotonic() < until:
+            self.check()
+            self.stop.wait(min(.2, max(0, until - time.monotonic())))
+
+
+def valid_r2_copy_task(task):
+    if not isinstance(task, dict) or type(task.get("id")) is not int or task["id"] <= 0:
+        raise ValueError("invalid copy task")
+    if not re.fullmatch(r"[a-f0-9]{48}", task.get("token", "")) or task.get("policy_sha256") != R2_RETIRE_COPY_POLICY:
+        raise ValueError("invalid copy token/policy")
+    item, clip = task["item"], task["clip"]
+    if item.get("kind") != "raw":
+        raise ValueError("collated copy custody is blocked")
+    for name in ("source_id", "recording_id", "stream_id", "size_bytes"):
+        if type(item.get(name)) is not int or item[name] <= 0:
+            raise ValueError("invalid copy identity")
+    if item["size_bytes"] > COLLATED_MAX_BYTES:
+        raise ValueError("copy size cap")
+    valid_sha256(item["sha256"], "copy")
+    relative = str(valid_relative_path({"relative_path": item["relative_path"], "clip_id": item["source_id"]}))
+    if relative != item["relative_path"] or any(p.startswith(".") for p in relative.split("/")):
+        raise ValueError("noncanonical copy path")
+    for field, source in (("clip_id", "source_id"), ("recording_id", "recording_id"), ("relative_path", "relative_path"),
+                          ("size_bytes", "size_bytes"), ("sha256", "sha256")):
+        if clip.get(field) != item[source]:
+            raise ValueError("copy payload identity changed")
+    normalized_etag(task["etag"])
+    return task
+
+
+def r2_copy_parent(cfg, relative):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(str(cfg.output_dir), flags)
+    try:
+        root_device = os.fstat(fd).st_dev
+        for part in relative.split("/")[:-1]:
+            try:
+                child = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                os.mkdir(part, 0o755, dir_fd=fd)
+                os.fsync(fd)
+                child = os.open(part, flags, dir_fd=fd)
+            if os.fstat(child).st_dev != root_device:
+                os.close(child)
+                raise R2CopyHold("copy path crossed a mount")
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def r2_copy_hash(fd, guard, limiter):
+    before = os.fstat(fd)
+    if not stat_module.S_ISREG(before.st_mode):
+        raise R2CopyHold("copy requires regular file")
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    size = 0
+    while True:
+        guard.check()
+        chunk = os.read(fd, R2_COPY_CHUNK)
+        if not chunk:
+            break
+        size += len(chunk)
+        digest.update(chunk)
+        guard.wait(len(chunk) / limiter)
+    after = os.fstat(fd)
+    if cleanup_identity(before) != cleanup_identity(after):
+        raise R2CopyHold("copy file changed while hashing")
+    return size, digest, after
+
+
+def r2_copy_range(cfg, task, offset, length, guard, fd, digest):
+    free = guard.check(remote=True)
+    grant = request_json(cfg, "POST", "/account/connections/r2-copy/%d/range" % task["id"],
+                         body={"token": task["token"], "free_bytes": free, "offset": offset, "length": length},
+                         timeout=R2_COPY_TIMEOUT)
+    if (grant.get("offset") != offset or grant.get("length") != length or grant.get("max_duration_sec") != 10
+            or normalized_etag(grant.get("etag")) != normalized_etag(task["etag"])
+            or not re.fullmatch(r"[a-f0-9]{48}", grant.get("range_id", ""))):
+        raise R2CopyHold("invalid copy grant")
+    url = urllib.parse.urlsplit(grant["url"])
+    if url.scheme != "https" or not url.hostname or url.username or url.fragment:
+        raise R2CopyHold("invalid copy range URL")
+    headers = grant["headers"]
+    if (headers.get("Range") != "bytes=%d-%d" % (offset, offset + length - 1)
+            or headers.get("If-Match") != '\"%s\"' % normalized_etag(task["etag"])):
+        raise R2CopyHold("copy grant lacks signed range/identity")
+    CLIENT_LOG_RING.add_secrets([grant["url"]])
+    req = urllib.request.Request(grant["url"], method="GET", headers={"User-Agent": USER_AGENT, **headers})
+    deadline = time.monotonic() + 10
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            raise R2CopyHold("copy redirect refused")
+    opener = urllib.request.build_opener(NoRedirect())
+    # Exactly ONE GET per grant: no retry, redirect, or persisted capability.
+    # A later attempt must obtain (and pay for) a new grant even after a crash.
+    with opener.open(req, timeout=R2_COPY_TIMEOUT) as response:
+        remember_response_secrets(response)
+        expected = "bytes %d-%d/%d" % (offset, offset + length - 1, task["item"]["size_bytes"])
+        if response.headers.get("Content-Range") != expected or normalized_etag(response.headers.get("ETag")) != normalized_etag(task["etag"]):
+            raise R2CopyHold("copy range identity changed")
+        left = length
+        while left:
+            if time.monotonic() >= deadline:
+                raise R2CopyHold("copy range deadline; partial retained")
+            guard.check()
+            block = response.read(min(R2_COPY_CHUNK, left))
+            if not block:
+                raise R2CopyHold("copy range truncated; partial retained")
+            written = 0
+            while written < len(block):
+                written += os.write(fd, block[written:])
+            digest.update(block)
+            left -= len(block)
+            guard.wait(len(block) / R2_COPY_RATE)
+        if response.read(1):
+            raise R2CopyHold("copy range exceeded bound")
+    # Only a completed GET clears its dispatch gate. A stale completion cannot
+    # clear a later grant, and a failure never retries the same capability.
+    request_json(cfg, "POST", "/account/connections/r2-copy/%d/checkpoint" % task["id"],
+                 body={"token": task["token"], "free_bytes": guard.check(), "range_id": grant["range_id"]},
+                 timeout=R2_COPY_TIMEOUT)
+
+
+def r2_copy_sidecar(parent, name, clip):
+    payload = (json.dumps(stitch_provenance(clip), sort_keys=True, separators=(",", ":")) + "\n").encode()
+    sidecar = name + ".stoarama.json"
+    try:
+        fd = os.open(sidecar, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    except FileNotFoundError:
+        temporary = ".%s.r2-copy-sidecar-%d.part" % (name, clip["clip_id"])
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644, dir_fd=parent)
+        try:
+            info = os.fstat(fd)
+            if not stat_module.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise R2CopyHold("copy temporary sidecar conflicts; preserved")
+            os.ftruncate(fd, 0)
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(fd, payload[offset:])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        # Crash-safe, no-overwrite publication of the fully fsynced metadata.
+        os.link(temporary, sidecar, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+        os.fsync(parent)
+        os.unlink(temporary, dir_fd=parent)
+        os.fsync(parent)
+    else:
+        try:
+            if not stat_module.S_ISREG(os.fstat(fd).st_mode) or os.read(fd, len(payload) + 1) != payload:
+                raise R2CopyHold("existing copy sidecar conflicts; preserved")
+        finally:
+            os.close(fd)
+    return payload
+
+
+def execute_r2_copy(cfg, runtime, inventory, stop, task):
+    task = valid_r2_copy_task(task)
+    guard = R2CopyGuard(cfg, runtime, stop, task)
+    # Fail immediately behind any existing writer. Cleanup never waits for us
+    # to enter a queue; once active, chunk checkpoints see its drain request.
+    with NAS_MEDIA_FENCE.condition:
+        if (NAS_MEDIA_FENCE.execution_owner is not None or NAS_MEDIA_FENCE.cleaners
+                or NAS_MEDIA_FENCE.writers or NAS_MEDIA_FENCE.writers_waiting or STITCH_ACTIVE.is_set()):
+            raise R2CopyHold("copy yields to active NAS work")
+        NAS_MEDIA_FENCE.writers += 1
+    try:
+        guard.check(remote=True)
+        item = task["item"]
+        parent = r2_copy_parent(cfg, item["relative_path"])
+        name = item["relative_path"].split("/")[-1]
+        partial = ".%s.r2-copy-%d.part" % (name, item["source_id"])
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        try:
+            try:
+                final_fd = os.open(name, flags, dir_fd=parent)
+            except FileNotFoundError:
+                final_fd = None
+            if final_fd is None:
+                fd = os.open(partial, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644, dir_fd=parent)
+                try:
+                    opened = os.fstat(fd)
+                    if not stat_module.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or opened.st_size > item["size_bytes"]:
+                        raise R2CopyHold("copy partial conflicts; preserved")
+                    offset, digest, _ = r2_copy_hash(fd, guard, R2_COPY_RATE)
+                    while offset < item["size_bytes"]:
+                        length = min(R2_COPY_RANGE, item["size_bytes"] - offset)
+                        # Coordinate with all existing downloads, then enforce
+                        # the larger copy floor while the reservation is held.
+                        status = storage_status(cfg)
+                        with runtime.lock:
+                            if (not status.get("available") or int(status["free_bytes"]) - runtime.capacity_reserved_bytes
+                                    < max(R2_COPY_FLOOR, cfg.min_free_bytes) + length + R2_COPY_RANGE):
+                                raise R2CopyHold("copy free-space reserve")
+                            runtime.capacity_reserved_bytes += length
+                        try:
+                            r2_copy_range(cfg, task, offset, length, guard, fd, digest)
+                        finally:
+                            os.fsync(fd)
+                            runtime.release_storage_reservation(length)
+                        offset += length
+                    if digest.hexdigest() != item["sha256"]:
+                        raise R2CopyHold("copy checksum differs; partial preserved for inspection")
+                    guard.check(remote=True)
+                    # link is create-only. Never replace or quarantine user data.
+                    os.link(partial, name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+                    os.fsync(parent)
+                    os.unlink(partial, dir_fd=parent)  # only our committed temporary link
+                    os.fsync(parent)
+                finally:
+                    os.close(fd)
+                final_fd = os.open(name, flags, dir_fd=parent)
+            try:
+                size, digest, info = r2_copy_hash(final_fd, guard, R2_COPY_RATE)
+                if size != item["size_bytes"] or digest.hexdigest() != item["sha256"]:
+                    raise R2CopyHold("existing copy final conflicts; preserved")
+                payload = r2_copy_sidecar(parent, name, task["clip"])
+                guard.check(remote=True)
+                current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                if cleanup_identity(current) != cleanup_identity(info):
+                    raise R2CopyHold("copy final changed before inventory")
+                inventory._upsert(task["clip"], "present", utc_now_precise(), info.st_mtime_ns,
+                                  file_identity=(info.st_ctime_ns, info.st_ino, info.st_dev),
+                                  sidecar_evidence=(item["relative_path"] + ".stoarama.json", len(payload), hashlib.sha256(payload).hexdigest()))
+                rows = inventory._rows("dirty=1 AND clip_id=?", (item["source_id"],), 1)
+                request_json(cfg, "POST", "/account/connections/inventory", timeout=R2_COPY_TIMEOUT, body={
+                    "generation": "live", "dataset_schema": INVENTORY_DATASET_SCHEMA,
+                    "root_exclusions": list(INVENTORY_ROOT_EXCLUSIONS), "complete": False, "files": inventory._reports(rows)})
+                inventory._mark_clean(rows)
+                guard.check(remote=True)
+                request_json(cfg, "POST", "/account/connections/r2-copy/%d/result" % task["id"],
+                             body={"token": task["token"], "free_bytes": r2_copy_resources(cfg, runtime)}, timeout=R2_COPY_TIMEOUT)
+            finally:
+                os.close(final_fd)
+        finally:
+            os.close(parent)
+    finally:
+        with NAS_MEDIA_FENCE.condition:
+            NAS_MEDIA_FENCE.writers -= 1
+            NAS_MEDIA_FENCE.condition.notify_all()
+
+
+def r2_copy_loop(cfg, runtime, inventory, stop):
+    wait = 60
+    while not stop.wait(wait):
+        wait = 60
+        try:
+            # Linux thread-local nice19 and idle I/O; failure holds this lane.
+            stitch_priority()
+            free = r2_copy_resources(cfg, runtime)
+            response = request_json(cfg, "POST", "/account/connections/r2-copy/lease",
+                                    body={"free_bytes": free}, timeout=R2_COPY_TIMEOUT)
+            if response.get("task") is not None:
+                execute_r2_copy(cfg, runtime, inventory, stop, response["task"])
+                wait = 1
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (404, 409, 429):
+                log("WARN", "R2 copy control HTTP %d; holding" % exc.code)
+        except Exception as exc:
+            log("WARN", "R2 copy held: %s" % (str(exc) if isinstance(exc, R2CopyHold) else type(exc).__name__))
 
 
 def main(argv=None):

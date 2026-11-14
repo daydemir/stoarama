@@ -147,6 +147,17 @@ func (c *Client) PresignGetExact(ctx context.Context, key, etag, versionID strin
 }
 
 func (c *Client) PresignGetExactRequest(ctx context.Context, key, etag, versionID string, ttl time.Duration) (PresignedRequest, error) {
+	return c.presignGetExactRequest(ctx, key, etag, versionID, "", ttl)
+}
+
+// PresignGetExactRangeRequest binds the byte range as well as object identity.
+func (c *Client) PresignGetExactRangeRequest(ctx context.Context, key, etag, versionID string, offset, length int64, ttl time.Duration) (PresignedRequest, error) {
+	if offset < 0 || length <= 0 || offset > int64(^uint64(0)>>1)-length {
+		return PresignedRequest{}, errors.New("invalid exact range")
+	}
+	return c.presignGetExactRequest(ctx, key, etag, versionID, fmt.Sprintf("bytes=%d-%d", offset, offset+length-1), ttl)
+}
+func (c *Client) presignGetExactRequest(ctx context.Context, key, etag, versionID, byteRange string, ttl time.Duration) (PresignedRequest, error) {
 	clean := cleanETag(etag)
 	if clean == "" {
 		return PresignedRequest{}, errors.New("presign exact get: etag is required")
@@ -158,6 +169,9 @@ func (c *Client) PresignGetExactRequest(ctx context.Context, key, etag, versionI
 	}
 	if strings.TrimSpace(versionID) != "" {
 		in.VersionId = aws.String(strings.TrimSpace(versionID))
+	}
+	if byteRange != "" {
+		in.Range = aws.String(byteRange)
 	}
 	out, err := c.presigner.PresignGetObject(ctx, in, s3.WithPresignExpires(ttl))
 	if err != nil {
