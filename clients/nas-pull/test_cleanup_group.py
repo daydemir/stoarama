@@ -6,6 +6,7 @@ import datetime
 import hashlib
 import json
 import select
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -743,6 +744,20 @@ class CleanupGroupTests(unittest.TestCase):
         self.assertEqual((status['last_abort_stage'], status['last_abort_reason']), ('caps', 'transport_error'))
         self.assertEqual(status['last_abort_files'], 1)
         self.assertNotIn('private', json.dumps(status))
+
+    def test_production_ownership_failure_reports_one_abort_before_permits(self):
+        tasks = self.group(1)
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_GROUP_VERSION), \
+                mock.patch.object(pull, 'cleanup_lease_v2', return_value={'tasks': tasks}), \
+                mock.patch.object(pull, 'cleanup_journal_group', side_effect=sqlite3.OperationalError('private schema error')), \
+                mock.patch.object(pull, 'restore_api', side_effect=AssertionError('ownership failure cannot request permit')):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.cycle(tasks)
+        status, _, _ = pull.CLEANUP_STATUS.snapshot()
+        self.assertEqual(status['aborted_groups'], 1)
+        self.assertEqual((status['last_abort_stage'], status['last_abort_reason']), ('ownership', 'sqlite_error'))
+        self.assertFalse(self.inventory.cleanup_claims)
+        self.assertTrue((self.cfg.output_dir/tasks[0]['item']['relative_path']).exists())
 
     def test_journal_updates_have_no_ddl_or_full_receipts_read_and_three_namespace_checks(self):
         tasks = self.group(1)

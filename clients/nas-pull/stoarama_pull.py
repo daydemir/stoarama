@@ -18345,14 +18345,14 @@ def cleanup_group_response(response, tasks):
 
 def cleanup_own_group(inventory, tasks):
     """Journal every unused member atomically before any drain or proof."""
-    if (CLIENT_VERSION != CLEANUP_GROUP_VERSION or not 1 <= len(tasks) <= CLEANUP_EXECUTION_GROUP
-            or len({t["item_id"] for t in tasks}) != len(tasks)
-            or len({t["plan_sha256"] for t in tasks}) != 1
-            or any(t.get("execution_batch") is not True or t.get("approved_proof") is None for t in tasks)):
-        raise CleanupResponseError("invalid cleanup execution group")
     owned = []
     with inventory.lock:
         try:
+            if (CLIENT_VERSION != CLEANUP_GROUP_VERSION or not 1 <= len(tasks) <= CLEANUP_EXECUTION_GROUP
+                    or len({t["item_id"] for t in tasks}) != len(tasks)
+                    or len({t["plan_sha256"] for t in tasks}) != 1
+                    or any(t.get("execution_batch") is not True or t.get("approved_proof") is None for t in tasks)):
+                raise CleanupResponseError("invalid cleanup execution group")
             for task in tasks:
                 owner = cleanup_reserve_item(inventory, task["item_id"])
                 if owner is None:
@@ -18361,9 +18361,10 @@ def cleanup_own_group(inventory, tasks):
             cleanup_journal_group(inventory, [(task, owner, "observe",
                 cleanup_unused_lease_body(task, "client interrupted before cleanup observation"))
                 for task, owner in owned])
-        except BaseException:
+        except BaseException as exc:
             for task, owner in owned:
                 inventory.cleanup_claims.pop(task["item_id"], None)
+            CLEANUP_STATUS.execution_failure(CleanupStage.OWNERSHIP, exc, len(tasks), aborted=True)
             raise
     return owned
 
@@ -18376,11 +18377,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
     """
     import contextlib
     release_owned = owned is None
-    try:
-        owned = cleanup_own_group(inventory, tasks) if release_owned else owned
-    except BaseException as exc:
-        CLEANUP_STATUS.execution_failure(CleanupStage.OWNERSHIP, exc, len(tasks), aborted=True)
-        raise
+    owned = cleanup_own_group(inventory, tasks) if release_owned else owned
     started = time.monotonic()
     opened, observations, receipts, timings = [], [], [], []
     reservations = []
