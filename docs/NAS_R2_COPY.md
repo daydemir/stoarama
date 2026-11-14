@@ -103,8 +103,9 @@ writes and hashes can run alongside it. No fsync, network request or hashing run
 under the registry lock. A crash/interruption after publication is recovered by
 removing only an exact same-inode private link; conflicts are preserved.
 
-Cleanup proofs and the complete bulk permit/durability interval have cooperative
-priority over copy disk work. Copy may finish a started chunk or fsync, then waits
+The complete cleanup bulk permit/durability interval has cooperative priority
+over copy disk work. Pre-permit hashes share ordinary I/O; background dry runs
+do not impose an unmeasured transfer throttle. Copy may finish a started chunk or fsync, then waits
 at its next disk checkpoint while continuing cancellation, resource and remote
 checks. Bounded download transports can continue; no cleanup worker waits for a
 copy network request or whole-file hash. The pool supervisor drains every worker

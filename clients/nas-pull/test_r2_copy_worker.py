@@ -86,6 +86,19 @@ class R2CopyWorkerTests(unittest.TestCase):
             self.run_copy()
         self.assertEqual(final.read_bytes(), self.body)
 
+    def test_stop_during_range_releases_reservation_and_preserves_partial(self):
+        def stop(cfg, task, offset, length, guard, fd, digest):
+            os.write(fd, self.body[:100])
+            self.stop.set()
+            guard.check()
+        with mock.patch.object(pull, "r2_copy_range", side_effect=stop):
+            with self.assertRaises(pull.R2CopyHold):
+                self.run_copy()
+        self.assertEqual(self.runtime.capacity_reserved_bytes, 0)
+        self.assertFalse(pull.NAS_COPY_PATHS.active)
+        self.assertFalse((self.cfg.output_dir/self.item["relative_path"]).exists())
+        self.assertEqual(next((self.cfg.output_dir/"p").glob(".*.part")).read_bytes(), self.body[:100])
+
     def test_existing_conflicts_symlinks_and_bad_checksums_are_preserved(self):
         final = self.cfg.output_dir / self.item["relative_path"]
         final.parent.mkdir()

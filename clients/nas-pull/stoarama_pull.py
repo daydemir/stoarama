@@ -2583,7 +2583,6 @@ class CleanupFile:
                     or cleanup_identity(current) != frozen or cleanup_identity(opened) != frozen):
                 raise RuntimeError("cleanup file identity changed")
 
-    @NAS_COPY_PATHS.cleanup_priority
     def proof(self):
         started = time.monotonic()
         before_names, before_seq = self.parent_snapshot()
@@ -18228,7 +18227,7 @@ def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes, execution_onl
             "reconciliation_protocol": CLEANUP_RECONCILIATION_PROTOCOL}
     if CLIENT_VERSION in CLEANUP_GROUP_VERSIONS:
         body["execution_batch"] = True
-    if CLIENT_VERSION == CLEANUP_BULK_VERSION:
+    if CLIENT_VERSION in CLEANUP_BULK_VERSIONS:
         body["dry_run_limit"] = min(2, limit)  # No long local queue ahead of execution.
     if execution_only:
         body["execution_only"] = True
@@ -18291,9 +18290,9 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
             verified_event.set()
     try:
         while not stop_event.is_set() and (active is None or active.is_set()):
-            while not exhausted and not stop_event.is_set() and (active is None or active.is_set()) and error is None and (len(pending) < inflight or (pending and not dry_run_only and CLIENT_VERSION == CLEANUP_BULK_VERSION)) and leased < task_limit:
+            while not exhausted and not stop_event.is_set() and (active is None or active.is_set()) and error is None and (len(pending) < inflight or (pending and not dry_run_only and CLIENT_VERSION in CLEANUP_BULK_VERSIONS)) and leased < task_limit:
                 lane.before_lease()
-                execution_poll = bool(pending) and not dry_run_only and CLIENT_VERSION == CLEANUP_BULK_VERSION
+                execution_poll = bool(pending) and not dry_run_only and CLIENT_VERSION in CLEANUP_BULK_VERSIONS
                 room = min(CLEANUP_EXECUTION_GROUP if execution_poll else min(CLEANUP_V2_LEASE, inflight - len(pending)), task_limit - leased)
                 files_left, bytes_left = (0, 0) if dry_run_only else cleanup_local_headroom(inventory)
                 files_left = min(files_left, CLEANUP_EXECUTION_GROUP if CLIENT_VERSION in CLEANUP_GROUP_VERSIONS else CLEANUP_EXECUTION_INFLIGHT)
@@ -18360,7 +18359,7 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                 break
             # An empty execution lease is only a snapshot: the runner can
             # enable a plan while the at-most-two dry runs are still hashing.
-            poll_execution = not dry_run_only and CLIENT_VERSION == CLEANUP_BULK_VERSION
+            poll_execution = not dry_run_only and CLIENT_VERSION in CLEANUP_BULK_VERSIONS
             done, _ = concurrent.futures.wait(list(pending), timeout=CLEANUP_DRAIN_RETRY_SEC if poll_execution else None,
                                                return_when=concurrent.futures.FIRST_COMPLETED)
             if poll_execution:
@@ -49506,8 +49505,8 @@ class R2CopyGuard:
         return free
 
     def disk(self):
-        # Download transport may continue, but disk work gives cleanup proofs
-        # and the entire bulk permit/durability interval first use of the NAS.
+        # Download transport may continue, but disk work gives the entire cleanup bulk
+        # permit/durability interval first use of the NAS.
         # An already-started chunk/fsync is bounded work, never a held fence.
         while True:
             self.check()
