@@ -8,6 +8,7 @@ import html
 import http.client
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -302,6 +303,7 @@ PREPARER = 'backend/scripts/nas-cleanup/prepare_keep28_plans.py'
 # A stream whose read-only preparation failed is retried after this delay while
 # other streams continue. Admission rejection remains a failed check and stops.
 STREAM_RETRY_SEC = 3600
+MAX_STREAM_DEFERRALS = 6  # Consecutive failures; a persistent cause goes to the owner.
 COMMAND_FAILURE_LOG = Path.home() / 'stoarama-cleanup-runner' / 'command-failures.log'
 
 
@@ -374,7 +376,9 @@ class Runner:
                          and status['next_plan'] > 0 and status['next_plan'] != status['current_plan'])
                     and (status['last_error'] is None or isinstance(status['last_error'], str))
                     and isinstance(status.get('deferred_streams', {}), dict)
-                    and all(re.fullmatch('[1-9][0-9]*', k) and type(v) in (int, float)
+                    and all(re.fullmatch('[1-9][0-9]*', k) and isinstance(v, dict) and set(v) == {'retry_after', 'failures'}
+                            and type(v['retry_after']) in (int, float) and math.isfinite(v['retry_after'])
+                            and type(v['failures']) is int and 1 <= v['failures'] <= MAX_STREAM_DEFERRALS
                             for k, v in status.get('deferred_streams', {}).items()),
                     'invalid ownership state')
         except Exception:
@@ -432,7 +436,10 @@ class Runner:
         except CommandFailed as exc:
             if exc.returncode == self.preparer().EXIT_READ_FAILED or (exc.returncode is None and not submit):
                 self.step_failed('stream preparation deferred', reason='stream ' + str(sid))
-                deferred = dict(self.status.get('deferred_streams') or {}, **{str(sid): time.time() + STREAM_RETRY_SEC})
+                deferred = dict(self.status.get('deferred_streams') or {})
+                failures = deferred.get(str(sid), {'failures': 0})['failures'] + 1
+                require(failures <= MAX_STREAM_DEFERRALS, 'stream preparation keeps failing; owner review required')
+                deferred[str(sid)] = {'retry_after': time.time() + STREAM_RETRY_SEC, 'failures': failures}
                 self.save(self.status.get('phase', 'dry_run'), deferred_streams=deferred)
                 return False
             raise
@@ -443,12 +450,13 @@ class Runner:
         return True
 
     def stream_ready(self, sid):
-        return (self.status.get('deferred_streams') or {}).get(str(sid), 0) <= time.time()
+        entry = (self.status.get('deferred_streams') or {}).get(str(sid))
+        return entry is None or entry['retry_after'] <= time.time()
 
     def wait_for_deferred_streams(self):
         # Master is OFF and nothing is enabled here; never call this completion.
         self.save('waiting_for_stream_retry')
-        while not self.stopped() and min(self.status['deferred_streams'].values()) > time.time():
+        while not self.stopped() and min(v['retry_after'] for v in self.status['deferred_streams'].values()) > time.time():
             self.progress()
             time.sleep(60)
 
@@ -1073,6 +1081,8 @@ class Runner:
         require(not self.status.get('last_error'), 'failure is latched; owner must review before restart')
         require(not self.status.get('lookahead_pending'), 'lookahead admission interrupted; owner must reconcile its label before restart')
         self.load_policy()
+        require({int(k) for k in self.status.get('deferred_streams', {})} <= set(self.windows),
+                'deferred stream outside pinned policy; owner review required')
         self.check_delivery()
         if active['plans']:
             self.monitor(pid)

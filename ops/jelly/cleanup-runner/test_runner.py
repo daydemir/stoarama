@@ -422,7 +422,10 @@ class LoopTests(unittest.TestCase):
             self.assertNotIn('deferred_streams', job.status)
 
     def test_malformed_deferrals_are_unreadable_ownership_state(self):
-        for bad in ([3], {'x': 1}, {'3': 'soon'}):
+        for bad in ([3], {'x': {'retry_after': 1, 'failures': 1}}, {'3': 1.0},
+                    {'3': {'retry_after': float('nan'), 'failures': 1}},
+                    {'3': {'retry_after': float('inf'), 'failures': 1}},
+                    {'3': {'retry_after': 1, 'failures': r.MAX_STREAM_DEFERRALS + 1}}):
             with tempfile.TemporaryDirectory() as root:
                 (Path(root) / 'status.json').write_text(json.dumps(
                     {'current_plan': None, 'last_error': None, 'deferred_streams': bad}))
@@ -442,7 +445,8 @@ class LoopTests(unittest.TestCase):
             self.assertEqual(sorted(job.status['deferred_streams']), ['3', '4'])
             self.assertEqual(len(queries), 1)
             self.assertFalse(job.stream_ready(3))
-            job.status['deferred_streams']['3'] = 0
+            self.assertEqual(job.status['deferred_streams']['3']['failures'], 1)
+            job.status['deferred_streams']['3']['retry_after'] = 0
             with patch.object(r, 'command', side_effect=self.preparer_exits({'3': 'k28auto-x-s3-raw-0001'})):
                 self.assertEqual(r.Runner.pick(job), 1406)
             self.assertEqual(list(job.status['deferred_streams']), ['4'])
@@ -455,6 +459,22 @@ class LoopTests(unittest.TestCase):
                     with self.assertRaisesRegex(r.Halt, 'local command failed'):
                         r.Runner.pick(job)
                 self.assertNotIn('deferred_streams', job.status)
+
+    def test_persistent_read_failure_goes_to_the_owner(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = self.isolation_job(root, [3])
+            job.status['deferred_streams'] = {'3': {'retry_after': 0, 'failures': r.MAX_STREAM_DEFERRALS}}
+            with patch.object(r, 'command', side_effect=self.preparer_exits({'3': 4})):
+                with self.assertRaisesRegex(r.Halt, 'keeps failing'):
+                    r.Runner.pick(job)
+
+    def test_deferral_for_unknown_stream_stops_before_any_work(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            job.status['deferred_streams'] = {'999': {'retry_after': 0, 'failures': 1}}
+            job.pick = lambda **kw: self.fail('picked work with unknown deferral state')
+            with self.assertRaisesRegex(r.Halt, 'outside pinned policy'):
+                job.run()
 
     def test_summary_timeout_defers_stream_ranking(self):
         with tempfile.TemporaryDirectory() as root:
@@ -472,7 +492,7 @@ class LoopTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             job = FakeRunner(root)
             job.picks = [None, None]
-            job.status['deferred_streams'] = {'3': 1.0}
+            job.status['deferred_streams'] = {'3': {'retry_after': 1.0, 'failures': 1}}
             def wait():
                 self.assertEqual(job.events, ['OFF', 'idle'])
                 job.status['deferred_streams'] = {}

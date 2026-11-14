@@ -23,6 +23,9 @@ class ReadFailed(RuntimeError):
 
 
 SHARD_FETCH_WORKERS = 8
+# curl exits that mean the object could not be reached. Anything else, including
+# 63 (larger than the pinned byte bound), is an integrity failure and stops.
+TRANSIENT_CURL_EXITS = frozenset({5, 6, 7, 18, 22, 28, 35, 52, 55, 56})
 
 
 def fetch_pinned(key, sha, compressed_limit, cache):
@@ -44,8 +47,10 @@ def fetch_pinned(key, sha, compressed_limit, cache):
         ], capture_output=True, timeout=50)
     except subprocess.TimeoutExpired:
         raise ReadFailed('reviewed cleanup metadata read timed out') from None
-    if result.returncode:
+    if result.returncode in TRANSIENT_CURL_EXITS:
         raise ReadFailed('reviewed cleanup metadata unavailable')
+    if result.returncode:
+        raise RuntimeError('reviewed cleanup metadata fetch refused')
     if len(result.stdout) > compressed_limit or hashlib.sha256(result.stdout).hexdigest() != sha:
         raise RuntimeError('reviewed cleanup metadata hash differs')
     if cached is not None:

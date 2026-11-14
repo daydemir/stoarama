@@ -20,6 +20,10 @@ class ReviewedScopeTests(unittest.TestCase):
             with patch('subprocess.run', return_value=wrong), self.assertRaisesRegex(RuntimeError, 'hash differs') as caught:
                 scope.read_pinned('k', 'a'*64, 100, 100)
             self.assertNotIsInstance(caught.exception, scope.ReadFailed)
+            oversized = scope.subprocess.CompletedProcess([], 63, b'', b'')
+            with patch('subprocess.run', return_value=oversized), self.assertRaisesRegex(RuntimeError, 'refused') as caught:
+                scope.read_pinned('k', 'a'*64, 100, 100)
+            self.assertNotIsInstance(caught.exception, scope.ReadFailed)
 
     def test_cache_is_content_addressed_and_reverified(self):
         import tempfile
