@@ -11,18 +11,24 @@ from pathlib import Path
 
 class CleanupSyncTests(unittest.TestCase):
     def test_eight_file_group_sync_budget(self):
+        self.measure('cleanup-batch-v6.1', commits=21, syncs=45)
+
+    def test_v7_eight_file_group_sync_budget(self):
+        self.measure('cleanup-batch-v7', commits=7, syncs=10)
+
+    def measure(self, version, commits, syncs):
         source = Path(__file__).parent
         mac = platform.system() == 'Darwin'
         with tempfile.TemporaryDirectory() as scratch:
             library = str(Path(scratch)/('count_fsync.dylib' if mac else 'count_fsync.so'))
             subprocess.run(['cc', *(['-dynamiclib'] if mac else ['-shared', '-fPIC']),
                 '-o', library, str(source/'test-support'/'count_fsync.c'), *([] if mac else ['-ldl'])], check=True)
-            result = subprocess.run([sys.executable, str(source/'bench_cleanup_group.py'), '--runs', '2'],
+            result = subprocess.run([sys.executable, str(source/'bench_cleanup_group.py'),
+                '--version', version, '--runs', '2'],
                 env=dict(os.environ, **{('DYLD_INSERT_LIBRARIES' if mac else 'LD_PRELOAD'): library}),
                 capture_output=True, text=True, check=True)
             measured = json.loads(result.stdout)
-            self.assertEqual(measured['client'], 'cleanup-batch-v6.1')
+            self.assertEqual(measured['client'], version)
             for sample in measured['samples']:
-                self.assertEqual(sample['sqlite_commits'], 21)
-                # 21 FULL-WAL syncs, 16 ledger syncs, 8 media-directory syncs.
-                self.assertEqual(sample['fsyncs'], 45)
+                self.assertEqual(sample['sqlite_commits'], commits)
+                self.assertEqual(sample['fsyncs'], syncs)

@@ -18,3 +18,10 @@ func nasCleanupSupportsV6(version string) bool {
 		return false
 	}
 }
+
+// V7 retains v6 admission/session/lease gates, with bounded bulk observations.
+const nasCleanupBulkDurabilityClientVersion = "cleanup-batch-v7"
+
+func nasCleanupSupportsGroupedExecution(version string) bool {
+	return nasCleanupSupportsV6(version) || version == nasCleanupBulkDurabilityClientVersion
+}

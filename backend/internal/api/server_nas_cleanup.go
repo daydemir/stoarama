@@ -573,7 +573,7 @@ func cleanupRequestSession(r *http.Request) cleanupClientSession {
 }
 
 func cleanupSessionDeadline(ctx context.Context, tx pgx.Tx, cid int64, session cleanupClientSession) (time.Time, error) {
-	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion && session.version != nasCleanupV85RClientVersion && session.version != nasCleanupV85RServerSwitchClientVersion && session.version != nasCleanupV85RCorpusUAClientVersion && session.version != nasCleanupRefusalClientVersion && session.version != nasCleanupListingProofClientVersion && session.version != nasCleanupListingFenceClientVersion && session.version != nasCleanupPipelineClientVersion && session.version != nasCleanupGroupClientVersion && session.version != nasCleanupSerialGroupClientVersion && session.version != nasCleanupDurableGroupClientVersion && session.version != nasCleanupBatchedCapsClientVersion && session.version != nasCleanupDeliveryHoldClientVersion && !nasCleanupSupportsV6(session.version)) {
+	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion && session.version != nasCleanupV85RClientVersion && session.version != nasCleanupV85RServerSwitchClientVersion && session.version != nasCleanupV85RCorpusUAClientVersion && session.version != nasCleanupRefusalClientVersion && session.version != nasCleanupListingProofClientVersion && session.version != nasCleanupListingFenceClientVersion && session.version != nasCleanupPipelineClientVersion && session.version != nasCleanupGroupClientVersion && session.version != nasCleanupSerialGroupClientVersion && session.version != nasCleanupDurableGroupClientVersion && session.version != nasCleanupBatchedCapsClientVersion && session.version != nasCleanupDeliveryHoldClientVersion && !nasCleanupSupportsGroupedExecution(session.version)) {
 		return time.Time{}, nil
 	}
 	var seen *time.Time
@@ -674,7 +674,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, 400, "cleanup protocol1, client version and bounded limit required")
 		return
 	}
-	if req.ExecutionBatch && (req.Protocol != 2 || (req.ClientVersion != nasCleanupGroupClientVersion && req.ClientVersion != nasCleanupSerialGroupClientVersion && req.ClientVersion != nasCleanupDurableGroupClientVersion && req.ClientVersion != nasCleanupBatchedCapsClientVersion && req.ClientVersion != nasCleanupDeliveryHoldClientVersion && !nasCleanupSupportsV6(req.ClientVersion)) || req.RequestID == "") {
+	if req.ExecutionBatch && (req.Protocol != 2 || (req.ClientVersion != nasCleanupGroupClientVersion && req.ClientVersion != nasCleanupSerialGroupClientVersion && req.ClientVersion != nasCleanupDurableGroupClientVersion && req.ClientVersion != nasCleanupBatchedCapsClientVersion && req.ClientVersion != nasCleanupDeliveryHoldClientVersion && !nasCleanupSupportsGroupedExecution(req.ClientVersion)) || req.RequestID == "") {
 		util.WriteError(w, 400, "reviewed group client and protocol2 request identity required")
 		return
 	}
@@ -706,7 +706,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		return
 	}
 	session := cleanupRequestSession(r)
-	group := req.ExecutionBatch && (session.version == nasCleanupGroupClientVersion || session.version == nasCleanupSerialGroupClientVersion || session.version == nasCleanupDurableGroupClientVersion || session.version == nasCleanupBatchedCapsClientVersion || session.version == nasCleanupDeliveryHoldClientVersion || nasCleanupSupportsV6(session.version))
+	group := req.ExecutionBatch && (session.version == nasCleanupGroupClientVersion || session.version == nasCleanupSerialGroupClientVersion || session.version == nasCleanupDurableGroupClientVersion || session.version == nasCleanupBatchedCapsClientVersion || session.version == nasCleanupDeliveryHoldClientVersion || nasCleanupSupportsGroupedExecution(session.version))
 	groupIDs := []int64{}
 	var budgetLeft *int64
 	sessionDeadline, err := cleanupSessionDeadline(ctx, tx, cid, session)
@@ -1376,12 +1376,12 @@ func validCleanupReceiptEvidence(req cleanupReceipt) bool {
 	if req.RefusalProtocol != 0 && (req.RefusalProtocol != nasCleanupRefusalProtocol || req.RefusalReason == "") {
 		return false
 	}
-	if len(req.StageTimings) > 14 {
+	if len(req.StageTimings) > 15 {
 		return false
 	}
 	for name, elapsed := range req.StageTimings {
 		switch name {
-		case "lease_ms", "queue_ms", "lane_ms", "fence_ms", "open_ms", "proof_ms", "guard_ms", "observe_journal_ms", "observe_ms", "intent_journal_ms", "caps_ms", "ledger_intent_ms", "delete_ms", "ledger_result_ms":
+		case "lease_ms", "queue_ms", "lane_ms", "fence_ms", "open_ms", "proof_ms", "guard_ms", "observe_journal_ms", "observe_ms", "intent_journal_ms", "caps_ms", "ledger_intent_ms", "delete_ms", "directory_sync_ms", "ledger_result_ms":
 		default:
 			return false
 		}

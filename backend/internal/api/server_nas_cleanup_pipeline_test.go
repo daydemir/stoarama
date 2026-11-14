@@ -18,14 +18,18 @@ import (
 )
 
 func TestNASCleanupSuccessorPipelineClientServer(t *testing.T) {
-	testNASCleanupPipelineClientServer(t, false)
+	testNASCleanupPipelineClientServer(t, false, nasCleanupInventoryClientVersion)
 }
 
 func TestNASCleanupExecutionGroupClientServer(t *testing.T) {
-	testNASCleanupPipelineClientServer(t, true)
+	testNASCleanupPipelineClientServer(t, true, nasCleanupInventoryClientVersion)
 }
 
-func testNASCleanupPipelineClientServer(t *testing.T, grouped bool) {
+func TestNASCleanupBulkDurabilityClientServer(t *testing.T) {
+	testNASCleanupPipelineClientServer(t, true, nasCleanupBulkDurabilityClientVersion)
+}
+
+func testNASCleanupPipelineClientServer(t *testing.T, grouped bool, groupVersion string) {
 	for _, pipeline := range []bool{false, true} {
 		t.Run(fmt.Sprint(pipeline), func(t *testing.T) {
 			f := newCleanupFixture(t, 24)
@@ -34,7 +38,7 @@ func testNASCleanupPipelineClientServer(t *testing.T, grouped bool) {
 			if grouped {
 				apiDelay, headDelay = 200*time.Millisecond, 200*time.Millisecond
 				if pipeline {
-					version = nasCleanupInventoryClientVersion
+					version = groupVersion
 				}
 			}
 			if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, version); err != nil {
