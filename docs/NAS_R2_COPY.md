@@ -79,8 +79,15 @@ NAS SQL against this shape. This grants **no R2 deletion authority**. Evidence
 freshness for any later retirement must be re-established within that tool's
 24-hour window; a months-old copy result is not fresh proof.
 
-Network operations time out after 2s; reads/hashes/rate waits check cancellation
-at chunk boundaries. Policy, OFF and cleanup state are checkpointed at most
+Control HTTP has a 2s total deadline; each range GET has a 10s total deadline.
+A small isolated Python stdlib transport process makes DNS, TLS, trickling
+headers/body and reads killable. Its pipe output is bounded to 8 MiB plus a
+4 KiB metadata header, it has no media paths or inherited credential environment,
+and it is always killed/reaped before releasing the writer fence. The parent
+checks cancellation while polling I/O, hashing and pacing writes; a range GET
+may also have one bounded control request in flight for its checkpoint.
+Transient lease tokens and URLs are scoped to active operations, never accumulated
+in the shared diagnostic secret registry. Policy, OFF and cleanup state are checkpointed at most
 4s apart during work. The worker drains before self-update or inventory close.
 Only its private temporary links are removed after successful no-overwrite
 commit; existing source media, final files and conflicts are never deleted.

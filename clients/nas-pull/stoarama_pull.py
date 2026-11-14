@@ -4,6 +4,7 @@
 import argparse
 import base64
 import concurrent.futures
+from contextlib import contextmanager
 import datetime
 import errno
 import fcntl
@@ -355,7 +356,7 @@ def _redact_diagnostics(value, depth=0):
     if depth >= DIAGNOSTIC_MAX_DEPTH:
         return "[REDACTED]"
     if isinstance(value, (str, bytes, bytearray, memoryview)):
-        return redact_log_line(value, CLIENT_LOG_RING.output_root, CLIENT_LOG_RING.secrets)
+        return redact_log_line(value, CLIENT_LOG_RING.output_root, CLIENT_LOG_RING.redaction_secrets())
     if isinstance(value, dict):
         return {_redact_diagnostics(k, depth + 1): ("[REDACTED]" if diagnostic_secret_name(k) else _redact_diagnostics(v, depth + 1)) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -500,6 +501,7 @@ class ClientLogRing:
         self.max_lines, self.max_bytes = max_lines, max_bytes
         self.output_root = None
         self.secrets = client_log_secrets()
+        self.scoped_secret_counts = {}
         self.error_event = threading.Event()
         self.dropped = 0
 
@@ -512,11 +514,32 @@ class ClientLogRing:
         with self.lock:
             self.secrets = tuple(set(self.secrets).union(v for v in values if isinstance(v, str) and len(v) >= 8))
 
+    def redaction_secrets(self):
+        with self.lock:
+            return self.secrets + tuple(self.scoped_secret_counts)
+
+    @contextmanager
+    def scoped_secrets(self, values):
+        values = set(v for v in values if isinstance(v, str) and len(v) >= 8)
+        with self.lock:
+            for value in values:
+                self.scoped_secret_counts[value] = self.scoped_secret_counts.get(value, 0) + 1
+        try:
+            yield
+        finally:
+            with self.lock:
+                for value in values:
+                    count = self.scoped_secret_counts[value] - 1
+                    if count:
+                        self.scoped_secret_counts[value] = count
+                    else:
+                        del self.scoped_secret_counts[value]
+
     def record(self, level, message):
         level = str(level).upper()
         if level not in CLIENT_LOG_LEVELS and not CLIENT_LOG_TOPICS.search(str(message)):
             return
-        line = redact_log_line(message, self.output_root, self.secrets)
+        line = redact_log_line(message, self.output_root, self.redaction_secrets())
         with self.lock:
             self.seq += 1
             entry = {"seq": self.seq, "at": utc_now_precise(), "level": level, "message": line}
@@ -49194,6 +49217,116 @@ class R2CopyHold(RuntimeError):
     pass
 
 
+# An isolated stdlib transport lets the parent enforce a TOTAL deadline even
+# during DNS, TLS, trickling headers, or a read that never becomes idle. The
+# child has no NAS file paths, no inherited credentials, and cannot write media.
+R2_COPY_HTTP_CHILD = r'''
+import base64,json,sys,urllib.error,urllib.request
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,*args,**kwargs):
+        raise OSError("redirect refused")
+try:
+    p=json.load(sys.stdin)
+    req=urllib.request.Request(p["url"],method=p["method"],headers=p["headers"],
+        data=base64.b64decode(p["body"]) if p["body"] is not None else None)
+    try:
+        response=urllib.request.build_opener(NoRedirect()).open(req,timeout=2)
+    except urllib.error.HTTPError as error:
+        sys.stdout.buffer.write((json.dumps({"status":error.code,"headers":{}})+"\n").encode())
+        sys.stdout.buffer.flush()
+        sys.exit(0)
+    with response:
+        headers={k:response.headers.get(k,"") for k in ("Content-Range","ETag")}
+        sys.stdout.buffer.write((json.dumps({"status":response.status,"headers":headers})+"\n").encode())
+        sys.stdout.buffer.flush()
+        remaining=p["limit"]+1
+        while remaining:
+            block=response.read(min(65536,remaining))
+            if not block:break
+            sys.stdout.buffer.write(block);sys.stdout.buffer.flush();remaining-=len(block)
+except Exception:
+    sys.exit(1)
+'''
+
+
+def r2_copy_http(url, method, headers, body=None, limit=R2_COPY_RANGE, timeout=10, guard=None):
+    import select
+    message = json.dumps({"url": url, "method": method, "headers": headers,
+                          "body": base64.b64encode(body).decode() if body is not None else None,
+                          "limit": limit}).encode()
+    if len(message) > 32768:
+        raise R2CopyHold("copy HTTP input exceeds bound")
+    deadline = time.monotonic() + timeout
+    process = subprocess.Popen([sys.executable, "-I", "-c", R2_COPY_HTTP_CHILD], stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={}, start_new_session=True)
+    def kill_transport():
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    watchdog = threading.Timer(max(0, deadline - time.monotonic()), kill_transport)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        os.set_blocking(process.stdin.fileno(), False)
+        offset = 0
+        while offset < len(message):
+            if time.monotonic() >= deadline:
+                raise R2CopyHold("copy HTTP total deadline")
+            if guard is not None:
+                guard.check()
+            _, writable, _ = select.select([], [process.stdin], [], min(.2, max(0, deadline - time.monotonic())))
+            if writable:
+                try:
+                    offset += os.write(process.stdin.fileno(), message[offset:])
+                except BlockingIOError:
+                    pass
+        process.stdin.close()
+        output = bytearray()
+        while True:
+            if time.monotonic() >= deadline:
+                raise R2CopyHold("copy HTTP total deadline")
+            if guard is not None:
+                guard.check()
+            ready, _, _ = select.select([process.stdout], [], [], min(.2, max(0, deadline - time.monotonic())))
+            if not ready:
+                continue
+            block = os.read(process.stdout.fileno(), 65536)
+            if not block:
+                break
+            output.extend(block)
+            if len(output) > limit + 4096:
+                raise R2CopyHold("copy HTTP response exceeds bound")
+        if process.wait(timeout=max(.01, deadline - time.monotonic())) != 0:
+            raise R2CopyHold("copy HTTP transport failed")
+        metadata, separator, data = output.partition(b"\n")
+        if not separator or len(metadata) > 4096 or len(data) > limit:
+            raise R2CopyHold("copy HTTP response exceeds bound")
+        result = json.loads(metadata)
+        return result["status"], result["headers"], data
+    finally:
+        watchdog.cancel()
+        if process.poll() is None:
+            kill_transport()
+        process.wait(timeout=2)
+        watchdog.join(timeout=1)
+        process.stdout.close()
+        process.stdin.close()
+
+
+def r2_copy_request_json(cfg, method, path, body=None, timeout=R2_COPY_TIMEOUT):
+    # Copy tokens are scoped by execute_r2_copy, not permanently learned by the
+    # general response-secret registry. HTTP failures expose only a status code.
+    status, _, data = r2_copy_http(cfg.api_base + path, method,
+                                  {"User-Agent": USER_AGENT, "Authorization": "Bearer " + cfg.api_key,
+                                   "Content-Type": "application/json"},
+                                  json.dumps(body).encode() if body is not None else None,
+                                  limit=1024 * 1024, timeout=timeout)
+    if status != 200:
+        raise urllib.error.HTTPError(path, status, "copy control refused", {}, None)
+    return json.loads(data)
+
+
 def r2_copy_resources(cfg, runtime, needed=R2_COPY_RANGE):
     stitch_resources(cfg)  # mounted root, host/cgroup headroom and load
     _, available = meminfo_bytes(_read_text("/proc/meminfo"))
@@ -49228,7 +49361,7 @@ class R2CopyGuard:
                 raise R2CopyHold("copy yields to cleanup")
         free = r2_copy_resources(self.cfg, self.runtime)
         if remote or time.monotonic() - self.checked >= 4:
-            request_json(self.cfg, "POST", "/account/connections/r2-copy/%d/checkpoint" % self.task["id"],
+            r2_copy_request_json(self.cfg, "POST", "/account/connections/r2-copy/%d/checkpoint" % self.task["id"],
                          body={"token": self.task["token"], "free_bytes": free}, timeout=R2_COPY_TIMEOUT)
             self.checked = time.monotonic()
         return free
@@ -49311,7 +49444,7 @@ def r2_copy_hash(fd, guard, limiter):
 
 def r2_copy_range(cfg, task, offset, length, guard, fd, digest):
     free = guard.check(remote=True)
-    grant = request_json(cfg, "POST", "/account/connections/r2-copy/%d/range" % task["id"],
+    grant = r2_copy_request_json(cfg, "POST", "/account/connections/r2-copy/%d/range" % task["id"],
                          body={"token": task["token"], "free_bytes": free, "offset": offset, "length": length},
                          timeout=R2_COPY_TIMEOUT)
     if (grant.get("offset") != offset or grant.get("length") != length or grant.get("max_duration_sec") != 10
@@ -49325,39 +49458,26 @@ def r2_copy_range(cfg, task, offset, length, guard, fd, digest):
     if (headers.get("Range") != "bytes=%d-%d" % (offset, offset + length - 1)
             or headers.get("If-Match") != '\"%s\"' % normalized_etag(task["etag"])):
         raise R2CopyHold("copy grant lacks signed range/identity")
-    CLIENT_LOG_RING.add_secrets([grant["url"]])
-    req = urllib.request.Request(grant["url"], method="GET", headers={"User-Agent": USER_AGENT, **headers})
-    deadline = time.monotonic() + 10
-    class NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, *args, **kwargs):
-            raise R2CopyHold("copy redirect refused")
-    opener = urllib.request.build_opener(NoRedirect())
-    # Exactly ONE GET per grant: no retry, redirect, or persisted capability.
-    # A later attempt must obtain (and pay for) a new grant even after a crash.
-    with opener.open(req, timeout=R2_COPY_TIMEOUT) as response:
-        remember_response_secrets(response)
-        expected = "bytes %d-%d/%d" % (offset, offset + length - 1, task["item"]["size_bytes"])
-        if response.headers.get("Content-Range") != expected or normalized_etag(response.headers.get("ETag")) != normalized_etag(task["etag"]):
-            raise R2CopyHold("copy range identity changed")
-        left = length
-        while left:
-            if time.monotonic() >= deadline:
-                raise R2CopyHold("copy range deadline; partial retained")
-            guard.check()
-            block = response.read(min(R2_COPY_CHUNK, left))
-            if not block:
-                raise R2CopyHold("copy range truncated; partial retained")
-            written = 0
-            while written < len(block):
-                written += os.write(fd, block[written:])
-            digest.update(block)
-            left -= len(block)
-            guard.wait(len(block) / R2_COPY_RATE)
-        if response.read(1):
-            raise R2CopyHold("copy range exceeded bound")
+    # Exactly one GET per charged grant. The bounded child is killed/reaped
+    # before this worker can release its writer fence or retry another grant.
+    with CLIENT_LOG_RING.scoped_secrets([grant["url"]]):
+        status, response_headers, data = r2_copy_http(grant["url"], "GET", {"User-Agent": USER_AGENT, **headers},
+                                                     limit=length, timeout=10, guard=guard)
+    expected = "bytes %d-%d/%d" % (offset, offset + length - 1, task["item"]["size_bytes"])
+    if (status != 206 or response_headers.get("Content-Range") != expected
+            or normalized_etag(response_headers.get("ETag")) != normalized_etag(task["etag"]) or len(data) != length):
+        raise R2CopyHold("copy range identity or length changed")
+    for at in range(0, length, R2_COPY_CHUNK):
+        guard.check()
+        block = data[at:at + R2_COPY_CHUNK]
+        written = 0
+        while written < len(block):
+            written += os.write(fd, block[written:])
+        digest.update(block)
+        guard.wait(len(block) / R2_COPY_RATE)
     # Only a completed GET clears its dispatch gate. A stale completion cannot
     # clear a later grant, and a failure never retries the same capability.
-    request_json(cfg, "POST", "/account/connections/r2-copy/%d/checkpoint" % task["id"],
+    r2_copy_request_json(cfg, "POST", "/account/connections/r2-copy/%d/checkpoint" % task["id"],
                  body={"token": task["token"], "free_bytes": guard.check(), "range_id": grant["range_id"]},
                  timeout=R2_COPY_TIMEOUT)
 
@@ -49397,6 +49517,11 @@ def r2_copy_sidecar(parent, name, clip):
 
 def execute_r2_copy(cfg, runtime, inventory, stop, task):
     task = valid_r2_copy_task(task)
+    with CLIENT_LOG_RING.scoped_secrets([task["token"]]):
+        return _execute_r2_copy(cfg, runtime, inventory, stop, task)
+
+
+def _execute_r2_copy(cfg, runtime, inventory, stop, task):
     guard = R2CopyGuard(cfg, runtime, stop, task)
     # Fail immediately behind any existing writer. Cleanup never waits for us
     # to enter a queue; once active, chunk checkpoints see its drain request.
@@ -49464,12 +49589,12 @@ def execute_r2_copy(cfg, runtime, inventory, stop, task):
                                   file_identity=(info.st_ctime_ns, info.st_ino, info.st_dev),
                                   sidecar_evidence=(item["relative_path"] + ".stoarama.json", len(payload), hashlib.sha256(payload).hexdigest()))
                 rows = inventory._rows("dirty=1 AND clip_id=?", (item["source_id"],), 1)
-                request_json(cfg, "POST", "/account/connections/inventory", timeout=R2_COPY_TIMEOUT, body={
+                r2_copy_request_json(cfg, "POST", "/account/connections/inventory", timeout=R2_COPY_TIMEOUT, body={
                     "generation": "live", "dataset_schema": INVENTORY_DATASET_SCHEMA,
                     "root_exclusions": list(INVENTORY_ROOT_EXCLUSIONS), "complete": False, "files": inventory._reports(rows)})
                 inventory._mark_clean(rows)
                 guard.check(remote=True)
-                request_json(cfg, "POST", "/account/connections/r2-copy/%d/result" % task["id"],
+                r2_copy_request_json(cfg, "POST", "/account/connections/r2-copy/%d/result" % task["id"],
                              body={"token": task["token"], "free_bytes": r2_copy_resources(cfg, runtime)}, timeout=R2_COPY_TIMEOUT)
             finally:
                 os.close(final_fd)
@@ -49489,7 +49614,7 @@ def r2_copy_loop(cfg, runtime, inventory, stop):
             # Linux thread-local nice19 and idle I/O; failure holds this lane.
             stitch_priority()
             free = r2_copy_resources(cfg, runtime)
-            response = request_json(cfg, "POST", "/account/connections/r2-copy/lease",
+            response = r2_copy_request_json(cfg, "POST", "/account/connections/r2-copy/lease",
                                     body={"free_bytes": free}, timeout=R2_COPY_TIMEOUT)
             if response.get("task") is not None:
                 execute_r2_copy(cfg, runtime, inventory, stop, response["task"])
