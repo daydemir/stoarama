@@ -44,12 +44,13 @@ class ReviewedScopeTests(unittest.TestCase):
         rows = [dict(kind='raw', source_id=n, stream_id=3, path='p%d/%d.mp4' % (n, n), size_bytes=10, sha256='a'*64) for n in (1, 2)]
         refs = {'p%d' % n: dict(owner_stream_id=3, entries=1, shards=[dict(
             key=scope.PREFIX + c*64 + '/files.json.gz', sha256=c*64, bytes=100, entries=1)]) for n, c in ((1, 'a'), (2, 'b'))}
-        def fetch(key, sha, *a):
-            raise scope.ReadFailed('down') if sha[0] == 'a' else RuntimeError('reviewed cleanup metadata fetch refused')
-        with patch.object(scope, 'load_scope', return_value={'parents': refs}), patch.object(scope, 'fetch_pinned', side_effect=fetch):
-            with self.assertRaisesRegex(RuntimeError, 'refused') as caught:
-                scope.admissible_candidates(rows)
-        self.assertNotIsInstance(caught.exception, scope.ReadFailed)
+        for transient in ('a', 'b'):
+            def fetch(key, sha, *a):
+                raise scope.ReadFailed('down') if sha[0] == transient else RuntimeError('reviewed cleanup metadata fetch refused')
+            with patch.object(scope, 'load_scope', return_value={'parents': refs}), patch.object(scope, 'fetch_pinned', side_effect=fetch):
+                with self.assertRaisesRegex(RuntimeError, 'refused') as caught:
+                    scope.admissible_candidates(rows)
+            self.assertNotIsInstance(caught.exception, scope.ReadFailed)
 
     def test_selection_requires_frozen_size_single_link_and_raw_sidecar(self):
         rows = [dict(kind='raw', source_id=n, stream_id=3, path='reviewed/%d.mp4' % n,
