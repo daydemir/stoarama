@@ -508,6 +508,7 @@ class Runner:
             self.in_off = previous
 
     def _off(self):
+        latched_before = self.status.get('shutdown_or_recovery_failed', False)
         delay = 15
         pending = None
         while True:
@@ -577,7 +578,10 @@ class Runner:
                 time.sleep(delay)
                 delay = min(delay * 2, 300)
         # A disk error must not invalidate a confirmed OFF or block failure notification.
-        self.status.update(phase='master_false', live_commit=commit)
+        # A successful retry resolves only this OFF call's warning. Preserve
+        # prior failures and any recovery error that still needs owner review.
+        self.status.update(phase='master_false', live_commit=commit,
+                           shutdown_or_recovery_failed=latched_before or bool(self.status.get('recovery_error')))
 
     def master(self, enabled, emergency=False):
         if not enabled:
