@@ -127,7 +127,7 @@ def admissible_candidates(rows, cache=None):
         if transient is not None:
             raise transient
     finally:
-        pool.shutdown(wait=True, cancel_futures=True)
+        pool.shutdown(wait=False, cancel_futures=True)  # Do not wait on siblings to report a failure.
     # Compressed shards are <=128 KiB each; decompress one at a time below.
     fetched = {ref['sha256']: future.result() for future, ref in futures.items()}
     accepted = set()

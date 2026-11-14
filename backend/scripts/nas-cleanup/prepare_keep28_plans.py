@@ -127,12 +127,13 @@ def pg_env():
 def transient_sql_failure(stderr):
     """Fixed reason when psql stderr (VERBOSITY sqlstate or verbose) shows a
     retryable read failure; None for any other failure, which must stop."""
-    code = re.search(r'(?:ERROR|FATAL):\s+([0-9A-Z]{5})\b', stderr)
-    code = code[1] if code else None
-    if code == '57014':
+    codes = set(re.findall(r'(?:ERROR|FATAL|PANIC):\s+([0-9A-Z]{5})\b', stderr))
+    connection = {c for c in codes if c.startswith('08') or c in {'53300', '57P01', '57P02', '57P03', '40001', '40P01', '55P03'}}
+    if codes - connection - {'57014'} or 'PANIC' in stderr:
+        return None  # Any other reported condition, or any PANIC, must stop.
+    if codes == {'57014'}:
         return 'statement timeout'
-    if (code and (code.startswith('08') or code in {'53300', '57P01', '57P02', '57P03', '40001', '40P01', '55P03'})
-            or not code and any(x in stderr for x in ('connection to server', 'server closed the connection', 'SSL SYSCALL'))):
+    if codes or any(x in stderr for x in ('connection to server', 'server closed the connection', 'SSL SYSCALL')):
         return 'database connection or transaction unavailable'
     return None
 

@@ -44,6 +44,20 @@ class Keep28PlanTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'admission not confirmed'):
                     k.entrypoint()
 
+    def test_only_transient_sqlstates_are_read_failures(self):
+        transient = ['ERROR:  57014: canceling statement due to statement timeout',
+                     'FATAL:  57P01: terminating connection due to administrator command\nserver closed the connection unexpectedly',
+                     'psql: error: connection to server at "db" failed: timeout expired',
+                     'ERROR:  40001: could not serialize access']
+        fatal = ['PANIC:  XX001: invalid page\nserver closed the connection unexpectedly',
+                 'PANIC:  could not write to file\nserver closed the connection unexpectedly',
+                 'ERROR:  57014: canceling statement\nERROR:  XX001: invalid page',
+                 'ERROR:  42601: syntax error', 'ERROR:  XX000: internal error', 'something else']
+        for text in transient:
+            self.assertIsNotNone(k.transient_sql_failure(text), text)
+        for text in fatal:
+            self.assertIsNone(k.transient_sql_failure(text), text)
+
     def test_catalogue_timeout_is_a_read_failure(self):
         with patch('subprocess.run', side_effect=k.subprocess.TimeoutExpired('psql', 330)), patch.object(k, 'pg_env', return_value={}):
             with self.assertRaises(k.ReadFailed):
