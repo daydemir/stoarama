@@ -141,7 +141,7 @@ Before activation, measured copied bytes/day is **zero** (switch OFF). The old
 single-worker ideal ceiling was 86.4 GB/day for download plus rehash, with a
 100 GB/day grant cap. The uncapped rate must be measured on the NAS; do not use
 link speed as an achieved rate. Each successful file logs numeric source ID,
-size, newly downloaded bytes and elapsed milliseconds, separately from
+size, newly downloaded bytes, committed new-file bytes and elapsed milliseconds, separately from
 verification-only work. Queue verified totals and timestamped cleanup receipts
 supply the simultaneous custody/deletion measurement. Partial download/retries
 are not verified custody.

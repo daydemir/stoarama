@@ -99,6 +99,78 @@ class R2CopyWorkerTests(unittest.TestCase):
         self.assertFalse((self.cfg.output_dir/self.item["relative_path"]).exists())
         self.assertEqual(next((self.cfg.output_dir/"p").glob(".*.part")).read_bytes(), self.body[:100])
 
+    def test_complete_interrupted_partial_is_media_synced_before_resume_publication(self):
+        def interrupted(cfg, task, offset, length, guard, fd, digest):
+            os.write(fd, self.body)
+            self.stop.set()
+            raise pull.R2CopyHold("cancelled after complete write")
+        with mock.patch.object(pull, "r2_copy_range", side_effect=interrupted):
+            with self.assertRaises(pull.R2CopyHold):
+                self.run_copy()
+        self.stop.clear()
+        events = []
+        fsync = pull.os.fsync
+        def sync(fd):
+            if os.fstat(fd).st_size == len(self.body):
+                events.append("media_sync")
+            return fsync(fd)
+        def control(cfg, method, path, **kwargs):
+            if path.endswith("/inventory"):
+                self.assertIn("media_sync", events)
+            return self.control(cfg, method, path, **kwargs)
+        with mock.patch.object(pull, "r2_copy_range", side_effect=AssertionError("redownloaded")), \
+                mock.patch.object(pull.os, "fsync", side_effect=sync), \
+                mock.patch.object(pull, "r2_copy_request_json", side_effect=control):
+            self.run_copy()
+        self.assertTrue(events)
+        self.assertTrue(any(path.endswith("/result") for path, _ in self.calls))
+
+    def test_normal_delivery_publication_waits_for_copy_and_retains_exact_custody(self):
+        started, done = threading.Event(), threading.Event()
+        workers, errors, reports = [], [], []
+        def delivery():
+            started.set()
+            try:
+                self.inventory.record_verified(self.clip)
+                self.inventory.sync_clip_ids(self.cfg, [self.clip["clip_id"]])
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+        def control(cfg, method, path, **kwargs):
+            if path.endswith("/inventory"):
+                workers.append(threading.Thread(target=delivery))
+                workers[-1].start()
+                self.assertTrue(started.wait(1))
+                self.assertFalse(done.wait(.05))
+                row = kwargs["body"]["files"][0]
+                self.assertEqual(row["sidecar_relative_path"], self.item["relative_path"] + ".stoarama.json")
+                self.assertTrue(row["file_inode"])
+            return self.control(cfg, method, path, **kwargs)
+        try:
+            with mock.patch.object(pull, "r2_copy_range", side_effect=self.transfer), \
+                    mock.patch.object(pull, "r2_copy_request_json", side_effect=control), \
+                    mock.patch.object(pull, "request_json", side_effect=lambda *a, **kw: reports.extend(kw["body"]["files"]) or {}):
+                self.run_copy()
+                self.assertTrue(done.wait(2))
+                for worker in workers:
+                    worker.join(2)
+        finally:
+            for worker in workers:
+                worker.join(2)
+        self.assertFalse(errors)
+        self.assertEqual(len(reports), 1)
+        self.assertTrue(reports[0]["sidecar_sha256"])
+        self.assertTrue(reports[0]["file_inode"])
+        # A later ordinary delivery must not erase or merely refresh old proof.
+        self.inventory.record_verified(self.clip)
+        row = self.inventory._reports(self.inventory._rows("clip_id=?", (self.clip["clip_id"],), 1))[0]
+        self.assertEqual(row["sidecar_sha256"], reports[0]["sidecar_sha256"])
+        sidecar = self.cfg.output_dir/(self.item["relative_path"] + ".stoarama.json")
+        sidecar.write_text("{}")
+        with self.assertRaises(RuntimeError):
+            self.inventory.record_verified(self.clip)
+
     def test_existing_conflicts_symlinks_and_bad_checksums_are_preserved(self):
         final = self.cfg.output_dir / self.item["relative_path"]
         final.parent.mkdir()

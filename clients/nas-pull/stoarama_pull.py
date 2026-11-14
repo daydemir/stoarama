@@ -4,7 +4,7 @@
 import argparse
 import base64
 import concurrent.futures
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import datetime
 import errno
 import fcntl
@@ -1003,11 +1003,23 @@ class Inventory:
             raise InventoryProgressError("inventory progress persistence failed") from exc
 
     def record_verified(self, clip):
-        path = self.cfg.output_dir / valid_relative_path(clip)
-        stat = path.stat()
-        if stat.st_size != int(clip["size_bytes"]):
-            raise RuntimeError("inventory size changed after verification for clip %d" % int(clip["clip_id"]))
-        self._upsert(clip, "present", utc_now_precise(), stat.st_mtime_ns, file_identity=(stat.st_ctime_ns, stat.st_ino, stat.st_dev))
+        relative = str(valid_relative_path(clip))
+        # Ordinary delivery publishes after its worker returns. Reacquire path
+        # ownership and fresh complete custody, never replace exact copy proof
+        # with a size-only observation or refresh an old sidecar's timestamp.
+        with NAS_COPY_PATHS.own(relative, wait=True):
+            path, before = confined_regular_file(self.cfg.output_dir, relative)
+            size, sha = sha256_file(path)
+            sidecar, _ = confined_regular_file(self.cfg.output_dir, relative + ".stoarama.json")
+            payload, _ = stable_regular_file_bytes(sidecar, 65536)
+            _, current = confined_regular_file(self.cfg.output_dir, relative)
+            if (size != int(clip["size_bytes"]) or sha != clip["sha256"].lower()
+                    or cleanup_identity(before) != cleanup_identity(current)
+                    or json.loads(payload) != stitch_provenance(clip)):
+                raise RuntimeError("inventory media or sidecar changed after delivery")
+            self._upsert(clip, "present", utc_now_precise(), current.st_mtime_ns,
+                file_identity=(current.st_ctime_ns, current.st_ino, current.st_dev),
+                sidecar_evidence=(relative + ".stoarama.json", len(payload), hashlib.sha256(payload).hexdigest()))
 
     def _rows(self, where, params=(), limit=INVENTORY_SYNC_BATCH):
         with self.lock:
@@ -1047,15 +1059,23 @@ class Inventory:
     def sync_clip_ids(self, cfg, clip_ids, generation="live"):
         if not clip_ids:
             return
-        placeholders = ",".join("?" for _ in clip_ids)
-        rows = self._rows("dirty=1 AND clip_id IN (%s)" % placeholders, tuple(clip_ids), len(clip_ids))
-        if not rows:
-            return
-        request_json(cfg, "POST", "/account/connections/inventory", body={
-            "generation": generation, "dataset_schema": INVENTORY_DATASET_SCHEMA,
-            "root_exclusions": list(INVENTORY_ROOT_EXCLUSIONS), "complete": False, "files": self._reports(rows),
-        })
-        self._mark_clean(rows)
+        where = "dirty=1 AND clip_id IN (%s)" % ",".join("?" for _ in clip_ids)
+        rows = self._rows(where, tuple(clip_ids), len(clip_ids))
+        paths = sorted({row[2] for row in rows})
+        with ExitStack() as owned:
+            for path in paths:
+                owned.enter_context(NAS_COPY_PATHS.own(path, wait=True))
+            # Copy may have completed while ownership was being acquired.
+            rows = self._rows(where, tuple(clip_ids), len(clip_ids))
+            if any(row[2] not in paths for row in rows):
+                raise RuntimeError("inventory publication paths changed")
+            if not rows:
+                return
+            request_json(cfg, "POST", "/account/connections/inventory", body={
+                "generation": generation, "dataset_schema": INVENTORY_DATASET_SCHEMA,
+                "root_exclusions": list(INVENTORY_ROOT_EXCLUSIONS), "complete": False, "files": self._reports(rows),
+            })
+            self._mark_clean(rows)
 
     def sync_dirty(self, cfg, generation="live", scan_started_at=None, stop_event=None):
         # Establish a full-scan generation even when every local row is already
@@ -49700,7 +49720,7 @@ def execute_r2_copy(cfg, runtime, inventory, stop, task):
 
 
 def _execute_r2_copy(cfg, runtime, inventory, stop, task):
-    started, downloaded = time.monotonic(), 0
+    started, downloaded, committed = time.monotonic(), 0, 0
     guard = R2CopyGuard(cfg, runtime, stop, task)
     if STITCH_ACTIVE.is_set():
         raise R2CopyHold("copy yields to stitching")
@@ -49744,6 +49764,11 @@ def _execute_r2_copy(cfg, runtime, inventory, stop, task):
                     downloaded += length
                 if digest.hexdigest() != item["sha256"]:
                     raise R2CopyHold("copy checksum differs; partial preserved for inspection")
+                # A complete resumed partial may skip the range loop. Its
+                # media must be durable even if cancellation skipped a prior
+                # range-finally sync; directory fsync alone is insufficient.
+                guard.disk()
+                os.fsync(fd)
                 guard.check(remote=True)
                 # link is create-only. Never replace or quarantine user data.
                 r2_copy_namespace(parent, guard, lambda: os.link(partial, name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False))
@@ -49752,6 +49777,7 @@ def _execute_r2_copy(cfg, runtime, inventory, stop, task):
             finally:
                 os.close(fd)
             final_fd = os.open(name, flags, dir_fd=parent)
+            committed = item["size_bytes"]
         try:
             r2_copy_remove_private(parent, partial, name, guard)
             size, digest, info = r2_copy_hash(final_fd, guard)
@@ -49773,8 +49799,8 @@ def _execute_r2_copy(cfg, runtime, inventory, stop, task):
             guard.check(remote=True)
             r2_copy_request_json(cfg, "POST", "/account/connections/r2-copy/%d/result" % task["id"],
                          body={"token": task["token"], "free_bytes": r2_copy_resources(cfg, runtime)}, timeout=R2_COPY_TIMEOUT)
-            log("INFO", "R2 copy verified source_id=%d size_bytes=%d downloaded_bytes=%d elapsed_ms=%d" %
-                (item["source_id"], item["size_bytes"], downloaded, round((time.monotonic() - started) * 1000)))
+            log("INFO", "R2 copy verified source_id=%d size_bytes=%d downloaded_bytes=%d committed_bytes=%d elapsed_ms=%d" %
+                (item["source_id"], item["size_bytes"], downloaded, committed, round((time.monotonic() - started) * 1000)))
         finally:
             os.close(final_fd)
     finally:
