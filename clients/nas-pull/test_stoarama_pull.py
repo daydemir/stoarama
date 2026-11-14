@@ -1892,7 +1892,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 def __init__(self, target, args=(), **_kwargs):
                     self.target = target
                     self.args = args
-                    self.alive = target not in (pull.inventory_loop, pull.listing_proof_loop, pull.joined_loop, pull.cleanup_loop, pull.stitch_loop)
+                    self.alive = target not in (pull.inventory_loop, pull.listing_proof_loop, pull.joined_loop, pull.cleanup_loop, pull.stitch_loop, pull.r2_copy_loop)
 
                 def start(self):
                     started.append(self.target)

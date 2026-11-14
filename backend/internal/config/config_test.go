@@ -940,3 +940,20 @@ func TestNASStitchDefaultsOffAndIndependent(t *testing.T) {
 		t.Fatal("NAS V85 switches must ship disabled independently of cleanup")
 	}
 }
+
+func TestNASR2CopyDefaultsOffAndIndependent(t *testing.T) {
+	t.Setenv("NAS_R2_COPY_ENABLED", "")
+	t.Setenv("NAS_CLEANUP_DELETION_ENABLED", "true")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.NASR2CopyEnabled {
+		t.Fatal("R2 copies must ship disabled")
+	}
+	t.Setenv("NAS_R2_COPY_ENABLED", "true")
+	cfg, err = Load()
+	if err != nil || !cfg.NASR2CopyEnabled {
+		t.Fatal("copy switch not independently configurable")
+	}
+}

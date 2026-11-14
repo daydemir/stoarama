@@ -454,3 +454,18 @@ func TestHeadExposesProviderLastModified(t *testing.T) {
 		t.Fatalf("HEAD=%+v err=%v", h, err)
 	}
 }
+
+func TestPresignGetExactRangeBindsByteBoundaries(t *testing.T) {
+	c, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap, err := c.PresignGetExactRangeRequest(context.Background(), "clip.mp4", "abc123", "version-7", 10, 20, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := mustURL(t, cap.URL)
+	if !strings.Contains(u.Query().Get("X-Amz-SignedHeaders"), "range") || cap.Headers.Get("Range") != "bytes=10-29" || cap.Headers.Get("If-Match") != `"abc123"` || u.Query().Get("X-Amz-Expires") != "10" {
+		t.Fatalf("range capability not bound: %s %+v", u.Query().Get("X-Amz-SignedHeaders"), cap.Headers)
+	}
+}

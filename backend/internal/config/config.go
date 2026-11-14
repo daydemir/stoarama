@@ -47,6 +47,7 @@ type Config struct {
 	NASUploadProbeInterval           time.Duration
 	NASBenchmarkEnabled              bool
 	NASCleanupDeletionEnabled        bool
+	NASR2CopyEnabled                 bool
 	NASStitchEnabled                 bool
 	NASStitchDeletionEnabled         bool
 	StorageCredKey                   string
@@ -241,6 +242,7 @@ func Load() (Config, error) {
 		NASUploadProbeInterval:           durEnv("NAS_UPLOAD_PROBE_INTERVAL", 6*time.Hour),
 		NASBenchmarkEnabled:              boolEnv("NAS_BENCHMARK_ENABLED", true),
 		NASCleanupDeletionEnabled:        boolEnv("NAS_CLEANUP_DELETION_ENABLED", false),
+		NASR2CopyEnabled:                 boolEnv("NAS_R2_COPY_ENABLED", false),
 		NASStitchEnabled:                 boolEnv("NAS_STITCH_ENABLED", false),
 		NASStitchDeletionEnabled:         boolEnv("NAS_STITCH_DELETION_ENABLED", false),
 		StorageCredKey:                   strings.TrimSpace(os.Getenv("STORAGE_CRED_KEY")),

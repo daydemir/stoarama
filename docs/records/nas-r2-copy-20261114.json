@@ -1,0 +1,838 @@
+{
+  "as_of": "2026-11-12T18:10:35.630649Z",
+  "collated_blocked_copy_or_verify": {
+    "bytes": 3527398460691,
+    "objects": 46685
+  },
+  "note": "Copy classification is not a physical NAS-absence proof. New v9 raw includes earlier NAS identity-unproven rows. No fresh NAS media verification or copy has run.",
+  "older": {
+    "collated_no_exact_inventory": {
+      "bytes": 3927694960178,
+      "objects": 44700
+    },
+    "copy": {
+      "bytes": 4031313694496,
+      "objects": 272935
+    },
+    "copy_by_stream": {
+      "14782": {
+        "bytes": 153326788178,
+        "objects": 11200
+      },
+      "158": {
+        "bytes": 142989570322,
+        "objects": 19542
+      },
+      "17251": {
+        "bytes": 273500952270,
+        "objects": 18895
+      },
+      "17254": {
+        "bytes": 274509509042,
+        "objects": 18959
+      },
+      "17256": {
+        "bytes": 274546145238,
+        "objects": 18986
+      },
+      "17261": {
+        "bytes": 274527718712,
+        "objects": 18976
+      },
+      "17268": {
+        "bytes": 274069820018,
+        "objects": 18939
+      },
+      "17320": {
+        "bytes": 86772231214,
+        "objects": 11300
+      },
+      "17322": {
+        "bytes": 229892495780,
+        "objects": 11315
+      },
+      "17324": {
+        "bytes": 44296015649,
+        "objects": 11356
+      },
+      "17328": {
+        "bytes": 79749949398,
+        "objects": 11317
+      },
+      "17329": {
+        "bytes": 257833413967,
+        "objects": 11418
+      },
+      "17337": {
+        "bytes": 163140655477,
+        "objects": 12671
+      },
+      "17338": {
+        "bytes": 347298290725,
+        "objects": 11331
+      },
+      "182": {
+        "bytes": 10399586,
+        "objects": 2
+      },
+      "186": {
+        "bytes": 40892833,
+        "objects": 3
+      },
+      "195": {
+        "bytes": 170059060876,
+        "objects": 11319
+      },
+      "2666": {
+        "bytes": 8383837676,
+        "objects": 3203
+      },
+      "2675": {
+        "bytes": 25969442623,
+        "objects": 3800
+      },
+      "2676": {
+        "bytes": 86552164218,
+        "objects": 3310
+      },
+      "2678": {
+        "bytes": 43693771825,
+        "objects": 3298
+      },
+      "2681": {
+        "bytes": 32548826043,
+        "objects": 3448
+      },
+      "2693": {
+        "bytes": 76781018218,
+        "objects": 2878
+      },
+      "2708": {
+        "bytes": 85278668766,
+        "objects": 3243
+      },
+      "2718": {
+        "bytes": 44182271571,
+        "objects": 3145
+      },
+      "2720": {
+        "bytes": 31793598401,
+        "objects": 1250
+      },
+      "2757": {
+        "bytes": 25057558833,
+        "objects": 3252
+      },
+      "2963": {
+        "bytes": 37587431862,
+        "objects": 2785
+      },
+      "2973": {
+        "bytes": 18516611230,
+        "objects": 741
+      },
+      "3": {
+        "bytes": 200959204222,
+        "objects": 5754
+      },
+      "3007": {
+        "bytes": 20965013493,
+        "objects": 3076
+      },
+      "3039": {
+        "bytes": 72382229156,
+        "objects": 2766
+      },
+      "3049": {
+        "bytes": 70634764442,
+        "objects": 2691
+      },
+      "469": {
+        "bytes": 77421298938,
+        "objects": 2931
+      },
+      "487": {
+        "bytes": 26042073694,
+        "objects": 3835
+      }
+    },
+    "created_at": "2026-11-11T23:49:38.000282Z",
+    "file_sha256": "09ce02a93976527654a468518b5a920b5bb74b96ed5bc2646c6522d10d04d6f2",
+    "listing_sha256": "b392110220ca4a2f600c6b97548225555a084ad2c6d3380eab2b10efc18813bc",
+    "raw_nas_identity_unproven": {
+      "bytes": 2434585746239,
+      "objects": 182428
+    }
+  },
+  "policy_sha256": "060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811",
+  "raw_copy_or_verify": {
+    "bytes": 6465899440735,
+    "objects": 455363
+  },
+  "source": "Jelly ~/r2-retire-plans/20261112-v9/head-guard-final/copy.jsonl.gz",
+  "source_sha256": "f35e1299bd741bc5827927168fe47ed9a228c18183d795bd71c3bc88efff5a9c",
+  "streams": {
+    "12725": {
+      "collated": {
+        "bytes": 29303240625,
+        "objects": 7128
+      },
+      "raw": {
+        "bytes": 15048579350,
+        "objects": 6480
+      }
+    },
+    "14782": {
+      "collated": {
+        "bytes": 133686442987,
+        "objects": 2004
+      },
+      "raw": {
+        "bytes": 153326788178,
+        "objects": 11200
+      }
+    },
+    "158": {
+      "collated": {
+        "bytes": 11096333845,
+        "objects": 65
+      },
+      "raw": {
+        "bytes": 142989570322,
+        "objects": 19542
+      }
+    },
+    "17186": {
+      "raw": {
+        "bytes": 3828101024,
+        "objects": 254
+      }
+    },
+    "17208": {
+      "collated": {
+        "bytes": 112784045420,
+        "objects": 8496
+      },
+      "raw": {
+        "bytes": 121225914087,
+        "objects": 10762
+      }
+    },
+    "17216": {
+      "collated": {
+        "bytes": 43331388712,
+        "objects": 2487
+      },
+      "raw": {
+        "bytes": 9939054501,
+        "objects": 1777
+      }
+    },
+    "17219": {
+      "collated": {
+        "bytes": 98846241640,
+        "objects": 335
+      },
+      "raw": {
+        "bytes": 27187817342,
+        "objects": 1772
+      }
+    },
+    "17233": {
+      "collated": {
+        "bytes": 91206658125,
+        "objects": 653
+      },
+      "raw": {
+        "bytes": 105351436233,
+        "objects": 10715
+      }
+    },
+    "17234": {
+      "collated": {
+        "bytes": 166428705764,
+        "objects": 389
+      },
+      "raw": {
+        "bytes": 226127098554,
+        "objects": 7653
+      }
+    },
+    "17237": {
+      "collated": {
+        "bytes": 65122280517,
+        "objects": 176
+      },
+      "raw": {
+        "bytes": 24360559753,
+        "objects": 1678
+      }
+    },
+    "17238": {
+      "collated": {
+        "bytes": 115110319849,
+        "objects": 344
+      },
+      "raw": {
+        "bytes": 66571954242,
+        "objects": 3143
+      }
+    },
+    "17240": {
+      "collated": {
+        "bytes": 92725665188,
+        "objects": 491
+      },
+      "raw": {
+        "bytes": 53089049535,
+        "objects": 2367
+      }
+    },
+    "17241": {
+      "collated": {
+        "bytes": 91857539043,
+        "objects": 627
+      },
+      "raw": {
+        "bytes": 86051127533,
+        "objects": 7695
+      }
+    },
+    "17242": {
+      "raw": {
+        "bytes": 3945804352,
+        "objects": 268
+      }
+    },
+    "17243": {
+      "collated": {
+        "bytes": 205233742131,
+        "objects": 2072
+      },
+      "raw": {
+        "bytes": 33823899310,
+        "objects": 1895
+      }
+    },
+    "17247": {
+      "collated": {
+        "bytes": 151094701559,
+        "objects": 5003
+      },
+      "raw": {
+        "bytes": 32665306514,
+        "objects": 2297
+      }
+    },
+    "17248": {
+      "raw": {
+        "bytes": 3334483584,
+        "objects": 248
+      }
+    },
+    "17249": {
+      "raw": {
+        "bytes": 3506974432,
+        "objects": 250
+      }
+    },
+    "17251": {
+      "collated": {
+        "bytes": 97575615755,
+        "objects": 567
+      },
+      "raw": {
+        "bytes": 273500952270,
+        "objects": 18895
+      }
+    },
+    "17254": {
+      "collated": {
+        "bytes": 43658393087,
+        "objects": 225
+      },
+      "raw": {
+        "bytes": 274509509042,
+        "objects": 18959
+      }
+    },
+    "17256": {
+      "collated": {
+        "bytes": 44222690025,
+        "objects": 207
+      },
+      "raw": {
+        "bytes": 274546145238,
+        "objects": 18986
+      }
+    },
+    "17261": {
+      "collated": {
+        "bytes": 54399536983,
+        "objects": 248
+      },
+      "raw": {
+        "bytes": 274527718712,
+        "objects": 18976
+      }
+    },
+    "17268": {
+      "collated": {
+        "bytes": 45903329395,
+        "objects": 294
+      },
+      "raw": {
+        "bytes": 274069820018,
+        "objects": 18939
+      }
+    },
+    "17312": {
+      "collated": {
+        "bytes": 24394669666,
+        "objects": 333
+      },
+      "raw": {
+        "bytes": 12829523990,
+        "objects": 1440
+      }
+    },
+    "17315": {
+      "collated": {
+        "bytes": 141241879621,
+        "objects": 751
+      },
+      "raw": {
+        "bytes": 49478988447,
+        "objects": 1440
+      }
+    },
+    "17316": {
+      "collated": {
+        "bytes": 36668233770,
+        "objects": 930
+      },
+      "raw": {
+        "bytes": 61529084788,
+        "objects": 12916
+      }
+    },
+    "17319": {
+      "collated": {
+        "bytes": 2372073641,
+        "objects": 257
+      },
+      "raw": {
+        "bytes": 22881751532,
+        "objects": 10031
+      }
+    },
+    "17320": {
+      "collated": {
+        "bytes": 70155280393,
+        "objects": 958
+      },
+      "raw": {
+        "bytes": 86772231214,
+        "objects": 11300
+      }
+    },
+    "17321": {
+      "collated": {
+        "bytes": 39482031709,
+        "objects": 751
+      },
+      "raw": {
+        "bytes": 8059438373,
+        "objects": 1439
+      }
+    },
+    "17322": {
+      "collated": {
+        "bytes": 178901349040,
+        "objects": 835
+      },
+      "raw": {
+        "bytes": 229892495780,
+        "objects": 11315
+      }
+    },
+    "17323": {
+      "collated": {
+        "bytes": 205154519177,
+        "objects": 698
+      },
+      "raw": {
+        "bytes": 249091970395,
+        "objects": 10590
+      }
+    },
+    "17324": {
+      "collated": {
+        "bytes": 35862857692,
+        "objects": 2151
+      },
+      "raw": {
+        "bytes": 44296015649,
+        "objects": 11356
+      }
+    },
+    "17325": {
+      "raw": {
+        "bytes": 100926448,
+        "objects": 21
+      }
+    },
+    "17326": {
+      "collated": {
+        "bytes": 101493799850,
+        "objects": 1306
+      },
+      "raw": {
+        "bytes": 120708000779,
+        "objects": 14251
+      }
+    },
+    "17328": {
+      "collated": {
+        "bytes": 64849273753,
+        "objects": 1263
+      },
+      "raw": {
+        "bytes": 79749949398,
+        "objects": 11317
+      }
+    },
+    "17329": {
+      "collated": {
+        "bytes": 206744693598,
+        "objects": 921
+      },
+      "raw": {
+        "bytes": 257833413967,
+        "objects": 11418
+      }
+    },
+    "17336": {
+      "collated": {
+        "bytes": 99248341457,
+        "objects": 544
+      }
+    },
+    "17337": {
+      "raw": {
+        "bytes": 163140655477,
+        "objects": 12671
+      }
+    },
+    "17338": {
+      "collated": {
+        "bytes": 280955395251,
+        "objects": 1906
+      },
+      "raw": {
+        "bytes": 347298290725,
+        "objects": 11331
+      }
+    },
+    "17339": {
+      "collated": {
+        "bytes": 48472652052,
+        "objects": 188
+      },
+      "raw": {
+        "bytes": 10823553876,
+        "objects": 722
+      }
+    },
+    "17340": {
+      "collated": {
+        "bytes": 2923403109,
+        "objects": 42
+      },
+      "raw": {
+        "bytes": 318033233044,
+        "objects": 11318
+      }
+    },
+    "17342": {
+      "collated": {
+        "bytes": 42527550573,
+        "objects": 492
+      },
+      "raw": {
+        "bytes": 188286504621,
+        "objects": 9451
+      }
+    },
+    "175": {
+      "collated": {
+        "bytes": 36618887455,
+        "objects": 359
+      },
+      "raw": {
+        "bytes": 5791533476,
+        "objects": 807
+      }
+    },
+    "178": {
+      "raw": {
+        "bytes": 3053726400,
+        "objects": 228
+      }
+    },
+    "179": {
+      "raw": {
+        "bytes": 932458640,
+        "objects": 259
+      }
+    },
+    "182": {
+      "raw": {
+        "bytes": 10399586,
+        "objects": 2
+      }
+    },
+    "186": {
+      "raw": {
+        "bytes": 40892833,
+        "objects": 3
+      }
+    },
+    "195": {
+      "collated": {
+        "bytes": 8892747744,
+        "objects": 32
+      },
+      "raw": {
+        "bytes": 170059060876,
+        "objects": 11319
+      }
+    },
+    "2666": {
+      "raw": {
+        "bytes": 8505754448,
+        "objects": 3251
+      }
+    },
+    "2667": {
+      "raw": {
+        "bytes": 747383008,
+        "objects": 218
+      }
+    },
+    "2674": {
+      "raw": {
+        "bytes": 16598015573,
+        "objects": 2487
+      }
+    },
+    "2675": {
+      "raw": {
+        "bytes": 26396573233,
+        "objects": 3863
+      }
+    },
+    "2676": {
+      "raw": {
+        "bytes": 87110410754,
+        "objects": 3332
+      }
+    },
+    "2677": {
+      "raw": {
+        "bytes": 3735040192,
+        "objects": 260
+      }
+    },
+    "2678": {
+      "raw": {
+        "bytes": 44423952040,
+        "objects": 3352
+      }
+    },
+    "2680": {
+      "raw": {
+        "bytes": 47372432890,
+        "objects": 3523
+      }
+    },
+    "2681": {
+      "raw": {
+        "bytes": 32892381947,
+        "objects": 3504
+      }
+    },
+    "2693": {
+      "raw": {
+        "bytes": 77361711843,
+        "objects": 2902
+      }
+    },
+    "2708": {
+      "raw": {
+        "bytes": 85924726230,
+        "objects": 3270
+      }
+    },
+    "2713": {
+      "raw": {
+        "bytes": 767306672,
+        "objects": 233
+      }
+    },
+    "2717": {
+      "raw": {
+        "bytes": 25921165120,
+        "objects": 3379
+      }
+    },
+    "2718": {
+      "raw": {
+        "bytes": 44853606141,
+        "objects": 3196
+      }
+    },
+    "2720": {
+      "raw": {
+        "bytes": 70195876055,
+        "objects": 2835
+      }
+    },
+    "2726": {
+      "raw": {
+        "bytes": 77317808003,
+        "objects": 2957
+      }
+    },
+    "2740": {
+      "raw": {
+        "bytes": 1965102611,
+        "objects": 134
+      }
+    },
+    "2757": {
+      "raw": {
+        "bytes": 25486041200,
+        "objects": 3305
+      }
+    },
+    "293": {
+      "raw": {
+        "bytes": 3262918512,
+        "objects": 253
+      }
+    },
+    "295": {
+      "raw": {
+        "bytes": 3295423984,
+        "objects": 245
+      }
+    },
+    "2963": {
+      "raw": {
+        "bytes": 37974329246,
+        "objects": 2816
+      }
+    },
+    "2965": {
+      "raw": {
+        "bytes": 33548750236,
+        "objects": 3208
+      }
+    },
+    "2973": {
+      "raw": {
+        "bytes": 69867847482,
+        "objects": 2717
+      }
+    },
+    "2975": {
+      "raw": {
+        "bytes": 1006908448,
+        "objects": 278
+      }
+    },
+    "3": {
+      "collated": {
+        "bytes": 206851950490,
+        "objects": 157
+      },
+      "raw": {
+        "bytes": 297385549727,
+        "objects": 11276
+      }
+    },
+    "3006": {
+      "raw": {
+        "bytes": 836774640,
+        "objects": 229
+      }
+    },
+    "3007": {
+      "raw": {
+        "bytes": 21377024536,
+        "objects": 3135
+      }
+    },
+    "3018": {
+      "raw": {
+        "bytes": 2021405488,
+        "objects": 273
+      }
+    },
+    "3021": {
+      "raw": {
+        "bytes": 909651968,
+        "objects": 256
+      }
+    },
+    "3022": {
+      "raw": {
+        "bytes": 966799552,
+        "objects": 260
+      }
+    },
+    "3025": {
+      "raw": {
+        "bytes": 1759521520,
+        "objects": 229
+      }
+    },
+    "3039": {
+      "raw": {
+        "bytes": 73397267099,
+        "objects": 2804
+      }
+    },
+    "3049": {
+      "raw": {
+        "bytes": 71522074865,
+        "objects": 2729
+      }
+    },
+    "415": {
+      "raw": {
+        "bytes": 75340289046,
+        "objects": 10051
+      }
+    },
+    "469": {
+      "raw": {
+        "bytes": 78113232936,
+        "objects": 2957
+      }
+    },
+    "487": {
+      "raw": {
+        "bytes": 26470567559,
+        "objects": 3895
+      }
+    },
+    "78": {
+      "raw": {
+        "bytes": 75046051491,
+        "objects": 10055
+      }
+    }
+  }
+}

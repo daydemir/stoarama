@@ -63,7 +63,7 @@ func TestDeliveryKeepMigrationsUpgradeCleanupBatchV4(t *testing.T) {
 	if err := MigrateUp(ctx, pool, dir); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"0189_delivery_keep_holds.sql", "0190_delivery_r2_retirement_guards.sql", "0191_nas_cleanup_delivery_lookup.sql", "0192_delivery_only_r2_apply.sql"} {
+	for _, name := range []string{"0189_delivery_keep_holds.sql", "0190_delivery_r2_retirement_guards.sql", "0191_nas_cleanup_delivery_lookup.sql", "0192_delivery_only_r2_apply.sql", "0193_nas_r2_copy.sql"} {
 		copyMigration(name)
 	}
 	for pass := 0; pass < 2; pass++ {
@@ -71,7 +71,7 @@ func TestDeliveryKeepMigrationsUpgradeCleanupBatchV4(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, name := range []string{"0188_nas_cleanup_leased_index.sql", "0189_delivery_keep_holds.sql", "0190_delivery_r2_retirement_guards.sql", "0191_nas_cleanup_delivery_lookup.sql", "0192_delivery_only_r2_apply.sql"} {
+	for _, name := range []string{"0188_nas_cleanup_leased_index.sql", "0189_delivery_keep_holds.sql", "0190_delivery_r2_retirement_guards.sql", "0191_nas_cleanup_delivery_lookup.sql", "0192_delivery_only_r2_apply.sql", "0193_nas_r2_copy.sql"} {
 		if applied, err := isApplied(ctx, pool, name); err != nil || !applied {
 			t.Fatalf("migration %s skipped: %v", name, err)
 		}
