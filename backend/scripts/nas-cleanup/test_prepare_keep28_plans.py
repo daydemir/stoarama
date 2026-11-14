@@ -28,7 +28,7 @@ class Keep28PlanTests(unittest.TestCase):
             self.assertEqual([p.name for p in Path(out).iterdir()], ['summary.json'])
 
     def test_atomic_admission_never_splits_an_uncertain_proposal(self):
-        with patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', 409, 'conflict', {}, None)) as call:
+        with patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', 409, 'conflict', {}, io.BytesIO(b'rejected'))) as call:
             with self.assertRaisesRegex(RuntimeError, 'atomic admission rejected'):
                 k.submit('https://example.invalid', 'lookahead', [row(3, 'raw', 1), row(3, 'raw', 2)], [], [], atomic=True)
             self.assertEqual(call.call_count, 1)
@@ -36,7 +36,7 @@ class Keep28PlanTests(unittest.TestCase):
         with patch('traceback.print_exc'):
             with patch.object(k, 'main', side_effect=k.ReadFailed('timeout')):
                 self.assertEqual(k.entrypoint(), k.EXIT_READ_FAILED)
-            with patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', 409, 'conflict', {}, None)), \
+            with patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', 409, 'conflict', {}, io.BytesIO(b'rejected'))), \
                  patch.object(k, 'main', side_effect=lambda: k.submit('https://example.invalid', 'x', [row(3, 'raw', 1)], [], [], atomic=True)):
                 with self.assertRaisesRegex(RuntimeError, 'atomic admission rejected'):
                     k.entrypoint()

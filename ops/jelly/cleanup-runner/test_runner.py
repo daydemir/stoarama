@@ -487,7 +487,7 @@ class LoopTests(unittest.TestCase):
 
     def test_excluded_unenabled_current_or_successor_never_enables_but_issued_stops(self):
         for saved in ('current_plan', 'next_plan'):
-            with tempfile.TemporaryDirectory() as root:
+            with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
                 job = FakeRunner(root)
                 job.status.update(excluded_streams={'3': dict(http_status=409, stream_id=3,
                     reason='protected', label='rejected')}, **{saved: 42})
@@ -521,6 +521,24 @@ class LoopTests(unittest.TestCase):
             job.query = lambda sql: 1 if 'count(*)' in sql else []
             with self.assertRaisesRegex(r.Halt, 'reserved or uncertain'):
                 r.Runner.pick(job)
+
+    def test_excluded_plan_waits_for_complete_dry_run_before_parking(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
+            job = FakeRunner(root)
+            job.status.update(current_plan=42, excluded_streams={'3': {}})
+            job.p['results'][0]['state'] = 'leased'
+            job.picks = [None]
+            observed = []
+            def finish_dry(pid):
+                self.assertNotIn('parked_unenabled_plan', job.status)
+                observed.append(pid)
+                job.p['results'][0]['state'] = 'would_delete'
+                return job.p
+            job.await_dry = finish_dry
+            job.run()
+            self.assertEqual(observed, [42])
+            self.assertNotIn('ON', job.events)
+            self.assertEqual(job.status['parked_unenabled_plan'], 42)
 
     def test_rejection_without_evidence_or_outside_admission_still_stops(self):
         with tempfile.TemporaryDirectory() as root:

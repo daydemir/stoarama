@@ -946,10 +946,11 @@ class Runner:
         if lookahead or self.stopped() or self.status.get('deferred_streams'):
             return None  # Current/reserved/deferred work is expected; never claim completion here.
         # The preparer excludes reserved files. Never call that a completed cleanup.
+        excluded = ','.join(str(int(k)) for k in self.status.get('excluded_streams', {}))
         pending = self.query("""SELECT count(*) FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id
           WHERE p.account_id=47 AND p.connection_id=13 AND i.state<>'deleted'
           AND (p.mode<>'retired' OR i.delete_ever_issued)""" +
-          (" AND NOT (p.mode='dry_run' AND NOT i.delete_ever_issued AND i.state IN ('pending','leased','would_delete') AND (coalesce(i.item,p.manifest->(i.ordinal-1))->>'stream_id')::bigint IN (" + excluded + "))" if excluded else ''))
+          (" AND NOT (p.mode='dry_run' AND NOT i.delete_ever_issued AND i.state='would_delete' AND i.recovery IN (" + ','.join("'" + value + "'" for value in sorted(RECOVERY)) + ") AND (coalesce(i.item,p.manifest->(i.ordinal-1))->>'stream_id')::bigint IN (" + excluded + "))" if excluded else ''))
         require(pending == 0, 'no eligible work but reserved or uncertain files remain')
         if self.status.get('excluded_streams'):
             self.save('excluded_streams_remaining')
@@ -961,7 +962,7 @@ class Runner:
         excluded = self.status.get('excluded_streams') or {}
         if not any(str(item['stream_id']) in excluded for item in plan['items']):
             return False
-        dry_state(plan)  # A failed check or ever-issued authority still stops.
+        require(dry_state(plan), 'excluded plan dry run is incomplete')  # Never abandon live observations.
         require(not self.status.get('started_plan_sha256'), 'excluded plan has execution ownership')
         # Park read-only reservations; never clear an execution/recovery owner.
         self.save('dry_run', current_plan=None, parked_unenabled_plan=plan['id'])
@@ -1142,12 +1143,12 @@ class Runner:
                 self.save('stopped' if self.stopped() else 'excluded_streams_remaining' if self.status.get('excluded_streams') else 'complete', current_plan=None)
                 return
             self.save('dry_run', current_plan=pid, next_plan=None if pid == self.status.get('next_plan') else self.status.get('next_plan'))
-            if self.excluded_plan(self.plan(pid)):
-                continue
             p = self.await_dry(pid)
             if p is None:
                 break
             size = verify(p, self.catalog(p), self.windows, utcnow())
+            if self.excluded_plan(p):
+                continue
             if not budget_permits(self.recent_bytes(), size):
                 self.save('waiting_for_budget')
                 self.progress()
