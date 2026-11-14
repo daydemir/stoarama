@@ -411,24 +411,25 @@ class LoopTests(unittest.TestCase):
                 receipts=[dict(id=1406, label=outcome)], rejected_at_admission=[])))
         return command
 
-    def test_admission_rejection_excludes_only_that_stream_and_alerts(self):
+    def test_admission_rejection_is_still_a_stop(self):
         with tempfile.TemporaryDirectory() as root:
             job = self.isolation_job(root, [3, 4])
-            with patch.object(r, 'command', side_effect=self.preparer_exits({'3': 3, '4': 'k28auto-x-s4-raw-0001'})):
-                self.assertEqual(r.Runner.pick(job), 1406)
-            self.assertEqual(job.status['rejected_streams'], [3])
-            self.assertIn('notify', job.events)
-            self.assertFalse(job.stream_ready(3))
-            self.assertTrue(job.stream_ready(4))
-
-    def test_too_many_rejected_streams_stop_the_runner(self):
-        with tempfile.TemporaryDirectory() as root:
-            job = self.isolation_job(root, [3, 4, 5, 6])
-            outcomes = {'3': 3, '4': 3, '5': 3, '6': 3}
+            outcomes = {'3': 1, '4': 'k28auto-x-s4-raw-0001'}
             with patch.object(r, 'command', side_effect=self.preparer_exits(outcomes)):
-                with self.assertRaisesRegex(r.Halt, 'too many streams'):
+                with self.assertRaisesRegex(r.Halt, 'local command failed'):
                     r.Runner.pick(job)
-            self.assertEqual(job.status['rejected_streams'], [3, 4, 5, 6])
+            self.assertIn('4', outcomes, 'continued to another stream after a failed admission check')
+            self.assertNotIn('deferred_streams', job.status)
+
+    def test_malformed_deferrals_are_unreadable_ownership_state(self):
+        for bad in ([3], {'x': 1}, {'3': 'soon'}):
+            with tempfile.TemporaryDirectory() as root:
+                (Path(root) / 'status.json').write_text(json.dumps(
+                    {'current_plan': None, 'last_error': None, 'deferred_streams': bad}))
+                job = r.Runner(Path('.'), Path(root))
+                with self.assertRaisesRegex(r.Halt, 'ownership unreadable'):
+                    job.initialize()
+                job.lock.close()
 
     def test_read_failure_defers_stream_and_never_claims_completion(self):
         with tempfile.TemporaryDirectory() as root:
@@ -447,13 +448,12 @@ class LoopTests(unittest.TestCase):
             self.assertEqual(list(job.status['deferred_streams']), ['4'])
 
     def test_ambiguous_submission_timeout_or_unknown_failure_still_stops(self):
-        for code in (None, 1):
+        for code in (None, 1, 3):
             with tempfile.TemporaryDirectory() as root:
                 job = self.isolation_job(root, [3, 4])
                 with patch.object(r, 'command', side_effect=self.preparer_exits({'3': code})):
                     with self.assertRaisesRegex(r.Halt, 'local command failed'):
                         r.Runner.pick(job)
-                self.assertNotIn('rejected_streams', job.status)
                 self.assertNotIn('deferred_streams', job.status)
 
     def test_summary_timeout_defers_stream_ranking(self):

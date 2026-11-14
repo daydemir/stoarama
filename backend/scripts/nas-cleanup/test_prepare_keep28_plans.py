@@ -37,7 +37,8 @@ class Keep28PlanTests(unittest.TestCase):
                 self.assertEqual(k.entrypoint(), k.EXIT_READ_FAILED)
             with patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', 409, 'conflict', {}, None)), \
                  patch.object(k, 'main', side_effect=lambda: k.submit('https://example.invalid', 'x', [row(3, 'raw', 1)], [], [], atomic=True)):
-                self.assertEqual(k.entrypoint(), k.EXIT_ADMISSION_REJECTED)
+                with self.assertRaisesRegex(RuntimeError, 'atomic admission rejected'):
+                    k.entrypoint()
             with patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', 502, 'bad gateway', {}, None)), \
                  patch.object(k, 'main', side_effect=lambda: k.submit('https://example.invalid', 'x', [row(3, 'raw', 1)], [], [], atomic=True)):
                 with self.assertRaisesRegex(RuntimeError, 'admission not confirmed'):

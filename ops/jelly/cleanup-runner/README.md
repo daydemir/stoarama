@@ -54,16 +54,14 @@ The runner:
   ON still rejects concurrent deploys. Repeats OFF after completion or pause.
 - Uses a complete fresh dry run or invokes `prepare_keep28_plans.py --submit`
   for one stream, at most one <=100 GB plan. Unique `k28auto-YYYYMMDD-HHMMSS`
-  prefixes avoid immutable-label reuse. One stream cannot idle the others. The
-  preparer exits 3 when the server refused the whole atomic proposal (HTTP 409)
-  and 4 when a read-only catalogue or reviewed-scope read failed or timed out
-  before any submission; both mean nothing was admitted. Exit 3 alerts the owner
-  and excludes that stream (`rejected_streams`, sticky until owner review; never
-  retried); more than three rejected streams stop the runner. Exit 4, or a
-  summary-only timeout, defers that stream for an hour (`deferred_streams`) and
-  the next stream proceeds. With work deferred, the runner waits with master OFF
-  and never reports completion. Any other preparer failure, including a timeout
-  during submission (an ambiguous admission), still stops.
+  prefixes avoid immutable-label reuse. Admission rejection is a failed check
+  and stops. A slow read cannot idle the other streams: the preparer exits 4
+  when a read-only catalogue or reviewed-scope read failed or timed out before
+  any submission (nothing admitted). Exit 4, or a summary-only timeout, defers
+  that stream for an hour (`deferred_streams`) and the next stream proceeds.
+  With work deferred, the runner waits with master OFF and never reports
+  completion. Any other preparer failure, including a timeout during
+  submission (an ambiguous admission), still stops.
   Streams rank by R2-present candidate bytes per file, descending (stream ID
   breaks ties). The preparer's read-only `--summary-only --stream ID` mode
   supplies one stream at a time, retaining its indexed scope and 300-second SQL

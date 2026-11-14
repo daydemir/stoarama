@@ -299,11 +299,9 @@ COMMAND_TIMEOUT_SEC = 360
 PREPARE_TIMEOUT_SEC = 1800  # keep28 preparation on large streams exceeds six minutes
 STREAM_SUMMARY_TTL_SEC = 7 * 24 * 3600  # Ranking hints only; refreshes run with master OFF.
 PREPARER = 'backend/scripts/nas-cleanup/prepare_keep28_plans.py'
-# A stream whose read-only preparation failed is retried after this delay; other
-# streams continue. Admission-rejected streams stay out until owner review, and
-# more than this many rejected streams is systemic and stops the runner.
+# A stream whose read-only preparation failed is retried after this delay while
+# other streams continue. Admission rejection remains a failed check and stops.
 STREAM_RETRY_SEC = 3600
-MAX_REJECTED_STREAMS = 3
 COMMAND_FAILURE_LOG = Path.home() / 'stoarama-cleanup-runner' / 'command-failures.log'
 
 
@@ -374,7 +372,10 @@ class Runner:
                     and (status['current_plan'] is None or type(status['current_plan']) is int and status['current_plan'] > 0)
                     and (status.get('next_plan') is None or type(status['next_plan']) is int
                          and status['next_plan'] > 0 and status['next_plan'] != status['current_plan'])
-                    and (status['last_error'] is None or isinstance(status['last_error'], str)),
+                    and (status['last_error'] is None or isinstance(status['last_error'], str))
+                    and isinstance(status.get('deferred_streams', {}), dict)
+                    and all(re.fullmatch('[1-9][0-9]*', k) and type(v) in (int, float)
+                            for k, v in status.get('deferred_streams', {}).items()),
                     'invalid ownership state')
         except Exception:
             raise Halt('execution ownership unreadable; unknown enabled plan; owner review required') from None
@@ -420,25 +421,19 @@ class Runner:
         return self.prepare
 
     def prepare_stream(self, sid, args, submit):
-        """Run the preparer for one stream. False means this stream was set aside
-        with nothing admitted; every other failure, including an ambiguous
-        submission timeout, stops the runner."""
+        """Run the preparer for one stream. False means a read failed before any
+        submission, so nothing was admitted and the stream is deferred. Every
+        other failure, including admission rejection or an ambiguous submission
+        timeout, stops the runner."""
         try:
             command([sys.executable, str(self.repo / PREPARER), '--stream', str(sid),
                      '--scope-cache', str(self.root / 'reviewed-scope-cache'), *args],
                     env=os.environ.copy(), timeout=PREPARE_TIMEOUT_SEC)
         except CommandFailed as exc:
-            codes = self.preparer()
-            if exc.returncode == codes.EXIT_READ_FAILED or (exc.returncode is None and not submit):
+            if exc.returncode == self.preparer().EXIT_READ_FAILED or (exc.returncode is None and not submit):
                 self.step_failed('stream preparation deferred', reason='stream ' + str(sid))
                 deferred = dict(self.status.get('deferred_streams') or {}, **{str(sid): time.time() + STREAM_RETRY_SEC})
                 self.save(self.status.get('phase', 'dry_run'), deferred_streams=deferred)
-                return False
-            if submit and exc.returncode == codes.EXIT_ADMISSION_REJECTED:
-                rejected = sorted(set(self.status.get('rejected_streams') or []) | {sid})
-                self.save(self.status.get('phase', 'dry_run'), rejected_streams=rejected)
-                self.alert('Stream %d admission rejected; stream excluded until owner review' % sid)
-                require(len(rejected) <= MAX_REJECTED_STREAMS, 'admission rejected for too many streams; owner review required')
                 return False
             raise
         deferred = self.status.get('deferred_streams') or {}
@@ -448,8 +443,7 @@ class Runner:
         return True
 
     def stream_ready(self, sid):
-        return (sid not in (self.status.get('rejected_streams') or [])
-                and (self.status.get('deferred_streams') or {}).get(str(sid), 0) <= time.time())
+        return (self.status.get('deferred_streams') or {}).get(str(sid), 0) <= time.time()
 
     def wait_for_deferred_streams(self):
         # Master is OFF and nothing is enabled here; never call this completion.

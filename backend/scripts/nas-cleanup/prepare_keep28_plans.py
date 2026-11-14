@@ -69,14 +69,9 @@ LABEL = re.compile(r'^[a-z0-9][a-z0-9._-]{0,79}$')
 MAX_PLAN_ITEMS = 10000
 MAX_PLAN_BYTES = 100_000_000_000  # backend nasCleanupMaxPlanBytes
 MAX_BATCH_PLANS = 500
-# Exit codes the runner relies on. Both mean nothing was admitted; any other
-# failure (including a lost admission response) stays ambiguous and stops it.
-EXIT_ADMISSION_REJECTED = 3
+# A read failed before any submission: nothing was admitted and the runner may
+# retry this stream later. Every other failure stops the runner.
 EXIT_READ_FAILED = 4
-
-
-class AdmissionRejected(RuntimeError):
-    """The server refused the whole atomic proposal with HTTP 409."""
 
 
 def batch_digest(policy_sha, plans):
@@ -238,7 +233,7 @@ def submit(api, label, rows, receipts, rejected, atomic=False):
         if exc.code != 409:
             raise RuntimeError(f'admission not confirmed for {label}: HTTP {exc.code}; inspect the label before retrying')
         if atomic:
-            raise AdmissionRejected(f'atomic admission rejected for {label}; inspect the label before retrying') from None
+            raise RuntimeError(f'atomic admission rejected for {label}; inspect the label before retrying') from None
         if len(rows) == 1:
             rejected.append({'label': label, 'kind': rows[0]['kind'], 'source_id': rows[0]['source_id'], 'path': rows[0]['path'], 'reason': exc.read(2000).decode(errors='replace')})
             return
@@ -316,9 +311,9 @@ def main():
 def entrypoint():
     try:
         return main()
-    except (ReadFailed, AdmissionRejected) as exc:
+    except ReadFailed:
         traceback.print_exc()
-        return EXIT_READ_FAILED if isinstance(exc, ReadFailed) else EXIT_ADMISSION_REJECTED
+        return EXIT_READ_FAILED
 
 
 if __name__ == '__main__':
