@@ -127,7 +127,7 @@ func r2WriterAudit(ctx context.Context, pool *pgxpool.Pool, bucket string) (r2Wr
 	}
 	err = tx.QueryRow(ctx, `SELECT clock_timestamp(),r2_retirement_delivery_indexes_ready(),r2_retirement_writers_drained($1),coalesce((SELECT jsonb_agg(jsonb_build_object('bucket',bucket,'activated_at',activated_at,'drain_not_before',drain_not_before)) FROM r2_retirement_writer_fences),'[]'::jsonb)`, bucket).Scan(&h.ObservedAt, &h.IndexesReady, &h.WritersDrained, &h.Fence)
 	if err != nil {
-		return h, nil, err
+		return h, nil, fmt.Errorf("read readiness header: %w", err)
 	}
 	var items []r2WriterAuditItem
 	for _, spec := range r2WriterAuditSpecs {
@@ -157,7 +157,7 @@ func r2WriterAudit(ctx context.Context, pool *pgxpool.Pool, bucket string) (r2Wr
 		err = rows.Err()
 		rows.Close()
 		if err != nil {
-			return h, nil, err
+			return h, nil, fmt.Errorf("read %s rows: %w", spec.category, err)
 		}
 	}
 	// clock_timestamp() predicates can expire within this read-only snapshot.
