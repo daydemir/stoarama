@@ -140,14 +140,14 @@ def query(sql, psql):
     return json.loads(p.stdout)
 
 
-def candidates(policy, streams, bucket, psql):
+def candidates(policy, streams, bucket, psql, scope_cache=None):
     # One bounded read-only query per stream keeps each transaction short.
     rows = []
     for sid in sorted(streams or policy):
         part = stream_candidates(policy[sid], bucket, psql)
         rows += part
         print(json.dumps({'phase': 'listed_stream', 'stream_id': sid, 'files': len(part), 'bytes': sum(r['size_bytes'] for r in part)}), file=sys.stderr, flush=True)
-    return admissible_candidates(rows)
+    return admissible_candidates(rows, scope_cache)
 
 
 def stream_candidates(w, bucket, psql):
@@ -270,6 +270,7 @@ def main():
     ap.add_argument('--summary-only', action='store_true', help='write candidate totals only; never admit or write plans')
     ap.add_argument('--atomic-admission', action='store_true', help='stop on admission rejection; never split one proposal into several plans')
     ap.add_argument('--api', default='https://stoarama.com')
+    ap.add_argument('--scope-cache', help='content-addressed cache of pinned reviewed-scope objects (re-verified on every read)')
     a = ap.parse_args()
     if a.summary_only and (a.submit or len(a.stream) != 1):
         raise SystemExit('--summary-only requires exactly one stream and no --submit')
@@ -281,7 +282,7 @@ def main():
     unknown = set(a.stream) - set(policy)
     if unknown:
         raise SystemExit(f'streams without a keep28 window: {sorted(unknown)}')
-    rows = candidates(policy, set(a.stream), a.bucket, a.psql)
+    rows = candidates(policy, set(a.stream), a.bucket, a.psql, a.scope_cache)
     plans = [] if a.summary_only else batches(rows, a.label_prefix, a.max_items, int(a.max_bytes))
     if a.max_plans:
         plans = plans[:a.max_plans]

@@ -297,7 +297,7 @@ SHORT_READ_RETRY_DELAYS = (5, 10, 20, 30, 30, 25, None)  # 120 s
 READ_RETRY_DELAYS = (5, 10, 20, 30, 60, 60, 120, 120, 120, 120, 120, 120, None)  # 905 s
 COMMAND_TIMEOUT_SEC = 360
 PREPARE_TIMEOUT_SEC = 1800  # keep28 preparation on large streams exceeds six minutes
-STREAM_SUMMARY_TTL_SEC = 24 * 3600
+STREAM_SUMMARY_TTL_SEC = 7 * 24 * 3600  # Ranking hints only; refreshes run with master OFF.
 PREPARER = 'backend/scripts/nas-cleanup/prepare_keep28_plans.py'
 # A stream whose read-only preparation failed is retried after this delay; other
 # streams continue. Admission-rejected streams stay out until owner review, and
@@ -424,7 +424,8 @@ class Runner:
         with nothing admitted; every other failure, including an ambiguous
         submission timeout, stops the runner."""
         try:
-            command([sys.executable, str(self.repo / PREPARER), '--stream', str(sid), *args],
+            command([sys.executable, str(self.repo / PREPARER), '--stream', str(sid),
+                     '--scope-cache', str(self.root / 'reviewed-scope-cache'), *args],
                     env=os.environ.copy(), timeout=PREPARE_TIMEOUT_SEC)
         except CommandFailed as exc:
             codes = self.preparer()

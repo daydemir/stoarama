@@ -68,9 +68,13 @@ The runner:
   breaks ties). The preparer's read-only `--summary-only --stream ID` mode
   supplies one stream at a time, retaining its indexed scope and 300-second SQL
   cap. Summaries live in `stream-summaries/<policy-and-bucket-digest>/<id>/`
-  beneath the runner state on Jelly, expire after 24 hours, and are invalidated
-  after that stream's admission. The initial cache fill visits all 109 streams;
-  subsequent ranking reuses the cache. These are ranking hints only.
+  beneath the runner state on Jelly, expire after 7 days, and are invalidated
+  after that stream's admission. The initial cache fill visits all 109 streams
+  (about an hour, with master OFF); a 24-hour expiry repeated that idle hour
+  daily. Subsequent ranking reuses the cache. These are ranking hints only.
+  Pinned reviewed-scope objects (report, frozen index, folder shards) are cached
+  by SHA-256 in `reviewed-scope-cache/` and re-verified on every read; missing or
+  mismatched entries are refetched (8 parallel fetches).
   Preparation, dry run and independent verification rederive eligibility.
   Within each stream, files and plans
   prioritize bytes per operation, with R2-present plans ahead of NAS-only work.
