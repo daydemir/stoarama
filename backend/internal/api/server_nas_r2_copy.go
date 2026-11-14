@@ -18,9 +18,8 @@ import (
 
 const (
 	NASR2CopyFloor      int64 = 2_000_000_000_000
-	NASR2CopyDailyBytes int64 = 100_000_000_000
-	NASR2CopyRate       int64 = 2_000_000
-	NASR2CopyRangeBytes int64 = 8 << 20
+	NASR2CopyWorkers          = 4
+	NASR2CopyRangeBytes int64 = 16 << 20
 	NASR2CopyMaxFile    int64 = 64 << 30
 	nasR2CopyLock       int64 = 7343226011192
 )
@@ -99,6 +98,16 @@ func LoadNASR2CopySource(ctx context.Context, tx pgx.Tx, i NASR2CopyItem) (json.
 		!start.Equal(i.StartAt) || !end.Equal(i.EndAt) || tz != windows[stream].Timezone || purged || held {
 		return nil, errors.New("copy source changed, held, retired or outside policy")
 	}
+	// Raw and collated namespaces are disjoint (joined/ is refused above).
+	// A second raw catalog identity at this path is ambiguous even if bytes agree.
+	// The existing nas_delivery_raw_writer_path index bounds this lookup.
+	var alias bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_clips WHERE display_path<>'' AND display_path=$1 AND id<>$2)`, i.RelativePath, i.SourceID).Scan(&alias); err != nil {
+		return nil, err
+	}
+	if alias {
+		return nil, errors.New("copy path has another catalog identity")
+	}
 	var clip map[string]json.RawMessage
 	var identity struct {
 		RecordingID int64 `json:"recording_id"`
@@ -147,21 +156,16 @@ func (s *Server) nasR2CopyConnection(w http.ResponseWriter, r *http.Request) (in
 	return cid, true
 }
 
-// This lane only runs between cleanup batches. Also veto in-flight work from
-// paused plans, so turning a plan off never manufactures copy headroom.
-func nasR2CopyIdle(ctx context.Context, tx pgx.Tx) error {
+// Ordinary cleanup is outside the same pinned window that copy intersects.
+// Maintenance remains exclusive; per-source holds below also veto special
+// stitched-source retirement. No global plan/lease/permit veto is necessary.
+func nasR2CopyReady(ctx context.Context, tx pgx.Tx) error {
 	var busy bool
-	err := tx.QueryRow(ctx, `SELECT
- EXISTS(SELECT 1 FROM nas_cleanup_plans WHERE connection_id=13 AND mode='enabled') OR
- EXISTS(SELECT 1 FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE p.connection_id=13
- AND (i.state='delete_issued' OR (i.state='leased' AND i.lease_expires_at>now()))) OR
- EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE connection_id=13 AND mode='enabled') OR
- EXISTS(SELECT 1 FROM nas_cleanup_maintenance WHERE active)`).Scan(&busy)
-	if err != nil {
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_maintenance WHERE active)`).Scan(&busy); err != nil {
 		return err
 	}
 	if busy {
-		return errors.New("copy yields to cleanup")
+		return errors.New("copy yields to maintenance")
 	}
 	return nil
 }
@@ -203,16 +207,16 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, 503, "copy admission busy")
 		return
 	}
-	if err = nasR2CopyIdle(ctx, tx); err != nil {
-		util.WriteError(w, 409, "copy yields to cleanup")
+	if err = nasR2CopyReady(ctx, tx); err != nil {
+		util.WriteError(w, 409, "copy yields to maintenance")
 		return
 	}
-	var busy bool
-	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_r2_copy_items WHERE connection_id=$1 AND state='leased' AND lease_expires_at>now())`, cid).Scan(&busy); err != nil {
+	var active int
+	if err = tx.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE connection_id=$1 AND state='leased' AND lease_expires_at>now()`, cid).Scan(&active); err != nil {
 		util.WriteError(w, 503, "copy lease unavailable")
 		return
 	}
-	if busy {
+	if active >= NASR2CopyWorkers {
 		util.WriteJSON(w, 200, map[string]any{"task": nil})
 		return
 	}
@@ -256,7 +260,7 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, 503, "copy lease commit failed")
 		return
 	}
-	util.WriteJSON(w, 200, map[string]any{"task": task, "floor_bytes": NASR2CopyFloor, "bytes_per_sec": NASR2CopyRate, "range_bytes": NASR2CopyRangeBytes})
+	util.WriteJSON(w, 200, map[string]any{"task": task, "floor_bytes": NASR2CopyFloor, "range_bytes": NASR2CopyRangeBytes})
 }
 
 func (s *Server) nasR2CopyActive(w http.ResponseWriter, r *http.Request) (pgx.Tx, nasR2CopyTask, string, nasR2CopyControl, bool) {
@@ -281,15 +285,9 @@ func (s *Server) nasR2CopyActive(w http.ResponseWriter, r *http.Request) (pgx.Tx
 		return nil, t, version, req, false
 	}
 	fail := func() { tx.Rollback(ctx) }
-	// Same singleton as leasing: no new owner or simultaneous range can pass.
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasR2CopyLock); err != nil {
+	if err = nasR2CopyReady(ctx, tx); err != nil {
 		fail()
-		util.WriteError(w, 503, "copy admission busy")
-		return nil, t, version, req, false
-	}
-	if err = nasR2CopyIdle(ctx, tx); err != nil {
-		fail()
-		util.WriteError(w, 409, "copy yields to cleanup")
+		util.WriteError(w, 409, "copy yields to maintenance")
 		return nil, t, version, req, false
 	}
 	var data []byte
@@ -329,28 +327,6 @@ func (s *Server) handleNASR2CopyCheckpoint(w http.ResponseWriter, r *http.Reques
 	util.WriteJSON(w, 200, map[string]any{"active": true})
 }
 
-// Reserve every single-use client GET (including retries) before issuing a
-// signed exact range. Ten-second URL TTL plus ten-second client work deadline
-// fit inside the conservative 30s window charged to BOTH UTC dates.
-func nasR2CopyCharge(ctx context.Context, tx pgx.Tx, n int64, now time.Time) error {
-	day := now.UTC().Truncate(24 * time.Hour)
-	days := []time.Time{day}
-	if day.Add(24*time.Hour).Sub(now.UTC()) <= 30*time.Second {
-		days = append(days, day.Add(24*time.Hour))
-	}
-	for _, d := range days {
-		tag, err := tx.Exec(ctx, `INSERT INTO nas_r2_copy_budgets(connection_id,day,charged_bytes) VALUES(13,$1,$2)
- ON CONFLICT(connection_id,day) DO UPDATE SET charged_bytes=nas_r2_copy_budgets.charged_bytes+excluded.charged_bytes
- WHERE nas_r2_copy_budgets.charged_bytes+excluded.charged_bytes<=$3`, d, n, NASR2CopyDailyBytes)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() != 1 {
-			return errors.New("daily copy budget exhausted")
-		}
-	}
-	return nil
-}
 func (s *Server) handleNASR2CopyRange(w http.ResponseWriter, r *http.Request) {
 	tx, t, version, req, ok := s.nasR2CopyActive(w, r)
 	if !ok {
@@ -362,12 +338,7 @@ func (s *Server) handleNASR2CopyRange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	issuedAt := time.Now()
-	if err := nasR2CopyCharge(r.Context(), tx, req.Length, issuedAt); err != nil {
-		util.WriteError(w, 429, "daily copy budget exhausted")
-		return
-	}
-	// Refuse overlapping transfers even from a stale client. Any attempt moves
-	// this gate 10s forward; a timed-out request keeps its charge and cooldown.
+	// One in-flight range per item, independent of every other file.
 	var ready bool
 	if err := tx.QueryRow(r.Context(), `SELECT coalesce(range_until<=now(),true) FROM nas_r2_copy_items WHERE id=$1`, t.ID).Scan(&ready); err != nil || !ready {
 		util.WriteError(w, 409, "copy transfer already active")
@@ -380,7 +351,7 @@ func (s *Server) handleNASR2CopyRange(w http.ResponseWriter, r *http.Request) {
 	}
 	rangeID := hex.EncodeToString(nonce)
 	if _, err := tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET range_until=$2,range_id=$3,lease_expires_at=now()+interval '30 seconds' WHERE id=$1`, t.ID, issuedAt.Add(10*time.Second), rangeID); err != nil || tx.Commit(r.Context()) != nil {
-		util.WriteError(w, 503, "copy budget commit failed")
+		util.WriteError(w, 503, "copy range commit failed")
 		return
 	}
 	// Range+If-Match are signed: the client cannot expand this grant. URLs

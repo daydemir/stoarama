@@ -841,7 +841,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		}
 	}
 	groupIDs := itemIDs
-	bulk := req.ClientVersion == nasCleanupBulkDurabilityClientVersion
+	bulk := nasCleanupSupportsBulk(req.ClientVersion)
 	serial := req.ClientVersion == nasCleanupSerialGroupClientVersion || req.ClientVersion == nasCleanupDurableGroupClientVersion || req.ClientVersion == nasCleanupBatchedCapsClientVersion || req.ClientVersion == nasCleanupDeliveryHoldClientVersion || nasCleanupSupportsV6(req.ClientVersion)
 	if serial && req.ExecutionBatch {
 		// The full lease roster still owns the execution slot. Only the current

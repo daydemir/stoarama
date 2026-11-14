@@ -35,9 +35,10 @@ class R2CopyWorkerTests(unittest.TestCase):
         self.control_patch = SimpleNamespace(original=pull.r2_copy_request_json)
         for patch in (
             mock.patch.object(pull, "NAS_MEDIA_FENCE", pull.NASMediaFence()),
+            mock.patch.object(pull, "NAS_COPY_PATHS", pull.NASCopyPaths()),
+            mock.patch.object(pull, "CLEANUP_DIRECTORIES", pull.CleanupDirectoryLog()),
             mock.patch.object(pull, "r2_copy_resources", return_value=pull.R2_COPY_FLOOR + 1_000_000_000),
             mock.patch.object(pull, "storage_status", return_value={"available": True, "free_bytes": pull.R2_COPY_FLOOR + 1_000_000_000}),
-            mock.patch.object(pull.R2CopyGuard, "wait", side_effect=lambda n: None),
             mock.patch.object(pull, "r2_copy_request_json", side_effect=self.control),
         ):
             patch.start()
@@ -101,20 +102,123 @@ class R2CopyWorkerTests(unittest.TestCase):
             self.run_copy()
         self.assertEqual(target.read_bytes(), b"user data")
 
-    def test_cleanup_and_remote_off_release_fence(self):
-        def start_cleanup(cfg, task, offset, length, guard, fd, digest):
-            pull.NAS_MEDIA_FENCE.execution_owner = 123
-            guard.check()
-        with mock.patch.object(pull, "r2_copy_range", side_effect=start_cleanup):
-            with self.assertRaises(pull.R2CopyHold):
-                self.run_copy()
+    def test_enabled_cleanup_allows_copy_but_remote_off_stops_it(self):
+        pull.NAS_MEDIA_FENCE.execution_owner = 123
+        pull.NAS_MEDIA_FENCE.cleaners = 1
+        with mock.patch.object(pull, "r2_copy_range", side_effect=self.transfer):
+            self.run_copy()
+        self.assertTrue(any(path.endswith("/result") for path, _ in self.calls))
         self.assertEqual(pull.NAS_MEDIA_FENCE.writers, 0)
         self.assertEqual(self.runtime.capacity_reserved_bytes, 0)
-        pull.NAS_MEDIA_FENCE.execution_owner = None
         with mock.patch.object(pull, "r2_copy_request_json", side_effect=urllib.error.HTTPError("https://redacted", 409, "off", {}, None)):
             with self.assertRaises(urllib.error.HTTPError):
                 self.run_copy()
-        self.assertEqual(pull.NAS_MEDIA_FENCE.writers, 0)
+        self.assertFalse(pull.NAS_COPY_PATHS.active)
+
+    def test_cleanup_registration_between_publication_steps_recovers_private_links(self):
+        final = self.cfg.output_dir / self.item["relative_path"]
+        link = pull.os.link
+        namespace = pull.r2_copy_namespace
+        for sidecar in (False, True):
+            # Fresh target per case; kept fixture files are never overwritten.
+            self.item["relative_path"] = "p/copy-%s.mp4" % sidecar
+            self.clip["relative_path"] = self.item["relative_path"]
+            final = self.cfg.output_dir / self.item["relative_path"]
+            registered, pending = [], []
+            def namespace_then_register(parent, guard, mutate):
+                result = namespace(parent, guard, mutate)
+                for key in pending:
+                    pull.CLEANUP_DIRECTORIES.enter(key)
+                    registered.append(key)
+                pending.clear()
+                return result
+            def register_after_link(src, dst, **kwargs):
+                result = link(src, dst, **kwargs)
+                if dst.endswith(".stoarama.json") == sidecar:
+                    info = os.fstat(kwargs["dst_dir_fd"])
+                    key = (info.st_dev, info.st_ino)
+                    pending.append(key)
+                return result
+            with self.subTest(sidecar=sidecar), mock.patch.object(pull, "r2_copy_range", side_effect=self.transfer), \
+                    mock.patch.object(pull.os, "link", side_effect=register_after_link), \
+                    mock.patch.object(pull, "r2_copy_namespace", side_effect=namespace_then_register):
+                with self.assertRaises(pull.R2CopyHold):
+                    self.run_copy()
+            self.assertTrue(final.exists())
+            self.assertEqual(self.runtime.capacity_reserved_bytes, 0)
+            for key in registered:
+                pull.CLEANUP_DIRECTORIES.leave(key)
+            with mock.patch.object(pull, "r2_copy_range", side_effect=AssertionError("redownloaded")):
+                self.run_copy()
+            self.assertEqual(final.read_bytes(), self.body)
+            self.assertEqual(final.stat().st_nlink, 1)
+            self.assertFalse(list(final.parent.glob(".*.part")))
+
+    def test_cleanup_namespace_registration_refuses_only_that_directory(self):
+        parent = self.cfg.output_dir / "p"
+        parent.mkdir()
+        info = parent.stat()
+        key = (info.st_dev, info.st_ino)
+        pull.CLEANUP_DIRECTORIES.enter(key)
+        try:
+            with self.assertRaises(pull.R2CopyHold):
+                self.run_copy()
+            self.assertFalse(list(parent.iterdir()))
+        finally:
+            pull.CLEANUP_DIRECTORIES.leave(key)
+
+    def test_delivery_and_stale_copy_cannot_replace_owned_path(self):
+        with pull.NAS_COPY_PATHS.own(self.item["relative_path"]):
+            with self.assertRaises(pull.R2CopyHold):
+                self.run_copy()
+            entered = threading.Event()
+            def delivery():
+                with pull.NAS_COPY_PATHS.own(self.item["relative_path"], wait=True):
+                    entered.set()
+            worker = threading.Thread(target=delivery)
+            worker.start()
+            self.assertFalse(entered.wait(.05))
+            # A waiting delivery has not taken the cleanup writer fence.
+            self.assertEqual(pull.NAS_MEDIA_FENCE.writers, 0)
+        worker.join(1)
+        self.assertTrue(entered.is_set())
+
+    def test_cleanup_priority_blocks_disk_but_not_control_and_cancels(self):
+        guard = pull.R2CopyGuard(self.cfg, self.runtime, self.stop, self.task)
+        ready = threading.Event()
+        @pull.NAS_COPY_PATHS.cleanup_priority
+        def cleanup():
+            ready.set()
+            self.assertEqual(guard.check(), pull.R2_COPY_FLOOR + 1_000_000_000)
+            self.stop.wait(1)
+        worker = threading.Thread(target=cleanup)
+        worker.start()
+        self.assertTrue(ready.wait(1))
+        timer = threading.Timer(.1, self.stop.set)
+        timer.start()
+        with self.assertRaises(pull.R2CopyHold):
+            guard.disk()
+        worker.join(1)
+        timer.join(1)
+        self.assertEqual(pull.NAS_COPY_PATHS.priority, 0)
+
+    def test_copy_pool_drains_every_worker_before_supervisor_finishes(self):
+        started = threading.Barrier(pull.R2_COPY_WORKERS + 1)
+        drain = threading.Event()
+        def worker(*args):
+            started.wait(2)
+            self.stop.wait(2)
+            drain.wait(2)
+        with mock.patch.object(pull, "r2_copy_worker", side_effect=worker):
+            supervisor = threading.Thread(target=pull.r2_copy_loop, args=(self.cfg, self.runtime, self.inventory, self.stop))
+            supervisor.start()
+            started.wait(2)
+            self.stop.set()
+            supervisor.join(.05)
+            self.assertTrue(supervisor.is_alive())
+            drain.set()
+            supervisor.join(2)
+            self.assertFalse(supervisor.is_alive())
 
     def test_total_deadline_bounds_stalled_and_trickling_io_and_reaps_child(self):
         for mode in ("stall", "body", "headers"):

@@ -21,6 +21,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Manifest batches bound operator review/import size; they never limit transfer rate.
+const nasCopyBatchBytes int64 = 100_000_000_000
+
 type nasCopyHeader struct {
 	Version      int    `json:"version"`
 	PolicySHA256 string `json:"policy_sha256"`
@@ -138,7 +141,7 @@ func planNASR2Copy(input, out, expected string) (nasCopySummary, error) {
 		}
 		sum.Raw.Objects++
 		sum.Raw.Bytes += i.SizeBytes
-		if len(batch) >= 5000 || batchBytes+i.SizeBytes > api.NASR2CopyDailyBytes {
+		if len(batch) >= 5000 || batchBytes+i.SizeBytes > nasCopyBatchBytes {
 			batches = append(batches, batch)
 			batch = nil
 			batchBytes = 0
@@ -230,7 +233,7 @@ func readNASCopyBatch(filename, expected string) (nasCopyHeader, []api.NASR2Copy
 	if err != nil {
 		return h, nil, err
 	}
-	if h.Version != 1 || h.PolicySHA256 != policy || len(h.SourceSHA256) != 64 || h.Items <= 0 || h.Items > 5000 || h.Bytes <= 0 || h.Bytes > api.NASR2CopyDailyBytes {
+	if h.Version != 1 || h.PolicySHA256 != policy || len(h.SourceSHA256) != 64 || h.Items <= 0 || h.Items > 5000 || h.Bytes <= 0 || h.Bytes > nasCopyBatchBytes {
 		return h, nil, errors.New("invalid manifest totals or policy")
 	}
 	items := []api.NASR2CopyItem{}
@@ -300,12 +303,7 @@ func runNASR2Copy(ctx context.Context, cfg config.Config, args []string) {
 	}
 	defer pool.Close()
 	if args[0] == "status" {
-		fmt.Printf("enabled_by=NAS_R2_COPY_ENABLED floor_bytes=%d daily_bytes=%d download_bytes_per_sec=%d\n", api.NASR2CopyFloor, api.NASR2CopyDailyBytes, api.NASR2CopyRate)
-		var today int64
-		if err = pool.QueryRow(ctx, `SELECT coalesce((SELECT charged_bytes FROM nas_r2_copy_budgets WHERE connection_id=13 AND day=(now() AT TIME ZONE 'UTC')::date),0)`).Scan(&today); err != nil {
-			log.Fatal(err)
-		}
-		fmt.Printf("charged_today_bytes=%d remaining_today_bytes=%d\n", today, api.NASR2CopyDailyBytes-today)
+		fmt.Printf("enabled_by=NAS_R2_COPY_ENABLED floor_bytes=%d daily_limit=none rate_limit=none workers=%d range_bytes=%d\n", api.NASR2CopyFloor, api.NASR2CopyWorkers, api.NASR2CopyRangeBytes)
 		rows, err := pool.Query(ctx, `SELECT kind,state,count(*),coalesce(sum((item->>'size_bytes')::bigint),0) FROM nas_r2_copy_items WHERE connection_id=13 GROUP BY kind,state ORDER BY kind,state`)
 		if err != nil {
 			log.Fatal(err)

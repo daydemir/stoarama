@@ -22,8 +22,10 @@ class CleanupBulkTests(unittest.TestCase):
     api = fixtures.CleanupGroupTests.api
     fixture_pins = fixtures.CleanupGroupTests.fixture_pins
 
+    version = "cleanup-batch-v7"
+
     def run_group(self, tasks):
-        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_BULK_VERSION), \
+        with mock.patch.object(pull, 'CLIENT_VERSION', self.version), \
                 mock.patch.object(pull, 'restore_api', side_effect=self.api):
             pull.cleanup_process_group(self.cfg, self.inventory, threading.Event(), tasks)
 
@@ -111,7 +113,7 @@ class CleanupBulkTests(unittest.TestCase):
 
     def test_sigkill_at_each_durability_boundary_replays_without_permit_or_unlink(self):
         for cut in ('intent_ledger', 'intent', 'media', 'sidecar', 'directory', 'result_ledger', 'result'):
-            case = CleanupBulkTests('test_one_bulk_request_all_intents_before_unlink_all_syncs_before_success')
+            case = type(self)('test_one_bulk_request_all_intents_before_unlink_all_syncs_before_success')
             case.setUp()
             try:
                 tasks = case.group(3)
@@ -122,11 +124,12 @@ class CleanupBulkTests(unittest.TestCase):
                     from unittest import mock
                     import test_cleanup_bulk as fixtures
                     pull=fixtures.pull
-                    root,cut,encoded=sys.argv[1:]
+                    root,cut,encoded,version=sys.argv[1:]
                     case=fixtures.CleanupBulkTests('test_one_bulk_request_all_intents_before_unlink_all_syncs_before_success')
                     case.cfg=SimpleNamespace(output_dir=Path(root)/'clips',state_dir=Path(root)/'state',
                         inventory_file=Path(root)/'state'/'inventory.sqlite3',dry_run=False)
                     case.inventory,case.logs=pull.Inventory(case.cfg),[]
+                    case.version=version
                     ledger,journal,unlink,sync=pull.cleanup_ledger_append_many,pull.cleanup_journal_group,pull.os.unlink,pull.os.fsync
                     def halt():
                         print('ready',flush=True);sys.stdin.read();raise AssertionError('must SIGKILL')
@@ -151,7 +154,7 @@ class CleanupBulkTests(unittest.TestCase):
                         mock.patch.object(pull.os,'fsync',side_effect=fsync):
                         case.run_group(json.loads(encoded))
                 ''')
-                child = subprocess.Popen([sys.executable, '-c', script, str(case.root), cut, json.dumps(tasks)],
+                child = subprocess.Popen([sys.executable, '-c', script, str(case.root), cut, json.dumps(tasks), self.version],
                     cwd=str(Path(__file__).parent), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 try:
                     self.assertTrue(select.select([child.stdout], [], [], 20)[0], 'child never reached '+cut)
@@ -209,7 +212,7 @@ class CleanupBulkTests(unittest.TestCase):
 
     def test_partial_ledger_append_never_certifies_a_deleted_result(self):
         for event in ('intent','result'):
-            case=CleanupBulkTests('test_one_bulk_request_all_intents_before_unlink_all_syncs_before_success');case.setUp()
+            case=type(self)('test_one_bulk_request_all_intents_before_unlink_all_syncs_before_success');case.setUp()
             try:
                 tasks=case.group(3);append=pull.cleanup_ledger_append_many
                 def partial(cfg,records):
@@ -224,3 +227,7 @@ class CleanupBulkTests(unittest.TestCase):
                 self.assertEqual(case.phases(),['observe' if event=='intent' else 'intent']*3)
                 self.assertTrue(all(json.loads(r[2]).get('outcome')!='deleted' for r in pull.cleanup_journal(case.inventory)))
             finally:case.doCleanups()
+
+
+class R2CopyBulkTests(CleanupBulkTests):
+    version = "r2-copy-v2"

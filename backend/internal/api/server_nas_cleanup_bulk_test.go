@@ -7,14 +7,20 @@ import (
 )
 
 func TestNASCleanupBulkDurabilitySessionGates(t *testing.T) {
-	testNASCleanupReviewedReleaseGates(t, nasCleanupBulkDurabilityClientVersion)
+	for _, v := range []string{nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion} {
+		t.Run(v, func(t *testing.T) { testNASCleanupReviewedReleaseGates(t, v) })
+	}
 }
 
 func TestNASCleanupBulkDurabilityRequiresCompleteFreshLease(t *testing.T) {
+	for _, v := range []string{nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion} {
+		t.Run(v, func(t *testing.T) { testNASCleanupBulkDurabilityRequiresCompleteFreshLease(t, v) })
+	}
+}
+func testNASCleanupBulkDurabilityRequiresCompleteFreshLease(t *testing.T, version string) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("bulk-durability", syntheticFiles(100, 20, 20))
 	f.dryRun()
-	version := nasCleanupBulkDurabilityClientVersion
 	if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, version); err != nil {
 		t.Fatal(err)
 	}

@@ -1,10 +1,15 @@
-# R2 keep28 copy to NAS (build only)
+# R2 keep28 copy to NAS
 
 Owner decision: keep28 footage only in R2 → **“Copy to NAS, then delete”**.
-This change implements raw copy/verification only. No NAS client release or
-promotion, switch activation, queue import, production migration, or deletion
-is part of this implementation. Collated copies are explicitly blocked by the
-owner's follow-up; the existing retirement and cleanup selection code is unchanged.
+The raw copy/verification lane remains default OFF. The production controller
+alone deploys, stages/promotes clients, queues reviewed manifests and enables it
+between cleanup batches. No R2 deletion authority is added. Collated copies
+remain blocked by the owner's follow-up below.
+
+Owner throughput decision, 2026-11-14: **“no copy limit, so delete and transfer
+as fast as possible”**. `r2-copy-v2` removes the daily grant cap, fixed 2 MB/s
+pacing and nice19/idle-I/O priority. It carries v7 bulk cleanup durability (and
+must carry the execution-poll fix when released).
 
 ## Reconciled size and evidence
 
@@ -50,24 +55,61 @@ time; `--apply` idempotently queues the reviewed batch. Every transaction has
 10s statement timeout, 2s lock timeout, 16 MB work memory and one CLI connection.
 All work remains bound to account 47 / connection 13 and the keep28 policy.
 
-`NAS_R2_COPY_ENABLED=false` is the server default. When enabled, the existing
-always-running NAS client leases one file, nice19 / idle I/O, one thread and
-256 KiB working chunks. It refuses low host/cgroup memory or critical load,
-uses the existing storage reservations, requires the mounted output and a
-**2 TB free-space floor**, and yields to cleanup's local execution fence.
-The server refuses enabled cleanup plans/batches, maintenance and live cleanup
-leases/delete permits. The worker runs only in natural gaps between batches;
-no cleanup suspension is required or authorized.
+`NAS_R2_COPY_ENABLED=false` is the server default. Four independent workers
+lease at most four files per connection. Lease admission retains the serialized
+count; active operations lock only their own item. Each range is <=16 MiB,
+ETag/version/Range-bound, signed for 10s, and consumed by one non-retrying,
+non-redirecting GET with a 10s total deadline. Nonces and the per-item dispatch
+gate prevent simultaneous grants and stale completions. A retry obtains a new
+grant. R2 URLs remain reusable until expiry; trusted-client single use is not a
+defense against deliberate hostile replay. Historical daily ledger rows are
+preserved but are neither read nor updated by grant admission.
 
-Each exact GET range is <=8 MiB, ETag/version/Range-bound and signed for 10s.
-Before every GET the server durably charges its full range to the connection's
-**100 GB UTC-day** ledger. Abandoned grants, failed GETs and retries retain their
-charge. Grants in the last 30s of a UTC day charge both dates, covering their
-10s URL lifetime plus the client's bounded transfer deadline. A GET is consumed
-once, with no retry or redirect; capabilities are never persisted. A crash or
-retry obtains and charges a new grant. This bound depends on the trusted client
-obeying single-use dispatch: R2 presigned GETs themselves are reusable until
-expiry. It is not a defense against deliberate capability replay by a hostile NAS.
+Mounted-root, host/cgroup memory and load checks, the **2 TB runtime free floor**
+and shared storage reservations remain. Four bounded HTTP buffers require extra
+memory headroom. 256 KiB disk chunks remain cancellable. A reservation includes
+its range plus an aggregate concurrency guard; other downloads share the same
+reservation counter. There is no fixed byte rate or idle/nice throttle.
+
+### Concurrent cleanup proof and local fences
+
+`Keep28Policy` exports cleanup's exact embedded policy and SHA. Copy validation
+requires `start < keep_end && end > keep_start`, with valid nonempty bounds.
+`nasCleanupPolicy.outside` requires its negation; ordinary cleanup rechecks the
+file AND every source interval at admission, observation and permission. Unknown
+bounds/streams remain KEEP. Boundary tests execute both predicates. Raw copy
+rejects `joined/`, so collated deletion has a disjoint namespace. Stitched-source
+retirement is a separate inside-window exception: its source holds/reservations
+still veto copy and its permissions require stitching switches ON. Stitching
+remains OFF. Copy does not alter those gates.
+
+Source-ID holds and retirement reservations are rechecked on every operation.
+An indexed `recording_clips(display_path)` probe rejects any second raw catalog
+identity at the destination, including equal-content aliases. Equal bytes at a
+different path do not authorize unlinking the copy's path. Independently, cleanup
+requires exact frozen media identity, physical sidecar source/time binding and
+its own pinned-window guard immediately before unlink; a new catalog alias cannot
+make kept sidecar bytes into an outside-window file. No cleanup check is weakened.
+Global enabled-plan/batch/live-lease/delete-permit vetoes are therefore removed;
+the global maintenance veto remains.
+
+Copy and ordinary raw delivery share per-path ownership across media, sidecar
+and inventory publication. Cleanup never waits for that ownership. Every copy
+namespace mutation (including ancestor mkdir, private creation and publication)
+checks cleanup's directory registry under its short lock. Cleanup registers before
+its first namespace snapshot and retains registration through unlink/durability.
+Copy refuses namespace mutations in a registered directory; existing partial
+writes and hashes can run alongside it. No fsync, network request or hashing runs
+under the registry lock. A crash/interruption after publication is recovered by
+removing only an exact same-inode private link; conflicts are preserved.
+
+Cleanup proofs and the complete bulk permit/durability interval have cooperative
+priority over copy disk work. Copy may finish a started chunk or fsync, then waits
+at its next disk checkpoint while continuing cancellation, resource and remote
+checks. Bounded download transports can continue; no cleanup worker waits for a
+copy network request or whole-file hash. The pool supervisor drains every worker
+before update or inventory close. Verify live cleanup permit timings and rate
+with the combined client before claiming production throughput.
 
 The NAS writes a no-follow resumable private partial, checks each range's
 Content-Range/ETag, verifies whole-file SHA/size, fsyncs and hardlinks the final
@@ -81,79 +123,91 @@ freshness for any later retirement must be re-established within that tool's
 
 Control HTTP has a 2s total deadline; each range GET has a 10s total deadline.
 A small isolated Python stdlib transport process makes DNS, TLS, trickling
-headers/body and reads killable. Its pipe output is bounded to 8 MiB plus a
+headers/body and reads killable. Its pipe output is bounded to 16 MiB plus a
 4 KiB metadata header, it has no media paths or inherited credential environment,
-and it is always killed/reaped before releasing the writer fence. The parent
-checks cancellation while polling I/O, hashing and pacing writes; a range GET
+and it is always killed/reaped before releasing path ownership. The parent
+checks cancellation while polling I/O, hashing and writing; a range GET
 may also have one bounded control request in flight for its checkpoint.
 Transient lease tokens and URLs are scoped to active operations, never accumulated
-in the shared diagnostic secret registry. Policy, OFF and cleanup state are checkpointed at most
+in the shared diagnostic secret registry. Policy, OFF and maintenance state are checkpointed at most
 4s apart during work. The worker drains before self-update or inventory close.
 Only its private temporary links are removed after successful no-overwrite
 commit; existing source media, final files and conflicts are never deleted.
 
-## Rate and space
+## Rate and capacity (2026-11-14 inputs)
 
-Defaults: 2 MB/s network writes and 2 MB/s verification reads; 100 GB/day of
-charged grants. The ideal download+rehash ceiling is 86.4 GB/day, before API,
-per-file and retry overhead. Plan for approximately **70–85 GB/day of new
-bytes during continuously available copy time**, then measure on NAS. Existing
-files need only hashing. Cleanup gaps and resource holds reduce calendar rate.
-No rate has been measured on the NAS by this build-only task.
+Before activation, measured copied bytes/day is **zero** (switch OFF). The old
+single-worker ideal ceiling was 86.4 GB/day for download plus rehash, with a
+100 GB/day grant cap. The uncapped rate must be measured on the NAS; do not use
+link speed as an achieved rate. Each successful file logs numeric source ID,
+size, newly downloaded bytes and elapsed milliseconds, separately from
+verification-only work. Queue verified totals and timestamped cleanup receipts
+supply the simultaneous custody/deletion measurement. Partial download/retries
+are not verified custody.
 
-Given 1.77 TB free of 92.14 TB and a 2 TB floor, let C be cleanup GB/day,
-assuming no other disk growth and no copy consumption while accumulating space:
+Use decimal TB. With F=1.77 TB currently free, D=6.99 TB cleanup remaining,
+C=6.465899440735 TB conservative raw copy-or-verify ceiling, and R=2 TB floor:
 
-| Threshold | Additional free GB | At 109 GB/day | At 200 GB/day |
-|---|---:|---:|---:|
-| First bounded copy range (includes two 8 MiB guards) | 230.017 | 2.11 days | 1.15 days |
-| Earlier 4.031314 TB no-presence raw cohort fits in full | 4,261.314 | 39.09 days | 21.31 days |
-| Conservative 6.465899 TB raw ceiling fits in full | 6,695.899 | 61.43 days | 33.48 days |
-| All 9.993298 TB incl. future collated support fits in full | 10,223.298 | 93.79 days | 51.12 days |
+- After all cleanup and worst-case raw copy: F+D-C = **2.294100559265 TB** free,
+  about **294.1 GB above the runtime floor** before filesystem overhead, sidecars,
+  other writers/growth and measurement uncertainty. This is an arithmetic fit,
+  not proof of allocated physical bytes. The 2.434586 TB identity-unproven cohort
+  may verify existing files without consuming new media space; known-absent raw
+  is 4.031314 TB, which would leave 4.728686 TB free if that were the true deficit.
+- The controller's **2.23 TB one-time enable threshold** is an operator buffer,
+  distinct from the runtime floor. From 1.77 TB it needs **460 GB** cleanup first.
+  The worst-case final free is only 64.1 GB above that threshold, but no continuing
+  2.23 TB floor is added. The runtime floor currently blocks start; it is retained.
+- To guarantee no space pauses for the whole raw ceiling, cleanup first needs
+  C+R-F = **6.695899440735 TB**, plus allocation/sidecar/concurrency overhead.
+  Of 6.99 TB this leaves only about 294.1 GB margin. To start earlier, keep
+  cumulative deletion D(t) ahead of physical new-copy bytes C(t) by at least
+  **230 GB plus reservations/overhead**, since F+D(t)-C(t) must stay above 2 TB.
+  If copy outruns cleanup, it MUST pause at the floor. No scheduling order can
+  guarantee continuous full-speed copy from the early threshold without knowing
+  both rates. Prefer verification-only work and cleanup first, then absent raw.
+- Blocked collated adds 3.527398460691 TB. If all raw+collated needed new space,
+  even all stated cleanup would leave **-1.233297901426 TB** free: **3.2333 TB**
+  short of the 2 TB floor. It does not fit under that assumption, and remains
+  blocked regardless of capacity.
+- The newly discussed ~20 TB blocked R2 classes are NOT additional queue
+  authority. Await fresh per-class NAS custody/needs-copy totals, deduplicated
+  against raw copy sources. After worst-case raw, only ~294 GB new media fits
+  above the floor before overhead. Extra physical deficit X needs at least
+  max(0, X-0.294100559265 TB) further space. Footage already on NAS can verify
+  without another media copy. Keep-all exclusions and the owner's stitching
+  condition remain with the retirement delegate; no copy scope expands here.
 
-Time is additional-free-GB / C. Copying is resumable and can start at the first
-threshold; it need not wait for the whole cohort to fit. With cleanup and copy
-alternating, free-space gain is cleanup bytes minus actual copied bytes.
-The supplied 109 GB/day is plan 1409's measured active rate before v6/byte
-ordering; 200 GB/day is an unmeasured target. Actual last-24h cleanup was only
-20–45 GB/day because it was stopped part of the time. 12.47 TB remains eligible
-for cleanup: 114.40 active days at 109 or 62.35 at 200 GB/day, not a verified
-“coming weeks” completion forecast. These are estimates, not a reason to lower
-the floor or interrupt cleanup.
+## Controller release procedure
 
-## Parent release procedure (do not execute during implementation)
-
-1. Merge this reviewed PR on top of merged #486. Deploy backend migrations and
-   API through the normal server flow with `NAS_R2_COPY_ENABLED` absent/false.
-   Confirm all API instances serve the new endpoints with the switch OFF.
-2. Wait for a natural cleanup batch drain: no enabled plan/batch, live cleanup
-   lease/delete permit, replay backlog, or unresolved quarantine. Do not pause
-   an issued enabled plan to manufacture a release window.
-3. From the clean reviewed merged checkout, use the existing operator-local R2
-   credential environment (never DSM env, no auth movement):
-   `NAS_VERSION=r2-copy-v1 backend/scripts/release-nas-pull.sh`.
-   Then `backend/scripts/promote-nas-pull.sh --version r2-copy-v1 --expected-live-version <observed-live-version>`.
-   These commands stage/promote through the existing server-controlled updater.
-   Confirm heartbeat/logs show `r2-copy-v1`, healthy inventory, and the v6 cleanup
-   capability path. This implementation does not run either command.
-4. Recreate/validate a current copy-or-verify classification if catalog/policy
-   changed. Do not generate a production R2-retire plan with unbounded legacy
-   scans. The saved v9 input is evidence, not current apply authority. Plan:
-   `stoaramactl nas-r2-copy plan --input <copy.jsonl.gz> --sha256 <exact-file-sha> --out <new-dir>`.
-   Review `summary.json`, the raw batches and the blocked collated manifest.
-5. Validate one raw batch without `--apply`, then queue that reviewed batch:
-   `stoaramactl nas-r2-copy queue --input <raw-NNNN.jsonl> --sha256 <batch-sha> --apply`.
-   Queueing does not enable work. Start with one bounded batch, inspect
-   `stoaramactl nas-r2-copy status`, and verify NAS has >2 TB plus range guards.
-6. In the chosen gap, edit only server key `NAS_R2_COPY_ENABLED=true` through
-   the existing single-key server settings/deploy flow. Observe first copies,
-   stable inventory/sidecars, quota charges, free space and cleanup yielding.
-   Return the key to false before the next cleanup batch if desired; cleanup
-   activation independently stops copy admission and checkpoints active work.
-   No NAS environment variable or shell command is needed.
-7. A separate reviewed retirement step must reverify fresh exact NAS custody
-   and all existing holds/policy/identity gates before deleting anything in R2.
-   Collated work remains blocked until the follow-up below lands.
+1. Merge the reviewed exact head on current main with `[skip render]`; retain
+   v7 group durability and the controller's execution-poll fix. All exact bulk
+   predicates and polling predicates must accept `r2-copy-v2`, without prefix
+   matching. No new copy migration is required.
+2. Controller only: deploy backend at a natural batch boundary (master OFF,
+   no enabled plan/batch/live lease/permit/replay/quarantine). A deploy during
+   enabled cleanup trips the runner's live-commit safety stop. Keep copy OFF.
+3. From clean merged source, stage with
+   `NAS_VERSION=r2-copy-v2 backend/scripts/release-nas-pull.sh`, then promote with
+   `backend/scripts/promote-nas-pull.sh --version r2-copy-v2 --expected-live-version <observed>`.
+   Use operator-local credentials in place; never move them to the NAS or another
+   computer. Verify the complete published artifact against reviewed source.
+4. Confirm heartbeat/client `r2-copy-v2`, healthy inventory and v7 bulk + execution
+   polling behavior. Revalidate fresh current classification/policy/catalog before
+   queueing; stale v9 totals are evidence, never sufficient apply authority.
+   Validate a raw batch read-only, then queue with its exact SHA and `--apply`.
+   Collated and unknown objects remain unqueued.
+5. Once observed actual free exceeds the operator's 2.23 TB threshold, controller
+   enables only `NAS_R2_COPY_ENABLED=true` between batches. Run alongside cleanup;
+   preserve stitching OFF. Capture timestamped copy logs (downloaded bytes vs
+   verified files), queue states, free space and cleanup confirmed-byte/file totals.
+   Compare cleanup permit timings/deletion rate with baseline; resolve contention
+   before calling throughput proven. Do not lower the 2 TB floor.
+6. Calculate copied GB/day from new bytes over elapsed wall time, verified files
+   separately, then project remaining raw completion from measured physical
+   download and verification rates plus space/cleanup availability. A separate
+   reviewed retirement flow must reprove fresh custody before any R2 deletion.
+   This copy change has no R2 deletion capability.
 
 ## Collated follow-up after #483
 

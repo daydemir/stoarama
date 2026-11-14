@@ -22,6 +22,17 @@ func nasCleanupSupportsV6(version string) bool {
 // V7 retains v6 admission/session/lease gates, with bounded bulk observations.
 const nasCleanupBulkDurabilityClientVersion = "cleanup-batch-v7"
 
+const nasCleanupR2CopyClientVersion = "r2-copy-v2"
+
+func nasCleanupSupportsBulk(version string) bool {
+	switch version {
+	case nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion:
+		return true
+	default:
+		return false
+	}
+}
+
 func nasCleanupSupportsGroupedExecution(version string) bool {
-	return nasCleanupSupportsV6(version) || version == nasCleanupBulkDurabilityClientVersion
+	return nasCleanupSupportsV6(version) || nasCleanupSupportsBulk(version)
 }
