@@ -907,6 +907,8 @@ class Inventory:
                         self.db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, definition))
             self.db.commit()
 
+            cleanup_initialize(self)
+
     def close(self):
         with self.lock:
             self.db.close()
@@ -2290,7 +2292,6 @@ def cleanup_json_bytes(payload):
 
 def cleanup_journal(inventory, item_id=None, phase=None, body=None, owner=None, *, commit=True):
     with inventory.lock:
-        inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_receipts(item_id INTEGER PRIMARY KEY,phase TEXT NOT NULL,body TEXT NOT NULL)")
         try:
             if item_id is not None:
                 claim = inventory.cleanup_claims.get(item_id)
@@ -2298,7 +2299,6 @@ def cleanup_journal(inventory, item_id=None, phase=None, body=None, owner=None, 
                     if claim is None or claim[0] is not owner:
                         raise RuntimeError("cleanup journal is reserved")
                     current = inventory.db.execute("SELECT phase,body FROM cleanup_receipts WHERE item_id=?", (item_id,)).fetchone()
-                    cleanup_quarantine_tables(inventory)
                     quarantined = inventory.db.execute("SELECT 1 FROM cleanup_quarantine WHERE item_id=?", (item_id,)).fetchone()
                     if current != claim[1] or quarantined:
                         raise RuntimeError("cleanup journal changed; deferred without modifying evidence")
@@ -2333,14 +2333,18 @@ def cleanup_journal(inventory, item_id=None, phase=None, body=None, owner=None, 
         except Exception:
             inventory.db.rollback()
             raise
-        return inventory.db.execute("SELECT item_id,phase,body FROM cleanup_receipts ORDER BY item_id").fetchall()
+        if item_id is None:
+            return inventory.db.execute("SELECT item_id,phase,body FROM cleanup_receipts ORDER BY item_id").fetchall()
+
+
+def cleanup_journal_contains(inventory, item_id):
+    with inventory.lock:
+        return inventory.db.execute("SELECT 1 FROM cleanup_receipts WHERE item_id=?", (item_id,)).fetchone() is not None
 
 
 def cleanup_blocked_items(inventory):
     # Release holds this same lock across the quarantine -> journal transaction.
     with inventory.lock:
-        cleanup_journal(inventory)
-        cleanup_quarantine_tables(inventory)
         rows = inventory.db.execute("SELECT item_id FROM cleanup_receipts UNION SELECT item_id FROM cleanup_quarantine").fetchall()
         inventory.db.commit()
         return {row[0] for row in rows} | set(inventory.cleanup_claims)
@@ -2558,16 +2562,14 @@ class CleanupFile:
         # The final listing, checks and unlinks are one step for this folder:
         # no other worker of this process can list or unlink in between.
         with lock:
+            if self.before_unlink is not None:
+                self.before_unlink()
+            # The durable attempt marker can block. Enumerate and validate
+            # afterwards, immediately before either syscall. An enumeration
+            # before the marker would have to be repeated here.
             check_namespace()
             self.check_paths()
             self.check_active()
-            if self.before_unlink is not None:
-                self.before_unlink()
-                # The durable attempt marker can block. Revalidate the live
-                # pathname and deadlines afterwards, before either syscall.
-                check_namespace()
-                self.check_paths()
-                self.check_active()
             if self.item.get("permit_reason"):
                 # Stitched retirement: read the live switches at the unlink itself.
                 switch = stitch_switch_refusal(self.cfg, True)
@@ -17000,21 +17002,47 @@ def cleanup_guard_refusal(task, proof, cfg=None):
         return "keep-window check failed: %s" % str(exc)[:200]
 
 
+def cleanup_cap_totals(inventory):
+    """Exact rolling totals; caller holds lock and an IMMEDIATE transaction.
+
+    Only rows crossing the cutoff are visited. Retain all history so a wall
+    clock rollback reintroduces exactly the rows the original predicate did.
+    Ledger triggers keep reservations/releases atomic with the cached totals.
+    """
+    cutoff, files, total = inventory.db.execute(
+        "SELECT cutoff,files,bytes FROM cleanup_cap_totals WHERE id=1").fetchone()
+    next_cutoff = time.time() - 86400
+    if next_cutoff != cutoff:
+        crossed_files, crossed_bytes = inventory.db.execute(
+            "SELECT count(*),coalesce(sum(size_bytes),0) FROM cleanup_local_deletions WHERE at_epoch>? AND at_epoch<=?",
+            (min(cutoff, next_cutoff), max(cutoff, next_cutoff))).fetchone()
+        if crossed_files:
+            direction = -1 if next_cutoff > cutoff else 1
+            files += direction * crossed_files
+            total += direction * crossed_bytes
+            inventory.db.execute("UPDATE cleanup_cap_totals SET cutoff=?,files=?,bytes=? WHERE id=1",
+                                 (next_cutoff, files, total))
+    return files, total
+
+
 def cleanup_local_caps(inventory, size_bytes, reserve=None):
     """Refuse beyond the hard local rolling-24h caps; optionally reserve one deletion."""
     if type(size_bytes) is not int or size_bytes <= 0:
         return "invalid deletion size"
     with inventory.lock:
-        # A wall clock that moves backwards only keeps rows in the window longer.
-        files, total = inventory.db.execute("SELECT count(*),coalesce(sum(size_bytes),0) FROM cleanup_local_deletions WHERE at_epoch>?",
-                                            (time.time() - 86400,)).fetchone()
-        if files + 1 > CLEANUP_MAX_FILES_24H or total + size_bytes > CLEANUP_MAX_BYTES_24H:
+        try:
+            inventory.db.execute("BEGIN IMMEDIATE")
+            files, total = cleanup_cap_totals(inventory)
+            if files + 1 > CLEANUP_MAX_FILES_24H or total + size_bytes > CLEANUP_MAX_BYTES_24H:
+                inventory.db.commit()
+                return "local 24h deletion cap reached (%d files, %d bytes)" % (files, total)
+            if reserve is not None:
+                inventory.db.execute("INSERT INTO cleanup_local_deletions(item_id,plan_sha256,relative_path,size_bytes,at_epoch) VALUES(?,?,?,?,?)",
+                                     (reserve["item_id"], reserve["plan_sha256"], reserve["relative_path"], size_bytes, time.time()))
             inventory.db.commit()
-            return "local 24h deletion cap reached (%d files, %d bytes)" % (files, total)
-        if reserve is not None:
-            inventory.db.execute("INSERT INTO cleanup_local_deletions(item_id,plan_sha256,relative_path,size_bytes,at_epoch) VALUES(?,?,?,?,?)",
-                                 (reserve["item_id"], reserve["plan_sha256"], reserve["relative_path"], size_bytes, time.time()))
-        inventory.db.commit()
+        except BaseException:
+            inventory.db.rollback()
+            raise
     return None
 
 
@@ -17059,6 +17087,65 @@ def cleanup_send_result(cfg, item_id, receipt):
 CLEANUP_REPLAY_WORKERS = 16
 
 
+class CleanupStage(str, Enum):
+    OWNERSHIP = "ownership"
+    LANE = "lane"
+    FENCE = "fence"
+    PROOF = "proof"
+    GUARD = "guard"
+    OBSERVE_JOURNAL = "observe_journal"
+    CAPS = "caps"
+    PERMIT = "permit"
+    LEDGER_INTENT = "ledger_intent"
+    PERMIT_CHECK = "permit_check"
+    INTENT_JOURNAL = "intent_journal"
+    UNLINK = "unlink"
+    LEDGER_RESULT = "ledger_result"
+    RESULT_JOURNAL = "result_journal"
+    RECEIPT = "receipt"
+    CLEAR_JOURNAL = "clear_journal"
+
+
+class CleanupAbortReason(str, Enum):
+    DEADLINE = "deadline_exceeded"
+    PERMIT_EXPIRED = "permit_expired"
+    PROOF_MISMATCH = "proof_mismatch"
+    DISABLED = "execution_disabled"
+    LOCAL_GUARD = "local_guard"
+    PRE_UNLINK = "pre_unlink_failure"
+    INTERRUPTED = "interrupted"
+    DRAIN_TIMEOUT = "drain_timeout"
+    RESPONSE = "invalid_response"
+    HTTP = "http_error"
+    TRANSPORT = "transport_error"
+    IO = "io_error"
+    SQLITE = "sqlite_error"
+    UNEXPECTED = "unexpected_error"
+
+
+def cleanup_abort_reason(exc):
+    if isinstance(exc, CleanupPermitRefused):
+        try:
+            return CleanupAbortReason(exc.reason)
+        except ValueError:
+            return CleanupAbortReason.UNEXPECTED
+    if isinstance(exc, CleanupDrainTimeout):
+        return CleanupAbortReason.DRAIN_TIMEOUT
+    if isinstance(exc, CleanupInterrupted):
+        return CleanupAbortReason.INTERRUPTED
+    if isinstance(exc, CleanupResponseError):
+        return CleanupAbortReason.RESPONSE
+    if isinstance(exc, urllib.error.HTTPError):
+        return CleanupAbortReason.HTTP
+    if isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError)):
+        return CleanupAbortReason.TRANSPORT
+    if isinstance(exc, sqlite3.Error):
+        return CleanupAbortReason.SQLITE
+    if isinstance(exc, OSError):
+        return CleanupAbortReason.IO
+    return CleanupAbortReason.UNEXPECTED
+
+
 class CleanupStatus:
     """Small, thread-safe cleanup status for the heartbeat ("cleanup" field)
     and for client_last_error when cleanup is what is failing."""
@@ -17086,6 +17173,19 @@ class CleanupStatus:
     def clear_error(self):
         with self.lock:
             self.error, self.error_at = "", None
+
+    def execution_failure(self, stage, exc, items, *, aborted):
+        # Fixed labels only: heartbeat must not expose exception text, paths,
+        # response bodies or credentials. A handled item refusal is distinct
+        # from an aborted group and does not change continuation semantics.
+        prefix = "abort" if aborted else "item_failure"
+        with self.lock:
+            counter = "aborted_groups" if aborted else "item_failures"
+            self.values[counter] = self.values.get(counter, 0) + 1
+            self.values.update({"last_" + prefix + "_stage": stage.value,
+                                "last_" + prefix + "_reason": cleanup_abort_reason(exc).value,
+                                "last_" + prefix + "_at": utc_now_precise(),
+                                "last_" + prefix + "_files": items})
 
     def snapshot(self):
         with self.lock:
@@ -17115,6 +17215,37 @@ def cleanup_quarantine_tables(inventory):
         inventory.db.execute("ALTER TABLE cleanup_replay_failures ADD COLUMN first_at REAL")
     inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_control(key TEXT PRIMARY KEY,value INTEGER NOT NULL)")
     inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_quarantine(item_id INTEGER NOT NULL,phase TEXT NOT NULL,body TEXT NOT NULL,error TEXT NOT NULL,failures INTEGER NOT NULL,quarantined_at TEXT NOT NULL)")
+    inventory.db.execute("CREATE INDEX IF NOT EXISTS cleanup_quarantine_item ON cleanup_quarantine(item_id)")
+
+
+def cleanup_initialize(inventory):
+    """Migrate once per startup; schema, initial totals and triggers are atomic."""
+    with inventory.lock:
+        try:
+            inventory.db.execute("BEGIN IMMEDIATE")
+            inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_receipts(item_id INTEGER PRIMARY KEY,phase TEXT NOT NULL,body TEXT NOT NULL)")
+            cleanup_quarantine_tables(inventory)
+            inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_rejected_receipts(item_id INTEGER,phase TEXT,body TEXT,rejected_at TEXT)")
+            inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_execution_outcomes(id INTEGER PRIMARY KEY,item_id INTEGER NOT NULL,attempt INTEGER NOT NULL,at TEXT NOT NULL,body TEXT NOT NULL)")
+            inventory.db.execute("CREATE INDEX IF NOT EXISTS cleanup_local_deletions_window ON cleanup_local_deletions(at_epoch,size_bytes)")
+            inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_cap_totals(id INTEGER PRIMARY KEY CHECK(id=1),cutoff REAL NOT NULL,files INTEGER NOT NULL CHECK(files>=0),bytes INTEGER NOT NULL CHECK(bytes>=0))")
+            if inventory.db.execute("SELECT 1 FROM cleanup_cap_totals WHERE id=1").fetchone() is None:
+                cutoff = time.time() - 86400
+                inventory.db.execute("INSERT INTO cleanup_cap_totals SELECT 1,?,count(*),coalesce(sum(size_bytes),0) FROM cleanup_local_deletions WHERE at_epoch>?", (cutoff, cutoff))
+            inventory.db.execute("""CREATE TRIGGER IF NOT EXISTS cleanup_cap_insert AFTER INSERT ON cleanup_local_deletions BEGIN
+                UPDATE cleanup_cap_totals SET files=files+(NEW.at_epoch>cutoff),
+                bytes=bytes+CASE WHEN NEW.at_epoch>cutoff THEN NEW.size_bytes ELSE 0 END WHERE id=1; END""")
+            inventory.db.execute("""CREATE TRIGGER IF NOT EXISTS cleanup_cap_delete AFTER DELETE ON cleanup_local_deletions BEGIN
+                UPDATE cleanup_cap_totals SET files=files-(OLD.at_epoch>cutoff),
+                bytes=bytes-CASE WHEN OLD.at_epoch>cutoff THEN OLD.size_bytes ELSE 0 END WHERE id=1; END""")
+            inventory.db.execute("""CREATE TRIGGER IF NOT EXISTS cleanup_cap_update AFTER UPDATE ON cleanup_local_deletions BEGIN
+                UPDATE cleanup_cap_totals SET files=files-(OLD.at_epoch>cutoff)+(NEW.at_epoch>cutoff),
+                bytes=bytes-CASE WHEN OLD.at_epoch>cutoff THEN OLD.size_bytes ELSE 0 END
+                           +CASE WHEN NEW.at_epoch>cutoff THEN NEW.size_bytes ELSE 0 END WHERE id=1; END""")
+            inventory.db.commit()
+        except BaseException:
+            inventory.db.rollback()
+            raise
 
 
 def cleanup_replay_failed(inventory, item_id, phase, encoded, exc):
@@ -17129,7 +17260,6 @@ def cleanup_replay_failed(inventory, item_id, phase, encoded, exc):
     message = redact_diagnostics("%s: %s" % (type(exc).__name__, exc))[:500]
     now = time.time()
     with inventory.lock:
-        cleanup_quarantine_tables(inventory)
         inventory.db.execute("INSERT INTO cleanup_replay_failures(item_id,failures,last_error,last_at,first_at) VALUES(?,1,?,?,?) ON CONFLICT(item_id) DO UPDATE SET failures=CASE WHEN first_at IS NULL THEN 1 ELSE failures+1 END,last_error=excluded.last_error,last_at=excluded.last_at,first_at=coalesce(first_at,excluded.first_at)",
                              (item_id, message, utc_now_precise(), now))
         failures, first_at = inventory.db.execute("SELECT failures,first_at FROM cleanup_replay_failures WHERE item_id=?", (item_id,)).fetchone()
@@ -17158,8 +17288,6 @@ def cleanup_release_quarantine(inventory, generation):
     if type(generation) is not int or generation < 1:
         return
     with inventory.lock:
-        cleanup_journal(inventory)
-        cleanup_quarantine_tables(inventory)
         current = inventory.db.execute("SELECT value FROM cleanup_control WHERE key='release_generation'").fetchone()
         if current and current[0] >= generation:
             return
@@ -17181,7 +17309,6 @@ def cleanup_release_quarantine(inventory, generation):
 
 def cleanup_quarantine_status(inventory):
     with inventory.lock:
-        cleanup_quarantine_tables(inventory)
         count = inventory.db.execute("SELECT count(DISTINCT item_id) FROM cleanup_quarantine").fetchone()[0]
         ids = [r[0] for r in inventory.db.execute("SELECT DISTINCT item_id FROM cleanup_quarantine ORDER BY item_id LIMIT 100")]
         ack = inventory.db.execute("SELECT value FROM cleanup_control WHERE key='release_generation'").fetchone()
@@ -17192,7 +17319,6 @@ def cleanup_quarantine_status(inventory):
 
 def cleanup_quarantined_items(inventory):
     with inventory.lock:
-        cleanup_quarantine_tables(inventory)
         inventory.db.commit()
         return {row[0] for row in inventory.db.execute("SELECT DISTINCT item_id FROM cleanup_quarantine")}
 
@@ -17245,7 +17371,6 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
             # Preserve rejected evidence, then unblock unrelated leases. A stale
             # observation/result must never be interpreted as a fresh permit.
             with inventory.lock:
-                inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_rejected_receipts(item_id INTEGER,phase TEXT,body TEXT,rejected_at TEXT)")
                 inventory.db.execute("INSERT INTO cleanup_rejected_receipts VALUES(?,?,?,?)", (item_id, phase, cleanup_json_bytes(body).decode(), utc_now_precise()))
                 cleanup_journal(inventory, item_id, owner=owner)
             log("WARN", "cleanup item=%d stale %s receipt archived; no destructive retry" % (item_id, phase))
@@ -17255,7 +17380,6 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
         # Own the exact snapshot until its replay finishes. A delayed replay
         # must never advance/archive/remove another worker's checkpoint.
         with inventory.lock:
-            cleanup_quarantine_tables(inventory)
             current = inventory.db.execute("SELECT phase,body FROM cleanup_receipts WHERE item_id=?", (item_id,)).fetchone()
             quarantined = inventory.db.execute("SELECT 1 FROM cleanup_quarantine WHERE item_id=?", (item_id,)).fetchone()
             if item_id in inventory.cleanup_claims or current != (phase, encoded) or quarantined:
@@ -17277,7 +17401,7 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
         response = replay(item_id, "observe" if phase == "observe" else "result", body, owner)
         if response is None:
             # Only the explicit 409 archive path may resolve without a body.
-            if any(row[0] == item_id for row in cleanup_journal(inventory)):
+            if cleanup_journal_contains(inventory, item_id):
                 raise CleanupResponseError("missing cleanup replay response")
             return
         cleanup_validate_ack(item_id, phase, body, response)
@@ -17291,7 +17415,7 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
             # though this replay owns it now (#448). Never certify its refusal.
             cleanup_journal(inventory, item_id, "result", body, owner=owner)
             result = replay(item_id, "result", body, owner)
-            if result is None and any(row[0] == item_id for row in cleanup_journal(inventory)):
+            if result is None and cleanup_journal_contains(inventory, item_id):
                 raise CleanupResponseError("missing cleanup result acknowledgement")
             if result is not None:
                 cleanup_validate_ack(item_id, "result", body, result)
@@ -17309,7 +17433,6 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
         try:
             one(item_id, phase, encoded)
             with inventory.lock:
-                cleanup_quarantine_tables(inventory)
                 inventory.db.execute("DELETE FROM cleanup_replay_failures WHERE item_id=?", (item_id,))
                 inventory.db.commit()
             with counts_lock:
@@ -17408,7 +17531,6 @@ def cleanup_execution_outcomes(inventory, outcomes):
     # Diagnostics only. Authoritative per-file results are already durable.
     with inventory.lock:
         try:
-            inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_execution_outcomes(id INTEGER PRIMARY KEY,item_id INTEGER NOT NULL,attempt INTEGER NOT NULL,at TEXT NOT NULL,body TEXT NOT NULL)")
             inventory.db.executemany("INSERT INTO cleanup_execution_outcomes(item_id,attempt,at,body) VALUES(?,?,?,?)",
                 [(item_id, attempt, utc_now_precise(), cleanup_json_bytes(outcome).decode())
                  for item_id, attempt, outcome in outcomes])
@@ -17494,7 +17616,7 @@ def cleanup_process_task(cfg, inventory, stop_event, task, api=None, lane=None):
     except CleanupInterrupted as exc:
         # An observe checkpoint precedes every permit request. Never return a
         # task with uncertain authority; those checkpoints reconcile normally.
-        if not any(row[0] == task["item_id"] for row in cleanup_journal(inventory)):
+        if not cleanup_journal_contains(inventory, task["item_id"]):
             cleanup_return_unused(cfg, inventory, task, owner, exc)
         raise
     finally:
@@ -17628,7 +17750,7 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner, timings,
         if isinstance(exc, CleanupResponseError) and "acknowledgement differs:" in str(exc):
             execution_outcome["refusal_reason"] = "proof_mismatch"
         # Never overwrite a durable intent/result with a speculative retry.
-        if any(row[0] == item_id for row in cleanup_journal(inventory)):
+        if cleanup_journal_contains(inventory, item_id):
             raise
         if isinstance(exc, CleanupInterrupted):
             raise
@@ -17767,7 +17889,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
 # protocol 2 reject it with HTTP 400 and the client keeps using protocol 1.
 CLEANUP_V2_LEASE = 64          # tasks per lease request (server maximum)
 CLEANUP_V2_WORKERS = 16        # concurrent dry-run file workers
-CLEANUP_GROUP_VERSION = "cleanup-batch-v5"
+CLEANUP_GROUP_VERSION = "cleanup-batch-v6"
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
 CLEANUP_V2_INFLIGHT = 64       # leased tasks held locally (running + queued)
@@ -17986,9 +18108,13 @@ class CleanupBatchAPI:
 def cleanup_local_headroom(inventory):
     """Files and bytes still allowed by the local rolling-24h caps."""
     with inventory.lock:
-        files, total = inventory.db.execute("SELECT count(*),coalesce(sum(size_bytes),0) FROM cleanup_local_deletions WHERE at_epoch>?",
-                                            (time.time() - 86400,)).fetchone()
-        inventory.db.commit()
+        try:
+            inventory.db.execute("BEGIN IMMEDIATE")
+            files, total = cleanup_cap_totals(inventory)
+            inventory.db.commit()
+        except BaseException:
+            inventory.db.rollback()
+            raise
     return CLEANUP_MAX_FILES_24H - files, CLEANUP_MAX_BYTES_24H - total
 
 
@@ -18175,9 +18301,7 @@ def cleanup_reserve_group_caps(inventory, tasks):
     with inventory.lock:
         try:
             inventory.db.execute("BEGIN IMMEDIATE")
-            files, total = inventory.db.execute(
-                "SELECT count(*),coalesce(sum(size_bytes),0) FROM cleanup_local_deletions WHERE at_epoch>?",
-                (time.time() - 86400,)).fetchone()
+            files, total = cleanup_cap_totals(inventory)
             sizes = [task["item"]["size_bytes"] for task in tasks]
             if (any(type(size) is not int or size <= 0 for size in sizes)
                     or files + len(tasks) > CLEANUP_MAX_FILES_24H or total + sum(sizes) > CLEANUP_MAX_BYTES_24H):
@@ -18252,7 +18376,11 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
     """
     import contextlib
     release_owned = owned is None
-    owned = cleanup_own_group(inventory, tasks) if release_owned else owned
+    try:
+        owned = cleanup_own_group(inventory, tasks) if release_owned else owned
+    except BaseException as exc:
+        CLEANUP_STATUS.execution_failure(CleanupStage.OWNERSHIP, exc, len(tasks), aborted=True)
+        raise
     started = time.monotonic()
     opened, observations, receipts, timings = [], [], [], []
     reservations = []
@@ -18276,6 +18404,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
 
     fenced = False
     error = None
+    stage = CleanupStage.LANE
     with inventory.cleanup_execution_lock:
         try:
             progress("lane_start")
@@ -18284,6 +18413,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
                     cleanup_timed(shared, "lane_ms", lane.run, lambda: None, deadline=deadline)
                 finally:
                     progress("lane_end")
+            stage = CleanupStage.FENCE
             cleanup_timed(shared, "fence_ms", NAS_MEDIA_FENCE.acquire_cleanup,
                           stop_event, min(deadline, time.monotonic() + CLEANUP_EXECUTION_DRAIN_SEC))
             fenced = True
@@ -18292,6 +18422,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
                 # All proofs precede authority. Keep sibling unlink references
                 # alive; delete_exact still rechecks each live pathname/identity.
                 for task in tasks:
+                    stage = CleanupStage.PROOF
                     timing = {"lease_ms": task.get("_lease_elapsed_ms", 0)}
                     progress("proof_start", task, timing)
                     timings.append(timing)
@@ -18305,6 +18436,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
                     opened[-1] = (current, proof)
                     if {k:v for k,v in proof.items() if k != "parent_members_sha256"} != {k:v for k,v in task["approved_proof"].items() if k != "parent_members_sha256"}:
                         raise CleanupResponseError("cleanup dry-run proof changed; KEEP")
+                    stage = CleanupStage.GUARD
                     refusal = cleanup_timed(timing, "guard_ms", cleanup_guard_refusal, task, proof, cfg)
                     if refusal:
                         raise CleanupPermitRefused("local_guard", refusal)
@@ -18317,10 +18449,13 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
                     if deadline - time.monotonic() <= CLEANUP_EXECUTION_OBSERVE_SEC:
                         raise CleanupInterrupted("cleanup lease has insufficient time for proof group")
                 progress("proofs_ready")
+                stage = CleanupStage.OBSERVE_JOURNAL
                 cleanup_timed(shared, "observe_journal_ms", cleanup_journal_group, inventory,
                     [(t, o, "observe", b) for (t, o), b in zip(owned, observations)])
+                stage = CleanupStage.CAPS
                 reservations = cleanup_timed(shared, "caps_ms", cleanup_reserve_group_caps, inventory, tasks)
                 for (task, owner), body, (current, proof), timing in zip(owned, observations, opened, timings):
+                    stage = CleanupStage.PERMIT
                     current.check_active()
                     if current.deadline - time.monotonic() <= CLEANUP_EXECUTION_OBSERVE_SEC:
                         raise CleanupInterrupted("cleanup lease has insufficient time for another permit")
@@ -18349,24 +18484,35 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
                         "sidecar_relative_path": item["relative_path"] + ".stoarama.json" if item["sidecar_required"] else None,
                         "size_bytes": item["size_bytes"], "sha256": proof["sha256"], "kind": item["kind"],
                         "stream_id": item["stream_id"], "client_version": CLIENT_VERSION}
+                    stage = CleanupStage.LEDGER_INTENT
                     cleanup_timed(timing, "ledger_intent_ms", cleanup_ledger_append_many, cfg, [dict(ledger, event="intent", at=utc_now_precise())])
                     # The durable observation covers crashes before this sole
                     # intent commit. A true marker precedes the syscall, never a
                     # false claim in an intent. Crash replay stays uncertain.
-                    current.before_unlink = lambda: cleanup_timed(timing, "intent_journal_ms", cleanup_journal_group,
-                        inventory, [(task, owner, "intent", dict(receipt, unlink_attempted=True))])
+                    def mark_attempt():
+                        nonlocal stage
+                        stage = CleanupStage.INTENT_JOURNAL
+                        cleanup_timed(timing, "intent_journal_ms", cleanup_journal_group,
+                            inventory, [(task, owner, "intent", dict(receipt, unlink_attempted=True))])
+                        stage = CleanupStage.UNLINK
+                    current.before_unlink = mark_attempt
                     unlink_error = None
                     try:
+                        stage = CleanupStage.PERMIT_CHECK
                         expiry = cleanup_check_permit(cfg, fenced, task, proof, decision, permit_started)
                         current.permit_started, current.permit_expiry = permit_started, expiry
                         current.permit_max_age_sec = CLEANUP_EXECUTION_OBSERVE_BUDGET_SEC
                         current.deadline = min(current.deadline, permit_started + CLEANUP_PERMIT_MAX_AGE_SEC)
+                        stage = CleanupStage.GUARD
                         refusal = cleanup_timed(timing, "guard_ms", cleanup_guard_refusal, task, proof, cfg)
                         if refusal:
                             raise CleanupPermitRefused("local_guard", refusal)
+                        stage = CleanupStage.UNLINK
                         cleanup_timed(timing, "delete_ms", current.delete_exact, proof)
                         receipt["outcome"] = "deleted"
                     except Exception as exc:
+                        CLEANUP_STATUS.execution_failure(stage, exc, 1, aborted=False)
+                        unlink_failure_stage = stage
                         unlink_error = exc
                         receipt["error"] = str(exc)[:500]
                         if not current.unlink_attempted:
@@ -18377,23 +18523,29 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
                     receipt["unlink_attempted"] = current.unlink_attempted
                     # A failed ledger result must leave the durable intent;
                     # no refusal or deletion is certified without durability.
+                    stage = CleanupStage.LEDGER_RESULT
                     cleanup_timed(timing, "ledger_result_ms", cleanup_ledger_append_many, cfg,
                         [dict(ledger, event="result", at=utc_now_precise(), outcome=receipt["outcome"],
                               media_unlinked=current.media_unlinked, sidecar_unlinked=current.sidecar_unlinked, error=receipt["error"])])
                     receipt.update(execution_elapsed_ms=round((time.monotonic() - started) * 1000),
                                    stage_timings=dict(timing, **shared))
+                    stage = CleanupStage.RESULT_JOURNAL
                     cleanup_timed(timing, "result_journal_ms", cleanup_journal_group, inventory, [(task, owner, "result", receipt)])
                     if unlink_error is not None and current.unlink_attempted:
                         # Stop issuing authority after an uncertain syscall.
                         # Replay submits this exact durable result first.
+                        stage = unlink_failure_stage
                         raise unlink_error
+                stage = CleanupStage.RECEIPT
                 result = cleanup_timed(shared, "receipt_ms", cleanup_api_retry, cfg, "/account/connections/cleanup/result-batch",
                     {"client_version": CLIENT_VERSION, "receipts": [dict(b, item_id=t["item_id"]) for t, b in zip(tasks, receipts)]})
                 acknowledgments = cleanup_group_response(result, tasks)
                 for task, receipt in zip(tasks, receipts):
                     cleanup_validate_ack(task["item_id"], "result", receipt, acknowledgments[task["item_id"]])
+                stage = CleanupStage.CLEAR_JOURNAL
                 cleanup_timed(shared, "clear_journal_ms", cleanup_journal_group, inventory, [(t, o, None, None) for t, o in owned])
         except BaseException as exc:
+            CLEANUP_STATUS.execution_failure(stage, exc, len(tasks), aborted=True)
             error = str(exc)[:500]
             progress("aborted")
             # Only the initial unused-lease checkpoints may be returned.

@@ -2059,10 +2059,14 @@ class CleanupProtocol2Tests(unittest.TestCase):
 
     def test_upgrade_does_not_count_legacy_transient_failures(self):
         self.journal_observe(900)
+        self.inventory.db.execute("DROP TABLE cleanup_replay_failures")
         self.inventory.db.execute("CREATE TABLE cleanup_replay_failures(item_id INTEGER PRIMARY KEY,failures INTEGER NOT NULL,last_error TEXT NOT NULL,last_at TEXT NOT NULL)")
         self.inventory.db.execute("INSERT INTO cleanup_replay_failures VALUES(900,100,'network','old')")
         self.inventory.db.commit()
+        self.inventory.close()
+        self.inventory = pull.Inventory(self.cfg)
         entry = pull.cleanup_journal(self.inventory)[0]
+        self.addCleanup(self.inventory.close)
         exc = pull.CleanupResponseError('invalid response')
         for n in range(4):
             with mock.patch.object(pull.time, 'time', return_value=10000 + 3600*n):
