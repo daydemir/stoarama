@@ -240,3 +240,60 @@ The delivery migrations are `0189_delivery_keep_holds.sql` and
 `0188_nas_cleanup_leased_index.sql`. Migration identities use full filenames.
 The upgrade regression applies main first, then both delivery migrations, checks
 the exact seed and R2 veto, and replays migration discovery without duplication.
+
+## R2 writer readiness reconciliation
+
+`stoaramactl r2-retire reconcile-writers --out NEW_FILE.jsonl --bucket stoarama`
+creates a read-only, repeatable-read observation of every category in
+`r2_retirement_writers_drained`. It writes a private, fsynced JSONL record for
+**each blocking item**, including its lifecycle, owner/heartbeat/lease facts
+where recorded, and the SHA256 of those allowlisted observations. Zero-count
+categories appear in the header. Existing evidence files cannot be overwritten.
+The command has a 15-second SQL statement limit and does not read media tables,
+provider credentials, signed URLs or claim tokens into the report.
+
+This is the diagnostic stage of reconciliation. It deliberately has no `--apply`
+option: every item remains unproven and `apply_command` is null. To reconcile a
+writer, first establish its exact owner and obtain fresh primary evidence that
+its process is stopped and cannot resume, that no recent writes/heartbeats or
+live leases remain, and that the owning stream/machine is stopped. A suspended
+provider, old timestamp, expired lease or active fence alone does not prove all
+of this. Preserve provider/machine evidence alongside the report. Re-run the
+observation before proposing any mutation; its digest is an observation digest,
+not a full-row compare-and-swap token or apply authority.
+
+The existing joined lifecycle guards do not support abandoning pending hours,
+expired ordinary leases, or sealed artifacts. A parent batch state change does
+not drain these children. Keep such work blocking until a separately reviewed,
+atomic audited cancellation protocol exists; never create temporary claims,
+renew leases, disable triggers, or modify the drain function to evade it. NAS
+stitch tasks also require owner process evidence even when their leases expired.
+The writer admission fence and its immutable seven-day drain deadline remain
+independent requirements.
+
+Migration `0194_r2_delivery_presence_indexes.sql` completes the delivery index
+prerequisite. Since migrations are transactional, inventories larger than
+128 MiB require **two separate** concurrent builds before deploying it:
+
+```sql
+SET lock_timeout = '5s';
+SET statement_timeout = '30min';
+CREATE INDEX CONCURRENTLY nas_inventory_r2_owner_path
+  ON nas_inventory_files(relative_path) WHERE state<>'missing';
+CREATE INDEX CONCURRENTLY nas_inventory_r2_owner_content
+  ON nas_inventory_files(sha256,size_bytes) WHERE state<>'missing';
+SELECT r2_retirement_delivery_indexes_ready();
+```
+
+Run these outside a transaction, one build at a time; do not wrap the script in
+one extended-protocol execution or `psql --single-transaction`. Concurrent
+builds still scan the inventory and consume I/O and storage. Check production
+relation sizes, active transactions and existing index definitions first. Verify
+NAS cleanup is between plans, master OFF, and no deployment is in flight;
+coordinate the whole window with the cleanup operator. A failed concurrent
+build can leave an invalid index: inspect and review it explicitly rather than
+automatically dropping or accepting it. The migration validates the exact
+existing indexes through the unchanged readiness function and fails closed on
+incompatible definitions. On small fresh databases it creates them in the
+migration transaction. Build readiness does not authorize any writer rewrite,
+fence override or R2 deletion.
