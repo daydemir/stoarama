@@ -3,6 +3,7 @@ import tempfile
 import json
 from pathlib import Path
 import urllib.error
+import io
 from unittest.mock import patch
 
 import prepare_keep28_plans as k
@@ -27,7 +28,7 @@ class Keep28PlanTests(unittest.TestCase):
             self.assertEqual([p.name for p in Path(out).iterdir()], ['summary.json'])
 
     def test_atomic_admission_never_splits_an_uncertain_proposal(self):
-        with patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', 409, 'conflict', {}, None)) as call:
+        with patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', 409, 'conflict', {}, io.BytesIO(b'rejected'))) as call:
             with self.assertRaisesRegex(RuntimeError, 'atomic admission rejected'):
                 k.submit('https://example.invalid', 'lookahead', [row(3, 'raw', 1), row(3, 'raw', 2)], [], [], atomic=True)
             self.assertEqual(call.call_count, 1)
@@ -35,7 +36,7 @@ class Keep28PlanTests(unittest.TestCase):
         with patch('traceback.print_exc'):
             with patch.object(k, 'main', side_effect=k.ReadFailed('timeout')):
                 self.assertEqual(k.entrypoint(), k.EXIT_READ_FAILED)
-            with patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', 409, 'conflict', {}, None)), \
+            with patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', 409, 'conflict', {}, io.BytesIO(b'rejected'))), \
                  patch.object(k, 'main', side_effect=lambda: k.submit('https://example.invalid', 'x', [row(3, 'raw', 1)], [], [], atomic=True)):
                 with self.assertRaisesRegex(RuntimeError, 'atomic admission rejected'):
                     k.entrypoint()
@@ -43,6 +44,33 @@ class Keep28PlanTests(unittest.TestCase):
                  patch.object(k, 'main', side_effect=lambda: k.submit('https://example.invalid', 'x', [row(3, 'raw', 1)], [], [], atomic=True)):
                 with self.assertRaisesRegex(RuntimeError, 'admission not confirmed'):
                     k.entrypoint()
+
+    def test_only_atomic_post_409_emits_durable_single_stream_rejection(self):
+        for code in (409, 502):
+            with tempfile.TemporaryDirectory() as out, \
+                 patch('sys.argv', ['prepare', '--stream', '3', '--max-plans', '1', '--atomic-admission', '--submit', '--out', out]), \
+                 patch.object(k, 'candidates', return_value=[row(3, 'raw', 1)]), \
+                 patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', code, 'conflict', {}, io.BytesIO(b'{"error":"protected identity"}'))) as post:
+                if code == 409:
+                    self.assertEqual(k.entrypoint(), k.EXIT_ADMISSION_REJECTED)
+                    evidence = json.loads((Path(out) / 'admission-rejected.json').read_text())
+                    self.assertEqual((evidence['http_status'], evidence['stream_id']), (409, 3))
+                    self.assertIn('protected identity', evidence['reason'])
+                    self.assertFalse((Path(out) / 'summary.json').exists())
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'admission not confirmed'):
+                        k.entrypoint()
+                    self.assertFalse((Path(out) / 'admission-rejected.json').exists())
+                self.assertEqual(post.call_count, 1)
+
+    def test_detail_get_conflict_does_not_mean_admission_was_rejected(self):
+        with tempfile.TemporaryDirectory() as out, \
+             patch('sys.argv', ['prepare', '--stream', '3', '--atomic-admission', '--submit', '--out', out]), \
+             patch.object(k, 'candidates', return_value=[row(3, 'raw', 1)]), \
+             patch.object(k, 'service', side_effect=[{'id': 1}, urllib.error.HTTPError('/plans/1', 409, 'conflict', {}, None)]):
+            with self.assertRaises(urllib.error.HTTPError):
+                k.entrypoint()
+            self.assertFalse((Path(out) / 'admission-rejected.json').exists())
 
     def test_only_transient_sqlstates_are_read_failures(self):
         transient = ['ERROR:  57014: canceling statement due to statement timeout',

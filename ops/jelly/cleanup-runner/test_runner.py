@@ -452,6 +452,104 @@ class LoopTests(unittest.TestCase):
                 self.assertEqual(r.Runner.pick(job), 1406)
             self.assertEqual(list(job.status['deferred_streams']), ['4'])
 
+    def test_atomic_409_excludes_stream_persistently_and_admits_other_stream(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = self.isolation_job(root, [3, 4])
+            good = self.preparer_exits({'4': 'k28auto-x-s4-raw-0001'})
+            calls = []
+            def prepare(args, **kwargs):
+                sid = args[args.index('--stream') + 1]
+                calls.append(sid)
+                if sid == '4':
+                    return good(args, **kwargs)
+                out = Path(args[args.index('--out') + 1]); out.mkdir(parents=True)
+                label = args[args.index('--label-prefix') + 1] + '-s3-raw-0001'
+                (out / 'admission-rejected.json').write_text(json.dumps(dict(http_status=409, stream_id=3,
+                    label=label, reason='protected identity', rejected_at_epoch=1)))
+                raise r.CommandFailed(5)
+            with patch.object(r, 'command', side_effect=prepare):
+                self.assertEqual(r.Runner.pick(job, lookahead=True), 1406)
+            self.assertEqual(calls, ['3', '4'])
+            self.assertEqual(job.status['excluded_streams']['3']['reason'], 'protected identity')
+            self.assertFalse(job.stream_ready(3))
+            restored = r.Runner(job.repo, Path(root))
+            restored.initialize()
+            try:
+                self.assertFalse(restored.stream_ready(3))
+                restored.windows = job.windows
+                restored.query = lambda sql, *a: 0 if 'count(*)' in sql else []
+                restored.stream_order = lambda: [3]
+                restored.confirm_empty = lambda: self.fail('excluded supply claimed complete')
+                self.assertIsNone(restored.pick())
+                self.assertEqual(restored.status['phase'], 'excluded_streams_remaining')
+            finally:
+                restored.lock.close()
+
+    def test_excluded_unenabled_current_or_successor_never_enables_but_issued_stops(self):
+        for saved in ('current_plan', 'next_plan'):
+            with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
+                job = FakeRunner(root)
+                job.status.update(excluded_streams={'3': dict(http_status=409, stream_id=3,
+                    reason='protected', label='rejected')}, **{saved: 42})
+                job.picks = [None]
+                job.run()
+                self.assertNotIn('ON', job.events)
+                self.assertEqual(job.status['parked_unenabled_plan'], 42)
+                self.assertEqual(job.status['phase'], 'excluded_streams_remaining')
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            job.status['excluded_streams'] = {'3': {}}
+            job.p['results'][0]['delete_ever_issued'] = True
+            with self.assertRaisesRegex(r.Halt, 'issued deletions'):
+                job.excluded_plan(job.p)
+            self.assertNotIn('parked_unenabled_plan', job.status)
+
+    def test_lookahead_exclusion_prevents_current_enable_and_unrelated_pending_still_stops(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
+            job = FakeRunner(root)
+            def pick(lookahead=False):
+                if lookahead:
+                    job.status['excluded_streams'] = {'3': {}}
+                    return None
+                return None if job.status.get('excluded_streams') else 42
+            job.pick = pick
+            job.run()
+            self.assertNotIn('ON', job.events)
+        with tempfile.TemporaryDirectory() as root:
+            job = self.isolation_job(root, [])
+            job.status['excluded_streams'] = {'3': {}}
+            job.query = lambda sql: 1 if 'count(*)' in sql else []
+            with self.assertRaisesRegex(r.Halt, 'reserved or uncertain'):
+                r.Runner.pick(job)
+
+    def test_excluded_plan_waits_for_complete_dry_run_before_parking(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
+            job = FakeRunner(root)
+            job.status.update(current_plan=42, excluded_streams={'3': {}})
+            job.p['results'][0]['state'] = 'leased'
+            job.picks = [None]
+            observed = []
+            def finish_dry(pid):
+                self.assertNotIn('parked_unenabled_plan', job.status)
+                observed.append(pid)
+                job.p['results'][0]['state'] = 'would_delete'
+                return job.p
+            job.await_dry = finish_dry
+            job.run()
+            self.assertEqual(observed, [42])
+            self.assertNotIn('ON', job.events)
+            self.assertEqual(job.status['parked_unenabled_plan'], 42)
+
+    def test_rejection_without_evidence_or_outside_admission_still_stops(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = self.isolation_job(root, [3])
+            with patch.object(r, 'command', side_effect=r.CommandFailed(5)):
+                with self.assertRaises(FileNotFoundError):
+                    r.Runner.pick(job)
+                with self.assertRaisesRegex(r.Halt, 'outside atomic admission'):
+                    job.prepare_stream(3, ['--summary-only', '--out', root])
+            self.assertNotIn('excluded_streams', job.status)
+
     def test_ambiguous_submission_timeout_or_unknown_failure_still_stops(self):
         for code in (None, 1, 3):
             with tempfile.TemporaryDirectory() as root:

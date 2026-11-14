@@ -301,7 +301,7 @@ PREPARE_TIMEOUT_SEC = 1800  # keep28 preparation on large streams exceeds six mi
 STREAM_SUMMARY_TTL_SEC = 7 * 24 * 3600  # Ranking hints only; refreshes run with master OFF.
 PREPARER = 'backend/scripts/nas-cleanup/prepare_keep28_plans.py'
 # A stream whose read-only preparation failed is retried after this delay while
-# other streams continue. Admission rejection remains a failed check and stops.
+# other streams continue. Confirmed atomic admission 409s exclude that stream.
 STREAM_RETRY_SEC = 3600
 MAX_STREAM_DEFERRALS = 6  # The sixth consecutive failure of one stream goes to the owner.
 COMMAND_FAILURE_LOG = Path.home() / 'stoarama-cleanup-runner' / 'command-failures.log'
@@ -375,6 +375,12 @@ class Runner:
                     and (status.get('next_plan') is None or type(status['next_plan']) is int
                          and status['next_plan'] > 0 and status['next_plan'] != status['current_plan'])
                     and (status['last_error'] is None or isinstance(status['last_error'], str))
+                    and isinstance(status.get('excluded_streams', {}), dict)
+                    and all(re.fullmatch('[1-9][0-9]*', k) and isinstance(v, dict)
+                            and v.get('http_status') == 409 and v.get('stream_id') == int(k)
+                            and isinstance(v.get('reason'), str) and len(v['reason']) <= 2048
+                            and isinstance(v.get('label'), str)
+                            for k, v in status.get('excluded_streams', {}).items())
                     and isinstance(status.get('deferred_streams', {}), dict)
                     and all(re.fullmatch('[1-9][0-9]*', k) and isinstance(v, dict) and set(v) == {'retry_after', 'failures'}
                             and type(v['retry_after']) in (int, float) and math.isfinite(v['retry_after'])
@@ -427,13 +433,29 @@ class Runner:
     def prepare_stream(self, sid, args):
         """Run the preparer for one stream. False means a read failed before any
         submission, so nothing was admitted and the stream is deferred. Every
-        other failure, including admission rejection or a runner-side timeout,
-        stops the runner."""
+        other failure stops, except a confirmed single atomic admission 409
+        which permanently excludes this stream with its private evidence."""
         try:
             command([sys.executable, str(self.repo / PREPARER), '--stream', str(sid),
                      '--scope-cache', str(self.root / 'reviewed-scope-cache'), *args],
                     env=os.environ.copy(), timeout=PREPARE_TIMEOUT_SEC)
         except CommandFailed as exc:
+            if exc.returncode == self.preparer().EXIT_ADMISSION_REJECTED:
+                require('--submit' in args and '--atomic-admission' in args,
+                        'rejection outside atomic admission')
+                out = Path(args[args.index('--out') + 1])
+                evidence = json.loads((out / 'admission-rejected.json').read_text())
+                prefix = args[args.index('--label-prefix') + 1] + '-s' + str(sid) + '-'
+                require(evidence['http_status'] == 409 and evidence['stream_id'] == sid
+                        and isinstance(evidence['label'], str) and evidence['label'].startswith(prefix)
+                        and isinstance(evidence['reason'], str) and len(evidence['reason']) <= 2048,
+                        'invalid atomic admission rejection evidence')
+                excluded = dict(self.status.get('excluded_streams') or {})
+                excluded[str(sid)] = evidence
+                deferred = {k: v for k, v in (self.status.get('deferred_streams') or {}).items() if k != str(sid)}
+                self.save(self.status.get('phase', 'dry_run'), excluded_streams=excluded, deferred_streams=deferred)
+                self.step_failed('stream excluded after atomic admission rejection', reason='stream ' + str(sid))
+                return False
             if exc.returncode == self.preparer().EXIT_READ_FAILED:
                 self.step_failed('stream preparation deferred', reason='stream ' + str(sid))
                 deferred = dict(self.status.get('deferred_streams') or {})
@@ -450,6 +472,8 @@ class Runner:
         return True
 
     def stream_ready(self, sid):
+        if str(sid) in (self.status.get('excluded_streams') or {}):
+            return False
         entry = (self.status.get('deferred_streams') or {}).get(str(sid))
         return entry is None or entry['retry_after'] <= time.time()
 
@@ -884,15 +908,19 @@ class Runner:
         return sorted(scores, key=lambda sid: (-scores[sid], sid))
 
     def pick(self, lookahead=False):
+        excluded = ','.join(str(int(k)) for k in self.status.get('excluded_streams', {}))
         ids = self.query("""SELECT coalesce(json_agg(id ORDER BY id),'[]') FROM nas_cleanup_plans p
           WHERE account_id=47 AND connection_id=13 AND mode='dry_run'
           AND id<>""" + str(self.status['current_plan'] or 0) + """
           AND report_sha256='""" + POLICY_SHA + """' AND label NOT LIKE '%-nasonly-%' AND EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=p.id)
           AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=p.id
-            AND (state<>'would_delete' OR delete_ever_issued OR updated_at<=now()-interval '20 hours'))""")
+            AND (state<>'would_delete' OR delete_ever_issued OR updated_at<=now()-interval '20 hours'))""" +
+          (" AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(p.manifest) e WHERE (e->>'stream_id')::bigint IN (" + excluded + "))" if excluded else ''))
         if ids:
             return ids[0]
         for sid in self.stream_order():
+            if not self.stream_ready(sid):
+                continue
             if self.stopped():
                 return None
             # A new prefix per admission avoids immutable-label reuse, even on one day.
@@ -918,12 +946,27 @@ class Runner:
         if lookahead or self.stopped() or self.status.get('deferred_streams'):
             return None  # Current/reserved/deferred work is expected; never claim completion here.
         # The preparer excludes reserved files. Never call that a completed cleanup.
+        excluded = ','.join(str(int(k)) for k in self.status.get('excluded_streams', {}))
         pending = self.query("""SELECT count(*) FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id
           WHERE p.account_id=47 AND p.connection_id=13 AND i.state<>'deleted'
-          AND (p.mode<>'retired' OR i.delete_ever_issued)""")
+          AND (p.mode<>'retired' OR i.delete_ever_issued)""" +
+          (" AND NOT (p.mode='dry_run' AND NOT i.delete_ever_issued AND i.state='would_delete' AND i.recovery IN (" + ','.join("'" + value + "'" for value in sorted(RECOVERY)) + ") AND (coalesce(i.item,p.manifest->(i.ordinal-1))->>'stream_id')::bigint IN (" + excluded + "))" if excluded else ''))
         require(pending == 0, 'no eligible work but reserved or uncertain files remain')
+        if self.status.get('excluded_streams'):
+            self.save('excluded_streams_remaining')
+            return None  # Preserve unrelated pending/uncertain-work stops above.
         self.confirm_empty()
         return None
+
+    def excluded_plan(self, plan):
+        excluded = self.status.get('excluded_streams') or {}
+        if not any(str(item['stream_id']) in excluded for item in plan['items']):
+            return False
+        require(dry_state(plan), 'excluded plan dry run is incomplete')  # Never abandon live observations.
+        require(not self.status.get('started_plan_sha256'), 'excluded plan has execution ownership')
+        # Park read-only reservations; never clear an execution/recovery owner.
+        self.save('dry_run', current_plan=None, parked_unenabled_plan=plan['id'])
+        return True
 
     def confirm_empty(self):
         # Inventory/acks can outlive a deletion receipt. Only confirmed deleted
@@ -1078,6 +1121,8 @@ class Runner:
         self.load_policy()
         require({int(k) for k in self.status.get('deferred_streams', {})} <= set(self.windows),
                 'deferred stream outside pinned policy; owner review required')
+        require({int(k) for k in self.status.get('excluded_streams', {})} <= set(self.windows),
+                'excluded stream outside pinned policy; owner review required')
         self.check_delivery()
         if active['plans']:
             self.monitor(pid)
@@ -1095,13 +1140,15 @@ class Runner:
                 self.wait_for_deferred_streams()
                 continue
             if pid is None:
-                self.save('stopped' if self.stopped() else 'complete', current_plan=None)
+                self.save('stopped' if self.stopped() else 'excluded_streams_remaining' if self.status.get('excluded_streams') else 'complete', current_plan=None)
                 return
             self.save('dry_run', current_plan=pid, next_plan=None if pid == self.status.get('next_plan') else self.status.get('next_plan'))
             p = self.await_dry(pid)
             if p is None:
                 break
             size = verify(p, self.catalog(p), self.windows, utcnow())
+            if self.excluded_plan(p):
+                continue
             if not budget_permits(self.recent_bytes(), size):
                 self.save('waiting_for_budget')
                 self.progress()
@@ -1121,6 +1168,8 @@ class Runner:
                 self.save('dry_run', lookahead_pending=True)
                 successor = self.pick(lookahead=True)
                 self.save('dry_run', next_plan=successor, lookahead_pending=False)
+            if self.excluded_plan(p):
+                continue
             self.idle()
             self.master(True)
             if self.stopped():

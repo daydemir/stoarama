@@ -54,8 +54,11 @@ The runner:
   ON still rejects concurrent deploys. Repeats OFF after completion or pause.
 - Uses a complete fresh dry run or invokes `prepare_keep28_plans.py --submit`
   for one stream, at most one <=100 GB plan. Unique `k28auto-YYYYMMDD-HHMMSS`
-  prefixes avoid immutable-label reuse. Admission rejection is a failed check
-  and stops. A slow read cannot idle the other streams: the preparer exits 4
+  prefixes avoid immutable-label reuse. A confirmed HTTP 409 from a single atomic admission excludes that
+  stream persistently, recording its label and bounded server reason in private
+  state (Deniz approval, 2026-11-14). Other streams continue. Missing evidence,
+  ambiguous admission, and every other failed check still stop. Excluded supply
+  is never reported as completed cleanup. A slow read cannot idle the other streams: the preparer exits 4
   only when a read-only catalogue read hit a transient SQLSTATE (timeout,
   connection, serialization) or a reviewed-scope object was unreachable, before
   any submission (nothing admitted). Exit 4 defers that stream for an hour
