@@ -170,7 +170,9 @@ For fixes, create STOP and wait until `phase=stopped`, no enabled plans/batches,
 and master OFF before changing runner/server code or booting out the job. After
 a failed check, review `last_error` and recovery/shutdown flags with Deniz; resolve
 the cause, clear `last_error` in status, then remove STOP and restart. Never clear
-the persisted `current_plan` to bypass recovery. No automatic retry clears a latch.
+the persisted `current_plan` to bypass recovery. A confirmed OFF clears the
+warning raised by retries in that OFF call. Prior latches and recovery errors
+remain sticky and require owner review.
 
 An isolated release worktree avoids updating Jelly's working checkout. After
 the same STOP/drain/OFF barrier, fetch the reviewed main commit and create a

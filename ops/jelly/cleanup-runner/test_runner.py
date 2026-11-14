@@ -1153,10 +1153,22 @@ class RenderOffTests(unittest.TestCase):
                 self.assertEqual(remaining, [])
                 self.assertEqual([c.args[0] for c in sleep.call_args_list], [delay for delay in r.SHORT_READ_RETRY_DELAYS if delay is not None] + [15])
                 self.assertEqual(job.events, ['notify'])
+                self.assertFalse(job.status['shutdown_or_recovery_failed'])
                 self.assertEqual(self.created, ['off-0'])
                 self.assertEqual([c[1] for c in self.calls if c[0] == 'POST' and c[1].endswith('/cancel')], ['/deploys/on/cancel'])
                 self.assertEqual(sum(c[0] == 'PUT' for c in self.calls), 2)
                 self.assertEqual(job.status['phase'], 'master_false')
+
+    def test_confirmed_off_preserves_prior_latches_and_recovery_errors(self):
+        for latched, recovery_error in ((True, None), (True, 'recovery failed'), (False, 'recovery failed')):
+            with self.subTest(latched=latched, recovery_error=recovery_error), tempfile.TemporaryDirectory() as root:
+                job = FakeRunner(root)
+                job.status.update(shutdown_or_recovery_failed=latched, recovery_error=recovery_error)
+                self.make_render(job, ['put'])
+                with patch.object(r.time, 'sleep'), patch.object(r.sys, 'stderr', new=io.StringIO()):
+                    r.Runner.master(job, False)
+                self.assertTrue(job.status['shutdown_or_recovery_failed'])
+                self.assertEqual(job.status['recovery_error'], recovery_error)
 
     def test_persistent_off_status_failure_keeps_alerting_and_never_cancels_own_deploy(self):
         class EndTest(BaseException): pass
@@ -1176,6 +1188,7 @@ class RenderOffTests(unittest.TestCase):
             self.assertEqual(self.created, ['off-0'])
             self.assertEqual(self.deploys['off-0']['status'], 'created')
             self.assertNotEqual(job.status.get('phase'), 'master_false')
+            self.assertTrue(job.status['shutdown_or_recovery_failed'])
             self.assertEqual([c[1] for c in self.calls if c[0] == 'POST' and c[1].endswith('/cancel')], ['/deploys/on/cancel'])
             rows = [json.loads(line) for line in (Path(root) / 'runner.jsonl').read_text().splitlines()]
             self.assertEqual(len(rows), 2 * (len(r.SHORT_READ_RETRY_DELAYS) + 1))
