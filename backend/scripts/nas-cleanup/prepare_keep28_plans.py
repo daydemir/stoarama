@@ -56,9 +56,12 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from reviewed_scope import ReadFailed, admissible_candidates
 
 POLICY_SHA = '060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811'
 POLICY_PATH = pathlib.Path(__file__).resolve().parents[2] / 'internal/api/nas_cleanup_keep28_policy.json'
@@ -66,6 +69,9 @@ LABEL = re.compile(r'^[a-z0-9][a-z0-9._-]{0,79}$')
 MAX_PLAN_ITEMS = 10000
 MAX_PLAN_BYTES = 100_000_000_000  # backend nasCleanupMaxPlanBytes
 MAX_BATCH_PLANS = 500
+# A read failed before any submission: nothing was admitted and the runner may
+# retry this stream later. Every other failure stops the runner.
+EXIT_READ_FAILED = 4
 
 
 def batch_digest(policy_sha, plans):
@@ -118,23 +124,40 @@ def pg_env():
     return env
 
 
+def transient_sql_failure(stderr):
+    """Fixed reason when psql stderr (VERBOSITY sqlstate or verbose) shows a
+    retryable read failure; None for any other failure, which must stop."""
+    codes = set(re.findall(r'(?:ERROR|FATAL|PANIC):\s+([0-9A-Z]{5})\b', stderr))
+    connection = {c for c in codes if c.startswith('08') or c in {'53300', '57P01', '57P02', '57P03', '40001', '40P01', '55P03'}}
+    if codes - connection - {'57014'} or 'PANIC' in stderr:
+        return None  # Any other reported condition, or any PANIC, must stop.
+    if codes == {'57014'}:
+        return 'statement timeout'
+    if codes or any(x in stderr for x in ('connection to server', 'server closed the connection', 'SSL SYSCALL')):
+        return 'database connection or transaction unavailable'
+    return None
+
+
 def query(sql, psql):
-    p = subprocess.run([psql, '-XqAt', '-v', 'ON_ERROR_STOP=1'], input=('BEGIN READ ONLY;' + sql + ';ROLLBACK;').encode(),
-                       env=pg_env(), capture_output=True, timeout=330)
+    try:
+        p = subprocess.run([psql, '-XqAt', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=verbose'], input=('BEGIN READ ONLY;' + sql + ';ROLLBACK;').encode(),
+                           env=pg_env(), capture_output=True, timeout=330)
+    except subprocess.TimeoutExpired:
+        raise ReadFailed('read-only catalogue query timed out') from None
     if p.returncode:
-        raise RuntimeError('read-only catalogue query failed: ' + p.stderr.decode()[:400])
+        error = p.stderr.decode(errors='replace')
+        raise (ReadFailed if transient_sql_failure(error) else RuntimeError)('read-only catalogue query failed: ' + error[:400])
     return json.loads(p.stdout)
 
 
-def candidates(policy, streams, bucket, psql):
-    from reviewed_scope import admissible_candidates
+def candidates(policy, streams, bucket, psql, scope_cache=None):
     # One bounded read-only query per stream keeps each transaction short.
     rows = []
     for sid in sorted(streams or policy):
         part = stream_candidates(policy[sid], bucket, psql)
         rows += part
         print(json.dumps({'phase': 'listed_stream', 'stream_id': sid, 'files': len(part), 'bytes': sum(r['size_bytes'] for r in part)}), file=sys.stderr, flush=True)
-    return admissible_candidates(rows)
+    return admissible_candidates(rows, scope_cache)
 
 
 def stream_candidates(w, bucket, psql):
@@ -257,6 +280,7 @@ def main():
     ap.add_argument('--summary-only', action='store_true', help='write candidate totals only; never admit or write plans')
     ap.add_argument('--atomic-admission', action='store_true', help='stop on admission rejection; never split one proposal into several plans')
     ap.add_argument('--api', default='https://stoarama.com')
+    ap.add_argument('--scope-cache', help='content-addressed cache of pinned reviewed-scope objects (re-verified on every read)')
     a = ap.parse_args()
     if a.summary_only and (a.submit or len(a.stream) != 1):
         raise SystemExit('--summary-only requires exactly one stream and no --submit')
@@ -268,7 +292,7 @@ def main():
     unknown = set(a.stream) - set(policy)
     if unknown:
         raise SystemExit(f'streams without a keep28 window: {sorted(unknown)}')
-    rows = candidates(policy, set(a.stream), a.bucket, a.psql)
+    rows = candidates(policy, set(a.stream), a.bucket, a.psql, a.scope_cache)
     plans = [] if a.summary_only else batches(rows, a.label_prefix, a.max_items, int(a.max_bytes))
     if a.max_plans:
         plans = plans[:a.max_plans]
@@ -299,5 +323,13 @@ def main():
                       'out': str(out), 'deletion_enabled': False}), flush=True)
 
 
+def entrypoint():
+    try:
+        return main()
+    except ReadFailed:
+        traceback.print_exc()
+        return EXIT_READ_FAILED
+
+
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(entrypoint())

@@ -18,6 +18,7 @@ spec = importlib.util.spec_from_file_location('runner', Path(__file__).with_name
 r = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(r)
 NOW = r.timestamp('2026-11-11T12:00:00+00:00')
+PREPARER = r.Runner(Path(__file__).resolve().parents[3], Path('.')).preparer()
 WINDOWS = {3: (r.timestamp('2026-09-01T00:00:00+00:00'), r.timestamp('2026-09-29T00:00:00+00:00'))}
 
 
@@ -391,6 +392,119 @@ class LoopTests(unittest.TestCase):
             with patch.object(r, 'command', side_effect=command):
                 self.assertEqual(r.Runner.pick(job, lookahead=True), 1406)
             self.assertIn("NOT LIKE '%-nasonly-%'", queries[0])
+
+    def isolation_job(self, root, windows):
+        job = FakeRunner(root)
+        job.repo = Path(__file__).resolve().parents[3]
+        job.windows = dict.fromkeys(windows)
+        job.query = lambda *a, **k: []
+        return job
+
+    def preparer_exits(self, outcomes):
+        """Fake preparer: an int is its exit code; a str is the admitted label."""
+        def command(args, **kwargs):
+            outcome = outcomes.pop(args[args.index('--stream') + 1])
+            if not isinstance(outcome, str):
+                raise r.CommandFailed(outcome)
+            out = Path(args[args.index('--out') + 1])
+            out.mkdir(parents=True)
+            (out / 'summary.json').write_text(json.dumps(dict(
+                receipts=[dict(id=1406, label=outcome)], rejected_at_admission=[])))
+        return command
+
+    def test_admission_rejection_is_still_a_stop(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = self.isolation_job(root, [3, 4])
+            outcomes = {'3': 1, '4': 'k28auto-x-s4-raw-0001'}
+            with patch.object(r, 'command', side_effect=self.preparer_exits(outcomes)):
+                with self.assertRaisesRegex(r.Halt, 'local command failed'):
+                    r.Runner.pick(job)
+            self.assertIn('4', outcomes, 'continued to another stream after a failed admission check')
+            self.assertNotIn('deferred_streams', job.status)
+
+    def test_malformed_deferrals_are_unreadable_ownership_state(self):
+        for bad in ([3], {'x': {'retry_after': 1, 'failures': 1}}, {'3': 1.0},
+                    {'3': {'retry_after': float('nan'), 'failures': 1}},
+                    {'3': {'retry_after': float('inf'), 'failures': 1}},
+                    {'3': {'retry_after': 1, 'failures': r.MAX_STREAM_DEFERRALS}}):
+            with tempfile.TemporaryDirectory() as root:
+                (Path(root) / 'status.json').write_text(json.dumps(
+                    {'current_plan': None, 'last_error': None, 'deferred_streams': bad}))
+                job = r.Runner(Path('.'), Path(root))
+                with self.assertRaisesRegex(r.Halt, 'ownership unreadable'):
+                    job.initialize()
+                job.lock.close()
+
+    def test_read_failure_defers_stream_and_never_claims_completion(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = self.isolation_job(root, [3, 4])
+            queries = []
+            job.query = lambda sql, *a: queries.append(sql) or (0 if 'count(*)' in sql else [])
+            job.confirm_empty = lambda: self.fail('completion claimed while a stream is deferred')
+            with patch.object(r, 'command', side_effect=self.preparer_exits({'3': 4, '4': 4})):
+                self.assertIsNone(r.Runner.pick(job))
+            self.assertEqual(sorted(job.status['deferred_streams']), ['3', '4'])
+            self.assertEqual(len(queries), 1)
+            self.assertFalse(job.stream_ready(3))
+            self.assertEqual(job.status['deferred_streams']['3']['failures'], 1)
+            job.status['deferred_streams']['3']['retry_after'] = 0
+            with patch.object(r, 'command', side_effect=self.preparer_exits({'3': 'k28auto-x-s3-raw-0001'})):
+                self.assertEqual(r.Runner.pick(job), 1406)
+            self.assertEqual(list(job.status['deferred_streams']), ['4'])
+
+    def test_ambiguous_submission_timeout_or_unknown_failure_still_stops(self):
+        for code in (None, 1, 3):
+            with tempfile.TemporaryDirectory() as root:
+                job = self.isolation_job(root, [3, 4])
+                with patch.object(r, 'command', side_effect=self.preparer_exits({'3': code})):
+                    with self.assertRaisesRegex(r.Halt, 'local command failed'):
+                        r.Runner.pick(job)
+                self.assertNotIn('deferred_streams', job.status)
+
+    def test_persistent_read_failure_goes_to_the_owner(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = self.isolation_job(root, [3])
+            job.status['deferred_streams'] = {'3': {'retry_after': 0, 'failures': r.MAX_STREAM_DEFERRALS - 1}}
+            with patch.object(r, 'command', side_effect=self.preparer_exits({'3': 4})):
+                with self.assertRaisesRegex(r.Halt, 'keeps failing'):
+                    r.Runner.pick(job)
+
+    def test_deferral_for_unknown_stream_stops_before_any_work(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            job.status['deferred_streams'] = {'999': {'retry_after': 0, 'failures': 1}}
+            job.pick = lambda **kw: self.fail('picked work with unknown deferral state')
+            with self.assertRaisesRegex(r.Halt, 'outside pinned policy'):
+                job.run()
+
+    def test_only_explicit_read_failure_defers_stream_ranking(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = r.Runner(Path(__file__).resolve().parents[3], Path(root))
+            job.windows = {3: WINDOWS[3], 4: WINDOWS[3]}
+            path = job.stream_summary_path(4)
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(dict(policy_sha256=r.POLICY_SHA, bucket=os.environ.get('R2_BUCKET', 'stoarama'),
+                streams=[4], observed_at_epoch=r.time.time(), recoverable_files=1, recoverable_bytes=10)))
+            with patch.object(r, 'command', side_effect=r.CommandFailed(4)):
+                self.assertEqual(job.stream_order(), [4])
+            self.assertEqual(list(job.status['deferred_streams']), ['3'])
+            job.status['deferred_streams'] = {}
+            with patch.object(r, 'command', side_effect=r.CommandFailed(None)):
+                with self.assertRaisesRegex(r.Halt, 'local command failed'):
+                    job.stream_order()  # A runner-side timeout cannot prove what the preparer saw.
+
+    def test_run_waits_for_deferred_streams_with_master_off(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            job.picks = [None, None]
+            job.status['deferred_streams'] = {'3': {'retry_after': 1.0, 'failures': 1}}
+            def wait():
+                self.assertEqual(job.events, ['OFF', 'idle'])
+                job.status['deferred_streams'] = {}
+            job.wait_for_deferred_streams = wait
+            job.run()
+            self.assertEqual(job.status['phase'], 'complete')
+            self.assertEqual(job.events, ['OFF', 'idle'])
 
     def test_command_failure_logs_privately_and_halts(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1463,7 +1577,8 @@ class EmailTests(unittest.TestCase):
 class ReadRetryTests(unittest.TestCase):
     def job(self, root):
         job = r.Runner(Path('.'), Path(root))
-        job.prepare = SimpleNamespace(pg_env=lambda: {'PGOPTIONS': '-c default_transaction_read_only=on'})
+        job.prepare = SimpleNamespace(pg_env=lambda: {'PGOPTIONS': '-c default_transaction_read_only=on'},
+                                      transient_sql_failure=PREPARER.transient_sql_failure)
         return job
 
     def test_plan_report_get_retries_without_latching(self):

@@ -31,6 +31,47 @@ class Keep28PlanTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'atomic admission rejected'):
                 k.submit('https://example.invalid', 'lookahead', [row(3, 'raw', 1), row(3, 'raw', 2)], [], [], atomic=True)
             self.assertEqual(call.call_count, 1)
+    def test_exit_codes_mean_nothing_was_admitted_and_other_failures_stay_ambiguous(self):
+        with patch('traceback.print_exc'):
+            with patch.object(k, 'main', side_effect=k.ReadFailed('timeout')):
+                self.assertEqual(k.entrypoint(), k.EXIT_READ_FAILED)
+            with patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', 409, 'conflict', {}, None)), \
+                 patch.object(k, 'main', side_effect=lambda: k.submit('https://example.invalid', 'x', [row(3, 'raw', 1)], [], [], atomic=True)):
+                with self.assertRaisesRegex(RuntimeError, 'atomic admission rejected'):
+                    k.entrypoint()
+            with patch.object(k, 'service', side_effect=urllib.error.HTTPError('/plans', 502, 'bad gateway', {}, None)), \
+                 patch.object(k, 'main', side_effect=lambda: k.submit('https://example.invalid', 'x', [row(3, 'raw', 1)], [], [], atomic=True)):
+                with self.assertRaisesRegex(RuntimeError, 'admission not confirmed'):
+                    k.entrypoint()
+
+    def test_only_transient_sqlstates_are_read_failures(self):
+        transient = ['ERROR:  57014: canceling statement due to statement timeout',
+                     'FATAL:  57P01: terminating connection due to administrator command\nserver closed the connection unexpectedly',
+                     'psql: error: connection to server at "db" failed: timeout expired',
+                     'ERROR:  40001: could not serialize access']
+        fatal = ['PANIC:  XX001: invalid page\nserver closed the connection unexpectedly',
+                 'PANIC:  could not write to file\nserver closed the connection unexpectedly',
+                 'ERROR:  57014: canceling statement\nERROR:  XX001: invalid page',
+                 'ERROR:  42601: syntax error', 'ERROR:  XX000: internal error', 'something else']
+        for text in transient:
+            self.assertIsNotNone(k.transient_sql_failure(text), text)
+        for text in fatal:
+            self.assertIsNone(k.transient_sql_failure(text), text)
+
+    def test_catalogue_timeout_is_a_read_failure(self):
+        with patch('subprocess.run', side_effect=k.subprocess.TimeoutExpired('psql', 330)), patch.object(k, 'pg_env', return_value={}):
+            with self.assertRaises(k.ReadFailed):
+                k.query('SELECT 1', 'psql')
+        failed = k.subprocess.CompletedProcess([], 1, b'', b'ERROR:  57014: canceling statement due to statement timeout')
+        with patch('subprocess.run', return_value=failed), patch.object(k, 'pg_env', return_value={}):
+            with self.assertRaises(k.ReadFailed):
+                k.query('SELECT 1', 'psql')
+        corrupt = k.subprocess.CompletedProcess([], 1, b'', b'ERROR:  XX001: invalid page in block 7 of relation base/1/2')
+        with patch('subprocess.run', return_value=corrupt), patch.object(k, 'pg_env', return_value={}):
+            with self.assertRaisesRegex(RuntimeError, 'query failed') as caught:
+                k.query('SELECT 1', 'psql')
+        self.assertNotIsInstance(caught.exception, k.ReadFailed)
+
     def test_preparer_requires_current_delivery_hold_check(self):
         with patch.object(k, 'query', return_value=[]) as query:
             k.stream_candidates(k.load_policy(k.POLICY_PATH)[3], 'stoarama', 'psql')

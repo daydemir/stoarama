@@ -54,14 +54,27 @@ The runner:
   ON still rejects concurrent deploys. Repeats OFF after completion or pause.
 - Uses a complete fresh dry run or invokes `prepare_keep28_plans.py --submit`
   for one stream, at most one <=100 GB plan. Unique `k28auto-YYYYMMDD-HHMMSS`
-  prefixes avoid immutable-label reuse. Admission rejection is a stop.
+  prefixes avoid immutable-label reuse. Admission rejection is a failed check
+  and stops. A slow read cannot idle the other streams: the preparer exits 4
+  only when a read-only catalogue read hit a transient SQLSTATE (timeout,
+  connection, serialization) or a reviewed-scope object was unreachable, before
+  any submission (nothing admitted). Exit 4 defers that stream for an hour
+  (`deferred_streams`) and the next stream proceeds; the sixth consecutive
+  deferral of one stream stops. With work deferred, the runner waits with
+  master OFF and never reports completion. Any other failure (integrity or
+  size-bound mismatch, other SQL errors, a runner-side timeout, a lost
+  admission response) still stops.
   Streams rank by R2-present candidate bytes per file, descending (stream ID
   breaks ties). The preparer's read-only `--summary-only --stream ID` mode
   supplies one stream at a time, retaining its indexed scope and 300-second SQL
   cap. Summaries live in `stream-summaries/<policy-and-bucket-digest>/<id>/`
-  beneath the runner state on Jelly, expire after 24 hours, and are invalidated
-  after that stream's admission. The initial cache fill visits all 109 streams;
-  subsequent ranking reuses the cache. These are ranking hints only.
+  beneath the runner state on Jelly, expire after 7 days, and are invalidated
+  after that stream's admission. The initial cache fill visits all 109 streams
+  (about an hour, with master OFF); a 24-hour expiry repeated that idle hour
+  daily. Subsequent ranking reuses the cache. These are ranking hints only.
+  Pinned reviewed-scope objects (report, frozen index, folder shards) are cached
+  by SHA-256 in `reviewed-scope-cache/` and re-verified on every read; missing or
+  mismatched entries are refetched (8 parallel fetches).
   Preparation, dry run and independent verification rederive eligibility.
   Within each stream, files and plans
   prioritize bytes per operation, with R2-present plans ahead of NAS-only work.
