@@ -1112,15 +1112,6 @@ class Runner:
                 return
             if self.stopped():
                 break
-            # Admission is read-only on the NAS and still happens with master
-            # OFF. Never prepare more than one successor. Its own independent
-            # verification and every enable gate run after this plan closes.
-            if self.status.get('next_plan') is None:
-                # A lost response/crash must not silently admit another plan
-                # on restart. Ambiguous admission requires owner reconciliation.
-                self.save('dry_run', lookahead_pending=True)
-                successor = self.pick(lookahead=True)
-                self.save('dry_run', next_plan=successor, lookahead_pending=False)
             self.idle()
             self.master(True)
             if self.stopped():
@@ -1138,8 +1129,26 @@ class Runner:
             self.api('POST', 'plans/' + str(pid) + '/control', {'mode': 'enabled',
                 'plan_sha256': p['plan_sha256'], 'approval_hours': 24,
                 'allow_long_approval': True, 'reason': REASON})
+            self.admit_successor()
             self.monitor(pid)
         self.save('stopped')
+
+    def admit_successor(self):
+        # Admit only after the current plan is enabled: a successor admitted
+        # first fills the NAS client's lease window with its dry run, delaying
+        # execution until those hashes finish. Admitted now, the client leases
+        # execution first (it wins queue priority) and dry-runs the successor
+        # on its two preflight workers. Never prepare more than one successor;
+        # its independent verification and every enable gate run after this
+        # plan closes, with master OFF between batches.
+        if self.status.get('next_plan') is not None or self.stopped():
+            return
+        # A lost response/crash must not silently admit another plan on
+        # restart. Ambiguous admission requires owner reconciliation.
+        phase = self.status['phase']
+        self.save(phase, lookahead_pending=True)
+        successor = self.pick(lookahead=True)
+        self.save(phase, next_plan=successor, lookahead_pending=False)
 
     def fail(self, error):
         self.status.update(phase='failed', last_error=error)

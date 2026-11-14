@@ -303,7 +303,7 @@ class FakeRunner(r.Runner):
 
 
 class LoopTests(unittest.TestCase):
-    def test_lookahead_is_admitted_off_and_never_enabled_before_current_close(self):
+    def test_lookahead_is_admitted_after_enable_and_never_enabled_before_current_close(self):
         with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
             job = FakeRunner(root)
             successor = copy.deepcopy(job.p)
@@ -312,8 +312,11 @@ class LoopTests(unittest.TestCase):
             job.picks = [42, 43]
             def pick(lookahead=False):
                 if lookahead:
-                    self.assertEqual(job.p['mode'], 'dry_run')
-                    self.assertEqual([e for e in job.events if e in {'ON', 'OFF'}][-1], 'OFF')
+                    # The current plan already owns execution, so the NAS
+                    # client leases it ahead of the successor's dry run.
+                    self.assertEqual(job.p['mode'], 'enabled')
+                    self.assertEqual(job.events[-1], 'plans/%d/control' % job.p['id'])
+                    self.assertEqual([e for e in job.events if e in {'ON', 'OFF'}][-1], 'ON')
                     self.assertTrue(job.status['lookahead_pending'])
                 return job.picks.pop(0) if job.picks else None
             job.pick = pick

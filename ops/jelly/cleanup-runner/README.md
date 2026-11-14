@@ -78,9 +78,12 @@ The runner:
   Preparation, dry run and independent verification rederive eligibility.
   Within each stream, files and plans
   prioritize bytes per operation, with R2-present plans ahead of NAS-only work.
-- Before ON, admits at most one successor using atomic admission (no recursive
-  rejection splitting). Two NAS workers can dry-run it during current serial
-  execution; executable work wins queue priority. `next_plan` never owns execution.
+- Right after enabling the current plan, admits at most one successor using
+  atomic admission (no recursive rejection splitting). Admitting it before ON
+  let the NAS client fill its lease window with the successor's dry run, and
+  execution waited for those hashes (plan 1411: ~40 minutes). Now the client
+  leases execution first (it wins queue priority) and two NAS workers dry-run
+  the successor during current serial execution. `next_plan` never owns execution.
   Its failure stops the runner too. OFF/recovery/close precede promoting it;
   independent catalog/window checks, budget, freshness and enable rechecks still
   run normally. An interrupted `lookahead_pending` admission requires owner
