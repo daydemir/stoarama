@@ -121,6 +121,8 @@ func main() {
 		runJoinedSourcePurge(ctx, cfg, os.Args[2:])
 	case "do-spend":
 		runDOSpend(ctx, cfg, os.Args[2:])
+	case "nas-r2-copy":
+		runNASR2Copy(ctx, cfg, os.Args[2:])
 	case "nas-restore":
 		runNASRestore(ctx, cfg, os.Args[2:])
 	case "nas-stitch":
@@ -259,7 +261,9 @@ func usage() {
 	  stoaramactl joined-source-purge hold --hour-record-id N --reason CODE [--note TEXT] | holds [--json]
 	  stoaramactl do-spend report [--json]
 	  stoaramactl do-spend check [--dry-run]
-	  stoaramactl nas-restore request (--clip-ids 1,2 | --hour-record-id N | --recording-id N --from TIME --to TIME) [--test-prefix --label L --max-bytes N --limit N --dry-run --json]
+	  stoaramactl nas-r2-copy plan --input copy.jsonl.gz --sha256 SHA --out DIR
+  stoaramactl nas-r2-copy queue --input raw-NNNN.jsonl --sha256 SHA [--apply] | status
+  stoaramactl nas-restore request (--clip-ids 1,2 | --hour-record-id N | --recording-id N --from TIME --to TIME) [--test-prefix --label L --max-bytes N --limit N --dry-run --json]
 	  stoaramactl nas-restore status [--label L --json] | cancel --label L
 	  stoaramactl nas-stitch status|approve|pause|import-corpus
   stoaramactl nas-cleanup prepare --input PLAN.json | report --plan-id ID | verify-recovery --plan-id ID | pause|enable|close --plan-id ID --expected-plan-sha256 SHA --reason TEXT | retire-superseded --reason TEXT [--expected-plans N] | enable-batch --batch-input BATCH.json --expected-batch-sha256 SHA --reason TEXT --approval-hours H | pause-batch|batch-report --batch-id ID
