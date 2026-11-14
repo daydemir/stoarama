@@ -913,12 +913,12 @@ class Inventory:
         with self.lock:
             self.db.close()
 
-    def _upsert(self, clip, state, verified_at, mtime_ns, generation="live", commit=True, scan_pass="", file_identity=(0, 0, 0), sidecar_evidence=("", 0, "")):
+    def _upsert(self, clip, state, verified_at, mtime_ns, generation="live", commit=True, scan_pass="", file_identity=(0, 0, 0), sidecar_evidence=("", 0, ""), pending=None):
         updated_at = utc_now_precise()
         ctime_ns, inode, device = file_identity
         sidecar_path, sidecar_size, sidecar_sha = sidecar_evidence
         with self.lock:
-            self.db.execute(
+            self._scan_write(pending,
                 """INSERT INTO files
                    (clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,file_mtime_ns,file_ctime_ns,file_inode,file_device,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256,clip_start_us,clip_end_us,seen_generation,scan_pass,client_updated_at,dirty)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
@@ -930,7 +930,8 @@ class Inventory:
                      sidecar_relative_path=excluded.sidecar_relative_path,sidecar_size_bytes=excluded.sidecar_size_bytes,sidecar_sha256=excluded.sidecar_sha256,
                      clip_start_us=excluded.clip_start_us,clip_end_us=excluded.clip_end_us,
                      seen_generation=excluded.seen_generation,scan_pass=excluded.scan_pass,
-                     client_updated_at=excluded.client_updated_at,dirty=1""",
+                     client_updated_at=excluded.client_updated_at,dirty=1
+                   WHERE files.client_updated_at<=excluded.client_updated_at""",
                 (
                     int(clip["clip_id"]), int(clip["recording_id"]), str(clip["relative_path"]),
                     int(clip["size_bytes"]), str(clip["sha256"]).lower(), state,
@@ -941,22 +942,39 @@ class Inventory:
                     generation, scan_pass, updated_at,
                 ),
             )
-            if commit:
+            if commit and pending is None:
                 self.db.commit()
 
-    def _commit_scan_batch(self, progress=None):
-        with self.lock:
-            if progress is not None:
-                self.db.executemany(
-                    "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (("scan_rows_visited", str(progress[0])), ("scan_rows_skipped", str(progress[1])),
-                     ("scan_skip_reasons", json.dumps(progress[2], sort_keys=True, separators=(",", ":")))),
-                )
-            self.db.commit()
+    def _scan_write(self, pending, sql, params):
+        # Buffer scan observations until the bounded checkpoint. No SQLite
+        # transaction may span filesystem I/O or release of the journal lock:
+        # cleanup checkpoints must commit or roll back independently.
+        if pending is None:
+            self.db.execute(sql, params)
+        else:
+            pending.append((sql, params))
 
-    def _publish_scan_batch(self, cfg, generation, started_at, progress, stop_event=None):
+    def _commit_scan_batch(self, progress=None, pending=None):
+        with self.lock:
+            try:
+                for sql, params in pending or ():
+                    self.db.execute(sql, params)
+                if progress is not None:
+                    self.db.executemany(
+                        "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (("scan_rows_visited", str(progress[0])), ("scan_rows_skipped", str(progress[1])),
+                         ("scan_skip_reasons", json.dumps(progress[2], sort_keys=True, separators=(",", ":")))),
+                    )
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
+            if pending is not None:
+                pending.clear()
+
+    def _publish_scan_batch(self, cfg, generation, started_at, progress, stop_event=None, pending=None):
         try:
-            self._commit_scan_batch(progress)
+            self._commit_scan_batch(progress, pending)
             self.sync_dirty(cfg, generation, started_at, stop_event=stop_event)
         except Exception as exc:
             raise InventoryProgressError("inventory progress persistence failed") from exc
@@ -1118,11 +1136,11 @@ class Inventory:
             return generation, started_at
         return None
 
-    def _linked_scan_row_is_current(self, clip, generation, scan_pass, path, sidecar_evidence):
+    def _linked_scan_row_is_current(self, clip, generation, scan_pass, path, sidecar_evidence, pending=None):
         # NAS I/O must never hold the receipt journal mutex.
         query = """SELECT recording_id,relative_path,size_bytes,sha256,state,file_mtime_ns,seen_generation,
                           file_ctime_ns,file_inode,file_device,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256,
-                          clip_start_us,clip_end_us,verified_at
+                          clip_start_us,clip_end_us,verified_at,client_updated_at
                    FROM files WHERE clip_id=?"""
         params = (int(clip["clip_id"]),)
         with self.lock:
@@ -1171,12 +1189,12 @@ class Inventory:
                     # identity. Publish the observation in this generation but
                     # retain the timestamp of the actual payload hash: this is
                     # not a fresh hash or an extension of release eligibility.
-                    self.db.execute(
-                        "UPDATE files SET seen_generation=?,scan_pass=?,client_updated_at=?,dirty=1 WHERE clip_id=?",
-                        (generation, scan_pass, utc_now_precise(), int(clip["clip_id"])),
+                    self._scan_write(pending,
+                        "UPDATE files SET seen_generation=?,scan_pass=?,client_updated_at=?,dirty=1 WHERE clip_id=? AND client_updated_at=?",
+                        (generation, scan_pass, utc_now_precise(), int(clip["clip_id"]), row[16]),
                     )
                 else:
-                    self.db.execute("UPDATE files SET scan_pass=? WHERE clip_id=?", (scan_pass, int(clip["clip_id"])))
+                    self._scan_write(pending, "UPDATE files SET scan_pass=? WHERE clip_id=? AND client_updated_at=?", (scan_pass, int(clip["clip_id"]), row[16]))
         return current
 
     def _cached_regular_stat(self, relative_path):
@@ -1199,9 +1217,9 @@ class Inventory:
                 os.close(descriptor)
         return None
 
-    def _unmatched_scan_row_is_current(self, relative_path, generation, scan_pass, stat):
+    def _unmatched_scan_row_is_current(self, relative_path, generation, scan_pass, stat, pending=None):
         # NAS I/O must never hold the receipt journal mutex.
-        query = """SELECT size_bytes,state,file_mtime_ns,seen_generation,file_ctime_ns,file_inode,file_device,sha256
+        query = """SELECT size_bytes,state,file_mtime_ns,seen_generation,file_ctime_ns,file_inode,file_device,sha256,client_updated_at
                    FROM unmatched_files WHERE relative_path=?"""
         params = (relative_path,)
         with self.lock:
@@ -1223,20 +1241,21 @@ class Inventory:
                 if latest != row:
                     return False
                 if different_generation:
-                    self.db.execute(
-                        "UPDATE unmatched_files SET seen_generation=?,scan_pass=?,client_updated_at=?,dirty=1 WHERE relative_path=?",
-                        (generation, scan_pass, utc_now_precise(), relative_path),
+                    self._scan_write(pending,
+                        "UPDATE unmatched_files SET seen_generation=?,scan_pass=?,client_updated_at=?,dirty=1 WHERE relative_path=? AND client_updated_at=?",
+                        (generation, scan_pass, utc_now_precise(), relative_path, row[8]),
                     )
                 else:
-                    self.db.execute("UPDATE unmatched_files SET scan_pass=? WHERE relative_path=?", (scan_pass, relative_path))
+                    self._scan_write(pending, "UPDATE unmatched_files SET scan_pass=? WHERE relative_path=? AND client_updated_at=?", (scan_pass, relative_path, row[8]))
         return current
 
-    def _retire_unmatched_linked_path(self, relative_path, generation, scan_pass):
+    def _retire_unmatched_linked_path(self, relative_path, generation, scan_pass, pending=None):
+        observed_at = utc_now_precise()
         with self.lock:
-            self.db.execute(
+            self._scan_write(pending,
                 """UPDATE unmatched_files SET state='missing',seen_generation=?,scan_pass=?,client_updated_at=?,dirty=1
-                   WHERE relative_path=? AND state<>'missing'""",
-                (generation, scan_pass, utc_now_precise(), relative_path),
+                   WHERE relative_path=? AND state<>'missing' AND client_updated_at<=?""",
+                (generation, scan_pass, observed_at, relative_path, observed_at),
             )
 
     def summary(self):
@@ -1301,6 +1320,7 @@ class Inventory:
             return self._full_scan_locked(cfg, stop_event)
 
     def _full_scan_locked(self, cfg, stop_event):
+        pending = []
         resumed = self._incomplete_scan()
         if resumed is None:
             started_at = utc_now_precise()
@@ -1321,12 +1341,12 @@ class Inventory:
         known_paths = set()
         for sidecar in walk_raw_files(cfg.output_dir):
             if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
-                self._commit_scan_batch((scanned, skipped, skip_reasons))
+                self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
                 return
             if not sidecar.name.endswith(".stoarama.json"):
                 continue
             if stop_event.is_set():
-                self._commit_scan_batch((scanned, skipped, skip_reasons))
+                self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
                 return
             try:
                 sidecar_bytes, _sidecar_stat = stable_regular_file_bytes(sidecar, 1024 * 1024)
@@ -1344,12 +1364,12 @@ class Inventory:
                 sidecar_relative = str(sidecar.relative_to(cfg.output_dir))
                 sidecar_evidence = (sidecar_relative, len(sidecar_bytes), hashlib.sha256(sidecar_bytes).hexdigest())
                 known_paths.add(str(relative))
-                self._retire_unmatched_linked_path(str(relative), generation, scan_pass)
-                if self._linked_scan_row_is_current(clip, generation, scan_pass, path, sidecar_evidence):
+                self._retire_unmatched_linked_path(str(relative), generation, scan_pass, pending)
+                if self._linked_scan_row_is_current(clip, generation, scan_pass, path, sidecar_evidence, pending):
                     scanned += 1
-                    if scanned % INVENTORY_SYNC_BATCH == 0:
+                    if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
                         self._publish_scan_batch(
-                            cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event,
+                            cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending,
                         )
                     continue
                 try:
@@ -1364,7 +1384,7 @@ class Inventory:
                         identity = (0, 0, 0)
                     except FileChangedDuringHash:
                         self._upsert(
-                            clip, "mismatch", None, 0, generation, commit=False,
+                            clip, "mismatch", None, 0, generation, pending=pending,
                             scan_pass=scan_pass, file_identity=(0, 0, 0),
                         )
                         raise
@@ -1376,16 +1396,16 @@ class Inventory:
                 else:
                     state, verified_at, mtime_ns = "missing", None, 0
                     identity = (0, 0, 0)
-                self._upsert(clip, state, verified_at, mtime_ns, generation, commit=False, scan_pass=scan_pass, file_identity=identity, sidecar_evidence=sidecar_evidence)
+                self._upsert(clip, state, verified_at, mtime_ns, generation, pending=pending, scan_pass=scan_pass, file_identity=identity, sidecar_evidence=sidecar_evidence)
                 scanned += 1
-                if scanned % INVENTORY_SYNC_BATCH == 0:
+                if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
                     self._publish_scan_batch(
-                        cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event,
+                        cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending,
                     )
                 if cfg.inventory_scan_delay_ms:
                     stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
             except InventoryScanStopped:
-                self._commit_scan_batch((scanned, skipped, skip_reasons))
+                self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
                 return
             except sqlite3.Error as exc:
                 raise InventoryProgressError("inventory state persistence failed") from exc
@@ -1396,12 +1416,14 @@ class Inventory:
                 reason = inventory_skip_reason(exc, sidecar=True)
                 skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
                 log("WARN", f"inventory skipped reason={reason} count={skip_reasons[reason]}")
+                if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
+                    self._publish_scan_batch(cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending)
         for path in walk_raw_files(cfg.output_dir):
             if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
-                self._commit_scan_batch((scanned, skipped, skip_reasons))
+                self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
                 return
             if stop_event.is_set():
-                self._commit_scan_batch((scanned, skipped, skip_reasons))
+                self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
                 return
             try:
                 if (
@@ -1415,35 +1437,36 @@ class Inventory:
                 if relative in known_paths:
                     continue
                 stat = path.stat()
-                if self._unmatched_scan_row_is_current(relative, generation, scan_pass, stat):
+                if self._unmatched_scan_row_is_current(relative, generation, scan_pass, stat, pending):
                     scanned += 1
-                    if scanned % INVENTORY_SYNC_BATCH == 0:
+                    if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
                         self._publish_scan_batch(
-                            cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event,
+                            cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending,
                         )
                     continue
                 size_bytes, sha256, stat = sha256_file_throttled_stable(path, cfg.inventory_hash_mbps, stop_event)
                 updated_at = utc_now_precise()
                 with self.lock:
-                    self.db.execute(
+                    self._scan_write(pending,
                         """INSERT INTO unmatched_files(relative_path,size_bytes,sha256,state,file_mtime_ns,file_ctime_ns,file_inode,file_device,seen_generation,scan_pass,client_updated_at,dirty)
                            VALUES(?,?,?,'present',?,?,?,?,?,?,?,1)
                            ON CONFLICT(relative_path) DO UPDATE SET size_bytes=excluded.size_bytes,sha256=excluded.sha256,
                              state='present',file_mtime_ns=excluded.file_mtime_ns,file_ctime_ns=excluded.file_ctime_ns,
                              file_inode=excluded.file_inode,file_device=excluded.file_device,
                              seen_generation=excluded.seen_generation,scan_pass=excluded.scan_pass,
-                             client_updated_at=excluded.client_updated_at,dirty=1""",
+                             client_updated_at=excluded.client_updated_at,dirty=1
+                           WHERE unmatched_files.client_updated_at<=excluded.client_updated_at""",
                         (relative, size_bytes, sha256, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino, stat.st_dev, generation, scan_pass, updated_at),
                     )
                 scanned += 1
-                if scanned % INVENTORY_SYNC_BATCH == 0:
+                if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
                     self._publish_scan_batch(
-                        cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event,
+                        cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending,
                     )
                 if cfg.inventory_scan_delay_ms:
                     stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
             except InventoryScanStopped:
-                self._commit_scan_batch((scanned, skipped, skip_reasons))
+                self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
                 return
             except sqlite3.Error as exc:
                 raise InventoryProgressError("inventory state persistence failed") from exc
@@ -1454,10 +1477,12 @@ class Inventory:
                 reason = inventory_skip_reason(exc, sidecar=False)
                 skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
                 log("WARN", f"inventory skipped reason={reason} count={skip_reasons[reason]}")
+                if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
+                    self._publish_scan_batch(cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending)
         # Flush and publish every successfully observed row, but never promote a
         # partial generation. In particular, do not turn unseen prior rows into
         # "missing" when an unreadable/corrupt path was skipped.
-        self._commit_scan_batch((scanned, skipped, skip_reasons))
+        self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
         self.sync_dirty(cfg, generation, started_at, stop_event=stop_event)
         if stop_event.is_set():
             return
@@ -17889,7 +17914,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
 # protocol 2 reject it with HTTP 400 and the client keeps using protocol 1.
 CLEANUP_V2_LEASE = 64          # tasks per lease request (server maximum)
 CLEANUP_V2_WORKERS = 16        # concurrent dry-run file workers
-CLEANUP_GROUP_VERSION = "cleanup-batch-v6"
+CLEANUP_GROUP_VERSION = "cleanup-batch-v6.1"
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
 CLEANUP_V2_INFLIGHT = 64       # leased tasks held locally (running + queued)
@@ -18794,11 +18819,11 @@ def sha256_file_throttled_stable(path, megabytes_per_sec, stop_event):
     return size, digest, after
 
 
-def stable_regular_file_bytes(path, max_bytes):
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+def stable_regular_file_bytes(path, max_bytes, directory_fd=None):
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = None
     try:
-        descriptor = os.open(str(path), flags)
+        descriptor = os.open(str(path), flags, dir_fd=directory_fd)
         before = os.fstat(descriptor)
         if not stat_module.S_ISREG(before.st_mode) or before.st_size < 0 or before.st_size > max_bytes:
             raise ValueError("sidecar is not a bounded regular file")
@@ -19972,16 +19997,8 @@ def valid_joined_item(raw):
     batch_id = raw.get("batch_id")
     if not isinstance(batch_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", batch_id):
         raise ValueError("joined item has invalid batch_id")
-    relative_raw = raw.get("relative_path")
-    if not isinstance(relative_raw, str):
-        raise ValueError("joined item has invalid relative_path")
+    relative_raw = valid_joined_relative_path(raw.get("relative_path"))
     relative = Path(relative_raw)
-    if (
-        not relative_raw or relative.is_absolute() or relative_raw != relative.as_posix()
-        or "\\" in relative_raw or any(part in ("", ".", "..") for part in relative.parts)
-        or relative.parts[0] == JOINED_ROOT
-    ):
-        raise ValueError("joined item has invalid relative_path")
     sha256 = valid_sha256(raw.get("sha256"), "joined item")
     kind = raw.get("kind")
     content_type = raw.get("content_type")
@@ -20077,7 +20094,7 @@ def valid_joined_relative_path(value, suffix=None):
     raw = value
     relative = Path(raw)
     if (
-        not raw or relative.is_absolute() or raw != relative.as_posix() or "\\" in raw
+        not relative.parts or relative.is_absolute() or raw != relative.as_posix() or "\\" in raw
         or any(part in ("", ".", "..") for part in relative.parts) or relative.parts[0] == JOINED_ROOT
         or (suffix is not None and not raw.endswith(suffix))
     ):
@@ -22249,12 +22266,54 @@ def joined_sidecar_intent(cfg, directory_fd, name, content):
     return cfg.state_dir / ("joined-sidecar-intent-" + key + ".json"), identity
 
 
+def joined_quarantine_stage_evidence(cfg, directory_fd, entry, record, copies):
+    """Read-only proof of an old redundant ownership marker, never deletion authority."""
+    try:
+        if not record or record.get("state") != "complete":
+            return None
+        stage = Path(record["old_path"])
+        match = re.fullmatch(r"(.+\.joined-([1-9][0-9]*)\.part\.stoarama\.json)\.stage-[0-9a-f]{32}", stage.name)
+        if not match or int(match[2]) != record["artifact_id"]:
+            return None
+        content, current = stable_regular_file_bytes(entry, 1024 * 1024, directory_fd)
+        latest = joined_entry_stat(directory_fd, entry)
+        if (latest is None or certification_identity(current) != certification_identity(latest)
+                or current.st_nlink != 1 or latest.st_nlink != 1
+                or (current.st_dev, current.st_ino, current.st_size)
+                != (record["device"], record["inode"], record["size_bytes"])):
+            return None
+        marker = json.loads(content)
+        if not isinstance(marker, dict):
+            return None
+        if marker.pop("schema_version") != 3:
+            return None
+        for key in ("etag", "version_id", "url_scheme", "url_authority", "url_path"):
+            marker.pop(key)
+        marker["artifact_id"] = marker.pop("id")
+        item = valid_joined_item(marker)
+        final = joined_output_path(cfg, item)
+        canonical = final.with_name(".%s.joined-%d.part.stoarama.json" % (final.name, item["id"])).absolute()
+        if item["id"] != record["artifact_id"] or match[1] != canonical.name or stage != canonical.with_name(stage.name):
+            return None
+        digest = hashlib.sha256(content).hexdigest()
+        paired = [copy for copy in copies if (
+            copy.get("artifact_id"), copy.get("device"), copy.get("old_inode"), copy.get("size_bytes"),
+            copy.get("canonical_path"), copy.get("sha256")
+        ) == (item["id"], current.st_dev, current.st_ino, len(content), str(canonical), digest)]
+        if len(paired) != 1 or type(paired[0].get("new_inode")) is not int or paired[0]["new_inode"] <= 0 or paired[0]["new_inode"] == current.st_ino:
+            return None
+        return dict(artifact_id=item["id"], inode=current.st_ino, size_bytes=len(content), sha256=digest)
+    except (OSError, ValueError, KeyError, TypeError, ExistingFileMismatch, FileChangedDuringHash):
+        return None
+
+
 def joined_quarantine_startup_status(cfg):
     # Replay diagnostics only; neither the ledger nor this scan grants authority
     # to mutate NAS files. Scan the whole ledger to match older quarantined names.
     path = cfg.state_dir / "joined-alias-quarantine.jsonl"
     recorded_paths = {}
     unfinished = {}
+    copies = []
     problems = []
     malformed = 0
     try:
@@ -22277,6 +22336,8 @@ def joined_quarantine_startup_status(cfg):
                         continue
                     if record.get("operation") == "alias_move" and isinstance(record.get("new_path"), str):
                         recorded_paths[record["new_path"]] = record
+                    if record.get("operation") == "canonical_copy" and record.get("state") == "complete":
+                        copies.append(record)
                     if record.get("operation") in ("alias_move", "canonical_copy"):
                         key = json.dumps([
                             record["operation"], record.get("new_path"),
@@ -22297,8 +22358,8 @@ def joined_quarantine_startup_status(cfg):
 
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = None
-    unrecorded = total = 0
-    status = {"aliases": [], "pending_recoveries": []}
+    unrecorded = total = proven_stages = 0
+    status = {"aliases": [], "pending_recoveries": [], "stage_evidence": []}
     detail_bytes = 0
 
     def add_detail(category, message):
@@ -22323,6 +22384,11 @@ def joined_quarantine_startup_status(cfg):
             alias = str(qroot / entry)
             total += 1
             record = recorded_paths.get(alias)
+            evidence = None if problems or unfinished else joined_quarantine_stage_evidence(cfg, descriptor, entry, record, copies)
+            if evidence is not None:
+                proven_stages += 1
+                if len(status["stage_evidence"]) < 5:
+                    status["stage_evidence"].append(evidence)
             if record is None:
                 unrecorded += 1
                 message = "joined quarantine unrecorded alias: " + alias
@@ -22349,6 +22415,8 @@ def joined_quarantine_startup_status(cfg):
     if not (total or pending or problems):
         return "", None, {}
     status.update(alias_count=total, unrecorded_count=unrecorded, pending_recovery_count=pending,
+                  proven_stage_count=proven_stages, unknown_alias_count=total - proven_stages,
+                  ledger_problem_count=len(problems),
                   aliases_omitted=total - len(status["aliases"]),
                   pending_recoveries_omitted=pending - len(status["pending_recoveries"]))
     summary = "joined quarantine ledger replay: aliases=%d pending recoveries=%d" % (total, pending)
@@ -22581,7 +22649,7 @@ def quarantine_joined_aliases(cfg, runtime, directory_fd, name, artifact, stop_e
         os.close(quarantine_fd)
 
 
-def recover_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event, journal, identity, record):
+def recover_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event, journal, identity, record, created_stage=None):
     # The journal is only a path hint. Recorded device/inode never authorizes
     # deletion or establishes provenance (inodes can be reused after a crash).
     stage = record.get("stage_name") if isinstance(record, dict) else None
@@ -22604,7 +22672,35 @@ def recover_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event
         os.fsync(directory_fd)
     if not verify_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
         raise ExistingFileMismatch("joined partial ownership marker conflicts")
-    quarantine_joined_aliases(cfg, runtime, directory_fd, name, json.loads(content), stop_event, stage)
+    if created_stage is None:
+        # Restart journals remain hints. Matching bytes/inodes cannot establish
+        # ownership after a crash; preserve recovered and foreign stages.
+        quarantine_joined_aliases(cfg, runtime, directory_fd, name, json.loads(content), stop_event, stage)
+    else:
+        # Only this invocation's O_EXCL-created stage can be removed. Normal
+        # publication used to quarantine this expected hardlink on every call.
+        parent = os.fstat(directory_fd)
+        current = joined_entry_stat(directory_fd, stage)
+        marker = joined_entry_stat(directory_fd, name)
+        if (parent.st_dev != identity["directory_device"] or parent.st_ino != identity["directory_inode"]
+                or current is None or marker is None or not same_joined_inode(current, marker)
+                or current.st_nlink != 2 or marker.st_nlink != 2
+                or (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+                != (created_stage.st_dev, created_stage.st_ino, created_stage.st_size, created_stage.st_mtime_ns)
+                or not verify_joined_sidecar(cfg, runtime, directory_fd, stage, content, stop_event)):
+            raise ExistingFileMismatch("fresh joined sidecar stage changed before removal")
+        latest = joined_entry_stat(directory_fd, stage)
+        canonical = joined_entry_stat(directory_fd, name)
+        if (latest is None or canonical is None or certification_identity(latest) != certification_identity(current)
+                or certification_identity(canonical) != certification_identity(marker)
+                or latest.st_nlink != 2 or canonical.st_nlink != 2):
+            raise ExistingFileMismatch("fresh joined sidecar namespace changed before removal")
+        os.unlink(stage, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        canonical = joined_entry_stat(directory_fd, name)
+        if (canonical is None or not same_joined_inode(canonical, created_stage) or canonical.st_nlink != 1
+                or not verify_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event)):
+            raise ExistingFileMismatch("joined sidecar changed after private stage removal")
     os.fsync(directory_fd)
     journal.unlink()
     fsync_dir(journal.parent)
@@ -22642,7 +22738,7 @@ def publish_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event
                       stage_path=str(Path(identity["marker_path"]).with_name(stage)),
                       device=current.st_dev, inode=current.st_ino)
         atomic_write(journal, json.dumps(record, sort_keys=True).encode("utf-8"))
-        recover_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event, journal, identity, record)
+        recover_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event, journal, identity, record, created_stage=current)
     except (ExistingFileMismatch, OSError) as exc:
         message = "joined marker=%s artifact_id=%d: %s" % (identity["marker_path"], identity["artifact_id"], exc)
         report_joined_quarantine(runtime, message)

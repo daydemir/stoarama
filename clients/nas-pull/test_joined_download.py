@@ -1706,6 +1706,7 @@ class JoinedDownloadTests(unittest.TestCase):
                 try: self.assertEqual(os.read(descriptor, len(expected) + 1), expected)
                 finally: os.close(descriptor)
             finally: os.close(directory_fd)
+
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
             runtime = self.runtime(cfg)
@@ -1724,6 +1725,25 @@ class JoinedDownloadTests(unittest.TestCase):
                     pull.publish_joined_sidecar(cfg, runtime, directory_fd, marker, expected, threading.Event())
                 self.assertEqual(os.stat(short, dir_fd=directory_fd).st_size, 7)
             finally: os.close(directory_fd)
+
+    def test_new_sidecar_publication_removes_only_its_fresh_private_stage(self):
+        item = pull.valid_joined_item(self.media_item())
+        expected = self.marker(item)
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            directory_fd, _, _part, marker = self.names(cfg, item)
+            try:
+                with mock.patch.object(pull, "poll_raw_pending", return_value=False):
+                    pull.publish_joined_sidecar(cfg, runtime, directory_fd, marker, expected, threading.Event())
+                parent = pull.joined_output_path(cfg, item).parent
+                self.assertEqual((parent / marker).read_bytes(), expected)
+                self.assertEqual((parent / marker).stat().st_nlink, 1)
+                self.assertFalse(list(parent.glob("*.stage-*")))
+                self.assertFalse((cfg.output_dir / ".stoarama-quarantine").exists())
+                self.assertFalse(list(cfg.state_dir.glob("joined-sidecar-intent-*")))
+            finally:
+                os.close(directory_fd)
 
     def entry_snapshot(self, path):
         current = path.stat()
@@ -1746,6 +1766,41 @@ class JoinedDownloadTests(unittest.TestCase):
 
     def quarantine_records(self, cfg):
         return [json.loads(line) for line in (cfg.state_dir / "joined-alias-quarantine.jsonl").read_text().splitlines()]
+
+    def test_startup_proves_retained_sidecar_stage_and_keeps_unknown_aliases_visible(self):
+        item = pull.valid_joined_item(self.media_item())
+        expected = self.marker(item)
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            directory_fd, _, _, marker = self.names(cfg, item)
+            try:
+                self.crash_marker_publication(cfg, runtime, directory_fd, marker, expected)
+                with mock.patch.object(pull, "poll_raw_pending", return_value=False):
+                    pull.publish_joined_sidecar(cfg, runtime, directory_fd, marker, expected, threading.Event())
+            finally:
+                os.close(directory_fd)
+            alias = next((cfg.output_dir / ".stoarama-quarantine/aliases").iterdir())
+            before = self.entry_snapshot(alias)
+            _, _, status = pull.joined_quarantine_startup_status(cfg)
+            self.assertEqual(status["alias_count"], 1)
+            self.assertEqual(status["proven_stage_count"], 1)
+            self.assertEqual(status["unknown_alias_count"], 0)
+            self.assertEqual(status["stage_evidence"][0]["sha256"], hashlib.sha256(expected).hexdigest())
+            self.assertEqual(before, self.entry_snapshot(alias))
+            for value in (None, "foreign marker", 17, True, [], dict(json.loads(expected), relative_path=".")):
+                with self.subTest(value=value):
+                    content = json.dumps(value).encode().ljust(len(expected), b" ")
+                    alias.write_bytes(content)
+                    restarted = self.runtime(cfg)
+                    status = restarted.heartbeat_payload(None)["cleanup"]["joined_quarantine"]
+                    self.assertEqual(status["proven_stage_count"], 0)
+                    self.assertEqual(status["unknown_alias_count"], 1)
+                    self.assertEqual(alias.read_bytes(), content)
+            alias.write_bytes(b"changed metadata")
+            _, _, status = pull.joined_quarantine_startup_status(cfg)
+            self.assertEqual(status["proven_stage_count"], 0)
+            self.assertEqual(status["unknown_alias_count"], 1)
 
     def test_torn_ledger_restart_then_alias_rename_crash_retains_mapping(self):
         class Crash(BaseException): pass

@@ -51,6 +51,29 @@ def plan_with_refusals(plan, total, ordinals):
 
 
 class DecisionTests(unittest.TestCase):
+    def test_17234_catalog_only_ranking_cache_is_rebuilt_for_reviewed_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = r.Runner(Path('.'), Path(tmp))
+            job.windows = {17234: WINDOWS[3]}
+            bucket = os.environ.get('R2_BUCKET', 'stoarama')
+            legacy = r.hashlib.sha256((r.POLICY_SHA + '\n' + bucket).encode()).hexdigest()
+            path = job.root / 'stream-summaries' / legacy / '17234' / 'summary.json'
+            path.parent.mkdir(parents=True)
+            summary = dict(policy_sha256=r.POLICY_SHA, bucket=bucket, streams=[17234],
+                           observed_at_epoch=r.time.time(), recoverable_files=50, recoverable_bytes=29585000000)
+            path.write_text(json.dumps(summary))
+
+            def prepare(argv, **kwargs):
+                self.assertIn('--summary-only', argv)
+                new_path = Path(argv[argv.index('--out')+1]) / 'summary.json'
+                new_path.parent.mkdir(parents=True, exist_ok=True)
+                new_path.write_text(json.dumps(dict(summary, recoverable_files=0, recoverable_bytes=0)))
+
+            with patch.object(r, 'command', side_effect=prepare) as call:
+                self.assertEqual(job.stream_order(), [17234])
+                self.assertEqual(call.call_count, 1)
+            self.assertEqual(json.loads(path.read_text())['recoverable_files'], 50)
+
     def test_stream_order_uses_cached_bytes_per_file_not_stream_id_or_total(self):
         with tempfile.TemporaryDirectory() as tmp:
             job = r.Runner(Path('.'), Path(tmp))

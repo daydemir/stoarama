@@ -794,7 +794,8 @@ class Runner:
 
     def stream_summary_path(self, sid):
         bucket = os.environ.get('R2_BUCKET', 'stoarama')
-        key = hashlib.sha256((POLICY_SHA + '\n' + bucket).encode()).hexdigest()
+        # Catalog-only density hints predate reviewed-folder/frozen-file filtering.
+        key = hashlib.sha256((POLICY_SHA + '\n' + bucket + '\nreviewed-frozen-v1').encode()).hexdigest()
         return self.root / 'stream-summaries' / key / str(sid) / 'summary.json'
 
     def stream_order(self):
