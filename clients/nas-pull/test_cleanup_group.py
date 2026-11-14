@@ -6,6 +6,7 @@ import datetime
 import hashlib
 import json
 import select
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -29,6 +30,9 @@ class CleanupGroupTests(unittest.TestCase):
         logger = mock.patch.object(pull, 'log', side_effect=lambda level, message: self.logs.append((level, message)))
         logger.start()
         self.addCleanup(logger.stop)
+        status = mock.patch.object(pull, 'CLEANUP_STATUS', pull.CleanupStatus())
+        status.start()
+        self.addCleanup(status.stop)
 
     def group(self, size=3):
         tasks = []
@@ -665,7 +669,9 @@ class CleanupGroupTests(unittest.TestCase):
         self.assertEqual(len(diagnostics.call_args.args[1]), 8)
         # All cap INSERTs have the same enclosing transaction.
         charge_positions = [n for n, sql in enumerate(statements) if sql.startswith('INSERT INTO cleanup_local_deletions')]
-        self.assertEqual(len(charge_positions), 8)
+        # SQLite's trace callback repeats the outer INSERT for trigger steps.
+        self.assertEqual(len({statements[n] for n in charge_positions}), 8)
+        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 8)
         self.assertFalse(any(sql == 'COMMIT' for sql in statements[charge_positions[0]:charge_positions[-1]]))
 
     def test_abort_releases_exact_unattempted_rows_including_unvisited_members(self):
@@ -723,6 +729,57 @@ class CleanupGroupTests(unittest.TestCase):
             self.run_group(tasks)
         outcomes = [json.loads(r[0]) for r in self.inventory.db.execute('SELECT body FROM cleanup_execution_outcomes')]
         self.assertTrue(all(r['refusal_reason']=='pre_unlink_failure' and not r['unlink_attempted'] for r in outcomes))
+        status, _, _ = pull.CLEANUP_STATUS.snapshot()
+        self.assertEqual(status['item_failures'], len(tasks))
+        self.assertEqual(status['last_item_failure_stage'], 'unlink')
+        self.assertNotIn('aborted_groups', status)
+
+    def test_abort_heartbeat_has_fixed_stage_reason_and_no_exception_contents(self):
+        tasks = self.group(1)
+        with mock.patch.object(pull, 'cleanup_reserve_group_caps', side_effect=TimeoutError('private credential sentinel')):
+            with self.assertRaises(TimeoutError):
+                self.run_group(tasks)
+        status, _, _ = pull.CLEANUP_STATUS.snapshot()
+        self.assertEqual(status['aborted_groups'], 1)
+        self.assertEqual((status['last_abort_stage'], status['last_abort_reason']), ('caps', 'transport_error'))
+        self.assertEqual(status['last_abort_files'], 1)
+        self.assertNotIn('private', json.dumps(status))
+
+    def test_production_ownership_failure_reports_one_abort_before_permits(self):
+        tasks = self.group(1)
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_GROUP_VERSION), \
+                mock.patch.object(pull, 'cleanup_lease_v2', return_value={'tasks': tasks}), \
+                mock.patch.object(pull, 'cleanup_journal_group', side_effect=sqlite3.OperationalError('private schema error')), \
+                mock.patch.object(pull, 'restore_api', side_effect=AssertionError('ownership failure cannot request permit')):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.cycle(tasks)
+        status, _, _ = pull.CLEANUP_STATUS.snapshot()
+        self.assertEqual(status['aborted_groups'], 1)
+        self.assertEqual((status['last_abort_stage'], status['last_abort_reason']), ('ownership', 'sqlite_error'))
+        self.assertFalse(self.inventory.cleanup_claims)
+        self.assertTrue((self.cfg.output_dir/tasks[0]['item']['relative_path']).exists())
+
+    def test_journal_updates_have_no_ddl_or_full_receipts_read_and_three_namespace_checks(self):
+        tasks = self.group(1)
+        statements = []
+        self.inventory.db.set_trace_callback(statements.append)
+        list_parent = pull.CleanupFile.list_parent
+        listings = []
+        def listing(current):
+            listings.append(current.item['relative_path'])
+            return list_parent(current)
+        with mock.patch.object(pull.CleanupFile, 'list_parent', listing):
+            self.run_group(tasks)
+        self.inventory.db.set_trace_callback(None)
+        self.assertEqual(len(listings), 3)  # before/after hash, after durable marker
+        self.assertFalse(any(sql.startswith(('CREATE ', 'PRAGMA table_info')) for sql in statements))
+        # Explicit replay/status reads are allowed; item journal writes don't
+        # themselves read every receipt. Exercise one outside the fixture API.
+        statements.clear()
+        self.inventory.db.set_trace_callback(statements.append)
+        pull.cleanup_journal(self.inventory, 999, 'result', {'test': True})
+        self.inventory.db.set_trace_callback(None)
+        self.assertFalse(any('SELECT item_id,phase,body FROM cleanup_receipts' in sql for sql in statements))
 
     def test_mismatched_result_ack_keeps_all_exact_results(self):
         tasks = self.group()
@@ -775,6 +832,8 @@ class CleanupGroupTests(unittest.TestCase):
             self.run_group(tasks)
         outcomes = [json.loads(r[0]) for r in self.inventory.db.execute('SELECT body FROM cleanup_execution_outcomes')]
         self.assertTrue(all(r['refusal_reason']=='deadline_exceeded' and r['refusal_protocol']==1 for r in outcomes))
+        status, _, _ = pull.CLEANUP_STATUS.snapshot()
+        self.assertEqual((status['last_item_failure_stage'], status['last_item_failure_reason']), ('unlink', 'deadline_exceeded'))
 
     def test_failed_refusal_checkpoint_cannot_certify_an_intent(self):
         tasks = self.group()

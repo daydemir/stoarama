@@ -174,6 +174,41 @@ batched diagnostics, durability ordering, and steady eight-file budget of 21
 SQLite commits / 45 fsyncs. Release with the existing NAS client release procedure;
 this change does not publish or deploy a client.
 
+### NAS client cleanup-batch-v6 throughput
+
+`cleanup-batch-v6` keeps v5's serial per-file permits, proof checks, delivery
+holds and durability ordering. A covering SQLite index and transactional rolling
+totals replace repeated full cap-ledger scans. Reads visit only rows crossing
+the strict `at_epoch > now - 86400` boundary; insert/update/delete triggers keep
+reservations and releases in the same transaction. History is retained so a
+backward wall-clock adjustment restores the exact original count. The first
+upgrade creates the index and totals once; later restarts reuse them.
+
+Receipt/quarantine schema initialization runs once at startup. Journal writes
+retain their per-item compare-and-swap checks without reading all receipts.
+Namespace enumeration remains before and after hashing and after the durable
+attempt marker immediately before unlink; the redundant pre-marker enumeration
+is removed. An eight-file steady group still uses 21 SQLite commits / 45 fsyncs.
+
+Heartbeat `cleanup` includes `aborted_groups`, `last_abort_stage`,
+`last_abort_reason`, `last_abort_at` and `last_abort_files`. Handled per-file
+refusals separately report `item_failures` and `last_item_failure_*`; they do
+not change receipt or continuation behavior. Reasons/stages are fixed labels,
+never raw exception contents. Counters are per client process and the last
+failure remains visible after later successes.
+
+Deploy v6 support, then stage and promote `NAS_VERSION=cleanup-batch-v6` through
+the existing release scripts only after natural drain, no enabled plan/batch,
+and confirmed master OFF. Verify the executing heartbeat version before restart.
+Do not pause an enabled issued plan to deploy or promote. V5 remains accepted.
+
+Grouped directory fsync and bulk permits are deferred to a separately reviewed
+v7. Grouping eight directory fsyncs into one would save 7 of 45 steady syncs
+(a theoretical 16% sync-bound time reduction, about 18% more files/minute).
+Bulk permits would save at most 7 observation round trips per eight files but
+would age later permits during earlier durability writes; no production speedup
+estimate is justified without measuring that latency and proving crash safety.
+
 The delivery migrations are `0189_delivery_keep_holds.sql` and
 `0190_delivery_r2_retirement_guards.sql`, following main's
 `0188_nas_cleanup_leased_index.sql`. Migration identities use full filenames.
