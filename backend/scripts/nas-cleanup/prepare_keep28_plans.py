@@ -111,7 +111,7 @@ def pg_env():
     env.update(PGHOST=url.hostname or '', PGPORT=str(url.port or 5432),
                PGUSER=urllib.parse.unquote(url.username or ''), PGPASSWORD=urllib.parse.unquote(url.password or ''),
                PGDATABASE=url.path.lstrip('/'), PGCONNECT_TIMEOUT='10',
-               PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=300000 -c timezone=UTC')
+               PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=300000 -c work_mem=16MB -c timezone=UTC')
     for k, v in urllib.parse.parse_qsl(url.query):
         if k in ('sslmode', 'connect_timeout'):
             env['PG' + k.upper()] = v
