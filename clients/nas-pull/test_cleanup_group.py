@@ -108,6 +108,51 @@ class CleanupGroupTests(unittest.TestCase):
             return pull.cleanup_batch_v2(self.cfg, self.inventory, threading.Event(), executor, None,
                                          task_limit=len(tasks))
 
+    def test_v7_polls_execution_while_dry_work_is_pending_without_queuing_more(self):
+        dry = dict(self.task, item_id=100)
+        execution = self.group(1)[0]
+        entered, release = threading.Event(), threading.Event()
+        calls, executed = [], []
+        def lease(cfg, limit, files, size, execution_only=False):
+            calls.append(execution_only)
+            if len(calls) == 1:
+                return dict(tasks=[dry])
+            self.assertTrue(entered.wait(2))
+            self.assertTrue(execution_only, 'queued more dry work instead of checking execution')
+            if len(calls) == 2:
+                return dict(tasks=[], retry_after_sec=120)
+            release.set()
+            return dict(tasks=[execution])
+        def dry_worker(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(5), 'empty lease stopped execution polling until dry-run drain')
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_BULK_VERSION), \
+             mock.patch.object(pull, 'cleanup_lease_v2', side_effect=lease), \
+             mock.patch.object(pull, 'cleanup_process_task', side_effect=dry_worker), \
+             mock.patch.object(pull, 'cleanup_process_group', side_effect=lambda *a, **kw: executed.append(a[3])), \
+             mock.patch.object(pull, 'CLEANUP_DRAIN_RETRY_SEC', .01), \
+             concurrent.futures.ThreadPoolExecutor(2) as executor:
+            try:
+                pull.cleanup_batch_v2(self.cfg, self.inventory, threading.Event(), executor, None, inflight=1, task_limit=2)
+            finally:
+                release.set()
+        self.assertEqual(calls, [False, True, True])
+        self.assertEqual(executed, [[execution]])
+
+    def test_v7_lease_bounds_dry_work_and_rejects_wrong_role(self):
+        bodies = []
+        def api(cfg, path, body):
+            bodies.append(body)
+            return dict(tasks=[dict(self.task)])
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_BULK_VERSION), \
+             mock.patch.object(pull, 'cleanup_api_retry', side_effect=api):
+            pull.cleanup_lease_v2(self.cfg, 1, 1, 100)
+            self.assertEqual(bodies[-1]['dry_run_limit'], 1)
+            with self.assertRaisesRegex(pull.CleanupResponseError, 'execution-only'):
+                pull.cleanup_lease_v2(self.cfg, 8, 8, 100, execution_only=True)
+            self.assertTrue(bodies[-1]['execution_only'])
+            self.assertEqual(bodies[-1]['dry_run_limit'], 2)
+
     def test_production_singleton_lease_drain_timeout_returns_before_expiry_then_retries(self):
         tasks = self.group(1)
         fence, clock = pull.NASMediaFence(), time.monotonic
