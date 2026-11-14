@@ -17,6 +17,7 @@ require (
 	github.com/stripe/stripe-go/v82 v82.5.1
 	github.com/yalue/onnxruntime_go v1.31.0
 	golang.org/x/image v0.43.0
+	golang.org/x/sync v0.21.0
 	modernc.org/sqlite v1.40.1
 )
 
@@ -47,7 +48,6 @@ require (
 	golang.org/x/crypto v0.37.0 // indirect
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
 	golang.org/x/oauth2 v0.27.0 // indirect
-	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.36.0 // indirect
 	golang.org/x/text v0.38.0 // indirect
 	golang.org/x/time v0.6.0 // indirect

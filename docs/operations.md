@@ -296,3 +296,20 @@ explicitly simulated 300 ms sync and 250 ms permit latency, medians were 15.824 
 Stage and promote only from reviewed merged source after natural drain, no
 enabled plan or batch, and confirmed master OFF. Keep R2 copying and stitching
 disabled unless separately authorized conditions are met.
+
+### Full R2 recovery reads
+
+Full-object recovery downloads share one process-wide weighted limit across
+HTTP requests. Each 64 MiB (rounded up) consumes one of 16 units; objects over
+1 GiB run alone. Conditional HEAD verification and MD5/ETag matches bypass this
+full-read limit, so already verified execution does not queue behind audits.
+The weights bound read pressure; they are not a measured bandwidth optimum.
+
+Each full read has a 35-second child deadline inside the existing 40-second
+prefetch budget and 60-second HTTP write limit. An execution request still has
+its original 15-second deadline, including any capacity wait. Cancellation and
+incomplete reads yield no verification verdict. Exact ETag/version, byte count
+and SHA checks, retained completed results, and all deletion gates are unchanged.
+This addresses repeated large-object retries without storing media or introducing
+an asynchronous verifier. Validate production progress after a natural batch gap;
+controlled contention tests do not establish production throughput.
