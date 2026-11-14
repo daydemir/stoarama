@@ -19997,16 +19997,8 @@ def valid_joined_item(raw):
     batch_id = raw.get("batch_id")
     if not isinstance(batch_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", batch_id):
         raise ValueError("joined item has invalid batch_id")
-    relative_raw = raw.get("relative_path")
-    if not isinstance(relative_raw, str):
-        raise ValueError("joined item has invalid relative_path")
+    relative_raw = valid_joined_relative_path(raw.get("relative_path"))
     relative = Path(relative_raw)
-    if (
-        not relative_raw or relative.is_absolute() or relative_raw != relative.as_posix()
-        or "\\" in relative_raw or any(part in ("", ".", "..") for part in relative.parts)
-        or relative.parts[0] == JOINED_ROOT
-    ):
-        raise ValueError("joined item has invalid relative_path")
     sha256 = valid_sha256(raw.get("sha256"), "joined item")
     kind = raw.get("kind")
     content_type = raw.get("content_type")
@@ -20102,7 +20094,7 @@ def valid_joined_relative_path(value, suffix=None):
     raw = value
     relative = Path(raw)
     if (
-        not raw or relative.is_absolute() or raw != relative.as_posix() or "\\" in raw
+        not relative.parts or relative.is_absolute() or raw != relative.as_posix() or "\\" in raw
         or any(part in ("", ".", "..") for part in relative.parts) or relative.parts[0] == JOINED_ROOT
         or (suffix is not None and not raw.endswith(suffix))
     ):

@@ -1788,7 +1788,7 @@ class JoinedDownloadTests(unittest.TestCase):
             self.assertEqual(status["unknown_alias_count"], 0)
             self.assertEqual(status["stage_evidence"][0]["sha256"], hashlib.sha256(expected).hexdigest())
             self.assertEqual(before, self.entry_snapshot(alias))
-            for value in (None, "foreign marker", 17, True, []):
+            for value in (None, "foreign marker", 17, True, [], dict(json.loads(expected), relative_path=".")):
                 with self.subTest(value=value):
                     content = json.dumps(value).encode().ljust(len(expected), b" ")
                     alias.write_bytes(content)
