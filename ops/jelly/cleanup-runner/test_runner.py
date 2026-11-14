@@ -477,7 +477,7 @@ class LoopTests(unittest.TestCase):
             with self.assertRaisesRegex(r.Halt, 'outside pinned policy'):
                 job.run()
 
-    def test_summary_timeout_defers_stream_ranking(self):
+    def test_only_explicit_read_failure_defers_stream_ranking(self):
         with tempfile.TemporaryDirectory() as root:
             job = r.Runner(Path(__file__).resolve().parents[3], Path(root))
             job.windows = {3: WINDOWS[3], 4: WINDOWS[3]}
@@ -485,9 +485,13 @@ class LoopTests(unittest.TestCase):
             path.parent.mkdir(parents=True)
             path.write_text(json.dumps(dict(policy_sha256=r.POLICY_SHA, bucket=os.environ.get('R2_BUCKET', 'stoarama'),
                 streams=[4], observed_at_epoch=r.time.time(), recoverable_files=1, recoverable_bytes=10)))
-            with patch.object(r, 'command', side_effect=r.CommandFailed(None)):
+            with patch.object(r, 'command', side_effect=r.CommandFailed(4)):
                 self.assertEqual(job.stream_order(), [4])
             self.assertEqual(list(job.status['deferred_streams']), ['3'])
+            job.status['deferred_streams'] = {}
+            with patch.object(r, 'command', side_effect=r.CommandFailed(None)):
+                with self.assertRaisesRegex(r.Halt, 'local command failed'):
+                    job.stream_order()  # A runner-side timeout cannot prove what the preparer saw.
 
     def test_run_waits_for_deferred_streams_with_master_off(self):
         with tempfile.TemporaryDirectory() as root:

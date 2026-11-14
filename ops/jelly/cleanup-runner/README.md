@@ -56,12 +56,14 @@ The runner:
   for one stream, at most one <=100 GB plan. Unique `k28auto-YYYYMMDD-HHMMSS`
   prefixes avoid immutable-label reuse. Admission rejection is a failed check
   and stops. A slow read cannot idle the other streams: the preparer exits 4
-  when a read-only catalogue or reviewed-scope read failed or timed out before
-  any submission (nothing admitted). Exit 4, or a summary-only timeout, defers
-  that stream for an hour (`deferred_streams`) and the next stream proceeds.
-  With work deferred, the runner waits with master OFF and never reports
-  completion. Any other preparer failure, including a timeout during
-  submission (an ambiguous admission), still stops.
+  only when a read-only catalogue read hit a transient SQLSTATE (timeout,
+  connection, serialization) or a reviewed-scope object was unreachable, before
+  any submission (nothing admitted). Exit 4 defers that stream for an hour
+  (`deferred_streams`) and the next stream proceeds; the sixth consecutive
+  deferral of one stream stops. With work deferred, the runner waits with
+  master OFF and never reports completion. Any other failure (integrity or
+  size-bound mismatch, other SQL errors, a runner-side timeout, a lost
+  admission response) still stops.
   Streams rank by R2-present candidate bytes per file, descending (stream ID
   breaks ties). The preparer's read-only `--summary-only --stream ID` mode
   supplies one stream at a time, retaining its indexed scope and 300-second SQL

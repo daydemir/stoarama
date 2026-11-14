@@ -424,17 +424,17 @@ class Runner:
             self.prepare = module
         return self.prepare
 
-    def prepare_stream(self, sid, args, submit):
+    def prepare_stream(self, sid, args):
         """Run the preparer for one stream. False means a read failed before any
         submission, so nothing was admitted and the stream is deferred. Every
-        other failure, including admission rejection or an ambiguous submission
-        timeout, stops the runner."""
+        other failure, including admission rejection or a runner-side timeout,
+        stops the runner."""
         try:
             command([sys.executable, str(self.repo / PREPARER), '--stream', str(sid),
                      '--scope-cache', str(self.root / 'reviewed-scope-cache'), *args],
                     env=os.environ.copy(), timeout=PREPARE_TIMEOUT_SEC)
         except CommandFailed as exc:
-            if exc.returncode == self.preparer().EXIT_READ_FAILED or (exc.returncode is None and not submit):
+            if exc.returncode == self.preparer().EXIT_READ_FAILED:
                 self.step_failed('stream preparation deferred', reason='stream ' + str(sid))
                 deferred = dict(self.status.get('deferred_streams') or {})
                 failures = deferred.get(str(sid), {'failures': 0})['failures'] + 1
@@ -870,7 +870,7 @@ class Runner:
             path = self.stream_summary_path(sid)
             summary = json.loads(path.read_text()) if path.exists() else None
             if summary is None or not 0 <= time.time() - summary['observed_at_epoch'] < STREAM_SUMMARY_TTL_SEC:
-                if not self.prepare_stream(sid, ['--summary-only', '--out', str(path.parent)], submit=False):
+                if not self.prepare_stream(sid, ['--summary-only', '--out', str(path.parent)]):
                     continue
                 summary = json.loads(path.read_text())
             files, size = summary['recoverable_files'], summary['recoverable_bytes']
@@ -900,7 +900,7 @@ class Runner:
             out = self.root / 'plans' / (prefix + '-s' + str(sid))
             if not self.prepare_stream(sid, ['--max-bytes', str(PLAN_CAP), '--max-plans', '1',
                     '--label-prefix', prefix, '--out', str(out), '--api', API, '--submit',
-                    '--atomic-admission'], submit=True):
+                    '--atomic-admission']):
                 continue
             summary = json.loads((out / 'summary.json').read_text())
             # Reservations changed eligibility; rank the remainder freshly on
