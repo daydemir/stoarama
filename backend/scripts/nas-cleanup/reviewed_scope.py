@@ -116,9 +116,13 @@ def admissible_candidates(rows, cache=None):
                 or not 0 < ref['bytes'] <= 131072 or not 0 < ref['entries'] <= 20000):
             raise RuntimeError('invalid reviewed cleanup shard reference')
     with concurrent.futures.ThreadPoolExecutor(max_workers=SHARD_FETCH_WORKERS) as pool:
-        # Compressed shards are <=128 KiB each; decompress one at a time below.
-        fetched = dict(zip((ref['sha256'] for ref in refs),
-                           pool.map(lambda ref: fetch_pinned(ref['key'], ref['sha256'], ref['bytes'], cache), refs)))
+        futures = [pool.submit(fetch_pinned, ref['key'], ref['sha256'], ref['bytes'], cache) for ref in refs]
+    # Every fetch has finished. An integrity failure anywhere outranks a transient one.
+    errors = [f.exception() for f in futures if f.exception() is not None]
+    if errors:
+        raise next((e for e in errors if not isinstance(e, ReadFailed)), errors[0])
+    # Compressed shards are <=128 KiB each; decompress one at a time below.
+    fetched = {ref['sha256']: f.result() for ref, f in zip(refs, futures)}
     accepted = set()
     for parent, candidates in groups.items():
         metadata = index['parents'][parent]

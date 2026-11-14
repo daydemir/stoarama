@@ -425,7 +425,7 @@ class LoopTests(unittest.TestCase):
         for bad in ([3], {'x': {'retry_after': 1, 'failures': 1}}, {'3': 1.0},
                     {'3': {'retry_after': float('nan'), 'failures': 1}},
                     {'3': {'retry_after': float('inf'), 'failures': 1}},
-                    {'3': {'retry_after': 1, 'failures': r.MAX_STREAM_DEFERRALS + 1}}):
+                    {'3': {'retry_after': 1, 'failures': r.MAX_STREAM_DEFERRALS}}):
             with tempfile.TemporaryDirectory() as root:
                 (Path(root) / 'status.json').write_text(json.dumps(
                     {'current_plan': None, 'last_error': None, 'deferred_streams': bad}))
@@ -463,7 +463,7 @@ class LoopTests(unittest.TestCase):
     def test_persistent_read_failure_goes_to_the_owner(self):
         with tempfile.TemporaryDirectory() as root:
             job = self.isolation_job(root, [3])
-            job.status['deferred_streams'] = {'3': {'retry_after': 0, 'failures': r.MAX_STREAM_DEFERRALS}}
+            job.status['deferred_streams'] = {'3': {'retry_after': 0, 'failures': r.MAX_STREAM_DEFERRALS - 1}}
             with patch.object(r, 'command', side_effect=self.preparer_exits({'3': 4})):
                 with self.assertRaisesRegex(r.Halt, 'keeps failing'):
                     r.Runner.pick(job)

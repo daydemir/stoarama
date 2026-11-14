@@ -303,7 +303,7 @@ PREPARER = 'backend/scripts/nas-cleanup/prepare_keep28_plans.py'
 # A stream whose read-only preparation failed is retried after this delay while
 # other streams continue. Admission rejection remains a failed check and stops.
 STREAM_RETRY_SEC = 3600
-MAX_STREAM_DEFERRALS = 6  # Consecutive failures; a persistent cause goes to the owner.
+MAX_STREAM_DEFERRALS = 6  # The sixth consecutive failure of one stream goes to the owner.
 COMMAND_FAILURE_LOG = Path.home() / 'stoarama-cleanup-runner' / 'command-failures.log'
 
 
@@ -378,7 +378,7 @@ class Runner:
                     and isinstance(status.get('deferred_streams', {}), dict)
                     and all(re.fullmatch('[1-9][0-9]*', k) and isinstance(v, dict) and set(v) == {'retry_after', 'failures'}
                             and type(v['retry_after']) in (int, float) and math.isfinite(v['retry_after'])
-                            and type(v['failures']) is int and 1 <= v['failures'] <= MAX_STREAM_DEFERRALS
+                            and type(v['failures']) is int and 1 <= v['failures'] < MAX_STREAM_DEFERRALS
                             for k, v in status.get('deferred_streams', {}).items()),
                     'invalid ownership state')
         except Exception:
@@ -438,7 +438,7 @@ class Runner:
                 self.step_failed('stream preparation deferred', reason='stream ' + str(sid))
                 deferred = dict(self.status.get('deferred_streams') or {})
                 failures = deferred.get(str(sid), {'failures': 0})['failures'] + 1
-                require(failures <= MAX_STREAM_DEFERRALS, 'stream preparation keeps failing; owner review required')
+                require(failures < MAX_STREAM_DEFERRALS, 'stream preparation keeps failing; owner review required')
                 deferred[str(sid)] = {'retry_after': time.time() + STREAM_RETRY_SEC, 'failures': failures}
                 self.save(self.status.get('phase', 'dry_run'), deferred_streams=deferred)
                 return False
