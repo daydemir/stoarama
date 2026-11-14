@@ -474,14 +474,9 @@ class Runner:
                 raise Halt(step + ': psql unavailable') from None
             if proc.returncode:
                 # Never emit SQL, connection strings, stderr, or exception text.
-                err = proc.stderr.decode(errors='replace')
-                code = re.search(r'(?:ERROR|FATAL):\s+([0-9A-Z]{5})\b', err)
-                code = code[1] if code else None
-                if code == '57014':
-                    raise ReadFailure('statement timeout')
-                if (code and (code.startswith('08') or code in {'53300', '57P01', '57P02', '57P03', '40001', '40P01', '55P03'})
-                        or not code and any(x in err for x in ('connection to server', 'server closed the connection', 'SSL SYSCALL'))):
-                    raise ReadFailure('database connection or transaction unavailable')
+                reason = self.prepare.transient_sql_failure(proc.stderr.decode(errors='replace'))
+                if reason:
+                    raise ReadFailure(reason)
                 raise Halt(step + ': database query rejected')
             try:
                 return json.loads(proc.stdout)

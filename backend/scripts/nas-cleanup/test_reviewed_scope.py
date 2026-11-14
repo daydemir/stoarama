@@ -52,6 +52,24 @@ class ReviewedScopeTests(unittest.TestCase):
                     scope.admissible_candidates(rows)
             self.assertNotIsInstance(caught.exception, scope.ReadFailed)
 
+    def test_fatal_shard_fetch_stops_without_waiting_for_the_rest(self):
+        import threading
+        rows = [dict(kind='raw', source_id=n, stream_id=3, path='p%d/%d.mp4' % (n, n), size_bytes=10, sha256='a'*64) for n in range(1, 41)]
+        refs = {'p%d' % n: dict(owner_stream_id=3, entries=1, shards=[dict(
+            key=scope.PREFIX + '%064x' % n + '/files.json.gz', sha256='%064x' % n, bytes=100, entries=1)]) for n in range(1, 41)}
+        release, started = threading.Event(), []
+        def fetch(key, sha, *a):
+            started.append(sha)
+            if int(sha, 16) == 1:
+                raise RuntimeError('reviewed cleanup metadata fetch refused')
+            release.wait(5)
+            return b''
+        with patch.object(scope, 'load_scope', return_value={'parents': refs}), patch.object(scope, 'fetch_pinned', side_effect=fetch):
+            with self.assertRaisesRegex(RuntimeError, 'refused'):
+                threading.Timer(1, release.set).start()
+                scope.admissible_candidates(rows)
+        self.assertLess(len(started), 40, 'queued fetches ran after a fatal failure')
+
     def test_selection_requires_frozen_size_single_link_and_raw_sidecar(self):
         rows = [dict(kind='raw', source_id=n, stream_id=3, path='reviewed/%d.mp4' % n,
                      size_bytes=10, sha256='a'*64) for n in range(1, 5)]

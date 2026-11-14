@@ -48,10 +48,15 @@ class Keep28PlanTests(unittest.TestCase):
         with patch('subprocess.run', side_effect=k.subprocess.TimeoutExpired('psql', 330)), patch.object(k, 'pg_env', return_value={}):
             with self.assertRaises(k.ReadFailed):
                 k.query('SELECT 1', 'psql')
-        failed = k.subprocess.CompletedProcess([], 1, b'', b'ERROR:  canceling statement due to statement timeout')
+        failed = k.subprocess.CompletedProcess([], 1, b'', b'ERROR:  57014: canceling statement due to statement timeout')
         with patch('subprocess.run', return_value=failed), patch.object(k, 'pg_env', return_value={}):
             with self.assertRaises(k.ReadFailed):
                 k.query('SELECT 1', 'psql')
+        corrupt = k.subprocess.CompletedProcess([], 1, b'', b'ERROR:  XX001: invalid page in block 7 of relation base/1/2')
+        with patch('subprocess.run', return_value=corrupt), patch.object(k, 'pg_env', return_value={}):
+            with self.assertRaisesRegex(RuntimeError, 'query failed') as caught:
+                k.query('SELECT 1', 'psql')
+        self.assertNotIsInstance(caught.exception, k.ReadFailed)
 
     def test_preparer_requires_current_delivery_hold_check(self):
         with patch.object(k, 'query', return_value=[]) as query:

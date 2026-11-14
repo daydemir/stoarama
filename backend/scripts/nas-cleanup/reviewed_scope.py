@@ -115,14 +115,21 @@ def admissible_candidates(rows, cache=None):
         if (not re.fullmatch('[0-9a-f]{64}', ref['sha256']) or ref['key'] != PREFIX + ref['sha256'] + '/files.json.gz'
                 or not 0 < ref['bytes'] <= 131072 or not 0 < ref['entries'] <= 20000):
             raise RuntimeError('invalid reviewed cleanup shard reference')
-    with concurrent.futures.ThreadPoolExecutor(max_workers=SHARD_FETCH_WORKERS) as pool:
-        futures = [pool.submit(fetch_pinned, ref['key'], ref['sha256'], ref['bytes'], cache) for ref in refs]
-    # Every fetch has finished. An integrity failure anywhere outranks a transient one.
-    errors = [f.exception() for f in futures if f.exception() is not None]
-    if errors:
-        raise next((e for e in errors if not isinstance(e, ReadFailed)), errors[0])
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=SHARD_FETCH_WORKERS)
+    try:
+        futures = {pool.submit(fetch_pinned, ref['key'], ref['sha256'], ref['bytes'], cache): ref for ref in refs}
+        transient = None
+        for future in concurrent.futures.as_completed(futures):
+            error = future.exception()
+            if error is not None and not isinstance(error, ReadFailed):
+                raise error  # An integrity failure stops at once and outranks any transient one.
+            transient = transient or error
+        if transient is not None:
+            raise transient
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
     # Compressed shards are <=128 KiB each; decompress one at a time below.
-    fetched = {ref['sha256']: f.result() for ref, f in zip(refs, futures)}
+    fetched = {ref['sha256']: future.result() for future, ref in futures.items()}
     accepted = set()
     for parent, candidates in groups.items():
         metadata = index['parents'][parent]

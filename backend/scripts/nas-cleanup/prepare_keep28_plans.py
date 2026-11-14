@@ -124,14 +124,28 @@ def pg_env():
     return env
 
 
+def transient_sql_failure(stderr):
+    """Fixed reason when psql stderr (VERBOSITY sqlstate or verbose) shows a
+    retryable read failure; None for any other failure, which must stop."""
+    code = re.search(r'(?:ERROR|FATAL):\s+([0-9A-Z]{5})\b', stderr)
+    code = code[1] if code else None
+    if code == '57014':
+        return 'statement timeout'
+    if (code and (code.startswith('08') or code in {'53300', '57P01', '57P02', '57P03', '40001', '40P01', '55P03'})
+            or not code and any(x in stderr for x in ('connection to server', 'server closed the connection', 'SSL SYSCALL'))):
+        return 'database connection or transaction unavailable'
+    return None
+
+
 def query(sql, psql):
     try:
-        p = subprocess.run([psql, '-XqAt', '-v', 'ON_ERROR_STOP=1'], input=('BEGIN READ ONLY;' + sql + ';ROLLBACK;').encode(),
+        p = subprocess.run([psql, '-XqAt', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=verbose'], input=('BEGIN READ ONLY;' + sql + ';ROLLBACK;').encode(),
                            env=pg_env(), capture_output=True, timeout=330)
     except subprocess.TimeoutExpired:
         raise ReadFailed('read-only catalogue query timed out') from None
     if p.returncode:
-        raise ReadFailed('read-only catalogue query failed: ' + p.stderr.decode()[:400])
+        error = p.stderr.decode(errors='replace')
+        raise (ReadFailed if transient_sql_failure(error) else RuntimeError)('read-only catalogue query failed: ' + error[:400])
     return json.loads(p.stdout)
 
 

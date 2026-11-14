@@ -18,6 +18,7 @@ spec = importlib.util.spec_from_file_location('runner', Path(__file__).with_name
 r = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(r)
 NOW = r.timestamp('2026-11-11T12:00:00+00:00')
+PREPARER = r.Runner(Path(__file__).resolve().parents[3], Path('.')).preparer()
 WINDOWS = {3: (r.timestamp('2026-09-01T00:00:00+00:00'), r.timestamp('2026-09-29T00:00:00+00:00'))}
 
 
@@ -1572,7 +1573,8 @@ class EmailTests(unittest.TestCase):
 class ReadRetryTests(unittest.TestCase):
     def job(self, root):
         job = r.Runner(Path('.'), Path(root))
-        job.prepare = SimpleNamespace(pg_env=lambda: {'PGOPTIONS': '-c default_transaction_read_only=on'})
+        job.prepare = SimpleNamespace(pg_env=lambda: {'PGOPTIONS': '-c default_transaction_read_only=on'},
+                                      transient_sql_failure=PREPARER.transient_sql_failure)
         return job
 
     def test_plan_report_get_retries_without_latching(self):
