@@ -37,8 +37,9 @@ import urllib.parse
 import urllib.request
 import uuid
 import zlib
-from enum import Enum
+from enum import Enum, IntEnum
 from pathlib import Path
+from typing import NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 CLIENT_VERSION = "development"
@@ -651,6 +652,12 @@ def read_json(path, default):
         raise RuntimeError("invalid state file %s: %s" % (path, exc)) from exc
 
 
+class NASStitchMode(IntEnum):
+    DISABLED = 0
+    NATIVE = 1
+    READBACK = 2
+
+
 class StitchSwitches:
     """Heartbeat authority; an OFF latches cancellation for the current job."""
     def __init__(self):
@@ -659,7 +666,7 @@ class StitchSwitches:
         cancel = threading.Event()
         cancel.set()
         self.state = (False, False, cancel)
-        self.proof = (0, threading.Event())
+        self.proof = (NASStitchMode.DISABLED, threading.Event())
         self.proof[1].set()
 
     def apply(self, response):
@@ -673,14 +680,17 @@ class StitchSwitches:
             # A later ON may start a new job, but cannot revive a cancelled one.
             cancel = threading.Event()
         self.state = (enabled, deletion, cancel)
-        selector = response.get("stitch_proof_task_id") if valid else 0
-        selector = 1 if type(selector) is int and selector == 1 and not enabled and self.local_enabled else 0
+        raw = response.get("stitch_proof_task_id", 0) if valid else 0
+        invalid = type(raw) is not int or raw not in tuple(NASStitchMode)
+        selector = NASStitchMode.DISABLED if invalid or enabled or not self.local_enabled else NASStitchMode(raw)
         proof_cancel = self.proof[1]
-        if not selector:
+        if selector != self.proof[0] or selector is NASStitchMode.DISABLED:
             proof_cancel.set()
-        elif proof_cancel.is_set():
+        if selector is not NASStitchMode.DISABLED and proof_cancel.is_set():
             proof_cancel = threading.Event()
         self.proof = (selector, proof_cancel)
+        if invalid:
+            raise ValueError("unsupported NAS stitching mode")
 
 
 class Config:
@@ -690,7 +700,11 @@ class Config:
 
     @property
     def stitch_proof_enabled(self):
-        return self.stitch_switches.proof[0] == 1
+        return self.stitch_switches.proof[0] is NASStitchMode.NATIVE
+
+    @property
+    def stitch_readback_enabled(self):
+        return self.stitch_switches.proof[0] is NASStitchMode.READBACK
 
     @property
     def stitch_delete_enabled(self):
@@ -47066,7 +47080,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise OSError('redirect refused')
 try:
     p=json.load(sys.stdin)
-    request=urllib.request.Request(p['url'],method='GET',headers=p['headers'])
+    request=urllib.request.Request(p['url'],method=p['method'],headers=p['headers'],
+        data=p['body'].encode('utf-8') if p['method']=='POST' else None)
     try:response=urllib.request.build_opener(NoRedirect()).open(request,timeout=p['timeout'])
     except urllib.error.HTTPError as error:
         print(json.dumps({'status':error.code}),flush=True)
@@ -47095,16 +47110,35 @@ def stitch_proof_remaining(stop, deadline):
 
 @contextmanager
 def stitch_proof_http(cfg, request, stop, limit, timeout):
-    # Reserve kill/reap time inside the immutable original task deadline.
+    if request.get_method() != "GET" or request.data is not None:
+        raise StitchHold("proof HTTP requires a bounded HTTPS GET")
+    with stitch_bounded_http(cfg, request, stop, limit, timeout) as response:
+        yield response
+
+
+@contextmanager
+def stitch_bounded_http(cfg, request, stop, limit, timeout):
+    # Reserve kill/reap time inside the immutable original caller deadline.
     deadline = min(stop.deadline - STITCH_PROOF_HTTP_REAP_SEC, time.monotonic() + timeout)
     remaining = stitch_proof_remaining(stop, deadline)
     url = urllib.parse.urlsplit(request.full_url)
-    if (request.get_method() != "GET" or request.data is not None or url.scheme != "https"
-            or not url.hostname or url.username or url.password or url.fragment):
-        raise StitchHold("proof HTTP requires a bounded HTTPS GET")
+    method = request.get_method()
+    if (method not in ("GET", "POST") or url.scheme != "https"
+            or not url.hostname or url.username or url.password or url.fragment
+            or type(limit) is not int or not 0 < limit <= 256*1024*1024):
+        raise StitchHold("bounded HTTP request refused")
+    body = None
+    if method == "POST":
+        if (request.full_url != cfg.api_base+"/account/connections/client-logs"
+                or type(request.data) is not bytes or not 0 < len(request.data) <= 128*1024
+                or limit > 4096):
+            raise StitchHold("bounded metadata POST refused")
+        body = request.data.decode("utf-8")
+    elif request.data is not None:
+        raise StitchHold("bounded GET body refused")
     message = cleanup_json_bytes(dict(url=request.full_url, headers=dict(request.header_items()),
-                                     timeout=remaining, limit=limit))
-    if len(message) > 32768:
+        timeout=remaining, limit=limit, method=method, body=body))
+    if len(message) > (256*1024 if method == "POST" else 32768):
         raise StitchHold("proof HTTP request exceeds bound")
     inventory_scratch_backing(cfg.state_dir)
     with tempfile.TemporaryFile(dir=cfg.state_dir) as output:
@@ -48711,6 +48745,717 @@ def stitch_proof_once(cfg, inventory, stop_event):
             stitch_build(cfg,inventory,task,stop_event,tools,kind=StitchRunKind.PROOF,proof_stop=stop)
     return 1
 
+
+STITCH_READBACK_SCHEMA_SHA = "fa8cf483844243ce9ffab54abc81d98ce094ab99b2642152b3c7767513123ab6"
+STITCH_READBACK_SCHEMA_JSON = '{\n  "$schema": "https://json-schema.org/draft/2020-12/schema",\n  "$id": "stoarama.nas-stitch-attestation.v2",\n  "title": "PROPOSED dual-profile NAS attestation with separate provider binding; no accepted profile/pair",\n  "type": "object",\n  "additionalProperties": false,\n  "required": [\n    "schema",\n    "synthetic",\n    "payload",\n    "independent_review"\n  ],\n  "properties": {\n    "schema": {\n      "const": "stoarama.nas-stitch-attestation.v2"\n    },\n    "synthetic": {\n      "const": false\n    },\n    "payload": {\n      "allOf": [\n        {\n          "$ref": "#/$defs/file"\n        },\n        {\n          "properties": {\n            "size_bytes": {\n              "maximum": 1048576\n            }\n          }\n        }\n      ]\n    },\n    "independent_review": {\n      "allOf": [\n        {\n          "$ref": "#/$defs/file"\n        },\n        {\n          "properties": {\n            "size_bytes": {\n              "maximum": 1048576\n            }\n          }\n        }\n      ]\n    }\n  },\n  "$defs": {\n    "file": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "file",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "file": {\n          "type": "string",\n          "maxLength": 2048,\n          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*$"\n        },\n        "sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "size_bytes": {\n          "type": "integer",\n          "minimum": 1,\n          "maximum": 16777216\n        }\n      }\n    },\n    "media": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "relative_path",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "relative_path": {\n          "type": "string",\n          "minLength": 1,\n          "maxLength": 2048\n        },\n        "sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "size_bytes": {\n          "type": "integer",\n          "minimum": 1\n        }\n      }\n    },\n    "input": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "clip_id",\n        "relative_path",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "clip_id": {\n          "type": "integer",\n          "minimum": 1\n        },\n        "relative_path": {\n          "type": "string",\n          "minLength": 1,\n          "maxLength": 2048\n        },\n        "sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "size_bytes": {\n          "type": "integer",\n          "minimum": 1\n        }\n      }\n    },\n    "output": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "relative_path",\n        "sha256",\n        "size_bytes",\n        "source_clip_ids",\n        "readback_sha256"\n      ],\n      "properties": {\n        "relative_path": {\n          "type": "string",\n          "minLength": 1,\n          "maxLength": 2048\n        },\n        "sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "size_bytes": {\n          "type": "integer",\n          "minimum": 1\n        },\n        "source_clip_ids": {\n          "const": [\n            373218,\n            373262\n          ]\n        },\n        "readback_sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        }\n      }\n    },\n    "policy": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "name",\n        "revision",\n        "keep28_sha256",\n        "corpus_sha256",\n        "package_manifest_sha256"\n      ],\n      "properties": {\n        "name": {\n          "const": "v85r"\n        },\n        "revision": {\n          "const": "v85r-rebuilt-1"\n        },\n        "keep28_sha256": {\n          "const": "060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811"\n        },\n        "corpus_sha256": {\n          "const": "5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b"\n        },\n        "package_manifest_sha256": {\n          "const": "337c606985e930abf1df459cbbda0c674f13bd9d92e11013131e2b2348e78a06"\n        }\n      }\n    },\n    "tool": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "version",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "version": {\n          "const": "N-126826-gc0e8b139fd-20260924"\n        },\n        "sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "size_bytes": {\n          "type": "integer",\n          "minimum": 1\n        }\n      }\n    },\n    "run": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "id",\n        "client_boot_id",\n        "host",\n        "started_at",\n        "completed_at",\n        "media_seconds",\n        "build_wall_seconds"\n      ],\n      "properties": {\n        "id": {\n          "type": "string",\n          "format": "uuid"\n        },\n        "client_boot_id": {\n          "type": "string",\n          "format": "uuid"\n        },\n        "host": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "connection_id",\n            "system",\n            "machine",\n            "cpu_model",\n            "cpu_count"\n          ],\n          "properties": {\n            "connection_id": {\n              "const": 13\n            },\n            "system": {\n              "const": "Linux"\n            },\n            "machine": {\n              "const": "x86_64"\n            },\n            "cpu_model": {\n              "type": "string",\n              "minLength": 1,\n              "maxLength": 2048\n            },\n            "cpu_count": {\n              "type": "integer",\n              "minimum": 1\n            }\n          }\n        },\n        "started_at": {\n          "type": "string",\n          "format": "date-time",\n          "pattern": "^\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}(?:\\\\.\\\\d+)?Z$"\n        },\n        "completed_at": {\n          "type": "string",\n          "format": "date-time",\n          "pattern": "^\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}(?:\\\\.\\\\d+)?Z$"\n        },\n        "media_seconds": {\n          "type": "number",\n          "exclusiveMinimum": 0\n        },\n        "build_wall_seconds": {\n          "type": "number",\n          "exclusiveMinimum": 0\n        }\n      }\n    },\n    "ffmpeg": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "version",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "version": {\n          "const": "N-126826-gc0e8b139fd-20260924"\n        },\n        "sha256": {\n          "const": "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b"\n        },\n        "size_bytes": {\n          "const": 174165384\n        }\n      }\n    },\n    "ffprobe": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "version",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "version": {\n          "const": "N-126826-gc0e8b139fd-20260924"\n        },\n        "sha256": {\n          "const": "9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c"\n        },\n        "size_bytes": {\n          "const": 173923656\n        }\n      }\n    },\n    "scope": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "stream_id",\n        "recording_id",\n        "source_task_id",\n        "source_plan_sha256",\n        "proof_plan_sha256",\n        "clip_ids"\n      ],\n      "properties": {\n        "stream_id": {\n          "const": 17208\n        },\n        "recording_id": {\n          "const": 444\n        },\n        "source_task_id": {\n          "const": 1\n        },\n        "source_plan_sha256": {\n          "const": "0dfa6b172f33bd55e409729ecd517d492cdee03427b028ac226788e530a72726"\n        },\n        "proof_plan_sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "clip_ids": {\n          "const": [\n            373218,\n            373262\n          ]\n        }\n      }\n    },\n    "tools": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "ffmpeg",\n        "ffprobe"\n      ],\n      "properties": {\n        "ffmpeg": {\n          "$ref": "#/$defs/ffmpeg"\n        },\n        "ffprobe": {\n          "$ref": "#/$defs/ffprobe"\n        }\n      }\n    },\n    "host": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "connection_id",\n        "system",\n        "machine",\n        "cpu_model",\n        "cpu_count"\n      ],\n      "properties": {\n        "connection_id": {\n          "const": 13\n        },\n        "system": {\n          "const": "Linux"\n        },\n        "machine": {\n          "const": "x86_64"\n        },\n        "cpu_model": {\n          "type": "string",\n          "minLength": 1,\n          "maxLength": 2048\n        },\n        "cpu_count": {\n          "type": "integer",\n          "minimum": 1\n        }\n      }\n    },\n    "utc": {\n      "type": "string",\n      "format": "date-time",\n      "pattern": "^\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}(?:\\\\.\\\\d+)?Z$"\n    },\n    "sha256": {\n      "type": "string",\n      "pattern": "^[a-f0-9]{64}$"\n    },\n    "commit": {\n      "type": "string",\n      "pattern": "^[a-f0-9]{40}$"\n    },\n    "uuid": {\n      "type": "string",\n      "format": "uuid"\n    },\n    "producer_profile": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "profile_id",\n        "repository",\n        "base_commit_sha",\n        "reviewed_head_sha",\n        "merged_commit_sha",\n        "source_sha256",\n        "client_version",\n        "client_artifact",\n        "contracts",\n        "native_kind",\n        "native_schema_id",\n        "package_manifest",\n        "policy",\n        "tools"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-producer-profile.v1"\n        },\n        "profile_id": {\n          "enum": [\n            "nas-v2-5009-337c",\n            "nas-combined-v3-337c"\n          ]\n        },\n        "repository": {\n          "const": "daydemir/stoarama"\n        },\n        "base_commit_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "reviewed_head_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "merged_commit_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "source_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "client_version": {\n          "enum": [\n            "v85r-nas-proof-v2",\n            "r2-copy-v3",\n            "cleanup-batch-v8"\n          ]\n        },\n        "client_artifact": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 8388608\n                }\n              }\n            }\n          ]\n        },\n        "contracts": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "native_receipt_schema",\n            "native_verifier",\n            "attestation_schema"\n          ],\n          "properties": {\n            "native_receipt_schema": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            },\n            "native_verifier": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 65536\n                    }\n                  }\n                }\n              ]\n            },\n            "attestation_schema": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            }\n          }\n        },\n        "native_kind": {\n          "const": "nas-only-v85r-proof-v1"\n        },\n        "native_schema_id": {\n          "const": "stoarama.nas-stitch-native-receipt.v1"\n        },\n        "package_manifest": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "policy": {\n          "$ref": "#/$defs/policy"\n        },\n        "tools": {\n          "$ref": "#/$defs/tools"\n        }\n      },\n      "allOf": [\n        {\n          "if": {\n            "properties": {\n              "profile_id": {\n                "const": "nas-v2-5009-337c"\n              }\n            }\n          },\n          "then": {\n            "properties": {\n              "client_version": {\n                "const": "v85r-nas-proof-v2"\n              }\n            }\n          },\n          "else": {\n            "properties": {\n              "client_version": {\n                "const": "r2-copy-v3"\n              }\n            }\n          }\n        }\n      ]\n    },\n    "reader_profile": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "profile_id",\n        "repository",\n        "base_commit_sha",\n        "reviewed_head_sha",\n        "merged_commit_sha",\n        "source_sha256",\n        "client_version",\n        "client_artifact",\n        "contracts",\n        "capabilities",\n        "package_manifest",\n        "policy",\n        "tools"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-reader-profile.v1"\n        },\n        "profile_id": {\n          "const": "nas-combined-v3-337c"\n        },\n        "repository": {\n          "const": "daydemir/stoarama"\n        },\n        "base_commit_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "reviewed_head_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "merged_commit_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "source_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "client_version": {\n          "const": "r2-copy-v3"\n        },\n        "client_artifact": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 8388608\n                }\n              }\n            }\n          ]\n        },\n        "contracts": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "readback_schema",\n            "readback_validator",\n            "attestation_schema"\n          ],\n          "properties": {\n            "readback_schema": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            },\n            "readback_validator": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 65536\n                    }\n                  }\n                }\n              ]\n            },\n            "attestation_schema": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            }\n          }\n        },\n        "capabilities": {\n          "const": [\n            "stitch-proof",\n            "r2-copy-control-v3",\n            "cleanup-bulk-v8"\n          ]\n        },\n        "package_manifest": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "policy": {\n          "$ref": "#/$defs/policy"\n        },\n        "tools": {\n          "$ref": "#/$defs/tools"\n        }\n      }\n    },\n    "pair": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "pair_id",\n        "producer_profile",\n        "reader_profile",\n        "native_kind",\n        "native_schema_id",\n        "native_schema",\n        "native_verifier",\n        "readback_schema",\n        "readback_validator",\n        "package_manifest",\n        "policy",\n        "tools"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-profile-pair.v1"\n        },\n        "pair_id": {\n          "enum": [\n            "nas-v2-5009-to-combined-v3-337c",\n            "nas-combined-v3-337c-self"\n          ]\n        },\n        "producer_profile": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "reader_profile": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "native_kind": {\n          "const": "nas-only-v85r-proof-v1"\n        },\n        "native_schema_id": {\n          "const": "stoarama.nas-stitch-native-receipt.v1"\n        },\n        "native_schema": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "native_verifier": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 65536\n                }\n              }\n            }\n          ]\n        },\n        "readback_schema": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "readback_validator": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 65536\n                }\n              }\n            }\n          ]\n        },\n        "package_manifest": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "policy": {\n          "$ref": "#/$defs/policy"\n        },\n        "tools": {\n          "$ref": "#/$defs/tools"\n        }\n      }\n    },\n    "reader_execution": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "connection_id",\n        "account_id",\n        "client_boot_id",\n        "host",\n        "client_version",\n        "client_artifact_sha256",\n        "client_artifact_size_bytes"\n      ],\n      "properties": {\n        "connection_id": {\n          "const": 13\n        },\n        "account_id": {\n          "const": 47\n        },\n        "client_boot_id": {\n          "$ref": "#/$defs/uuid"\n        },\n        "host": {\n          "$ref": "#/$defs/host"\n        },\n        "client_version": {\n          "const": "r2-copy-v3"\n        },\n        "client_artifact_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "client_artifact_size_bytes": {\n          "type": "integer",\n          "minimum": 1,\n          "maximum": 8388608\n        }\n      }\n    },\n    "readback": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "native_run_id",\n        "native_bundle_sha256",\n        "native_plan_sha256",\n        "producer_profile_sha256",\n        "reader_profile_sha256",\n        "profile_pair_sha256",\n        "id",\n        "started_at",\n        "verified_at",\n        "reader_execution",\n        "outputs",\n        "policy",\n        "tools",\n        "native_registration_sha256"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-readback.v2"\n        },\n        "native_run_id": {\n          "$ref": "#/$defs/uuid"\n        },\n        "native_bundle_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "native_plan_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "producer_profile_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "reader_profile_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "profile_pair_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "id": {\n          "$ref": "#/$defs/uuid"\n        },\n        "started_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "verified_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "reader_execution": {\n          "$ref": "#/$defs/reader_execution"\n        },\n        "outputs": {\n          "type": "array",\n          "minItems": 1,\n          "maxItems": 1,\n          "items": {\n            "$ref": "#/$defs/media"\n          }\n        },\n        "policy": {\n          "$ref": "#/$defs/policy"\n        },\n        "tools": {\n          "$ref": "#/$defs/tools"\n        },\n        "native_registration_sha256": {\n          "$ref": "#/$defs/sha256"\n        }\n      }\n    },\n    "server_execution": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "repository",\n        "commit_sha",\n        "service_id",\n        "instance_id"\n      ],\n      "properties": {\n        "repository": {\n          "const": "daydemir/stoarama"\n        },\n        "commit_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "service_id": {\n          "const": "srv-d6usqn94tr6s73d94cd0"\n        },\n        "instance_id": {\n          "type": "string",\n          "minLength": 1,\n          "maxLength": 256\n        }\n      }\n    },\n    "validation": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "native_run_id",\n        "native_bundle_sha256",\n        "native_plan_sha256",\n        "producer_profile_sha256",\n        "reader_profile_sha256",\n        "profile_pair_sha256",\n        "validated_at",\n        "readback_receipt_sha256",\n        "reader_execution",\n        "reader_heartbeat_received_at",\n        "reader_release_stable",\n        "reader_release_candidate",\n        "reader_version_mismatch_count",\n        "server_execution",\n        "scope",\n        "outputs",\n        "policy",\n        "tools",\n        "registered_locally_only",\n        "grants_retirement"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-validation.v2"\n        },\n        "native_run_id": {\n          "$ref": "#/$defs/uuid"\n        },\n        "native_bundle_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "native_plan_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "producer_profile_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "reader_profile_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "profile_pair_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "validated_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "readback_receipt_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "reader_execution": {\n          "$ref": "#/$defs/reader_execution"\n        },\n        "reader_heartbeat_received_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "reader_release_stable": {\n          "const": true\n        },\n        "reader_release_candidate": {\n          "const": false\n        },\n        "reader_version_mismatch_count": {\n          "const": 0\n        },\n        "server_execution": {\n          "$ref": "#/$defs/server_execution"\n        },\n        "scope": {\n          "$ref": "#/$defs/scope"\n        },\n        "outputs": {\n          "type": "array",\n          "minItems": 1,\n          "maxItems": 1,\n          "items": {\n            "$ref": "#/$defs/media"\n          }\n        },\n        "policy": {\n          "$ref": "#/$defs/policy"\n        },\n        "tools": {\n          "$ref": "#/$defs/tools"\n        },\n        "registered_locally_only": {\n          "const": true\n        },\n        "grants_retirement": {\n          "const": false\n        }\n      }\n    },\n    "payload": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "connection_id",\n        "account_id",\n        "scope",\n        "policy",\n        "tools",\n        "producer_profile",\n        "reader_profile",\n        "profile_pair",\n        "native_run",\n        "inputs",\n        "outputs",\n        "evidence"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-payload.v2"\n        },\n        "connection_id": {\n          "const": 13\n        },\n        "account_id": {\n          "const": 47\n        },\n        "scope": {\n          "$ref": "#/$defs/scope"\n        },\n        "policy": {\n          "$ref": "#/$defs/policy"\n        },\n        "tools": {\n          "$ref": "#/$defs/tools"\n        },\n        "producer_profile": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "reader_profile": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "profile_pair": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "native_run": {\n          "$ref": "#/$defs/run"\n        },\n        "inputs": {\n          "type": "array",\n          "minItems": 2,\n          "maxItems": 2,\n          "items": {\n            "$ref": "#/$defs/input"\n          }\n        },\n        "outputs": {\n          "type": "array",\n          "minItems": 1,\n          "maxItems": 1,\n          "items": {\n            "$ref": "#/$defs/output"\n          }\n        },\n        "evidence": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "native_bundle",\n            "local_registration",\n            "native_task",\n            "readback_receipt",\n            "server_validation",\n            "server_deployment"\n          ],\n          "properties": {\n            "native_bundle": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            },\n            "local_registration": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 16777216\n                    }\n                  }\n                }\n              ]\n            },\n            "native_task": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            },\n            "readback_receipt": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            },\n            "server_validation": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            },\n            "server_deployment": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            }\n          }\n        }\n      }\n    },\n    "review": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "reviewer",\n        "reviewed_at",\n        "verdict",\n        "payload_sha256",\n        "native_bundle_sha256",\n        "producer_profile_sha256",\n        "reader_profile_sha256",\n        "profile_pair_sha256",\n        "readback_receipt_sha256",\n        "server_validation_sha256",\n        "producer_reviewed_code_head_sha",\n        "reader_reviewed_code_head_sha",\n        "observations",\n        "server_deployment_sha256"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-review.v2"\n        },\n        "reviewer": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "name",\n            "provider",\n            "model",\n            "reference"\n          ],\n          "properties": {\n            "name": {\n              "type": "string",\n              "minLength": 1,\n              "maxLength": 2048\n            },\n            "provider": {\n              "type": "string",\n              "minLength": 1,\n              "maxLength": 2048\n            },\n            "model": {\n              "type": "string",\n              "minLength": 1,\n              "maxLength": 2048\n            },\n            "reference": {\n              "type": "string",\n              "minLength": 1,\n              "maxLength": 2048\n            }\n          }\n        },\n        "reviewed_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "verdict": {\n          "const": "approve"\n        },\n        "payload_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "native_bundle_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "producer_profile_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "reader_profile_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "profile_pair_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "readback_receipt_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "server_validation_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "producer_reviewed_code_head_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "reader_reviewed_code_head_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "observations": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "server_deployment_sha256": {\n          "$ref": "#/$defs/sha256"\n        }\n      }\n    },\n    "server_deployment": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "provider",\n        "service_id",\n        "provider_account_id",\n        "api_origin",\n        "provider_api_origin",\n        "deployment_id",\n        "commit_sha",\n        "status",\n        "request_started_at",\n        "response_received_at",\n        "observed_at",\n        "request_elapsed_ms",\n        "server_validation_sha256",\n        "provider_response",\n        "provider_service_response",\n        "provider_live_list_response"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-server-deployment.v1"\n        },\n        "provider": {\n          "const": "render"\n        },\n        "service_id": {\n          "const": "srv-d6usqn94tr6s73d94cd0"\n        },\n        "provider_account_id": {\n          "const": "tea-d1g1uevfte5s7384s1q0"\n        },\n        "api_origin": {\n          "const": "https://stoarama-api.onrender.com"\n        },\n        "provider_api_origin": {\n          "const": "https://api.render.com/v1"\n        },\n        "deployment_id": {\n          "type": "string",\n          "pattern": "^dep-[a-z0-9]+$"\n        },\n        "commit_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "status": {\n          "const": "live"\n        },\n        "request_started_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "response_received_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "observed_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "request_elapsed_ms": {\n          "type": "integer",\n          "minimum": 0,\n          "maximum": 30000\n        },\n        "server_validation_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "provider_response": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "provider_service_response": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "provider_live_list_response": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        }\n      }\n    },\n    "current_context": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "native_run_id",\n        "native_bundle_sha256",\n        "native_plan_sha256",\n        "producer_profile_sha256",\n        "reader_profile_sha256",\n        "profile_pair_sha256",\n        "checked_at",\n        "readback_receipt_sha256",\n        "reader_execution",\n        "reader_heartbeat_received_at",\n        "reader_release_stable",\n        "reader_release_candidate",\n        "reader_version_mismatch_count",\n        "server_execution",\n        "scope",\n        "outputs",\n        "policy",\n        "tools",\n        "registered_locally_only",\n        "grants_retirement",\n        "status_received_at",\n        "readback_verified_at",\n        "readback_id",\n        "source_scope_approved_until",\n        "integrity"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-current-context.v1"\n        },\n        "native_run_id": {\n          "$ref": "#/$defs/uuid"\n        },\n        "native_bundle_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "native_plan_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "producer_profile_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "reader_profile_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "profile_pair_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "readback_receipt_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "reader_execution": {\n          "$ref": "#/$defs/reader_execution"\n        },\n        "reader_heartbeat_received_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "reader_release_stable": {\n          "const": true\n        },\n        "reader_release_candidate": {\n          "const": false\n        },\n        "reader_version_mismatch_count": {\n          "const": 0\n        },\n        "server_execution": {\n          "$ref": "#/$defs/server_execution"\n        },\n        "scope": {\n          "$ref": "#/$defs/scope"\n        },\n        "outputs": {\n          "type": "array",\n          "minItems": 1,\n          "maxItems": 1,\n          "items": {\n            "$ref": "#/$defs/media"\n          }\n        },\n        "policy": {\n          "$ref": "#/$defs/policy"\n        },\n        "tools": {\n          "$ref": "#/$defs/tools"\n        },\n        "registered_locally_only": {\n          "const": true\n        },\n        "grants_retirement": {\n          "const": false\n        },\n        "checked_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "status_received_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "readback_verified_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "readback_id": {\n          "$ref": "#/$defs/uuid"\n        },\n        "source_scope_approved_until": {\n          "$ref": "#/$defs/utc"\n        },\n        "integrity": {\n          "const": "clear"\n        }\n      }\n    }\n  },\n  "$comment": "DESIGN DRAFT ONLY, not an accepted/frozen runtime schema or authority. Compiled accepted producer-reader pair table is EMPTY until final source/artifact review. Runtime must stream-check all canonical regular no-symlink file references/sizes/hashes before isolated byte-snapshot replay; reject duplicate keys, nonfinite and wrong types; compare every field with finite full-profile/pair pins; enforce immutable native time/result/registration equality, native replay, actual current output rehash and server binding, UTC ordering, 24h readback/validation/review and <=5min future skew, DB-anchored expiry and unchanged object/custody/fence/drain/keep gates. Unknown profiles/packages/readers require new review; no cross-package pairing. Server validation is exact raw API bytes: DB-derived validated_at and only actual runtime commit/service/instance, never exporter-inserted deploy ID. Separate server_deployment binds exact provider responses and validation hash. Fixed service/API origin are from held reviewed runner35; candidate provider account tea-d1g1uevfte5s7384s1q0 is from primary dd5a9b22; final compiled pin/profile acceptance remains separate. Pure replay has no network/auth; outer caller independently checks provider/API under separately reviewed bounded online contract. Rollout/identity/freshness ambiguity refuses. No old authority deadline extends."\n}\n'
+
+
+class StitchReadbackContractError(StitchHold):
+    pass
+
+
+class StitchReadbackDefinition(Enum):
+    PRODUCER = "producer_profile"
+    READER = "reader_profile"
+    PAIR = "pair"
+    READBACK = "readback"
+    VALIDATION = "validation"
+    CURRENT = "current_context"
+
+
+class StitchProfileKey(NamedTuple):
+    producer: str
+    reader: str
+    pair: str
+
+
+class StitchClientIdentity(NamedTuple):
+    sha256: str
+    size_bytes: int
+    version: str
+
+
+class StitchProfileBytes(NamedTuple):
+    producer: bytes
+    reader: bytes
+    pair: bytes
+
+
+class StitchProducerProfile(Enum):
+    LEGACY_V2 = "nas-v2-5009-337c"
+    COMBINED_V3 = "nas-combined-v3-337c"
+
+
+class StitchProfilePair(Enum):
+    LEGACY_TO_V3 = "nas-v2-5009-to-combined-v3-337c"
+    COMBINED_SELF = "nas-combined-v3-337c-self"
+
+
+def stitch_readback_validate(value, definition: StitchReadbackDefinition):
+    """Validate the separate v2 contract; never substitute the native schema."""
+    if hashlib.sha256(STITCH_READBACK_SCHEMA_JSON.encode()).hexdigest() != STITCH_READBACK_SCHEMA_SHA:
+        raise StitchReadbackContractError("readback contract drift")
+    if type(definition) is not StitchReadbackDefinition:
+        raise StitchReadbackContractError("unknown readback definition")
+    schema = json.loads(STITCH_READBACK_SCHEMA_JSON)
+    types = {"object": (dict,), "array": (list,), "string": (str,),
+             "boolean": (bool,), "integer": (int,), "number": (int, float)}
+    vocabulary = {"$comment", "$defs", "$id", "$ref", "$schema", "title", "type", "const", "enum",
+        "allOf", "if", "then", "else", "properties", "required", "additionalProperties", "items",
+        "minItems", "maxItems", "minLength", "maxLength", "minimum", "maximum", "exclusiveMinimum", "format", "pattern"}
+
+    def check(item, node, depth=0):
+        if depth > 64 or not set(node) <= vocabulary:
+            raise StitchReadbackContractError("unsupported readback contract")
+        if "$ref" in node:
+            reference = node["$ref"]
+            if set(node) != {"$ref"} or not reference.startswith("#/$defs/"):
+                raise StitchReadbackContractError("nonlocal readback contract reference")
+            return check(item, schema["$defs"][reference.removeprefix("#/$defs/")], depth+1)
+        if "const" in node and (type(item) is not type(node["const"]) or item != node["const"]):
+            raise StitchHold("readback constant differs")
+        if "enum" in node and not any(type(item) is type(choice) and item == choice for choice in node["enum"]):
+            raise StitchHold("unknown readback enum")
+        kind = node.get("type")
+        if kind is not None and kind not in types:
+            raise StitchReadbackContractError("unsupported readback contract type")
+        if node.get("format") not in (None, "uuid", "date-time"):
+            raise StitchReadbackContractError("unsupported readback contract format")
+        if kind is not None and type(item) not in types[kind]:
+            raise StitchHold("readback field type differs")
+        if type(item) is dict:
+            fields = node.get("properties", {})
+            if (not set(node.get("required", [])) <= set(item)
+                    or node.get("additionalProperties") is False and not set(item) <= set(fields)):
+                raise StitchHold("readback fields differ")
+            for key, child in item.items():
+                if key in fields:
+                    check(child, fields[key], depth+1)
+        elif type(item) is list:
+            if not node.get("minItems", 0) <= len(item) <= node.get("maxItems", len(item)):
+                raise StitchHold("readback array bound")
+            if "items" in node:
+                for child in item:
+                    check(child, node["items"], depth+1)
+        elif type(item) is str:
+            if (not node.get("minLength", 0) <= len(item) <= node.get("maxLength", len(item))
+                    or "pattern" in node and re.search(node["pattern"], item) is None):
+                raise StitchHold("readback string bound")
+            if node.get("format") == "uuid" and re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", item) is None:
+                raise StitchHold("readback UUID invalid")
+            if node.get("format") == "date-time":
+                try:
+                    parsed = datetime.datetime.fromisoformat(item.replace("Z", "+00:00"))
+                except ValueError:
+                    raise StitchHold("readback timestamp invalid") from None
+                if not item.endswith("Z") or parsed.utcoffset() != datetime.timedelta(0):
+                    raise StitchHold("readback timestamp is not UTC")
+        elif type(item) in (int, float):
+            if (not -float("inf") < item < float("inf")
+                    or "minimum" in node and item < node["minimum"]
+                    or "maximum" in node and item > node["maximum"]
+                    or "exclusiveMinimum" in node and item <= node["exclusiveMinimum"]):
+                raise StitchHold("readback numeric bound")
+        for child in node.get("allOf", []):
+            check(item, child, depth+1)
+        if "if" in node:
+            try:
+                check(item, node["if"], depth+1)
+            except StitchReadbackContractError:
+                raise
+            except StitchHold:
+                branch = "else"
+            else:
+                branch = "then"
+            if branch in node:
+                check(item, node[branch], depth+1)
+
+    check(value, schema["$defs"][definition.value])
+
+
+def stitch_readback_profiles(raw: StitchProfileBytes, expected: StitchProfileKey,
+                            client: StitchClientIdentity, mode: NASStitchMode):
+    """Bind all three immutable component bytes to an accepted server key.
+
+    This validates a supplied accepted key, never creates registry acceptance or
+    native/deletion authority. Callers must obtain it from the scoped registry.
+    """
+    if (type(raw) is not StitchProfileBytes or type(expected) is not StitchProfileKey
+            or type(client) is not StitchClientIdentity or type(mode) is not NASStitchMode
+            or mode is NASStitchMode.DISABLED):
+        raise StitchHold("typed readback profile binding required")
+    documents = []
+    definitions = (StitchReadbackDefinition.PRODUCER, StitchReadbackDefinition.READER, StitchReadbackDefinition.PAIR)
+    for body, digest, definition in zip(raw, expected, definitions):
+        if (type(body) is not bytes or not 0 < len(body) <= 65536 or type(digest) is not str
+                or re.fullmatch(r"[a-f0-9]{64}", digest) is None or hashlib.sha256(body).hexdigest() != digest):
+            raise StitchHold("readback component bytes differ")
+        document = stitch_proof_json(body)
+        stitch_readback_validate(document, definition)
+        documents.append(document)
+    producer, reader, pair = documents
+    for reference, body, digest in ((pair["producer_profile"], raw.producer, expected.producer),
+                                     (pair["reader_profile"], raw.reader, expected.reader)):
+        if reference["sha256"] != digest or reference["size_bytes"] != len(body):
+            raise StitchHold("readback pair component differs")
+    producer_id = StitchProducerProfile(producer["profile_id"])
+    expected_pair = {StitchProducerProfile.LEGACY_V2: StitchProfilePair.LEGACY_TO_V3,
+                     StitchProducerProfile.COMBINED_V3: StitchProfilePair.COMBINED_SELF}[producer_id]
+    if pair["pair_id"] != expected_pair.value:
+        raise StitchHold("readback producer/reader pair differs")
+    artifact = reader["client_artifact"]
+    if (type(client.sha256) is not str or re.fullmatch(r"[a-f0-9]{64}", client.sha256) is None
+            or type(client.size_bytes) is not int or client.size_bytes <= 0 or type(client.version) is not str
+            or client != StitchClientIdentity(artifact["sha256"], artifact["size_bytes"], reader["client_version"])):
+        raise StitchHold("current readback client differs")
+    if mode is NASStitchMode.NATIVE:
+        original = producer["client_artifact"]
+        if client != StitchClientIdentity(original["sha256"], original["size_bytes"], producer["client_version"]):
+            raise StitchHold("native mode requires the executing producer")
+    for name in ("policy", "tools", "package_manifest"):
+        if producer[name] != reader[name] or producer[name] != pair[name]:
+            raise StitchHold("readback pipeline/package drift")
+    if (pair["package_manifest"]["sha256"] != V85R_MANIFEST_SHA
+            or pair["package_manifest"]["size_bytes"] != 5416):
+        raise StitchHold("unsupported readback native package")
+    native_contract = producer["contracts"]
+    for label, reference, digest, size in (
+            ("native_receipt_schema", pair["native_schema"], STITCH_PROOF_SCHEMA_SHA, len(STITCH_PROOF_SCHEMA_JSON.encode())),
+            ("native_verifier", pair["native_verifier"], "81ff91e5accd93d32ff475024c10281177684b583e121a6c5d0c1f1938d49532", 18817)):
+        if reference != native_contract[label] or reference["sha256"] != digest or reference["size_bytes"] != size:
+            raise StitchHold("unsupported readback native contract")
+    current_contract = reader["contracts"]
+    for label in ("readback_schema", "readback_validator"):
+        if pair[label] != current_contract[label]:
+            raise StitchHold("current readback contract differs")
+    for reference in (current_contract["readback_schema"], current_contract["attestation_schema"]):
+        if reference["sha256"] != STITCH_READBACK_SCHEMA_SHA or reference["size_bytes"] != len(STITCH_READBACK_SCHEMA_JSON.encode()):
+            raise StitchHold("unsupported current readback schema")
+    old = producer_id is StitchProducerProfile.LEGACY_V2
+    outer_sha = "03d9a5fa930b67249036a6b522dcffa59f6bba9744f79abc0747f85d9ee63abc" if old else STITCH_READBACK_SCHEMA_SHA
+    outer_size = 17438 if old else len(STITCH_READBACK_SCHEMA_JSON.encode())
+    original_contract = native_contract["attestation_schema"]
+    if original_contract["sha256"] != outer_sha or original_contract["size_bytes"] != outer_size:
+        raise StitchHold("original producer schema differs")
+    # Return fresh parsed values to the current call; immutable bytes remain the
+    # authoritative cache. No mutable global/registry is populated here.
+    return producer, reader, pair
+
+
+
+class StitchReadbackIntegrity(StitchHold):
+    """Preserved tested bytes or their identity changed; never a retryable HOLD."""
+
+
+def stitch_readback_file(root, relative, limit, stop, expected=None, retain=False):
+    """Read/hash one confined file, pinning every ancestor and the open inode.
+
+    Only bounded metadata is retained. Media and installed tools stream in 1MiB
+    blocks. Readback never creates directories, repairs a file or follows links.
+    """
+    raw_root, raw_relative = str(root), str(relative)
+    if (not raw_root.startswith("/") or "\\" in raw_root or "\\" in raw_relative
+            or not raw_relative or raw_relative.startswith("/")
+            or any(part in ("", ".", "..") for part in raw_relative.split("/"))
+            or type(limit) is not int or limit <= 0
+            or (retain and limit > 16*1024*1024)):
+        raise StitchReadbackIntegrity("invalid confined readback path/bound")
+    parts = raw_root.rstrip("/").split("/")[1:] + raw_relative.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise StitchReadbackIntegrity("invalid readback root")
+    descriptors, links = [], []
+    try:
+        stitch_check(stop)
+        descriptors.append(os.open("/", os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW))
+        for index, part in enumerate(parts):
+            stitch_check(stop)
+            parent = descriptors[-1]
+            # Opening a substituted FIFO must refuse without blocking first.
+            flags = os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK
+            if index < len(parts)-1:
+                flags |= os.O_DIRECTORY
+            descriptor = os.open(part, flags, dir_fd=parent)
+            descriptors.append(descriptor)
+            before = os.fstat(descriptor)
+            links.append((parent, part, before))
+            if index < len(parts)-1:
+                if not stat_module.S_ISDIR(before.st_mode):
+                    raise StitchReadbackIntegrity("readback ancestor is not a directory")
+            elif not stat_module.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0 < before.st_size <= limit:
+                raise StitchReadbackIntegrity("readback requires a bounded private regular file")
+        digest, size, chunks = hashlib.sha256(), 0, []
+        while True:
+            stitch_check(stop)
+            block = os.read(descriptors[-1], min(1024*1024, limit+1-size))
+            stitch_check(stop)
+            if not block:
+                break
+            size += len(block)
+            if size > limit:
+                raise StitchReadbackIntegrity("readback file exceeds bound")
+            digest.update(block)
+            if retain:
+                chunks.append(block)
+        for index, (parent, part, before) in enumerate(links):
+            stitch_check(stop)
+            opened = os.fstat(descriptors[index+1])
+            named = os.stat(part, dir_fd=parent, follow_symlinks=False)
+            if index == len(links)-1:
+                if (opened.st_nlink != 1 or named.st_nlink != 1
+                        or certification_identity(before) != certification_identity(opened)
+                        or certification_identity(opened) != certification_identity(named)):
+                    raise StitchReadbackIntegrity("readback file changed during hashing")
+            elif any((before.st_dev, before.st_ino, before.st_mode) != (value.st_dev, value.st_ino, value.st_mode)
+                     for value in (opened, named)):
+                raise StitchReadbackIntegrity("readback ancestor changed during hashing")
+        actual = (size, digest.hexdigest())
+        if size != links[-1][2].st_size or (expected is not None and actual != expected):
+            raise StitchReadbackIntegrity("preserved readback bytes differ")
+        return actual, b"".join(chunks) if retain else None
+    except OSError as exc:
+        raise StitchReadbackIntegrity("preserved readback file unavailable") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def stitch_readback_registration(body, stop=None):
+    """Hash the exact full decoded native registration, not normalized JSON."""
+    decoder, digest, size = zlib.decompressobj(16+zlib.MAX_WBITS), hashlib.sha256(), 0
+    for offset in range(0, len(body), 65536):
+        if stop is not None:
+            stitch_check(stop)
+        pending = body[offset:offset+65536]
+        while pending:
+            if stop is not None:
+                stitch_check(stop)
+            block = decoder.decompress(pending, min(1024*1024, 16*1024*1024+1-size))
+            size += len(block); digest.update(block)
+            if size > 16*1024*1024:
+                raise StitchReadbackIntegrity("native registration exceeds bound")
+            pending = decoder.unconsumed_tail
+        if decoder.unused_data:
+            raise StitchReadbackIntegrity("native registration has trailing data")
+    if not decoder.eof or size == 0:
+        raise StitchReadbackIntegrity("native registration is incomplete")
+    return digest.hexdigest()
+
+
+def stitch_readback_native(receipt, task, producer):
+    """Bind immutable native evidence to its original task and producer.
+
+    The separate checksum-pinned native verifier still replays every inventory
+    offline. This binding never substitutes a current reader into old evidence.
+    """
+    stitch_proof_check(task)
+    original = producer["client_artifact"]
+    if (receipt["client_artifact_sha256"] != original["sha256"]
+            or receipt["client_version"] != producer["client_version"]
+            or receipt["plan_sha256"] != task["plan_sha256"]
+            or receipt["source_plan_sha256"] != STITCH_PROOF_SOURCE_SHA):
+        raise StitchReadbackIntegrity("original native producer/task differs")
+    output = receipt["result"]["outputs"][0]
+    if (output["relative_path"] != task["plan"]["output_folder"]+"/proof.mp4"
+            or output["readback_sha256"] != output["sha256"]
+            or any(output.get(name) is not True for name in
+                ("full_decode", "seam_decode", "packet_chain", "native_audit", "original_sources_no_audio", "fsynced"))):
+        raise StitchReadbackIntegrity("original native output binding differs")
+    for source, included in zip(task["plan"]["clips"], output["inputs"]):
+        if (source["source_id"], source["sha256"], source["size_bytes"]) != (included["clip_id"], included["sha256"], included["size_bytes"]):
+            raise StitchReadbackIntegrity("original native inclusion differs")
+    provenance = output["provenance"]
+    if (provenance["manifest_sha256"] != producer["package_manifest"]["sha256"]
+            or provenance["policy"] != producer["policy"]["name"]
+            or provenance.get("october_ffmpeg_recovered") is not True):
+        raise StitchReadbackIntegrity("original native package differs")
+    for tool, pin in producer["tools"].items():
+        if provenance[tool+"_sha256"] != pin["sha256"] or provenance[tool+"_version"] != pin["version"]:
+            raise StitchReadbackIntegrity("original native tool differs")
+
+
+def stitch_readback_pipeline(cfg, reader, stop):
+    """Rehash the installed tested package/tools; no download or repair path."""
+    package = reader["package_manifest"]
+    prefix = "tools/v85r-"+package["sha256"]+"/"
+    _, raw = stitch_readback_file(cfg.state_dir, prefix+"manifest.json", 65536, stop,
+        (package["size_bytes"], package["sha256"]), retain=True)
+    manifest = stitch_proof_json(raw)
+    for name, digest in manifest["files"].items():
+        actual, _ = stitch_readback_file(cfg.state_dir, prefix+name, 16*1024*1024, stop)
+        if actual[1] != digest:
+            raise StitchReadbackIntegrity("tested readback package member differs")
+    for name, pin in reader["tools"].items():
+        stitch_readback_file(cfg.state_dir, "tools/v85r-ffmpeg-"+pin["version"]+"/"+name,
+            pin["size_bytes"], stop, (pin["size_bytes"], pin["sha256"]))
+
+
+class StitchReadbackStop:
+    """One immutable budget for admission, rehash and receipt construction."""
+    def __init__(self, cfg, stop, expires_at):
+        self.cfg, self.stop, self.reason = cfg, stop, ""
+        switches = cfg.stitch_switches
+        self.mode, self.switch_cancel = switches.proof
+        if self.mode not in (NASStitchMode.NATIVE, NASStitchMode.READBACK):
+            raise StitchHold("readback selector inactive")
+        now = time.monotonic()
+        remaining = (parse_certification_timestamp(expires_at, "readback expiry")
+                     - datetime.datetime.now(datetime.timezone.utc)).total_seconds()-30
+        self.deadline = min(now+90, now+remaining)
+        self.next_resource_check = now+5
+        self.started_at, self.run_id = utc_now(), str(uuid.uuid4())
+        stitch_check(self)
+
+    def is_set(self):
+        if self.stop.is_set() or self.switch_cancel.is_set() or self.cfg.stitch_switches.proof[0] is not self.mode:
+            self.reason = "readback cancelled"
+        now = time.monotonic()
+        if now >= self.deadline:
+            self.reason = "readback deadline reached"
+        with NAS_MEDIA_FENCE.condition:
+            if NAS_MEDIA_FENCE.execution_owner is not None or NAS_MEDIA_FENCE.cleaners:
+                self.reason = "readback yielded to cleanup"
+        if not self.reason and now >= self.next_resource_check:
+            self.next_resource_check = now+5
+            try:
+                stitch_resources(self.cfg)
+            except StitchHold:
+                self.reason = "readback resources unavailable"
+        return bool(self.reason)
+
+
+def stitch_readback_run(cfg, stop, raw_profiles, profile_key, task_raw, bundle):
+    """Reverify preserved output only. No native/source/download/repair entry.
+
+    Inputs are immutable metadata byte copies selected by the scoped admission.
+    Publishing the returned receipt and transport happen outside this function;
+    its original deadline covers every controlled read and receipt construction.
+    """
+    stitch_check(stop)
+    stitch_resources(cfg)
+    # Startup already pins the executing release. Renewal must never fetch a
+    # manifest, install a tool or obtain a new identity budget here.
+    client_pin = getattr(cfg, "executing_release_sha256", None)
+    if cfg.is_candidate or type(client_pin) is not str or re.fullmatch(r"[a-f0-9]{64}", client_pin) is None:
+        raise StitchHold("promoted executing reader identity unavailable")
+    actual, _ = stitch_readback_file(Path(cfg.current_file).parent, Path(cfg.current_file).name,
+        8*1024*1024, stop)
+    if actual[1] != client_pin:
+        raise StitchReadbackIntegrity("executing readback bytes changed")
+    client = StitchClientIdentity(actual[1], actual[0], CLIENT_VERSION)
+    try:
+        producer, reader, pair = stitch_readback_profiles(raw_profiles, profile_key, client, NASStitchMode.READBACK)
+    except StitchHold as exc:
+        raise StitchReadbackIntegrity("current readback profile differs") from exc
+    if type(task_raw) is not bytes or not 0 < len(task_raw) <= 1024*1024 or type(bundle) is not bytes or not 0 < len(bundle) <= 1024*1024:
+        raise StitchReadbackIntegrity("native readback metadata bound/type")
+    task = stitch_proof_json(task_raw)
+    try:
+        receipt = stitch_proof_unpack(bundle)
+    except (StitchHold, ValueError, KeyError, zlib.error) as exc:
+        raise StitchReadbackIntegrity("preserved native registration differs") from exc
+    stitch_readback_native(receipt, task, producer)
+    registration_sha = stitch_readback_registration(bundle, stop)
+    stitch_check(stop)
+    stitch_readback_pipeline(cfg, reader, stop)
+    outputs = []
+    for output in receipt["result"]["outputs"]:
+        stitch_readback_file(cfg.output_dir, output["relative_path"], STITCH_PROOF_MAX_BYTES, stop,
+            (output["size_bytes"], output["sha256"]))
+        outputs.append({name: output[name] for name in ("relative_path", "sha256", "size_bytes")})
+    _, runtime_raw = stitch_readback_file(cfg.state_dir, Path(cfg.runtime_file).name, 65536, stop, retain=True)
+    runtime = stitch_proof_json(runtime_raw)
+    import platform
+    cpu = next((line.split(":",1)[1].strip() for line in _read_text("/proc/cpuinfo").splitlines()
+                if line.startswith("model name")), "unknown")
+    execution = dict(connection_id=13, account_id=47, client_boot_id=runtime["boot_id"],
+        host=dict(connection_id=13,system=platform.system(),machine=platform.machine(),cpu_model=cpu,cpu_count=os.cpu_count()),
+        client_version=CLIENT_VERSION, client_artifact_sha256=client.sha256, client_artifact_size_bytes=client.size_bytes)
+    result = dict(schema="stoarama.nas-stitch-readback.v2", native_run_id=receipt["run"]["id"],
+        native_bundle_sha256=hashlib.sha256(bundle).hexdigest(), native_plan_sha256=receipt["plan_sha256"],
+        producer_profile_sha256=profile_key.producer, reader_profile_sha256=profile_key.reader, profile_pair_sha256=profile_key.pair,
+        id=stop.run_id, started_at=stop.started_at, verified_at=utc_now(), reader_execution=execution,
+        outputs=outputs, policy=reader["policy"], tools=reader["tools"], native_registration_sha256=registration_sha)
+    stitch_readback_validate(result, StitchReadbackDefinition.READBACK)
+    ordered = [parse_certification_timestamp(value, "readback time") for value in
+        (receipt["verified_at"], result["started_at"], result["verified_at"])]
+    if ordered != sorted(ordered):
+        raise StitchHold("readback timestamps out of order")
+    body = cleanup_json_bytes(result)
+    if len(body) > 65536:
+        raise StitchHold("readback receipt exceeds bound")
+    stitch_check(stop)
+    return body
+
+
+class StitchEvidenceKind(Enum):
+    NATIVE = "proof-v1"
+    TASK = "task-v2"
+    PRODUCER = "producer-v2"
+    READER = "reader-v2"
+    PAIR = "pair-v2"
+    READBACK = "readback-v2"
+
+
+class StitchEvidenceKey(NamedTuple):
+    kind: StitchEvidenceKind
+    native_run: str
+    plan: str
+    pair: str
+    readback: str
+
+
+def stitch_evidence_chunks(key: StitchEvidenceKey, body: bytes, cursor: int):
+    """Build one <=64-chunk metadata batch; duplicates retain exact identity."""
+    if type(key) is not StitchEvidenceKey or type(key.kind) is not StitchEvidenceKind:
+        raise StitchHold("typed evidence transport key required")
+    for digest in (key.plan, key.pair):
+        if type(digest) is not str or re.fullmatch(r"[a-f0-9]{64}", digest) is None:
+            raise StitchHold("evidence transport digest differs")
+    for identity in (key.native_run, key.readback):
+        if type(identity) is not str:
+            raise StitchHold("evidence transport UUID differs")
+        try:
+            if str(uuid.UUID(identity)) != identity:
+                raise ValueError("noncanonical UUID")
+        except ValueError:
+            raise StitchHold("evidence transport UUID differs") from None
+    limit = 1024*1024 if key.kind in (StitchEvidenceKind.NATIVE, StitchEvidenceKind.TASK) else 65536
+    if type(body) is not bytes or not 0 < len(body) <= limit:
+        raise StitchHold("evidence transport body bound/type")
+    count = (len(body)+511)//512
+    if type(cursor) is not int or not 0 <= cursor <= count:
+        raise StitchHold("evidence transport cursor differs")
+    digest = hashlib.sha256(body).hexdigest()
+    lines = []
+    end = min(cursor+64,count)
+    for index in range(cursor,end):
+        part = body[index*512:(index+1)*512].hex()
+        if key.kind is StitchEvidenceKind.NATIVE:
+            # Byte-identical historical wire contract consumed by pinned81ff.
+            message = "V85r proof-v1 %s %s %d/%d %s" % (key.plan,digest,index,count,part)
+        else:
+            message = "V85r %s %s %s %s %s %s %d %d/%d %s" % (
+                key.kind.value,key.plan,digest,key.native_run,key.pair,key.readback,len(body),index,count,part)
+        lines.append(dict(seq=index+1,at=utc_now_precise(),level="INFO",message=message))
+    return lines, end
+
+
+class StitchEvidencePacer:
+    """One shared dispatch reservation, including failed/lost ACK attempts.
+
+    A full minute of startup quiet prevents a restart resetting the budget.
+    No batch is admitted between the reservation and its original+60s floor.
+    This only paces transport; a durable cursor advances after exact DB ACK.
+    """
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.allowed_at = time.monotonic()+60
+
+    def take(self):
+        with self.lock:
+            now = time.monotonic()
+            if now < self.allowed_at:
+                return False
+            self.allowed_at = now+60
+            return True
+
+
+class StitchEvidenceDispatch(Enum):
+    QUIET = "quiet"
+    COMPLETE = "complete"
+    ACKNOWLEDGED = "acknowledged"
+
+
+class StitchEvidenceProgress(NamedTuple):
+    state: StitchEvidenceDispatch
+    cursor: int
+
+
+class StitchEvidenceStop:
+    """Transport already durable metadata after OFF, with its own short bound."""
+    def __init__(self, stop):
+        self.stop = stop
+        self.deadline = time.monotonic()+min(20, HEARTBEAT_TIMEOUT_SEC)
+
+    def is_set(self):
+        return self.stop.is_set() or time.monotonic() >= self.deadline
+
+
+def stitch_evidence_send(cfg, pacer, key, body, cursor, boot, stop_event):
+    lines, end = stitch_evidence_chunks(key, body, cursor)
+    if not lines:
+        return StitchEvidenceProgress(StitchEvidenceDispatch.COMPLETE, cursor)
+    for line in lines:
+        message = line["message"]
+        if redact_log_line(message, CLIENT_LOG_RING.output_root, CLIENT_LOG_RING.redaction_secrets()) != message:
+            raise StitchHold("evidence transport redaction changed bytes")
+    if not pacer.take():
+        return StitchEvidenceProgress(StitchEvidenceDispatch.QUIET, cursor)
+    # Reservation precedes every RPC attempt, including a lost/invalid ACK.
+    stop = StitchEvidenceStop(stop_event)
+    path = "/account/connections/client-logs"
+    payload = cleanup_json_bytes(dict(client_version=CLIENT_VERSION,boot_id=boot,lines=lines))
+    request = urllib.request.Request(cfg.api_base+path,method="POST",data=payload,
+        headers={"User-Agent":USER_AGENT,"Content-Type":"application/json",
+                 "Authorization":"Bearer "+cfg.api_key,**cleanup_session_headers(path)})
+    with stitch_bounded_http(cfg,request,stop,4096,20) as response:
+        ack = stitch_proof_json(response.read())
+    if (type(ack) is not dict or set(ack) != {"ok","stored_lines"} or ack["ok"] is not True
+            or type(ack["stored_lines"]) is not int or ack["stored_lines"] != len(lines)):
+        raise StitchHold("evidence diagnostic batch not acknowledged")
+    # Caller must durably store this cursor. A crash before storage repeats the
+    # identical batch; no timestamp or native/readback identity is rewritten.
+    return StitchEvidenceProgress(StitchEvidenceDispatch.ACKNOWLEDGED, end)
+
+
+class StitchEvidenceSnapshot(NamedTuple):
+    present: bool
+    sha256: str
+    body: bytes
+
+
+class StitchEvidenceDirectory(StitchDirectory):
+    """Private bounded metadata, create-only blobs and a locked CAS checkpoint.
+
+    Immutable receipts are never pruned. Only this invocation's random stage is
+    disposable; the persistent lock inode and prior evidence survive restarts.
+    """
+    def __init__(self, cfg, stop):
+        super().__init__(cfg, "v85r-proof-evidence", 1, stop)
+        self.root = Path(cfg.state_dir)
+        self.lock_fd = -1
+
+    def __enter__(self):
+        inventory_scratch_backing(self.cfg.state_dir)
+        super().__enter__()
+        try:
+            owned = os.fstat(self.fds[-1])
+            if owned.st_uid != os.geteuid() or stat_module.S_IMODE(owned.st_mode) != 0o700:
+                raise StitchReadbackIntegrity("evidence directory is not private")
+            self.lock_fd = os.open(".lock",os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_NONBLOCK,0o600,dir_fd=self.fds[-1])
+            try:
+                fcntl.flock(self.lock_fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise StitchHold("another evidence writer is active") from None
+            self.check()
+            self.capacity(0)
+            return self
+        except BaseException:
+            self.__exit__(None,None,None)
+            raise
+
+    def __exit__(self, *unused):
+        if self.lock_fd >= 0:
+            os.close(self.lock_fd)
+            self.lock_fd = -1
+        super().__exit__(*unused)
+
+    def check(self):
+        stitch_check(self.stop)
+        for before, after in ((os.fstat(self.fds[0]),os.stat(self.root,follow_symlinks=False)),
+                (os.fstat(self.fds[-1]),os.stat(self.relative,dir_fd=self.fds[0],follow_symlinks=False))):
+            if (before.st_dev,before.st_ino,before.st_mode) != (after.st_dev,after.st_ino,after.st_mode):
+                raise StitchReadbackIntegrity("evidence directory identity changed")
+        opened = os.fstat(self.lock_fd)
+        named = os.stat(".lock",dir_fd=self.fds[-1],follow_symlinks=False)
+        if (not stat_module.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid()
+                or stat_module.S_IMODE(opened.st_mode) != 0o600 or opened.st_nlink != 1
+                or opened.st_size != 0 or certification_identity(opened) != certification_identity(named)):
+            raise StitchReadbackIntegrity("evidence lock identity changed")
+
+    def capacity(self, additional):
+        if type(additional) is not int or additional < 0:
+            raise StitchHold("evidence storage bound/type")
+        self.check()
+        total = additional
+        for name in stitch_directory_entries(self.fds[-1],self.stop):
+            if re.fullmatch(r"(?:[a-f0-9]{64}\.blob|state\.json|\.lock|stage-[a-f0-9-]{36}\.partial)",name) is None:
+                raise StitchReadbackIntegrity("unknown evidence directory entry")
+            entry = os.stat(name,dir_fd=self.fds[-1],follow_symlinks=False)
+            if (not stat_module.S_ISREG(entry.st_mode) or entry.st_nlink != 1
+                    or entry.st_uid != os.geteuid() or stat_module.S_IMODE(entry.st_mode) != 0o600
+                    or entry.st_size > 1024*1024):
+                raise StitchReadbackIntegrity("evidence storage identity/bound differs")
+            total += entry.st_size
+            if total > 64*1024*1024:
+                raise StitchHold("owned evidence storage cap reached")
+        if total > 64*1024*1024:
+            raise StitchHold("owned evidence storage cap reached")
+
+    @contextmanager
+    def stage(self, body):
+        if type(body) is not bytes or not 0 < len(body) <= 1024*1024:
+            raise StitchHold("evidence byte bound/type")
+        self.capacity(len(body))
+        name = "stage-"+str(uuid.uuid4())+".partial"
+        descriptor = os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=self.fds[-1])
+        identity = os.fstat(descriptor)
+        try:
+            with os.fdopen(descriptor,"wb") as output:
+                for offset in range(0,len(body),65536):
+                    self.check()
+                    output.write(body[offset:offset+65536])
+                output.flush();os.fsync(output.fileno())
+            self.check()
+            yield name
+        finally:
+            # Publication consumed the stage, or this exact invocation owns it.
+            try:
+                named = os.stat(name,dir_fd=self.fds[-1],follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                if (identity.st_dev,identity.st_ino) != (named.st_dev,named.st_ino):
+                    raise StitchReadbackIntegrity("evidence stage identity changed")
+                os.unlink(name,dir_fd=self.fds[-1]);os.fsync(self.fds[-1])
+
+    def put(self, body):
+        if type(body) is not bytes or not 0 < len(body) <= 1024*1024:
+            raise StitchHold("evidence byte bound/type")
+        digest = hashlib.sha256(body).hexdigest()
+        name = digest+".blob"
+        self.check()
+        try:
+            os.stat(name,dir_fd=self.fds[-1],follow_symlinks=False)
+        except FileNotFoundError:
+            with self.stage(body) as stage:
+                StitchProofDirectory.publish(self,stage,name)
+        # Preserve/create only, then independently rehash its named identity.
+        stitch_readback_file(self.root,self.relative+"/"+name,1024*1024,self.stop,(len(body),digest))
+        return digest
+
+    def read(self, digest, limit=1024*1024):
+        if type(digest) is not str or re.fullmatch(r"[a-f0-9]{64}",digest) is None:
+            raise StitchReadbackIntegrity("evidence blob digest differs")
+        self.check()
+        actual, body = stitch_readback_file(self.root,self.relative+"/"+digest+".blob",limit,self.stop,retain=True)
+        if actual[1] != digest:
+            raise StitchReadbackIntegrity("preserved evidence blob changed")
+        return body
+
+    def snapshot(self):
+        self.check()
+        try:
+            os.stat("state.json",dir_fd=self.fds[-1],follow_symlinks=False)
+        except FileNotFoundError:
+            if set(stitch_directory_entries(self.fds[-1],self.stop)) != {".lock"}:
+                raise StitchReadbackIntegrity("evidence checkpoint missing beside preserved bytes")
+            return StitchEvidenceSnapshot(False,"",b"")
+        actual, body = stitch_readback_file(self.root,self.relative+"/state.json",65536,self.stop,retain=True)
+        return StitchEvidenceSnapshot(True,actual[1],body)
+
+    def replace(self, expected, body):
+        if type(expected) is not StitchEvidenceSnapshot or type(body) is not bytes or not 0 < len(body) <= 65536:
+            raise StitchReadbackIntegrity("evidence checkpoint binding required")
+        if cleanup_json_bytes(stitch_proof_json(body)) != body:
+            raise StitchReadbackIntegrity("evidence checkpoint must be canonical JSON")
+        if self.snapshot() != expected:
+            raise StitchReadbackIntegrity("evidence checkpoint changed")
+        with self.stage(body) as stage:
+            self.check()
+            os.replace(stage,"state.json",src_dir_fd=self.fds[-1],dst_dir_fd=self.fds[-1])
+            os.fsync(self.fds[-1])
+        return self.snapshot()
 
 def stitch_proof_unpack(body):
     decoder = zlib.decompressobj(16+zlib.MAX_WBITS)

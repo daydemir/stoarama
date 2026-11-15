@@ -254,9 +254,17 @@ class ProofTests(unittest.TestCase):
         cfg.stitch_switches.apply(on);self.assertTrue(cfg.stitch_proof_enabled)
         self.assertFalse(cfg.stitch_enabled);self.assertFalse(cfg.stitch_delete_enabled)
         old=cfg.stitch_switches.proof[1]
-        for bad in [None,{},dict(on,stitch_proof_task_id=True),dict(on,stitch_proof_task_id=2),dict(on,stitch_enabled=True)]:
+        for bad in [None,{},dict(on,stitch_enabled=True)]:
             cfg.stitch_switches.apply(bad);self.assertTrue(old.is_set());self.assertFalse(cfg.stitch_proof_enabled)
             cfg.stitch_switches.apply(on);old=cfg.stitch_switches.proof[1]
+        for selector in (True,3,"1",None):
+            with self.assertRaises(ValueError):cfg.stitch_switches.apply(dict(on,stitch_proof_task_id=selector))
+            self.assertTrue(old.is_set());self.assertFalse(cfg.stitch_proof_enabled);self.assertFalse(cfg.stitch_readback_enabled)
+            cfg.stitch_switches.apply(on);old=cfg.stitch_switches.proof[1]
+        cfg.stitch_switches.apply(dict(on,stitch_proof_task_id=2))
+        self.assertTrue(old.is_set());self.assertFalse(cfg.stitch_proof_enabled);self.assertTrue(cfg.stitch_readback_enabled)
+        self.assertFalse(cfg.stitch_enabled);self.assertFalse(cfg.stitch_delete_enabled)
+        cfg.stitch_switches.apply(on)
         stop=pull.StitchStop(cfg,threading.Event(),kind=pull.StitchRunKind.PROOF)
         self.assertFalse(stop.is_set());cfg.stitch_switches.apply(None);self.assertTrue(stop.is_set())
 
