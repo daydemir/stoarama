@@ -42,8 +42,8 @@ func TestR2RetireDeliveryOnlyOrderingAndAllPicks(t *testing.T) {
 				c.SourceStart = c.StartAt
 				c.SourceEnd = c.EndAt
 			}
-			for _, choice := range []string{"none", "keep", "st", ""} {
-				picks := map[int64]r2RetirePick{3: {Choice: choice}}
+			for _, choice := range []string{"none", "keep", "st"} {
+				picks := map[int64]r2RetirePick{3: {Choice: choice, KeepStartUTC: w.Start.Format(time.RFC3339), KeepEndUTC: w.End.Format(time.RFC3339)}}
 				reason, choice, eligible := r2RetireDecideForScope(c, scope, windows, picks)
 				phases := newR2RetirePhases()
 				phases.add(c, reason, choice, eligible)

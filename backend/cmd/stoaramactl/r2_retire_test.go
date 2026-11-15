@@ -1291,7 +1291,8 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		if kept.Facts.ExactNAS || !kept.Facts.ListingPresence {
 			t.Fatal("old listing authorized kept footage instead of only vetoing outside retirement", kept.Facts)
 		}
-		if reason, _, eligible := r2RetireDecideForScope(kept, r2RetireScope{Class: r2RetireDeliveryOnly, Bucket: "stoarama", NASBacked: true}, windows, nil); eligible || reason != "copy_to_nas" {
+		picks := map[int64]r2RetirePick{3: {Choice: "none", KeepStartUTC: windows[3].Start.Format(time.RFC3339), KeepEndUTC: windows[3].End.Format(time.RFC3339)}}
+		if reason, _, eligible := r2RetireDecideForScope(kept, r2RetireScope{Class: r2RetireDeliveryOnly, Bucket: "stoarama", NASBacked: true}, windows, picks); eligible || reason != "copy_to_nas" {
 			t.Fatal("kept footage bypassed copy-first after newer physical absence", reason, eligible)
 		}
 		candidate := r2RetireCandidate{Kind: "raw", SourceID: 999997, RelativePath: "p/999997.mp4", SHA256: r2tSHA, SizeBytes: 1000997}
@@ -1466,6 +1467,29 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			t.Fatal("read-only plan changed lifecycle", purged, err)
 		}
 
+	})
+
+	t.Run("UnknownOwnerKeepsSharedOutputAndSourcesProtected", func(t *testing.T) {
+		output(2900, "joined/nightly-collation-v2/o/2900.mp4", outside, "{101,104}")
+		for _, known := range []bool{false, true} {
+			picks := map[int64]r2RetirePick{3: {Choice: "none", KeepStartUTC: windows[3].Start.Format(time.RFC3339), KeepEndUTC: windows[3].End.Format(time.RFC3339)}}
+			if known {
+				picks[4] = r2RetirePick{Choice: "none", KeepStartUTC: windows[4].Start.Format(time.RFC3339), KeepEndUTC: windows[4].End.Format(time.RFC3339)}
+			}
+			for _, sql := range []string{r2OwnerPolicySQL, r2RetireOwnerPlanSQL()} {
+				var safeSource, unsafeOutput, protectedSharedSource bool
+				query := r2RetireDeliverySourceSQL(sql) + `SELECT
+ EXISTS(SELECT 1 FROM safe_raw WHERE id=104),
+ EXISTS(SELECT 1 FROM unsafe_outputs WHERE id=2900),
+ EXISTS(SELECT 1 FROM unsafe_outputs WHERE id=2900 AND 101=ANY(source_clip_ids))`
+				if err := pool.QueryRow(ctx, query, r2RetireDeliveryPolicy(windows, picks), 47).Scan(&safeSource, &unsafeOutput, &protectedSharedSource); err != nil {
+					t.Fatal(err)
+				}
+				if safeSource != known || unsafeOutput == known || protectedSharedSource == known {
+					t.Fatalf("unknown ownership reduced protection: known=%v safe=%v unsafe=%v shared=%v", known, safeSource, unsafeOutput, protectedSharedSource)
+				}
+			}
+		}
 	})
 
 	var a errR2RetireAnomaly

@@ -59,14 +59,22 @@ func r2RetireDeliveryHeld(ctx context.Context, q r2RetireQuerier, bucket, key st
 	return nil
 }
 func r2RetireDeliveryDecide(c r2RetireCandidate, scope r2RetireScope, windows map[int64]api.Keep28Window, picks map[int64]r2RetirePick) (string, string, bool) {
-	if p, ok := picks[c.StreamID]; ok && p.Choice == "all" {
+	pick, known := picks[c.StreamID]
+	if pick.Choice == "all" {
 		return "pick_all", "all", false
 	}
 	w, ok := windows[c.StreamID]
 	if !ok {
 		return "no_keep_window", "", false
 	}
-	effective := map[int64]r2RetirePick{c.StreamID: {Choice: "none", KeepStartUTC: w.Start.Format(time.RFC3339), KeepEndUTC: w.End.Format(time.RFC3339)}}
+	choice := r2RetireDeliveryChoice(pick, known, w)
+	if choice == "" {
+		if known {
+			return "pick_window_mismatch", "", false
+		}
+		return "undecided", "", false
+	}
+	effective := map[int64]r2RetirePick{c.StreamID: {Choice: choice, KeepStartUTC: w.Start.Format(time.RFC3339), KeepEndUTC: w.End.Format(time.RFC3339)}}
 	outside := r2RetireOutside(w, c.StartAt, c.EndAt) && r2RetireOutside(w, c.SourceStart, c.SourceEnd)
 	// The owner waives absence proof outside keep28. Broad NAS presence and
 	// every other veto still win; only kept footage needs a verified copy.
@@ -80,21 +88,32 @@ func r2RetireDeliveryDecide(c r2RetireCandidate, scope r2RetireScope, windows ma
 	return reason, choice, eligible
 }
 func (c r2RetireClass) owner() bool { return c == r2RetireOwnerAccepted || c == r2RetireDeliveryOnly }
+
+// The owner permits valid non-All choices under this class, but an unknown
+// choice is never evidence of nonmembership in Keep All. All always vetoes.
+func r2RetireDeliveryChoice(pick r2RetirePick, known bool, window api.Keep28Window) string {
+	if pick.Choice == "all" {
+		return "all"
+	}
+	if r2RetireEffectiveChoice(pick, known, window) == "" {
+		return ""
+	}
+	return "none"
+}
+
 func r2RetireDeliveryChoices(picks map[int64]r2RetirePick, windows map[int64]api.Keep28Window) map[string]string {
 	out := map[string]string{}
-	for id := range windows {
-		choice := "none"
-		if picks[id].Choice == "all" {
-			choice = "all"
-		}
-		out[fmt.Sprint(id)] = choice
+	for id, window := range windows {
+		pick, known := picks[id]
+		out[fmt.Sprint(id)] = r2RetireDeliveryChoice(pick, known, window)
 	}
 	return out
 }
 func r2RetireDeliveryPolicy(windows map[int64]api.Keep28Window, picks map[int64]r2RetirePick) []byte {
 	effective := map[int64]r2RetirePick{}
 	for id, w := range windows {
-		if picks[id].Choice == "all" {
+		pick, known := picks[id]
+		if r2RetireDeliveryChoice(pick, known, w) != "none" {
 			continue
 		}
 		effective[id] = r2RetirePick{Choice: "none", KeepStartUTC: w.Start.Format(time.RFC3339), KeepEndUTC: w.End.Format(time.RFC3339)}
