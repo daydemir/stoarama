@@ -50,9 +50,15 @@ hashed without download; mismatched files and sidecars are preserved and HOLD.
 `stoaramactl nas-r2-copy plan` verifies the exact saved classification, pinned
 policy and all row/header totals before producing a new directory of immutable
 raw JSONL batches and `collated-blocked.jsonl`. Nothing is silently filtered.
-`queue` defaults to a read-only validation against one primary-key source at a
-time; `--apply` idempotently queues the reviewed batch. Every transaction has
-10s statement timeout, 2s lock timeout, 16 MB work memory and one CLI connection.
+`queue` defaults to read-only validation with four workers and at most four CLI
+connections, each checking one primary-key source at a time. `--apply`
+idempotently queues the reviewed batch. Every item has its own transaction with
+10s statement timeout, 2s lock timeout and 16 MB work memory per query operation.
+The entire manifest passes its SHA, totals and duplicate checks before work
+starts. Each item commits independently: a failure can leave any valid subset
+queued. The command cancels and joins its workers before reporting failure;
+repeat the exact manifest to finish an interrupted import. Existing queue
+identity and progress are preserved, and a conflicting identity refuses.
 All work remains bound to account 47 / connection 13 and the keep28 policy.
 
 `NAS_R2_COPY_ENABLED=false` is the server default. Four independent workers

@@ -15,14 +15,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/api"
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
 )
 
 // Manifest batches bound operator review/import size; they never limit transfer rate.
 const nasCopyBatchBytes int64 = 100_000_000_000
+const nasCopyQueueWorkers = 4
 
 type nasCopyHeader struct {
 	Version      int    `json:"version"`
@@ -265,6 +270,81 @@ func readNASCopyBatch(filename, expected string) (nasCopyHeader, []api.NASR2Copy
 	return h, items, nil
 }
 
+func nasR2CopyPoolConfig(databaseURL string, apply bool) (*pgxpool.Config, error) {
+	pc, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	pc.MaxConns = nasCopyQueueWorkers
+	pc.ConnConfig.RuntimeParams["statement_timeout"] = "10s"
+	pc.ConnConfig.RuntimeParams["work_mem"] = "16MB"
+	pc.ConnConfig.RuntimeParams["application_name"] = "stoarama-nas-r2-copy"
+	if !apply {
+		pc.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
+	}
+	return pc, nil
+}
+
+type nasCopyDB interface {
+	Begin(context.Context) (pgx.Tx, error)
+}
+
+func queueNASR2CopyItem(ctx context.Context, pool nasCopyDB, h nasCopyHeader, manifestSHA string, i api.NASR2CopyItem, apply bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tx, err := api.BeginNASR2CopyTx(ctx, pool)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// Cancellation must not skip rollback. A broken connection still has
+		// a hard cleanup deadline and is discarded by pgx on rollback failure.
+		cleanup, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = tx.Rollback(cleanup)
+	}()
+	if _, err = api.LoadNASR2CopySource(ctx, tx, i); err != nil {
+		return err
+	}
+	if !apply {
+		return tx.Rollback(ctx)
+	}
+	data, _ := json.Marshal(i)
+	var old []byte
+	err = tx.QueryRow(ctx, `INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item) VALUES(13,$1,$2,$3,$4,$5) ON CONFLICT(connection_id,kind,source_id) DO UPDATE SET source_id=excluded.source_id RETURNING item`, i.Kind, i.SourceID, manifestSHA, h.PolicySHA256, data).Scan(&old)
+	if err != nil {
+		return err
+	}
+	var existing api.NASR2CopyItem
+	if json.Unmarshal(old, &existing) != nil || existing != i {
+		return errors.New("queued source identity differs; preserved")
+	}
+	return tx.Commit(ctx)
+}
+
+func queueNASR2Copy(ctx context.Context, pool nasCopyDB, h nasCopyHeader, manifestSHA string, items []api.NASR2CopyItem, apply bool) error {
+	group, work := errgroup.WithContext(ctx)
+	var next atomic.Uint32
+	// Only four goroutines exist regardless of manifest size. Any failure can
+	// leave an arbitrary valid subset committed; exact-manifest restarts are
+	// idempotent. Wait joins all started work before the CLI reports failure.
+	for range nasCopyQueueWorkers {
+		group.Go(func() error {
+			for {
+				n := int(next.Add(1) - 1)
+				if n >= len(items) {
+					return nil
+				}
+				if err := queueNASR2CopyItem(work, pool, h, manifestSHA, items[n], apply); err != nil {
+					return fmt.Errorf("copy source %d: %w", items[n].SourceID, err)
+				}
+			}
+		})
+	}
+	return group.Wait()
+}
+
 func runNASR2Copy(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) == 0 {
 		log.Fatal("nas-r2-copy plan|queue|status")
@@ -286,16 +366,9 @@ func runNASR2Copy(ctx context.Context, cfg config.Config, args []string) {
 		_ = json.NewEncoder(os.Stdout).Encode(sum)
 		return
 	}
-	pc, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	pc, err := nasR2CopyPoolConfig(cfg.DatabaseURL, *apply)
 	if err != nil {
 		log.Fatal("invalid database configuration")
-	}
-	pc.MaxConns = 1
-	pc.ConnConfig.RuntimeParams["statement_timeout"] = "10s"
-	pc.ConnConfig.RuntimeParams["work_mem"] = "16MB"
-	pc.ConnConfig.RuntimeParams["application_name"] = "stoarama-nas-r2-copy"
-	if !*apply {
-		pc.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, pc)
 	if err != nil {
@@ -329,36 +402,9 @@ func runNASR2Copy(ctx context.Context, cfg config.Config, args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	var queued int
-	// Per-item transactions are bounded, idempotent and safely restartable.
-	for _, i := range items {
-		tx, e := api.BeginNASR2CopyTx(ctx, pool)
-		if e != nil {
-			log.Fatal(e)
-		}
-		_, e = api.LoadNASR2CopySource(ctx, tx, i)
-		if e == nil && *apply {
-			data, _ := json.Marshal(i)
-			var old []byte
-			e = tx.QueryRow(ctx, `INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item) VALUES(13,$1,$2,$3,$4,$5) ON CONFLICT(connection_id,kind,source_id) DO UPDATE SET source_id=excluded.source_id RETURNING item`, i.Kind, i.SourceID, *sha, h.PolicySHA256, data).Scan(&old)
-			var existing api.NASR2CopyItem
-			if e == nil && (json.Unmarshal(old, &existing) != nil || existing != i) {
-				e = errors.New("queued source identity differs; preserved")
-			}
-		}
-		if e != nil {
-			tx.Rollback(ctx)
-			log.Fatal(e)
-		}
-		if *apply {
-			e = tx.Commit(ctx)
-		} else {
-			e = tx.Rollback(ctx)
-		}
-		if e != nil {
-			log.Fatal(e)
-		}
-		queued++
+	if err = queueNASR2Copy(ctx, pool, h, *sha, items, *apply); err != nil {
+		pool.Close() // log.Fatal skips defers; also finish pgx's connection cleanup.
+		log.Fatal(err)
 	}
-	fmt.Printf("validated=%d queued=%t switch_unchanged=true deletes=0\n", queued, *apply)
+	fmt.Printf("validated=%d queued=%t switch_unchanged=true deletes=0\n", len(items), *apply)
 }
