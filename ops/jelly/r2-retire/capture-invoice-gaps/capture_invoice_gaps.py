@@ -392,14 +392,16 @@ def request_http(path, token):
         connection.sock.settimeout(6)
         connection.request("GET", path, headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
         response = connection.getresponse()
-        raw = bytearray()
-        while len(raw) <= BODY_LIMIT:
-            chunk = response.read(min(65536, BODY_LIMIT + 1 - len(raw)))
-            if not chunk:
-                break
-            raw.extend(chunk)
-        require(0 < len(raw) <= BODY_LIMIT, "HTTP body bound")
-        return response.status, response.getheader("x-request-id", ""), response.getheader("date", ""), bytes(raw)
+        length = response.getheader("Content-Length", "")
+        require(re.fullmatch(r"[0-9]{1,7}", length) is not None
+                and response.getheader("Transfer-Encoding") is None, "HTTP length framing required")
+        expected = int(length)
+        require(0 < expected <= BODY_LIMIT and response.length == expected and not response.chunked, "HTTP body bound")
+        # With a validated bounded length, read() uses HTTPResponse's exact
+        # read and raises IncompleteRead on premature EOF, even after valid JSON.
+        raw = response.read()
+        require(len(raw) == expected and response.length == 0, "HTTP body incomplete")
+        return response.status, response.getheader("x-request-id", ""), response.getheader("date", ""), raw
     finally:
         connection.close()
 

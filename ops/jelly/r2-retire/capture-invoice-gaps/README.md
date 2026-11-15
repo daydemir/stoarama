@@ -61,6 +61,11 @@ attempts skip durable failure writes and leave partial evidence/HOLD. The armed
 timer survives exec; interruption during
 interpreter startup may leave only a reserved/partial attempt. That is HOLD,
 never inferred success. Per-request connect/read limits are 3/6 seconds.
+Each response must have one decimal Content-Length between 1 byte and 2 MiB
+and no Transfer-Encoding. The parser must receive exactly that complete body;
+premature EOF, ambiguous framing and close-delimited/chunked bodies refuse
+before retention, even if the bytes already form valid JSON. Actual provider
+framing compatibility remains unproved until the separate operational phase.
 The input-channel watcher stops the owned process on EOF, unexpected input or
 channel failure. It stays active through manifest/checksum writes; its exit and
 a final channel check precede emitting success. A durable manifest can therefore

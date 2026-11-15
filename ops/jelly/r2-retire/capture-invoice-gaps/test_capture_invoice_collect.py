@@ -1,6 +1,8 @@
 """Offline collector mechanics using fake transport/credentials and own signals."""
 import copy
 import importlib.util
+import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -9,7 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('capture_gaps_collect', HERE / 'capture_invoice_gaps.py')
@@ -115,6 +117,66 @@ class CollectorTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             self.collect()  # started.json is exclusive: no second request.
         self.assertEqual(len(self.calls), 7)
+
+    def wire_response(self, headers, body):
+        socket = Mock()
+        socket.makefile.return_value = io.BytesIO(b'HTTP/1.1 200 OK\r\nx-request-id: SYNTHETIC\r\n' + headers + b'\r\n' + body)
+        response = http.client.HTTPResponse(socket)
+        response.begin()  # Actual stdlib framing parser; no network adapter.
+        self.addCleanup(response.close)
+        return response
+
+    def test_actual_http_parser_accepts_complete_bounded_length(self):
+        body = gaps.canonical(self.body(0))
+        response = self.wire_response(b'Content-Length: %d\r\n' % len(body), body)
+        connection = Mock()
+        connection.getresponse.return_value = response
+        with patch('http.client.HTTPSConnection', return_value=connection), patch('ssl.create_default_context', return_value=None):
+            status, request_id, _, raw = gaps.request_http('/SYNTHETIC', SYNTHETIC_TOKEN)
+        self.assertEqual((status, request_id, raw, response.length), (200, 'SYNTHETIC', body, 0))
+        connection.close.assert_called_once_with()
+
+    def test_actual_http_parser_refuses_premature_eof_after_valid_json(self):
+        body = gaps.canonical(self.body(0))
+        response = self.wire_response(b'Content-Length: %d\r\n' % (len(body) + 9), body)
+        connection = Mock()
+        connection.getresponse.return_value = response
+        with patch('http.client.HTTPSConnection', return_value=connection), patch('ssl.create_default_context', return_value=None):
+            with self.assertRaises((gaps.EvidenceError, http.client.IncompleteRead)):
+                gaps.request_http('/SYNTHETIC', SYNTHETIC_TOKEN)
+        connection.close.assert_called_once_with()
+
+    def test_truncated_framed_json_never_reaches_durable_collection(self):
+        responses = []
+        for index in range(7):
+            body = gaps.canonical(self.body(index))
+            responses.append(self.wire_response(b'Content-Length: %d\r\n' % (len(body) + 9), body))
+        connection = Mock()
+        connection.getresponse.side_effect = responses
+        with patch('http.client.HTTPSConnection', return_value=connection), patch('ssl.create_default_context', return_value=None):
+            with self.assertRaises(gaps.EvidenceError):
+                self.collect(gaps.request_http)
+        self.assertEqual(connection.request.call_count, 1)
+        self.assertEqual(self.failure()['completed_requests'], 0)
+        self.assertEqual(list(self.root.glob('*.body.json')), [])
+        self.assertFalse((self.root / 'manifest.json').exists())
+
+    def test_actual_http_parser_refuses_unbounded_or_ambiguous_framing(self):
+        body = b'{"SYNTHETIC":true}'
+        for headers in [b'', b'Content-Length: -1\r\n', b'Content-Length: invalid\r\n',
+                        b'Content-Length: 2097153\r\n', b'Content-Length: 0\r\n',
+                        b'Content-Length: 18\r\nContent-Length: 18\r\n',
+                        b'Transfer-Encoding: chunked\r\n',
+                        b'Transfer-Encoding: chunked\r\nContent-Length: 18\r\n']:
+            with self.subTest(headers=headers):
+                wire_body = b'12\r\n' + body + b'\r\n0\r\n\r\n' if b'Transfer-Encoding' in headers else body
+                response = self.wire_response(headers, wire_body)
+                connection = Mock()
+                connection.getresponse.return_value = response
+                with patch('http.client.HTTPSConnection', return_value=connection), patch('ssl.create_default_context', return_value=None):
+                    with self.assertRaises((gaps.EvidenceError, http.client.IncompleteRead)):
+                        gaps.request_http('/SYNTHETIC', SYNTHETIC_TOKEN)
+                connection.close.assert_called_once_with()
 
     def test_first_failure_preserves_stage_and_never_retries(self):
         def fetch(path, token):
