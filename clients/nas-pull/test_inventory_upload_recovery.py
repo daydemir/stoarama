@@ -12,6 +12,12 @@ import test_stoarama_pull as base
 pull = base.pull
 
 class InventoryUploadRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        disk = mock.patch.object(pull, "inventory_scratch_backing",
+            side_effect=lambda root: (Path(root).stat().st_dev, pull.InventoryScratchFilesystem.EXT4))
+        disk.start()
+        self.addCleanup(disk.stop)
+
     def fixture(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

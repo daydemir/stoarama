@@ -295,10 +295,10 @@ class ProofTests(unittest.TestCase):
             signature=('h264','avc1',10,10,'yuv420p','1/1','SHA256:'+'a'*64)
             packet='pts=0|dts=0|duration=1|size=1|flags=K__|data_hash=SHA256:'+'b'*64+'\n'
             (root/'packets').write_text(packet);(root/'frames').write_text('0,0,0,1,1,'+'c'*64+'\n')
-            source=pull.stitch_source_inventory(signature,root/'packets',root/'frames')
-            pull.stitch_output_inventory(signature,[source],root/'packets',root/'frames')
+            source=pull.stitch_source_inventory(signature,root/'packets',root/'frames',threading.Event())
+            pull.stitch_output_inventory(signature,[source],root/'packets',root/'frames',threading.Event())
             (root/'missing.frames').write_text('')
-            with self.assertRaises(pull.StitchHold):pull.stitch_output_inventory(signature,[source],root/'packets',root/'missing.frames')
+            with self.assertRaises(pull.StitchHold):pull.stitch_output_inventory(signature,[source],root/'packets',root/'missing.frames',threading.Event())
 
     @unittest.skipUnless(sys.platform.startswith('linux'),'actual Linux renameat2 required; exercised by Linux CI')
     def test_atomic_publication_adopts_exact_bytes_without_alias_or_quarantine(self):

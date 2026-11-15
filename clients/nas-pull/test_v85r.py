@@ -57,7 +57,7 @@ class V85rTests(unittest.TestCase):
                         cfg = SimpleNamespace(inventory_file=filename, api_key='fixture',
                                               api_base='http://127.0.0.1:%d/api/v1' % server.server_port)
                         with self.assertRaisesRegex(pull.StitchHold, 'frozen corpus hash/census differs'):
-                            pull.stitch_corpus(cfg, inventory)
+                            pull.stitch_corpus(cfg)
                         self.assertEqual(db.execute('SELECT count(*) FROM v85r_stitch_corpus_meta').fetchone()[0], 0)
                         self.assertEqual(db.execute('SELECT count(*) FROM v85r_stitch_edges').fetchone()[0], 0)
                 self.assertEqual(requests, [('/api/v1/account/connections/stitch/corpus', 'Bearer fixture')])
@@ -71,21 +71,21 @@ class V85rTests(unittest.TestCase):
         manifest=json.loads(raw)
         self.assertEqual(manifest['policy'],'v85r')
         with tempfile.TemporaryDirectory() as state:
-            installed=pull.stitch_v85r_bundle(state)
+            installed=pull.stitch_v85r_bundle(state, threading.Event())
             for name,pin in manifest['files'].items():
                 self.assertEqual(hashlib.sha256((installed/name).read_bytes()).hexdigest(),pin,name)
                 if name!='remeasure-linux-amd64':
                     self.assertEqual(hashlib.sha256((ROOT/'v85r'/name).read_bytes()).hexdigest(),pin,name)
             (installed/'runner.py').write_text('tampered')
             with self.assertRaisesRegex(pull.StitchHold,'installed V85r member hash'):
-                pull.stitch_v85r_bundle(state)
+                pull.stitch_v85r_bundle(state, threading.Event())
 
     def test_bundle_tamper_and_wrong_ffmpeg_refused(self):
         with tempfile.TemporaryDirectory() as state, mock.patch.object(pull,'V85R_BUNDLE',('0' if pull.V85R_BUNDLE[0]!='0' else '1')+pull.V85R_BUNDLE[1:]):
             with self.assertRaises((pull.StitchHold,ValueError)):
-                pull.stitch_v85r_bundle(state)
+                pull.stitch_v85r_bundle(state, threading.Event())
         with self.assertRaises(pull.StitchHold):
-            pull.stitch_v85r_provenance(dict(ffmpeg=__file__,ffprobe=__file__))
+            pull.stitch_v85r_provenance(dict(ffmpeg=__file__,ffprobe=__file__), threading.Event())
 
     def test_tool_download_installs_only_hash_verified_bytes(self):
         from types import SimpleNamespace
@@ -234,7 +234,7 @@ class V85rTests(unittest.TestCase):
             inventory=SimpleNamespace(lock=threading.RLock(),db=db)
             cfg=SimpleNamespace(inventory_file=filename,api_base='https://api.invalid',api_key='fixture')
             with mock.patch.object(pull.urllib.request,'urlopen',side_effect=lambda *a,**kw:open(os.environ['V85R_FROZEN_CORPUS'],'rb')):
-                pull.stitch_corpus(cfg,inventory)
+                pull.stitch_corpus(cfg)
             self.assertEqual(db.execute('SELECT count(*) FROM v85r_stitch_edges').fetchone()[0],73843)
             self.assertEqual(db.execute('SELECT count(*) FROM v85r_stitch_edges WHERE nomination=1').fetchone()[0],52462)
 
@@ -242,10 +242,10 @@ class V85rTests(unittest.TestCase):
                          'Linux amd64 with pinned V85R_TEST_TOOLS required')
     def test_actual_packaged_linux_producer_and_frozen_status_hold(self):
         tools={name:str(Path(os.environ['V85R_TEST_TOOLS'])/name) for name in ('ffmpeg','ffprobe')}
-        provenance=pull.stitch_v85r_provenance(tools)
+        provenance=pull.stitch_v85r_provenance(tools, threading.Event())
         self.assertEqual(provenance['ffmpeg_version'],'N-126826-gc0e8b139fd-20260924')
         with tempfile.TemporaryDirectory() as tmp:
-            work=Path(tmp);bundle=pull.stitch_v85r_bundle(work)
+            work=Path(tmp);bundle=pull.stitch_v85r_bundle(work, threading.Event())
             media=work/'source.mp4'
             subprocess.run([tools['ffmpeg'],'-nostdin','-v','error','-f','lavfi','-i','testsrc2=size=128x96:rate=25:duration=60',
                             '-c:v','libx264','-preset','ultrafast','-threads','1','-bf','0','-g','25','-pix_fmt','yuv420p',str(media)],check=True)

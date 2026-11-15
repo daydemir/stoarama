@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import struct
 import tempfile
+import threading
 import unittest
 
 from test_stitch_proof import pull, verify, synthetic_receipt
@@ -97,10 +98,10 @@ class EditListTests(unittest.TestCase):
             good=box(b'moov',box(b'mvhd',e['movie_header'])+trak,wide=bool(version))
             with tempfile.TemporaryDirectory() as temp:
                 path=Path(temp)/'synthetic-boxes.mp4';path.write_bytes(good)
-                self.assertEqual(pull.stitch_editlist_metadata(path),evidence(version=version))
+                self.assertEqual(pull.stitch_editlist_metadata(path,threading.Event()),evidence(version=version))
                 for malformed in [good[:-1],b'\0\0\0\0mdat',good+box(b'moof',b''),box(b'moov',box(b'mvhd',e['movie_header'])+trak+trak),good+good]:
                     path.write_bytes(malformed)
-                    with self.assertRaises(pull.StitchHold):pull.stitch_editlist_metadata(path)
+                    with self.assertRaises(pull.StitchHold):pull.stitch_editlist_metadata(path,threading.Event())
 
     def test_real_census_packet_lists_replay_without_raw_byte_equality(self):
         fixtures=json.loads(gzip.decompress(Path(__file__).with_name('testdata').joinpath('editlist-census-packets.json.gz').read_bytes()))
