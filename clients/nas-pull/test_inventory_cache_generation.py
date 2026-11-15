@@ -8,14 +8,20 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from test_stoarama_pull import NASPullTests, pull
+import test_stoarama_pull as base
+
+pull = base.pull
 
 
 class InventoryGenerationCacheTests(unittest.TestCase):
     def setUp(self):
+        disk = mock.patch.object(pull, "inventory_scratch_backing",
+            side_effect=lambda root: (Path(root).stat().st_dev, pull.InventoryScratchFilesystem.EXT4))
+        disk.start()
+        self.addCleanup(disk.stop)
         self.scratch = tempfile.TemporaryDirectory()
         self.addCleanup(self.scratch.cleanup)
-        self.cfg = NASPullTests().config(Path(self.scratch.name))
+        self.cfg = base.NASPullTests().config(Path(self.scratch.name))
         self.inventory = pull.Inventory(self.cfg)
         self.addCleanup(self.inventory.close)
         self.old_verified = "2026-08-09T00:00:00Z"

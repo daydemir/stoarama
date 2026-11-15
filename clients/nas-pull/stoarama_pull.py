@@ -855,6 +855,80 @@ def post_inventory_scan_page(cfg, body, stop_event=None):
         delay = min(delay * 2, 30)
 
 
+class InventoryScratchFilesystem(Enum):
+    BTRFS = "btrfs"
+    EXT4 = "ext4"
+    XFS = "xfs"
+
+
+def inventory_scratch_backing(root):
+    """Require positive disk backing, not a FILE pragma on an unknown /tmp."""
+    root = Path(root).resolve(strict=True)
+    device = root.stat().st_dev
+    device_name = "%d:%d" % (os.major(device), os.minor(device))
+    matches = []
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        fields, filesystem = line.split(" - ", 1)
+        row = fields.split()
+        if len(row) < 5 or not filesystem.split():
+            raise InventoryProgressError("inventory scratch mount metadata invalid")
+        mount = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), row[4])
+        if row[2] == device_name and (root == Path(mount) or Path(mount) in root.parents):
+            matches.append((len(Path(mount).parts), filesystem.split()[0]))
+    if not matches:
+        raise InventoryProgressError("inventory scratch backing is unknown")
+    try:
+        filesystem = InventoryScratchFilesystem(max(matches)[1])
+    except ValueError:
+        raise InventoryProgressError("inventory scratch requires disk-backed storage") from None
+    storage = os.statvfs(root)
+    if storage.f_bavail * storage.f_frsize < 1024**3:
+        raise InventoryProgressError("inventory scratch reserve reached")
+    return device, filesystem
+
+
+class InventoryPathIndex:
+    """Per-pass non-authoritative disk index with a bounded SQLite page cache."""
+    def __init__(self, cfg):
+        self.root = Path(cfg.state_dir).resolve(strict=True)
+        self.pending = 0
+
+    def __enter__(self):
+        self.backing = inventory_scratch_backing(self.root)
+        storage = os.statvfs(self.root)
+        log("INFO", "inventory path index qualified filesystem=%s device=%d free_bytes=%d" %
+            (self.backing[1].value, self.backing[0], storage.f_bavail * storage.f_frsize))
+        self.resources = ExitStack()
+        try:
+            directory = self.resources.enter_context(tempfile.TemporaryDirectory(prefix="inventory-paths-", dir=self.root))
+            self.db = sqlite3.connect(str(Path(directory) / "paths.sqlite3"))
+            self.resources.callback(self.db.close)
+            self.db.execute("PRAGMA cache_size=-2048")
+            self.db.execute("CREATE TABLE paths(path BLOB PRIMARY KEY) WITHOUT ROWID")
+            return self
+        except BaseException:
+            self.resources.close()
+            raise
+
+    def checkpoint(self):
+        if inventory_scratch_backing(self.root) != self.backing:
+            raise InventoryProgressError("inventory scratch backing changed")
+        self.db.commit()
+        self.pending = 0
+
+    def add(self, path):
+        self.db.execute("INSERT OR IGNORE INTO paths VALUES(?)", (path.encode("utf-8", "surrogatepass"),))
+        self.pending += 1
+        if self.pending >= INVENTORY_SYNC_BATCH:
+            self.checkpoint()
+
+    def __contains__(self, path):
+        return self.db.execute("SELECT 1 FROM paths WHERE path=?", (path.encode("utf-8", "surrogatepass"),)).fetchone() is not None
+
+    def __exit__(self, *_):
+        self.resources.close()
+
+
 class Inventory:
     """Durable, locally authoritative NAS clip inventory.
 
@@ -1395,190 +1469,191 @@ class Inventory:
         skip_reasons = {}
         self._meta_set({"scan_pass_started_at": pass_started_at, "scan_rows_visited": "0", "scan_rows_skipped": "0", "scan_skip_reasons": "{}"})
 
-        known_paths = set()
-        for sidecar in walk_raw_files(cfg.output_dir):
-            if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
-                self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
-                return
-            if not sidecar.name.endswith(".stoarama.json"):
-                continue
-            if stop_event.is_set():
-                self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
-                return
-            try:
-                sidecar_bytes, _sidecar_stat = stable_regular_file_bytes(sidecar, 1024 * 1024)
-                clip = json.loads(sidecar_bytes.decode("utf-8"))
-                relative = valid_relative_path(clip)
-                if str(relative) != str(clip.get("relative_path", "")):
-                    raise ValueError("sidecar path is not canonical")
-                path = cfg.output_dir / relative
-                if sidecar != stitch_sidecar_path(path):
-                    raise ValueError("sidecar location does not match its clip path")
-                expected_size = int(clip["size_bytes"])
-                expected_sha = str(clip["sha256"]).lower()
-                if len(expected_sha) != 64 or any(ch not in "0123456789abcdef" for ch in expected_sha):
-                    raise ValueError("sidecar checksum is invalid")
-                sidecar_relative = str(sidecar.relative_to(cfg.output_dir))
-                sidecar_evidence = (sidecar_relative, len(sidecar_bytes), hashlib.sha256(sidecar_bytes).hexdigest())
-                known_paths.add(str(relative))
-                self._retire_unmatched_linked_path(str(relative), generation, scan_pass, pending)
-                if self._linked_scan_row_is_current(clip, generation, scan_pass, path, sidecar_evidence, pending):
-                    scanned += 1
-                    if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
-                        self._publish_scan_batch(
-                            cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending,
-                        )
+        with InventoryPathIndex(cfg) as known_paths:
+            for sidecar in walk_raw_files(cfg.output_dir):
+                if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
+                    self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
+                    return
+                if not sidecar.name.endswith(".stoarama.json"):
                     continue
+                if stop_event.is_set():
+                    self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
+                    return
                 try:
-                    stat = path.stat()
-                except FileNotFoundError:
-                    stat = None
-                if stat is not None:
+                    sidecar_bytes, _sidecar_stat = stable_regular_file_bytes(sidecar, 1024 * 1024)
+                    clip = json.loads(sidecar_bytes.decode("utf-8"))
+                    relative = valid_relative_path(clip)
+                    if str(relative) != str(clip.get("relative_path", "")):
+                        raise ValueError("sidecar path is not canonical")
+                    path = cfg.output_dir / relative
+                    if sidecar != stitch_sidecar_path(path):
+                        raise ValueError("sidecar location does not match its clip path")
+                    expected_size = int(clip["size_bytes"])
+                    expected_sha = str(clip["sha256"]).lower()
+                    if len(expected_sha) != 64 or any(ch not in "0123456789abcdef" for ch in expected_sha):
+                        raise ValueError("sidecar checksum is invalid")
+                    sidecar_relative = str(sidecar.relative_to(cfg.output_dir))
+                    sidecar_evidence = (sidecar_relative, len(sidecar_bytes), hashlib.sha256(sidecar_bytes).hexdigest())
+                    known_paths.add(str(relative))
+                    self._retire_unmatched_linked_path(str(relative), generation, scan_pass, pending)
+                    if self._linked_scan_row_is_current(clip, generation, scan_pass, path, sidecar_evidence, pending):
+                        scanned += 1
+                        if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
+                            self._publish_scan_batch(
+                                cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending,
+                            )
+                        continue
                     try:
-                        actual_size, actual_sha, stat = sha256_file_throttled_stable(path, cfg.inventory_hash_mbps, stop_event)
+                        stat = path.stat()
                     except FileNotFoundError:
+                        stat = None
+                    if stat is not None:
+                        try:
+                            actual_size, actual_sha, stat = sha256_file_throttled_stable(path, cfg.inventory_hash_mbps, stop_event)
+                        except FileNotFoundError:
+                            state, verified_at, mtime_ns = "missing", None, 0
+                            identity = (0, 0, 0)
+                        except FileChangedDuringHash:
+                            self._upsert(
+                                clip, "mismatch", None, 0, generation, pending=pending,
+                                scan_pass=scan_pass, file_identity=(0, 0, 0),
+                            )
+                            raise
+                        else:
+                            state = "present" if actual_size == expected_size and actual_sha == expected_sha else "mismatch"
+                            verified_at = utc_now_precise() if state == "present" else None
+                            mtime_ns = stat.st_mtime_ns
+                            identity = (stat.st_ctime_ns, stat.st_ino, stat.st_dev)
+                    else:
                         state, verified_at, mtime_ns = "missing", None, 0
                         identity = (0, 0, 0)
-                    except FileChangedDuringHash:
-                        self._upsert(
-                            clip, "mismatch", None, 0, generation, pending=pending,
-                            scan_pass=scan_pass, file_identity=(0, 0, 0),
-                        )
-                        raise
-                    else:
-                        state = "present" if actual_size == expected_size and actual_sha == expected_sha else "mismatch"
-                        verified_at = utc_now_precise() if state == "present" else None
-                        mtime_ns = stat.st_mtime_ns
-                        identity = (stat.st_ctime_ns, stat.st_ino, stat.st_dev)
-                else:
-                    state, verified_at, mtime_ns = "missing", None, 0
-                    identity = (0, 0, 0)
-                self._upsert(clip, state, verified_at, mtime_ns, generation, pending=pending, scan_pass=scan_pass, file_identity=identity, sidecar_evidence=sidecar_evidence)
-                scanned += 1
-                if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
-                    self._publish_scan_batch(
-                        cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending,
-                    )
-                if cfg.inventory_scan_delay_ms:
-                    stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
-            except InventoryScanStopped:
-                self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
-                return
-            except sqlite3.Error as exc:
-                raise InventoryProgressError("inventory state persistence failed") from exc
-            except InventoryProgressError:
-                raise
-            except Exception as exc:
-                skipped += 1
-                reason = inventory_skip_reason(exc, sidecar=True)
-                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
-                log("WARN", f"inventory skipped reason={reason} count={skip_reasons[reason]}")
-                if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
-                    self._publish_scan_batch(cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending)
-        for path in walk_raw_files(cfg.output_dir):
-            if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
-                self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
-                return
-            if stop_event.is_set():
-                self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
-                return
-            try:
-                if (
-                    not path.is_file()
-                    or path.name.endswith(".stoarama.json")
-                    or re.fullmatch(r".+\.part-\d+", path.name)
-                    or re.fullmatch(r"\..+\.invalid-\d+-\d+", path.name)
-                ):
-                    continue
-                relative = str(path.relative_to(cfg.output_dir))
-                if relative in known_paths:
-                    continue
-                stat = path.stat()
-                if self._unmatched_scan_row_is_current(relative, generation, scan_pass, stat, pending):
+                    self._upsert(clip, state, verified_at, mtime_ns, generation, pending=pending, scan_pass=scan_pass, file_identity=identity, sidecar_evidence=sidecar_evidence)
                     scanned += 1
                     if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
                         self._publish_scan_batch(
                             cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending,
                         )
-                    continue
-                size_bytes, sha256, stat = sha256_file_throttled_stable(path, cfg.inventory_hash_mbps, stop_event)
-                updated_at = utc_now_precise()
-                with self.lock:
-                    self._scan_write(pending,
-                        """INSERT INTO unmatched_files(relative_path,size_bytes,sha256,state,file_mtime_ns,file_ctime_ns,file_inode,file_device,seen_generation,scan_pass,client_updated_at,dirty)
-                           VALUES(?,?,?,'present',?,?,?,?,?,?,?,1)
-                           ON CONFLICT(relative_path) DO UPDATE SET size_bytes=excluded.size_bytes,sha256=excluded.sha256,
-                             state='present',file_mtime_ns=excluded.file_mtime_ns,file_ctime_ns=excluded.file_ctime_ns,
-                             file_inode=excluded.file_inode,file_device=excluded.file_device,
-                             seen_generation=excluded.seen_generation,scan_pass=excluded.scan_pass,
-                             client_updated_at=excluded.client_updated_at,dirty=1
-                           WHERE unmatched_files.client_updated_at<=excluded.client_updated_at""",
-                        (relative, size_bytes, sha256, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino, stat.st_dev, generation, scan_pass, updated_at),
-                    )
-                scanned += 1
-                if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
-                    self._publish_scan_batch(
-                        cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending,
-                    )
-                if cfg.inventory_scan_delay_ms:
-                    stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
-            except InventoryScanStopped:
-                self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
+                    if cfg.inventory_scan_delay_ms:
+                        stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
+                except InventoryScanStopped:
+                    self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
+                    return
+                except sqlite3.Error as exc:
+                    raise InventoryProgressError("inventory state persistence failed") from exc
+                except InventoryProgressError:
+                    raise
+                except Exception as exc:
+                    skipped += 1
+                    reason = inventory_skip_reason(exc, sidecar=True)
+                    skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                    log("WARN", f"inventory skipped reason={reason} count={skip_reasons[reason]}")
+                    if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
+                        self._publish_scan_batch(cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending)
+            for path in walk_raw_files(cfg.output_dir):
+                if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
+                    self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
+                    return
+                if stop_event.is_set():
+                    self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
+                    return
+                try:
+                    if (
+                        not path.is_file()
+                        or path.name.endswith(".stoarama.json")
+                        or re.fullmatch(r".+\.part-\d+", path.name)
+                        or re.fullmatch(r"\..+\.invalid-\d+-\d+", path.name)
+                    ):
+                        continue
+                    relative = str(path.relative_to(cfg.output_dir))
+                    if relative in known_paths:
+                        continue
+                    stat = path.stat()
+                    if self._unmatched_scan_row_is_current(relative, generation, scan_pass, stat, pending):
+                        scanned += 1
+                        if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
+                            self._publish_scan_batch(
+                                cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending,
+                            )
+                        continue
+                    size_bytes, sha256, stat = sha256_file_throttled_stable(path, cfg.inventory_hash_mbps, stop_event)
+                    updated_at = utc_now_precise()
+                    with self.lock:
+                        self._scan_write(pending,
+                            """INSERT INTO unmatched_files(relative_path,size_bytes,sha256,state,file_mtime_ns,file_ctime_ns,file_inode,file_device,seen_generation,scan_pass,client_updated_at,dirty)
+                               VALUES(?,?,?,'present',?,?,?,?,?,?,?,1)
+                               ON CONFLICT(relative_path) DO UPDATE SET size_bytes=excluded.size_bytes,sha256=excluded.sha256,
+                                 state='present',file_mtime_ns=excluded.file_mtime_ns,file_ctime_ns=excluded.file_ctime_ns,
+                                 file_inode=excluded.file_inode,file_device=excluded.file_device,
+                                 seen_generation=excluded.seen_generation,scan_pass=excluded.scan_pass,
+                                 client_updated_at=excluded.client_updated_at,dirty=1
+                               WHERE unmatched_files.client_updated_at<=excluded.client_updated_at""",
+                            (relative, size_bytes, sha256, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino, stat.st_dev, generation, scan_pass, updated_at),
+                        )
+                    scanned += 1
+                    if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
+                        self._publish_scan_batch(
+                            cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending,
+                        )
+                    if cfg.inventory_scan_delay_ms:
+                        stop_event.wait(cfg.inventory_scan_delay_ms / 1000.0)
+                except InventoryScanStopped:
+                    self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
+                    return
+                except sqlite3.Error as exc:
+                    raise InventoryProgressError("inventory state persistence failed") from exc
+                except InventoryProgressError:
+                    raise
+                except Exception as exc:
+                    skipped += 1
+                    reason = inventory_skip_reason(exc, sidecar=False)
+                    skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                    log("WARN", f"inventory skipped reason={reason} count={skip_reasons[reason]}")
+                    if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
+                        self._publish_scan_batch(cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending)
+            known_paths.checkpoint()
+            # Flush and publish every successfully observed row, but never promote a
+            # partial generation. In particular, do not turn unseen prior rows into
+            # "missing" when an unreadable/corrupt path was skipped.
+            self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
+            self.sync_dirty(cfg, generation, started_at, stop_event=stop_event)
+            if stop_event.is_set():
                 return
-            except sqlite3.Error as exc:
-                raise InventoryProgressError("inventory state persistence failed") from exc
-            except InventoryProgressError:
-                raise
-            except Exception as exc:
-                skipped += 1
-                reason = inventory_skip_reason(exc, sidecar=False)
-                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
-                log("WARN", f"inventory skipped reason={reason} count={skip_reasons[reason]}")
-                if (scanned + skipped) % INVENTORY_SYNC_BATCH == 0:
-                    self._publish_scan_batch(cfg, generation, started_at, (scanned, skipped, skip_reasons), stop_event, pending)
-        # Flush and publish every successfully observed row, but never promote a
-        # partial generation. In particular, do not turn unseen prior rows into
-        # "missing" when an unreadable/corrupt path was skipped.
-        self._commit_scan_batch((scanned, skipped, skip_reasons), pending)
-        self.sync_dirty(cfg, generation, started_at, stop_event=stop_event)
-        if stop_event.is_set():
-            return
-        if skipped:
-            raise RuntimeError("inventory scan incomplete: %d path(s) could not be verified" % skipped)
-        completed_at = utc_now_precise()
-        with self.lock:
-            self.db.execute(
-                """UPDATE files SET state='missing',verified_at=NULL,seen_generation=?,scan_pass=?,dirty=1,client_updated_at=?
-                   WHERE state<>'missing' AND scan_pass<>? AND (seen_generation=? OR client_updated_at<=?)
-                     AND relative_path<>'#recycle' AND relative_path NOT GLOB '#recycle/*' AND relative_path<>'joined' AND relative_path NOT GLOB 'joined/*'""",
-                (generation, scan_pass, completed_at, scan_pass, generation, pass_started_at),
-            )
-            self.db.execute(
-                """UPDATE unmatched_files SET state='missing',seen_generation=?,scan_pass=?,dirty=1,client_updated_at=?
-                   WHERE state<>'missing' AND scan_pass<>? AND (seen_generation=? OR client_updated_at<=?)
-                     AND relative_path<>'#recycle' AND relative_path NOT GLOB '#recycle/*' AND relative_path<>'joined' AND relative_path NOT GLOB 'joined/*'""",
-                (generation, scan_pass, completed_at, scan_pass, generation, pass_started_at),
-            )
-            self.db.commit()
-        self.sync_dirty(cfg, generation, started_at, stop_event=stop_event)
-        if stop_event.is_set():
-            return
-        digest, clips, total_bytes, mismatches, unmatched = self._digest_and_counts()
-        if stop_event.is_set():
-            return
-        if not post_inventory_scan_page(cfg, {
-            "generation": generation, "scan_started_at": started_at,
-            "dataset_schema": INVENTORY_DATASET_SCHEMA, "root_exclusions": list(INVENTORY_ROOT_EXCLUSIONS),
-            "scan_completed_at": completed_at, "digest": digest, "complete": True, "files": [],
-        }, stop_event):
-            return
-        self._meta_set({
-            "generation": generation, "scan_started_at": started_at,
-            "scan_completed_at": completed_at, "digest": digest,
-            "clips": str(clips), "bytes": str(total_bytes), "mismatches": str(mismatches),
-            "unmatched": str(unmatched),
-        })
-        log("INFO", "inventory scan complete generation=%s clips=%d bytes=%d mismatches=%d unmatched=%d" % (generation, clips, total_bytes, mismatches, unmatched))
+            if skipped:
+                raise RuntimeError("inventory scan incomplete: %d path(s) could not be verified" % skipped)
+            completed_at = utc_now_precise()
+            with self.lock:
+                self.db.execute(
+                    """UPDATE files SET state='missing',verified_at=NULL,seen_generation=?,scan_pass=?,dirty=1,client_updated_at=?
+                       WHERE state<>'missing' AND scan_pass<>? AND (seen_generation=? OR client_updated_at<=?)
+                         AND relative_path<>'#recycle' AND relative_path NOT GLOB '#recycle/*' AND relative_path<>'joined' AND relative_path NOT GLOB 'joined/*'""",
+                    (generation, scan_pass, completed_at, scan_pass, generation, pass_started_at),
+                )
+                self.db.execute(
+                    """UPDATE unmatched_files SET state='missing',seen_generation=?,scan_pass=?,dirty=1,client_updated_at=?
+                       WHERE state<>'missing' AND scan_pass<>? AND (seen_generation=? OR client_updated_at<=?)
+                         AND relative_path<>'#recycle' AND relative_path NOT GLOB '#recycle/*' AND relative_path<>'joined' AND relative_path NOT GLOB 'joined/*'""",
+                    (generation, scan_pass, completed_at, scan_pass, generation, pass_started_at),
+                )
+                self.db.commit()
+            self.sync_dirty(cfg, generation, started_at, stop_event=stop_event)
+            if stop_event.is_set():
+                return
+            digest, clips, total_bytes, mismatches, unmatched = self._digest_and_counts()
+            if stop_event.is_set():
+                return
+            if not post_inventory_scan_page(cfg, {
+                "generation": generation, "scan_started_at": started_at,
+                "dataset_schema": INVENTORY_DATASET_SCHEMA, "root_exclusions": list(INVENTORY_ROOT_EXCLUSIONS),
+                "scan_completed_at": completed_at, "digest": digest, "complete": True, "files": [],
+            }, stop_event):
+                return
+            self._meta_set({
+                "generation": generation, "scan_started_at": started_at,
+                "scan_completed_at": completed_at, "digest": digest,
+                "clips": str(clips), "bytes": str(total_bytes), "mismatches": str(mismatches),
+                "unmatched": str(unmatched),
+            })
+            log("INFO", "inventory scan complete generation=%s clips=%d bytes=%d mismatches=%d unmatched=%d" % (generation, clips, total_bytes, mismatches, unmatched))
 
 
 # Independent metadata-only proof. It never opens media for reading or shares
@@ -46722,6 +46797,12 @@ class StitchHold(RuntimeError):
     pass
 
 
+class StitchNativeFailure(StitchHold):
+    def __init__(self, returncode):
+        self.returncode = returncode
+        super().__init__("native proof process failed")
+
+
 def stitch_resources(cfg, input_bytes=0):
     """Unknown resource telemetry is HOLD. Consult cgroup headroom as well."""
     import shutil
@@ -46774,8 +46855,12 @@ class StitchStop:
     def __init__(self, cfg, stop, task=None, kind=StitchRunKind.PRODUCTION):
         self.cfg, self.stop, self.task, self.reason = cfg, stop, task, ""
         self.kind = kind
+        self.failure = None
         self.measurements = []
         self.started = time.monotonic()
+        self.deadline = (self.started + (parse_certification_timestamp(task["expires_at"], "proof expiry")
+            - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 30
+            if kind is StitchRunKind.PROOF and task is not None else None)
         self.run_id = str(uuid.uuid4())
         self.started_at = utc_now()
         switches = getattr(cfg, "stitch_switches", None)
@@ -46786,6 +46871,8 @@ class StitchStop:
     def is_set(self):
         if self.stop.is_set():
             return True
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            self.reason = "proof deadline reached"
         if ((self.switch_cancel is not None and self.switch_cancel.is_set())
                 or not getattr(self.cfg, "stitch_proof_enabled" if self.kind is StitchRunKind.PROOF else "stitch_enabled", False)):
             self.reason = "stitch switch off"
@@ -46820,6 +46907,24 @@ class StitchStop:
         self.monitor.join(timeout=1)
 
 
+@contextmanager
+def stitch_proof_activity(inventory, stop):
+    STITCH_STATUS.update(state="proof_waiting_inventory")
+    while not stop.is_set():
+        remaining = stop.deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if inventory.activity_lock.acquire(timeout=min(.25, remaining)):
+            try:
+                if stop.is_set():
+                    raise StitchHold(stop.reason or "proof cancelled")
+                yield
+                return
+            finally:
+                inventory.activity_lock.release()
+    raise StitchHold(stop.reason or "proof inventory wait expired")
+
+
 def stitch_run(args, deadline, stop, stdout=None):
     # The worker thread is already nice19/idle; explicitly apply the same
     # priorities to FFmpeg and ffprobe children. No '-t' silent ionice fallback.
@@ -46828,6 +46933,8 @@ def stitch_run(args, deadline, stop, stdout=None):
     if getattr(stop, "kind", None) is StitchRunKind.PROOF:
         stop.measurements.append(dict(argv=list(map(str, args)), returncode=measured["returncode"], wall_s=measured.get("wall_s"), cpu_s=measured.get("cpu_s")))
     if measured["returncode"] != 0:
+        if getattr(stop, "kind", None) is StitchRunKind.PROOF:
+            raise StitchNativeFailure(measured["returncode"])
         raise StitchHold("native media check failed: " + measured["stderr"][:200])
     return measured
 
@@ -46950,15 +47057,20 @@ V85R_TOOLS = {
 
 def stitch_v85r_tools(cfg, deadline, stop):
     import platform
+    _check_benchmark_tool_budget(deadline, stop)
     if not sys.platform.startswith("linux") or benchmark_tool_arch(platform.machine()) != "x86_64":
         raise StitchHold("V85r requires Linux x86_64")
     root = Path(cfg.state_dir)/"tools"/("v85r-ffmpeg-"+V85R_TOOL_VERSION)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     tools = {}
     for name,(sha,size) in V85R_TOOLS.items():
+        _check_benchmark_tool_budget(deadline, stop)
         target = root/name
         if not _verified_binary(target,sha):
-            capability = request_json(cfg,"GET","/account/connections/stitch/tools/"+name)
+            _check_benchmark_tool_budget(deadline, stop)
+            capability = request_json(cfg,"GET","/account/connections/stitch/tools/"+name,
+                                      timeout=min(HEARTBEAT_TIMEOUT_SEC, max(.1, deadline-time.monotonic())))
+            _check_benchmark_tool_budget(deadline, stop)
             if capability.get("sha256") != sha or capability.get("size_bytes") != size:
                 raise StitchHold("V85r tool capability identity differs")
             url = capability["url"]
@@ -46990,6 +47102,7 @@ def stitch_v85r_tools(cfg, deadline, stop):
             finally:
                 try:temporary.unlink()
                 except FileNotFoundError:pass
+        _check_benchmark_tool_budget(deadline, stop)
         tools[name]=str(target)
     return tools
 
@@ -47004,25 +47117,249 @@ def stitch_v85r_provenance(tools):
                 october_ffmpeg_recovered=True)
 
 
+class StitchMeasureStage(Enum):
+    SOURCE = "source"
+    FEATURE = "feature"
+    FROZEN = "frozen"
+    REQUEST = "request"
+    DRIVER = "driver"
+    CLASSIFIER = "classifier"
+    VETO = "veto"
+    NATIVE = "native"
+    RESULT = "result"
+    DECISION = "decision"
+    RESOLVE = "resolve"
+    SETUP = "setup"
+    BUILD = "build"
+
+
+class StitchMeasurePhase(Enum):
+    NONE = "none"
+    REQUESTED = "requested"
+    ACTUAL = "actual"
+
+
+class StitchMeasureInput(Enum):
+    LEFT = "left"
+    RIGHT = "right"
+    PAIR = "pair"
+
+
+class StitchMeasureError(Enum):
+    STITCH_HOLD = "StitchHold"
+    SOURCE = "MediaCertificationError"
+    IO = "OSError"
+    MISSING_FILE = "FileNotFoundError"
+    PERMISSION = "PermissionError"
+    VALUE = "ValueError"
+    KEY = "KeyError"
+    DEADLINE = "BenchmarkDeadline"
+    BENCHMARK = "BenchmarkError"
+    TIMEOUT = "TimeoutExpired"
+    CHILD = "CalledProcessError"
+    PROCESS = "StitchNativeFailure"
+    JSON = "JSONDecodeError"
+    TYPE = "TypeError"
+    ATTRIBUTE = "AttributeError"
+    MEMORY = "MemoryError"
+    RUNTIME = "RuntimeError"
+    ASSERTION = "AssertionError"
+    CANCELLED = "InventoryScanStopped"
+    POLICY_HOLD = "PolicyHold"
+    NATIVE_SOURCE = "NativeSourceIntegrity"
+    NATIVE_ERROR = "NativeError"
+    UNEXPECTED = "UnexpectedError"
+
+
+class StitchMeasureHoldReason(Enum):
+    NONE = "none"
+    MISSING = "missing_input_or_decoder_error"
+    FROZEN_IDENTITY = "frozen_identity_mismatch"
+    FROZEN_DECISION = "october_decision_difference"
+    NEGATIVE = "policy_negative"
+    AMBIGUOUS = "ambiguous_status"
+    MEASUREMENT = "measurement_failed"
+    UNKNOWN = "unknown"
+
+
+def stitch_measure_error(exc):
+    try:
+        return StitchMeasureError(type(exc).__name__)
+    except ValueError:
+        return StitchMeasureError.IO if isinstance(exc, OSError) else StitchMeasureError.UNEXPECTED
+
+
+def stitch_measure_failure(stop, stage, source, error, phase=StitchMeasurePhase.NONE,
+                           returncode=None, timeout=None, native_error=False, source_integrity=False,
+                           hold_reason=StitchMeasureHoldReason.NONE):
+    if getattr(stop, "kind", None) is not StitchRunKind.PROOF or stop.failure is not None:
+        return
+    stop.failure = dict(stage=stage.value, input=source.value, error=error.value, phase=phase.value,
+        returncode=returncode, timeout=timeout, native_error=native_error,
+        source_integrity=source_integrity or error is StitchMeasureError.SOURCE,
+        command_index=len(stop.measurements), hold_reason=hold_reason.value)
+    STITCH_STATUS.update(failure=dict(stop.failure, run_id=stop.run_id, plan_sha256=stop.task["plan_sha256"], at=utc_now()))
+    log("ERROR" if source_integrity or error is StitchMeasureError.SOURCE else "WARN",
+        "V85r proof measurement failure " + cleanup_json_bytes(stop.failure).decode())
+
+
+@contextmanager
+def stitch_measure_stage(stop, stage, source=StitchMeasureInput.PAIR):
+    try:
+        yield
+    except Exception as exc:
+        code = exc.returncode if isinstance(exc, StitchNativeFailure) else None
+        stitch_measure_failure(stop, stage, source, stitch_measure_error(exc), returncode=code)
+        raise
+
+
+# The checked package's policy/producer sources remain byte-identical. This
+# isolated boundary observes outcomes before runner.__main__ discards causes.
+STITCH_MEASURE_DRIVER = r'''
+import hashlib,json,os,stat,subprocess,sys,types
+
+def run_driver(runner,request,expected,native_run):
+    state=dict(s='driver',p='none',i='pair',e='PolicyHold',r=None,t=None,n=False,v=False,h='none')
+    allowed={'StitchHold','MediaCertificationError','OSError','FileNotFoundError','PermissionError','ValueError',
+             'KeyError','BenchmarkDeadline','BenchmarkError','TimeoutExpired','CalledProcessError','JSONDecodeError',
+             'TypeError','AttributeError','MemoryError','RuntimeError','AssertionError','InventoryScanStopped'}
+    def exception(exc):
+        state['e']=type(exc).__name__ if type(exc).__name__ in allowed else 'OSError' if isinstance(exc,OSError) else 'UnexpectedError'
+        code=getattr(exc,'returncode',None)
+        wait=getattr(exc,'timeout',None)
+        state['r']=code if type(code) is int and -128<=code<=255 else None
+        state['t']=wait if type(wait) in (int,float) and 0<=wait<=390 else None
+    def observe(raw):
+        try:
+            value=json.loads(raw)
+            if isinstance(value,dict):
+                state['n']=bool(value.get('error'))
+                state['v']=bool(value.get('source_integrity_error'))
+        except (ValueError,TypeError):
+            pass
+    def native(*args,**kwargs):
+        state.update(s='native',p='actual' if json.loads(kwargs['input']).get('actual_span') else 'requested')
+        try:
+            result=native_run(*args,**kwargs)
+        except Exception as exc:
+            observe(getattr(exc,'stdout',None))
+            exception(exc)
+            raise
+        state['s']='result'
+        observe(result.stdout)  # The unmodified runner parses/refuses it next.
+        return result
+    def phase(stage,fn):
+        def call(*args,**kwargs):
+            state['s']=stage
+            result=fn(*args,**kwargs)
+            if stage=='classifier':state['s']='veto'
+            return result
+        return call
+    try:
+        fd=os.open(runner,os.O_RDONLY|os.O_NOFOLLOW)
+        try:
+            before=os.fstat(fd)
+            assert stat.S_ISREG(before.st_mode) and 0<before.st_size<=65536
+            body=os.read(fd,65537)
+            after=os.fstat(fd)
+            assert (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)==(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns)
+            assert len(body)==before.st_size and hashlib.sha256(body).hexdigest()==expected
+        finally:os.close(fd)
+        module=types.ModuleType('checked_v85r_measurement');module.__file__=runner
+        exec(compile(body,runner,'exec'),module.__dict__)
+        module.subprocess=types.SimpleNamespace(run=native)
+        for name,stage in [('classifier','classifier'),('decide','decision'),('resolve','resolve')]:
+            setattr(module,name,phase(stage,getattr(module,name)))
+        with open(request,'rb') as source:raw=source.read(65537)
+        assert len(raw)<=65536
+        result=module.run(json.loads(raw))
+        if not isinstance(result,dict):
+            state['s']='result'
+            raise TypeError()
+        encoded=json.dumps(result,allow_nan=False)
+        reasons={'missing_input_or_decoder_error','frozen_identity_mismatch','october_decision_difference',
+                 'policy_negative','ambiguous_status','measurement_failed'}
+        state['h']=result.get('reason') if result.get('reason') in reasons else 'unknown'
+        if state['v']:state['e']='NativeSourceIntegrity'
+        elif state['n']:state['e']='NativeError'
+    except Exception as exc:
+        exception(exc)
+        result=dict(policy='v85r',join=False,nomination=False,status='UNKNOWN_measurement_failed',decision='hold',reason='measurement_failed')
+        state['h']='measurement_failed'
+        encoded=json.dumps(result,allow_nan=False)
+    return result,encoded,state
+
+if __name__=='__main__':
+    result,encoded,state=run_driver(sys.argv[0],sys.argv[1],sys.argv[2],subprocess.run)
+    if result.get('decision')!='join':
+        diagnostic=json.dumps(state,separators=(',',':'),allow_nan=False)
+        assert len(diagnostic.encode())<=320
+        print('STITCH_MEASURE '+diagnostic,file=sys.stderr)
+    print(encoded)
+'''
+
+
+def stitch_measure_driver_argv(root, request):
+    raw = (root / "manifest.json").read_bytes()
+    if hashlib.sha256(raw).hexdigest() != V85R_MANIFEST_SHA:
+        raise StitchHold("measurement manifest identity differs")
+    manifest = stitch_proof_json(raw)
+    code = base64.b64encode(STITCH_MEASURE_DRIVER.encode()).decode()
+    chunks = [code[n:n+1536] for n in range(0, len(code), 1536)]
+    loader = "import base64,sys; source=base64.b64decode(''.join(sys.argv[4:])); sys.argv=sys.argv[1:4]; exec(compile(source,'<proof measurement driver>','exec'))"
+    return [sys.executable, "-I", "-B", "-c", loader, str(root / "runner.py"), str(request), manifest["files"]["runner.py"], *chunks]
+
+
+def stitch_measure_diagnostic(stop, stderr):
+    if not stderr:
+        return
+    if not stderr.startswith("STITCH_MEASURE ") or len(stderr.encode()) > 336:
+        raise StitchHold("invalid measurement diagnostic framing")
+    value = stitch_proof_json(stderr[len("STITCH_MEASURE "):])
+    if set(value) != {"s", "p", "i", "e", "r", "t", "n", "v", "h"}:
+        raise StitchHold("invalid measurement diagnostic fields")
+    if (value["r"] is not None and (type(value["r"]) is not int or not -128 <= value["r"] <= 255)
+            or value["t"] is not None and (type(value["t"]) not in (int, float) or not 0 <= value["t"] <= 390)
+            or type(value["n"]) is not bool or type(value["v"]) is not bool):
+        raise StitchHold("invalid measurement diagnostic values")
+    stitch_measure_failure(stop, StitchMeasureStage(value["s"]), StitchMeasureInput(value["i"]),
+        StitchMeasureError(value["e"]), StitchMeasurePhase(value["p"]), value["r"], value["t"], value["n"], value["v"],
+        StitchMeasureHoldReason(value["h"]))
+
+
 def stitch_v85r_measure(cfg, inventory, previous, clip, tools, work, deadline, stop, root):
-    def source(c):
-        path, _, _ = stitch_hash(cfg, c["relative_path"], c["size_bytes"], c["sha256"], stop)
-        binding = c.get("feature_input")
-        if (not binding or binding.get("clip_id") != c["source_id"] or binding.get("sha256") != c["sha256"]
-                or binding.get("size_bytes") != c["size_bytes"] or binding.get("nominal_seconds",0) <= 0
-                or binding.get("recording_id") != c["recording_id"]
-                or parse_certification_timestamp(binding.get("start_utc"),"feature start") != parse_certification_timestamp(c["start_at"],"clip start")
-                or parse_certification_timestamp(binding.get("end_utc"),"feature end") != parse_certification_timestamp(c["end_at"],"clip end")):
-            raise StitchHold("V85r metadata missing or differs")
+    def source(c, side):
+        with stitch_measure_stage(stop, StitchMeasureStage.SOURCE, side):
+            path, _, _ = stitch_hash(cfg, c["relative_path"], c["size_bytes"], c["sha256"], stop)
+        with stitch_measure_stage(stop, StitchMeasureStage.FEATURE, side):
+            binding = c.get("feature_input")
+            if (not binding or binding.get("clip_id") != c["source_id"] or binding.get("sha256") != c["sha256"]
+                    or binding.get("size_bytes") != c["size_bytes"] or binding.get("nominal_seconds",0) <= 0
+                    or binding.get("recording_id") != c["recording_id"]
+                    or parse_certification_timestamp(binding.get("start_utc"),"feature start") != parse_certification_timestamp(c["start_at"],"clip start")
+                    or parse_certification_timestamp(binding.get("end_utc"),"feature end") != parse_certification_timestamp(c["end_at"],"clip end")):
+                raise StitchHold("V85r metadata missing or differs")
         return str(path), binding
-    ap, a = source(previous)
-    bp, b = source(clip)
+    ap, a = source(previous, StitchMeasureInput.LEFT)
+    bp, b = source(clip, StitchMeasureInput.RIGHT)
+    with stitch_measure_stage(stop, StitchMeasureStage.FROZEN):
+        frozen = stitch_frozen(inventory, previous, clip)
     request = dict(prev=a, next=b, prev_path=ap, next_path=bp, tools=tools,
-                   actual_span=False, frozen=stitch_frozen(inventory, previous, clip))
-    (work/"v85r-request.json").write_bytes(cleanup_json_bytes(request))
-    stitch_run([sys.executable, "-I", "-B", str(root/"runner.py"), str(work/"v85r-request.json")],
-               min(deadline,time.monotonic()+390), stop, work/"v85r-decision.json")
-    return json.loads((work/"v85r-decision.json").read_text())
+                   actual_span=False, frozen=frozen)
+    with stitch_measure_stage(stop, StitchMeasureStage.REQUEST):
+        (work/"v85r-request.json").write_bytes(cleanup_json_bytes(request))
+    with stitch_measure_stage(stop, StitchMeasureStage.DRIVER):
+        args = ([sys.executable, "-I", "-B", str(root/"runner.py"), str(work/"v85r-request.json")]
+                if getattr(stop, "kind", None) is not StitchRunKind.PROOF
+                else stitch_measure_driver_argv(root, work/"v85r-request.json"))
+        measured = stitch_run(args, min(deadline,time.monotonic()+390), stop, work/"v85r-decision.json")
+        if getattr(stop, "kind", None) is StitchRunKind.PROOF:
+            stitch_measure_diagnostic(stop, measured["stderr"])
+    with stitch_measure_stage(stop, StitchMeasureStage.RESULT):
+        decision = json.loads((work/"v85r-decision.json").read_text())
+        if getattr(stop, "kind", None) is StitchRunKind.PROOF and not isinstance(decision, dict):
+            raise StitchHold("V85r measurement result is not an object")
+        return decision
 
 
 class StitchDirectory:
@@ -47585,7 +47922,7 @@ def stitch_checkpoint(cfg, task):
         raise StitchHold("stitch paused by cleanup source freeze or inactive lease/scope")
 
 
-def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=StitchRunKind.PRODUCTION):
+def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=StitchRunKind.PRODUCTION, proof_stop=None):
     """Read sources, write only the separate versioned sibling directory.
 
     No delivery writer fence is held across native tools or hashing: cleanup
@@ -47597,6 +47934,8 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
         if admitted is not None:
             raise StitchHold("proof cannot use synthetic policy admission")
         stitch_proof_check(task)
+        if proof_stop is None or proof_stop.task is not task or proof_stop.deadline is None:
+            raise StitchHold("proof requires its original attempt deadline")
     plan = task["plan"]
     if (plan.get("policy") != STITCH_POLICY or plan.get("revision") != STITCH_REVISION
             or plan.get("corpus_sha256") != STITCH_CORPUS_SHA or plan.get("keep_policy_sha256") != CLEANUP_KEEP28_POLICY_SHA256):
@@ -47608,8 +47947,10 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
     expected = clips[0]["relative_path"].split("/")[0] + folder + str(plan["recording_id"]) + "/"
     if (not plan["output_folder"].startswith(expected) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}-00-00Z" + ("/proof-" + STITCH_PROOF_SOURCE_SHA[:16] if kind is StitchRunKind.PROOF else ""), plan["output_folder"][len(expected):])):
         raise StitchHold("output must be in the stream's new versioned sibling folder")
-    deadline = min(time.monotonic() + 7000, time.monotonic() + (parse_certification_timestamp(task["expires_at"], "stitch lease") - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 30)
-    stop = StitchStop(cfg, stop_event, task if admitted is None else None, kind)
+    stop = proof_stop if kind is StitchRunKind.PROOF else StitchStop(cfg, stop_event, task if admitted is None else None, kind)
+    deadline = (stop.deadline if kind is StitchRunKind.PROOF else min(time.monotonic() + 7000,
+        time.monotonic() + (parse_certification_timestamp(task["expires_at"], "stitch lease")
+        - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 30))
     stop.refresh()
     if stop.is_set():
         raise StitchHold(stop.reason or "stitch cancelled")
@@ -47750,7 +48091,9 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                 result["left_out"].append(clip["source_id"])
                 continue
             try:
-                source = stitch_audit_source(ffmpeg, ffprobe, path, work, index, deadline, stop)
+                with stitch_measure_stage(stop, StitchMeasureStage.BUILD,
+                        StitchMeasureInput.LEFT if index == 0 else StitchMeasureInput.RIGHT):
+                    source = stitch_audit_source(ffmpeg, ffprobe, path, work, index, deadline, stop)
             except StitchHold as exc:
                 if kind is StitchRunKind.PROOF or stop.is_set():
                     raise
@@ -47915,6 +48258,8 @@ class StitchProofDirectory(StitchDirectory):
 
     def publish(self, temporary, name):
         import ctypes
+        if self.stop.is_set():
+            raise StitchHold(self.stop.reason or "proof cancelled")
         if not sys.platform.startswith("linux") or os.uname().machine != "x86_64":
             raise StitchHold("NAS proof publication requires Linux amd64 renameat2")
         descriptor = self.fds[-1]
@@ -47930,6 +48275,8 @@ class StitchProofDirectory(StitchDirectory):
         rename = ctypes.CDLL(None, use_errno=True).syscall
         rename.argtypes = (ctypes.c_long, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
         rename.restype = ctypes.c_long
+        if self.stop.is_set():
+            raise StitchHold(self.stop.reason or "proof cancelled")
         # renameat2 is syscall 316 on the required Linux amd64 target.
         if rename(316, descriptor, os.fsencode(temporary), descriptor, os.fsencode(name), 1):
             error = ctypes.get_errno()
@@ -47956,9 +48303,13 @@ def stitch_proof_success(result):
 
 
 def stitch_proof_complete(cfg, task, result, work, stop):
+    if stop.is_set():
+        raise StitchHold(stop.reason or "proof cancelled")
     stitch_proof_success(result)
     files = {}
     for name in STITCH_PROOF_AUDIT_NAMES:
+        if stop.is_set():
+            raise StitchHold(stop.reason or "proof cancelled")
         source = work/name
         if source.is_symlink() or not source.is_file():
             raise StitchHold("native proof audit missing")
@@ -47980,6 +48331,8 @@ def stitch_proof_complete(cfg, task, result, work, stop):
     if len(raw) > 16*1024*1024:
         raise StitchHold("proof receipt exceeds decompressed bound")
     body = gzip.compress(raw, mtime=0)
+    if stop.is_set():
+        raise StitchHold(stop.reason or "proof cancelled")
     if len(body) > 1024*1024:
         raise StitchHold("proof receipt exceeds transport bound")
     stage = work/"receipt.partial.gz"
@@ -48054,12 +48407,19 @@ def stitch_proof_once(cfg, inventory, stop_event):
         STITCH_STATUS.update(readback_at=utc_now(),readback_boot_id=runtime["boot_id"],run_id=receipt["run"]["id"],client_artifact_sha256=receipt["client_artifact_sha256"],output_sha256=receipt["result"]["outputs"][0]["sha256"],output_size_bytes=receipt["result"]["outputs"][0]["size_bytes"])
         stitch_proof_emit(cfg,task,body,runtime["boot_id"])
         return 60
-    stitch_resources(cfg,22620379)
-    stitch_corpus(cfg,inventory,stop)
-    tools = stitch_v85r_tools(cfg,time.monotonic()+BENCHMARK_TOOL_INSTALL_SEC,stop)
-    STITCH_STATUS.update(kind=STITCH_PROOF_KIND,state="proof_working",started_at=utc_now(),plan_sha256=task["plan_sha256"])
-    stitch_proof_space(cfg,task)
-    stitch_build(cfg,inventory,task,stop_event,tools,kind=StitchRunKind.PROOF)
+    with stitch_measure_stage(stop, StitchMeasureStage.SETUP), stitch_proof_activity(inventory, stop):
+        stop.refresh()
+        if stop.is_set():
+            raise StitchHold(stop.reason or "proof cancelled")
+        stitch_resources(cfg,22620379)
+        stitch_corpus(cfg,inventory,stop)
+        tools = stitch_v85r_tools(cfg,min(stop.deadline,time.monotonic()+BENCHMARK_TOOL_INSTALL_SEC),stop)
+        if stop.is_set():
+            raise StitchHold(stop.reason or "proof cancelled")
+        STITCH_STATUS.update(kind=STITCH_PROOF_KIND,state="proof_working",started_at=utc_now(),plan_sha256=task["plan_sha256"])
+        stitch_proof_space(cfg,task)
+        with stitch_measure_stage(stop, StitchMeasureStage.BUILD):
+            stitch_build(cfg,inventory,task,stop_event,tools,kind=StitchRunKind.PROOF,proof_stop=stop)
     return 1
 
 
@@ -48188,18 +48548,21 @@ def stitch_loop(cfg, inventory, stop_event):
     try:
         stitch_priority()
     except Exception as exc:
-        STITCH_STATUS.fail(str(exc))
-        log("ERROR", "V85r stitch lane disabled: %s" % exc)
+        reason = ("proof priority failed: " + stitch_measure_error(exc).value) if cfg.stitch_proof_enabled else str(exc)
+        STITCH_STATUS.fail(reason)
+        log("ERROR", "V85r stitch lane disabled: %s" % reason)
         return
     while not stop_event.is_set():
         retry = 60
+        proof_mode = cfg.stitch_proof_enabled
         try:
             STITCH_ACTIVE.set()
-            retry = stitch_proof_once(cfg, inventory, stop_event) if cfg.stitch_proof_enabled else stitch_once(cfg, inventory, stop_event)
+            retry = stitch_proof_once(cfg, inventory, stop_event) if proof_mode else stitch_once(cfg, inventory, stop_event)
         except Exception as exc:
             STITCH_STATUS.update(state="paused")
-            STITCH_STATUS.fail(str(exc))
-            log("WARN", "V85r stitch HOLD: %s" % str(exc)[:300])
+            reason = ("proof failed: " + stitch_measure_error(exc).value) if proof_mode else str(exc)
+            STITCH_STATUS.fail(reason)
+            log("WARN", "V85r stitch HOLD: %s" % reason[:300])
         finally:
             STITCH_ACTIVE.clear()
         stop_event.wait(retry)
