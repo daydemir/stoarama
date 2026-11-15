@@ -253,7 +253,16 @@ t.subprocess.Popen=lambda *args,**kwargs:Unreaped()
                 filled += os.write(write_fd, b'SYNTHETIC' * 128)
         except BlockingIOError:
             pass
+        # An atomic chunk can fail while a smaller result still fits (Linux).
+        # Fill that tail too, then prove even one byte cannot be written.
+        try:
+            while filled < 2 * 1024 * 1024:
+                filled += os.write(write_fd, b'x')
+        except BlockingIOError:
+            pass
         self.assertLess(filled, 2 * 1024 * 1024)
+        with self.assertRaises(BlockingIOError):
+            os.write(write_fd, b'x')
         os.set_blocking(write_fd, True)
         return read_fd, write_fd
 
