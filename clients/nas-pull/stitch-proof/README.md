@@ -110,19 +110,40 @@ client version and actual release-artifact SHA. A fresh independent reviewer mus
 review the real evidence and bind payload SHA, native bundle SHA and exact code
 head. Only then assemble the outer attestation with those file/SHA/size refs.
 
-The R2 gate invokes exactly:
+The R2 gate snapshots and verifies all artifact bytes before starting Python.
+It supplies the exact checksum-pinned verifier source as the `-c` argument;
+neither the verifier nor its inputs are reopened by pathname. The fixed argv is:
 
 ```
-python3 -I -S -B <verifier> replay-bundle --plan <source_plan> --client-source <client_artifact> --expected-client-sha256 <pipeline.client_artifact_sha256> --bundle <native_bundle> --expected-sha256 <native_bundle.sha256>
+python3 -I -S -B -c <verified verifier source string> replay-stream --expected-client-sha256 <pipeline.client_artifact_sha256> --expected-sha256 <native_bundle.sha256> --expected-plan-sha256 <source_plan.sha256>
 ```
 
-This mode reads only supplied artifacts. It imports no NAS app, accesses no
+Stdin is one strict JSON object, at most 16 MiB, with exactly `schema` (literal
+`stoarama.nas-stitch-replay-input.v1`), `client_source_b64`, `source_plan_b64`,
+and `native_bundle_b64`. Values are canonical base64 of the already verified
+component bytes: client at most 8 MiB, raw plan at most 1 MiB, gzip at most 1 MiB.
+All three hashes are checked again before native replay. The raw plan file SHA
+in argv is distinct from its logical proof-plan digest checked by the native
+validator. The verifier source is at most 64 KiB UTF-8 without NUL, keeping the
+inline argument below Linux and macOS argument limits. Its source hash is checked
+by the gate before execve, using a trusted reviewed pin; artifact self-report is
+not a code pin. Supply no inherited credentials and enforce bounded runtime and
+stdout/stderr. There is no FD path, temporary-file or pathname fallback.
+
+This mode reads only the bounded stdin byte stream. It imports no NAS app, accesses no
 credentials, writes no files, downloads no media, starts no subprocess and
 activates no NAS work. It executes only checksum-pinned pure inventory functions
 from the exact reviewed client source. Success stdout is one JSON object with
 schema `stoarama.nas-stitch-native-replay.v1`, `native_replay: passed`, connection,
 run, receipt/plan/client/output hashes, output size, media seconds, build wall
 seconds and recording-hours-per-wall-hour. Invalid evidence exits nonzero.
+`collect` and `replay-bundle` remain operator tools; the R2 gate uses only
+`replay-stream`. This change requires a new reviewed verifier pin. The frozen
+outer/inner artifact schemas and replay stdout fields are unchanged.
+
+`verified-receipt.json` is the complete decoded native receipt, including audit
+inventories, at most 16 MiB. The gate requires exact byte equality with the
+validated decompressed native bundle; it is not a small metadata-only file.
 
 Frozen schemas in this directory are byte-identical to the assessment records.
 The R2 consumer must reject synthetic fixtures, unknown schemas/fields, duplicate
