@@ -235,6 +235,30 @@ class R2CopyControlTests(unittest.TestCase):
             timer.join()
             self.stop.clear()
 
+    def test_kill_failure_cannot_release_unreaped_transport_ownership(self):
+        self.control.request_json(Operation.LEASE, "/ok")
+        process = self.control.process
+        kill, wait = process.kill, process.wait
+        entered, release = threading.Event(), threading.Event()
+        def delayed_wait(timeout):
+            entered.set()
+            release.wait(2)
+            kill()
+            return wait(timeout=timeout)
+        with mock.patch.object(process, "kill", side_effect=PermissionError("fixture")), \
+                mock.patch.object(process, "wait", side_effect=delayed_wait):
+            worker = threading.Thread(target=self.control.close)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertIs(self.control.process, process)
+                self.assertTrue(worker.is_alive())
+            finally:
+                release.set()
+                worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertIsNone(self.control.process)
+
     def test_bad_framing_bounds_and_json_poison_the_transport(self):
         for path in ("/bad-json", "/oversize"):
             with self.subTest(path=path), self.assertRaises(pull.R2CopyHold):

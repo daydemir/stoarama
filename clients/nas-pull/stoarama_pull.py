@@ -50237,12 +50237,15 @@ class R2CopyControl:
         if self.process is None:
             return
         process = self.process
+        reported = False
         if process.poll() is None:
             try:
                 process.kill()
             except ProcessLookupError:
                 pass
-        reported = False
+            except OSError:
+                log("WARN", "R2 copy held: copy control child termination failed")
+                reported = True
         while True:
             try:
                 process.wait(timeout=2)
