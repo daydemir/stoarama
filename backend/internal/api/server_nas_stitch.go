@@ -227,7 +227,7 @@ func (s *Server) handleAccountNASStitchCorpus(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if !s.cfg.NASStitchEnabled {
+	if !s.cfg.NASStitchEnabled && s.cfg.NASStitchProofTaskID != 1 {
 		util.WriteError(w, 409, "stitch switch off")
 		return
 	}
@@ -918,7 +918,7 @@ func (s *Server) handleAccountNASStitchTool(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	if cid != 13 || !s.cfg.NASStitchEnabled {
+	if cid != 13 || (!s.cfg.NASStitchEnabled && s.cfg.NASStitchProofTaskID != 1) {
 		util.WriteError(w, 403, "V85r tool download disabled")
 		return
 	}

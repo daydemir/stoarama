@@ -62,6 +62,7 @@ class NASPullTests(unittest.TestCase):
             dry_run=dry_run,
             stitch_switches=pull.StitchSwitches(),
             stitch_enabled=False,
+            stitch_proof_enabled=False,
             stitch_delete_enabled=False,
             is_candidate=False,
         )

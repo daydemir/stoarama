@@ -87,7 +87,7 @@ func pullPathAllowed(method, path string) bool {
 	// lease, source-freeze and independent deletion authorization checks.
 	case method == http.MethodPost && (path == "/api/v1/account/connections/stitch/lease" || pullStitchTaskRe.MatchString(path)):
 		return true
-	case method == http.MethodGet && (path == "/api/v1/account/connections/stitch/corpus" || path == "/api/v1/account/connections/stitch/tools/ffmpeg" || path == "/api/v1/account/connections/stitch/tools/ffprobe"):
+	case method == http.MethodGet && (path == "/api/v1/account/connections/stitch/proof" || path == "/api/v1/account/connections/stitch/corpus" || path == "/api/v1/account/connections/stitch/tools/ffmpeg" || path == "/api/v1/account/connections/stitch/tools/ffprobe"):
 		return true
 	case method == http.MethodPost && path == "/api/v1/account/connections/selected-verify/lease":
 		return true
@@ -701,6 +701,7 @@ type connectionHeartbeatRequest struct {
 
 type connectionHeartbeatResponse struct {
 	ListingEnabled           bool  `json:"listing_enabled"`
+	StitchProofTaskID        int   `json:"stitch_proof_task_id,omitempty"`
 	StitchEnabled            bool  `json:"stitch_enabled"`
 	StitchDeletionEnabled    bool  `json:"stitch_deletion_enabled"`
 	CleanupReleaseGeneration int64 `json:"cleanup_release_generation,omitempty"`
@@ -1177,6 +1178,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 	}
 	util.WriteJSON(w, http.StatusOK, connectionHeartbeatResponse{
 		ListingEnabled:        connectionID == 13 && listingEnabled,
+		StitchProofTaskID:     stitchProofSelector(s.cfg.NASStitchProofTaskID, connectionID, req.ClientVersion),
 		StitchEnabled:         connectionID == 13 && s.cfg.NASStitchEnabled,
 		StitchDeletionEnabled: connectionID == 13 && s.cfg.NASStitchDeletionEnabled,
 		OK:                    true, JoinedDeliveryAccepted: joinedDeliveryAccepted, CleanupReleaseGeneration: cleanupReleaseGeneration,

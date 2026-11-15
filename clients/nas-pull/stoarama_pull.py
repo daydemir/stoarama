@@ -659,6 +659,8 @@ class StitchSwitches:
         cancel = threading.Event()
         cancel.set()
         self.state = (False, False, cancel)
+        self.proof = (0, threading.Event())
+        self.proof[1].set()
 
     def apply(self, response):
         valid = isinstance(response, dict) and response.get("ok") is True
@@ -671,12 +673,24 @@ class StitchSwitches:
             # A later ON may start a new job, but cannot revive a cancelled one.
             cancel = threading.Event()
         self.state = (enabled, deletion, cancel)
+        selector = response.get("stitch_proof_task_id") if valid else 0
+        selector = 1 if type(selector) is int and selector == 1 and not enabled and self.local_enabled else 0
+        proof_cancel = self.proof[1]
+        if not selector:
+            proof_cancel.set()
+        elif proof_cancel.is_set():
+            proof_cancel = threading.Event()
+        self.proof = (selector, proof_cancel)
 
 
 class Config:
     @property
     def stitch_enabled(self):
         return self.stitch_switches.state[0]
+
+    @property
+    def stitch_proof_enabled(self):
+        return self.stitch_switches.proof[0] == 1
 
     @property
     def stitch_delete_enabled(self):
@@ -1242,7 +1256,7 @@ class Inventory:
 
     def _cached_regular_stat(self, relative_path):
         parts = Path(relative_path).parts
-        if not parts or parts[0] in (JOINED_ROOT,) + INVENTORY_ROOT_EXCLUSIONS or parts[0].endswith("_V85r_keep28"):
+        if not parts or parts[0] in (JOINED_ROOT,) + INVENTORY_ROOT_EXCLUSIONS or parts[0].endswith(("_V85r_keep28", "_V85r_proof_keep28")):
             return None
         descriptor = None
         try:
@@ -1739,7 +1753,7 @@ def inventory_loop(cfg, inventory, stop_event):
 
 class Runtime:
     def __init__(self, cfg, inventory=None):
-        self.stitch_enabled = getattr(cfg, "stitch_enabled", False)
+        self.stitch_enabled = getattr(cfg, "stitch_enabled", False) or getattr(cfg, "stitch_proof_enabled", False)
         progress = read_json(cfg.progress_file, {})
         if not progress and cfg.legacy_progress_file.exists():
             progress = read_json(cfg.legacy_progress_file, {})
@@ -1907,8 +1921,10 @@ class Runtime:
         switches = {"listing_enabled", "stitch_enabled", "stitch_deletion_enabled"}
         valid = (
             isinstance(response, dict) and required <= set(response)
-            and set(response) <= required | switches | {"cleanup_release_generation"}
+            and set(response) <= required | switches | {"cleanup_release_generation", "stitch_proof_task_id"}
             and all(type(response[k]) is bool for k in switches if k in response)
+            and ("stitch_proof_task_id" not in response or
+                 type(response["stitch_proof_task_id"]) is int and response["stitch_proof_task_id"] in (0, 1))
             and ("cleanup_release_generation" not in response or
                  type(response["cleanup_release_generation"]) is int and 0 <= response["cleanup_release_generation"] <= 0x7fffffffffffffff)
             and response.get("ok") is True and type(response.get("joined_delivery_accepted")) is bool
@@ -18006,7 +18022,7 @@ CLEANUP_V2_WORKERS = 16        # concurrent dry-run file workers
 CLEANUP_GROUP_VERSION = "cleanup-batch-v6.1"
 CLEANUP_V6_VERSIONS: frozenset[str] = frozenset((CLEANUP_GROUP_VERSION, "r2-copy-v1"))
 CLEANUP_BULK_VERSION = "cleanup-batch-v7"
-CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, "r2-copy-v2"))
+CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, "r2-copy-v2", "v85r-nas-proof-v1"))
 CLEANUP_GROUP_VERSIONS: frozenset[str] = CLEANUP_V6_VERSIONS | CLEANUP_BULK_VERSIONS
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
@@ -18947,7 +18963,7 @@ def walk_raw_files(root):
     for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=fail_walk, followlinks=False):
         directory = Path(dirpath)
         if directory == root:
-            dirnames[:] = [name for name in dirnames if name != JOINED_ROOT and name not in INVENTORY_ROOT_EXCLUSIONS and not name.endswith("_V85r_keep28")]
+            dirnames[:] = [name for name in dirnames if name != JOINED_ROOT and name not in INVENTORY_ROOT_EXCLUSIONS and not name.endswith(("_V85r_keep28", "_V85r_proof_keep28"))]
         for filename in filenames:
             if directory == root and filename in INVENTORY_ROOT_EXCLUSIONS:
                 continue
@@ -19696,19 +19712,20 @@ def hash_certification_file_cancellable(root, relative_path, expected_size, expe
     except BaseException:
         os.close(descriptor)
         raise
-    path_after = path.stat()
-    parent_after = path.parent.stat()
-    if certification_identity(opened_before) != certification_identity(opened_after) or certification_identity(opened_after) != certification_identity(path_after):
+    try:
+        path_after = path.stat()
+        parent_after = path.parent.stat()
+        if certification_identity(opened_before) != certification_identity(opened_after) or certification_identity(opened_after) != certification_identity(path_after):
+            raise MediaCertificationError("media identity changed while hashing")
+        if certification_identity(parent_before) != certification_identity(parent_after):
+            raise MediaCertificationError("media directory changed while hashing")
+        if actual_size != expected_size or digest.hexdigest() != expected_sha:
+            raise MediaCertificationError("media bytes do not match frozen manifest")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return path, path_after, parent_after, descriptor, Path("/dev/fd/%d" % descriptor)
+    except BaseException:
         os.close(descriptor)
-        raise MediaCertificationError("media identity changed while hashing")
-    if certification_identity(parent_before) != certification_identity(parent_after):
-        os.close(descriptor)
-        raise MediaCertificationError("media directory changed while hashing")
-    if actual_size != expected_size or digest.hexdigest() != expected_sha:
-        os.close(descriptor)
-        raise MediaCertificationError("media bytes do not match frozen manifest")
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    return path, path_after, parent_after, descriptor, Path("/dev/fd/%d" % descriptor)
+        raise
 
 
 def verify_certification_source_identities(paths, identities, phase):
@@ -24692,7 +24709,7 @@ def heartbeat_loop(cfg, runtime, stop_event):
             response = send_heartbeat(cfg, runtime, outage)
             cfg.stitch_switches.apply(response)
             cfg.listing_enabled.set() if response.get("listing_enabled") is True else cfg.listing_enabled.clear()
-            runtime.stitch_enabled = cfg.stitch_enabled
+            runtime.stitch_enabled = cfg.stitch_enabled or cfg.stitch_proof_enabled
             runtime.apply_joined_protocol_response(response)
             if runtime.inventory is not None:
                 cleanup_release_quarantine(runtime.inventory, response.get("cleanup_release_generation"))
@@ -24702,7 +24719,7 @@ def heartbeat_loop(cfg, runtime, stop_event):
                 response = send_heartbeat(cfg, runtime, outage)
                 cfg.stitch_switches.apply(response)
                 cfg.listing_enabled.set() if response.get("listing_enabled") is True else cfg.listing_enabled.clear()
-                runtime.stitch_enabled = cfg.stitch_enabled
+                runtime.stitch_enabled = cfg.stitch_enabled or cfg.stitch_proof_enabled
                 runtime.apply_joined_protocol_response(response)
                 outage = None
                 try:
@@ -46644,12 +46661,22 @@ def stitch_priority():
                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+class StitchRunKind(Enum):
+    PRODUCTION = "production"
+    PROOF = "proof"
+
+
 class StitchStop:
     """Keep the native-child watchdog nonblocking; poll remote gates separately."""
-    def __init__(self, cfg, stop, task=None):
+    def __init__(self, cfg, stop, task=None, kind=StitchRunKind.PRODUCTION):
         self.cfg, self.stop, self.task, self.reason = cfg, stop, task, ""
+        self.kind = kind
+        self.measurements = []
+        self.started = time.monotonic()
+        self.run_id = str(uuid.uuid4())
+        self.started_at = utc_now()
         switches = getattr(cfg, "stitch_switches", None)
-        self.switch_cancel = switches.state[2] if switches is not None else None
+        self.switch_cancel = (switches.proof[1] if kind is StitchRunKind.PROOF else switches.state[2]) if switches is not None else None
         self.done = threading.Event()
         self.monitor = None
 
@@ -46657,7 +46684,7 @@ class StitchStop:
         if self.stop.is_set():
             return True
         if ((self.switch_cancel is not None and self.switch_cancel.is_set())
-                or not getattr(self.cfg, "stitch_enabled", False)):
+                or not getattr(self.cfg, "stitch_proof_enabled" if self.kind is StitchRunKind.PROOF else "stitch_enabled", False)):
             self.reason = "stitch switch off"
         with NAS_MEDIA_FENCE.condition:
             if NAS_MEDIA_FENCE.execution_owner is not None:
@@ -46667,8 +46694,10 @@ class StitchStop:
     def refresh(self):
         try:
             stitch_resources(self.cfg)
+            if self.kind is StitchRunKind.PROOF:
+                stitch_proof_space(self.cfg, self.task)
             if self.task is not None:
-                stitch_checkpoint(self.cfg, self.task)
+                stitch_proof_checkpoint(self.cfg, self.task) if self.kind is StitchRunKind.PROOF else stitch_checkpoint(self.cfg, self.task)
         except Exception as exc:
             self.reason = str(exc)
 
@@ -46693,6 +46722,8 @@ def stitch_run(args, deadline, stop, stdout=None):
     # priorities to FFmpeg and ffprobe children. No '-t' silent ionice fallback.
     prefix = ["nice", "-n", "19", "ionice", "-c", "3"] if sys.platform.startswith("linux") else []
     measured = run_measured(prefix + list(args), deadline, stop, stdout_path=stdout, niced=False)
+    if getattr(stop, "kind", None) is StitchRunKind.PROOF:
+        stop.measurements.append(dict(argv=list(map(str, args)), returncode=measured["returncode"], wall_s=measured.get("wall_s"), cpu_s=measured.get("cpu_s")))
     if measured["returncode"] != 0:
         raise StitchHold("native media check failed: " + measured["stderr"][:200])
     return measured
@@ -46711,7 +46742,7 @@ def stitch_journal(inventory, task_id, sha, result=None, registered=False):
         return json.loads(old[1]) if old and old[1] else None
 
 
-def stitch_corpus(cfg, inventory):
+def stitch_corpus(cfg, inventory, stop=None):
     """Stream the exact frozen JSONL into SQLite once; never trust a row alone."""
     with inventory.lock:
         inventory.db.execute("CREATE TABLE IF NOT EXISTS v85r_stitch_corpus_meta(sha TEXT PRIMARY KEY)")
@@ -46730,7 +46761,10 @@ def stitch_corpus(cfg, inventory):
         database.execute("BEGIN IMMEDIATE")
         database.execute("DELETE FROM v85r_stitch_edges")
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as response:
+            deadline = time.monotonic() + 900
             while True:
+                if stop is not None and (stop.is_set() or time.monotonic() >= deadline):
+                    raise StitchHold("corpus import cancelled or expired")
                 line = response.readline(1024 * 1024 + 1)
                 if not line:
                     break
@@ -46869,7 +46903,7 @@ def stitch_v85r_provenance(tools):
 
 def stitch_v85r_measure(cfg, inventory, previous, clip, tools, work, deadline, stop, root):
     def source(c):
-        path, _, _ = hash_certification_file(cfg.output_dir, c["relative_path"], c["size_bytes"], c["sha256"])
+        path, _, _ = stitch_hash(cfg, c["relative_path"], c["size_bytes"], c["sha256"], stop)
         binding = c.get("feature_input")
         if (not binding or binding.get("clip_id") != c["source_id"] or binding.get("sha256") != c["sha256"]
                 or binding.get("size_bytes") != c["size_bytes"] or binding.get("nominal_seconds",0) <= 0
@@ -46965,19 +46999,23 @@ class StitchDirectory:
 
 def stitch_packet_rows(file):
     with open(file, encoding="ascii") as source:
-        for line in source:
-            line = line.strip()
-            if not line:
-                continue
-            fields = dict(part.split("=", 1) for part in line.split("|") if "=" in part)
-            if (set(fields) != {"pts", "dts", "duration", "size", "flags", "data_hash"}
-                    or not fields["data_hash"].startswith("SHA256:") or len(fields["data_hash"]) != 71):
-                raise StitchHold("unsupported packet mapping/side data")
-            try:
-                yield (int(fields["pts"]), int(fields["dts"]), int(fields["duration"]),
-                       int(fields["size"]), fields["flags"], fields["data_hash"])
-            except ValueError as exc:
-                raise StitchHold("packet timestamps missing") from exc
+        yield from stitch_packet_records(source)
+
+
+def stitch_packet_records(source):
+    for line in source:
+        line = line.strip()
+        if not line:
+            continue
+        fields = dict(part.split("=", 1) for part in line.split("|") if "=" in part)
+        if (set(fields) != {"pts", "dts", "duration", "size", "flags", "data_hash"}
+                or not fields["data_hash"].startswith("SHA256:") or len(fields["data_hash"]) != 71):
+            raise StitchHold("unsupported packet mapping/side data")
+        try:
+            yield (int(fields["pts"]), int(fields["dts"]), int(fields["duration"]),
+                   int(fields["size"]), fields["flags"], fields["data_hash"])
+        except ValueError as exc:
+            raise StitchHold("packet timestamps missing") from exc
 
 
 def stitch_packets(ffprobe, source, target, deadline, stop, hidden=False):
@@ -46995,20 +47033,27 @@ def stitch_frames(ffmpeg, source, target, deadline, stop):
 
 def stitch_frame_rows(file):
     with open(file, encoding="ascii") as source:
-        for line in source:
-            if line.startswith("#") or not line.strip():
-                continue
-            row = [v.strip() for v in line.split(",")]
-            if len(row) != 6 or len(row[5]) != 64:
-                raise StitchHold("unsupported decoded frame audit")
-            yield int(row[2]), row[4], row[5]
+        yield from stitch_frame_records(source)
+
+
+def stitch_frame_records(source):
+    for line in source:
+        if line.startswith("#") or not line.strip():
+            continue
+        row = [v.strip() for v in line.split(",")]
+        if len(row) != 6 or len(row[5]) != 64:
+            raise StitchHold("unsupported decoded frame audit")
+        yield int(row[2]), row[4], row[5]
 
 
 def stitch_probe(ffprobe, source, target, deadline, stop):
     stitch_run([ffprobe, "-v", "error", "-show_streams", "-show_data_hash", "sha256", "-of", "json", str(source)], deadline, stop, target)
     if target.stat().st_size > 1024 * 1024:
         raise StitchHold("oversized stream metadata")
-    streams = json.loads(target.read_text())["streams"]
+    return stitch_signature(json.loads(target.read_text())["streams"])
+
+
+def stitch_signature(streams):
     if len(streams) != 1 or streams[0].get("codec_type") != "video" or streams[0].get("codec_name") != "h264":
         raise StitchHold("only positively audio-absent native H264 is admitted")
     s = streams[0]
@@ -47027,8 +47072,16 @@ def stitch_audit_source(ffmpeg, ffprobe, source, work, index, deadline, stop):
     if sha256_file(packets) != sha256_file(hidden):
         raise StitchHold("hidden edit-list inventory differs")
     stitch_frames(ffmpeg, source, frames, deadline, stop)
+    return stitch_source_inventory(signature, packets, frames)
+
+
+def stitch_source_inventory(signature, packets, frames):
+    return stitch_source_records(signature, lambda: stitch_packet_rows(packets), lambda: stitch_frame_rows(frames))
+
+
+def stitch_source_records(signature, packet_rows, frame_rows):
     chain, count, last, minimum, maximum = hashlib.sha256(), 0, None, None, 0
-    for pts, dts, duration, size, flags, payload in stitch_packet_rows(packets):
+    for pts, dts, duration, size, flags, payload in packet_rows():
         if duration <= 0 or (last is not None and dts <= last) or (count == 0 and "K" not in flags):
             raise StitchHold("source native packet interval invalid")
         chain.update(("%s:%s\n" % (size, payload)).encode())
@@ -47037,13 +47090,13 @@ def stitch_audit_source(ffmpeg, ffprobe, source, work, index, deadline, stop):
         count += 1
         last = dts
     decoded, last = 0, None
-    for pts, size, digest in stitch_frame_rows(frames):
+    for pts, size, digest in frame_rows():
         if last is not None and pts <= last:
             raise StitchHold("source presentation PTS not increasing")
         last, decoded = pts, decoded + 1
     if count == 0 or count != decoded or minimum != 0:
         raise StitchHold("source EOF/packet/frame assumption failed")
-    return dict(signature=signature, packets=packets, frames=frames, count=count,
+    return dict(signature=signature, packet_rows=packet_rows, frame_rows=frame_rows, count=count,
                 chain=chain.hexdigest(), span=maximum * Fraction(signature[5]))
 
 
@@ -47057,11 +47110,26 @@ def stitch_audit_output(ffmpeg, ffprobe, output, sources, work, deadline, stop):
     if sha256_file(packets) != sha256_file(hidden):
         raise StitchHold("output hidden payload inventory differs")
     stitch_frames(ffmpeg, output, frames, deadline, stop)
-    actual, decoded, last_dts = iter(stitch_packet_rows(packets)), iter(stitch_frame_rows(frames)), None
+    stitch_output_inventory(signature, sources, packets, frames)
+    # Full strict EOF decode above includes every frame. Decode each seam again
+    # with an independent seek to exercise keyframe/preroll behavior.
+    offset = Fraction(0)
+    for source in sources[:-1]:
+        offset += source["span"]
+        stitch_run([ffmpeg, "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-threads", "1",
+                    "-ss", "%.6f" % max(0, float(offset) - 2), "-i", str(output), "-t", "4", "-map", "0:v:0", "-f", "null", "-"], deadline, stop)
+
+
+def stitch_output_inventory(signature, sources, packets, frames):
+    stitch_output_records(signature, sources, stitch_packet_rows(packets), stitch_frame_rows(frames))
+
+
+def stitch_output_records(signature, sources, packets, frames):
+    actual, decoded, last_dts = iter(packets), iter(frames), None
     offset = Fraction(0)
     for source in sources:
         translation = None
-        for expected in stitch_packet_rows(source["packets"]):
+        for expected in source["packet_rows"]():
             row = next(actual, None)
             if row is None or row[2:] != expected[2:]:
                 raise StitchHold("source packet omitted, changed or reordered")
@@ -47071,20 +47139,13 @@ def stitch_audit_output(ffmpeg, ffprobe, output, sources, work, deadline, stop):
             if abs(dp * Fraction(signature[5]) - offset) > Fraction(signature[5]):
                 raise StitchHold("native span changed or gap compressed")
             translation, last_dts = dp, row[1]
-        for expected in stitch_frame_rows(source["frames"]):
+        for expected in source["frame_rows"]():
             row = next(decoded, None)
             if row is None or row[1:] != expected[1:] or row[0]-expected[0] != translation:
                 raise StitchHold("decoded EOF/pixel/raw PTS inventory differs")
         offset += source["span"]
     if next(actual, None) is not None or next(decoded, None) is not None:
         raise StitchHold("extra output packets or frames")
-    # Full strict EOF decode above includes every frame. Decode each seam again
-    # with an independent seek to exercise keyframe/preroll behavior.
-    offset = Fraction(0)
-    for source in sources[:-1]:
-        offset += source["span"]
-        stitch_run([ffmpeg, "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-threads", "1",
-                    "-ss", "%.6f" % max(0, float(offset) - 2), "-i", str(output), "-t", "4", "-map", "0:v:0", "-f", "null", "-"], deadline, stop)
 
 
 # mdat/Annex B and SPS/VUI parser ported from the existing repair owner,
@@ -47281,7 +47342,7 @@ def stitch_checkpoint(cfg, task):
         raise StitchHold("stitch paused by cleanup source freeze or inactive lease/scope")
 
 
-def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None):
+def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=StitchRunKind.PRODUCTION):
     """Read sources, write only the separate versioned sibling directory.
 
     No delivery writer fence is held across native tools or hashing: cleanup
@@ -47289,6 +47350,10 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None):
     a concurrent retirement makes the fresh exact source proof fail closed.
     Local execution cancels the tools immediately, remote freezes at checkpoints.
     """
+    if kind is StitchRunKind.PROOF:
+        if admitted is not None:
+            raise StitchHold("proof cannot use synthetic policy admission")
+        stitch_proof_check(task)
     plan = task["plan"]
     if (plan.get("policy") != STITCH_POLICY or plan.get("revision") != STITCH_REVISION
             or plan.get("corpus_sha256") != STITCH_CORPUS_SHA or plan.get("keep_policy_sha256") != CLEANUP_KEEP28_POLICY_SHA256):
@@ -47296,15 +47361,16 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None):
     clips, joins = plan["clips"], plan["joins"]
     if not 1 <= len(clips) <= 200 or len(joins) != len(clips) - 1 or len(plan.get("eligible", [])) != len(clips) or sum(c["size_bytes"] for c in clips) > STITCH_MAX_INPUT:
         raise StitchHold("unbounded assembly unit")
-    expected = clips[0]["relative_path"].split("/")[0] + "_V85r_keep28/" + str(plan["recording_id"]) + "/"
-    if (not plan["output_folder"].startswith(expected) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}-00-00Z", plan["output_folder"][len(expected):])):
+    folder = "_V85r_proof_keep28/" if kind is StitchRunKind.PROOF else "_V85r_keep28/"
+    expected = clips[0]["relative_path"].split("/")[0] + folder + str(plan["recording_id"]) + "/"
+    if (not plan["output_folder"].startswith(expected) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}-00-00Z" + ("/proof-" + STITCH_PROOF_SOURCE_SHA[:16] if kind is StitchRunKind.PROOF else ""), plan["output_folder"][len(expected):])):
         raise StitchHold("output must be in the stream's new versioned sibling folder")
     deadline = min(time.monotonic() + 7000, time.monotonic() + (parse_certification_timestamp(task["expires_at"], "stitch lease") - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 30)
-    stop = StitchStop(cfg, stop_event, task if admitted is None else None)
+    stop = StitchStop(cfg, stop_event, task if admitted is None else None, kind)
     stop.refresh()
     if stop.is_set():
         raise StitchHold(stop.reason or "stitch cancelled")
-    result = dict(policy=STITCH_POLICY, lease_token=task["lease_token"], plan_sha256=task["plan_sha256"], outputs=[], repairs=[], left_out=[], seams=[], error="")
+    result = dict(policy=STITCH_POLICY, lease_token=task.get("lease_token", ""), plan_sha256=task["plan_sha256"], outputs=[], repairs=[], left_out=[], seams=[], error="")
     provenance = stitch_v85r_provenance(tools)
     root = stitch_v85r_bundle(cfg.state_dir) if admitted is None else None
     ffmpeg, ffprobe = tools["ffmpeg"], tools["ffprobe"]
@@ -47314,11 +47380,15 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None):
     with contextlib.ExitStack() as resources:
         stop.start()
         resources.callback(stop.close)
-        directory = resources.enter_context(StitchDirectory(cfg, plan["output_folder"], task["id"], stop))
+        directory_type = StitchProofDirectory if kind is StitchRunKind.PROOF else StitchDirectory
+        directory = resources.enter_context(directory_type(cfg, plan["output_folder"], task["id"], stop))
         work = directory.path
         def clear_scratch():
             names = ["concat.txt", "run.partial.mp4", "proof.partial.json", "output.json", "output.packets", "output.hidden", "output.frames", "repair.h264", "repair.partial.mp4", "repair.frames", "repair.proof.partial.json", "v85r-request.json", "v85r-decision.json"]
-            names += ["source-%03d.%s" % (n, suffix) for n in range(len(clips)) for suffix in ("json", "packets", "hidden", "frames")]
+            if kind is StitchRunKind.PROOF:
+                names = ["concat.txt", "run.partial.mp4", "proof.partial.json", "v85r-request.json"]
+            else:
+                names += ["source-%03d.%s" % (n, suffix) for n in range(len(clips)) for suffix in ("json", "packets", "hidden", "frames")]
             for name in names:
                 try:
                     os.unlink(name, dir_fd=directory.fds[-1])
@@ -47356,6 +47426,8 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None):
                 held.update((a["source_id"], b["source_id"]))
             decision.update(left_id=a["source_id"], right_id=b["source_id"])
             result["seams"].append(decision)
+        if kind is StitchRunKind.PROOF and (len(result["seams"]) != 1 or result["seams"][0].get("decision") != "join"):
+            raise StitchHold("proof current-policy seam is not a real join")
         sources, run_clips, run_index = [], [], 0
 
         def flush():
@@ -47376,10 +47448,10 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None):
                         str(Fraction(sources[0]["signature"][5]).denominator), "-movflags", "+faststart", "-y", str(output)], deadline, stop)
             stitch_audit_output(ffmpeg, ffprobe, output, sources, work, deadline, stop)
             size, sha = sha256_file(output)
-            name = "run-%03d-%s.mp4" % (run_index, sha)
+            name = "proof.mp4" if kind is StitchRunKind.PROOF else "run-%03d-%s.mp4" % (run_index, sha)
             published = directory.publish(output.name, name)
             relative = plan["output_folder"] + "/" + name
-            hash_certification_file(cfg.output_dir, relative, size, sha)  # reopen after fsync
+            stitch_hash(cfg, relative, size, sha, stop)  # reopen after fsync
             proof = dict(policy=STITCH_POLICY, provenance=provenance, relative_path=relative, sha256=sha, size_bytes=size, inputs=[], full_decode=True,
                          seam_decode=True, packet_chain=True, native_audit=True, original_sources_no_audio=True,
                          readback_sha256=sha, fsynced=True)
@@ -47391,9 +47463,12 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None):
                 proof["inputs"].append(dict(clip_id=clip["source_id"], sha256=clip["sha256"], size_bytes=clip["size_bytes"],
                                              packet_chain_sha256=source["chain"], packets=source["count"], frames=source["count"],
                                              repaired=False, retirement_held=clip["source_id"] in held, raw_proof=raw_proof))
-            proof_temp = work / "proof.partial.json"
-            proof_temp.write_bytes(cleanup_json_bytes(proof))
-            directory.publish(proof_temp.name, name + ".proof.json")
+            if kind is StitchRunKind.PROOF:
+                proof["media_seconds"] = float(cumulative)
+            if kind is StitchRunKind.PRODUCTION:
+                proof_temp = work / "proof.partial.json"
+                proof_temp.write_bytes(cleanup_json_bytes(proof))
+                directory.publish(proof_temp.name, name + ".proof.json")
             result["outputs"].append(proof)
             STITCH_STATUS.add("outputs_verified")
             run_index += 1
@@ -47413,7 +47488,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None):
             b = parse_certification_timestamp(clip["end_at"], "source end")
             if a < start or b > end or b <= a:
                 raise StitchHold("source crosses keep boundary")
-            path, info, _ = hash_certification_file(cfg.output_dir, clip["relative_path"], clip["size_bytes"], clip["sha256"])
+            path, info, _ = stitch_hash(cfg, clip["relative_path"], clip["size_bytes"], clip["sha256"], stop)
             if sys.platform.startswith("linux"):
                 fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
                 resources.callback(os.close, fd)
@@ -47423,6 +47498,8 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None):
             sidecar, scinfo = confined_regular_file(cfg.output_dir, clip["relative_path"] + ".stoarama.json")
             clip.update(frozen_identity=cleanup_identity(info), frozen_sidecar_identity=cleanup_identity(scinfo), _path=path)
             if not plan["eligible"][index] or (admitted is not None and not admitted(clip)):
+                if kind is StitchRunKind.PROOF:
+                    raise StitchHold("proof source is ineligible")
                 flush()
                 repaired = stitch_repair_local(cfg, clip, path, directory, tools, deadline, stop)
                 if repaired:
@@ -47432,7 +47509,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None):
             try:
                 source = stitch_audit_source(ffmpeg, ffprobe, path, work, index, deadline, stop)
             except StitchHold as exc:
-                if stop.is_set():
+                if kind is StitchRunKind.PROOF or stop.is_set():
                     raise
                 flush()
                 repaired = stitch_repair_local(cfg, clip, path, directory, tools, deadline, stop)
@@ -47447,8 +47524,360 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None):
             sources.append(source)
             run_clips.append(clip)
         flush()
-    stitch_journal(inventory, task["id"], task["plan_sha256"], result)
+        if kind is StitchRunKind.PROOF:
+            stitch_proof_complete(cfg, task, result, work, stop)
+    if kind is StitchRunKind.PRODUCTION:
+        stitch_journal(inventory, task["id"], task["plan_sha256"], result)
     return result
+
+
+# Isolated NAS-only proof. No lease/result/ready call or old stitch journal use.
+STITCH_PROOF_SOURCE_SHA = "0dfa6b172f33bd55e409729ecd517d492cdee03427b028ac226788e530a72726"
+STITCH_PROOF_KIND = "nas-only-v85r-proof-v1"
+STITCH_PROOF_AUDIT_NAMES = ('source-000.json', 'source-000.packets', 'source-000.hidden', 'source-000.frames', 'source-001.json', 'source-001.packets', 'source-001.hidden', 'source-001.frames', 'output.json', 'output.packets', 'output.hidden', 'output.frames', 'v85r-decision.json')
+STITCH_PROOF_MAX_BYTES = 128 * 1024 * 1024
+STITCH_PROOF_SCHEMA_SHA = "18fffd8f94334210eb12ccee8c0856a824cd9ae9c3dc97b6fe6124e99a0906d4"
+STITCH_PROOF_SCHEMA_JSON = '{\n  "$schema": "https://json-schema.org/draft/2020-12/schema",\n  "$id": "stoarama.nas-stitch-native-receipt.v1",\n  "type": "object",\n  "additionalProperties": false,\n  "required": [\n    "schema",\n    "kind",\n    "connection_id",\n    "account_id",\n    "run",\n    "client_artifact_sha256",\n    "client_version",\n    "source_plan_sha256",\n    "plan_sha256",\n    "result",\n    "audits",\n    "measurements",\n    "build_wall_seconds",\n    "verified_at"\n  ],\n  "properties": {\n    "schema": {\n      "const": "stoarama.nas-stitch-native-receipt.v1"\n    },\n    "kind": {\n      "const": "nas-only-v85r-proof-v1"\n    },\n    "connection_id": {\n      "const": 13\n    },\n    "account_id": {\n      "const": 47\n    },\n    "run": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "id",\n        "client_boot_id",\n        "host",\n        "started_at",\n        "completed_at"\n      ],\n      "properties": {\n        "id": {\n          "type": "string",\n          "format": "uuid"\n        },\n        "client_boot_id": {\n          "type": "string",\n          "format": "uuid"\n        },\n        "host": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "connection_id",\n            "system",\n            "machine",\n            "cpu_model",\n            "cpu_count"\n          ],\n          "properties": {\n            "connection_id": {\n              "const": 13\n            },\n            "system": {\n              "const": "Linux"\n            },\n            "machine": {\n              "const": "x86_64"\n            },\n            "cpu_model": {\n              "type": "string",\n              "minLength": 1,\n              "maxLength": 2048\n            },\n            "cpu_count": {\n              "type": "integer",\n              "minimum": 1\n            }\n          }\n        },\n        "started_at": {\n          "type": "string",\n          "format": "date-time",\n          "pattern": "^\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}(?:\\\\.\\\\d+)?Z$"\n        },\n        "completed_at": {\n          "type": "string",\n          "format": "date-time",\n          "pattern": "^\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}(?:\\\\.\\\\d+)?Z$"\n        }\n      }\n    },\n    "client_artifact_sha256": {\n      "type": "string",\n      "pattern": "^[a-f0-9]{64}$"\n    },\n    "client_version": {\n      "type": "string",\n      "minLength": 1,\n      "maxLength": 128\n    },\n    "source_plan_sha256": {\n      "const": "0dfa6b172f33bd55e409729ecd517d492cdee03427b028ac226788e530a72726"\n    },\n    "plan_sha256": {\n      "type": "string",\n      "pattern": "^[a-f0-9]{64}$"\n    },\n    "result": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "policy",\n        "plan_sha256",\n        "outputs",\n        "repairs",\n        "left_out",\n        "seams",\n        "error"\n      ],\n      "properties": {\n        "policy": {\n          "const": "v85r"\n        },\n        "plan_sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "outputs": {\n          "type": "array",\n          "items": {\n            "type": "object",\n            "additionalProperties": false,\n            "required": [\n              "policy",\n              "provenance",\n              "relative_path",\n              "sha256",\n              "size_bytes",\n              "inputs",\n              "full_decode",\n              "seam_decode",\n              "packet_chain",\n              "native_audit",\n              "original_sources_no_audio",\n              "readback_sha256",\n              "fsynced",\n              "media_seconds"\n            ],\n            "properties": {\n              "policy": {\n                "const": "v85r"\n              },\n              "provenance": {\n                "type": "object",\n                "additionalProperties": false,\n                "required": [\n                  "policy",\n                  "manifest_sha256",\n                  "ffmpeg_version",\n                  "ffprobe_version",\n                  "ffmpeg_sha256",\n                  "ffprobe_sha256",\n                  "october_ffmpeg_recovered"\n                ],\n                "properties": {\n                  "policy": {\n                    "const": "v85r"\n                  },\n                  "manifest_sha256": {\n                    "const": "337c606985e930abf1df459cbbda0c674f13bd9d92e11013131e2b2348e78a06"\n                  },\n                  "ffmpeg_version": {\n                    "const": "N-126826-gc0e8b139fd-20260924"\n                  },\n                  "ffprobe_version": {\n                    "const": "N-126826-gc0e8b139fd-20260924"\n                  },\n                  "ffmpeg_sha256": {\n                    "const": "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b"\n                  },\n                  "ffprobe_sha256": {\n                    "const": "9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c"\n                  },\n                  "october_ffmpeg_recovered": {\n                    "const": true\n                  }\n                }\n              },\n              "relative_path": {\n                "type": "string",\n                "minLength": 1,\n                "maxLength": 2048\n              },\n              "sha256": {\n                "type": "string",\n                "pattern": "^[a-f0-9]{64}$"\n              },\n              "size_bytes": {\n                "type": "integer",\n                "minimum": 1\n              },\n              "inputs": {\n                "type": "array",\n                "items": {\n                  "type": "object",\n                  "additionalProperties": false,\n                  "required": [\n                    "clip_id",\n                    "sha256",\n                    "size_bytes",\n                    "packet_chain_sha256",\n                    "packets",\n                    "frames",\n                    "repaired",\n                    "retirement_held",\n                    "raw_proof"\n                  ],\n                  "properties": {\n                    "clip_id": {\n                      "type": "integer",\n                      "minimum": 1\n                    },\n                    "sha256": {\n                      "type": "string",\n                      "pattern": "^[a-f0-9]{64}$"\n                    },\n                    "size_bytes": {\n                      "type": "integer",\n                      "minimum": 1\n                    },\n                    "packet_chain_sha256": {\n                      "type": "string",\n                      "pattern": "^[a-f0-9]{64}$"\n                    },\n                    "packets": {\n                      "type": "integer",\n                      "minimum": 1\n                    },\n                    "frames": {\n                      "type": "integer",\n                      "minimum": 1\n                    },\n                    "repaired": {\n                      "const": false\n                    },\n                    "retirement_held": {\n                      "const": false\n                    },\n                    "raw_proof": {\n                      "type": "object",\n                      "minProperties": 1\n                    }\n                  }\n                },\n                "minItems": 2,\n                "maxItems": 2\n              },\n              "full_decode": {\n                "const": true\n              },\n              "seam_decode": {\n                "const": true\n              },\n              "packet_chain": {\n                "const": true\n              },\n              "native_audit": {\n                "const": true\n              },\n              "original_sources_no_audio": {\n                "const": true\n              },\n              "readback_sha256": {\n                "type": "string",\n                "pattern": "^[a-f0-9]{64}$"\n              },\n              "fsynced": {\n                "const": true\n              },\n              "media_seconds": {\n                "type": "number",\n                "exclusiveMinimum": 0\n              }\n            }\n          },\n          "minItems": 1,\n          "maxItems": 1\n        },\n        "repairs": {\n          "const": []\n        },\n        "left_out": {\n          "const": []\n        },\n        "seams": {\n          "type": "array",\n          "items": {\n            "type": "object",\n            "additionalProperties": false,\n            "required": [\n              "policy",\n              "nomination",\n              "status",\n              "join",\n              "frozen",\n              "decision",\n              "reason",\n              "diagnostic_sha256",\n              "left_id",\n              "right_id"\n            ],\n            "properties": {\n              "policy": {\n                "const": "v85r"\n              },\n              "nomination": {\n                "const": true\n              },\n              "status": {\n                "const": "APPROVED85_nomination_requires_runtime_native_join_checks"\n              },\n              "join": {\n                "const": true\n              },\n              "frozen": {\n                "const": true\n              },\n              "decision": {\n                "const": "join"\n              },\n              "reason": {\n                "type": "string",\n                "minLength": 1,\n                "maxLength": 200\n              },\n              "diagnostic_sha256": {\n                "type": "string",\n                "pattern": "^[a-f0-9]{64}$"\n              },\n              "left_id": {\n                "const": 373218\n              },\n              "right_id": {\n                "const": 373262\n              }\n            }\n          },\n          "minItems": 1,\n          "maxItems": 1\n        },\n        "error": {\n          "const": ""\n        }\n      }\n    },\n    "audits": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "source-000.json",\n        "source-000.packets",\n        "source-000.hidden",\n        "source-000.frames",\n        "source-001.json",\n        "source-001.packets",\n        "source-001.hidden",\n        "source-001.frames",\n        "output.json",\n        "output.packets",\n        "output.hidden",\n        "output.frames",\n        "v85r-decision.json"\n      ],\n      "properties": {\n        "source-000.json": {\n          "type": "string",\n          "maxLength": 4194304\n        },\n        "source-000.packets": {\n          "type": "string",\n          "maxLength": 4194304\n        },\n        "source-000.hidden": {\n          "type": "string",\n          "maxLength": 4194304\n        },\n        "source-000.frames": {\n          "type": "string",\n          "maxLength": 4194304\n        },\n        "source-001.json": {\n          "type": "string",\n          "maxLength": 4194304\n        },\n        "source-001.packets": {\n          "type": "string",\n          "maxLength": 4194304\n        },\n        "source-001.hidden": {\n          "type": "string",\n          "maxLength": 4194304\n        },\n        "source-001.frames": {\n          "type": "string",\n          "maxLength": 4194304\n        },\n        "output.json": {\n          "type": "string",\n          "maxLength": 4194304\n        },\n        "output.packets": {\n          "type": "string",\n          "maxLength": 4194304\n        },\n        "output.hidden": {\n          "type": "string",\n          "maxLength": 4194304\n        },\n        "output.frames": {\n          "type": "string",\n          "maxLength": 4194304\n        },\n        "v85r-decision.json": {\n          "type": "string",\n          "maxLength": 4194304\n        }\n      }\n    },\n    "measurements": {\n      "type": "array",\n      "items": {\n        "type": "object",\n        "additionalProperties": false,\n        "required": [\n          "argv",\n          "returncode",\n          "wall_s",\n          "cpu_s"\n        ],\n        "properties": {\n          "argv": {\n            "type": "array",\n            "minItems": 1,\n            "maxItems": 100,\n            "items": {\n              "type": "string",\n              "maxLength": 2048\n            }\n          },\n          "returncode": {\n            "const": 0\n          },\n          "wall_s": {\n            "type": "number",\n            "minimum": 0\n          },\n          "cpu_s": {\n            "type": "number",\n            "minimum": 0\n          }\n        }\n      },\n      "minItems": 15,\n      "maxItems": 15\n    },\n    "build_wall_seconds": {\n      "type": "number",\n      "exclusiveMinimum": 0\n    },\n    "verified_at": {\n      "type": "string",\n      "format": "date-time",\n      "pattern": "^\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}(?:\\\\.\\\\d+)?Z$"\n    }\n  },\n  "$comment": "gzip canonical UTF8 JSON, <=1MiB compressed/16MiB decompressed; strict duplicate/unknown fields; no concatenated/trailing compressed members. Audit values are raw ffprobe compact packet rows and ffmpeg framehash rows/probe JSON/fresh current-policy decision JSON. Mechanical replay uses only pure functions extracted from the exact checksum-pinned tested client artifact. Booleans alone are never a successful replay.",\n  "$defs": {\n    "file": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "file",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "file": {\n          "type": "string",\n          "pattern": "^(?!/)(?!.*(?:^|/)\\\\.{1,2}(?:/|$))(?!.*//)[A-Za-z0-9][A-Za-z0-9._/-]*$"\n        },\n        "sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "size_bytes": {\n          "type": "integer",\n          "minimum": 1\n        }\n      }\n    },\n    "media": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "relative_path",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "relative_path": {\n          "type": "string",\n          "minLength": 1,\n          "maxLength": 2048\n        },\n        "sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "size_bytes": {\n          "type": "integer",\n          "minimum": 1\n        }\n      }\n    },\n    "input": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "clip_id",\n        "relative_path",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "clip_id": {\n          "type": "integer",\n          "minimum": 1\n        },\n        "relative_path": {\n          "type": "string",\n          "minLength": 1,\n          "maxLength": 2048\n        },\n        "sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "size_bytes": {\n          "type": "integer",\n          "minimum": 1\n        }\n      }\n    },\n    "output": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "relative_path",\n        "sha256",\n        "size_bytes",\n        "source_clip_ids",\n        "readback_sha256"\n      ],\n      "properties": {\n        "relative_path": {\n          "type": "string",\n          "minLength": 1,\n          "maxLength": 2048\n        },\n        "sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "size_bytes": {\n          "type": "integer",\n          "minimum": 1\n        },\n        "source_clip_ids": {\n          "const": [\n            373218,\n            373262\n          ]\n        },\n        "readback_sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        }\n      }\n    },\n    "policy": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "name",\n        "revision",\n        "keep28_sha256",\n        "corpus_sha256",\n        "package_manifest_sha256"\n      ],\n      "properties": {\n        "name": {\n          "const": "v85r"\n        },\n        "revision": {\n          "const": "v85r-rebuilt-1"\n        },\n        "keep28_sha256": {\n          "const": "060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811"\n        },\n        "corpus_sha256": {\n          "const": "5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b"\n        },\n        "package_manifest_sha256": {\n          "const": "337c606985e930abf1df459cbbda0c674f13bd9d92e11013131e2b2348e78a06"\n        }\n      }\n    },\n    "tool": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "version",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "version": {\n          "const": "N-126826-gc0e8b139fd-20260924"\n        },\n        "sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "size_bytes": {\n          "type": "integer",\n          "minimum": 1\n        }\n      }\n    },\n    "pipeline": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "repository",\n        "base_commit_sha",\n        "reviewed_head_sha",\n        "merged_commit_sha",\n        "client_version",\n        "client_artifact_sha256"\n      ],\n      "properties": {\n        "repository": {\n          "const": "daydemir/stoarama"\n        },\n        "base_commit_sha": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{40}$"\n        },\n        "reviewed_head_sha": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{40}$"\n        },\n        "merged_commit_sha": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{40}$"\n        },\n        "client_version": {\n          "type": "string",\n          "minLength": 1,\n          "maxLength": 2048\n        },\n        "client_artifact_sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        }\n      }\n    },\n    "run": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "id",\n        "client_boot_id",\n        "host",\n        "started_at",\n        "completed_at",\n        "media_seconds",\n        "build_wall_seconds"\n      ],\n      "properties": {\n        "id": {\n          "type": "string",\n          "format": "uuid"\n        },\n        "client_boot_id": {\n          "type": "string",\n          "format": "uuid"\n        },\n        "host": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "connection_id",\n            "system",\n            "machine",\n            "cpu_model",\n            "cpu_count"\n          ],\n          "properties": {\n            "connection_id": {\n              "const": 13\n            },\n            "system": {\n              "const": "Linux"\n            },\n            "machine": {\n              "const": "x86_64"\n            },\n            "cpu_model": {\n              "type": "string",\n              "minLength": 1,\n              "maxLength": 2048\n            },\n            "cpu_count": {\n              "type": "integer",\n              "minimum": 1\n            }\n          }\n        },\n        "started_at": {\n          "type": "string",\n          "format": "date-time",\n          "pattern": "^\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}(?:\\\\.\\\\d+)?Z$"\n        },\n        "completed_at": {\n          "type": "string",\n          "format": "date-time",\n          "pattern": "^\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}(?:\\\\.\\\\d+)?Z$"\n        },\n        "media_seconds": {\n          "type": "number",\n          "exclusiveMinimum": 0\n        },\n        "build_wall_seconds": {\n          "type": "number",\n          "exclusiveMinimum": 0\n        }\n      }\n    },\n    "payload": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "connection_id",\n        "account_id",\n        "scope",\n        "policy",\n        "pipeline",\n        "tools",\n        "run",\n        "inputs",\n        "outputs",\n        "evidence",\n        "verification"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-payload.v1"\n        },\n        "connection_id": {\n          "const": 13\n        },\n        "account_id": {\n          "const": 47\n        },\n        "scope": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "stream_id",\n            "recording_id",\n            "source_task_id",\n            "source_plan_sha256",\n            "proof_plan_sha256",\n            "clip_ids"\n          ],\n          "properties": {\n            "stream_id": {\n              "const": 17208\n            },\n            "recording_id": {\n              "const": 444\n            },\n            "source_task_id": {\n              "const": 1\n            },\n            "source_plan_sha256": {\n              "const": "0dfa6b172f33bd55e409729ecd517d492cdee03427b028ac226788e530a72726"\n            },\n            "proof_plan_sha256": {\n              "type": "string",\n              "pattern": "^[a-f0-9]{64}$"\n            },\n            "clip_ids": {\n              "const": [\n                373218,\n                373262\n              ]\n            }\n          }\n        },\n        "policy": {\n          "$ref": "#/$defs/policy"\n        },\n        "pipeline": {\n          "$ref": "#/$defs/pipeline"\n        },\n        "tools": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "ffmpeg",\n            "ffprobe"\n          ],\n          "properties": {\n            "ffmpeg": {\n              "$ref": "#/$defs/ffmpeg"\n            },\n            "ffprobe": {\n              "$ref": "#/$defs/ffprobe"\n            }\n          }\n        },\n        "run": {\n          "$ref": "#/$defs/run"\n        },\n        "inputs": {\n          "type": "array",\n          "items": {\n            "$ref": "#/$defs/input"\n          },\n          "minItems": 2,\n          "maxItems": 2\n        },\n        "outputs": {\n          "type": "array",\n          "items": {\n            "$ref": "#/$defs/output"\n          },\n          "minItems": 1,\n          "maxItems": 1\n        },\n        "evidence": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "native_bundle",\n            "local_registration",\n            "source_plan",\n            "server_validation",\n            "verifier",\n            "client_artifact"\n          ],\n          "properties": {\n            "native_bundle": {\n              "$ref": "#/$defs/file"\n            },\n            "local_registration": {\n              "$ref": "#/$defs/file"\n            },\n            "source_plan": {\n              "$ref": "#/$defs/file"\n            },\n            "server_validation": {\n              "$ref": "#/$defs/file"\n            },\n            "verifier": {\n              "$ref": "#/$defs/file"\n            },\n            "client_artifact": {\n              "$ref": "#/$defs/file"\n            }\n          }\n        },\n        "verification": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "current_policy",\n            "native_inventory_replay",\n            "server_binding",\n            "result_sha256"\n          ],\n          "properties": {\n            "current_policy": {\n              "const": "passed"\n            },\n            "native_inventory_replay": {\n              "const": "passed"\n            },\n            "server_binding": {\n              "const": "passed"\n            },\n            "result_sha256": {\n              "type": "string",\n              "pattern": "^[a-f0-9]{64}$"\n            }\n          }\n        }\n      }\n    },\n    "validation": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "validated_at",\n        "run_id",\n        "proof_plan_sha256",\n        "client_artifact_sha256",\n        "policy",\n        "tools",\n        "server_binding",\n        "nas_readback"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-validation.v1"\n        },\n        "validated_at": {\n          "type": "string",\n          "format": "date-time",\n          "pattern": "^\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}(?:\\\\.\\\\d+)?Z$"\n        },\n        "run_id": {\n          "type": "string",\n          "format": "uuid"\n        },\n        "proof_plan_sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "client_artifact_sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "policy": {\n          "$ref": "#/$defs/policy"\n        },\n        "tools": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "ffmpeg",\n            "ffprobe"\n          ],\n          "properties": {\n            "ffmpeg": {\n              "$ref": "#/$defs/ffmpeg"\n            },\n            "ffprobe": {\n              "$ref": "#/$defs/ffprobe"\n            }\n          }\n        },\n        "server_binding": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "verified",\n            "kind",\n            "plan_sha256",\n            "output_sha256",\n            "registered_locally_only",\n            "grants_retirement"\n          ],\n          "properties": {\n            "verified": {\n              "const": true\n            },\n            "kind": {\n              "const": "nas-only-v85r-proof-v1"\n            },\n            "plan_sha256": {\n              "type": "string",\n              "pattern": "^[a-f0-9]{64}$"\n            },\n            "output_sha256": {\n              "type": "string",\n              "pattern": "^[a-f0-9]{64}$"\n            },\n            "registered_locally_only": {\n              "const": true\n            },\n            "grants_retirement": {\n              "const": false\n            }\n          }\n        },\n        "nas_readback": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "verified_at",\n            "client_boot_id",\n            "run_id",\n            "receipt_sha256",\n            "outputs"\n          ],\n          "properties": {\n            "verified_at": {\n              "type": "string",\n              "format": "date-time",\n              "pattern": "^\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}(?:\\\\.\\\\d+)?Z$"\n            },\n            "client_boot_id": {\n              "type": "string",\n              "format": "uuid"\n            },\n            "run_id": {\n              "type": "string",\n              "format": "uuid"\n            },\n            "receipt_sha256": {\n              "type": "string",\n              "pattern": "^[a-f0-9]{64}$"\n            },\n            "outputs": {\n              "type": "array",\n              "items": {\n                "$ref": "#/$defs/media"\n              },\n              "minItems": 1,\n              "maxItems": 1\n            }\n          }\n        }\n      }\n    },\n    "review": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "reviewer",\n        "reviewed_at",\n        "verdict",\n        "payload_sha256",\n        "bundle_sha256",\n        "reviewed_code_head_sha",\n        "observations"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-review.v1"\n        },\n        "reviewer": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "name",\n            "provider",\n            "model",\n            "reference"\n          ],\n          "properties": {\n            "name": {\n              "type": "string",\n              "minLength": 1,\n              "maxLength": 2048\n            },\n            "provider": {\n              "type": "string",\n              "minLength": 1,\n              "maxLength": 2048\n            },\n            "model": {\n              "type": "string",\n              "minLength": 1,\n              "maxLength": 2048\n            },\n            "reference": {\n              "type": "string",\n              "minLength": 1,\n              "maxLength": 2048\n            }\n          }\n        },\n        "reviewed_at": {\n          "type": "string",\n          "format": "date-time",\n          "pattern": "^\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}(?:\\\\.\\\\d+)?Z$"\n        },\n        "verdict": {\n          "const": "approve"\n        },\n        "payload_sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "bundle_sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "reviewed_code_head_sha": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{40}$"\n        },\n        "observations": {\n          "$ref": "#/$defs/file"\n        }\n      }\n    },\n    "ffmpeg": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "version",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "version": {\n          "const": "N-126826-gc0e8b139fd-20260924"\n        },\n        "sha256": {\n          "const": "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b"\n        },\n        "size_bytes": {\n          "const": 174165384\n        }\n      }\n    },\n    "ffprobe": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "version",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "version": {\n          "const": "N-126826-gc0e8b139fd-20260924"\n        },\n        "sha256": {\n          "const": "9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c"\n        },\n        "size_bytes": {\n          "const": 173923656\n        }\n      }\n    }\n  }\n}\n'
+
+
+def stitch_hash(cfg, relative, size, sha, stop):
+    verified = hash_certification_file_cancellable(cfg.output_dir, relative, size, sha, stop)
+    os.close(verified[3])
+    return verified[:3]
+
+
+def stitch_proof_json(raw):
+    def unique(pairs):
+        value={}
+        for key,item in pairs:
+            if key in value:
+                raise StitchHold("duplicate proof JSON field")
+            value[key]=item
+        return value
+    def invalid(number):
+        raise StitchHold("nonfinite proof JSON number")
+    return json.loads(raw,object_pairs_hook=unique,parse_constant=invalid)
+
+
+def stitch_proof_digest(path, stop):
+    descriptor=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+    try:
+        before=os.fstat(descriptor);digest=hashlib.sha256();size=0
+        if not stat_module.S_ISREG(before.st_mode) or before.st_nlink!=1:
+            raise StitchHold("proof digest requires private regular file")
+        while True:
+            if stop.is_set():raise StitchHold("proof hash cancelled")
+            block=os.read(descriptor,1024*1024)
+            if not block:break
+            size+=len(block);digest.update(block)
+        if certification_identity(before)!=certification_identity(os.fstat(descriptor)):
+            raise StitchHold("proof digest input changed")
+        return size,digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def stitch_proof_pipeline(cfg,receipt,stop):
+    if receipt["client_version"]!=CLIENT_VERSION or stitch_proof_client(cfg,stop)!=receipt["client_artifact_sha256"]:
+        raise StitchHold("tested client drift requires new proof")
+    root=Path(cfg.state_dir)/"tools"/("v85r-"+V85R_MANIFEST_SHA)
+    manifest=root/"manifest.json"
+    confined_regular_file(cfg.state_dir,str(manifest.relative_to(cfg.state_dir)))
+    if stitch_proof_digest(manifest,stop)[1]!=V85R_MANIFEST_SHA:
+        raise StitchHold("tested policy drift requires new proof")
+    pins=dict(stitch_proof_json(manifest.read_bytes())["files"],**{"manifest.json":V85R_MANIFEST_SHA})
+    for name,sha in pins.items():
+        path=root/name
+        confined_regular_file(cfg.state_dir,str(path.relative_to(cfg.state_dir)))
+        if stitch_proof_digest(path,stop)[1]!=sha:raise StitchHold("tested policy member drift requires new proof")
+    for name,(sha,size) in V85R_TOOLS.items():
+        path=Path(cfg.state_dir)/"tools"/("v85r-ffmpeg-"+V85R_TOOL_VERSION)/name
+        confined_regular_file(cfg.state_dir,str(path.relative_to(cfg.state_dir)))
+        if stitch_proof_digest(path,stop)!=(size,sha):raise StitchHold("tested media tool drift requires new proof")
+
+
+def stitch_proof_client(cfg,stop):
+    if cfg.is_candidate:
+        raise StitchHold("proof requires the promoted executing release")
+    sha=stitch_proof_digest(cfg.current_file,stop)[1]
+    if sha!=executing_release_sha256(cfg):
+        raise StitchHold("installed proof client differs from executing release")
+    return sha
+
+
+def stitch_proof_check(task):
+    plan = task.get("plan", {})
+    if (task.get("kind") != STITCH_PROOF_KIND or task.get("id") != 1
+            or task.get("source_plan_sha256") != STITCH_PROOF_SOURCE_SHA
+            or hashlib.sha256(cleanup_json_bytes(plan)).hexdigest() != task.get("plan_sha256")
+            or [c["source_id"] for c in plan.get("clips", [])] != [373218, 373262]
+            or [c["sha256"] for c in plan["clips"]] != ["7bfea81fc9dd6fc83d15759b061a05b82f9b7a70a618e728d9a4e490a0534505", "600d2998f6799386ccf07be1687074e3a761babdd435ad0f79ce068fa7f166a4"]
+            or [c["size_bytes"] for c in plan["clips"]] != [11371311, 11249068]
+            or plan.get("joins") != [True] or plan.get("eligible") != [True, True]
+            or plan.get("policy") != STITCH_POLICY or plan.get("revision") != STITCH_REVISION
+            or plan.get("corpus_sha256") != STITCH_CORPUS_SHA or plan.get("keep_policy_sha256") != CLEANUP_KEEP28_POLICY_SHA256):
+        raise StitchHold("unapproved isolated proof identity")
+
+
+def stitch_proof_space(cfg, task):
+    folder = cfg.output_dir/task["plan"]["output_folder"]
+    if not folder.exists():
+        return
+    allowed = set(STITCH_PROOF_AUDIT_NAMES) | {".owner.json", "owner.partial.json", "concat.txt", "run.partial.mp4", "proof.mp4", "receipt.partial.gz", "receipt.json.gz", "v85r-request.json", "proof.partial.json"}
+    total = 0
+    with StitchDirectory(cfg, task["plan"]["output_folder"],1,threading.Event()) as directory:
+        for name in os.listdir(directory.fds[-1]):
+            entry=joined_entry_stat(directory.fds[-1],name)
+            if name not in allowed or entry is None or entry.st_nlink!=1:
+                raise StitchHold("unrecognized proof namespace entry")
+            total+=entry.st_size
+    if total>STITCH_PROOF_MAX_BYTES:
+        raise StitchHold("proof storage bound reached")
+
+
+def stitch_proof_checkpoint(cfg, task):
+    current = request_json(cfg, "GET", "/account/connections/stitch/proof", timeout=HEARTBEAT_TIMEOUT_SEC)
+    stitch_proof_check(current)
+    if current["plan_sha256"] != task["plan_sha256"]:
+        raise StitchHold("proof admission changed")
+
+
+class StitchProofDirectory(StitchDirectory):
+    """Linux atomic create-only rename: no hardlink/quarantine/shared ledger."""
+    def __enter__(self):
+        super().__enter__()
+        try:
+            expected = cleanup_json_bytes(dict(kind=STITCH_PROOF_KIND, source_plan_sha256=STITCH_PROOF_SOURCE_SHA,
+                                               namespace=self.relative, manifest_sha256=V85R_MANIFEST_SHA))
+            entries = set(os.listdir(self.fds[-1]))
+            if ".owner.json" not in entries:
+                if entries - {"owner.partial.json"}:
+                    raise StitchHold("proof namespace has no ownership receipt")
+                if "owner.partial.json" not in entries:
+                    fd = os.open("owner.partial.json", os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, 0o600, dir_fd=self.fds[-1])
+                    try:
+                        os.write(fd,expected);os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                if sha256_file(self.path/"owner.partial.json") != (len(expected),hashlib.sha256(expected).hexdigest()):
+                    raise StitchHold("proof ownership intent differs")
+                self.publish("owner.partial.json",".owner.json")
+            marker = joined_entry_stat(self.fds[-1],".owner.json")
+            if marker is None or marker.st_nlink!=1 or sha256_file(self.path/".owner.json")!=(len(expected),hashlib.sha256(expected).hexdigest()):
+                raise StitchHold("proof ownership receipt differs")
+            return self
+        except BaseException:
+            self.__exit__(None,None,None)
+            raise
+
+    def publish(self, temporary, name):
+        import ctypes
+        if not sys.platform.startswith("linux") or os.uname().machine != "x86_64":
+            raise StitchHold("NAS proof publication requires Linux amd64 renameat2")
+        descriptor = self.fds[-1]
+        current = joined_entry_stat(descriptor, temporary)
+        if current is None or current.st_nlink != 1:
+            raise StitchHold("proof stage is not private")
+        expected = sha256_file(self.path / temporary)
+        fd = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        rename = ctypes.CDLL(None, use_errno=True).syscall
+        rename.argtypes = (ctypes.c_long, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+        rename.restype = ctypes.c_long
+        # renameat2 is syscall 316 on the required Linux amd64 target.
+        if rename(316, descriptor, os.fsencode(temporary), descriptor, os.fsencode(name), 1):
+            error = ctypes.get_errno()
+            if error != errno.EEXIST:
+                raise OSError(error, "atomic proof publication refused")
+            target = joined_entry_stat(descriptor, name)
+            if target is None or target.st_nlink != 1 or sha256_file(self.path/name) != expected:
+                raise StitchHold("immutable proof publication conflict")
+            # Only the current call's newly generated private duplicate stage.
+            os.unlink(temporary, dir_fd=descriptor)
+        os.fsync(descriptor)
+        return self.path / name
+
+
+def stitch_proof_success(result):
+    outputs = result.get("outputs", [])
+    if (result.get("repairs") or result.get("left_out") or result.get("error")
+            or len(outputs) != 1 or len(outputs[0].get("inputs", [])) != 2
+            or [x["clip_id"] for x in outputs[0]["inputs"]] != [373218, 373262]
+            or len(result.get("seams", [])) != 1 or result["seams"][0].get("decision") != "join"
+            or result["seams"][0].get("status") != "APPROVED85_nomination_requires_runtime_native_join_checks"
+            or any(x.get("retirement_held") for x in outputs[0]["inputs"])):
+        raise StitchHold("proof requires one real nominated two-input joined output")
+
+
+def stitch_proof_complete(cfg, task, result, work, stop):
+    stitch_proof_success(result)
+    files = {}
+    for name in STITCH_PROOF_AUDIT_NAMES:
+        source = work/name
+        if source.is_symlink() or not source.is_file():
+            raise StitchHold("native proof audit missing")
+        if source.stat().st_size > 4*1024*1024:
+            raise StitchHold("native proof audit exceeds bound")
+        files[name] = source.read_text(encoding="ascii")
+    for clip in task["plan"]["clips"]:
+        stitch_hash(cfg, clip["relative_path"], clip["size_bytes"], clip["sha256"], stop)
+    for output in result["outputs"]:
+        stitch_hash(cfg, output["relative_path"], output["size_bytes"], output["sha256"], stop)
+    clean_result = {k:v for k,v in result.items() if k != "lease_token"}
+    runtime = read_json(cfg.runtime_file,{})
+    import platform
+    cpu = next((line.split(":",1)[1].strip() for line in _read_text("/proc/cpuinfo").splitlines() if line.startswith("model name")), "unknown")
+    receipt = dict(schema="stoarama.nas-stitch-native-receipt.v1", connection_id=13, account_id=47, run=dict(id=stop.run_id, client_boot_id=runtime["boot_id"], started_at=stop.started_at, completed_at=utc_now(), host=dict(connection_id=13,system=platform.system(),machine=platform.machine(),cpu_model=cpu,cpu_count=os.cpu_count())), client_artifact_sha256=stitch_proof_client(cfg,stop), kind=STITCH_PROOF_KIND, source_plan_sha256=STITCH_PROOF_SOURCE_SHA,
+                   plan_sha256=task["plan_sha256"], result=clean_result, audits=files,
+                   measurements=stop.measurements, build_wall_seconds=time.monotonic()-stop.started, client_version=CLIENT_VERSION, verified_at=utc_now())
+    raw = cleanup_json_bytes(receipt)
+    if len(raw) > 16*1024*1024:
+        raise StitchHold("proof receipt exceeds decompressed bound")
+    body = gzip.compress(raw, mtime=0)
+    if len(body) > 1024*1024:
+        raise StitchHold("proof receipt exceeds transport bound")
+    stage = work/"receipt.partial.gz"
+    with stage.open("wb") as output:
+        output.write(body); output.flush(); os.fsync(output.fileno())
+    # Local registration is append-only and distinct from task1/catalogue admission.
+    with StitchProofDirectory(cfg, task["plan"]["output_folder"], 1, stop) as directory:
+        directory.publish(stage.name, "receipt.json.gz")
+
+
+def stitch_proof_emit(cfg, task, body, boot):
+    digest = hashlib.sha256(body).hexdigest()
+    encoded = body.hex()
+    chunks = [encoded[n:n+1024] for n in range(0,len(encoded),1024)]
+    state_path = cfg.state_dir/("v85r-proof-transport-"+task["plan_sha256"]+".json")
+    state = read_json(state_path, dict(digest=digest, cursor=0))
+    if state.get("digest") != digest or type(state.get("cursor")) is not int or not 0 <= state["cursor"] <= len(chunks):
+        raise StitchHold("proof transport checkpoint differs")
+    # Repeat after a complete pass so a lost diagnostic ACK/restart cannot lose proof.
+    start = state["cursor"] if state["cursor"] < len(chunks) else 0
+    lines=[]
+    for n in range(start,min(start+64,len(chunks))):
+        line = "V85r proof-v1 %s %s %d/%d %s" % (task["plan_sha256"],digest,n,len(chunks),chunks[n])
+        if redact_log_line(line, CLIENT_LOG_RING.output_root, CLIENT_LOG_RING.redaction_secrets()) != line:
+            raise StitchHold("proof transport redaction changed receipt")
+        lines.append(dict(seq=n+1,at=utc_now_precise(),level="INFO",message=line))
+    # Send through the existing log RPC so ring eviction cannot lose a batch.
+    # Redaction is unchanged; only a persisted acknowledgement advances cursor.
+    ack=request_json(cfg,"POST","/account/connections/client-logs",
+                     body=dict(client_version=CLIENT_VERSION,boot_id=boot,lines=lines),timeout=HEARTBEAT_TIMEOUT_SEC)
+    if ack.get("ok") is not True or type(ack.get("stored_lines")) is not int or ack["stored_lines"]!=len(lines):
+        raise StitchHold("proof diagnostic batch not acknowledged")
+    atomic_write(state_path,cleanup_json_bytes(dict(digest=digest,cursor=min(start+64,len(chunks)))))
+    log("INFO","V85r proof transport acknowledged %d/%d receipt=%s"%(min(start+64,len(chunks)),len(chunks),digest))
+    STITCH_STATUS.clear_error()
+    STITCH_STATUS.update(kind=STITCH_PROOF_KIND,state="proof_registered_locally",receipt_sha256=digest,
+                         plan_sha256=task["plan_sha256"],chunks=len(chunks),chunks_emitted=min(start+64,len(chunks)))
+
+
+def stitch_proof_once(cfg, inventory, stop_event):
+    stitch_resources(cfg)
+    if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
+        raise StitchHold("proof yielded to cleanup")
+    task = request_json(cfg,"GET","/account/connections/stitch/proof",timeout=HEARTBEAT_TIMEOUT_SEC)
+    stitch_proof_check(task)
+    stop = StitchStop(cfg,stop_event,task,StitchRunKind.PROOF)
+    stitch_proof_client(cfg,stop)
+    stitch_proof_space(cfg,task)
+    with StitchProofDirectory(cfg, task["plan"]["output_folder"],1,stop):
+        pass
+    relative = task["plan"]["output_folder"]+"/receipt.json.gz"
+    receipt_path = cfg.output_dir/relative
+    try:
+        receipt_path.lstat()
+    except FileNotFoundError:
+        receipt_path = None
+    else:
+        receipt_path,_ = confined_regular_file(cfg.output_dir,relative)
+    if receipt_path is not None:
+        if receipt_path.stat().st_size > 1024*1024:
+            raise StitchHold("oversized proof registration")
+        body = receipt_path.read_bytes()
+        receipt = stitch_proof_unpack(body)
+        stitch_proof_pipeline(cfg,receipt,stop)
+        if receipt["plan_sha256"] != task["plan_sha256"]:
+            raise StitchHold("local proof registration plan differs")
+        for clip in task["plan"]["clips"]:
+            stitch_hash(cfg,clip["relative_path"],clip["size_bytes"],clip["sha256"],stop)
+        for output in receipt["result"]["outputs"]:
+            stitch_hash(cfg,output["relative_path"],output["size_bytes"],output["sha256"],stop)
+        runtime=read_json(cfg.runtime_file,{})
+        STITCH_STATUS.update(readback_at=utc_now(),readback_boot_id=runtime["boot_id"],run_id=receipt["run"]["id"],client_artifact_sha256=receipt["client_artifact_sha256"],output_sha256=receipt["result"]["outputs"][0]["sha256"],output_size_bytes=receipt["result"]["outputs"][0]["size_bytes"])
+        stitch_proof_emit(cfg,task,body,runtime["boot_id"])
+        return 60
+    stitch_resources(cfg,22620379)
+    stitch_corpus(cfg,inventory,stop)
+    tools = stitch_v85r_tools(cfg,time.monotonic()+BENCHMARK_TOOL_INSTALL_SEC,stop)
+    STITCH_STATUS.update(kind=STITCH_PROOF_KIND,state="proof_working",started_at=utc_now(),plan_sha256=task["plan_sha256"])
+    stitch_proof_space(cfg,task)
+    stitch_build(cfg,inventory,task,stop_event,tools,kind=StitchRunKind.PROOF)
+    return 1
+
+
+def stitch_proof_unpack(body):
+    decoder = zlib.decompressobj(16+zlib.MAX_WBITS)
+    raw = decoder.decompress(body,16*1024*1024+1)
+    if len(raw)>16*1024*1024 or not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
+        raise StitchHold("invalid or oversized compressed proof")
+    receipt=stitch_proof_json(raw)
+    stitch_proof_validate(receipt)
+    result=receipt["result"]
+    stitch_proof_success(result)
+    if result["policy"]!=STITCH_POLICY or result["plan_sha256"]!=receipt["plan_sha256"]:
+        raise StitchHold("native proof result binding differs")
+    timestamps=[datetime.datetime.fromisoformat(x.replace("Z","+00:00")) for x in (receipt["run"]["started_at"],receipt["run"]["completed_at"],receipt["verified_at"])]
+    if timestamps!=sorted(timestamps):
+        raise StitchHold("native proof timestamps out of order")
+    return receipt
+
+
+def stitch_proof_validate(value):
+    """Only the frozen schema's used vocabulary; no optional validator dependency."""
+    if hashlib.sha256(STITCH_PROOF_SCHEMA_JSON.encode()).hexdigest()!=STITCH_PROOF_SCHEMA_SHA:
+        raise StitchHold("native receipt schema drift")
+    schema=json.loads(STITCH_PROOF_SCHEMA_JSON)
+    types={"object":(dict,),"array":(list,),"string":(str,),"boolean":(bool,),"integer":(int,),"number":(int,float)}
+    def check(item,node):
+        if not set(node)<={"$comment","$defs","$id","$ref","$schema","additionalProperties","const","exclusiveMinimum","format","items","maxItems","maxLength","minItems","minLength","minProperties","minimum","pattern","properties","required","type"}:
+            raise StitchHold("unsupported native receipt schema vocabulary")
+        if "$ref" in node:
+            return check(item,schema["$defs"][node["$ref"].removeprefix("#/$defs/")])
+        if "const" in node and (type(item) is not type(node["const"]) or item!=node["const"]):
+            raise StitchHold("native receipt constant differs")
+        kind=node.get("type")
+        if kind is not None and type(item) not in types[kind]:
+            raise StitchHold("native receipt field type differs")
+        if kind=="object":
+            fields=node.get("properties",{})
+            if (not set(node.get("required",[]))<=set(item) or len(item)<node.get("minProperties",0)
+                    or node.get("additionalProperties") is False and not set(item)<=set(fields)):
+                raise StitchHold("native receipt fields differ")
+            for key,child in item.items():
+                if key in fields:check(child,fields[key])
+        elif kind=="array":
+            if not node.get("minItems",0)<=len(item)<=node.get("maxItems",len(item)):
+                raise StitchHold("native receipt array bound")
+            for child in item:check(child,node["items"])
+        elif kind=="string":
+            if (not node.get("minLength",0)<=len(item)<=node.get("maxLength",len(item))
+                    or "pattern" in node and re.search(node["pattern"],item) is None):
+                raise StitchHold("native receipt string bound")
+            if node.get("format")=="uuid" and re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}",item) is None:
+                raise StitchHold("native receipt UUID invalid")
+            if node.get("format")=="date-time":
+                datetime.datetime.fromisoformat(item.replace("Z","+00:00"))
+        elif kind in ("number","integer"):
+            if (not -float("inf")<item<float("inf") or "minimum" in node and item<node["minimum"]
+                    or "exclusiveMinimum" in node and item<=node["exclusiveMinimum"]):
+                raise StitchHold("native receipt numeric bound")
+    check(value,schema)
+
 
 
 def stitch_register(cfg, inventory, task_id, result):
@@ -47523,7 +47952,7 @@ def stitch_loop(cfg, inventory, stop_event):
         retry = 60
         try:
             STITCH_ACTIVE.set()
-            retry = stitch_once(cfg, inventory, stop_event)
+            retry = stitch_proof_once(cfg, inventory, stop_event) if cfg.stitch_proof_enabled else stitch_once(cfg, inventory, stop_event)
         except Exception as exc:
             STITCH_STATUS.update(state="paused")
             STITCH_STATUS.fail(str(exc))
