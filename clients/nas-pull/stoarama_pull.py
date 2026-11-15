@@ -47747,7 +47747,7 @@ def stitch_proof_complete(cfg, task, result, work, stop):
         directory.publish(stage.name, "receipt.json.gz")
 
 
-def stitch_proof_emit(cfg, task, body):
+def stitch_proof_emit(cfg, task, body, boot):
     digest = hashlib.sha256(body).hexdigest()
     encoded = body.hex()
     chunks = [encoded[n:n+1024] for n in range(0,len(encoded),1024)]
@@ -47757,12 +47757,20 @@ def stitch_proof_emit(cfg, task, body):
         raise StitchHold("proof transport checkpoint differs")
     # Repeat after a complete pass so a lost diagnostic ACK/restart cannot lose proof.
     start = state["cursor"] if state["cursor"] < len(chunks) else 0
+    lines=[]
     for n in range(start,min(start+64,len(chunks))):
         line = "V85r proof-v1 %s %s %d/%d %s" % (task["plan_sha256"],digest,n,len(chunks),chunks[n])
         if redact_log_line(line, CLIENT_LOG_RING.output_root, CLIENT_LOG_RING.redaction_secrets()) != line:
             raise StitchHold("proof transport redaction changed receipt")
-        log("INFO",line)
+        lines.append(dict(seq=n+1,at=utc_now_precise(),level="INFO",message=line))
+    # Send through the existing log RPC so ring eviction cannot lose a batch.
+    # Redaction is unchanged; only a persisted acknowledgement advances cursor.
+    ack=request_json(cfg,"POST","/account/connections/client-logs",
+                     body=dict(client_version=CLIENT_VERSION,boot_id=boot,lines=lines),timeout=HEARTBEAT_TIMEOUT_SEC)
+    if ack.get("ok") is not True or type(ack.get("stored_lines")) is not int or ack["stored_lines"]!=len(lines):
+        raise StitchHold("proof diagnostic batch not acknowledged")
     atomic_write(state_path,cleanup_json_bytes(dict(digest=digest,cursor=min(start+64,len(chunks)))))
+    log("INFO","V85r proof transport acknowledged %d/%d receipt=%s"%(min(start+64,len(chunks)),len(chunks),digest))
     STITCH_STATUS.clear_error()
     STITCH_STATUS.update(kind=STITCH_PROOF_KIND,state="proof_registered_locally",receipt_sha256=digest,
                          plan_sha256=task["plan_sha256"],chunks=len(chunks),chunks_emitted=min(start+64,len(chunks)))
@@ -47801,7 +47809,7 @@ def stitch_proof_once(cfg, inventory, stop_event):
             stitch_hash(cfg,output["relative_path"],output["size_bytes"],output["sha256"],stop)
         runtime=read_json(cfg.runtime_file,{})
         STITCH_STATUS.update(readback_at=utc_now(),readback_boot_id=runtime["boot_id"],run_id=receipt["run"]["id"],client_artifact_sha256=receipt["client_artifact_sha256"],output_sha256=receipt["result"]["outputs"][0]["sha256"],output_size_bytes=receipt["result"]["outputs"][0]["size_bytes"])
-        stitch_proof_emit(cfg,task,body)
+        stitch_proof_emit(cfg,task,body,runtime["boot_id"])
         return 60
     stitch_resources(cfg,22620379)
     stitch_corpus(cfg,inventory,stop)

@@ -243,7 +243,7 @@ func TestNASStitchProofValidationRequiresMatchingFreshNASReadback(t *testing.T) 
 			change(s)
 		}
 		raw, _ := json.Marshal(s)
-		if _, err := pool.Exec(ctx, `UPDATE connections SET nas_stitch_status=$1,nas_stitch_status_at=now(),last_seen_at=now() WHERE id=13`, string(raw)); err != nil {
+		if _, err := pool.Exec(ctx, `UPDATE connections SET client_version='v85r-nas-proof-v1',nas_stitch_status=$1,nas_stitch_status_at=now(),last_seen_at=now() WHERE id=13`, string(raw)); err != nil {
 			t.Fatal(err)
 		}
 		body, _ := json.Marshal(request)
@@ -257,6 +257,18 @@ func TestNASStitchProofValidationRequiresMatchingFreshNASReadback(t *testing.T) 
 			t.Fatalf("validation got %d want %d: %s", w.Code, want, w.Body)
 		}
 	}
+	rawStatus, _ := json.Marshal(status())
+	if _, err := pool.Exec(ctx, `UPDATE connections SET client_version='r2-copy-v2',nas_stitch_status=$1,nas_stitch_status_at=now(),last_seen_at=now() WHERE id=13`, string(rawStatus)); err != nil {
+		t.Fatal(err)
+	}
+	// A new client's fresh heartbeat must not revive the previous proof status.
+	body, _ := json.Marshal(request)
+	w := httptest.NewRecorder()
+	server.handleAdminNASStitchProofVerify(w, httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body)))
+	if w.Code != http.StatusConflict {
+		t.Fatal("previous client proof accepted after client drift")
+	}
+
 	var state string
 	var count int
 	if err := pool.QueryRow(ctx, `SELECT state,(SELECT count(*) FROM nas_stitch_outputs) FROM nas_stitch_tasks WHERE id=1`).Scan(&state, &count); err != nil || state != "leased" || count != 0 {

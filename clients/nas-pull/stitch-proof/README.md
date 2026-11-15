@@ -80,10 +80,13 @@ bounds, not a throughput promise. New work gets no lower threshold.
 
 The canonical gzip local receipt is <=1 MiB compressed /16 MiB decompressed.
 The client emits at most 64 chunks/minute, each <=512 binary bytes encoded as
-1024 hex characters, through existing seven-day client logs. A full maximum-size
-cycle takes 32 minutes. Each chunk carries plan SHA, receipt SHA, index and
-census. Cursor persistence and repeating complete cycles recover dropped ACKs,
-ring drops and restarts. Missing/conflicting/truncated/redacted chunks fail.
+1024 hex characters, through the existing seven-day client-log endpoint. A maximum-size cycle needs
+32 successfully acknowledged batches at a one-minute cadence, plus readback and
+HTTP work; cleanup holds or outages can extend this. Each chunk carries plan SHA,
+receipt SHA, index and census. The cursor advances only after the server confirms
+that every batch line was stored. Lost ACKs retry identical chunks; restart,
+background ring eviction and repeating complete cycles cannot skip delivery.
+The regular diagnostic ring is not a proof transport queue. Missing/conflicting/truncated/redacted chunks fail.
 No redaction bypass exists. Preserve the receipt outside log retention promptly.
 
 GET `/api/v1/service/nas-connections/13/client-logs?since=1h&limit=10000&grep=V85r%20proof-v1`

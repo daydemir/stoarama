@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import urllib.error
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -45,6 +46,36 @@ def synthetic_receipt():
 
 
 class ProofTests(unittest.TestCase):
+    def test_transport_ack_recovers_eviction_lost_ack_and_restart(self):
+        # Synthetic maximum-sized-ish data; delivery cannot depend on ring phase.
+        body=os.urandom(800*1024);digest=hashlib.sha256(body).hexdigest();plan='a'*64
+        persisted=[];requests=[];failed=False
+        def server(cfg,method,path,**kw):
+            nonlocal failed
+            self.assertEqual((method,path),('POST','/account/connections/client-logs'))
+            lines=kw['body']['lines'];self.assertLessEqual(len(lines),64)
+            persisted.extend(lines);requests.append(lines)
+            if not failed:
+                failed=True
+                raise urllib.error.URLError('synthetic ACK lost after commit')
+            return dict(ok=True,stored_lines=len(lines))
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull,'CLIENT_LOG_RING',pull.ClientLogRing(max_lines=2,max_bytes=4096)),mock.patch.object(pull,'request_json',side_effect=server),mock.patch.object(pull,'log'):
+            cfg=SimpleNamespace(state_dir=Path(tmp));task=dict(plan_sha256=plan)
+            with self.assertRaises(urllib.error.URLError):pull.stitch_proof_emit(cfg,task,body,'synthetic-boot')
+            self.assertFalse(list(Path(tmp).iterdir())) # Failed ACK cannot advance.
+            for cycle in range(3):
+                # A new cfg/ring models restart; cursor alone survives.
+                for minute in range(25):
+                    pull.CLIENT_LOG_RING.record('ERROR','background eviction '*200)
+                    pull.stitch_proof_emit(SimpleNamespace(state_dir=Path(tmp)),task,body,'restarted-boot')
+                self.assertEqual(verify.reassemble(dict(lines=persisted),plan,digest),body)
+            self.assertEqual([x["message"] for x in requests[0]],[x["message"] for x in requests[1]]) # Lost ACK retries exact chunk bytes.
+            self.assertGreater(pull.CLIENT_LOG_RING.dropped,0)
+            state=json.loads(next(Path(tmp).iterdir()).read_text());before=dict(state)
+            with mock.patch.object(pull,'request_json',return_value=dict(ok=True,stored_lines='64')):
+                with self.assertRaises(pull.StitchHold):pull.stitch_proof_emit(cfg,task,body,'restarted-boot')
+            self.assertEqual(json.loads(next(Path(tmp).iterdir()).read_text()),before)
+
     def test_candidate_or_wrong_executing_artifact_cannot_claim_proof(self):
         stop=threading.Event()
         with self.assertRaises(pull.StitchHold):pull.stitch_proof_client(SimpleNamespace(is_candidate=True),stop)

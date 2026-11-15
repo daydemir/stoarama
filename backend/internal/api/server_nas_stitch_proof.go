@@ -170,7 +170,7 @@ func (s *Server) handleAdminNASStitchProofVerify(w http.ResponseWriter, r *http.
 	}
 	var status []byte
 	var boot string
-	if s.pool.QueryRow(ctx, `SELECT nas_stitch_status,client_boot_id FROM connections WHERE id=13 AND nas_stitch_status_at>now()-interval '2 minutes' AND last_seen_at>now()-interval '2 minutes'`).Scan(&status, &boot) != nil {
+	if s.pool.QueryRow(ctx, `SELECT nas_stitch_status,client_boot_id FROM connections WHERE id=13 AND client_version=$1 AND nas_stitch_status_at>now()-interval '2 minutes' AND last_seen_at>now()-interval '2 minutes'`, nasCleanupProofClientVersion).Scan(&status, &boot) != nil {
 		util.WriteError(w, 409, "fresh NAS proof readback unavailable")
 		return
 	}
