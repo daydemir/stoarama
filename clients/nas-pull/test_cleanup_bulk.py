@@ -1,5 +1,6 @@
 """V7 durability ordering on real files and FULL-WAL SQLite; no NAS access."""
 import datetime
+import io
 import json
 import os
 import select
@@ -9,6 +10,7 @@ import textwrap
 import threading
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -19,10 +21,25 @@ pull = fixtures.pull
 class CleanupBulkTests(unittest.TestCase):
     setUp = fixtures.CleanupGroupTests.setUp
     group = fixtures.CleanupGroupTests.group
-    api = fixtures.CleanupGroupTests.api
     fixture_pins = fixtures.CleanupGroupTests.fixture_pins
 
     version = "cleanup-batch-v7"
+
+    def api(self, cfg, path, body, **kwargs):
+        if path.endswith('/observe-batch'):
+            checkpoints = {item_id: (phase, json.loads(encoded))
+                           for item_id, phase, encoded in pull.cleanup_journal(self.inventory)}
+            for observation in body['observations']:
+                phase, checkpoint = checkpoints[observation['item_id']]
+                self.assertEqual(phase, 'intent')
+                self.assertIs(checkpoint['unlink_attempted'], True)
+                self.assertEqual(pull.cleanup_pre_permit_observation(checkpoint),
+                                 {key: value for key, value in observation.items() if key != 'item_id'})
+            return {'results': [fixtures.fixture_ack(observation, observation['item_id'], status=200,
+                delivery_keep_checked=True, action='delete_issued', delete=True, plan_paused=False,
+                expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
+                for observation in body['observations']]}
+        return fixtures.CleanupGroupTests.api(self, cfg, path, body, **kwargs)
 
     def run_group(self, tasks):
         with mock.patch.object(pull, 'CLIENT_VERSION', self.version), \
@@ -31,6 +48,205 @@ class CleanupBulkTests(unittest.TestCase):
 
     def phases(self):
         return [row[1] for row in pull.cleanup_journal(self.inventory)]
+
+    def test_slow_durable_intents_do_not_age_the_bulk_permit(self):
+        tasks = self.group(8)
+        journal, clock, api = pull.cleanup_journal_group, time.monotonic, self.api
+        offset = [0.0]
+        def slow_journal(inventory, entries):
+            journal(inventory, entries)
+            if entries[0][2] == 'intent':
+                offset[0] += 10.0
+        def delayed_response(cfg, path, body, **kwargs):
+            result = api(cfg, path, body, **kwargs)
+            if path.endswith('/observe-batch'):
+                offset[0] += 6.2
+            return result
+        with mock.patch.object(pull, 'cleanup_journal_group', side_effect=slow_journal), \
+                mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock()+offset[0]), \
+                mock.patch.object(self, 'api', side_effect=delayed_response):
+            self.run_group(tasks)
+        self.assertFalse(self.phases())
+        self.assertTrue(all(not (self.cfg.output_dir/t['item']['relative_path']).exists() for t in tasks))
+
+    def test_live_expiry_before_first_unlink_records_certified_refusals(self):
+        tasks = self.group(8)
+        guard, clock = pull.cleanup_guard_refusal, time.monotonic
+        calls, offset = [0], [0.0]
+        def slow_guard(*args):
+            result = guard(*args)
+            calls[0] += 1
+            if calls[0] == len(tasks)+1:
+                offset[0] += 16.0
+            return result
+        with mock.patch.object(pull, 'cleanup_guard_refusal', side_effect=slow_guard), \
+                mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock()+offset[0]), \
+                mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('expired permit cannot unlink')):
+            self.run_group(tasks)
+        outcomes = [json.loads(row[0]) for row in self.inventory.db.execute('SELECT body FROM cleanup_execution_outcomes')]
+        self.assertEqual(len(outcomes), 8)
+        self.assertTrue(all(row['refusal_protocol'] == 1 and row['refusal_reason'] == 'deadline_exceeded'
+                            and row['unlink_attempted'] is False for row in outcomes))
+        self.assertFalse(self.phases())
+
+    def lose_permit_response(self, tasks):
+        issued, api = {}, self.api
+        def lose(cfg, path, body, **kwargs):
+            response = api(cfg, path, body, **kwargs)
+            if path.endswith('/observe-batch'):
+                for observation, decision in zip(body['observations'], response['results']):
+                    issued[observation['item_id']] = {
+                        'proof_json': json.dumps(observation['proof']),
+                        'proof_sha256': decision['proof_sha256'],
+                    }
+                raise TimeoutError('server issued; response lost')
+            return response
+        with mock.patch.object(self, 'api', side_effect=lose):
+            with self.assertRaises(TimeoutError):
+                self.run_group(tasks)
+        self.assertEqual(self.phases(), ['intent'] * len(tasks))
+        return issued
+
+    def test_restart_replay_binds_to_original_issued_proof_serialization(self):
+        tasks = self.group(3)
+        issued = self.lose_permit_response(tasks)
+        self.inventory.close()
+        self.inventory = pull.Inventory(self.cfg)
+        self.addCleanup(self.inventory.close)
+        received = []
+        def replay(cfg, path, body, **kwargs):
+            item_id = int(path.split('/')[-2])
+            self.assertNotIn(pull.CLEANUP_PRE_PERMIT_OBSERVATION_JSON, body)
+            if path.endswith('/reconcile'):
+                self.assertEqual(json.dumps(body['proof']), issued[item_id]['proof_json'])
+                ack = fixtures.fixture_ack(body, item_id, action='reconcile', delete=False)
+            else:
+                self.assertTrue(path.endswith('/result'))
+                self.assertEqual(body['proof_sha256'], issued[item_id]['proof_sha256'])
+                self.assertIs(body['unlink_attempted'], True)
+                self.assertNotIn('refusal_protocol', body)
+                received.append(item_id)
+                ack = fixtures.fixture_ack(body, item_id, ok=True)
+            # This is the SHA issued before the restart, not one recomputed
+            # from the replayed body; recursive sorting must fail this test.
+            ack['proof_sha256'] = issued[item_id]['proof_sha256']
+            return ack
+        with mock.patch.object(pull, 'restore_api', side_effect=replay), \
+                mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('replay cannot unlink')):
+            result = pull.cleanup_replay_receipts(self.cfg, self.inventory, budget=5)
+        self.assertEqual(result['failed'], 0)
+        self.assertEqual(sorted(received), sorted(issued))
+        self.assertFalse(self.phases())
+
+    def test_armed_reconciliation_failures_retain_complete_checkpoint(self):
+        tasks = self.group(3)
+        issued = self.lose_permit_response(tasks)
+        before = pull.cleanup_journal(self.inventory)
+        for fault in ('409', 'lost', 'malformed', 'authority'):
+            def replay(cfg, path, body, **kwargs):
+                self.assertTrue(path.endswith('/reconcile'))
+                self.assertNotIn(pull.CLEANUP_PRE_PERMIT_OBSERVATION_JSON, body)
+                if fault == '409':
+                    raise urllib.error.HTTPError('https://example.invalid', 409, 'conflict', {}, io.BytesIO(b'{}'))
+                if fault == 'lost':
+                    raise TimeoutError('reconciliation response lost')
+                if fault == 'malformed':
+                    return {'ok': True}
+                item_id = int(path.split('/')[-2])
+                ack = fixtures.fixture_ack(body, item_id, action='delete_issued', delete=True)
+                ack['proof_sha256'] = issued[item_id]['proof_sha256']
+                return ack
+            with self.subTest(fault=fault), mock.patch.object(pull, 'restore_api', side_effect=replay), \
+                    mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('replay cannot unlink')):
+                result = pull.cleanup_replay_receipts(self.cfg, self.inventory, budget=5)
+            self.assertEqual(result['failed'], 3)
+            self.assertEqual(pull.cleanup_journal(self.inventory), before)
+            self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_rejected_receipts').fetchone()[0], 0)
+
+    def test_armed_result_409_and_lost_ack_retain_wrapper_until_positive_ack(self):
+        tasks = self.group(3)
+        issued = self.lose_permit_response(tasks)
+        mode = ['409']
+        def replay(cfg, path, body, **kwargs):
+            item_id = int(path.split('/')[-2])
+            self.assertNotIn(pull.CLEANUP_PRE_PERMIT_OBSERVATION_JSON, body)
+            if path.endswith('/reconcile'):
+                ack = fixtures.fixture_ack(body, item_id, action='reconcile', delete=False)
+            else:
+                self.assertTrue(path.endswith('/result'))
+                self.assertEqual(body['proof_sha256'], issued[item_id]['proof_sha256'])
+                if mode[0] == '409':
+                    raise urllib.error.HTTPError('https://example.invalid', 409, 'conflict', {}, io.BytesIO(b'{}'))
+                if mode[0] == 'lost':
+                    raise TimeoutError('result acknowledgement lost')
+                ack = fixtures.fixture_ack(body, item_id, ok=True)
+            ack['proof_sha256'] = issued[item_id]['proof_sha256']
+            return ack
+        with mock.patch.object(pull, 'restore_api', side_effect=replay):
+            self.assertEqual(pull.cleanup_replay_receipts(self.cfg, self.inventory, budget=5)['failed'], 3)
+            before = pull.cleanup_journal(self.inventory)
+            self.assertEqual([row[1] for row in before], ['result'] * 3)
+            self.assertTrue(all(pull.CLEANUP_PRE_PERMIT_OBSERVATION_JSON in json.loads(row[2]) for row in before))
+            mode[0] = 'lost'
+            self.assertEqual(pull.cleanup_replay_receipts(self.cfg, self.inventory, budget=5)['failed'], 3)
+            self.assertEqual(pull.cleanup_journal(self.inventory), before)
+            mode[0] = 'ack'
+            self.assertEqual(pull.cleanup_replay_receipts(self.cfg, self.inventory, budget=5)['failed'], 0)
+        self.assertFalse(self.phases())
+        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_rejected_receipts').fetchone()[0], 0)
+
+    def test_armed_before_request_reconciles_without_a_permit_or_result(self):
+        tasks = self.group(3)
+        journal = pull.cleanup_journal_group
+        class Interrupted(BaseException):
+            pass
+        def interrupt(inventory, entries):
+            journal(inventory, entries)
+            if entries[0][2] == 'intent':
+                raise Interrupted()
+        with mock.patch.object(pull, 'cleanup_journal_group', side_effect=interrupt), \
+                mock.patch.object(self, 'api', side_effect=AssertionError('no permit request before durability')):
+            with self.assertRaises(Interrupted):
+                self.run_group(tasks)
+        def replay(cfg, path, body, **kwargs):
+            self.assertTrue(path.endswith('/reconcile'))
+            return fixtures.fixture_ack(body, int(path.split('/')[-2]), action='pending', delete=False)
+        with mock.patch.object(pull, 'restore_api', side_effect=replay), \
+                mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('replay cannot unlink')):
+            self.assertEqual(pull.cleanup_replay_receipts(self.cfg, self.inventory, budget=5)['failed'], 0)
+        self.assertFalse(self.phases())
+        self.assertTrue(all((self.cfg.output_dir/task['item']['relative_path']).exists() for task in tasks))
+
+    def test_replayer_cannot_steal_a_live_prearmed_group(self):
+        tasks = self.group(3)
+        entered, release, errors = threading.Event(), threading.Event(), []
+        api, calls = self.api, []
+        def transport(cfg, path, body, **kwargs):
+            calls.append(path)
+            if path.endswith('/observe-batch'):
+                entered.set()
+                self.assertTrue(release.wait(5))
+            return api(cfg, path, body, **kwargs)
+        def execute():
+            try:
+                self.run_group(tasks)
+            except BaseException as exc:
+                errors.append(exc)
+        with mock.patch.object(self, 'api', side_effect=transport):
+            worker = threading.Thread(target=execute)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertEqual(self.phases(), ['intent'] * 3)
+                result = pull.cleanup_replay_receipts(self.cfg, self.inventory, budget=5)
+                self.assertEqual((result['replayed'], result['failed']), (0, 0))
+                self.assertEqual(len(calls), 1)
+            finally:
+                release.set()
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(errors)
+        self.assertFalse(self.phases())
 
     def test_one_bulk_request_all_intents_before_unlink_all_syncs_before_success(self):
         tasks = self.group(8)
@@ -75,7 +291,7 @@ class CleanupBulkTests(unittest.TestCase):
                     mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('invalid bulk authority')):
                 with self.assertRaises((pull.CleanupResponseError, pull.CleanupPermitRefused)):
                     self.run_group(tasks)
-            self.assertEqual(self.phases(), ['observe'] * 3)
+            self.assertEqual(self.phases(), ['intent'] * 3)
             # Fresh fixture: unresolved observations are preserved, never replaced.
             if fault != 'identity':
                 self.doCleanups()
@@ -112,7 +328,7 @@ class CleanupBulkTests(unittest.TestCase):
         self.assertTrue(all(json.loads(r[2])['outcome'] == 'unverified' for r in pull.cleanup_journal(self.inventory)))
 
     def test_sigkill_at_each_durability_boundary_replays_without_permit_or_unlink(self):
-        for cut in ('intent_ledger', 'intent', 'media', 'sidecar', 'directory', 'result_ledger', 'result'):
+        for cut in ('intent_ledger', 'intent', 'permit', 'media', 'sidecar', 'directory', 'result_ledger', 'result'):
             case = type(self)('test_one_bulk_request_all_intents_before_unlink_all_syncs_before_success')
             case.setUp()
             try:
@@ -130,9 +346,18 @@ class CleanupBulkTests(unittest.TestCase):
                         inventory_file=Path(root)/'state'/'inventory.sqlite3',dry_run=False)
                     case.inventory,case.logs=pull.Inventory(case.cfg),[]
                     case.version=version
+                    api=case.api
                     ledger,journal,unlink,sync=pull.cleanup_ledger_append_many,pull.cleanup_journal_group,pull.os.unlink,pull.os.fsync
                     def halt():
                         print('ready',flush=True);sys.stdin.read();raise AssertionError('must SIGKILL')
+                    def transport(cfg,path,body,**kwargs):
+                        result=api(cfg,path,body,**kwargs)
+                        if path.endswith('/observe-batch'):
+                            with (Path(root)/'server-issued.json').open('w') as record:
+                                json.dump({str(row['item_id']):row['proof_sha256'] for row in result['results']},record)
+                                record.flush();os.fsync(record.fileno())
+                            if cut=='permit':halt()
+                        return result
                     def append(cfg,records):
                         ledger(cfg,records)
                         if cut == records[0]['event']+'_ledger': halt()
@@ -148,6 +373,7 @@ class CleanupBulkTests(unittest.TestCase):
                     with mock.patch.object(pull.os.path,'ismount',return_value=True), \
                         mock.patch.object(pull,'cleanup_pins',return_value=case.fixture_pins('2027-01-01T00:00:00+00:00','2027-01-29T00:00:00+00:00')), \
                         mock.patch.object(pull,'log',side_effect=lambda l,m:case.logs.append((l,m))), \
+                        mock.patch.object(case,'api',side_effect=transport), \
                         mock.patch.object(pull,'cleanup_ledger_append_many',side_effect=append), \
                         mock.patch.object(pull,'cleanup_journal_group',side_effect=checkpoint), \
                         mock.patch.object(pull.os,'unlink',side_effect=remove), \
@@ -166,20 +392,32 @@ class CleanupBulkTests(unittest.TestCase):
                 rows = pull.cleanup_journal(case.inventory)
                 expected = 'observe' if cut=='intent_ledger' else 'result' if cut=='result' else 'intent'
                 self.assertEqual([r[1] for r in rows], [expected]*3)
+                marker=case.root/'server-issued.json'
+                issued=json.loads(marker.read_text()) if marker.exists() else {}
+                self.assertEqual(bool(issued),cut not in ('intent_ledger','intent'))
                 received = []
                 def replay(cfg,path,body,**kwargs):
                     item_id=int(path.split('/')[-2])
                     if path.endswith('/reconcile'):
-                        return fixtures.fixture_ack(body,item_id,action='unverified',delete=False)
+                        ack=fixtures.fixture_ack(body,item_id,action='reconcile' if issued else 'pending',delete=False)
+                        if issued:ack['proof_sha256']=issued[str(item_id)]
+                        return ack
                     self.assertTrue(path.endswith('/result'),path)
+                    self.assertTrue(issued)
+                    self.assertEqual(body['proof_sha256'],issued[str(item_id)])
+                    self.assertNotIn(pull.CLEANUP_PRE_PERMIT_OBSERVATION_JSON,body)
                     received.append(body)
                     return fixtures.fixture_ack(body,item_id,ok=True)
                 with mock.patch.object(pull,'restore_api',side_effect=replay), \
                         mock.patch.object(pull.os,'unlink',side_effect=AssertionError('replay cannot unlink')):
                     result=pull.cleanup_replay_receipts(case.cfg,case.inventory)
                 self.assertEqual(result['failed'],0)
-                if expected=='intent':
+                if expected=='intent' and issued:
+                    self.assertEqual(len(received),3)
                     self.assertTrue(all(b['outcome']=='unverified' and 'refusal_protocol' not in b for b in received))
+                    self.assertTrue(all(b['unlink_attempted'] is True for b in received))
+                if not issued:
+                    self.assertFalse(received)
             finally:
                 case.doCleanups()
 
@@ -231,3 +469,7 @@ class CleanupBulkTests(unittest.TestCase):
 
 class R2CopyBulkTests(CleanupBulkTests):
     version = "r2-copy-v2"
+
+
+class NASProofBulkTests(CleanupBulkTests):
+    version = "v85r-nas-proof-v1"

@@ -17475,6 +17475,29 @@ def cleanup_validate_ack(item_id, phase, body, response):
         raise CleanupResponseError("cleanup result not acknowledged")
 
 
+CLEANUP_PRE_PERMIT_OBSERVATION_JSON = "pre_permit_observation_json"
+
+
+def cleanup_pre_permit_observation(body):
+    """An armed checkpoint binds the original proof bytes, never a permit."""
+    encoded = body[CLEANUP_PRE_PERMIT_OBSERVATION_JSON]
+    if type(encoded) is not str or len(encoded.encode()) > 65536:
+        raise CleanupResponseError("invalid armed cleanup observation")
+    observation = json.loads(encoded)
+    if (not isinstance(observation, dict) or not isinstance(observation.get("proof"), dict)
+            or observation.get("attempt") != body.get("attempt")
+            or observation.get("plan_sha256") != body.get("plan_sha256")
+            or hashlib.sha256(json.dumps(observation["proof"]).encode()).hexdigest() != body.get("proof_sha256")
+            or observation.get("outcome") != "match"
+            or observation.get("reconciliation_protocol") != CLEANUP_RECONCILIATION_PROTOCOL
+            or not isinstance(observation.get("request_id"), str) or not observation["request_id"]
+            or observation.get("client_version") not in CLEANUP_BULK_VERSIONS
+            or body.get("unlink_attempted") is not True or body.get("outcome") != "unverified"
+            or "refusal_protocol" in body):
+        raise CleanupResponseError("armed cleanup observation binding differs")
+    return observation
+
+
 def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
     """Replay every durable journal entry; protocol 2 replays in parallel
     using the reconciliation-only endpoint for observations and the ordinary
@@ -17485,18 +17508,21 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
     unfinished replays continue in the background and are not
     resubmitted while in flight. Returns {"replayed", "failed", "pending",
     "quarantined"} counts."""
-    def replay(item_id, phase, body, owner):
+    def replay(item_id, phase, body, owner, *, armed=False):
+        wire = {k: v for k, v in body.items() if k != CLEANUP_PRE_PERMIT_OBSERVATION_JSON}
         try:
             if phase == "observe":
                 # Deliberately no fallback to /observe or observe-batch: those
                 # endpoints may issue first permits. Old servers must leave the
                 # checkpoint unresolved until reconciliation is supported.
-                return restore_api(cfg, "/account/connections/cleanup/%d/reconcile" % item_id, body)
+                return restore_api(cfg, "/account/connections/cleanup/%d/reconcile" % item_id, wire)
             if api is not None:
-                return api.result(cfg, item_id, body)
-            return cleanup_send_result(cfg, item_id, body)
+                return api.result(cfg, item_id, wire)
+            return cleanup_send_result(cfg, item_id, wire)
         except urllib.error.HTTPError as exc:
-            if exc.code != 409:
+            if exc.code != 409 or armed:
+                # A conflict never proves whether an armed request issued. Keep
+                # its complete checkpoint until an exactly bound positive ACK.
                 raise
             # Preserve rejected evidence, then unblock unrelated leases. A stale
             # observation/result must never be interpreted as a fresh permit.
@@ -17524,11 +17550,23 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
 
     def replay_owned(item_id, phase, encoded, owner):
         body = json.loads(encoded)
+        armed = CLEANUP_PRE_PERMIT_OBSERVATION_JSON in body
+        observation = cleanup_pre_permit_observation(body) if armed else None
+        if armed and phase not in ("intent", "result"):
+            raise CleanupResponseError("invalid armed cleanup checkpoint phase")
         if phase == "intent":
+            if armed:
+                response = replay(item_id, "observe", observation, owner, armed=True)
+                cleanup_validate_ack(item_id, "observe", observation, response)
+                if response.get("delete") is not False or response.get("action") == "delete_issued":
+                    raise CleanupResponseError("reconciliation returned deletion authority")
+                if response["action"] != "reconcile":
+                    cleanup_journal(inventory, item_id, owner=owner)
+                    return
             body.update(outcome="unverified", error="client interrupted after permit; operator reconciliation required")
             phase = "result"
             cleanup_journal(inventory, item_id, phase, body, owner=owner)
-        response = replay(item_id, "observe" if phase == "observe" else "result", body, owner)
+        response = replay(item_id, "observe" if phase == "observe" else "result", body, owner, armed=armed)
         if response is None:
             # Only the explicit 409 archive path may resolve without a body.
             if cleanup_journal_contains(inventory, item_id):
@@ -18549,9 +18587,34 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
 
     @NAS_COPY_PATHS.cleanup_priority
     def bulk_delete():
-        # Exact v7 only. One request-start clock bounds the ENTIRE group;
-        # later permits never gain time while earlier files are made durable.
+        # Arm every possible attempt durably BEFORE starting the permit clock.
+        # The nested JSON string preserves proof insertion order across the
+        # intent journal's canonical sorting. It grants no deletion authority.
         nonlocal stage
+        ledgers = []
+        for task, body, (current, proof) in zip(tasks, observations, opened):
+            proof_sha = hashlib.sha256(json.dumps(proof).encode()).hexdigest()
+            receipts.append({"attempt": task["attempt"], "plan_sha256": task["plan_sha256"],
+                "proof_sha256": proof_sha, "outcome": "unverified", "error": ""})
+            item = task["item"]
+            ledgers.append({"item_id": task["item_id"], "attempt": task["attempt"],
+                "plan_sha256": task["plan_sha256"], "proof_sha256": proof_sha,
+                "relative_path": item["relative_path"],
+                "sidecar_relative_path": item["relative_path"] + ".stoarama.json" if item["sidecar_required"] else None,
+                "size_bytes": item["size_bytes"], "sha256": proof["sha256"], "kind": item["kind"],
+                "stream_id": item["stream_id"], "client_version": CLIENT_VERSION})
+        stage = CleanupStage.LEDGER_INTENT
+        cleanup_timed(shared, "ledger_intent_ms", cleanup_ledger_append_many, cfg,
+            [dict(ledger, event="intent", at=utc_now_precise()) for ledger in ledgers])
+        stage = CleanupStage.INTENT_JOURNAL
+        cleanup_timed(shared, "intent_journal_ms", cleanup_journal_group, inventory,
+            [(task, owner, "intent", dict(receipt, unlink_attempted=True,
+                **{CLEANUP_PRE_PERMIT_OBSERVATION_JSON: json.dumps(body, ensure_ascii=False)}))
+             for (task, owner), receipt, body in zip(owned, receipts, observations)])
+        for current, _ in opened:
+            current.check_active()
+            if current.deadline - time.monotonic() <= CLEANUP_EXECUTION_OBSERVE_SEC:
+                raise CleanupInterrupted("cleanup lease has insufficient time after durable intents")
         stage = CleanupStage.PERMIT
         for task, timing in zip(tasks, timings):
             progress("permit_start", task, timing)
@@ -18561,8 +18624,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
              "observations": [dict(body, item_id=task["item_id"]) for task, body in zip(tasks, observations)]},
             timeout=CLEANUP_EXECUTION_OBSERVE_SEC)
         decisions = cleanup_group_response(response, tasks)
-        ledgers = []
-        for task, body, (current, proof), timing in zip(tasks, observations, opened, timings):
+        for task, body, (current, proof), timing, receipt in zip(tasks, observations, opened, timings, receipts):
             timing["observe_ms"] = round((time.monotonic() - permit_started) * 1000)
             decision = decisions[task["item_id"]]
             cleanup_validate_ack(task["item_id"], "observe", body, decision)
@@ -18572,53 +18634,52 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
             current.permit_started, current.permit_expiry = permit_started, expiry
             current.permit_max_age_sec = CLEANUP_EXECUTION_OBSERVE_BUDGET_SEC
             current.deadline = min(current.deadline, permit_started + CLEANUP_PERMIT_MAX_AGE_SEC)
-            receipts.append({"attempt": task["attempt"], "plan_sha256": task["plan_sha256"],
-                "proof_sha256": decision["proof_sha256"], "outcome": "unverified", "error": "",
-                "observe_elapsed_ms": timing["observe_ms"]})
-            item = task["item"]
-            ledgers.append({"item_id": task["item_id"], "attempt": task["attempt"],
-                "plan_sha256": task["plan_sha256"], "proof_sha256": decision["proof_sha256"],
-                "relative_path": item["relative_path"],
-                "sidecar_relative_path": item["relative_path"] + ".stoarama.json" if item["sidecar_required"] else None,
-                "size_bytes": item["size_bytes"], "sha256": proof["sha256"], "kind": item["kind"],
-                "stream_id": item["stream_id"], "client_version": CLIENT_VERSION})
-        stage = CleanupStage.LEDGER_INTENT
-        cleanup_timed(shared, "ledger_intent_ms", cleanup_ledger_append_many, cfg,
-            [dict(ledger, event="intent", at=utc_now_precise()) for ledger in ledgers])
-        # All markers are conservative possible attempts. After interruption
-        # replay cannot infer non-unlink from a missing path or an old permit.
-        stage = CleanupStage.INTENT_JOURNAL
-        cleanup_timed(shared, "intent_journal_ms", cleanup_journal_group, inventory,
-            [(task, owner, "intent", dict(receipt, unlink_attempted=True))
-             for (task, owner), receipt in zip(owned, receipts)])
+            receipt["observe_elapsed_ms"] = timing["observe_ms"]
+
+        def journal_results():
+            nonlocal stage
+            stage = CleanupStage.LEDGER_RESULT
+            cleanup_timed(shared, "ledger_result_ms", cleanup_ledger_append_many, cfg,
+                [dict(ledger, event="result", at=utc_now_precise(), outcome=receipt["outcome"],
+                      media_unlinked=current.media_unlinked, sidecar_unlinked=current.sidecar_unlinked,
+                      error=receipt["error"])
+                 for ledger, receipt, (current, _) in zip(ledgers, receipts, opened)])
+            for receipt, timing in zip(receipts, timings):
+                receipt.update(execution_elapsed_ms=round((time.monotonic() - started) * 1000),
+                               stage_timings=dict(timing, **shared))
+            stage = CleanupStage.RESULT_JOURNAL
+            cleanup_timed(shared, "result_journal_ms", cleanup_journal_group, inventory,
+                [(task, owner, "result", receipt) for (task, owner), receipt in zip(owned, receipts)])
+
         directories = {}
-        for task, (current, proof), timing in zip(tasks, opened, timings):
-            stage = CleanupStage.GUARD
-            refusal = cleanup_timed(timing, "guard_ms", cleanup_guard_refusal, task, proof, cfg)
-            if refusal:
-                raise CleanupPermitRefused("local_guard", refusal)
-            stage = CleanupStage.UNLINK
-            # delete_exact rechecks paths, namespace, stop and BOTH permit
-            # clocks immediately before media and sidecar syscalls.
-            cleanup_timed(timing, "delete_ms", current.delete_exact, proof, sync_directory=False)
-            info = os.fstat(current.fds[-1])
-            directories[(info.st_dev, info.st_ino)] = current.fds[-1]
-        # Every descriptor remains open in the enclosing ExitStack. A failed
-        # sync leaves EVERY intent uncertain, including already unlinked files.
+        try:
+            for task, (current, proof), timing in zip(tasks, opened, timings):
+                stage = CleanupStage.GUARD
+                refusal = cleanup_timed(timing, "guard_ms", cleanup_guard_refusal, task, proof, cfg)
+                if refusal:
+                    raise CleanupPermitRefused("local_guard", refusal)
+                stage = CleanupStage.UNLINK
+                cleanup_timed(timing, "delete_ms", current.delete_exact, proof, sync_directory=False)
+                info = os.fstat(current.fds[-1])
+                directories[(info.st_dev, info.st_ino)] = current.fds[-1]
+        except Exception as exc:
+            if any(current.unlink_attempted or current.media_unlinked or current.sidecar_unlinked for current, _ in opened):
+                raise
+            # Only this live, owned worker can prove no syscall was attempted.
+            # A crash or a failed result checkpoint still replays as uncertain.
+            CLEANUP_STATUS.execution_failure(stage, exc, len(tasks), aborted=False)
+            for receipt in receipts:
+                receipt.update(unlink_attempted=False, refusal_protocol=CLEANUP_REFUSAL_PROTOCOL,
+                    refusal_reason=exc.reason if isinstance(exc, CleanupPermitRefused) else "pre_unlink_failure",
+                    error=str(exc)[:500])
+            journal_results()
+            return
+        # Every parent inode is synced before ANY successful durable result.
         for fd in directories.values():
             cleanup_timed(shared, "directory_sync_ms", os.fsync, fd)
-        stage = CleanupStage.LEDGER_RESULT
-        cleanup_timed(shared, "ledger_result_ms", cleanup_ledger_append_many, cfg,
-            [dict(ledger, event="result", at=utc_now_precise(), outcome="deleted",
-                  media_unlinked=current.media_unlinked, sidecar_unlinked=current.sidecar_unlinked, error="")
-             for ledger, (current, _) in zip(ledgers, opened)])
-        for receipt, timing in zip(receipts, timings):
-            receipt.update(outcome="deleted", unlink_attempted=True,
-                execution_elapsed_ms=round((time.monotonic() - started) * 1000),
-                stage_timings=dict(timing, **shared))
-        stage = CleanupStage.RESULT_JOURNAL
-        cleanup_timed(shared, "result_journal_ms", cleanup_journal_group, inventory,
-            [(task, owner, "result", receipt) for (task, owner), receipt in zip(owned, receipts)])
+        for receipt in receipts:
+            receipt.update(outcome="deleted", unlink_attempted=True)
+        journal_results()
 
     fenced = False
     error = None

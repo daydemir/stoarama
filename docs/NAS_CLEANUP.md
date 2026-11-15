@@ -589,6 +589,12 @@ plan fence as issuance, then item/plan row fences, so any original request must
 commit or roll back before reconciliation. This endpoint performs no policy/R2
 work and never returns deletion authority or a permit expiry.
 
+Bulk workers arm the intent before requesting permits, retaining the exact
+original observation in that checkpoint. Replay first reconciles that observation:
+an exactly acknowledged unissued attempt can clear, while an issued attempt is
+reported as uncertain. A conflict or missing acknowledgement retains the complete
+checkpoint. This ordering keeps durable intent writes outside the permit clock.
+
 If no permit was ever committed and the exact attempt is still leased/pending,
 it releases the lease to `pending` and resets the lease-expiry baseline without
 pausing the plan. Approved dry-run proof/recovery stay intact; a fresh lease
