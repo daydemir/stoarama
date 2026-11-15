@@ -1552,7 +1552,8 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			id BIGSERIAL PRIMARY KEY,
 			provider TEXT NOT NULL DEFAULT '',
 			source_page_url TEXT NOT NULL DEFAULT '',
-			execution_class TEXT NOT NULL DEFAULT ''
+			execution_class TEXT NOT NULL DEFAULT '',
+			local_timezone TEXT
 		)`,
 		`CREATE TABLE recordings (
 			id BIGSERIAL PRIMARY KEY,
