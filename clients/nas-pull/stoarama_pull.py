@@ -2306,22 +2306,28 @@ class NASMediaFence:
     def background_delivery(self, fn):
         return self.delivery(fn, background=True)
 
+    def acquire_delivery(self, background=False):
+        with self.condition:
+            self.writers_waiting += 1
+            try:
+                while self.cleaners or (background and self.execution_owner is not None):
+                    self.condition.wait(1)
+            finally:
+                self.writers_waiting -= 1
+            self.writers += 1
+
+    def release_delivery(self):
+        with self.condition:
+            self.writers -= 1
+            self.condition.notify_all()
+
     def delivery(self, fn, background=False):
         def wrapped(*args, **kwargs):
-            with self.condition:
-                self.writers_waiting += 1
-                try:
-                    while self.cleaners or (background and self.execution_owner is not None):
-                        self.condition.wait(1)
-                finally:
-                    self.writers_waiting -= 1
-                self.writers += 1
+            self.acquire_delivery(background)
             try:
                 return fn(*args, **kwargs)
             finally:
-                with self.condition:
-                    self.writers -= 1
-                    self.condition.notify_all()
+                self.release_delivery()
         return wrapped
 
     def acquire_cleanup(self, stop_event, deadline):
@@ -23378,86 +23384,152 @@ def joined_identity_step(reason_code, operation, *args):
         raise
 
 
-@NAS_MEDIA_FENCE.background_delivery
+class JoinedPollFence:
+    """Drop only this writer during a priority poll; distrust the namespace gap."""
+    def __init__(self, cfg, runtime, item, stop_event):
+        self.cfg, self.runtime, self.item, self.stop_event = cfg, runtime, item, stop_event
+        self.fence = NAS_MEDIA_FENCE
+        self.held = False
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def acquire(self):
+        self.fence.acquire_delivery(background=True)
+        self.held = True
+
+    def __exit__(self, *_args):
+        if self.held:
+            self.fence.release_delivery()
+            self.held = False
+
+    def snapshot(self, directory_fd, names, marker):
+        directory = os.fstat(directory_fd)
+        identities = tuple(
+            None if entry is None else (certification_identity(entry), entry.st_nlink)
+            for entry in (joined_entry_stat(directory_fd, name) for name in names)
+        )
+        marker_stat = joined_entry_stat(directory_fd, names[2])
+        if marker_stat is None or marker_stat.st_nlink != 1 or marker_stat.st_size != len(marker):
+            raise ExistingFileMismatch("joined transfer marker changed across priority poll")
+        flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(names[2], flags, dir_fd=directory_fd)
+        try:
+            before = os.fstat(fd)
+            if certification_identity(before) != certification_identity(marker_stat) or before.st_nlink != 1:
+                raise ExistingFileMismatch("joined transfer marker changed across priority poll")
+            content = os.read(fd, len(marker) + 1)
+            after = os.fstat(fd)
+        finally:
+            os.close(fd)
+        if (
+            content != marker or certification_identity(before) != certification_identity(marker_stat)
+            or certification_identity(after) != certification_identity(marker_stat)
+            or after.st_nlink != 1
+        ):
+            raise ExistingFileMismatch("joined transfer marker changed across priority poll")
+        return (directory.st_dev, directory.st_ino), identities, content
+
+    def priority_boundary(self, directory_fd, names, marker):
+        before = self.snapshot(directory_fd, names, marker)
+        self.fence.release_delivery()
+        self.held = False
+        try:
+            joined_raw_priority_boundary(self.cfg, self.runtime, self.stop_event)
+        finally:
+            self.acquire()
+        current = open_joined_output_dir(self.cfg, self.item, create=False)
+        try:
+            current_stat = os.fstat(current)
+            if (current_stat.st_dev, current_stat.st_ino) != before[0]:
+                raise ExistingFileMismatch("joined output directory changed across priority poll")
+            if self.snapshot(directory_fd, names, marker) != before:
+                raise ExistingFileMismatch("joined transfer changed across priority poll")
+        finally:
+            os.close(current)
+
+
 def download_joined_item(cfg, runtime, item, stop_event):
     joined_raw_priority_boundary(cfg, runtime, stop_event)
-    # Expose failures while opening or hashing prerequisite manifests. Offset
-    # zero is a phase marker; the server preserves any prior durable range.
-    runtime.set_joined_transfer(item["id"], 0, "validate")
-    joined_identity_step("dependency_identity", ensure_joined_dependency_ack, cfg, runtime, item, stop_event)
-    joined_identity_step("manifest_identity", validate_media_manifest_binding, cfg, runtime, item, stop_event)
-    directory_fd = open_joined_output_dir(cfg, item)
-    final_name = Path(item["relative_path"]).name
-    part_name = ".%s.joined-%d.part" % (final_name, item["id"])
-    marker_name = part_name + ".stoarama.json"
-    names = (final_name, part_name, marker_name)
-    try:
-        final_stat = joined_entry_stat(directory_fd, final_name)
-        part_stat = joined_entry_stat(directory_fd, part_name)
-        marker_stat = joined_entry_stat(directory_fd, marker_name)
-        if final_stat is not None and part_stat is None and marker_stat is None and joined_identity_step("existing_output_identity", complete_existing_joined,
-            cfg, runtime, directory_fd, item, names, None, stop_event,
-        ):
-            return False
-        prepared = joined_identity_step("prepared_object_identity", prepare_joined_download, cfg, item)
-        marker = joined_transfer_marker_bytes(item, prepared)
-        if joined_identity_step("existing_output_identity", complete_existing_joined, cfg, runtime, directory_fd, item, names, marker, stop_event):
-            return False
-        part_stat = joined_identity_step("transfer_marker_identity", ensure_owned_joined_partial,
-            cfg, runtime, directory_fd, part_name, marker_name, marker, stop_event,
-        )
-        if part_stat.st_nlink != 1:
-            raise ExistingFileMismatch("joined partial has an unknown hardlink")
-        part_size = part_stat.st_size
-        if part_size > item["size_bytes"]:
-            truncate_joined_part(directory_fd, part_name)
-            part_size = 0
-        runtime.set_joined_transfer(item["id"], part_size, "range")
-        while part_size < item["size_bytes"]:
-            if not runtime.joined_protocol_enabled() or stop_event.is_set():
-                raise JoinedDownloadYield("joined download stopped at a range boundary")
-            joined_raw_priority_boundary(cfg, runtime, stop_event)
+    with JoinedPollFence(cfg, runtime, item, stop_event) as fence:
+        # Expose failures while opening or hashing prerequisite manifests. Offset
+        # zero is a phase marker; the server preserves any prior durable range.
+        runtime.set_joined_transfer(item["id"], 0, "validate")
+        joined_identity_step("dependency_identity", ensure_joined_dependency_ack, cfg, runtime, item, stop_event)
+        joined_identity_step("manifest_identity", validate_media_manifest_binding, cfg, runtime, item, stop_event)
+        directory_fd = open_joined_output_dir(cfg, item)
+        final_name = Path(item["relative_path"]).name
+        part_name = ".%s.joined-%d.part" % (final_name, item["id"])
+        marker_name = part_name + ".stoarama.json"
+        names = (final_name, part_name, marker_name)
+        try:
+            final_stat = joined_entry_stat(directory_fd, final_name)
+            part_stat = joined_entry_stat(directory_fd, part_name)
+            marker_stat = joined_entry_stat(directory_fd, marker_name)
+            if final_stat is not None and part_stat is None and marker_stat is None and joined_identity_step("existing_output_identity", complete_existing_joined,
+                cfg, runtime, directory_fd, item, names, None, stop_event,
+            ):
+                return False
+            prepared = joined_identity_step("prepared_object_identity", prepare_joined_download, cfg, item)
+            marker = joined_transfer_marker_bytes(item, prepared)
+            if joined_identity_step("existing_output_identity", complete_existing_joined, cfg, runtime, directory_fd, item, names, marker, stop_event):
+                return False
+            part_stat = joined_identity_step("transfer_marker_identity", ensure_owned_joined_partial,
+                cfg, runtime, directory_fd, part_name, marker_name, marker, stop_event,
+            )
+            if part_stat.st_nlink != 1:
+                raise ExistingFileMismatch("joined partial has an unknown hardlink")
+            part_size = part_stat.st_size
+            if part_size > item["size_bytes"]:
+                truncate_joined_part(directory_fd, part_name)
+                part_size = 0
+            runtime.set_joined_transfer(item["id"], part_size, "range")
+            while part_size < item["size_bytes"]:
+                if not runtime.joined_protocol_enabled() or stop_event.is_set():
+                    raise JoinedDownloadYield("joined download stopped at a range boundary")
+                fence.priority_boundary(directory_fd, names, marker)
+                try:
+                    current_prepared = prepare_joined_download(cfg, item)
+                except ExistingFileMismatch:
+                    truncate_joined_part(directory_fd, part_name)
+                    raise
+                validate_joined_download_renewal(prepared, current_prepared)
+                end = min(item["size_bytes"], part_size + JOINED_RANGE_BYTES) - 1
+                range_bytes = end - part_size + 1
+                require_joined_storage_capacity(cfg, runtime, range_bytes)
+                try:
+                    append_joined_range(current_prepared, directory_fd, part_name, item, part_size, end, stop_event)
+                finally:
+                    runtime.release_storage_reservation(range_bytes)
+                part_size = end + 1
+                runtime.set_joined_transfer(item["id"], part_size, "range")
+            if not runtime.joined_protocol_enabled():
+                raise JoinedDownloadYield("joined protocol was disabled")
+            fence.priority_boundary(directory_fd, names, marker)
+            runtime.set_joined_transfer(item["id"], part_size, "verify")
             try:
-                current_prepared = prepare_joined_download(cfg, item)
+                verify_joined_entry(
+                    cfg, runtime, directory_fd, part_name, item["size_bytes"], item["sha256"], stop_event,
+                )
             except ExistingFileMismatch:
                 truncate_joined_part(directory_fd, part_name)
-                raise
-            validate_joined_download_renewal(prepared, current_prepared)
-            end = min(item["size_bytes"], part_size + JOINED_RANGE_BYTES) - 1
-            range_bytes = end - part_size + 1
-            require_joined_storage_capacity(cfg, runtime, range_bytes)
-            try:
-                append_joined_range(current_prepared, directory_fd, part_name, item, part_size, end, stop_event)
-            finally:
-                runtime.release_storage_reservation(range_bytes)
-            part_size = end + 1
-            runtime.set_joined_transfer(item["id"], part_size, "range")
-        if not runtime.joined_protocol_enabled():
-            raise JoinedDownloadYield("joined protocol was disabled")
-        joined_raw_priority_boundary(cfg, runtime, stop_event)
-        runtime.set_joined_transfer(item["id"], part_size, "verify")
-        try:
-            verify_joined_entry(
-                cfg, runtime, directory_fd, part_name, item["size_bytes"], item["sha256"], stop_event,
-            )
-        except ExistingFileMismatch:
-            truncate_joined_part(directory_fd, part_name)
-            raise RuntimeError("joined download checksum mismatch; partial restarted")
-        joined_raw_priority_boundary(cfg, runtime, stop_event)
-        runtime.set_joined_transfer(item["id"], part_size, "validate")
-        validate_joined_artifact(cfg, runtime, directory_fd, part_name, item, stop_event)
-        joined_raw_priority_boundary(cfg, runtime, stop_event)
-        runtime.set_joined_transfer(item["id"], part_size, "publish")
-        def publish_final():
-            os.link(part_name, final_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
-            os.fsync(directory_fd)
-        if not runtime.run_joined_completion(publish_final):
-            raise JoinedDownloadYield("joined protocol was disabled")
-        if not complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, stop_event):
-            raise RuntimeError("joined publication disappeared")
-        return True
-    finally:
-        os.close(directory_fd)
+                raise RuntimeError("joined download checksum mismatch; partial restarted")
+            fence.priority_boundary(directory_fd, names, marker)
+            runtime.set_joined_transfer(item["id"], part_size, "validate")
+            validate_joined_artifact(cfg, runtime, directory_fd, part_name, item, stop_event)
+            fence.priority_boundary(directory_fd, names, marker)
+            runtime.set_joined_transfer(item["id"], part_size, "publish")
+            def publish_final():
+                os.link(part_name, final_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+                os.fsync(directory_fd)
+            if not runtime.run_joined_completion(publish_final):
+                raise JoinedDownloadYield("joined protocol was disabled")
+            if not complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, stop_event):
+                raise RuntimeError("joined publication disappeared")
+            return True
+        finally:
+            os.close(directory_fd)
 
 
 def joined_ack_receipt_path(cfg, connection_id):
