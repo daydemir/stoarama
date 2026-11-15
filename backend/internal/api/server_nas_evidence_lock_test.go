@@ -16,7 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-func TestNASEvidenceLockCopyForeignKey(t *testing.T) {
+func TestNASR2CopyEvidenceLockForeignKey(t *testing.T) {
 	for _, mode := range []struct {
 		name, clause string
 		blocked      bool
@@ -62,7 +62,7 @@ func TestNASEvidenceLockCopyForeignKey(t *testing.T) {
 	}
 }
 
-func TestNASEvidenceLockPreservesExclusion(t *testing.T) {
+func TestNASR2CopyEvidenceLockPreservesExclusion(t *testing.T) {
 	for _, other := range []struct{ name, sql string }{
 		{"metadata_writer", `SELECT id FROM connections WHERE id=13` + nasConnectionEvidenceLock},
 		{"cleanup_session", `SELECT id FROM connections WHERE id=13 FOR SHARE`},
@@ -96,7 +96,7 @@ func TestNASEvidenceLockPreservesExclusion(t *testing.T) {
 // Pause each real handler after its writes, with the declared connection unique
 // indexes and triggers present. A parent UPDATE can otherwise silently strengthen
 // an initially compatible lock and defeat the copy foreign-key check.
-func TestNASEvidenceLockActualWriters(t *testing.T) {
+func TestNASR2CopyEvidenceLockActualWriters(t *testing.T) {
 	for _, writer := range []string{"heartbeat", "inventory", "release"} {
 		t.Run(writer, func(t *testing.T) {
 			pool, cleanup := testAccountClipsPool(t)
