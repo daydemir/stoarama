@@ -21,7 +21,7 @@ sidecar binding and pinned keep28 window. No source download or source write
 occurs. A missing source is HOLD, not permission to use R2 or copy data.
 
 Output is in a new sibling namespace under the NAS output mount:
-`100042_Europe_Czech_republic_Most_Public_square_089_Market_square_V85r_proof_keep28/444/2026-08-09T09-00-00Z/proof-0dfa6b172f33bd55/`.
+`100042_Europe_Czech_republic_Most_Public_square_089_Market_square_V85r_proof_keep28_v2/444/2026-08-09T09-00-00Z/proof-0dfa6b172f33bd55/`.
 `proof.mp4` and `receipt.json.gz` are fsynced and published with Linux amd64
 `renameat2(RENAME_NOREPLACE)`. Unknown entries, symlinks, aliases or conflicting
 final bytes cause HOLD. Only private scratch created in this owned namespace is
@@ -43,7 +43,7 @@ receipt preserves all 13 native audit files and 15 measured command results.
    writer to manufacture this boundary. Keep ordinary stitching OFF and the
    old task-1 owner/journal obligations unresolved unless primary proof exists.
 2. Release only the exact reviewed merged client source using the existing
-   release mechanism with the distinct immutable label `v85r-nas-proof-v1`.
+   release mechanism with the distinct immutable label `v85r-nas-proof-v2`.
    The release artifact substitutes that label for the development placeholder;
    record its actual SHA/size and deployment source identities. The controller
    alone stages/promotes it. Keep the proof selector 0 through deployment.
@@ -151,3 +151,22 @@ JSON keys, unsafe paths or changed hashes/sizes. Fresh validation/readback and
 independent review expire after 24h at R2 execution (<=5min future skew). Pipeline,
 tool or policy drift requires a new proof. This prerequisite grants no custody,
 Keep All, delivery-set, fence, drain or per-object eligibility exception.
+
+## Packet conservation and edit lists
+
+The v1 attempt failed because it compared raw packet-listing bytes. A valid
+single edit translated every PTS/DTS by1024 ticks without hiding any packet.
+V2 preserves both raw listings and directly records the pinned input/output
+MP4 clock, track, handler and elst payloads inside the existing JSON audits.
+The shared native/offline validator requires one nonempty unit-rate edit, the
+same constant PTS and DTS offset on every packet equal to media_time, and full
+packet count/order/size/payload/duration/flags conservation with edit-duration
+coverage. The coverage endpoint is computed at `media_time`, not zero; the
+edited segment length is not compared directly to the unedited media bound.
+Every actual presentation packet must still fit the translated edit window.
+Empty/multiple edits, missing evidence, cuts or drift are HOLD.
+Full frame/EOF/seam decode and all prior source/publication checks remain.
+Audio and non-H264 admission remains unchanged; no audio is dropped to pass.
+The outer/inner schemas and replay-stream protocol are unchanged; V2 still
+requires newly reviewed client/verifier pins and a new real proof. The failed
+v1 namespace remains preserved and conveys no success or deletion authority.

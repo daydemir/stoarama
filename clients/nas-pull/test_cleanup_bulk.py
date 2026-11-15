@@ -471,5 +471,9 @@ class R2CopyBulkTests(CleanupBulkTests):
     version = "r2-copy-v2"
 
 
-class NASProofBulkTests(CleanupBulkTests):
+class LegacyNASProofBulkTests(CleanupBulkTests):
     version = "v85r-nas-proof-v1"
+
+
+class NASProofBulkTests(CleanupBulkTests):
+    version = "v85r-nas-proof-v2"

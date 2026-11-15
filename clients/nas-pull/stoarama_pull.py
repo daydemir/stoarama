@@ -1256,7 +1256,7 @@ class Inventory:
 
     def _cached_regular_stat(self, relative_path):
         parts = Path(relative_path).parts
-        if not parts or parts[0] in (JOINED_ROOT,) + INVENTORY_ROOT_EXCLUSIONS or parts[0].endswith(("_V85r_keep28", "_V85r_proof_keep28")):
+        if not parts or parts[0] in (JOINED_ROOT,) + INVENTORY_ROOT_EXCLUSIONS or parts[0].endswith(("_V85r_keep28", "_V85r_proof_keep28", "_V85r_proof_keep28_v2")):
             return None
         descriptor = None
         try:
@@ -18060,7 +18060,7 @@ CLEANUP_V2_WORKERS = 16        # concurrent dry-run file workers
 CLEANUP_GROUP_VERSION = "cleanup-batch-v6.1"
 CLEANUP_V6_VERSIONS: frozenset[str] = frozenset((CLEANUP_GROUP_VERSION, "r2-copy-v1"))
 CLEANUP_BULK_VERSION = "cleanup-batch-v7"
-CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, "r2-copy-v2", "v85r-nas-proof-v1"))
+CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, "r2-copy-v2", "v85r-nas-proof-v1", "v85r-nas-proof-v2"))
 CLEANUP_GROUP_VERSIONS: frozenset[str] = CLEANUP_V6_VERSIONS | CLEANUP_BULK_VERSIONS
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
@@ -19024,7 +19024,7 @@ def walk_raw_files(root):
     for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=fail_walk, followlinks=False):
         directory = Path(dirpath)
         if directory == root:
-            dirnames[:] = [name for name in dirnames if name != JOINED_ROOT and name not in INVENTORY_ROOT_EXCLUSIONS and not name.endswith(("_V85r_keep28", "_V85r_proof_keep28"))]
+            dirnames[:] = [name for name in dirnames if name != JOINED_ROOT and name not in INVENTORY_ROOT_EXCLUSIONS and not name.endswith(("_V85r_keep28", "_V85r_proof_keep28", "_V85r_proof_keep28_v2"))]
         for filename in filenames:
             if directory == root and filename in INVENTORY_ROOT_EXCLUSIONS:
                 continue
@@ -47068,9 +47068,12 @@ def stitch_packet_records(source):
         line = line.strip()
         if not line:
             continue
-        fields = dict(part.split("=", 1) for part in line.split("|") if "=" in part)
+        parts = line.split("|")
+        if len(parts) != 6 or any("=" not in part for part in parts):
+            raise StitchHold("unsupported packet mapping/side data")
+        fields = dict(part.split("=", 1) for part in parts)
         if (set(fields) != {"pts", "dts", "duration", "size", "flags", "data_hash"}
-                or not fields["data_hash"].startswith("SHA256:") or len(fields["data_hash"]) != 71):
+                or re.fullmatch("SHA256:[0-9a-f]{64}", fields["data_hash"]) is None):
             raise StitchHold("unsupported packet mapping/side data")
         try:
             yield (int(fields["pts"]), int(fields["dts"]), int(fields["duration"]),
@@ -47111,7 +47114,144 @@ def stitch_probe(ffprobe, source, target, deadline, stop):
     stitch_run([ffprobe, "-v", "error", "-show_streams", "-show_data_hash", "sha256", "-of", "json", str(source)], deadline, stop, target)
     if target.stat().st_size > 1024 * 1024:
         raise StitchHold("oversized stream metadata")
-    return stitch_signature(json.loads(target.read_text())["streams"])
+    document = json.loads(target.read_text())
+    signature = stitch_signature(document["streams"])
+    document["mp4_edit"] = stitch_editlist_metadata(source)
+    target.write_bytes(cleanup_json_bytes(document))
+    return signature
+
+
+def stitch_editlist_metadata(source):
+    """Read bounded metadata from the already pinned, catalog-hashed descriptor."""
+    with open(source, "rb") as media:
+        size, visited = os.fstat(media.fileno()).st_size, 0
+
+        def boxes(start, end):
+            nonlocal visited
+            result = {}
+            while start < end:
+                visited += 1
+                if visited > 1024 or end - start < 8:
+                    raise StitchHold("invalid or excessive MP4 boxes")
+                media.seek(start)
+                head = media.read(8)
+                if len(head) != 8:
+                    raise StitchHold("truncated MP4 header")
+                length, kind = struct.unpack(">I4s", head)
+                header = 8
+                if length == 1:
+                    head = media.read(8)
+                    if len(head) != 8:
+                        raise StitchHold("truncated MP4 extended header")
+                    length, header = struct.unpack(">Q", head)[0], 16
+                if length == 0:
+                    length = end - start
+                if length < header or length > end - start:
+                    raise StitchHold("MP4 box exceeds parent")
+                result.setdefault(kind, []).append((start + header, start + length))
+                start += length
+            return result
+
+        def one(items, kind):
+            matches = items.get(kind, [])
+            if len(matches) != 1:
+                raise StitchHold("missing or duplicate MP4 audit box")
+            return matches[0]
+
+        def payload(box):
+            start, end = box
+            if not 4 <= end - start <= 4096:
+                raise StitchHold("MP4 audit payload bound")
+            media.seek(start)
+            raw = media.read(end - start)
+            if len(raw) != end - start:
+                raise StitchHold("truncated MP4 audit payload")
+            return raw.hex()
+
+        top = boxes(0, size)
+        if b'moof' in top:
+            raise StitchHold("fragmented MP4 requires separate native qualification")
+        movie = boxes(*one(top, b'moov'))
+        track = boxes(*one(movie, b'trak'))
+        mdia = boxes(*one(track, b'mdia'))
+        edits = boxes(*one(track, b'edts'))
+        return dict(movie_header=payload(one(movie, b'mvhd')), track_header=payload(one(track, b'tkhd')),
+                    media_header=payload(one(mdia, b'mdhd')), handler=payload(one(mdia, b'hdlr')),
+                    edit_list=payload(one(edits, b'elst')))
+
+
+def stitch_editlist_records(document, packets, hidden):
+    """Conserve all packets; allow only one directly evidenced PTS/DTS translation."""
+    signature = stitch_signature(document["streams"])
+    evidence = document.get("mp4_edit")
+    keys = {"movie_header", "track_header", "media_header", "handler", "edit_list"}
+    if type(evidence) is not dict or set(evidence) != keys:
+        raise StitchHold("MP4 edit evidence missing")
+    raw = {}
+    for key, value in evidence.items():
+        if type(value) is not str or not 8 <= len(value) <= 8192 or len(value) % 2 or re.fullmatch("[0-9a-f]+", value) is None:
+            raise StitchHold("MP4 edit evidence invalid")
+        raw[key] = bytes.fromhex(value)
+
+    def number(data, offset, width, signed=False):
+        if offset + width > len(data):
+            raise StitchHold("truncated MP4 edit fields")
+        return int.from_bytes(data[offset:offset + width], "big", signed=signed)
+
+    def version(data):
+        if data[0] not in (0, 1):
+            raise StitchHold("unsupported MP4 edit version")
+        return data[0]
+
+    def clock(data):
+        wide = version(data)
+        scale = number(data, 20 if wide else 12, 4)
+        duration = number(data, 24 if wide else 16, 8 if wide else 4)
+        if scale <= 0 or duration <= 0 or duration == (1 << (64 if wide else 32)) - 1:
+            raise StitchHold("missing MP4 media clock")
+        return scale, duration
+
+    movie_scale, _ = clock(raw["movie_header"])
+    media_scale, media_duration = clock(raw["media_header"])
+    track_id = number(raw["track_header"], 20 if version(raw["track_header"]) else 12, 4)
+    stream_id = document["streams"][0].get("id")
+    if (type(stream_id) is not str or re.fullmatch("0x[0-9a-fA-F]+", stream_id) is None
+            or int(stream_id, 16) != track_id or raw["handler"][8:12] != b'vide'
+            or Fraction(signature[5]) != Fraction(1, media_scale)):
+        raise StitchHold("MP4 track/timebase differs from packet stream")
+    edit = raw["edit_list"]
+    wide = version(edit)
+    if edit[1:4] != b'\0\0\0' or len(edit) != (28 if wide else 20) or number(edit, 4, 4) != 1:
+        raise StitchHold("exactly one nonempty edit required")
+    width = 8 if wide else 4
+    segment = number(edit, 8, width)
+    media_time = number(edit, 8 + width, width, signed=True)
+    if segment <= 0 or media_time < 0 or edit[8 + 2 * width:] != b'\0\1\0\0':
+        raise StitchHold("empty edit or non-unit rate")
+    coverage = Fraction(segment * media_scale, movie_scale)
+    # The edit starts at media_time, not zero. Packet intervals below still
+    # prove that its translated presentation window contains every sample.
+    if media_time + coverage < media_duration:
+        raise StitchHold("edit duration does not cover media")
+    actual, ignored = iter(packets), iter(hidden)
+    offset, count = None, 0
+    while True:
+        left, right = next(actual, None), next(ignored, None)
+        if left is None and right is None:
+            break
+        if left is None or right is None or left[2:] != right[2:]:
+            raise StitchHold("hidden packet count/order/payload differs")
+        delta = right[0] - left[0]
+        if offset is None:
+            offset = delta
+        if delta != offset or right[1] - left[1] != offset or offset != media_time:
+            raise StitchHold("edit is not one shared PTS/DTS translation")
+        if left[2] <= 0 or left[0] < 0 or left[0] + left[2] > coverage:
+            raise StitchHold("edit hides presentation content")
+        count += 1
+    if count == 0:
+        raise StitchHold("empty packet inventory")
+    return offset
 
 
 def stitch_signature(streams):
@@ -47130,8 +47270,8 @@ def stitch_audit_source(ffmpeg, ffprobe, source, work, index, deadline, stop):
     packets, hidden, frames = (prefix.with_suffix(suffix) for suffix in (".packets", ".hidden", ".frames"))
     stitch_packets(ffprobe, source, packets, deadline, stop)
     stitch_packets(ffprobe, source, hidden, deadline, stop, hidden=True)
-    if sha256_file(packets) != sha256_file(hidden):
-        raise StitchHold("hidden edit-list inventory differs")
+    stitch_editlist_records(json.loads(prefix.with_suffix(".json").read_text()),
+                            stitch_packet_rows(packets), stitch_packet_rows(hidden))
     stitch_frames(ffmpeg, source, frames, deadline, stop)
     return stitch_source_inventory(signature, packets, frames)
 
@@ -47168,8 +47308,8 @@ def stitch_audit_output(ffmpeg, ffprobe, output, sources, work, deadline, stop):
     packets, hidden, frames = (work / name for name in ("output.packets", "output.hidden", "output.frames"))
     stitch_packets(ffprobe, output, packets, deadline, stop)
     stitch_packets(ffprobe, output, hidden, deadline, stop, hidden=True)
-    if sha256_file(packets) != sha256_file(hidden):
-        raise StitchHold("output hidden payload inventory differs")
+    stitch_editlist_records(json.loads((work / "output.json").read_text()),
+                            stitch_packet_rows(packets), stitch_packet_rows(hidden))
     stitch_frames(ffmpeg, output, frames, deadline, stop)
     stitch_output_inventory(signature, sources, packets, frames)
     # Full strict EOF decode above includes every frame. Decode each seam again
@@ -47422,7 +47562,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
     clips, joins = plan["clips"], plan["joins"]
     if not 1 <= len(clips) <= 200 or len(joins) != len(clips) - 1 or len(plan.get("eligible", [])) != len(clips) or sum(c["size_bytes"] for c in clips) > STITCH_MAX_INPUT:
         raise StitchHold("unbounded assembly unit")
-    folder = "_V85r_proof_keep28/" if kind is StitchRunKind.PROOF else "_V85r_keep28/"
+    folder = "_V85r_proof_keep28_v2/" if kind is StitchRunKind.PROOF else "_V85r_keep28/"
     expected = clips[0]["relative_path"].split("/")[0] + folder + str(plan["recording_id"]) + "/"
     if (not plan["output_folder"].startswith(expected) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}-00-00Z" + ("/proof-" + STITCH_PROOF_SOURCE_SHA[:16] if kind is StitchRunKind.PROOF else ""), plan["output_folder"][len(expected):])):
         raise StitchHold("output must be in the stream's new versioned sibling folder")

@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import struct
 import subprocess
 from pathlib import Path
 import sys
@@ -28,16 +29,20 @@ def synthetic_receipt():
         (373218,373262),('7bfea81fc9dd6fc83d15759b061a05b82f9b7a70a618e728d9a4e490a0534505','600d2998f6799386ccf07be1687074e3a761babdd435ad0f79ce068fa7f166a4'),(11371311,11249068))]
     plan=dict(policy=pull.STITCH_POLICY,revision=pull.STITCH_REVISION,corpus_sha256=pull.STITCH_CORPUS_SHA,keep_policy_sha256=pull.CLEANUP_KEEP28_POLICY_SHA256,output_folder="synthetic-proof",clips=clips,joins=[True],eligible=[True,True])
     task=dict(kind=pull.STITCH_PROOF_KIND,id=1,source_plan_sha256=pull.STITCH_PROOF_SOURCE_SHA,plan=plan,plan_sha256=hashlib.sha256(pull.cleanup_json_bytes(plan)).hexdigest())
-    probe=json.dumps(dict(streams=[dict(codec_type='video',codec_name='h264',codec_tag_string='avc1',width=10,height=10,pix_fmt='yuv420p',time_base='1/1',extradata_hash='SHA256:'+'a'*64)]))
+    def probe(duration):
+        clock=bytes(12)+struct.pack('>II',1,duration)
+        evidence=dict(movie_header=clock.hex(),media_header=clock.hex(),track_header=(bytes(12)+struct.pack('>I',1)).hex(),
+            handler=(bytes(8)+b'vide').hex(),edit_list=(bytes(4)+struct.pack('>IIihh',1,duration,0,1,0)).hex())
+        return json.dumps(dict(streams=[dict(id='0x1',codec_type='video',codec_name='h264',codec_tag_string='avc1',width=10,height=10,pix_fmt='yuv420p',time_base='1/1',extradata_hash='SHA256:'+'a'*64)],mp4_edit=evidence))
     def packet(pts):return 'pts=%d|dts=%d|duration=60|size=1|flags=K__|data_hash=SHA256:%s\n'%(pts,pts,'b'*64)
     def frame(pts):return '0,0,%d,60,1,%s\n'%(pts,'c'*64)
     audits={};inputs=[]
     for n,c in enumerate(clips):
         prefix='source-%03d'%n
-        audits.update({prefix+'.json':probe,prefix+'.packets':packet(0),prefix+'.hidden':packet(0),prefix+'.frames':frame(0)})
+        audits.update({prefix+'.json':probe(60),prefix+'.packets':packet(0),prefix+'.hidden':packet(0),prefix+'.frames':frame(0)})
         inputs.append(dict(repaired=False,retirement_held=False,raw_proof={'synthetic':True},clip_id=c['source_id'],sha256=c['sha256'],size_bytes=c['size_bytes'],packets=1,frames=1,packet_chain_sha256=hashlib.sha256(('1:SHA256:'+'b'*64+'\n').encode()).hexdigest()))
     seam=dict(policy=pull.STITCH_POLICY,frozen=True,reason='synthetic_fixture',left_id=373218,right_id=373262,decision='join',join=True,nomination=True,status='APPROVED85_nomination_requires_runtime_native_join_checks',diagnostic_sha256='d'*64)
-    audits.update({'output.json':probe,'output.packets':packet(0)+packet(60),'output.hidden':packet(0)+packet(60),'output.frames':frame(0)+frame(60),'v85r-decision.json':json.dumps(seam)})
+    audits.update({'output.json':probe(120),'output.packets':packet(0)+packet(60),'output.hidden':packet(0)+packet(60),'output.frames':frame(0)+frame(60),'v85r-decision.json':json.dumps(seam)})
     provenance=dict(policy=pull.STITCH_POLICY,manifest_sha256=pull.V85R_MANIFEST_SHA,ffmpeg_sha256=pull.V85R_TOOLS['ffmpeg'][0],ffprobe_sha256=pull.V85R_TOOLS['ffprobe'][0],ffmpeg_version=pull.V85R_TOOL_VERSION,ffprobe_version=pull.V85R_TOOL_VERSION,october_ffmpeg_recovered=True)
     output=dict(policy=pull.STITCH_POLICY,relative_path='synthetic-proof/proof.mp4',sha256='e'*64,readback_sha256='e'*64,size_bytes=1,inputs=inputs,provenance=provenance,media_seconds=120,**{k:True for k in ('full_decode','seam_decode','packet_chain','native_audit','original_sources_no_audio','fsynced')})
     result=dict(policy=pull.STITCH_POLICY,plan_sha256=task['plan_sha256'],outputs=[output],seams=[seam],repairs=[],left_out=[],error='')

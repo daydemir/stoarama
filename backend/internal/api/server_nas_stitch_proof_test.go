@@ -30,7 +30,7 @@ func proofPlanFixture() nasStitchPlan {
 func TestNASStitchProofBindsExactPair(t *testing.T) {
 	p := proofPlanFixture()
 	proof, err := boundedNASStitchProof(p, nasStitchProofSourceSHA)
-	if err != nil || len(proof.Plan.Clips) != 2 || !strings.Contains(proof.Plan.OutputFolder, "_V85r_proof_keep28/") || proof.PlanSHA == nasStitchProofSourceSHA {
+	if err != nil || len(proof.Plan.Clips) != 2 || !strings.Contains(proof.Plan.OutputFolder, "_V85r_proof_keep28_v2/") || proof.PlanSHA == nasStitchProofSourceSHA {
 		t.Fatalf("proof: %+v %v", proof, err)
 	}
 	for _, change := range []func(*nasStitchPlan){func(p *nasStitchPlan) { p.KeepSHA = "changed" }, func(p *nasStitchPlan) { p.Clips[0].SourceID++ }, func(p *nasStitchPlan) { p.Clips[1].SizeBytes++ }, func(p *nasStitchPlan) { p.Joins[0] = false }, func(p *nasStitchPlan) { p.Frozen[0] = nil }} {
@@ -46,7 +46,7 @@ func TestNASStitchProofBindsExactPair(t *testing.T) {
 }
 
 func TestNASStitchProofHeartbeatPreservesJoinedClientContract(t *testing.T) {
-	for _, version := range []string{nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion, nasCleanupProofClientVersion} {
+	for _, version := range []string{nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion, "v85r-nas-proof-v1", nasCleanupProofClientVersion} {
 		for _, selector := range []int{0, 1} {
 			response := connectionHeartbeatResponse{OK: true, JoinedDeliveryAccepted: true, JoinedProtocolVersion: 1, JoinedProtocolGeneration: 1, StitchProofTaskID: stitchProofSelector(selector, 13, version)}
 			raw, err := json.Marshal(response)
@@ -243,7 +243,7 @@ func TestNASStitchProofValidationRequiresMatchingFreshNASReadback(t *testing.T) 
 			change(s)
 		}
 		raw, _ := json.Marshal(s)
-		if _, err := pool.Exec(ctx, `UPDATE connections SET client_version='v85r-nas-proof-v1',nas_stitch_status=$1,nas_stitch_status_at=now(),last_seen_at=now() WHERE id=13`, string(raw)); err != nil {
+		if _, err := pool.Exec(ctx, `UPDATE connections SET client_version='v85r-nas-proof-v2',nas_stitch_status=$1,nas_stitch_status_at=now(),last_seen_at=now() WHERE id=13`, string(raw)); err != nil {
 			t.Fatal(err)
 		}
 		body, _ := json.Marshal(request)
