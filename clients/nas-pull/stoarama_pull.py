@@ -50381,7 +50381,8 @@ class R2CopyControl:
             self.check(deadline)
             if status != 200:
                 error = urllib.error.HTTPError(path, status, "copy control refused", {}, None)
-                error.close()
+                if error.fp is not None:
+                    error.close()
                 raise error
             result = json.loads(data)
             if not isinstance(result, dict):

@@ -135,6 +135,30 @@ class R2CopyControlTests(unittest.TestCase):
         self.assertNotIn("/destination", self.requests)
         self.assertIsNone(self.control.process)
 
+    def test_bodyless_python39_http_error_keeps_refusal_and_transport(self):
+        original = urllib.error.HTTPError
+        class BodylessHTTPError39(original):
+            def __init__(self, *args):
+                super().__init__(*args)
+                if self.fp is not None:
+                    super().close()
+                self.fp = None
+            def close(self):
+                # Python3.9 skips addinfourl initialization for fp=None.
+                if self.fp is None:
+                    raise KeyError("file")
+                return super().close()
+        self.control.request_json(Operation.LEASE, "/ok")
+        pid = self.control.process.pid
+        with mock.patch.object(pull.urllib.error, "HTTPError", BodylessHTTPError39):
+            with self.assertRaises(BodylessHTTPError39) as refused:
+                self.control.request_json(Operation.CHECKPOINT, "/refuse")
+        self.assertIsNone(refused.exception.fp)
+        self.assertEqual(refused.exception.code, 409)
+        self.assertEqual(self.last_values()["status"], 409)
+        self.control.request_json(Operation.RESULT, "/ok")
+        self.assertEqual(self.control.process.pid, pid)
+
     def test_actual_log_ring_and_upload_keep_every_operation_and_cached_startup(self):
         for operation in Operation:
             self.control.request_json(operation, "/ok")
@@ -245,7 +269,8 @@ class R2CopyControlTests(unittest.TestCase):
             release.wait(2)
             kill()
             return wait(timeout=timeout)
-        with mock.patch.object(process, "kill", side_effect=PermissionError("fixture")), \
+        with mock.patch.object(pull, "log", wraps=pull.log) as logged, \
+                mock.patch.object(process, "kill", side_effect=PermissionError("fixture")), \
                 mock.patch.object(process, "wait", side_effect=delayed_wait):
             worker = threading.Thread(target=self.control.close)
             worker.start()
@@ -256,6 +281,8 @@ class R2CopyControlTests(unittest.TestCase):
             finally:
                 release.set()
                 worker.join(2)
+            logged.assert_any_call("WARN", "R2 copy held: copy control child termination failed")
+            self.assertEqual(sum(call.args == ("WARN", "R2 copy held: copy control child termination failed") for call in logged.call_args_list), 1)
         self.assertFalse(worker.is_alive())
         self.assertIsNone(self.control.process)
 
