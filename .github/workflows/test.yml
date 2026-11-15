@@ -93,7 +93,7 @@ jobs:
       - name: Test delivery keep holds and unexecutable R2 previews
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api ./cmd/stoaramactl ./internal/db -run '^(TestDeliveryKeep.*|TestR2Retire.*)$' -race -count=1 -v
+        run: go test -p 1 ./internal/api ./cmd/stoaramactl ./internal/db -run '^(TestDeliveryKeep.*|TestR2Retire.*)$' -race -count=1 -v
       - name: Test cleanup receipt lock order and transaction replay under race detector
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
@@ -287,13 +287,13 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: |
-          go test ./internal/api -run '^Test(NASRestoreLifecycle|ValidateNASRestoreResult|PullPathAllowed)$' -count=1 -v
+          go test ./internal/api -run '^Test(R2StitchRetiredNASHandlersPreserveDurableRows|PullPathAllowed)$' -count=1 -v
           go test ./cmd/stoaramactl -run '^Test(ParseNASRestoreRequestArgs|ClassifyNASRestoreCandidate|RequestNASRestoresQueuesOnlyVerifiedClips|ParseNASPurgeArgsDefaultsToSafeDryRun|NASPurgeSkipReasonOrder|NASVerifiedPurgeEndToEnd|NASPurgeCohortWindowsCoverTheApprovedFourteenDays|NASPurgeBindProtectionsNumbersPlaceholders)$' -count=1 -v
-          go test ./internal/r2 -run '^TestDeleteObjectsEachReportsPerKeyFailures$' -count=1 -v
+          go test ./internal/r2 -run '^TestR2LegacyDeletesAndMissingStitchAuthorityNeverReachWire$' -count=1 -v
       - name: Test R2 retire selection and apply safety
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./cmd/stoaramactl ./internal/r2 -run '^Test(R2Fence|R2Retire|R2WriterFence|RequireNoMultipart|UnboundR2Client|ParseR2RetirePicks|DeleteObjectOnce|HeadExposes)' -race -count=1 -v
+        run: go test -p 1 ./cmd/stoaramactl ./internal/r2 ./internal/api ./internal/stitchproof -run '^Test(R2Fence|R2Retire|R2WriterFence|R2Stitch|R2Legacy|Batch|RequireNoMultipart|UnboundR2Client|ParseR2RetirePicks|HeadExposes)' -race -count=1 -v
       - name: Test selected-file NAS verification
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -305,23 +306,24 @@ func r2RetireDecideForScope(c r2RetireCandidate, scope r2RetireScope, windows ma
 	return r2RetireDecideMode(c, scope.Bucket, windows, picks, scope.NASBacked)
 }
 
-func r2RetireLockNASIdentity(ctx context.Context, q r2RetireQuerier, it r2RetireItem, connectionID int64) error {
-	pathSQL := `n.relative_path=$5`
-	if it.Kind == "collated" {
-		pathSQL = `n.relative_path IN ($5,'joined/'||$5)`
+func r2RetireLockNASIdentity(ctx context.Context, q r2RetireQuerier, it r2RetireItem, connectionID int64) (time.Time, error) {
+	// The supported apply path is RAW only. Lock the same exact identity and
+	// sidecar proof used by selection, and carry its expiry to the wire boundary.
+	if it.Kind != "raw" {
+		return time.Time{}, errors.New("NAS custody lock requires RAW identity")
 	}
-	var id int64
-	err := q.QueryRow(ctx, `SELECT n.clip_id FROM nas_inventory_files n WHERE n.connection_id=$1 AND n.state='present'
- AND n.sha256=$2 AND n.size_bytes=$3 AND n.verified_at BETWEEN now()-interval '24 hours' AND now()+interval '5 minutes' AND n.server_received_at>=now()-interval '24 hours' AND ($4::bigint=0 OR n.clip_id=$4) AND `+pathSQL+` ORDER BY n.clip_id LIMIT 1 FOR SHARE`, connectionID, it.SHA256, it.SizeBytes, func() int64 {
-		if it.Kind == "raw" {
-			return it.SourceID
-		}
-		return 0
-	}(), it.RelativePath).Scan(&id)
+	var expiry time.Time
+	err := q.QueryRow(ctx, `SELECT LEAST(n.verified_at,n.server_received_at)+interval '24 hours'
+ FROM nas_inventory_files n WHERE n.connection_id=$1 AND n.state='present'
+ AND n.sha256=$2 AND n.size_bytes=$3 AND n.clip_id=$4 AND n.relative_path=$5
+ AND n.verified_at BETWEEN clock_timestamp()-interval '24 hours' AND clock_timestamp()+interval '5 minutes'
+ AND n.server_received_at>=clock_timestamp()-interval '24 hours'
+ AND n.sidecar_relative_path=$5||'.stoarama.json' AND n.sidecar_size_bytes>0 AND n.sidecar_sha256 ~ '^[a-f0-9]{64}$'
+ FOR SHARE`, connectionID, it.SHA256, it.SizeBytes, it.SourceID, it.RelativePath).Scan(&expiry)
 	if err != nil {
-		return fmt.Errorf("exact present NAS identity no longer lockable: %w", err)
+		return time.Time{}, fmt.Errorf("exact present NAS identity no longer lockable: %w", err)
 	}
-	return nil
+	return expiry, nil
 }
 
 func (a *r2RetireApplier) reserve(ctx context.Context, it r2RetireItem) error {
@@ -407,21 +409,17 @@ func readR2RetireListing(path, want, bucket string) (map[string]r2.ObjectInfo, e
 // R2's compatibility docs do not promise If-Match on DeleteObject. A unit
 // fake only proves we send the header. Require an operator's live scratch-key
 // probe rather than silently relying on a header the provider might ignore.
-func checkR2RetireDeleteProof(path, want, bucket, endpointSHA string) error {
-	return checkR2RetireDeleteProofMode(path, want, bucket, endpointSHA, false)
-}
-
-func checkR2RetireDeleteProofMode(path, want, bucket, endpointSHA string, unsupported bool) error {
+func r2RetireDeleteProofExpiry(path, want, bucket, endpointSHA string, unsupported bool, now time.Time) (time.Time, error) {
 	if !r2RetireLowerHex64(want) {
-		return fmt.Errorf("NAS-backed apply requires --conditional-delete-proof and --expected-delete-proof-sha256; run the operator-only probe first")
+		return time.Time{}, fmt.Errorf("NAS-backed apply requires --conditional-delete-proof and --expected-delete-proof-sha256; run the operator-only probe first")
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	sum := sha256.Sum256(raw)
 	if hex.EncodeToString(sum[:]) != want {
-		return fmt.Errorf("conditional-delete proof digest differs")
+		return time.Time{}, fmt.Errorf("conditional-delete proof digest differs")
 	}
 	var p struct {
 		Bucket         string    `json:"bucket"`
@@ -436,14 +434,15 @@ func checkR2RetireDeleteProofMode(path, want, bucket, endpointSHA string, unsupp
 		ProbeKey       string    `json:"probe_key"`
 	}
 	if err := json.Unmarshal(raw, &p); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	valid := p.Rejected && p.Preserved && p.Confirmed && !p.Unsupported && !p.WrongSucceeded && !p.Absent
 	if unsupported {
 		valid = p.Unsupported && p.WrongSucceeded && p.Absent && !p.Rejected && !p.Preserved && !p.Confirmed && strings.HasPrefix(p.ProbeKey, "r2-retire-probes/")
 	}
-	if p.Bucket != bucket || p.EndpointSHA256 != endpointSHA || !valid || (unsupported && p.CreatedAt.After(time.Now())) || time.Since(p.CreatedAt) > 24*time.Hour || p.CreatedAt.After(time.Now().Add(time.Minute)) {
-		return fmt.Errorf("conditional-delete proof bucket/endpoint/results/age differ; run the operator-only probe again")
+	expiry := p.CreatedAt.Add(24 * time.Hour)
+	if now.IsZero() || p.CreatedAt.IsZero() || p.Bucket != bucket || p.EndpointSHA256 != endpointSHA || !valid || (unsupported && p.CreatedAt.After(now)) || !now.Before(expiry) || p.CreatedAt.After(now.Add(time.Minute)) {
+		return time.Time{}, fmt.Errorf("conditional-delete proof bucket/endpoint/results/age differ; run the operator-only probe again")
 	}
-	return nil
+	return expiry, nil
 }

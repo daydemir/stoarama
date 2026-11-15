@@ -1,5 +1,10 @@
 # R2 retirement from the saved owner picks
 
+Current authority and execution protocol: [NAS stitching prerequisite](R2_STITCH_PREREQUISITE.md).
+The historical sections below do not waive the mandatory real-stitch artifact,
+24-hour manifest limit, KeepAll/global-delivery protections, writer/index/fence
+gates, or retirement of legacy/conditional delete paths.
+
 Operator execution only. Planning is read-only; this change neither runs an R2
 DELETE nor queues a production copy, deploys code, applies migrations, changes the
 owner's picks, nor changes the running cleanup job.

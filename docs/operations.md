@@ -318,3 +318,22 @@ and SHA checks, retained completed results, and all deletion gates are unchanged
 This addresses repeated large-object retries without storing media or introducing
 an asynchronous verifier. Validate production progress after a natural batch gap;
 controlled contention tests do not establish production throughput.
+
+
+## R2 retirement during wind-down
+
+Every supported R2 wire deletion now requires the real NAS stitching prerequisite
+and an independent postrun artifact digest. See
+[R2 stitching prerequisite](R2_STITCH_PREREQUISITE.md) for the owner wording,
+read-only verification command, immutable replay and recovery contract.
+
+Legacy `survey delete-stream-captures`, `joined-source-purge --apply` and
+`nas-verified-purge --apply` refuse before catalog or object mutations. Keep the
+NAS purge cron suspended and its enable flag false. Probe/restore requests issue
+no new capabilities; existing rows and objects remain preserved. New account and
+admin S3 destination verification/provisioning is retired before writing probes
+or credentials. Existing managed destinations resolve by read-only lookup;
+missing managed storage is not implicitly created, billed or marked verified.
+Existing destination selection and separately transported WebDAV verification
+remain available. These backend changes require the production controller's
+reviewed between-batch deployment; merging does not deploy or authorize deletion.

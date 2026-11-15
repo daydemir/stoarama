@@ -282,8 +282,23 @@ func r2RetireDecideMode(c r2RetireCandidate, bucket string, windows map[int64]ap
 		return "unknown_timing", "", false
 	}
 	outside := r2RetireOutside(w, c.StartAt, c.EndAt) && r2RetireOutside(w, c.SourceStart, c.SourceEnd)
+
 	if !nasBacked && !outside {
 		return "inside_keep_window", "", false
+	}
+	if !outside {
+		location, err := time.LoadLocation(w.Timezone)
+		if err != nil {
+			return "delivery_window_unknown", "", false
+		}
+		best, err := time.ParseInLocation("2006-01-02", w.BestStart, location)
+		if err != nil {
+			return "delivery_window_unknown", "", false
+		}
+		delivery := api.Keep28Window{Start: best, End: best.AddDate(0, 0, 14)}
+		if !r2RetireOutside(delivery, c.StartAt, c.EndAt) || !r2RetireOutside(delivery, c.SourceStart, c.SourceEnd) {
+			return "delivery_keep_period", "", false
+		}
 	}
 	switch {
 	case !nasBacked && c.Facts.NASCopy:

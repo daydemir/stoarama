@@ -11,7 +11,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/util"
 	"github.com/daydemir/stoarama/backend/internal/webdav"
 )
@@ -34,17 +33,13 @@ type adminStorageDestinationCreateRequest struct {
 }
 
 // handleAdminStorageDestinationCreate creates a shared destination after a live
-// connection check. provider 'webdav' verifies via a WebDAV MKCOL+PUT+HEAD+GET+DELETE
-// probe; any other provider verifies via the existing S3 round-trip. The secret is
+// connection check. Only the separate WebDAV transport remains available;
+// S3 creation refuses before probes or mutations. The WebDAV secret is
 // secretbox-encrypted; the row is shared=true, managed=false, status='verified'.
 func (s *Server) handleAdminStorageDestinationCreate(w http.ResponseWriter, r *http.Request) {
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-	if s.secrets == nil {
-		util.WriteError(w, http.StatusServiceUnavailable, "storage destinations are not enabled (STORAGE_CRED_KEY is unset)")
 		return
 	}
 	var req adminStorageDestinationCreateRequest
@@ -59,6 +54,14 @@ func (s *Server) handleAdminStorageDestinationCreate(w http.ResponseWriter, r *h
 	}
 	if provider != "webdav" && provider != "s3_compatible" {
 		util.WriteError(w, http.StatusBadRequest, "provider must be 'webdav' or 's3_compatible'")
+		return
+	}
+	if provider != "webdav" {
+		util.WriteError(w, http.StatusConflict, "S3 storage verification and provisioning are retired")
+		return
+	}
+	if s.secrets == nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "storage destinations are not enabled (STORAGE_CRED_KEY is unset)")
 		return
 	}
 	endpoint := strings.TrimSpace(req.Endpoint)
@@ -80,10 +83,6 @@ func (s *Server) handleAdminStorageDestinationCreate(w http.ResponseWriter, r *h
 		"endpoint":          endpoint,
 		"access_key_id":     accessKeyID,
 		"secret_access_key": secret,
-	}
-	if provider == "s3_compatible" {
-		required["region"] = region
-		required["bucket"] = bucket
 	}
 	for label, val := range required {
 		if val == "" {
@@ -110,22 +109,9 @@ func (s *Server) handleAdminStorageDestinationCreate(w http.ResponseWriter, r *h
 
 	verifyCtx, cancel := context.WithTimeout(r.Context(), storageVerifyTimeout)
 	defer cancel()
-	if provider == "webdav" {
-		if err := verifyWebDAVDestination(verifyCtx, endpoint, accessKeyID, secret, keyPrefix); err != nil {
-			util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("destination verification failed: %v", err))
-			return
-		}
-	} else {
-		if err := verifyStorageDestination(verifyCtx, r2.Config{WriterDB: s.pool,
-			AccessKey: accessKeyID,
-			SecretKey: secret,
-			Region:    region,
-			Bucket:    bucket,
-			Endpoint:  endpoint,
-		}, keyPrefix); err != nil {
-			util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("destination verification failed: %v", err))
-			return
-		}
+	if err := verifyWebDAVDestination(verifyCtx, endpoint, accessKeyID, secret, keyPrefix); err != nil {
+		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("destination verification failed: %v", err))
+		return
 	}
 
 	sealed, err := s.secrets.Encrypt([]byte(secret))

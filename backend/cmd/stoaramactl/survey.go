@@ -325,22 +325,5 @@ func runSurveyCoverage(ctx context.Context, cfg config.Config, args []string) {
 // frame rows but never deletes R2 bytes and orphans media_objects, so this is
 // the explicit cleanup path.
 func runSurveyDeleteStreamCaptures(ctx context.Context, cfg config.Config, args []string) {
-	fs := flag.NewFlagSet("survey delete-stream-captures", flag.ExitOnError)
-	id := fs.Int64("id", 0, "stream id whose survey captures to delete")
-	apply := fs.Bool("apply", false, "perform deletion (required)")
-	_ = fs.Parse(args)
-	if *id <= 0 {
-		log.Fatalf("--id is required")
-	}
-	if !*apply {
-		log.Fatalf("--apply is required for delete-stream-captures")
-	}
-	pool := mustOpenPool(ctx, cfg)
-	defer pool.Close()
-	r2c := mustArchiveR2Client(ctx, cfg, pool)
-	deleted, err := survey.DeleteStreamCaptures(ctx, pool, r2c, *id)
-	if err != nil {
-		log.Fatalf("delete survey captures for stream %d: %v", *id, err)
-	}
-	fmt.Printf("deleted survey captures stream=%d r2_objects=%d\n", *id, deleted)
+	log.Fatal("survey capture deletion is retired; no catalog or R2 mutation is permitted")
 }

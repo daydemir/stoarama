@@ -394,19 +394,12 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			util.WriteError(w, http.StatusBadRequest, "a verified WebDAV delivery_storage_destination_id is required")
 			return
 		}
-		if req.DryRun {
-			if s.r2 == nil || s.secrets == nil || s.cfg.ValidateR2() != nil {
-				util.WriteError(w, http.StatusServiceUnavailable, "managed staging unavailable")
-				return
-			}
-		} else {
-			managedID, _, err := s.provisionManagedDestination(r.Context(), tx, accountID)
-			if err != nil {
-				util.WriteError(w, http.StatusServiceUnavailable, "managed staging unavailable")
-				return
-			}
-			captureDestID = managedID
+		managedID, _, err := s.resolveManagedDestination(r.Context(), tx, accountID)
+		if err != nil {
+			util.WriteError(w, http.StatusServiceUnavailable, "managed staging unavailable")
+			return
 		}
+		captureDestID = managedID
 		deliveryDestArg = req.DeliveryStorageDestinationID
 	} else {
 		var verified, managed bool
