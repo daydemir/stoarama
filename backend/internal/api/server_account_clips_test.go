@@ -500,6 +500,7 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 				OR (inventory_in_progress_dataset_schema = 'raw-dataset-v2' AND inventory_in_progress_root_exclusions = '["#recycle"]'::jsonb)
 			)
 		)`,
+		`CREATE TABLE streams (id BIGINT PRIMARY KEY, local_timezone TEXT)`,
 		`CREATE TABLE recordings (
 			id BIGSERIAL PRIMARY KEY,
 			account_id BIGINT NOT NULL,
@@ -507,7 +508,9 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			status TEXT NOT NULL DEFAULT 'active',
 			naming_profile TEXT NOT NULL DEFAULT 'stoarama_v1',
 			folder_name TEXT NOT NULL DEFAULT 'recordings',
-			delivery TEXT NOT NULL DEFAULT 'managed'
+			delivery TEXT NOT NULL DEFAULT 'managed',
+			stream_id BIGINT,
+			cron_timezone TEXT
 		)`,
 		`CREATE TABLE recording_clips (
 			id BIGSERIAL PRIMARY KEY,
@@ -519,8 +522,8 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			thumbnail_object_key TEXT NOT NULL DEFAULT '',
 			storage_destination_id BIGINT NOT NULL DEFAULT 0,
 			sha256 TEXT NOT NULL DEFAULT '` + strings.Repeat("a", 64) + `',
-			clip_start_at TIMESTAMPTZ NOT NULL,
-			clip_end_at TIMESTAMPTZ NOT NULL,
+			clip_start_at TIMESTAMPTZ,
+			clip_end_at TIMESTAMPTZ,
 			display_path TEXT NOT NULL DEFAULT 'clips/test.mp4',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now() - interval '10 minutes',
 			purged_at TIMESTAMPTZ,
