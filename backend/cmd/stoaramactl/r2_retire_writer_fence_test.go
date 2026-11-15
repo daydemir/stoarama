@@ -25,10 +25,10 @@ func r2WriterFenceFixture(t *testing.T) *pgxpool.Pool {
 			t.Fatal(err)
 		}
 	}
-	// The exact additive migration runs against the admission/state surfaces;
-	// TestRecordingPresentationV2MigrationRunsThroughMigrateUp covers full DDL.
+	// Apply both exact admission/drain migrations to all blocker surfaces.
+	// TestR2WriterFenceProcessRunsWithRealSchema also covers the full real DDL.
 	exec(`CREATE TABLE recordings(status text); CREATE TABLE streams(recording_state text); CREATE TABLE stream_capture_runtime(status text);
- CREATE TABLE recording_jobs(status text); CREATE TABLE clip_transfer_jobs(status text);
+ CREATE TABLE recording_jobs(status text); CREATE TABLE clip_transfer_jobs(status text); CREATE TABLE recording_process_runs(status text);
  CREATE TABLE inference_box_jobs(status text); CREATE TABLE nas_restore_requests(state text,put_expires_at timestamptz);
  CREATE TABLE nas_stitch_tasks(state text); CREATE TABLE recording_native_stitch_tasks(state text);
  CREATE TABLE recording_presentation_v2_probe_tasks(state text); CREATE TABLE recording_joined_batches(state text);
@@ -40,11 +40,13 @@ func r2WriterFenceFixture(t *testing.T) *pgxpool.Pool {
 	for _, table := range []string{"recording_clips", "recording_collation_hours", "recording_collation_outputs", "nas_stitch_outputs", "recording_native_stitch_certifications", "media_objects", "frames"} {
 		exec("CREATE TABLE " + table + "(id bigint)")
 	}
-	body, err := os.ReadFile("../../../infra/sql/migrations/0187_r2_writer_admission_fence.sql")
-	if err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"0187_r2_writer_admission_fence.sql", "0196_r2_capture_process_admission.sql"} {
+		body, err := os.ReadFile("../../../infra/sql/migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		exec(string(body))
 	}
-	exec(string(body))
 	return pool
 }
 
@@ -66,6 +68,7 @@ func TestR2WriterFenceAllAdmissionsAndDrain(t *testing.T) {
 		{"recording_presentation_v2_probe_tasks", "state", "awaiting_retention"},
 		{"recording_joined_batches", "state", "frozen"}, {"recording_joined_hours", "state", "pending"},
 		{"recording_joined_stream_days", "state", "pending"}, {"recording_joined_artifacts", "publication_state", "publishing"},
+		{"recording_process_runs", "status", "starting"}, {"recording_process_runs", "status", "running"},
 	}
 	if err := r2RetireCheckStoppedWriters(ctx, pool, "bucket"); err != nil {
 		t.Fatal(err)

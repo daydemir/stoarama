@@ -42,6 +42,7 @@ const (
 	r2WriterJobs            r2WriterCategory = "recording_jobs"
 	r2WriterStreams         r2WriterCategory = "streams_on"
 	r2WriterRuntime         r2WriterCategory = "capture_runtime"
+	r2WriterProcessRun      r2WriterCategory = "capture_process_runs"
 	r2WriterCaptureLease    r2WriterCategory = "capture_leases"
 	r2WriterRecordingUpload r2WriterCategory = "recording_upload_intents"
 	r2WriterUpload          r2WriterCategory = "upload_intents"
@@ -64,7 +65,7 @@ type r2WriterAuditSpec struct {
 	query    string
 }
 
-// These are exactly the blocker predicates in migration 0187. Select only
+// These are exactly the blocker predicates in migrations 0187 and 0196. Select only
 // lifecycle/owner observations: never bearer tokens, URLs, plans or media blobs.
 var r2WriterAuditSpecs = []r2WriterAuditSpec{
 	{r2WriterRecordings, `SELECT jsonb_build_object('id',id,'stream_id',stream_id,'state',status,'updated_at',updated_at,'last_clip_at',last_clip_at) FROM recordings WHERE status='active' ORDER BY id`},
@@ -86,6 +87,7 @@ var r2WriterAuditSpecs = []r2WriterAuditSpec{
 	{r2WriterJoinedHour, `SELECT jsonb_build_object('id',id,'state',state,'batch_record_id',batch_record_id,'batch_id',batch_id,'hour_id',hour_id,'recording_id',recording_id,'owner',claimed_by,'heartbeat_at',heartbeat_at,'lease_expires_at',lease_expires_at,'attempt_count',attempt_count,'updated_at',updated_at) FROM recording_joined_hours WHERE state IN ('pending','leased') ORDER BY id`},
 	{r2WriterJoinedDay, `SELECT jsonb_build_object('id',id,'state',state,'batch_record_id',batch_record_id,'batch_id',batch_id) FROM recording_joined_stream_days WHERE state='pending' ORDER BY id`},
 	{r2WriterJoinedArtifact, `SELECT jsonb_build_object('id',id,'state',publication_state,'batch_record_id',batch_record_id,'batch_id',batch_id,'artifact_kind',artifact_kind,'owner',publication_claimed_by,'heartbeat_at',publication_heartbeat_at,'lease_expires_at',publication_lease_expires_at,'attempt_count',publication_attempt_count,'published_at',published_at,'updated_at',updated_at) FROM recording_joined_artifacts WHERE publication_state IN ('sealed','publishing') ORDER BY id`},
+	{r2WriterProcessRun, `SELECT jsonb_build_object('id',id,'stream_id',stream_id,'state',status,'server_id',server_id,'worker_id',worker_id,'process_id',process_id,'assignment_revision',assignment_revision,'started_at',started_at,'stopped_at',stopped_at,'last_heartbeat_at',last_heartbeat_at,'last_frame_at',last_frame_at,'updated_at',updated_at) FROM recording_process_runs WHERE status IN ('starting','running') ORDER BY id`},
 }
 
 type r2WriterAuditHeader struct {

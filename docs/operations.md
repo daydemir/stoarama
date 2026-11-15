@@ -346,6 +346,11 @@ creates a read-only, repeatable-read observation of every category in
 **each blocking item**, including its lifecycle, owner/heartbeat/lease facts
 where recorded, and the SHA256 of those allowlisted observations. Zero-count
 categories appear in the header. Existing evidence files cannot be overwritten.
+Migration0196 adds the twentieth category, `capture_process_runs`: every
+`starting` or `running` process blocks drain independently of parent/runtime
+state and `stopped_at`. The active writer fence rejects runnable process
+inserts, transitions and heartbeats; ordinary terminal history remains legal.
+These checks do not prove an old owner stopped or authorize cancellation.
 The command has a 15-second SQL statement limit and does not read media tables,
 provider credentials, signed URLs or claim tokens into the report.
 

@@ -32,7 +32,7 @@ func TestWriterReconcileObservesRealGateWithoutChangingLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !h.DryRun || !h.WritersDrained || !h.IndexesReady || len(items) != 0 || len(h.Counts) != 19 || h.ApplyCommand != nil {
+	if !h.DryRun || !h.WritersDrained || !h.IndexesReady || len(items) != 0 || len(h.Counts) != 20 || h.ApplyCommand != nil {
 		t.Fatalf("empty gate report: %+v items=%d", h, len(items))
 	}
 	_, err = pool.Exec(ctx, `INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,capture_type,source_family,execution_class,capture_family,expected_fps) VALUES(991,'test','991','test','writer-reconcile-test','https://secret.invalid/never-report-me','on','hls','video_manifest','video_live','continuous_video',30);
