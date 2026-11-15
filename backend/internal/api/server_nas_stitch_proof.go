@@ -125,8 +125,8 @@ func (s *Server) writeNASStitchProof(w http.ResponseWriter, r *http.Request) {
 	util.WriteJSON(w, 200, proof)
 }
 
-func stitchProofSelector(selector int, connectionID int64) int {
-	if selector == 1 && connectionID == 13 {
+func stitchProofSelector(selector int, connectionID int64, version string) int {
+	if selector == 1 && connectionID == 13 && version == nasCleanupProofClientVersion {
 		return 1
 	}
 	return 0

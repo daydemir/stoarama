@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -39,8 +40,54 @@ func TestNASStitchProofBindsExactPair(t *testing.T) {
 			t.Fatal("changed proof admitted")
 		}
 	}
-	if stitchProofSelector(1, 13) != 1 || stitchProofSelector(2, 13) != 0 || stitchProofSelector(1, 14) != 0 {
+	if stitchProofSelector(1, 13, nasCleanupProofClientVersion) != 1 || stitchProofSelector(2, 13, nasCleanupProofClientVersion) != 0 || stitchProofSelector(1, 14, nasCleanupProofClientVersion) != 0 {
 		t.Fatal("proof selector widened")
+	}
+}
+
+func TestNASStitchProofHeartbeatPreservesJoinedClientContract(t *testing.T) {
+	for _, version := range []string{nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion, nasCleanupProofClientVersion} {
+		for _, selector := range []int{0, 1} {
+			response := connectionHeartbeatResponse{OK: true, JoinedDeliveryAccepted: true, JoinedProtocolVersion: 1, JoinedProtocolGeneration: 1, StitchProofTaskID: stitchProofSelector(selector, 13, version)}
+			raw, err := json.Marshal(response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(raw), "stitch_proof_task_id") != (selector == 1 && version == nasCleanupProofClientVersion) {
+				t.Fatalf("selector leaked to unqualified client: %s %s", version, raw)
+			}
+			cmd := exec.Command("python3", "-I", "-S", "-B", "-c", `import importlib.util,json,sys,threading
+from types import SimpleNamespace
+s=importlib.util.spec_from_file_location('client',sys.argv[1]);p=importlib.util.module_from_spec(s);s.loader.exec_module(p)
+r=SimpleNamespace(joined_completion_lock=threading.RLock(),lock=threading.Lock(),joined_protocol_generation=0,joined_protocol_version=0,joined_transfer=None,joined_work_condition=threading.Condition())
+p.Runtime.apply_joined_protocol_response(r,json.load(sys.stdin))
+assert r.joined_protocol_version==1,'proof selector disabled joined delivery'
+`, "../../../clients/nas-pull/stoarama_pull.py")
+			cmd.Env = []string{}
+			cmd.Stdin = bytes.NewReader(raw)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("serialized heartbeat rejected: %s %v %s", raw, err, output)
+			}
+		}
+	}
+}
+
+func TestNASStitchProofPullMiddlewareAllowsOnlyExactRead(t *testing.T) {
+	id := int64(5)
+	principal := accountPrincipal{AccountID: 47, AuthType: "api_key", APIKeyID: &id, KeyScopes: []string{accountScopePull}}
+	path := "/api/v1/account/connections/stitch/proof"
+	if runConfine(principal, http.MethodGet, path) != http.StatusOK {
+		t.Fatal("proof GET blocked by pull scope")
+	}
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
+		if runConfine(principal, method, path) != http.StatusForbidden {
+			t.Fatal("proof mutation admitted")
+		}
+	}
+	for _, neighbor := range []string{path + "/", path + "/other", path + "x"} {
+		if runConfine(principal, http.MethodGet, neighbor) != http.StatusForbidden {
+			t.Fatal("neighbor proof route admitted")
+		}
 	}
 }
 func TestNASStitchProofReadsAcrossUnchangedAdmissionFence(t *testing.T) {
@@ -71,6 +118,15 @@ func TestNASStitchProofReadsAcrossUnchangedAdmissionFence(t *testing.T) {
 	p, err := server.nasStitchProof(ctx)
 	if err != nil || !p.Expires.After(before) {
 		t.Fatalf("read-only proof refused: %v", err)
+	}
+	keyID := int64(5)
+	principal := accountPrincipal{AccountID: 47, AuthType: "api_key", APIKeyID: &keyID, KeyScopes: []string{accountScopePull}}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/account/connections/stitch/proof", nil)
+	req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, principal))
+	w := httptest.NewRecorder()
+	server.confineAccountScope(http.HandlerFunc(server.handleAccountNASStitchProof)).ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("bounded proof inaccessible through pull middleware: %d %s", w.Code, w.Body)
 	}
 	if _, err = pool.Exec(ctx, `UPDATE nas_stitch_tasks SET attempt=attempt+1 WHERE id=1`); err == nil {
 		t.Fatal("ordinary re-lease escaped fence")

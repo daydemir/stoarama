@@ -24,7 +24,7 @@ def synthetic_receipt():
     """Mechanical replay fixture only: invented inventories, never NAS evidence."""
     clips=[dict(source_id=clip,relative_path='synthetic/%d.mp4'%clip,sha256=sha,size_bytes=size) for clip,sha,size in zip(
         (373218,373262),('7bfea81fc9dd6fc83d15759b061a05b82f9b7a70a618e728d9a4e490a0534505','600d2998f6799386ccf07be1687074e3a761babdd435ad0f79ce068fa7f166a4'),(11371311,11249068))]
-    plan=dict(policy=pull.STITCH_POLICY,revision=pull.STITCH_REVISION,corpus_sha256=pull.STITCH_CORPUS_SHA,keep_policy_sha256=pull.CLEANUP_KEEP28_POLICY_SHA256,clips=clips,joins=[True],eligible=[True,True])
+    plan=dict(policy=pull.STITCH_POLICY,revision=pull.STITCH_REVISION,corpus_sha256=pull.STITCH_CORPUS_SHA,keep_policy_sha256=pull.CLEANUP_KEEP28_POLICY_SHA256,output_folder="synthetic-proof",clips=clips,joins=[True],eligible=[True,True])
     task=dict(kind=pull.STITCH_PROOF_KIND,id=1,source_plan_sha256=pull.STITCH_PROOF_SOURCE_SHA,plan=plan,plan_sha256=hashlib.sha256(pull.cleanup_json_bytes(plan)).hexdigest())
     probe=json.dumps(dict(streams=[dict(codec_type='video',codec_name='h264',codec_tag_string='avc1',width=10,height=10,pix_fmt='yuv420p',time_base='1/1',extradata_hash='SHA256:'+'a'*64)]))
     def packet(pts):return 'pts=%d|dts=%d|duration=60|size=1|flags=K__|data_hash=SHA256:%s\n'%(pts,pts,'b'*64)
@@ -33,18 +33,34 @@ def synthetic_receipt():
     for n,c in enumerate(clips):
         prefix='source-%03d'%n
         audits.update({prefix+'.json':probe,prefix+'.packets':packet(0),prefix+'.hidden':packet(0),prefix+'.frames':frame(0)})
-        inputs.append(dict(clip_id=c['source_id'],sha256=c['sha256'],size_bytes=c['size_bytes'],packets=1,frames=1,packet_chain_sha256=hashlib.sha256(('1:SHA256:'+'b'*64+'\n').encode()).hexdigest()))
-    seam=dict(decision='join',join=True,nomination=True,status='APPROVED85_nomination_requires_runtime_native_join_checks',diagnostic_sha256='d'*64)
+        inputs.append(dict(repaired=False,retirement_held=False,raw_proof={'synthetic':True},clip_id=c['source_id'],sha256=c['sha256'],size_bytes=c['size_bytes'],packets=1,frames=1,packet_chain_sha256=hashlib.sha256(('1:SHA256:'+'b'*64+'\n').encode()).hexdigest()))
+    seam=dict(policy=pull.STITCH_POLICY,frozen=True,reason='synthetic_fixture',left_id=373218,right_id=373262,decision='join',join=True,nomination=True,status='APPROVED85_nomination_requires_runtime_native_join_checks',diagnostic_sha256='d'*64)
     audits.update({'output.json':probe,'output.packets':packet(0)+packet(60),'output.hidden':packet(0)+packet(60),'output.frames':frame(0)+frame(60),'v85r-decision.json':json.dumps(seam)})
     provenance=dict(policy=pull.STITCH_POLICY,manifest_sha256=pull.V85R_MANIFEST_SHA,ffmpeg_sha256=pull.V85R_TOOLS['ffmpeg'][0],ffprobe_sha256=pull.V85R_TOOLS['ffprobe'][0],ffmpeg_version=pull.V85R_TOOL_VERSION,ffprobe_version=pull.V85R_TOOL_VERSION,october_ffmpeg_recovered=True)
-    output=dict(relative_path='synthetic-proof/proof.mp4',sha256='e'*64,readback_sha256='e'*64,size_bytes=1,inputs=inputs,provenance=provenance,media_seconds=120,**{k:True for k in ('full_decode','seam_decode','packet_chain','native_audit','original_sources_no_audio','fsynced')})
+    output=dict(policy=pull.STITCH_POLICY,relative_path='synthetic-proof/proof.mp4',sha256='e'*64,readback_sha256='e'*64,size_bytes=1,inputs=inputs,provenance=provenance,media_seconds=120,**{k:True for k in ('full_decode','seam_decode','packet_chain','native_audit','original_sources_no_audio','fsynced')})
     result=dict(policy=pull.STITCH_POLICY,plan_sha256=task['plan_sha256'],outputs=[output],seams=[seam],repairs=[],left_out=[],error='')
     commands=[['runner.py']]+[['ffprobe']]*6+[['ffmpeg','-xerror','-err_detect','explode']]*3+[['ffmpeg','-xerror','-err_detect','explode','-ss','58']]+[['ffmpeg','-c:v','copy']]+[['ffprobe']]*3
-    receipt=dict(schema='stoarama.nas-stitch-native-receipt.v1',connection_id=13,account_id=47,kind=pull.STITCH_PROOF_KIND,source_plan_sha256=pull.STITCH_PROOF_SOURCE_SHA,plan_sha256=task['plan_sha256'],run=dict(id='00000000-0000-4000-8000-000000000001'),client_artifact_sha256='f'*64,client_version=pull.CLIENT_VERSION,result=result,audits=audits,measurements=[dict(argv=c,returncode=0,wall_s=1,cpu_s=1) for c in commands],build_wall_seconds=15,verified_at='2000-01-01T00:00:00Z')
+    receipt=dict(schema='stoarama.nas-stitch-native-receipt.v1',connection_id=13,account_id=47,kind=pull.STITCH_PROOF_KIND,source_plan_sha256=pull.STITCH_PROOF_SOURCE_SHA,plan_sha256=task['plan_sha256'],run=dict(id='00000000-0000-4000-8000-000000000001',client_boot_id='00000000-0000-4000-8000-000000000002',host=dict(connection_id=13,system='Linux',machine='x86_64',cpu_model='SYNTHETIC',cpu_count=1),started_at='2000-01-01T00:00:00Z',completed_at='2000-01-01T00:00:15Z'),client_artifact_sha256='f'*64,client_version=pull.CLIENT_VERSION,result=result,audits=audits,measurements=[dict(argv=c,returncode=0,wall_s=1,cpu_s=1) for c in commands],build_wall_seconds=15,verified_at='2000-01-01T00:00:15Z')
     return task,receipt
 
 
 class ProofTests(unittest.TestCase):
+    def test_candidate_or_wrong_executing_artifact_cannot_claim_proof(self):
+        stop=threading.Event()
+        with self.assertRaises(pull.StitchHold):pull.stitch_proof_client(SimpleNamespace(is_candidate=True),stop)
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'client.py';path.write_bytes(b'synthetic source')
+            cfg=SimpleNamespace(is_candidate=False,current_file=path)
+            with mock.patch.object(pull,'executing_release_sha256',return_value='0'*64):
+                with self.assertRaises(pull.StitchHold):pull.stitch_proof_client(cfg,stop)
+            sha=hashlib.sha256(path.read_bytes()).hexdigest()
+            with mock.patch.object(pull,'executing_release_sha256',return_value=sha):self.assertEqual(pull.stitch_proof_client(cfg,stop),sha)
+
+    def test_embedded_receipt_schema_matches_frozen_file(self):
+        raw=Path(__file__).with_name('stitch-proof').joinpath('native-receipt.schema.json').read_bytes()
+        self.assertEqual(raw,pull.STITCH_PROOF_SCHEMA_JSON.encode())
+        self.assertEqual(hashlib.sha256(raw).hexdigest(),pull.STITCH_PROOF_SCHEMA_SHA)
+
     def test_exact_pinned_source_replays_and_native_corruption_fails(self):
         source=Path(__file__).with_name('stoarama_pull.py');sha=hashlib.sha256(source.read_bytes()).hexdigest()
         core=verify.load_core(source,sha)
@@ -59,6 +75,12 @@ class ProofTests(unittest.TestCase):
             lambda r:r['measurements'][0].__setitem__('returncode',1),
             lambda r:r['result']['outputs'][0].__setitem__('media_seconds',119),
             lambda r:r.__setitem__('client_artifact_sha256','0'*64),
+            lambda r:r['result']['outputs'][0]['inputs'][0].__setitem__('repaired',True),
+            lambda r:r['result'].__setitem__('plan_sha256','0'*64),
+            lambda r:r['result']['outputs'][0].__setitem__('unknown',True),
+            lambda r:r['run']['host'].__setitem__('system','Darwin'),
+            lambda r:r['run']['host'].__setitem__('machine','arm64'),
+            lambda r:r['run'].__setitem__('started_at','2000-01-01T00:00:16Z'),
             lambda r:r.__setitem__('unknown',True)]:
             bad=copy.deepcopy(receipt);change(bad)
             with self.assertRaises((verify.ProofError,ValueError)):replay(bad)

@@ -4,6 +4,7 @@ import sys
 sys.dont_write_bytecode = True
 import argparse
 import ast
+import datetime
 from fractions import Fraction
 import hashlib
 import io
@@ -49,15 +50,15 @@ def read_bounded(path,limit,expected_sha=None):
     finally:os.close(fd)
 
 
-PURE_FUNCTIONS=frozenset(('cleanup_json_bytes','stitch_signature','stitch_packet_records','stitch_frame_records','stitch_source_records','stitch_output_records','stitch_proof_json','stitch_proof_check','stitch_proof_success','stitch_proof_unpack'))
-PURE_CONSTANTS=frozenset(('STITCH_POLICY','STITCH_REVISION','STITCH_CORPUS_SHA','STITCH_PROOF_SOURCE_SHA','STITCH_PROOF_KIND','STITCH_PROOF_AUDIT_NAMES','V85R_MANIFEST_SHA','V85R_TOOL_VERSION','V85R_TOOLS','CLEANUP_KEEP28_POLICY_SHA256'))
+PURE_FUNCTIONS=frozenset(('cleanup_json_bytes','stitch_signature','stitch_packet_records','stitch_frame_records','stitch_source_records','stitch_output_records','stitch_proof_json','stitch_proof_check','stitch_proof_success','stitch_proof_unpack','stitch_proof_validate'))
+PURE_CONSTANTS=frozenset(('STITCH_POLICY','STITCH_REVISION','STITCH_CORPUS_SHA','STITCH_PROOF_SOURCE_SHA','STITCH_PROOF_KIND','STITCH_PROOF_AUDIT_NAMES','STITCH_PROOF_SCHEMA_JSON','STITCH_PROOF_SCHEMA_SHA','V85R_MANIFEST_SHA','V85R_TOOL_VERSION','V85R_TOOLS','CLEANUP_KEEP28_POLICY_SHA256'))
 
 
 def load_core(client_source,expected_sha):
     # Do not import the NAS app: that would initialize its diagnostics/auth readers.
     # Only these reviewed pure declarations execute, without file/network/auth APIs.
     tree=ast.parse(read_bounded(client_source,8*1024*1024,expected_sha))
-    namespace={'json':json,'hashlib':hashlib,'Fraction':Fraction,'zlib':zlib,'StitchHold':ProofError}
+    namespace={'json':json,'hashlib':hashlib,'Fraction':Fraction,'zlib':zlib,'re':re,'datetime':datetime,'StitchHold':ProofError}
     declarations=[];found=set()
     for node in tree.body:
         if isinstance(node,ast.FunctionDef) and node.name in PURE_FUNCTIONS:
@@ -70,7 +71,7 @@ def load_core(client_source,expected_sha):
                     if target.id in namespace:raise ProofError('duplicate verifier constant')
                     namespace[target.id]=ast.literal_eval(node.value)
     if found!=PURE_FUNCTIONS or not PURE_CONSTANTS<=namespace.keys():raise ProofError('unsupported client verifier revision')
-    safe={k:__builtins__[k] if isinstance(__builtins__,dict) else getattr(__builtins__,k) for k in ('dict','list','set','len','str','int','float','bool','range','type','any','all','enumerate','zip','iter','next','max','min','abs','tuple','ValueError','KeyError','Exception')}
+    safe={k:__builtins__[k] if isinstance(__builtins__,dict) else getattr(__builtins__,k) for k in ('dict','list','set','len','str','int','float','bool','range','type','any','all','enumerate','zip','iter','next','max','min','abs','sorted','tuple','ValueError','KeyError','Exception')}
     namespace['__builtins__']=safe
     exec(compile(ast.Module(body=declarations,type_ignores=[]),'<pinned native inventory verifier>','exec'),namespace)
     return SimpleNamespace(**namespace)
@@ -100,6 +101,7 @@ def verify(core,task,body,client_sha):
     receipt=core.stitch_proof_unpack(body)
     if receipt['plan_sha256']!=task['plan_sha256'] or receipt['client_artifact_sha256']!=client_sha:raise ProofError('proof plan/pipeline mismatch')
     result=receipt['result'];output=result['outputs'][0]
+    if output['relative_path']!=task['plan']['output_folder']+'/proof.mp4':raise ProofError('output namespace differs')
     if output['readback_sha256']!=output['sha256'] or output['size_bytes']<=0:raise ProofError('output readback mismatch')
     if not all(output.get(k) is True for k in ('full_decode','seam_decode','packet_chain','native_audit','original_sources_no_audio','fsynced')):raise ProofError('incomplete output audit')
     provenance=output['provenance']
