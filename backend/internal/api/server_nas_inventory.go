@@ -330,7 +330,7 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 	var existingCompletedAt *time.Time
 	var activeGeneration, activeDatasetSchema string
 	var activeRootExclusions []byte
-	if err := tx.QueryRow(r.Context(), `SELECT id,inventory_scan_completed_at,inventory_in_progress_generation,inventory_in_progress_dataset_schema,inventory_in_progress_root_exclusions FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`, *principal.APIKeyID, principal.AccountID).Scan(&connectionID, &existingCompletedAt, &activeGeneration, &activeDatasetSchema, &activeRootExclusions); errors.Is(err, pgx.ErrNoRows) {
+	if err := tx.QueryRow(r.Context(), `SELECT id,inventory_scan_completed_at,inventory_in_progress_generation,inventory_in_progress_dataset_schema,inventory_in_progress_root_exclusions FROM connections WHERE api_key_id=$1 AND account_id=$2`+nasConnectionEvidenceLock, *principal.APIKeyID, principal.AccountID).Scan(&connectionID, &existingCompletedAt, &activeGeneration, &activeDatasetSchema, &activeRootExclusions); errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusForbidden, "no connection for this key")
 		return
 	} else if err != nil {
@@ -1016,7 +1016,7 @@ func (s *Server) handleAccountClipsReleaseBatch(w http.ResponseWriter, r *http.R
 	var connectionID int64
 	var mode, datasetSchema, inventoryGeneration string
 	var rootExclusions []byte
-	if err := tx.QueryRow(r.Context(), `SELECT id,inventory_mode,inventory_dataset_schema,inventory_root_exclusions,inventory_generation FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`, *principal.APIKeyID, principal.AccountID).Scan(&connectionID, &mode, &datasetSchema, &rootExclusions, &inventoryGeneration); errors.Is(err, pgx.ErrNoRows) {
+	if err := tx.QueryRow(r.Context(), `SELECT id,inventory_mode,inventory_dataset_schema,inventory_root_exclusions,inventory_generation FROM connections WHERE api_key_id=$1 AND account_id=$2`+nasConnectionEvidenceLock, *principal.APIKeyID, principal.AccountID).Scan(&connectionID, &mode, &datasetSchema, &rootExclusions, &inventoryGeneration); errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusForbidden, "no connection for this key")
 		return
 	} else if err != nil {
