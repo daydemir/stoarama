@@ -758,7 +758,16 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 		_, _ = lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, r2RetireAdvisoryLockKey)
 	}()
 	if h.NASBacked {
-		if err := checkR2RetireDeleteProofMode(opts.DeleteProofPath, opts.DeleteProofSHA256, h.Bucket, store.EndpointSHA256(), opts.ProviderUnconditionalHeadGuard); err != nil {
+		now, err := authority.CurrentUTC()
+		if err != nil {
+			return sum, err
+		}
+		expiry, err := r2RetireDeleteProofExpiry(opts.DeleteProofPath, opts.DeleteProofSHA256, h.Bucket, store.EndpointSHA256(), true, now)
+		if err != nil {
+			return sum, err
+		}
+		authority, err = authority.LimitDeadline(expiry)
+		if err != nil {
 			return sum, err
 		}
 		var has bool
@@ -924,7 +933,8 @@ func r2RetireUsedBudget(ctx context.Context, q r2RetireQuerier, used *int64) err
 // retired, retired_absent, already_done, ineligible (detail = reason). Any
 // error stops the run.
 func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string, string, error) {
-	if err := a.authority.Check(); err != nil {
+	authority := a.authority
+	if err := authority.Check(); err != nil {
 		return "", "", err
 	}
 	target := r2RetireTarget{a.digest, it.Bucket, a.store.EndpointSHA256(), r2RetireTargetKind(it.Kind), it.SourceID, it.RecordingID, it.StreamID, it.ObjectKey, it.RelativePath, it.StartAt.UTC(), it.EndAt.UTC(), it.SizeBytes, it.SHA256, it.ETag}
@@ -988,6 +998,9 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 		}
 		return "", "", err
 	}
+	if _, err := r2RetireRequireCatalogETag(ctx, tx, it); err != nil {
+		return "", "", err
+	}
 	cur, err := r2RetireLoadOne(ctx, tx, it.Kind, it.SourceID, a.scope, a.sets)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1018,6 +1031,16 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 	}
 	if choice != it.Choice {
 		return "ineligible", "pick_changed", nil
+	}
+	if reason == r2RetireNASReason {
+		expiry, err := r2RetireLockNASIdentity(ctx, tx, it, a.scope.ConnectionID)
+		if err != nil {
+			return "", "", err
+		}
+		authority, err = authority.LimitDeadline(expiry)
+		if err != nil {
+			return "", "", err
+		}
 	}
 	head, herr := a.store.Head(ctx, it.ObjectKey)
 	absent := false
@@ -1057,13 +1080,13 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 		if err := r2RetireRequireIndexes(ctx, tx); err != nil {
 			return "", "", err
 		}
-		if err := checkR2RetireDeleteProofMode(a.opts.DeleteProofPath, a.opts.DeleteProofSHA256, a.header.Bucket, a.store.EndpointSHA256(), true); err != nil {
+		if err := a.checkProviderProof(); err != nil {
 			return "", "", err
 		}
 		if err := a.checkWriterState(ctx, tx, it.ObjectKey); err != nil {
 			return "", "", err
 		}
-		if err := a.authority.Check(); err != nil {
+		if err := authority.Check(); err != nil {
 			return "", "", err
 		}
 		if err := a.ledger.resume(target); err != nil {
@@ -1074,7 +1097,7 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 			return "", "", r2RetireAnomalyf("unresolved prior intent for present object; reviewed recovery required, no automatic retransmission")
 		}
 	}
-	if err := a.authority.Check(); err != nil {
+	if err := authority.Check(); err != nil {
 		return "", "", err
 	}
 	if a.scope.Class.owner() {
@@ -1099,13 +1122,6 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 		}
 	}
 	if a.scope.NASBacked {
-		// Lock the actual matching inventory row through R2 deletion/commit.
-		// Inventory can no longer transition this proof to missing mid-delete.
-		if reason == r2RetireNASReason {
-			if err := r2RetireLockNASIdentity(ctx, tx, it, a.scope.ConnectionID); err != nil {
-				return "", "", err
-			}
-		}
 		latest, err := r2RetireLoadOne(ctx, tx, it.Kind, it.SourceID, a.scope, a.sets)
 		if err != nil {
 			return "", "", err
@@ -1149,13 +1165,13 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 		return "", "", r2RetireAnomalyf("%s: %v", event, err)
 	}
 	if !absent {
-		if err := a.headGuard(finishCtx, tx, it); err != nil {
+		if err := a.headGuard(finishCtx, tx, it, authority); err != nil {
 			return fail("head_guard_refused", err)
 		}
-		if err := a.authority.Check(); err != nil {
+		if err := authority.Check(); err != nil {
 			return fail("head_guard_refused", err)
 		}
-		if err := a.store.(r2RetireSingleDeleteStore).DeleteObjectOnce(finishCtx, it.ObjectKey, a.authority); err != nil {
+		if err := a.store.(r2RetireSingleDeleteStore).DeleteObjectOnce(finishCtx, it.ObjectKey, authority); err != nil {
 			return fail("delete_error", err)
 		}
 
@@ -1166,7 +1182,7 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 			return fail("delete_unconfirmed", err)
 		}
 	}
-	if err := a.authority.Check(); err != nil {
+	if err := authority.Check(); err != nil {
 		return fail("head_guard_refused", err)
 	}
 	if err := tx.Commit(finishCtx); err != nil {

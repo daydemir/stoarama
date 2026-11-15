@@ -97,6 +97,23 @@ func (a *Authority) BindRetirement(manifest string, created time.Time, age time.
 	return &b, b.Check()
 }
 
+// LimitDeadline returns an independent authority capped by another immutable
+// evidence deadline. A provider or per-object custody check can only shorten
+// authority; it cannot refresh the original proof or another object's lifetime.
+func (a *Authority) LimitDeadline(expiry time.Time) (*Authority, error) {
+	if err := a.Check(); err != nil {
+		return nil, err
+	}
+	if expiry.IsZero() {
+		return nil, errors.New("missing evidence expiry")
+	}
+	b := *a
+	if expiry.Before(b.provenance.ExpiresAt) {
+		b.provenance.ExpiresAt = expiry
+	}
+	return &b, b.Check()
+}
+
 // RequireWire is also checked in the shared SDK immediately before its one wire
 // attempt. A proof verified for inspection alone is not a retirement binding.
 func (a *Authority) RequireWire(bucket, endpoint string) error {

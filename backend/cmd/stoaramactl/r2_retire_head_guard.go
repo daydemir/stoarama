@@ -84,17 +84,42 @@ func r2RetireValidateGuardHead(h r2.ObjectHead, it r2RetireItem, catalogETag str
 	return nil
 }
 
+// Called only while the catalog row lock is held, before either present-object
+// deletion or absent-object reconciliation. Preflight ETags are not authority.
+func r2RetireRequireCatalogETag(ctx context.Context, q r2RetireQuerier, it r2RetireItem) (string, error) {
+	if it.Kind != "raw" {
+		return "", errors.New("catalog ETag requires RAW identity")
+	}
+	var etag string
+	if err := q.QueryRow(ctx, `SELECT etag FROM recording_clips WHERE id=$1`, it.SourceID).Scan(&etag); err != nil {
+		return "", err
+	}
+	if strings.Trim(etag, `"`) == "" || strings.Trim(etag, `"`) != strings.Trim(it.ETag, `"`) {
+		return "", errors.New("locked catalog ETag differs from manifest/intent")
+	}
+	return etag, nil
+}
+
+func (a *r2RetireApplier) checkProviderProof() error {
+	now, err := a.authority.CurrentUTC()
+	if err != nil {
+		return err
+	}
+	_, err = r2RetireDeleteProofExpiry(a.opts.DeleteProofPath, a.opts.DeleteProofSHA256, a.header.Bucket, a.store.EndpointSHA256(), true, now)
+	return err
+}
+
 // This runs AFTER the reservation and fsynced intent, immediately before the
 // single wire DELETE. HEAD and live vetoes are observations, not a provider
 // compare-and-delete: an ungated credential holder can still race.
-func (a *r2RetireApplier) headGuard(ctx context.Context, tx pgx.Tx, it r2RetireItem) error {
-	if err := a.authority.Check(); err != nil {
+func (a *r2RetireApplier) headGuard(ctx context.Context, tx pgx.Tx, it r2RetireItem, authority *stitchproof.Authority) error {
+	if err := authority.Check(); err != nil {
 		return err
 	}
 	if err := r2RetireDeliveryClosureUnchanged(ctx, a.store, a.opts.Delivery); err != nil {
 		return err
 	}
-	if err := checkR2RetireDeleteProofMode(a.opts.DeleteProofPath, a.opts.DeleteProofSHA256, a.header.Bucket, a.store.EndpointSHA256(), true); err != nil {
+	if err := a.checkProviderProof(); err != nil {
 		return err
 	}
 	if err := a.checkWriterState(ctx, tx, it.ObjectKey); err != nil {
@@ -105,15 +130,19 @@ func (a *r2RetireApplier) headGuard(ctx context.Context, tx pgx.Tx, it r2RetireI
 	if it.Kind != "raw" {
 		return errors.New("HEAD-guard mode requires a catalog ETag; collated catalog has none")
 	}
-	var etag string
-	if err := tx.QueryRow(ctx, `SELECT etag FROM recording_clips WHERE id=$1`, it.SourceID).Scan(&etag); err != nil {
+	etag, err := r2RetireRequireCatalogETag(ctx, tx, it)
+	if err != nil {
 		return err
 	}
 	head, err := a.store.Head(ctx, it.ObjectKey)
 	if err != nil {
 		return fmt.Errorf("final guarded HEAD: %w", err)
 	}
-	if err := r2RetireValidateGuardHead(head, it, etag, a.opts.MinObjectAge, time.Now()); err != nil {
+	now, err := a.authority.CurrentUTC()
+	if err != nil {
+		return err
+	}
+	if err := r2RetireValidateGuardHead(head, it, etag, a.opts.MinObjectAge, now); err != nil {
 		return err
 	}
 	if err := r2RetireRequireIndexes(ctx, tx); err != nil {
@@ -151,7 +180,7 @@ func (a *r2RetireApplier) headGuard(ctx context.Context, tx pgx.Tx, it r2RetireI
 		return err
 	}
 	// Expiry or evidence revocation while waiting for HEAD/DB must veto too.
-	if err := checkR2RetireDeleteProofMode(a.opts.DeleteProofPath, a.opts.DeleteProofSHA256, a.header.Bucket, a.store.EndpointSHA256(), true); err != nil {
+	if err := a.checkProviderProof(); err != nil {
 		return err
 	}
 	if err := a.checkWriterState(ctx, tx, it.ObjectKey); err != nil {
@@ -160,7 +189,7 @@ func (a *r2RetireApplier) headGuard(ctx context.Context, tx pgx.Tx, it r2RetireI
 	if err := r2RetireDeliveryClosureUnchanged(ctx, a.store, a.opts.Delivery); err != nil {
 		return err
 	}
-	return a.authority.Check()
+	return authority.Check()
 }
 
 // Raw catalog authority is enumerated by its primary key in bounded pages.

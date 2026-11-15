@@ -252,3 +252,32 @@ func TestR2StitchCrossFileIdentityBindings(t *testing.T) {
 		})
 	}
 }
+
+func TestR2StitchIndependentDeadlinesCannotRenewAuthority(t *testing.T) {
+	now := time.Now()
+	// Private clock fixtures only, never accepted proof artifacts or an exported
+	// test constructor. Model elapsed HEAD time while stitching itself stays fresh.
+	run := &Authority{utc: now.UTC(), observed: now, provenance: Provenance{OuterSHA: strings.Repeat("a", 64), ExpiresAt: now.Add(time.Hour)}}
+	for _, name := range []string{"provider", "object custody"} {
+		t.Run(name, func(t *testing.T) {
+			item, err := run.LimitDeadline(now.Add(10 * time.Second))
+			if err != nil {
+				t.Fatal(err)
+			}
+			extended, err := item.LimitDeadline(now.Add(2 * time.Hour))
+			if err != nil || !extended.provenance.ExpiresAt.Equal(item.provenance.ExpiresAt) {
+				t.Fatal("deadline was renewed", err)
+			}
+			item.observed = now.Add(-30 * time.Second)
+			if item.Check() == nil {
+				t.Fatal("expired independent evidence survived HEAD time")
+			}
+			if run.Check() != nil || !run.provenance.ExpiresAt.Equal(now.Add(time.Hour)) {
+				t.Fatal("one item's deadline changed the run")
+			}
+		})
+	}
+	if _, err := run.LimitDeadline(time.Time{}); err == nil {
+		t.Fatal("missing deadline accepted")
+	}
+}

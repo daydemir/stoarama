@@ -28,12 +28,13 @@ func TestR2RetireHeadGuardProofMode(t *testing.T) {
 	writeGuardProofs(t, &opts, h)
 	raw, _ := os.ReadFile(opts.DeleteProofPath)
 	check := func() error {
-		return checkR2RetireDeleteProofMode(opts.DeleteProofPath, opts.DeleteProofSHA256, h.Bucket, r2tSHA, true)
+		_, err := r2RetireDeleteProofExpiry(opts.DeleteProofPath, opts.DeleteProofSHA256, h.Bucket, r2tSHA, true, time.Now().UTC())
+		return err
 	}
 	if err := check(); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkR2RetireDeleteProof(opts.DeleteProofPath, opts.DeleteProofSHA256, h.Bucket, r2tSHA); err == nil {
+	if _, err := r2RetireDeleteProofExpiry(opts.DeleteProofPath, opts.DeleteProofSHA256, h.Bucket, r2tSHA, false, time.Now().UTC()); err == nil {
 		t.Fatal("unsupported proof authorized conditional mode")
 	}
 	for _, change := range []func(map[string]any){
@@ -109,5 +110,26 @@ func TestR2RetireHeadGuardExactIdentityAndAge(t *testing.T) {
 	good.SHA256Metadata = ""
 	if err := r2RetireValidateGuardHead(good, it, "e", age, now); err != nil {
 		t.Fatal("optional absent SHA metadata rejected", err)
+	}
+}
+
+func TestR2RetireProviderProofUsesAdvancingDatabaseUTC(t *testing.T) {
+	created := time.Date(2026, 11, 14, 0, 0, 0, 0, time.UTC)
+	raw := []byte(`{"bucket":"stoarama","endpoint_sha256":"` + r2tSHA + `","created_at":"` + created.Format(time.RFC3339Nano) + `","conditional_delete_unsupported":true,"wrong_etag_delete_succeeded":true,"wrong_etag_delete_confirmed_absent":true,"probe_key":"r2-retire-probes/test.bin"}`)
+	path := filepath.Join(t.TempDir(), "provider.json")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	check := func(now time.Time) (time.Time, error) {
+		return r2RetireDeleteProofExpiry(path, r2SHA(raw), "stoarama", r2tSHA, true, now)
+	}
+	expiry, err := check(created.Add(24*time.Hour - 10*time.Second))
+	if err != nil || !expiry.Equal(created.Add(24*time.Hour)) {
+		t.Fatal("wrong immutable provider deadline", expiry, err)
+	}
+	for _, now := range []time.Time{created.Add(24 * time.Hour), created.Add(24*time.Hour + 30*time.Second), created.Add(-time.Second), time.Time{}} {
+		if _, err := check(now); err == nil {
+			t.Fatal("expired/future/missing database time accepted", now)
+		}
 	}
 }

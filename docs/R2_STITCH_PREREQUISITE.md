@@ -67,8 +67,12 @@ No provider probe or production operation is run by proof verification.
 
 Manifest age is at most24h. Authoritative DB UTC, anchored before its clock query
 to monotonic elapsed time, bounds proof and manifest expiry immediately before
-every SDK wire delete. The single-attempt transport takes a private verified
-authority; missing, zero, inspection-only or expired authority sends no request.
+every SDK wire delete. The provider proof's immutable 24h expiry also caps the
+run. Kept-window objects carry the earlier verified-at/server-received custody
+expiry from their exact locked inventory row into a separate per-item authority;
+transaction start time cannot preserve stale custody during HEAD or network work.
+The single-attempt transport takes that private verified authority; missing,
+zero, inspection-only or expired authority sends no request.
 The real NAS artifact must pass the read-only command before an execution plan
 is proposed. A production run still needs its own fresh review and explicit
 controller window; the controller alone deploys code.
@@ -81,7 +85,8 @@ stop without rewriting the old bytes. Preserve them for separately reviewed
 recovery.
 
 An absent object requires an exact prior intent for the same manifest and full
-target identity, plus a current verified authorization. Resume appends a new
+target identity, plus a current verified authorization. The catalog ETag is
+compared under the row lock before either present deletion or absent reconciliation. Resume appends a new
 authorization and an explicit relationship to the original intent and its hash;
 it never rewrites or extends old proof expiry. `--record-already-absent` cannot
 waive these conditions. An unresolved intent for a still-present object stops

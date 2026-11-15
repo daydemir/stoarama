@@ -690,15 +690,15 @@ func r2RetireLoadOne(ctx context.Context, q r2RetireQuerier, kind string, id int
 const r2RetireRawExactSQL = `,
  EXISTS(SELECT 1 FROM nas_inventory_files n WHERE n.connection_id=$2 AND n.clip_id=c.id
    AND n.relative_path=c.display_path AND n.state='present' AND n.sha256=lower(c.sha256) AND n.size_bytes=c.size_bytes
-   AND n.verified_at BETWEEN now()-interval '24 hours' AND now()+interval '5 minutes'
-   AND n.server_received_at>=now()-interval '24 hours' AND n.sidecar_relative_path=c.display_path||'.stoarama.json' AND n.sidecar_size_bytes>0 AND n.sidecar_sha256 ~ '^[a-f0-9]{64}$'),
+   AND n.verified_at BETWEEN clock_timestamp()-interval '24 hours' AND clock_timestamp()+interval '5 minutes'
+   AND n.server_received_at>=clock_timestamp()-interval '24 hours' AND n.sidecar_relative_path=c.display_path||'.stoarama.json' AND n.sidecar_size_bytes>0 AND n.sidecar_sha256 ~ '^[a-f0-9]{64}$'),
  coalesce(c.display_path,'')
 `
 const r2RetireCollatedExactSQL = `,
  EXISTS(SELECT 1 FROM nas_inventory_files n WHERE n.connection_id=$2
    AND n.relative_path IN (o.nas_relative_path,'joined/'||o.nas_relative_path)
    AND n.state='present' AND n.sha256=lower(o.sha256) AND n.size_bytes=o.size_bytes
-   AND n.verified_at BETWEEN now()-interval '24 hours' AND now()+interval '5 minutes'
-   AND n.server_received_at>=now()-interval '24 hours'),
+   AND n.verified_at BETWEEN clock_timestamp()-interval '24 hours' AND clock_timestamp()+interval '5 minutes'
+   AND n.server_received_at>=clock_timestamp()-interval '24 hours'),
  coalesce(o.nas_relative_path,'')
 `

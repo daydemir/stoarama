@@ -10,7 +10,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
+	"github.com/daydemir/stoarama/backend/internal/secretbox"
 )
 
 func TestUniqueBatchStreamIDs(t *testing.T) {
@@ -686,5 +688,66 @@ func TestBatchSchedulePersistsPlazaHourlyNamingAndDaytimeWindow(t *testing.T) {
 		SELECT plaza_id FROM account_stream_plaza_ids WHERE account_id=$1 AND stream_id=$2
 	`, accountID, streamID).Scan(&mappedPlazaID); err != nil || mappedPlazaID != 1 {
 		t.Fatalf("mapped plaza id=%d err=%v", mappedPlazaID, err)
+	}
+}
+
+func TestBatchScheduleDryRunMatchesExistingManagedStaging(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+	ctx := context.Background()
+	s.cfg.RecSchedMinIntervalSec = 60
+	// Make the retired config-only preview succeed; only the existing-row
+	// resolver may decide availability. These dummy clients must never be used.
+	s.cfg.R2AccountID, s.cfg.R2AccessKeyID, s.cfg.R2SecretAccessKey, s.cfg.R2Bucket, s.cfg.R2Endpoint = "test", "test", "test", "test", "https://example.test"
+	s.r2, s.secrets = new(r2.Client), new(secretbox.Cipher)
+	userID, accountID := seedUserOrg(t, pool, "batch-staging@example.com", false)
+	var streamID, deliveryID, managedID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO streams(provider,external_id,name,slug,source_url,capture_type,source_family,execution_class,capture_family,expected_fps,local_timezone)
+ VALUES('test','staging','Staging','staging','https://example.com/live.m3u8','hls','video_manifest','video_live','continuous_video',30,'UTC') RETURNING id`).Scan(&streamID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO storage_destinations(account_id,name,provider,endpoint,region,bucket,access_key_id,secret_access_key_enc,status)
+ VALUES($1,'webdav','webdav','https://example.test','auto','test','test',decode('00','hex'),'verified') RETURNING id`, accountID).Scan(&deliveryID); err != nil {
+		t.Fatal(err)
+	}
+	request := batchScheduleRequest{StreamIDs: []int64{streamID}, NamingProfile: recordingnaming.ProfileStoaramaV1.String(), Mode: "sampled", CronExpr: "0 * * * *", ClipDurationSec: 60, Delivery: "managed", DeliveryStorageDestinationID: deliveryID}
+	post := func(dry bool) *httptest.ResponseRecorder {
+		t.Helper()
+		request.DryRun = dry
+		body, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := withPrincipal(httptest.NewRequest(http.MethodPost, "/batch", bytes.NewReader(body)), accountPrincipal{AccountID: accountID, UserID: userID, MemberRole: "owner"}, "")
+		rr := httptest.NewRecorder()
+		s.handleAccountRecordingsBatchSchedule(rr, req)
+		return rr
+	}
+	for _, state := range []string{"missing", "unverified", "verified"} {
+		if state == "unverified" {
+			if err := pool.QueryRow(ctx, `INSERT INTO storage_destinations(account_id,name,provider,endpoint,region,bucket,access_key_id,secret_access_key_enc,status,managed)
+ VALUES($1,'managed','r2_managed','https://example.test','auto','test','test',decode('00','hex'),'unverified',true) RETURNING id`, accountID).Scan(&managedID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if state == "verified" {
+			if _, err := pool.Exec(ctx, `UPDATE storage_destinations SET status='verified' WHERE id=$1`, managedID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		want := http.StatusServiceUnavailable
+		if state == "verified" {
+			want = http.StatusOK
+		}
+		for _, dry := range []bool{true, false} {
+			rr := post(dry)
+			if rr.Code != want {
+				t.Fatalf("%s dry=%t status=%d want=%d body=%s", state, dry, rr.Code, want, rr.Body.String())
+			}
+		}
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM storage_destinations WHERE account_id=$1`, accountID).Scan(&count); err != nil || count != 2 {
+		t.Fatal("staging preflight provisioned storage", count, err)
 	}
 }
