@@ -62,6 +62,13 @@ func activateFeedFence(t *testing.T, pool *pgxpool.Pool) {
 
 func clipQueryRows(t *testing.T, tx pgx.Tx, sql string, account, after int64, limit int) [][]any {
 	t.Helper()
+	if sql == accountClipsCursorSQL {
+		var err error
+		sql, err = accountClipsQuery(context.Background(), tx, account)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	rows, err := tx.Query(context.Background(), sql, account, after, limit)
 	if err != nil {
 		t.Fatal(err)
