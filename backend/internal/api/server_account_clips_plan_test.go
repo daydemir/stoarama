@@ -136,8 +136,8 @@ func TestAccountClipsCursorManyRecordingPreparedPlans(t *testing.T) {
 	// history on both sides of the cursor, and a genuinely empty final tail.
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,size_bytes,clip_start_at,clip_end_at)
   SELECT n,10+n%128,1000,
-   CASE WHEN n<=450000 AND n%4<>0 THEN $1::timestamptz ELSE $2::timestamptz END+make_interval(secs=>(n%259200)::int),
-   CASE WHEN n<=450000 AND n%4<>0 THEN $1::timestamptz ELSE $2::timestamptz END+make_interval(secs=>(n%259200)::int)+interval '1 minute'
+   CASE WHEN n<=450000 AND n%4<>0 THEN $1::timestamptz ELSE $2::timestamptz END+make_interval(secs=>n::int),
+   CASE WHEN n<=450000 AND n%4<>0 THEN $1::timestamptz ELSE $2::timestamptz END+make_interval(secs=>n::int)+interval '1 minute'
   FROM generate_series(1,500000) n`, window.Start, window.End.AddDate(0, 0, 1)); err != nil {
 		t.Fatal(err)
 	}
