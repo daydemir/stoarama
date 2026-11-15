@@ -394,3 +394,82 @@ existing indexes through the unchanged readiness function and fails closed on
 incompatible definitions. On small fresh databases it creates them in the
 migration transaction. Build readiness does not authorize any writer rewrite,
 fence override or R2 deletion.
+
+
+### Audited retirement of stopped joined writers
+
+`stoaramactl r2-retire cancel-joined-writers --batch-record-id 5 --out NEW_FILE`
+observes the complete joined batch snapshot and emits row digests, owner IDs and
+lifecycle states without exporting claim tokens, source plans or media. It is a
+dry run by default. Migration 0195 is required; this does not change the existing
+read-only `reconcile-writers` command.
+
+Apply requires the exact reviewed snapshot digest, a checksummed owner map,
+a fresh independent production-review reference, and the controller-pinned live
+backend commit. A new private evidence file is fsynced before any transition.
+Every leased owner must map exactly to a primary provider resource.
+The entire batch must retain complete ownership history: unattempted rows or
+first attempts with their owner still recorded. A reclaim, released claim or
+completed attempted row loses prior-owner identity and refuses cancellation;
+current claims cannot substitute for a complete old-owner inventory. Render proof
+requires the exact joined service suspended with work scope disabled. A deleted
+DO owner requires its preserved primary resource identity and original account
+UUID association, a fresh matching account read, and a fresh exact-resource 404.
+A 404 under an unbound account, a hostname guess, an expired lease or a missing
+provider name is not a stop proof. Worker lanes whose IDs differ from the parent
+machine name remain unsupported until their exact association is proved; do not
+invent a resource receipt or relax the matcher.
+
+The owner map is a JSON array of typed `render_suspended` or `do_destroyed`
+entries with owner/resource IDs. DO entries additionally name an absolute local
+historical resource file and its reviewed SHA256. That JSON contains
+`account_uuid` and the original provider `droplet` identity; the account
+association must come from preserved primary evidence in the same authorization
+context. All source evidence and credentials remain on Jelly. Unknown fields,
+missing mappings, digest drift, unsupported proof kinds and provider errors stop
+the command. Provider reads never stop, restart or destroy machines.
+
+Only after exact-head council/green CI and a separate fresh production review,
+run in the cleanup controller's explicit global-idle/master-OFF window:
+
+```sh
+stoaramactl r2-retire cancel-joined-writers --batch-record-id 5 \
+  --owner-map /absolute/reviewed-owners.json --expected-owner-map-sha256 OWNER_MAP_SHA \
+  --expected-snapshot-sha256 REVIEWED_SNAPSHOT_SHA \
+  --expected-live-commit CONTROLLER_PINNED_BACKEND_SHA \
+  --reviewer-reference 'exact independent production review and window record' \
+  --out /absolute/new-apply-evidence.jsonl --apply
+```
+
+The command independently confirms configured/runtime master OFF, the exact
+live backend with no concurrent deployment, and no enabled cleanup work or
+outstanding cleanup authority. Provider HTTP reads finish before the database
+transaction; the controller must hold that whole window. SQL takes the existing
+writer/freeze locks, rechecks the exact complete snapshot, requires 15 minutes
+without writes/heartbeats and no live leases, and requires a fresh exact owner
+proof roster. Unsupported pending stream-days remain blockers.
+
+Audit INSERT admission independently locks and validates the fence, full snapshot,
+owner roster and activity. SQL derives every exact permitted before/after row;
+callers cannot supply a different authorization. A deferred constraint checks
+the entire expected audit roster, actual committed rows, admission and parent.
+Direct audit inserts cannot commit a partial or forged cancellation. Retired
+admission retains its exact audited after-image, including when a caller runs
+the deferred constraint early or attempts to reopen it in a later transaction.
+
+The transaction appends immutable run and per-item before/after digests, pauses
+admission, terminalizes every pending/expired hour and sealed/nonlive-publishing
+artifact, checks all children, then terminalizes the parent through its existing
+guard. No claim is manufactured, no attempt count changes, no lease is renewed,
+no trigger is disabled, and the drain function is unchanged. New child terminal
+transitions require exact same-transaction audit authorization with unchanged
+identity/result fields. Every stored after-digest is checked against its actual
+row before return. Any error rolls everything back. A lost commit response must
+be investigated using the durable run UUID; never delete audit rows or retry by
+manufacturing new authority.
+
+This narrow command does not reconcile capture, Durham, NAS stitch task 1, or
+any other writer category. It does not delete R2/NAS media, change the immutable
+fence, release recovery/delivery/reference holds, or prove global writer drain.
+The ordinary diagnostic still reports every remaining blocker honestly. No
+production cancellation has been performed by this implementation.

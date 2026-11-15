@@ -172,8 +172,10 @@ func TestJoinedFrozenBatchLegacyRetryFence(t *testing.T) {
 	if _, err := pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts DISABLE TRIGGER recording_joined_artifact_update_guard`); err != nil {
 		t.Fatal(err)
 	}
+	// Preserve the earlier committed claim even in this legacy-state fixture.
+	// Frozen exclusion must cover both unattempted468 and attempted470.
 	_, resetLiveErr := pool.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_state='sealed',
-		publication_attempt_count=0,publication_token=NULL,publication_claimed_by=NULL,
+		publication_token=NULL,publication_claimed_by=NULL,
 		publication_lease_expires_at=NULL,publication_heartbeat_at=NULL WHERE id=470`)
 	_, enableArtifactErr = pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts ENABLE TRIGGER recording_joined_artifact_update_guard`)
 	if resetLiveErr != nil {
@@ -225,7 +227,7 @@ func TestJoinedFrozenBatchLegacyRetryFence(t *testing.T) {
 	var legacyUnchanged, legacyAttempts int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE publication_state='sealed'),
 		COALESCE(sum(publication_attempt_count),0) FROM recording_joined_artifacts WHERE id=ANY($1::bigint[])`,
-		[]int64{468, 470}).Scan(&legacyUnchanged, &legacyAttempts); err != nil || legacyUnchanged != 2 || legacyAttempts != 0 {
+		[]int64{468, 470}).Scan(&legacyUnchanged, &legacyAttempts); err != nil || legacyUnchanged != 2 || legacyAttempts != 1 {
 		t.Fatalf("legacy publication artifacts mutated sealed=%d attempts=%d err=%v", legacyUnchanged, legacyAttempts, err)
 	}
 

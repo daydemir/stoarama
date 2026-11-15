@@ -36,6 +36,7 @@ func requireJoinedTestReplicationRole(t *testing.T, pool *pgxpool.Pool) {
 }
 
 var joinedMigrationNames = []string{
+	"0195_r2_joined_writer_retirement.sql",
 	"0194_r2_delivery_presence_indexes.sql",
 	"0193_nas_r2_copy.sql",
 	"0192_delivery_only_r2_apply.sql",
@@ -81,8 +82,23 @@ var joinedMigrationNames = []string{
 	"0179_nas_v85r_stitch.sql",
 }
 
+type joinedFixtureMigrationPhase uint8
+
+const (
+	joinedFixtureAllMigrations joinedFixtureMigrationPhase = iota
+	joinedFixtureBeforeWriterRetirement
+)
+
 func testJoinedServerBeforeMigration(t *testing.T) (*Server, *pgxpool.Pool, func(), func()) {
 	t.Helper()
+	return testJoinedServerBeforeMigrationPhase(t, joinedFixtureAllMigrations)
+}
+
+func testJoinedServerBeforeMigrationPhase(t *testing.T, phase joinedFixtureMigrationPhase) (*Server, *pgxpool.Pool, func(), func()) {
+	t.Helper()
+	if phase != joinedFixtureAllMigrations && phase != joinedFixtureBeforeWriterRetirement {
+		t.Fatal("unknown joined fixture migration phase")
+	}
 	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
 	if databaseURL == "" {
 		t.Skip("set STOARAMA_TEST_DATABASE_URL to run joined freeze regressions")
@@ -132,6 +148,9 @@ func testJoinedServerBeforeMigration(t *testing.T) (*Server, *pgxpool.Pool, func
 	applyMigration := func() {
 		t.Helper()
 		for _, migration := range joinedMigrationNames {
+			if phase == joinedFixtureBeforeWriterRetirement && migration == "0195_r2_joined_writer_retirement.sql" {
+				continue
+			}
 			if _, err := pool.Exec(ctx, `DELETE FROM schema_migrations WHERE version=$1`, migration); err != nil {
 				t.Fatal(err)
 			}
@@ -198,9 +217,21 @@ func newJoinedHistoricalTier1FixtureWithoutCheckpoint(t *testing.T, email string
 }
 
 func newJoinedHistoricalTier1FixtureWithCheckpoint(t *testing.T, email string, seedCheckpoint bool) joinedHistoricalTier1Fixture {
+	return newJoinedHistoricalTier1FixtureWithSetup(t, email, seedCheckpoint, nil)
+}
+
+func newJoinedHistoricalTier1FixtureWithSetup(t *testing.T, email string, seedCheckpoint bool, setup func(*pgxpool.Pool)) joinedHistoricalTier1Fixture {
 	t.Helper()
-	s, pool, applyMigration, cleanup := testJoinedServerBeforeMigration(t)
+	return newJoinedHistoricalTier1FixtureAtMigrationPhase(t, email, seedCheckpoint, setup, joinedFixtureAllMigrations)
+}
+
+func newJoinedHistoricalTier1FixtureAtMigrationPhase(t *testing.T, email string, seedCheckpoint bool, setup func(*pgxpool.Pool), phase joinedFixtureMigrationPhase) joinedHistoricalTier1Fixture {
+	t.Helper()
+	s, pool, applyMigration, cleanup := testJoinedServerBeforeMigrationPhase(t, phase)
 	applyMigration()
+	if setup != nil {
+		setup(pool)
+	}
 	ctx := context.Background()
 	cipher, err := secretbox.NewFromBase64Key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {
