@@ -98,6 +98,28 @@ def readback():
         policy=copy.deepcopy(POLICY), tools=copy.deepcopy(TOOLS), native_registration_sha256=SHA)
 
 
+def server_validation():
+    original=readback()
+    value={name:copy.deepcopy(original[name]) for name in (
+        "native_run_id","native_bundle_sha256","native_plan_sha256","producer_profile_sha256",
+        "reader_profile_sha256","profile_pair_sha256","reader_execution","outputs","policy","tools")}
+    value.update(schema="stoarama.nas-stitch-validation.v2",validated_at=UTC,readback_receipt_sha256=SHA,
+        reader_heartbeat_received_at=UTC,reader_release_stable=True,reader_release_candidate=False,
+        reader_inventory_mismatch_count=0,registered_locally_only=True,grants_retirement=False,
+        server_execution=dict(repository="daydemir/stoarama",commit_sha="a"*40,
+            service_id="srv-d6usqn94tr6s73d94cd0",instance_id="SYNTHETIC-NOT-A-DEPLOYMENT"),
+        scope=dict(stream_id=17208,recording_id=444,source_task_id=1,
+            source_plan_sha256=CORE["STITCH_PROOF_SOURCE_SHA"],proof_plan_sha256=SHA,clip_ids=[373218,373262]))
+    return value
+
+
+def current_context():
+    value=server_validation();value.pop("validated_at")
+    value.update(schema="stoarama.nas-stitch-current-context.v1",checked_at=UTC,status_received_at=UTC,
+        readback_verified_at=UTC,readback_id=ID,source_scope_approved_until="2026-11-15T01:00:00Z",integrity="clear")
+    return value
+
+
 def profiles():
     def file(name, sha, size): return dict(file="synthetic/"+name, sha256=sha, size_bytes=size)
     package = file("manifest.json", CORE["V85R_MANIFEST_SHA"], 5416)
@@ -183,6 +205,34 @@ class ReadbackContractTests(unittest.TestCase):
                 lambda x: x.update(id="not-a-uuid"), lambda x: x.update(outputs=[])):
             value = readback(); mutate(value)
             with self.assertRaises(Hold): self.validate(value, DEFINITION.READBACK)
+
+    def test_server_inventory_counter_has_no_version_alias_or_untyped_zero(self):
+        schema=json.loads(SCHEMA)
+        for builder,definition,name in ((server_validation,DEFINITION.VALIDATION,"validation"),
+                (current_context,DEFINITION.CURRENT,"current_context")):
+            self.assertIn("reader_inventory_mismatch_count",schema["$defs"][name]["required"])
+            self.assertNotIn("reader_version_mismatch_count",schema["$defs"][name]["properties"])
+            self.validate(builder(),definition)
+            for count in (False,True,"0",0.0,1,-1,None):
+                value=builder();value["reader_inventory_mismatch_count"]=count
+                with self.subTest(name=name,count=count),self.assertRaises(Hold):self.validate(value,definition)
+            for replace in (False,True):
+                value=builder();value["reader_version_mismatch_count"]=0
+                if replace:value.pop("reader_inventory_mismatch_count")
+                with self.assertRaises(Hold):self.validate(value,definition)
+
+    def test_inventory_zero_never_substitutes_for_version_release_boot_or_integrity_guards(self):
+        for builder,definition in ((server_validation,DEFINITION.VALIDATION),(current_context,DEFINITION.CURRENT)):
+            mutations=(lambda value:value["reader_execution"].update(client_version="development"),
+                lambda value:value["reader_execution"].update(client_boot_id="unknown"),
+                lambda value:value.update(reader_release_stable=False),
+                lambda value:value.update(reader_release_candidate=True))
+            for mutate in mutations:
+                value=builder();mutate(value)
+                self.assertEqual(value["reader_inventory_mismatch_count"],0)
+                with self.assertRaises(Hold):self.validate(value,definition)
+        value=current_context();value["integrity"]="refused"
+        with self.assertRaises(Hold):self.validate(value,DEFINITION.CURRENT)
 
     def test_definition_is_typed_and_schema_errors_do_not_become_if_else_admission(self):
         with self.assertRaises(Hold): self.validate(readback(), "readback")

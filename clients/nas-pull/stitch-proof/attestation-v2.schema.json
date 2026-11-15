@@ -1029,7 +1029,7 @@
         "reader_heartbeat_received_at",
         "reader_release_stable",
         "reader_release_candidate",
-        "reader_version_mismatch_count",
+        "reader_inventory_mismatch_count",
         "server_execution",
         "scope",
         "outputs",
@@ -1078,7 +1078,7 @@
         "reader_release_candidate": {
           "const": false
         },
-        "reader_version_mismatch_count": {
+        "reader_inventory_mismatch_count": {
           "const": 0
         },
         "server_execution": {
@@ -1544,7 +1544,7 @@
         "reader_heartbeat_received_at",
         "reader_release_stable",
         "reader_release_candidate",
-        "reader_version_mismatch_count",
+        "reader_inventory_mismatch_count",
         "server_execution",
         "scope",
         "outputs",
@@ -1595,7 +1595,7 @@
         "reader_release_candidate": {
           "const": false
         },
-        "reader_version_mismatch_count": {
+        "reader_inventory_mismatch_count": {
           "const": 0
         },
         "server_execution": {
