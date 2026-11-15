@@ -29,6 +29,10 @@ func TestNASCleanupBulkDurabilityClientServer(t *testing.T) {
 	testNASCleanupPipelineClientServer(t, true, nasCleanupBulkDurabilityClientVersion)
 }
 
+func TestNASCleanupItemTruthClientServer(t *testing.T) {
+	testNASCleanupPipelineClientServer(t, true, nasCleanupItemTruthClientVersion)
+}
+
 func testNASCleanupPipelineClientServer(t *testing.T, grouped bool, groupVersion string) {
 	for _, pipeline := range []bool{false, true} {
 		t.Run(fmt.Sprint(pipeline), func(t *testing.T) {

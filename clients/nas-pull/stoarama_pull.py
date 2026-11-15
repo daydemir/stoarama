@@ -17230,6 +17230,7 @@ class CleanupStage(str, Enum):
     PERMIT_CHECK = "permit_check"
     INTENT_JOURNAL = "intent_journal"
     UNLINK = "unlink"
+    DIRECTORY_SYNC = "directory_sync"
     LEDGER_RESULT = "ledger_result"
     RESULT_JOURNAL = "result_journal"
     RECEIPT = "receipt"
@@ -18060,7 +18061,8 @@ CLEANUP_V2_WORKERS = 16        # concurrent dry-run file workers
 CLEANUP_GROUP_VERSION = "cleanup-batch-v6.1"
 CLEANUP_V6_VERSIONS: frozenset[str] = frozenset((CLEANUP_GROUP_VERSION, "r2-copy-v1"))
 CLEANUP_BULK_VERSION = "cleanup-batch-v7"
-CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, "r2-copy-v2", "v85r-nas-proof-v1", "v85r-nas-proof-v2"))
+CLEANUP_TRUTH_VERSION = "cleanup-batch-v8"
+CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, "r2-copy-v2", "v85r-nas-proof-v1", "v85r-nas-proof-v2"))
 CLEANUP_GROUP_VERSIONS: frozenset[str] = CLEANUP_V6_VERSIONS | CLEANUP_BULK_VERSIONS
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
@@ -18642,7 +18644,8 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
             cleanup_timed(shared, "ledger_result_ms", cleanup_ledger_append_many, cfg,
                 [dict(ledger, event="result", at=utc_now_precise(), outcome=receipt["outcome"],
                       media_unlinked=current.media_unlinked, sidecar_unlinked=current.sidecar_unlinked,
-                      error=receipt["error"])
+                      error=receipt["error"], **{key: receipt[key] for key in
+                          ("unlink_attempted", "refusal_protocol", "refusal_reason") if key in receipt})
                  for ledger, receipt, (current, _) in zip(ledgers, receipts, opened)])
             for receipt, timing in zip(receipts, timings):
                 receipt.update(execution_elapsed_ms=round((time.monotonic() - started) * 1000),
@@ -18651,7 +18654,8 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
             cleanup_timed(shared, "result_journal_ms", cleanup_journal_group, inventory,
                 [(task, owner, "result", receipt) for (task, owner), receipt in zip(owned, receipts)])
 
-        directories = {}
+        failure = None
+        failure_stage = stage
         try:
             for task, (current, proof), timing in zip(tasks, opened, timings):
                 stage = CleanupStage.GUARD
@@ -18660,26 +18664,48 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
                     raise CleanupPermitRefused("local_guard", refusal)
                 stage = CleanupStage.UNLINK
                 cleanup_timed(timing, "delete_ms", current.delete_exact, proof, sync_directory=False)
-                info = os.fstat(current.fds[-1])
-                directories[(info.st_dev, info.st_ino)] = current.fds[-1]
         except Exception as exc:
-            if any(current.unlink_attempted or current.media_unlinked or current.sidecar_unlinked for current, _ in opened):
-                raise
-            # Only this live, owned worker can prove no syscall was attempted.
-            # A crash or a failed result checkpoint still replays as uncertain.
-            CLEANUP_STATUS.execution_failure(stage, exc, len(tasks), aborted=False)
-            for receipt in receipts:
-                receipt.update(unlink_attempted=False, refusal_protocol=CLEANUP_REFUSAL_PROTOCOL,
-                    refusal_reason=exc.reason if isinstance(exc, CleanupPermitRefused) else "pre_unlink_failure",
-                    error=str(exc)[:500])
-            journal_results()
-            return
-        # Every parent inode is synced before ANY successful durable result.
-        for fd in directories.values():
-            cleanup_timed(shared, "directory_sync_ms", os.fsync, fd)
-        for receipt in receipts:
-            receipt.update(outcome="deleted", unlink_attempted=True)
+            failure, failure_stage = exc, stage
+        # Include a failing delete_exact that unlinked media but did not return.
+        # The registered key identifies the still-open parent inode. A failed
+        # sync affects every attempted member of that parent, not other parents.
+        directories = {current.directory_key: current.fds[-1] for current, _ in opened
+                       if current.media_unlinked or current.sidecar_unlinked}
+        sync_errors = {}
+        for key, fd in directories.items():
+            stage = CleanupStage.DIRECTORY_SYNC
+            try:
+                cleanup_timed(shared, "directory_sync_ms", os.fsync, fd)
+            except Exception as exc:
+                sync_errors[key] = exc
+                if failure is None:
+                    failure, failure_stage = exc, stage
+        attempted = False
+        for task, receipt, (current, _) in zip(tasks, receipts, opened):
+            touched = current.unlink_attempted or current.media_unlinked or current.sidecar_unlinked
+            attempted = attempted or touched
+            receipt["unlink_attempted"] = touched
+            if not touched:
+                # Only the live owner can certify this; crash replay cannot.
+                receipt.update(refusal_protocol=CLEANUP_REFUSAL_PROTOCOL,
+                    refusal_reason=failure.reason if isinstance(failure, CleanupPermitRefused) else "pre_unlink_failure",
+                    error=str(failure)[:500])
+            elif current.directory_key in sync_errors:
+                receipt["error"] = "parent directory sync failed: " + str(sync_errors[current.directory_key])[:450]
+            elif current.media_unlinked:
+                receipt["outcome"] = ("media_deleted_sidecar_failed" if
+                    task["item"]["sidecar_required"] and not current.sidecar_unlinked else "deleted")
+                receipt["error"] = "" if receipt["outcome"] == "deleted" else str(failure)[:500]
+            else:
+                receipt["error"] = str(failure)[:500]
+        # Parent durability precedes ledger fsync and the atomic owned result
+        # transaction. Any checkpoint failure still leaves conservative intents.
         journal_results()
+        if failure is not None:
+            stage = failure_stage
+            if attempted:
+                raise failure
+            CLEANUP_STATUS.execution_failure(stage, failure, len(tasks), aborted=False)
 
     fenced = False
     error = None
@@ -25222,6 +25248,21 @@ def meminfo_bytes(text):
     return values.get("MemTotal", 0), values.get("MemAvailable", 0)
 
 
+def process_memory_bytes(text):
+    """Client-only RSS, not child processes or a census of the NAS services."""
+    fields = {"VmRSS": "client_rss_bytes", "VmHWM": "client_peak_rss_bytes"}
+    result = {}
+    for line in (text or "").splitlines():
+        name, _, value = line.partition(":")
+        parts = value.split()
+        if (name in fields and len(parts) == 2 and len(parts[0]) <= 16
+                and parts[0].isascii() and parts[0].isdigit() and parts[1] == "kB"):
+            size = int(parts[0]) * 1024
+            if size <= (1 << 63) - 1:
+                result[fields[name]] = size
+    return result
+
+
 def cpu_model(text):
     for line in (text or "").splitlines():
         name, _, value = line.partition(":")
@@ -25288,6 +25329,7 @@ class HostFacts:
         total, available = meminfo_bytes(_read_text("/proc/meminfo"))
         facts["mem_total_bytes"] = total
         facts["mem_available_bytes"] = available
+        facts.update(process_memory_bytes(_read_text("/proc/self/status", 8192)))
         try:
             facts["load1"] = round(max(0.0, os.getloadavg()[0]), 2)
         except (AttributeError, OSError):

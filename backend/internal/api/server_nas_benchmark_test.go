@@ -34,6 +34,8 @@ func TestValidateNASHostFacts(t *testing.T) {
 		"long kernel":   func(h *nasHostFacts) { h.KernelRelease = strings.Repeat("k", 300) },
 		"cpu count":     func(h *nasHostFacts) { h.CPUCount = -1 },
 		"memory":        func(h *nasHostFacts) { h.MemTotalBytes = -1 },
+		"client rss":    func(h *nasHostFacts) { h.ClientRSSBytes = &negative },
+		"client peak":   func(h *nasHostFacts) { h.ClientPeakRSSBytes = &negative },
 		"cgroup cpu":    func(h *nasHostFacts) { h.CgroupCPULimit = &zero },
 		"cgroup mem":    func(h *nasHostFacts) { h.CgroupMemoryLimitBytes = &negative },
 	} {

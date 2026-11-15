@@ -310,10 +310,14 @@ class CleanupBulkTests(unittest.TestCase):
             with self.assertRaises(pull.CleanupPermitRefused): self.run_group(tasks)
         self.assertFalse((self.cfg.output_dir/tasks[0]['item']['relative_path']).exists())
         self.assertTrue((self.cfg.output_dir/tasks[1]['item']['relative_path']).exists())
-        self.assertEqual(self.phases(), ['intent'] * 3)
+        self.assertEqual(self.phases(), ['result'] * 3)
+        rows = [json.loads(row[2]) for row in pull.cleanup_journal(self.inventory)]
+        self.assertEqual(rows[0]['outcome'], 'deleted')
+        self.assertTrue(rows[0]['unlink_attempted'])
+        self.assertTrue(all(row['unlink_attempted'] is False and row['refusal_protocol'] == 1 for row in rows[1:]))
         self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 1)
 
-    def test_directory_sync_failure_retains_all_uncertain_intents(self):
+    def test_directory_sync_failure_persists_uncertain_parent_results(self):
         tasks = self.group(3)
         sync = pull.os.fsync
         def fail(fd):
@@ -323,9 +327,11 @@ class CleanupBulkTests(unittest.TestCase):
             return sync(fd)
         with mock.patch.object(pull.os, 'fsync', side_effect=fail):
             with self.assertRaises(OSError): self.run_group(tasks)
-        self.assertEqual(self.phases(), ['intent'] * 3)
+        self.assertEqual(self.phases(), ['result'] * 3)
         self.assertTrue(all(not (self.cfg.output_dir/t['item']['relative_path']).exists() for t in tasks))
         self.assertTrue(all(json.loads(r[2])['outcome'] == 'unverified' for r in pull.cleanup_journal(self.inventory)))
+        self.assertTrue(all(json.loads(r[2])['unlink_attempted'] is True for r in pull.cleanup_journal(self.inventory)))
+        self.assertTrue(all('refusal_protocol' not in json.loads(r[2]) for r in pull.cleanup_journal(self.inventory)))
 
     def test_sigkill_at_each_durability_boundary_replays_without_permit_or_unlink(self):
         for cut in ('intent_ledger', 'intent', 'permit', 'media', 'sidecar', 'directory', 'result_ledger', 'result'):
@@ -421,7 +427,13 @@ class CleanupBulkTests(unittest.TestCase):
             finally:
                 case.doCleanups()
 
-    def test_last_of_multiple_directory_syncs_fails_without_any_success_checkpoint(self):
+    def test_first_directory_sync_failure_does_not_hide_other_parent_truth(self):
+        self.multiple_parent_sync_failure(1)
+
+    def test_last_directory_sync_failure_does_not_hide_other_parent_truth(self):
+        self.multiple_parent_sync_failure(2)
+
+    def multiple_parent_sync_failure(self, failure):
         tasks = self.group(4)
         # Two separate parent inodes, with exact fresh proofs for both.
         for task in tasks[2:]:
@@ -441,12 +453,17 @@ class CleanupBulkTests(unittest.TestCase):
             import stat
             if stat.S_ISDIR(os.fstat(fd).st_mode) and not (self.cfg.output_dir/tasks[0]['item']['relative_path']).exists():
                 synced.append((os.fstat(fd).st_dev,os.fstat(fd).st_ino))
-                if len(synced)==2: raise OSError('last directory sync failed')
+                if len(synced)==failure: raise OSError('directory sync failed')
             return sync(fd)
         with mock.patch.object(pull.os,'fsync',side_effect=fail_last):
             with self.assertRaises(OSError):self.run_group(tasks)
         self.assertEqual(len(set(synced)),2)
-        self.assertEqual(self.phases(),['intent']*4)
+        self.assertEqual(self.phases(),['result']*4)
+        rows = [json.loads(row[2]) for row in pull.cleanup_journal(self.inventory)]
+        for n, row in enumerate(rows):
+            self.assertEqual(row['outcome'], 'unverified' if n//2+1 == failure else 'deleted')
+            self.assertIs(row['unlink_attempted'], True)
+            self.assertNotIn('refusal_protocol', row)
 
     def test_partial_ledger_append_never_certifies_a_deleted_result(self):
         for event in ('intent','result'):
@@ -477,3 +494,7 @@ class LegacyNASProofBulkTests(CleanupBulkTests):
 
 class NASProofBulkTests(CleanupBulkTests):
     version = "v85r-nas-proof-v2"
+
+
+class ItemTruthBulkTests(CleanupBulkTests):
+    version = "cleanup-batch-v8"

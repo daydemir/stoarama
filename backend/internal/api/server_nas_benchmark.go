@@ -61,6 +61,8 @@ type nasHostFacts struct {
 	CgroupCPULimit         *float64          `json:"cgroup_cpu_limit"`
 	MemTotalBytes          int64             `json:"mem_total_bytes"`
 	MemAvailableBytes      int64             `json:"mem_available_bytes"`
+	ClientRSSBytes         *int64            `json:"client_rss_bytes,omitempty"`
+	ClientPeakRSSBytes     *int64            `json:"client_peak_rss_bytes,omitempty"`
 	CgroupMemoryLimitBytes *int64            `json:"cgroup_memory_limit_bytes"`
 	StateExecAllowed       *bool             `json:"state_exec_allowed"`
 	Load1                  *float64          `json:"load1"`
@@ -90,6 +92,11 @@ func validateNASHostFacts(h *nasHostFacts) error {
 	}
 	if h.MemTotalBytes < 0 || h.MemAvailableBytes < 0 {
 		return errors.New("invalid NAS host memory")
+	}
+	for _, rss := range []*int64{h.ClientRSSBytes, h.ClientPeakRSSBytes} {
+		if rss != nil && *rss < 0 {
+			return errors.New("invalid NAS client memory")
+		}
 	}
 	if h.CgroupCPULimit != nil && (*h.CgroupCPULimit <= 0 || *h.CgroupCPULimit > 4096) {
 		return errors.New("invalid NAS host cgroup cpu limit")
