@@ -1,0 +1,58 @@
+{
+  "account.json": {
+    "sha256": "0c469a810249e625901401986db8f727bf6ebfdc726afdb139fe0c7d4dc50d46",
+    "size_bytes": 566
+  },
+  "capture-lifetimes.json": {
+    "sha256": "019a0af447af0e6e843242e27c1dfc7e7db74ac9df84708c724511e5a694e2b0",
+    "size_bytes": 5230
+  },
+  "invoice-2026-05.json": {
+    "sha256": "ecafd00c00934c42936b4f39735772ebc684e979fc0cd4a70de07ef37b6dedc7",
+    "size_bytes": 1983
+  },
+  "invoice-2026-06.json": {
+    "sha256": "fb2dcb09994cb3ba13c09b81b50491599fb7ebb4e80a859f95ba44b4d106838d",
+    "size_bytes": 16873
+  },
+  "invoice-2026-07.json": {
+    "sha256": "bcdff83dec047278e4d1a8141ebc618696e697069bda157916f1466f60cd6977",
+    "size_bytes": 20217
+  },
+  "invoice-2026-08.json": {
+    "sha256": "bbd2eadc19df9c503d85755156386067a706987ac9a2cc6bd65cb0ca7745fe5e",
+    "size_bytes": 70242
+  },
+  "invoice-2026-09.json": {
+    "sha256": "f392ab44d5d3f1485d6ce69fc0bcf8c087424a4f519fb704a0bb7c9b97e76ff3",
+    "size_bytes": 72060
+  },
+  "invoice-2026-10.json": {
+    "sha256": "5855f0c5f2952192dce0be587661d7bcaddcd59c8cc20f60201aa04b92fa0cbe",
+    "size_bytes": 36390
+  },
+  "invoice-2026-11.json": {
+    "sha256": "636450a256e06a906db32da8d666146d0289867519348e343eaf7fc80be0cedf",
+    "size_bytes": 13893
+  },
+  "invoice-full-2026-02.json": {
+    "sha256": "3f87ffc03464a65781b49e4f28d1eacf30832ad7054b0c6d0f60aba4cac31fe2",
+    "size_bytes": 580
+  },
+  "invoice-full-2026-03.json": {
+    "sha256": "84f86b02c463836fef1153a25e4b71d6daf68db866b4edf093c4cdf8cfde2d4e",
+    "size_bytes": 4209
+  },
+  "invoice-full-2026-04.json": {
+    "sha256": "48e093ed9ce31fca1a02b83c5aa8394e05a563b3328dff6348715799fdefd25b",
+    "size_bytes": 12010
+  },
+  "invoice-full-2026-08.json": {
+    "sha256": "a26d0c9b205c802905735534acc90f94362f63fc25417eb7f0d76d34f05fe22e",
+    "size_bytes": 93605
+  },
+  "invoice-full-2026-09.json": {
+    "sha256": "324fbc5f31d941feaf76924175365402701b6097b990e09bd71762653528b61a",
+    "size_bytes": 87808
+  }
+}
