@@ -130,11 +130,25 @@ NAS SQL against this shape. This grants **no R2 deletion authority**. Evidence
 freshness for any later retirement must be re-established within that tool's
 24-hour window; a months-old copy result is not fresh proof.
 
-Control HTTP has a 2s total deadline; each range GET has a 10s total deadline.
-A small isolated Python stdlib transport process makes DNS, TLS, trickling
-headers/body and reads killable. Its pipe output is bounded to 16 MiB plus a
-4 KiB metadata header, it has no media paths or inherited credential environment,
-and it is always killed/reaped before releasing path ownership. The parent
+Control HTTP has a 2s total request deadline. Each of the four workers owns one
+isolated, reusable stdlib control process, initialized before its first request.
+Imports and verified TLS context initialization are paid once per healthy
+process, outside the request deadline. Startup accounting has a separate 2s
+expiry; OS process creation itself cannot be preempted before Popen returns.
+On an overrun or cancellation, ownership is assigned before killing/reaping,
+and no API request is sent. Do not claim a fixed maximum first-call wall time.
+
+Each control request retains a killable 2s deadline covering IPC, DNS, TLS,
+backend work and complete JSON response/parsing. Requests are at most 32 KiB,
+responses at most 1 MiB, and frames at most 4 KiB. A failed transport is killed
+and reaped before a later ordinary poll can create another; operations are
+never automatically replayed. If the OS cannot reap after 2s, that worker
+retains ownership and update/drain gating until the same process exits.
+
+Each range GET keeps its separate, one-shot 10s deadline, including interpreter
+startup. Its pipe output is bounded to 16 MiB plus a 4 KiB metadata header.
+Both transports have no media paths or inherited credential environment.
+The parent
 checks cancellation while polling I/O, hashing and writing; a range GET
 may also have one bounded control request in flight for its checkpoint.
 Transient lease tokens and URLs are scoped to active operations, never accumulated
@@ -142,6 +156,49 @@ in the shared diagnostic secret registry. Policy, OFF and maintenance state are 
 4s apart during work. The worker drains before self-update or inventory close.
 Only its private temporary links are removed after successful no-overwrite
 commit; existing source media, final files and conflicts are never deleted.
+
+### Control timing log contract (r2-copy-v3)
+
+The fixed INFO topic is R2 copy lease-control, admitted by the existing
+diagnostic ring and uploaded through its existing client-log endpoint. Values
+are integers only. No URLs, paths, headers, request/response bodies or
+credentials are logged. Outer log records supply boot ID, sequence, timestamp
+and client label; consumers must retain those and report coverage/relay lag.
+
+Phase1 is startup: worker (0–3), generation (positive), startup_ready_ms,
+total_ms, status=-1. Startup-ready time is measured once per process, from
+before Popen to validated READY after imports/TLS initialization. It is -1
+if READY was not observed. Startup total_ms includes failure cleanup.
+
+Phase2 is one control request:
+
+| Field | Meaning |
+| --- | --- |
+| worker, generation, request | Worker index, owned process generation, monotonically increasing per-worker request number |
+| operation | 1 lease, 2 checkpoint, 3 range, 4 inventory publication, 5 result |
+| startup_ready_ms | Cached measurement for this generation; repeated so READY eviction does not erase it |
+| request_sent_ms | Child elapsed until HTTP request headers/body were handed to its socket, including DNS/connect/TLS |
+| sent_to_first_byte_ms | From that send completion to the first HTTP response application byte, before complete headers |
+| total_ms | Parent elapsed from before IPC write through JSON completion or failure, excluding subsequent reaping |
+| status | Parsed HTTP status, retained even if a later body phase fails |
+
+Unobserved timing/status values are -1, never fabricated zeros. Genuine
+sub-millisecond values can round to zero. The child reports sent, first-byte
+and status progress before the complete body so a later timeout retains those
+observations. Sent-to-first-byte combines network return and backend time; it
+does not identify HEAD, auth, fence or lock time individually. Parent and child
+timings start at different IPC stages; do not subtract them into exact server
+phase durations.
+
+Sanitized examples:
+
+    R2 copy lease-control phase=1 worker=0 generation=1 startup_ready_ms=740 total_ms=740 status=-1
+    R2 copy lease-control phase=2 worker=0 generation=1 request=1 operation=1 startup_ready_ms=740 request_sent_ms=12 sent_to_first_byte_ms=84 total_ms=99 status=200
+    R2 copy lease-control phase=2 worker=0 generation=1 request=2 operation=2 startup_ready_ms=740 request_sent_ms=10 sent_to_first_byte_ms=-1 total_ms=2001 status=-1
+
+The existing generic hold lines remain. A separate controller-owned, pinned v3
+consumer must parse this schema; the active earlier measurement helper is not
+modified. A missing success metric alone does not measure in-flight downloads.
 
 ## Rate and capacity (2026-11-14 inputs)
 
@@ -187,7 +244,7 @@ C=6.465899440735 TB conservative raw copy-or-verify ceiling, and R=2 TB floor:
   without another media copy. Keep-all exclusions and the owner's stitching
   condition remain with the retirement delegate; no copy scope expands here.
 
-## Controller release procedure
+## Initial copy-v2 controller release procedure
 
 1. Merge the reviewed exact head on current main with `[skip render]`; retain
    v7 group durability and the controller's execution-poll fix. All exact bulk
@@ -217,6 +274,45 @@ C=6.465899440735 TB conservative raw copy-or-verify ceiling, and R=2 TB floor:
    download and verification rates plus space/cleanup availability. A separate
    reviewed retirement flow must reprove fresh custody before any R2 deletion.
    This copy change has no R2 deletion capability.
+
+## Copy-v3 upgrade (controller only)
+
+The exact r2-copy-v3 label supports bulk/grouped cleanup, execution-only polling,
+dry_run_limit2, v8 per-item truth and the retained v2 proof capability. The shared
+proof-capability predicate admits exactly v85r-nas-proof-v2, r2-copy-v3 and
+cleanup-batch-v8, only with selector1/connection13; default selector0 is unchanged.
+This is eligibility, never artifact/profile acceptance or proof/deletion
+authority. V3 is not a legacy-v6 client. Unknown/prefix labels are refused.
+
+The native proof implementation and same-producer drift checks stay unchanged.
+Legacy v1 verification remains strictly v2-only: its single client SHA cannot
+represent a different current reader. Cross-version preserved-output renewal
+requires the proof owner's new explicit readback protocol/handler/verifier and
+versioned schemas, plus gates-owner finite exact original-producer/current-reader
+profiles. Do not widen the old SQL, relabel new bytes5009, refresh native run
+times or weaken24h/5min/DB expiry. V3 publication is blocked until that renewal
+integration and consumer acceptance land on the final combined source/artifact.
+
+1. Require the reviewed exact head, green CI and full artifact/source binding.
+   Deploy the backend containing the exact v3 allowlist at a natural cleanup
+   boundary and verify it LIVE before v3 can run.
+2. Immutable5009 proof-v2 must have been published/promoted and verified stable.
+   Its separately authorized proof window must finish and be runtime OFF
+   before switching to v3. Never overwrite or relabel that artifact.
+3. Build/stage/promote only the distinct immutable r2-copy-v3 artifact using the
+   supported release mechanism and freshly verified pointers. Preserve v7/v8
+   group durability/polling and proof+copy+cleanup union. Proof stays OFF without
+   separate approval; no new producer/reader profile is implied by the label.
+4. Keep the 305 already committed rows untouched: no reimport/retry, expiry
+   extension or new cohort is part of this upgrade. Preserve resource/floor
+   checks and the original operator-approved expiry/window.
+5. Bind a separate pinned v3 numeric consumer/profile to the committed timing
+   schema/tests above. Preserve outer boot/seq/label/time and coverage limits;
+   do not edit an active earlier sampler or turn unknown fields into zeros.
+6. Measure the next real run. No startup or server phase is historically
+   established by the refused request-log probe. HEAD under1192 stays unchanged
+   in this release; sent/first-byte/total timing guides any subsequent reviewed
+   root fix. No shared timeout, grant or integrity check is relaxed.
 
 ## Collated follow-up after #483
 

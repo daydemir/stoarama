@@ -182,6 +182,10 @@ class CleanupTruthTests(unittest.TestCase):
                     case.doCleanups()
 
 
+class R2CopyControlTruthTests(CleanupTruthTests):
+    version = "r2-copy-v3"
+
+
 class ClientMemoryTests(unittest.TestCase):
     def test_numeric_rss_and_peak_only(self):
         self.assertEqual(pull.process_memory_bytes('Name: private\nVmRSS:\t123 kB\nVmHWM: 456 kB\nVmSwap: 789 kB\n'),
