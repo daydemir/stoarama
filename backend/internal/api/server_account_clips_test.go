@@ -33,7 +33,8 @@ func TestAccountClipsCursorSQLShape(t *testing.T) {
 		"c.capture_lease_token",
 		"c.capture_sequence",
 		"ORDER BY c.id ASC",
-		"LIMIT $3",
+		"LIMIT (SELECT page_size FROM page_request)",
+		"SELECT $3::bigint AS page_size",
 	} {
 		if !strings.Contains(accountClipsCursorSQL, want) {
 			t.Fatalf("account clips cursor SQL missing %q", want)
