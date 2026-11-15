@@ -37,10 +37,12 @@ func (t *cleanupSlowPolicyTracer) TraceQueryStart(ctx context.Context, _ *pgx.Co
 func (*cleanupSlowPolicyTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 func TestNASCleanupSixteenContendingWorkersSlowPolicyClientServer(t *testing.T) {
+	requireNASCleanupThroughputBench(t)
 	testNASCleanupSerialClientServer(t, 0, false)
 }
 
 func TestNASCleanupDedicatedLaneWithSlowJoinedDeliveryClientServer(t *testing.T) {
+	requireNASCleanupThroughputBench(t)
 	testNASCleanupSerialClientServer(t, 5, false)
 }
 

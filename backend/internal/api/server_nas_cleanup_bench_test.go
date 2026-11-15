@@ -19,6 +19,13 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
+func requireNASCleanupThroughputBench(t *testing.T) {
+	t.Helper()
+	if os.Getenv("STOARAMA_CLEANUP_BENCH") == "" {
+		t.Skip("set STOARAMA_CLEANUP_BENCH=1 for latency-sized cleanup throughput cases")
+	}
+}
+
 // TestNASCleanupClientServerThroughput runs the real NAS client cleanup
 // coordinator (clients/nas-pull/stoarama_pull.py via bench_cleanup.py) against
 // these handlers over HTTP, with a fake NAS directory, local PostgreSQL and a

@@ -177,6 +177,13 @@ Python uses `unittest`; there is no pytest/conftest database fixture. Keep CI's
 Postgres service container and explicit URL unchanged. Scratch databases default
 to UTC to match CI.
 
+Cleanup pipeline tests keep every correctness/overlap assertion in the default
+run with small files and short simulated delays. Set the existing
+STOARAMA_CLEANUP_BENCH=1 on the supported test command to restore the original
+latency-sized pipeline fixtures and run the two serial throughput scenarios.
+Real drain/deadline recovery tests remain mandatory and retain their original
+timing. Opted-in throughput cases retain every assertion.
+
 All worktrees share one cluster at `<user-temp>/stoarama-shared-pg-<uid>/data`,
 listening only on `127.0.0.1:55432`, with a private Unix socket. On macOS user-temp
 comes from `getconf DARWIN_USER_TEMP_DIR`; elsewhere it uses `$TMPDIR` or the

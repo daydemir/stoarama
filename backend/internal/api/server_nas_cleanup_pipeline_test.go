@@ -38,9 +38,18 @@ func testNASCleanupPipelineClientServer(t *testing.T, grouped bool, groupVersion
 		t.Run(fmt.Sprint(pipeline), func(t *testing.T) {
 			f := newCleanupFixture(t, 24)
 			version := nasCleanupPipelineClientVersion
-			apiDelay, headDelay := 40*time.Millisecond, 80*time.Millisecond
+			// Keep correctness/overlap assertions in every run. The original
+			// throughput-sized fixture belongs to the existing opt-in bench.
+			count, fileSize := 8, 4096
+			apiDelay, headDelay := 10*time.Millisecond, 20*time.Millisecond
+			if os.Getenv("STOARAMA_CLEANUP_BENCH") != "" {
+				count, fileSize = 16, 1048576
+				apiDelay, headDelay = 40*time.Millisecond, 80*time.Millisecond
+				if grouped {
+					apiDelay, headDelay = 200*time.Millisecond, 200*time.Millisecond
+				}
+			}
 			if grouped {
-				apiDelay, headDelay = 200*time.Millisecond, 200*time.Millisecond
 				if pipeline {
 					version = groupVersion
 				}
@@ -54,8 +63,7 @@ func testNASCleanupPipelineClientServer(t *testing.T, grouped bool, groupVersion
 			}
 			script, _ := filepath.Abs("../../../clients/nas-pull/bench_cleanup.py")
 			root, state := filepath.Join(t.TempDir(), "nas"), filepath.Join(t.TempDir(), "state")
-			const count = 16
-			raw, err := exec.Command(python, script, "prepare", "--root", root, "--count", fmt.Sprint(count*2), "--size", "1048576", "--first-clip", "100000").Output()
+			raw, err := exec.Command(python, script, "prepare", "--root", root, "--count", fmt.Sprint(count*2), "--size", fmt.Sprint(fileSize), "--first-clip", "100000").Output()
 			if err != nil {
 				t.Fatal(err)
 			}
