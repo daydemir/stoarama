@@ -282,12 +282,17 @@ the media fence. Every member uses the same request-start clock and existing
 15-second permit age limit, including the sidecar syscall.
 
 V7 durably appends all ledger intents, then commits conservative attempt markers
-before the first unlink. It syncs each distinct pinned directory inode after
-all unlinks and before any durable success result. Ledger results and SQLite
-results are then grouped separately. A crash, expired permit, partial write or
-failed directory sync leaves unresolved members uncertain; replay requests no
-new permits and performs no unlinks. Predecessor releases keep their existing
-serial permits and durability ordering.
+before requesting permits. This keeps filesystem sync latency outside the permit
+clock. Each marker retains the original observation bytes for reconciliation.
+Replay clears an unissued marker only after the server positively acknowledges
+the exact attempt; issued authority remains uncertain. Conflicts and lost replies
+preserve the marker. Replay requests no new permits and performs no unlinks.
+
+After unlinks, every distinct pinned directory inode is synced before any durable
+success result. Ledger results and SQLite results are grouped separately. Only
+the live owned worker can certify a refusal before any unlink was attempted;
+crashes, possible attempts and failed directory syncs remain uncertain.
+Predecessor releases keep their existing serial permits and durability ordering.
 
 Real disposable-file/FULL-WAL measurements reduce a steady eight-file group in
 one folder from 45 fsyncs / 21 SQLite commits to 10 fsyncs / 7 commits. With
