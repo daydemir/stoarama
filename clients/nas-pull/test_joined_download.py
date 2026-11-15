@@ -1603,6 +1603,10 @@ class JoinedDownloadTests(unittest.TestCase):
             original_wait, original_acquire = runtime.wait_joined_work_credit, fence.acquire_cleanup
 
             def wait_credit(timeout):
+                # The first priority boundary is deliberately unfenced. Keep
+                # this regression at the later dependency hash checkpoint.
+                if fence.writers == 0:
+                    return True
                 waiting.set()
                 return original_wait(timeout)
 
@@ -1652,6 +1656,8 @@ class JoinedDownloadTests(unittest.TestCase):
                     self.assertTrue(draining.wait(1))
                     threads[2].start()
                     self.assertTrue(executed.wait(2), "raw -> joined -> execution scheduling stalled")
+                    threads[0].join(2)
+                    self.assertFalse(threads[0].is_alive(), "joined download did not finish after cleanup")
                 finally:
                     stop.set()
                     for thread in threads:
