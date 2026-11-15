@@ -336,6 +336,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             path = cfg.output_dir / clip["relative_path"]
             path.parent.mkdir()
             path.write_bytes(b"abc")
+            pull.write_stitch_sidecar(path, clip)
             inventory = pull.Inventory(cfg)
             inventory.record_verified(clip)
             calls = []

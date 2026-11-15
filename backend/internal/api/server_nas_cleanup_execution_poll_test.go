@@ -7,9 +7,13 @@ import (
 )
 
 func TestNASCleanupExecutionPollingDoesNotQueueDryWork(t *testing.T) {
+	for _, v := range []string{nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion} {
+		t.Run(v, func(t *testing.T) { testTestNASCleanupExecutionPollingDoesNotQueueDryWork(t, v) })
+	}
+}
+func testTestNASCleanupExecutionPollingDoesNotQueueDryWork(t *testing.T, version string) {
 	f := newCleanupFixture(t, 12)
 	f.admit("dry-supply", syntheticFiles(100, 12, 10))
-	version := nasCleanupBulkDurabilityClientVersion
 	lease := func(only bool, request string) (int, []cleanupTask) {
 		w := cleanupCall(t, f.s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{
 			"client_version": version, "protocol": 2, "reconciliation_protocol": 1, "limit": 8,
@@ -40,10 +44,14 @@ func TestNASCleanupExecutionPollingDoesNotQueueDryWork(t *testing.T) {
 }
 
 func TestNASCleanupDryLimitDoesNotShrinkExecutionGroup(t *testing.T) {
+	for _, v := range []string{nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion} {
+		t.Run(v, func(t *testing.T) { testTestNASCleanupDryLimitDoesNotShrinkExecutionGroup(t, v) })
+	}
+}
+func testTestNASCleanupDryLimitDoesNotShrinkExecutionGroup(t *testing.T, version string) {
 	f := newCleanupFixture(t, 12)
 	id, sha, _ := f.admit("execute", syntheticFiles(100, 8, 10))
 	f.dryRun()
-	version := nasCleanupBulkDurabilityClientVersion
 	if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, version); err != nil {
 		t.Fatal(err)
 	}

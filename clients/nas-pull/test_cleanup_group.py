@@ -109,6 +109,16 @@ class CleanupGroupTests(unittest.TestCase):
                                          task_limit=len(tasks))
 
     def test_v7_polls_execution_while_dry_work_is_pending_without_queuing_more(self):
+        for version in sorted(pull.CLEANUP_BULK_VERSIONS):
+            with self.subTest(version=version):
+                case = type(self)("test_v7_polls_execution_while_dry_work_is_pending_without_queuing_more")
+                case.setUp()
+                try:
+                    case._test_v7_polls_execution_while_dry_work_is_pending_without_queuing_more(version)
+                finally:
+                    case.doCleanups()
+
+    def _test_v7_polls_execution_while_dry_work_is_pending_without_queuing_more(self, version):
         dry = dict(self.task, item_id=100)
         execution = self.group(1)[0]
         entered, release = threading.Event(), threading.Event()
@@ -126,7 +136,7 @@ class CleanupGroupTests(unittest.TestCase):
         def dry_worker(*args, **kwargs):
             entered.set()
             self.assertTrue(release.wait(5), 'empty lease stopped execution polling until dry-run drain')
-        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_BULK_VERSION), \
+        with mock.patch.object(pull, 'CLIENT_VERSION', version), \
              mock.patch.object(pull, 'cleanup_lease_v2', side_effect=lease), \
              mock.patch.object(pull, 'cleanup_process_task', side_effect=dry_worker), \
              mock.patch.object(pull, 'cleanup_process_group', side_effect=lambda *a, **kw: executed.append(a[3])), \
@@ -140,11 +150,21 @@ class CleanupGroupTests(unittest.TestCase):
         self.assertEqual(executed, [[execution]])
 
     def test_v7_lease_bounds_dry_work_and_rejects_wrong_role(self):
+        for version in sorted(pull.CLEANUP_BULK_VERSIONS):
+            with self.subTest(version=version):
+                case = type(self)("test_v7_lease_bounds_dry_work_and_rejects_wrong_role")
+                case.setUp()
+                try:
+                    case._test_v7_lease_bounds_dry_work_and_rejects_wrong_role(version)
+                finally:
+                    case.doCleanups()
+
+    def _test_v7_lease_bounds_dry_work_and_rejects_wrong_role(self, version):
         bodies = []
         def api(cfg, path, body):
             bodies.append(body)
             return dict(tasks=[dict(self.task)])
-        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_BULK_VERSION), \
+        with mock.patch.object(pull, 'CLIENT_VERSION', version), \
              mock.patch.object(pull, 'cleanup_api_retry', side_effect=api):
             pull.cleanup_lease_v2(self.cfg, 1, 1, 100)
             self.assertEqual(bodies[-1]['dry_run_limit'], 1)
