@@ -4017,7 +4017,9 @@ class NASBenchmarkTests(unittest.TestCase):
     def test_host_facts_match_server_fields_and_probe_exec(self):
         with tempfile.TemporaryDirectory() as tmp:
             facts = pull.HostFacts(Path(tmp))()
-            self.assertEqual(set(facts), self.SERVER_HOST_FIELDS)
+            optional = {"client_rss_bytes", "client_peak_rss_bytes"}
+            self.assertTrue(self.SERVER_HOST_FIELDS <= set(facts))
+            self.assertTrue(set(facts) <= self.SERVER_HOST_FIELDS | optional)
             self.assertTrue(facts["state_exec_allowed"])
             self.assertGreaterEqual(facts["cpu_count"], 1)
             self.assertEqual(list((Path(tmp) / "tools").iterdir()), [])
