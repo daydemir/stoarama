@@ -169,6 +169,24 @@ func TestR2StitchExecutableSubstitutionFailsBeforeReplay(t *testing.T) {
 	}
 }
 
+func TestR2StitchDevelopmentClientFailsBeforeReplay(t *testing.T) {
+	verifier, err := os.ReadFile("../../../clients/nas-pull/verify_stitch_proof.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := os.ReadFile("../../../clients/nas-pull/stoarama_pull.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// All other front-end identities/bounds match. An unstamped development
+	// source cannot substitute for the exact reviewed executing release.
+	plan, bundle := []byte("{}"), []byte("synthetic native bytes")
+	_, err = replay(context.Background(), verifier, client, plan, bundle, digest(plan), digest(bundle))
+	if err == nil || err.Error() != "native replay input identity differs" {
+		t.Fatalf("development source reached replay: %v", err)
+	}
+}
+
 func TestR2StitchFrozenProducerContracts(t *testing.T) {
 	for file, want := range map[string]string{
 		"attestation.schema.json":    "03d9a5fa930b67249036a6b522dcffa59f6bba9744f79abc0747f85d9ee63abc",
@@ -200,7 +218,7 @@ func TestR2StitchCrossFileIdentityBindings(t *testing.T) {
 		sha := strings.Repeat("a", 64)
 		p := Payload{
 			Scope:    PayloadScope{ProofPlanSHA256: sha},
-			Pipeline: Pipeline{ClientVersion: "v85r-nas-proof-v1"},
+			Pipeline: Pipeline{ClientVersion: "v85r-nas-proof-v2"},
 			Run:      Run{ID: "79dc929e-087f-4fbf-9317-8e0e0994d132", ClientBootID: "bc24648c-f613-421c-8989-6d43c245417e", Host: RunHost{ConnectionID: 13, System: "Linux", Machine: "x86_64", CpuModel: "test-only", CpuCount: 4}, StartedAt: "2026-11-15T00:00:00Z", CompletedAt: "2026-11-15T00:01:00Z", MediaSeconds: 120, BuildWallSeconds: 60},
 			Inputs:   []Input{{373218, "input/a.mp4", sha, 10}, {373262, "input/b.mp4", sha, 20}},
 			Outputs:  []Output{{"joined/test.mp4", sha, 30, []int64{373218, 373262}, sha}},

@@ -20,9 +20,9 @@ import (
 
 const (
 	VerifierSHA   = "81ff91e5accd93d32ff475024c10281177684b583e121a6c5d0c1f1938d49532"
-	ClientSHA     = "06425b3a518ae327cf322b7ef19d8c35917737e14a78182b9d8671b8f3dfc411"
-	clientHead    = "4e433a0f9203b579f8f7e55f2b3e25557367d3e4"
-	clientMerge   = "2ea3ef181cb5d07ba57a809993ce4c9104a6326e"
+	ClientSHA     = "500920969dfca2d4009544b5f8fc0ab7ca4cbdcf74bc3cd7aff202f7e0c436ba"
+	clientHead    = "2b3dfa06a88475878238a7a8ec5a2b82465a2ac4"
+	clientMerge   = "37d14dc83555ce710078be10b26bdd3ca18d44b0"
 	sourcePlanSHA = "0dfa6b172f33bd55e409729ecd517d492cdee03427b028ac226788e530a72726"
 	MaxAge        = 24 * time.Hour
 	futureSkew    = 5 * time.Minute
@@ -232,9 +232,9 @@ func Verify(ctx context.Context, filename, expectedSHA string, databaseUTC, obse
 
 func pins(p Payload) error {
 	policy := Policy{"v85r", "v85r-rebuilt-1", "060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811", "5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b", "337c606985e930abf1df459cbbda0c674f13bd9d92e11013131e2b2348e78a06"}
-	pipeline := Pipeline{"daydemir/stoarama", "a474f0d52f8558a8033813d1d158ca8567786bdd", clientHead, clientMerge, "v85r-nas-proof-v1", ClientSHA}
+	pipeline := Pipeline{"daydemir/stoarama", "d0f9b22df761584e0fb8a0762fadc17e90c3316a", clientHead, clientMerge, "v85r-nas-proof-v2", ClientSHA}
 	tools := PayloadTools{FFmpeg{"N-126826-gc0e8b139fd-20260924", "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b", 174165384}, FFprobe{"N-126826-gc0e8b139fd-20260924", "9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c", 173923656}}
-	if p.Schema != "stoarama.nas-stitch-payload.v1" || p.ConnectionID != 13 || p.AccountID != 47 || p.Policy != policy || p.Pipeline != pipeline || p.Tools != tools || p.Scope.StreamID != 17208 || p.Scope.RecordingID != 444 || p.Scope.SourceTaskID != 1 || p.Scope.SourcePlanSHA256 != sourcePlanSHA || !digestPattern.MatchString(p.Scope.ProofPlanSHA256) || !reflect.DeepEqual(p.Scope.ClipIDs, []int64{373218, 373262}) || p.Run.Host.ConnectionID != 13 || p.Run.Host.System != "Linux" || p.Run.Host.Machine != "x86_64" || len(p.Inputs) != 2 || len(p.Outputs) != 1 || p.Verification.CurrentPolicy != "passed" || p.Verification.NativeInventoryReplay != "passed" || p.Verification.ServerBinding != "passed" || !digestPattern.MatchString(p.Verification.ResultSHA256) || p.Evidence.Verifier.SHA256 != VerifierSHA || p.Evidence.Verifier.SizeBytes != 18817 || p.Evidence.ClientArtifact.SHA256 != ClientSHA || p.Evidence.ClientArtifact.SizeBytes != 4822304 {
+	if p.Schema != "stoarama.nas-stitch-payload.v1" || p.ConnectionID != 13 || p.AccountID != 47 || p.Policy != policy || p.Pipeline != pipeline || p.Tools != tools || p.Scope.StreamID != 17208 || p.Scope.RecordingID != 444 || p.Scope.SourceTaskID != 1 || p.Scope.SourcePlanSHA256 != sourcePlanSHA || !digestPattern.MatchString(p.Scope.ProofPlanSHA256) || !reflect.DeepEqual(p.Scope.ClipIDs, []int64{373218, 373262}) || p.Run.Host.ConnectionID != 13 || p.Run.Host.System != "Linux" || p.Run.Host.Machine != "x86_64" || len(p.Inputs) != 2 || len(p.Outputs) != 1 || p.Verification.CurrentPolicy != "passed" || p.Verification.NativeInventoryReplay != "passed" || p.Verification.ServerBinding != "passed" || !digestPattern.MatchString(p.Verification.ResultSHA256) || p.Evidence.Verifier.SHA256 != VerifierSHA || p.Evidence.Verifier.SizeBytes != 18817 || p.Evidence.ClientArtifact.SHA256 != ClientSHA || p.Evidence.ClientArtifact.SizeBytes != 4828896 {
 		return errors.New("NAS stitching proof scope, policy, pipeline or executable pin differs")
 	}
 	for _, id := range []string{p.Run.ID, p.Run.ClientBootID} {
