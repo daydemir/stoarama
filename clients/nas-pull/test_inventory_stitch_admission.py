@@ -188,7 +188,7 @@ class ProofInventoryAdmissionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.sys, "platform", "linux"), \
                 mock.patch("platform.machine", return_value="x86_64"), \
                 mock.patch.object(pull.time, "monotonic", return_value=stop.deadline + .01), \
-                mock.patch.object(pull, "request_json") as request:
+                mock.patch.object(pull, "stitch_proof_request") as request:
             with self.assertRaises(pull.BenchmarkError):
                 pull.stitch_v85r_tools(SimpleNamespace(state_dir=Path(tmp)), stop.deadline, stop)
         request.assert_not_called()
@@ -203,7 +203,7 @@ class ProofInventoryAdmissionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.sys, "platform", "linux"), \
                 mock.patch("platform.machine", return_value="x86_64"), \
                 mock.patch.object(pull.time, "monotonic", side_effect=lambda:clock[0]), \
-                mock.patch.object(pull, "request_json", side_effect=capability), \
+                mock.patch.object(pull, "stitch_proof_request", side_effect=capability), \
                 mock.patch.object(pull.urllib.request, "urlopen") as download:
             with self.assertRaises(pull.BenchmarkError):
                 pull.stitch_v85r_tools(SimpleNamespace(state_dir=Path(tmp)), stop.deadline, stop)

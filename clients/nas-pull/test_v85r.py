@@ -57,7 +57,7 @@ class V85rTests(unittest.TestCase):
                         cfg = SimpleNamespace(inventory_file=filename, api_key='fixture',
                                               api_base='http://127.0.0.1:%d/api/v1' % server.server_port)
                         with self.assertRaisesRegex(pull.StitchHold, 'frozen corpus hash/census differs'):
-                            pull.stitch_corpus(cfg, inventory)
+                            pull.stitch_corpus(cfg)
                         self.assertEqual(db.execute('SELECT count(*) FROM v85r_stitch_corpus_meta').fetchone()[0], 0)
                         self.assertEqual(db.execute('SELECT count(*) FROM v85r_stitch_edges').fetchone()[0], 0)
                 self.assertEqual(requests, [('/api/v1/account/connections/stitch/corpus', 'Bearer fixture')])
@@ -234,7 +234,7 @@ class V85rTests(unittest.TestCase):
             inventory=SimpleNamespace(lock=threading.RLock(),db=db)
             cfg=SimpleNamespace(inventory_file=filename,api_base='https://api.invalid',api_key='fixture')
             with mock.patch.object(pull.urllib.request,'urlopen',side_effect=lambda *a,**kw:open(os.environ['V85R_FROZEN_CORPUS'],'rb')):
-                pull.stitch_corpus(cfg,inventory)
+                pull.stitch_corpus(cfg)
             self.assertEqual(db.execute('SELECT count(*) FROM v85r_stitch_edges').fetchone()[0],73843)
             self.assertEqual(db.execute('SELECT count(*) FROM v85r_stitch_edges WHERE nomination=1').fetchone()[0],52462)
 

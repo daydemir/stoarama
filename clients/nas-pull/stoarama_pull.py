@@ -46887,7 +46887,7 @@ class StitchStop:
             if self.kind is StitchRunKind.PROOF:
                 stitch_proof_space(self.cfg, self.task)
             if self.task is not None:
-                stitch_proof_checkpoint(self.cfg, self.task) if self.kind is StitchRunKind.PROOF else stitch_checkpoint(self.cfg, self.task)
+                stitch_proof_checkpoint(self.cfg, self.task, self) if self.kind is StitchRunKind.PROOF else stitch_checkpoint(self.cfg, self.task)
         except Exception as exc:
             self.reason = str(exc)
 
@@ -46925,6 +46925,100 @@ def stitch_proof_activity(inventory, stop):
     raise StitchHold(stop.reason or "proof inventory wait expired")
 
 
+# Socket idle timeouts do not bound DNS, headers or a trickling response. This
+# proof-only GET child has one absolute parent deadline, credential stdin only,
+# and disk stdout; it neither imports the NAS app nor writes media paths.
+STITCH_PROOF_HTTP_CHILD = r'''
+import json,sys,urllib.error,urllib.request
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,*args,**kwargs):
+        raise OSError('redirect refused')
+try:
+    p=json.load(sys.stdin)
+    request=urllib.request.Request(p['url'],method='GET',headers=p['headers'])
+    try:response=urllib.request.build_opener(NoRedirect()).open(request,timeout=p['timeout'])
+    except urllib.error.HTTPError as error:
+        print(json.dumps({'status':error.code}),flush=True)
+        sys.exit(0)
+    with response:
+        print(json.dumps({'status':response.status}),flush=True)
+        remaining=p['limit']+1
+        while remaining:
+            block=response.read(min(65536,remaining))
+            if not block:break
+            sys.stdout.buffer.write(block);remaining-=len(block)
+except Exception:
+    sys.exit(1)
+'''
+STITCH_PROOF_HTTP_REAP_SEC = 2
+
+
+def stitch_proof_remaining(stop, deadline):
+    if stop.is_set():
+        raise StitchHold("proof cancelled or expired")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise BenchmarkDeadline("proof deadline reached")
+    return remaining
+
+
+@contextmanager
+def stitch_proof_http(cfg, request, stop, limit, timeout):
+    # Reserve kill/reap time inside the immutable original task deadline.
+    deadline = min(stop.deadline - STITCH_PROOF_HTTP_REAP_SEC, time.monotonic() + timeout)
+    remaining = stitch_proof_remaining(stop, deadline)
+    url = urllib.parse.urlsplit(request.full_url)
+    if (request.get_method() != "GET" or request.data is not None or url.scheme != "https"
+            or not url.hostname or url.username or url.password or url.fragment):
+        raise StitchHold("proof HTTP requires a bounded HTTPS GET")
+    message = cleanup_json_bytes(dict(url=request.full_url, headers=dict(request.header_items()),
+                                     timeout=remaining, limit=limit))
+    if len(message) > 32768:
+        raise StitchHold("proof HTTP request exceeds bound")
+    inventory_scratch_backing(cfg.state_dir)
+    with tempfile.TemporaryFile(dir=cfg.state_dir) as output:
+        stitch_proof_remaining(stop, deadline)
+        process = subprocess.Popen([sys.executable, "-I", "-S", "-B", "-c", STITCH_PROOF_HTTP_CHILD],
+            stdin=subprocess.PIPE, stdout=output, stderr=subprocess.DEVNULL, env={}, start_new_session=True)
+        try:
+            first = True
+            while True:
+                remaining = stitch_proof_remaining(stop, deadline)
+                try:
+                    process.communicate(input=message if first else None, timeout=min(.2, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    first = False
+            stitch_proof_remaining(stop, deadline)
+            if process.returncode != 0:
+                raise StitchHold("proof HTTP transport failed")
+        finally:
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            process.communicate(timeout=STITCH_PROOF_HTTP_REAP_SEC)
+        size = output.tell()
+        output.seek(0)
+        metadata = output.readline(4097)
+        if len(metadata) > 4096 or size - len(metadata) > limit:
+            raise StitchHold("proof HTTP response exceeds bound")
+        status = stitch_proof_json(metadata)
+        if set(status) != {"status"} or type(status["status"]) is not int or status["status"] != 200:
+            raise StitchHold("proof HTTP request refused")
+        yield output
+
+
+def stitch_proof_request(cfg, path, stop, timeout=HEARTBEAT_TIMEOUT_SEC):
+    request = urllib.request.Request(cfg.api_base + path, headers={"User-Agent": USER_AGENT,
+        "Authorization": "Bearer " + cfg.api_key, **cleanup_session_headers(path)})
+    with stitch_proof_http(cfg, request, stop, 1024*1024, timeout) as response:
+        result = stitch_proof_json(response.read())
+    CLIENT_LOG_RING.add_secrets(diagnostic_secret_values(result, response=True))
+    return result
+
+
 def stitch_run(args, deadline, stop, stdout=None):
     # The worker thread is already nice19/idle; explicitly apply the same
     # priorities to FFmpeg and ffprobe children. No '-t' silent ionice fallback.
@@ -46952,26 +47046,37 @@ def stitch_journal(inventory, task_id, sha, result=None, registered=False):
         return json.loads(old[1]) if old and old[1] else None
 
 
-def stitch_corpus(cfg, inventory, stop=None):
+def stitch_corpus(cfg, stop=None):
     """Stream the exact frozen JSONL into SQLite once; never trust a row alone."""
-    with inventory.lock:
-        inventory.db.execute("CREATE TABLE IF NOT EXISTS v85r_stitch_corpus_meta(sha TEXT PRIMARY KEY)")
-        inventory.db.execute("CREATE TABLE IF NOT EXISTS v85r_stitch_edges(a TEXT,b TEXT,nomination INTEGER,witness TEXT,PRIMARY KEY(a,b))")
-        inventory.db.commit()
-        if inventory.db.execute("SELECT 1 FROM v85r_stitch_corpus_meta WHERE sha=?", (STITCH_CORPUS_SHA,)).fetchone():
-            return
     req = urllib.request.Request(cfg.api_base + "/account/connections/stitch/corpus")
     req.add_header("User-Agent", USER_AGENT)
     req.add_header("Authorization", "Bearer " + cfg.api_key)
     digest, count, nominees, size = hashlib.sha256(), 0, 0, 0
     # Import in a separate DB connection/transaction. Inventory heartbeats keep
     # reading their last completed snapshot; no partial corpus becomes usable.
-    database = sqlite3.connect(str(cfg.inventory_file), timeout=60)
+    proof = getattr(stop, "kind", None) is StitchRunKind.PROOF
+    wait = min(60, stitch_proof_remaining(stop, stop.deadline)) if proof else 60
+    database = sqlite3.connect(str(cfg.inventory_file), timeout=wait)
+    def budget():
+        if proof:
+            database.execute("PRAGMA busy_timeout=%d" % int(1000 * min(60, stitch_proof_remaining(stop, stop.deadline))))
     try:
+        budget()
+        database.execute("CREATE TABLE IF NOT EXISTS v85r_stitch_corpus_meta(sha TEXT PRIMARY KEY)")
+        budget()
+        database.execute("CREATE TABLE IF NOT EXISTS v85r_stitch_edges(a TEXT,b TEXT,nomination INTEGER,witness TEXT,PRIMARY KEY(a,b))")
+        budget()
+        database.commit()
+        budget()
+        if database.execute("SELECT 1 FROM v85r_stitch_corpus_meta WHERE sha=?", (STITCH_CORPUS_SHA,)).fetchone():
+            return
+        budget()
         database.execute("BEGIN IMMEDIATE")
         database.execute("DELETE FROM v85r_stitch_edges")
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as response:
-            deadline = time.monotonic() + 900
+        response_source = (stitch_proof_http(cfg, req, stop, 64*1024*1024, 900) if proof
+                           else urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC))
+        with response_source as response:
+            deadline = stop.deadline if proof else time.monotonic() + 900
             while True:
                 if stop is not None and (stop.is_set() or time.monotonic() >= deadline):
                     raise StitchHold("corpus import cancelled or expired")
@@ -46995,7 +47100,9 @@ def stitch_corpus(cfg, inventory, stop=None):
                 nominees += int(row["nomination"])
         if digest.hexdigest() != STITCH_CORPUS_SHA or count != 73843 or nominees != 52462:
             raise StitchHold("frozen corpus hash/census differs")
+        budget()
         database.execute("INSERT INTO v85r_stitch_corpus_meta VALUES(?)", (STITCH_CORPUS_SHA,))
+        budget()
         database.commit()
     finally:
         database.close()
@@ -47066,10 +47173,15 @@ def stitch_v85r_tools(cfg, deadline, stop):
     for name,(sha,size) in V85R_TOOLS.items():
         _check_benchmark_tool_budget(deadline, stop)
         target = root/name
-        if not _verified_binary(target,sha):
+        verified = (target.is_file() and stitch_proof_digest(target, stop) == (size, sha)
+                    if getattr(stop, "kind", None) is StitchRunKind.PROOF else _verified_binary(target, sha))
+        if not verified:
             _check_benchmark_tool_budget(deadline, stop)
-            capability = request_json(cfg,"GET","/account/connections/stitch/tools/"+name,
-                                      timeout=min(HEARTBEAT_TIMEOUT_SEC, max(.1, deadline-time.monotonic())))
+            capability = (stitch_proof_request(cfg, "/account/connections/stitch/tools/"+name, stop,
+                                              timeout=min(HEARTBEAT_TIMEOUT_SEC, deadline-time.monotonic()))
+                          if getattr(stop, "kind", None) is StitchRunKind.PROOF else
+                          request_json(cfg,"GET","/account/connections/stitch/tools/"+name,
+                                       timeout=min(HEARTBEAT_TIMEOUT_SEC, max(.1, deadline-time.monotonic()))))
             _check_benchmark_tool_budget(deadline, stop)
             if capability.get("sha256") != sha or capability.get("size_bytes") != size:
                 raise StitchHold("V85r tool capability identity differs")
@@ -47081,8 +47193,12 @@ def stitch_v85r_tools(cfg, deadline, stop):
             try:
                 digest,total=hashlib.sha256(),0
                 req=urllib.request.Request(url,headers={"If-Match":capability["if_match"]})
-                with urllib.request.urlopen(req,timeout=min(60,max(.1,deadline-time.monotonic()))) as response, temporary.open("wb") as output:
-                    remember_response_secrets(response)
+                proof = getattr(stop, "kind", None) is StitchRunKind.PROOF
+                response_source = (stitch_proof_http(cfg, req, stop, size, deadline-time.monotonic()) if proof
+                    else urllib.request.urlopen(req,timeout=min(60,max(.1,deadline-time.monotonic()))))
+                with response_source as response, temporary.open("wb") as output:
+                    if not proof:
+                        remember_response_secrets(response)
                     while True:
                         _check_benchmark_tool_budget(deadline,stop)
                         block=response.read(1024*1024)
@@ -48221,8 +48337,8 @@ def stitch_proof_space(cfg, task):
         raise StitchHold("proof storage bound reached")
 
 
-def stitch_proof_checkpoint(cfg, task):
-    current = request_json(cfg, "GET", "/account/connections/stitch/proof", timeout=HEARTBEAT_TIMEOUT_SEC)
+def stitch_proof_checkpoint(cfg, task, stop):
+    current = stitch_proof_request(cfg, "/account/connections/stitch/proof", stop)
     stitch_proof_check(current)
     if current["plan_sha256"] != task["plan_sha256"]:
         raise StitchHold("proof admission changed")
@@ -48412,7 +48528,7 @@ def stitch_proof_once(cfg, inventory, stop_event):
         if stop.is_set():
             raise StitchHold(stop.reason or "proof cancelled")
         stitch_resources(cfg,22620379)
-        stitch_corpus(cfg,inventory,stop)
+        stitch_corpus(cfg,stop)
         tools = stitch_v85r_tools(cfg,min(stop.deadline,time.monotonic()+BENCHMARK_TOOL_INSTALL_SEC),stop)
         if stop.is_set():
             raise StitchHold(stop.reason or "proof cancelled")
@@ -48535,7 +48651,7 @@ def stitch_once(cfg, inventory, stop_event):
     stitch_resources(cfg, sum(c["size_bytes"] for c in task["plan"]["clips"]))
     result = stitch_journal(inventory, task["id"], task["plan_sha256"])
     if result is None:
-        stitch_corpus(cfg, inventory)
+        stitch_corpus(cfg)
         tools = stitch_v85r_tools(cfg, time.monotonic() + BENCHMARK_TOOL_INSTALL_SEC, stop_event)
         result = stitch_build(cfg, inventory, task, stop_event, tools)
     result["lease_token"] = task["lease_token"]

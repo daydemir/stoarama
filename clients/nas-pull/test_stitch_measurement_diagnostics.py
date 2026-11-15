@@ -52,21 +52,66 @@ class MeasurementDiagnosticTests(unittest.TestCase):
         return json.dumps(result, allow_nan=False)
 
     def native_result(self, row, **extra):
-        return dict(evidence_row=copy.deepcopy(row), diagnostic_window20=copy.deepcopy(row["diagnostic_window20"]), **extra)
+        row = copy.deepcopy(row)
+        # The archived research wrapper has extra custody fields. The pinned
+        # live native producer emits exactly these three identity fields.
+        row["source_bindings"] = [{k:b[k] for k in ("clip_id","sha256","size_bytes")} for b in row["source_bindings"]]
+        row["spatial_provenance"]["source_bindings"] = copy.deepcopy(row["source_bindings"])
+        return dict(evidence_row=row, diagnostic_window20=copy.deepcopy(row["diagnostic_window20"]), **extra)
 
     def invoke(self, native):
         return self.driver(str(self.runner), str(self.request_path), self.runner_sha, native)
 
-    def test_recorded_join_split_hold_outcomes_and_serialization_are_identical(self):
+    def test_recorded_positive_joins_serialization_and_native_calls_are_identical(self):
         for case in self.cases:
             with self.subTest(case=case["case"]):
                 row = case["row"]
                 request = self.request(row)
-                native = lambda *a, **k: SimpleNamespace(stdout=json.dumps(self.native_result(row)))
+                calls = []
+                def native(*args, **kwargs):
+                    calls.append(hashlib.sha256(json.dumps(dict(args=args,kwargs=kwargs),sort_keys=True).encode()).hexdigest())
+                    return SimpleNamespace(stdout=json.dumps(self.native_result(row)))
                 expected = self.original_main(request, native)
                 result, encoded, diagnostic = self.invoke(native)
                 self.assertTrue(encoded == expected, "driver changed a recorded policy outcome or serialization")
                 self.assertEqual(json.loads(encoded), result)
+                self.assertEqual((result["decision"],result["join"],result["nomination"],result["status"]),
+                    ("join",True,*case["expected"]))
+                self.assertEqual(len(calls),2)
+                self.assertEqual(calls[0],calls[1],"native command, request, environment or timeout changed")
+
+    def test_policy_split_and_safety_hold_are_explicitly_exercised(self):
+        positive = self.cases[0]["row"]
+        split = copy.deepcopy(positive)
+        split["spatial_temporal_diagnostic"].update(tail_dx_pixels_per_frame=0,tail_dy_pixels_per_frame=0,
+            head_dx_pixels_per_frame=0,head_dy_pixels_per_frame=0,motion_observable=False,
+            ambiguities=["no_observable_motion"],texture_gradient_mad=3,minimum_spatial_novelty_margin=2,
+            heldout_pixels=1000,forward_heldout_residual_mad=10,backward_heldout_residual_mad=10,
+            internal_heldout_residual_mad=.1,direction_speed_disagreement=0,
+            max_acceleration_pixels_per_frame_squared=0,boundary_unwarped_mad=10)
+        missing = copy.deepcopy(positive);del missing["full_source_integrity"]
+        for row, decision, status in ((split,"split","REJECT_stationary_severe_seam_forecast"),
+                (missing,"hold","UNKNOWN_missing_authenticated_evidence")):
+            with self.subTest(decision=decision):
+                request = self.request(row)
+                native = lambda *a,**k:SimpleNamespace(stdout=json.dumps(self.native_result(row)))
+                expected = self.original_main(request,native)
+                result,encoded,_ = self.invoke(native)
+                self.assertEqual((result["decision"],result["status"],result["join"]),(decision,status,False))
+                self.assertTrue(encoded==expected,"driver changed a policy negative or safety HOLD")
+
+    def test_frozen_current_policy_join_and_identity_hold_are_preserved(self):
+        row = self.cases[0]["row"]
+        for valid in (True,False):
+            request = self.request(row)
+            keys = [[b["clip_id"],b["sha256"],b["size_bytes"]] for b in row["source_bindings"]]
+            request["frozen"] = dict(source_key=keys,nomination=valid,status=self.original.APPROVED)
+            self.request_path.write_text(json.dumps(request))
+            native = lambda *a,**k:SimpleNamespace(stdout=json.dumps(self.native_result(row)))
+            expected = self.original_main(request,native)
+            result,encoded,_ = self.invoke(native)
+            self.assertEqual(result["decision"],"join" if valid else "hold")
+            self.assertTrue(encoded==expected,"driver changed frozen current-policy admission")
 
     def test_returned_source_integrity_failure_has_its_own_bounded_class(self):
         row = self.cases[0]["row"]

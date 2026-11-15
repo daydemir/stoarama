@@ -15,9 +15,19 @@ again. Cleanup retains its existing fence and cancellation priority.
 One monotonic deadline is derived from the original task expiry, minus the
 existing 30-second margin. It covers waiting, cold tool setup, source hashing,
 native tools, publication and local receipt construction. Checkpoint refreshes
-cannot extend it. Network and native budgets use its remaining time. This is a
-logical deadline; an uninterruptible kernel filesystem call cannot be promised
-a hard kill bound. The separate controller cutoff still requires timely OFF.
+cannot extend it. Proof checkpoint, capability, corpus and tool GETs use a small
+isolated child with credential stdin, an empty inherited environment and bounded
+private disk output. The parent applies the remaining absolute deadline across
+DNS, TLS, headers and body reads, polls cleanup cancellation, and kills/reaps a
+stalled or trickling child. Corpus SQLite connection/transaction waits and cached
+tool hashing also use the original budget. Copy transport is unchanged.
+Transport reserves two seconds for kill/reap inside that original deadline;
+insufficient remaining cleanup budget refuses before spawning.
+
+This is a logical deadline; an uninterruptible kernel filesystem call cannot be
+promised a hard kill bound. The separate controller cutoff still requires timely
+OFF. Proof control GETs add a short-lived stdlib process; their actual NAS cost
+has not been measured and must be included in operational observation.
 
 Receipt transport and preserved-output readback occur outside the activity
 lock. They retain all existing source, output, pipeline and registration
