@@ -23,6 +23,10 @@ stalled or trickling child. Corpus SQLite connection/transaction waits and cache
 tool hashing also use the original budget. Copy transport is unchanged.
 Transport reserves two seconds for kill/reap inside that original deadline;
 insufficient remaining cleanup budget refuses before spawning.
+Repeated provenance and embedded-package verification, audit-file reads,
+packet/frame iteration, frozen-witness reads and publication hashes use that
+same stop object. Cancellation is checked between reads and members; acquiring
+the lock near expiry never grants another setup budget.
 
 This is a logical deadline; an uninterruptible kernel filesystem call cannot be
 promised a hard kill bound. The separate controller cutoff still requires timely
@@ -32,6 +36,47 @@ has not been measured and must be included in operational observation.
 Receipt transport and preserved-output readback occur outside the activity
 lock. They retain all existing source, output, pipeline and registration
 checks. A newer artifact is never an alias for the tested producer.
+
+## Scheduling after a scan
+
+A long-running scan can occupy the activity lock for longer than the proof's
+entire budget. The proof then refuses cleanly; the bounded wait promises no
+successful turn. Do not hold cleanup idle while waiting for such a scan.
+
+Before proposing activation, the controller needs a fresh heartbeat from the
+exact stable target artifact and boot, a non-null `inventory_scan_completed_at`
+not earlier than the latest `inventory_scan_pass_started_at`, and no newer pass
+start in a second fresh observation. A historical generation's completion or an
+incomplete pass is insufficient. These are scheduling observations; acquiring
+the shared lock and rechecking admission is the atomic exclusion. If a new pass
+wins the race, the proof waits only within its original budget and refuses at
+expiry. Normal resource, cleanup, storage and custody gates still apply.
+
+The inventory loop waits ten seconds after startup. It holds the activity lock
+across dirty-row synchronization and the full scan, then waits the configured
+scan interval after the attempt returns, including a failed attempt. The
+interval defaults to 24 hours and is validated at a minimum of 300 seconds.
+The controller must establish the actual configured interval and allow for
+deployment and polling time before choosing that idle window. A timestamp does
+not establish the configured interval, lock ownership or a future reservation.
+
+Held production metadata at 2026-11-15T18:17:28Z reports a pass start at
+13:49:35.861748Z with completion still null, about 4 hours 28 minutes later.
+It establishes incompletion, not continuous scanning, a stuck worker, overlap
+with the failed proof, or memory causation. No held progress series or actual
+NAS scan throttle/configuration resolves those alternatives.
+
+The default hash throttle is 20 MiB/s despite its `MBPS` variable name. It
+limits payload hashing per file, not metadata walking, sidecar reads, SQLite,
+uploads or cleanup-fence waits. Verified cache hits can skip payload rehashing
+across generations when their full identity and authenticated sidecar evidence
+remain equal. Consequently the full NAS byte count cannot be divided by the
+throttle to predict each scan. Both walks also wait on the cleanup maintenance
+fence, potentially while holding the activity lock. Bounded disk membership
+removes scan-wide Python path retention; it promises neither a shorter scan nor
+a measured NAS rate. After an authorized release, record pass progress,
+completion, actual configuration and process RSS/peak RSS before attributing
+the observed memory cycles or estimating scan duration.
 
 ## Full-scan path membership
 

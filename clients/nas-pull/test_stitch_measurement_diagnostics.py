@@ -205,7 +205,7 @@ class MeasurementDiagnosticTests(unittest.TestCase):
                         raise pull.MediaCertificationError("/private/SYNTHETIC_TOKEN")
         self.assertEqual((stop.failure["stage"],stop.failure["input"],stop.failure["error"]),
                          ("source","left","MediaCertificationError"))
-        args = pull.stitch_measure_driver_argv(ROOT/"v85r",self.request_path)
+        args = pull.stitch_measure_driver_argv(ROOT/"v85r",self.request_path,self.proof_stop())
         self.assertLessEqual(len(args),100)
         self.assertTrue(all(len(item)<=2048 for item in args))
 
