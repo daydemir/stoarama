@@ -1,5 +1,6 @@
 """Isolated proof authority/transport/inventory tests; never production proof."""
 import copy
+import base64
 import gzip
 import hashlib
 import importlib.util
@@ -46,6 +47,79 @@ def synthetic_receipt():
 
 
 class ProofTests(unittest.TestCase):
+    def stream_fixture(self):
+        # Explicitly synthetic/stale native inventories: never production authority.
+        source=Path(__file__).with_name('stoarama_pull.py').read_bytes()
+        client_sha=hashlib.sha256(source).hexdigest()
+        task,receipt=synthetic_receipt();receipt['client_artifact_sha256']=client_sha
+        plan=pull.cleanup_json_bytes(task);bundle=gzip.compress(pull.cleanup_json_bytes(receipt),mtime=0)
+        envelope=dict(schema=verify.REPLAY_INPUT_SCHEMA,client_source_b64=base64.b64encode(source).decode(),source_plan_b64=base64.b64encode(plan).decode(),native_bundle_b64=base64.b64encode(bundle).decode())
+        return envelope,(client_sha,hashlib.sha256(bundle).hexdigest(),hashlib.sha256(plan).hexdigest()),(source,plan,bundle)
+
+    def test_replay_stream_uses_only_checksum_bound_memory(self):
+        envelope,pins,parts=self.stream_fixture()
+        with mock.patch.object(verify,'read_bounded',side_effect=AssertionError('no path read')),mock.patch.object(verify,'load_core',side_effect=AssertionError('no path loader')):
+            actual=verify.replay_stream(pull.cleanup_json_bytes(envelope),*pins)
+        core=verify.load_core_bytes(parts[0],pins[0]);task=verify.strict_json(parts[1])
+        receipt=verify.verify(core,task,parts[2],pins[0])
+        self.assertEqual(actual,verify.replay_result(receipt,task,pins[0],pins[1]))
+        self.assertEqual(actual['media_seconds'],120)
+
+    def test_replay_stream_rejects_hash_encoding_schema_and_inventory_changes(self):
+        envelope,pins,parts=self.stream_fixture()
+        raw=pull.cleanup_json_bytes(envelope)
+        for n in range(3):
+            wrong=list(pins);wrong[n]='0'*64
+            with self.assertRaises(verify.ProofError):verify.replay_stream(raw,*wrong)
+        mutations=[
+            lambda e:e.__setitem__('schema','unknown'),
+            lambda e:e.__setitem__('extra',True),
+            lambda e:e.pop('native_bundle_b64'),
+            lambda e:e.__setitem__('source_plan_b64',None),
+            lambda e:e.__setitem__('source_plan_b64',''),
+            lambda e:e.__setitem__('source_plan_b64','%%%'),
+            lambda e:e.__setitem__('source_plan_b64','Zg==='),
+            lambda e:e.__setitem__('source_plan_b64','Zh=='), # Nonzero pad bits.
+            lambda e:e.__setitem__('source_plan_b64','é'),
+            lambda e:e.__setitem__('source_plan_b64','A'*(4*((1024*1024+2)//3)+1)),
+            lambda e:e.__setitem__('source_plan_b64',base64.b64encode(b'x'*(1024*1024+1)).decode()),
+        ]
+        for change in mutations:
+            bad=copy.deepcopy(envelope);change(bad)
+            with self.assertRaises((verify.ProofError,ValueError)):verify.replay_stream(pull.cleanup_json_bytes(bad),*pins)
+        for bad in (b'{}',b'[]',b'null',b'',b' '*(verify.REPLAY_INPUT_MAX_BYTES+1),raw[:-1]+b',"schema":"duplicate"}',raw[:-1]+b',"x":NaN}'):
+            with self.assertRaises((verify.ProofError,ValueError)):verify.replay_stream(bad,*pins)
+        receipt=verify.strict_json(gzip.decompress(parts[2]));receipt['audits']['output.frames']=receipt['audits']['output.frames'].splitlines()[0]+'\n'
+        bad_bundle=gzip.compress(pull.cleanup_json_bytes(receipt),mtime=0)
+        bad=dict(envelope,native_bundle_b64=base64.b64encode(bad_bundle).decode())
+        with self.assertRaises(verify.ProofError):verify.replay_stream(pull.cleanup_json_bytes(bad),pins[0],hashlib.sha256(bad_bundle).hexdigest(),pins[2])
+        receipt=verify.strict_json(gzip.decompress(parts[2]));receipt['build_wall_seconds']=1e-320
+        bad_bundle=gzip.compress(pull.cleanup_json_bytes(receipt),mtime=0)
+        bad=dict(envelope,native_bundle_b64=base64.b64encode(bad_bundle).decode())
+        with self.assertRaises(verify.ProofError):verify.replay_stream(pull.cleanup_json_bytes(bad),pins[0],hashlib.sha256(bad_bundle).hexdigest(),pins[2])
+
+    def test_isolated_inline_stream_exec_survives_original_paths_replaced(self):
+        envelope,pins,parts=self.stream_fixture()
+        script=Path(__file__).with_name('verify_stitch_proof.py').read_bytes()
+        self.assertLessEqual(len(script),64*1024)
+        self.assertNotIn(b'\0',script)
+        # The consumer snapshots bytes before execve. Later pathname contents
+        # cannot select the interpreter program or any of its native inputs.
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            for name,body in zip(('verifier.py','client.py','plan.json','receipt.gz'),(script,*parts)):
+                path=root/name;path.write_bytes(body);path.write_bytes(b'changed after checksum; must never reopen')
+            (root/'json.py').write_text('raise RuntimeError("cwd import forbidden")')
+            before={p.name:p.read_bytes() for p in root.iterdir()}
+            argv=[sys.executable,'-I','-S','-B','-c',script.decode('utf-8'),'replay-stream','--expected-client-sha256',pins[0],'--expected-sha256',pins[1],'--expected-plan-sha256',pins[2]]
+            run=subprocess.run(argv,input=pull.cleanup_json_bytes(envelope),cwd=root,env={},capture_output=True,timeout=20)
+            self.assertEqual(run.returncode,0,run.stderr);self.assertEqual(run.stderr,b'')
+            actual=json.loads(run.stdout);self.assertEqual(actual['native_replay'],'passed')
+            self.assertEqual(set(actual),{'schema','native_replay','connection_id','run_id','receipt_sha256','plan_sha256','client_artifact_sha256','output_sha256','output_size_bytes','media_seconds','build_wall_seconds','recording_hours_per_wall_hour'})
+            self.assertEqual({p.name:p.read_bytes() for p in root.iterdir()},before)
+            bad=subprocess.run(argv,input=b'{"schema":"unknown"}',cwd=root,env={},capture_output=True,timeout=20)
+            self.assertNotEqual(bad.returncode,0);self.assertEqual(bad.stdout,b'')
+
     def test_transport_ack_recovers_eviction_lost_ack_and_restart(self):
         # Synthetic maximum-sized-ish data; delivery cannot depend on ring phase.
         body=os.urandom(800*1024);digest=hashlib.sha256(body).hexdigest();plan='a'*64
@@ -145,6 +219,7 @@ class ProofTests(unittest.TestCase):
             (root/'logs.json').write_bytes(pull.cleanup_json_bytes(logs));out=root/'artifact'
             run=subprocess.run([sys.executable,'-I','-S','-B',str(Path(__file__).with_name('verify_stitch_proof.py')),'collect','--plan',str(root/'plan.json'),'--client-source',str(source),'--expected-client-sha256',sha,'--logs',str(root/'logs.json'),'--expected-sha256',digest,'--out',str(out)],env={},capture_output=True,text=True,timeout=20)
             self.assertEqual(run.returncode,0,run.stderr);self.assertEqual((out/'client.py').read_bytes(),source.read_bytes());self.assertEqual((out/'receipt.json.gz').read_bytes(),bundle)
+            self.assertEqual((out/'verified-receipt.json').read_bytes(),gzip.decompress(bundle))
             response=dict(verified=True,kind=pull.STITCH_PROOF_KIND,plan_sha256=task['plan_sha256'],output_sha256='e'*64,registered_locally_only=True,grants_retirement=False,validated_at='2000-01-01T00:00:00Z',nas_readback_at='2000-01-01T00:00:00Z',client_boot_id='synthetic-boot',run_id=receipt['run']['id'],receipt_sha256=digest,client_artifact_sha256=sha)
             (root/'server.json').write_bytes(pull.cleanup_json_bytes(response));(root/'pipeline.json').write_bytes(pull.cleanup_json_bytes(dict(repository='daydemir/stoarama',base_commit_sha='1'*40,reviewed_head_sha='2'*40,merged_commit_sha='3'*40,client_version=pull.CLIENT_VERSION,client_artifact_sha256=sha)))
             verify.export_payload(out,root/'server.json',root/'pipeline.json')

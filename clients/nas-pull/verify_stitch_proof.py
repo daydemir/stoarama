@@ -4,6 +4,7 @@ import sys
 sys.dont_write_bytecode = True
 import argparse
 import ast
+import base64
 import datetime
 from fractions import Fraction
 import hashlib
@@ -52,12 +53,24 @@ def read_bounded(path,limit,expected_sha=None):
 
 PURE_FUNCTIONS=frozenset(('cleanup_json_bytes','stitch_signature','stitch_packet_records','stitch_frame_records','stitch_source_records','stitch_output_records','stitch_proof_json','stitch_proof_check','stitch_proof_success','stitch_proof_unpack','stitch_proof_validate'))
 PURE_CONSTANTS=frozenset(('STITCH_POLICY','STITCH_REVISION','STITCH_CORPUS_SHA','STITCH_PROOF_SOURCE_SHA','STITCH_PROOF_KIND','STITCH_PROOF_AUDIT_NAMES','STITCH_PROOF_SCHEMA_JSON','STITCH_PROOF_SCHEMA_SHA','V85R_MANIFEST_SHA','V85R_TOOL_VERSION','V85R_TOOLS','CLEANUP_KEEP28_POLICY_SHA256'))
+REPLAY_INPUT_SCHEMA='stoarama.nas-stitch-replay-input.v1'
+REPLAY_INPUT_MAX_BYTES=16*1024*1024
 
 
 def load_core(client_source,expected_sha):
+    return load_core_bytes(read_bounded(client_source,8*1024*1024),expected_sha)
+
+
+def checked_bytes(raw,limit,expected_sha):
+    if type(raw) is not bytes or not 0<len(raw)<=limit:raise ProofError('artifact byte bound/type')
+    if not isinstance(expected_sha,str) or not re.fullmatch('[a-f0-9]{64}',expected_sha) or hashlib.sha256(raw).hexdigest()!=expected_sha:raise ProofError('artifact checksum mismatch')
+    return raw
+
+
+def load_core_bytes(client_source,expected_sha):
     # Do not import the NAS app: that would initialize its diagnostics/auth readers.
     # Only these reviewed pure declarations execute, without file/network/auth APIs.
-    tree=ast.parse(read_bounded(client_source,8*1024*1024,expected_sha))
+    tree=ast.parse(checked_bytes(client_source,8*1024*1024,expected_sha))
     namespace={'json':json,'hashlib':hashlib,'Fraction':Fraction,'zlib':zlib,'re':re,'datetime':datetime,'StitchHold':ProofError}
     declarations=[];found=set()
     for node in tree.body:
@@ -133,6 +146,38 @@ def verify(core,task,body,client_sha):
     return receipt
 
 
+def replay_result(receipt,task,client_sha,bundle_sha):
+    output=receipt['result']['outputs'][0]
+    media=output['media_seconds'];wall=receipt['build_wall_seconds']
+    rate=media/wall
+    if not 0<rate<float('inf'):raise ProofError('nonfinite replay throughput')
+    return dict(schema='stoarama.nas-stitch-native-replay.v1',native_replay='passed',connection_id=13,run_id=receipt['run']['id'],receipt_sha256=bundle_sha,plan_sha256=task['plan_sha256'],client_artifact_sha256=client_sha,output_sha256=output['sha256'],output_size_bytes=output['size_bytes'],media_seconds=media,build_wall_seconds=wall,recording_hours_per_wall_hour=rate)
+
+
+def replay_stream(raw,client_sha,bundle_sha,plan_sha):
+    """Replay immutable byte copies; no supplied pathname is opened or executed."""
+    if type(raw) is not bytes or not 0<len(raw)<=REPLAY_INPUT_MAX_BYTES:raise ProofError('replay input bound/type')
+    envelope=strict_json(raw)
+    components={
+        'client_source_b64':(8*1024*1024,client_sha),
+        'source_plan_b64':(1024*1024,plan_sha),
+        'native_bundle_b64':(1024*1024,bundle_sha),
+    }
+    if type(envelope) is not dict or set(envelope)!={'schema',*components} or envelope['schema']!=REPLAY_INPUT_SCHEMA:raise ProofError('unsupported replay input schema/fields')
+    decoded={}
+    for name,(limit,sha) in components.items():
+        encoded=envelope[name]
+        if type(encoded) is not str or not 0<len(encoded)<=4*((limit+2)//3):raise ProofError('replay component encoding bound/type')
+        try:body=base64.b64decode(encoded,validate=True)
+        except ValueError:raise ProofError('invalid replay component base64') from None
+        if base64.b64encode(body).decode('ascii')!=encoded:raise ProofError('noncanonical replay component base64')
+        decoded[name]=checked_bytes(body,limit,sha)
+    task=strict_json(decoded['source_plan_b64'])
+    core=load_core_bytes(decoded['client_source_b64'],client_sha)
+    receipt=verify(core,task,decoded['native_bundle_b64'],client_sha)
+    return replay_result(receipt,task,client_sha,bundle_sha)
+
+
 def write_new(path,body):
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     try:
@@ -179,8 +224,12 @@ def main():
         p=sub.add_parser(name);p.add_argument('--plan',type=Path,required=True);p.add_argument('--client-source',type=Path,required=True);p.add_argument('--expected-client-sha256',required=True);p.add_argument('--expected-sha256',required=True)
         if name=='collect':p.add_argument('--logs',type=Path,required=True);p.add_argument('--out',type=Path,required=True)
         else:p.add_argument('--bundle',type=Path,required=True)
+    p=sub.add_parser('replay-stream');p.add_argument('--expected-client-sha256',required=True);p.add_argument('--expected-sha256',required=True);p.add_argument('--expected-plan-sha256',required=True)
     p=sub.add_parser('export-payload');p.add_argument('--artifact-dir',type=Path,required=True);p.add_argument('--server-response',type=Path,required=True);p.add_argument('--pipeline',type=Path,required=True)
     args=parser.parse_args()
+    if args.command=='replay-stream':
+        print(json.dumps(replay_stream(sys.stdin.buffer.read(REPLAY_INPUT_MAX_BYTES+1),args.expected_client_sha256,args.expected_sha256,args.expected_plan_sha256)))
+        return
     if args.command=='export-payload':return export_payload(args.artifact_dir,args.server_response,args.pipeline)
     core=load_core(args.client_source,args.expected_client_sha256)
     task=strict_json(read_bounded(args.plan,1024*1024))
@@ -195,7 +244,6 @@ def main():
         fd=os.open(args.out,os.O_RDONLY|os.O_DIRECTORY)
         try:os.fsync(fd)
         finally:os.close(fd)
-    media=receipt['result']['outputs'][0]['media_seconds'];wall=receipt['build_wall_seconds']
-    print(json.dumps(dict(schema='stoarama.nas-stitch-native-replay.v1',native_replay='passed',connection_id=13,run_id=receipt['run']['id'],receipt_sha256=args.expected_sha256,plan_sha256=task['plan_sha256'],client_artifact_sha256=args.expected_client_sha256,output_sha256=receipt['result']['outputs'][0]['sha256'],output_size_bytes=receipt['result']['outputs'][0]['size_bytes'],media_seconds=media,build_wall_seconds=wall,recording_hours_per_wall_hour=media/wall)))
+    print(json.dumps(replay_result(receipt,task,args.expected_client_sha256,args.expected_sha256)))
 
 if __name__=='__main__':main()
