@@ -1257,6 +1257,7 @@ func r2RetireDefaultLedger() string {
 func runR2Retire(ctx context.Context, cfg config.Config, args []string) {
 	const usage = `usage:
   stoaramactl r2-retire reconcile-writers --out FILE [--bucket stoarama] (read-only; no apply)
+  stoaramactl r2-retire cancel-joined-writers --batch-record-id ID --out FILE (dry-run; apply requires reviewed snapshot and exact primary owner proofs)
   stoaramactl r2-retire writer-fence --activate --all-writers-gated
   stoaramactl r2-retire writer-fence --deactivate
   stoaramactl r2-retire delivery-fence --activate --all-api-instances-gated
@@ -1276,6 +1277,8 @@ func runR2Retire(ctx context.Context, cfg config.Config, args []string) {
 		log.Fatalf("r2-retire: keep28 policy unavailable (keep everything): %v", err)
 	}
 	switch args[0] {
+	case "cancel-joined-writers":
+		runR2JoinedWriterCancel(ctx, cfg, args[1:])
 	case "reconcile-writers":
 		runR2WriterReconcile(ctx, cfg, args[1:])
 	case "writer-fence":
