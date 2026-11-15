@@ -49,6 +49,20 @@ def require(ok, message):
         raise Refused(message)
 
 
+def result_json(raw):
+    def unique(pairs):
+        body = {}
+        for key, value in pairs:
+            require(key not in body, 'duplicate result field')
+            body[key] = value
+        return body
+
+    def noninteger(_):
+        raise Refused('unexpected noninteger result number')
+
+    return json.loads(raw, object_pairs_hook=unique, parse_float=noninteger, parse_constant=noninteger)
+
+
 def checked_file(path, sha, limit):
     require(re.fullmatch('[a-f0-9]{64}', sha), 'invalid checksum')
     path = Path(path)
@@ -107,10 +121,27 @@ def token_file():
     return token
 
 
-def reap(child):
+def reap(child, timeout=REAP_SECONDS):
     if child.poll() is None:
         child.terminate()  # Only our own process; never SIGKILL or remote kill.
-    child.wait(timeout=REAP_SECONDS)
+    child.wait(timeout=max(0, timeout))
+
+
+def emit_failure(status):
+    """Best-effort bounded pipe write; never a late blocking file/fsync."""
+    try:
+        fd = sys.stdout.fileno()
+        require(stat.S_ISFIFO(os.fstat(fd).st_mode) or stat.S_ISSOCK(os.fstat(fd).st_mode), 'status channel is not a pipe/socket')
+        raw = (json.dumps(status, sort_keys=True, allow_nan=False) + '\n').encode()
+        require(len(raw) <= 4096, 'status bound')
+        blocking = os.get_blocking(fd)
+        try:
+            os.set_blocking(fd, False)
+            os.write(fd, raw)  # Partial/EAGAIN/missing means unproved, no retry.
+        finally:
+            os.set_blocking(fd, blocking)
+    except Exception:
+        pass
 
 
 def write_receipt(path, value):
@@ -148,7 +179,7 @@ def remote(source_sha):
             stage = Stage.CREDENTIAL
             env['DIGITALOCEAN_TOKEN'] = token_file()  # Reservation and preparer exit precede auth access.
             deadline.check()
-            watcher.close()
+            watcher.close(deadline)
             require(not watcher.disconnected.is_set(), 'owned input changed before exec')
             deadline.check()
             stage = Stage.EXEC
@@ -156,18 +187,33 @@ def remote(source_sha):
             # absolute deadline and armed timer survive exec; no budget reset.
             os.execve(PYTHON, [PYTHON, '-I', '-S', '-B', '-c', raw.decode(), 'collect', *common], env)
         except (Exception, module.Cancelled) as error:
-            if child is not None:
-                reap(child)
-            attempt = module.REMOTE_OUT / 'attempt.json'
-            if attempt.exists():
-                value = module.strict_json(module.read_regular(attempt, 4096))
-                if value.get('shell_pid') == os.getpid() and value.get('monotonic_start') == start:
-                    failure = module.REMOTE_OUT / 'failure.json'
-                    if not failure.exists():
-                        module.write_new(failure, module.canonical({'stage': stage, 'outcome': deadline.outcome if isinstance(error, module.Cancelled) else 'refused', 'exception_type': type(error).__name__, 'apply_authority': False}))
+            try:
+                deadline.begin_cleanup()
+                watcher.close(deadline)
+                if child is not None:
+                    reap(child, min(REAP_SECONDS, deadline.remaining()))
+            except (Exception, module.Cancelled):
+                pass
+            code = child.poll() if child is not None else None
+            status = {'schema': 'stoarama.capture-invoice-remote-failure.v1', 'outcome': Outcome.HOLD,
+                      'stage': stage, 'source_sha256': source_sha, 'preparer_pid': child.pid if child is not None else None,
+                      'preparer_exit_observed': code is not None, 'preparer_exit_code': code,
+                      'exception_type': type(error).__name__, 'apply_authority': False}
+            emit_failure(status)
+            try:
+                deadline.check_hard()
+                attempt = module.REMOTE_OUT / 'attempt.json'
+                if attempt.exists():
+                    value = module.strict_json(module.read_regular(attempt, 4096))
+                    if value.get('shell_pid') == os.getpid() and value.get('monotonic_start') == start and value.get('source_sha256') == source_sha:
+                        failure = module.REMOTE_OUT / 'failure.json'
+                        if not failure.exists():
+                            module.write_new(failure, module.canonical(status))
+            except (Exception, module.Cancelled):
+                pass  # No persistence retry or deadline extension.
             raise Refused('owned remote attempt refused; no retry') from None
         finally:
-            watcher.close()
+            watcher.close(deadline)
 
 
 def command(collector_path, source_sha, transport_path, transport_sha):
@@ -189,7 +235,8 @@ def run(argv, capture):
     for sig in previous:
         signal.signal(sig, stop)
     child = None
-    result = {'outcome': Outcome.HOLD, 'reaped': False, 'exit_code': None, 'retry': False, 'apply_authority': False}
+    result = {'outcome': Outcome.HOLD, 'reaped': False, 'exit_code': None, 'retry': False, 'apply_authority': False,
+              'remote_preparer_exit_observed': False}
     deadline = time.monotonic() + LOCAL_SECONDS
     try:
         with os.fdopen(os.open(capture / 'stdout.bin', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as stdout, os.fdopen(os.open(capture / 'stderr.bin', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as stderr:
@@ -202,13 +249,7 @@ def run(argv, capture):
             os.fsync(stdout.fileno())
             os.fsync(stderr.fileno())
             require(result['exit_code'] == 0 and stderr.tell() == 0 and stdout.tell() <= 65536, 'transport did not return clean bounded success')
-            def unique(pairs):
-                body = {}
-                for key, value in pairs:
-                    require(key not in body, 'duplicate result field')
-                    body[key] = value
-                return body
-            body = json.loads((capture / 'stdout.bin').read_bytes(), object_pairs_hook=unique)
+            body = result_json((capture / 'stdout.bin').read_bytes())
             require(body == {'outcome': 'complete', 'requests': 7, 'manifest_sha256': body.get('manifest_sha256'), 'apply_authority': False}
                     and body['apply_authority'] is False and type(body['requests']) is int
                     and type(body['manifest_sha256']) is str and re.fullmatch('[a-f0-9]{64}', body['manifest_sha256']), 'remote result contract')
@@ -229,6 +270,21 @@ def run(argv, capture):
             child.stdin.close()
         for sig, handler in previous.items():
             signal.signal(sig, handler)
+        path = capture / 'stdout.bin'
+        if result['outcome'] == Outcome.HOLD and path.exists() and 0 < path.stat().st_size <= 4096:
+            try:
+                failure = result_json(path.read_bytes())
+                require(type(failure) is dict and set(failure) == {'schema', 'outcome', 'stage', 'source_sha256', 'preparer_pid', 'preparer_exit_observed', 'preparer_exit_code', 'exception_type', 'apply_authority'}
+                        and failure['schema'] == 'stoarama.capture-invoice-remote-failure.v1' and failure['outcome'] == Outcome.HOLD
+                        and failure['apply_authority'] is False and failure['stage'] in list(Stage)
+                        and type(failure['source_sha256']) is str and re.fullmatch('[a-f0-9]{64}', failure['source_sha256'])
+                        and (failure['preparer_pid'] is None or type(failure['preparer_pid']) is int and failure['preparer_pid'] > 0)
+                        and type(failure['preparer_exit_observed']) is bool
+                        and (failure['preparer_pid'] is not None and type(failure['preparer_exit_code']) is int if failure['preparer_exit_observed'] else failure['preparer_exit_code'] is None), 'failure status contract')
+                result['remote_failure'] = failure
+                result['remote_preparer_exit_observed'] = failure['preparer_exit_observed']
+            except Exception:
+                pass  # Missing/invalid status stays explicitly unproved.
         for name in ['stdout.bin', 'stderr.bin']:
             path = capture / name
             if path.exists():
@@ -266,5 +322,7 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (Exception, Interrupted):
-        raise SystemExit('invoice transport refused; HOLD, no retry') from None
+    except BaseException as error:
+        if isinstance(error, SystemExit):
+            raise
+        raise SystemExit(1) from None

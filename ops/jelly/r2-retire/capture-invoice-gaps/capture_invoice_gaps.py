@@ -97,15 +97,36 @@ class Deadline:
                 and math.isfinite(start) and math.isfinite(end)
                 and start < end <= start + RUN_SECONDS, "attempt deadline fields")
         self.start, self.end = start, end
+        # Reserve cleanup INSIDE the existing hard cap, never after it. Tests
+        # use shorter synthetic budgets; production keeps 50s work + <=5s
+        # cleanup within the same immutable 55s deadline.
+        self.work_end = end - min(5, (end - start) / 3)
+        self.cleaning = False
         self.outcome = Outcome.INTERRUPTED
 
-    def check(self):
+    def remaining(self):
+        return max(0, self.end - time.monotonic())
+
+    def check_hard(self):
         if not self.start <= time.monotonic() < self.end:
             self.outcome = Outcome.TIMEOUT
             raise Cancelled()
 
+    def begin_cleanup(self):
+        self.cleaning = True
+        self.check_hard()
+        signal.setitimer(signal.ITIMER_REAL, self.remaining())
+
+    def check(self):
+        self.check_hard()
+        if not self.cleaning and time.monotonic() >= self.work_end:
+            self.outcome = Outcome.TIMEOUT
+            self.begin_cleanup()
+            raise Cancelled()
+
     def stop(self, sig, _):
         self.outcome = Outcome.TIMEOUT if sig == signal.SIGALRM else Outcome.INTERRUPTED
+        self.begin_cleanup()  # The second alarm is still the original hard end.
         raise Cancelled()
 
     def __enter__(self):
@@ -114,7 +135,7 @@ class Deadline:
             signal.signal(sig, self.stop)
         try:
             self.check()
-            signal.setitimer(signal.ITIMER_REAL, self.end - time.monotonic())
+            signal.setitimer(signal.ITIMER_REAL, self.work_end - time.monotonic())
             self.check()
             return self
         except BaseException:
@@ -150,14 +171,24 @@ class ChannelWatch:
     def start(self):
         self.thread.start()
 
-    def close(self):
+    def close(self, deadline=None):
         self.finished.set()
-        self.thread.join(timeout=0.5)
+        self.thread.join(timeout=min(0.5, deadline.remaining()) if deadline else 0.5)
         require(not self.thread.is_alive(), "channel watcher exit unproved; HOLD")
 
 
 def canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def contains_secret(value, secret):
+    if isinstance(value, str):
+        return secret in value
+    if isinstance(value, list):
+        return any(contains_secret(item, secret) for item in value)
+    if isinstance(value, dict):
+        return any(contains_secret(key, secret) or contains_secret(item, secret) for key, item in value.items())
+    return False
 
 
 def digest(raw):
@@ -336,7 +367,9 @@ def prepare(source_sha, deadline):
         load_baseline(REMOTE_BASE, REMOTE_PINS)
         deadline.check()
     except (Exception, Cancelled) as error:
-        write_new(REMOTE_OUT / "failure.json", canonical({"outcome": Outcome.BASELINE, "stage": "prepare", "exception_type": type(error).__name__, "requests": 0}))
+        deadline.begin_cleanup()
+        deadline.check_hard()
+        write_new(REMOTE_OUT / "failure.json", canonical({"outcome": deadline.outcome if isinstance(error, Cancelled) else Outcome.BASELINE, "stage": "prepare", "exception_type": type(error).__name__, "requests": 0}))
         raise EvidenceError("baseline refused; attempt remains reserved") from None
 
 
@@ -388,13 +421,16 @@ def collect(source_sha, fetch, channel, deadline):
             status, request_id, date, raw = fetch(path, token)
             require(token.encode() not in raw and token not in request_id and token not in date, "provider reflected credential; body not retained")
             stage, outcome = Stage.RESPONSE, Outcome.RESPONSE
-            write_new(REMOTE_OUT / (name + ".body.json"), raw)
             parsed = strict_json(raw)
+            require(not contains_secret(parsed, token), "decoded provider response reflected credential")
             envelope = {"schema": "stoarama.capture-invoice-response.v1", "request_name": name,
                         "started_at": started, "completed_at": now(), "method": "GET", "path": path,
                         "status": status, "request_id": request_id, "date": date,
                         "body": {"file": name + ".body.json", "sha256": digest(raw), "size_bytes": len(raw)}, "parsed_body": parsed}
-            write_new(REMOTE_OUT / (name + ".json"), canonical(envelope))
+            encoded = canonical(envelope)
+            require(token.encode() not in encoded, "serialized response reflected credential")
+            write_new(REMOTE_OUT / (name + ".body.json"), raw)
+            write_new(REMOTE_OUT / (name + ".json"), encoded)
             require(status == 200 and bool(re.fullmatch(r"[A-Za-z0-9-]{1,256}", request_id)), "response status or request ID")
             if name in ("account-before", "account-after"):
                 account(parsed)
@@ -406,8 +442,6 @@ def collect(source_sha, fetch, channel, deadline):
             completed.append(name)
         stage, outcome = Stage.VALIDATION, Outcome.COVERAGE
         validation = validate_capture(REMOTE_OUT, baseline)
-        watcher.close()
-        require(not watcher.disconnected.is_set(), "channel closure before completion")
         deadline.check()
         manifest = {"schema": "stoarama.capture-invoice-collection.v1", "outcome": Outcome.COMPLETE,
                     "source_sha256": source_sha, "baseline_pins_sha256": PINS_SHA, "completed_at": now(),
@@ -419,17 +453,24 @@ def collect(source_sha, fetch, channel, deadline):
             pins.append(digest(body) + "  " + path.name + "\n")
         write_new(REMOTE_OUT / "SHA256SUMS", "".join(pins).encode())
         deadline.check()
+        watcher.close(deadline)
+        require(not watcher.disconnected.is_set(), "channel closure before completion")
+        require(not select.select([channel], [], [], 0)[0], "channel changed after watcher exit")
+        deadline.check()
         outcome = Outcome.COMPLETE
         return {"outcome": outcome, "requests": 7, "manifest_sha256": digest(canonical(manifest)), "apply_authority": False}
     except (Exception, Cancelled) as error:
         if isinstance(error, Cancelled):
             outcome = deadline.outcome
+        deadline.begin_cleanup()
+        watcher.close(deadline)  # Observe exit before a potentially slow fsync.
+        deadline.check_hard()
         failure = {"outcome": outcome, "stage": stage, "request_name": current, "completed_requests": len(completed),
                    "exception_type": type(error).__name__, "channel_disconnected": watcher.disconnected.is_set(), "apply_authority": False}
         write_new(REMOTE_OUT / "failure.json", canonical(failure))
         raise EvidenceError("collection refused; bounded failure preserved; no retry") from None
     finally:
-        watcher.close()
+        watcher.close(deadline)
 
 
 def main():
@@ -463,4 +504,6 @@ if __name__ == "__main__":
     try:
         main()
     except (Exception, Cancelled):
-        raise SystemExit("invoice evidence refused; HOLD, no retry") from None
+        # No late stderr write/flush after a hard deadline. Reserved/partial
+        # evidence plus nonzero terminal status is HOLD, never success.
+        raise SystemExit(1) from None

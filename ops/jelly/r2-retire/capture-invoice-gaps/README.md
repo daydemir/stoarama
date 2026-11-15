@@ -54,17 +54,27 @@ redirect, proxy, retry or next-page discovery.
 
 The one absolute 55-second monotonic budget covers reservation, baseline reads,
 credential parsing, exec, seven requests and durable completion. It cannot be
-reset by exec or a slow fsync. The armed timer survives exec; interruption during
+reset by exec or a slow fsync. Normal work stops at 50 seconds, reserving up to
+5 seconds **inside** that same hard deadline for cooperative cleanup. A second
+alarm protects any failure persistence until the original hard end; expired
+attempts skip durable failure writes and leave partial evidence/HOLD. The armed
+timer survives exec; interruption during
 interpreter startup may leave only a reserved/partial attempt. That is HOLD,
 never inferred success. Per-request connect/read limits are 3/6 seconds.
 The input-channel watcher stops the owned process on EOF, unexpected input or
-channel failure, and its exit must be observed before publishing completion.
+channel failure. It stays active through manifest/checksum writes; its exit and
+a final channel check precede emitting success. A durable manifest can therefore
+exist in a failed attempt; it never replaces the successful terminal receipt.
 
 The local SSH wait is capped at 60 seconds. Timeout or interruption closes its
 owned input and cooperatively TERM/reaps only its own SSH process, with a
 5-second reap limit and **no SIGKILL or remote/session kill**. A process that
 cannot be reaped is explicitly recorded as such; no exit is inferred. Such a
 receipt requires operator reconciliation, and the attempt stays consumed.
+Remote preparer status is independent of SSH exit. A bounded nonblocking pipe
+receipt explicitly reports whether the preparer's exit was observed, including
+false/null when unproved. Missing, partial or invalid status stays explicitly
+unproved in the local receipt; there is no late fsync or status-write retry.
 
 Accept collection only with the complete terminal exit-zero/empty-stderr
 transport receipt and its bound manifest, raw bodies, envelopes and checksums.

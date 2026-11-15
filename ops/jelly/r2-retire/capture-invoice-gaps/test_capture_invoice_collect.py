@@ -149,6 +149,19 @@ class CollectorTests(unittest.TestCase):
         for path in self.root.iterdir():
             self.assertNotIn(SYNTHETIC_TOKEN.encode(), path.read_bytes())
 
+    def test_json_escaped_reflection_is_rejected_before_either_artifact(self):
+        def fetch(path, token):
+            self.calls.append(path)
+            raw = json.dumps({'reflected': token}).replace(token[0], '\\u%04x' % ord(token[0]), 1).encode()
+            self.assertNotIn(token.encode(), raw)
+            return 200, 'SYNTHETIC-1', '', raw
+        with self.assertRaises(gaps.EvidenceError):
+            self.collect(fetch)
+        self.assertFalse((self.root / 'account-before.body.json').exists())
+        self.assertFalse((self.root / 'account-before.json').exists())
+        for path in self.root.iterdir():
+            self.assertNotIn(SYNTHETIC_TOKEN.encode(), path.read_bytes())
+
     def test_baseline_failure_precedes_credentials_and_transport(self):
         class ForbiddenCredentials(dict):
             def pop(self, *args):
@@ -197,20 +210,23 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual((failure['outcome'], failure['channel_disconnected']), ('interrupted', True))
         self.assertEqual(len(self.calls), 1)
 
-    def test_unproved_watcher_exit_cannot_publish_manifest(self):
+    def test_unproved_watcher_exit_cannot_return_success(self):
         class UnprovedWatch:
             disconnected = threading.Event()
             def __init__(self, channel):
                 pass
             def start(self):
                 pass
-            def close(self):
+            def close(self, deadline=None):
                 raise gaps.EvidenceError('SYNTHETIC exit unproved')
         with patch.object(gaps, 'ChannelWatch', UnprovedWatch):
             with self.assertRaises(gaps.EvidenceError):
                 self.collect()
         self.assertEqual(len(self.calls), 7)
-        self.assertFalse((self.root / 'manifest.json').exists())
+        self.assertTrue((self.root / 'manifest.json').exists())
+        # Durable metadata can exist before shutdown is proved. Validation is
+        # not a successful transport receipt and grants no authority.
+        self.assertFalse(gaps.validate_capture(self.root, self.baseline)['apply_authority'])
 
 
 if __name__ == '__main__':

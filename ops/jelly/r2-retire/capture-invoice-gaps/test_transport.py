@@ -72,15 +72,14 @@ except BaseException:sys.exit('SYNTHETIC remote refused; no retry')
 
     def launch(self, seconds=3, core_hook='', launcher_hook='', close_input=False):
         source, sha = self.source(seconds, core_hook)
-        stdout = (self.root / 'stdout').open('wb')
         stderr = (self.root / 'stderr').open('wb')
         env = {'HOME': str(self.root), 'PATH': os.environ.get('PATH', '')}
         child = subprocess.Popen([sys.executable, '-I', '-S', '-B', '-c', self.bootstrap(source, sha, launcher_hook)],
-                                 stdin=subprocess.PIPE, stdout=stdout, stderr=stderr, env=env)
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, env=env)
         try:
             if close_input:
                 child.stdin.close()
-            code = child.wait(timeout=6)
+            code = child.wait(timeout=8)
             self.assertEqual(child.wait(timeout=0), code)  # Owned parent reaped.
         finally:
             if child.poll() is None:
@@ -88,7 +87,9 @@ except BaseException:sys.exit('SYNTHETIC remote refused; no retry')
                 child.wait(timeout=5)
             if not child.stdin.closed:
                 child.stdin.close()
-            stdout.close()
+            raw_stdout = child.stdout.read(65537)
+            child.stdout.close()
+            (self.root / 'stdout').write_bytes(raw_stdout)
             stderr.close()
         for path in self.output.glob('*'):
             self.assertNotIn(TOKEN.encode(), path.read_bytes())
@@ -169,6 +170,76 @@ except BaseException:sys.exit('SYNTHETIC remote refused; no retry')
         _, code = self.launch(close_input=True)
         self.assertNotEqual(code, 0)
         self.assertFalse((self.output / 'manifest.json').exists())
+
+    def test_disconnect_during_finalization_cannot_return_complete(self):
+        marker = self.root / 'late-eof-reached'
+        hook = "original_write=write_new\ndef write_new(path,raw):\n    if path.name=='manifest.json':\n        Path(%r).write_text('reached');os.close(0);time.sleep(0.2)\n    return original_write(path,raw)" % str(marker)
+        _, code = self.launch(core_hook=hook)
+        self.assertTrue(marker.exists())
+        self.assertNotEqual(code, 0)
+        raw = (self.root / 'stdout').read_bytes()
+        if raw:
+            self.assertNotEqual(json.loads(raw)['outcome'], 'complete')
+
+    def test_failure_persistence_after_alarm_remains_inside_hard_budget(self):
+        marker = self.root / 'failure-write-reached'
+        hook = "original_write=write_new\ndef write_new(path,raw):\n    if path.name=='failure.json':\n        Path(%r).write_text('reached');time.sleep(5)\n    return original_write(path,raw)\ndef request_http(path,token):\n    time.sleep(5);raise AssertionError('deadline failed')" % str(marker)
+        started = time.monotonic()
+        _, code = self.launch(seconds=1.5, core_hook=hook)
+        self.assertTrue(marker.exists())
+        self.assertNotEqual(code, 0)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertFalse((self.output / 'failure.json').exists())
+
+    def test_remote_unreaped_preparer_is_explicit_in_failure_status(self):
+        hook = '''
+class Unreaped:
+ pid=99999
+ returncode=None
+ def wait(self,timeout):raise t.subprocess.TimeoutExpired('SYNTHETIC',timeout)
+ def poll(self):return None
+ def terminate(self):pass
+t.subprocess.Popen=lambda *args,**kwargs:Unreaped()
+'''
+        _, code = self.launch(launcher_hook=hook)
+        self.assertNotEqual(code, 0)
+        result = json.loads((self.root / 'stdout').read_bytes())
+        self.assertEqual(result['schema'], 'stoarama.capture-invoice-remote-failure.v1')
+        self.assertFalse(result['preparer_exit_observed'])
+        self.assertIsNone(result['preparer_exit_code'])
+
+    def test_preparer_timeout_failure_fsync_has_no_extra_budget(self):
+        marker = self.root / 'prepare-failure-write'
+        hook = "original_write=write_new\ndef write_new(path,raw):\n    if path.name=='failure.json':\n        Path(%r).write_text('reached');time.sleep(5)\n    return original_write(path,raw)\ndef load_baseline(*args):time.sleep(5);raise AssertionError('deadline failed')" % str(marker)
+        source, sha = self.source(seconds=1.5, hook=hook)
+        code = [sys.executable, '-I', '-S', '-B', '-c', source.read_text(), 'prepare', '--source-sha', sha]
+        start = time.monotonic()
+        code += ['--monotonic-start', repr(start), '--deadline', repr(start + 1.5)]
+        child = subprocess.Popen(code, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            child.communicate(timeout=4)
+        finally:
+            if child.poll() is None:
+                child.terminate()
+                child.wait(timeout=5)
+        self.assertTrue(marker.exists())
+        self.assertNotEqual(child.returncode, 0)
+        self.assertLess(time.monotonic() - start, 4)
+        self.assertFalse((self.output / 'failure.json').exists())
+
+    def test_remote_failure_fsync_stops_at_same_deadline_and_keeps_status(self):
+        marker = self.root / 'remote-failure-write'
+        hook = "original_write=write_new\ndef write_new(path,raw):\n    if path.name=='failure.json':\n        Path(%r).write_text('reached');time.sleep(5)\n    return original_write(path,raw)" % str(marker)
+        launcher = "def refuse_auth():raise ValueError('SYNTHETIC')\nt.token_file=refuse_auth"
+        started = time.monotonic()
+        _, code = self.launch(seconds=1.5, core_hook=hook, launcher_hook=launcher)
+        self.assertTrue(marker.exists())
+        self.assertNotEqual(code, 0)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertFalse((self.output / 'failure.json').exists())
+        status = json.loads((self.root / 'stdout').read_bytes())
+        self.assertEqual(status['stage'], 'credential')
+        self.assertTrue(status['preparer_exit_observed'])
 
     def test_literal_credentials_duplicate_and_mode_refusals(self):
         with patch.object(transport, 'REMOTE_CREDENTIALS', self.config):
