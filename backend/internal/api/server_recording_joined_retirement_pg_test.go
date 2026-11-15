@@ -177,6 +177,25 @@ func TestR2JoinedWriterRetirementRealSchema(t *testing.T) {
 	if snapshot(pool) != original {
 		t.Fatal("rollback changed snapshot")
 	}
+	// Checking a deferred constraint early must not let later mutations diverge
+	// from the audited after-image before COMMIT.
+	tx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.QueryRow(ctx, `SELECT r2_retire_dead_joined_batch($1,$2,$3,$4,'independent-test','[]')`, uuid.New(), batch, original, digest).Scan(&count); err != nil {
+		tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(ctx, `SET CONSTRAINTS r2_joined_writer_run_complete IMMEDIATE`); err != nil {
+		tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	_, err = tx.Exec(ctx, `UPDATE recording_joined_admission_controls SET claims_paused=false,updated_at=clock_timestamp() WHERE batch_record_id=$1`, batch)
+	tx.Rollback(ctx)
+	if err == nil {
+		t.Fatal("early constraint validation allowed conflicting admission mutation")
+	}
 	if err = pool.QueryRow(ctx, `SELECT r2_retire_dead_joined_batch($1,$2,$3,$4,'independent-test','[]')`, uuid.New(), batch, original, digest).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
@@ -185,6 +204,9 @@ func TestR2JoinedWriterRetirementRealSchema(t *testing.T) {
 	var state string
 	if err = pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM recording_joined_hours WHERE batch_record_id=$1 AND state IN ('pending','leased'))+(SELECT count(*) FROM recording_joined_artifacts WHERE batch_record_id=$1 AND publication_state IN ('sealed','publishing')),(SELECT count(*) FROM r2_joined_writer_retirement_items),(SELECT claims_paused FROM recording_joined_admission_controls WHERE batch_record_id=$1),(SELECT state FROM recording_joined_batches WHERE id=$1)`, batch).Scan(&blocked, &audited, &paused, &state); err != nil || blocked != 0 || count != audited || !paused || state != "terminal_failed" {
 		t.Fatalf("atomic result blocked=%d count=%d audit=%d paused=%v state=%s err=%v", blocked, count, audited, paused, state, err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_joined_admission_controls SET claims_paused=false,updated_at=clock_timestamp() WHERE batch_record_id=$1`, batch); err == nil {
+		t.Fatal("committed retired admission reopened")
 	}
 	if _, err = pool.Exec(ctx, `DELETE FROM r2_joined_writer_retirement_items`); err == nil {
 		t.Fatal("audit mutable")

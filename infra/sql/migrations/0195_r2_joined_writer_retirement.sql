@@ -149,6 +149,20 @@ END $$;
 CREATE CONSTRAINT TRIGGER r2_joined_writer_run_complete AFTER INSERT ON r2_joined_writer_retirement_runs
  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION validate_r2_joined_writer_retirement_complete();
 
+-- Admission is the only ordinary mutable row after terminalizing the batch.
+-- Keep its exact audited image even if deferred checks were run early, and
+-- prevent later transactions from reopening retired admission.
+CREATE FUNCTION guard_r2_joined_retired_admission() RETURNS trigger LANGUAGE plpgsql SET timezone='UTC' AS $$
+BEGIN
+ IF EXISTS(SELECT 1 FROM r2_joined_writer_retirement_runs r WHERE r.batch_record_id=NEW.batch_record_id
+  AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(r.expected_rows) e WHERE e->>'kind'='admission'
+   AND (e->>'record_id')::bigint=NEW.batch_record_id AND e->>'after_sha256'=r2_joined_writer_row_sha(to_jsonb(NEW))))
+ THEN RAISE EXCEPTION 'retired joined admission must retain its exact audited after-image'; END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_joined_retired_admission_guard BEFORE UPDATE ON recording_joined_admission_controls
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_joined_retired_admission();
+
 CREATE FUNCTION r2_joined_writer_retirement_matches(k r2_joined_retired_kind, record bigint, old_row jsonb, new_row jsonb)
  RETURNS boolean LANGUAGE plpgsql STABLE SET timezone='UTC' AS $$
 DECLARE fields text[];

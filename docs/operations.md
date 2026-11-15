@@ -453,7 +453,9 @@ Audit INSERT admission independently locks and validates the fence, full snapsho
 owner roster and activity. SQL derives every exact permitted before/after row;
 callers cannot supply a different authorization. A deferred constraint checks
 the entire expected audit roster, actual committed rows, admission and parent.
-Direct audit inserts cannot commit a partial or forged cancellation.
+Direct audit inserts cannot commit a partial or forged cancellation. Retired
+admission retains its exact audited after-image, including when a caller runs
+the deferred constraint early or attempts to reopen it in a later transaction.
 
 The transaction appends immutable run and per-item before/after digests, pauses
 admission, terminalizes every pending/expired hour and sealed/nonlive-publishing
