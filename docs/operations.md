@@ -407,7 +407,11 @@ read-only `reconcile-writers` command.
 Apply requires the exact reviewed snapshot digest, a checksummed owner map,
 a fresh independent production-review reference, and the controller-pinned live
 backend commit. A new private evidence file is fsynced before any transition.
-Every leased owner must map exactly to a primary provider resource. Render proof
+Every leased owner must map exactly to a primary provider resource.
+The entire batch must retain complete ownership history: unattempted rows or
+first attempts with their owner still recorded. A reclaim, released claim or
+completed attempted row loses prior-owner identity and refuses cancellation;
+current claims cannot substitute for a complete old-owner inventory. Render proof
 requires the exact joined service suspended with work scope disabled. A deleted
 DO owner requires its preserved primary resource identity and original account
 UUID association, a fresh matching account read, and a fresh exact-resource 404.
@@ -444,6 +448,12 @@ transaction; the controller must hold that whole window. SQL takes the existing
 writer/freeze locks, rechecks the exact complete snapshot, requires 15 minutes
 without writes/heartbeats and no live leases, and requires a fresh exact owner
 proof roster. Unsupported pending stream-days remain blockers.
+
+Audit INSERT admission independently locks and validates the fence, full snapshot,
+owner roster and activity. SQL derives every exact permitted before/after row;
+callers cannot supply a different authorization. A deferred constraint checks
+the entire expected audit roster, actual committed rows, admission and parent.
+Direct audit inserts cannot commit a partial or forged cancellation.
 
 The transaction appends immutable run and per-item before/after digests, pauses
 admission, terminalizes every pending/expired hour and sealed/nonlive-publishing

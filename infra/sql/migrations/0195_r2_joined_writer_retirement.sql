@@ -10,6 +10,7 @@ CREATE TABLE r2_joined_writer_retirement_runs (
  snapshot_sha256 text NOT NULL CHECK(snapshot_sha256 ~ '^[a-f0-9]{64}$'),
  proof_sha256 text NOT NULL CHECK(proof_sha256 ~ '^[a-f0-9]{64}$'),
  reviewer_reference text NOT NULL CHECK(length(btrim(reviewer_reference)) BETWEEN 1 AND 1024),
+ expected_rows jsonb NOT NULL CHECK(jsonb_typeof(expected_rows)='array'),
  owner_evidence jsonb NOT NULL CHECK(jsonb_typeof(owner_evidence)='array'),
  transaction_id xid8 NOT NULL DEFAULT pg_current_xact_id(),
  created_at timestamptz NOT NULL DEFAULT clock_timestamp()
@@ -42,6 +43,111 @@ CREATE FUNCTION r2_joined_writer_snapshot(p_batch bigint) RETURNS text LANGUAGE 
   'artifacts',(SELECT coalesce(jsonb_agg(jsonb_build_array(a.id,r2_joined_writer_row_sha(to_jsonb(a))) ORDER BY a.id),'[]') FROM recording_joined_artifacts a WHERE a.batch_record_id=b.id)))
  FROM recording_joined_batches b WHERE b.id=p_batch
 $$;
+
+
+-- Derive the complete allowed transition from locked source rows. Neither a
+-- caller-supplied audit item nor an arbitrary same-transaction ID grants it.
+CREATE FUNCTION r2_joined_writer_expected_rows(p_batch bigint) RETURNS jsonb LANGUAGE sql STABLE SET timezone='UTC' AS $$
+ WITH source_rows AS (
+  SELECT 'hour' kind,h.id,to_jsonb(h) body FROM recording_joined_hours h WHERE batch_record_id=p_batch AND state IN ('pending','leased')
+  UNION ALL SELECT 'artifact',a.id,to_jsonb(a) FROM recording_joined_artifacts a WHERE batch_record_id=p_batch AND publication_state IN ('sealed','publishing')
+  UNION ALL SELECT 'admission',c.batch_record_id,to_jsonb(c) FROM recording_joined_admission_controls c WHERE batch_record_id=p_batch
+  UNION ALL SELECT 'batch',b.id,to_jsonb(b) FROM recording_joined_batches b WHERE id=p_batch
+ ), transitions AS (
+  SELECT kind,id,body,body || CASE kind
+   WHEN 'hour' THEN jsonb_build_object('state','terminal_failed','failure_reason_code','owner_retired','claim_token',NULL,'claimed_by',NULL,'lease_expires_at',NULL,'heartbeat_at',NULL,'updated_at',transaction_timestamp())
+   WHEN 'artifact' THEN jsonb_build_object('publication_state','terminal_failed','failure_reason_code','owner_retired','publication_token',NULL,'publication_claimed_by',NULL,'publication_lease_expires_at',NULL,'publication_heartbeat_at',NULL,'updated_at',transaction_timestamp())
+   WHEN 'admission' THEN jsonb_build_object('claims_paused',true,'updated_at',transaction_timestamp())
+   WHEN 'batch' THEN jsonb_build_object('state','terminal_failed','failure_reason_code','owner_retired') END after_body
+  FROM source_rows
+ ) SELECT jsonb_agg(jsonb_build_object('kind',kind,'record_id',id,'before_sha256',r2_joined_writer_row_sha(body),
+  'after_sha256',r2_joined_writer_row_sha(after_body)) ORDER BY kind,id) FROM transitions
+$$;
+
+-- Old reclaim/release/completion overwrites owner identity. Until preserved
+-- primary history accounts for every attempt, these batches must stay blocked.
+CREATE FUNCTION r2_joined_writer_owner_inventory_complete(p_batch bigint) RETURNS boolean LANGUAGE sql STABLE AS $$
+ SELECT NOT EXISTS(SELECT 1 FROM recording_joined_hours WHERE batch_record_id=p_batch AND attempt_count>0
+  AND (attempt_count<>1 OR state<>'leased' OR claimed_by IS NULL))
+ AND NOT EXISTS(SELECT 1 FROM recording_joined_artifacts WHERE batch_record_id=p_batch AND publication_attempt_count>0
+  AND (publication_attempt_count<>1 OR publication_state<>'publishing' OR publication_claimed_by IS NULL))
+$$;
+
+CREATE FUNCTION guard_r2_joined_writer_retirement_run() RETURNS trigger LANGUAGE plpgsql SET timezone='UTC' AS $$
+DECLARE b recording_joined_batches%ROWTYPE; c recording_joined_admission_controls%ROWTYPE;
+BEGIN
+ PERFORM pg_advisory_xact_lock(7343226011187);
+ PERFORM pg_advisory_xact_lock(137,1);
+ IF NOT EXISTS(SELECT 1 FROM r2_retirement_writer_fences WHERE bucket='stoarama')
+ THEN RAISE EXCEPTION 'active R2 writer fence required'; END IF;
+ SELECT * INTO STRICT b FROM recording_joined_batches WHERE id=NEW.batch_record_id FOR UPDATE;
+ SELECT * INTO STRICT c FROM recording_joined_admission_controls WHERE batch_record_id=NEW.batch_record_id FOR UPDATE;
+ PERFORM 1 FROM recording_joined_hours WHERE batch_record_id=NEW.batch_record_id ORDER BY id FOR UPDATE;
+ PERFORM 1 FROM recording_joined_artifacts WHERE batch_record_id=NEW.batch_record_id ORDER BY id FOR UPDATE;
+ PERFORM 1 FROM recording_joined_stream_days WHERE batch_record_id=NEW.batch_record_id ORDER BY id FOR UPDATE;
+ IF b.state NOT IN ('building','frozen','index_sealed') OR b.account_id<>47 OR b.connection_id<>13
+  OR r2_joined_writer_snapshot(NEW.batch_record_id) IS DISTINCT FROM NEW.snapshot_sha256
+  OR EXISTS(SELECT 1 FROM recording_joined_stream_days WHERE batch_record_id=NEW.batch_record_id AND state='pending')
+  OR EXISTS(SELECT 1 FROM recording_joined_hours WHERE batch_record_id=NEW.batch_record_id AND state IN ('pending','leased')
+   AND (lease_expires_at>clock_timestamp() OR heartbeat_at>clock_timestamp()-interval '15 minutes' OR updated_at>clock_timestamp()-interval '15 minutes'))
+  OR EXISTS(SELECT 1 FROM recording_joined_artifacts WHERE batch_record_id=NEW.batch_record_id AND publication_state IN ('sealed','publishing')
+   AND (publication_lease_expires_at>clock_timestamp() OR publication_heartbeat_at>clock_timestamp()-interval '15 minutes' OR updated_at>clock_timestamp()-interval '15 minutes'))
+ THEN RAISE EXCEPTION 'joined snapshot drift, live/recent work or unsupported pending day'; END IF;
+ IF NOT r2_joined_writer_owner_inventory_complete(NEW.batch_record_id)
+ THEN RAISE EXCEPTION 'historical joined owner inventory is incomplete; current claims are not a complete roster'; END IF;
+ IF jsonb_typeof(NEW.owner_evidence) IS DISTINCT FROM 'array'
+  OR jsonb_array_length(NEW.owner_evidence)<>(SELECT count(DISTINCT e->>'owner') FROM jsonb_array_elements(NEW.owner_evidence)e) OR EXISTS(SELECT 1 FROM jsonb_array_elements(NEW.owner_evidence) e
+  WHERE coalesce(e->>'kind','') NOT IN ('render_suspended','do_destroyed') OR coalesce(e->>'owner','')='' OR coalesce(e->>'resource_id','')=''
+   OR coalesce(e->>'evidence_sha256','') !~ '^[a-f0-9]{64}$'
+   OR e->>'observed_at' IS NULL OR (e->>'observed_at')::timestamptz NOT BETWEEN clock_timestamp()-interval '5 minutes' AND clock_timestamp()+interval '1 minute')
+  OR ARRAY(SELECT DISTINCT owner FROM (
+   SELECT claimed_by owner FROM recording_joined_hours WHERE batch_record_id=NEW.batch_record_id AND state='leased'
+   UNION SELECT publication_claimed_by FROM recording_joined_artifacts WHERE batch_record_id=NEW.batch_record_id AND publication_state='publishing') x WHERE owner IS NOT NULL ORDER BY owner)
+   IS DISTINCT FROM ARRAY(SELECT DISTINCT e->>'owner' FROM jsonb_array_elements(NEW.owner_evidence)e ORDER BY e->>'owner')
+ THEN RAISE EXCEPTION 'fresh exact owner evidence roster required'; END IF;
+ NEW.transaction_id:=pg_current_xact_id();
+ NEW.created_at:=clock_timestamp();
+ NEW.expected_rows:=r2_joined_writer_expected_rows(NEW.batch_record_id);
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_joined_writer_run_admission BEFORE INSERT ON r2_joined_writer_retirement_runs
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_joined_writer_retirement_run();
+
+CREATE FUNCTION guard_r2_joined_writer_retirement_item() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF NOT EXISTS(SELECT 1 FROM r2_joined_writer_retirement_runs r WHERE r.id=NEW.run_id
+  AND r.transaction_id=pg_current_xact_id() AND r.expected_rows @> jsonb_build_array(to_jsonb(NEW)-'run_id'))
+ THEN RAISE EXCEPTION 'joined audit item is not an exact admitted transition'; END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_joined_writer_item_admission BEFORE INSERT ON r2_joined_writer_retirement_items
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_joined_writer_retirement_item();
+
+-- Even direct INSERTs cannot commit partial or forged audit authorization.
+-- This runs at commit, after all children and the parent have transitioned.
+CREATE FUNCTION validate_r2_joined_writer_retirement_complete() RETURNS trigger LANGUAGE plpgsql SET timezone='UTC' AS $$
+DECLARE actual jsonb;
+BEGIN
+ SELECT jsonb_agg(to_jsonb(i)-'run_id' ORDER BY kind::text,record_id) INTO actual
+ FROM r2_joined_writer_retirement_items i WHERE run_id=NEW.id;
+ IF actual IS DISTINCT FROM NEW.expected_rows
+  OR NOT EXISTS(SELECT 1 FROM recording_joined_batches WHERE id=NEW.batch_record_id AND state='terminal_failed' AND failure_reason_code='owner_retired')
+  OR NOT EXISTS(SELECT 1 FROM recording_joined_admission_controls WHERE batch_record_id=NEW.batch_record_id AND claims_paused)
+  OR EXISTS(SELECT 1 FROM recording_joined_hours WHERE batch_record_id=NEW.batch_record_id AND state IN ('pending','leased'))
+  OR EXISTS(SELECT 1 FROM recording_joined_artifacts WHERE batch_record_id=NEW.batch_record_id AND publication_state IN ('sealed','publishing'))
+  OR EXISTS(SELECT 1 FROM recording_joined_stream_days WHERE batch_record_id=NEW.batch_record_id AND state='pending')
+  OR EXISTS(SELECT 1 FROM r2_joined_writer_retirement_items i WHERE i.run_id=NEW.id AND i.after_sha256 IS DISTINCT FROM
+   CASE i.kind
+    WHEN 'hour' THEN (SELECT r2_joined_writer_row_sha(to_jsonb(h)) FROM recording_joined_hours h WHERE h.id=i.record_id)
+    WHEN 'artifact' THEN (SELECT r2_joined_writer_row_sha(to_jsonb(a)) FROM recording_joined_artifacts a WHERE a.id=i.record_id)
+    WHEN 'admission' THEN (SELECT r2_joined_writer_row_sha(to_jsonb(c)) FROM recording_joined_admission_controls c WHERE c.batch_record_id=i.record_id)
+    WHEN 'batch' THEN (SELECT r2_joined_writer_row_sha(to_jsonb(b)) FROM recording_joined_batches b WHERE b.id=i.record_id)
+   END)
+ THEN RAISE EXCEPTION 'joined retirement must commit the entire exact audited batch'; END IF;
+ RETURN NULL;
+END $$;
+CREATE CONSTRAINT TRIGGER r2_joined_writer_run_complete AFTER INSERT ON r2_joined_writer_retirement_runs
+ DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION validate_r2_joined_writer_retirement_complete();
 
 CREATE FUNCTION r2_joined_writer_retirement_matches(k r2_joined_retired_kind, record bigint, old_row jsonb, new_row jsonb)
  RETURNS boolean LANGUAGE plpgsql STABLE SET timezone='UTC' AS $$
@@ -95,35 +201,10 @@ CREATE FUNCTION r2_retire_dead_joined_batch(p_run uuid,p_batch bigint,p_snapshot
  RETURNS integer LANGUAGE plpgsql SET timezone='UTC' AS $$
 DECLARE b recording_joined_batches%ROWTYPE; c recording_joined_admission_controls%ROWTYPE; row record; old_body jsonb; new_body jsonb; total integer:=0;
 BEGIN
- PERFORM pg_advisory_xact_lock(7343226011187);
- PERFORM pg_advisory_xact_lock(137,1);
- IF NOT EXISTS(SELECT 1 FROM r2_retirement_writer_fences WHERE bucket='stoarama')
- THEN RAISE EXCEPTION 'active R2 writer fence required'; END IF;
- SELECT * INTO STRICT b FROM recording_joined_batches WHERE id=p_batch FOR UPDATE;
- SELECT * INTO STRICT c FROM recording_joined_admission_controls WHERE batch_record_id=p_batch FOR UPDATE;
- PERFORM 1 FROM recording_joined_hours WHERE batch_record_id=p_batch ORDER BY id FOR UPDATE;
- PERFORM 1 FROM recording_joined_artifacts WHERE batch_record_id=p_batch ORDER BY id FOR UPDATE;
- PERFORM 1 FROM recording_joined_stream_days WHERE batch_record_id=p_batch ORDER BY id FOR UPDATE;
- IF b.state NOT IN ('building','frozen','index_sealed') OR b.account_id<>47 OR b.connection_id<>13
-  OR r2_joined_writer_snapshot(p_batch) IS DISTINCT FROM p_snapshot
-  OR EXISTS(SELECT 1 FROM recording_joined_stream_days WHERE batch_record_id=p_batch AND state='pending')
-  OR EXISTS(SELECT 1 FROM recording_joined_hours WHERE batch_record_id=p_batch AND state IN ('pending','leased')
-   AND (lease_expires_at>clock_timestamp() OR heartbeat_at>clock_timestamp()-interval '15 minutes' OR updated_at>clock_timestamp()-interval '15 minutes'))
-  OR EXISTS(SELECT 1 FROM recording_joined_artifacts WHERE batch_record_id=p_batch AND publication_state IN ('sealed','publishing')
-   AND (publication_lease_expires_at>clock_timestamp() OR publication_heartbeat_at>clock_timestamp()-interval '15 minutes' OR updated_at>clock_timestamp()-interval '15 minutes'))
- THEN RAISE EXCEPTION 'joined snapshot drift, live/recent work or unsupported pending day'; END IF;
- IF jsonb_typeof(p_evidence) IS DISTINCT FROM 'array'
-  OR jsonb_array_length(p_evidence)<>(SELECT count(DISTINCT e->>'owner') FROM jsonb_array_elements(p_evidence)e) OR EXISTS(SELECT 1 FROM jsonb_array_elements(p_evidence) e
-  WHERE coalesce(e->>'kind','') NOT IN ('render_suspended','do_destroyed') OR coalesce(e->>'owner','')='' OR coalesce(e->>'resource_id','')=''
-   OR coalesce(e->>'evidence_sha256','') !~ '^[a-f0-9]{64}$'
-   OR e->>'observed_at' IS NULL OR (e->>'observed_at')::timestamptz NOT BETWEEN clock_timestamp()-interval '5 minutes' AND clock_timestamp()+interval '1 minute')
-  OR ARRAY(SELECT DISTINCT owner FROM (
-   SELECT claimed_by owner FROM recording_joined_hours WHERE batch_record_id=p_batch AND state='leased'
-   UNION SELECT publication_claimed_by FROM recording_joined_artifacts WHERE batch_record_id=p_batch AND publication_state='publishing') x WHERE owner IS NOT NULL ORDER BY owner)
-   IS DISTINCT FROM ARRAY(SELECT DISTINCT e->>'owner' FROM jsonb_array_elements(p_evidence)e ORDER BY e->>'owner')
- THEN RAISE EXCEPTION 'fresh exact owner evidence roster required'; END IF;
  INSERT INTO r2_joined_writer_retirement_runs(id,batch_record_id,snapshot_sha256,proof_sha256,reviewer_reference,owner_evidence)
  VALUES(p_run,p_batch,p_snapshot,p_proof,p_reviewer,p_evidence);
+ SELECT * INTO STRICT b FROM recording_joined_batches WHERE id=p_batch;
+ SELECT * INTO STRICT c FROM recording_joined_admission_controls WHERE batch_record_id=p_batch;
  old_body:=to_jsonb(c);new_body:=old_body||jsonb_build_object('claims_paused',true,'updated_at',transaction_timestamp());
  INSERT INTO r2_joined_writer_retirement_items VALUES(p_run,'admission',p_batch,r2_joined_writer_row_sha(old_body),r2_joined_writer_row_sha(new_body));
  UPDATE recording_joined_admission_controls SET claims_paused=true,updated_at=transaction_timestamp() WHERE batch_record_id=p_batch;

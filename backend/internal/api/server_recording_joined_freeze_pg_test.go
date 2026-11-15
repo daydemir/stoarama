@@ -199,9 +199,16 @@ func newJoinedHistoricalTier1FixtureWithoutCheckpoint(t *testing.T, email string
 }
 
 func newJoinedHistoricalTier1FixtureWithCheckpoint(t *testing.T, email string, seedCheckpoint bool) joinedHistoricalTier1Fixture {
+	return newJoinedHistoricalTier1FixtureWithSetup(t, email, seedCheckpoint, nil)
+}
+
+func newJoinedHistoricalTier1FixtureWithSetup(t *testing.T, email string, seedCheckpoint bool, setup func(*pgxpool.Pool)) joinedHistoricalTier1Fixture {
 	t.Helper()
 	s, pool, applyMigration, cleanup := testJoinedServerBeforeMigration(t)
 	applyMigration()
+	if setup != nil {
+		setup(pool)
+	}
 	ctx := context.Background()
 	cipher, err := secretbox.NewFromBase64Key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {

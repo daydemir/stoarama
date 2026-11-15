@@ -237,16 +237,17 @@ type r2JoinedWriterItem struct {
 	RowSHA256 string             `json:"row_sha256"`
 }
 type r2JoinedWriterSnapshot struct {
-	ObservedAt time.Time            `json:"observed_at"`
-	BatchID    int64                `json:"batch_record_id"`
-	SHA256     string               `json:"snapshot_sha256"`
-	Owners     []string             `json:"owners"`
-	Items      []r2JoinedWriterItem `json:"items"`
+	ObservedAt             time.Time            `json:"observed_at"`
+	BatchID                int64                `json:"batch_record_id"`
+	SHA256                 string               `json:"snapshot_sha256"`
+	Owners                 []string             `json:"owners"`
+	OwnerInventoryComplete bool                 `json:"owner_inventory_complete"`
+	Items                  []r2JoinedWriterItem `json:"items"`
 }
 
 func r2JoinedWriterObserve(ctx context.Context, q r2RetireQuerier, batch int64) (r2JoinedWriterSnapshot, error) {
 	s := r2JoinedWriterSnapshot{BatchID: batch}
-	if err := q.QueryRow(ctx, `SELECT clock_timestamp(),r2_joined_writer_snapshot($1),ARRAY(SELECT DISTINCT owner FROM(SELECT claimed_by owner FROM recording_joined_hours WHERE batch_record_id=$1 AND state='leased' UNION SELECT publication_claimed_by FROM recording_joined_artifacts WHERE batch_record_id=$1 AND publication_state='publishing') x WHERE owner IS NOT NULL ORDER BY owner)`, batch).Scan(&s.ObservedAt, &s.SHA256, &s.Owners); err != nil {
+	if err := q.QueryRow(ctx, `SELECT clock_timestamp(),r2_joined_writer_snapshot($1),r2_joined_writer_owner_inventory_complete($1),ARRAY(SELECT DISTINCT owner FROM(SELECT claimed_by owner FROM recording_joined_hours WHERE batch_record_id=$1 AND state='leased' UNION SELECT publication_claimed_by FROM recording_joined_artifacts WHERE batch_record_id=$1 AND publication_state='publishing') x WHERE owner IS NOT NULL ORDER BY owner)`, batch).Scan(&s.ObservedAt, &s.SHA256, &s.OwnerInventoryComplete, &s.Owners); err != nil {
 		return s, errors.New("joined writer snapshot unavailable")
 	}
 	rows, err := q.Query(ctx, `SELECT 'hour',id,state,coalesce(claimed_by,''),r2_joined_writer_row_sha(to_jsonb(h)) FROM recording_joined_hours h WHERE batch_record_id=$1 AND state IN('pending','leased') UNION ALL SELECT 'artifact',id,publication_state,coalesce(publication_claimed_by,''),r2_joined_writer_row_sha(to_jsonb(a)) FROM recording_joined_artifacts a WHERE batch_record_id=$1 AND publication_state IN('sealed','publishing') UNION ALL SELECT 'admission',batch_record_id,claims_paused::text,'',r2_joined_writer_row_sha(to_jsonb(c)) FROM recording_joined_admission_controls c WHERE batch_record_id=$1 UNION ALL SELECT 'batch',id,state,'',r2_joined_writer_row_sha(to_jsonb(b)) FROM recording_joined_batches b WHERE id=$1 ORDER BY 1,2`, batch)
@@ -342,6 +343,9 @@ func runR2JoinedWriterCancel(ctx context.Context, cfg config.Config, args []stri
 	if !o.apply {
 		log.Printf("dry run: %d exact joined writer rows; no transitions", len(snapshot.Items))
 		return
+	}
+	if !snapshot.OwnerInventoryComplete {
+		log.Fatal("historical joined owner inventory is incomplete; no transition")
 	}
 	if snapshot.SHA256 != o.snapshot {
 		log.Fatal("joined writer snapshot differs from reviewed dry run")
