@@ -228,6 +228,47 @@ class CollectorTests(unittest.TestCase):
         # not a successful transport receipt and grants no authority.
         self.assertFalse(gaps.validate_capture(self.root, self.baseline)['apply_authority'])
 
+    def test_observed_input_or_error_survives_shutdown_and_empty_open_pipe(self):
+        original_select, original_read = gaps.select.select, os.read
+        for observed_error in [False, True]:
+            with self.subTest(error=observed_error):
+                reached, release = threading.Event(), threading.Event()
+                os.write(self.write_fd, b'x')
+                def interleave(*args):
+                    ready = original_select(*args)
+                    if ready[0]:
+                        # Reproduce the old consumed-byte point: the pipe is
+                        # empty but remains open while close() races shutdown.
+                        original_read(self.channel.fileno(), 1)
+                        reached.set()
+                        self.assertTrue(release.wait(2))
+                        if observed_error:
+                            raise OSError('SYNTHETIC observed channel failure')
+                    return ready
+                with patch.object(gaps.select, 'select', interleave), patch.object(gaps.os, 'kill') as kill:
+                    watcher = gaps.ChannelWatch(self.channel)
+                    watcher.start()
+                    try:
+                        self.assertTrue(reached.wait(2))
+                        watcher.finished.set()
+                    finally:
+                        release.set()
+                        watcher.close()
+                    self.assertTrue(watcher.disconnected.is_set())
+                    kill.assert_not_called()  # Suppress the signal, not evidence.
+                self.assertEqual(original_select([self.channel], [], [], 0)[0], [])
+
+    def test_partial_artifact_syscall_is_hold_without_write_retry(self):
+        path = self.root / 'partial-artifact'
+        original = os.write
+        def partial(fd, raw):
+            return original(fd, raw[:1])
+        with patch.object(gaps.os, 'write', side_effect=partial) as write:
+            with self.assertRaises(gaps.EvidenceError):
+                gaps.write_new(path, b'{"SYNTHETIC":true}')
+            self.assertEqual(write.call_count, 1)
+        self.assertEqual(path.read_bytes(), b'{')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

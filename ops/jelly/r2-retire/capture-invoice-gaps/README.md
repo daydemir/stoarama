@@ -65,6 +65,11 @@ The input-channel watcher stops the owned process on EOF, unexpected input or
 channel failure. It stays active through manifest/checksum writes; its exit and
 a final channel check precede emitting success. A durable manifest can therefore
 exist in a failed attempt; it never replaces the successful terminal receipt.
+Artifact, receipt and stdout writes use single raw descriptor writes. Partial
+writes mean HOLD; no buffered close, deallocation or interpreter-shutdown flush
+can retry them after cancellation. Remote Python also uses `-u`. The watcher
+never consumes forbidden input: readiness/error is latched independently of
+shutdown, even when a late signal is suppressed.
 
 The local SSH wait is capped at 60 seconds. Timeout or interruption closes its
 owned input and cooperatively TERM/reaps only its own SSH process, with a

@@ -145,12 +145,13 @@ def emit_failure(status):
 
 
 def write_receipt(path, value):
+    raw = (json.dumps(value, sort_keys=True, allow_nan=False) + '\n').encode()
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, 'w') as output:
-        json.dump(value, output, sort_keys=True, allow_nan=False)
-        output.write('\n')
-        output.flush()
-        os.fsync(output.fileno())
+    try:
+        require(os.write(fd, raw) == len(raw), 'partial receipt write; HOLD')
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     directory = os.open(Path(path).parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(directory)
@@ -172,7 +173,7 @@ def remote(source_sha):
         try:
             watcher.start()
             common = ['--source-sha', source_sha, '--monotonic-start', repr(start), '--deadline', repr(end)]
-            child = subprocess.Popen([PYTHON, '-I', '-S', '-B', '-c', raw.decode(), 'prepare', *common],
+            child = subprocess.Popen([PYTHON, '-I', '-S', '-B', '-u', '-c', raw.decode(), 'prepare', *common],
                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
             require(child.wait(timeout=max(0.001, end - time.monotonic())) == 0, 'preparation refused')
             deadline.check()
@@ -185,7 +186,7 @@ def remote(source_sha):
             stage = Stage.EXEC
             # Exact verified bytes; no mutable executable path reopened. The
             # absolute deadline and armed timer survive exec; no budget reset.
-            os.execve(PYTHON, [PYTHON, '-I', '-S', '-B', '-c', raw.decode(), 'collect', *common], env)
+            os.execve(PYTHON, [PYTHON, '-I', '-S', '-B', '-u', '-c', raw.decode(), 'collect', *common], env)
         except (Exception, module.Cancelled) as error:
             try:
                 deadline.begin_cleanup()
@@ -219,7 +220,7 @@ def remote(source_sha):
 def command(collector_path, source_sha, transport_path, transport_sha):
     checked_file(collector_path, source_sha, 65536)
     script = checked_file(transport_path, transport_sha, 65536).decode()
-    return SSH + [shlex.join([PYTHON, '-I', '-S', '-B', '-c', script, 'remote', '--source-sha', source_sha])]
+    return SSH + [shlex.join([PYTHON, '-I', '-S', '-B', '-u', '-c', script, 'remote', '--source-sha', source_sha])]
 
 
 def run(argv, capture):
@@ -313,10 +314,11 @@ def main():
         require(args.collector_file and args.transport_file and args.transport_sha, 'both public source pins required')
         argv = command(args.collector_file, args.source_sha, args.transport_file, args.transport_sha)
         if args.mode == 'plan':
-            print(json.dumps({'argv': argv, 'execution_authorized': False}))
+            raw = (json.dumps({'argv': argv, 'execution_authorized': False}) + '\n').encode()
         else:
             require(args.capture_dir, 'new local capture directory required')
-            print(json.dumps(run(argv, args.capture_dir)))
+            raw = (json.dumps(run(argv, args.capture_dir)) + '\n').encode()
+        require(os.write(sys.stdout.fileno(), raw) == len(raw), 'partial transport stdout; HOLD')
 
 
 if __name__ == '__main__':

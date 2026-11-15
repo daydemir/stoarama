@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shlex
 import signal
+import select
 import subprocess
 import sys
 import tempfile
@@ -241,6 +242,84 @@ t.subprocess.Popen=lambda *args,**kwargs:Unreaped()
         self.assertEqual(status['stage'], 'credential')
         self.assertTrue(status['preparer_exit_observed'])
 
+    def full_pipe(self):
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        os.set_blocking(write_fd, False)
+        filled = 0
+        try:
+            while filled < 2 * 1024 * 1024:
+                filled += os.write(write_fd, b'SYNTHETIC' * 128)
+        except BlockingIOError:
+            pass
+        self.assertLess(filled, 2 * 1024 * 1024)
+        os.set_blocking(write_fd, True)
+        return read_fd, write_fd
+
+    def wait_then_release_pipe(self, child, read_fd):
+        timely = True
+        try:
+            child.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            timely = False
+        finally:
+            # Release a broken implementation without force-killing it or
+            # leaving a fixture child blocked during interpreter shutdown.
+            os.set_blocking(read_fd, False)
+            until = time.monotonic() + 3
+            while child.poll() is None and time.monotonic() < until:
+                ready, _, _ = select.select([read_fd], [], [], 0.02)
+                if ready:
+                    os.read(read_fd, 65536)
+            if child.poll() is None:
+                child.terminate()
+            child.wait(timeout=5)
+            if child.stdin is not None and not child.stdin.closed:
+                child.stdin.close()
+            if child.stdout is not None:
+                child.stdout.close()
+            if child.stderr is not None:
+                child.stderr.close()
+        return timely
+
+    def test_actual_blocked_failure_write_has_no_implicit_flush_retry(self):
+        read_fd, write_fd = self.full_pipe()
+        marker = self.root / 'blocked-failure-write-reached'
+        hook = "original_open=os.open\ndef redirected_open(path,flags,*args):\n    if Path(path).name=='failure.json':\n        Path(%r).write_text('reached');return os.dup(%d)\n    return original_open(path,flags,*args)\nos.open=redirected_open\ndef request_http(path,token):raise OSError('SYNTHETIC')" % (str(marker), write_fd)
+        source, sha = self.source(seconds=1.5, hook=hook)
+        child = subprocess.Popen([sys.executable, '-I', '-S', '-B', '-c', self.bootstrap(source, sha)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 pass_fds=(write_fd,), env={'HOME': str(self.root), 'PATH': os.environ.get('PATH', '')})
+        timely = self.wait_then_release_pipe(child, read_fd)
+        self.assertTrue(marker.exists())
+        self.assertTrue(timely, 'buffered close retried after the hard alarm')
+        self.assertNotEqual(child.returncode, 0)
+
+    def test_actual_blocked_success_stdout_exits_without_shutdown_flush(self):
+        read_fd, write_fd = self.full_pipe()
+        source, sha = self.source(seconds=1.5)
+        child = subprocess.Popen([sys.executable, '-I', '-S', '-B', '-c', self.bootstrap(source, sha)],
+                                 stdin=subprocess.PIPE, stdout=write_fd, stderr=subprocess.PIPE,
+                                 env={'HOME': str(self.root), 'PATH': os.environ.get('PATH', '')})
+        timely = self.wait_then_release_pipe(child, read_fd)
+        self.assertTrue((self.output / 'manifest.json').exists())
+        self.assertTrue((self.output / 'SHA256SUMS').exists())
+        self.assertTrue(timely, 'interpreter shutdown retried buffered stdout')
+        self.assertNotEqual(child.returncode, 0)
+
+    def test_saturated_failure_status_pipe_does_not_retry_or_block(self):
+        read_fd, write_fd = self.full_pipe()
+        self.output.mkdir()  # The actual preparer must refuse before auth.
+        source, sha = self.source(seconds=1.5)
+        child = subprocess.Popen([sys.executable, '-I', '-S', '-B', '-c', self.bootstrap(source, sha)],
+                                 stdin=subprocess.PIPE, stdout=write_fd, stderr=subprocess.PIPE,
+                                 env={'HOME': str(self.root), 'PATH': os.environ.get('PATH', '')})
+        timely = self.wait_then_release_pipe(child, read_fd)
+        self.assertTrue(timely)
+        self.assertNotEqual(child.returncode, 0)
+        self.assertEqual(list(self.output.iterdir()), [])
+
     def test_literal_credentials_duplicate_and_mode_refusals(self):
         with patch.object(transport, 'REMOTE_CREDENTIALS', self.config):
             self.assertEqual(transport.token_file(), TOKEN)
@@ -259,9 +338,9 @@ t.subprocess.Popen=lambda *args,**kwargs:Unreaped()
         argv = transport.command(source, sha, path, gaps.digest(path.read_bytes()))
         remote = shlex.split(argv[-1])
         self.assertEqual(argv[:-1], transport.SSH)
-        self.assertEqual(remote[:5], [transport.PYTHON, '-I', '-S', '-B', '-c'])
-        self.assertEqual(remote[5], path.read_text())
-        self.assertEqual(remote[6:], ['remote', '--source-sha', sha])
+        self.assertEqual(remote[:6], [transport.PYTHON, '-I', '-S', '-B', '-u', '-c'])
+        self.assertEqual(remote[6], path.read_text())
+        self.assertEqual(remote[7:], ['remote', '--source-sha', sha])
         with self.assertRaises(transport.Refused):
             transport.command(source, '0' * 64, path, gaps.digest(path.read_bytes()))
 
@@ -283,6 +362,7 @@ t.subprocess.Popen=lambda *args,**kwargs:Unreaped()
         result = json.loads((directory / 'transport-result.json').read_bytes())
         self.assertEqual(result['outcome'], 'HOLD')
         self.assertTrue(result['reaped'])
+        self.assertFalse(result['remote_preparer_exit_observed'])
 
     def test_local_signal_interruptions_reap_owned_child(self):
         for sig in [signal.SIGTERM, signal.SIGINT]:

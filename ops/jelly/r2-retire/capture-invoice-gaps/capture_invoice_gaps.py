@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 from enum import Enum
 import signal
 import select
@@ -157,15 +158,18 @@ class ChannelWatch:
         self.thread = threading.Thread(target=self.watch, name="capture-evidence-channel")
 
     def watch(self):
+        violated = False
         try:
             while not self.finished.is_set():
                 readable, _, _ = select.select([self.channel], [], [], 0.05)
-                if readable and not self.finished.is_set():
-                    os.read(self.channel.fileno(), 1)
-                    raise EvidenceError("owned input channel closed or changed")
+                if readable:
+                    violated = True  # Never consume input or discard observation.
+                    break
         except Exception:
+            violated = True
+        if violated:
+            self.disconnected.set()  # Shutdown suppresses only the late signal.
             if not self.finished.is_set():
-                self.disconnected.set()
                 os.kill(os.getpid(), signal.SIGTERM)
 
     def start(self):
@@ -179,6 +183,11 @@ class ChannelWatch:
 
 def canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def emit_result(value):
+    raw = canonical(value) + b"\n"
+    require(os.write(sys.stdout.fileno(), raw) == len(raw), "partial stdout result; HOLD")
 
 
 def contains_secret(value, secret):
@@ -202,10 +211,10 @@ def now():
 def write_new(path, raw):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
-        with os.fdopen(fd, "wb", closefd=False) as output:
-            output.write(raw)
-            output.flush()
-            os.fsync(output.fileno())
+        # No BufferedWriter: cancellation must not trigger another flush from
+        # close(), deallocation or interpreter shutdown. Partial writes refuse.
+        require(os.write(fd, raw) == len(raw), "partial artifact write; HOLD")
+        os.fsync(fd)
     finally:
         os.close(fd)
     directory = os.open(Path(path).parent, os.O_RDONLY | os.O_DIRECTORY)
@@ -462,6 +471,8 @@ def collect(source_sha, fetch, channel, deadline):
     except (Exception, Cancelled) as error:
         if isinstance(error, Cancelled):
             outcome = deadline.outcome
+        elif watcher.disconnected.is_set():
+            outcome = Outcome.INTERRUPTED
         deadline.begin_cleanup()
         watcher.close(deadline)  # Observe exit before a potentially slow fsync.
         deadline.check_hard()
@@ -493,11 +504,11 @@ def main():
                 prepare(args.source_sha, deadline)
             else:
                 result = collect(args.source_sha, request_http, sys.stdin.buffer, deadline)
-                print(canonical(result).decode(), flush=True)
+                emit_result(result)
                 deadline.check()
     else:
         baseline = load_baseline(Path(args.baseline_root), Path(args.pins))
-        print(canonical(validate_capture(Path(args.capture_root), baseline)).decode())
+        emit_result(validate_capture(Path(args.capture_root), baseline))
 
 
 if __name__ == "__main__":
