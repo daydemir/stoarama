@@ -161,7 +161,10 @@ MP4 clock, track, handler and elst payloads inside the existing JSON audits.
 The shared native/offline validator requires one nonempty unit-rate edit, the
 same constant PTS and DTS offset on every packet equal to media_time, and full
 packet count/order/size/payload/duration/flags conservation with edit-duration
-coverage. Empty/multiple edits, missing evidence, cuts or drift are HOLD.
+coverage. The coverage endpoint is computed at `media_time`, not zero; the
+edited segment length is not compared directly to the unedited media bound.
+Every actual presentation packet must still fit the translated edit window.
+Empty/multiple edits, missing evidence, cuts or drift are HOLD.
 Full frame/EOF/seam decode and all prior source/publication checks remain.
 Audio and non-H264 admission remains unchanged; no audio is dropped to pass.
 The outer/inner schemas and replay-stream protocol are unchanged; V2 still

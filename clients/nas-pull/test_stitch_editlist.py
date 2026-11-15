@@ -55,6 +55,18 @@ class EditListTests(unittest.TestCase):
             with self.assertRaises(pull.StitchHold):self.check(hidden=changed)
         with self.assertRaises(pull.StitchHold):self.check(document(offset=1))
 
+    def test_media_duration_is_checked_at_the_edit_media_origin(self):
+        # FFmpeg8 B-frames can declare mdhd longer than the edited segment.
+        # The segment still covers every packet after translating its origin.
+        doc=document()
+        doc['mp4_edit']['media_header']=(bytes(12)+struct.pack('>II',1,4)).hex()
+        self.assertEqual(self.check(doc),2)  # edit media interval[2,5]
+        doc['mp4_edit']['media_header']=(bytes(12)+struct.pack('>II',1,6)).hex()
+        with self.assertRaises(pull.StitchHold):self.check(doc)
+        # A cut through actual packet content remains forbidden even when
+        # the declared bound itself fits the shifted edit interval.
+        with self.assertRaises(pull.StitchHold):self.check(document(duration=2))
+
     def test_edits_cannot_hide_cut_or_synthesize_timeline(self):
         for offset,count,duration,rate in [(-1,1,3,1),(2,0,3,1),(2,2,3,1),(2,1,0,1),(2,1,2,1),(2,1,3,0),(2,1,3,2)]:
             doc=document();doc['mp4_edit']['edit_list']=(bytes(4)+struct.pack('>IIihh',count,duration,offset,rate,0)).hex()

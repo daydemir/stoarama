@@ -47229,7 +47229,9 @@ def stitch_editlist_records(document, packets, hidden):
     if segment <= 0 or media_time < 0 or edit[8 + 2 * width:] != b'\0\1\0\0':
         raise StitchHold("empty edit or non-unit rate")
     coverage = Fraction(segment * media_scale, movie_scale)
-    if coverage < media_duration:
+    # The edit starts at media_time, not zero. Packet intervals below still
+    # prove that its translated presentation window contains every sample.
+    if media_time + coverage < media_duration:
         raise StitchHold("edit duration does not cover media")
     actual, ignored = iter(packets), iter(hidden)
     offset, count = None, 0
