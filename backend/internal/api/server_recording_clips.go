@@ -2095,7 +2095,7 @@ const accountClipsCommitWatermark = `interval '90 seconds'`
 const accountClipsCursorSQL = `
 	WITH delivery_fence AS MATERIALIZED (
 	  SELECT EXISTS (SELECT 1 FROM nas_delivery_retirement_fences
-	    WHERE connection_id=CASE WHEN $1=47 THEN 13 ELSE 0 END) AS active
+	    WHERE connection_id=CASE WHEN $1::bigint=47 THEN 13 ELSE 0 END) AS active
 	)
 	SELECT c.id, c.recording_id, c.size_bytes, c.sha256, c.clip_start_at, c.clip_end_at, c.display_path,
 	       c.recording_job_id, c.capture_lease_token, c.capture_sequence,

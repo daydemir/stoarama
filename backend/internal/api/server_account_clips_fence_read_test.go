@@ -37,7 +37,8 @@ func feedFenceFixture(t *testing.T) (*pgxpool.Pool, Keep28Window) {
  (1,47,'good','nas_pull',3,'Asia/Tokyo'),(2,47,'fallback','nas_pull',3,'UTC'),
  (3,47,'null-zone','nas_pull',3,NULL),(4,47,'unknown-stream','nas_pull',99999,'Asia/Tokyo'),
  (5,99,'foreign','nas_pull',3,'Asia/Tokyo'),(6,47,'managed','managed',3,'Asia/Tokyo'),
- (7,47,'null-stream','nas_pull',NULL,'Asia/Tokyo')`); err != nil {
+ (7,47,'null-stream','nas_pull',NULL,'Asia/Tokyo'),
+ (8,2147483648,'big-account','nas_pull',3,'Asia/Tokyo')`); err != nil {
 		t.Fatal(err)
 	}
 	return pool, windows[3]
@@ -120,7 +121,7 @@ func TestAccountClipsCursorFencePredicateEquivalent(t *testing.T) {
 		{"future-invalid", w.Start, end2028}, {"future-valid", w.Start, end2028.Add(-time.Second)},
 	}
 	id := int64(1)
-	for rec := int64(1); rec <= 7; rec++ {
+	for rec := int64(1); rec <= 8; rec++ {
 		for _, s := range spans {
 			if _, err := pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,size_bytes,clip_start_at,clip_end_at,display_path) VALUES($1,$2,10,$3,$4,$5)`, id, rec, s.start, s.end, s.name); err != nil {
 				t.Fatal(err)
@@ -151,7 +152,7 @@ func TestAccountClipsCursorFencePredicateEquivalent(t *testing.T) {
 			if _, err := pool.Exec(ctx, `UPDATE streams SET local_timezone=$1 WHERE id=3`, zone); err != nil {
 				t.Fatal(err)
 			}
-			for _, account := range []int64{47, 99, 100} {
+			for _, account := range []int64{47, 99, 100, 2147483648} {
 				for _, cursor := range []int64{0, 1, 7, 40, 200, 1000} {
 					for _, limit := range []int{1, 3, 500} {
 						t.Run(fmt.Sprintf("fence%v/zone%v/account%d/after%d/limit%d", fenced, zone, account, cursor, limit), func(t *testing.T) { compareFeedQueries(t, pool, account, cursor, limit) })
