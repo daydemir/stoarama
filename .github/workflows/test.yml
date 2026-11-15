@@ -130,6 +130,11 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/api ./cmd/stoaramactl -run 'Test(NASCollatedHoldSkipsRawFeedAndBacklog|AdminRecordingNASDeliveryModeFencesAndReportsHolds|AccountClipsCursorEndpoint|CollatedHoldClipsAreNeverMeteredAsStorage)' -count=1
+      - name: NAS clips cursor and precreated window index regression
+        working-directory: backend
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/api -run '^TestAccountClips' -race -count=1 -v
       - name: Test collated NAS delivery lane
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
