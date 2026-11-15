@@ -254,9 +254,9 @@ func TestNASR2CopySourceHoldsStillRefused(t *testing.T) {
 	}
 }
 
-func TestNASR2CopyConcurrentLeaseSlotsAndExpiredOwner(t *testing.T) {
-	f, i := copyTestFixture(t)
-	f.s.cfg.NASR2CopyEnabled = true
+// Five exact source/path identities let a fifth lease expose a slot race.
+func queueCopySources(t *testing.T, f *cleanupFixture, i NASR2CopyItem) {
+	t.Helper()
 	for n := 1; n < 5; n++ {
 		next := i
 		next.SourceID += int64(n)
@@ -269,6 +269,81 @@ func TestNASR2CopyConcurrentLeaseSlotsAndExpiredOwner(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+func TestNASR2CopyRenewalCannotRaceExpiredSlotAdmission(t *testing.T) {
+	f, i := copyTestFixture(t)
+	f.s.cfg.NASR2CopyEnabled = true
+	queueCopySources(t, f, i)
+	tasks := make([]nasR2CopyTask, NASR2CopyWorkers)
+	for n := range tasks {
+		tasks[n] = copyLease(t, f)
+	}
+	old := tasks[0]
+	expires := time.Now().Add(time.Second)
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_r2_copy_items SET lease_expires_at=$2 WHERE id=$1`, old.ID, expires); err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := BeginNASR2CopyTx(f.ctx, f.pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(f.ctx)
+	if _, err = blocker.Exec(f.ctx, `SELECT id FROM nas_r2_copy_items WHERE id=$1 FOR UPDATE`, old.ID); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		checkpoint <- copyCall(f, "checkpoint", old.ID, nasR2CopyControl{Token: old.Token, FreeBytes: NASR2CopyFloor + 1e9})
+	}()
+	waitLocks := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			var count int
+			if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND pid<>pg_backend_pid()`).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count >= want {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("request did not reach lock barrier")
+	}
+	waitLocks(1) // Checkpoint validated its old token before expiry, then blocked.
+	if delay := time.Until(expires.Add(20 * time.Millisecond)); delay > 0 {
+		time.Sleep(delay)
+	}
+	admission := make(chan *httptest.ResponseRecorder, 1)
+	go func() { admission <- copyCall(f, "lease", 0, nasR2CopyControl{FreeBytes: NASR2CopyFloor + 1e9}) }()
+	waitLocks(2) // Admission is now racing that renewal across its expiry.
+	if err := blocker.Rollback(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, result := range []chan *httptest.ResponseRecorder{checkpoint, admission} {
+		select {
+		case out := <-result:
+			if out.Code != 200 && out.Code != 409 {
+				t.Fatalf("race request %d %s", out.Code, out.Body)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("race request did not finish")
+		}
+	}
+	var live int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE state='leased' AND lease_expires_at>clock_timestamp()`).Scan(&live); err != nil {
+		t.Fatal(err)
+	}
+	if live != NASR2CopyWorkers {
+		t.Fatalf("renewal/admission produced %d live leases; want %d", live, NASR2CopyWorkers)
+	}
+}
+
+func TestNASR2CopyConcurrentLeaseSlotsAndExpiredOwner(t *testing.T) {
+	f, i := copyTestFixture(t)
+	f.s.cfg.NASR2CopyEnabled = true
+	queueCopySources(t, f, i)
 	var wg sync.WaitGroup
 	results := make(chan *httptest.ResponseRecorder, 5)
 	for n := 0; n < 5; n++ {

@@ -212,7 +212,7 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var active int
-	if err = tx.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE connection_id=$1 AND state='leased' AND lease_expires_at>now()`, cid).Scan(&active); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE connection_id=$1 AND state='leased' AND lease_expires_at>clock_timestamp()`, cid).Scan(&active); err != nil {
 		util.WriteError(w, 503, "copy lease unavailable")
 		return
 	}
@@ -223,7 +223,7 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 	var task nasR2CopyTask
 	var data []byte
 	err = tx.QueryRow(ctx, `SELECT id,item,policy_sha256 FROM nas_r2_copy_items WHERE connection_id=$1 AND kind='raw' AND
- (state='pending' OR (state='leased' AND lease_expires_at<now())) ORDER BY id LIMIT 1 FOR UPDATE`, cid).Scan(&task.ID, &data, &task.PolicySHA256)
+ (state='pending' OR (state='leased' AND lease_expires_at<clock_timestamp())) ORDER BY id LIMIT 1 FOR UPDATE`, cid).Scan(&task.ID, &data, &task.PolicySHA256)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteJSON(w, 200, map[string]any{"task": nil})
 		return
@@ -255,7 +255,7 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	task.Token = hex.EncodeToString(b)
-	_, err = tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='leased',lease_token=$2,lease_expires_at=now()+interval '30 seconds',etag=$3,version_id=$4,attempts=attempts+1,last_error='' WHERE id=$1`, task.ID, task.Token, task.ETag, head.VersionID)
+	_, err = tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='leased',lease_token=$2,lease_expires_at=clock_timestamp()+interval '30 seconds',etag=$3,version_id=$4,attempts=attempts+1,last_error='' WHERE id=$1`, task.ID, task.Token, task.ETag, head.VersionID)
 	if err != nil || tx.Commit(ctx) != nil {
 		util.WriteError(w, 503, "copy lease commit failed")
 		return
@@ -285,13 +285,21 @@ func (s *Server) nasR2CopyActive(w http.ResponseWriter, r *http.Request) (pgx.Tx
 		return nil, t, version, req, false
 	}
 	fail := func() { tx.Rollback(ctx) }
+	// Renewals may run together, but admission must count only after every
+	// concurrent renewal commits. Always take this before the item row lock.
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, nasR2CopyLock); err != nil {
+		fail()
+		util.WriteError(w, 503, "copy admission busy")
+		return nil, t, version, req, false
+	}
+
 	if err = nasR2CopyReady(ctx, tx); err != nil {
 		fail()
 		util.WriteError(w, 409, "copy yields to maintenance")
 		return nil, t, version, req, false
 	}
 	var data []byte
-	err = tx.QueryRow(ctx, `SELECT id,item,policy_sha256,etag,coalesce(version_id,'') FROM nas_r2_copy_items WHERE id=$1 AND connection_id=13 AND state='leased' AND lease_token=$2 AND lease_expires_at>now() FOR UPDATE`, id, req.Token).Scan(&t.ID, &data, &t.PolicySHA256, &t.ETag, &version)
+	err = tx.QueryRow(ctx, `SELECT id,item,policy_sha256,etag,coalesce(version_id,'') FROM nas_r2_copy_items WHERE id=$1 AND connection_id=13 AND state='leased' AND lease_token=$2 AND lease_expires_at>clock_timestamp() FOR UPDATE`, id, req.Token).Scan(&t.ID, &data, &t.PolicySHA256, &t.ETag, &version)
 	policy, _, pe := Keep28Policy()
 	if err != nil || json.Unmarshal(data, &t.Item) != nil || pe != nil || policy != t.PolicySHA256 {
 		fail()
@@ -319,7 +327,7 @@ func (s *Server) handleNASR2CopyCheckpoint(w http.ResponseWriter, r *http.Reques
 			return
 		}
 	}
-	_, err := tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET lease_expires_at=now()+interval '30 seconds' WHERE id=$1`, t.ID)
+	_, err := tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET lease_expires_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, t.ID)
 	if err != nil || tx.Commit(r.Context()) != nil {
 		util.WriteError(w, 503, "copy checkpoint failed")
 		return
@@ -350,7 +358,7 @@ func (s *Server) handleNASR2CopyRange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rangeID := hex.EncodeToString(nonce)
-	if _, err := tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET range_until=$2,range_id=$3,lease_expires_at=now()+interval '30 seconds' WHERE id=$1`, t.ID, issuedAt.Add(10*time.Second), rangeID); err != nil || tx.Commit(r.Context()) != nil {
+	if _, err := tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET range_until=$2,range_id=$3,lease_expires_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, t.ID, issuedAt.Add(10*time.Second), rangeID); err != nil || tx.Commit(r.Context()) != nil {
 		util.WriteError(w, 503, "copy range commit failed")
 		return
 	}

@@ -57,7 +57,9 @@ All work remains bound to account 47 / connection 13 and the keep28 policy.
 
 `NAS_R2_COPY_ENABLED=false` is the server default. Four independent workers
 lease at most four files per connection. Lease admission retains the serialized
-count; active operations lock only their own item. Each range is <=16 MiB,
+count. Active operations take a shared admission fence before their own item
+lock, so renewals remain parallel but cannot race that count. Lease checks and
+renewals use the current wall clock after lock acquisition. Each range is <=16 MiB,
 ETag/version/Range-bound, signed for 10s, and consumed by one non-retrying,
 non-redirecting GET with a 10s total deadline. Nonces and the per-item dispatch
 gate prevent simultaneous grants and stale completions. A retry obtains a new
