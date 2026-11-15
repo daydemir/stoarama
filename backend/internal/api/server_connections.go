@@ -988,7 +988,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 	}
 
 	var connectionID, cleanupReleaseGeneration int64
-	if err := tx.QueryRow(r.Context(), `SELECT id,coalesce(nas_cleanup_release_generation,0) FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`,
+	if err := tx.QueryRow(r.Context(), `SELECT id,coalesce(nas_cleanup_release_generation,0) FROM connections WHERE api_key_id=$1 AND account_id=$2`+nasConnectionEvidenceLock,
 		*principal.APIKeyID, principal.AccountID).Scan(&connectionID, &cleanupReleaseGeneration); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusForbidden, "no connection for this key")
