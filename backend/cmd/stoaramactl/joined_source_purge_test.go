@@ -451,77 +451,19 @@ func TestJoinedSourcePurgeRunDryRunThenApplyIsResumable(t *testing.T) {
 		t.Fatalf("dry-run log: %v", acts)
 	}
 
-	// A failed delete rolls purged_at back.
-	store.deleteErr = errors.New("r2 unavailable")
-	failed, err := runJoinedSourcePurgePass(ctx, pool, store, joinedPurgeTestOpts(t, true), io.Discard)
-	if err != nil || failed.Purged != 0 || failed.Errors != 2 {
-		t.Fatalf("delete failure: %+v err=%v", failed, err)
-	}
-	var purgedCount int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_clips WHERE purged_at IS NOT NULL`).Scan(&purgedCount); err != nil || purgedCount != 0 {
-		t.Fatalf("purged_at survived a failed delete: %d %v", purgedCount, err)
-	}
-	store.deleteErr = nil
-
-	// Limit to one clip first (the canary pattern), then finish.
 	opts := joinedPurgeTestOpts(t, true)
-	opts.limit = 1
-	var applyLog bytes.Buffer
-	first, err := runJoinedSourcePurgePass(ctx, pool, store, opts, &applyLog)
-	if err != nil || first.Purged != 1 || !first.LimitReached {
-		t.Fatalf("limited apply: %+v err=%v", first, err)
+	if result, err := runJoinedSourcePurgePass(ctx, pool, store, opts, io.Discard); !errors.Is(err, r2.ErrLegacyDeleteRetired) || result.Purged != 0 {
+		t.Fatal("legacy apply did not refuse", result, err)
 	}
-	delete(store.objects, joinedPurgeSourceKey(2)) // simulate a crash after delete, before commit
-	rest, err := runJoinedSourcePurgePass(ctx, pool, store, joinedPurgeTestOpts(t, true), &applyLog)
-	if err != nil || rest.Purged != 1 || rest.SourceAbsent != 1 {
-		t.Fatalf("resumed apply: %+v err=%v", rest, err)
-	}
-	rows, err := pool.Query(ctx, `SELECT id FROM recording_clips WHERE purged_at IS NOT NULL ORDER BY id`)
-	if err != nil {
+	if _, _, err := purgeJoinedSourceClip(ctx, nil, nil, joinedPurgeCandidate{}, opts); !errors.Is(err, r2.ErrLegacyDeleteRetired) {
 		t.Fatal(err)
 	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
-	if err != nil || fmt.Sprint(ids) != "[1 2]" {
-		t.Fatalf("purged ids %v err=%v", ids, err)
+	var purged int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_clips WHERE purged_at IS NOT NULL`).Scan(&purged); err != nil || purged != 0 {
+		t.Fatal("refusal changed catalog", purged, err)
 	}
-	var rowsLeft int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_clips WHERE id IN (1,2) AND object_key IS NOT NULL`).Scan(&rowsLeft); err != nil || rowsLeft != 2 {
-		t.Fatalf("clip rows not retained: %d %v", rowsLeft, err)
-	}
-	if _, ok := store.objects["joined/m1.mp4"]; !ok {
-		t.Fatal("joined media deleted")
-	}
-	for _, key := range store.deleted {
-		if !strings.HasPrefix(key, "src/") {
-			t.Fatalf("deleted non-source key %q", key)
-		}
-	}
-	if acts := joinedPurgeLogActions(t, applyLog.Bytes()); acts[1] != "purged:" || acts[2] != "purged:source_already_absent" {
-		t.Fatalf("apply log: %v", acts)
-	}
-	again, err := runJoinedSourcePurgePass(ctx, pool, store, joinedPurgeTestOpts(t, true), io.Discard)
-	if err != nil || again.Purged != 0 || again.Eligible != 0 {
-		t.Fatalf("rerun not idempotent: %+v err=%v", again, err)
-	}
-}
-
-func TestJoinedSourcePurgeRunRefusesUnverifiedJoinedMedia(t *testing.T) {
-	pool := joinedPurgeFixture(t)
-	ctx := context.Background()
-
-	store := newFakePurgeStore()
-	store.objects["joined/m1.mp4"] = []byte("short") // size mismatch -> skip clip 1 only
-	s, err := runJoinedSourcePurgePass(ctx, pool, store, joinedPurgeTestOpts(t, true), io.Discard)
-	if err != nil || s.Purged != 1 || s.Skipped["media_size_mismatch"] != 1 {
-		t.Fatalf("size mismatch: %+v err=%v", s, err)
-	}
-
-	pool = joinedPurgeFixture(t)
-	store = newFakePurgeStore()
-	store.objects["joined/m1.mp4"] = []byte("MEDIA-1") // same size, wrong bytes -> abort
-	s, err = runJoinedSourcePurgePass(ctx, pool, store, joinedPurgeTestOpts(t, true), io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "sha256") || s.Purged != 0 || len(store.deleted) != 0 {
-		t.Fatalf("sha mismatch did not abort before any delete: %+v err=%v", s, err)
+	if len(store.deleted) != 0 {
+		t.Fatal("refusal deleted objects")
 	}
 }
 

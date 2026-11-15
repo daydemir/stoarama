@@ -19,7 +19,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
@@ -207,6 +206,9 @@ func runJoinedSourcePurge(ctx context.Context, cfg config.Config, args []string)
 		if err != nil {
 			log.Fatalf("%v\n%s", err, joinedSourcePurgeUsage)
 		}
+		if err := refuseLegacyR2Apply(opts.apply); err != nil {
+			log.Fatal(err)
+		}
 		pool := mustJoinedPurgePool(ctx, cfg)
 		defer pool.Close()
 		store := mustArchiveR2Client(ctx, cfg, pool)
@@ -382,6 +384,9 @@ type joinedPurgeRunner struct {
 }
 
 func runJoinedSourcePurgePass(ctx context.Context, pool *pgxpool.Pool, store purgeObjectStore, opts joinedSourcePurgeOptions, logw io.Writer) (summary joinedPurgeSummary, err error) {
+	if err := refuseLegacyR2Apply(opts.apply); err != nil {
+		return summary, err
+	}
 	summary = joinedPurgeSummary{Mode: "dry_run", BatchID: opts.batchID, HourRecordID: opts.hourRecordID, Skipped: map[string]int64{}, LogPath: opts.logPath}
 	if opts.apply {
 		summary.Mode = "apply"
@@ -569,66 +574,7 @@ func sha256JoinedObject(ctx context.Context, store purgeObjectStore, c joinedPur
 // verified GUC), deletes the source object, and commits. Any failure before the
 // delete rolls purged_at back; the delete is the last step before the commit.
 func purgeJoinedSourceClip(ctx context.Context, pool *pgxpool.Pool, store purgeObjectStore, c joinedPurgeCandidate, opts joinedSourcePurgeOptions) (bool, string, error) {
-	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-	if err != nil {
-		return false, "", err
-	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := tx.Exec(ctx, `SELECT set_config($1,$2,true)`, joinedSourcePurgeGUC, joinedSourcePurgeGUCValue); err != nil {
-		return false, "", err
-	}
-	var objectKey, bucket, sha string
-	var size int64
-	var purgedAt *time.Time
-	err = tx.QueryRow(ctx, `SELECT COALESCE(object_key,''), COALESCE(bucket,''), lower(COALESCE(sha256,'')), size_bytes, purged_at
-		FROM recording_clips WHERE id=$1 FOR UPDATE`, c.ClipID).Scan(&objectKey, &bucket, &sha, &size, &purgedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, "clip_missing", nil
-	}
-	if err != nil {
-		return false, "", err
-	}
-	if purgedAt != nil {
-		return false, "already_purged", nil
-	}
-	if objectKey != c.ObjectKey || bucket != c.ClipBucket || sha != c.SHA256 || size != c.SizeBytes {
-		return false, "clip_identity_changed", nil
-	}
-	if opts.requireNAS {
-		var nasOK bool
-		if err := tx.QueryRow(ctx, `SELECT `+joinedPurgeNASVerified("$3")+`
-			FROM recording_clips c
-			JOIN recording_joined_hours h ON h.id=$2
-			JOIN recording_joined_batches b ON b.id=h.batch_record_id
-			WHERE c.id=$1`,
-			c.ClipID, c.HourRecordID, int64(opts.nasMaxAge/time.Second)).Scan(&nasOK); err != nil {
-			return false, "", err
-		}
-		if !nasOK {
-			return false, "nas_unverified", nil
-		}
-	}
-	tag, err := tx.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=$1 AND purged_at IS NULL`, c.ClipID)
-	if err != nil {
-		if strings.Contains(err.Error(), "retention protected") {
-			return false, "trigger_refused", nil
-		}
-		return false, "", err
-	}
-	if tag.RowsAffected() != 1 {
-		return false, "already_purged", nil
-	}
-	// Past this point the delete and the commit must finish together: an
-	// interrupt between them would leave an absent object behind a live row.
-	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), joinedSourcePurgeFinishTimeout)
-	defer cancel()
-	if err := store.DeleteObjects(finishCtx, []string{c.ObjectKey}); err != nil {
-		return false, "", fmt.Errorf("delete source object: %w", err)
-	}
-	if err := tx.Commit(finishCtx); err != nil {
-		return false, "", fmt.Errorf("commit after delete (a rerun completes it): %w", err)
-	}
-	return true, "", nil
+	return false, "", r2.ErrLegacyDeleteRetired
 }
 
 func (r *joinedPurgeRunner) logLine(c joinedPurgeCandidate, action, reason string) {

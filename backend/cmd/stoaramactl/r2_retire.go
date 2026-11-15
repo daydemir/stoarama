@@ -30,6 +30,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/api"
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/daydemir/stoarama/backend/internal/stitchproof"
 )
 
 // r2-retire deletes R2 objects for footage the owner decided not to keep.
@@ -51,7 +52,7 @@ const (
 	r2RetireFinishTimeout   = 2 * time.Minute
 	r2RetireManifestName    = "manifest.jsonl"
 	// r2RetireMaxManifestAge caps --max-manifest-age; staleness can't be disabled.
-	r2RetireMaxManifestAge = 7 * 24 * time.Hour
+	r2RetireMaxManifestAge = 24 * time.Hour
 )
 
 type r2RetireHeader struct {
@@ -138,7 +139,7 @@ type r2RetireHeadStore interface {
 
 type r2RetireStore interface {
 	r2RetireHeadStore
-	DeleteObject(ctx context.Context, key string) error
+	api.DeliveryKeepStore
 	EndpointSHA256() string
 }
 
@@ -501,101 +502,12 @@ type r2RetireOperatorAcknowledgment struct {
 	DecisionReference string    `json:"decision_reference"`
 	At                time.Time `json:"at"`
 }
-type r2RetireLedgerLine struct {
-	OperatorCredentialRisk *r2RetireOperatorAcknowledgment `json:"operator_credential_risk,omitempty"`
-	ETag                   string                          `json:"etag,omitempty"`
-	LastModified           time.Time                       `json:"last_modified,omitzero"`
-	At                     time.Time                       `json:"at"`
-	Event                  string                          `json:"event"`
-	ManifestSHA256         string                          `json:"manifest_sha256"`
-	Kind                   string                          `json:"kind,omitempty"`
-	SourceID               int64                           `json:"source_id,omitempty"`
-	StreamID               int64                           `json:"stream_id,omitempty"`
-	ObjectKey              string                          `json:"object_key,omitempty"`
-	SizeBytes              int64                           `json:"size_bytes,omitempty"`
-	SHA256                 string                          `json:"sha256,omitempty"`
-	Detail                 string                          `json:"detail,omitempty"`
-}
-
-// r2RetireLedger is append-only, exclusively locked, and fsynced per line.
-// An "intent" line is written (and synced) before every R2 delete, so a run
-// that crashed between the delete and the commit can be completed.
-type r2RetireLedger struct {
-	operatorCredentialRisk *r2RetireOperatorAcknowledgment
-	f                      *os.File
-	path                   string
-	intents                map[string]bool
-	torn                   int
-}
-
-func openR2RetireLedger(path string) (*r2RetireLedger, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("ledger %s is in use by another r2-retire: %w", path, err)
-	}
-	l := &r2RetireLedger{f: f, path: path, intents: map[string]bool{}}
-	raw, err := io.ReadAll(f)
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	lines := bytes.Split(raw, []byte("\n"))
-	for _, line := range lines {
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
-		}
-		var e r2RetireLedgerLine
-		if err := json.Unmarshal(line, &e); err != nil {
-			// A torn line from a crash mid-write. Its fsync never completed,
-			// and every delete happens only after its intent line is synced,
-			// so ignoring it is safe. The file itself is never rewritten.
-			l.torn++
-			continue
-		}
-		if e.Event == "intent" {
-			l.intents[e.ObjectKey] = true
-		}
-	}
-	if len(raw) > 0 && raw[len(raw)-1] != '\n' {
-		if _, err := f.Write([]byte("\n")); err != nil {
-			f.Close()
-			return nil, err
-		}
-	}
-	return l, nil
-}
-
-func (l *r2RetireLedger) write(e r2RetireLedgerLine) error {
-	e.At = time.Now().UTC()
-	e.OperatorCredentialRisk = l.operatorCredentialRisk
-	b, err := json.Marshal(e)
-	if err != nil {
-		return err
-	}
-	if _, err := l.f.Write(append(b, '\n')); err != nil {
-		return fmt.Errorf("write ledger: %w", err)
-	}
-	if err := l.f.Sync(); err != nil {
-		return fmt.Errorf("fsync ledger: %w", err)
-	}
-	if e.Event == "intent" {
-		l.intents[e.ObjectKey] = true
-	}
-	return nil
-}
-
-func (l *r2RetireLedger) Close() error { return l.f.Close() }
 
 // ---------------------------------------------------------------- apply
 
 type r2RetireApplyOptions struct {
+	StitchProofPath                string
+	StitchProofSHA                 string
 	Delivery                       api.DeliveryKeepSnapshot
 	AcceptOperatorCredentialRisk   string
 	ProviderUnconditionalHeadGuard bool
@@ -635,18 +547,19 @@ type r2RetireApplySummary struct {
 }
 
 type r2RetireApplier struct {
-	pool     *pgxpool.Pool
-	store    r2RetireStore
-	opts     r2RetireApplyOptions
-	header   r2RetireHeader
-	digest   string
-	scope    r2RetireScope
-	sets     r2RetireSets
-	fp       string
-	picks    r2RetirePicks
-	windows  map[int64]api.Keep28Window
-	policySH string
-	ledger   *r2RetireLedger
+	pool      *pgxpool.Pool
+	store     r2RetireStore
+	opts      r2RetireApplyOptions
+	header    r2RetireHeader
+	digest    string
+	scope     r2RetireScope
+	sets      r2RetireSets
+	fp        string
+	picks     r2RetirePicks
+	windows   map[int64]api.Keep28Window
+	policySH  string
+	authority *stitchproof.Authority
+	ledger    *r2RetireLedger
 }
 
 // errR2RetireAnomaly marks a stop condition that needs an operator.
@@ -674,12 +587,25 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 			sum.Anomaly = a.msg
 		}
 	}()
-	if opts.ProviderUnconditionalHeadGuard && strings.TrimSpace(opts.AcceptOperatorCredentialRisk) == "" {
-		return sum, errors.New("HEAD-guard mode requires --accept-operator-credential-risk with an owner decision reference")
+	if opts.StitchProofPath == "" || !r2RetireLowerHex64(opts.StitchProofSHA) {
+		return sum, errors.New("every R2 delete requires --stitch-proof and an independently reviewed --expected-stitch-proof-sha256")
 	}
-	if !opts.ProviderUnconditionalHeadGuard && opts.AcceptOperatorCredentialRisk != "" {
-		return sum, errors.New("--accept-operator-credential-risk requires HEAD-guard mode")
+	if !opts.ProviderUnconditionalHeadGuard {
+		return sum, errors.New("legacy and conditional retirement apply modes are retired; reviewed NAS-backed RAW HEAD-guard mode is required")
 	}
+	observed := time.Now()
+	var databaseUTC time.Time
+	if err := pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&databaseUTC); err != nil {
+		return sum, fmt.Errorf("authoritative retirement clock: %w", err)
+	}
+	authority, err := stitchproof.Verify(ctx, opts.StitchProofPath, opts.StitchProofSHA, databaseUTC, observed)
+	if err != nil {
+		return sum, fmt.Errorf("NAS stitching prerequisite: %w", err)
+	}
+	if err := r2RetireOperatorRisk(opts); err != nil {
+		return sum, err
+	}
+
 	if opts.ProviderUnconditionalHeadGuard && opts.MinObjectAge < 7*24*time.Hour {
 		return sum, errors.New("HEAD-guard mode requires --min-object-age >= 168h")
 	}
@@ -695,6 +621,19 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 		return sum, fmt.Errorf("manifest digest %s does not match --expected-sha256", digest)
 	}
 	if err != nil {
+		return sum, err
+	}
+	if !h.NASBacked || h.AccountID != 47 || h.ConnectionID != 13 {
+		return sum, errors.New("retirement requires a NAS-backed account47 connection13 manifest")
+	}
+	authority, err = authority.BindRetirement(digest, h.CreatedAt, opts.MaxManifestAge, h.Bucket, store.EndpointSHA256())
+	if err != nil {
+		return sum, err
+	}
+	if err := r2RetireRequireIndexes(ctx, pool); err != nil {
+		return sum, err
+	}
+	if err := r2RetireDeliveryClosureUnchanged(ctx, store, opts.Delivery); err != nil {
 		return sum, err
 	}
 	if h.Class == r2RetireDeliveryOnly && !opts.ProviderUnconditionalHeadGuard {
@@ -844,6 +783,9 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 		return sum, err
 	}
 	defer ledger.Close()
+	if err := ledger.authorize(digest, h.Bucket, store.EndpointSHA256(), authority); err != nil {
+		return sum, err
+	}
 	if opts.ProviderUnconditionalHeadGuard {
 		sum.OperatorCredentialRisk = &r2RetireOperatorAcknowledgment{DecisionReference: opts.AcceptOperatorCredentialRisk, At: time.Now().UTC()}
 		ledger.operatorCredentialRisk = sum.OperatorCredentialRisk
@@ -851,7 +793,7 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 			return sum, err
 		}
 	}
-	a := &r2RetireApplier{pool: pool, store: store, opts: opts, header: h, digest: digest, picks: picks, windows: windows, policySH: policySHA, ledger: ledger,
+	a := &r2RetireApplier{authority: authority, pool: pool, store: store, opts: opts, header: h, digest: digest, picks: picks, windows: windows, policySH: policySHA, ledger: ledger,
 		scope: r2RetireScope{Class: h.Class, OwnerPolicy: func() []byte {
 			if h.Class == r2RetireDeliveryOnly {
 				return r2RetireDeliveryPolicy(windows, picks.Choices)
@@ -942,10 +884,11 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 			_ = ledger.write(r2RetireLedgerLine{Event: "skip", ManifestSHA256: digest, Kind: it.Kind, SourceID: it.SourceID, ObjectKey: it.ObjectKey, Detail: detail})
 		case "retired", "retired_absent":
 			sum.Retired++
-			sum.RetiredBytes += it.SizeBytes
 			run += it.SizeBytes
 			if outcome == "retired_absent" {
 				sum.RetiredAbsent++
+			} else {
+				sum.RetiredBytes += it.SizeBytes
 			}
 		}
 		if opts.Rate > 0 {
@@ -981,6 +924,14 @@ func r2RetireUsedBudget(ctx context.Context, q r2RetireQuerier, used *int64) err
 // retired, retired_absent, already_done, ineligible (detail = reason). Any
 // error stops the run.
 func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string, string, error) {
+	if err := a.authority.Check(); err != nil {
+		return "", "", err
+	}
+	target := r2RetireTarget{a.digest, it.Bucket, a.store.EndpointSHA256(), r2RetireTargetKind(it.Kind), it.SourceID, it.RecordingID, it.StreamID, it.ObjectKey, it.RelativePath, it.StartAt.UTC(), it.EndAt.UTC(), it.SizeBytes, it.SHA256, it.ETag}
+	if !target.valid() {
+		return "", "", errors.New("retirement target identity is incomplete")
+	}
+
 	tx, err := a.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return "", "", err
@@ -1001,7 +952,7 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 	if err := r2RetireDeliveryHeld(ctx, tx, it.Bucket, it.ObjectKey); err != nil {
 		return "", "", err
 	}
-	if err := r2RetireDeliveryRegistryUnchanged(ctx, a.store, a.opts.Delivery); err != nil {
+	if err := r2RetireDeliveryClosureUnchanged(ctx, a.store, a.opts.Delivery); err != nil {
 		return "", "", err
 	}
 	if ids, err := r2RetireEnabledPlans(ctx, tx); err != nil {
@@ -1072,9 +1023,6 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 	absent := false
 	switch {
 	case herr != nil && r2.IsNotFound(herr):
-		if !a.ledger.intents[it.ObjectKey] && !a.opts.RecordAbsent {
-			return "", "", r2RetireAnomalyf("object is already missing from R2 and the ledger has no delete intent for it (pass --record-already-absent to mark such rows)")
-		}
 		absent = true
 	case herr != nil:
 		return "", "", fmt.Errorf("head: %w", herr)
@@ -1088,7 +1036,7 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 	if err := r2RetireDeliveryHeld(ctx, tx, it.Bucket, it.ObjectKey); err != nil {
 		return "", "", err
 	}
-	if err := r2RetireDeliveryRegistryUnchanged(ctx, a.store, a.opts.Delivery); err != nil {
+	if err := r2RetireDeliveryClosureUnchanged(ctx, a.store, a.opts.Delivery); err != nil {
 		return "", "", err
 	}
 	if a.scope.NASBacked {
@@ -1103,6 +1051,32 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 		}
 	}
 
+	if absent {
+		// Absence is reconciliation, never a waiver of the current operational
+		// gates. HEAD may have consumed the provider proof's remaining lifetime.
+		if err := r2RetireRequireIndexes(ctx, tx); err != nil {
+			return "", "", err
+		}
+		if err := checkR2RetireDeleteProofMode(a.opts.DeleteProofPath, a.opts.DeleteProofSHA256, a.header.Bucket, a.store.EndpointSHA256(), true); err != nil {
+			return "", "", err
+		}
+		if err := a.checkWriterState(ctx, tx, it.ObjectKey); err != nil {
+			return "", "", err
+		}
+		if err := a.authority.Check(); err != nil {
+			return "", "", err
+		}
+		if err := a.ledger.resume(target); err != nil {
+			return "", "", r2RetireAnomalyf("%v", err)
+		}
+	} else {
+		if _, pending := a.ledger.intents[target]; pending {
+			return "", "", r2RetireAnomalyf("unresolved prior intent for present object; reviewed recovery required, no automatic retransmission")
+		}
+	}
+	if err := a.authority.Check(); err != nil {
+		return "", "", err
+	}
 	if a.scope.Class.owner() {
 		if err := a.reserve(ctx, it); err != nil {
 			return "", "", err
@@ -1156,51 +1130,44 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 		}
 	}
 
-	line := r2RetireLedgerLine{ManifestSHA256: a.digest, Kind: it.Kind, SourceID: it.SourceID, StreamID: it.StreamID, ObjectKey: it.ObjectKey, SizeBytes: it.SizeBytes, SHA256: it.SHA256}
-	intent := line
-	intent.Event = "intent"
+	line := a.ledger.operation(target, r2LedgerIntent)
 	if absent {
-		intent.Detail = "already_absent"
+		line.Event = "reconcile_absent"
+		line.Detail = "already_absent"
 	}
-	if err := a.ledger.write(intent); err != nil {
+	if err := a.ledger.write(line); err != nil {
 		return "", "", err
 	}
+
 	// Past this point the delete and the commit finish together.
 	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r2RetireFinishTimeout)
 	defer cancel()
 	fail := func(event string, err error) (string, string, error) {
 		e := line
-		e.Event, e.Detail = event, err.Error()
+		e.Event, e.Detail = r2RetireLedgerEvent(event), err.Error()
 		_ = a.ledger.write(e)
 		return "", "", r2RetireAnomalyf("%s: %v", event, err)
 	}
 	if !absent {
-		var deleteErr error
-		if a.opts.ProviderUnconditionalHeadGuard {
-			if err := a.headGuard(finishCtx, tx, it); err != nil {
-				return fail("head_guard_refused", err)
-			}
-			deleteErr = a.store.(r2RetireSingleDeleteStore).DeleteObjectOnce(finishCtx, it.ObjectKey)
-		} else if a.scope.NASBacked {
-			exact, ok := a.store.(interface {
-				DeleteObjectExact(context.Context, string, string) error
-			})
-			if !ok {
-				return fail("delete_error", errors.New("conditional delete is required"))
-			}
-			deleteErr = exact.DeleteObjectExact(finishCtx, it.ObjectKey, it.ETag)
-		} else {
-			deleteErr = a.store.DeleteObject(finishCtx, it.ObjectKey)
+		if err := a.headGuard(finishCtx, tx, it); err != nil {
+			return fail("head_guard_refused", err)
 		}
-		if err := deleteErr; err != nil {
+		if err := a.authority.Check(); err != nil {
+			return fail("head_guard_refused", err)
+		}
+		if err := a.store.(r2RetireSingleDeleteStore).DeleteObjectOnce(finishCtx, it.ObjectKey, a.authority); err != nil {
 			return fail("delete_error", err)
 		}
+
 		if _, err := a.store.Head(finishCtx, it.ObjectKey); !r2.IsNotFound(err) {
 			if err == nil {
 				err = errors.New("object still present after delete")
 			}
 			return fail("delete_unconfirmed", err)
 		}
+	}
+	if err := a.authority.Check(); err != nil {
+		return fail("head_guard_refused", err)
 	}
 	if err := tx.Commit(finishCtx); err != nil {
 		return fail("commit_failed", fmt.Errorf("%w (the object is deleted; a rerun records it)", err))
@@ -1278,8 +1245,10 @@ func runR2Retire(ctx context.Context, cfg config.Config, args []string) {
   stoaramactl r2-retire delivery-fence --activate --all-api-instances-gated
   stoaramactl r2-retire delivery-fence --settle-drain-acknowledgment EVIDENCE
   stoaramactl r2-retire plan --picks FILE --out DIR [--sample 200 --grace 168h --connection-id N --page-size 5000 --json]
-  stoaramactl r2-retire apply --manifest FILE --expected-sha256 SHA --max-bytes N [--budget-24h-bytes N --picks FILE
-      --ledger PATH --rate 10 --max-items N --max-manifest-age 72h --skip-ineligible --record-already-absent --json]`
+  stoaramactl r2-retire verify-stitch-proof --stitch-proof FILE --expected-stitch-proof-sha256 SHA (read-only)
+  stoaramactl r2-retire apply --manifest FILE --expected-sha256 SHA --max-bytes N
+      --stitch-proof FILE --expected-stitch-proof-sha256 SHA [--budget-24h-bytes N --picks FILE
+      --ledger PATH --rate 10 --max-items N --max-manifest-age 24h --skip-ineligible --record-already-absent --json]`
 	if len(args) < 1 {
 		log.Fatal(usage)
 	}
@@ -1298,6 +1267,8 @@ func runR2Retire(ctx context.Context, cfg config.Config, args []string) {
 		runR2HoldReleases(ctx, cfg, args[1:], policySHA, windows)
 	case "plan":
 		runR2RetirePlan(ctx, cfg, args[1:], usage, policySHA, windows)
+	case "verify-stitch-proof":
+		runR2RetireVerifyStitch(ctx, cfg, args[1:])
 	case "apply":
 		runR2RetireApply(ctx, cfg, args[1:], usage, policySHA, windows)
 	default:
@@ -1539,6 +1510,8 @@ func printR2RetirePlan(w io.Writer, sum r2RetirePlanSummary) {
 func runR2RetireApply(ctx context.Context, cfg config.Config, args []string, usage, policySHA string, windows map[int64]api.Keep28Window) {
 	fs := flag.NewFlagSet("r2-retire apply", flag.ContinueOnError)
 	var opts r2RetireApplyOptions
+	fs.StringVar(&opts.StitchProofPath, "stitch-proof", "", "real NAS stitching attestation path (required)")
+	fs.StringVar(&opts.StitchProofSHA, "expected-stitch-proof-sha256", "", "outer SHA from fresh independent postrun review (required)")
 	fs.StringVar(&opts.AcceptOperatorCredentialRisk, "accept-operator-credential-risk", "", "owner decision reference acknowledging operator/release tools will not write footage keys during this run; required in HEAD-guard mode; never waives prefix exclusions or other guards")
 	fs.BoolVar(&opts.ProviderUnconditionalHeadGuard, "provider-unconditional-delete-with-head-guard", false, "explicit residual TOCTOU acceptance; requires unsupported-provider probe, durable writer fence and real multipart inventory")
 	fs.DurationVar(&opts.MinObjectAge, "min-object-age", 7*24*time.Hour, "HEAD LastModified minimum age in HEAD-guard mode (minimum 168h)")
@@ -1552,11 +1525,11 @@ func runR2RetireApply(ctx context.Context, cfg config.Config, args []string, usa
 	fs.StringVar(&opts.LedgerPath, "ledger", r2RetireDefaultLedger(), "append-only JSONL ledger")
 	fs.Float64Var(&opts.Rate, "rate", 10, "maximum objects per second")
 	fs.Int64Var(&opts.MaxItems, "max-items", 0, "stop after retiring this many objects (0 = no limit)")
-	fs.DurationVar(&opts.MaxManifestAge, "max-manifest-age", 72*time.Hour, "refuse manifests older than this (max 168h; cannot be disabled)")
+	fs.DurationVar(&opts.MaxManifestAge, "max-manifest-age", 24*time.Hour, "refuse manifests older than this (max 24h; cannot be disabled)")
 	fs.BoolVar(&opts.SkipIneligible, "skip-ineligible", false, "skip (keep) items that are no longer eligible instead of stopping")
-	fs.BoolVar(&opts.RecordAbsent, "record-already-absent", false, "mark items whose object is already missing from R2 instead of stopping")
+	fs.BoolVar(&opts.RecordAbsent, "record-already-absent", false, "reconcile absent items only with an exact durable prior intent and fresh proof; never waives identity")
 	asJSON := fs.Bool("json", false, "print the summary as JSON")
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || opts.ManifestPath == "" || opts.ExpectedSHA == "" || opts.MaxBytes <= 0 {
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || opts.ManifestPath == "" || opts.ExpectedSHA == "" || opts.MaxBytes <= 0 || opts.StitchProofPath == "" || !r2RetireLowerHex64(opts.StitchProofSHA) {
 		log.Fatal(usage)
 	}
 	if opts.Rate <= 0 || opts.Rate > 100 || opts.MaxItems < 0 || opts.Budget24h <= 0 || opts.MaxManifestAge <= 0 || opts.MaxManifestAge > r2RetireMaxManifestAge {
@@ -1568,7 +1541,7 @@ func runR2RetireApply(ctx context.Context, cfg config.Config, args []string, usa
 	}
 	defer pool.Close()
 	store := mustArchiveR2Client(ctx, cfg, pool)
-	opts.Delivery, err = api.ReadPublicDeliveryKeep(ctx, mustArchiveR2Client(ctx, cfg, pool))
+	opts.Delivery, err = api.ReadPublicDeliveryKeep(ctx, store)
 	if err != nil {
 		log.Fatal(err)
 	}

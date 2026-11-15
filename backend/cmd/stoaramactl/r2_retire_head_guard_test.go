@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -73,7 +72,7 @@ func TestR2RetireHeadGuardUngatedWritersVeto(t *testing.T) {
 
 func TestR2RetireOperatorAcknowledgmentRequired(t *testing.T) {
 	for _, reference := range []string{"", " ", "\n\t"} {
-		_, err := r2RetireApply(context.Background(), nil, nil, r2RetireApplyOptions{ProviderUnconditionalHeadGuard: true, AcceptOperatorCredentialRisk: reference}, "", nil)
+		err := r2RetireOperatorRisk(r2RetireApplyOptions{ProviderUnconditionalHeadGuard: true, AcceptOperatorCredentialRisk: reference})
 		if err == nil || !strings.Contains(err.Error(), "--accept-operator-credential-risk") {
 			t.Fatal(err)
 		}

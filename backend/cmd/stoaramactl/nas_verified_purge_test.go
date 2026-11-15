@@ -3,11 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -282,104 +282,27 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 	if s := run(limited); !s.LimitReached || s.Eligible != 1 {
 		t.Fatalf("limited summary %+v", s)
 	}
-	// Between the scan and the lock, a joined batch starts snapshotting clip
-	// 114's job; the locked re-check must leave it alone.
-	store.beforeHead = func(key string) {
-		if strings.HasSuffix(key, "/114.mp4") {
-			_, _ = pool.Exec(ctx, `INSERT INTO recording_joined_snapshot_scopes(batch_record_id,recording_id,recording_job_id,high_water_clip_id) VALUES (2,50,5003,1000)`)
-		}
-	}
 	apply := base
 	apply.apply = true
-	got := run(apply)
-	store.beforeHead = nil
-	if got.Purged != 4 || got.SourceAbsent != 1 || got.Skipped["source_size_mismatch"] != 1 || got.Skipped["source_sha_mismatch"] != 1 ||
-		got.Skipped["changed_before_lock"] != 1 || got.DeleteFailed != 1 || got.Errors != 1 || got.ShaChecks < 3 {
-		t.Fatalf("apply summary %+v", got)
+	if result, err := runNASVerifiedPurgePass(ctx, pool, store, apply, nil); !errors.Is(err, r2.ErrLegacyDeleteRetired) || result.Purged != 0 {
+		t.Fatal("legacy apply did not refuse", result, err)
 	}
-	var purged []int64
-	rows, err := pool.Query(ctx, `SELECT id FROM recording_clips WHERE purged_at IS NOT NULL AND id>=100 ORDER BY id`)
-	if err != nil {
+	runner := nasPurgeRunner{}
+	if _, err := runner.purgeBatch(ctx, nil); !errors.Is(err, r2.ErrLegacyDeleteRetired) {
 		t.Fatal(err)
 	}
-	for rows.Next() {
-		var id int64
-		_ = rows.Scan(&id)
-		purged = append(purged, id)
+	var purged int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_clips WHERE id>=100 AND purged_at IS NOT NULL`).Scan(&purged); err != nil || purged != 0 {
+		t.Fatal("refusal changed catalog", purged, err)
 	}
-	rows.Close()
-	if fmt.Sprint(purged) != "[101 102 121 162]" {
-		t.Fatalf("purged clips %v", purged)
+	if len(store.deleted) != 0 {
+		t.Fatal("refusal deleted objects")
 	}
-	sort.Strings(store.deleted)
-	if fmt.Sprint(store.deleted) != "[managed/acct-47/101.mp4 managed/acct-47/102.mp4 managed/acct-47/121.mp4 managed/acct-47/162.mp4]" {
-		t.Fatalf("deleted objects %v", store.deleted)
-	}
-	for _, id := range []int64{103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 120, 130, 140, 160, 161, 163, 164, 170, 171} {
-		if _, ok := store.objects[fmt.Sprintf("managed/acct-47/%d.mp4", id)]; !ok {
-			t.Fatalf("object of protected clip %d was deleted", id)
-		}
-	}
-	logged, err := os.ReadFile(logPath)
-	if err != nil || !strings.Contains(string(logged), `"action":"purged"`) || !strings.Contains(string(logged), `"reason":"source_already_absent"`) {
-		t.Fatalf("log missing purge lines: %v", err)
-	}
-
-	// Reruns are idempotent; a key whose delete failed is retried and, once
-	// the store accepts it, purged.
-	store.failKeys = nil
-	again := run(apply)
-	if again.Purged != 1 || len(store.deleted) != 5 {
-		t.Fatalf("rerun summary %+v deleted=%v", again, store.deleted)
-	}
-	// Sample mode purges without a HEAD per clip.
-	var pre int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_clips WHERE id=115 AND purged_at IS NOT NULL`).Scan(&pre); err != nil || pre != 1 {
-		t.Fatalf("clip 115 not purged after retry: %d %v", pre, err)
-	}
-	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,recording_job_id,storage_destination_id,bucket,object_key,size_bytes,sha256,display_path,clip_start_at,clip_end_at,created_at)
-		VALUES (150,50,5000,20,'stoarama','managed/acct-47/150.mp4',3,$1,'r/150.mp4',now()-interval '20 days',now()-interval '20 days',now()-interval '20 days')`, joinedPurgeSHA("abc")); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans VALUES(3,'enabled')`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,state,sha256,size_bytes,relative_path) VALUES (13,150,'present',$1,3,'r/150.mp4')`, joinedPurgeSHA("abc")); err != nil {
-		t.Fatal(err)
-	}
-	store.objects["managed/acct-47/150.mp4"] = []byte("abc")
-	sample := apply
-	sample.headMode, sample.shaEvery = "sample", 0
-	store.heads = 0
-	// Without a HEAD, 111 (short R2 copy) and 113 (R2 bytes differ) are purged
-	// too: the NAS holds the exact recorded bytes, so no good copy is lost.
-	if s := run(sample); s.Purged != 3 || store.heads != 0 {
-		t.Fatalf("sample mode summary %+v heads=%d", s, store.heads)
-	}
-	// While any NAS cleanup plan is enabled the tool refuses to run at all,
-	// dry run included, and deletes nothing.
-	if _, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans VALUES (3,'enabled')`); err != nil {
-		t.Fatal(err)
-	}
-	deleted := len(store.deleted)
-	for _, opts := range []nasPurgeOptions{base, apply} {
-		if s, err := runNASVerifiedPurgePass(ctx, pool, store, opts, nil); err == nil || !strings.Contains(err.Error(), "refusing to run while NAS cleanup plan(s) [3] are enabled") || s.Scanned != 0 {
-			t.Fatalf("%s ran during an enabled cleanup plan: %v %+v", opts.headMode, err, s)
-		}
-	}
-	if len(store.deleted) != deleted {
-		t.Fatal("objects deleted while a cleanup plan was enabled")
-	}
-	// The per-clip fact also fences a plan enabled after the run started.
-	if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='paused' WHERE id=3`); err != nil {
-		t.Fatal(err)
-	}
-	page, err := loadNASPurgeCandidates(ctx, pool, store.Bucket(), base, 0)
-	if err != nil || len(page) == 0 || !page[0].Facts["no_enabled_cleanup"] {
-		t.Fatalf("paused plan fenced the scan: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='enabled' WHERE id=3`); err != nil {
-		t.Fatal(err)
-	}
-	if page, err = loadNASPurgeCandidates(ctx, pool, store.Bucket(), base, 0); err != nil || len(page) == 0 || page[0].Facts["no_enabled_cleanup"] || page[0].skipReason() != "nas_cleanup_enabled" {
-		t.Fatalf("enabled plan did not fence the scan: %v", err)
+	if result, err := runNASVerifiedPurgePass(ctx, pool, store, base, nil); err == nil || result.Scanned != 0 {
+		t.Fatal("read-only preview ran during cleanup", result, err)
 	}
 }
 

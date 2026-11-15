@@ -89,6 +89,7 @@ func TestBatchScheduleRejectsReencodingTargetFPSBeforePersistence(t *testing.T) 
 func TestBatchScheduleDryRunIsReadOnly(t *testing.T) {
 	s, pool, cleanup := testIdentityServer(t)
 	defer cleanup()
+	s.cfg.RecSchedMinIntervalSec = 60
 
 	userID, accountID := seedUserOrg(t, pool, "batch-dry-run@example.com", false)
 	principal := accountPrincipal{AccountID: accountID, UserID: userID, MemberRole: "owner"}
@@ -107,8 +108,8 @@ func TestBatchScheduleDryRunIsReadOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(context.Background(), `
-		INSERT INTO streams (provider, external_id, name, slug, source_url, capture_type, source_family, execution_class, capture_family, expected_fps)
-		VALUES ('test', 'dry-run', 'Dry Run', 'dry-run', 'https://example.com/live.m3u8', 'hls', 'direct_stream', 'video_live', 'continuous_video', 30)
+		INSERT INTO streams (provider, external_id, name, slug, source_url, capture_type, source_family, execution_class, capture_family, expected_fps, location_country, location_city, metadata_jsonb)
+		VALUES ('test', 'dry-run', 'Dry Run', 'dry-run', 'https://example.com/live.m3u8', 'hls', 'video_manifest', 'video_live', 'continuous_video', 30, 'United States', 'Seattle', '{"continent":"North America"}'::jsonb)
 		RETURNING id
 	`).Scan(&streamID); err != nil {
 		t.Fatal(err)
@@ -219,7 +220,7 @@ func TestBatchScheduleRejectsInsufficientRelayCapacity(t *testing.T) {
 	}
 	if err := pool.QueryRow(context.Background(), `
 		INSERT INTO streams (provider, external_id, name, slug, source_url, capture_type, source_family, execution_class, capture_family, expected_fps, local_timezone)
-		VALUES ('SDOT', 'no-capacity', 'No Capacity', 'no-capacity', 'https://example.com/live.m3u8', 'hls', 'direct_stream', 'video_live', 'continuous_video', 30, 'America/Los_Angeles')
+		VALUES ('SDOT', 'no-capacity', 'No Capacity', 'no-capacity', 'https://example.com/live.m3u8', 'hls', 'video_manifest', 'video_live', 'continuous_video', 30, 'America/Los_Angeles')
 		RETURNING id
 	`).Scan(&streamID); err != nil {
 		t.Fatal(err)
@@ -388,6 +389,7 @@ func TestAvailableRelayCapacityCountsOfflineGroupLeases(t *testing.T) {
 func TestBatchScheduleRefreshesExistingRecordingSource(t *testing.T) {
 	s, pool, cleanup := testIdentityServer(t)
 	defer cleanup()
+	s.cfg.RecSchedMinIntervalSec = 60
 
 	userID, accountID := seedUserOrg(t, pool, "batch-source-refresh@example.com", false)
 	principal := accountPrincipal{AccountID: accountID, UserID: userID, MemberRole: "owner"}
@@ -403,7 +405,7 @@ func TestBatchScheduleRefreshesExistingRecordingSource(t *testing.T) {
 	const newURL = "https://new.example.com/live.m3u8"
 	if err := pool.QueryRow(context.Background(), `
 		INSERT INTO streams (provider, external_id, name, slug, source_url, capture_type, source_family, execution_class, capture_family, expected_fps, local_timezone)
-		VALUES ('test', 'source-refresh', 'Source Refresh', 'source-refresh', $1, 'hls', 'direct_stream', 'video_live', 'continuous_video', 30, 'UTC')
+		VALUES ('test', 'source-refresh', 'Source Refresh', 'source-refresh', $1, 'hls', 'video_manifest', 'video_live', 'continuous_video', 30, 'UTC')
 		RETURNING id
 	`, oldURL).Scan(&streamID); err != nil {
 		t.Fatal(err)
@@ -456,6 +458,7 @@ func TestBatchScheduleRefreshesExistingRecordingSource(t *testing.T) {
 func TestBatchScheduleMixedRecordingStates(t *testing.T) {
 	s, pool, cleanup := testIdentityServer(t)
 	defer cleanup()
+	s.cfg.RecSchedMinIntervalSec = 60
 
 	userID, accountID := seedUserOrg(t, pool, "batch@example.com", false)
 	principal := accountPrincipal{AccountID: accountID, UserID: userID, MemberRole: "owner"}
@@ -498,8 +501,8 @@ func TestBatchScheduleMixedRecordingStates(t *testing.T) {
 			recordingZone = "Asia/Tokyo"
 		}
 		if _, err := pool.Exec(context.Background(), `
-			INSERT INTO recordings (account_id, storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, status, start_at, capture_via)
-			VALUES ($1, $2, $3, 'https://www.youtube.com/watch?v=' || $3, $4, 'auto', 'sampled', '0 * * * *', $5, 60, $3, now(), 'cloud')
+			INSERT INTO recordings (account_id, storage_destination_id, name, stream_url, stream_id, source_kind, mode, cron_expr, cron_timezone, clip_duration_sec, status, start_at, capture_via,paused_at)
+			VALUES ($1, $2, $3, 'https://www.youtube.com/watch?v=' || $3, $4, 'auto', 'sampled', '0 * * * *', $5, 60, $3, now(), 'cloud',CASE WHEN $3='paused' THEN now() END)
 		`, accountID, destID, status, streamIDs[status], recordingZone); err != nil {
 			t.Fatal(err)
 		}

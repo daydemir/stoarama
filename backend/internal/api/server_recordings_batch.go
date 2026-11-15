@@ -400,7 +400,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 				return
 			}
 		} else {
-			managedID, _, err := s.provisionManagedDestination(r.Context(), tx, accountID)
+			managedID, _, err := s.resolveManagedDestination(r.Context(), tx, accountID)
 			if err != nil {
 				util.WriteError(w, http.StatusServiceUnavailable, "managed staging unavailable")
 				return

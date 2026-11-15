@@ -20,7 +20,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
@@ -532,6 +531,9 @@ func refuseNASPurgeDuringCleanup(ctx context.Context, pool *pgxpool.Pool) error 
 }
 
 func runNASVerifiedPurgePass(ctx context.Context, pool *pgxpool.Pool, store nasPurgeStore, opts nasPurgeOptions, logw io.Writer) (summary nasPurgeSummary, err error) {
+	if err := refuseLegacyR2Apply(opts.apply); err != nil {
+		return summary, err
+	}
 	started := time.Now()
 	summary = nasPurgeSummary{Mode: "dry_run", ConnectionID: opts.connectionID, Protections: opts.protections, Skipped: map[string]int64{}, LogPath: opts.logPath, LastClipID: opts.afterClipID}
 	if opts.apply {
@@ -833,88 +835,7 @@ type nasPurgeBatchResult struct {
 // objects are gone but the rows are unpurged; the next run completes them
 // (deleting an absent key succeeds).
 func (r *nasPurgeRunner) purgeBatch(ctx context.Context, batch []nasPurgeCandidate) (nasPurgeBatchResult, error) {
-	res := nasPurgeBatchResult{}
-	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-	if err != nil {
-		return res, err
-	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
-	ids := make([]int64, len(batch))
-	byID := map[int64]nasPurgeCandidate{}
-	for i, c := range batch {
-		ids[i] = c.ClipID
-		byID[c.ClipID] = c
-	}
-	lockArgs := append([]any{r.opts.connectionID, r.store.Bucket(), int64(r.opts.grace / time.Second),
-		int64(r.opts.nasMaxAge / time.Second), ids}, r.opts.protections.args()...)
-	rows, err := tx.Query(ctx, nasPurgeLockSQL, lockArgs...)
-	if err != nil {
-		return res, err
-	}
-	var lockedIDs []int64
-	for rows.Next() {
-		var id, size int64
-		var sha, key string
-		if err := rows.Scan(&id, &size, &sha, &key); err != nil {
-			rows.Close()
-			return res, err
-		}
-		c := byID[id]
-		if c.SizeBytes != size || c.SHA256 != sha || c.ObjectKey != key {
-			continue
-		}
-		lockedIDs = append(lockedIDs, id)
-		res.purged = append(res.purged, c)
-		delete(byID, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return res, err
-	}
-	for _, c := range byID {
-		res.changed = append(res.changed, c)
-	}
-	if len(lockedIDs) == 0 {
-		return res, nil
-	}
-	tag, err := tx.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=ANY($1) AND purged_at IS NULL`, lockedIDs)
-	if err != nil {
-		return nasPurgeBatchResult{}, err
-	}
-	if tag.RowsAffected() != int64(len(lockedIDs)) {
-		return nasPurgeBatchResult{}, fmt.Errorf("purged %d rows, locked %d", tag.RowsAffected(), len(lockedIDs))
-	}
-	// Past this point the delete and the commit must finish together.
-	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), nasPurgeFinishLimit)
-	defer cancel()
-	keys := make([]string, len(res.purged))
-	for i, c := range res.purged {
-		keys[i] = c.ObjectKey
-	}
-	failed, err := r.store.DeleteObjectsEach(finishCtx, keys)
-	if err != nil {
-		return nasPurgeBatchResult{}, fmt.Errorf("delete source objects: %w", err)
-	}
-	if len(failed) > 0 {
-		var keep []int64
-		var purged []nasPurgeCandidate
-		for _, c := range res.purged {
-			if msg, bad := failed[c.ObjectKey]; bad {
-				keep = append(keep, c.ClipID)
-				res.deleteFailed = append(res.deleteFailed, nasPurgeDeleteFailure{c, msg})
-				continue
-			}
-			purged = append(purged, c)
-		}
-		if _, err := tx.Exec(finishCtx, `UPDATE recording_clips SET purged_at=NULL WHERE id=ANY($1)`, keep); err != nil {
-			return nasPurgeBatchResult{}, fmt.Errorf("revert purged_at for undeleted keys: %w", err)
-		}
-		res.purged = purged
-	}
-	if err := tx.Commit(finishCtx); err != nil {
-		return nasPurgeBatchResult{}, fmt.Errorf("commit after delete (a rerun completes it): %w", err)
-	}
-	return res, nil
+	return nasPurgeBatchResult{}, r2.ErrLegacyDeleteRetired
 }
 
 func parseNASPurgeIDList(raw string) (map[int64]bool, error) {
@@ -967,6 +888,9 @@ func runNASVerifiedPurge(ctx context.Context, cfg config.Config, args []string) 
 	opts, err := parseNASPurgeArgs(args[1:])
 	if err != nil {
 		log.Fatalf("%v\n%s", err, usage)
+	}
+	if err := refuseLegacyR2Apply(opts.apply); err != nil {
+		log.Fatal(err)
 	}
 	if opts.cron && os.Getenv(nasPurgeEnabledEnv) != "true" {
 		fmt.Printf("nas-verified-purge: disabled (%s is not true); nothing done\n", nasPurgeEnabledEnv)

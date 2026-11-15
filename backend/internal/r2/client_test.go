@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/stitchproof"
 )
 
 func TestPresignGetExactBindsConditionalGenerationIdentity(t *testing.T) {
@@ -305,34 +307,6 @@ func TestPresignPutSizedRequestSignsExactLength(t *testing.T) {
 	}
 }
 
-func TestDeleteObjectsEachReportsPerKeyFailures(t *testing.T) {
-	var got string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		got = string(body)
-		w.Header().Set("Content-Type", "application/xml")
-		_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`+
-			`<Error><Key>b.mp4</Key><Code>InternalError</Code><Message>try again</Message></Error></DeleteResult>`)
-	}))
-	defer server.Close()
-	c, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
-	if err != nil {
-		t.Fatal(err)
-	}
-	failed, err := c.DeleteObjectsEach(context.Background(), []string{"a.mp4", "b.mp4"})
-	if err != nil || len(failed) != 1 || failed["b.mp4"] != "InternalError try again" {
-		t.Fatalf("failed=%v err=%v", failed, err)
-	}
-	if !strings.Contains(got, "<Key>a.mp4</Key>") || !strings.Contains(got, "<Key>b.mp4</Key>") {
-		t.Fatalf("request body %s", got)
-	}
-	for _, bad := range [][]string{{" a.mp4"}, {""}, make([]string, MaxDeleteBatch+1)} {
-		if _, err := c.DeleteObjectsEach(context.Background(), bad); err == nil {
-			t.Fatalf("accepted %q", bad[0])
-		}
-	}
-}
-
 func TestNASSpaceAuditMetadataPresignAndHead(t *testing.T) {
 	sha := strings.Repeat("a", 64)
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -365,31 +339,6 @@ func TestNASSpaceAuditMetadataPresignAndHead(t *testing.T) {
 	}
 }
 
-func TestDeleteObjectExactUsesConditionalSingleKey(t *testing.T) {
-	calls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		if r.Method != http.MethodDelete || r.URL.Path != "/bucket/managed/a.mp4" || r.Header.Get("If-Match") != `"exact"` {
-			t.Errorf("unbound delete: %s %s %q", r.Method, r.URL.Path, r.Header.Get("If-Match"))
-		}
-		w.WriteHeader(412)
-	}))
-	defer server.Close()
-	c, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := c.DeleteObjectExact(context.Background(), "managed/a.mp4", "exact"); err == nil {
-		t.Fatal("replacement accepted")
-	}
-	if calls != 1 {
-		t.Fatalf("conditional failure retried %d times", calls)
-	}
-	if err := c.DeleteObjectExact(context.Background(), "managed/a.mp4", ""); err == nil {
-		t.Fatal("empty ETag accepted")
-	}
-}
-
 func TestEndpointProofIdentityUsesConfiguredEndpoint(t *testing.T) {
 	endpoint := "https://account.r2.cloudflarestorage.com/"
 	c, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: endpoint})
@@ -399,41 +348,6 @@ func TestEndpointProofIdentityUsesConfiguredEndpoint(t *testing.T) {
 	sum := sha256.Sum256([]byte(strings.TrimRight(endpoint, "/")))
 	if c.EndpointSHA256() != hex.EncodeToString(sum[:]) {
 		t.Fatal("proof endpoint identity differs from configured storage")
-	}
-}
-
-func TestDeleteObjectOnceNeverRetriesAmbiguousResult(t *testing.T) {
-	for _, lostResponse := range []bool{false, true} {
-		t.Run(fmt.Sprint(lostResponse), func(t *testing.T) {
-			var calls atomic.Int32
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				calls.Add(1)
-				if r.Method != http.MethodDelete || r.URL.Path != "/bucket/managed/a.mp4" || r.Header.Get("If-Match") != "" {
-					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-				}
-				if lostResponse {
-					conn, _, err := w.(http.Hijacker).Hijack()
-					if err != nil {
-						t.Error(err)
-						return
-					}
-					conn.Close()
-					return
-				}
-				w.WriteHeader(http.StatusServiceUnavailable)
-			}))
-			defer server.Close()
-			c, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := c.DeleteObjectOnce(context.Background(), "managed/a.mp4"); err == nil {
-				t.Fatal("ambiguous DELETE accepted")
-			}
-			if calls.Load() != 1 {
-				t.Fatalf("DELETE attempted %d times", calls.Load())
-			}
-		})
 	}
 }
 
@@ -467,5 +381,52 @@ func TestPresignGetExactRangeBindsByteBoundaries(t *testing.T) {
 	u := mustURL(t, cap.URL)
 	if !strings.Contains(u.Query().Get("X-Amz-SignedHeaders"), "range") || cap.Headers.Get("Range") != "bytes=10-29" || cap.Headers.Get("If-Match") != `"abc123"` || u.Query().Get("X-Amz-Expires") != "10" {
 		t.Fatalf("range capability not bound: %s %+v", u.Query().Get("X-Amz-SignedHeaders"), cap.Headers)
+	}
+}
+
+func TestR2LegacyDeletesAndMissingStitchAuthorityNeverReachWire(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(204) }))
+	defer server.Close()
+	c, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "fake", SecretKey: "fake", Region: "auto", Bucket: "stoarama", Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, keys := range [][]string{nil, {}, {"managed/a.mp4"}} {
+		if err := c.DeleteObjects(ctx, keys); !errors.Is(err, ErrLegacyDeleteRetired) {
+			t.Fatal(err)
+		}
+		if _, err := c.DeleteObjectsEach(ctx, keys); !errors.Is(err, ErrLegacyDeleteRetired) {
+			t.Fatal(err)
+		}
+	}
+	if err := c.DeleteObject(ctx, "managed/a.mp4"); !errors.Is(err, ErrLegacyDeleteRetired) {
+		t.Fatal(err)
+	}
+	if err := c.DeleteObjectExact(ctx, "managed/a.mp4", "etag"); !errors.Is(err, ErrLegacyDeleteRetired) {
+		t.Fatal(err)
+	}
+	for _, authority := range []*stitchproof.Authority{nil, new(stitchproof.Authority)} {
+		if err := c.DeleteObjectOnce(ctx, "managed/a.mp4", authority); err == nil {
+			t.Fatal("missing/zero authority accepted")
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("unauthorized wire requests=%d", calls.Load())
+	}
+}
+
+func TestR2StitchTransportRefusesAtWireAndNeverRedirects(t *testing.T) {
+	transport := retirementTransport{authority: new(stitchproof.Authority), bucket: "stoarama", endpoint: strings.Repeat("a", 64)}
+	req, err := http.NewRequest(http.MethodDelete, "https://storage.example.test/stoarama/managed/a.mp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transport.RoundTrip(req); err == nil {
+		t.Fatal("zero authority reached base transport")
+	}
+	if err := refuseRetirementRedirect(req, nil); err != http.ErrUseLastResponse {
+		t.Fatal("wire DELETE may follow another key", err)
 	}
 }

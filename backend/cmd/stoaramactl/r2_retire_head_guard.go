@@ -8,11 +8,12 @@ import (
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/daydemir/stoarama/backend/internal/stitchproof"
 	"github.com/jackc/pgx/v5"
 )
 
 type r2RetireSingleDeleteStore interface {
-	DeleteObjectOnce(context.Context, string) error
+	DeleteObjectOnce(context.Context, string, *stitchproof.Authority) error
 }
 
 // Operator acknowledgment never waives these known writer destinations.
@@ -87,6 +88,12 @@ func r2RetireValidateGuardHead(h r2.ObjectHead, it r2RetireItem, catalogETag str
 // single wire DELETE. HEAD and live vetoes are observations, not a provider
 // compare-and-delete: an ungated credential holder can still race.
 func (a *r2RetireApplier) headGuard(ctx context.Context, tx pgx.Tx, it r2RetireItem) error {
+	if err := a.authority.Check(); err != nil {
+		return err
+	}
+	if err := r2RetireDeliveryClosureUnchanged(ctx, a.store, a.opts.Delivery); err != nil {
+		return err
+	}
 	if err := checkR2RetireDeleteProofMode(a.opts.DeleteProofPath, a.opts.DeleteProofSHA256, a.header.Bucket, a.store.EndpointSHA256(), true); err != nil {
 		return err
 	}
@@ -107,6 +114,9 @@ func (a *r2RetireApplier) headGuard(ctx context.Context, tx pgx.Tx, it r2RetireI
 		return fmt.Errorf("final guarded HEAD: %w", err)
 	}
 	if err := r2RetireValidateGuardHead(head, it, etag, a.opts.MinObjectAge, time.Now()); err != nil {
+		return err
+	}
+	if err := r2RetireRequireIndexes(ctx, tx); err != nil {
 		return err
 	}
 	if err := r2RetireCheckStoppedWriters(ctx, tx, a.header.Bucket); err != nil {
@@ -147,7 +157,10 @@ func (a *r2RetireApplier) headGuard(ctx context.Context, tx pgx.Tx, it r2RetireI
 	if err := a.checkWriterState(ctx, tx, it.ObjectKey); err != nil {
 		return err
 	}
-	return nil
+	if err := r2RetireDeliveryClosureUnchanged(ctx, a.store, a.opts.Delivery); err != nil {
+		return err
+	}
+	return a.authority.Check()
 }
 
 // Raw catalog authority is enumerated by its primary key in bounded pages.

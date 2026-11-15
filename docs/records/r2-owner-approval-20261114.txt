@@ -1,0 +1,28 @@
+Owner authority relayed verbatim by the parent operator on 2026-11-14 ~23:45Z.
+This supersedes the prior looser blocked-class sentence and two-week deadline.
+
+Deniz, Q1:
+"i approve deletion on r2 and NAS when
+
+on NAS, the footage is outside the 28 day kept periods
+on R2, the footage is NOT in the keep everything set of streams AND is NOT in the global street scores delivery set of kept 14 day periods AND is NOT in the 27 day kept periods that still need to be transferred to the NAS"
+
+Deniz, Q2:
+"prove stitching can work at any speed before we start deleting from R2. you could also use the rpis for stitching if that would be faster and create a connection between the NAS and the rpi.. think about ways to get the stitching working without need for any intervention from us or use of our systems"
+
+Parent's recorded interpretation:
+- Use the full pinned keep28 windows despite the R2 line saying 27 days.
+- KeepAll and the global delivery kept14 set/dependencies stay in R2.
+- Kept footage still awaiting a fresh exact verified NAS copy stays in R2.
+- Unmapped identities stay. Cleanup recovery/source holds remain protected.
+- The real stitching prerequisite applies to EVERY R2 deletion, at any speed.
+- The immutable fence, honest writer drain, index readiness, per-object custody,
+  independently reviewed execution window and all other guards remain.
+- No narrative or code/CI approval establishes an actual real NAS proof.
+- Never run the legacy survey, joined-source-purge or nas-verified-purge apply
+  commands; never resume the NAS purge cron or flip its enable environment flag.
+
+NAS deletion, runner/master/STOP/plans, backend deployments and NAS releases
+remain exclusively controlled by the production controller. The R2 implementation
+agent may run its own exact reviewed index/writer operations only in separately
+and explicitly granted controller windows. This record is not such a window.

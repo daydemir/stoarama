@@ -603,43 +603,5 @@ func ComputeCoverage(ctx context.Context, pool *pgxpool.Pool, day time.Time) (Co
 // removes frame rows but never deletes R2 bytes and orphans media_objects, so
 // this is the explicit cleanup path.
 func DeleteStreamCaptures(ctx context.Context, pool *pgxpool.Pool, r2c *r2.Client, streamID int64) (deletedObjects int, _ error) {
-	prefix := fmt.Sprintf("survey/stream/%d/", streamID)
-	keys := make([]string, 0, 512)
-	if err := r2c.ListPrefix(ctx, prefix, 0, func(obj r2.ObjectInfo) error {
-		keys = append(keys, obj.Key)
-		return nil
-	}); err != nil {
-		return 0, fmt.Errorf("list survey objects for stream %d: %w", streamID, err)
-	}
-	if len(keys) > 0 {
-		if err := r2c.DeleteObjects(ctx, keys); err != nil {
-			return 0, fmt.Errorf("delete survey objects for stream %d: %w", streamID, err)
-		}
-	}
-
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("begin survey delete tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	// Delete survey frame rows for the stream, then the now-orphaned
-	// media_objects rows for those survey keys.
-	if _, err := tx.Exec(ctx, `
-		DELETE FROM frames
-		WHERE stream_id = $1 AND source_kind = 'survey'
-	`, streamID); err != nil {
-		return 0, fmt.Errorf("delete survey frames for stream %d: %w", streamID, err)
-	}
-	if _, err := tx.Exec(ctx, `
-		DELETE FROM media_objects
-		WHERE bucket = $1 AND object_key LIKE $2
-		  AND NOT EXISTS (SELECT 1 FROM frames f WHERE f.raw_media_object_id = media_objects.id)
-	`, r2c.Bucket(), prefix+"%"); err != nil {
-		return 0, fmt.Errorf("delete orphaned survey media_objects for stream %d: %w", streamID, err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("commit survey delete tx: %w", err)
-	}
-	return len(keys), nil
+	return 0, r2.ErrLegacyDeleteRetired
 }

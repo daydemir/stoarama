@@ -21,9 +21,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/daydemir/stoarama/backend/internal/stitchproof"
 )
 
 // MaxConditionalPutBytes is R2's exact single-part PUT ceiling: 5 GiB minus
@@ -33,11 +34,12 @@ import (
 const MaxConditionalPutBytes int64 = 5*1024*1024*1024 - 5*1024*1024
 
 type Client struct {
-	bucket        string
-	s3            *s3.Client
-	presigner     *s3.PresignClient
-	writerDB      *pgxpool.Pool
-	ungatedWriter bool
+	bucket          string
+	s3              *s3.Client
+	presigner       *s3.PresignClient
+	writerDB        *pgxpool.Pool
+	ungatedWriter   bool
+	deleteTransport http.RoundTripper
 }
 
 type Config struct {
@@ -81,11 +83,12 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Region == "" {
 		cfg.Region = "auto"
 	}
+	httpClient := newHTTPSRedirectClient()
 	awsCfg, err := awsconfig.LoadDefaultConfig(
 		ctx,
 		awsconfig.WithRegion(cfg.Region),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")),
-		awsconfig.WithHTTPClient(newHTTPSRedirectClient()),
+		awsconfig.WithHTTPClient(httpClient),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
@@ -97,11 +100,12 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	})
 
 	return &Client{
-		bucket:        cfg.Bucket,
-		writerDB:      cfg.WriterDB,
-		ungatedWriter: cfg.UngatedWriter,
-		s3:            client,
-		presigner:     s3.NewPresignClient(client),
+		bucket:          cfg.Bucket,
+		writerDB:        cfg.WriterDB,
+		ungatedWriter:   cfg.UngatedWriter,
+		s3:              client,
+		presigner:       s3.NewPresignClient(client),
+		deleteTransport: httpClient.Transport,
 	}, nil
 }
 
@@ -654,105 +658,74 @@ func (c *Client) ListPrefix(ctx context.Context, prefix string, limit int, fn fu
 	}
 }
 
+// ErrLegacyDeleteRetired is returned even for empty batches: callers must not
+// interpret a no-op wire request as permission to mutate their catalog.
+var ErrLegacyDeleteRetired = errors.New("legacy object deletion is retired; use reviewed r2-retire with verified NAS stitching authority")
+
 func (c *Client) DeleteObjects(ctx context.Context, keys []string) error {
-	if len(keys) == 0 {
-		return nil
-	}
-	objects := make([]types.ObjectIdentifier, 0, len(keys))
-	for _, key := range keys {
-		trimmed := strings.TrimSpace(key)
-		if trimmed == "" {
-			return fmt.Errorf("delete object key is empty")
-		}
-		objects = append(objects, types.ObjectIdentifier{Key: aws.String(trimmed)})
-	}
-	out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-		Bucket: aws.String(c.bucket),
-		Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
-	})
-	if err != nil {
-		return fmt.Errorf("delete objects: %w", err)
-	}
-	if len(out.Errors) > 0 {
-		first := out.Errors[0]
-		return fmt.Errorf("delete object %s: %s %s", aws.ToString(first.Key), aws.ToString(first.Code), aws.ToString(first.Message))
-	}
-	return nil
+	return ErrLegacyDeleteRetired
 }
 
-// DeleteObject deletes exactly one key: no prefix, batch or wildcard
-// semantics. A key with surrounding whitespace is refused rather than
-// normalized into a different key. Deleting an absent key succeeds.
+// DeleteObject is retired. It never sends a request.
 func (c *Client) DeleteObject(ctx context.Context, key string) error {
-	if key == "" || strings.TrimSpace(key) != key {
-		return fmt.Errorf("delete object key %q is empty or padded", key)
-	}
-	if _, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)}); err != nil {
-		return fmt.Errorf("delete object %s: %w", key, err)
-	}
-	return nil
+	return ErrLegacyDeleteRetired
 }
 
 // DeleteObjectOnce performs exactly one unconditional wire attempt. A lost
 // response is ambiguous: retirement must retain its intent and re-HEAD on resume.
-func (c *Client) DeleteObjectOnce(ctx context.Context, key string) error {
+func (c *Client) DeleteObjectOnce(ctx context.Context, key string, authority *stitchproof.Authority) error {
+	if err := authority.RequireWire(c.bucket, c.EndpointSHA256()); err != nil {
+		return err
+	}
 	if key == "" || strings.TrimSpace(key) != key {
 		return errors.New("single-attempt delete requires an exact key")
 	}
-	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)}, func(o *s3.Options) {
+	remaining, err := authority.Remaining()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, remaining)
+	defer cancel()
+	_, err = c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)}, func(o *s3.Options) {
 		o.Retryer = aws.NopRetryer{}
+		o.HTTPClient = &http.Client{Transport: retirementTransport{c.deleteTransport, authority, c.bucket, c.EndpointSHA256()}, CheckRedirect: refuseRetirementRedirect}
 	})
 	return err
+}
+
+func refuseRetirementRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+type retirementTransport struct {
+	base             http.RoundTripper
+	authority        *stitchproof.Authority
+	bucket, endpoint string
+}
+
+func (t retirementTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method != http.MethodDelete {
+		return nil, errors.New("retirement transport only sends one exact DELETE")
+	}
+	if err := t.authority.RequireWire(t.bucket, t.endpoint); err != nil {
+		return nil, err
+	}
+	return t.base.RoundTrip(req)
 }
 
 // MaxDeleteBatch is the S3/R2 multi-object delete limit per request.
 const MaxDeleteBatch = 1000
 
-// DeleteObjectsEach deletes up to MaxDeleteBatch keys in one request and
-// returns the keys the store reported as not deleted, with their error. A
-// non-nil error means the request itself failed and no key may be assumed
-// deleted or kept. Keys are sent exactly as given: a key with surrounding
-// whitespace is refused rather than normalized into a different key.
+// DeleteObjectsEach is retired, including empty batches.
 func (c *Client) DeleteObjectsEach(ctx context.Context, keys []string) (map[string]string, error) {
-	if len(keys) == 0 {
-		return map[string]string{}, nil
-	}
-	if len(keys) > MaxDeleteBatch {
-		return nil, fmt.Errorf("delete batch of %d keys exceeds %d", len(keys), MaxDeleteBatch)
-	}
-	objects := make([]types.ObjectIdentifier, 0, len(keys))
-	for _, key := range keys {
-		if key == "" || strings.TrimSpace(key) != key {
-			return nil, fmt.Errorf("delete object key %q is empty or padded", key)
-		}
-		objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})
-	}
-	out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-		Bucket: aws.String(c.bucket),
-		Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("delete objects: %w", err)
-	}
-	failed := make(map[string]string, len(out.Errors))
-	for _, e := range out.Errors {
-		failed[aws.ToString(e.Key)] = strings.TrimSpace(aws.ToString(e.Code) + " " + aws.ToString(e.Message))
-	}
-	return failed, nil
+	return nil, ErrLegacyDeleteRetired
 }
 
 func cleanETag(v string) string {
 	return strings.Trim(v, "\"")
 }
 
-// DeleteObjectExact refuses a replacement object at the same key. Never use a
-// prefix, unconditional retry or multi-delete for a reviewed retirement item.
+// DeleteObjectExact is retired; no conditional-delete fallback remains.
 func (c *Client) DeleteObjectExact(ctx context.Context, key, etag string) error {
-	if key == "" || cleanETag(etag) == "" {
-		return errors.New("exact delete requires key and ETag")
-	}
-	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key), IfMatch: aws.String(`"` + cleanETag(etag) + `"`)})
-	return err
+	return ErrLegacyDeleteRetired
 }
 
 // EndpointSHA256 binds an operator capability proof without recording account
