@@ -51,7 +51,7 @@ def read_bounded(path,limit,expected_sha=None):
     finally:os.close(fd)
 
 
-PURE_FUNCTIONS=frozenset(('cleanup_json_bytes','stitch_signature','stitch_packet_records','stitch_frame_records','stitch_source_records','stitch_output_records','stitch_proof_json','stitch_proof_check','stitch_proof_success','stitch_proof_unpack','stitch_proof_validate'))
+PURE_FUNCTIONS=frozenset(('cleanup_json_bytes','stitch_signature','stitch_editlist_records','stitch_packet_records','stitch_frame_records','stitch_source_records','stitch_output_records','stitch_proof_json','stitch_proof_check','stitch_proof_success','stitch_proof_unpack','stitch_proof_validate'))
 PURE_CONSTANTS=frozenset(('STITCH_POLICY','STITCH_REVISION','STITCH_CORPUS_SHA','STITCH_PROOF_SOURCE_SHA','STITCH_PROOF_KIND','STITCH_PROOF_AUDIT_NAMES','STITCH_PROOF_SCHEMA_JSON','STITCH_PROOF_SCHEMA_SHA','V85R_MANIFEST_SHA','V85R_TOOL_VERSION','V85R_TOOLS','CLEANUP_KEEP28_POLICY_SHA256'))
 REPLAY_INPUT_SCHEMA='stoarama.nas-stitch-replay-input.v1'
 REPLAY_INPUT_MAX_BYTES=16*1024*1024
@@ -84,7 +84,7 @@ def load_core_bytes(client_source,expected_sha):
                     if target.id in namespace:raise ProofError('duplicate verifier constant')
                     namespace[target.id]=ast.literal_eval(node.value)
     if found!=PURE_FUNCTIONS or not PURE_CONSTANTS<=namespace.keys():raise ProofError('unsupported client verifier revision')
-    safe={k:__builtins__[k] if isinstance(__builtins__,dict) else getattr(__builtins__,k) for k in ('dict','list','set','len','str','int','float','bool','range','type','any','all','enumerate','zip','iter','next','max','min','abs','sorted','tuple','ValueError','KeyError','Exception')}
+    safe={k:__builtins__[k] if isinstance(__builtins__,dict) else getattr(__builtins__,k) for k in ('dict','list','set','len','str','bytes','int','float','bool','range','type','any','all','enumerate','zip','iter','next','max','min','abs','sorted','tuple','ValueError','KeyError','Exception')}
     namespace['__builtins__']=safe
     exec(compile(ast.Module(body=declarations,type_ignores=[]),'<pinned native inventory verifier>','exec'),namespace)
     return SimpleNamespace(**namespace)
@@ -129,16 +129,16 @@ def verify(core,task,body,client_sha):
     files=receipt['audits'];sources=[]
     for n,(clip,proof) in enumerate(zip(task['plan']['clips'],output['inputs'])):
         if proof['sha256']!=clip['sha256'] or proof['size_bytes']!=clip['size_bytes']:raise ProofError('source identity mismatch')
-        prefix='source-%03d'%n;signature=core.stitch_signature(strict_json(files[prefix+'.json'])['streams'])
-        if files[prefix+'.packets']!=files[prefix+'.hidden']:raise ProofError('source hidden inventory differs')
+        prefix='source-%03d'%n;document=strict_json(files[prefix+'.json']);signature=core.stitch_signature(document['streams'])
+        core.stitch_editlist_records(document,core.stitch_packet_records(io.StringIO(files[prefix+'.packets'])),core.stitch_packet_records(io.StringIO(files[prefix+'.hidden'])))
         packets=lambda text=files[prefix+'.packets']:core.stitch_packet_records(io.StringIO(text))
         frames=lambda text=files[prefix+'.frames']:core.stitch_frame_records(io.StringIO(text))
         source=core.stitch_source_records(signature,packets,frames)
         if source['count']!=proof['packets'] or proof['frames']!=proof['packets'] or source['chain']!=proof['packet_chain_sha256']:raise ProofError('source native receipt differs')
         sources.append(source)
-    signature=core.stitch_signature(strict_json(files['output.json'])['streams'])
+    document=strict_json(files['output.json']);signature=core.stitch_signature(document['streams'])
     if any(s['signature']!=signature for s in sources):raise ProofError('codec identity differs')
-    if files['output.packets']!=files['output.hidden']:raise ProofError('output hidden inventory differs')
+    core.stitch_editlist_records(document,core.stitch_packet_records(io.StringIO(files['output.packets'])),core.stitch_packet_records(io.StringIO(files['output.hidden'])))
     core.stitch_output_records(signature,sources,core.stitch_packet_records(io.StringIO(files['output.packets'])),core.stitch_frame_records(io.StringIO(files['output.frames'])))
     decision=strict_json(files['v85r-decision.json']);seam=result['seams'][0]
     if any(decision.get(k)!=seam.get(k) for k in ('decision','status','nomination','join','diagnostic_sha256')):raise ProofError('fresh policy decision receipt differs')

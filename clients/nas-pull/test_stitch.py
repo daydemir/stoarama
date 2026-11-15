@@ -306,6 +306,22 @@ class StitchIntegrationTests(unittest.TestCase):
             return dict(ack,delivery_keep_checked=True,action='delete_issued',delete=True,expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
         return dict(ack,ok=True)
 
+    def test_b_frame_start_edit_is_conserved_through_real_remux_and_decode(self):
+        for clip in self.clips[:2]:
+            path = self.cfg.output_dir/clip['relative_path']
+            subprocess.run([self.tools['ffmpeg'], '-nostdin', '-v', 'error', '-y', '-f', 'lavfi', '-i',
+                'testsrc2=size=64x64:rate=5:duration=2', '-c:v', 'libx264', '-threads', '1',
+                '-pix_fmt', 'yuv420p', '-bf', '2', '-x264-params', 'aud=1:repeat-headers=1', str(path)], check=True)
+            clip.update(size_bytes=path.stat().st_size, sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+            sidecar=Path(str(path)+'.stoarama.json');doc=json.loads(sidecar.read_text())
+            doc.update(size_bytes=clip['size_bytes'],sha256=clip['sha256']);sidecar.write_text(json.dumps(doc))
+        result=self.build()
+        self.assertEqual(result['left_out'],[3,4])
+        self.assertEqual(len(result['outputs']),1)
+        output=result['outputs'][0]
+        self.assertEqual([c['clip_id'] for c in output['inputs']],[1,2])
+        self.assertTrue(all(output[key] for key in ('full_decode','seam_decode','native_audit','packet_chain')))
+
     def test_stitch_register_then_delete_only_fully_included(self):
         result=self.build()
         self.assertEqual(result['left_out'],[3,4])

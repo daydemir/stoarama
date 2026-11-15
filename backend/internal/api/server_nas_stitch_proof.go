@@ -56,7 +56,7 @@ func boundedNASStitchProof(p nasStitchPlan, sourceSHA string) (nasStitchProof, e
 	if !strings.Contains(p.OutputFolder, "_V85r_keep28/") {
 		return nasStitchProof{}, errors.New("proof source namespace differs")
 	}
-	p.OutputFolder = strings.Replace(p.OutputFolder, "_V85r_keep28/", "_V85r_proof_keep28/", 1) + "/proof-" + sourceSHA[:16]
+	p.OutputFolder = strings.Replace(p.OutputFolder, "_V85r_keep28/", "_V85r_proof_keep28_v2/", 1) + "/proof-" + sourceSHA[:16]
 	raw, err := json.Marshal(p)
 	if err != nil {
 		return nasStitchProof{}, err

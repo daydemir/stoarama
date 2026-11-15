@@ -23,11 +23,11 @@ func nasCleanupSupportsV6(version string) bool {
 const nasCleanupBulkDurabilityClientVersion = "cleanup-batch-v7"
 
 const nasCleanupR2CopyClientVersion = "r2-copy-v2"
-const nasCleanupProofClientVersion = "v85r-nas-proof-v1"
+const nasCleanupProofClientVersion = "v85r-nas-proof-v2"
 
 func nasCleanupSupportsBulk(version string) bool {
 	switch version {
-	case nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion, nasCleanupProofClientVersion:
+	case nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion, "v85r-nas-proof-v1", nasCleanupProofClientVersion:
 		return true
 	default:
 		return false
