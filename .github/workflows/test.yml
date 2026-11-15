@@ -189,7 +189,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ffmpeg
       - name: NAS V85r fake-NAS stitching and crash recovery
         working-directory: .
-        run: python3 -m unittest discover -s clients/nas-pull -p test_stitch.py -v
+        run: python3 -m unittest discover -s clients/nas-pull -p 'test_stitch*.py' -v
       - name: V85r package pins and conservative decisions
         working-directory: .
         run: python3 -m unittest discover -s clients/nas-pull -p test_v85r.py -v

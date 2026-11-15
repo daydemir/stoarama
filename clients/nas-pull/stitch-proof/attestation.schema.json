@@ -1,0 +1,707 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "stoarama.nas-stitch-attestation.v1",
+  "title": "Frozen NAS stitching prerequisite artifact v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "synthetic",
+    "payload",
+    "independent_review"
+  ],
+  "properties": {
+    "schema": {
+      "const": "stoarama.nas-stitch-attestation.v1"
+    },
+    "synthetic": {
+      "const": false
+    },
+    "payload": {
+      "$ref": "#/$defs/file"
+    },
+    "independent_review": {
+      "$ref": "#/$defs/file"
+    }
+  },
+  "$defs": {
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "file": {
+          "type": "string",
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[A-Za-z0-9][A-Za-z0-9._/-]*$"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "media": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relative_path",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "relative_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clip_id",
+        "relative_path",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "clip_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "relative_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relative_path",
+        "sha256",
+        "size_bytes",
+        "source_clip_ids",
+        "readback_sha256"
+      ],
+      "properties": {
+        "relative_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "source_clip_ids": {
+          "const": [
+            373218,
+            373262
+          ]
+        },
+        "readback_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "revision",
+        "keep28_sha256",
+        "corpus_sha256",
+        "package_manifest_sha256"
+      ],
+      "properties": {
+        "name": {
+          "const": "v85r"
+        },
+        "revision": {
+          "const": "v85r-rebuilt-1"
+        },
+        "keep28_sha256": {
+          "const": "060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811"
+        },
+        "corpus_sha256": {
+          "const": "5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b"
+        },
+        "package_manifest_sha256": {
+          "const": "337c606985e930abf1df459cbbda0c674f13bd9d92e11013131e2b2348e78a06"
+        }
+      }
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "version": {
+          "const": "N-126826-gc0e8b139fd-20260924"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "pipeline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "base_commit_sha",
+        "reviewed_head_sha",
+        "merged_commit_sha",
+        "client_version",
+        "client_artifact_sha256"
+      ],
+      "properties": {
+        "repository": {
+          "const": "daydemir/stoarama"
+        },
+        "base_commit_sha": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "reviewed_head_sha": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "merged_commit_sha": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "client_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "client_artifact_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "client_boot_id",
+        "host",
+        "started_at",
+        "completed_at",
+        "media_seconds",
+        "build_wall_seconds"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "client_boot_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "host": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "connection_id",
+            "system",
+            "machine",
+            "cpu_model",
+            "cpu_count"
+          ],
+          "properties": {
+            "connection_id": {
+              "const": 13
+            },
+            "system": {
+              "const": "Linux"
+            },
+            "machine": {
+              "const": "x86_64"
+            },
+            "cpu_model": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            },
+            "cpu_count": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$"
+        },
+        "completed_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$"
+        },
+        "media_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "build_wall_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "connection_id",
+        "account_id",
+        "scope",
+        "policy",
+        "pipeline",
+        "tools",
+        "run",
+        "inputs",
+        "outputs",
+        "evidence",
+        "verification"
+      ],
+      "properties": {
+        "schema": {
+          "const": "stoarama.nas-stitch-payload.v1"
+        },
+        "connection_id": {
+          "const": 13
+        },
+        "account_id": {
+          "const": 47
+        },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "stream_id",
+            "recording_id",
+            "source_task_id",
+            "source_plan_sha256",
+            "proof_plan_sha256",
+            "clip_ids"
+          ],
+          "properties": {
+            "stream_id": {
+              "const": 17208
+            },
+            "recording_id": {
+              "const": 444
+            },
+            "source_task_id": {
+              "const": 1
+            },
+            "source_plan_sha256": {
+              "const": "0dfa6b172f33bd55e409729ecd517d492cdee03427b028ac226788e530a72726"
+            },
+            "proof_plan_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "clip_ids": {
+              "const": [
+                373218,
+                373262
+              ]
+            }
+          }
+        },
+        "policy": {
+          "$ref": "#/$defs/policy"
+        },
+        "pipeline": {
+          "$ref": "#/$defs/pipeline"
+        },
+        "tools": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ffmpeg",
+            "ffprobe"
+          ],
+          "properties": {
+            "ffmpeg": {
+              "$ref": "#/$defs/ffmpeg"
+            },
+            "ffprobe": {
+              "$ref": "#/$defs/ffprobe"
+            }
+          }
+        },
+        "run": {
+          "$ref": "#/$defs/run"
+        },
+        "inputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/input"
+          },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "outputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/output"
+          },
+          "minItems": 1,
+          "maxItems": 1
+        },
+        "evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "native_bundle",
+            "local_registration",
+            "source_plan",
+            "server_validation",
+            "verifier",
+            "client_artifact"
+          ],
+          "properties": {
+            "native_bundle": {
+              "$ref": "#/$defs/file"
+            },
+            "local_registration": {
+              "$ref": "#/$defs/file"
+            },
+            "source_plan": {
+              "$ref": "#/$defs/file"
+            },
+            "server_validation": {
+              "$ref": "#/$defs/file"
+            },
+            "verifier": {
+              "$ref": "#/$defs/file"
+            },
+            "client_artifact": {
+              "$ref": "#/$defs/file"
+            }
+          }
+        },
+        "verification": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "current_policy",
+            "native_inventory_replay",
+            "server_binding",
+            "result_sha256"
+          ],
+          "properties": {
+            "current_policy": {
+              "const": "passed"
+            },
+            "native_inventory_replay": {
+              "const": "passed"
+            },
+            "server_binding": {
+              "const": "passed"
+            },
+            "result_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            }
+          }
+        }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "validated_at",
+        "run_id",
+        "proof_plan_sha256",
+        "client_artifact_sha256",
+        "policy",
+        "tools",
+        "server_binding",
+        "nas_readback"
+      ],
+      "properties": {
+        "schema": {
+          "const": "stoarama.nas-stitch-validation.v1"
+        },
+        "validated_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$"
+        },
+        "run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "proof_plan_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "client_artifact_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "policy": {
+          "$ref": "#/$defs/policy"
+        },
+        "tools": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ffmpeg",
+            "ffprobe"
+          ],
+          "properties": {
+            "ffmpeg": {
+              "$ref": "#/$defs/ffmpeg"
+            },
+            "ffprobe": {
+              "$ref": "#/$defs/ffprobe"
+            }
+          }
+        },
+        "server_binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "verified",
+            "kind",
+            "plan_sha256",
+            "output_sha256",
+            "registered_locally_only",
+            "grants_retirement"
+          ],
+          "properties": {
+            "verified": {
+              "const": true
+            },
+            "kind": {
+              "const": "nas-only-v85r-proof-v1"
+            },
+            "plan_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "output_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "registered_locally_only": {
+              "const": true
+            },
+            "grants_retirement": {
+              "const": false
+            }
+          }
+        },
+        "nas_readback": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "verified_at",
+            "client_boot_id",
+            "run_id",
+            "receipt_sha256",
+            "outputs"
+          ],
+          "properties": {
+            "verified_at": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$"
+            },
+            "client_boot_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "run_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "receipt_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "outputs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/media"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            }
+          }
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "reviewer",
+        "reviewed_at",
+        "verdict",
+        "payload_sha256",
+        "bundle_sha256",
+        "reviewed_code_head_sha",
+        "observations"
+      ],
+      "properties": {
+        "schema": {
+          "const": "stoarama.nas-stitch-review.v1"
+        },
+        "reviewer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "provider",
+            "model",
+            "reference"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            },
+            "provider": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            },
+            "model": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            },
+            "reference": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            }
+          }
+        },
+        "reviewed_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$"
+        },
+        "verdict": {
+          "const": "approve"
+        },
+        "payload_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "bundle_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "reviewed_code_head_sha": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "observations": {
+          "$ref": "#/$defs/file"
+        }
+      }
+    },
+    "ffmpeg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "version": {
+          "const": "N-126826-gc0e8b139fd-20260924"
+        },
+        "sha256": {
+          "const": "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b"
+        },
+        "size_bytes": {
+          "const": 174165384
+        }
+      }
+    },
+    "ffprobe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "version": {
+          "const": "N-126826-gc0e8b139fd-20260924"
+        },
+        "sha256": {
+          "const": "9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c"
+        },
+        "size_bytes": {
+          "const": 173923656
+        }
+      }
+    }
+  },
+  "$comment": "Also enforce strict duplicate-key rejection, exact streamed SHA/size, canonical relative artifact paths/regular no-symlink ancestry, input uniqueness/order and exact identities, runtime timestamp ordering and <=5min future skew, validation/review <=24h at apply, all cross-file bindings and actual native replay. No fixture or narrative/booleans alone grant authority."
+}

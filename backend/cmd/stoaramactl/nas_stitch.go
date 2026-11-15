@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -16,7 +17,7 @@ import (
 
 func runNASStitch(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) == 0 {
-		log.Fatal("usage: nas-stitch status|approve|pause|import-corpus")
+		log.Fatal("usage: nas-stitch status|proof-plan|verify-proof|approve|pause|import-corpus")
 	}
 	fs := flag.NewFlagSet("nas-stitch "+args[0], flag.ExitOnError)
 	base := fs.String("backend-api-url", defaultBackendAPIURL(), "backend URL")
@@ -28,9 +29,21 @@ func runNASStitch(ctx context.Context, cfg config.Config, args []string) {
 	until := fs.String("approved-until", "", "explicit approval expiry RFC3339, <=180 days")
 	reason := fs.String("reason", "", "owner approval reference")
 	deletion := fs.Bool("approve-deletion", false, "owner authorizes fully proven stitched raw retirement")
-	input := fs.String("input", "", "exact pinned uncompressed frozen decision JSONL")
+	input := fs.String("input", "", "proof validation envelope or pinned frozen decision JSONL")
 	fs.Parse(args[1:])
 	switch args[0] {
+	case "proof-plan":
+		printJSON(mustAPIGet(ctx, *base, *token, "/api/v1/service/nas-stitch/proof"))
+	case "verify-proof":
+		raw, err := os.ReadFile(*input)
+		if err != nil || len(raw) > 1<<20 {
+			log.Fatal("bounded proof result required")
+		}
+		var result any
+		if json.Unmarshal(raw, &result) != nil {
+			log.Fatal("invalid proof result")
+		}
+		printJSON(mustAPIRequest(ctx, http.MethodPost, *base, *token, "/api/v1/service/nas-stitch/proof/verify", result))
 	case "status":
 		printJSON(mustAPIGet(ctx, *base, *token, "/api/v1/service/nas-stitch/status"))
 	case "approve":
@@ -83,6 +96,6 @@ func runNASStitch(ctx context.Context, cfg config.Config, args []string) {
 		}
 		fmt.Println(string(body))
 	default:
-		log.Fatal("usage: nas-stitch status|approve|pause|import-corpus")
+		log.Fatal("usage: nas-stitch status|proof-plan|verify-proof|approve|pause|import-corpus")
 	}
 }
