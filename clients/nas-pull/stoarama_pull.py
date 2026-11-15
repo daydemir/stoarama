@@ -18062,7 +18062,7 @@ CLEANUP_GROUP_VERSION = "cleanup-batch-v6.1"
 CLEANUP_V6_VERSIONS: frozenset[str] = frozenset((CLEANUP_GROUP_VERSION, "r2-copy-v1"))
 CLEANUP_BULK_VERSION = "cleanup-batch-v7"
 CLEANUP_TRUTH_VERSION = "cleanup-batch-v8"
-CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, "r2-copy-v2", "v85r-nas-proof-v1", "v85r-nas-proof-v2"))
+CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, "r2-copy-v2", "r2-copy-v3", "v85r-nas-proof-v1", "v85r-nas-proof-v2"))
 CLEANUP_GROUP_VERSIONS: frozenset[str] = CLEANUP_V6_VERSIONS | CLEANUP_BULK_VERSIONS
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
@@ -50147,17 +50147,259 @@ def r2_copy_http(url, method, headers, body=None, limit=R2_COPY_RANGE, timeout=1
         process.stdin.close()
 
 
-def r2_copy_request_json(cfg, method, path, body=None, timeout=R2_COPY_TIMEOUT):
-    # Copy tokens are scoped by execute_r2_copy, not permanently learned by the
-    # general response-secret registry. HTTP failures expose only a status code.
-    status, _, data = r2_copy_http(cfg.api_base + path, method,
-                                  {"User-Agent": USER_AGENT, "Authorization": "Bearer " + cfg.api_key,
-                                   "Content-Type": "application/json"},
-                                  json.dumps(body).encode() if body is not None else None,
-                                  limit=1024 * 1024, timeout=timeout)
-    if status != 200:
-        raise urllib.error.HTTPError(path, status, "copy control refused", {}, None)
-    return json.loads(data)
+class R2CopyControlOperation(Enum):
+    LEASE = 1
+    CHECKPOINT = 2
+    RANGE = 3
+    INVENTORY = 4
+    RESULT = 5
+
+
+class R2CopyControlFrame(Enum):
+    READY = 1
+    SENT = 2
+    FIRST_BYTE = 3
+    STATUS = 4
+    BODY = 5
+    ERROR = 6
+
+
+# One owned process per worker amortizes imports and TLS context initialization.
+# Only control JSON uses this protocol; signed media GETs remain one-shot above.
+R2_COPY_CONTROL_CHILD = r'''
+import base64,http.client,json,ssl,sys,time,urllib.error,urllib.request
+context=ssl.create_default_context()
+def emit(*values):
+    sys.stdout.buffer.write((json.dumps(values)+"\n").encode());sys.stdout.buffer.flush()
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,*args,**kwargs):
+        raise OSError("redirect refused")
+def request(p):
+    started=time.monotonic()
+    def elapsed():return round((time.monotonic()-started)*1000)
+    class Response(http.client.HTTPResponse):
+        def begin(self):
+            if self.fp.peek(1):emit(3,elapsed())
+            super().begin()
+            emit(4,self.status)
+    class Timed:
+        response_class=Response
+        def request(self,*args,**kwargs):
+            super().request(*args,**kwargs)
+            emit(2,elapsed())
+    class HTTPConnection(Timed,http.client.HTTPConnection):pass
+    class HTTPSConnection(Timed,http.client.HTTPSConnection):pass
+    class HTTP(urllib.request.HTTPHandler):
+        def http_open(self,req):return self.do_open(HTTPConnection,req)
+    class HTTPS(urllib.request.HTTPSHandler):
+        def https_open(self,req):return self.do_open(HTTPSConnection,req,context=context)
+    req=urllib.request.Request(p["url"],method="POST",headers=p["headers"],
+        data=base64.b64decode(p["body"]) if p["body"] is not None else None)
+    try:
+        response=urllib.request.build_opener(NoRedirect(),HTTP(),HTTPS()).open(req,timeout=2)
+    except urllib.error.HTTPError as error:
+        error.close()
+        data=b""
+    else:
+        with response:data=response.read(1024*1024+1)
+    if len(data)>1024*1024:raise OSError("response exceeds bound")
+    emit(5,len(data))
+    sys.stdout.buffer.write(data);sys.stdout.buffer.flush()
+emit(1)
+while True:
+    line=sys.stdin.buffer.readline(32769)
+    if not line:break
+    try:
+        if len(line)>32768 or not line.endswith(b"\n"):raise OSError("input exceeds bound")
+        request(json.loads(line))
+        line=b""
+    except Exception:
+        emit(6)
+        sys.exit(1)
+'''
+
+
+class R2CopyControl:
+    def __init__(self, cfg, stop, worker):
+        self.cfg, self.stop, self.worker = cfg, stop, worker
+        self.process = None
+        self.buffer = bytearray()
+        self.generation = self.sequence = 0
+        self.startup_ms = -1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def close(self):
+        if self.process is None:
+            return
+        process = self.process
+        reported = False
+        if process.poll() is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except OSError:
+                log("WARN", "R2 copy held: copy control child termination failed")
+                reported = True
+        while True:
+            try:
+                process.wait(timeout=2)
+                break
+            except subprocess.TimeoutExpired:
+                # Keep ownership and updater drain gating if the OS cannot reap.
+                if not reported:
+                    log("WARN", "R2 copy held: copy control child did not reap")
+                    reported = True
+        process.stdin.close()
+        process.stdout.close()
+        self.process = None
+        self.buffer.clear()
+
+    def check(self, deadline):
+        if self.stop.is_set():
+            raise R2CopyHold("copy stopped")
+        if time.monotonic() >= deadline:
+            raise R2CopyHold("copy HTTP total deadline")
+
+    def read_more(self, deadline):
+        import select
+        self.check(deadline)
+        ready, _, _ = select.select([self.process.stdout], [], [], min(.2, max(0, deadline - time.monotonic())))
+        if not ready:
+            return
+        try:
+            data = os.read(self.process.stdout.fileno(), 65536)
+        except BlockingIOError:
+            return
+        if not data:
+            raise R2CopyHold("copy control transport failed")
+        self.buffer.extend(data)
+        if len(self.buffer) > 1024 * 1024 + 4096:
+            raise R2CopyHold("copy HTTP response exceeds bound")
+
+    def frame(self, deadline):
+        while b"\n" not in self.buffer:
+            if len(self.buffer) > 4096:
+                raise R2CopyHold("copy control frame exceeds bound")
+            self.read_more(deadline)
+        line, _, rest = self.buffer.partition(b"\n")
+        self.buffer = bytearray(rest)
+        if len(line) > 4096:
+            raise R2CopyHold("copy control frame exceeds bound")
+        values = json.loads(line)
+        if not isinstance(values, list) or not values or any(type(v) is not int for v in values):
+            raise R2CopyHold("invalid copy control frame")
+        kind = R2CopyControlFrame(values[0])
+        if kind is R2CopyControlFrame.ERROR:
+            raise R2CopyHold("copy control transport failed")
+        return kind, values[1:]
+
+    def start(self):
+        if self.process is not None:
+            return
+        self.generation += 1
+        self.startup_ms = -1
+        started = time.monotonic()
+        deadline = started + R2_COPY_TIMEOUT
+        try:
+            # Popen itself is not preemptible. Assign ownership before checking
+            # cancellation/expiry; the child waits for input after READY.
+            self.process = subprocess.Popen(
+                [sys.executable, "-I", "-S", "-c", R2_COPY_CONTROL_CHILD],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, env={}, start_new_session=True)
+            os.set_blocking(self.process.stdin.fileno(), False)
+            os.set_blocking(self.process.stdout.fileno(), False)
+            self.check(deadline)
+            if self.frame(deadline) != (R2CopyControlFrame.READY, []):
+                raise R2CopyHold("invalid copy control ready")
+            self.check(deadline)
+            self.startup_ms = round((time.monotonic() - started) * 1000)
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            log("INFO", "R2 copy lease-control phase=1 worker=%d generation=%d startup_ready_ms=%d total_ms=%d status=-1" %
+                (self.worker, self.generation, self.startup_ms, round((time.monotonic() - started) * 1000)))
+
+    def request_json(self, operation, path, body=None, timeout=R2_COPY_TIMEOUT):
+        import select
+        if not isinstance(operation, R2CopyControlOperation):
+            raise ValueError("invalid copy control operation")
+        self.start()
+        self.sequence += 1
+        message = (json.dumps({"url": self.cfg.api_base + path,
+                   "headers": {"User-Agent": USER_AGENT, "Authorization": "Bearer " + self.cfg.api_key,
+                               "Content-Type": "application/json"},
+                   "body": base64.b64encode(json.dumps(body).encode()).decode() if body is not None else None}) + "\n").encode()
+        if len(message) > 32768:
+            raise R2CopyHold("copy HTTP input exceeds bound")
+        started = time.monotonic()
+        deadline = started + timeout
+        sent = first = status = -1
+        finished = None
+        try:
+            offset = 0
+            while offset < len(message):
+                self.check(deadline)
+                _, writable, _ = select.select([], [self.process.stdin], [], min(.2, max(0, deadline - time.monotonic())))
+                if writable:
+                    try:
+                        offset += os.write(self.process.stdin.fileno(), message[offset:])
+                    except BlockingIOError:
+                        pass
+            for expected in (R2CopyControlFrame.SENT, R2CopyControlFrame.FIRST_BYTE,
+                             R2CopyControlFrame.STATUS, R2CopyControlFrame.BODY):
+                kind, values = self.frame(deadline)
+                if kind is not expected or len(values) != 1 or values[0] < 0:
+                    raise R2CopyHold("invalid copy control frame")
+                value = values[0]
+                if kind is R2CopyControlFrame.SENT:
+                    sent = value
+                elif kind is R2CopyControlFrame.FIRST_BYTE:
+                    if value < sent:
+                        raise R2CopyHold("invalid copy control timing")
+                    first = value
+                elif kind is R2CopyControlFrame.STATUS:
+                    if not 100 <= value <= 599:
+                        raise R2CopyHold("invalid copy control status")
+                    status = value
+                else:
+                    if value > 1024 * 1024:
+                        raise R2CopyHold("copy HTTP response exceeds bound")
+                    while len(self.buffer) < value:
+                        self.read_more(deadline)
+                    if len(self.buffer) != value:
+                        raise R2CopyHold("invalid copy control framing")
+            data = bytes(self.buffer)
+            self.buffer.clear()
+            self.check(deadline)
+            if status != 200:
+                error = urllib.error.HTTPError(path, status, "copy control refused", {}, None)
+                if error.fp is not None:
+                    error.close()
+                raise error
+            result = json.loads(data)
+            if not isinstance(result, dict):
+                raise R2CopyHold("invalid copy control JSON")
+            self.check(deadline)
+            return result
+        except urllib.error.HTTPError:
+            raise
+        except BaseException:
+            finished = time.monotonic()
+            self.close()
+            raise
+        finally:
+            elapsed = round(((finished if finished is not None else time.monotonic()) - started) * 1000)
+            log("INFO", "R2 copy lease-control phase=2 worker=%d generation=%d request=%d operation=%d startup_ready_ms=%d request_sent_ms=%d sent_to_first_byte_ms=%d total_ms=%d status=%d" %
+                (self.worker, self.generation, self.sequence, operation.value, self.startup_ms,
+                 sent, first - sent if first >= 0 and sent >= 0 else -1, elapsed, status))
 
 
 def r2_copy_resources(cfg, runtime, needed=R2_COPY_RANGE):
@@ -50182,8 +50424,9 @@ def r2_copy_resources(cfg, runtime, needed=R2_COPY_RANGE):
 
 
 class R2CopyGuard:
-    def __init__(self, cfg, runtime, stop, task):
+    def __init__(self, cfg, runtime, stop, task, control):
         self.cfg, self.runtime, self.stop, self.task = cfg, runtime, stop, task
+        self.control = control
         self.checked = 0.0
 
     def check(self, remote=False):
@@ -50191,7 +50434,7 @@ class R2CopyGuard:
             raise R2CopyHold("copy stopped")
         free = r2_copy_resources(self.cfg, self.runtime)
         if remote or time.monotonic() - self.checked >= 4:
-            r2_copy_request_json(self.cfg, "POST", "/account/connections/r2-copy/%d/checkpoint" % self.task["id"],
+            self.control.request_json(R2CopyControlOperation.CHECKPOINT, "/account/connections/r2-copy/%d/checkpoint" % self.task["id"],
                          body={"token": self.task["token"], "free_bytes": free}, timeout=R2_COPY_TIMEOUT)
             self.checked = time.monotonic()
         return free
@@ -50313,7 +50556,7 @@ def r2_copy_hash(fd, guard):
 
 def r2_copy_range(cfg, task, offset, length, guard, fd, digest):
     free = guard.check(remote=True)
-    grant = r2_copy_request_json(cfg, "POST", "/account/connections/r2-copy/%d/range" % task["id"],
+    grant = guard.control.request_json(R2CopyControlOperation.RANGE, "/account/connections/r2-copy/%d/range" % task["id"],
                          body={"token": task["token"], "free_bytes": free, "offset": offset, "length": length},
                          timeout=R2_COPY_TIMEOUT)
     if (grant.get("offset") != offset or grant.get("length") != length or grant.get("max_duration_sec") != 10
@@ -50345,7 +50588,7 @@ def r2_copy_range(cfg, task, offset, length, guard, fd, digest):
         digest.update(block)
     # Only a completed GET clears its dispatch gate. A stale completion cannot
     # clear a later grant, and a failure never retries the same capability.
-    r2_copy_request_json(cfg, "POST", "/account/connections/r2-copy/%d/checkpoint" % task["id"],
+    guard.control.request_json(R2CopyControlOperation.CHECKPOINT, "/account/connections/r2-copy/%d/checkpoint" % task["id"],
                  body={"token": task["token"], "free_bytes": guard.check(), "range_id": grant["range_id"]},
                  timeout=R2_COPY_TIMEOUT)
 
@@ -50385,15 +50628,15 @@ def r2_copy_sidecar(parent, name, clip, guard):
     return payload
 
 
-def execute_r2_copy(cfg, runtime, inventory, stop, task):
+def execute_r2_copy(cfg, runtime, inventory, stop, task, control):
     task = valid_r2_copy_task(task)
     with NAS_COPY_PATHS.own(task["item"]["relative_path"]), CLIENT_LOG_RING.scoped_secrets([task["token"]]):
-        return _execute_r2_copy(cfg, runtime, inventory, stop, task)
+        return _execute_r2_copy(cfg, runtime, inventory, stop, task, control)
 
 
-def _execute_r2_copy(cfg, runtime, inventory, stop, task):
+def _execute_r2_copy(cfg, runtime, inventory, stop, task, control):
     started, downloaded, committed = time.monotonic(), 0, 0
-    guard = R2CopyGuard(cfg, runtime, stop, task)
+    guard = R2CopyGuard(cfg, runtime, stop, task, control)
     if STITCH_ACTIVE.is_set():
         raise R2CopyHold("copy yields to stitching")
     guard.check(remote=True)
@@ -50464,12 +50707,12 @@ def _execute_r2_copy(cfg, runtime, inventory, stop, task):
                               file_identity=(info.st_ctime_ns, info.st_ino, info.st_dev),
                               sidecar_evidence=(item["relative_path"] + ".stoarama.json", len(payload), hashlib.sha256(payload).hexdigest()))
             rows = inventory._rows("dirty=1 AND clip_id=?", (item["source_id"],), 1)
-            r2_copy_request_json(cfg, "POST", "/account/connections/inventory", timeout=R2_COPY_TIMEOUT, body={
+            control.request_json(R2CopyControlOperation.INVENTORY, "/account/connections/inventory", timeout=R2_COPY_TIMEOUT, body={
                 "generation": "live", "dataset_schema": INVENTORY_DATASET_SCHEMA,
                 "root_exclusions": list(INVENTORY_ROOT_EXCLUSIONS), "complete": False, "files": inventory._reports(rows)})
             inventory._mark_clean(rows)
             guard.check(remote=True)
-            r2_copy_request_json(cfg, "POST", "/account/connections/r2-copy/%d/result" % task["id"],
+            control.request_json(R2CopyControlOperation.RESULT, "/account/connections/r2-copy/%d/result" % task["id"],
                          body={"token": task["token"], "free_bytes": r2_copy_resources(cfg, runtime)}, timeout=R2_COPY_TIMEOUT)
             log("INFO", "R2 copy verified source_id=%d size_bytes=%d downloaded_bytes=%d committed_bytes=%d elapsed_ms=%d" %
                 (item["source_id"], item["size_bytes"], downloaded, committed, round((time.monotonic() - started) * 1000)))
@@ -50479,29 +50722,30 @@ def _execute_r2_copy(cfg, runtime, inventory, stop, task):
         os.close(parent)
 
 
-def r2_copy_worker(cfg, runtime, inventory, stop):
-    wait = 0
-    while not stop.wait(wait):
-        wait = 60
-        try:
-            free = r2_copy_resources(cfg, runtime)
-            response = r2_copy_request_json(cfg, "POST", "/account/connections/r2-copy/lease",
-                                    body={"free_bytes": free}, timeout=R2_COPY_TIMEOUT)
-            if response.get("task") is not None:
-                execute_r2_copy(cfg, runtime, inventory, stop, response["task"])
-                wait = 0
-        except urllib.error.HTTPError as exc:
-            if exc.code not in (404, 409, 429):
-                log("WARN", "R2 copy control HTTP %d; holding" % exc.code)
-        except Exception as exc:
-            log("WARN", "R2 copy held: %s" % (str(exc) if isinstance(exc, R2CopyHold) else type(exc).__name__))
+def r2_copy_worker(cfg, runtime, inventory, stop, worker):
+    with R2CopyControl(cfg, stop, worker) as control:
+        wait = 0
+        while not stop.wait(wait):
+            wait = 60
+            try:
+                free = r2_copy_resources(cfg, runtime)
+                response = control.request_json(R2CopyControlOperation.LEASE, "/account/connections/r2-copy/lease",
+                                        body={"free_bytes": free})
+                if response.get("task") is not None:
+                    execute_r2_copy(cfg, runtime, inventory, stop, response["task"], control)
+                    wait = 0
+            except urllib.error.HTTPError as exc:
+                if exc.code not in (404, 409, 429):
+                    log("WARN", "R2 copy control HTTP %d; holding" % exc.code)
+            except Exception as exc:
+                log("WARN", "R2 copy held: %s" % (str(exc) if isinstance(exc, R2CopyHold) else type(exc).__name__))
 
 
 def r2_copy_loop(cfg, runtime, inventory, stop):
     # The supervisor stays alive until EVERY file/transport drains, so the
     # existing updater/shutdown gate also covers this complete bounded pool.
     with concurrent.futures.ThreadPoolExecutor(max_workers=R2_COPY_WORKERS, thread_name_prefix="r2-copy") as pool:
-        futures = [pool.submit(r2_copy_worker, cfg, runtime, inventory, stop) for _ in range(R2_COPY_WORKERS)]
+        futures = [pool.submit(r2_copy_worker, cfg, runtime, inventory, stop, worker) for worker in range(R2_COPY_WORKERS)]
         for future in futures:
             future.result()
 

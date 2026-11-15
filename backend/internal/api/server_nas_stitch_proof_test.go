@@ -46,14 +46,18 @@ func TestNASStitchProofBindsExactPair(t *testing.T) {
 }
 
 func TestNASStitchProofHeartbeatPreservesJoinedClientContract(t *testing.T) {
-	for _, version := range []string{nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion, "v85r-nas-proof-v1", nasCleanupProofClientVersion} {
+	for version, eligible := range map[string]bool{
+		"cleanup-batch-v7": false, "r2-copy-v2": false, "v85r-nas-proof-v1": false,
+		"v85r-nas-proof-v2": true, "r2-copy-v3": true, "cleanup-batch-v8": true,
+		"development": false, "r2-copy-v3-extra": false, "cleanup-batch-v80": false,
+	} {
 		for _, selector := range []int{0, 1} {
 			response := connectionHeartbeatResponse{OK: true, JoinedDeliveryAccepted: true, JoinedProtocolVersion: 1, JoinedProtocolGeneration: 1, StitchProofTaskID: stitchProofSelector(selector, 13, version)}
 			raw, err := json.Marshal(response)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if strings.Contains(string(raw), "stitch_proof_task_id") != (selector == 1 && version == nasCleanupProofClientVersion) {
+			if strings.Contains(string(raw), "stitch_proof_task_id") != (selector == 1 && eligible) {
 				t.Fatalf("selector leaked to unqualified client: %s %s", version, raw)
 			}
 			cmd := exec.Command("python3", "-I", "-S", "-B", "-c", `import importlib.util,json,sys,threading
@@ -67,6 +71,26 @@ assert r.joined_protocol_version==1,'proof selector disabled joined delivery'
 			cmd.Stdin = bytes.NewReader(raw)
 			if output, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("serialized heartbeat rejected: %s %v %s", raw, err, output)
+			}
+		}
+	}
+}
+
+func TestNASStitchProofCombinedCapabilitySelectors(t *testing.T) {
+	for version, eligible := range map[string]bool{
+		"v85r-nas-proof-v2": true, "r2-copy-v3": true, "cleanup-batch-v8": true,
+		"": false, "development": false, "r2-copy-v2": false, "v85r-nas-proof-v1": false,
+		"r2-copy-v3-extra": false, "cleanup-batch-v80": false,
+	} {
+		for _, connection := range []int64{13, 14} {
+			for _, selector := range []int{0, 1, 2} {
+				want := 0
+				if eligible && connection == 13 && selector == 1 {
+					want = 1
+				}
+				if got := stitchProofSelector(selector, connection, version); got != want {
+					t.Fatalf("version=%q connection=%d selector=%d got=%d want=%d", version, connection, selector, got, want)
+				}
 			}
 		}
 	}
@@ -258,15 +282,18 @@ func TestNASStitchProofValidationRequiresMatchingFreshNASReadback(t *testing.T) 
 		}
 	}
 	rawStatus, _ := json.Marshal(status())
-	if _, err := pool.Exec(ctx, `UPDATE connections SET client_version='r2-copy-v2',nas_stitch_status=$1,nas_stitch_status_at=now(),last_seen_at=now() WHERE id=13`, string(rawStatus)); err != nil {
-		t.Fatal(err)
-	}
-	// A new client's fresh heartbeat must not revive the previous proof status.
-	body, _ := json.Marshal(request)
-	w := httptest.NewRecorder()
-	server.handleAdminNASStitchProofVerify(w, httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body)))
-	if w.Code != http.StatusConflict {
-		t.Fatal("previous client proof accepted after client drift")
+	for _, version := range []string{"r2-copy-v2", "r2-copy-v3", "cleanup-batch-v8", "development", "v85r-nas-proof-v2-extra"} {
+		if _, err := pool.Exec(ctx, `UPDATE connections SET client_version=$2,nas_stitch_status=$1,nas_stitch_status_at=now(),last_seen_at=now() WHERE id=13`, string(rawStatus), version); err != nil {
+			t.Fatal(err)
+		}
+		// Capability is not current-reader identity. Legacy v1 cannot bind a
+		// different producer/reader; the new readback contract is separate.
+		body, _ := json.Marshal(request)
+		w := httptest.NewRecorder()
+		server.handleAdminNASStitchProofVerify(w, httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body)))
+		if w.Code != http.StatusConflict {
+			t.Fatalf("previous client proof accepted after drift to %s", version)
+		}
 	}
 
 	var state string

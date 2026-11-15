@@ -32,19 +32,18 @@ class R2CopyWorkerTests(unittest.TestCase):
         self.task = dict(id=1, token="a" * 48, item=self.item, clip=self.clip, etag="b" * 32, policy_sha256=pull.R2_RETIRE_COPY_POLICY)
         self.stop = threading.Event()
         self.calls = []
-        self.control_patch = SimpleNamespace(original=pull.r2_copy_request_json)
+        self.control_client = SimpleNamespace(request_json=self.control)
         for patch in (
             mock.patch.object(pull, "NAS_MEDIA_FENCE", pull.NASMediaFence()),
             mock.patch.object(pull, "NAS_COPY_PATHS", pull.NASCopyPaths()),
             mock.patch.object(pull, "CLEANUP_DIRECTORIES", pull.CleanupDirectoryLog()),
             mock.patch.object(pull, "r2_copy_resources", return_value=pull.R2_COPY_FLOOR + 1_000_000_000),
             mock.patch.object(pull, "storage_status", return_value={"available": True, "free_bytes": pull.R2_COPY_FLOOR + 1_000_000_000}),
-            mock.patch.object(pull, "r2_copy_request_json", side_effect=self.control),
         ):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def control(self, cfg, method, path, **kwargs):
+    def control(self, operation, path, **kwargs):
         self.calls.append((path, kwargs))
         if path.endswith("/range"):
             body = kwargs["body"]
@@ -58,7 +57,7 @@ class R2CopyWorkerTests(unittest.TestCase):
         digest.update(data)
 
     def run_copy(self):
-        pull.execute_r2_copy(self.cfg, self.runtime, self.inventory, self.stop, self.task)
+        pull.execute_r2_copy(self.cfg, self.runtime, self.inventory, self.stop, self.task, self.control_client)
 
     def test_resume_after_interruption_publishes_exact_inventory_once_verified(self):
         def interrupted(cfg, task, offset, length, guard, fd, digest):
@@ -114,13 +113,13 @@ class R2CopyWorkerTests(unittest.TestCase):
             if os.fstat(fd).st_size == len(self.body):
                 events.append("media_sync")
             return fsync(fd)
-        def control(cfg, method, path, **kwargs):
+        def control(operation, path, **kwargs):
             if path.endswith("/inventory"):
                 self.assertIn("media_sync", events)
-            return self.control(cfg, method, path, **kwargs)
+            return self.control(operation, path, **kwargs)
         with mock.patch.object(pull, "r2_copy_range", side_effect=AssertionError("redownloaded")), \
                 mock.patch.object(pull.os, "fsync", side_effect=sync), \
-                mock.patch.object(pull, "r2_copy_request_json", side_effect=control):
+                mock.patch.object(self.control_client, "request_json", side_effect=control):
             self.run_copy()
         self.assertTrue(events)
         self.assertTrue(any(path.endswith("/result") for path, _ in self.calls))
@@ -137,7 +136,7 @@ class R2CopyWorkerTests(unittest.TestCase):
                 errors.append(exc)
             finally:
                 done.set()
-        def control(cfg, method, path, **kwargs):
+        def control(operation, path, **kwargs):
             if path.endswith("/inventory"):
                 workers.append(threading.Thread(target=delivery))
                 workers[-1].start()
@@ -146,10 +145,10 @@ class R2CopyWorkerTests(unittest.TestCase):
                 row = kwargs["body"]["files"][0]
                 self.assertEqual(row["sidecar_relative_path"], self.item["relative_path"] + ".stoarama.json")
                 self.assertTrue(row["file_inode"])
-            return self.control(cfg, method, path, **kwargs)
+            return self.control(operation, path, **kwargs)
         try:
             with mock.patch.object(pull, "r2_copy_range", side_effect=self.transfer), \
-                    mock.patch.object(pull, "r2_copy_request_json", side_effect=control), \
+                    mock.patch.object(self.control_client, "request_json", side_effect=control), \
                     mock.patch.object(pull, "request_json", side_effect=lambda *a, **kw: reports.extend(kw["body"]["files"]) or {}):
                 self.run_copy()
                 self.assertTrue(done.wait(2))
@@ -195,7 +194,7 @@ class R2CopyWorkerTests(unittest.TestCase):
         self.assertTrue(any(path.endswith("/result") for path, _ in self.calls))
         self.assertEqual(pull.NAS_MEDIA_FENCE.writers, 0)
         self.assertEqual(self.runtime.capacity_reserved_bytes, 0)
-        with mock.patch.object(pull, "r2_copy_request_json", side_effect=urllib.error.HTTPError("https://redacted", 409, "off", {}, None)):
+        with mock.patch.object(self.control_client, "request_json", side_effect=urllib.error.HTTPError("https://redacted", 409, "off", {}, None)):
             with self.assertRaises(urllib.error.HTTPError):
                 self.run_copy()
         self.assertFalse(pull.NAS_COPY_PATHS.active)
@@ -269,7 +268,7 @@ class R2CopyWorkerTests(unittest.TestCase):
         self.assertTrue(entered.is_set())
 
     def test_cleanup_priority_blocks_disk_but_not_control_and_cancels(self):
-        guard = pull.R2CopyGuard(self.cfg, self.runtime, self.stop, self.task)
+        guard = pull.R2CopyGuard(self.cfg, self.runtime, self.stop, self.task, self.control_client)
         ready = threading.Event()
         @pull.NAS_COPY_PATHS.cleanup_priority
         def cleanup():
@@ -375,10 +374,9 @@ class R2CopyWorkerTests(unittest.TestCase):
             # server never becomes idle and never completes a JSON body.
             self.cfg.api_base = url
             before = time.monotonic()
-            # setUp mocks the API boundary; call its original implementation.
-            original = self.control_patch.original
-            with self.assertRaises(pull.R2CopyHold):
-                original(self.cfg, "POST", "/control", body={}, timeout=.4)
+            with pull.R2CopyControl(self.cfg, self.stop, 0) as control:
+                with self.assertRaises(pull.R2CopyHold):
+                    control.request_json(pull.R2CopyControlOperation.LEASE, "/control", body={}, timeout=.4)
             self.assertLess(time.monotonic() - before, 1.5)
         finally:
             done.set(); server.shutdown(); server.server_close(); thread.join()
@@ -395,12 +393,6 @@ class R2CopyWorkerTests(unittest.TestCase):
                     self.assertNotIn(token, ring.since(0)[0][-1]["message"])
             self.assertEqual(ring.scoped_secret_counts, {})
         self.assertEqual(ring.secrets, stable)
-        global_stable = pull.CLIENT_LOG_RING.secrets
-        for n in range(1000):
-            payload = json.dumps({"task": {"token": "opaque-lease-%08d" % n}}).encode()
-            with mock.patch.object(pull, "r2_copy_http", return_value=(200, {}, payload)):
-                self.control_patch.original(self.cfg, "POST", "/account/connections/r2-copy/lease", body={})
-        self.assertEqual(pull.CLIENT_LOG_RING.secrets, global_stable)
         # Nested users of one value cannot remove another active user's guard.
         with ring.scoped_secrets(["nested-private-value"]):
             with ring.scoped_secrets(["nested-private-value"]):

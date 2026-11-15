@@ -36,6 +36,9 @@ jobs:
         run: python -m unittest discover -s ops/jelly/r2-retire -p 'test_*.py' -q
       - name: Test finite capability staging on the control host Python version
         run: python -m unittest discover -s infra/collation-v2 -p 'test_*.py' -q
+      - name: Test isolated R2 controls on the deployed Python version
+        working-directory: clients/nas-pull
+        run: python -m unittest test_r2_copy_control test_r2_copy_worker -q
 
   joined-folder-zip-worker:
     runs-on: ubuntu-latest
@@ -103,7 +106,7 @@ jobs:
         run: python3 -m unittest discover -s clients/nas-pull -p 'test_cleanup*.py' -v
       - name: Test resumable R2 keep28 copies and cleanup cancellation
         working-directory: .
-        run: python3 -m unittest discover -s clients/nas-pull -p test_r2_copy_worker.py -v
+        run: python3 -m unittest discover -s clients/nas-pull -p 'test_r2_copy*.py' -v
       - name: Hash-free listing completeness and resumable metadata uploads
         working-directory: .
         run: python3 -m unittest discover -s clients/nas-pull -p test_listing_proof.py -v
