@@ -2,11 +2,13 @@ package api
 
 import (
 	"context"
+	"strings"
+	"testing"
+
+	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"strings"
-	"testing"
 )
 
 // Exercise the actual migrated tables, FKs, checks, ordinary update/insert
@@ -14,8 +16,13 @@ import (
 // disabled triggers, replication role or fabricated claim is used.
 func newR2JoinedRetirementFixture(t *testing.T, email string) (joinedHistoricalTier1Fixture, int64, int64, int64) {
 	t.Helper()
+	return newR2JoinedRetirementFixtureAtPhase(t, email, joinedFixtureAllMigrations)
+}
+
+func newR2JoinedRetirementFixtureAtPhase(t *testing.T, email string, phase joinedFixtureMigrationPhase) (joinedHistoricalTier1Fixture, int64, int64, int64) {
+	t.Helper()
 	ctx := context.Background()
-	fixture := newJoinedHistoricalTier1FixtureWithSetup(t, email, true, func(pool *pgxpool.Pool) {
+	fixture := newJoinedHistoricalTier1FixtureAtMigrationPhase(t, email, true, func(pool *pgxpool.Pool) {
 		for _, q := range []string{
 			`SELECT setval(pg_get_serial_sequence('accounts','id'),46)`,
 			`SELECT setval(pg_get_serial_sequence('connections','id'),12)`,
@@ -28,7 +35,7 @@ func newR2JoinedRetirementFixture(t *testing.T, email string) (joinedHistoricalT
 				t.Fatal(err)
 			}
 		}
-	})
+	}, phase)
 	pool := fixture.pool
 	if fixture.accountID != 47 || fixture.connectionID != 13 {
 		t.Fatalf("scope %d/%d", fixture.accountID, fixture.connectionID)
@@ -236,5 +243,77 @@ func TestR2JoinedWriterRetirementRejectsLostHistoricalOwners(t *testing.T) {
 	var owner string
 	if err := pool.QueryRow(ctx, `SELECT r2_joined_writer_owner_inventory_complete($1),(SELECT claimed_by FROM recording_joined_hours WHERE id=$2)`, batch, hour).Scan(&complete, &owner); err != nil || complete || owner != "owner-B" {
 		t.Fatalf("lost A owner was treated as covered complete=%v owner=%s err=%v", complete, owner, err)
+	}
+}
+
+func TestR2JoinedWriterRetirementPreservesPublicationAttempts(t *testing.T) {
+	ctx := context.Background()
+	fixture, batch, _, artifact := newR2JoinedRetirementFixture(t, "r2-joined-attempts@example.test")
+	defer fixture.cleanup()
+	pool := fixture.pool
+	if _, err := pool.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_state='publishing',publication_attempt_count=1,publication_token=gen_random_uuid(),publication_claimed_by='owner-A',publication_lease_expires_at=now()+interval '1 hour',publication_heartbeat_at=now() WHERE id=$1`, artifact); err != nil {
+		t.Fatal(err)
+	}
+	for _, attempts := range []int{0, 2} {
+		if _, err := pool.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_state='terminal_failed',publication_attempt_count=$2,failure_reason_code='worker_failed',publication_token=NULL,publication_claimed_by=NULL,publication_lease_expires_at=NULL,publication_heartbeat_at=NULL WHERE id=$1`, artifact, attempts); err == nil {
+			t.Fatalf("terminal failure rewrote publication attempts to %d", attempts)
+		}
+	}
+	// The ordinary live-worker failure remains supported, retaining its history.
+	if _, err := pool.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_state='terminal_failed',failure_reason_code='worker_failed',publication_token=NULL,publication_claimed_by=NULL,publication_lease_expires_at=NULL,publication_heartbeat_at=NULL WHERE id=$1`, artifact); err != nil {
+		t.Fatal(err)
+	}
+	var complete bool
+	var attempts int
+	if err := pool.QueryRow(ctx, `SELECT r2_joined_writer_owner_inventory_complete($1),(SELECT publication_attempt_count FROM recording_joined_artifacts WHERE id=$2)`, batch, artifact).Scan(&complete, &attempts); err != nil || complete || attempts != 1 {
+		t.Fatalf("terminal owner history complete=%v attempts=%d err=%v", complete, attempts, err)
+	}
+}
+
+func TestR2JoinedWriterRetirementRejectsLegacyErasedPublicationOwner(t *testing.T) {
+	ctx := context.Background()
+	// Create the bad state through the actual pre-0195 guard, commit it, then
+	// apply 0195. No trigger is disabled or removed to manufacture this history.
+	fixture, batch, _, artifact := newR2JoinedRetirementFixtureAtPhase(t, "r2-joined-legacy-attempts@example.test", joinedFixtureBeforeWriterRetirement)
+	defer fixture.cleanup()
+	pool := fixture.pool
+	for _, query := range []string{
+		`UPDATE recording_joined_artifacts SET publication_state='publishing',publication_attempt_count=1,publication_token=gen_random_uuid(),publication_claimed_by='lost-owner',publication_lease_expires_at=now()+interval '1 hour',publication_heartbeat_at=now() WHERE id=$1`,
+		`UPDATE recording_joined_artifacts SET publication_state='terminal_failed',publication_attempt_count=0,failure_reason_code='worker_failed',publication_token=NULL,publication_claimed_by=NULL,publication_lease_expires_at=NULL,publication_heartbeat_at=NULL WHERE id=$1`,
+	} {
+		if _, err := pool.Exec(ctx, query, artifact); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM schema_migrations WHERE version='0195_r2_joined_writer_retirement.sql'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MigrateUp(ctx, pool, findMigrationsDir(t)); err != nil {
+		t.Fatal(err)
+	}
+	var complete bool
+	if err := pool.QueryRow(ctx, `SELECT r2_joined_writer_owner_inventory_complete($1)`, batch).Scan(&complete); err != nil || complete {
+		t.Fatalf("legacy erased owner accepted complete=%v err=%v", complete, err)
+	}
+	digest := strings.Repeat("a", 64)
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, digest); err != nil {
+		t.Fatal(err)
+	}
+	var snapshot string
+	if err := pool.QueryRow(ctx, `SELECT r2_joined_writer_snapshot($1)`, batch).Scan(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		`SELECT r2_retire_dead_joined_batch($1,$2,$3,$4,'independent-test','[]')`,
+		`INSERT INTO r2_joined_writer_retirement_runs(id,batch_record_id,snapshot_sha256,proof_sha256,reviewer_reference,owner_evidence) VALUES($1,$2,$3,$4,'independent-test','[]')`,
+	} {
+		if _, err := pool.Exec(ctx, query, uuid.New(), batch, snapshot, digest); err == nil || !strings.Contains(err.Error(), "historical joined owner inventory is incomplete") {
+			t.Fatalf("legacy owner loss bypassed audit admission: %v", err)
+		}
+	}
+	var after string
+	var runs int
+	if err := pool.QueryRow(ctx, `SELECT r2_joined_writer_snapshot($1),(SELECT count(*) FROM r2_joined_writer_retirement_runs)`, batch).Scan(&after, &runs); err != nil || after != snapshot || runs != 0 {
+		t.Fatalf("rejected legacy retirement changed rows snapshot=%s runs=%d err=%v", after, runs, err)
 	}
 }

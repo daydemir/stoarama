@@ -66,11 +66,27 @@ $$;
 
 -- Old reclaim/release/completion overwrites owner identity. Until preserved
 -- primary history accounts for every attempt, these batches must stay blocked.
+-- The original live-worker failure guard permits rewriting its attempt count.
+-- Preserve that history on every update, including ordinary terminal failure;
+-- only the existing publishing claim/reclaim guard may increment it.
+CREATE FUNCTION guard_r2_joined_publication_attempt_history() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF NEW.publication_attempt_count<OLD.publication_attempt_count
+  OR (NEW.publication_state IS DISTINCT FROM 'publishing' AND NEW.publication_attempt_count<>OLD.publication_attempt_count)
+ THEN RAISE EXCEPTION 'joined publication attempt history is immutable outside claim/reclaim'; END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_joined_publication_attempt_history BEFORE UPDATE ON recording_joined_artifacts
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_joined_publication_attempt_history();
+
 CREATE FUNCTION r2_joined_writer_owner_inventory_complete(p_batch bigint) RETURNS boolean LANGUAGE sql STABLE AS $$
  SELECT NOT EXISTS(SELECT 1 FROM recording_joined_hours WHERE batch_record_id=p_batch AND attempt_count>0
   AND (attempt_count<>1 OR state<>'leased' OR claimed_by IS NULL))
- AND NOT EXISTS(SELECT 1 FROM recording_joined_artifacts WHERE batch_record_id=p_batch AND publication_attempt_count>0
-  AND (publication_attempt_count<>1 OR publication_state<>'publishing' OR publication_claimed_by IS NULL))
+ AND NOT EXISTS(SELECT 1 FROM recording_joined_artifacts WHERE batch_record_id=p_batch
+  AND ((publication_attempt_count>0 AND (publication_attempt_count<>1 OR publication_state IS DISTINCT FROM 'publishing' OR publication_claimed_by IS NULL))
+   -- Existing terminal/published roots with zero attempts may already have
+   -- erased their owner. Installing this guard cannot reconstruct that proof.
+   OR (publication_attempt_count=0 AND publication_state IN ('publishing','published','terminal_failed'))))
 $$;
 
 CREATE FUNCTION guard_r2_joined_writer_retirement_run() RETURNS trigger LANGUAGE plpgsql SET timezone='UTC' AS $$
