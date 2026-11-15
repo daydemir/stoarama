@@ -2092,42 +2092,53 @@ func deliveryObjectKey(keyPrefix string, recordingID, clipID int64, sourceObject
 // negligible.
 const accountClipsCommitWatermark = `interval '90 seconds'`
 
+// Keep ordinary delivery on its global cursor index. While fenced, bound each
+// recording's work before the global merge: a clip past its recording's first
+// $3 eligible IDs cannot be in the global first $3 IDs. Explicit branches let
+// the fenced path use the existing recording/time index without an OR filter.
 const accountClipsCursorSQL = `
-	WITH delivery_fence AS MATERIALIZED (
-	  SELECT EXISTS (SELECT 1 FROM nas_delivery_retirement_fences
-	    WHERE connection_id=CASE WHEN $1::bigint=47 THEN 13 ELSE 0 END) AS active
-	)
-	SELECT c.id, c.recording_id, c.size_bytes, c.sha256, c.clip_start_at, c.clip_end_at, c.display_path,
-	       c.recording_job_id, c.capture_lease_token, c.capture_sequence,
-	       c.capture_attempt_id,c.timestamp_contract_version,c.timestamp_contract,c.timestamp_contract_status,c.timestamp_contract_reason
-	FROM recording_clips c
-	JOIN recordings r ON r.id = c.recording_id
-	CROSS JOIN delivery_fence fence
-	LEFT JOIN streams stream ON stream.id=r.stream_id
-	LEFT JOIN nas_delivery_retirement_windows kept_window
-	  ON kept_window.connection_id=13 AND kept_window.stream_id=r.stream_id
-	WHERE r.account_id = $1 AND c.purged_at IS NULL AND c.released_at IS NULL
-	  AND r.delivery = 'nas_pull'
-  -- Exact raw nas_delivery_allowed/span predicate, using the rows already
-	  -- joined here instead of repeating PLpgSQL catalogue reads for each clip.
-	  AND (NOT fence.active OR (
-	    r.account_id=47
-	    AND kept_window.timezone=coalesce(nullif(stream.local_timezone,''),r.cron_timezone)
-	    AND c.clip_start_at IS NOT NULL AND c.clip_end_at IS NOT NULL
-	    AND c.clip_end_at>c.clip_start_at
-	    AND c.clip_start_at>='2020-01-01' AND c.clip_end_at<'2028-01-01'
-	    AND c.clip_start_at<kept_window.end_at AND c.clip_end_at>kept_window.start_at
-	  ))
-	  -- Retain zero-byte rows for audit, but never let one poison the forward
-	  -- cursor page and block every later valid clip.
-	  AND c.size_bytes > 0
-	  -- Clips of collated_only recordings stay in R2 until collated; the NAS
-	  -- receives them only as joined hours.
-	  AND ` + nasdelivery.NotHeldC + `
-	  AND c.created_at < now() - ` + accountClipsCommitWatermark + `
-	  AND c.id > $2
-	ORDER BY c.id ASC
-	LIMIT $3
+ WITH delivery_fence AS MATERIALIZED (
+   SELECT EXISTS (SELECT 1 FROM nas_delivery_retirement_fences
+     WHERE connection_id=CASE WHEN $1::bigint=47 THEN 13 ELSE 0 END) AS active
+ ), available_clips AS NOT MATERIALIZED (
+   SELECT c.* FROM recording_clips c
+   WHERE c.purged_at IS NULL AND c.released_at IS NULL
+     AND c.size_bytes > 0
+     AND ` + nasdelivery.NotHeldC + `
+     AND c.created_at < now() - ` + accountClipsCommitWatermark + `
+     AND c.id > $2
+ )
+ SELECT c.id, c.recording_id, c.size_bytes, c.sha256, c.clip_start_at, c.clip_end_at, c.display_path,
+        c.recording_job_id, c.capture_lease_token, c.capture_sequence,
+        c.capture_attempt_id,c.timestamp_contract_version,c.timestamp_contract,c.timestamp_contract_status,c.timestamp_contract_reason
+ FROM (
+   (SELECT c.* FROM delivery_fence fence
+    CROSS JOIN LATERAL (
+      SELECT c.* FROM available_clips c
+      JOIN recordings r ON r.id=c.recording_id
+      WHERE NOT fence.active AND r.account_id = $1 AND r.delivery = 'nas_pull'
+      ORDER BY c.id ASC LIMIT $3
+    ) c)
+   UNION ALL
+   (SELECT c.* FROM recordings r
+    CROSS JOIN delivery_fence fence
+    LEFT JOIN streams stream ON stream.id=r.stream_id
+    JOIN nas_delivery_retirement_windows kept_window
+      ON kept_window.connection_id=13 AND kept_window.stream_id=r.stream_id
+    CROSS JOIN LATERAL (
+      SELECT c.* FROM available_clips c
+      WHERE fence.active AND c.recording_id=r.id
+       AND c.clip_start_at IS NOT NULL AND c.clip_end_at IS NOT NULL
+       AND c.clip_end_at>c.clip_start_at
+       AND c.clip_start_at>='2020-01-01' AND c.clip_end_at<'2028-01-01'
+       AND c.clip_start_at<kept_window.end_at AND c.clip_end_at>kept_window.start_at
+      ORDER BY c.id ASC LIMIT $3
+    ) c
+    WHERE fence.active AND r.account_id = $1 AND r.account_id=47 AND r.delivery = 'nas_pull'
+      AND kept_window.timezone=coalesce(nullif(stream.local_timezone,''),r.cron_timezone))
+ ) c
+ ORDER BY c.id ASC
+ LIMIT $3
 `
 
 // handleAccountClips returns one forward-cursored page of the calling account's
