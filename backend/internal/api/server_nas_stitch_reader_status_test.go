@@ -170,8 +170,8 @@ func TestNASStitchReadbackServerResponsesMatchAgreedClosedFieldNames(t *testing.
 	server := nasStitchServerExecution{Repository: "daydemir/stoarama", Commit: strings.Repeat("a", 40), ServiceID: nasStitchReadbackServiceID, InstanceID: "instance-SYNTHETIC"}
 	binding := bindNASStitchReadback(receipt, sha, snapshot, server)
 	values := map[string]any{
-		"validation":      nasStitchReadbackValidation{Schema: "stoarama.nas-stitch-validation.v2", ValidatedAt: snapshot.Now.Format(time.RFC3339Nano), nasStitchReadbackBinding: binding},
-		"current_context": nasStitchReadbackCurrent{Schema: "stoarama.nas-stitch-current-context.v1", CheckedAt: snapshot.Now.Format(time.RFC3339Nano), StatusAt: snapshot.Now.Format(time.RFC3339Nano), VerifiedAt: receipt.VerifiedAt, ID: receipt.ID, ApprovedUntil: snapshot.ApprovedUntil.Format(time.RFC3339Nano), Integrity: "clear", nasStitchReadbackBinding: binding},
+		"validation":      nasStitchReadbackValidation{Schema: "stoarama.nas-stitch-validation.v2", ValidatedAt: nasStitchWireTime(snapshot.Now), nasStitchReadbackBinding: binding},
+		"current_context": nasStitchReadbackCurrent{Schema: "stoarama.nas-stitch-current-context.v1", CheckedAt: nasStitchWireTime(snapshot.Now), StatusAt: nasStitchWireTime(snapshot.Now), VerifiedAt: receipt.VerifiedAt, ID: receipt.ID, ApprovedUntil: nasStitchWireTime(snapshot.ApprovedUntil), Integrity: "clear", nasStitchReadbackBinding: binding},
 	}
 	file, err := os.ReadFile("../../../clients/nas-pull/stitch-proof/attestation-v2.schema.json")
 	if err != nil {
