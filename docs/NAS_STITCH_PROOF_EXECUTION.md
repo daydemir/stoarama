@@ -259,3 +259,15 @@ Future controller enable packets must bind the UUID, guarded single-key config
 writes while selector0 then1, one pinned deployment, original cutoff and exact
 raw-task evidence. Every operation still needs fresh four-incident guards and
 independent review; code defaults grant no release/activation authority.
+
+### New server timestamp encoding
+
+New admission, validation and current-context observations use UTC with exactly
+six fractional digits, preserving PostgreSQL's microsecond instants. An
+unrepresentable precision or timestamp refuses before HTTP200; timestamps are
+never rounded and expiry is never extended. This permits the unchanged pinned
+Python3.9 reader to consume DB values whose trailing zeros RFC3339Nano removes.
+Native task bytes are serialized once and reused as the parsed JSON task,
+base64 and SHA; task and outer expiry encode the same instant. Copied original
+native/readback timestamp strings remain exact. The client, profile provenance,
+native package, policy, tools and original expiry/freshness cuts are unchanged.

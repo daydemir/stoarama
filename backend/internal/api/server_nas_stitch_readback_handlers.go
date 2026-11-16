@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/stitchproof"
 	"github.com/daydemir/stoarama/backend/internal/util"
@@ -24,7 +23,7 @@ type nasStitchReadbackBinding struct {
 	PairSHA             string                   `json:"profile_pair_sha256"`
 	ReadbackSHA         string                   `json:"readback_receipt_sha256"`
 	Reader              nasStitchReaderExecution `json:"reader_execution"`
-	HeartbeatAt         string                   `json:"reader_heartbeat_received_at"`
+	HeartbeatAt         nasStitchWireTime        `json:"reader_heartbeat_received_at"`
 	Stable              bool                     `json:"reader_release_stable"`
 	Candidate           bool                     `json:"reader_release_candidate"`
 	InventoryMismatches int64                    `json:"reader_inventory_mismatch_count"`
@@ -38,19 +37,19 @@ type nasStitchReadbackBinding struct {
 }
 
 type nasStitchReadbackValidation struct {
-	Schema      string `json:"schema"`
-	ValidatedAt string `json:"validated_at"`
+	Schema      string            `json:"schema"`
+	ValidatedAt nasStitchWireTime `json:"validated_at"`
 	nasStitchReadbackBinding
 }
 
 type nasStitchReadbackCurrent struct {
-	Schema        string `json:"schema"`
-	CheckedAt     string `json:"checked_at"`
-	StatusAt      string `json:"status_received_at"`
-	VerifiedAt    string `json:"readback_verified_at"`
-	ID            string `json:"readback_id"`
-	ApprovedUntil string `json:"source_scope_approved_until"`
-	Integrity     string `json:"integrity"`
+	Schema        string            `json:"schema"`
+	CheckedAt     nasStitchWireTime `json:"checked_at"`
+	StatusAt      nasStitchWireTime `json:"status_received_at"`
+	VerifiedAt    string            `json:"readback_verified_at"`
+	ID            string            `json:"readback_id"`
+	ApprovedUntil nasStitchWireTime `json:"source_scope_approved_until"`
+	Integrity     string            `json:"integrity"`
 	nasStitchReadbackBinding
 }
 
@@ -61,7 +60,7 @@ func nasStitchReadbackScope(planSHA string) stitchproof.PayloadScope {
 func bindNASStitchReadback(receipt nasStitchReadbackReceipt, sha string, snapshot nasStitchReadbackSnapshot, server nasStitchServerExecution) nasStitchReadbackBinding {
 	return nasStitchReadbackBinding{NativeTaskSHA: receipt.NativeTaskSHA, NativeActivationID: receipt.NativeActivationID, NativeRunID: receipt.NativeRunID, NativeBundleSHA: receipt.NativeBundleSHA, NativePlanSHA: receipt.NativePlanSHA,
 		ProducerSHA: receipt.ProducerProfileSHA, ReaderSHA: receipt.ReaderProfileSHA, PairSHA: receipt.PairSHA, ReadbackSHA: sha, Reader: receipt.Reader,
-		HeartbeatAt: snapshot.Facts.HeartbeatAt.Time.UTC().Format(time.RFC3339Nano), Stable: snapshot.Facts.Host.Release.Stable,
+		HeartbeatAt: nasStitchWireTime(snapshot.Facts.HeartbeatAt.Time), Stable: snapshot.Facts.Host.Release.Stable,
 		Candidate: snapshot.Facts.Host.Release.Candidate, InventoryMismatches: snapshot.Facts.InventoryMismatches.Int64,
 		Server: server, Scope: nasStitchReadbackScope(receipt.NativePlanSHA), Outputs: receipt.Outputs, Policy: receipt.Policy, Tools: receipt.Tools, LocalOnly: true, GrantsRetirement: false}
 }
@@ -142,33 +141,13 @@ func (s *Server) handleAccountNASStitchEvidenceAdmission(w http.ResponseWriter, 
 		util.WriteError(w, 409, err.Error())
 		return
 	}
-	expires := snapshot.Now.Add(120 * time.Second)
-	response := map[string]any{"schema": "stoarama.nas-stitch-admission.v1", "mode": mode, "profiles": components, "expires_at": ""}
-	if mode == nasStitchProofNative {
-		proof, err := boundedNASStitchNativeV3(snapshot.SourcePlan, snapshot.SourceSHA, query.run)
-		if err != nil {
-			util.WriteError(w, 409, err.Error())
-			return
-		}
-		expires = snapshot.Now.Add(15 * time.Minute)
-		if snapshot.ApprovedUntil.Before(expires) {
-			expires = snapshot.ApprovedUntil
-		}
-		proof.Expires, proof.ActivationID = expires, query.activation
-		taskRaw, err := json.Marshal(proof)
-		if err != nil {
-			util.WriteError(w, 409, "native task bytes unavailable")
-			return
-		}
-		response["task_b64"], response["task_sha256"] = base64.StdEncoding.EncodeToString(taskRaw), cleanupSHA(taskRaw)
-		response["task"], response["native_run_id"], response["activation_id"] = proof, query.run, query.activation
+	response, err := buildNASStitchAdmissionResponse(snapshot, components, mode, query)
+	if err != nil {
+		util.WriteError(w, 409, err.Error())
+		return
 	}
-	if snapshot.ApprovedUntil.Before(expires) {
-		expires = snapshot.ApprovedUntil
-	}
-	response["expires_at"] = expires.UTC().Format(time.RFC3339Nano)
 	w.Header().Set("Cache-Control", "private, no-store")
-	util.WriteJSON(w, 200, response)
+	writeNASStitchWireJSON(w, response)
 }
 
 type nasStitchAdmissionQuery struct{ run, producer, activation string }
@@ -243,11 +222,11 @@ func (s *Server) handleAdminNASStitchReadbackStatus(w http.ResponseWriter, r *ht
 			util.WriteError(w, 409, err.Error())
 			return
 		}
-		value := nasStitchReadbackCurrent{Schema: "stoarama.nas-stitch-current-context.v1", CheckedAt: snapshot.Now.Format(time.RFC3339Nano),
-			StatusAt: snapshot.Facts.StatusAt.Time.UTC().Format(time.RFC3339Nano), VerifiedAt: entry.VerifiedAt, ID: entry.ID,
-			ApprovedUntil: snapshot.ApprovedUntil.Format(time.RFC3339Nano), Integrity: "clear", nasStitchReadbackBinding: bindNASStitchReadback(receipt, entry.SHA, snapshot, server)}
+		value := nasStitchReadbackCurrent{Schema: "stoarama.nas-stitch-current-context.v1", CheckedAt: nasStitchWireTime(snapshot.Now),
+			StatusAt: nasStitchWireTime(snapshot.Facts.StatusAt.Time), VerifiedAt: entry.VerifiedAt, ID: entry.ID,
+			ApprovedUntil: nasStitchWireTime(snapshot.ApprovedUntil), Integrity: "clear", nasStitchReadbackBinding: bindNASStitchReadback(receipt, entry.SHA, snapshot, server)}
 		w.Header().Set("Cache-Control", "private, no-store")
-		util.WriteJSON(w, 200, value)
+		writeNASStitchWireJSON(w, value)
 		return
 	}
 	util.WriteError(w, 409, "requested readback absent from current reader history")
@@ -334,9 +313,9 @@ func (s *Server) handleAdminNASStitchReadbackValidate(w http.ResponseWriter, r *
 		util.WriteError(w, 409, err.Error())
 		return
 	}
-	value := nasStitchReadbackValidation{Schema: "stoarama.nas-stitch-validation.v2", ValidatedAt: snapshot.Now.Format(time.RFC3339Nano), nasStitchReadbackBinding: bindNASStitchReadback(receipt, req.ReadbackSHA, snapshot, server)}
+	value := nasStitchReadbackValidation{Schema: "stoarama.nas-stitch-validation.v2", ValidatedAt: nasStitchWireTime(snapshot.Now), nasStitchReadbackBinding: bindNASStitchReadback(receipt, req.ReadbackSHA, snapshot, server)}
 	w.Header().Set("Cache-Control", "private, no-store")
-	util.WriteJSON(w, 200, value)
+	writeNASStitchWireJSON(w, value)
 }
 
 // Preserve the full original native result bytes/hash. Only project its extra
