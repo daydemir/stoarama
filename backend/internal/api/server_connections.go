@@ -89,6 +89,8 @@ func pullPathAllowed(method, path string) bool {
 		return true
 	case method == http.MethodGet && (path == "/api/v1/account/connections/stitch/proof" || path == "/api/v1/account/connections/stitch/corpus" || path == "/api/v1/account/connections/stitch/tools/ffmpeg" || path == "/api/v1/account/connections/stitch/tools/ffprobe"):
 		return true
+	case method == http.MethodGet && path == "/api/v1/account/connections/stitch/evidence/admission":
+		return true
 	case method == http.MethodPost && path == "/api/v1/account/connections/selected-verify/lease":
 		return true
 	case method == http.MethodPost && pullSelectedVerifyResultRe.MatchString(path):

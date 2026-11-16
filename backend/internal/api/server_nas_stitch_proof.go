@@ -126,6 +126,10 @@ func (s *Server) writeNASStitchProof(w http.ResponseWriter, r *http.Request) {
 }
 
 func stitchProofSelector(selector int, connectionID int64, version string) int {
+	// Readback has a distinct protocol; legacy native-only releases never see2.
+	if selector == 2 && connectionID == 13 && version == nasCleanupR2CopyControlClientVersion {
+		return 2
+	}
 	if selector == 1 && connectionID == 13 && nasClientSupportsStitchProof(version) {
 		return 1
 	}

@@ -88,6 +88,9 @@ func TestNASStitchProofCombinedCapabilitySelectors(t *testing.T) {
 				if eligible && connection == 13 && selector == 1 {
 					want = 1
 				}
+				if version == nasCleanupR2CopyControlClientVersion && connection == 13 && selector == 2 {
+					want = 2
+				}
 				if got := stitchProofSelector(selector, connection, version); got != want {
 					t.Fatalf("version=%q connection=%d selector=%d got=%d want=%d", version, connection, selector, got, want)
 				}

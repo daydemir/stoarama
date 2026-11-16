@@ -40,7 +40,9 @@ def load_contract():
              "stitch_readback_pipeline", "StitchReadbackStop", "stitch_readback_run",
              "stitch_check", "certification_identity", "stitch_proof_check", "cleanup_json_bytes",
              "stitch_proof_unpack", "stitch_proof_validate", "stitch_proof_success",
-             "StitchEvidenceKind", "StitchEvidenceKey", "stitch_evidence_chunks", "StitchEvidencePacer"}
+             "StitchEvidenceKind", "StitchEvidenceKey", "stitch_evidence_chunks", "StitchEvidencePacer",
+             "StitchEvidenceSnapshot", "StitchNativeEvidenceStage", "stitch_evidence_index",
+             "StitchEvidenceLedger", "StitchEvidenceDispatch", "StitchEvidenceProgress"}
     constants = {"STITCH_READBACK_SCHEMA_SHA", "STITCH_READBACK_SCHEMA_JSON",
                  "STITCH_PROOF_SCHEMA_SHA", "STITCH_PROOF_SCHEMA_JSON", "V85R_MANIFEST_SHA",
                  "STITCH_POLICY", "STITCH_REVISION", "STITCH_CORPUS_SHA", "STITCH_PROOF_SOURCE_SHA",
@@ -294,6 +296,14 @@ class ReadbackContractTests(unittest.TestCase):
         docs = seal_profiles((producer, reader, pair))
         bound = self.bind_profiles(docs, CORE["NASStitchMode"].NATIVE)
         self.assertEqual(bound[0]["client_artifact"], bound[1]["client_artifact"])
+        docs[0]["client_artifact"]["file"]="synthetic/original-client.py"
+        seal_profiles(docs)
+        self.bind_profiles(docs,CORE["NASStitchMode"].NATIVE)
+        docs[1]["client_artifact"]["sha256"]="c"*64
+        seal_profiles(docs)
+        with self.assertRaisesRegex(Hold,"original exact artifact"):
+            self.bind_profiles(docs,CORE["NASStitchMode"].READBACK,
+                identity=CORE["StitchClientIdentity"]("c"*64,2,"r2-copy-v3"))
 
     def test_resealed_semantic_drift_reaches_pipeline_and_contract_checks(self):
         mutations = (
@@ -588,6 +598,132 @@ class EvidenceFramingTests(unittest.TestCase):
         clock[0]=219.999;self.assertFalse(pacer.take());clock[0]=220;self.assertTrue(pacer.take())
         restart=CORE["StitchEvidencePacer"]();self.assertFalse(restart.take())
         clock[0]=279.999;self.assertFalse(restart.take());clock[0]=280;self.assertTrue(restart.take())
+
+
+class SyntheticMemoryEvidenceStore:
+    """CAS test double only; no registry, media, native or production authority."""
+    def __init__(self):
+        self.body=None;self.blobs={};self.fail=False
+
+    def snapshot(self):
+        return CORE["StitchEvidenceSnapshot"](self.body is not None,
+            hashlib.sha256(self.body).hexdigest() if self.body is not None else "",self.body or b"")
+
+    def replace(self,expected,body):
+        if self.fail:raise OSError("SYNTHETIC failed durable checkpoint")
+        if expected != self.snapshot():raise Hold("SYNTHETIC CAS mismatch")
+        self.body=bytes(body);return self.snapshot()
+
+    def put(self,body):
+        digest=hashlib.sha256(body).hexdigest();self.blobs[digest]=bytes(body);return digest
+
+    def read(self,digest):
+        return self.blobs[digest]
+
+
+class EvidenceLedgerTests(unittest.TestCase):
+    def setUp(self):
+        self.old=dict(CORE);self.clock=100.0
+        CORE.update(time=SimpleNamespace(monotonic=lambda:self.clock,monotonic_ns=lambda:int(self.clock*10**9)),utc_now_precise=lambda:UTC)
+        self.store=SyntheticMemoryEvidenceStore();self.ledger=CORE["StitchEvidenceLedger"](self.store)
+        self.now=datetime.datetime.fromisoformat(UTC.replace("Z","+00:00"))
+
+    def tearDown(self):
+        CORE.clear();CORE.update(self.old)
+
+    def session(self):
+        return dict(native_run_id=ID,producer_profile_sha256=SHA,reader_profile_sha256=SHA,
+                    profile_pair_sha256=SHA,reader_boot_id=ID)
+
+    def test_native_window_and_original_admission_do_not_extend_after_restart_or_refresh(self):
+        mode=CORE["NASStitchMode"]
+        self.assertFalse(self.ledger.due())
+        self.ledger.observe_mode(mode.NATIVE,self.now, ID)
+        expiry=self.ledger.state["window"]["expires_at"]
+        original=b'{"explicitly_synthetic":"original admission"}'
+        self.assertEqual(self.ledger.bind_admission(original),original)
+        self.ledger.observe_mode(mode.NATIVE,self.now+datetime.timedelta(minutes=10), ID)
+        self.assertEqual(self.ledger.state["window"]["expires_at"],expiry)
+        restarted=CORE["StitchEvidenceLedger"](self.store)
+        self.assertEqual(restarted.original_admission(),original)
+        restarted.observe_mode(mode.NATIVE,self.now+datetime.timedelta(minutes=20), ID)
+        with self.assertRaises(Hold):restarted.native_deadline(self.now+datetime.timedelta(minutes=15))
+        with self.assertRaises(CORE["StitchReadbackIntegrity"]):restarted.bind_admission(b'{"later":"expiry"}')
+        self.assertEqual(restarted.native_deadline(self.now),100+15*60-30)
+        restarted.observe_mode(mode.DISABLED,self.now+datetime.timedelta(minutes=20), ID)
+        restarted.observe_mode(mode.NATIVE,self.now+datetime.timedelta(minutes=21), ID)
+        self.assertNotEqual(restarted.state["window"]["expires_at"],expiry)
+
+    def test_restart_profile_or_boot_change_drops_accepting_history_not_preserved_blobs(self):
+        self.ledger.observe_mode(CORE["NASStitchMode"].READBACK,self.now, ID)
+        self.ledger.bind_session(self.session());self.ledger.complete_readback(CORE["cleanup_json_bytes"](readback()))
+        original_blobs=dict(self.store.blobs)
+        restarted=CORE["StitchEvidenceLedger"](self.store)
+        self.assertEqual(restarted.history,[]);self.assertEqual(len(restarted.state["history"]),1)
+        self.assertTrue(restarted.due())
+        changed=self.session();changed["reader_boot_id"]="22222222-2222-4222-8222-222222222222"
+        restarted.bind_session(changed)
+        self.assertEqual(restarted.history,[]);self.assertEqual(restarted.state["history"],[])
+        self.assertEqual(self.store.blobs,original_blobs)
+
+    def test_four_observations_six_hour_cadence_and_hold_never_refresh_prior_time(self):
+        self.ledger.observe_mode(CORE["NASStitchMode"].READBACK,self.now, ID)
+        self.ledger.bind_session(self.session())
+        for number in range(5):
+            value=readback();value["id"]="%08x-1111-4111-8111-111111111111"%(number+1)
+            self.ledger.complete_readback(CORE["cleanup_json_bytes"](value))
+        self.assertEqual(len(self.ledger.history),4)
+        previous=copy.deepcopy(self.ledger.history)
+        self.assertFalse(self.ledger.due());self.clock+=6*3600;self.assertTrue(self.ledger.due())
+        self.ledger.hold();self.assertFalse(self.ledger.due());self.clock+=59.999;self.assertFalse(self.ledger.due())
+        self.clock+=.001;self.assertTrue(self.ledger.due());self.assertEqual(self.ledger.history,previous)
+        self.assertEqual(len(self.store.blobs),5)
+
+    def test_integrity_refusal_survives_restart_mode_changes_and_cannot_complete(self):
+        mode=CORE["NASStitchMode"];self.ledger.observe_mode(mode.READBACK,self.now, ID)
+        self.ledger.bind_session(self.session());self.ledger.refuse()
+        restarted=CORE["StitchEvidenceLedger"](self.store)
+        restarted.observe_mode(mode.DISABLED,self.now, ID);restarted.observe_mode(mode.READBACK,self.now, ID)
+        with self.assertRaises(CORE["StitchReadbackIntegrity"]):restarted.due()
+        with self.assertRaises(CORE["StitchReadbackIntegrity"]):restarted.complete_readback(CORE["cleanup_json_bytes"](readback()))
+        self.assertEqual(restarted.history,[])
+
+    def test_exact_ack_persists_cursor_and_complete_queue_row_drops_without_deleting_blob(self):
+        key=CORE["StitchEvidenceKey"](CORE["StitchEvidenceKind"].READBACK,ID,SHA,SHA,ID)
+        body=b"SYNTHETIC"*6000;self.ledger.enqueue(key,body);self.ledger.enqueue(key,body)
+        self.assertEqual(len(self.ledger.state["queue"]),1)
+        item=dict(self.ledger.state["queue"][0]);progress=CORE["StitchEvidenceProgress"]
+        with self.assertRaises(CORE["StitchReadbackIntegrity"]):
+            self.ledger.acknowledge(item,progress(CORE["StitchEvidenceDispatch"].ACKNOWLEDGED,65))
+        self.ledger.acknowledge(item,progress(CORE["StitchEvidenceDispatch"].ACKNOWLEDGED,64))
+        restarted=CORE["StitchEvidenceLedger"](self.store);item=dict(restarted.state["queue"][0])
+        self.assertEqual(item["cursor"],64)
+        restarted.acknowledge(item,progress(CORE["StitchEvidenceDispatch"].ACKNOWLEDGED,(len(body)+511)//512))
+        self.assertEqual(restarted.state["queue"],[]);self.assertEqual(self.store.read(item["blob_sha256"]),body)
+
+    def test_failed_checkpoint_does_not_advance_memory_state_and_malformed_index_refuses(self):
+        before=self.ledger.copy();self.store.fail=True
+        with self.assertRaises(OSError):self.ledger.observe_mode(CORE["NASStitchMode"].READBACK,self.now, ID)
+        self.assertEqual(self.ledger.state,before)
+        self.store.fail=False
+        for mutate in (lambda value:value.update(mode=True),lambda value:value.update(mode=3),
+                lambda value:value.update(mode=1),lambda value:value.update(window=1),
+                lambda value:value.update(extra=True),lambda value:value.update(native={"stage":"unknown"})):
+            value=copy.deepcopy(before);mutate(value)
+            with self.assertRaises(CORE["StitchReadbackIntegrity"]):CORE["stitch_evidence_index"](CORE["cleanup_json_bytes"](value))
+
+    def test_clock_rollback_or_new_boot_cannot_extend_original_native_window(self):
+        mode=CORE["NASStitchMode"];self.ledger.observe_mode(mode.NATIVE,self.now,ID)
+        original=self.ledger.state["window"]["deadline_monotonic_ns"]
+        self.clock+=15*60
+        restarted=CORE["StitchEvidenceLedger"](self.store)
+        restarted.observe_mode(mode.NATIVE,self.now-datetime.timedelta(days=1),ID)
+        self.assertEqual(restarted.state["window"]["deadline_monotonic_ns"],original)
+        with self.assertRaises(Hold):restarted.native_deadline(self.now-datetime.timedelta(days=1))
+        self.clock=1
+        restarted.observe_mode(mode.NATIVE,self.now,"22222222-2222-4222-8222-222222222222")
+        with self.assertRaises(Hold):restarted.native_deadline(self.now)
+        with self.assertRaises(Hold):restarted.due()
 
 
 if __name__ == "__main__":

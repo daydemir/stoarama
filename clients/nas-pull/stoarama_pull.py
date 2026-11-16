@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import binascii
 import concurrent.futures
 from contextlib import contextmanager, ExitStack
 import datetime
@@ -21,6 +22,7 @@ import os
 import posixpath
 import random
 import re
+import select
 import signal
 import socket
 import sqlite3
@@ -1344,7 +1346,7 @@ class Inventory:
 
     def _cached_regular_stat(self, relative_path):
         parts = Path(relative_path).parts
-        if not parts or parts[0] in (JOINED_ROOT,) + INVENTORY_ROOT_EXCLUSIONS or parts[0].endswith(("_V85r_keep28", "_V85r_proof_keep28", "_V85r_proof_keep28_v2")):
+        if not parts or parts[0] in (JOINED_ROOT,) + INVENTORY_ROOT_EXCLUSIONS or parts[0].endswith(("_V85r_keep28", "_V85r_proof_keep28", "_V85r_proof_keep28_v2", "_V85r_proof_keep28_v3")):
             return None
         descriptor = None
         try:
@@ -2187,8 +2189,16 @@ class Runtime:
             payload["cleanup"] = redact_diagnostics(cleanup)
         if cleanup_error and not payload["client_last_error"]:
             payload["client_last_error"], payload["client_last_error_at"] = cleanup_error, cleanup_error_at
-        if getattr(self, "stitch_enabled", False):
+        if getattr(self, "stitch_enabled", False) or CLIENT_VERSION == "r2-copy-v3":
             stitch, error, at = STITCH_STATUS.snapshot()
+            if CLIENT_VERSION == "r2-copy-v3":
+                # Keep the complete authority subtree; old counters/transport
+                # details cannot crowd it out of the existing8KiB heartbeat.
+                stitch = {name:stitch[name] for name in ("stitch_reader","state","kind","started_at",
+                    "run_id","plan_sha256","receipt_sha256","failure") if name in stitch}
+                error = error[:300]
+                if len(cleanup_json_bytes(dict(stitch,last_error=error,last_error_at=at)))>8192:
+                    raise StitchHold("bounded proof status unavailable")
             payload["stitch"] = redact_diagnostics(dict(stitch, last_error=error, last_error_at=at))
         payload["client_last_error"] = redact_diagnostics(payload["client_last_error"])
         host_facts = getattr(self, "host_facts", None)
@@ -19145,7 +19155,7 @@ def walk_raw_files(root):
     for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=fail_walk, followlinks=False):
         directory = Path(dirpath)
         if directory == root:
-            dirnames[:] = [name for name in dirnames if name != JOINED_ROOT and name not in INVENTORY_ROOT_EXCLUSIONS and not name.endswith(("_V85r_keep28", "_V85r_proof_keep28", "_V85r_proof_keep28_v2"))]
+            dirnames[:] = [name for name in dirnames if name != JOINED_ROOT and name not in INVENTORY_ROOT_EXCLUSIONS and not name.endswith(("_V85r_keep28", "_V85r_proof_keep28", "_V85r_proof_keep28_v2", "_V85r_proof_keep28_v3"))]
         for filename in filenames:
             if directory == root and filename in INVENTORY_ROOT_EXCLUSIONS:
                 continue
@@ -47003,8 +47013,8 @@ class StitchStop:
         self.failure = None
         self.measurements = []
         self.started = time.monotonic()
-        self.deadline = (self.started + (parse_certification_timestamp(task["expires_at"], "proof expiry")
-            - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 30
+        self.deadline = (min(self.started+15*60-30, self.started + (parse_certification_timestamp(task["expires_at"], "proof expiry")
+            - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 30)
             if kind is StitchRunKind.PROOF and task is not None else None)
         self.run_id = str(uuid.uuid4())
         self.started_at = utc_now()
@@ -47116,6 +47126,40 @@ def stitch_proof_http(cfg, request, stop, limit, timeout):
         yield response
 
 
+def stitch_proof_input(process, message, stop, deadline):
+    """Write credential stdin without a blocking write or partial-input retry.
+
+    Repeated communicate(input=None) can strand an incomplete stdin payload on
+    older Python/small pipes. This explicit nonblocking writer owns EOF and
+    checks the same original deadline/cancellation while applying backpressure.
+    """
+    stream = process.stdin
+    try:
+        fd = stream.fileno()
+        os.set_blocking(fd,False)
+        payload = memoryview(message);sent = 0
+        while sent < len(payload):
+            remaining = stitch_proof_remaining(stop,deadline)
+            if process.poll() is not None:
+                raise StitchHold("proof HTTP child exited before complete stdin")
+            _,ready,_ = select.select([], [fd], [], min(.2,remaining))
+            if not ready:
+                continue
+            try:
+                count = os.write(fd,payload[sent:sent+16384])
+            except BlockingIOError:
+                continue
+            except BrokenPipeError:
+                raise StitchHold("proof HTTP child refused stdin") from None
+            if count <= 0:
+                raise StitchHold("proof HTTP stdin made no progress")
+            sent += count
+        stitch_proof_remaining(stop,deadline)
+    finally:
+        stream.close()
+        process.stdin = None
+
+
 @contextmanager
 def stitch_bounded_http(cfg, request, stop, limit, timeout):
     # Reserve kill/reap time inside the immutable original caller deadline.
@@ -47146,14 +47190,14 @@ def stitch_bounded_http(cfg, request, stop, limit, timeout):
         process = subprocess.Popen([sys.executable, "-I", "-S", "-B", "-c", STITCH_PROOF_HTTP_CHILD],
             stdin=subprocess.PIPE, stdout=output, stderr=subprocess.DEVNULL, env={}, start_new_session=True)
         try:
-            first = True
+            stitch_proof_input(process,message,stop,deadline)
             while True:
                 remaining = stitch_proof_remaining(stop, deadline)
                 try:
-                    process.communicate(input=message if first else None, timeout=min(.2, remaining))
+                    process.wait(timeout=min(.2, remaining))
                     break
                 except subprocess.TimeoutExpired:
-                    first = False
+                    pass
             stitch_proof_remaining(stop, deadline)
             if process.returncode != 0:
                 raise StitchHold("proof HTTP transport failed")
@@ -47163,7 +47207,7 @@ def stitch_bounded_http(cfg, request, stop, limit, timeout):
                     process.kill()
                 except ProcessLookupError:
                     pass
-            process.communicate(timeout=STITCH_PROOF_HTTP_REAP_SEC)
+            process.wait(timeout=STITCH_PROOF_HTTP_REAP_SEC)
         size = output.tell()
         output.seek(0)
         metadata = output.readline(4097)
@@ -48260,8 +48304,12 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
     if not 1 <= len(clips) <= 200 or len(joins) != len(clips) - 1 or len(plan.get("eligible", [])) != len(clips) or sum(c["size_bytes"] for c in clips) > STITCH_MAX_INPUT:
         raise StitchHold("unbounded assembly unit")
     folder = "_V85r_proof_keep28_v2/" if kind is StitchRunKind.PROOF else "_V85r_keep28/"
+    suffix = "/proof-" + STITCH_PROOF_SOURCE_SHA[:16] if kind is StitchRunKind.PROOF else ""
+    if kind is StitchRunKind.PROOF and hasattr(proof_stop,"evidence_context"):
+        folder = "_V85r_proof_keep28_v3/"
+        suffix += "/run-"+proof_stop.run_id
     expected = clips[0]["relative_path"].split("/")[0] + folder + str(plan["recording_id"]) + "/"
-    if (not plan["output_folder"].startswith(expected) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}-00-00Z" + ("/proof-" + STITCH_PROOF_SOURCE_SHA[:16] if kind is StitchRunKind.PROOF else ""), plan["output_folder"][len(expected):])):
+    if (not plan["output_folder"].startswith(expected) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}-00-00Z" + re.escape(suffix), plan["output_folder"][len(expected):])):
         raise StitchHold("output must be in the stream's new versioned sibling folder")
     stop = proof_stop if kind is StitchRunKind.PROOF else StitchStop(cfg, stop_event, task if admitted is None else None, kind)
     deadline = (stop.deadline if kind is StitchRunKind.PROOF else min(time.monotonic() + 7000,
@@ -48546,6 +48594,12 @@ def stitch_proof_space(cfg, task, stop):
 
 
 def stitch_proof_checkpoint(cfg, task, stop):
+    if hasattr(stop, "evidence_context"):
+        current = stitch_evidence_admission(cfg, stop, NASStitchMode.NATIVE, stop.run_id)
+        if (current["task"]["plan_sha256"] != task["plan_sha256"]
+                or current["profiles"] != stop.evidence_context["profiles"]):
+            raise StitchHold("original evidence admission changed")
+        return
     current = stitch_proof_request(cfg, "/account/connections/stitch/proof", stop)
     stitch_proof_check(current)
     if current["plan_sha256"] != task["plan_sha256"]:
@@ -48903,6 +48957,10 @@ def stitch_readback_profiles(raw: StitchProfileBytes, expected: StitchProfileKey
                      StitchProducerProfile.COMBINED_V3: StitchProfilePair.COMBINED_SELF}[producer_id]
     if pair["pair_id"] != expected_pair.value:
         raise StitchHold("readback producer/reader pair differs")
+    if producer_id is StitchProducerProfile.COMBINED_V3 and (
+            producer["client_version"] != reader["client_version"] or any(
+                producer["client_artifact"][name] != reader["client_artifact"][name] for name in ("sha256","size_bytes"))):
+        raise StitchHold("combined self pair requires the original exact artifact")
     artifact = reader["client_artifact"]
     if (type(client.sha256) is not str or re.fullmatch(r"[a-f0-9]{64}", client.sha256) is None
             or type(client.size_bytes) is not int or client.size_bytes <= 0 or type(client.version) is not str
@@ -48932,8 +48990,10 @@ def stitch_readback_profiles(raw: StitchProfileBytes, expected: StitchProfileKey
         if reference["sha256"] != STITCH_READBACK_SCHEMA_SHA or reference["size_bytes"] != len(STITCH_READBACK_SCHEMA_JSON.encode()):
             raise StitchHold("unsupported current readback schema")
     old = producer_id is StitchProducerProfile.LEGACY_V2
-    outer_sha = "03d9a5fa930b67249036a6b522dcffa59f6bba9744f79abc0747f85d9ee63abc" if old else STITCH_READBACK_SCHEMA_SHA
-    outer_size = 17438 if old else len(STITCH_READBACK_SCHEMA_JSON.encode())
+    # Producer identities are immutable. A later reader schema must never
+    # reinterpret an original combined-v3 producer as having used its new hash.
+    outer_sha = "03d9a5fa930b67249036a6b522dcffa59f6bba9744f79abc0747f85d9ee63abc" if old else "e38f8e95588264fa579e53a66c1eb39bab84370c680dd8c2aac05865afe562b1"
+    outer_size = 17438 if old else 40151
     original_contract = native_contract["attestation_schema"]
     if original_contract["sha256"] != outer_sha or original_contract["size_bytes"] != outer_size:
         raise StitchHold("original producer schema differs")
@@ -49326,7 +49386,10 @@ class StitchEvidenceDirectory(StitchDirectory):
         self.lock_fd = -1
 
     def __enter__(self):
-        inventory_scratch_backing(self.cfg.state_dir)
+        backing = inventory_scratch_backing(self.cfg.state_dir)
+        storage = os.statvfs(self.cfg.state_dir)
+        log("INFO","proof evidence storage qualified filesystem=%s device=%d free_bytes=%d" %
+            (backing[1].value,backing[0],storage.f_bavail*storage.f_frsize))
         super().__enter__()
         try:
             owned = os.fstat(self.fds[-1])
@@ -49457,6 +49520,549 @@ class StitchEvidenceDirectory(StitchDirectory):
             os.fsync(self.fds[-1])
         return self.snapshot()
 
+
+class StitchNativeEvidenceStage(Enum):
+    ABSENT = "absent"
+    PREPARED = "prepared"
+    FAILED = "failed"
+    REGISTERED = "registered"
+
+
+def stitch_evidence_index(raw):
+    """Closed private checkpoint. Absence/corruption never invents history."""
+    value = stitch_proof_json(raw)
+    def closed(item, fields):
+        if type(item) is not dict or set(item) != set(fields):
+            raise StitchReadbackIntegrity("evidence checkpoint fields differ")
+    def digest(item):
+        if type(item) is not str or re.fullmatch(r"[a-f0-9]{64}",item) is None:
+            raise StitchReadbackIntegrity("evidence checkpoint digest differs")
+    def identity(item):
+        if type(item) is not str:
+            raise StitchReadbackIntegrity("evidence checkpoint UUID differs")
+        try:
+            if str(uuid.UUID(item)) != item or uuid.UUID(item).int == 0:
+                raise ValueError("noncanonical UUID")
+        except ValueError:
+            raise StitchReadbackIntegrity("evidence checkpoint UUID differs") from None
+    def timestamp(item):
+        if type(item) is not str or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z",item) is None:
+            raise StitchReadbackIntegrity("evidence checkpoint UTC differs")
+        try:
+            datetime.datetime.fromisoformat(item.replace("Z","+00:00"))
+        except ValueError:
+            raise StitchReadbackIntegrity("evidence checkpoint time differs") from None
+    closed(value,("schema","mode","window","native","session","history","queue","integrity"))
+    if (value["schema"] != "stoarama.nas-stitch-reader-state.v1" or type(value["mode"]) is not int
+            or value["mode"] not in tuple(NASStitchMode) or value["integrity"] not in ("clear","refused")):
+        raise StitchReadbackIntegrity("evidence checkpoint schema/mode differs")
+    window = value["window"]
+    if type(window) is not dict:
+        raise StitchReadbackIntegrity("evidence native window differs")
+    if window:
+        fields = ("expires_at","boot_id","deadline_monotonic_ns")
+        if "admission_sha256" in window:
+            fields += ("admission_sha256",);digest(window["admission_sha256"])
+        closed(window,fields);identity(window["boot_id"])
+        if type(window["deadline_monotonic_ns"]) is not int or not 0 < window["deadline_monotonic_ns"] < 2**63:
+            raise StitchReadbackIntegrity("original monotonic native deadline differs")
+        timestamp(window["expires_at"])
+        if value["mode"] != NASStitchMode.NATIVE:
+            raise StitchReadbackIntegrity("native window without native selector")
+    else:
+        closed(window,())
+        if value["mode"] == NASStitchMode.NATIVE:
+            raise StitchReadbackIntegrity("native selector has no original window")
+    native = value["native"]
+    try:
+        stage = StitchNativeEvidenceStage(native["stage"])
+    except (KeyError,TypeError,ValueError):
+        raise StitchReadbackIntegrity("evidence native stage differs") from None
+    if stage is StitchNativeEvidenceStage.ABSENT:
+        closed(native,("stage",))
+    else:
+        fields = ("stage","run_id","context_sha256")
+        if stage is StitchNativeEvidenceStage.REGISTERED:
+            fields += ("bundle_sha256",)
+        closed(native,fields);identity(native["run_id"]);digest(native["context_sha256"])
+        if stage is StitchNativeEvidenceStage.REGISTERED:
+            digest(native["bundle_sha256"])
+    session = value["session"]
+    if session:
+        closed(session,("native_run_id","producer_profile_sha256","reader_profile_sha256","profile_pair_sha256","reader_boot_id"))
+        identity(session["native_run_id"]);identity(session["reader_boot_id"])
+        for name in ("producer_profile_sha256","reader_profile_sha256","profile_pair_sha256"):
+            digest(session[name])
+    else:
+        closed(session,())
+    if type(value["history"]) is not list or len(value["history"]) > 4 or (value["history"] and not session):
+        raise StitchReadbackIntegrity("evidence readback history differs")
+    seen = set()
+    for item in value["history"]:
+        closed(item,("id","verified_at","sha256"));identity(item["id"]);timestamp(item["verified_at"]);digest(item["sha256"])
+        if item["id"] in seen:
+            raise StitchReadbackIntegrity("duplicate evidence readback identity")
+        seen.add(item["id"])
+    if type(value["queue"]) is not list or len(value["queue"]) > 64:
+        raise StitchReadbackIntegrity("evidence transport queue differs")
+    seen = set()
+    for item in value["queue"]:
+        closed(item,("kind","native_run","plan","pair","readback","blob_sha256","size_bytes","cursor"))
+        try:
+            kind = StitchEvidenceKind(item["kind"])
+        except (TypeError,ValueError):
+            raise StitchReadbackIntegrity("evidence transport kind differs") from None
+        identity(item["native_run"]);identity(item["readback"])
+        for name in ("plan","pair","blob_sha256"):
+            digest(item[name])
+        limit = 1024*1024 if kind in (StitchEvidenceKind.NATIVE,StitchEvidenceKind.TASK) else 65536
+        size,cursor = item["size_bytes"],item["cursor"]
+        if (type(size) is not int or not 0 < size <= limit or type(cursor) is not int
+                or not 0 <= cursor < (size+511)//512):
+            raise StitchReadbackIntegrity("evidence transport size/cursor differs")
+        key = tuple(item[name] for name in ("kind","native_run","plan","pair","readback","blob_sha256"))
+        if key in seen:
+            raise StitchReadbackIntegrity("duplicate evidence queue identity")
+        seen.add(key)
+    return value
+
+
+class StitchEvidenceLedger:
+    """One worker's durable metadata; no accepted history restored on startup."""
+    def __init__(self, store):
+        self.store = store
+        self.snapshot = store.snapshot()
+        if not self.snapshot.present:
+            initial = dict(schema="stoarama.nas-stitch-reader-state.v1",mode=0,window={},
+                native=dict(stage=StitchNativeEvidenceStage.ABSENT.value),session={},history=[],queue=[],integrity="clear")
+            self.snapshot = store.replace(self.snapshot,cleanup_json_bytes(initial))
+        self.state = stitch_evidence_index(self.snapshot.body)
+        self.history = []
+        self.next_due, self.retry_at = 0, 0
+        self.observed_boot = None
+
+    def commit(self, value):
+        raw = cleanup_json_bytes(value)
+        stitch_evidence_index(raw)
+        if len(raw) > 65536:
+            raise StitchHold("evidence checkpoint exceeds bound")
+        snapshot = self.store.replace(self.snapshot,raw)
+        self.state, self.snapshot = value, snapshot
+
+    def copy(self):
+        return stitch_evidence_index(cleanup_json_bytes(self.state))
+
+    def observe_mode(self, mode, now, boot):
+        if type(mode) is not NASStitchMode or now.tzinfo != datetime.timezone.utc:
+            raise StitchHold("typed UTC selector observation required")
+        if type(boot) is not str or str(uuid.UUID(boot)) != boot or uuid.UUID(boot).int == 0:
+            raise StitchHold("actual canonical selector boot required")
+        self.observed_boot = boot
+        if mode is NASStitchMode(self.state["mode"]):
+            return
+        value = self.copy();value["mode"] = int(mode);value["window"] = {}
+        if mode is NASStitchMode.NATIVE:
+            value["window"] = dict(expires_at=(now+datetime.timedelta(minutes=15)).isoformat().replace("+00:00","Z"),
+                boot_id=boot,deadline_monotonic_ns=time.monotonic_ns()+15*60*10**9)
+        self.commit(value)
+
+    def bind_admission(self, raw):
+        if self.state["mode"] != NASStitchMode.NATIVE or not self.state["window"]:
+            raise StitchHold("native activation window unavailable")
+        window = self.state["window"]
+        if "admission_sha256" in window:
+            if hashlib.sha256(raw).hexdigest() != window["admission_sha256"]:
+                raise StitchReadbackIntegrity("original native admission cannot be replaced")
+            return self.store.read(window["admission_sha256"])
+        digest = self.store.put(raw)
+        value = self.copy();value["window"]["admission_sha256"] = digest;self.commit(value)
+        return raw
+
+    def original_admission(self):
+        if "admission_sha256" not in self.state["window"]:
+            raise StitchHold("original native admission unavailable")
+        return self.store.read(self.state["window"]["admission_sha256"])
+
+    def native_deadline(self, now):
+        if (now.tzinfo != datetime.timezone.utc or self.state["mode"] != NASStitchMode.NATIVE
+                or not self.state["window"]):
+            raise StitchHold("original native window unavailable")
+        expiry = datetime.datetime.fromisoformat(self.state["window"]["expires_at"].replace("Z","+00:00"))
+        if self.observed_boot != self.state["window"]["boot_id"]:
+            raise StitchHold("native activation boot changed; fresh operation required")
+        remaining = min((expiry-now).total_seconds(),
+            (self.state["window"]["deadline_monotonic_ns"]-time.monotonic_ns())/10**9)-30
+        if remaining <= 0:
+            raise StitchHold("original native window expired")
+        return time.monotonic()+min(15*60-30,remaining)
+
+    def bind_session(self, session):
+        value = self.copy()
+        if value["session"] != session:
+            value["session"] = session;value["history"] = []
+            self.commit(value);self.history = [];self.next_due = 0
+
+    def due(self):
+        if self.state["mode"] == NASStitchMode.DISABLED:
+            return False
+        if self.state["integrity"] == "refused":
+            raise StitchReadbackIntegrity("persistent readback integrity refusal")
+        if self.state["mode"] == NASStitchMode.NATIVE:
+            if self.observed_boot != self.state["window"]["boot_id"]:
+                raise StitchHold("native activation boot changed; fresh operation required")
+            expiry = datetime.datetime.fromisoformat(self.state["window"]["expires_at"].replace("Z","+00:00"))
+            if (expiry <= datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)
+                    or self.state["window"]["deadline_monotonic_ns"] <= time.monotonic_ns()+30*10**9):
+                return False
+        return time.monotonic() >= max(self.next_due,self.retry_at)
+
+    def hold(self):
+        self.retry_at = time.monotonic()+60
+
+    def refuse(self):
+        if self.state["integrity"] == "refused" and not self.state["history"]:
+            self.history = []
+            return
+        value = self.copy();value["integrity"] = "refused";value["history"] = []
+        self.history = []
+        self.commit(value)
+
+    def complete_readback(self, body):
+        result = stitch_proof_json(body)
+        stitch_readback_validate(result,StitchReadbackDefinition.READBACK)
+        session = dict(native_run_id=result["native_run_id"],producer_profile_sha256=result["producer_profile_sha256"],
+            reader_profile_sha256=result["reader_profile_sha256"],profile_pair_sha256=result["profile_pair_sha256"],
+            reader_boot_id=result["reader_execution"]["client_boot_id"])
+        if self.state["mode"] == NASStitchMode.DISABLED or self.state["integrity"] != "clear" or self.state["session"] != session:
+            raise StitchReadbackIntegrity("completed readback session differs")
+        digest = self.store.put(body)
+        entry = dict(id=result["id"],verified_at=result["verified_at"],sha256=digest)
+        history = (self.history+[entry])[-4:]
+        value = self.copy();value["history"] = history
+        self.commit(value)
+        self.history = history;self.next_due = time.monotonic()+6*3600;self.retry_at = 0
+        return digest
+
+    def enqueue(self, key, body):
+        stitch_evidence_chunks(key,body,0)
+        digest = self.store.put(body)
+        item = dict(kind=key.kind.value,native_run=key.native_run,plan=key.plan,pair=key.pair,readback=key.readback,
+                    blob_sha256=digest,size_bytes=len(body),cursor=0)
+        identity = {name:item[name] for name in item if name != "cursor"}
+        for old in self.state["queue"]:
+            if {name:old[name] for name in old if name != "cursor"} == identity:
+                return
+        if len(self.state["queue"]) >= 64:
+            raise StitchHold("bounded evidence transport queue full")
+        value = self.copy();value["queue"].append(item);self.commit(value)
+
+    def acknowledge(self, item, progress):
+        if progress.state is not StitchEvidenceDispatch.ACKNOWLEDGED:
+            return
+        if not self.state["queue"] or self.state["queue"][0] != item:
+            raise StitchReadbackIntegrity("evidence ACK checkpoint identity differs")
+        end = min(item["cursor"]+64,(item["size_bytes"]+511)//512)
+        if progress.cursor != end:
+            raise StitchReadbackIntegrity("evidence ACK skipped a batch")
+        value = self.copy()
+        if end == (item["size_bytes"]+511)//512:
+            value["queue"].pop(0)
+        else:
+            value["queue"][0]["cursor"] = end
+        self.commit(value)
+
+    def prepare_native(self, context):
+        raw = cleanup_json_bytes(context)
+        if self.original_admission() != raw:
+            raise StitchReadbackIntegrity("native context differs from original admission")
+        digest = self.store.put(raw)
+        value = self.copy()
+        value["native"] = dict(stage=StitchNativeEvidenceStage.PREPARED.value,
+            run_id=context["native_run_id"],context_sha256=digest)
+        value["session"],value["history"] = {},[]
+        self.commit(value);self.history = []
+
+    def fail_native(self):
+        value = self.copy()
+        if value["native"]["stage"] == StitchNativeEvidenceStage.PREPARED.value:
+            value["native"]["stage"] = StitchNativeEvidenceStage.FAILED.value
+            self.commit(value)
+
+    def register_native(self, body):
+        native = self.state["native"]
+        if native["stage"] not in (StitchNativeEvidenceStage.PREPARED.value,StitchNativeEvidenceStage.FAILED.value):
+            raise StitchReadbackIntegrity("native registration without prepared context")
+        context = stitch_proof_json(self.store.read(native["context_sha256"]))
+        task = context["task"]
+        try:
+            receipt = stitch_proof_unpack(body)
+        except (StitchHold,ValueError,KeyError,zlib.error) as exc:
+            raise StitchReadbackIntegrity("durable native registration is invalid") from exc
+        raw_profiles,_ = stitch_evidence_profiles(context)
+        stitch_readback_native(receipt,task,stitch_proof_json(raw_profiles.producer))
+        if receipt["run"]["id"] != native["run_id"] or receipt["plan_sha256"] != task["plan_sha256"]:
+            raise StitchReadbackIntegrity("durable native registration identity differs")
+        digest = self.store.put(body)
+        value = self.copy();value["native"]["stage"] = StitchNativeEvidenceStage.REGISTERED.value
+        value["native"]["bundle_sha256"] = digest;self.commit(value)
+
+
+def stitch_evidence_identity(cfg, stop):
+    if CLIENT_VERSION != "r2-copy-v3" or cfg.is_candidate:
+        raise StitchHold("promoted combined reader required")
+    # This is the existing startup release-manifest bootstrap, outside a native
+    # or readback attempt. Actual readback never fetches or repairs a manifest.
+    pin = executing_release_sha256(cfg)
+    actual,_ = stitch_readback_file(Path(cfg.current_file).parent,Path(cfg.current_file).name,8*1024*1024,stop)
+    if actual[1] != pin:
+        raise StitchReadbackIntegrity("executing reader source differs from release")
+    import platform
+    cpu = next((line.split(":",1)[1].strip() for line in _read_text("/proc/cpuinfo").splitlines()
+                if line.startswith("model name")),"unknown")
+    value = dict(connection_id=13,account_id=47,client_boot_id=boot_id(),
+        host=dict(connection_id=13,system=platform.system(),machine=platform.machine(),cpu_model=cpu,cpu_count=os.cpu_count()),
+        client_version=CLIENT_VERSION,client_artifact_sha256=actual[1],client_artifact_size_bytes=actual[0])
+    if value["host"]["system"] != "Linux" or value["host"]["machine"] != "x86_64" or value["client_boot_id"] == "unknown":
+        raise StitchHold("actual Linux reader identity unavailable")
+    return value
+
+
+def stitch_evidence_admission(cfg, stop, mode, identity):
+    if type(mode) is not NASStitchMode or mode is NASStitchMode.DISABLED:
+        raise StitchHold("typed active evidence mode required")
+    parameter = "run_id" if mode is NASStitchMode.NATIVE else "producer_profile_sha256"
+    if (type(identity) is not str or (mode is NASStitchMode.NATIVE and
+            (str(uuid.UUID(identity)) != identity or uuid.UUID(identity).int == 0)) or
+            (mode is NASStitchMode.READBACK and re.fullmatch(r"[a-f0-9]{64}",identity) is None)):
+        raise StitchHold("exact evidence admission identity required")
+    value = stitch_proof_request(cfg,"/account/connections/stitch/evidence/admission?"+parameter+"="+identity,stop)
+    required = {"schema","mode","expires_at","profiles"}
+    if mode is NASStitchMode.NATIVE:
+        required |= {"task","native_run_id"}
+    if (type(value) is not dict or set(value) != required or value["schema"] != "stoarama.nas-stitch-admission.v1"
+            or type(value["mode"]) is not int or value["mode"] != int(mode)):
+        raise StitchReadbackIntegrity("evidence admission protocol differs")
+    expiry = parse_certification_timestamp(value["expires_at"],"evidence expiry")
+    if expiry <= datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30):
+        raise StitchHold("evidence admission expired")
+    if mode is NASStitchMode.NATIVE:
+        stitch_proof_check(value["task"])
+        if value["native_run_id"] != identity or value["task"]["expires_at"] != value["expires_at"]:
+            raise StitchReadbackIntegrity("original native admission differs")
+    stitch_evidence_profiles(value)
+    return value
+
+
+def stitch_evidence_profiles(context):
+    value = context["profiles"]
+    names = ("producer_profile","reader_profile","profile_pair")
+    if type(value) is not dict or set(value) != {n+s for n in names for s in ("_sha256","_b64")}:
+        raise StitchReadbackIntegrity("evidence profile component fields differ")
+    bodies,digests = [],[]
+    for name in names:
+        encoded,digest = value[name+"_b64"],value[name+"_sha256"]
+        if type(encoded) is not str or not 0 < len(encoded) <= 87384:
+            raise StitchReadbackIntegrity("bounded evidence profile required")
+        try:
+            raw = base64.b64decode(encoded,validate=True)
+        except (ValueError,binascii.Error):
+            raise StitchReadbackIntegrity("evidence profile encoding differs") from None
+        if (not 0 < len(raw) <= 65536 or base64.b64encode(raw).decode("ascii") != encoded
+                or type(digest) is not str or re.fullmatch(r"[a-f0-9]{64}",digest) is None
+                or hashlib.sha256(raw).hexdigest() != digest):
+            raise StitchReadbackIntegrity("evidence profile bytes differ")
+        bodies.append(raw);digests.append(digest)
+    return StitchProfileBytes(*bodies),StitchProfileKey(*digests)
+
+
+def stitch_evidence_native(cfg, inventory, event, ledger, execution):
+    native = ledger.state["native"]
+    if native["stage"] == StitchNativeEvidenceStage.REGISTERED.value:
+        return
+    if "admission_sha256" in ledger.state["window"]:
+        # Never retry an interrupted/failed native workspace automatically. Its
+        # original audits/output remain untouched. A new OFF->ON operation gets
+        # a distinct run namespace, not a refreshed lease/deadline on this run.
+        raise StitchHold("native attempt already entered; new reviewed activation required")
+    stop = StitchReadbackStop(cfg,event,ledger.state["window"]["expires_at"])
+    context = stitch_evidence_admission(cfg,stop,NASStitchMode.NATIVE,str(uuid.uuid4()))
+    raw_profiles,key = stitch_evidence_profiles(context)
+    actual = StitchClientIdentity(execution["client_artifact_sha256"],execution["client_artifact_size_bytes"],CLIENT_VERSION)
+    stitch_readback_profiles(raw_profiles,key,actual,NASStitchMode.NATIVE)
+    stitch_check(stop)
+    ledger.bind_admission(cleanup_json_bytes(context));ledger.prepare_native(context)
+    task = context["task"]
+    stop = StitchStop(cfg,event,task,StitchRunKind.PROOF)
+    stop.run_id,stop.evidence_context = context["native_run_id"],context
+    stop.deadline = min(stop.deadline,ledger.native_deadline(datetime.datetime.now(datetime.timezone.utc)))
+    try:
+        stitch_proof_client(cfg,stop);stitch_proof_space(cfg,task,stop)
+        with stitch_measure_stage(stop,StitchMeasureStage.SETUP),stitch_proof_activity(inventory,stop):
+            stop.refresh();stitch_check(stop);stitch_resources(cfg,22620379)
+            stitch_corpus(cfg,stop)
+            tools = stitch_v85r_tools(cfg,min(stop.deadline,time.monotonic()+BENCHMARK_TOOL_INSTALL_SEC),stop)
+            stitch_check(stop)
+            STITCH_STATUS.update(kind=STITCH_PROOF_KIND,state="proof_working",started_at=stop.started_at,
+                run_id=stop.run_id,plan_sha256=task["plan_sha256"])
+            with stitch_measure_stage(stop,StitchMeasureStage.BUILD):
+                stitch_build(cfg,inventory,task,event,tools,kind=StitchRunKind.PROOF,proof_stop=stop)
+        # This reads only the durable metadata produced above. No media read,
+        # tool invocation, source check or acceptance refresh follows OFF.
+        _,body = stitch_readback_file(cfg.output_dir,task["plan"]["output_folder"]+"/receipt.json.gz",1024*1024,event,retain=True)
+        ledger.register_native(body)
+        STITCH_STATUS.update(state="proof_registered_locally",run_id=stop.run_id,
+            receipt_sha256=hashlib.sha256(body).hexdigest(),plan_sha256=task["plan_sha256"])
+    except BaseException:
+        ledger.fail_native()
+        raise
+
+
+def stitch_evidence_readback(cfg,event,ledger,execution):
+    native = ledger.state["native"]
+    if native["stage"] != StitchNativeEvidenceStage.REGISTERED.value:
+        raise StitchHold("preserved native registration required; no native fallback")
+    original = stitch_proof_json(ledger.store.read(native["context_sha256"]))
+    bundle = ledger.store.read(native["bundle_sha256"])
+    task_raw = cleanup_json_bytes(original["task"])
+    mode = NASStitchMode(ledger.state["mode"])
+    stop = StitchReadbackStop(cfg,event,(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=120)).isoformat())
+    if mode is NASStitchMode.NATIVE:
+        context = original
+        stop.deadline = min(stop.deadline,ledger.native_deadline(datetime.datetime.now(datetime.timezone.utc)))
+    else:
+        context = stitch_evidence_admission(cfg,stop,mode,original["profiles"]["producer_profile_sha256"])
+        stop.deadline = min(stop.deadline,time.monotonic()+(parse_certification_timestamp(context["expires_at"],"readback expiry")
+            -datetime.datetime.now(datetime.timezone.utc)).total_seconds()-30)
+    raw_profiles,key = stitch_evidence_profiles(context)
+    session = dict(native_run_id=native["run_id"],producer_profile_sha256=key.producer,reader_profile_sha256=key.reader,
+        profile_pair_sha256=key.pair,reader_boot_id=execution["client_boot_id"])
+    ledger.bind_session(session)
+    STITCH_STATUS.update(state="readback_working")
+    body = stitch_readback_run(cfg,stop,raw_profiles,key,task_raw,bundle)
+    result = stitch_proof_json(body)
+    if result["reader_execution"] != execution:
+        raise StitchReadbackIntegrity("current reader execution changed during readback")
+    stitch_check(stop)
+    ledger.complete_readback(body)
+    for kind,component in ((StitchEvidenceKind.NATIVE,bundle),(StitchEvidenceKind.TASK,task_raw),
+            (StitchEvidenceKind.PRODUCER,raw_profiles.producer),(StitchEvidenceKind.READER,raw_profiles.reader),
+            (StitchEvidenceKind.PAIR,raw_profiles.pair),(StitchEvidenceKind.READBACK,body)):
+        ledger.enqueue(StitchEvidenceKey(kind,native["run_id"],original["task"]["plan_sha256"],key.pair,result["id"]),component)
+    STITCH_STATUS.clear_error();STITCH_STATUS.update(state="readback_verified")
+
+
+def stitch_evidence_status(ledger,execution):
+    value = dict(schema="stoarama.nas-stitch-reader-status.v1",reader_execution=execution,
+        integrity=ledger.state["integrity"],history=list(ledger.history))
+    if ledger.state["native"]["stage"] == StitchNativeEvidenceStage.REGISTERED.value and ledger.state["session"]:
+        native,session = ledger.state["native"],ledger.state["session"]
+        cache_key = (native["context_sha256"],native["bundle_sha256"],tuple(sorted(session.items())))
+        cached = getattr(ledger,"native_status_cache",None)
+        if cached is not None and cached[0] == cache_key:
+            value["native"] = stitch_proof_json(cached[1])
+            if len(cleanup_json_bytes(value))>6000:
+                raise StitchReadbackIntegrity("reader status exceeds heartbeat bound")
+            return value
+        context = stitch_proof_json(ledger.store.read(native["context_sha256"]))
+        bundle = ledger.store.read(native["bundle_sha256"])
+        receipt = stitch_proof_unpack(bundle)
+        # Shared metadata is immutable native evidence, not a fresh media read.
+        raw_profiles,key = stitch_evidence_profiles(context)
+        producer,reader,pair = (stitch_proof_json(raw) for raw in raw_profiles)
+        value["native"] = dict(run_id=native["run_id"],bundle_sha256=native["bundle_sha256"],
+            plan_sha256=receipt["plan_sha256"],task_sha256=hashlib.sha256(cleanup_json_bytes(context["task"])).hexdigest(),
+            result_sha256=hashlib.sha256(cleanup_json_bytes(receipt["result"])).hexdigest(),
+            producer_profile_sha256=session["producer_profile_sha256"],reader_profile_sha256=session["reader_profile_sha256"],
+            profile_pair_sha256=session["profile_pair_sha256"],registration_sha256=stitch_readback_registration(bundle),
+            outputs=[{name:o[name] for name in ("relative_path","sha256","size_bytes")} for o in receipt["result"]["outputs"]],
+            policy=producer["policy"],tools=producer["tools"])
+        ledger.native_status_cache = (cache_key,cleanup_json_bytes(value["native"]))
+    if len(cleanup_json_bytes(value))>6000:
+        raise StitchReadbackIntegrity("reader status exceeds heartbeat bound")
+    return value
+
+
+def stitch_evidence_reconcile(cfg,event,ledger):
+    native = ledger.state["native"]
+    if native["stage"] not in (StitchNativeEvidenceStage.PREPARED.value,StitchNativeEvidenceStage.FAILED.value):
+        return
+    context = stitch_proof_json(ledger.store.read(native["context_sha256"]))
+    relative = context["task"]["plan"]["output_folder"]+"/receipt.json.gz"
+    try:
+        _,body = stitch_readback_file(cfg.output_dir,relative,1024*1024,event,retain=True)
+    except StitchReadbackIntegrity as exc:
+        if isinstance(exc.__cause__,FileNotFoundError):
+            ledger.fail_native()
+            return
+        raise
+    # Adopt only complete already-published metadata. Actual preserved output
+    # hashing still requires a new active readback; startup accepts no history.
+    ledger.register_native(body)
+
+
+def stitch_evidence_invalidate():
+    # An unavailable store/identity must immediately remove the prior positive
+    # heartbeat subtree. This deliberately incomplete negative observation can
+    # never satisfy the server's required actual reader/native identity fields.
+    STITCH_STATUS.update(stitch_reader=dict(schema="stoarama.nas-stitch-reader-status.v1",
+        integrity="refused",history=[]))
+
+
+def stitch_evidence_loop(cfg,inventory,event):
+    pacer = StitchEvidencePacer()
+    log("INFO","proof reader inventory configuration interval_sec=%d hash_mibps=%d delay_ms=%d" %
+        (cfg.inventory_scan_interval_sec,cfg.inventory_hash_mbps,cfg.inventory_scan_delay_ms))
+    while not event.is_set():
+        try:
+            execution = stitch_evidence_identity(cfg,StitchEvidenceStop(event))
+            with StitchEvidenceDirectory(cfg,event) as store:
+                ledger = StitchEvidenceLedger(store)
+                stitch_evidence_reconcile(cfg,event,ledger)
+                while not event.is_set():
+                    retry = 1
+                    try:
+                        mode = cfg.stitch_switches.proof[0]
+                        ledger.observe_mode(mode,datetime.datetime.now(datetime.timezone.utc),execution["client_boot_id"])
+                        if cfg.stitch_enabled:
+                            if mode is not NASStitchMode.DISABLED:
+                                raise StitchHold("ordinary and proof modes conflict")
+                            STITCH_ACTIVE.set()
+                            try:
+                                retry = stitch_once(cfg,inventory,event)
+                            finally:
+                                STITCH_ACTIVE.clear()
+                        elif ledger.due():
+                            STITCH_ACTIVE.set()
+                            try:
+                                if mode is NASStitchMode.NATIVE:
+                                    stitch_evidence_native(cfg,inventory,event,ledger,execution)
+                                stitch_evidence_readback(cfg,event,ledger,execution)
+                            finally:
+                                STITCH_ACTIVE.clear()
+                    except StitchReadbackIntegrity:
+                        ledger.refuse();STITCH_STATUS.fail("proof reader integrity refused")
+                    except Exception as exc:
+                        retry = 60
+                        ledger.hold();STITCH_STATUS.update(state="paused")
+                        STITCH_STATUS.fail("proof reader HOLD: "+stitch_measure_error(exc).value)
+                    STITCH_STATUS.update(stitch_reader=stitch_evidence_status(ledger,execution))
+                    if ledger.state["queue"]:
+                        item = dict(ledger.state["queue"][0])
+                        try:
+                            key = StitchEvidenceKey(StitchEvidenceKind(item["kind"]),item["native_run"],item["plan"],item["pair"],item["readback"])
+                            body = store.read(item["blob_sha256"])
+                            progress = stitch_evidence_send(cfg,pacer,key,body,item["cursor"],execution["client_boot_id"],event)
+                            ledger.acknowledge(item,progress)
+                        except StitchReadbackIntegrity:
+                            ledger.refuse();raise
+                        except Exception as exc:
+                            STITCH_STATUS.fail("evidence transport HOLD: "+stitch_measure_error(exc).value)
+                    event.wait(60 if ledger.state["integrity"] == "refused" else retry)
+        except Exception as exc:
+            stitch_evidence_invalidate()
+            STITCH_STATUS.fail("proof reader unavailable: "+stitch_measure_error(exc).value)
+            event.wait(60)
+
 def stitch_proof_unpack(body):
     decoder = zlib.decompressobj(16+zlib.MAX_WBITS)
     raw = decoder.decompress(body,16*1024*1024+1)
@@ -49585,6 +50191,9 @@ def stitch_loop(cfg, inventory, stop_event):
         reason = ("proof priority failed: " + stitch_measure_error(exc).value) if cfg.stitch_proof_enabled else str(exc)
         STITCH_STATUS.fail(reason)
         log("ERROR", "V85r stitch lane disabled: %s" % reason)
+        return
+    if CLIENT_VERSION == "r2-copy-v3":
+        stitch_evidence_loop(cfg,inventory,stop_event)
         return
     while not stop_event.is_set():
         retry = 60

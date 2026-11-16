@@ -101,12 +101,11 @@ class ProofHTTPTests(unittest.TestCase):
         child.poll=lambda:child.returncode
         def kill():child.returncode=-9
         child.kill=kill
-        def communicate(input=None,timeout=None):
-            if child.returncode is not None:return None,None
-            observed.append((json.loads(input),timeout))
+        def send(process,message,current_stop,deadline):
+            observed.append((json.loads(message),min(.2,deadline-time.monotonic())))
             clock[0]=stop.deadline-pull.STITCH_PROOF_HTTP_REAP_SEC+.01
-            raise subprocess.TimeoutExpired("synthetic child",timeout)
-        child.communicate=communicate
+        child.send=send
+        child.wait=lambda timeout:child.returncode
         return child
 
     def test_near_expiry_checkpoint_clamps_total_budget_and_releases_lock(self):
@@ -115,6 +114,7 @@ class ProofHTTPTests(unittest.TestCase):
         lock=threading.RLock()
         with mock.patch.object(pull.time,"monotonic",side_effect=lambda:clock[0]), \
                 mock.patch.object(pull.subprocess,"Popen",return_value=child) as spawn, \
+                mock.patch.object(pull,"stitch_proof_input",side_effect=child.send), \
                 mock.patch.object(pull,"stitch_resources"),mock.patch.object(pull,"stitch_proof_space"):
             with self.assertRaises(pull.StitchHold):
                 with pull.stitch_proof_activity(SimpleNamespace(activity_lock=lock),stop):
@@ -135,6 +135,7 @@ class ProofHTTPTests(unittest.TestCase):
             waits.append(kwargs["timeout"]);return real_connect(*args,**kwargs)
         with mock.patch.object(pull.time,"monotonic",side_effect=lambda:clock[0]), \
                 mock.patch.object(pull.subprocess,"Popen",return_value=child), \
+                mock.patch.object(pull,"stitch_proof_input",side_effect=child.send), \
                 mock.patch.object(pull.sqlite3,"connect",side_effect=connect):
             with self.assertRaises(pull.BenchmarkDeadline):pull.stitch_corpus(self.cfg,stop)
         self.assertLessEqual(waits[0],pull.STITCH_PROOF_HTTP_REAP_SEC+.011)

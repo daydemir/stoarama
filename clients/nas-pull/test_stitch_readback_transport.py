@@ -18,6 +18,7 @@ import test_stitch_proof_http as transport
 
 pull = transport.pull
 ID = "11111111-1111-4111-8111-111111111111"
+REAL_MONOTONIC = time.monotonic
 
 
 class EvidenceTransportTests(unittest.TestCase):
@@ -104,6 +105,31 @@ class EvidenceTransportTests(unittest.TestCase):
             with self.assertRaises((pull.StitchHold,pull.BenchmarkDeadline)):
                 with pull.stitch_bounded_http(self.cfg,request,stop,4096,20):pass
             spawn.assert_not_called()
+
+    def test_real_partial_stdin_backpressure_beyond_poll_interval_still_delivers_exact_ack(self):
+        child="import time;time.sleep(.35)\n"+self.child(dict(ok=True,stored_lines=64))
+        with mock.patch.object(pull.time,"monotonic",REAL_MONOTONIC),mock.patch.object(pull,"STITCH_PROOF_HTTP_CHILD",child):
+            self.pacer.allowed_at=REAL_MONOTONIC()
+            result=self.send()
+        self.assertEqual(result,pull.StitchEvidenceProgress(pull.StitchEvidenceDispatch.ACKNOWLEDGED,64))
+        self.assertEqual(list(self.cfg.state_dir.iterdir()),[])
+
+    def test_nonreading_stdin_cannot_outlive_original_deadline_and_child_is_reaped(self):
+        children=[];spawn=pull.subprocess.Popen
+        def capture(*args,**kwargs):
+            child=spawn(*args,**kwargs);children.append(child);return child
+        request=urllib.request.Request(self.cfg.api_base+"/account/connections/client-logs",method="POST",data=b"x"*(128*1024))
+        with mock.patch.object(pull.time,"monotonic",REAL_MONOTONIC),\
+                mock.patch.object(pull,"STITCH_PROOF_HTTP_CHILD","import time;time.sleep(30)"),\
+                mock.patch.object(pull.subprocess,"Popen",side_effect=capture) as factory:
+            stop=pull.StitchEvidenceStop(threading.Event());stop.deadline=REAL_MONOTONIC()+2.5
+            started=REAL_MONOTONIC()
+            with self.assertRaises((pull.StitchHold,pull.BenchmarkDeadline)):
+                with pull.stitch_bounded_http(self.cfg,request,stop,4096,20):pass
+            self.assertLess(REAL_MONOTONIC()-started,3)
+        self.assertEqual(len(children),1);self.assertIsNotNone(children[0].poll())
+        self.assertNotIn("SYNTHETIC_TOKEN",repr(factory.call_args.args))
+        self.assertEqual(list(self.cfg.state_dir.iterdir()),[])
 
 
 class EvidenceStorageTests(unittest.TestCase):

@@ -91,6 +91,14 @@ func nasStitchReadbackTools() stitchproof.PayloadTools {
 	}
 }
 
+func validNASStitchReaderExecution(r nasStitchReaderExecution) bool {
+	return r.ConnectionID == 13 && r.AccountID == 47 && nasStitchReadbackUUID(r.BootID) &&
+		r.Version == nasCleanupR2CopyControlClientVersion && stitchSHA(r.ArtifactSHA) && r.ArtifactSize > 0 && r.ArtifactSize <= 8*1024*1024 &&
+		r.Host.ConnectionID == 13 && r.Host.System == "Linux" && r.Host.Machine == "x86_64" && r.Host.CpuCount > 0 &&
+		r.Host.CpuCount <= 4096 && r.Host.CpuModel != "" && len(r.Host.CpuModel) <= 2048 &&
+		strings.IndexFunc(r.Host.CpuModel, func(r rune) bool { return r < 32 || r == 127 }) < 0
+}
+
 func decodeNASStitchReadback(raw []byte) (nasStitchReadbackReceipt, error) {
 	var receipt nasStitchReadbackReceipt
 	if len(raw) == 0 || len(raw) > 65536 || stitchproof.DecodeExact(raw, &receipt) != nil {
@@ -106,9 +114,7 @@ func decodeNASStitchReadback(raw []byte) (nasStitchReadbackReceipt, error) {
 		}
 	}
 	r := receipt.Reader
-	if r.ConnectionID != 13 || r.AccountID != 47 || !nasStitchReadbackUUID(r.BootID) || r.Version != nasCleanupR2CopyControlClientVersion ||
-		r.ArtifactSize <= 0 || r.ArtifactSize > 8*1024*1024 || r.Host.ConnectionID != 13 || r.Host.System != "Linux" ||
-		r.Host.Machine != "x86_64" || r.Host.CpuCount <= 0 || r.Host.CpuCount > 4096 || r.Host.CpuModel == "" || len(r.Host.CpuModel) > 2048 {
+	if !validNASStitchReaderExecution(r) {
 		return receipt, errors.New("readback executing reader identity differs")
 	}
 	if len(receipt.Outputs) != 1 {
