@@ -1,5 +1,7 @@
 """SYNTHETIC contract examples only; no app import, media or authority export."""
 import ast
+import base64
+import binascii
 import copy
 import datetime
 from enum import Enum, IntEnum
@@ -42,7 +44,8 @@ def load_contract():
              "stitch_proof_unpack", "stitch_proof_validate", "stitch_proof_success",
              "StitchEvidenceKind", "StitchEvidenceKey", "stitch_evidence_chunks", "StitchEvidencePacer",
              "StitchEvidenceSnapshot", "StitchNativeEvidenceStage", "stitch_evidence_index",
-             "StitchEvidenceLedger", "StitchEvidenceDispatch", "StitchEvidenceProgress"}
+             "StitchEvidenceLedger", "StitchEvidenceDispatch", "StitchEvidenceProgress",
+             "stitch_evidence_task", "parse_certification_timestamp", "MediaCertificationError"}
     constants = {"STITCH_READBACK_SCHEMA_SHA", "STITCH_READBACK_SCHEMA_JSON",
                  "STITCH_PROOF_SCHEMA_SHA", "STITCH_PROOF_SCHEMA_JSON", "V85R_MANIFEST_SHA",
                  "STITCH_POLICY", "STITCH_REVISION", "STITCH_CORPUS_SHA", "STITCH_PROOF_SOURCE_SHA",
@@ -51,7 +54,7 @@ def load_contract():
     namespace = dict(StitchHold=Hold, Enum=Enum, IntEnum=IntEnum, hashlib=hashlib, json=json, re=re,
                      datetime=datetime, threading=threading, NamedTuple=NamedTuple,
                      env_str=lambda key, default: default, os=os, stat_module=stat, Path=Path,
-                     time=time, uuid=uuid, zlib=zlib)
+                     time=time, uuid=uuid, zlib=zlib, base64=base64, binascii=binascii)
     selected = []
     for node in ast.parse(SOURCE).body:
         if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names:
@@ -635,9 +638,14 @@ class SyntheticMemoryEvidenceStore:
 class EvidenceLedgerTests(unittest.TestCase):
     def setUp(self):
         self.old=dict(CORE);self.clock=100.0
-        CORE.update(time=SimpleNamespace(monotonic=lambda:self.clock,monotonic_ns=lambda:int(self.clock*10**9)),utc_now_precise=lambda:UTC)
-        self.store=SyntheticMemoryEvidenceStore();self.ledger=CORE["StitchEvidenceLedger"](self.store)
         self.now=datetime.datetime.fromisoformat(UTC.replace("Z","+00:00"))
+        now=self.now
+        class FrozenDatetime(datetime.datetime):
+            @classmethod
+            def now(cls,tz=None):return now
+        CORE.update(time=SimpleNamespace(monotonic=lambda:self.clock,monotonic_ns=lambda:int(self.clock*10**9)),utc_now_precise=lambda:UTC,
+                    datetime=SimpleNamespace(datetime=FrozenDatetime,timezone=datetime.timezone,timedelta=datetime.timedelta))
+        self.store=SyntheticMemoryEvidenceStore();self.ledger=CORE["StitchEvidenceLedger"](self.store)
 
     def tearDown(self):
         CORE.clear();CORE.update(self.old)
@@ -652,7 +660,10 @@ class EvidenceLedgerTests(unittest.TestCase):
         self.ledger.observe_mode(mode.NATIVE,self.now, ID,ID)
         expiry=self.ledger.state["window"]["expires_at"]
         self.ledger.enter_native()
-        original=b'{"explicitly_synthetic":"original admission"}'
+        task=dict(expires_at=expiry,explicitly_synthetic="original admission")
+        raw=CORE["cleanup_json_bytes"](task)
+        original=CORE["cleanup_json_bytes"](dict(task=task,task_b64=base64.b64encode(raw).decode("ascii"),
+            task_sha256=hashlib.sha256(raw).hexdigest()))
         self.assertEqual(self.ledger.bind_admission(original),original)
         self.ledger.observe_mode(mode.NATIVE,self.now+datetime.timedelta(minutes=10), ID,ID)
         self.assertEqual(self.ledger.state["window"]["expires_at"],expiry)

@@ -240,6 +240,70 @@ class WorkerTests(unittest.TestCase):
             pull.stitch_evidence_readback(self.cfg,self.event,self.ledger,self.execution)
         self.assertEqual(calls,["budget","context"])
 
+    def test_short_original_task_cut_survives_restart_and_bounds_only_native_readback(self):
+        origin=2**60+12345;clock=[origin]
+        real_datetime=datetime.datetime
+        now=[real_datetime(2026,11,16,tzinfo=datetime.timezone.utc)]
+        class FrozenDatetime(real_datetime):
+            @classmethod
+            def now(cls,tz=None):return now[0]
+        with mock.patch.object(pull.datetime,"datetime",FrozenDatetime),\
+                mock.patch.object(pull.time,"monotonic_ns",side_effect=lambda:clock[0]),\
+                mock.patch.object(pull,"stitch_resources"):
+            context=copy.deepcopy(self.context)
+            context["expires_at"]=context["task"]["expires_at"]=(now[0]+datetime.timedelta(seconds=40)).isoformat().replace("+00:00","Z")
+            task_raw=pull.cleanup_json_bytes(context["task"])
+            context.update(task_b64=base64.b64encode(task_raw).decode("ascii"),task_sha256=hashlib.sha256(task_raw).hexdigest())
+            for mode,budget in ((pull.NASStitchMode.NATIVE,10),(pull.NASStitchMode.READBACK,90)):
+                with self.subTest(mode=mode):
+                    clock[0]=origin
+                    store=fixtures.SyntheticMemoryEvidenceStore();ledger=pull.StitchEvidenceLedger(store)
+                    with mock.patch.object(pull.uuid,"uuid4",return_value=pull.uuid.UUID(ID)):
+                        ledger.observe_mode(pull.NASStitchMode.NATIVE,now[0],ID,ID)
+                    ledger.enter_native();ledger.bind_admission(pull.cleanup_json_bytes(context));ledger.prepare_native(context)
+                    ledger.register_native(self.bundle)
+                    preserved=copy.deepcopy(ledger.state["window"])
+                    ledger=pull.StitchEvidenceLedger(store)
+                    ledger.observe_mode(mode,now[0],ID,ID if mode is pull.NASStitchMode.NATIVE else "")
+                    self.assertEqual(ledger.state["window"],preserved)
+                    self.cfg.stitch_switches.apply(dict(ok=True,stitch_proof_task_id=int(mode),stitch_proof_activation_id=ID))
+                    def inspect(_cfg,stop,*_args):
+                        self.assertEqual(stop.deadline_ns,origin+budget*10**9)
+                        clock[0]=stop.deadline_ns-1;self.assertFalse(stop.is_set())
+                        clock[0]+=1;self.assertTrue(stop.is_set())
+                        raise RuntimeError("SYNTHETIC inspected bounded readback")
+                    renewed=dict(schema="stoarama.nas-stitch-admission.v1",mode=2,
+                        expires_at=(now[0]+datetime.timedelta(seconds=120)).isoformat(),profiles=context["profiles"])
+                    with mock.patch.object(pull,"stitch_evidence_admission",return_value=renewed) as admission,\
+                            mock.patch.object(pull,"stitch_readback_run",side_effect=inspect),\
+                            self.assertRaisesRegex(RuntimeError,"SYNTHETIC inspected"):
+                        pull.stitch_evidence_readback(self.cfg,self.event,ledger,self.execution)
+                    self.assertEqual(admission.call_count,int(mode is pull.NASStitchMode.READBACK))
+
+    def test_short_original_task_cut_cannot_be_renewed_by_rebinding_or_clock_rollback(self):
+        origin=2**60+12345;clock=[origin]
+        real_datetime=datetime.datetime
+        now=[real_datetime(2026,11,16,tzinfo=datetime.timezone.utc)]
+        class FrozenDatetime(real_datetime):
+            @classmethod
+            def now(cls,tz=None):return now[0]
+        with mock.patch.object(pull.datetime,"datetime",FrozenDatetime),\
+                mock.patch.object(pull.time,"monotonic_ns",side_effect=lambda:clock[0]):
+            context=copy.deepcopy(self.context)
+            context["expires_at"]=context["task"]["expires_at"]=(now[0]+datetime.timedelta(seconds=40)).isoformat().replace("+00:00","Z")
+            task_raw=pull.cleanup_json_bytes(context["task"])
+            context.update(task_b64=base64.b64encode(task_raw).decode("ascii"),task_sha256=hashlib.sha256(task_raw).hexdigest())
+            ledger=pull.StitchEvidenceLedger(fixtures.SyntheticMemoryEvidenceStore())
+            with mock.patch.object(pull.uuid,"uuid4",return_value=pull.uuid.UUID(ID)):
+                ledger.observe_mode(pull.NASStitchMode.NATIVE,now[0],ID,ID)
+            ledger.enter_native();ledger.bind_admission(pull.cleanup_json_bytes(context))
+            captured=copy.deepcopy(ledger.state["window"])
+            clock[0]+=10*10**9;now[0]-=datetime.timedelta(days=1)
+            ledger.bind_admission(pull.cleanup_json_bytes(context))
+            self.assertEqual(ledger.state["window"],captured)
+            with self.assertRaisesRegex(pull.StitchHold,"original native window expired"):
+                ledger.native_deadline_ns(now[0])
+
     def test_off_still_drains_durable_metadata_without_native_or_output_read(self):
         key=pull.StitchEvidenceKey(pull.StitchEvidenceKind.READBACK,ID,"a"*64,"b"*64,ID)
         self.ledger.enqueue(key,b"SYNTHETIC")

@@ -155,7 +155,10 @@ all older workspaces. One original activation UUID, window and admission are sav
 before native work. The deadline is the earliest original window/task expiry,
 with the30-second margin and an absolute14m30s cap. Its original monotonic
 deadline and boot are persisted; a wall-clock rollback cannot extend it, and a
-changed boot refuses the window. A refresh/restart cannot extend it. An interrupted or failed attempt is not automatically reentered;
+changed boot refuses the window. Capturing admission can only shorten that
+persisted limit to the task expiry. Mode1's immediate readback shares this cut;
+mode2 renewal keeps its own bounded budget for preserved historical output.
+A refresh/restart cannot extend it. An interrupted or failed attempt is not automatically reentered;
 a fresh reviewed activation UUID uses another run directory. Startup may
 adopt a complete already-published registration, reading metadata only. This
 neither replays native work nor accepts output integrity on startup.

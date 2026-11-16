@@ -49772,8 +49772,17 @@ class StitchEvidenceLedger:
             if hashlib.sha256(raw).hexdigest() != window["admission_sha256"]:
                 raise StitchReadbackIntegrity("original native admission cannot be replaced")
             return self.store.read(window["admission_sha256"])
+        context = stitch_proof_json(raw)
+        stitch_evidence_task(context)
+        task_deadline_ns = time.monotonic_ns()+stitch_delta_ns(
+            parse_certification_timestamp(context["task"]["expires_at"],"original task expiry")
+            -datetime.datetime.now(datetime.timezone.utc))
         digest = self.store.put(raw)
-        value = self.copy();value["window"]["admission_sha256"] = digest;self.commit(value)
+        value = self.copy();value["window"]["admission_sha256"] = digest
+        # Persist the tighter original task cut before native work. Mode 1
+        # readback and restart retain it; mode 2 reads preserved history only.
+        value["window"]["deadline_monotonic_ns"] = min(window["deadline_monotonic_ns"],task_deadline_ns)
+        self.commit(value)
         return raw
 
     def original_admission(self):
