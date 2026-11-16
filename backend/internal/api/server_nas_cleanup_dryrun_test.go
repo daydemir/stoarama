@@ -202,7 +202,7 @@ func TestNASCleanupExpiredLeasesSweptWithoutLeaseAndDuplicateIDsTolerated(t *tes
 	f.admit("stall-1", syntheticFiles(100, 3, 10))
 	tasks := f.leaseV2(64, 0, 0, "")
 	// Duplicate item id in one request: processed once, same answer twice.
-	o := map[string]any{"item_id": tasks[0].ItemID, "attempt": tasks[0].Attempt, "plan_sha256": tasks[0].PlanSHA, "outcome": "match", "proof": fixtureProof(tasks[0].Item), "error": "", "request_id": strings.Repeat("a", 32)}
+	o := map[string]any{"item_id": tasks[0].ItemID, "attempt": tasks[0].Attempt, "plan_sha256": tasks[0].PlanSHA, "outcome": "match", "proof": fixtureProof(tasks[0].Item), "error": "", "client_version": nasCleanupExecutionClientVersion, "request_id": strings.Repeat("a", 32)}
 	w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "observations": []map[string]any{o, o}})
 	if w.Code != 200 || strings.Count(w.Body.String(), `"would_delete"`) != 2 {
 		t.Fatalf("duplicate ids: %d %s", w.Code, w.Body.String())
@@ -236,7 +236,7 @@ func TestNASCleanupConflictingDuplicatesAreRefused(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	f.admit("dups-1", syntheticFiles(100, 1, 10))
 	tasks := f.leaseV2(64, 0, 0, "")
-	o := map[string]any{"item_id": tasks[0].ItemID, "attempt": tasks[0].Attempt, "plan_sha256": tasks[0].PlanSHA, "outcome": "match", "proof": fixtureProof(tasks[0].Item), "error": "", "request_id": strings.Repeat("a", 32)}
+	o := map[string]any{"item_id": tasks[0].ItemID, "attempt": tasks[0].Attempt, "plan_sha256": tasks[0].PlanSHA, "outcome": "match", "proof": fixtureProof(tasks[0].Item), "error": "", "client_version": nasCleanupExecutionClientVersion, "request_id": strings.Repeat("a", 32)}
 	other := map[string]any{}
 	for k, v := range o {
 		other[k] = v

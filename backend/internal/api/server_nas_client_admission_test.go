@@ -241,3 +241,94 @@ func TestNASClientAdmissionProofRefusesUnstampedAndPreservesOFF(t *testing.T) {
 		}
 	}
 }
+
+// Persist the old handler's accepted payload through the unchanged transaction
+// primitive, so replay tests cover an actual pre-fix issued outcome without
+// disabling any authority or immutability guard.
+func seedLegacyBatchPermit(t *testing.T, f *cleanupFixture, task cleanupTask, observation cleanupObserve) {
+	t.Helper()
+	fresh, err := f.s.cleanupRegisterObservation(f.ctx, observation.RequestID, task.ItemID)
+	if err != nil || !fresh {
+		t.Fatalf("legacy history fixture: %t %v", fresh, err)
+	}
+	prefetched := f.s.cleanupPrefetchRecovery(f.ctx, 13, map[int64]string{task.ItemID: ""})
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(f.ctx)
+	result := f.s.cleanupObserveOne(f.ctx, tx, 13, task.ItemID, observation, &cleanupObserveEnv{
+		session:       cleanupClientSession{boot: "fixture-boot", version: f.version},
+		freshRequests: map[int64]bool{task.ItemID: true}, prefetched: prefetched,
+	})
+	if result.status != 200 || !result.write || result.body["delete"] != true {
+		t.Fatalf("legacy issued fixture: %+v", result)
+	}
+	if err := tx.Commit(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNASClientAdmissionBatchChildVersion(t *testing.T) {
+	for _, mode := range []string{"fresh", "issued-replay", "mixed"} {
+		for _, version := range []string{"development", "", nasCleanupProofClientVersion} {
+			t.Run(mode+"/"+version, func(t *testing.T) {
+				f := newCleanupFixture(t, 1)
+				count := 1
+				if mode == "mixed" {
+					count = 2
+				}
+				id, sha, _ := f.admit("nested-admission", syntheticFiles(920, count, 1))
+				if mode != "mixed" {
+					f.dryRun()
+					f.s.cfg.NASCleanupDeletionEnabled = true
+					if code, body := f.enableBatch([]int64{id}, []string{sha}, 1); code != http.StatusOK {
+						t.Fatalf("enable: %d %s", code, body)
+					}
+				}
+				tasks := f.leaseV2(count, count, 1<<30, "")
+				if len(tasks) != count {
+					t.Fatalf("lease count: %d", len(tasks))
+				}
+				observations := make([]cleanupBatchObservation, len(tasks))
+				for n, task := range tasks {
+					observations[n] = cleanupBatchObservation{ItemID: task.ItemID, cleanupObserve: cleanupObserve{
+						Attempt: task.Attempt, PlanSHA: sha, ReconciliationProtocol: nasCleanupReconciliationProtocol,
+						Outcome: "match", Proof: fixtureProof(task.Item), ClientVersion: f.version, RequestID: fmt.Sprintf("%032x", n+1),
+					}}
+				}
+				observations[len(observations)-1].ClientVersion = version
+				if mode == "issued-replay" {
+					seedLegacyBatchPermit(t, f, tasks[0], observations[0].cleanupObserve)
+				}
+				snapshot := func() string {
+					t.Helper()
+					var rows string
+					if err := f.pool.QueryRow(f.ctx, `SELECT jsonb_agg(to_jsonb(i) ORDER BY id)::text FROM nas_cleanup_items i WHERE plan_id=$1`, id).Scan(&rows); err != nil {
+						t.Fatal(err)
+					}
+					return rows
+				}
+				before := snapshot()
+				var history int
+				if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM nas_cleanup_observation_requests`).Scan(&history); err != nil {
+					t.Fatal(err)
+				}
+				gets, heads := f.bucket.counts()
+				out := admissionCall(t, f, f.s.handleAccountNASCleanupObserveBatch, http.MethodPost, "/api/v1/account/connections/cleanup/observe-batch", 0,
+					map[string]any{"client_version": f.version, "observations": observations}, []string{"stoarama-nas-pull/" + f.version}, "fixture-boot "+f.version)
+				if out.Code != http.StatusConflict || strings.Contains(out.Body.String(), `"delete":true`) {
+					t.Fatalf("nested version borrowed outer identity: %d %s", out.Code, out.Body)
+				}
+				var afterHistory int
+				if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM nas_cleanup_observation_requests`).Scan(&afterHistory); err != nil {
+					t.Fatal(err)
+				}
+				lateGets, lateHeads := f.bucket.counts()
+				if snapshot() != before || afterHistory != history || lateGets != gets || lateHeads != heads {
+					t.Fatal("inconsistent batch changed an item/history or performed R2 I/O")
+				}
+			})
+		}
+	}
+}

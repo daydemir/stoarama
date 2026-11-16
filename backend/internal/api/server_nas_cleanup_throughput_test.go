@@ -410,7 +410,7 @@ func TestNASCleanupLeaseV2BudgetAndIsolation(t *testing.T) {
 	if w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "observations": []map[string]any{}}); w.Code != 400 {
 		t.Fatal("empty observation batch accepted")
 	}
-	w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 48, 6, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "observations": []map[string]any{{"item_id": tasks[0].ItemID, "attempt": tasks[0].Attempt, "plan_sha256": tasks[0].PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(tasks[0].Item), "error": ""}}})
+	w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 48, 6, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "observations": []map[string]any{{"item_id": tasks[0].ItemID, "attempt": tasks[0].Attempt, "plan_sha256": tasks[0].PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(tasks[0].Item), "error": "", "client_version": nasCleanupExecutionClientVersion}}})
 	var r struct {
 		Results []batchResult `json:"results"`
 	}
