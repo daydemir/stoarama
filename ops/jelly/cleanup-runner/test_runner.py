@@ -263,6 +263,7 @@ class FakeRunner(r.Runner):
         self.dry_run = dry_run
         self.stopping = False
         self.lock = None
+        self.ownership_unreadable = False
         self.windows = WINDOWS
         self.events = []
         self.p, self.cat = fixture()
@@ -422,19 +423,14 @@ class LoopTests(unittest.TestCase):
             self.assertIn('4', outcomes, 'continued to another stream after a failed admission check')
             self.assertNotIn('deferred_streams', job.status)
 
-    def test_malformed_deferrals_are_unreadable_ownership_state(self):
-        for bad in ([3], {'x': {'retry_after': 1, 'failures': 1}}, {'3': 1.0},
-                    {'3': {'retry_after': float('nan'), 'failures': 1}},
-                    {'3': {'retry_after': float('inf'), 'failures': 1}},
-                    {'3': {'retry_after': 1, 'failures': 6}},
-                    {'3': {'retry_after': 0, 'failures': 1}}):
-            with tempfile.TemporaryDirectory() as root:
-                (Path(root) / 'status.json').write_text(json.dumps(
-                    {'current_plan': None, 'last_error': None, 'deferred_streams': bad}))
-                job = r.Runner(Path('.'), Path(root))
-                with self.assertRaisesRegex(r.Halt, 'ownership unreadable'):
-                    job.initialize()
-                job.lock.close()
+    def test_non_dictionary_deferrals_are_unreadable_ownership_state(self):
+        with tempfile.TemporaryDirectory() as root:
+            raw=json.dumps({'current_plan': None, 'last_error': None, 'deferred_streams': [3]})
+            path=Path(root)/'status.json';path.write_text(raw)
+            job=r.Runner(Path('.'),Path(root))
+            with self.assertRaisesRegex(r.Halt,'ownership unreadable'):job.initialize()
+            with self.assertRaisesRegex(r.Halt,'must be preserved'):job.save('failed')
+            self.assertEqual(path.read_text(),raw);job.lock.close()
 
     def test_atomic_409_excludes_stream_persistently_and_admits_other_stream(self):
         with tempfile.TemporaryDirectory() as root:
@@ -911,6 +907,21 @@ class SafetyRegressionTests(unittest.TestCase):
             finally:
                 owner.lock.close()
 
+    def test_legacy_deferral_startup_refusal_preserves_full_ownership(self):
+        with tempfile.TemporaryDirectory() as root:
+            original=dict(current_plan=42,last_error=None,deleted_files=29797,deleted_bytes=2026235087172,
+                          deferred_streams={'3':{'retry_after':0,'failures':1}})
+            path=Path(root)/'status.json';path.write_text(json.dumps(original))
+            job=FakeRunner(root);job.repo=Path(root)
+            initialize=r.Runner.initialize;job.initialize=lambda:initialize(job)
+            with patch.object(r,'Runner',return_value=job),patch.object(r.sys,'argv',['runner']), \
+                 patch.object(r.signal,'signal'),patch.object(r.sys,'stderr',new=io.StringIO()):
+                self.assertEqual(r.main(),1)
+            stored=json.loads(path.read_text())
+            for key in ('current_plan','deleted_files','deleted_bytes','deferred_streams'):self.assertEqual(stored[key],original[key])
+            self.assertIn('prior deferred failure',stored['last_error']);self.assertNotIn('ON',job.events)
+            self.assertTrue((Path(root)/'STOP').exists())
+
     def test_main_handles_other_startup_errors_through_fail_safe(self):
         for stage in ('initialize', 'active', 'load_policy', 'check_delivery'):
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as root:
@@ -1157,9 +1168,8 @@ class RenderOffTests(unittest.TestCase):
                     self.assertEqual(r.main(), 1)
                 self.assertEqual(job.events, ['STOPPED: owner review required'])
                 self.assertTrue((Path(root) / 'STOP').exists())
-                status = json.loads(state.read_text())
-                self.assertIn('unknown enabled plan', status['last_error'])
-                self.assertNotIn('fake-sensitive', stderr.getvalue() + json.dumps(status))
+                self.assertEqual(state.read_text(), 'fake-sensitive-corrupt-json' if failure == 'json' else '[]')
+                self.assertNotIn('fake-sensitive', stderr.getvalue())
 
     def test_off_cancels_inflight_on_and_verifies_new_live_env_without_disk(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1402,24 +1412,19 @@ class RenderOffTests(unittest.TestCase):
             self.assertTrue(all(row['step'] == 'OFF deploy status GET' for row in rows))
             self.assertNotIn('fake-sensitive', stderr.getvalue() + json.dumps(rows))
 
-    def test_on_retries_reads_without_replaying_mutations(self):
+    def test_on_read_failure_stops_without_replaying_mutations(self):
         for target in ('query', 'list', 'status', 'live', 'env', 'plan'):
             for error in self.transient_errors():
                 with self.subTest(target=target, error=getattr(error, 'code', type(error).__name__)), tempfile.TemporaryDirectory() as root:
                     job = FakeRunner(root)
                     self.make_render(job, enabled=True)
                     remaining = self.inject_reads(job, target, [error, error], enabled=True)
-                    with patch.object(r.time, 'sleep') as sleep, \
-                            patch.object(r.sys, 'stderr', new=io.StringIO()) as stderr:
-                        r.Runner.master(job, True)
-                    self.assertEqual(remaining, [])
-                    self.assertEqual([c.args[0] for c in sleep.call_args_list], [5, 10])
-                    self.assertEqual(len(self.created), 1)
-                    self.assertEqual(sum(c[0] == 'PUT' for c in self.calls), 1)
-                    self.assertFalse(any(c[0] == 'POST' and c[1].endswith('/cancel') for c in self.calls))
-                    self.assertEqual(job.status['phase'], 'master_true')
-                    self.assertEqual(self.deploys[self.created[0]]['env'], 'true')
-                    self.assertIn('STEP FAILED: ON', stderr.getvalue())
+                    with patch.object(r.time, 'sleep') as sleep,patch.object(r.sys, 'stderr', new=io.StringIO()):
+                        with self.assertRaises(r.Halt):r.Runner.master(job, True)
+                    self.assertEqual(len(remaining),1);sleep.assert_not_called()
+                    self.assertLessEqual(len(self.created),1)
+                    self.assertLessEqual(sum(c[0]=='PUT' for c in self.calls),1)
+                    self.assertNotEqual(job.status.get('phase'),'master_true')
 
     def test_on_waits_for_runtime_switchover_then_confirms(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1455,14 +1460,14 @@ class RenderOffTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             job = FakeRunner(root)
             self.make_render(job, enabled=True)
-            self.inject_reads(job, 'status', [TimeoutError('fake-sensitive')] * len(r.READ_RETRY_DELAYS), enabled=True)
+            self.inject_reads(job, 'status', [TimeoutError('fake-sensitive')], enabled=True)
             with patch.object(r.time, 'sleep') as sleep, \
                     patch.object(r.sys, 'stderr', new=io.StringIO()) as stderr:
                 with self.assertRaises(r.Halt):
                     r.Runner.master(job, True)
-            self.assertEqual(sum(c.args[0] for c in sleep.call_args_list), sum(delay for delay in r.READ_RETRY_DELAYS if delay is not None))
+            sleep.assert_not_called()
             self.assertEqual(len(self.created), 1)
-            self.assertEqual(stderr.getvalue().count('STEP FAILED: ON deploy status GET'), len(r.READ_RETRY_DELAYS) + 1)
+            self.assertEqual(stderr.getvalue().count('STEP FAILED: ON deploy status GET'), 2)
             self.assertNotIn('fake-sensitive', stderr.getvalue() + (Path(root) / 'runner.jsonl').read_text())
 
     def test_off_email_and_retry_survive_broken_stderr(self):
@@ -1644,241 +1649,61 @@ class EmailTests(unittest.TestCase):
 
 
 
-class ReadRetryTests(unittest.TestCase):
+class ReadFailureTests(unittest.TestCase):
     def job(self, root):
         job = r.Runner(Path('.'), Path(root))
         job.prepare = SimpleNamespace(pg_env=lambda: {'PGOPTIONS': '-c default_transaction_read_only=on'},
                                       transient_sql_failure=PREPARER.transient_sql_failure)
         return job
 
-    def test_plan_report_get_retries_without_latching(self):
-        with tempfile.TemporaryDirectory() as root:
-            job = self.job(root)
-            plan, _ = fixture()
-            with patch.dict(os.environ, SERVICE_TOKEN='fixture'), \
-                    patch.object(r, 'request', side_effect=[r.ReadFailure('HTTP request failed (GET)'), plan]) as request, \
-                    patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
-                self.assertEqual(job.plan(42), plan)
-            self.assertEqual(request.call_count, 2)
-            sleep.assert_called_once_with(5)
-            self.assertIn('plan report GET', (Path(root) / 'runner.jsonl').read_text())
-            self.assertIsNone(job.status['last_error'])
+    def test_normal_plan_and_render_reads_never_accept_later_success(self):
+        for kind in ('plan','live','env','deploy'):
+            with self.subTest(kind=kind),tempfile.TemporaryDirectory() as root:
+                job=self.job(root)
+                with patch.dict(os.environ,SERVICE_TOKEN='fixture'),patch.object(r,'render_key',return_value='fixture'), \
+                     patch.object(r,'request',side_effect=[r.ReadFailure('HTTP request failed (GET)'),{}]) as request, \
+                     patch.object(r.time,'sleep') as sleep,patch.object(r.sys,'stderr',new=io.StringIO()):
+                    with self.assertRaises(r.Halt):
+                        if kind=='plan':job.plan(42)
+                        elif kind=='live':job.read('outer',job.live)
+                        else:job.render('GET','/env-vars/flag' if kind=='env' else '/deploys/fixture')
+                self.assertEqual(request.call_count,1);sleep.assert_not_called()
 
-    def test_ten_minute_api_outage_recovers_without_latching(self):
-        with tempfile.TemporaryDirectory() as root:
-            job = self.job(root)
-            job.dry_run = True
-            plan, _ = fixture()
-            elapsed = 0
-            def request(*args, **kwargs):
-                if elapsed < 600:
-                    raise r.ReadFailure('HTTP request failed (GET)')
-                return plan
-            def sleep(delay):
-                nonlocal elapsed
-                elapsed += delay
-            with patch.dict(os.environ, SERVICE_TOKEN='fixture'), \
-                    patch.object(r, 'request', side_effect=request) as get, \
-                    patch.object(r.time, 'sleep', side_effect=sleep), \
-                    patch.object(r.sys, 'stderr', new=io.StringIO()):
-                self.assertEqual(job.plan(42), plan)
-            self.assertGreaterEqual(elapsed, 600)
-            self.assertLessEqual(elapsed, sum(delay for delay in r.READ_RETRY_DELAYS if delay is not None))
-            self.assertLessEqual(get.call_count, len(r.READ_RETRY_DELAYS))
-            self.assertIsNone(job.status['last_error'])
-            self.assertFalse((Path(root) / 'STOP').exists())
+    def test_database_failures_and_nested_reads_stop_once(self):
+        for code in ('57014','08006','53300','57P03','40001','40P01','55P03','42601',None):
+            with self.subTest(code=code),tempfile.TemporaryDirectory() as root:
+                job=self.job(root)
+                bad=subprocess.TimeoutExpired(['psql'],330) if code is None else SimpleNamespace(returncode=1,stdout=b'',stderr=('ERROR:  '+code+' fake-sensitive').encode())
+                with patch.object(r.subprocess,'run',side_effect=[bad,SimpleNamespace(returncode=0,stdout=b'7')]) as run, \
+                     patch.object(r.time,'sleep') as sleep,patch.object(r.sys,'stderr',new=io.StringIO()) as stderr:
+                    with self.assertRaises(r.Halt):job.read('outer',lambda:job.query('SELECT 7','progress query'))
+                self.assertEqual(run.call_count,1);sleep.assert_not_called()
+                self.assertNotIn('fake-sensitive',stderr.getvalue())
 
-    def test_render_management_outage_uses_short_budget_outside_off(self):
-        with tempfile.TemporaryDirectory() as root:
-            job = self.job(root)
-            with patch.object(r, 'render_key', return_value='fixture'), \
-                    patch.object(r, 'request', side_effect=r.ReadFailure('HTTP request failed (GET)')) as request, \
-                    patch.object(r.time, 'sleep') as sleep, \
-                    patch.object(r.sys, 'stderr', new=io.StringIO()):
-                with self.assertRaises(r.Halt):
-                    job.read('outer live read', job.live)
-            self.assertEqual(sum(c.args[0] for c in sleep.call_args_list), 120)
-            self.assertEqual(request.call_count, len(r.SHORT_READ_RETRY_DELAYS))
-
-    def test_live_deploy_get_retries_without_latching(self):
-        with tempfile.TemporaryDirectory() as root:
-            job = self.job(root)
-            live = dict(id='live', status='live', commit={'id': 'd' * 40})
-            with patch.object(r, 'render_key', return_value='fixture'), \
-                    patch.object(r, 'request', side_effect=[r.ReadFailure('HTTP request failed (GET)'), [{'deploy': live}]]) as request, \
-                    patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
-                self.assertEqual(job.live(), live)
-            self.assertEqual(request.call_count, 2)
-            sleep.assert_called_once_with(5)
-            self.assertIn('live deploy list GET', (Path(root) / 'runner.jsonl').read_text())
-            self.assertIsNone(job.status['last_error'])
-
-    def check_render_get_retry(self, path, value, step):
-        with tempfile.TemporaryDirectory() as root:
-            job = self.job(root)
-            with patch.object(r, 'render_key', return_value='fixture'), \
-                    patch.object(r, 'request', side_effect=[r.ReadFailure('HTTP request failed (GET)'), value]) as request, \
-                    patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
-                self.assertEqual(job.render('GET', path), value)
-            self.assertEqual(request.call_count, 2)
-            sleep.assert_called_once_with(5)
-            self.assertIn(step, (Path(root) / 'runner.jsonl').read_text())
-            self.assertIsNone(job.status['last_error'])
-
-    def test_render_env_get_retries_without_latching(self):
-        self.check_render_get_retry('/env-vars/NAS_CLEANUP_DELETION_ENABLED',
-                                    {'value': 'true'}, 'Render env GET')
-
-    def test_render_deploy_status_get_retries_without_latching(self):
-        self.check_render_get_retry('/deploys/fixture', {'status': 'live'}, 'Render deploy status GET')
-
-    def test_query_retries_timeout_connection_and_serialization_but_not_sql_errors(self):
-        for code in ('57014', '08006', '53300', '57P03', '40001', '40P01', '55P03', '42601'):
-            with self.subTest(code=code), tempfile.TemporaryDirectory() as root:
-                job = self.job(root)
-                failed = SimpleNamespace(returncode=1, stdout=b'', stderr=('ERROR:  '+code+' fake-sensitive').encode())
-                ok = SimpleNamespace(returncode=0, stdout=b'7')
-                with patch.object(r.subprocess, 'run', side_effect=[failed, ok]) as run, \
-                        patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
-                    if code == '42601':
-                        with self.assertRaisesRegex(r.Halt, 'progress query: database query rejected'):
-                            job.query('SELECT 7', 'progress query')
-                        sleep.assert_not_called()
-                    else:
-                        self.assertEqual(job.query('SELECT 7', 'progress query'), 7)
-                        sleep.assert_called_once_with(5)
-                        log = (Path(root)/'runner.jsonl').read_text()
-                        self.assertNotIn('fake-sensitive', log)
-                        self.assertIn('progress query', log)
-                    self.assertEqual(run.call_args.kwargs['input'], b'BEGIN READ ONLY;SELECT 7;ROLLBACK;')
-                    self.assertEqual(run.call_args.kwargs['timeout'], 330)
-                    self.assertIn('VERBOSITY=sqlstate', run.call_args.args[0])
-
-    def test_exhaustion_is_bounded_and_does_not_multiply_enclosing_read(self):
-        with tempfile.TemporaryDirectory() as root:
-            job = self.job(root)
-            with patch.object(r.subprocess, 'run', side_effect=subprocess.TimeoutExpired(['psql'],330)) as run, \
-                    patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
-                with self.assertRaisesRegex(r.Halt, 'progress query: psql process timeout'):
-                    job.read('outer', lambda: job.query('SELECT 1','progress query'))
-            self.assertEqual(run.call_count, len(r.READ_RETRY_DELAYS))
-            self.assertEqual([c.args[0] for c in sleep.call_args_list], [delay for delay in r.READ_RETRY_DELAYS if delay is not None])
-
-    def test_http_reads_retry_transient_status_and_timeout_without_replaying_writes(self):
+    def test_http_failures_never_replay_reads_or_writes(self):
         for method in ('GET','POST','PUT'):
             for code in (401,403,408,429,503):
-                with self.subTest(method=method,code=code), tempfile.TemporaryDirectory() as root:
-                    job = self.job(root)
-                    error = r.urllib.error.HTTPError('https://invalid',code,'fake-sensitive',{},io.BytesIO(b'secret'))
-                    response = io.BytesIO(b'{}')
-                    opener = SimpleNamespace(open=unittest.mock.Mock(side_effect=[error,response]))
-                    with patch.dict(os.environ, SERVICE_TOKEN='fake-test-token'), \
-                            patch.object(r.urllib.request,'build_opener',return_value=opener), \
-                            patch.object(r.time,'sleep') as sleep, patch.object(r.sys,'stderr',new=io.StringIO()):
-                        if method == 'GET' and code in (408,429,503):
-                            self.assertEqual(job.api(method,'plans/42'), {})
-                            sleep.assert_called_once_with(5)
-                        else:
-                            with self.assertRaises(r.Halt): job.api(method,'plans/42')
-                            sleep.assert_not_called()
-                            self.assertEqual(opener.open.call_count,1)
+                with self.subTest(method=method,code=code),tempfile.TemporaryDirectory() as root:
+                    job=self.job(root)
+                    error=r.urllib.error.HTTPError('https://invalid',code,'fake-sensitive',{},io.BytesIO(b'secret'))
+                    opener=SimpleNamespace(open=unittest.mock.Mock(side_effect=[error,io.BytesIO(b'{}')]))
+                    with patch.dict(os.environ,SERVICE_TOKEN='fixture'),patch.object(r.urllib.request,'build_opener',return_value=opener), \
+                         patch.object(r.time,'sleep') as sleep,patch.object(r.sys,'stderr',new=io.StringIO()) as stderr:
+                        with self.assertRaises(r.Halt):job.api(method,'plans/42')
+                    self.assertEqual(opener.open.call_count,1);sleep.assert_not_called();self.assertNotIn('fake-sensitive',stderr.getvalue())
 
-    def test_http_transport_and_truncated_read_errors_retry_with_sanitized_reasons(self):
-        for error in (TimeoutError('fake-sensitive'),r.urllib.error.URLError('fake-sensitive'),
-                      r.http.client.IncompleteRead(b'fake-sensitive')):
-            with self.subTest(error=type(error).__name__),tempfile.TemporaryDirectory() as root:
-                job=self.job(root)
-                opener=SimpleNamespace(open=unittest.mock.Mock(side_effect=[error,io.BytesIO(b'{}')]))
-                with patch.dict(os.environ,SERVICE_TOKEN='fake-test-token'), \
-                        patch.object(r.urllib.request,'build_opener',return_value=opener), \
-                        patch.object(r.time,'sleep') as sleep,patch.object(r.sys,'stderr',new=io.StringIO()) as stderr:
-                    self.assertEqual(job.api('GET','plans/42'),{})
-                sleep.assert_called_once_with(5)
-                self.assertNotIn('fake-sensitive',stderr.getvalue()+(Path(root)/'runner.jsonl').read_text())
-
-    def test_monitor_survives_transient_reads_and_stops_immediately_on_anomaly(self):
+    def test_monitor_read_failure_reaches_failure_path_before_progress(self):
         with tempfile.TemporaryDirectory() as root:
-            job = self.job(root)
-            plan,_ = fixture()
-            plan.update(mode='enabled', master_deletion_enabled=True)
-            job.status.update(live_commit='d'*40)
-            calls = [r.ReadFailure('HTTP transport failed (GET)'),plan]
-            def request(*args):
-                value=calls.pop(0)
-                if isinstance(value,Exception): raise value
-                return value
-            with patch.dict(os.environ,SERVICE_TOKEN='fake-test-token'), \
-                    patch.object(r,'request',side_effect=request), \
-                    patch.object(job,'active',return_value={'plans':[99],'batches':0}), \
-                    patch.object(job,'finish') as finish, patch.object(job,'progress') as progress, \
-                    patch.object(r.time,'sleep') as sleep, patch.object(r.sys,'stderr',new=io.StringIO()):
-                with self.assertRaisesRegex(r.Halt,'concurrent cleanup execution'): job.monitor(42)
-            sleep.assert_called_once_with(5)
-            finish.assert_not_called()
-            progress.assert_not_called()
-
-    def test_monitor_latches_when_running_plan_reports_master_off(self):
-        with tempfile.TemporaryDirectory() as root:
-            job = self.job(root)
-            plan,_ = fixture()
-            plan.update(mode='enabled', master_deletion_enabled=False)
-            job.status.update(live_commit='d'*40)
-            with patch.dict(os.environ,SERVICE_TOKEN='fake-test-token'), \
-                    patch.object(r,'request',return_value=plan), \
-                    patch.object(job,'active',return_value={'plans':[42],'batches':0}), \
-                    patch.object(job,'finish') as finish, patch.object(job,'progress') as progress, \
-                    patch.object(r.time,'sleep') as sleep:
-                with self.assertRaisesRegex(r.Halt,'master switch mismatch'): job.monitor(42)
-            finish.assert_not_called(); progress.assert_not_called(); sleep.assert_not_called()
-
-    def test_monitor_retries_active_and_progress_queries_then_finishes_without_latching(self):
-        with tempfile.TemporaryDirectory() as root:
-            job=self.job(root)
-            job.status.update(current_plan=42,live_commit='d'*40,last_note_day=r.utcnow().date().isoformat())
-            plan,_=fixture()
-            plan.update(mode='enabled',master_deletion_enabled=True)
-            done=copy.deepcopy(plan)
-            done['results'][0].update(state='deleted',delete_ever_issued=True)
-            plans=[plan,done]
-            methods=[]
-            def request(url,token,method='GET',body=None):
-                methods.append(method)
-                if '/deploys?' in url:
-                    return [{'deploy':dict(id='live',status='live',commit={'id':'d'*40})}]
-                return plans.pop(0)
-            active_attempts,progress_attempts=[],[]
-            def run(argv,**kwargs):
-                sql=kwargs['input'].decode()
-                if "'plans'" in sql:
-                    active_attempts.append(True)
-                    if len(active_attempts)==1: raise subprocess.TimeoutExpired(argv,330)
-                    value={'plans':[42],'batches':0}
-                elif 'WITH receipts' in sql:
-                    progress_attempts.append(True)
-                    if len(progress_attempts)==1:
-                        return SimpleNamespace(returncode=1,stdout=b'',stderr=b'ERROR:  57014 fake-sensitive')
-                    value=[dict(stream_id=3,files=1,bytes=100,recent_files=1,recent_bytes=100)]
-                else: value={}
-                return SimpleNamespace(returncode=0,stdout=json.dumps(value).encode())
-            with patch.dict(os.environ,SERVICE_TOKEN='fake-test-token'), \
-                    patch.object(r,'request',side_effect=request),patch.object(r,'render_key',return_value='fake'), \
-                    patch.object(r.subprocess,'run',side_effect=run),patch.object(job,'finish') as finish, \
-                    patch.object(r.time,'sleep') as sleep,patch.object(r.sys,'stderr',new=io.StringIO()):
-                job.monitor(42)
-            self.assertEqual([c.args[0] for c in sleep.call_args_list],[5,5,60])
-            self.assertEqual(methods,['GET','GET','GET'])
-            finish.assert_called_once_with(done)
-            self.assertIsNone(job.status['last_error'])
-            self.assertFalse((Path(root)/'STOP').exists())
-            self.assertEqual(job.status['deleted_bytes'],100)
-
-    def test_validation_errors_are_not_retried(self):
-        with tempfile.TemporaryDirectory() as root:
-            job=self.job(root)
-            for error in (r.Halt('plan identity differs'),ValueError('invalid response')):
-                with patch.object(r.time,'sleep') as sleep:
-                    with self.assertRaises(type(error)): job.read('monitor',lambda: (_ for _ in ()).throw(error))
-                    sleep.assert_not_called()
+            job=self.job(root);job.status.update(current_plan=42,live_commit='d'*40)
+            with patch.dict(os.environ,SERVICE_TOKEN='fixture'),patch.object(r,'request',side_effect=r.ReadFailure('HTTP transport failed (GET)')) as request, \
+                 patch.object(job,'master') as master,patch.object(job,'alert'),patch.object(job,'drain'),patch.object(job,'recovery'), \
+                 patch.object(job,'finish') as finish,patch.object(job,'progress') as progress,patch.object(r.time,'sleep') as sleep, \
+                 patch.object(r.sys,'stderr',new=io.StringIO()):
+                try:job.monitor(42)
+                except r.Halt as exc:job.fail(str(exc))
+            master.assert_called_once_with(False,emergency=True);finish.assert_not_called();progress.assert_not_called();sleep.assert_not_called()
+            self.assertEqual(request.call_count,2)  # Failed monitor, then one read during fail-safe recovery.
+            self.assertTrue((Path(root)/'STOP').exists());self.assertIsNotNone(job.status['last_error'])
 
 
 class RecoveryRetryTests(unittest.TestCase):
@@ -1890,7 +1715,7 @@ class RecoveryRetryTests(unittest.TestCase):
         summary.update(changes)
         return p,summary
 
-    def test_recovery_retries_cli_timeout_failed_get_and_head_errors(self):
+    def test_recovery_read_failures_stop_without_retrying(self):
         for failure in ('timeout','get','head'):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
                 p,summary=self.summary()
@@ -1902,10 +1727,10 @@ class RecoveryRetryTests(unittest.TestCase):
                 job=r.Runner(Path('.'),Path(root))
                 with patch.object(r.subprocess,'run',side_effect=[first,good]) as run, \
                         patch.object(r.time,'sleep') as sleep, patch.object(r.sys,'stderr',new=io.StringIO()):
-                    job.recovery(p)
-                sleep.assert_called_once_with(5)
+                    with self.assertRaises(r.Halt):job.recovery(p)
+                sleep.assert_not_called()
                 self.assertEqual(run.call_args.kwargs['timeout'],1800)
-                self.assertEqual(job.status['recovery_issued'],1)
+                self.assertEqual(run.call_count,1);self.assertNotIn('recovery_issued',job.status)
                 self.assertNotIn('fake-sensitive',(Path(root)/'runner.jsonl').read_text())
 
     def test_missing_mismatched_and_wrong_identity_recovery_never_retry_or_pass(self):
@@ -1932,8 +1757,8 @@ class RecoveryRetryTests(unittest.TestCase):
             with patch.object(r.subprocess,'run',return_value=failed) as run, \
                     patch.object(r.time,'sleep') as sleep,patch.object(r.sys,'stderr',new=io.StringIO()):
                 job.fail('original failure')
-            self.assertEqual(run.call_count,len(r.READ_RETRY_DELAYS))
-            self.assertEqual(sum(c.args[0] for c in sleep.call_args_list),sum(delay for delay in r.READ_RETRY_DELAYS if delay is not None))
+            self.assertEqual(run.call_count,1)
+            sleep.assert_not_called()
             self.assertEqual(job.status['last_error'],'original failure')
             self.assertEqual(job.status['recovery_error'],'recovery verification: recovery CLI read failed')
             self.assertTrue(job.status['shutdown_or_recovery_failed'])

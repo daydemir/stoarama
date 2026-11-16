@@ -43,14 +43,14 @@ The runner:
   configured env is false, and the live API reports master false; rechecks live
   deploy identity after that report. With no saved plan, reads the latest existing
   account-47/connection-13 plan report for this runtime check. Missing reports
-  cannot confirm OFF. OFF and ON retry idempotent reads (deploy status/list,
-  live identity, env, plan, and read-only queries) with at most 905 seconds (about 15 minutes) of
+  cannot confirm OFF. OFF retries idempotent reads (deploy status/list,
+  live identity, env, plan, and read-only queries) with at most 120 seconds (two minutes) of
   added backoff per read, in addition to existing I/O timeouts. Exhausted reads,
   failed/canceled/timed-out deploys, concurrent deploys, or a runtime master mismatch trigger loud stderr + owner email alerts
   and retries forever with 15-second exponential backoff capped at five minutes.
   A terminal failed OFF deploy or a confirmed verification mismatch requires a
   new OFF deploy; read failures alone resume the remembered deploy. ON read
-  exhaustion propagates to the normal fail-safe OFF path.
+  failure propagates to the normal fail-safe OFF path.
   ON still rejects concurrent deploys. Repeats OFF after completion or pause.
 - Uses a complete fresh dry run or invokes `prepare_keep28_plans.py --submit`
   for one stream, at most one <=100 GB plan. Unique `k28auto-YYYYMMDD-HHMMSS`
@@ -208,12 +208,12 @@ both large tables use parameterized indexed reads. NAS fsync ordering is unchang
 
 ## Read failures and the November 11 incident
 
-Monitoring retries transient database reads and HTTP GETs with delays of 5, 10,
-20, 30, 30 and 25 seconds. Each read keeps its I/O timeout. SQL rejection,
-malformed reports, identity changes, concurrent execution and other safety
-violations fail immediately. Mutations are never replayed by this retry loop.
-Exhausted reads still enter the existing latched failure / confirmed OFF path.
-Diagnostics contain fixed step names and error categories, never SQL or stderr.
+Normal API/database/recovery read failures stop immediately through the existing
+latched failure and confirmed OFF path. Only emergency OFF retries reads so an
+outage cannot prevent shutdown convergence. Mutations are never replayed by the
+read loop. Unreadable ownership records are preserved; failure handling cannot
+replace them with default state. Diagnostics use fixed step names and error
+categories, never SQL or stderr.
 
 Read-only investigation on Jelly reproduced the original progress aggregation
 in **266.1 seconds**; the preparer sets PostgreSQL `statement_timeout=300000`
@@ -233,10 +233,9 @@ while serially HEADing 2,873 issued objects. Manual verification subsequently
 reported 2,873 verified, zero problems. The old failure path also skipped receipt
 drain before taking its reference report. Both normal completion and failed
 execution now drain before reading the reference report. Recovery has a separate
-30-minute subprocess limit and retries command read failures/timeouts and
-HEAD-only errors. Missing objects, size/identity mismatches and mixed problems
-still stop immediately. Exhaustion preserves the original latch and records a
-separate sanitized recovery error. No production state was changed for this fix.
+30-minute subprocess limit. Command read failures, timeouts, HEAD errors, missing
+objects and size/identity mismatches stop immediately. Failure preserves the
+original latch and records a separate sanitized recovery error.
 
 ## Offline checks
 

@@ -294,7 +294,6 @@ def request(url, token, method='GET', body=None):
 
 
 SHORT_READ_RETRY_DELAYS = (5, 10, 20, 30, 30, 25, None)  # 120 s
-READ_RETRY_DELAYS = (5, 10, 20, 30, 60, 60, 120, 120, 120, 120, 120, 120, None)  # 905 s
 COMMAND_TIMEOUT_SEC = 360
 PREPARE_TIMEOUT_SEC = 1800  # keep28 preparation on large streams exceeds six minutes
 STREAM_SUMMARY_TTL_SEC = 7 * 24 * 3600  # Ranking hints only; refreshes run with master OFF.
@@ -346,6 +345,7 @@ class Runner:
         self.repo, self.root, self.dry_run = repo, state, dry_run
         self.stopping = False
         self.lock = None
+        self.ownership_unreadable = False
         self.status = {'current_plan': None, 'last_error': None}
 
     def initialize(self):
@@ -359,10 +359,12 @@ class Runner:
         except BlockingIOError:
             raise LockHeld from None
         path = self.root / 'status.json'
+        self.ownership_unreadable = True
         try:
             try:
                 raw = path.read_text()
             except FileNotFoundError:
+                self.ownership_unreadable = False
                 return
             status = json.loads(raw)
             require(isinstance(status, dict)
@@ -376,11 +378,12 @@ class Runner:
                             and isinstance(v.get('reason'), str) and len(v['reason']) <= 2048
                             and isinstance(v.get('label'), str)
                             for k, v in status.get('excluded_streams', {}).items())
-                    and status.get('deferred_streams', {}) == {},
+                    and isinstance(status.get('deferred_streams', {}), dict),
                     'invalid ownership state')
         except Exception:
             raise Halt('execution ownership unreadable; unknown enabled plan; owner review required') from None
         self.status = status
+        self.ownership_unreadable = False
 
     def load_policy(self):
         repo = self.repo
@@ -391,6 +394,7 @@ class Runner:
         require((repo / POLICY).read_bytes() == raw, 'checkout keep28 policy differs from origin/main')
 
     def save(self, phase, **values):
+        require(not self.ownership_unreadable, 'unreadable ownership record must be preserved')
         self.status.update(values, phase=phase, updated_at=utcnow().isoformat(), dry_run=self.dry_run)
         tmp = self.root / 'status.tmp'
         with tmp.open('w') as f:
@@ -494,7 +498,7 @@ class Runner:
         action = lambda: request('https://api.render.com/v1/services/' + SERVICE + path, render_key(), method, body)
         step = ('live deploy list GET' if path == '/deploys?limit=100' else
                 'Render env GET' if path.startswith('/env-vars/') else 'Render deploy status GET')
-        return self.read(step, action, delays=SHORT_READ_RETRY_DELAYS) if method == 'GET' else action()
+        return self.read(step, action) if method == 'GET' else action()
 
     def live(self):
         rows = self.render('GET', '/deploys?limit=100')
@@ -523,11 +527,9 @@ class Runner:
         except Exception:
             pass  # Diagnostics must never block shutdown, even before initialize().
 
-    def read(self, step, action, delays=READ_RETRY_DELAYS):
-        # Render management outages do not stop permits. OFF and all its nested
-        # API/DB reads must return to the shutdown loop promptly.
-        if getattr(self, 'in_off', False):
-            delays = SHORT_READ_RETRY_DELAYS
+    def read(self, step, action):
+        # Only emergency OFF may retry a failed check to converge to shutdown.
+        delays = SHORT_READ_RETRY_DELAYS if getattr(self, 'in_off', False) else (None,)
         # Exhaustion is terminal to enclosing read wrappers, avoiding multiplied
         # retry budgets. Mutations are never replayed here.
         for delay in delays:
