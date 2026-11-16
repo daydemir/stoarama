@@ -179,7 +179,7 @@ func TestNASCleanupRecoveryLongerReadCompletesWithinRealWriteDeadline(t *testing
 			t.Fatalf("read budget %s: %q %v", c.read, body, err)
 		}
 	}
-	if nasCleanupRecoveryBudget != 40*time.Second || nasCleanupExecutionBudget != 15*time.Second {
+	if nasCleanupRecoveryBudget != 40*time.Second || nasCleanupExecutionBudget != 10*time.Second {
 		t.Fatal("prefetch/execution deadline changed")
 	}
 }

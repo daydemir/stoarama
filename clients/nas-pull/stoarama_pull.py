@@ -18182,7 +18182,7 @@ CLEANUP_GROUP_VERSION = "cleanup-batch-v6.1"
 CLEANUP_V6_VERSIONS: frozenset[str] = frozenset((CLEANUP_GROUP_VERSION, "r2-copy-v1"))
 CLEANUP_BULK_VERSION = "cleanup-batch-v7"
 CLEANUP_TRUTH_VERSION = "cleanup-batch-v8"
-CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, "r2-copy-v2", "r2-copy-v3", "v85r-nas-proof-v1", "v85r-nas-proof-v2"))
+CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, "r2-copy-v2", "r2-copy-v3", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
 CLEANUP_GROUP_VERSIONS: frozenset[str] = CLEANUP_V6_VERSIONS | CLEANUP_BULK_VERSIONS
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
@@ -18738,6 +18738,11 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
             if current.deadline - time.monotonic() <= CLEANUP_EXECUTION_OBSERVE_SEC:
                 raise CleanupInterrupted("cleanup lease has insufficient time after durable intents")
         stage = CleanupStage.PERMIT
+        # Proofs/journals can outlive the HTTP idle timeout. DNS/TCP/TLS must
+        # finish immediately before starting the short permit clock.
+        cleanup_timed(shared, "connect_ms", restore_prepare_api, cfg, CLEANUP_EXECUTION_OBSERVE_SEC)
+        for current, _ in opened:
+            current.check_active()
         for task, timing in zip(tasks, timings):
             progress("permit_start", task, timing)
         permit_started = time.monotonic()
@@ -24580,11 +24585,8 @@ def reset_restore_connections():
     _restore_http.conns = {}
 
 
-def restore_https(netloc, method, target, body, headers, timeout, read_limit=None):
-    """One request on this thread's keep-alive connection to netloc.
-
-    With read_limit, at most that many response bytes are read; a longer
-    response closes the connection instead of being buffered."""
+def restore_connection(netloc, timeout):
+    """Select this thread's live connection; connecting remains explicit."""
     conns = getattr(_restore_http, "conns", None)
     if conns is None:
         conns = _restore_http.conns = {}
@@ -24595,10 +24597,37 @@ def restore_https(netloc, method, target, body, headers, timeout, read_limit=Non
     if conn is None:
         conn = http.client.HTTPSConnection(netloc, timeout=timeout, blocksize=RESTORE_BLOCK_BYTES)
         conns[netloc] = conn
+    conn.timeout = timeout
+    if conn.sock is not None:
+        conn.sock.settimeout(timeout)
+    return conn
+
+
+def restore_prepare_api(cfg, timeout):
+    """Connect without submitting work, before a bulk permit's freshness clock."""
+    parsed = urllib.parse.urlsplit(getattr(cfg, "api_base", ""))
+    proxied = bool(urllib.request.getproxies().get("https")) and not urllib.request.proxy_bypass(parsed.netloc)
+    if parsed.scheme != "https" or proxied:
+        return  # These installs use urllib, not the persistent HTTPS transport.
+    conn = restore_connection(parsed.netloc, timeout)
     try:
-        conn.timeout = timeout
-        if conn.sock is not None:
-            conn.sock.settimeout(timeout)
+        if conn.sock is None:
+            conn.connect()
+        conn.stoarama_last_used = time.monotonic()
+    except BaseException:
+        _restore_http.conns.pop(parsed.netloc, None)
+        conn.close()
+        raise
+
+
+def restore_https(netloc, method, target, body, headers, timeout, read_limit=None):
+    """One request on this thread's keep-alive connection to netloc.
+
+    With read_limit, at most that many response bytes are read; a longer
+    response closes the connection instead of being buffered."""
+    conn = restore_connection(netloc, timeout)
+    conns = _restore_http.conns
+    try:
         conn.request(method, target, body=body, headers=headers)
         response = conn.getresponse()
         remember_response_secrets(response)

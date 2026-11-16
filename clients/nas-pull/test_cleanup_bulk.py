@@ -49,6 +49,41 @@ class CleanupBulkTests(unittest.TestCase):
     def phases(self):
         return [row[1] for row in pull.cleanup_journal(self.inventory)]
 
+    def test_cold_connect_follows_intents_and_precedes_permit_clock(self):
+        tasks = self.group(8)
+        clock, offset = time.monotonic, [0.0]
+        connection = mock.Mock(sock=None)
+        self.cfg.api_base = 'https://example.invalid'
+        def connect():
+            self.assertEqual(self.phases(), ['intent']*8)
+            offset[0] += 18.276
+            connection.sock = mock.Mock()
+        connection.connect.side_effect = connect
+        with mock.patch.object(pull, '_restore_http', threading.local()), \
+                mock.patch.object(pull.urllib.request, 'getproxies', return_value={}), \
+                mock.patch.object(pull.http.client, 'HTTPSConnection', return_value=connection), \
+                mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock()+offset[0]):
+            self.run_group(tasks)
+        connection.connect.assert_called_once()
+        self.assertFalse(self.phases())
+        self.assertTrue(all(not (self.cfg.output_dir/t['item']['relative_path']).exists() for t in tasks))
+
+    def test_slow_response_still_refuses_all_eight_without_unlink(self):
+        tasks = self.group(8)
+        api, clock, offset = self.api, time.monotonic, [0.0]
+        def slow(cfg, path, body, **kwargs):
+            response = api(cfg, path, body, **kwargs)
+            if path.endswith('/observe-batch'):
+                offset[0] += 18.276
+            return response
+        with mock.patch.object(self, 'api', side_effect=slow), \
+                mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock()+offset[0]), \
+                mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('late permit cannot unlink')):
+            with self.assertRaises(pull.CleanupPermitRefused):
+                self.run_group(tasks)
+        self.assertEqual(self.phases(), ['intent']*8)
+        self.assertTrue(all((self.cfg.output_dir/t['item']['relative_path']).exists() for t in tasks))
+
     def test_slow_durable_intents_do_not_age_the_bulk_permit(self):
         tasks = self.group(8)
         journal, clock, api = pull.cleanup_journal_group, time.monotonic, self.api
