@@ -283,3 +283,26 @@ func TestNASStitchProofValidationRequiresMatchingFreshNASReadback(t *testing.T) 
 		t.Fatalf("validation mutated writer state: %s %d %v", state, count, err)
 	}
 }
+
+func TestNASStitchProofRuntimeOffObserverContract(t *testing.T) {
+	for _, selector := range []int{0, 1, 2, -1, 3} {
+		server := &Server{} // No DB, environment credential or admission dependency.
+		server.cfg.NASStitchProofTaskID = selector
+		server.cfg.NASStitchProofActivationID = "invalid-nonce-must-not-block-OFF"
+		w := httptest.NewRecorder()
+		server.handleAdminNASStitchProof(w, httptest.NewRequest(http.MethodGet, "/synthetic", nil))
+		var body map[string]any
+		if json.Unmarshal(w.Body.Bytes(), &body) != nil || len(body) != 1 || w.Code != 409 {
+			t.Fatal("runtime observer response differs")
+		}
+		expected := "legacy native proof admission retired; activation protocol required"
+		if selector == 0 {
+			expected = "isolated proof selector inactive"
+		}
+		if body["error"] != expected {
+			t.Fatal("OFF/retired distinction differs")
+		}
+		evidence, _ := json.Marshal(map[string]any{"selector": selector, "status": w.Code, "body": string(w.Body.Bytes())})
+		t.Logf("OFF_OBSERVER_RESPONSE=%s", evidence)
+	}
+}

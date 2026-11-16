@@ -87,6 +87,12 @@ func (s *Server) handleAdminNASStitchProof(w http.ResponseWriter, r *http.Reques
 	s.writeNASStitchProof(w, r)
 }
 func (s *Server) writeNASStitchProof(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.NASStitchProofTaskID == 0 {
+		// The existing fail-safe observer needs an actual runtime OFF response,
+		// independent of UUID, admission, heartbeat, resources or database state.
+		util.WriteError(w, 409, "isolated proof selector inactive")
+		return
+	}
 	// Historical clients cannot echo/spend the operator activation UUID.
 	// Keep preserved-result verification separate; never grant legacy native work.
 	util.WriteError(w, 409, "legacy native proof admission retired; activation protocol required")
