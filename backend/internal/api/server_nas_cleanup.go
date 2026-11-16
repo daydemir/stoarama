@@ -1413,12 +1413,12 @@ func validCleanupReceiptEvidence(req cleanupReceipt) bool {
 	if req.RefusalProtocol != 0 && (req.RefusalProtocol != nasCleanupRefusalProtocol || req.RefusalReason == "") {
 		return false
 	}
-	if len(req.StageTimings) > 15 {
+	if len(req.StageTimings) > 16 {
 		return false
 	}
 	for name, elapsed := range req.StageTimings {
 		switch name {
-		case "lease_ms", "queue_ms", "lane_ms", "fence_ms", "open_ms", "proof_ms", "guard_ms", "observe_journal_ms", "observe_ms", "intent_journal_ms", "caps_ms", "ledger_intent_ms", "delete_ms", "directory_sync_ms", "ledger_result_ms":
+		case "lease_ms", "queue_ms", "lane_ms", "fence_ms", "open_ms", "proof_ms", "guard_ms", "observe_journal_ms", "observe_ms", "intent_journal_ms", "caps_ms", "ledger_intent_ms", "delete_ms", "directory_sync_ms", "ledger_result_ms", "connect_ms":
 		default:
 			return false
 		}
