@@ -228,7 +228,7 @@ func TestNASCleanupLeastLeasedItemDoesNotStarveFreshWork(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &Server{pool: pool}
-	w := cleanupCall(t, s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": "old-client", "protocol": 1})
+	w := cleanupCall(t, s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "protocol": 1})
 	var out struct {
 		Tasks []cleanupTask `json:"tasks"`
 	}

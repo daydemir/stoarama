@@ -771,6 +771,10 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 			cleanupObservationFailure(w, ctx, 400, "positive item ids required")
 			return
 		}
+		if o.ClientVersion != req.ClientVersion {
+			cleanupObservationFailure(w, ctx, 409, "cleanup observation client release differs")
+			return
+		}
 		payloads[n], _ = json.Marshal(o)
 		if f, ok := first[o.ItemID]; !ok {
 			first[o.ItemID] = n
@@ -778,7 +782,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 			conflicting[n] = true
 		}
 	}
-	cid, ok := s.nasRestoreConnection(ctx, w, r)
+	cid, ok := s.nasCleanupConnection(ctx, w, r, req.ClientVersion)
 	if !ok {
 		return
 	}
@@ -823,7 +827,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 			md5s[o.ItemID] = o.MD5
 		}
 	}
-	env := &cleanupObserveEnv{session: cleanupRequestSession(r), dryRunOnly: dryRunOnly, freshRequests: freshRequests, prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
+	env := &cleanupObserveEnv{session: cleanupAdmissionSession(r, req.ClientVersion), dryRunOnly: dryRunOnly, freshRequests: freshRequests, prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
 	if cleanupObservationExpired(ctx) {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
 		return

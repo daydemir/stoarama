@@ -123,13 +123,14 @@ type cleanupFixtureFile struct {
 }
 
 type cleanupFixture struct {
-	t      *testing.T
-	ctx    context.Context
-	pool   *pgxpool.Pool
-	s      *Server
-	bucket *fakeCleanupBucket
-	r2srv  *httptest.Server
-	nodes  map[string]bool
+	t       *testing.T
+	ctx     context.Context
+	pool    *pgxpool.Pool
+	s       *Server
+	bucket  *fakeCleanupBucket
+	r2srv   *httptest.Server
+	nodes   map[string]bool
+	version string
 }
 
 // newCleanupFixture prepares stream 3 so the live best-14 replay yields its
@@ -155,12 +156,20 @@ func newCleanupFixture(t *testing.T, seedPerDay int) *cleanupFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &cleanupFixture{t: t, ctx: ctx, pool: pool, s: &Server{pool: pool, r2: client}, bucket: bucket, r2srv: srv, nodes: map[string]bool{}}
+	f := &cleanupFixture{t: t, ctx: ctx, pool: pool, s: &Server{pool: pool, r2: client}, bucket: bucket, r2srv: srv, nodes: map[string]bool{}, version: nasCleanupExecutionClientVersion}
 	var best string
 	if err := pool.QueryRow(ctx, cleanupCurrentRankingsSQL, 3).Scan(&best); err != nil || best != "2026-09-19" {
 		t.Fatalf("fixture best14 replay %q %v", best, err)
 	}
 	return f
+}
+
+func (f *cleanupFixture) useClientVersion(version string) {
+	f.t.Helper()
+	if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, version); err != nil {
+		f.t.Fatal(err)
+	}
+	f.version = version
 }
 
 // syntheticFiles returns n August clips (outside stream 3's keep window)
@@ -264,11 +273,11 @@ func fixtureProof(i nasCleanupItem) json.RawMessage {
 
 func (f *cleanupFixture) leaseV2(limit, files int, bytes int64, requestID string) []cleanupTask {
 	f.t.Helper()
-	body := map[string]any{"client_version": "test", "protocol": 2, "reconciliation_protocol": nasCleanupReconciliationProtocol, "limit": limit, "execution_files": files, "execution_bytes": bytes}
+	body := map[string]any{"client_version": f.version, "protocol": 2, "reconciliation_protocol": nasCleanupReconciliationProtocol, "limit": limit, "execution_files": files, "execution_bytes": bytes}
 	if requestID != "" {
 		body["request_id"] = requestID
 	}
-	w := cleanupCall(f.t, f.s.handleAccountNASCleanupLease, 47, 5, "", "", body)
+	w := cleanupCall(f.t, f.s.handleAccountNASCleanupLease, 47, 5, "", "", body, "fixture-boot "+f.version)
 	if w.Code != 200 {
 		f.t.Fatalf("lease v2: %d %s", w.Code, w.Body.String())
 	}
@@ -303,7 +312,7 @@ func (f *cleanupFixture) observeMD5(tasks []cleanupTask, requestIDs map[int64]st
 	f.t.Helper()
 	observations := []map[string]any{}
 	for _, task := range tasks {
-		o := map[string]any{"item_id": task.ItemID, "attempt": task.Attempt, "plan_sha256": task.PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(task.Item), "error": "", "client_version": "test"}
+		o := map[string]any{"item_id": task.ItemID, "attempt": task.Attempt, "plan_sha256": task.PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(task.Item), "error": "", "client_version": f.version}
 		if id := requestIDs[task.ItemID]; id != "" {
 			o["request_id"] = id
 		}
@@ -312,7 +321,7 @@ func (f *cleanupFixture) observeMD5(tasks []cleanupTask, requestIDs map[int64]st
 		}
 		observations = append(observations, o)
 	}
-	w := cleanupCall(f.t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": "test", "observations": observations})
+	w := cleanupCall(f.t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": f.version, "observations": observations}, "fixture-boot "+f.version)
 	if w.Code != 200 {
 		f.t.Fatalf("observe batch: %d %s", w.Code, w.Body.String())
 	}
@@ -331,7 +340,7 @@ func (f *cleanupFixture) receipts(tasks []cleanupTask, results []batchResult, ou
 	for n, task := range tasks {
 		receipts = append(receipts, map[string]any{"item_id": task.ItemID, "attempt": task.Attempt, "plan_sha256": task.PlanSHA, "proof_sha256": results[n].ProofSHA, "outcome": outcome, "error": ""})
 	}
-	w := cleanupCall(f.t, f.s.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": "test", "receipts": receipts})
+	w := cleanupCall(f.t, f.s.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "receipts": receipts})
 	if w.Code != 200 {
 		f.t.Fatalf("result batch: %d %s", w.Code, w.Body.String())
 	}

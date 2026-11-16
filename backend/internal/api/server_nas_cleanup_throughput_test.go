@@ -396,21 +396,21 @@ func TestNASCleanupLeaseV2BudgetAndIsolation(t *testing.T) {
 		t.Fatalf("execution lease %+v", tasks)
 	}
 	for _, bad := range []map[string]any{
-		{"client_version": "t", "protocol": 2, "limit": 65, "execution_files": 0, "execution_bytes": 0},
-		{"client_version": "t", "protocol": 2, "limit": 8},
-		{"client_version": "t", "protocol": 2, "limit": 8, "execution_files": -1, "execution_bytes": 0},
-		{"client_version": "t", "protocol": 1, "limit": 8, "execution_files": 1, "execution_bytes": 1},
-		{"client_version": "t", "protocol": 2, "limit": 8, "execution_files": 1, "execution_bytes": 1, "request_id": "short"},
+		{"client_version": nasCleanupExecutionClientVersion, "protocol": 2, "limit": 65, "execution_files": 0, "execution_bytes": 0},
+		{"client_version": nasCleanupExecutionClientVersion, "protocol": 2, "limit": 8},
+		{"client_version": nasCleanupExecutionClientVersion, "protocol": 2, "limit": 8, "execution_files": -1, "execution_bytes": 0},
+		{"client_version": nasCleanupExecutionClientVersion, "protocol": 1, "limit": 8, "execution_files": 1, "execution_bytes": 1},
+		{"client_version": nasCleanupExecutionClientVersion, "protocol": 2, "limit": 8, "execution_files": 1, "execution_bytes": 1, "request_id": "short"},
 	} {
 		if w := cleanupCall(t, f.s.handleAccountNASCleanupLease, 47, 5, "", "", bad); w.Code != 400 {
 			t.Fatalf("invalid lease accepted: %v %d", bad, w.Code)
 		}
 	}
 	// Batched requests validate shape and identity.
-	if w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": "t", "observations": []map[string]any{}}); w.Code != 400 {
+	if w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "observations": []map[string]any{}}); w.Code != 400 {
 		t.Fatal("empty observation batch accepted")
 	}
-	w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 48, 6, "", "", map[string]any{"client_version": "t", "observations": []map[string]any{{"item_id": tasks[0].ItemID, "attempt": tasks[0].Attempt, "plan_sha256": tasks[0].PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(tasks[0].Item), "error": ""}}})
+	w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 48, 6, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "observations": []map[string]any{{"item_id": tasks[0].ItemID, "attempt": tasks[0].Attempt, "plan_sha256": tasks[0].PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(tasks[0].Item), "error": "", "client_version": nasCleanupExecutionClientVersion}}})
 	var r struct {
 		Results []batchResult `json:"results"`
 	}
@@ -505,11 +505,11 @@ func TestNASCleanupBatchAndSingleObservationsShareLockOrder(t *testing.T) {
 	for n := 0; n < 20; n++ {
 		single, batch := tasks[0], tasks[0]
 		go func() {
-			w := cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(single.ItemID), cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: single.Attempt, PlanSHA: single.PlanSHA, Outcome: "match", Proof: fixtureProof(single.Item), ClientVersion: "t", RequestID: strings.Repeat("a", 32)})
+			w := cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(single.ItemID), cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: single.Attempt, PlanSHA: single.PlanSHA, Outcome: "match", Proof: fixtureProof(single.Item), ClientVersion: nasCleanupExecutionClientVersion, RequestID: strings.Repeat("a", 32)})
 			done <- fmt.Sprintf("%d %s", w.Code, w.Body.String())
 		}()
 		go func() {
-			w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": "t", "observations": []map[string]any{{"item_id": batch.ItemID, "attempt": batch.Attempt, "plan_sha256": batch.PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(batch.Item), "error": "", "client_version": "t", "request_id": strings.Repeat("a", 32)}}})
+			w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "observations": []map[string]any{{"item_id": batch.ItemID, "attempt": batch.Attempt, "plan_sha256": batch.PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(batch.Item), "error": "", "client_version": nasCleanupExecutionClientVersion, "request_id": strings.Repeat("a", 32)}}})
 			// A batch uses HTTP 200 even when the item conflicts. Check the
 			// item's status, just as the single endpoint's HTTP status below.
 			var response struct {

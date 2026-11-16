@@ -32,6 +32,7 @@ def main():
     pull = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(pull)
     pull.CLIENT_VERSION = "r2-copy-v3"
+    pull.USER_AGENT = "stoarama-nas-pull/" + pull.CLIENT_VERSION
     if args.ca_file:
         # Public, ephemeral fixture trust, ONLY in this test harness. Production
         # has no trust override or fallback; its child source is unchanged.

@@ -97,7 +97,7 @@ func TestNASCleanupReceiptLockOrder(t *testing.T) {
 				go func() {
 					if batch {
 						contradiction["item_id"] = ids[0]
-						done <- cleanupCall(t, receiptServer.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": "test", "receipts": []any{contradiction}})
+						done <- cleanupCall(t, receiptServer.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "receipts": []any{contradiction}})
 					} else {
 						done <- cleanupCall(t, receiptServer.handleAccountNASCleanupResult, 47, 5, "itemId", fmt.Sprint(ids[0]), contradiction)
 					}
@@ -201,7 +201,7 @@ func TestNASCleanupReceiptTransactionRetry(t *testing.T) {
 						send := func() *httptest.ResponseRecorder {
 							if batch {
 								receipt["item_id"] = ids[0]
-								return cleanupCall(t, f.s.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": "test", "receipts": []any{receipt}})
+								return cleanupCall(t, f.s.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "receipts": []any{receipt}})
 							}
 							return cleanupCall(t, f.s.handleAccountNASCleanupResult, 47, 5, "itemId", fmt.Sprint(ids[0]), receipt)
 						}

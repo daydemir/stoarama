@@ -25,7 +25,7 @@ func TestNASCleanupBatchLeaseBoundAndExecutionIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	lease := func(limit any) []cleanupTask {
-		body := map[string]any{"client_version": "test", "protocol": 1, "reconciliation_protocol": nasCleanupReconciliationProtocol}
+		body := map[string]any{"client_version": nasCleanupExecutionClientVersion, "protocol": 1, "reconciliation_protocol": nasCleanupReconciliationProtocol}
 		if limit != nil {
 			body["limit"] = limit
 		}
@@ -82,7 +82,7 @@ func TestNASCleanupBatchLeaseBoundAndExecutionIsolation(t *testing.T) {
 		t.Fatal("foreign task leaked")
 	}
 	for _, limit := range []any{-1, 9, 1.5} {
-		w := cleanupCall(t, s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": "test", "protocol": 1, "limit": limit})
+		w := cleanupCall(t, s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "protocol": 1, "limit": limit})
 		if w.Code != 400 {
 			t.Fatal("invalid batch bound accepted", limit, w.Code)
 		}

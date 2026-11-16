@@ -73,12 +73,18 @@ func TestNASCleanupExecutionCapabilityAndConcurrentLeaseLimit(t *testing.T) {
 	}
 	request := func(protocol, capability int, requestID string) []cleanupTask {
 		t.Helper()
-		body := map[string]any{"client_version": "old-protocol-2", "protocol": protocol, "limit": 8, "reconciliation_protocol": capability}
+		body := map[string]any{"client_version": f.version, "protocol": protocol, "limit": 8, "reconciliation_protocol": capability}
 		if protocol == 2 {
 			body["limit"], body["execution_files"], body["execution_bytes"] = 64, 64, int64(1<<40)
 			body["request_id"] = requestID
 		}
 		w := cleanupCall(t, f.s.handleAccountNASCleanupLease, 47, 5, "", "", body)
+		if !nasCleanupSupportsExecution(f.version) {
+			if w.Code != 409 {
+				t.Errorf("unreviewed release admitted: %d %s", w.Code, w.Body.String())
+			}
+			return nil
+		}
 		var result struct {
 			Tasks []cleanupTask `json:"tasks"`
 		}
@@ -89,9 +95,7 @@ func TestNASCleanupExecutionCapabilityAndConcurrentLeaseLimit(t *testing.T) {
 	}
 	setHeartbeat := func(version string) {
 		t.Helper()
-		if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, version); err != nil {
-			t.Fatal(err)
-		}
+		f.useClientVersion(version)
 	}
 	setHeartbeat("old-protocol-2")
 	for _, protocol := range []int{1, 2} {
@@ -175,16 +179,13 @@ func TestNASCleanupOldProtocolReplayCannotMintFirstPermit(t *testing.T) {
 	body := map[string]any{"reconciliation_protocol": nasCleanupReconciliationProtocol, "attempt": task.Attempt, "plan_sha256": sha, "outcome": "match", "proof": fixtureProof(task.Item), "client_version": "old", "request_id": strings.Repeat("a", 32)}
 	for n := 0; n < 2; n++ {
 		w := cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(task.ItemID), body)
-		if w.Code != 200 || strings.Contains(w.Body.String(), `"delete":true`) {
+		if w.Code != 409 || strings.Contains(w.Body.String(), `"delete":true`) {
 			t.Fatalf("old replay minted permit: %d %s", w.Code, w.Body.String())
 		}
 		body["item_id"] = task.ItemID
 		w = cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": "old", "observations": []any{body}})
 		delete(body, "item_id")
-		var response struct {
-			Results []batchResult `json:"results"`
-		}
-		if json.Unmarshal(w.Body.Bytes(), &response) != nil || len(response.Results) != 1 || response.Results[0].Status != 200 || response.Results[0].Delete {
+		if w.Code != 409 || strings.Contains(w.Body.String(), `"delete":true`) {
 			t.Fatalf("old batch replay: %d %s", w.Code, w.Body.String())
 		}
 	}
@@ -229,12 +230,13 @@ func TestNASCleanupRolledBackCheckpointNeverMintsFirstPermit(t *testing.T) {
 			t.Fatal(err)
 		}
 		w := cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(task.ItemID), req)
-		if w.Code != 200 && w.Code != 409 || strings.Contains(w.Body.String(), `"delete":true`) {
+		deniedHeartbeat := version != nasCleanupExecutionClientVersion
+		if (deniedHeartbeat && w.Code != 403) || (!deniedHeartbeat && w.Code != 200 && w.Code != 409) || strings.Contains(w.Body.String(), `"delete":true`) {
 			t.Fatalf("replay minted permit: %d %s", w.Code, w.Body.String())
 		}
 		o := cleanupBatchObservation{ItemID: task.ItemID, cleanupObserve: req}
 		w = cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "observations": []any{o}})
-		if w.Code != 200 || strings.Contains(w.Body.String(), `"delete":true`) {
+		if (deniedHeartbeat && w.Code != 403) || (!deniedHeartbeat && w.Code != 200) || strings.Contains(w.Body.String(), `"delete":true`) {
 			t.Fatalf("batch replay minted permit: %d %s", w.Code, w.Body.String())
 		}
 	}
@@ -377,7 +379,7 @@ func TestNASCleanupLiveSessionRequiredBeforeRollbackHeartbeat(t *testing.T) {
 				t.Fatal(err)
 			}
 			w := cleanupCall(t, f.s.handleAccountNASCleanupLease, 47, 5, "", "", leaseBody, "rollback-boot old-protocol-2")
-			if w.Code != 200 || strings.Contains(w.Body.String(), `"approved_proof"`) {
+			if w.Code != 403 || strings.Contains(w.Body.String(), `"approved_proof"`) {
 				t.Fatalf("old version execution: %s", w.Body.String())
 			}
 		})
@@ -396,7 +398,7 @@ func TestNASCleanupMatchingHeartbeatCannotReplaceLeaseSession(t *testing.T) {
 	if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_boot_id='replacement-boot',last_seen_at=now() WHERE id=13`); err != nil {
 		t.Fatal(err)
 	}
-	req := cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: task.Attempt, PlanSHA: sha, Outcome: "match", Proof: fixtureProof(task.Item), RequestID: strings.Repeat("a", 32)}
+	req := cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: task.Attempt, PlanSHA: sha, Outcome: "match", Proof: fixtureProof(task.Item), ClientVersion: nasCleanupExecutionClientVersion, RequestID: strings.Repeat("a", 32)}
 	w := cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(task.ItemID), req, "replacement-boot "+nasCleanupExecutionClientVersion)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), `"action":"reconcile"`) || strings.Contains(w.Body.String(), `"delete":true`) {
 		t.Fatalf("new heartbeat borrowed lease: %d %s", w.Code, w.Body.String())
@@ -464,7 +466,7 @@ func TestNASCleanupHeartbeatExpiresDuringPolicyWork(t *testing.T) {
 	if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET last_seen_at=clock_timestamp()-interval '5 minutes'+interval '800 milliseconds' WHERE id=13`); err != nil {
 		t.Fatal(err)
 	}
-	req := cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: task.Attempt, PlanSHA: sha, Outcome: "match", Proof: fixtureProof(task.Item), RequestID: strings.Repeat("a", 32)}
+	req := cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: task.Attempt, PlanSHA: sha, Outcome: "match", Proof: fixtureProof(task.Item), ClientVersion: nasCleanupExecutionClientVersion, RequestID: strings.Repeat("a", 32)}
 	w := cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(task.ItemID), req)
 	if tracer.calls.Load() != 1 || w.Code != 200 || !strings.Contains(w.Body.String(), `"action":"reconcile"`) || strings.Contains(w.Body.String(), `"delete":true`) {
 		t.Fatalf("heartbeat expiry minted authority or bypassed policy: calls=%d %d %s", tracer.calls.Load(), w.Code, w.Body.String())

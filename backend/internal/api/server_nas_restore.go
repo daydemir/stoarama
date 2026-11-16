@@ -2,12 +2,10 @@ package api
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/util"
-	"github.com/jackc/pgx/v5"
 )
 
 // NAS restores are retired. Empty leases issue no capabilities. Reports refuse
@@ -37,27 +35,7 @@ type nasRestoreLeaseResponse struct {
 // nasRestoreConnection resolves the caller's NAS pull connection without
 // locking it: heartbeats update the same row every 30 seconds.
 func (s *Server) nasRestoreConnection(ctx context.Context, w http.ResponseWriter, r *http.Request) (int64, bool) {
-	principal, ok := accountPrincipalFromContext(r.Context())
-	if !ok {
-		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
-		return 0, false
-	}
-	if principal.APIKeyID == nil {
-		util.WriteError(w, http.StatusForbidden, "operation requires a NAS pull key")
-		return 0, false
-	}
-	var connectionID int64
-	err := s.pool.QueryRow(ctx, `SELECT id FROM connections WHERE api_key_id=$1 AND account_id=$2 AND kind='nas_pull'`,
-		*principal.APIKeyID, principal.AccountID).Scan(&connectionID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		util.WriteError(w, http.StatusForbidden, "no connection for this key")
-		return 0, false
-	}
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, "load restore connection failed")
-		return 0, false
-	}
-	return connectionID, true
+	return s.nasConnection(ctx, w, r, nasConnectionMetadata)
 }
 
 // handleAccountConnectionRestoreLease returns the existing empty-lease protocol.

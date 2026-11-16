@@ -122,6 +122,17 @@ func cleanupCall(t *testing.T, h http.HandlerFunc, account, key int64, idParam, 
 	if header != "" {
 		req.Header.Set(cleanupClientSessionHeader, header)
 	}
+	version := nasCleanupExecutionClientVersion
+	if fields := strings.Fields(header); len(fields) == 2 {
+		version = fields[1]
+	}
+	var declared struct {
+		Version string `json:"client_version"`
+	}
+	if json.Unmarshal(b, &declared) == nil && declared.Version != "" {
+		version = declared.Version
+	}
+	req.Header.Set("User-Agent", "stoarama-nas-pull/"+version)
 	route := chi.NewRouteContext()
 	route.URLParams.Add(idParam, id)
 	req = req.WithContext(context.WithValue(context.WithValue(req.Context(), chi.RouteCtxKey, route), accountPrincipalContextKey, accountPrincipal{AccountID: account, APIKeyID: &key}))
@@ -138,7 +149,7 @@ func TestNASCleanupLeaseRetriesAndMasterOff(t *testing.T) {
 		t.Fatal(err)
 	}
 	lease := func(account, key int64) cleanupTask {
-		w := cleanupCall(t, s.handleAccountNASCleanupLease, account, key, "", "", map[string]any{"client_version": "test", "protocol": 1})
+		w := cleanupCall(t, s.handleAccountNASCleanupLease, account, key, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "protocol": 1})
 		if w.Code != 200 {
 			t.Fatal(w.Body.String())
 		}
@@ -162,7 +173,7 @@ func TestNASCleanupLeaseRetriesAndMasterOff(t *testing.T) {
 	if first.Attempt != 1 {
 		t.Fatal("bad first attempt")
 	}
-	body := cleanupObserve{Attempt: 1, PlanSHA: strings.Repeat("b", 64), Outcome: "missing", Error: "missing", ClientVersion: "test"}
+	body := cleanupObserve{Attempt: 1, PlanSHA: strings.Repeat("b", 64), Outcome: "missing", Error: "missing", ClientVersion: nasCleanupExecutionClientVersion}
 	if w := cleanupCall(t, s.handleAccountNASCleanupObserve, 48, 6, "itemId", "1", body); w.Code != 409 {
 		t.Fatal("foreign observation accepted")
 	}

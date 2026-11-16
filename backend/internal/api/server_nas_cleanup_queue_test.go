@@ -55,7 +55,7 @@ func TestNASCleanupPriorityAndReadOnlyResume(t *testing.T) {
 		t.Fatal("status omitted scheduling/master gates")
 	}
 	lease := func() cleanupTask {
-		w := cleanupCall(t, s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": "test", "protocol": 1})
+		w := cleanupCall(t, s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "protocol": 1})
 		var r struct {
 			Tasks []cleanupTask `json:"tasks"`
 		}
@@ -77,7 +77,7 @@ func TestNASCleanupPriorityAndReadOnlyResume(t *testing.T) {
 		t.Fatalf("within-plan order changed: %d", got)
 	}
 	// Master OFF, paused and foreign plans stay excluded even at high priority.
-	w = cleanupCall(t, s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": "test", "protocol": 1})
+	w = cleanupCall(t, s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "protocol": 1})
 	var empty struct {
 		Tasks []cleanupTask `json:"tasks"`
 	}
@@ -147,7 +147,7 @@ func TestNASCleanupPriorityProbeSkipsLockedPlan(t *testing.T) {
 	if _, err = tx.Exec(ctx, `SELECT id FROM nas_cleanup_items WHERE id=2 FOR UPDATE`); err != nil {
 		t.Fatal(err)
 	}
-	w := cleanupCall(t, s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": "test", "protocol": 1})
+	w := cleanupCall(t, s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "protocol": 1})
 	var result struct {
 		Tasks []cleanupTask `json:"tasks"`
 	}
@@ -178,7 +178,7 @@ func TestNASCleanupSupersededPlansAreInertAndRetire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := cleanupCall(t, s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": "test", "protocol": 1, "limit": 8})
+	w := cleanupCall(t, s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "protocol": 1, "limit": 8})
 	var leased struct {
 		Tasks []cleanupTask `json:"tasks"`
 	}

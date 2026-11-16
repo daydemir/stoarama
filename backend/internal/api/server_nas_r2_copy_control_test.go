@@ -88,6 +88,7 @@ func runCopyControlFixture(t *testing.T, url, ca string, timeout time.Duration, 
 func authenticatedCopyFixture(t *testing.T) (*cleanupFixture, *httptest.Server) {
 	t.Helper()
 	f, first := copyTestFixture(t)
+	f.useClientVersion(nasCleanupR2CopyControlClientVersion)
 	f.s.cfg.NASR2CopyEnabled = true
 	_, err := f.pool.Exec(f.ctx, `ALTER TABLE accounts ADD COLUMN email text DEFAULT 'fixture@example.test', ADD COLUMN name text DEFAULT 'fixture', ADD COLUMN role text DEFAULT 'member', ADD COLUMN status text DEFAULT 'active';
 CREATE TABLE account_api_keys(id bigint PRIMARY KEY,account_id bigint,secret_hash text,scopes text[],revoked_at timestamptz,expires_at timestamptz,last_used_at timestamptz)`)
@@ -119,6 +120,7 @@ CREATE TABLE account_api_keys(id bigint PRIMARY KEY,account_id bigint,secret_has
 	}
 	router := chi.NewRouter()
 	router.Use(f.s.requireAccountAuth, f.s.confineAccountScope, f.s.fenceNASDelivery)
+	router.Get("/api/v1/account/connections/stitch/evidence/admission", f.s.handleAccountNASStitchEvidenceAdmission)
 	router.Post(copyControlLeasePath, f.s.handleNASR2CopyLease)
 	router.Post("/api/v1/account/connections/r2-copy/{id}/checkpoint", f.s.handleNASR2CopyCheckpoint)
 	srv := httptest.NewServer(router)

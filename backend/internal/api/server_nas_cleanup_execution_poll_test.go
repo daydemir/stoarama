@@ -13,6 +13,7 @@ func TestNASCleanupExecutionPollingDoesNotQueueDryWork(t *testing.T) {
 }
 func testTestNASCleanupExecutionPollingDoesNotQueueDryWork(t *testing.T, version string) {
 	f := newCleanupFixture(t, 12)
+	f.useClientVersion(version)
 	f.admit("dry-supply", syntheticFiles(100, 12, 10))
 	lease := func(only bool, request string) (int, []cleanupTask) {
 		w := cleanupCall(t, f.s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{

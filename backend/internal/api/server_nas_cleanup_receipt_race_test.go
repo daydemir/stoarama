@@ -149,7 +149,7 @@ func TestNASCleanupContradictionRacingAdvancePausesSuccessor(t *testing.T) {
 			go func() {
 				if batch {
 					contradiction["item_id"] = task.ItemID
-					done <- cleanupCall(t, f.s.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": "test", "receipts": []any{contradiction}})
+					done <- cleanupCall(t, f.s.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "receipts": []any{contradiction}})
 				} else {
 					done <- cleanupCall(t, f.s.handleAccountNASCleanupResult, 47, 5, "itemId", fmt.Sprint(task.ItemID), contradiction)
 				}
