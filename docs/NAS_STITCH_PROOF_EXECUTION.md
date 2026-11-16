@@ -188,8 +188,8 @@ These metadata writes/reads must be included in the controller's operation
 review; they grant no additional NAS/media action.
 
 The new service POST `/service/nas-stitch/readback/validate` accepts a strict
-<=256KiB request containing canonical-base64 readback and full native-result
-bytes with hashes (each decoded<=64KiB). It preserves `media_seconds`; only an
+<=2MiB request containing canonical-base64 original task bytes (decoded<=1MiB),
+readback and full native-result bytes (each decoded<=64KiB), all with exact hashes. It preserves `media_seconds`; only an
 internal projection enters the unchanged native-result validator. GET
 `/service/nas-stitch/readback/status?receipt_sha256=...` observes the specific
 preserved receipt without refreshing it. Both use read-only PK-scoped SQL with
@@ -206,7 +206,7 @@ repository/commit/service/instance only; no deployment ID is inferred.
 credential or activation entry. It takes bounded scoped log pages, original
 run/plan/pair/readback/task/boot identities, a dedicated regular-file component
 root and explicit reviewed producer/reader executable hashes. It holds byte
-snapshots before executing the exact native81ff and distinct readbacke98c
+snapshots before executing the exact native81ff and distinct readbackf3a22a
 verifiers. It rejects unstamped source, aliases, missing/conflicting chunks,
 changed metadata and wrong transport identity. Output is create-only metadata,
 the exact decoded registration, mechanical replay results, and a server

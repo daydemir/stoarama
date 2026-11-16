@@ -33,7 +33,7 @@ class Hold(ValueError):
 
 def load_contract():
     names = {"StitchReadbackContractError", "StitchReadbackDefinition", "stitch_readback_validate",
-             "NASStitchMode", "StitchProofSwitch", "StitchSwitches", "StitchProfileKey", "StitchClientIdentity",
+             "stitch_seconds_ns", "stitch_delta_ns", "StitchDeadline", "NASStitchMode", "StitchProofSwitch", "StitchSwitches", "StitchProfileKey", "StitchClientIdentity",
              "StitchProfileBytes", "StitchProducerProfile", "StitchProfilePair",
              "stitch_readback_profiles", "stitch_proof_json", "StitchReadbackIntegrity",
              "stitch_readback_file", "stitch_readback_registration", "stitch_readback_native",
@@ -417,7 +417,7 @@ class ReadbackDeadlineTests(unittest.TestCase):
         self.clock = 100.0
         self.switches = CORE["StitchSwitches"](); self.switches.apply(dict(ok=True,stitch_proof_task_id=2))
         self.cfg=SimpleNamespace(stitch_switches=self.switches)
-        CORE.update(time=SimpleNamespace(monotonic=lambda:self.clock),
+        CORE.update(time=SimpleNamespace(monotonic=lambda:self.clock,monotonic_ns=lambda:int(self.clock*10**9)),
             utc_now=lambda:UTC, parse_certification_timestamp=lambda value,label:datetime.datetime.fromisoformat(value.replace("Z","+00:00")),
             stitch_resources=lambda cfg:None,
             NAS_MEDIA_FENCE=SimpleNamespace(condition=threading.Condition(),execution_owner=None,cleaners=0))
@@ -659,9 +659,9 @@ class EvidenceLedgerTests(unittest.TestCase):
         restarted=CORE["StitchEvidenceLedger"](self.store)
         self.assertEqual(restarted.original_admission(),original)
         restarted.observe_mode(mode.NATIVE,self.now+datetime.timedelta(minutes=20), ID,ID)
-        with self.assertRaises(Hold):restarted.native_deadline(self.now+datetime.timedelta(minutes=15))
+        with self.assertRaises(Hold):restarted.native_deadline_ns(self.now+datetime.timedelta(minutes=15))
         with self.assertRaises(CORE["StitchReadbackIntegrity"]):restarted.bind_admission(b'{"later":"expiry"}')
-        self.assertEqual(restarted.native_deadline(self.now),100+15*60-30)
+        self.assertEqual(restarted.native_deadline_ns(self.now),(100+15*60-30)*10**9)
         restarted.observe_mode(mode.DISABLED,self.now+datetime.timedelta(minutes=20), ID)
         restarted.observe_mode(mode.NATIVE,self.now+datetime.timedelta(minutes=21), ID,ID)
         self.assertEqual(restarted.state["window"]["expires_at"],expiry)
@@ -760,10 +760,10 @@ class EvidenceLedgerTests(unittest.TestCase):
         restarted=CORE["StitchEvidenceLedger"](self.store)
         restarted.observe_mode(mode.NATIVE,self.now-datetime.timedelta(days=1),ID,ID)
         self.assertEqual(restarted.state["window"]["deadline_monotonic_ns"],original)
-        with self.assertRaises(Hold):restarted.native_deadline(self.now-datetime.timedelta(days=1))
+        with self.assertRaises(Hold):restarted.native_deadline_ns(self.now-datetime.timedelta(days=1))
         self.clock=1
         restarted.observe_mode(mode.NATIVE,self.now,"22222222-2222-4222-8222-222222222222",ID)
-        with self.assertRaises(Hold):restarted.native_deadline(self.now)
+        with self.assertRaises(Hold):restarted.native_deadline_ns(self.now)
         with self.assertRaises(Hold):restarted.due()
 
 

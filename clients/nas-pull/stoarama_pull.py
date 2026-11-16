@@ -47020,16 +47020,40 @@ class StitchRunKind(Enum):
     PROOF = "proof"
 
 
-class StitchStop:
+def stitch_seconds_ns(seconds):
+    """Conservative conversion only at legacy float-seconds I/O boundaries."""
+    numerator,denominator = seconds.as_integer_ratio()
+    return numerator*10**9//denominator
+
+
+def stitch_delta_ns(delta):
+    return (delta.days*86400+delta.seconds)*10**9+delta.microseconds*1000
+
+
+class StitchDeadline:
+    """Hard authority uses integer ns; float seconds are an I/O projection."""
+    @property
+    def deadline(self):
+        return None if self.deadline_ns is None else self.deadline_ns/10**9
+
+    @deadline.setter
+    def deadline(self, seconds):
+        limit = stitch_seconds_ns(seconds)
+        self.deadline_ns = limit if self.deadline_ns is None else min(self.deadline_ns,limit)
+
+
+class StitchStop(StitchDeadline):
     """Keep the native-child watchdog nonblocking; poll remote gates separately."""
     def __init__(self, cfg, stop, task=None, kind=StitchRunKind.PRODUCTION):
         self.cfg, self.stop, self.task, self.reason = cfg, stop, task, ""
         self.kind = kind
         self.failure = None
         self.measurements = []
-        self.started = time.monotonic()
-        self.deadline = (min(self.started+15*60-30, self.started + (parse_certification_timestamp(task["expires_at"], "proof expiry")
-            - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 30)
+        self.started_ns = time.monotonic_ns()
+        self.started = self.started_ns/10**9
+        self.deadline_ns = (self.started_ns+min(870*10**9,
+            stitch_delta_ns(parse_certification_timestamp(task["expires_at"], "proof expiry")
+                - datetime.datetime.now(datetime.timezone.utc))-30*10**9)
             if kind is StitchRunKind.PROOF and task is not None else None)
         self.run_id = str(uuid.uuid4())
         self.started_at = utc_now()
@@ -47041,7 +47065,7 @@ class StitchStop:
     def is_set(self):
         if self.stop.is_set():
             return True
-        if self.deadline is not None and time.monotonic() >= self.deadline:
+        if self.deadline_ns is not None and time.monotonic_ns() >= self.deadline_ns:
             self.reason = "proof deadline reached"
         if ((self.switch_cancel is not None and self.switch_cancel.is_set())
                 or not getattr(self.cfg, "stitch_proof_enabled" if self.kind is StitchRunKind.PROOF else "stitch_enabled", False)):
@@ -47081,7 +47105,7 @@ class StitchStop:
 def stitch_proof_activity(inventory, stop):
     STITCH_STATUS.update(state="proof_waiting_inventory")
     while not stop.is_set():
-        remaining = stop.deadline - time.monotonic()
+        remaining = (stop.deadline_ns-time.monotonic_ns())/10**9
         if remaining <= 0:
             break
         if inventory.activity_lock.acquire(timeout=min(.25, remaining)):
@@ -47124,13 +47148,15 @@ except Exception:
 STITCH_PROOF_HTTP_REAP_SEC = 2
 
 
-def stitch_proof_remaining(stop, deadline):
+def stitch_proof_remaining(stop, deadline_ns):
     if stop.is_set():
         raise StitchHold("proof cancelled or expired")
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
+    if type(deadline_ns) is not int:
+        raise StitchHold("integer proof deadline required")
+    remaining_ns = min(deadline_ns,stop.deadline_ns)-time.monotonic_ns()
+    if remaining_ns <= 0:
         raise BenchmarkDeadline("proof deadline reached")
-    return remaining
+    return remaining_ns/10**9
 
 
 @contextmanager
@@ -47178,7 +47204,8 @@ def stitch_proof_input(process, message, stop, deadline):
 @contextmanager
 def stitch_bounded_http(cfg, request, stop, limit, timeout):
     # Reserve kill/reap time inside the immutable original caller deadline.
-    deadline = min(stop.deadline - STITCH_PROOF_HTTP_REAP_SEC, time.monotonic() + timeout)
+    deadline = min(stop.deadline_ns-STITCH_PROOF_HTTP_REAP_SEC*10**9,
+        time.monotonic_ns()+stitch_seconds_ns(timeout))
     remaining = stitch_proof_remaining(stop, deadline)
     url = urllib.parse.urlsplit(request.full_url)
     method = request.get_method()
@@ -47280,11 +47307,11 @@ def stitch_corpus(cfg, stop=None):
     # Import in a separate DB connection/transaction. Inventory heartbeats keep
     # reading their last completed snapshot; no partial corpus becomes usable.
     proof = getattr(stop, "kind", None) is StitchRunKind.PROOF
-    wait = min(60, stitch_proof_remaining(stop, stop.deadline)) if proof else 60
+    wait = min(60, stitch_proof_remaining(stop, stop.deadline_ns)) if proof else 60
     database = sqlite3.connect(str(cfg.inventory_file), timeout=wait)
     def budget():
         if proof:
-            database.execute("PRAGMA busy_timeout=%d" % int(1000 * min(60, stitch_proof_remaining(stop, stop.deadline))))
+            database.execute("PRAGMA busy_timeout=%d" % int(1000 * min(60, stitch_proof_remaining(stop, stop.deadline_ns))))
     try:
         budget()
         database.execute("CREATE TABLE IF NOT EXISTS v85r_stitch_corpus_meta(sha TEXT PRIMARY KEY)")
@@ -47342,9 +47369,9 @@ def stitch_frozen(inventory, previous, clip, stop):
     query = "SELECT witness FROM v85r_stitch_edges WHERE a=? AND b=?"
     if getattr(stop, "kind", None) is StitchRunKind.PROOF:
         database = sqlite3.connect(Path(stop.cfg.inventory_file).resolve().as_uri()+"?mode=ro",
-            uri=True, timeout=min(30, stitch_proof_remaining(stop, stop.deadline)))
+            uri=True, timeout=min(30, stitch_proof_remaining(stop, stop.deadline_ns)))
         try:
-            database.execute("PRAGMA busy_timeout=%d" % int(1000 * min(30, stitch_proof_remaining(stop, stop.deadline))))
+            database.execute("PRAGMA busy_timeout=%d" % int(1000 * min(30, stitch_proof_remaining(stop, stop.deadline_ns))))
             row = database.execute(query, params).fetchone()
         finally:
             database.close()
@@ -47744,6 +47771,7 @@ class StitchDirectory:
             raise StitchHold("invalid stitch directory")
         self.cfg, self.task_id, self.stop = cfg, task_id, stop
         self.root, self.relative, self.fds = Path(cfg.output_dir), relative, []
+        self.created = False
 
     def __enter__(self):
         try:
@@ -47753,9 +47781,11 @@ class StitchDirectory:
             device = os.fstat(fd).st_dev
             for part in self.relative.split("/"):
                 stitch_check(self.stop)
+                self.created = False
                 try:
                     os.mkdir(part, 0o700, dir_fd=self.fds[-1])
                     os.fsync(self.fds[-1])
+                    self.created = True
                 except FileExistsError:
                     pass
                 fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fds[-1])
@@ -49180,7 +49210,7 @@ def stitch_readback_pipeline(cfg, reader, stop):
             pin["size_bytes"], stop, (pin["size_bytes"], pin["sha256"]))
 
 
-class StitchReadbackStop:
+class StitchReadbackStop(StitchDeadline):
     """One immutable budget for admission, rehash and receipt construction."""
     def __init__(self, cfg, stop, expires_at):
         self.cfg, self.stop, self.reason = cfg, stop, ""
@@ -49188,25 +49218,25 @@ class StitchReadbackStop:
         self.mode, self.switch_cancel, self.activation_id = switches.proof
         if self.mode not in (NASStitchMode.NATIVE, NASStitchMode.READBACK):
             raise StitchHold("readback selector inactive")
-        now = time.monotonic()
-        remaining = (parse_certification_timestamp(expires_at, "readback expiry")
-                     - datetime.datetime.now(datetime.timezone.utc)).total_seconds()-30
-        self.deadline = min(now+90, now+remaining)
-        self.next_resource_check = now+5
+        self.started_ns = time.monotonic_ns()
+        remaining_ns = stitch_delta_ns(parse_certification_timestamp(expires_at, "readback expiry")
+                     - datetime.datetime.now(datetime.timezone.utc))-30*10**9
+        self.deadline_ns = self.started_ns+min(90*10**9,remaining_ns)
+        self.next_resource_check_ns = self.started_ns+5*10**9
         self.started_at, self.run_id = utc_now(), str(uuid.uuid4())
         stitch_check(self)
 
     def is_set(self):
         if self.stop.is_set() or self.switch_cancel.is_set() or self.cfg.stitch_switches.proof[0] is not self.mode:
             self.reason = "readback cancelled"
-        now = time.monotonic()
-        if now >= self.deadline:
+        now_ns = time.monotonic_ns()
+        if now_ns >= self.deadline_ns:
             self.reason = "readback deadline reached"
         with NAS_MEDIA_FENCE.condition:
             if NAS_MEDIA_FENCE.execution_owner is not None or NAS_MEDIA_FENCE.cleaners:
                 self.reason = "readback yielded to cleanup"
-        if not self.reason and now >= self.next_resource_check:
-            self.next_resource_check = now+5
+        if not self.reason and now_ns >= self.next_resource_check_ns:
+            self.next_resource_check_ns = now_ns+5*10**9
             try:
                 stitch_resources(self.cfg)
             except StitchHold:
@@ -49365,14 +49395,14 @@ class StitchEvidenceProgress(NamedTuple):
     cursor: int
 
 
-class StitchEvidenceStop:
+class StitchEvidenceStop(StitchDeadline):
     """Transport already durable metadata after OFF, with its own short bound."""
     def __init__(self, stop):
         self.stop = stop
-        self.deadline = time.monotonic()+min(20, HEARTBEAT_TIMEOUT_SEC)
+        self.deadline_ns = time.monotonic_ns()+min(20, HEARTBEAT_TIMEOUT_SEC)*10**9
 
     def is_set(self):
-        return self.stop.is_set() or time.monotonic() >= self.deadline
+        return self.stop.is_set() or time.monotonic_ns() >= self.deadline_ns
 
 
 def stitch_evidence_send(cfg, pacer, key, body, cursor, boot, stop_event):
@@ -49418,6 +49448,7 @@ class StitchEvidenceDirectory(StitchDirectory):
         super().__init__(cfg, "v85r-proof-evidence", 1, stop)
         self.root = Path(cfg.state_dir)
         self.lock_fd = -1
+        self.initializing = False
 
     def __enter__(self):
         backing = inventory_scratch_backing(self.cfg.state_dir)
@@ -49425,6 +49456,7 @@ class StitchEvidenceDirectory(StitchDirectory):
         log("INFO","proof evidence storage qualified filesystem=%s device=%d free_bytes=%d" %
             (backing[1].value,backing[0],storage.f_bavail*storage.f_frsize))
         super().__enter__()
+        self.initializing = self.created
         try:
             owned = os.fstat(self.fds[-1])
             if owned.st_uid != os.geteuid() or stat_module.S_IMODE(owned.st_mode) != 0o700:
@@ -49436,6 +49468,7 @@ class StitchEvidenceDirectory(StitchDirectory):
                 raise StitchHold("another evidence writer is active") from None
             self.check()
             self.capacity(0)
+            self.snapshot()  # Existing stores never default a missing checkpoint.
             return self
         except BaseException:
             self.__exit__(None,None,None)
@@ -49537,9 +49570,10 @@ class StitchEvidenceDirectory(StitchDirectory):
         try:
             os.stat("state.json",dir_fd=self.fds[-1],follow_symlinks=False)
         except FileNotFoundError:
-            if set(stitch_directory_entries(self.fds[-1],self.stop)) != {".lock"}:
+            if not self.initializing or set(stitch_directory_entries(self.fds[-1],self.stop)) != {".lock"}:
                 raise StitchReadbackIntegrity("evidence checkpoint missing beside preserved bytes")
             return StitchEvidenceSnapshot(False,"",b"")
+        self.initializing = False
         actual, body = stitch_readback_file(self.root,self.relative+"/state.json",65536,self.stop,retain=True)
         return StitchEvidenceSnapshot(True,actual[1],body)
 
@@ -49552,6 +49586,7 @@ class StitchEvidenceDirectory(StitchDirectory):
             raise StitchReadbackIntegrity("evidence checkpoint changed")
         with self.stage(body) as stage:
             self.check()
+            self.initializing = False
             os.replace(stage,"state.json",src_dir_fd=self.fds[-1],dst_dir_fd=self.fds[-1])
             os.fsync(self.fds[-1])
         return self.snapshot()
@@ -49746,18 +49781,19 @@ class StitchEvidenceLedger:
             raise StitchHold("original native admission unavailable")
         return self.store.read(self.state["window"]["admission_sha256"])
 
-    def native_deadline(self, now):
+    def native_deadline_ns(self, now):
         if (now.tzinfo != datetime.timezone.utc or self.state["mode"] != NASStitchMode.NATIVE
                 or not self.state["window"]):
             raise StitchHold("original native window unavailable")
         expiry = datetime.datetime.fromisoformat(self.state["window"]["expires_at"].replace("Z","+00:00"))
         if self.observed_boot != self.state["window"]["boot_id"]:
             raise StitchHold("native activation boot changed; fresh operation required")
-        remaining = min((expiry-now).total_seconds(),
-            (self.state["window"]["deadline_monotonic_ns"]-time.monotonic_ns())/10**9)-30
-        if remaining <= 0:
+        now_ns = time.monotonic_ns()
+        remaining_ns = min(stitch_delta_ns(expiry-now),
+            self.state["window"]["deadline_monotonic_ns"]-now_ns)-30*10**9
+        if remaining_ns <= 0:
             raise StitchHold("original native window expired")
-        return time.monotonic()+min(15*60-30,remaining)
+        return now_ns+min(870*10**9,remaining_ns)
 
     def bind_session(self, session):
         value = self.copy()
@@ -49975,7 +50011,7 @@ def stitch_evidence_native(cfg, inventory, event, ledger, execution):
         # a distinct run namespace, not a refreshed lease/deadline on this run.
         raise StitchHold("native attempt already entered; new reviewed activation required")
     stop = StitchReadbackStop(cfg,event,ledger.state["window"]["expires_at"])
-    stop.deadline = min(stop.deadline,ledger.native_deadline(datetime.datetime.now(datetime.timezone.utc)))
+    stop.deadline_ns = min(stop.deadline_ns,ledger.native_deadline_ns(datetime.datetime.now(datetime.timezone.utc)))
     if stop.activation_id != ledger.state["window"]["activation_id"]:
         raise StitchHold("native activation observation changed")
     stitch_check(stop);ledger.enter_native()
@@ -49992,7 +50028,7 @@ def stitch_evidence_native(cfg, inventory, event, ledger, execution):
     stitch_check(admission_stop)
     stop.run_id,stop.evidence_context = context["native_run_id"],context
     stop.activation_id = context["activation_id"]
-    stop.deadline = min(stop.deadline,ledger.native_deadline(datetime.datetime.now(datetime.timezone.utc)))
+    stop.deadline_ns = min(stop.deadline_ns,ledger.native_deadline_ns(datetime.datetime.now(datetime.timezone.utc)))
     try:
         stitch_proof_client(cfg,stop);stitch_proof_space(cfg,task,stop)
         with stitch_measure_stage(stop,StitchMeasureStage.SETUP),stitch_proof_activity(inventory,stop):
@@ -50022,7 +50058,7 @@ def stitch_evidence_readback(cfg,event,ledger,execution):
     mode = NASStitchMode(ledger.state["mode"])
     stop = StitchReadbackStop(cfg,event,(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=120)).isoformat())
     if mode is NASStitchMode.NATIVE:
-        stop.deadline = min(stop.deadline,ledger.native_deadline(datetime.datetime.now(datetime.timezone.utc)))
+        stop.deadline_ns = min(stop.deadline_ns,ledger.native_deadline_ns(datetime.datetime.now(datetime.timezone.utc)))
     original = stitch_proof_json(ledger.store.read(native["context_sha256"],stop=stop))
     bundle = ledger.store.read(native["bundle_sha256"],stop=stop)
     task_raw = stitch_evidence_task(original)
@@ -50031,8 +50067,9 @@ def stitch_evidence_readback(cfg,event,ledger,execution):
         context = original
     else:
         context = stitch_evidence_admission(cfg,stop,mode,original["profiles"]["producer_profile_sha256"])
-        stop.deadline = min(stop.deadline,time.monotonic()+(parse_certification_timestamp(context["expires_at"],"readback expiry")
-            -datetime.datetime.now(datetime.timezone.utc)).total_seconds()-30)
+        stop.deadline_ns = min(stop.deadline_ns,time.monotonic_ns()+stitch_delta_ns(
+            parse_certification_timestamp(context["expires_at"],"readback expiry")
+            -datetime.datetime.now(datetime.timezone.utc))-30*10**9)
     raw_profiles,key = stitch_evidence_profiles(context)
     session = dict(native_run_id=native["run_id"],producer_profile_sha256=key.producer,reader_profile_sha256=key.reader,
         profile_pair_sha256=key.pair,reader_boot_id=execution["client_boot_id"])

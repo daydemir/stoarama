@@ -159,8 +159,21 @@ class WorkerTests(unittest.TestCase):
         task=copy.deepcopy(self.context["task"])
         task["expires_at"]=(self.now+datetime.timedelta(days=1)).isoformat()
         stop=pull.StitchStop(self.cfg,self.event,task,pull.StitchRunKind.PROOF)
-        self.assertLessEqual(stop.deadline-stop.started,15*60-30)
+        self.assertLessEqual(stop.deadline_ns-stop.started_ns,(15*60-30)*10**9)
         self.assertEqual(stop.task,task)
+
+    def test_integer_hard_deadlines_hold_at_large_awkward_clock_and_one_ns_boundary(self):
+        origin=2**60+12345;clock=[origin]
+        task=copy.deepcopy(self.context["task"]);task["expires_at"]=(self.now+datetime.timedelta(days=1)).isoformat()
+        with mock.patch.object(pull.time,"monotonic_ns",side_effect=lambda:clock[0]),mock.patch.object(pull,"stitch_resources"):
+            native=pull.StitchStop(self.cfg,self.event,task,pull.StitchRunKind.PROOF)
+            reader=pull.StitchReadbackStop(self.cfg,self.event,task["expires_at"])
+            transport=pull.StitchEvidenceStop(self.event)
+            for stop,budget in ((native,870),(reader,90),(transport,20)):
+                self.assertEqual(stop.deadline_ns,origin+budget*10**9)
+                clock[0]=stop.deadline_ns-1;self.assertFalse(stop.is_set())
+                clock[0]+=1;self.assertTrue(stop.is_set())
+                clock[0]=origin
 
     def test_restart_adopts_only_existing_complete_registration_without_media_work(self):
         with mock.patch.object(pull,"stitch_readback_file",return_value=((len(self.bundle),hashlib.sha256(self.bundle).hexdigest()),self.bundle)) as read,\
@@ -194,7 +207,7 @@ class WorkerTests(unittest.TestCase):
 
     def test_readback_queues_exact_original_bytes_and_preserves_native_times(self):
         self.register()
-        stop=SimpleNamespace(deadline=time.monotonic()+90,is_set=lambda:False)
+        stop=SimpleNamespace(deadline=time.monotonic()+90,deadline_ns=time.monotonic_ns()+90*10**9,is_set=lambda:False)
         with mock.patch.object(pull,"StitchReadbackStop",return_value=stop),\
                 mock.patch.object(pull,"stitch_readback_run",return_value=self.readback()),\
                 mock.patch.object(pull,"stitch_check"),mock.patch.object(pull,"STITCH_STATUS"):

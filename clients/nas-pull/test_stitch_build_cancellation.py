@@ -53,6 +53,7 @@ class BuildCancellationTests(unittest.TestCase):
                 real_bundle=pull.stitch_v85r_bundle
                 with ExitStack() as context:
                     context.enter_context(mock.patch.object(pull.time,"monotonic",side_effect=lambda:clock[0]))
+                    context.enter_context(mock.patch.object(pull.time,"monotonic_ns",side_effect=lambda:int(clock[0]*10**9)))
                     context.enter_context(mock.patch.object(pull.os,"read",side_effect=read))
                     context.enter_context(mock.patch.object(pull,"V85R_TOOLS",pins))
                     context.enter_context(mock.patch.object(pull,"stitch_proof_check"))
@@ -150,6 +151,7 @@ class BuildCancellationTests(unittest.TestCase):
             self.assertTrue(filename.endswith("?mode=ro"));self.assertTrue(kwargs["uri"])
             waits.append(kwargs["timeout"]);return real_connect(filename,**kwargs)
         with mock.patch.object(pull.time,"monotonic",return_value=stop.deadline-.01), \
+                mock.patch.object(pull.time,"monotonic_ns",return_value=int((stop.deadline-.01)*10**9)), \
                 mock.patch.object(pull.sqlite3,"connect",side_effect=connect):
             self.assertEqual(pull.stitch_frozen(inventory,previous,clip,stop),witness)
         self.assertLessEqual(waits[0],.011)
@@ -168,6 +170,7 @@ class BuildCancellationTests(unittest.TestCase):
                 mock.patch.object(pull.os,"uname",return_value=SimpleNamespace(machine="x86_64")), \
                 mock.patch.object(pull,"joined_entry_stat",return_value=SimpleNamespace(st_nlink=1)), \
                 mock.patch.object(pull.time,"monotonic",side_effect=lambda:clock[0]), \
+                mock.patch.object(pull.time,"monotonic_ns",side_effect=lambda:int(clock[0]*10**9)), \
                 mock.patch.object(pull.os,"read",side_effect=read), \
                 mock.patch.object(ctypes,"CDLL") as rename:
             with self.assertRaises(pull.StitchHold):directory.publish("stage.mp4","proof.mp4")
@@ -179,6 +182,7 @@ class BuildCancellationTests(unittest.TestCase):
         def opened():
             file=real_tempfile();clock[0]=deadline+.01;return file
         with mock.patch.object(pull.time,"monotonic",side_effect=lambda:clock[0]), \
+                mock.patch.object(pull.time,"monotonic_ns",side_effect=lambda:int(clock[0]*10**9)), \
                 mock.patch.object(pull.tempfile,"TemporaryFile",side_effect=opened), \
                 mock.patch.object(pull.subprocess,"Popen") as spawn:
             with self.assertRaises(pull.BenchmarkDeadline):

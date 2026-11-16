@@ -19,6 +19,7 @@ import test_stitch_proof_http as transport
 pull = transport.pull
 ID = "11111111-1111-4111-8111-111111111111"
 REAL_MONOTONIC = time.monotonic
+REAL_MONOTONIC_NS = time.monotonic_ns
 
 
 class EvidenceTransportTests(unittest.TestCase):
@@ -29,6 +30,8 @@ class EvidenceTransportTests(unittest.TestCase):
         self.clock = [100.0]
         patch = mock.patch.object(pull.time,"monotonic",side_effect=lambda:self.clock[0])
         patch.start();self.addCleanup(patch.stop)
+        patch_ns=mock.patch.object(pull.time,"monotonic_ns",side_effect=lambda:int(self.clock[0]*10**9))
+        patch_ns.start();self.addCleanup(patch_ns.stop)
         backing = mock.patch.object(pull,"inventory_scratch_backing",return_value=(0,pull.InventoryScratchFilesystem.EXT4))
         backing.start();self.addCleanup(backing.stop)
         self.pacer = pull.StitchEvidencePacer()
@@ -108,7 +111,7 @@ class EvidenceTransportTests(unittest.TestCase):
 
     def test_real_partial_stdin_backpressure_beyond_poll_interval_still_delivers_exact_ack(self):
         child="import time;time.sleep(.35)\n"+self.child(dict(ok=True,stored_lines=64))
-        with mock.patch.object(pull.time,"monotonic",REAL_MONOTONIC),mock.patch.object(pull,"STITCH_PROOF_HTTP_CHILD",child):
+        with mock.patch.object(pull.time,"monotonic",REAL_MONOTONIC),mock.patch.object(pull.time,"monotonic_ns",REAL_MONOTONIC_NS),mock.patch.object(pull,"STITCH_PROOF_HTTP_CHILD",child):
             self.pacer.allowed_at=REAL_MONOTONIC()
             result=self.send()
         self.assertEqual(result,pull.StitchEvidenceProgress(pull.StitchEvidenceDispatch.ACKNOWLEDGED,64))
@@ -119,7 +122,7 @@ class EvidenceTransportTests(unittest.TestCase):
         def capture(*args,**kwargs):
             child=spawn(*args,**kwargs);children.append(child);return child
         request=urllib.request.Request(self.cfg.api_base+"/account/connections/client-logs",method="POST",data=b"x"*(128*1024))
-        with mock.patch.object(pull.time,"monotonic",REAL_MONOTONIC),\
+        with mock.patch.object(pull.time,"monotonic",REAL_MONOTONIC),mock.patch.object(pull.time,"monotonic_ns",REAL_MONOTONIC_NS),\
                 mock.patch.object(pull,"STITCH_PROOF_HTTP_CHILD","import time;time.sleep(30)"),\
                 mock.patch.object(pull.subprocess,"Popen",side_effect=capture) as factory:
             stop=pull.StitchEvidenceStop(threading.Event());stop.deadline=REAL_MONOTONIC()+2.5
@@ -158,6 +161,7 @@ class EvidenceStorageTests(unittest.TestCase):
 
     def test_second_writer_refuses_and_lock_inode_is_never_replaced(self):
         with pull.StitchEvidenceDirectory(self.cfg,self.stop) as first:
+            first.replace(first.snapshot(),b'{"synthetic":true}')
             identity=os.fstat(first.lock_fd)
             with self.assertRaisesRegex(pull.StitchHold,"another evidence writer"):
                 with pull.StitchEvidenceDirectory(self.cfg,self.stop):pass
@@ -173,8 +177,33 @@ class EvidenceStorageTests(unittest.TestCase):
             # Fault injection affects only this test's disposable metadata.
             os.unlink("state.json",dir_fd=store.fds[-1])
             with self.assertRaisesRegex(pull.StitchReadbackIntegrity,"checkpoint missing"):store.snapshot()
+        with self.assertRaisesRegex(pull.StitchReadbackIntegrity,"checkpoint missing"):
+            with pull.StitchEvidenceDirectory(self.cfg,self.stop):pass
+
+    def test_spent_before_admission_missing_state_and_no_blob_never_reinitializes(self):
+        from datetime import datetime,timezone
+        activation="11111111-1111-4111-8111-111111111111"
         with pull.StitchEvidenceDirectory(self.cfg,self.stop) as store:
+            ledger=pull.StitchEvidenceLedger(store)
+            ledger.observe_mode(pull.NASStitchMode.NATIVE,datetime.now(timezone.utc),activation,activation)
+            ledger.enter_native()
+            self.assertEqual(set(os.listdir(store.fds[-1])),{".lock","state.json"})
+            os.unlink("state.json",dir_fd=store.fds[-1])
             with self.assertRaisesRegex(pull.StitchReadbackIntegrity,"checkpoint missing"):store.snapshot()
+        with self.assertRaisesRegex(pull.StitchReadbackIntegrity,"checkpoint missing"):
+            with pull.StitchEvidenceDirectory(self.cfg,self.stop):pass
+        self.assertEqual(set((self.root/"v85r-proof-evidence").iterdir()),{self.root/"v85r-proof-evidence/.lock"})
+
+    def test_interrupted_initialization_and_preexisting_empty_directory_never_default(self):
+        with pull.StitchEvidenceDirectory(self.cfg,self.stop) as store:
+            self.assertFalse(store.snapshot().present)
+        with self.assertRaisesRegex(pull.StitchReadbackIntegrity,"checkpoint missing"):
+            with pull.StitchEvidenceDirectory(self.cfg,self.stop):pass
+        other=self.root/"other";other.mkdir()
+        cfg=SimpleNamespace(state_dir=other,output_dir=self.root/"UNUSED")
+        (other/"v85r-proof-evidence").mkdir(mode=0o700)
+        with self.assertRaisesRegex(pull.StitchReadbackIntegrity,"checkpoint missing"):
+            with pull.StitchEvidenceDirectory(cfg,self.stop):pass
 
     def test_cancelled_or_failed_stage_is_removed_without_changing_checkpoint(self):
         with pull.StitchEvidenceDirectory(self.cfg,self.stop) as store:
