@@ -660,9 +660,9 @@ class EvidenceLedgerTests(unittest.TestCase):
         self.ledger.observe_mode(mode.NATIVE,self.now, ID,ID)
         expiry=self.ledger.state["window"]["expires_at"]
         self.ledger.enter_native()
-        task=dict(expires_at=expiry,explicitly_synthetic="original admission")
+        task=dict(expires_at=expiry,activation_id=ID,explicitly_synthetic="original admission")
         raw=CORE["cleanup_json_bytes"](task)
-        original=CORE["cleanup_json_bytes"](dict(task=task,task_b64=base64.b64encode(raw).decode("ascii"),
+        original=CORE["cleanup_json_bytes"](dict(task=task,activation_id=ID,native_run_id=self.ledger.state["window"]["run_id"],task_b64=base64.b64encode(raw).decode("ascii"),
             task_sha256=hashlib.sha256(raw).hexdigest()))
         self.assertEqual(self.ledger.bind_admission(original),original)
         self.ledger.observe_mode(mode.NATIVE,self.now+datetime.timedelta(minutes=10), ID,ID)
@@ -671,7 +671,10 @@ class EvidenceLedgerTests(unittest.TestCase):
         self.assertEqual(restarted.original_admission(),original)
         restarted.observe_mode(mode.NATIVE,self.now+datetime.timedelta(minutes=20), ID,ID)
         with self.assertRaises(Hold):restarted.native_deadline_ns(self.now+datetime.timedelta(minutes=15))
-        with self.assertRaises(CORE["StitchReadbackIntegrity"]):restarted.bind_admission(b'{"later":"expiry"}')
+        changed=json.loads(original);changed["task"]["expires_at"]="2099-01-01T00:00:00Z"
+        raw=CORE["cleanup_json_bytes"](changed["task"])
+        changed.update(task_b64=base64.b64encode(raw).decode("ascii"),task_sha256=hashlib.sha256(raw).hexdigest())
+        with self.assertRaises(CORE["StitchReadbackIntegrity"]):restarted.bind_admission(CORE["cleanup_json_bytes"](changed))
         self.assertEqual(restarted.native_deadline_ns(self.now),(100+15*60-30)*10**9)
         restarted.observe_mode(mode.DISABLED,self.now+datetime.timedelta(minutes=20), ID)
         restarted.observe_mode(mode.NATIVE,self.now+datetime.timedelta(minutes=21), ID,ID)

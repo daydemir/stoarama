@@ -49768,12 +49768,12 @@ class StitchEvidenceLedger:
         if self.state["mode"] != NASStitchMode.NATIVE or not self.state["window"] or not self.state["window"]["entered"]:
             raise StitchHold("native activation window unavailable")
         window = self.state["window"]
+        context = stitch_proof_json(raw)
+        self.native_task(context)
         if "admission_sha256" in window:
             if hashlib.sha256(raw).hexdigest() != window["admission_sha256"]:
                 raise StitchReadbackIntegrity("original native admission cannot be replaced")
             return self.store.read(window["admission_sha256"])
-        context = stitch_proof_json(raw)
-        stitch_evidence_task(context)
         task_deadline_ns = time.monotonic_ns()+stitch_delta_ns(
             parse_certification_timestamp(context["task"]["expires_at"],"original task expiry")
             -datetime.datetime.now(datetime.timezone.utc))
@@ -49789,6 +49789,13 @@ class StitchEvidenceLedger:
         if "admission_sha256" not in self.state["window"]:
             raise StitchHold("original native admission unavailable")
         return self.store.read(self.state["window"]["admission_sha256"])
+
+    def native_task(self, context):
+        window = self.state["window"]
+        if (context["activation_id"] != window["activation_id"] or context["native_run_id"] != window["run_id"]
+                or context["task"].get("activation_id") != context["activation_id"]):
+            raise StitchReadbackIntegrity("original operator activation/run differs")
+        return stitch_evidence_task(context)
 
     def native_deadline_ns(self, now):
         if (now.tzinfo != datetime.timezone.utc or self.state["mode"] != NASStitchMode.NATIVE
@@ -49881,11 +49888,7 @@ class StitchEvidenceLedger:
 
     def prepare_native(self, context):
         raw = cleanup_json_bytes(context)
-        if (context["activation_id"] != self.state["window"]["activation_id"]
-                or context["native_run_id"] != self.state["window"]["run_id"]
-                or context["task"].get("activation_id") != context["activation_id"]):
-            raise StitchReadbackIntegrity("original operator activation/run differs")
-        stitch_evidence_task(context)
+        self.native_task(context)
         if self.original_admission() != raw:
             raise StitchReadbackIntegrity("native context differs from original admission")
         digest = self.store.put(raw)
@@ -50066,7 +50069,14 @@ def stitch_evidence_readback(cfg,event,ledger,execution):
         raise StitchHold("preserved native registration required; no native fallback")
     mode = NASStitchMode(ledger.state["mode"])
     stop = StitchReadbackStop(cfg,event,(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=120)).isoformat())
+    if stop.mode is not mode:
+        raise StitchHold("readback selector observation changed")
     if mode is NASStitchMode.NATIVE:
+        window = ledger.state["window"]
+        if (not window["entered"] or window["run_id"] != native["run_id"]
+                or window.get("admission_sha256") != native["context_sha256"]
+                or window["activation_id"] != stop.activation_id):
+            raise StitchHold("native readback original activation differs; preserved renewal requires mode2")
         stop.deadline_ns = min(stop.deadline_ns,ledger.native_deadline_ns(datetime.datetime.now(datetime.timezone.utc)))
     original = stitch_proof_json(ledger.store.read(native["context_sha256"],stop=stop))
     bundle = ledger.store.read(native["bundle_sha256"],stop=stop)

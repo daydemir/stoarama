@@ -162,6 +162,10 @@ A refresh/restart cannot extend it. An interrupted or failed attempt is not auto
 a fresh reviewed activation UUID uses another run directory. Startup may
 adopt a complete already-published registration, reading metadata only. This
 neither replays native work nor accepts output integrity on startup.
+Mode1 readback requires the registered run/context to match the durably entered
+window/admission and current activation. A different UUID cannot renew an old
+registered result; mode2 provides historical renewal. A changed selector or
+binding refuses before original metadata, output or tool reads.
 
 The private state directory is disk-qualified under the same btrfs/ext4/xfs and
 1GiB reserve rules as the scan index. It owns a lock inode that is never unlinked,

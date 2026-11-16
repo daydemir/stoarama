@@ -123,13 +123,13 @@ class ProofInventoryAdmissionTests(unittest.TestCase):
 
     def test_original_deadline_is_not_extended_by_checkpoint_refresh(self):
         stop = self.stop()
-        deadline = stop.deadline
+        deadline = stop.deadline_ns
         with mock.patch.object(pull, "stitch_resources"), mock.patch.object(pull, "stitch_proof_space"), \
                 mock.patch.object(pull, "stitch_proof_checkpoint"):
             stop.task["expires_at"] = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)).isoformat()
             stop.refresh()
-        self.assertEqual(stop.deadline, deadline)
-        with mock.patch.object(pull.time, "monotonic", return_value=deadline + .01):
+        self.assertEqual(stop.deadline_ns, deadline)
+        with mock.patch.object(pull.time, "monotonic_ns", return_value=deadline):
             self.assertTrue(stop.is_set())
         self.assertEqual(stop.reason, "proof deadline reached")
 
@@ -165,11 +165,11 @@ class ProofInventoryAdmissionTests(unittest.TestCase):
 
     def test_near_expiry_acquisition_releases_without_entering_native(self):
         stop = self.stop()
-        clock = [stop.deadline - .01]
+        clock = [stop.deadline_ns - 1]
         lock = mock.Mock()
-        def acquired(**kwargs): clock[0] = stop.deadline + .01;return True
+        def acquired(**kwargs): clock[0] = stop.deadline_ns;return True
         lock.acquire.side_effect = acquired
-        with mock.patch.object(pull.time, "monotonic", side_effect=lambda:clock[0]):
+        with mock.patch.object(pull.time, "monotonic_ns", side_effect=lambda:clock[0]):
             with self.assertRaisesRegex(pull.StitchHold, "deadline"):
                 with pull.stitch_proof_activity(SimpleNamespace(activity_lock=lock), stop): self.fail("native entered")
         lock.release.assert_called_once()
@@ -187,7 +187,8 @@ class ProofInventoryAdmissionTests(unittest.TestCase):
         stop = self.stop()
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.sys, "platform", "linux"), \
                 mock.patch("platform.machine", return_value="x86_64"), \
-                mock.patch.object(pull.time, "monotonic", return_value=stop.deadline + .01), \
+                mock.patch.object(pull.time, "monotonic_ns", return_value=stop.deadline_ns), \
+                mock.patch.object(pull.time, "monotonic", return_value=stop.deadline), \
                 mock.patch.object(pull, "stitch_proof_request") as request:
             with self.assertRaises(pull.BenchmarkError):
                 pull.stitch_v85r_tools(SimpleNamespace(state_dir=Path(tmp)), stop.deadline, stop)
@@ -195,14 +196,15 @@ class ProofInventoryAdmissionTests(unittest.TestCase):
 
     def test_cold_capability_response_cannot_refresh_expired_budget(self):
         stop = self.stop()
-        clock = [stop.deadline - .01]
+        clock = [stop.deadline_ns - 10_000_000]
         def capability(*args, **kwargs):
             self.assertLessEqual(kwargs["timeout"], .1)
-            clock[0] = stop.deadline + 1
+            clock[0] = stop.deadline_ns
             return {}
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.sys, "platform", "linux"), \
                 mock.patch("platform.machine", return_value="x86_64"), \
-                mock.patch.object(pull.time, "monotonic", side_effect=lambda:clock[0]), \
+                mock.patch.object(pull.time, "monotonic_ns", side_effect=lambda:clock[0]), \
+                mock.patch.object(pull.time, "monotonic", side_effect=lambda:clock[0]/10**9), \
                 mock.patch.object(pull, "stitch_proof_request", side_effect=capability), \
                 mock.patch.object(pull.urllib.request, "urlopen") as download:
             with self.assertRaises(pull.BenchmarkError):
@@ -212,7 +214,7 @@ class ProofInventoryAdmissionTests(unittest.TestCase):
     def test_setup_uses_original_deadline_and_releases_lock_after_expiry(self):
         stop = self.stop(90)
         stop.task.update(plan_sha256="a"*64, plan=dict(output_folder="proof"))
-        clock = [stop.deadline - 1]
+        clock = [stop.deadline_ns - 10**9]
         lock = threading.RLock()
         with tempfile.TemporaryDirectory() as tmp:
             cfg = SimpleNamespace(output_dir=Path(tmp))
@@ -220,9 +222,10 @@ class ProofInventoryAdmissionTests(unittest.TestCase):
                 self.assertIs(actual_stop, stop)
                 self.assertEqual(deadline, stop.deadline)
                 self.assertTrue(lock._is_owned())
-                clock[0] = stop.deadline + .01
+                clock[0] = stop.deadline_ns
                 return {}
-            with mock.patch.object(pull.time,"monotonic",side_effect=lambda:clock[0]), \
+            with mock.patch.object(pull.time,"monotonic_ns",side_effect=lambda:clock[0]), \
+                    mock.patch.object(pull.time,"monotonic",side_effect=lambda:clock[0]/10**9), \
                     mock.patch.object(pull,"stitch_resources"), \
                     mock.patch.object(pull.NAS_MEDIA_FENCE,"wait_maintenance",return_value=True), \
                     mock.patch.object(pull,"request_json",return_value=stop.task), \

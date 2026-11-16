@@ -207,7 +207,8 @@ class WorkerTests(unittest.TestCase):
 
     def test_readback_queues_exact_original_bytes_and_preserves_native_times(self):
         self.register()
-        stop=SimpleNamespace(deadline=time.monotonic()+90,deadline_ns=time.monotonic_ns()+90*10**9,is_set=lambda:False)
+        stop=SimpleNamespace(mode=pull.NASStitchMode.NATIVE,activation_id=ID,
+            deadline=time.monotonic()+90,deadline_ns=time.monotonic_ns()+90*10**9,is_set=lambda:False)
         with mock.patch.object(pull,"StitchReadbackStop",return_value=stop),\
                 mock.patch.object(pull,"stitch_readback_run",return_value=self.readback()),\
                 mock.patch.object(pull,"stitch_check"),mock.patch.object(pull,"STITCH_STATUS"):
@@ -227,7 +228,7 @@ class WorkerTests(unittest.TestCase):
         self.cfg.stitch_switches.apply(dict(ok=True,stitch_proof_task_id=2))
         self.ledger.observe_mode(pull.NASStitchMode.READBACK,self.now,ID)
         clock=[100.0];calls=[]
-        stop=SimpleNamespace(deadline=190.0,is_set=lambda:clock[0]>=190.0)
+        stop=SimpleNamespace(mode=pull.NASStitchMode.READBACK,deadline=190.0,is_set=lambda:clock[0]>=190.0)
         def budget(*args):calls.append("budget");return stop
         def delayed(digest,*,stop):
             calls.append("context");self.assertIs(stop,bound)
