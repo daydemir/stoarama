@@ -8,7 +8,6 @@ import html
 import http.client
 import importlib.util
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -300,10 +299,6 @@ COMMAND_TIMEOUT_SEC = 360
 PREPARE_TIMEOUT_SEC = 1800  # keep28 preparation on large streams exceeds six minutes
 STREAM_SUMMARY_TTL_SEC = 7 * 24 * 3600  # Ranking hints only; refreshes run with master OFF.
 PREPARER = 'backend/scripts/nas-cleanup/prepare_keep28_plans.py'
-# A stream whose read-only preparation failed is retried after this delay while
-# other streams continue. Confirmed atomic admission 409s exclude that stream.
-STREAM_RETRY_SEC = 3600
-MAX_STREAM_DEFERRALS = 6  # The sixth consecutive failure of one stream goes to the owner.
 COMMAND_FAILURE_LOG = Path.home() / 'stoarama-cleanup-runner' / 'command-failures.log'
 
 
@@ -381,11 +376,7 @@ class Runner:
                             and isinstance(v.get('reason'), str) and len(v['reason']) <= 2048
                             and isinstance(v.get('label'), str)
                             for k, v in status.get('excluded_streams', {}).items())
-                    and isinstance(status.get('deferred_streams', {}), dict)
-                    and all(re.fullmatch('[1-9][0-9]*', k) and isinstance(v, dict) and set(v) == {'retry_after', 'failures'}
-                            and type(v['retry_after']) in (int, float) and math.isfinite(v['retry_after'])
-                            and type(v['failures']) is int and 1 <= v['failures'] < MAX_STREAM_DEFERRALS
-                            for k, v in status.get('deferred_streams', {}).items()),
+                    and status.get('deferred_streams', {}) == {},
                     'invalid ownership state')
         except Exception:
             raise Halt('execution ownership unreadable; unknown enabled plan; owner review required') from None
@@ -431,10 +422,7 @@ class Runner:
         return self.prepare
 
     def prepare_stream(self, sid, args):
-        """Run the preparer for one stream. False means a read failed before any
-        submission, so nothing was admitted and the stream is deferred. Every
-        other failure stops, except a confirmed single atomic admission 409
-        which permanently excludes this stream with its private evidence."""
+        """Only an evidenced atomic admission 409 may skip a stream."""
         try:
             command([sys.executable, str(self.repo / PREPARER), '--stream', str(sid),
                      '--scope-cache', str(self.root / 'reviewed-scope-cache'), *args],
@@ -452,37 +440,14 @@ class Runner:
                         'invalid atomic admission rejection evidence')
                 excluded = dict(self.status.get('excluded_streams') or {})
                 excluded[str(sid)] = evidence
-                deferred = {k: v for k, v in (self.status.get('deferred_streams') or {}).items() if k != str(sid)}
-                self.save(self.status.get('phase', 'dry_run'), excluded_streams=excluded, deferred_streams=deferred)
+                self.save(self.status.get('phase', 'dry_run'), excluded_streams=excluded)
                 self.step_failed('stream excluded after atomic admission rejection', reason='stream ' + str(sid))
                 return False
-            if exc.returncode == self.preparer().EXIT_READ_FAILED:
-                self.step_failed('stream preparation deferred', reason='stream ' + str(sid))
-                deferred = dict(self.status.get('deferred_streams') or {})
-                failures = deferred.get(str(sid), {'failures': 0})['failures'] + 1
-                require(failures < MAX_STREAM_DEFERRALS, 'stream preparation keeps failing; owner review required')
-                deferred[str(sid)] = {'retry_after': time.time() + STREAM_RETRY_SEC, 'failures': failures}
-                self.save(self.status.get('phase', 'dry_run'), deferred_streams=deferred)
-                return False
             raise
-        deferred = self.status.get('deferred_streams') or {}
-        if str(sid) in deferred:
-            self.save(self.status.get('phase', 'dry_run'),
-                      deferred_streams={k: v for k, v in deferred.items() if k != str(sid)})
         return True
 
     def stream_ready(self, sid):
-        if str(sid) in (self.status.get('excluded_streams') or {}):
-            return False
-        entry = (self.status.get('deferred_streams') or {}).get(str(sid))
-        return entry is None or entry['retry_after'] <= time.time()
-
-    def wait_for_deferred_streams(self):
-        # Master is OFF and nothing is enabled here; never call this completion.
-        self.save('waiting_for_stream_retry')
-        while not self.stopped() and min(v['retry_after'] for v in self.status['deferred_streams'].values()) > time.time():
-            self.progress()
-            time.sleep(60)
+        return str(sid) not in (self.status.get('excluded_streams') or {})
 
     def query(self, sql, step='catalog query'):
         self.preparer()
@@ -943,8 +908,8 @@ class Runner:
                     # in dry run (its items stay reserved) and move on to the next stream.
                     continue
                 return receipt['id']
-        if lookahead or self.stopped() or self.status.get('deferred_streams'):
-            return None  # Current/reserved/deferred work is expected; never claim completion here.
+        if lookahead or self.stopped():
+            return None  # Current/reserved work is expected; never claim completion here.
         # The preparer excludes reserved files. Never call that a completed cleanup.
         excluded = ','.join(str(int(k)) for k in self.status.get('excluded_streams', {}))
         pending = self.query("""SELECT count(*) FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id
@@ -1119,8 +1084,8 @@ class Runner:
         require(not self.status.get('last_error'), 'failure is latched; owner must review before restart')
         require(not self.status.get('lookahead_pending'), 'lookahead admission interrupted; owner must reconcile its label before restart')
         self.load_policy()
-        require({int(k) for k in self.status.get('deferred_streams', {})} <= set(self.windows),
-                'deferred stream outside pinned policy; owner review required')
+        require(not self.status.get('deferred_streams'),
+                'prior deferred failure requires owner review before restart')
         require({int(k) for k in self.status.get('excluded_streams', {})} <= set(self.windows),
                 'excluded stream outside pinned policy; owner review required')
         self.check_delivery()
@@ -1136,9 +1101,6 @@ class Runner:
         self.progress()  # Accepted owner delivery before any deletion is enabled.
         while not self.stopped():
             pid = self.status['current_plan'] or self.status.get('next_plan') or self.pick()
-            if pid is None and self.status.get('deferred_streams') and not self.stopped():
-                self.wait_for_deferred_streams()
-                continue
             if pid is None:
                 self.save('stopped' if self.stopped() else 'excluded_streams_remaining' if self.status.get('excluded_streams') else 'complete', current_plan=None)
                 return

@@ -58,15 +58,9 @@ The runner:
   stream persistently, recording its label and bounded server reason in private
   state (Deniz approval, 2026-11-14). Other streams continue. Missing evidence,
   ambiguous admission, and every other failed check still stop. Excluded supply
-  is never reported as completed cleanup. A slow read cannot idle the other streams: the preparer exits 4
-  only when a read-only catalogue read hit a transient SQLSTATE (timeout,
-  connection, serialization) or a reviewed-scope object was unreachable, before
-  any submission (nothing admitted). Exit 4 defers that stream for an hour
-  (`deferred_streams`) and the next stream proceeds; the sixth consecutive
-  deferral of one stream stops. With work deferred, the runner waits with
-  master OFF and never reports completion. Any other failure (integrity or
-  size-bound mismatch, other SQL errors, a runner-side timeout, a lost
-  admission response) still stops.
+  is never reported as completed cleanup. Preparation read failures also stop
+  immediately. Prior nonempty
+  `deferred_streams` state requires owner reconciliation; restart never clears it.
   Streams rank by R2-present candidate bytes per file, descending (stream ID
   breaks ties). The preparer's read-only `--summary-only --stream ID` mode
   supplies one stream at a time, retaining its indexed scope and 300-second SQL

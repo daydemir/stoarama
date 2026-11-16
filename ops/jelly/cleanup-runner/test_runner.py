@@ -426,7 +426,8 @@ class LoopTests(unittest.TestCase):
         for bad in ([3], {'x': {'retry_after': 1, 'failures': 1}}, {'3': 1.0},
                     {'3': {'retry_after': float('nan'), 'failures': 1}},
                     {'3': {'retry_after': float('inf'), 'failures': 1}},
-                    {'3': {'retry_after': 1, 'failures': r.MAX_STREAM_DEFERRALS}}):
+                    {'3': {'retry_after': 1, 'failures': 6}},
+                    {'3': {'retry_after': 0, 'failures': 1}}):
             with tempfile.TemporaryDirectory() as root:
                 (Path(root) / 'status.json').write_text(json.dumps(
                     {'current_plan': None, 'last_error': None, 'deferred_streams': bad}))
@@ -434,23 +435,6 @@ class LoopTests(unittest.TestCase):
                 with self.assertRaisesRegex(r.Halt, 'ownership unreadable'):
                     job.initialize()
                 job.lock.close()
-
-    def test_read_failure_defers_stream_and_never_claims_completion(self):
-        with tempfile.TemporaryDirectory() as root:
-            job = self.isolation_job(root, [3, 4])
-            queries = []
-            job.query = lambda sql, *a: queries.append(sql) or (0 if 'count(*)' in sql else [])
-            job.confirm_empty = lambda: self.fail('completion claimed while a stream is deferred')
-            with patch.object(r, 'command', side_effect=self.preparer_exits({'3': 4, '4': 4})):
-                self.assertIsNone(r.Runner.pick(job))
-            self.assertEqual(sorted(job.status['deferred_streams']), ['3', '4'])
-            self.assertEqual(len(queries), 1)
-            self.assertFalse(job.stream_ready(3))
-            self.assertEqual(job.status['deferred_streams']['3']['failures'], 1)
-            job.status['deferred_streams']['3']['retry_after'] = 0
-            with patch.object(r, 'command', side_effect=self.preparer_exits({'3': 'k28auto-x-s3-raw-0001'})):
-                self.assertEqual(r.Runner.pick(job), 1406)
-            self.assertEqual(list(job.status['deferred_streams']), ['4'])
 
     def test_atomic_409_excludes_stream_persistently_and_admits_other_stream(self):
         with tempfile.TemporaryDirectory() as root:
@@ -551,7 +535,7 @@ class LoopTests(unittest.TestCase):
             self.assertNotIn('excluded_streams', job.status)
 
     def test_ambiguous_submission_timeout_or_unknown_failure_still_stops(self):
-        for code in (None, 1, 3):
+        for code in (None, 1, 3, 4):
             with tempfile.TemporaryDirectory() as root:
                 job = self.isolation_job(root, [3, 4])
                 with patch.object(r, 'command', side_effect=self.preparer_exits({'3': code})):
@@ -559,23 +543,16 @@ class LoopTests(unittest.TestCase):
                         r.Runner.pick(job)
                 self.assertNotIn('deferred_streams', job.status)
 
-    def test_persistent_read_failure_goes_to_the_owner(self):
-        with tempfile.TemporaryDirectory() as root:
-            job = self.isolation_job(root, [3])
-            job.status['deferred_streams'] = {'3': {'retry_after': 0, 'failures': r.MAX_STREAM_DEFERRALS - 1}}
-            with patch.object(r, 'command', side_effect=self.preparer_exits({'3': 4})):
-                with self.assertRaisesRegex(r.Halt, 'keeps failing'):
-                    r.Runner.pick(job)
-
-    def test_deferral_for_unknown_stream_stops_before_any_work(self):
+    def test_legacy_deferral_stops_before_any_work(self):
         with tempfile.TemporaryDirectory() as root:
             job = FakeRunner(root)
-            job.status['deferred_streams'] = {'999': {'retry_after': 0, 'failures': 1}}
-            job.pick = lambda **kw: self.fail('picked work with unknown deferral state')
-            with self.assertRaisesRegex(r.Halt, 'outside pinned policy'):
+            job.status['deferred_streams'] = {'3': {'retry_after': 0, 'failures': 1}}
+            job.pick = lambda **kw: self.fail('picked work after a prior failed check')
+            with self.assertRaisesRegex(r.Halt, 'prior deferred failure'):
                 job.run()
+            self.assertNotIn('ON', job.events)
 
-    def test_only_explicit_read_failure_defers_stream_ranking(self):
+    def test_ranking_read_failure_stops_before_cached_other_stream(self):
         with tempfile.TemporaryDirectory() as root:
             job = r.Runner(Path(__file__).resolve().parents[3], Path(root))
             job.windows = {3: WINDOWS[3], 4: WINDOWS[3]}
@@ -584,25 +561,20 @@ class LoopTests(unittest.TestCase):
             path.write_text(json.dumps(dict(policy_sha256=r.POLICY_SHA, bucket=os.environ.get('R2_BUCKET', 'stoarama'),
                 streams=[4], observed_at_epoch=r.time.time(), recoverable_files=1, recoverable_bytes=10)))
             with patch.object(r, 'command', side_effect=r.CommandFailed(4)):
-                self.assertEqual(job.stream_order(), [4])
-            self.assertEqual(list(job.status['deferred_streams']), ['3'])
-            job.status['deferred_streams'] = {}
-            with patch.object(r, 'command', side_effect=r.CommandFailed(None)):
                 with self.assertRaisesRegex(r.Halt, 'local command failed'):
-                    job.stream_order()  # A runner-side timeout cannot prove what the preparer saw.
+                    job.stream_order()
+            self.assertNotIn('deferred_streams', job.status)
 
-    def test_run_waits_for_deferred_streams_with_master_off(self):
-        with tempfile.TemporaryDirectory() as root:
+    def test_lookahead_read_failure_stops_before_enable(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
             job = FakeRunner(root)
-            job.picks = [None, None]
-            job.status['deferred_streams'] = {'3': {'retry_after': 1.0, 'failures': 1}}
-            def wait():
-                self.assertEqual(job.events, ['OFF', 'idle'])
-                job.status['deferred_streams'] = {}
-            job.wait_for_deferred_streams = wait
-            job.run()
-            self.assertEqual(job.status['phase'], 'complete')
-            self.assertEqual(job.events, ['OFF', 'idle'])
+            job.status['current_plan'] = 42
+            job.pick = lambda **kw: (_ for _ in ()).throw(r.CommandFailed(4))
+            with self.assertRaisesRegex(r.Halt, 'local command failed'):
+                job.run()
+            self.assertNotIn('ON', job.events)
+            self.assertTrue(job.status['lookahead_pending'])
+            self.assertEqual(job.status['current_plan'], 42)
 
     def test_command_failure_logs_privately_and_halts(self):
         with tempfile.TemporaryDirectory() as root:
