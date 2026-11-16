@@ -48,7 +48,7 @@ class ExportTests(unittest.TestCase):
         task=pull.cleanup_json_bytes(self.context["task"])
         self.task_sha=export.sha(task)
         self.readback=fixture.readback()
-        self.readback.update(native_run_id=self.receipt["run"]["id"],native_plan_sha256=self.context["task"]["plan_sha256"],
+        self.readback.update(native_task_sha256=self.task_sha,native_activation_id=self.context["activation_id"],native_run_id=self.receipt["run"]["id"],native_plan_sha256=self.context["task"]["plan_sha256"],
             native_bundle_sha256=export.sha(self.bundle),producer_profile_sha256=export.sha(profiles[0]),
             reader_profile_sha256=export.sha(profiles[1]),profile_pair_sha256=export.sha(profiles[2]),
             native_registration_sha256=export.sha(pull.cleanup_json_bytes(self.receipt)),
@@ -88,6 +88,17 @@ class ExportTests(unittest.TestCase):
     def test_identical_duplicate_chunks_and_order_changes_preserve_exact_bytes(self):
         pages=copy.deepcopy(self.pages);pages[0]["lines"].reverse()
         pages[0]["lines"]+=copy.deepcopy(pages[0]["lines"])
+        self.assertEqual(self.assemble(pages),self.assemble())
+
+    def test_previous_valid_readback_contexts_do_not_conflict_with_selected_component_bytes(self):
+        pages=copy.deepcopy(self.pages)
+        predecessor=[]
+        previous="22222222-2222-4222-8222-222222222222"
+        for row in pages[0]["lines"]:
+            if row["message"].startswith("V85r proof-v1 "):continue
+            fields=row["message"].split(" ");fields[6]=previous
+            predecessor.append(dict(row,message=" ".join(fields)))
+        pages[0]["lines"]=predecessor+pages[0]["lines"]+predecessor
         self.assertEqual(self.assemble(pages),self.assemble())
 
     def test_selected_identity_redaction_missing_chunk_and_census_conflicts_refuse(self):

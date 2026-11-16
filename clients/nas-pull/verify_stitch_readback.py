@@ -138,10 +138,14 @@ def replay_stream(raw, digests):
     outputs = [{name: value[name] for name in ('relative_path', 'sha256', 'size_bytes')}
                for value in native['result']['outputs']]
     expected = dict(native_run_id=native['run']['id'],native_bundle_sha256=bundle_sha,
-        native_plan_sha256=native['plan_sha256'],producer_profile_sha256=producer_sha,
+        native_plan_sha256=native['plan_sha256'],native_task_sha256=task_sha,producer_profile_sha256=producer_sha,
         reader_profile_sha256=profile_sha,profile_pair_sha256=pair_sha,outputs=outputs,
         policy=reader['policy'],tools=reader['tools'],
         native_registration_sha256=core.stitch_readback_registration(decoded['native_bundle_b64']))
+    if producer['client_version']=='r2-copy-v3':
+        expected['native_activation_id']=task['activation_id']
+    elif 'native_activation_id' in readback:
+        raise ReadbackError('historical producer has no activation UUID')
     if any(readback[name] != value for name, value in expected.items()):
         raise ReadbackError('readback/native relationship differs')
     if execution['client_artifact_sha256'] != reader_sha or execution['client_artifact_size_bytes'] != identity.size_bytes:

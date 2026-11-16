@@ -20,7 +20,7 @@ func syntheticNASStitchReaderStatus(t *testing.T) (nasStitchReaderStatus, nasSti
 	status := nasStitchReaderStatus{Schema: "stoarama.nas-stitch-reader-status.v1", Reader: receipt.Reader, Integrity: "clear",
 		History: []nasStitchReadbackSummary{{ID: receipt.ID, VerifiedAt: receipt.VerifiedAt, SHA: sha}},
 		Native: &nasStitchNativeStatus{RunID: receipt.NativeRunID, BundleSHA: receipt.NativeBundleSHA, PlanSHA: receipt.NativePlanSHA,
-			TaskSHA: strings.Repeat("1", 64), ResultSHA: strings.Repeat("2", 64), ProducerSHA: receipt.ProducerProfileSHA,
+			TaskSHA: receipt.NativeTaskSHA, ResultSHA: strings.Repeat("2", 64), ProducerSHA: receipt.ProducerProfileSHA,
 			ReaderSHA: receipt.ReaderProfileSHA, PairSHA: receipt.PairSHA, RegistrationSHA: receipt.NativeRegistration,
 			Outputs: receipt.Outputs, Policy: receipt.Policy, Tools: receipt.Tools}}
 	return status, nasStitchReadbackSnapshot{Now: now, ApprovedUntil: now.Add(time.Hour), Version: receipt.Reader.Version, BootID: receipt.Reader.BootID, Facts: facts}, receipt, sha
@@ -53,6 +53,8 @@ func TestNASStitchReadbackStatusBindsActualCurrentIdentityAndHistory(t *testing.
 	for _, mutate := range []func(*nasStitchReaderStatus){
 		func(v *nasStitchReaderStatus) { v.Native.Outputs[0].SHA256 = strings.Repeat("0", 64) },
 		func(v *nasStitchReaderStatus) { v.Native.BundleSHA = strings.Repeat("0", 64) },
+		func(v *nasStitchReaderStatus) { v.Native.TaskSHA = strings.Repeat("0", 64) },
+		func(v *nasStitchReaderStatus) { v.Native.ActivationID = "22222222-2222-4222-8222-222222222222" },
 		func(v *nasStitchReaderStatus) { v.History[0].SHA = strings.Repeat("0", 64) },
 		func(v *nasStitchReaderStatus) { v.Reader.ArtifactSize++ },
 	} {
@@ -88,12 +90,15 @@ func TestNASStitchReadbackAdmissionQueriesAndPullScopeAreClosed(t *testing.T) {
 		mode  nasStitchProofMode
 		ok    bool
 	}{
-		{"run_id=" + id, nasStitchProofNative, true},
+		{"run_id=" + id + "&activation_id=" + id, nasStitchProofNative, true},
 		{"producer_profile_sha256=" + strings.Repeat("a", 64), nasStitchProofReadback, true},
 		{"run_id=" + id, nasStitchProofReadback, false},
 		{"run_id=" + id, nasStitchProofDisabled, false},
 		{"run_id=" + id + "&run_id=" + id, nasStitchProofNative, false},
 		{"run_id=" + id + "&other=1", nasStitchProofNative, false},
+		{"run_id=" + id, nasStitchProofNative, false},
+		{"run_id=" + id + "&activation_id=00000000-0000-0000-0000-000000000000", nasStitchProofNative, false},
+		{"run_id=" + id + "&activation_id=" + id + "&activation_id=" + id, nasStitchProofNative, false},
 		{"run_id=00000000-0000-0000-0000-000000000000", nasStitchProofNative, false},
 		{"run_id=%zz", nasStitchProofNative, false},
 	} {
@@ -182,8 +187,13 @@ func TestNASStitchReadbackServerResponsesMatchAgreedClosedFieldNames(t *testing.
 		json.Unmarshal(raw, &wire)
 		definition := schema["$defs"].(map[string]any)[name].(map[string]any)
 		properties := definition["properties"].(map[string]any)
-		if len(wire) != len(properties) {
+		if len(wire) != len(definition["required"].([]any)) {
 			t.Fatalf("response closed shape differs for %s: %s", name, raw)
+		}
+		for field := range wire {
+			if _, ok := properties[field]; !ok {
+				t.Fatal("unknown response field")
+			}
 		}
 		for _, required := range definition["required"].([]any) {
 			if _, ok := wire[required.(string)]; !ok {
@@ -200,6 +210,61 @@ func TestNASStitchReadbackServerResponsesMatchAgreedClosedFieldNames(t *testing.
 		}
 		if _, ok := wire["reader_version_mismatch_count"]; ok {
 			t.Fatal("invented version counter alias")
+		}
+	}
+}
+
+func TestNASStitchNativeActivationIsNotASelectorOrRunIdentity(t *testing.T) {
+	const id = "11111111-1111-4111-8111-111111111111"
+	for _, version := range []string{"development", nasCleanupProofClientVersion, "v85r-nas-proof-v1", "cleanup-batch-v8", nasCleanupR2CopyControlClientVersion} {
+		for _, activation := range []string{"", "00000000-0000-0000-0000-000000000000", " " + id, id} {
+			mode, got := stitchProofActivation(1, 13, version, activation)
+			want := version == nasCleanupR2CopyControlClientVersion && activation == id
+			if (mode == 1) != want || (want && got != id) || (!want && got != "") {
+				t.Fatal("native activation/reader binding differs")
+			}
+		}
+	}
+	for _, selector := range []int{0, 2} {
+		mode, activation := stitchProofActivation(selector, 13, nasCleanupR2CopyControlClientVersion, "")
+		if mode != selector || activation != "" {
+			t.Fatal("OFF/readback depends on native UUID")
+		}
+	}
+}
+
+func TestNASStitchTaskMutationCannotReplaceCapturedReadbackHash(t *testing.T) {
+	const activation = "11111111-1111-4111-8111-111111111111"
+	proof, err := boundedNASStitchNativeV3(proofPlanFixture(), nasStitchProofSourceSHA, activation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof.ActivationID = activation
+	proof.Expires = time.Date(2026, 11, 15, 0, 15, 0, 0, time.UTC)
+	original, _ := json.Marshal(proof)
+	if _, err = validateNASStitchReadbackTask(original, cleanupSHA(original), activation, activation, "r2-copy-v3", proofPlanFixture(), nasStitchProofSourceSHA); err != nil {
+		t.Fatal(err)
+	}
+	receipt, _, _ := syntheticNASStitchReadback(t)
+	receipt.NativeTaskSHA = cleanupSHA(original)
+	receipt.NativeActivationID = activation
+	readback, _ := json.Marshal(receipt)
+	result := []byte(`{}`)
+	for _, field := range []string{"activation_id", "expires_at"} {
+		var changed map[string]any
+		json.Unmarshal(original, &changed)
+		if field == "activation_id" {
+			changed[field] = "22222222-2222-4222-8222-222222222222"
+		} else {
+			changed[field] = "2026-11-15T00:16:00Z"
+		}
+		mutated, _ := json.Marshal(changed)
+		request := nasStitchReadbackValidateRequest{Schema: "stoarama.nas-stitch-validation-request.v2", ReadbackB64: base64.StdEncoding.EncodeToString(readback), ReadbackSHA: cleanupSHA(readback), NativeTaskB64: base64.StdEncoding.EncodeToString(mutated), NativeTaskSHA: cleanupSHA(mutated), NativeResultB64: base64.StdEncoding.EncodeToString(result), NativeResultSHA: cleanupSHA(result)}
+		body, _ := json.Marshal(request)
+		w := httptest.NewRecorder()
+		(&Server{}).handleAdminNASStitchReadbackValidate(w, httptest.NewRequest(http.MethodPost, "/synthetic", strings.NewReader(string(body))))
+		if w.Code != 400 {
+			t.Fatalf("rewritten task with recomputed component hash escaped original readback binding: %d", w.Code)
 		}
 	}
 }

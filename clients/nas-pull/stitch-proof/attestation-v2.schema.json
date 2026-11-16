@@ -931,7 +931,8 @@
         "outputs",
         "policy",
         "tools",
-        "native_registration_sha256"
+        "native_registration_sha256",
+        "native_task_sha256"
       ],
       "properties": {
         "schema": {
@@ -983,6 +984,12 @@
         },
         "native_registration_sha256": {
           "$ref": "#/$defs/sha256"
+        },
+        "native_task_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "native_activation_id": {
+          "$ref": "#/$defs/uuid"
         }
       }
     },
@@ -1036,7 +1043,8 @@
         "policy",
         "tools",
         "registered_locally_only",
-        "grants_retirement"
+        "grants_retirement",
+        "native_task_sha256"
       ],
       "properties": {
         "schema": {
@@ -1106,6 +1114,12 @@
         },
         "grants_retirement": {
           "const": false
+        },
+        "native_task_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "native_activation_id": {
+          "$ref": "#/$defs/uuid"
         }
       }
     },
@@ -1125,7 +1139,8 @@
         "native_run",
         "inputs",
         "outputs",
-        "evidence"
+        "evidence",
+        "native_task_sha256"
       ],
       "properties": {
         "schema": {
@@ -1304,6 +1319,12 @@
               ]
             }
           }
+        },
+        "native_task_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "native_activation_id": {
+          "$ref": "#/$defs/uuid"
         }
       }
     },
@@ -1325,7 +1346,8 @@
         "producer_reviewed_code_head_sha",
         "reader_reviewed_code_head_sha",
         "observations",
-        "server_deployment_sha256"
+        "server_deployment_sha256",
+        "native_task_sha256"
       ],
       "properties": {
         "schema": {
@@ -1412,6 +1434,12 @@
         },
         "server_deployment_sha256": {
           "$ref": "#/$defs/sha256"
+        },
+        "native_task_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "native_activation_id": {
+          "$ref": "#/$defs/uuid"
         }
       }
     },
@@ -1556,7 +1584,8 @@
         "readback_verified_at",
         "readback_id",
         "source_scope_approved_until",
-        "integrity"
+        "integrity",
+        "native_task_sha256"
       ],
       "properties": {
         "schema": {
@@ -1641,9 +1670,15 @@
         },
         "integrity": {
           "const": "clear"
+        },
+        "native_task_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "native_activation_id": {
+          "$ref": "#/$defs/uuid"
         }
       }
     }
   },
-  "$comment": "DESIGN DRAFT ONLY, not an accepted/frozen runtime schema or authority. Compiled accepted producer-reader pair table is EMPTY until final source/artifact review. Runtime must stream-check all canonical regular no-symlink file references/sizes/hashes before isolated byte-snapshot replay; reject duplicate keys, nonfinite and wrong types; compare every field with finite full-profile/pair pins; enforce immutable native time/result/registration equality, native replay, actual current output rehash and server binding, UTC ordering, 24h readback/validation/review and <=5min future skew, DB-anchored expiry and unchanged object/custody/fence/drain/keep gates. Unknown profiles/packages/readers require new review; no cross-package pairing. Server validation is exact raw API bytes: DB-derived validated_at and only actual runtime commit/service/instance, never exporter-inserted deploy ID. Separate server_deployment binds exact provider responses and validation hash. Fixed service/API origin are from held reviewed runner35; candidate provider account tea-d1g1uevfte5s7384s1q0 is from primary dd5a9b22; final compiled pin/profile acceptance remains separate. Pure replay has no network/auth; outer caller independently checks provider/API under separately reviewed bounded online contract. Rollout/identity/freshness ambiguity refuses. No old authority deadline extends."
+  "$comment": "DESIGN DRAFT ONLY, not an accepted/frozen runtime schema or authority. Compiled accepted producer-reader pair table is EMPTY until final source/artifact review. Runtime must stream-check all canonical regular no-symlink file references/sizes/hashes before isolated byte-snapshot replay; reject duplicate keys, nonfinite and wrong types; compare every field with finite full-profile/pair pins; enforce immutable native time/result/registration equality, native replay, actual current output rehash and server binding, UTC ordering, 24h readback/validation/review and <=5min future skew, DB-anchored expiry and unchanged object/custody/fence/drain/keep gates. Unknown profiles/packages/readers require new review; no cross-package pairing. Server validation is exact raw API bytes: DB-derived validated_at and only actual runtime commit/service/instance, never exporter-inserted deploy ID. Separate server_deployment binds exact provider responses and validation hash. Fixed service/API origin are from held reviewed runner35; candidate provider account tea-d1g1uevfte5s7384s1q0 is from primary dd5a9b22; final compiled pin/profile acceptance remains separate. Pure replay has no network/auth; outer caller independently checks provider/API under separately reviewed bounded online contract. Rollout/identity/freshness ambiguity refuses. No old authority deadline extends. Exact original server task bytes/SHA are mandatory through native admission, durable storage, readback, export/replay, API/current context and review. native_activation_id is semantically mandatory for the accepted new producer3 and absent for historical5009, determined by immutable producer profile, never current reader. Original admission expiry is immutable history, not a fresh readback deadline."
 }

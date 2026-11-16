@@ -19,7 +19,7 @@ func syntheticNASStitchReadback(t *testing.T) (nasStitchReadbackReceipt, nasStit
 	now := time.Date(2026, 11, 15, 0, 0, 0, 0, time.UTC)
 	const id = "11111111-1111-4111-8111-111111111111"
 	receipt := nasStitchReadbackReceipt{
-		Schema: nasStitchReadbackSchema, NativeRunID: id, ID: id,
+		Schema: nasStitchReadbackSchema, NativeRunID: id, ID: id, NativeTaskSHA: strings.Repeat("1", 64),
 		NativeBundleSHA: strings.Repeat("a", 64), NativePlanSHA: strings.Repeat("b", 64),
 		ProducerProfileSHA: strings.Repeat("c", 64), ReaderProfileSHA: strings.Repeat("d", 64),
 		PairSHA: strings.Repeat("e", 64), NativeRegistration: strings.Repeat("f", 64),

@@ -21,7 +21,7 @@ import zlib
 
 
 NATIVE_VERIFIER = ("81ff91e5accd93d32ff475024c10281177684b583e121a6c5d0c1f1938d49532",18817)
-READBACK_VERIFIER = ("e98c433064eb4c2bc5276794c62838440981726cc13231c18052edc7bfcf41de",8792)
+READBACK_VERIFIER = ('f3a22aebaf50eb3e2faa5c669a56a059fea3d973bf6cd13ad3edaf890be94c74', 9051)
 LIMITS = {"proof-v1":1048576,"task-v2":1048576,"producer-v2":65536,
           "reader-v2":65536,"pair-v2":65536,"readback-v2":65536}
 
@@ -125,15 +125,20 @@ def reassemble(pages,kind,expected,key,reader_boot):
             if type(row) is not dict or type(row.get("message")) is not str:raise ExportError("typed log row required")
             message=row["message"]
             if not message.startswith(prefix):continue
-            if row.get("client_version")!="r2-copy-v3" or row.get("boot_id")!=reader_boot or row.get("level")!="INFO":raise ExportError("selected transport reader identity differs")
             fields=message.split(" ")
             if kind=="proof-v1":
                 if len(fields)!=6:raise ExportError("native transport changed")
                 ordinal,part=fields[4:];claimed=None
             else:
-                if len(fields)!=10 or fields[4:7]!=[run,pair,readback]:raise ExportError("selected metadata transport binding differs")
+                if len(fields)!=10:raise ExportError("selected metadata transport header differs")
+                identity(fields[4]);digest(fields[5]);identity(fields[6])
+                # Identical task/profile bytes are legitimately resent by later
+                # readbacks. Select the complete identity before census/conflict
+                # checks; another valid context is not conflicting evidence.
+                if fields[4:7]!=[run,pair,readback]:continue
                 if re.fullmatch(r"[1-9][0-9]{0,6}",fields[7]) is None:raise ExportError("metadata size encoding differs")
                 claimed=int(fields[7]);ordinal,part=fields[8:]
+            if row.get("client_version")!="r2-copy-v3" or row.get("boot_id")!=reader_boot or row.get("level")!="INFO":continue
             match=re.fullmatch(r"(0|[1-9][0-9]{0,3})/([1-9][0-9]{0,3})",ordinal)
             if match is None or re.fullmatch(r"[a-f0-9]{2,1024}",part) is None or len(part)%2:raise ExportError("metadata ordinal/hex differs")
             index,total=int(match[1]),int(match[2])
@@ -213,7 +218,8 @@ def assemble(pages,key,readback_sha,task_sha,reader_boot,producer_client_sha,rea
     result=canonical(receipt["result"])
     if len(result)>65536:raise ExportError("native result exceeds server request bound")
     request=dict(schema="stoarama.nas-stitch-validation-request.v2",readback_b64=base64.b64encode(parts["readback.json"]).decode("ascii"),readback_receipt_sha256=readback_sha,
-        native_result_b64=base64.b64encode(result).decode("ascii"),native_result_sha256=sha(result))
+        native_result_b64=base64.b64encode(result).decode("ascii"),native_result_sha256=sha(result),
+        native_task_b64=base64.b64encode(parts["native-task.json"]).decode("ascii"),native_task_sha256=sha(parts["native-task.json"]))
     parts["server-validation-request.json"]=canonical(request)
     parts["native-replay.json"]=canonical(native_replay);parts["readback-replay.json"]=canonical(readback_replay)
     return parts

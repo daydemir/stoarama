@@ -39,7 +39,9 @@ def context_fixture():
     receipt["run"]["id"] = ID
     receipt["result"]["plan_sha256"] = task["plan_sha256"]
     receipt["result"]["outputs"][0]["relative_path"] = task["plan"]["output_folder"]+"/proof.mp4"
-    context = dict(schema="stoarama.nas-stitch-admission.v1",mode=1,expires_at=task["expires_at"],profiles=profiles,task=task,native_run_id=ID)
+    task["activation_id"]=ID
+    task_raw=pull.cleanup_json_bytes(task)
+    context = dict(activation_id=ID,task_b64=base64.b64encode(task_raw).decode("ascii"),task_sha256=hashlib.sha256(task_raw).hexdigest(),schema="stoarama.nas-stitch-admission.v1",mode=1,expires_at=task["expires_at"],profiles=profiles,task=task,native_run_id=ID)
     return context,receipt
 
 
@@ -53,8 +55,10 @@ class WorkerTests(unittest.TestCase):
         self.cfg = SimpleNamespace(stitch_switches=pull.StitchSwitches(),stitch_proof_enabled=True,stitch_enabled=False,
             output_dir="/SYNTHETIC/no-media",is_candidate=False,
             inventory_scan_interval_sec=86400,inventory_hash_mbps=20,inventory_scan_delay_ms=0)
-        self.cfg.stitch_switches.apply(dict(ok=True,stitch_proof_task_id=1))
-        self.ledger.observe_mode(pull.NASStitchMode.NATIVE,self.now, ID)
+        self.cfg.stitch_switches.apply(dict(ok=True,stitch_proof_task_id=1,stitch_proof_activation_id=ID))
+        with mock.patch.object(pull.uuid,"uuid4",return_value=pull.uuid.UUID(ID)):
+            self.ledger.observe_mode(pull.NASStitchMode.NATIVE,self.now,ID,ID)
+        self.ledger.enter_native()
         self.ledger.bind_admission(pull.cleanup_json_bytes(self.context))
         self.ledger.prepare_native(self.context)
         self.bundle = gzip.compress(pull.cleanup_json_bytes(self.receipt),mtime=0)
@@ -66,7 +70,7 @@ class WorkerTests(unittest.TestCase):
 
     def readback(self):
         result = fixtures.readback()
-        result.update(native_run_id=ID,native_bundle_sha256=hashlib.sha256(self.bundle).hexdigest(),
+        result.update(native_task_sha256=self.context["task_sha256"],native_activation_id=ID,native_run_id=ID,native_bundle_sha256=hashlib.sha256(self.bundle).hexdigest(),
             native_plan_sha256=self.context["task"]["plan_sha256"],
             producer_profile_sha256=self.context["profiles"]["producer_profile_sha256"],
             reader_profile_sha256=self.context["profiles"]["reader_profile_sha256"],
@@ -98,6 +102,58 @@ class WorkerTests(unittest.TestCase):
             with mock.patch.object(pull,"stitch_build",side_effect=AssertionError("native reentered")),self.assertRaises(pull.StitchHold):
                 pull.stitch_evidence_native(self.cfg,None,self.event,self.ledger,self.execution)
             self.assertEqual(self.ledger.state["native"]["stage"],stage)
+
+    def test_actual_startup_off_and_transport_off_cannot_reenter_failed_native(self):
+        self.ledger.fail_native();original=copy.deepcopy(self.ledger.state["window"])
+        for response in (None,dict(ok=True,stitch_proof_task_id=0)):
+            restarted=pull.StitchEvidenceLedger(self.store)
+            self.cfg.stitch_switches.apply(response)
+            observation=self.cfg.stitch_switches.proof
+            restarted.observe_mode(observation.mode,self.now,ID,observation.activation_id)
+            self.cfg.stitch_switches.apply(dict(ok=True,stitch_proof_task_id=1,stitch_proof_activation_id=ID))
+            observation=self.cfg.stitch_switches.proof
+            restarted.observe_mode(observation.mode,self.now+datetime.timedelta(minutes=1),ID,observation.activation_id)
+            self.assertEqual(restarted.state["window"],original)
+            with mock.patch.object(pull,"stitch_evidence_admission",side_effect=AssertionError("fresh admission")),self.assertRaises(pull.StitchHold):
+                pull.stitch_evidence_native(self.cfg,None,self.event,restarted,self.execution)
+
+    def test_entered_cas_failure_prevents_first_admission(self):
+        # New reviewed synthetic UUID, with a different namespace/run and no entry yet.
+        fresh="22222222-2222-4222-8222-222222222222"
+        self.cfg.stitch_switches.apply(dict(ok=True,stitch_proof_task_id=1,stitch_proof_activation_id=fresh))
+        self.ledger.observe_mode(pull.NASStitchMode.NATIVE,self.now,ID,fresh)
+        with mock.patch.object(self.store,"replace",side_effect=OSError("SYNTHETIC durable refusal")),                mock.patch.object(pull,"stitch_evidence_admission",side_effect=AssertionError("network before durable spend")),                self.assertRaises(OSError):
+            pull.stitch_evidence_native(self.cfg,None,self.event,self.ledger,self.execution)
+        self.assertFalse(self.ledger.state["window"]["entered"])
+
+    def test_original_task_byte_identity_is_not_reserialized_or_replaceable(self):
+        raw=pull.stitch_evidence_task(self.context)
+        self.assertEqual(hashlib.sha256(raw).hexdigest(),self.context["task_sha256"])
+        for field in ("activation_id","expires_at"):
+            changed=copy.deepcopy(self.context)
+            changed["task"][field]="22222222-2222-4222-8222-222222222222" if field=="activation_id" else "2000-01-01T00:00:00Z"
+            with self.assertRaises(pull.StitchReadbackIntegrity):pull.stitch_evidence_task(changed)
+
+    def test_recomputed_task_hash_cannot_replace_captured_original_admission(self):
+        for field in ("activation_id","expires_at"):
+            changed=copy.deepcopy(self.context)
+            changed["task"][field]="22222222-2222-4222-8222-222222222222" if field=="activation_id" else "2000-01-01T00:00:00Z"
+            raw=pull.cleanup_json_bytes(changed["task"])
+            changed.update(task_b64=base64.b64encode(raw).decode("ascii"),task_sha256=hashlib.sha256(raw).hexdigest())
+            if field=="activation_id":changed["activation_id"]=changed["task"][field]
+            with self.assertRaises(pull.StitchReadbackIntegrity):self.ledger.prepare_native(changed)
+            self.assertEqual(self.ledger.original_admission(),pull.cleanup_json_bytes(self.context))
+
+    def test_native_admission_echoes_operator_uuid_and_exact_server_task_bytes(self):
+        stop=SimpleNamespace(activation_id=ID)
+        with mock.patch.object(pull,"stitch_proof_request",return_value=self.context) as request:
+            self.assertEqual(pull.stitch_evidence_admission(self.cfg,stop,pull.NASStitchMode.NATIVE,ID),self.context)
+        self.assertTrue(request.call_args.args[1].endswith("run_id="+ID+"&activation_id="+ID))
+        for field in ("activation_id","task_b64"):
+            changed=copy.deepcopy(self.context)
+            changed[field]="22222222-2222-4222-8222-222222222222" if field=="activation_id" else base64.b64encode(b"{}").decode("ascii")
+            with mock.patch.object(pull,"stitch_proof_request",return_value=changed),self.assertRaises(pull.StitchHold):
+                pull.stitch_evidence_admission(self.cfg,stop,pull.NASStitchMode.NATIVE,ID)
 
     def test_native_setup_hard_deadline_cannot_be_extended_by_future_server_expiry(self):
         task=copy.deepcopy(self.context["task"])
@@ -138,7 +194,7 @@ class WorkerTests(unittest.TestCase):
 
     def test_readback_queues_exact_original_bytes_and_preserves_native_times(self):
         self.register()
-        stop=SimpleNamespace(deadline=time.monotonic()+90)
+        stop=SimpleNamespace(deadline=time.monotonic()+90,is_set=lambda:False)
         with mock.patch.object(pull,"StitchReadbackStop",return_value=stop),\
                 mock.patch.object(pull,"stitch_readback_run",return_value=self.readback()),\
                 mock.patch.object(pull,"stitch_check"),mock.patch.object(pull,"STITCH_STATUS"):
@@ -152,6 +208,24 @@ class WorkerTests(unittest.TestCase):
         preserved=dict(self.store.blobs)
         self.ledger.observe_mode(pull.NASStitchMode.DISABLED,self.now, ID)
         self.assertFalse(self.ledger.due());self.assertEqual(self.store.blobs,preserved)
+
+    def test_readback_budget_exists_before_original_context_and_bundle_reads(self):
+        self.register()
+        self.cfg.stitch_switches.apply(dict(ok=True,stitch_proof_task_id=2))
+        self.ledger.observe_mode(pull.NASStitchMode.READBACK,self.now,ID)
+        clock=[100.0];calls=[]
+        stop=SimpleNamespace(deadline=190.0,is_set=lambda:clock[0]>=190.0)
+        def budget(*args):calls.append("budget");return stop
+        def delayed(digest,*,stop):
+            calls.append("context");self.assertIs(stop,bound)
+            clock[0]=191.0;pull.stitch_check(stop)
+        bound=stop
+        with mock.patch.object(pull,"StitchReadbackStop",side_effect=budget),\
+                mock.patch.object(self.store,"read",side_effect=delayed),\
+                mock.patch.object(pull,"stitch_readback_run",side_effect=AssertionError("renewed readback budget")),\
+                self.assertRaises(pull.StitchHold):
+            pull.stitch_evidence_readback(self.cfg,self.event,self.ledger,self.execution)
+        self.assertEqual(calls,["budget","context"])
 
     def test_off_still_drains_durable_metadata_without_native_or_output_read(self):
         key=pull.StitchEvidenceKey(pull.StitchEvidenceKind.READBACK,ID,"a"*64,"b"*64,ID)
@@ -177,7 +251,7 @@ class WorkerTests(unittest.TestCase):
 
     def test_existing_ordinary_entry_remains_separate_and_requires_its_own_switch(self):
         self.cfg.stitch_enabled=True
-        self.cfg.stitch_switches.apply(dict(ok=True,stitch_enabled=True,stitch_proof_task_id=1))
+        self.cfg.stitch_switches.apply(dict(ok=True,stitch_enabled=True,stitch_proof_task_id=1,stitch_proof_activation_id=ID))
         self.assertIs(self.cfg.stitch_switches.proof[0],pull.NASStitchMode.DISABLED)
         def ordinary(*args):self.event.set();return 60
         with mock.patch.object(pull,"stitch_evidence_identity",return_value=self.execution),\

@@ -250,7 +250,7 @@ class ProofTests(unittest.TestCase):
     def test_authority_is_separate_and_off_or_update_latches_cancellation(self):
         with mock.patch.dict(os.environ,{},clear=True):cfg=pull.Config()
         self.assertFalse(cfg.stitch_proof_enabled)
-        on=dict(ok=True,stitch_proof_task_id=1,stitch_enabled=False)
+        on=dict(ok=True,stitch_proof_task_id=1,stitch_enabled=False,stitch_proof_activation_id="11111111-1111-4111-8111-111111111111")
         cfg.stitch_switches.apply(on);self.assertTrue(cfg.stitch_proof_enabled)
         self.assertFalse(cfg.stitch_enabled);self.assertFalse(cfg.stitch_delete_enabled)
         old=cfg.stitch_switches.proof[1]

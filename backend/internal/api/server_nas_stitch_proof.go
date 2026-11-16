@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -16,6 +15,7 @@ import (
 const nasStitchProofSourceSHA = "0dfa6b172f33bd55e409729ecd517d492cdee03427b028ac226788e530a72726"
 
 type nasStitchProof struct {
+	ActivationID  string        `json:"activation_id,omitempty"`
 	Kind          string        `json:"kind"`
 	ID            int64         `json:"id"`
 	SourcePlanSHA string        `json:"source_plan_sha256"`
@@ -72,33 +72,6 @@ func boundedNASStitchProof(p nasStitchPlan, sourceSHA string) (nasStitchProof, e
 	return nasStitchProof{Kind: "nas-only-v85r-proof-v1", ID: 1, SourcePlanSHA: sourceSHA, PlanSHA: cleanupSHA(raw), Plan: p}, nil
 }
 
-func (s *Server) nasStitchProof(ctx context.Context) (nasStitchProof, error) {
-	if s.cfg.NASStitchProofTaskID != 1 || s.cfg.NASStitchEnabled || s.cfg.NASStitchDeletionEnabled {
-		return nasStitchProof{}, errors.New("isolated proof selector inactive")
-	}
-	var raw []byte
-	var sourceSHA string
-	var until time.Time
-	err := s.pool.QueryRow(ctx, `SELECT t.plan,t.plan_sha256,s.approved_until FROM nas_stitch_tasks t JOIN nas_stitch_scopes s ON s.id=t.scope_id WHERE t.id=1 AND t.recording_id=444 AND s.id=1 AND s.stream_id=17208 AND s.start_at<='2026-08-09T09:00:52.52Z' AND s.end_at>='2026-08-09T09:02:52.52Z' AND NOT s.paused AND NOT s.deletion_approved AND s.approved_until>now() AND NOT EXISTS(SELECT 1 FROM nas_cleanup_frozen_streams)`).Scan(&raw, &sourceSHA, &until)
-	if err != nil {
-		return nasStitchProof{}, errors.New("proof scope or cleanup admission unavailable")
-	}
-	var p nasStitchPlan
-	if json.Unmarshal(raw, &p) != nil {
-		return nasStitchProof{}, errors.New("proof source plan unreadable")
-	}
-	result, err := boundedNASStitchProof(p, sourceSHA)
-	if err != nil {
-		return result, err
-	}
-	// Admission validity is short-lived; it does not renew or impersonate task1's lease.
-	result.Expires = time.Now().UTC().Add(15 * time.Minute)
-	if until.Before(result.Expires) {
-		result.Expires = until
-	}
-	return result, nil
-}
-
 func (s *Server) handleAccountNASStitchProof(w http.ResponseWriter, r *http.Request) {
 	cid, ok := s.nasRestoreConnection(r.Context(), w, r)
 	if !ok {
@@ -114,15 +87,20 @@ func (s *Server) handleAdminNASStitchProof(w http.ResponseWriter, r *http.Reques
 	s.writeNASStitchProof(w, r)
 }
 func (s *Server) writeNASStitchProof(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := cleanupExecutionContext(r.Context())
-	defer cancel()
-	proof, err := s.nasStitchProof(ctx)
-	if err != nil {
-		util.WriteError(w, 409, err.Error())
-		return
+	// Historical clients cannot echo/spend the operator activation UUID.
+	// Keep preserved-result verification separate; never grant legacy native work.
+	util.WriteError(w, 409, "legacy native proof admission retired; activation protocol required")
+}
+
+func stitchProofActivation(selector int, connectionID int64, version, activation string) (int, string) {
+	mode := stitchProofSelector(selector, connectionID, version)
+	if mode == 1 {
+		if version != nasCleanupR2CopyControlClientVersion || !nasStitchReadbackUUID(activation) {
+			return 0, ""
+		}
+		return mode, activation
 	}
-	w.Header().Set("Cache-Control", "private, no-store")
-	util.WriteJSON(w, 200, proof)
+	return mode, ""
 }
 
 func stitchProofSelector(selector int, connectionID int64, version string) int {

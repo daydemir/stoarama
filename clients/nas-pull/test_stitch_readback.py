@@ -33,7 +33,7 @@ class Hold(ValueError):
 
 def load_contract():
     names = {"StitchReadbackContractError", "StitchReadbackDefinition", "stitch_readback_validate",
-             "NASStitchMode", "StitchSwitches", "StitchProfileKey", "StitchClientIdentity",
+             "NASStitchMode", "StitchProofSwitch", "StitchSwitches", "StitchProfileKey", "StitchClientIdentity",
              "StitchProfileBytes", "StitchProducerProfile", "StitchProfilePair",
              "stitch_readback_profiles", "stitch_proof_json", "StitchReadbackIntegrity",
              "stitch_readback_file", "stitch_readback_registration", "stitch_readback_native",
@@ -92,7 +92,7 @@ def producer():
 
 def readback():
     return dict(schema="stoarama.nas-stitch-readback.v2", native_run_id=ID, native_bundle_sha256=SHA,
-        native_plan_sha256=SHA, producer_profile_sha256=SHA, reader_profile_sha256=SHA,
+        native_plan_sha256=SHA,native_task_sha256=SHA, producer_profile_sha256=SHA, reader_profile_sha256=SHA,
         profile_pair_sha256=SHA, id=ID, started_at=UTC, verified_at=UTC,
         reader_execution=dict(connection_id=13, account_id=47, client_boot_id=ID, host=copy.deepcopy(HOST),
             client_version="r2-copy-v3", client_artifact_sha256=SHA, client_artifact_size_bytes=1),
@@ -103,7 +103,7 @@ def readback():
 def server_validation():
     original=readback()
     value={name:copy.deepcopy(original[name]) for name in (
-        "native_run_id","native_bundle_sha256","native_plan_sha256","producer_profile_sha256",
+        "native_run_id","native_bundle_sha256","native_plan_sha256","native_task_sha256","producer_profile_sha256",
         "reader_profile_sha256","profile_pair_sha256","reader_execution","outputs","policy","tools")}
     value.update(schema="stoarama.nas-stitch-validation.v2",validated_at=UTC,readback_receipt_sha256=SHA,
         reader_heartbeat_received_at=UTC,reader_release_stable=True,reader_release_candidate=False,
@@ -251,7 +251,7 @@ class ReadbackContractTests(unittest.TestCase):
     def test_mode_changes_permanently_cancel_previous_native_or_readback_job(self):
         switches = CORE["StitchSwitches"]()
         mode = CORE["NASStitchMode"]
-        switches.apply(dict(ok=True, stitch_proof_task_id=1))
+        switches.apply(dict(ok=True, stitch_proof_task_id=1,stitch_proof_activation_id=ID))
         first = switches.proof[1]
         self.assertIs(switches.proof[0], mode.NATIVE)
         switches.apply(dict(ok=True, stitch_proof_task_id=2))
@@ -262,10 +262,20 @@ class ReadbackContractTests(unittest.TestCase):
         switches.apply(dict(ok=True, stitch_proof_task_id=2))
         self.assertTrue(second.is_set()); self.assertFalse(switches.proof[1].is_set())
 
+    def test_activation_change_cancels_atomically_and_missing_native_nonce_refuses(self):
+        switches=CORE["StitchSwitches"]()
+        switches.apply(dict(ok=True,stitch_proof_task_id=1,stitch_proof_activation_id=ID))
+        first=switches.proof
+        switches.apply(dict(ok=True,stitch_proof_task_id=1,stitch_proof_activation_id="22222222-2222-4222-8222-222222222222"))
+        self.assertTrue(first.cancel.is_set());self.assertFalse(switches.proof.cancel.is_set())
+        self.assertEqual(switches.proof.activation_id,"22222222-2222-4222-8222-222222222222")
+        with self.assertRaises(ValueError):switches.apply(dict(ok=True,stitch_proof_task_id=1))
+        self.assertTrue(switches.proof.cancel.is_set());self.assertEqual(switches.proof.mode,CORE["NASStitchMode"].DISABLED)
+
     def test_unknown_or_boolean_mode_refuses_and_cancels_instead_of_native_fallback(self):
         for value in (True, None, 3, "1", -1):
             switches = CORE["StitchSwitches"]()
-            switches.apply(dict(ok=True, stitch_proof_task_id=1)); old = switches.proof[1]
+            switches.apply(dict(ok=True, stitch_proof_task_id=1,stitch_proof_activation_id=ID)); old = switches.proof[1]
             with self.subTest(value=value), self.assertRaises(ValueError):
                 switches.apply(dict(ok=True, stitch_proof_task_id=value))
             self.assertTrue(old.is_set())
@@ -617,7 +627,8 @@ class SyntheticMemoryEvidenceStore:
     def put(self,body):
         digest=hashlib.sha256(body).hexdigest();self.blobs[digest]=bytes(body);return digest
 
-    def read(self,digest):
+    def read(self,digest,*,stop=None):
+        if stop is not None:CORE["stitch_check"](stop)
         return self.blobs[digest]
 
 
@@ -638,21 +649,51 @@ class EvidenceLedgerTests(unittest.TestCase):
     def test_native_window_and_original_admission_do_not_extend_after_restart_or_refresh(self):
         mode=CORE["NASStitchMode"]
         self.assertFalse(self.ledger.due())
-        self.ledger.observe_mode(mode.NATIVE,self.now, ID)
+        self.ledger.observe_mode(mode.NATIVE,self.now, ID,ID)
         expiry=self.ledger.state["window"]["expires_at"]
+        self.ledger.enter_native()
         original=b'{"explicitly_synthetic":"original admission"}'
         self.assertEqual(self.ledger.bind_admission(original),original)
-        self.ledger.observe_mode(mode.NATIVE,self.now+datetime.timedelta(minutes=10), ID)
+        self.ledger.observe_mode(mode.NATIVE,self.now+datetime.timedelta(minutes=10), ID,ID)
         self.assertEqual(self.ledger.state["window"]["expires_at"],expiry)
         restarted=CORE["StitchEvidenceLedger"](self.store)
         self.assertEqual(restarted.original_admission(),original)
-        restarted.observe_mode(mode.NATIVE,self.now+datetime.timedelta(minutes=20), ID)
+        restarted.observe_mode(mode.NATIVE,self.now+datetime.timedelta(minutes=20), ID,ID)
         with self.assertRaises(Hold):restarted.native_deadline(self.now+datetime.timedelta(minutes=15))
         with self.assertRaises(CORE["StitchReadbackIntegrity"]):restarted.bind_admission(b'{"later":"expiry"}')
         self.assertEqual(restarted.native_deadline(self.now),100+15*60-30)
         restarted.observe_mode(mode.DISABLED,self.now+datetime.timedelta(minutes=20), ID)
-        restarted.observe_mode(mode.NATIVE,self.now+datetime.timedelta(minutes=21), ID)
-        self.assertNotEqual(restarted.state["window"]["expires_at"],expiry)
+        restarted.observe_mode(mode.NATIVE,self.now+datetime.timedelta(minutes=21), ID,ID)
+        self.assertEqual(restarted.state["window"]["expires_at"],expiry)
+
+    def test_activation_spend_survives_off_restart_and_replay_after_new_uuid(self):
+        mode=CORE["NASStitchMode"];later="22222222-2222-4222-8222-222222222222"
+        self.ledger.observe_mode(mode.NATIVE,self.now,ID,ID)
+        self.ledger.enter_native()
+        original=copy.deepcopy(self.ledger.state["window"])
+        for off in (mode.DISABLED,mode.READBACK,mode.DISABLED):
+            self.ledger.observe_mode(off,self.now,ID)
+            self.ledger=CORE["StitchEvidenceLedger"](self.store)
+            self.ledger.observe_mode(mode.NATIVE,self.now+datetime.timedelta(minutes=10),ID,ID)
+            self.assertEqual(self.ledger.state["window"],original)
+            with self.assertRaises(Hold):self.ledger.enter_native()
+        self.ledger.observe_mode(mode.NATIVE,self.now,ID,later)
+        self.assertNotEqual(self.ledger.state["window"]["run_id"],original["run_id"])
+        self.assertEqual(self.ledger.state["used_activation_ids"],[ID,later])
+        self.assertFalse(self.ledger.state["window"]["entered"])
+        with self.assertRaises(Hold):self.ledger.observe_mode(mode.NATIVE,self.now,ID,ID)
+
+    def test_activation_bound_never_prunes_and_invalid_native_id_never_commits(self):
+        mode=CORE["NASStitchMode"]
+        before=self.store.snapshot()
+        for activation in ("", "00000000-0000-0000-0000-000000000000", "ABCDEFAB-1111-4111-8111-111111111111",None):
+            with self.assertRaises(Hold):self.ledger.observe_mode(mode.NATIVE,self.now,ID,activation)
+            self.assertEqual(self.store.snapshot(),before)
+        for index in range(1,65):
+            self.ledger.observe_mode(mode.NATIVE,self.now,ID,str(uuid.UUID(int=index)))
+        before=self.store.snapshot()
+        with self.assertRaises(Hold):self.ledger.observe_mode(mode.NATIVE,self.now,ID,str(uuid.UUID(int=65)))
+        self.assertEqual(self.store.snapshot(),before)
 
     def test_restart_profile_or_boot_change_drops_accepting_history_not_preserved_blobs(self):
         self.ledger.observe_mode(CORE["NASStitchMode"].READBACK,self.now, ID)
@@ -713,15 +754,15 @@ class EvidenceLedgerTests(unittest.TestCase):
             with self.assertRaises(CORE["StitchReadbackIntegrity"]):CORE["stitch_evidence_index"](CORE["cleanup_json_bytes"](value))
 
     def test_clock_rollback_or_new_boot_cannot_extend_original_native_window(self):
-        mode=CORE["NASStitchMode"];self.ledger.observe_mode(mode.NATIVE,self.now,ID)
+        mode=CORE["NASStitchMode"];self.ledger.observe_mode(mode.NATIVE,self.now,ID,ID)
         original=self.ledger.state["window"]["deadline_monotonic_ns"]
         self.clock+=15*60
         restarted=CORE["StitchEvidenceLedger"](self.store)
-        restarted.observe_mode(mode.NATIVE,self.now-datetime.timedelta(days=1),ID)
+        restarted.observe_mode(mode.NATIVE,self.now-datetime.timedelta(days=1),ID,ID)
         self.assertEqual(restarted.state["window"]["deadline_monotonic_ns"],original)
         with self.assertRaises(Hold):restarted.native_deadline(self.now-datetime.timedelta(days=1))
         self.clock=1
-        restarted.observe_mode(mode.NATIVE,self.now,"22222222-2222-4222-8222-222222222222")
+        restarted.observe_mode(mode.NATIVE,self.now,"22222222-2222-4222-8222-222222222222",ID)
         with self.assertRaises(Hold):restarted.native_deadline(self.now)
         with self.assertRaises(Hold):restarted.due()
 

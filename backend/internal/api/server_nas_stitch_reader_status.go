@@ -15,6 +15,7 @@ type nasStitchReadbackSummary struct {
 }
 
 type nasStitchNativeStatus struct {
+	ActivationID    string                   `json:"activation_id,omitempty"`
 	RunID           string                   `json:"run_id"`
 	BundleSHA       string                   `json:"bundle_sha256"`
 	PlanSHA         string                   `json:"plan_sha256"`
@@ -61,7 +62,7 @@ func decodeNASStitchReaderStatus(raw json.RawMessage, snapshot nasStitchReadback
 		return value, nil
 	}
 	n := value.Native
-	if !nasStitchReadbackUUID(n.RunID) || len(n.Outputs) != 1 {
+	if !nasStitchReadbackUUID(n.RunID) || len(n.Outputs) != 1 || (n.ActivationID != "" && !nasStitchReadbackUUID(n.ActivationID)) {
 		return value, errors.New("preserved native status incomplete")
 	}
 	for _, sha := range []string{n.BundleSHA, n.PlanSHA, n.TaskSHA, n.ResultSHA, n.ProducerSHA, n.ReaderSHA, n.PairSHA, n.RegistrationSHA} {
@@ -88,7 +89,7 @@ func decodeNASStitchReaderStatus(raw json.RawMessage, snapshot nasStitchReadback
 
 func matchNASStitchReadbackStatus(receipt nasStitchReadbackReceipt, rawSHA string, status nasStitchReaderStatus) error {
 	n := status.Native
-	if n == nil || n.RunID != receipt.NativeRunID || n.BundleSHA != receipt.NativeBundleSHA || n.PlanSHA != receipt.NativePlanSHA ||
+	if n == nil || n.RunID != receipt.NativeRunID || n.BundleSHA != receipt.NativeBundleSHA || n.PlanSHA != receipt.NativePlanSHA || n.TaskSHA != receipt.NativeTaskSHA || n.ActivationID != receipt.NativeActivationID ||
 		n.ProducerSHA != receipt.ProducerProfileSHA || n.ReaderSHA != receipt.ReaderProfileSHA || n.PairSHA != receipt.PairSHA ||
 		n.RegistrationSHA != receipt.NativeRegistration || status.Reader != receipt.Reader || len(n.Outputs) != 1 ||
 		n.Outputs[0] != receipt.Outputs[0] || n.Policy != receipt.Policy || n.Tools != receipt.Tools {

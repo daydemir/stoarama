@@ -145,18 +145,18 @@ stitching/deletion retain their unchanged entry and authority checks, and remain
 off. Only the combined reader receives2;
 legacy native-only releases never do. Account GET
 `/connections/stitch/evidence/admission` is scoped to connection13/account47.
-Native requests carry one canonical `run_id`; readback requests carry the
+Native requests carry canonical `run_id` and operator `activation_id`; readback requests carry the
 original producer-profile digest. A readback request never leases or creates a
 native task, downloads sources/tools, calls ffmpeg, or falls back to stitching.
 
 Native admission preserves exact source0dfa and the two approved clips. It uses
 a new `_V85r_proof_keep28_v3/.../run-UUID` directory and plan digest, preserving
-all older workspaces. One original activation window and admission are saved
+all older workspaces. One original activation UUID, window and admission are saved
 before native work. The deadline is the earliest original window/task expiry,
 with the30-second margin and an absolute14m30s cap. Its original monotonic
 deadline and boot are persisted; a wall-clock rollback cannot extend it, and a
 changed boot refuses the window. A refresh/restart cannot extend it. An interrupted or failed attempt is not automatically reentered;
-another reviewed OFF-to-ON operation uses another run directory. Startup may
+a fresh reviewed activation UUID uses another run directory. Startup may
 adopt a complete already-published registration, reading metadata only. This
 neither replays native work nor accepts output integrity on startup.
 
@@ -228,3 +228,27 @@ This draft's current reader is exactly `r2-copy-v3`. No v8 artifact or pair is
 accepted here. A future v8 release must retain proof, copy and cleanup together
 and add its own exact reviewed reader/schema/pair support before publication;
 it cannot reuse the v3 artifact identity or switch the NAS back to5009.
+
+
+### One-use operator activation
+
+Native mode requires a fresh reviewed canonical nonzero UUID in
+`NAS_STITCH_PROOF_ACTIVATION_ID`. It is distinct from selector/task1, the client
+run UUID, boot and Render identities. The server echoes it with native mode;
+the client captures mode/cancellation/UUID atomically, persists the UUID and one
+run/window before any admission, then commits native entry before its first API
+request. OFF, heartbeat outage, startup and restart never clear the spent set,
+original deadline or entry. Reuse cannot create work; a new reviewed operation
+uses a new UUID. The bounded64-ID journal refuses at capacity and never prunes.
+
+Legacy native admission is retired: clients unable to echo/spend the UUID
+receive no native selector/admission. Historical frozen5009 evidence can still
+be verified/read back only under a separately accepted pair. Frozen native
+runner337c, receipt18ff, verifier81ff and attestation03d9 remain separately pinned.
+Readback2 never falls through to native. Fail-safe0 does not depend on the UUID
+or successful native admission, and never clears the UUID/journal.
+
+Future controller enable packets must bind the UUID, guarded single-key config
+writes while selector0 then1, one pinned deployment, original cutoff and exact
+raw-task evidence. Every operation still needs fresh four-incident guards and
+independent review; code defaults grant no release/activation authority.

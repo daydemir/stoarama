@@ -14,6 +14,8 @@ import (
 )
 
 type nasStitchReadbackBinding struct {
+	NativeTaskSHA       string                   `json:"native_task_sha256"`
+	NativeActivationID  string                   `json:"native_activation_id,omitempty"`
 	NativeRunID         string                   `json:"native_run_id"`
 	NativeBundleSHA     string                   `json:"native_bundle_sha256"`
 	NativePlanSHA       string                   `json:"native_plan_sha256"`
@@ -57,7 +59,7 @@ func nasStitchReadbackScope(planSHA string) stitchproof.PayloadScope {
 }
 
 func bindNASStitchReadback(receipt nasStitchReadbackReceipt, sha string, snapshot nasStitchReadbackSnapshot, server nasStitchServerExecution) nasStitchReadbackBinding {
-	return nasStitchReadbackBinding{NativeRunID: receipt.NativeRunID, NativeBundleSHA: receipt.NativeBundleSHA, NativePlanSHA: receipt.NativePlanSHA,
+	return nasStitchReadbackBinding{NativeTaskSHA: receipt.NativeTaskSHA, NativeActivationID: receipt.NativeActivationID, NativeRunID: receipt.NativeRunID, NativeBundleSHA: receipt.NativeBundleSHA, NativePlanSHA: receipt.NativePlanSHA,
 		ProducerSHA: receipt.ProducerProfileSHA, ReaderSHA: receipt.ReaderProfileSHA, PairSHA: receipt.PairSHA, ReadbackSHA: sha, Reader: receipt.Reader,
 		HeartbeatAt: snapshot.Facts.HeartbeatAt.Time.UTC().Format(time.RFC3339Nano), Stable: snapshot.Facts.Host.Release.Stable,
 		Candidate: snapshot.Facts.Host.Release.Candidate, InventoryMismatches: snapshot.Facts.InventoryMismatches.Int64,
@@ -83,6 +85,10 @@ func acceptedNASStitchReadback(receipt nasStitchReadbackReceipt) (stitchproof.Ac
 	if err != nil {
 		return pair, errors.New("producer/current-reader pair is not accepted")
 	}
+	if (pair.ProducerIdentity().Version() == stitchproof.ClientCopyV3 && !nasStitchReadbackUUID(receipt.NativeActivationID)) ||
+		(pair.ProducerIdentity().Version() == stitchproof.ClientNativeV2 && receipt.NativeActivationID != "") {
+		return pair, errors.New("producer activation protocol differs")
+	}
 	r := pair.ReaderIdentity()
 	if pair.Key() != key || string(r.Version()) != receipt.Reader.Version || r.ArtifactSHA256().String() != receipt.Reader.ArtifactSHA || r.SizeBytes() != receipt.Reader.ArtifactSize {
 		return stitchproof.AcceptedPair{}, errors.New("current reader differs from sealed profile")
@@ -103,7 +109,8 @@ func (s *Server) handleAccountNASStitchEvidenceAdmission(w http.ResponseWriter, 
 	}
 	mode := nasStitchProofMode(s.cfg.NASStitchProofTaskID)
 	query, err := parseNASStitchAdmissionQuery(r, mode)
-	if err != nil || s.cfg.NASStitchEnabled || s.cfg.NASStitchDeletionEnabled {
+	if err != nil || s.cfg.NASStitchEnabled || s.cfg.NASStitchDeletionEnabled ||
+		(mode == nasStitchProofNative && (!nasStitchReadbackUUID(s.cfg.NASStitchProofActivationID) || query.activation != s.cfg.NASStitchProofActivationID)) {
 		util.WriteError(w, 409, "isolated evidence mode inactive or request differs")
 		return
 	}
@@ -143,8 +150,14 @@ func (s *Server) handleAccountNASStitchEvidenceAdmission(w http.ResponseWriter, 
 		if snapshot.ApprovedUntil.Before(expires) {
 			expires = snapshot.ApprovedUntil
 		}
-		proof.Expires = expires
-		response["task"], response["native_run_id"] = proof, query.run
+		proof.Expires, proof.ActivationID = expires, query.activation
+		taskRaw, err := json.Marshal(proof)
+		if err != nil {
+			util.WriteError(w, 409, "native task bytes unavailable")
+			return
+		}
+		response["task_b64"], response["task_sha256"] = base64.StdEncoding.EncodeToString(taskRaw), cleanupSHA(taskRaw)
+		response["task"], response["native_run_id"], response["activation_id"] = proof, query.run, query.activation
 	}
 	if snapshot.ApprovedUntil.Before(expires) {
 		expires = snapshot.ApprovedUntil
@@ -154,7 +167,7 @@ func (s *Server) handleAccountNASStitchEvidenceAdmission(w http.ResponseWriter, 
 	util.WriteJSON(w, 200, response)
 }
 
-type nasStitchAdmissionQuery struct{ run, producer string }
+type nasStitchAdmissionQuery struct{ run, producer, activation string }
 
 func urlParseNASStitchQuery(r *http.Request) (url.Values, error) {
 	if len(r.URL.RawQuery) > 256 {
@@ -168,8 +181,8 @@ func parseNASStitchAdmissionQuery(r *http.Request, mode nasStitchProofMode) (nas
 	if err != nil {
 		return value, err
 	}
-	if mode == nasStitchProofNative && len(q) == 1 && len(q["run_id"]) == 1 && nasStitchReadbackUUID(q.Get("run_id")) {
-		value.run = q.Get("run_id")
+	if mode == nasStitchProofNative && len(q) == 2 && len(q["run_id"]) == 1 && nasStitchReadbackUUID(q.Get("run_id")) && len(q["activation_id"]) == 1 && nasStitchReadbackUUID(q.Get("activation_id")) {
+		value.run, value.activation = q.Get("run_id"), q.Get("activation_id")
 		return value, nil
 	}
 	if mode == nasStitchProofReadback && len(q) == 1 && len(q["producer_profile_sha256"]) == 1 && stitchSHA(q.Get("producer_profile_sha256")) {
@@ -204,7 +217,7 @@ func (s *Server) handleAdminNASStitchReadbackStatus(w http.ResponseWriter, r *ht
 		if entry.SHA != q.Get("receipt_sha256") {
 			continue
 		}
-		receipt := nasStitchReadbackReceipt{Schema: nasStitchReadbackSchema, NativeRunID: n.RunID, NativeBundleSHA: n.BundleSHA, NativePlanSHA: n.PlanSHA,
+		receipt := nasStitchReadbackReceipt{NativeTaskSHA: n.TaskSHA, NativeActivationID: n.ActivationID, Schema: nasStitchReadbackSchema, NativeRunID: n.RunID, NativeBundleSHA: n.BundleSHA, NativePlanSHA: n.PlanSHA,
 			ProducerProfileSHA: n.ProducerSHA, ReaderProfileSHA: n.ReaderSHA, PairSHA: n.PairSHA, ID: entry.ID, VerifiedAt: entry.VerifiedAt,
 			Reader: status.Reader, Outputs: n.Outputs, Policy: n.Policy, Tools: n.Tools, NativeRegistration: n.RegistrationSHA}
 		receipt.StartedAt = receipt.VerifiedAt // projection only; current-context does not emit a started_at
@@ -237,6 +250,8 @@ func (s *Server) handleAdminNASStitchReadbackStatus(w http.ResponseWriter, r *ht
 }
 
 type nasStitchReadbackValidateRequest struct {
+	NativeTaskB64   string `json:"native_task_b64"`
+	NativeTaskSHA   string `json:"native_task_sha256"`
 	Schema          string `json:"schema"`
 	ReadbackB64     string `json:"readback_b64"`
 	ReadbackSHA     string `json:"readback_receipt_sha256"`
@@ -260,9 +275,9 @@ func (s *Server) handleAdminNASStitchReadbackValidate(w http.ResponseWriter, r *
 		util.WriteError(w, 409, "isolated proof contract inactive")
 		return
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 256*1024+1))
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 2*1024*1024+1))
 	var req nasStitchReadbackValidateRequest
-	if err != nil || len(raw) > 256*1024 || stitchproof.DecodeExact(raw, &req) != nil || req.Schema != "stoarama.nas-stitch-validation-request.v2" {
+	if err != nil || len(raw) > 2*1024*1024 || stitchproof.DecodeExact(raw, &req) != nil || req.Schema != "stoarama.nas-stitch-validation-request.v2" {
 		util.WriteError(w, 400, "strict bounded validation request required")
 		return
 	}
@@ -276,9 +291,14 @@ func (s *Server) handleAdminNASStitchReadbackValidate(w http.ResponseWriter, r *
 		util.WriteError(w, 400, err.Error())
 		return
 	}
-	receipt, err := decodeNASStitchReadback(readback)
+	taskRaw, err := decodeNASStitchReadbackComponent(req.NativeTaskB64, req.NativeTaskSHA, 1024*1024)
 	if err != nil {
 		util.WriteError(w, 400, err.Error())
+		return
+	}
+	receipt, err := decodeNASStitchReadback(readback)
+	if err != nil || receipt.NativeTaskSHA != req.NativeTaskSHA {
+		util.WriteError(w, 400, "native readback/task binding differs")
 		return
 	}
 	pair, err := acceptedNASStitchReadback(receipt)
@@ -296,10 +316,7 @@ func (s *Server) handleAdminNASStitchReadbackValidate(w http.ResponseWriter, r *
 		util.WriteError(w, 409, "current native/readback relationship differs")
 		return
 	}
-	proof, err := boundedNASStitchProof(snapshot.SourcePlan, snapshot.SourceSHA)
-	if pair.ProducerIdentity().Version() == stitchproof.ClientCopyV3 {
-		proof, err = boundedNASStitchNativeV3(snapshot.SourcePlan, snapshot.SourceSHA, receipt.NativeRunID)
-	}
+	proof, err := validateNASStitchReadbackTask(taskRaw, receipt.NativeTaskSHA, receipt.NativeActivationID, receipt.NativeRunID, pair.ProducerIdentity().Version(), snapshot.SourcePlan, snapshot.SourceSHA)
 	if err != nil || proof.PlanSHA != receipt.NativePlanSHA {
 		util.WriteError(w, 409, "original native plan differs")
 		return

@@ -37,7 +37,7 @@ def synthetic_stream():
     native.update(client_artifact_sha256=producer['client_artifact']['sha256'],client_version=producer['client_version'])
     bundle=gzip.compress(canonical(native),mtime=0)
     readback=fixture.readback()
-    readback.update(native_run_id=native['run']['id'],native_bundle_sha256=hashlib.sha256(bundle).hexdigest(),
+    readback.update(native_task_sha256=hashlib.sha256(canonical(task)).hexdigest(),native_run_id=native['run']['id'],native_bundle_sha256=hashlib.sha256(bundle).hexdigest(),
         native_plan_sha256=native['plan_sha256'],producer_profile_sha256=hashlib.sha256(profiles[0]).hexdigest(),
         reader_profile_sha256=hashlib.sha256(profiles[1]).hexdigest(),profile_pair_sha256=hashlib.sha256(profiles[2]).hexdigest(),
         native_registration_sha256=hashlib.sha256(gzip.decompress(bundle)).hexdigest(),
@@ -65,6 +65,17 @@ class PureReadbackVerifierTests(unittest.TestCase):
         self.assertNotIn('grants_retirement',actual)
         core=verify.load_core(parts[0],digests[0])
         self.assertFalse(hasattr(core,'stitch_build'));self.assertFalse(hasattr(core,'stitch_readback_run'))
+
+    def test_recomputed_task_component_cannot_rewrite_captured_readback_binding(self):
+        for field,value in (("expires_at","2000-01-01T00:15:00Z"),("activation_id",fixture.ID)):
+            envelope,digests,parts=synthetic_stream()
+            task=json.loads(parts[3]);task[field]=value
+            body=fixture.CORE["cleanup_json_bytes"](task)
+            # Deliberately supply the attacker's recomputed component digest.
+            # The original independently bound readback/task identity stays fixed.
+            envelope['native_task_b64']=base64.b64encode(body).decode('ascii')
+            digests[3]=hashlib.sha256(body).hexdigest()
+            with self.assertRaises(verify.ReadbackError):verify.replay_stream(fixture.CORE['cleanup_json_bytes'](envelope),digests)
 
     def test_each_component_hash_and_canonical_envelope_is_required(self):
         envelope,digests,_=synthetic_stream();raw=fixture.CORE['cleanup_json_bytes'](envelope)

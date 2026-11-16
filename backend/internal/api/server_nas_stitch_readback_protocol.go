@@ -12,7 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-// New/unfrozen v2 contract: e38f8e95588264fa579e53a66c1eb39bab84370c680dd8c2aac05865afe562b1.
+// New/unfrozen v2 contract: a8d8adc0df07f3314596fb964a218f4c3f98a4782e9197390c59e21f38f7c4a8.
 // These wire checks do not accept a profile, create authority or replay native
 // inventories. Endpoint integration must first use the sealed registry lookup.
 const nasStitchReadbackSchema = "stoarama.nas-stitch-readback.v2"
@@ -31,6 +31,8 @@ type nasStitchReaderExecution struct {
 }
 
 type nasStitchReadbackReceipt struct {
+	NativeTaskSHA      string                   `json:"native_task_sha256"`
+	NativeActivationID string                   `json:"native_activation_id,omitempty"`
 	Schema             string                   `json:"schema"`
 	NativeRunID        string                   `json:"native_run_id"`
 	NativeBundleSHA    string                   `json:"native_bundle_sha256"`
@@ -107,11 +109,14 @@ func decodeNASStitchReadback(raw []byte) (nasStitchReadbackReceipt, error) {
 	if receipt.Schema != nasStitchReadbackSchema || !nasStitchReadbackUUID(receipt.NativeRunID) || !nasStitchReadbackUUID(receipt.ID) {
 		return receipt, errors.New("readback schema/run identity differs")
 	}
-	for _, digest := range []string{receipt.NativeBundleSHA, receipt.NativePlanSHA, receipt.ProducerProfileSHA,
+	for _, digest := range []string{receipt.NativeBundleSHA, receipt.NativePlanSHA, receipt.NativeTaskSHA, receipt.ProducerProfileSHA,
 		receipt.ReaderProfileSHA, receipt.PairSHA, receipt.NativeRegistration, receipt.Reader.ArtifactSHA} {
 		if !stitchSHA(digest) {
 			return receipt, errors.New("readback digest identity differs")
 		}
+	}
+	if receipt.NativeActivationID != "" && !nasStitchReadbackUUID(receipt.NativeActivationID) {
+		return receipt, errors.New("native activation identity differs")
 	}
 	r := receipt.Reader
 	if !validNASStitchReaderExecution(r) {

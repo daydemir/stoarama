@@ -117,7 +117,7 @@ func TestNASStitchProofPullMiddlewareAllowsOnlyExactRead(t *testing.T) {
 		}
 	}
 }
-func TestNASStitchProofReadsAcrossUnchangedAdmissionFence(t *testing.T) {
+func TestNASStitchLegacyAdmissionRefusesAcrossUnchangedAdmissionFence(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
 	f := &cleanupFixture{pool: pool, ctx: ctx}
@@ -141,19 +141,14 @@ func TestNASStitchProofReadsAcrossUnchangedAdmissionFence(t *testing.T) {
 	}
 	server := &Server{pool: pool}
 	server.cfg.NASStitchProofTaskID = 1
-	before := time.Now()
-	p, err := server.nasStitchProof(ctx)
-	if err != nil || !p.Expires.After(before) {
-		t.Fatalf("read-only proof refused: %v", err)
-	}
 	keyID := int64(5)
 	principal := accountPrincipal{AccountID: 47, AuthType: "api_key", APIKeyID: &keyID, KeyScopes: []string{accountScopePull}}
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/account/connections/stitch/proof", nil)
 	req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, principal))
 	w := httptest.NewRecorder()
 	server.confineAccountScope(http.HandlerFunc(server.handleAccountNASStitchProof)).ServeHTTP(w, req)
-	if w.Code != 200 {
-		t.Fatalf("bounded proof inaccessible through pull middleware: %d %s", w.Code, w.Body)
+	if w.Code != 409 {
+		t.Fatalf("legacy native admission was not retired: %d %s", w.Code, w.Body)
 	}
 	if _, err = pool.Exec(ctx, `UPDATE nas_stitch_tasks SET attempt=attempt+1 WHERE id=1`); err == nil {
 		t.Fatal("ordinary re-lease escaped fence")
@@ -161,24 +156,7 @@ func TestNASStitchProofReadsAcrossUnchangedAdmissionFence(t *testing.T) {
 	if _, err = pool.Exec(ctx, `INSERT INTO nas_stitch_outputs(task_id,relative_path,sha256,size_bytes,proof)VALUES(1,'proof',repeat('b',64),1,'{}')`); err == nil {
 		t.Fatal("catalogue insert escaped fence")
 	}
-	for _, selector := range []int{0, 2} {
-		server.cfg.NASStitchProofTaskID = selector
-		if _, err = server.nasStitchProof(ctx); err == nil {
-			t.Fatal("wrong selector admitted")
-		}
-	}
-	server.cfg.NASStitchProofTaskID = 1
-	server.cfg.NASStitchEnabled = true
-	if _, err = server.nasStitchProof(ctx); err == nil {
-		t.Fatal("ordinary lane active with proof")
-	}
-	server.cfg.NASStitchEnabled = false
-	if _, err = pool.Exec(ctx, `UPDATE nas_stitch_scopes SET paused=true WHERE id=1`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = server.nasStitchProof(ctx); err == nil {
-		t.Fatal("paused scope admitted")
-	}
+
 }
 
 func TestNASStitchProofTransportSurvivesServerRedaction(t *testing.T) {

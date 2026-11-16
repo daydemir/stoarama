@@ -702,15 +702,16 @@ type connectionHeartbeatRequest struct {
 }
 
 type connectionHeartbeatResponse struct {
-	ListingEnabled           bool  `json:"listing_enabled"`
-	StitchProofTaskID        int   `json:"stitch_proof_task_id,omitempty"`
-	StitchEnabled            bool  `json:"stitch_enabled"`
-	StitchDeletionEnabled    bool  `json:"stitch_deletion_enabled"`
-	CleanupReleaseGeneration int64 `json:"cleanup_release_generation,omitempty"`
-	OK                       bool  `json:"ok"`
-	JoinedDeliveryAccepted   bool  `json:"joined_delivery_accepted"`
-	JoinedProtocolVersion    int   `json:"joined_protocol_version"`
-	JoinedProtocolGeneration int   `json:"joined_protocol_generation"`
+	ListingEnabled           bool   `json:"listing_enabled"`
+	StitchProofTaskID        int    `json:"stitch_proof_task_id,omitempty"`
+	StitchProofActivationID  string `json:"stitch_proof_activation_id,omitempty"`
+	StitchEnabled            bool   `json:"stitch_enabled"`
+	StitchDeletionEnabled    bool   `json:"stitch_deletion_enabled"`
+	CleanupReleaseGeneration int64  `json:"cleanup_release_generation,omitempty"`
+	OK                       bool   `json:"ok"`
+	JoinedDeliveryAccepted   bool   `json:"joined_delivery_accepted"`
+	JoinedProtocolVersion    int    `json:"joined_protocol_version"`
+	JoinedProtocolGeneration int    `json:"joined_protocol_generation"`
 }
 
 func desiredJoinedProtocol(cfg config.Config, connectionID int64) (int, int) {
@@ -1178,12 +1179,14 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		util.WriteError(w, 503, "listing policy unavailable")
 		return
 	}
+	proofMode, proofActivation := stitchProofActivation(s.cfg.NASStitchProofTaskID, connectionID, req.ClientVersion, s.cfg.NASStitchProofActivationID)
 	util.WriteJSON(w, http.StatusOK, connectionHeartbeatResponse{
-		ListingEnabled:        connectionID == 13 && listingEnabled,
-		StitchProofTaskID:     stitchProofSelector(s.cfg.NASStitchProofTaskID, connectionID, req.ClientVersion),
-		StitchEnabled:         connectionID == 13 && s.cfg.NASStitchEnabled,
-		StitchDeletionEnabled: connectionID == 13 && s.cfg.NASStitchDeletionEnabled,
-		OK:                    true, JoinedDeliveryAccepted: joinedDeliveryAccepted, CleanupReleaseGeneration: cleanupReleaseGeneration,
+		ListingEnabled:          connectionID == 13 && listingEnabled,
+		StitchProofTaskID:       proofMode,
+		StitchProofActivationID: proofActivation,
+		StitchEnabled:           connectionID == 13 && s.cfg.NASStitchEnabled,
+		StitchDeletionEnabled:   connectionID == 13 && s.cfg.NASStitchDeletionEnabled,
+		OK:                      true, JoinedDeliveryAccepted: joinedDeliveryAccepted, CleanupReleaseGeneration: cleanupReleaseGeneration,
 		JoinedProtocolVersion: desiredProtocol, JoinedProtocolGeneration: desiredGeneration,
 	})
 }

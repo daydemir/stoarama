@@ -49,6 +49,7 @@ type Config struct {
 	NASCleanupDeletionEnabled        bool
 	NASR2CopyEnabled                 bool
 	NASStitchProofTaskID             int
+	NASStitchProofActivationID       string
 	NASStitchEnabled                 bool
 	NASStitchDeletionEnabled         bool
 	StorageCredKey                   string
@@ -245,6 +246,7 @@ func Load() (Config, error) {
 		NASCleanupDeletionEnabled:        boolEnv("NAS_CLEANUP_DELETION_ENABLED", false),
 		NASR2CopyEnabled:                 boolEnv("NAS_R2_COPY_ENABLED", false),
 		NASStitchProofTaskID:             intEnv("NAS_STITCH_PROOF_TASK_ID", 0),
+		NASStitchProofActivationID:       os.Getenv("NAS_STITCH_PROOF_ACTIVATION_ID"),
 		NASStitchEnabled:                 boolEnv("NAS_STITCH_ENABLED", false),
 		NASStitchDeletionEnabled:         boolEnv("NAS_STITCH_DELETION_ENABLED", false),
 		StorageCredKey:                   strings.TrimSpace(os.Getenv("STORAGE_CRED_KEY")),
