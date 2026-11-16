@@ -20,7 +20,7 @@ func TestR2StitchRegistryDigestStrictEncoding(t *testing.T) {
 	}
 }
 
-func TestR2StitchRegistryHasNoAcceptedPairs(t *testing.T) {
+func TestR2StitchRegistryRejectsUnacceptedPairs(t *testing.T) {
 	producer := Digest(sha256.Sum256([]byte("unaccepted producer")))
 	reader := Digest(sha256.Sum256([]byte("unaccepted reader")))
 	pair := Digest(sha256.Sum256([]byte("unaccepted relationship")))
