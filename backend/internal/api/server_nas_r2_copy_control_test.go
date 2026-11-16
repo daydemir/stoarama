@@ -120,6 +120,7 @@ CREATE TABLE account_api_keys(id bigint PRIMARY KEY,account_id bigint,secret_has
 	}
 	router := chi.NewRouter()
 	router.Use(f.s.requireAccountAuth, f.s.confineAccountScope, f.s.fenceNASDelivery)
+	router.Get("/api/v1/account/connections/stitch/evidence/admission", f.s.handleAccountNASStitchEvidenceAdmission)
 	router.Post(copyControlLeasePath, f.s.handleNASR2CopyLease)
 	router.Post("/api/v1/account/connections/r2-copy/{id}/checkpoint", f.s.handleNASR2CopyCheckpoint)
 	srv := httptest.NewServer(router)

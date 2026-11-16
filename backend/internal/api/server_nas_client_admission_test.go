@@ -209,21 +209,21 @@ func TestNASClientAdmissionCleanupBlocksLeaseAndPermitReplay(t *testing.T) {
 	}
 }
 
-func TestNASClientAdmissionProofRefusesUnstampedAndPreservesOFF(t *testing.T) {
+func TestNASClientAdmissionLegacyProofRetiredAndPreservesOFF(t *testing.T) {
 	f := newCleanupFixture(t, 1)
 	f.s.cfg.NASStitchProofTaskID = 1
 	for _, agents := range [][]string{{"stoarama-nas-pull/development"}, nil, {"stoarama-nas-pull/unknown"}} {
 		out := admissionCall(t, f, f.s.handleAccountNASStitchProof, http.MethodGet, "/api/v1/account/connections/stitch/proof", 0, nil, agents, "")
-		if out.Code != http.StatusConflict {
-			t.Fatalf("unreviewed proof request reached source lookup: %d %s", out.Code, out.Body)
+		if out.Code != http.StatusConflict || !strings.Contains(out.Body.String(), "legacy native proof admission retired") {
+			t.Fatalf("legacy proof route admitted work: %d %s", out.Code, out.Body)
 		}
 	}
 	if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version='development' WHERE id=13`); err != nil {
 		t.Fatal(err)
 	}
 	out := admissionCall(t, f, f.s.handleAccountNASStitchProof, http.MethodGet, "/api/v1/account/connections/stitch/proof", 0, nil, []string{"stoarama-nas-pull/" + nasCleanupProofClientVersion}, "")
-	if out.Code != http.StatusForbidden {
-		t.Fatalf("reviewed request borrowed development heartbeat: %d %s", out.Code, out.Body)
+	if out.Code != http.StatusConflict || !strings.Contains(out.Body.String(), "legacy native proof admission retired") {
+		t.Fatalf("legacy proof retirement gained a heartbeat dependency: %d %s", out.Code, out.Body)
 	}
 	f.s.cfg.NASStitchProofTaskID = 0
 	out = admissionCall(t, f, f.s.handleAccountNASStitchProof, http.MethodGet, "/api/v1/account/connections/stitch/proof", 0, nil, []string{"stoarama-nas-pull/development"}, "")
@@ -330,5 +330,91 @@ func TestNASClientAdmissionBatchChildVersion(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestNASClientAdmissionModernNativeIdentity(t *testing.T) {
+	f, server := authenticatedCopyFixture(t)
+	const activation = "22222222-2222-4222-8222-222222222222"
+	f.s.cfg.NASStitchProofTaskID = 1
+	f.s.cfg.NASStitchProofActivationID = activation
+	path := "/api/v1/account/connections/stitch/evidence/admission?run_id=11111111-1111-4111-8111-111111111111&activation_id=" + activation
+	call := func(path string, agents []string) (int, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, server.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer fixture-key")
+		req.Header["User-Agent"] = agents
+		response, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		var body struct {
+			Error string `json:"error"`
+		}
+		if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return response.StatusCode, body.Error
+	}
+	for _, tc := range []struct {
+		name      string
+		agents    []string
+		heartbeat string
+		status    int
+		message   string
+	}{
+		{"development-before-heartbeat", []string{"stoarama-nas-pull/development"}, nasCleanupR2CopyControlClientVersion, 409, "reviewed NAS client release required"},
+		{"missing", nil, nasCleanupR2CopyControlClientVersion, 409, "reviewed NAS client release required"},
+		{"unknown", []string{"stoarama-nas-pull/r2-copy-v3-extra"}, nasCleanupR2CopyControlClientVersion, 409, "reviewed NAS client release required"},
+		{"development-heartbeat", []string{"stoarama-nas-pull/r2-copy-v3"}, "development", 403, "no connection for this key"},
+		{"different-heartbeat", []string{"stoarama-nas-pull/r2-copy-v3"}, nasCleanupProofClientVersion, 403, "no connection for this key"},
+		// The fixture intentionally has no proof source tables. Matching identity
+		// must reach the existing read-only source gate, never return a task.
+		{"matching-reaches-existing-source-gate", []string{"stoarama-nas-pull/r2-copy-v3"}, nasCleanupR2CopyControlClientVersion, 409, "current scoped proof facts unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f.useClientVersion(tc.heartbeat)
+			if status, message := call(path, tc.agents); status != tc.status || message != tc.message {
+				t.Fatalf("native identity admission: %d %q", status, message)
+			}
+		})
+	}
+	f.useClientVersion(nasCleanupR2CopyControlClientVersion)
+	// Go's HTTP client emits only the first User-Agent. Exercise the parsed
+	// multi-valued header directly instead of silently testing one valid value.
+	duplicate := admissionCall(t, f, f.s.handleAccountNASStitchEvidenceAdmission, http.MethodGet, path, 0, nil,
+		[]string{"stoarama-nas-pull/r2-copy-v3", "stoarama-nas-pull/development"}, "")
+	if duplicate.Code != http.StatusConflict || !strings.Contains(duplicate.Body.String(), "reviewed NAS client release required") {
+		t.Fatalf("ambiguous native request admitted: %d %s", duplicate.Code, duplicate.Body)
+	}
+	// OFF and readback-only requests retain metadata authorization and their
+	// existing mode/source gates; neither can start native work.
+	for _, tc := range []struct {
+		mode          int
+		path, message string
+	}{
+		{0, "/api/v1/account/connections/stitch/evidence/admission", "isolated evidence mode inactive or request differs"},
+		{2, "/api/v1/account/connections/stitch/evidence/admission?producer_profile_sha256=" + strings.Repeat("a", 64), "current scoped proof facts unavailable"},
+	} {
+		f.s.cfg.NASStitchProofTaskID = tc.mode
+		if status, message := call(tc.path, []string{"stoarama-nas-pull/development"}); status != 409 || message != tc.message {
+			t.Fatalf("metadata mode%d changed: %d %q", tc.mode, status, message)
+		}
+	}
+	var attempts, nonpending int
+	var authenticated bool
+	if err := f.pool.QueryRow(f.ctx, `SELECT coalesce(sum(attempts),0),count(*) FILTER(WHERE state<>'pending') FROM nas_r2_copy_items`).Scan(&attempts, &nonpending); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.pool.QueryRow(f.ctx, `SELECT last_used_at IS NOT NULL FROM account_api_keys WHERE id=5`).Scan(&authenticated); err != nil {
+		t.Fatal(err)
+	}
+	gets, heads := f.bucket.counts()
+	if !authenticated || attempts != 0 || nonpending != 0 || gets != 0 || heads != 0 {
+		t.Fatalf("proof admission affected work: auth=%t attempts=%d states=%d get=%d head=%d", authenticated, attempts, nonpending, gets, heads)
 	}
 }

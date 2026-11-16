@@ -99,7 +99,12 @@ func acceptedNASStitchReadback(receipt nasStitchReadbackReceipt) (stitchproof.Ac
 // Admission is metadata-only and never a task1 lease. Native and readback use
 // distinct modes. Changing mode cannot turn missing preserved evidence into work.
 func (s *Server) handleAccountNASStitchEvidenceAdmission(w http.ResponseWriter, r *http.Request) {
-	cid, ok := s.nasRestoreConnection(r.Context(), w, r)
+	mode := nasStitchProofMode(s.cfg.NASStitchProofTaskID)
+	purpose := nasConnectionMetadata
+	if mode == nasStitchProofNative {
+		purpose = nasConnectionProof
+	}
+	cid, ok := s.nasConnection(r.Context(), w, r, purpose)
 	if !ok {
 		return
 	}
@@ -107,7 +112,6 @@ func (s *Server) handleAccountNASStitchEvidenceAdmission(w http.ResponseWriter, 
 		util.WriteError(w, 403, "proof connection not approved")
 		return
 	}
-	mode := nasStitchProofMode(s.cfg.NASStitchProofTaskID)
 	query, err := parseNASStitchAdmissionQuery(r, mode)
 	if err != nil || s.cfg.NASStitchEnabled || s.cfg.NASStitchDeletionEnabled ||
 		(mode == nasStitchProofNative && (!nasStitchReadbackUUID(s.cfg.NASStitchProofActivationID) || query.activation != s.cfg.NASStitchProofActivationID)) {
