@@ -103,7 +103,7 @@ type cleanupDeadlineClientResult struct {
 }
 
 // Plan 1390 regression: real client, disposable files, PostgreSQL handlers and
-// ETag-bound HEAD. A 35 s HEAD must be cut off by the unmodified 15 s execution
+// ETag-bound HEAD. A 35 s HEAD must be cut off by the 10 s execution
 // budget, with no issued permit and zero calls to unlink, in both protocols.
 func TestNASCleanupExecutionDeadlineClientServer(t *testing.T) {
 	if os.Getenv("STOARAMA_TEST_DATABASE_URL") == "" {
@@ -214,8 +214,8 @@ func TestNASCleanupExecutionDeadlineClientServer(t *testing.T) {
 					if itemState != "leased" || issued || result.Unlinks != 0 || result.Deleted != 0 || result.Outcomes[0].Unlink || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "503") {
 						t.Fatalf("slow HEAD issued/acted: state=%s issued=%t client=%+v", itemState, issued, result)
 					}
-					if result.Seconds < 14 || result.Seconds > 20 {
-						t.Fatalf("execution did not honor 15 s total budget: %+v", result)
+					if result.Seconds < 9 || result.Seconds > 15 {
+						t.Fatalf("execution did not honor 10 s total budget: %+v", result)
 					}
 					for _, name := range []string{files[0].Path, files[0].Path + ".stoarama.json"} {
 						if _, err := os.Stat(name); err != nil {

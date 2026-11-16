@@ -56,8 +56,10 @@ func cleanupRecoveryReadWeight(size int64) int64 {
 }
 
 // Includes authentication, mode lookup, recovery, lock waits and commit. This
-// must leave ample room inside the client's independent 30 s refusal guard.
-var nasCleanupExecutionBudget = 15 * time.Second
+// leaves five seconds inside the client's independent 15 s refusal guard for
+// request/response transit and the final local checks. Connecting is not part
+// of the server clock; the bulk client establishes TLS before its permit clock.
+var nasCleanupExecutionBudget = 10 * time.Second
 
 func cleanupExecutionContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	started, ok := ctx.Value(accountRequestStartedContextKey).(time.Time)
