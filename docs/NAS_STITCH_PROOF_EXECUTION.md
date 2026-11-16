@@ -19,7 +19,9 @@ cannot extend it. Proof checkpoint, capability, corpus and tool GETs use a small
 isolated child with credential stdin, an empty inherited environment and bounded
 private disk output. The parent applies the remaining absolute deadline across
 DNS, TLS, headers and body reads, polls cleanup cancellation, and kills/reaps a
-stalled or trickling child. Corpus SQLite connection/transaction waits and cached
+stalled or trickling child. Credential stdin uses a nonblocking writer and
+explicit EOF inside the same deadline, including pipe backpressure. It never
+uses a credential file or repeated partial-input communicate calls. Corpus SQLite connection/transaction waits and cached
 tool hashing also use the original budget. Copy transport is unchanged.
 Transport reserves two seconds for kill/reap inside that original deadline;
 insufficient remaining cleanup budget refuses before spawning.
@@ -128,3 +130,132 @@ New client source/artifact/profile acceptance and a genuinely new native run
 remain necessary. Future producer/current-reader profile pairing and an
 isolated output namespace require their own reviewed integration; this change
 does not make an old failed workspace adoptable by a new identity.
+
+## Combined producer and current reader
+
+The combined `r2-copy-v3` source retains copy control, cleanup item truth/RSS,
+the reviewed joined-poll fence fix, and the native proof. Publication still
+requires the complete exact artifact/profile/pair review. The shared registry
+and API discovery list are empty: every new admission and validation refuses.
+The source in Git is `development`; it must never run with a real connection
+credential. Stamped releases have a distinct literal and full artifact hash.
+
+Modes are disabled0, bounded native1, and preserved-output readback2. Ordinary
+stitching/deletion retain their unchanged entry and authority checks, and remain
+off. Only the combined reader receives2;
+legacy native-only releases never do. Account GET
+`/connections/stitch/evidence/admission` is scoped to connection13/account47.
+Native requests carry canonical `run_id` and operator `activation_id`; readback requests carry the
+original producer-profile digest. A readback request never leases or creates a
+native task, downloads sources/tools, calls ffmpeg, or falls back to stitching.
+
+Native admission preserves exact source0dfa and the two approved clips. It uses
+a new `_V85r_proof_keep28_v3/.../run-UUID` directory and plan digest, preserving
+all older workspaces. One original activation UUID, window and admission are saved
+before native work. The deadline is the earliest original window/task expiry,
+with the30-second margin and an absolute14m30s cap. Its original monotonic
+deadline and boot are persisted; a wall-clock rollback cannot extend it, and a
+changed boot refuses the window. Capturing admission can only shorten that
+persisted limit to the task expiry. Mode1's immediate readback shares this cut;
+mode2 renewal keeps its own bounded budget for preserved historical output.
+A refresh/restart cannot extend it. An interrupted or failed attempt is not automatically reentered;
+a fresh reviewed activation UUID uses another run directory. Startup may
+adopt a complete already-published registration, reading metadata only. This
+neither replays native work nor accepts output integrity on startup.
+Mode1 readback requires the registered run/context to match the durably entered
+window/admission and current activation. A different UUID cannot renew an old
+registered result; mode2 provides historical renewal. A changed selector or
+binding refuses before original metadata, output or tool reads.
+
+The private state directory is disk-qualified under the same btrfs/ext4/xfs and
+1GiB reserve rules as the scan index. It owns a lock inode that is never unlinked,
+create-only SHA-named evidence blobs, and a checked atomic state index. Total
+owned evidence is capped at64MiB; exhaustion holds instead of deleting history.
+The client logs actual inventory interval/hash/delay and successful storage
+qualification without paths. Actual NAS qualification is still unproved.
+
+An active readback has one90-second deadline covering admission, metadata and
+output/tool/package hashing and receipt construction. It yields to cleanup and
+uses normal resource floors. It rehashes installed bytes without repairing or
+downloading anything. Success preserves the original native run/timestamps and
+full decoded registration. It records a new real readback ID/time. Readbacks
+run immediately after success or identity change and then every6h; transient
+holds wait at least60s and never refresh old times. Integrity refusal persists
+across restarts. At most four successful summaries enter the8KiB heartbeat;
+process startup accepts none until another actual rehash. Changed/unavailable
+evidence or execution identity removes the prior positive status subtree.
+
+OFF cancels native/readback and prevents further media hashing. Already-durable
+metadata may drain through existing client logs. All evidence shares one
+64-chunk/minute pacer, including failed ACKs, and a full quiet minute after
+restart. An exact ACK advances a durable cursor; a lost ACK repeats the same
+message bytes. Completed queue entries are dropped, while evidence files stay.
+Proof status continues after OFF so fresh current-reader facts remain visible.
+These metadata writes/reads must be included in the controller's operation
+review; they grant no additional NAS/media action.
+
+The new service POST `/service/nas-stitch/readback/validate` accepts a strict
+<=2MiB request containing canonical-base64 original task bytes (decoded<=1MiB),
+readback and full native-result bytes (each decoded<=64KiB), all with exact hashes. It preserves `media_seconds`; only an
+internal projection enters the unchanged native-result validator. GET
+`/service/nas-stitch/readback/status?receipt_sha256=...` observes the specific
+preserved receipt without refreshing it. Both use read-only PK-scoped SQL with
+5s statement/context and500ms lock bounds, DB-derived time, the exact sealed
+pair, current version/artifact/size/boot/host, stable/noncandidate release, and
+the actual integer-zero inventory counter. Inventory zero is neither a version
+counter nor evidence of a recent full census. Heartbeat/host/status must be
+within120s; the particular readback is valid at most24h with5min future skew.
+Scope, output, tested policy/tools/package and integrity must still match.
+Legacy v2 validation remains unchanged. Server identity contains actual runtime
+repository/commit/service/instance only; no deployment ID is inferred.
+
+`export_stitch_readback.py` is an offline component assembler, with no network,
+credential or activation entry. It takes bounded scoped log pages, original
+run/plan/pair/readback/task/boot identities, a dedicated regular-file component
+root and explicit reviewed producer/reader executable hashes. It holds byte
+snapshots before executing the exact native81ff and distinct readbackf3a22a
+verifiers. It rejects unstamped source, aliases, missing/conflicting chunks,
+changed metadata and wrong transport identity. Output is create-only metadata,
+the exact decoded registration, mechanical replay results, and a server
+validation REQUEST. `components.json` states `authority=none`; it is not an
+attestation and an explicitly synthetic input remains synthetic. Actual raw
+API validation, separate primary provider binding, independent review and all
+consumer gates remain necessary. Final R2 exporter/caller integration is not
+implemented by this assembler.
+
+Every future release/proof operation must preserve all four permanent incident
+envelopes1414/1417/1421/1427 plus fresh exact rosters/row hashes/source holds and
+zero-release checks under that window. Historical operation packets are spent.
+Old task1 owner closure and0187 remain independent; this NAS-only protocol
+neither reconciles them nor grants R2 eligibility. Audio admission and complete
+backlog/rate/space/unattended ordinary stitching remain unresolved. No real NAS
+success or finish estimate follows from local tests.
+
+This draft's current reader is exactly `r2-copy-v3`. No v8 artifact or pair is
+accepted here. A future v8 release must retain proof, copy and cleanup together
+and add its own exact reviewed reader/schema/pair support before publication;
+it cannot reuse the v3 artifact identity or switch the NAS back to5009.
+
+
+### One-use operator activation
+
+Native mode requires a fresh reviewed canonical nonzero UUID in
+`NAS_STITCH_PROOF_ACTIVATION_ID`. It is distinct from selector/task1, the client
+run UUID, boot and Render identities. The server echoes it with native mode;
+the client captures mode/cancellation/UUID atomically, persists the UUID and one
+run/window before any admission, then commits native entry before its first API
+request. OFF, heartbeat outage, startup and restart never clear the spent set,
+original deadline or entry. Reuse cannot create work; a new reviewed operation
+uses a new UUID. The bounded64-ID journal refuses at capacity and never prunes.
+
+Legacy native admission is retired: clients unable to echo/spend the UUID
+receive no native selector/admission. Historical frozen5009 evidence can still
+be verified/read back only under a separately accepted pair. Frozen native
+runner337c, receipt18ff, verifier81ff and attestation03d9 remain separately pinned.
+Readback2 never falls through to native. Fail-safe0 does not depend on the UUID
+or successful native admission, and never clears the UUID/journal.
+
+Future controller enable packets must bind the UUID, guarded single-key config
+writes while selector0 then1, one pinned deployment, original cutoff and exact
+raw-task evidence. Every operation still needs fresh four-incident guards and
+independent review; code defaults grant no release/activation authority.

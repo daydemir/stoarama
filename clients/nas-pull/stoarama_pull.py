@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import binascii
 import concurrent.futures
 from contextlib import contextmanager, ExitStack
 import datetime
@@ -21,6 +22,7 @@ import os
 import posixpath
 import random
 import re
+import select
 import signal
 import socket
 import sqlite3
@@ -37,8 +39,9 @@ import urllib.parse
 import urllib.request
 import uuid
 import zlib
-from enum import Enum
+from enum import Enum, IntEnum
 from pathlib import Path
+from typing import NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 CLIENT_VERSION = "development"
@@ -651,6 +654,18 @@ def read_json(path, default):
         raise RuntimeError("invalid state file %s: %s" % (path, exc)) from exc
 
 
+class NASStitchMode(IntEnum):
+    DISABLED = 0
+    NATIVE = 1
+    READBACK = 2
+
+
+class StitchProofSwitch(NamedTuple):
+    mode: NASStitchMode
+    cancel: threading.Event
+    activation_id: str
+
+
 class StitchSwitches:
     """Heartbeat authority; an OFF latches cancellation for the current job."""
     def __init__(self):
@@ -659,7 +674,7 @@ class StitchSwitches:
         cancel = threading.Event()
         cancel.set()
         self.state = (False, False, cancel)
-        self.proof = (0, threading.Event())
+        self.proof = StitchProofSwitch(NASStitchMode.DISABLED, threading.Event(), "")
         self.proof[1].set()
 
     def apply(self, response):
@@ -673,14 +688,26 @@ class StitchSwitches:
             # A later ON may start a new job, but cannot revive a cancelled one.
             cancel = threading.Event()
         self.state = (enabled, deletion, cancel)
-        selector = response.get("stitch_proof_task_id") if valid else 0
-        selector = 1 if type(selector) is int and selector == 1 and not enabled and self.local_enabled else 0
+        raw = response.get("stitch_proof_task_id", 0) if valid else 0
+        invalid = type(raw) is not int or raw not in tuple(NASStitchMode)
+        selector = NASStitchMode.DISABLED if invalid or enabled or not self.local_enabled else NASStitchMode(raw)
+        activation = response.get("stitch_proof_activation_id", "") if valid else ""
+        if selector is NASStitchMode.NATIVE:
+            try:
+                if type(activation) is not str or str(uuid.UUID(activation)) != activation or uuid.UUID(activation).int == 0:
+                    raise ValueError("invalid native activation")
+            except ValueError:
+                selector, invalid = NASStitchMode.DISABLED, True
+        else:
+            activation = ""
         proof_cancel = self.proof[1]
-        if not selector:
+        if selector != self.proof[0] or activation != self.proof.activation_id or selector is NASStitchMode.DISABLED:
             proof_cancel.set()
-        elif proof_cancel.is_set():
+        if selector is not NASStitchMode.DISABLED and proof_cancel.is_set():
             proof_cancel = threading.Event()
-        self.proof = (selector, proof_cancel)
+        self.proof = StitchProofSwitch(selector, proof_cancel, activation)
+        if invalid:
+            raise ValueError("unsupported NAS stitching mode")
 
 
 class Config:
@@ -690,7 +717,11 @@ class Config:
 
     @property
     def stitch_proof_enabled(self):
-        return self.stitch_switches.proof[0] == 1
+        return self.stitch_switches.proof[0] is NASStitchMode.NATIVE
+
+    @property
+    def stitch_readback_enabled(self):
+        return self.stitch_switches.proof[0] is NASStitchMode.READBACK
 
     @property
     def stitch_delete_enabled(self):
@@ -1330,7 +1361,7 @@ class Inventory:
 
     def _cached_regular_stat(self, relative_path):
         parts = Path(relative_path).parts
-        if not parts or parts[0] in (JOINED_ROOT,) + INVENTORY_ROOT_EXCLUSIONS or parts[0].endswith(("_V85r_keep28", "_V85r_proof_keep28", "_V85r_proof_keep28_v2")):
+        if not parts or parts[0] in (JOINED_ROOT,) + INVENTORY_ROOT_EXCLUSIONS or parts[0].endswith(("_V85r_keep28", "_V85r_proof_keep28", "_V85r_proof_keep28_v2", "_V85r_proof_keep28_v3")):
             return None
         descriptor = None
         try:
@@ -2173,8 +2204,16 @@ class Runtime:
             payload["cleanup"] = redact_diagnostics(cleanup)
         if cleanup_error and not payload["client_last_error"]:
             payload["client_last_error"], payload["client_last_error_at"] = cleanup_error, cleanup_error_at
-        if getattr(self, "stitch_enabled", False):
+        if getattr(self, "stitch_enabled", False) or CLIENT_VERSION == "r2-copy-v3":
             stitch, error, at = STITCH_STATUS.snapshot()
+            if CLIENT_VERSION == "r2-copy-v3":
+                # Keep the complete authority subtree; old counters/transport
+                # details cannot crowd it out of the existing8KiB heartbeat.
+                stitch = {name:stitch[name] for name in ("stitch_reader","state","kind","started_at",
+                    "run_id","plan_sha256","receipt_sha256","failure") if name in stitch}
+                error = error[:300]
+                if len(cleanup_json_bytes(dict(stitch,last_error=error,last_error_at=at)))>8192:
+                    raise StitchHold("bounded proof status unavailable")
             payload["stitch"] = redact_diagnostics(dict(stitch, last_error=error, last_error_at=at))
         payload["client_last_error"] = redact_diagnostics(payload["client_last_error"])
         host_facts = getattr(self, "host_facts", None)
@@ -19131,7 +19170,7 @@ def walk_raw_files(root):
     for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=fail_walk, followlinks=False):
         directory = Path(dirpath)
         if directory == root:
-            dirnames[:] = [name for name in dirnames if name != JOINED_ROOT and name not in INVENTORY_ROOT_EXCLUSIONS and not name.endswith(("_V85r_keep28", "_V85r_proof_keep28", "_V85r_proof_keep28_v2"))]
+            dirnames[:] = [name for name in dirnames if name != JOINED_ROOT and name not in INVENTORY_ROOT_EXCLUSIONS and not name.endswith(("_V85r_keep28", "_V85r_proof_keep28", "_V85r_proof_keep28_v2", "_V85r_proof_keep28_v3"))]
         for filename in filenames:
             if directory == root and filename in INVENTORY_ROOT_EXCLUSIONS:
                 continue
@@ -46981,16 +47020,40 @@ class StitchRunKind(Enum):
     PROOF = "proof"
 
 
-class StitchStop:
+def stitch_seconds_ns(seconds):
+    """Conservative conversion only at legacy float-seconds I/O boundaries."""
+    numerator,denominator = seconds.as_integer_ratio()
+    return numerator*10**9//denominator
+
+
+def stitch_delta_ns(delta):
+    return (delta.days*86400+delta.seconds)*10**9+delta.microseconds*1000
+
+
+class StitchDeadline:
+    """Hard authority uses integer ns; float seconds are an I/O projection."""
+    @property
+    def deadline(self):
+        return None if self.deadline_ns is None else self.deadline_ns/10**9
+
+    @deadline.setter
+    def deadline(self, seconds):
+        limit = stitch_seconds_ns(seconds)
+        self.deadline_ns = limit if self.deadline_ns is None else min(self.deadline_ns,limit)
+
+
+class StitchStop(StitchDeadline):
     """Keep the native-child watchdog nonblocking; poll remote gates separately."""
     def __init__(self, cfg, stop, task=None, kind=StitchRunKind.PRODUCTION):
         self.cfg, self.stop, self.task, self.reason = cfg, stop, task, ""
         self.kind = kind
         self.failure = None
         self.measurements = []
-        self.started = time.monotonic()
-        self.deadline = (self.started + (parse_certification_timestamp(task["expires_at"], "proof expiry")
-            - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 30
+        self.started_ns = time.monotonic_ns()
+        self.started = self.started_ns/10**9
+        self.deadline_ns = (self.started_ns+min(870*10**9,
+            stitch_delta_ns(parse_certification_timestamp(task["expires_at"], "proof expiry")
+                - datetime.datetime.now(datetime.timezone.utc))-30*10**9)
             if kind is StitchRunKind.PROOF and task is not None else None)
         self.run_id = str(uuid.uuid4())
         self.started_at = utc_now()
@@ -47002,7 +47065,7 @@ class StitchStop:
     def is_set(self):
         if self.stop.is_set():
             return True
-        if self.deadline is not None and time.monotonic() >= self.deadline:
+        if self.deadline_ns is not None and time.monotonic_ns() >= self.deadline_ns:
             self.reason = "proof deadline reached"
         if ((self.switch_cancel is not None and self.switch_cancel.is_set())
                 or not getattr(self.cfg, "stitch_proof_enabled" if self.kind is StitchRunKind.PROOF else "stitch_enabled", False)):
@@ -47042,7 +47105,7 @@ class StitchStop:
 def stitch_proof_activity(inventory, stop):
     STITCH_STATUS.update(state="proof_waiting_inventory")
     while not stop.is_set():
-        remaining = stop.deadline - time.monotonic()
+        remaining = (stop.deadline_ns-time.monotonic_ns())/10**9
         if remaining <= 0:
             break
         if inventory.activity_lock.acquire(timeout=min(.25, remaining)):
@@ -47066,7 +47129,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise OSError('redirect refused')
 try:
     p=json.load(sys.stdin)
-    request=urllib.request.Request(p['url'],method='GET',headers=p['headers'])
+    request=urllib.request.Request(p['url'],method=p['method'],headers=p['headers'],
+        data=p['body'].encode('utf-8') if p['method']=='POST' else None)
     try:response=urllib.request.build_opener(NoRedirect()).open(request,timeout=p['timeout'])
     except urllib.error.HTTPError as error:
         print(json.dumps({'status':error.code}),flush=True)
@@ -47084,27 +47148,83 @@ except Exception:
 STITCH_PROOF_HTTP_REAP_SEC = 2
 
 
-def stitch_proof_remaining(stop, deadline):
+def stitch_proof_remaining(stop, deadline_ns):
     if stop.is_set():
         raise StitchHold("proof cancelled or expired")
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
+    if type(deadline_ns) is not int:
+        raise StitchHold("integer proof deadline required")
+    remaining_ns = min(deadline_ns,stop.deadline_ns)-time.monotonic_ns()
+    if remaining_ns <= 0:
         raise BenchmarkDeadline("proof deadline reached")
-    return remaining
+    return remaining_ns/10**9
 
 
 @contextmanager
 def stitch_proof_http(cfg, request, stop, limit, timeout):
-    # Reserve kill/reap time inside the immutable original task deadline.
-    deadline = min(stop.deadline - STITCH_PROOF_HTTP_REAP_SEC, time.monotonic() + timeout)
+    if request.get_method() != "GET" or request.data is not None:
+        raise StitchHold("proof HTTP requires a bounded HTTPS GET")
+    with stitch_bounded_http(cfg, request, stop, limit, timeout) as response:
+        yield response
+
+
+def stitch_proof_input(process, message, stop, deadline):
+    """Write credential stdin without a blocking write or partial-input retry.
+
+    Repeated communicate(input=None) can strand an incomplete stdin payload on
+    older Python/small pipes. This explicit nonblocking writer owns EOF and
+    checks the same original deadline/cancellation while applying backpressure.
+    """
+    stream = process.stdin
+    try:
+        fd = stream.fileno()
+        os.set_blocking(fd,False)
+        payload = memoryview(message);sent = 0
+        while sent < len(payload):
+            remaining = stitch_proof_remaining(stop,deadline)
+            if process.poll() is not None:
+                raise StitchHold("proof HTTP child exited before complete stdin")
+            _,ready,_ = select.select([], [fd], [], min(.2,remaining))
+            if not ready:
+                continue
+            try:
+                count = os.write(fd,payload[sent:sent+16384])
+            except BlockingIOError:
+                continue
+            except BrokenPipeError:
+                raise StitchHold("proof HTTP child refused stdin") from None
+            if count <= 0:
+                raise StitchHold("proof HTTP stdin made no progress")
+            sent += count
+        stitch_proof_remaining(stop,deadline)
+    finally:
+        stream.close()
+        process.stdin = None
+
+
+@contextmanager
+def stitch_bounded_http(cfg, request, stop, limit, timeout):
+    # Reserve kill/reap time inside the immutable original caller deadline.
+    deadline = min(stop.deadline_ns-STITCH_PROOF_HTTP_REAP_SEC*10**9,
+        time.monotonic_ns()+stitch_seconds_ns(timeout))
     remaining = stitch_proof_remaining(stop, deadline)
     url = urllib.parse.urlsplit(request.full_url)
-    if (request.get_method() != "GET" or request.data is not None or url.scheme != "https"
-            or not url.hostname or url.username or url.password or url.fragment):
-        raise StitchHold("proof HTTP requires a bounded HTTPS GET")
+    method = request.get_method()
+    if (method not in ("GET", "POST") or url.scheme != "https"
+            or not url.hostname or url.username or url.password or url.fragment
+            or type(limit) is not int or not 0 < limit <= 256*1024*1024):
+        raise StitchHold("bounded HTTP request refused")
+    body = None
+    if method == "POST":
+        if (request.full_url != cfg.api_base+"/account/connections/client-logs"
+                or type(request.data) is not bytes or not 0 < len(request.data) <= 128*1024
+                or limit > 4096):
+            raise StitchHold("bounded metadata POST refused")
+        body = request.data.decode("utf-8")
+    elif request.data is not None:
+        raise StitchHold("bounded GET body refused")
     message = cleanup_json_bytes(dict(url=request.full_url, headers=dict(request.header_items()),
-                                     timeout=remaining, limit=limit))
-    if len(message) > 32768:
+        timeout=remaining, limit=limit, method=method, body=body))
+    if len(message) > (256*1024 if method == "POST" else 32768):
         raise StitchHold("proof HTTP request exceeds bound")
     inventory_scratch_backing(cfg.state_dir)
     with tempfile.TemporaryFile(dir=cfg.state_dir) as output:
@@ -47112,14 +47232,14 @@ def stitch_proof_http(cfg, request, stop, limit, timeout):
         process = subprocess.Popen([sys.executable, "-I", "-S", "-B", "-c", STITCH_PROOF_HTTP_CHILD],
             stdin=subprocess.PIPE, stdout=output, stderr=subprocess.DEVNULL, env={}, start_new_session=True)
         try:
-            first = True
+            stitch_proof_input(process,message,stop,deadline)
             while True:
                 remaining = stitch_proof_remaining(stop, deadline)
                 try:
-                    process.communicate(input=message if first else None, timeout=min(.2, remaining))
+                    process.wait(timeout=min(.2, remaining))
                     break
                 except subprocess.TimeoutExpired:
-                    first = False
+                    pass
             stitch_proof_remaining(stop, deadline)
             if process.returncode != 0:
                 raise StitchHold("proof HTTP transport failed")
@@ -47129,7 +47249,7 @@ def stitch_proof_http(cfg, request, stop, limit, timeout):
                     process.kill()
                 except ProcessLookupError:
                     pass
-            process.communicate(timeout=STITCH_PROOF_HTTP_REAP_SEC)
+            process.wait(timeout=STITCH_PROOF_HTTP_REAP_SEC)
         size = output.tell()
         output.seek(0)
         metadata = output.readline(4097)
@@ -47187,11 +47307,11 @@ def stitch_corpus(cfg, stop=None):
     # Import in a separate DB connection/transaction. Inventory heartbeats keep
     # reading their last completed snapshot; no partial corpus becomes usable.
     proof = getattr(stop, "kind", None) is StitchRunKind.PROOF
-    wait = min(60, stitch_proof_remaining(stop, stop.deadline)) if proof else 60
+    wait = min(60, stitch_proof_remaining(stop, stop.deadline_ns)) if proof else 60
     database = sqlite3.connect(str(cfg.inventory_file), timeout=wait)
     def budget():
         if proof:
-            database.execute("PRAGMA busy_timeout=%d" % int(1000 * min(60, stitch_proof_remaining(stop, stop.deadline))))
+            database.execute("PRAGMA busy_timeout=%d" % int(1000 * min(60, stitch_proof_remaining(stop, stop.deadline_ns))))
     try:
         budget()
         database.execute("CREATE TABLE IF NOT EXISTS v85r_stitch_corpus_meta(sha TEXT PRIMARY KEY)")
@@ -47249,9 +47369,9 @@ def stitch_frozen(inventory, previous, clip, stop):
     query = "SELECT witness FROM v85r_stitch_edges WHERE a=? AND b=?"
     if getattr(stop, "kind", None) is StitchRunKind.PROOF:
         database = sqlite3.connect(Path(stop.cfg.inventory_file).resolve().as_uri()+"?mode=ro",
-            uri=True, timeout=min(30, stitch_proof_remaining(stop, stop.deadline)))
+            uri=True, timeout=min(30, stitch_proof_remaining(stop, stop.deadline_ns)))
         try:
-            database.execute("PRAGMA busy_timeout=%d" % int(1000 * min(30, stitch_proof_remaining(stop, stop.deadline))))
+            database.execute("PRAGMA busy_timeout=%d" % int(1000 * min(30, stitch_proof_remaining(stop, stop.deadline_ns))))
             row = database.execute(query, params).fetchone()
         finally:
             database.close()
@@ -47651,6 +47771,7 @@ class StitchDirectory:
             raise StitchHold("invalid stitch directory")
         self.cfg, self.task_id, self.stop = cfg, task_id, stop
         self.root, self.relative, self.fds = Path(cfg.output_dir), relative, []
+        self.created = False
 
     def __enter__(self):
         try:
@@ -47660,9 +47781,11 @@ class StitchDirectory:
             device = os.fstat(fd).st_dev
             for part in self.relative.split("/"):
                 stitch_check(self.stop)
+                self.created = False
                 try:
                     os.mkdir(part, 0o700, dir_fd=self.fds[-1])
                     os.fsync(self.fds[-1])
+                    self.created = True
                 except FileExistsError:
                     pass
                 fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fds[-1])
@@ -48226,8 +48349,12 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
     if not 1 <= len(clips) <= 200 or len(joins) != len(clips) - 1 or len(plan.get("eligible", [])) != len(clips) or sum(c["size_bytes"] for c in clips) > STITCH_MAX_INPUT:
         raise StitchHold("unbounded assembly unit")
     folder = "_V85r_proof_keep28_v2/" if kind is StitchRunKind.PROOF else "_V85r_keep28/"
+    suffix = "/proof-" + STITCH_PROOF_SOURCE_SHA[:16] if kind is StitchRunKind.PROOF else ""
+    if kind is StitchRunKind.PROOF and hasattr(proof_stop,"evidence_context"):
+        folder = "_V85r_proof_keep28_v3/"
+        suffix += "/run-"+proof_stop.run_id
     expected = clips[0]["relative_path"].split("/")[0] + folder + str(plan["recording_id"]) + "/"
-    if (not plan["output_folder"].startswith(expected) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}-00-00Z" + ("/proof-" + STITCH_PROOF_SOURCE_SHA[:16] if kind is StitchRunKind.PROOF else ""), plan["output_folder"][len(expected):])):
+    if (not plan["output_folder"].startswith(expected) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}-00-00Z" + re.escape(suffix), plan["output_folder"][len(expected):])):
         raise StitchHold("output must be in the stream's new versioned sibling folder")
     stop = proof_stop if kind is StitchRunKind.PROOF else StitchStop(cfg, stop_event, task if admitted is None else None, kind)
     deadline = (stop.deadline if kind is StitchRunKind.PROOF else min(time.monotonic() + 7000,
@@ -48512,6 +48639,13 @@ def stitch_proof_space(cfg, task, stop):
 
 
 def stitch_proof_checkpoint(cfg, task, stop):
+    if hasattr(stop, "evidence_context"):
+        current = stitch_evidence_admission(cfg, stop, NASStitchMode.NATIVE, stop.run_id)
+        if (current["task"]["plan_sha256"] != task["plan_sha256"]
+                or current["profiles"] != stop.evidence_context["profiles"]
+                or current["activation_id"] != stop.activation_id):
+            raise StitchHold("original evidence admission changed")
+        return
     current = stitch_proof_request(cfg, "/account/connections/stitch/proof", stop)
     stitch_proof_check(current)
     if current["plan_sha256"] != task["plan_sha256"]:
@@ -48712,6 +48846,1381 @@ def stitch_proof_once(cfg, inventory, stop_event):
     return 1
 
 
+STITCH_READBACK_SCHEMA_SHA = 'a8d8adc0df07f3314596fb964a218f4c3f98a4782e9197390c59e21f38f7c4a8'
+STITCH_READBACK_SCHEMA_JSON = '{\n  "$schema": "https://json-schema.org/draft/2020-12/schema",\n  "$id": "stoarama.nas-stitch-attestation.v2",\n  "title": "PROPOSED dual-profile NAS attestation with separate provider binding; no accepted profile/pair",\n  "type": "object",\n  "additionalProperties": false,\n  "required": [\n    "schema",\n    "synthetic",\n    "payload",\n    "independent_review"\n  ],\n  "properties": {\n    "schema": {\n      "const": "stoarama.nas-stitch-attestation.v2"\n    },\n    "synthetic": {\n      "const": false\n    },\n    "payload": {\n      "allOf": [\n        {\n          "$ref": "#/$defs/file"\n        },\n        {\n          "properties": {\n            "size_bytes": {\n              "maximum": 1048576\n            }\n          }\n        }\n      ]\n    },\n    "independent_review": {\n      "allOf": [\n        {\n          "$ref": "#/$defs/file"\n        },\n        {\n          "properties": {\n            "size_bytes": {\n              "maximum": 1048576\n            }\n          }\n        }\n      ]\n    }\n  },\n  "$defs": {\n    "file": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "file",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "file": {\n          "type": "string",\n          "maxLength": 2048,\n          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*$"\n        },\n        "sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "size_bytes": {\n          "type": "integer",\n          "minimum": 1,\n          "maximum": 16777216\n        }\n      }\n    },\n    "media": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "relative_path",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "relative_path": {\n          "type": "string",\n          "minLength": 1,\n          "maxLength": 2048\n        },\n        "sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "size_bytes": {\n          "type": "integer",\n          "minimum": 1\n        }\n      }\n    },\n    "input": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "clip_id",\n        "relative_path",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "clip_id": {\n          "type": "integer",\n          "minimum": 1\n        },\n        "relative_path": {\n          "type": "string",\n          "minLength": 1,\n          "maxLength": 2048\n        },\n        "sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "size_bytes": {\n          "type": "integer",\n          "minimum": 1\n        }\n      }\n    },\n    "output": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "relative_path",\n        "sha256",\n        "size_bytes",\n        "source_clip_ids",\n        "readback_sha256"\n      ],\n      "properties": {\n        "relative_path": {\n          "type": "string",\n          "minLength": 1,\n          "maxLength": 2048\n        },\n        "sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "size_bytes": {\n          "type": "integer",\n          "minimum": 1\n        },\n        "source_clip_ids": {\n          "const": [\n            373218,\n            373262\n          ]\n        },\n        "readback_sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        }\n      }\n    },\n    "policy": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "name",\n        "revision",\n        "keep28_sha256",\n        "corpus_sha256",\n        "package_manifest_sha256"\n      ],\n      "properties": {\n        "name": {\n          "const": "v85r"\n        },\n        "revision": {\n          "const": "v85r-rebuilt-1"\n        },\n        "keep28_sha256": {\n          "const": "060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811"\n        },\n        "corpus_sha256": {\n          "const": "5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b"\n        },\n        "package_manifest_sha256": {\n          "const": "337c606985e930abf1df459cbbda0c674f13bd9d92e11013131e2b2348e78a06"\n        }\n      }\n    },\n    "tool": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "version",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "version": {\n          "const": "N-126826-gc0e8b139fd-20260924"\n        },\n        "sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "size_bytes": {\n          "type": "integer",\n          "minimum": 1\n        }\n      }\n    },\n    "run": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "id",\n        "client_boot_id",\n        "host",\n        "started_at",\n        "completed_at",\n        "media_seconds",\n        "build_wall_seconds"\n      ],\n      "properties": {\n        "id": {\n          "type": "string",\n          "format": "uuid"\n        },\n        "client_boot_id": {\n          "type": "string",\n          "format": "uuid"\n        },\n        "host": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "connection_id",\n            "system",\n            "machine",\n            "cpu_model",\n            "cpu_count"\n          ],\n          "properties": {\n            "connection_id": {\n              "const": 13\n            },\n            "system": {\n              "const": "Linux"\n            },\n            "machine": {\n              "const": "x86_64"\n            },\n            "cpu_model": {\n              "type": "string",\n              "minLength": 1,\n              "maxLength": 2048\n            },\n            "cpu_count": {\n              "type": "integer",\n              "minimum": 1\n            }\n          }\n        },\n        "started_at": {\n          "type": "string",\n          "format": "date-time",\n          "pattern": "^\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}(?:\\\\.\\\\d+)?Z$"\n        },\n        "completed_at": {\n          "type": "string",\n          "format": "date-time",\n          "pattern": "^\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}(?:\\\\.\\\\d+)?Z$"\n        },\n        "media_seconds": {\n          "type": "number",\n          "exclusiveMinimum": 0\n        },\n        "build_wall_seconds": {\n          "type": "number",\n          "exclusiveMinimum": 0\n        }\n      }\n    },\n    "ffmpeg": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "version",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "version": {\n          "const": "N-126826-gc0e8b139fd-20260924"\n        },\n        "sha256": {\n          "const": "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b"\n        },\n        "size_bytes": {\n          "const": 174165384\n        }\n      }\n    },\n    "ffprobe": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "version",\n        "sha256",\n        "size_bytes"\n      ],\n      "properties": {\n        "version": {\n          "const": "N-126826-gc0e8b139fd-20260924"\n        },\n        "sha256": {\n          "const": "9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c"\n        },\n        "size_bytes": {\n          "const": 173923656\n        }\n      }\n    },\n    "scope": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "stream_id",\n        "recording_id",\n        "source_task_id",\n        "source_plan_sha256",\n        "proof_plan_sha256",\n        "clip_ids"\n      ],\n      "properties": {\n        "stream_id": {\n          "const": 17208\n        },\n        "recording_id": {\n          "const": 444\n        },\n        "source_task_id": {\n          "const": 1\n        },\n        "source_plan_sha256": {\n          "const": "0dfa6b172f33bd55e409729ecd517d492cdee03427b028ac226788e530a72726"\n        },\n        "proof_plan_sha256": {\n          "type": "string",\n          "pattern": "^[a-f0-9]{64}$"\n        },\n        "clip_ids": {\n          "const": [\n            373218,\n            373262\n          ]\n        }\n      }\n    },\n    "tools": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "ffmpeg",\n        "ffprobe"\n      ],\n      "properties": {\n        "ffmpeg": {\n          "$ref": "#/$defs/ffmpeg"\n        },\n        "ffprobe": {\n          "$ref": "#/$defs/ffprobe"\n        }\n      }\n    },\n    "host": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "connection_id",\n        "system",\n        "machine",\n        "cpu_model",\n        "cpu_count"\n      ],\n      "properties": {\n        "connection_id": {\n          "const": 13\n        },\n        "system": {\n          "const": "Linux"\n        },\n        "machine": {\n          "const": "x86_64"\n        },\n        "cpu_model": {\n          "type": "string",\n          "minLength": 1,\n          "maxLength": 2048\n        },\n        "cpu_count": {\n          "type": "integer",\n          "minimum": 1\n        }\n      }\n    },\n    "utc": {\n      "type": "string",\n      "format": "date-time",\n      "pattern": "^\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}(?:\\\\.\\\\d+)?Z$"\n    },\n    "sha256": {\n      "type": "string",\n      "pattern": "^[a-f0-9]{64}$"\n    },\n    "commit": {\n      "type": "string",\n      "pattern": "^[a-f0-9]{40}$"\n    },\n    "uuid": {\n      "type": "string",\n      "format": "uuid"\n    },\n    "producer_profile": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "profile_id",\n        "repository",\n        "base_commit_sha",\n        "reviewed_head_sha",\n        "merged_commit_sha",\n        "source_sha256",\n        "client_version",\n        "client_artifact",\n        "contracts",\n        "native_kind",\n        "native_schema_id",\n        "package_manifest",\n        "policy",\n        "tools"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-producer-profile.v1"\n        },\n        "profile_id": {\n          "enum": [\n            "nas-v2-5009-337c",\n            "nas-combined-v3-337c"\n          ]\n        },\n        "repository": {\n          "const": "daydemir/stoarama"\n        },\n        "base_commit_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "reviewed_head_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "merged_commit_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "source_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "client_version": {\n          "enum": [\n            "v85r-nas-proof-v2",\n            "r2-copy-v3",\n            "cleanup-batch-v8"\n          ]\n        },\n        "client_artifact": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 8388608\n                }\n              }\n            }\n          ]\n        },\n        "contracts": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "native_receipt_schema",\n            "native_verifier",\n            "attestation_schema"\n          ],\n          "properties": {\n            "native_receipt_schema": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            },\n            "native_verifier": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 65536\n                    }\n                  }\n                }\n              ]\n            },\n            "attestation_schema": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            }\n          }\n        },\n        "native_kind": {\n          "const": "nas-only-v85r-proof-v1"\n        },\n        "native_schema_id": {\n          "const": "stoarama.nas-stitch-native-receipt.v1"\n        },\n        "package_manifest": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "policy": {\n          "$ref": "#/$defs/policy"\n        },\n        "tools": {\n          "$ref": "#/$defs/tools"\n        }\n      },\n      "allOf": [\n        {\n          "if": {\n            "properties": {\n              "profile_id": {\n                "const": "nas-v2-5009-337c"\n              }\n            }\n          },\n          "then": {\n            "properties": {\n              "client_version": {\n                "const": "v85r-nas-proof-v2"\n              }\n            }\n          },\n          "else": {\n            "properties": {\n              "client_version": {\n                "const": "r2-copy-v3"\n              }\n            }\n          }\n        }\n      ]\n    },\n    "reader_profile": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "profile_id",\n        "repository",\n        "base_commit_sha",\n        "reviewed_head_sha",\n        "merged_commit_sha",\n        "source_sha256",\n        "client_version",\n        "client_artifact",\n        "contracts",\n        "capabilities",\n        "package_manifest",\n        "policy",\n        "tools"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-reader-profile.v1"\n        },\n        "profile_id": {\n          "const": "nas-combined-v3-337c"\n        },\n        "repository": {\n          "const": "daydemir/stoarama"\n        },\n        "base_commit_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "reviewed_head_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "merged_commit_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "source_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "client_version": {\n          "const": "r2-copy-v3"\n        },\n        "client_artifact": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 8388608\n                }\n              }\n            }\n          ]\n        },\n        "contracts": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "readback_schema",\n            "readback_validator",\n            "attestation_schema"\n          ],\n          "properties": {\n            "readback_schema": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            },\n            "readback_validator": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 65536\n                    }\n                  }\n                }\n              ]\n            },\n            "attestation_schema": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            }\n          }\n        },\n        "capabilities": {\n          "const": [\n            "stitch-proof",\n            "r2-copy-control-v3",\n            "cleanup-bulk-v8"\n          ]\n        },\n        "package_manifest": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "policy": {\n          "$ref": "#/$defs/policy"\n        },\n        "tools": {\n          "$ref": "#/$defs/tools"\n        }\n      }\n    },\n    "pair": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "pair_id",\n        "producer_profile",\n        "reader_profile",\n        "native_kind",\n        "native_schema_id",\n        "native_schema",\n        "native_verifier",\n        "readback_schema",\n        "readback_validator",\n        "package_manifest",\n        "policy",\n        "tools"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-profile-pair.v1"\n        },\n        "pair_id": {\n          "enum": [\n            "nas-v2-5009-to-combined-v3-337c",\n            "nas-combined-v3-337c-self"\n          ]\n        },\n        "producer_profile": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "reader_profile": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "native_kind": {\n          "const": "nas-only-v85r-proof-v1"\n        },\n        "native_schema_id": {\n          "const": "stoarama.nas-stitch-native-receipt.v1"\n        },\n        "native_schema": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "native_verifier": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 65536\n                }\n              }\n            }\n          ]\n        },\n        "readback_schema": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "readback_validator": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 65536\n                }\n              }\n            }\n          ]\n        },\n        "package_manifest": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "policy": {\n          "$ref": "#/$defs/policy"\n        },\n        "tools": {\n          "$ref": "#/$defs/tools"\n        }\n      }\n    },\n    "reader_execution": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "connection_id",\n        "account_id",\n        "client_boot_id",\n        "host",\n        "client_version",\n        "client_artifact_sha256",\n        "client_artifact_size_bytes"\n      ],\n      "properties": {\n        "connection_id": {\n          "const": 13\n        },\n        "account_id": {\n          "const": 47\n        },\n        "client_boot_id": {\n          "$ref": "#/$defs/uuid"\n        },\n        "host": {\n          "$ref": "#/$defs/host"\n        },\n        "client_version": {\n          "const": "r2-copy-v3"\n        },\n        "client_artifact_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "client_artifact_size_bytes": {\n          "type": "integer",\n          "minimum": 1,\n          "maximum": 8388608\n        }\n      }\n    },\n    "readback": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "native_run_id",\n        "native_bundle_sha256",\n        "native_plan_sha256",\n        "producer_profile_sha256",\n        "reader_profile_sha256",\n        "profile_pair_sha256",\n        "id",\n        "started_at",\n        "verified_at",\n        "reader_execution",\n        "outputs",\n        "policy",\n        "tools",\n        "native_registration_sha256",\n        "native_task_sha256"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-readback.v2"\n        },\n        "native_run_id": {\n          "$ref": "#/$defs/uuid"\n        },\n        "native_bundle_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "native_plan_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "producer_profile_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "reader_profile_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "profile_pair_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "id": {\n          "$ref": "#/$defs/uuid"\n        },\n        "started_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "verified_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "reader_execution": {\n          "$ref": "#/$defs/reader_execution"\n        },\n        "outputs": {\n          "type": "array",\n          "minItems": 1,\n          "maxItems": 1,\n          "items": {\n            "$ref": "#/$defs/media"\n          }\n        },\n        "policy": {\n          "$ref": "#/$defs/policy"\n        },\n        "tools": {\n          "$ref": "#/$defs/tools"\n        },\n        "native_registration_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "native_task_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "native_activation_id": {\n          "$ref": "#/$defs/uuid"\n        }\n      }\n    },\n    "server_execution": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "repository",\n        "commit_sha",\n        "service_id",\n        "instance_id"\n      ],\n      "properties": {\n        "repository": {\n          "const": "daydemir/stoarama"\n        },\n        "commit_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "service_id": {\n          "const": "srv-d6usqn94tr6s73d94cd0"\n        },\n        "instance_id": {\n          "type": "string",\n          "minLength": 1,\n          "maxLength": 256\n        }\n      }\n    },\n    "validation": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "native_run_id",\n        "native_bundle_sha256",\n        "native_plan_sha256",\n        "producer_profile_sha256",\n        "reader_profile_sha256",\n        "profile_pair_sha256",\n        "validated_at",\n        "readback_receipt_sha256",\n        "reader_execution",\n        "reader_heartbeat_received_at",\n        "reader_release_stable",\n        "reader_release_candidate",\n        "reader_inventory_mismatch_count",\n        "server_execution",\n        "scope",\n        "outputs",\n        "policy",\n        "tools",\n        "registered_locally_only",\n        "grants_retirement",\n        "native_task_sha256"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-validation.v2"\n        },\n        "native_run_id": {\n          "$ref": "#/$defs/uuid"\n        },\n        "native_bundle_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "native_plan_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "producer_profile_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "reader_profile_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "profile_pair_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "validated_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "readback_receipt_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "reader_execution": {\n          "$ref": "#/$defs/reader_execution"\n        },\n        "reader_heartbeat_received_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "reader_release_stable": {\n          "const": true\n        },\n        "reader_release_candidate": {\n          "const": false\n        },\n        "reader_inventory_mismatch_count": {\n          "const": 0\n        },\n        "server_execution": {\n          "$ref": "#/$defs/server_execution"\n        },\n        "scope": {\n          "$ref": "#/$defs/scope"\n        },\n        "outputs": {\n          "type": "array",\n          "minItems": 1,\n          "maxItems": 1,\n          "items": {\n            "$ref": "#/$defs/media"\n          }\n        },\n        "policy": {\n          "$ref": "#/$defs/policy"\n        },\n        "tools": {\n          "$ref": "#/$defs/tools"\n        },\n        "registered_locally_only": {\n          "const": true\n        },\n        "grants_retirement": {\n          "const": false\n        },\n        "native_task_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "native_activation_id": {\n          "$ref": "#/$defs/uuid"\n        }\n      }\n    },\n    "payload": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "connection_id",\n        "account_id",\n        "scope",\n        "policy",\n        "tools",\n        "producer_profile",\n        "reader_profile",\n        "profile_pair",\n        "native_run",\n        "inputs",\n        "outputs",\n        "evidence",\n        "native_task_sha256"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-payload.v2"\n        },\n        "connection_id": {\n          "const": 13\n        },\n        "account_id": {\n          "const": 47\n        },\n        "scope": {\n          "$ref": "#/$defs/scope"\n        },\n        "policy": {\n          "$ref": "#/$defs/policy"\n        },\n        "tools": {\n          "$ref": "#/$defs/tools"\n        },\n        "producer_profile": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "reader_profile": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "profile_pair": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "native_run": {\n          "$ref": "#/$defs/run"\n        },\n        "inputs": {\n          "type": "array",\n          "minItems": 2,\n          "maxItems": 2,\n          "items": {\n            "$ref": "#/$defs/input"\n          }\n        },\n        "outputs": {\n          "type": "array",\n          "minItems": 1,\n          "maxItems": 1,\n          "items": {\n            "$ref": "#/$defs/output"\n          }\n        },\n        "evidence": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "native_bundle",\n            "local_registration",\n            "native_task",\n            "readback_receipt",\n            "server_validation",\n            "server_deployment"\n          ],\n          "properties": {\n            "native_bundle": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            },\n            "local_registration": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 16777216\n                    }\n                  }\n                }\n              ]\n            },\n            "native_task": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            },\n            "readback_receipt": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            },\n            "server_validation": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            },\n            "server_deployment": {\n              "allOf": [\n                {\n                  "$ref": "#/$defs/file"\n                },\n                {\n                  "properties": {\n                    "size_bytes": {\n                      "maximum": 1048576\n                    }\n                  }\n                }\n              ]\n            }\n          }\n        },\n        "native_task_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "native_activation_id": {\n          "$ref": "#/$defs/uuid"\n        }\n      }\n    },\n    "review": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "reviewer",\n        "reviewed_at",\n        "verdict",\n        "payload_sha256",\n        "native_bundle_sha256",\n        "producer_profile_sha256",\n        "reader_profile_sha256",\n        "profile_pair_sha256",\n        "readback_receipt_sha256",\n        "server_validation_sha256",\n        "producer_reviewed_code_head_sha",\n        "reader_reviewed_code_head_sha",\n        "observations",\n        "server_deployment_sha256",\n        "native_task_sha256"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-review.v2"\n        },\n        "reviewer": {\n          "type": "object",\n          "additionalProperties": false,\n          "required": [\n            "name",\n            "provider",\n            "model",\n            "reference"\n          ],\n          "properties": {\n            "name": {\n              "type": "string",\n              "minLength": 1,\n              "maxLength": 2048\n            },\n            "provider": {\n              "type": "string",\n              "minLength": 1,\n              "maxLength": 2048\n            },\n            "model": {\n              "type": "string",\n              "minLength": 1,\n              "maxLength": 2048\n            },\n            "reference": {\n              "type": "string",\n              "minLength": 1,\n              "maxLength": 2048\n            }\n          }\n        },\n        "reviewed_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "verdict": {\n          "const": "approve"\n        },\n        "payload_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "native_bundle_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "producer_profile_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "reader_profile_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "profile_pair_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "readback_receipt_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "server_validation_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "producer_reviewed_code_head_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "reader_reviewed_code_head_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "observations": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "server_deployment_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "native_task_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "native_activation_id": {\n          "$ref": "#/$defs/uuid"\n        }\n      }\n    },\n    "server_deployment": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "provider",\n        "service_id",\n        "provider_account_id",\n        "api_origin",\n        "provider_api_origin",\n        "deployment_id",\n        "commit_sha",\n        "status",\n        "request_started_at",\n        "response_received_at",\n        "observed_at",\n        "request_elapsed_ms",\n        "server_validation_sha256",\n        "provider_response",\n        "provider_service_response",\n        "provider_live_list_response"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-server-deployment.v1"\n        },\n        "provider": {\n          "const": "render"\n        },\n        "service_id": {\n          "const": "srv-d6usqn94tr6s73d94cd0"\n        },\n        "provider_account_id": {\n          "const": "tea-d1g1uevfte5s7384s1q0"\n        },\n        "api_origin": {\n          "const": "https://stoarama-api.onrender.com"\n        },\n        "provider_api_origin": {\n          "const": "https://api.render.com/v1"\n        },\n        "deployment_id": {\n          "type": "string",\n          "pattern": "^dep-[a-z0-9]+$"\n        },\n        "commit_sha": {\n          "$ref": "#/$defs/commit"\n        },\n        "status": {\n          "const": "live"\n        },\n        "request_started_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "response_received_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "observed_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "request_elapsed_ms": {\n          "type": "integer",\n          "minimum": 0,\n          "maximum": 30000\n        },\n        "server_validation_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "provider_response": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "provider_service_response": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        },\n        "provider_live_list_response": {\n          "allOf": [\n            {\n              "$ref": "#/$defs/file"\n            },\n            {\n              "properties": {\n                "size_bytes": {\n                  "maximum": 1048576\n                }\n              }\n            }\n          ]\n        }\n      }\n    },\n    "current_context": {\n      "type": "object",\n      "additionalProperties": false,\n      "required": [\n        "schema",\n        "native_run_id",\n        "native_bundle_sha256",\n        "native_plan_sha256",\n        "producer_profile_sha256",\n        "reader_profile_sha256",\n        "profile_pair_sha256",\n        "checked_at",\n        "readback_receipt_sha256",\n        "reader_execution",\n        "reader_heartbeat_received_at",\n        "reader_release_stable",\n        "reader_release_candidate",\n        "reader_inventory_mismatch_count",\n        "server_execution",\n        "scope",\n        "outputs",\n        "policy",\n        "tools",\n        "registered_locally_only",\n        "grants_retirement",\n        "status_received_at",\n        "readback_verified_at",\n        "readback_id",\n        "source_scope_approved_until",\n        "integrity",\n        "native_task_sha256"\n      ],\n      "properties": {\n        "schema": {\n          "const": "stoarama.nas-stitch-current-context.v1"\n        },\n        "native_run_id": {\n          "$ref": "#/$defs/uuid"\n        },\n        "native_bundle_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "native_plan_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "producer_profile_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "reader_profile_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "profile_pair_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "readback_receipt_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "reader_execution": {\n          "$ref": "#/$defs/reader_execution"\n        },\n        "reader_heartbeat_received_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "reader_release_stable": {\n          "const": true\n        },\n        "reader_release_candidate": {\n          "const": false\n        },\n        "reader_inventory_mismatch_count": {\n          "const": 0\n        },\n        "server_execution": {\n          "$ref": "#/$defs/server_execution"\n        },\n        "scope": {\n          "$ref": "#/$defs/scope"\n        },\n        "outputs": {\n          "type": "array",\n          "minItems": 1,\n          "maxItems": 1,\n          "items": {\n            "$ref": "#/$defs/media"\n          }\n        },\n        "policy": {\n          "$ref": "#/$defs/policy"\n        },\n        "tools": {\n          "$ref": "#/$defs/tools"\n        },\n        "registered_locally_only": {\n          "const": true\n        },\n        "grants_retirement": {\n          "const": false\n        },\n        "checked_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "status_received_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "readback_verified_at": {\n          "$ref": "#/$defs/utc"\n        },\n        "readback_id": {\n          "$ref": "#/$defs/uuid"\n        },\n        "source_scope_approved_until": {\n          "$ref": "#/$defs/utc"\n        },\n        "integrity": {\n          "const": "clear"\n        },\n        "native_task_sha256": {\n          "$ref": "#/$defs/sha256"\n        },\n        "native_activation_id": {\n          "$ref": "#/$defs/uuid"\n        }\n      }\n    }\n  },\n  "$comment": "DESIGN DRAFT ONLY, not an accepted/frozen runtime schema or authority. Compiled accepted producer-reader pair table is EMPTY until final source/artifact review. Runtime must stream-check all canonical regular no-symlink file references/sizes/hashes before isolated byte-snapshot replay; reject duplicate keys, nonfinite and wrong types; compare every field with finite full-profile/pair pins; enforce immutable native time/result/registration equality, native replay, actual current output rehash and server binding, UTC ordering, 24h readback/validation/review and <=5min future skew, DB-anchored expiry and unchanged object/custody/fence/drain/keep gates. Unknown profiles/packages/readers require new review; no cross-package pairing. Server validation is exact raw API bytes: DB-derived validated_at and only actual runtime commit/service/instance, never exporter-inserted deploy ID. Separate server_deployment binds exact provider responses and validation hash. Fixed service/API origin are from held reviewed runner35; candidate provider account tea-d1g1uevfte5s7384s1q0 is from primary dd5a9b22; final compiled pin/profile acceptance remains separate. Pure replay has no network/auth; outer caller independently checks provider/API under separately reviewed bounded online contract. Rollout/identity/freshness ambiguity refuses. No old authority deadline extends. Exact original server task bytes/SHA are mandatory through native admission, durable storage, readback, export/replay, API/current context and review. native_activation_id is semantically mandatory for the accepted new producer3 and absent for historical5009, determined by immutable producer profile, never current reader. Original admission expiry is immutable history, not a fresh readback deadline."\n}\n'
+
+
+class StitchReadbackContractError(StitchHold):
+    pass
+
+
+class StitchReadbackDefinition(Enum):
+    PRODUCER = "producer_profile"
+    READER = "reader_profile"
+    PAIR = "pair"
+    READBACK = "readback"
+    VALIDATION = "validation"
+    CURRENT = "current_context"
+
+
+class StitchProfileKey(NamedTuple):
+    producer: str
+    reader: str
+    pair: str
+
+
+class StitchClientIdentity(NamedTuple):
+    sha256: str
+    size_bytes: int
+    version: str
+
+
+class StitchProfileBytes(NamedTuple):
+    producer: bytes
+    reader: bytes
+    pair: bytes
+
+
+class StitchProducerProfile(Enum):
+    LEGACY_V2 = "nas-v2-5009-337c"
+    COMBINED_V3 = "nas-combined-v3-337c"
+
+
+class StitchProfilePair(Enum):
+    LEGACY_TO_V3 = "nas-v2-5009-to-combined-v3-337c"
+    COMBINED_SELF = "nas-combined-v3-337c-self"
+
+
+def stitch_readback_validate(value, definition: StitchReadbackDefinition):
+    """Validate the separate v2 contract; never substitute the native schema."""
+    if hashlib.sha256(STITCH_READBACK_SCHEMA_JSON.encode()).hexdigest() != STITCH_READBACK_SCHEMA_SHA:
+        raise StitchReadbackContractError("readback contract drift")
+    if type(definition) is not StitchReadbackDefinition:
+        raise StitchReadbackContractError("unknown readback definition")
+    schema = json.loads(STITCH_READBACK_SCHEMA_JSON)
+    types = {"object": (dict,), "array": (list,), "string": (str,),
+             "boolean": (bool,), "integer": (int,), "number": (int, float)}
+    vocabulary = {"$comment", "$defs", "$id", "$ref", "$schema", "title", "type", "const", "enum",
+        "allOf", "if", "then", "else", "properties", "required", "additionalProperties", "items",
+        "minItems", "maxItems", "minLength", "maxLength", "minimum", "maximum", "exclusiveMinimum", "format", "pattern"}
+
+    def check(item, node, depth=0):
+        if depth > 64 or not set(node) <= vocabulary:
+            raise StitchReadbackContractError("unsupported readback contract")
+        if "$ref" in node:
+            reference = node["$ref"]
+            if set(node) != {"$ref"} or not reference.startswith("#/$defs/"):
+                raise StitchReadbackContractError("nonlocal readback contract reference")
+            return check(item, schema["$defs"][reference.removeprefix("#/$defs/")], depth+1)
+        if "const" in node and (type(item) is not type(node["const"]) or item != node["const"]):
+            raise StitchHold("readback constant differs")
+        if "enum" in node and not any(type(item) is type(choice) and item == choice for choice in node["enum"]):
+            raise StitchHold("unknown readback enum")
+        kind = node.get("type")
+        if kind is not None and kind not in types:
+            raise StitchReadbackContractError("unsupported readback contract type")
+        if node.get("format") not in (None, "uuid", "date-time"):
+            raise StitchReadbackContractError("unsupported readback contract format")
+        if kind is not None and type(item) not in types[kind]:
+            raise StitchHold("readback field type differs")
+        if type(item) is dict:
+            fields = node.get("properties", {})
+            if (not set(node.get("required", [])) <= set(item)
+                    or node.get("additionalProperties") is False and not set(item) <= set(fields)):
+                raise StitchHold("readback fields differ")
+            for key, child in item.items():
+                if key in fields:
+                    check(child, fields[key], depth+1)
+        elif type(item) is list:
+            if not node.get("minItems", 0) <= len(item) <= node.get("maxItems", len(item)):
+                raise StitchHold("readback array bound")
+            if "items" in node:
+                for child in item:
+                    check(child, node["items"], depth+1)
+        elif type(item) is str:
+            if (not node.get("minLength", 0) <= len(item) <= node.get("maxLength", len(item))
+                    or "pattern" in node and re.search(node["pattern"], item) is None):
+                raise StitchHold("readback string bound")
+            if node.get("format") == "uuid" and re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", item) is None:
+                raise StitchHold("readback UUID invalid")
+            if node.get("format") == "date-time":
+                try:
+                    parsed = datetime.datetime.fromisoformat(item.replace("Z", "+00:00"))
+                except ValueError:
+                    raise StitchHold("readback timestamp invalid") from None
+                if not item.endswith("Z") or parsed.utcoffset() != datetime.timedelta(0):
+                    raise StitchHold("readback timestamp is not UTC")
+        elif type(item) in (int, float):
+            if (not -float("inf") < item < float("inf")
+                    or "minimum" in node and item < node["minimum"]
+                    or "maximum" in node and item > node["maximum"]
+                    or "exclusiveMinimum" in node and item <= node["exclusiveMinimum"]):
+                raise StitchHold("readback numeric bound")
+        for child in node.get("allOf", []):
+            check(item, child, depth+1)
+        if "if" in node:
+            try:
+                check(item, node["if"], depth+1)
+            except StitchReadbackContractError:
+                raise
+            except StitchHold:
+                branch = "else"
+            else:
+                branch = "then"
+            if branch in node:
+                check(item, node[branch], depth+1)
+
+    check(value, schema["$defs"][definition.value])
+
+
+def stitch_readback_profiles(raw: StitchProfileBytes, expected: StitchProfileKey,
+                            client: StitchClientIdentity, mode: NASStitchMode):
+    """Bind all three immutable component bytes to an accepted server key.
+
+    This validates a supplied accepted key, never creates registry acceptance or
+    native/deletion authority. Callers must obtain it from the scoped registry.
+    """
+    if (type(raw) is not StitchProfileBytes or type(expected) is not StitchProfileKey
+            or type(client) is not StitchClientIdentity or type(mode) is not NASStitchMode
+            or mode is NASStitchMode.DISABLED):
+        raise StitchHold("typed readback profile binding required")
+    documents = []
+    definitions = (StitchReadbackDefinition.PRODUCER, StitchReadbackDefinition.READER, StitchReadbackDefinition.PAIR)
+    for body, digest, definition in zip(raw, expected, definitions):
+        if (type(body) is not bytes or not 0 < len(body) <= 65536 or type(digest) is not str
+                or re.fullmatch(r"[a-f0-9]{64}", digest) is None or hashlib.sha256(body).hexdigest() != digest):
+            raise StitchHold("readback component bytes differ")
+        document = stitch_proof_json(body)
+        stitch_readback_validate(document, definition)
+        documents.append(document)
+    producer, reader, pair = documents
+    for reference, body, digest in ((pair["producer_profile"], raw.producer, expected.producer),
+                                     (pair["reader_profile"], raw.reader, expected.reader)):
+        if reference["sha256"] != digest or reference["size_bytes"] != len(body):
+            raise StitchHold("readback pair component differs")
+    producer_id = StitchProducerProfile(producer["profile_id"])
+    expected_pair = {StitchProducerProfile.LEGACY_V2: StitchProfilePair.LEGACY_TO_V3,
+                     StitchProducerProfile.COMBINED_V3: StitchProfilePair.COMBINED_SELF}[producer_id]
+    if pair["pair_id"] != expected_pair.value:
+        raise StitchHold("readback producer/reader pair differs")
+    if producer_id is StitchProducerProfile.COMBINED_V3 and (
+            producer["client_version"] != reader["client_version"] or any(
+                producer["client_artifact"][name] != reader["client_artifact"][name] for name in ("sha256","size_bytes"))):
+        raise StitchHold("combined self pair requires the original exact artifact")
+    artifact = reader["client_artifact"]
+    if (type(client.sha256) is not str or re.fullmatch(r"[a-f0-9]{64}", client.sha256) is None
+            or type(client.size_bytes) is not int or client.size_bytes <= 0 or type(client.version) is not str
+            or client != StitchClientIdentity(artifact["sha256"], artifact["size_bytes"], reader["client_version"])):
+        raise StitchHold("current readback client differs")
+    if mode is NASStitchMode.NATIVE:
+        original = producer["client_artifact"]
+        if client != StitchClientIdentity(original["sha256"], original["size_bytes"], producer["client_version"]):
+            raise StitchHold("native mode requires the executing producer")
+    for name in ("policy", "tools", "package_manifest"):
+        if producer[name] != reader[name] or producer[name] != pair[name]:
+            raise StitchHold("readback pipeline/package drift")
+    if (pair["package_manifest"]["sha256"] != V85R_MANIFEST_SHA
+            or pair["package_manifest"]["size_bytes"] != 5416):
+        raise StitchHold("unsupported readback native package")
+    native_contract = producer["contracts"]
+    for label, reference, digest, size in (
+            ("native_receipt_schema", pair["native_schema"], STITCH_PROOF_SCHEMA_SHA, len(STITCH_PROOF_SCHEMA_JSON.encode())),
+            ("native_verifier", pair["native_verifier"], "81ff91e5accd93d32ff475024c10281177684b583e121a6c5d0c1f1938d49532", 18817)):
+        if reference != native_contract[label] or reference["sha256"] != digest or reference["size_bytes"] != size:
+            raise StitchHold("unsupported readback native contract")
+    current_contract = reader["contracts"]
+    for label in ("readback_schema", "readback_validator"):
+        if pair[label] != current_contract[label]:
+            raise StitchHold("current readback contract differs")
+    for reference in (current_contract["readback_schema"], current_contract["attestation_schema"]):
+        if reference["sha256"] != STITCH_READBACK_SCHEMA_SHA or reference["size_bytes"] != len(STITCH_READBACK_SCHEMA_JSON.encode()):
+            raise StitchHold("unsupported current readback schema")
+    old = producer_id is StitchProducerProfile.LEGACY_V2
+    # Producer identities are immutable. A later reader schema must never
+    # reinterpret an original combined-v3 producer as having used its new hash.
+    outer_sha = "03d9a5fa930b67249036a6b522dcffa59f6bba9744f79abc0747f85d9ee63abc" if old else "a8d8adc0df07f3314596fb964a218f4c3f98a4782e9197390c59e21f38f7c4a8"
+    outer_size = 17438 if old else 41484
+    original_contract = native_contract["attestation_schema"]
+    if original_contract["sha256"] != outer_sha or original_contract["size_bytes"] != outer_size:
+        raise StitchHold("original producer schema differs")
+    # Return fresh parsed values to the current call; immutable bytes remain the
+    # authoritative cache. No mutable global/registry is populated here.
+    return producer, reader, pair
+
+
+
+class StitchReadbackIntegrity(StitchHold):
+    """Preserved tested bytes or their identity changed; never a retryable HOLD."""
+
+
+def stitch_readback_file(root, relative, limit, stop, expected=None, retain=False):
+    """Read/hash one confined file, pinning every ancestor and the open inode.
+
+    Only bounded metadata is retained. Media and installed tools stream in 1MiB
+    blocks. Readback never creates directories, repairs a file or follows links.
+    """
+    raw_root, raw_relative = str(root), str(relative)
+    if (not raw_root.startswith("/") or "\\" in raw_root or "\\" in raw_relative
+            or not raw_relative or raw_relative.startswith("/")
+            or any(part in ("", ".", "..") for part in raw_relative.split("/"))
+            or type(limit) is not int or limit <= 0
+            or (retain and limit > 16*1024*1024)):
+        raise StitchReadbackIntegrity("invalid confined readback path/bound")
+    parts = raw_root.rstrip("/").split("/")[1:] + raw_relative.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise StitchReadbackIntegrity("invalid readback root")
+    descriptors, links = [], []
+    try:
+        stitch_check(stop)
+        descriptors.append(os.open("/", os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW))
+        for index, part in enumerate(parts):
+            stitch_check(stop)
+            parent = descriptors[-1]
+            # Opening a substituted FIFO must refuse without blocking first.
+            flags = os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK
+            if index < len(parts)-1:
+                flags |= os.O_DIRECTORY
+            descriptor = os.open(part, flags, dir_fd=parent)
+            descriptors.append(descriptor)
+            before = os.fstat(descriptor)
+            links.append((parent, part, before))
+            if index < len(parts)-1:
+                if not stat_module.S_ISDIR(before.st_mode):
+                    raise StitchReadbackIntegrity("readback ancestor is not a directory")
+            elif not stat_module.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0 < before.st_size <= limit:
+                raise StitchReadbackIntegrity("readback requires a bounded private regular file")
+        digest, size, chunks = hashlib.sha256(), 0, []
+        while True:
+            stitch_check(stop)
+            block = os.read(descriptors[-1], min(1024*1024, limit+1-size))
+            stitch_check(stop)
+            if not block:
+                break
+            size += len(block)
+            if size > limit:
+                raise StitchReadbackIntegrity("readback file exceeds bound")
+            digest.update(block)
+            if retain:
+                chunks.append(block)
+        for index, (parent, part, before) in enumerate(links):
+            stitch_check(stop)
+            opened = os.fstat(descriptors[index+1])
+            named = os.stat(part, dir_fd=parent, follow_symlinks=False)
+            if index == len(links)-1:
+                if (opened.st_nlink != 1 or named.st_nlink != 1
+                        or certification_identity(before) != certification_identity(opened)
+                        or certification_identity(opened) != certification_identity(named)):
+                    raise StitchReadbackIntegrity("readback file changed during hashing")
+            elif any((before.st_dev, before.st_ino, before.st_mode) != (value.st_dev, value.st_ino, value.st_mode)
+                     for value in (opened, named)):
+                raise StitchReadbackIntegrity("readback ancestor changed during hashing")
+        actual = (size, digest.hexdigest())
+        if size != links[-1][2].st_size or (expected is not None and actual != expected):
+            raise StitchReadbackIntegrity("preserved readback bytes differ")
+        return actual, b"".join(chunks) if retain else None
+    except OSError as exc:
+        raise StitchReadbackIntegrity("preserved readback file unavailable") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def stitch_readback_registration(body, stop=None):
+    """Hash the exact full decoded native registration, not normalized JSON."""
+    decoder, digest, size = zlib.decompressobj(16+zlib.MAX_WBITS), hashlib.sha256(), 0
+    for offset in range(0, len(body), 65536):
+        if stop is not None:
+            stitch_check(stop)
+        pending = body[offset:offset+65536]
+        while pending:
+            if stop is not None:
+                stitch_check(stop)
+            block = decoder.decompress(pending, min(1024*1024, 16*1024*1024+1-size))
+            size += len(block); digest.update(block)
+            if size > 16*1024*1024:
+                raise StitchReadbackIntegrity("native registration exceeds bound")
+            pending = decoder.unconsumed_tail
+        if decoder.unused_data:
+            raise StitchReadbackIntegrity("native registration has trailing data")
+    if not decoder.eof or size == 0:
+        raise StitchReadbackIntegrity("native registration is incomplete")
+    return digest.hexdigest()
+
+
+def stitch_readback_native(receipt, task, producer):
+    """Bind immutable native evidence to its original task and producer.
+
+    The separate checksum-pinned native verifier still replays every inventory
+    offline. This binding never substitutes a current reader into old evidence.
+    """
+    stitch_proof_check(task)
+    original = producer["client_artifact"]
+    activation = task.get("activation_id")
+    if producer["client_version"] == "r2-copy-v3":
+        try:
+            if (type(activation) is not str or str(uuid.UUID(activation)) != activation or uuid.UUID(activation).int == 0
+                    or not task["plan"]["output_folder"].endswith("/run-"+receipt["run"]["id"])):
+                raise ValueError("original native activation/run differs")
+            expiry = task.get("expires_at")
+            if type(expiry) is not str or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z",expiry) is None:
+                raise ValueError("original native expiry differs")
+            if datetime.datetime.fromisoformat(expiry.replace("Z","+00:00")) < datetime.datetime.fromisoformat(receipt["run"]["completed_at"].replace("Z","+00:00")):
+                raise ValueError("native completion exceeded original admission")
+        except ValueError:
+            raise StitchReadbackIntegrity("original native activation/run differs") from None
+    elif activation is not None:
+        raise StitchReadbackIntegrity("historical producer has no activation UUID")
+    if (receipt["client_artifact_sha256"] != original["sha256"]
+            or receipt["client_version"] != producer["client_version"]
+            or receipt["plan_sha256"] != task["plan_sha256"]
+            or receipt["source_plan_sha256"] != STITCH_PROOF_SOURCE_SHA):
+        raise StitchReadbackIntegrity("original native producer/task differs")
+    output = receipt["result"]["outputs"][0]
+    if (output["relative_path"] != task["plan"]["output_folder"]+"/proof.mp4"
+            or output["readback_sha256"] != output["sha256"]
+            or any(output.get(name) is not True for name in
+                ("full_decode", "seam_decode", "packet_chain", "native_audit", "original_sources_no_audio", "fsynced"))):
+        raise StitchReadbackIntegrity("original native output binding differs")
+    for source, included in zip(task["plan"]["clips"], output["inputs"]):
+        if (source["source_id"], source["sha256"], source["size_bytes"]) != (included["clip_id"], included["sha256"], included["size_bytes"]):
+            raise StitchReadbackIntegrity("original native inclusion differs")
+    provenance = output["provenance"]
+    if (provenance["manifest_sha256"] != producer["package_manifest"]["sha256"]
+            or provenance["policy"] != producer["policy"]["name"]
+            or provenance.get("october_ffmpeg_recovered") is not True):
+        raise StitchReadbackIntegrity("original native package differs")
+    for tool, pin in producer["tools"].items():
+        if provenance[tool+"_sha256"] != pin["sha256"] or provenance[tool+"_version"] != pin["version"]:
+            raise StitchReadbackIntegrity("original native tool differs")
+
+
+def stitch_readback_pipeline(cfg, reader, stop):
+    """Rehash the installed tested package/tools; no download or repair path."""
+    package = reader["package_manifest"]
+    prefix = "tools/v85r-"+package["sha256"]+"/"
+    _, raw = stitch_readback_file(cfg.state_dir, prefix+"manifest.json", 65536, stop,
+        (package["size_bytes"], package["sha256"]), retain=True)
+    manifest = stitch_proof_json(raw)
+    for name, digest in manifest["files"].items():
+        actual, _ = stitch_readback_file(cfg.state_dir, prefix+name, 16*1024*1024, stop)
+        if actual[1] != digest:
+            raise StitchReadbackIntegrity("tested readback package member differs")
+    for name, pin in reader["tools"].items():
+        stitch_readback_file(cfg.state_dir, "tools/v85r-ffmpeg-"+pin["version"]+"/"+name,
+            pin["size_bytes"], stop, (pin["size_bytes"], pin["sha256"]))
+
+
+class StitchReadbackStop(StitchDeadline):
+    """One immutable budget for admission, rehash and receipt construction."""
+    def __init__(self, cfg, stop, expires_at):
+        self.cfg, self.stop, self.reason = cfg, stop, ""
+        switches = cfg.stitch_switches
+        self.mode, self.switch_cancel, self.activation_id = switches.proof
+        if self.mode not in (NASStitchMode.NATIVE, NASStitchMode.READBACK):
+            raise StitchHold("readback selector inactive")
+        self.started_ns = time.monotonic_ns()
+        remaining_ns = stitch_delta_ns(parse_certification_timestamp(expires_at, "readback expiry")
+                     - datetime.datetime.now(datetime.timezone.utc))-30*10**9
+        self.deadline_ns = self.started_ns+min(90*10**9,remaining_ns)
+        self.next_resource_check_ns = self.started_ns+5*10**9
+        self.started_at, self.run_id = utc_now(), str(uuid.uuid4())
+        stitch_check(self)
+
+    def is_set(self):
+        if self.stop.is_set() or self.switch_cancel.is_set() or self.cfg.stitch_switches.proof[0] is not self.mode:
+            self.reason = "readback cancelled"
+        now_ns = time.monotonic_ns()
+        if now_ns >= self.deadline_ns:
+            self.reason = "readback deadline reached"
+        with NAS_MEDIA_FENCE.condition:
+            if NAS_MEDIA_FENCE.execution_owner is not None or NAS_MEDIA_FENCE.cleaners:
+                self.reason = "readback yielded to cleanup"
+        if not self.reason and now_ns >= self.next_resource_check_ns:
+            self.next_resource_check_ns = now_ns+5*10**9
+            try:
+                stitch_resources(self.cfg)
+            except StitchHold:
+                self.reason = "readback resources unavailable"
+        return bool(self.reason)
+
+
+def stitch_readback_run(cfg, stop, raw_profiles, profile_key, task_raw, bundle):
+    """Reverify preserved output only. No native/source/download/repair entry.
+
+    Inputs are immutable metadata byte copies selected by the scoped admission.
+    Publishing the returned receipt and transport happen outside this function;
+    its original deadline covers every controlled read and receipt construction.
+    """
+    stitch_check(stop)
+    stitch_resources(cfg)
+    # Startup already pins the executing release. Renewal must never fetch a
+    # manifest, install a tool or obtain a new identity budget here.
+    client_pin = getattr(cfg, "executing_release_sha256", None)
+    if cfg.is_candidate or type(client_pin) is not str or re.fullmatch(r"[a-f0-9]{64}", client_pin) is None:
+        raise StitchHold("promoted executing reader identity unavailable")
+    actual, _ = stitch_readback_file(Path(cfg.current_file).parent, Path(cfg.current_file).name,
+        8*1024*1024, stop)
+    if actual[1] != client_pin:
+        raise StitchReadbackIntegrity("executing readback bytes changed")
+    client = StitchClientIdentity(actual[1], actual[0], CLIENT_VERSION)
+    try:
+        producer, reader, pair = stitch_readback_profiles(raw_profiles, profile_key, client, NASStitchMode.READBACK)
+    except StitchHold as exc:
+        raise StitchReadbackIntegrity("current readback profile differs") from exc
+    if type(task_raw) is not bytes or not 0 < len(task_raw) <= 1024*1024 or type(bundle) is not bytes or not 0 < len(bundle) <= 1024*1024:
+        raise StitchReadbackIntegrity("native readback metadata bound/type")
+    task = stitch_proof_json(task_raw)
+    try:
+        receipt = stitch_proof_unpack(bundle)
+    except (StitchHold, ValueError, KeyError, zlib.error) as exc:
+        raise StitchReadbackIntegrity("preserved native registration differs") from exc
+    stitch_readback_native(receipt, task, producer)
+    registration_sha = stitch_readback_registration(bundle, stop)
+    stitch_check(stop)
+    stitch_readback_pipeline(cfg, reader, stop)
+    outputs = []
+    for output in receipt["result"]["outputs"]:
+        stitch_readback_file(cfg.output_dir, output["relative_path"], STITCH_PROOF_MAX_BYTES, stop,
+            (output["size_bytes"], output["sha256"]))
+        outputs.append({name: output[name] for name in ("relative_path", "sha256", "size_bytes")})
+    _, runtime_raw = stitch_readback_file(cfg.state_dir, Path(cfg.runtime_file).name, 65536, stop, retain=True)
+    runtime = stitch_proof_json(runtime_raw)
+    import platform
+    cpu = next((line.split(":",1)[1].strip() for line in _read_text("/proc/cpuinfo").splitlines()
+                if line.startswith("model name")), "unknown")
+    execution = dict(connection_id=13, account_id=47, client_boot_id=runtime["boot_id"],
+        host=dict(connection_id=13,system=platform.system(),machine=platform.machine(),cpu_model=cpu,cpu_count=os.cpu_count()),
+        client_version=CLIENT_VERSION, client_artifact_sha256=client.sha256, client_artifact_size_bytes=client.size_bytes)
+    result = dict(schema="stoarama.nas-stitch-readback.v2", native_run_id=receipt["run"]["id"],
+        native_bundle_sha256=hashlib.sha256(bundle).hexdigest(), native_plan_sha256=receipt["plan_sha256"],
+        native_task_sha256=hashlib.sha256(task_raw).hexdigest(),
+        producer_profile_sha256=profile_key.producer, reader_profile_sha256=profile_key.reader, profile_pair_sha256=profile_key.pair,
+        id=stop.run_id, started_at=stop.started_at, verified_at=utc_now(), reader_execution=execution,
+        outputs=outputs, policy=reader["policy"], tools=reader["tools"], native_registration_sha256=registration_sha)
+    if producer["client_version"] == "r2-copy-v3":
+        result["native_activation_id"] = task["activation_id"]
+    stitch_readback_validate(result, StitchReadbackDefinition.READBACK)
+    ordered = [parse_certification_timestamp(value, "readback time") for value in
+        (receipt["verified_at"], result["started_at"], result["verified_at"])]
+    if ordered != sorted(ordered):
+        raise StitchHold("readback timestamps out of order")
+    body = cleanup_json_bytes(result)
+    if len(body) > 65536:
+        raise StitchHold("readback receipt exceeds bound")
+    stitch_check(stop)
+    return body
+
+
+class StitchEvidenceKind(Enum):
+    NATIVE = "proof-v1"
+    TASK = "task-v2"
+    PRODUCER = "producer-v2"
+    READER = "reader-v2"
+    PAIR = "pair-v2"
+    READBACK = "readback-v2"
+
+
+class StitchEvidenceKey(NamedTuple):
+    kind: StitchEvidenceKind
+    native_run: str
+    plan: str
+    pair: str
+    readback: str
+
+
+def stitch_evidence_chunks(key: StitchEvidenceKey, body: bytes, cursor: int):
+    """Build one <=64-chunk metadata batch; duplicates retain exact identity."""
+    if type(key) is not StitchEvidenceKey or type(key.kind) is not StitchEvidenceKind:
+        raise StitchHold("typed evidence transport key required")
+    for digest in (key.plan, key.pair):
+        if type(digest) is not str or re.fullmatch(r"[a-f0-9]{64}", digest) is None:
+            raise StitchHold("evidence transport digest differs")
+    for identity in (key.native_run, key.readback):
+        if type(identity) is not str:
+            raise StitchHold("evidence transport UUID differs")
+        try:
+            if str(uuid.UUID(identity)) != identity:
+                raise ValueError("noncanonical UUID")
+        except ValueError:
+            raise StitchHold("evidence transport UUID differs") from None
+    limit = 1024*1024 if key.kind in (StitchEvidenceKind.NATIVE, StitchEvidenceKind.TASK) else 65536
+    if type(body) is not bytes or not 0 < len(body) <= limit:
+        raise StitchHold("evidence transport body bound/type")
+    count = (len(body)+511)//512
+    if type(cursor) is not int or not 0 <= cursor <= count:
+        raise StitchHold("evidence transport cursor differs")
+    digest = hashlib.sha256(body).hexdigest()
+    lines = []
+    end = min(cursor+64,count)
+    for index in range(cursor,end):
+        part = body[index*512:(index+1)*512].hex()
+        if key.kind is StitchEvidenceKind.NATIVE:
+            # Byte-identical historical wire contract consumed by pinned81ff.
+            message = "V85r proof-v1 %s %s %d/%d %s" % (key.plan,digest,index,count,part)
+        else:
+            message = "V85r %s %s %s %s %s %s %d %d/%d %s" % (
+                key.kind.value,key.plan,digest,key.native_run,key.pair,key.readback,len(body),index,count,part)
+        lines.append(dict(seq=index+1,at=utc_now_precise(),level="INFO",message=message))
+    return lines, end
+
+
+class StitchEvidencePacer:
+    """One shared dispatch reservation, including failed/lost ACK attempts.
+
+    A full minute of startup quiet prevents a restart resetting the budget.
+    No batch is admitted between the reservation and its original+60s floor.
+    This only paces transport; a durable cursor advances after exact DB ACK.
+    """
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.allowed_at = time.monotonic()+60
+
+    def take(self):
+        with self.lock:
+            now = time.monotonic()
+            if now < self.allowed_at:
+                return False
+            self.allowed_at = now+60
+            return True
+
+
+class StitchEvidenceDispatch(Enum):
+    QUIET = "quiet"
+    COMPLETE = "complete"
+    ACKNOWLEDGED = "acknowledged"
+
+
+class StitchEvidenceProgress(NamedTuple):
+    state: StitchEvidenceDispatch
+    cursor: int
+
+
+class StitchEvidenceStop(StitchDeadline):
+    """Transport already durable metadata after OFF, with its own short bound."""
+    def __init__(self, stop):
+        self.stop = stop
+        self.deadline_ns = time.monotonic_ns()+min(20, HEARTBEAT_TIMEOUT_SEC)*10**9
+
+    def is_set(self):
+        return self.stop.is_set() or time.monotonic_ns() >= self.deadline_ns
+
+
+def stitch_evidence_send(cfg, pacer, key, body, cursor, boot, stop_event):
+    lines, end = stitch_evidence_chunks(key, body, cursor)
+    if not lines:
+        return StitchEvidenceProgress(StitchEvidenceDispatch.COMPLETE, cursor)
+    for line in lines:
+        message = line["message"]
+        if redact_log_line(message, CLIENT_LOG_RING.output_root, CLIENT_LOG_RING.redaction_secrets()) != message:
+            raise StitchHold("evidence transport redaction changed bytes")
+    if not pacer.take():
+        return StitchEvidenceProgress(StitchEvidenceDispatch.QUIET, cursor)
+    # Reservation precedes every RPC attempt, including a lost/invalid ACK.
+    stop = StitchEvidenceStop(stop_event)
+    path = "/account/connections/client-logs"
+    payload = cleanup_json_bytes(dict(client_version=CLIENT_VERSION,boot_id=boot,lines=lines))
+    request = urllib.request.Request(cfg.api_base+path,method="POST",data=payload,
+        headers={"User-Agent":USER_AGENT,"Content-Type":"application/json",
+                 "Authorization":"Bearer "+cfg.api_key,**cleanup_session_headers(path)})
+    with stitch_bounded_http(cfg,request,stop,4096,20) as response:
+        ack = stitch_proof_json(response.read())
+    if (type(ack) is not dict or set(ack) != {"ok","stored_lines"} or ack["ok"] is not True
+            or type(ack["stored_lines"]) is not int or ack["stored_lines"] != len(lines)):
+        raise StitchHold("evidence diagnostic batch not acknowledged")
+    # Caller must durably store this cursor. A crash before storage repeats the
+    # identical batch; no timestamp or native/readback identity is rewritten.
+    return StitchEvidenceProgress(StitchEvidenceDispatch.ACKNOWLEDGED, end)
+
+
+class StitchEvidenceSnapshot(NamedTuple):
+    present: bool
+    sha256: str
+    body: bytes
+
+
+class StitchEvidenceDirectory(StitchDirectory):
+    """Private bounded metadata, create-only blobs and a locked CAS checkpoint.
+
+    Immutable receipts are never pruned. Only this invocation's random stage is
+    disposable; the persistent lock inode and prior evidence survive restarts.
+    """
+    def __init__(self, cfg, stop):
+        super().__init__(cfg, "v85r-proof-evidence", 1, stop)
+        self.root = Path(cfg.state_dir)
+        self.lock_fd = -1
+        self.initializing = False
+
+    def __enter__(self):
+        backing = inventory_scratch_backing(self.cfg.state_dir)
+        storage = os.statvfs(self.cfg.state_dir)
+        log("INFO","proof evidence storage qualified filesystem=%s device=%d free_bytes=%d" %
+            (backing[1].value,backing[0],storage.f_bavail*storage.f_frsize))
+        super().__enter__()
+        self.initializing = self.created
+        try:
+            owned = os.fstat(self.fds[-1])
+            if owned.st_uid != os.geteuid() or stat_module.S_IMODE(owned.st_mode) != 0o700:
+                raise StitchReadbackIntegrity("evidence directory is not private")
+            self.lock_fd = os.open(".lock",os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_NONBLOCK,0o600,dir_fd=self.fds[-1])
+            try:
+                fcntl.flock(self.lock_fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise StitchHold("another evidence writer is active") from None
+            self.check()
+            self.capacity(0)
+            self.snapshot()  # Existing stores never default a missing checkpoint.
+            return self
+        except BaseException:
+            self.__exit__(None,None,None)
+            raise
+
+    def __exit__(self, *unused):
+        if self.lock_fd >= 0:
+            os.close(self.lock_fd)
+            self.lock_fd = -1
+        super().__exit__(*unused)
+
+    def check(self):
+        stitch_check(self.stop)
+        for before, after in ((os.fstat(self.fds[0]),os.stat(self.root,follow_symlinks=False)),
+                (os.fstat(self.fds[-1]),os.stat(self.relative,dir_fd=self.fds[0],follow_symlinks=False))):
+            if (before.st_dev,before.st_ino,before.st_mode) != (after.st_dev,after.st_ino,after.st_mode):
+                raise StitchReadbackIntegrity("evidence directory identity changed")
+        opened = os.fstat(self.lock_fd)
+        named = os.stat(".lock",dir_fd=self.fds[-1],follow_symlinks=False)
+        if (not stat_module.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid()
+                or stat_module.S_IMODE(opened.st_mode) != 0o600 or opened.st_nlink != 1
+                or opened.st_size != 0 or certification_identity(opened) != certification_identity(named)):
+            raise StitchReadbackIntegrity("evidence lock identity changed")
+
+    def capacity(self, additional):
+        if type(additional) is not int or additional < 0:
+            raise StitchHold("evidence storage bound/type")
+        self.check()
+        total = additional
+        for name in stitch_directory_entries(self.fds[-1],self.stop):
+            if re.fullmatch(r"(?:[a-f0-9]{64}\.blob|state\.json|\.lock|stage-[a-f0-9-]{36}\.partial)",name) is None:
+                raise StitchReadbackIntegrity("unknown evidence directory entry")
+            entry = os.stat(name,dir_fd=self.fds[-1],follow_symlinks=False)
+            if (not stat_module.S_ISREG(entry.st_mode) or entry.st_nlink != 1
+                    or entry.st_uid != os.geteuid() or stat_module.S_IMODE(entry.st_mode) != 0o600
+                    or entry.st_size > 1024*1024):
+                raise StitchReadbackIntegrity("evidence storage identity/bound differs")
+            total += entry.st_size
+            if total > 64*1024*1024:
+                raise StitchHold("owned evidence storage cap reached")
+        if total > 64*1024*1024:
+            raise StitchHold("owned evidence storage cap reached")
+
+    @contextmanager
+    def stage(self, body):
+        if type(body) is not bytes or not 0 < len(body) <= 1024*1024:
+            raise StitchHold("evidence byte bound/type")
+        self.capacity(len(body))
+        name = "stage-"+str(uuid.uuid4())+".partial"
+        descriptor = os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=self.fds[-1])
+        identity = os.fstat(descriptor)
+        try:
+            with os.fdopen(descriptor,"wb") as output:
+                for offset in range(0,len(body),65536):
+                    self.check()
+                    output.write(body[offset:offset+65536])
+                output.flush();os.fsync(output.fileno())
+            self.check()
+            yield name
+        finally:
+            # Publication consumed the stage, or this exact invocation owns it.
+            try:
+                named = os.stat(name,dir_fd=self.fds[-1],follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                if (identity.st_dev,identity.st_ino) != (named.st_dev,named.st_ino):
+                    raise StitchReadbackIntegrity("evidence stage identity changed")
+                os.unlink(name,dir_fd=self.fds[-1]);os.fsync(self.fds[-1])
+
+    def put(self, body):
+        if type(body) is not bytes or not 0 < len(body) <= 1024*1024:
+            raise StitchHold("evidence byte bound/type")
+        digest = hashlib.sha256(body).hexdigest()
+        name = digest+".blob"
+        self.check()
+        try:
+            os.stat(name,dir_fd=self.fds[-1],follow_symlinks=False)
+        except FileNotFoundError:
+            with self.stage(body) as stage:
+                StitchProofDirectory.publish(self,stage,name)
+        # Preserve/create only, then independently rehash its named identity.
+        stitch_readback_file(self.root,self.relative+"/"+name,1024*1024,self.stop,(len(body),digest))
+        return digest
+
+    def read(self, digest, limit=1024*1024, *, stop=None):
+        budget = self.stop if stop is None else stop
+        stitch_check(budget)
+        if type(digest) is not str or re.fullmatch(r"[a-f0-9]{64}",digest) is None:
+            raise StitchReadbackIntegrity("evidence blob digest differs")
+        self.check()
+        actual, body = stitch_readback_file(self.root,self.relative+"/"+digest+".blob",limit,budget,retain=True)
+        if actual[1] != digest:
+            raise StitchReadbackIntegrity("preserved evidence blob changed")
+        return body
+
+    def snapshot(self):
+        self.check()
+        try:
+            os.stat("state.json",dir_fd=self.fds[-1],follow_symlinks=False)
+        except FileNotFoundError:
+            if not self.initializing or set(stitch_directory_entries(self.fds[-1],self.stop)) != {".lock"}:
+                raise StitchReadbackIntegrity("evidence checkpoint missing beside preserved bytes")
+            return StitchEvidenceSnapshot(False,"",b"")
+        self.initializing = False
+        actual, body = stitch_readback_file(self.root,self.relative+"/state.json",65536,self.stop,retain=True)
+        return StitchEvidenceSnapshot(True,actual[1],body)
+
+    def replace(self, expected, body):
+        if type(expected) is not StitchEvidenceSnapshot or type(body) is not bytes or not 0 < len(body) <= 65536:
+            raise StitchReadbackIntegrity("evidence checkpoint binding required")
+        if cleanup_json_bytes(stitch_proof_json(body)) != body:
+            raise StitchReadbackIntegrity("evidence checkpoint must be canonical JSON")
+        if self.snapshot() != expected:
+            raise StitchReadbackIntegrity("evidence checkpoint changed")
+        with self.stage(body) as stage:
+            self.check()
+            self.initializing = False
+            os.replace(stage,"state.json",src_dir_fd=self.fds[-1],dst_dir_fd=self.fds[-1])
+            os.fsync(self.fds[-1])
+        return self.snapshot()
+
+
+class StitchNativeEvidenceStage(Enum):
+    ABSENT = "absent"
+    PREPARED = "prepared"
+    FAILED = "failed"
+    REGISTERED = "registered"
+
+
+def stitch_evidence_index(raw):
+    """Closed private checkpoint. Absence/corruption never invents history."""
+    value = stitch_proof_json(raw)
+    def closed(item, fields):
+        if type(item) is not dict or set(item) != set(fields):
+            raise StitchReadbackIntegrity("evidence checkpoint fields differ")
+    def digest(item):
+        if type(item) is not str or re.fullmatch(r"[a-f0-9]{64}",item) is None:
+            raise StitchReadbackIntegrity("evidence checkpoint digest differs")
+    def identity(item):
+        if type(item) is not str:
+            raise StitchReadbackIntegrity("evidence checkpoint UUID differs")
+        try:
+            if str(uuid.UUID(item)) != item or uuid.UUID(item).int == 0:
+                raise ValueError("noncanonical UUID")
+        except ValueError:
+            raise StitchReadbackIntegrity("evidence checkpoint UUID differs") from None
+    def timestamp(item):
+        if type(item) is not str or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z",item) is None:
+            raise StitchReadbackIntegrity("evidence checkpoint UTC differs")
+        try:
+            datetime.datetime.fromisoformat(item.replace("Z","+00:00"))
+        except ValueError:
+            raise StitchReadbackIntegrity("evidence checkpoint time differs") from None
+    closed(value,("schema","mode","window","used_activation_ids","native","session","history","queue","integrity"))
+    if (value["schema"] != "stoarama.nas-stitch-reader-state.v2" or type(value["mode"]) is not int
+            or value["mode"] not in tuple(NASStitchMode) or value["integrity"] not in ("clear","refused")):
+        raise StitchReadbackIntegrity("evidence checkpoint schema/mode differs")
+    used = value["used_activation_ids"]
+    if type(used) is not list or len(used) > 64:
+        raise StitchReadbackIntegrity("bounded unique spent activations required")
+    for activation in used:
+        identity(activation)
+    if len(set(used)) != len(used):
+        raise StitchReadbackIntegrity("duplicate spent activation")
+    window = value["window"]
+    if type(window) is not dict:
+        raise StitchReadbackIntegrity("evidence native window differs")
+    if window:
+        fields = ("activation_id","run_id","entered","expires_at","boot_id","deadline_monotonic_ns")
+        if "admission_sha256" in window:
+            fields += ("admission_sha256",);digest(window["admission_sha256"])
+        closed(window,fields);identity(window["boot_id"]);identity(window["activation_id"]);identity(window["run_id"])
+        if window["activation_id"] not in used or type(window["entered"]) is not bool:
+            raise StitchReadbackIntegrity("original spent activation differs")
+        if "admission_sha256" in window and not window["entered"]:
+            raise StitchReadbackIntegrity("admission without durable native entry")
+        if type(window["deadline_monotonic_ns"]) is not int or not 0 < window["deadline_monotonic_ns"] < 2**63:
+            raise StitchReadbackIntegrity("original monotonic native deadline differs")
+        timestamp(window["expires_at"])
+    else:
+        closed(window,())
+        if value["mode"] == NASStitchMode.NATIVE:
+            raise StitchReadbackIntegrity("native selector has no original window")
+    native = value["native"]
+    try:
+        stage = StitchNativeEvidenceStage(native["stage"])
+    except (KeyError,TypeError,ValueError):
+        raise StitchReadbackIntegrity("evidence native stage differs") from None
+    if stage is StitchNativeEvidenceStage.ABSENT:
+        closed(native,("stage",))
+    else:
+        fields = ("stage","run_id","context_sha256")
+        if stage is StitchNativeEvidenceStage.REGISTERED:
+            fields += ("bundle_sha256",)
+        closed(native,fields);identity(native["run_id"]);digest(native["context_sha256"])
+        if stage is StitchNativeEvidenceStage.REGISTERED:
+            digest(native["bundle_sha256"])
+    session = value["session"]
+    if session:
+        closed(session,("native_run_id","producer_profile_sha256","reader_profile_sha256","profile_pair_sha256","reader_boot_id"))
+        identity(session["native_run_id"]);identity(session["reader_boot_id"])
+        for name in ("producer_profile_sha256","reader_profile_sha256","profile_pair_sha256"):
+            digest(session[name])
+    else:
+        closed(session,())
+    if type(value["history"]) is not list or len(value["history"]) > 4 or (value["history"] and not session):
+        raise StitchReadbackIntegrity("evidence readback history differs")
+    seen = set()
+    for item in value["history"]:
+        closed(item,("id","verified_at","sha256"));identity(item["id"]);timestamp(item["verified_at"]);digest(item["sha256"])
+        if item["id"] in seen:
+            raise StitchReadbackIntegrity("duplicate evidence readback identity")
+        seen.add(item["id"])
+    if type(value["queue"]) is not list or len(value["queue"]) > 64:
+        raise StitchReadbackIntegrity("evidence transport queue differs")
+    seen = set()
+    for item in value["queue"]:
+        closed(item,("kind","native_run","plan","pair","readback","blob_sha256","size_bytes","cursor"))
+        try:
+            kind = StitchEvidenceKind(item["kind"])
+        except (TypeError,ValueError):
+            raise StitchReadbackIntegrity("evidence transport kind differs") from None
+        identity(item["native_run"]);identity(item["readback"])
+        for name in ("plan","pair","blob_sha256"):
+            digest(item[name])
+        limit = 1024*1024 if kind in (StitchEvidenceKind.NATIVE,StitchEvidenceKind.TASK) else 65536
+        size,cursor = item["size_bytes"],item["cursor"]
+        if (type(size) is not int or not 0 < size <= limit or type(cursor) is not int
+                or not 0 <= cursor < (size+511)//512):
+            raise StitchReadbackIntegrity("evidence transport size/cursor differs")
+        key = tuple(item[name] for name in ("kind","native_run","plan","pair","readback","blob_sha256"))
+        if key in seen:
+            raise StitchReadbackIntegrity("duplicate evidence queue identity")
+        seen.add(key)
+    return value
+
+
+class StitchEvidenceLedger:
+    """One worker's durable metadata; no accepted history restored on startup."""
+    def __init__(self, store):
+        self.store = store
+        self.snapshot = store.snapshot()
+        if not self.snapshot.present:
+            initial = dict(schema="stoarama.nas-stitch-reader-state.v2",mode=0,window={},used_activation_ids=[],
+                native=dict(stage=StitchNativeEvidenceStage.ABSENT.value),session={},history=[],queue=[],integrity="clear")
+            self.snapshot = store.replace(self.snapshot,cleanup_json_bytes(initial))
+        self.state = stitch_evidence_index(self.snapshot.body)
+        self.history = []
+        self.next_due, self.retry_at = 0, 0
+        self.observed_boot = None
+
+    def commit(self, value):
+        raw = cleanup_json_bytes(value)
+        stitch_evidence_index(raw)
+        if len(raw) > 65536:
+            raise StitchHold("evidence checkpoint exceeds bound")
+        snapshot = self.store.replace(self.snapshot,raw)
+        self.state, self.snapshot = value, snapshot
+
+    def copy(self):
+        return stitch_evidence_index(cleanup_json_bytes(self.state))
+
+    def observe_mode(self, mode, now, boot, activation_id=""):
+        if type(mode) is not NASStitchMode or now.tzinfo != datetime.timezone.utc:
+            raise StitchHold("typed UTC selector observation required")
+        if type(boot) is not str or str(uuid.UUID(boot)) != boot or uuid.UUID(boot).int == 0:
+            raise StitchHold("actual canonical selector boot required")
+        self.observed_boot = boot
+        value = self.copy()
+        if mode is NASStitchMode.NATIVE:
+            try:
+                if type(activation_id) is not str or str(uuid.UUID(activation_id)) != activation_id or uuid.UUID(activation_id).int == 0:
+                    raise ValueError("invalid activation")
+            except ValueError:
+                raise StitchHold("canonical operator activation required") from None
+            if value["window"].get("activation_id") != activation_id:
+                if activation_id in value["used_activation_ids"]:
+                    raise StitchHold("operator activation already spent")
+                if len(value["used_activation_ids"]) == 64:
+                    raise StitchHold("spent activation bound reached")
+                value["used_activation_ids"].append(activation_id)
+                value["window"] = dict(activation_id=activation_id,run_id=str(uuid.uuid4()),entered=False,
+                    expires_at=(now+datetime.timedelta(minutes=15)).isoformat().replace("+00:00","Z"),
+                    boot_id=boot,deadline_monotonic_ns=time.monotonic_ns()+15*60*10**9)
+        value["mode"] = int(mode)
+        if value != self.state:
+            self.commit(value)
+
+    def enter_native(self):
+        if self.state["mode"] != NASStitchMode.NATIVE or self.state["window"]["entered"]:
+            raise StitchHold("native activation already entered; fresh reviewed UUID required")
+        value = self.copy();value["window"]["entered"] = True
+        self.commit(value)
+
+    def bind_admission(self, raw):
+        if self.state["mode"] != NASStitchMode.NATIVE or not self.state["window"] or not self.state["window"]["entered"]:
+            raise StitchHold("native activation window unavailable")
+        window = self.state["window"]
+        context = stitch_proof_json(raw)
+        self.native_task(context)
+        if "admission_sha256" in window:
+            if hashlib.sha256(raw).hexdigest() != window["admission_sha256"]:
+                raise StitchReadbackIntegrity("original native admission cannot be replaced")
+            return self.store.read(window["admission_sha256"])
+        task_deadline_ns = time.monotonic_ns()+stitch_delta_ns(
+            parse_certification_timestamp(context["task"]["expires_at"],"original task expiry")
+            -datetime.datetime.now(datetime.timezone.utc))
+        digest = self.store.put(raw)
+        value = self.copy();value["window"]["admission_sha256"] = digest
+        # Persist the tighter original task cut before native work. Mode 1
+        # readback and restart retain it; mode 2 reads preserved history only.
+        value["window"]["deadline_monotonic_ns"] = min(window["deadline_monotonic_ns"],task_deadline_ns)
+        self.commit(value)
+        return raw
+
+    def original_admission(self):
+        if "admission_sha256" not in self.state["window"]:
+            raise StitchHold("original native admission unavailable")
+        return self.store.read(self.state["window"]["admission_sha256"])
+
+    def native_task(self, context):
+        window = self.state["window"]
+        if (context["activation_id"] != window["activation_id"] or context["native_run_id"] != window["run_id"]
+                or context["task"].get("activation_id") != context["activation_id"]):
+            raise StitchReadbackIntegrity("original operator activation/run differs")
+        return stitch_evidence_task(context)
+
+    def native_deadline_ns(self, now):
+        if (now.tzinfo != datetime.timezone.utc or self.state["mode"] != NASStitchMode.NATIVE
+                or not self.state["window"]):
+            raise StitchHold("original native window unavailable")
+        expiry = datetime.datetime.fromisoformat(self.state["window"]["expires_at"].replace("Z","+00:00"))
+        if self.observed_boot != self.state["window"]["boot_id"]:
+            raise StitchHold("native activation boot changed; fresh operation required")
+        now_ns = time.monotonic_ns()
+        remaining_ns = min(stitch_delta_ns(expiry-now),
+            self.state["window"]["deadline_monotonic_ns"]-now_ns)-30*10**9
+        if remaining_ns <= 0:
+            raise StitchHold("original native window expired")
+        return now_ns+min(870*10**9,remaining_ns)
+
+    def bind_session(self, session):
+        value = self.copy()
+        if value["session"] != session:
+            value["session"] = session;value["history"] = []
+            self.commit(value);self.history = [];self.next_due = 0
+
+    def due(self):
+        if self.state["mode"] == NASStitchMode.DISABLED:
+            return False
+        if self.state["integrity"] == "refused":
+            raise StitchReadbackIntegrity("persistent readback integrity refusal")
+        if self.state["mode"] == NASStitchMode.NATIVE:
+            if self.observed_boot != self.state["window"]["boot_id"]:
+                raise StitchHold("native activation boot changed; fresh operation required")
+            expiry = datetime.datetime.fromisoformat(self.state["window"]["expires_at"].replace("Z","+00:00"))
+            if (expiry <= datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)
+                    or self.state["window"]["deadline_monotonic_ns"] <= time.monotonic_ns()+30*10**9):
+                return False
+        return time.monotonic() >= max(self.next_due,self.retry_at)
+
+    def hold(self):
+        self.retry_at = time.monotonic()+60
+
+    def refuse(self):
+        if self.state["integrity"] == "refused" and not self.state["history"]:
+            self.history = []
+            return
+        value = self.copy();value["integrity"] = "refused";value["history"] = []
+        self.history = []
+        self.commit(value)
+
+    def complete_readback(self, body):
+        result = stitch_proof_json(body)
+        stitch_readback_validate(result,StitchReadbackDefinition.READBACK)
+        session = dict(native_run_id=result["native_run_id"],producer_profile_sha256=result["producer_profile_sha256"],
+            reader_profile_sha256=result["reader_profile_sha256"],profile_pair_sha256=result["profile_pair_sha256"],
+            reader_boot_id=result["reader_execution"]["client_boot_id"])
+        if self.state["mode"] == NASStitchMode.DISABLED or self.state["integrity"] != "clear" or self.state["session"] != session:
+            raise StitchReadbackIntegrity("completed readback session differs")
+        digest = self.store.put(body)
+        entry = dict(id=result["id"],verified_at=result["verified_at"],sha256=digest)
+        history = (self.history+[entry])[-4:]
+        value = self.copy();value["history"] = history
+        self.commit(value)
+        self.history = history;self.next_due = time.monotonic()+6*3600;self.retry_at = 0
+        return digest
+
+    def enqueue(self, key, body):
+        stitch_evidence_chunks(key,body,0)
+        digest = self.store.put(body)
+        item = dict(kind=key.kind.value,native_run=key.native_run,plan=key.plan,pair=key.pair,readback=key.readback,
+                    blob_sha256=digest,size_bytes=len(body),cursor=0)
+        identity = {name:item[name] for name in item if name != "cursor"}
+        for old in self.state["queue"]:
+            if {name:old[name] for name in old if name != "cursor"} == identity:
+                return
+        if len(self.state["queue"]) >= 64:
+            raise StitchHold("bounded evidence transport queue full")
+        value = self.copy();value["queue"].append(item);self.commit(value)
+
+    def acknowledge(self, item, progress):
+        if progress.state is not StitchEvidenceDispatch.ACKNOWLEDGED:
+            return
+        if not self.state["queue"] or self.state["queue"][0] != item:
+            raise StitchReadbackIntegrity("evidence ACK checkpoint identity differs")
+        end = min(item["cursor"]+64,(item["size_bytes"]+511)//512)
+        if progress.cursor != end:
+            raise StitchReadbackIntegrity("evidence ACK skipped a batch")
+        value = self.copy()
+        if end == (item["size_bytes"]+511)//512:
+            value["queue"].pop(0)
+        else:
+            value["queue"][0]["cursor"] = end
+        self.commit(value)
+
+    def prepare_native(self, context):
+        raw = cleanup_json_bytes(context)
+        self.native_task(context)
+        if self.original_admission() != raw:
+            raise StitchReadbackIntegrity("native context differs from original admission")
+        digest = self.store.put(raw)
+        value = self.copy()
+        value["native"] = dict(stage=StitchNativeEvidenceStage.PREPARED.value,
+            run_id=context["native_run_id"],context_sha256=digest)
+        value["session"],value["history"] = {},[]
+        self.commit(value);self.history = []
+
+    def fail_native(self):
+        value = self.copy()
+        if value["native"]["stage"] == StitchNativeEvidenceStage.PREPARED.value:
+            value["native"]["stage"] = StitchNativeEvidenceStage.FAILED.value
+            self.commit(value)
+
+    def register_native(self, body):
+        native = self.state["native"]
+        if native["stage"] not in (StitchNativeEvidenceStage.PREPARED.value,StitchNativeEvidenceStage.FAILED.value):
+            raise StitchReadbackIntegrity("native registration without prepared context")
+        context = stitch_proof_json(self.store.read(native["context_sha256"]))
+        task = stitch_proof_json(stitch_evidence_task(context))
+        try:
+            receipt = stitch_proof_unpack(body)
+        except (StitchHold,ValueError,KeyError,zlib.error) as exc:
+            raise StitchReadbackIntegrity("durable native registration is invalid") from exc
+        raw_profiles,_ = stitch_evidence_profiles(context)
+        stitch_readback_native(receipt,task,stitch_proof_json(raw_profiles.producer))
+        if receipt["run"]["id"] != native["run_id"] or receipt["plan_sha256"] != task["plan_sha256"]:
+            raise StitchReadbackIntegrity("durable native registration identity differs")
+        digest = self.store.put(body)
+        value = self.copy();value["native"]["stage"] = StitchNativeEvidenceStage.REGISTERED.value
+        value["native"]["bundle_sha256"] = digest;self.commit(value)
+
+
+def stitch_evidence_identity(cfg, stop):
+    if CLIENT_VERSION != "r2-copy-v3" or cfg.is_candidate:
+        raise StitchHold("promoted combined reader required")
+    # This is the existing startup release-manifest bootstrap, outside a native
+    # or readback attempt. Actual readback never fetches or repairs a manifest.
+    pin = executing_release_sha256(cfg)
+    actual,_ = stitch_readback_file(Path(cfg.current_file).parent,Path(cfg.current_file).name,8*1024*1024,stop)
+    if actual[1] != pin:
+        raise StitchReadbackIntegrity("executing reader source differs from release")
+    import platform
+    cpu = next((line.split(":",1)[1].strip() for line in _read_text("/proc/cpuinfo").splitlines()
+                if line.startswith("model name")),"unknown")
+    value = dict(connection_id=13,account_id=47,client_boot_id=boot_id(),
+        host=dict(connection_id=13,system=platform.system(),machine=platform.machine(),cpu_model=cpu,cpu_count=os.cpu_count()),
+        client_version=CLIENT_VERSION,client_artifact_sha256=actual[1],client_artifact_size_bytes=actual[0])
+    if value["host"]["system"] != "Linux" or value["host"]["machine"] != "x86_64" or value["client_boot_id"] == "unknown":
+        raise StitchHold("actual Linux reader identity unavailable")
+    return value
+
+
+def stitch_evidence_admission(cfg, stop, mode, identity):
+    if type(mode) is not NASStitchMode or mode is NASStitchMode.DISABLED:
+        raise StitchHold("typed active evidence mode required")
+    parameter = "run_id" if mode is NASStitchMode.NATIVE else "producer_profile_sha256"
+    if (type(identity) is not str or (mode is NASStitchMode.NATIVE and
+            (str(uuid.UUID(identity)) != identity or uuid.UUID(identity).int == 0)) or
+            (mode is NASStitchMode.READBACK and re.fullmatch(r"[a-f0-9]{64}",identity) is None)):
+        raise StitchHold("exact evidence admission identity required")
+    query = parameter+"="+identity
+    if mode is NASStitchMode.NATIVE:
+        query += "&activation_id="+stop.activation_id
+    value = stitch_proof_request(cfg,"/account/connections/stitch/evidence/admission?"+query,stop)
+    required = {"schema","mode","expires_at","profiles"}
+    if mode is NASStitchMode.NATIVE:
+        required |= {"task","task_b64","task_sha256","native_run_id","activation_id"}
+    if (type(value) is not dict or set(value) != required or value["schema"] != "stoarama.nas-stitch-admission.v1"
+            or type(value["mode"]) is not int or value["mode"] != int(mode)):
+        raise StitchReadbackIntegrity("evidence admission protocol differs")
+    expiry = parse_certification_timestamp(value["expires_at"],"evidence expiry")
+    if expiry <= datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30):
+        raise StitchHold("evidence admission expired")
+    if mode is NASStitchMode.NATIVE:
+        stitch_proof_check(value["task"]);stitch_evidence_task(value)
+        if value["activation_id"] != stop.activation_id:
+            raise StitchHold("operator activation changed during admission")
+        if (value["native_run_id"] != identity or value["task"]["expires_at"] != value["expires_at"]
+                or value["task"].get("activation_id") != stop.activation_id):
+            raise StitchReadbackIntegrity("original native admission differs")
+    stitch_evidence_profiles(value)
+    return value
+
+
+def stitch_evidence_task(context):
+    """The server's exact authoritative task bytes; never reconstructed JSON."""
+    try:
+        encoded, digest = context["task_b64"], context["task_sha256"]
+        if type(encoded) is not str or not 0 < len(encoded) <= 1398104:
+            raise ValueError("task encoding bound")
+        raw = base64.b64decode(encoded,validate=True)
+        if (not 0 < len(raw) <= 1024*1024 or base64.b64encode(raw).decode("ascii") != encoded
+                or type(digest) is not str or hashlib.sha256(raw).hexdigest() != digest
+                or cleanup_json_bytes(stitch_proof_json(raw)) != cleanup_json_bytes(context["task"])):
+            raise ValueError("task identity differs")
+    except (ValueError,TypeError,KeyError,binascii.Error):
+        raise StitchReadbackIntegrity("authoritative native task bytes differ") from None
+    return raw
+
+
+def stitch_evidence_profiles(context):
+    value = context["profiles"]
+    names = ("producer_profile","reader_profile","profile_pair")
+    if type(value) is not dict or set(value) != {n+s for n in names for s in ("_sha256","_b64")}:
+        raise StitchReadbackIntegrity("evidence profile component fields differ")
+    bodies,digests = [],[]
+    for name in names:
+        encoded,digest = value[name+"_b64"],value[name+"_sha256"]
+        if type(encoded) is not str or not 0 < len(encoded) <= 87384:
+            raise StitchReadbackIntegrity("bounded evidence profile required")
+        try:
+            raw = base64.b64decode(encoded,validate=True)
+        except (ValueError,binascii.Error):
+            raise StitchReadbackIntegrity("evidence profile encoding differs") from None
+        if (not 0 < len(raw) <= 65536 or base64.b64encode(raw).decode("ascii") != encoded
+                or type(digest) is not str or re.fullmatch(r"[a-f0-9]{64}",digest) is None
+                or hashlib.sha256(raw).hexdigest() != digest):
+            raise StitchReadbackIntegrity("evidence profile bytes differ")
+        bodies.append(raw);digests.append(digest)
+    return StitchProfileBytes(*bodies),StitchProfileKey(*digests)
+
+
+def stitch_evidence_native(cfg, inventory, event, ledger, execution):
+    native = ledger.state["native"]
+    if native["stage"] == StitchNativeEvidenceStage.REGISTERED.value:
+        return
+    if ledger.state["window"]["entered"]:
+        # Never retry an interrupted/failed native workspace automatically. Its
+        # original audits/output remain untouched. A fresh operator activation UUID gets
+        # a distinct run namespace, not a refreshed lease/deadline on this run.
+        raise StitchHold("native attempt already entered; new reviewed activation required")
+    stop = StitchReadbackStop(cfg,event,ledger.state["window"]["expires_at"])
+    stop.deadline_ns = min(stop.deadline_ns,ledger.native_deadline_ns(datetime.datetime.now(datetime.timezone.utc)))
+    if stop.activation_id != ledger.state["window"]["activation_id"]:
+        raise StitchHold("native activation observation changed")
+    stitch_check(stop);ledger.enter_native()
+    context = stitch_evidence_admission(cfg,stop,NASStitchMode.NATIVE,ledger.state["window"]["run_id"])
+    raw_profiles,key = stitch_evidence_profiles(context)
+    actual = StitchClientIdentity(execution["client_artifact_sha256"],execution["client_artifact_size_bytes"],CLIENT_VERSION)
+    stitch_readback_profiles(raw_profiles,key,actual,NASStitchMode.NATIVE)
+    stitch_check(stop)
+    ledger.bind_admission(cleanup_json_bytes(context));ledger.prepare_native(context)
+    task = context["task"]
+    admission_stop = stop
+    stop = StitchStop(cfg,event,task,StitchRunKind.PROOF)
+    stop.switch_cancel = admission_stop.switch_cancel
+    stitch_check(admission_stop)
+    stop.run_id,stop.evidence_context = context["native_run_id"],context
+    stop.activation_id = context["activation_id"]
+    stop.deadline_ns = min(stop.deadline_ns,ledger.native_deadline_ns(datetime.datetime.now(datetime.timezone.utc)))
+    try:
+        stitch_proof_client(cfg,stop);stitch_proof_space(cfg,task,stop)
+        with stitch_measure_stage(stop,StitchMeasureStage.SETUP),stitch_proof_activity(inventory,stop):
+            stop.refresh();stitch_check(stop);stitch_resources(cfg,22620379)
+            stitch_corpus(cfg,stop)
+            tools = stitch_v85r_tools(cfg,min(stop.deadline,time.monotonic()+BENCHMARK_TOOL_INSTALL_SEC),stop)
+            stitch_check(stop)
+            STITCH_STATUS.update(kind=STITCH_PROOF_KIND,state="proof_working",started_at=stop.started_at,
+                run_id=stop.run_id,plan_sha256=task["plan_sha256"])
+            with stitch_measure_stage(stop,StitchMeasureStage.BUILD):
+                stitch_build(cfg,inventory,task,event,tools,kind=StitchRunKind.PROOF,proof_stop=stop)
+        # This reads only the durable metadata produced above. No media read,
+        # tool invocation, source check or acceptance refresh follows OFF.
+        _,body = stitch_readback_file(cfg.output_dir,task["plan"]["output_folder"]+"/receipt.json.gz",1024*1024,event,retain=True)
+        ledger.register_native(body)
+        STITCH_STATUS.update(state="proof_registered_locally",run_id=stop.run_id,
+            receipt_sha256=hashlib.sha256(body).hexdigest(),plan_sha256=task["plan_sha256"])
+    except BaseException:
+        ledger.fail_native()
+        raise
+
+
+def stitch_evidence_readback(cfg,event,ledger,execution):
+    native = ledger.state["native"]
+    if native["stage"] != StitchNativeEvidenceStage.REGISTERED.value:
+        raise StitchHold("preserved native registration required; no native fallback")
+    mode = NASStitchMode(ledger.state["mode"])
+    stop = StitchReadbackStop(cfg,event,(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=120)).isoformat())
+    if stop.mode is not mode:
+        raise StitchHold("readback selector observation changed")
+    if mode is NASStitchMode.NATIVE:
+        window = ledger.state["window"]
+        if (not window["entered"] or window["run_id"] != native["run_id"]
+                or window.get("admission_sha256") != native["context_sha256"]
+                or window["activation_id"] != stop.activation_id):
+            raise StitchHold("native readback original activation differs; preserved renewal requires mode2")
+        stop.deadline_ns = min(stop.deadline_ns,ledger.native_deadline_ns(datetime.datetime.now(datetime.timezone.utc)))
+    original = stitch_proof_json(ledger.store.read(native["context_sha256"],stop=stop))
+    bundle = ledger.store.read(native["bundle_sha256"],stop=stop)
+    task_raw = stitch_evidence_task(original)
+    stitch_check(stop)
+    if mode is NASStitchMode.NATIVE:
+        context = original
+    else:
+        context = stitch_evidence_admission(cfg,stop,mode,original["profiles"]["producer_profile_sha256"])
+        stop.deadline_ns = min(stop.deadline_ns,time.monotonic_ns()+stitch_delta_ns(
+            parse_certification_timestamp(context["expires_at"],"readback expiry")
+            -datetime.datetime.now(datetime.timezone.utc))-30*10**9)
+    raw_profiles,key = stitch_evidence_profiles(context)
+    session = dict(native_run_id=native["run_id"],producer_profile_sha256=key.producer,reader_profile_sha256=key.reader,
+        profile_pair_sha256=key.pair,reader_boot_id=execution["client_boot_id"])
+    ledger.bind_session(session)
+    STITCH_STATUS.update(state="readback_working")
+    body = stitch_readback_run(cfg,stop,raw_profiles,key,task_raw,bundle)
+    result = stitch_proof_json(body)
+    if result["reader_execution"] != execution:
+        raise StitchReadbackIntegrity("current reader execution changed during readback")
+    stitch_check(stop)
+    ledger.complete_readback(body)
+    for kind,component in ((StitchEvidenceKind.NATIVE,bundle),(StitchEvidenceKind.TASK,task_raw),
+            (StitchEvidenceKind.PRODUCER,raw_profiles.producer),(StitchEvidenceKind.READER,raw_profiles.reader),
+            (StitchEvidenceKind.PAIR,raw_profiles.pair),(StitchEvidenceKind.READBACK,body)):
+        ledger.enqueue(StitchEvidenceKey(kind,native["run_id"],original["task"]["plan_sha256"],key.pair,result["id"]),component)
+    STITCH_STATUS.clear_error();STITCH_STATUS.update(state="readback_verified")
+
+
+def stitch_evidence_status(ledger,execution):
+    value = dict(schema="stoarama.nas-stitch-reader-status.v1",reader_execution=execution,
+        integrity=ledger.state["integrity"],history=list(ledger.history))
+    if ledger.state["native"]["stage"] == StitchNativeEvidenceStage.REGISTERED.value and ledger.state["session"]:
+        native,session = ledger.state["native"],ledger.state["session"]
+        cache_key = (native["context_sha256"],native["bundle_sha256"],tuple(sorted(session.items())))
+        cached = getattr(ledger,"native_status_cache",None)
+        if cached is not None and cached[0] == cache_key:
+            value["native"] = stitch_proof_json(cached[1])
+            if len(cleanup_json_bytes(value))>6000:
+                raise StitchReadbackIntegrity("reader status exceeds heartbeat bound")
+            return value
+        context = stitch_proof_json(ledger.store.read(native["context_sha256"]))
+        bundle = ledger.store.read(native["bundle_sha256"])
+        receipt = stitch_proof_unpack(bundle)
+        # Shared metadata is immutable native evidence, not a fresh media read.
+        raw_profiles,key = stitch_evidence_profiles(context)
+        producer,reader,pair = (stitch_proof_json(raw) for raw in raw_profiles)
+        value["native"] = dict(run_id=native["run_id"],bundle_sha256=native["bundle_sha256"],
+            plan_sha256=receipt["plan_sha256"],task_sha256=hashlib.sha256(stitch_evidence_task(context)).hexdigest(),
+            activation_id=context["activation_id"],
+            result_sha256=hashlib.sha256(cleanup_json_bytes(receipt["result"])).hexdigest(),
+            producer_profile_sha256=session["producer_profile_sha256"],reader_profile_sha256=session["reader_profile_sha256"],
+            profile_pair_sha256=session["profile_pair_sha256"],registration_sha256=stitch_readback_registration(bundle),
+            outputs=[{name:o[name] for name in ("relative_path","sha256","size_bytes")} for o in receipt["result"]["outputs"]],
+            policy=producer["policy"],tools=producer["tools"])
+        ledger.native_status_cache = (cache_key,cleanup_json_bytes(value["native"]))
+    if len(cleanup_json_bytes(value))>6000:
+        raise StitchReadbackIntegrity("reader status exceeds heartbeat bound")
+    return value
+
+
+def stitch_evidence_reconcile(cfg,event,ledger):
+    native = ledger.state["native"]
+    if native["stage"] not in (StitchNativeEvidenceStage.PREPARED.value,StitchNativeEvidenceStage.FAILED.value):
+        return
+    context = stitch_proof_json(ledger.store.read(native["context_sha256"]))
+    relative = context["task"]["plan"]["output_folder"]+"/receipt.json.gz"
+    try:
+        _,body = stitch_readback_file(cfg.output_dir,relative,1024*1024,event,retain=True)
+    except StitchReadbackIntegrity as exc:
+        if isinstance(exc.__cause__,FileNotFoundError):
+            ledger.fail_native()
+            return
+        raise
+    # Adopt only complete already-published metadata. Actual preserved output
+    # hashing still requires a new active readback; startup accepts no history.
+    ledger.register_native(body)
+
+
+def stitch_evidence_invalidate():
+    # An unavailable store/identity must immediately remove the prior positive
+    # heartbeat subtree. This deliberately incomplete negative observation can
+    # never satisfy the server's required actual reader/native identity fields.
+    STITCH_STATUS.update(stitch_reader=dict(schema="stoarama.nas-stitch-reader-status.v1",
+        integrity="refused",history=[]))
+
+
+def stitch_evidence_loop(cfg,inventory,event):
+    pacer = StitchEvidencePacer()
+    log("INFO","proof reader inventory configuration interval_sec=%d hash_mibps=%d delay_ms=%d" %
+        (cfg.inventory_scan_interval_sec,cfg.inventory_hash_mbps,cfg.inventory_scan_delay_ms))
+    while not event.is_set():
+        try:
+            execution = stitch_evidence_identity(cfg,StitchEvidenceStop(event))
+            with StitchEvidenceDirectory(cfg,event) as store:
+                ledger = StitchEvidenceLedger(store)
+                stitch_evidence_reconcile(cfg,event,ledger)
+                while not event.is_set():
+                    retry = 1
+                    try:
+                        observation = cfg.stitch_switches.proof
+                        mode = observation.mode
+                        ledger.observe_mode(mode,datetime.datetime.now(datetime.timezone.utc),execution["client_boot_id"],observation.activation_id)
+                        if cfg.stitch_enabled:
+                            if mode is not NASStitchMode.DISABLED:
+                                raise StitchHold("ordinary and proof modes conflict")
+                            STITCH_ACTIVE.set()
+                            try:
+                                retry = stitch_once(cfg,inventory,event)
+                            finally:
+                                STITCH_ACTIVE.clear()
+                        elif ledger.due():
+                            STITCH_ACTIVE.set()
+                            try:
+                                if mode is NASStitchMode.NATIVE:
+                                    stitch_evidence_native(cfg,inventory,event,ledger,execution)
+                                stitch_evidence_readback(cfg,event,ledger,execution)
+                            finally:
+                                STITCH_ACTIVE.clear()
+                    except StitchReadbackIntegrity:
+                        ledger.refuse();STITCH_STATUS.fail("proof reader integrity refused")
+                    except Exception as exc:
+                        retry = 60
+                        ledger.hold();STITCH_STATUS.update(state="paused")
+                        STITCH_STATUS.fail("proof reader HOLD: "+stitch_measure_error(exc).value)
+                    STITCH_STATUS.update(stitch_reader=stitch_evidence_status(ledger,execution))
+                    if ledger.state["queue"]:
+                        item = dict(ledger.state["queue"][0])
+                        try:
+                            key = StitchEvidenceKey(StitchEvidenceKind(item["kind"]),item["native_run"],item["plan"],item["pair"],item["readback"])
+                            body = store.read(item["blob_sha256"])
+                            progress = stitch_evidence_send(cfg,pacer,key,body,item["cursor"],execution["client_boot_id"],event)
+                            ledger.acknowledge(item,progress)
+                        except StitchReadbackIntegrity:
+                            ledger.refuse();raise
+                        except Exception as exc:
+                            STITCH_STATUS.fail("evidence transport HOLD: "+stitch_measure_error(exc).value)
+                    event.wait(60 if ledger.state["integrity"] == "refused" else retry)
+        except Exception as exc:
+            stitch_evidence_invalidate()
+            STITCH_STATUS.fail("proof reader unavailable: "+stitch_measure_error(exc).value)
+            event.wait(60)
+
 def stitch_proof_unpack(body):
     decoder = zlib.decompressobj(16+zlib.MAX_WBITS)
     raw = decoder.decompress(body,16*1024*1024+1)
@@ -48840,6 +50349,9 @@ def stitch_loop(cfg, inventory, stop_event):
         reason = ("proof priority failed: " + stitch_measure_error(exc).value) if cfg.stitch_proof_enabled else str(exc)
         STITCH_STATUS.fail(reason)
         log("ERROR", "V85r stitch lane disabled: %s" % reason)
+        return
+    if CLIENT_VERSION == "r2-copy-v3":
+        stitch_evidence_loop(cfg,inventory,stop_event)
         return
     while not stop_event.is_set():
         retry = 60
