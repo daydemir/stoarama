@@ -73,7 +73,11 @@ func boundedNASStitchProof(p nasStitchPlan, sourceSHA string) (nasStitchProof, e
 }
 
 func (s *Server) handleAccountNASStitchProof(w http.ResponseWriter, r *http.Request) {
-	cid, ok := s.nasRestoreConnection(r.Context(), w, r)
+	purpose := nasConnectionMetadata
+	if s.cfg.NASStitchProofTaskID == 1 && !s.cfg.NASStitchEnabled && !s.cfg.NASStitchDeletionEnabled {
+		purpose = nasConnectionProof
+	}
+	cid, ok := s.nasConnection(r.Context(), w, r, purpose)
 	if !ok {
 		return
 	}

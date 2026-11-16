@@ -11,7 +11,7 @@ func TestNASCleanupReturnDryLeaseBeforeObservation(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("return-dry-lease", syntheticFiles(100, 1, 1))
 	task := f.leaseV2(1, 0, 0, "")[0]
-	body := cleanupObserve{Attempt: task.Attempt, PlanSHA: sha, Outcome: "unverified", Proof: json.RawMessage("null"), ReturnLease: true}
+	body := cleanupObserve{Attempt: task.Attempt, PlanSHA: sha, Outcome: "unverified", Proof: json.RawMessage("null"), ReturnLease: true, ClientVersion: nasCleanupExecutionClientVersion}
 	for n := 0; n < 2; n++ {
 		w := cleanupCall(t, f.s.handleAccountNASCleanupReconcile, 47, 5, "itemId", fmt.Sprint(task.ItemID), body)
 		if w.Code != 200 || !strings.Contains(w.Body.String(), `"delete":false`) || !strings.Contains(w.Body.String(), `"action":"pending"`) {
@@ -39,7 +39,7 @@ func TestNASCleanupReconciliationCannotMintFirstPermit(t *testing.T) {
 		t.Fatalf("enable: %d %s", code, body)
 	}
 	task := f.leaseV2(1, 1, 1<<30, "")[0]
-	body := map[string]any{"attempt": task.Attempt, "plan_sha256": sha, "outcome": "match", "proof": fixtureProof(task.Item), "error": "", "client_version": "test", "request_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	body := map[string]any{"attempt": task.Attempt, "plan_sha256": sha, "outcome": "match", "proof": fixtureProof(task.Item), "error": "", "client_version": nasCleanupExecutionClientVersion, "request_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 	gets, heads := f.bucket.counts()
 	// The original observation failed before issuance. Reconciliation must work
 	// even with R2 unavailable, and repeats must not consume another attempt.
@@ -88,7 +88,7 @@ func TestNASCleanupReconciliationRetainsIssuedAuthority(t *testing.T) {
 	}
 	task := f.leaseV2(1, 1, 1<<30, "")[0]
 	permit := f.observe([]cleanupTask{task}, nil)[0]
-	body := map[string]any{"attempt": task.Attempt, "plan_sha256": sha, "outcome": "match", "proof": fixtureProof(task.Item), "error": "", "client_version": "test"}
+	body := map[string]any{"attempt": task.Attempt, "plan_sha256": sha, "outcome": "match", "proof": fixtureProof(task.Item), "error": "", "client_version": nasCleanupExecutionClientVersion}
 	// Even a still-live original permit is never returned for execution.
 	w := cleanupCall(t, f.s.handleAccountNASCleanupReconcile, 47, 5, "itemId", fmt.Sprint(task.ItemID), body)
 	var ack map[string]any
@@ -125,7 +125,7 @@ func TestNASCleanupReturnUnusedLeaseGuards(t *testing.T) {
 		t.Fatalf("enable: %d %s", code, body)
 	}
 	task := f.leaseV2(1, 1, 1<<30, "")[0]
-	body := cleanupObserve{Attempt: task.Attempt, PlanSHA: sha, Outcome: "unverified", Proof: json.RawMessage("null"), ReturnLease: true}
+	body := cleanupObserve{Attempt: task.Attempt, PlanSHA: sha, Outcome: "unverified", Proof: json.RawMessage("null"), ReturnLease: true, ClientVersion: nasCleanupExecutionClientVersion}
 	call := func(body cleanupObserve, session string) int {
 		return cleanupCall(t, f.s.handleAccountNASCleanupReconcile, 47, 5, "itemId", fmt.Sprint(task.ItemID), body, session).Code
 	}

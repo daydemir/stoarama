@@ -140,8 +140,8 @@ func BeginNASR2CopyTx(ctx context.Context, pool interface {
 	return tx, nil
 }
 
-func (s *Server) nasR2CopyConnection(w http.ResponseWriter, r *http.Request) (int64, bool) {
-	cid, ok := s.nasRestoreConnection(r.Context(), w, r)
+func (s *Server) nasR2CopyConnection(w http.ResponseWriter, r *http.Request, purpose nasConnectionPurpose) (int64, bool) {
+	cid, ok := s.nasConnection(r.Context(), w, r, purpose)
 	if !ok {
 		return 0, false
 	}
@@ -187,7 +187,7 @@ type nasR2CopyTask struct {
 }
 
 func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
-	cid, ok := s.nasR2CopyConnection(w, r)
+	cid, ok := s.nasR2CopyConnection(w, r, nasConnectionCopy)
 	if !ok {
 		return
 	}
@@ -263,11 +263,11 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 	util.WriteJSON(w, 200, map[string]any{"task": task, "floor_bytes": NASR2CopyFloor, "range_bytes": NASR2CopyRangeBytes})
 }
 
-func (s *Server) nasR2CopyActive(w http.ResponseWriter, r *http.Request) (pgx.Tx, nasR2CopyTask, string, nasR2CopyControl, bool) {
+func (s *Server) nasR2CopyActive(w http.ResponseWriter, r *http.Request, purpose nasConnectionPurpose) (pgx.Tx, nasR2CopyTask, string, nasR2CopyControl, bool) {
 	var t nasR2CopyTask
 	var version string
 	var req nasR2CopyControl
-	if _, ok := s.nasR2CopyConnection(w, r); !ok {
+	if _, ok := s.nasR2CopyConnection(w, r, purpose); !ok {
 		return nil, t, version, req, false
 	}
 	id, ok := parseInt64Path(w, r, "id")
@@ -315,7 +315,7 @@ func (s *Server) nasR2CopyActive(w http.ResponseWriter, r *http.Request) (pgx.Tx
 	return tx, t, version, req, true
 }
 func (s *Server) handleNASR2CopyCheckpoint(w http.ResponseWriter, r *http.Request) {
-	tx, t, _, req, ok := s.nasR2CopyActive(w, r)
+	tx, t, _, req, ok := s.nasR2CopyActive(w, r, nasConnectionMetadata)
 	if !ok {
 		return
 	}
@@ -336,7 +336,7 @@ func (s *Server) handleNASR2CopyCheckpoint(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleNASR2CopyRange(w http.ResponseWriter, r *http.Request) {
-	tx, t, version, req, ok := s.nasR2CopyActive(w, r)
+	tx, t, version, req, ok := s.nasR2CopyActive(w, r, nasConnectionCopy)
 	if !ok {
 		return
 	}
@@ -380,7 +380,7 @@ func (s *Server) handleNASR2CopyRange(w http.ResponseWriter, r *http.Request) {
 	util.WriteJSON(w, 200, map[string]any{"url": cap.URL, "headers": headers, "etag": t.ETag, "offset": req.Offset, "length": req.Length, "max_duration_sec": 10, "range_id": rangeID})
 }
 func (s *Server) handleNASR2CopyResult(w http.ResponseWriter, r *http.Request) {
-	tx, t, _, _, ok := s.nasR2CopyActive(w, r)
+	tx, t, _, _, ok := s.nasR2CopyActive(w, r, nasConnectionMetadata)
 	if !ok {
 		return
 	}

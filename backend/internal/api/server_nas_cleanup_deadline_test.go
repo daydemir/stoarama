@@ -58,11 +58,11 @@ CREATE TABLE account_api_keys(id bigint PRIMARY KEY,account_id bigint,secret_has
 			router.Use(f.s.requireAccountAuth)
 			router.Post("/cleanup/{itemId}/observe", f.s.handleAccountNASCleanupObserve)
 			router.Post("/cleanup/observe-batch", f.s.handleAccountNASCleanupObserveBatch)
-			body := map[string]any{"attempt": task.Attempt, "plan_sha256": task.PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(task.Item), "client_version": "test"}
+			body := map[string]any{"attempt": task.Attempt, "plan_sha256": task.PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(task.Item), "client_version": nasCleanupExecutionClientVersion}
 			url := fmt.Sprintf("/cleanup/%d/observe", task.ItemID)
 			if batch {
 				body["item_id"] = task.ItemID
-				body = map[string]any{"client_version": "test", "observations": []any{body}}
+				body = map[string]any{"client_version": nasCleanupExecutionClientVersion, "observations": []any{body}}
 				url = "/cleanup/observe-batch"
 			}
 			raw, err := json.Marshal(body)
@@ -273,11 +273,11 @@ func TestNASCleanupExecutionDeadlineIncludesBatchAndLockWait(t *testing.T) {
 					f.bucket.headDelay = 35 * time.Second
 					f.bucket.mu.Unlock()
 				}
-				body := map[string]any{"item_id": task.ItemID, "attempt": task.Attempt, "plan_sha256": task.PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(task.Item), "client_version": "test"}
+				body := map[string]any{"item_id": task.ItemID, "attempt": task.Attempt, "plan_sha256": task.PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(task.Item), "client_version": nasCleanupExecutionClientVersion}
 				started := time.Now()
 				var w *httptest.ResponseRecorder
 				if batch {
-					w = cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": "test", "observations": []map[string]any{body}})
+					w = cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "observations": []map[string]any{body}})
 				} else {
 					delete(body, "item_id")
 					w = cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(task.ItemID), body)

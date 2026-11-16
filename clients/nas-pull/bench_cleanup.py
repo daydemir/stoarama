@@ -67,6 +67,7 @@ def prepare(args):
 def run(args):
     pull = load_client()
     pull.CLIENT_VERSION = args.client_version
+    pull.USER_AGENT = "stoarama-nas-pull/" + pull.CLIENT_VERSION
     pull.boot_id = lambda: args.boot_id
     state = Path(args.state)
     state.mkdir(parents=True, exist_ok=True)

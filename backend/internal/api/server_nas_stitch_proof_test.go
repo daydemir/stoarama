@@ -144,6 +144,10 @@ func TestNASStitchLegacyAdmissionRefusesAcrossUnchangedAdmissionFence(t *testing
 	keyID := int64(5)
 	principal := accountPrincipal{AccountID: 47, AuthType: "api_key", APIKeyID: &keyID, KeyScopes: []string{accountScopePull}}
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/account/connections/stitch/proof", nil)
+	req.Header.Set("User-Agent", "stoarama-nas-pull/"+nasCleanupProofClientVersion)
+	if _, err := pool.Exec(ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, nasCleanupProofClientVersion); err != nil {
+		t.Fatal(err)
+	}
 	req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, principal))
 	w := httptest.NewRecorder()
 	server.confineAccountScope(http.HandlerFunc(server.handleAccountNASStitchProof)).ServeHTTP(w, req)

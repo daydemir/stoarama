@@ -20,6 +20,7 @@ import (
 func copyTestFixture(t *testing.T) (*cleanupFixture, NASR2CopyItem) {
 	t.Helper()
 	f := newCleanupFixture(t, 1)
+	f.useClientVersion(nasCleanupProofClientVersion)
 
 	for _, name := range []string{"0174_r2_object_retirements.sql", "0182_r2_retirement_reservations.sql", "0193_nas_r2_copy.sql"} {
 		b, err := os.ReadFile("../../../infra/sql/migrations/" + name)
@@ -56,6 +57,7 @@ func copyCall(f *cleanupFixture, action string, id int64, body any) *httptest.Re
 		path = "/api/v1/account/connections/r2-copy/lease"
 	}
 	req := httptest.NewRequest("POST", path, strings.NewReader(string(data)))
+	req.Header.Set("User-Agent", "stoarama-nas-pull/"+f.version)
 	ctx := context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: 47, APIKeyID: ptrInt64(5), KeyScopes: []string{accountScopePull}})
 	route := chi.NewRouteContext()
 	route.URLParams.Add("id", fmt.Sprint(id))
@@ -470,7 +472,11 @@ func TestNASR2CopyScopedRouteShapes(t *testing.T) {
 func TestNASR2CopyScopedOtherConnectionDenied(t *testing.T) {
 	f, _ := copyTestFixture(t)
 	f.s.cfg.NASR2CopyEnabled = true
+	if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=14`, f.version); err != nil {
+		t.Fatal(err)
+	}
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/r2-copy/lease", strings.NewReader(fmt.Sprintf(`{"free_bytes":%d}`, NASR2CopyFloor+1_000_000_000)))
+	req.Header.Set("User-Agent", "stoarama-nas-pull/"+f.version)
 	req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: 48, APIKeyID: ptrInt64(6), KeyScopes: []string{accountScopePull}}))
 	out := httptest.NewRecorder()
 	f.s.confineAccountScope(f.s.fenceNASDelivery(http.HandlerFunc(f.s.handleNASR2CopyLease))).ServeHTTP(out, req)

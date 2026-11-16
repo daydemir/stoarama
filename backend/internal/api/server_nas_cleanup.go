@@ -572,8 +572,30 @@ func cleanupRequestSession(r *http.Request) cleanupClientSession {
 	return cleanupClientSession{boot: parts[0], version: parts[1]}
 }
 
+func cleanupAdmissionSession(r *http.Request, declaredVersion string) cleanupClientSession {
+	session := cleanupRequestSession(r)
+	version, ok := nasRequestWorkVersion(r, nasConnectionCleanup)
+	if !ok || version != session.version || version != declaredVersion {
+		return cleanupClientSession{}
+	}
+	return session
+}
+
+func (s *Server) nasCleanupConnection(ctx context.Context, w http.ResponseWriter, r *http.Request, declaredVersion string) (int64, bool) {
+	id, ok := s.nasConnection(ctx, w, r, nasConnectionCleanup)
+	if !ok {
+		return 0, false
+	}
+	version, _ := nasRequestWorkVersion(r, nasConnectionCleanup)
+	if declaredVersion != version {
+		util.WriteError(w, http.StatusConflict, "cleanup client release differs")
+		return 0, false
+	}
+	return id, true
+}
+
 func cleanupSessionDeadline(ctx context.Context, tx pgx.Tx, cid int64, session cleanupClientSession) (time.Time, error) {
-	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion && session.version != nasCleanupV85RClientVersion && session.version != nasCleanupV85RServerSwitchClientVersion && session.version != nasCleanupV85RCorpusUAClientVersion && session.version != nasCleanupRefusalClientVersion && session.version != nasCleanupListingProofClientVersion && session.version != nasCleanupListingFenceClientVersion && session.version != nasCleanupPipelineClientVersion && session.version != nasCleanupGroupClientVersion && session.version != nasCleanupSerialGroupClientVersion && session.version != nasCleanupDurableGroupClientVersion && session.version != nasCleanupBatchedCapsClientVersion && session.version != nasCleanupDeliveryHoldClientVersion && !nasCleanupSupportsGroupedExecution(session.version)) {
+	if session.boot == "" || session.boot == "unknown" || !nasCleanupSupportsExecution(session.version) {
 		return time.Time{}, nil
 	}
 	var seen *time.Time
@@ -688,7 +710,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		req.Limit = 1
 	}
 	ctx := r.Context()
-	cid, ok := s.nasRestoreConnection(ctx, w, r)
+	cid, ok := s.nasCleanupConnection(ctx, w, r, req.ClientVersion)
 	if !ok {
 		return
 	}
@@ -1021,7 +1043,7 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 		util.WriteError(w, 400, "invalid cleanup observation")
 		return
 	}
-	cid, ok := s.nasRestoreConnection(ctx, w, r)
+	cid, ok := s.nasCleanupConnection(ctx, w, r, req.ClientVersion)
 	if !ok {
 		return
 	}
@@ -1040,7 +1062,7 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 		return
 	}
 	// R2 work happens before the transaction (no locks held across it).
-	env := &cleanupObserveEnv{session: cleanupRequestSession(r), dryRunOnly: dryRunOnly, freshRequests: map[int64]bool{id: fresh}}
+	env := &cleanupObserveEnv{session: cleanupAdmissionSession(r, req.ClientVersion), dryRunOnly: dryRunOnly, freshRequests: map[int64]bool{id: fresh}}
 	if req.Outcome == "match" {
 		env.prefetched = s.cleanupPrefetchRecovery(ctx, cid, map[int64]string{id: req.MD5})
 	}

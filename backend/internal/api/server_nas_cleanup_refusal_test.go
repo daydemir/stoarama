@@ -37,7 +37,7 @@ func TestNASCleanupContradictoryRefusalBecomesUncertain(t *testing.T) {
 					for _, receipt := range receipts {
 						receipt["item_id"] = task.ItemID
 					}
-					w := cleanupCall(t, f.s.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": "test", "receipts": receipts})
+					w := cleanupCall(t, f.s.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "receipts": receipts})
 					var body struct {
 						Results []struct {
 							Status int `json:"status"`
@@ -115,7 +115,7 @@ func TestNASCleanupRefusalsAreTerminal(t *testing.T) {
 						}
 						if batchReceipt {
 							receipt["item_id"] = task.ItemID
-							w := cleanupCall(t, f.s.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": "test", "receipts": []any{receipt}})
+							w := cleanupCall(t, f.s.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "receipts": []any{receipt}})
 							if w.Code != 200 || !strings.Contains(w.Body.String(), `"status":200`) {
 								t.Fatalf("receipt: %d %s", w.Code, w.Body.String())
 							}
@@ -190,7 +190,7 @@ func TestNASCleanupLateRefusalContradictionStopsAdvancedBatch(t *testing.T) {
 			delete(receipt, "refusal_reason")
 			if batch {
 				receipt["item_id"] = task.ItemID
-				w := cleanupCall(t, f.s.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": "test", "receipts": []any{receipt}})
+				w := cleanupCall(t, f.s.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "receipts": []any{receipt}})
 				if w.Code != 200 || !strings.Contains(w.Body.String(), `"status":409`) {
 					t.Fatalf("contradiction: %d %s", w.Code, w.Body.String())
 				}
@@ -252,7 +252,7 @@ func TestNASCleanupDurableRefusalsDoNotPause(t *testing.T) {
 					var body string
 					if batch {
 						receipt["item_id"] = task.ItemID
-						w := cleanupCall(t, f.s.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": "test", "receipts": []any{receipt}})
+						w := cleanupCall(t, f.s.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "receipts": []any{receipt}})
 						code, body = w.Code, w.Body.String()
 					} else {
 						w := cleanupCall(t, f.s.handleAccountNASCleanupResult, 47, 5, "itemId", fmt.Sprint(task.ItemID), receipt)
