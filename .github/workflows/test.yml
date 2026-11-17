@@ -33,14 +33,18 @@ jobs:
           --health-retries 10
     env:
       STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-      STOARAMA_TEST_PYTHON: python3.9
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        id: compatibility-python
         with:
           python-version: '3.9'
+      - name: Pin the compatibility pipeline interpreter by absolute path
+        env:
+          STOARAMA_PINNED_TEST_PYTHON: ${{ steps.compatibility-python.outputs.python-path }}
+        run: printf '%s\n' "STOARAMA_TEST_PYTHON=$STOARAMA_PINNED_TEST_PYTHON" >> "$GITHUB_ENV"
       - name: Test dashboard on its deployed Python version
         run: python -m unittest discover -s backend/scripts/nas-storage-dashboard -p 'test_*.py' -q
       - name: Test NAS full-manifest timestamp parsing on Python 3.9
@@ -61,7 +65,7 @@ jobs:
         run: python -B -m unittest discover -s ops/jelly/r2-retire/capture-invoice-gaps -p 'test_*.py' -v
       - name: Test finite capability staging on the control host Python version
         run: python -m unittest discover -s infra/collation-v2 -p 'test_*.py' -q
-      - name: Test isolated R2 controls on the deployed Python version
+      - name: Test isolated R2 controls on supported Python 3.9
         working-directory: clients/nas-pull
         run: python -m unittest test_r2_copy_control test_r2_copy_worker test_heartbeat_v5 test_cleanup_fresh_permit -q
       - name: Test cleanup truth and bounded accounting on Python 3.9
@@ -115,15 +119,18 @@ jobs:
     defaults:
       run:
         working-directory: backend
-    env:
-      STOARAMA_TEST_PYTHON: python3.14
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        id: nas-python
         with:
           python-version: '3.14.6'
+      - name: Pin the observed NAS pipeline interpreter by absolute path
+        env:
+          STOARAMA_PINNED_TEST_PYTHON: ${{ steps.nas-python.outputs.python-path }}
+        run: printf '%s\n' "STOARAMA_TEST_PYTHON=$STOARAMA_PINNED_TEST_PYTHON" >> "$GITHUB_ENV"
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: backend/go.mod
