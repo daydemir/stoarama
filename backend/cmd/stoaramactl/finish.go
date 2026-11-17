@@ -21,6 +21,8 @@ import (
 
 const finishTarget = 10000
 const finishEvidenceAge = 5 * time.Minute
+const finishSpaceAge = 10 * time.Minute
+const finishCleanupHeadroom int64 = 300_000_000_000
 const finishRecoveryAge = 7 * time.Hour // six-hour refresh plus verification/scheduling margin
 const finishLock int64 = 7343226011199
 
@@ -59,7 +61,6 @@ type finishSafety struct {
 	HeldError         *string          `json:"controller_held_error"`
 	LocalMismatch     int64            `json:"local_copy_mismatch_latched"`
 	LocalCheckedAt    time.Time        `json:"local_copy_checked_at"`
-	HoldsCheckedAt    time.Time        `json:"holds_checked_at"`
 	MasterCheckedAt   time.Time        `json:"master_checked_at"`
 	KnownPlans        []int64          `json:"known_enabled_plans"`
 	KnownBatches      []int64          `json:"known_enabled_batches"`
@@ -68,18 +69,22 @@ type finishSafety struct {
 	Holds             map[string]int64 `json:"holds_by_reason"`
 }
 type finishCopy struct {
-	Schema          string                 `json:"schema"`
-	UpdatedAt       time.Time              `json:"updated_at"`
-	QueueDepth      int64                  `json:"queue_depth"`
-	VerifiedInPlace nasCopyStat            `json:"verified_in_place"`
-	Downloaded      nasCopyStat            `json:"downloaded"`
-	DownloadedBytes int64                  `json:"downloaded_bytes"`
-	CommittedBytes  int64                  `json:"committed_bytes"`
-	Blocked         int64                  `json:"blocked"`
-	BlockedByReason map[string]nasCopyStat `json:"blocked_by_reason"`
-	MismatchLatched int64                  `json:"mismatch_latched"`
+	VerifiedInPlaceItemsPerMinute int64                  `json:"verified_in_place_items_per_minute"`
+	DownloadedItemsPerMinute      int64                  `json:"downloaded_items_per_minute"`
+	Schema                        string                 `json:"schema"`
+	UpdatedAt                     time.Time              `json:"updated_at"`
+	QueueDepth                    int64                  `json:"queue_depth"`
+	VerifiedInPlace               nasCopyStat            `json:"verified_in_place"`
+	Downloaded                    nasCopyStat            `json:"downloaded"`
+	DownloadedBytes               int64                  `json:"downloaded_bytes"`
+	CommittedBytes                int64                  `json:"committed_bytes"`
+	Blocked                       int64                  `json:"blocked"`
+	BlockedByReason               map[string]nasCopyStat `json:"blocked_by_reason"`
+	MismatchLatched               int64                  `json:"mismatch_latched"`
 }
 type finishStatus struct {
+	NASFreeBytes       *int64           `json:"nas_storage_free_bytes,omitempty"`
+	NASSpaceReportedAt *time.Time       `json:"nas_storage_reported_at,omitempty"`
 	Schema             string           `json:"schema"`
 	UpdatedAt          time.Time        `json:"updated_at"`
 	Stop               finishStop       `json:"stop_reason,omitempty"`
@@ -127,7 +132,7 @@ func finishReadJSON(path string, required []string, out any) error {
 func finishReadEvidence(safetyPath, copyPath string) (finishSafety, finishCopy, error) {
 	var s finishSafety
 	var c finishCopy
-	if err := finishReadJSON(safetyPath, []string{"updated_at", "recovery_problems", "recovery_checked_at", "recovery_issued_items", "recovery_verified_items", "recovery_plan_id", "recovery_plan_sha256", "last_error", "controller_held_error", "local_copy_mismatch_latched", "local_copy_checked_at", "holds_checked_at", "master_checked_at", "shutdown_or_recovery_failed", "recovery_error", "known_enabled_plans", "known_enabled_batches", "master_deletion_enabled", "expected_deletion_enabled", "holds_by_reason"}, &s); err != nil {
+	if err := finishReadJSON(safetyPath, []string{"updated_at", "recovery_problems", "recovery_checked_at", "recovery_issued_items", "recovery_verified_items", "recovery_plan_id", "recovery_plan_sha256", "last_error", "controller_held_error", "local_copy_mismatch_latched", "local_copy_checked_at", "master_checked_at", "shutdown_or_recovery_failed", "recovery_error", "known_enabled_plans", "known_enabled_batches", "master_deletion_enabled", "expected_deletion_enabled", "holds_by_reason"}, &s); err != nil {
 		return s, c, err
 	}
 	if err := finishReadJSON(copyPath, []string{"schema", "updated_at", "queue_depth", "verified_in_place", "downloaded", "downloaded_bytes", "committed_bytes", "blocked", "blocked_by_reason", "mismatch_latched"}, &c); err != nil {
@@ -159,7 +164,7 @@ func finishCheck(ctx context.Context, pool *pgxpool.Pool, s finishSafety, c fini
 	if s.RecoveryProblems > 0 {
 		return finishRecovery
 	}
-	if !finishFresh(s.LocalCheckedAt, time.Now()) || !finishFresh(s.HoldsCheckedAt, time.Now()) || !finishFresh(s.MasterCheckedAt, time.Now()) || s.LocalMismatch < 0 {
+	if !finishFresh(s.LocalCheckedAt, time.Now()) || !finishFresh(s.MasterCheckedAt, time.Now()) || s.LocalMismatch < 0 {
 		return finishEvidence
 	}
 	if s.RecoveryPlanID <= 0 || len(s.RecoveryPlanSHA) != 64 {
@@ -304,6 +309,28 @@ func finishManifest(dir string, items []api.NASR2CopyItem) (nasCopyHeader, strin
 func finishDepth(ctx context.Context, pool *pgxpool.Pool, status *finishStatus) error {
 	return pool.QueryRow(ctx, `SELECT count(*) FILTER(WHERE state IN ('pending','leased')),count(*) FILTER(WHERE state='verified' AND verified_at>=clock_timestamp()-interval '5 minutes')/5.0 FROM nas_r2_copy_items WHERE connection_id=13 AND kind='raw'`).Scan(&status.QueueDepth, &status.ItemsPerMinute)
 }
+
+// Current storage evidence is independent of historical hold counters.
+func finishCleanupValve(ctx context.Context, pool *pgxpool.Pool, status *finishStatus) error {
+	status.CleanupShouldRun = false
+	if err := pool.QueryRow(ctx, `SELECT nas_storage_free_bytes,nas_storage_reported_at FROM connections WHERE id=13`).Scan(&status.NASFreeBytes, &status.NASSpaceReportedAt); err != nil {
+		return err
+	}
+	status.CleanupReason = "nas_space_heartbeat_missing"
+	if status.NASFreeBytes == nil || status.NASSpaceReportedAt == nil || *status.NASFreeBytes < 0 {
+		return nil
+	}
+	status.CleanupReason = "nas_space_heartbeat_stale"
+	if time.Since(*status.NASSpaceReportedAt) > finishSpaceAge || time.Until(*status.NASSpaceReportedAt) > 30*time.Second {
+		return nil
+	}
+	status.CleanupReason = "nas_headroom_sufficient"
+	if *status.NASFreeBytes-api.NASR2CopyFloor < finishCleanupHeadroom {
+		status.CleanupShouldRun = true
+		status.CleanupReason = "nas_headroom_below_threshold"
+	}
+	return nil
+}
 func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath string) (status finishStatus, err error) {
 	status = finishStatus{Schema: "stoarama.finish-status.v1", CleanupReason: "copy_not_holding_on_free_space"}
 	defer func() {
@@ -356,10 +383,8 @@ func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath st
 		if e = finishDepth(ctx, pool, &status); e != nil {
 			return status, finishDatabase
 		}
-		status.CleanupShouldRun = s.Holds["free_space"] > 0
-		status.CleanupReason = "copy_not_holding_on_free_space"
-		if status.CleanupShouldRun {
-			status.CleanupReason = "copy_holding_on_free_space"
+		if e = finishCleanupValve(ctx, pool, &status); e != nil {
+			return status, finishDatabase
 		}
 		// At most 10k new rows per tick, even while workers consume the queue.
 		remaining := finishTarget - int(status.QueueDepth)

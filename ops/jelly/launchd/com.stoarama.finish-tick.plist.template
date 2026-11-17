@@ -9,7 +9,7 @@
     <string>--safety-collector</string><string>__COLLECTOR__</string>
     <string>--notify-agent</string><string>__NOTIFY_AGENT__</string>
   </array>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/Users/jelly/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
   <key>StartInterval</key><integer>120</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>__STATE__/tick.log</string>

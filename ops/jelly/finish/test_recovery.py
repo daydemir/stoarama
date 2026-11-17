@@ -36,6 +36,32 @@ class RecoveryRefreshTest(unittest.TestCase):
                 else:
                     self.assertEqual(json.loads(saved), {'refresh_error': 'recovery_refresh_failed'})
 
+class RecoveryInvalidationTest(unittest.TestCase):
+    def test_old_success_is_invalidated_for_malformed_sources_and_full_disk(self):
+        import refresh_recovery as refresh
+        from unittest.mock import patch
+        for failure in ('null-source', 'list-source', 'null-report', 'list-report', 'publish'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                state=Path(temp)
+                canonical=state/'recovery.json'
+                canonical.write_text('{"checked_at":"old success"}')
+                def run(command, **kwargs):
+                    if command[0]=='source':
+                        raw=b'[]' if failure=='list-source' else (b'{"plan_id":1440}' if failure.endswith('report') else b'null')
+                        return subprocess.CompletedProcess(command,0,stdout=raw)
+                    kwargs['stdout'].write(b'null' if failure=='null-report' else b'[]')
+                    return subprocess.CompletedProcess(command,0)
+                with patch('sys.argv',['refresh','--cli','cli','--state',temp,'--plan-source','source','--notify-agent','deniz']), \
+                     patch.object(refresh.subprocess,'run',side_effect=run), patch.object(refresh,'notify') as notify:
+                    if failure=='publish':
+                        with patch.object(refresh,'publish',side_effect=OSError('full disk')):
+                            self.assertEqual(refresh.main(),1)
+                        self.assertFalse(canonical.exists())
+                    else:
+                        self.assertEqual(refresh.main(),1)
+                        self.assertIn('refresh_error',json.loads(canonical.read_text()))
+                    notify.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()

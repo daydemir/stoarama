@@ -38,7 +38,6 @@ launch. It emits this complete JSON (all fields required; only the three error f
   "controller_held_error": null,
   "local_copy_mismatch_latched": 0,
   "local_copy_checked_at": "2026-11-17T12:00:00Z",
-  "holds_checked_at": "2026-11-17T12:00:00Z",
   "master_checked_at": "2026-11-17T12:00:00Z",
   "known_enabled_plans": [],
   "known_enabled_batches": [],
@@ -83,18 +82,24 @@ on other connections. An ON master without a known owned plan is refused. `maste
 the actual live API check, independently of envelope creation.
 The safety collector owns the coherent/fresh observation of these facts.
 
-`holds_by_reason` contains current COPY holds, from a fresh client heartbeat
-`cleanup.r2_copy` (persisted at `connections.nas_cleanup_status->'r2_copy'`,
-with `nas_cleanup_status_at`) (use that heartbeat's own age, not the API response time). Normalize
-only a COPY free-space hold to `free_space`. Memory, transport, sidecar conflicts,
-maintenance and general resource holds retain their own keys. Never convert
-historical cumulative counts into a current free-space hold. Emit zero/omit a
-reason only with fresh evidence that the corresponding hold is not active.
-`holds_checked_at` is the heartbeat observation time. `local_copy_mismatch_latched`
-comes from A1's inventory SQLite latch, which can precede the server blocked-row
-ACK. `local_copy_checked_at` records that independent observation time; do not
-substitute the time a stale heartbeat was fetched. A positive local or server
-latch stops the tick. All three COPY/master observation times must be fresh.
+`holds_by_reason` contains diagnostic COPY hold counters from the client heartbeat
+`cleanup.r2_copy` (persisted at `connections.nas_cleanup_status->'r2_copy'`, with
+`nas_cleanup_status_at`). These are boot-cumulative and never authorize cleanup.
+`local_copy_mismatch_latched` comes from A1's durable inventory SQLite latch,
+which can precede the server blocked-row ACK. `local_copy_checked_at` records
+that independent observation time; do not substitute the time a stale heartbeat
+was fetched. A positive local or server latch stops the tick. Local mismatch and
+master observation timestamps must be fresh.
+
+Root's latest valve decision (2026-11-17) supersedes hold-based interleaving:
+read current `connections.nas_storage_free_bytes` and `nas_storage_reported_at`
+directly. Recommend cleanup only if free bytes minus the unchanged 2 TB COPY
+floor is strictly below the typed 300 GB headroom threshold. The storage heartbeat
+must be no older than ten minutes (and no more than 30 seconds in the future).
+Missing/stale storage evidence gives no recommendation and a visible reason;
+it does not stop metadata feeding. Historical hold counters, memory holds,
+transport holds and empty queues do not decide the valve. The controller alone
+acts on the recommendation.
 
 Both safety and copy status timestamps must be no older than five minutes and
 no more than 30 seconds in the future. Copy status is produced afresh by A1's
@@ -105,8 +110,8 @@ last five minutes divided by five, including idle time) are refreshed from DB.
 Listing size conflicts are reported by count and up to 50 source IDs when the
 queueable candidates are exhausted; they produce a typed nonzero
 `listing_size_conflict` stop so stranded objects cannot look complete.
-On a safety stop, cleanup is always false. On a successful tick it is true only
-for a positive current `free_space` hold. The controller runner alone acts on
+On a safety stop, cleanup is always false. On a successful tick it follows only
+the current free-space headroom rule above. The controller runner alone acts on
 this decision; an empty queue is not cleanup authority.
 
 ## Install packet
@@ -130,7 +135,9 @@ v4 heartbeat provides local mismatch/hold evidence:
    This runs the real read-only `nas-cleanup verify-recovery`, with its own
    30-minute timeout, and atomically writes `<state>/recovery.json`. It preserves
    the CLI's own checked_at and canonical identity/count fields; problem detail is
-   redacted. Failure publishes a failed record, alerts, and retains the last good
+   redacted. Failure publishes a failed record; if replacement publication fails it unlinks
+   the old canonical record, so it cannot remain consumable. Malformed JSON shapes
+   also enter this failure path. It alerts and retains the last good
    result separately as `recovery-last-good.json` (never a fallback for collection).
    The safety collector reads the canonical record, maps `delete_ever_issued` to
    `recovery_issued_items` and copies `checked_at` without modification; it fails
@@ -138,8 +145,7 @@ v4 heartbeat provides local mismatch/hold evidence:
 4. Before installing launchd, run the fast tick wrapper once with absolute paths:
    `python3 <install>/tick.py --cli <install>/stoaramactl --state <state> --safety-collector <collector> --notify-agent <target>`.
    Verify exit 0, a current `<state>/status.json`, no `stop_reason`, queue growth
-   toward 10k (or `candidates_exhausted`), copy metrics, and cleanup false unless a
-   fresh free-space hold is active. Confirm cleanup/master/STOP were unchanged.
+   toward 10k (or `candidates_exhausted`), copy metrics, and the expected cleanup headroom decision (or a missing/stale reason). Confirm cleanup/master/STOP were unchanged.
 5. Render both plist templates with XML-escaped absolute `__INSTALL__`, `__STATE__`,
    `__COLLECTOR__`, `__PLAN_SOURCE__`, `__NOTIFY_AGENT__`. Run `plutil -lint`, copy the rendered tick plist
    to `~/Library/LaunchAgents/com.stoarama.finish-tick.plist`, then

@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from datetime import datetime
+import re
 
 from tick import notify
 
@@ -45,7 +47,10 @@ def main():
             except BlockingIOError:
                 return 0
             source = subprocess.run([str(args.plan_source)], capture_output=True, timeout=30, check=True)
-            plan = json.loads(source.stdout)['plan_id']
+            source_record=json.loads(source.stdout)
+            if not isinstance(source_record,dict):
+                raise ValueError('invalid plan source')
+            plan = source_record['plan_id']
             if type(plan) is not int or plan <= 0:
                 raise ValueError('invalid plan')
             # Keep potentially credential-bearing stderr and raw problem detail
@@ -58,7 +63,16 @@ def main():
             if len(raw) > 2 * 1024 * 1024:
                 raise ValueError('oversize report')
             record = json.loads(raw)
+            if not isinstance(record,dict):
+                raise ValueError('invalid report shape')
             record = {key: record[key] for key in FIELDS}
+            for key in ('plan_id','delete_ever_issued','verified','problems'):
+                if type(record[key]) is not int or record[key]<0:
+                    raise ValueError('invalid report counts')
+            if not isinstance(record['plan_sha256'],str) or not re.fullmatch('[a-f0-9]{64}',record['plan_sha256']):
+                raise ValueError('invalid report digest')
+            if not isinstance(record['checked_at'],str) or datetime.fromisoformat(record['checked_at'].replace('Z','+00:00')).tzinfo is None:
+                raise ValueError('invalid check time')
             if record['plan_id'] != plan or not record['checked_at']:
                 raise ValueError('wrong report')
             passed = (result.returncode == 0 and record['problems'] == 0
@@ -74,7 +88,12 @@ def main():
         try:
             publish(args.state / 'recovery.json', {'refresh_error': reason})
         except OSError:
-            pass
+            # Unlink needs no replacement allocation. A full disk must not leave
+            # the previous success consumable after a failed verification.
+            try:
+                (args.state / 'recovery.json').unlink(missing_ok=True)
+            except OSError:
+                reason = 'recovery_invalidation_failed'
     notify(args.notify_agent, reason)
     return 1
 

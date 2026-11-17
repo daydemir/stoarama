@@ -20,6 +20,7 @@ func finishFixture(t *testing.T, n int) (*pgxpool.Pool, string, string) {
 	_, err := pool.Exec(context.Background(), `ALTER TABLE nas_cleanup_plans ADD COLUMN connection_id bigint DEFAULT 13, ADD COLUMN plan_sha256 text DEFAULT repeat('d',64);
  INSERT INTO nas_cleanup_plans(id,mode) VALUES(99,'retired');
  ALTER TABLE nas_cleanup_items ADD COLUMN updated_at timestamptz DEFAULT now();
+ ALTER TABLE connections ADD COLUMN nas_storage_free_bytes bigint, ADD COLUMN nas_storage_reported_at timestamptz;
  CREATE TABLE nas_cleanup_batches(id bigint,mode text);
  CREATE TABLE nas_listing_generations(connection_id bigint,generation text,started_at timestamptz,completed_at timestamptz);
  CREATE TABLE nas_listing_files(connection_id bigint,generation text,relative_path text,size_bytes bigint);
@@ -30,7 +31,7 @@ func finishFixture(t *testing.T, n int) (*pgxpool.Pool, string, string) {
 	dir := t.TempDir()
 	safety := filepath.Join(dir, "safety.json")
 	copy := filepath.Join(dir, "copy.json")
-	finishTestJSON(t, safety, finishSafety{UpdatedAt: time.Now().UTC(), RecoveryCheckedAt: time.Now().UTC(), RecoveryPlanID: 99, RecoveryPlanSHA: strings.Repeat("d", 64), LocalCheckedAt: time.Now().UTC(), HoldsCheckedAt: time.Now().UTC(), MasterCheckedAt: time.Now().UTC(), KnownPlans: []int64{}, KnownBatches: []int64{}, Holds: map[string]int64{}})
+	finishTestJSON(t, safety, finishSafety{UpdatedAt: time.Now().UTC(), RecoveryCheckedAt: time.Now().UTC(), RecoveryPlanID: 99, RecoveryPlanSHA: strings.Repeat("d", 64), LocalCheckedAt: time.Now().UTC(), MasterCheckedAt: time.Now().UTC(), KnownPlans: []int64{}, KnownBatches: []int64{}, Holds: map[string]int64{}})
 	finishTestJSON(t, copy, finishCopy{Schema: "stoarama.nas-r2-copy-status.v1", UpdatedAt: time.Now().UTC(), BlockedByReason: map[string]nasCopyStat{}})
 	return pool, safety, copy
 }
@@ -163,31 +164,42 @@ func TestFinishEvidenceMissingAndNullFailClosed(t *testing.T) {
 		}
 	}
 }
-func TestFinishCleanupOnlyForFreeSpaceAndKnownOwnership(t *testing.T) {
-	for _, reason := range []string{"free_space", "memory", "transport", "maintenance"} {
-		t.Run(reason, func(t *testing.T) {
+func TestFinishCleanupUsesFreshSpaceAndKnownOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name, sql, reason string
+		want              bool
+	}{
+		{"low", `UPDATE connections SET nas_storage_free_bytes=2299999999999,nas_storage_reported_at=now()`, "nas_headroom_below_threshold", true},
+		{"boundary", `UPDATE connections SET nas_storage_free_bytes=2300000000000,nas_storage_reported_at=now()`, "nas_headroom_sufficient", false},
+		{"belowfloor", `UPDATE connections SET nas_storage_free_bytes=1,nas_storage_reported_at=now()`, "nas_headroom_below_threshold", true},
+		{"stale", `UPDATE connections SET nas_storage_free_bytes=1,nas_storage_reported_at=now()-interval '11 minutes'`, "nas_space_heartbeat_stale", false},
+		{"future", `UPDATE connections SET nas_storage_free_bytes=1,nas_storage_reported_at=now()+interval '1 minute'`, "nas_space_heartbeat_stale", false},
+		{"missing", `SELECT 1`, "nas_space_heartbeat_missing", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			pool, safety, copy := finishFixture(t, 0)
 			s, c, err := finishReadEvidence(safety, copy)
 			if err != nil {
 				t.Fatal(err)
 			}
-			s.Holds[reason] = 1
+			// A historical disk hold never decides the valve.
+			s.Holds["free_space"] = 100
 			s.KnownPlans = []int64{99}
-			s.KnownBatches = []int64{}
 			s.Master = true
 			s.ExpectedMaster = true
 			finishTestJSON(t, safety, s)
 			finishTestJSON(t, copy, c)
-			if _, err := pool.Exec(context.Background(), `UPDATE nas_cleanup_plans SET mode='enabled' WHERE id=99`); err != nil {
+			if _, err = pool.Exec(context.Background(), `UPDATE nas_cleanup_plans SET mode='enabled' WHERE id=99;`+tc.sql); err != nil {
 				t.Fatal(err)
 			}
 			status := finishRun(t, pool, safety, copy)
-			if status.CleanupShouldRun != (reason == "free_space") {
+			if status.CleanupShouldRun != tc.want || status.CleanupReason != tc.reason {
 				t.Fatalf("wrong valve: %+v", status)
 			}
 		})
 	}
 }
+
 func TestFinishManifestCapsAndEquality(t *testing.T) {
 	_, w, _ := api.Keep28Policy()
 	start := w[3].Start
