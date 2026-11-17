@@ -67,8 +67,17 @@ CREATE TRIGGER r2_inverse_recording_identity_fence BEFORE UPDATE OF stream_id,cr
  FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();
 CREATE TRIGGER r2_inverse_stream_identity_fence BEFORE UPDATE OF local_timezone ON streams
  FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();
-CREATE TRIGGER r2_inverse_copy_state_fence BEFORE INSERT OR UPDATE OF state,item ON nas_r2_copy_items
- FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();
+-- COPY latches serialize only with their exact R2 key, preserving A1's
+-- independent-connection reservation contract and unrelated copy throughput.
+CREATE FUNCTION fence_r2_inverse_copy_key() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF NEW.item->>'bucket' IS DISTINCT FROM OLD.item->>'bucket'
+ OR NEW.item->>'object_key' IS DISTINCT FROM OLD.item->>'object_key' THEN
+  RAISE EXCEPTION 'COPY R2 identity is immutable'; END IF;
+ PERFORM lock_nas_r2_copy_key(NEW.item->>'bucket',NEW.item->>'object_key');
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_inverse_copy_state_fence BEFORE UPDATE OF state,item ON nas_r2_copy_items
+ FOR EACH ROW EXECUTE FUNCTION fence_r2_inverse_copy_key();
 CREATE TRIGGER r2_inverse_plan_fence BEFORE INSERT OR UPDATE ON nas_cleanup_plans
  FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();
 CREATE TRIGGER r2_inverse_source_hold_fence BEFORE INSERT OR UPDATE ON nas_cleanup_source_holds

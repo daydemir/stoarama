@@ -179,6 +179,7 @@ const inverseRawHeldSQL = `SELECT
  EXISTS(SELECT 1 FROM nas_cleanup_reserved_files WHERE kind='raw' AND source_id=$1)
  OR EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id WHERE h.clip_id=$1 AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued)))
  OR EXISTS(SELECT 1 FROM nas_cleanup_incident_sources WHERE clip_id=$1)
+ OR EXISTS(SELECT 1 FROM nas_cleanup_incident_roster WHERE bucket=$2 AND object_key=$3)
  OR EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE bucket=$2 AND object_key=$3 AND NOT (kind='raw' AND source_id=$1 AND manifest_sha256=$4))
  OR EXISTS(SELECT 1 FROM r2_object_retirements WHERE bucket=$2 AND object_key=$3)
  OR EXISTS(SELECT 1 FROM nas_r2_copy_items WHERE (state<>'verified' OR blocked_reason<>'') AND item->>'bucket'=$2 AND item->>'object_key'=$3)
@@ -235,6 +236,9 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	}
 	defer tx.Rollback(context.Background())
 	if err = inverseProtectionLocks(ctx, tx, false); err != nil {
+		return t, err
+	}
+	if _, err = tx.Exec(ctx, `SELECT lock_nas_r2_copy_key($1,$2)`, a.store.Bucket(), e.Key); err != nil {
 		return t, err
 	}
 	t, err = a.loadTarget(ctx, tx, e)
@@ -310,6 +314,9 @@ func (a *inverseApplier) delete(ctx context.Context, e inverseEntry) (bool, erro
 	}
 	defer tx.Rollback(context.Background())
 	if err = inverseProtectionLocks(ctx, tx, true); err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(ctx, `SELECT lock_nas_r2_copy_key($1,$2)`, a.store.Bucket(), e.Key); err != nil {
 		return false, err
 	}
 	t, err = a.loadTarget(ctx, tx, e)

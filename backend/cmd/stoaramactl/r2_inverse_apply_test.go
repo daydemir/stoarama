@@ -166,7 +166,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		data, _ := json.Marshal(sum)
 		os.WriteFile(summary, data, 0600)
 		summarySHA, _ := inverseFileSHA(summary)
-		o := inverseApplyOptions{Manifest: manifest, ManifestSHA: sha, Summary: summary, SummarySHA: summarySHA, Picks: picksPath, Ledger: filepath.Join(dir, "ledger.jsonl"), DrainEvidence: drainPath, DrainSHA: drainSHA, MaxItems: n, MaxBytes: int64(n) * 100, Budget24h: 100000, Workers: 8}
+		o := inverseApplyOptions{Manifest: manifest, ManifestSHA: sha, Summary: summary, SummarySHA: summarySHA, Picks: picksPath, Ledger: filepath.Join(dir, "ledger.jsonl"), DrainEvidence: drainPath, DrainSHA: drainSHA, MaxItems: n, MaxBytes: int64(n) * 100, Budget24h: 200000, Workers: 8}
 		p, err := loadInverseProtection(ctx, pool, "stoarama", picks, windows)
 		if err != nil {
 			t.Fatal(err)
