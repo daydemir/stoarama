@@ -37,7 +37,7 @@ func (a *inverseDeleteAuthority) requireWire(ctx context.Context, bucket, endpoi
 	return a.check(ctx, bucket, endpoint)
 }
 func (a *inverseDeleteAuthority) check(ctx context.Context, bucket, endpoint string) error {
-	if a.guard == nil || bucket != a.binding.Bucket || endpoint != a.binding.EndpointSHA256 {
+	if a.guard == nil || a.guard.a.opts.Lane != inverseOutsideKeep28 || bucket != a.binding.Bucket || endpoint != a.binding.EndpointSHA256 {
 		return errors.New("inverse wire binding differs")
 	}
 	if err := a.guard.check(ctx, a.binding); err != nil {
@@ -54,39 +54,55 @@ func (a *inverseDeleteAuthority) check(ctx context.Context, bucket, endpoint str
 	return nil
 }
 
-func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntry) (*inverseDeleteAuthority, error) {
+func (a *inverseApplier) prepareWireTarget(ctx context.Context, tx pgx.Tx, e inverseEntry) (inverseRawTarget, error) {
 	if err := inverseProtectionBarrier(ctx, tx); err != nil {
-		return nil, err
+		return inverseRawTarget{}, err
 	}
 	if err := inverseProtectionLocks(ctx, tx, true); err != nil {
-		return nil, err
+		return inverseRawTarget{}, err
 	}
 	if _, err := tx.Exec(ctx, `SELECT lock_nas_r2_copy_key($1,$2)`, a.store.Bucket(), e.Key); err != nil {
-		return nil, err
+		return inverseRawTarget{}, err
 	}
 	target, err := a.loadTarget(ctx, tx, e)
 	if err != nil {
-		return nil, err
+		return inverseRawTarget{}, err
 	}
 	if err = a.checkTarget(ctx, tx, target, e, true); err != nil {
-		return nil, err
+		return inverseRawTarget{}, err
 	}
+	return target, nil
+}
+func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverseEntry, target inverseRawTarget) error {
 	head, err := a.store.Head(ctx, e.Key)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	var now time.Time
 	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
-		return nil, err
+		return err
 	}
 	item := r2RetireItem{r2RetireCandidate: r2RetireCandidate{SizeBytes: e.SizeBytes, SHA256: target.SHA, ETag: e.ETag}}
 	if err = r2RetireValidateGuardHead(head, item, target.ETag, 7*24*time.Hour, now); err != nil {
-		return nil, err
+		return err
 	}
 	if e.LastModified.IsZero() || !head.LastModified.Equal(e.LastModified) || !e.LastModified.Before(now.Add(-7*24*time.Hour)) {
-		return nil, errors.New("listing LastModified missing, changed or too young")
+		return errors.New("listing LastModified missing, changed or too young")
 	}
 	if err = a.store.RequireNoMultipartUploads(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntry) (*inverseDeleteAuthority, error) {
+	if a.opts.Lane != inverseOutsideKeep28 {
+		return nil, errors.New("B1 authority cannot authorize B2")
+	}
+	target, err := a.prepareWireTarget(ctx, tx, e)
+	if err != nil {
+		return nil, err
+	}
+	if err = a.checkWireHead(ctx, tx, e, target); err != nil {
 		return nil, err
 	}
 	guard := &inverseWireGuard{a, tx, target, e}

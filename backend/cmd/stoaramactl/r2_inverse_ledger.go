@@ -17,22 +17,37 @@ const (
 	inverseAbsent inverseEvent = "absent"
 )
 
+type inverseLedgerLane string
+
+const (
+	inverseLegacyLedger inverseLedgerLane = ""
+	inverseKeep28Ledger inverseLedgerLane = "keep28_raw_v1"
+)
+
 type inverseLedgerRecord struct {
-	EndpointSHA256 string       `json:"endpoint_sha256"`
-	Event          inverseEvent `json:"event"`
-	Bucket         string       `json:"bucket"`
-	Key            string       `json:"key"`
-	ManifestSHA256 string       `json:"manifest_sha256"`
-	At             time.Time    `json:"at"`
-	SizeBytes      int64        `json:"size_bytes"`
+	Lane           inverseLedgerLane `json:"lane,omitempty"`
+	EndpointSHA256 string            `json:"endpoint_sha256"`
+	Event          inverseEvent      `json:"event"`
+	Bucket         string            `json:"bucket"`
+	Key            string            `json:"key"`
+	ManifestSHA256 string            `json:"manifest_sha256"`
+	At             time.Time         `json:"at"`
+	SizeBytes      int64             `json:"size_bytes"`
 }
 type inverseLedger struct {
+	lane inverseLedgerLane
 	file *os.File
 	mu   sync.Mutex
 	seen map[string]inverseLedgerRecord
 }
 
 func openInverseLedger(path string) (*inverseLedger, error) {
+	return openInverseLaneLedger(path, inverseLegacyLedger)
+}
+func openKeep28Ledger(path string) (*inverseLedger, error) {
+	return openInverseLaneLedger(path, inverseKeep28Ledger)
+}
+func openInverseLaneLedger(path string, lane inverseLedgerLane) (*inverseLedger, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
 		return nil, err
@@ -48,15 +63,24 @@ func openInverseLedger(path string) (*inverseLedger, error) {
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
 		return fail(errors.New("ledger must be a private regular file"))
 	}
-	l := &inverseLedger{file: f, seen: map[string]inverseLedgerRecord{}}
+	l := &inverseLedger{lane: lane, file: f, seen: map[string]inverseLedgerRecord{}}
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	var consumed int64
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		consumed += int64(len(line) + 1)
+		if lane == inverseLegacyLedger {
+			var fields map[string]json.RawMessage
+			if json.Unmarshal(line, &fields) != nil {
+				return fail(errors.New("invalid legacy ledger record"))
+			}
+			if _, exists := fields["lane"]; exists {
+				return fail(errors.New("B1 refuses a lane-tagged ledger"))
+			}
+		}
 		var rec inverseLedgerRecord
-		if json.Unmarshal(line, &rec) != nil || !validInverseRecord(rec) {
+		if json.Unmarshal(line, &rec) != nil || !validInverseRecord(rec) || rec.Lane != lane {
 			return fail(errors.New("invalid ledger record; preserve and reconcile"))
 		}
 		key := inverseLedgerKey(rec)
@@ -82,7 +106,10 @@ func validInverseRecord(r inverseLedgerRecord) bool {
 func (l *inverseLedger) append(r inverseLedgerRecord) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if !validInverseRecord(r) {
+	if r.Lane == "" {
+		r.Lane = l.lane
+	}
+	if !validInverseRecord(r) || r.Lane != l.lane {
 		return errors.New("invalid inverse ledger record")
 	}
 	key := inverseLedgerKey(r)

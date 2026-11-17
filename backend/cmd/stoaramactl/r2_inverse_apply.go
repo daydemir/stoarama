@@ -24,11 +24,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type inverseDeleteStore interface {
+type inverseReader interface {
 	inverseLister
 	Head(context.Context, string) (r2.ObjectHead, error)
 	EndpointSHA256() string
 	RequireNoMultipartUploads(context.Context) error
+}
+type inverseDeleteStore interface {
+	inverseReader
 	deleteOnce(context.Context, *inverseDeleteAuthority) error
 }
 type inverseDrainEvidence struct {
@@ -40,7 +43,15 @@ type inverseDrainEvidence struct {
 	DeployedWriterCoverage string    `json:"deployed_writer_coverage_evidence"`
 	AcceptedPUTCompletion  string    `json:"accepted_put_completion_evidence"`
 }
+type inverseLane uint8
+
+const (
+	inverseOutsideKeep28 inverseLane = iota
+	inverseNASKeep28
+)
+
 type inverseApplyOptions struct {
+	Lane                                                                               inverseLane
 	Manifest, ManifestSHA, Summary, SummarySHA, Picks, Ledger, DrainEvidence, DrainSHA string
 	MaxItems                                                                           int
 	MaxBytes, Budget24h                                                                int64
@@ -63,7 +74,7 @@ type inverseRawTarget struct {
 type inverseApplier struct {
 	keEpoch    int64
 	pool       *pgxpool.Pool
-	store      inverseDeleteStore
+	store      inverseReader
 	opts       inverseApplyOptions
 	summary    inverseSummary
 	protection inverseProtection
@@ -176,8 +187,22 @@ func (a *inverseApplier) loadTarget(ctx context.Context, tx pgx.Tx, e inverseEnt
 	p.Identities = map[string][]inverseIdentity{e.Key: {t.Identity}}
 	p.Held = map[string]bool{}
 	p.Delivery = map[string]bool{}
-	if class, _ := p.classify(e.ObjectInfo); class != inverseDeletable {
-		return t, errors.New("target is no longer raw non-keep28")
+	want := inverseDeletable
+	if a.opts.Lane == inverseNASKeep28 {
+		want = inverseKeep28
+	}
+	if class, _ := p.classify(e.ObjectInfo); class != want {
+		return t, errors.New("target is no longer in the requested raw lane")
+	}
+	if a.opts.Lane == inverseNASKeep28 {
+		var scoped bool
+		if err = tx.QueryRow(ctx, `SELECT r.account_id=47 AND EXISTS(SELECT 1 FROM connections WHERE id=13 AND account_id=47 AND kind='nas_pull') FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE c.id=$1`, t.ID).Scan(&scoped); err != nil {
+			return t, err
+		}
+		choice := a.protection.Picks.Choices[t.StreamID].Choice
+		if !scoped || (choice != "none" && choice != "st" && choice != "keep") || r2RetireCheckUngatedPrefix(e.Key) != nil {
+			return t, errors.New("keep28 scope or owner choice is unknown")
+		}
 	}
 	return t, nil
 }
@@ -257,6 +282,14 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	if err = a.checkTarget(ctx, tx, t, e, true); err != nil {
 		return t, err
 	}
+	var custody *keep28Custody
+	if a.opts.Lane == inverseNASKeep28 {
+		c, err := a.lockKeep28Custody(ctx, tx, t)
+		if err != nil {
+			return t, err
+		}
+		custody = &c
+	}
 	var charged int64
 	err = tx.QueryRow(ctx, `SELECT coalesce(sum(charged_bytes),0) FROM r2_inverse_budget_minutes WHERE bucket=$1 AND minute>=date_trunc('minute',clock_timestamp()-interval '24 hours')`, a.store.Bucket()).Scan(&charged)
 	if err != nil {
@@ -271,7 +304,22 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	if err != nil {
 		return t, err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO r2_inverse_intents(bucket,object_key,source_id,size_bytes,etag,last_modified,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice,endpoint_sha256,stream_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, a.store.Bucket(), e.Key, t.ID, e.SizeBytes, e.ETag, e.LastModified, a.opts.ManifestSHA, a.summary.PolicySHA256, a.summary.PicksSHA256, a.opts.DrainSHA, a.protection.Picks.Choices[t.StreamID].Choice, a.store.EndpointSHA256(), t.StreamID)
+	intentSQL := `INSERT INTO ` + a.intentTable() + `(bucket,object_key,source_id,size_bytes,etag,last_modified,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice,endpoint_sha256,stream_id`
+	intentArgs := []any{a.store.Bucket(), e.Key, t.ID, e.SizeBytes, e.ETag, e.LastModified, a.opts.ManifestSHA, a.summary.PolicySHA256, a.summary.PicksSHA256, a.opts.DrainSHA, a.protection.Picks.Choices[t.StreamID].Choice, a.store.EndpointSHA256(), t.StreamID}
+	if custody != nil {
+		data, marshalErr := json.Marshal(custody)
+		if marshalErr != nil {
+			return t, marshalErr
+		}
+		intentSQL += `,custody`
+		intentArgs = append(intentArgs, data)
+	}
+	intentSQL += `) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13`
+	if custody != nil {
+		intentSQL += `,$14`
+	}
+	intentSQL += `)`
+	_, err = tx.Exec(ctx, intentSQL, intentArgs...)
 	if err != nil {
 		return t, err
 	}
@@ -303,7 +351,7 @@ func (g *inverseWireGuard) check(ctx context.Context, binding inverseDeleteBindi
 		return err
 	}
 	var durable bool
-	err := g.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_intents WHERE bucket=$1 AND object_key=$2 AND source_id=$3 AND manifest_sha256=$4 AND drain_evidence_sha256=$5 AND endpoint_sha256=$6 AND size_bytes=$7 AND etag=$8 AND stream_id=$9 AND picks_sha256=$10 AND policy_sha256=$11 AND last_modified=$12)`, binding.Bucket, binding.Key, g.t.ID, g.a.opts.ManifestSHA, g.a.opts.DrainSHA, binding.EndpointSHA256, g.e.SizeBytes, g.e.ETag, g.t.StreamID, binding.PicksSHA256, binding.PolicySHA256, binding.LastModified).Scan(&durable)
+	err := g.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM `+g.a.intentTable()+` WHERE bucket=$1 AND object_key=$2 AND source_id=$3 AND manifest_sha256=$4 AND drain_evidence_sha256=$5 AND endpoint_sha256=$6 AND size_bytes=$7 AND etag=$8 AND stream_id=$9 AND picks_sha256=$10 AND policy_sha256=$11 AND last_modified=$12)`, binding.Bucket, binding.Key, g.t.ID, g.a.opts.ManifestSHA, g.a.opts.DrainSHA, binding.EndpointSHA256, g.e.SizeBytes, g.e.ETag, g.t.StreamID, binding.PicksSHA256, binding.PolicySHA256, binding.LastModified).Scan(&durable)
 	if err != nil {
 		return err
 	}
@@ -330,11 +378,30 @@ func (a *inverseApplier) delete(ctx context.Context, e inverseEntry) (bool, erro
 		return false, err
 	}
 	defer tx.Rollback(context.Background())
-	authority, err := a.authorize(ctx, tx, e)
-	if err != nil {
-		return false, err
+	if a.opts.Lane == inverseNASKeep28 {
+		authority, authErr := a.authorizeKeep28(ctx, tx, e)
+		if authErr != nil {
+			return false, authErr
+		}
+		defer authority.cancel()
+		ctx = authority.ctx
+		err = a.store.(keep28DeleteStore).deleteKeep28Once(ctx, authority)
+		if err == nil {
+			confirming, cancel, clockErr := authority.bound(ctx)
+			if clockErr != nil {
+				return false, clockErr
+			}
+			defer cancel()
+			ctx = confirming
+		}
+	} else {
+		authority, authErr := a.authorize(ctx, tx, e)
+		if authErr != nil {
+			return false, authErr
+		}
+		err = a.store.(inverseDeleteStore).deleteOnce(ctx, authority)
 	}
-	if err = a.store.deleteOnce(ctx, authority); err != nil {
+	if err != nil {
 		return false, fmt.Errorf("single DELETE result ambiguous; intent retained, never retransmit: %w", err)
 	}
 
@@ -355,28 +422,37 @@ func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, mani
 		return err
 	}
 	defer tx.Rollback(context.Background())
+	if a.opts.Lane == inverseNASKeep28 {
+		if err = inverseProtectionBarrier(ctx, tx); err != nil {
+			return err
+		}
+	}
 	if err = inverseProtectionLocks(ctx, tx, false); err != nil {
 		return err
 	}
 	// A receipt and source publication must resolve the exact durable identity.
 	// Never turn a missing/rebound source into a successful absence event.
 	var sourceID int64
-	err = tx.QueryRow(ctx, `SELECT c.id FROM r2_inverse_intents i JOIN recording_clips c ON c.id=i.source_id
+	exactSource := ""
+	if a.opts.Lane == inverseNASKeep28 {
+		exactSource = ` AND lower(c.sha256)=i.custody->>'SHA' AND c.display_path=i.custody->>'Path' AND EXISTS(SELECT 1 FROM recordings r WHERE r.id=c.recording_id AND r.stream_id=i.stream_id)`
+	}
+	err = tx.QueryRow(ctx, `SELECT c.id FROM `+a.intentTable()+` i JOIN recording_clips c ON c.id=i.source_id
  WHERE i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 AND i.endpoint_sha256=$4
  AND c.bucket=i.bucket AND c.object_key=i.object_key AND c.size_bytes=i.size_bytes AND btrim(c.etag,'"')=btrim(i.etag,'"')
- FOR UPDATE OF c`, a.store.Bucket(), e.Key, manifest, a.store.EndpointSHA256()).Scan(&sourceID)
+ `+exactSource+` FOR UPDATE OF c`, a.store.Bucket(), e.Key, manifest, a.store.EndpointSHA256()).Scan(&sourceID)
 	if err != nil {
 		return fmt.Errorf("absence publication requires exact source: %w", err)
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256,already_absent)
- SELECT 'raw',c.id,i.stream_id,c.bucket,c.object_key,c.size_bytes,lower(c.sha256),'inverse_non_keep28',i.choice,$3,i.policy_sha256,$4
- FROM recording_clips c JOIN recordings r ON r.id=c.recording_id JOIN r2_inverse_intents i ON i.source_id=c.id
+ SELECT 'raw',c.id,i.stream_id,c.bucket,c.object_key,c.size_bytes,lower(c.sha256),'`+a.retirementReason()+`',i.choice,$3,i.policy_sha256,$4
+ FROM recording_clips c JOIN recordings r ON r.id=c.recording_id JOIN `+a.intentTable()+` i ON i.source_id=c.id
  WHERE i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 ON CONFLICT DO NOTHING`, a.store.Bucket(), e.Key, manifest, reconciled)
 	if err != nil {
 		return err
 	}
 	var receipt bool
-	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_object_retirements r JOIN r2_inverse_intents i ON r.bucket=i.bucket AND r.object_key=i.object_key JOIN recording_clips c ON c.id=i.source_id
+	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_object_retirements r JOIN `+a.intentTable()+` i ON r.bucket=i.bucket AND r.object_key=i.object_key JOIN recording_clips c ON c.id=i.source_id
  WHERE i.bucket=$1 AND i.object_key=$2 AND r.kind='raw' AND r.source_id=$3 AND r.stream_id=i.stream_id AND r.size_bytes=i.size_bytes AND r.sha256=lower(c.sha256) AND r.choice=i.choice AND r.manifest_sha256=$4 AND r.policy_sha256=i.policy_sha256)`, a.store.Bucket(), e.Key, sourceID, manifest).Scan(&receipt)
 	if err != nil {
 		return err
@@ -384,11 +460,11 @@ func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, mani
 	if !receipt {
 		return errors.New("absence publication requires exact receipt")
 	}
-	_, err = tx.Exec(ctx, `UPDATE recording_clips c SET purged_at=clock_timestamp() FROM r2_inverse_intents i WHERE i.bucket=$1 AND i.object_key=$2 AND i.source_id=c.id AND c.purged_at IS NULL`, a.store.Bucket(), e.Key)
+	_, err = tx.Exec(ctx, `UPDATE recording_clips c SET purged_at=clock_timestamp() FROM `+a.intentTable()+` i WHERE i.bucket=$1 AND i.object_key=$2 AND i.source_id=c.id AND c.purged_at IS NULL`, a.store.Bucket(), e.Key)
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO r2_inverse_events(bucket,object_key,event) VALUES($1,$2,'absent') ON CONFLICT DO NOTHING`, a.store.Bucket(), e.Key)
+	_, err = tx.Exec(ctx, `INSERT INTO `+a.eventTable()+`(bucket,object_key,event) VALUES($1,$2,'absent') ON CONFLICT DO NOTHING`, a.store.Bucket(), e.Key)
 	if err != nil {
 		return err
 	}
@@ -399,8 +475,11 @@ func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, mani
 }
 
 func runR2InverseApply(ctx context.Context, cfg config.Config, args []string) {
+	runR2InverseLane(ctx, cfg, args, inverseOutsideKeep28)
+}
+func runR2InverseLane(ctx context.Context, cfg config.Config, args []string, lane inverseLane) {
 	fs := flag.NewFlagSet("r2-inverse apply", flag.ExitOnError)
-	o := inverseApplyOptions{}
+	o := inverseApplyOptions{Lane: lane}
 	fs.StringVar(&o.Manifest, "manifest", "", "partition.jsonl")
 	fs.StringVar(&o.ManifestSHA, "expected-sha256", "", "partition SHA256")
 	fs.StringVar(&o.Summary, "summary", "", "summary.json")
@@ -430,9 +509,22 @@ func runR2InverseApply(ctx context.Context, cfg config.Config, args []string) {
 	}
 }
 
-func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteStore, o inverseApplyOptions) (inverseApplySummary, error) {
+func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, o inverseApplyOptions) (inverseApplySummary, error) {
 	started := time.Now()
 	result := inverseApplySummary{}
+	if o.Lane != inverseOutsideKeep28 && o.Lane != inverseNASKeep28 {
+		return result, errors.New("unknown inverse lane")
+	}
+	if o.Lane == inverseNASKeep28 {
+		if _, ok := store.(keep28DeleteStore); !ok {
+			return result, errors.New("keep28 transport required")
+		}
+	} else {
+		if _, ok := store.(inverseDeleteStore); !ok {
+			return result, errors.New("B1 transport required")
+		}
+	}
+
 	if o.Workers < 1 || o.Workers > 64 || o.MaxItems < 1 || o.MaxBytes <= 0 || o.Budget24h <= 0 {
 		return result, errors.New("invalid bounded apply options")
 	}
@@ -473,7 +565,12 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteSt
 		return result, errors.New("another retirement apply is active")
 	}
 	defer lock.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, r2RetireAdvisoryLockKey)
-	ledger, err := openInverseLedger(o.Ledger)
+	var ledger *inverseLedger
+	if o.Lane == inverseNASKeep28 {
+		ledger, err = openKeep28Ledger(o.Ledger)
+	} else {
+		ledger, err = openInverseLedger(o.Ledger)
+	}
 	if err != nil {
 		return result, err
 	}
@@ -513,7 +610,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteSt
 	// An existing intent is NEVER resubmitted, regardless of manifest or ledger.
 	// Only confirmed absence can advance it to a receipt on restart.
 	existing := map[string]bool{}
-	rows, err := pool.Query(ctx, `SELECT i.object_key,i.size_bytes,i.manifest_sha256,i.endpoint_sha256,EXISTS(SELECT 1 FROM r2_inverse_events e WHERE e.bucket=i.bucket AND e.object_key=i.object_key AND e.event='absent') FROM r2_inverse_intents i WHERE i.bucket=$1`, store.Bucket())
+	rows, err := pool.Query(ctx, `SELECT i.object_key,i.size_bytes,i.manifest_sha256,i.endpoint_sha256,EXISTS(SELECT 1 FROM `+a.eventTable()+` e WHERE e.bucket=i.bucket AND e.object_key=i.object_key AND e.event='absent') FROM `+a.intentTable()+` i WHERE i.bucket=$1`, store.Bucket())
 	if err != nil {
 		return result, err
 	}
@@ -582,13 +679,25 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteSt
 	scanner := bufio.NewScanner(io.TeeReader(f, manifestHash))
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	var jobs []inverseEntry
+	candidates := map[string]inverseEntry{}
 	var planned int64
 	for scanner.Scan() {
 		var e inverseEntry
 		if err = json.Unmarshal(scanner.Bytes(), &e); err != nil {
 			return result, err
 		}
-		if e.Class != inverseDeletable || existing[e.Key] {
+		want := inverseDeletable
+		if o.Lane == inverseNASKeep28 {
+			want = inverseKeep28
+		}
+		if e.Class != want || existing[e.Key] {
+			continue
+		}
+		if o.Lane == inverseNASKeep28 {
+			if _, dup := candidates[e.Key]; dup {
+				return result, errors.New("duplicate keep28 partition key")
+			}
+			candidates[e.Key] = e
 			continue
 		}
 		if len(jobs) >= o.MaxItems || e.SizeBytes > o.MaxBytes-planned {
@@ -605,6 +714,12 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteSt
 	}
 	if hex.EncodeToString(manifestHash.Sum(nil)) != o.ManifestSHA {
 		return result, errors.New("partition changed while reading")
+	}
+	if o.Lane == inverseNASKeep28 {
+		jobs, err = a.selectKeep28(ctx, candidates)
+		if err != nil {
+			return result, err
+		}
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()

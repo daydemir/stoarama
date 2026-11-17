@@ -289,6 +289,10 @@ func partitionInverse(ctx context.Context, store inverseLister, p inverseProtect
 }
 
 func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
+	if len(args) > 0 && args[0] == "apply-keep28" {
+		runR2InverseLane(ctx, cfg, args[1:], inverseNASKeep28)
+		return
+	}
 	if len(args) > 0 && args[0] == "apply" {
 		runR2InverseApply(ctx, cfg, args[1:])
 		return
