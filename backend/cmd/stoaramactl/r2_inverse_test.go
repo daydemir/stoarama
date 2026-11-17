@@ -173,7 +173,7 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
 			t.Fatalf("%s got %s", key, got)
 		}
 	}
-	if got, _ := p.classify(r2.ObjectInfo{Key: "ordinary", "snapshot_scoped", "dryrun_scoped"}); got != inverseDeletable {
+	if got, _ := p.classify(r2.ObjectInfo{Key: "ordinary"}); got != inverseDeletable {
 		t.Fatal(got)
 	}
 	// The frozen incident roster survives plan transitions independently.
