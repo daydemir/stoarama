@@ -29,6 +29,10 @@ func TestNASCleanupBulkDurabilityClientServer(t *testing.T) {
 	testNASCleanupPipelineClientServer(t, true, nasCleanupBulkDurabilityClientVersion)
 }
 
+func TestNASCleanupFreshPermitClientServer(t *testing.T) {
+	testNASCleanupPipelineClientServer(t, true, nasCleanupFreshPermitClientVersion)
+}
+
 func TestNASCleanupPermitTransportClientServer(t *testing.T) {
 	testNASCleanupPipelineClientServer(t, true, nasCleanupPermitTransportClientVersion)
 }
