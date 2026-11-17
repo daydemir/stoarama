@@ -19,6 +19,7 @@ func finishFixture(t *testing.T, n int) (*pgxpool.Pool, string, string) {
 	pool, _, _, _ := nasCopyQueueFixture(t, n, true)
 	_, err := pool.Exec(context.Background(), `ALTER TABLE nas_cleanup_plans ADD COLUMN connection_id bigint DEFAULT 13, ADD COLUMN plan_sha256 text DEFAULT repeat('d',64);
  INSERT INTO nas_cleanup_plans(id,mode) VALUES(99,'retired');
+ ALTER TABLE nas_cleanup_items ADD COLUMN updated_at timestamptz DEFAULT now();
  CREATE TABLE nas_cleanup_batches(id bigint,mode text);
  CREATE TABLE nas_listing_generations(connection_id bigint,generation text,started_at timestamptz,completed_at timestamptz);
  CREATE TABLE nas_listing_files(connection_id bigint,generation text,relative_path text,size_bytes bigint);
@@ -117,8 +118,8 @@ func TestFinishStopsBeforeFeeding(t *testing.T) {
 		{name: "unknown batch", sql: `INSERT INTO nas_cleanup_batches VALUES(92,'enabled')`, stop: finishUnknownPlan},
 		{name: "master mismatch", mutate: func(s *finishSafety, c *finishCopy) { s.Master = true }, stop: finishMaster},
 		{name: "unowned master", mutate: func(s *finishSafety, c *finishCopy) { s.Master = true; s.ExpectedMaster = true }, stop: finishMaster},
-		{name: "stale underlying recovery", mutate: func(s *finishSafety, c *finishCopy) { s.RecoveryCheckedAt = time.Now().Add(-6 * time.Minute) }, stop: finishEvidence},
-		{name: "issued changed", sql: `INSERT INTO nas_cleanup_items VALUES(99,true)`, stop: finishEvidence},
+		{name: "stale underlying recovery", mutate: func(s *finishSafety, c *finishCopy) { s.RecoveryCheckedAt = time.Now().Add(-8 * time.Hour) }, stop: finishRecoveryStale},
+		{name: "issued changed", sql: `INSERT INTO nas_cleanup_items(plan_id,delete_ever_issued) VALUES(99,true)`, stop: finishRecoveryStale},
 		{name: "stale safety", mutate: func(s *finishSafety, c *finishCopy) { s.UpdatedAt = time.Now().Add(-6 * time.Minute) }, stop: finishEvidence},
 		{name: "stale copy", mutate: func(s *finishSafety, c *finishCopy) { c.UpdatedAt = time.Now().Add(-6 * time.Minute) }, stop: finishEvidence},
 		{name: "future", mutate: func(s *finishSafety, c *finishCopy) { s.UpdatedAt = time.Now().Add(time.Minute) }, stop: finishEvidence},
@@ -261,7 +262,7 @@ func TestFinishScopedRecoveryAndKnownHeldError(t *testing.T) {
 	pool, safety, copy := finishFixture(t, 1)
 	// Older issued permits do not participate: closed-plan recovery records own
 	// their history. Only the declared current/latest plan is checked here.
-	if _, err := pool.Exec(context.Background(), `INSERT INTO nas_cleanup_plans(id,mode) VALUES(1,'retired');INSERT INTO nas_cleanup_items VALUES(1,true)`); err != nil {
+	if _, err := pool.Exec(context.Background(), `INSERT INTO nas_cleanup_plans(id,mode) VALUES(1,'retired');INSERT INTO nas_cleanup_items(plan_id,delete_ever_issued) VALUES(1,true)`); err != nil {
 		t.Fatal(err)
 	}
 	s, c, err := finishReadEvidence(safety, copy)
@@ -280,7 +281,31 @@ func TestFinishScopedRecoveryAndKnownHeldError(t *testing.T) {
 	s.RecoveryPlanSHA = strings.Repeat("e", 64)
 	finishTestJSON(t, safety, s)
 	_, err = finishTick(context.Background(), pool, safety, copy)
-	if !errors.Is(err, finishEvidence) {
+	if !errors.Is(err, finishRecoveryStale) {
 		t.Fatalf("wrong plan proof accepted: %v", err)
+	}
+}
+
+func TestFinishRecoveryBindsUnchangedIssuedState(t *testing.T) {
+	pool, safety, copy := finishFixture(t, 0)
+	s, c, err := finishReadEvidence(safety, copy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.RecoveryCheckedAt = time.Now().Add(-time.Hour)
+	s.RecoveryIssued = 1
+	s.RecoveryVerified = 1
+	if _, err = pool.Exec(context.Background(), `INSERT INTO nas_cleanup_items(plan_id,delete_ever_issued,updated_at) VALUES(99,true,now()-interval '2 hours')`); err != nil {
+		t.Fatal(err)
+	}
+	finishTestJSON(t, safety, s)
+	finishTestJSON(t, copy, c)
+	finishRun(t, pool, safety, copy) // An old real check is valid for unchanged state.
+	if _, err = pool.Exec(context.Background(), `UPDATE nas_cleanup_items SET updated_at=now() WHERE plan_id=99`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = finishTick(context.Background(), pool, safety, copy)
+	if !errors.Is(err, finishRecoveryStale) {
+		t.Fatalf("same-count new deletion accepted: %v", err)
 	}
 }

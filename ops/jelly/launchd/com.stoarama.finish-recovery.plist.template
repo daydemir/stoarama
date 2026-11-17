@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.stoarama.finish-recovery</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string><string>__INSTALL__/refresh_recovery.py</string>
+    <string>--cli</string><string>__INSTALL__/stoaramactl</string>
+    <string>--state</string><string>__STATE__</string>
+    <string>--plan-source</string><string>__PLAN_SOURCE__</string>
+    <string>--notify-agent</string><string>__NOTIFY_AGENT__</string>
+  </array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>StartInterval</key><integer>21600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>__STATE__/recovery.log</string>
+  <key>StandardErrorPath</key><string>__STATE__/recovery.log</string>
+</dict></plist>

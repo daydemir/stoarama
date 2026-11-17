@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/r2"
@@ -38,6 +39,7 @@ type nasRecoveryItem struct {
 }
 
 type nasRecoverySummary struct {
+	CheckedAt   time.Time         `json:"checked_at"`
 	PlanID      int64             `json:"plan_id"`
 	PlanSHA     string            `json:"plan_sha256"`
 	Items       int               `json:"items"`
@@ -73,7 +75,8 @@ func verifyNASCleanupRecovery(ctx context.Context, report map[string]any, store 
 	if err := json.Unmarshal(raw, &plan); err != nil || plan.ID <= 0 || len(plan.Results) != len(plan.Items) {
 		return nasRecoverySummary{}, errors.New("cleanup plan report is incomplete")
 	}
-	sum := nasRecoverySummary{PlanID: plan.ID, PlanSHA: plan.PlanSHA, Items: len(plan.Items), ByStatus: map[string]int{}}
+	// Start time conservatively binds every HEAD to a time before it ran.
+	sum := nasRecoverySummary{CheckedAt: time.Now().UTC(), PlanID: plan.ID, PlanSHA: plan.PlanSHA, Items: len(plan.Items), ByStatus: map[string]int{}}
 	for _, res := range plan.Results {
 		if !res.Issued {
 			continue

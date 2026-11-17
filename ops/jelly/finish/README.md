@@ -53,10 +53,18 @@ must fail if any source is missing or cannot be verified. Read recovery problem
 counts from the actual recovery verifier, and preserve its failure latch until
 resolved. Scope recovery to the runner's current or latest plan. Bind its verifier
 report to `recovery_plan_id`, `recovery_plan_sha256`, issued/verified counts,
-successful verifier exit and actual verification observation time
-`recovery_checked_at`. The tick checks this plan's SHA and issued count in DB.
-Verified must equal issued, problems must be zero, and checked_at must be within
-five minutes. A new permit requires a fresh check. Historical plans are covered
+successful verifier exit and the canonical verifier's own `checked_at`, copied
+unchanged into `recovery_checked_at`. The canonical CLI now records checked_at at
+the start of its HEAD pass, so every HEAD occurs after that time. The tick checks
+this plan's SHA, issued count and newest issued-item `updated_at` in DB.
+Verified must equal issued, problems must be zero, and checked_at must be strictly
+later than that newest timestamp. `updated_at` is a conservative upper bound on
+permit issuance: a later receipt can also require a new verification. A changed
+count or later issuance invalidates the report even while the count stays equal.
+The tick never re-stamps cached evidence or re-HEADs objects inline. A real result
+remains acceptable while its bound state is unchanged, up to seven hours (the
+six-hour refresh cadence plus verification/scheduling margin). A binding or age
+failure produces `recovery_evidence_stale`; the controller reruns the verifier. Historical plans are covered
 by their verified close records; there is no global count aggregation or sealed
 baseline (root decision, 2026-11-17).
 
@@ -103,37 +111,56 @@ this decision; an empty queue is not cleanup authority.
 
 ## Install packet
 
-Sole controller, at a natural boundary after A1 is merged/deployed:
+Sole controller, at a natural boundary after A1 is merged/deployed and a fresh
+v4 heartbeat provides local mismatch/hold evidence:
 
 1. Build the merged CLI on Jelly using `darma storage check` then
    `darma run --slot -- go -C backend build -o <install>/stoaramactl ./cmd/stoaramactl`.
-   Copy `tick.py` to the private install directory. Do not reuse or modify the
+   Copy `tick.py` and `refresh_recovery.py` to the private install directory. Do not reuse or modify the
    cleanup runner's code/state/launchd job. Create a separate private state dir.
 2. Provide the executable safety collector described above. Configure credentials
    non-interactively for the CLI and collector using existing controller auth;
    never put secrets in the plist, arguments, logs, or this repository. The wrapper
    deliberately loads no env file. Configure a working `darma msg` notification
    target with `--notify-agent`; it must route to Deniz.
-3. Before installing launchd, run the wrapper once with absolute paths:
+3. Provide a separate controller-owned executable `__PLAN_SOURCE__` emitting
+   `{"plan_id":1440}` for the actual current/latest runner plan. It must fail on
+   unknown ownership and use no inline verifier. Run the refresh once:
+   `python3 <install>/refresh_recovery.py --cli <install>/stoaramactl --state <state> --plan-source <plan-source> --notify-agent <target>`.
+   This runs the real read-only `nas-cleanup verify-recovery`, with its own
+   30-minute timeout, and atomically writes `<state>/recovery.json`. It preserves
+   the CLI's own checked_at and canonical identity/count fields; problem detail is
+   redacted. Failure publishes a failed record, alerts, and retains the last good
+   result separately as `recovery-last-good.json` (never a fallback for collection).
+   The safety collector reads the canonical record, maps `delete_ever_issued` to
+   `recovery_issued_items` and copies `checked_at` without modification; it fails
+   on `refresh_error`. It does not invoke the slow verifier in its 90s budget.
+4. Before installing launchd, run the fast tick wrapper once with absolute paths:
    `python3 <install>/tick.py --cli <install>/stoaramactl --state <state> --safety-collector <collector> --notify-agent <target>`.
    Verify exit 0, a current `<state>/status.json`, no `stop_reason`, queue growth
    toward 10k (or `candidates_exhausted`), copy metrics, and cleanup false unless a
    fresh free-space hold is active. Confirm cleanup/master/STOP were unchanged.
-4. Render the plist template with XML-escaped absolute `__INSTALL__`, `__STATE__`,
-   `__COLLECTOR__`, `__NOTIFY_AGENT__`. Run `plutil -lint`, copy the rendered plist
+5. Render both plist templates with XML-escaped absolute `__INSTALL__`, `__STATE__`,
+   `__COLLECTOR__`, `__PLAN_SOURCE__`, `__NOTIFY_AGENT__`. Run `plutil -lint`, copy the rendered tick plist
    to `~/Library/LaunchAgents/com.stoarama.finish-tick.plist`, then
    `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.stoarama.finish-tick.plist`.
    It runs immediately and every 120 seconds; launchd and a wrapper lock prevent
    overlap. Verify the next automatic timestamp. The independent Rolly dead-man
    check reads the output age and `stop_reason`; CLI status is replaced atomically.
-5. To stop only the feeder:
+   Also install/bootstrap `com.stoarama.finish-recovery.plist` from its separate
+   template: it runs immediately and every six hours, with a separate lock and
+   timeout. It performs only canonical recovery HEAD verification, never cleanup
+   or master control. Verify `recovery.json` has its own fresh checked_at.
+6. To stop only the feeder:
    `launchctl bootout gui/$(id -u)/com.stoarama.finish-tick`.
+   To stop its independent refresh, boot out `com.stoarama.finish-recovery`.
 
 ## Stops
 
 | `stop_reason` | Meaning / controller action |
 |---|---|
 | `evidence_unavailable` | Missing, malformed, incomplete, stale or future evidence. Repair collection; never stamp old facts as fresh. |
+| `recovery_evidence_stale` | Canonical result does not bind current/latest plan SHA, issued count and newest issued-item update, or exceeds the seven-hour refresh budget. Run the real refresh; never re-stamp. |
 | `cleanup_recovery_problems` | Current/latest plan recovery verifier reports problems > 0. Resolve missing/conflicting R2 recovery evidence. |
 | `unknown_enabled_cleanup` | DB enabled plan/batch not owned by the controller. Reconcile ownership; do not adopt it blindly. |
 | `copy_mismatch_latched` | A1 reports durable checksum/final conflict. Reconcile the affected exact key; never clear to feed. |

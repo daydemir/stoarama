@@ -11,7 +11,7 @@ import tempfile
 
 STOPS = {'evidence_unavailable', 'cleanup_recovery_problems', 'unknown_enabled_cleanup',
          'copy_mismatch_latched', 'shutdown_or_recovery_failed', 'deletion_master_mismatch',
-         'database_unavailable', 'manifest_import_failed', 'tick_already_running', 'listing_size_conflict'}
+         'database_unavailable', 'recovery_evidence_stale', 'manifest_import_failed', 'tick_already_running', 'listing_size_conflict'}
 
 
 def main():
@@ -59,14 +59,17 @@ def main():
                 return 0
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
+    notify(args.notify_agent, reason)
+    return 1
+
+def notify(agent, reason):
     message = 'Stoarama finish ' + reason + '; inspect finish status and controller safety evidence.'
     try:
-        subprocess.run(['darma', 'msg', 'send', args.notify_agent, message],
+        subprocess.run(['darma', 'msg', 'send', agent, message],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=True)
     except (OSError, subprocess.SubprocessError):
         print('finish notification_failed', flush=True)
     print('finish ' + reason, flush=True)
-    return 1
 
 
 if __name__ == '__main__':

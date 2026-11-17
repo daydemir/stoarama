@@ -21,6 +21,7 @@ import (
 
 const finishTarget = 10000
 const finishEvidenceAge = 5 * time.Minute
+const finishRecoveryAge = 7 * time.Hour // six-hour refresh plus verification/scheduling margin
 const finishLock int64 = 7343226011199
 
 type finishStop string
@@ -28,6 +29,7 @@ type finishStop string
 const (
 	finishEvidence        finishStop = "evidence_unavailable"
 	finishRecovery        finishStop = "cleanup_recovery_problems"
+	finishRecoveryStale   finishStop = "recovery_evidence_stale"
 	finishUnknownPlan     finishStop = "unknown_enabled_cleanup"
 	finishMismatch        finishStop = "copy_mismatch_latched"
 	finishShutdown        finishStop = "shutdown_or_recovery_failed"
@@ -157,15 +159,22 @@ func finishCheck(ctx context.Context, pool *pgxpool.Pool, s finishSafety, c fini
 	if s.RecoveryProblems > 0 {
 		return finishRecovery
 	}
-	if !finishFresh(s.RecoveryCheckedAt, time.Now()) || !finishFresh(s.LocalCheckedAt, time.Now()) || !finishFresh(s.HoldsCheckedAt, time.Now()) || !finishFresh(s.MasterCheckedAt, time.Now()) || s.RecoveryIssued < 0 || s.RecoveryVerified != s.RecoveryIssued || s.RecoveryPlanID <= 0 || len(s.RecoveryPlanSHA) != 64 || s.LocalMismatch < 0 {
+	if !finishFresh(s.LocalCheckedAt, time.Now()) || !finishFresh(s.HoldsCheckedAt, time.Now()) || !finishFresh(s.MasterCheckedAt, time.Now()) || s.LocalMismatch < 0 {
 		return finishEvidence
+	}
+	if s.RecoveryPlanID <= 0 || len(s.RecoveryPlanSHA) != 64 {
+		return finishRecoveryStale
 	}
 	var issued int64
 	var planSHA string
-	if err := pool.QueryRow(ctx, `SELECT p.plan_sha256,(SELECT count(*) FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued) FROM nas_cleanup_plans p WHERE p.id=$1 AND p.connection_id=13`, s.RecoveryPlanID).Scan(&planSHA, &issued); err != nil {
+	var newestIssued time.Time
+	if err := pool.QueryRow(ctx, `SELECT p.plan_sha256,(SELECT count(*) FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued),coalesce((SELECT max(i.updated_at) FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued),timestamptz '1970-01-01') FROM nas_cleanup_plans p WHERE p.id=$1 AND p.connection_id=13`, s.RecoveryPlanID).Scan(&planSHA, &issued, &newestIssued); err != nil {
 		return finishDatabase
 	}
-	if issued != s.RecoveryIssued || planSHA != s.RecoveryPlanSHA || len(s.KnownBatches) > 0 || len(s.KnownPlans) > 1 || (len(s.KnownPlans) == 1 && s.KnownPlans[0] != s.RecoveryPlanID) {
+	if s.RecoveryCheckedAt.IsZero() || time.Since(s.RecoveryCheckedAt) > finishRecoveryAge || time.Until(s.RecoveryCheckedAt) > 30*time.Second || !s.RecoveryCheckedAt.After(newestIssued) || s.RecoveryIssued < 0 || s.RecoveryVerified != s.RecoveryIssued || issued != s.RecoveryIssued || planSHA != s.RecoveryPlanSHA {
+		return finishRecoveryStale
+	}
+	if len(s.KnownBatches) > 0 || len(s.KnownPlans) > 1 || (len(s.KnownPlans) == 1 && s.KnownPlans[0] != s.RecoveryPlanID) {
 		return finishEvidence
 	}
 	if s.ShutdownFailed || s.RecoveryError != nil || (s.LastError != nil && (s.HeldError == nil || *s.LastError != *s.HeldError)) {
