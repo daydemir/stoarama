@@ -141,8 +141,23 @@ WHERE m.clip_id IS NULL AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_clean
 			return nil, rows.Err()
 		}
 	}
-	for _, id := range r2RetireIncidentSources {
-		p.held[retireIdentity("raw", id)] = true
+	rows, err = q.Query(ctx, `SELECT kind,source_id FROM nas_cleanup_incident_files UNION SELECT 'raw',clip_id FROM nas_cleanup_incident_sources`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var kind string
+		var id int64
+		if err = rows.Scan(&kind, &id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		p.held[retireIdentity(kind, id)] = true
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
 	}
 	if m.Class == r2RetireOwnerAccepted {
 		return p, nil
