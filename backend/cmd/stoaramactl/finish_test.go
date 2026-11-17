@@ -6,8 +6,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -24,9 +22,9 @@ func finishFixture(t *testing.T, n int) (*pgxpool.Pool, string, string) {
  ALTER TABLE nas_cleanup_items ADD COLUMN updated_at timestamptz DEFAULT now();
  ALTER TABLE connections ADD COLUMN nas_storage_free_bytes bigint, ADD COLUMN nas_storage_reported_at timestamptz;
  CREATE TABLE nas_cleanup_batches(id bigint,mode text);
- ALTER TABLE connections ADD COLUMN nas_storage_client_version text NOT NULL DEFAULT '';
+ ALTER TABLE connections ADD COLUMN nas_storage_client_version text NOT NULL DEFAULT '',ADD COLUMN nas_storage_budget_at timestamptz;
  CREATE TABLE nas_inventory_files(connection_id bigint,clip_id bigint,relative_path text,state text,sha256 text,size_bytes bigint,verified_at timestamptz);
- UPDATE connections SET nas_storage_free_bytes=10000000000000,nas_storage_reported_at=now(),nas_storage_client_version='r2-copy-v5';
+ UPDATE connections SET nas_storage_free_bytes=10000000000000,nas_storage_reported_at=now(),nas_storage_client_version='r2-copy-v5',nas_storage_budget_at=now();
  ALTER TABLE nas_r2_copy_items ADD COLUMN IF NOT EXISTS completion text DEFAULT '', ADD COLUMN IF NOT EXISTS committed_bytes bigint DEFAULT 0, ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();`)
 	if err != nil {
 		t.Fatal(err)
@@ -419,14 +417,14 @@ func TestFinishLateTierRetainsAmbiguousTerminalDebits(t *testing.T) {
 	}
 }
 
-func TestFinishLateTierReceiptAgeAndInclusiveDebitBoundary(t *testing.T) {
+func TestFinishLateTierChallengeAgeAndInclusiveDebitBoundary(t *testing.T) {
 	pool, safety, copy := finishFixture(t, 1)
 	ctx := context.Background()
-	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_reported_at=now()-interval '91 seconds'`); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_budget_at=now()-interval '181 seconds'`); err != nil {
 		t.Fatal(err)
 	}
 	status := finishRun(t, pool, safety, copy)
-	if status.CleanupShouldRun || status.LateTierHold != finishLateReceiptStale || status.ImportedItems != 0 {
+	if status.CleanupShouldRun || status.LateTierHold != finishLateProofStale || status.ImportedItems != 0 {
 		t.Fatalf("old receipt spent: %+v", status)
 	}
 	cutoff := time.Date(2026, 11, 17, 0, 0, 0, 0, time.UTC)
@@ -441,46 +439,31 @@ func TestFinishLateTierReceiptAgeAndInclusiveDebitBoundary(t *testing.T) {
 	}
 }
 
-func TestFinishPublicationMarginTracksClientConstants(t *testing.T) {
-	source, err := os.ReadFile("../../../clients/nas-pull/stoarama_pull.py")
-	if err != nil {
-		t.Fatal(err)
-	}
-	read := func(pattern string) int {
-		t.Helper()
-		m := regexp.MustCompile(pattern).FindSubmatch(source)
-		if len(m) != 2 {
-			t.Fatalf("client sampling/HTTP contract changed: %s", pattern)
-		}
-		v, err := strconv.Atoi(string(m[1]))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return v
-	}
-	heartbeat := read(`(?m)^HEARTBEAT_INTERVAL_SEC = ([0-9]+)$`)
-	sampleFactor := read(`(?m)^STORAGE_TELEMETRY_MAX_AGE_SEC = HEARTBEAT_INTERVAL_SEC \* ([0-9]+)$`)
-	timeout := read(`(?m)^HEARTBEAT_TIMEOUT_SEC = ([0-9]+)$`)
-	if time.Duration(heartbeat*sampleFactor)*time.Second != finishClientStorageMaxAge || time.Duration(timeout)*time.Second != finishClientHeartbeatTimeout || finishPublicationMargin != finishClientStorageMaxAge+finishClientHeartbeatTimeout {
-		t.Fatal("client bounds changed: update publication margin and retention proof")
-	}
+func TestFinishServerBudgetTimeBoundary(t *testing.T) {
 	asOf := time.Date(2026, 11, 17, 0, 0, 0, 0, time.UTC)
-	if !finishLateReceiptFresh(asOf, asOf.Add(-70*time.Second)) || finishLateReceiptFresh(asOf, asOf.Add(-70*time.Second-time.Nanosecond)) {
-		t.Fatal("publication margin boundary incorrect")
+	if finishLateDebitWindow != 180*time.Second || !finishBudgetFresh(asOf, asOf.Add(-180*time.Second)) || finishBudgetFresh(asOf, asOf.Add(-180*time.Second-time.Nanosecond)) || finishBudgetFresh(asOf, asOf.Add(time.Nanosecond)) || finishBudgetFresh(asOf, time.Time{}) {
+		t.Fatal("server-issued budget boundary incorrect")
 	}
 }
 
-func TestFinishPublicationDelayCannotRespentOldSample(t *testing.T) {
-	pool, safety, copy := finishFixture(t, 1)
+func TestFinishBufferedV5BudgetUsesChallengeNotReceipt(t *testing.T) {
+	pool, safety, copy := finishFixture(t, 5)
 	ctx := context.Background()
-	// sample t=0, terminal t=5, payload t=90, receipt t=100, tick t=187.
-	// Receipt age87s alone passes90s, but age+M197s exceeds the180s window.
-	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_reported_at=now()-interval '87 seconds';INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item,state,updated_at) VALUES(13,'raw',100,repeat('a',64),repeat('b',64),'{"size_bytes":100}','verified',now()-interval '182 seconds')`); err != nil {
+	// Challenge t60, physical sample t64, buffered update accepted t200, tick t250.
+	// The240GB write at t65 is185s old and no longer reserved. Receipt is50s old,
+	// but matched challenge issuance is190s old, so this genuine v5 sample is held.
+	if _, err := pool.Exec(ctx, `UPDATE recording_clips SET size_bytes=60000000000;
+ UPDATE connections SET nas_storage_free_bytes=2500000000000,nas_storage_reported_at=clock_timestamp()-interval '50 seconds',nas_storage_budget_at=clock_timestamp()-interval '190 seconds';
+ INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item,state,updated_at) SELECT 13,'raw',id,repeat('a',64),repeat('b',64),'{"size_bytes":60000000000}','verified',clock_timestamp()-interval '185 seconds' FROM generate_series(100,103) id`); err != nil {
 		t.Fatal(err)
 	}
+	var debits int64
+	if err := pool.QueryRow(ctx, finishLateDebitsSQL, time.Now().Add(-finishLateDebitWindow)).Scan(&debits); err != nil || debits != 0 {
+		t.Fatal("timeline terminal debit did not expire")
+	}
 	status := finishRun(t, pool, safety, copy)
-	if status.ImportedItems != 0 || status.LateTierHold != finishLateReceiptStale || status.CleanupShouldRun {
-		t.Fatalf("stale pre-publication capacity spent: %+v", status)
+	if status.ImportedItems != 0 || status.LateTierHold != finishLateProofStale || status.CleanupShouldRun || status.NASSpaceClientVersion != api.NASStorageBudgetClientVersion {
+		t.Fatalf("buffered genuine v5 capacity spent: %+v", status)
 	}
 }
 
@@ -537,8 +520,8 @@ func TestFinishDelayedLegacyTimelinesNeedNewV5Storage(t *testing.T) {
 			}
 			// The real v5 producer samples after assembly: its new sample includes the
 			// 240GB write. The handler binding test proves only a real v5 storage update
-			// can assign this version, and omission preserves the old unknown binding.
-			if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_free_bytes=2260000000000,nas_storage_reported_at=clock_timestamp(),nas_storage_client_version=$1`, api.NASStorageBudgetClientVersion); err != nil {
+			// with a fresh matched challenge can assign this version; omission never promotes it.
+			if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_free_bytes=2260000000000,nas_storage_reported_at=clock_timestamp(),nas_storage_client_version=$1,nas_storage_budget_at=clock_timestamp()`, api.NASStorageBudgetClientVersion); err != nil {
 				t.Fatal(err)
 			}
 			status = finishRun(t, pool, safety, copy)

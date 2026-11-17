@@ -3,7 +3,7 @@
 `stoaramactl finish tick --safety FILE --copy-status FILE --status FILE` feeds
 keep28 raw metadata for account 47 / connection 13. It never changes cleanup,
 master switches, NAS files, R2 objects or deletion budgets. A1's
-`nas-r2-copy status --json` and A1b's reviewed `r2-copy-v5` send-time storage
+`nas-r2-copy status --json` and A1b's reviewed `r2-copy-v5` server-challenge storage
 boundary are required before installation. B and stitching are
 not wired into D-min.
 
@@ -33,25 +33,32 @@ regardless of verified-in-place/downloaded/blocked label or committed bytes.
 This also conservatively covers recently completed tiers 1/2 for at most T.
 It needs no publication ledger, completion-label inference or sample timestamp.
 
-Source: `clients/nas-pull/stoarama_pull.py:57-58` fixes the heartbeat at 30 seconds
-and maximum cached storage sample age at 3×30=90 seconds. The heartbeat HTTP timeout
-is 20 seconds (`:56`, used by `send_heartbeat` at `:24997`). The typed publication
-margin M is their sum, 110 seconds; treat a sample as taken at receipt minus M.
-Late-debit freshness requires `(tick − receipt) + M <= T`, where T remains 180
-seconds. This leaves a useful 70-second receipt window at the normal 30-second
-heartbeat cadence. The source-contract test fails if either client bound changes.
-Terminal debits use an inclusive `>=` cutoff, retaining writes exactly T old.
-The cleanup valve's separate freshness limit remains ten minutes. No client
-clock comparison, new payload field or fallback is involved.
+Budget freshness is proven on the database clock, independent of network delay
+or client lifetime. Every successful heartbeat stores a new random 64-hex nonce
+and its server issuance time, returned as `storage_challenge_nonce`. The v5 client
+consumes that nonce before the next actual storage attempt, samples physically
+after receiving it, and echoes `storage.challenge_nonce`. Without a nonce it
+still sends fresh display-only storage; no budget is granted for that cycle.
 
-Storage budget eligibility is server-authored in migration
-`0203_nas_storage_client_binding.sql`. Only an actual available storage update
-from exact literal `r2-copy-v5` receives that binding. Missing storage preserves
-the previous sample's binding; unavailable/legacy storage clears it. A later v5
-heartbeat without storage cannot promote an older v4 sample. The CLI reads this
-sample binding, not the latest `connections.client_version`; all old/unknown
-bindings withhold late admission with a typed reason. Regular legacy telemetry
-and the cleanup valve remain readable.
+Under the existing connection row lock, the storage UPDATE checks the exact
+current nonce, exact v5 literal and nonfuture issuance no older than 180 seconds.
+It atomically saves that **matched old issuance** in `nas_storage_budget_at`, binds
+the sample to v5, and rotates the next challenge. Rotating or delivering a later
+response cannot refresh an earlier sample. Missing, expired or mismatched nonces
+update display storage normally but clear budget eligibility. A lost response
+or replay therefore gives a normal no-budget cycle; the next response provides
+a fresh challenge. Omitted storage preserves the earlier sample's proof/time;
+unavailable or legacy storage clears it. Old rows start without any proof.
+
+Migration `0203_nas_storage_client_binding.sql` stores the challenge and accepted
+sample separately. The CLI requires `nas_storage_client_version='r2-copy-v5'`
+and `0 <= DB clock - nas_storage_budget_at <= T=180s`. T is shared server policy
+(`api.NASStorageBudgetMaxAge`), with an inclusive terminal-debit cutoff. A delayed
+complete request accepted at t200 with challenge t60 still has budget time t60;
+a tick at t250 refuses it. There is no M/receipt arithmetic, HMAC secret, client
+clock comparison or fallback. The child's 20-second watchdog limits wasted work;
+it does not establish sample freshness. The separate cleanup valve retains its
+ten-minute storage-receipt bound. Holds never grant cleanup authority.
 
 Late budget subtracts these full-size reservations and the existing 16 MiB range
 reserve from free bytes above the unchanged floor. Status includes typed
@@ -156,9 +163,10 @@ this decision; an empty queue is not cleanup authority.
 
 Sole controller, at a natural boundary after the combined D/A1b boundary review:
 A1 + #526 and fresh v4 observation come first. Deploy the server with migration
-0203 and A1b's exact v5 admission support before releasing the reviewed v5 client.
-Only then verify a fresh v5 heartbeat and `nas_storage_client_version='r2-copy-v5'`
-on its actual storage receipt, retarget the collector explicitly to v5, and
+0203, #535's COPY lease fix and A1b's exact v5 admission support before releasing the reviewed v5 client.
+Only then verify a completed v5 nonce exchange, `nas_storage_client_version='r2-copy-v5'`
+and a fresh `nas_storage_budget_at` bound to the matched challenge, never re-stamped
+to the storage receipt, retarget the collector explicitly to v5, and
 install D. A v4 observation packet is not late-budget eligible.
 
 1. Build the merged CLI on Jelly using `darma storage check` then

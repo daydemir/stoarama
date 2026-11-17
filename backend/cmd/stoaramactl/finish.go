@@ -24,12 +24,8 @@ const finishTarget = 10000
 const finishEvidenceAge = 5 * time.Minute
 const finishSpaceAge time.Duration = 10 * time.Minute
 
-// Client source: stoarama_pull.py:57-58 (30s*3 sample age), :56 and
-// send_heartbeat():24997 (20s HTTP timeout). The source-contract test pins both.
-const finishClientStorageMaxAge time.Duration = 90 * time.Second
-const finishClientHeartbeatTimeout time.Duration = 20 * time.Second
-const finishPublicationMargin time.Duration = finishClientStorageMaxAge + finishClientHeartbeatTimeout
-const finishLateDebitWindow time.Duration = 2 * finishClientStorageMaxAge
+// The accepted sample uses the matched server challenge's issuance time.
+const finishLateDebitWindow time.Duration = api.NASStorageBudgetMaxAge
 const finishCleanupHeadroom int64 = 300_000_000_000
 const finishRecoveryAge = 7 * time.Hour // six-hour refresh plus verification/scheduling margin
 const finishLock int64 = 7343226011199
@@ -91,11 +87,12 @@ const (
 	finishLateSpaceUnknown  finishLateHold = "nas_space_evidence_unavailable"
 	finishLateSpaceLow      finishLateHold = "nas_headroom_below_threshold"
 	finishLateBudgetHeld    finishLateHold = "next_download_exceeds_budget"
-	finishLateReceiptStale  finishLateHold = "nas_space_receipt_too_old_for_budget"
+	finishLateProofStale    finishLateHold = "nas_storage_budget_proof_stale"
 	finishLateClientUnknown finishLateHold = "nas_storage_client_not_budget_eligible"
 )
 
 type finishStatus struct {
+	NASStorageBudgetAt          *time.Time       `json:"nas_storage_budget_at,omitempty"`
 	NASSpaceClientVersion       string           `json:"nas_storage_client_version"`
 	ImportedHistoricalInventory int              `json:"imported_historical_inventory"`
 	ImportedEarlyUnknown        int              `json:"imported_early_unknown"`
@@ -332,12 +329,12 @@ func finishDepth(ctx context.Context, pool *pgxpool.Pool, status *finishStatus) 
 // Inclusive cutoff retains a terminal write completed exactly T ago.
 const finishLateDebitsSQL = `SELECT coalesce(sum((item->>'size_bytes')::bigint),0) FROM nas_r2_copy_items WHERE connection_id=13 AND kind='raw' AND (state IN ('pending','leased') OR (state IN ('verified','blocked') AND updated_at >= $1))`
 
-func finishLateReceiptFresh(asOf, receipt time.Time) bool {
-	return asOf.Sub(receipt)+finishPublicationMargin <= finishLateDebitWindow
+func finishBudgetFresh(asOf, issued time.Time) bool {
+	return !issued.IsZero() && !issued.After(asOf) && asOf.Sub(issued) <= finishLateDebitWindow
 }
 func finishCleanupValve(ctx context.Context, pool *pgxpool.Pool, status *finishStatus) error {
 	status.CleanupShouldRun = false
-	if err := pool.QueryRow(ctx, `SELECT nas_storage_free_bytes,nas_storage_reported_at,nas_storage_client_version,clock_timestamp() FROM connections WHERE id=13`).Scan(&status.NASFreeBytes, &status.NASSpaceReportedAt, &status.NASSpaceClientVersion, &status.NASSpaceCheckedAt); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT nas_storage_free_bytes,nas_storage_reported_at,nas_storage_client_version,nas_storage_budget_at,clock_timestamp() FROM connections WHERE id=13`).Scan(&status.NASFreeBytes, &status.NASSpaceReportedAt, &status.NASSpaceClientVersion, &status.NASStorageBudgetAt, &status.NASSpaceCheckedAt); err != nil {
 		return err
 	}
 	status.CleanupReason = "nas_space_heartbeat_missing"
@@ -448,8 +445,8 @@ func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath st
 				status.LateTierHold = finishLateClientUnknown
 				return status, nil
 			}
-			if !finishLateReceiptFresh(status.NASSpaceCheckedAt, *status.NASSpaceReportedAt) {
-				status.LateTierHold = finishLateReceiptStale
+			if status.NASStorageBudgetAt == nil || !finishBudgetFresh(status.NASSpaceCheckedAt, *status.NASStorageBudgetAt) {
+				status.LateTierHold = finishLateProofStale
 				return status, nil
 			}
 			if e = pool.QueryRow(ctx, finishLateDebitsSQL, status.NASSpaceCheckedAt.Add(-finishLateDebitWindow)).Scan(&status.QueueReservedBytes); e != nil {
