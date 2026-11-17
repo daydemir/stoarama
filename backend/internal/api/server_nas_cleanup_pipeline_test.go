@@ -33,6 +33,10 @@ func TestNASCleanupFreshPermitClientServer(t *testing.T) {
 	testNASCleanupPipelineClientServer(t, true, nasCleanupFreshPermitClientVersion)
 }
 
+func TestNASR2CopyV4FreshPermitClientServer(t *testing.T) {
+	testNASCleanupPipelineClientServer(t, true, nasCleanupR2CopyProgressClientVersion)
+}
+
 func TestNASCleanupPermitTransportClientServer(t *testing.T) {
 	testNASCleanupPipelineClientServer(t, true, nasCleanupPermitTransportClientVersion)
 }

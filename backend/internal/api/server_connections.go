@@ -28,7 +28,7 @@ var (
 	pullReleasePathRe          = regexp.MustCompile(`^/api/v1/account/recordings/\d+/clips/\d+/release$`)
 	pullJoinedDownloadPathRe   = regexp.MustCompile(`^/api/v1/account/joined/\d+/download$`)
 	pullUploadProbeResultRe    = regexp.MustCompile(`^/api/v1/account/connections/upload-probe/\d+/result$`)
-	pullR2CopyTaskRe           = regexp.MustCompile(`^/api/v1/account/connections/r2-copy/\d+/(checkpoint|range|result)$`)
+	pullR2CopyTaskRe           = regexp.MustCompile(`^/api/v1/account/connections/r2-copy/\d+/(checkpoint|range|result|block)$`)
 	pullRestoreResultRe        = regexp.MustCompile(`^/api/v1/account/connections/nas-restore/\d+/result$`)
 	pullCleanupResultRe        = regexp.MustCompile(`^/api/v1/account/connections/cleanup/\d+/(observe|result|reconcile)$`)
 	pullSelectedVerifyResultRe = regexp.MustCompile(`^/api/v1/account/connections/selected-verify/\d+/result$`)

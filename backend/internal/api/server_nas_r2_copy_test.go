@@ -22,7 +22,7 @@ func copyTestFixture(t *testing.T) (*cleanupFixture, NASR2CopyItem) {
 	f := newCleanupFixture(t, 1)
 	f.useClientVersion(nasCleanupProofClientVersion)
 
-	for _, name := range []string{"0174_r2_object_retirements.sql", "0182_r2_retirement_reservations.sql", "0193_nas_r2_copy.sql"} {
+	for _, name := range []string{"0174_r2_object_retirements.sql", "0182_r2_retirement_reservations.sql", "0193_nas_r2_copy.sql", "0200_nas_r2_copy_progress.sql"} {
 		b, err := os.ReadFile("../../../infra/sql/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
@@ -64,7 +64,7 @@ func copyCall(f *cleanupFixture, action string, id int64, body any) *httptest.Re
 	ctx = context.WithValue(ctx, chi.RouteCtxKey, route)
 	req = req.WithContext(ctx)
 	out := httptest.NewRecorder()
-	handlers := map[string]http.HandlerFunc{"lease": f.s.handleNASR2CopyLease, "checkpoint": f.s.handleNASR2CopyCheckpoint, "range": f.s.handleNASR2CopyRange, "result": f.s.handleNASR2CopyResult}
+	handlers := map[string]http.HandlerFunc{"lease": f.s.handleNASR2CopyLease, "checkpoint": f.s.handleNASR2CopyCheckpoint, "range": f.s.handleNASR2CopyRange, "result": f.s.handleNASR2CopyResult, "block": f.s.handleNASR2CopyBlock}
 	f.s.confineAccountScope(f.s.fenceNASDelivery(handlers[action])).ServeHTTP(out, req)
 	return out
 }
@@ -105,11 +105,23 @@ func TestNASR2CopyDefaultOffAndInventory(t *testing.T) {
 		URL     string            `json:"url"`
 		Headers map[string]string `json:"headers"`
 		Length  int64             `json:"length"`
+		RangeID string            `json:"range_id"`
 	}
 	if err := json.Unmarshal(out.Body.Bytes(), &grant); err != nil || grant.Length != i.SizeBytes || grant.Headers["Range"] != fmt.Sprintf("bytes=0-%d", i.SizeBytes-1) || grant.Headers["If-Match"] == "" {
 		t.Fatalf("grant %s %v", out.Body, err)
 	}
 
+	completed := req
+	completed.RangeID = grant.RangeID
+	if out := copyCall(f, "checkpoint", task.ID, completed); out.Code != 200 {
+		t.Fatalf("completion %d %s", out.Code, out.Body)
+	}
+	if out := copyCall(f, "checkpoint", task.ID, completed); out.Code != 409 {
+		t.Fatal("range completion counted twice")
+	}
+	req.Completion = NASR2CopyDownloaded
+	req.DownloadedBytes = i.SizeBytes
+	req.CommittedBytes = i.SizeBytes
 	if out := copyCall(f, "result", task.ID, req); out.Code != 409 {
 		t.Fatal("result without inventory")
 	}
@@ -124,6 +136,11 @@ func TestNASR2CopyDefaultOffAndInventory(t *testing.T) {
 	f.pool.QueryRow(f.ctx, `SELECT state FROM nas_r2_copy_items WHERE id=$1`, task.ID).Scan(&state)
 	if state != "verified" {
 		t.Fatal(state)
+	}
+	var completion string
+	var downloaded, committed int64
+	if err := f.pool.QueryRow(f.ctx, `SELECT completion,downloaded_bytes,committed_bytes FROM nas_r2_copy_items WHERE id=$1`, task.ID).Scan(&completion, &downloaded, &committed); err != nil || completion != "downloaded" || downloaded != i.SizeBytes || committed != i.SizeBytes {
+		t.Fatalf("durable counters %s %d %d %v", completion, downloaded, committed, err)
 	}
 	f.bucket.mu.Lock()
 	defer f.bucket.mu.Unlock()
@@ -230,7 +247,7 @@ func TestNASR2CopyAliasRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := copyCall(f, "lease", 0, nasR2CopyControl{FreeBytes: NASR2CopyFloor + 1e9})
-	if out.Code != 409 {
+	if out.Code != 200 || !strings.Contains(out.Body.String(), `"reason":"source_changed"`) {
 		t.Fatalf("path alias accepted: %d %s", out.Code, out.Body)
 	}
 }
@@ -482,5 +499,127 @@ func TestNASR2CopyScopedOtherConnectionDenied(t *testing.T) {
 	f.s.confineAccountScope(f.s.fenceNASDelivery(http.HandlerFunc(f.s.handleNASR2CopyLease))).ServeHTTP(out, req)
 	if out.Code != 403 || !strings.Contains(out.Body.String(), "connection 13") {
 		t.Fatalf("foreign valid pull key response %d %s", out.Code, out.Body)
+	}
+}
+
+func TestNASR2CopyBlockedItemAdvancesAndProtectsExactKey(t *testing.T) {
+	f, i := copyTestFixture(t)
+	f.s.cfg.NASR2CopyEnabled = true
+	queueCopySources(t, f, i)
+	task := copyLease(t, f)
+	for _, req := range []nasR2CopyControl{{Token: "wrong", Reason: NASR2CopyChecksumMismatch}, {Token: task.Token, Reason: "memory"}} {
+		out := copyCall(f, "block", task.ID, req)
+		if out.Code == 200 {
+			t.Fatal("invalid block accepted")
+		}
+	}
+	// Resource pressure and source changes cannot prevent an owned conflict report.
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_r2_copy_items SET lease_expires_at=now()-interval '1 second' WHERE id=$1`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	out := copyCall(f, "block", task.ID, nasR2CopyControl{Token: task.Token, Reason: NASR2CopyChecksumMismatch})
+	if out.Code != 200 {
+		t.Fatalf("block %d %s", out.Code, out.Body)
+	}
+	next := copyLease(t, f)
+	if next.ID <= task.ID {
+		t.Fatal("queue stuck on blocked item")
+	}
+	var reason string
+	var token *string
+	if err := f.pool.QueryRow(f.ctx, `SELECT blocked_reason,lease_token FROM nas_r2_copy_items WHERE id=$1 AND state='blocked'`, task.ID).Scan(&reason, &token); err != nil || reason != "checksum_mismatch" || token != nil {
+		t.Fatalf("latch %s %v %v", reason, token, err)
+	}
+	// An identical manifest import preserves the latch; no ordinary update clears it.
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_r2_copy_items SET source_id=source_id WHERE id=$1`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_r2_copy_items SET state='pending' WHERE id=$1`, task.ID); err == nil {
+		t.Fatal("latch cleared")
+	}
+	// Stale exact custody is irrelevant: the exact key cannot acquire retirement intent.
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO nas_inventory_files VALUES(13,$1,$2,$3,$4,'present',now(),now(),$2||'.stoarama.json',100,repeat('b',64))`, i.SourceID, i.RelativePath, i.SHA256, i.SizeBytes); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) VALUES('raw',9999,$1,$2,$3,$4,repeat('a',64))`, i.Bucket, i.ObjectKey, i.SizeBytes, i.SHA256); err == nil || !strings.Contains(err.Error(), "COPY custody") {
+		t.Fatalf("blocked key reservation: %v", err)
+	}
+	if out := copyCall(f, "result", task.ID, nasR2CopyControl{Token: task.Token, FreeBytes: NASR2CopyFloor + 1e9}); out.Code == 200 {
+		t.Fatal("blocked result accepted")
+	}
+}
+
+func TestNASR2CopyIdentityFailureMovesQueueButTransportRetries(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		t.Run(fmt.Sprint(missing), func(t *testing.T) {
+			f, i := copyTestFixture(t)
+			f.s.cfg.NASR2CopyEnabled = true
+			queueCopySources(t, f, i)
+			f.bucket.mu.Lock()
+			if missing {
+				delete(f.bucket.objects, i.ObjectKey)
+			} else {
+				f.bucket.objects[i.ObjectKey] = []byte("wrong identity")
+			}
+			f.bucket.mu.Unlock()
+			out := copyCall(f, "lease", 0, nasR2CopyControl{FreeBytes: NASR2CopyFloor + 1e9})
+			if out.Code != 200 || !strings.Contains(out.Body.String(), `"reason":"r2_identity"`) {
+				t.Fatalf("identity block %d %s", out.Code, out.Body)
+			}
+			f.bucket.put(i.ObjectKey, []byte("verified kept R2 footage"))
+			if next := copyLease(t, f); next.Item.SourceID == i.SourceID {
+				t.Fatal("blocked head re-leased")
+			}
+		})
+	}
+}
+
+func TestNASR2CopyTransientHEADIsVisibleAndResumable(t *testing.T) {
+	f, _ := copyTestFixture(t)
+	f.s.cfg.NASR2CopyEnabled = true
+	f.bucket.mu.Lock()
+	f.bucket.headFailures = 1
+	f.bucket.mu.Unlock()
+	out := copyCall(f, "lease", 0, nasR2CopyControl{FreeBytes: NASR2CopyFloor + 1e9})
+	if out.Code != 503 {
+		t.Fatalf("transient HEAD %d %s", out.Code, out.Body)
+	}
+	task := copyLease(t, f)
+	if task.ID != 1 {
+		t.Fatal("transient item lost")
+	}
+}
+func TestNASR2CopyFailedBlockCommitNeverAcknowledges(t *testing.T) {
+	f, _ := copyTestFixture(t)
+	f.s.cfg.NASR2CopyEnabled = true
+	task := copyLease(t, f)
+	if _, err := f.pool.Exec(f.ctx, `CREATE FUNCTION fail_copy_block() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture commit failure'; END $$; CREATE CONSTRAINT TRIGGER fail_copy_block AFTER UPDATE ON nas_r2_copy_items DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_copy_block()`); err != nil {
+		t.Fatal(err)
+	}
+	out := copyCall(f, "block", task.ID, nasR2CopyControl{Token: task.Token, Reason: NASR2CopyChecksumMismatch})
+	if out.Code != 503 {
+		t.Fatalf("failed commit acknowledged %d %s", out.Code, out.Body)
+	}
+	var state string
+	if err := f.pool.QueryRow(f.ctx, `SELECT state FROM nas_r2_copy_items WHERE id=$1`, task.ID).Scan(&state); err != nil || state != "leased" {
+		t.Fatalf("rollback %s %v", state, err)
+	}
+}
+
+func TestNASR2CopyDatabaseLookupFailureDoesNotBlockIdentity(t *testing.T) {
+	f, _ := copyTestFixture(t)
+	f.s.cfg.NASR2CopyEnabled = true
+	if _, err := f.pool.Exec(f.ctx, `ALTER TABLE recording_clips RENAME TO unavailable_clips`); err != nil {
+		t.Fatal(err)
+	}
+	out := copyCall(f, "lease", 0, nasR2CopyControl{FreeBytes: NASR2CopyFloor + 1e9})
+	if out.Code != 503 {
+		t.Fatalf("lookup error %d %s", out.Code, out.Body)
+	}
+	if _, err := f.pool.Exec(f.ctx, `ALTER TABLE unavailable_clips RENAME TO recording_clips`); err != nil {
+		t.Fatal(err)
+	}
+	if task := copyLease(t, f); task.ID != 1 {
+		t.Fatal("lookup failure blocked source")
 	}
 }

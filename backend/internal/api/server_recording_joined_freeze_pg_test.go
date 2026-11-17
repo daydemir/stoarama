@@ -37,6 +37,8 @@ func requireJoinedTestReplicationRole(t *testing.T, pool *pgxpool.Pool) {
 
 var joinedMigrationNames = []string{
 	"0202_r2_incident_roster.sql",
+	// Progress depends on the deferred COPY queue; apply both in the final chain.
+	"0200_nas_r2_copy_progress.sql",
 	"0198_r2_blocked_writes.sql",
 	"0196_r2_capture_process_admission.sql",
 	"0195_r2_joined_writer_retirement.sql",

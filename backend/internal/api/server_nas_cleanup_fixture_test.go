@@ -32,6 +32,7 @@ type fakeCleanupBucket struct {
 	gets          int
 	heads         int
 	headDelay     time.Duration
+	headFailures  int
 	getDelay      time.Duration
 	getFailures   int
 	getShortReads int
@@ -58,6 +59,10 @@ func (b *fakeCleanupBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		b.heads++
+		fail = b.headFailures > 0
+		if b.headFailures > 0 {
+			b.headFailures--
+		}
 	}
 	b.mu.Unlock()
 	select {
