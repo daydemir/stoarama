@@ -2,7 +2,9 @@
 -- Offline controller descriptors pin RAW source IDs, never cleanup item IDs.
 -- Canonical descriptors are immutable VALUES; no runtime roster writer exists.
 DO $$ BEGIN
- IF NOT pg_try_advisory_xact_lock(7343226011173) THEN
+ -- Migrations may share this guard; active/new appliers require it exclusive.
+ -- The admission locks below still serialize the actual roster changes.
+ IF NOT pg_try_advisory_xact_lock_shared(7343226011173) THEN
   RAISE EXCEPTION 'R2 retirement apply is active; incident migration refused';
  END IF;
 END $$;
