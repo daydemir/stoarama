@@ -3004,7 +3004,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             self.assertEqual(report["seams"][0]["verdict"], "ambiguous")
             self.assertEqual(report["seams"][0]["reason"], "continuous_source_pts_unavailable")
 
-    def test_native_stitch_real_reset0_bframes_aac_keeps_audio_axis_fail_closed(self):
+    def test_native_stitch_real_reset0_bframes_aac_keeps_unproven_video_axis_fail_closed(self):
         ffmpeg = shutil.which("ffmpeg")
         ffprobe = shutil.which("ffprobe")
         if not ffmpeg or not ffprobe:
@@ -3070,9 +3070,20 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             self.assertEqual(report["nas_byte_decode_status"], "passed")
             self.assertEqual(report["native_run_concat_status"], "passed")
             self.assertEqual(report["within_run_frame_adjacency_status"], "unknown")
-            self.assertEqual(report["within_run_audio_sample_continuity_status"], "unknown")
+            # FFmpeg versions can retain enough AAC packet timing to prove
+            # sample adjacency. That independent proof cannot establish video
+            # adjacency or elevate the whole window to passed.
+            audio = report["audio_seams"][0]
+            if audio["verdict"] == "exact":
+                self.assertEqual(audio["previous_end_sample"], audio["next_start_sample"])
+                self.assertGreater(audio["previous_sample_count"], 0)
+                self.assertGreater(audio["next_sample_count"], 0)
+                self.assertEqual(audio["sample_rate"], 48000)
+                self.assertEqual(report["within_run_audio_sample_continuity_status"], "passed")
+            else:
+                self.assertEqual(audio["verdict"], "ambiguous")
+                self.assertEqual(report["within_run_audio_sample_continuity_status"], "unknown")
             self.assertEqual(report["window_continuity_status"], "unknown")
-            self.assertEqual(report["audio_seams"][0]["verdict"], "ambiguous")
 
     def test_native_stitch_timeline_tracks_internal_without_edge_gaps(self):
         utc = datetime.timezone.utc
