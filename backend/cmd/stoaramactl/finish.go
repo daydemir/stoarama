@@ -26,16 +26,17 @@ const finishLock int64 = 7343226011199
 type finishStop string
 
 const (
-	finishEvidence    finishStop = "evidence_unavailable"
-	finishRecovery    finishStop = "cleanup_recovery_problems"
-	finishUnknownPlan finishStop = "unknown_enabled_cleanup"
-	finishMismatch    finishStop = "copy_mismatch_latched"
-	finishShutdown    finishStop = "shutdown_or_recovery_failed"
-	finishMaster      finishStop = "deletion_master_mismatch"
-	finishDatabase    finishStop = "database_unavailable"
-	finishImport      finishStop = "manifest_import_failed"
-	finishBusy        finishStop = "tick_already_running"
-	finishOutput      finishStop = "status_write_failed"
+	finishEvidence        finishStop = "evidence_unavailable"
+	finishRecovery        finishStop = "cleanup_recovery_problems"
+	finishUnknownPlan     finishStop = "unknown_enabled_cleanup"
+	finishMismatch        finishStop = "copy_mismatch_latched"
+	finishShutdown        finishStop = "shutdown_or_recovery_failed"
+	finishMaster          finishStop = "deletion_master_mismatch"
+	finishDatabase        finishStop = "database_unavailable"
+	finishImport          finishStop = "manifest_import_failed"
+	finishBusy            finishStop = "tick_already_running"
+	finishOutput          finishStop = "status_write_failed"
+	finishListingConflict finishStop = "listing_size_conflict"
 )
 
 func (s finishStop) Error() string { return string(s) }
@@ -49,7 +50,15 @@ type finishSafety struct {
 	RecoveryIssued    int64            `json:"recovery_issued_items"`
 	RecoveryVerified  int64            `json:"recovery_verified_items"`
 	ShutdownFailed    bool             `json:"shutdown_or_recovery_failed"`
-	RecoveryError     string           `json:"recovery_error"`
+	RecoveryError     *string          `json:"recovery_error"`
+	RecoveryPlanID    int64            `json:"recovery_plan_id"`
+	RecoveryPlanSHA   string           `json:"recovery_plan_sha256"`
+	LastError         *string          `json:"last_error"`
+	HeldError         *string          `json:"controller_held_error"`
+	LocalMismatch     int64            `json:"local_copy_mismatch_latched"`
+	LocalCheckedAt    time.Time        `json:"local_copy_checked_at"`
+	HoldsCheckedAt    time.Time        `json:"holds_checked_at"`
+	MasterCheckedAt   time.Time        `json:"master_checked_at"`
 	KnownPlans        []int64          `json:"known_enabled_plans"`
 	KnownBatches      []int64          `json:"known_enabled_batches"`
 	Master            bool             `json:"master_deletion_enabled"`
@@ -69,18 +78,20 @@ type finishCopy struct {
 	MismatchLatched int64                  `json:"mismatch_latched"`
 }
 type finishStatus struct {
-	Schema            string           `json:"schema"`
-	UpdatedAt         time.Time        `json:"updated_at"`
-	Stop              finishStop       `json:"stop_reason,omitempty"`
-	QueueDepth        int64            `json:"queue_depth"`
-	ItemsPerMinute    float64          `json:"items_per_min"`
-	Copy              finishCopy       `json:"copy"`
-	Holds             map[string]int64 `json:"holds_by_reason"`
-	CleanupShouldRun  bool             `json:"cleanup_should_run"`
-	CleanupReason     string           `json:"cleanup_reason"`
-	ImportedItems     int              `json:"imported_items"`
-	ImportedManifests int              `json:"imported_manifests"`
-	Exhausted         bool             `json:"candidates_exhausted"`
+	Schema             string           `json:"schema"`
+	UpdatedAt          time.Time        `json:"updated_at"`
+	Stop               finishStop       `json:"stop_reason,omitempty"`
+	QueueDepth         int64            `json:"queue_depth"`
+	ItemsPerMinute     float64          `json:"items_per_min"`
+	Copy               finishCopy       `json:"copy"`
+	Holds              map[string]int64 `json:"holds_by_reason"`
+	CleanupShouldRun   bool             `json:"cleanup_should_run"`
+	CleanupReason      string           `json:"cleanup_reason"`
+	ImportedItems      int              `json:"imported_items"`
+	ImportedManifests  int              `json:"imported_manifests"`
+	ListingConflicts   int64            `json:"listing_size_conflicts"`
+	ListingConflictIDs []int64          `json:"listing_size_conflict_source_ids"`
+	Exhausted          bool             `json:"candidates_exhausted"`
 }
 
 func finishFresh(t, now time.Time) bool {
@@ -102,7 +113,7 @@ func finishReadJSON(path string, required []string, out any) error {
 		return finishEvidence
 	}
 	for _, key := range required {
-		if v, ok := fields[key]; !ok || bytes.Equal(bytes.TrimSpace(v), []byte("null")) {
+		if v, ok := fields[key]; !ok || (key != "recovery_error" && key != "last_error" && key != "controller_held_error" && bytes.Equal(bytes.TrimSpace(v), []byte("null"))) {
 			return finishEvidence
 		}
 	}
@@ -114,7 +125,7 @@ func finishReadJSON(path string, required []string, out any) error {
 func finishReadEvidence(safetyPath, copyPath string) (finishSafety, finishCopy, error) {
 	var s finishSafety
 	var c finishCopy
-	if err := finishReadJSON(safetyPath, []string{"updated_at", "recovery_problems", "recovery_checked_at", "recovery_issued_items", "recovery_verified_items", "shutdown_or_recovery_failed", "recovery_error", "known_enabled_plans", "known_enabled_batches", "master_deletion_enabled", "expected_deletion_enabled", "holds_by_reason"}, &s); err != nil {
+	if err := finishReadJSON(safetyPath, []string{"updated_at", "recovery_problems", "recovery_checked_at", "recovery_issued_items", "recovery_verified_items", "recovery_plan_id", "recovery_plan_sha256", "last_error", "controller_held_error", "local_copy_mismatch_latched", "local_copy_checked_at", "holds_checked_at", "master_checked_at", "shutdown_or_recovery_failed", "recovery_error", "known_enabled_plans", "known_enabled_batches", "master_deletion_enabled", "expected_deletion_enabled", "holds_by_reason"}, &s); err != nil {
 		return s, c, err
 	}
 	if err := finishReadJSON(copyPath, []string{"schema", "updated_at", "queue_depth", "verified_in_place", "downloaded", "downloaded_bytes", "committed_bytes", "blocked", "blocked_by_reason", "mismatch_latched"}, &c); err != nil {
@@ -146,20 +157,21 @@ func finishCheck(ctx context.Context, pool *pgxpool.Pool, s finishSafety, c fini
 	if s.RecoveryProblems > 0 {
 		return finishRecovery
 	}
-	if !finishFresh(s.RecoveryCheckedAt, time.Now()) || s.RecoveryIssued < 0 || s.RecoveryVerified != s.RecoveryIssued {
+	if !finishFresh(s.RecoveryCheckedAt, time.Now()) || !finishFresh(s.LocalCheckedAt, time.Now()) || !finishFresh(s.HoldsCheckedAt, time.Now()) || !finishFresh(s.MasterCheckedAt, time.Now()) || s.RecoveryIssued < 0 || s.RecoveryVerified != s.RecoveryIssued || s.RecoveryPlanID <= 0 || len(s.RecoveryPlanSHA) != 64 || s.LocalMismatch < 0 {
 		return finishEvidence
 	}
 	var issued int64
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE p.connection_id=13 AND i.delete_ever_issued`).Scan(&issued); err != nil {
+	var planSHA string
+	if err := pool.QueryRow(ctx, `SELECT p.plan_sha256,(SELECT count(*) FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued) FROM nas_cleanup_plans p WHERE p.id=$1 AND p.connection_id=13`, s.RecoveryPlanID).Scan(&planSHA, &issued); err != nil {
 		return finishDatabase
 	}
-	if issued != s.RecoveryIssued {
+	if issued != s.RecoveryIssued || planSHA != s.RecoveryPlanSHA || len(s.KnownBatches) > 0 || len(s.KnownPlans) > 1 || (len(s.KnownPlans) == 1 && s.KnownPlans[0] != s.RecoveryPlanID) {
 		return finishEvidence
 	}
-	if s.ShutdownFailed || s.RecoveryError != "" {
+	if s.ShutdownFailed || s.RecoveryError != nil || (s.LastError != nil && (s.HeldError == nil || *s.LastError != *s.HeldError)) {
 		return finishShutdown
 	}
-	if c.MismatchLatched > 0 {
+	if c.MismatchLatched > 0 || s.LocalMismatch > 0 {
 		return finishMismatch
 	}
 	var unknown bool
@@ -178,13 +190,12 @@ func finishCheck(ctx context.Context, pool *pgxpool.Pool, s finishSafety, c fini
 
 // Listing is a scheduling hint, never custody proof. A conflicting path/size
 // observation is held out of the absent tier for reconciliation.
-const finishCandidatesSQL = `WITH windows AS (
+const finishWindowSQL = `WITH windows AS (
  SELECT * FROM jsonb_to_recordset($1::jsonb) AS w(stream_id bigint,timezone text,start_at timestamptz,end_at timestamptz)
 ), generation AS (
  SELECT generation FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL ORDER BY started_at DESC,generation DESC LIMIT 1
-)
-SELECT c.id,c.recording_id,r.stream_id,c.bucket,c.object_key,c.display_path,c.size_bytes,lower(c.sha256),c.clip_start_at,c.clip_end_at,
- EXISTS(SELECT 1 FROM nas_listing_files f WHERE f.connection_id=13 AND f.generation=(SELECT generation FROM generation) AND f.relative_path=c.display_path AND f.size_bytes=c.size_bytes) AS likely_present
+)`
+const finishEligibleSQL = `
 FROM recording_clips c JOIN recordings r ON r.id=c.recording_id AND r.account_id=47 JOIN windows w ON w.stream_id=r.stream_id LEFT JOIN streams s ON s.id=r.stream_id
 WHERE c.purged_at IS NULL AND c.clip_start_at<w.end_at AND c.clip_end_at>w.start_at AND c.clip_end_at>c.clip_start_at
  AND coalesce(nullif(s.local_timezone,''),r.cron_timezone,'')=w.timezone
@@ -193,11 +204,13 @@ WHERE c.purged_at IS NULL AND c.clip_start_at<w.end_at AND c.clip_end_at>w.start
  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_reserved_files f WHERE f.kind='raw' AND f.source_id=c.id)
  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id WHERE h.clip_id=c.id AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued)))
  AND NOT EXISTS(SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='raw' AND x.source_id=c.id)
- AND NOT EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.kind='raw' AND x.source_id=c.id)
- AND NOT EXISTS(SELECT 1 FROM nas_listing_files f WHERE f.connection_id=13 AND f.generation=(SELECT generation FROM generation) AND f.relative_path=c.display_path AND f.size_bytes<>c.size_bytes)
-ORDER BY likely_present DESC,c.id LIMIT $3`
+ AND NOT EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.kind='raw' AND x.source_id=c.id)`
+const finishListingConflictSQL = `EXISTS(SELECT 1 FROM nas_listing_files f WHERE f.connection_id=13 AND f.generation=(SELECT generation FROM generation) AND f.relative_path=c.display_path AND f.size_bytes<>c.size_bytes)`
+const finishCandidatesSQL = finishWindowSQL + `
+SELECT c.id,c.recording_id,r.stream_id,c.bucket,c.object_key,c.display_path,c.size_bytes,lower(c.sha256),c.clip_start_at,c.clip_end_at,
+ EXISTS(SELECT 1 FROM nas_listing_files f WHERE f.connection_id=13 AND f.generation=(SELECT generation FROM generation) AND f.relative_path=c.display_path AND f.size_bytes=c.size_bytes) AS likely_present` + finishEligibleSQL + ` AND NOT ` + finishListingConflictSQL + ` ORDER BY likely_present DESC,c.id LIMIT $3`
 
-func finishCandidates(ctx context.Context, pool *pgxpool.Pool, limit int) ([]api.NASR2CopyItem, error) {
+func finishPolicyJSON() ([]byte, error) {
 	_, windows, err := api.Keep28Policy()
 	if err != nil {
 		return nil, err
@@ -206,7 +219,17 @@ func finishCandidates(ctx context.Context, pool *pgxpool.Pool, limit int) ([]api
 	for _, w := range windows {
 		rowsJSON = append(rowsJSON, map[string]any{"stream_id": w.StreamID, "timezone": w.Timezone, "start_at": w.Start, "end_at": w.End})
 	}
-	data, err := json.Marshal(rowsJSON)
+	return json.Marshal(rowsJSON)
+}
+func finishListingConflicts(ctx context.Context, pool *pgxpool.Pool, status *finishStatus) error {
+	data, err := finishPolicyJSON()
+	if err != nil {
+		return err
+	}
+	return pool.QueryRow(ctx, finishWindowSQL+` SELECT count(*),coalesce((array_agg(c.id ORDER BY c.id))[1:50],'{}'::bigint[]) `+finishEligibleSQL+` AND `+finishListingConflictSQL, data, api.NASR2CopyMaxFile).Scan(&status.ListingConflicts, &status.ListingConflictIDs)
+}
+func finishCandidates(ctx context.Context, pool *pgxpool.Pool, limit int) ([]api.NASR2CopyItem, error) {
+	data, err := finishPolicyJSON()
 	if err != nil {
 		return nil, err
 	}
@@ -313,6 +336,7 @@ func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath st
 	for {
 		s, c, e := finishReadEvidence(safetyPath, copyPath)
 		status.Copy = c
+		status.QueueDepth = c.QueueDepth
 		status.Holds = s.Holds
 		if e != nil {
 			return status, e
@@ -347,7 +371,13 @@ func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath st
 			return status, finishDatabase
 		}
 		if len(items) == 0 {
-			status.Exhausted = true
+			if e = finishListingConflicts(ctx, pool, &status); e != nil {
+				return status, finishDatabase
+			}
+			status.Exhausted = status.ListingConflicts == 0
+			if status.ListingConflicts > 0 {
+				return status, finishListingConflict
+			}
 			return status, nil
 		}
 		n := 0

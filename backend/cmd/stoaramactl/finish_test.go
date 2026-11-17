@@ -17,7 +17,8 @@ import (
 func finishFixture(t *testing.T, n int) (*pgxpool.Pool, string, string) {
 	t.Helper()
 	pool, _, _, _ := nasCopyQueueFixture(t, n, true)
-	_, err := pool.Exec(context.Background(), `ALTER TABLE nas_cleanup_plans ADD COLUMN connection_id bigint DEFAULT 13;
+	_, err := pool.Exec(context.Background(), `ALTER TABLE nas_cleanup_plans ADD COLUMN connection_id bigint DEFAULT 13, ADD COLUMN plan_sha256 text DEFAULT repeat('d',64);
+ INSERT INTO nas_cleanup_plans(id,mode) VALUES(99,'retired');
  CREATE TABLE nas_cleanup_batches(id bigint,mode text);
  CREATE TABLE nas_listing_generations(connection_id bigint,generation text,started_at timestamptz,completed_at timestamptz);
  CREATE TABLE nas_listing_files(connection_id bigint,generation text,relative_path text,size_bytes bigint);
@@ -28,7 +29,7 @@ func finishFixture(t *testing.T, n int) (*pgxpool.Pool, string, string) {
 	dir := t.TempDir()
 	safety := filepath.Join(dir, "safety.json")
 	copy := filepath.Join(dir, "copy.json")
-	finishTestJSON(t, safety, finishSafety{UpdatedAt: time.Now().UTC(), RecoveryCheckedAt: time.Now().UTC(), KnownPlans: []int64{}, KnownBatches: []int64{}, Holds: map[string]int64{}})
+	finishTestJSON(t, safety, finishSafety{UpdatedAt: time.Now().UTC(), RecoveryCheckedAt: time.Now().UTC(), RecoveryPlanID: 99, RecoveryPlanSHA: strings.Repeat("d", 64), LocalCheckedAt: time.Now().UTC(), HoldsCheckedAt: time.Now().UTC(), MasterCheckedAt: time.Now().UTC(), KnownPlans: []int64{}, KnownBatches: []int64{}, Holds: map[string]int64{}})
 	finishTestJSON(t, copy, finishCopy{Schema: "stoarama.nas-r2-copy-status.v1", UpdatedAt: time.Now().UTC(), BlockedByReason: map[string]nasCopyStat{}})
 	return pool, safety, copy
 }
@@ -60,8 +61,14 @@ func TestFinishFeedPriorityIdempotenceAndTerminalStates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	status := finishRun(t, pool, safety, copy)
-	if status.ImportedItems != 6 || status.QueueDepth != 6 || !status.Exhausted || status.ImportedManifests != 2 {
+	status, stop := finishTick(ctx, pool, safety, copy)
+	if !errors.Is(stop, finishListingConflict) || status.ListingConflicts != 1 || len(status.ListingConflictIDs) != 1 || status.ListingConflictIDs[0] != 5 {
+		t.Fatalf("lost listing conflict: %v %+v", stop, status)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=5`); err != nil {
+		t.Fatal(err)
+	}
+	if status.ImportedItems != 6 || status.QueueDepth != 6 || status.Exhausted || status.ImportedManifests != 2 {
 		t.Fatalf("feed: %+v", status)
 	}
 	rows, err := pool.Query(ctx, `SELECT source_id FROM nas_r2_copy_items ORDER BY id LIMIT 2`)
@@ -102,14 +109,16 @@ func TestFinishStopsBeforeFeeding(t *testing.T) {
 	}{
 		{name: "recovery", mutate: func(s *finishSafety, c *finishCopy) { s.RecoveryProblems = 1 }, stop: finishRecovery},
 		{name: "shutdown", mutate: func(s *finishSafety, c *finishCopy) { s.ShutdownFailed = true }, stop: finishShutdown},
-		{name: "recovery error without latch", mutate: func(s *finishSafety, c *finishCopy) { s.RecoveryError = "failed" }, stop: finishShutdown},
+		{name: "recovery error without latch", mutate: func(s *finishSafety, c *finishCopy) { v := "failed"; s.RecoveryError = &v }, stop: finishShutdown},
+		{name: "local mismatch", mutate: func(s *finishSafety, c *finishCopy) { s.LocalMismatch = 1 }, stop: finishMismatch},
+		{name: "last error", mutate: func(s *finishSafety, c *finishCopy) { v := "unexpected"; s.LastError = &v }, stop: finishShutdown},
 		{name: "mismatch", mutate: func(s *finishSafety, c *finishCopy) { c.MismatchLatched = 1 }, stop: finishMismatch},
 		{name: "unknown plan", sql: `INSERT INTO nas_cleanup_plans(id,mode) VALUES(91,'enabled')`, stop: finishUnknownPlan},
 		{name: "unknown batch", sql: `INSERT INTO nas_cleanup_batches VALUES(92,'enabled')`, stop: finishUnknownPlan},
 		{name: "master mismatch", mutate: func(s *finishSafety, c *finishCopy) { s.Master = true }, stop: finishMaster},
 		{name: "unowned master", mutate: func(s *finishSafety, c *finishCopy) { s.Master = true; s.ExpectedMaster = true }, stop: finishMaster},
 		{name: "stale underlying recovery", mutate: func(s *finishSafety, c *finishCopy) { s.RecoveryCheckedAt = time.Now().Add(-6 * time.Minute) }, stop: finishEvidence},
-		{name: "issued changed", sql: `INSERT INTO nas_cleanup_plans(id,mode) VALUES(91,'retired'); INSERT INTO nas_cleanup_items VALUES(91,true)`, stop: finishEvidence},
+		{name: "issued changed", sql: `INSERT INTO nas_cleanup_items VALUES(99,true)`, stop: finishEvidence},
 		{name: "stale safety", mutate: func(s *finishSafety, c *finishCopy) { s.UpdatedAt = time.Now().Add(-6 * time.Minute) }, stop: finishEvidence},
 		{name: "stale copy", mutate: func(s *finishSafety, c *finishCopy) { c.UpdatedAt = time.Now().Add(-6 * time.Minute) }, stop: finishEvidence},
 		{name: "future", mutate: func(s *finishSafety, c *finishCopy) { s.UpdatedAt = time.Now().Add(time.Minute) }, stop: finishEvidence},
@@ -162,13 +171,13 @@ func TestFinishCleanupOnlyForFreeSpaceAndKnownOwnership(t *testing.T) {
 				t.Fatal(err)
 			}
 			s.Holds[reason] = 1
-			s.KnownPlans = []int64{91}
-			s.KnownBatches = []int64{92}
+			s.KnownPlans = []int64{99}
+			s.KnownBatches = []int64{}
 			s.Master = true
 			s.ExpectedMaster = true
 			finishTestJSON(t, safety, s)
 			finishTestJSON(t, copy, c)
-			if _, err := pool.Exec(context.Background(), `INSERT INTO nas_cleanup_plans(id,mode) VALUES(91,'enabled');INSERT INTO nas_cleanup_batches VALUES(92,'enabled')`); err != nil {
+			if _, err := pool.Exec(context.Background(), `UPDATE nas_cleanup_plans SET mode='enabled' WHERE id=99`); err != nil {
 				t.Fatal(err)
 			}
 			status := finishRun(t, pool, safety, copy)
@@ -245,5 +254,33 @@ func TestFinishConcurrentTickDoesNotFeed(t *testing.T) {
 	status, err := finishTick(ctx, pool, safety, copy)
 	if !errors.Is(err, finishBusy) || status.ImportedItems != 0 {
 		t.Fatalf("concurrent feed: %v %+v", err, status)
+	}
+}
+
+func TestFinishScopedRecoveryAndKnownHeldError(t *testing.T) {
+	pool, safety, copy := finishFixture(t, 1)
+	// Older issued permits do not participate: closed-plan recovery records own
+	// their history. Only the declared current/latest plan is checked here.
+	if _, err := pool.Exec(context.Background(), `INSERT INTO nas_cleanup_plans(id,mode) VALUES(1,'retired');INSERT INTO nas_cleanup_items VALUES(1,true)`); err != nil {
+		t.Fatal(err)
+	}
+	s, c, err := finishReadEvidence(safety, copy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := "controller-held STOP after recovery-verified close"
+	s.LastError = &held
+	s.HeldError = &held
+	finishTestJSON(t, safety, s)
+	finishTestJSON(t, copy, c)
+	status := finishRun(t, pool, safety, copy)
+	if status.ImportedItems != 1 {
+		t.Fatal("history blocked scoped recovery")
+	}
+	s.RecoveryPlanSHA = strings.Repeat("e", 64)
+	finishTestJSON(t, safety, s)
+	_, err = finishTick(context.Background(), pool, safety, copy)
+	if !errors.Is(err, finishEvidence) {
+		t.Fatalf("wrong plan proof accepted: %v", err)
 	}
 }
