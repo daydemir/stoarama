@@ -69,7 +69,46 @@ func TestR2InverseCanonicalIncidentMigration(t *testing.T) {
 	if err = pool.QueryRow(ctx, `SELECT array_agg(source_id ORDER BY source_id) FROM nas_cleanup_incident_files`).Scan(&old); err != nil || len(old) != 28 {
 		t.Fatal(old, err)
 	}
+	// Independent schemas share advisory locks in one PostgreSQL database. A
+	// migration may coexist with another migration, but never an active applier.
+	applier, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = applier.Exec(ctx, `SELECT pg_advisory_lock(7343226011173)`); err != nil {
+		t.Fatal(err)
+	}
+	err = db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir())
+	if _, unlockErr := applier.Exec(ctx, `SELECT pg_advisory_unlock(7343226011173)`); unlockErr != nil {
+		t.Fatal(unlockErr)
+	}
+	applier.Release()
+	if err == nil || !strings.Contains(err.Error(), "R2 retirement apply is active") {
+		t.Fatal("active applier did not refuse migration", err)
+	}
+	otherMigration, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer otherMigration.Rollback(ctx)
+	if _, err = otherMigration.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011173)`); err != nil {
+		t.Fatal(err)
+	}
 	if err = db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir()); err != nil {
+		t.Fatal(err)
+	}
+	// A migration's shared guard still prevents a new exclusive applier.
+	probe, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var admitted bool
+	err = probe.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(7343226011173)`).Scan(&admitted)
+	probe.Rollback(ctx)
+	if err != nil || admitted {
+		t.Fatal("migration admitted concurrent apply", admitted, err)
+	}
+	if err = otherMigration.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 	var filesAfter, sourcesAfter uint32
