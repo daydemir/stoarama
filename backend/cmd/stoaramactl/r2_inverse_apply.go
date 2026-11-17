@@ -123,7 +123,15 @@ func (a *inverseApplier) checkEvidence(ctx context.Context, q r2RetireQuerier) e
 	}
 	return nil
 }
+func inverseProtectionBarrier(ctx context.Context, tx pgx.Tx) error {
+	// First lock: a waiting B1 transaction owns nothing a legacy mutator needs.
+	_, err := tx.Exec(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`)
+	return err
+}
 func inverseProtectionLocks(ctx context.Context, tx pgx.Tx, shared bool) error {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(137,1)`); err != nil {
+		return err
+	}
 	sql := `SELECT pg_advisory_xact_lock($1)`
 	if shared {
 		sql = `SELECT pg_advisory_xact_lock_shared($1)`
@@ -133,8 +141,7 @@ func inverseProtectionLocks(ctx context.Context, tx pgx.Tx, shared bool) error {
 			return err
 		}
 	}
-	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(137,1)`)
-	return err
+	return nil
 }
 
 const inverseRawTargetSQL = `SELECT c.id,coalesce(r.stream_id,0),c.size_bytes,lower(c.sha256),coalesce(c.etag,''),c.display_path,c.clip_start_at,c.clip_end_at,
@@ -177,7 +184,7 @@ func (a *inverseApplier) loadTarget(ctx context.Context, tx pgx.Tx, e inverseEnt
 
 const inverseRawHeldSQL = `SELECT
  EXISTS(SELECT 1 FROM nas_cleanup_reserved_files WHERE kind='raw' AND source_id=$1)
- OR EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id WHERE h.clip_id=$1 AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued)))
+ OR EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id WHERE h.clip_id=$1 AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND (i.delete_ever_issued OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed')))))
  OR EXISTS(SELECT 1 FROM nas_cleanup_incident_sources WHERE clip_id=$1)
  OR EXISTS(SELECT 1 FROM nas_cleanup_incident_roster WHERE bucket=$2 AND object_key=$3)
  OR EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE bucket=$2 AND object_key=$3 AND NOT (kind='raw' AND source_id=$1 AND manifest_sha256=$4))
@@ -234,6 +241,9 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 		return t, err
 	}
 	defer tx.Rollback(context.Background())
+	if err = inverseProtectionBarrier(ctx, tx); err != nil {
+		return t, err
+	}
 	if err = inverseProtectionLocks(ctx, tx, false); err != nil {
 		return t, err
 	}
@@ -399,7 +409,7 @@ func runR2InverseApply(ctx context.Context, cfg config.Config, args []string) {
 	fs.StringVar(&o.Ledger, "ledger", "", "private append-only key ledger")
 	fs.StringVar(&o.DrainEvidence, "drain-evidence", "", "controller-reviewed accepted-PUT drain evidence")
 	fs.StringVar(&o.DrainSHA, "expected-drain-evidence-sha256", "", "drain evidence SHA256")
-	fs.IntVar(&o.Workers, "workers", 16, "concurrent independent keys (1..64)")
+	fs.IntVar(&o.Workers, "workers", 16, "concurrent keys (1..64, at least two DB connections remain reserved)")
 	fs.IntVar(&o.MaxItems, "max-items", 100, "maximum new objects")
 	fs.Int64Var(&o.MaxBytes, "max-bytes", 0, "maximum new intent bytes this run")
 	fs.Int64Var(&o.Budget24h, "budget-24h-bytes", 0, "maximum charged bytes in previous24h")
@@ -425,6 +435,11 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteSt
 	result := inverseApplySummary{}
 	if o.Workers < 1 || o.Workers > 64 || o.MaxItems < 1 || o.MaxBytes <= 0 || o.Budget24h <= 0 {
 		return result, errors.New("invalid bounded apply options")
+	}
+	// One session connection and one independent issuance connection must stay
+	// available even when every worker owns a transaction or waits for admission.
+	if o.Workers > int(pool.Config().MaxConns)-2 {
+		return result, errors.New("workers exceed database capacity with session and issuance connections reserved")
 	}
 	var summary inverseSummary
 	if err := inverseReadPinned(o.Summary, o.SummarySHA, &summary); err != nil {
@@ -463,11 +478,14 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteSt
 		return result, err
 	}
 	defer ledger.close()
-	initTx, err := pool.Begin(ctx)
+	initTx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return result, err
 	}
 	defer initTx.Rollback(context.Background())
+	if err = inverseProtectionBarrier(ctx, initTx); err != nil {
+		return result, err
+	}
 	if err = inverseProtectionLocks(ctx, initTx, true); err != nil {
 		return result, err
 	}
@@ -642,28 +660,7 @@ send:
 // the read-only partition; repeated batches must not rescan them.
 func loadInverseApplyProtection(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks, windows map[int64]api.Keep28Window) (inverseProtection, error) {
 	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, KEFolders: map[string]bool{}, Picks: picks, Windows: windows}
-	var streams []int64
-	for id, pick := range picks.Choices {
-		if pick.Choice == "all" {
-			streams = append(streams, id)
-		}
-	}
-	if len(streams) == 0 {
-		return p, nil
-	}
-	rows, err := q.Query(ctx, `SELECT DISTINCT folder FROM (
- SELECT split_part(c.display_path,'/',1) folder FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE c.bucket=$1 AND r.stream_id=ANY($2::bigint[])
- UNION SELECT split_part(regexp_replace(o.nas_relative_path,'^joined/',''),'/',1) FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id JOIN recordings r ON r.id=h.recording_id WHERE r.stream_id=ANY($2::bigint[])) folders WHERE folder<>''`, bucket, streams)
-	if err != nil {
-		return p, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var folder string
-		if err = rows.Scan(&folder); err != nil {
-			return p, err
-		}
-		p.KEFolders[folder] = true
-	}
-	return p, rows.Err()
+	var err error
+	p.KEFolders, err = loadInverseKEFolders(ctx, q, bucket, picks)
+	return p, err
 }

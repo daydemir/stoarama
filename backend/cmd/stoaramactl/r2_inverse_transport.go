@@ -55,6 +55,9 @@ func (a *inverseDeleteAuthority) check(ctx context.Context, bucket, endpoint str
 }
 
 func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntry) (*inverseDeleteAuthority, error) {
+	if err := inverseProtectionBarrier(ctx, tx); err != nil {
+		return nil, err
+	}
 	if err := inverseProtectionLocks(ctx, tx, true); err != nil {
 		return nil, err
 	}

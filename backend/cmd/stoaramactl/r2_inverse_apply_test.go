@@ -21,6 +21,9 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/api"
 	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type inverseFakeStore struct {
@@ -90,7 +93,15 @@ func (s *inverseFakeStore) deleteOnce(ctx context.Context, authority *inverseDel
 }
 func TestR2InverseExecutorLifecycle(t *testing.T) {
 	ctx := context.Background()
-	pool := joinedPurgeTestPool(t, "inverse_apply")
+	schemaPool := joinedPurgeTestPool(t, "inverse_apply")
+	workerConfig := schemaPool.Config()
+	workerConfig.MaxConns = 20
+	workerConfig.MinConns = 2
+	pool, err := pgxpool.NewWithConfig(ctx, workerConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
 	if err := db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir()); err != nil {
 		t.Fatal(err)
 	}
@@ -116,9 +127,12 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec(`INSERT INTO accounts(id,email) VALUES(47,'inverse@test.invalid');
+ INSERT INTO account_api_keys(id,account_id,key_prefix,secret_hash) VALUES(1,47,'test-inverse','not-a-real-credential');
+ INSERT INTO connections(id,account_id,kind,api_key_id) VALUES(13,47,'nas_pull',1);
  INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps) VALUES(3,'test','3','inverse','inverse','https://test.invalid','off','Asia/Tokyo','hls','video_manifest','video_live','continuous_video',30);
  INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc) VALUES(1,47,'test','https://test.invalid','auto','stoarama','fixture',decode('00','hex'));
- INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at) VALUES(30,47,1,'inverse','https://test.invalid','* * * * *','Asia/Tokyo','paused',3,now());`)
+ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at) VALUES(30,47,1,'inverse','https://test.invalid','* * * * *','Asia/Tokyo','paused',3,now());
+ INSERT INTO recording_qualification_runs(id,account_id,definition_version,definition_jsonb,target_recording_count,window_sequence_start_at) VALUES(1,47,'inverse-fixture','{}',50,'2026-06-01');`)
 	const count = 1200
 	store := &inverseFakeStore{objects: map[string]r2.ObjectInfo{}}
 	sdk, providerDeletes := inverseSDKTestStore(t, store)
@@ -205,6 +219,43 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 		return &inverseApplier{pool: pool, store: store, opts: o, summary: sum, protection: p, ledger: ledger, keEpoch: epoch}, entries
+	}
+	cleanupPlan := func(sourceID int64, mode string, withItem, withHold bool) int64 {
+		t.Helper()
+		var planID int64
+		err := pool.QueryRow(ctx, `INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode) VALUES(47,13,$1,repeat('d',64),'[]',repeat('e',64),$2) RETURNING id`, fmt.Sprintf("inverse-%s-%d", mode, sourceID), mode).Scan(&planID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if withItem {
+			exec(`INSERT INTO nas_cleanup_items(plan_id,ordinal,state) VALUES($1,1,'keep')`, planID)
+		}
+		if withHold {
+			exec(`INSERT INTO nas_cleanup_source_holds(plan_id,clip_id) VALUES($1,$2)`, planID, sourceID)
+		}
+		return planID
+	}
+	latentCleanup := func(sourceID int64, withItem bool) int64 { return cleanupPlan(sourceID, "retired", withItem, true) }
+
+	const insertDryScope = `INSERT INTO recording_joined_dry_run_scopes(dry_run_id,recording_id,priority_ordinal,local_date,date_ordinal,recording_job_id,high_water_clip_id)
+ SELECT id,30,1,'2026-06-01',1,(convert_from(skeleton_bytes,'UTF8')::jsonb#>>'{recordings,0,snapshot_days,0,recording_job_id}')::bigint,(convert_from(skeleton_bytes,'UTF8')::jsonb#>>'{recordings,0,snapshot_days,0,high_water_clip_id}')::bigint FROM recording_joined_dry_runs WHERE id=$1::uuid`
+	dryScope := func(sourceID int64) string {
+		t.Helper()
+		var jobID int64
+		err := pool.QueryRow(ctx, `INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,completed_at) VALUES(30,'2026-06-01'::timestamptz+($1::bigint-9000000)*interval '1 minute','2026-06-01'::timestamptz+($1::bigint-9000000)*interval '1 minute',60,'done','inverse-scope-'||$1::bigint,'2026-06-02') RETURNING id`, sourceID).Scan(&jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		exec(`UPDATE recording_clips SET recording_job_id=$2 WHERE id=$1`, sourceID, jobID)
+		batchID := fmt.Sprintf("inverse-scope-%d", sourceID)
+		input, _ := json.Marshal(map[string]any{"batch_id": batchID, "generation": 1, "connection_id": 13, "qualification_run_id": 1, "apply": false})
+		skeleton, _ := json.Marshal(map[string]any{"batch_id": batchID, "generation": 1, "connection_id": 13, "selection_authority": map[string]any{"qualification_run_id": 1}, "recordings": []any{map[string]any{"frozen_recording": map[string]any{"recording_id": 30, "priority_ordinal": 1}, "snapshot_days": []any{map[string]any{"local_date": "2026-06-01", "date_ordinal": 1, "recording_job_id": jobID, "high_water_clip_id": sourceID}}}}})
+		var runID string
+		err = pool.QueryRow(ctx, `INSERT INTO recording_joined_dry_runs(account_id,connection_id,batch_id,generation,qualification_run_id,input_bytes,input_sha256,skeleton_bytes,skeleton_sha256) VALUES(47,13,'inverse-scope-'||$1::bigint,1,1,$3,encode(sha256($3::bytea),'hex'),$2,encode(sha256($2::bytea),'hex')) RETURNING id::text`, sourceID, skeleton, input).Scan(&runID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return runID
 	}
 	t.Run("success", func(t *testing.T) {
 		a, _ := build(2)
@@ -334,7 +385,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 	})
 	t.Run("late_admission_blocked_through_wire_then_intent_vetoes", func(t *testing.T) {
-		for _, kind := range []string{"delivery_key", "delivery_source", "delivery_output", "delivery_path_enrichment", "collated_key", "held_output_source", "delivery_output_cached_source"} {
+		for _, kind := range []string{"delivery_key", "delivery_source", "delivery_output", "delivery_path_enrichment", "collated_key", "held_output_source", "delivery_output_cached_source", "output_id", "cleanup_reactivate", "cleanup_insert_reactivate", "cleanup_source_admission", "cleanup_plan_admission", "joined_scope_admission"} {
 			t.Run(kind, func(t *testing.T) {
 				a, entries := build(1)
 				defer a.ledger.close()
@@ -347,6 +398,27 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				query := `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`
 				var arg any = e.Key
 				switch kind {
+				case "output_id":
+					unusedID := int64(980000000) + id
+					exec(`INSERT INTO delivery_keep_output_dependencies(output_id,recording_id) VALUES($1,30)`, unusedID)
+					query = `UPDATE recording_collation_outputs SET id=$1 WHERE id=10000001`
+					arg = unusedID
+				case "joined_scope_admission":
+					query = insertDryScope
+					arg = dryScope(id)
+				case "cleanup_source_admission":
+					planID := cleanupPlan(id, "dry_run", false, false)
+					query = fmt.Sprintf(`INSERT INTO nas_cleanup_source_holds(plan_id,clip_id) VALUES(%d,$1)`, planID)
+					arg = id
+				case "cleanup_plan_admission":
+					query = `INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(47,13,'inverse-manifest-'||$1::bigint,repeat('d',64),jsonb_build_array(jsonb_build_object('kind','raw','source_id',$1::bigint)),repeat('e',64))`
+					arg = id
+				case "cleanup_reactivate":
+					arg = latentCleanup(id, true)
+					query = `UPDATE nas_cleanup_items SET delete_ever_issued=true WHERE plan_id=$1`
+				case "cleanup_insert_reactivate":
+					arg = latentCleanup(id, false)
+					query = `INSERT INTO nas_cleanup_items(plan_id,ordinal,state,delete_ever_issued) VALUES($1,1,'keep',true)`
 				case "delivery_source":
 					query = `INSERT INTO delivery_nas_source_holds(clip_id) VALUES($1)`
 					arg = id
@@ -365,6 +437,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					query = `INSERT INTO delivery_nas_source_holds(clip_id) VALUES($1)`
 					arg = int64(9001198)
 				case "held_output_source":
+					exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256) SELECT 'stoarama','datasets/test/late-source-output','hold',size_bytes,'metadata',sha256 FROM recording_collation_outputs WHERE id=10000008 ON CONFLICT DO NOTHING`)
 					query = `UPDATE recording_collation_outputs SET source_clip_ids=array_append(source_clip_ids,$1::bigint) WHERE id=10000008`
 					arg = id
 				}
@@ -380,8 +453,12 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					lateCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
 					defer cancel()
 					_, err := pool.Exec(lateCtx, query, arg)
-					if err == nil || lateCtx.Err() == nil {
-						return fmt.Errorf("late admission was not fenced: %v", err)
+					if err == nil {
+						return errors.New("late protection mutation committed")
+					}
+					var pe *pgconn.PgError
+					if lateCtx.Err() == nil && !(errors.As(err, &pe) && pe.Code == "55P03") && !(kind == "output_id" && strings.Contains(err.Error(), "immutable")) && !strings.Contains(err.Error(), "cannot reactivate") {
+						return fmt.Errorf("unexpected late admission refusal: %w", err)
 					}
 					return nil
 				}
@@ -391,8 +468,19 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				if err != nil || !ok || store.calls != before+1 {
 					t.Fatalf("wire result %v %v", ok, err)
 				}
-				if _, err = pool.Exec(ctx, query, arg); err == nil || !strings.Contains(err.Error(), "reservation") {
-					t.Fatal("committed intent failed to forbid later admission", err)
+				_, err = pool.Exec(ctx, query, arg)
+				expected := "reservation"
+				if kind == "output_id" {
+					expected = "immutable"
+				}
+				if kind == "cleanup_reactivate" || kind == "cleanup_insert_reactivate" {
+					expected = "cannot reactivate"
+				}
+				if kind == "cleanup_source_admission" || kind == "cleanup_plan_admission" || kind == "joined_scope_admission" {
+					expected = "retirement"
+				}
+				if err == nil || !strings.Contains(err.Error(), expected) {
+					t.Fatal("post-wire protection adoption allowed", kind, err)
 				}
 			})
 		}
@@ -432,6 +520,276 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		var events int
 		if err = pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_events WHERE object_key=$1`, e.Key).Scan(&events); err != nil || events != 0 {
 			t.Fatal(events, err)
+		}
+	})
+	t.Run("legacy_cleanup_scope_does_not_upgrade_to_admission", func(t *testing.T) {
+		for _, exclusive := range []bool{false, true} {
+			t.Run(strconv.FormatBool(exclusive), func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				var sourceID int64
+				if err := pool.QueryRow(ctx, `SELECT id FROM recording_clips WHERE object_key=$1`, e.Key).Scan(&sourceID); err != nil {
+					t.Fatal(err)
+				}
+				planID := cleanupPlan(sourceID, "dry_run", true, false)
+				legacy, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer legacy.Rollback(ctx)
+				lockSQL := `SELECT pg_advisory_xact_lock_shared(7343226011101)`
+				if exclusive {
+					lockSQL = `SELECT pg_advisory_xact_lock(7343226011101)`
+				}
+				if _, err = legacy.Exec(ctx, lockSQL); err != nil {
+					t.Fatal(err)
+				}
+				if _, err = legacy.Exec(ctx, `SELECT id FROM nas_cleanup_plans WHERE id=$1 FOR UPDATE`, planID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err = legacy.Exec(ctx, `SELECT id FROM nas_cleanup_items WHERE plan_id=$1 FOR UPDATE`, planID); err != nil {
+					t.Fatal(err)
+				}
+				done := make(chan error, 1)
+				go func() { _, err := a.delete(ctx, e); done <- err }()
+				deadline := time.Now().Add(3 * time.Second)
+				for {
+					var held bool
+					if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND classid::bigint*4294967296+objid::bigint=7343226011103 AND granted AND pid<>pg_backend_pid())`).Scan(&held); err != nil {
+						t.Fatal(err)
+					}
+					if held {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("B1 never reached legacy public fence")
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				progressCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				defer cancel()
+				// Same parent/item order and mutations as observe/auto-pause/receipt paths.
+				if _, err = legacy.Exec(progressCtx, `UPDATE nas_cleanup_items SET state='unverified' WHERE plan_id=$1`, planID); err != nil {
+					t.Fatal("legacy item mutation blocked", err)
+				}
+				if _, err = legacy.Exec(progressCtx, `UPDATE nas_cleanup_plans SET mode='paused' WHERE id=$1`, planID); err != nil {
+					t.Fatal("legacy plan mutation upgraded locks", err)
+				}
+				var upgraded bool
+				if err = legacy.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid() AND classid::bigint*4294967296+objid::bigint=7343226011103)`).Scan(&upgraded); err != nil || upgraded {
+					t.Fatal("cleanup acquired admission lock", upgraded, err)
+				}
+				if err = legacy.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case err = <-done:
+					if err != nil {
+						t.Fatal("B1 stranded by cleanup", err)
+					}
+				case <-time.After(10 * time.Second):
+					t.Fatal("legacy/B1 lock cycle")
+				}
+			})
+		}
+	})
+	t.Run("cleanup_admission_before_intent_wins", func(t *testing.T) {
+		for _, manifestOnly := range []bool{false, true} {
+			t.Run(strconv.FormatBool(manifestOnly), func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				var id int64
+				if err := pool.QueryRow(ctx, `SELECT id FROM recording_clips WHERE object_key=$1`, e.Key).Scan(&id); err != nil {
+					t.Fatal(err)
+				}
+				if manifestOnly {
+					exec(`INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(47,13,'inverse-first-manifest-'||$1::bigint,repeat('d',64),jsonb_build_array(jsonb_build_object('kind','raw','source_id',$1::bigint)),repeat('e',64))`, id)
+				} else {
+					cleanupPlan(id, "dry_run", false, true)
+				}
+				if _, err := a.reserve(ctx, e); err == nil {
+					t.Fatal("cleanup admission lost to intent")
+				}
+			})
+		}
+	})
+	t.Run("joined_mutator_wins_barrier_before_B1_owns_legacy_locks", func(t *testing.T) {
+		a, entries := build(1)
+		defer a.ledger.close()
+		e := entries[0]
+		var id int64
+		if err := pool.QueryRow(ctx, `SELECT id FROM recording_clips WHERE object_key=$1`, e.Key).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		runID := dryScope(id)
+		mutator, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer mutator.Rollback(ctx)
+		if _, err = mutator.Exec(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR UPDATE`); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { _, err := a.delete(ctx, e); done <- err }()
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			var waiting bool
+			if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE%')`).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+			if waiting {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("B1 did not wait on first barrier")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		var held bool
+		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND granted AND ((classid::bigint*4294967296+objid::bigint)=ANY(ARRAY[7343226011103,7343226011101]::bigint[]) OR(classid=137 AND objid=1 AND objsubid=2)))`).Scan(&held); err != nil || held {
+			t.Fatal("waiting B1 owns later locks", held, err)
+		}
+		admissionCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		if _, err = mutator.Exec(admissionCtx, insertDryScope, runID); err != nil {
+			t.Fatal("joined admission blocked by waiting B1", err)
+		}
+		if err = mutator.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err = <-done:
+			if err == nil {
+				t.Fatal("B1 ignored committed scope")
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("joined/B1 lock cycle")
+		}
+		var intents int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1`, e.Key).Scan(&intents); err != nil || intents != 0 {
+			t.Fatal("scope winner left intent", intents, err)
+		}
+	})
+	t.Run("repeatable_snapshot_cannot_adopt_after_intent", func(t *testing.T) {
+		for _, level := range []pgx.TxIsoLevel{pgx.RepeatableRead, pgx.Serializable} {
+			t.Run(string(level), func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				stale, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: level})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer stale.Rollback(ctx)
+				var count int
+				if err = stale.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1`, e.Key).Scan(&count); err != nil || count != 0 {
+					t.Fatal(count, err)
+				}
+				if _, err = a.delete(ctx, e); err != nil {
+					t.Fatal(err)
+				}
+				_, err = stale.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`, e.Key)
+				var pe *pgconn.PgError
+				if !errors.As(err, &pe) || pe.Code != "55000" {
+					t.Fatal("stale snapshot admission not refused", err)
+				}
+			})
+		}
+	})
+	t.Run("pool_capacity_reserved_before_any_intent", func(t *testing.T) {
+		a, entries := build(4)
+		a.ledger.close()
+		smallConfig := pool.Config()
+		smallConfig.MaxConns = 4
+		smallConfig.MinConns = 0
+		small, err := pgxpool.NewWithConfig(ctx, smallConfig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer small.Close()
+		a.opts.Workers = 3
+		if _, err = applyInverse(ctx, small, store, a.opts); err == nil || !strings.Contains(err.Error(), "capacity") {
+			t.Fatal("oversubscribed pool admitted", err)
+		}
+		var count int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_intents WHERE manifest_sha256=$1`, a.opts.ManifestSHA).Scan(&count); err != nil || count != 0 {
+			t.Fatal("invalid pool wrote intent", count, err)
+		}
+		a.opts.Workers = 2
+		bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		result, err := applyInverse(bounded, small, store, a.opts)
+		if err != nil || result.Deleted != int64(len(entries)) {
+			t.Fatalf("capacity ceiling %+v %v", result, err)
+		}
+	})
+	t.Run("retired_item_reactivation_is_terminal", func(t *testing.T) {
+		a, entries := build(1)
+		defer a.ledger.close()
+		var sourceID int64
+		if err := pool.QueryRow(ctx, `SELECT id FROM recording_clips WHERE object_key=$1`, entries[0].Key).Scan(&sourceID); err != nil {
+			t.Fatal(err)
+		}
+		planID := latentCleanup(sourceID, true)
+		for _, query := range []string{`UPDATE nas_cleanup_items SET delete_ever_issued=true WHERE plan_id=$1`, `UPDATE nas_cleanup_items SET state='unverified' WHERE plan_id=$1`} {
+			if _, err := pool.Exec(ctx, query, planID); err == nil || !strings.Contains(err.Error(), "cannot reactivate") {
+				t.Fatal("retired hold reactivated", err)
+			}
+		}
+	})
+	t.Run("cleanup_retirement_and_first_hold_serialize", func(t *testing.T) {
+		for _, retireFirst := range []bool{true, false} {
+			t.Run(strconv.FormatBool(retireFirst), func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				var id int64
+				if err := pool.QueryRow(ctx, `SELECT id FROM recording_clips WHERE object_key=$1`, e.Key).Scan(&id); err != nil {
+					t.Fatal(err)
+				}
+				planID := cleanupPlan(id, "paused", true, true)
+				first, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer first.Rollback(ctx)
+				if retireFirst {
+					if _, err = first.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='retired' WHERE id=$1`, planID); err != nil {
+						t.Fatal(err)
+					}
+					_, err = pool.Exec(ctx, `UPDATE nas_cleanup_items SET delete_ever_issued=true WHERE plan_id=$1`, planID)
+					var pe *pgconn.PgError
+					if !errors.As(err, &pe) || pe.Code != "55P03" {
+						t.Fatal("retire/flip could cycle", err)
+					}
+					if err = first.Commit(ctx); err != nil {
+						t.Fatal(err)
+					}
+					if _, err = pool.Exec(ctx, `UPDATE nas_cleanup_items SET delete_ever_issued=true WHERE plan_id=$1`, planID); err == nil || !strings.Contains(err.Error(), "cannot reactivate") {
+						t.Fatal("retired hold returned", err)
+					}
+				} else {
+					if _, err = first.Exec(ctx, `UPDATE nas_cleanup_items SET delete_ever_issued=true WHERE plan_id=$1`, planID); err != nil {
+						t.Fatal(err)
+					}
+					bounded, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+					_, err = pool.Exec(bounded, `UPDATE nas_cleanup_plans SET mode='retired' WHERE id=$1`, planID)
+					cancel()
+					if err == nil {
+						t.Fatal("retirement crossed hold publication")
+					}
+					if err = first.Commit(ctx); err != nil {
+						t.Fatal(err)
+					}
+					exec(`UPDATE nas_cleanup_plans SET mode='retired' WHERE id=$1`, planID)
+					if _, err = a.reserve(ctx, e); err == nil {
+						t.Fatal("retirement shed issued source hold")
+					}
+				}
+			})
 		}
 	})
 	t.Run("installed_purge_veto_precedes_intent_and_wire", func(t *testing.T) {
@@ -540,7 +898,10 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					t.Fatal(err)
 				}
 				lockCtx, lockCancel := context.WithTimeout(ctx, time.Second)
-				err = inverseProtectionLocks(lockCtx, tx, false)
+				_, err = tx.Exec(lockCtx, `SELECT epoch FROM r2_inverse_ke_epoch FOR UPDATE NOWAIT`)
+				if err == nil {
+					err = inverseProtectionLocks(lockCtx, tx, false)
+				}
 				lockCancel()
 				tx.Rollback(ctx)
 				if err != nil {
@@ -590,6 +951,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 	t.Run("worker_pool_rate_with_durable_DB_and_ledger", func(t *testing.T) {
 		a, _ := build(1024)
 		a.ledger.close()
+		a.opts.Workers = 16
 		store.delay = 100 * time.Millisecond
 		defer func() { store.delay = 0 }()
 		s, err := applyInverse(ctx, pool, store, a.opts)

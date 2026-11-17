@@ -120,7 +120,7 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
  CREATE TABLE recording_collation_hours(id bigint,recording_id bigint);
  CREATE TABLE recording_collation_outputs(id bigint,collation_hour_id bigint,object_key text,nas_relative_path text,start_at timestamptz,end_at timestamptz,source_clip_ids bigint[],sha256 text DEFAULT '',size_bytes bigint DEFAULT 1);
  CREATE TABLE nas_cleanup_plans(id bigint,mode text,account_id bigint,connection_id bigint,label text,manifest jsonb);
- CREATE TABLE nas_cleanup_items(id bigserial,plan_id bigint,ordinal bigint,delete_ever_issued boolean);
+ CREATE TABLE nas_cleanup_items(id bigserial,plan_id bigint,ordinal bigint,delete_ever_issued boolean,state text DEFAULT 'pending');
  CREATE TABLE nas_cleanup_source_holds(plan_id bigint,clip_id bigint);
  CREATE TABLE r2_retirement_reservations(bucket text,object_key text);
  CREATE TABLE r2_object_retirements(bucket text,object_key text);
@@ -184,6 +184,34 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
 	if got, _ := p.classify(r2.ObjectInfo{Key: "ordinary"}); got != inverseDeletable {
 		t.Fatal(got)
 	}
+	t.Run("KE_alias_after_partition_uses_shared_normalization", func(t *testing.T) {
+		exec(`UPDATE recording_clips SET display_path='F/candidate.mp4' WHERE id=7;INSERT INTO recordings VALUES(2,4,'UTC');INSERT INTO streams VALUES(4,'UTC')`)
+		picks := p.Picks
+		picks.Choices[4] = r2RetirePick{Choice: "all"}
+		before, err := loadInverseProtection(ctx, pool, "bucket", picks, p.Windows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := before.classify(r2.ObjectInfo{Key: "ordinary"}); got != inverseDeletable {
+			t.Fatal("bad pre-alias fixture", got)
+		}
+		exec(`INSERT INTO recording_clips(id,recording_id,bucket,object_key,display_path,clip_start_at,clip_end_at) VALUES(100,2,'bucket','hashed-ke-alias','joined/F/ke.mp4','2026-06-01','2026-06-02')`)
+		apply, err := loadInverseApplyProtection(ctx, pool, "bucket", picks, p.Windows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		partition, err := loadInverseProtection(ctx, pool, "bucket", picks, p.Windows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !apply.KEFolders["F"] || !partition.KEFolders["F"] || apply.KEFolders["joined"] {
+			t.Fatal("KE normalization drift", apply.KEFolders, partition.KEFolders)
+		}
+		before.KEFolders = apply.KEFolders
+		if got, _ := before.classify(r2.ObjectInfo{Key: "ordinary"}); got != inverseKE {
+			t.Fatal("fresh KE alias reached apply", got)
+		}
+	})
 	// The frozen incident roster survives plan transitions independently.
 	exec(`UPDATE nas_cleanup_plans SET mode='retired'; DELETE FROM nas_cleanup_source_holds; DELETE FROM nas_cleanup_items`)
 	p, err = loadInverseProtection(ctx, pool, "bucket", p.Picks, p.Windows)

@@ -80,12 +80,13 @@ CREATE TRIGGER r2_inverse_joined_snapshot_scope BEFORE INSERT OR UPDATE ON recor
 CREATE TRIGGER r2_inverse_joined_dry_scope BEFORE INSERT OR UPDATE ON recording_joined_dry_run_scopes
  FOR EACH ROW EXECUTE FUNCTION guard_r2_inverse_joined_reference();
 
--- Acquire admission BEFORE row locks on relevant mutations. Network workers
--- take shared locks in the same order, allowing concurrent independent DELETEs.
+-- Metadata uses a fail-fast epoch-row barrier, without upgrading any legacy
+-- NAS advisory lock. B1 takes its shared barrier FIRST, before other locks.
 -- purged_at-only publication is excluded: it executes existing purge vetoes.
 CREATE FUNCTION fence_r2_inverse_protection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
- PERFORM pg_advisory_xact_lock(7343226011103);
- PERFORM pg_advisory_xact_lock(7343226011101);
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'R2 protection admission requires READ COMMITTED' USING ERRCODE='55000'; END IF;
+ PERFORM 1 FROM r2_inverse_ke_epoch FOR UPDATE NOWAIT;
  RETURN NULL;
 END $$;
 CREATE TRIGGER r2_inverse_source_identity_fence BEFORE UPDATE OF id,recording_id,recording_job_id,bucket,object_key,etag,size_bytes,sha256,display_path,clip_start_at,clip_end_at OR DELETE ON recording_clips
@@ -97,6 +98,8 @@ CREATE TRIGGER r2_inverse_stream_identity_fence BEFORE UPDATE OF local_timezone 
 -- COPY latches serialize only with their exact R2 key, preserving A1's
 -- independent-connection reservation contract and unrelated copy throughput.
 CREATE FUNCTION fence_r2_inverse_copy_key() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'R2 COPY protection admission requires READ COMMITTED' USING ERRCODE='55000'; END IF;
  IF NEW.item->>'bucket' IS DISTINCT FROM OLD.item->>'bucket'
  OR NEW.item->>'object_key' IS DISTINCT FROM OLD.item->>'object_key' THEN
   RAISE EXCEPTION 'COPY R2 identity is immutable'; END IF;
@@ -105,10 +108,6 @@ CREATE FUNCTION fence_r2_inverse_copy_key() RETURNS trigger LANGUAGE plpgsql AS 
 END $$;
 CREATE TRIGGER r2_inverse_copy_state_fence BEFORE UPDATE OF state,item ON nas_r2_copy_items
  FOR EACH ROW EXECUTE FUNCTION fence_r2_inverse_copy_key();
-CREATE TRIGGER r2_inverse_plan_fence BEFORE INSERT OR UPDATE ON nas_cleanup_plans
- FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();
-CREATE TRIGGER r2_inverse_source_hold_fence BEFORE INSERT OR UPDATE ON nas_cleanup_source_holds
- FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();
 CREATE TRIGGER r2_inverse_joined_source_fence BEFORE INSERT OR UPDATE ON recording_joined_source_snapshots
  FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();
 CREATE TRIGGER r2_inverse_joined_snapshot_fence BEFORE INSERT OR UPDATE ON recording_joined_snapshot_scopes
@@ -156,6 +155,55 @@ CREATE TRIGGER r2_inverse_output_delivery_admission AFTER INSERT OR UPDATE OF ob
 CREATE TRIGGER r2_inverse_hour_delivery_admission AFTER UPDATE OF recording_id ON recording_collation_hours
  FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_inverse_delivery_admission();
 
+-- Catalog output IDs are identities, not a means to adopt/shed a held output.
+CREATE FUNCTION guard_r2_inverse_output_id() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF NEW.id IS DISTINCT FROM OLD.id THEN RAISE EXCEPTION 'collated output ID is immutable'; END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_inverse_output_id_immutable BEFORE UPDATE OF id ON recording_collation_outputs
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_inverse_output_id();
+
+-- Cleanup admission uses ordered clip locks, not the metadata barrier or a
+-- later global-lock upgrade in an existing receipt/observe transaction.
+CREATE OR REPLACE FUNCTION guard_nas_cleanup_r2_retirement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'R2 cleanup admission requires READ COMMITTED' USING ERRCODE='55000'; END IF;
+ IF TG_TABLE_NAME='nas_cleanup_plans' THEN
+  PERFORM c.id FROM recording_clips c WHERE c.id IN
+   (SELECT (i->>'source_id')::bigint FROM jsonb_array_elements(NEW.manifest) i WHERE i->>'kind'='raw')
+   ORDER BY c.id FOR KEY SHARE;
+  IF EXISTS(SELECT 1 FROM jsonb_array_elements(NEW.manifest) i JOIN r2_retirement_reservations r
+   ON r.kind=i->>'kind' AND r.source_id=(i->>'source_id')::bigint) THEN
+   RAISE EXCEPTION 'retention protected: R2 retirement pending or completed'; END IF;
+ ELSE
+  PERFORM id FROM recording_clips WHERE id=NEW.clip_id FOR KEY SHARE;
+  IF EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE kind='raw' AND source_id=NEW.clip_id) THEN
+   RAISE EXCEPTION 'retention protected: R2 recovery copy retirement pending or completed'; END IF;
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE FUNCTION guard_r2_inverse_hold_identity() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF ROW(NEW.plan_id,NEW.clip_id) IS DISTINCT FROM ROW(OLD.plan_id,OLD.clip_id) THEN
+  RAISE EXCEPTION 'cleanup source hold identity is immutable'; END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_inverse_hold_identity BEFORE UPDATE ON nas_cleanup_source_holds
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_inverse_hold_identity();
+
+-- Retired is terminal. A released hold must never become active again. NOWAIT
+-- avoids reversing legacy plan-before-item row order for a direct item UPDATE.
+CREATE FUNCTION guard_r2_inverse_retired_item() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE mode text; BEGIN
+ IF NOT (NEW.delete_ever_issued OR NEW.state IN ('delete_issued','unverified','media_deleted_sidecar_failed')) THEN RETURN NEW; END IF;
+ IF TG_OP='UPDATE' AND (OLD.delete_ever_issued OR OLD.state IN ('delete_issued','unverified','media_deleted_sidecar_failed')) THEN RETURN NEW; END IF;
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'cleanup hold activation requires READ COMMITTED' USING ERRCODE='55000'; END IF;
+ SELECT p.mode INTO mode FROM nas_cleanup_plans p WHERE p.id=NEW.plan_id FOR SHARE NOWAIT;
+ IF mode='retired' THEN RAISE EXCEPTION 'retired cleanup hold cannot reactivate'; END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_inverse_retired_item BEFORE INSERT OR UPDATE OF delete_ever_issued,state ON nas_cleanup_items
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_inverse_retired_item();
+
 -- Freeze pending source identity after admission commits. Once confirmed
 -- absent, immutable receipts retain history without permanently locking the
 -- catalog or adding a foreign-key veto to later authorized metadata cleanup.
@@ -174,8 +222,9 @@ CREATE TRIGGER r2_inverse_source_identity BEFORE UPDATE OF id,recording_id,recor
 CREATE TABLE r2_inverse_ke_epoch(singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),epoch bigint NOT NULL DEFAULT 0);
 INSERT INTO r2_inverse_ke_epoch DEFAULT VALUES;
 CREATE FUNCTION advance_r2_inverse_ke_epoch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
- PERFORM pg_advisory_xact_lock(7343226011103);
- PERFORM pg_advisory_xact_lock(7343226011101);
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'R2 catalog admission requires READ COMMITTED' USING ERRCODE='55000'; END IF;
+ PERFORM 1 FROM r2_inverse_ke_epoch FOR UPDATE NOWAIT;
  UPDATE r2_inverse_ke_epoch SET epoch=epoch+1;
  RETURN NULL;
 END $$;

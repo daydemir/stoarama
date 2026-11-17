@@ -152,7 +152,7 @@ WITH held_sources AS (
  UNION SELECT kind,source_id FROM nas_cleanup_incident_files
  UNION SELECT 'raw',clip_id FROM nas_cleanup_incident_sources
  UNION SELECT 'raw',h.clip_id FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id
- WHERE p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued)
+ WHERE p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND (i.delete_ever_issued OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed')))
 ), held_keys AS (
  SELECT bucket,object_key FROM nas_cleanup_incident_roster
  UNION SELECT bucket,object_key FROM r2_retirement_reservations
@@ -204,15 +204,14 @@ func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string
 			continue
 		}
 		p.Identities[key] = append(p.Identities[key], id)
-		if picks.Choices[id.StreamID].Choice == "all" && id.Path != "" {
-			folder := strings.Split(strings.TrimPrefix(id.Path, "joined/"), "/")[0]
-			if folder != "" {
-				p.KEFolders[folder] = true
-			}
-		}
+
 	}
 	err = rows.Err()
 	rows.Close()
+	if err != nil {
+		return p, err
+	}
+	p.KEFolders, err = loadInverseKEFolders(ctx, q, bucket, picks)
 	if err != nil {
 		return p, err
 	}
@@ -354,4 +353,35 @@ func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 		log.Fatal(err)
 	}
 	fmt.Println(string(data))
+}
+
+// Both full partition and bounded apply use the same KE path normalization and
+// discovery, including raw source paths behind content-addressed outputs.
+func loadInverseKEFolders(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks) (map[string]bool, error) {
+	folders := map[string]bool{}
+	var streams []int64
+	for id, pick := range picks.Choices {
+		if pick.Choice == "all" {
+			streams = append(streams, id)
+		}
+	}
+	if len(streams) == 0 {
+		return folders, nil
+	}
+	rows, err := q.Query(ctx, `SELECT DISTINCT folder FROM (
+ SELECT split_part(regexp_replace(c.display_path,'^joined/',''),'/',1) folder FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE c.bucket=$1 AND r.stream_id=ANY($2::bigint[])
+ UNION SELECT split_part(regexp_replace(o.nas_relative_path,'^joined/',''),'/',1) FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id JOIN recordings r ON r.id=h.recording_id WHERE r.stream_id=ANY($2::bigint[])
+ UNION SELECT split_part(regexp_replace(c.display_path,'^joined/',''),'/',1) FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE r.stream_id=ANY($2::bigint[]) AND EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.source_clip_ids @> ARRAY[c.id])) folders WHERE folder<>''`, bucket, streams)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var folder string
+		if err = rows.Scan(&folder); err != nil {
+			return nil, err
+		}
+		folders[folder] = true
+	}
+	return folders, rows.Err()
 }

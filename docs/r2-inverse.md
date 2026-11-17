@@ -67,8 +67,8 @@ The tick can generate a new read-only partition when its current one expires.
 
 Each new key commits an ordinary source reservation and a permanent key intent
 before wire, charges its byte budget, and fsyncs a private append-only JSONL
-ledger. The network phase uses shared admission locks so independent keys can
-run concurrently. A common live delivery predicate includes content/path aliases
+ledger. The network phase takes the metadata barrier first in shared mode, then
+ordered joined/admission locks, allowing independent keys to run concurrently. A common live delivery predicate includes content/path aliases
 and current collated-output dependencies without relying on a refreshed source
 cache; admission of those protections and output membership changes is fenced. It exercises the installed purge guards before DELETE, rolls
 that probe back, HEAD-checks listing/catalog ETag, size and seven-day age, and
@@ -117,3 +117,15 @@ Controller canary gate after Nov 19 14:30:47Z AND actual drain evidence:
 Full-cardinality startup cost and memory remain unmeasured: each invocation reads
 the manifest, private ledger and historical intent keys. The offline throughput
 fixture includes 10,010 collated outputs but does not establish 4.17M-key scale.
+
+Protection metadata changes take the epoch-row barrier with NOWAIT and can return
+SQLSTATE 55P03 during an active batch; retry metadata admission in a new
+transaction. They require READ COMMITTED so an earlier snapshot cannot miss a
+committed retirement. Cleanup receipts/control do not take this barrier or a new
+global lock. New cleanup recovery admission instead locks raw clip rows in order
+and rejects a committed reservation; retired items cannot reactivate a hold.
+Output IDs and source-hold identities cannot be rebound.
+
+The CLI pool has 20 connections. Workers default to 16 and may use at most the
+pool capacity minus two (18 here), retaining the session and independent issuance
+connections. Invalid capacity fails before any reservation or budget charge.
