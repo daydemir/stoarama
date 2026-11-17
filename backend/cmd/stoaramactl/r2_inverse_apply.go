@@ -29,7 +29,7 @@ type inverseDeleteStore interface {
 	Head(context.Context, string) (r2.ObjectHead, error)
 	EndpointSHA256() string
 	RequireNoMultipartUploads(context.Context) error
-	DeleteNonKeep28Once(context.Context, string, r2.NonKeep28DeleteGuard) error
+	DeleteNonKeep28Once(context.Context, *r2.NonKeep28DeleteAuthority) error
 }
 type inverseDrainEvidence struct {
 	Bucket                 string    `json:"bucket"`
@@ -283,15 +283,18 @@ type inverseWireGuard struct {
 	e  inverseEntry
 }
 
-func (g *inverseWireGuard) CheckNonKeep28Delete(ctx context.Context, bucket, endpoint, key string) error {
-	if bucket != g.a.store.Bucket() || endpoint != g.a.store.EndpointSHA256() || key != g.e.Key {
+func (g *inverseWireGuard) binding() r2.NonKeep28DeleteBinding {
+	return r2.NonKeep28DeleteBinding{Bucket: g.a.store.Bucket(), EndpointSHA256: g.a.store.EndpointSHA256(), Key: g.e.Key, ETag: g.e.ETag, SourceID: g.t.ID, StreamID: g.t.StreamID, SizeBytes: g.e.SizeBytes, LastModified: g.e.LastModified, ManifestSHA256: g.a.opts.ManifestSHA, PolicySHA256: g.a.summary.PolicySHA256, PicksSHA256: g.a.summary.PicksSHA256, DrainSHA256: g.a.opts.DrainSHA}
+}
+func (g *inverseWireGuard) CheckNonKeep28Delete(ctx context.Context, binding r2.NonKeep28DeleteBinding) error {
+	if binding != g.binding() {
 		return errors.New("wire authority scope differs")
 	}
 	if err := g.a.checkTarget(ctx, g.tx, g.t, g.e, false); err != nil {
 		return err
 	}
 	var durable bool
-	err := g.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_intents WHERE bucket=$1 AND object_key=$2 AND source_id=$3 AND manifest_sha256=$4 AND drain_evidence_sha256=$5 AND endpoint_sha256=$6 AND size_bytes=$7 AND etag=$8 AND stream_id=$9)`, bucket, key, g.t.ID, g.a.opts.ManifestSHA, g.a.opts.DrainSHA, endpoint, g.e.SizeBytes, g.e.ETag, g.t.StreamID).Scan(&durable)
+	err := g.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_intents WHERE bucket=$1 AND object_key=$2 AND source_id=$3 AND manifest_sha256=$4 AND drain_evidence_sha256=$5 AND endpoint_sha256=$6 AND size_bytes=$7 AND etag=$8 AND stream_id=$9)`, binding.Bucket, binding.Key, g.t.ID, g.a.opts.ManifestSHA, g.a.opts.DrainSHA, binding.EndpointSHA256, g.e.SizeBytes, g.e.ETag, g.t.StreamID).Scan(&durable)
 	if err != nil {
 		return err
 	}
@@ -344,7 +347,12 @@ func (a *inverseApplier) delete(ctx context.Context, e inverseEntry) (bool, erro
 	if err = a.store.RequireNoMultipartUploads(ctx); err != nil {
 		return false, err
 	}
-	if err = a.store.DeleteNonKeep28Once(ctx, e.Key, &inverseWireGuard{a, tx, t, e}); err != nil {
+	guard := &inverseWireGuard{a, tx, t, e}
+	authority, err := r2.AuthorizeNonKeep28Delete(ctx, guard.binding(), guard)
+	if err != nil {
+		return false, err
+	}
+	if err = a.store.DeleteNonKeep28Once(ctx, authority); err != nil {
 		return false, fmt.Errorf("single DELETE result ambiguous; intent retained, never retransmit: %w", err)
 	}
 	if _, err = a.store.Head(ctx, e.Key); !r2.IsNotFound(err) {
@@ -367,12 +375,31 @@ func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, mani
 	if err = inverseProtectionLocks(ctx, tx, false); err != nil {
 		return err
 	}
+	// A receipt and source publication must resolve the exact durable identity.
+	// Never turn a missing/rebound source into a successful absence event.
+	var sourceID int64
+	err = tx.QueryRow(ctx, `SELECT c.id FROM r2_inverse_intents i JOIN recording_clips c ON c.id=i.source_id
+ WHERE i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 AND i.endpoint_sha256=$4
+ AND c.bucket=i.bucket AND c.object_key=i.object_key AND c.size_bytes=i.size_bytes AND btrim(c.etag,'"')=btrim(i.etag,'"')
+ FOR UPDATE OF c`, a.store.Bucket(), e.Key, manifest, a.store.EndpointSHA256()).Scan(&sourceID)
+	if err != nil {
+		return fmt.Errorf("absence publication requires exact source: %w", err)
+	}
 	_, err = tx.Exec(ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256,already_absent)
  SELECT 'raw',c.id,i.stream_id,c.bucket,c.object_key,c.size_bytes,lower(c.sha256),'inverse_non_keep28',i.choice,$3,i.policy_sha256,$4
  FROM recording_clips c JOIN recordings r ON r.id=c.recording_id JOIN r2_inverse_intents i ON i.source_id=c.id
  WHERE i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 ON CONFLICT DO NOTHING`, a.store.Bucket(), e.Key, manifest, reconciled)
 	if err != nil {
 		return err
+	}
+	var receipt bool
+	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_object_retirements r JOIN r2_inverse_intents i ON r.bucket=i.bucket AND r.object_key=i.object_key JOIN recording_clips c ON c.id=i.source_id
+ WHERE i.bucket=$1 AND i.object_key=$2 AND r.kind='raw' AND r.source_id=$3 AND r.stream_id=i.stream_id AND r.size_bytes=i.size_bytes AND r.sha256=lower(c.sha256) AND r.choice=i.choice AND r.manifest_sha256=$4 AND r.policy_sha256=i.policy_sha256)`, a.store.Bucket(), e.Key, sourceID, manifest).Scan(&receipt)
+	if err != nil {
+		return err
+	}
+	if !receipt {
+		return errors.New("absence publication requires exact receipt")
 	}
 	_, err = tx.Exec(ctx, `UPDATE recording_clips c SET purged_at=clock_timestamp() FROM r2_inverse_intents i WHERE i.bucket=$1 AND i.object_key=$2 AND i.source_id=c.id AND c.purged_at IS NULL`, a.store.Bucket(), e.Key)
 	if err != nil {

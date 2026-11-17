@@ -42,7 +42,9 @@ live fence, drain, intent, budget and provider checks.
 
 ## Raw-only executor (separate release)
 
-The sole controller can call a bounded batch from `finish tick`:
+The sole controller can run a bounded batch with this interface. D-min remains
+a metadata feeder plus safety/space decision; it has no R2 apply hook. A later
+reviewed integration can call this interface after the drain/canary gate:
 
 ```
 stoaramactl r2-inverse apply \
@@ -55,12 +57,12 @@ stoaramactl r2-inverse apply \
 ```
 
 The budget is explicit, configurable, and includes unresolved intents. It is
-conservatively charged by minute over the preceding24h, with no owner-class5TB
-cap. The default100-object limit is the canary size; subsequent tick calls may
+conservatively charged by minute over the preceding 24h, with no owner-class 5 TB
+cap. The default 100-object limit is the canary size; subsequent tick calls may
 increase `--max-items` and the per-run byte bound within the daily budget.
 Only raw keys with one certain catalog identity and no protection are eligible.
 Collated, KE, keep28, tools, delivery, held and unknown keys are never deleted.
-The partition and picks must match the pinned policy and be no older than24h.
+The partition and picks must match the pinned policy and be no older than 24h.
 The tick can generate a new read-only partition when its current one expires.
 
 Each new key commits an ordinary source reservation and a permanent key intent
@@ -68,13 +70,13 @@ before wire, charges its byte budget, and fsyncs a private append-only JSONL
 ledger. The network phase uses shared admission locks so independent keys can
 run concurrently. It exercises the installed purge guards before DELETE, rolls
 that probe back, HEAD-checks listing/catalog ETag, size and seven-day age, and
-rechecks live protections, controller drain evidence and migration0198 at the
+rechecks live protections, controller drain evidence and migration 0198 at the
 wire. There is one DELETE attempt, no SDK replay or redirects. Success requires
-a confirming404. Receipt and raw purged_at publication happens separately with
+a confirming 404. Receipt and raw purged_at publication happens separately with
 exclusive admission locks, without upgrading a network transaction's locks.
 
 An existing intent is never retransmitted, including a crash before wire. On
-restart, a404 reconciles its receipt and ledger; a present object stays held as
+restart, a 404 reconciles its receipt and ledger; a present object stays held as
 `ambiguous_held` while unrelated fresh keys can proceed. Preserve the ledger and
 DB records. There is no automated intent expiry, removal, or ambiguous retry.
 A damaged/partial local ledger fails closed; it is never truncated or repaired.
@@ -89,17 +91,18 @@ all deployed writer coverage and completion of externally accepted PUTs.
 A string claiming completion or capability expiry does not establish that fact.
 The implementation agent creates none of this production evidence.
 
-Controller canary gate after Nov19 14:30:47Z AND actual drain evidence:
+Controller canary gate after Nov 19 14:30:47Z AND actual drain evidence:
 
 1. Record baseline provider bucket bytes and object count using the controller's
-   read-only metrics. Pin exactly100 eligible raw keys and their total bytes.
-2. Run one100-object batch with an explicit byte cap and24h budget. On any error,
+   read-only metrics. Pin exactly 100 eligible raw keys and their total bytes.
+2. Run one 100-object batch with an explicit byte cap and 24h budget. On any error,
    preserve evidence; reconcile existing intents by HEAD before continuing.
-3. Require100 distinct absent ledger keys =100 DB absent events =100 provider
-   removals, and HEAD404 for all100. Provider bucket bytes must fall; account for
+3. Require 100 distinct absent ledger keys = 100 DB absent events = 100 provider
+   removals, and HEAD 404 for all 100. Provider bucket bytes must fall; account for
    metric publication delay explicitly. No double-counting reconciliations.
-4. Require sustained>=8objects/s measured by elapsed batch wall time. The CLI
+4. Require sustained >=8 objects/s measured by elapsed batch wall time. The CLI
    prints `deleted`, `reconciled`, `ambiguous_held`, `bytes`, `elapsed_seconds`,
    and `objects_per_second`. Synthetic-provider throughput is not this gate.
-5. Only after every gate passes, configure the tick's larger bounded batches.
+5. Only after every gate passes, configure larger controller-owned batches.
+   Tick integration is a later change.
    Keep the same durable ledger across runs. Preserve reports outside temp.

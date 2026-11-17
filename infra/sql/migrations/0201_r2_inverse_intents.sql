@@ -63,7 +63,7 @@ CREATE FUNCTION fence_r2_inverse_protection() RETURNS trigger LANGUAGE plpgsql A
  PERFORM pg_advisory_xact_lock(7343226011101);
  RETURN NULL;
 END $$;
-CREATE TRIGGER r2_inverse_source_identity_fence BEFORE UPDATE OF recording_id,recording_job_id,bucket,object_key,etag,size_bytes,sha256,display_path,clip_start_at,clip_end_at OR DELETE ON recording_clips
+CREATE TRIGGER r2_inverse_source_identity_fence BEFORE UPDATE OF id,recording_id,recording_job_id,bucket,object_key,etag,size_bytes,sha256,display_path,clip_start_at,clip_end_at OR DELETE ON recording_clips
  FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();
 CREATE TRIGGER r2_inverse_recording_identity_fence BEFORE UPDATE OF stream_id,cron_timezone,account_id ON recordings
  FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();
@@ -91,6 +91,51 @@ CREATE TRIGGER r2_inverse_joined_snapshot_fence BEFORE INSERT OR UPDATE ON recor
 CREATE TRIGGER r2_inverse_joined_dry_fence BEFORE INSERT OR UPDATE ON recording_joined_dry_run_scopes
  FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();
 
+-- Delivery admission/enrichment is serialized with the entire wire phase.
+-- Reject adoption of any reserved identity, not just the direct hold key.
+CREATE TRIGGER r2_inverse_delivery_key_fence BEFORE INSERT OR UPDATE ON delivery_keep_holds
+ FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();
+CREATE TRIGGER r2_inverse_delivery_source_fence BEFORE INSERT OR UPDATE ON delivery_nas_source_holds
+ FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();
+CREATE TRIGGER r2_inverse_delivery_output_fence BEFORE INSERT OR UPDATE ON delivery_keep_output_dependencies
+ FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();
+CREATE FUNCTION guard_r2_inverse_delivery_admission() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF TG_TABLE_NAME='delivery_nas_source_holds' THEN
+  IF EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE kind='raw' AND source_id=NEW.clip_id) THEN
+   RAISE EXCEPTION 'R2 retirement reservation forbids delivery source adoption'; END IF;
+ ELSIF TG_TABLE_NAME='delivery_keep_output_dependencies' THEN
+  IF EXISTS(SELECT 1 FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id
+   JOIN r2_retirement_reservations r ON r.kind='raw' AND r.source_id=ANY(o.source_clip_ids)
+   WHERE o.id=NEW.output_id AND h.recording_id=NEW.recording_id) THEN
+   RAISE EXCEPTION 'R2 retirement reservation forbids delivery dependency adoption'; END IF;
+ ELSE
+  IF EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE bucket=NEW.bucket AND object_key=NEW.object_key)
+  OR EXISTS(SELECT 1 FROM r2_inverse_intents WHERE bucket=NEW.bucket AND object_key=NEW.object_key)
+  OR EXISTS(SELECT 1 FROM recording_clips c JOIN r2_retirement_reservations r ON r.kind='raw' AND r.source_id=c.id
+   WHERE (NEW.relative_path<>'' AND NEW.relative_path IN(c.display_path,regexp_replace(c.display_path,'^joined/','')))
+   OR (NEW.sha256<>'' AND NEW.sha256=c.sha256 AND NEW.size_bytes=c.size_bytes))
+  OR EXISTS(SELECT 1 FROM recording_collation_outputs o JOIN r2_retirement_reservations r ON r.kind='raw' AND r.source_id=ANY(o.source_clip_ids)
+   WHERE o.object_key=NEW.object_key) THEN
+   RAISE EXCEPTION 'R2 retirement reservation forbids delivery key adoption'; END IF;
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_inverse_delivery_key_admission BEFORE INSERT OR UPDATE ON delivery_keep_holds
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_inverse_delivery_admission();
+CREATE TRIGGER r2_inverse_delivery_source_admission BEFORE INSERT OR UPDATE ON delivery_nas_source_holds
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_inverse_delivery_admission();
+CREATE TRIGGER r2_inverse_delivery_output_admission BEFORE INSERT OR UPDATE ON delivery_keep_output_dependencies
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_inverse_delivery_admission();
+
+CREATE FUNCTION guard_r2_inverse_output_key() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE object_key=NEW.object_key)
+ OR EXISTS(SELECT 1 FROM r2_inverse_intents WHERE object_key=NEW.object_key) THEN
+  RAISE EXCEPTION 'R2 retirement reservation forbids collated key adoption'; END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_inverse_output_key_admission BEFORE INSERT OR UPDATE OF object_key ON recording_collation_outputs
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_inverse_output_key();
+
 -- Freeze pending source identity after admission commits. Once confirmed
 -- absent, immutable receipts retain history without permanently locking the
 -- catalog or adding a foreign-key veto to later authorized metadata cleanup.
@@ -100,7 +145,7 @@ CREATE FUNCTION guard_r2_inverse_source_identity() RETURNS trigger LANGUAGE plpg
   RAISE EXCEPTION 'R2 inverse intent freezes source identity'; END IF;
  IF TG_OP='DELETE' THEN RETURN OLD; END IF; RETURN NEW;
 END $$;
-CREATE TRIGGER r2_inverse_source_identity BEFORE UPDATE OF recording_id,recording_job_id,bucket,object_key,etag,size_bytes,sha256,display_path,clip_start_at,clip_end_at OR DELETE ON recording_clips
+CREATE TRIGGER r2_inverse_source_identity BEFORE UPDATE OF id,recording_id,recording_job_id,bucket,object_key,etag,size_bytes,sha256,display_path,clip_start_at,clip_end_at OR DELETE ON recording_clips
  FOR EACH ROW EXECUTE FUNCTION guard_r2_inverse_source_identity();
 
 -- The KE folder cache is small, but catalog identity may change between batches.
@@ -116,7 +161,7 @@ CREATE FUNCTION advance_r2_inverse_ke_epoch() RETURNS trigger LANGUAGE plpgsql A
 END $$;
 CREATE TRIGGER r2_inverse_ke_raw_epoch BEFORE INSERT OR UPDATE OF bucket,display_path,recording_id OR DELETE ON recording_clips
  FOR EACH STATEMENT EXECUTE FUNCTION advance_r2_inverse_ke_epoch();
-CREATE TRIGGER r2_inverse_ke_output_epoch BEFORE INSERT OR UPDATE OF nas_relative_path,collation_hour_id OR DELETE ON recording_collation_outputs
+CREATE TRIGGER r2_inverse_ke_output_epoch BEFORE INSERT OR UPDATE OF object_key,nas_relative_path,collation_hour_id OR DELETE ON recording_collation_outputs
  FOR EACH STATEMENT EXECUTE FUNCTION advance_r2_inverse_ke_epoch();
 CREATE TRIGGER r2_inverse_ke_hour_epoch BEFORE UPDATE OF recording_id ON recording_collation_hours
  FOR EACH STATEMENT EXECUTE FUNCTION advance_r2_inverse_ke_epoch();

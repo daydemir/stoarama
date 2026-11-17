@@ -24,13 +24,14 @@ import (
 )
 
 type inverseFakeStore struct {
-	endpointSHA string
-	mu          sync.Mutex
-	objects     map[string]r2.ObjectInfo
-	calls       int
-	lost        bool
-	delay       time.Duration
-	beforeHead  func(string) error
+	endpointSHA  string
+	mu           sync.Mutex
+	objects      map[string]r2.ObjectInfo
+	calls        int
+	lost         bool
+	delay        time.Duration
+	beforeHead   func(string) error
+	beforeDelete func(string) error
 }
 
 func (s *inverseFakeStore) Bucket() string         { return "stoarama" }
@@ -60,9 +61,15 @@ func (s *inverseFakeStore) Head(ctx context.Context, key string) (r2.ObjectHead,
 	}
 	return r2.ObjectHead{ETag: o.ETag, SizeBytes: o.SizeBytes, LastModified: o.LastModified}, nil
 }
-func (s *inverseFakeStore) DeleteNonKeep28Once(ctx context.Context, key string, g r2.NonKeep28DeleteGuard) error {
-	if err := g.CheckNonKeep28Delete(ctx, s.Bucket(), s.EndpointSHA256(), key); err != nil {
+func (s *inverseFakeStore) DeleteNonKeep28Once(ctx context.Context, authority *r2.NonKeep28DeleteAuthority) error {
+	key := authority.Binding().Key
+	if err := authority.RequireWire(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
 		return err
+	}
+	if s.beforeDelete != nil {
+		if err := s.beforeDelete(key); err != nil {
+			return err
+		}
 	}
 	if s.delay > 0 {
 		select {
@@ -121,6 +128,10 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		store.objects[key] = r2.ObjectInfo{Key: key, ETag: etag, SizeBytes: 100, LastModified: time.Now().UTC().Add(-8 * 24 * time.Hour).Truncate(time.Second)}
 		exec(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path) VALUES($1,30,1,'https://test.invalid','stoarama',$2,100,$3,repeat('b',64),'2026-06-01','2026-06-01','2026-06-01 00:01:00','ordinary/'||$4)`, 9000000+n, key, etag, fmt.Sprintf("%04d.mp4", n))
 	}
+	exec(`INSERT INTO recording_collation_hours(id,hour_id,batch_id,generation,recording_id,local_date,delivery_hour,status,manifest_object_key,manifest_sha256,manifest,source_clip_count,included_clip_count,excluded_clip_count,join_count,split_count)
+ VALUES(1,'inverse__recording-30__date-2026-06-01__hour-01__generation-2','inverse',2,30,'2026-06-01',1,'collated','joined/inverse/manifest.json',repeat('a',64),'{}',1,1,0,0,0);
+ INSERT INTO recording_collation_outputs(id,collation_hour_id,part,parts,object_key,nas_relative_path,size_bytes,sha256,start_at,end_at,source_clip_ids,r2_verified_at)
+ VALUES(1,1,1,1,'joined/inverse/objects/'||repeat('a',64)||'.mp4','joined/ordinary/test-output.mp4',100,repeat('a',64),'2026-06-01','2026-06-01 00:01',ARRAY[9000000]::bigint[],now());`)
 	exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, store.EndpointSHA256())
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -216,8 +227,10 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		if _, err := a.reserve(ctx, entries[0]); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := pool.Exec(ctx, `UPDATE recording_clips SET display_path='changed' WHERE object_key=$1`, entries[0].Key); err == nil {
-			t.Fatal("pending source identity changed")
+		for _, query := range []string{`UPDATE recording_clips SET display_path='changed' WHERE object_key=$1`, `UPDATE recording_clips SET id=id+100000 WHERE object_key=$1`} {
+			if _, err := pool.Exec(ctx, query, entries[0].Key); err == nil {
+				t.Fatal("pending source identity changed", query)
+			}
 		}
 		a.ledger.close()
 		before := store.calls
@@ -249,7 +262,9 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		store.beforeHead = func(key string) error {
 			if key == target {
 				once.Do(func() {
-					exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`, key)
+					if err := os.WriteFile(picksPath, append(picksData, ' '), 0600); err != nil {
+						t.Fatal(err)
+					}
 				})
 			}
 			return nil
@@ -257,8 +272,118 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		before := store.calls
 		_, err := applyInverse(ctx, pool, store, a.opts)
 		store.beforeHead = nil
+		if restoreErr := os.WriteFile(picksPath, picksData, 0600); restoreErr != nil {
+			t.Fatal(restoreErr)
+		}
 		if err == nil || store.calls != before {
-			t.Fatal("changed hold reached DELETE", err)
+			t.Fatal("changed picks reached DELETE", err)
+		}
+	})
+	t.Run("delivery_admitted_before_intent_wins", func(t *testing.T) {
+		for _, kind := range []string{"key", "source"} {
+			t.Run(kind, func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				if kind == "key" {
+					exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`, entries[0].Key)
+				} else {
+					exec(`INSERT INTO delivery_nas_source_holds SELECT id FROM recording_clips WHERE object_key=$1`, entries[0].Key)
+				}
+				if _, err := a.reserve(ctx, entries[0]); err == nil {
+					t.Fatal("delivery admission lost to intent")
+				}
+			})
+		}
+	})
+	t.Run("late_admission_blocked_through_wire_then_intent_vetoes", func(t *testing.T) {
+		for _, kind := range []string{"delivery_key", "delivery_source", "delivery_output", "delivery_path_enrichment", "collated_key"} {
+			t.Run(kind, func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				var id int64
+				if err := pool.QueryRow(ctx, `SELECT id FROM recording_clips WHERE object_key=$1`, e.Key).Scan(&id); err != nil {
+					t.Fatal(err)
+				}
+				exec(`UPDATE recording_collation_outputs SET source_clip_ids=ARRAY[$1]::bigint[] WHERE id=1`, id)
+				query := `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`
+				var arg any = e.Key
+				switch kind {
+				case "delivery_source":
+					query = `INSERT INTO delivery_nas_source_holds(clip_id) VALUES($1)`
+					arg = id
+				case "delivery_output":
+					query = `INSERT INTO delivery_keep_output_dependencies(output_id,recording_id) VALUES(1,$1)`
+					arg = int64(30)
+				case "delivery_path_enrichment":
+					placeholder := "datasets/test/" + strconv.FormatInt(id, 10)
+					exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`, placeholder)
+					query = `UPDATE delivery_keep_holds SET relative_path=(SELECT display_path FROM recording_clips WHERE id=$1) WHERE object_key='` + placeholder + `'`
+					arg = id
+				case "collated_key":
+					query = `UPDATE recording_collation_outputs SET object_key=$1 WHERE id=1`
+				}
+				store.beforeDelete = func(key string) error {
+					if key != e.Key {
+						return errors.New("unexpected wire key")
+					}
+					// This runs after the final live guard, while the network transaction
+					// owns shared protection locks. Direct SQL must be unable to commit.
+					lateCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+					defer cancel()
+					_, err := pool.Exec(lateCtx, query, arg)
+					if err == nil || lateCtx.Err() == nil {
+						return fmt.Errorf("late admission was not fenced: %v", err)
+					}
+					return nil
+				}
+				before := store.calls
+				ok, err := a.delete(ctx, e)
+				store.beforeDelete = nil
+				if err != nil || !ok || store.calls != before+1 {
+					t.Fatalf("wire result %v %v", ok, err)
+				}
+				if _, err = pool.Exec(ctx, query, arg); err == nil || !strings.Contains(err.Error(), "reservation") {
+					t.Fatal("committed intent failed to forbid later admission", err)
+				}
+			})
+		}
+	})
+	t.Run("missing_source_cannot_publish_completion", func(t *testing.T) {
+		a, entries := build(1)
+		defer a.ledger.close()
+		e := entries[0]
+		target, err := a.reserve(ctx, e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Deliberately bypass triggers in this isolated test database to prove the
+		// publication invariant independently from the identity freeze trigger.
+		move := func(from, to int64) {
+			t.Helper()
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if _, err = tx.Exec(ctx, `SET LOCAL session_replication_role=replica`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec(ctx, `UPDATE recording_clips SET id=$2 WHERE id=$1`, from, to); err != nil {
+				t.Fatal(err)
+			}
+			if err = tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		move(target.ID, target.ID+100000)
+		defer move(target.ID+100000, target.ID)
+		if err = a.publishAbsent(ctx, e, a.opts.ManifestSHA, true); err == nil {
+			t.Fatal("missing source published completion")
+		}
+		var events int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_events WHERE object_key=$1`, e.Key).Scan(&events); err != nil || events != 0 {
+			t.Fatal(events, err)
 		}
 	})
 	t.Run("installed_purge_veto_precedes_intent_and_wire", func(t *testing.T) {

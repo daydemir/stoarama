@@ -5,8 +5,10 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type testNonKeep28Guard struct {
@@ -14,8 +16,8 @@ type testNonKeep28Guard struct {
 	denyAt int32
 }
 
-func (g *testNonKeep28Guard) CheckNonKeep28Delete(_ context.Context, bucket, endpoint, key string) error {
-	if bucket != "bucket" || endpoint == "" || key != "managed/test.mp4" {
+func (g *testNonKeep28Guard) CheckNonKeep28Delete(_ context.Context, b NonKeep28DeleteBinding) error {
+	if b.Bucket != "bucket" || b.EndpointSHA256 == "" || b.Key != "managed/test.mp4" {
 		return errors.New("binding differs")
 	}
 	if n := g.calls.Add(1); g.denyAt > 0 && n >= g.denyAt {
@@ -46,13 +48,27 @@ func TestR2InverseSingleWireAndChangedProtection(t *testing.T) {
 			}
 			guard := &testNonKeep28Guard{}
 			if mode == "changed_protection" {
-				guard.denyAt = 2
+				guard.denyAt = 3
 			}
-			var authority NonKeep28DeleteGuard = guard
+			b := NonKeep28DeleteBinding{Bucket: "bucket", EndpointSHA256: c.EndpointSHA256(), Key: "managed/test.mp4", ETag: "etag", SourceID: 1, StreamID: 1, SizeBytes: 100, LastModified: time.Now().Add(-8 * 24 * time.Hour), ManifestSHA256: strings.Repeat("a", 64), PolicySHA256: strings.Repeat("b", 64), PicksSHA256: strings.Repeat("c", 64), DrainSHA256: strings.Repeat("d", 64)}
+			authority, err := AuthorizeNonKeep28Delete(context.Background(), b, guard)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if mode == "missing_authority" {
-				authority = nil
+				authority = &NonKeep28DeleteAuthority{}
 			}
-			err = c.DeleteNonKeep28Once(context.Background(), "managed/test.mp4", authority)
+			err = c.DeleteNonKeep28Once(context.Background(), authority)
+			// Repeated calls and value copies may never create a second attempt,
+			// after success, a protection veto or an ambiguous lost response.
+			clone := *authority
+			if retryErr := c.DeleteNonKeep28Once(context.Background(), authority); retryErr == nil {
+				t.Fatal("authority replay accepted")
+			}
+			if retryErr := c.DeleteNonKeep28Once(context.Background(), &clone); retryErr == nil {
+				t.Fatal("copied authority replay accepted")
+			}
+
 			want := int32(1)
 			if mode == "changed_protection" || mode == "missing_authority" {
 				want = 0
