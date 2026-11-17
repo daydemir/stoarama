@@ -82,6 +82,11 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 	}
 	identities := p.Identities[o.Key]
 	for _, id := range identities {
+		for _, component := range strings.Split(id.Path, "/") {
+			if p.KEFolders[component] {
+				return inverseKE, "keep_everything_catalog_path"
+			}
+		}
 		if p.Picks.Choices[id.StreamID].Choice == "all" {
 			return inverseKE, "keep_everything_stream"
 		}
@@ -94,7 +99,7 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 	unknown := false
 	for _, id := range identities {
 		w, ok := p.Windows[id.StreamID]
-		if !ok || id.Start == nil || id.End == nil || !id.End.After(*id.Start) || id.Timezone != w.Timezone || id.Path == "" {
+		if !ok || id.Start == nil || id.End == nil || !r2RetireValidSpan(*id.Start, *id.End) || id.Timezone != w.Timezone || id.Path == "" {
 			unknown = true
 			continue
 		}
@@ -104,6 +109,14 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 		if r2RetireEffectiveChoice(p.Picks.Choices[id.StreamID], true, w) == "" {
 			unknown = true
 		}
+	}
+	for _, id := range identities {
+		if id.Kind == "collated" {
+			return inverseHeld, "collated_deferred"
+		}
+	}
+	if len(identities) > 1 {
+		unknown = true
 	}
 	if unknown {
 		return inverseUnknown, "uncertain_policy_or_identity"
@@ -146,6 +159,11 @@ WITH held_sources AS (
  UNION SELECT $1,o.object_key FROM recording_collation_outputs o WHERE EXISTS(SELECT 1 FROM nas_cleanup_incident_sources i WHERE i.clip_id=ANY(o.source_clip_ids))
  UNION SELECT c.bucket,c.object_key FROM recording_clips c JOIN nas_restore_requests r ON r.clip_id=c.id WHERE r.state IN ('pending','leased')
  UNION SELECT c.bucket,c.object_key FROM recording_clips c JOIN recording_joined_source_snapshots s ON s.clip_id=c.id
+ UNION SELECT c.bucket,c.object_key FROM recording_clips c JOIN recording_joined_snapshot_scopes s
+ ON s.recording_id=c.recording_id AND s.recording_job_id=c.recording_job_id AND c.id<=s.high_water_clip_id
+ JOIN recording_joined_batches b ON b.id=s.batch_record_id AND b.state='snapshotting'
+ UNION SELECT c.bucket,c.object_key FROM recording_clips c JOIN recording_joined_dry_run_scopes s
+ ON s.recording_id=c.recording_id AND s.recording_job_id=c.recording_job_id AND c.id<=s.high_water_clip_id
  UNION SELECT item->>'bucket',item->>'object_key' FROM nas_r2_copy_items WHERE state='blocked'
 ) SELECT object_key FROM held_keys WHERE bucket=$1`
 const inverseDeliverySQL = `
