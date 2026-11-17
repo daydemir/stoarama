@@ -1,5 +1,6 @@
 -- B1 raw-only inverse retirement. No activation or deletion by migration.
 -- 0200 supplies the exact COPY-key reservation/import lock and veto.
+SELECT 'lock_nas_r2_copy_key(text,text)'::regprocedure;
 CREATE TABLE r2_inverse_intents (
  bucket text NOT NULL, object_key text NOT NULL,
  source_id bigint NOT NULL REFERENCES recording_clips(id),

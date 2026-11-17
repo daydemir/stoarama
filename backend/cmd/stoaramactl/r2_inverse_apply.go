@@ -48,10 +48,12 @@ type inverseApplyOptions struct {
 	Workers                                                                            int
 }
 type inverseApplySummary struct {
-	Deleted, Reconciled, AmbiguousHeld int64   `json:",omitempty"`
-	Bytes                              int64   `json:"bytes"`
-	ElapsedSeconds                     float64 `json:"elapsed_seconds"`
-	ObjectsPerSecond                   float64 `json:"objects_per_second"`
+	Deleted          int64   `json:"deleted"`
+	Reconciled       int64   `json:"reconciled"`
+	AmbiguousHeld    int64   `json:"ambiguous_held"`
+	Bytes            int64   `json:"bytes"`
+	ElapsedSeconds   float64 `json:"elapsed_seconds"`
+	ObjectsPerSecond float64 `json:"objects_per_second"`
 }
 type inverseRawTarget struct {
 	ID, StreamID    int64
@@ -179,7 +181,7 @@ const inverseRawHeldSQL = `SELECT
  OR EXISTS(SELECT 1 FROM nas_cleanup_incident_sources WHERE clip_id=$1)
  OR EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE bucket=$2 AND object_key=$3 AND NOT (kind='raw' AND source_id=$1 AND manifest_sha256=$4))
  OR EXISTS(SELECT 1 FROM r2_object_retirements WHERE bucket=$2 AND object_key=$3)
- OR EXISTS(SELECT 1 FROM nas_r2_copy_items WHERE state<>'verified' AND item->>'bucket'=$2 AND item->>'object_key'=$3)
+ OR EXISTS(SELECT 1 FROM nas_r2_copy_items WHERE (state<>'verified' OR blocked_reason<>'') AND item->>'bucket'=$2 AND item->>'object_key'=$3)
  OR EXISTS(SELECT 1 FROM delivery_keep_holds WHERE bucket=$2 AND (object_key=$3 OR (relative_path<>'' AND relative_path=$5)))
  OR EXISTS(SELECT 1 FROM delivery_nas_source_holds WHERE clip_id=$1)
  OR EXISTS(SELECT 1 FROM nas_restore_requests WHERE clip_id=$1 AND state IN ('pending','leased'))
