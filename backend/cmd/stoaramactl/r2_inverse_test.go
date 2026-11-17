@@ -250,3 +250,26 @@ func TestR2InverseCatalogPathBoundsAndDeferredCollated(t *testing.T) {
 		t.Fatal("ambiguous aliases", got)
 	}
 }
+
+func TestR2InversePartitionTxReadOnlyCatalogBudget(t *testing.T) {
+	ctx := context.Background()
+	pool := joinedPurgeTestPool(t, "inverse_partition_tx")
+	tx, err := beginInversePartitionTx(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	var timeout, readOnly string
+	if err := tx.QueryRow(ctx, `SHOW statement_timeout`).Scan(&timeout); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.QueryRow(ctx, `SHOW transaction_read_only`).Scan(&readOnly); err != nil {
+		t.Fatal(err)
+	}
+	if timeout != "30min" {
+		t.Fatalf("statement_timeout got %q want 30min", timeout)
+	}
+	if readOnly != "on" {
+		t.Fatalf("transaction_read_only got %q want on", readOnly)
+	}
+}
