@@ -18182,7 +18182,8 @@ CLEANUP_GROUP_VERSION = "cleanup-batch-v6.1"
 CLEANUP_V6_VERSIONS: frozenset[str] = frozenset((CLEANUP_GROUP_VERSION, "r2-copy-v1"))
 CLEANUP_BULK_VERSION = "cleanup-batch-v7"
 CLEANUP_TRUTH_VERSION = "cleanup-batch-v8"
-CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, "r2-copy-v2", "r2-copy-v3", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
+CLEANUP_FRESH_PERMIT_VERSION = "v85r-nas-proof-v2.2"
+CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v2", "r2-copy-v3", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
 CLEANUP_GROUP_VERSIONS: frozenset[str] = CLEANUP_V6_VERSIONS | CLEANUP_BULK_VERSIONS
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
@@ -18195,6 +18196,12 @@ CLEANUP_V2_FALLBACK_SEC = 3600
 CLEANUP_V2_ERROR_WAIT_SEC = 15
 CLEANUP_DRAIN_RETRY_SEC = 2
 CLEANUP_RETRYABLE_ATTEMPTS = 8
+
+
+def cleanup_execution_group_size():
+    # One lease/permit clock per file. NAS syscall latency must never consume
+    # another file's short authority window. Historical releases retain v7.
+    return 1 if CLIENT_VERSION == CLEANUP_FRESH_PERMIT_VERSION else CLEANUP_EXECUTION_GROUP
 
 
 class CleanupProtocolUnsupported(RuntimeError):
@@ -18489,9 +18496,9 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
             while not exhausted and not stop_event.is_set() and (active is None or active.is_set()) and error is None and (len(pending) < inflight or (pending and not dry_run_only and CLIENT_VERSION in CLEANUP_BULK_VERSIONS)) and leased < task_limit:
                 lane.before_lease()
                 execution_poll = bool(pending) and not dry_run_only and CLIENT_VERSION in CLEANUP_BULK_VERSIONS
-                room = min(CLEANUP_EXECUTION_GROUP if execution_poll else min(CLEANUP_V2_LEASE, inflight - len(pending)), task_limit - leased)
+                room = min(cleanup_execution_group_size() if execution_poll else min(CLEANUP_V2_LEASE, inflight - len(pending)), task_limit - leased)
                 files_left, bytes_left = (0, 0) if dry_run_only else cleanup_local_headroom(inventory)
-                files_left = min(files_left, CLEANUP_EXECUTION_GROUP if CLIENT_VERSION in CLEANUP_GROUP_VERSIONS else CLEANUP_EXECUTION_INFLIGHT)
+                files_left = min(files_left, cleanup_execution_group_size() if CLIENT_VERSION in CLEANUP_GROUP_VERSIONS else CLEANUP_EXECUTION_INFLIGHT)
                 if pins_error is not None:
                     files_left = bytes_left = 0  # every deletion would be refused
                 lease = (cleanup_lease_v2(cfg, room, files_left, bytes_left, execution_only=True)
@@ -18656,7 +18663,7 @@ def cleanup_own_group(inventory, tasks):
     owned = []
     with inventory.lock:
         try:
-            if (CLIENT_VERSION not in CLEANUP_GROUP_VERSIONS or not 1 <= len(tasks) <= CLEANUP_EXECUTION_GROUP
+            if (CLIENT_VERSION not in CLEANUP_GROUP_VERSIONS or not 1 <= len(tasks) <= cleanup_execution_group_size()
                     or len({t["item_id"] for t in tasks}) != len(tasks)
                     or len({t["plan_sha256"] for t in tasks}) != 1
                     or any(t.get("execution_batch") is not True or t.get("approved_proof") is None for t in tasks)):

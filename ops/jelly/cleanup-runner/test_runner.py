@@ -860,6 +860,32 @@ class LoopTests(unittest.TestCase):
                 r.Runner.monitor(job, 42)
             self.assertEqual(job.events, ['OFF', 'recovery', 'plans/42/close'])
 
+    def test_monitor_rechecks_auto_pause_between_report_and_active_query(self):
+        for reason in ('auto-paused: approval expired', 'auto-paused: uncertain receipt'):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as root:
+                job = FakeRunner(root)
+                job.p.update(mode='enabled', master_deletion_enabled=True)
+                job.status.update(current_plan=42, live_commit='d'*40)
+                def pause():
+                    job.p.update(mode='paused', approval_reason=reason)
+                    return {'plans': [], 'batches': 0}
+                job.active = pause
+                with patch.object(job, 'finish') as finish:
+                    r.Runner.monitor(job, 42)
+                finish.assert_called_once_with(job.p)
+                self.assertEqual(job.p['mode'], 'paused')
+
+    def test_monitor_empty_active_requires_confirmed_stop_and_rejects_other_execution(self):
+        for active in ({'plans': [], 'batches': 0}, {'plans': [99], 'batches': 0},
+                       {'plans': [], 'batches': 1}):
+            with self.subTest(active=active), tempfile.TemporaryDirectory() as root:
+                job = FakeRunner(root)
+                job.p.update(mode='enabled', master_deletion_enabled=True)
+                job.active = lambda: active
+                with patch.object(job, 'finish') as finish, self.assertRaises(r.Halt):
+                    r.Runner.monitor(job, 42)
+                finish.assert_not_called()
+
     def test_deleted_anomalous_pause_still_stops(self):
         p, _ = fixture()
         p['mode'] = 'paused'

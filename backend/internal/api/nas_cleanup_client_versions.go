@@ -26,6 +26,7 @@ const nasCleanupItemTruthClientVersion = "cleanup-batch-v8"
 const nasCleanupR2CopyClientVersion = "r2-copy-v2"
 const nasCleanupR2CopyControlClientVersion = "r2-copy-v3"
 const nasCleanupProofClientVersion = "v85r-nas-proof-v2"
+const nasCleanupFreshPermitClientVersion = "v85r-nas-proof-v2.2"
 const nasCleanupPermitTransportClientVersion = "v85r-nas-proof-v2.1"
 
 // Capability eligibility only. Native producer/current reader artifact profiles
@@ -49,7 +50,7 @@ func nasClientSupportsStitchProof(version string) bool {
 
 func nasCleanupSupportsBulk(version string) bool {
 	switch version {
-	case nasCleanupBulkDurabilityClientVersion, nasCleanupItemTruthClientVersion, nasCleanupR2CopyClientVersion, nasCleanupR2CopyControlClientVersion, "v85r-nas-proof-v1", nasCleanupProofClientVersion, nasCleanupPermitTransportClientVersion:
+	case nasCleanupBulkDurabilityClientVersion, nasCleanupItemTruthClientVersion, nasCleanupR2CopyClientVersion, nasCleanupR2CopyControlClientVersion, "v85r-nas-proof-v1", nasCleanupProofClientVersion, nasCleanupPermitTransportClientVersion, nasCleanupFreshPermitClientVersion:
 		return true
 	default:
 		return false

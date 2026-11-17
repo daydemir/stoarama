@@ -1057,7 +1057,16 @@ class Runner:
             # A running plan we own must still see the master ON; anything else is a mismatch.
             require(p.get('master_deletion_enabled') is True, 'master switch mismatch during execution')
             active = self.active()
-            require(active['plans'] == [pid] and active['batches'] == 0, 'concurrent cleanup execution')
+            require(active['batches'] == 0 and active['plans'] in ([], [pid]),
+                    'concurrent cleanup execution')
+            if not active['plans']:
+                # Auto-pause can commit between the report and catalog read.
+                # Reclassify only our plan; unknown execution still stops above.
+                p = self.plan(pid)
+                require(execution_state(p) != 'running',
+                        'owned running plan missing from active execution')
+                self.finish(p)
+                return
             require(self.live()['commit']['id'] == self.status['live_commit'], 'live commit changed during execution')
             if self.status.get('next_plan') is not None:
                 dry_state(self.plan(self.status['next_plan']))  # A failed lookahead stops and alerts too.
