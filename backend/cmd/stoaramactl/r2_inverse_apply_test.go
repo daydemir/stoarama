@@ -103,7 +103,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec(`INSERT INTO accounts(id,email) VALUES(47,'inverse@test.invalid');
- INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone) VALUES(3,'test','3','inverse','inverse','https://test.invalid','off','Asia/Tokyo');
+ INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps) VALUES(3,'test','3','inverse','inverse','https://test.invalid','off','Asia/Tokyo','hls','video_manifest','video_live','continuous_video',30);
  INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc) VALUES(1,47,'test','https://test.invalid','auto','stoarama','fixture',decode('00','hex'));
  INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id) VALUES(30,47,1,'inverse','https://test.invalid','* * * * *','Asia/Tokyo','paused',3);`)
 	const count = 80
