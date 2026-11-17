@@ -783,6 +783,8 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				if err := pool.QueryRow(ctx, `SELECT id,recording_id,display_path,size_bytes,sha256,clip_start_at,clip_end_at FROM recording_clips WHERE object_key=$1`, e.Key).Scan(&i.SourceID, &i.RecordingID, &i.RelativePath, &i.SizeBytes, &i.SHA256, &i.StartAt, &i.EndAt); err != nil {
 					t.Fatal(err)
 				}
+				// Manifest import receives JSON timestamps, not pgx's scan location.
+				i.StartAt, i.EndAt = i.StartAt.UTC(), i.EndAt.UTC()
 				h := nasCopyHeader{PolicySHA256: policy}
 				if err := queueNASR2CopyItem(ctx, pool, h, strings.Repeat("a", 64), i, true); err != nil {
 					t.Fatal("initial real import", err)
