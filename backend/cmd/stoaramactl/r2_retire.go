@@ -948,7 +948,7 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	if a.opts.ProviderUnconditionalHeadGuard {
-		if err := r2RetireLockStoppedWriters(ctx, tx, a.header.Bucket); err != nil {
+		if err := r2RetireLockBlockedWrites(ctx, tx, a.header.Bucket, a.store.EndpointSHA256()); err != nil {
 			return "", "", err
 		}
 	}

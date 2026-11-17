@@ -40,7 +40,7 @@ func r2WriterFenceFixture(t *testing.T) *pgxpool.Pool {
 	for _, table := range []string{"recording_clips", "recording_collation_hours", "recording_collation_outputs", "nas_stitch_outputs", "recording_native_stitch_certifications", "media_objects", "frames"} {
 		exec("CREATE TABLE " + table + "(id bigint)")
 	}
-	for _, name := range []string{"0187_r2_writer_admission_fence.sql", "0196_r2_capture_process_admission.sql"} {
+	for _, name := range []string{"0187_r2_writer_admission_fence.sql", "0196_r2_capture_process_admission.sql", "0198_r2_blocked_writes.sql"} {
 		body, err := os.ReadFile("../../../infra/sql/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
