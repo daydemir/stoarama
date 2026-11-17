@@ -122,7 +122,13 @@ UNION ALL
 SELECT o.object_key,coalesce(r.stream_id,0),coalesce(o.nas_relative_path,''),o.start_at,o.end_at,
  coalesce(nullif(s.local_timezone,''),r.cron_timezone,''),'collated'
 FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id
-JOIN recordings r ON r.id=h.recording_id LEFT JOIN streams s ON s.id=r.stream_id`
+JOIN recordings r ON r.id=h.recording_id LEFT JOIN streams s ON s.id=r.stream_id
+UNION ALL
+SELECT o.object_key,coalesce(r.stream_id,0),coalesce(c.display_path,''),c.clip_start_at,c.clip_end_at,
+ coalesce(nullif(s.local_timezone,''),r.cron_timezone,''),'source'
+FROM recording_collation_outputs o LEFT JOIN LATERAL unnest(o.source_clip_ids) source_id ON true
+LEFT JOIN recording_clips c ON c.id=source_id LEFT JOIN recordings r ON r.id=c.recording_id
+LEFT JOIN streams s ON s.id=r.stream_id`
 
 // Use the actual hold tables, without interpreting a NAS inventory row as a
 // hold release. Retired plans that ever issued a delete retain source holds.
