@@ -251,7 +251,7 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 	if err = finishCleanupValve(ctx, tx, status); err != nil {
 		return false, err
 	}
-	if status.NASSpaceClientVersion != api.NASStorageBudgetClientVersion {
+	if !api.SupportsNASStorageBudget(status.NASSpaceClientVersion) {
 		status.RefreshHold = finishLateClientUnknown
 		return false, nil
 	}

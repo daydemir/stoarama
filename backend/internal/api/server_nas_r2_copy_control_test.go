@@ -460,3 +460,27 @@ func TestNASR2CopyStalledBodyReturnsBeforeTransportDeadline(t *testing.T) {
 		t.Fatalf("stalled body status %d", response.StatusCode)
 	}
 }
+
+func TestNASR2CopyEarlyRefusalDoesNotDrainStalledBody(t *testing.T) {
+	_, srv := authenticatedCopyFixture(t)
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err = conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: fixture\r\nAuthorization: Bearer wrong-fixture-key\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{", copyControlLeasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("silent early-refusal drain: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 401 {
+		t.Fatalf("early refusal status %d", response.StatusCode)
+	}
+}

@@ -326,6 +326,28 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 		t.Fatalf("paged=%v oracle=%v advanced empty=%t", got, want, emptyAdvanced)
 	}
 
+	// A complete expensive-stage batch rejected by the fence must advance only
+	// to that batch's end; later held outputs within the candidate page survive.
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_collation_outputs
+ SELECT g,12,1,'held-object-'||g,'held-'||g,1000,repeat('a',64),ARRAY[101::bigint]
+ FROM generate_series(3000,3020)g;
+ CREATE OR REPLACE FUNCTION nas_delivery_allowed(connection bigint,kind text,source bigint) RETURNS boolean LANGUAGE sql STABLE AS $$SELECT source=3020$$;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_collation_outputs SET nas_relative_path=$1 WHERE id=3020`, dir+"19_190001-200001.mp4"); err != nil {
+		t.Fatal(err)
+	}
+	after = 2999
+	for _, wantNext := range []int64{3009, 3019, 3020} {
+		code, page := do(s.handleAccountCollated, http.MethodGet, fmt.Sprintf("/api/v1/account/collated?after_id=%d", after), nil, nil)
+		if code != 200 || int64(page["next_after_id"].(float64)) != wantNext {
+			t.Fatalf("fence page=%v status=%d", page, code)
+		}
+		if wantNext == 3020 && len(page["items"].([]any)) != 1 {
+			t.Fatalf("later fenced-page output lost: %v", page)
+		}
+		after = wantNext
+	}
 	// PostgreSQL, not only the Go context, cancels slow eligibility work. The
 	// connection remains usable and the outer 3s budget has time to return 503.
 	if _, err := pool.Exec(ctx, `CREATE OR REPLACE FUNCTION nas_delivery_allowed(connection bigint,kind text,source bigint) RETURNS boolean LANGUAGE plpgsql STABLE AS $$BEGIN PERFORM pg_sleep(4);RETURN true;END$$`); err != nil {

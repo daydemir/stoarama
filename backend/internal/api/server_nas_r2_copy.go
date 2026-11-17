@@ -57,10 +57,11 @@ func nasR2CopyDeadline(next http.Handler) http.Handler {
 		deadline, _ := ctx.Deadline()
 		transport := http.NewResponseController(w)
 		if err := transport.SetReadDeadline(deadline); err != nil {
+			w.Header().Set("Connection", "close")
 			util.WriteError(w, 503, "copy read deadline unavailable; retryable")
 			return
 		}
-		defer transport.SetReadDeadline(time.Time{})
+		defer func() { _ = transport.Flush(); _ = transport.SetReadDeadline(time.Time{}) }()
 		out := &nasDeliveryResponse{header: make(http.Header)}
 		next.ServeHTTP(out, r.WithContext(ctx))
 		if (ctx.Err() != nil || !time.Now().Before(deadline)) && !nasR2CopyCommittedResponse(out.status) {

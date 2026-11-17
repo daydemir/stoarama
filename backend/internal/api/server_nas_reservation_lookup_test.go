@@ -76,21 +76,39 @@ func TestNASReservationMigrationRejectsUnsafePrerequisites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, change := range []string{
-		`DROP INDEX nas_cleanup_manifest_keys_idx`,
-		`DROP INDEX nas_cleanup_manifest_keys_idx; CREATE INDEX nas_cleanup_manifest_keys_idx ON nas_cleanup_plans(id)`,
-		`CREATE OR REPLACE FUNCTION nas_cleanup_manifest_keys(manifest jsonb) RETURNS text[] LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT '{}'::text[] $$`,
+	if _, err = f.pool.Exec(f.ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(99999,47,13,'guard-seed',repeat('a',64),'[]',repeat('b',64))`); err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range []struct{ sql, want string }{
+		{`DROP INDEX nas_cleanup_manifest_keys_idx`, "precreate nas_cleanup_manifest_keys_idx"},
+		{`DROP INDEX nas_cleanup_manifest_keys_idx; CREATE INDEX nas_cleanup_manifest_keys_idx ON nas_cleanup_plans(id)`, "not the exact valid reservation index"},
+		{`CREATE OR REPLACE FUNCTION nas_cleanup_manifest_keys(manifest jsonb) RETURNS text[] LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT '{}'::text[] $$`, "differs from the indexed immutable projection"},
 	} {
 		tx, err := f.pool.Begin(f.ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err = tx.Exec(f.ctx, change); err != nil {
+		if _, err = tx.Exec(f.ctx, `DROP FUNCTION nas_cleanup_file_reserved(text,bigint)`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err = tx.Exec(f.ctx, string(body)); err == nil {
-			t.Fatalf("unsafe prerequisite accepted: %s", change)
+		if _, err = tx.Exec(f.ctx, change.sql); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = tx.Exec(f.ctx, string(body)); err == nil || !strings.Contains(err.Error(), change.want) {
+			t.Fatalf("expected %s, got %v", change.want, err)
 		}
 		tx.Rollback(f.ctx)
 	}
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(f.ctx)
+	if _, err = tx.Exec(f.ctx, `DROP FUNCTION nas_cleanup_file_reserved(text,bigint)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(f.ctx, string(body)); err != nil {
+		t.Fatalf("valid prerequisites rejected: %v", err)
+	}
+
 }

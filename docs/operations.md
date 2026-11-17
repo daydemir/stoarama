@@ -498,7 +498,7 @@ fence, release recovery/delivery/reference holds, or prove global writer drain.
 The ordinary diagnostic still reports every remaining blocker honestly. No
 production cancellation has been performed by this implementation.
 
-### COPY source lookup and collated paging rollout (0206–0207)
+### COPY source lookup and collated paging rollout (0206–0208)
 
 The COPY lease validates a source before HEAD and again under admission. The old
 reservation view expands every cleanup manifest for each lookup; 1,438 plans
@@ -510,7 +510,13 @@ in force. No plan or item is rewritten.
 
 The original collated feed exceeded a 30-second read-only EXPLAIN ANALYZE budget.
 The paged query took 291 ms on the first 1,000 candidates and 115 ms near the tail
-of the same production catalog. These are DB execution times, not HTTP timings.
+of the same production catalog (both empty). A read-only probe of 50 real outputs
+intersecting the active keep window evaluated the unchanged delivery fence and
+returned all 50 in 39 ms. Production source fanout has p99=60 and maximum=61. A 50-output high-fanout
+probe took 3.9s; reducing the fence stage to 10 returned ten high-fanout outputs
+in 291ms. The exact feed query scanning the high-fanout region took 228ms.
+The expensive stage is capped at 10 held outputs, with its own advancing cursor,
+so a rejected held prefix cannot trap the scan or cause 1,000 recursive checks. These are DB execution times, not HTTP timings.
 The new reservation index is deliberately **not** provisioned during read-only
 production diagnosis; its production timing must be verified during the assigned
 release slot. Local tests compare the indexed predicate with the old view.
@@ -518,9 +524,9 @@ release slot. Local tests compare the indexed predicate with the old view.
 Release sequence, to be executed only by the assigned controller:
 
 1. Keep the existing runner STOP and maintenance fence under their owner's
-   control. Prepare and verify the updated `r2-copy-v5` client artifact (version identity unchanged) but do not start it.
-   Older clients reject the added collated cursor field, so coordinate this
-   backend/client release. COPY's two-second transport budget is unchanged.
+   control. Prepare and verify the immutable `r2-copy-v6` client artifact but do not start it.
+   The controller must quiesce the client for the cutover: old clients reject
+   the added collated cursor field. Same-version publication is unsupported. COPY's two-second transport budget is unchanged.
 2. Apply only migration `0206_nas_cleanup_manifest_keys.sql` through the migration
    CLI using a staged migration directory containing that file. It creates the
    immutable projection independently and records it in `schema_migrations`.
@@ -534,11 +540,17 @@ Release sequence, to be executed only by the assigned controller:
    Do not replace the projection function beneath an existing index. Migration
    0207 rejects mismatched function contents and missing, invalid or differently
    defined indexes; inspect a failed concurrent build before any remedial action.
-4. Apply `0207_nas_cleanup_reservation_lookup.sql`, then deploy the reviewed API
-   and roll the prepared client in the controller's assigned slot. The API
+4. Apply `0207_nas_cleanup_reservation_lookup.sql` and
+   `0208_nas_storage_v6_binding.sql`, then deploy the reviewed API and compatible
+   finish-controller CLI before rolling the prepared v6 client in the controller's assigned slot. The API
    budgets every COPY control at 1.5 seconds, starting before authentication and
    delivery fencing; exhausted budgets return retryable 503. Admission still
-   rechecks source identity and serializes grants with active renewals.
+   rechecks source identity and serializes grants with active renewals. V5 and
+   V6 share the nonce/freshness storage-proof contract; migration 0208 adds the
+   exact v6 identity without promoting or rewriting existing samples. The shared
+   version predicate covers cleanup-space, late-tier and custody-refresh gates.
+   Root must audit private collector/version pins for v6 before activation;
+   compatibility of those external pins is not established by this code change.
 5. The controller performs its own authorized release/fence sequence, then
    compares two samples of this read-only query (for example 60 seconds apart):
 

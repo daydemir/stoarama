@@ -387,7 +387,7 @@ func finishCleanupValve(ctx context.Context, pool r2RetireQuerier, status *finis
 		return nil
 	}
 	status.CleanupReason = "nas_space_proof_missing"
-	if status.NASSpaceClientVersion != api.NASStorageBudgetClientVersion || status.NASStorageBudgetAt == nil {
+	if !api.SupportsNASStorageBudget(status.NASSpaceClientVersion) || status.NASStorageBudgetAt == nil {
 		return nil
 	}
 	status.CleanupReason = "nas_space_proof_stale"
@@ -506,7 +506,7 @@ func finishTickWithRefresh(ctx context.Context, pool *pgxpool.Pool, safetyPath, 
 			if e = finishCleanupValve(ctx, pool, &status); e != nil {
 				return status, finishDatabase
 			}
-			if status.NASSpaceClientVersion != api.NASStorageBudgetClientVersion {
+			if !api.SupportsNASStorageBudget(status.NASSpaceClientVersion) {
 				status.LateTierHold = finishLateClientUnknown
 				return status, nil
 			}

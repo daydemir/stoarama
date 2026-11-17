@@ -24,6 +24,7 @@ import (
 
 const (
 	collatedFeedBudget       = 3 * time.Second
+	collatedFeedFenceLimit   = 10
 	collatedFeedMaxLimit     = 200
 	collatedFeedDefaultLimit = 50
 	collatedDownloadTTL      = time.Hour
@@ -118,11 +119,11 @@ const collatedFeedSQL = `WITH page AS MATERIALIZED (
  ORDER BY o.id LIMIT 1000
 ), eligible AS MATERIALIZED (
  SELECT o.id,o.nas_relative_path,o.size_bytes,o.sha256 FROM page
- JOIN recording_collation_outputs o ON o.id=page.id ` + collatedEligibilitySQL + collatedNotBackedOffSQL + `
+ JOIN recording_collation_outputs o ON o.id=page.id ` + collatedEligibilitySQL + collatedNotBackedOffSQL + ` ORDER BY o.id LIMIT $4
 ), delivered AS (
  SELECT * FROM eligible WHERE nas_delivery_allowed($1,'collated',id) ORDER BY id LIMIT $3
 )
-SELECT coalesce(jsonb_agg(jsonb_build_object('output_id',id,'nas_relative_path',nas_relative_path,'size_bytes',size_bytes,'sha256',sha256) ORDER BY id),'[]'::jsonb),coalesce((SELECT max(id) FROM page),0)
+SELECT coalesce(jsonb_agg(jsonb_build_object('output_id',id,'nas_relative_path',nas_relative_path,'size_bytes',size_bytes,'sha256',sha256) ORDER BY id),'[]'::jsonb),coalesce((SELECT max(id) FROM eligible HAVING count(*)=$4),(SELECT max(id) FROM page),0)
 FROM delivered`
 
 // collatedNotBackedOffSQL withholds outputs whose last delivery failed until
@@ -189,7 +190,7 @@ func (s *Server) handleAccountCollated(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var raw []byte
-		if err := tx.QueryRow(ctx, collatedFeedSQL, connectionID, afterID, limit).Scan(&raw, &nextID); err != nil {
+		if err := tx.QueryRow(ctx, collatedFeedSQL, connectionID, afterID, limit, collatedFeedFenceLimit).Scan(&raw, &nextID); err != nil {
 			util.WriteError(w, 503, "collated feed unavailable; retryable")
 			return
 		}

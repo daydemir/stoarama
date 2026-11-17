@@ -631,3 +631,16 @@ func TestNASR2CopyDatabaseLookupFailureDoesNotBlockIdentity(t *testing.T) {
 		t.Fatal("lookup failure blocked source")
 	}
 }
+
+func TestNASR2CopyV6LeaseKeepsExactRequestAdmission(t *testing.T) {
+	f, _ := copyTestFixture(t)
+	f.s.cfg.NASR2CopyEnabled = true
+	f.useClientVersion(NASR2CopyPagedClientVersion)
+	task := copyLease(t, f)
+	if task.ID <= 0 || task.Token == "" {
+		t.Fatal("v6 did not acquire an ordinary copy lease")
+	}
+	if nasClientSupportsStitchProof(NASR2CopyPagedClientVersion) {
+		t.Fatal("copy release gained stitch-proof eligibility")
+	}
+}

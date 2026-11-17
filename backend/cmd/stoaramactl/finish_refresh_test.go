@@ -12,6 +12,11 @@ import (
 )
 
 func TestFinishRefreshFlagAndRequeueKeepsOriginalWork(t *testing.T) {
+	for _, version := range []string{api.NASStorageBudgetClientVersion, api.NASR2CopyPagedClientVersion} {
+		t.Run(version, func(t *testing.T) { testFinishRefreshFlagAndRequeueKeepsOriginalWork(t, version) })
+	}
+}
+func testFinishRefreshFlagAndRequeueKeepsOriginalWork(t *testing.T, version string) {
 	f := newKeep28Fixture(t)
 	_, windows, _ := api.Keep28Policy()
 	w := windows[3]
@@ -21,6 +26,9 @@ func TestFinishRefreshFlagAndRequeueKeepsOriginalWork(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=now()-interval '25 hours',server_received_at=now()-interval '25 hours'; UPDATE connections SET nas_storage_total_bytes=20000000000000,nas_storage_free_bytes=10000000000000,nas_storage_reported_at=now(),nas_storage_client_version='r2-copy-v5',nas_storage_budget_at=now()`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET nas_storage_client_version=$1`, version); err != nil {
 		t.Fatal(err)
 	}
 	status := finishStatus{}
