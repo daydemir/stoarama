@@ -137,6 +137,8 @@ func main() {
 		runNASVerifiedPurge(ctx, cfg, os.Args[2:])
 	case "delivery-keep":
 		runDeliveryKeep(ctx, cfg, os.Args[2:])
+	case "r2-inverse":
+		runR2Inverse(ctx, cfg, os.Args[2:])
 	case "r2-retire":
 		runR2Retire(ctx, cfg, os.Args[2:])
 	case "collation-v2":
