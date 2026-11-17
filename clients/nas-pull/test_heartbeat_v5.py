@@ -1,5 +1,8 @@
 import copy
 import json
+import os
+import signal
+import sys
 import ssl
 import subprocess
 import tempfile
@@ -186,6 +189,62 @@ class HeartbeatFreshStorageTests(unittest.TestCase):
         with mock.patch.object(pull, 'R2_COPY_HTTP_CHILD', child), mock.patch.object(pull, 'storage_status', return_value=self.storage):
             self.assertEqual(pull.heartbeat_request_json(self.cfg, {}), {'ok':True})
         self.assertEqual(received[0]['storage'], self.storage)
+
+    def test_child_deadline_survives_parent_exec_during_connect(self):
+        root = Path(self.tmp.name)
+        entered, child_pid, sampled = root/'connect', root/'pid', root/'sample'
+        received_ages = []
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                received_ages.append(pull.heartbeat_monotonic()-float(sampled.read_text()))
+                self.send_response(200); self.end_headers()
+        self.server(Handler)
+        # The replacement parent only reaps. No old Python thread/watchdog
+        # survives exec; SIGALRM must terminate the child blocked in connect.
+        code = r'''import importlib.util,json,os,sys,threading,time
+from pathlib import Path
+from types import SimpleNamespace
+spec=importlib.util.spec_from_file_location("pull",sys.argv[1]);p=importlib.util.module_from_spec(spec);spec.loader.exec_module(p)
+entered,pidfile,sampled=map(Path,sys.argv[2:5])
+p.HEARTBEAT_TIMEOUT_SEC=1.0;p.STORAGE_TELEMETRY_MAX_AGE_SEC=2.0
+def storage(cfg):
+ sampled.write_text(str(p.heartbeat_monotonic()));return dict(available=True,total_bytes=1000,free_bytes=500)
+p.storage_status=storage
+p.R2_COPY_HTTP_CHILD=p.R2_COPY_HTTP_CHILD.replace("class FreshHTTP(FreshSend,http.client.HTTPConnection):pass",
+ "class FreshHTTP(FreshSend,http.client.HTTPConnection):\n    def connect(self):\n        super().connect();open(%r,'w').close();time.sleep(3)" % str(entered))
+real=p.subprocess.Popen
+def spawn(*a,**k):
+ child=real(*a,**k);pidfile.write_text(str(child.pid));return child
+p.subprocess.Popen=spawn
+def replace():
+ while not entered.exists():time.sleep(.005)
+ os.execv(sys.executable,[sys.executable,"-c","import json,os,sys;_,s=os.waitpid(int(sys.argv[1]),0);print(json.dumps(dict(signaled=os.WIFSIGNALED(s),signal=os.WTERMSIG(s) if os.WIFSIGNALED(s) else None)))",pidfile.read_text()])
+threading.Thread(target=replace,daemon=True).start()
+p.heartbeat_request_json(SimpleNamespace(api_base=sys.argv[5],api_key="synthetic"),{})
+'''
+        parent = subprocess.Popen([sys.executable, '-I', '-c', code, str(support.MODULE_PATH), str(entered), str(child_pid), str(sampled), self.cfg.api_base],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            stdout, stderr = parent.communicate(timeout=6)
+            self.assertEqual(parent.returncode, 0, stderr.decode())
+            self.assertTrue(entered.exists(), 'parent must exec during child connect')
+            self.assertEqual(json.loads(stdout), dict(signaled=True, signal=signal.SIGALRM))
+            elapsed = pull.heartbeat_monotonic()-float(sampled.read_text())
+            self.assertLess(elapsed, 1.8)  # scaled1s deadline, including exec/reap scheduling
+            self.assertTrue(all(age <= 3.0 for age in received_ages))  # scaled M=2+1
+            self.assertEqual(received_ages, [])
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(child_pid.read_text()), 0)
+            print('v5 parent exec during connect: child SIGALRM/reaped in %.3fs for1s budget; no payload' % elapsed)
+        finally:
+            if parent.poll() is None:
+                parent.kill(); parent.wait()
+            parent.stdout.close(); parent.stderr.close()
+            if child_pid.exists():
+                try: os.kill(int(child_pid.read_text()), signal.SIGKILL)
+                except ProcessLookupError: pass
 
     def test_child_rechecks_age_after_connect_before_any_post(self):
         received = []

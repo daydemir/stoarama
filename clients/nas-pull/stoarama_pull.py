@@ -52420,6 +52420,9 @@ def r2_copy_report_block(inventory, control, task, reason):
 # during DNS, TLS, trickling headers, or a read that never becomes idle. The
 # child has no NAS file paths, no inherited credentials, and cannot write media.
 R2_COPY_HTTP_CHILD = r'''
+import signal
+signal.signal(signal.SIGALRM,signal.SIG_DFL)
+signal.setitimer(signal.ITIMER_REAL,20)
 import base64,http.client,json,sys,time,urllib.error,urllib.request
 class FreshSend:
     def send(self,data):
@@ -52437,6 +52440,9 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise OSError("redirect refused")
 try:
     p=json.load(sys.stdin)
+    remaining=p["total_deadline"]-time.clock_gettime(time.CLOCK_MONOTONIC)
+    if remaining<=0:sys.exit(1)
+    signal.setitimer(signal.ITIMER_REAL,min(signal.getitimer(signal.ITIMER_REAL)[0],remaining))
     req=urllib.request.Request(p["url"],method=p["method"],headers=p["headers"],
         data=base64.b64decode(p["body"]) if p["body"] is not None else None)
     try:
@@ -52463,12 +52469,12 @@ except Exception:
 
 def r2_copy_http(url, method, headers, body=None, limit=R2_COPY_RANGE, timeout=10, guard=None, input_limit=32768, socket_timeout=2, send_deadline=None):
     import select
+    deadline = heartbeat_monotonic() + timeout
     message = json.dumps({"url": url, "method": method, "headers": headers,
                           "body": base64.b64encode(body).decode() if body is not None else None,
-                          "limit": limit, "socket_timeout": socket_timeout, "send_deadline": send_deadline}).encode()
+                          "limit": limit, "socket_timeout": socket_timeout, "send_deadline": send_deadline, "total_deadline": deadline}).encode()
     if len(message) > input_limit:
         raise R2CopyHold("copy HTTP input exceeds bound")
-    deadline = time.monotonic() + timeout
     process = subprocess.Popen([sys.executable, "-I", "-c", R2_COPY_HTTP_CHILD], stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={}, start_new_session=True)
     def kill_transport():
@@ -52476,18 +52482,15 @@ def r2_copy_http(url, method, headers, body=None, limit=R2_COPY_RANGE, timeout=1
             process.kill()
         except ProcessLookupError:
             pass
-    watchdog = threading.Timer(max(0, deadline - time.monotonic()), kill_transport)
-    watchdog.daemon = True
-    watchdog.start()
     try:
         os.set_blocking(process.stdin.fileno(), False)
         offset = 0
         while offset < len(message):
-            if time.monotonic() >= deadline:
+            if heartbeat_monotonic() >= deadline:
                 raise R2CopyHold("copy HTTP total deadline")
             if guard is not None:
                 guard.check()
-            _, writable, _ = select.select([], [process.stdin], [], min(.2, max(0, deadline - time.monotonic())))
+            _, writable, _ = select.select([], [process.stdin], [], min(.2, max(0, deadline - heartbeat_monotonic())))
             if writable:
                 try:
                     offset += os.write(process.stdin.fileno(), message[offset:])
@@ -52496,11 +52499,11 @@ def r2_copy_http(url, method, headers, body=None, limit=R2_COPY_RANGE, timeout=1
         process.stdin.close()
         output = bytearray()
         while True:
-            if time.monotonic() >= deadline:
+            if heartbeat_monotonic() >= deadline:
                 raise R2CopyHold("copy HTTP total deadline")
             if guard is not None:
                 guard.check()
-            ready, _, _ = select.select([process.stdout], [], [], min(.2, max(0, deadline - time.monotonic())))
+            ready, _, _ = select.select([process.stdout], [], [], min(.2, max(0, deadline - heartbeat_monotonic())))
             if not ready:
                 continue
             block = os.read(process.stdout.fileno(), 65536)
@@ -52509,7 +52512,7 @@ def r2_copy_http(url, method, headers, body=None, limit=R2_COPY_RANGE, timeout=1
             output.extend(block)
             if len(output) > limit + 4096:
                 raise R2CopyHold("copy HTTP response exceeds bound")
-        if process.wait(timeout=max(.01, deadline - time.monotonic())) != 0:
+        if process.wait(timeout=max(.01, deadline - heartbeat_monotonic())) != 0:
             raise R2CopyHold("copy HTTP transport failed")
         metadata, separator, data = output.partition(b"\n")
         if not separator or len(metadata) > 4096 or len(data) > limit:
@@ -52517,11 +52520,9 @@ def r2_copy_http(url, method, headers, body=None, limit=R2_COPY_RANGE, timeout=1
         result = json.loads(metadata)
         return result["status"], result["headers"], data
     finally:
-        watchdog.cancel()
         if process.poll() is None:
             kill_transport()
         process.wait(timeout=2)
-        watchdog.join(timeout=1)
         process.stdout.close()
         process.stdin.close()
 

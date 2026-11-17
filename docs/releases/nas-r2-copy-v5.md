@@ -24,9 +24,12 @@ The sample timestamp precedes the filesystem read. Its age is checked after JSON
 assembly, during transport, and in the isolated child immediately before header
 and body sends, after DNS/TCP/TLS preparation. The shared POSIX monotonic clock
 works across processes, including macOS Python 3.9. The heartbeat uses the
-existing bounded child transport with a **20-second total** watchdog (startup,
-DNS, TLS, send and response), rather than urllib's per-operation timeout. Timeout
-kills/reaps the child; it never replays that ambiguous request.
+existing bounded child transport with a **20-second total** deadline (startup,
+DNS, TLS, send and response), rather than urllib's per-operation timeout. Its
+first actions install default-action SIGALRM and arm20s; once input arrives it
+only shortens that alarm to the original absolute request deadline. This hard
+kill survives parent exec/crash/SIGKILL. The parent checks guards and reaps the
+child without a watchdog thread; it never replays an ambiguous request.
 
 Thus the receipt-age bound is `M = 90 + 20 = 110 seconds`. D's independent
 controller contract retains `T = 180 seconds`, leaving a 70-second receipt age
