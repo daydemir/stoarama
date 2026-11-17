@@ -15,7 +15,7 @@ Protected classes: Keep Everything by stream or a known stream-folder path;
 keep28 by pinned stream window (including every collated source); permanent
 incident roster and dependent outputs; cleanup reservations and unretired or
 ever-issued source holds; retirement reservations/receipts; pending restores;
-joined source snapshots; A1 `blocked` items by exact bucket/key regardless of
+joined source snapshots, snapshotting scopes and dry-run scopes; A1 `blocked` items by exact bucket/key regardless of
 inventory; delivery keys and source/output dependencies; stitch tools under
 `experimental/v85-retired-WORK-custody/`; unknown or ambiguous identities.
 Delivery remains protected pending Deniz's answer. No hold is inferred released
@@ -30,5 +30,6 @@ is a planning classification only; this report grants no wire authority.
 The sole controller runs this read-only on Jelly after merge. Compare total
 bucket bytes with the approximately 53 TB bill, inspect unknown counts, and
 retain the report as durable evidence. No production partition was run by the
-implementation agent. The executor is a separate change and has additional
+implementation agent. Collated outputs are held in this release, including outside-window outputs;
+raw keys with multiple catalog identities remain unknown. The executor is a separate change and has additional
 live fence, drain, intent, budget and provider checks.
