@@ -16,12 +16,17 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/api"
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const finishTarget = 10000
 const finishEvidenceAge = 5 * time.Minute
-const finishSpaceAge = 10 * time.Minute
+const finishSpaceAge time.Duration = 10 * time.Minute
+
+// clients/nas-pull/stoarama_pull.py:57-58: 30s heartbeat, sample max age 3*30s.
+const finishLateReceiptAge time.Duration = 90 * time.Second
+const finishLateDebitWindow time.Duration = 2 * finishLateReceiptAge
 const finishCleanupHeadroom int64 = 300_000_000_000
 const finishRecoveryAge = 7 * time.Hour // six-hour refresh plus verification/scheduling margin
 const finishLock int64 = 7343226011199
@@ -85,8 +90,8 @@ type finishTier uint8
 
 const (
 	finishExactInventory finishTier = iota + 1
-	finishEarlyNoInventory
-	finishLateNoInventory
+	finishEarlyUnknown
+	finishLateUnknown
 )
 
 type finishLateHold string
@@ -95,26 +100,31 @@ const (
 	finishLateSpaceUnknown finishLateHold = "nas_space_evidence_unavailable"
 	finishLateSpaceLow     finishLateHold = "nas_headroom_below_threshold"
 	finishLateBudgetHeld   finishLateHold = "next_download_exceeds_budget"
+	finishLateReceiptStale finishLateHold = "nas_space_receipt_too_old_for_budget"
 )
 
 type finishStatus struct {
-	NASFreeBytes        *int64           `json:"nas_storage_free_bytes,omitempty"`
-	NASSpaceReportedAt  *time.Time       `json:"nas_storage_reported_at,omitempty"`
-	LateTierHold        finishLateHold   `json:"late_tier_hold_reason,omitempty"`
-	LateTierBudgetBytes int64            `json:"late_tier_budget_bytes"`
-	QueueReservedBytes  int64            `json:"queue_reserved_bytes"`
-	Schema              string           `json:"schema"`
-	UpdatedAt           time.Time        `json:"updated_at"`
-	Stop                finishStop       `json:"stop_reason,omitempty"`
-	QueueDepth          int64            `json:"queue_depth"`
-	ItemsPerMinute      float64          `json:"items_per_min"`
-	Copy                finishCopy       `json:"copy"`
-	Holds               map[string]int64 `json:"holds_by_reason"`
-	CleanupShouldRun    bool             `json:"cleanup_should_run"`
-	CleanupReason       string           `json:"cleanup_reason"`
-	ImportedItems       int              `json:"imported_items"`
-	ImportedManifests   int              `json:"imported_manifests"`
-	Exhausted           bool             `json:"candidates_exhausted"`
+	ImportedHistoricalInventory int              `json:"imported_historical_inventory"`
+	ImportedEarlyUnknown        int              `json:"imported_early_unknown"`
+	ImportedLateUnknown         int              `json:"imported_late_unknown"`
+	NASSpaceCheckedAt           time.Time        `json:"nas_space_checked_at"`
+	NASFreeBytes                *int64           `json:"nas_storage_free_bytes,omitempty"`
+	NASSpaceReportedAt          *time.Time       `json:"nas_storage_reported_at,omitempty"`
+	LateTierHold                finishLateHold   `json:"late_tier_hold_reason,omitempty"`
+	LateTierBudgetBytes         int64            `json:"late_tier_budget_bytes"`
+	QueueReservedBytes          int64            `json:"queue_reserved_bytes"`
+	Schema                      string           `json:"schema"`
+	UpdatedAt                   time.Time        `json:"updated_at"`
+	Stop                        finishStop       `json:"stop_reason,omitempty"`
+	QueueDepth                  int64            `json:"queue_depth"`
+	ItemsPerMinute              float64          `json:"items_per_min"`
+	Copy                        finishCopy       `json:"copy"`
+	Holds                       map[string]int64 `json:"holds_by_reason"`
+	CleanupShouldRun            bool             `json:"cleanup_should_run"`
+	CleanupReason               string           `json:"cleanup_reason"`
+	ImportedItems               int              `json:"imported_items"`
+	ImportedManifests           int              `json:"imported_manifests"`
+	Exhausted                   bool             `json:"candidates_exhausted"`
 }
 
 func finishFresh(t, now time.Time) bool {
@@ -190,6 +200,9 @@ func finishCheck(ctx context.Context, pool *pgxpool.Pool, s finishSafety, c fini
 	var planSHA string
 	var newestIssued time.Time
 	if err := pool.QueryRow(ctx, `SELECT p.plan_sha256,(SELECT count(*) FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued),coalesce((SELECT max(i.updated_at) FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued),timestamptz '1970-01-01') FROM nas_cleanup_plans p WHERE p.id=$1 AND p.connection_id=13`, s.RecoveryPlanID).Scan(&planSHA, &issued, &newestIssued); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return finishRecoveryStale
+		}
 		return finishDatabase
 	}
 	if s.RecoveryCheckedAt.IsZero() || time.Since(s.RecoveryCheckedAt) > finishRecoveryAge || time.Until(s.RecoveryCheckedAt) > 30*time.Second || !s.RecoveryCheckedAt.After(newestIssued) || s.RecoveryIssued < 0 || s.RecoveryVerified != s.RecoveryIssued || issued != s.RecoveryIssued || planSHA != s.RecoveryPlanSHA {
@@ -259,8 +272,8 @@ func finishCandidates(ctx context.Context, pool *pgxpool.Pool, limit int) ([]api
 		predicate string
 	}{
 		{finishExactInventory, `n.clip_id IS NOT NULL`},
-		{finishEarlyNoInventory, `n.clip_id IS NULL AND w.end_at<timestamptz '2026-09-24 00:00:00+00'`},
-		{finishLateNoInventory, `n.clip_id IS NULL AND w.end_at>=timestamptz '2026-09-24 00:00:00+00'`},
+		{finishEarlyUnknown, `n.clip_id IS NULL AND w.end_at<timestamptz '2026-09-24 00:00:00+00'`},
+		{finishLateUnknown, `n.clip_id IS NULL AND w.end_at>=timestamptz '2026-09-24 00:00:00+00'`},
 	} {
 		rows, err := pool.Query(ctx, finishWindowSQL+finishCandidateSelectSQL+finishEligibleSQL+` AND `+selection.predicate+` ORDER BY r.stream_id,c.id LIMIT $3`, data, api.NASR2CopyMaxFile, limit)
 		if err != nil {
@@ -322,9 +335,13 @@ func finishDepth(ctx context.Context, pool *pgxpool.Pool, status *finishStatus) 
 }
 
 // Current storage evidence is independent of historical hold counters.
+// Full admission debits do not depend on potentially ambiguous completion labels.
+// Inclusive cutoff retains a terminal write completed exactly T ago.
+const finishLateDebitsSQL = `SELECT coalesce(sum((item->>'size_bytes')::bigint),0) FROM nas_r2_copy_items WHERE connection_id=13 AND kind='raw' AND (state IN ('pending','leased') OR (state IN ('verified','blocked') AND updated_at >= $1))`
+
 func finishCleanupValve(ctx context.Context, pool *pgxpool.Pool, status *finishStatus) error {
 	status.CleanupShouldRun = false
-	if err := pool.QueryRow(ctx, `SELECT nas_storage_free_bytes,nas_storage_reported_at FROM connections WHERE id=13`).Scan(&status.NASFreeBytes, &status.NASSpaceReportedAt); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT nas_storage_free_bytes,nas_storage_reported_at,clock_timestamp() FROM connections WHERE id=13`).Scan(&status.NASFreeBytes, &status.NASSpaceReportedAt, &status.NASSpaceCheckedAt); err != nil {
 		return err
 	}
 	status.CleanupReason = "nas_space_heartbeat_missing"
@@ -332,7 +349,7 @@ func finishCleanupValve(ctx context.Context, pool *pgxpool.Pool, status *finishS
 		return nil
 	}
 	status.CleanupReason = "nas_space_heartbeat_stale"
-	if time.Since(*status.NASSpaceReportedAt) > finishSpaceAge || time.Until(*status.NASSpaceReportedAt) > 30*time.Second {
+	if status.NASSpaceCheckedAt.Sub(*status.NASSpaceReportedAt) > finishSpaceAge || status.NASSpaceReportedAt.Sub(status.NASSpaceCheckedAt) > 30*time.Second {
 		return nil
 	}
 	status.CleanupReason = "nas_headroom_sufficient"
@@ -419,7 +436,10 @@ func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath st
 			status.Exhausted = true
 			return status, nil
 		}
-		if tier == finishLateNoInventory {
+		if tier == finishLateUnknown {
+			if e = finishCleanupValve(ctx, pool, &status); e != nil {
+				return status, finishDatabase
+			}
 			if status.CleanupReason != "nas_headroom_sufficient" {
 				status.LateTierHold = finishLateSpaceUnknown
 				if status.CleanupShouldRun {
@@ -427,23 +447,28 @@ func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath st
 				}
 				return status, nil
 			}
-			if e = pool.QueryRow(ctx, `SELECT coalesce(sum(CASE WHEN state IN ('pending','leased') THEN (item->>'size_bytes')::bigint WHEN state='verified' AND completion='downloaded' AND updated_at>=$1 THEN committed_bytes ELSE 0 END),0) FROM nas_r2_copy_items WHERE connection_id=13`, *status.NASSpaceReportedAt).Scan(&status.QueueReservedBytes); e != nil {
+			if status.NASSpaceCheckedAt.Sub(*status.NASSpaceReportedAt) > finishLateReceiptAge {
+				status.LateTierHold = finishLateReceiptStale
+				return status, nil
+			}
+			if e = pool.QueryRow(ctx, finishLateDebitsSQL, status.NASSpaceCheckedAt.Add(-finishLateDebitWindow)).Scan(&status.QueueReservedBytes); e != nil {
 				return status, finishDatabase
 			}
+
 			status.LateTierBudgetBytes = max(int64(0), *status.NASFreeBytes-api.NASR2CopyFloor-api.NASR2CopyRangeBytes-status.QueueReservedBytes)
 		}
 
 		n := 0
 		var total int64
 		for _, i := range items {
-			if total+i.SizeBytes > nasCopyBatchBytes || (tier == finishLateNoInventory && total+i.SizeBytes > status.LateTierBudgetBytes) {
+			if total+i.SizeBytes > nasCopyBatchBytes || (tier == finishLateUnknown && total+i.SizeBytes > status.LateTierBudgetBytes) {
 				break
 			}
 			total += i.SizeBytes
 			n++
 		}
 		if n == 0 {
-			if tier == finishLateNoInventory {
+			if tier == finishLateUnknown {
 				status.LateTierHold = finishLateBudgetHeld
 				return status, nil
 			}
@@ -464,6 +489,18 @@ func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath st
 		}
 		if e = queueNASR2Copy(ctx, pool, h, digest, validated, true); e != nil {
 			return status, finishImport
+		}
+		switch tier {
+		case finishExactInventory:
+			status.ImportedHistoricalInventory += n
+		case finishEarlyUnknown:
+			status.ImportedEarlyUnknown += n
+		case finishLateUnknown:
+			status.ImportedLateUnknown += n
+		}
+		if tier == finishLateUnknown {
+			status.LateTierBudgetBytes -= total
+			status.QueueReservedBytes += total
 		}
 		status.ImportedItems += n
 		status.ImportedManifests++

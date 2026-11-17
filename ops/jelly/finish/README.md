@@ -16,6 +16,8 @@ minute deadline. Root's latest catalog priority replaces the unavailable listing
 3. Remaining sources without exact inventory (the 23 late-window streams).
 
 Each tier is selected by stream then source ID; tiers use separate manifests.
+The existing four-worker importer can reorder insertion/lease IDs within a tier;
+selection and manifest order follow stream/ID, not a serial execution guarantee.
 There is no listing query or fallback. Inventory is only a priority hint; the
 worker still hashes and publishes fresh exact custody. Existing queue rows of
 every state are excluded; verified and blocked work is never requeued. Live
@@ -24,14 +26,28 @@ existing exact-manifest importer. Partial imports resume idempotently. An adviso
 lock excludes concurrent feeders. Existing queue IDs/order are preserved.
 
 Tier 3 requires fresh storage data and at least 300 GB headroom above the 2 TB
-floor. Its byte budget subtracts the existing 16 MiB range reserve, pending/leased
-raw bytes that could download, and successful downloaded final bytes published
-since the storage heartbeat (A1 completion/committed_bytes/updated_at). This keeps
-an old storage observation from being spent twice. Verified-in-place and blocked
-rows reserve no disk. Status includes typed `late_tier_hold_reason`, remaining
-`late_tier_budget_bytes` and `queue_reserved_bytes`; low/missing space is a
-resumable feed hold, not exhaustion. Tiers 1/2 can still feed. Every manifest is
-capped at 100 GB; large files can require more than two manifests to reach 10k.
+floor. Root's conservative admission window reserves the full size of pending and
+leased raw rows, plus every terminal raw row updated within T=180 seconds,
+regardless of verified-in-place/downloaded/blocked label or committed bytes.
+This also conservatively covers recently completed tiers 1/2 for at most T.
+It needs no publication ledger, completion-label inference or sample timestamp.
+
+Source: `clients/nas-pull/stoarama_pull.py:57-58` fixes the heartbeat at 30 seconds
+and maximum cached storage sample age at 3×30=90 seconds. The typed late-budget
+receipt limit is separately 90 seconds and T is twice that, 180 seconds. Terminal
+debits use an inclusive `>=` cutoff, retaining writes exactly T old. A receipt at
+most 90 seconds old plus sample age at most 90 seconds means an expired terminal
+debit is already represented in free bytes. The cleanup valve's separate freshness
+limit remains ten minutes. A 91-second-old receipt can therefore report a valve
+decision while withholding late-tier admission.
+
+Late budget subtracts these full-size reservations and the existing 16 MiB range
+reserve from free bytes above the unchanged floor. Status includes typed
+`late_tier_hold_reason`, `late_tier_budget_bytes` and `queue_reserved_bytes`.
+A capacity hold is resumable, not exhaustion; tiers 1/2 can still feed. Imported
+cohort counters explicitly label historical inventory, early unknown and late
+unknown sources. None asserts a completed census or physical absence; COPY is
+the actual measurement. Each manifest remains capped at 100 GB.
 
 The sole controller must supply an executable safety collector, run on every
 launch. It emits this complete JSON (all fields required; only the three error fields may be null):

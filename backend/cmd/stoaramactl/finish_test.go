@@ -66,14 +66,18 @@ func TestFinishFeedPriorityIdempotenceAndTerminalStates(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO recordings VALUES(3,47,78,$1)`, early.Timezone); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE recording_clips SET recording_id=3,clip_start_at=$1,clip_end_at=$2 WHERE id IN(2,3)`, early.Start, early.Start.Add(time.Minute)); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE recording_clips SET recording_id=3,clip_start_at=$1,clip_end_at=$2 WHERE id IN(1,2,3)`, early.Start, early.Start.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files SELECT 13,id,display_path,'present',sha256,size_bytes,now()-interval '3 months' FROM recording_clips WHERE id IN(1,4)`); err != nil {
 		t.Fatal(err)
 	}
+	selected, tier, err := finishCandidates(ctx, pool, 5000)
+	if err != nil || tier != finishExactInventory || len(selected) != 2 || selected[0].SourceID != 4 || selected[1].SourceID != 1 {
+		t.Fatalf("stream/id priority: tier=%v items=%v err=%v", tier, selected, err)
+	}
 	status := finishRun(t, pool, safety, copy)
-	if status.ImportedItems != 7 || status.QueueDepth != 7 || !status.Exhausted || status.ImportedManifests != 3 {
+	if status.ImportedHistoricalInventory != 2 || status.ImportedEarlyUnknown != 2 || status.ImportedLateUnknown != 3 || status.ImportedItems != 7 || status.QueueDepth != 7 || !status.Exhausted || status.ImportedManifests != 3 {
 		t.Fatalf("tier feed: %+v", status)
 	}
 	rows, err := pool.Query(ctx, `SELECT source_id FROM nas_r2_copy_items ORDER BY id LIMIT 2`)
@@ -123,6 +127,7 @@ func TestFinishStopsBeforeFeeding(t *testing.T) {
 		{name: "master mismatch", mutate: func(s *finishSafety, c *finishCopy) { s.Master = true }, stop: finishMaster},
 		{name: "unowned master", mutate: func(s *finishSafety, c *finishCopy) { s.Master = true; s.ExpectedMaster = true }, stop: finishMaster},
 		{name: "stale underlying recovery", mutate: func(s *finishSafety, c *finishCopy) { s.RecoveryCheckedAt = time.Now().Add(-8 * time.Hour) }, stop: finishRecoveryStale},
+		{name: "recovery plan missing", mutate: func(s *finishSafety, c *finishCopy) { s.RecoveryPlanID = 1234567 }, stop: finishRecoveryStale},
 		{name: "issued changed", sql: `INSERT INTO nas_cleanup_items(plan_id,delete_ever_issued) VALUES(99,true)`, stop: finishRecoveryStale},
 		{name: "stale safety", mutate: func(s *finishSafety, c *finishCopy) { s.UpdatedAt = time.Now().Add(-6 * time.Minute) }, stop: finishEvidence},
 		{name: "stale copy", mutate: func(s *finishSafety, c *finishCopy) { c.UpdatedAt = time.Now().Add(-6 * time.Minute) }, stop: finishEvidence},
@@ -325,13 +330,13 @@ func TestFinishRecoveryBindsUnchangedIssuedState(t *testing.T) {
 	}
 }
 
-func TestFinishLateTierReservesOnlyDownloadCapacity(t *testing.T) {
+func TestFinishLateTierReservesAdmissionAndTerminalWindow(t *testing.T) {
 	pool, safety, copy := finishFixture(t, 3)
 	ctx := context.Background()
 	_, err := pool.Exec(ctx, `UPDATE recording_clips SET size_bytes=60000000000;
  UPDATE connections SET nas_storage_free_bytes=2300000000000,nas_storage_reported_at=now()-interval '1 minute';
  INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item,state,completion,committed_bytes,updated_at)
- SELECT 13,'raw',id,repeat('a',64),repeat('b',64),jsonb_build_object('size_bytes',size),state,completion,committed,now()
+ SELECT 13,'raw',id,repeat('a',64),repeat('b',64),jsonb_build_object('size_bytes',size),state,completion,committed,CASE WHEN id IN(103,104) THEN now()-interval '4 minutes' ELSE now() END
  FROM (VALUES(100,60000000000::bigint,'pending','',0::bigint),(101,60000000000,'leased','',0),(102,40000000000,'verified','downloaded',40000000000),(103,60000000000,'verified','verified_in_place',60000000000),(104,60000000000,'blocked','',0)) v(id,size,state,completion,committed);`)
 	if err != nil {
 		t.Fatal(err)
@@ -384,5 +389,51 @@ func TestFinishMissingStorageHoldsOnlyLateTier(t *testing.T) {
 	status = finishRun(t, pool, safety, copy)
 	if status.ImportedItems != 1 {
 		t.Fatal("missing storage blocked verify-in-place tier")
+	}
+}
+
+func TestFinishLateTierRetainsAmbiguousTerminalDebits(t *testing.T) {
+	for _, completion := range []string{"downloaded", "verified_in_place"} {
+		t.Run(completion, func(t *testing.T) {
+			pool, safety, copy := finishFixture(t, 1)
+			ctx := context.Background()
+			if _, err := pool.Exec(ctx, `UPDATE recording_clips SET size_bytes=60000000000;UPDATE connections SET nas_storage_free_bytes=2300000000000,nas_storage_reported_at=now()`); err != nil {
+				t.Fatal(err)
+			}
+			// Downloads can precede receipt of a cached free-space sample. A failed
+			// result can also retry as verified-in-place with zero committed bytes.
+			// Both outcomes retain the same full-size debit for T after terminal state.
+			_, err := pool.Exec(ctx, `INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item,state,completion,committed_bytes,updated_at)
+ SELECT 13,'raw',id,repeat('a',64),repeat('b',64),jsonb_build_object('size_bytes',60000000000::bigint),'verified',$1,0,now()-interval '1 minute' FROM generate_series(100,103) id`, completion)
+			if err != nil {
+				t.Fatal(err)
+			}
+			status := finishRun(t, pool, safety, copy)
+			if status.ImportedItems != 0 || status.LateTierHold != finishLateBudgetHeld || status.QueueReservedBytes != 240000000000 {
+				t.Fatalf("released ambiguous capacity: %+v", status)
+			}
+		})
+	}
+}
+
+func TestFinishLateTierReceiptAgeAndInclusiveDebitBoundary(t *testing.T) {
+	pool, safety, copy := finishFixture(t, 1)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_reported_at=now()-interval '91 seconds'`); err != nil {
+		t.Fatal(err)
+	}
+	status := finishRun(t, pool, safety, copy)
+	if status.CleanupShouldRun || status.LateTierHold != finishLateReceiptStale || status.ImportedItems != 0 {
+		t.Fatalf("old receipt spent: %+v", status)
+	}
+	cutoff := time.Date(2026, 11, 17, 0, 0, 0, 0, time.UTC)
+	for id, at := range []time.Time{cutoff, cutoff.Add(-time.Microsecond)} {
+		if _, err := pool.Exec(ctx, `INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item,state,updated_at) VALUES(13,'raw',$1,repeat('a',64),repeat('b',64),'{"size_bytes":100}','verified',$2)`, 100+id, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var reserved int64
+	if err := pool.QueryRow(ctx, finishLateDebitsSQL, cutoff).Scan(&reserved); err != nil || reserved != 100 {
+		t.Fatalf("T boundary not inclusive: %d %v", reserved, err)
 	}
 }
