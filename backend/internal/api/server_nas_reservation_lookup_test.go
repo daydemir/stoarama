@@ -82,6 +82,7 @@ func TestNASReservationMigrationRejectsUnsafePrerequisites(t *testing.T) {
 	for _, change := range []struct{ sql, want string }{
 		{`DROP INDEX nas_cleanup_manifest_keys_idx`, "precreate nas_cleanup_manifest_keys_idx"},
 		{`DROP INDEX nas_cleanup_manifest_keys_idx; CREATE INDEX nas_cleanup_manifest_keys_idx ON nas_cleanup_plans(id)`, "not the exact valid reservation index"},
+		{`DROP INDEX nas_cleanup_manifest_keys_idx; CREATE INDEX nas_cleanup_manifest_keys_idx ON nas_cleanup_plans USING gin(nas_cleanup_manifest_keys(manifest))`, "not the exact valid reservation index"},
 		{`CREATE OR REPLACE FUNCTION nas_cleanup_manifest_keys(manifest jsonb) RETURNS text[] LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT '{}'::text[] $$`, "differs from the indexed immutable projection"},
 	} {
 		tx, err := f.pool.Begin(f.ctx)

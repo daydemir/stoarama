@@ -540,9 +540,14 @@ Release sequence, to be executed only by the assigned controller:
 
    ```sql
    CREATE INDEX CONCURRENTLY nas_cleanup_manifest_keys_idx
-     ON nas_cleanup_plans USING gin(nas_cleanup_manifest_keys(manifest));
+     ON nas_cleanup_plans USING gin(nas_cleanup_manifest_keys(manifest)) WITH (fastupdate=off);
    ```
 
+   Build the index with `fastupdate=off` from the start. A large GIN pending list
+   caused the generic planner to revert to a full manifest scan on a local
+   1,438-plan/89MB fixture; the reviewed option retained the index plan and a
+   0.5ms complete lookup. Do not silently alter an older index into compliance;
+   a differently built index needs separately reviewed replacement/validation.
    Do not replace the projection function beneath an existing index. Migration
    0207 rejects mismatched function contents and missing, invalid or differently
    defined indexes; inspect a failed concurrent build before any remedial action.
