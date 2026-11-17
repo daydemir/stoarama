@@ -245,3 +245,78 @@ func TestFinishRefreshAndB2ReservationRaceBothOrders(t *testing.T) {
 		})
 	}
 }
+
+func TestFinishRefreshExcludedPrefixDoesNotStarveLiveSource(t *testing.T) {
+	for _, excluded := range []string{"purged", "keep_everything"} {
+		t.Run(excluded, func(t *testing.T) {
+			f := newKeep28Fixture(t)
+			opts := seedRefreshCandidates(t, f, []int64{100})
+			tx, err := f.pool.Begin(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(f.ctx)
+			// Retained history and ordinary COPY can both precede live B2 work.
+			// Use actual valid rows, exceeding the bounded catalog page size.
+			_, err = tx.Exec(f.ctx, `SET LOCAL session_replication_role=replica;
+ INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path)
+ SELECT 10000000+g,c.recording_id,c.storage_destination_id,c.endpoint,c.bucket,'managed/acct-47/ke/old-'||g||'.mp4',c.size_bytes,c.etag,c.sha256,c.fire_at,c.clip_start_at,c.clip_end_at,'ke/old-'||g||'.mp4'
+ FROM recording_clips c CROSS JOIN generate_series(1,10000)g WHERE c.id=9000001;
+ INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at,server_received_at,file_ctime_ns,file_inode,file_device,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256)
+ SELECT 13,c.id,c.recording_id,c.display_path,c.size_bytes,c.sha256,'present',now()-interval '25 hours',now(),now()-interval '25 hours',1,2,3,c.display_path||'.stoarama.json',50,repeat('c',64)
+ FROM recording_clips c WHERE c.id BETWEEN 10000001 AND 10010000;
+ INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item,state,verified_at,completion,downloaded_bytes,committed_bytes)
+ SELECT 13,'raw',c.id,q.manifest_sha256,q.policy_sha256,q.item||jsonb_build_object('source_id',c.id,'object_key',c.object_key,'relative_path',c.display_path),'verified',now()-interval '25 hours','downloaded',100,100
+ FROM recording_clips c CROSS JOIN nas_r2_copy_items q WHERE c.id BETWEEN 10000001 AND 10010000 AND q.source_id=9000001`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if excluded == "purged" {
+				_, err = tx.Exec(f.ctx, `UPDATE recording_clips SET purged_at=now() WHERE id BETWEEN 10000001 AND 10010000`)
+			} else {
+				// A KE stream establishes the protected folder for these ordinary-copy
+				// aliases; the live keep28 source remains in a separate folder.
+				_, err = tx.Exec(f.ctx, `INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
+ SELECT 999,provider,'999','KE','ke',source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps FROM streams WHERE id=3;
+ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
+ SELECT 31,account_id,storage_destination_id,'KE',stream_url,cron_expr,cron_timezone,status,999,paused_at FROM recordings WHERE id=30;
+ INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path)
+ SELECT 99900000,31,storage_destination_id,endpoint,bucket,'managed/acct-47/ke/anchor.mp4',size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,'ke/anchor.mp4' FROM recording_clips WHERE id=9000001`)
+				picks, readErr := loadR2RetirePicks(opts.Picks)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				picks.Choices[999] = r2RetirePick{Choice: "all"}
+				finishTestJSON(t, opts.Picks, map[string]any{"choices": picks.Choices})
+				opts.PicksSHA = f.picksSHA(t)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = tx.Commit(f.ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = f.pool.Exec(f.ctx, `ANALYZE recording_clips; ANALYZE nas_inventory_files; ANALYZE nas_r2_copy_items`); err != nil {
+				t.Fatal(err)
+			}
+			status := finishStatus{}
+			n, err := feedKeep28Refresh(f.ctx, f.pool, opts, 1, &status)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n == 0 {
+				// A bounded page of rejected rows must not be selected forever, including
+				// after process/connection loss. The next tick must reach the live source.
+				f.pool.Reset()
+				n, err = feedKeep28Refresh(f.ctx, f.pool, opts, 1, &status)
+			}
+			if err != nil || n != 1 {
+				t.Fatalf("excluded prefix starved live source: admitted=%d err=%v held=%d", n, err, status.RefreshHeldItems)
+			}
+			var live, excludedQueued int
+			if err = f.pool.QueryRow(f.ctx, `SELECT count(*) FILTER(WHERE source_id=9000001),count(*) FILTER(WHERE source_id<>9000001) FROM nas_r2_copy_items WHERE state='refresh_pending'`).Scan(&live, &excludedQueued); err != nil || live != 1 || excludedQueued != 0 {
+				t.Fatalf("queued live=%d excluded=%d err=%v", live, excludedQueued, err)
+			}
+		})
+	}
+}

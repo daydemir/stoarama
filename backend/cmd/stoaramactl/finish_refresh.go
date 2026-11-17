@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/api"
 	"github.com/daydemir/stoarama/backend/internal/config"
@@ -61,7 +62,9 @@ func feedKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefreshO
 		return 0, nil
 	}
 	var enabled bool
-	if err := pool.QueryRow(ctx, `SELECT enabled FROM r2_keep28_refresh_control`).Scan(&enabled); err != nil {
+	var scanAt *time.Time
+	var scanID int64
+	if err := pool.QueryRow(ctx, `SELECT enabled,scan_custody_at,scan_source_id FROM r2_keep28_refresh_control`).Scan(&enabled, &scanAt, &scanID); err != nil {
 		return 0, err
 	}
 	if !enabled {
@@ -103,22 +106,24 @@ func feedKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefreshO
 		return 0, err
 	}
 	defer rollbackFinishCandidateTx(catalog)
-	rows, err := catalog.Query(ctx, `SELECT q.item,coalesce(c.etag,'') FROM nas_r2_copy_items q JOIN recording_clips c ON c.id=q.source_id
+	rows, err := catalog.Query(ctx, `SELECT q.item,coalesce(c.etag,''),LEAST(n.verified_at,n.server_received_at),c.id FROM nas_r2_copy_items q JOIN recording_clips c ON c.id=q.source_id
  JOIN nas_inventory_files n ON n.clip_id=c.id AND n.connection_id=13
- WHERE c.bucket='stoarama' AND q.connection_id=13 AND q.kind='raw' AND q.state='verified' AND q.blocked_reason='' AND q.policy_sha256=$1
- AND `+finishRefreshExactSQL+` ORDER BY LEAST(n.verified_at,n.server_received_at),c.id LIMIT $2`, policy, finishTarget)
+ WHERE c.bucket='stoarama' AND c.purged_at IS NULL AND q.connection_id=13 AND q.kind='raw' AND q.state='verified' AND q.blocked_reason='' AND q.policy_sha256=$1
+ AND `+finishRefreshExactSQL+` ORDER BY ($2::timestamptz IS NOT NULL AND (LEAST(n.verified_at,n.server_received_at),c.id)<=($2,$3::bigint)),LEAST(n.verified_at,n.server_received_at),c.id LIMIT $4`, policy, scanAt, scanID, finishTarget)
 	if err != nil {
 		return 0, err
 	}
 	type candidate struct {
-		item api.NASR2CopyItem
-		etag string
+		item      api.NASR2CopyItem
+		etag      string
+		custodyAt time.Time
+		sourceID  int64
 	}
 	var candidates []candidate
 	for rows.Next() {
 		var data []byte
 		var c candidate
-		if err = rows.Scan(&data, &c.etag); err != nil {
+		if err = rows.Scan(&data, &c.etag, &c.custodyAt, &c.sourceID); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -135,6 +140,21 @@ func feedKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefreshO
 	}
 	if err = catalog.Commit(ctx); err != nil {
 		return 0, err
+	}
+	// Advance the bounded catalog page before per-key work, including rejects
+	// or a process stop. Circular expiry/source ordering visits later work on
+	// subsequent ticks instead of retrying an excluded prefix forever. This
+	// cursor is scheduling only; every admission still rechecks live guards.
+	if len(candidates) > 0 {
+		last := candidates[len(candidates)-1]
+		tag, err := pool.Exec(ctx, `UPDATE r2_keep28_refresh_control SET scan_custody_at=$1,scan_source_id=$2 WHERE singleton AND enabled`, last.custodyAt, last.sourceID)
+		if err != nil {
+			return 0, err
+		}
+		if tag.RowsAffected() != 1 {
+			status.RefreshHold = finishRefreshDisabled
+			return 0, nil
+		}
 	}
 	admitted := 0
 	var bytes int64

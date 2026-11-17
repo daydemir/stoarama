@@ -260,15 +260,19 @@ capped queue ages out; B2 independently refuses stale custody. There are no paci
 windows, revocation/adoption journals or new proof protocols.
 
 This deliberately narrows “verified work is never requeued” only for exact,
-unblocked keep28 RAW in account47/connection13/bucket stoarama whose matching
+unblocked keep28 RAW in account 47 / connection 13 / bucket stoarama whose matching
 inventory expires within one hour. D allocates refresh at most half the current
 total deficit **before** ordinary fill. Ordinary keeps the other half, including
-odd spare slots and unused refresh capacity. Refresh is capped at5,000 outstanding
-rows inside the unchanged10,000 total; that is10m25s of B2's8/s canary throughput,
-below one consumer-hour. The refresh catalog read reuses the scoped60s read-only candidate transaction;
+odd spare slots and unused refresh capacity. Refresh is capped at 5,000 outstanding
+rows inside the unchanged 10,000 total; that is 10m25s of B2's 8/s canary throughput,
+below one consumer-hour. Purged sources are excluded before the catalog limit.
+A persisted custody-time/source-ID cursor makes each bounded 10,000-row page
+circular, so later ticks/restarts progress past rejected KE/held/changed rows.
+The cursor advances before per-key work and grants no admission authority.
+The refresh catalog read reuses the scoped 60s read-only candidate transaction;
 pooled queries, writes and the four-minute tick deadline keep their existing
-budgets. Each tick retains the existing100GB byte bound, admitting
-the complete64GiB COPY domain. A row too large for the remaining allowance is
+budgets. Each tick retains the existing 100 GB byte bound, admitting
+the complete 64 GiB COPY domain. A row too large for the remaining allowance is
 skipped so smaller following rows progress; it can fit a subsequent fresh batch.
 
 Fresh storage proof, full-file capacity debits, memory/cgroup/load/free-space and

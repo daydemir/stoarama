@@ -2,7 +2,10 @@
 CREATE TABLE r2_keep28_refresh_control (
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
  enabled boolean NOT NULL DEFAULT false,
- last_mode text NOT NULL DEFAULT 'copy' CHECK(last_mode IN ('copy','verify_existing'))
+ last_mode text NOT NULL DEFAULT 'copy' CHECK(last_mode IN ('copy','verify_existing')),
+ scan_custody_at timestamptz,
+ scan_source_id bigint NOT NULL DEFAULT 0,
+ CHECK ((scan_custody_at IS NULL AND scan_source_id=0) OR (scan_custody_at IS NOT NULL AND scan_source_id>0))
 );
 INSERT INTO r2_keep28_refresh_control DEFAULT VALUES;
 CREATE TRIGGER r2_refresh_control_no_delete BEFORE DELETE ON r2_keep28_refresh_control FOR EACH ROW EXECUTE FUNCTION guard_r2_object_retirement();
