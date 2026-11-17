@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -352,13 +351,27 @@ func joinedBinPlanRelationVisits(plan map[string]any, relation string) int64 {
 		rows, _ := plan["Actual Rows"].(float64)
 		loops, _ := plan["Actual Loops"].(float64)
 		removed, _ := plan["Rows Removed by Filter"].(float64)
-		total += (rows + removed) * loops
+		rechecked, _ := plan["Rows Removed by Index Recheck"].(float64)
+		total += (rows + removed + rechecked) * loops
 	}
 	children, _ := plan["Plans"].([]any)
 	for _, child := range children {
 		total += float64(joinedBinPlanRelationVisits(child.(map[string]any), relation))
 	}
 	return int64(total)
+}
+
+func joinedPlanContains(plan map[string]any, match func(map[string]any) bool) bool {
+	if match(plan) {
+		return true
+	}
+	children, _ := plan["Plans"].([]any)
+	for _, child := range children {
+		if joinedPlanContains(child.(map[string]any), match) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRecordingJoinedProgressLazyEndpointAuthPublicParityAndIsolation(t *testing.T) {
@@ -445,64 +458,89 @@ func TestRecordingJoinedProgressExplainAnalyzeUsesBoundedIndexes(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		CREATE INDEX idx_recording_clips_recording_started ON recording_clips(recording_id,clip_start_at DESC);
-		INSERT INTO recordings(id,account_id,status) VALUES (60,47,'completed');
+		INSERT INTO recordings(id,account_id,status) VALUES (60,47,'completed'),(70,47,'canceled');
 		INSERT INTO recording_joined_hours VALUES
-			(205,3,47,60,'sealed','same-account-noise','2026-05-04',4,'2026-05-04 11:00:00Z','2026-05-04 12:00:00Z');
+			(205,3,47,60,'sealed','raw-heavy-requested','2026-05-04',4,'2026-05-04 08:00:00Z','2026-05-04 09:00:00Z'),
+			(206,4,47,70,'sealed','same-account-noise','2026-05-04',5,'2026-05-04 08:00:00Z','2026-05-04 09:00:00Z');
 		INSERT INTO recording_clips(id,recording_id,clip_start_at,clip_end_at)
 		SELECT 1000000+value,60,'2026-05-04 08:00:00Z'::timestamptz+value*interval '1 second','2026-05-04 08:00:01Z'::timestamptz+value*interval '1 second'
 		FROM generate_series(1,50000) value;
-		INSERT INTO recording_joined_sources(id,hour_record_id,batch_record_id,account_id,recording_id,clip_id)
-		SELECT 1000000+value,205,3,47,60,1000000+value FROM generate_series(1,50000) value;
-		INSERT INTO recording_joined_artifacts(id,hour_record_id,batch_record_id,account_id,artifact_kind,publication_state,published_at,etag,version_id,content_type,relative_path,expected_size_bytes,expected_sha256,object_key,ordinal)
-		SELECT 1000000+value,205,3,47,'media',NULL,now(),'noise-'||value,'','video/mp4','noise/'||value||'.mp4',10,repeat('9',64),'joined/noise/'||value||'.mp4',value
+		INSERT INTO recording_clips(id,recording_id,clip_start_at,clip_end_at)
+		SELECT 2000000+value,70,'2026-05-04 08:00:00Z','2026-05-04 08:01:00Z'
 		FROM generate_series(1,50000) value;
+		INSERT INTO recording_joined_sources(id,hour_record_id,batch_record_id,account_id,recording_id,clip_id,start_at,end_at)
+		VALUES (501,205,3,47,60,1000001,'2026-05-04 08:00:01Z','2026-05-04 08:00:02Z');
+		INSERT INTO recording_joined_sources(id,hour_record_id,batch_record_id,account_id,recording_id,clip_id)
+		SELECT 2000000+value,206,4,47,70,2000000+value FROM generate_series(1,50000) value;
+		INSERT INTO recording_joined_artifacts(id,hour_record_id,batch_record_id,account_id,artifact_kind,publication_state,published_at,etag,version_id,content_type,relative_path,expected_size_bytes,expected_sha256,object_key,ordinal)
+		VALUES (501,205,3,47,'hour_manifest','published',now(),'requested-manifest','','application/json','60/coverage/hour.json',10,repeat('8',64),'joined/requested/hour.json',1),
+			(502,205,3,47,'media',NULL,now(),'requested-media','','video/mp4','60/requested.mp4',10,repeat('8',64),'joined/requested/media.mp4',1);
+		INSERT INTO recording_joined_artifacts(id,hour_record_id,batch_record_id,account_id,artifact_kind,publication_state,published_at,etag,version_id,content_type,relative_path,expected_size_bytes,expected_sha256,object_key,ordinal)
+		SELECT 2000000+value,206,4,47,'media',NULL,now(),'noise-'||value,'','video/mp4','noise/'||value||'.mp4',10,repeat('9',64),'joined/noise/'||value||'.mp4',value
+		FROM generate_series(1,50000) value;
+		INSERT INTO recording_joined_media_sources VALUES (502,501,1);
 		INSERT INTO recording_joined_media_sources(artifact_id,source_id,ordinal)
-		SELECT 1000000+value,1000000+value,1 FROM generate_series(1,50000) value;
+		SELECT 2000000+value,2000000+value,1 FROM generate_series(1,50000) value;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	// Refresh statistics only after all fixture writes. Requested recording60
+	// is raw-heavy but has one frozen source; canceled70 supplies unrelated
+	// joined history, so scanning every frozen source is unnecessary.
+	if _, err := pool.Exec(ctx, `
 		ANALYZE recordings; ANALYZE recording_clips; ANALYZE recording_joined_hours;
-		ANALYZE recording_joined_sources; ANALYZE recording_joined_artifacts; ANALYZE recording_joined_media_sources;
+		ANALYZE recording_joined_sources; ANALYZE recording_joined_artifacts;
+		ANALYZE recording_joined_media_sources; ANALYZE recording_joined_hour_dispositions;
 	`); err != nil {
 		t.Fatal(err)
 	}
 	started := time.Now()
-	// Production requests every visible recording at once. Keep the large
-	// recording in scope so this catches a plan that only looks bounded when
-	// the noise belongs to an unrequested recording.
-	rows, err := pool.Query(ctx, "EXPLAIN (ANALYZE,BUFFERS,TIMING,FORMAT TEXT) "+recordingJoinedProgressSQL, int64(47), []int64{10, 20, 30, 40, 60})
+	recordingIDs := []int64{10, 20, 30, 40, 60}
+	progress, err := (&Server{pool: pool}).recordingJoinedProgressForAccount(ctx, 47, recordingIDs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(progress) != len(recordingIDs) || progress[60].SourceDurationMS != 1000 || progress[60].JoinedReadyMS != 1000 {
+		t.Fatalf("raw-heavy recording did not use its exact frozen source: %+v", progress)
+	}
+	// Every visible recording, including the raw-heavy one, remains in scope.
+	rows, err := pool.Query(ctx, "EXPLAIN (ANALYZE,BUFFERS,TIMING OFF,FORMAT JSON) "+recordingJoinedProgressSQL, int64(47), recordingIDs)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
-	planLines := []string{}
-	for rows.Next() {
-		var line string
-		if err := rows.Scan(&line); err != nil {
-			t.Fatal(err)
-		}
-		planLines = append(planLines, line)
+	var raw []byte
+	if !rows.Next() {
+		t.Fatalf("EXPLAIN returned no plan: %v", rows.Err())
 	}
-	if err := rows.Err(); err != nil {
+	if err := rows.Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
-	plan := strings.Join(planLines, "\n")
-	t.Logf("joined progress EXPLAIN ANALYZE (%s):\n%s", time.Since(started).Round(time.Millisecond), plan)
-	for _, index := range []string{"recording_joined_sources_account_recording_idx", "recording_joined_media_sources_source_artifact_idx", "recording_joined_artifacts_published_hour_idx"} {
-		if !strings.Contains(plan, index) {
-			t.Fatalf("plan did not use %s:\n%s", index, plan)
-		}
-	}
-	if strings.Contains(plan, "recording_clips") {
-		t.Fatalf("joined progress scanned mutable raw clips instead of the frozen source set:\n%s", plan)
-	}
-	bufferMatch := regexp.MustCompile(`Buffers: shared hit=([0-9]+)`).FindStringSubmatch(plan)
-	if len(bufferMatch) != 2 {
-		t.Fatalf("plan did not report shared buffers:\n%s", plan)
-	}
-	sharedHits, err := strconv.Atoi(bufferMatch[1])
-	if err != nil {
+	var document []map[string]any
+	if err := json.Unmarshal(raw, &document); err != nil {
 		t.Fatal(err)
 	}
-	if sharedHits > 1000 {
-		t.Fatalf("joined progress touched %d shared buffers; want at most 1000:\n%s", sharedHits, plan)
+	plan := document[0]["Plan"].(map[string]any)
+	t.Logf("joined progress EXPLAIN ANALYZE (%s): %s", time.Since(started).Round(time.Millisecond), raw)
+	if joinedPlanContains(plan, func(node map[string]any) bool { return node["Relation Name"] == "recording_clips" }) {
+		t.Fatalf("joined progress accessed mutable raw clips instead of frozen sources: %s", raw)
+	}
+	for _, relation := range []string{"recording_joined_sources", "recording_joined_artifacts", "recording_joined_media_sources"} {
+		if joinedPlanContains(plan, func(node map[string]any) bool {
+			return node["Relation Name"] == relation && node["Node Type"] == "Seq Scan"
+		}) {
+			t.Fatalf("joined progress sequentially scanned big table %s: %s", relation, raw)
+		}
+		visits := joinedBinPlanRelationVisits(plan, relation)
+		t.Logf("%s row visits=%d", relation, visits)
+		if visits > 256 {
+			t.Fatalf("joined progress visited %d rows in %s; want at most256: %s", visits, relation, raw)
+		}
+	}
+	hits, hitsOK := plan["Shared Hit Blocks"].(float64)
+	reads, readsOK := plan["Shared Read Blocks"].(float64)
+	if !hitsOK || !readsOK || hits+reads > 1000 {
+		t.Fatalf("joined progress did not keep shared-buffer visits bounded to1000: hits=%v reads=%v: %s", hits, reads, raw)
 	}
 	if elapsed := time.Since(started); elapsed > 5*time.Second {
 		t.Fatalf("indexed joined progress EXPLAIN took %s", elapsed)
