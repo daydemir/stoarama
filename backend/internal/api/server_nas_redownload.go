@@ -21,6 +21,30 @@ type nasRedownloadRequest struct {
 	PolicySHA256 string `json:"policy_sha256"`
 }
 
+type nasRedownloadSource struct {
+	streamID                         int64
+	bucket, key, sha, timezone, path string
+	size                             int64
+	start, end                       time.Time
+	held, purged                     bool
+	payload                          []byte
+	token                            *string
+}
+
+func loadNASRedownloadSource(ctx context.Context, query func(context.Context, string, ...any) pgx.Row, clipID, accountID int64) (nasRedownloadSource, error) {
+	var source nasRedownloadSource
+	err := query(ctx, nasRedownloadSQL, clipID, accountID).Scan(&source.streamID, &source.bucket, &source.key, &source.sha,
+		&source.size, &source.path, &source.start, &source.end, &source.timezone, &source.purged, &source.held, &source.payload, &source.token)
+	return source, err
+}
+
+func (source nasRedownloadSource) eligible(req nasRedownloadRequest, windows map[int64]Keep28Window, bucket string) bool {
+	window, exists := windows[source.streamID]
+	return exists && source.timezone == window.Timezone && source.end.After(source.start) && source.start.Before(window.End) && source.end.After(window.Start) &&
+		source.bucket == bucket && strings.HasPrefix(source.key, "managed/") && source.sha == req.SHA256 && source.size == req.SizeBytes &&
+		validNASRelativePath(source.path) && !source.purged && !source.held
+}
+
 // Read-only, connection-13-only recovery download. Unlike the public browser
 // download this permits released clips, but never purged/reserved/held clips.
 // The caller supplies identity, never a bucket/key or download destination.
@@ -47,29 +71,8 @@ func (s *Server) handleAccountConnectionRedownload(w http.ResponseWriter, r *htt
 		util.WriteError(w, 503, "archive unavailable")
 		return
 	}
-	tx, err := s.pool.BeginTx(r.Context(), pgx.TxOptions{AccessMode: pgx.ReadOnly})
-	if err != nil {
-		util.WriteError(w, 503, "copy database unavailable")
-		return
-	}
-	defer tx.Rollback(r.Context())
-	// Shared admission/public locks exclude a cleanup admission/activation while
-	// the source identity and short-lived capability are checked and signed.
-	for _, key := range []int64{nasCleanupAdmissionLock, nasCleanupPublicFence} {
-		if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock_shared($1)`, key); err != nil {
-			util.WriteError(w, 503, "copy fence unavailable")
-			return
-		}
-	}
 	principal, _ := accountPrincipalFromContext(r.Context())
-	var streamID int64
-	var bucket, key, sha, tz, path string
-	var size int64
-	var start, end time.Time
-	var held, purged bool
-	var payload []byte
-	var token *string
-	err = tx.QueryRow(r.Context(), nasRedownloadSQL, req.ClipID, principal.AccountID).Scan(&streamID, &bucket, &key, &sha, &size, &path, &start, &end, &tz, &purged, &held, &payload, &token)
+	source, err := loadNASRedownloadSource(r.Context(), s.pool.QueryRow, req.ClipID, principal.AccountID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, 404, "copy clip not found")
 		return
@@ -78,30 +81,57 @@ func (s *Server) handleAccountConnectionRedownload(w http.ResponseWriter, r *htt
 		util.WriteError(w, 503, "copy identity unavailable")
 		return
 	}
-	window, exists := windows[streamID]
-	if !exists || tz != window.Timezone || !end.After(start) || !start.Before(window.End) || !end.After(window.Start) ||
-		bucket != s.r2.Bucket() || !strings.HasPrefix(key, "managed/") || sha != req.SHA256 || size != req.SizeBytes || !validNASRelativePath(path) || purged || held {
+	if !source.eligible(req, windows, s.r2.Bucket()) {
 		util.WriteError(w, 409, "copy source is outside policy, held, retired or changed")
 		return
 	}
-	head, err := s.r2.Head(r.Context(), key)
-	if err != nil || head.ETag == "" || head.SizeBytes != size || (head.SHA256Metadata != "" && !strings.EqualFold(head.SHA256Metadata, sha)) {
+	// HEAD issues no authority and holds no database transaction or fence.
+	head, err := s.r2.Head(r.Context(), source.key)
+	if err != nil || head.ETag == "" || head.SizeBytes != source.size || (head.SHA256Metadata != "" && !strings.EqualFold(head.SHA256Metadata, source.sha)) {
 		util.WriteError(w, 409, "copy R2 identity unavailable")
 		return
 	}
-	cap, err := s.r2.PresignGetExactRequest(r.Context(), key, head.ETag, head.VersionID, 15*time.Minute)
+	tx, err := BeginNASR2CopyTx(r.Context(), s.pool)
+	if err != nil {
+		util.WriteError(w, 503, "copy database unavailable")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	// COPY/deploy fence first, then the existing cleanup fences, then the
+	// shared maintenance singleton. Never wait for1192 while holding a cleanup
+	// fence or the singleton: the controller takes1192 before its row lock.
+	for _, key := range []int64{nasR2CopyLock, nasCleanupAdmissionLock, nasCleanupPublicFence} {
+		if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock_shared($1)`, key); err != nil {
+			util.WriteError(w, 503, "copy fence unavailable")
+			return
+		}
+	}
+	if err = cleanupMaintenanceCheck(r.Context(), tx); err != nil {
+		util.WriteError(w, 409, "redownload maintenance gate unavailable or active")
+		return
+	}
+	current, err := loadNASRedownloadSource(r.Context(), tx.QueryRow, req.ClipID, principal.AccountID)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (!current.eligible(req, windows, s.r2.Bucket()) || current.key != source.key)) {
+		util.WriteError(w, 409, "copy source changed during HEAD")
+		return
+	}
+	if err != nil {
+		util.WriteError(w, 503, "copy identity unavailable")
+		return
+	}
+	cap, err := s.r2.PresignGetExactRequest(r.Context(), current.key, head.ETag, head.VersionID, 15*time.Minute)
 	if err != nil {
 		util.WriteError(w, 503, "copy capability unavailable")
 		return
 	}
 	var clip map[string]any
-	if json.Unmarshal(payload, &clip) != nil {
+	if json.Unmarshal(current.payload, &clip) != nil {
 		util.WriteError(w, 503, "copy metadata unavailable")
 		return
 	}
 	clip["capture_generation"] = nil
-	if token != nil {
-		sum := sha256.Sum256([]byte(*token))
+	if current.token != nil {
+		sum := sha256.Sum256([]byte(*current.token))
 		clip["capture_generation"] = fmt.Sprintf("sha256:%x", sum[:])
 	}
 	util.WriteJSON(w, 200, map[string]any{"policy_sha256": policy, "clip": clip, "url": cap.URL, "headers": cap.Headers, "expires_at": time.Now().UTC().Add(15 * time.Minute)})
