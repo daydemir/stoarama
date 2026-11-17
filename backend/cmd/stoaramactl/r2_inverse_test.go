@@ -119,7 +119,7 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
  CREATE TABLE recording_collation_hours(id bigint,recording_id bigint);
  CREATE TABLE recording_collation_outputs(id bigint,collation_hour_id bigint,object_key text,nas_relative_path text,start_at timestamptz,end_at timestamptz,source_clip_ids bigint[]);
  CREATE TABLE nas_cleanup_plans(id bigint,mode text,account_id bigint,connection_id bigint,label text,manifest jsonb);
- CREATE TABLE nas_cleanup_items(plan_id bigint,ordinal bigint,delete_ever_issued boolean);
+ CREATE TABLE nas_cleanup_items(id bigserial,plan_id bigint,ordinal bigint,delete_ever_issued boolean);
  CREATE TABLE nas_cleanup_source_holds(plan_id bigint,clip_id bigint);
  CREATE TABLE r2_retirement_reservations(bucket text,object_key text);
  CREATE TABLE r2_object_retirements(bucket text,object_key text);
@@ -142,7 +142,7 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
 		exec(`INSERT INTO recording_clips VALUES($1,1,'bucket',$2,$2,'2026-06-01','2026-06-02')`, id+1, key)
 	}
 	exec(`INSERT INTO nas_cleanup_plans VALUES(1,'retired',47,13,'source','[]'),(2,'active',47,13,'reserved','[{"kind":"raw","source_id":1}]');
- INSERT INTO nas_cleanup_items VALUES(1,1,true); INSERT INTO nas_cleanup_source_holds VALUES(1,2);
+ INSERT INTO nas_cleanup_items(plan_id,ordinal,delete_ever_issued) VALUES(1,1,true); INSERT INTO nas_cleanup_source_holds VALUES(1,2);
  INSERT INTO nas_cleanup_incident_files VALUES('raw',3);
  INSERT INTO recording_collation_outputs VALUES(20,1,'incident_collated','incident-collated','2026-06-01','2026-06-02',ARRAY[3]::bigint[]);
  INSERT INTO r2_retirement_reservations VALUES('bucket','reservation'),('other','other_reservation');
