@@ -39,9 +39,9 @@ Budget freshness is proven on the database clock, independent of network delay
 or client lifetime. Every successful heartbeat stores a new random 64-hex nonce
 and its server issuance time. Only exact v5/v6 responses expose the private
 `storage_challenge_nonce`; legacy joined/proof envelopes omit it entirely.
-V5/V6 consume it before passing the response to the unchanged strict control parser. These clients
-consume that nonce before the next actual storage attempt, samples physically
-after receiving it, and echoes `storage.challenge_nonce`. Without a nonce it
+V5/V6 extract and store it before passing the remaining response to the unchanged
+strict control parser. Each client spends that nonce once, immediately before
+sampling storage for the next request, then echoes `storage.challenge_nonce`. Without a nonce it
 still sends fresh display-only storage; no budget is granted for that cycle.
 
 Under the existing connection row lock, the storage UPDATE checks the exact
@@ -169,16 +169,14 @@ this decision; an empty queue is not cleanup authority.
 ## Install packet
 
 Sole controller, at a natural boundary after the combined D/A1b boundary review:
-A1 + #526 and the reviewed storage-sample boundary remain prerequisites. For the
-current v6 release, follow `docs/operations.md`'s quiesced COPY/collated cutover:
-confirm reviewed 0205 is installed, apply 0206, precreate its exact GIN index
-concurrently, then apply 0207/0208, and deploy compatible API and finish CLI before activating v6.
-Migration 0208 preserves existing v5 evidence and adds the exact v6 proof pair;
-it does not manufacture proof. Quiesce every collated caller until it has a
-compatible immutable artifact; the old parser cannot consume the new wire shape.
-Verify two v6 heartbeats and `nas_storage_client_version='r2-copy-v6'` bound to the
-preceding server challenge time, audit/retarget private collector version pins,
-and only then install D. A v4 observation packet is not late-budget eligible.
+A1 + #526 and the reviewed storage-sample boundary remain prerequisites. Follow
+[the canonical COPY/collated rollout](../../../docs/operations.md)
+for the complete schema/index, API/CLI, all-caller quiescence and immutable v6
+cutover order. Audit and retarget private collector/version pins **before v6
+activation**, as required there; do not activate until its preactivation gates
+are complete. After activation, verify two v6 heartbeats with
+`nas_storage_client_version='r2-copy-v6'` bound to the preceding server challenge
+time, then install D. A v4 observation packet is not late-budget eligible.
 
 1. Build the merged CLI on Jelly using `darma storage check` then
    `darma run --slot -- go -C backend build -o <install>/stoaramactl ./cmd/stoaramactl`.
