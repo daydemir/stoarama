@@ -97,6 +97,16 @@ CREATE TRIGGER r2_inverse_stream_identity_fence BEFORE UPDATE OF local_timezone 
  FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();
 -- COPY latches serialize only with their exact R2 key, preserving A1's
 -- independent-connection reservation contract and unrelated copy throughput.
+-- Both INSERT directions must see the commit that preceded their key lock.
+CREATE FUNCTION require_r2_inverse_copy_read_committed() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'COPY/retirement admission requires READ COMMITTED' USING ERRCODE='55000'; END IF;
+ RETURN NULL;
+END $$;
+CREATE TRIGGER r2_inverse_copy_insert_isolation BEFORE INSERT ON nas_r2_copy_items
+ FOR EACH STATEMENT EXECUTE FUNCTION require_r2_inverse_copy_read_committed();
+CREATE TRIGGER r2_inverse_reservation_insert_isolation BEFORE INSERT ON r2_retirement_reservations
+ FOR EACH STATEMENT EXECUTE FUNCTION require_r2_inverse_copy_read_committed();
 CREATE FUNCTION fence_r2_inverse_copy_key() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
  IF current_setting('transaction_isolation')<>'read committed' THEN
   RAISE EXCEPTION 'R2 COPY protection admission requires READ COMMITTED' USING ERRCODE='55000'; END IF;

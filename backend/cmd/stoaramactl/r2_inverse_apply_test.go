@@ -699,6 +699,41 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			})
 		}
 	})
+	t.Run("stale_snapshot_cannot_cross_COPY_reservation_boundary", func(t *testing.T) {
+		const copyInsert = `INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item,state,blocked_reason)
+ SELECT 13,'raw',id,repeat('a',64),$3,jsonb_build_object('bucket',bucket,'object_key',object_key),$2,CASE WHEN $2='blocked' THEN 'checksum_mismatch' ELSE '' END FROM recording_clips WHERE object_key=$1`
+		for _, level := range []pgx.TxIsoLevel{pgx.RepeatableRead, pgx.Serializable} {
+			for _, admission := range []string{"pending", "blocked", "reservation"} {
+				t.Run(string(level)+"/"+admission, func(t *testing.T) {
+					a, entries := build(1)
+					defer a.ledger.close()
+					e := entries[0]
+					stale, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: level})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer stale.Rollback(ctx)
+					var count int
+					if err = stale.QueryRow(ctx, `SELECT count(*) FROM r2_retirement_reservations WHERE object_key=$1`, e.Key).Scan(&count); err != nil || count != 0 {
+						t.Fatal(count, err)
+					}
+					if admission == "reservation" {
+						exec(copyInsert, e.Key, "blocked", policy)
+						_, err = stale.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) SELECT 'raw',id,bucket,object_key,size_bytes,sha256,repeat('a',64) FROM recording_clips WHERE object_key=$1`, e.Key)
+					} else {
+						if _, err = a.delete(ctx, e); err != nil {
+							t.Fatal(err)
+						}
+						_, err = stale.Exec(ctx, copyInsert, e.Key, admission, policy)
+					}
+					var pe *pgconn.PgError
+					if !errors.As(err, &pe) || pe.Code != "55000" {
+						t.Fatal("stale COPY/reservation admission not refused", err)
+					}
+				})
+			}
+		}
+	})
 	t.Run("pool_capacity_reserved_before_any_intent", func(t *testing.T) {
 		a, entries := build(4)
 		a.ledger.close()
