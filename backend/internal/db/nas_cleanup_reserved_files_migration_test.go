@@ -17,6 +17,9 @@ func TestNASCleanupReservedFilesMigrationLocksAndNoRewrite(t *testing.T) {
 	if dsn == "" {
 		t.Skip("set STOARAMA_TEST_DATABASE_URL")
 	}
+	// Keep the bounded retry short here; this test asserts that each attempt
+	// aborts quickly rather than waiting on the held lock.
+	setMigrationLock(t, migrationLockPolicy{timeout: 500 * time.Millisecond, attempts: 2, backoff: 100 * time.Millisecond})
 	ctx := context.Background()
 	admin, err := pgxpool.New(ctx, dsn)
 	if err != nil {
