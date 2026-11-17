@@ -154,10 +154,10 @@ func finishReadEvidence(safetyPath, copyPath string) (finishSafety, finishCopy, 
 	if err := finishReadJSON(safetyPath, []string{"updated_at", "recovery_problems", "recovery_checked_at", "recovery_issued_items", "recovery_verified_items", "recovery_plan_id", "recovery_plan_sha256", "last_error", "controller_held_error", "local_copy_mismatch_latched", "local_copy_checked_at", "master_checked_at", "shutdown_or_recovery_failed", "recovery_error", "known_enabled_plans", "known_enabled_batches", "master_deletion_enabled", "expected_deletion_enabled", "holds_by_reason"}, &s); err != nil {
 		return s, c, err
 	}
-	if err := finishReadJSON(copyPath, []string{"schema", "updated_at", "queue_depth", "verified_in_place", "downloaded", "downloaded_bytes", "committed_bytes", "blocked", "blocked_by_reason", "mismatch_latched"}, &c); err != nil {
+	if err := finishReadJSON(copyPath, []string{"schema", "updated_at", "queue_depth", "verified_in_place", "downloaded", "downloaded_bytes", "committed_bytes", "blocked", "blocked_by_reason", "mismatch_latched", "verified_in_place_items_per_minute", "downloaded_items_per_minute"}, &c); err != nil {
 		return s, c, err
 	}
-	if !finishFresh(s.UpdatedAt, time.Now()) || !finishFresh(c.UpdatedAt, time.Now()) || c.Schema != "stoarama.nas-r2-copy-status.v1" || s.RecoveryProblems < 0 || c.QueueDepth < 0 || c.Blocked < 0 || c.MismatchLatched < 0 {
+	if !finishFresh(s.UpdatedAt, time.Now()) || !finishFresh(c.UpdatedAt, time.Now()) || c.Schema != "stoarama.nas-r2-copy-status.v1" || s.RecoveryProblems < 0 || c.QueueDepth < 0 || c.Blocked < 0 || c.MismatchLatched < 0 || c.VerifiedInPlaceItemsPerMinute < 0 || c.DownloadedItemsPerMinute < 0 {
 		return s, c, finishEvidence
 	}
 	for _, ids := range [][]int64{s.KnownPlans, s.KnownBatches} {
@@ -324,7 +324,7 @@ func finishManifest(dir string, items []api.NASR2CopyItem) (nasCopyHeader, strin
 	return parsed, digest, validated, err
 }
 func finishDepth(ctx context.Context, pool *pgxpool.Pool, status *finishStatus) error {
-	return pool.QueryRow(ctx, `SELECT count(*) FILTER(WHERE state IN ('pending','leased')),count(*) FILTER(WHERE state='verified' AND verified_at>=clock_timestamp()-interval '5 minutes')/5.0 FROM nas_r2_copy_items WHERE connection_id=13 AND kind='raw'`).Scan(&status.QueueDepth, &status.ItemsPerMinute)
+	return pool.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE connection_id=13 AND kind='raw' AND state IN ('pending','leased')`).Scan(&status.QueueDepth)
 }
 
 // Current storage evidence is independent of historical hold counters.
@@ -396,6 +396,7 @@ func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath st
 	for {
 		s, c, e := finishReadEvidence(safetyPath, copyPath)
 		status.Copy = c
+		status.ItemsPerMinute = float64(c.VerifiedInPlaceItemsPerMinute) + float64(c.DownloadedItemsPerMinute)
 		status.QueueDepth = c.QueueDepth
 		status.Holds = s.Holds
 		if e != nil {

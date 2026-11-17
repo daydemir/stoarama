@@ -29,7 +29,7 @@ func TestFinishConsumesActualA1Status(t *testing.T) {
 		t.Fatalf("A1 status lost: %+v", consumer)
 	}
 	status, err := finishTick(ctx, pool, safety, copy)
-	if !errors.Is(err, finishMismatch) || status.Stop != finishMismatch {
+	if !errors.Is(err, finishMismatch) || status.Stop != finishMismatch || status.ItemsPerMinute != 2 {
 		t.Fatalf("A1 latch ignored: %v %+v", err, status)
 	}
 }

@@ -146,8 +146,8 @@ Both safety and copy status timestamps must be no older than five minutes and
 no more than 30 seconds in the future. Copy status is produced afresh by A1's
 `stoaramactl nas-r2-copy status --json`, schema
 `stoarama.nas-r2-copy-status.v1`. Its mismatch latch and durable copy statistics
-are copied into finish status. Queue depth and `items_per_min` (verified in the
-last five minutes divided by five, including idle time) are refreshed from DB.
+are copied into finish status. The live admission queue depth is refreshed from DB; `items_per_min` is the sum
+of A1 JSON's rolling-60-second verified-in-place and downloaded completion rates.
 On a safety stop, cleanup is always false. On a successful tick it follows only
 the current free-space headroom rule above. The controller runner alone acts on
 this decision; an empty queue is not cleanup authority.
