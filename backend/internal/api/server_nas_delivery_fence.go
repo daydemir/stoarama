@@ -99,7 +99,7 @@ func (s *Server) fenceNASDelivery(next http.Handler) http.Handler {
 		}
 		response := &nasDeliveryResponse{header: make(http.Header)}
 		next.ServeHTTP(response, r)
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && !(nasR2CopyControlRequest(r) && nasR2CopyCommittedResponse(response.status)) {
 			util.WriteError(w, 503, "delivery admission expired")
 			return
 		}

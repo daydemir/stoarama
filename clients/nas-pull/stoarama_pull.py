@@ -1869,6 +1869,8 @@ class Runtime:
         self.joined_work_condition = threading.Condition()
         self.joined_work_credit = 0
         self.cursor_id = max(0, int(progress.get("after_id", 0)))
+        self.collated_after_id = 0
+        self.collated_next_poll = 0.0
         self.clips_pulled = max(0, int(progress.get("clips_pulled", 0)))
         self.bytes_pulled = max(0, int(progress.get("bytes_pulled", 0)))
         self.phase = Phase.STARTING
@@ -18186,7 +18188,7 @@ CLEANUP_V6_VERSIONS: frozenset[str] = frozenset((CLEANUP_GROUP_VERSION, "r2-copy
 CLEANUP_BULK_VERSION = "cleanup-batch-v7"
 CLEANUP_TRUTH_VERSION = "cleanup-batch-v8"
 CLEANUP_FRESH_PERMIT_VERSION = "v85r-nas-proof-v2.2"
-CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v2", "r2-copy-v3", "r2-copy-v4", "r2-copy-v5", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
+CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v2", "r2-copy-v3", "r2-copy-v4", "r2-copy-v5", "r2-copy-v6", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
 CLEANUP_GROUP_VERSIONS: frozenset[str] = CLEANUP_V6_VERSIONS | CLEANUP_BULK_VERSIONS
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
@@ -18204,7 +18206,7 @@ CLEANUP_RETRYABLE_ATTEMPTS = 8
 def cleanup_execution_group_size():
     # One lease/permit clock per file. NAS syscall latency must never consume
     # another file's short authority window. Historical releases retain v7.
-    return 1 if CLIENT_VERSION in (CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v4", "r2-copy-v5") else CLEANUP_EXECUTION_GROUP
+    return 1 if CLIENT_VERSION in (CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v4", "r2-copy-v5", "r2-copy-v6") else CLEANUP_EXECUTION_GROUP
 
 
 class CleanupProtocolUnsupported(RuntimeError):
@@ -24082,13 +24084,24 @@ def drain_collated(cfg, runtime, stop_event):
     """Deliver one page of collated outputs. Returns True when any output landed."""
     if cfg.dry_run:
         return False
-    page = request_json(cfg, "GET", "/account/collated?limit=%d" % COLLATED_PAGE_LIMIT)
-    if not isinstance(page, dict) or set(page) != {"policy", "items"} or not isinstance(page["items"], list):
+    now = time.monotonic()
+    if now < runtime.collated_next_poll:
+        return False
+    # This lane's idle/error pacing is independent of joined-download progress.
+    runtime.collated_next_poll = now + min(cfg.poll_interval_sec, 10)
+    page = request_json(cfg, "GET", "/account/collated?limit=%d&after_id=%d" % (COLLATED_PAGE_LIMIT, runtime.collated_after_id))
+    if not isinstance(page, dict) or set(page) != {"policy", "items", "next_after_id"} or not isinstance(page["items"], list):
         raise RuntimeError("collated response is invalid")
     policy = valid_collated_policy(page["policy"])
-    if not policy["enabled"] or not page["items"]:
-        return False
+    next_id = page["next_after_id"]
+    if type(next_id) is not int or next_id < 0 or (next_id != 0 and next_id <= runtime.collated_after_id):
+        raise RuntimeError("collated cursor is invalid")
     items = [valid_collated_item(raw) for raw in page["items"]]
+    if any(item["output_id"] <= runtime.collated_after_id or item["output_id"] > next_id for item in items):
+        raise RuntimeError("collated item outside cursor page")
+    runtime.collated_after_id = next_id
+    if not policy["enabled"] or not items:
+        return False
     limiter = ByteRateLimiter(policy["download_bytes_per_sec"])
     delivered = []
 
@@ -24126,6 +24139,8 @@ def drain_collated(cfg, runtime, stop_event):
                 stopped = exc
     if stopped is not None and not delivered:
         log("INFO", "collated delivery paused: %s" % stopped)
+    if delivered:
+        runtime.collated_next_poll = 0.0
     return bool(delivered)
 
 
@@ -52808,7 +52823,8 @@ class R2CopyControl:
         self.sequence += 1
         message = (json.dumps({"url": self.cfg.api_base + path,
                    "headers": {"User-Agent": USER_AGENT, "Authorization": "Bearer " + self.cfg.api_key,
-                               "Content-Type": "application/json"},
+                               "Content-Type": "application/json",
+                               **({"X-Stoarama-Copy-Control": "inventory"} if operation is R2CopyControlOperation.INVENTORY else {})},
                    "body": base64.b64encode(json.dumps(body).encode()).decode() if body is not None else None}) + "\n").encode()
         if len(message) > 32768:
             raise R2CopyHold("copy HTTP input exceeds bound")

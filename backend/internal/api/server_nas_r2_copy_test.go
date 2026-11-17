@@ -50,6 +50,11 @@ func copyTestFixture(t *testing.T) (*cleanupFixture, NASR2CopyItem) {
 	}
 	return f, i
 }
+
+type copyDeadlineRecorder struct{ *httptest.ResponseRecorder }
+
+func (copyDeadlineRecorder) SetReadDeadline(time.Time) error { return nil }
+
 func copyCall(f *cleanupFixture, action string, id int64, body any) *httptest.ResponseRecorder {
 	data, _ := json.Marshal(body)
 	path := fmt.Sprintf("/api/v1/account/connections/r2-copy/%d/%s", id, action)
@@ -65,7 +70,7 @@ func copyCall(f *cleanupFixture, action string, id int64, body any) *httptest.Re
 	req = req.WithContext(ctx)
 	out := httptest.NewRecorder()
 	handlers := map[string]http.HandlerFunc{"lease": f.s.handleNASR2CopyLease, "checkpoint": f.s.handleNASR2CopyCheckpoint, "range": f.s.handleNASR2CopyRange, "result": f.s.handleNASR2CopyResult, "block": f.s.handleNASR2CopyBlock}
-	f.s.confineAccountScope(f.s.fenceNASDelivery(handlers[action])).ServeHTTP(out, req)
+	nasDeliveryRequestDeadline(f.s.confineAccountScope(f.s.fenceNASDelivery(handlers[action]))).ServeHTTP(copyDeadlineRecorder{out}, req)
 	return out
 }
 func copyLease(t *testing.T, f *cleanupFixture) nasR2CopyTask {
@@ -262,10 +267,8 @@ func TestNASR2CopySourceHoldsStillRefused(t *testing.T) {
 	defer tx.Rollback(f.ctx)
 	// A stitched-source cleanup reservation can overlap keep28; it must still
 	// veto copy even though ordinary outside-window plans can run concurrently.
-	if _, err = tx.Exec(f.ctx, `CREATE TEMP TABLE nas_cleanup_reserved_files(kind text,source_id bigint)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = tx.Exec(f.ctx, `INSERT INTO nas_cleanup_reserved_files VALUES('raw',$1)`, i.SourceID); err != nil {
+	if _, err = tx.Exec(f.ctx, `INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256)
+ VALUES(47,13,'copy-source-reserved',repeat('a',64),jsonb_build_array(jsonb_build_object('kind','raw','source_id',$1::bigint)),repeat('b',64))`, i.SourceID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = LoadNASR2CopySource(f.ctx, tx, i); err == nil {
@@ -501,7 +504,7 @@ func TestNASR2CopyScopedOtherConnectionDenied(t *testing.T) {
 	req.Header.Set("User-Agent", "stoarama-nas-pull/"+f.version)
 	req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: 48, APIKeyID: ptrInt64(6), KeyScopes: []string{accountScopePull}}))
 	out := httptest.NewRecorder()
-	f.s.confineAccountScope(f.s.fenceNASDelivery(http.HandlerFunc(f.s.handleNASR2CopyLease))).ServeHTTP(out, req)
+	f.s.confineAccountScope(f.s.fenceNASDelivery(http.HandlerFunc(f.s.handleNASR2CopyLease))).ServeHTTP(copyDeadlineRecorder{out}, req)
 	if out.Code != 403 || !strings.Contains(out.Body.String(), "connection 13") {
 		t.Fatalf("foreign valid pull key response %d %s", out.Code, out.Body)
 	}
@@ -626,5 +629,46 @@ func TestNASR2CopyDatabaseLookupFailureDoesNotBlockIdentity(t *testing.T) {
 	}
 	if task := copyLease(t, f); task.ID != 1 {
 		t.Fatal("lookup failure blocked source")
+	}
+}
+
+func TestNASR2CopyV6LeaseKeepsExactRequestAdmission(t *testing.T) {
+	f, _ := copyTestFixture(t)
+	f.s.cfg.NASR2CopyEnabled = true
+	f.useClientVersion(NASR2CopyPagedClientVersion)
+	task := copyLease(t, f)
+	if task.ID <= 0 || task.Token == "" {
+		t.Fatal("v6 did not acquire an ordinary copy lease")
+	}
+	if nasClientSupportsStitchProof(NASR2CopyPagedClientVersion) {
+		t.Fatal("copy release gained stitch-proof eligibility")
+	}
+}
+
+func TestNASR2CopyProgressCannotBeProvedByCustodyRefresh(t *testing.T) {
+	f, item := copyTestFixture(t)
+	_, err := f.pool.Exec(f.ctx, `UPDATE nas_r2_copy_items SET state='verified',verified_at=now()-interval '1 day',completion='downloaded',downloaded_bytes=$1,committed_bytes=$1`, item.SizeBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.pool.Exec(f.ctx, `UPDATE nas_r2_copy_items SET work_mode='verify_existing',state='refresh_leased'`); err != nil {
+		t.Fatal(err)
+	}
+	baseline := time.Now().UTC()
+	sample := func() (int64, int64, int64) {
+		t.Helper()
+		var downloaded, committed, completed int64
+		if err := f.pool.QueryRow(f.ctx, `SELECT coalesce(sum(downloaded_bytes),0),coalesce(sum(committed_bytes),0),count(*) FILTER(WHERE state='verified' AND completion='downloaded' AND committed_bytes>0 AND verified_at>$1) FROM nas_r2_copy_items WHERE connection_id=13`, baseline).Scan(&downloaded, &committed, &completed); err != nil {
+			t.Fatal(err)
+		}
+		return downloaded, committed, completed
+	}
+	d0, c0, n0 := sample()
+	if _, err = f.pool.Exec(f.ctx, `UPDATE nas_r2_copy_items SET state='verified',custody_refreshed_at=clock_timestamp(),refresh_count=refresh_count+1`); err != nil {
+		t.Fatal(err)
+	}
+	d1, c1, n1 := sample()
+	if d0 != d1 || c0 != c1 || n0 != 0 || n1 != 0 {
+		t.Fatalf("refresh masqueraded as original progress: %d/%d/%d -> %d/%d/%d", d0, c0, n0, d1, c1, n1)
 	}
 }

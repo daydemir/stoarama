@@ -267,6 +267,102 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	if code, _ := do(s.handleAccountCollatedDownload, http.MethodGet, "/x", nil, map[string]string{"outputId": "103"}); code != 404 {
 		t.Fatalf("retired output download code=%d", code)
 	}
+
+	// A prefix longer than the scan page is withheld, but the cursor must reach
+	// the later deliverable output. Duplicated sources cannot duplicate outputs.
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_collation_outputs
+ SELECT g,12,1,'object-'||g,'invalid-'||g,1000,repeat('a',64),ARRAY[5000::bigint]
+ FROM generate_series(1000,2000)g`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_collation_outputs VALUES(2001,12,1,'object-2001',$1,1000,repeat('a',64),ARRAY[101,101]::bigint[])`, dir+"18_180001-190001.mp4"); err != nil {
+		t.Fatal(err)
+	}
+	// Preserve the pre-rewrite ANY predicate as a result-set oracle; compare all
+	// pages at limit=1 so advancing to the candidate maximum would lose items.
+	oracleSQL := strings.Replace(collatedEligibleSQL,
+		"JOIN unnest(o.source_clip_ids) source_id ON source_id=hold.clip_id WHERE hold.mode=",
+		"WHERE hold.clip_id=ANY(o.source_clip_ids) AND hold.mode=", 1)
+	rows, err := pool.Query(ctx, `SELECT o.id `+oracleSQL+collatedNotBackedOffSQL+` ORDER BY o.id`, int64(13))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	var got []int64
+	after := int64(0)
+	emptyAdvanced := false
+	for n := 0; n < 10; n++ {
+		code, page := do(s.handleAccountCollated, http.MethodGet, fmt.Sprintf("/api/v1/account/collated?limit=1&after_id=%d", after), nil, nil)
+		if code != 200 {
+			t.Fatalf("page %d: %v", code, page)
+		}
+		next := int64(page["next_after_id"].(float64))
+		for _, raw := range page["items"].([]any) {
+			got = append(got, int64(raw.(map[string]any)["output_id"].(float64)))
+		}
+		if next == 0 {
+			break
+		}
+		if next <= after {
+			t.Fatalf("non-forward cursor %d -> %d", after, next)
+		}
+		if len(page["items"].([]any)) == 0 {
+			emptyAdvanced = true
+		}
+		after = next
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) || !emptyAdvanced {
+		t.Fatalf("paged=%v oracle=%v advanced empty=%t", got, want, emptyAdvanced)
+	}
+
+	// A complete expensive-stage batch rejected by the fence must advance only
+	// to that batch's end; later held outputs within the candidate page survive.
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_collation_outputs
+ SELECT g,12,1,'held-object-'||g,'held-'||g,1000,repeat('a',64),ARRAY[101::bigint]
+ FROM generate_series(3000,3020)g;
+ CREATE OR REPLACE FUNCTION nas_delivery_allowed(connection bigint,kind text,source bigint) RETURNS boolean LANGUAGE sql STABLE AS $$SELECT source=3020$$;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_collation_outputs SET nas_relative_path=$1 WHERE id=3020`, dir+"19_190001-200001.mp4"); err != nil {
+		t.Fatal(err)
+	}
+	after = 2999
+	for _, wantNext := range []int64{3009, 3019, 3020} {
+		code, page := do(s.handleAccountCollated, http.MethodGet, fmt.Sprintf("/api/v1/account/collated?after_id=%d", after), nil, nil)
+		if code != 200 || int64(page["next_after_id"].(float64)) != wantNext {
+			t.Fatalf("fence page=%v status=%d", page, code)
+		}
+		if wantNext == 3020 && len(page["items"].([]any)) != 1 {
+			t.Fatalf("later fenced-page output lost: %v", page)
+		}
+		after = wantNext
+	}
+	// PostgreSQL, not only the Go context, cancels slow eligibility work. The
+	// connection remains usable and the outer 3s budget has time to return 503.
+	if _, err := pool.Exec(ctx, `CREATE OR REPLACE FUNCTION nas_delivery_allowed(connection bigint,kind text,source bigint) RETURNS boolean LANGUAGE plpgsql STABLE AS $$BEGIN PERFORM pg_sleep(4);RETURN true;END$$`); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if code, _ := do(s.handleAccountCollated, http.MethodGet, "/api/v1/account/collated?after_id=0", nil, nil); code != 503 {
+		t.Fatalf("slow feed status %d", code)
+	}
+	if elapsed := time.Since(started); elapsed >= collatedFeedBudget {
+		t.Fatalf("feed exhausted HTTP rather than statement budget: %v", elapsed)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `DELETE FROM recording_collation_output_acks`); err == nil {
 		t.Fatal("ack rows are not append-only")
 	}

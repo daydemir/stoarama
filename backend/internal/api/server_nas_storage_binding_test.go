@@ -28,6 +28,20 @@ func storageHeartbeatFixture(t *testing.T) (*Server, *pgxpool.Pool) {
 	if _, err := pool.Exec(context.Background(), `INSERT INTO connections(id,account_id,kind,api_key_id) VALUES(13,47,'nas_pull',123)`); err != nil {
 		t.Fatal(err)
 	}
+	// Use the actual storage-proof constraints for heartbeat writes as well as
+	// the dedicated migration-preservation oracle below.
+	if _, err := pool.Exec(context.Background(), `ALTER TABLE connections DROP COLUMN nas_storage_client_version,DROP COLUMN nas_storage_challenge_nonce,DROP COLUMN nas_storage_challenge_issued_at,DROP COLUMN nas_storage_budget_at`); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"0203_nas_storage_client_binding.sql", "0208_nas_storage_v6_binding.sql"} {
+		body, err := os.ReadFile("../../../infra/sql/migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = pool.Exec(context.Background(), string(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return &Server{pool: pool}, pool
 }
 func storageHeartbeat(t *testing.T, s *Server, version string, sample *connectionStorageStatus) string {
@@ -48,7 +62,7 @@ func storageHeartbeat(t *testing.T, s *Server, version string, sample *connectio
 		t.Fatal(err)
 	}
 	nonce := response.StorageChallengeNonce
-	if version == NASStorageBudgetClientVersion {
+	if SupportsNASStorageBudget(version) {
 		if decoded, err := hex.DecodeString(nonce); err != nil || len(decoded) != 32 {
 			t.Fatal("invalid v5 challenge shape")
 		}
@@ -206,6 +220,71 @@ func TestNASStorageBindingMigrationLeavesOldSamplesIneligible(t *testing.T) {
 	for _, sql := range []string{`UPDATE connections SET nas_storage_client_version='r2-copy-v4'`, `UPDATE connections SET nas_storage_client_version='r2-copy-v5'`, `UPDATE connections SET nas_storage_challenge_issued_at=now()`} {
 		if _, err = pool.Exec(ctx, sql); err == nil {
 			t.Fatal("invalid proof binding accepted")
+		}
+	}
+}
+
+func TestConnectionHeartbeatStorageV6UsesSameNonceContract(t *testing.T) {
+	s, pool := storageHeartbeatFixture(t)
+	nonce := storageHeartbeat(t, s, NASR2CopyPagedClientVersion, storageSample(""))
+	first := storageObservation(t, pool)
+	if first.budget != nil || first.version != "" {
+		t.Fatal("unproven v6 sample earned budget")
+	}
+	next := storageHeartbeat(t, s, NASR2CopyPagedClientVersion, storageSample(nonce))
+	second := storageObservation(t, pool)
+	if second.version != NASR2CopyPagedClientVersion || second.budget == nil || !second.budget.Equal(*first.issued) || next == nonce || !SupportsNASStorageBudget(second.version) {
+		t.Fatal("v6 proof not bound to preceding challenge", second)
+	}
+	replacement := storageHeartbeat(t, s, NASR2CopyPagedClientVersion, storageSample(nonce))
+	if o := storageObservation(t, pool); o.budget != nil || o.version != "" {
+		t.Fatal("v6 replay retained proof")
+	}
+	storageHeartbeat(t, s, NASR2CopyPagedClientVersion, storageSample(replacement))
+	storageHeartbeat(t, s, "r2-copy-v6-extra", storageSample(storageObservation(t, pool).nonce))
+	if o := storageObservation(t, pool); o.budget != nil || o.version != "" {
+		t.Fatal("unknown v6 suffix earned proof")
+	}
+}
+
+func TestNASStorageBindingV6MigrationPreservesEvidence(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `ALTER TABLE connections DROP COLUMN nas_storage_client_version,DROP COLUMN nas_storage_challenge_nonce,DROP COLUMN nas_storage_challenge_issued_at,DROP COLUMN nas_storage_budget_at;`); err != nil {
+		t.Fatal(err)
+	}
+	old, err := os.ReadFile("../../../infra/sql/migrations/0203_nas_storage_client_binding.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, string(old)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO connections(account_id,kind,api_key_id,nas_storage_client_version,nas_storage_budget_at) VALUES(47,'nas_pull',123,'r2-copy-v5',now()-interval '1 minute'),(47,'nas_pull',124,'',NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := `SELECT jsonb_agg(jsonb_build_array(api_key_id,nas_storage_client_version,nas_storage_budget_at) ORDER BY api_key_id)::text FROM connections WHERE api_key_id IN(123,124)`
+	var before, after string
+	if err = pool.QueryRow(ctx, snapshot).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile("../../../infra/sql/migrations/0208_nas_storage_v6_binding.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, string(body)); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, snapshot).Scan(&after); err != nil || before != after {
+		t.Fatal("migration changed evidence", err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version='r2-copy-v6',nas_storage_budget_at=now() WHERE api_key_id=123`); err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{`UPDATE connections SET nas_storage_client_version='r2-copy-v6-extra' WHERE api_key_id=123`, `UPDATE connections SET nas_storage_budget_at=NULL WHERE api_key_id=123`, `UPDATE connections SET nas_storage_client_version='' WHERE api_key_id=123`, `UPDATE connections SET nas_storage_client_version='r2-copy-v6' WHERE api_key_id=124`} {
+		if _, err = pool.Exec(ctx, sql); err == nil {
+			t.Fatal("invalid v6 proof pair accepted")
 		}
 	}
 }

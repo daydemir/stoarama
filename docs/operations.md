@@ -497,3 +497,98 @@ any other writer category. It does not delete R2/NAS media, change the immutable
 fence, release recovery/delivery/reference holds, or prove global writer drain.
 The ordinary diagnostic still reports every remaining blocker honestly. No
 production cancellation has been performed by this implementation.
+
+### COPY source lookup and collated paging rollout (0206–0208)
+
+The COPY lease validates a source before HEAD and again under admission. The old
+reservation view expands every cleanup manifest for each lookup; 1,438 plans
+(86 MB of JSON) cost 923 ms per source check on basic_1gb. The new lookup first
+uses a GIN index of immutable normalized `(kind, source_id)` keys, then applies
+the existing ordinal-specific reservation rule. Source/recovery holds, missing
+item vetoes, permanent issued-item protection and the old reservation view remain
+in force. No plan or item is rewritten.
+
+The original collated feed exceeded a 30-second read-only EXPLAIN ANALYZE budget.
+The paged query took 291 ms on the first 1,000 candidates and 115 ms near the tail
+of the same production catalog (both empty). A read-only probe of 50 real outputs
+intersecting the active keep window evaluated the unchanged delivery fence and
+returned all 50 in 39 ms. Production source fanout has p99=60 and maximum=61. A 50-output high-fanout
+probe took 3.9s; reducing the fence stage to 10 returned ten high-fanout outputs
+in 291ms. The exact feed query scanning the high-fanout region took 228ms.
+The expensive stage is capped at 10 held outputs, with its own advancing cursor,
+so a rejected held prefix cannot trap the scan or cause 1,000 recursive checks. These are DB execution times, not HTTP timings.
+The new reservation index is deliberately **not** provisioned during read-only
+production diagnosis; its production timing must be verified during the assigned
+release slot. Local tests compare the indexed predicate with the old view.
+
+Release sequence, to be executed only by the assigned controller:
+
+1. Keep the existing runner STOP and maintenance fence under their owner's
+   control. Confirm the reviewed 0205 schema (including
+   `r2_keep28_refresh_control` and `nas_r2_copy_items.work_mode`) is installed
+   before deployment: ordinary COPY leases also require it. Refresh activation
+   remains a separate controller decision. Prepare and verify the immutable `r2-copy-v6` client artifact but do not start it.
+   The controller must inventory and quiesce **every caller** of the collated
+   route for cutover, including callers whose collated policy is disabled: old
+   clients reject the added cursor field. Scope is not assumed to be connection13
+   alone. Resume each caller only with a compatible immutable artifact.
+   Same-version publication is unsupported. COPY's two-second transport budget is unchanged.
+2. Apply only migration `0206_nas_cleanup_manifest_keys.sql` through the migration
+   CLI using a staged migration directory containing that file. It creates the
+   immutable projection independently and records it in `schema_migrations`.
+3. Outside a transaction, precreate the index using an operator DB session:
+
+   ```sql
+   CREATE INDEX CONCURRENTLY nas_cleanup_manifest_keys_idx
+     ON nas_cleanup_plans USING gin(nas_cleanup_manifest_keys(manifest)) WITH (fastupdate=off);
+   ```
+
+   Build the index with `fastupdate=off` from the start. A large GIN pending list
+   caused the generic planner to revert to a full manifest scan on a local
+   1,438-plan/89MB fixture; the reviewed option retained the index plan and a
+   0.5ms complete lookup. Do not silently alter an older index into compliance;
+   a differently built index needs separately reviewed replacement/validation.
+   Do not replace the projection function beneath an existing index. Migration
+   0207 rejects mismatched function contents and missing, invalid or differently
+   defined indexes; inspect a failed concurrent build before any remedial action.
+4. Apply `0207_nas_cleanup_reservation_lookup.sql` and
+   `0208_nas_storage_v6_binding.sql`, then deploy the reviewed API and compatible
+   finish-controller CLI before rolling the prepared v6 client in the controller's assigned slot. The API
+   budgets every COPY control at 1.5 seconds, starting before authentication and
+   delivery fencing; exhausted budgets return retryable 503. Admission still
+   rechecks source identity and serializes grants with active renewals. V5 and
+   V6 share the nonce/freshness storage-proof contract; migration 0208 adds the
+   exact v6 identity without promoting or rewriting existing samples. The shared
+   version predicate covers cleanup-space, late-tier and custody-refresh gates.
+   Root must audit private collector/version pins for v6 before activation;
+   compatibility of those external pins is not established by this code change.
+5. The controller performs its own authorized release/fence sequence. Capture
+   this baseline, retaining its exact `sampled_at` as T0 and both byte totals:
+
+   ```sql
+   SELECT clock_timestamp() AS sampled_at,
+          coalesce(sum(downloaded_bytes),0) AS downloaded_bytes,
+          coalesce(sum(committed_bytes),0) AS committed_bytes
+   FROM nas_r2_copy_items WHERE connection_id=13;
+   ```
+
+   After about 60 seconds, compare connection-wide totals and substitute the
+   saved T0 timestamp below. Do not group counters by current state: a custody
+   refresh can move historical bytes into the verified group without moving data.
+
+   ```sql
+   SELECT clock_timestamp() AS sampled_at,
+          coalesce(sum(downloaded_bytes),0) AS downloaded_bytes,
+          coalesce(sum(committed_bytes),0) AS committed_bytes,
+          count(*) FILTER (WHERE state='verified' AND completion='downloaded'
+            AND committed_bytes>0 AND verified_at >
+            TIMESTAMPTZ '<saved T0 UTC>') AS new_original_downloads
+   FROM nas_r2_copy_items WHERE connection_id=13;
+   ```
+
+   Require a connection-wide byte total to increase AND a new original downloaded completion
+   after T0. Refresh preserves `verified_at` and both original byte counters, so
+   its state transitions cannot satisfy this proof. Attempts or changing per-state
+   totals alone are insufficient. Keep inventory mismatch and unverified recovery
+   problem counts at zero. Any mismatch stops the release; uncertain/held cleanup
+   items never become retry candidates.

@@ -27,10 +27,9 @@ CREATE TABLE streams(id bigint PRIMARY KEY,local_timezone text);
 CREATE TABLE recordings(id bigint PRIMARY KEY,account_id bigint,stream_id bigint,cron_timezone text);
 CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint,bucket text,object_key text,sha256 text,size_bytes bigint,display_path text,clip_start_at timestamptz,clip_end_at timestamptz,purged_at timestamptz);
 CREATE INDEX nas_delivery_raw_writer_path ON recording_clips(display_path) WHERE display_path<>'';
-CREATE TABLE nas_cleanup_reserved_files(kind text,source_id bigint);
 CREATE TABLE nas_cleanup_source_holds(clip_id bigint,plan_id bigint);
-CREATE TABLE nas_cleanup_plans(id bigint PRIMARY KEY,mode text);
-CREATE TABLE nas_cleanup_items(plan_id bigint,delete_ever_issued boolean);
+CREATE TABLE nas_cleanup_plans(id bigint PRIMARY KEY,mode text,manifest jsonb NOT NULL DEFAULT '[]',account_id bigint DEFAULT 47,connection_id bigint DEFAULT 13,label text DEFAULT 'fixture');
+CREATE TABLE nas_cleanup_items(plan_id bigint,delete_ever_issued boolean,id bigserial,ordinal integer DEFAULT 1);
 CREATE TABLE r2_retirement_reservations(kind text,source_id bigint,bucket text,object_key text,size_bytes bigint,sha256 text,manifest_sha256 text,retirement_class text);
 CREATE TABLE r2_object_retirements(kind text,source_id bigint);
 INSERT INTO connections VALUES(13);`)
@@ -60,6 +59,15 @@ INSERT INTO connections VALUES(13);`)
 	}
 	if _, err = pool.Exec(ctx, string(migration)); err != nil {
 		t.Fatal(err)
+	}
+	for _, name := range []string{"0177_nas_cleanup_reserved_files.sql", "0206_nas_cleanup_manifest_keys.sql", "0207_nas_cleanup_reservation_lookup.sql"} {
+		migration, err := os.ReadFile("../../../infra/sql/migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = pool.Exec(ctx, string(migration)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	policy, windows, err := api.Keep28Policy()
 	if err != nil {
@@ -368,9 +376,9 @@ func TestNASR2CopyQueueIdempotencyAndConflictPreservesCustody(t *testing.T) {
 func TestNASR2CopyQueueRetainsSourceAndAliasVetoes(t *testing.T) {
 	for _, sql := range []string{
 		`INSERT INTO recording_clips SELECT id+1000,recording_id,bucket,object_key,sha256,size_bytes,display_path,clip_start_at,clip_end_at,purged_at FROM recording_clips`,
-		`INSERT INTO nas_cleanup_reserved_files VALUES('raw',1)`,
-		`INSERT INTO nas_cleanup_plans VALUES(1,'enabled'); INSERT INTO nas_cleanup_source_holds VALUES(1,1)`,
-		`INSERT INTO nas_cleanup_plans VALUES(1,'retired'); INSERT INTO nas_cleanup_source_holds VALUES(1,1); INSERT INTO nas_cleanup_items VALUES(1,true)`,
+		`INSERT INTO nas_cleanup_plans(id,mode,manifest) VALUES(1,'retired','[{"kind":"raw","source_id":1}]')`,
+		`INSERT INTO nas_cleanup_plans(id,mode) VALUES(1,'enabled'); INSERT INTO nas_cleanup_source_holds VALUES(1,1)`,
+		`INSERT INTO nas_cleanup_plans(id,mode) VALUES(1,'retired'); INSERT INTO nas_cleanup_source_holds VALUES(1,1); INSERT INTO nas_cleanup_items(plan_id,delete_ever_issued) VALUES(1,true)`,
 		`INSERT INTO r2_retirement_reservations VALUES('raw',1)`,
 		`INSERT INTO r2_object_retirements VALUES('raw',1)`,
 		`UPDATE recording_clips SET sha256=repeat('b',64)`,

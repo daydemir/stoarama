@@ -36,6 +36,9 @@ func requireJoinedTestReplicationRole(t *testing.T, pool *pgxpool.Pool) {
 }
 
 var joinedMigrationNames = []string{
+	"0208_nas_storage_v6_binding.sql",
+	"0207_nas_cleanup_reservation_lookup.sql",
+	"0206_nas_cleanup_manifest_keys.sql",
 	"0205_nas_r2_refresh.sql",
 	"0202_r2_incident_roster.sql",
 	"0201_r2_inverse_intents.sql",

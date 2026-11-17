@@ -77,8 +77,15 @@ Collation v2 records each part in `recording_collation_outputs`
 (`nas_relative_path`, size, SHA-256, content-addressed R2 object). The NAS
 pulls those rows directly:
 
-1. `GET /api/v1/account/collated` returns the connection's delivery policy and a
-   page of undelivered outputs (R2-verified, nas_pull recordings of the account).
+1. `GET /api/v1/account/collated?after_id=0&limit=50` returns `policy`, `items`,
+   and `next_after_id`. Each request examines at most 1,000 account-scoped
+   candidates in output-ID order and applies the delivery fence to at most 10 held outputs, under a two-second PostgreSQL statement and three-second request budget. Eligibility
+   and backoff can produce an empty page with a nonzero cursor. Advance that
+   cursor even on empty pages; zero means exhausted. Start a fresh scan at zero
+   after exhaustion, so expired backoff and late old-hour publications are retried.
+   The client drains pages alongside generation-1 joined work. Empty/error pages use their own
+   next-poll time (normal poll interval capped at ten seconds), independent of
+   successful generation-1 joined downloads, bounding idle database duty while still advancing through withheld prefixes.
 2. `GET /api/v1/account/collated/{id}/download` presigns the exact object.
 3. The client downloads to a hidden partial beside the final path, verifies
    size and SHA-256, fsyncs, links it into place without overwriting, and

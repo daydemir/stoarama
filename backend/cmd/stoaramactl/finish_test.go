@@ -17,7 +17,7 @@ import (
 func finishFixture(t *testing.T, n int) (*pgxpool.Pool, string, string) {
 	t.Helper()
 	pool, _, _, _ := nasCopyQueueFixture(t, n, true)
-	_, err := pool.Exec(context.Background(), `ALTER TABLE nas_cleanup_plans ADD COLUMN connection_id bigint DEFAULT 13, ADD COLUMN plan_sha256 text DEFAULT repeat('d',64);
+	_, err := pool.Exec(context.Background(), `ALTER TABLE nas_cleanup_plans ADD COLUMN plan_sha256 text DEFAULT repeat('d',64);
  INSERT INTO nas_cleanup_plans(id,mode) VALUES(99,'retired');
  ALTER TABLE nas_cleanup_items ADD COLUMN updated_at timestamptz DEFAULT now();
  ALTER TABLE connections ADD COLUMN nas_storage_free_bytes bigint, ADD COLUMN nas_storage_reported_at timestamptz;
@@ -579,5 +579,31 @@ func TestFinishCleanupRequiresProofNotDisplayReceipt(t *testing.T) {
 				t.Fatalf("display receipt authorized cleanup: %+v", status)
 			}
 		})
+	}
+}
+
+func TestFinishV6BudgetKeepsProofAndLateTierGates(t *testing.T) {
+	pool, safety, copy := finishFixture(t, 1)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version='r2-copy-v6',nas_storage_budget_at=now(),nas_storage_free_bytes=2260000000000,nas_storage_reported_at=now()`); err != nil {
+		t.Fatal(err)
+	}
+	status := finishRun(t, pool, safety, copy)
+	if status.NASSpaceClientVersion != api.NASR2CopyPagedClientVersion || !status.CleanupShouldRun || status.CleanupReason != "nas_headroom_below_threshold" {
+		t.Fatalf("valid v6 proof rejected: %+v", status)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_free_bytes=2500000000000,nas_storage_reported_at=now(),nas_storage_budget_at=now()`); err != nil {
+		t.Fatal(err)
+	}
+	status = finishRun(t, pool, safety, copy)
+	if status.ImportedItems != 1 || status.LateTierHold == finishLateClientUnknown {
+		t.Fatalf("v6 late-tier admission rejected: %+v", status)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version='r2-copy-v6-extra'`); err != nil {
+		t.Fatal(err)
+	}
+	status = finishRun(t, pool, safety, copy)
+	if status.CleanupShouldRun || status.CleanupReason != "nas_space_proof_missing" {
+		t.Fatalf("unreviewed v6 identity accepted: %+v", status)
 	}
 }
