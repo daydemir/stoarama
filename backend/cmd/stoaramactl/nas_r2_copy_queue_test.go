@@ -390,10 +390,10 @@ func TestNASCopyStatusDurableCountersAndReimport(t *testing.T) {
 	if err := queueNASR2Copy(ctx, pool, h, manifest, items, true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',completion='verified_in_place' WHERE source_id=$1`, items[0].SourceID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',verified_at=now(),completion='verified_in_place' WHERE source_id=$1`, items[0].SourceID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',completion='downloaded',downloaded_bytes=50,committed_bytes=100 WHERE source_id=$1`, items[1].SourceID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',verified_at=now(),completion='downloaded',downloaded_bytes=50,committed_bytes=100 WHERE source_id=$1`, items[1].SourceID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE nas_r2_copy_items SET state='blocked',blocked_reason='checksum_mismatch',attempts=4 WHERE source_id=$1`, items[2].SourceID); err != nil {
@@ -406,8 +406,15 @@ func TestNASCopyStatusDurableCountersAndReimport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.QueueDepth != 1 || status.Blocked != 1 || status.MismatchLatched != 1 || status.VerifiedInPlace.Objects != 1 || status.Downloaded.Objects != 1 || status.DownloadedBytes != 50 || status.CommittedBytes != 100 || status.ReLeasedItems != 1 || status.MaxAttempts != 4 || status.BlockedByReason["checksum_mismatch"].Objects != 1 {
+	if status.VerifiedInPlaceItemsPerMinute != 1 || status.DownloadedItemsPerMinute != 1 || status.QueueDepth != 1 || status.Blocked != 1 || status.MismatchLatched != 1 || status.VerifiedInPlace.Objects != 1 || status.Downloaded.Objects != 1 || status.DownloadedBytes != 50 || status.CommittedBytes != 100 || status.ReLeasedItems != 1 || status.MaxAttempts != 4 || status.BlockedByReason["checksum_mismatch"].Objects != 1 {
 		t.Fatalf("status %+v", status)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nas_r2_copy_items SET verified_at=now()-interval '61 seconds' WHERE completion='verified_in_place'`); err != nil {
+		t.Fatal(err)
+	}
+	status, err = loadNASCopyStatus(ctx, pool)
+	if err != nil || status.VerifiedInPlaceItemsPerMinute != 0 || status.VerifiedInPlace.Objects != 1 || status.DownloadedItemsPerMinute != 1 {
+		t.Fatalf("rolling rate %+v %v", status, err)
 	}
 }
 
