@@ -361,6 +361,7 @@ func (s *Server) router() http.Handler {
 			account.Post("/connections/r2-copy/{id}/checkpoint", s.handleNASR2CopyCheckpoint)
 			account.Post("/connections/r2-copy/{id}/range", s.handleNASR2CopyRange)
 			account.Post("/connections/r2-copy/{id}/result", s.handleNASR2CopyResult)
+			account.Post("/connections/r2-copy/{id}/block", s.handleNASR2CopyBlock)
 			account.Post("/connections/redownload", s.handleAccountConnectionRedownload)
 			account.Post("/connections/nas-restore/lease", s.handleAccountConnectionRestoreLease)
 			account.Post("/connections/nas-restore/{taskId}/result", s.handleAccountConnectionRestoreResult)
