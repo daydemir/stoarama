@@ -29,18 +29,17 @@ const finishLock int64 = 7343226011199
 type finishStop string
 
 const (
-	finishEvidence        finishStop = "evidence_unavailable"
-	finishRecovery        finishStop = "cleanup_recovery_problems"
-	finishRecoveryStale   finishStop = "recovery_evidence_stale"
-	finishUnknownPlan     finishStop = "unknown_enabled_cleanup"
-	finishMismatch        finishStop = "copy_mismatch_latched"
-	finishShutdown        finishStop = "shutdown_or_recovery_failed"
-	finishMaster          finishStop = "deletion_master_mismatch"
-	finishDatabase        finishStop = "database_unavailable"
-	finishImport          finishStop = "manifest_import_failed"
-	finishBusy            finishStop = "tick_already_running"
-	finishOutput          finishStop = "status_write_failed"
-	finishListingConflict finishStop = "listing_size_conflict"
+	finishEvidence      finishStop = "evidence_unavailable"
+	finishRecovery      finishStop = "cleanup_recovery_problems"
+	finishRecoveryStale finishStop = "recovery_evidence_stale"
+	finishUnknownPlan   finishStop = "unknown_enabled_cleanup"
+	finishMismatch      finishStop = "copy_mismatch_latched"
+	finishShutdown      finishStop = "shutdown_or_recovery_failed"
+	finishMaster        finishStop = "deletion_master_mismatch"
+	finishDatabase      finishStop = "database_unavailable"
+	finishImport        finishStop = "manifest_import_failed"
+	finishBusy          finishStop = "tick_already_running"
+	finishOutput        finishStop = "status_write_failed"
 )
 
 func (s finishStop) Error() string { return string(s) }
@@ -82,23 +81,40 @@ type finishCopy struct {
 	BlockedByReason               map[string]nasCopyStat `json:"blocked_by_reason"`
 	MismatchLatched               int64                  `json:"mismatch_latched"`
 }
+type finishTier uint8
+
+const (
+	finishExactInventory finishTier = iota + 1
+	finishEarlyNoInventory
+	finishLateNoInventory
+)
+
+type finishLateHold string
+
+const (
+	finishLateSpaceUnknown finishLateHold = "nas_space_evidence_unavailable"
+	finishLateSpaceLow     finishLateHold = "nas_headroom_below_threshold"
+	finishLateBudgetHeld   finishLateHold = "next_download_exceeds_budget"
+)
+
 type finishStatus struct {
-	NASFreeBytes       *int64           `json:"nas_storage_free_bytes,omitempty"`
-	NASSpaceReportedAt *time.Time       `json:"nas_storage_reported_at,omitempty"`
-	Schema             string           `json:"schema"`
-	UpdatedAt          time.Time        `json:"updated_at"`
-	Stop               finishStop       `json:"stop_reason,omitempty"`
-	QueueDepth         int64            `json:"queue_depth"`
-	ItemsPerMinute     float64          `json:"items_per_min"`
-	Copy               finishCopy       `json:"copy"`
-	Holds              map[string]int64 `json:"holds_by_reason"`
-	CleanupShouldRun   bool             `json:"cleanup_should_run"`
-	CleanupReason      string           `json:"cleanup_reason"`
-	ImportedItems      int              `json:"imported_items"`
-	ImportedManifests  int              `json:"imported_manifests"`
-	ListingConflicts   int64            `json:"listing_size_conflicts"`
-	ListingConflictIDs []int64          `json:"listing_size_conflict_source_ids"`
-	Exhausted          bool             `json:"candidates_exhausted"`
+	NASFreeBytes        *int64           `json:"nas_storage_free_bytes,omitempty"`
+	NASSpaceReportedAt  *time.Time       `json:"nas_storage_reported_at,omitempty"`
+	LateTierHold        finishLateHold   `json:"late_tier_hold_reason,omitempty"`
+	LateTierBudgetBytes int64            `json:"late_tier_budget_bytes"`
+	QueueReservedBytes  int64            `json:"queue_reserved_bytes"`
+	Schema              string           `json:"schema"`
+	UpdatedAt           time.Time        `json:"updated_at"`
+	Stop                finishStop       `json:"stop_reason,omitempty"`
+	QueueDepth          int64            `json:"queue_depth"`
+	ItemsPerMinute      float64          `json:"items_per_min"`
+	Copy                finishCopy       `json:"copy"`
+	Holds               map[string]int64 `json:"holds_by_reason"`
+	CleanupShouldRun    bool             `json:"cleanup_should_run"`
+	CleanupReason       string           `json:"cleanup_reason"`
+	ImportedItems       int              `json:"imported_items"`
+	ImportedManifests   int              `json:"imported_manifests"`
+	Exhausted           bool             `json:"candidates_exhausted"`
 }
 
 func finishFresh(t, now time.Time) bool {
@@ -202,15 +218,14 @@ func finishCheck(ctx context.Context, pool *pgxpool.Pool, s finishSafety, c fini
 	return nil
 }
 
-// Listing is a scheduling hint, never custody proof. A conflicting path/size
-// observation is held out of the absent tier for reconciliation.
+// Inventory is a priority hint, never refreshed custody proof. Sources without
+// exact inventory use the pinned window's end relative to the old pull cutoff.
 const finishWindowSQL = `WITH windows AS (
  SELECT * FROM jsonb_to_recordset($1::jsonb) AS w(stream_id bigint,timezone text,start_at timestamptz,end_at timestamptz)
-), generation AS (
- SELECT generation FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL ORDER BY started_at DESC,generation DESC LIMIT 1
 )`
 const finishEligibleSQL = `
 FROM recording_clips c JOIN recordings r ON r.id=c.recording_id AND r.account_id=47 JOIN windows w ON w.stream_id=r.stream_id LEFT JOIN streams s ON s.id=r.stream_id
+LEFT JOIN nas_inventory_files n ON n.connection_id=13 AND n.clip_id=c.id AND n.state='present' AND n.relative_path=c.display_path AND n.size_bytes=c.size_bytes AND n.sha256=lower(c.sha256)
 WHERE c.purged_at IS NULL AND c.clip_start_at<w.end_at AND c.clip_end_at>w.start_at AND c.clip_end_at>c.clip_start_at
  AND coalesce(nullif(s.local_timezone,''),r.cron_timezone,'')=w.timezone
  AND c.bucket<>'' AND c.object_key LIKE 'managed/%' AND c.size_bytes>0 AND c.size_bytes<=$2 AND lower(c.sha256) ~ '^[a-f0-9]{64}$' AND c.display_path<>''
@@ -219,10 +234,7 @@ WHERE c.purged_at IS NULL AND c.clip_start_at<w.end_at AND c.clip_end_at>w.start
  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id WHERE h.clip_id=c.id AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued)))
  AND NOT EXISTS(SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='raw' AND x.source_id=c.id)
  AND NOT EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.kind='raw' AND x.source_id=c.id)`
-const finishListingConflictSQL = `EXISTS(SELECT 1 FROM nas_listing_files f WHERE f.connection_id=13 AND f.generation=(SELECT generation FROM generation) AND f.relative_path=c.display_path AND f.size_bytes<>c.size_bytes)`
-const finishCandidatesSQL = finishWindowSQL + `
-SELECT c.id,c.recording_id,r.stream_id,c.bucket,c.object_key,c.display_path,c.size_bytes,lower(c.sha256),c.clip_start_at,c.clip_end_at,
- EXISTS(SELECT 1 FROM nas_listing_files f WHERE f.connection_id=13 AND f.generation=(SELECT generation FROM generation) AND f.relative_path=c.display_path AND f.size_bytes=c.size_bytes) AS likely_present` + finishEligibleSQL + ` AND NOT ` + finishListingConflictSQL + ` ORDER BY likely_present DESC,c.id LIMIT $3`
+const finishCandidateSelectSQL = `SELECT c.id,c.recording_id,r.stream_id,c.bucket,c.object_key,c.display_path,c.size_bytes,lower(c.sha256),c.clip_start_at,c.clip_end_at `
 
 func finishPolicyJSON() ([]byte, error) {
 	_, windows, err := api.Keep28Policy()
@@ -235,45 +247,44 @@ func finishPolicyJSON() ([]byte, error) {
 	}
 	return json.Marshal(rowsJSON)
 }
-func finishListingConflicts(ctx context.Context, pool *pgxpool.Pool, status *finishStatus) error {
+func finishCandidates(ctx context.Context, pool *pgxpool.Pool, limit int) ([]api.NASR2CopyItem, finishTier, error) {
 	data, err := finishPolicyJSON()
 	if err != nil {
-		return err
+		return nil, 0, err
 	}
-	return pool.QueryRow(ctx, finishWindowSQL+` SELECT count(*),coalesce((array_agg(c.id ORDER BY c.id))[1:50],'{}'::bigint[]) `+finishEligibleSQL+` AND `+finishListingConflictSQL, data, api.NASR2CopyMaxFile).Scan(&status.ListingConflicts, &status.ListingConflictIDs)
-}
-func finishCandidates(ctx context.Context, pool *pgxpool.Pool, limit int) ([]api.NASR2CopyItem, error) {
-	data, err := finishPolicyJSON()
-	if err != nil {
-		return nil, err
-	}
-	var listing bool
-	if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_listing_generations WHERE connection_id=13 AND completed_at IS NOT NULL)`).Scan(&listing); err != nil {
-		return nil, err
-	}
-	if !listing {
-		return nil, finishEvidence
-	}
-	rows, err := pool.Query(ctx, finishCandidatesSQL, data, api.NASR2CopyMaxFile, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []api.NASR2CopyItem{}
-	var tier bool
-	for rows.Next() {
-		i := api.NASR2CopyItem{Kind: api.NASR2CopyRaw}
-		var present bool
-		if err = rows.Scan(&i.SourceID, &i.RecordingID, &i.StreamID, &i.Bucket, &i.ObjectKey, &i.RelativePath, &i.SizeBytes, &i.SHA256, &i.StartAt, &i.EndAt, &present); err != nil {
-			return nil, err
+	// Separate joins let PostgreSQL plan indexed exact inventory and anti-joins;
+	// sorting a CASE over every raw object made a 1.16m-row pass nearly time out.
+	for _, selection := range []struct {
+		tier      finishTier
+		predicate string
+	}{
+		{finishExactInventory, `n.clip_id IS NOT NULL`},
+		{finishEarlyNoInventory, `n.clip_id IS NULL AND w.end_at<timestamptz '2026-09-24 00:00:00+00'`},
+		{finishLateNoInventory, `n.clip_id IS NULL AND w.end_at>=timestamptz '2026-09-24 00:00:00+00'`},
+	} {
+		rows, err := pool.Query(ctx, finishWindowSQL+finishCandidateSelectSQL+finishEligibleSQL+` AND `+selection.predicate+` ORDER BY r.stream_id,c.id LIMIT $3`, data, api.NASR2CopyMaxFile, limit)
+		if err != nil {
+			return nil, 0, err
 		}
-		if len(items) > 0 && present != tier {
-			break
+		items := []api.NASR2CopyItem{}
+		for rows.Next() {
+			i := api.NASR2CopyItem{Kind: api.NASR2CopyRaw}
+			if err = rows.Scan(&i.SourceID, &i.RecordingID, &i.StreamID, &i.Bucket, &i.ObjectKey, &i.RelativePath, &i.SizeBytes, &i.SHA256, &i.StartAt, &i.EndAt); err != nil {
+				rows.Close()
+				return nil, 0, err
+			}
+			items = append(items, i)
 		}
-		tier = present
-		items = append(items, i)
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, 0, err
+		}
+		if len(items) > 0 {
+			return items, selection.tier, nil
+		}
 	}
-	return items, rows.Err()
+	return nil, 0, nil
 }
 func finishManifest(dir string, items []api.NASR2CopyItem) (nasCopyHeader, string, []api.NASR2CopyItem, error) {
 	var h nasCopyHeader
@@ -397,7 +408,7 @@ func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath st
 		if remaining > 5000 {
 			remaining = 5000
 		}
-		items, e := finishCandidates(ctx, pool, remaining)
+		items, tier, e := finishCandidates(ctx, pool, remaining)
 		if e != nil {
 			if errors.Is(e, finishEvidence) {
 				return status, e
@@ -405,25 +416,37 @@ func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath st
 			return status, finishDatabase
 		}
 		if len(items) == 0 {
-			if e = finishListingConflicts(ctx, pool, &status); e != nil {
-				return status, finishDatabase
-			}
-			status.Exhausted = status.ListingConflicts == 0
-			if status.ListingConflicts > 0 {
-				return status, finishListingConflict
-			}
+			status.Exhausted = true
 			return status, nil
 		}
+		if tier == finishLateNoInventory {
+			if status.CleanupReason != "nas_headroom_sufficient" {
+				status.LateTierHold = finishLateSpaceUnknown
+				if status.CleanupShouldRun {
+					status.LateTierHold = finishLateSpaceLow
+				}
+				return status, nil
+			}
+			if e = pool.QueryRow(ctx, `SELECT coalesce(sum(CASE WHEN state IN ('pending','leased') THEN (item->>'size_bytes')::bigint WHEN state='verified' AND completion='downloaded' AND updated_at>=$1 THEN committed_bytes ELSE 0 END),0) FROM nas_r2_copy_items WHERE connection_id=13`, *status.NASSpaceReportedAt).Scan(&status.QueueReservedBytes); e != nil {
+				return status, finishDatabase
+			}
+			status.LateTierBudgetBytes = max(int64(0), *status.NASFreeBytes-api.NASR2CopyFloor-api.NASR2CopyRangeBytes-status.QueueReservedBytes)
+		}
+
 		n := 0
 		var total int64
 		for _, i := range items {
-			if total+i.SizeBytes > nasCopyBatchBytes {
+			if total+i.SizeBytes > nasCopyBatchBytes || (tier == finishLateNoInventory && total+i.SizeBytes > status.LateTierBudgetBytes) {
 				break
 			}
 			total += i.SizeBytes
 			n++
 		}
 		if n == 0 {
+			if tier == finishLateNoInventory {
+				status.LateTierHold = finishLateBudgetHeld
+				return status, nil
+			}
 			return status, finishImport
 		}
 		h, digest, validated, e := finishManifest(dir, items[:n])

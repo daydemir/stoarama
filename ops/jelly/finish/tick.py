@@ -11,7 +11,7 @@ import tempfile
 
 STOPS = {'evidence_unavailable', 'cleanup_recovery_problems', 'unknown_enabled_cleanup',
          'copy_mismatch_latched', 'shutdown_or_recovery_failed', 'deletion_master_mismatch',
-         'database_unavailable', 'recovery_evidence_stale', 'manifest_import_failed', 'tick_already_running', 'listing_size_conflict'}
+         'database_unavailable', 'recovery_evidence_stale', 'manifest_import_failed', 'tick_already_running'}
 
 
 def main():

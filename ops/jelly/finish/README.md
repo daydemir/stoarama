@@ -8,17 +8,30 @@ not wired into D-min.
 
 The queue target is 10,000 pending + leased rows, split into manifests of at most
 5,000 items / 100 GB. Each tick imports at most 10,000 new rows and has a four
-minute deadline. It selects likely-present files by exact path + size in the
-newest completed connection-13 listing, then absent files. Conflicting listing
-sizes are excluded for reconciliation. This listing is only a priority hint;
-it confers no custody. Existing queue rows of every state are excluded. Source
-validation, holds, path ambiguity and queue identity equality remain enforced by
-the existing exact-manifest importer. A partial import can safely resume on the
-next tick. An advisory lock excludes concurrent feeders. Present and absent tiers use
-separate manifests, so the concurrent importer finishes the present tier first.
-Existing queue IDs are preserved, so already queued absent items keep their
-original order. The 10k-row bound may require more than two byte-capped manifests
-for large files; the 100GB cap applies separately to every manifest.
+minute deadline. Root's latest catalog priority replaces the unavailable listing:
+
+1. Raw with an exact stale inventory row (connection, clip, path, size, SHA and
+   present state): verify-in-place first, with no age requirement for scheduling.
+2. Sources without exact inventory whose pinned window ends before Sep 24, 2026.
+3. Remaining sources without exact inventory (the 23 late-window streams).
+
+Each tier is selected by stream then source ID; tiers use separate manifests.
+There is no listing query or fallback. Inventory is only a priority hint; the
+worker still hashes and publishes fresh exact custody. Existing queue rows of
+every state are excluded; verified and blocked work is never requeued. Live
+source validation, holds, destination ambiguity and queue equality stay in the
+existing exact-manifest importer. Partial imports resume idempotently. An advisory
+lock excludes concurrent feeders. Existing queue IDs/order are preserved.
+
+Tier 3 requires fresh storage data and at least 300 GB headroom above the 2 TB
+floor. Its byte budget subtracts the existing 16 MiB range reserve, pending/leased
+raw bytes that could download, and successful downloaded final bytes published
+since the storage heartbeat (A1 completion/committed_bytes/updated_at). This keeps
+an old storage observation from being spent twice. Verified-in-place and blocked
+rows reserve no disk. Status includes typed `late_tier_hold_reason`, remaining
+`late_tier_budget_bytes` and `queue_reserved_bytes`; low/missing space is a
+resumable feed hold, not exhaustion. Tiers 1/2 can still feed. Every manifest is
+capped at 100 GB; large files can require more than two manifests to reach 10k.
 
 The sole controller must supply an executable safety collector, run on every
 launch. It emits this complete JSON (all fields required; only the three error fields may be null):
@@ -107,9 +120,6 @@ no more than 30 seconds in the future. Copy status is produced afresh by A1's
 `stoarama.nas-r2-copy-status.v1`. Its mismatch latch and durable copy statistics
 are copied into finish status. Queue depth and `items_per_min` (verified in the
 last five minutes divided by five, including idle time) are refreshed from DB.
-Listing size conflicts are reported by count and up to 50 source IDs when the
-queueable candidates are exhausted; they produce a typed nonzero
-`listing_size_conflict` stop so stranded objects cannot look complete.
 On a safety stop, cleanup is always false. On a successful tick it follows only
 the current free-space headroom rule above. The controller runner alone acts on
 this decision; an empty queue is not cleanup authority.
@@ -173,7 +183,6 @@ v4 heartbeat provides local mismatch/hold evidence:
 | `shutdown_or_recovery_failed` | Failure latch, non-null recovery_error or an unrecognized last_error. Controller resolves recovery/shutdown failure first. |
 | `deletion_master_mismatch` | Live master differs from expected, or ON has no owned plan/batch. Reconcile actual runtime state. |
 | `database_unavailable` | Bounded DB read/lock unavailable or deadline exceeded. Inspect privately; wrapper alerts. |
-| `listing_size_conflict` | Remaining raw sources have a conflicting size in the newest listing. Reconcile reported source IDs; no absent-tier download is authorized. |
 | `manifest_import_failed` | Manifest/source/hold/equality validation or import failed. Existing queue state survives; inspect source identity. |
 | `tick_already_running` | Another feeder holds the DB lock. Check duplicate installation. |
 | `status_write_failed` | CLI could not publish status; stderr only. Repair storage. Dead-man sees the old timestamp. |

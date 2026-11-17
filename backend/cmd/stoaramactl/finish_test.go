@@ -22,9 +22,9 @@ func finishFixture(t *testing.T, n int) (*pgxpool.Pool, string, string) {
  ALTER TABLE nas_cleanup_items ADD COLUMN updated_at timestamptz DEFAULT now();
  ALTER TABLE connections ADD COLUMN nas_storage_free_bytes bigint, ADD COLUMN nas_storage_reported_at timestamptz;
  CREATE TABLE nas_cleanup_batches(id bigint,mode text);
- CREATE TABLE nas_listing_generations(connection_id bigint,generation text,started_at timestamptz,completed_at timestamptz);
- CREATE TABLE nas_listing_files(connection_id bigint,generation text,relative_path text,size_bytes bigint);
- INSERT INTO nas_listing_generations VALUES(13,'old',now()-interval '2 days',now()),(13,'new',now()-interval '1 day',now()),(13,'incomplete',now(),NULL);`)
+ CREATE TABLE nas_inventory_files(connection_id bigint,clip_id bigint,relative_path text,state text,sha256 text,size_bytes bigint,verified_at timestamptz);
+ UPDATE connections SET nas_storage_free_bytes=10000000000000,nas_storage_reported_at=now();
+ ALTER TABLE nas_r2_copy_items ADD COLUMN IF NOT EXISTS completion text DEFAULT '', ADD COLUMN IF NOT EXISTS committed_bytes bigint DEFAULT 0, ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,22 +56,25 @@ func finishRun(t *testing.T, pool *pgxpool.Pool, safety, copy string) finishStat
 func TestFinishFeedPriorityIdempotenceAndTerminalStates(t *testing.T) {
 	pool, safety, copy := finishFixture(t, 7)
 	ctx := context.Background()
-	// IDs 2 and 4 are likely present only in the newest COMPLETED generation.
-	// A stale-only hit (1), an incomplete-generation hit (3) are absent-tier;
-	// a conflicting size (5) is held out rather than treated as absent.
-	_, err := pool.Exec(ctx, `INSERT INTO nas_listing_files VALUES(13,'old','p/copy-0.mp4',100),(13,'new','p/copy-1.mp4',100),(13,'incomplete','p/copy-2.mp4',100),(13,'new','p/copy-3.mp4',100),(13,'new','p/copy-4.mp4',101)`)
-	if err != nil {
+	// Stale exact inventory is tier1; stream78 is early tier2; stream3
+	// without exact inventory is late tier3. No listing tables exist at all.
+	_, windows, _ := api.Keep28Policy()
+	early := windows[78]
+	if _, err := pool.Exec(ctx, `INSERT INTO streams VALUES(78,$1)`, early.Timezone); err != nil {
 		t.Fatal(err)
 	}
-	status, stop := finishTick(ctx, pool, safety, copy)
-	if !errors.Is(stop, finishListingConflict) || status.ListingConflicts != 1 || len(status.ListingConflictIDs) != 1 || status.ListingConflictIDs[0] != 5 {
-		t.Fatalf("lost listing conflict: %v %+v", stop, status)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=5`); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO recordings VALUES(3,47,78,$1)`, early.Timezone); err != nil {
 		t.Fatal(err)
 	}
-	if status.ImportedItems != 6 || status.QueueDepth != 6 || status.Exhausted || status.ImportedManifests != 2 {
-		t.Fatalf("feed: %+v", status)
+	if _, err := pool.Exec(ctx, `UPDATE recording_clips SET recording_id=3,clip_start_at=$1,clip_end_at=$2 WHERE id IN(2,3)`, early.Start, early.Start.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files SELECT 13,id,display_path,'present',sha256,size_bytes,now()-interval '3 months' FROM recording_clips WHERE id IN(1,4)`); err != nil {
+		t.Fatal(err)
+	}
+	status := finishRun(t, pool, safety, copy)
+	if status.ImportedItems != 7 || status.QueueDepth != 7 || !status.Exhausted || status.ImportedManifests != 3 {
+		t.Fatalf("tier feed: %+v", status)
 	}
 	rows, err := pool.Query(ctx, `SELECT source_id FROM nas_r2_copy_items ORDER BY id LIMIT 2`)
 	if err != nil {
@@ -86,7 +89,7 @@ func TestFinishFeedPriorityIdempotenceAndTerminalStates(t *testing.T) {
 		ids[id] = true
 	}
 	rows.Close()
-	if !ids[2] || !ids[4] {
+	if !ids[1] || !ids[4] {
 		t.Fatalf("present not first: %v", ids)
 	}
 	_, err = pool.Exec(ctx, `UPDATE nas_r2_copy_items SET state=CASE WHEN source_id=2 THEN 'verified' ELSE 'blocked' END,attempts=7,last_error='retained'`)
@@ -98,7 +101,7 @@ func TestFinishFeedPriorityIdempotenceAndTerminalStates(t *testing.T) {
 		t.Fatalf("requeued terminal: %+v", status)
 	}
 	var n int
-	if err = pool.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE attempts=7 AND last_error='retained'`).Scan(&n); err != nil || n != 6 {
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE attempts=7 AND last_error='retained'`).Scan(&n); err != nil || n != 7 {
 		t.Fatalf("terminal state changed: %d %v", n, err)
 	}
 }
@@ -174,7 +177,7 @@ func TestFinishCleanupUsesFreshSpaceAndKnownOwnership(t *testing.T) {
 		{"belowfloor", `UPDATE connections SET nas_storage_free_bytes=1,nas_storage_reported_at=now()`, "nas_headroom_below_threshold", true},
 		{"stale", `UPDATE connections SET nas_storage_free_bytes=1,nas_storage_reported_at=now()-interval '11 minutes'`, "nas_space_heartbeat_stale", false},
 		{"future", `UPDATE connections SET nas_storage_free_bytes=1,nas_storage_reported_at=now()+interval '1 minute'`, "nas_space_heartbeat_stale", false},
-		{"missing", `SELECT 1`, "nas_space_heartbeat_missing", false},
+		{"missing", `UPDATE connections SET nas_storage_free_bytes=NULL,nas_storage_reported_at=NULL`, "nas_space_heartbeat_missing", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pool, safety, copy := finishFixture(t, 0)
@@ -319,5 +322,67 @@ func TestFinishRecoveryBindsUnchangedIssuedState(t *testing.T) {
 	_, err = finishTick(context.Background(), pool, safety, copy)
 	if !errors.Is(err, finishRecoveryStale) {
 		t.Fatalf("same-count new deletion accepted: %v", err)
+	}
+}
+
+func TestFinishLateTierReservesOnlyDownloadCapacity(t *testing.T) {
+	pool, safety, copy := finishFixture(t, 3)
+	ctx := context.Background()
+	_, err := pool.Exec(ctx, `UPDATE recording_clips SET size_bytes=60000000000;
+ UPDATE connections SET nas_storage_free_bytes=2300000000000,nas_storage_reported_at=now()-interval '1 minute';
+ INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item,state,completion,committed_bytes,updated_at)
+ SELECT 13,'raw',id,repeat('a',64),repeat('b',64),jsonb_build_object('size_bytes',size),state,completion,committed,now()
+ FROM (VALUES(100,60000000000::bigint,'pending','',0::bigint),(101,60000000000,'leased','',0),(102,40000000000,'verified','downloaded',40000000000),(103,60000000000,'verified','verified_in_place',60000000000),(104,60000000000,'blocked','',0)) v(id,size,state,completion,committed);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := finishRun(t, pool, safety, copy)
+	if status.ImportedItems != 2 || status.LateTierHold != finishLateBudgetHeld || status.Exhausted || status.QueueReservedBytes != 280000000000 {
+		t.Fatalf("late budget: %+v", status)
+	}
+	// Reusing the same free-space heartbeat cannot spend its capacity twice.
+	status = finishRun(t, pool, safety, copy)
+	if status.ImportedItems != 0 {
+		t.Fatal("reused capacity")
+	}
+	if _, err = pool.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',completion='downloaded',committed_bytes=60000000000,updated_at=now() WHERE source_id IN(1,2)`); err != nil {
+		t.Fatal(err)
+	}
+	status = finishRun(t, pool, safety, copy)
+	if status.ImportedItems != 0 {
+		t.Fatal("forgot downloads since heartbeat")
+	}
+	if _, err = pool.Exec(ctx, `UPDATE connections SET nas_storage_free_bytes=2180000000000,nas_storage_reported_at=now()`); err != nil {
+		t.Fatal(err)
+	}
+	status = finishRun(t, pool, safety, copy)
+	if !status.CleanupShouldRun || status.LateTierHold != finishLateSpaceLow || status.ImportedItems != 0 {
+		t.Fatalf("low-space valve: %+v", status)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE connections SET nas_storage_free_bytes=2500000000000,nas_storage_reported_at=now()`); err != nil {
+		t.Fatal(err)
+	}
+	status = finishRun(t, pool, safety, copy)
+	if status.ImportedItems != 1 {
+		t.Fatalf("new capacity did not resume: %+v", status)
+	}
+}
+
+func TestFinishMissingStorageHoldsOnlyLateTier(t *testing.T) {
+	pool, safety, copy := finishFixture(t, 1)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_free_bytes=NULL,nas_storage_reported_at=NULL`); err != nil {
+		t.Fatal(err)
+	}
+	status := finishRun(t, pool, safety, copy)
+	if status.ImportedItems != 0 || status.Exhausted || status.LateTierHold != finishLateSpaceUnknown || status.CleanupShouldRun {
+		t.Fatalf("missing storage: %+v", status)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files SELECT 13,id,display_path,'present',sha256,size_bytes,now()-interval '3 months' FROM recording_clips`); err != nil {
+		t.Fatal(err)
+	}
+	status = finishRun(t, pool, safety, copy)
+	if status.ImportedItems != 1 {
+		t.Fatal("missing storage blocked verify-in-place tier")
 	}
 }
