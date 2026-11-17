@@ -247,6 +247,22 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatal("changed hold reached DELETE", err)
 		}
 	})
+	t.Run("installed_purge_veto_precedes_intent_and_wire", func(t *testing.T) {
+		a, entries := build(1)
+		a.ledger.close()
+		exec(`CREATE FUNCTION test_inverse_purge_veto() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test installed purge veto'; END $$;
+ CREATE TRIGGER zz_test_inverse_purge_veto BEFORE UPDATE OF purged_at ON recording_clips FOR EACH ROW EXECUTE FUNCTION test_inverse_purge_veto();`)
+		before := store.calls
+		_, err := applyInverse(ctx, pool, store, a.opts)
+		exec(`DROP TRIGGER zz_test_inverse_purge_veto ON recording_clips; DROP FUNCTION test_inverse_purge_veto()`)
+		if err == nil || !strings.Contains(err.Error(), "pre-delete purge veto") || store.calls != before {
+			t.Fatal("purge veto reached wire", err)
+		}
+		var count int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1`, entries[0].Key).Scan(&count); err != nil || count != 0 {
+			t.Fatal("veto published intent", count, err)
+		}
+	})
 	t.Run("budget", func(t *testing.T) {
 		a, _ := build(2)
 		a.ledger.close()
