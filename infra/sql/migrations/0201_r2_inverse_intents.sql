@@ -45,7 +45,8 @@ CREATE FUNCTION r2_inverse_delivery_held(i bigint,b text,k text,p text,sha text,
  OR EXISTS(SELECT 1 FROM delivery_keep_holds WHERE bucket=b AND object_key=k)
  OR EXISTS(SELECT 1 FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id
   WHERE o.source_clip_ids @> ARRAY[i] AND (
-   EXISTS(SELECT 1 FROM delivery_keep_holds d WHERE d.object_key=o.object_key)
+   EXISTS(SELECT 1 FROM delivery_nas_source_holds d WHERE d.clip_id=ANY(o.source_clip_ids))
+   OR EXISTS(SELECT 1 FROM delivery_keep_holds d WHERE d.object_key=o.object_key)
    OR EXISTS(SELECT 1 FROM delivery_keep_holds d WHERE d.relative_path<>'' AND d.relative_path IN(o.nas_relative_path,regexp_replace(o.nas_relative_path,'^joined/','')))
    OR EXISTS(SELECT 1 FROM delivery_keep_holds d WHERE d.sha256<>'' AND d.sha256=o.sha256 AND d.size_bytes=o.size_bytes)
    OR EXISTS(SELECT 1 FROM delivery_keep_output_dependencies d WHERE d.output_id=o.id AND d.recording_id=h.recording_id)))

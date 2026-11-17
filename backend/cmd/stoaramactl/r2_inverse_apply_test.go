@@ -30,7 +30,7 @@ type inverseFakeStore struct {
 	calls        int
 	lost         bool
 	delay        time.Duration
-	beforeHead   func(string) error
+	beforeHead   func(context.Context, string) error
 	beforeDelete func(string) error
 }
 
@@ -50,7 +50,7 @@ func (s *inverseFakeStore) Head(ctx context.Context, key string) (r2.ObjectHead,
 		}
 	}
 	if s.beforeHead != nil {
-		if err := s.beforeHead(key); err != nil {
+		if err := s.beforeHead(ctx, key); err != nil {
 			return r2.ObjectHead{}, err
 		}
 	}
@@ -266,7 +266,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		a.ledger.close()
 		target := entries[0].Key
 		var once sync.Once
-		store.beforeHead = func(key string) error {
+		store.beforeHead = func(_ context.Context, key string) error {
 			if key == target {
 				once.Do(func() {
 					if err := os.WriteFile(picksPath, append(picksData, ' '), 0600); err != nil {
@@ -287,7 +287,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 	})
 	t.Run("delivery_admitted_before_intent_wins", func(t *testing.T) {
-		for n, kind := range []string{"key", "source", "content_alias", "normalized_path", "output_dependency", "output_key", "output_content", "output_path"} {
+		for n, kind := range []string{"key", "source", "content_alias", "normalized_path", "output_dependency", "output_key", "output_content", "output_path", "output_cached_source"} {
 			t.Run(kind, func(t *testing.T) {
 				a, entries := build(1)
 				defer a.ledger.close()
@@ -319,6 +319,9 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 						exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) SELECT 'stoarama',object_key,'hold',100,'metadata' FROM recording_collation_outputs WHERE id=$1`, outputID)
 					case "output_content":
 						exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256) SELECT 'stoarama',$1,'hold',size_bytes,'metadata',sha256 FROM recording_collation_outputs WHERE id=$2`, placeholder, outputID)
+					case "output_cached_source":
+						exec(`UPDATE recording_collation_outputs SET source_clip_ids=array_append(source_clip_ids,9001199::bigint) WHERE id=$1`, outputID)
+						exec(`INSERT INTO delivery_nas_source_holds(clip_id) VALUES(9001199)`)
 					case "output_path":
 						exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,relative_path) SELECT 'stoarama',$1,'hold',100,'metadata',regexp_replace(nas_relative_path,'^joined/','') FROM recording_collation_outputs WHERE id=$2`, placeholder, outputID)
 					}
@@ -331,7 +334,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 	})
 	t.Run("late_admission_blocked_through_wire_then_intent_vetoes", func(t *testing.T) {
-		for _, kind := range []string{"delivery_key", "delivery_source", "delivery_output", "delivery_path_enrichment", "collated_key", "held_output_source"} {
+		for _, kind := range []string{"delivery_key", "delivery_source", "delivery_output", "delivery_path_enrichment", "collated_key", "held_output_source", "delivery_output_cached_source"} {
 			t.Run(kind, func(t *testing.T) {
 				a, entries := build(1)
 				defer a.ledger.close()
@@ -357,6 +360,10 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					arg = id
 				case "collated_key":
 					query = `UPDATE recording_collation_outputs SET object_key=$1 WHERE id=10000001`
+				case "delivery_output_cached_source":
+					exec(`UPDATE recording_collation_outputs SET source_clip_ids=array_append(source_clip_ids,9001198::bigint) WHERE id=10000001`)
+					query = `INSERT INTO delivery_nas_source_holds(clip_id) VALUES($1)`
+					arg = int64(9001198)
 				case "held_output_source":
 					query = `UPDATE recording_collation_outputs SET source_clip_ids=array_append(source_clip_ids,$1::bigint) WHERE id=10000008`
 					arg = id
@@ -504,18 +511,24 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				a, entries := build(1)
 				defer a.ledger.close()
 				e := entries[0]
-				store.beforeHead = func(key string) error {
-					if key == e.Key {
-						store.mu.Lock()
-						_, present := store.objects[key]
-						store.mu.Unlock()
-						if !afterDelete || !present {
-							time.Sleep(80 * time.Millisecond)
-						}
+				timed, cancel := context.WithCancel(ctx)
+				store.beforeHead = func(headCtx context.Context, key string) error {
+					if key != e.Key {
+						return nil
+					}
+					deadline, bounded := headCtx.Deadline()
+					if !bounded || time.Until(deadline) > inverseNetworkTimeout {
+						return errors.New("network context has no bounded deadline")
+					}
+					store.mu.Lock()
+					_, present := store.objects[key]
+					store.mu.Unlock()
+					if !afterDelete || !present {
+						cancel()
+						return headCtx.Err()
 					}
 					return nil
 				}
-				timed, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 				_, err := a.delete(timed, e)
 				cancel()
 				store.beforeHead = nil
