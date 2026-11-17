@@ -3,7 +3,7 @@
 `stoaramactl finish tick --safety FILE --copy-status FILE --status FILE` feeds
 keep28 raw metadata for account 47 / connection 13. It never changes cleanup,
 master switches, NAS files, R2 objects or deletion budgets. A1's
-`nas-r2-copy status --json` and A1b's reviewed `r2-copy-v5` server-challenge storage
+`nas-r2-copy status --json` and A1b's reviewed server-challenge storage (exact `r2-copy-v5`/`r2-copy-v6`)
 boundary are required before installation. B and stitching are
 not wired into D-min.
 
@@ -37,17 +37,17 @@ It needs no publication ledger, completion-label inference or sample timestamp.
 
 Budget freshness is proven on the database clock, independent of network delay
 or client lifetime. Every successful heartbeat stores a new random 64-hex nonce
-and its server issuance time. Only exact v5 responses expose the private
+and its server issuance time. Only exact v5/v6 responses expose the private
 `storage_challenge_nonce`; legacy joined/proof envelopes omit it entirely.
-V5 consumes it before passing the response to the unchanged strict control parser. The v5 client
-consumes that nonce before the next actual storage attempt, samples physically
+V5/V6 consume it before passing the response to the unchanged strict control parser. These clients
+consume that nonce before the next actual storage attempt, samples physically
 after receiving it, and echoes `storage.challenge_nonce`. Without a nonce it
 still sends fresh display-only storage; no budget is granted for that cycle.
 
 Under the existing connection row lock, the storage UPDATE checks the exact
-current nonce, exact v5 literal and nonfuture issuance no older than 180 seconds.
+current nonce, exact v5/v6 literal and nonfuture issuance no older than 180 seconds.
 It atomically saves that **matched old issuance** in `nas_storage_budget_at`, binds
-the sample to v5, and rotates the next challenge. Rotating or delivering a later
+the sample to its actual accepted version, and rotates the next challenge. Rotating or delivering a later
 response cannot refresh an earlier sample. Missing, expired or mismatched nonces
 update display storage normally but clear budget eligibility. A lost response
 or replay therefore gives a normal no-budget cycle; the next response provides
@@ -55,7 +55,8 @@ a fresh challenge. Omitted storage preserves the earlier sample's proof/time;
 unavailable or legacy storage clears it. Old rows start without any proof.
 
 Migration `0203_nas_storage_client_binding.sql` stores the challenge and accepted
-sample separately. The CLI requires `nas_storage_client_version='r2-copy-v5'`
+sample separately. The CLI requires an exact v5/v6 `nas_storage_client_version` via the shared
+`api.SupportsNASStorageBudget` predicate
 and `0 <= DB clock - nas_storage_budget_at <= T=180s`. T is shared server policy
 (`api.NASStorageBudgetMaxAge`), with an inclusive terminal-debit cutoff. A delayed
 complete request accepted at t200 with challenge t60 still has budget time t60;
@@ -148,7 +149,7 @@ read current `connections.nas_storage_free_bytes` and `nas_storage_reported_at`
 directly. Recommend cleanup only if free bytes minus the unchanged 2 TB COPY
 floor is strictly below the typed 300 GB headroom threshold. The storage heartbeat
 must be no older than ten minutes (and no more than 30 seconds in the future).
-The sample must also have an exact v5 proof whose server issuance is nonfuture
+The sample must also have an exact v5/v6 proof whose server issuance is nonfuture
 and no older than ten minutes; a fresh display receipt alone has no authority.
 Missing/stale storage or challenge evidence gives no recommendation and a visible reason;
 it does not stop metadata feeding. Historical hold counters, memory holds,
@@ -168,12 +169,16 @@ this decision; an empty queue is not cleanup authority.
 ## Install packet
 
 Sole controller, at a natural boundary after the combined D/A1b boundary review:
-A1 + #526 and fresh v4 observation come first. Deploy the server with migration
-0203, #535's COPY lease fix and A1b's exact v5 admission support before releasing the reviewed v5 client.
-Only then verify a completed v5 nonce exchange, `nas_storage_client_version='r2-copy-v5'`
-and a fresh `nas_storage_budget_at` bound to the matched challenge, never re-stamped
-to the storage receipt, retarget the collector explicitly to v5, and
-install D. A v4 observation packet is not late-budget eligible.
+A1 + #526 and the reviewed storage-sample boundary remain prerequisites. For the
+current v6 release, follow `docs/operations.md`'s quiesced COPY/collated cutover:
+confirm reviewed 0205 is installed, apply 0206, precreate its exact GIN index
+concurrently, then apply 0207/0208, and deploy compatible API and finish CLI before activating v6.
+Migration 0208 preserves existing v5 evidence and adds the exact v6 proof pair;
+it does not manufacture proof. Quiesce every collated caller until it has a
+compatible immutable artifact; the old parser cannot consume the new wire shape.
+Verify two v6 heartbeats and `nas_storage_client_version='r2-copy-v6'` bound to the
+preceding server challenge time, audit/retarget private collector version pins,
+and only then install D. A v4 observation packet is not late-budget eligible.
 
 1. Build the merged CLI on Jelly using `darma storage check` then
    `darma run --slot -- go -C backend build -o <install>/stoaramactl ./cmd/stoaramactl`.
