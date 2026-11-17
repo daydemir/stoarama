@@ -46,6 +46,7 @@ func TestNASClientAdmissionExactVersions(t *testing.T) {
 		{"v85r-nas-proof-v1", true, true, false},
 		{nasCleanupProofClientVersion, true, true, true},
 		{nasCleanupPermitTransportClientVersion, true, false, false},
+		{nasCleanupFreshPermitClientVersion, true, true, false},
 		{nasCleanupR2CopyControlClientVersion, true, true, true},
 		{nasCleanupItemTruthClientVersion, true, true, true},
 		{"development", false, false, false},
@@ -53,6 +54,7 @@ func TestNASClientAdmissionExactVersions(t *testing.T) {
 		{"test", false, false, false},
 		{"01234567", false, false, false},
 		{"r2-copy-v3-extra", false, false, false},
+		{nasCleanupFreshPermitClientVersion + "-extra", false, false, false},
 		{"v85r-nas-proof-v2 ", false, false, false},
 	} {
 		for purpose, want := range map[nasConnectionPurpose]bool{nasConnectionCleanup: tc.cleanup, nasConnectionCopy: tc.copy, nasConnectionProof: tc.proof} {
@@ -69,6 +71,89 @@ func TestNASClientAdmissionExactVersions(t *testing.T) {
 		if _, ok := nasRequestWorkVersion(r, nasConnectionCopy); ok {
 			t.Fatalf("ambiguous or unstamped transport admitted: %v", agents)
 		}
+	}
+}
+
+func TestNASClientAdmissionFreshPermitCopyAuthenticated(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*cleanupFixture) string
+		want   int
+	}{
+		{"matching release", func(f *cleanupFixture) string { return f.version }, http.StatusOK},
+		{"copy disabled", func(f *cleanupFixture) string {
+			f.s.cfg.NASR2CopyEnabled = false
+			return f.version
+		}, http.StatusConflict},
+		{"request mismatch", func(f *cleanupFixture) string { return "development" }, http.StatusConflict},
+		{"heartbeat mismatch", func(f *cleanupFixture) string {
+			if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version='development' WHERE id=13`); err != nil {
+				f.t.Fatal(err)
+			}
+			return f.version
+		}, http.StatusForbidden},
+		{"maintenance", func(f *cleanupFixture) string {
+			if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_maintenance SET active=true`); err != nil {
+				f.t.Fatal(err)
+			}
+			return f.version
+		}, http.StatusConflict},
+		{"source changed", func(f *cleanupFixture) string {
+			if _, err := f.pool.Exec(f.ctx, `UPDATE recording_clips SET sha256=repeat('b',64) WHERE id=901`); err != nil {
+				f.t.Fatal(err)
+			}
+			return f.version
+		}, http.StatusConflict},
+		{"queue policy changed", func(f *cleanupFixture) string {
+			if _, err := f.pool.Exec(f.ctx, `UPDATE nas_r2_copy_items SET policy_sha256=repeat('b',64)`); err != nil {
+				f.t.Fatal(err)
+			}
+			return f.version
+		}, http.StatusConflict},
+		{"source held", func(f *cleanupFixture) string {
+			id, _, _ := f.admit("copy-source-held", syntheticFiles(9901, 1, 1))
+			if _, err := f.pool.Exec(f.ctx, `INSERT INTO nas_cleanup_source_holds(plan_id,clip_id) VALUES($1,901)`, id); err != nil {
+				f.t.Fatal(err)
+			}
+			return f.version
+		}, http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, server := authenticatedCopyFixture(t)
+			f.useClientVersion(nasCleanupFreshPermitClientVersion)
+			version := tc.mutate(f)
+			req, err := http.NewRequest(http.MethodPost, server.URL+copyControlLeasePath, strings.NewReader(`{"free_bytes":3000000000000}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer fixture-key")
+			req.Header.Set("User-Agent", "stoarama-nas-pull/"+version)
+			response, err := server.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != tc.want {
+				t.Fatalf("status=%d want=%d", response.StatusCode, tc.want)
+			}
+			var attempts, leased int
+			if err := f.pool.QueryRow(f.ctx, `SELECT coalesce(sum(attempts),0),count(*) FILTER(WHERE state='leased') FROM nas_r2_copy_items`).Scan(&attempts, &leased); err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			if tc.want == http.StatusOK {
+				want = 1
+				var body struct {
+					Task nasR2CopyTask `json:"task"`
+				}
+				if err := json.NewDecoder(response.Body).Decode(&body); err != nil || body.Task.ID <= 0 || body.Task.Item.SourceID != 901 || body.Task.ETag == "" {
+					t.Fatalf("matching release did not receive a source-bound copy task: %v", err)
+				}
+			}
+			if attempts != want || leased != want {
+				t.Fatalf("unexpected queue mutation: attempts=%d leased=%d want=%d", attempts, leased, want)
+			}
+		})
 	}
 }
 
