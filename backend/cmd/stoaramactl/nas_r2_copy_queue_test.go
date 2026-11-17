@@ -31,7 +31,7 @@ CREATE TABLE nas_cleanup_reserved_files(kind text,source_id bigint);
 CREATE TABLE nas_cleanup_source_holds(clip_id bigint,plan_id bigint);
 CREATE TABLE nas_cleanup_plans(id bigint PRIMARY KEY,mode text);
 CREATE TABLE nas_cleanup_items(plan_id bigint,delete_ever_issued boolean);
-CREATE TABLE r2_retirement_reservations(kind text,source_id bigint,bucket text,object_key text);
+CREATE TABLE r2_retirement_reservations(kind text,source_id bigint,bucket text,object_key text,size_bytes bigint,sha256 text,manifest_sha256 text,retirement_class text);
 CREATE TABLE r2_object_retirements(kind text,source_id bigint);
 INSERT INTO connections VALUES(13);`)
 	if err != nil {
@@ -408,5 +408,48 @@ func TestNASCopyStatusDurableCountersAndReimport(t *testing.T) {
 	}
 	if status.QueueDepth != 1 || status.Blocked != 1 || status.MismatchLatched != 1 || status.VerifiedInPlace.Objects != 1 || status.Downloaded.Objects != 1 || status.DownloadedBytes != 50 || status.CommittedBytes != 100 || status.ReLeasedItems != 1 || status.MaxAttempts != 4 || status.BlockedByReason["checksum_mismatch"].Objects != 1 {
 		t.Fatalf("status %+v", status)
+	}
+}
+
+// applyOne owns the global cleanup/public fence on its main transaction and
+// reserve must independently COMMIT intent via another pooled connection. The
+// trigger must neither self-block on that fence nor admit a protected key.
+func TestNASR2CopyRetirementIntentUsesIndependentConnection(t *testing.T) {
+	for _, class := range []r2RetireClass{"", r2RetireOwnerAccepted} {
+		t.Run(string(class), func(t *testing.T) {
+			pool, _, h, items := nasCopyQueueFixture(t, 1, true)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := queueNASR2Copy(ctx, pool, h, strings.Repeat("a", 64), items, true); err != nil {
+				t.Fatal(err)
+			}
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(context.Background())
+			if err := api.LockNASCleanupR2Retirement(ctx, tx); err != nil {
+				t.Fatal(err)
+			}
+			applier := r2RetireApplier{pool: pool, digest: strings.Repeat("b", 64), scope: r2RetireScope{Class: class}}
+			unrelated := r2RetireItem{r2RetireCandidate: r2RetireCandidate{Kind: "raw", SourceID: 9999, Bucket: "bucket", ObjectKey: "managed/unrelated.mp4", SizeBytes: 1, SHA256: strings.Repeat("c", 64)}}
+			if err := applier.reserve(ctx, unrelated); err != nil {
+				t.Fatalf("independent durable intent blocked by own outer transaction: %v", err)
+			}
+			if err := tx.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var count int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_retirement_reservations WHERE source_id=9999`).Scan(&count); err != nil || count != 1 {
+				t.Fatalf("intent lost on outer rollback: count=%d err=%v", count, err)
+			}
+			protected := items[0]
+			if _, err := pool.Exec(ctx, `UPDATE nas_r2_copy_items SET state='blocked',blocked_reason='checksum_mismatch'`); err != nil {
+				t.Fatal(err)
+			}
+			if err := applier.reserve(ctx, r2RetireItem{r2RetireCandidate: r2RetireCandidate{Kind: "raw", SourceID: protected.SourceID, Bucket: protected.Bucket, ObjectKey: protected.ObjectKey, SizeBytes: protected.SizeBytes, SHA256: protected.SHA256}}); err == nil || !strings.Contains(err.Error(), "COPY custody") {
+				t.Fatalf("protected intent accepted: %v", err)
+			}
+		})
 	}
 }

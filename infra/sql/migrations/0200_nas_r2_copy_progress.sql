@@ -20,11 +20,15 @@ CREATE FUNCTION guard_nas_r2_copy_block() RETURNS trigger LANGUAGE plpgsql AS $$
 END $$;
 CREATE TRIGGER nas_r2_copy_block_latch BEFORE UPDATE OR DELETE ON nas_r2_copy_items FOR EACH ROW EXECUTE FUNCTION guard_nas_r2_copy_block();
 
--- Existing retirement callers acquire this fence before intent publication.
--- Nonverified COPY custody cannot become deletion authority, even when stale
--- inventory still claims exact bytes. Check the exact key, not only source_id.
+-- Retirement publishes intent on another connection while its outer transaction
+-- owns the global admission fence. Never reacquire that global fence here.
+-- Both independent intent publication and COPY import serialize on this exact
+-- key instead; hash collisions only conservatively serialize unrelated keys.
+CREATE FUNCTION lock_nas_r2_copy_key(b text,k text) RETURNS void LANGUAGE sql VOLATILE AS $$
+ SELECT pg_advisory_xact_lock(hashtextextended(jsonb_build_array(b,k)::text,7343226011200));
+$$;
 CREATE FUNCTION guard_r2_copy_reservation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
- PERFORM pg_advisory_xact_lock(7343226011103);
+ PERFORM lock_nas_r2_copy_key(NEW.bucket,NEW.object_key);
  IF EXISTS(SELECT 1 FROM nas_r2_copy_items WHERE state<>'verified'
   AND item->>'bucket'=NEW.bucket AND item->>'object_key'=NEW.object_key) THEN
   RAISE EXCEPTION 'COPY custody pending or blocked: R2 key protected';
@@ -36,7 +40,7 @@ CREATE TRIGGER r2_copy_reservation_guard BEFORE INSERT ON r2_retirement_reservat
 -- Serialize initial custody admission with retirement intent; neither side can
 -- win from a stale read. Normal exact-manifest ON CONFLICT imports stay valid.
 CREATE FUNCTION guard_nas_r2_copy_admission() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
- PERFORM pg_advisory_xact_lock_shared(7343226011103);
+ PERFORM lock_nas_r2_copy_key(NEW.item->>'bucket',NEW.item->>'object_key');
  IF EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE bucket=NEW.item->>'bucket' AND object_key=NEW.item->>'object_key') THEN
   RAISE EXCEPTION 'COPY source has retirement intent; preserved';
  END IF;
