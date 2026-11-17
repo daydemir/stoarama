@@ -19,6 +19,7 @@ const (
 type NASR2CopyBlockReason string
 
 const (
+	NASR2CopyVerifyMissing    NASR2CopyBlockReason = "verify_missing"
 	NASR2CopySourceChanged    NASR2CopyBlockReason = "source_changed"
 	NASR2CopyR2Identity       NASR2CopyBlockReason = "r2_identity"
 	NASR2CopyFinalConflict    NASR2CopyBlockReason = "final_conflict"
@@ -30,7 +31,7 @@ const (
 
 func (reason NASR2CopyBlockReason) client() bool {
 	switch reason {
-	case NASR2CopyFinalConflict, NASR2CopySidecarConflict, NASR2CopyPartialConflict, NASR2CopyPathConflict, NASR2CopyChecksumMismatch:
+	case NASR2CopyVerifyMissing, NASR2CopyFinalConflict, NASR2CopySidecarConflict, NASR2CopyPartialConflict, NASR2CopyPathConflict, NASR2CopyChecksumMismatch:
 		return true
 	default:
 		return false
@@ -77,7 +78,7 @@ func (s *Server) handleNASR2CopyBlock(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 	var owned bool
-	err = tx.QueryRow(r.Context(), `SELECT true FROM nas_r2_copy_items WHERE id=$1 AND connection_id=13 AND state='leased' AND lease_token=$2 FOR UPDATE`, id, req.Token).Scan(&owned)
+	err = tx.QueryRow(r.Context(), `SELECT true FROM nas_r2_copy_items WHERE id=$1 AND connection_id=13 AND state IN ('leased','refresh_leased') AND lease_token=$2 FOR UPDATE`, id, req.Token).Scan(&owned)
 	if err != nil || !owned {
 		util.WriteError(w, 409, "copy block owner changed")
 		return
