@@ -5,7 +5,7 @@ CREATE TABLE r2_inverse_intents (
  bucket text NOT NULL, object_key text NOT NULL,
  endpoint_sha256 text NOT NULL CHECK(endpoint_sha256 ~ '^[a-f0-9]{64}$'),
  stream_id bigint NOT NULL CHECK(stream_id>0),
- source_id bigint NOT NULL REFERENCES recording_clips(id),
+ source_id bigint NOT NULL CHECK(source_id>0),
  size_bytes bigint NOT NULL CHECK(size_bytes>0),
  etag text NOT NULL CHECK(etag<>''), last_modified timestamptz NOT NULL,
  manifest_sha256 text NOT NULL CHECK(manifest_sha256 ~ '^[a-f0-9]{64}$'),
@@ -91,10 +91,12 @@ CREATE TRIGGER r2_inverse_joined_snapshot_fence BEFORE INSERT OR UPDATE ON recor
 CREATE TRIGGER r2_inverse_joined_dry_fence BEFORE INSERT OR UPDATE ON recording_joined_dry_run_scopes
  FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();
 
--- Freeze reserved source identity after the admission transaction commits.
+-- Freeze pending source identity after admission commits. Once confirmed
+-- absent, immutable receipts retain history without permanently locking the
+-- catalog or adding a foreign-key veto to later authorized metadata cleanup.
 CREATE FUNCTION guard_r2_inverse_source_identity() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
- IF EXISTS(SELECT 1 FROM r2_inverse_intents WHERE source_id=OLD.id)
- OR (TG_OP='UPDATE' AND EXISTS(SELECT 1 FROM r2_inverse_intents WHERE bucket=NEW.bucket AND object_key=NEW.object_key)) THEN
+ IF EXISTS(SELECT 1 FROM r2_inverse_intents i WHERE i.source_id=OLD.id AND NOT EXISTS(SELECT 1 FROM r2_inverse_events e WHERE e.bucket=i.bucket AND e.object_key=i.object_key AND e.event='absent'))
+ OR (TG_OP='UPDATE' AND EXISTS(SELECT 1 FROM r2_inverse_intents i WHERE i.bucket=NEW.bucket AND i.object_key=NEW.object_key AND NOT EXISTS(SELECT 1 FROM r2_inverse_events e WHERE e.bucket=i.bucket AND e.object_key=i.object_key AND e.event='absent'))) THEN
   RAISE EXCEPTION 'R2 inverse intent freezes source identity'; END IF;
  IF TG_OP='DELETE' THEN RETURN OLD; END IF; RETURN NEW;
 END $$;

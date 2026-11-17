@@ -216,6 +216,9 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		if _, err := a.reserve(ctx, entries[0]); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := pool.Exec(ctx, `UPDATE recording_clips SET display_path='changed' WHERE object_key=$1`, entries[0].Key); err == nil {
+			t.Fatal("pending source identity changed")
+		}
 		a.ledger.close()
 		before := store.calls
 		s, err := applyInverse(ctx, pool, store, a.opts)
