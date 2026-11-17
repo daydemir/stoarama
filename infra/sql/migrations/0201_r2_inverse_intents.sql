@@ -114,9 +114,13 @@ CREATE FUNCTION fence_r2_inverse_copy_key() RETURNS trigger LANGUAGE plpgsql AS 
  OR NEW.item->>'object_key' IS DISTINCT FROM OLD.item->>'object_key' THEN
   RAISE EXCEPTION 'COPY R2 identity is immutable'; END IF;
  PERFORM lock_nas_r2_copy_key(NEW.item->>'bucket',NEW.item->>'object_key');
+ IF (NEW.state<>'verified' OR NEW.blocked_reason<>'')
+ AND OLD.state='verified' AND OLD.blocked_reason=''
+ AND EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE bucket=NEW.item->>'bucket' AND object_key=NEW.item->>'object_key') THEN
+  RAISE EXCEPTION 'R2 retirement reservation forbids COPY protection adoption'; END IF;
  RETURN NEW;
 END $$;
-CREATE TRIGGER r2_inverse_copy_state_fence BEFORE UPDATE OF state,item ON nas_r2_copy_items
+CREATE TRIGGER r2_inverse_copy_state_fence BEFORE UPDATE OF state,item,blocked_reason ON nas_r2_copy_items
  FOR EACH ROW EXECUTE FUNCTION fence_r2_inverse_copy_key();
 CREATE TRIGGER r2_inverse_joined_source_fence BEFORE INSERT OR UPDATE ON recording_joined_source_snapshots
  FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();

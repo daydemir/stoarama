@@ -385,7 +385,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 	})
 	t.Run("late_admission_blocked_through_wire_then_intent_vetoes", func(t *testing.T) {
-		for _, kind := range []string{"delivery_key", "delivery_source", "delivery_output", "delivery_path_enrichment", "collated_key", "held_output_source", "delivery_output_cached_source", "output_id", "cleanup_reactivate", "cleanup_insert_reactivate", "cleanup_source_admission", "cleanup_plan_admission", "joined_scope_admission"} {
+		for _, kind := range []string{"delivery_key", "delivery_source", "delivery_output", "delivery_path_enrichment", "collated_key", "held_output_source", "delivery_output_cached_source", "output_id", "cleanup_reactivate", "cleanup_insert_reactivate", "cleanup_source_admission", "cleanup_plan_admission", "joined_scope_admission", "copy_state", "copy_reason"} {
 			t.Run(kind, func(t *testing.T) {
 				a, entries := build(1)
 				defer a.ledger.close()
@@ -398,6 +398,13 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				query := `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`
 				var arg any = e.Key
 				switch kind {
+				case "copy_state", "copy_reason":
+					exec(`INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item,state) SELECT 13,'raw',id,repeat('a',64),$2,jsonb_build_object('bucket',bucket,'object_key',object_key),'verified' FROM recording_clips WHERE id=$1`, id, policy)
+					query = `UPDATE nas_r2_copy_items SET blocked_reason='checksum_mismatch' WHERE source_id=$1`
+					if kind == "copy_state" {
+						query = `UPDATE nas_r2_copy_items SET state='blocked',blocked_reason='checksum_mismatch' WHERE source_id=$1`
+					}
+					arg = id
 				case "output_id":
 					unusedID := int64(980000000) + id
 					exec(`INSERT INTO delivery_keep_output_dependencies(output_id,recording_id) VALUES($1,30)`, unusedID)
@@ -729,6 +736,37 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					var pe *pgconn.PgError
 					if !errors.As(err, &pe) || pe.Code != "55000" {
 						t.Fatal("stale COPY/reservation admission not refused", err)
+					}
+				})
+			}
+		}
+	})
+	t.Run("COPY_update_admission_both_orderings", func(t *testing.T) {
+		for _, reasonOnly := range []bool{false, true} {
+			for _, reservationFirst := range []bool{false, true} {
+				t.Run(fmt.Sprintf("reason_only=%t/reservation_first=%t", reasonOnly, reservationFirst), func(t *testing.T) {
+					a, entries := build(1)
+					defer a.ledger.close()
+					e := entries[0]
+					exec(`INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item,state) SELECT 13,'raw',id,repeat('a',64),$2,jsonb_build_object('bucket',bucket,'object_key',object_key),'verified' FROM recording_clips WHERE object_key=$1`, e.Key, policy)
+					query := `UPDATE nas_r2_copy_items SET state='blocked',blocked_reason='checksum_mismatch' WHERE item->>'object_key'=$1`
+					if reasonOnly {
+						query = `UPDATE nas_r2_copy_items SET blocked_reason='final_conflict' WHERE item->>'object_key'=$1`
+					}
+					if reservationFirst {
+						if _, err := a.reserve(ctx, e); err != nil {
+							t.Fatal(err)
+						}
+						// A no-change verified update is not a new protection admission.
+						exec(`UPDATE nas_r2_copy_items SET state='verified' WHERE item->>'object_key'=$1`, e.Key)
+						if _, err := pool.Exec(ctx, query, e.Key); err == nil || !strings.Contains(err.Error(), "reservation") {
+							t.Fatal("COPY UPDATE adopted reserved key", err)
+						}
+					} else {
+						exec(query, e.Key)
+						if _, err := a.reserve(ctx, e); err == nil {
+							t.Fatal("COPY protection lost to reservation")
+						}
 					}
 				})
 			}
