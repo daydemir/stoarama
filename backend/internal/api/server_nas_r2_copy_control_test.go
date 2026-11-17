@@ -133,7 +133,7 @@ CREATE TABLE account_api_keys(id bigint PRIMARY KEY,account_id bigint,secret_has
 		}
 	}
 	router := chi.NewRouter()
-	router.Use(f.s.requireAccountAuth, f.s.confineAccountScope, f.s.fenceNASDelivery)
+	router.Use(nasR2CopyDeadline, f.s.requireAccountAuth, f.s.confineAccountScope, f.s.fenceNASDelivery)
 	router.Get("/api/v1/account/connections/stitch/evidence/admission", f.s.handleAccountNASStitchEvidenceAdmission)
 	router.Post(copyControlLeasePath, f.s.handleNASR2CopyLease)
 	router.Post("/api/v1/account/connections/r2-copy/{id}/checkpoint", f.s.handleNASR2CopyCheckpoint)
@@ -356,5 +356,38 @@ func TestNASR2CopyControlCapabilityUnion(t *testing.T) {
 		if nasCleanupSupportsBulk(unknown) || nasCleanupSupportsGroupedExecution(unknown) {
 			t.Fatal("copy capability prefix admitted")
 		}
+	}
+}
+
+func TestNASR2CopyControlDeadlineReturnsRetryableStatus(t *testing.T) {
+	for _, stage := range []string{"head", "auth-pool", "admission"} {
+		t.Run(stage, func(t *testing.T) {
+			f, srv := authenticatedCopyFixture(t)
+			switch stage {
+			case "head":
+				f.bucket.headDelay = 3 * time.Second
+			case "auth-pool":
+				for n := int32(0); n < f.pool.Config().MaxConns; n++ {
+					conn, err := f.pool.Acquire(f.ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer conn.Release()
+				}
+			case "admission":
+				tx, err := f.pool.Begin(f.ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback(f.ctx)
+				if _, err = tx.Exec(f.ctx, `SELECT pg_advisory_xact_lock($1)`, nasR2CopyLock); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result := runCopyControlFixture(t, srv.URL, "", 2*time.Second, []copyControlFixtureRequest{{1, copyControlLeasePath, nasR2CopyControl{FreeBytes: NASR2CopyFloor + 1e9}}})
+			if result.Results[0].Status != 503 {
+				t.Fatalf("%s silently timed out or misclassified: %+v", stage, result)
+			}
+		})
 	}
 }

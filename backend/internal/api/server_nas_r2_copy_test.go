@@ -65,7 +65,7 @@ func copyCall(f *cleanupFixture, action string, id int64, body any) *httptest.Re
 	req = req.WithContext(ctx)
 	out := httptest.NewRecorder()
 	handlers := map[string]http.HandlerFunc{"lease": f.s.handleNASR2CopyLease, "checkpoint": f.s.handleNASR2CopyCheckpoint, "range": f.s.handleNASR2CopyRange, "result": f.s.handleNASR2CopyResult, "block": f.s.handleNASR2CopyBlock}
-	f.s.confineAccountScope(f.s.fenceNASDelivery(handlers[action])).ServeHTTP(out, req)
+	nasR2CopyDeadline(f.s.confineAccountScope(f.s.fenceNASDelivery(handlers[action]))).ServeHTTP(out, req)
 	return out
 }
 func copyLease(t *testing.T, f *cleanupFixture) nasR2CopyTask {
@@ -262,10 +262,8 @@ func TestNASR2CopySourceHoldsStillRefused(t *testing.T) {
 	defer tx.Rollback(f.ctx)
 	// A stitched-source cleanup reservation can overlap keep28; it must still
 	// veto copy even though ordinary outside-window plans can run concurrently.
-	if _, err = tx.Exec(f.ctx, `CREATE TEMP TABLE nas_cleanup_reserved_files(kind text,source_id bigint)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = tx.Exec(f.ctx, `INSERT INTO nas_cleanup_reserved_files VALUES('raw',$1)`, i.SourceID); err != nil {
+	if _, err = tx.Exec(f.ctx, `INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256)
+ VALUES(47,13,'copy-source-reserved',repeat('a',64),jsonb_build_array(jsonb_build_object('kind','raw','source_id',$1::bigint)),repeat('b',64))`, i.SourceID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = LoadNASR2CopySource(f.ctx, tx, i); err == nil {

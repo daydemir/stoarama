@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/daydemir/stoarama/backend/internal/nasdelivery"
@@ -8,6 +10,7 @@ import (
 	"net/http"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +23,7 @@ import (
 // server-set rate, beside (never yielding to) raw delivery.
 
 const (
+	collatedFeedBudget       = 3 * time.Second
 	collatedFeedMaxLimit     = 200
 	collatedFeedDefaultLimit = 50
 	collatedDownloadTTL      = time.Hour
@@ -80,18 +84,16 @@ type collatedItem struct {
 // generation of each recording hour, nas_pull recordings of the connection's
 // account, R2-verified, not yet acknowledged by this connection, and not
 // retired from R2 (r2-retire). $1=connection.
-const collatedEligibleSQL = `
-	FROM recording_collation_outputs o
+const collatedEligibilitySQL = `
 	JOIN recording_collation_hours h ON h.id=o.collation_hour_id
 	JOIN recordings r ON r.id=h.recording_id
 	JOIN connections conn ON conn.id=$1 AND conn.kind='nas_pull' AND r.account_id=conn.account_id
 	WHERE r.delivery='nas_pull' AND conn.collated_delivery_enabled
-	  AND nas_delivery_allowed(conn.id,'collated',o.id)
 	  -- Scope: only outputs collated from clips held for collated-only delivery
 	  -- (nasdelivery.HoldContractMode). The NAS already has the raw of every other
 	  -- output (e.g. the good+ backfill), so those stay in R2.
 	  AND EXISTS (SELECT 1 FROM clip_storage_billing_contracts hold
-	    WHERE hold.clip_id=ANY(o.source_clip_ids) AND hold.mode='` + nasdelivery.HoldContractMode + `')
+	    JOIN unnest(o.source_clip_ids) source_id ON source_id=hold.clip_id WHERE hold.mode='` + nasdelivery.HoldContractMode + `')
 	  AND NOT EXISTS (SELECT 1 FROM recording_collation_hours newer
 	    WHERE newer.recording_id=h.recording_id AND newer.local_date=h.local_date
 	      AND newer.delivery_hour=h.delivery_hour AND newer.generation>h.generation)
@@ -100,6 +102,28 @@ const collatedEligibleSQL = `
 	  -- Outputs retired from R2 by stoaramactl r2-retire are gone for good.
 	  AND NOT EXISTS (SELECT 1 FROM r2_object_retirements retired
 	    WHERE retired.kind='collated' AND retired.source_id=o.id)`
+
+const collatedEligibleSQL = `FROM recording_collation_outputs o ` + collatedEligibilitySQL + ` AND nas_delivery_allowed(conn.id,'collated',o.id)`
+
+// Bound expensive source and fence checks to one PK-ordered candidate page.
+// Materialization keeps the planner from running the fence on the full catalog.
+// The cursor covers candidates, including withheld outputs, so an ineligible
+// prefix can never starve later deliverable outputs. Downloads recheck eligibility.
+const collatedFeedSQL = `WITH page AS MATERIALIZED (
+ SELECT o.id FROM recording_collation_outputs o
+ JOIN recording_collation_hours h ON h.id=o.collation_hour_id
+ JOIN recordings r ON r.id=h.recording_id
+ JOIN connections conn ON conn.id=$1 AND conn.kind='nas_pull' AND conn.account_id=r.account_id
+ WHERE r.delivery='nas_pull' AND conn.collated_delivery_enabled AND o.id>$2
+ ORDER BY o.id LIMIT 1000
+), eligible AS MATERIALIZED (
+ SELECT o.id,o.nas_relative_path,o.size_bytes,o.sha256 FROM page
+ JOIN recording_collation_outputs o ON o.id=page.id ` + collatedEligibilitySQL + collatedNotBackedOffSQL + `
+), delivered AS (
+ SELECT * FROM eligible WHERE nas_delivery_allowed($1,'collated',id) ORDER BY id LIMIT $3
+)
+SELECT coalesce(jsonb_agg(jsonb_build_object('output_id',id,'nas_relative_path',nas_relative_path,'size_bytes',size_bytes,'sha256',sha256) ORDER BY id),'[]'::jsonb),coalesce((SELECT max(id) FROM page),0)
+FROM delivered`
 
 // collatedNotBackedOffSQL withholds outputs whose last delivery failed until
 // their backoff expires.
@@ -126,13 +150,25 @@ func (s *Server) collatedPullConnection(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleAccountCollated returns the connection's policy and one page of
-// undelivered collated outputs, oldest hour first.
+// undelivered collated outputs, in output-ID order.
 func (s *Server) handleAccountCollated(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), collatedFeedBudget)
+	defer cancel()
+	r = r.WithContext(ctx)
 	connectionID, _, ok := s.collatedPullConnection(w, r)
 	if !ok {
 		return
 	}
 	limit := parseIntQuery(r, "limit", collatedFeedDefaultLimit, 1, collatedFeedMaxLimit)
+	afterID := int64(0)
+	if raw := r.URL.Query().Get("after_id"); raw != "" {
+		var err error
+		afterID, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || afterID < 0 {
+			util.WriteError(w, 400, "invalid collated cursor")
+			return
+		}
+	}
 	var policy collatedPolicy
 	if err := s.pool.QueryRow(r.Context(), `SELECT collated_delivery_enabled,collated_download_bytes_per_sec,collated_download_parallel
 		FROM connections WHERE id=$1`, connectionID).Scan(&policy.Enabled, &policy.DownloadBytesPerSec, &policy.DownloadParallel); err != nil {
@@ -140,34 +176,32 @@ func (s *Server) handleAccountCollated(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	items := make([]collatedItem, 0, limit)
+	nextID := int64(0)
 	if policy.Enabled {
-		rows, err := s.pool.Query(r.Context(), `SELECT o.id,o.nas_relative_path,o.size_bytes,o.sha256 `+collatedEligibleSQL+collatedNotBackedOffSQL+`
-			ORDER BY h.local_date,h.delivery_hour,h.recording_id,o.part,o.id LIMIT $2`, connectionID, limit)
-		if err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list collated outputs: %v", err))
+		var raw []byte
+		if err := s.pool.QueryRow(ctx, collatedFeedSQL, connectionID, afterID, limit).Scan(&raw, &nextID); err != nil {
+			util.WriteError(w, 503, "collated feed unavailable; retryable")
 			return
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var item collatedItem
-			if err := rows.Scan(&item.OutputID, &item.NASRelativePath, &item.SizeBytes, &item.SHA256); err != nil {
-				util.WriteError(w, http.StatusInternalServerError, "read collated outputs")
-				return
-			}
+		if err := json.Unmarshal(raw, &items); err != nil {
+			util.WriteError(w, 500, "read collated outputs")
+			return
+		}
+		if len(items) == limit {
+			nextID = items[len(items)-1].OutputID
+		}
+		valid := items[:0]
+		for _, item := range items {
 			if !validCollatedNASPath(item.NASRelativePath) {
-				// A contract violation is a collation bug; never hand the NAS a path it must refuse.
 				log.Printf("collated output %d violates the NAS path contract; withheld", item.OutputID)
 				continue
 			}
 			item.DownloadPath = fmt.Sprintf("/api/v1/account/collated/%d/download", item.OutputID)
-			items = append(items, item)
+			valid = append(valid, item)
 		}
-		if err := rows.Err(); err != nil {
-			util.WriteError(w, http.StatusInternalServerError, "read collated outputs")
-			return
-		}
+		items = valid
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"policy": policy, "items": items})
+	util.WriteJSON(w, 200, map[string]any{"policy": policy, "items": items, "next_after_id": nextID})
 }
 
 // handleAccountCollatedDownload presigns the exact R2 object of one eligible

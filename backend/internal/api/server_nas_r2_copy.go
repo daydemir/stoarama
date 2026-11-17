@@ -32,6 +32,46 @@ const (
 	NASR2VerifyExisting NASR2CopyMode = "verify_existing"
 )
 
+// The Python control transport waits 2s after sending. Start before auth and
+// delivery fencing; leave 500ms for the response and network. One budget covers
+// all retries, pool acquisition, source rechecks, R2 HEAD and commit.
+const nasR2CopyControlBudget = 1500 * time.Millisecond
+
+func nasR2CopyDeadline(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/account/connections/r2-copy/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), nasR2CopyControlBudget)
+		defer cancel()
+		out := &nasDeliveryResponse{header: make(http.Header)}
+		next.ServeHTTP(out, r.WithContext(ctx))
+		if ctx.Err() != nil {
+			w.Header().Set("Retry-After", "1")
+			util.WriteError(w, 503, "copy control deadline; retryable")
+			return
+		}
+		for k, v := range out.header {
+			w.Header()[k] = v
+		}
+		if out.status != 0 {
+			w.WriteHeader(out.status)
+		}
+		_, _ = w.Write(out.body.Bytes())
+	})
+}
+
+var errNASR2CopyMaintenance = errors.New("copy yields to maintenance")
+
+func nasR2CopyReadyError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errNASR2CopyMaintenance) {
+		util.WriteError(w, 409, errNASR2CopyMaintenance.Error())
+		return
+	}
+	util.WriteError(w, 503, "copy maintenance check unavailable; retryable")
+}
+
 type NASR2CopyKind string
 
 const (
@@ -178,7 +218,7 @@ func nasR2CopyReady(ctx context.Context, tx pgx.Tx) error {
 		return err
 	}
 	if busy {
-		return errors.New("copy yields to maintenance")
+		return errNASR2CopyMaintenance
 	}
 	return nil
 }
@@ -218,7 +258,7 @@ func (s *Server) nasR2CopyPrepare(w http.ResponseWriter, r *http.Request, cid in
 	}
 	defer tx.Rollback(ctx)
 	if err = nasR2CopyReady(ctx, tx); err != nil {
-		util.WriteError(w, 409, "copy yields to maintenance")
+		nasR2CopyReadyError(w, err)
 		return task, nil, "", false
 	}
 	var active int
@@ -326,7 +366,7 @@ func (s *Server) nasR2CopyLeaseAttempt(w http.ResponseWriter, r *http.Request, c
 		return false
 	}
 	if err = nasR2CopyReady(ctx, tx); err != nil {
-		util.WriteError(w, 409, "copy yields to maintenance")
+		nasR2CopyReadyError(w, err)
 		return false
 	}
 	var active int
@@ -414,19 +454,35 @@ func (s *Server) nasR2CopyActive(w http.ResponseWriter, r *http.Request, purpose
 
 	if err = nasR2CopyReady(ctx, tx); err != nil {
 		fail()
-		util.WriteError(w, 409, "copy yields to maintenance")
+		nasR2CopyReadyError(w, err)
 		return nil, t, version, req, false
 	}
 	var data []byte
 	err = tx.QueryRow(ctx, `SELECT id,item,policy_sha256,etag,coalesce(version_id,''),work_mode FROM nas_r2_copy_items WHERE id=$1 AND connection_id=13 AND state IN ('leased','refresh_leased') AND lease_token=$2 AND lease_expires_at>clock_timestamp() FOR UPDATE`, id, req.Token).Scan(&t.ID, &data, &t.PolicySHA256, &t.ETag, &version, &t.WorkMode)
+
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		fail()
+		util.WriteError(w, 503, "copy lease lookup unavailable; retryable")
+		return nil, t, version, req, false
+	}
+
 	policy, _, pe := Keep28Policy()
-	if err != nil || json.Unmarshal(data, &t.Item) != nil || pe != nil || policy != t.PolicySHA256 {
+	if pe != nil {
+		fail()
+		util.WriteError(w, 503, "copy policy unavailable; retryable")
+		return nil, t, version, req, false
+	}
+	if err != nil || json.Unmarshal(data, &t.Item) != nil || policy != t.PolicySHA256 {
 		fail()
 		util.WriteError(w, 409, "copy lease or policy expired")
 		return nil, t, version, req, false
 	}
 	if t.Clip, err = LoadNASR2CopySource(ctx, tx, t.Item); err != nil {
 		fail()
+		if !errors.Is(err, errNASR2CopySourceIdentity) {
+			util.WriteError(w, 503, "copy source lookup unavailable; retryable")
+			return nil, t, version, req, false
+		}
 		util.WriteError(w, 409, "copy source changed")
 		return nil, t, version, req, false
 	}

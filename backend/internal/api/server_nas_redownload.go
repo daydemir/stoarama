@@ -140,7 +140,7 @@ func (s *Server) handleAccountConnectionRedownload(w http.ResponseWriter, r *htt
 const nasRedownloadSQL = `
 SELECT coalesce(r.stream_id,0),coalesce(c.bucket,''),coalesce(c.object_key,''),lower(coalesce(c.sha256,'')),
  c.size_bytes,c.display_path,c.clip_start_at,c.clip_end_at,coalesce(nullif(s.local_timezone,''),r.cron_timezone,''),c.purged_at IS NOT NULL,
- (EXISTS(SELECT 1 FROM nas_cleanup_reserved_files f WHERE f.kind='raw' AND f.source_id=c.id)
+ (nas_cleanup_file_reserved('raw',c.id)
  OR EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id
    WHERE h.clip_id=c.id AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued)))
  OR EXISTS(SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='raw' AND x.source_id=c.id)

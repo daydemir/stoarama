@@ -497,3 +497,59 @@ any other writer category. It does not delete R2/NAS media, change the immutable
 fence, release recovery/delivery/reference holds, or prove global writer drain.
 The ordinary diagnostic still reports every remaining blocker honestly. No
 production cancellation has been performed by this implementation.
+
+### COPY source lookup and collated paging rollout (0205–0206)
+
+The COPY lease validates a source before HEAD and again under admission. The old
+reservation view expands every cleanup manifest for each lookup; 1,438 plans
+(86 MB of JSON) cost 923 ms per source check on basic_1gb. The new lookup first
+uses a GIN index of immutable normalized `(kind, source_id)` keys, then applies
+the existing ordinal-specific reservation rule. Source/recovery holds, missing
+item vetoes, permanent issued-item protection and the old reservation view remain
+in force. No plan or item is rewritten.
+
+The original collated feed exceeded a 30-second read-only EXPLAIN ANALYZE budget.
+The paged query took 291 ms on the first 1,000 candidates and 115 ms near the tail
+of the same production catalog. These are DB execution times, not HTTP timings.
+The new reservation index is deliberately **not** provisioned during read-only
+production diagnosis; its production timing must be verified during the assigned
+release slot. Local tests compare the indexed predicate with the old view.
+
+Release sequence, to be executed only by the assigned controller:
+
+1. Keep the existing runner STOP and maintenance fence under their owner's
+   control. Prepare and verify the `r2-copy-v6` client artifact but do not start it.
+   Older clients reject the added collated cursor field, so coordinate this
+   backend/client release. COPY's two-second transport budget is unchanged.
+2. Apply only migration `0205_nas_cleanup_manifest_keys.sql` through the migration
+   CLI using a staged migration directory containing that file. It creates the
+   immutable projection independently and records it in `schema_migrations`.
+3. Outside a transaction, precreate the index using an operator DB session:
+
+   ```sql
+   CREATE INDEX CONCURRENTLY nas_cleanup_manifest_keys_idx
+     ON nas_cleanup_plans USING gin(nas_cleanup_manifest_keys(manifest));
+   ```
+
+   Do not replace the projection function beneath an existing index. Migration
+   0206 rejects mismatched function contents and missing, invalid or differently
+   defined indexes; inspect a failed concurrent build before any remedial action.
+4. Apply `0206_nas_cleanup_reservation_lookup.sql`, then deploy the reviewed API
+   and roll the prepared v6 client in the controller's assigned slot. The API
+   budgets every COPY control at 1.5 seconds, starting before authentication and
+   delivery fencing; exhausted budgets return retryable 503. Admission still
+   rechecks source identity and serializes grants with active renewals.
+5. The controller performs its own authorized release/fence sequence, then
+   compares two samples of this read-only query (for example 60 seconds apart):
+
+   ```sql
+   SELECT clock_timestamp() AS sampled_at, state, count(*) AS items,
+          sum(attempts) AS attempts, sum(downloaded_bytes) AS downloaded_bytes,
+          sum(committed_bytes) AS committed_bytes, max(updated_at) AS latest_update
+   FROM nas_r2_copy_items WHERE connection_id=13 GROUP BY state ORDER BY state;
+   ```
+
+   Require `downloaded_bytes` or `committed_bytes` to increase, followed by verified
+   rows; a lease attempt alone is insufficient. Keep inventory mismatch and
+   unverified recovery problem counts at zero. An unexpected mismatch stops the
+   release; uncertain or held cleanup items never become retry candidates.

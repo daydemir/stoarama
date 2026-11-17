@@ -52,6 +52,7 @@ class CollatedDownloadTests(unittest.TestCase):
         self.runtime.lock = threading.Lock()
         self.runtime.capacity_reserved_bytes = 0
         self.runtime.capacity_blocked = False
+        self.runtime.collated_after_id = 0
         self.requests = []
         self.acks = []
         self.errors = []
@@ -63,7 +64,8 @@ class CollatedDownloadTests(unittest.TestCase):
         def request_json(cfg, method, path, base=None, body=None, **_):
             if path.startswith("/account/collated?"):
                 return {"policy": policy or {"enabled": True, "download_bytes_per_sec": 1 << 30, "download_parallel": 2},
-                        "items": items if items is not None else [dict(self.item)]}
+                        "items": items if items is not None else [dict(self.item)],
+                        "next_after_id": max((i["output_id"] for i in (items if items is not None else [self.item])), default=0)}
             if path.startswith("/api/v1/account/collated/") and path.endswith("/download"):
                 return {"url": "https://r2.test/obj", "etag": "e1", "if_match": '"e1"',
                         "size_bytes": self.item["size_bytes"], "sha256": self.item["sha256"], "expires_in_sec": 3600}
@@ -82,10 +84,29 @@ class CollatedDownloadTests(unittest.TestCase):
         return Response(self.body, start, len(self.body))
 
     def drain(self, **kwargs):
+        self.runtime.collated_after_id = 0
         with mock.patch.object(pull, "request_json", side_effect=self.fake_request_json(**kwargs)), \
                 mock.patch.object(pull, "open_joined_url", side_effect=self.fake_open), \
                 mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**13, "free_bytes": 10**13}):
             return pull.drain_collated(self.cfg, self.runtime, threading.Event())
+
+    def test_cursor_advances_empty_pages_and_revisits_after_exhaustion(self):
+        policy = {"enabled": True, "download_bytes_per_sec": 1 << 20, "download_parallel": 1}
+        pages = [{"policy": policy, "items": [], "next_after_id": n} for n in (1000, 2000, 0, 1000)]
+        with mock.patch.object(pull, "request_json", side_effect=pages) as request:
+            for expected in (1000, 2000, 0, 1000):
+                self.assertFalse(pull.drain_collated(self.cfg, self.runtime, threading.Event()))
+                self.assertEqual(self.runtime.collated_after_id, expected)
+        self.assertEqual([call.args[2].split("after_id=")[1] for call in request.call_args_list], ["0", "1000", "2000", "0"])
+
+    def test_cursor_rejects_nonforward_or_wrong_type(self):
+        policy = {"enabled": True, "download_bytes_per_sec": 1 << 20, "download_parallel": 1}
+        self.runtime.collated_after_id = 1000
+        for cursor in (True, -1, 1000, 999, "2000"):
+            with mock.patch.object(pull, "request_json", return_value={"policy": policy, "items": [], "next_after_id": cursor}):
+                with self.assertRaises(RuntimeError):
+                    pull.drain_collated(self.cfg, self.runtime, threading.Event())
+            self.assertEqual(self.runtime.collated_after_id, 1000)
 
     def test_contract_validation(self):
         pull.valid_collated_relative_path(REL)
