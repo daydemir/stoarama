@@ -702,7 +702,7 @@ type connectionHeartbeatRequest struct {
 }
 
 type connectionHeartbeatResponse struct {
-	StorageChallengeNonce    string `json:"storage_challenge_nonce"`
+	StorageChallengeNonce    string `json:"storage_challenge_nonce,omitempty"`
 	ListingEnabled           bool   `json:"listing_enabled"`
 	StitchProofTaskID        int    `json:"stitch_proof_task_id,omitempty"`
 	StitchProofActivationID  string `json:"stitch_proof_activation_id,omitempty"`
@@ -1200,8 +1200,14 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		return
 	}
 	proofMode, proofActivation := stitchProofActivation(s.cfg.NASStitchProofTaskID, connectionID, req.ClientVersion, s.cfg.NASStitchProofActivationID)
+	// Legacy joined/proof readers reject unknown control fields. V5 consumes
+	// this private token before passing the response to that unchanged reader.
+	responseNonce := ""
+	if req.ClientVersion == NASStorageBudgetClientVersion {
+		responseNonce = storageNonce
+	}
 	util.WriteJSON(w, http.StatusOK, connectionHeartbeatResponse{
-		StorageChallengeNonce:   storageNonce,
+		StorageChallengeNonce:   responseNonce,
 		ListingEnabled:          connectionID == 13 && listingEnabled,
 		StitchProofTaskID:       proofMode,
 		StitchProofActivationID: proofActivation,

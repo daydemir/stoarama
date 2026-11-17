@@ -35,7 +35,9 @@ It needs no publication ledger, completion-label inference or sample timestamp.
 
 Budget freshness is proven on the database clock, independent of network delay
 or client lifetime. Every successful heartbeat stores a new random 64-hex nonce
-and its server issuance time, returned as `storage_challenge_nonce`. The v5 client
+and its server issuance time. Only exact v5 responses expose the private
+`storage_challenge_nonce`; legacy joined/proof envelopes omit it entirely.
+V5 consumes it before passing the response to the unchanged strict control parser. The v5 client
 consumes that nonce before the next actual storage attempt, samples physically
 after receiving it, and echoes `storage.challenge_nonce`. Without a nonce it
 still sends fresh display-only storage; no budget is granted for that cycle.

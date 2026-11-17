@@ -48,8 +48,12 @@ func storageHeartbeat(t *testing.T, s *Server, version string, sample *connectio
 		t.Fatal(err)
 	}
 	nonce := response.StorageChallengeNonce
-	if decoded, err := hex.DecodeString(nonce); err != nil || len(decoded) != 32 {
-		t.Fatal("invalid challenge shape")
+	if version == NASStorageBudgetClientVersion {
+		if decoded, err := hex.DecodeString(nonce); err != nil || len(decoded) != 32 {
+			t.Fatal("invalid v5 challenge shape")
+		}
+	} else if nonce != "" || bytes.Contains(rec.Body.Bytes(), []byte("storage_challenge_nonce")) {
+		t.Fatal("private v5 field leaked into legacy heartbeat contract")
 	}
 	return nonce
 }
