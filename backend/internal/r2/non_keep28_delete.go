@@ -45,7 +45,7 @@ type nonKeep28Transport struct {
 }
 
 func (t *nonKeep28Transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.Method != http.MethodDelete || req.URL.Path != "/"+t.bucket+"/"+t.key || req.URL.RawQuery != "" || !t.attempted.CompareAndSwap(false, true) {
+	if req.Method != http.MethodDelete || req.URL.Path != "/"+t.bucket+"/"+t.key || req.URL.RawQuery != "x-id=DeleteObject" || !t.attempted.CompareAndSwap(false, true) {
 		return nil, errors.New("non-keep28 transport permits one exact DELETE")
 	}
 	if err := t.guard.CheckNonKeep28Delete(req.Context(), t.bucket, t.endpoint, t.key); err != nil {
