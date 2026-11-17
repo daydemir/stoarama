@@ -18,6 +18,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
     parser.add_argument("--ca-file")
+    parser.add_argument("--connect-timeout", type=float, default=15)
+    parser.add_argument("--sequential", action="store_true")
     parser.add_argument("--timeout", type=float, default=2)
     args = parser.parse_args()
     url = urllib.parse.urlsplit(args.url)
@@ -31,6 +33,7 @@ def main():
     spec = importlib.util.spec_from_file_location("copy_fixture_pull", Path(__file__).with_name("stoarama_pull.py"))
     pull = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(pull)
+    pull.R2_COPY_CONNECT_TIMEOUT = args.connect_timeout
     pull.CLIENT_VERSION = "r2-copy-v3"
     pull.USER_AGENT = "stoarama-nas-pull/" + pull.CLIENT_VERSION
     if args.ca_file:
@@ -67,9 +70,14 @@ def main():
             except pull.R2CopyHold as error:
                 return {"ok": False, "status": -1, "error": type(error).__name__}
     with contextlib.redirect_stdout(io.StringIO()):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(requests)) as pool:
-            futures = [pool.submit(run, i, request) for i, request in enumerate(requests)]
-            results = [future.result() for future in futures]
+        if args.sequential:
+            with pull.R2CopyControl(cfg, stop, 0) as control:
+                results = [dict(ok=True, status=200, task_id=None, active=control.request_json(
+                    pull.R2CopyControlOperation(req["operation"]), req["path"], body=req.get("body"), timeout=args.timeout).get("active")) for req in requests]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(requests)) as pool:
+                futures = [pool.submit(run, i, request) for i, request in enumerate(requests)]
+                results = [future.result() for future in futures]
     lines, dropped = pull.CLIENT_LOG_RING.since(0)
     print(json.dumps({"results": results, "timings": [entry["message"] for entry in lines],
                       "dropped": dropped, "children": len(children),
