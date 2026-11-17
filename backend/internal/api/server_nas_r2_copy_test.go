@@ -105,11 +105,23 @@ func TestNASR2CopyDefaultOffAndInventory(t *testing.T) {
 		URL     string            `json:"url"`
 		Headers map[string]string `json:"headers"`
 		Length  int64             `json:"length"`
+		RangeID string            `json:"range_id"`
 	}
 	if err := json.Unmarshal(out.Body.Bytes(), &grant); err != nil || grant.Length != i.SizeBytes || grant.Headers["Range"] != fmt.Sprintf("bytes=0-%d", i.SizeBytes-1) || grant.Headers["If-Match"] == "" {
 		t.Fatalf("grant %s %v", out.Body, err)
 	}
 
+	completed := req
+	completed.RangeID = grant.RangeID
+	if out := copyCall(f, "checkpoint", task.ID, completed); out.Code != 200 {
+		t.Fatalf("completion %d %s", out.Code, out.Body)
+	}
+	if out := copyCall(f, "checkpoint", task.ID, completed); out.Code != 409 {
+		t.Fatal("range completion counted twice")
+	}
+	req.Completion = NASR2CopyDownloaded
+	req.DownloadedBytes = i.SizeBytes
+	req.CommittedBytes = i.SizeBytes
 	if out := copyCall(f, "result", task.ID, req); out.Code != 409 {
 		t.Fatal("result without inventory")
 	}
@@ -124,6 +136,11 @@ func TestNASR2CopyDefaultOffAndInventory(t *testing.T) {
 	f.pool.QueryRow(f.ctx, `SELECT state FROM nas_r2_copy_items WHERE id=$1`, task.ID).Scan(&state)
 	if state != "verified" {
 		t.Fatal(state)
+	}
+	var completion string
+	var downloaded, committed int64
+	if err := f.pool.QueryRow(f.ctx, `SELECT completion,downloaded_bytes,committed_bytes FROM nas_r2_copy_items WHERE id=$1`, task.ID).Scan(&completion, &downloaded, &committed); err != nil || completion != "downloaded" || downloaded != i.SizeBytes || committed != i.SizeBytes {
+		t.Fatalf("durable counters %s %d %d %v", completion, downloaded, committed, err)
 	}
 	f.bucket.mu.Lock()
 	defer f.bucket.mu.Unlock()

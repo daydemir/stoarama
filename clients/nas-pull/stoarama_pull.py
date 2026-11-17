@@ -52844,6 +52844,10 @@ def r2_copy_range(cfg, task, offset, length, guard, fd, digest):
     if (status != 206 or response_headers.get("Content-Range") != expected
             or normalized_etag(response_headers.get("ETag")) != normalized_etag(task["etag"]) or len(data) != length):
         raise R2CopyHold("copy range identity or length changed")
+    # This is actual received media, independent of disk or completion-report
+    # success. A resumable partial must never make these bytes disappear.
+    with R2_COPY_TELEMETRY.lock:
+        R2_COPY_TELEMETRY.downloaded += len(data)
     for at in range(0, length, R2_COPY_CHUNK):
         guard.disk()
         block = data[at:at + R2_COPY_CHUNK]
@@ -52957,8 +52961,6 @@ def _execute_r2_copy(cfg, runtime, inventory, stop, task, control):
                             runtime.release_storage_reservation(length)
                     offset += length
                     downloaded += length
-                    with R2_COPY_TELEMETRY.lock:
-                        R2_COPY_TELEMETRY.downloaded += length
                 if digest.hexdigest() != item["sha256"]:
                     raise R2CopyBlocked(R2CopyBlockReason.CHECKSUM)
                 # A complete resumed partial may skip the range loop. Its

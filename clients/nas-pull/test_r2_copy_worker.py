@@ -261,6 +261,26 @@ class R2CopyWorkerTests(unittest.TestCase):
             self.run_copy()
         self.assertEqual(self.calls[-1][1]["body"]["token"], "b" * 48)
 
+    def test_actual_download_bytes_survive_failed_completion_and_partial_resume(self):
+        original = self.control_client.request_json
+        def control(operation, path, **kw):
+            if path.endswith("/checkpoint") and kw["body"].get("range_id"):
+                raise pull.R2CopyHold("copy HTTP total deadline")
+            return original(operation, path, **kw)
+        headers = {"Content-Range": "bytes 0-%d/%d" % (len(self.body)-1, len(self.body)), "ETag": self.task["etag"]}
+        with mock.patch.object(pull, "r2_copy_http", return_value=(206, headers, self.body)), \
+                mock.patch.object(self.control_client, "request_json", side_effect=control):
+            with self.assertRaises(pull.R2CopyHold):
+                self.run_copy()
+        partial = next((self.cfg.output_dir / "p").glob(".*.part"))
+        self.assertEqual(partial.read_bytes(), self.body)
+        self.assertEqual(pull.r2_copy_status(self.inventory)["downloaded_bytes"], len(self.body))
+        with mock.patch.object(pull, "r2_copy_http", side_effect=AssertionError("partial was downloaded twice")):
+            self.run_copy()
+        status = pull.r2_copy_status(self.inventory)
+        self.assertEqual(status["downloaded_bytes"], len(self.body))
+        self.assertEqual(status["committed_bytes"], len(self.body))
+
     def test_resource_hold_does_not_block_or_latch(self):
         with mock.patch.object(pull, "r2_copy_resources", side_effect=pull.R2CopyHold("copy memory headroom")):
             with self.assertRaises(pull.R2CopyHold):
