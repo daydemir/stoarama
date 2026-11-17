@@ -91,6 +91,24 @@ class R2CopyWorkerTests(unittest.TestCase):
         self.assertEqual(after["verified_in_place"], before["verified_in_place"])
         self.assertEqual(after["refresh_verified_in_place"], dict(objects=2, bytes=2 * len(self.body)))
 
+    def test_verify_only_preserves_media_partial_and_resource_holds(self):
+        self.task["work_mode"] = "verify_existing"
+        final = self.cfg.output_dir / self.item["relative_path"]
+        final.parent.mkdir()
+        final.write_bytes(self.body)
+        partial = final.parent / ".copy.mp4.r2-copy-901.part"
+        partial.write_bytes(b"preserve partial")
+        with mock.patch.object(pull, "r2_copy_resources", side_effect=pull.R2CopyHold("copy memory headroom")):
+            with self.assertRaises(pull.R2CopyHold):
+                self.run_copy()
+        self.assertEqual(partial.read_bytes(), b"preserve partial")
+        self.assertEqual(final.read_bytes(), self.body)
+        self.assertFalse(self.calls)
+        with mock.patch.object(pull, "r2_copy_range", side_effect=AssertionError("download")):
+            self.run_copy()
+        self.assertEqual(partial.read_bytes(), b"preserve partial")
+        self.assertEqual(final.read_bytes(), self.body)
+
     def test_resume_after_interruption_publishes_exact_inventory_once_verified(self):
         def interrupted(cfg, task, offset, length, guard, fd, digest):
             os.write(fd, self.body[:100])

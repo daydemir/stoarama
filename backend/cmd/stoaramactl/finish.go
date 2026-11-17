@@ -95,6 +95,9 @@ const (
 )
 
 type finishStatus struct {
+	RefreshAdmittedItems        int              `json:"refresh_admitted_items"`
+	RefreshHeldItems            int              `json:"refresh_held_items"`
+	RefreshHold                 finishLateHold   `json:"refresh_hold_reason,omitempty"`
 	NASStorageBudgetAt          *time.Time       `json:"nas_storage_budget_at,omitempty"`
 	NASSpaceClientVersion       string           `json:"nas_storage_client_version"`
 	ImportedHistoricalInventory int              `json:"imported_historical_inventory"`
@@ -358,18 +361,18 @@ func finishManifest(dir string, items []api.NASR2CopyItem) (nasCopyHeader, strin
 	return parsed, digest, validated, err
 }
 func finishDepth(ctx context.Context, pool *pgxpool.Pool, status *finishStatus) error {
-	return pool.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE connection_id=13 AND kind='raw' AND state IN ('pending','leased')`).Scan(&status.QueueDepth)
+	return pool.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE connection_id=13 AND kind='raw' AND state IN ('pending','leased','refresh_pending','refresh_leased')`).Scan(&status.QueueDepth)
 }
 
 // Current storage evidence is independent of historical hold counters.
 // Full admission debits do not depend on potentially ambiguous completion labels.
 // Inclusive cutoff retains a terminal write completed exactly T ago.
-const finishLateDebitsSQL = `SELECT coalesce(sum((item->>'size_bytes')::bigint),0) FROM nas_r2_copy_items WHERE connection_id=13 AND kind='raw' AND (state IN ('pending','leased') OR (state IN ('verified','blocked') AND updated_at >= $1))`
+const finishLateDebitsSQL = `SELECT coalesce(sum((item->>'size_bytes')::bigint),0) FROM nas_r2_copy_items WHERE connection_id=13 AND kind='raw' AND (state IN ('pending','leased','refresh_pending','refresh_leased') OR (state IN ('verified','blocked') AND updated_at >= $1))`
 
 func finishProofFresh(asOf, issued time.Time, maxAge time.Duration) bool {
 	return !issued.IsZero() && !issued.After(asOf) && asOf.Sub(issued) <= maxAge
 }
-func finishCleanupValve(ctx context.Context, pool *pgxpool.Pool, status *finishStatus) error {
+func finishCleanupValve(ctx context.Context, pool r2RetireQuerier, status *finishStatus) error {
 	status.CleanupShouldRun = false
 	if err := pool.QueryRow(ctx, `SELECT nas_storage_free_bytes,nas_storage_reported_at,nas_storage_client_version,nas_storage_budget_at,clock_timestamp() FROM connections WHERE id=13`).Scan(&status.NASFreeBytes, &status.NASSpaceReportedAt, &status.NASSpaceClientVersion, &status.NASStorageBudgetAt, &status.NASSpaceCheckedAt); err != nil {
 		return err
@@ -397,7 +400,10 @@ func finishCleanupValve(ctx context.Context, pool *pgxpool.Pool, status *finishS
 	}
 	return nil
 }
-func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath string) (status finishStatus, err error) {
+func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath string) (finishStatus, error) {
+	return finishTickWithRefresh(ctx, pool, safetyPath, copyPath, finishRefreshOptions{})
+}
+func finishTickWithRefresh(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath string, refresh finishRefreshOptions) (status finishStatus, err error) {
 	status = finishStatus{Schema: "stoarama.finish-status.v1", CleanupReason: "copy_not_holding_on_free_space"}
 	defer func() {
 		status.UpdatedAt = time.Now().UTC()
@@ -435,6 +441,7 @@ func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath st
 		return status, finishImport
 	}
 	defer os.RemoveAll(dir)
+	refreshFed := false
 	for {
 		s, c, e := finishReadEvidence(safetyPath, copyPath)
 		status.Copy = c
@@ -452,6 +459,25 @@ func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath st
 		}
 		if e = finishCleanupValve(ctx, pool, &status); e != nil {
 			return status, finishDatabase
+		}
+		if !refreshFed {
+			refreshFed = true
+			var refreshDepth int
+			if e = pool.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE connection_id=13 AND state IN ('refresh_pending','refresh_leased')`).Scan(&refreshDepth); e != nil {
+				return status, finishDatabase
+			}
+			slots := finishRefreshShare(int(status.QueueDepth), refreshDepth)
+			n, feedErr := feedKeep28Refresh(ctx, pool, refresh, slots, &status)
+			if feedErr != nil {
+				return status, feedErr
+			}
+			status.RefreshAdmittedItems = n
+			status.ImportedItems += n
+			if n > 0 {
+				if e = finishDepth(ctx, pool, &status); e != nil {
+					return status, finishDatabase
+				}
+			}
 		}
 		// At most 10k new rows per tick, even while workers consume the queue.
 		remaining := finishTarget - int(status.QueueDepth)
@@ -576,6 +602,9 @@ func runFinish(ctx context.Context, cfg config.Config, args []string) int {
 	safety := fs.String("safety", "", "fresh controller safety JSON")
 	copyStatus := fs.String("copy-status", "", "fresh nas-r2-copy status --json output (A1 required)")
 	out := fs.String("status", "", "atomic output JSON path")
+	refresh := finishRefreshOptions{}
+	fs.StringVar(&refresh.Picks, "refresh-picks", "", "B2 owner picks for optional verify-existing refresh")
+	fs.StringVar(&refresh.PicksSHA, "expected-refresh-picks-sha256", "", "pinned owner picks digest")
 	if len(args) == 0 || args[0] != "tick" || fs.Parse(args[1:]) != nil || fs.NArg() != 0 || *safety == "" || *copyStatus == "" || *out == "" {
 		fmt.Fprintln(os.Stderr, "usage: stoaramactl finish tick --safety FILE --copy-status FILE --status FILE")
 		return 2
@@ -588,7 +617,7 @@ func runFinish(ctx context.Context, cfg config.Config, args []string) int {
 		var pool *pgxpool.Pool
 		pool, err = pgxpool.NewWithConfig(ctx, pc)
 		if err == nil {
-			status, err = finishTick(ctx, pool, *safety, *copyStatus)
+			status, err = finishTickWithRefresh(ctx, pool, *safety, *copyStatus, refresh)
 			pool.Close()
 		}
 	}

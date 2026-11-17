@@ -159,9 +159,14 @@ const inverseRawTargetSQL = `SELECT c.id,coalesce(r.stream_id,0),c.size_bytes,lo
  coalesce(nullif(s.local_timezone,''),r.cron_timezone,'') FROM recording_clips c JOIN recordings r ON r.id=c.recording_id
  LEFT JOIN streams s ON s.id=r.stream_id WHERE c.bucket=$1 AND c.object_key=$2 AND c.purged_at IS NULL AND NOT EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.object_key=c.object_key) FOR UPDATE OF c FOR SHARE OF r`
 
+var errInverseRawIneligible = errors.New("raw target ineligible")
+
 func (a *inverseApplier) loadTarget(ctx context.Context, tx pgx.Tx, e inverseEntry) (inverseRawTarget, error) {
+	return loadInverseRawTarget(ctx, tx, a.store.Bucket(), a.protection, a.opts.Lane, e)
+}
+func loadInverseRawTarget(ctx context.Context, tx pgx.Tx, bucket string, protection inverseProtection, lane inverseLane, e inverseEntry) (inverseRawTarget, error) {
 	t := inverseRawTarget{}
-	rows, err := tx.Query(ctx, inverseRawTargetSQL, a.store.Bucket(), e.Key)
+	rows, err := tx.Query(ctx, inverseRawTargetSQL, bucket, e.Key)
 	if err != nil {
 		return t, err
 	}
@@ -177,31 +182,31 @@ func (a *inverseApplier) loadTarget(ctx context.Context, tx pgx.Tx, e inverseEnt
 		return t, err
 	}
 	if n != 1 || t.ID <= 0 || t.Size <= 0 || t.Size != e.SizeBytes || !r2RetireLowerHex64(t.SHA) || strings.Trim(t.ETag, `"`) == "" || strings.Trim(t.ETag, `"`) != strings.Trim(e.ETag, `"`) || !strings.HasPrefix(e.Key, "managed/") {
-		return t, errors.New("raw catalog identity absent, ambiguous or changed")
+		return t, fmt.Errorf("%w: raw catalog identity absent, ambiguous or changed", errInverseRawIneligible)
 	}
 	t.Identity.StreamID = t.StreamID
 	t.Identity.Path = t.Path
 	t.Identity.Kind = "raw"
 	// Use a copy: an old snapshot never becomes wire authority for current identity.
-	p := a.protection
+	p := protection
 	p.Identities = map[string][]inverseIdentity{e.Key: {t.Identity}}
 	p.Held = map[string]bool{}
 	p.Delivery = map[string]bool{}
 	want := inverseDeletable
-	if a.opts.Lane == inverseNASKeep28 {
+	if lane == inverseNASKeep28 {
 		want = inverseKeep28
 	}
 	if class, _ := p.classify(e.ObjectInfo); class != want {
-		return t, errors.New("target is no longer in the requested raw lane")
+		return t, fmt.Errorf("%w: target is no longer in the requested raw lane", errInverseRawIneligible)
 	}
-	if a.opts.Lane == inverseNASKeep28 {
+	if lane == inverseNASKeep28 {
 		var scoped bool
 		if err = tx.QueryRow(ctx, `SELECT r.account_id=47 AND EXISTS(SELECT 1 FROM connections WHERE id=13 AND account_id=47 AND kind='nas_pull') FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE c.id=$1`, t.ID).Scan(&scoped); err != nil {
 			return t, err
 		}
-		choice := a.protection.Picks.Choices[t.StreamID].Choice
+		choice := protection.Picks.Choices[t.StreamID].Choice
 		if !scoped || (choice != "none" && choice != "st" && choice != "keep") || r2RetireCheckUngatedPrefix(e.Key) != nil {
-			return t, errors.New("keep28 scope or owner choice is unknown")
+			return t, fmt.Errorf("%w: keep28 scope or owner choice is unknown", errInverseRawIneligible)
 		}
 	}
 	return t, nil

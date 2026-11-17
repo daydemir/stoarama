@@ -21,7 +21,9 @@ The existing four-worker importer can reorder insertion/lease IDs within a tier;
 selection and manifest order follow stream/ID, not a serial execution guarantee.
 There is no listing query or fallback. Inventory is only a priority hint; the
 worker still hashes and publishes fresh exact custody. Existing queue rows of
-every state are excluded; verified and blocked work is never requeued. Live
+every state are excluded from ordinary import; blocked work is never requeued.
+Verified work is unchanged except for the explicit bounded verify-only refresh
+lane described below. Live
 source validation, holds, destination ambiguity and queue equality stay in the
 existing exact-manifest importer. Partial imports resume idempotently. An advisory
 lock excludes concurrent feeders. Existing queue IDs/order are preserved.
@@ -238,3 +240,65 @@ also alerts and leaves the last CLI status age unchanged. State directory/lock f
 status reports `current_status_unavailable`, never a prior stop reason.
 Raw subprocess errors
 are suppressed to keep credential-bearing URLs out of logs/notifications.
+
+## Bounded keep28 custody refresh (PR2)
+
+The sole controller may enable the optional refresh lane after deploying migration
+0205, the new backend and capable NAS worker at its existing maintenance boundary:
+
+```sh
+"$STOARAMACTL" r2-inverse refresh on
+# Add these to the existing tick.py/controller installation:
+# --refresh-picks "$PICKS_FILE" --expected-refresh-picks-sha256 "$PICKS_SHA"
+```
+
+The default DB flag is off. Missing optional tick arguments preserve ordinary
+feeding. Pausing B2 uses `r2-inverse refresh off`; D admits no new refresh and the
+backend grants no new refresh leases. Existing guarded hashes may finish. Queued
+or expired-leased refresh work remains retryable when enabled later. At most the
+capped queue ages out; B2 independently refuses stale custody. There are no pacing
+windows, revocation/adoption journals or new proof protocols.
+
+This deliberately narrows “verified work is never requeued” only for exact,
+unblocked keep28 RAW in account47/connection13/bucket stoarama whose matching
+inventory expires within one hour. D allocates refresh at most half the current
+total deficit **before** ordinary fill. Ordinary keeps the other half, including
+odd spare slots and unused refresh capacity. Refresh is capped at5,000 outstanding
+rows inside the unchanged10,000 total; that is10m25s of B2's8/s canary throughput,
+below one consumer-hour. Each tick retains the existing100GB byte bound, admitting
+the complete64GiB COPY domain. A row too large for the remaining allowance is
+skipped so smaller following rows progress; it can fit a subsequent fresh batch.
+
+Fresh storage proof, full-file capacity debits, memory/cgroup/load/free-space and
+cleanup/stitching gates remain. KE streams/paths, delivery and dependency aliases,
+incidents/live holds, A1 blocked keys, ambiguity, collated, tool prefix and any
+retirement reservation/intent veto refresh. Exact key serialization handles both
+admission orders. Refresh changes no source identity, removes no intent, and
+publishes no freshness until the existing worker hashes stable media and proves
+its sidecar. Inventory replay preserves verified_at and cannot extend expiry past
+that timestamp+24h; B2 continues locking the exact complete proof through wire.
+
+DB work mode `verify_existing` uses `refresh_pending`/`refresh_leased`, which legacy
+lease and token SQL cannot select. Constraints prohibit ordinary pending/leased
+states and RANGE grant fields for that mode. A combined four-live-lease DB guard
+also covers old-server admissions. Ordinary shared-lock renewals do not upgrade
+locks. New-server dispatch alternates modes when both have work; ordinary FIFO
+is preserved. Old clients never get refresh tasks. On rollback, disable refresh
+and retain its DB guards/states; never reset them into ordinary copy. A new worker
+against an old server may hold on the unsupported capability field; rollback the
+worker together with the server for ordinary work. No download fallback exists.
+
+Verify-only workers open existing parents/media without creating either. Missing
+media is durably `verify_missing`; media partials are not recovered or removed,
+and no RANGE, download, quarantine or replacement occurs. Sidecar conflicts remain
+protected. Worker and CLI status expose refresh completion separately from first
+transfer throughput. Original completion, verified_at, downloaded/committed totals
+and cumulative attempts are retained across refreshes; `custody_refreshed_at` and
+`refresh_count` record successful refreshes. Recent-terminal full-file debits stay
+conservative even for a zero-download hash.
+
+The controller measures refresh queue age, actual hash rate and delay from fresh
+custody to B2 removal. Repeated hashing and imperfect timing are accepted bounded
+waste while enabled. No refresh counter or enable flag grants DELETE authority;
+B2 still checks exact fresh locked custody, policy/holds, HEAD7d, mature0198 fence,
+substantiated drain evidence, durable intent/ledger and its own single-use token.

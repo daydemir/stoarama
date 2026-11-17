@@ -51,6 +51,16 @@ INSERT INTO connections VALUES(13);`)
 	if _, err = pool.Exec(ctx, string(migration)); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = pool.Exec(ctx, `CREATE FUNCTION guard_r2_object_retirement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'r2 object retirements are append-only'; END $$`); err != nil {
+		t.Fatal(err)
+	}
+	migration, err = os.ReadFile("../../../infra/sql/migrations/0205_nas_r2_refresh.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, string(migration)); err != nil {
+		t.Fatal(err)
+	}
 	policy, windows, err := api.Keep28Policy()
 	if err != nil {
 		t.Fatal(err)

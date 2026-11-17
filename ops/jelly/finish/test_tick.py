@@ -23,6 +23,8 @@ from pathlib import Path
 if sys.argv[1:]==['nas-r2-copy','status','--json']:
     print('{}')
 else:
+    assert sys.argv[sys.argv.index('--refresh-picks')+1].endswith('picks.json')
+    assert sys.argv[sys.argv.index('--expected-refresh-picks-sha256')+1]=='a'*64
     Path(sys.argv[sys.argv.index('--status')+1]).write_text('{"queue_depth":10000}')
 ''')
                 darma = root / 'darma'
@@ -30,7 +32,8 @@ else:
                 for executable in (collector, cli, darma):
                     executable.chmod(0o700)
                 result = subprocess.run([sys.executable, str(wrapper), '--cli', str(cli), '--state', str(root / 'state'),
-                                         '--safety-collector', str(collector), '--notify-agent', 'deniz'],
+                                         '--safety-collector', str(collector), '--notify-agent', 'deniz',
+                                         '--refresh-picks', str(root/'picks.json'), '--expected-refresh-picks-sha256', 'a'*64],
                                         env={**os.environ, 'PATH': str(root) + ':' + os.environ['PATH']}, capture_output=True)
                 self.assertEqual(result.returncode, 0 if success else 1)
                 self.assertNotIn(b'SECRET', result.stdout + result.stderr)

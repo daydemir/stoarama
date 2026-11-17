@@ -20,11 +20,11 @@ ALTER TABLE nas_r2_copy_items
   (work_mode='verify_existing' AND state NOT IN ('pending','leased') AND verified_at IS NOT NULL
    AND range_until IS NULL AND range_id IS NULL AND range_length=0)
  );
-CREATE INDEX nas_r2_refresh_queue ON nas_r2_copy_items(connection_id,custody_refreshed_at,id) WHERE state IN ('refresh_pending','refresh_leased');
+CREATE INDEX nas_r2_copy_active ON nas_r2_copy_items(connection_id,state,lease_expires_at) WHERE state IN ('pending','leased','refresh_pending','refresh_leased');
 CREATE FUNCTION guard_nas_r2_refresh_history() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
  IF OLD.work_mode='verify_existing' THEN
   IF TG_OP='DELETE' THEN RAISE EXCEPTION 'refresh history is retained'; END IF;
-  IF NEW.work_mode<>OLD.work_mode OR NEW.verified_at IS DISTINCT FROM OLD.verified_at
+  IF NEW.work_mode<>OLD.work_mode OR NEW.item<>OLD.item OR NEW.verified_at IS DISTINCT FROM OLD.verified_at
    OR NEW.completion<>OLD.completion OR NEW.downloaded_bytes<>OLD.downloaded_bytes
    OR NEW.committed_bytes<>OLD.committed_bytes OR NEW.attempts<OLD.attempts
    OR NEW.refresh_count<OLD.refresh_count THEN RAISE EXCEPTION 'refresh preserves original completion and byte history'; END IF;
