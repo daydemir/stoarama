@@ -108,15 +108,20 @@ CREATE TRIGGER r2_inverse_copy_insert_isolation BEFORE INSERT ON nas_r2_copy_ite
 CREATE TRIGGER r2_inverse_reservation_insert_isolation BEFORE INSERT ON r2_retirement_reservations
  FOR EACH STATEMENT EXECUTE FUNCTION require_r2_inverse_copy_read_committed();
 CREATE FUNCTION fence_r2_inverse_copy_key() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
- IF current_setting('transaction_isolation')<>'read committed' THEN
-  RAISE EXCEPTION 'R2 COPY protection admission requires READ COMMITTED' USING ERRCODE='55000'; END IF;
  IF NEW.item->>'bucket' IS DISTINCT FROM OLD.item->>'bucket'
  OR NEW.item->>'object_key' IS DISTINCT FROM OLD.item->>'object_key' THEN
   RAISE EXCEPTION 'COPY R2 identity is immutable'; END IF;
- PERFORM lock_nas_r2_copy_key(NEW.item->>'bucket',NEW.item->>'object_key');
- IF (NEW.state<>'verified' OR NEW.blocked_reason<>'')
- AND OLD.state='verified' AND OLD.blocked_reason=''
- AND EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE bucket=NEW.item->>'bucket' AND object_key=NEW.item->>'object_key') THEN
+ -- Progress already has protection and owns the COPY row. Do not invert the
+ -- importer's key-before-row order for progress or unchanged verified rows.
+ IF NOT (OLD.state='verified' AND OLD.blocked_reason=''
+  AND (NEW.state<>'verified' OR NEW.blocked_reason<>'')) THEN RETURN NEW; END IF;
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'R2 COPY protection admission requires READ COMMITTED' USING ERRCODE='55000'; END IF;
+ -- New protection is row-first too: fail fast rather than wait for an importer
+ -- or B1. The hash is exactly the key used by0200's lock_nas_r2_copy_key.
+ IF NOT pg_try_advisory_xact_lock(hashtextextended(jsonb_build_array(NEW.item->>'bucket',NEW.item->>'object_key')::text,7343226011200)) THEN
+  RAISE EXCEPTION 'COPY protection key is busy' USING ERRCODE='55P03'; END IF;
+ IF EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE bucket=NEW.item->>'bucket' AND object_key=NEW.item->>'object_key') THEN
   RAISE EXCEPTION 'R2 retirement reservation forbids COPY protection adoption'; END IF;
  RETURN NEW;
 END $$;

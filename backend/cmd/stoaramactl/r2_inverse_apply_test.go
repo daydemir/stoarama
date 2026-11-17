@@ -772,6 +772,91 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			}
 		}
 	})
+	t.Run("COPY_progress_with_real_reimport_has_no_lock_cycle", func(t *testing.T) {
+		for _, transition := range []string{"pending_to_leased", "leased_to_verified", "leased_to_blocked", "verified_noop", "new_protection"} {
+			t.Run(transition, func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				exec(`UPDATE recording_clips SET clip_start_at=$2,clip_end_at=$3 WHERE object_key=$1`, e.Key, w.Start.Add(time.Hour), w.Start.Add(2*time.Hour))
+				i := api.NASR2CopyItem{Kind: api.NASR2CopyRaw, StreamID: 3, Bucket: "stoarama", ObjectKey: e.Key}
+				if err := pool.QueryRow(ctx, `SELECT id,recording_id,display_path,size_bytes,sha256,clip_start_at,clip_end_at FROM recording_clips WHERE object_key=$1`, e.Key).Scan(&i.SourceID, &i.RecordingID, &i.RelativePath, &i.SizeBytes, &i.SHA256, &i.StartAt, &i.EndAt); err != nil {
+					t.Fatal(err)
+				}
+				h := nasCopyHeader{PolicySHA256: policy}
+				if err := queueNASR2CopyItem(ctx, pool, h, strings.Repeat("a", 64), i, true); err != nil {
+					t.Fatal("initial real import", err)
+				}
+				initial, nextState := "pending", "leased"
+				switch transition {
+				case "leased_to_verified":
+					initial, nextState = "leased", "verified"
+				case "leased_to_blocked":
+					initial, nextState = "leased", "blocked"
+				case "verified_noop":
+					initial, nextState = "verified", "verified"
+				case "new_protection":
+					initial, nextState = "verified", "blocked"
+				}
+				exec(`UPDATE nas_r2_copy_items SET state=$2 WHERE source_id=$1`, i.SourceID, initial)
+				handler, err := api.BeginNASR2CopyTx(ctx, pool)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer handler.Rollback(ctx)
+				if _, err = handler.Exec(ctx, `SET LOCAL deadlock_timeout='50ms'`); err != nil {
+					t.Fatal(err)
+				}
+				if _, err = handler.Exec(ctx, `SELECT id FROM nas_r2_copy_items WHERE source_id=$1 FOR UPDATE`, i.SourceID); err != nil {
+					t.Fatal(err)
+				}
+				done := make(chan error, 1)
+				go func() { done <- queueNASR2CopyItem(ctx, pool, h, strings.Repeat("a", 64), i, true) }()
+				deadline := time.Now().Add(3 * time.Second)
+				for {
+					var waiting bool
+					if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE query LIKE 'INSERT INTO nas_r2_copy_items%' AND $1::integer=ANY(pg_blocking_pids(pid)))`, handler.Conn().PgConn().PID()).Scan(&waiting); err != nil {
+						t.Fatal(err)
+					}
+					if waiting {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("real reimport did not reach handler row")
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+				progress, cancel := context.WithTimeout(ctx, time.Second)
+				_, err = handler.Exec(progress, `UPDATE nas_r2_copy_items SET state=$2,blocked_reason=CASE WHEN $2='blocked' THEN 'checksum_mismatch' ELSE '' END WHERE source_id=$1`, i.SourceID, nextState)
+				cancel()
+				if transition == "new_protection" {
+					var pe *pgconn.PgError
+					if !errors.As(err, &pe) || pe.Code != "55P03" {
+						t.Fatal("new admission must fail fast behind importer", err)
+					}
+					handler.Rollback(ctx)
+				} else {
+					if err != nil {
+						t.Fatal("COPY progress deadlocked with real reimport", err)
+					}
+					if err = handler.Commit(ctx); err != nil {
+						t.Fatal(err)
+					}
+				}
+				select {
+				case err = <-done:
+					if err != nil {
+						t.Fatal("real reimport failed", err)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("reimport remained blocked")
+				}
+				if nextState == "leased" {
+					exec(`UPDATE nas_r2_copy_items SET state='verified' WHERE source_id=$1`, i.SourceID)
+				}
+			})
+		}
+	})
 	t.Run("pool_capacity_reserved_before_any_intent", func(t *testing.T) {
 		a, entries := build(4)
 		a.ledger.close()

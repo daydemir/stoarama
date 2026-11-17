@@ -126,6 +126,11 @@ global lock. New cleanup recovery admission instead locks raw clip rows in order
 and rejects a committed reservation; retired items cannot reactivate a hold.
 Output IDs and source-hold identities cannot be rebound.
 
+COPY reimport keeps its existing key-before-row order. Already-protected COPY
+progress and unchanged verified rows take no new key lock. A clean verified row
+gaining protection requires READ COMMITTED and tries the same key lock without
+waiting; a busy key returns 55P03, and a committed reservation vetoes adoption.
+
 The CLI pool has 20 connections. Workers default to 16 and may use at most the
 pool capacity minus two (18 here), retaining the session and independent issuance
 connections. Invalid capacity fails before any reservation or budget charge.
