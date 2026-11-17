@@ -41,7 +41,7 @@ func nasCleanupSupportsExecution(version string) bool {
 func nasCopySupportsVersion(version string) bool {
 	switch version {
 	case nasCleanupR2CopyClientVersion, "v85r-nas-proof-v1", nasCleanupProofClientVersion,
-		nasCleanupR2CopyControlClientVersion, nasCleanupItemTruthClientVersion:
+		nasCleanupR2CopyControlClientVersion, nasCleanupItemTruthClientVersion, nasCleanupFreshPermitClientVersion:
 		return true
 	default:
 		return false
