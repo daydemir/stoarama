@@ -196,6 +196,59 @@ type nasR2CopyTask struct {
 	PolicySHA256 string          `json:"policy_sha256"`
 }
 
+// Preparation holds only short database row locks. It commits before HEAD;
+// admission and maintenance must revalidate everything that can change.
+func (s *Server) nasR2CopyPrepare(w http.ResponseWriter, r *http.Request, cid int64) (nasR2CopyTask, []byte, NASR2CopyBlockReason, bool) {
+	var task nasR2CopyTask
+	var data []byte
+	ctx := r.Context()
+	tx, err := BeginNASR2CopyTx(ctx, s.pool)
+	if err != nil {
+		util.WriteError(w, 503, "copy database unavailable")
+		return task, nil, "", false
+	}
+	defer tx.Rollback(ctx)
+	if err = nasR2CopyReady(ctx, tx); err != nil {
+		util.WriteError(w, 409, "copy yields to maintenance")
+		return task, nil, "", false
+	}
+	var active int
+	if err = tx.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE connection_id=$1 AND state='leased' AND lease_expires_at>clock_timestamp()`, cid).Scan(&active); err != nil {
+		util.WriteError(w, 503, "copy lease unavailable")
+		return task, nil, "", false
+	}
+	if active >= NASR2CopyWorkers {
+		return task, nil, "", true
+	}
+	err = tx.QueryRow(ctx, `SELECT id,item,policy_sha256 FROM nas_r2_copy_items WHERE connection_id=$1 AND kind='raw' AND
+ (state='pending' OR (state='leased' AND lease_expires_at<clock_timestamp())) ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`, cid).Scan(&task.ID, &data, &task.PolicySHA256)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return task, nil, "", true
+	}
+	if err != nil || json.Unmarshal(data, &task.Item) != nil {
+		util.WriteError(w, 503, "copy queue unavailable")
+		return task, nil, "", false
+	}
+	policy, _, err := Keep28Policy()
+	if err != nil || policy != task.PolicySHA256 {
+		util.WriteError(w, 409, "copy policy changed")
+		return task, nil, "", false
+	}
+	reason := NASR2CopyBlockReason("")
+	if _, err = LoadNASR2CopySource(ctx, tx, task.Item); err != nil {
+		if !errors.Is(err, errNASR2CopySourceIdentity) {
+			util.WriteError(w, 503, "copy source lookup unavailable; retryable")
+			return task, nil, "", false
+		}
+		reason = NASR2CopySourceChanged
+	}
+	if err = tx.Commit(ctx); err != nil {
+		util.WriteError(w, 503, "copy preparation commit failed")
+		return task, nil, "", false
+	}
+	return task, data, reason, true
+}
+
 func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 	cid, ok := s.nasR2CopyConnection(w, r, nasConnectionCopy)
 	if !ok {
@@ -206,46 +259,84 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, 409, "copy free-space floor")
 		return
 	}
+	// A concurrent grant can consume the prepared row. Retry a bounded number
+	// of candidates without making the client hold for a normal admission race.
+	for attempt := 0; attempt < NASR2CopyWorkers; attempt++ {
+		if !s.nasR2CopyLeaseAttempt(w, r, cid) {
+			return
+		}
+	}
+	util.WriteError(w, 409, "copy queue changed during preparation; retryable")
+}
+
+func (s *Server) nasR2CopyLeaseAttempt(w http.ResponseWriter, r *http.Request, cid int64) bool {
+	task, data, reason, ok := s.nasR2CopyPrepare(w, r, cid)
+	if !ok {
+		return false
+	}
+	if task.ID == 0 {
+		util.WriteJSON(w, 200, map[string]any{"task": nil})
+		return false
+	}
 	ctx := r.Context()
+	var head r2.ObjectHead
+	var err error
+	// No transaction, row lock or advisory lock survives preparation. HEAD
+	// can be slow or blocked without obstructing controls or the deploy fence.
+	if reason == "" {
+		head, err = s.r2.Head(ctx, task.Item.ObjectKey)
+		if err != nil {
+			if !r2.IsNotFound(err) {
+				util.WriteError(w, 503, "copy R2 HEAD unavailable; retryable")
+				return false
+			}
+			reason = NASR2CopyR2Identity
+		} else if head.ETag == "" || head.SizeBytes != task.Item.SizeBytes || (head.SHA256Metadata != "" && !strings.EqualFold(head.SHA256Metadata, task.Item.SHA256)) {
+			reason = NASR2CopyR2Identity
+		}
+	}
+	nonce := make([]byte, 24)
+	if reason == "" {
+		if _, err = rand.Read(nonce); err != nil {
+			util.WriteError(w, 503, "copy token unavailable")
+			return false
+		}
+	}
 	tx, err := BeginNASR2CopyTx(ctx, s.pool)
 	if err != nil {
 		util.WriteError(w, 503, "copy database unavailable")
-		return
+		return false
 	}
 	defer tx.Rollback(ctx)
+	// EXCLUSIVE is also the four-live-lease cap, not just a maintenance fence:
+	// admission must recount only after concurrent renewals have committed.
+	// Keep it solely across database revalidation and grant/block commit.
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasR2CopyLock); err != nil {
 		util.WriteError(w, 503, "copy admission busy")
-		return
+		return false
 	}
 	if err = nasR2CopyReady(ctx, tx); err != nil {
 		util.WriteError(w, 409, "copy yields to maintenance")
-		return
+		return false
 	}
 	var active int
 	if err = tx.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE connection_id=$1 AND state='leased' AND lease_expires_at>clock_timestamp()`, cid).Scan(&active); err != nil {
 		util.WriteError(w, 503, "copy lease unavailable")
-		return
+		return false
 	}
 	if active >= NASR2CopyWorkers {
 		util.WriteJSON(w, 200, map[string]any{"task": nil})
-		return
+		return false
 	}
-	var task nasR2CopyTask
-	var data []byte
-	err = tx.QueryRow(ctx, `SELECT id,item,policy_sha256 FROM nas_r2_copy_items WHERE connection_id=$1 AND kind='raw' AND
- (state='pending' OR (state='leased' AND lease_expires_at<clock_timestamp())) ORDER BY id LIMIT 1 FOR UPDATE`, cid).Scan(&task.ID, &data, &task.PolicySHA256)
+	var id int64
+	err = tx.QueryRow(ctx, `SELECT id FROM nas_r2_copy_items WHERE id=$1 AND connection_id=$2 AND kind='raw' AND item=$3::jsonb AND policy_sha256=$4 AND
+ (state='pending' OR (state='leased' AND lease_expires_at<clock_timestamp())) FOR UPDATE SKIP LOCKED`, task.ID, cid, data, task.PolicySHA256).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
-		util.WriteJSON(w, 200, map[string]any{"task": nil})
-		return
+		return true
 	}
-	if err != nil || json.Unmarshal(data, &task.Item) != nil {
+	if err != nil {
 		util.WriteError(w, 503, "copy queue unavailable")
-		return
-	}
-	policy, _, err := Keep28Policy()
-	if err != nil || policy != task.PolicySHA256 {
-		util.WriteError(w, 409, "copy policy changed")
-		return
+		return false
 	}
 	if task.Clip, err = LoadNASR2CopySource(ctx, tx, task.Item); err != nil {
 		if errors.Is(err, errNASR2CopySourceIdentity) {
@@ -253,34 +344,23 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 		} else {
 			util.WriteError(w, 503, "copy source lookup unavailable; retryable")
 		}
-		return
+		return false
 	}
-	head, err := s.r2.Head(ctx, task.Item.ObjectKey)
-	if err != nil {
-		if r2.IsNotFound(err) {
-			s.nasR2CopyBlockResponse(w, r, tx, task.ID, NASR2CopyR2Identity)
-		} else {
-			util.WriteError(w, 503, "copy R2 HEAD unavailable; retryable")
-		}
-		return
+	if reason == NASR2CopySourceChanged {
+		return true
+	} // Source recovered; obtain a fresh HEAD.
+	if reason != "" {
+		s.nasR2CopyBlockResponse(w, r, tx, task.ID, reason)
+		return false
 	}
-	if head.ETag == "" || head.SizeBytes != task.Item.SizeBytes || (head.SHA256Metadata != "" && !strings.EqualFold(head.SHA256Metadata, task.Item.SHA256)) {
-		s.nasR2CopyBlockResponse(w, r, tx, task.ID, NASR2CopyR2Identity)
-		return
-	}
-	task.ETag = strings.Trim(head.ETag, "\"")
-	b := make([]byte, 24)
-	if _, err = rand.Read(b); err != nil {
-		util.WriteError(w, 503, "copy token unavailable")
-		return
-	}
-	task.Token = hex.EncodeToString(b)
+	task.ETag, task.Token = strings.Trim(head.ETag, "\""), hex.EncodeToString(nonce)
 	_, err = tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='leased',lease_token=$2,lease_expires_at=clock_timestamp()+interval '30 seconds',etag=$3,version_id=$4,attempts=attempts+1,last_error='',updated_at=clock_timestamp() WHERE id=$1`, task.ID, task.Token, task.ETag, head.VersionID)
 	if err != nil || tx.Commit(ctx) != nil {
 		util.WriteError(w, 503, "copy lease commit failed")
-		return
+		return false
 	}
 	util.WriteJSON(w, 200, map[string]any{"task": task, "floor_bytes": NASR2CopyFloor, "range_bytes": NASR2CopyRangeBytes})
+	return false
 }
 
 func (s *Server) nasR2CopyActive(w http.ResponseWriter, r *http.Request, purpose nasConnectionPurpose) (pgx.Tx, nasR2CopyTask, string, nasR2CopyControl, bool) {
