@@ -1715,7 +1715,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                     stop_event.set()
                 raise urllib.error.URLError(socket.gaierror("name resolution"))
 
-            with mock.patch.object(pull, "request_json", side_effect=flaky_post), mock.patch.object(
+            with mock.patch.object(pull, "heartbeat_request_json", side_effect=flaky_post), mock.patch.object(
                 pull, "atomic_write", side_effect=OSError("no space left on device")
             ), mock.patch.object(pull, "HEARTBEAT_INTERVAL_SEC", 0):
                 pull.heartbeat_loop(cfg, runtime, stop_event)
@@ -1731,8 +1731,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             stop_event = threading.Event()
             payloads = []
 
-            def heartbeat(_cfg, _method, path, body=None, **_kwargs):
-                self.assertEqual(path, "/account/connections/heartbeat")
+            def heartbeat(_cfg, body, challenge):
                 payloads.append(body)
                 if len(payloads) == 2:
                     stop_event.set()
@@ -1741,7 +1740,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                         "listing_enabled": True, "stitch_enabled": False,
                         "stitch_deletion_enabled": False, "cleanup_release_generation": 1}
 
-            with mock.patch.object(pull, "request_json", side_effect=heartbeat), \
+            with mock.patch.object(pull, "heartbeat_request_json", side_effect=heartbeat), \
                  mock.patch.object(pull, "HEARTBEAT_INTERVAL_SEC", 0):
                 pull.heartbeat_loop(cfg, runtime, stop_event)
 
@@ -4034,7 +4033,7 @@ class NASBenchmarkTests(unittest.TestCase):
     def test_host_facts_match_server_fields_and_probe_exec(self):
         with tempfile.TemporaryDirectory() as tmp:
             facts = pull.HostFacts(Path(tmp))()
-            optional = {"client_rss_bytes", "client_peak_rss_bytes"}
+            optional = {"client_rss_bytes", "client_peak_rss_bytes", "memory_diagnostics"}
             self.assertTrue(self.SERVER_HOST_FIELDS <= set(facts))
             self.assertTrue(set(facts) <= self.SERVER_HOST_FIELDS | optional)
             self.assertTrue(facts["state_exec_allowed"])

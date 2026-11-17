@@ -1879,6 +1879,7 @@ class Runtime:
         self.boot_id = boot_id()
         self.previous_exit = self._previous_exit(cfg)
         self.heartbeat_succeeded = False
+        self.storage_challenge = HeartbeatStorageChallenge()
         self.list_succeeded = False
         self.stable_marked = False
         self.release_candidate_at_start = bool(getattr(cfg, "is_candidate", False))
@@ -18185,7 +18186,7 @@ CLEANUP_V6_VERSIONS: frozenset[str] = frozenset((CLEANUP_GROUP_VERSION, "r2-copy
 CLEANUP_BULK_VERSION = "cleanup-batch-v7"
 CLEANUP_TRUTH_VERSION = "cleanup-batch-v8"
 CLEANUP_FRESH_PERMIT_VERSION = "v85r-nas-proof-v2.2"
-CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v2", "r2-copy-v3", "r2-copy-v4", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
+CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v2", "r2-copy-v3", "r2-copy-v4", "r2-copy-v5", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
 CLEANUP_GROUP_VERSIONS: frozenset[str] = CLEANUP_V6_VERSIONS | CLEANUP_BULK_VERSIONS
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
@@ -18203,7 +18204,7 @@ CLEANUP_RETRYABLE_ATTEMPTS = 8
 def cleanup_execution_group_size():
     # One lease/permit clock per file. NAS syscall latency must never consume
     # another file's short authority window. Historical releases retain v7.
-    return 1 if CLIENT_VERSION in (CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v4") else CLEANUP_EXECUTION_GROUP
+    return 1 if CLIENT_VERSION in (CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v4", "r2-copy-v5") else CLEANUP_EXECUTION_GROUP
 
 
 class CleanupProtocolUnsupported(RuntimeError):
@@ -19278,8 +19279,15 @@ def parse_certification_timestamp(value, field):
     raw = str(value or "").strip()
     if not raw:
         raise MediaCertificationError(f"{field} is required")
+    match = re.fullmatch(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]{1,9}))?(Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])", raw)
+    if match is None:
+        raise MediaCertificationError(f"{field} must be an ISO-8601 timestamp")
+    # Python 3.9 accepts only 3/6 fractional digits. Preserve representable
+    # microseconds, truncating sub-microsecond precision rather than extending expiry.
+    fraction = "." + match[2][:6].ljust(6, "0") if match[2] else ""
+    normalized = match[1] + fraction + ("+00:00" if match[3] == "Z" else match[3])
     try:
-        parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        parsed = datetime.datetime.fromisoformat(normalized)
     except ValueError as exc:
         raise MediaCertificationError(f"{field} must be an ISO-8601 timestamp") from exc
     if parsed.tzinfo is None:
@@ -24979,38 +24987,108 @@ def load_outage(cfg):
     return read_json(cfg.outage_file, None)
 
 
-def send_heartbeat_payload(cfg, payload):
+class HeartbeatStorageChallenge:
+    """One in-flight heartbeat; the server rotates a fresh nonce per response."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pending = None
+        self.last_echoed = None
+
+    def receive(self, nonce):
+        with self.lock:
+            self.pending = (nonce if isinstance(nonce, str) and re.fullmatch(r"[0-9a-f]{64}", nonce)
+                            and nonce != self.last_echoed else None)
+
+    def take(self):
+        with self.lock:
+            nonce, self.pending = self.pending, None
+            if nonce is not None:
+                self.last_echoed = nonce
+            return nonce
+
+
+class HeartbeatStorageUnavailable(RuntimeError):
+    pass
+
+
+def heartbeat_monotonic():
+    # CLOCK_MONOTONIC is shared across processes, including macOS Python 3.9.
+    return time.clock_gettime(time.CLOCK_MONOTONIC)
+
+
+class HeartbeatStorageAge:
+    def __init__(self, observed_at):
+        self.observed_at = observed_at
+
+    def check(self):
+        if heartbeat_monotonic() - self.observed_at > STORAGE_TELEMETRY_MAX_AGE_SEC:
+            raise HeartbeatStorageUnavailable("heartbeat storage sample expired before delivery")
+
+
+def heartbeat_request_json(cfg, payload, challenge=None):
+    # All inventory/host locks and payload construction precede this sample.
+    # Each compatibility attempt calls here anew; cached storage is never sent.
+    # Spend before sampling or sending: failures/retries never reuse a nonce.
+    nonce = challenge.take() if challenge is not None else None
+    age = HeartbeatStorageAge(heartbeat_monotonic())
+    storage = storage_status(cfg)
+    if storage.get("available") is not True:
+        raise HeartbeatStorageUnavailable("heartbeat fresh storage read unavailable; skipped")
+    if nonce is not None:
+        storage = dict(storage, challenge_nonce=nonce)
+    data = json.dumps(dict(payload, storage=storage)).encode("utf-8")
+    age.check()
+    # This bounds wasted work, not buffered ingress delivery. Budget freshness
+    # comes only from the server issuance time of the matched nonce.
+    status, _, raw = r2_copy_http(cfg.api_base + "/account/connections/heartbeat", "POST",
+        {"User-Agent": USER_AGENT, "Authorization": "Bearer " + cfg.api_key, "Content-Type": "application/json"},
+        body=data, limit=1024*1024, timeout=HEARTBEAT_TIMEOUT_SEC, guard=age, input_limit=2*1024*1024, socket_timeout=HEARTBEAT_TIMEOUT_SEC,
+        send_deadline=age.observed_at + STORAGE_TELEMETRY_MAX_AGE_SEC)
+    if status != 200:
+        error = urllib.error.HTTPError("/account/connections/heartbeat", status, "heartbeat refused", {}, None)
+        if error.fp is not None:
+            error.close()
+        raise error
+    result = json.loads(raw.decode("utf-8")) if raw else {}
+    if not isinstance(result, dict):
+        raise RuntimeError("invalid heartbeat response")
+    # Keep this private transport token out of generic response diagnostics.
+    next_nonce = result.pop("storage_challenge_nonce", None)
+    if challenge is not None:
+        challenge.receive(next_nonce)
+    CLIENT_LOG_RING.add_secrets(diagnostic_secret_values(result, response=True))
+    return result
+
+
+def send_heartbeat_payload(cfg, payload, challenge):
     try:
-        return request_json(cfg, "POST", "/account/connections/heartbeat",
-                            body=payload, timeout=HEARTBEAT_TIMEOUT_SEC)
+        return heartbeat_request_json(cfg, payload, challenge)
     except urllib.error.HTTPError as exc:
         host = payload.get("host")
         if exc.code != 400 or not isinstance(host, dict) or "release" not in host:
             raise
         payload["host"] = {k: v for k, v in host.items() if k != "release"}
-        return request_json(cfg, "POST", "/account/connections/heartbeat",
-                            body=payload, timeout=HEARTBEAT_TIMEOUT_SEC)
+        return heartbeat_request_json(cfg, payload, challenge)
 
 
 def send_heartbeat(cfg, runtime, outage):
     payload = runtime.heartbeat_payload(outage)
+    challenge = runtime.storage_challenge
     try:
-        return request_json(cfg, "POST", "/account/connections/heartbeat",
-                            body=payload, timeout=HEARTBEAT_TIMEOUT_SEC)
+        return heartbeat_request_json(cfg, payload, challenge)
     except urllib.error.HTTPError as exc:
         host = payload.get("host")
         if exc.code == 400 and "cleanup" in payload:
             # A backend that predates the optional cleanup status field.
             payload.pop("cleanup")
-            return send_heartbeat_payload(cfg, payload)
+            return send_heartbeat_payload(cfg, payload, challenge)
         if exc.code != 400 or not isinstance(host, dict) or "release" not in host:
             raise
         # A rolled-back backend may not know this optional diagnostic field.
         # Retry only without that field; authentication and all other telemetry
         # stay exact, and any second rejection follows normal outage handling.
         payload["host"] = {k: v for k, v in host.items() if k != "release"}
-        return request_json(cfg, "POST", "/account/connections/heartbeat",
-                            body=payload, timeout=HEARTBEAT_TIMEOUT_SEC)
+        return heartbeat_request_json(cfg, payload, challenge)
 
 
 def heartbeat_loop(cfg, runtime, stop_event):
@@ -25472,6 +25550,63 @@ def meminfo_bytes(text):
     return values.get("MemTotal", 0), values.get("MemAvailable", 0)
 
 
+# Optional host pressure diagnostics. These never feed resource admission.
+PROC_DIAGNOSTIC_MAX_BYTES = 64 * 1024
+PROC_DIAGNOSTIC_MAX_VM_FIELDS = 20
+PROC_MEMINFO_FIELDS = frozenset(("MemFree", "Buffers", "Cached", "SwapCached", "Active(anon)",
+    "Inactive(anon)", "Active(file)", "Inactive(file)", "Dirty", "Writeback", "AnonPages", "Shmem",
+    "Slab", "SReclaimable", "SUnreclaim", "SwapTotal", "SwapFree"))
+
+
+def proc_pressure_diagnostics(meminfo, stat, vmstat):
+    result = {}
+    for section, text in (("meminfo_bytes", meminfo), ("proc_stat", stat), ("vmstat", vmstat)):
+        values = {}
+        for line in (text or "")[:PROC_DIAGNOSTIC_MAX_BYTES].splitlines():
+            parts = line.split()
+            if section == "meminfo_bytes":
+                if len(parts) != 3 or parts[2] != "kB" or not parts[0].endswith(":"):
+                    continue
+                name, raw = parts[0][:-1], parts[1]
+                if name not in PROC_MEMINFO_FIELDS:
+                    continue
+            else:
+                if len(parts) != 2:
+                    continue
+                name, raw = parts
+                if section == "proc_stat":
+                    if name not in ("procs_running", "procs_blocked"):
+                        continue
+                elif not (name in ("pswpin", "pswpout", "pgmajfault") or
+                        (len(name) <= 32 and re.fullmatch(r"[a-z0-9_]+", name) and
+                         name.startswith(("pgscan_kswapd", "pgsteal_kswapd")))):
+                    continue
+            if len(raw) > 19 or not raw.isascii() or not raw.isdigit():
+                continue
+            value = int(raw) * (1024 if section == "meminfo_bytes" else 1)
+            if value > (1 << 63) - 1:
+                continue
+            if section == "vmstat" and name not in values and len(values) >= PROC_DIAGNOSTIC_MAX_VM_FIELDS:
+                continue
+            values[name] = value
+        if values:
+            result[section] = values
+    return result
+
+
+def memory_hold_diagnostics(reason):
+    if reason not in ("copy memory headroom", "copy cgroup memory telemetry unavailable",
+                      "NAS memory or load critical", "cgroup memory usage unavailable"):
+        return ""
+    snapshot = nas_pressure_snapshot(_read_text("/proc/meminfo"))
+    return " memory_diagnostics=" + json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+
+
+def nas_pressure_snapshot(meminfo):
+    return proc_pressure_diagnostics(meminfo, _read_text("/proc/stat", PROC_DIAGNOSTIC_MAX_BYTES),
+                                     _read_text("/proc/vmstat", PROC_DIAGNOSTIC_MAX_BYTES))
+
+
 def process_memory_bytes(text):
     """Client-only RSS, not child processes or a census of the NAS services."""
     fields = {"VmRSS": "client_rss_bytes", "VmHWM": "client_peak_rss_bytes"}
@@ -25550,7 +25685,11 @@ class HostFacts:
             if self.static is None:
                 self.static = self._gather_static()
             facts = dict(self.static)
-        total, available = meminfo_bytes(_read_text("/proc/meminfo"))
+        meminfo = _read_text("/proc/meminfo")
+        total, available = meminfo_bytes(meminfo)
+        diagnostics = nas_pressure_snapshot(meminfo)
+        if diagnostics:
+            facts["memory_diagnostics"] = diagnostics
         facts["mem_total_bytes"] = total
         facts["mem_available_bytes"] = available
         facts.update(process_memory_bytes(_read_text("/proc/self/status", 8192)))
@@ -50401,7 +50540,7 @@ def stitch_loop(cfg, inventory, stop_event):
             STITCH_STATUS.update(state="paused")
             reason = ("proof failed: " + stitch_measure_error(exc).value) if proof_mode else str(exc)
             STITCH_STATUS.fail(reason)
-            log("WARN", "V85r stitch HOLD: %s" % reason[:300])
+            log("WARN", "V85r stitch HOLD: %s%s" % (reason[:300], memory_hold_diagnostics(str(exc))))
         finally:
             STITCH_ACTIVE.clear()
         stop_event.wait(retry)
@@ -52311,16 +52450,35 @@ def r2_copy_report_block(inventory, control, task, reason):
 # during DNS, TLS, trickling headers, or a read that never becomes idle. The
 # child has no NAS file paths, no inherited credentials, and cannot write media.
 R2_COPY_HTTP_CHILD = r'''
-import base64,json,sys,urllib.error,urllib.request
+import signal
+signal.signal(signal.SIGALRM,signal.SIG_DFL)
+signal.setitimer(signal.ITIMER_REAL,20)
+import base64,http.client,json,sys,time,urllib.error,urllib.request
+class FreshSend:
+    def send(self,data):
+        if self.sock is None:self.connect()
+        if time.clock_gettime(time.CLOCK_MONOTONIC)>p["send_deadline"]:raise TimeoutError("storage sample expired before send")
+        return super().send(data)
+class FreshHTTP(FreshSend,http.client.HTTPConnection):pass
+class FreshHTTPS(FreshSend,http.client.HTTPSConnection):pass
+class FreshHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self,req):return self.do_open(FreshHTTP,req)
+class FreshHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self,req):return self.do_open(FreshHTTPS,req,context=self._context)
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,*args,**kwargs):
         raise OSError("redirect refused")
 try:
     p=json.load(sys.stdin)
+    remaining=p["total_deadline"]-time.clock_gettime(time.CLOCK_MONOTONIC)
+    if remaining<=0:sys.exit(1)
+    signal.setitimer(signal.ITIMER_REAL,min(signal.getitimer(signal.ITIMER_REAL)[0],remaining))
     req=urllib.request.Request(p["url"],method=p["method"],headers=p["headers"],
         data=base64.b64decode(p["body"]) if p["body"] is not None else None)
     try:
-        response=urllib.request.build_opener(NoRedirect()).open(req,timeout=2)
+        handlers=[NoRedirect()]
+        if p.get("send_deadline") is not None:handlers.extend((FreshHTTPHandler(),FreshHTTPSHandler()))
+        response=urllib.request.build_opener(*handlers).open(req,timeout=p.get("socket_timeout",2))
     except urllib.error.HTTPError as error:
         sys.stdout.buffer.write((json.dumps({"status":error.code,"headers":{}})+"\n").encode())
         sys.stdout.buffer.flush()
@@ -52339,14 +52497,14 @@ except Exception:
 '''
 
 
-def r2_copy_http(url, method, headers, body=None, limit=R2_COPY_RANGE, timeout=10, guard=None):
+def r2_copy_http(url, method, headers, body=None, limit=R2_COPY_RANGE, timeout=10, guard=None, input_limit=32768, socket_timeout=2, send_deadline=None):
     import select
+    deadline = heartbeat_monotonic() + timeout
     message = json.dumps({"url": url, "method": method, "headers": headers,
                           "body": base64.b64encode(body).decode() if body is not None else None,
-                          "limit": limit}).encode()
-    if len(message) > 32768:
+                          "limit": limit, "socket_timeout": socket_timeout, "send_deadline": send_deadline, "total_deadline": deadline}).encode()
+    if len(message) > input_limit:
         raise R2CopyHold("copy HTTP input exceeds bound")
-    deadline = time.monotonic() + timeout
     process = subprocess.Popen([sys.executable, "-I", "-c", R2_COPY_HTTP_CHILD], stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={}, start_new_session=True)
     def kill_transport():
@@ -52354,18 +52512,15 @@ def r2_copy_http(url, method, headers, body=None, limit=R2_COPY_RANGE, timeout=1
             process.kill()
         except ProcessLookupError:
             pass
-    watchdog = threading.Timer(max(0, deadline - time.monotonic()), kill_transport)
-    watchdog.daemon = True
-    watchdog.start()
     try:
         os.set_blocking(process.stdin.fileno(), False)
         offset = 0
         while offset < len(message):
-            if time.monotonic() >= deadline:
+            if heartbeat_monotonic() >= deadline:
                 raise R2CopyHold("copy HTTP total deadline")
             if guard is not None:
                 guard.check()
-            _, writable, _ = select.select([], [process.stdin], [], min(.2, max(0, deadline - time.monotonic())))
+            _, writable, _ = select.select([], [process.stdin], [], min(.2, max(0, deadline - heartbeat_monotonic())))
             if writable:
                 try:
                     offset += os.write(process.stdin.fileno(), message[offset:])
@@ -52374,11 +52529,11 @@ def r2_copy_http(url, method, headers, body=None, limit=R2_COPY_RANGE, timeout=1
         process.stdin.close()
         output = bytearray()
         while True:
-            if time.monotonic() >= deadline:
+            if heartbeat_monotonic() >= deadline:
                 raise R2CopyHold("copy HTTP total deadline")
             if guard is not None:
                 guard.check()
-            ready, _, _ = select.select([process.stdout], [], [], min(.2, max(0, deadline - time.monotonic())))
+            ready, _, _ = select.select([process.stdout], [], [], min(.2, max(0, deadline - heartbeat_monotonic())))
             if not ready:
                 continue
             block = os.read(process.stdout.fileno(), 65536)
@@ -52387,7 +52542,7 @@ def r2_copy_http(url, method, headers, body=None, limit=R2_COPY_RANGE, timeout=1
             output.extend(block)
             if len(output) > limit + 4096:
                 raise R2CopyHold("copy HTTP response exceeds bound")
-        if process.wait(timeout=max(.01, deadline - time.monotonic())) != 0:
+        if process.wait(timeout=max(.01, deadline - heartbeat_monotonic())) != 0:
             raise R2CopyHold("copy HTTP transport failed")
         metadata, separator, data = output.partition(b"\n")
         if not separator or len(metadata) > 4096 or len(data) > limit:
@@ -52395,11 +52550,9 @@ def r2_copy_http(url, method, headers, body=None, limit=R2_COPY_RANGE, timeout=1
         result = json.loads(metadata)
         return result["status"], result["headers"], data
     finally:
-        watchdog.cancel()
         if process.poll() is None:
             kill_transport()
         process.wait(timeout=2)
-        watchdog.join(timeout=1)
         process.stdout.close()
         process.stdin.close()
 
@@ -53076,7 +53229,7 @@ def r2_copy_worker(cfg, runtime, inventory, stop, worker):
             except Exception as exc:
                 reason = str(exc) if isinstance(exc, (R2CopyHold, StitchHold)) else type(exc).__name__
                 R2_COPY_TELEMETRY.hold(reason)
-                log("WARN", "R2 copy held: %s" % reason)
+                log("WARN", "R2 copy held: %s%s" % (reason, memory_hold_diagnostics(reason)))
 
 
 def r2_copy_loop(cfg, runtime, inventory, stop):

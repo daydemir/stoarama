@@ -962,15 +962,16 @@ class CleanupTests(unittest.TestCase):
         from types import SimpleNamespace
         payload = {"client_version": "new", "cursor_id": 42,
                    "host": {"machine": "x86_64", "release": {"candidate": False, "stable": True}}}
-        runtime = SimpleNamespace(heartbeat_payload=lambda outage: dict(payload))
+        runtime = SimpleNamespace(heartbeat_payload=lambda outage: dict(payload), storage_challenge=pull.HeartbeatStorageChallenge())
         calls = []
-        def heartbeat(cfg, method, path, **kwargs):
+        def heartbeat(cfg, payload, challenge):
             import copy
-            calls.append(copy.deepcopy(kwargs["body"]))
+            path = "/account/connections/heartbeat"
+            calls.append(copy.deepcopy(payload))
             if len(calls) == 1:
                 raise pull.urllib.error.HTTPError(path, 400, "unknown release field", {}, None)
             return {"ok": True}
-        with mock.patch.object(pull, "request_json", side_effect=heartbeat):
+        with mock.patch.object(pull, "heartbeat_request_json", side_effect=heartbeat):
             self.assertEqual(pull.send_heartbeat(self.cfg, runtime, None), {"ok": True})
         self.assertIn("release", calls[0]["host"])
         self.assertEqual(calls[1], {"client_version": "new", "cursor_id": 42, "host": {"machine": "x86_64"}})
@@ -1930,12 +1931,13 @@ class CleanupProtocol2Tests(unittest.TestCase):
         self.assertEqual(payload['cleanup']['quarantined'], 1)
         self.assertTrue(payload['client_last_error'].startswith('cleanup: journal replay'))
         sent = []
-        def fake(cfg, method, path, body=None, timeout=None):
+        def fake(cfg, body, challenge):
+            path = "/account/connections/heartbeat"
             sent.append(dict(body))
             if 'cleanup' in body:
                 raise pull.urllib.error.HTTPError(path, 400, 'unknown field', {}, None)
             return dict(ok=True)
-        with mock.patch.object(pull, 'request_json', side_effect=fake):
+        with mock.patch.object(pull, 'heartbeat_request_json', side_effect=fake):
             self.assertEqual(pull.send_heartbeat(self.cfg, runtime, None), dict(ok=True))
         self.assertIn('cleanup', sent[0]); self.assertNotIn('cleanup', sent[1])
         self.assertTrue(sent[1]['client_last_error'].startswith('cleanup: journal replay'))

@@ -104,6 +104,15 @@ func TestHeartbeatDropsInvalidHostFactsKeepsTelemetry(t *testing.T) {
 	if json.Unmarshal(host, &facts) != nil || facts.Release == nil || facts.Release.Candidate || !facts.Release.Stable {
 		t.Fatalf("release stability telemetry not persisted: %s", host)
 	}
+	call(`{"storage":{"available":true,"total_bytes":1000,"free_bytes":175},"host":{"machine":"x86_64","memory_diagnostics":{"meminfo_bytes":{"Cached":1024,"Dirty":"bad"},"proc_stat":{"procs_blocked":7},"vmstat":{"pgmajfault":25}}}}`)
+	_, free, host = read()
+	if err := json.Unmarshal(host, &facts); err != nil || facts.MemoryDiagnostics == nil || facts.MemoryDiagnostics.MeminfoBytes["Cached"] != 1024 || len(facts.MemoryDiagnostics.MeminfoBytes) != 1 || facts.MemoryDiagnostics.ProcStat["procs_blocked"] != 7 || facts.MemoryDiagnostics.VMStat["pgmajfault"] != 25 || free == nil || *free != 175 {
+		t.Fatalf("optional pressure facts not persisted: free=%v host=%s err=%v", free, host, err)
+	}
+	call(`{"host":{"machine":"x86_64","memory_diagnostics":{"vmstat":"invalid subtree"}}}`)
+	if _, free, host = read(); free == nil || *free != 175 || !strings.Contains(string(host), `"x86_64"`) {
+		t.Fatalf("bad diagnostics lost valid facts/storage: free=%v host=%s", free, host)
+	}
 	// A later invalid report must not erase the last good facts.
 	call(`{"storage":{"available":true,"total_bytes":1000,"free_bytes":150},"host":{"machine":"x86 64"}}`)
 	if _, free, host = read(); free == nil || *free != 150 || !strings.Contains(string(host), `"x86_64"`) {

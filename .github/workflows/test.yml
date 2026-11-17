@@ -17,6 +17,23 @@ permissions:
 jobs:
   nas-storage-dashboard-python39:
     runs-on: ubuntu-24.04 # Python 3.9 has no Ubuntu 26.04 toolcache build.
+    services:
+      postgres:
+        image: postgres:17@sha256:a426e44bac0b759c95894d68e1a0ac03ecc20b619f498a91aae373bf06d8508d
+        env:
+          POSTGRES_DB: stoarama_test
+          POSTGRES_USER: stoarama
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stoarama -d stoarama_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+      STOARAMA_TEST_PYTHON: python3.9
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -42,7 +59,16 @@ jobs:
         run: python -m unittest discover -s infra/collation-v2 -p 'test_*.py' -q
       - name: Test isolated R2 controls on the deployed Python version
         working-directory: clients/nas-pull
-        run: python -m unittest test_r2_copy_control test_r2_copy_worker -q
+        run: python -m unittest test_r2_copy_control test_r2_copy_worker test_heartbeat_v5 test_cleanup_fresh_permit -q
+      - name: Test cleanup truth and bounded accounting on Python 3.9
+        run: python -m unittest discover -s clients/nas-pull -p 'test_cleanup*.py' -q
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Test v5 real client/server pipeline on explicit Python 3.9
+        working-directory: backend
+        run: go test ./internal/api -run '^TestNASR2CopyV5FreshPermitClientServer$' -race -count=1 -v
 
   joined-folder-zip-worker:
     runs-on: ubuntu-latest
@@ -85,10 +111,15 @@ jobs:
     defaults:
       run:
         working-directory: backend
+    env:
+      STOARAMA_TEST_PYTHON: python3.14
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.14.6'
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: backend/go.mod
@@ -96,7 +127,7 @@ jobs:
       - name: Test original NAS presentation witnesses first
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api ./cmd/stoaramactl ./internal/db -run '^Test(NASDeliveryFence|NASR2Copy|NASRedownload|NASListing|NASSelectedVerify|OriginalWitness|NASCleanup|NASStitch|NASClient|NASDiagnostics)' -count=1 -v
+        run: go test ./internal/api ./cmd/stoaramactl ./internal/db -run '^Test(NASDeliveryFence|NASR2Copy|NASRedownload|NASListing|NASSelectedVerify|OriginalWitness|NASCleanup|NASStitch|NASClient|NASDiagnostics|NASHostPressure|ValidateNASHostFacts|HeartbeatDropsInvalidHostFactsKeepsTelemetry)' -count=1 -v
       - name: Test delivery keep holds and unexecutable R2 previews
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

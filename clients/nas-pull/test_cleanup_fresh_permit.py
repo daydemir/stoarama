@@ -65,3 +65,7 @@ class CleanupFreshPermitTests(unittest.TestCase):
 
 class R2CopyV4FreshPermitTests(CleanupFreshPermitTests):
     version = "r2-copy-v4"
+
+
+class R2CopyV5FreshPermitTests(CleanupFreshPermitTests):
+    version = "r2-copy-v5"

@@ -5,6 +5,7 @@ import binascii
 import datetime
 import hashlib
 import json
+import re
 from pathlib import Path
 import sys
 import unittest
@@ -19,7 +20,7 @@ FIXTURE = json.loads((ROOT.parent.parent / "backend/internal/api/testdata/nas_st
 nodes = [node for node in ast.parse(SOURCE).body if isinstance(node, (ast.FunctionDef, ast.ClassDef))
          and node.name in {"parse_certification_timestamp", "MediaCertificationError"}]
 assert len(nodes) == 2 and all(not node.decorator_list for node in nodes)
-PARSER = {"datetime": datetime}
+PARSER = {"datetime": datetime, "re": re}
 exec(compile(ast.Module(body=nodes, type_ignores=[]), "<exact client UTC parser>", "exec"), PARSER)
 
 VERIFIER_NAMESPACE = {"__name__": "offline_wire_fixture_validator"}
@@ -86,6 +87,31 @@ class WireTimestampTests(unittest.TestCase):
                         self.assertEqual(body["readback_verified_at"], row["copied_verified_at"])
                         self.assertTrue(body["readback_verified_at"].endswith(".123Z"))
 
+    def test_rfc3339_fraction_widths_offsets_and_expiry_never_round_up(self):
+        for width in range(1, 10):
+            digits = "123456789"[:width]
+            expected_microseconds = int(digits[:6].ljust(6, "0"))
+            for zone, offset in (("Z", 0), ("+05:30", 330), ("-07:45", -465)):
+                with self.subTest(width=width, zone=zone):
+                    raw = "2026-11-17T10:32:32." + digits + zone
+                    actual = PARSER["parse_certification_timestamp"](raw, "cleanup expiry")
+                    expected = datetime.datetime(2026, 11, 17, 10, 32, 32, expected_microseconds,
+                        tzinfo=datetime.timezone(datetime.timedelta(minutes=offset))).astimezone(datetime.timezone.utc)
+                    self.assertEqual(actual, expected)
+                    self.assertEqual(actual.microsecond, expected_microseconds)
+        self.assertEqual(PARSER["parse_certification_timestamp"]("2026-11-17T10:32:32.33494+00:00", "expiry").microsecond, 334940)
+        for zone in ("Z", "+00:00", "-00:00"):
+            self.assertEqual(PARSER["parse_certification_timestamp"]("2026-11-17T10:32:32.999999999"+zone, "expiry").microsecond, 999999)
+            self.assertEqual(PARSER["parse_certification_timestamp"]("2026-11-17T10:32:32"+zone, "expiry").microsecond, 0)
+
+    def test_rfc3339_malformed_timestamps_still_fail(self):
+        for raw in ("", "2026-11-17", "2026-11-17T10:32:32", "2026-11-17T10:32:32.Z", "2026-11-17T10:32:32.-1Z",
+                    "2026-11-17T10:32:32.1234567890Z", "2026-11-17T10:32:32.1.2Z", "2026-11-17T10:32:32.1+24:00",
+                    "2026-11-17T10:32:32.1+00:60", "2026-11-17T10:32:32.1+0530", "2026-11-17T10:32:32.1Zextra",
+                    "2026-02-30T10:32:32.1Z", "2026-11-17T25:32:32.1Z", "2026-11-17T10:32:32.١Z"):
+            with self.subTest(raw=raw), self.assertRaises(PARSER["MediaCertificationError"]):
+                PARSER["parse_certification_timestamp"](raw, "expiry")
+
     @unittest.skipUnless(sys.version_info[:2] < (3, 11), "strict fractional-width regression targets supported Python 3.9/3.10")
     def test_prior_actual_go_encodings_reproduce_the_supported_runtime_failure(self):
         rejected = set()
@@ -93,8 +119,8 @@ class WireTimestampTests(unittest.TestCase):
             stamp = row["legacy_nano_expiry"]
             width = len(stamp.split(".")[1][:-1]) if "." in stamp else 0
             if width in {1, 2, 4, 5}:
-                with self.subTest(case=row["name"]), self.assertRaises(PARSER["MediaCertificationError"]):
-                    PARSER["parse_certification_timestamp"](stamp, "expiry")
+                with self.subTest(case=row["name"]), self.assertRaises(ValueError):
+                    datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
                 rejected.add(width)
         self.assertEqual(rejected, {1, 2, 4, 5})
 
