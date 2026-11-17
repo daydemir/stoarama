@@ -106,7 +106,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
  INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps) VALUES(3,'test','3','inverse','inverse','https://test.invalid','off','Asia/Tokyo','hls','video_manifest','video_live','continuous_video',30);
  INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc) VALUES(1,47,'test','https://test.invalid','auto','stoarama','fixture',decode('00','hex'));
  INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at) VALUES(30,47,1,'inverse','https://test.invalid','* * * * *','Asia/Tokyo','paused',3,now());`)
-	const count = 80
+	const count = 1100
 	store := &inverseFakeStore{objects: map[string]r2.ObjectInfo{}}
 	for n := range count {
 		key := fmt.Sprintf("managed/acct-47/ordinary/%04d.mp4", n)
@@ -129,7 +129,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 	if err = pool.QueryRow(ctx, `SELECT activated_at,drain_not_before FROM r2_retirement_writer_fences`).Scan(&activated, &deadline); err != nil {
 		t.Fatal(err)
 	}
-	drain := inverseDrainEvidence{Bucket: "stoarama", EndpointSHA256: store.EndpointSHA256(), FenceActivatedAt: activated, DrainNotBefore: deadline, ObservedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour), DeployedWriterCoverage: "test fixture all admissions checked", AcceptedPUTCompletion: "test fixture no provider PUTs accepted"}
+	drain := inverseDrainEvidence{Bucket: "stoarama", EndpointSHA256: store.EndpointSHA256(), FenceActivatedAt: activated, DrainNotBefore: deadline, ObservedAt: time.Now().UTC(), DeployedWriterCoverage: "test fixture all admissions checked", AcceptedPUTCompletion: "test fixture no provider PUTs accepted"}
 	drainPath := filepath.Join(root, "drain.json")
 	data, _ := json.Marshal(drain)
 	if err = os.WriteFile(drainPath, data, 0600); err != nil {
@@ -175,7 +175,11 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return &inverseApplier{pool, store, o, sum, p, ledger}, entries
+		var epoch int64
+		if err = pool.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch`).Scan(&epoch); err != nil {
+			t.Fatal(err)
+		}
+		return &inverseApplier{pool: pool, store: store, opts: o, summary: sum, protection: p, ledger: ledger, keEpoch: epoch}, entries
 	}
 	t.Run("success", func(t *testing.T) {
 		a, _ := build(2)
@@ -247,15 +251,15 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 	})
 	t.Run("worker_pool_rate_with_durable_DB_and_ledger", func(t *testing.T) {
-		a, _ := build(32)
+		a, _ := build(1024)
 		a.ledger.close()
-		store.delay = 10 * time.Millisecond
+		store.delay = 100 * time.Millisecond
 		defer func() { store.delay = 0 }()
 		s, err := applyInverse(ctx, pool, store, a.opts)
-		if err != nil || s.Deleted != 32 {
+		if err != nil || s.Deleted != 1024 {
 			t.Fatalf("%+v %v", s, err)
 		}
-		t.Logf("objects/s %.2f (full schema, real locks/intent commits/fsync,10ms each HEAD/DELETE)", s.ObjectsPerSecond)
+		t.Logf("objects/s %.2f (full schema, real locks/intent commits/fsync,100ms each HEAD/DELETE)", s.ObjectsPerSecond)
 		if s.ObjectsPerSecond < 8 {
 			t.Fatalf("rate %.2f below8", s.ObjectsPerSecond)
 		}

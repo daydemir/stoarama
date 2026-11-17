@@ -89,3 +89,23 @@ CREATE FUNCTION guard_r2_inverse_source_identity() RETURNS trigger LANGUAGE plpg
 END $$;
 CREATE TRIGGER r2_inverse_source_identity BEFORE UPDATE OF recording_id,recording_job_id,bucket,object_key,etag,size_bytes,sha256,display_path,clip_start_at,clip_end_at OR DELETE ON recording_clips
  FOR EACH ROW EXECUTE FUNCTION guard_r2_inverse_source_identity();
+
+-- The KE folder cache is small, but catalog identity may change between batches.
+-- Version only those identities; COPY state changes remain per-key vetoes and
+-- cannot globally freeze unrelated inverse deletion.
+CREATE TABLE r2_inverse_ke_epoch(singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),epoch bigint NOT NULL DEFAULT 0);
+INSERT INTO r2_inverse_ke_epoch DEFAULT VALUES;
+CREATE FUNCTION advance_r2_inverse_ke_epoch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ PERFORM pg_advisory_xact_lock(7343226011103);
+ PERFORM pg_advisory_xact_lock(7343226011101);
+ UPDATE r2_inverse_ke_epoch SET epoch=epoch+1;
+ RETURN NULL;
+END $$;
+CREATE TRIGGER r2_inverse_ke_raw_epoch BEFORE INSERT OR UPDATE OF bucket,display_path,recording_id OR DELETE ON recording_clips
+ FOR EACH STATEMENT EXECUTE FUNCTION advance_r2_inverse_ke_epoch();
+CREATE TRIGGER r2_inverse_ke_output_epoch BEFORE INSERT OR UPDATE OF nas_relative_path,collation_hour_id OR DELETE ON recording_collation_outputs
+ FOR EACH STATEMENT EXECUTE FUNCTION advance_r2_inverse_ke_epoch();
+CREATE TRIGGER r2_inverse_ke_hour_epoch BEFORE UPDATE OF recording_id ON recording_collation_hours
+ FOR EACH STATEMENT EXECUTE FUNCTION advance_r2_inverse_ke_epoch();
+CREATE TRIGGER r2_inverse_ke_recording_epoch BEFORE UPDATE OF stream_id ON recordings
+ FOR EACH STATEMENT EXECUTE FUNCTION advance_r2_inverse_ke_epoch();

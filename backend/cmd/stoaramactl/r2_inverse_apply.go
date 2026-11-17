@@ -37,7 +37,6 @@ type inverseDrainEvidence struct {
 	FenceActivatedAt       time.Time `json:"fence_activated_at"`
 	DrainNotBefore         time.Time `json:"drain_not_before"`
 	ObservedAt             time.Time `json:"observed_at"`
-	ExpiresAt              time.Time `json:"expires_at"`
 	DeployedWriterCoverage string    `json:"deployed_writer_coverage_evidence"`
 	AcceptedPUTCompletion  string    `json:"accepted_put_completion_evidence"`
 }
@@ -62,6 +61,7 @@ type inverseRawTarget struct {
 	Identity        inverseIdentity
 }
 type inverseApplier struct {
+	keEpoch    int64
 	pool       *pgxpool.Pool
 	store      inverseDeleteStore
 	opts       inverseApplyOptions
@@ -115,7 +115,7 @@ func (a *inverseApplier) checkEvidence(ctx context.Context, q r2RetireQuerier) e
 	if err != nil {
 		return fmt.Errorf("exact 0198 writer fence required: %w", err)
 	}
-	if !blocked || !now.After(deadline) || e.Bucket != a.store.Bucket() || e.EndpointSHA256 != a.store.EndpointSHA256() || !e.FenceActivatedAt.Equal(activated) || !e.DrainNotBefore.Equal(deadline) || e.ObservedAt.Before(deadline) || e.ObservedAt.After(now) || !e.ExpiresAt.After(now) || e.ExpiresAt.After(e.ObservedAt.Add(24*time.Hour)) || strings.TrimSpace(e.DeployedWriterCoverage) == "" || strings.TrimSpace(e.AcceptedPUTCompletion) == "" {
+	if !blocked || !now.After(deadline) || e.Bucket != a.store.Bucket() || e.EndpointSHA256 != a.store.EndpointSHA256() || !e.FenceActivatedAt.Equal(activated) || !e.DrainNotBefore.Equal(deadline) || e.ObservedAt.Before(deadline) || e.ObservedAt.After(now) || strings.TrimSpace(e.DeployedWriterCoverage) == "" || strings.TrimSpace(e.AcceptedPUTCompletion) == "" {
 		return errors.New("writer drain or controller evidence missing, stale or outside exact fence")
 	}
 	if now.Sub(a.summary.CreatedAt) > 24*time.Hour || a.summary.CreatedAt.After(now) {
@@ -139,7 +139,7 @@ func inverseProtectionLocks(ctx context.Context, tx pgx.Tx, shared bool) error {
 
 const inverseRawTargetSQL = `SELECT c.id,coalesce(r.stream_id,0),c.size_bytes,lower(c.sha256),coalesce(c.etag,''),c.display_path,c.clip_start_at,c.clip_end_at,
  coalesce(nullif(s.local_timezone,''),r.cron_timezone,'') FROM recording_clips c JOIN recordings r ON r.id=c.recording_id
- LEFT JOIN streams s ON s.id=r.stream_id WHERE c.bucket=$1 AND c.object_key=$2 AND c.purged_at IS NULL FOR UPDATE OF c FOR SHARE OF r`
+ LEFT JOIN streams s ON s.id=r.stream_id WHERE c.bucket=$1 AND c.object_key=$2 AND c.purged_at IS NULL AND NOT EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.object_key=c.object_key) FOR UPDATE OF c FOR SHARE OF r`
 
 func (a *inverseApplier) loadTarget(ctx context.Context, tx pgx.Tx, e inverseEntry) (inverseRawTarget, error) {
 	t := inverseRawTarget{}
@@ -192,6 +192,13 @@ const inverseRawHeldSQL = `SELECT
 func (a *inverseApplier) checkTarget(ctx context.Context, tx pgx.Tx, t inverseRawTarget, e inverseEntry, purgeProbe bool) error {
 	if err := a.checkEvidence(ctx, tx); err != nil {
 		return err
+	}
+	var epoch int64
+	if err := tx.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`).Scan(&epoch); err != nil {
+		return err
+	}
+	if epoch != a.keEpoch {
+		return errors.New("KE catalog identity changed; refresh partition before further wire attempts")
 	}
 	var held bool
 	if err := tx.QueryRow(ctx, inverseRawHeldSQL, t.ID, a.store.Bucket(), e.Key, a.opts.ManifestSHA, t.Path).Scan(&held); err != nil {
@@ -316,11 +323,15 @@ func (a *inverseApplier) delete(ctx context.Context, e inverseEntry) (bool, erro
 	if err != nil {
 		return false, err
 	}
-	item := r2RetireItem{r2RetireCandidate: r2RetireCandidate{SizeBytes: e.SizeBytes, SHA256: t.SHA, ETag: e.ETag}}
-	if err = r2RetireValidateGuardHead(head, item, t.ETag, 7*24*time.Hour, time.Now().UTC()); err != nil {
+	var now time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
 		return false, err
 	}
-	if e.LastModified.IsZero() || !head.LastModified.Equal(e.LastModified) || !e.LastModified.Before(time.Now().Add(-7*24*time.Hour)) {
+	item := r2RetireItem{r2RetireCandidate: r2RetireCandidate{SizeBytes: e.SizeBytes, SHA256: t.SHA, ETag: e.ETag}}
+	if err = r2RetireValidateGuardHead(head, item, t.ETag, 7*24*time.Hour, now); err != nil {
+		return false, err
+	}
+	if e.LastModified.IsZero() || !head.LastModified.Equal(e.LastModified) || !e.LastModified.Before(now.Add(-7*24*time.Hour)) {
 		return false, errors.New("listing LastModified missing, changed or too young")
 	}
 	if err = a.store.RequireNoMultipartUploads(ctx); err != nil {
@@ -338,9 +349,9 @@ func (a *inverseApplier) delete(ctx context.Context, e inverseEntry) (bool, erro
 	if err = tx.Commit(ctx); err != nil {
 		return false, err
 	}
-	return true, a.publishAbsent(ctx, e, a.opts.ManifestSHA)
+	return true, a.publishAbsent(ctx, e, a.opts.ManifestSHA, false)
 }
-func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, manifest string) error {
+func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, manifest string, reconciled bool) error {
 	tx, err := a.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return err
@@ -350,9 +361,9 @@ func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, mani
 		return err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256,already_absent)
- SELECT 'raw',c.id,r.stream_id,c.bucket,c.object_key,c.size_bytes,lower(c.sha256),'inverse_non_keep28',i.choice,$3,i.policy_sha256,true
+ SELECT 'raw',c.id,r.stream_id,c.bucket,c.object_key,c.size_bytes,lower(c.sha256),'inverse_non_keep28',i.choice,$3,i.policy_sha256,$4
  FROM recording_clips c JOIN recordings r ON r.id=c.recording_id JOIN r2_inverse_intents i ON i.source_id=c.id
- WHERE i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 ON CONFLICT DO NOTHING`, a.store.Bucket(), e.Key, manifest)
+ WHERE i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 ON CONFLICT DO NOTHING`, a.store.Bucket(), e.Key, manifest, reconciled)
 	if err != nil {
 		return err
 	}
@@ -402,6 +413,9 @@ func runR2InverseApply(ctx context.Context, cfg config.Config, args []string) {
 func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteStore, o inverseApplyOptions) (inverseApplySummary, error) {
 	started := time.Now()
 	result := inverseApplySummary{}
+	if o.Workers < 1 || o.Workers > 64 || o.MaxItems < 1 || o.MaxBytes <= 0 || o.Budget24h <= 0 {
+		return result, errors.New("invalid bounded apply options")
+	}
 	var summary inverseSummary
 	if err := inverseReadPinned(o.Summary, o.SummarySHA, &summary); err != nil {
 		return result, err
@@ -439,11 +453,26 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteSt
 		return result, err
 	}
 	defer ledger.close()
-	protection, err := loadInverseProtection(ctx, pool, store.Bucket(), picks, windows)
+	initTx, err := pool.Begin(ctx)
 	if err != nil {
 		return result, err
 	}
-	a := &inverseApplier{pool: pool, store: store, opts: o, summary: summary, protection: protection, ledger: ledger}
+	defer initTx.Rollback(context.Background())
+	if err = inverseProtectionLocks(ctx, initTx, true); err != nil {
+		return result, err
+	}
+	var keEpoch int64
+	if err = initTx.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`).Scan(&keEpoch); err != nil {
+		return result, err
+	}
+	protection, err := loadInverseApplyProtection(ctx, initTx, store.Bucket(), picks, windows)
+	if err != nil {
+		return result, err
+	}
+	if err = initTx.Commit(ctx); err != nil {
+		return result, err
+	}
+	a := &inverseApplier{pool: pool, store: store, opts: o, summary: summary, protection: protection, ledger: ledger, keEpoch: keEpoch}
 	if err = a.checkEvidence(ctx, pool); err != nil {
 		return result, err
 	}
@@ -497,7 +526,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteSt
 		}
 		_, err = store.Head(ctx, p.e.Key)
 		if r2.IsNotFound(err) {
-			if err = a.publishAbsent(ctx, p.e, p.manifest); err != nil {
+			if err = a.publishAbsent(ctx, p.e, p.manifest, true); err != nil {
 				return result, err
 			}
 			result.Reconciled++
@@ -528,12 +557,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteSt
 		if len(jobs) >= o.MaxItems || e.SizeBytes > o.MaxBytes-planned {
 			continue
 		}
-		class, _ := protection.classify(e.ObjectInfo)
-		if class != inverseDeletable {
-			continue
-		}
-		ids := protection.Identities[e.Key]
-		if len(ids) != 1 || ids[0].Kind != "raw" {
+		if !strings.HasPrefix(e.Key, "managed/") || r2RetireCheckUngatedPrefix(e.Key) != nil {
 			continue
 		}
 		jobs = append(jobs, e)
@@ -592,4 +616,35 @@ send:
 	result.ElapsedSeconds = time.Since(started).Seconds()
 	result.ObjectsPerSecond = float64(result.Deleted) / result.ElapsedSeconds
 	return result, first
+}
+
+// Apply loads only the small KE path set, not the full4M-row catalog. Every raw
+// target is reloaded and checked under locks. Full catalog maps belong only to
+// the read-only partition; repeated batches must not rescan them.
+func loadInverseApplyProtection(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks, windows map[int64]api.Keep28Window) (inverseProtection, error) {
+	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, KEFolders: map[string]bool{}, Picks: picks, Windows: windows}
+	var streams []int64
+	for id, pick := range picks.Choices {
+		if pick.Choice == "all" {
+			streams = append(streams, id)
+		}
+	}
+	if len(streams) == 0 {
+		return p, nil
+	}
+	rows, err := q.Query(ctx, `SELECT DISTINCT folder FROM (
+ SELECT split_part(c.display_path,'/',1) folder FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE c.bucket=$1 AND r.stream_id=ANY($2::bigint[])
+ UNION SELECT split_part(regexp_replace(o.nas_relative_path,'^joined/',''),'/',1) FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id JOIN recordings r ON r.id=h.recording_id WHERE r.stream_id=ANY($2::bigint[])) folders WHERE folder<>''`, bucket, streams)
+	if err != nil {
+		return p, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var folder string
+		if err = rows.Scan(&folder); err != nil {
+			return p, err
+		}
+		p.KEFolders[folder] = true
+	}
+	return p, rows.Err()
 }
