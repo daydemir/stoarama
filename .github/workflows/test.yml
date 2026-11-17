@@ -42,7 +42,7 @@ jobs:
         run: python -m unittest discover -s infra/collation-v2 -p 'test_*.py' -q
       - name: Test isolated R2 controls on the deployed Python version
         working-directory: clients/nas-pull
-        run: python -m unittest test_r2_copy_control test_r2_copy_worker -q
+        run: python -m unittest test_r2_copy_control test_r2_copy_worker test_heartbeat_v5 test_cleanup_fresh_permit -q
 
   joined-folder-zip-worker:
     runs-on: ubuntu-latest
@@ -96,7 +96,7 @@ jobs:
       - name: Test original NAS presentation witnesses first
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api ./cmd/stoaramactl ./internal/db -run '^Test(NASDeliveryFence|NASR2Copy|NASRedownload|NASListing|NASSelectedVerify|OriginalWitness|NASCleanup|NASStitch|NASClient|NASDiagnostics)' -count=1 -v
+        run: go test ./internal/api ./cmd/stoaramactl ./internal/db -run '^Test(NASDeliveryFence|NASR2Copy|NASRedownload|NASListing|NASSelectedVerify|OriginalWitness|NASCleanup|NASStitch|NASClient|NASDiagnostics|NASHostPressure|ValidateNASHostFacts|HeartbeatDropsInvalidHostFactsKeepsTelemetry)' -count=1 -v
       - name: Test delivery keep holds and unexecutable R2 previews
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

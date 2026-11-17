@@ -18185,7 +18185,7 @@ CLEANUP_V6_VERSIONS: frozenset[str] = frozenset((CLEANUP_GROUP_VERSION, "r2-copy
 CLEANUP_BULK_VERSION = "cleanup-batch-v7"
 CLEANUP_TRUTH_VERSION = "cleanup-batch-v8"
 CLEANUP_FRESH_PERMIT_VERSION = "v85r-nas-proof-v2.2"
-CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v2", "r2-copy-v3", "r2-copy-v4", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
+CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v2", "r2-copy-v3", "r2-copy-v4", "r2-copy-v5", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
 CLEANUP_GROUP_VERSIONS: frozenset[str] = CLEANUP_V6_VERSIONS | CLEANUP_BULK_VERSIONS
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
@@ -18203,7 +18203,7 @@ CLEANUP_RETRYABLE_ATTEMPTS = 8
 def cleanup_execution_group_size():
     # One lease/permit clock per file. NAS syscall latency must never consume
     # another file's short authority window. Historical releases retain v7.
-    return 1 if CLIENT_VERSION in (CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v4") else CLEANUP_EXECUTION_GROUP
+    return 1 if CLIENT_VERSION in (CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v4", "r2-copy-v5") else CLEANUP_EXECUTION_GROUP
 
 
 class CleanupProtocolUnsupported(RuntimeError):
@@ -24979,24 +24979,66 @@ def load_outage(cfg):
     return read_json(cfg.outage_file, None)
 
 
+class HeartbeatStorageUnavailable(RuntimeError):
+    pass
+
+
+def heartbeat_monotonic():
+    # CLOCK_MONOTONIC is shared across processes, including macOS Python 3.9.
+    return time.clock_gettime(time.CLOCK_MONOTONIC)
+
+
+class HeartbeatStorageAge:
+    def __init__(self, observed_at):
+        self.observed_at = observed_at
+
+    def check(self):
+        if heartbeat_monotonic() - self.observed_at > STORAGE_TELEMETRY_MAX_AGE_SEC:
+            raise HeartbeatStorageUnavailable("heartbeat storage sample expired before delivery")
+
+
+def heartbeat_request_json(cfg, payload):
+    # All inventory/host locks and payload construction precede this sample.
+    # Each compatibility attempt calls here anew; cached storage is never sent.
+    age = HeartbeatStorageAge(heartbeat_monotonic())
+    storage = storage_status(cfg)
+    if storage.get("available") is not True:
+        raise HeartbeatStorageUnavailable("heartbeat fresh storage read unavailable; skipped")
+    data = json.dumps(dict(payload, storage=storage)).encode("utf-8")
+    age.check()
+    # urllib's timeout is per socket operation, so it cannot establish M.
+    # The existing isolated transport enforces a TOTAL 20s request watchdog.
+    status, _, raw = r2_copy_http(cfg.api_base + "/account/connections/heartbeat", "POST",
+        {"User-Agent": USER_AGENT, "Authorization": "Bearer " + cfg.api_key, "Content-Type": "application/json"},
+        body=data, limit=1024*1024, timeout=HEARTBEAT_TIMEOUT_SEC, guard=age, input_limit=2*1024*1024, socket_timeout=HEARTBEAT_TIMEOUT_SEC,
+        send_deadline=age.observed_at + STORAGE_TELEMETRY_MAX_AGE_SEC)
+    if status != 200:
+        error = urllib.error.HTTPError("/account/connections/heartbeat", status, "heartbeat refused", {}, None)
+        if error.fp is not None:
+            error.close()
+        raise error
+    result = json.loads(raw.decode("utf-8")) if raw else {}
+    if not isinstance(result, dict):
+        raise RuntimeError("invalid heartbeat response")
+    CLIENT_LOG_RING.add_secrets(diagnostic_secret_values(result, response=True))
+    return result
+
+
 def send_heartbeat_payload(cfg, payload):
     try:
-        return request_json(cfg, "POST", "/account/connections/heartbeat",
-                            body=payload, timeout=HEARTBEAT_TIMEOUT_SEC)
+        return heartbeat_request_json(cfg, payload)
     except urllib.error.HTTPError as exc:
         host = payload.get("host")
         if exc.code != 400 or not isinstance(host, dict) or "release" not in host:
             raise
         payload["host"] = {k: v for k, v in host.items() if k != "release"}
-        return request_json(cfg, "POST", "/account/connections/heartbeat",
-                            body=payload, timeout=HEARTBEAT_TIMEOUT_SEC)
+        return heartbeat_request_json(cfg, payload)
 
 
 def send_heartbeat(cfg, runtime, outage):
     payload = runtime.heartbeat_payload(outage)
     try:
-        return request_json(cfg, "POST", "/account/connections/heartbeat",
-                            body=payload, timeout=HEARTBEAT_TIMEOUT_SEC)
+        return heartbeat_request_json(cfg, payload)
     except urllib.error.HTTPError as exc:
         host = payload.get("host")
         if exc.code == 400 and "cleanup" in payload:
@@ -25009,8 +25051,7 @@ def send_heartbeat(cfg, runtime, outage):
         # Retry only without that field; authentication and all other telemetry
         # stay exact, and any second rejection follows normal outage handling.
         payload["host"] = {k: v for k, v in host.items() if k != "release"}
-        return request_json(cfg, "POST", "/account/connections/heartbeat",
-                            body=payload, timeout=HEARTBEAT_TIMEOUT_SEC)
+        return heartbeat_request_json(cfg, payload)
 
 
 def heartbeat_loop(cfg, runtime, stop_event):
@@ -25472,6 +25513,63 @@ def meminfo_bytes(text):
     return values.get("MemTotal", 0), values.get("MemAvailable", 0)
 
 
+# Optional host pressure diagnostics. These never feed resource admission.
+PROC_DIAGNOSTIC_MAX_BYTES = 64 * 1024
+PROC_DIAGNOSTIC_MAX_VM_FIELDS = 20
+PROC_MEMINFO_FIELDS = frozenset(("MemFree", "Buffers", "Cached", "SwapCached", "Active(anon)",
+    "Inactive(anon)", "Active(file)", "Inactive(file)", "Dirty", "Writeback", "AnonPages", "Shmem",
+    "Slab", "SReclaimable", "SUnreclaim", "SwapTotal", "SwapFree"))
+
+
+def proc_pressure_diagnostics(meminfo, stat, vmstat):
+    result = {}
+    for section, text in (("meminfo_bytes", meminfo), ("proc_stat", stat), ("vmstat", vmstat)):
+        values = {}
+        for line in (text or "")[:PROC_DIAGNOSTIC_MAX_BYTES].splitlines():
+            parts = line.split()
+            if section == "meminfo_bytes":
+                if len(parts) != 3 or parts[2] != "kB" or not parts[0].endswith(":"):
+                    continue
+                name, raw = parts[0][:-1], parts[1]
+                if name not in PROC_MEMINFO_FIELDS:
+                    continue
+            else:
+                if len(parts) != 2:
+                    continue
+                name, raw = parts
+                if section == "proc_stat":
+                    if name not in ("procs_running", "procs_blocked"):
+                        continue
+                elif not (name in ("pswpin", "pswpout", "pgmajfault") or
+                        (len(name) <= 32 and re.fullmatch(r"[a-z0-9_]+", name) and
+                         name.startswith(("pgscan_kswapd", "pgsteal_kswapd")))):
+                    continue
+            if len(raw) > 19 or not raw.isascii() or not raw.isdigit():
+                continue
+            value = int(raw) * (1024 if section == "meminfo_bytes" else 1)
+            if value > (1 << 63) - 1:
+                continue
+            if section == "vmstat" and name not in values and len(values) >= PROC_DIAGNOSTIC_MAX_VM_FIELDS:
+                continue
+            values[name] = value
+        if values:
+            result[section] = values
+    return result
+
+
+def memory_hold_diagnostics(reason):
+    if reason not in ("copy memory headroom", "copy cgroup memory telemetry unavailable",
+                      "NAS memory or load critical", "cgroup memory usage unavailable"):
+        return ""
+    snapshot = nas_pressure_snapshot(_read_text("/proc/meminfo"))
+    return " memory_diagnostics=" + json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+
+
+def nas_pressure_snapshot(meminfo):
+    return proc_pressure_diagnostics(meminfo, _read_text("/proc/stat", PROC_DIAGNOSTIC_MAX_BYTES),
+                                     _read_text("/proc/vmstat", PROC_DIAGNOSTIC_MAX_BYTES))
+
+
 def process_memory_bytes(text):
     """Client-only RSS, not child processes or a census of the NAS services."""
     fields = {"VmRSS": "client_rss_bytes", "VmHWM": "client_peak_rss_bytes"}
@@ -25550,7 +25648,11 @@ class HostFacts:
             if self.static is None:
                 self.static = self._gather_static()
             facts = dict(self.static)
-        total, available = meminfo_bytes(_read_text("/proc/meminfo"))
+        meminfo = _read_text("/proc/meminfo")
+        total, available = meminfo_bytes(meminfo)
+        diagnostics = nas_pressure_snapshot(meminfo)
+        if diagnostics:
+            facts["memory_diagnostics"] = diagnostics
         facts["mem_total_bytes"] = total
         facts["mem_available_bytes"] = available
         facts.update(process_memory_bytes(_read_text("/proc/self/status", 8192)))
@@ -50401,7 +50503,7 @@ def stitch_loop(cfg, inventory, stop_event):
             STITCH_STATUS.update(state="paused")
             reason = ("proof failed: " + stitch_measure_error(exc).value) if proof_mode else str(exc)
             STITCH_STATUS.fail(reason)
-            log("WARN", "V85r stitch HOLD: %s" % reason[:300])
+            log("WARN", "V85r stitch HOLD: %s%s" % (reason[:300], memory_hold_diagnostics(str(exc))))
         finally:
             STITCH_ACTIVE.clear()
         stop_event.wait(retry)
@@ -52311,7 +52413,18 @@ def r2_copy_report_block(inventory, control, task, reason):
 # during DNS, TLS, trickling headers, or a read that never becomes idle. The
 # child has no NAS file paths, no inherited credentials, and cannot write media.
 R2_COPY_HTTP_CHILD = r'''
-import base64,json,sys,urllib.error,urllib.request
+import base64,http.client,json,sys,time,urllib.error,urllib.request
+class FreshSend:
+    def send(self,data):
+        if self.sock is None:self.connect()
+        if time.clock_gettime(time.CLOCK_MONOTONIC)>p["send_deadline"]:raise TimeoutError("storage sample expired before send")
+        return super().send(data)
+class FreshHTTP(FreshSend,http.client.HTTPConnection):pass
+class FreshHTTPS(FreshSend,http.client.HTTPSConnection):pass
+class FreshHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self,req):return self.do_open(FreshHTTP,req)
+class FreshHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self,req):return self.do_open(FreshHTTPS,req,context=self._context)
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,*args,**kwargs):
         raise OSError("redirect refused")
@@ -52320,7 +52433,9 @@ try:
     req=urllib.request.Request(p["url"],method=p["method"],headers=p["headers"],
         data=base64.b64decode(p["body"]) if p["body"] is not None else None)
     try:
-        response=urllib.request.build_opener(NoRedirect()).open(req,timeout=2)
+        handlers=[NoRedirect()]
+        if p.get("send_deadline") is not None:handlers.extend((FreshHTTPHandler(),FreshHTTPSHandler()))
+        response=urllib.request.build_opener(*handlers).open(req,timeout=p.get("socket_timeout",2))
     except urllib.error.HTTPError as error:
         sys.stdout.buffer.write((json.dumps({"status":error.code,"headers":{}})+"\n").encode())
         sys.stdout.buffer.flush()
@@ -52339,12 +52454,12 @@ except Exception:
 '''
 
 
-def r2_copy_http(url, method, headers, body=None, limit=R2_COPY_RANGE, timeout=10, guard=None):
+def r2_copy_http(url, method, headers, body=None, limit=R2_COPY_RANGE, timeout=10, guard=None, input_limit=32768, socket_timeout=2, send_deadline=None):
     import select
     message = json.dumps({"url": url, "method": method, "headers": headers,
                           "body": base64.b64encode(body).decode() if body is not None else None,
-                          "limit": limit}).encode()
-    if len(message) > 32768:
+                          "limit": limit, "socket_timeout": socket_timeout, "send_deadline": send_deadline}).encode()
+    if len(message) > input_limit:
         raise R2CopyHold("copy HTTP input exceeds bound")
     deadline = time.monotonic() + timeout
     process = subprocess.Popen([sys.executable, "-I", "-c", R2_COPY_HTTP_CHILD], stdin=subprocess.PIPE,
@@ -53076,7 +53191,7 @@ def r2_copy_worker(cfg, runtime, inventory, stop, worker):
             except Exception as exc:
                 reason = str(exc) if isinstance(exc, (R2CopyHold, StitchHold)) else type(exc).__name__
                 R2_COPY_TELEMETRY.hold(reason)
-                log("WARN", "R2 copy held: %s" % reason)
+                log("WARN", "R2 copy held: %s%s" % (reason, memory_hold_diagnostics(reason)))
 
 
 def r2_copy_loop(cfg, runtime, inventory, stop):

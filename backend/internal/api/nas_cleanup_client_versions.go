@@ -24,6 +24,7 @@ const nasCleanupBulkDurabilityClientVersion = "cleanup-batch-v7"
 const nasCleanupItemTruthClientVersion = "cleanup-batch-v8"
 
 const nasCleanupR2CopyClientVersion = "r2-copy-v2"
+const nasCleanupR2CopyDiagnosticsClientVersion = "r2-copy-v5"
 const nasCleanupR2CopyProgressClientVersion = "r2-copy-v4"
 const nasCleanupR2CopyControlClientVersion = "r2-copy-v3"
 const nasCleanupProofClientVersion = "v85r-nas-proof-v2"
@@ -51,7 +52,7 @@ func nasClientSupportsStitchProof(version string) bool {
 
 func nasCleanupSupportsBulk(version string) bool {
 	switch version {
-	case nasCleanupR2CopyProgressClientVersion, nasCleanupBulkDurabilityClientVersion, nasCleanupItemTruthClientVersion, nasCleanupR2CopyClientVersion, nasCleanupR2CopyControlClientVersion, "v85r-nas-proof-v1", nasCleanupProofClientVersion, nasCleanupPermitTransportClientVersion, nasCleanupFreshPermitClientVersion:
+	case nasCleanupR2CopyDiagnosticsClientVersion, nasCleanupR2CopyProgressClientVersion, nasCleanupBulkDurabilityClientVersion, nasCleanupItemTruthClientVersion, nasCleanupR2CopyClientVersion, nasCleanupR2CopyControlClientVersion, "v85r-nas-proof-v1", nasCleanupProofClientVersion, nasCleanupPermitTransportClientVersion, nasCleanupFreshPermitClientVersion:
 		return true
 	default:
 		return false

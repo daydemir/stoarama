@@ -50,6 +50,7 @@ type nasReleaseHealth struct {
 }
 
 type nasHostFacts struct {
+	MemoryDiagnostics      *nasHostPressure  `json:"memory_diagnostics,omitempty"`
 	Release                *nasReleaseHealth `json:"release,omitempty"`
 	Machine                string            `json:"machine"`
 	System                 string            `json:"system"`
