@@ -27,6 +27,30 @@ CREATE TRIGGER r2_inverse_intent_immutable BEFORE UPDATE OR DELETE ON r2_inverse
  FOR EACH ROW EXECUTE FUNCTION guard_r2_object_retirement();
 CREATE TRIGGER r2_inverse_event_immutable BEFORE UPDATE OR DELETE ON r2_inverse_events
  FOR EACH ROW EXECUTE FUNCTION guard_r2_object_retirement();
+-- A verifier may issue wire authority for an intent only once, across restarts.
+CREATE TABLE r2_inverse_attempts (
+ bucket text NOT NULL,object_key text NOT NULL,issued_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+ PRIMARY KEY(bucket,object_key),FOREIGN KEY(bucket,object_key) REFERENCES r2_inverse_intents(bucket,object_key)
+);
+CREATE TRIGGER r2_inverse_attempt_immutable BEFORE UPDATE OR DELETE ON r2_inverse_attempts
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_object_retirement();
+CREATE TRIGGER r2_inverse_attempt_no_truncate BEFORE TRUNCATE ON r2_inverse_attempts
+ FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_object_retirement();
+
+-- Derive live delivery closure, without a separately refreshed source cache.
+CREATE INDEX r2_inverse_delivery_key ON delivery_keep_holds(object_key);
+CREATE INDEX r2_inverse_output_sources ON recording_collation_outputs USING gin(source_clip_ids);
+CREATE FUNCTION r2_inverse_delivery_held(i bigint,b text,k text,p text,sha text,n bigint) RETURNS boolean LANGUAGE sql STABLE AS $$
+ SELECT delivery_nas_held('raw',i,p,sha,n)
+ OR EXISTS(SELECT 1 FROM delivery_keep_holds WHERE bucket=b AND object_key=k)
+ OR EXISTS(SELECT 1 FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id
+  WHERE o.source_clip_ids @> ARRAY[i] AND (
+   EXISTS(SELECT 1 FROM delivery_keep_holds d WHERE d.object_key=o.object_key)
+   OR EXISTS(SELECT 1 FROM delivery_keep_holds d WHERE d.relative_path<>'' AND d.relative_path IN(o.nas_relative_path,regexp_replace(o.nas_relative_path,'^joined/','')))
+   OR EXISTS(SELECT 1 FROM delivery_keep_holds d WHERE d.sha256<>'' AND d.sha256=o.sha256 AND d.size_bytes=o.size_bytes)
+   OR EXISTS(SELECT 1 FROM delivery_keep_output_dependencies d WHERE d.output_id=o.id AND d.recording_id=h.recording_id)))
+$$;
+
 -- Minute buckets conservatively charge up to one extra minute, never less than
 -- the previous 24h. Intent bytes remain charged even if the wire result is lost.
 CREATE TABLE r2_inverse_budget_minutes (
@@ -100,32 +124,21 @@ CREATE TRIGGER r2_inverse_delivery_source_fence BEFORE INSERT OR UPDATE ON deliv
 CREATE TRIGGER r2_inverse_delivery_output_fence BEFORE INSERT OR UPDATE ON delivery_keep_output_dependencies
  FOR EACH STATEMENT EXECUTE FUNCTION fence_r2_inverse_protection();
 CREATE FUNCTION guard_r2_inverse_delivery_admission() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
- IF TG_TABLE_NAME='delivery_nas_source_holds' THEN
-  IF EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE kind='raw' AND source_id=NEW.clip_id) THEN
-   RAISE EXCEPTION 'R2 retirement reservation forbids delivery source adoption'; END IF;
- ELSIF TG_TABLE_NAME='delivery_keep_output_dependencies' THEN
-  IF EXISTS(SELECT 1 FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id
-   JOIN r2_retirement_reservations r ON r.kind='raw' AND r.source_id=ANY(o.source_clip_ids)
-   WHERE o.id=NEW.output_id AND h.recording_id=NEW.recording_id) THEN
-   RAISE EXCEPTION 'R2 retirement reservation forbids delivery dependency adoption'; END IF;
- ELSE
-  IF EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE bucket=NEW.bucket AND object_key=NEW.object_key)
-  OR EXISTS(SELECT 1 FROM r2_inverse_intents WHERE bucket=NEW.bucket AND object_key=NEW.object_key)
-  OR EXISTS(SELECT 1 FROM recording_clips c JOIN r2_retirement_reservations r ON r.kind='raw' AND r.source_id=c.id
-   WHERE (NEW.relative_path<>'' AND NEW.relative_path IN(c.display_path,regexp_replace(c.display_path,'^joined/','')))
-   OR (NEW.sha256<>'' AND NEW.sha256=c.sha256 AND NEW.size_bytes=c.size_bytes))
-  OR EXISTS(SELECT 1 FROM recording_collation_outputs o JOIN r2_retirement_reservations r ON r.kind='raw' AND r.source_id=ANY(o.source_clip_ids)
-   WHERE o.object_key=NEW.object_key) THEN
-   RAISE EXCEPTION 'R2 retirement reservation forbids delivery key adoption'; END IF;
- END IF;
- RETURN NEW;
+ IF EXISTS(SELECT 1 FROM r2_retirement_reservations r JOIN recording_clips c ON r.kind='raw' AND r.source_id=c.id
+  WHERE r2_inverse_delivery_held(c.id,c.bucket,c.object_key,c.display_path,lower(c.sha256),c.size_bytes))
+ OR EXISTS(SELECT 1 FROM r2_retirement_reservations r JOIN delivery_keep_holds d USING(bucket,object_key))
+ OR EXISTS(SELECT 1 FROM r2_inverse_intents i JOIN delivery_keep_holds d USING(bucket,object_key)) THEN
+  RAISE EXCEPTION 'R2 retirement reservation forbids delivery adoption'; END IF;
+ RETURN NULL;
 END $$;
-CREATE TRIGGER r2_inverse_delivery_key_admission BEFORE INSERT OR UPDATE ON delivery_keep_holds
- FOR EACH ROW EXECUTE FUNCTION guard_r2_inverse_delivery_admission();
-CREATE TRIGGER r2_inverse_delivery_source_admission BEFORE INSERT OR UPDATE ON delivery_nas_source_holds
- FOR EACH ROW EXECUTE FUNCTION guard_r2_inverse_delivery_admission();
-CREATE TRIGGER r2_inverse_delivery_output_admission BEFORE INSERT OR UPDATE ON delivery_keep_output_dependencies
- FOR EACH ROW EXECUTE FUNCTION guard_r2_inverse_delivery_admission();
+-- One complete closure check per statement, after new rows are visible, while
+-- the BEFORE statement fence still excludes every network worker.
+CREATE TRIGGER r2_inverse_delivery_key_admission AFTER INSERT OR UPDATE ON delivery_keep_holds
+ FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_inverse_delivery_admission();
+CREATE TRIGGER r2_inverse_delivery_source_admission AFTER INSERT OR UPDATE ON delivery_nas_source_holds
+ FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_inverse_delivery_admission();
+CREATE TRIGGER r2_inverse_delivery_output_admission AFTER INSERT OR UPDATE ON delivery_keep_output_dependencies
+ FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_inverse_delivery_admission();
 
 CREATE FUNCTION guard_r2_inverse_output_key() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
  IF EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE object_key=NEW.object_key)
@@ -135,6 +148,12 @@ CREATE FUNCTION guard_r2_inverse_output_key() RETURNS trigger LANGUAGE plpgsql A
 END $$;
 CREATE TRIGGER r2_inverse_output_key_admission BEFORE INSERT OR UPDATE OF object_key ON recording_collation_outputs
  FOR EACH ROW EXECUTE FUNCTION guard_r2_inverse_output_key();
+
+-- Output dependency membership/content can also create a live delivery alias.
+CREATE TRIGGER r2_inverse_output_delivery_admission AFTER INSERT OR UPDATE OF object_key,nas_relative_path,collation_hour_id,source_clip_ids,sha256,size_bytes ON recording_collation_outputs
+ FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_inverse_delivery_admission();
+CREATE TRIGGER r2_inverse_hour_delivery_admission AFTER UPDATE OF recording_id ON recording_collation_hours
+ FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_inverse_delivery_admission();
 
 -- Freeze pending source identity after admission commits. Once confirmed
 -- absent, immutable receipts retain history without permanently locking the
@@ -161,7 +180,7 @@ CREATE FUNCTION advance_r2_inverse_ke_epoch() RETURNS trigger LANGUAGE plpgsql A
 END $$;
 CREATE TRIGGER r2_inverse_ke_raw_epoch BEFORE INSERT OR UPDATE OF bucket,display_path,recording_id OR DELETE ON recording_clips
  FOR EACH STATEMENT EXECUTE FUNCTION advance_r2_inverse_ke_epoch();
-CREATE TRIGGER r2_inverse_ke_output_epoch BEFORE INSERT OR UPDATE OF object_key,nas_relative_path,collation_hour_id OR DELETE ON recording_collation_outputs
+CREATE TRIGGER r2_inverse_ke_output_epoch BEFORE INSERT OR UPDATE OF object_key,nas_relative_path,collation_hour_id,source_clip_ids,sha256,size_bytes OR DELETE ON recording_collation_outputs
  FOR EACH STATEMENT EXECUTE FUNCTION advance_r2_inverse_ke_epoch();
 CREATE TRIGGER r2_inverse_ke_hour_epoch BEFORE UPDATE OF recording_id ON recording_collation_hours
  FOR EACH STATEMENT EXECUTE FUNCTION advance_r2_inverse_ke_epoch();

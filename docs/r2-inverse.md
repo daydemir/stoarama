@@ -68,10 +68,17 @@ The tick can generate a new read-only partition when its current one expires.
 Each new key commits an ordinary source reservation and a permanent key intent
 before wire, charges its byte budget, and fsyncs a private append-only JSONL
 ledger. The network phase uses shared admission locks so independent keys can
-run concurrently. It exercises the installed purge guards before DELETE, rolls
+run concurrently. A common live delivery predicate includes content/path aliases
+and current collated-output dependencies without relying on a refreshed source
+cache; admission of those protections and output membership changes is fenced. It exercises the installed purge guards before DELETE, rolls
 that probe back, HEAD-checks listing/catalog ETag, size and seven-day age, and
 rechecks live protections, controller drain evidence and migration 0198 at the
-wire. There is one DELETE attempt, no SDK replay or redirects. Success requires
+wire. The private concrete executor verifier issues authority only after these checks
+and independently commits a permanent one-issuance row. No exported approval
+callback or generic R2 delete API is added. Repeated verification cannot remint
+authority. The entire per-key network phase has a 30-second deadline, including
+HEAD, multipart inspection and confirming HEAD; timeout retains the intent for
+reconciliation. There is one DELETE attempt, no SDK replay or redirects. Success requires
 a confirming 404. Receipt and raw purged_at publication happens separately with
 exclusive admission locks, without upgrading a network transaction's locks.
 
@@ -106,3 +113,7 @@ Controller canary gate after Nov 19 14:30:47Z AND actual drain evidence:
 5. Only after every gate passes, configure larger controller-owned batches.
    Tick integration is a later change.
    Keep the same durable ledger across runs. Preserve reports outside temp.
+
+Full-cardinality startup cost and memory remain unmeasured: each invocation reads
+the manifest, private ledger and historical intent keys. The offline throughput
+fixture includes 10,010 collated outputs but does not establish 4.17M-key scale.

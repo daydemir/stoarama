@@ -170,11 +170,22 @@ WITH held_sources AS (
  UNION SELECT item->>'bucket',item->>'object_key' FROM nas_r2_copy_items WHERE state='blocked'
 ) SELECT object_key FROM held_keys WHERE bucket=$1`
 const inverseDeliverySQL = `
+WITH delivery_outputs AS (
+ SELECT o.object_key,o.source_clip_ids FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id
+ WHERE EXISTS(SELECT 1 FROM delivery_keep_output_dependencies d WHERE d.output_id=o.id AND d.recording_id=h.recording_id)
+ OR EXISTS(SELECT 1 FROM delivery_nas_source_holds d WHERE d.clip_id=ANY(o.source_clip_ids))
+ OR EXISTS(SELECT 1 FROM delivery_keep_holds d WHERE d.object_key=o.object_key)
+ OR EXISTS(SELECT 1 FROM delivery_keep_holds d WHERE d.relative_path<>'' AND d.relative_path IN(o.nas_relative_path,regexp_replace(o.nas_relative_path,'^joined/','')))
+ OR EXISTS(SELECT 1 FROM delivery_keep_holds d WHERE d.sha256<>'' AND d.sha256=o.sha256 AND d.size_bytes=o.size_bytes)
+)
 SELECT object_key FROM delivery_keep_holds WHERE bucket=$1
 UNION SELECT c.object_key FROM recording_clips c JOIN delivery_nas_source_holds d ON d.clip_id=c.id WHERE c.bucket=$1
-UNION SELECT o.object_key FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id
-WHERE EXISTS(SELECT 1 FROM delivery_keep_output_dependencies d WHERE d.output_id=o.id AND d.recording_id=h.recording_id)
- OR EXISTS(SELECT 1 FROM delivery_nas_source_holds d WHERE d.clip_id=ANY(o.source_clip_ids))`
+UNION SELECT c.object_key FROM recording_clips c JOIN delivery_keep_holds d ON d.bucket=c.bucket AND d.object_key=c.object_key WHERE c.bucket=$1
+UNION SELECT c.object_key FROM recording_clips c JOIN delivery_keep_holds d ON d.relative_path<>'' AND d.relative_path IN(c.display_path,regexp_replace(c.display_path,'^joined/','')) WHERE c.bucket=$1
+UNION SELECT c.object_key FROM recording_clips c JOIN delivery_keep_holds d ON d.sha256<>'' AND d.sha256=lower(c.sha256) AND d.size_bytes=c.size_bytes WHERE c.bucket=$1
+UNION SELECT object_key FROM delivery_outputs
+UNION SELECT c.object_key FROM delivery_outputs o CROSS JOIN LATERAL unnest(o.source_clip_ids) source_id
+ JOIN recording_clips c ON c.id=source_id WHERE c.bucket=$1`
 
 func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks, windows map[int64]api.Keep28Window) (inverseProtection, error) {
 	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, KEFolders: map[string]bool{}, Windows: windows, Picks: picks}

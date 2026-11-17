@@ -1,0 +1,158 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"sync/atomic"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/jackc/pgx/v5"
+)
+
+type inverseDeleteBinding struct {
+	Bucket, EndpointSHA256, Key, ETag                      string
+	ManifestSHA256, PolicySHA256, PicksSHA256, DrainSHA256 string
+	SourceID, StreamID, SizeBytes                          int64
+	LastModified                                           time.Time
+}
+
+// Only the concrete executor verifier below can issue this private capability.
+// Copies share consumption state, and the DB independently forbids reminting.
+type inverseDeleteAuthority struct {
+	binding inverseDeleteBinding
+	guard   *inverseWireGuard
+	used    *atomic.Bool
+}
+
+func (a *inverseDeleteAuthority) requireWire(ctx context.Context, bucket, endpoint string) error {
+	if a == nil || a.used == nil || !a.used.CompareAndSwap(false, true) {
+		return errors.New("inverse authority absent or consumed")
+	}
+	return a.check(ctx, bucket, endpoint)
+}
+func (a *inverseDeleteAuthority) check(ctx context.Context, bucket, endpoint string) error {
+	if a.guard == nil || bucket != a.binding.Bucket || endpoint != a.binding.EndpointSHA256 {
+		return errors.New("inverse wire binding differs")
+	}
+	if err := a.guard.check(ctx, a.binding); err != nil {
+		return err
+	}
+	var issued bool
+	err := a.guard.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_attempts WHERE bucket=$1 AND object_key=$2)`, bucket, a.binding.Key).Scan(&issued)
+	if err != nil {
+		return err
+	}
+	if !issued {
+		return errors.New("durable wire issuance missing")
+	}
+	return nil
+}
+
+func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntry) (*inverseDeleteAuthority, error) {
+	if err := inverseProtectionLocks(ctx, tx, true); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT lock_nas_r2_copy_key($1,$2)`, a.store.Bucket(), e.Key); err != nil {
+		return nil, err
+	}
+	target, err := a.loadTarget(ctx, tx, e)
+	if err != nil {
+		return nil, err
+	}
+	if err = a.checkTarget(ctx, tx, target, e, true); err != nil {
+		return nil, err
+	}
+	head, err := a.store.Head(ctx, e.Key)
+	if err != nil {
+		return nil, err
+	}
+	var now time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return nil, err
+	}
+	item := r2RetireItem{r2RetireCandidate: r2RetireCandidate{SizeBytes: e.SizeBytes, SHA256: target.SHA, ETag: e.ETag}}
+	if err = r2RetireValidateGuardHead(head, item, target.ETag, 7*24*time.Hour, now); err != nil {
+		return nil, err
+	}
+	if e.LastModified.IsZero() || !head.LastModified.Equal(e.LastModified) || !e.LastModified.Before(now.Add(-7*24*time.Hour)) {
+		return nil, errors.New("listing LastModified missing, changed or too young")
+	}
+	if err = a.store.RequireNoMultipartUploads(ctx); err != nil {
+		return nil, err
+	}
+	guard := &inverseWireGuard{a, tx, target, e}
+	binding := guard.binding()
+	if err = guard.check(ctx, binding); err != nil {
+		return nil, err
+	}
+	// Independent commit precedes capability issuance. Even another verifier or
+	// process cannot remint authority after any ambiguous/crashed wire attempt.
+	tag, err := a.pool.Exec(ctx, `INSERT INTO r2_inverse_attempts(bucket,object_key) VALUES($1,$2) ON CONFLICT DO NOTHING`, binding.Bucket, binding.Key)
+	if err != nil {
+		return nil, err
+	}
+	if tag.RowsAffected() != 1 {
+		return nil, errors.New("inverse wire authority was already issued; reconcile only")
+	}
+	return &inverseDeleteAuthority{binding: binding, guard: guard, used: &atomic.Bool{}}, nil
+}
+
+type inverseSDKStore struct {
+	*r2.Client
+	sdk       *s3.Client
+	transport http.RoundTripper
+}
+
+func newInverseSDKStore(ctx context.Context, cfg r2.Config) (*inverseSDKStore, error) {
+	reader, err := r2.New(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	region := cfg.Region
+	if region == "" {
+		region = "auto"
+	}
+	transport := awshttp.NewBuildableClient().GetTransport()
+	sdk := s3.NewFromConfig(aws.Config{Region: region, Credentials: credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")}, func(o *s3.Options) {
+		o.UsePathStyle = true
+		o.BaseEndpoint = aws.String(cfg.Endpoint)
+		o.Retryer = aws.NopRetryer{}
+	})
+	return &inverseSDKStore{reader, sdk, transport}, nil
+}
+func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDeleteAuthority) error {
+	if err := authority.requireWire(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
+		return err
+	}
+	transport := &inverseDeleteTransport{base: s.transport, authority: authority, bucket: s.Bucket(), endpoint: s.EndpointSHA256()}
+	_, err := s.sdk.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.Bucket()), Key: aws.String(authority.binding.Key)}, func(o *s3.Options) {
+		o.Retryer = aws.NopRetryer{}
+		o.HTTPClient = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	})
+	return err
+}
+
+type inverseDeleteTransport struct {
+	base             http.RoundTripper
+	authority        *inverseDeleteAuthority
+	bucket, endpoint string
+	attempted        atomic.Bool
+}
+
+func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method != http.MethodDelete || req.URL.Path != "/"+t.bucket+"/"+t.authority.binding.Key || req.URL.RawQuery != "x-id=DeleteObject" || !t.attempted.CompareAndSwap(false, true) {
+		return nil, errors.New("inverse transport permits one exact DELETE")
+	}
+	if err := t.authority.check(req.Context(), t.bucket, t.endpoint); err != nil {
+		return nil, err
+	}
+	req.Header.Del("Idempotency-Key")
+	req.Header.Del("X-Idempotency-Key")
+	return t.base.RoundTrip(req)
+}

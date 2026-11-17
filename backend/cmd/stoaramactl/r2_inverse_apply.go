@@ -29,7 +29,7 @@ type inverseDeleteStore interface {
 	Head(context.Context, string) (r2.ObjectHead, error)
 	EndpointSHA256() string
 	RequireNoMultipartUploads(context.Context) error
-	DeleteNonKeep28Once(context.Context, *r2.NonKeep28DeleteAuthority) error
+	deleteOnce(context.Context, *inverseDeleteAuthority) error
 }
 type inverseDrainEvidence struct {
 	Bucket                 string    `json:"bucket"`
@@ -183,8 +183,7 @@ const inverseRawHeldSQL = `SELECT
  OR EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE bucket=$2 AND object_key=$3 AND NOT (kind='raw' AND source_id=$1 AND manifest_sha256=$4))
  OR EXISTS(SELECT 1 FROM r2_object_retirements WHERE bucket=$2 AND object_key=$3)
  OR EXISTS(SELECT 1 FROM nas_r2_copy_items WHERE (state<>'verified' OR blocked_reason<>'') AND item->>'bucket'=$2 AND item->>'object_key'=$3)
- OR EXISTS(SELECT 1 FROM delivery_keep_holds WHERE bucket=$2 AND (object_key=$3 OR (relative_path<>'' AND relative_path=$5)))
- OR EXISTS(SELECT 1 FROM delivery_nas_source_holds WHERE clip_id=$1)
+ OR r2_inverse_delivery_held($1,$2,$3,$5,$6,$7)
  OR EXISTS(SELECT 1 FROM nas_restore_requests WHERE clip_id=$1 AND state IN ('pending','leased'))
  OR EXISTS(SELECT 1 FROM recording_joined_source_snapshots WHERE clip_id=$1)
  OR EXISTS(SELECT 1 FROM recording_joined_snapshot_scopes s JOIN recording_joined_batches b ON b.id=s.batch_record_id AND b.state='snapshotting' JOIN recording_clips c ON c.id=$1 WHERE s.recording_id=c.recording_id AND s.recording_job_id=c.recording_job_id AND c.id<=s.high_water_clip_id)
@@ -202,7 +201,7 @@ func (a *inverseApplier) checkTarget(ctx context.Context, tx pgx.Tx, t inverseRa
 		return errors.New("KE catalog identity changed; refresh partition before further wire attempts")
 	}
 	var held bool
-	if err := tx.QueryRow(ctx, inverseRawHeldSQL, t.ID, a.store.Bucket(), e.Key, a.opts.ManifestSHA, t.Path).Scan(&held); err != nil {
+	if err := tx.QueryRow(ctx, inverseRawHeldSQL, t.ID, a.store.Bucket(), e.Key, a.opts.ManifestSHA, t.Path, t.SHA, t.Size).Scan(&held); err != nil {
 		return err
 	}
 	if held {
@@ -283,10 +282,10 @@ type inverseWireGuard struct {
 	e  inverseEntry
 }
 
-func (g *inverseWireGuard) binding() r2.NonKeep28DeleteBinding {
-	return r2.NonKeep28DeleteBinding{Bucket: g.a.store.Bucket(), EndpointSHA256: g.a.store.EndpointSHA256(), Key: g.e.Key, ETag: g.e.ETag, SourceID: g.t.ID, StreamID: g.t.StreamID, SizeBytes: g.e.SizeBytes, LastModified: g.e.LastModified, ManifestSHA256: g.a.opts.ManifestSHA, PolicySHA256: g.a.summary.PolicySHA256, PicksSHA256: g.a.summary.PicksSHA256, DrainSHA256: g.a.opts.DrainSHA}
+func (g *inverseWireGuard) binding() inverseDeleteBinding {
+	return inverseDeleteBinding{Bucket: g.a.store.Bucket(), EndpointSHA256: g.a.store.EndpointSHA256(), Key: g.e.Key, ETag: g.e.ETag, SourceID: g.t.ID, StreamID: g.t.StreamID, SizeBytes: g.e.SizeBytes, LastModified: g.e.LastModified, ManifestSHA256: g.a.opts.ManifestSHA, PolicySHA256: g.a.summary.PolicySHA256, PicksSHA256: g.a.summary.PicksSHA256, DrainSHA256: g.a.opts.DrainSHA}
 }
-func (g *inverseWireGuard) CheckNonKeep28Delete(ctx context.Context, binding r2.NonKeep28DeleteBinding) error {
+func (g *inverseWireGuard) check(ctx context.Context, binding inverseDeleteBinding) error {
 	if binding != g.binding() {
 		return errors.New("wire authority scope differs")
 	}
@@ -294,7 +293,7 @@ func (g *inverseWireGuard) CheckNonKeep28Delete(ctx context.Context, binding r2.
 		return err
 	}
 	var durable bool
-	err := g.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_intents WHERE bucket=$1 AND object_key=$2 AND source_id=$3 AND manifest_sha256=$4 AND drain_evidence_sha256=$5 AND endpoint_sha256=$6 AND size_bytes=$7 AND etag=$8 AND stream_id=$9)`, binding.Bucket, binding.Key, g.t.ID, g.a.opts.ManifestSHA, g.a.opts.DrainSHA, binding.EndpointSHA256, g.e.SizeBytes, g.e.ETag, g.t.StreamID).Scan(&durable)
+	err := g.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_intents WHERE bucket=$1 AND object_key=$2 AND source_id=$3 AND manifest_sha256=$4 AND drain_evidence_sha256=$5 AND endpoint_sha256=$6 AND size_bytes=$7 AND etag=$8 AND stream_id=$9 AND picks_sha256=$10 AND policy_sha256=$11 AND last_modified=$12)`, binding.Bucket, binding.Key, g.t.ID, g.a.opts.ManifestSHA, g.a.opts.DrainSHA, binding.EndpointSHA256, g.e.SizeBytes, g.e.ETag, g.t.StreamID, binding.PicksSHA256, binding.PolicySHA256, binding.LastModified).Scan(&durable)
 	if err != nil {
 		return err
 	}
@@ -303,8 +302,13 @@ func (g *inverseWireGuard) CheckNonKeep28Delete(ctx context.Context, binding r2.
 	}
 	return nil
 }
+
+const inverseNetworkTimeout = 30 * time.Second
+
 func (a *inverseApplier) delete(ctx context.Context, e inverseEntry) (bool, error) {
-	t, err := a.reserve(ctx, e)
+	ctx, cancel := context.WithTimeout(ctx, inverseNetworkTimeout)
+	defer cancel()
+	_, err := a.reserve(ctx, e)
 	if err != nil {
 		return false, err
 	}
@@ -316,45 +320,14 @@ func (a *inverseApplier) delete(ctx context.Context, e inverseEntry) (bool, erro
 		return false, err
 	}
 	defer tx.Rollback(context.Background())
-	if err = inverseProtectionLocks(ctx, tx, true); err != nil {
-		return false, err
-	}
-	if _, err = tx.Exec(ctx, `SELECT lock_nas_r2_copy_key($1,$2)`, a.store.Bucket(), e.Key); err != nil {
-		return false, err
-	}
-	t, err = a.loadTarget(ctx, tx, e)
+	authority, err := a.authorize(ctx, tx, e)
 	if err != nil {
 		return false, err
 	}
-	if err = a.checkTarget(ctx, tx, t, e, true); err != nil {
-		return false, err
-	}
-	head, err := a.store.Head(ctx, e.Key)
-	if err != nil {
-		return false, err
-	}
-	var now time.Time
-	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
-		return false, err
-	}
-	item := r2RetireItem{r2RetireCandidate: r2RetireCandidate{SizeBytes: e.SizeBytes, SHA256: t.SHA, ETag: e.ETag}}
-	if err = r2RetireValidateGuardHead(head, item, t.ETag, 7*24*time.Hour, now); err != nil {
-		return false, err
-	}
-	if e.LastModified.IsZero() || !head.LastModified.Equal(e.LastModified) || !e.LastModified.Before(now.Add(-7*24*time.Hour)) {
-		return false, errors.New("listing LastModified missing, changed or too young")
-	}
-	if err = a.store.RequireNoMultipartUploads(ctx); err != nil {
-		return false, err
-	}
-	guard := &inverseWireGuard{a, tx, t, e}
-	authority, err := r2.AuthorizeNonKeep28Delete(ctx, guard.binding(), guard)
-	if err != nil {
-		return false, err
-	}
-	if err = a.store.DeleteNonKeep28Once(ctx, authority); err != nil {
+	if err = a.store.deleteOnce(ctx, authority); err != nil {
 		return false, fmt.Errorf("single DELETE result ambiguous; intent retained, never retransmit: %w", err)
 	}
+
 	if _, err = a.store.Head(ctx, e.Key); !r2.IsNotFound(err) {
 		if err == nil {
 			err = errors.New("object remains after DELETE")
@@ -435,7 +408,10 @@ func runR2InverseApply(ctx context.Context, cfg config.Config, args []string) {
 	}
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
-	store := mustArchiveR2Client(ctx, cfg, pool)
+	store, err := newInverseSDKStore(ctx, archiveR2Config(cfg, pool))
+	if err != nil {
+		log.Fatal(err)
+	}
 	result, err := applyInverse(ctx, pool, store, o)
 	data, _ := json.Marshal(result)
 	fmt.Println(string(data))
@@ -510,7 +486,10 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteSt
 	if err = a.checkEvidence(ctx, pool); err != nil {
 		return result, err
 	}
-	if err = store.RequireNoMultipartUploads(ctx); err != nil {
+	probeCtx, probeCancel := context.WithTimeout(ctx, inverseNetworkTimeout)
+	err = store.RequireNoMultipartUploads(probeCtx)
+	probeCancel()
+	if err != nil {
 		return result, err
 	}
 	// An existing intent is NEVER resubmitted, regardless of manifest or ledger.
@@ -562,7 +541,9 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteSt
 		if err = a.record(p.e, inverseIntent, p.manifest); err != nil {
 			return result, err
 		}
-		_, err = store.Head(ctx, p.e.Key)
+		probeCtx, probeCancel := context.WithTimeout(ctx, inverseNetworkTimeout)
+		_, err = store.Head(probeCtx, p.e.Key)
+		probeCancel()
 		if r2.IsNotFound(err) {
 			if err = a.publishAbsent(ctx, p.e, p.manifest, true); err != nil {
 				return result, err

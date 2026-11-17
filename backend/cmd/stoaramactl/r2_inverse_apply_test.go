@@ -34,6 +34,7 @@ type inverseFakeStore struct {
 	beforeDelete func(string) error
 }
 
+func (s *inverseFakeStore) setLost(lost bool)      { s.mu.Lock(); defer s.mu.Unlock(); s.lost = lost }
 func (s *inverseFakeStore) Bucket() string         { return "stoarama" }
 func (s *inverseFakeStore) EndpointSHA256() string { return s.endpointSHA }
 func (s *inverseFakeStore) ListPrefix(context.Context, string, int, func(r2.ObjectInfo) error) error {
@@ -61,9 +62,9 @@ func (s *inverseFakeStore) Head(ctx context.Context, key string) (r2.ObjectHead,
 	}
 	return r2.ObjectHead{ETag: o.ETag, SizeBytes: o.SizeBytes, LastModified: o.LastModified}, nil
 }
-func (s *inverseFakeStore) DeleteNonKeep28Once(ctx context.Context, authority *r2.NonKeep28DeleteAuthority) error {
-	key := authority.Binding().Key
-	if err := authority.RequireWire(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
+func (s *inverseFakeStore) deleteOnce(ctx context.Context, authority *inverseDeleteAuthority) error {
+	key := authority.binding.Key
+	if err := authority.requireWire(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
 		return err
 	}
 	if s.beforeDelete != nil {
@@ -131,7 +132,10 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 	exec(`INSERT INTO recording_collation_hours(id,hour_id,batch_id,generation,recording_id,local_date,delivery_hour,status,manifest_object_key,manifest_sha256,manifest,source_clip_count,included_clip_count,excluded_clip_count,join_count,split_count)
  VALUES(1,'inverse__recording-30__date-2026-06-01__hour-01__generation-2','inverse',2,30,'2026-06-01',1,'collated','joined/inverse/manifest.json',repeat('a',64),'{}',1,1,0,0,0);
  INSERT INTO recording_collation_outputs(id,collation_hour_id,part,parts,object_key,nas_relative_path,size_bytes,sha256,start_at,end_at,source_clip_ids,r2_verified_at)
- VALUES(1,1,1,1,'joined/inverse/objects/'||repeat('a',64)||'.mp4','joined/ordinary/test-output.mp4',100,repeat('a',64),'2026-06-01','2026-06-01 00:01',ARRAY[9000000]::bigint[],now());`)
+ VALUES(10000001,1,1,1,'joined/inverse/objects/'||repeat('a',64)||'.mp4','joined/ordinary/test-output.mp4',100,repeat('a',64),'2026-06-01','2026-06-01 00:01',ARRAY[9000000]::bigint[],now());
+ INSERT INTO recording_collation_outputs(id,collation_hour_id,part,parts,object_key,nas_relative_path,size_bytes,sha256,start_at,end_at,source_clip_ids,r2_verified_at)
+ SELECT 10000000+n,1,n,10010,'joined/inverse/objects/'||lpad(to_hex(n),64,'0')||'.mp4','joined/ordinary/output-'||n||'.mp4',100,lpad(to_hex(n),64,'0'),'2026-06-01','2026-06-01 00:01',ARRAY[10000000+n]::bigint[],now() FROM generate_series(2,10010) n;
+ ANALYZE recording_collation_outputs;`)
 	exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, store.EndpointSHA256())
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -164,7 +168,10 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		var entries []inverseEntry
 		for i := next; i < next+n; i++ {
 			key := fmt.Sprintf("managed/acct-47/ordinary/%04d.mp4", i)
-			entries = append(entries, inverseEntry{ObjectInfo: store.objects[key], Class: inverseDeletable})
+			store.mu.Lock()
+			object := store.objects[key]
+			store.mu.Unlock()
+			entries = append(entries, inverseEntry{ObjectInfo: object, Class: inverseDeletable})
 		}
 		next += n
 		manifest := filepath.Join(dir, "partition.jsonl")
@@ -212,7 +219,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 	})
 	t.Run("durable_history_cannot_be_erased_or_rolled_back", func(t *testing.T) {
-		for _, query := range []string{`DELETE FROM r2_inverse_intents`, `UPDATE r2_inverse_intents SET size_bytes=1`, `TRUNCATE r2_inverse_intents CASCADE`, `DELETE FROM r2_inverse_events`, `TRUNCATE r2_inverse_events`, `UPDATE r2_inverse_budget_minutes SET charged_bytes=1`, `DELETE FROM r2_inverse_budget_minutes`, `TRUNCATE r2_inverse_budget_minutes`, `UPDATE r2_inverse_ke_epoch SET epoch=0`, `DELETE FROM r2_inverse_ke_epoch`, `TRUNCATE r2_inverse_ke_epoch`} {
+		for _, query := range []string{`DELETE FROM r2_inverse_attempts`, `TRUNCATE r2_inverse_attempts`, `UPDATE r2_inverse_attempts SET issued_at=now()`, `DELETE FROM r2_inverse_intents`, `UPDATE r2_inverse_intents SET size_bytes=1`, `TRUNCATE r2_inverse_intents CASCADE`, `DELETE FROM r2_inverse_events`, `TRUNCATE r2_inverse_events`, `UPDATE r2_inverse_budget_minutes SET charged_bytes=1`, `DELETE FROM r2_inverse_budget_minutes`, `TRUNCATE r2_inverse_budget_minutes`, `UPDATE r2_inverse_ke_epoch SET epoch=0`, `DELETE FROM r2_inverse_ke_epoch`, `TRUNCATE r2_inverse_ke_epoch`} {
 			if _, err := pool.Exec(ctx, query); err == nil {
 				t.Fatal("durable authority could be erased", query)
 			}
@@ -242,9 +249,9 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 	t.Run("lost_response_reconciles_without_retransmit", func(t *testing.T) {
 		a, _ := build(1)
 		a.ledger.close()
-		store.lost = true
+		store.setLost(true)
 		_, err := applyInverse(ctx, pool, store, a.opts)
-		store.lost = false
+		store.setLost(false)
 		if err == nil {
 			t.Fatal("lost response accepted")
 		}
@@ -280,23 +287,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 	})
 	t.Run("delivery_admitted_before_intent_wins", func(t *testing.T) {
-		for _, kind := range []string{"key", "source"} {
-			t.Run(kind, func(t *testing.T) {
-				a, entries := build(1)
-				defer a.ledger.close()
-				if kind == "key" {
-					exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`, entries[0].Key)
-				} else {
-					exec(`INSERT INTO delivery_nas_source_holds SELECT id FROM recording_clips WHERE object_key=$1`, entries[0].Key)
-				}
-				if _, err := a.reserve(ctx, entries[0]); err == nil {
-					t.Fatal("delivery admission lost to intent")
-				}
-			})
-		}
-	})
-	t.Run("late_admission_blocked_through_wire_then_intent_vetoes", func(t *testing.T) {
-		for _, kind := range []string{"delivery_key", "delivery_source", "delivery_output", "delivery_path_enrichment", "collated_key"} {
+		for n, kind := range []string{"key", "source", "content_alias", "normalized_path", "output_dependency", "output_key", "output_content", "output_path"} {
 			t.Run(kind, func(t *testing.T) {
 				a, entries := build(1)
 				defer a.ledger.close()
@@ -305,7 +296,51 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				if err := pool.QueryRow(ctx, `SELECT id FROM recording_clips WHERE object_key=$1`, e.Key).Scan(&id); err != nil {
 					t.Fatal(err)
 				}
-				exec(`UPDATE recording_collation_outputs SET source_clip_ids=ARRAY[$1]::bigint[] WHERE id=1`, id)
+				placeholder := "datasets/test/first-" + strconv.FormatInt(id, 10)
+				switch kind {
+				case "key":
+					exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`, e.Key)
+				case "source":
+					exec(`INSERT INTO delivery_nas_source_holds(clip_id) VALUES($1)`, id)
+				case "content_alias":
+					sha := fmt.Sprintf("%064x", id)
+					exec(`UPDATE recording_clips SET sha256=$2 WHERE id=$1`, id, sha)
+					exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256) VALUES('stoarama',$1,'hold',100,'metadata',$2)`, placeholder, sha)
+				case "normalized_path":
+					exec(`UPDATE recording_clips SET display_path='joined/'||display_path WHERE id=$1`, id)
+					exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,relative_path) SELECT 'stoarama',$1,'hold',100,'metadata',regexp_replace(display_path,'^joined/','') FROM recording_clips WHERE id=$2`, placeholder, id)
+				default:
+					outputID := int64(10000000 + n + 2)
+					exec(`UPDATE recording_collation_outputs SET source_clip_ids=ARRAY[$1]::bigint[] WHERE id=$2`, id, outputID)
+					switch kind {
+					case "output_dependency":
+						exec(`INSERT INTO delivery_keep_output_dependencies(output_id,recording_id) VALUES($1,30)`, outputID)
+					case "output_key":
+						exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) SELECT 'stoarama',object_key,'hold',100,'metadata' FROM recording_collation_outputs WHERE id=$1`, outputID)
+					case "output_content":
+						exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256) SELECT 'stoarama',$1,'hold',size_bytes,'metadata',sha256 FROM recording_collation_outputs WHERE id=$2`, placeholder, outputID)
+					case "output_path":
+						exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,relative_path) SELECT 'stoarama',$1,'hold',100,'metadata',regexp_replace(nas_relative_path,'^joined/','') FROM recording_collation_outputs WHERE id=$2`, placeholder, outputID)
+					}
+				}
+				// No refresh_delivery_nas_source_holds: protection derives live closure.
+				if _, err := a.reserve(ctx, e); err == nil {
+					t.Fatal("pre-existing delivery protection lost to intent", kind)
+				}
+			})
+		}
+	})
+	t.Run("late_admission_blocked_through_wire_then_intent_vetoes", func(t *testing.T) {
+		for _, kind := range []string{"delivery_key", "delivery_source", "delivery_output", "delivery_path_enrichment", "collated_key", "held_output_source"} {
+			t.Run(kind, func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				var id int64
+				if err := pool.QueryRow(ctx, `SELECT id FROM recording_clips WHERE object_key=$1`, e.Key).Scan(&id); err != nil {
+					t.Fatal(err)
+				}
+				exec(`UPDATE recording_collation_outputs SET source_clip_ids=ARRAY[$1]::bigint[] WHERE id=10000001`, id)
 				query := `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`
 				var arg any = e.Key
 				switch kind {
@@ -313,7 +348,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					query = `INSERT INTO delivery_nas_source_holds(clip_id) VALUES($1)`
 					arg = id
 				case "delivery_output":
-					query = `INSERT INTO delivery_keep_output_dependencies(output_id,recording_id) VALUES(1,$1)`
+					query = `INSERT INTO delivery_keep_output_dependencies(output_id,recording_id) VALUES(10000001,$1)`
 					arg = int64(30)
 				case "delivery_path_enrichment":
 					placeholder := "datasets/test/" + strconv.FormatInt(id, 10)
@@ -321,7 +356,13 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					query = `UPDATE delivery_keep_holds SET relative_path=(SELECT display_path FROM recording_clips WHERE id=$1) WHERE object_key='` + placeholder + `'`
 					arg = id
 				case "collated_key":
-					query = `UPDATE recording_collation_outputs SET object_key=$1 WHERE id=1`
+					query = `UPDATE recording_collation_outputs SET object_key=$1 WHERE id=10000001`
+				case "held_output_source":
+					query = `UPDATE recording_collation_outputs SET source_clip_ids=array_append(source_clip_ids,$1::bigint) WHERE id=10000008`
+					arg = id
+				}
+				if err := pool.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch`).Scan(&a.keEpoch); err != nil {
+					t.Fatal(err)
 				}
 				store.beforeDelete = func(key string) error {
 					if key != e.Key {
@@ -412,6 +453,95 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatal("budget exceeded", err)
 		}
 	})
+	t.Run("private_authority_cannot_replay_or_remint", func(t *testing.T) {
+		for _, lost := range []bool{false, true} {
+			t.Run(strconv.FormatBool(lost), func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				a.store = sdk
+				if _, err := a.reserve(ctx, e); err != nil {
+					t.Fatal(err)
+				}
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback(ctx)
+				authority, err := a.authorize(ctx, tx, e)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err = a.authorize(ctx, tx, e); err == nil {
+					t.Fatal("durable authority reminted")
+				}
+				before := providerDeletes()
+				store.setLost(lost)
+				err = sdk.deleteOnce(ctx, authority)
+				store.setLost(false)
+				if (err != nil) != lost {
+					t.Fatal("first wire result", err)
+				}
+				clone := *authority
+				if err = sdk.deleteOnce(ctx, authority); err == nil {
+					t.Fatal("wire authority replayed")
+				}
+				if err = sdk.deleteOnce(ctx, &clone); err == nil {
+					t.Fatal("copied wire authority replayed")
+				}
+				if err = sdk.deleteOnce(ctx, &inverseDeleteAuthority{}); err == nil {
+					t.Fatal("zero authority reached wire")
+				}
+				if providerDeletes()-before != 1 {
+					t.Fatal("provider replay", providerDeletes()-before)
+				}
+			})
+		}
+	})
+	t.Run("network_deadline_releases_locks_and_reconciles", func(t *testing.T) {
+		for _, afterDelete := range []bool{false, true} {
+			t.Run(strconv.FormatBool(afterDelete), func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				store.beforeHead = func(key string) error {
+					if key == e.Key {
+						store.mu.Lock()
+						_, present := store.objects[key]
+						store.mu.Unlock()
+						if !afterDelete || !present {
+							time.Sleep(80 * time.Millisecond)
+						}
+					}
+					return nil
+				}
+				timed, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+				_, err := a.delete(timed, e)
+				cancel()
+				store.beforeHead = nil
+				if err == nil {
+					t.Fatal("stalled network ignored deadline")
+				}
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				lockCtx, lockCancel := context.WithTimeout(ctx, time.Second)
+				err = inverseProtectionLocks(lockCtx, tx, false)
+				lockCancel()
+				tx.Rollback(ctx)
+				if err != nil {
+					t.Fatal("network timeout retained protection locks", err)
+				}
+				before := store.calls
+				a.ledger.close()
+				result, err := applyInverse(ctx, pool, store, a.opts)
+				if err != nil || store.calls != before || (afterDelete && result.Reconciled < 1) {
+					t.Fatalf("restart %+v %v", result, err)
+				}
+			})
+		}
+	})
 	t.Run("real_SDK_canary_contract", func(t *testing.T) {
 		a, entries := build(100)
 		a.ledger.close()
@@ -488,7 +618,7 @@ func TestR2InverseLedgerRestartAndPartialTail(t *testing.T) {
 
 // Exercises the actual SDK, single-attempt transport and live DB authority in
 // one end-to-end path. The endpoint is an isolated loopback server, never R2.
-func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*r2.Client, func() int64) {
+func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*inverseSDKStore, func() int64) {
 	t.Helper()
 	var deleted atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -515,13 +645,18 @@ func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*r2.Client, fun
 		case http.MethodDelete:
 			deleted.Add(1)
 			delete(store.objects, key)
+			if store.lost {
+				c, _, _ := w.(http.Hijacker).Hijack()
+				c.Close()
+				return
+			}
 			w.WriteHeader(204)
 		default:
 			w.WriteHeader(400)
 		}
 	}))
 	t.Cleanup(server.Close)
-	client, err := r2.New(context.Background(), r2.Config{Bucket: "stoarama", Endpoint: server.URL, AccessKey: "test", SecretKey: "test", Region: "auto"})
+	client, err := newInverseSDKStore(context.Background(), r2.Config{Bucket: "stoarama", Endpoint: server.URL, AccessKey: "test", SecretKey: "test", Region: "auto"})
 	if err != nil {
 		t.Fatal(err)
 	}
