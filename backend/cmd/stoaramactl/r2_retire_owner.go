@@ -161,7 +161,7 @@ func (s *r2RetireSets) loadOwnerProtections(ctx context.Context, q r2RetireQueri
 	for _, id := range incidentSources {
 		s.HeldRaw[id] = true
 	}
-	rows, err := q.Query(ctx, `SELECT id FROM recording_collation_outputs WHERE source_clip_ids && $1::bigint[]`, incidentSources)
+	rows, err := q.Query(ctx, `SELECT id FROM recording_collation_outputs WHERE source_clip_ids && $1::bigint[] UNION SELECT source_id FROM nas_cleanup_incident_files WHERE kind='collated'`, incidentSources)
 	if err != nil {
 		return err
 	}
@@ -194,7 +194,7 @@ func r2RetireOwnerLive(ctx context.Context, q r2RetireQuerier, c *r2RetireCandid
  EXISTS(SELECT 1 FROM unsafe_outputs o WHERE ($3='raw' AND o.source_clip_ids @> ARRAY[$4::bigint]) OR ($3='collated' AND o.id=$4)),
  (SELECT count(*) FROM recording_clips WHERE bucket=$5 AND object_key=$6)>CASE WHEN $3='raw' THEN 1 ELSE 0 END
  OR (SELECT count(*) FROM recording_collation_outputs WHERE object_key=$6)>CASE WHEN $3='collated' THEN 1 ELSE 0 END,
- ($3='raw' AND $4=ANY($7::bigint[])) OR ($3='collated' AND EXISTS(SELECT 1 FROM recording_collation_outputs WHERE id=$4 AND source_clip_ids && $7::bigint[]))`
+ ($3='raw' AND $4=ANY($7::bigint[])) OR ($3='collated' AND (EXISTS(SELECT 1 FROM recording_collation_outputs WHERE id=$4 AND source_clip_ids && $7::bigint[]) OR EXISTS(SELECT 1 FROM nas_cleanup_incident_files WHERE kind='collated' AND source_id=$4)))`
 	if scope.Class == r2RetireDeliveryOnly {
 		query = r2RetireDeliverySourceSQL(query)
 		query = strings.Replace(query, "SELECT 1 FROM safe_raw s WHERE s.id=source", "SELECT 1 FROM LATERAL (SELECT id FROM safe_raw WHERE id=source OFFSET 0) s", 1)
