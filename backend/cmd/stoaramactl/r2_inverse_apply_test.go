@@ -200,6 +200,17 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatal(receipts, err)
 		}
 	})
+	t.Run("durable_history_cannot_be_erased_or_rolled_back", func(t *testing.T) {
+		for _, query := range []string{`DELETE FROM r2_inverse_intents`, `UPDATE r2_inverse_intents SET size_bytes=1`, `TRUNCATE r2_inverse_intents CASCADE`, `DELETE FROM r2_inverse_events`, `TRUNCATE r2_inverse_events`, `UPDATE r2_inverse_budget_minutes SET charged_bytes=1`, `DELETE FROM r2_inverse_budget_minutes`, `TRUNCATE r2_inverse_budget_minutes`, `UPDATE r2_inverse_ke_epoch SET epoch=0`, `DELETE FROM r2_inverse_ke_epoch`, `TRUNCATE r2_inverse_ke_epoch`} {
+			if _, err := pool.Exec(ctx, query); err == nil {
+				t.Fatal("durable authority could be erased", query)
+			}
+		}
+		var events int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_events`).Scan(&events); err != nil || events != 2 {
+			t.Fatal("ledger history changed", events, err)
+		}
+	})
 	t.Run("crash_after_intent_and_restart", func(t *testing.T) {
 		a, entries := build(1)
 		if _, err := a.reserve(ctx, entries[0]); err != nil {

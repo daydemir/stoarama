@@ -120,3 +120,29 @@ CREATE TRIGGER r2_inverse_ke_hour_epoch BEFORE UPDATE OF recording_id ON recordi
  FOR EACH STATEMENT EXECUTE FUNCTION advance_r2_inverse_ke_epoch();
 CREATE TRIGGER r2_inverse_ke_recording_epoch BEFORE UPDATE OF stream_id ON recordings
  FOR EACH STATEMENT EXECUTE FUNCTION advance_r2_inverse_ke_epoch();
+
+-- Intent/event history cannot be erased even by statement-level TRUNCATE.
+CREATE TRIGGER r2_inverse_intents_no_truncate BEFORE TRUNCATE ON r2_inverse_intents
+ FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_object_retirement();
+CREATE TRIGGER r2_inverse_events_no_truncate BEFORE TRUNCATE ON r2_inverse_events
+ FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_object_retirement();
+CREATE FUNCTION guard_r2_inverse_budget() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF TG_OP<>'UPDATE' THEN RAISE EXCEPTION 'R2 inverse budget history is permanent'; END IF;
+ IF NEW.bucket<>OLD.bucket OR NEW.minute<>OLD.minute OR NEW.charged_bytes<=OLD.charged_bytes THEN
+  RAISE EXCEPTION 'R2 inverse byte charges may only increase'; END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_inverse_budget_monotone BEFORE UPDATE OR DELETE ON r2_inverse_budget_minutes
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_inverse_budget();
+CREATE TRIGGER r2_inverse_budget_no_truncate BEFORE TRUNCATE ON r2_inverse_budget_minutes
+ FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_inverse_budget();
+CREATE FUNCTION guard_r2_inverse_epoch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF TG_OP<>'UPDATE' THEN RAISE EXCEPTION 'R2 inverse protection version is permanent'; END IF;
+ IF NEW.singleton<>OLD.singleton OR NEW.epoch<=OLD.epoch THEN
+  RAISE EXCEPTION 'R2 inverse protection version may only increase'; END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_inverse_epoch_monotone BEFORE UPDATE OR DELETE ON r2_inverse_ke_epoch
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_inverse_epoch();
+CREATE TRIGGER r2_inverse_epoch_no_truncate BEFORE TRUNCATE ON r2_inverse_ke_epoch
+ FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_inverse_epoch();
