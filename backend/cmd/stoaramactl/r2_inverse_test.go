@@ -154,7 +154,7 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
  INSERT INTO recording_collation_outputs VALUES(20,1,'incident_collated','incident-collated','2026-06-01','2026-06-02',ARRAY[3]::bigint[]);
  INSERT INTO r2_retirement_reservations VALUES('bucket','reservation'),('other','other_reservation');
  INSERT INTO r2_object_retirements VALUES('bucket','retired');
- INSERT INTO nas_r2_copy_items VALUES('{"bucket":"bucket","object_key":"blocked"}','blocked','checksum_mismatch'),('{"bucket":"other","object_key":"ordinary", "snapshot_scoped", "dryrun_scoped"}','blocked','final_conflict');
+ INSERT INTO nas_r2_copy_items VALUES('{"bucket":"bucket","object_key":"blocked"}','blocked','checksum_mismatch'),('{"bucket":"other","object_key":"ordinary"}','blocked','final_conflict');
  INSERT INTO delivery_keep_holds VALUES('bucket','direct_delivery');
  INSERT INTO delivery_nas_source_holds VALUES(4);
  INSERT INTO recording_collation_outputs VALUES(21,1,'delivery_output','delivery-output','2026-06-01','2026-06-02',ARRAY[4]::bigint[]);`)
