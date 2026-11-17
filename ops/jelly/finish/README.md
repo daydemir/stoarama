@@ -3,7 +3,8 @@
 `stoaramactl finish tick --safety FILE --copy-status FILE --status FILE` feeds
 keep28 raw metadata for account 47 / connection 13. It never changes cleanup,
 master switches, NAS files, R2 objects or deletion budgets. A1's
-`nas-r2-copy status --json` is required before installation. B and stitching are
+`nas-r2-copy status --json` and A1b's reviewed `r2-copy-v5` send-time storage
+boundary are required before installation. B and stitching are
 not wired into D-min.
 
 The queue target is 10,000 pending + leased rows, split into manifests of at most
@@ -42,6 +43,15 @@ heartbeat cadence. The source-contract test fails if either client bound changes
 Terminal debits use an inclusive `>=` cutoff, retaining writes exactly T old.
 The cleanup valve's separate freshness limit remains ten minutes. No client
 clock comparison, new payload field or fallback is involved.
+
+Storage budget eligibility is server-authored in migration
+`0203_nas_storage_client_binding.sql`. Only an actual available storage update
+from exact literal `r2-copy-v5` receives that binding. Missing storage preserves
+the previous sample's binding; unavailable/legacy storage clears it. A later v5
+heartbeat without storage cannot promote an older v4 sample. The CLI reads this
+sample binding, not the latest `connections.client_version`; all old/unknown
+bindings withhold late admission with a typed reason. Regular legacy telemetry
+and the cleanup valve remain readable.
 
 Late budget subtracts these full-size reservations and the existing 16 MiB range
 reserve from free bytes above the unchanged floor. Status includes typed
@@ -144,8 +154,12 @@ this decision; an empty queue is not cleanup authority.
 
 ## Install packet
 
-Sole controller, at a natural boundary after A1 is merged/deployed and a fresh
-v4 heartbeat provides local mismatch/hold evidence:
+Sole controller, at a natural boundary after the combined D/A1b boundary review:
+A1 + #526 and fresh v4 observation come first. Deploy the server with migration
+0203 and A1b's exact v5 admission support before releasing the reviewed v5 client.
+Only then verify a fresh v5 heartbeat and `nas_storage_client_version='r2-copy-v5'`
+on its actual storage receipt, retarget the collector explicitly to v5, and
+install D. A v4 observation packet is not late-budget eligible.
 
 1. Build the merged CLI on Jelly using `darma storage check` then
    `darma run --slot -- go -C backend build -o <install>/stoaramactl ./cmd/stoaramactl`.

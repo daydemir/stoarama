@@ -75,20 +75,8 @@ type finishSafety struct {
 	ExpectedMaster    bool             `json:"expected_deletion_enabled"`
 	Holds             map[string]int64 `json:"holds_by_reason"`
 }
-type finishCopy struct {
-	VerifiedInPlaceItemsPerMinute int64                  `json:"verified_in_place_items_per_minute"`
-	DownloadedItemsPerMinute      int64                  `json:"downloaded_items_per_minute"`
-	Schema                        string                 `json:"schema"`
-	UpdatedAt                     time.Time              `json:"updated_at"`
-	QueueDepth                    int64                  `json:"queue_depth"`
-	VerifiedInPlace               nasCopyStat            `json:"verified_in_place"`
-	Downloaded                    nasCopyStat            `json:"downloaded"`
-	DownloadedBytes               int64                  `json:"downloaded_bytes"`
-	CommittedBytes                int64                  `json:"committed_bytes"`
-	Blocked                       int64                  `json:"blocked"`
-	BlockedByReason               map[string]nasCopyStat `json:"blocked_by_reason"`
-	MismatchLatched               int64                  `json:"mismatch_latched"`
-}
+type finishCopy = nasCopyStatus
+
 type finishTier uint8
 
 const (
@@ -100,13 +88,15 @@ const (
 type finishLateHold string
 
 const (
-	finishLateSpaceUnknown finishLateHold = "nas_space_evidence_unavailable"
-	finishLateSpaceLow     finishLateHold = "nas_headroom_below_threshold"
-	finishLateBudgetHeld   finishLateHold = "next_download_exceeds_budget"
-	finishLateReceiptStale finishLateHold = "nas_space_receipt_too_old_for_budget"
+	finishLateSpaceUnknown  finishLateHold = "nas_space_evidence_unavailable"
+	finishLateSpaceLow      finishLateHold = "nas_headroom_below_threshold"
+	finishLateBudgetHeld    finishLateHold = "next_download_exceeds_budget"
+	finishLateReceiptStale  finishLateHold = "nas_space_receipt_too_old_for_budget"
+	finishLateClientUnknown finishLateHold = "nas_storage_client_not_budget_eligible"
 )
 
 type finishStatus struct {
+	NASSpaceClientVersion       string           `json:"nas_storage_client_version"`
 	ImportedHistoricalInventory int              `json:"imported_historical_inventory"`
 	ImportedEarlyUnknown        int              `json:"imported_early_unknown"`
 	ImportedLateUnknown         int              `json:"imported_late_unknown"`
@@ -347,7 +337,7 @@ func finishLateReceiptFresh(asOf, receipt time.Time) bool {
 }
 func finishCleanupValve(ctx context.Context, pool *pgxpool.Pool, status *finishStatus) error {
 	status.CleanupShouldRun = false
-	if err := pool.QueryRow(ctx, `SELECT nas_storage_free_bytes,nas_storage_reported_at,clock_timestamp() FROM connections WHERE id=13`).Scan(&status.NASFreeBytes, &status.NASSpaceReportedAt, &status.NASSpaceCheckedAt); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT nas_storage_free_bytes,nas_storage_reported_at,nas_storage_client_version,clock_timestamp() FROM connections WHERE id=13`).Scan(&status.NASFreeBytes, &status.NASSpaceReportedAt, &status.NASSpaceClientVersion, &status.NASSpaceCheckedAt); err != nil {
 		return err
 	}
 	status.CleanupReason = "nas_space_heartbeat_missing"
@@ -451,6 +441,10 @@ func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath st
 				if status.CleanupShouldRun {
 					status.LateTierHold = finishLateSpaceLow
 				}
+				return status, nil
+			}
+			if status.NASSpaceClientVersion != api.NASStorageBudgetClientVersion {
+				status.LateTierHold = finishLateClientUnknown
 				return status, nil
 			}
 			if !finishLateReceiptFresh(status.NASSpaceCheckedAt, *status.NASSpaceReportedAt) {

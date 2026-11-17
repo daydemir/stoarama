@@ -24,8 +24,9 @@ func finishFixture(t *testing.T, n int) (*pgxpool.Pool, string, string) {
  ALTER TABLE nas_cleanup_items ADD COLUMN updated_at timestamptz DEFAULT now();
  ALTER TABLE connections ADD COLUMN nas_storage_free_bytes bigint, ADD COLUMN nas_storage_reported_at timestamptz;
  CREATE TABLE nas_cleanup_batches(id bigint,mode text);
+ ALTER TABLE connections ADD COLUMN nas_storage_client_version text NOT NULL DEFAULT '';
  CREATE TABLE nas_inventory_files(connection_id bigint,clip_id bigint,relative_path text,state text,sha256 text,size_bytes bigint,verified_at timestamptz);
- UPDATE connections SET nas_storage_free_bytes=10000000000000,nas_storage_reported_at=now();
+ UPDATE connections SET nas_storage_free_bytes=10000000000000,nas_storage_reported_at=now(),nas_storage_client_version='r2-copy-v5';
  ALTER TABLE nas_r2_copy_items ADD COLUMN IF NOT EXISTS completion text DEFAULT '', ADD COLUMN IF NOT EXISTS committed_bytes bigint DEFAULT 0, ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();`)
 	if err != nil {
 		t.Fatal(err)
@@ -480,5 +481,70 @@ func TestFinishPublicationDelayCannotRespentOldSample(t *testing.T) {
 	status := finishRun(t, pool, safety, copy)
 	if status.ImportedItems != 0 || status.LateTierHold != finishLateReceiptStale || status.CleanupShouldRun {
 		t.Fatalf("stale pre-publication capacity spent: %+v", status)
+	}
+}
+
+func TestFinishLateBudgetRejectsLegacyStorageSamples(t *testing.T) {
+	pool, safety, copy := finishFixture(t, 1)
+	ctx := context.Background()
+	for _, version := range []string{"", "r2-copy-v4", "v85r-nas-proof-v2.2", "r2-copy-v5-extra"} {
+		if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version=$1`, version); err != nil {
+			t.Fatal(err)
+		}
+		status := finishRun(t, pool, safety, copy)
+		if status.ImportedItems != 0 || status.LateTierHold != finishLateClientUnknown || status.Exhausted {
+			t.Fatalf("legacy sample admitted %q: %+v", version, status)
+		}
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version=$1`, api.NASStorageBudgetClientVersion); err != nil {
+		t.Fatal(err)
+	}
+	status := finishRun(t, pool, safety, copy)
+	if status.ImportedItems != 1 {
+		t.Fatal("reviewed sample not admitted")
+	}
+}
+
+func TestFinishDelayedLegacyTimelinesNeedNewV5Storage(t *testing.T) {
+	for _, frame := range []struct {
+		name                    string
+		receiptAge, terminalAge time.Duration
+	}{
+		{"receipt87_terminal182", 87 * time.Second, 182 * time.Second},
+		{"receipt50_terminal245", 50 * time.Second, 245 * time.Second},
+	} {
+		t.Run(frame.name, func(t *testing.T) {
+			pool, safety, copy := finishFixture(t, 5)
+			ctx := context.Background()
+			if _, err := pool.Exec(ctx, `UPDATE recording_clips SET size_bytes=60000000000`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_free_bytes=2500000000000,nas_storage_reported_at=clock_timestamp()-$1::bigint*interval '1 second',nas_storage_client_version=''`, int64(frame.receiptAge/time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item,state,updated_at) SELECT 13,'raw',id,repeat('a',64),repeat('b',64),'{"size_bytes":60000000000}','verified',clock_timestamp()-$1::bigint*interval '1 second' FROM generate_series(100,103) id`, int64(frame.terminalAge/time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			// Both panel timelines have expired terminal debits. The old cached sample
+			// must nevertheless remain ineligible, not become v5 through metadata alone.
+			var expired int64
+			if err := pool.QueryRow(ctx, finishLateDebitsSQL, time.Now().Add(-finishLateDebitWindow)).Scan(&expired); err != nil || expired != 0 {
+				t.Fatalf("timeline fixture not expired: %d %v", expired, err)
+			}
+			status := finishRun(t, pool, safety, copy)
+			if status.ImportedItems != 0 || status.LateTierHold != finishLateClientUnknown {
+				t.Fatalf("legacy timeline spent: %+v", status)
+			}
+			// The real v5 producer samples after assembly: its new sample includes the
+			// 240GB write. The handler binding test proves only a real v5 storage update
+			// can assign this version, and omission preserves the old unknown binding.
+			if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_free_bytes=2260000000000,nas_storage_reported_at=clock_timestamp(),nas_storage_client_version=$1`, api.NASStorageBudgetClientVersion); err != nil {
+				t.Fatal(err)
+			}
+			status = finishRun(t, pool, safety, copy)
+			if status.ImportedItems != 0 || !status.CleanupShouldRun || status.LateTierHold != finishLateSpaceLow {
+				t.Fatalf("fresh v5 sample not bounded: %+v", status)
+			}
+		})
 	}
 }

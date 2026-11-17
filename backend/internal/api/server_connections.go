@@ -1051,6 +1051,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		    nas_storage_total_bytes=CASE WHEN $33::boolean IS NULL THEN nas_storage_total_bytes WHEN $33 THEN $34 ELSE NULL END,
 		    nas_storage_free_bytes=CASE WHEN $33::boolean IS NULL THEN nas_storage_free_bytes WHEN $33 THEN $35 ELSE NULL END,
 		    nas_storage_reported_at=CASE WHEN $33::boolean IS NULL THEN nas_storage_reported_at WHEN $33 THEN now() ELSE NULL END,
+            nas_storage_client_version=CASE WHEN $33::boolean IS NULL THEN nas_storage_client_version WHEN $33 THEN $43 ELSE '' END,
 		    nas_capacity_blocked=$40,
 		    joined_protocol_version=$41,
 		    updated_at=now()
@@ -1067,7 +1068,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		inventoryClips, inventoryBytes, inventoryMismatches, inventoryUnmatched, inventoryDigest,
 		storageAvailable(req.Storage), storageTotal(req.Storage), storageFree(req.Storage),
 		inventoryScanPassStartedAt, inventoryRowsVisited, inventoryRowsSkipped, inventorySkipReasonsJSON,
-		req.CapacityBlocked, effectiveProtocol, connectionID)
+		req.CapacityBlocked, effectiveProtocol, connectionID, nasStorageBudgetVersion(req.ClientVersion))
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("heartbeat: %v", err))
 		return

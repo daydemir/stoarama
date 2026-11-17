@@ -475,6 +475,7 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			nas_storage_total_bytes BIGINT,
 			nas_storage_free_bytes BIGINT,
 			nas_storage_reported_at TIMESTAMPTZ,
+            nas_storage_client_version TEXT NOT NULL DEFAULT '',
 			nas_capacity_blocked BOOLEAN NOT NULL DEFAULT FALSE,
             nas_cleanup_release_generation BIGINT,
             nas_cleanup_status JSONB,
