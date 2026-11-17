@@ -50,6 +50,11 @@ func copyTestFixture(t *testing.T) (*cleanupFixture, NASR2CopyItem) {
 	}
 	return f, i
 }
+
+type copyDeadlineRecorder struct{ *httptest.ResponseRecorder }
+
+func (copyDeadlineRecorder) SetReadDeadline(time.Time) error { return nil }
+
 func copyCall(f *cleanupFixture, action string, id int64, body any) *httptest.ResponseRecorder {
 	data, _ := json.Marshal(body)
 	path := fmt.Sprintf("/api/v1/account/connections/r2-copy/%d/%s", id, action)
@@ -65,7 +70,7 @@ func copyCall(f *cleanupFixture, action string, id int64, body any) *httptest.Re
 	req = req.WithContext(ctx)
 	out := httptest.NewRecorder()
 	handlers := map[string]http.HandlerFunc{"lease": f.s.handleNASR2CopyLease, "checkpoint": f.s.handleNASR2CopyCheckpoint, "range": f.s.handleNASR2CopyRange, "result": f.s.handleNASR2CopyResult, "block": f.s.handleNASR2CopyBlock}
-	nasR2CopyDeadline(f.s.confineAccountScope(f.s.fenceNASDelivery(handlers[action]))).ServeHTTP(out, req)
+	nasR2CopyDeadline(f.s.confineAccountScope(f.s.fenceNASDelivery(handlers[action]))).ServeHTTP(copyDeadlineRecorder{out}, req)
 	return out
 }
 func copyLease(t *testing.T, f *cleanupFixture) nasR2CopyTask {
@@ -499,7 +504,7 @@ func TestNASR2CopyScopedOtherConnectionDenied(t *testing.T) {
 	req.Header.Set("User-Agent", "stoarama-nas-pull/"+f.version)
 	req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: 48, APIKeyID: ptrInt64(6), KeyScopes: []string{accountScopePull}}))
 	out := httptest.NewRecorder()
-	f.s.confineAccountScope(f.s.fenceNASDelivery(http.HandlerFunc(f.s.handleNASR2CopyLease))).ServeHTTP(out, req)
+	f.s.confineAccountScope(f.s.fenceNASDelivery(http.HandlerFunc(f.s.handleNASR2CopyLease))).ServeHTTP(copyDeadlineRecorder{out}, req)
 	if out.Code != 403 || !strings.Contains(out.Body.String(), "connection 13") {
 		t.Fatalf("foreign valid pull key response %d %s", out.Code, out.Body)
 	}

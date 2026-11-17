@@ -178,8 +178,18 @@ func (s *Server) handleAccountCollated(w http.ResponseWriter, r *http.Request) {
 	items := make([]collatedItem, 0, limit)
 	nextID := int64(0)
 	if policy.Enabled {
+		tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+		if err != nil {
+			util.WriteError(w, 503, "collated feed database unavailable; retryable")
+			return
+		}
+		defer tx.Rollback(ctx)
+		if _, err = tx.Exec(ctx, `SET LOCAL statement_timeout='2s'`); err != nil {
+			util.WriteError(w, 503, "collated feed budget unavailable; retryable")
+			return
+		}
 		var raw []byte
-		if err := s.pool.QueryRow(ctx, collatedFeedSQL, connectionID, afterID, limit).Scan(&raw, &nextID); err != nil {
+		if err := tx.QueryRow(ctx, collatedFeedSQL, connectionID, afterID, limit).Scan(&raw, &nextID); err != nil {
 			util.WriteError(w, 503, "collated feed unavailable; retryable")
 			return
 		}

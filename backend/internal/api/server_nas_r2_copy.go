@@ -37,17 +37,33 @@ const (
 // all retries, pool acquisition, source rechecks, R2 HEAD and commit.
 const nasR2CopyControlBudget = 1500 * time.Millisecond
 
+func nasR2CopyControlRequest(r *http.Request) bool {
+	return strings.HasPrefix(r.URL.Path, "/api/v1/account/connections/r2-copy/") ||
+		(r.URL.Path == "/api/v1/account/connections/inventory" && r.Header.Get("X-Stoarama-Copy-Control") == "inventory")
+}
+
+func nasR2CopyCommittedResponse(status int) bool { return status >= 200 && status < 300 }
+
 func nasR2CopyDeadline(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/api/v1/account/connections/r2-copy/") {
+		if !nasR2CopyControlRequest(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), nasR2CopyControlBudget)
 		defer cancel()
+		// Bound request body reads too: context cancellation alone cannot
+		// interrupt net/http's JSON decoder while the peer stops sending.
+		deadline, _ := ctx.Deadline()
+		transport := http.NewResponseController(w)
+		if err := transport.SetReadDeadline(deadline); err != nil {
+			util.WriteError(w, 503, "copy read deadline unavailable; retryable")
+			return
+		}
+		defer transport.SetReadDeadline(time.Time{})
 		out := &nasDeliveryResponse{header: make(http.Header)}
 		next.ServeHTTP(out, r.WithContext(ctx))
-		if ctx.Err() != nil {
+		if (ctx.Err() != nil || !time.Now().Before(deadline)) && !nasR2CopyCommittedResponse(out.status) {
 			w.Header().Set("Retry-After", "1")
 			util.WriteError(w, 503, "copy control deadline; retryable")
 			return

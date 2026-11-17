@@ -498,7 +498,7 @@ fence, release recovery/delivery/reference holds, or prove global writer drain.
 The ordinary diagnostic still reports every remaining blocker honestly. No
 production cancellation has been performed by this implementation.
 
-### COPY source lookup and collated paging rollout (0205–0206)
+### COPY source lookup and collated paging rollout (0206–0207)
 
 The COPY lease validates a source before HEAD and again under admission. The old
 reservation view expands every cleanup manifest for each lookup; 1,438 plans
@@ -518,10 +518,10 @@ release slot. Local tests compare the indexed predicate with the old view.
 Release sequence, to be executed only by the assigned controller:
 
 1. Keep the existing runner STOP and maintenance fence under their owner's
-   control. Prepare and verify the `r2-copy-v6` client artifact but do not start it.
+   control. Prepare and verify the updated `r2-copy-v5` client artifact (version identity unchanged) but do not start it.
    Older clients reject the added collated cursor field, so coordinate this
    backend/client release. COPY's two-second transport budget is unchanged.
-2. Apply only migration `0205_nas_cleanup_manifest_keys.sql` through the migration
+2. Apply only migration `0206_nas_cleanup_manifest_keys.sql` through the migration
    CLI using a staged migration directory containing that file. It creates the
    immutable projection independently and records it in `schema_migrations`.
 3. Outside a transaction, precreate the index using an operator DB session:
@@ -532,10 +532,10 @@ Release sequence, to be executed only by the assigned controller:
    ```
 
    Do not replace the projection function beneath an existing index. Migration
-   0206 rejects mismatched function contents and missing, invalid or differently
+   0207 rejects mismatched function contents and missing, invalid or differently
    defined indexes; inspect a failed concurrent build before any remedial action.
-4. Apply `0206_nas_cleanup_reservation_lookup.sql`, then deploy the reviewed API
-   and roll the prepared v6 client in the controller's assigned slot. The API
+4. Apply `0207_nas_cleanup_reservation_lookup.sql`, then deploy the reviewed API
+   and roll the prepared client in the controller's assigned slot. The API
    budgets every COPY control at 1.5 seconds, starting before authentication and
    delivery fencing; exhausted budgets return retryable 503. Admission still
    rechecks source identity and serializes grants with active renewals.

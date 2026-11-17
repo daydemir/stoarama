@@ -1,4 +1,4 @@
--- On populated databases, first apply 0205, then outside any transaction:
+-- On populated databases, first apply 0206, then outside any transaction:
 -- CREATE INDEX CONCURRENTLY nas_cleanup_manifest_keys_idx ON nas_cleanup_plans
 -- USING gin(nas_cleanup_manifest_keys(manifest));
 -- No plan, item, hold or reservation authority changes.
@@ -12,7 +12,7 @@ BEGIN
  IF to_regclass('nas_cleanup_manifest_keys_idx') IS NULL THEN
   LOCK TABLE nas_cleanup_plans IN SHARE MODE;
   IF EXISTS(SELECT 1 FROM nas_cleanup_plans LIMIT 1) THEN
-   RAISE EXCEPTION 'apply 0205 then precreate nas_cleanup_manifest_keys_idx concurrently before 0206';
+   RAISE EXCEPTION 'apply 0206 then precreate nas_cleanup_manifest_keys_idx concurrently before 0207';
   END IF;
   CREATE INDEX nas_cleanup_manifest_keys_idx ON nas_cleanup_plans USING gin(nas_cleanup_manifest_keys(manifest));
  END IF;

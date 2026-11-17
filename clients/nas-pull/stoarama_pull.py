@@ -18187,7 +18187,7 @@ CLEANUP_V6_VERSIONS: frozenset[str] = frozenset((CLEANUP_GROUP_VERSION, "r2-copy
 CLEANUP_BULK_VERSION = "cleanup-batch-v7"
 CLEANUP_TRUTH_VERSION = "cleanup-batch-v8"
 CLEANUP_FRESH_PERMIT_VERSION = "v85r-nas-proof-v2.2"
-CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v2", "r2-copy-v3", "r2-copy-v4", "r2-copy-v5", "r2-copy-v6", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
+CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v2", "r2-copy-v3", "r2-copy-v4", "r2-copy-v5", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
 CLEANUP_GROUP_VERSIONS: frozenset[str] = CLEANUP_V6_VERSIONS | CLEANUP_BULK_VERSIONS
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
@@ -18205,7 +18205,7 @@ CLEANUP_RETRYABLE_ATTEMPTS = 8
 def cleanup_execution_group_size():
     # One lease/permit clock per file. NAS syscall latency must never consume
     # another file's short authority window. Historical releases retain v7.
-    return 1 if CLIENT_VERSION in (CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v4", "r2-copy-v5", "r2-copy-v6") else CLEANUP_EXECUTION_GROUP
+    return 1 if CLIENT_VERSION in (CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v4", "r2-copy-v5") else CLEANUP_EXECUTION_GROUP
 
 
 class CleanupProtocolUnsupported(RuntimeError):
@@ -23764,8 +23764,7 @@ def joined_loop(cfg, runtime, stop_event):
             return
         progress = False
         try:
-            before = runtime.collated_after_id
-            progress = drain_collated(cfg, runtime, stop_event) or runtime.collated_after_id > before
+            progress = drain_collated(cfg, runtime, stop_event)
         except Exception as exc:
             log("WARN", "collated delivery deferred: %s" % exc)
         if stop_event.is_set():
@@ -52816,7 +52815,8 @@ class R2CopyControl:
         self.sequence += 1
         message = (json.dumps({"url": self.cfg.api_base + path,
                    "headers": {"User-Agent": USER_AGENT, "Authorization": "Bearer " + self.cfg.api_key,
-                               "Content-Type": "application/json"},
+                               "Content-Type": "application/json",
+                               **({"X-Stoarama-Copy-Control": "inventory"} if operation is R2CopyControlOperation.INVENTORY else {})},
                    "body": base64.b64encode(json.dumps(body).encode()).decode() if body is not None else None}) + "\n").encode()
         if len(message) > 32768:
             raise R2CopyHold("copy HTTP input exceeds bound")

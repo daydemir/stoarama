@@ -99,6 +99,23 @@ class CollatedDownloadTests(unittest.TestCase):
                 self.assertEqual(self.runtime.collated_after_id, expected)
         self.assertEqual([call.args[2].split("after_id=")[1] for call in request.call_args_list], ["0", "1000", "2000", "0"])
 
+    def test_joined_loop_paces_advancing_empty_pages(self):
+        stop = threading.Event()
+        scans = []
+        self.runtime.joined_background_enabled = lambda: False
+        def drain(cfg, runtime, event):
+            scans.append(runtime.collated_after_id)
+            runtime.collated_after_id += 1000
+            if len(scans) == 3:
+                event.set()
+            return False
+        with mock.patch.object(pull, "drain_collated", side_effect=drain), \
+                mock.patch.object(pull.NAS_MEDIA_FENCE, "wait_maintenance", return_value=True), \
+                mock.patch.object(stop, "wait", return_value=False) as wait:
+            pull.joined_loop(self.cfg, self.runtime, stop)
+        self.assertEqual(scans, [0, 1000, 2000])
+        self.assertEqual([c.args[0] for c in wait.call_args_list], [10, 10])
+
     def test_cursor_rejects_nonforward_or_wrong_type(self):
         policy = {"enabled": True, "download_bytes_per_sec": 1 << 20, "download_parallel": 1}
         self.runtime.collated_after_id = 1000

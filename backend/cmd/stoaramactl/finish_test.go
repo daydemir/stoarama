@@ -17,7 +17,7 @@ import (
 func finishFixture(t *testing.T, n int) (*pgxpool.Pool, string, string) {
 	t.Helper()
 	pool, _, _, _ := nasCopyQueueFixture(t, n, true)
-	_, err := pool.Exec(context.Background(), `ALTER TABLE nas_cleanup_plans ADD COLUMN connection_id bigint DEFAULT 13, ADD COLUMN plan_sha256 text DEFAULT repeat('d',64);
+	_, err := pool.Exec(context.Background(), `ALTER TABLE nas_cleanup_plans ADD COLUMN plan_sha256 text DEFAULT repeat('d',64);
  INSERT INTO nas_cleanup_plans(id,mode) VALUES(99,'retired');
  ALTER TABLE nas_cleanup_items ADD COLUMN updated_at timestamptz DEFAULT now();
  ALTER TABLE connections ADD COLUMN nas_storage_free_bytes bigint, ADD COLUMN nas_storage_reported_at timestamptz;

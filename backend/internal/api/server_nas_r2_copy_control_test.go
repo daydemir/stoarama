@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -100,6 +101,9 @@ func runCopyControlFixtureLimits(t *testing.T, url, ca string, timeout time.Dura
 }
 
 func authenticatedCopyFixture(t *testing.T) (*cleanupFixture, *httptest.Server) {
+	return authenticatedCopyFixtureAfterLease(t, nil)
+}
+func authenticatedCopyFixtureAfterLease(t *testing.T, after func()) (*cleanupFixture, *httptest.Server) {
 	t.Helper()
 	f, first := copyTestFixture(t)
 	f.useClientVersion(nasCleanupR2CopyControlClientVersion)
@@ -135,7 +139,13 @@ CREATE TABLE account_api_keys(id bigint PRIMARY KEY,account_id bigint,secret_has
 	router := chi.NewRouter()
 	router.Use(nasR2CopyDeadline, f.s.requireAccountAuth, f.s.confineAccountScope, f.s.fenceNASDelivery)
 	router.Get("/api/v1/account/connections/stitch/evidence/admission", f.s.handleAccountNASStitchEvidenceAdmission)
-	router.Post(copyControlLeasePath, f.s.handleNASR2CopyLease)
+	router.Post(copyControlLeasePath, func(w http.ResponseWriter, r *http.Request) {
+		f.s.handleNASR2CopyLease(w, r)
+		if after != nil {
+			after()
+		}
+	})
+	router.Post("/api/v1/account/connections/inventory", f.s.handleAccountConnectionInventorySync)
 	router.Post("/api/v1/account/connections/r2-copy/{id}/checkpoint", f.s.handleNASR2CopyCheckpoint)
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)
@@ -389,5 +399,64 @@ func TestNASR2CopyControlDeadlineReturnsRetryableStatus(t *testing.T) {
 				t.Fatalf("%s silently timed out or misclassified: %+v", stage, result)
 			}
 		})
+	}
+}
+
+func TestNASR2CopyInventoryDeadlineKeepsBulkInventoryUnchanged(t *testing.T) {
+	f, srv := authenticatedCopyFixture(t)
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(f.ctx)
+	if _, err = tx.Exec(f.ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
+		t.Fatal(err)
+	}
+	request := copyControlFixtureRequest{4, "/api/v1/account/connections/inventory", nasInventorySyncRequest{Generation: "live", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"#recycle"}}}
+	// The transport attaches the explicit marker only to its typed INVENTORY op.
+	result := runCopyControlFixture(t, srv.URL, "", 2*time.Second, []copyControlFixtureRequest{request})
+	if result.Results[0].Status != 503 {
+		t.Fatalf("inventory silently timed out: %+v", result)
+	}
+	ordinary := httptest.NewRequest("POST", "/api/v1/account/connections/inventory", nil)
+	if nasR2CopyControlRequest(ordinary) {
+		t.Fatal("ordinary bulk inventory inherited the copy deadline")
+	}
+}
+
+func TestNASR2CopyCommittedLeaseSurvivesResponseBoundary(t *testing.T) {
+	f, srv := authenticatedCopyFixtureAfterLease(t, func() { time.Sleep(nasR2CopyControlBudget + 20*time.Millisecond) })
+	result := runCopyControlFixture(t, srv.URL, "", 2*time.Second, []copyControlFixtureRequest{{1, copyControlLeasePath, nasR2CopyControl{FreeBytes: NASR2CopyFloor + 1e9}}})
+	if result.Results[0].Status != 200 || result.Results[0].TaskID == nil {
+		t.Fatalf("committed outcome discarded by deadline/fence: %+v", result)
+	}
+	var live bool
+	if err := f.pool.QueryRow(f.ctx, `SELECT state='leased' AND lease_expires_at>clock_timestamp() FROM nas_r2_copy_items WHERE id=$1`, *result.Results[0].TaskID).Scan(&live); err != nil || !live {
+		t.Fatal(live, err)
+	}
+}
+
+func TestNASR2CopyStalledBodyReturnsBeforeTransportDeadline(t *testing.T) {
+	_, srv := authenticatedCopyFixture(t)
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err = conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// Send the headers and one byte, then stall the rest of the declared body.
+	_, err = fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: fixture\r\nAuthorization: Bearer fixture-key\r\nUser-Agent: stoarama-nas-pull/%s\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{", copyControlLeasePath, nasCleanupR2CopyControlClientVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("silent stalled-body timeout: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 503 {
+		t.Fatalf("stalled body status %d", response.StatusCode)
 	}
 }

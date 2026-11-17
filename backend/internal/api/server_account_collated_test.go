@@ -325,6 +325,22 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	if fmt.Sprint(got) != fmt.Sprint(want) || !emptyAdvanced {
 		t.Fatalf("paged=%v oracle=%v advanced empty=%t", got, want, emptyAdvanced)
 	}
+
+	// PostgreSQL, not only the Go context, cancels slow eligibility work. The
+	// connection remains usable and the outer 3s budget has time to return 503.
+	if _, err := pool.Exec(ctx, `CREATE OR REPLACE FUNCTION nas_delivery_allowed(connection bigint,kind text,source bigint) RETURNS boolean LANGUAGE plpgsql STABLE AS $$BEGIN PERFORM pg_sleep(4);RETURN true;END$$`); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if code, _ := do(s.handleAccountCollated, http.MethodGet, "/api/v1/account/collated?after_id=0", nil, nil); code != 503 {
+		t.Fatalf("slow feed status %d", code)
+	}
+	if elapsed := time.Since(started); elapsed >= collatedFeedBudget {
+		t.Fatalf("feed exhausted HTTP rather than statement budget: %v", elapsed)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `DELETE FROM recording_collation_output_acks`); err == nil {
 		t.Fatal("ack rows are not append-only")
 	}
