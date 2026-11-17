@@ -53,14 +53,15 @@ type inverseEntry struct {
 	Reason string       `json:"reason"`
 }
 type inverseSummary struct {
-	Version      int                           `json:"version"`
-	Bucket       string                        `json:"bucket"`
-	CreatedAt    time.Time                     `json:"created_at"`
-	PolicySHA256 string                        `json:"policy_sha256"`
-	PicksSHA256  string                        `json:"picks_sha256"`
-	Total        r2RetireStat                  `json:"total"`
-	Classes      map[inverseClass]r2RetireStat `json:"classes"`
-	ReadOnly     bool                          `json:"read_only"`
+	Version        int                           `json:"version"`
+	Bucket         string                        `json:"bucket"`
+	EndpointSHA256 string                        `json:"endpoint_sha256"`
+	CreatedAt      time.Time                     `json:"created_at"`
+	PolicySHA256   string                        `json:"policy_sha256"`
+	PicksSHA256    string                        `json:"picks_sha256"`
+	Total          r2RetireStat                  `json:"total"`
+	Classes        map[inverseClass]r2RetireStat `json:"classes"`
+	ReadOnly       bool                          `json:"read_only"`
 }
 
 // A path alias of any KE stream remains protected even when its catalog row
@@ -235,11 +236,12 @@ func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string
 
 type inverseLister interface {
 	Bucket() string
+	EndpointSHA256() string
 	ListPrefix(context.Context, string, int, func(r2.ObjectInfo) error) error
 }
 
 func partitionInverse(ctx context.Context, store inverseLister, p inverseProtection, policy string, out io.Writer) (inverseSummary, error) {
-	sum := inverseSummary{Version: 1, Bucket: store.Bucket(), CreatedAt: time.Now().UTC(), PolicySHA256: policy, PicksSHA256: p.Picks.SHA256, ReadOnly: true, Classes: map[inverseClass]r2RetireStat{}}
+	sum := inverseSummary{Version: 1, Bucket: store.Bucket(), EndpointSHA256: store.EndpointSHA256(), CreatedAt: time.Now().UTC(), PolicySHA256: policy, PicksSHA256: p.Picks.SHA256, ReadOnly: true, Classes: map[inverseClass]r2RetireStat{}}
 	for _, class := range inverseClasses {
 		sum.Classes[class] = r2RetireStat{}
 	}
