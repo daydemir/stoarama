@@ -20,7 +20,22 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-var r2RetireIncidentSources = []int64{296368, 296406, 296453, 296637, 296684, 296727, 296769, 296844, 296891, 296940, 296985, 297022, 297109, 297152, 297204, 297248, 297292, 297335, 297379, 297419, 297469, 297516, 297559, 297602, 297638, 297684, 297734, 297859}
+func loadR2RetireIncidentSources(ctx context.Context, q r2RetireQuerier) ([]int64, error) {
+	rows, err := q.Query(ctx, `SELECT clip_id FROM nas_cleanup_incident_sources ORDER BY clip_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err = rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
 
 type r2HoldReleaseItem struct {
 	ItemID      int64            `json:"item_id"`
@@ -160,12 +175,16 @@ func r2HoldReleasePlan(ctx context.Context, q r2RetireQuerier, picks r2RetirePic
 	}
 	// Protect incident sources and any collated file containing one, regardless
 	// of which plan admitted it or what its current receipt state says.
+	incidentSources, err := loadR2RetireIncidentSources(ctx, q)
+	if err != nil {
+		return m, err
+	}
 	incident := map[int64]bool{}
-	for _, id := range r2RetireIncidentSources {
+	for _, id := range incidentSources {
 		incident[id] = true
 	}
 	collatedIncident := map[int64]bool{}
-	rows, err = q.Query(ctx, `SELECT id FROM recording_collation_outputs WHERE source_clip_ids && $1::bigint[]`, r2RetireIncidentSources)
+	rows, err = q.Query(ctx, `SELECT id FROM recording_collation_outputs WHERE source_clip_ids && $1::bigint[]`, incidentSources)
 	if err != nil {
 		return m, err
 	}
