@@ -262,7 +262,7 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	if err != nil {
 		return t, err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO r2_inverse_intents(bucket,object_key,source_id,size_bytes,etag,last_modified,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, a.store.Bucket(), e.Key, t.ID, e.SizeBytes, e.ETag, e.LastModified, a.opts.ManifestSHA, a.summary.PolicySHA256, a.summary.PicksSHA256, a.opts.DrainSHA, a.protection.Picks.Choices[t.StreamID].Choice)
+	_, err = tx.Exec(ctx, `INSERT INTO r2_inverse_intents(bucket,object_key,source_id,size_bytes,etag,last_modified,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice,endpoint_sha256,stream_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, a.store.Bucket(), e.Key, t.ID, e.SizeBytes, e.ETag, e.LastModified, a.opts.ManifestSHA, a.summary.PolicySHA256, a.summary.PicksSHA256, a.opts.DrainSHA, a.protection.Picks.Choices[t.StreamID].Choice, a.store.EndpointSHA256(), t.StreamID)
 	if err != nil {
 		return t, err
 	}
@@ -273,7 +273,7 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	return t, tx.Commit(ctx)
 }
 func (a *inverseApplier) record(e inverseEntry, event inverseEvent, manifest string) error {
-	return a.ledger.append(inverseLedgerRecord{Event: event, Bucket: a.store.Bucket(), Key: e.Key, ManifestSHA256: manifest, At: time.Now().UTC(), SizeBytes: e.SizeBytes})
+	return a.ledger.append(inverseLedgerRecord{Event: event, Bucket: a.store.Bucket(), EndpointSHA256: a.store.EndpointSHA256(), Key: e.Key, ManifestSHA256: manifest, At: time.Now().UTC(), SizeBytes: e.SizeBytes})
 }
 
 type inverseWireGuard struct {
@@ -291,7 +291,7 @@ func (g *inverseWireGuard) CheckNonKeep28Delete(ctx context.Context, bucket, end
 		return err
 	}
 	var durable bool
-	err := g.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_intents WHERE bucket=$1 AND object_key=$2 AND source_id=$3 AND manifest_sha256=$4 AND drain_evidence_sha256=$5)`, bucket, key, g.t.ID, g.a.opts.ManifestSHA, g.a.opts.DrainSHA).Scan(&durable)
+	err := g.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_intents WHERE bucket=$1 AND object_key=$2 AND source_id=$3 AND manifest_sha256=$4 AND drain_evidence_sha256=$5 AND endpoint_sha256=$6 AND size_bytes=$7 AND etag=$8 AND stream_id=$9)`, bucket, key, g.t.ID, g.a.opts.ManifestSHA, g.a.opts.DrainSHA, endpoint, g.e.SizeBytes, g.e.ETag, g.t.StreamID).Scan(&durable)
 	if err != nil {
 		return err
 	}
@@ -368,7 +368,7 @@ func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, mani
 		return err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256,already_absent)
- SELECT 'raw',c.id,r.stream_id,c.bucket,c.object_key,c.size_bytes,lower(c.sha256),'inverse_non_keep28',i.choice,$3,i.policy_sha256,$4
+ SELECT 'raw',c.id,i.stream_id,c.bucket,c.object_key,c.size_bytes,lower(c.sha256),'inverse_non_keep28',i.choice,$3,i.policy_sha256,$4
  FROM recording_clips c JOIN recordings r ON r.id=c.recording_id JOIN r2_inverse_intents i ON i.source_id=c.id
  WHERE i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 ON CONFLICT DO NOTHING`, a.store.Bucket(), e.Key, manifest, reconciled)
 	if err != nil {
@@ -442,7 +442,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteSt
 	if err != nil {
 		return result, err
 	}
-	if summary.Version != 1 || summary.Bucket != store.Bucket() || summary.PolicySHA256 != policy || summary.PicksSHA256 != picks.SHA256 || !summary.ReadOnly {
+	if summary.Version != 1 || summary.Bucket != store.Bucket() || summary.EndpointSHA256 != store.EndpointSHA256() || summary.PolicySHA256 != policy || summary.PicksSHA256 != picks.SHA256 || !summary.ReadOnly {
 		return result, errors.New("partition metadata differs")
 	}
 	lock, err := pool.Acquire(ctx)
@@ -489,7 +489,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteSt
 	// An existing intent is NEVER resubmitted, regardless of manifest or ledger.
 	// Only confirmed absence can advance it to a receipt on restart.
 	existing := map[string]bool{}
-	rows, err := pool.Query(ctx, `SELECT i.object_key,i.size_bytes,i.manifest_sha256,EXISTS(SELECT 1 FROM r2_inverse_events e WHERE e.bucket=i.bucket AND e.object_key=i.object_key AND e.event='absent') FROM r2_inverse_intents i WHERE i.bucket=$1`, store.Bucket())
+	rows, err := pool.Query(ctx, `SELECT i.object_key,i.size_bytes,i.manifest_sha256,i.endpoint_sha256,EXISTS(SELECT 1 FROM r2_inverse_events e WHERE e.bucket=i.bucket AND e.object_key=i.object_key AND e.event='absent') FROM r2_inverse_intents i WHERE i.bucket=$1`, store.Bucket())
 	if err != nil {
 		return result, err
 	}
@@ -499,12 +499,16 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteSt
 	}
 	var pendingItems []pending
 	for rows.Next() {
-		var key, manifest string
+		var key, manifest, endpoint string
 		var size int64
 		var done bool
-		if err = rows.Scan(&key, &size, &manifest, &done); err != nil {
+		if err = rows.Scan(&key, &size, &manifest, &endpoint, &done); err != nil {
 			rows.Close()
 			return result, err
+		}
+		if endpoint != store.EndpointSHA256() {
+			rows.Close()
+			return result, errors.New("durable intent belongs to a different provider endpoint")
 		}
 		existing[key] = true
 		if done {

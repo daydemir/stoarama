@@ -18,6 +18,7 @@ const (
 )
 
 type inverseLedgerRecord struct {
+	EndpointSHA256 string       `json:"endpoint_sha256"`
 	Event          inverseEvent `json:"event"`
 	Bucket         string       `json:"bucket"`
 	Key            string       `json:"key"`
@@ -73,10 +74,10 @@ func openInverseLedger(path string) (*inverseLedger, error) {
 	return l, nil
 }
 func inverseLedgerKey(r inverseLedgerRecord) string {
-	return r.Bucket + "\x00" + r.Key + "\x00" + string(r.Event)
+	return r.Bucket + "\x00" + r.EndpointSHA256 + "\x00" + r.Key + "\x00" + string(r.Event)
 }
 func validInverseRecord(r inverseLedgerRecord) bool {
-	return (r.Event == inverseIntent || r.Event == inverseAbsent) && r.Bucket != "" && r.Key != "" && r.SizeBytes > 0 && r2RetireLowerHex64(r.ManifestSHA256) && !r.At.IsZero()
+	return (r.Event == inverseIntent || r.Event == inverseAbsent) && r2RetireLowerHex64(r.EndpointSHA256) && r.Bucket != "" && r.Key != "" && r.SizeBytes > 0 && r2RetireLowerHex64(r.ManifestSHA256) && !r.At.IsZero()
 }
 func (l *inverseLedger) append(r inverseLedgerRecord) error {
 	l.mu.Lock()

@@ -6,10 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,16 +24,17 @@ import (
 )
 
 type inverseFakeStore struct {
-	mu         sync.Mutex
-	objects    map[string]r2.ObjectInfo
-	calls      int
-	lost       bool
-	delay      time.Duration
-	beforeHead func(string) error
+	endpointSHA string
+	mu          sync.Mutex
+	objects     map[string]r2.ObjectInfo
+	calls       int
+	lost        bool
+	delay       time.Duration
+	beforeHead  func(string) error
 }
 
 func (s *inverseFakeStore) Bucket() string         { return "stoarama" }
-func (s *inverseFakeStore) EndpointSHA256() string { return strings.Repeat("a", 64) }
+func (s *inverseFakeStore) EndpointSHA256() string { return s.endpointSHA }
 func (s *inverseFakeStore) ListPrefix(context.Context, string, int, func(r2.ObjectInfo) error) error {
 	return errors.New("apply must not relist")
 }
@@ -106,15 +111,17 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
  INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps) VALUES(3,'test','3','inverse','inverse','https://test.invalid','off','Asia/Tokyo','hls','video_manifest','video_live','continuous_video',30);
  INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc) VALUES(1,47,'test','https://test.invalid','auto','stoarama','fixture',decode('00','hex'));
  INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at) VALUES(30,47,1,'inverse','https://test.invalid','* * * * *','Asia/Tokyo','paused',3,now());`)
-	const count = 1100
+	const count = 1200
 	store := &inverseFakeStore{objects: map[string]r2.ObjectInfo{}}
+	sdk, providerDeletes := inverseSDKTestStore(t, store)
+	store.endpointSHA = sdk.EndpointSHA256()
 	for n := range count {
 		key := fmt.Sprintf("managed/acct-47/ordinary/%04d.mp4", n)
 		etag := fmt.Sprintf("etag-%04d", n)
-		store.objects[key] = r2.ObjectInfo{Key: key, ETag: etag, SizeBytes: 100, LastModified: time.Now().UTC().Add(-8 * 24 * time.Hour).Truncate(time.Microsecond)}
+		store.objects[key] = r2.ObjectInfo{Key: key, ETag: etag, SizeBytes: 100, LastModified: time.Now().UTC().Add(-8 * 24 * time.Hour).Truncate(time.Second)}
 		exec(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path) VALUES($1,30,1,'https://test.invalid','stoarama',$2,100,$3,repeat('b',64),'2026-06-01','2026-06-01','2026-06-01 00:01:00','ordinary/'||$4)`, 9000000+n, key, etag, fmt.Sprintf("%04d.mp4", n))
 	}
-	exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',repeat('a',64))`)
+	exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, store.EndpointSHA256())
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -161,7 +168,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 		f.Close()
 		sha, _ := inverseFileSHA(manifest)
-		sum := inverseSummary{Version: 1, Bucket: "stoarama", CreatedAt: time.Now().UTC(), PolicySHA256: policy, PicksSHA256: picks.SHA256, ReadOnly: true}
+		sum := inverseSummary{Version: 1, Bucket: "stoarama", EndpointSHA256: store.EndpointSHA256(), CreatedAt: time.Now().UTC(), PolicySHA256: policy, PicksSHA256: picks.SHA256, ReadOnly: true}
 		summary := filepath.Join(dir, "summary.json")
 		data, _ := json.Marshal(sum)
 		os.WriteFile(summary, data, 0600)
@@ -250,6 +257,38 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatal("budget exceeded", err)
 		}
 	})
+	t.Run("real_SDK_canary_contract", func(t *testing.T) {
+		a, entries := build(100)
+		a.ledger.close()
+		before := providerDeletes()
+		result, err := applyInverse(ctx, pool, sdk, a.opts)
+		if err != nil || result.Deleted != 100 || providerDeletes()-before != 100 {
+			t.Fatalf("SDK canary %+v deletes%d err%v", result, providerDeletes()-before, err)
+		}
+		var count int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_events e JOIN r2_inverse_intents i USING(bucket,object_key) WHERE i.manifest_sha256=$1`, a.opts.ManifestSHA).Scan(&count); err != nil || count != 100 {
+			t.Fatal(count, err)
+		}
+		ledger, err := openInverseLedger(a.opts.Ledger)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ledger.close()
+		count = 0
+		for _, record := range ledger.seen {
+			if record.Event == inverseAbsent && record.ManifestSHA256 == a.opts.ManifestSHA {
+				count++
+			}
+		}
+		if count != 100 {
+			t.Fatal("ledger/provider mismatch", count)
+		}
+		for _, e := range entries {
+			if _, err = sdk.Head(ctx, e.Key); !r2.IsNotFound(err) {
+				t.Fatal("SDK confirming HEAD", e.Key, err)
+			}
+		}
+	})
 	t.Run("worker_pool_rate_with_durable_DB_and_ledger", func(t *testing.T) {
 		a, _ := build(1024)
 		a.ledger.close()
@@ -271,7 +310,7 @@ func TestR2InverseLedgerRestartAndPartialTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := inverseLedgerRecord{Event: inverseIntent, Bucket: "stoarama", Key: "managed/x", ManifestSHA256: strings.Repeat("a", 64), At: time.Now().UTC(), SizeBytes: 1}
+	r := inverseLedgerRecord{Event: inverseIntent, Bucket: "stoarama", EndpointSHA256: strings.Repeat("a", 64), Key: "managed/x", ManifestSHA256: strings.Repeat("a", 64), At: time.Now().UTC(), SizeBytes: 1}
 	if err = l.append(r); err != nil {
 		t.Fatal(err)
 	}
@@ -290,4 +329,46 @@ func TestR2InverseLedgerRestartAndPartialTail(t *testing.T) {
 	if _, err = openInverseLedger(path); err == nil {
 		t.Fatal("partial ledger tail accepted")
 	}
+}
+
+// Exercises the actual SDK, single-attempt transport and live DB authority in
+// one end-to-end path. The endpoint is an isolated loopback server, never R2.
+func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*r2.Client, func() int64) {
+	t.Helper()
+	var deleted atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodGet && req.URL.Path == "/stoarama" && req.URL.Query().Has("uploads") {
+			w.Header().Set("Content-Type", "application/xml")
+			fmt.Fprint(w, `<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>`)
+			return
+		}
+		key := strings.TrimPrefix(req.URL.Path, "/stoarama/")
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		o, ok := store.objects[key]
+		switch req.Method {
+		case http.MethodHead:
+			if !ok {
+				w.WriteHeader(404)
+				return
+			}
+			w.Header().Set("ETag", `"`+o.ETag+`"`)
+			w.Header().Set("Content-Length", strconv.FormatInt(o.SizeBytes, 10))
+			w.Header().Set("Last-Modified", o.LastModified.Format(http.TimeFormat))
+			w.Header().Set("x-amz-meta-sha256", strings.Repeat("b", 64))
+			w.WriteHeader(200)
+		case http.MethodDelete:
+			deleted.Add(1)
+			delete(store.objects, key)
+			w.WriteHeader(204)
+		default:
+			w.WriteHeader(400)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client, err := r2.New(context.Background(), r2.Config{Bucket: "stoarama", Endpoint: server.URL, AccessKey: "test", SecretKey: "test", Region: "auto"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client, deleted.Load
 }

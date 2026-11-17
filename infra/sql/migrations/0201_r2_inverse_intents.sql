@@ -3,6 +3,8 @@
 SELECT 'lock_nas_r2_copy_key(text,text)'::regprocedure;
 CREATE TABLE r2_inverse_intents (
  bucket text NOT NULL, object_key text NOT NULL,
+ endpoint_sha256 text NOT NULL CHECK(endpoint_sha256 ~ '^[a-f0-9]{64}$'),
+ stream_id bigint NOT NULL CHECK(stream_id>0),
  source_id bigint NOT NULL REFERENCES recording_clips(id),
  size_bytes bigint NOT NULL CHECK(size_bytes>0),
  etag text NOT NULL CHECK(etag<>''), last_modified timestamptz NOT NULL,
