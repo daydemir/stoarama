@@ -134,3 +134,57 @@ waiting; a busy key returns 55P03, and a committed reservation vetoes adoption.
 The CLI pool has 20 connections. Workers default to 16 and may use at most the
 pool capacity minus two (18 here), retaining the session and independent issuance
 connections. Invalid capacity fails before any reservation or budget charge.
+
+## Keep28 RAW with fresh NAS custody (B2)
+
+`r2-inverse apply-keep28` takes the same bounded, SHA-pinned partition, picks,
+ledger, drain and budget arguments as `apply`. Use a **separate B2 ledger**;
+every B2 record contains `lane: keep28_raw_v1`. Both commands reject the other
+lane's ledger before any append. B1 still refuses keep28. B2 admits only a unique
+managed RAW identity overlapping pinned keep28, in account 47 / NAS connection
+13, with a known non-KE owner choice. All existing KE stream/path, delivery,
+incident, live hold, exact A1 blocked-key, purge, unknown, tool-prefix and
+collated exclusions remain. A broad partition can label collated/ambiguous
+keep28 keys; that classification cannot authorize them here.
+
+Selection intersects the report with fresh exact inventory in `verified_at`,
+source-ID order. Reservation and final authorization both use the existing
+`r2RetireLockNASIdentity` lock: exact connection/source/path/size/SHA, present,
+both verified and server-received timestamps within 24 hours, exact sidecar
+path/size/SHA. The complete proof is persisted with the permanent B2 intent and
+compared again under lock, including timestamps and sidecar. Old October 30
+inventory does not qualify. The final inventory row stays locked through DELETE
+and confirming HEAD404. PostgreSQL time and monotonic elapsed duration bound
+each network handoff by the earlier of custody expiry and the existing
+30-second cap; local wall-clock skew cannot extend authority.
+
+Migration 0204 creates independent `r2_keep28_intents`, `r2_keep28_attempts`,
+`r2_keep28_events` and a pending-source identity guard. Ordinary reservations
+and the conservative byte budget remain shared protections. B2 uses its own
+concrete verifier, single-use authority and exact one-attempt transport; no B1
+token grants B2 authority. An existing B2 intent is never retransmitted, even
+after a stop before wire. Restart publishes only a confirming HEAD404 against
+the exact persisted source/receipt; a present object remains `ambiguous_held`.
+
+Deniz's November 17 order to delete group 3 that is on the NAS supersedes the
+stitch-proof prerequisite **only for this keep28 RAW lane**. This new command
+accepts no stitch-proof and never calls the legacy stitch-gated retirement
+entry point. The old `r2-retire` command and its stitch-proof gate are unchanged.
+Final HEAD identity and seven-day age, mature immutable 0198 fence (earliest
+November 19 14:30:47Z), and substantiated pinned drain evidence still apply.
+
+Only the sole production controller may deploy and run this command. Use the
+same 100-object canary gate, but reconcile **B2** DB events, B2 ledger and exact
+provider removals separately from B1. Require HEAD404, bucket-byte reduction and
+at least 8 objects/second by full batch wall time before larger batches.
+Production readiness and throughput are not established by offline tests.
+
+At this base COPY does not re-lease verified rows, so expired verified custody
+remains held pending the separately reviewed PR2 refresh tool. No timestamp
+refresh, manual reset, NAS scanner or reduced memory/load guard is supplied by
+B2. The recorded 1,158,889 RAW / 16.44 TB requires about 5.37 days at 150
+verifications/minute or 2.01 days at 400/minute (~95 MB/s of hashing). Memory and
+load can hold the worker entirely. Selection and startup memory at full
+cardinality remain unmeasured: B2 retains the report's keep28 entries in memory,
+and both lanes read their historical intents and ledger. Use bounded controller
+batches and measure startup/RSS before scaling.
