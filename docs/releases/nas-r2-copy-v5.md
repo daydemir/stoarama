@@ -64,6 +64,8 @@ digits, Z and explicit ±hh:mm offsets. It pads to six fractional digits for
 Python 3.9 and truncates sub-microsecond digits without rounding or extending
 expiry. There are no caller-specific shims or server timestamp changes.
 Malformed dates, fractions and offsets still fail. The pipeline harness requires
-an explicit `STOARAMA_TEST_PYTHON`; CI pins Python 3.9 rather than inheriting PATH.
+an explicit `STOARAMA_TEST_PYTHON`; CI uses NAS Python 3.14.6 as the primary backend interpreter. The existing
+Ubuntu 24.04 Python 3.9 job also runs the parser, complete cleanup suite and
+explicitly bound real v5 pipeline; neither inherits an arbitrary PATH version.
 Jelly validation uses `/usr/bin/python3` (3.9.6) and an isolated exact 3.14.6
 interpreter matching the recorded NAS runtime, with no production execution.
