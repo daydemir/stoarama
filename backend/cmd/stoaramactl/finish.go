@@ -30,6 +30,9 @@ const finishCleanupHeadroom int64 = 300_000_000_000
 const finishRecoveryAge = 7 * time.Hour // six-hour refresh plus verification/scheduling margin
 const finishLock int64 = 7343226011199
 
+// Three tiers at 60s fit inside the 4-minute tick deadline; writes and other tick queries keep the 10s copy budget.
+const finishCandidateStatementTimeout = "60s"
+
 type finishStop string
 
 const (
@@ -250,6 +253,28 @@ func finishPolicyJSON() ([]byte, error) {
 	}
 	return json.Marshal(rowsJSON)
 }
+
+// beginFinishCandidateTx opens a read-only transaction whose statement budget
+// covers the catalog candidate selection without raising the pooled 10s budget.
+func beginFinishCandidateTx(ctx context.Context, pool *pgxpool.Pool) (pgx.Tx, error) {
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(ctx, `SET LOCAL statement_timeout = '`+finishCandidateStatementTimeout+`'`); err != nil {
+		rollbackFinishCandidateTx(tx)
+		return nil, err
+	}
+	return tx, nil
+}
+
+// rollbackFinishCandidateTx releases the transaction; cancellation must not leave it open.
+func rollbackFinishCandidateTx(tx pgx.Tx) {
+	cleanup, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = tx.Rollback(cleanup)
+}
+
 func finishCandidates(ctx context.Context, pool *pgxpool.Pool, limit int) ([]api.NASR2CopyItem, finishTier, error) {
 	data, err := finishPolicyJSON()
 	if err != nil {
@@ -265,8 +290,13 @@ func finishCandidates(ctx context.Context, pool *pgxpool.Pool, limit int) ([]api
 		{finishEarlyUnknown, `n.clip_id IS NULL AND w.end_at<timestamptz '2026-09-24 00:00:00+00'`},
 		{finishLateUnknown, `n.clip_id IS NULL AND w.end_at>=timestamptz '2026-09-24 00:00:00+00'`},
 	} {
-		rows, err := pool.Query(ctx, finishWindowSQL+finishCandidateSelectSQL+finishEligibleSQL+` AND `+selection.predicate+` ORDER BY r.stream_id,c.id LIMIT $3`, data, api.NASR2CopyMaxFile, limit)
+		tx, err := beginFinishCandidateTx(ctx, pool)
 		if err != nil {
+			return nil, 0, err
+		}
+		rows, err := tx.Query(ctx, finishWindowSQL+finishCandidateSelectSQL+finishEligibleSQL+` AND `+selection.predicate+` ORDER BY r.stream_id,c.id LIMIT $3`, data, api.NASR2CopyMaxFile, limit)
+		if err != nil {
+			rollbackFinishCandidateTx(tx)
 			return nil, 0, err
 		}
 		items := []api.NASR2CopyItem{}
@@ -274,6 +304,7 @@ func finishCandidates(ctx context.Context, pool *pgxpool.Pool, limit int) ([]api
 			i := api.NASR2CopyItem{Kind: api.NASR2CopyRaw}
 			if err = rows.Scan(&i.SourceID, &i.RecordingID, &i.StreamID, &i.Bucket, &i.ObjectKey, &i.RelativePath, &i.SizeBytes, &i.SHA256, &i.StartAt, &i.EndAt); err != nil {
 				rows.Close()
+				rollbackFinishCandidateTx(tx)
 				return nil, 0, err
 			}
 			items = append(items, i)
@@ -281,6 +312,11 @@ func finishCandidates(ctx context.Context, pool *pgxpool.Pool, limit int) ([]api
 		err = rows.Err()
 		rows.Close()
 		if err != nil {
+			rollbackFinishCandidateTx(tx)
+			return nil, 0, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			rollbackFinishCandidateTx(tx)
 			return nil, 0, err
 		}
 		if len(items) > 0 {
@@ -289,6 +325,7 @@ func finishCandidates(ctx context.Context, pool *pgxpool.Pool, limit int) ([]api
 	}
 	return nil, 0, nil
 }
+
 func finishManifest(dir string, items []api.NASR2CopyItem) (nasCopyHeader, string, []api.NASR2CopyItem, error) {
 	var h nasCopyHeader
 	var body bytes.Buffer

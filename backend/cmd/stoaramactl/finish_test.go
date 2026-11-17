@@ -532,6 +532,37 @@ func TestFinishDelayedLegacyTimelinesNeedNewV5Storage(t *testing.T) {
 	}
 }
 
+func TestFinishCandidateTxBudget(t *testing.T) {
+	pool, _, _ := finishFixture(t, 1)
+	ctx := context.Background()
+	// Use the COPY control budget so the test proves SET LOCAL raises it.
+	cfg, err := nasR2CopyPoolConfig(pool.Config().ConnString(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = pool.Config().ConnConfig.RuntimeParams["search_path"]
+	copyPool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer copyPool.Close()
+	tx, err := beginFinishCandidateTx(ctx, copyPool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollbackFinishCandidateTx(tx)
+	var timeout, readOnly string
+	if err = tx.QueryRow(ctx, `SHOW statement_timeout`).Scan(&timeout); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.QueryRow(ctx, `SHOW transaction_read_only`).Scan(&readOnly); err != nil {
+		t.Fatal(err)
+	}
+	if timeout != "1min" || readOnly != "on" {
+		t.Fatalf("candidate tx budget timeout=%q read_only=%q", timeout, readOnly)
+	}
+}
+
 func TestFinishCleanupRequiresProofNotDisplayReceipt(t *testing.T) {
 	for _, frame := range []struct{ name, mutation, reason string }{
 		{"nonce_missing", `nas_storage_budget_at=NULL,nas_storage_client_version=''`, "nas_space_proof_missing"},
