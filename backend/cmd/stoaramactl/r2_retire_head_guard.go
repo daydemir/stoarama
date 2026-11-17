@@ -37,25 +37,25 @@ func r2RetireCheckMultipart(ctx context.Context, store r2RetireStore) error {
 }
 
 func r2RetireCheckWriterFence(ctx context.Context, q r2RetireQuerier, bucket, endpoint string) error {
-	var fenced bool
-	err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_retirement_writer_fences
- WHERE bucket=$1 AND endpoint_sha256=$2 AND drain_not_before<clock_timestamp())`, bucket, endpoint).Scan(&fenced)
-	if err != nil {
-		return fmt.Errorf("R2 writer fence unavailable (migration 0187 required): %w", err)
+	var blocked bool
+	if err := q.QueryRow(ctx, `SELECT r2_retirement_writes_blocked($1,$2)`, bucket, endpoint).Scan(&blocked); err != nil {
+		return fmt.Errorf("check fenced R2 writes (migration 0198 required): %w", err)
 	}
-	if !fenced {
-		return errors.New("R2 writer fence missing, scope differs or legacy capabilities have not drained")
+	if !blocked {
+		return errors.New("R2 writer fence missing or scope differs, or wire writes/capabilities have not drained")
 	}
-	return r2RetireCheckStoppedWriters(ctx, q, bucket)
+	return nil
 }
 
-func r2RetireLockStoppedWriters(ctx context.Context, tx pgx.Tx, bucket string) error {
+func r2RetireLockBlockedWrites(ctx context.Context, tx pgx.Tx, bucket, endpoint string) error {
 	// A durable fence survives transaction failures and crashes. The apply session
 	// lock also prevents explicit deactivation through its SQL transition trigger.
-	if _, err := tx.Exec(ctx, `SELECT singleton FROM r2_retirement_writer_fences FOR SHARE`); err != nil {
-		return err
+	var singleton bool
+	if err := tx.QueryRow(ctx, `SELECT singleton FROM r2_retirement_writer_fences
+ WHERE bucket=$1 AND endpoint_sha256=$2 FOR SHARE`, bucket, endpoint).Scan(&singleton); err != nil {
+		return fmt.Errorf("lock exact R2 writer fence: %w", err)
 	}
-	return r2RetireCheckStoppedWriters(ctx, tx, bucket)
+	return r2RetireCheckWriterFence(ctx, tx, bucket, endpoint)
 }
 
 func r2RetireCheckStoppedWriters(ctx context.Context, q r2RetireQuerier, bucket string) error {
@@ -148,7 +148,7 @@ func (a *r2RetireApplier) headGuard(ctx context.Context, tx pgx.Tx, it r2RetireI
 	if err := r2RetireRequireIndexes(ctx, tx); err != nil {
 		return err
 	}
-	if err := r2RetireCheckStoppedWriters(ctx, tx, a.header.Bucket); err != nil {
+	if err := r2RetireCheckWriterFence(ctx, tx, a.header.Bucket, a.store.EndpointSHA256()); err != nil {
 		return err
 	}
 	// Refresh every protection set too: fingerprint caching is not deletion
