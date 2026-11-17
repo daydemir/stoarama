@@ -395,6 +395,11 @@ func TestNASR2CopyConcurrentLeaseSlotsAndExpiredOwner(t *testing.T) {
 	if len(tasks) != NASR2CopyWorkers {
 		t.Fatalf("leases %d", len(tasks))
 	}
+	// Concurrent preparation may grant rows out of ID order. Isolate token
+	// replacement from any ungranted lower-ID synthetic candidate.
+	if _, err := f.pool.Exec(f.ctx, `DELETE FROM nas_r2_copy_items WHERE state='pending'`); err != nil {
+		t.Fatal(err)
+	}
 	for id, old := range tasks {
 		if _, err := f.pool.Exec(f.ctx, `UPDATE nas_r2_copy_items SET lease_expires_at=now()-interval '1 second' WHERE id=$1`, id); err != nil {
 			t.Fatal(err)

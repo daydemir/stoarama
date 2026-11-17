@@ -31,8 +31,12 @@ type fakeCleanupBucket struct {
 	objects       map[string][]byte
 	gets          int
 	heads         int
+	activeHeads   int
+	peakHeads     int
 	headDelay     time.Duration
 	headFailures  int
+	headStarted   chan string
+	headRelease   <-chan struct{}
 	getDelay      time.Duration
 	getFailures   int
 	getShortReads int
@@ -59,12 +63,35 @@ func (b *fakeCleanupBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		b.heads++
+		b.activeHeads++
+		if b.activeHeads > b.peakHeads {
+			b.peakHeads = b.activeHeads
+		}
+		defer func() { b.mu.Lock(); b.activeHeads--; b.mu.Unlock() }()
 		fail = b.headFailures > 0
 		if b.headFailures > 0 {
 			b.headFailures--
 		}
 	}
+	started, release := b.headStarted, b.headRelease
+	if r.Method != http.MethodHead {
+		started, release = nil, nil
+	}
 	b.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- key:
+		case <-r.Context().Done():
+			return
+		}
+	}
+	if release != nil {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+	}
 	select {
 	case <-time.After(delay):
 	case <-r.Context().Done():

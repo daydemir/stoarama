@@ -161,8 +161,11 @@ func TestNASR2CopyControlAuthenticatedAdmission(t *testing.T) {
 			if delay == 100*time.Millisecond && successes != NASR2CopyWorkers {
 				t.Fatalf("fast full-auth admission did not fit unchanged2s request budget: %+v", result)
 			}
-			if delay == 600*time.Millisecond && (successes == 0 || successes == NASR2CopyWorkers) {
-				t.Fatalf("controlled serialized HEAD boundary not exposed: %+v", result)
+			f.bucket.mu.Lock()
+			peak := f.bucket.peakHeads
+			f.bucket.mu.Unlock()
+			if delay == 600*time.Millisecond && (successes == 0 || peak <= 1) {
+				t.Fatalf("full-auth HEAD requests did not overlap: peak=%d result=%+v", peak, result)
 			}
 			var leases, ranges int
 			var authenticated bool
