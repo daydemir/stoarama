@@ -39,6 +39,10 @@ func TestR2WriterFenceProcessRunsWithRealSchema(t *testing.T) {
 	if _, err = pool.Exec(ctx, `INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, strings.Repeat("a", 64)); err != nil {
 		t.Fatal(err)
 	}
+	injectR2WriterState(t, pool, `UPDATE r2_retirement_writer_fences SET drain_not_before=clock_timestamp()-interval '1 second'`)
+	if err := r2RetireCheckWriterFence(ctx, pool, "stoarama", strings.Repeat("a", 64)); err != nil {
+		t.Fatal("real-schema historical processes could not be fenced without rewriting them", err)
+	}
 	// Terminal history is legal; it does not authorize a runnable transition.
 	if _, err = pool.Exec(ctx, `INSERT INTO recording_process_runs(stream_id,execution_class,server_id,process_id,worker_id,status,started_at,stopped_at)
  VALUES(991,'video_live','test-server','terminal-process','test-worker','stopped',now()-interval '1 year',now()-interval '1 year')`); err != nil {

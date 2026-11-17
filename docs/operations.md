@@ -340,6 +340,25 @@ reviewed between-batch deployment; merging does not deploy or authorize deletion
 
 ## R2 writer readiness reconciliation
 
+Migration0198 separates the retirement consumer's `r2_retirement_writes_blocked`
+check from the historical twenty-category diagnostic. A runnable job may remain
+unchanged when durable admission prevents it from writing. The consumer requires
+the exact bucket/endpoint fence, its immutable minimum drain deadline, and no
+outstanding wire operations, PUT capabilities, upload intents, capture leases or
+restore PUT capabilities. Unknown scope blocks globally. Every item locks the
+exact fence row and repeats the check immediately before its single wire DELETE;
+fence removal stays excluded through the existing apply session lock.
+
+This database predicate alone is insufficient production evidence. The controller
+must verify every deployed overlapping automated writer uses this fence or is
+excluded, and prove externally accepted PUT requests have finished or cannot
+reach selected keys. URL expiry, signer revocation and the two-minute signing
+allowance do not prove an accepted upload completed. Unknown completion remains
+blocking after the seven-day deadline. No deadline override, credential change,
+historical-row reconciliation or broader deletion authority is introduced.
+Keep all custody, retention, delivery, incident, provider-proof and stitching
+checks; the approved verified-NAS exception requires its own typed consumer path.
+
 `stoaramactl r2-retire reconcile-writers --out NEW_FILE.jsonl --bucket stoarama`
 creates a read-only, repeatable-read observation of every category in
 `r2_retirement_writers_drained`. It writes a private, fsynced JSONL record for
