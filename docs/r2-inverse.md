@@ -39,3 +39,98 @@ retain the report as durable evidence. No production partition was run by the
 implementation agent. Collated outputs are held in this release, including outside-window outputs;
 raw keys with multiple catalog identities remain unknown. The executor is a separate change and has additional
 live fence, drain, intent, budget and provider checks.
+
+## Raw-only executor (separate release)
+
+The sole controller can run a bounded batch with this interface. D-min remains
+a metadata feeder plus safety/space decision; it has no R2 apply hook. A later
+reviewed integration can call this interface after the drain/canary gate:
+
+```
+stoaramactl r2-inverse apply \
+  --manifest REPORT/partition.jsonl --expected-sha256 PARTITION_SHA \
+  --summary REPORT/summary.json --expected-summary-sha256 SUMMARY_SHA \
+  --picks PICKS --ledger PRIVATE_LEDGER \
+  --drain-evidence DRAIN_JSON --expected-drain-evidence-sha256 DRAIN_SHA \
+  --workers 16 --max-items 100 --max-bytes CANARY_BYTES \
+  --budget-24h-bytes CONTROLLER_BUDGET
+```
+
+The budget is explicit, configurable, and includes unresolved intents. It is
+conservatively charged by minute over the preceding 24h, with no owner-class 5 TB
+cap. The default 100-object limit is the canary size; subsequent tick calls may
+increase `--max-items` and the per-run byte bound within the daily budget.
+Only raw keys with one certain catalog identity and no protection are eligible.
+Collated, KE, keep28, tools, delivery, held and unknown keys are never deleted.
+The partition and picks must match the pinned policy and be no older than 24h.
+The tick can generate a new read-only partition when its current one expires.
+
+Each new key commits an ordinary source reservation and a permanent key intent
+before wire, charges its byte budget, and fsyncs a private append-only JSONL
+ledger. The network phase takes the metadata barrier first in shared mode, then
+ordered joined/admission locks, allowing independent keys to run concurrently. A common live delivery predicate includes content/path aliases
+and current collated-output dependencies without relying on a refreshed source
+cache; admission of those protections and output membership changes is fenced. It exercises the installed purge guards before DELETE, rolls
+that probe back, HEAD-checks listing/catalog ETag, size and seven-day age, and
+rechecks live protections, controller drain evidence and migration 0198 at the
+wire. The private concrete executor verifier issues authority only after these checks
+and independently commits a permanent one-issuance row. No exported approval
+callback or generic R2 delete API is added. Repeated verification cannot remint
+authority. The entire per-key network phase has a 30-second deadline, including
+HEAD, multipart inspection and confirming HEAD; timeout retains the intent for
+reconciliation. There is one DELETE attempt, no SDK replay or redirects. Success requires
+a confirming 404. Receipt and raw purged_at publication happens separately with
+exclusive admission locks, without upgrading a network transaction's locks.
+
+An existing intent is never retransmitted, including a crash before wire. On
+restart, a 404 reconciles its receipt and ledger; a present object stays held as
+`ambiguous_held` while unrelated fresh keys can proceed. Preserve the ledger and
+DB records. There is no automated intent expiry, removal, or ambiguous retry.
+A damaged/partial local ledger fails closed; it is never truncated or repaired.
+
+Drain evidence is a controller-reviewed, SHA-pinned JSON artifact, bound to the
+exact bucket, endpoint and durable fence activation/deadline. It must include
+`bucket`, `endpoint_sha256`, `fence_activated_at`, `drain_not_before`,
+`observed_at`, `deployed_writer_coverage_evidence`, and
+`accepted_put_completion_evidence`. The observation is after the real deadline. Completion evidence remains bound
+to that immutable fence; it does not need a daily reapproval. References must substantiate
+all deployed writer coverage and completion of externally accepted PUTs.
+A string claiming completion or capability expiry does not establish that fact.
+The implementation agent creates none of this production evidence.
+
+Controller canary gate after Nov 19 14:30:47Z AND actual drain evidence:
+
+1. Record baseline provider bucket bytes and object count using the controller's
+   read-only metrics. Pin exactly 100 eligible raw keys and their total bytes.
+2. Run one 100-object batch with an explicit byte cap and 24h budget. On any error,
+   preserve evidence; reconcile existing intents by HEAD before continuing.
+3. Require 100 distinct absent ledger keys = 100 DB absent events = 100 provider
+   removals, and HEAD 404 for all 100. Provider bucket bytes must fall; account for
+   metric publication delay explicitly. No double-counting reconciliations.
+4. Require sustained >=8 objects/s measured by elapsed batch wall time. The CLI
+   prints `deleted`, `reconciled`, `ambiguous_held`, `bytes`, `elapsed_seconds`,
+   and `objects_per_second`. Synthetic-provider throughput is not this gate.
+5. Only after every gate passes, configure larger controller-owned batches.
+   Tick integration is a later change.
+   Keep the same durable ledger across runs. Preserve reports outside temp.
+
+Full-cardinality startup cost and memory remain unmeasured: each invocation reads
+the manifest, private ledger and historical intent keys. The offline throughput
+fixture includes 10,010 collated outputs but does not establish 4.17M-key scale.
+
+Protection metadata changes take the epoch-row barrier with NOWAIT and can return
+SQLSTATE 55P03 during an active batch; retry metadata admission in a new
+transaction. They require READ COMMITTED so an earlier snapshot cannot miss a
+committed retirement. Cleanup receipts/control do not take this barrier or a new
+global lock. New cleanup recovery admission instead locks raw clip rows in order
+and rejects a committed reservation; retired items cannot reactivate a hold.
+Output IDs and source-hold identities cannot be rebound.
+
+COPY reimport keeps its existing key-before-row order. Already-protected COPY
+progress and unchanged verified rows take no new key lock. A clean verified row
+gaining protection requires READ COMMITTED and tries the same key lock without
+waiting; a busy key returns 55P03, and a committed reservation vetoes adoption.
+
+The CLI pool has 20 connections. Workers default to 16 and may use at most the
+pool capacity minus two (18 here), retaining the session and independent issuance
+connections. Invalid capacity fails before any reservation or budget charge.

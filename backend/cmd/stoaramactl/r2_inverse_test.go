@@ -116,11 +116,11 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
 	}
 	exec(`CREATE TABLE recordings(id bigint,stream_id bigint,cron_timezone text);
  CREATE TABLE streams(id bigint,local_timezone text);
- CREATE TABLE recording_clips(id bigint,recording_id bigint,recording_job_id bigint DEFAULT 1,bucket text,object_key text,display_path text,clip_start_at timestamptz,clip_end_at timestamptz);
+ CREATE TABLE recording_clips(id bigint,recording_id bigint,recording_job_id bigint DEFAULT 1,bucket text,object_key text,display_path text,clip_start_at timestamptz,clip_end_at timestamptz,sha256 text DEFAULT '',size_bytes bigint DEFAULT 1);
  CREATE TABLE recording_collation_hours(id bigint,recording_id bigint);
- CREATE TABLE recording_collation_outputs(id bigint,collation_hour_id bigint,object_key text,nas_relative_path text,start_at timestamptz,end_at timestamptz,source_clip_ids bigint[]);
+ CREATE TABLE recording_collation_outputs(id bigint,collation_hour_id bigint,object_key text,nas_relative_path text,start_at timestamptz,end_at timestamptz,source_clip_ids bigint[],sha256 text DEFAULT '',size_bytes bigint DEFAULT 1);
  CREATE TABLE nas_cleanup_plans(id bigint,mode text,account_id bigint,connection_id bigint,label text,manifest jsonb);
- CREATE TABLE nas_cleanup_items(id bigserial,plan_id bigint,ordinal bigint,delete_ever_issued boolean);
+ CREATE TABLE nas_cleanup_items(id bigserial,plan_id bigint,ordinal bigint,delete_ever_issued boolean,state text DEFAULT 'pending');
  CREATE TABLE nas_cleanup_source_holds(plan_id bigint,clip_id bigint);
  CREATE TABLE r2_retirement_reservations(bucket text,object_key text);
  CREATE TABLE r2_object_retirements(bucket text,object_key text);
@@ -130,7 +130,7 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
  CREATE TABLE recording_joined_batches(id bigint,state text);
  CREATE TABLE recording_joined_dry_run_scopes(recording_id bigint,recording_job_id bigint,high_water_clip_id bigint);
  CREATE TABLE nas_r2_copy_items(item jsonb,state text,blocked_reason text);
- CREATE TABLE delivery_keep_holds(bucket text,object_key text);
+ CREATE TABLE delivery_keep_holds(bucket text,object_key text,relative_path text DEFAULT '',sha256 text DEFAULT '',size_bytes bigint DEFAULT 1);
  CREATE TABLE delivery_nas_source_holds(clip_id bigint);
  CREATE TABLE delivery_keep_output_dependencies(output_id bigint,recording_id bigint);
  CREATE TABLE nas_cleanup_incident_files(kind text,source_id bigint);
@@ -143,7 +143,7 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec(string(body))
-	for id, key := range []string{"reserved", "source_hold", "incident", "delivery_source", "blocked", "delivery_output", "ordinary", "snapshot_scoped", "dryrun_scoped"} {
+	for id, key := range []string{"reserved", "source_hold", "incident", "delivery_source", "blocked", "delivery_output", "ordinary", "snapshot_scoped", "dryrun_scoped", "delivery_alias", "delivery_normalized", "delivery_dependency", "delivery_output_alias"} {
 		exec(`INSERT INTO recording_clips(id,recording_id,bucket,object_key,display_path,clip_start_at,clip_end_at) VALUES($1,1,'bucket',$2,$2,'2026-06-01','2026-06-02')`, id+1, key)
 	}
 	exec(`INSERT INTO recording_joined_batches VALUES(1,'snapshotting');
@@ -153,13 +153,19 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
  INSERT INTO nas_cleanup_plans VALUES(1,'retired',47,13,'source','[]'),(2,'active',47,13,'reserved','[{"kind":"raw","source_id":1}]');
  INSERT INTO nas_cleanup_items(plan_id,ordinal,delete_ever_issued) VALUES(1,1,true); INSERT INTO nas_cleanup_source_holds VALUES(1,2);
  INSERT INTO nas_cleanup_incident_files VALUES('raw',3);
- INSERT INTO recording_collation_outputs VALUES(20,1,'incident_collated','incident-collated','2026-06-01','2026-06-02',ARRAY[3]::bigint[]);
+ INSERT INTO recording_collation_outputs(id,collation_hour_id,object_key,nas_relative_path,start_at,end_at,source_clip_ids) VALUES(20,1,'incident_collated','incident-collated','2026-06-01','2026-06-02',ARRAY[3]::bigint[]);
  INSERT INTO r2_retirement_reservations VALUES('bucket','reservation'),('other','other_reservation');
  INSERT INTO r2_object_retirements VALUES('bucket','retired');
  INSERT INTO nas_r2_copy_items VALUES('{"bucket":"bucket","object_key":"blocked"}','blocked','checksum_mismatch'),('{"bucket":"other","object_key":"ordinary"}','blocked','final_conflict');
- INSERT INTO delivery_keep_holds VALUES('bucket','direct_delivery');
+ INSERT INTO delivery_keep_holds(bucket,object_key) VALUES('bucket','direct_delivery');
  INSERT INTO delivery_nas_source_holds VALUES(4);
- INSERT INTO recording_collation_outputs VALUES(21,1,'delivery_output','delivery-output','2026-06-01','2026-06-02',ARRAY[4]::bigint[]);`)
+ INSERT INTO recording_collation_outputs(id,collation_hour_id,object_key,nas_relative_path,start_at,end_at,source_clip_ids) VALUES(21,1,'delivery_output','delivery-output','2026-06-01','2026-06-02',ARRAY[4]::bigint[]);
+ UPDATE recording_clips SET sha256=repeat('c',64),size_bytes=123 WHERE id=10;
+ UPDATE recording_clips SET display_path='joined/normalize-held' WHERE id=11;
+ INSERT INTO delivery_keep_holds(bucket,object_key,sha256,size_bytes) VALUES('bucket','content-alias',repeat('c',64),123);
+ INSERT INTO delivery_keep_holds(bucket,object_key,relative_path) VALUES('bucket','normalized-alias','normalize-held'),('bucket','output-alias','alias-output');
+ INSERT INTO recording_collation_outputs(id,collation_hour_id,object_key,nas_relative_path,start_at,end_at,source_clip_ids) VALUES(22,1,'live-held-output','live-output','2026-06-01','2026-06-02',ARRAY[12]::bigint[]),(23,1,'alias-held-output','joined/alias-output','2026-06-01','2026-06-02',ARRAY[13]::bigint[]);
+ INSERT INTO delivery_keep_output_dependencies VALUES(22,1);`)
 	p := inverseTestProtection()
 	p, err = loadInverseProtection(ctx, pool, "bucket", p.Picks, p.Windows)
 	if err != nil {
@@ -170,7 +176,7 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
 			t.Fatalf("%s got %s", key, got)
 		}
 	}
-	for _, key := range []string{"direct_delivery", "delivery_source", "delivery_output"} {
+	for _, key := range []string{"direct_delivery", "delivery_source", "delivery_output", "delivery_alias", "delivery_normalized", "delivery_dependency", "delivery_output_alias"} {
 		if got, _ := p.classify(r2.ObjectInfo{Key: key}); got != inverseDelivery {
 			t.Fatalf("%s got %s", key, got)
 		}
@@ -178,6 +184,34 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
 	if got, _ := p.classify(r2.ObjectInfo{Key: "ordinary"}); got != inverseDeletable {
 		t.Fatal(got)
 	}
+	t.Run("KE_alias_after_partition_uses_shared_normalization", func(t *testing.T) {
+		exec(`UPDATE recording_clips SET display_path='F/candidate.mp4' WHERE id=7;INSERT INTO recordings VALUES(2,4,'UTC');INSERT INTO streams VALUES(4,'UTC')`)
+		picks := p.Picks
+		picks.Choices[4] = r2RetirePick{Choice: "all"}
+		before, err := loadInverseProtection(ctx, pool, "bucket", picks, p.Windows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := before.classify(r2.ObjectInfo{Key: "ordinary"}); got != inverseDeletable {
+			t.Fatal("bad pre-alias fixture", got)
+		}
+		exec(`INSERT INTO recording_clips(id,recording_id,bucket,object_key,display_path,clip_start_at,clip_end_at) VALUES(100,2,'bucket','hashed-ke-alias','joined/F/ke.mp4','2026-06-01','2026-06-02')`)
+		apply, err := loadInverseApplyProtection(ctx, pool, "bucket", picks, p.Windows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		partition, err := loadInverseProtection(ctx, pool, "bucket", picks, p.Windows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !apply.KEFolders["F"] || !partition.KEFolders["F"] || apply.KEFolders["joined"] {
+			t.Fatal("KE normalization drift", apply.KEFolders, partition.KEFolders)
+		}
+		before.KEFolders = apply.KEFolders
+		if got, _ := before.classify(r2.ObjectInfo{Key: "ordinary"}); got != inverseKE {
+			t.Fatal("fresh KE alias reached apply", got)
+		}
+	})
 	// The frozen incident roster survives plan transitions independently.
 	exec(`UPDATE nas_cleanup_plans SET mode='retired'; DELETE FROM nas_cleanup_source_holds; DELETE FROM nas_cleanup_items`)
 	p, err = loadInverseProtection(ctx, pool, "bucket", p.Picks, p.Windows)

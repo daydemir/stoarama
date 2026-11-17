@@ -1,0 +1,1199 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/aws/smithy-go"
+	"github.com/daydemir/stoarama/backend/internal/api"
+	"github.com/daydemir/stoarama/backend/internal/db"
+	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type inverseFakeStore struct {
+	endpointSHA  string
+	mu           sync.Mutex
+	objects      map[string]r2.ObjectInfo
+	calls        int
+	lost         bool
+	delay        time.Duration
+	beforeHead   func(context.Context, string) error
+	beforeDelete func(string) error
+}
+
+func (s *inverseFakeStore) setLost(lost bool)      { s.mu.Lock(); defer s.mu.Unlock(); s.lost = lost }
+func (s *inverseFakeStore) Bucket() string         { return "stoarama" }
+func (s *inverseFakeStore) EndpointSHA256() string { return s.endpointSHA }
+func (s *inverseFakeStore) ListPrefix(context.Context, string, int, func(r2.ObjectInfo) error) error {
+	return errors.New("apply must not relist")
+}
+func (s *inverseFakeStore) RequireNoMultipartUploads(context.Context) error { return nil }
+func (s *inverseFakeStore) Head(ctx context.Context, key string) (r2.ObjectHead, error) {
+	if s.delay > 0 {
+		select {
+		case <-time.After(s.delay):
+		case <-ctx.Done():
+			return r2.ObjectHead{}, ctx.Err()
+		}
+	}
+	if s.beforeHead != nil {
+		if err := s.beforeHead(ctx, key); err != nil {
+			return r2.ObjectHead{}, err
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o, ok := s.objects[key]
+	if !ok {
+		return r2.ObjectHead{}, &smithy.GenericAPIError{Code: "NotFound"}
+	}
+	return r2.ObjectHead{ETag: o.ETag, SizeBytes: o.SizeBytes, LastModified: o.LastModified}, nil
+}
+func (s *inverseFakeStore) deleteOnce(ctx context.Context, authority *inverseDeleteAuthority) error {
+	key := authority.binding.Key
+	if err := authority.requireWire(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
+		return err
+	}
+	if s.beforeDelete != nil {
+		if err := s.beforeDelete(key); err != nil {
+			return err
+		}
+	}
+	if s.delay > 0 {
+		select {
+		case <-time.After(s.delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	delete(s.objects, key)
+	if s.lost {
+		return errors.New("lost response")
+	}
+	return nil
+}
+func TestR2InverseExecutorLifecycle(t *testing.T) {
+	ctx := context.Background()
+	schemaPool := joinedPurgeTestPool(t, "inverse_apply")
+	workerConfig := schemaPool.Config()
+	workerConfig.MaxConns = 20
+	workerConfig.MinConns = 2
+	pool, err := pgxpool.NewWithConfig(ctx, workerConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir()); err != nil {
+		t.Fatal(err)
+	}
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	policy, windows, err := api.Keep28Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := windows[3]
+	root := t.TempDir()
+	picksPath := filepath.Join(root, "picks.json")
+	picksData, _ := json.Marshal(map[string]any{"choices": map[string]any{"3": r2RetirePick{Choice: "none", KeepStartUTC: w.Start.Format(time.RFC3339), KeepEndUTC: w.End.Format(time.RFC3339)}}})
+	if err = os.WriteFile(picksPath, picksData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	picks, err := loadR2RetirePicks(picksPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(`INSERT INTO accounts(id,email) VALUES(47,'inverse@test.invalid');
+ INSERT INTO account_api_keys(id,account_id,key_prefix,secret_hash) VALUES(1,47,'test-inverse','not-a-real-credential');
+ INSERT INTO connections(id,account_id,kind,api_key_id) VALUES(13,47,'nas_pull',1);
+ INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps) VALUES(3,'test','3','inverse','inverse','https://test.invalid','off','Asia/Tokyo','hls','video_manifest','video_live','continuous_video',30);
+ INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc) VALUES(1,47,'test','https://test.invalid','auto','stoarama','fixture',decode('00','hex'));
+ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at) VALUES(30,47,1,'inverse','https://test.invalid','* * * * *','Asia/Tokyo','paused',3,now());
+ INSERT INTO recording_qualification_runs(id,account_id,definition_version,definition_jsonb,target_recording_count,window_sequence_start_at) VALUES(1,47,'inverse-fixture','{}',50,'2026-06-01');`)
+	const count = 1200
+	store := &inverseFakeStore{objects: map[string]r2.ObjectInfo{}}
+	sdk, providerDeletes := inverseSDKTestStore(t, store)
+	store.endpointSHA = sdk.EndpointSHA256()
+	for n := range count {
+		key := fmt.Sprintf("managed/acct-47/ordinary/%04d.mp4", n)
+		etag := fmt.Sprintf("etag-%04d", n)
+		store.objects[key] = r2.ObjectInfo{Key: key, ETag: etag, SizeBytes: 100, LastModified: time.Now().UTC().Add(-8 * 24 * time.Hour).Truncate(time.Second)}
+		exec(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path) VALUES($1,30,1,'https://test.invalid','stoarama',$2,100,$3,repeat('b',64),'2026-06-01','2026-06-01','2026-06-01 00:01:00','ordinary/'||$4)`, 9000000+n, key, etag, fmt.Sprintf("%04d.mp4", n))
+	}
+	exec(`INSERT INTO recording_collation_hours(id,hour_id,batch_id,generation,recording_id,local_date,delivery_hour,status,manifest_object_key,manifest_sha256,manifest,source_clip_count,included_clip_count,excluded_clip_count,join_count,split_count)
+ VALUES(1,'inverse__recording-30__date-2026-06-01__hour-01__generation-2','inverse',2,30,'2026-06-01',1,'collated','joined/inverse/manifest.json',repeat('a',64),'{}',1,1,0,0,0);
+ INSERT INTO recording_collation_outputs(id,collation_hour_id,part,parts,object_key,nas_relative_path,size_bytes,sha256,start_at,end_at,source_clip_ids,r2_verified_at)
+ VALUES(10000001,1,1,1,'joined/inverse/objects/'||repeat('a',64)||'.mp4','joined/ordinary/test-output.mp4',100,repeat('a',64),'2026-06-01','2026-06-01 00:01',ARRAY[9000000]::bigint[],now());
+ INSERT INTO recording_collation_outputs(id,collation_hour_id,part,parts,object_key,nas_relative_path,size_bytes,sha256,start_at,end_at,source_clip_ids,r2_verified_at)
+ SELECT 10000000+n,1,n,10010,'joined/inverse/objects/'||lpad(to_hex(n),64,'0')||'.mp4','joined/ordinary/output-'||n||'.mp4',100,lpad(to_hex(n),64,'0'),'2026-06-01','2026-06-01 00:01',ARRAY[10000000+n]::bigint[],now() FROM generate_series(2,10010) n;
+ ANALYZE recording_collation_outputs;`)
+	exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, store.EndpointSHA256())
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(ctx, `SET LOCAL session_replication_role=replica; UPDATE r2_retirement_writer_fences SET activated_at=clock_timestamp()-interval '8 days',drain_not_before=clock_timestamp()-interval '23 hours 58 minutes'`); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var activated, deadline time.Time
+	if err = pool.QueryRow(ctx, `SELECT activated_at,drain_not_before FROM r2_retirement_writer_fences`).Scan(&activated, &deadline); err != nil {
+		t.Fatal(err)
+	}
+	drain := inverseDrainEvidence{Bucket: "stoarama", EndpointSHA256: store.EndpointSHA256(), FenceActivatedAt: activated, DrainNotBefore: deadline, ObservedAt: time.Now().UTC(), DeployedWriterCoverage: "test fixture all admissions checked", AcceptedPUTCompletion: "test fixture no provider PUTs accepted"}
+	drainPath := filepath.Join(root, "drain.json")
+	data, _ := json.Marshal(drain)
+	if err = os.WriteFile(drainPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	drainSHA, _ := inverseFileSHA(drainPath)
+	next := 0
+	build := func(n int) (*inverseApplier, []inverseEntry) {
+		t.Helper()
+		dir := filepath.Join(root, fmt.Sprintf("run%d", next))
+		if err = os.Mkdir(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		var entries []inverseEntry
+		for i := next; i < next+n; i++ {
+			key := fmt.Sprintf("managed/acct-47/ordinary/%04d.mp4", i)
+			store.mu.Lock()
+			object := store.objects[key]
+			store.mu.Unlock()
+			entries = append(entries, inverseEntry{ObjectInfo: object, Class: inverseDeletable})
+		}
+		next += n
+		manifest := filepath.Join(dir, "partition.jsonl")
+		f, err := os.Create(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			if err = json.NewEncoder(f).Encode(e); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.Close()
+		sha, _ := inverseFileSHA(manifest)
+		sum := inverseSummary{Version: 1, Bucket: "stoarama", EndpointSHA256: store.EndpointSHA256(), CreatedAt: time.Now().UTC(), PolicySHA256: policy, PicksSHA256: picks.SHA256, ReadOnly: true}
+		summary := filepath.Join(dir, "summary.json")
+		data, _ := json.Marshal(sum)
+		os.WriteFile(summary, data, 0600)
+		summarySHA, _ := inverseFileSHA(summary)
+		o := inverseApplyOptions{Manifest: manifest, ManifestSHA: sha, Summary: summary, SummarySHA: summarySHA, Picks: picksPath, Ledger: filepath.Join(dir, "ledger.jsonl"), DrainEvidence: drainPath, DrainSHA: drainSHA, MaxItems: n, MaxBytes: int64(n) * 100, Budget24h: 200000, Workers: 8}
+		p, err := loadInverseProtection(ctx, pool, "stoarama", picks, windows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ledger, err := openInverseLedger(o.Ledger)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var epoch int64
+		if err = pool.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch`).Scan(&epoch); err != nil {
+			t.Fatal(err)
+		}
+		return &inverseApplier{pool: pool, store: store, opts: o, summary: sum, protection: p, ledger: ledger, keEpoch: epoch}, entries
+	}
+	cleanupPlan := func(sourceID int64, mode string, withItem, withHold bool) int64 {
+		t.Helper()
+		var planID int64
+		err := pool.QueryRow(ctx, `INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode) VALUES(47,13,$1,repeat('d',64),'[]',repeat('e',64),$2) RETURNING id`, fmt.Sprintf("inverse-%s-%d", mode, sourceID), mode).Scan(&planID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if withItem {
+			exec(`INSERT INTO nas_cleanup_items(plan_id,ordinal,state) VALUES($1,1,'keep')`, planID)
+		}
+		if withHold {
+			exec(`INSERT INTO nas_cleanup_source_holds(plan_id,clip_id) VALUES($1,$2)`, planID, sourceID)
+		}
+		return planID
+	}
+	latentCleanup := func(sourceID int64, withItem bool) int64 { return cleanupPlan(sourceID, "retired", withItem, true) }
+
+	const insertDryScope = `INSERT INTO recording_joined_dry_run_scopes(dry_run_id,recording_id,priority_ordinal,local_date,date_ordinal,recording_job_id,high_water_clip_id)
+ SELECT id,30,1,'2026-06-01',1,(convert_from(skeleton_bytes,'UTF8')::jsonb#>>'{recordings,0,snapshot_days,0,recording_job_id}')::bigint,(convert_from(skeleton_bytes,'UTF8')::jsonb#>>'{recordings,0,snapshot_days,0,high_water_clip_id}')::bigint FROM recording_joined_dry_runs WHERE id=$1::uuid`
+	dryScope := func(sourceID int64) string {
+		t.Helper()
+		var jobID int64
+		err := pool.QueryRow(ctx, `INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,completed_at) VALUES(30,'2026-06-01'::timestamptz+($1::bigint-9000000)*interval '1 minute','2026-06-01'::timestamptz+($1::bigint-9000000)*interval '1 minute',60,'done','inverse-scope-'||$1::bigint,'2026-06-02') RETURNING id`, sourceID).Scan(&jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		exec(`UPDATE recording_clips SET recording_job_id=$2 WHERE id=$1`, sourceID, jobID)
+		batchID := fmt.Sprintf("inverse-scope-%d", sourceID)
+		input, _ := json.Marshal(map[string]any{"batch_id": batchID, "generation": 1, "connection_id": 13, "qualification_run_id": 1, "apply": false})
+		skeleton, _ := json.Marshal(map[string]any{"batch_id": batchID, "generation": 1, "connection_id": 13, "selection_authority": map[string]any{"qualification_run_id": 1}, "recordings": []any{map[string]any{"frozen_recording": map[string]any{"recording_id": 30, "priority_ordinal": 1}, "snapshot_days": []any{map[string]any{"local_date": "2026-06-01", "date_ordinal": 1, "recording_job_id": jobID, "high_water_clip_id": sourceID}}}}})
+		var runID string
+		err = pool.QueryRow(ctx, `INSERT INTO recording_joined_dry_runs(account_id,connection_id,batch_id,generation,qualification_run_id,input_bytes,input_sha256,skeleton_bytes,skeleton_sha256) VALUES(47,13,'inverse-scope-'||$1::bigint,1,1,$3,encode(sha256($3::bytea),'hex'),$2,encode(sha256($2::bytea),'hex')) RETURNING id::text`, sourceID, skeleton, input).Scan(&runID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return runID
+	}
+	t.Run("success", func(t *testing.T) {
+		a, _ := build(2)
+		a.ledger.close()
+		s, err := applyInverse(ctx, pool, store, a.opts)
+		if err != nil || s.Deleted != 2 {
+			t.Fatalf("%+v %v", s, err)
+		}
+		var receipts int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_events`).Scan(&receipts); err != nil || receipts != 2 {
+			t.Fatal(receipts, err)
+		}
+	})
+	t.Run("durable_history_cannot_be_erased_or_rolled_back", func(t *testing.T) {
+		for _, query := range []string{`DELETE FROM r2_inverse_attempts`, `TRUNCATE r2_inverse_attempts`, `UPDATE r2_inverse_attempts SET issued_at=now()`, `DELETE FROM r2_inverse_intents`, `UPDATE r2_inverse_intents SET size_bytes=1`, `TRUNCATE r2_inverse_intents CASCADE`, `DELETE FROM r2_inverse_events`, `TRUNCATE r2_inverse_events`, `UPDATE r2_inverse_budget_minutes SET charged_bytes=1`, `DELETE FROM r2_inverse_budget_minutes`, `TRUNCATE r2_inverse_budget_minutes`, `UPDATE r2_inverse_ke_epoch SET epoch=0`, `DELETE FROM r2_inverse_ke_epoch`, `TRUNCATE r2_inverse_ke_epoch`} {
+			if _, err := pool.Exec(ctx, query); err == nil {
+				t.Fatal("durable authority could be erased", query)
+			}
+		}
+		var events int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_events`).Scan(&events); err != nil || events != 2 {
+			t.Fatal("ledger history changed", events, err)
+		}
+	})
+	t.Run("crash_after_intent_and_restart", func(t *testing.T) {
+		a, entries := build(1)
+		if _, err := a.reserve(ctx, entries[0]); err != nil {
+			t.Fatal(err)
+		}
+		for _, query := range []string{`UPDATE recording_clips SET display_path='changed' WHERE object_key=$1`, `UPDATE recording_clips SET id=id+100000 WHERE object_key=$1`} {
+			if _, err := pool.Exec(ctx, query, entries[0].Key); err == nil {
+				t.Fatal("pending source identity changed", query)
+			}
+		}
+		a.ledger.close()
+		before := store.calls
+		s, err := applyInverse(ctx, pool, store, a.opts)
+		if err != nil || s.AmbiguousHeld != 1 || store.calls != before {
+			t.Fatalf("%+v %v calls%d", s, err, store.calls)
+		}
+	})
+	t.Run("lost_response_reconciles_without_retransmit", func(t *testing.T) {
+		a, _ := build(1)
+		a.ledger.close()
+		store.setLost(true)
+		_, err := applyInverse(ctx, pool, store, a.opts)
+		store.setLost(false)
+		if err == nil {
+			t.Fatal("lost response accepted")
+		}
+		before := store.calls
+		s, err := applyInverse(ctx, pool, store, a.opts)
+		if err != nil || s.Reconciled != 1 || store.calls != before {
+			t.Fatalf("%+v %v calls%d", s, err, store.calls)
+		}
+	})
+	t.Run("protection_changed_during_HEAD", func(t *testing.T) {
+		a, entries := build(1)
+		a.ledger.close()
+		target := entries[0].Key
+		var once sync.Once
+		store.beforeHead = func(_ context.Context, key string) error {
+			if key == target {
+				once.Do(func() {
+					if err := os.WriteFile(picksPath, append(picksData, ' '), 0600); err != nil {
+						t.Fatal(err)
+					}
+				})
+			}
+			return nil
+		}
+		before := store.calls
+		_, err := applyInverse(ctx, pool, store, a.opts)
+		store.beforeHead = nil
+		if restoreErr := os.WriteFile(picksPath, picksData, 0600); restoreErr != nil {
+			t.Fatal(restoreErr)
+		}
+		if err == nil || store.calls != before {
+			t.Fatal("changed picks reached DELETE", err)
+		}
+	})
+	t.Run("delivery_admitted_before_intent_wins", func(t *testing.T) {
+		for n, kind := range []string{"key", "source", "content_alias", "normalized_path", "output_dependency", "output_key", "output_content", "output_path", "output_cached_source"} {
+			t.Run(kind, func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				var id int64
+				if err := pool.QueryRow(ctx, `SELECT id FROM recording_clips WHERE object_key=$1`, e.Key).Scan(&id); err != nil {
+					t.Fatal(err)
+				}
+				placeholder := "datasets/test/first-" + strconv.FormatInt(id, 10)
+				switch kind {
+				case "key":
+					exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`, e.Key)
+				case "source":
+					exec(`INSERT INTO delivery_nas_source_holds(clip_id) VALUES($1)`, id)
+				case "content_alias":
+					sha := fmt.Sprintf("%064x", id)
+					exec(`UPDATE recording_clips SET sha256=$2 WHERE id=$1`, id, sha)
+					exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256) VALUES('stoarama',$1,'hold',100,'metadata',$2)`, placeholder, sha)
+				case "normalized_path":
+					exec(`UPDATE recording_clips SET display_path='joined/'||display_path WHERE id=$1`, id)
+					exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,relative_path) SELECT 'stoarama',$1,'hold',100,'metadata',regexp_replace(display_path,'^joined/','') FROM recording_clips WHERE id=$2`, placeholder, id)
+				default:
+					outputID := int64(10000000 + n + 2)
+					exec(`UPDATE recording_collation_outputs SET source_clip_ids=ARRAY[$1]::bigint[] WHERE id=$2`, id, outputID)
+					switch kind {
+					case "output_dependency":
+						exec(`INSERT INTO delivery_keep_output_dependencies(output_id,recording_id) VALUES($1,30)`, outputID)
+					case "output_key":
+						exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) SELECT 'stoarama',object_key,'hold',100,'metadata' FROM recording_collation_outputs WHERE id=$1`, outputID)
+					case "output_content":
+						exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256) SELECT 'stoarama',$1,'hold',size_bytes,'metadata',sha256 FROM recording_collation_outputs WHERE id=$2`, placeholder, outputID)
+					case "output_cached_source":
+						exec(`UPDATE recording_collation_outputs SET source_clip_ids=array_append(source_clip_ids,9001199::bigint) WHERE id=$1`, outputID)
+						exec(`INSERT INTO delivery_nas_source_holds(clip_id) VALUES(9001199)`)
+					case "output_path":
+						exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,relative_path) SELECT 'stoarama',$1,'hold',100,'metadata',regexp_replace(nas_relative_path,'^joined/','') FROM recording_collation_outputs WHERE id=$2`, placeholder, outputID)
+					}
+				}
+				// No refresh_delivery_nas_source_holds: protection derives live closure.
+				if _, err := a.reserve(ctx, e); err == nil {
+					t.Fatal("pre-existing delivery protection lost to intent", kind)
+				}
+			})
+		}
+	})
+	t.Run("late_admission_blocked_through_wire_then_intent_vetoes", func(t *testing.T) {
+		for _, kind := range []string{"delivery_key", "delivery_source", "delivery_output", "delivery_path_enrichment", "collated_key", "held_output_source", "delivery_output_cached_source", "output_id", "cleanup_reactivate", "cleanup_insert_reactivate", "cleanup_source_admission", "cleanup_plan_admission", "joined_scope_admission", "copy_state", "copy_reason"} {
+			t.Run(kind, func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				var id int64
+				if err := pool.QueryRow(ctx, `SELECT id FROM recording_clips WHERE object_key=$1`, e.Key).Scan(&id); err != nil {
+					t.Fatal(err)
+				}
+				exec(`UPDATE recording_collation_outputs SET source_clip_ids=ARRAY[$1]::bigint[] WHERE id=10000001`, id)
+				query := `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`
+				var arg any = e.Key
+				switch kind {
+				case "copy_state", "copy_reason":
+					exec(`INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item,state) SELECT 13,'raw',id,repeat('a',64),$2,jsonb_build_object('bucket',bucket,'object_key',object_key),'verified' FROM recording_clips WHERE id=$1`, id, policy)
+					query = `UPDATE nas_r2_copy_items SET blocked_reason='checksum_mismatch' WHERE source_id=$1`
+					if kind == "copy_state" {
+						query = `UPDATE nas_r2_copy_items SET state='blocked',blocked_reason='checksum_mismatch' WHERE source_id=$1`
+					}
+					arg = id
+				case "output_id":
+					unusedID := int64(980000000) + id
+					exec(`INSERT INTO delivery_keep_output_dependencies(output_id,recording_id) VALUES($1,30)`, unusedID)
+					query = `UPDATE recording_collation_outputs SET id=$1 WHERE id=10000001`
+					arg = unusedID
+				case "joined_scope_admission":
+					query = insertDryScope
+					arg = dryScope(id)
+				case "cleanup_source_admission":
+					planID := cleanupPlan(id, "dry_run", false, false)
+					query = fmt.Sprintf(`INSERT INTO nas_cleanup_source_holds(plan_id,clip_id) VALUES(%d,$1)`, planID)
+					arg = id
+				case "cleanup_plan_admission":
+					query = `INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(47,13,'inverse-manifest-'||$1::bigint,repeat('d',64),jsonb_build_array(jsonb_build_object('kind','raw','source_id',$1::bigint)),repeat('e',64))`
+					arg = id
+				case "cleanup_reactivate":
+					arg = latentCleanup(id, true)
+					query = `UPDATE nas_cleanup_items SET delete_ever_issued=true WHERE plan_id=$1`
+				case "cleanup_insert_reactivate":
+					arg = latentCleanup(id, false)
+					query = `INSERT INTO nas_cleanup_items(plan_id,ordinal,state,delete_ever_issued) VALUES($1,1,'keep',true)`
+				case "delivery_source":
+					query = `INSERT INTO delivery_nas_source_holds(clip_id) VALUES($1)`
+					arg = id
+				case "delivery_output":
+					query = `INSERT INTO delivery_keep_output_dependencies(output_id,recording_id) VALUES(10000001,$1)`
+					arg = int64(30)
+				case "delivery_path_enrichment":
+					placeholder := "datasets/test/" + strconv.FormatInt(id, 10)
+					exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`, placeholder)
+					query = `UPDATE delivery_keep_holds SET relative_path=(SELECT display_path FROM recording_clips WHERE id=$1) WHERE object_key='` + placeholder + `'`
+					arg = id
+				case "collated_key":
+					query = `UPDATE recording_collation_outputs SET object_key=$1 WHERE id=10000001`
+				case "delivery_output_cached_source":
+					exec(`UPDATE recording_collation_outputs SET source_clip_ids=array_append(source_clip_ids,9001198::bigint) WHERE id=10000001`)
+					query = `INSERT INTO delivery_nas_source_holds(clip_id) VALUES($1)`
+					arg = int64(9001198)
+				case "held_output_source":
+					exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256) SELECT 'stoarama','datasets/test/late-source-output','hold',size_bytes,'metadata',sha256 FROM recording_collation_outputs WHERE id=10000008 ON CONFLICT DO NOTHING`)
+					query = `UPDATE recording_collation_outputs SET source_clip_ids=array_append(source_clip_ids,$1::bigint) WHERE id=10000008`
+					arg = id
+				}
+				if err := pool.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch`).Scan(&a.keEpoch); err != nil {
+					t.Fatal(err)
+				}
+				store.beforeDelete = func(key string) error {
+					if key != e.Key {
+						return errors.New("unexpected wire key")
+					}
+					// This runs after the final live guard, while the network transaction
+					// owns shared protection locks. Direct SQL must be unable to commit.
+					lateCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+					defer cancel()
+					_, err := pool.Exec(lateCtx, query, arg)
+					if err == nil {
+						return errors.New("late protection mutation committed")
+					}
+					var pe *pgconn.PgError
+					if lateCtx.Err() == nil && !(errors.As(err, &pe) && pe.Code == "55P03") && !(kind == "output_id" && strings.Contains(err.Error(), "immutable")) && !strings.Contains(err.Error(), "cannot reactivate") {
+						return fmt.Errorf("unexpected late admission refusal: %w", err)
+					}
+					return nil
+				}
+				before := store.calls
+				ok, err := a.delete(ctx, e)
+				store.beforeDelete = nil
+				if err != nil || !ok || store.calls != before+1 {
+					t.Fatalf("wire result %v %v", ok, err)
+				}
+				_, err = pool.Exec(ctx, query, arg)
+				expected := "reservation"
+				if kind == "output_id" {
+					expected = "immutable"
+				}
+				if kind == "cleanup_reactivate" || kind == "cleanup_insert_reactivate" {
+					expected = "cannot reactivate"
+				}
+				if kind == "cleanup_source_admission" || kind == "cleanup_plan_admission" || kind == "joined_scope_admission" {
+					expected = "retirement"
+				}
+				if err == nil || !strings.Contains(err.Error(), expected) {
+					t.Fatal("post-wire protection adoption allowed", kind, err)
+				}
+			})
+		}
+	})
+	t.Run("missing_source_cannot_publish_completion", func(t *testing.T) {
+		a, entries := build(1)
+		defer a.ledger.close()
+		e := entries[0]
+		target, err := a.reserve(ctx, e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Deliberately bypass triggers in this isolated test database to prove the
+		// publication invariant independently from the identity freeze trigger.
+		move := func(from, to int64) {
+			t.Helper()
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if _, err = tx.Exec(ctx, `SET LOCAL session_replication_role=replica`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec(ctx, `UPDATE recording_clips SET id=$2 WHERE id=$1`, from, to); err != nil {
+				t.Fatal(err)
+			}
+			if err = tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		move(target.ID, target.ID+100000)
+		defer move(target.ID+100000, target.ID)
+		if err = a.publishAbsent(ctx, e, a.opts.ManifestSHA, true); err == nil {
+			t.Fatal("missing source published completion")
+		}
+		var events int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_events WHERE object_key=$1`, e.Key).Scan(&events); err != nil || events != 0 {
+			t.Fatal(events, err)
+		}
+	})
+	t.Run("legacy_cleanup_scope_does_not_upgrade_to_admission", func(t *testing.T) {
+		for _, exclusive := range []bool{false, true} {
+			t.Run(strconv.FormatBool(exclusive), func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				var sourceID int64
+				if err := pool.QueryRow(ctx, `SELECT id FROM recording_clips WHERE object_key=$1`, e.Key).Scan(&sourceID); err != nil {
+					t.Fatal(err)
+				}
+				planID := cleanupPlan(sourceID, "dry_run", true, false)
+				legacy, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer legacy.Rollback(ctx)
+				lockSQL := `SELECT pg_advisory_xact_lock_shared(7343226011101)`
+				if exclusive {
+					lockSQL = `SELECT pg_advisory_xact_lock(7343226011101)`
+				}
+				if _, err = legacy.Exec(ctx, lockSQL); err != nil {
+					t.Fatal(err)
+				}
+				if _, err = legacy.Exec(ctx, `SELECT id FROM nas_cleanup_plans WHERE id=$1 FOR UPDATE`, planID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err = legacy.Exec(ctx, `SELECT id FROM nas_cleanup_items WHERE plan_id=$1 FOR UPDATE`, planID); err != nil {
+					t.Fatal(err)
+				}
+				done := make(chan error, 1)
+				go func() { _, err := a.delete(ctx, e); done <- err }()
+				deadline := time.Now().Add(3 * time.Second)
+				for {
+					var held bool
+					if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND classid::bigint*4294967296+objid::bigint=7343226011103 AND granted AND pid<>pg_backend_pid())`).Scan(&held); err != nil {
+						t.Fatal(err)
+					}
+					if held {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("B1 never reached legacy public fence")
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				progressCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				defer cancel()
+				// Same parent/item order and mutations as observe/auto-pause/receipt paths.
+				if _, err = legacy.Exec(progressCtx, `UPDATE nas_cleanup_items SET state='unverified' WHERE plan_id=$1`, planID); err != nil {
+					t.Fatal("legacy item mutation blocked", err)
+				}
+				if _, err = legacy.Exec(progressCtx, `UPDATE nas_cleanup_plans SET mode='paused' WHERE id=$1`, planID); err != nil {
+					t.Fatal("legacy plan mutation upgraded locks", err)
+				}
+				var upgraded bool
+				if err = legacy.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid() AND classid::bigint*4294967296+objid::bigint=7343226011103)`).Scan(&upgraded); err != nil || upgraded {
+					t.Fatal("cleanup acquired admission lock", upgraded, err)
+				}
+				if err = legacy.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case err = <-done:
+					if err != nil {
+						t.Fatal("B1 stranded by cleanup", err)
+					}
+				case <-time.After(10 * time.Second):
+					t.Fatal("legacy/B1 lock cycle")
+				}
+			})
+		}
+	})
+	t.Run("cleanup_admission_before_intent_wins", func(t *testing.T) {
+		for _, manifestOnly := range []bool{false, true} {
+			t.Run(strconv.FormatBool(manifestOnly), func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				var id int64
+				if err := pool.QueryRow(ctx, `SELECT id FROM recording_clips WHERE object_key=$1`, e.Key).Scan(&id); err != nil {
+					t.Fatal(err)
+				}
+				if manifestOnly {
+					exec(`INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(47,13,'inverse-first-manifest-'||$1::bigint,repeat('d',64),jsonb_build_array(jsonb_build_object('kind','raw','source_id',$1::bigint)),repeat('e',64))`, id)
+				} else {
+					cleanupPlan(id, "dry_run", false, true)
+				}
+				if _, err := a.reserve(ctx, e); err == nil {
+					t.Fatal("cleanup admission lost to intent")
+				}
+			})
+		}
+	})
+	t.Run("joined_mutator_wins_barrier_before_B1_owns_legacy_locks", func(t *testing.T) {
+		a, entries := build(1)
+		defer a.ledger.close()
+		e := entries[0]
+		var id int64
+		if err := pool.QueryRow(ctx, `SELECT id FROM recording_clips WHERE object_key=$1`, e.Key).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		runID := dryScope(id)
+		mutator, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer mutator.Rollback(ctx)
+		if _, err = mutator.Exec(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR UPDATE`); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { _, err := a.delete(ctx, e); done <- err }()
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			var waiting bool
+			if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE%')`).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+			if waiting {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("B1 did not wait on first barrier")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		var held bool
+		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND granted AND ((classid::bigint*4294967296+objid::bigint)=ANY(ARRAY[7343226011103,7343226011101]::bigint[]) OR(classid=137 AND objid=1 AND objsubid=2)))`).Scan(&held); err != nil || held {
+			t.Fatal("waiting B1 owns later locks", held, err)
+		}
+		admissionCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		if _, err = mutator.Exec(admissionCtx, insertDryScope, runID); err != nil {
+			t.Fatal("joined admission blocked by waiting B1", err)
+		}
+		if err = mutator.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err = <-done:
+			if err == nil {
+				t.Fatal("B1 ignored committed scope")
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("joined/B1 lock cycle")
+		}
+		var intents int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1`, e.Key).Scan(&intents); err != nil || intents != 0 {
+			t.Fatal("scope winner left intent", intents, err)
+		}
+	})
+	t.Run("repeatable_snapshot_cannot_adopt_after_intent", func(t *testing.T) {
+		for _, level := range []pgx.TxIsoLevel{pgx.RepeatableRead, pgx.Serializable} {
+			t.Run(string(level), func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				stale, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: level})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer stale.Rollback(ctx)
+				var count int
+				if err = stale.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1`, e.Key).Scan(&count); err != nil || count != 0 {
+					t.Fatal(count, err)
+				}
+				if _, err = a.delete(ctx, e); err != nil {
+					t.Fatal(err)
+				}
+				_, err = stale.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`, e.Key)
+				var pe *pgconn.PgError
+				if !errors.As(err, &pe) || pe.Code != "55000" {
+					t.Fatal("stale snapshot admission not refused", err)
+				}
+			})
+		}
+	})
+	t.Run("stale_snapshot_cannot_cross_COPY_reservation_boundary", func(t *testing.T) {
+		const copyInsert = `INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item,state,blocked_reason)
+ SELECT 13,'raw',id,repeat('a',64),$3,jsonb_build_object('bucket',bucket,'object_key',object_key),$2,CASE WHEN $2='blocked' THEN 'checksum_mismatch' ELSE '' END FROM recording_clips WHERE object_key=$1`
+		for _, level := range []pgx.TxIsoLevel{pgx.RepeatableRead, pgx.Serializable} {
+			for _, admission := range []string{"pending", "blocked", "reservation"} {
+				t.Run(string(level)+"/"+admission, func(t *testing.T) {
+					a, entries := build(1)
+					defer a.ledger.close()
+					e := entries[0]
+					stale, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: level})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer stale.Rollback(ctx)
+					var count int
+					if err = stale.QueryRow(ctx, `SELECT count(*) FROM r2_retirement_reservations WHERE object_key=$1`, e.Key).Scan(&count); err != nil || count != 0 {
+						t.Fatal(count, err)
+					}
+					if admission == "reservation" {
+						exec(copyInsert, e.Key, "blocked", policy)
+						_, err = stale.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) SELECT 'raw',id,bucket,object_key,size_bytes,sha256,repeat('a',64) FROM recording_clips WHERE object_key=$1`, e.Key)
+					} else {
+						if _, err = a.delete(ctx, e); err != nil {
+							t.Fatal(err)
+						}
+						_, err = stale.Exec(ctx, copyInsert, e.Key, admission, policy)
+					}
+					var pe *pgconn.PgError
+					if !errors.As(err, &pe) || pe.Code != "55000" {
+						t.Fatal("stale COPY/reservation admission not refused", err)
+					}
+				})
+			}
+		}
+	})
+	t.Run("COPY_update_admission_both_orderings", func(t *testing.T) {
+		for _, reasonOnly := range []bool{false, true} {
+			for _, reservationFirst := range []bool{false, true} {
+				t.Run(fmt.Sprintf("reason_only=%t/reservation_first=%t", reasonOnly, reservationFirst), func(t *testing.T) {
+					a, entries := build(1)
+					defer a.ledger.close()
+					e := entries[0]
+					exec(`INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item,state) SELECT 13,'raw',id,repeat('a',64),$2,jsonb_build_object('bucket',bucket,'object_key',object_key),'verified' FROM recording_clips WHERE object_key=$1`, e.Key, policy)
+					query := `UPDATE nas_r2_copy_items SET state='blocked',blocked_reason='checksum_mismatch' WHERE item->>'object_key'=$1`
+					if reasonOnly {
+						query = `UPDATE nas_r2_copy_items SET blocked_reason='final_conflict' WHERE item->>'object_key'=$1`
+					}
+					if reservationFirst {
+						if _, err := a.reserve(ctx, e); err != nil {
+							t.Fatal(err)
+						}
+						// A no-change verified update is not a new protection admission.
+						exec(`UPDATE nas_r2_copy_items SET state='verified' WHERE item->>'object_key'=$1`, e.Key)
+						if _, err := pool.Exec(ctx, query, e.Key); err == nil || !strings.Contains(err.Error(), "reservation") {
+							t.Fatal("COPY UPDATE adopted reserved key", err)
+						}
+					} else {
+						exec(query, e.Key)
+						if _, err := a.reserve(ctx, e); err == nil {
+							t.Fatal("COPY protection lost to reservation")
+						}
+					}
+				})
+			}
+		}
+	})
+	t.Run("COPY_progress_with_real_reimport_has_no_lock_cycle", func(t *testing.T) {
+		for _, transition := range []string{"pending_to_leased", "leased_to_verified", "leased_to_blocked", "verified_noop", "new_protection"} {
+			t.Run(transition, func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				exec(`UPDATE recording_clips SET clip_start_at=$2,clip_end_at=$3 WHERE object_key=$1`, e.Key, w.Start.Add(time.Hour), w.Start.Add(2*time.Hour))
+				i := api.NASR2CopyItem{Kind: api.NASR2CopyRaw, StreamID: 3, Bucket: "stoarama", ObjectKey: e.Key}
+				if err := pool.QueryRow(ctx, `SELECT id,recording_id,display_path,size_bytes,sha256,clip_start_at,clip_end_at FROM recording_clips WHERE object_key=$1`, e.Key).Scan(&i.SourceID, &i.RecordingID, &i.RelativePath, &i.SizeBytes, &i.SHA256, &i.StartAt, &i.EndAt); err != nil {
+					t.Fatal(err)
+				}
+				// Manifest import receives JSON timestamps, not pgx's scan location.
+				i.StartAt, i.EndAt = i.StartAt.UTC(), i.EndAt.UTC()
+				h := nasCopyHeader{PolicySHA256: policy}
+				if err := queueNASR2CopyItem(ctx, pool, h, strings.Repeat("a", 64), i, true); err != nil {
+					t.Fatal("initial real import", err)
+				}
+				initial, nextState := "pending", "leased"
+				switch transition {
+				case "leased_to_verified":
+					initial, nextState = "leased", "verified"
+				case "leased_to_blocked":
+					initial, nextState = "leased", "blocked"
+				case "verified_noop":
+					initial, nextState = "verified", "verified"
+				case "new_protection":
+					initial, nextState = "verified", "blocked"
+				}
+				exec(`UPDATE nas_r2_copy_items SET state=$2 WHERE source_id=$1`, i.SourceID, initial)
+				handler, err := api.BeginNASR2CopyTx(ctx, pool)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer handler.Rollback(ctx)
+				if _, err = handler.Exec(ctx, `SET LOCAL deadlock_timeout='50ms'`); err != nil {
+					t.Fatal(err)
+				}
+				if _, err = handler.Exec(ctx, `SELECT id FROM nas_r2_copy_items WHERE source_id=$1 FOR UPDATE`, i.SourceID); err != nil {
+					t.Fatal(err)
+				}
+				done := make(chan error, 1)
+				go func() { done <- queueNASR2CopyItem(ctx, pool, h, strings.Repeat("a", 64), i, true) }()
+				deadline := time.Now().Add(3 * time.Second)
+				for {
+					var waiting bool
+					if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE query LIKE 'INSERT INTO nas_r2_copy_items%' AND $1::integer=ANY(pg_blocking_pids(pid)))`, handler.Conn().PgConn().PID()).Scan(&waiting); err != nil {
+						t.Fatal(err)
+					}
+					if waiting {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("real reimport did not reach handler row")
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+				progress, cancel := context.WithTimeout(ctx, time.Second)
+				_, err = handler.Exec(progress, `UPDATE nas_r2_copy_items SET state=$2,blocked_reason=CASE WHEN $2='blocked' THEN 'checksum_mismatch' ELSE '' END WHERE source_id=$1`, i.SourceID, nextState)
+				cancel()
+				if transition == "new_protection" {
+					var pe *pgconn.PgError
+					if !errors.As(err, &pe) || pe.Code != "55P03" {
+						t.Fatal("new admission must fail fast behind importer", err)
+					}
+					handler.Rollback(ctx)
+				} else {
+					if err != nil {
+						t.Fatal("COPY progress deadlocked with real reimport", err)
+					}
+					if err = handler.Commit(ctx); err != nil {
+						t.Fatal(err)
+					}
+				}
+				select {
+				case err = <-done:
+					if err != nil {
+						t.Fatal("real reimport failed", err)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("reimport remained blocked")
+				}
+				if nextState == "leased" {
+					exec(`UPDATE nas_r2_copy_items SET state='verified' WHERE source_id=$1`, i.SourceID)
+				}
+			})
+		}
+	})
+	t.Run("pool_capacity_reserved_before_any_intent", func(t *testing.T) {
+		a, entries := build(4)
+		a.ledger.close()
+		smallConfig := pool.Config()
+		smallConfig.MaxConns = 4
+		smallConfig.MinConns = 0
+		small, err := pgxpool.NewWithConfig(ctx, smallConfig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer small.Close()
+		a.opts.Workers = 3
+		if _, err = applyInverse(ctx, small, store, a.opts); err == nil || !strings.Contains(err.Error(), "capacity") {
+			t.Fatal("oversubscribed pool admitted", err)
+		}
+		var count int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_intents WHERE manifest_sha256=$1`, a.opts.ManifestSHA).Scan(&count); err != nil || count != 0 {
+			t.Fatal("invalid pool wrote intent", count, err)
+		}
+		a.opts.Workers = 2
+		bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		result, err := applyInverse(bounded, small, store, a.opts)
+		if err != nil || result.Deleted != int64(len(entries)) {
+			t.Fatalf("capacity ceiling %+v %v", result, err)
+		}
+	})
+	t.Run("retired_item_reactivation_is_terminal", func(t *testing.T) {
+		a, entries := build(1)
+		defer a.ledger.close()
+		var sourceID int64
+		if err := pool.QueryRow(ctx, `SELECT id FROM recording_clips WHERE object_key=$1`, entries[0].Key).Scan(&sourceID); err != nil {
+			t.Fatal(err)
+		}
+		planID := latentCleanup(sourceID, true)
+		for _, query := range []string{`UPDATE nas_cleanup_items SET delete_ever_issued=true WHERE plan_id=$1`, `UPDATE nas_cleanup_items SET state='unverified' WHERE plan_id=$1`} {
+			if _, err := pool.Exec(ctx, query, planID); err == nil || !strings.Contains(err.Error(), "cannot reactivate") {
+				t.Fatal("retired hold reactivated", err)
+			}
+		}
+	})
+	t.Run("cleanup_retirement_and_first_hold_serialize", func(t *testing.T) {
+		for _, retireFirst := range []bool{true, false} {
+			t.Run(strconv.FormatBool(retireFirst), func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				var id int64
+				if err := pool.QueryRow(ctx, `SELECT id FROM recording_clips WHERE object_key=$1`, e.Key).Scan(&id); err != nil {
+					t.Fatal(err)
+				}
+				planID := cleanupPlan(id, "paused", true, true)
+				first, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer first.Rollback(ctx)
+				if retireFirst {
+					if _, err = first.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='retired' WHERE id=$1`, planID); err != nil {
+						t.Fatal(err)
+					}
+					_, err = pool.Exec(ctx, `UPDATE nas_cleanup_items SET delete_ever_issued=true WHERE plan_id=$1`, planID)
+					var pe *pgconn.PgError
+					if !errors.As(err, &pe) || pe.Code != "55P03" {
+						t.Fatal("retire/flip could cycle", err)
+					}
+					if err = first.Commit(ctx); err != nil {
+						t.Fatal(err)
+					}
+					if _, err = pool.Exec(ctx, `UPDATE nas_cleanup_items SET delete_ever_issued=true WHERE plan_id=$1`, planID); err == nil || !strings.Contains(err.Error(), "cannot reactivate") {
+						t.Fatal("retired hold returned", err)
+					}
+				} else {
+					if _, err = first.Exec(ctx, `UPDATE nas_cleanup_items SET delete_ever_issued=true WHERE plan_id=$1`, planID); err != nil {
+						t.Fatal(err)
+					}
+					bounded, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+					_, err = pool.Exec(bounded, `UPDATE nas_cleanup_plans SET mode='retired' WHERE id=$1`, planID)
+					cancel()
+					if err == nil {
+						t.Fatal("retirement crossed hold publication")
+					}
+					if err = first.Commit(ctx); err != nil {
+						t.Fatal(err)
+					}
+					exec(`UPDATE nas_cleanup_plans SET mode='retired' WHERE id=$1`, planID)
+					if _, err = a.reserve(ctx, e); err == nil {
+						t.Fatal("retirement shed issued source hold")
+					}
+				}
+			})
+		}
+	})
+	t.Run("installed_purge_veto_precedes_intent_and_wire", func(t *testing.T) {
+		a, entries := build(1)
+		a.ledger.close()
+		exec(`CREATE FUNCTION test_inverse_purge_veto() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test installed purge veto'; END $$;
+ CREATE TRIGGER zz_test_inverse_purge_veto BEFORE UPDATE OF purged_at ON recording_clips FOR EACH ROW EXECUTE FUNCTION test_inverse_purge_veto();`)
+		before := store.calls
+		_, err := applyInverse(ctx, pool, store, a.opts)
+		exec(`DROP TRIGGER zz_test_inverse_purge_veto ON recording_clips; DROP FUNCTION test_inverse_purge_veto()`)
+		if err == nil || !strings.Contains(err.Error(), "pre-delete purge veto") || store.calls != before {
+			t.Fatal("purge veto reached wire", err)
+		}
+		var count int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1`, entries[0].Key).Scan(&count); err != nil || count != 0 {
+			t.Fatal("veto published intent", count, err)
+		}
+	})
+	t.Run("budget", func(t *testing.T) {
+		a, _ := build(2)
+		a.ledger.close()
+		a.opts.Budget24h = 1
+		before := store.calls
+		_, err := applyInverse(ctx, pool, store, a.opts)
+		if err == nil || store.calls != before {
+			t.Fatal("budget exceeded", err)
+		}
+	})
+	t.Run("private_authority_cannot_replay_or_remint", func(t *testing.T) {
+		for _, lost := range []bool{false, true} {
+			t.Run(strconv.FormatBool(lost), func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				a.store = sdk
+				if _, err := a.reserve(ctx, e); err != nil {
+					t.Fatal(err)
+				}
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback(ctx)
+				authority, err := a.authorize(ctx, tx, e)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err = a.authorize(ctx, tx, e); err == nil {
+					t.Fatal("durable authority reminted")
+				}
+				before := providerDeletes()
+				store.setLost(lost)
+				err = sdk.deleteOnce(ctx, authority)
+				store.setLost(false)
+				if (err != nil) != lost {
+					t.Fatal("first wire result", err)
+				}
+				clone := *authority
+				if err = sdk.deleteOnce(ctx, authority); err == nil {
+					t.Fatal("wire authority replayed")
+				}
+				if err = sdk.deleteOnce(ctx, &clone); err == nil {
+					t.Fatal("copied wire authority replayed")
+				}
+				if err = sdk.deleteOnce(ctx, &inverseDeleteAuthority{}); err == nil {
+					t.Fatal("zero authority reached wire")
+				}
+				if providerDeletes()-before != 1 {
+					t.Fatal("provider replay", providerDeletes()-before)
+				}
+			})
+		}
+	})
+	t.Run("network_deadline_releases_locks_and_reconciles", func(t *testing.T) {
+		for _, afterDelete := range []bool{false, true} {
+			t.Run(strconv.FormatBool(afterDelete), func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				timed, cancel := context.WithCancel(ctx)
+				store.beforeHead = func(headCtx context.Context, key string) error {
+					if key != e.Key {
+						return nil
+					}
+					deadline, bounded := headCtx.Deadline()
+					if !bounded || time.Until(deadline) > inverseNetworkTimeout {
+						return errors.New("network context has no bounded deadline")
+					}
+					store.mu.Lock()
+					_, present := store.objects[key]
+					store.mu.Unlock()
+					if !afterDelete || !present {
+						cancel()
+						return headCtx.Err()
+					}
+					return nil
+				}
+				_, err := a.delete(timed, e)
+				cancel()
+				store.beforeHead = nil
+				if err == nil {
+					t.Fatal("stalled network ignored deadline")
+				}
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				lockCtx, lockCancel := context.WithTimeout(ctx, time.Second)
+				_, err = tx.Exec(lockCtx, `SELECT epoch FROM r2_inverse_ke_epoch FOR UPDATE NOWAIT`)
+				if err == nil {
+					err = inverseProtectionLocks(lockCtx, tx, false)
+				}
+				lockCancel()
+				tx.Rollback(ctx)
+				if err != nil {
+					t.Fatal("network timeout retained protection locks", err)
+				}
+				before := store.calls
+				a.ledger.close()
+				result, err := applyInverse(ctx, pool, store, a.opts)
+				if err != nil || store.calls != before || (afterDelete && result.Reconciled < 1) {
+					t.Fatalf("restart %+v %v", result, err)
+				}
+			})
+		}
+	})
+	t.Run("real_SDK_canary_contract", func(t *testing.T) {
+		a, entries := build(100)
+		a.ledger.close()
+		before := providerDeletes()
+		result, err := applyInverse(ctx, pool, sdk, a.opts)
+		if err != nil || result.Deleted != 100 || providerDeletes()-before != 100 {
+			t.Fatalf("SDK canary %+v deletes%d err%v", result, providerDeletes()-before, err)
+		}
+		var count int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_events e JOIN r2_inverse_intents i USING(bucket,object_key) WHERE i.manifest_sha256=$1`, a.opts.ManifestSHA).Scan(&count); err != nil || count != 100 {
+			t.Fatal(count, err)
+		}
+		ledger, err := openInverseLedger(a.opts.Ledger)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ledger.close()
+		count = 0
+		for _, record := range ledger.seen {
+			if record.Event == inverseAbsent && record.ManifestSHA256 == a.opts.ManifestSHA {
+				count++
+			}
+		}
+		if count != 100 {
+			t.Fatal("ledger/provider mismatch", count)
+		}
+		for _, e := range entries {
+			if _, err = sdk.Head(ctx, e.Key); !r2.IsNotFound(err) {
+				t.Fatal("SDK confirming HEAD", e.Key, err)
+			}
+		}
+	})
+	t.Run("worker_pool_rate_with_durable_DB_and_ledger", func(t *testing.T) {
+		a, _ := build(1024)
+		a.ledger.close()
+		a.opts.Workers = 16
+		store.delay = 100 * time.Millisecond
+		defer func() { store.delay = 0 }()
+		s, err := applyInverse(ctx, pool, store, a.opts)
+		if err != nil || s.Deleted != 1024 {
+			t.Fatalf("%+v %v", s, err)
+		}
+		t.Logf("objects/s %.2f (full schema, real locks/intent commits/fsync,100ms each HEAD/DELETE)", s.ObjectsPerSecond)
+		if s.ObjectsPerSecond < 8 {
+			t.Fatalf("rate %.2f below8", s.ObjectsPerSecond)
+		}
+	})
+}
+func TestR2InverseLedgerRestartAndPartialTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger")
+	l, err := openInverseLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := inverseLedgerRecord{Event: inverseIntent, Bucket: "stoarama", EndpointSHA256: strings.Repeat("a", 64), Key: "managed/x", ManifestSHA256: strings.Repeat("a", 64), At: time.Now().UTC(), SizeBytes: 1}
+	if err = l.append(r); err != nil {
+		t.Fatal(err)
+	}
+	l.close()
+	l, err = openInverseLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = l.append(r); err != nil {
+		t.Fatal(err)
+	}
+	l.close()
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	io.WriteString(f, "{")
+	f.Close()
+	if _, err = openInverseLedger(path); err == nil {
+		t.Fatal("partial ledger tail accepted")
+	}
+}
+
+// Exercises the actual SDK, single-attempt transport and live DB authority in
+// one end-to-end path. The endpoint is an isolated loopback server, never R2.
+func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*inverseSDKStore, func() int64) {
+	t.Helper()
+	var deleted atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodGet && req.URL.Path == "/stoarama" && req.URL.Query().Has("uploads") {
+			w.Header().Set("Content-Type", "application/xml")
+			fmt.Fprint(w, `<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>`)
+			return
+		}
+		key := strings.TrimPrefix(req.URL.Path, "/stoarama/")
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		o, ok := store.objects[key]
+		switch req.Method {
+		case http.MethodHead:
+			if !ok {
+				w.WriteHeader(404)
+				return
+			}
+			w.Header().Set("ETag", `"`+o.ETag+`"`)
+			w.Header().Set("Content-Length", strconv.FormatInt(o.SizeBytes, 10))
+			w.Header().Set("Last-Modified", o.LastModified.Format(http.TimeFormat))
+			w.Header().Set("x-amz-meta-sha256", strings.Repeat("b", 64))
+			w.WriteHeader(200)
+		case http.MethodDelete:
+			deleted.Add(1)
+			delete(store.objects, key)
+			if store.lost {
+				c, _, _ := w.(http.Hijacker).Hijack()
+				c.Close()
+				return
+			}
+			w.WriteHeader(204)
+		default:
+			w.WriteHeader(400)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client, err := newInverseSDKStore(context.Background(), r2.Config{Bucket: "stoarama", Endpoint: server.URL, AccessKey: "test", SecretKey: "test", Region: "auto"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client, deleted.Load
+}
