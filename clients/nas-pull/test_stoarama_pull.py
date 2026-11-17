@@ -1731,7 +1731,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             stop_event = threading.Event()
             payloads = []
 
-            def heartbeat(_cfg, body):
+            def heartbeat(_cfg, body, challenge):
                 payloads.append(body)
                 if len(payloads) == 2:
                     stop_event.set()

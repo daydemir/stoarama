@@ -962,9 +962,9 @@ class CleanupTests(unittest.TestCase):
         from types import SimpleNamespace
         payload = {"client_version": "new", "cursor_id": 42,
                    "host": {"machine": "x86_64", "release": {"candidate": False, "stable": True}}}
-        runtime = SimpleNamespace(heartbeat_payload=lambda outage: dict(payload))
+        runtime = SimpleNamespace(heartbeat_payload=lambda outage: dict(payload), storage_challenge=pull.HeartbeatStorageChallenge())
         calls = []
-        def heartbeat(cfg, payload):
+        def heartbeat(cfg, payload, challenge):
             import copy
             path = "/account/connections/heartbeat"
             calls.append(copy.deepcopy(payload))
@@ -1931,7 +1931,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
         self.assertEqual(payload['cleanup']['quarantined'], 1)
         self.assertTrue(payload['client_last_error'].startswith('cleanup: journal replay'))
         sent = []
-        def fake(cfg, body):
+        def fake(cfg, body, challenge):
             path = "/account/connections/heartbeat"
             sent.append(dict(body))
             if 'cleanup' in body:

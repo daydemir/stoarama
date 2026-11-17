@@ -11,31 +11,40 @@ children before replacing the client. The sole production controller binds the
 backend commit, client literal and immutable artifact hash at its idle release
 boundary. This change makes no production operation and has no migration.
 
-## Storage age at delivery
+## Storage challenge and bounded work
 
-After inventory/host payload assembly, **each** actual heartbeat attempt reads
-`storage_status` again through its existing stable mounted-directory descriptor.
+Each successful heartbeat response provides `storage_challenge_nonce`, a fresh
+64-character lowercase-hex nonce issued/stored by the server. The next storage
+attempt samples **after receiving** that challenge and echoes it as
+`storage.challenge_nonce`. The process-local cache is consumed before sampling
+or transport, including compatibility retries. A failed request, lost response
+or failed sample cannot reuse the spent nonce. Heartbeat sends are single-flight;
+the server rotates on every response. Duplicate immediate responses are ignored.
+The nonce is removed from generic response diagnostics and never persisted.
+
+First boot or response loss sends fresh display-only storage without a nonce.
+That is normal: the server updates display facts, clears budget eligibility and
+returns a new challenge. Missing/stale/mismatched proof earns no budget. D owns
+migration0203, connection-row atomic verification/rotation and the separate
+`nas_storage_budget_at`, copied from the matched challenge's server issuance.
+Budget freshness uses that server clock and `T = 180 seconds`. A delayed/buffered
+request cannot acquire a fresh budget timestamp merely by arriving late.
+
+After inventory/host payload assembly, **each** actual attempt reads
+`storage_status` through its existing stable mounted-directory descriptor.
 Compatibility retries also resample. Cached runtime storage is overwritten only
 in that attempt's payload. If the fresh read fails or is unavailable, the entire
 heartbeat is skipped; no cached storage is sent.
 
-`STORAGE_TELEMETRY_MAX_AGE_SEC = 90` and `HEARTBEAT_TIMEOUT_SEC = 20` are unchanged.
-The sample timestamp precedes the filesystem read. Its age is checked after JSON
-assembly, during transport, and in the isolated child immediately before header
-and body sends, after DNS/TCP/TLS preparation. The shared POSIX monotonic clock
-works across processes, including macOS Python 3.9. The heartbeat uses the
-existing bounded child transport with a **20-second total** deadline (startup,
-DNS, TLS, send and response), rather than urllib's per-operation timeout. Its
-first actions install default-action SIGALRM and arm20s; once input arrives it
-only shortens that alarm to the original absolute request deadline. This hard
-kill survives parent exec/crash/SIGKILL. The parent checks guards and reaps the
-child without a watchdog thread; it never replays an ambiguous request.
-
-Thus the receipt-age bound is `M = 90 + 20 = 110 seconds`. D's independent
-controller contract retains `T = 180 seconds`, leaving a 70-second receipt age
-window. D owns migration 0203 and the storage-update version binding: only an
-actual v5 storage update can establish eligibility. This PR does not change the
-server's storage UPDATE or authorize cleanup.
+`STORAGE_TELEMETRY_MAX_AGE_SEC = 90` and `HEARTBEAT_TIMEOUT_SEC = 20` remain local
+work bounds. The sample age is checked after JSON assembly, during transport and
+immediately before sends after connection setup. The I/O child's first actions
+set default-action SIGALRM and arm20s, then only shorten it to the original
+absolute shared-monotonic deadline. Parent exec/crash/SIGKILL cannot remove the
+child deadline. The parent checks resources and reaps without a watchdog thread.
+These bounds limit wasted work; they do not prove publication time at buffered
+ingress. The earlier M=90+20 receipt-age claim is superseded by the challenge.
+No heartbeat response or ambiguous failed POST is automatically replayed.
 
 ## Optional host pressure diagnostics
 

@@ -68,6 +68,31 @@ class HostPressureTests(unittest.TestCase):
                 self.assertEqual(json.loads(log.call_args.args[1].split(' memory_diagnostics=')[1]), {'proc_stat':{'procs_blocked':7}})
 
 
+class StorageChallengeTests(unittest.TestCase):
+    def test_one_shot_and_repeated_or_malformed_responses(self):
+        challenge = pull.HeartbeatStorageChallenge()
+        self.assertIsNone(challenge.take())
+        for bad in (None, 42, "", "a"*63, "A"*64, "g"*64):
+            challenge.receive(bad)
+            self.assertIsNone(challenge.take())
+        challenge.receive("a"*64)
+        self.assertEqual(challenge.take(), "a"*64)
+        self.assertIsNone(challenge.take())
+        challenge.receive("a"*64)
+        self.assertIsNone(challenge.take(), 'an echoed challenge cannot be restored')
+        challenge.receive("b"*64)
+        challenge.receive(None)
+        self.assertIsNone(challenge.take(), 'missing challenge clears cached state')
+
+    def test_concurrent_takes_spend_only_once(self):
+        challenge = pull.HeartbeatStorageChallenge()
+        challenge.receive("a"*64)
+        with pull.concurrent.futures.ThreadPoolExecutor(8) as pool:
+            values = list(pool.map(lambda _:challenge.take(), range(8)))
+        self.assertEqual(values.count("a"*64), 1)
+        self.assertEqual(values.count(None), 7)
+
+
 class HeartbeatFreshStorageTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -104,14 +129,17 @@ class HeartbeatFreshStorageTests(unittest.TestCase):
 
     def test_every_compatibility_retry_resamples_after_payload_changes(self):
         payload = dict(storage={'available':True,'free_bytes':1}, cleanup={'quarantined':1}, host={'machine':'x86_64','release':{'stable':True}})
-        runtime = SimpleNamespace(heartbeat_payload=lambda outage:copy.deepcopy(payload))
+        runtime = SimpleNamespace(heartbeat_payload=lambda outage:copy.deepcopy(payload), storage_challenge=pull.HeartbeatStorageChallenge())
+        runtime.storage_challenge.receive('a'*64)
         samples = [dict(self.storage, free_bytes=n) for n in (300, 200, 100)]
         def transport(*args, **kwargs):
             self.transport(*args, **kwargs)
-            return (400, {}, b'') if len(self.sent) < 3 else (200, {}, b'{"ok":true}')
+            return (400, {}, b'') if len(self.sent) < 3 else (200, {}, json.dumps(dict(ok=True, storage_challenge_nonce='b'*64)).encode())
         with mock.patch.object(pull, 'storage_status', side_effect=samples) as read, mock.patch.object(pull, 'r2_copy_http', side_effect=transport):
             self.assertEqual(pull.send_heartbeat(self.cfg, runtime, None), {'ok':True})
         self.assertEqual(read.call_count, 3)
+        self.assertEqual([p['storage'].get('challenge_nonce') for p in self.sent], ['a'*64, None, None])
+        self.assertEqual(runtime.storage_challenge.take(), 'b'*64)
         self.assertEqual([p['storage']['free_bytes'] for p in self.sent], [300, 200, 100])
         self.assertIn('cleanup', self.sent[0]); self.assertNotIn('cleanup', self.sent[1])
         self.assertIn('release', self.sent[1]['host']); self.assertNotIn('release', self.sent[2]['host'])
@@ -140,6 +168,52 @@ class HeartbeatFreshStorageTests(unittest.TestCase):
         self.addCleanup(lambda:(server.shutdown(), server.server_close(), thread.join(2)))
         self.cfg.api_base = 'http://127.0.0.1:%d' % server.server_port
         return server
+
+    def test_real_boot_loss_and_recovery_never_reuse_nonce(self):
+        runtime = pull.Runtime(self.cfg)
+        requests, samples, received = [], [], {}
+        nonces = ['a'*64, 'b'*64, 'c'*64, 'd'*64]
+        real_receive = runtime.storage_challenge.receive
+        def receive(nonce):
+            received[nonce] = pull.heartbeat_monotonic()
+            real_receive(nonce)
+        runtime.storage_challenge.receive = receive
+        def storage(cfg):
+            samples.append(pull.heartbeat_monotonic())
+            return dict(self.storage, free_bytes=9000+len(samples))
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_POST(self):
+                requests.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+                if len(requests) == 2:
+                    # The server accepted the echoed nonce and rotated, but the
+                    # response was lost. The next attempt must be display-only.
+                    self.close_connection = True
+                    return
+                self.send_response(200); self.end_headers()
+                self.wfile.write(json.dumps(dict(ok=True, storage_challenge_nonce=nonces[len(requests)-1])).encode())
+        self.server(Handler)
+        with mock.patch.object(pull, 'storage_status', side_effect=storage):
+            self.assertEqual(pull.send_heartbeat(self.cfg, runtime, None), {'ok':True})
+            with self.assertRaises(pull.R2CopyHold):
+                pull.send_heartbeat(self.cfg, runtime, None)
+            self.assertEqual(pull.send_heartbeat(self.cfg, runtime, None), {'ok':True})
+            self.assertEqual(pull.send_heartbeat(self.cfg, runtime, None), {'ok':True})
+        self.assertEqual([p['storage'].get('challenge_nonce') for p in requests], [None, nonces[0], None, nonces[2]])
+        self.assertEqual([p['storage']['free_bytes'] for p in requests], [9001,9002,9003,9004])
+        self.assertGreater(samples[1], received[nonces[0]])
+        self.assertGreater(samples[3], received[nonces[2]])
+
+    def test_failed_fresh_read_burns_nonce_without_sending(self):
+        challenge = pull.HeartbeatStorageChallenge()
+        challenge.receive('a'*64)
+        with mock.patch.object(pull, 'storage_status', return_value={'available':False}), mock.patch.object(pull, 'r2_copy_http') as transport:
+            with self.assertRaises(pull.HeartbeatStorageUnavailable):
+                pull.heartbeat_request_json(self.cfg, {}, challenge)
+            transport.assert_not_called()
+        with mock.patch.object(pull, 'storage_status', return_value=self.storage), mock.patch.object(pull, 'r2_copy_http', side_effect=self.transport):
+            self.assertEqual(pull.heartbeat_request_json(self.cfg, {'storage':{'challenge_nonce':'a'*64}}, challenge), {'ok':True})
+        self.assertNotIn('challenge_nonce', self.sent[0]['storage'])
 
     def test_real_send_uses_fresh_sample_and_total_watchdog_reaps_child(self):
         received = []

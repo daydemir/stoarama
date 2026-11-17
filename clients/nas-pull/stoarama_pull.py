@@ -1879,6 +1879,7 @@ class Runtime:
         self.boot_id = boot_id()
         self.previous_exit = self._previous_exit(cfg)
         self.heartbeat_succeeded = False
+        self.storage_challenge = HeartbeatStorageChallenge()
         self.list_succeeded = False
         self.stable_marked = False
         self.release_candidate_at_start = bool(getattr(cfg, "is_candidate", False))
@@ -24986,6 +24987,26 @@ def load_outage(cfg):
     return read_json(cfg.outage_file, None)
 
 
+class HeartbeatStorageChallenge:
+    """One in-flight heartbeat; the server rotates a fresh nonce per response."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pending = None
+        self.last_echoed = None
+
+    def receive(self, nonce):
+        with self.lock:
+            self.pending = (nonce if isinstance(nonce, str) and re.fullmatch(r"[0-9a-f]{64}", nonce)
+                            and nonce != self.last_echoed else None)
+
+    def take(self):
+        with self.lock:
+            nonce, self.pending = self.pending, None
+            if nonce is not None:
+                self.last_echoed = nonce
+            return nonce
+
+
 class HeartbeatStorageUnavailable(RuntimeError):
     pass
 
@@ -25004,17 +25025,21 @@ class HeartbeatStorageAge:
             raise HeartbeatStorageUnavailable("heartbeat storage sample expired before delivery")
 
 
-def heartbeat_request_json(cfg, payload):
+def heartbeat_request_json(cfg, payload, challenge=None):
     # All inventory/host locks and payload construction precede this sample.
     # Each compatibility attempt calls here anew; cached storage is never sent.
+    # Spend before sampling or sending: failures/retries never reuse a nonce.
+    nonce = challenge.take() if challenge is not None else None
     age = HeartbeatStorageAge(heartbeat_monotonic())
     storage = storage_status(cfg)
     if storage.get("available") is not True:
         raise HeartbeatStorageUnavailable("heartbeat fresh storage read unavailable; skipped")
+    if nonce is not None:
+        storage = dict(storage, challenge_nonce=nonce)
     data = json.dumps(dict(payload, storage=storage)).encode("utf-8")
     age.check()
-    # urllib's timeout is per socket operation, so it cannot establish M.
-    # The existing isolated transport enforces a TOTAL 20s request watchdog.
+    # This bounds wasted work, not buffered ingress delivery. Budget freshness
+    # comes only from the server issuance time of the matched nonce.
     status, _, raw = r2_copy_http(cfg.api_base + "/account/connections/heartbeat", "POST",
         {"User-Agent": USER_AGENT, "Authorization": "Bearer " + cfg.api_key, "Content-Type": "application/json"},
         body=data, limit=1024*1024, timeout=HEARTBEAT_TIMEOUT_SEC, guard=age, input_limit=2*1024*1024, socket_timeout=HEARTBEAT_TIMEOUT_SEC,
@@ -25027,38 +25052,43 @@ def heartbeat_request_json(cfg, payload):
     result = json.loads(raw.decode("utf-8")) if raw else {}
     if not isinstance(result, dict):
         raise RuntimeError("invalid heartbeat response")
+    # Keep this private transport token out of generic response diagnostics.
+    next_nonce = result.pop("storage_challenge_nonce", None)
+    if challenge is not None:
+        challenge.receive(next_nonce)
     CLIENT_LOG_RING.add_secrets(diagnostic_secret_values(result, response=True))
     return result
 
 
-def send_heartbeat_payload(cfg, payload):
+def send_heartbeat_payload(cfg, payload, challenge):
     try:
-        return heartbeat_request_json(cfg, payload)
+        return heartbeat_request_json(cfg, payload, challenge)
     except urllib.error.HTTPError as exc:
         host = payload.get("host")
         if exc.code != 400 or not isinstance(host, dict) or "release" not in host:
             raise
         payload["host"] = {k: v for k, v in host.items() if k != "release"}
-        return heartbeat_request_json(cfg, payload)
+        return heartbeat_request_json(cfg, payload, challenge)
 
 
 def send_heartbeat(cfg, runtime, outage):
     payload = runtime.heartbeat_payload(outage)
+    challenge = runtime.storage_challenge
     try:
-        return heartbeat_request_json(cfg, payload)
+        return heartbeat_request_json(cfg, payload, challenge)
     except urllib.error.HTTPError as exc:
         host = payload.get("host")
         if exc.code == 400 and "cleanup" in payload:
             # A backend that predates the optional cleanup status field.
             payload.pop("cleanup")
-            return send_heartbeat_payload(cfg, payload)
+            return send_heartbeat_payload(cfg, payload, challenge)
         if exc.code != 400 or not isinstance(host, dict) or "release" not in host:
             raise
         # A rolled-back backend may not know this optional diagnostic field.
         # Retry only without that field; authentication and all other telemetry
         # stay exact, and any second rejection follows normal outage handling.
         payload["host"] = {k: v for k, v in host.items() if k != "release"}
-        return heartbeat_request_json(cfg, payload)
+        return heartbeat_request_json(cfg, payload, challenge)
 
 
 def heartbeat_loop(cfg, runtime, stop_event):
