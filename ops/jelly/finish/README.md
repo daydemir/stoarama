@@ -265,7 +265,9 @@ inventory expires within one hour. D allocates refresh at most half the current
 total deficit **before** ordinary fill. Ordinary keeps the other half, including
 odd spare slots and unused refresh capacity. Refresh is capped at5,000 outstanding
 rows inside the unchanged10,000 total; that is10m25s of B2's8/s canary throughput,
-below one consumer-hour. Each tick retains the existing100GB byte bound, admitting
+below one consumer-hour. The refresh catalog read reuses the scoped60s read-only candidate transaction;
+pooled queries, writes and the four-minute tick deadline keep their existing
+budgets. Each tick retains the existing100GB byte bound, admitting
 the complete64GiB COPY domain. A row too large for the remaining allowance is
 skipped so smaller following rows progress; it can fit a subsequent fresh batch.
 

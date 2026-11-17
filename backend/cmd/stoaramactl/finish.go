@@ -89,6 +89,7 @@ type finishLateHold string
 const (
 	finishLateSpaceUnknown  finishLateHold = "nas_space_evidence_unavailable"
 	finishLateSpaceLow      finishLateHold = "nas_headroom_below_threshold"
+	finishRefreshDisabled   finishLateHold = "refresh_disabled"
 	finishLateBudgetHeld    finishLateHold = "next_download_exceeds_budget"
 	finishLateProofStale    finishLateHold = "nas_storage_budget_proof_stale"
 	finishLateClientUnknown finishLateHold = "nas_storage_client_not_budget_eligible"

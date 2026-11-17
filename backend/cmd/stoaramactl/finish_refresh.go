@@ -82,7 +82,7 @@ func feedKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefreshO
 	if err != nil {
 		return 0, err
 	}
-	defer init.Rollback(ctx)
+	defer rollbackFinishCandidateTx(init)
 	if err = inverseProtectionBarrier(ctx, init); err != nil {
 		return 0, err
 	}
@@ -98,7 +98,12 @@ func feedKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefreshO
 	if err = init.Commit(ctx); err != nil {
 		return 0, err
 	}
-	rows, err := pool.Query(ctx, `SELECT q.item,coalesce(c.etag,'') FROM nas_r2_copy_items q JOIN recording_clips c ON c.id=q.source_id
+	catalog, err := beginFinishCandidateTx(ctx, pool)
+	if err != nil {
+		return 0, err
+	}
+	defer rollbackFinishCandidateTx(catalog)
+	rows, err := catalog.Query(ctx, `SELECT q.item,coalesce(c.etag,'') FROM nas_r2_copy_items q JOIN recording_clips c ON c.id=q.source_id
  JOIN nas_inventory_files n ON n.clip_id=c.id AND n.connection_id=13
  WHERE c.bucket='stoarama' AND q.connection_id=13 AND q.kind='raw' AND q.state='verified' AND q.blocked_reason='' AND q.policy_sha256=$1
  AND `+finishRefreshExactSQL+` ORDER BY LEAST(n.verified_at,n.server_received_at),c.id LIMIT $2`, policy, finishTarget)
@@ -128,6 +133,9 @@ func feedKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefreshO
 	if err != nil {
 		return 0, err
 	}
+	if err = catalog.Commit(ctx); err != nil {
+		return 0, err
+	}
 	admitted := 0
 	var bytes int64
 	for _, c := range candidates {
@@ -140,6 +148,9 @@ func feedKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefreshO
 		ok, err := queueKeep28Refresh(ctx, pool, o, protection, epoch, c.item, c.etag, policy, status)
 		if err != nil {
 			return admitted, err
+		}
+		if status.RefreshHold == finishRefreshDisabled {
+			break
 		}
 		if ok {
 			admitted++
@@ -158,7 +169,7 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback(context.Background())
+	defer rollbackFinishCandidateTx(tx)
 	if _, err = tx.Exec(ctx, `SET LOCAL statement_timeout='10s'; SET LOCAL lock_timeout='2s'; SET LOCAL work_mem='16MB'`); err != nil {
 		return false, err
 	}
@@ -236,6 +247,7 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 	if err = tx.QueryRow(ctx, finishLateDebitsSQL, status.NASSpaceCheckedAt.Add(-finishLateDebitWindow)).Scan(&charged); err != nil {
 		return false, err
 	}
+	status.QueueReservedBytes = charged
 	if i.SizeBytes > max(int64(0), *status.NASFreeBytes-api.NASR2CopyFloor-api.NASR2CopyRangeBytes-charged) {
 		status.RefreshHold = finishLateBudgetHeld
 		return false, nil
