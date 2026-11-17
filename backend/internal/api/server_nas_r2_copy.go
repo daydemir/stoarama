@@ -25,6 +25,13 @@ const (
 	nasR2CopyLock       int64 = 7343226011192
 )
 
+type NASR2CopyMode string
+
+const (
+	NASR2OrdinaryCopy   NASR2CopyMode = "copy"
+	NASR2VerifyExisting NASR2CopyMode = "verify_existing"
+)
+
 type NASR2CopyKind string
 
 const (
@@ -177,6 +184,7 @@ func nasR2CopyReady(ctx context.Context, tx pgx.Tx) error {
 }
 
 type nasR2CopyControl struct {
+	VerifyExisting  bool                 `json:"verify_existing"`
 	Token           string               `json:"token"`
 	RangeID         string               `json:"range_id,omitempty"`
 	FreeBytes       int64                `json:"free_bytes"`
@@ -188,6 +196,7 @@ type nasR2CopyControl struct {
 	CommittedBytes  int64                `json:"committed_bytes"`
 }
 type nasR2CopyTask struct {
+	WorkMode     NASR2CopyMode   `json:"work_mode"`
 	ID           int64           `json:"id"`
 	Token        string          `json:"token"`
 	Item         NASR2CopyItem   `json:"item"`
@@ -198,7 +207,7 @@ type nasR2CopyTask struct {
 
 // Preparation holds only short database row locks. It commits before HEAD;
 // admission and maintenance must revalidate everything that can change.
-func (s *Server) nasR2CopyPrepare(w http.ResponseWriter, r *http.Request, cid int64) (nasR2CopyTask, []byte, NASR2CopyBlockReason, bool) {
+func (s *Server) nasR2CopyPrepare(w http.ResponseWriter, r *http.Request, cid int64, verify bool) (nasR2CopyTask, []byte, NASR2CopyBlockReason, bool) {
 	var task nasR2CopyTask
 	var data []byte
 	ctx := r.Context()
@@ -213,15 +222,16 @@ func (s *Server) nasR2CopyPrepare(w http.ResponseWriter, r *http.Request, cid in
 		return task, nil, "", false
 	}
 	var active int
-	if err = tx.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE connection_id=$1 AND state='leased' AND lease_expires_at>clock_timestamp()`, cid).Scan(&active); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE connection_id=$1 AND state IN ('leased','refresh_leased') AND lease_expires_at>clock_timestamp()`, cid).Scan(&active); err != nil {
 		util.WriteError(w, 503, "copy lease unavailable")
 		return task, nil, "", false
 	}
 	if active >= NASR2CopyWorkers {
 		return task, nil, "", true
 	}
-	err = tx.QueryRow(ctx, `SELECT id,item,policy_sha256 FROM nas_r2_copy_items WHERE connection_id=$1 AND kind='raw' AND
- (state='pending' OR (state='leased' AND lease_expires_at<clock_timestamp())) ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`, cid).Scan(&task.ID, &data, &task.PolicySHA256)
+	err = tx.QueryRow(ctx, `SELECT q.id,q.item,q.policy_sha256,q.work_mode FROM nas_r2_copy_items q CROSS JOIN r2_keep28_refresh_control control WHERE connection_id=$1 AND kind='raw' AND
+ (state='pending' OR (state='leased' AND lease_expires_at<clock_timestamp()) OR ($2 AND control.enabled AND (state='refresh_pending' OR (state='refresh_leased' AND lease_expires_at<clock_timestamp()))))
+ ORDER BY (q.work_mode=control.last_mode),CASE WHEN q.work_mode='verify_existing' THEN q.updated_at END,q.id LIMIT 1 FOR UPDATE OF q SKIP LOCKED`, cid, verify).Scan(&task.ID, &data, &task.PolicySHA256, &task.WorkMode)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return task, nil, "", true
 	}
@@ -262,15 +272,15 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 	// A concurrent grant can consume the prepared row. Retry a bounded number
 	// of candidates without making the client hold for a normal admission race.
 	for attempt := 0; attempt < NASR2CopyWorkers; attempt++ {
-		if !s.nasR2CopyLeaseAttempt(w, r, cid) {
+		if !s.nasR2CopyLeaseAttempt(w, r, cid, req.VerifyExisting) {
 			return
 		}
 	}
 	util.WriteError(w, 409, "copy queue changed during preparation; retryable")
 }
 
-func (s *Server) nasR2CopyLeaseAttempt(w http.ResponseWriter, r *http.Request, cid int64) bool {
-	task, data, reason, ok := s.nasR2CopyPrepare(w, r, cid)
+func (s *Server) nasR2CopyLeaseAttempt(w http.ResponseWriter, r *http.Request, cid int64, verify bool) bool {
+	task, data, reason, ok := s.nasR2CopyPrepare(w, r, cid, verify)
 	if !ok {
 		return false
 	}
@@ -320,7 +330,7 @@ func (s *Server) nasR2CopyLeaseAttempt(w http.ResponseWriter, r *http.Request, c
 		return false
 	}
 	var active int
-	if err = tx.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE connection_id=$1 AND state='leased' AND lease_expires_at>clock_timestamp()`, cid).Scan(&active); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE connection_id=$1 AND state IN ('leased','refresh_leased') AND lease_expires_at>clock_timestamp()`, cid).Scan(&active); err != nil {
 		util.WriteError(w, 503, "copy lease unavailable")
 		return false
 	}
@@ -330,7 +340,7 @@ func (s *Server) nasR2CopyLeaseAttempt(w http.ResponseWriter, r *http.Request, c
 	}
 	var id int64
 	err = tx.QueryRow(ctx, `SELECT id FROM nas_r2_copy_items WHERE id=$1 AND connection_id=$2 AND kind='raw' AND item=$3::jsonb AND policy_sha256=$4 AND
- (state='pending' OR (state='leased' AND lease_expires_at<clock_timestamp())) FOR UPDATE SKIP LOCKED`, task.ID, cid, data, task.PolicySHA256).Scan(&id)
+ (state='pending' OR (state='leased' AND lease_expires_at<clock_timestamp()) OR (state='refresh_pending' OR (state='refresh_leased' AND lease_expires_at<clock_timestamp()))) AND work_mode=$5 FOR UPDATE SKIP LOCKED`, task.ID, cid, data, task.PolicySHA256, task.WorkMode).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return true
 	}
@@ -353,8 +363,17 @@ func (s *Server) nasR2CopyLeaseAttempt(w http.ResponseWriter, r *http.Request, c
 		s.nasR2CopyBlockResponse(w, r, tx, task.ID, reason)
 		return false
 	}
+	tag, err := tx.Exec(ctx, `UPDATE r2_keep28_refresh_control SET last_mode=$1 WHERE singleton AND (enabled OR $1='copy')`, task.WorkMode)
+	if err != nil || tag.RowsAffected() != 1 {
+		util.WriteError(w, 409, "refresh disabled")
+		return false
+	}
+	leaseState := "leased"
+	if task.WorkMode == NASR2VerifyExisting {
+		leaseState = "refresh_leased"
+	}
 	task.ETag, task.Token = strings.Trim(head.ETag, "\""), hex.EncodeToString(nonce)
-	_, err = tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='leased',lease_token=$2,lease_expires_at=clock_timestamp()+interval '30 seconds',etag=$3,version_id=$4,attempts=attempts+1,last_error='',updated_at=clock_timestamp() WHERE id=$1`, task.ID, task.Token, task.ETag, head.VersionID)
+	_, err = tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state=$5,lease_token=$2,lease_expires_at=clock_timestamp()+interval '30 seconds',etag=$3,version_id=$4,attempts=attempts+1,last_error='',updated_at=clock_timestamp() WHERE id=$1`, task.ID, task.Token, task.ETag, head.VersionID, leaseState)
 	if err != nil || tx.Commit(ctx) != nil {
 		util.WriteError(w, 503, "copy lease commit failed")
 		return false
@@ -399,7 +418,7 @@ func (s *Server) nasR2CopyActive(w http.ResponseWriter, r *http.Request, purpose
 		return nil, t, version, req, false
 	}
 	var data []byte
-	err = tx.QueryRow(ctx, `SELECT id,item,policy_sha256,etag,coalesce(version_id,'') FROM nas_r2_copy_items WHERE id=$1 AND connection_id=13 AND state='leased' AND lease_token=$2 AND lease_expires_at>clock_timestamp() FOR UPDATE`, id, req.Token).Scan(&t.ID, &data, &t.PolicySHA256, &t.ETag, &version)
+	err = tx.QueryRow(ctx, `SELECT id,item,policy_sha256,etag,coalesce(version_id,''),work_mode FROM nas_r2_copy_items WHERE id=$1 AND connection_id=13 AND state IN ('leased','refresh_leased') AND lease_token=$2 AND lease_expires_at>clock_timestamp() FOR UPDATE`, id, req.Token).Scan(&t.ID, &data, &t.PolicySHA256, &t.ETag, &version, &t.WorkMode)
 	policy, _, pe := Keep28Policy()
 	if err != nil || json.Unmarshal(data, &t.Item) != nil || pe != nil || policy != t.PolicySHA256 {
 		fail()
@@ -441,6 +460,10 @@ func (s *Server) handleNASR2CopyRange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if t.WorkMode == NASR2VerifyExisting {
+		util.WriteError(w, 409, "verify-existing never downloads")
+		return
+	}
 	if req.Offset < 0 || req.Length <= 0 || req.Length > NASR2CopyRangeBytes || req.Offset > t.Item.SizeBytes-req.Length {
 		util.WriteError(w, 400, "invalid copy range")
 		return
@@ -493,6 +516,10 @@ func (s *Server) handleNASR2CopyResult(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, 400, "invalid copy completion counters")
 		return
 	}
+	if t.WorkMode == NASR2VerifyExisting && (req.Completion != NASR2CopyVerifiedInPlace || req.DownloadedBytes != 0 || req.CommittedBytes != 0) {
+		util.WriteError(w, 400, "refresh requires verify-in-place without download")
+		return
+	}
 	// Existing inventory publication is the custody proof, never a result claim.
 	var exact bool
 	err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM nas_inventory_files WHERE connection_id=13 AND clip_id=$1 AND relative_path=$2 AND sha256=$3 AND size_bytes=$4 AND state='present' AND verified_at BETWEEN now()-interval '5 minutes' AND now()+interval '5 minutes' AND server_received_at>=now()-interval '5 minutes' AND sidecar_relative_path=$2||'.stoarama.json' AND sidecar_size_bytes>0 AND sidecar_sha256 ~ '^[a-f0-9]{64}$')`, t.Item.SourceID, t.Item.RelativePath, t.Item.SHA256, t.Item.SizeBytes).Scan(&exact)
@@ -500,7 +527,11 @@ func (s *Server) handleNASR2CopyResult(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, 409, "copy requires exact NAS inventory proof")
 		return
 	}
-	_, err = tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET state='verified',verified_at=now(),lease_token=NULL,lease_expires_at=NULL,completion=$2,committed_bytes=$3,updated_at=clock_timestamp() WHERE id=$1`, t.ID, req.Completion, req.CommittedBytes)
+	if t.WorkMode == NASR2VerifyExisting {
+		_, err = tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET state='verified',lease_token=NULL,lease_expires_at=NULL,custody_refreshed_at=clock_timestamp(),refresh_count=refresh_count+1,updated_at=clock_timestamp() WHERE id=$1`, t.ID)
+	} else {
+		_, err = tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET state='verified',verified_at=now(),lease_token=NULL,lease_expires_at=NULL,completion=$2,committed_bytes=$3,updated_at=clock_timestamp() WHERE id=$1`, t.ID, req.Completion, req.CommittedBytes)
+	}
 	if err != nil || tx.Commit(r.Context()) != nil {
 		util.WriteError(w, 503, "copy result commit failed")
 		return

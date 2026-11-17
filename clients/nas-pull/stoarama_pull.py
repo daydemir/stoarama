@@ -52393,7 +52393,19 @@ class R2CopyHold(RuntimeError):
     pass
 
 
+class R2CopyWorkMode(Enum):
+    COPY = "copy"
+    VERIFY_EXISTING = "verify_existing"
+
+
+def r2_copy_work_mode(task):
+    # The legacy wire protocol represents ordinary copy without this field.
+    # Refresh states are invisible to that server and require explicit mode.
+    return R2CopyWorkMode(task.get("work_mode", R2CopyWorkMode.COPY.value))
+
+
 class R2CopyBlockReason(Enum):
+    VERIFY_MISSING = "verify_missing"
     FINAL = "final_conflict"
     SIDECAR = "sidecar_conflict"
     PARTIAL = "partial_conflict"
@@ -52414,6 +52426,7 @@ class R2CopyTelemetry:
         self.lock = threading.Lock()
         self.holds = {}
         self.downloaded = self.committed = self.present = self.present_bytes = 0
+        self.refreshed = self.refreshed_bytes = 0
 
     def hold(self, reason):
         with self.lock:
@@ -52429,7 +52442,8 @@ def r2_copy_status(inventory):
     with R2_COPY_TELEMETRY.lock:
         return dict(holds_by_reason=dict(R2_COPY_TELEMETRY.holds), mismatch_latched=mismatches,
                     downloaded_bytes=R2_COPY_TELEMETRY.downloaded, committed_bytes=R2_COPY_TELEMETRY.committed,
-                    verified_in_place=dict(objects=R2_COPY_TELEMETRY.present, bytes=R2_COPY_TELEMETRY.present_bytes))
+                    verified_in_place=dict(objects=R2_COPY_TELEMETRY.present, bytes=R2_COPY_TELEMETRY.present_bytes),
+                    refresh_verified_in_place=dict(objects=R2_COPY_TELEMETRY.refreshed, bytes=R2_COPY_TELEMETRY.refreshed_bytes))
 
 
 def r2_copy_report_block(inventory, control, task, reason):
@@ -52944,6 +52958,7 @@ def valid_r2_copy_task(task):
         raise ValueError("invalid copy task")
     if not re.fullmatch(r"[a-f0-9]{48}", task.get("token", "")) or task.get("policy_sha256") != R2_RETIRE_COPY_POLICY:
         raise ValueError("invalid copy token/policy")
+    r2_copy_work_mode(task)
     item, clip = task["item"], task["clip"]
     if item.get("kind") != "raw":
         raise ValueError("collated copy custody is blocked")
@@ -52964,7 +52979,7 @@ def valid_r2_copy_task(task):
     return task
 
 
-def r2_copy_parent(cfg, relative, guard):
+def r2_copy_parent(cfg, relative, guard, create=True):
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     fd = os.open(str(cfg.output_dir), flags)
     try:
@@ -52973,6 +52988,8 @@ def r2_copy_parent(cfg, relative, guard):
             try:
                 child = os.open(part, flags, dir_fd=fd)
             except FileNotFoundError:
+                if not create:
+                    raise R2CopyBlocked(R2CopyBlockReason.VERIFY_MISSING)
                 def mkdir():
                     try:
                         os.mkdir(part, 0o755, dir_fd=fd)
@@ -53119,7 +53136,8 @@ def _execute_r2_copy(cfg, runtime, inventory, stop, task, control):
         raise R2CopyHold("copy yields to stitching")
     guard.check(remote=True)
     item = task["item"]
-    parent = r2_copy_parent(cfg, item["relative_path"], guard)
+    verify_only = r2_copy_work_mode(task) is R2CopyWorkMode.VERIFY_EXISTING
+    parent = r2_copy_parent(cfg, item["relative_path"], guard, create=not verify_only)
     name = item["relative_path"].split("/")[-1]
     partial = ".%s.r2-copy-%d.part" % (name, item["source_id"])
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -53129,6 +53147,8 @@ def _execute_r2_copy(cfg, runtime, inventory, stop, task, control):
         except FileNotFoundError:
             final_fd = None
         if final_fd is None:
+            if verify_only:
+                raise R2CopyBlocked(R2CopyBlockReason.VERIFY_MISSING)
             fd = r2_copy_namespace(parent, guard, lambda: os.open(partial, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644, dir_fd=parent))
             try:
                 opened = os.fstat(fd)
@@ -53174,7 +53194,8 @@ def _execute_r2_copy(cfg, runtime, inventory, stop, task, control):
             with R2_COPY_TELEMETRY.lock:
                 R2_COPY_TELEMETRY.committed += committed
         try:
-            r2_copy_remove_private(parent, partial, name, guard)
+            if not verify_only:
+                r2_copy_remove_private(parent, partial, name, guard)
             size, digest, info = r2_copy_hash(final_fd, guard)
             if size != item["size_bytes"] or digest.hexdigest() != item["sha256"]:
                 raise R2CopyBlocked(R2CopyBlockReason.FINAL)
@@ -53196,8 +53217,11 @@ def _execute_r2_copy(cfg, runtime, inventory, stop, task, control):
                          body={"token": task["token"], "free_bytes": r2_copy_resources(cfg, runtime),
                                "completion": "downloaded" if committed else "verified_in_place",
                                "downloaded_bytes": downloaded, "committed_bytes": committed}, timeout=R2_COPY_TIMEOUT)
-            if not committed:
-                with R2_COPY_TELEMETRY.lock:
+            with R2_COPY_TELEMETRY.lock:
+                if verify_only:
+                    R2_COPY_TELEMETRY.refreshed += 1
+                    R2_COPY_TELEMETRY.refreshed_bytes += item["size_bytes"]
+                elif not committed:
                     R2_COPY_TELEMETRY.present += 1
                     R2_COPY_TELEMETRY.present_bytes += item["size_bytes"]
             log("INFO", "R2 copy verified source_id=%d size_bytes=%d downloaded_bytes=%d committed_bytes=%d elapsed_ms=%d" %
@@ -53216,7 +53240,7 @@ def r2_copy_worker(cfg, runtime, inventory, stop, worker):
             try:
                 free = r2_copy_resources(cfg, runtime)
                 response = control.request_json(R2CopyControlOperation.LEASE, "/account/connections/r2-copy/lease",
-                                        body={"free_bytes": free})
+                                        body={"free_bytes": free, "verify_existing": True})
                 if response.get("blocked") is True:
                     log("ERROR", "R2 copy server blocked id=%s reason=%s; key protected" % (response.get("id"), response.get("reason")))
                     wait = 0

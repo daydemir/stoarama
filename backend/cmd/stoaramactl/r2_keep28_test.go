@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/daydemir/stoarama/backend/internal/api"
 	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/r2"
@@ -112,15 +113,18 @@ func newKeep28FixtureCount(t *testing.T, count int) keep28Fixture {
 	exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at,server_received_at,file_ctime_ns,file_inode,file_device,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256) VALUES(13,9000001,30,'keep28/1.mp4',100,repeat('b',64),'present',clock_timestamp()-interval '1 hour',clock_timestamp(),clock_timestamp()-interval '2 hours',1,2,3,'keep28/1.mp4.stoarama.json',50,repeat('c',64))`)
 	object := r2.ObjectInfo{Key: f.key, ETag: "etag", SizeBytes: 100, LastModified: time.Now().UTC().Add(-8 * 24 * time.Hour).Truncate(time.Second)}
 	f.store = &inverseFakeStore{objects: map[string]r2.ObjectInfo{f.key: object}}
-	if count == 2 {
+	for n := 2; n <= count; n++ {
+		key := fmt.Sprintf("managed/acct-47/keep28/%d.mp4", n)
+		path := fmt.Sprintf("keep28/%d.mp4", n)
 		exec(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path)
- SELECT 9000002,recording_id,storage_destination_id,endpoint,bucket,'managed/acct-47/keep28/2.mp4',size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,'keep28/2.mp4' FROM recording_clips WHERE id=9000001`)
+ SELECT $1,recording_id,storage_destination_id,endpoint,bucket,$2,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,$3 FROM recording_clips WHERE id=9000001`, 9000000+n, key, path)
 		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at,server_received_at,file_ctime_ns,file_inode,file_device,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256)
- SELECT connection_id,9000002,recording_id,'keep28/2.mp4',size_bytes,sha256,state,clock_timestamp()-interval '3 hours',client_updated_at,server_received_at,file_ctime_ns,file_inode,file_device,'keep28/2.mp4.stoarama.json',sidecar_size_bytes,sidecar_sha256 FROM nas_inventory_files WHERE clip_id=9000001`)
+ SELECT connection_id,$1,recording_id,$2,size_bytes,sha256,state,clock_timestamp()-interval '3 hours',client_updated_at,server_received_at,file_ctime_ns,file_inode,file_device,$2||'.stoarama.json',sidecar_size_bytes,sidecar_sha256 FROM nas_inventory_files WHERE clip_id=9000001`, 9000000+n, path)
 		second := object
-		second.Key = "managed/acct-47/keep28/2.mp4"
-		f.store.objects[second.Key] = second
+		second.Key = key
+		f.store.objects[key] = second
 	}
+
 	f.sdk, f.deletes = inverseSDKTestStore(t, f.store)
 	f.store.endpointSHA = f.sdk.EndpointSHA256()
 	exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, f.sdk.EndpointSHA256())

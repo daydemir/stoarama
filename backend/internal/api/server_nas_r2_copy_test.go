@@ -22,7 +22,7 @@ func copyTestFixture(t *testing.T) (*cleanupFixture, NASR2CopyItem) {
 	f := newCleanupFixture(t, 1)
 	f.useClientVersion(nasCleanupProofClientVersion)
 
-	for _, name := range []string{"0174_r2_object_retirements.sql", "0182_r2_retirement_reservations.sql", "0193_nas_r2_copy.sql", "0200_nas_r2_copy_progress.sql"} {
+	for _, name := range []string{"0174_r2_object_retirements.sql", "0182_r2_retirement_reservations.sql", "0193_nas_r2_copy.sql", "0200_nas_r2_copy_progress.sql", "0205_nas_r2_refresh.sql"} {
 		b, err := os.ReadFile("../../../infra/sql/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)

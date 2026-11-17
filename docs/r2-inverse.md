@@ -179,10 +179,12 @@ provider removals separately from B1. Require HEAD404, bucket-byte reduction and
 at least 8 objects/second by full batch wall time before larger batches.
 Production readiness and throughput are not established by offline tests.
 
-At this base COPY does not re-lease verified rows, so expired verified custody
-remains held pending the separately reviewed PR2 refresh tool. No timestamp
-refresh, manual reset, NAS scanner or reduced memory/load guard is supplied by
-B2. The recorded 1,158,889 RAW / 16.44 TB requires about 5.37 days at 150
+COPY ordinary import still does not re-lease verified rows. The separately
+reviewed PR2 adds optional bounded verify-only refresh through D; see
+[finish tick](../ops/jelly/finish/README.md#bounded-keep28-custody-refresh-pr2).
+Its controller flag and queue status grant no deletion authority. No timestamp
+refresh without hashing, manual reset, NAS scanner or reduced resource guard
+is supplied. The recorded 1,158,889 RAW / 16.44 TB requires about 5.37 days at 150
 verifications/minute or 2.01 days at 400/minute (~95 MB/s of hashing). Memory and
 load can hold the worker entirely. Selection and startup memory at full
 cardinality remain unmeasured: B2 retains the report's keep28 entries in memory,

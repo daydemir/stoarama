@@ -21,7 +21,11 @@ def main():
     ap.add_argument('--safety-collector', required=True, type=Path,
                     help='controller executable; emits fresh safety JSON on stdout')
     ap.add_argument('--notify-agent', required=True, help='darma msg target configured by controller')
+    ap.add_argument('--refresh-picks', type=Path, help='optional pinned B2 picks for guarded verify-only refresh')
+    ap.add_argument('--expected-refresh-picks-sha256')
     args = ap.parse_args()
+    if bool(args.refresh_picks) != bool(args.expected_refresh_picks_sha256):
+        ap.error('refresh picks and digest must be supplied together')
     reason = 'dependency_failed'
     try:
         with ExitStack() as stack:
@@ -44,8 +48,12 @@ def main():
                                    timeout=90, check=True)
                 if path.stat().st_size > 1024 * 1024:
                     raise ValueError('oversize evidence')
-            result = subprocess.run([str(args.cli), 'finish', 'tick', '--safety', str(safety),
-                                     '--copy-status', str(copy), '--status', str(status)],
+            command = [str(args.cli), 'finish', 'tick', '--safety', str(safety),
+                       '--copy-status', str(copy), '--status', str(status)]
+            if args.refresh_picks is not None:
+                command += ['--refresh-picks', str(args.refresh_picks),
+                            '--expected-refresh-picks-sha256', args.expected_refresh_picks_sha256]
+            result = subprocess.run(command,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=270)
             reason = 'current_status_unavailable'
             # This path did not exist before THIS invocation. Never report an old

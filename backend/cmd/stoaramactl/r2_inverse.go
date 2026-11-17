@@ -308,6 +308,10 @@ func beginInversePartitionTx(ctx context.Context, pool *pgxpool.Pool) (pgx.Tx, e
 }
 
 func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
+	if len(args) > 0 && args[0] == "refresh" {
+		runKeep28RefreshControl(ctx, cfg, args[1:])
+		return
+	}
 	if len(args) > 0 && args[0] == "apply-keep28" {
 		runR2InverseLane(ctx, cfg, args[1:], inverseNASKeep28)
 		return

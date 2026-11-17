@@ -60,6 +60,55 @@ class R2CopyWorkerTests(unittest.TestCase):
     def run_copy(self):
         pull.execute_r2_copy(self.cfg, self.runtime, self.inventory, self.stop, self.task, self.control_client)
 
+    def test_verify_only_missing_parent_and_media_never_create_or_download(self):
+        self.task["work_mode"] = "verify_existing"
+        parent = self.cfg.output_dir / "p"
+        for existing_parent in (False, True):
+            with self.subTest(existing_parent=existing_parent):
+                if existing_parent:
+                    parent.mkdir()
+                with mock.patch.object(pull, "r2_copy_range", side_effect=AssertionError("download")):
+                    self.run_copy()
+                self.assertEqual(parent.exists(), existing_parent)
+                self.assertFalse((parent / "copy.mp4").exists())
+                self.assertFalse(list(parent.glob("*.part")))
+                self.assertTrue(any(path.endswith("/block") and kw["body"]["reason"] == "verify_missing" for path, kw in self.calls))
+                with self.inventory.lock:
+                    self.inventory.db.execute("DELETE FROM r2_copy_blocks")
+                    self.inventory.db.commit()
+                self.calls.clear()
+
+    def test_two_refreshes_keep_original_download_telemetry(self):
+        with mock.patch.object(pull, "r2_copy_range", side_effect=self.transfer):
+            self.run_copy()
+        before = pull.r2_copy_status(self.inventory)
+        self.task["work_mode"] = "verify_existing"
+        for _ in range(2):
+            with mock.patch.object(pull, "r2_copy_range", side_effect=AssertionError("download")):
+                self.run_copy()
+        after = pull.r2_copy_status(self.inventory)
+        self.assertEqual(after["committed_bytes"], before["committed_bytes"])
+        self.assertEqual(after["verified_in_place"], before["verified_in_place"])
+        self.assertEqual(after["refresh_verified_in_place"], dict(objects=2, bytes=2 * len(self.body)))
+
+    def test_verify_only_preserves_media_partial_and_resource_holds(self):
+        self.task["work_mode"] = "verify_existing"
+        final = self.cfg.output_dir / self.item["relative_path"]
+        final.parent.mkdir()
+        final.write_bytes(self.body)
+        partial = final.parent / ".copy.mp4.r2-copy-901.part"
+        partial.write_bytes(b"preserve partial")
+        with mock.patch.object(pull, "r2_copy_resources", side_effect=pull.R2CopyHold("copy memory headroom")):
+            with self.assertRaises(pull.R2CopyHold):
+                self.run_copy()
+        self.assertEqual(partial.read_bytes(), b"preserve partial")
+        self.assertEqual(final.read_bytes(), self.body)
+        self.assertFalse(self.calls)
+        with mock.patch.object(pull, "r2_copy_range", side_effect=AssertionError("download")):
+            self.run_copy()
+        self.assertEqual(partial.read_bytes(), b"preserve partial")
+        self.assertEqual(final.read_bytes(), self.body)
+
     def test_resume_after_interruption_publishes_exact_inventory_once_verified(self):
         def interrupted(cfg, task, offset, length, guard, fd, digest):
             os.write(fd, self.body[:100])
