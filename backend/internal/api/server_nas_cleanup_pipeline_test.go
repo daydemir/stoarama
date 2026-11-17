@@ -37,6 +37,10 @@ func TestNASR2CopyV4FreshPermitClientServer(t *testing.T) {
 	testNASCleanupPipelineClientServer(t, true, nasCleanupR2CopyProgressClientVersion)
 }
 
+func TestNASR2CopyV5FreshPermitClientServer(t *testing.T) {
+	testNASCleanupPipelineClientServer(t, true, nasCleanupR2CopyDiagnosticsClientVersion)
+}
+
 func TestNASCleanupPermitTransportClientServer(t *testing.T) {
 	testNASCleanupPipelineClientServer(t, true, nasCleanupPermitTransportClientVersion)
 }
@@ -71,8 +75,13 @@ func testNASCleanupPipelineClientServer(t *testing.T, grouped bool, groupVersion
 			}
 			python := os.Getenv("STOARAMA_TEST_PYTHON")
 			if python == "" {
-				python = "python3"
+				t.Fatal("set STOARAMA_TEST_PYTHON to the pinned NAS/support-floor interpreter; do not inherit PATH")
 			}
+			versionBytes, err := exec.Command(python, "--version").CombinedOutput()
+			if err != nil {
+				t.Fatalf("pinned Python: %v %s", err, versionBytes)
+			}
+			t.Logf("explicit cleanup interpreter=%s version=%s", python, strings.TrimSpace(string(versionBytes)))
 			script, _ := filepath.Abs("../../../clients/nas-pull/bench_cleanup.py")
 			root, state := filepath.Join(t.TempDir(), "nas"), filepath.Join(t.TempDir(), "state")
 			raw, err := exec.Command(python, script, "prepare", "--root", root, "--count", fmt.Sprint(count*2), "--size", fmt.Sprint(fileSize), "--first-clip", "100000").Output()

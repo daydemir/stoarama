@@ -106,7 +106,8 @@ class CleanupCapTests(unittest.TestCase):
             with self.assertRaises(sqlite3.DatabaseError):
                 pull.cleanup_initialize(self.inventory)
         finally:
-            self.inventory.db.set_authorizer(None)
+            # Python 3.9 cannot disable an authorizer with None.
+            self.inventory.db.set_authorizer(lambda *args: sqlite3.SQLITE_OK)
         self.assertIsNone(self.inventory.db.execute("SELECT 1 FROM sqlite_master WHERE name='cleanup_cap_totals'").fetchone())
         with patch.object(pull.time, 'time', return_value=100000):
             pull.cleanup_initialize(self.inventory)

@@ -49,6 +49,8 @@ func TestNASClientAdmissionExactVersions(t *testing.T) {
 		{nasCleanupFreshPermitClientVersion, true, true, false},
 		{nasCleanupR2CopyControlClientVersion, true, true, true},
 		{nasCleanupR2CopyProgressClientVersion, true, true, false},
+		{nasCleanupR2CopyDiagnosticsClientVersion, true, true, false},
+		{"r2-copy-v5-extra", false, false, false},
 		{"r2-copy-v4-extra", false, false, false},
 		{nasCleanupItemTruthClientVersion, true, true, true},
 		{"development", false, false, false},

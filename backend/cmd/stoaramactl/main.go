@@ -121,6 +121,8 @@ func main() {
 		runJoinedSourcePurge(ctx, cfg, os.Args[2:])
 	case "do-spend":
 		runDOSpend(ctx, cfg, os.Args[2:])
+	case "finish":
+		os.Exit(runFinish(ctx, cfg, os.Args[2:]))
 	case "nas-r2-copy":
 		runNASR2Copy(ctx, cfg, os.Args[2:])
 	case "nas-restore":
@@ -263,7 +265,8 @@ func usage() {
 	  stoaramactl joined-source-purge hold --hour-record-id N --reason CODE [--note TEXT] | holds [--json]
 	  stoaramactl do-spend report [--json]
 	  stoaramactl do-spend check [--dry-run]
-	  stoaramactl nas-r2-copy plan --input copy.jsonl.gz --sha256 SHA --out DIR
+	  stoaramactl finish tick --safety FILE --copy-status FILE --status FILE
+  stoaramactl nas-r2-copy plan --input copy.jsonl.gz --sha256 SHA --out DIR
   stoaramactl nas-r2-copy queue --input raw-NNNN.jsonl --sha256 SHA [--apply] | status
   stoaramactl nas-restore request (--clip-ids 1,2 | --hour-record-id N | --recording-id N --from TIME --to TIME) [--test-prefix --label L --max-bytes N --limit N --dry-run --json]
 	  stoaramactl nas-restore status [--label L --json] | cancel --label L

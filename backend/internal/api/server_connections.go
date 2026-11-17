@@ -702,6 +702,7 @@ type connectionHeartbeatRequest struct {
 }
 
 type connectionHeartbeatResponse struct {
+	StorageChallengeNonce    string `json:"storage_challenge_nonce,omitempty"`
 	ListingEnabled           bool   `json:"listing_enabled"`
 	StitchProofTaskID        int    `json:"stitch_proof_task_id,omitempty"`
 	StitchProofActivationID  string `json:"stitch_proof_activation_id,omitempty"`
@@ -745,9 +746,10 @@ type connectionJoinedTransfer struct {
 }
 
 type connectionStorageStatus struct {
-	Available  bool  `json:"available"`
-	TotalBytes int64 `json:"total_bytes"`
-	FreeBytes  int64 `json:"free_bytes"`
+	ChallengeNonce string `json:"challenge_nonce,omitempty"`
+	Available      bool   `json:"available"`
+	TotalBytes     int64  `json:"total_bytes"`
+	FreeBytes      int64  `json:"free_bytes"`
 }
 
 type connectionInventoryStatus struct {
@@ -979,6 +981,11 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		inventoryUnmatched = req.Inventory.Unmatched
 		inventoryDigest = req.Inventory.Digest
 	}
+	storageNonce, err := newNASStorageChallenge()
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "storage challenge unavailable")
+		return
+	}
 	tx, err := s.pool.Begin(r.Context())
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin heartbeat: %v", err))
@@ -1005,7 +1012,17 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 	if desiredProtocol == 1 && req.JoinedProtocol == 1 {
 		effectiveProtocol = 1
 	}
+	// One DB-clock instant after the connection row lock. Validate the old nonce
+	// and rotate the next challenge without refreshing accepted sample time.
 	ct, err := tx.Exec(r.Context(), `
+        WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS at),
+        proof AS MATERIALIZED (
+          SELECT c.id AS proof_id,observed.at,
+           CASE WHEN $43::text<>'' AND $44::text<>'' AND $44=c.nas_storage_challenge_nonce
+             AND c.nas_storage_challenge_issued_at BETWEEN observed.at-$46::bigint*interval '1 second' AND observed.at
+            THEN c.nas_storage_challenge_issued_at END AS budget_at
+          FROM connections c CROSS JOIN observed WHERE c.id=$42
+        )
 		UPDATE connections
 		SET last_seen_at=now(),
 		    nas_listing_cursor_at=CASE WHEN $1>last_cursor_id OR nas_listing_cursor_at IS NULL THEN now() ELSE nas_listing_cursor_at END,
@@ -1050,11 +1067,14 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		      ELSE inventory_scan_skip_reasons END,
 		    nas_storage_total_bytes=CASE WHEN $33::boolean IS NULL THEN nas_storage_total_bytes WHEN $33 THEN $34 ELSE NULL END,
 		    nas_storage_free_bytes=CASE WHEN $33::boolean IS NULL THEN nas_storage_free_bytes WHEN $33 THEN $35 ELSE NULL END,
-		    nas_storage_reported_at=CASE WHEN $33::boolean IS NULL THEN nas_storage_reported_at WHEN $33 THEN now() ELSE NULL END,
+		    nas_storage_reported_at=CASE WHEN $33::boolean IS NULL THEN nas_storage_reported_at WHEN $33 THEN proof.at ELSE NULL END,
+            nas_storage_client_version=CASE WHEN $33::boolean IS NULL THEN nas_storage_client_version WHEN $33 AND proof.budget_at IS NOT NULL THEN $43 ELSE '' END,
+            nas_storage_budget_at=CASE WHEN $33::boolean IS NULL THEN nas_storage_budget_at WHEN $33 THEN proof.budget_at ELSE NULL END,
+            nas_storage_challenge_nonce=$45,nas_storage_challenge_issued_at=proof.at,
 		    nas_capacity_blocked=$40,
 		    joined_protocol_version=$41,
 		    updated_at=now()
-		WHERE id=$42 AND api_key_id=$23 AND account_id=$24
+		FROM proof WHERE id=proof.proof_id AND id=$42 AND api_key_id=$23 AND account_id=$24
 	`, req.CursorID, req.ClipsPulled, req.BytesPulled, req.ClientVersion,
 		req.ClientStartedAt, req.ClientBootID, req.ClientPhase, req.ClientPreviousExit,
 		req.ClientLastSuccess, redactNASClientLogLine(req.ClientLastError), req.ClientLastErrorAt,
@@ -1067,7 +1087,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		inventoryClips, inventoryBytes, inventoryMismatches, inventoryUnmatched, inventoryDigest,
 		storageAvailable(req.Storage), storageTotal(req.Storage), storageFree(req.Storage),
 		inventoryScanPassStartedAt, inventoryRowsVisited, inventoryRowsSkipped, inventorySkipReasonsJSON,
-		req.CapacityBlocked, effectiveProtocol, connectionID)
+		req.CapacityBlocked, effectiveProtocol, connectionID, nasStorageBudgetVersion(req.ClientVersion), storageChallenge(req.Storage), storageNonce, int64(NASStorageBudgetMaxAge/time.Second))
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("heartbeat: %v", err))
 		return
@@ -1180,7 +1200,14 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		return
 	}
 	proofMode, proofActivation := stitchProofActivation(s.cfg.NASStitchProofTaskID, connectionID, req.ClientVersion, s.cfg.NASStitchProofActivationID)
+	// Legacy joined/proof readers reject unknown control fields. V5 consumes
+	// this private token before passing the response to that unchanged reader.
+	responseNonce := ""
+	if req.ClientVersion == NASStorageBudgetClientVersion {
+		responseNonce = storageNonce
+	}
 	util.WriteJSON(w, http.StatusOK, connectionHeartbeatResponse{
+		StorageChallengeNonce:   responseNonce,
 		ListingEnabled:          connectionID == 13 && listingEnabled,
 		StitchProofTaskID:       proofMode,
 		StitchProofActivationID: proofActivation,

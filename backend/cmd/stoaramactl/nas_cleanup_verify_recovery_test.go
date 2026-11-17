@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func TestNASCleanupVerifyRecoveryHeadsEveryIssuedItem(t *testing.T) {
@@ -17,9 +18,13 @@ func TestNASCleanupVerifyRecoveryHeadsEveryIssuedItem(t *testing.T) {
 		"items":   []any{item("ok", "stoarama", 5), item("gone", "stoarama", 5), item("short", "stoarama", 5), item("ok", "other", 5), item("never-issued", "stoarama", 5)},
 		"results": []any{result(1, 1, true), result(2, 2, true), result(3, 3, true), result(4, 4, true), result(5, 5, false)},
 	}
+	before := time.Now()
 	sum, err := verifyNASCleanupRecovery(context.Background(), report, store)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if sum.CheckedAt.Before(before) || sum.CheckedAt.After(time.Now()) {
+		t.Fatal("canonical check timestamp missing or fabricated")
 	}
 	if sum.Issued != 4 || sum.Verified != 1 || sum.Problems != 3 || sum.ByStatus["missing"] != 1 || sum.ByStatus["size_mismatch"] != 1 || sum.ByStatus["bucket_mismatch"] != 1 {
 		t.Fatalf("summary %+v", sum)
