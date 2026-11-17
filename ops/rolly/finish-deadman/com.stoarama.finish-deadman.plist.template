@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.stoarama.finish-deadman</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string><string>__INSTALL__/deadman.py</string>
+    <string>--ssh-target</string><string>__SSH_TARGET__</string>
+    <string>--status-path</string><string>__STATUS_PATH__</string>
+    <string>--state</string><string>__STATE__</string>
+    <string>--notify-agent</string><string>__NOTIFY_AGENT__</string>
+  </array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/Users/rolly/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>__STATE__/deadman.log</string>
+  <key>StandardErrorPath</key><string>__STATE__/deadman.log</string>
+</dict></plist>
