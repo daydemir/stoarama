@@ -524,9 +524,15 @@ release slot. Local tests compare the indexed predicate with the old view.
 Release sequence, to be executed only by the assigned controller:
 
 1. Keep the existing runner STOP and maintenance fence under their owner's
-   control. Prepare and verify the immutable `r2-copy-v6` client artifact but do not start it.
-   The controller must quiesce the client for the cutover: old clients reject
-   the added collated cursor field. Same-version publication is unsupported. COPY's two-second transport budget is unchanged.
+   control. Confirm the reviewed 0205 schema (including
+   `r2_keep28_refresh_control` and `nas_r2_copy_items.work_mode`) is installed
+   before deployment: ordinary COPY leases also require it. Refresh activation
+   remains a separate controller decision. Prepare and verify the immutable `r2-copy-v6` client artifact but do not start it.
+   The controller must inventory and quiesce **every caller** of the collated
+   route for cutover, including callers whose collated policy is disabled: old
+   clients reject the added cursor field. Scope is not assumed to be connection13
+   alone. Resume each caller only with a compatible immutable artifact.
+   Same-version publication is unsupported. COPY's two-second transport budget is unchanged.
 2. Apply only migration `0206_nas_cleanup_manifest_keys.sql` through the migration
    CLI using a staged migration directory containing that file. It creates the
    immutable projection independently and records it in `schema_migrations`.

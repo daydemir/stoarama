@@ -53,6 +53,7 @@ class CollatedDownloadTests(unittest.TestCase):
         self.runtime.capacity_reserved_bytes = 0
         self.runtime.capacity_blocked = False
         self.runtime.collated_after_id = 0
+        self.runtime.collated_next_poll = 0.0
         self.requests = []
         self.acks = []
         self.errors = []
@@ -85,6 +86,7 @@ class CollatedDownloadTests(unittest.TestCase):
 
     def drain(self, **kwargs):
         self.runtime.collated_after_id = 0
+        self.runtime.collated_next_poll = 0.0
         with mock.patch.object(pull, "request_json", side_effect=self.fake_request_json(**kwargs)), \
                 mock.patch.object(pull, "open_joined_url", side_effect=self.fake_open), \
                 mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**13, "free_bytes": 10**13}):
@@ -93,7 +95,8 @@ class CollatedDownloadTests(unittest.TestCase):
     def test_cursor_advances_empty_pages_and_revisits_after_exhaustion(self):
         policy = {"enabled": True, "download_bytes_per_sec": 1 << 20, "download_parallel": 1}
         pages = [{"policy": policy, "items": [], "next_after_id": n} for n in (1000, 2000, 0, 1000)]
-        with mock.patch.object(pull, "request_json", side_effect=pages) as request:
+        with mock.patch.object(pull, "request_json", side_effect=pages) as request, \
+                mock.patch.object(pull.time,"monotonic",side_effect=[0,10,20,30]):
             for expected in (1000, 2000, 0, 1000):
                 self.assertFalse(pull.drain_collated(self.cfg, self.runtime, threading.Event()))
                 self.assertEqual(self.runtime.collated_after_id, expected)
@@ -116,10 +119,38 @@ class CollatedDownloadTests(unittest.TestCase):
         self.assertEqual(scans, [0, 1000, 2000])
         self.assertEqual([c.args[0] for c in wait.call_args_list], [10, 10])
 
+    def test_empty_collated_poll_has_own_clock_during_joined_progress(self):
+        stop = threading.Event()
+        clock = [0.0]
+        joined = []
+        self.runtime.joined_background_enabled = lambda: True
+        policy = {"enabled": True, "download_bytes_per_sec": 1 << 20, "download_parallel": 1}
+        def deliver_joined(*args, **kwargs):
+            joined.append(clock[0])
+            clock[0] += 1
+            if len(joined) == 4:
+                stop.set()
+            return True
+        with mock.patch.object(pull.time,"monotonic",side_effect=lambda:clock[0]), \
+                mock.patch.object(pull,"request_json",return_value={"policy":policy,"items":[],"next_after_id":1000}) as request, \
+                mock.patch.object(pull,"drain_joined",side_effect=deliver_joined), \
+                mock.patch.object(pull.NAS_MEDIA_FENCE,"wait_maintenance",return_value=True), \
+                mock.patch.object(stop,"wait",return_value=False) as wait:
+            pull.joined_loop(self.cfg,self.runtime,stop)
+            self.assertEqual(request.call_count,1)
+            self.assertEqual(len(joined),4)
+            wait.assert_not_called()
+            clock[0] = 10
+            request.return_value = {"policy":policy,"items":[],"next_after_id":2000}
+            self.assertFalse(pull.drain_collated(self.cfg,self.runtime,threading.Event()))
+            self.assertEqual(request.call_count,2)
+            self.assertEqual(self.runtime.collated_after_id,2000)
+
     def test_cursor_rejects_nonforward_or_wrong_type(self):
         policy = {"enabled": True, "download_bytes_per_sec": 1 << 20, "download_parallel": 1}
         self.runtime.collated_after_id = 1000
         for cursor in (True, -1, 1000, 999, "2000"):
+            self.runtime.collated_next_poll = 0.0
             with mock.patch.object(pull, "request_json", return_value={"policy": policy, "items": [], "next_after_id": cursor}):
                 with self.assertRaises(RuntimeError):
                     pull.drain_collated(self.cfg, self.runtime, threading.Event())

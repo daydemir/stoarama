@@ -83,9 +83,9 @@ pulls those rows directly:
    and backoff can produce an empty page with a nonzero cursor. Advance that
    cursor even on empty pages; zero means exhausted. Start a fresh scan at zero
    after exhaustion, so expired backoff and late old-hour publications are retried.
-   The client drains pages alongside generation-1 joined work. Empty pages wait
-   for the normal poll interval (capped at ten seconds), bounding idle
-   database duty while still advancing through withheld prefixes.
+   The client drains pages alongside generation-1 joined work. Empty/error pages use their own
+   next-poll time (normal poll interval capped at ten seconds), independent of
+   successful generation-1 joined downloads, bounding idle database duty while still advancing through withheld prefixes.
 2. `GET /api/v1/account/collated/{id}/download` presigns the exact object.
 3. The client downloads to a hidden partial beside the final path, verifies
    size and SHA-256, fsyncs, links it into place without overwriting, and

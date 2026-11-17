@@ -1870,6 +1870,7 @@ class Runtime:
         self.joined_work_credit = 0
         self.cursor_id = max(0, int(progress.get("after_id", 0)))
         self.collated_after_id = 0
+        self.collated_next_poll = 0.0
         self.clips_pulled = max(0, int(progress.get("clips_pulled", 0)))
         self.bytes_pulled = max(0, int(progress.get("bytes_pulled", 0)))
         self.phase = Phase.STARTING
@@ -24083,6 +24084,11 @@ def drain_collated(cfg, runtime, stop_event):
     """Deliver one page of collated outputs. Returns True when any output landed."""
     if cfg.dry_run:
         return False
+    now = time.monotonic()
+    if now < runtime.collated_next_poll:
+        return False
+    # This lane's idle/error pacing is independent of joined-download progress.
+    runtime.collated_next_poll = now + min(cfg.poll_interval_sec, 10)
     page = request_json(cfg, "GET", "/account/collated?limit=%d&after_id=%d" % (COLLATED_PAGE_LIMIT, runtime.collated_after_id))
     if not isinstance(page, dict) or set(page) != {"policy", "items", "next_after_id"} or not isinstance(page["items"], list):
         raise RuntimeError("collated response is invalid")
@@ -24133,6 +24139,8 @@ def drain_collated(cfg, runtime, stop_event):
                 stopped = exc
     if stopped is not None and not delivered:
         log("INFO", "collated delivery paused: %s" % stopped)
+    if delivered:
+        runtime.collated_next_poll = 0.0
     return bool(delivered)
 
 
