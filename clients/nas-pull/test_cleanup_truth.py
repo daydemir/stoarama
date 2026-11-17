@@ -197,16 +197,26 @@ class ClientMemoryTests(unittest.TestCase):
 
     def test_host_memory_refreshes_without_cached_or_stale_rss(self):
         facts = pull.HostFacts(Path('/unused-test-state'))
+        mem_values = iter((1000, 900, 800))
+        reads = []
         values = iter(('VmRSS: 100 kB\nVmHWM: 200 kB', 'VmRSS: 150 kB\nVmHWM: 300 kB', None))
         def read(path, *args):
+            reads.append(path)
+            if path in ('/proc/stat', '/proc/vmstat'):
+                self.assertEqual(args, (pull.PROC_DIAGNOSTIC_MAX_BYTES,))
+                return {'/proc/stat':'procs_running 2\nprocs_blocked 1', '/proc/vmstat':'pgmajfault 7'}[path]
             if path == '/proc/self/status':
                 self.assertEqual(args, (8192,))
                 return next(values)
             self.assertEqual(path, '/proc/meminfo')
-            return 'MemTotal: 4000 kB\nMemAvailable: 1000 kB'
+            self.assertEqual(args, ())
+            return 'MemTotal: 4000 kB\nMemAvailable: %d kB' % next(mem_values)
         with mock.patch.object(facts, '_gather_static', return_value={}), \
                 mock.patch.object(pull, '_read_text', side_effect=read):
             first, second, third = facts(), facts(), facts()
+        self.assertEqual(reads, ['/proc/meminfo', '/proc/stat', '/proc/vmstat', '/proc/self/status']*3)
+        self.assertEqual([f['mem_available_bytes'] for f in (first, second, third)], [1000*1024, 900*1024, 800*1024])
+        self.assertTrue(all(f['memory_diagnostics']['proc_stat']['procs_blocked'] == 1 for f in (first, second, third)))
         self.assertEqual(first['client_rss_bytes'], 100*1024)
         self.assertEqual(second['client_rss_bytes'], 150*1024)
         self.assertEqual(second['client_peak_rss_bytes'], 300*1024)

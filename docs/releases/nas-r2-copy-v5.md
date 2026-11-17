@@ -56,3 +56,14 @@ without rejecting valid liveness or existing host facts. Global decoding remains
 strict. COPY and stitch memory HOLD lines append the same bounded JSON snapshot.
 Existing resource parsers, floors, hold reasons, counters and retry waits remain
 unchanged.
+
+## Supported timestamp runtimes
+
+The central `parse_certification_timestamp` accepts RFC3339 fractions of 1–9
+digits, Z and explicit ±hh:mm offsets. It pads to six fractional digits for
+Python 3.9 and truncates sub-microsecond digits without rounding or extending
+expiry. There are no caller-specific shims or server timestamp changes.
+Malformed dates, fractions and offsets still fail. The pipeline harness requires
+an explicit `STOARAMA_TEST_PYTHON`; CI pins Python 3.9 rather than inheriting PATH.
+Jelly validation uses `/usr/bin/python3` (3.9.6) and an isolated exact 3.14.6
+interpreter matching the recorded NAS runtime, with no production execution.

@@ -19278,8 +19278,15 @@ def parse_certification_timestamp(value, field):
     raw = str(value or "").strip()
     if not raw:
         raise MediaCertificationError(f"{field} is required")
+    match = re.fullmatch(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]{1,9}))?(Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])", raw)
+    if match is None:
+        raise MediaCertificationError(f"{field} must be an ISO-8601 timestamp")
+    # Python 3.9 accepts only 3/6 fractional digits. Preserve representable
+    # microseconds, truncating sub-microsecond precision rather than extending expiry.
+    fraction = "." + match[2][:6].ljust(6, "0") if match[2] else ""
+    normalized = match[1] + fraction + ("+00:00" if match[3] == "Z" else match[3])
     try:
-        parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        parsed = datetime.datetime.fromisoformat(normalized)
     except ValueError as exc:
         raise MediaCertificationError(f"{field} must be an ISO-8601 timestamp") from exc
     if parsed.tzinfo is None:
