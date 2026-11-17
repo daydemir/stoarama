@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -15,7 +16,7 @@ class RecoveryRefreshTest(unittest.TestCase):
                 source = root / 'source'
                 source.write_text('#!/bin/sh\necho \'{"plan_id":1440}\'\n')
                 record = {'plan_id': 1440, 'plan_sha256': 'a' * 64, 'delete_ever_issued': 2,
-                          'verified': 2, 'problems': 0, 'checked_at': '2026-11-17T07:00:00Z',
+                          'verified': 2, 'problems': 0, 'checked_at': '2026-11-17T07:00:00.123456789Z',
                           'problem_items': [{'error': 'SECRET'}]}
                 cli = root / 'cli'
                 cli.write_text('#!/bin/sh\n' + ("echo '" + json.dumps(record) + "'\n" if success else 'echo SECRET >&2\nexit 1\n'))
@@ -23,7 +24,7 @@ class RecoveryRefreshTest(unittest.TestCase):
                 darma.write_text('#!/bin/sh\necho "$*" > "' + str(root / 'notification') + '"\n')
                 for executable in (source, cli, darma):
                     executable.chmod(0o700)
-                result = subprocess.run(['python3', str(script), '--cli', str(cli), '--state', str(root / 'state'),
+                result = subprocess.run([sys.executable, str(script), '--cli', str(cli), '--state', str(root / 'state'),
                                          '--plan-source', str(source), '--notify-agent', 'deniz'],
                                         env={**os.environ, 'PATH': str(root) + ':' + os.environ['PATH']}, capture_output=True)
                 self.assertEqual(result.returncode, 0 if success else 1)
@@ -61,6 +62,19 @@ class RecoveryInvalidationTest(unittest.TestCase):
                         self.assertEqual(refresh.main(),1)
                         self.assertIn('refresh_error',json.loads(canonical.read_text()))
                     notify.assert_called_once()
+
+
+class WireTimestampTest(unittest.TestCase):
+    def test_all_go_fraction_widths_on_supported_python(self):
+        import refresh_recovery as refresh
+        refresh.validate_checked_at('2026-11-17T07:00:00Z')
+        for width in range(1, 10):
+            with self.subTest(width=width):
+                refresh.validate_checked_at('2026-11-17T07:00:00.' + '123456789'[:width] + 'Z')
+                refresh.validate_checked_at('2026-11-17T07:00:00.' + '123456789'[:width] + '+00:00')
+        for value in (None, '2026-11-17T07:00:00', '2026-11-17T07:00:00.1234567890Z'):
+            with self.assertRaises(ValueError):
+                refresh.validate_checked_at(value)
 
 
 if __name__ == '__main__':

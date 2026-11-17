@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -28,7 +29,7 @@ else:
                 darma.write_text('#!/bin/sh\necho "$*" > "' + str(root / 'notification') + '"\n')
                 for executable in (collector, cli, darma):
                     executable.chmod(0o700)
-                result = subprocess.run(['python3', str(wrapper), '--cli', str(cli), '--state', str(root / 'state'),
+                result = subprocess.run([sys.executable, str(wrapper), '--cli', str(cli), '--state', str(root / 'state'),
                                          '--safety-collector', str(collector), '--notify-agent', 'deniz'],
                                         env={**os.environ, 'PATH': str(root) + ':' + os.environ['PATH']}, capture_output=True)
                 self.assertEqual(result.returncode, 0 if success else 1)
@@ -57,7 +58,7 @@ else:
                 darma.write_text('#!/bin/sh\necho "$*" > "' + str(root / 'notification') + '"\n')
                 for executable in (collector, cli, darma):
                     executable.chmod(0o700)
-                result = subprocess.run(['python3', str(wrapper), '--cli', str(cli), '--state', str(state),
+                result = subprocess.run([sys.executable, str(wrapper), '--cli', str(cli), '--state', str(state),
                                          '--safety-collector', str(collector), '--notify-agent', 'deniz'],
                                         env={**os.environ, 'PATH': str(root) + ':' + os.environ['PATH']}, capture_output=True)
                 self.assertEqual(result.returncode, 1)

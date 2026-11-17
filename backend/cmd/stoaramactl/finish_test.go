@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -435,5 +437,48 @@ func TestFinishLateTierReceiptAgeAndInclusiveDebitBoundary(t *testing.T) {
 	var reserved int64
 	if err := pool.QueryRow(ctx, finishLateDebitsSQL, cutoff).Scan(&reserved); err != nil || reserved != 100 {
 		t.Fatalf("T boundary not inclusive: %d %v", reserved, err)
+	}
+}
+
+func TestFinishPublicationMarginTracksClientConstants(t *testing.T) {
+	source, err := os.ReadFile("../../../clients/nas-pull/stoarama_pull.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func(pattern string) int {
+		t.Helper()
+		m := regexp.MustCompile(pattern).FindSubmatch(source)
+		if len(m) != 2 {
+			t.Fatalf("client sampling/HTTP contract changed: %s", pattern)
+		}
+		v, err := strconv.Atoi(string(m[1]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	heartbeat := read(`(?m)^HEARTBEAT_INTERVAL_SEC = ([0-9]+)$`)
+	sampleFactor := read(`(?m)^STORAGE_TELEMETRY_MAX_AGE_SEC = HEARTBEAT_INTERVAL_SEC \* ([0-9]+)$`)
+	timeout := read(`(?m)^HEARTBEAT_TIMEOUT_SEC = ([0-9]+)$`)
+	if time.Duration(heartbeat*sampleFactor)*time.Second != finishClientStorageMaxAge || time.Duration(timeout)*time.Second != finishClientHeartbeatTimeout || finishPublicationMargin != finishClientStorageMaxAge+finishClientHeartbeatTimeout {
+		t.Fatal("client bounds changed: update publication margin and retention proof")
+	}
+	asOf := time.Date(2026, 11, 17, 0, 0, 0, 0, time.UTC)
+	if !finishLateReceiptFresh(asOf, asOf.Add(-70*time.Second)) || finishLateReceiptFresh(asOf, asOf.Add(-70*time.Second-time.Nanosecond)) {
+		t.Fatal("publication margin boundary incorrect")
+	}
+}
+
+func TestFinishPublicationDelayCannotRespentOldSample(t *testing.T) {
+	pool, safety, copy := finishFixture(t, 1)
+	ctx := context.Background()
+	// sample t=0, terminal t=5, payload t=90, receipt t=100, tick t=187.
+	// Receipt age87s alone passes90s, but age+M197s exceeds the180s window.
+	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_reported_at=now()-interval '87 seconds';INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item,state,updated_at) VALUES(13,'raw',100,repeat('a',64),repeat('b',64),'{"size_bytes":100}','verified',now()-interval '182 seconds')`); err != nil {
+		t.Fatal(err)
+	}
+	status := finishRun(t, pool, safety, copy)
+	if status.ImportedItems != 0 || status.LateTierHold != finishLateReceiptStale || status.CleanupShouldRun {
+		t.Fatalf("stale pre-publication capacity spent: %+v", status)
 	}
 }

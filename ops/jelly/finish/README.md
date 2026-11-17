@@ -33,13 +33,15 @@ This also conservatively covers recently completed tiers 1/2 for at most T.
 It needs no publication ledger, completion-label inference or sample timestamp.
 
 Source: `clients/nas-pull/stoarama_pull.py:57-58` fixes the heartbeat at 30 seconds
-and maximum cached storage sample age at 3×30=90 seconds. The typed late-budget
-receipt limit is separately 90 seconds and T is twice that, 180 seconds. Terminal
-debits use an inclusive `>=` cutoff, retaining writes exactly T old. A receipt at
-most 90 seconds old plus sample age at most 90 seconds means an expired terminal
-debit is already represented in free bytes. The cleanup valve's separate freshness
-limit remains ten minutes. A 91-second-old receipt can therefore report a valve
-decision while withholding late-tier admission.
+and maximum cached storage sample age at 3×30=90 seconds. The heartbeat HTTP timeout
+is 20 seconds (`:56`, used by `send_heartbeat` at `:24997`). The typed publication
+margin M is their sum, 110 seconds; treat a sample as taken at receipt minus M.
+Late-debit freshness requires `(tick − receipt) + M <= T`, where T remains 180
+seconds. This leaves a useful 70-second receipt window at the normal 30-second
+heartbeat cadence. The source-contract test fails if either client bound changes.
+Terminal debits use an inclusive `>=` cutoff, retaining writes exactly T old.
+The cleanup valve's separate freshness limit remains ten minutes. No client
+clock comparison, new payload field or fallback is involved.
 
 Late budget subtracts these full-size reservations and the existing 16 MiB range
 reserve from free bytes above the unchanged floor. Status includes typed
@@ -165,6 +167,8 @@ v4 heartbeat provides local mismatch/hold evidence:
    the old canonical record, so it cannot remain consumable. Malformed JSON shapes
    also enter this failure path. It alerts and retains the last good
    result separately as `recovery-last-good.json` (never a fallback for collection).
+   Python 3.9 validates a normalized six-digit fractional copy of Go RFC3339Nano
+   timestamps; the canonical string itself is preserved byte-for-byte.
    The safety collector reads the canonical record, maps `delete_ever_issued` to
    `recovery_issued_items` and copies `checked_at` without modification; it fails
    on `refresh_error`. It does not invoke the slow verifier in its 90s budget.

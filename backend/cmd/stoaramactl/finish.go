@@ -24,9 +24,12 @@ const finishTarget = 10000
 const finishEvidenceAge = 5 * time.Minute
 const finishSpaceAge time.Duration = 10 * time.Minute
 
-// clients/nas-pull/stoarama_pull.py:57-58: 30s heartbeat, sample max age 3*30s.
-const finishLateReceiptAge time.Duration = 90 * time.Second
-const finishLateDebitWindow time.Duration = 2 * finishLateReceiptAge
+// Client source: stoarama_pull.py:57-58 (30s*3 sample age), :56 and
+// send_heartbeat():24997 (20s HTTP timeout). The source-contract test pins both.
+const finishClientStorageMaxAge time.Duration = 90 * time.Second
+const finishClientHeartbeatTimeout time.Duration = 20 * time.Second
+const finishPublicationMargin time.Duration = finishClientStorageMaxAge + finishClientHeartbeatTimeout
+const finishLateDebitWindow time.Duration = 2 * finishClientStorageMaxAge
 const finishCleanupHeadroom int64 = 300_000_000_000
 const finishRecoveryAge = 7 * time.Hour // six-hour refresh plus verification/scheduling margin
 const finishLock int64 = 7343226011199
@@ -339,6 +342,9 @@ func finishDepth(ctx context.Context, pool *pgxpool.Pool, status *finishStatus) 
 // Inclusive cutoff retains a terminal write completed exactly T ago.
 const finishLateDebitsSQL = `SELECT coalesce(sum((item->>'size_bytes')::bigint),0) FROM nas_r2_copy_items WHERE connection_id=13 AND kind='raw' AND (state IN ('pending','leased') OR (state IN ('verified','blocked') AND updated_at >= $1))`
 
+func finishLateReceiptFresh(asOf, receipt time.Time) bool {
+	return asOf.Sub(receipt)+finishPublicationMargin <= finishLateDebitWindow
+}
 func finishCleanupValve(ctx context.Context, pool *pgxpool.Pool, status *finishStatus) error {
 	status.CleanupShouldRun = false
 	if err := pool.QueryRow(ctx, `SELECT nas_storage_free_bytes,nas_storage_reported_at,clock_timestamp() FROM connections WHERE id=13`).Scan(&status.NASFreeBytes, &status.NASSpaceReportedAt, &status.NASSpaceCheckedAt); err != nil {
@@ -447,7 +453,7 @@ func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath st
 				}
 				return status, nil
 			}
-			if status.NASSpaceCheckedAt.Sub(*status.NASSpaceReportedAt) > finishLateReceiptAge {
+			if !finishLateReceiptFresh(status.NASSpaceCheckedAt, *status.NASSpaceReportedAt) {
 				status.LateTierHold = finishLateReceiptStale
 				return status, nil
 			}

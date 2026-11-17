@@ -16,6 +16,20 @@ from tick import notify
 FIELDS = ('plan_id', 'plan_sha256', 'delete_ever_issued', 'verified', 'problems', 'checked_at')
 
 
+def validate_checked_at(value):
+    # Go RFC3339Nano uses 1..9 fractional digits; Python 3.9 accepts only 3/6.
+    # Normalize only this validation copy. The published canonical string stays
+    # byte-for-byte unchanged, including its original nanosecond precision.
+    if not isinstance(value, str):
+        raise ValueError('invalid check time')
+    match = re.fullmatch(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})', value)
+    if match is None:
+        raise ValueError('invalid check time')
+    base, fraction, zone = match.groups()
+    normalized = base + ('.' + fraction.ljust(6, '0')[:6] if fraction else '') + zone.replace('Z', '+00:00')
+    datetime.fromisoformat(normalized)
+
+
 def publish(path, record):
     with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as output:
         temp = Path(output.name)
@@ -71,8 +85,7 @@ def main():
                     raise ValueError('invalid report counts')
             if not isinstance(record['plan_sha256'],str) or not re.fullmatch('[a-f0-9]{64}',record['plan_sha256']):
                 raise ValueError('invalid report digest')
-            if not isinstance(record['checked_at'],str) or datetime.fromisoformat(record['checked_at'].replace('Z','+00:00')).tzinfo is None:
-                raise ValueError('invalid check time')
+            validate_checked_at(record['checked_at'])
             if record['plan_id'] != plan or not record['checked_at']:
                 raise ValueError('wrong report')
             passed = (result.returncode == 0 and record['problems'] == 0
