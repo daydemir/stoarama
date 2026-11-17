@@ -133,6 +133,7 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
  CREATE TABLE delivery_nas_source_holds(clip_id bigint);
  CREATE TABLE delivery_keep_output_dependencies(output_id bigint,recording_id bigint);
  CREATE TABLE nas_cleanup_incident_files(kind text,source_id bigint);
+ CREATE TABLE nas_cleanup_incident_roster(kind text,source_id bigint,bucket text,object_key text);
  CREATE VIEW nas_cleanup_incident_sources AS SELECT source_id clip_id FROM nas_cleanup_incident_files;
  INSERT INTO recordings VALUES(1,3,'UTC'); INSERT INTO streams VALUES(3,'UTC');
  INSERT INTO recording_collation_hours VALUES(1,1);`)

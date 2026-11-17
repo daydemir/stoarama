@@ -21,8 +21,14 @@ inventory; delivery keys and source/output dependencies; stitch tools under
 Delivery remains protected pending Deniz's answer. No hold is inferred released
 from an exact NAS inventory record or a changed cleanup receipt.
 
-Incident identities come from `nas_cleanup_incident_files` and
-`nas_cleanup_incident_sources`, independently of mutable plan/receipt state.
+Permanent incidents have one immutable `nas_cleanup_incident_roster` descriptor
+view (53 direct identities, 25 exact R2 keys, 292 raw identities including the
+1414 collated-source dependencies). The compatibility views
+`nas_cleanup_incident_files` and
+`nas_cleanup_incident_sources` preserve their OIDs and derive from it, independently
+of mutable plan/receipt state. Kind namespaces and literal controller-supplied
+R2 keys are preserved; no R2 sidecar identity is inferred. Legacy release/owner
+checks and SQL reservation/output guards consume the same canonical roster.
 Missing required tables/views or unreadable holds fail the command. All unknown
 keys appear individually in JSONL and are ineligible for deletion. `deletable`
 is a planning classification only; this report grants no wire authority.

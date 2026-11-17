@@ -141,7 +141,11 @@ WHERE m.clip_id IS NULL AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_clean
 			return nil, rows.Err()
 		}
 	}
-	for _, id := range r2RetireIncidentSources {
+	incidentSources, err := loadR2RetireIncidentSources(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range incidentSources {
 		p.held[retireIdentity("raw", id)] = true
 	}
 	if m.Class == r2RetireOwnerAccepted {

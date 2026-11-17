@@ -149,10 +149,12 @@ const inverseHeldSQL = `
 WITH held_sources AS (
  SELECT kind,source_id FROM nas_cleanup_reserved_files
  UNION SELECT kind,source_id FROM nas_cleanup_incident_files
+ UNION SELECT 'raw',clip_id FROM nas_cleanup_incident_sources
  UNION SELECT 'raw',h.clip_id FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id
  WHERE p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued)
 ), held_keys AS (
- SELECT bucket,object_key FROM r2_retirement_reservations
+ SELECT bucket,object_key FROM nas_cleanup_incident_roster
+ UNION SELECT bucket,object_key FROM r2_retirement_reservations
  UNION SELECT bucket,object_key FROM r2_object_retirements
  UNION SELECT c.bucket,c.object_key FROM held_sources h JOIN recording_clips c ON h.kind='raw' AND c.id=h.source_id
  UNION SELECT $1,o.object_key FROM held_sources h JOIN recording_collation_outputs o ON h.kind='collated' AND o.id=h.source_id
