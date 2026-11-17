@@ -57,8 +57,8 @@ and `0 <= DB clock - nas_storage_budget_at <= T=180s`. T is shared server policy
 complete request accepted at t200 with challenge t60 still has budget time t60;
 a tick at t250 refuses it. There is no M/receipt arithmetic, HMAC secret, client
 clock comparison or fallback. The child's 20-second watchdog limits wasted work;
-it does not establish sample freshness. The separate cleanup valve retains its
-ten-minute storage-receipt bound. Holds never grant cleanup authority.
+it does not establish sample freshness. The separate cleanup valve requires the same proven sample, allowing its
+server issuance time and display receipt to be up to ten minutes old. Holds never grant cleanup authority.
 
 Late budget subtracts these full-size reservations and the existing 16 MiB range
 reserve from free bytes above the unchanged floor. Status includes typed
@@ -144,7 +144,9 @@ read current `connections.nas_storage_free_bytes` and `nas_storage_reported_at`
 directly. Recommend cleanup only if free bytes minus the unchanged 2 TB COPY
 floor is strictly below the typed 300 GB headroom threshold. The storage heartbeat
 must be no older than ten minutes (and no more than 30 seconds in the future).
-Missing/stale storage evidence gives no recommendation and a visible reason;
+The sample must also have an exact v5 proof whose server issuance is nonfuture
+and no older than ten minutes; a fresh display receipt alone has no authority.
+Missing/stale storage or challenge evidence gives no recommendation and a visible reason;
 it does not stop metadata feeding. Historical hold counters, memory holds,
 transport holds and empty queues do not decide the valve. The controller alone
 acts on the recommendation.

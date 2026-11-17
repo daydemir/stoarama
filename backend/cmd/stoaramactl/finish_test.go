@@ -441,7 +441,7 @@ func TestFinishLateTierChallengeAgeAndInclusiveDebitBoundary(t *testing.T) {
 
 func TestFinishServerBudgetTimeBoundary(t *testing.T) {
 	asOf := time.Date(2026, 11, 17, 0, 0, 0, 0, time.UTC)
-	if finishLateDebitWindow != 180*time.Second || !finishBudgetFresh(asOf, asOf.Add(-180*time.Second)) || finishBudgetFresh(asOf, asOf.Add(-180*time.Second-time.Nanosecond)) || finishBudgetFresh(asOf, asOf.Add(time.Nanosecond)) || finishBudgetFresh(asOf, time.Time{}) {
+	if finishLateDebitWindow != 180*time.Second || !finishProofFresh(asOf, asOf.Add(-180*time.Second), finishLateDebitWindow) || finishProofFresh(asOf, asOf.Add(-180*time.Second-time.Nanosecond), finishLateDebitWindow) || finishProofFresh(asOf, asOf.Add(time.Nanosecond), finishLateDebitWindow) || finishProofFresh(asOf, time.Time{}, finishLateDebitWindow) {
 		t.Fatal("server-issued budget boundary incorrect")
 	}
 }
@@ -527,6 +527,25 @@ func TestFinishDelayedLegacyTimelinesNeedNewV5Storage(t *testing.T) {
 			status = finishRun(t, pool, safety, copy)
 			if status.ImportedItems != 0 || !status.CleanupShouldRun || status.LateTierHold != finishLateSpaceLow {
 				t.Fatalf("fresh v5 sample not bounded: %+v", status)
+			}
+		})
+	}
+}
+
+func TestFinishCleanupRequiresProofNotDisplayReceipt(t *testing.T) {
+	for _, frame := range []struct{ name, mutation, reason string }{
+		{"nonce_missing", `nas_storage_budget_at=NULL,nas_storage_client_version=''`, "nas_space_proof_missing"},
+		{"old_proof", `nas_storage_budget_at=now()-interval '11 minutes'`, "nas_space_proof_stale"},
+		{"future_proof", `nas_storage_budget_at=now()+interval '1 hour'`, "nas_space_proof_stale"},
+	} {
+		t.Run(frame.name, func(t *testing.T) {
+			pool, safety, copy := finishFixture(t, 1)
+			if _, err := pool.Exec(context.Background(), `UPDATE connections SET nas_storage_free_bytes=2260000000000,nas_storage_reported_at=clock_timestamp(),`+frame.mutation); err != nil {
+				t.Fatal(err)
+			}
+			status := finishRun(t, pool, safety, copy)
+			if status.CleanupShouldRun || status.CleanupReason != frame.reason {
+				t.Fatalf("display receipt authorized cleanup: %+v", status)
 			}
 		})
 	}

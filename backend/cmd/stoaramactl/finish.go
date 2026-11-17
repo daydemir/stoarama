@@ -329,8 +329,8 @@ func finishDepth(ctx context.Context, pool *pgxpool.Pool, status *finishStatus) 
 // Inclusive cutoff retains a terminal write completed exactly T ago.
 const finishLateDebitsSQL = `SELECT coalesce(sum((item->>'size_bytes')::bigint),0) FROM nas_r2_copy_items WHERE connection_id=13 AND kind='raw' AND (state IN ('pending','leased') OR (state IN ('verified','blocked') AND updated_at >= $1))`
 
-func finishBudgetFresh(asOf, issued time.Time) bool {
-	return !issued.IsZero() && !issued.After(asOf) && asOf.Sub(issued) <= finishLateDebitWindow
+func finishProofFresh(asOf, issued time.Time, maxAge time.Duration) bool {
+	return !issued.IsZero() && !issued.After(asOf) && asOf.Sub(issued) <= maxAge
 }
 func finishCleanupValve(ctx context.Context, pool *pgxpool.Pool, status *finishStatus) error {
 	status.CleanupShouldRun = false
@@ -343,6 +343,14 @@ func finishCleanupValve(ctx context.Context, pool *pgxpool.Pool, status *finishS
 	}
 	status.CleanupReason = "nas_space_heartbeat_stale"
 	if status.NASSpaceCheckedAt.Sub(*status.NASSpaceReportedAt) > finishSpaceAge || status.NASSpaceReportedAt.Sub(status.NASSpaceCheckedAt) > 30*time.Second {
+		return nil
+	}
+	status.CleanupReason = "nas_space_proof_missing"
+	if status.NASSpaceClientVersion != api.NASStorageBudgetClientVersion || status.NASStorageBudgetAt == nil {
+		return nil
+	}
+	status.CleanupReason = "nas_space_proof_stale"
+	if !finishProofFresh(status.NASSpaceCheckedAt, *status.NASStorageBudgetAt, finishSpaceAge) {
 		return nil
 	}
 	status.CleanupReason = "nas_headroom_sufficient"
@@ -434,19 +442,19 @@ func finishTick(ctx context.Context, pool *pgxpool.Pool, safetyPath, copyPath st
 			if e = finishCleanupValve(ctx, pool, &status); e != nil {
 				return status, finishDatabase
 			}
+			if status.NASSpaceClientVersion != api.NASStorageBudgetClientVersion {
+				status.LateTierHold = finishLateClientUnknown
+				return status, nil
+			}
+			if status.NASStorageBudgetAt == nil || !finishProofFresh(status.NASSpaceCheckedAt, *status.NASStorageBudgetAt, finishLateDebitWindow) {
+				status.LateTierHold = finishLateProofStale
+				return status, nil
+			}
 			if status.CleanupReason != "nas_headroom_sufficient" {
 				status.LateTierHold = finishLateSpaceUnknown
 				if status.CleanupShouldRun {
 					status.LateTierHold = finishLateSpaceLow
 				}
-				return status, nil
-			}
-			if status.NASSpaceClientVersion != api.NASStorageBudgetClientVersion {
-				status.LateTierHold = finishLateClientUnknown
-				return status, nil
-			}
-			if status.NASStorageBudgetAt == nil || !finishBudgetFresh(status.NASSpaceCheckedAt, *status.NASStorageBudgetAt) {
-				status.LateTierHold = finishLateProofStale
 				return status, nil
 			}
 			if e = pool.QueryRow(ctx, finishLateDebitsSQL, status.NASSpaceCheckedAt.Add(-finishLateDebitWindow)).Scan(&status.QueueReservedBytes); e != nil {
