@@ -275,6 +275,10 @@ func partitionInverse(ctx context.Context, store inverseLister, p inverseProtect
 }
 
 func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
+	if len(args) > 0 && args[0] == "apply" {
+		runR2InverseApply(ctx, cfg, args[1:])
+		return
+	}
 	const usage = "usage: stoaramactl r2-inverse partition --picks FILE --out DIR (read-only full bucket partition)"
 	if len(args) == 0 || args[0] != "partition" {
 		log.Fatal(usage)
