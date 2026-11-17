@@ -61,3 +61,7 @@ class CleanupFreshPermitTests(unittest.TestCase):
             self.run_group(tasks)
         self.assertFalse(self.phases())
         self.assertTrue(all((self.cfg.output_dir/t["item"]["relative_path"]).exists() for t in tasks))
+
+
+class R2CopyV4FreshPermitTests(CleanupFreshPermitTests):
+    version = "r2-copy-v4"

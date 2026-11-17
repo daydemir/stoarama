@@ -158,6 +158,7 @@ class R2CopyControlTests(unittest.TestCase):
         self.assertEqual(refused.exception.code, 409)
         self.control.request_json(Operation.RESULT, "/ok")
         self.assertEqual(self.control.process.pid, pid)
+        self.assertEqual(len(set(self.connections[:3])), 1)  # Fully read HTTP failure keeps the same socket.
         with self.assertRaises(pull.R2CopyHold):
             self.control.request_json(Operation.LEASE, "/redirect")
         self.assertEqual(self.last_values()["status"], 302)
@@ -197,7 +198,7 @@ class R2CopyControlTests(unittest.TestCase):
         with mock.patch.object(pull, "request_json", side_effect=lambda *a, **kw: payloads.append(kw["body"])):
             pull.client_log_upload_once(self.cfg, SimpleNamespace(boot_id="fixture"), None, 0)
         lines = [entry["message"] for entry in payloads[0]["lines"]]
-        self.assertEqual(len(lines), 1 + 2 * len(Operation))  # READY plus success/refusal for every operation.
+        self.assertEqual(len(lines), 1 + 4 * len(Operation))  # READY plus success/refusal for every operation.
         for operation in Operation:
             for status in (200, 409):
                 self.assertTrue(any("operation=%d " % operation.value in line and line.endswith("status=%d" % status) for line in lines))
@@ -270,9 +271,11 @@ class R2CopyControlTests(unittest.TestCase):
         child = pull.R2_COPY_CONTROL_CHILD.replace(
             "context=ssl.create_default_context()",
             "context=ssl.create_default_context()\nimport socket\nsocket.getaddrinfo=lambda *a,**k: time.sleep(3)")
-        with mock.patch.object(pull, "R2_COPY_CONTROL_CHILD", child), self.assertRaises(pull.R2CopyHold):
+        with mock.patch.object(pull, "R2_COPY_CONTROL_CHILD", child), \
+                mock.patch.object(pull, "R2_COPY_CONNECT_TIMEOUT", .3), self.assertRaises(pull.R2CopyHold):
             self.control.request_json(Operation.LEASE, "/ok", timeout=.3)
-        self.assertEqual(self.last_values()["request_sent_ms"], -1)
+        self.assertEqual(self.last_values()["phase"], 3)
+        self.assertEqual(self.last_values()["connect_ready_ms"], -1)
         self.assertEqual(self.requests, [])
         self.assertIsNone(self.control.process)
         self.control.start()

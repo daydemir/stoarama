@@ -52247,6 +52247,7 @@ R2_COPY_SPACE_GUARD = 2 * R2_COPY_WORKERS * R2_COPY_RANGE
 R2_COPY_CHUNK = 256 * 1024
 R2_COPY_TIMEOUT = 2
 R2_COPY_STARTUP_TIMEOUT = 15
+R2_COPY_CONNECT_TIMEOUT = 15
 
 
 class R2CopyHold(RuntimeError):
@@ -52419,6 +52420,7 @@ class R2CopyControlFrame(Enum):
     STATUS = 4
     BODY = 5
     ERROR = 6
+    CONNECTED = 7
 
 
 # One owned process per worker amortizes imports and TLS context initialization.
@@ -52430,15 +52432,8 @@ connection=None
 origin=None
 def emit(*values):
     sys.stdout.buffer.write((json.dumps(values)+"\n").encode());sys.stdout.buffer.flush()
-def request(p):
+def prepare(p):
     global connection,origin
-    started=time.monotonic()
-    def elapsed():return round((time.monotonic()-started)*1000)
-    class Response(http.client.HTTPResponse):
-        def begin(self):
-            if self.fp.peek(1):emit(3,elapsed())
-            super().begin()
-            emit(4,self.status)
     url=urllib.parse.urlsplit(p["url"])
     target=(url.scheme,url.hostname,url.port)
     if url.scheme not in ("https","http") or not url.hostname or url.username or url.password or url.fragment:
@@ -52455,11 +52450,23 @@ def request(p):
     if connection is None:
         cls=http.client.HTTPSConnection if url.scheme=="https" else http.client.HTTPConnection
         kwargs={"context":context} if url.scheme=="https" else {}
-        connection=cls(url.hostname,url.port,timeout=2,**kwargs)
-        connection.response_class=Response
+        connection=cls(url.hostname,url.port,timeout=15,**kwargs)
         connection.auto_open=0
-    connection.response_class=Response
     if connection.sock is None:connection.connect()
+    emit(7)
+def request(p):
+    started=time.monotonic()
+    def elapsed():return round((time.monotonic()-started)*1000)
+    class Response(http.client.HTTPResponse):
+        def begin(self):
+            if self.fp.peek(1):emit(3,elapsed())
+            super().begin()
+            emit(4,self.status)
+    url=urllib.parse.urlsplit(p["url"])
+    if (url.scheme,url.hostname,url.port)!=origin or connection is None or connection.sock is None:
+        raise OSError("control connection is not prepared")
+    connection.response_class=Response
+    connection.sock.settimeout(2)
     connection.request("POST",urllib.parse.urlunsplit(("","",url.path or "/",url.query,"")),
         body=base64.b64decode(p["body"]) if p["body"] is not None else None,headers=p["headers"])
     emit(2,elapsed())
@@ -52476,7 +52483,9 @@ while True:
     if not line:break
     try:
         if len(line)>32768 or not line.endswith(b"\n"):raise OSError("input exceeds bound")
-        request(json.loads(line))
+        p=json.loads(line)
+        if p.get("prepare") is True:prepare(p)
+        else:request(p)
         line=b""
     except Exception:
         emit(6)
@@ -52592,11 +52601,43 @@ class R2CopyControl:
             log("INFO", "R2 copy lease-control phase=1 worker=%d generation=%d startup_ready_ms=%d total_ms=%d status=-1" %
                 (self.worker, self.generation, self.startup_ms, round((time.monotonic() - started) * 1000)))
 
+    def prepare(self):
+        # This phase has its own bound, before the POST's two-second timer.
+        # There are no credentials or operation bytes in the prepare command.
+        import select
+        started = time.monotonic()
+        deadline = started + R2_COPY_CONNECT_TIMEOUT
+        message = (json.dumps({"prepare": True, "url": self.cfg.api_base}) + "\n").encode()
+        if len(message) > 32768:
+            raise R2CopyHold("copy control origin exceeds bound")
+        ready = -1
+        try:
+            offset = 0
+            while offset < len(message):
+                self.check(deadline)
+                _, writable, _ = select.select([], [self.process.stdin], [], min(.2, max(0, deadline-time.monotonic())))
+                if writable:
+                    try:
+                        offset += os.write(self.process.stdin.fileno(), message[offset:])
+                    except BlockingIOError:
+                        pass
+            if self.frame(deadline) != (R2CopyControlFrame.CONNECTED, []):
+                raise R2CopyHold("invalid copy control connection ready")
+            self.check(deadline)
+            ready = round((time.monotonic()-started)*1000)
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            log("INFO", "R2 copy lease-control phase=3 worker=%d generation=%d connect_ready_ms=%d total_ms=%d status=-1" %
+                (self.worker,self.generation,ready,round((time.monotonic()-started)*1000)))
+
     def request_json(self, operation, path, body=None, timeout=R2_COPY_TIMEOUT):
         import select
         if not isinstance(operation, R2CopyControlOperation):
             raise ValueError("invalid copy control operation")
         self.start()
+        self.prepare()
         self.sequence += 1
         message = (json.dumps({"url": self.cfg.api_base + path,
                    "headers": {"User-Agent": USER_AGENT, "Authorization": "Bearer " + self.cfg.api_key,

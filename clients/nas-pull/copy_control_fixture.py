@@ -18,6 +18,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
     parser.add_argument("--ca-file")
+    parser.add_argument("--connect-timeout", type=float, default=15)
     parser.add_argument("--sequential", action="store_true")
     parser.add_argument("--timeout", type=float, default=2)
     args = parser.parse_args()
@@ -32,6 +33,7 @@ def main():
     spec = importlib.util.spec_from_file_location("copy_fixture_pull", Path(__file__).with_name("stoarama_pull.py"))
     pull = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(pull)
+    pull.R2_COPY_CONNECT_TIMEOUT = args.connect_timeout
     pull.CLIENT_VERSION = "r2-copy-v3"
     pull.USER_AGENT = "stoarama-nas-pull/" + pull.CLIENT_VERSION
     if args.ca_file:
