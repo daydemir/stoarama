@@ -184,7 +184,7 @@ func r2HoldReleasePlan(ctx context.Context, q r2RetireQuerier, picks r2RetirePic
 		incident[id] = true
 	}
 	collatedIncident := map[int64]bool{}
-	rows, err = q.Query(ctx, `SELECT id FROM recording_collation_outputs WHERE source_clip_ids && $1::bigint[]`, incidentSources)
+	rows, err = q.Query(ctx, `SELECT id FROM recording_collation_outputs WHERE source_clip_ids && $1::bigint[] UNION SELECT source_id FROM nas_cleanup_incident_files WHERE kind='collated'`, incidentSources)
 	if err != nil {
 		return m, err
 	}
