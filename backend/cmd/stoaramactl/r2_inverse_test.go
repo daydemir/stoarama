@@ -273,3 +273,95 @@ func TestR2InversePartitionTxReadOnlyCatalogBudget(t *testing.T) {
 		t.Fatalf("transaction_read_only got %q want on", readOnly)
 	}
 }
+
+// inverseKEFoldersPreJoinOracleSQL is the pre-fix loadInverseKEFolders query: its
+// KE collation-source branch ran EXISTS(source_clip_ids @> ARRAY[c.id]) per clip.
+// Kept verbatim as the oracle for the join rewrite's equivalence test.
+const inverseKEFoldersPreJoinOracleSQL = `SELECT DISTINCT folder FROM (
+ SELECT split_part(regexp_replace(c.display_path,'^joined/',''),'/',1) folder FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE c.bucket=$1 AND r.stream_id=ANY($2::bigint[])
+ UNION SELECT split_part(regexp_replace(o.nas_relative_path,'^joined/',''),'/',1) FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id JOIN recordings r ON r.id=h.recording_id WHERE r.stream_id=ANY($2::bigint[])
+ UNION SELECT split_part(regexp_replace(c.display_path,'^joined/',''),'/',1) FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE r.stream_id=ANY($2::bigint[]) AND EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.source_clip_ids @> ARRAY[c.id])) folders WHERE folder<>''`
+
+func TestR2InverseKEFoldersMatchPreJoinOracle(t *testing.T) {
+	ctx := context.Background()
+	pool := joinedPurgeTestPool(t, "inverse_ke_folders")
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`CREATE TABLE recordings(id bigint,stream_id bigint,cron_timezone text DEFAULT 'UTC');
+ CREATE TABLE recording_clips(id bigint,recording_id bigint,bucket text,object_key text,display_path text,clip_start_at timestamptz,clip_end_at timestamptz,sha256 text DEFAULT '',size_bytes bigint DEFAULT 1);
+ CREATE TABLE recording_collation_hours(id bigint,recording_id bigint);
+ CREATE TABLE recording_collation_outputs(id bigint,collation_hour_id bigint,object_key text,nas_relative_path text,start_at timestamptz,end_at timestamptz,source_clip_ids bigint[],sha256 text DEFAULT '',size_bytes bigint DEFAULT 1);
+ INSERT INTO recordings VALUES(1,3,'UTC'),(2,4,'UTC');`)
+	picks := r2RetirePicks{Choices: map[int64]r2RetirePick{3: {Choice: "all"}, 4: {Choice: "none"}}}
+	// KE stream (3) is Keep Everything; stream 4 is not.
+	exec(`INSERT INTO recording_clips VALUES
+ (1,1,'bucket','ke_shared','joined/KEShared/clip.mp4','2026-06-01','2026-06-02','',1),
+ (2,1,'other','ke_foreign','joined/KEOnlyRaw/deep/clip.mp4','2026-06-01','2026-06-02','',1),
+ (3,1,'other','ke_not_source','joined/KENotSource/clip.mp4','2026-06-01','2026-06-02','',1),
+ (4,2,'other','non_ke_source','joined/NonKE/clip.mp4','2026-06-01','2026-06-02','',1),
+ (5,1,'bucket','plain','PlainFolder/clip.mp4','2026-06-01','2026-06-02','',1),
+ (6,1,'bucket','empty_folder','joined/','2026-06-01','2026-06-02','',1)`)
+	exec(`INSERT INTO recording_collation_hours VALUES(1,1)
+ ,(2,2)`)
+	// One output with several source ids and a duplicate; clip 3 and 4 are not
+	// sources of anything, clip 4 is a source only of the stream-4 hour's output.
+	exec(`INSERT INTO recording_collation_outputs(id,collation_hour_id,object_key,nas_relative_path,start_at,end_at,source_clip_ids) VALUES
+ (10,1,'collated_hour','joined/CollatedHour/hour.mp4','2026-06-01','2026-06-02',ARRAY[1,2,6,1]::bigint[]),
+ (11,2,'non_ke_collated','joined/NonKECollated/hour.mp4','2026-06-01','2026-06-02',ARRAY[4,4]::bigint[])`)
+	streams := []int64{3}
+	rows, err := pool.Query(ctx, inverseKEFoldersPreJoinOracleSQL, "bucket", streams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oracle := map[string]bool{}
+	for rows.Next() {
+		var folder string
+		if err = rows.Scan(&folder); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		oracle[folder] = true
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadInverseKEFolders(ctx, pool, "bucket", picks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"KEShared": true, "KEOnlyRaw": true, "CollatedHour": true, "PlainFolder": true}
+	for folder := range want {
+		if !got[folder] {
+			t.Fatalf("missing folder %q in %v", folder, got)
+		}
+	}
+	for folder := range got {
+		if !oracle[folder] {
+			t.Fatalf("folder %q absent from pre-join oracle %v", folder, oracle)
+		}
+	}
+	for folder := range oracle {
+		if !got[folder] {
+			t.Fatalf("folder %q missing from join query %v", folder, got)
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("folder set %v want %v", got, want)
+	}
+	// KEOnlyRaw comes only from branch 3 (no bucket filter, foreign bucket): it is
+	// what proves the fixture exercises the rewritten branch at all.
+	if !oracle["KEOnlyRaw"] || !got["KEOnlyRaw"] {
+		t.Fatalf("fixture does not exercise branch 3: %v / %v", got, oracle)
+	}
+	for _, folder := range []string{"KENotSource", "NonKE", "NonKECollated", ""} {
+		if got[folder] || oracle[folder] {
+			t.Fatalf("unexpected folder %q in %v / %v", folder, got, oracle)
+		}
+	}
+}

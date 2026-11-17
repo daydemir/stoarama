@@ -394,7 +394,7 @@ func loadInverseKEFolders(ctx context.Context, q r2RetireQuerier, bucket string,
 	rows, err := q.Query(ctx, `SELECT DISTINCT folder FROM (
  SELECT split_part(regexp_replace(c.display_path,'^joined/',''),'/',1) folder FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE c.bucket=$1 AND r.stream_id=ANY($2::bigint[])
  UNION SELECT split_part(regexp_replace(o.nas_relative_path,'^joined/',''),'/',1) FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id JOIN recordings r ON r.id=h.recording_id WHERE r.stream_id=ANY($2::bigint[])
- UNION SELECT split_part(regexp_replace(c.display_path,'^joined/',''),'/',1) FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE r.stream_id=ANY($2::bigint[]) AND EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.source_clip_ids @> ARRAY[c.id])) folders WHERE folder<>''`, bucket, streams)
+ UNION SELECT split_part(regexp_replace(c.display_path,'^joined/',''),'/',1) FROM recording_collation_outputs o CROSS JOIN LATERAL unnest(o.source_clip_ids) source_id JOIN recording_clips c ON c.id=source_id JOIN recordings r ON r.id=c.recording_id WHERE r.stream_id=ANY($2::bigint[])) folders WHERE folder<>''`, bucket, streams)
 	if err != nil {
 		return nil, err
 	}
