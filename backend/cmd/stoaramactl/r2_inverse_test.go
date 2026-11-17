@@ -16,7 +16,8 @@ import (
 
 type inverseTestListing []r2.ObjectInfo
 
-func (s inverseTestListing) Bucket() string { return "bucket" }
+func (s inverseTestListing) Bucket() string         { return "bucket" }
+func (s inverseTestListing) EndpointSHA256() string { return r2tSHA }
 func (s inverseTestListing) ListPrefix(_ context.Context, prefix string, limit int, fn func(r2.ObjectInfo) error) error {
 	if prefix != "" || limit != 0 {
 		return errors.New("listing must cover full bucket")
