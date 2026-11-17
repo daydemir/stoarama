@@ -43,6 +43,9 @@ type copyControlFixtureResult struct {
 }
 
 func runCopyControlFixture(t *testing.T, url, ca string, timeout time.Duration, requests []copyControlFixtureRequest) copyControlFixtureResult {
+	return runCopyControlFixtureMode(t, url, ca, timeout, requests, false)
+}
+func runCopyControlFixtureMode(t *testing.T, url, ca string, timeout time.Duration, requests []copyControlFixtureRequest, sequential bool) copyControlFixtureResult {
 	t.Helper()
 	python := os.Getenv("STOARAMA_TEST_PYTHON")
 	if python == "" {
@@ -55,6 +58,11 @@ func runCopyControlFixture(t *testing.T, url, ca string, timeout time.Duration, 
 	args := []string{"-I", "-B", script, "--url", url, "--timeout", fmt.Sprint(timeout.Seconds())}
 	if ca != "" {
 		args = append(args, "--ca-file", ca)
+	}
+	children := len(requests)
+	if sequential {
+		args = append(args, "--sequential")
+		children = 1
 	}
 	data, err := json.Marshal(requests)
 	if err != nil {
@@ -78,7 +86,7 @@ func runCopyControlFixture(t *testing.T, url, ca string, timeout time.Duration, 
 	if err = json.Unmarshal(out, &result); err != nil {
 		t.Fatalf("fixture result: %v %s", err, out)
 	}
-	if !result.Reaped || result.Children != len(requests) || len(result.Results) != len(requests) {
+	if !result.Reaped || result.Children != children || len(result.Results) != len(requests) {
 		t.Fatalf("fixture did not drain its owned processes: %+v", result)
 	}
 	t.Logf("local fixture timings: %v", result.Timings)
@@ -205,13 +213,14 @@ func TestNASR2CopyControlRenewalCompetesWithAdmissions(t *testing.T) {
 
 func TestNASR2CopyControlHTTPS(t *testing.T) {
 	requests := []copyControlFixtureRequest{{1, "/control", map[string]any{}}}
+	var connections atomic.Int32
 	var forwarded atomic.Int32
 	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		forwarded.Add(1)
 		w.WriteHeader(500)
 	}))
 	defer destination.Close()
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/redirect" {
 			http.Redirect(w, r, destination.URL, http.StatusFound)
 			return
@@ -219,6 +228,12 @@ func TestNASR2CopyControlHTTPS(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte("{\"task\":null}"))
 	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connections.Add(1)
+		}
+	}
+	srv.StartTLS()
 	defer srv.Close()
 	ca := filepath.Join(t.TempDir(), "fixture-public-ca.pem")
 	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0600); err != nil {
@@ -228,6 +243,14 @@ func TestNASR2CopyControlHTTPS(t *testing.T) {
 		result := runCopyControlFixture(t, srv.URL, ca, 2*time.Second, requests)
 		if !result.Results[0].OK {
 			t.Fatalf("trusted fixture refused: %+v", result)
+		}
+	})
+	t.Run("persistent", func(t *testing.T) {
+		before := connections.Load()
+		repeated := []copyControlFixtureRequest{{1, "/control", nil}, {2, "/control", nil}, {3, "/control", nil}}
+		result := runCopyControlFixtureMode(t, srv.URL, ca, 2*time.Second, repeated, true)
+		if len(result.Results) != 3 || connections.Load()-before != 1 {
+			t.Fatalf("HTTPS connection not reused: connections=%d", connections.Load()-before)
 		}
 	})
 	t.Run("untrusted", func(t *testing.T) {

@@ -1,5 +1,6 @@
 import json
 import re
+import socket
 import subprocess
 import tempfile
 import threading
@@ -25,6 +26,7 @@ class R2CopyControlTests(unittest.TestCase):
         self.stop = threading.Event()
         self.done = threading.Event()
         self.requests = []
+        self.connections = []
         self.ring = pull.ClientLogRing()
         patch = mock.patch.object(pull, "CLIENT_LOG_RING", self.ring)
         patch.start()
@@ -32,10 +34,18 @@ class R2CopyControlTests(unittest.TestCase):
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
             def do_POST(self):
                 owner.requests.append(self.path)
+                owner.connections.append(self.client_address)
                 self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 try:
+                    if self.path == "/lost":
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        self.connection.close()
+                        return
+                    if self.path == "/close":
+                        self.close_connection = True
                     if self.path == "/stall":
                         owner.done.wait(3)
                         return
@@ -47,6 +57,7 @@ class R2CopyControlTests(unittest.TestCase):
                     if self.path == "/redirect":
                         self.send_response(302)
                         self.send_header("Location", "/destination")
+                        self.send_header("Content-Length", "0")
                         self.end_headers()
                         return
                     status = 409 if self.path == "/refuse" else 200
@@ -54,6 +65,8 @@ class R2CopyControlTests(unittest.TestCase):
                     if self.path == "/oversize":
                         data = b"x" * (1024 * 1024 + 1)
                     self.send_response(status)
+                    if self.path == "/close":
+                        self.send_header("Connection", "close")
                     if self.path != "/body":
                         self.send_header("Content-Length", str(len(data)))
                     self.end_headers()
@@ -62,7 +75,7 @@ class R2CopyControlTests(unittest.TestCase):
                         while not owner.done.wait(.02):
                             self.wfile.write(b" ")
                             self.wfile.flush()
-                    elif status == 200:
+                    else:
                         self.wfile.write(data)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
@@ -89,7 +102,7 @@ class R2CopyControlTests(unittest.TestCase):
         return {key: int(value) for key, value in re.findall(r"(\w+)=(-?\d+)", self.timings()[-1])}
 
     def test_startup_is_paid_once_outside_request_deadline(self):
-        child = pull.R2_COPY_CONTROL_CHILD.replace("emit(1)\nwhile True:", "time.sleep(.7)\nemit(1)\nwhile True:")
+        child = pull.R2_COPY_CONTROL_CHILD.replace("emit(1)\nwhile True:", "time.sleep(2.1)\nemit(1)\nwhile True:")
         popen = pull.subprocess.Popen
         with mock.patch.object(pull, "R2_COPY_CONTROL_CHILD", child), \
                 mock.patch.object(pull.subprocess, "Popen", wraps=popen) as spawn:
@@ -120,6 +133,22 @@ class R2CopyControlTests(unittest.TestCase):
                 self.assertEqual(values["status"], status)
                 self.assertIsNone(self.control.process)
         self.assertEqual(len(self.requests), 3)  # No request replay.
+
+    def test_keepalive_reuses_one_socket_and_reconnects_only_before_next_send(self):
+        for _ in range(4):
+            self.control.request_json(Operation.LEASE, "/ok")
+        self.assertEqual(len(set(self.connections)), 1)
+        self.control.request_json(Operation.LEASE, "/close")
+        self.control.request_json(Operation.LEASE, "/ok")
+        self.assertEqual(len(set(self.connections)), 2)
+
+    def test_accepted_post_with_lost_response_is_never_replayed(self):
+        with self.assertRaises(pull.R2CopyHold):
+            self.control.request_json(Operation.LEASE, "/lost")
+        self.assertEqual(self.requests, ["/lost"])
+        self.assertIsNone(self.control.process)
+        self.control.request_json(Operation.LEASE, "/ok")
+        self.assertEqual(self.requests, ["/lost", "/ok"])
 
     def test_refusals_reuse_transport_and_redirects_do_not_forward_credentials(self):
         self.control.request_json(Operation.LEASE, "/ok")
@@ -168,7 +197,7 @@ class R2CopyControlTests(unittest.TestCase):
         with mock.patch.object(pull, "request_json", side_effect=lambda *a, **kw: payloads.append(kw["body"])):
             pull.client_log_upload_once(self.cfg, SimpleNamespace(boot_id="fixture"), None, 0)
         lines = [entry["message"] for entry in payloads[0]["lines"]]
-        self.assertEqual(len(lines), 11)  # READY plus success/refusal for every operation.
+        self.assertEqual(len(lines), 1 + 2 * len(Operation))  # READY plus success/refusal for every operation.
         for operation in Operation:
             for status in (200, 409):
                 self.assertTrue(any("operation=%d " % operation.value in line and line.endswith("status=%d" % status) for line in lines))
@@ -198,7 +227,7 @@ class R2CopyControlTests(unittest.TestCase):
                     self.stop.set()
                 time.sleep(.08)
                 return process
-            with self.subTest(cancelled=cancelled), mock.patch.object(pull, "R2_COPY_TIMEOUT", .03), \
+            with self.subTest(cancelled=cancelled), mock.patch.object(pull, "R2_COPY_STARTUP_TIMEOUT", .03), \
                     mock.patch.object(pull.subprocess, "Popen", side_effect=delayed):
                 with self.assertRaises(pull.R2CopyHold):
                     self.control.request_json(Operation.LEASE, "/ok")

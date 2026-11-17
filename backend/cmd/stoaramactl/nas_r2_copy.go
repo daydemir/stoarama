@@ -353,6 +353,7 @@ func runNASR2Copy(ctx context.Context, cfg config.Config, args []string) {
 	input := fs.String("input", "", "source copy.jsonl[.gz] or batch")
 	sha := fs.String("sha256", "", "required exact input file SHA256")
 	out := fs.String("out", "", "new output directory")
+	jsonOutput := fs.Bool("json", false, "machine-readable status")
 	apply := fs.Bool("apply", false, "queue validated raw work; default read-only")
 	_ = fs.Parse(args[1:])
 	if fs.NArg() != 0 {
@@ -376,6 +377,16 @@ func runNASR2Copy(ctx context.Context, cfg config.Config, args []string) {
 	}
 	defer pool.Close()
 	if args[0] == "status" {
+		if *jsonOutput {
+			status, err := loadNASCopyStatus(ctx, pool)
+			if err != nil {
+				log.Fatal(err)
+			}
+			if err := json.NewEncoder(os.Stdout).Encode(status); err != nil {
+				log.Fatal(err)
+			}
+			return
+		}
 		fmt.Printf("enabled_by=NAS_R2_COPY_ENABLED floor_bytes=%d daily_limit=none rate_limit=none workers=%d range_bytes=%d\n", api.NASR2CopyFloor, api.NASR2CopyWorkers, api.NASR2CopyRangeBytes)
 		rows, err := pool.Query(ctx, `SELECT kind,state,count(*),coalesce(sum((item->>'size_bytes')::bigint),0) FROM nas_r2_copy_items WHERE connection_id=13 GROUP BY kind,state ORDER BY kind,state`)
 		if err != nil {

@@ -34,6 +34,7 @@ class R2CopyWorkerTests(unittest.TestCase):
         self.calls = []
         self.control_client = SimpleNamespace(request_json=self.control)
         for patch in (
+            mock.patch.object(pull, "R2_COPY_TELEMETRY", pull.R2CopyTelemetry()),
             mock.patch.object(pull, "NAS_MEDIA_FENCE", pull.NASMediaFence()),
             mock.patch.object(pull, "NAS_COPY_PATHS", pull.NASCopyPaths()),
             mock.patch.object(pull, "CLEANUP_DIRECTORIES", pull.CleanupDirectoryLog()),
@@ -84,6 +85,36 @@ class R2CopyWorkerTests(unittest.TestCase):
         with mock.patch.object(pull, "r2_copy_range", side_effect=AssertionError("redownloaded")):
             self.run_copy()
         self.assertEqual(final.read_bytes(), self.body)
+
+    def test_verified_in_place_and_downloaded_result_counters(self):
+        final = self.cfg.output_dir / self.item["relative_path"]
+        final.parent.mkdir()
+        final.write_bytes(self.body)
+        self.run_copy()
+        result = next(kw["body"] for path, kw in self.calls if path.endswith("/result"))
+        self.assertEqual((result["completion"], result["downloaded_bytes"], result["committed_bytes"]), ("verified_in_place", 0, 0))
+        self.assertEqual(pull.r2_copy_status(self.inventory)["verified_in_place"], dict(objects=1, bytes=len(self.body)))
+        final.unlink()
+        self.calls.clear()
+        with mock.patch.object(pull, "r2_copy_range", side_effect=self.transfer):
+            self.run_copy()
+        result = next(kw["body"] for path, kw in self.calls if path.endswith("/result"))
+        self.assertEqual((result["completion"], result["downloaded_bytes"], result["committed_bytes"]), ("downloaded", len(self.body), len(self.body)))
+
+    def test_worker_immediately_moves_past_acknowledged_block_and_logs_http_holds(self):
+        waits = []
+        class Stop:
+            def wait(self, seconds):
+                waits.append(seconds)
+                return len(waits) > 2
+        control = mock.MagicMock()
+        control.__enter__.return_value = control
+        control.request_json.side_effect = [{"blocked": True, "id": 1, "reason": "r2_identity"},
+                                           urllib.error.HTTPError("/lease", 409, "hold", {}, None)]
+        with mock.patch.object(pull, "R2CopyControl", return_value=control), mock.patch.object(pull, "log") as logged:
+            pull.r2_copy_worker(self.cfg, self.runtime, self.inventory, Stop(), 0)
+        self.assertEqual(waits, [0, 0, 60])
+        logged.assert_any_call("WARN", "R2 copy control HTTP 409; holding")
 
     def test_stop_during_range_releases_reservation_and_preserves_partial(self):
         def stop(cfg, task, offset, length, guard, fd, digest):
@@ -174,17 +205,68 @@ class R2CopyWorkerTests(unittest.TestCase):
         final = self.cfg.output_dir / self.item["relative_path"]
         final.parent.mkdir()
         final.write_bytes(b"different source data")
-        with self.assertRaises(pull.R2CopyHold):
-            self.run_copy()
+        self.run_copy()
+        self.assertEqual(self.calls[-1][1]["body"]["reason"], "final_conflict")
+        self.assertEqual(pull.r2_copy_status(self.inventory)["mismatch_latched"], 1)
         self.assertEqual(final.read_bytes(), b"different source data")
         self.assertFalse(any(path.endswith("/result") for path, _ in self.calls))
         final.unlink()  # test-owned fixture only
         target = self.cfg.output_dir / "untouched"
         target.write_bytes(b"user data")
         final.symlink_to(target)
-        with self.assertRaises(OSError):
-            self.run_copy()
+        self.task["id"] = 2
+        self.run_copy()
+        self.assertEqual(self.calls[-1][1]["body"]["reason"], "path_conflict")
         self.assertEqual(target.read_bytes(), b"user data")
+
+    def test_sidecar_partial_checksum_conflicts_are_terminal_and_preserved(self):
+        final = self.cfg.output_dir / self.item["relative_path"]
+        final.parent.mkdir()
+        final.write_bytes(self.body)
+        sidecar = Path(str(final) + ".stoarama.json")
+        sidecar.write_bytes(b"old sidecar")
+        self.run_copy()
+        self.assertEqual(self.calls[-1][1]["body"]["reason"], "sidecar_conflict")
+        self.assertEqual(sidecar.read_bytes(), b"old sidecar")
+        final.unlink()
+        sidecar.unlink()
+        self.task["id"] = 2
+        partial = final.parent / (".%s.r2-copy-%d.part" % (final.name, self.item["source_id"]))
+        partial.write_bytes(self.body + b"oversize")
+        self.run_copy()
+        self.assertEqual(self.calls[-1][1]["body"]["reason"], "partial_conflict")
+        partial.write_bytes(b"x" * len(self.body))
+        self.task["id"] = 3
+        self.run_copy()
+        self.assertEqual(self.calls[-1][1]["body"]["reason"], "checksum_mismatch")
+        self.assertEqual(partial.read_bytes(), b"x" * len(self.body))
+
+    def test_mismatch_latch_survives_failed_report_restart_and_reassigned_token(self):
+        final = self.cfg.output_dir / self.item["relative_path"]
+        final.parent.mkdir()
+        final.write_bytes(b"conflict")
+        original = self.control_client.request_json
+        def fail(operation, path, **kw):
+            if path.endswith("/block"):
+                raise pull.R2CopyHold("copy HTTP total deadline")
+            return original(operation, path, **kw)
+        with mock.patch.object(self.control_client, "request_json", side_effect=fail), self.assertRaises(pull.R2CopyHold):
+            self.run_copy()
+        self.inventory.close()
+        self.inventory = pull.Inventory(self.cfg)
+        self.addCleanup(self.inventory.close)
+        self.assertEqual(pull.r2_copy_status(self.inventory)["mismatch_latched"], 1)
+        self.task["token"] = "b" * 48
+        with mock.patch.object(pull, "_execute_r2_copy", side_effect=AssertionError("lost latch")):
+            self.run_copy()
+        self.assertEqual(self.calls[-1][1]["body"]["token"], "b" * 48)
+
+    def test_resource_hold_does_not_block_or_latch(self):
+        with mock.patch.object(pull, "r2_copy_resources", side_effect=pull.R2CopyHold("copy memory headroom")):
+            with self.assertRaises(pull.R2CopyHold):
+                self.run_copy()
+        self.assertFalse(any(path.endswith("/block") for path, _ in self.calls))
+        self.assertEqual(self.inventory.db.execute("SELECT count(*) FROM r2_copy_blocks").fetchone()[0], 0)
 
     def test_enabled_cleanup_allows_copy_but_remote_off_stops_it(self):
         pull.NAS_MEDIA_FENCE.execution_owner = 123

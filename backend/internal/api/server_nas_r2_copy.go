@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/util"
 	"github.com/jackc/pgx/v5"
 )
@@ -73,12 +74,14 @@ func ValidateNASR2CopyItem(i NASR2CopyItem) error {
 
 // LoadNASR2CopySource uses one primary-key lookup, never a catalog scan. The
 // existing redownload guard supplies the same policy/hold/retirement vetoes.
+var errNASR2CopySourceIdentity = errors.New("copy source identity changed")
+
 func LoadNASR2CopySource(ctx context.Context, tx pgx.Tx, i NASR2CopyItem) (json.RawMessage, error) {
 	if err := ValidateNASR2CopyItem(i); err != nil {
-		return nil, err
+		return nil, errors.Join(errNASR2CopySourceIdentity, err)
 	}
 	if i.Kind != "raw" {
-		return nil, errors.New("collated custody requires follow-up support")
+		return nil, fmt.Errorf("%w: %s", errNASR2CopySourceIdentity, "collated custody requires follow-up support")
 	}
 	var stream, size int64
 	var bucket, key, sha, tz, path string
@@ -88,7 +91,10 @@ func LoadNASR2CopySource(ctx context.Context, tx pgx.Tx, i NASR2CopyItem) (json.
 	var token *string
 	err := tx.QueryRow(ctx, nasRedownloadSQL, i.SourceID, int64(47)).Scan(&stream, &bucket, &key, &sha, &size, &path, &start, &end, &tz, &purged, &held, &payload, &token)
 	if err != nil {
-		return nil, errors.New("copy source unavailable")
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("%w: copy source unavailable", errNASR2CopySourceIdentity)
+		}
+		return nil, err
 	}
 	_, windows, err := Keep28Policy()
 	if err != nil {
@@ -96,7 +102,7 @@ func LoadNASR2CopySource(ctx context.Context, tx pgx.Tx, i NASR2CopyItem) (json.
 	}
 	if stream != i.StreamID || bucket != i.Bucket || key != i.ObjectKey || sha != i.SHA256 || size != i.SizeBytes || path != i.RelativePath ||
 		!start.Equal(i.StartAt) || !end.Equal(i.EndAt) || tz != windows[stream].Timezone || purged || held {
-		return nil, errors.New("copy source changed, held, retired or outside policy")
+		return nil, fmt.Errorf("%w: %s", errNASR2CopySourceIdentity, "copy source changed, held, retired or outside policy")
 	}
 	// Raw and collated namespaces are disjoint (joined/ is refused above).
 	// A second raw catalog identity at this path is ambiguous even if bytes agree.
@@ -106,14 +112,14 @@ func LoadNASR2CopySource(ctx context.Context, tx pgx.Tx, i NASR2CopyItem) (json.
 		return nil, err
 	}
 	if alias {
-		return nil, errors.New("copy path has another catalog identity")
+		return nil, fmt.Errorf("%w: %s", errNASR2CopySourceIdentity, "copy path has another catalog identity")
 	}
 	var clip map[string]json.RawMessage
 	var identity struct {
 		RecordingID int64 `json:"recording_id"`
 	}
 	if json.Unmarshal(payload, &clip) != nil || json.Unmarshal(payload, &identity) != nil || identity.RecordingID != i.RecordingID {
-		return nil, errors.New("copy recording changed")
+		return nil, fmt.Errorf("%w: %s", errNASR2CopySourceIdentity, "copy recording changed")
 	}
 	// Match the normal downloader's provenance representation.
 	clip["capture_generation"] = json.RawMessage("null")
@@ -171,11 +177,15 @@ func nasR2CopyReady(ctx context.Context, tx pgx.Tx) error {
 }
 
 type nasR2CopyControl struct {
-	Token     string `json:"token"`
-	RangeID   string `json:"range_id,omitempty"`
-	FreeBytes int64  `json:"free_bytes"`
-	Offset    int64  `json:"offset"`
-	Length    int64  `json:"length"`
+	Token           string               `json:"token"`
+	RangeID         string               `json:"range_id,omitempty"`
+	FreeBytes       int64                `json:"free_bytes"`
+	Offset          int64                `json:"offset"`
+	Length          int64                `json:"length"`
+	Reason          NASR2CopyBlockReason `json:"reason"`
+	Completion      NASR2CopyCompletion  `json:"completion"`
+	DownloadedBytes int64                `json:"downloaded_bytes"`
+	CommittedBytes  int64                `json:"committed_bytes"`
 }
 type nasR2CopyTask struct {
 	ID           int64           `json:"id"`
@@ -238,14 +248,24 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if task.Clip, err = LoadNASR2CopySource(ctx, tx, task.Item); err != nil {
-		_, _ = tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='blocked',last_error=$2 WHERE id=$1`, task.ID, err.Error())
-		_ = tx.Commit(ctx)
-		util.WriteError(w, 409, "copy source blocked; inspect queue")
+		if errors.Is(err, errNASR2CopySourceIdentity) {
+			s.nasR2CopyBlockResponse(w, r, tx, task.ID, NASR2CopySourceChanged)
+		} else {
+			util.WriteError(w, 503, "copy source lookup unavailable; retryable")
+		}
 		return
 	}
 	head, err := s.r2.Head(ctx, task.Item.ObjectKey)
-	if err != nil || head.ETag == "" || head.SizeBytes != task.Item.SizeBytes || (head.SHA256Metadata != "" && !strings.EqualFold(head.SHA256Metadata, task.Item.SHA256)) {
-		util.WriteError(w, 409, "copy R2 identity unavailable")
+	if err != nil {
+		if r2.IsNotFound(err) {
+			s.nasR2CopyBlockResponse(w, r, tx, task.ID, NASR2CopyR2Identity)
+		} else {
+			util.WriteError(w, 503, "copy R2 HEAD unavailable; retryable")
+		}
+		return
+	}
+	if head.ETag == "" || head.SizeBytes != task.Item.SizeBytes || (head.SHA256Metadata != "" && !strings.EqualFold(head.SHA256Metadata, task.Item.SHA256)) {
+		s.nasR2CopyBlockResponse(w, r, tx, task.ID, NASR2CopyR2Identity)
 		return
 	}
 	task.ETag = strings.Trim(head.ETag, "\"")
@@ -255,7 +275,7 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	task.Token = hex.EncodeToString(b)
-	_, err = tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='leased',lease_token=$2,lease_expires_at=clock_timestamp()+interval '30 seconds',etag=$3,version_id=$4,attempts=attempts+1,last_error='' WHERE id=$1`, task.ID, task.Token, task.ETag, head.VersionID)
+	_, err = tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='leased',lease_token=$2,lease_expires_at=clock_timestamp()+interval '30 seconds',etag=$3,version_id=$4,attempts=attempts+1,last_error='',updated_at=clock_timestamp() WHERE id=$1`, task.ID, task.Token, task.ETag, head.VersionID)
 	if err != nil || tx.Commit(ctx) != nil {
 		util.WriteError(w, 503, "copy lease commit failed")
 		return
@@ -321,7 +341,7 @@ func (s *Server) handleNASR2CopyCheckpoint(w http.ResponseWriter, r *http.Reques
 	}
 	defer tx.Rollback(r.Context())
 	if req.RangeID != "" {
-		tag, err := tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET range_until=NULL,range_id=NULL WHERE id=$1 AND range_id=$2`, t.ID, req.RangeID)
+		tag, err := tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET range_until=NULL,range_id=NULL,downloaded_bytes=downloaded_bytes+range_length,range_length=0,updated_at=clock_timestamp() WHERE id=$1 AND range_id=$2`, t.ID, req.RangeID)
 		if err != nil || tag.RowsAffected() != 1 {
 			util.WriteError(w, 409, "copy range completion is stale")
 			return
@@ -358,7 +378,7 @@ func (s *Server) handleNASR2CopyRange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rangeID := hex.EncodeToString(nonce)
-	if _, err := tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET range_until=$2,range_id=$3,lease_expires_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, t.ID, issuedAt.Add(10*time.Second), rangeID); err != nil || tx.Commit(r.Context()) != nil {
+	if _, err := tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET range_until=$2,range_id=$3,range_length=$4,lease_expires_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, t.ID, issuedAt.Add(10*time.Second), rangeID, req.Length); err != nil || tx.Commit(r.Context()) != nil {
 		util.WriteError(w, 503, "copy range commit failed")
 		return
 	}
@@ -380,11 +400,19 @@ func (s *Server) handleNASR2CopyRange(w http.ResponseWriter, r *http.Request) {
 	util.WriteJSON(w, 200, map[string]any{"url": cap.URL, "headers": headers, "etag": t.ETag, "offset": req.Offset, "length": req.Length, "max_duration_sec": 10, "range_id": rangeID})
 }
 func (s *Server) handleNASR2CopyResult(w http.ResponseWriter, r *http.Request) {
-	tx, t, _, _, ok := s.nasR2CopyActive(w, r, nasConnectionMetadata)
+	tx, t, _, req, ok := s.nasR2CopyActive(w, r, nasConnectionMetadata)
 	if !ok {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if req.Completion != "" && req.Completion != NASR2CopyVerifiedInPlace && req.Completion != NASR2CopyDownloaded ||
+		req.DownloadedBytes < 0 || req.DownloadedBytes > t.Item.SizeBytes || req.CommittedBytes < 0 ||
+		(req.Completion == "" && (req.DownloadedBytes != 0 || req.CommittedBytes != 0)) ||
+		(req.Completion == NASR2CopyVerifiedInPlace && (req.DownloadedBytes != 0 || req.CommittedBytes != 0)) ||
+		(req.Completion == NASR2CopyDownloaded && req.CommittedBytes != t.Item.SizeBytes) {
+		util.WriteError(w, 400, "invalid copy completion counters")
+		return
+	}
 	// Existing inventory publication is the custody proof, never a result claim.
 	var exact bool
 	err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM nas_inventory_files WHERE connection_id=13 AND clip_id=$1 AND relative_path=$2 AND sha256=$3 AND size_bytes=$4 AND state='present' AND verified_at BETWEEN now()-interval '5 minutes' AND now()+interval '5 minutes' AND server_received_at>=now()-interval '5 minutes' AND sidecar_relative_path=$2||'.stoarama.json' AND sidecar_size_bytes>0 AND sidecar_sha256 ~ '^[a-f0-9]{64}$')`, t.Item.SourceID, t.Item.RelativePath, t.Item.SHA256, t.Item.SizeBytes).Scan(&exact)
@@ -392,7 +420,7 @@ func (s *Server) handleNASR2CopyResult(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, 409, "copy requires exact NAS inventory proof")
 		return
 	}
-	_, err = tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET state='verified',verified_at=now(),lease_token=NULL,lease_expires_at=NULL WHERE id=$1`, t.ID)
+	_, err = tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET state='verified',verified_at=now(),lease_token=NULL,lease_expires_at=NULL,completion=$2,committed_bytes=$3,updated_at=clock_timestamp() WHERE id=$1`, t.ID, req.Completion, req.CommittedBytes)
 	if err != nil || tx.Commit(r.Context()) != nil {
 		util.WriteError(w, 503, "copy result commit failed")
 		return

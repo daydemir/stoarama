@@ -18,6 +18,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
     parser.add_argument("--ca-file")
+    parser.add_argument("--sequential", action="store_true")
     parser.add_argument("--timeout", type=float, default=2)
     args = parser.parse_args()
     url = urllib.parse.urlsplit(args.url)
@@ -67,9 +68,14 @@ def main():
             except pull.R2CopyHold as error:
                 return {"ok": False, "status": -1, "error": type(error).__name__}
     with contextlib.redirect_stdout(io.StringIO()):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(requests)) as pool:
-            futures = [pool.submit(run, i, request) for i, request in enumerate(requests)]
-            results = [future.result() for future in futures]
+        if args.sequential:
+            with pull.R2CopyControl(cfg, stop, 0) as control:
+                results = [dict(ok=True, status=200, task_id=None, active=control.request_json(
+                    pull.R2CopyControlOperation(req["operation"]), req["path"], body=req.get("body"), timeout=args.timeout).get("active")) for req in requests]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(requests)) as pool:
+                futures = [pool.submit(run, i, request) for i, request in enumerate(requests)]
+                results = [future.result() for future in futures]
     lines, dropped = pull.CLIENT_LOG_RING.since(0)
     print(json.dumps({"results": results, "timings": [entry["message"] for entry in lines],
                       "dropped": dropped, "children": len(children),

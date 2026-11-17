@@ -48,6 +48,8 @@ func TestNASClientAdmissionExactVersions(t *testing.T) {
 		{nasCleanupPermitTransportClientVersion, true, false, false},
 		{nasCleanupFreshPermitClientVersion, true, true, false},
 		{nasCleanupR2CopyControlClientVersion, true, true, true},
+		{nasCleanupR2CopyProgressClientVersion, true, true, false},
+		{"r2-copy-v4-extra", false, false, false},
 		{nasCleanupItemTruthClientVersion, true, true, true},
 		{"development", false, false, false},
 		{"", false, false, false},
@@ -103,7 +105,7 @@ func TestNASClientAdmissionFreshPermitCopyAuthenticated(t *testing.T) {
 				f.t.Fatal(err)
 			}
 			return f.version
-		}, http.StatusConflict},
+		}, http.StatusOK},
 		{"queue policy changed", func(f *cleanupFixture) string {
 			if _, err := f.pool.Exec(f.ctx, `UPDATE nas_r2_copy_items SET policy_sha256=repeat('b',64)`); err != nil {
 				f.t.Fatal(err)
@@ -116,7 +118,7 @@ func TestNASClientAdmissionFreshPermitCopyAuthenticated(t *testing.T) {
 				f.t.Fatal(err)
 			}
 			return f.version
-		}, http.StatusConflict},
+		}, http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f, server := authenticatedCopyFixture(t)
@@ -141,7 +143,7 @@ func TestNASClientAdmissionFreshPermitCopyAuthenticated(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := 0
-			if tc.want == http.StatusOK {
+			if tc.name == "matching release" {
 				want = 1
 				var body struct {
 					Task nasR2CopyTask `json:"task"`

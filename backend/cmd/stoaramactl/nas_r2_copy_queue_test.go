@@ -31,13 +31,20 @@ CREATE TABLE nas_cleanup_reserved_files(kind text,source_id bigint);
 CREATE TABLE nas_cleanup_source_holds(clip_id bigint,plan_id bigint);
 CREATE TABLE nas_cleanup_plans(id bigint PRIMARY KEY,mode text);
 CREATE TABLE nas_cleanup_items(plan_id bigint,delete_ever_issued boolean);
-CREATE TABLE r2_retirement_reservations(kind text,source_id bigint);
+CREATE TABLE r2_retirement_reservations(kind text,source_id bigint,bucket text,object_key text);
 CREATE TABLE r2_object_retirements(kind text,source_id bigint);
 INSERT INTO connections VALUES(13);`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	migration, err := os.ReadFile("../../../infra/sql/migrations/0193_nas_r2_copy.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, string(migration)); err != nil {
+		t.Fatal(err)
+	}
+	migration, err = os.ReadFile("../../../infra/sql/migrations/0200_nas_r2_copy_progress.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,5 +380,33 @@ func TestNASR2CopyQueueRetainsSourceAndAliasVetoes(t *testing.T) {
 				t.Fatalf("refused source queued: count=%d err=%v", count, err)
 			}
 		})
+	}
+}
+
+func TestNASCopyStatusDurableCountersAndReimport(t *testing.T) {
+	pool, _, h, items := nasCopyQueueFixture(t, 4, true)
+	ctx := context.Background()
+	manifest := strings.Repeat("a", 64)
+	if err := queueNASR2Copy(ctx, pool, h, manifest, items, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',completion='verified_in_place' WHERE source_id=$1`, items[0].SourceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',completion='downloaded',downloaded_bytes=50,committed_bytes=100 WHERE source_id=$1`, items[1].SourceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nas_r2_copy_items SET state='blocked',blocked_reason='checksum_mismatch',attempts=4 WHERE source_id=$1`, items[2].SourceID); err != nil {
+		t.Fatal(err)
+	}
+	if err := queueNASR2Copy(ctx, pool, h, manifest, items, true); err != nil {
+		t.Fatal(err)
+	}
+	status, err := loadNASCopyStatus(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.QueueDepth != 1 || status.Blocked != 1 || status.MismatchLatched != 1 || status.VerifiedInPlace.Objects != 1 || status.Downloaded.Objects != 1 || status.DownloadedBytes != 50 || status.CommittedBytes != 100 || status.ReLeasedItems != 1 || status.MaxAttempts != 4 || status.BlockedByReason["checksum_mismatch"].Objects != 1 {
+		t.Fatalf("status %+v", status)
 	}
 }
