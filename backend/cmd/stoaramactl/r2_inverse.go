@@ -17,7 +17,11 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// Matches r2-retire's read-only catalog budget.
+const r2InversePartitionStatementTimeout = "1800s"
 
 type inverseClass string
 
@@ -288,6 +292,21 @@ func partitionInverse(ctx context.Context, store inverseLister, p inverseProtect
 	return sum, nil
 }
 
+// beginInversePartitionTx opens the read-only catalog snapshot the partition
+// classifies against, with a budget that fits the full protection load instead
+// of the DB role's default statement_timeout.
+func beginInversePartitionTx(ctx context.Context, pool *pgxpool.Pool) (pgx.Tx, error) {
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = '"+r2InversePartitionStatementTimeout+"'"); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	return tx, nil
+}
+
 func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) > 0 && args[0] == "apply" {
 		runR2InverseApply(ctx, cfg, args[1:])
@@ -314,7 +333,7 @@ func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
 	// Enforced read-only at PostgreSQL, independently of CLI control flow.
-	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	tx, err := beginInversePartitionTx(ctx, pool)
 	if err != nil {
 		log.Fatal(err)
 	}
