@@ -302,7 +302,7 @@ func TestNASR2CopyQueueFirstErrorCancelsAndDrainsOtherWorkers(t *testing.T) {
 	close(gate.failureRelease) // The other three only unblock when work is canceled.
 	select {
 	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "copy source 1: copy source unavailable") {
+		if err == nil || !strings.Contains(err.Error(), "copy source 1: injected source failure") {
 			t.Fatalf("first source error lost: %v", err)
 		}
 	case <-ctx.Done():
