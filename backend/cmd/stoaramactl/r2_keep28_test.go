@@ -170,7 +170,7 @@ func newKeep28FixtureCount(t *testing.T, count int) keep28Fixture {
 // A stopped process can leave only its committed intent. Restart must never
 // adopt a parent recording's changed stream as the intended source identity.
 func TestKeep28CrashIdentityFreezeAndExactReconciliation(t *testing.T) {
-	f := newKeep28Fixture(t)
+	f := newKeep28FixtureCount(t, 2)
 	broken := &keep28ReadStore{inverseSDKStore: f.sdk, headErr: errors.New("process stopped before final HEAD")}
 	if _, err := applyInverse(f.ctx, f.pool, broken, f.options); err == nil {
 		t.Fatal("expected stopped attempt")
@@ -178,7 +178,7 @@ func TestKeep28CrashIdentityFreezeAndExactReconciliation(t *testing.T) {
 	if f.deletes() != 0 {
 		t.Fatal("wire ran before HEAD")
 	}
-	for _, sql := range []string{`UPDATE recording_clips SET sha256=repeat('a',64) WHERE id=9000001`, `UPDATE recording_clips SET display_path='other.mp4' WHERE id=9000001`, `DELETE FROM recording_clips WHERE id=9000001`} {
+	for _, sql := range []string{`UPDATE recording_clips SET sha256=repeat('a',64) WHERE id=9000001`, `UPDATE recording_clips SET display_path='other.mp4' WHERE id=9000001`, `DELETE FROM recording_clips WHERE id=9000001`, `UPDATE recording_clips SET object_key='managed/acct-47/keep28/1.mp4' WHERE id=9000002`} {
 		if _, err := f.pool.Exec(f.ctx, sql); err == nil {
 			t.Fatalf("pending identity mutated: %s", sql)
 		}
@@ -369,13 +369,13 @@ type keep28RoundTripFunc func(*http.Request) (*http.Response, error)
 func (f keep28RoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 func TestKeep28WireDeadlineAndCustodyLock(t *testing.T) {
 	f := newKeep28Fixture(t)
-	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '23 hours 59 minutes 58 seconds',server_received_at=clock_timestamp()`); err != nil {
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '23 hours 59 minutes 55 seconds',server_received_at=clock_timestamp()`); err != nil {
 		t.Fatal(err)
 	}
 	var observed atomic.Bool
 	f.sdk.transport = keep28RoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		deadline, ok := req.Context().Deadline()
-		if !ok || time.Until(deadline) > 2*time.Second {
+		if !ok || time.Until(deadline) > 5*time.Second {
 			t.Error("wire lacks custody deadline")
 		}
 		tx, err := f.pool.Begin(f.ctx)
