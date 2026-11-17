@@ -298,7 +298,7 @@ func (s *Server) router() http.Handler {
 		api.Post("/auth/request-link", s.handleAccountAuthRequestLink)
 		api.Post("/nodes/enroll", s.handleNodeEnroll)
 		api.Route("/account", func(account chi.Router) {
-			account.Use(nasR2CopyDeadline)
+			account.Use(nasDeliveryRequestDeadline)
 			account.Use(s.requireAccountAuth)
 			// Confine a 'stoarama.pull'-scoped key to the NAS pull endpoints; a
 			// session or full/read key is unaffected. Runs after requireAccountAuth

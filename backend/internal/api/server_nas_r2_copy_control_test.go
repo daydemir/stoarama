@@ -137,7 +137,7 @@ CREATE TABLE account_api_keys(id bigint PRIMARY KEY,account_id bigint,secret_has
 		}
 	}
 	router := chi.NewRouter()
-	router.Use(nasR2CopyDeadline, f.s.requireAccountAuth, f.s.confineAccountScope, f.s.fenceNASDelivery)
+	router.Use(nasDeliveryRequestDeadline, f.s.requireAccountAuth, f.s.confineAccountScope, f.s.fenceNASDelivery)
 	router.Get("/api/v1/account/connections/stitch/evidence/admission", f.s.handleAccountNASStitchEvidenceAdmission)
 	router.Post(copyControlLeasePath, func(w http.ResponseWriter, r *http.Request) {
 		f.s.handleNASR2CopyLease(w, r)
@@ -146,6 +146,7 @@ CREATE TABLE account_api_keys(id bigint PRIMARY KEY,account_id bigint,secret_has
 		}
 	})
 	router.Post("/api/v1/account/connections/inventory", f.s.handleAccountConnectionInventorySync)
+	router.Get("/api/v1/account/collated", f.s.handleAccountCollated)
 	router.Post("/api/v1/account/connections/r2-copy/{id}/checkpoint", f.s.handleNASR2CopyCheckpoint)
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)
@@ -482,5 +483,32 @@ func TestNASR2CopyEarlyRefusalDoesNotDrainStalledBody(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != 401 {
 		t.Fatalf("early refusal status %d", response.StatusCode)
+	}
+}
+
+func TestCollatedDeadlineIncludesAuthenticatedFenceWait(t *testing.T) {
+	f, srv := authenticatedCopyFixture(t)
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(f.ctx)
+	if _, err = tx.Exec(f.ctx, `SELECT pg_advisory_xact_lock($1)`, NASDeliveryFenceLock); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/account/collated", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer fixture-key")
+	client := http.Client{Timeout: collatedFeedBudget + time.Second}
+	started := time.Now()
+	response, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("fence wait exceeded advertised request budget: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 503 || time.Since(started) >= collatedFeedBudget+time.Second {
+		t.Fatalf("fence status=%d elapsed=%v", response.StatusCode, time.Since(started))
 	}
 }

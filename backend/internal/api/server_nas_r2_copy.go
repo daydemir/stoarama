@@ -44,13 +44,16 @@ func nasR2CopyControlRequest(r *http.Request) bool {
 
 func nasR2CopyCommittedResponse(status int) bool { return status >= 200 && status < 300 }
 
-func nasR2CopyDeadline(next http.Handler) http.Handler {
+func nasDeliveryRequestDeadline(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !nasR2CopyControlRequest(r) {
+		budget := nasR2CopyControlBudget
+		if r.Method == http.MethodGet && r.URL.Path == "/api/v1/account/collated" {
+			budget = collatedFeedBudget
+		} else if !nasR2CopyControlRequest(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), nasR2CopyControlBudget)
+		ctx, cancel := context.WithTimeout(r.Context(), budget)
 		defer cancel()
 		// Bound request body reads too: context cancellation alone cannot
 		// interrupt net/http's JSON decoder while the peer stops sending.
@@ -58,15 +61,15 @@ func nasR2CopyDeadline(next http.Handler) http.Handler {
 		transport := http.NewResponseController(w)
 		if err := transport.SetReadDeadline(deadline); err != nil {
 			w.Header().Set("Connection", "close")
-			util.WriteError(w, 503, "copy read deadline unavailable; retryable")
+			util.WriteError(w, 503, "delivery read deadline unavailable; retryable")
 			return
 		}
 		defer func() { _ = transport.Flush(); _ = transport.SetReadDeadline(time.Time{}) }()
 		out := &nasDeliveryResponse{header: make(http.Header)}
 		next.ServeHTTP(out, r.WithContext(ctx))
-		if (ctx.Err() != nil || !time.Now().Before(deadline)) && !nasR2CopyCommittedResponse(out.status) {
+		if (ctx.Err() != nil || !time.Now().Before(deadline)) && !(nasR2CopyControlRequest(r) && nasR2CopyCommittedResponse(out.status)) {
 			w.Header().Set("Retry-After", "1")
-			util.WriteError(w, 503, "copy control deadline; retryable")
+			util.WriteError(w, 503, "delivery request deadline; retryable")
 			return
 		}
 		for k, v := range out.header {

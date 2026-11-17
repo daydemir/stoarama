@@ -70,7 +70,7 @@ func copyCall(f *cleanupFixture, action string, id int64, body any) *httptest.Re
 	req = req.WithContext(ctx)
 	out := httptest.NewRecorder()
 	handlers := map[string]http.HandlerFunc{"lease": f.s.handleNASR2CopyLease, "checkpoint": f.s.handleNASR2CopyCheckpoint, "range": f.s.handleNASR2CopyRange, "result": f.s.handleNASR2CopyResult, "block": f.s.handleNASR2CopyBlock}
-	nasR2CopyDeadline(f.s.confineAccountScope(f.s.fenceNASDelivery(handlers[action]))).ServeHTTP(copyDeadlineRecorder{out}, req)
+	nasDeliveryRequestDeadline(f.s.confineAccountScope(f.s.fenceNASDelivery(handlers[action]))).ServeHTTP(copyDeadlineRecorder{out}, req)
 	return out
 }
 func copyLease(t *testing.T, f *cleanupFixture) nasR2CopyTask {
@@ -642,5 +642,33 @@ func TestNASR2CopyV6LeaseKeepsExactRequestAdmission(t *testing.T) {
 	}
 	if nasClientSupportsStitchProof(NASR2CopyPagedClientVersion) {
 		t.Fatal("copy release gained stitch-proof eligibility")
+	}
+}
+
+func TestNASR2CopyProgressCannotBeProvedByCustodyRefresh(t *testing.T) {
+	f, item := copyTestFixture(t)
+	_, err := f.pool.Exec(f.ctx, `UPDATE nas_r2_copy_items SET state='verified',verified_at=now()-interval '1 day',completion='downloaded',downloaded_bytes=$1,committed_bytes=$1`, item.SizeBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.pool.Exec(f.ctx, `UPDATE nas_r2_copy_items SET work_mode='verify_existing',state='refresh_leased'`); err != nil {
+		t.Fatal(err)
+	}
+	baseline := time.Now().UTC()
+	sample := func() (int64, int64, int64) {
+		t.Helper()
+		var downloaded, committed, completed int64
+		if err := f.pool.QueryRow(f.ctx, `SELECT coalesce(sum(downloaded_bytes),0),coalesce(sum(committed_bytes),0),count(*) FILTER(WHERE state='verified' AND completion='downloaded' AND committed_bytes>0 AND verified_at>$1) FROM nas_r2_copy_items WHERE connection_id=13`, baseline).Scan(&downloaded, &committed, &completed); err != nil {
+			t.Fatal(err)
+		}
+		return downloaded, committed, completed
+	}
+	d0, c0, n0 := sample()
+	if _, err = f.pool.Exec(f.ctx, `UPDATE nas_r2_copy_items SET state='verified',custody_refreshed_at=clock_timestamp(),refresh_count=refresh_count+1`); err != nil {
+		t.Fatal(err)
+	}
+	d1, c1, n1 := sample()
+	if d0 != d1 || c0 != c1 || n0 != 0 || n1 != 0 {
+		t.Fatalf("refresh masqueraded as original progress: %d/%d/%d -> %d/%d/%d", d0, c0, n0, d1, c1, n1)
 	}
 }

@@ -551,17 +551,33 @@ Release sequence, to be executed only by the assigned controller:
    version predicate covers cleanup-space, late-tier and custody-refresh gates.
    Root must audit private collector/version pins for v6 before activation;
    compatibility of those external pins is not established by this code change.
-5. The controller performs its own authorized release/fence sequence, then
-   compares two samples of this read-only query (for example 60 seconds apart):
+5. The controller performs its own authorized release/fence sequence. Capture
+   this baseline, retaining its exact `sampled_at` as T0 and both byte totals:
 
    ```sql
-   SELECT clock_timestamp() AS sampled_at, state, count(*) AS items,
-          sum(attempts) AS attempts, sum(downloaded_bytes) AS downloaded_bytes,
-          sum(committed_bytes) AS committed_bytes, max(updated_at) AS latest_update
-   FROM nas_r2_copy_items WHERE connection_id=13 GROUP BY state ORDER BY state;
+   SELECT clock_timestamp() AS sampled_at,
+          coalesce(sum(downloaded_bytes),0) AS downloaded_bytes,
+          coalesce(sum(committed_bytes),0) AS committed_bytes
+   FROM nas_r2_copy_items WHERE connection_id=13;
    ```
 
-   Require `downloaded_bytes` or `committed_bytes` to increase, followed by verified
-   rows; a lease attempt alone is insufficient. Keep inventory mismatch and
-   unverified recovery problem counts at zero. An unexpected mismatch stops the
-   release; uncertain or held cleanup items never become retry candidates.
+   After about 60 seconds, compare connection-wide totals and substitute the
+   saved T0 timestamp below. Do not group counters by current state: a custody
+   refresh can move historical bytes into the verified group without moving data.
+
+   ```sql
+   SELECT clock_timestamp() AS sampled_at,
+          coalesce(sum(downloaded_bytes),0) AS downloaded_bytes,
+          coalesce(sum(committed_bytes),0) AS committed_bytes,
+          count(*) FILTER (WHERE state='verified' AND completion='downloaded'
+            AND committed_bytes>0 AND verified_at >
+            TIMESTAMPTZ '<saved T0 UTC>') AS new_original_downloads
+   FROM nas_r2_copy_items WHERE connection_id=13;
+   ```
+
+   Require a connection-wide byte total to increase AND a new original downloaded completion
+   after T0. Refresh preserves `verified_at` and both original byte counters, so
+   its state transitions cannot satisfy this proof. Attempts or changing per-state
+   totals alone are insufficient. Keep inventory mismatch and unverified recovery
+   problem counts at zero. Any mismatch stops the release; uncertain/held cleanup
+   items never become retry candidates.
