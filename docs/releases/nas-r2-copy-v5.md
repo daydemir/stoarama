@@ -75,9 +75,17 @@ The central `parse_certification_timestamp` accepts RFC3339 fractions of 1–9
 digits, Z and explicit ±hh:mm offsets. It pads to six fractional digits for
 Python 3.9 and truncates sub-microsecond digits without rounding or extending
 expiry. There are no caller-specific shims or server timestamp changes.
-Malformed dates, fractions and offsets still fail. The pipeline harness requires
-an explicit `STOARAMA_TEST_PYTHON`; CI uses NAS Python 3.14.6 as the primary backend interpreter. The existing
-Ubuntu 24.04 Python 3.9 job also runs the parser, complete cleanup suite and
-explicitly bound real v5 pipeline; neither inherits an arbitrary PATH version.
+Malformed dates, fractions and offsets still fail. Controller-recorded NAS
+heartbeat host facts at `2026-11-17T10:04:29.99246Z` report Python 3.14.6.
+CI's primary backend interpreter reproduces that production fact. Python 3.9
+remains an explicitly tested compatibility runtime in the existing CI matrix.
+The pipeline harness requires an absolute `STOARAMA_TEST_PYTHON` executable path;
+CI binds it to the exact `setup-python` output, rather than resolving a name on
+PATH. The Ubuntu 24.04 Python 3.9 job also runs the parser, complete cleanup suite
+and explicitly bound real v5 pipeline.
 Jelly validation uses `/usr/bin/python3` (3.9.6) and an isolated exact 3.14.6
 interpreter matching the recorded NAS runtime, with no production execution.
+The exact old v2.2 artifact accepts all tested fractional widths on 3.14.6.
+The supplied bounded observation/control/command-failure records do not
+establish timestamp parsing as their live failure cause; the 3.9 compatibility
+reproduction is not evidence of a production failure rate.

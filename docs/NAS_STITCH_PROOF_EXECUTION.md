@@ -265,8 +265,11 @@ independent review; code defaults grant no release/activation authority.
 New admission, validation and current-context observations use UTC with exactly
 six fractional digits, preserving PostgreSQL's microsecond instants. An
 unrepresentable precision or timestamp refuses before HTTP200; timestamps are
-never rounded and expiry is never extended. This permits the unchanged pinned
-Python3.9 reader to consume DB values whose trailing zeros RFC3339Nano removes.
+never rounded and expiry is never extended. This also permits the Python3.9
+compatibility reader to consume DB values whose trailing zeros RFC3339Nano
+removes. Controller-recorded NAS heartbeat host facts at
+2026-11-17T10:04:29.99246Z report Python3.14.6; Python3.9 is the separate
+compatibility target, not the observed NAS runtime pin.
 Native task bytes are serialized once and reused as the parsed JSON task,
 base64 and SHA; task and outer expiry encode the same instant. Copied original
 native/readback timestamp strings remain exact. The client, profile provenance,

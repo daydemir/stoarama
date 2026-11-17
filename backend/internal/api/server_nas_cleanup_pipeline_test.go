@@ -74,8 +74,8 @@ func testNASCleanupPipelineClientServer(t *testing.T, grouped bool, groupVersion
 				t.Fatal(err)
 			}
 			python := os.Getenv("STOARAMA_TEST_PYTHON")
-			if python == "" {
-				t.Fatal("set STOARAMA_TEST_PYTHON to the pinned NAS/support-floor interpreter; do not inherit PATH")
+			if !filepath.IsAbs(python) {
+				t.Fatal("set STOARAMA_TEST_PYTHON to an absolute path for the pinned NAS/support-floor interpreter; do not inherit PATH")
 			}
 			versionBytes, err := exec.Command(python, "--version").CombinedOutput()
 			if err != nil {
