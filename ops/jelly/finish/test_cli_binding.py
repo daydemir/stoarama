@@ -53,9 +53,14 @@ class BindingTests(unittest.TestCase):
                 binding.bound_cli()
 
     def test_runtime_source_cannot_reintroduce_another_cli_path_or_hash(self):
-        binary = dict(path='/bound/stoaramactl.bin', sha256='a'*64)
-        launcher = dict(path='/bound/stoaramactl', sha256='b'*64)
-        for text in ("exec /Users/jelly/tmp-safeguards/stoaramactl \"$@\"",
+        for text in ("#!/bin/sh\nstoaramactl\n",
+                     "#!/bin/sh\nstoaramactl --help\n",
+                     "#!/bin/sh\nexec \"$(command -v stoaramactl)\" \"$@\"",
+                     "subprocess.run(\"exec stoaramactl nas-cleanup verify-recovery\", shell=True)",
+                     "subprocess.run(['sh', '-c', 'exec stoaramactl nas-cleanup verify-recovery'])",
+                     "pins = {'cli_sha256': '" + 'c'*64 + "'}",
+                     "pins['CLI_SHA256'] = '" + 'c'*64 + "'",
+                     "exec /Users/jelly/tmp-safeguards/stoaramactl \"$@\"",
                      "subprocess.run(['stoaramactl', 'nas-cleanup', 'verify-recovery'])",
                      "subprocess.run([str(Path('/Users/jelly/tmp-safeguards') / 'stoaramactl')])",
                      "CLI_SHA256 = '" + binding.RETIRED_CLI_SHA256 + "'",
@@ -63,7 +68,7 @@ class BindingTests(unittest.TestCase):
                      "#!/bin/sh\nCLI_SHA256=" + 'c'*64 + "\nexec /bound/stoaramactl \"$@\"",
                      "CLI_SHA256 = '" + 'c'*64 + "'"):
             with self.subTest(text=text), self.assertRaises(binding.ContractError):
-                binding.verify_references(text, binary, launcher)
+                binding.verify_references(text)
 
 
 if __name__ == '__main__':

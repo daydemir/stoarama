@@ -31,7 +31,7 @@ def main():
     query['options'] = opts
     os.environ['DATABASE_URL'] = urllib.parse.urlunsplit(u._replace(query=urllib.parse.urlencode(query)))
     os.environ['PGOPTIONS'] = opts
-    os.execv(str(cli), ['stoaramactl'] + sys.argv[1:])
+    os.execv(str(cli), [str(cli)] + sys.argv[1:])
 
 
 if __name__ == '__main__':
