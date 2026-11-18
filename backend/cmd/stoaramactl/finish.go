@@ -240,6 +240,8 @@ WHERE c.purged_at IS NULL AND c.clip_start_at<w.end_at AND c.clip_end_at>w.start
  AND coalesce(nullif(s.local_timezone,''),r.cron_timezone,'')=w.timezone
  AND c.bucket<>'' AND c.object_key LIKE 'managed/%' AND c.size_bytes>0 AND c.size_bytes<=$2 AND lower(c.sha256) ~ '^[a-f0-9]{64}$' AND c.display_path<>''
  AND NOT EXISTS(SELECT 1 FROM nas_r2_copy_items q WHERE q.connection_id=13 AND q.kind='raw' AND q.source_id=c.id)
+ AND NOT EXISTS(SELECT 1 FROM nas_cleanup_incident_sources i WHERE i.clip_id=c.id)
+ AND NOT EXISTS(SELECT 1 FROM nas_cleanup_incident_roster i WHERE (i.kind='raw' AND i.source_id=c.id) OR (i.bucket=c.bucket AND i.object_key=c.object_key))
  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_reserved_files f WHERE f.kind='raw' AND f.source_id=c.id)
  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id WHERE h.clip_id=c.id AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued)))
  AND NOT EXISTS(SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='raw' AND x.source_id=c.id)
@@ -355,7 +357,23 @@ func finishManifest(dir string, items []api.NASR2CopyItem) (nasCopyHeader, strin
 	sum := sha256.Sum256(manifest.Bytes())
 	digest := hex.EncodeToString(sum[:])
 	path := filepath.Join(dir, digest+".jsonl")
-	if err = os.WriteFile(path, manifest.Bytes(), 0600); err != nil {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return h, "", nil, err
+	}
+	defer f.Close()
+	if _, err = f.Write(manifest.Bytes()); err != nil {
+		return h, "", nil, err
+	}
+	if err = f.Sync(); err != nil {
+		return h, "", nil, err
+	}
+	directory, err := os.Open(dir)
+	if err != nil {
+		return h, "", nil, err
+	}
+	defer directory.Close()
+	if err = directory.Sync(); err != nil {
 		return h, "", nil, err
 	}
 	parsed, validated, err := readNASCopyBatch(path, digest)
@@ -437,11 +455,9 @@ func finishTickWithRefresh(ctx context.Context, pool *pgxpool.Pool, safetyPath, 
 			_ = conn.Conn().Close(cleanup)
 		}
 	}()
-	dir, e := os.MkdirTemp("", "stoarama-finish-")
-	if e != nil {
-		return status, finishImport
-	}
-	defer os.RemoveAll(dir)
+	// The wrapper owns this private attempt directory. Retain exact manifests
+	// on CLI failure/interruption; only wrapper success removes its scratch.
+	dir := filepath.Dir(safetyPath)
 	refreshFed := false
 	for {
 		s, c, e := finishReadEvidence(safetyPath, copyPath)

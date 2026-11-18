@@ -2,12 +2,11 @@
 """Controller-installed metadata feeder. Never controls cleanup or deletion."""
 import argparse
 from contextlib import ExitStack
-import fcntl
 import json
 import os
 from pathlib import Path
 import subprocess
-import tempfile
+from admission import Attempt, Latched, publish
 
 STOPS = {'evidence_unavailable', 'cleanup_recovery_problems', 'unknown_enabled_cleanup',
          'copy_mismatch_latched', 'shutdown_or_recovery_failed', 'deletion_master_mismatch',
@@ -27,16 +26,12 @@ def main():
     if bool(args.refresh_picks) != bool(args.expected_refresh_picks_sha256):
         ap.error('refresh picks and digest must be supplied together')
     reason = 'dependency_failed'
-    try:
-        with ExitStack() as stack:
+    attempt = None
+    with ExitStack() as stack:
+        try:
             args.state.mkdir(mode=0o700, parents=True, exist_ok=True)
-            lock = stack.enter_context((args.state / 'lock').open('a'))
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return 0
-            # State and lock initialization failures also reach the notifier.
-            temp = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix='.tick-', dir=args.state)))
+            attempt = Attempt.start(args.state, 'tick', stack)
+            temp = attempt.path
             safety, copy, status = (temp / name for name in ('safety.json', 'copy.json', 'status.json'))
             # No env files are loaded. Controller supplies auth; dependency stderr
             # is discarded because it may contain credential-bearing URLs.
@@ -55,18 +50,40 @@ def main():
                             '--expected-refresh-picks-sha256', args.expected_refresh_picks_sha256]
             result = subprocess.run(command,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=270)
+            publish(attempt.path / 'result.json', {'returncode': result.returncode})
             reason = 'current_status_unavailable'
             # This path did not exist before THIS invocation. Never report an old
             # reason if CLI startup/status publication failed. Same-filesystem
             # rename publishes the invocation's status atomically for the dead-man.
             current = json.loads(status.read_text())
-            if result.returncode and current.get('stop_reason') in STOPS:
+            if not isinstance(current, dict):
+                raise ValueError('invalid status')
+            if current.get('stop_reason') in STOPS:
                 reason = current['stop_reason']
-            os.replace(status, args.state / 'status.json')
-            if result.returncode == 0:
+            elif result.returncode or current.get('stop_reason'):
+                reason = 'manifest_import_failed'
+            else:
+                if current.get('schema') != 'stoarama.finish-status.v1' or not isinstance(current.get('updated_at'), str):
+                    raise ValueError('invalid status schema/time')
+                reason = ''
+            if attempt.finish(reason, current):
                 return 0
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
+            reason = reason or 'evidence_unavailable'
+            notify(args.notify_agent, reason)
+            return 1
+        except Latched:
+            if attempt is not None and attempt.abandoned:
+                notify(args.notify_agent, 'admission_publication_failed')
+            print('finish admission_latched', flush=True)
+            return 1
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            reason = reason or 'current_status_unavailable'
+            if attempt is not None:
+                try:
+                    attempt.finish(reason, {})
+                except (OSError, ValueError, Latched):
+                    # The pre-subprocess active journal remains a durable stop.
+                    pass
     notify(args.notify_agent, reason)
     return 1
 

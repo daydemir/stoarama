@@ -48,6 +48,12 @@ func TestJoinedAdditiveMigrationDoesNotDependOnSessionTimezone(t *testing.T) {
 	if err := nonUTC.QueryRow(ctx, `SELECT current_setting('TimeZone'),cardinality(recording_joined_cohort_ids($1))`, additiveCohortTestBatch).Scan(&timezone, &count); err != nil || timezone != "America/Los_Angeles" || count != 9 {
 		t.Fatalf("migration changed session timezone or cohort: timezone=%s count=%d err=%v", timezone, count, err)
 	}
+	// The deferred cleanup migrations must really run in the final chain;
+	// marking 0209 applied forever would leave this permanent hold removable.
+	if _, err := nonUTC.Exec(ctx, `TRUNCATE nas_cleanup_source_holds`); err == nil || !strings.Contains(err.Error(), "source holds are permanent") {
+		t.Fatalf("final migration chain did not install permanent hold guard: %v", err)
+	}
+
 	t.Log("JOINED_ADDITIVE_NON_UTC_MIGRATION_EXECUTED")
 }
 

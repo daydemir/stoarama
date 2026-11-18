@@ -1,0 +1,398 @@
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import admission
+import reconcile
+import refresh_recovery as recovery
+import tick
+
+
+class AdmissionTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.state = Path(self.temp.name)
+        self.report = {'plan_id': 1440, 'plan_sha256': 'a' * 64, 'delete_ever_issued': 2,
+                       'verified': 2, 'problems': 0, 'checked_at': '2026-11-17T07:00:00Z'}
+
+    def invoke(self, module, run):
+        argv = ['wrapper', '--cli', 'cli', '--state', str(self.state), '--notify-agent', 'controller']
+        argv += ['--safety-collector', 'collector'] if module is tick else ['--plan-source', 'source']
+        with patch.object(sys, 'argv', argv), patch.object(subprocess, 'run', side_effect=run) as mocked, \
+                patch.object(module, 'notify'):
+            result = module.main()
+        return result, mocked.call_count
+
+    def ok(self, command, **kwargs):
+        if command[0] == 'source':
+            return subprocess.CompletedProcess(command, 0, stdout=b'{"plan_id":1440}')
+        if 'verify-recovery' in command:
+            kwargs['stdout'].write(json.dumps(self.report).encode())
+        elif 'tick' in command:
+            Path(command[command.index('--status') + 1]).write_text('{"schema":"stoarama.finish-status.v1","updated_at":"2026-11-17T07:00:00Z","imported_items":3}')
+        else:
+            kwargs['stdout'].write(b'{}')
+        return subprocess.CompletedProcess(command, 0)
+
+    def assert_blocked(self):
+        before = {str(p.relative_to(self.state)): p.read_bytes() for p in self.state.rglob('*') if p.is_file()}
+        for module in (tick, recovery):
+            self.assertEqual(self.invoke(module, self.ok), (1, 0))
+        after = {str(p.relative_to(self.state)): p.read_bytes() for p in self.state.rglob('*') if p.is_file()}
+        # Creating the other lane's flock is harmless; journal/evidence/status never change.
+        self.assertEqual(before, {k: v for k, v in after.items() if k in before})
+
+    def test_partial_import_then_next_tick_never_retries(self):
+        def partial(command, **kwargs):
+            if 'tick' in command:
+                Path(command[command.index('--status') + 1]).with_name('manifest.jsonl').write_bytes(b'exact partial import input')
+                Path(command[command.index('--status') + 1]).write_text('{"stop_reason":"manifest_import_failed","imported_items":2}')
+                return subprocess.CompletedProcess(command, 1)
+            return self.ok(command, **kwargs)
+        self.assertEqual(self.invoke(tick, partial)[0], 1)
+        evidence = next(self.state.glob('tick-*/status.json'))
+        self.assertEqual(json.loads(evidence.read_text())['imported_items'], 2)
+        self.assertEqual(evidence.with_name('manifest.jsonl').read_bytes(), b'exact partial import input')
+        self.assertEqual(json.loads((self.state / 'status.json').read_text())['stop_reason'], 'manifest_import_failed')
+        self.assert_blocked()
+
+    def test_dependency_timeout_and_missing_status_stay_latched(self):
+        for mode in ('timeout', 'missing', 'cli-timeout', 'bad-shape'):
+            with self.subTest(mode=mode):
+                # Each case uses an isolated state, every subprocess is mocked.
+                with tempfile.TemporaryDirectory() as temp:
+                    self.state = Path(temp)
+                    def failure(command, **kwargs):
+                        if mode == 'timeout' or (mode == 'cli-timeout' and 'tick' in command):
+                            raise subprocess.TimeoutExpired(command, 90)
+                        if 'tick' in command:
+                            if mode == 'bad-shape':
+                                Path(command[command.index('--status') + 1]).write_text('[]')
+                            return subprocess.CompletedProcess(command, 0)
+                        return self.ok(command, **kwargs)
+                    self.assertEqual(self.invoke(tick, failure)[0], 1)
+                    self.assert_blocked()
+
+    def test_recovery_problems_cannot_be_replaced_by_zero(self):
+        self.report['problems'] = 1
+        self.report['verified'] = 1
+        self.assertEqual(self.invoke(recovery, self.ok)[0], 1)
+        self.report['problems'] = 0
+        self.assert_blocked()
+        self.assertEqual(json.loads((self.state / 'recovery.json').read_text())['problems'], 1)
+        self.assertFalse((self.state / 'recovery-last-good.json').exists())
+
+    def test_reconcile_binds_actual_artifacts_and_resumes_recovery_first(self):
+        self.invoke(tick, lambda *a, **kw: (_ for _ in ()).throw(subprocess.TimeoutExpired('collector', 90)))
+        digest = admission.binding(self.state)
+        journal = admission.load(self.state)
+        authority, evidence = self.state / 'authority.json', self.state / 'evidence.json'
+        authority.write_text(json.dumps({'controller': '886efa32', 'authority': 'new root GO', 'latch_sha256': digest}))
+        evidence.write_text(json.dumps({'latch_sha256': digest, 'queue_reconciled': True,
+                                       'reconciled_attempts': list(journal['active'].values())}))
+        argv = ['reconcile', '--state', str(self.state), '--expected-latch-sha256', 'f' * 64,
+                '--authority', str(authority), '--evidence', str(evidence)]
+        with patch.object(sys, 'argv', argv), patch.object(subprocess, 'run') as run:
+            self.assertEqual(reconcile.main(), 1)
+            self.assertTrue(admission.load(self.state)['failed'])
+            argv[4] = digest
+            self.assertEqual(reconcile.main(), 0)
+            run.assert_not_called()
+        receipt = json.loads(next((self.state / 'reconciliations').iterdir()).read_text())
+        self.assertEqual(receipt['controller'], '886efa32')
+        self.assertEqual(receipt['evidence_sha256'], hashlib.sha256(evidence.read_bytes()).hexdigest())
+        self.assertEqual(self.invoke(tick, self.ok), (1, 0))
+        self.assertEqual(self.invoke(recovery, self.ok)[0], 0)
+        self.assertEqual(self.invoke(tick, self.ok)[0], 0)
+        self.assertTrue(next(self.state.glob('retained/tick-*/failure.json')).exists())
+
+    def test_interruption_and_failed_latch_write_leave_active_stop(self):
+        class Interrupted(BaseException):
+            pass
+        def interrupted(command, **kwargs):
+            if 'tick' in command:
+                Path(command[command.index('--status') + 1]).write_text('{"imported_items":2}')
+                raise Interrupted()
+            return self.ok(command, **kwargs)
+        with self.assertRaises(Interrupted):
+            self.invoke(tick, interrupted)
+        self.assertEqual(self.invoke(tick, self.ok), (1, 0))
+        self.assert_blocked()
+        self.assertTrue(admission.load(self.state)['failed'])
+
+    def test_failure_write_failure_still_cannot_retry(self):
+        original = admission.publish
+        def full(path, record):
+            if record.get('failed'):
+                raise OSError('disk full')
+            original(path, record)
+        with patch.object(admission, 'publish', side_effect=full):
+            self.assertEqual(self.invoke(tick, lambda *a, **kw: (_ for _ in ()).throw(OSError()))[0], 1)
+        self.assertEqual(self.invoke(tick, self.ok), (1, 0))
+        self.assert_blocked()
+
+    def test_cross_lane_failure_prevents_inflight_success_publication(self):
+        # Model either order with both real lane locks held, as in the wrappers.
+        import fcntl
+        for failed_lane in ('tick', 'recovery'):
+            with self.subTest(failed_lane=failed_lane), tempfile.TemporaryDirectory() as temp:
+                state = Path(temp)
+                with (state / 'lock').open('a') as tick_lock, (state / 'recovery.lock').open('a') as recovery_lock:
+                    for lock in (tick_lock, recovery_lock):
+                        fcntl.flock(lock, fcntl.LOCK_EX)
+                    attempts = {lane: admission.Attempt(state, lane, {'tick': tick_lock, 'recovery': recovery_lock}[lane]) for lane in admission.LANES}
+                    other = 'recovery' if failed_lane == 'tick' else 'tick'
+                    self.assertFalse(attempts[failed_lane].finish('dependency_failed', {}))
+                    self.assertFalse(attempts[other].finish('', self.report))
+                    self.assertIn('stop_reason', json.loads((state / 'status.json').read_text()))
+                    self.assertNotIn('problems', json.loads((state / 'recovery.json').read_text()))
+
+    def test_first_install_preserves_legacy_failure(self):
+        for filename, record in (('status.json', {'stop_reason': 'manifest_import_failed'}),
+                                 ('recovery.json', {'problems': 1})):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as temp:
+                self.state = Path(temp)
+                original = json.dumps(record)
+                (self.state / filename).write_text(original)
+                self.assertEqual(self.invoke(tick, self.ok), (1, 0))
+                self.assertEqual((self.state / filename).read_text(), original)
+                self.assertEqual(json.loads(next(self.state.glob('legacy-*/*')).read_text()), record)
+
+    def test_interrupted_sibling_cannot_publish_success_in_either_direction(self):
+        import fcntl
+        for interrupted_lane in ('tick', 'recovery'):
+            for failed_write in (False, True):
+                with self.subTest(lane=interrupted_lane, failed_write=failed_write), tempfile.TemporaryDirectory() as temp:
+                    state = Path(temp)
+                    with (state / 'lock').open('a') as tick_lock, (state / 'recovery.lock').open('a') as recovery_lock:
+                        locks = {'tick': tick_lock, 'recovery': recovery_lock}
+                        for lock in locks.values():
+                            fcntl.flock(lock, fcntl.LOCK_EX)
+                        attempts = {lane: admission.Attempt(state, lane, {'tick': tick_lock, 'recovery': recovery_lock}[lane]) for lane in admission.LANES}
+                        failed = attempts[interrupted_lane]
+                        admission.publish(failed.path / 'result.json', {'imported_items': 2, 'problems': 1})
+                        if failed_write:
+                            original = admission.publish
+                            def full(path, record):
+                                if path == state / 'admission.json' and record.get('failed'):
+                                    raise OSError('full disk')
+                                original(path, record)
+                            with patch.object(admission, 'publish', side_effect=full), self.assertRaises(admission.Latched):
+                                failed.finish('dependency_failed', {})
+                        fcntl.flock(locks[interrupted_lane], fcntl.LOCK_UN)
+                        other = 'recovery' if interrupted_lane == 'tick' else 'tick'
+                        self.assertFalse(attempts[other].finish('', self.report))
+                        self.assertTrue(admission.load(state)['failed'])
+                        self.assertIn('stop_reason', json.loads((state / 'status.json').read_text()))
+                        if other == 'recovery':
+                            self.assertNotIn('problems', json.loads((state / 'recovery.json').read_text()))
+
+    def test_both_legacy_failures_are_byte_preserved_and_bound(self):
+        status = b'{ "stop_reason" : "manifest_import_failed", "imported_items": 2 }\n'
+        report = b'{ "problems": 1 }\n'
+        (self.state / 'status.json').write_bytes(status)
+        (self.state / 'recovery.json').write_bytes(report)
+        self.assertEqual(self.invoke(tick, self.ok), (1, 0))
+        active = admission.load(self.state)['active']
+        self.assertEqual(len(active), 1)
+        legacy = self.state / active['legacy']
+        self.assertEqual((legacy / 'status.json').read_bytes(), status)
+        self.assertEqual((legacy / 'recovery.json').read_bytes(), report)
+        digest = admission.binding(self.state)
+        (legacy / 'status.json').write_bytes(b'changed partial import evidence')
+        self.assertNotEqual(admission.binding(self.state), digest)
+
+    def test_replacement_lock_handoff_cannot_hide_interrupted_attempt(self):
+        from contextlib import ExitStack
+        import fcntl
+        import threading
+        cases = [(lane, publishing, False) for lane in ('tick', 'recovery') for publishing in (False, True)]
+        cases.append(('tick', True, True))  # a refused reconcile can also take half the lane locks
+        for abandoned, publishing, reconciling in cases:
+            with self.subTest(lane=abandoned, publishing=publishing, reconciling=reconciling), tempfile.TemporaryDirectory() as temp:
+                state = Path(temp)
+                peer_lane = 'recovery' if abandoned == 'tick' else 'tick'
+                with ExitStack() as peer_stack, ExitStack() as old_stack:
+                    peer = admission.Attempt.start(state, peer_lane, peer_stack) if publishing else None
+                    admission.Attempt.start(state, abandoned, old_stack)
+                    old_stack.close()  # interrupted after durable admission
+                    locked, resume, peer_gate, peer_done = (threading.Event() for _ in range(4))
+                    outcomes = []
+                    real_flock = fcntl.flock
+                    def flock(fd, operation):
+                        if threading.current_thread().name == 'replacement' and operation == fcntl.LOCK_EX | fcntl.LOCK_NB:
+                            real_flock(fd, operation)
+                            locked.set()
+                            if not resume.wait(5):
+                                raise AssertionError('handoff test timed out')
+                            return
+                        if threading.current_thread().name == 'peer' and operation == fcntl.LOCK_EX:
+                            peer_gate.set()
+                        return real_flock(fd, operation)
+                    def replace():
+                        if reconciling:
+                            with patch.object(sys, 'argv', ['reconcile', '--state', str(state), '--inspect']):
+                                outcomes.append(reconcile.main())
+                            return
+                        with ExitStack() as stack:
+                            try:
+                                admission.Attempt.start(state, abandoned, stack)
+                                outcomes.append('replacement admitted')
+                            except admission.Latched:
+                                outcomes.append('replacement stopped')
+                    def complete_peer():
+                        try:
+                            if publishing:
+                                outcomes.append(peer.finish('', self.report))
+                            else:
+                                with ExitStack() as stack:
+                                    admission.Attempt.start(state, peer_lane, stack)
+                                    outcomes.append('peer admitted')
+                        except admission.Latched:
+                            outcomes.append('peer stopped')
+                        finally:
+                            peer_done.set()
+                    with patch.object(admission.fcntl, 'flock', side_effect=flock), patch.object(subprocess, 'run') as run:
+                        replacement = threading.Thread(target=replace, name='replacement')
+                        other = threading.Thread(target=complete_peer, name='peer')
+                        replacement.start()
+                        self.assertTrue(locked.wait(5))
+                        other.start()
+                        self.assertTrue(peer_gate.wait(5))
+                        try:
+                            self.assertFalse(peer_done.wait(0.05))
+                        finally:
+                            resume.set()
+                            replacement.join(5)
+                            other.join(5)
+                        self.assertFalse(replacement.is_alive() or other.is_alive())
+                        run.assert_not_called()
+                    self.assertIn(1 if reconciling else 'replacement stopped', outcomes)
+                    self.assertIn(False if publishing else 'peer stopped', outcomes)
+                    self.assertTrue(admission.load(state)['failed'])
+                    self.assertIn('stop_reason', json.loads((state / 'status.json').read_text()))
+
+    def test_failed_publication_blocks_peers_before_caller_lock_scope_exits(self):
+        from contextlib import ExitStack
+        for failed_lane in ('tick', 'recovery'):
+            for publishing in (False, True):
+                with self.subTest(lane=failed_lane, publishing=publishing), tempfile.TemporaryDirectory() as temp:
+                    state = Path(temp)
+                    other = 'recovery' if failed_lane == 'tick' else 'tick'
+                    with ExitStack() as failed_stack, ExitStack() as peer_stack:
+                        failed = admission.Attempt.start(state, failed_lane, failed_stack)
+                        peer = admission.Attempt.start(state, other, peer_stack) if publishing else None
+                        original = admission.publish
+                        def full(path, record):
+                            if path == state / 'admission.json' and record.get('failed'):
+                                raise OSError('full disk')
+                            original(path, record)
+                        with patch.object(admission, 'publish', side_effect=full), self.assertRaises(admission.Latched):
+                            failed.finish('manifest_import_failed', {})
+                        self.assertTrue(failed.abandoned)
+                        # The caller has not exited failed_stack or released its
+                        # descriptor. finish() must already make the peer stop.
+                        if publishing:
+                            self.assertFalse(peer.finish('', self.report))
+                        else:
+                            with self.assertRaises(admission.Latched):
+                                admission.Attempt.start(state, other, peer_stack)
+                        self.assertTrue(admission.load(state)['failed'])
+                        self.assertIn('stop_reason', json.loads((state / 'status.json').read_text()))
+                        if publishing and other == 'recovery':
+                            self.assertNotIn('problems', json.loads((state / 'recovery.json').read_text()))
+
+    def test_failed_replacement_admission_cannot_conceal_old_marker(self):
+        from contextlib import ExitStack
+        for abandoned in ('tick', 'recovery'):
+            with self.subTest(lane=abandoned), tempfile.TemporaryDirectory() as temp:
+                state = Path(temp)
+                other = 'recovery' if abandoned == 'tick' else 'tick'
+                with ExitStack() as old_stack, ExitStack() as replacement_stack, ExitStack() as peer_stack:
+                    admission.Attempt.start(state, abandoned, old_stack)
+                    peer = admission.Attempt.start(state, other, peer_stack)
+                    old_stack.close()
+                    original = admission.publish
+                    def full(path, record):
+                        if path == state / 'admission.json' and record.get('failed'):
+                            raise OSError('full disk')
+                        original(path, record)
+                    with patch.object(admission, 'publish', side_effect=full), self.assertRaises(OSError):
+                        admission.Attempt.start(state, abandoned, replacement_stack)
+                    # Even though the replacement caller still owns its open
+                    # descriptor, failed initialization has already unlocked it.
+                    self.assertFalse(peer.finish('', self.report))
+                    self.assertTrue(admission.load(state)['failed'])
+
+    def test_post_replace_fsync_error_stops_admission_publication_and_binds_orphan(self):
+        from contextlib import ExitStack
+        for failed_lane in ('tick', 'recovery'):
+            for publishing in (False, True):
+                with self.subTest(lane=failed_lane, publishing=publishing), tempfile.TemporaryDirectory() as temp:
+                    state = Path(temp)
+                    other = 'recovery' if failed_lane == 'tick' else 'tick'
+                    with ExitStack() as failed_stack, ExitStack() as peer_stack:
+                        failed = admission.Attempt.start(state, failed_lane, failed_stack)
+                        peer = admission.Attempt.start(state, other, peer_stack) if publishing else None
+                        original = admission.publish
+                        def after_replace(path, record):
+                            if path == state / 'admission.json' and failed_lane not in record['active']:
+                                # Exact publish ordering: replace succeeds, parent fsync fails.
+                                with patch.object(admission, 'sync_dir', side_effect=OSError('directory fsync')):
+                                    original(path, record)
+                            else:
+                                original(path, record)
+                        with patch.object(admission, 'publish', side_effect=after_replace), self.assertRaises(admission.Latched):
+                            failed.finish('', self.report)
+                        self.assertNotIn(failed_lane, admission.load(state)['active'])
+                        canonical = state / ('status.json' if failed_lane == 'tick' else 'recovery.json')
+                        self.assertFalse(canonical.exists())
+                        before = admission.binding(state)
+                        (failed.path / 'attempt.json').write_text('{"changed":"retained orphan evidence"}')
+                        self.assertNotEqual(admission.binding(state), before)
+                        if publishing:
+                            self.assertFalse(peer.finish('', self.report))
+                        else:
+                            with self.assertRaises(admission.Latched):
+                                admission.Attempt.start(state, other, peer_stack)
+                        self.assertTrue(admission.load(state)['failed'])
+
+    def test_reconcile_requires_orphan_evidence_even_with_empty_active_map(self):
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            attempt = admission.Attempt.start(self.state, 'tick', stack)
+            original = admission.publish
+            def after_replace(path, record):
+                if path == self.state / 'admission.json' and not record['active']:
+                    with patch.object(admission, 'sync_dir', side_effect=OSError('directory fsync')):
+                        original(path, record)
+                else:
+                    original(path, record)
+            with patch.object(admission, 'publish', side_effect=after_replace), self.assertRaises(admission.Latched):
+                attempt.finish('', self.report)
+        journal = admission.load(self.state)
+        self.assertFalse(journal['active'])
+        digest = admission.binding(self.state)
+        authority, evidence = self.state / 'authority.json', self.state / 'evidence.json'
+        authority.write_text(json.dumps({'controller': '886efa32', 'authority': 'new GO', 'latch_sha256': digest}))
+        record = {'latch_sha256': digest, 'queue_reconciled': True, 'reconciled_attempts': []}
+        evidence.write_text(json.dumps(record))
+        argv = ['reconcile', '--state', str(self.state), '--expected-latch-sha256', digest,
+                '--authority', str(authority), '--evidence', str(evidence)]
+        with patch.object(sys, 'argv', argv), patch.object(subprocess, 'run') as run:
+            self.assertEqual(reconcile.main(), 1)
+            record['reconciled_attempts'] = [attempt.path.name]
+            evidence.write_text(json.dumps(record))
+            self.assertEqual(reconcile.main(), 0)
+            run.assert_not_called()
+        self.assertFalse(attempt.path.exists())
+        self.assertTrue((self.state / 'retained' / attempt.path.name / 'attempt.json').exists())
+        self.assertEqual(self.invoke(tick, self.ok), (1, 0))
+        self.assertEqual(self.invoke(recovery, self.ok)[0], 0)
+        self.assertEqual(self.invoke(tick, self.ok)[0], 0)
