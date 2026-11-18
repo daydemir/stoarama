@@ -270,6 +270,7 @@ class FakeRunner(r.Runner):
         self.picks = [42, None]
         self.owner_validated = True
 
+    def finish_health(self): pass
     def validate_owner(self): self.owner_validated = True
     def load_policy(self): pass
     def initialize(self): pass
@@ -1293,7 +1294,7 @@ class ReadFailureTests(unittest.TestCase):
 
     def test_monitor_read_failure_reaches_failure_path_before_progress(self):
         with tempfile.TemporaryDirectory() as root:
-            job=self.job(root);job.owner_validated=True;job.status.update(current_plan=42,live_commit='d'*40)
+            job=self.job(root);job.finish_health=lambda:None;job.owner_validated=True;job.status.update(current_plan=42,live_commit='d'*40)
             with patch.dict(os.environ,SERVICE_TOKEN='fixture'),patch.object(r,'request',side_effect=r.ReadFailure('HTTP transport failed (GET)')) as request, \
                  patch.object(job,'master') as master,patch.object(job,'alert'),patch.object(job,'drain'),patch.object(job,'recovery'), \
                  patch.object(job,'finish') as finish,patch.object(job,'progress') as progress,patch.object(r.time,'sleep') as sleep, \

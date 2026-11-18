@@ -573,6 +573,7 @@ class Runner:
         require(active['batches'] == 0 and active['plans'] in ([], [pid]),
                 'unknown enabled plan or batch; owner review required')
         if enabled:
+            self.finish_health()
             require(not emergency and not active['plans'] and pid,
                     'execution cannot be enabled')
             require(self.plan(pid)['master_deletion_enabled'] is True,
@@ -582,10 +583,14 @@ class Runner:
             plan = self.plan(pid)
             require(self.status.get('started_plan_sha256') == plan['plan_sha256'],
                     'execution ownership digest differs')
+            if plan['mode'] in {'paused', 'retired'}:
+                return  # Preserve a server pause/expiry committed after active().
+            require(plan['mode'] == 'enabled', 'owned execution mode differs')
             self.api('POST', 'plans/' + str(pid) + '/control', {
                 'plan_sha256': plan['plan_sha256'], 'mode': 'paused',
-                'reason': ('completed: all items deleted or kept' if execution_state(plan) == 'done'
-                           else 'cleanup runner stopped; owner recovery required')})
+                'reason': ('completed: all items deleted or kept'
+                           if all((row['state'] == 'deleted' and row['delete_ever_issued']) or certified_refusal(row)
+                                  for row in results(plan)) else 'cleanup runner stopped; owner recovery required')})
             require(self.plan(pid)['mode'] == 'paused', 'owned pause not confirmed')
         self.status['phase'] = 'execution_off'
 
@@ -606,8 +611,48 @@ class Runner:
             require(pid == owner['initial_plan_id'] and
                     self.plan(pid)['plan_sha256'] == owner['initial_plan_sha256'],
                     'initial cleanup plan differs')
-        self.status['runner_pid'] = os.getpid()
+        self.finish_state = Path(owner['finish_state'])
+        require(self.finish_state.is_absolute(), 'finish state must be explicit and absolute')
         self.owner_validated = True
+        self.finish_health()
+        self.status['runner_pid'] = os.getpid()
+
+    def finish_health(self):
+        admission = json.loads((self.finish_state / 'admission.json').read_bytes())
+        require(admission['failed'] is False and admission['recovery_required'] is False,
+                'finish admission requires owner reconciliation')
+        report = json.loads((self.finish_state / 'recovery.json').read_bytes())
+        require(all(type(report[key]) is int and report[key] >= 0 for key in ('plan_id', 'problems', 'verified', 'delete_ever_issued')),
+                'invalid finish recovery counts')
+        prior = self.status['recovery_history'][str(report['plan_id'])]
+        require(prior['sha256'] == report['plan_sha256'] and prior['issued'] == report['delete_ever_issued'],
+                'finish recovery identity differs')
+        require('refresh_error' not in report and report['problems'] == 0
+                and report['verified'] == report['delete_ever_issued'],
+                'finish recovery failed; cleanup must stop')
+        require(0 <= (utcnow() - timestamp(report['checked_at'])).total_seconds() <= 7 * 3600,
+                'finish recovery evidence is stale or future')
+
+    def contain(self):
+        # A pause is monotonic and digest-bound. After a lost/failed response,
+        # re-read active execution and the exact plan before any further pause.
+        # Never abandon a possibly enabled plan just because the network failed.
+        delay = 15
+        while True:
+            try:
+                self.master(False, emergency=True)
+                return
+            except Exception:
+                self.status['shutdown_or_recovery_failed'] = True
+                self.status['recovery_error'] = 'owned execution stop not confirmed'
+                self.step_failed('owned execution stop')
+                self.alert('Owned execution stop unconfirmed; supervising until contained')
+                try:
+                    self.save('failed')
+                except Exception:
+                    critical('containment latch write failed')
+                time.sleep(delay)
+                delay = min(delay * 2, 300)
 
     def stopped(self):
         return self.stopping or (self.root / 'STOP').exists()
@@ -763,6 +808,7 @@ class Runner:
         while True:
             if self.stopped():
                 return None
+            self.finish_health()
             p = self.plan(pid)
             require(p['master_deletion_enabled'] is True, 'controller runtime master is OFF')
             if dry_state(p):
@@ -988,6 +1034,7 @@ class Runner:
         while True:
             require(not self.status.get('shutdown_or_recovery_failed') and not self.status.get('recovery_error'),
                     'live ownership failure requires shutdown')
+            self.finish_health()
             p = self.plan(pid)
             self.record_refusals(p)
             state = execution_state(p)
@@ -1018,6 +1065,7 @@ class Runner:
         self.check_restart()
         if not self.owner_validated:
             self.validate_owner()
+        self.finish_health()
         active = self.active()
         pid = self.status['current_plan']
         if not active['plans']:
@@ -1099,6 +1147,7 @@ class Runner:
             if self.stopped():
                 self.master(False)
                 break
+            self.finish_health()
             self.api('POST', 'plans/' + str(pid) + '/control', {'mode': 'enabled',
                 'plan_sha256': p['plan_sha256'], 'approval_hours': 24,
                 'allow_long_approval': True, 'reason': REASON})
@@ -1114,12 +1163,7 @@ class Runner:
             self.save('failed')
         except Exception:
             critical('failure latch write failed')
-        try:
-            self.master(False, emergency=True)
-        except Exception:
-            self.status['shutdown_or_recovery_failed'] = True
-            self.status['recovery_error'] = 'owned execution stop not confirmed'
-            self.step_failed('owned execution stop')
+        self.contain()
         self.alert('STOPPED: owner review required')
         try:
             if self.status['current_plan']:

@@ -10,8 +10,12 @@ class ControllerOwnershipTests(unittest.TestCase):
     def job(self, root):
         job = r.Runner(Path('.'), Path(root))
         job.owner_validated = True
+        job.finish_state = Path(root) / 'finish'
+        job.finish_state.mkdir()
+        (job.finish_state / 'admission.json').write_text(json.dumps(dict(failed=False, recovery_required=False)))
+        (job.finish_state / 'recovery.json').write_text(json.dumps(dict(plan_id=42, plan_sha256='b'*64, problems=0, verified=1, delete_ever_issued=1, checked_at=r.utcnow().isoformat())))
         plan, _ = fixture()
-        job.status.update(current_plan=42, started_plan_sha256=plan['plan_sha256'])
+        job.status.update(current_plan=42, started_plan_sha256=plan['plan_sha256'], recovery_history={'42':dict(sha256='b'*64, issued=1)})
         return job, plan
 
     def test_on_is_read_only_and_requires_controller_master(self):
@@ -29,6 +33,7 @@ class ControllerOwnershipTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             job, plan = self.job(root)
             plan.update(mode='enabled')
+            plan['results'][0].update(state='unverified', delete_ever_issued=True)
             job.active = lambda: dict(plans=[42], batches=0)
             job.plan = lambda _: plan
             calls = []
@@ -117,6 +122,46 @@ class ControllerOwnershipTests(unittest.TestCase):
                 job.start()
             self.assertEqual(json.loads(path.read_bytes())['runner_pid'], r.os.getpid())
             job.lock.close()
+
+    def test_pause_failure_is_reconciled_before_retry_and_never_abandoned(self):
+        with tempfile.TemporaryDirectory() as root:
+            job, plan = self.job(root)
+            plan.update(mode='enabled')
+            job.active = lambda: dict(plans=[42] if plan['mode'] == 'enabled' else [], batches=0)
+            job.plan = lambda _: plan
+            calls = []
+            def pause(*args):
+                calls.append(args)
+                if len(calls) == 1: raise r.Halt('HTTP transport failed')
+                plan['mode'] = 'paused'
+            job.api = pause
+            with patch.object(job, 'alert'), patch.object(r.time, 'sleep'):
+                job.contain()
+            self.assertEqual(plan['mode'], 'paused')
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(job.status['shutdown_or_recovery_failed'])
+
+    def test_d_failure_stops_monitor_and_prevents_enable(self):
+        for name, record in [('admission.json', dict(failed=True, recovery_required=True)),
+                             ('recovery.json', dict(problems=1, verified=0, delete_ever_issued=1)),
+                             ('recovery.json', dict(refresh_error='failed'))]:
+            with tempfile.TemporaryDirectory() as root:
+                job, plan = self.job(root)
+                (job.finish_state / name).write_text(json.dumps(record))
+                job.active = lambda: dict(plans=[], batches=0)
+                job.plan = lambda _: plan
+                with self.assertRaises((r.Halt, KeyError)): job.monitor(42)
+                with self.assertRaises((r.Halt, KeyError)): job.master(True)
+
+    def test_auto_pause_between_active_and_get_preserves_reason(self):
+        with tempfile.TemporaryDirectory() as root:
+            job, plan = self.job(root)
+            plan.update(mode='paused', approval_reason='auto-paused: approval expired; original')
+            job.active = lambda: dict(plans=[42], batches=0)
+            job.plan = lambda _: plan
+            job.api = lambda *_: self.fail('already paused plan must not be rewritten')
+            job.master(False)
+            self.assertEqual(r.execution_state(plan), 'expired')
 
     def test_runner_has_no_render_capability(self):
         text = Path(r.__file__).read_text()

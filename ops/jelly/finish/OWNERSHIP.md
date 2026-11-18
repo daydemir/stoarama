@@ -12,6 +12,7 @@ The controller writes an immutable `~/stoarama-cleanup-runner/cleanup-owner.json
 {
   "schema": "stoarama.cleanup-owner.v1",
   "owner_id": "<new canonical UUID>",
+  "finish_state": "/Users/jelly/stoarama-finish-eae77803-v5-v3/state",
   "initial_plan_id": 1441,
   "initial_plan_sha256": "23b175d7b1822030b24998e0deeb0da40b852f34ab9926d3a25d8dda7426ff40",
   "baseline_plan_id": 1440,
@@ -91,3 +92,10 @@ through restart-latch/manifest validation and durable PID publication. Rejected
 starts preserve the prior bytes; collectors cannot see a new flock with old PID.
 A live heartbeat failure raises a terminal execution check and takes the owned
 pause/drain path; it is distinct from a preexisting restart latch.
+
+The runner consumes the same explicit D admission/recovery state before startup,
+each active poll and enable. D failures, missing reports, stale reports or identity
+mismatches stop cleanup too. Emergency containment retains supervision until the
+exact owned plan is confirmed stopped. After a lost pause response it re-reads the
+active set and exact digest before another monotonic pause; it never retries item
+execution or writes a foreign plan. Already-paused expiry reasons are preserved.

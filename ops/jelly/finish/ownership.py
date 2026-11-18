@@ -99,6 +99,7 @@ def collect(root, repo, recovery_path, owner_sha256, now, plan_source=False):
     raw = (root / 'cleanup-owner.json').read_bytes()
     require(re.fullmatch('[a-f0-9]{64}', owner_sha256) and digest(raw) == owner_sha256)
     owner = json.loads(raw)
+    require(owner['finish_state'] == str(recovery_path.parent))
     require(digest((root / 'incident-recovery-1440-20261117/closed-verified.json').read_bytes()) == CLOSE_SHA)
     with (root / 'ownership.lock').open('a') as snapshot:
         fcntl.flock(snapshot, fcntl.LOCK_SH)
