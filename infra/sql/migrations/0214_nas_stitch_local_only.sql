@@ -1,0 +1,28 @@
+-- NAS stitching is a local-only writer: it reads raw clips from the NAS and
+-- writes new NAS files plus nas_stitch_* DB rows. It makes no R2 PUT. Its only
+-- R2 call is the pinned tool fetch, which the API serves as a presigned GET
+-- (read-only, exact object, no upload). The 0187 writer fence therefore must not
+-- gate the stitch lane: without this migration every pending/leased
+-- nas_stitch_tasks row and every nas_stitch_outputs row raises while the fence
+-- is active, and because keep28 raw on the NAS is never deleted for stitching,
+-- the lane-busy check (a verified task with an undeleted cleanup plan) would
+-- keep the single lane busy forever after its first task.
+--
+-- Only the two stitch triggers are removed. Every other 0187 trigger stays.
+--
+-- Functions that read these tables (grep for r2_retirement_writers_drained and
+-- r2_retirement_writes_blocked):
+--   * r2_retirement_writers_drained(b) (0187, replaced by 0196) counts
+--     nas_stitch_tasks in ('pending','leased') as a drain blocker. 0198 keeps
+--     that function as an explicitly diagnostic-only observation (see the
+--     0198 header and docs/r2-owner-fence-policy.md); it is not an admission
+--     gate, so a pending stitch task can no longer veto an R2 retirement batch.
+--   * r2_retirement_writes_blocked(b, endpoint) (0198) does not read
+--     nas_stitch_tasks or nas_stitch_outputs at all; it is unchanged.
+--   * stoatamactl r2-retire reconcile-writers / head-guard and
+--     r2RetireCheckStoppedWriters call r2_retirement_writers_drained for a
+--     read-only JSONL observation only (r2RetireCheckStoppedWriters is used
+--     only by tests). No production executor calls it before a delete batch.
+-- No function reads nas_stitch_outputs outside the fence triggers.
+DROP TRIGGER r2_writer_stitch ON nas_stitch_tasks;
+DROP TRIGGER r2_writer_insert ON nas_stitch_outputs;
