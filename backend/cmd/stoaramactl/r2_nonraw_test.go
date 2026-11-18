@@ -608,3 +608,252 @@ func TestR2NonrawWireProtectionRace(t *testing.T) {
 		}
 	})
 }
+
+// rawDeliveryFixture builds a disposable-PG schema with RAW clips that carry an
+// exact delivery_keep_holds row, so an exact-key delivery hold really is the
+// only thing standing between the clip and deletion.
+type rawDeliveryFixture struct {
+	pool     *pgxpool.Pool
+	ctx      context.Context
+	policy   string
+	picks    string
+	drain    string
+	drainSHA string
+	root     string
+	sdk      *inverseSDKStore
+	store    *inverseFakeStore
+	deletes  func() int64
+	keys     []string
+}
+
+func newRawDeliveryFixture(t *testing.T, prefix string, holdKeys ...string) *rawDeliveryFixture {
+	t.Helper()
+	ctx := context.Background()
+	schemaPool := joinedPurgeTestPool(t, prefix)
+	cfg := schemaPool.Config()
+	cfg.MaxConns = 20
+	cfg.MinConns = 2
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err = db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir()); err != nil {
+		t.Fatal(err)
+	}
+	policy, windows, err := api.Keep28Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := windows[3]
+	root := t.TempDir()
+	f := &rawDeliveryFixture{pool: pool, ctx: ctx, policy: policy, root: root}
+	w3 := w
+	picksPath := filepath.Join(root, "picks.json")
+	picksData, _ := json.Marshal(map[string]any{"choices": map[string]any{"3": r2RetirePick{Choice: "none", KeepStartUTC: w3.Start.Format(time.RFC3339), KeepEndUTC: w3.End.Format(time.RFC3339)}}})
+	if err = os.WriteFile(picksPath, picksData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.picks = picksPath
+	f.exec(`INSERT INTO accounts(id,email) VALUES(47,'rawdelivery@test.invalid');
+ INSERT INTO account_api_keys(id,account_id,key_prefix,secret_hash) VALUES(1,47,'test-rawdelivery','not-a-real-credential');
+ INSERT INTO connections(id,account_id,kind,api_key_id) VALUES(13,47,'nas_pull',1);
+ INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps) VALUES(3,'test','3','rawdelivery','rawdelivery','https://test.invalid','off','Asia/Tokyo','hls','video_manifest','video_live','continuous_video',30);
+ INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc) VALUES(1,47,'test','https://test.invalid','auto','stoarama','fixture',decode('00','hex'));
+ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at) VALUES(30,47,1,'rawdelivery','https://test.invalid','* * * * *','Asia/Tokyo','paused',3,now());`)
+	f.store = &inverseFakeStore{objects: map[string]r2.ObjectInfo{}}
+	f.sdk, f.deletes = inverseSDKTestStore(t, f.store)
+	f.store.endpointSHA = f.sdk.EndpointSHA256()
+	for i, key := range holdKeys {
+		etag := fmt.Sprintf("delivery-etag-%d", i)
+		f.store.objects[key] = r2.ObjectInfo{Key: key, ETag: etag, SizeBytes: 100, LastModified: inverseRetirementCutoff().Add(-time.Second)}
+		f.exec(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path)
+ VALUES($1,30,1,'https://test.invalid','stoarama',$2,100,$3,$4,'2026-06-01'::timestamptz,'2026-06-01'::timestamptz,'2026-06-01 00:01:00'::timestamptz,'delivery/'||$5)`, 9100000+i, key, etag, strings.Repeat("b", 64), fmt.Sprintf("%d.mp4", i))
+		f.exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,$2,100,'metadata')`, key, etag)
+		f.keys = append(f.keys, key)
+	}
+	f.exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, f.sdk.EndpointSHA256())
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`SET LOCAL session_replication_role=replica`, nil},
+		{`UPDATE r2_retirement_writer_fences SET activated_at='2026-11-12T14:28:47.037031Z'`, nil},
+		{`UPDATE r2_retirement_writer_fences SET drain_not_before=clock_timestamp()-interval '1 hour'`, nil},
+	} {
+		if _, err = tx.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(q.sql, err)
+		}
+	}
+	if err = tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// seed inserts with replication role disabled. Fixture rows are created by the
+// test, not by a writer the activated fence is meant to exclude, so the writer
+// admission must not be exercised by fixture setup itself.
+func (f *rawDeliveryFixture) seed(query string, args ...any) {
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		panic(err)
+	}
+	if _, err = tx.Exec(f.ctx, `SET LOCAL session_replication_role=replica`); err != nil {
+		panic(err)
+	}
+	if _, err = tx.Exec(f.ctx, query, args...); err != nil {
+		panic(fmt.Sprintf("seed %q: %v", query, err))
+	}
+	if err = tx.Commit(f.ctx); err != nil {
+		panic(err)
+	}
+}
+
+func (f *rawDeliveryFixture) exec(query string, args ...any) {
+	if _, err := f.pool.Exec(f.ctx, query, args...); err != nil {
+		panic(fmt.Sprintf("fixture %q: %v", query, err))
+	}
+}
+
+// applier builds a B1 outside-keep28 applier. Reviewed selects the owner fence
+// policy, which is the only thing that can grant RAW delivery eligibility.
+func (f *rawDeliveryFixture) applier(t *testing.T, reviewed bool) *inverseApplier {
+	t.Helper()
+	picks, err := loadR2RetirePicks(f.picks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var activated, deadline time.Time
+	if err = f.pool.QueryRow(f.ctx, `SELECT activated_at,drain_not_before FROM r2_retirement_writer_fences`).Scan(&activated, &deadline); err != nil {
+		t.Fatal(err)
+	}
+	drain := inverseDrainEvidence{Proof: inversePUTCompletionProof, Bucket: "stoarama", EndpointSHA256: f.sdk.EndpointSHA256(), FenceActivatedAt: activated, DrainNotBefore: deadline, ObservedAt: time.Now().UTC(), DeployedWriterCoverage: "fixture", AcceptedPUTCompletion: "fixture"}
+	if reviewed {
+		drain = inverseDrainEvidence{Proof: inverseOwnerFenceProof, Bucket: "stoarama", EndpointSHA256: f.sdk.EndpointSHA256(), FenceActivatedAt: activated, DrainNotBefore: deadline, ObservedAt: time.Now().UTC(),
+			FencePolicy: &inverseFencePolicyEvidence{PartitionSHA256: strings.Repeat("d", 64), SummarySHA256: strings.Repeat("c", 64), LastModifiedBefore: inverseRetirementCutoff(), OwnerDecision: inverseEvidenceReference{Path: "../../../docs/records/r2-owner-fence-policy-20261118.md", SHA256: inverseOwnerDecisionSHA256}, ResidualAcceptance: inverseApprovedFenceResidual}}
+	}
+	f.drain = filepath.Join(f.root, fmt.Sprintf("drain-%v.json", reviewed))
+	data, _ := json.Marshal(drain)
+	if err = os.WriteFile(f.drain, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.drainSHA, _ = inverseFileSHA(f.drain)
+	summary := inverseSummary{Version: 1, Bucket: "stoarama", EndpointSHA256: f.sdk.EndpointSHA256(), CreatedAt: time.Now().UTC(), PolicySHA256: f.policy, PicksSHA256: picks.SHA256, ReadOnly: true}
+	o := inverseApplyOptions{Lane: inverseOutsideKeep28, Manifest: f.root + "/partition.jsonl", ManifestSHA: strings.Repeat("d", 64), Summary: f.root + "/summary.json", SummarySHA: strings.Repeat("c", 64), Picks: f.picks, Ledger: filepath.Join(f.root, "ledger-"+fmt.Sprint(reviewed)+".jsonl"), DrainEvidence: f.drain, DrainSHA: f.drainSHA, MaxItems: 100, MaxBytes: 1 << 30, Workers: 2, ReviewedDelivery: reviewed}
+	protection, err := loadInverseProtection(f.ctx, f.pool, "stoarama", picks, windowsForTest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := openInverseLedger(o.Ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var epoch int64
+	if err = f.pool.QueryRow(f.ctx, `SELECT epoch FROM r2_inverse_ke_epoch`).Scan(&epoch); err != nil {
+		t.Fatal(err)
+	}
+	return &inverseApplier{pool: f.pool, store: f.sdk, opts: o, summary: summary, protection: protection, ledger: ledger, keEpoch: epoch}
+}
+
+func windowsForTest(t *testing.T) map[int64]api.Keep28Window {
+	t.Helper()
+	_, windows, err := api.Keep28Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return windows
+}
+
+func (f *rawDeliveryFixture) entry(i int) inverseEntry {
+	return inverseEntry{ObjectInfo: f.store.objects[f.keys[i]], Class: inverseDeletable}
+}
+
+// TestR2RawReviewedDeliveryIsEligible is the positive case: an exact-key delivery
+// hold on a mapped RAW clip is eligible under the reviewed owner fence policy,
+// through a typed RAW intent plus the matching reviewed reservation class.
+func TestR2RawReviewedDeliveryIsEligible(t *testing.T) {
+	key := "managed/acct-47/delivery/000.mp4"
+	f := newRawDeliveryFixture(t, "raw_delivery_pos", key)
+	a := f.applier(t, true)
+	ok, err := a.delete(f.ctx, f.entry(0))
+	if err != nil || !ok || f.deletes() != 1 {
+		t.Fatalf("reviewed RAW delivery not retired: ok=%v err=%v deletes=%d", ok, err, f.deletes())
+	}
+	var class string
+	if err = f.pool.QueryRow(f.ctx, `SELECT retirement_class FROM r2_retirement_reservations WHERE kind='raw' AND object_key=$1`, key).Scan(&class); err != nil || class != inverseNonrawRetirementClass {
+		t.Fatalf("reservation class %q err %v", class, err)
+	}
+	var intentClass string
+	if err = f.pool.QueryRow(f.ctx, `SELECT retirement_class FROM r2_inverse_intents WHERE object_key=$1`, key).Scan(&intentClass); err != nil || intentClass != inverseNonrawRetirementClass {
+		t.Fatalf("intent class %q err %v", intentClass, err)
+	}
+	var receipts int
+	if err = f.pool.QueryRow(f.ctx, `SELECT count(*) FROM r2_object_retirements WHERE object_key=$1 AND kind='raw'`, key).Scan(&receipts); err != nil || receipts != 1 {
+		t.Fatalf("receipt %d err %v", receipts, err)
+	}
+	a.ledger.close()
+}
+
+// TestR2RawDeliveryVetoesStayStrict is the negative case: without the reviewed
+// scope, with a mismatched identity, or with an untyped/legacy intent, the exact
+// delivery hold still wins and no DELETE happens.
+func TestR2RawDeliveryVetoesStayStrict(t *testing.T) {
+	t.Run("legacy_default_scope_still_vetoes", func(t *testing.T) {
+		key := "managed/acct-47/delivery/100.mp4"
+		f := newRawDeliveryFixture(t, "raw_delivery_legacy", key)
+		a := f.applier(t, false)
+		defer a.ledger.close()
+		if ok, err := a.delete(f.ctx, f.entry(0)); err == nil || ok || f.deletes() != 0 {
+			t.Fatalf("legacy scope deleted a delivery-held RAW key: ok=%v err=%v deletes=%d", ok, err, f.deletes())
+		}
+	})
+
+	t.Run("reviewed_class_without_typed_intent_vetoes", func(t *testing.T) {
+		key := "managed/acct-47/delivery/200.mp4"
+		f := newRawDeliveryFixture(t, "raw_delivery_notyped", key)
+		// The reservation alone, with the reviewed class but no typed intent, must
+		// still be refused by 0190.
+		if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class)
+ SELECT 'raw',c.id,'stoarama',c.object_key,c.size_bytes,lower(c.sha256),repeat('d',64),$2 FROM recording_clips c WHERE c.object_key=$1`, key, inverseNonrawRetirementClass); err == nil {
+			t.Fatal("reviewed class without a typed intent bypassed the delivery hold")
+		}
+	})
+
+	t.Run("wrong_scope_class_on_typed_intent_vetoes", func(t *testing.T) {
+		key := "managed/acct-47/delivery/300.mp4"
+		f := newRawDeliveryFixture(t, "raw_delivery_wrongclass", key)
+		// A typed intent with an empty (legacy) class must not authorize the class.
+		if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_inverse_intents(bucket,object_key,endpoint_sha256,stream_id,source_id,size_bytes,etag,last_modified,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice,retirement_class)
+ SELECT 'stoarama',c.object_key,$2,3,c.id,c.size_bytes,c.etag,'2026-11-01T00:00:00Z',repeat('d',64),$3,repeat('e',64),repeat('a',64),'none','' FROM recording_clips c WHERE c.object_key=$1`, key, f.sdk.EndpointSHA256(), f.policy); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class)
+ SELECT 'raw',c.id,'stoarama',c.object_key,c.size_bytes,lower(c.sha256),repeat('d',64),$2 FROM recording_clips c WHERE c.object_key=$1`, key, inverseNonrawRetirementClass); err == nil {
+			t.Fatal("empty-class intent authorized the reviewed retirement class")
+		}
+	})
+
+	t.Run("mismatched_identity_does_not_inherit_exemption", func(t *testing.T) {
+		key := "managed/acct-47/delivery/400.mp4"
+		f := newRawDeliveryFixture(t, "raw_delivery_mismatch", key)
+		var other int64 = 9100999
+		otherKey := "managed/acct-47/delivery/other.mp4"
+		f.seed(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path)
+ VALUES($1,30,1,'https://test.invalid','stoarama',$2,100,'other-etag',repeat('b',64),'2026-06-01'::timestamptz,'2026-06-01'::timestamptz,'2026-06-01 00:01:00'::timestamptz,'delivery/other.mp4')`, other, otherKey)
+		// A typed reviewed intent for a DIFFERENT key/source must not exempt this
+		// delivery-held key: the exemption is exact identity, never the class alone.
+		if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_inverse_intents(bucket,object_key,endpoint_sha256,stream_id,source_id,size_bytes,etag,last_modified,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice,retirement_class)
+ VALUES('stoarama',$1,$2,3,$3,100,'other-etag','2026-11-01T00:00:00Z',repeat('d',64),$4,repeat('e',64),repeat('a',64),'none',$5)`, otherKey, f.sdk.EndpointSHA256(), other, f.policy, inverseNonrawRetirementClass); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class)
+ SELECT 'raw',c.id,'stoarama',c.object_key,c.size_bytes,lower(c.sha256),repeat('d',64),$2 FROM recording_clips c WHERE c.object_key=$1`, key, inverseNonrawRetirementClass); err == nil {
+			t.Fatal("mismatched identity inherited the reviewed exemption")
+		}
+	})
+}

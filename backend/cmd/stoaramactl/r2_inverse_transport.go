@@ -60,24 +60,54 @@ func (a *inverseDeleteAuthority) check(ctx context.Context, bucket, endpoint str
 	return nil
 }
 
-func (a *inverseApplier) prepareWireTarget(ctx context.Context, tx pgx.Tx, e inverseEntry) (inverseRawTarget, error) {
+// protectionEnvelope is the ONE wire protection envelope shared by the RAW and
+// collated paths: the metadata barrier, ordered shared protection locks, the
+// exact COPY key latch, a locked live reload and a fresh KE-epoch plus controller
+// evidence check. load is the only per-lane part (typed RAW or typed collated);
+// everything that guards the DELETE is common, so the collated path cannot drift
+// into a weaker copy. The reservation commits before wire, so this envelope is
+// the only thing standing between a stale protection change and the DELETE.
+func (a *inverseApplier) protectionEnvelope(ctx context.Context, tx pgx.Tx, e inverseEntry, load func(context.Context, pgx.Tx, inverseEntry) error) error {
 	if err := inverseProtectionBarrier(ctx, tx); err != nil {
-		return inverseRawTarget{}, err
+		return err
 	}
 	if err := inverseProtectionLocks(ctx, tx, true); err != nil {
-		return inverseRawTarget{}, err
+		return err
 	}
 	if _, err := tx.Exec(ctx, `SELECT lock_nas_r2_copy_key($1,$2)`, a.store.Bucket(), e.Key); err != nil {
-		return inverseRawTarget{}, err
+		return err
 	}
-	target, err := a.loadTarget(ctx, tx, e)
-	if err != nil {
-		return inverseRawTarget{}, err
+	if err := load(ctx, tx, e); err != nil {
+		return err
 	}
-	if err = a.checkTarget(ctx, tx, target, e, true); err != nil {
-		return inverseRawTarget{}, err
+	// KE folder membership, picks and pinned windows are cached per batch. A
+	// catalog identity change must not survive into wire authority.
+	var epoch int64
+	if err := tx.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`).Scan(&epoch); err != nil {
+		return err
 	}
-	return target, nil
+	if epoch != a.keEpoch {
+		return errors.New("KE catalog identity changed; refresh partition before further wire attempts")
+	}
+	// Fresh controller evidence and live writer categories immediately before the
+	// DELETE, not just at batch start.
+	return a.checkEvidence(ctx, tx)
+}
+
+func (a *inverseApplier) prepareWireTarget(ctx context.Context, tx pgx.Tx, e inverseEntry) (inverseRawTarget, error) {
+	var target inverseRawTarget
+	err := a.protectionEnvelope(ctx, tx, e, func(ctx context.Context, tx pgx.Tx, e inverseEntry) error {
+		t, err := a.loadTarget(ctx, tx, e)
+		if err != nil {
+			return err
+		}
+		if err = a.checkTarget(ctx, tx, t, e, true); err != nil {
+			return err
+		}
+		target = t
+		return nil
+	})
+	return target, err
 }
 func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverseEntry, target inverseRawTarget) error {
 	head, err := a.store.Head(ctx, e.Key)

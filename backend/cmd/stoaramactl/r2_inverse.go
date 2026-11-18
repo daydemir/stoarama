@@ -165,6 +165,12 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 // collated paths: absent pinned window, nil/invalid span, missing or mismatched
 // timezone, empty path or an undecided stream policy all make an identity
 // uncertain, and uncertainty always holds instead of authorizing deletion.
+// sourceIdentityUncertain is the collated-source view of the same predicate, so a
+// collated source and a RAW clip are judged by one rule and cannot drift.
+func (p inverseProtection) sourceIdentityUncertain(s inverseCollatedSource) bool {
+	return p.identityUncertain(inverseIdentity{StreamID: s.StreamID, Path: s.Path, Start: s.Start, End: s.End, Timezone: s.Timezone, Kind: "source"})
+}
+
 func (p inverseProtection) identityUncertain(id inverseIdentity) bool {
 	w, ok := p.Windows[id.StreamID]
 	if !ok || id.Start == nil || id.End == nil || !r2RetireValidSpan(*id.Start, *id.End) ||

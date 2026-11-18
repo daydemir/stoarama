@@ -205,24 +205,15 @@ func assessCollated(p inverseProtection, x inverseCollatedAssessment) inverseCol
 			x.Reason = "keep_everything_stream"
 			return x
 		}
-		// Every source must positively establish both its pinned policy and its
-		// span. An absent window, a nil/invalid span, a missing or mismatched
-		// timezone or an undecided stream is uncertainty, and uncertainty HOLDS:
-		// it must never fall through as "not overlapping" and become eligible.
-		w, ok := p.Windows[s.StreamID]
-		if !ok {
-			x.Reason = "collated_source_no_pinned_window"
+		// The SAME uncertainty predicate the RAW path uses. An absent window, a
+		// nil/invalid span, a missing or mismatched timezone or an undecided
+		// stream is uncertainty, and uncertainty HOLDS: it must never fall through
+		// as "not overlapping" and become eligible.
+		if p.sourceIdentityUncertain(s) {
+			x.Reason = "collated_source_uncertain"
 			return x
 		}
-		if s.Start == nil || s.End == nil || !r2RetireValidSpan(*s.Start, *s.End) ||
-			s.Timezone == "" || s.Timezone != w.Timezone || s.Path == "" {
-			x.Reason = "collated_source_span_or_timezone_uncertain"
-			return x
-		}
-		if r2RetireEffectiveChoice(p.Picks.Choices[s.StreamID], true, w) == "" {
-			x.Reason = "collated_source_policy_undecided"
-			return x
-		}
+		w := p.Windows[s.StreamID]
 		if s.Start.Before(w.End) && s.End.After(w.Start) {
 			// ANY source in the pinned window protects the WHOLE output. Owner ACKs
 			// and copied RAW sources are not a current hashed inventory of it.
@@ -441,41 +432,20 @@ func (a *inverseApplier) deleteNonraw(ctx context.Context, e inverseEntry) (bool
 
 // authorizeNonraw issues the single-use capability only after every live check,
 // and only once across restarts and processes.
-// prepareNonrawWire takes the SAME protection envelope as the RAW wire path —
-// metadata barrier, ordered shared protection locks, the exact COPY key latch,
-// a locked reload and a live hold/veto check — and then re-checks the KE epoch
-// and fresh controller evidence. The reservation transaction has already
-// committed, so this is the only thing standing between a stale protection
-// change and the unconditional DELETE; it must not be a weaker copy.
+// prepareNonrawWire uses the SAME protection envelope as the RAW wire path via
+// protectionEnvelope; only the typed collated reload differs. Everything that
+// guards the DELETE is shared, so this path cannot become a weaker copy.
 func (a *inverseApplier) prepareNonrawWire(ctx context.Context, tx pgx.Tx, e inverseEntry) (inverseCollatedAssessment, error) {
-	if err := inverseProtectionBarrier(ctx, tx); err != nil {
-		return inverseCollatedAssessment{}, err
-	}
-	if err := inverseProtectionLocks(ctx, tx, true); err != nil {
-		return inverseCollatedAssessment{}, err
-	}
-	if _, err := tx.Exec(ctx, `SELECT lock_nas_r2_copy_key($1,$2)`, a.store.Bucket(), e.Key); err != nil {
-		return inverseCollatedAssessment{}, err
-	}
-	t, err := a.loadNonrawTarget(ctx, tx, e)
-	if err != nil {
-		return t, err
-	}
-	// KE folder membership, picks and pinned windows are cached per batch. A
-	// catalog identity change must not survive into wire authority.
-	var epoch int64
-	if err = tx.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`).Scan(&epoch); err != nil {
-		return t, err
-	}
-	if epoch != a.keEpoch {
-		return t, errors.New("KE catalog identity changed; refresh partition before further wire attempts")
-	}
-	// Fresh controller evidence and the six live writer categories, immediately
-	// before the DELETE, not just at batch start.
-	if err = a.checkEvidence(ctx, tx); err != nil {
-		return t, err
-	}
-	return t, nil
+	var t inverseCollatedAssessment
+	err := a.protectionEnvelope(ctx, tx, e, func(ctx context.Context, tx pgx.Tx, e inverseEntry) error {
+		loaded, err := a.loadNonrawTarget(ctx, tx, e)
+		if err != nil {
+			return err
+		}
+		t = loaded
+		return nil
+	})
+	return t, err
 }
 
 func (a *inverseApplier) authorizeNonraw(ctx context.Context, tx pgx.Tx, e inverseEntry) (*inverseNonrawAuthority, error) {

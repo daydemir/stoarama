@@ -185,11 +185,18 @@ func (a *inverseApplier) loadTarget(ctx context.Context, tx pgx.Tx, e inverseEnt
 	return loadInverseRawTarget(ctx, tx, a.store.Bucket(), a.protection, a.opts.Lane, e)
 }
 
+// rawReviewedDelivery is the single gate for RAW delivery eligibility. It is true
+// only for the B1 outside-keep28 lane under the reviewed owner fence policy, so
+// legacy/default RAW behavior and B2 keep28 never gain it.
+func (a *inverseApplier) rawReviewedDelivery() bool {
+	return a.opts.ReviewedDelivery && a.opts.Lane == inverseOutsideKeep28
+}
+
 // rawHeldSQL never derives SQL from operator input: it removes the one delivery
 // clause only when the reviewed owner fence policy selected this run. Every other
 // live veto in inverseRawHeldSQL stays in force.
 func (a *inverseApplier) rawHeldSQL() string {
-	if !a.opts.ReviewedDelivery {
+	if !a.rawReviewedDelivery() {
 		return inverseRawHeldSQL
 	}
 	// Keep the positional placeholders referenced so binding stays identical;
@@ -337,29 +344,43 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	if a.opts.Budget24h > 0 && e.SizeBytes > a.opts.Budget24h-charged {
 		return t, errors.New("rolling 24h inverse budget exhausted")
 	}
-	// Independent committed transaction. Never use an outer network transaction's
-	// connection or assume its rollback can discard this source reservation.
-	_, err = tx.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) VALUES('raw',$1,$2,$3,$4,$5,$6)`, t.ID, a.store.Bucket(), e.Key, e.SizeBytes, t.SHA, a.opts.ManifestSHA)
-	if err != nil {
-		return t, err
+	// Typed intent BEFORE the shared reservation, in the same transaction, so the
+	// reviewed delivery class and its exact intent always exist together. Only the
+	// reviewed owner fence policy sets the class; legacy B1/B2 intents keep ''.
+	cols := []string{"bucket", "object_key", "source_id", "size_bytes", "etag", "last_modified", "manifest_sha256", "policy_sha256", "picks_sha256", "drain_evidence_sha256", "choice", "endpoint_sha256", "stream_id"}
+	args := []any{a.store.Bucket(), e.Key, t.ID, e.SizeBytes, e.ETag, e.LastModified, a.opts.ManifestSHA, a.summary.PolicySHA256, a.summary.PicksSHA256, a.opts.DrainSHA, a.protection.Picks.Choices[t.StreamID].Choice, a.store.EndpointSHA256(), t.StreamID}
+	if a.rawReviewedDelivery() {
+		cols = append(cols, "retirement_class")
+		args = append(args, inverseNonrawRetirementClass)
 	}
-	intentSQL := `INSERT INTO ` + a.intentTable() + `(bucket,object_key,source_id,size_bytes,etag,last_modified,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice,endpoint_sha256,stream_id`
-	intentArgs := []any{a.store.Bucket(), e.Key, t.ID, e.SizeBytes, e.ETag, e.LastModified, a.opts.ManifestSHA, a.summary.PolicySHA256, a.summary.PicksSHA256, a.opts.DrainSHA, a.protection.Picks.Choices[t.StreamID].Choice, a.store.EndpointSHA256(), t.StreamID}
 	if custody != nil {
 		data, marshalErr := json.Marshal(custody)
 		if marshalErr != nil {
 			return t, marshalErr
 		}
-		intentSQL += `,custody`
-		intentArgs = append(intentArgs, data)
+		cols = append(cols, "custody")
+		args = append(args, data)
 	}
-	intentSQL += `) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13`
-	if custody != nil {
-		intentSQL += `,$14`
+	placeholders := make([]string, len(args))
+	for i := range args {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
 	}
-	intentSQL += `)`
-	_, err = tx.Exec(ctx, intentSQL, intentArgs...)
-	if err != nil {
+	// No network access happens before this commit.
+	if _, err = tx.Exec(ctx, `INSERT INTO `+a.intentTable()+`(`+strings.Join(cols, ",")+`) VALUES(`+strings.Join(placeholders, ",")+`)`, args...); err != nil {
+		return t, err
+	}
+	// Independent committed transaction. Never use an outer network transaction's
+	// connection or assume its rollback can discard this source reservation.
+	reservationSQL := `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256`
+	reservationArgs := []any{t.ID, a.store.Bucket(), e.Key, e.SizeBytes, t.SHA, a.opts.ManifestSHA}
+	values := ` VALUES('raw',$1,$2,$3,$4,$5,$6`
+	if a.rawReviewedDelivery() {
+		reservationSQL += `,retirement_class`
+		values += `,$7`
+		reservationArgs = append(reservationArgs, inverseNonrawRetirementClass)
+	}
+	reservationSQL += `)` + values + `)`
+	if _, err = tx.Exec(ctx, reservationSQL, reservationArgs...); err != nil {
 		return t, err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO r2_inverse_budget_minutes(bucket,minute,charged_bytes) VALUES($1,date_trunc('minute',clock_timestamp()),$2) ON CONFLICT(bucket,minute) DO UPDATE SET charged_bytes=r2_inverse_budget_minutes.charged_bytes+excluded.charged_bytes`, a.store.Bucket(), e.SizeBytes)
@@ -490,9 +511,18 @@ func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, mani
 	if err != nil {
 		return err
 	}
+	// The receipt has no retirement_class column, so it must resolve through the
+	// exact reservation that carries the reviewed class. A RAW reviewed retirement
+	// is only authorized when that reservation is the reviewed-scope one.
+	exactClass := ""
+	if a.rawReviewedDelivery() {
+		exactClass = ` AND EXISTS(SELECT 1 FROM r2_retirement_reservations v WHERE v.kind='raw' AND v.source_id=r.source_id
+  AND v.bucket=r.bucket AND v.object_key=r.object_key AND v.size_bytes=r.size_bytes AND v.sha256=r.sha256
+  AND v.manifest_sha256=r.manifest_sha256 AND v.retirement_class='` + inverseNonrawRetirementClass + `')`
+	}
 	var receipt bool
 	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_object_retirements r JOIN `+a.intentTable()+` i ON r.bucket=i.bucket AND r.object_key=i.object_key JOIN recording_clips c ON c.id=i.source_id
- WHERE i.bucket=$1 AND i.object_key=$2 AND r.kind='raw' AND r.reason='`+a.retirementReason()+`' AND r.source_id=$3 AND r.stream_id=i.stream_id AND r.size_bytes=i.size_bytes AND r.sha256=lower(c.sha256) AND r.choice=i.choice AND r.manifest_sha256=$4 AND r.policy_sha256=i.policy_sha256)`, a.store.Bucket(), e.Key, sourceID, manifest).Scan(&receipt)
+ WHERE i.bucket=$1 AND i.object_key=$2 AND r.kind='raw' AND r.reason='`+a.retirementReason()+`' AND r.source_id=$3 AND r.stream_id=i.stream_id AND r.size_bytes=i.size_bytes AND r.sha256=lower(c.sha256) AND r.choice=i.choice AND r.manifest_sha256=$4 AND r.policy_sha256=i.policy_sha256`+exactClass+`)`, a.store.Bucket(), e.Key, sourceID, manifest).Scan(&receipt)
 	if err != nil {
 		return err
 	}
