@@ -155,7 +155,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = tx.Exec(ctx, `SET LOCAL session_replication_role=replica; UPDATE r2_retirement_writer_fences SET activated_at=clock_timestamp()-interval '8 days',drain_not_before=clock_timestamp()-interval '23 hours 58 minutes'`); err != nil {
+	if _, err = tx.Exec(ctx, `SET LOCAL session_replication_role=replica; UPDATE r2_retirement_writer_fences SET activated_at=clock_timestamp()-interval '8 days'; UPDATE r2_retirement_writer_fences SET drain_not_before=activated_at+interval '7 days 2 minutes'`); err != nil {
 		t.Fatal(err)
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -165,7 +165,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 	if err = pool.QueryRow(ctx, `SELECT activated_at,drain_not_before FROM r2_retirement_writer_fences`).Scan(&activated, &deadline); err != nil {
 		t.Fatal(err)
 	}
-	drain := inverseDrainEvidence{Bucket: "stoarama", EndpointSHA256: store.EndpointSHA256(), FenceActivatedAt: activated, DrainNotBefore: deadline, ObservedAt: time.Now().UTC(), DeployedWriterCoverage: "test fixture all admissions checked", AcceptedPUTCompletion: "test fixture no provider PUTs accepted"}
+	drain := inverseDrainEvidence{Proof: inversePUTCompletionProof, Bucket: "stoarama", EndpointSHA256: store.EndpointSHA256(), FenceActivatedAt: activated, DrainNotBefore: deadline, ObservedAt: time.Now().UTC(), DeployedWriterCoverage: "test fixture all admissions checked", AcceptedPUTCompletion: "test fixture no provider PUTs accepted"}
 	drainPath := filepath.Join(root, "drain.json")
 	data, _ := json.Marshal(drain)
 	if err = os.WriteFile(drainPath, data, 0600); err != nil {
@@ -257,6 +257,63 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 		return runID
 	}
+	t.Run("B1_key_policy_without_completion_claim", func(t *testing.T) {
+		a, _ := build(1)
+		a.ledger.close()
+		e := drain
+		e.Proof = inverseNon28KeyPolicyProof
+		e.AcceptedPUTCompletion = ""
+		e.KeyPolicy = &inverseKeyPolicyEvidence{PartitionSHA256: a.opts.ManifestSHA, SummarySHA256: a.opts.SummarySHA, IssuanceBoundEvidence: inverseEvidenceReference{Path: drainPath, SHA256: drainSHA}, OperatorSigningEvidence: inverseEvidenceReference{Path: drainPath, SHA256: drainSHA}, OperatorSigningStoppedAt: activated, OperatorSigningObservedThrough: e.ObservedAt, OperatorLastCapabilityExpiresAt: activated.Add(2 * time.Hour), ResidualAcceptance: inverseApprovedKeyResidual}
+		data, err := json.Marshal(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.opts.DrainEvidence = filepath.Join(filepath.Dir(a.opts.Manifest), "key-policy.json")
+		if err = os.WriteFile(a.opts.DrainEvidence, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		a.opts.DrainSHA, err = inverseFileSHA(a.opts.DrainEvidence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before := providerDeletes()
+		result, err := applyInverse(ctx, pool, sdk, a.opts)
+		if err != nil || result.Deleted != 1 || providerDeletes()-before != 1 {
+			t.Fatalf("key-policy batch %+v err %v", result, err)
+		}
+	})
+	t.Run("changed_provider_identity_never_reaches_DELETE", func(t *testing.T) {
+		for _, field := range []string{"etag", "size", "last_modified", "after_partition"} {
+			t.Run(field, func(t *testing.T) {
+				a, entries := build(1)
+				defer a.ledger.close()
+				e := entries[0]
+				store.mu.Lock()
+				o := store.objects[e.Key]
+				switch field {
+				case "etag":
+					o.ETag = "changed"
+				case "size":
+					o.SizeBytes++
+				case "last_modified":
+					o.LastModified = o.LastModified.Add(-time.Hour)
+				case "after_partition":
+					a.summary.CreatedAt = o.LastModified.Add(-time.Second)
+				}
+				store.objects[e.Key] = o
+				store.mu.Unlock()
+				before := providerDeletes()
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback(ctx)
+				if err = a.checkWireHead(ctx, tx, e, inverseRawTarget{SHA: strings.Repeat("b", 64), ETag: e.ETag}); err == nil || providerDeletes() != before {
+					t.Fatal("changed identity reached wire", err)
+				}
+			})
+		}
+	})
 	t.Run("success", func(t *testing.T) {
 		a, _ := build(2)
 		a.ledger.close()
@@ -265,7 +322,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatalf("%+v %v", s, err)
 		}
 		var receipts int
-		if err = pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_events`).Scan(&receipts); err != nil || receipts != 2 {
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_events`).Scan(&receipts); err != nil || receipts != 3 {
 			t.Fatal(receipts, err)
 		}
 	})
@@ -276,7 +333,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			}
 		}
 		var events int
-		if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_events`).Scan(&events); err != nil || events != 2 {
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_events`).Scan(&events); err != nil || events != 3 {
 			t.Fatal("ledger history changed", events, err)
 		}
 	})

@@ -10,6 +10,9 @@ import (
 )
 
 func (c *Client) admitWrite(ctx context.Context, ttl time.Duration) (func(), func() error, error) {
+	if ttl > 7*24*time.Hour {
+		return nil, nil, errors.New("R2 PUT capability exceeds seven days")
+	}
 	noop := func() {}
 	complete := func() error { return nil }
 	if c.writerDB == nil {
@@ -29,10 +32,6 @@ func (c *Client) admitWrite(ctx context.Context, ttl time.Duration) (func(), fun
 	}
 	var operationID int64
 	if ttl > 0 {
-		if ttl > 7*24*time.Hour {
-			release()
-			return nil, nil, errors.New("R2 PUT capability exceeds seven days")
-		}
 		_, err = tx.Exec(ctx, `INSERT INTO r2_retirement_writer_capabilities(bucket,expires_at) VALUES($1,clock_timestamp()+$2::bigint*interval '1 microsecond'+interval '2 minutes')`, c.bucket, ttl.Microseconds())
 	} else {
 		// Commit intent BEFORE any network write. Connection/process loss must not

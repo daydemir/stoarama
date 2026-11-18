@@ -92,11 +92,19 @@ Drain evidence is a controller-reviewed, SHA-pinned JSON artifact, bound to the
 exact bucket, endpoint and durable fence activation/deadline. It must include
 `bucket`, `endpoint_sha256`, `fence_activated_at`, `drain_not_before`,
 `observed_at`, `deployed_writer_coverage_evidence`, and
-`accepted_put_completion_evidence`. The observation is after the real deadline. Completion evidence remains bound
+`proof`, and `accepted_put_completion_evidence`. Use
+`proof: accepted_put_completion_v1` for substantiated terminal evidence. The observation is strictly after the real deadline. Completion evidence remains bound
 to that immutable fence; it does not need a daily reapproval. References must substantiate
 all deployed writer coverage and completion of externally accepted PUTs.
 A string claiming completion or capability expiry does not establish that fact.
 The implementation agent creates none of this production evidence.
+
+B1 alone also accepts the explicit `non28_key_policy_v1` route described in
+[the key-policy proof contract](r2-non28-key-policy.md). It binds this partition
+and summary, pinned issuance/operator evidence, the operator signing window and
+the expressly accepted overwrite/reappearance/delivery-order residual. It does
+not claim external PUT completion. B2 rejects this route. All other live
+fence, hold, incident, delivery and tool-prefix checks remain mandatory.
 
 Controller canary gate after Nov 19 14:30:47Z AND actual drain evidence:
 

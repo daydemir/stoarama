@@ -307,6 +307,26 @@ func TestPresignPutSizedRequestSignsExactLength(t *testing.T) {
 	}
 }
 
+func TestUnboundR2ClientPUTPresignsRejectProviderTTLOverflow(t *testing.T) {
+	client, err := New(context.Background(), Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ttl := 7*24*time.Hour + time.Second
+	if _, err = client.PresignPut(context.Background(), "managed/x", "video/mp4", ttl); err == nil {
+		t.Fatal("ordinary presign exceeded provider TTL")
+	}
+	if _, err = client.PresignPutSizedRequest(context.Background(), "managed/x", "video/mp4", 1, ttl); err == nil {
+		t.Fatal("sized presign exceeded provider TTL")
+	}
+	if _, err = client.PresignPutCreateOnlyRequest(context.Background(), "managed/x", "video/mp4", 1, strings.Repeat("a", 64), ttl); err == nil {
+		t.Fatal("create-only presign exceeded provider TTL")
+	}
+	if _, err = client.PresignPutCreateOnlyMetadataRequest(context.Background(), "managed/x", "video/mp4", 1, strings.Repeat("a", 64), ttl); err == nil {
+		t.Fatal("metadata presign exceeded provider TTL")
+	}
+}
+
 func TestNASSpaceAuditMetadataPresignAndHead(t *testing.T) {
 	sha := strings.Repeat("a", 64)
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

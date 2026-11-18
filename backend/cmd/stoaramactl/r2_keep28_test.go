@@ -165,7 +165,7 @@ func newKeep28FixtureCount(t *testing.T, count int) keep28Fixture {
 	manifestSHA, _ := inverseFileSHA(manifest)
 	summary := write("summary.json", inverseSummary{Version: 1, Bucket: "stoarama", EndpointSHA256: f.sdk.EndpointSHA256(), CreatedAt: time.Now().UTC(), PolicySHA256: policy, PicksSHA256: picks.SHA256, ReadOnly: true})
 	summarySHA, _ := inverseFileSHA(summary)
-	drain := write("drain.json", inverseDrainEvidence{Bucket: "stoarama", EndpointSHA256: f.sdk.EndpointSHA256(), FenceActivatedAt: activated, DrainNotBefore: deadline, ObservedAt: time.Now().UTC(), DeployedWriterCoverage: "synthetic fixture has no writer", AcceptedPUTCompletion: "synthetic provider accepted no PUT"})
+	drain := write("drain.json", inverseDrainEvidence{Proof: inversePUTCompletionProof, Bucket: "stoarama", EndpointSHA256: f.sdk.EndpointSHA256(), FenceActivatedAt: activated, DrainNotBefore: deadline, ObservedAt: time.Now().UTC(), DeployedWriterCoverage: "synthetic fixture has no writer", AcceptedPUTCompletion: "synthetic provider accepted no PUT"})
 	drainSHA, _ := inverseFileSHA(drain)
 	f.options = inverseApplyOptions{Lane: inverseNASKeep28, Manifest: manifest, ManifestSHA: manifestSHA, Summary: summary, SummarySHA: summarySHA, Picks: picksPath, Ledger: filepath.Join(dir, "ledger"), DrainEvidence: drain, DrainSHA: drainSHA, MaxItems: 100, MaxBytes: 10000, Budget24h: 10000, Workers: 1}
 	return f
