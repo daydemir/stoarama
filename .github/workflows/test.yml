@@ -146,7 +146,7 @@ jobs:
       - name: Test delivery keep holds and unexecutable R2 previews
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test -p 1 ./internal/api ./cmd/stoaramactl ./internal/db -run '^(TestDeliveryKeep.*|TestR2Retire.*|TestNASR2Copy.*|TestNASCopyStatus.*|TestNASR2CopyQueue.*|TestNASReservation.*|TestNASClientAdmissionExactVersions)$' -race -count=1 -v
+        run: go test -p 1 ./internal/api ./cmd/stoaramactl ./internal/db -run '^(TestDeliveryKeep.*|TestR2Retire.*|TestR2Nonraw.*|TestR2RawReviewedDelivery.*|TestR2RawDeliveryVetoes.*|TestR2InverseToolsPrefixIsNeverDeletable|TestR2InversePartition.*|TestNASR2Copy.*|TestNASCopyStatus.*|TestNASR2CopyQueue.*|TestNASReservation.*|TestNASClientAdmissionExactVersions)$' -race -count=1 -v
       - name: Test cleanup receipt lock order and transaction replay under race detector
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

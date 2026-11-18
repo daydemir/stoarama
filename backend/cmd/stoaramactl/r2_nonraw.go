@@ -56,18 +56,23 @@ type inverseCollatedAssessment struct {
 	SizeBytes    int64
 	SHA, Path    string
 	VerifiedAt   time.Time
-	Shared       bool
-	Held         bool
-	Sources      []inverseCollatedSource
-	Reason       string
-	Keep28       bool
-	Choice       string
+	// Start/End/Timezone are the output's OWN live interval and zone. They decide
+	// its pinned-window class and must be reloaded, not assumed from the batch.
+	Start, End *time.Time
+	Timezone   string
+	Shared     bool
+	Held       bool
+	Sources    []inverseCollatedSource
+	Reason     string
+	Keep28     bool
+	Choice     string
 }
 
 // $1 is the bucket. The jsonb source aggregate is built in the same statement so
 // a partition pass and a locked reload share one definition.
 const inverseNonrawColumns = `
  o.id,o.object_key,coalesce(r.stream_id,0),o.size_bytes,lower(o.sha256),o.nas_relative_path,o.r2_verified_at,
+ o.start_at,o.end_at,coalesce(nullif(s.local_timezone,''),r.cron_timezone,''),
  (SELECT count(*) FROM recording_collation_outputs d WHERE d.object_key=o.object_key),
  cardinality(o.source_clip_ids),
  (SELECT count(*) FROM (SELECT DISTINCT unnest(o.source_clip_ids)) u),
@@ -144,6 +149,7 @@ func scanCollated(rows pgx.Rows) (inverseCollatedAssessment, error) {
 	var sourceJSON string
 	var shared, card, distinct, resolved int64
 	if err := rows.Scan(&x.ID, &x.Key, &x.StreamID, &x.SizeBytes, &x.SHA, &x.Path, &x.VerifiedAt,
+		&x.Start, &x.End, &x.Timezone,
 		&shared, &card, &distinct, &resolved, &sourceJSON, &x.Held); err != nil {
 		return x, err
 	}
@@ -187,6 +193,21 @@ func assessCollated(p inverseProtection, x inverseCollatedAssessment) inverseCol
 	if x.Held {
 		x.Reason = "live_hold"
 		return x
+	}
+	// The output's OWN interval is a live catalog fact. It must positively
+	// establish a pinned-window class just like a source, so an interval moved
+	// into keep28 after the batch can never authorize a DELETE.
+	own := inverseIdentity{StreamID: x.StreamID, Path: x.Path, Start: x.Start, End: x.End, Timezone: x.Timezone, Kind: "collated"}
+	if p.identityUncertain(own) {
+		x.Reason = "collated_output_interval_uncertain"
+		return x
+	}
+	if x.StreamID > 0 && p.Picks.Choices[x.StreamID].Choice == "all" {
+		x.Reason = "keep_everything_stream"
+		return x
+	}
+	if w := p.Windows[x.StreamID]; x.Start.Before(w.End) && x.End.After(w.Start) {
+		x.Keep28 = true
 	}
 	for _, component := range strings.Split(x.Path, "/") {
 		if p.KEFolders[component] {

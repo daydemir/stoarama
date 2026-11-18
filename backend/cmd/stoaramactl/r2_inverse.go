@@ -180,6 +180,32 @@ func (p inverseProtection) identityUncertain(id inverseIdentity) bool {
 	return r2RetireEffectiveChoice(p.Picks.Choices[id.StreamID], true, w) == ""
 }
 
+// inverseClassifierInputs declares, once, every catalog fact the classifier reads
+// to decide eligibility, and the trigger that versions it. The KE epoch is how a
+// cached batch approval notices that one of these changed, so this list and the
+// epoch triggers in 0212 must agree: a new classifier input added without a
+// matching entry here (and in the migration) would silently escape the freeze.
+// TestR2InverseEpochCoversClassifierInputs asserts this struct against pg_trigger.
+type inverseClassifierInput struct {
+	Table   string
+	Columns []string
+	// HoldCovered lists inputs that a classifier reads but that are enforced by
+	// the locked per-key reload instead of the batch epoch. purged_at is the only
+	// such input: the pre-delete purge probe writes it inside the wire
+	// transaction that already holds the epoch row, so versioning it there would
+	// self-deadlock. Every identity query requires purged_at IS NULL, so a purge
+	// HOLDs the key. ROOT's rule is satisfied by either branch.
+	HoldCovered []string
+}
+
+var inverseClassifierInputs = []inverseClassifierInput{
+	{"recording_clips", []string{"bucket", "recording_id", "object_key", "display_path", "etag", "size_bytes", "sha256", "clip_start_at", "clip_end_at"}, []string{"purged_at"}},
+	{Table: "recording_collation_outputs", Columns: []string{"object_key", "nas_relative_path", "collation_hour_id", "source_clip_ids", "sha256", "size_bytes", "start_at", "end_at", "r2_verified_at"}},
+	{Table: "recording_collation_hours", Columns: []string{"recording_id"}},
+	{Table: "recordings", Columns: []string{"stream_id", "cron_timezone", "account_id"}},
+	{Table: "streams", Columns: []string{"local_timezone"}},
+}
+
 const inverseCatalogSQL = `
 SELECT c.object_key,coalesce(r.stream_id,0),coalesce(c.display_path,''),c.clip_start_at,c.clip_end_at,
  coalesce(nullif(s.local_timezone,''),r.cron_timezone,''),'raw'

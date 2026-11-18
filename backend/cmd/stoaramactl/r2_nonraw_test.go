@@ -491,10 +491,13 @@ func TestR2NonrawSourceUncertaintyHolds(t *testing.T) {
 			Picks:      r2RetirePicks{Choices: map[int64]r2RetirePick{3: {Choice: "none", KeepStartUTC: start.Format(time.RFC3339), KeepEndUTC: end.Format(time.RFC3339)}}},
 		}
 	}
+	// The output's OWN interval and timezone are classifier inputs, so a realistic
+	// assessment must carry them; an empty one is (correctly) held as uncertain.
 	output := func(sources ...inverseCollatedSource) inverseCollatedAssessment {
+		ownStart, ownEnd := outside, outsideEnd
 		return inverseCollatedAssessment{ID: 7, Key: "joined/nightly-collation-v2/objects/" + nonrawOutputSHA + ".mp4",
 			Path: "nightly/video.mp4", SHA: nonrawOutputSHA, SizeBytes: 900, VerifiedAt: start,
-			StreamID: 3, Sources: sources}
+			StreamID: 3, Start: &ownStart, End: &ownEnd, Timezone: "Asia/Tokyo", Sources: sources}
 	}
 	good := inverseCollatedSource{ID: 1, StreamID: 3, Path: "s/a.mp4", Start: &outside, End: &outsideEnd, Timezone: "Asia/Tokyo"}
 	badEnd := outsideEnd.Add(-2 * time.Minute)
@@ -856,4 +859,300 @@ func TestR2RawDeliveryVetoesStayStrict(t *testing.T) {
 			t.Fatal("mismatched identity inherited the reviewed exemption")
 		}
 	})
+}
+
+// TestR2NonrawOutputIntervalReloadedAtWire proves blocker (1): the output's OWN
+// live interval is a classifier input, so changing it after approval must never
+// authorize a DELETE. While an intent is pending the freeze refuses the edit
+// outright; either way the wire must not run and nothing is deleted.
+func TestR2NonrawOutputIntervalReloadedAtWire(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate string
+	}{
+		{"interval_moved_into_keep28", `UPDATE recording_collation_outputs SET start_at=$2, end_at=$3 WHERE id=$1`},
+		// The interval itself already wraps the pinned window, so only the hour's
+		// own timezone changes the pinned-window match.
+		{"own_timezone_mismatched", `UPDATE streams SET local_timezone='UTC' WHERE id=3`},
+		{"own_stream_moved", `UPDATE recording_collation_hours SET recording_id=31 WHERE id=1`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newNonrawFixture(t, "nonraw_interval_"+strings.ReplaceAll(tc.name, "_", ""))
+			// A second recording on a stream with NO pinned window exists so the
+			// hour-move case genuinely changes the output's pinned-window class.
+			f.fixture(`INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
+ VALUES(4,'test','4','nowindow','nowindow','https://test.invalid','off','Asia/Tokyo','hls','video_manifest','video_live','continuous_video',30)`)
+			f.fixture(`INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
+ VALUES(31,47,1,'other','https://test.invalid','* * * * *','Asia/Tokyo','paused',4,now())`)
+			a := f.applier(t, "run1")
+			entry := inverseEntry{ObjectInfo: r2.ObjectInfo{Key: f.key, ETag: "collated-etag", SizeBytes: 900, LastModified: inverseRetirementCutoff().Add(-time.Second)}, Class: inverseCollated}
+			// Reserve first, exactly as the real flow does.
+			if _, err := a.reserveNonraw(f.ctx, entry); err != nil {
+				t.Fatal(err)
+			}
+			w := f.windows[3]
+			// The pending-intent freeze refuses this edit in normal operation; that is
+			// asserted separately by TestR2NonrawPendingIntentFreezesOutputInterval.
+			// Here the edit is applied with triggers disabled, exactly as an older
+			// binary or a bypass would, and the KE epoch is deliberately left
+			// unchanged, matching the reviewer's probe. This proves the WIRE BOUNDARY
+			// re-derives the output's own live interval instead of trusting the
+			// cached batch assessment.
+			// Pass arguments only for the statements that take any; pgx rejects a
+			// surplus argument rather than ignoring it.
+			switch {
+			case strings.Contains(tc.mutate, "$2"):
+				f.fixture(tc.mutate, f.outputID, w.Start.Add(time.Minute), w.Start.Add(2*time.Minute))
+			case strings.Contains(tc.mutate, "$1"):
+				f.fixture(tc.mutate, f.outputID)
+			default:
+				f.fixture(tc.mutate)
+			}
+			tx, err := f.pool.Begin(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(f.ctx)
+			if _, err = a.authorizeNonraw(f.ctx, tx, entry); err == nil {
+				t.Fatalf("%s: wire authorized after the output interval changed", tc.name)
+			}
+			if f.deletes() != 0 {
+				t.Fatalf("%s: DELETE reached the provider", tc.name)
+			}
+		})
+	}
+
+	// Control: an unchanged output is still eligible at the same boundary, so this
+	// cannot pass by refusing everything.
+	t.Run("unchanged_control_is_eligible", func(t *testing.T) {
+		f := newNonrawFixture(t, "nonraw_interval_control")
+		a := f.applier(t, "run1")
+		entry := inverseEntry{ObjectInfo: r2.ObjectInfo{Key: f.key, ETag: "collated-etag", SizeBytes: 900, LastModified: inverseRetirementCutoff().Add(-time.Second)}, Class: inverseCollated}
+		if _, err := a.reserveNonraw(f.ctx, entry); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := f.pool.Begin(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(f.ctx)
+		if _, err = a.authorizeNonraw(f.ctx, tx, entry); err != nil {
+			t.Fatalf("unchanged output refused: %v", err)
+		}
+		a.ledger.close()
+	})
+}
+
+// TestR2NonrawPendingIntentFreezesOutputInterval proves the second half of blocker
+// (1): once a pending intent exists, the output's interval is frozen, so the
+// mutation can never be applied behind the executor.
+func TestR2NonrawPendingIntentFreezesOutputInterval(t *testing.T) {
+	f := newNonrawFixture(t, "nonraw_interval_freeze")
+	a := f.applier(t, "run1")
+	entry := inverseEntry{ObjectInfo: r2.ObjectInfo{Key: f.key, ETag: "collated-etag", SizeBytes: 900, LastModified: inverseRetirementCutoff().Add(-time.Second)}, Class: inverseCollated}
+	if _, err := a.reserveNonraw(f.ctx, entry); err != nil {
+		t.Fatal(err)
+	}
+	a.ledger.close()
+	w := f.windows[3]
+	for _, q := range []string{
+		`UPDATE recording_collation_outputs SET start_at=start_at-interval '1 hour' WHERE id=$1`,
+		`UPDATE recording_collation_outputs SET end_at=end_at+interval '1 hour' WHERE id=$1`,
+	} {
+		if _, err := f.pool.Exec(f.ctx, q, f.outputID); err == nil {
+			t.Fatalf("pending intent did not freeze the output interval: %s", q)
+		}
+	}
+	_ = w
+}
+
+// TestR2NonrawCollatedHoldFollowsReservedSources proves blocker (2): a delivery
+// hold admitted on a collated OUTPUT that has a reserved/pending RAW source must
+// still be vetoed by the transitive closure, while unrelated holds stay admitted.
+func TestR2NonrawCollatedHoldFollowsReservedSources(t *testing.T) {
+	t.Run("hold_on_output_with_reserved_source_is_vetoed", func(t *testing.T) {
+		f := newNonrawFixture(t, "nonraw_closure_reserved")
+		// Reserve the RAW source clip through the real B1 path.
+		f.fixture(`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
+ SELECT 'raw',c.id,c.bucket,c.object_key,c.size_bytes,lower(c.sha256),repeat('d',64) FROM recording_clips c WHERE c.id=$1`, f.clipID)
+		if _, err := f.pool.Exec(f.ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',900,'metadata')`, f.key); err == nil {
+			t.Fatal("hold on a collated output with a reserved source was admitted")
+		}
+	})
+
+	t.Run("hold_on_output_with_pending_collated_retirement_is_vetoed", func(t *testing.T) {
+		f := newNonrawFixture(t, "nonraw_closure_pending")
+		f.insertIntent(t, strings.Repeat("d", 64))
+		f.fixture(`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class)
+ VALUES('collated',$1,'stoarama',$2,900,$3,$4,$5)`, f.outputID, f.key, nonrawOutputSHA, strings.Repeat("d", 64), inverseNonrawRetirementClass)
+		if _, err := f.pool.Exec(f.ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',900,'metadata')`, f.key); err == nil {
+			t.Fatal("hold on an output with a pending collated retirement was admitted")
+		}
+		// Content and normalized-path aliases of the same output must be vetoed too.
+		if _, err := f.pool.Exec(f.ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256) VALUES('stoarama','datasets/alias/content.json','hold',900,'metadata',$1)`, nonrawOutputSHA); err == nil {
+			t.Fatal("content alias of a pending collated output was admitted")
+		}
+		if _, err := f.pool.Exec(f.ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,relative_path) VALUES('stoarama','datasets/alias/path.json','hold',900,'metadata','nightly/video.mp4')`); err == nil {
+			t.Fatal("path alias of a pending collated output was admitted")
+		}
+	})
+
+	t.Run("unrelated_hold_still_admitted", func(t *testing.T) {
+		f := newNonrawFixture(t, "nonraw_closure_unrelated")
+		f.fixture(`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
+ SELECT 'raw',c.id,c.bucket,c.object_key,c.size_bytes,lower(c.sha256),repeat('d',64) FROM recording_clips c WHERE c.id=$1`, f.clipID)
+		// A genuinely unrelated row must never be blocked by another key's closure.
+		if _, err := f.pool.Exec(f.ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama','datasets/unrelated/other.json','hold',5,'metadata')`); err != nil {
+			t.Fatalf("unrelated hold was blocked: %v", err)
+		}
+	})
+}
+
+// TestR2NonrawHourMoveJudgesOnlyItsOwnOutputs proves blocker (3): moving an hour
+// whose outputs are unrelated to a reservation is admitted, while a move of an
+// affected hour is refused.
+func TestR2NonrawHourMoveJudgesOnlyItsOwnOutputs(t *testing.T) {
+	t.Run("unrelated_empty_hour_can_move", func(t *testing.T) {
+		f := newNonrawFixture(t, "nonraw_hour_unrelated")
+		// A second recording holds one reserved clip that has nothing to do with
+		// this hour.
+		f.fixture(`INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
+ VALUES(31,47,1,'other','https://test.invalid','* * * * *','Asia/Tokyo','paused',3,now())`)
+		f.fixture(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path)
+ VALUES(7000002,31,1,'https://test.invalid','stoarama','managed/acct-47/nonraw/other.mp4',10,'o',repeat('d',64),'2026-06-01'::timestamptz,'2026-06-01'::timestamptz,'2026-06-01 00:01:00'::timestamptz,'other/o.mp4')`)
+		f.fixture(`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
+ SELECT 'raw',c.id,c.bucket,c.object_key,c.size_bytes,lower(c.sha256),repeat('d',64) FROM recording_clips c WHERE c.id=7000002`)
+		// An hour with no affected outputs may move to that recording.
+		f.fixture(`INSERT INTO recording_collation_hours(id,hour_id,batch_id,generation,recording_id,local_date,delivery_hour,status,manifest_object_key,manifest_sha256,manifest,source_clip_count,included_clip_count,excluded_clip_count,join_count,split_count)
+ VALUES(2,'nonraw__recording-30__date-2026-06-02__hour-01__generation-2','nonraw',2,30,'2026-06-02',1,'collated','joined/nightly-collation-v2/m2.json',repeat('a',64),'{}',0,0,0,0,0)`)
+		if _, err := f.pool.Exec(f.ctx, `UPDATE recording_collation_hours SET recording_id=31 WHERE id=2`); err != nil {
+			t.Fatalf("unrelated hour move was blocked: %v", err)
+		}
+	})
+
+	t.Run("affected_hour_move_is_refused", func(t *testing.T) {
+		f := newNonrawFixture(t, "nonraw_hour_affected")
+		f.fixture(`INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
+ VALUES(31,47,1,'other','https://test.invalid','* * * * *','Asia/Tokyo','paused',3,now())`)
+		f.fixture(`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
+ SELECT 'raw',c.id,c.bucket,c.object_key,c.size_bytes,lower(c.sha256),repeat('d',64) FROM recording_clips c WHERE c.id=$1`, f.clipID)
+		// This hour's own source is reserved, so moving it is a new overlap.
+		if _, err := f.pool.Exec(f.ctx, `UPDATE recording_collation_hours SET recording_id=31 WHERE id=1`); err == nil {
+			t.Fatal("move of an affected hour was admitted")
+		}
+	})
+
+	t.Run("affected_hour_pending_collated_retirement_is_refused", func(t *testing.T) {
+		f := newNonrawFixture(t, "nonraw_hour_pending")
+		f.fixture(`INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
+ VALUES(31,47,1,'other','https://test.invalid','* * * * *','Asia/Tokyo','paused',3,now())`)
+		f.insertIntent(t, strings.Repeat("d", 64))
+		if _, err := f.pool.Exec(f.ctx, `UPDATE recording_collation_hours SET recording_id=31 WHERE id=1`); err == nil {
+			t.Fatal("move of an hour with a pending collated retirement was admitted")
+		}
+	})
+}
+
+// TestR2InverseEpochCoversClassifierInputs enforces ROOT's rule: the frozen
+// identity is exactly the classifier's input set. Every declared classifier input
+// must bump the KE epoch in real PostgreSQL, and a catalog edit to one of them
+// must therefore invalidate a cached approval. Adding a classifier input without
+// widening the epoch fails here instead of silently escaping the freeze.
+func TestR2InverseEpochCoversClassifierInputs(t *testing.T) {
+	f := newNonrawFixture(t, "nonraw_epoch_cover")
+	epoch := func() int64 {
+		t.Helper()
+		var n int64
+		if err := f.pool.QueryRow(f.ctx, `SELECT epoch FROM r2_inverse_ke_epoch`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	// Each declared column must be covered by a statement-level epoch trigger.
+	for _, in := range inverseClassifierInputs {
+		var cols []string
+		rows, err := f.pool.Query(f.ctx, `SELECT distinct a.attname FROM pg_trigger tg
+ JOIN pg_class c ON c.oid=tg.tgrelid JOIN pg_proc p ON p.oid=tg.tgfoid
+ CROSS JOIN LATERAL unnest(tg.tgattr::int2[]) col JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=col
+ WHERE c.relname=$1 AND p.proname='advance_r2_inverse_ke_epoch' AND NOT tg.tgisinternal`, in.Table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var name string
+			if err = rows.Scan(&name); err != nil {
+				rows.Close()
+				t.Fatal(err)
+			}
+			cols = append(cols, name)
+		}
+		rows.Close()
+		if err = rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		covered := map[string]bool{}
+		for _, c := range cols {
+			covered[c] = true
+		}
+		for _, want := range in.Columns {
+			if !covered[want] {
+				t.Fatalf("%s.%s is a classifier input but no epoch trigger covers it", in.Table, want)
+			}
+		}
+		// Hold-covered inputs are asserted by behaviour below, not by the trigger.
+		for _, held := range in.HoldCovered {
+			if covered[held] {
+				t.Fatalf("%s.%s is hold-covered but also epoch-versioned; that self-deadlocks the purge probe", in.Table, held)
+			}
+		}
+	}
+
+	// purged_at is hold-covered: it must NOT bump the epoch (that self-deadlocks the
+	// pre-delete purge probe) but must still HOLD the key. The hold is proven by
+	// TestR2NonrawExecutorLane and the B1 source-identity freeze tests.
+	for _, in := range inverseClassifierInputs {
+		for _, held := range in.HoldCovered {
+			var covered bool
+			if err := f.pool.QueryRow(f.ctx, `SELECT EXISTS(SELECT 1 FROM pg_trigger tg
+ JOIN pg_class c ON c.oid=tg.tgrelid JOIN pg_proc p ON p.oid=tg.tgfoid
+ CROSS JOIN LATERAL unnest(tg.tgattr::int2[]) col JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=col
+ WHERE c.relname=$1 AND p.proname='advance_r2_inverse_ke_epoch' AND a.attname=$2 AND NOT tg.tgisinternal)`,
+				in.Table, held).Scan(&covered); err != nil {
+				t.Fatal(err)
+			}
+			if covered {
+				t.Fatalf("%s.%s must stay hold-covered, not epoch-versioned", in.Table, held)
+			}
+		}
+	}
+
+	// And the epoch really moves for each such edit, so the cached approval dies.
+	for _, tc := range []struct {
+		name  string
+		apply string
+	}{
+		{"own_interval", `UPDATE recording_collation_outputs SET start_at=start_at-interval '1 minute' WHERE id=1`},
+		{"own_end", `UPDATE recording_collation_outputs SET end_at=end_at-interval '1 minute' WHERE id=1`},
+		{"own_verified_at", `UPDATE recording_collation_outputs SET r2_verified_at=r2_verified_at-interval '1 second' WHERE id=1`},
+		{"source_interval", `UPDATE recording_clips SET clip_start_at=clip_start_at-interval '1 minute' WHERE id=7000001`},
+
+		{"source_sha256", `UPDATE recording_clips SET sha256=repeat('e',64) WHERE id=7000001`},
+		{"source_etag", `UPDATE recording_clips SET etag='changed' WHERE id=7000001`},
+		{"stream_timezone", `UPDATE streams SET local_timezone='UTC' WHERE id=3`},
+		{"recording_cron_timezone", `UPDATE recordings SET cron_timezone='UTC' WHERE id=30`},
+		{"recording_stream", `UPDATE recordings SET stream_id=NULL WHERE id=30`},
+		{"hour_recording", `UPDATE recording_collation_hours SET recording_id=30 WHERE id=1`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := epoch()
+			// Interval and identity edits are all legitimate here: no intent is
+			// pending in this fixture, so only the epoch contract is under test.
+			if _, err := f.pool.Exec(f.ctx, tc.apply); err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if after := epoch(); after <= before {
+				t.Fatalf("%s did not bump the KE epoch (%d -> %d)", tc.name, before, after)
+			}
+		})
+	}
 }

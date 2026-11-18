@@ -72,7 +72,10 @@ CREATE FUNCTION guard_r2_nonraw_output_identity() RETURNS trigger LANGUAGE plpgs
   RAISE EXCEPTION 'R2 nonraw intent freezes collated output identity'; END IF;
  IF TG_OP='DELETE' THEN RETURN OLD; END IF; RETURN NEW;
 END $$;
-CREATE TRIGGER r2_nonraw_output_identity BEFORE UPDATE OF id,object_key,nas_relative_path,sha256,size_bytes,collation_hour_id,source_clip_ids OR DELETE ON recording_collation_outputs
+-- The output's OWN live interval and hour determine its pinned-window class, so a
+-- pending intent must freeze them exactly as it freezes key/content identity. A
+-- post-reservation interval rewrite into keep28 can no longer race the DELETE.
+CREATE TRIGGER r2_nonraw_output_identity BEFORE UPDATE OF id,object_key,nas_relative_path,sha256,size_bytes,collation_hour_id,source_clip_ids,start_at,end_at OR DELETE ON recording_collation_outputs
  FOR EACH ROW EXECUTE FUNCTION guard_r2_nonraw_output_identity();
 
 -- /0174 narrow amendment. Verbatim constraint names were confirmed against a
@@ -159,6 +162,22 @@ DECLARE r record; BEGIN
       AND EXISTS(SELECT 1 FROM r2_retirement_reservations v WHERE v.kind='raw' AND v.source_id=c.id))
     OR EXISTS(SELECT 1 FROM r2_nonraw_intents i WHERE regexp_replace(i.nas_relative_path,'^joined/','')=regexp_replace(r.relative_path,'^joined/',''))) THEN
    RAISE EXCEPTION 'R2 retirement reservation forbids delivery path alias'; END IF;
+  -- Transitive closure: a hold admitted on a collated OUTPUT is also an overlap
+  -- with that output's OWN reserved/pending RAW sources and with its own pending
+  -- collated retirement. Matching is exact on key, normalized path or content, so
+  -- unrelated rows are still admitted.
+  IF EXISTS(SELECT 1 FROM recording_collation_outputs o
+     WHERE (o.object_key=r.object_key
+       OR (r.relative_path<>'' AND regexp_replace(o.nas_relative_path,'^joined/','')=regexp_replace(r.relative_path,'^joined/',''))
+       OR (r.sha256<>'' AND o.sha256=r.sha256 AND o.size_bytes=r.size_bytes))
+     AND (EXISTS(SELECT 1 FROM r2_retirement_reservations v WHERE v.kind='collated' AND v.source_id=o.id)
+       OR EXISTS(SELECT 1 FROM r2_nonraw_intents i WHERE i.kind='collated' AND i.source_id=o.id)
+       OR EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.kind='collated' AND x.source_id=o.id)
+       OR EXISTS(SELECT 1 FROM recording_clips c JOIN r2_retirement_reservations v ON v.kind='raw' AND v.source_id=c.id
+            WHERE c.id=ANY(o.source_clip_ids))
+       OR EXISTS(SELECT 1 FROM recording_clips c JOIN r2_inverse_intents i ON i.source_id=c.id
+            WHERE c.id=ANY(o.source_clip_ids)))) THEN
+   RAISE EXCEPTION 'R2 retirement reservation forbids delivery collated-source closure'; END IF;
  END LOOP;
  RETURN NULL; END $$;
 -- A source hold must also close over collated outputs: a clip that is a source
@@ -238,11 +257,22 @@ CREATE FUNCTION guard_r2_delivery_hours_admitted() RETURNS trigger LANGUAGE plpg
 DECLARE r record; BEGIN
  FOR r IN SELECT n.* FROM new_rows n JOIN old_rows o ON o.id=n.id
   WHERE o.recording_id IS DISTINCT FROM n.recording_id LOOP
+  -- Judge ONLY the changed hour's own outputs, their source clips and their own
+  -- dependencies. A reservation on some unrelated clip of the destination
+  -- recording is not this hour's identity and must not veto the move.
   IF EXISTS(SELECT 1 FROM recording_collation_outputs x
+     JOIN r2_retirement_reservations v ON v.kind='collated' AND v.source_id=x.id
+     WHERE x.collation_hour_id=r.id)
+  OR EXISTS(SELECT 1 FROM recording_collation_outputs x
      JOIN r2_nonraw_intents i ON i.kind='collated' AND i.source_id=x.id
      WHERE x.collation_hour_id=r.id)
-  OR EXISTS(SELECT 1 FROM recording_clips c JOIN r2_retirement_reservations v ON v.kind='raw' AND v.source_id=c.id
-     WHERE c.recording_id=r.recording_id) THEN
+  OR EXISTS(SELECT 1 FROM recording_collation_outputs x CROSS JOIN LATERAL unnest(x.source_clip_ids) sid
+     JOIN r2_retirement_reservations v ON v.kind='raw' AND v.source_id=sid
+     WHERE x.collation_hour_id=r.id)
+  OR EXISTS(SELECT 1 FROM recording_collation_outputs x
+     JOIN delivery_keep_output_dependencies d ON d.output_id=x.id
+     JOIN r2_retirement_reservations v ON v.kind='collated' AND v.source_id=x.id
+     WHERE x.collation_hour_id=r.id) THEN
    RAISE EXCEPTION 'R2 retirement reservation forbids delivery adoption'; END IF;
  END LOOP;
  RETURN NULL; END $$;
