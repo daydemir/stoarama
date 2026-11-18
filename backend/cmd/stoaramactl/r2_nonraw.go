@@ -106,9 +106,19 @@ const inverseNonrawTargetSQL = inverseNonrawBatchSQL + ` WHERE o.object_key=$2 F
 
 // classifyCollated is the partition-side answer for a key with a collated
 // catalog identity. Default (unreviewed) behavior stays exactly as before.
-func (p inverseProtection) classifyCollated(o r2.ObjectInfo, identities []inverseIdentity) (inverseClass, string) {
+func (p inverseProtection) classifyCollated(o r2.ObjectInfo, identityUncertain bool) (inverseClass, string) {
+	if strings.HasPrefix(o.Key, inverseToolsPrefix) {
+		return inverseTools, "pinned_stitch_tools"
+	}
+	// Default behavior is byte-for-byte what it was: collated stays deferred.
 	if !p.ReviewedCollated {
 		return inverseHeld, "collated_deferred"
+	}
+	// Under the reviewed scope, respect the shared unknown veto before any
+	// eligibility. An identity the RAW path already judged uncertain must never
+	// gain eligibility merely by being collated.
+	if identityUncertain || p.Unknown[o.Key] {
+		return inverseUnknown, "uncertain_policy_or_identity"
 	}
 	x, ok := p.Collated[o.Key]
 	if !ok {
@@ -195,9 +205,27 @@ func assessCollated(p inverseProtection, x inverseCollatedAssessment) inverseCol
 			x.Reason = "keep_everything_stream"
 			return x
 		}
+		// Every source must positively establish both its pinned policy and its
+		// span. An absent window, a nil/invalid span, a missing or mismatched
+		// timezone or an undecided stream is uncertainty, and uncertainty HOLDS:
+		// it must never fall through as "not overlapping" and become eligible.
 		w, ok := p.Windows[s.StreamID]
-		if ok && s.Start != nil && s.End != nil && r2RetireValidSpan(*s.Start, *s.End) &&
-			s.Timezone == w.Timezone && s.Start.Before(w.End) && s.End.After(w.Start) {
+		if !ok {
+			x.Reason = "collated_source_no_pinned_window"
+			return x
+		}
+		if s.Start == nil || s.End == nil || !r2RetireValidSpan(*s.Start, *s.End) ||
+			s.Timezone == "" || s.Timezone != w.Timezone || s.Path == "" {
+			x.Reason = "collated_source_span_or_timezone_uncertain"
+			return x
+		}
+		if r2RetireEffectiveChoice(p.Picks.Choices[s.StreamID], true, w) == "" {
+			x.Reason = "collated_source_policy_undecided"
+			return x
+		}
+		if s.Start.Before(w.End) && s.End.After(w.Start) {
+			// ANY source in the pinned window protects the WHOLE output. Owner ACKs
+			// and copied RAW sources are not a current hashed inventory of it.
 			x.Keep28 = true
 		}
 	}
@@ -413,11 +441,48 @@ func (a *inverseApplier) deleteNonraw(ctx context.Context, e inverseEntry) (bool
 
 // authorizeNonraw issues the single-use capability only after every live check,
 // and only once across restarts and processes.
+// prepareNonrawWire takes the SAME protection envelope as the RAW wire path —
+// metadata barrier, ordered shared protection locks, the exact COPY key latch,
+// a locked reload and a live hold/veto check — and then re-checks the KE epoch
+// and fresh controller evidence. The reservation transaction has already
+// committed, so this is the only thing standing between a stale protection
+// change and the unconditional DELETE; it must not be a weaker copy.
+func (a *inverseApplier) prepareNonrawWire(ctx context.Context, tx pgx.Tx, e inverseEntry) (inverseCollatedAssessment, error) {
+	if err := inverseProtectionBarrier(ctx, tx); err != nil {
+		return inverseCollatedAssessment{}, err
+	}
+	if err := inverseProtectionLocks(ctx, tx, true); err != nil {
+		return inverseCollatedAssessment{}, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT lock_nas_r2_copy_key($1,$2)`, a.store.Bucket(), e.Key); err != nil {
+		return inverseCollatedAssessment{}, err
+	}
+	t, err := a.loadNonrawTarget(ctx, tx, e)
+	if err != nil {
+		return t, err
+	}
+	// KE folder membership, picks and pinned windows are cached per batch. A
+	// catalog identity change must not survive into wire authority.
+	var epoch int64
+	if err = tx.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`).Scan(&epoch); err != nil {
+		return t, err
+	}
+	if epoch != a.keEpoch {
+		return t, errors.New("KE catalog identity changed; refresh partition before further wire attempts")
+	}
+	// Fresh controller evidence and the six live writer categories, immediately
+	// before the DELETE, not just at batch start.
+	if err = a.checkEvidence(ctx, tx); err != nil {
+		return t, err
+	}
+	return t, nil
+}
+
 func (a *inverseApplier) authorizeNonraw(ctx context.Context, tx pgx.Tx, e inverseEntry) (*inverseNonrawAuthority, error) {
 	if a.opts.Lane != inverseNonrawCollated {
 		return nil, errors.New("nonraw authority requires the collated lane")
 	}
-	t, err := a.loadNonrawTarget(ctx, tx, e)
+	t, err := a.prepareNonrawWire(ctx, tx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -429,6 +494,11 @@ func (a *inverseApplier) authorizeNonraw(ctx context.Context, tx pgx.Tx, e inver
 		return nil, errors.New("nonraw wire authority already issued; reconcile only")
 	}
 	if err = a.proveNonrawReceipt(ctx, tx, t, e); err != nil {
+		return nil, err
+	}
+	binding := inverseDeleteBinding{Bucket: a.store.Bucket(), EndpointSHA256: a.store.EndpointSHA256(), Key: e.Key, ETag: e.ETag, SourceID: t.ID, StreamID: t.StreamID, SizeBytes: e.SizeBytes, LastModified: e.LastModified, ManifestSHA256: a.opts.ManifestSHA, PolicySHA256: a.summary.PolicySHA256, PicksSHA256: a.summary.PicksSHA256, DrainSHA256: a.opts.DrainSHA}
+	key := inverseWireGuardKey(a, tx, t, e)
+	if err = key.check(ctx, binding); err != nil {
 		return nil, err
 	}
 	head, err := a.store.Head(ctx, e.Key)
@@ -451,7 +521,6 @@ func (a *inverseApplier) authorizeNonraw(ctx context.Context, tx pgx.Tx, e inver
 	if err = a.store.RequireNoMultipartUploads(ctx); err != nil {
 		return nil, err
 	}
-	binding := inverseDeleteBinding{Bucket: a.store.Bucket(), EndpointSHA256: a.store.EndpointSHA256(), Key: e.Key, ETag: e.ETag, SourceID: t.ID, StreamID: t.StreamID, SizeBytes: e.SizeBytes, LastModified: e.LastModified, ManifestSHA256: a.opts.ManifestSHA, PolicySHA256: a.summary.PolicySHA256, PicksSHA256: a.summary.PicksSHA256, DrainSHA256: a.opts.DrainSHA}
 	tag, err := a.pool.Exec(ctx, `INSERT INTO r2_nonraw_attempts(bucket,object_key) VALUES($1,$2) ON CONFLICT DO NOTHING`, binding.Bucket, binding.Key)
 	if err != nil {
 		return nil, err
@@ -460,6 +529,40 @@ func (a *inverseApplier) authorizeNonraw(ctx context.Context, tx pgx.Tx, e inver
 		return nil, errors.New("nonraw wire authority was already issued; reconcile only")
 	}
 	return &inverseNonrawAuthority{binding: binding, applier: a, tx: tx, entry: e, used: &atomic.Bool{}}, nil
+}
+
+// inverseWireGuardKey is the collated durable-intent guard. It reuses the RAW
+// guard's shape and binding, restricted to the collated namespace.
+func inverseWireGuardKey(a *inverseApplier, tx pgx.Tx, t inverseCollatedAssessment, e inverseEntry) *inverseNonrawGuard {
+	return &inverseNonrawGuard{a: a, tx: tx, t: t, e: e}
+}
+
+type inverseNonrawGuard struct {
+	a  *inverseApplier
+	tx pgx.Tx
+	t  inverseCollatedAssessment
+	e  inverseEntry
+}
+
+func (g *inverseNonrawGuard) check(ctx context.Context, binding inverseDeleteBinding) error {
+	if g.a.opts.Lane != inverseNonrawCollated || binding.SourceID != g.t.ID || binding.Key != g.e.Key {
+		return errors.New("nonraw wire authority scope differs")
+	}
+	var durable bool
+	err := g.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_nonraw_intents i WHERE i.bucket=$1 AND i.object_key=$2
+ AND i.source_id=$3 AND i.manifest_sha256=$4 AND i.drain_evidence_sha256=$5 AND i.endpoint_sha256=$6
+ AND i.size_bytes=$7 AND i.etag=$8 AND i.stream_id=$9 AND i.picks_sha256=$10 AND i.policy_sha256=$11
+ AND i.last_modified=$12 AND i.retirement_class=$13)`,
+		binding.Bucket, binding.Key, g.t.ID, g.a.opts.ManifestSHA, g.a.opts.DrainSHA, binding.EndpointSHA256,
+		g.e.SizeBytes, g.e.ETag, g.t.StreamID, binding.PicksSHA256, binding.PolicySHA256,
+		g.e.LastModified, inverseNonrawRetirementClass).Scan(&durable)
+	if err != nil {
+		return err
+	}
+	if !durable {
+		return errors.New("nonraw wire intent missing")
+	}
+	return nil
 }
 
 type inverseNonrawStore interface {
@@ -498,7 +601,10 @@ func (a *inverseNonrawAuthority) check(ctx context.Context, bucket, endpoint str
 	if !issued {
 		return errors.New("durable nonraw issuance missing")
 	}
-	if _, err := a.applier.loadNonrawTarget(ctx, a.tx, a.entry); err != nil {
+	// Re-derive eligibility from live state under the same locks, then re-check
+	// the KE epoch and fresh evidence: the reservation committed earlier, so a
+	// protection or catalog change must be able to veto at the wire boundary.
+	if _, err := a.applier.prepareNonrawWire(ctx, a.tx, a.entry); err != nil {
 		return err
 	}
 	return nil

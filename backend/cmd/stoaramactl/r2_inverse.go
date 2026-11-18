@@ -62,6 +62,9 @@ type inverseProtection struct {
 	// ReviewedDelivery lifts the obsolete bare-delivery ownership veto. It is set
 	// ONLY by the owner fence policy, never by legacy/default RAW behavior.
 	ReviewedDelivery bool
+	// Unknown is the shared uncertainty set the RAW classification computes. The
+	// collated path must respect it rather than bypass it.
+	Unknown map[string]bool
 }
 type inverseEntry struct {
 	r2.ObjectInfo
@@ -119,25 +122,32 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 		return inverseUnknown, "no_catalog_identity"
 	}
 	// Every alias must positively establish non-keep28 identity. A single
-	// overlapping alias protects the key; an uncertain alias holds it.
+	// overlapping alias protects the key; an uncertain alias holds it. Collated
+	// keys carry one collated row plus one row per RAW source; the sources are
+	// assessed by the collated path, and the output's own row is judged here so
+	// the shared unknown veto is never bypassed.
+	collated := false
+	for _, id := range identities {
+		if id.Kind == "collated" {
+			collated = true
+		}
+	}
 	unknown := false
 	for _, id := range identities {
-		w, ok := p.Windows[id.StreamID]
-		if !ok || id.Start == nil || id.End == nil || !r2RetireValidSpan(*id.Start, *id.End) || id.Timezone != w.Timezone || id.Path == "" {
+		if collated && id.Kind == "source" {
+			continue
+		}
+		if p.identityUncertain(id) {
 			unknown = true
 			continue
 		}
+		w := p.Windows[id.StreamID]
 		if id.Start.Before(w.End) && id.End.After(w.Start) {
 			return inverseKeep28, "pinned_window_overlap"
 		}
-		if r2RetireEffectiveChoice(p.Picks.Choices[id.StreamID], true, w) == "" {
-			unknown = true
-		}
 	}
-	for _, id := range identities {
-		if id.Kind == "collated" {
-			return p.classifyCollated(o, identities)
-		}
+	if collated {
+		return p.classifyCollated(o, unknown)
 	}
 	if len(identities) > 1 {
 		unknown = true
@@ -149,6 +159,19 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 		return inverseUnknown, "ungated_writer_prefix"
 	}
 	return inverseDeletable, "outside_pinned_keep28"
+}
+
+// identityUncertain is the single uncertainty predicate shared by the RAW and
+// collated paths: absent pinned window, nil/invalid span, missing or mismatched
+// timezone, empty path or an undecided stream policy all make an identity
+// uncertain, and uncertainty always holds instead of authorizing deletion.
+func (p inverseProtection) identityUncertain(id inverseIdentity) bool {
+	w, ok := p.Windows[id.StreamID]
+	if !ok || id.Start == nil || id.End == nil || !r2RetireValidSpan(*id.Start, *id.End) ||
+		id.Timezone == "" || id.Timezone != w.Timezone || id.Path == "" {
+		return true
+	}
+	return r2RetireEffectiveChoice(p.Picks.Choices[id.StreamID], true, w) == ""
 }
 
 const inverseCatalogSQL = `

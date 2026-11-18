@@ -469,3 +469,142 @@ func TestR2InverseToolsPrefixIsNeverDeletable(t *testing.T) {
 		}
 	}
 }
+
+// TestR2NonrawSourceUncertaintyHolds is the ROOT "uncertainty must HOLD" property.
+// A source with an absent pinned window, a nil or invalid span, or a missing or
+// mismatched timezone may never fall through as "not overlapping" and become
+// eligible: each case must be held and never deletable.
+func TestR2NonrawSourceUncertaintyHolds(t *testing.T) {
+	start := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	end := start.Add(28 * 24 * time.Hour)
+	window := api.Keep28Window{StreamID: 3, Timezone: "Asia/Tokyo", Start: start, End: end}
+	inside := start.Add(time.Hour)
+	outside := start.Add(-30 * 24 * time.Hour)
+	outsideEnd := outside.Add(time.Minute)
+	base := func() inverseProtection {
+		return inverseProtection{
+			Identities: map[string][]inverseIdentity{},
+			Held:       map[string]bool{},
+			Delivery:   map[string]bool{},
+			KEFolders:  map[string]bool{},
+			Windows:    map[int64]api.Keep28Window{3: window},
+			Picks:      r2RetirePicks{Choices: map[int64]r2RetirePick{3: {Choice: "none", KeepStartUTC: start.Format(time.RFC3339), KeepEndUTC: end.Format(time.RFC3339)}}},
+		}
+	}
+	output := func(sources ...inverseCollatedSource) inverseCollatedAssessment {
+		return inverseCollatedAssessment{ID: 7, Key: "joined/nightly-collation-v2/objects/" + nonrawOutputSHA + ".mp4",
+			Path: "nightly/video.mp4", SHA: nonrawOutputSHA, SizeBytes: 900, VerifiedAt: start,
+			StreamID: 3, Sources: sources}
+	}
+	good := inverseCollatedSource{ID: 1, StreamID: 3, Path: "s/a.mp4", Start: &outside, End: &outsideEnd, Timezone: "Asia/Tokyo"}
+	badEnd := outsideEnd.Add(-2 * time.Minute)
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(p *inverseProtection, x *inverseCollatedAssessment)
+	}{
+		{"absent_pinned_window", func(p *inverseProtection, _ *inverseCollatedAssessment) { delete(p.Windows, 3) }},
+		{"nil_source_span", func(_ *inverseProtection, x *inverseCollatedAssessment) { x.Sources[0].Start = nil }},
+		{"nil_source_end", func(_ *inverseProtection, x *inverseCollatedAssessment) { x.Sources[0].End = nil }},
+		{"invalid_source_span", func(_ *inverseProtection, x *inverseCollatedAssessment) { e := badEnd; x.Sources[0].End = &e }},
+		{"missing_source_timezone", func(_ *inverseProtection, x *inverseCollatedAssessment) { x.Sources[0].Timezone = "" }},
+		{"mismatched_source_timezone", func(_ *inverseProtection, x *inverseCollatedAssessment) { x.Sources[0].Timezone = "UTC" }},
+		{"empty_source_path", func(_ *inverseProtection, x *inverseCollatedAssessment) { x.Sources[0].Path = "" }},
+		{"undecided_source_policy", func(p *inverseProtection, _ *inverseCollatedAssessment) {
+			delete(p.Picks.Choices, 3)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := base()
+			x := output(good)
+			tc.mutate(&p, &x)
+			got := assessCollated(p, x)
+			if got.Reason == "" && !got.Keep28 {
+				t.Fatalf("%s: uncertain source was treated as eligible", tc.name)
+			}
+			// The partition must agree.
+			p.Collated = map[string]inverseCollatedAssessment{got.Key: got}
+			p.Identities[got.Key] = []inverseIdentity{{StreamID: 3, Kind: "collated", Path: got.Path, Start: &outside, End: &outsideEnd, Timezone: "Asia/Tokyo"}}
+			class, reason := p.classify(r2.ObjectInfo{Key: got.Key, SizeBytes: 900})
+			if class == inverseCollated || class == inverseDeletable {
+				t.Fatalf("%s: partition classified %s (%s)", tc.name, class, reason)
+			}
+		})
+	}
+	// Control: a fully known non-overlapping source stays eligible, so the test
+	// cannot pass by holding everything.
+	p := base()
+	got := assessCollated(p, output(good))
+	if got.Reason != "" || got.Keep28 {
+		t.Fatalf("control case wrongly held: %q keep28=%v", got.Reason, got.Keep28)
+	}
+	// Any single in-window source holds the whole output.
+	inWindowEnd := inside.Add(time.Minute)
+	inWindow := inverseCollatedSource{ID: 2, StreamID: 3, Path: "s/b.mp4", Start: &inside, End: &inWindowEnd, Timezone: "Asia/Tokyo"}
+	if got := assessCollated(base(), output(good, inWindow)); !got.Keep28 {
+		t.Fatal("in-window source did not mark the output keep28")
+	}
+}
+
+// TestR2NonrawWireProtectionRace proves the collated wire path takes the shared
+// protection envelope: a KE epoch change committed after the reservation must
+// veto the DELETE instead of racing it.
+func TestR2NonrawWireProtectionRace(t *testing.T) {
+	// Each scenario needs its own schema and pool; the fixtures must not
+	// overlap, so each runs as a subtest whose cleanup releases connections.
+	t.Run("ke_epoch_change_after_reservation", func(t *testing.T) {
+		f := newNonrawFixture(t, "nonraw_race_epoch")
+		a := f.applier(t, "run1")
+		entry := inverseEntry{ObjectInfo: r2.ObjectInfo{Key: f.key, ETag: "collated-etag", SizeBytes: 900, LastModified: inverseRetirementCutoff().Add(-time.Second)}, Class: inverseCollated}
+		// Reserve first, exactly as the real flow does, so the mutation lands
+		// after the reservation transaction committed.
+		if _, err := a.reserveNonraw(f.ctx, entry); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.pool.Exec(f.ctx, `UPDATE r2_inverse_ke_epoch SET epoch=epoch+1`); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := f.pool.Begin(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(f.ctx)
+		if _, err = a.authorizeNonraw(f.ctx, tx, entry); err == nil {
+			t.Fatal("KE epoch change after reservation still authorized wire")
+		}
+		if f.deletes() != 0 {
+			t.Fatal("DELETE reached the provider after a protection change")
+		}
+	})
+
+	t.Run("live_hold_after_reservation", func(t *testing.T) {
+		f := newNonrawFixture(t, "nonraw_race_hold")
+		a := f.applier(t, "run1")
+		entry := inverseEntry{ObjectInfo: r2.ObjectInfo{Key: f.key, ETag: "collated-etag", SizeBytes: 900, LastModified: inverseRetirementCutoff().Add(-time.Second)}, Class: inverseCollated}
+		if _, err := a.reserveNonraw(f.ctx, entry); err != nil {
+			t.Fatal(err)
+		}
+		// A NAS cleanup source hold on a source clip is a real live veto that did
+		// not exist when the reservation committed, and it is inserted through an
+		// ordinary admission path so the live closure really has to reload.
+		var planID int64
+		if err := f.pool.QueryRow(f.ctx, `INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode)
+ VALUES(47,13,'nonraw-race',repeat('d',64),jsonb_build_array(jsonb_build_object('kind','raw','source_id',$1::bigint)),repeat('e',64),'dry_run') RETURNING id`, f.clipID).Scan(&planID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.pool.Exec(f.ctx, `INSERT INTO nas_cleanup_source_holds(plan_id,clip_id) VALUES($1,$2)`, planID, f.clipID); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := f.pool.Begin(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(f.ctx)
+		if _, err = a.authorizeNonraw(f.ctx, tx, entry); err == nil {
+			t.Fatal("live hold added after reservation still authorized wire")
+		}
+		if f.deletes() != 0 {
+			t.Fatal("DELETE reached the provider despite a live hold")
+		}
+	})
+}
