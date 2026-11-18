@@ -1033,7 +1033,7 @@ class SafetyRegressionTests(unittest.TestCase):
             job.save = full
             with patch.object(r.sys, 'stderr', new=io.StringIO()) as stderr:
                 job.fail('failure')
-            self.assertEqual(job.events, ['OFF', 'notify', 'save'])
+            self.assertEqual(job.events, ['save', 'OFF', 'notify', 'save'])
             self.assertTrue((job.root / 'STOP').exists())
             self.assertEqual(job.status['last_error'], 'failure')
             self.assertIn('failure state write failed', stderr.getvalue())
