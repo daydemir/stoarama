@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -260,13 +261,28 @@ func partitionInverse(ctx context.Context, store inverseLister, p inverseProtect
 		sum.Classes[class] = r2RetireStat{}
 	}
 	encoder := json.NewEncoder(out)
-	// S3 full listing is lexically ordered. Refuse duplicates/out-of-order keys
-	// instead of double counting or silently hiding incomplete provider output.
+	// R2 can return a key after its descendants (X.json.sig before X.json).
+	// Track identity independently of order, without retaining every key string.
+	// A 128-bit SHA-256 prefix collision also fails closed, never drops an entry.
+	seen := map[[16]byte]struct{}{}
 	previous := ""
 	err := store.ListPrefix(ctx, "", 0, func(o r2.ObjectInfo) error {
-		if o.Key == "" || o.Key <= previous || o.SizeBytes < 0 {
-			return errors.New("invalid or unordered full-bucket listing")
+		digest := sha256.Sum256([]byte(o.Key))
+		identity := [16]byte(digest[:16])
+		_, duplicate := seen[identity]
+		predicate := ""
+		switch {
+		case o.Key == "":
+			predicate = "empty_key"
+		case duplicate:
+			predicate = "duplicate_key"
+		case o.SizeBytes < 0:
+			predicate = "negative_size"
 		}
+		if predicate != "" {
+			return fmt.Errorf("invalid full-bucket listing: predicate=%s previous=%q offending=%q size=%d", predicate, previous, o.Key, o.SizeBytes)
+		}
+		seen[identity] = struct{}{}
 		previous = o.Key
 		class, reason := p.classify(o)
 		if err := encoder.Encode(inverseEntry{o, class, reason}); err != nil {

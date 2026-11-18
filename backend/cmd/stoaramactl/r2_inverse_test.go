@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,10 +101,47 @@ func TestR2InverseProtectionAliasesAndUncertainty(t *testing.T) {
 	}
 }
 func TestR2InverseRefusesBrokenListing(t *testing.T) {
-	for _, listing := range []inverseTestListing{{{Key: "a"}, {Key: "a"}}, {{Key: "b"}, {Key: "a"}}, {{Key: "a", SizeBytes: -1}}, {{Key: ""}}} {
-		if _, err := partitionInverse(context.Background(), listing, inverseTestProtection(), "policy", &bytes.Buffer{}); err == nil {
-			t.Fatal("accepted broken full listing", listing)
-		}
+	for _, tc := range []struct {
+		name, predicate string
+		bad             r2.ObjectInfo
+	}{
+		{"duplicate", "duplicate_key", r2.ObjectInfo{Key: "a"}},
+		{"negative size", "negative_size", r2.ObjectInfo{Key: "b", SizeBytes: -1}},
+		{"empty key", "empty_key", r2.ObjectInfo{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			listing := inverseTestListing{{Key: "a", SizeBytes: 1}, tc.bad, {Key: "z"}}
+			var out bytes.Buffer
+			sum, err := partitionInverse(context.Background(), listing, inverseTestProtection(), "policy", &out)
+			want := fmt.Sprintf("predicate=%s previous=%q offending=%q size=%d", tc.predicate, "a", tc.bad.Key, tc.bad.SizeBytes)
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("error=%v, want %s", err, want)
+			}
+			if sum.Total.Objects != 1 || strings.Count(out.String(), "\n") != 1 {
+				t.Fatalf("emitted rejected entry: sum=%+v output=%s", sum.Total, &out)
+			}
+		})
+	}
+}
+
+func TestR2InversePartitionR2PrefixOrderAndNonAdjacentDuplicate(t *testing.T) {
+	// Exact pair reproduced by the read-only R2 LIST on 2026-11-18.
+	listing := inverseTestListing{
+		{Key: "relay-releases/latest-05739dfe.json.sig", ETag: "db6b3c924cd1eb6d1239fca1d8a26551", SizeBytes: 89},
+		{Key: "relay-releases/latest-05739dfe.json", ETag: "ba2c866dae94df602275a78078bfc73c", SizeBytes: 3661},
+	}
+	var out bytes.Buffer
+	sum, err := partitionInverse(context.Background(), listing, inverseTestProtection(), "policy", &out)
+	if err != nil || sum.Total.Objects != 2 || sum.Total.Bytes != 3750 || strings.Count(out.String(), "\n") != 2 {
+		t.Fatalf("sum=%+v error=%v output=%s", sum.Total, err, &out)
+	}
+	// The duplicate need not be adjacent and may carry different metadata.
+	listing = append(listing, r2.ObjectInfo{Key: listing[0].Key, SizeBytes: 100})
+	out.Reset()
+	sum, err = partitionInverse(context.Background(), listing, inverseTestProtection(), "policy", &out)
+	want := fmt.Sprintf("predicate=duplicate_key previous=%q offending=%q size=100", listing[1].Key, listing[0].Key)
+	if err == nil || !strings.Contains(err.Error(), want) || sum.Total.Objects != 2 || strings.Count(out.String(), "\n") != 2 {
+		t.Fatalf("sum=%+v error=%v output=%s", sum.Total, err, &out)
 	}
 }
 func TestR2InverseLiveHoldTables(t *testing.T) {

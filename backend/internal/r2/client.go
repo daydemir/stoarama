@@ -654,6 +654,9 @@ func (c *Client) ListPrefix(ctx context.Context, prefix string, limit int, fn fu
 		if !aws.ToBool(out.IsTruncated) {
 			return nil
 		}
+		if aws.ToString(out.NextContinuationToken) == "" || aws.ToString(out.NextContinuationToken) == aws.ToString(token) {
+			return fmt.Errorf("list prefix %s: truncated listing has no advancing continuation token", prefix)
+		}
 		token = out.NextContinuationToken
 	}
 }
@@ -756,8 +759,8 @@ func (c *Client) ListRoots(ctx context.Context) ([]string, []ObjectInfo, error) 
 		if !aws.ToBool(out.IsTruncated) {
 			return prefixes, objects, nil
 		}
-		if out.NextContinuationToken == nil {
-			return nil, nil, errors.New("truncated root listing has no continuation token")
+		if aws.ToString(out.NextContinuationToken) == "" || aws.ToString(out.NextContinuationToken) == aws.ToString(token) {
+			return nil, nil, errors.New("truncated root listing has no advancing continuation token")
 		}
 		token = out.NextContinuationToken
 	}
