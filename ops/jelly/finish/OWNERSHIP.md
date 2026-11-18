@@ -99,3 +99,22 @@ mismatches stop cleanup too. Emergency containment retains supervision until the
 exact owned plan is confirmed stopped. After a lost pause response it re-reads the
 active set and exact digest before another monotonic pause; it never retries item
 execution or writes a foreign plan. Already-paused expiry reasons are preserved.
+
+New enablement takes the **existing D tick state/lock** before its final STOP/D
+health check and control POST. D already owns that lock before collecting safety
+and through its last import/check. No successor can become enabled while D uses
+an older ownership snapshot. The runner holds no snapshot lock while waiting;
+its heartbeat remains writable, and its previous plan has already drained.
+
+For an intentional natural boundary during owned execution, the controller writes
+and hashes an explicit STOP JSON, retaining the actual owner UUID and timestamp:
+
+```json
+{"schema":"stoarama.cleanup-stop.v1","owner_id":"<manifest UUID>","reason":"natural_boundary","created_at":"<actual RFC3339 time>"}
+```
+
+This prevents successor enablement while healthy active execution drains; D and
+monitoring continue. Empty STOPs, the retired initial STOP text, foreign UUIDs,
+other reasons and future timestamps fail closed. Failure STOPs never override D
+or runner latches. The original STOP is removed only by the initial reviewed
+handoff, not converted or reused. Controller journals preserve every actual byte.

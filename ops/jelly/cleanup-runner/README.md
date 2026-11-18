@@ -70,3 +70,8 @@ Actual installed runner paths come from the loaded plist, not the template.
 It never enables a plan and cannot adopt an enabled saved execution.
 No automatic rollback, stale status restore, hold removal, failure clear or item
 retry is part of installation. All production changes require the sole controller.
+
+Successor enablement waits on the existing D tick lock so D can consume its full
+safety snapshot before a new plan appears. A controller's natural STOP uses the
+owner-bound JSON in OWNERSHIP.md; it preserves active natural drain and D health.
+Foreign or empty STOP content is a safety failure, not a natural-boundary request.

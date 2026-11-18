@@ -594,6 +594,20 @@ class Runner:
             require(self.plan(pid)['mode'] == 'paused', 'owned pause not confirmed')
         self.status['phase'] = 'execution_off'
 
+    def enable(self, plan):
+        # D consumes one snapshot throughout its tick. It owns this same lock
+        # before collection, so a successor cannot appear during those checks.
+        # No active cleanup is held waiting here, and heartbeats stay writable.
+        with (self.finish_state / 'lock').open('a') as tick:
+            fcntl.flock(tick, fcntl.LOCK_EX)
+            if self.stopped():
+                return False
+            self.finish_health()
+            self.api('POST', 'plans/' + str(plan['id']) + '/control', {'mode': 'enabled',
+                'plan_sha256': plan['plan_sha256'], 'approval_hours': 24,
+                'allow_long_approval': True, 'reason': REASON})
+        return True
+
     def validate_owner(self):
         # Controller pins this immutable activation manifest in owner.env.
         path = self.root / 'cleanup-owner.json'
@@ -1147,10 +1161,8 @@ class Runner:
             if self.stopped():
                 self.master(False)
                 break
-            self.finish_health()
-            self.api('POST', 'plans/' + str(pid) + '/control', {'mode': 'enabled',
-                'plan_sha256': p['plan_sha256'], 'approval_hours': 24,
-                'allow_long_approval': True, 'reason': REASON})
+            if not self.enable(p):
+                break
             self.monitor(pid)
         self.save('stopped')
 

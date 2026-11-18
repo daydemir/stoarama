@@ -1,7 +1,8 @@
 import copy
+import json
 from datetime import datetime, timezone, timedelta
 import unittest
-from ownership import assemble_owned, POLICY_SHA
+from ownership import assemble_owned, validate_stop, POLICY_SHA
 from collector import PLAN, PLAN_SHA, timestamp
 
 NOW = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
@@ -94,6 +95,17 @@ class OwnershipTests(unittest.TestCase):
         with self.assertRaises(ValueError): self.collect(parts)
         parts = list(parts); parts[2] = None; parts[3] = None
         self.assertEqual(assemble_owned(*parts, now=NOW, running=True, selecting=True), result)
+
+    def test_natural_stop_is_exact_owner_bound_and_never_foreign(self):
+        owner = fixture()[1]
+        stop = dict(schema='stoarama.cleanup-stop.v1', owner_id=owner['owner_id'],
+                    reason='natural_boundary', created_at=NOW.isoformat())
+        validate_stop(json.dumps(stop), owner, NOW)
+        for change in (dict(owner_id='foreign'), dict(reason='failure'),
+                       dict(created_at=(NOW+timedelta(seconds=1)).isoformat())):
+            with self.assertRaises(ValueError):
+                validate_stop(json.dumps(dict(stop, **change)), owner, NOW)
+        with self.assertRaises(ValueError): validate_stop('', owner, NOW)
 
     def test_dead_owner_cannot_allow_enabled_plan(self):
         with self.assertRaises(ValueError): self.collect(fixture(), running=False)

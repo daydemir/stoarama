@@ -18,6 +18,14 @@ def digest(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
+def validate_stop(raw, owner, now):
+    stop = json.loads(raw)
+    require(stop['schema'] == 'stoarama.cleanup-stop.v1'
+            and stop['owner_id'] == owner['owner_id']
+            and stop['reason'] == 'natural_boundary'
+            and timestamp(stop['created_at']) <= now)
+
+
 def owner_plan(status, owner):
     pid = status['current_plan'] or status.get('next_plan') or status['recovery_plan_id']
     require(type(pid) is int and (pid >= owner['initial_plan_id'] or pid == owner['baseline_plan_id']))
@@ -104,7 +112,12 @@ def collect(root, repo, recovery_path, owner_sha256, now, plan_source=False):
     with (root / 'ownership.lock').open('a') as snapshot:
         fcntl.flock(snapshot, fcntl.LOCK_SH)
         status = json.loads((root / 'status.json').read_bytes())
-        require(not (root / 'STOP').exists())
+        try:
+            stop = (root / 'STOP').read_bytes()
+        except FileNotFoundError:
+            stop = None
+        if stop is not None:
+            validate_stop(stop, owner, datetime.now(timezone.utc))
         with (root / 'lock').open('a') as execution:
             try:
                 fcntl.flock(execution, fcntl.LOCK_EX | fcntl.LOCK_NB)

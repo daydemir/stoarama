@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest.mock import patch
 import json
 import tempfile
+import threading
 import unittest
 
 
@@ -162,6 +163,35 @@ class ControllerOwnershipTests(unittest.TestCase):
             job.api = lambda *_: self.fail('already paused plan must not be rewritten')
             job.master(False)
             self.assertEqual(r.execution_state(plan), 'expired')
+
+    def test_successor_cannot_enable_while_d_consumes_snapshot(self):
+        with tempfile.TemporaryDirectory() as root:
+            job, plan = self.job(root)
+            called, started, finished = threading.Event(), threading.Event(), threading.Event()
+            job.api = lambda *args: called.set()
+            result = []
+            def enable():
+                started.set()
+                result.append(job.enable(plan))
+                finished.set()
+            with (job.finish_state / 'lock').open('a') as tick:
+                r.fcntl.flock(tick, r.fcntl.LOCK_EX)
+                thread = threading.Thread(target=enable)
+                thread.start()
+                self.assertTrue(started.wait(1))
+                self.assertFalse(called.wait(0.05))
+                r.fcntl.flock(tick, r.fcntl.LOCK_UN)
+                self.assertTrue(finished.wait(1))
+                thread.join()
+            self.assertEqual(result, [True])
+            self.assertTrue(called.is_set())
+
+    def test_stop_while_waiting_for_d_prevents_successor(self):
+        with tempfile.TemporaryDirectory() as root:
+            job, plan = self.job(root)
+            (job.root / 'STOP').write_text('owned natural stop')
+            job.api = lambda *args: self.fail('STOP must prevent new enable')
+            self.assertFalse(job.enable(plan))
 
     def test_runner_has_no_render_capability(self):
         text = Path(r.__file__).read_text()

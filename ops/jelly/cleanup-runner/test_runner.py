@@ -267,6 +267,8 @@ class FakeRunner(r.Runner):
         self.windows = WINDOWS
         self.events = []
         self.p, self.cat = fixture()
+        self.finish_state = self.root / 'finish'
+        self.finish_state.mkdir()
         self.picks = [42, None]
         self.owner_validated = True
 
