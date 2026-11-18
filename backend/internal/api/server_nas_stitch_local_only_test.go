@@ -194,3 +194,27 @@ func TestNASStitchTaskDataHoldReplayIsIdempotent(t *testing.T) {
 		}
 	}
 }
+
+// A real plan carries frozen October witnesses. The task-data hold must still be
+// accepted then: a hold decision is exactly what a frozen difference requires,
+// and every leaf is still disposed by left_out.
+func TestNASStitchTaskDataHoldWithFrozenWitnessesIsAccepted(t *testing.T) {
+	f, p, q := newNASStitchTaskFixture(t)
+	f.s.cfg.NASStitchEnabled = true
+	edge := map[string]any{"recording_id": 2,
+		"source_key":               [][3]any{{int64(1), strings.Repeat("a", 64), int64(3)}, {int64(2), strings.Repeat("a", 64), int64(3)}},
+		"nomination":               true,
+		"status":                   "APPROVED85_nomination_requires_runtime_native_join_checks",
+		"frozen_diagnostic_sha256": strings.Repeat("d", 64)}
+	raw, _ := json.Marshal(edge)
+	p.Frozen[0] = raw
+	held := nasStitchResult{Policy: nasStitchPolicy, Token: q.Token, PlanSHA: q.PlanSHA,
+		Outputs: []nasStitchOutput{}, Repairs: []nasStitchRepair{}, LeftOut: []int64{1, 2, 3},
+		Seams: []nasStitchDecision{
+			{Policy: nasStitchPolicy, LeftID: 1, RightID: 2, Decision: "hold", Status: "HELD_task_data", Reason: "unreadable source"},
+			{Policy: nasStitchPolicy, LeftID: 2, RightID: 3, Decision: "hold", Status: "HELD_task_data", Reason: "unreadable source"},
+		}, Error: "unreadable source"}
+	if items, err := validateNASStitchResult(p, held); err != nil || len(items) != 0 {
+		t.Fatalf("frozen-witness hold rejected: %v %v", items, err)
+	}
+}
