@@ -28,34 +28,59 @@ def digest(path):
     return value.hexdigest()
 
 
+def literal_text(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = literal_text(node.left), literal_text(node.right)
+        if isinstance(left, (str, bytes)) and type(left) is type(right):
+            return left + right
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for value in node.values:
+            if isinstance(value, ast.FormattedValue) and value.format_spec is None:
+                value = value.value
+            part = literal_text(value)
+            if not isinstance(part, str):
+                return None
+            parts.append(part)
+        return ''.join(parts)
+    return None
+
+
 def verify_references(text):
     """Callers never duplicate the CLI filename or hash; both live in the binding.
 
-    Check source and decoded literals, including shell fragments. This checks
-    only Stoarama CLI references, not the execution graph or other tools.
+    Normalize source literals and shell quoting, not executable dependencies.
+    Other tools and their resolution are deliberately outside this check.
     """
-    def check(value):
-        require(RETIRED_CLI_SHA256 not in value, 'retired stoaramactl hash is referenced')
-        require(not re.search(r'\bstoaramactl\b', value, re.I), 'CLI selection must come from the binding')
-        require(not any(cli_digest_name(name) for name in re.findall(r'\b[A-Za-z_]\w*\b', value)),
-                'CLI hashes must come from the binding')
-    check(text)
+    pending, seen = [text], set()
     try:
         tree = ast.parse(text)
     except SyntaxError:
         tree = None
     if tree is not None:
         for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                check(node.value)
-    # Shell quote concatenation must not hide the same forbidden literal.
-    try:
-        tokens = shlex.split(text, comments=True)
-    except ValueError:
-        require(tree is not None, 'unparseable CLI caller')
-    else:
-        for token in tokens:
-            check(token)
+            value = literal_text(node)
+            if isinstance(value, bytes):
+                value = value.decode('latin-1')  # Preserve every byte for ASCII artifact-name checks.
+            if isinstance(value, str):
+                pending.append(value)
+    while pending:
+        value = pending.pop()
+        if value in seen:
+            continue
+        seen.add(value)
+        require(RETIRED_CLI_SHA256 not in value.lower(), 'retired stoaramactl hash is referenced')
+        require('stoaramactl' not in value.lower(), 'CLI selection must come from the binding')
+        require(not any(cli_digest_name(name) for name in re.findall(r'\b[A-Za-z_]\w*\b', value)),
+                'CLI hashes must come from the binding')
+        try:
+            pending.extend(shlex.split(value, comments=True))
+        except ValueError:
+            # A Python/SQL literal may contain incomplete shell quoting. Its raw
+            # and decoded text were still checked; it is not a shell command.
+            require(tree is not None, 'unparseable CLI caller')
 
 
 def cli_digest_name(name):

@@ -53,7 +53,13 @@ class BindingTests(unittest.TestCase):
                 binding.bound_cli()
 
     def test_runtime_source_cannot_reintroduce_another_cli_path_or_hash(self):
-        for text in ("#!/bin/sh\nstoaramactl\n",
+        for text in (r"subprocess.run([b'/Users/jelly/tmp-safeguards/\x73toaramactl'])",
+                     "subprocess.run(['/Users/jelly/tmp-safeguards/stoaramactl_old'])",
+                     "#!/bin/sh\nexec /Users/jelly/tmp-safeguards/stoaramactl_a889 \"$@\"",
+                     "subprocess.run('exec stoa\"\"ramactl nas-cleanup verify-recovery', shell=True)",
+                     "subprocess.run(['stoa' + 'ramactl'])",
+                     "subprocess.run([f\"sto{'ara'}mactl\"])",
+                     "#!/bin/sh\nstoaramactl\n",
                      "#!/bin/sh\nstoaramactl --help\n",
                      "#!/bin/sh\nexec \"$(command -v stoaramactl)\" \"$@\"",
                      "subprocess.run(\"exec stoaramactl nas-cleanup verify-recovery\", shell=True)",
