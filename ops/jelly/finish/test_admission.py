@@ -25,7 +25,7 @@ class AdmissionTest(unittest.TestCase):
         argv = ['wrapper', '--cli', 'cli', '--state', str(self.state), '--notify-agent', 'controller']
         argv += ['--safety-collector', 'collector'] if module is tick else ['--plan-source', 'source']
         with patch.object(sys, 'argv', argv), patch.object(subprocess, 'run', side_effect=run) as mocked, \
-                patch.object(module, 'notify'), patch.object(tick, 'run_cli',
+                patch.object(module, 'notify'), patch.object(module, 'bound_launcher', side_effect=Path), patch.object(tick, 'run_cli',
                     side_effect=lambda command, attempt: subprocess.run(command).returncode):
             result = module.main()
         return result, mocked.call_count

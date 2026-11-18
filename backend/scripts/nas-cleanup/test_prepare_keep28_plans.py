@@ -14,6 +14,51 @@ def row(sid, kind, n, size=1, purged=False):
 
 
 class Keep28PlanTests(unittest.TestCase):
+    def admission(self, master=True):
+        rows = [row(3, 'raw', 1), row(3, 'raw', 2)]
+        post = dict(id=1442, plan_sha256='a'*64)
+        detail = dict(post, label='k28-test', mode='dry_run', policy_current=True,
+                      policy_sha256=k.POLICY_SHA, master_deletion_enabled=master,
+                      allow_nas_only=False, approval_reason='', approved_until=None,
+                      items=[dict(kind='raw', source_id=n) for n in (1, 2)],
+                      results=[dict(ordinal=n, delete_ever_issued=False, state='leased') for n in (1, 2)])
+        return post, detail, rows
+
+    def test_admission_is_unarmed_independently_of_master_and_records_master(self):
+        for master in (True, False):
+            post, detail, rows = self.admission(master)
+            receipts = []
+            with patch.object(k, 'service', side_effect=[post, detail]) as service, patch('builtins.print'):
+                k.submit('fixture', 'k28-test', rows, receipts, [], atomic=True)
+            self.assertIs(receipts[0]['master_deletion_enabled'], master)
+            self.assertEqual([c.args[1] for c in service.call_args_list], ['POST', 'GET'])
+
+    def test_admitted_plan_contract_is_explicit_and_fail_closed(self):
+        mutations = [
+            lambda d: d.pop('master_deletion_enabled'),
+            lambda d: d.update(master_deletion_enabled=1),
+            lambda d: d.update(mode='enabled'),
+            lambda d: d.update(id=99),
+            lambda d: d.update(label='foreign'),
+            lambda d: d.update(plan_sha256='b'*64),
+            lambda d: d.update(policy_sha256='b'*64),
+            lambda d: d.update(policy_current=False),
+            lambda d: d.update(allow_nas_only=True),
+            lambda d: d.update(approval_reason='previous approval'),
+            lambda d: d['items'].append(d['items'][0]),
+            lambda d: d['results'].pop(),
+            lambda d: d['results'][0].update(ordinal=2),
+            lambda d: d['results'][0].update(delete_ever_issued=True),
+            lambda d: d['results'][0].update(delete_ever_issued=0),
+            lambda d: d['results'][0].update(state='delete_issued'),
+            lambda d: d['results'][0].update(state='deleted'),
+        ]
+        for mutation in mutations:
+            post, detail, rows = self.admission()
+            mutation(detail)
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(RuntimeError, 'reconcile its label'):
+                k.validate_admission(post, detail, 'k28-test', rows)
+
     def test_summary_only_counts_recoverable_supply_without_admission_or_plan_files(self):
         rows = [row(3, 'raw', 1, size=10), row(3, 'collated', 2, size=100), row(3, 'raw', 3, size=1000, purged=True)]
         with tempfile.TemporaryDirectory() as out, \

@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 from datetime import datetime, timezone, timedelta
 import unittest
-from ownership import assemble_owned, validate_stop, POLICY_SHA
+from ownership import assemble_owned, parse_stop, validate_stop, POLICY_SHA
 from collector import PLAN, PLAN_SHA, timestamp
 
 NOW = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
@@ -34,6 +34,14 @@ def fixture():
 
 
 class OwnershipTests(unittest.TestCase):
+    def test_failure_stop_has_valid_schema_but_never_allows_healthy_collection(self):
+        _, owner, *_ = fixture()
+        raw = json.dumps(dict(schema='stoarama.cleanup-stop.v1', owner_id=owner['owner_id'],
+                              reason='failure', created_at=NOW.isoformat())).encode()
+        self.assertEqual(parse_stop(raw, owner, NOW)['reason'], 'failure')
+        with self.assertRaises(ValueError):
+            validate_stop(raw, owner, NOW)
+
     def collect(self, parts, running=True):
         return assemble_owned(*parts, now=NOW, running=running)
 

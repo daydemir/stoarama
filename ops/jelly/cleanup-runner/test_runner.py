@@ -24,6 +24,14 @@ NOW = r.timestamp('2026-11-11T12:00:00+00:00')
 PREPARER = r.Runner(Path(__file__).resolve().parents[3], Path('.')).preparer()
 WINDOWS = {3: (r.timestamp('2026-09-01T00:00:00+00:00'), r.timestamp('2026-09-29T00:00:00+00:00'))}
 
+_bound_cli_fixture = patch.object(r, 'bound_launcher', return_value=Path('/fixture/stoaramactl.bin'))
+
+def setUpModule():
+    _bound_cli_fixture.start()
+
+def tearDownModule():
+    _bound_cli_fixture.stop()
+
 
 def fixture():
     item = dict(kind='raw', source_id=1, stream_id=3, size_bytes=100,
@@ -262,7 +270,7 @@ class FakeRunner(r.Runner):
     """Exercise orchestration without any network, DB or subprocess access."""
     def __init__(self, root, dry_run=False):
         self.root = Path(root)
-        self.status = {'current_plan': None, 'last_error': None}
+        self.status = {'current_plan': None, 'last_error': None, 'owner_id': '00000000-0000-0000-0000-000000000001'}
         self.dry_run = dry_run
         self.stopping = False
         self.lock = None
@@ -941,6 +949,7 @@ class SafetyRegressionTests(unittest.TestCase):
     def test_legacy_deferral_startup_refusal_preserves_full_ownership(self):
         with tempfile.TemporaryDirectory() as root:
             original=dict(current_plan=42,last_error=None,deleted_files=29797,deleted_bytes=2026235087172,
+                          owner_id='00000000-0000-0000-0000-000000000001',
                           deferred_streams={'3':{'retry_after':0,'failures':1}})
             path=Path(root)/'status.json';path.write_text(json.dumps(original))
             job=FakeRunner(root);job.repo=Path(root)
@@ -1049,7 +1058,7 @@ class SafetyRegressionTests(unittest.TestCase):
     def test_stop_write_failure_is_guarded_after_off_alert_and_state(self):
         with tempfile.TemporaryDirectory() as root:
             job = FakeRunner(root)
-            with patch.object(Path, 'touch', side_effect=OSError(errno.ENOSPC, 'test disk full')), \
+            with patch.object(r.os, 'link', side_effect=OSError(errno.ENOSPC, 'test disk full')), \
                     patch.object(r.sys, 'stderr', new=io.StringIO()) as stderr:
                 job.fail('failure')
             self.assertEqual(job.events, ['OFF', 'notify'])
@@ -1272,6 +1281,7 @@ class EmailTests(unittest.TestCase):
 class ReadFailureTests(unittest.TestCase):
     def job(self, root):
         job = r.Runner(Path('.'), Path(root))
+        job.status['owner_id'] = '00000000-0000-0000-0000-000000000001'
         job.prepare = SimpleNamespace(pg_env=lambda: {'PGOPTIONS': '-c default_transaction_read_only=on'},
                                       transient_sql_failure=PREPARER.transient_sql_failure)
         return job
@@ -1318,7 +1328,7 @@ class RecoveryRetryTests(unittest.TestCase):
         p,_=fixture()
         p['results'][0].update(delete_ever_issued=True)
         summary=dict(plan_id=42,plan_sha256=p['plan_sha256'],items=1,delete_ever_issued=1,
-                     verified=1,problems=0,by_status={'ok':1},problem_items=[])
+                     verified=1,problems=0,by_status={'ok':1},problem_items=[],checked_at=NOW.isoformat())
         summary.update(changes)
         return p,summary
 

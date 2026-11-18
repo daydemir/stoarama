@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 import subprocess
 from admission import Attempt, Latched, publish
+from cli_binding import bound_launcher
 
 STOPS = {'evidence_unavailable', 'cleanup_recovery_problems', 'unknown_enabled_cleanup',
          'copy_mismatch_latched', 'shutdown_or_recovery_failed', 'deletion_master_mismatch',
@@ -76,6 +77,7 @@ def main():
         try:
             args.state.mkdir(mode=0o700, parents=True, exist_ok=True)
             attempt = Attempt.start(args.state, 'tick', stack)
+            args.cli = bound_launcher(args.cli)
             temp = attempt.path
             safety, copy, status = (temp / name for name in ('safety.json', 'copy.json', 'status.json'))
             # No env files are loaded. Controller supplies auth; dependency stderr
@@ -120,7 +122,7 @@ def main():
                 notify(args.notify_agent, 'admission_publication_failed')
             print('finish admission_latched', flush=True)
             return 1
-        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
             reason = reason or 'current_status_unavailable'
             if attempt is not None:
                 try:

@@ -8,5 +8,6 @@ set -a
 . "$HOME/Build/stoarama/local/recording-supervisor.env" >/dev/null 2>&1
 . "$HOME/Build/stoarama/local/render.env" >/dev/null 2>&1
 . "$HOME/stoarama-cleanup-runner/owner.env" >/dev/null 2>&1
+. "$HOME/stoarama-cleanup-runner/cli-binding.env" >/dev/null 2>&1
 set +a
 exec /usr/bin/python3 -I "$repo/ops/jelly/cleanup-runner/runner.py" --repo "$repo" "$@"
