@@ -53,26 +53,32 @@ func (s finishStop) Error() string { return string(s) }
 
 // The sole controller collects these observations. This command never clears a
 // latch, changes a master, or trusts absent fields as evidence of safety.
+type finishCleanupOwner struct {
+	PlanID  int64  `json:"plan_id"`
+	PlanSHA string `json:"plan_sha256"`
+}
+
 type finishSafety struct {
-	UpdatedAt         time.Time        `json:"updated_at"`
-	RecoveryProblems  int64            `json:"recovery_problems"`
-	RecoveryCheckedAt time.Time        `json:"recovery_checked_at"`
-	RecoveryIssued    int64            `json:"recovery_issued_items"`
-	RecoveryVerified  int64            `json:"recovery_verified_items"`
-	ShutdownFailed    bool             `json:"shutdown_or_recovery_failed"`
-	RecoveryError     *string          `json:"recovery_error"`
-	RecoveryPlanID    int64            `json:"recovery_plan_id"`
-	RecoveryPlanSHA   string           `json:"recovery_plan_sha256"`
-	LastError         *string          `json:"last_error"`
-	HeldError         *string          `json:"controller_held_error"`
-	LocalMismatch     int64            `json:"local_copy_mismatch_latched"`
-	LocalCheckedAt    time.Time        `json:"local_copy_checked_at"`
-	MasterCheckedAt   time.Time        `json:"master_checked_at"`
-	KnownPlans        []int64          `json:"known_enabled_plans"`
-	KnownBatches      []int64          `json:"known_enabled_batches"`
-	Master            bool             `json:"master_deletion_enabled"`
-	ExpectedMaster    bool             `json:"expected_deletion_enabled"`
-	Holds             map[string]int64 `json:"holds_by_reason"`
+	CleanupOwner      *finishCleanupOwner `json:"cleanup_owner,omitempty"`
+	UpdatedAt         time.Time           `json:"updated_at"`
+	RecoveryProblems  int64               `json:"recovery_problems"`
+	RecoveryCheckedAt time.Time           `json:"recovery_checked_at"`
+	RecoveryIssued    int64               `json:"recovery_issued_items"`
+	RecoveryVerified  int64               `json:"recovery_verified_items"`
+	ShutdownFailed    bool                `json:"shutdown_or_recovery_failed"`
+	RecoveryError     *string             `json:"recovery_error"`
+	RecoveryPlanID    int64               `json:"recovery_plan_id"`
+	RecoveryPlanSHA   string              `json:"recovery_plan_sha256"`
+	LastError         *string             `json:"last_error"`
+	HeldError         *string             `json:"controller_held_error"`
+	LocalMismatch     int64               `json:"local_copy_mismatch_latched"`
+	LocalCheckedAt    time.Time           `json:"local_copy_checked_at"`
+	MasterCheckedAt   time.Time           `json:"master_checked_at"`
+	KnownPlans        []int64             `json:"known_enabled_plans"`
+	KnownBatches      []int64             `json:"known_enabled_batches"`
+	Master            bool                `json:"master_deletion_enabled"`
+	ExpectedMaster    bool                `json:"expected_deletion_enabled"`
+	Holds             map[string]int64    `json:"holds_by_reason"`
 }
 type finishCopy = nasCopyStatus
 
@@ -205,7 +211,20 @@ func finishCheck(ctx context.Context, pool *pgxpool.Pool, s finishSafety, c fini
 	if s.RecoveryCheckedAt.IsZero() || time.Since(s.RecoveryCheckedAt) > finishRecoveryAge || time.Until(s.RecoveryCheckedAt) > 30*time.Second || !s.RecoveryCheckedAt.After(newestIssued) || s.RecoveryIssued < 0 || s.RecoveryVerified != s.RecoveryIssued || issued != s.RecoveryIssued || planSHA != s.RecoveryPlanSHA {
 		return finishRecoveryStale
 	}
-	if len(s.KnownBatches) > 0 || len(s.KnownPlans) > 1 || (len(s.KnownPlans) == 1 && s.KnownPlans[0] != s.RecoveryPlanID) {
+	if s.CleanupOwner != nil {
+		owner := s.CleanupOwner
+		if owner.PlanID <= 0 || len(owner.PlanSHA) != 64 || len(s.KnownPlans) != 1 || s.KnownPlans[0] != owner.PlanID || !s.ExpectedMaster || s.HeldError != nil {
+			return finishEvidence
+		}
+		var matches bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_plans WHERE id=$1 AND plan_sha256=$2 AND account_id=47 AND connection_id=13 AND mode IN ('dry_run','enabled','paused','retired'))`, owner.PlanID, owner.PlanSHA).Scan(&matches); err != nil {
+			return finishDatabase
+		}
+		if !matches {
+			return finishUnknownPlan
+		}
+	}
+	if len(s.KnownBatches) > 0 || len(s.KnownPlans) > 1 || (s.CleanupOwner == nil && len(s.KnownPlans) == 1 && s.KnownPlans[0] != s.RecoveryPlanID) {
 		return finishEvidence
 	}
 	if s.ShutdownFailed || s.RecoveryError != nil || (s.LastError != nil && (s.HeldError == nil || *s.LastError != *s.HeldError)) {

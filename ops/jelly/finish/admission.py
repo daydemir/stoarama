@@ -9,6 +9,7 @@ import shutil
 from pathlib import Path
 import tempfile
 import uuid
+from typing import Optional
 
 LANES = {'tick': 'lock', 'recovery': 'recovery.lock'}
 
@@ -64,7 +65,7 @@ def attempt_paths(state: Path, record: dict) -> list:
     return [state / name for name in sorted(names)]
 
 
-def interrupted(state: Path, record: dict, lane: str, finishing: bool = False) -> bool:
+def interrupted(state: Path, record: dict, lane: Optional[str], finishing: bool = False) -> bool:
     if any(p.name not in record['active'].values() for p in attempt_paths(state, record)):
         return True
     for active in record['active']:
