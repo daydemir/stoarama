@@ -50,11 +50,15 @@ type inverseLane uint8
 const (
 	inverseOutsideKeep28 inverseLane = iota
 	inverseNASKeep28
+	// Reviewed collated lane. Explicitly distinct so a collated candidate can
+	// never fall into the RAW deletable path or loadInverseRawTarget.
+	inverseNonrawCollated
 )
 
 type inverseApplyOptions struct {
 	Lane                                                                               inverseLane
 	Manifest, ManifestSHA, Summary, SummarySHA, Picks, Ledger, DrainEvidence, DrainSHA string
+	ReviewedDelivery                                                                   bool
 	MaxItems                                                                           int
 	MaxBytes, Budget24h                                                                int64
 	Workers                                                                            int
@@ -64,6 +68,8 @@ type inverseApplySummary struct {
 	Reconciled       int64        `json:"reconciled"`
 	AmbiguousHeld    int64        `json:"ambiguous_held"`
 	LastModifiedHeld r2RetireStat `json:"last_modified_held"`
+	RawBytes         int64        `json:"raw_bytes"`
+	NonrawBytes      int64        `json:"nonraw_bytes"`
 	Bytes            int64        `json:"bytes"`
 	ElapsedSeconds   float64      `json:"elapsed_seconds"`
 	ObjectsPerSecond float64      `json:"objects_per_second"`
@@ -81,6 +87,7 @@ type inverseApplier struct {
 	opts       inverseApplyOptions
 	summary    inverseSummary
 	protection inverseProtection
+	collated   map[string]inverseCollatedAssessment
 	ledger     *inverseLedger
 }
 
@@ -177,6 +184,20 @@ var errInverseRawIneligible = errors.New("raw target ineligible")
 func (a *inverseApplier) loadTarget(ctx context.Context, tx pgx.Tx, e inverseEntry) (inverseRawTarget, error) {
 	return loadInverseRawTarget(ctx, tx, a.store.Bucket(), a.protection, a.opts.Lane, e)
 }
+
+// rawHeldSQL never derives SQL from operator input: it removes the one delivery
+// clause only when the reviewed owner fence policy selected this run. Every other
+// live veto in inverseRawHeldSQL stays in force.
+func (a *inverseApplier) rawHeldSQL() string {
+	if !a.opts.ReviewedDelivery {
+		return inverseRawHeldSQL
+	}
+	// Keep the positional placeholders referenced so binding stays identical;
+	// only the reviewed delivery clause becomes unconditionally false.
+	return strings.Replace(inverseRawHeldSQL,
+		"r2_inverse_delivery_held($1,$2,$3,$5,$6,$7)",
+		"(false AND $5::text IS NOT NULL AND $6::text IS NOT NULL AND $7::bigint IS NOT NULL)", 1)
+}
 func loadInverseRawTarget(ctx context.Context, tx pgx.Tx, bucket string, protection inverseProtection, lane inverseLane, e inverseEntry) (inverseRawTarget, error) {
 	t := inverseRawTarget{}
 	rows, err := tx.Query(ctx, inverseRawTargetSQL, bucket, e.Key)
@@ -251,7 +272,7 @@ func (a *inverseApplier) checkTarget(ctx context.Context, tx pgx.Tx, t inverseRa
 		return errors.New("KE catalog identity changed; refresh partition before further wire attempts")
 	}
 	var held bool
-	if err := tx.QueryRow(ctx, inverseRawHeldSQL, t.ID, a.store.Bucket(), e.Key, a.opts.ManifestSHA, t.Path, t.SHA, t.Size).Scan(&held); err != nil {
+	if err := tx.QueryRow(ctx, a.rawHeldSQL(), t.ID, a.store.Bucket(), e.Key, a.opts.ManifestSHA, t.Path, t.SHA, t.Size).Scan(&held); err != nil {
 		return err
 	}
 	if held {
@@ -530,14 +551,19 @@ func runR2InverseLane(ctx context.Context, cfg config.Config, args []string, lan
 func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, o inverseApplyOptions) (inverseApplySummary, error) {
 	started := time.Now()
 	result := inverseApplySummary{}
-	if o.Lane != inverseOutsideKeep28 && o.Lane != inverseNASKeep28 {
+	if o.Lane != inverseOutsideKeep28 && o.Lane != inverseNASKeep28 && o.Lane != inverseNonrawCollated {
 		return result, errors.New("unknown inverse lane")
 	}
-	if o.Lane == inverseNASKeep28 {
+	switch o.Lane {
+	case inverseNASKeep28:
 		if _, ok := store.(keep28DeleteStore); !ok {
 			return result, errors.New("keep28 transport required")
 		}
-	} else {
+	case inverseNonrawCollated:
+		if _, ok := store.(inverseNonrawStore); !ok {
+			return result, errors.New("collated nonraw transport required")
+		}
+	default:
 		if _, ok := store.(inverseDeleteStore); !ok {
 			return result, errors.New("B1 transport required")
 		}
@@ -554,6 +580,16 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	var summary inverseSummary
 	if err := inverseReadPinned(o.Summary, o.SummarySHA, &summary); err != nil {
 		return result, err
+	}
+	// Legacy/default RAW behavior is unchanged: the obsolete delivery veto is
+	// lifted ONLY for the explicitly reviewed owner fence policy, and only on the
+	// B1 outside-keep28 lane. No other proof shape can reach this.
+	var evidence inverseDrainEvidence
+	if err := inverseReadPinned(o.DrainEvidence, o.DrainSHA, &evidence); err != nil {
+		return result, err
+	}
+	if o.Lane == inverseOutsideKeep28 && evidence.Proof == inverseOwnerFenceProof {
+		o.ReviewedDelivery = true
 	}
 	sha, err := inverseFileSHA(o.Manifest)
 	if err != nil {
@@ -586,6 +622,8 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	var ledger *inverseLedger
 	if o.Lane == inverseNASKeep28 {
 		ledger, err = openKeep28Ledger(o.Ledger)
+	} else if o.Lane == inverseNonrawCollated {
+		ledger, err = openNonrawLedger(o.Ledger)
 	} else {
 		ledger, err = openInverseLedger(o.Ledger)
 	}
@@ -608,7 +646,13 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	if err = initTx.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`).Scan(&keEpoch); err != nil {
 		return result, err
 	}
-	protection, err := loadInverseApplyProtection(ctx, initTx, store.Bucket(), picks, windows)
+	var protection inverseProtection
+	if o.Lane == inverseNonrawCollated {
+		// Collated selection needs live catalog mapping facts, not just KE paths.
+		protection, err = loadInverseProtectionMode(ctx, initTx, store.Bucket(), picks, windows, true)
+	} else {
+		protection, err = loadInverseApplyProtection(ctx, initTx, store.Bucket(), picks, windows)
+	}
 	if err != nil {
 		return result, err
 	}
@@ -678,7 +722,12 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		_, err = store.Head(probeCtx, p.e.Key)
 		probeCancel()
 		if r2.IsNotFound(err) {
-			if err = a.publishAbsent(ctx, p.e, p.manifest, true); err != nil {
+			if o.Lane == inverseNonrawCollated {
+				err = a.publishNonrawAbsent(ctx, p.e, p.manifest, true)
+			} else {
+				err = a.publishAbsent(ctx, p.e, p.manifest, true)
+			}
+			if err != nil {
 				return result, err
 			}
 			result.Reconciled++
@@ -705,8 +754,13 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 			return result, err
 		}
 		want := inverseDeletable
-		if o.Lane == inverseNASKeep28 {
+		switch o.Lane {
+		case inverseNASKeep28:
 			want = inverseKeep28
+		case inverseNonrawCollated:
+			// Collated candidates carry their own typed class; they are never the
+			// RAW deletable class and never reach loadInverseRawTarget.
+			want = inverseCollated
 		}
 		if e.Class != want || existing[e.Key] {
 			continue
@@ -718,6 +772,16 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		if o.Lane == inverseNASKeep28 {
 			if _, dup := candidates[e.Key]; dup {
 				return result, errors.New("duplicate keep28 partition key")
+			}
+			candidates[e.Key] = e
+			continue
+		}
+		if o.Lane == inverseNonrawCollated {
+			if _, dup := candidates[e.Key]; dup {
+				return result, errors.New("duplicate collated partition key")
+			}
+			if !inverseCollatedPrefixAllowed(e.Key) {
+				continue
 			}
 			candidates[e.Key] = e
 			continue
@@ -743,13 +807,24 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 			return result, err
 		}
 	}
+	if o.Lane == inverseNonrawCollated {
+		// Collated selection follows the same live catalog reload the wire uses.
+		// Nothing is chosen from the stored assessment alone.
+		for _, e := range candidates {
+			if len(jobs) >= o.MaxItems || e.SizeBytes > o.MaxBytes-planned {
+				continue
+			}
+			jobs = append(jobs, e)
+			planned += e.SizeBytes
+		}
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	queue := make(chan inverseEntry)
 	var wg sync.WaitGroup
 	var first error
 	var mu sync.Mutex
-	var deleted, bytes atomic.Int64
+	var deleted, bytes, rawBytes, nonrawBytes atomic.Int64
 	var modifiedHeld, modifiedBytes atomic.Int64
 	for range o.Workers {
 		wg.Add(1)
@@ -759,10 +834,21 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 				if ctx.Err() != nil {
 					return
 				}
-				ok, err := a.delete(ctx, e)
+				var ok bool
+				var err error
+				if o.Lane == inverseNonrawCollated {
+					ok, err = a.deleteNonraw(ctx, e)
+				} else {
+					ok, err = a.delete(ctx, e)
+				}
 				if ok {
 					deleted.Add(1)
 					bytes.Add(e.SizeBytes)
+					if o.Lane == inverseNonrawCollated {
+						nonrawBytes.Add(e.SizeBytes)
+					} else {
+						rawBytes.Add(e.SizeBytes)
+					}
 				}
 				if err != nil {
 					var modifiedErr inverseLastModifiedError
@@ -793,6 +879,8 @@ send:
 	wg.Wait()
 	result.Deleted = deleted.Load()
 	result.Bytes = bytes.Load()
+	result.RawBytes = rawBytes.Load()
+	result.NonrawBytes = nonrawBytes.Load()
 	result.LastModifiedHeld.Objects += modifiedHeld.Load()
 	result.LastModifiedHeld.Bytes += modifiedBytes.Load()
 	result.ElapsedSeconds = time.Since(started).Seconds()

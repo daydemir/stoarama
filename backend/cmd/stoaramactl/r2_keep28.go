@@ -17,20 +17,29 @@ import (
 // Closed table selection: no operator-supplied identifier enters SQL. B1 stays
 // in its existing namespace; ordinary reservations and byte charges are shared.
 func (a *inverseApplier) intentTable() string {
-	if a.opts.Lane == inverseNASKeep28 {
+	switch a.opts.Lane {
+	case inverseNASKeep28:
 		return "r2_keep28_intents"
+	case inverseNonrawCollated:
+		return "r2_nonraw_intents"
 	}
 	return "r2_inverse_intents"
 }
 func (a *inverseApplier) eventTable() string {
-	if a.opts.Lane == inverseNASKeep28 {
+	switch a.opts.Lane {
+	case inverseNASKeep28:
 		return "r2_keep28_events"
+	case inverseNonrawCollated:
+		return "r2_nonraw_events"
 	}
 	return "r2_inverse_events"
 }
 func (a *inverseApplier) retirementReason() string {
-	if a.opts.Lane == inverseNASKeep28 {
+	switch a.opts.Lane {
+	case inverseNASKeep28:
 		return "keep28_exact_nas"
+	case inverseNonrawCollated:
+		return inverseNonrawReason
 	}
 	return "inverse_non_keep28"
 }

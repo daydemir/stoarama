@@ -34,9 +34,12 @@ const (
 	inverseUnknown   inverseClass = "unknown"
 	inverseDeletable inverseClass = "deletable"
 	inverseDelivery  inverseClass = "delivery"
+	// Collated outputs outside pinned keep28 with exactly one catalog output and
+	// fully resolved sources. Eligible only for the reviewed collated lane.
+	inverseCollated inverseClass = "collated"
 )
 
-var inverseClasses = []inverseClass{inverseKE, inverseKeep28, inverseTools, inverseHeld, inverseUnknown, inverseDeletable, inverseDelivery}
+var inverseClasses = []inverseClass{inverseKE, inverseKeep28, inverseTools, inverseHeld, inverseUnknown, inverseDeletable, inverseDelivery, inverseCollated}
 
 type inverseIdentity struct {
 	StreamID   int64
@@ -44,6 +47,7 @@ type inverseIdentity struct {
 	Start, End *time.Time
 	Timezone   string
 	Kind       string
+	Sources    int
 }
 type inverseProtection struct {
 	Identities     map[string][]inverseIdentity
@@ -51,6 +55,13 @@ type inverseProtection struct {
 	KEFolders      map[string]bool
 	Windows        map[int64]api.Keep28Window
 	Picks          r2RetirePicks
+	// ReviewedCollated selects the explicit non-raw partition scope. It is opt-in
+	// so default partition/apply output is unchanged for B1/B2.
+	ReviewedCollated bool
+	Collated         map[string]inverseCollatedAssessment
+	// ReviewedDelivery lifts the obsolete bare-delivery ownership veto. It is set
+	// ONLY by the owner fence policy, never by legacy/default RAW behavior.
+	ReviewedDelivery bool
 }
 type inverseEntry struct {
 	r2.ObjectInfo
@@ -72,15 +83,21 @@ type inverseSummary struct {
 
 // A path alias of any KE stream remains protected even when its catalog row
 // is missing. Match complete folder components, never a partial name.
+// inverseToolsPrefix is the retired WORK custody tree. It is not footage.
+const inverseToolsPrefix = "experimental/v85-retired-WORK-custody/"
+
 func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
+	// Hard cut FIRST: no eligibility, delivery or hold branch can ever label a
+	// tool-prefix key as footage, so all 666 stay protected regardless of what
+	// the catalog or an owner scope says about them.
+	if strings.HasPrefix(o.Key, inverseToolsPrefix) {
+		return inverseTools, "pinned_stitch_tools"
+	}
 	if p.Held[o.Key] {
 		return inverseHeld, "live_hold"
 	}
-	if p.Delivery[o.Key] {
+	if p.Delivery[o.Key] && !p.ReviewedCollated && !p.ReviewedDelivery {
 		return inverseDelivery, "delivery_hold_pending_owner"
-	}
-	if strings.HasPrefix(o.Key, "experimental/v85-retired-WORK-custody/") {
-		return inverseTools, "pinned_stitch_tools"
 	}
 	for _, component := range strings.Split(o.Key, "/") {
 		if p.KEFolders[component] {
@@ -119,7 +136,7 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 	}
 	for _, id := range identities {
 		if id.Kind == "collated" {
-			return inverseHeld, "collated_deferred"
+			return p.classifyCollated(o, identities)
 		}
 	}
 	if len(identities) > 1 {
@@ -194,7 +211,14 @@ UNION SELECT c.object_key FROM delivery_outputs o CROSS JOIN LATERAL unnest(o.so
  JOIN recording_clips c ON c.id=source_id WHERE c.bucket=$1`
 
 func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks, windows map[int64]api.Keep28Window) (inverseProtection, error) {
-	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, KEFolders: map[string]bool{}, Windows: windows, Picks: picks}
+	return loadInverseProtectionMode(ctx, q, bucket, picks, windows, false)
+}
+
+// loadInverseProtectionMode adds the reviewed collated assessment when the
+// reviewed non-raw scope is explicitly selected. Default callers keep the exact
+// previous classification, where collated keys are deferred and delivery holds.
+func loadInverseProtectionMode(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks, windows map[int64]api.Keep28Window, reviewed bool) (inverseProtection, error) {
+	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, KEFolders: map[string]bool{}, Windows: windows, Picks: picks, ReviewedCollated: reviewed, ReviewedDelivery: reviewed}
 	rows, err := q.Query(ctx, inverseCatalogSQL, bucket)
 	if err != nil {
 		return p, err
@@ -243,6 +267,12 @@ func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string
 		}
 		err = rows.Err()
 		rows.Close()
+		if err != nil {
+			return p, err
+		}
+	}
+	if reviewed {
+		p.Collated, err = loadInverseCollatedTargets(ctx, q, bucket, p)
 		if err != nil {
 			return p, err
 		}
@@ -340,13 +370,18 @@ func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 		runR2InverseApply(ctx, cfg, args[1:])
 		return
 	}
-	const usage = "usage: stoaramactl r2-inverse partition --picks FILE --out DIR (read-only full bucket partition)"
+	if len(args) > 0 && args[0] == "apply-collated" {
+		runR2InverseLane(ctx, cfg, args[1:], inverseNonrawCollated)
+		return
+	}
+	const usage = "usage: stoaramactl r2-inverse partition --picks FILE --out DIR [--owner-footage-scope] (read-only full bucket partition)"
 	if len(args) == 0 || args[0] != "partition" {
 		log.Fatal(usage)
 	}
 	fs := flag.NewFlagSet("r2-inverse partition", flag.ExitOnError)
 	picksPath := fs.String("picks", "", "owner picks")
 	out := fs.String("out", "", "new report directory")
+	ownerFootage := fs.Bool("owner-footage-scope", false, "reviewed non-raw scope: classify mapped collated footage separately from collated_deferred")
 	if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 || *picksPath == "" || *out == "" {
 		log.Fatal(usage)
 	}
@@ -366,7 +401,7 @@ func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 		log.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
-	protection, err := loadInverseProtection(ctx, tx, cfg.R2Bucket, picks, windows)
+	protection, err := loadInverseProtectionMode(ctx, tx, cfg.R2Bucket, picks, windows, *ownerFootage)
 	if err != nil {
 		log.Fatal(err)
 	}

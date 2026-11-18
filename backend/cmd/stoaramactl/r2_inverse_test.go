@@ -56,6 +56,14 @@ func TestR2InversePartitionAllClassesAndReconciliation(t *testing.T) {
 		t.Fatal(sum)
 	}
 	for _, class := range inverseClasses {
+		// The collated class exists only under the explicit reviewed owner
+		// footage scope; default classification keeps collated keys deferred.
+		if class == inverseCollated {
+			if sum.Classes[class].Objects != 0 {
+				t.Fatalf("default partition emitted collated class: %+v", sum.Classes)
+			}
+			continue
+		}
 		if sum.Classes[class].Objects != 1 {
 			t.Fatalf("class %s: %+v", class, sum.Classes)
 		}
