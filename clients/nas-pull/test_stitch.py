@@ -590,6 +590,7 @@ class StitchTaskDataHoldTests(unittest.TestCase):
                    mock.patch.object(pull, 'stitch_corpus'),
                    mock.patch.object(pull, 'stitch_v85r_tools', return_value={}),
                    mock.patch.object(pull, 'stitch_resources'),
+                   mock.patch.object(pull.os.path, 'ismount', return_value=True),
                    mock.patch.object(pull.NAS_MEDIA_FENCE, 'wait_maintenance', return_value=True),
                    mock.patch.object(pull, 'stitch_build', side_effect=build),
                    mock.patch.object(pull, 'log')]
@@ -635,6 +636,7 @@ class StitchTaskDataHoldTests(unittest.TestCase):
                         mock.patch.object(pull, 'stitch_corpus'), \
                         mock.patch.object(pull, 'stitch_v85r_tools', return_value={}), \
                         mock.patch.object(pull, 'stitch_resources'), \
+                        mock.patch.object(pull.os.path, 'ismount', return_value=True), \
                         mock.patch.object(pull.NAS_MEDIA_FENCE, 'wait_maintenance', return_value=True), \
                         mock.patch.object(pull, 'stitch_build', side_effect=build), \
                         mock.patch.object(pull, 'log'):
@@ -659,6 +661,26 @@ class StitchTaskDataHoldTests(unittest.TestCase):
                 with mock.patch.object(pull, 'meminfo_bytes', return_value=(0, 0)):
                     with self.assertRaises(pull.StitchResourceHold):
                         pull.stitch_resources(SimpleNamespace(output_dir=Path('/nonexistent-mount'), min_free_bytes=1))
+
+    def test_lost_mount_mid_build_is_a_resource_hold_not_a_task_hold(self):
+        # A media read failing because the share vanished must release and retry,
+        # never terminally hold the hour's data.
+        def build(cfg, inventory, task, stop, tools):
+            raise pull.MediaCertificationError("media path is unavailable")
+        with mock.patch.object(pull, 'restore_api', side_effect=self.api), \
+                mock.patch.object(pull, 'stitch_corpus'), \
+                mock.patch.object(pull, 'stitch_v85r_tools', return_value={}), \
+                mock.patch.object(pull, 'stitch_resources'), \
+                mock.patch.object(pull.os.path, 'ismount', return_value=False), \
+                mock.patch.object(pull.NAS_MEDIA_FENCE, 'wait_maintenance', return_value=True), \
+                mock.patch.object(pull, 'stitch_build', side_effect=build), \
+                mock.patch.object(pull, 'log'):
+            with self.assertRaises(pull.StitchResourceHold):
+                pull.stitch_once(self.cfg, self.inventory, self.stop)
+        self.assertEqual([p for p, _ in self.calls if p.endswith('/result')], [])
+        with self.inventory.lock:
+            row = self.inventory.db.execute('SELECT result FROM stitch_jobs WHERE task_id=7').fetchone()
+        self.assertTrue(row is None or row[0] is None, row)
 
     def test_mid_job_refresh_resource_hold_does_not_post_a_result(self):
         # The 5s refresh latches the same typed hold, which the lane then

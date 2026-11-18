@@ -50633,9 +50633,13 @@ def stitch_once(cfg, inventory, stop_event):
             # transient or environmental, never this hour's own data.
             raise
         except (StitchTaskFailure, MediaCertificationError) as exc:
-            # This hour's own bytes are unusable: missing/invalid sidecar,
-            # unreadable media metadata, or a plan whose data no longer matches.
-            # Report it once instead of re-leasing the same hour forever.
+            # A mount that vanished under a running read is a host condition, not
+            # this hour's data: release and retry rather than holding the hour.
+            if not os.path.ismount(str(cfg.output_dir)):
+                raise StitchResourceHold("NAS output root is not mounted") from None
+            # Otherwise this hour's own bytes are unusable: missing/invalid
+            # sidecar, unreadable media metadata, or a plan whose data no longer
+            # matches. Report it once instead of re-leasing the same hour forever.
             stitch_hold_task(cfg, inventory, task, str(exc))
             return 30
     result["lease_token"] = task["lease_token"]
