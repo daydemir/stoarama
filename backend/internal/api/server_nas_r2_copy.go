@@ -143,6 +143,13 @@ func ValidateNASR2CopyItem(i NASR2CopyItem) error {
 // existing redownload guard supplies the same policy/hold/retirement vetoes.
 var errNASR2CopySourceIdentity = errors.New("copy source identity changed")
 
+// NASR2CopySourceReadError separates driver/read failures from source validation.
+// Callers can preserve diagnostics without guessing the driver's error type.
+type NASR2CopySourceReadError struct{ Err error }
+
+func (e *NASR2CopySourceReadError) Error() string { return e.Err.Error() }
+func (e *NASR2CopySourceReadError) Unwrap() error { return e.Err }
+
 func LoadNASR2CopySource(ctx context.Context, tx pgx.Tx, i NASR2CopyItem) (json.RawMessage, error) {
 	if err := ValidateNASR2CopyItem(i); err != nil {
 		return nil, errors.Join(errNASR2CopySourceIdentity, err)
@@ -161,7 +168,7 @@ func LoadNASR2CopySource(ctx context.Context, tx pgx.Tx, i NASR2CopyItem) (json.
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("%w: copy source unavailable", errNASR2CopySourceIdentity)
 		}
-		return nil, err
+		return nil, &NASR2CopySourceReadError{Err: err}
 	}
 	_, windows, err := Keep28Policy()
 	if err != nil {
@@ -176,7 +183,7 @@ func LoadNASR2CopySource(ctx context.Context, tx pgx.Tx, i NASR2CopyItem) (json.
 	// The existing nas_delivery_raw_writer_path index bounds this lookup.
 	var alias bool
 	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_clips WHERE display_path<>'' AND display_path=$1 AND id<>$2)`, i.RelativePath, i.SourceID).Scan(&alias); err != nil {
-		return nil, err
+		return nil, &NASR2CopySourceReadError{Err: err}
 	}
 	if alias {
 		return nil, fmt.Errorf("%w: %s", errNASR2CopySourceIdentity, "copy path has another catalog identity")

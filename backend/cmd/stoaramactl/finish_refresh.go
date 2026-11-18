@@ -96,7 +96,7 @@ func feedKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefreshO
 	// KE folder discovery is shared with B2 and protected by its catalog epoch.
 	protection, err := loadInverseApplyProtection(ctx, init, "stoarama", picks, windows)
 	if err != nil {
-		return 0, finishKnownDBError(finishRefreshInitialize, err)
+		return 0, finishDBError(finishRefreshInitialize, 0, err)
 	}
 	if err = init.Commit(ctx); err != nil {
 		return 0, finishDBError(finishRefreshInitialize, 0, err)
@@ -215,7 +215,7 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 		return false, nil
 	}
 	if err != nil {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	var recording int64
 	if err = tx.QueryRow(ctx, `SELECT recording_id FROM recording_clips WHERE id=$1`, target.ID).Scan(&recording); err != nil {

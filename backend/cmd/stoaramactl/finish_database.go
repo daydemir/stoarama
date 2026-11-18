@@ -120,20 +120,6 @@ func finishDBError(statement finishStatement, tier finishTier, err error) error 
 	return e
 }
 
-// Validation/identity errors keep their original handling. Only recognized DB
-// failures acquire database diagnostics; no arbitrary error text is exported.
-func finishKnownDBError(statement finishStatement, err error) error {
-	if err == nil {
-		return nil
-	}
-	wrapped := finishDBError(statement, 0, err)
-	var failure *finishDatabaseFailure
-	if errors.As(wrapped, &failure) && failure.Cause != finishDBOther {
-		return wrapped
-	}
-	return err
-}
-
 func finishImportFailure(tier finishTier, err error) error {
 	var failure *finishDatabaseFailure
 	if errors.As(err, &failure) {

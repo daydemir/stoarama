@@ -305,7 +305,11 @@ func queueNASR2CopyItem(ctx context.Context, pool nasCopyDB, h nasCopyHeader, ma
 		_ = tx.Rollback(cleanup)
 	}()
 	if _, err = api.LoadNASR2CopySource(ctx, tx, i); err != nil {
-		return finishKnownDBError(finishImportSource, err)
+		var read *api.NASR2CopySourceReadError
+		if errors.As(err, &read) {
+			return finishDBError(finishImportSource, 0, err)
+		}
+		return err
 	}
 	if !apply {
 		return tx.Rollback(ctx)

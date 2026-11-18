@@ -123,10 +123,6 @@ func TestFinishRefreshAndImportDatabaseDiagnostics(t *testing.T) {
 			t.Fatal("raw driver text escaped")
 		}
 	})
-	validation := errors.New("identity mismatch")
-	if got := finishKnownDBError(finishImportSource, validation); got != validation {
-		t.Fatal("validation became a database failure")
-	}
 }
 
 func TestFinishDroppedConnectionAndUnknownDriverDiagnostics(t *testing.T) {
