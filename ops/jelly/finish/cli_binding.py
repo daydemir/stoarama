@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 
 # Retained forever as incident evidence; its report ABI lacks checked_at.
 RETIRED_CLI_SHA256 = 'a88984c75bf337a790e0ac34569435f3346cca812f2d131fa2ea5c29f253b42e'
@@ -34,21 +35,60 @@ def verify_references(text, binary, launcher):
     for path in re.findall(r'/[^\s\'"`<>\[\]{}(),;]+', text):
         if Path(path).name.startswith('stoaramactl'):
             require(path in allowed, 'another stoaramactl path is referenced')
+    for name, value in re.findall(r'\b([A-Za-z_]\w*)\s*=\s*[\'\"]?([a-f0-9]{64})\b', text):
+        if cli_digest_name(name):
+            require(value == binary['sha256'], 'another stoaramactl hash is referenced')
     try:
         tree = ast.parse(text)
     except SyntaxError:
-        return  # Shell shims are checked for CLI paths above and pinned below.
+        for token in shlex.split(text, comments=True):
+            value = token.partition('=')[2] if '=' in token else token
+            if Path(value).name.startswith('stoaramactl'):
+                require(value in allowed, 'unbound stoaramactl shell reference')
+        return
+    # The shim's exec argv[0] is a display name, not executable selection.
+    # It is allowed only when exec's actual target comes from bound_cli().
+    bound_names = {target.id for assign in ast.walk(tree) if isinstance(assign, ast.Assign)
+                   and isinstance(assign.value, ast.Call) and isinstance(assign.value.func, ast.Name)
+                   and assign.value.func.id == 'bound_cli' for target in assign.targets if isinstance(target, ast.Name)}
+    display_names = set()
+    for call in ast.walk(tree):
+        if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name) and call.func.value.id == 'os'
+                and call.func.attr == 'execv' and len(call.args) == 2):
+            target = call.args[0]
+            if (isinstance(target, ast.Call) and isinstance(target.func, ast.Name)
+                    and target.func.id == 'str' and len(target.args) == 1):
+                target = target.args[0]
+            if (isinstance(target, ast.Name) and target.id in bound_names
+                    or isinstance(target, ast.Call) and isinstance(target.func, ast.Name)
+                    and target.func.id == 'bound_cli' and not target.args and not target.keywords):
+                argv = call.args[1]
+                if isinstance(argv, ast.BinOp) and isinstance(argv.op, ast.Add):
+                    argv = argv.left
+                if isinstance(argv, ast.List) and argv.elts:
+                    display_names.add(id(argv.elts[0]))
     for node in ast.walk(tree):
         values = []
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and Path(node.value).name.startswith('stoaramactl'):
+            require(node.value in allowed or node.value == 'stoaramactl' and id(node) in display_names,
+                    'unbound stoaramactl path component')
         if isinstance(node, ast.Assign):
             names = [x.id for x in node.targets if isinstance(x, ast.Name)]
-            if any('CLI' in x.upper() and 'SHA' in x.upper() for x in names):
+            if any(cli_digest_name(x) for x in names):
                 values.append(node.value)
-        if isinstance(node, ast.keyword) and node.arg and 'cli' in node.arg.lower() and 'sha' in node.arg.lower():
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and cli_digest_name(node.target.id):
+            values.append(node.value)
+        if isinstance(node, ast.keyword) and node.arg and cli_digest_name(node.arg):
             values.append(node.value)
         for value in values:
             if isinstance(value, ast.Constant) and isinstance(value.value, str):
                 require(value.value == binary['sha256'], 'another stoaramactl hash is referenced')
+
+
+def cli_digest_name(name):
+    name = name.upper()
+    return ('CLI' in name or 'STOARAMACTL' in name) and ('SHA' in name or 'HASH' in name)
 
 
 def _load():

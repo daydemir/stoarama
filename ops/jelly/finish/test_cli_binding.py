@@ -56,7 +56,11 @@ class BindingTests(unittest.TestCase):
         binary = dict(path='/bound/stoaramactl.bin', sha256='a'*64)
         launcher = dict(path='/bound/stoaramactl', sha256='b'*64)
         for text in ("exec /Users/jelly/tmp-safeguards/stoaramactl \"$@\"",
+                     "subprocess.run(['stoaramactl', 'nas-cleanup', 'verify-recovery'])",
+                     "subprocess.run([str(Path('/Users/jelly/tmp-safeguards') / 'stoaramactl')])",
                      "CLI_SHA256 = '" + binding.RETIRED_CLI_SHA256 + "'",
+                     "CLI_SHA256: str = '" + 'c'*64 + "'",
+                     "#!/bin/sh\nCLI_SHA256=" + 'c'*64 + "\nexec /bound/stoaramactl \"$@\"",
                      "CLI_SHA256 = '" + 'c'*64 + "'"):
             with self.subTest(text=text), self.assertRaises(binding.ContractError):
                 binding.verify_references(text, binary, launcher)
