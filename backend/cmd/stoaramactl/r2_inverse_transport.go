@@ -86,7 +86,7 @@ func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverse
 	if err = r2RetireValidateGuardHead(head, item, target.ETag, 7*24*time.Hour, now); err != nil {
 		return err
 	}
-	if e.LastModified.IsZero() || !head.LastModified.Equal(e.LastModified) || !e.LastModified.Before(now.Add(-7*24*time.Hour)) {
+	if e.LastModified.IsZero() || !head.LastModified.Equal(e.LastModified) || !e.LastModified.Before(now.Add(-7*24*time.Hour)) || !e.LastModified.Before(a.summary.CreatedAt) {
 		return errors.New("listing LastModified missing, changed or too young")
 	}
 	if err = a.store.RequireNoMultipartUploads(ctx); err != nil {

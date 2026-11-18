@@ -35,13 +35,15 @@ type inverseDeleteStore interface {
 	deleteOnce(context.Context, *inverseDeleteAuthority) error
 }
 type inverseDrainEvidence struct {
-	Bucket                 string    `json:"bucket"`
-	EndpointSHA256         string    `json:"endpoint_sha256"`
-	FenceActivatedAt       time.Time `json:"fence_activated_at"`
-	DrainNotBefore         time.Time `json:"drain_not_before"`
-	ObservedAt             time.Time `json:"observed_at"`
-	DeployedWriterCoverage string    `json:"deployed_writer_coverage_evidence"`
-	AcceptedPUTCompletion  string    `json:"accepted_put_completion_evidence"`
+	Proof                  inverseDrainProof         `json:"proof"`
+	Bucket                 string                    `json:"bucket"`
+	EndpointSHA256         string                    `json:"endpoint_sha256"`
+	FenceActivatedAt       time.Time                 `json:"fence_activated_at"`
+	DrainNotBefore         time.Time                 `json:"drain_not_before"`
+	ObservedAt             time.Time                 `json:"observed_at"`
+	DeployedWriterCoverage string                    `json:"deployed_writer_coverage_evidence"`
+	AcceptedPUTCompletion  string                    `json:"accepted_put_completion_evidence"`
+	KeyPolicy              *inverseKeyPolicyEvidence `json:"key_policy,omitempty"`
 }
 type inverseLane uint8
 
@@ -126,8 +128,11 @@ func (a *inverseApplier) checkEvidence(ctx context.Context, q r2RetireQuerier) e
 	if err != nil {
 		return fmt.Errorf("exact 0198 writer fence required: %w", err)
 	}
-	if !blocked || !now.After(deadline) || e.Bucket != a.store.Bucket() || e.EndpointSHA256 != a.store.EndpointSHA256() || !e.FenceActivatedAt.Equal(activated) || !e.DrainNotBefore.Equal(deadline) || e.ObservedAt.Before(deadline) || e.ObservedAt.After(now) || strings.TrimSpace(e.DeployedWriterCoverage) == "" || strings.TrimSpace(e.AcceptedPUTCompletion) == "" {
+	if !blocked || !now.After(deadline) || e.Bucket != a.store.Bucket() || e.EndpointSHA256 != a.store.EndpointSHA256() || !e.FenceActivatedAt.Equal(activated) || !e.DrainNotBefore.Equal(deadline) || !e.ObservedAt.After(deadline) || e.ObservedAt.After(now) {
 		return errors.New("writer drain or controller evidence missing, stale or outside exact fence")
+	}
+	if err = e.validateProof(a.opts); err != nil {
+		return err
 	}
 	if now.Sub(a.summary.CreatedAt) > 24*time.Hour || a.summary.CreatedAt.After(now) {
 		return errors.New("partition is stale or future-dated")
