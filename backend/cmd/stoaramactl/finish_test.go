@@ -607,3 +607,36 @@ func TestFinishV6BudgetKeepsProofAndLateTierGates(t *testing.T) {
 		t.Fatalf("unreviewed v6 identity accepted: %+v", status)
 	}
 }
+
+func TestFinishOwnedCleanupUsesSettledRecovery(t *testing.T) {
+	pool, safety, copy := finishFixture(t, 0)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,mode,plan_sha256) VALUES(100,'enabled',repeat('e',64))`); err != nil {
+		t.Fatal(err)
+	}
+	s, c, err := finishReadEvidence(safety, copy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.KnownPlans = []int64{100}
+	s.Master = true
+	s.ExpectedMaster = true
+	s.CleanupOwner = &finishCleanupOwner{PlanID: 100, PlanSHA: strings.Repeat("e", 64)}
+	finishTestJSON(t, safety, s)
+	finishTestJSON(t, copy, c)
+	finishRun(t, pool, safety, copy)
+	// A changed owner digest or foreign enabled plan cannot ride the allowlist.
+	s.CleanupOwner.PlanSHA = strings.Repeat("f", 64)
+	finishTestJSON(t, safety, s)
+	if _, err := finishTick(ctx, pool, safety, copy); !errors.Is(err, finishUnknownPlan) {
+		t.Fatalf("wrong owner digest: %v", err)
+	}
+	s.CleanupOwner.PlanSHA = strings.Repeat("e", 64)
+	finishTestJSON(t, safety, s)
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,mode) VALUES(101,'enabled')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := finishTick(ctx, pool, safety, copy); !errors.Is(err, finishUnknownPlan) {
+		t.Fatalf("foreign enabled plan: %v", err)
+	}
+}

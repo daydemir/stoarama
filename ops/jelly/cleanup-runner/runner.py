@@ -15,19 +15,19 @@ import signal
 import subprocess
 import sys
 import time
+import threading
+from contextlib import contextmanager
 from fractions import Fraction
 from datetime import datetime, timezone
 import urllib.error
 import urllib.request
 
 API = 'https://stoarama-api.onrender.com'
-SERVICE = 'srv-d6usqn94tr6s73d94cd0'
 POLICY = 'backend/internal/api/nas_cleanup_keep28_policy.json'
 POLICY_SHA = '060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811'
 DAY_CAP = 5_000_000_000_000
 PLAN_CAP = 100_000_000_000
 RECOVERY = {'r2_sha_verified', 'r2_md5_etag_matched'}
-DEPLOY_TERMINAL = {'live', 'deactivated', 'canceled', 'build_failed', 'update_failed', 'pre_deploy_failed'}
 REASON = ('Deniz standing approval 2026-11-11: NAS files outside pinned keep28 only; '
           'server dry run + independent verification PASS; verified R2 copies retained; '
           '5 TB/24h; one plan; master OFF between batches.')
@@ -77,7 +77,9 @@ def utcnow():
 
 
 def timestamp(value):
-    d = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    match = re.fullmatch(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})', value)
+    require(match is not None, 'invalid timestamp')
+    d = datetime.fromisoformat(match[1] + '.' + (match[2] or '').ljust(6, '0')[:6] + match[3].replace('Z', '+00:00'))
     require(d.tzinfo is not None, 'timestamp has no timezone')
     return d
 
@@ -324,28 +326,13 @@ def command(argv, timeout=COMMAND_TIMEOUT_SEC, **kwargs):
         raise CommandFailed(getattr(exc, 'returncode', None)) from None
 
 
-def render_key():
-    # Deliberately supports only Render CLI's simple api: / key: mapping.
-    lines = (Path.home() / '.render/cli.yaml').read_text().splitlines()
-    in_api = False
-    for line in lines:
-        if line == 'api:':
-            in_api = True
-        elif in_api and line and not line[0].isspace():
-            break
-        elif in_api:
-            match = re.fullmatch(r'\s+key:\s*[\'\"]?([A-Za-z0-9_-]+)[\'\"]?\s*', line)
-            if match:
-                return match[1]
-    raise Halt('Render CLI api.key unavailable')
-
-
 class Runner:
     def __init__(self, repo, state, dry_run=False):
         self.repo, self.root, self.dry_run = repo, state, dry_run
         self.stopping = False
         self.lock = None
         self.ownership_unreadable = False
+        self.owner_validated = False
         self.status = {'current_plan': None, 'last_error': None}
 
     def initialize(self):
@@ -395,6 +382,11 @@ class Runner:
 
     def save(self, phase, **values):
         require(not self.ownership_unreadable, 'unreadable ownership record must be preserved')
+        with (self.root / 'ownership.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self._save(phase, **values)
+
+    def _save(self, phase, **values):
         self.status.update(values, phase=phase, updated_at=utcnow().isoformat(), dry_run=self.dry_run)
         tmp = self.root / 'status.tmp'
         with tmp.open('w') as f:
@@ -411,6 +403,31 @@ class Runner:
             f.write(json.dumps({'at': self.status['updated_at'], 'phase': phase, **values}) + '\n')
             f.flush()
             os.fsync(f.fileno())
+
+    @contextmanager
+    def heartbeat(self):
+        stop = threading.Event()
+        def pulse():
+            while not stop.wait(60):
+                if not self.owner_validated:
+                    continue
+                try:
+                    with (self.root / 'ownership.lock').open('a') as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX)
+                        self._save(self.status.get('phase', 'starting'))
+                except Exception:
+                    self.stopping = True
+                    self.status['shutdown_or_recovery_failed'] = True
+                    self.status['recovery_error'] = 'ownership heartbeat failed'
+                    self.alert('Ownership heartbeat failed; owner review required')
+                    return
+        thread = threading.Thread(target=pulse, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join()
 
     def preparer(self):
         if not hasattr(self, 'prepare'):
@@ -494,21 +511,6 @@ class Runner:
         active = self.active()
         require(not active['plans'] and active['batches'] == 0, 'another plan or batch is enabled')
 
-    def render(self, method, path, body=None):
-        action = lambda: request('https://api.render.com/v1/services/' + SERVICE + path, render_key(), method, body)
-        step = ('live deploy list GET' if path == '/deploys?limit=100' else
-                'Render env GET' if path.startswith('/env-vars/') else 'Render deploy status GET')
-        return self.read(step, action) if method == 'GET' else action()
-
-    def live(self):
-        rows = self.render('GET', '/deploys?limit=100')
-        deploys = [r['deploy'] for r in rows]
-        require(all(d['status'] in DEPLOY_TERMINAL for d in deploys),
-                'another Render deployment is in progress')
-        live = [d for d in deploys if d['status'] == 'live']
-        require(len(live) == 1 and re.fullmatch('[a-f0-9]{40}', live[0]['commit']['id']), 'current live commit unavailable')
-        return live[0]
-
     def alert(self, subject):
         # Must work even when state storage or email delivery is broken.
         critical(subject)
@@ -550,136 +552,48 @@ class Runner:
                 self.step_failed(step, str(exc) if isinstance(exc, ReadFailure) else None)
                 time.sleep(delay)
 
-    def off(self):
-        previous = getattr(self, 'in_off', False)
-        self.in_off = True
-        try:
-            self._off()
-        finally:
-            self.in_off = previous
-
-    def _off(self):
-        latched_before = self.status.get('shutdown_or_recovery_failed', False)
-        delay = 15
-        pending = None
-        while True:
-            try:
-                # This PUT must precede every other dependency, including state writes.
-                step = 'OFF env PUT'
-                self.render('PUT', '/env-vars/NAS_CLEANUP_DELETION_ENABLED', {'value': 'false'})
-                if pending is None:
-                    step = 'OFF deploy list GET'
-                    deploys = [r['deploy'] for r in self.read(step,
-                        lambda: self.render('GET', '/deploys?limit=100'))]
-                    live = [d for d in deploys if d['status'] == 'live']
-                    require(len(live) == 1 and re.fullmatch('[a-f0-9]{40}', live[0]['commit']['id']),
-                            'current live commit unavailable')
-                    commit = live[0]['commit']['id']
-                    step = 'OFF deploy cancel POST'
-                    for d in deploys:
-                        if d['status'] not in DEPLOY_TERMINAL:
-                            self.render('POST', '/deploys/' + d['id'] + '/cancel')
-                    step = 'OFF deploy create POST'
-                    dep = self.render('POST', '/deploys', {'commitId': commit, 'clearCache': 'do_not_clear'})
-                    # Remember only a deploy proven created AFTER the successful false PUT.
-                    require(dep['id'] not in {d['id'] for d in deploys}, 'OFF deploy was not newly created')
-                    pending = (dep['id'], commit)
-                dep_id, commit = pending
-                deadline = time.monotonic() + 1800
-                while True:
-                    step = 'OFF deploy status GET'
-                    d = self.read(step, lambda: self.render('GET', '/deploys/' + dep_id))
-                    if d['status'] in DEPLOY_TERMINAL and d['status'] != 'live':
-                        pending = None  # A terminal deploy cannot converge; replace it.
-                        raise Halt('OFF redeploy failed')
-                    if d['status'] == 'live':
-                        if d['commit']['id'] != commit:
-                            pending = None
-                        require(d['commit']['id'] == commit, 'Render deployed a different commit')
-                        break
-                    # Even after a timeout or exhausted read retries, keep waiting on
-                    # this false-env deploy. Never cancel our own in-progress OFF.
-                    require(time.monotonic() < deadline, 'OFF redeploy timed out')
-                    time.sleep(15)
-                step = 'OFF live deploy GET'
-                if self.read(step, self.live)['id'] != dep_id:
-                    pending = None
-                    raise Halt('live deployment changed concurrently')
-                step = 'OFF env GET'
-                env = self.read(step, lambda: self.render('GET', '/env-vars/NAS_CLEANUP_DELETION_ENABLED'))
-                if env['value'] != 'false':
-                    pending = None
-                require(env['value'] == 'false', 'Render master env differs')
-                step = 'OFF plan id query'
-                pid = self.status['current_plan'] or self.read(step, lambda: self.query(
-                    'SELECT id FROM nas_cleanup_plans WHERE account_id=47 AND connection_id=13 ORDER BY id DESC LIMIT 1'))
-                step = 'OFF runtime plan GET'
-                if not pid or self.read(step, lambda: self.plan(pid))['master_deletion_enabled'] is not False:
-                    pending = None
-                    raise Halt('live API master OFF not confirmed')
-                step = 'OFF final live deploy GET'
-                if self.read(step, self.live)['id'] != dep_id:
-                    pending = None
-                    raise Halt('live deployment changed during OFF verification')
-                break
-            except Exception:
-                self.step_failed(step)
-                self.status['shutdown_or_recovery_failed'] = True
-                self.alert('MASTER OFF NOT CONFIRMED; retrying shutdown')
-                time.sleep(delay)
-                delay = min(delay * 2, 300)
-        # A disk error must not invalidate a confirmed OFF or block failure notification.
-        # A successful retry resolves only this OFF call's warning. Preserve
-        # prior failures and any recovery error that still needs owner review.
-        self.status.update(phase='master_false', live_commit=commit,
-                           shutdown_or_recovery_failed=latched_before or bool(self.status.get('recovery_error')))
-
     def master(self, enabled, emergency=False):
-        if not enabled:
-            self.off()
+        """The controller owns the global switch. OFF pauses only our plan."""
+        pid = self.status['current_plan']
+        active = self.active()
+        require(active['batches'] == 0 and active['plans'] in ([], [pid]),
+                'unknown enabled plan or batch; owner review required')
+        if enabled:
+            require(not emergency and not active['plans'] and pid,
+                    'execution cannot be enabled')
+            require(self.plan(pid)['master_deletion_enabled'] is True,
+                    'controller must enable the runtime master before activation')
             return
-        require(not emergency, 'emergency enable forbidden')
-        try:
-            step = 'ON idle query'
-            self.read(step, self.idle)
-            step = 'ON live deploy GET'
-            live = self.read(step, self.live)
-            step = 'ON state write'
-            self.save('master_true_requested', live_commit=live['commit']['id'])
-            step = 'ON env PUT'
-            self.render('PUT', '/env-vars/NAS_CLEANUP_DELETION_ENABLED', {'value': 'true'})
-            # Never deploy HEAD, origin/main, or a fix: redeploy exactly the live SHA.
-            step = 'ON deploy create POST'
-            dep = self.render('POST', '/deploys', {'commitId': live['commit']['id'], 'clearCache': 'do_not_clear'})
-            deadline = time.monotonic() + 1800
-            while True:
-                step = 'ON deploy status GET'
-                d = self.read(step, lambda: self.render('GET', '/deploys/' + dep['id']))
-                if d['status'] == 'live':
-                    require(d['commit']['id'] == live['commit']['id'], 'Render deployed a different commit')
-                    break
-                require(d['status'] in {'created', 'build_in_progress', 'pre_deploy_in_progress', 'update_in_progress', 'queued'}, 'Render redeploy failed')
-                require(time.monotonic() < deadline, 'Render redeploy timed out')
-                time.sleep(15)
-            step = 'ON live deploy GET'
-            require(self.read(step, self.live)['id'] == dep['id'], 'live deployment changed concurrently')
-            step = 'ON env GET'
-            env = self.read(step, lambda: self.render('GET', '/env-vars/NAS_CLEANUP_DELETION_ENABLED'))
-            require(env['value'] == 'true', 'Render master env differs')
-            pid = self.status['current_plan']
-            if pid:
-                step = 'ON runtime plan GET'
-                # Render reports "live" while the previous instance can still answer briefly:
-                # wait (bounded) for the new runtime to report ON before declaring a mismatch.
-                confirm_deadline = time.monotonic() + ON_CONFIRM_WAIT_SEC
-                while self.read(step, lambda: self.plan(pid))['master_deletion_enabled'] is not True:
-                    require(time.monotonic() < confirm_deadline, 'live API master differs')
-                    time.sleep(10)
-            step = 'ON state write'
-            self.save('master_true')
-        except Exception:
-            self.step_failed(step)
-            raise
+        if active['plans']:
+            plan = self.plan(pid)
+            require(self.status.get('started_plan_sha256') == plan['plan_sha256'],
+                    'execution ownership digest differs')
+            self.api('POST', 'plans/' + str(pid) + '/control', {
+                'plan_sha256': plan['plan_sha256'], 'mode': 'paused',
+                'reason': ('completed: all items deleted or kept' if execution_state(plan) == 'done'
+                           else 'cleanup runner stopped; owner recovery required')})
+            require(self.plan(pid)['mode'] == 'paused', 'owned pause not confirmed')
+        self.status['phase'] = 'execution_off'
+
+    def validate_owner(self):
+        # Controller pins this immutable activation manifest in owner.env.
+        path = self.root / 'cleanup-owner.json'
+        raw = path.read_bytes()
+        require(hashlib.sha256(raw).hexdigest() == os.environ['CLEANUP_OWNER_SHA256'],
+                'cleanup ownership manifest differs')
+        owner = json.loads(raw)
+        require(owner['schema'] == 'stoarama.cleanup-owner.v1'
+                and self.status['owner_id'] == owner['owner_id']
+                and re.fullmatch('[a-f0-9-]{36}', owner['owner_id'])
+                and self.status.get('recovery_plan_id') is not None,
+                'cleanup ownership is not initialized')
+        if self.status['recovery_plan_id'] == owner['baseline_plan_id']:
+            pid = self.status['current_plan'] or self.status.get('next_plan')
+            require(pid == owner['initial_plan_id'] and
+                    self.plan(pid)['plan_sha256'] == owner['initial_plan_sha256'],
+                    'initial cleanup plan differs')
+        self.status['runner_pid'] = os.getpid()
+        self.owner_validated = True
 
     def stopped(self):
         return self.stopping or (self.root / 'STOP').exists()
@@ -1000,7 +914,17 @@ class Runner:
             return summary
         r = self.read('recovery verification', check)
         require(r['verified'] == issued and r['problems'] == 0, 'R2 recovery verification failed')
-        self.save('recovery_verified', recovery_issued=issued)
+        require(timestamp(r['checked_at']) <= utcnow(), 'recovery time is in the future')
+        path = self.root / ('recovery-' + str(plan['id']) + '.json')
+        tmp = path.with_suffix('.tmp')
+        with tmp.open('w') as output:
+            json.dump(r, output); output.flush(); os.fsync(output.fileno())
+        tmp.replace(path)
+        # save() fsyncs the shared directory before releasing ownership.
+        history = dict(self.status['recovery_history'])
+        history[str(plan['id'])] = {'sha256': plan['plan_sha256'], 'issued': issued}
+        self.save('recovery_verified', recovery_history=history, recovery_issued=issued, recovery_plan_id=plan['id'],
+                  recovery_plan_sha256=plan['plan_sha256'])
 
     def drain(self, pid):
         deadline = time.monotonic() + 900
@@ -1067,7 +991,6 @@ class Runner:
                         'owned running plan missing from active execution')
                 self.finish(p)
                 return
-            require(self.live()['commit']['id'] == self.status['live_commit'], 'live commit changed during execution')
             if self.status.get('next_plan') is not None:
                 dry_state(self.plan(self.status['next_plan']))  # A failed lookahead stops and alerts too.
             # STOP/SIGTERM drains the active plan naturally; never pause it for deployment.
@@ -1075,7 +998,11 @@ class Runner:
             time.sleep(60)
 
     def run(self):
-        # Owner policy: OFF is the first barrier unless resuming our healthy execution.
+        # A rejected kickstart is read-only, including the outer failure handler.
+        require(not self.status.get('last_error') and not self.status.get('recovery_error')
+                and not self.status.get('shutdown_or_recovery_failed'),
+                'failure is latched; owner must review before restart')
+        self.validate_owner()
         active = self.active()
         pid = self.status['current_plan']
         if not active['plans']:
@@ -1148,7 +1075,7 @@ class Runner:
             if self.stopped():
                 self.master(False)
                 break
-            # Recheck after the redeploy/budget wait; observations must still be fresh.
+            # Recheck before enable; observations must still be fresh.
             p = self.plan(pid)
             verify(p, self.catalog(p), self.windows, utcnow())
             require(budget_permits(self.recent_bytes(), size), 'budget changed before enable')
@@ -1164,8 +1091,20 @@ class Runner:
         self.save('stopped')
 
     def fail(self, error):
+        if not self.owner_validated or self.ownership_unreadable or self.status.get('last_error') or self.status.get('recovery_error') or self.status.get('shutdown_or_recovery_failed'):
+            self.alert('STOPPED: existing failure requires owner review')
+            return
         self.status.update(phase='failed', last_error=error)
-        self.master(False, emergency=True)  # Retries with alerts until OFF is confirmed.
+        try:
+            self.save('failed')
+        except Exception:
+            critical('failure latch write failed')
+        try:
+            self.master(False, emergency=True)
+        except Exception:
+            self.status['shutdown_or_recovery_failed'] = True
+            self.status['recovery_error'] = 'owned execution stop not confirmed'
+            self.step_failed('owned execution stop')
         self.alert('STOPPED: owner review required')
         try:
             if self.status['current_plan']:
@@ -1191,7 +1130,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--repo', type=Path, default=Path.home() / 'Build/stoarama')
     ap.add_argument('--state', type=Path, default=Path.home() / 'stoarama-cleanup-runner')
-    ap.add_argument('--dry-run', action='store_true', help='prepare/verify only; still forces master OFF and sends daily notes')
+    ap.add_argument('--dry-run', action='store_true', help='prepare/verify only; never enables a plan')
     args = ap.parse_args()
     os.umask(0o077)
     runner = Runner(args.repo, args.state, args.dry_run)
@@ -1199,7 +1138,8 @@ def main():
         runner.initialize()
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: setattr(runner, 'stopping', True))
-        runner.run()
+        with runner.heartbeat():
+            runner.run()
         return 0
     except LockHeld:
         return 0  # Another process owns the lock; never touch its master switch.

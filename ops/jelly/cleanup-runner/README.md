@@ -11,47 +11,31 @@ Owner approval (Deniz, 2026-11-11), verbatim conditions:
 > delete everything on the NAS outside each stream's pinned keep28 period (raw clips and old stitched files), without asking per batch, provided every batch passes: (1) the server's dry run AND an independent check that every file is outside its stream's kept period; (2) a verified R2 copy for every file (R2 copies stay); (3) no protected or uncertain files; (4) the 5 TB/day cap, one plan at a time; deletion master switch OFF between batches; fixes deployed only between batches (never pause an enabled plan to deploy); a short daily progress note; any failed check stops the run and goes to the owner.
 
 Certified non-unlink refusals remain visible in `certified_refusals` status,
-progress and owner notes. The runner stops through its existing master-OFF,
+progress and owner notes. The runner stops through its existing owned-plan pause/drain,
 STOP and owner-alert path when refusals exceed 1% of a plan's item count or five
 consecutive ordinals. It evaluates the full report on every execution poll and
 again before closing a plan; restarting cannot reset either bound. Uncertain
 receipts still stop immediately.
 
+This historical approval is retained verbatim. The ownership release changes the
+between-batch mechanism: the sole controller owns the global runtime master;
+the runner never reads Render credentials, changes its env, cancels a deployment,
+or redeploys. Its OFF operation pauses **only its digest-bound owned plan**, then
+drains receipts and runs real recovery. A foreign enabled plan/batch stops without
+mutation. A prior failure refuses restart without changing status, STOP, or plans.
+Activation requires a fresh ops review and explicit controller GO covering this
+changed policy; merging this preparation is not activation authority. The
+controller must explicitly establish runtime master ON before kickstart; an OFF
+runtime refuses enable. This prerequisite is never performed by the runner.
+
+The controller pins `cleanup-owner.json` via `CLEANUP_OWNER_SHA256` in existing
+`owner.env`. `ops/jelly/finish/OWNERSHIP.md` describes the handoff. The exclusive
+runner flock, PID, fresh heartbeat, owner UUID and exact execution digest bind
+active execution. Bounded slow preparation/verifier calls retain a 60s heartbeat.
+STOP still drains a healthy active plan naturally; it prevents the next enable.
+
 The runner:
 
-- Takes an exclusive local lock. On startup, first reads active execution.
-  With **no enabled plan**, forces master OFF as a barrier before policy loading,
-  email checks, progress, or other work (including a latched failure). With an
-  enabled plan matching the persisted `current_plan` and `started_plan_sha256`,
-  resumes monitoring **without toggling master** only if approval is still in the
-  future, the plan is enabled,
-  master is ON, no anomalous item states exist, and no failure is latched.
-  An unknown/unhealthy enabled plan, enabled batch, or dry-run takeover forces
-  OFF, alerts the owner, and stops. Startup errors also take this fail-safe path;
-  unreadable or malformed ownership state is treated as an unknown enabled plan.
-  Only actual lock contention exits without touching the master switch.
-  Never pauses a healthy plan on restart:
-  toggling OFF would expire its leases and force replanning. The start digest is
-  durably recorded before the enable request, including recovery from a lost API
-  response; a plan merely selected for dry run has no execution ownership marker.
-- Forces master OFF through a single-key Render env edit, cancels any in-progress
-  deploys, then explicitly redeploys the **current live SHA**, never HEAD. OFF
-  bypasses the normal concurrent-deploy rejection and needs no successful disk
-  write. Remembers its new OFF deploy in memory across retries and never cancels
-  it while it is in progress, including after a polling timeout. Confirms that
-  deploy (created after the OFF env edit) is live,
-  configured env is false, and the live API reports master false; rechecks live
-  deploy identity after that report. With no saved plan, reads the latest existing
-  account-47/connection-13 plan report for this runtime check. Missing reports
-  cannot confirm OFF. OFF retries idempotent reads (deploy status/list,
-  live identity, env, plan, and read-only queries) with at most 120 seconds (two minutes) of
-  added backoff per read, in addition to existing I/O timeouts. Exhausted reads,
-  failed/canceled/timed-out deploys, concurrent deploys, or a runtime master mismatch trigger loud stderr + owner email alerts
-  and retries forever with 15-second exponential backoff capped at five minutes.
-  A terminal failed OFF deploy or a confirmed verification mismatch requires a
-  new OFF deploy; read failures alone resume the remembered deploy. ON read
-  failure propagates to the normal fail-safe OFF path.
-  ON still rejects concurrent deploys. Repeats OFF after completion or pause.
 - Uses a complete fresh dry run or invokes `prepare_keep28_plans.py --submit`
   for one stream, at most one <=100 GB plan. Unique `k28auto-YYYYMMDD-HHMMSS`
   prefixes avoid immutable-label reuse. A confirmed HTTP 409 from a single atomic admission excludes that
@@ -82,7 +66,7 @@ The runner:
   independent catalog/window checks, budget, freshness and enable rechecks still
   run normally. An interrupted `lookahead_pending` admission requires owner
   reconciliation of the saved plan files/label before restart; never clear it
-  blindly or admit another successor. Master remains OFF between every batch.
+  blindly or admit another successor. No plan remains enabled between batches; the controller owns the global master.
   Future client staging requires explicit `NAS_VERSION=cleanup-pipeline-v1`.
 - Independently checks the pinned policy bytes at `origin/main` (no network
   fetch or checkout update), raw/collated catalog identities, all source clips,
