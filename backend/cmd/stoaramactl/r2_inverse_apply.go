@@ -128,7 +128,7 @@ func (a *inverseApplier) checkEvidence(ctx context.Context, q r2RetireQuerier) e
 	if err != nil {
 		return fmt.Errorf("exact 0198 writer fence required: %w", err)
 	}
-	if !blocked || !now.After(deadline) || e.Bucket != a.store.Bucket() || e.EndpointSHA256 != a.store.EndpointSHA256() || !e.FenceActivatedAt.Equal(activated) || !e.DrainNotBefore.Equal(deadline) || !e.ObservedAt.After(deadline) || e.ObservedAt.After(now) || strings.TrimSpace(e.DeployedWriterCoverage) == "" {
+	if !blocked || !now.After(deadline) || e.Bucket != a.store.Bucket() || e.EndpointSHA256 != a.store.EndpointSHA256() || !e.FenceActivatedAt.Equal(activated) || !e.DrainNotBefore.Equal(deadline) || !e.ObservedAt.After(deadline) || e.ObservedAt.After(now) {
 		return errors.New("writer drain or controller evidence missing, stale or outside exact fence")
 	}
 	if err = e.validateProof(a.opts); err != nil {

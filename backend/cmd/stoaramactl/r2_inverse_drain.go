@@ -17,17 +17,17 @@ type inverseKeyPolicyResidual string
 
 // This is an explicit B1-only acceptance of an already-issued PUT racing the
 // final HEAD/unconditional DELETE. It is not evidence of remote completion.
-const inverseApprovedKeyResidual inverseKeyPolicyResidual = "approved_key_overwrite_reappearance_delivery_order_v1"
+const inverseApprovedKeyResidual inverseKeyPolicyResidual = "approved_non28_key_overwrite_reappearance_delivery_and_historical_issuance_v1"
 
 type inverseKeyPolicyEvidence struct {
-	PartitionSHA256                 string                   `json:"partition_sha256"`
-	SummarySHA256                   string                   `json:"summary_sha256"`
-	IssuanceBoundEvidence           inverseEvidenceReference `json:"issuance_bound_evidence"`
-	OperatorSigningEvidence         inverseEvidenceReference `json:"operator_signing_evidence"`
-	OperatorSigningStoppedAt        time.Time                `json:"operator_signing_stopped_at"`
-	OperatorSigningObservedThrough  time.Time                `json:"operator_signing_observed_through"`
-	OperatorLastCapabilityExpiresAt time.Time                `json:"operator_last_capability_expires_at"`
-	ResidualAcceptance              inverseKeyPolicyResidual `json:"residual_acceptance"`
+	PartitionSHA256                string                   `json:"partition_sha256"`
+	SummarySHA256                  string                   `json:"summary_sha256"`
+	CanaryEvidence                 inverseEvidenceReference `json:"canary_evidence"`
+	ManagedPUTAnalytics            inverseEvidenceReference `json:"managed_put_analytics"`
+	OperatorSigningEvidence        inverseEvidenceReference `json:"operator_signing_evidence"`
+	OperatorSigningStoppedAt       time.Time                `json:"operator_signing_stopped_at"`
+	OperatorSigningObservedThrough time.Time                `json:"operator_signing_observed_through"`
+	ResidualAcceptance             inverseKeyPolicyResidual `json:"residual_acceptance"`
 }
 
 type inverseEvidenceReference struct {
@@ -52,7 +52,7 @@ func (r inverseEvidenceReference) verify() error {
 func (e inverseDrainEvidence) validateProof(o inverseApplyOptions) error {
 	switch e.Proof {
 	case inversePUTCompletionProof:
-		if e.KeyPolicy != nil || strings.TrimSpace(e.AcceptedPUTCompletion) == "" {
+		if e.KeyPolicy != nil || strings.TrimSpace(e.AcceptedPUTCompletion) == "" || strings.TrimSpace(e.DeployedWriterCoverage) == "" {
 			return errors.New("accepted-PUT completion evidence missing or mixed with key-policy proof")
 		}
 	case inverseNon28KeyPolicyProof:
@@ -61,18 +61,18 @@ func (e inverseDrainEvidence) validateProof(o inverseApplyOptions) error {
 			return errors.New("key-policy proof is exclusive to B1 non-keep28 RAW")
 		}
 		if !r2RetireLowerHex64(p.PartitionSHA256) || p.PartitionSHA256 != o.ManifestSHA || !r2RetireLowerHex64(p.SummarySHA256) || p.SummarySHA256 != o.SummarySHA || p.ResidualAcceptance != inverseApprovedKeyResidual {
-			return errors.New("key-policy partition binding, issuance evidence or residual acceptance missing")
+			return errors.New("key-policy partition binding, canary evidence or residual acceptance missing")
 		}
-		for _, ref := range []inverseEvidenceReference{p.IssuanceBoundEvidence, p.OperatorSigningEvidence} {
+		for _, ref := range []inverseEvidenceReference{p.CanaryEvidence, p.ManagedPUTAnalytics, p.OperatorSigningEvidence} {
 			if err := ref.verify(); err != nil {
 				return err
 			}
 		}
-		// The controller must substantiate the unchanged seven-day gate and the
-		// separate two-hour repair/operator signing window, not restamp expiry
-		// as proof that accepted requests have completed.
-		if !e.DrainNotBefore.Equal(e.FenceActivatedAt.Add(7*24*time.Hour+2*time.Minute)) || p.OperatorSigningStoppedAt.IsZero() || p.OperatorSigningStoppedAt.After(e.DrainNotBefore.Add(-2*time.Hour)) || p.OperatorSigningObservedThrough.IsZero() || !p.OperatorSigningObservedThrough.Equal(e.ObservedAt) || p.OperatorLastCapabilityExpiresAt.IsZero() || p.OperatorLastCapabilityExpiresAt.After(e.DrainNotBefore) {
-			return errors.New("key-policy fence or operator capability window not substantiated")
+		// Preserve the immutable fence minimum. B1 does not infer completion or
+		// a historical issuance census from it. The controller substantiates
+		// its current canary/analytics records and two-hour no-signing window.
+		if !e.DrainNotBefore.Equal(e.FenceActivatedAt.Add(7*24*time.Hour+2*time.Minute)) || p.OperatorSigningStoppedAt.IsZero() || p.OperatorSigningStoppedAt.After(e.ObservedAt.Add(-2*time.Hour)) || p.OperatorSigningObservedThrough.IsZero() || !p.OperatorSigningObservedThrough.Equal(e.ObservedAt) {
+			return errors.New("key-policy fence or operator no-signing window not substantiated")
 		}
 	default:
 		return errors.New("explicit supported writer proof required")

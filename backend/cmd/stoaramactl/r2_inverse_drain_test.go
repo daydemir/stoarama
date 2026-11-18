@@ -22,7 +22,7 @@ func TestR2InverseDrainProofScopeAndEvidence(t *testing.T) {
 	o := inverseApplyOptions{ManifestSHA: r2tSHA, SummarySHA: r2tSHA}
 	valid := func() inverseDrainEvidence {
 		return inverseDrainEvidence{Proof: inverseNon28KeyPolicyProof, FenceActivatedAt: activation, DrainNotBefore: deadline, ObservedAt: deadline.Add(time.Minute),
-			KeyPolicy: &inverseKeyPolicyEvidence{PartitionSHA256: r2tSHA, SummarySHA256: r2tSHA, IssuanceBoundEvidence: ref, OperatorSigningEvidence: ref, OperatorSigningStoppedAt: activation, OperatorSigningObservedThrough: deadline.Add(time.Minute), OperatorLastCapabilityExpiresAt: activation.Add(2 * time.Hour), ResidualAcceptance: inverseApprovedKeyResidual}}
+			KeyPolicy: &inverseKeyPolicyEvidence{PartitionSHA256: r2tSHA, SummarySHA256: r2tSHA, CanaryEvidence: ref, ManagedPUTAnalytics: ref, OperatorSigningEvidence: ref, OperatorSigningStoppedAt: activation, OperatorSigningObservedThrough: deadline.Add(time.Minute), ResidualAcceptance: inverseApprovedKeyResidual}}
 	}
 	if err := valid().validateProof(o); err != nil {
 		t.Fatal(err)
@@ -38,15 +38,21 @@ func TestR2InverseDrainProofScopeAndEvidence(t *testing.T) {
 		{"mixed proof", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.AcceptedPUTCompletion = "expired" }},
 		{"changed partition", func(_ *inverseDrainEvidence, o *inverseApplyOptions) { o.ManifestSHA = "changed" }},
 		{"changed summary", func(_ *inverseDrainEvidence, o *inverseApplyOptions) { o.SummarySHA = "changed" }},
-		{"missing issuance", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
-			e.KeyPolicy.IssuanceBoundEvidence = inverseEvidenceReference{}
+		{"missing canary", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
+			e.KeyPolicy.CanaryEvidence = inverseEvidenceReference{}
+		}},
+		{"missing analytics", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
+			e.KeyPolicy.ManagedPUTAnalytics = inverseEvidenceReference{}
 		}},
 		{"missing operator", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
 			e.KeyPolicy.OperatorSigningEvidence = inverseEvidenceReference{}
 		}},
+		{"old residual cannot waive current contract", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
+			e.KeyPolicy.ResidualAcceptance = "approved_key_overwrite_reappearance_delivery_order_v1"
+		}},
 		{"unaccepted residual", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.KeyPolicy.ResidualAcceptance = "" }},
 		{"wrong evidence digest", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
-			e.KeyPolicy.IssuanceBoundEvidence.SHA256 = r2tSHA
+			e.KeyPolicy.CanaryEvidence.SHA256 = r2tSHA
 		}},
 		{"unavailable evidence", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
 			e.KeyPolicy.OperatorSigningEvidence.Path = path + ".missing"
@@ -57,14 +63,8 @@ func TestR2InverseDrainProofScopeAndEvidence(t *testing.T) {
 		{"late signer", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
 			e.KeyPolicy.OperatorSigningStoppedAt = deadline.Add(-time.Hour)
 		}},
-		{"live operator capability", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
-			e.KeyPolicy.OperatorLastCapabilityExpiresAt = deadline.Add(time.Second)
-		}},
 		{"missing signer time", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
 			e.KeyPolicy.OperatorSigningStoppedAt = time.Time{}
-		}},
-		{"missing operator expiry", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
-			e.KeyPolicy.OperatorLastCapabilityExpiresAt = time.Time{}
 		}},
 		{"shortened fence", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.DrainNotBefore = deadline.Add(-time.Minute) }},
 	} {
@@ -77,7 +77,7 @@ func TestR2InverseDrainProofScopeAndEvidence(t *testing.T) {
 			}
 		})
 	}
-	completion := inverseDrainEvidence{Proof: inversePUTCompletionProof, AcceptedPUTCompletion: "terminal provider evidence"}
+	completion := inverseDrainEvidence{Proof: inversePUTCompletionProof, AcceptedPUTCompletion: "terminal provider evidence", DeployedWriterCoverage: "complete writer coverage"}
 	for _, lane := range []inverseLane{inverseOutsideKeep28, inverseNASKeep28} {
 		opts := o
 		opts.Lane = lane

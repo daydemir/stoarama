@@ -101,8 +101,8 @@ The implementation agent creates none of this production evidence.
 
 B1 alone also accepts the explicit `non28_key_policy_v1` route described in
 [the key-policy proof contract](r2-non28-key-policy.md). It binds this partition
-and summary, pinned issuance/operator evidence, the operator signing window and
-the expressly accepted overwrite/reappearance/delivery-order residual. It does
+and summary, pinned canary/analytics/operator evidence, the operator signing window and
+the expressly accepted overwrite/reappearance/delivery-order/historical-issuance residual. It does
 not claim external PUT completion. B2 rejects this route. All other live
 fence, hold, incident, delivery and tool-prefix checks remain mandatory.
 

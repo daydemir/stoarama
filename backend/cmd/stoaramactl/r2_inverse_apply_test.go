@@ -263,7 +263,8 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		e := drain
 		e.Proof = inverseNon28KeyPolicyProof
 		e.AcceptedPUTCompletion = ""
-		e.KeyPolicy = &inverseKeyPolicyEvidence{PartitionSHA256: a.opts.ManifestSHA, SummarySHA256: a.opts.SummarySHA, IssuanceBoundEvidence: inverseEvidenceReference{Path: drainPath, SHA256: drainSHA}, OperatorSigningEvidence: inverseEvidenceReference{Path: drainPath, SHA256: drainSHA}, OperatorSigningStoppedAt: activated, OperatorSigningObservedThrough: e.ObservedAt, OperatorLastCapabilityExpiresAt: activated.Add(2 * time.Hour), ResidualAcceptance: inverseApprovedKeyResidual}
+		e.DeployedWriterCoverage = ""
+		e.KeyPolicy = &inverseKeyPolicyEvidence{PartitionSHA256: a.opts.ManifestSHA, SummarySHA256: a.opts.SummarySHA, CanaryEvidence: inverseEvidenceReference{Path: drainPath, SHA256: drainSHA}, ManagedPUTAnalytics: inverseEvidenceReference{Path: drainPath, SHA256: drainSHA}, OperatorSigningEvidence: inverseEvidenceReference{Path: drainPath, SHA256: drainSHA}, OperatorSigningStoppedAt: activated, OperatorSigningObservedThrough: e.ObservedAt, ResidualAcceptance: inverseApprovedKeyResidual}
 		data, err := json.Marshal(e)
 		if err != nil {
 			t.Fatal(err)

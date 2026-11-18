@@ -67,9 +67,12 @@ are one minute and refuse results after context expiry. Migration 0187 serialize
 admission with fence activation and refuses new admitted writes/capabilities;
 0198 still checks durable wire intents and live capabilities. Two minutes are
 the existing issuance/signing margin, **not a provider transfer-duration bound**.
-Controller deployment/clock coverage must substantiate that margin, including
-retirement of old issuers and every raw credential holder; current code alone
-does not establish historical coverage.
+Historical effective `R2_SIGN_PUT_TTL` is unknown: the source default and
+committed Render declaration are15m, while the proven DB-admitted hard cap is
+7days. `upload_intents` is deletable by30-day transient-ledger maintenance;
+capability rows have no delete/truncate immutability guard. Neither NULL current
+maxima nor source defaults establish historical issuance. These are recorded
+facts, not premises of B1 key-policy eligibility. B2 keeps its completion gate.
 
 ## Provider facts and supporting observation
 
@@ -107,35 +110,40 @@ the missing historical admission ledger.
 
 The controller seals new evidence **after** the exact immutable deadline, never
 restamping the old completion finding. `proof` is mandatory: either
-`accepted_put_completion_v1` (existing substantive completion route), or
-`non28_key_policy_v1` (B1 only). Missing, unknown or mixed routes fail closed.
-For the latter, leave `accepted_put_completion_evidence` empty and supply:
+`accepted_put_completion_v1` (substantive completion plus deployed-writer coverage),
+or `non28_key_policy_v1` (B1 only). Missing, unknown or mixed routes fail closed.
+For B1 leave `accepted_put_completion_evidence` empty; historical
+`deployed_writer_coverage_evidence` is not a B1 prerequisite. Supply:
 
-- Existing exact bucket/endpoint/activation/deadline, post-deadline `observed_at`,
-  and reviewed `deployed_writer_coverage_evidence`.
+- Existing exact bucket/endpoint/activation/deadline and post-deadline observed_at.
 - `key_policy.partition_sha256` and `summary_sha256`, matching this apply's pins.
-- SHA-pinned file references `{path, sha256}` in `issuance_bound_evidence` and
-  `operator_signing_evidence`; files must remain available and unchanged.
-- Operator signing stop at/before deadline minus two hours, last operator
-  capability expiry at/before deadline,
-  `operator_signing_observed_through` equal to the new `observed_at`,
-  and `residual_acceptance` equal to
-  `approved_key_overwrite_reappearance_delivery_order_v1`.
+- SHA-pinned file references `{path, sha256}` for `canary_evidence`,
+  `managed_put_analytics` and `operator_signing_evidence`, available unchanged on
+  the CLI host. Canary evidence establishes the sole29de API instance and fresh
+  installed0209 ledger, both enabled source-hold removal guards, their exact
+  unconditional55000 body and origin replication role, plus the live0198 gate.
+- A fresh post-fence GraphQL query covering activation through canary, bucket
+  stoarama / PutObject / managed/%, with zero reported groups/count. Error,
+  truncation, unknown attribution or nonzero holds the next batch for root.
+  Sampling/publication lag means zero is anomaly evidence, not completeness.
+- Actual controller no-presign_remote use for the two hours before the canary
+  observation: operator_signing_stopped_at <= observed_at−2h and
+  operator_signing_observed_through equal to observed_at. No inference from
+  historical operator issuance logs is required.
+- `residual_acceptance` exactly
+  `approved_non28_key_overwrite_reappearance_delivery_and_historical_issuance_v1`.
 
-The controller reviews what those files substantiate; a digest verifies bytes,
-not the truth of an assertion. Issuance evidence must combine actual installed
-guard definitions, deployment/old-instance retirement/credential-holder history,
-the immutable fence and bounded DB observations with explicit limits. A missing
-historical timestamp is not a zero count. At 08:26Z capabilities had NULL max
-expiry and no `issued_at`; generic upload post-activation existence was false;
-recording-upload expiry was UNKNOWN (2s timeout); the highest 21 restore IDs were
-October rows and did not exclude updates to older rows. Current enabled triggers
-were read back. These facts do not independently prove every historical issuance.
+The controller reviews substance; a file hash verifies bytes, not truth. The
+explicit residual includes missing continuous historical fence coverage,
+per-instance retirement history and historical capability/T_max census. They
+cannot change a key's KE/keep28 catalog class. Still-valid old capabilities can
+race an unconditional DELETE at an already-approved key, evade a stale delivery
+content alias or recreate it afterward: those are the expressly accepted B1
+same-key/delivery-order/cost residuals. The immutable fence minimum remains;
+expiry is not accepted-request completion. B2 cannot use this alternative.
 
-Operator evidence must cover the two-hour window through the new observation,
-including `presign_remote.py`, sole-controller operation/stop history, and all
-other ungated holders. Longer-lived operator capabilities need their actual
-expiry covered too. The repair prefix remains excluded regardless. If coverage
-or the signing/clock margin cannot be substantiated, do not emit usable evidence.
-The post-fence live 0198 check must still succeed; a timed-out recording intent
-probe is never converted to a pass.
+Fresh canary inputs are required; the historical installation receipt or earlier
+zero-reported analytics is not a fresh canary observation. Operator signing
+windows are relative to the actual observation, not a hardcoded calendar date.
+No B1 route deletes collated/delivery/unknown/KE/keep28 keys or bypasses any live
+veto. Permanent intents still prevent retransmission after ambiguous deletion.
