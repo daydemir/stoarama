@@ -55,7 +55,18 @@ def stop_status(state: Path, reason: str) -> None:
             'updated_at': datetime.now(timezone.utc).isoformat(), 'stop_reason': reason})
 
 
+def attempt_paths(state: Path, record: dict) -> list:
+    # Directory existence is an independent unresolved-attempt marker. Journal
+    # replacement may be visible even when its final directory fsync failed.
+    names = set(record['active'].values())
+    names.update(p.name for p in state.iterdir() if p.is_dir()
+                 and p.name.startswith(('tick-', 'recovery-', 'legacy-')))
+    return [state / name for name in sorted(names)]
+
+
 def interrupted(state: Path, record: dict, lane: str, finishing: bool = False) -> bool:
+    if any(p.name not in record['active'].values() for p in attempt_paths(state, record)):
+        return True
     for active in record['active']:
         if active == lane:
             if not finishing:
@@ -144,6 +155,7 @@ class Attempt:
         # Serialize success publication with failure latching. A sibling that
         # was already in flight may retain evidence but cannot publish an OK.
         with gate(self.state):
+            publishing_success = False
             try:
                 record = load(self.state)
                 for path in self.path.iterdir():
@@ -167,6 +179,7 @@ class Attempt:
                         else:
                             stop_status(self.state, reason)
                     return False
+                publishing_success = True
                 if self.lane == 'tick':
                     publish(self.state / 'status.json', output)
                 else:
@@ -185,14 +198,20 @@ class Attempt:
                 # durable active marker as abandoned, even while our caller's
                 # lock scope still exists. Never publish again from this attempt.
                 self.abandoned = True
-                fcntl.flock(self.lock, fcntl.LOCK_UN)
+                try:
+                    if publishing_success:
+                        # Never leave apparent success after an uncertain commit.
+                        name = 'status.json' if self.lane == 'tick' else 'recovery.json'
+                        (self.state / name).unlink(missing_ok=True)
+                finally:
+                    fcntl.flock(self.lock, fcntl.LOCK_UN)
                 raise Latched() from None
 
 
 def binding(state: Path) -> str:
     """Bind the journal and every retained active attempt's evidence bytes."""
     paths = [state / 'admission.json']
-    for name in load(state)['active'].values():
-        paths.extend(sorted((state / name).iterdir()))
+    for attempt in attempt_paths(state, load(state)):
+        paths.extend(sorted(attempt.iterdir()))
     hashes = {str(p.relative_to(state)): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
     return hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()

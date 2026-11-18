@@ -329,7 +329,9 @@ and failure reason. Raw verifier detail stays private, out of canonical status
 and logs. Successful scratch attempts are removed. Existing failed status or
 recovery evidence is archived under `legacy-<id>` and latches first installation;
 absence of a new journal never erases a legacy failure. A full-disk failure to
-record a result leaves the pre-subprocess active marker unresolved, blocking retry.
+record a result leaves the attempt directory unresolved, blocking retry independently
+of the journal, even if replacement happened before an fsync error. Reconciliation
+binds every such directory. Success output is invalidated on publication failure.
 
 Only the sole controller, at a newly authorized boundary, may reconcile. First
 stop admission and reconcile the actual attempt's entire committed queue subset,
@@ -345,7 +347,7 @@ Bind two retained JSON artifacts to that digest:
 - Authority: `controller` (identity), `authority` (new explicit root authority),
   `latch_sha256`.
 - Evidence: `latch_sha256`, `queue_reconciled: true`, and `reconciled_attempts`
-  listing every directory in the journal's `active` map. Include the actual
+  listing every directory in the inspection output's `attempts` list (including any unresolved directory absent from the journal). Include the actual
   queue extraction/comparison and its hashes in this artifact. The controller
   is responsible for reviewing that evidence; the command validates bindings,
   not production truth.
@@ -355,7 +357,7 @@ Then run `python3 <install>/reconcile.py --state <state>
 --evidence <evidence.json>` as one command. It refuses changed bytes or running
 work, durably records controller, OS UID, time, full stopped journal and both
 artifact SHA256s under `reconciliations/`, and clears admission only. All failed
-attempts and canonical errors remain. The digest covers every active attempt's
+attempts move intact under `retained/`; canonical errors remain. The digest covers every active attempt's
 evidence, so an in-flight outcome cannot be omitted from reconciliation.
 
 Resumption is **recovery first**: ticks remain blocked without relatching until

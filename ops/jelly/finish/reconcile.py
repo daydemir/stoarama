@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import uuid
 
-from admission import LANES, binding, gate, load, publish
+from admission import LANES, attempt_paths, binding, gate, load, publish, sync_dir
 
 
 def main():
@@ -32,21 +32,22 @@ def main():
                 lock = stack.enter_context((args.state / filename).open('a'))
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             record = load(args.state)
+            attempts = attempt_paths(args.state, record)
             digest = binding(args.state)
             if args.inspect:
-                print(json.dumps({'latch_sha256': digest, 'journal': record}))
+                print(json.dumps({'latch_sha256': digest, 'journal': record, 'attempts': [p.name for p in attempts], 'attempts': [p.name for p in attempts]}))
                 return 0
             authority_bytes, evidence_bytes = args.authority.read_bytes(), args.evidence.read_bytes()
             authority, evidence = json.loads(authority_bytes), json.loads(evidence_bytes)
             if (digest != args.expected_latch_sha256 or authority['latch_sha256'] != digest
                     or evidence['latch_sha256'] != digest or not authority['controller'].strip()
                     or not authority['authority'].strip() or evidence['queue_reconciled'] is not True
-                    or sorted(evidence['reconciled_attempts']) != sorted(record['active'].values())
-                    or not (record['failed'] or record['active'])):
+                    or sorted(evidence['reconciled_attempts']) != sorted(p.name for p in attempts)
+                    or not (record['failed'] or attempts)):
                 raise ValueError('reconciliation binding mismatch')
             receipt = {'cleared_at': datetime.now(timezone.utc).isoformat(), 'uid': os.getuid(),
                        'controller': authority['controller'], 'authority': authority['authority'],
-                       'latch_sha256': digest, 'journal': record,
+                       'latch_sha256': digest, 'journal': record, 'attempts': [p.name for p in attempts],
                        'authority_sha256': hashlib.sha256(authority_bytes).hexdigest(),
                        'evidence_sha256': hashlib.sha256(evidence_bytes).hexdigest()}
             receipts = args.state / 'reconciliations'
@@ -55,6 +56,12 @@ def main():
             # No evidence/status is restored or deleted. A real recovery must
             # succeed before tick admission; tick cannot relatch during that step.
             publish(args.state / 'admission.json', {'failed': False, 'active': {}, 'recovery_required': True})
+            retained = args.state / 'retained'
+            retained.mkdir(mode=0o700, exist_ok=True)
+            for attempt in attempts:
+                os.rename(attempt, retained / attempt.name)
+            sync_dir(retained)
+            sync_dir(args.state)
             return 0
     except (OSError, ValueError, KeyError, TypeError):
         print('finish reconciliation_refused', flush=True)

@@ -110,7 +110,7 @@ class AdmissionTest(unittest.TestCase):
         self.assertEqual(self.invoke(tick, self.ok), (1, 0))
         self.assertEqual(self.invoke(recovery, self.ok)[0], 0)
         self.assertEqual(self.invoke(tick, self.ok)[0], 0)
-        self.assertTrue(next(self.state.glob('tick-*/failure.json')).exists())
+        self.assertTrue(next(self.state.glob('retained/tick-*/failure.json')).exists())
 
     def test_interruption_and_failed_latch_write_leave_active_stop(self):
         class Interrupted(BaseException):
@@ -329,3 +329,70 @@ class AdmissionTest(unittest.TestCase):
                     # descriptor, failed initialization has already unlocked it.
                     self.assertFalse(peer.finish('', self.report))
                     self.assertTrue(admission.load(state)['failed'])
+
+    def test_post_replace_fsync_error_stops_admission_publication_and_binds_orphan(self):
+        from contextlib import ExitStack
+        for failed_lane in ('tick', 'recovery'):
+            for publishing in (False, True):
+                with self.subTest(lane=failed_lane, publishing=publishing), tempfile.TemporaryDirectory() as temp:
+                    state = Path(temp)
+                    other = 'recovery' if failed_lane == 'tick' else 'tick'
+                    with ExitStack() as failed_stack, ExitStack() as peer_stack:
+                        failed = admission.Attempt.start(state, failed_lane, failed_stack)
+                        peer = admission.Attempt.start(state, other, peer_stack) if publishing else None
+                        original = admission.publish
+                        def after_replace(path, record):
+                            if path == state / 'admission.json' and failed_lane not in record['active']:
+                                # Exact publish ordering: replace succeeds, parent fsync fails.
+                                with patch.object(admission, 'sync_dir', side_effect=OSError('directory fsync')):
+                                    original(path, record)
+                            else:
+                                original(path, record)
+                        with patch.object(admission, 'publish', side_effect=after_replace), self.assertRaises(admission.Latched):
+                            failed.finish('', self.report)
+                        self.assertNotIn(failed_lane, admission.load(state)['active'])
+                        canonical = state / ('status.json' if failed_lane == 'tick' else 'recovery.json')
+                        self.assertFalse(canonical.exists())
+                        before = admission.binding(state)
+                        (failed.path / 'attempt.json').write_text('{"changed":"retained orphan evidence"}')
+                        self.assertNotEqual(admission.binding(state), before)
+                        if publishing:
+                            self.assertFalse(peer.finish('', self.report))
+                        else:
+                            with self.assertRaises(admission.Latched):
+                                admission.Attempt.start(state, other, peer_stack)
+                        self.assertTrue(admission.load(state)['failed'])
+
+    def test_reconcile_requires_orphan_evidence_even_with_empty_active_map(self):
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            attempt = admission.Attempt.start(self.state, 'tick', stack)
+            original = admission.publish
+            def after_replace(path, record):
+                if path == self.state / 'admission.json' and not record['active']:
+                    with patch.object(admission, 'sync_dir', side_effect=OSError('directory fsync')):
+                        original(path, record)
+                else:
+                    original(path, record)
+            with patch.object(admission, 'publish', side_effect=after_replace), self.assertRaises(admission.Latched):
+                attempt.finish('', self.report)
+        journal = admission.load(self.state)
+        self.assertFalse(journal['active'])
+        digest = admission.binding(self.state)
+        authority, evidence = self.state / 'authority.json', self.state / 'evidence.json'
+        authority.write_text(json.dumps({'controller': '886efa32', 'authority': 'new GO', 'latch_sha256': digest}))
+        record = {'latch_sha256': digest, 'queue_reconciled': True, 'reconciled_attempts': []}
+        evidence.write_text(json.dumps(record))
+        argv = ['reconcile', '--state', str(self.state), '--expected-latch-sha256', digest,
+                '--authority', str(authority), '--evidence', str(evidence)]
+        with patch.object(sys, 'argv', argv), patch.object(subprocess, 'run') as run:
+            self.assertEqual(reconcile.main(), 1)
+            record['reconciled_attempts'] = [attempt.path.name]
+            evidence.write_text(json.dumps(record))
+            self.assertEqual(reconcile.main(), 0)
+            run.assert_not_called()
+        self.assertFalse(attempt.path.exists())
+        self.assertTrue((self.state / 'retained' / attempt.path.name / 'attempt.json').exists())
+        self.assertEqual(self.invoke(tick, self.ok), (1, 0))
+        self.assertEqual(self.invoke(recovery, self.ok)[0], 0)
+        self.assertEqual(self.invoke(tick, self.ok)[0], 0)
