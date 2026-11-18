@@ -1029,11 +1029,32 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 	t.Run("budget", func(t *testing.T) {
 		a, _ := build(2)
 		a.ledger.close()
+		a.opts.Budget24h = -1
+		before := providerDeletes()
+		if _, err := applyInverse(ctx, pool, sdk, a.opts); err == nil || providerDeletes() != before {
+			t.Fatal("negative budget accepted", err)
+		}
 		a.opts.Budget24h = 1
-		before := store.calls
-		_, err := applyInverse(ctx, pool, store, a.opts)
-		if err == nil || store.calls != before {
+		_, err := applyInverse(ctx, pool, sdk, a.opts)
+		if err == nil || providerDeletes() != before {
 			t.Fatal("budget exceeded", err)
+		}
+		a.opts.Budget24h = 0
+		a.opts.MaxItems = 1
+		result, err := applyInverse(ctx, pool, sdk, a.opts)
+		if err != nil || result.Deleted != 1 || providerDeletes()-before != 1 {
+			t.Fatalf("unlimited budget crossed item bound: %+v %v", result, err)
+		}
+		a.opts.MaxItems = 2
+		a.opts.MaxBytes = 99
+		result, err = applyInverse(ctx, pool, sdk, a.opts)
+		if err != nil || result.Deleted != 0 || providerDeletes()-before != 1 {
+			t.Fatalf("unlimited budget crossed byte bound: %+v %v", result, err)
+		}
+		a.opts.MaxBytes = 100
+		result, err = applyInverse(ctx, pool, sdk, a.opts)
+		if err != nil || result.Deleted != 1 || providerDeletes()-before != 2 {
+			t.Fatalf("unlimited budget did not resume: %+v %v", result, err)
 		}
 	})
 	t.Run("private_authority_cannot_replay_or_remint", func(t *testing.T) {

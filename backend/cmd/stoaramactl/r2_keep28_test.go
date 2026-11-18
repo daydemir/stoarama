@@ -73,6 +73,27 @@ func TestKeep28ExecutorFreshCustodyAndNoReplay(t *testing.T) {
 	}
 }
 
+func TestKeep28UnlimitedBudgetRetainsAccounting(t *testing.T) {
+	f := newKeep28Fixture(t)
+	const charged = 6_000_000_000_000
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_inverse_budget_minutes(bucket,minute,charged_bytes) VALUES('stoarama',date_trunc('minute',clock_timestamp()),$1)`, int64(charged)); err != nil {
+		t.Fatal(err)
+	}
+	f.options.Budget24h = 5_000_000_000_000
+	if _, err := applyInverse(f.ctx, f.pool, f.sdk, f.options); err == nil || f.deletes() != 0 {
+		t.Fatal("positive exhausted budget reached wire", err)
+	}
+	f.options.Budget24h = 0
+	result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
+	if err != nil || result.Deleted != 1 || f.deletes() != 1 {
+		t.Fatalf("unlimited above 5 TB: %+v %v provider=%d", result, err, f.deletes())
+	}
+	var got int64
+	if err = f.pool.QueryRow(f.ctx, `SELECT sum(charged_bytes) FROM r2_inverse_budget_minutes WHERE bucket='stoarama'`).Scan(&got); err != nil || got != charged+100 {
+		t.Fatal("unlimited budget lost accounting", got, err)
+	}
+}
+
 type keep28Fixture struct {
 	ctx     context.Context
 	pool    *pgxpool.Pool

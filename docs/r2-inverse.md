@@ -53,13 +53,15 @@ stoaramactl r2-inverse apply \
   --picks PICKS --ledger PRIVATE_LEDGER \
   --drain-evidence DRAIN_JSON --expected-drain-evidence-sha256 DRAIN_SHA \
   --workers 16 --max-items 100 --max-bytes CANARY_BYTES \
-  --budget-24h-bytes CONTROLLER_BUDGET
+  --budget-24h-bytes 0
 ```
 
-The budget is explicit, configurable, and includes unresolved intents. It is
-conservatively charged by minute over the preceding 24h, with no owner-class 5 TB
-cap. The default 100-object limit is the canary size; subsequent tick calls may
-increase `--max-items` and the per-run byte bound within the daily budget.
+The rolling budget defaults to unlimited (`--budget-24h-bytes 0`) for both inverse
+and NAS-backed keep28 apply. A positive value sets an optional limit; negative
+values are rejected. Byte accounting, including unresolved intents, remains
+conservatively charged by minute over the preceding 24h in either mode. The
+default 100-object limit is the canary size; subsequent tick calls may increase
+`--max-items` and the required positive per-run byte bound.
 Only raw keys with one certain catalog identity and no protection are eligible.
 Collated, KE, keep28, tools, delivery, held and unknown keys are never deleted.
 The partition and picks must match the pinned policy and be no older than 24h.

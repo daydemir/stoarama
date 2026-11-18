@@ -305,7 +305,7 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	if err != nil {
 		return t, err
 	}
-	if e.SizeBytes > a.opts.Budget24h-charged {
+	if a.opts.Budget24h > 0 && e.SizeBytes > a.opts.Budget24h-charged {
 		return t, errors.New("rolling 24h inverse budget exhausted")
 	}
 	// Independent committed transaction. Never use an outer network transaction's
@@ -501,8 +501,8 @@ func runR2InverseLane(ctx context.Context, cfg config.Config, args []string, lan
 	fs.IntVar(&o.Workers, "workers", 16, "concurrent keys (1..64, at least two DB connections remain reserved)")
 	fs.IntVar(&o.MaxItems, "max-items", 100, "maximum new objects")
 	fs.Int64Var(&o.MaxBytes, "max-bytes", 0, "maximum new intent bytes this run")
-	fs.Int64Var(&o.Budget24h, "budget-24h-bytes", 0, "maximum charged bytes in previous24h")
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || o.MaxItems < 1 || o.Workers < 1 || o.Workers > 64 || o.MaxBytes <= 0 || o.Budget24h <= 0 || o.Ledger == "" {
+	fs.Int64Var(&o.Budget24h, "budget-24h-bytes", 0, "maximum charged bytes in previous24h (0 = unlimited; per-run bounds still apply)")
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || o.MaxItems < 1 || o.Workers < 1 || o.Workers > 64 || o.MaxBytes <= 0 || o.Budget24h < 0 || o.Ledger == "" {
 		log.Fatal("invalid bounded r2-inverse apply options")
 	}
 	pool := mustOpenPool(ctx, cfg)
@@ -535,7 +535,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		}
 	}
 
-	if o.Workers < 1 || o.Workers > 64 || o.MaxItems < 1 || o.MaxBytes <= 0 || o.Budget24h <= 0 {
+	if o.Workers < 1 || o.Workers > 64 || o.MaxItems < 1 || o.MaxBytes <= 0 || o.Budget24h < 0 {
 		return result, errors.New("invalid bounded apply options")
 	}
 	// One session connection and one independent issuance connection must stay
