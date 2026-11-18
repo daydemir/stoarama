@@ -9,9 +9,12 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestListPrefixContinuationPreservesR2OrderThroughRetry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	const token = "opaque+/=token"
 	const sig = "relay-releases/latest-05739dfe.json.sig"
 	const manifest = "relay-releases/latest-05739dfe.json"
@@ -44,12 +47,12 @@ func TestListPrefixContinuationPreservesR2OrderThroughRetry(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client, err := New(context.Background(), Config{Bucket: "bucket", AccessKey: "key", SecretKey: "secret", Endpoint: server.URL})
+	client, err := New(ctx, Config{Bucket: "bucket", AccessKey: "key", SecretKey: "secret", Endpoint: server.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var objects []ObjectInfo
-	err = client.ListPrefix(context.Background(), "relay-releases/", 0, func(o ObjectInfo) error {
+	err = client.ListPrefix(ctx, "relay-releases/", 0, func(o ObjectInfo) error {
 		objects = append(objects, o)
 		return nil
 	})
@@ -62,6 +65,8 @@ func TestListingsRefuseNonAdvancingContinuation(t *testing.T) {
 	for _, roots := range []bool{false, true} {
 		for _, next := range []string{"", "<NextContinuationToken></NextContinuationToken>", "<NextContinuationToken>same</NextContinuationToken>"} {
 			t.Run(fmt.Sprintf("roots=%t/next=%s", roots, next), func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
 				calls := 0
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 					calls++
@@ -72,14 +77,14 @@ func TestListingsRefuseNonAdvancingContinuation(t *testing.T) {
 					io.WriteString(w, `<ListBucketResult><IsTruncated>true</IsTruncated>`+next+`</ListBucketResult>`)
 				}))
 				defer server.Close()
-				client, err := New(context.Background(), Config{Bucket: "bucket", AccessKey: "key", SecretKey: "secret", Endpoint: server.URL})
+				client, err := New(ctx, Config{Bucket: "bucket", AccessKey: "key", SecretKey: "secret", Endpoint: server.URL})
 				if err != nil {
 					t.Fatal(err)
 				}
 				if roots {
-					_, _, err = client.ListRoots(context.Background())
+					_, _, err = client.ListRoots(ctx)
 				} else {
-					err = client.ListPrefix(context.Background(), "prefix", 0, func(ObjectInfo) error { return nil })
+					err = client.ListPrefix(ctx, "prefix", 0, func(ObjectInfo) error { return nil })
 				}
 				if err == nil || !strings.Contains(err.Error(), "no advancing continuation token") || calls != 2 {
 					t.Fatalf("calls=%d error=%v", calls, err)
