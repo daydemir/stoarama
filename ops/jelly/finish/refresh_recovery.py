@@ -85,6 +85,8 @@ def main():
             notify(args.notify_agent, reason or 'recovery_refresh_failed')
             return 1
         except Latched:
+            if attempt is not None and attempt.abandoned:
+                notify(args.notify_agent, 'admission_publication_failed')
             print('finish admission_latched', flush=True)
             return 1
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
@@ -93,6 +95,9 @@ def main():
                 if attempt is not None:
                     attempt.finish(reason, {})
                 publish(args.state / 'recovery.json', {'refresh_error': reason})
+            except Latched:
+                notify(args.notify_agent, 'admission_publication_failed')
+                return 1
             except OSError:
                 # Unlink needs no replacement allocation. A full disk must not leave
                 # the previous success consumable after a failed verification.

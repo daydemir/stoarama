@@ -81,12 +81,20 @@ class Attempt:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise Latched() from None
-            return cls(state, lane)
+            try:
+                return cls(state, lane, lock)
+            except BaseException:
+                # Constructor failure must not let this replacement's lock
+                # conceal the old marker before the outer stack unwinds.
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                raise
 
-    def __init__(self, state: Path, lane: str):
+    def __init__(self, state: Path, lane: str, lock):
         # Construction is internal to start(), under the shared gate.
         self.state = state
         self.lane = lane
+        self.lock = lock
+        self.abandoned = False
         journal = state / 'admission.json'
         if journal.exists():
             record = load(state)
@@ -131,42 +139,54 @@ class Attempt:
         publish(journal, record)
 
     def finish(self, reason: str, output: dict) -> bool:
+        if self.abandoned:
+            raise Latched()
         # Serialize success publication with failure latching. A sibling that
         # was already in flight may retain evidence but cannot publish an OK.
         with gate(self.state):
-            record = load(self.state)
-            for path in self.path.iterdir():
-                with path.open('rb') as evidence:
-                    os.fsync(evidence.fileno())
-            sync_dir(self.path)
-            failed = bool(reason) or record['failed'] or interrupted(self.state, record, self.lane, finishing=True)
-            if failed:
-                reason = reason or 'evidence_unavailable'
-                record['failed'] = True
-                publish(self.state / 'admission.json', record)
-                publish(self.path / 'failure.json', {'reason': reason})
-                if self.lane == 'recovery':
-                    publish(self.state / 'recovery.json', output if reason == 'cleanup_recovery_problems'
-                            else {'refresh_error': reason})
-                    stop_status(self.state, 'cleanup_recovery_problems' if reason == 'cleanup_recovery_problems'
-                                else 'evidence_unavailable')
-                else:
-                    if output.get('stop_reason') == reason:
-                        publish(self.state / 'status.json', output)
+            try:
+                record = load(self.state)
+                for path in self.path.iterdir():
+                    with path.open('rb') as evidence:
+                        os.fsync(evidence.fileno())
+                sync_dir(self.path)
+                failed = bool(reason) or record['failed'] or interrupted(self.state, record, self.lane, finishing=True)
+                if failed:
+                    reason = reason or 'evidence_unavailable'
+                    record['failed'] = True
+                    publish(self.state / 'admission.json', record)
+                    publish(self.path / 'failure.json', {'reason': reason})
+                    if self.lane == 'recovery':
+                        publish(self.state / 'recovery.json', output if reason == 'cleanup_recovery_problems'
+                                else {'refresh_error': reason})
+                        stop_status(self.state, 'cleanup_recovery_problems' if reason == 'cleanup_recovery_problems'
+                                    else 'evidence_unavailable')
                     else:
-                        stop_status(self.state, reason)
-                return False
-            if self.lane == 'tick':
-                publish(self.state / 'status.json', output)
-            else:
-                publish(self.state / 'recovery.json', output)
-                publish(self.state / 'recovery-last-good.json', output)
-            if self.lane == 'recovery':
-                record['recovery_required'] = False
-            del record['active'][self.lane]
-            publish(self.state / 'admission.json', record)
-            shutil.rmtree(self.path)
-            return True
+                        if output.get('stop_reason') == reason:
+                            publish(self.state / 'status.json', output)
+                        else:
+                            stop_status(self.state, reason)
+                    return False
+                if self.lane == 'tick':
+                    publish(self.state / 'status.json', output)
+                else:
+                    publish(self.state / 'recovery.json', output)
+                    publish(self.state / 'recovery-last-good.json', output)
+                if self.lane == 'recovery':
+                    record['recovery_required'] = False
+                del record['active'][self.lane]
+                publish(self.state / 'admission.json', record)
+                # Scratch reclamation cannot reverse a committed success.
+                shutil.rmtree(self.path, ignore_errors=True)
+                return True
+            except (OSError, ValueError, KeyError, TypeError):
+                # A failed journal write must not leave our old attempt looking
+                # live. Unlock BEFORE releasing the gate: peers now see the
+                # durable active marker as abandoned, even while our caller's
+                # lock scope still exists. Never publish again from this attempt.
+                self.abandoned = True
+                fcntl.flock(self.lock, fcntl.LOCK_UN)
+                raise Latched() from None
 
 
 def binding(state: Path) -> str:

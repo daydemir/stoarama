@@ -146,7 +146,7 @@ class AdmissionTest(unittest.TestCase):
                 with (state / 'lock').open('a') as tick_lock, (state / 'recovery.lock').open('a') as recovery_lock:
                     for lock in (tick_lock, recovery_lock):
                         fcntl.flock(lock, fcntl.LOCK_EX)
-                    attempts = {lane: admission.Attempt(state, lane) for lane in admission.LANES}
+                    attempts = {lane: admission.Attempt(state, lane, {'tick': tick_lock, 'recovery': recovery_lock}[lane]) for lane in admission.LANES}
                     other = 'recovery' if failed_lane == 'tick' else 'tick'
                     self.assertFalse(attempts[failed_lane].finish('dependency_failed', {}))
                     self.assertFalse(attempts[other].finish('', self.report))
@@ -174,7 +174,7 @@ class AdmissionTest(unittest.TestCase):
                         locks = {'tick': tick_lock, 'recovery': recovery_lock}
                         for lock in locks.values():
                             fcntl.flock(lock, fcntl.LOCK_EX)
-                        attempts = {lane: admission.Attempt(state, lane) for lane in admission.LANES}
+                        attempts = {lane: admission.Attempt(state, lane, {'tick': tick_lock, 'recovery': recovery_lock}[lane]) for lane in admission.LANES}
                         failed = attempts[interrupted_lane]
                         admission.publish(failed.path / 'result.json', {'imported_items': 2, 'problems': 1})
                         if failed_write:
@@ -183,7 +183,7 @@ class AdmissionTest(unittest.TestCase):
                                 if path == state / 'admission.json' and record.get('failed'):
                                     raise OSError('full disk')
                                 original(path, record)
-                            with patch.object(admission, 'publish', side_effect=full), self.assertRaises(OSError):
+                            with patch.object(admission, 'publish', side_effect=full), self.assertRaises(admission.Latched):
                                 failed.finish('dependency_failed', {})
                         fcntl.flock(locks[interrupted_lane], fcntl.LOCK_UN)
                         other = 'recovery' if interrupted_lane == 'tick' else 'tick'
@@ -277,3 +277,55 @@ class AdmissionTest(unittest.TestCase):
                     self.assertIn(False if publishing else 'peer stopped', outcomes)
                     self.assertTrue(admission.load(state)['failed'])
                     self.assertIn('stop_reason', json.loads((state / 'status.json').read_text()))
+
+    def test_failed_publication_blocks_peers_before_caller_lock_scope_exits(self):
+        from contextlib import ExitStack
+        for failed_lane in ('tick', 'recovery'):
+            for publishing in (False, True):
+                with self.subTest(lane=failed_lane, publishing=publishing), tempfile.TemporaryDirectory() as temp:
+                    state = Path(temp)
+                    other = 'recovery' if failed_lane == 'tick' else 'tick'
+                    with ExitStack() as failed_stack, ExitStack() as peer_stack:
+                        failed = admission.Attempt.start(state, failed_lane, failed_stack)
+                        peer = admission.Attempt.start(state, other, peer_stack) if publishing else None
+                        original = admission.publish
+                        def full(path, record):
+                            if path == state / 'admission.json' and record.get('failed'):
+                                raise OSError('full disk')
+                            original(path, record)
+                        with patch.object(admission, 'publish', side_effect=full), self.assertRaises(admission.Latched):
+                            failed.finish('manifest_import_failed', {})
+                        self.assertTrue(failed.abandoned)
+                        # The caller has not exited failed_stack or released its
+                        # descriptor. finish() must already make the peer stop.
+                        if publishing:
+                            self.assertFalse(peer.finish('', self.report))
+                        else:
+                            with self.assertRaises(admission.Latched):
+                                admission.Attempt.start(state, other, peer_stack)
+                        self.assertTrue(admission.load(state)['failed'])
+                        self.assertIn('stop_reason', json.loads((state / 'status.json').read_text()))
+                        if publishing and other == 'recovery':
+                            self.assertNotIn('problems', json.loads((state / 'recovery.json').read_text()))
+
+    def test_failed_replacement_admission_cannot_conceal_old_marker(self):
+        from contextlib import ExitStack
+        for abandoned in ('tick', 'recovery'):
+            with self.subTest(lane=abandoned), tempfile.TemporaryDirectory() as temp:
+                state = Path(temp)
+                other = 'recovery' if abandoned == 'tick' else 'tick'
+                with ExitStack() as old_stack, ExitStack() as replacement_stack, ExitStack() as peer_stack:
+                    admission.Attempt.start(state, abandoned, old_stack)
+                    peer = admission.Attempt.start(state, other, peer_stack)
+                    old_stack.close()
+                    original = admission.publish
+                    def full(path, record):
+                        if path == state / 'admission.json' and record.get('failed'):
+                            raise OSError('full disk')
+                        original(path, record)
+                    with patch.object(admission, 'publish', side_effect=full), self.assertRaises(OSError):
+                        admission.Attempt.start(state, abandoned, replacement_stack)
+                    # Even though the replacement caller still owns its open
+                    # descriptor, failed initialization has already unlocked it.
+                    self.assertFalse(peer.finish('', self.report))
+                    self.assertTrue(admission.load(state)['failed'])

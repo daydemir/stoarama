@@ -72,6 +72,8 @@ def main():
             notify(args.notify_agent, reason)
             return 1
         except Latched:
+            if attempt is not None and attempt.abandoned:
+                notify(args.notify_agent, 'admission_publication_failed')
             print('finish admission_latched', flush=True)
             return 1
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
@@ -79,7 +81,7 @@ def main():
             if attempt is not None:
                 try:
                     attempt.finish(reason, {})
-                except (OSError, ValueError):
+                except (OSError, ValueError, Latched):
                     # The pre-subprocess active journal remains a durable stop.
                     pass
     notify(args.notify_agent, reason)
