@@ -1,5 +1,9 @@
 import copy
 import json
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 from datetime import datetime, timezone, timedelta
 import unittest
 from ownership import assemble_owned, validate_stop, POLICY_SHA
@@ -106,6 +110,46 @@ class OwnershipTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_stop(json.dumps(dict(stop, **change)), owner, NOW)
         with self.assertRaises(ValueError): validate_stop('', owner, NOW)
+
+    def test_natural_stop_run_collect_and_restart_preserves_pending_plan(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'cleanup-runner'))
+        from test_runner import FakeRunner, r
+        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
+            job = FakeRunner(root)
+            job.p['id'] = 1441
+            job.p['results'][0]['updated_at'] = NOW.isoformat()
+            job.picks = [1441, None]
+            enable = job.enable
+            def stop_before_enable(plan):
+                (job.root / 'STOP').write_text(json.dumps(dict(schema='stoarama.cleanup-stop.v1',
+                    owner_id=fixture()[1]['owner_id'], reason='natural_boundary', created_at=NOW.isoformat())))
+                return enable(plan)
+            job.enable = stop_before_enable
+            job.run()
+            self.assertEqual(job.status['current_plan'], 1441)
+            self.assertEqual(job.status['phase'], 'stopped')
+            self.assertNotIn('plans/1441/control', job.events)
+            parts = fixture()
+            parts[0].update(job.status)
+            parts[5]['plans']['1441'].update(mode='dry_run', issued=0)
+            parts[5]['enabled_plans'] = []
+            self.collect(parts, running=False)
+            (job.root / 'STOP').unlink()
+            job.enable = enable
+            job.run()
+            self.assertIn('plans/1441/control', job.events)
+            self.assertEqual(job.status['phase'], 'complete')
+
+    def test_stopped_pending_plan_requires_dryrun_zero_issued(self):
+        parts = fixture()
+        parts[0]['phase'] = 'stopped'
+        parts[5]['enabled_plans'] = []
+        parts[5]['plans']['1441'].update(mode='dry_run', issued=0)
+        self.collect(parts, running=False)
+        parts[5]['plans']['1441']['issued'] = 1
+        with self.assertRaises(ValueError): self.collect(parts, running=False)
+        parts[5]['plans']['1441'].update(mode='paused', issued=0)
+        with self.assertRaises(ValueError): self.collect(parts, running=False)
 
     def test_dead_owner_cannot_allow_enabled_plan(self):
         with self.assertRaises(ValueError): self.collect(fixture(), running=False)

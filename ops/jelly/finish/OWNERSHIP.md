@@ -118,3 +118,17 @@ monitoring continue. Empty STOPs, the retired initial STOP text, foreign UUIDs,
 other reasons and future timestamps fail closed. Failure STOPs never override D
 or runner latches. The original STOP is removed only by the initial reviewed
 handoff, not converted or reused. Controller journals preserve every actual byte.
+
+A stopped runner may retain a selected plan and its pre-enable start digest only
+when fresh DB proof shows that exact plan remains dry_run with zero issuance and
+no enabled work. The collector accepts this explicit idle boundary, preserving
+both prepared plans for restart; paused or issued current plans cannot claim it.
+
+Before execution, the runner imports the existing installed admission module and
+uses its gate/journal/interrupted proof. Abandoned active markers or orphan
+attempts stop cleanup even if failed=false has not yet been published. New enable
+checks that proof under the gate, acquires the tick lock nonblocking under the
+same gate, then keeps the gate through the POST. Waiting for a live tick happens
+outside both locks before revalidation. A live recovery remains permitted. The
+module's observer parameter is Optional[str]; its D participant behavior is
+unchanged. Install the hash-bound admission.py alongside collector dependencies.

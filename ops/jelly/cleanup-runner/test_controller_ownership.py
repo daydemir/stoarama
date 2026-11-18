@@ -1,9 +1,10 @@
-from test_runner import r, fixture, NOW
+from test_runner import r, fixture, NOW, FINISH_ADMISSION
 from pathlib import Path
 from unittest.mock import patch
 import json
 import tempfile
 import threading
+from contextlib import ExitStack
 import unittest
 
 
@@ -11,9 +12,10 @@ class ControllerOwnershipTests(unittest.TestCase):
     def job(self, root):
         job = r.Runner(Path('.'), Path(root))
         job.owner_validated = True
+        job.admission = FINISH_ADMISSION
         job.finish_state = Path(root) / 'finish'
         job.finish_state.mkdir()
-        (job.finish_state / 'admission.json').write_text(json.dumps(dict(failed=False, recovery_required=False)))
+        (job.finish_state / 'admission.json').write_text(json.dumps(dict(failed=False, recovery_required=False, active={})))
         (job.finish_state / 'recovery.json').write_text(json.dumps(dict(plan_id=42, plan_sha256='b'*64, problems=0, verified=1, delete_ever_issued=1, checked_at=r.utcnow().isoformat())))
         plan, _ = fixture()
         job.status.update(current_plan=42, started_plan_sha256=plan['plan_sha256'], recovery_history={'42':dict(sha256='b'*64, issued=1)})
@@ -192,6 +194,25 @@ class ControllerOwnershipTests(unittest.TestCase):
             (job.root / 'STOP').write_text('owned natural stop')
             job.api = lambda *args: self.fail('STOP must prevent new enable')
             self.assertFalse(job.enable(plan))
+
+    def test_abandoned_d_attempt_cannot_enable_cleanup(self):
+        with tempfile.TemporaryDirectory() as root:
+            job, plan = self.job(root)
+            with ExitStack() as stack:
+                FINISH_ADMISSION.Attempt.start(job.finish_state, 'tick', stack)
+            job.api = lambda *args: self.fail('abandoned D tick cannot authorize cleanup')
+            with self.assertRaises(r.Halt): job.enable(plan)
+            with self.assertRaises(r.Halt): job.finish_health()
+
+    def test_live_recovery_can_coexist_but_orphan_directory_stops(self):
+        with tempfile.TemporaryDirectory() as root:
+            job, plan = self.job(root)
+            with ExitStack() as stack:
+                FINISH_ADMISSION.Attempt.start(job.finish_state, 'recovery', stack)
+                job.finish_health()
+                job.api = lambda *args: None
+                self.assertTrue(job.enable(plan))
+            with self.assertRaises(r.Halt): job.finish_health()
 
     def test_runner_has_no_render_capability(self):
         text = Path(r.__file__).read_text()

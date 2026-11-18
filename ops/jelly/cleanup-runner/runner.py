@@ -594,19 +594,41 @@ class Runner:
             require(self.plan(pid)['mode'] == 'paused', 'owned pause not confirmed')
         self.status['phase'] = 'execution_off'
 
+    def finish_admission(self):
+        if not hasattr(self, 'admission'):
+            path = self.finish_state.parent / 'install/admission.py'
+            spec = importlib.util.spec_from_file_location('finish_admission', path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self.admission = module
+        return self.admission
+
     def enable(self, plan):
-        # D consumes one snapshot throughout its tick. It owns this same lock
-        # before collection, so a successor cannot appear during those checks.
-        # No active cleanup is held waiting here, and heartbeats stay writable.
-        with (self.finish_state / 'lock').open('a') as tick:
-            fcntl.flock(tick, fcntl.LOCK_EX)
-            if self.stopped():
-                return False
-            self.finish_health()
-            self.api('POST', 'plans/' + str(plan['id']) + '/control', {'mode': 'enabled',
-                'plan_sha256': plan['plan_sha256'], 'approval_hours': 24,
-                'allow_long_approval': True, 'reason': REASON})
-        return True
+        # D's existing gate orders attempt journals with lane-lock ownership.
+        # Acquire the tick lock only after proving no abandoned attempt. Keep
+        # the gate through the POST so a new D tick cannot mistake our lock for
+        # its own live attempt or spuriously report lane contention.
+        admission = self.finish_admission()
+        while True:
+            with admission.gate(self.finish_state):
+                record = self._finish_health(admission)
+                with (self.finish_state / 'lock').open('a') as tick:
+                    try:
+                        fcntl.flock(tick, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        pass
+                    else:
+                        require('tick' not in record['active'], 'interrupted finish tick requires reconciliation')
+                        if self.stopped():
+                            return False
+                        self.api('POST', 'plans/' + str(plan['id']) + '/control', {'mode': 'enabled',
+                            'plan_sha256': plan['plan_sha256'], 'approval_hours': 24,
+                            'allow_long_approval': True, 'reason': REASON})
+                        return True
+            # Wait outside the gate and snapshot lock, then revalidate before
+            # acquiring it again. No active cleanup is waiting here.
+            with (self.finish_state / 'lock').open('a') as tick:
+                fcntl.flock(tick, fcntl.LOCK_EX)
 
     def validate_owner(self):
         # Controller pins this immutable activation manifest in owner.env.
@@ -632,9 +654,16 @@ class Runner:
         self.status['runner_pid'] = os.getpid()
 
     def finish_health(self):
-        admission = json.loads((self.finish_state / 'admission.json').read_bytes())
-        require(admission['failed'] is False and admission['recovery_required'] is False,
+        admission = self.finish_admission()
+        with admission.gate(self.finish_state):
+            self._finish_health(admission)
+
+    def _finish_health(self, admission):
+        record = admission.load(self.finish_state)
+        require(record['failed'] is False and record['recovery_required'] is False,
                 'finish admission requires owner reconciliation')
+        require(not admission.interrupted(self.finish_state, record, None),
+                'interrupted finish attempt requires reconciliation')
         report = json.loads((self.finish_state / 'recovery.json').read_bytes())
         require(all(type(report[key]) is int and report[key] >= 0 for key in ('plan_id', 'problems', 'verified', 'delete_ever_issued')),
                 'invalid finish recovery counts')
@@ -646,6 +675,8 @@ class Runner:
                 'finish recovery failed; cleanup must stop')
         require(0 <= (utcnow() - timestamp(report['checked_at'])).total_seconds() <= 7 * 3600,
                 'finish recovery evidence is stale or future')
+
+        return record
 
     def contain(self):
         # A pause is monotonic and digest-bound. After a lost/failed response,

@@ -75,3 +75,7 @@ Successor enablement waits on the existing D tick lock so D can consume its full
 safety snapshot before a new plan appears. A controller's natural STOP uses the
 owner-bound JSON in OWNERSHIP.md; it preserves active natural drain and D health.
 Foreign or empty STOP content is a safety failure, not a natural-boundary request.
+The runner reuses D's installed admission module to detect abandoned attempts and
+orphan directories under its admission gate, including before borrowing its tick
+lock. A live recovery can coexist. A stopped selected plan remains pending only
+with fresh dry-run/zero-issued proof; neither prepared plan is discarded.

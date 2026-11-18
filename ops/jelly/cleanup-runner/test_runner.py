@@ -17,6 +17,9 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location('runner', Path(__file__).with_name('runner.py'))
 r = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(r)
+_admission_spec = importlib.util.spec_from_file_location('finish_admission_fixture', Path(__file__).resolve().parents[1] / 'finish/admission.py')
+FINISH_ADMISSION = importlib.util.module_from_spec(_admission_spec)
+_admission_spec.loader.exec_module(FINISH_ADMISSION)
 NOW = r.timestamp('2026-11-11T12:00:00+00:00')
 PREPARER = r.Runner(Path(__file__).resolve().parents[3], Path('.')).preparer()
 WINDOWS = {3: (r.timestamp('2026-09-01T00:00:00+00:00'), r.timestamp('2026-09-29T00:00:00+00:00'))}
@@ -272,6 +275,8 @@ class FakeRunner(r.Runner):
         self.picks = [42, None]
         self.owner_validated = True
 
+    def finish_admission(self): return FINISH_ADMISSION
+    def _finish_health(self, admission): return {'active': {}}
     def finish_health(self): pass
     def validate_owner(self): self.owner_validated = True
     def load_policy(self): pass

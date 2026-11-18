@@ -45,7 +45,10 @@ def assemble_owned(status, owner, recovery, runner_report, api, db, now, running
     if running:
         fresh(status['updated_at'], now)
     else:
-        require(status['current_plan'] is None and status['phase'] in ('stopped', 'complete'))
+        require(status['phase'] in ('stopped', 'complete') and db['enabled_plans'] == [])
+        if status['current_plan'] is not None:
+            pending = db['plans'][str(status['current_plan'])]
+            require(pending['mode'] == 'dry_run' and pending['issued'] == 0)
     pid = owner_plan(status, owner)
     plan = db['plans'][str(pid)]
     checkpoint = status['recovery_plan_id']
