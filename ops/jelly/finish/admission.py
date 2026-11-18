@@ -71,52 +71,64 @@ def interrupted(state: Path, record: dict, lane: str, finishing: bool = False) -
 
 
 class Attempt:
+    @classmethod
+    def start(cls, state: Path, lane: str, stack):
+        # Acquire the lane lock AND validate old markers under the same gate.
+        # A replacement cannot disguise an abandoned attempt's lock as live.
+        with gate(state):
+            lock = stack.enter_context((state / LANES[lane]).open('a'))
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Latched() from None
+            return cls(state, lane)
+
     def __init__(self, state: Path, lane: str):
+        # Construction is internal to start(), under the shared gate.
         self.state = state
         self.lane = lane
-        with gate(state):
-            journal = state / 'admission.json'
-            if journal.exists():
-                record = load(state)
-            else:
-                record = {'failed': False, 'active': {}}
-                # Upgrade must not erase the already-recorded failed D attempt.
-                legacy = None
-                for name in ('status.json', 'recovery.json'):
-                    path = state / name
-                    if path.exists():
-                        previous = json.loads(path.read_text())
-                        if not isinstance(previous, dict):
-                            raise ValueError('invalid previous status')
-                        if (previous.get('stop_reason') or previous.get('refresh_error')
-                                or previous.get('problems', 0) > 0):
-                            if legacy is None:
-                                legacy = state / ('legacy-' + uuid.uuid4().hex)
-                                legacy.mkdir(mode=0o700)
-                            with (legacy / name).open('xb') as archived:
-                                os.chmod(archived.name, 0o600)
-                                archived.write(path.read_bytes())
-                                archived.flush()
-                                os.fsync(archived.fileno())
-                            sync_dir(legacy)
-                            record['failed'] = True
-                            record['active']['legacy'] = legacy.name
-                publish(journal, record)
-            if record['failed'] or (lane == 'tick' and record.get('recovery_required')):
-                raise Latched()
-            # A durable active marker precedes every subprocess. Under the lane
-            # flock, a previous own marker is necessarily an interrupted attempt.
-            record['failed'] = interrupted(state, record, lane)
-            if record['failed']:
-                publish(journal, record)
-                stop_status(state, 'evidence_unavailable')
-                raise Latched()
-            self.path = state / (lane + '-' + uuid.uuid4().hex)
-            self.path.mkdir(mode=0o700)
-            publish(self.path / 'attempt.json', {'lane': lane,
-                    'started_at': datetime.now(timezone.utc).isoformat()})
-            record['active'][lane] = self.path.name
+        journal = state / 'admission.json'
+        if journal.exists():
+            record = load(state)
+        else:
+            record = {'failed': False, 'active': {}}
+            # Upgrade must not erase the already-recorded failed D attempt.
+            legacy = None
+            for name in ('status.json', 'recovery.json'):
+                path = state / name
+                if path.exists():
+                    previous = json.loads(path.read_text())
+                    if not isinstance(previous, dict):
+                        raise ValueError('invalid previous status')
+                    if (previous.get('stop_reason') or previous.get('refresh_error')
+                            or previous.get('problems', 0) > 0):
+                        if legacy is None:
+                            legacy = state / ('legacy-' + uuid.uuid4().hex)
+                            legacy.mkdir(mode=0o700)
+                        with (legacy / name).open('xb') as archived:
+                            os.chmod(archived.name, 0o600)
+                            archived.write(path.read_bytes())
+                            archived.flush()
+                            os.fsync(archived.fileno())
+                        sync_dir(legacy)
+                        record['failed'] = True
+                        record['active']['legacy'] = legacy.name
             publish(journal, record)
+        if record['failed'] or (lane == 'tick' and record.get('recovery_required')):
+            raise Latched()
+        # A durable active marker precedes every subprocess. Under the lane
+        # flock, a previous own marker is necessarily an interrupted attempt.
+        record['failed'] = interrupted(state, record, lane)
+        if record['failed']:
+            publish(journal, record)
+            stop_status(state, 'evidence_unavailable')
+            raise Latched()
+        self.path = state / (lane + '-' + uuid.uuid4().hex)
+        self.path.mkdir(mode=0o700)
+        publish(self.path / 'attempt.json', {'lane': lane,
+                'started_at': datetime.now(timezone.utc).isoformat()})
+        record['active'][lane] = self.path.name
+        publish(journal, record)
 
     def finish(self, reason: str, output: dict) -> bool:
         # Serialize success publication with failure latching. A sibling that

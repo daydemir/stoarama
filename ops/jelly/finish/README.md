@@ -315,7 +315,7 @@ substantiated drain evidence, durable intent/ledger and its own single-use token
 ## Durable admission and reconciliation
 
 Both wrappers retain their existing lane flocks. A short shared `admission.lock`
-serializes journal transitions and status publication, without serializing the
+serializes lane-lock acquisition, journal transitions and status publication, without serializing the
 30-minute verifier with ordinary feeding. `admission.json` records an active
 attempt **before any subprocess**. A failed or interrupted attempt stops both
 lanes until controller reconciliation. Later launches exit nonzero, start no
@@ -323,7 +323,8 @@ subprocess and never overwrite failure evidence or publish success. An in-flight
 sibling cannot publish success after the other lane latches a failure.
 
 Each failed attempt retains its private `tick-<id>` / `recovery-<id>` directory:
-input evidence, original CLI status/verifier output, return code if available,
+input evidence, exact generated import manifests (fsynced before import),
+original CLI status/verifier output, return code if available,
 and failure reason. Raw verifier detail stays private, out of canonical status
 and logs. Successful scratch attempts are removed. Existing failed status or
 recovery evidence is archived under `legacy-<id>` and latches first installation;

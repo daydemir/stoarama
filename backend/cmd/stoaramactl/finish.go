@@ -357,7 +357,23 @@ func finishManifest(dir string, items []api.NASR2CopyItem) (nasCopyHeader, strin
 	sum := sha256.Sum256(manifest.Bytes())
 	digest := hex.EncodeToString(sum[:])
 	path := filepath.Join(dir, digest+".jsonl")
-	if err = os.WriteFile(path, manifest.Bytes(), 0600); err != nil {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return h, "", nil, err
+	}
+	defer f.Close()
+	if _, err = f.Write(manifest.Bytes()); err != nil {
+		return h, "", nil, err
+	}
+	if err = f.Sync(); err != nil {
+		return h, "", nil, err
+	}
+	directory, err := os.Open(dir)
+	if err != nil {
+		return h, "", nil, err
+	}
+	defer directory.Close()
+	if err = directory.Sync(); err != nil {
 		return h, "", nil, err
 	}
 	parsed, validated, err := readNASCopyBatch(path, digest)
@@ -439,11 +455,9 @@ func finishTickWithRefresh(ctx context.Context, pool *pgxpool.Pool, safetyPath, 
 			_ = conn.Conn().Close(cleanup)
 		}
 	}()
-	dir, e := os.MkdirTemp("", "stoarama-finish-")
-	if e != nil {
-		return status, finishImport
-	}
-	defer os.RemoveAll(dir)
+	// The wrapper owns this private attempt directory. Retain exact manifests
+	// on CLI failure/interruption; only wrapper success removes its scratch.
+	dir := filepath.Dir(safetyPath)
 	refreshFed := false
 	for {
 		s, c, e := finishReadEvidence(safetyPath, copyPath)

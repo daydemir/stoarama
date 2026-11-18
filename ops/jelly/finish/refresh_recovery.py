@@ -2,7 +2,6 @@
 """Run the canonical read-only verifier separately from the fast finish tick."""
 import argparse
 from contextlib import ExitStack
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -43,12 +42,7 @@ def main():
     with ExitStack() as stack:
         try:
             args.state.mkdir(parents=True, exist_ok=True, mode=0o700)
-            lock = stack.enter_context((args.state / 'recovery.lock').open('a'))
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return 1
-            attempt = Attempt(args.state, 'recovery')
+            attempt = Attempt.start(args.state, 'recovery', stack)
             source = subprocess.run([str(args.plan_source)], capture_output=True, timeout=30, check=True)
             source_record=json.loads(source.stdout)
             if not isinstance(source_record,dict):

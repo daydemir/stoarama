@@ -2,7 +2,6 @@
 """Controller-installed metadata feeder. Never controls cleanup or deletion."""
 import argparse
 from contextlib import ExitStack
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -31,13 +30,7 @@ def main():
     with ExitStack() as stack:
         try:
             args.state.mkdir(mode=0o700, parents=True, exist_ok=True)
-            lock = stack.enter_context((args.state / 'lock').open('a'))
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return 1
-            # State and lock initialization failures also reach the notifier.
-            attempt = Attempt(args.state, 'tick')
+            attempt = Attempt.start(args.state, 'tick', stack)
             temp = attempt.path
             safety, copy, status = (temp / name for name in ('safety.json', 'copy.json', 'status.json'))
             # No env files are loaded. Controller supplies auth; dependency stderr

@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -119,5 +121,44 @@ func TestFinishPermanentIncidentsWithoutReservations(t *testing.T) {
 	var queued, sources, reservations int
 	if err = pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM nas_r2_copy_items),(SELECT count(*) FROM recording_clips),(SELECT count(*) FROM nas_cleanup_reserved_files)`).Scan(&queued, &sources, &reservations); err != nil || queued != 0 || sources != len(items) || reservations != 0 {
 		t.Fatalf("unexpected writes queue=%d sources=%d reservations=%d %v", queued, sources, reservations, err)
+	}
+}
+
+func TestFinishPartialImportRetainsExactManifest(t *testing.T) {
+	pool, safety, copy := finishFixture(t, 4)
+	ctx := context.Background()
+	// The second worker may fail only after source 1 has committed. Other workers
+	// may also commit: evidence must describe the entire input, not just counters.
+	_, err := pool.Exec(ctx, `CREATE FUNCTION fail_partial_import() RETURNS trigger LANGUAGE plpgsql AS $$
+ DECLARE n integer:=0;
+ BEGIN
+  IF NEW.source_id=2 THEN
+   WHILE NOT EXISTS(SELECT 1 FROM nas_r2_copy_items WHERE source_id=1) AND n<200 LOOP
+    PERFORM pg_sleep(0.01); n:=n+1;
+   END LOOP;
+   RAISE EXCEPTION 'injected partial import failure';
+  END IF;
+  RETURN NEW;
+ END $$;
+ CREATE TRIGGER fail_partial_import BEFORE INSERT ON nas_r2_copy_items FOR EACH ROW EXECUTE FUNCTION fail_partial_import()`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := finishTick(ctx, pool, safety, copy)
+	if !errors.Is(err, finishImport) || status.ImportedItems != 0 {
+		t.Fatalf("expected partial failure: %+v %v", status, err)
+	}
+	paths, err := filepath.Glob(filepath.Join(filepath.Dir(safety), "*.jsonl"))
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("manifest evidence missing: %v %v", paths, err)
+	}
+	digest := strings.TrimSuffix(filepath.Base(paths[0]), ".jsonl")
+	header, items, err := readNASCopyBatch(paths[0], digest)
+	if err != nil || len(items) != 4 || header.Items != 4 {
+		t.Fatalf("exact input lost: %+v items=%d %v", header, len(items), err)
+	}
+	var committed int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE manifest_sha256=$1 AND policy_sha256=$2`, digest, header.PolicySHA256).Scan(&committed); err != nil || committed < 1 || committed >= 4 {
+		t.Fatalf("partial commit evidence missing: %d %v", committed, err)
 	}
 }

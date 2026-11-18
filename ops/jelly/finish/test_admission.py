@@ -51,12 +51,14 @@ class AdmissionTest(unittest.TestCase):
     def test_partial_import_then_next_tick_never_retries(self):
         def partial(command, **kwargs):
             if 'tick' in command:
+                Path(command[command.index('--status') + 1]).with_name('manifest.jsonl').write_bytes(b'exact partial import input')
                 Path(command[command.index('--status') + 1]).write_text('{"stop_reason":"manifest_import_failed","imported_items":2}')
                 return subprocess.CompletedProcess(command, 1)
             return self.ok(command, **kwargs)
         self.assertEqual(self.invoke(tick, partial)[0], 1)
         evidence = next(self.state.glob('tick-*/status.json'))
         self.assertEqual(json.loads(evidence.read_text())['imported_items'], 2)
+        self.assertEqual(evidence.with_name('manifest.jsonl').read_bytes(), b'exact partial import input')
         self.assertEqual(json.loads((self.state / 'status.json').read_text())['stop_reason'], 'manifest_import_failed')
         self.assert_blocked()
 
@@ -205,3 +207,73 @@ class AdmissionTest(unittest.TestCase):
         digest = admission.binding(self.state)
         (legacy / 'status.json').write_bytes(b'changed partial import evidence')
         self.assertNotEqual(admission.binding(self.state), digest)
+
+    def test_replacement_lock_handoff_cannot_hide_interrupted_attempt(self):
+        from contextlib import ExitStack
+        import fcntl
+        import threading
+        cases = [(lane, publishing, False) for lane in ('tick', 'recovery') for publishing in (False, True)]
+        cases.append(('tick', True, True))  # a refused reconcile can also take half the lane locks
+        for abandoned, publishing, reconciling in cases:
+            with self.subTest(lane=abandoned, publishing=publishing, reconciling=reconciling), tempfile.TemporaryDirectory() as temp:
+                state = Path(temp)
+                peer_lane = 'recovery' if abandoned == 'tick' else 'tick'
+                with ExitStack() as peer_stack, ExitStack() as old_stack:
+                    peer = admission.Attempt.start(state, peer_lane, peer_stack) if publishing else None
+                    admission.Attempt.start(state, abandoned, old_stack)
+                    old_stack.close()  # interrupted after durable admission
+                    locked, resume, peer_gate, peer_done = (threading.Event() for _ in range(4))
+                    outcomes = []
+                    real_flock = fcntl.flock
+                    def flock(fd, operation):
+                        if threading.current_thread().name == 'replacement' and operation == fcntl.LOCK_EX | fcntl.LOCK_NB:
+                            real_flock(fd, operation)
+                            locked.set()
+                            if not resume.wait(5):
+                                raise AssertionError('handoff test timed out')
+                            return
+                        if threading.current_thread().name == 'peer' and operation == fcntl.LOCK_EX:
+                            peer_gate.set()
+                        return real_flock(fd, operation)
+                    def replace():
+                        if reconciling:
+                            with patch.object(sys, 'argv', ['reconcile', '--state', str(state), '--inspect']):
+                                outcomes.append(reconcile.main())
+                            return
+                        with ExitStack() as stack:
+                            try:
+                                admission.Attempt.start(state, abandoned, stack)
+                                outcomes.append('replacement admitted')
+                            except admission.Latched:
+                                outcomes.append('replacement stopped')
+                    def complete_peer():
+                        try:
+                            if publishing:
+                                outcomes.append(peer.finish('', self.report))
+                            else:
+                                with ExitStack() as stack:
+                                    admission.Attempt.start(state, peer_lane, stack)
+                                    outcomes.append('peer admitted')
+                        except admission.Latched:
+                            outcomes.append('peer stopped')
+                        finally:
+                            peer_done.set()
+                    with patch.object(admission.fcntl, 'flock', side_effect=flock), patch.object(subprocess, 'run') as run:
+                        replacement = threading.Thread(target=replace, name='replacement')
+                        other = threading.Thread(target=complete_peer, name='peer')
+                        replacement.start()
+                        self.assertTrue(locked.wait(5))
+                        other.start()
+                        self.assertTrue(peer_gate.wait(5))
+                        try:
+                            self.assertFalse(peer_done.wait(0.05))
+                        finally:
+                            resume.set()
+                            replacement.join(5)
+                            other.join(5)
+                        self.assertFalse(replacement.is_alive() or other.is_alive())
+                        run.assert_not_called()
+                    self.assertIn(1 if reconciling else 'replacement stopped', outcomes)
+                    self.assertIn(False if publishing else 'peer stopped', outcomes)
+                    self.assertTrue(admission.load(state)['failed'])
+                    self.assertIn('stop_reason', json.loads((state / 'status.json').read_text()))

@@ -25,10 +25,12 @@ def main():
         ap.error('clearing requires exact latch, authority and reconciliation evidence')
     try:
         with ExitStack() as stack:
+            # Match scheduled admission's gate-before-lane-lock order. Even a
+            # refused reconcile must not disguise an interrupted peer as live.
+            stack.enter_context(gate(args.state))
             for filename in LANES.values():
                 lock = stack.enter_context((args.state / filename).open('a'))
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            stack.enter_context(gate(args.state))
             record = load(args.state)
             digest = binding(args.state)
             if args.inspect:
