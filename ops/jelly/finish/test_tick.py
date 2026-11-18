@@ -74,9 +74,6 @@ else:
                 self.assertIn('current_status_unavailable' if failure == 'status' else 'dependency_failed', notification)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 class StderrTailTest(unittest.TestCase):
     def setUp(self):
         sys.path.insert(0, str(Path(__file__).parent))
@@ -102,3 +99,7 @@ class StderrTailTest(unittest.TestCase):
             with self.assertRaises(subprocess.TimeoutExpired):
                 self.tick.run_cli([sys.executable, '-c', "import sys,time;print('before_timeout',file=sys.stderr,flush=True);time.sleep(10)"], path, timeout=0.2)
             self.assertIn('before_timeout', json.loads((path / 'cli-stderr.json').read_text())['tail'])
+
+
+if __name__ == '__main__':
+    unittest.main()

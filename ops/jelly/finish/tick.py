@@ -53,6 +53,7 @@ def run_cli(command, attempt, timeout=270):
         for key, value in os.environ.items():
             if value and len(value) >= 4 and any(x in key.upper() for x in ('TOKEN', 'PASSWORD', 'SECRET', 'DATABASE_URL', 'API_KEY')):
                 text = text.replace(value, '[redacted]')
+        text = text.encode('utf-8')[-STDERR_TAIL_BYTES:].decode('utf-8', errors='ignore')
         publish(attempt / 'cli-stderr.json', {'tail': text, 'limit_bytes': STDERR_TAIL_BYTES,
                                              'truncated': truncated})
 

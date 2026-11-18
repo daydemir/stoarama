@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/puddle/v2"
 )
 
 type finishStatement string
@@ -43,6 +44,8 @@ const (
 	finishDBConnection       finishDBCause = "connection_error"
 	finishDBClosed           finishDBCause = "connection_closed"
 	finishDBOther            finishDBCause = "database_error"
+	finishDBConfig           finishDBCause = "invalid_database_config"
+	finishDBPoolClosed       finishDBCause = "pool_closed"
 )
 
 // Only typed, non-secret diagnostics cross the status/stderr boundary. Driver
@@ -70,7 +73,12 @@ func finishDBError(statement finishStatement, tier finishTier, err error) error 
 	var dns *net.DNSError
 	var network net.Error
 	var connect *pgconn.ConnectError
+	var parse *pgconn.ParseConfigError
 	switch {
+	case errors.As(err, &parse):
+		e.Cause = finishDBConfig
+	case errors.Is(err, puddle.ErrClosedPool):
+		e.Cause = finishDBPoolClosed
 	case errors.As(err, &pg):
 		e.SQLState = pg.Code
 		e.Cause = finishDBSQL
