@@ -778,6 +778,10 @@ class Config:
             raise SystemExit("invalid NAS inventory scan cadence")
         if self.min_free_bytes < 1:
             raise SystemExit("STOARAMA_MIN_FREE_BYTES must be positive")
+        # Parse the stitch resource overrides at startup so a typo fails the
+        # process with a clear error instead of holding every lease later.
+        stitch_min_memory_bytes()
+        stitch_max_load_per_cpu()
 
 
 def boot_id():
@@ -47095,12 +47099,63 @@ STITCH_POLICY = "v85r"
 STITCH_REVISION = "v85r-rebuilt-1"
 STITCH_CORPUS_SHA = "5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b"
 STITCH_MAX_INPUT = 2_500_000_000
-STITCH_MIN_MEMORY = 384 * 1024 * 1024
+# Today's values, kept as the defaults of the two operator overrides below. Both
+# the pre-lease gate and the 5s mid-job refresh read them through these
+# functions, so a hosted worker with different headroom can be admitted without
+# editing the pinned client.
+STITCH_DEFAULT_MIN_MEMORY_BYTES = 384 * 1024 * 1024
+STITCH_DEFAULT_MAX_LOAD_PER_CPU = 1.5
+STITCH_MIN_MEMORY_ENV = "STOARAMA_STITCH_MIN_MEMORY_BYTES"
+STITCH_MAX_LOAD_PER_CPU_ENV = "STOARAMA_STITCH_MAX_LOAD_PER_CPU"
+
+
+def stitch_min_memory_bytes():
+    """Minimum free memory in bytes. Fail fast: never fall back silently."""
+    raw = os.environ.get(STITCH_MIN_MEMORY_ENV, "").strip()
+    if not raw:
+        return STITCH_DEFAULT_MIN_MEMORY_BYTES
+    try:
+        value = int(raw, 10)
+    except ValueError as exc:
+        raise SystemExit("%s must be an integer number of bytes" % STITCH_MIN_MEMORY_ENV) from exc
+    if value <= 0:
+        raise SystemExit("%s must be positive" % STITCH_MIN_MEMORY_ENV)
+    return value
+
+
+def stitch_max_load_per_cpu():
+    """Maximum load1 per CPU. Fail fast: never fall back silently."""
+    raw = os.environ.get(STITCH_MAX_LOAD_PER_CPU_ENV, "").strip()
+    if not raw:
+        return STITCH_DEFAULT_MAX_LOAD_PER_CPU
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise SystemExit("%s must be a number" % STITCH_MAX_LOAD_PER_CPU_ENV) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise SystemExit("%s must be a positive finite number" % STITCH_MAX_LOAD_PER_CPU_ENV)
+    return value
+
+
 STITCH_ACTIVE = threading.Event()
 STITCH_STATUS = CleanupStatus()
 
 
 class StitchHold(RuntimeError):
+    pass
+
+
+# Two mutually exclusive hold kinds. RESOURCE holds describe the host right now
+# (memory, load, free disk, a lost mount, a maintenance fence); the task is fine
+# and must be retried later, so they never post a result. TASK holds describe
+# this hour's own bytes (a missing/invalid sidecar, unreadable media metadata, a
+# plan whose data no longer matches), so they are terminal for this hour and the
+# client reports every input as left out instead of re-leasing forever.
+class StitchResourceHold(StitchHold):
+    pass
+
+
+class StitchTaskFailure(StitchHold):
     pass
 
 
@@ -47112,7 +47167,8 @@ class StitchNativeFailure(StitchHold):
 
 def stitch_check(stop):
     if stop.is_set():
-        raise StitchHold("stitch cancelled or expired")
+        # Stop objects carry their latch reason; a bare Event does not.
+        raise StitchHold(getattr(stop, "reason", "") or "stitch cancelled or expired")
 
 
 def stitch_read(source, size, stop):
@@ -47166,7 +47222,11 @@ def stitch_directory_entries(descriptor, stop):
 
 
 def stitch_resources(cfg, input_bytes=0):
-    """Unknown resource telemetry is HOLD. Consult cgroup headroom as well."""
+    """Unknown resource telemetry is HOLD. Consult cgroup headroom as well.
+
+    Every failure here is a host condition, not the task's data: it releases the
+    lease without a result and retries later.
+    """
     import shutil
     _, memory = meminfo_bytes(_read_text("/proc/meminfo"))
     try:
@@ -47182,25 +47242,27 @@ def stitch_resources(cfg, input_bytes=0):
             memory = min(memory, limit - used)
         except (OSError, ValueError):
             if cgroup_memory_limit():
-                raise StitchHold("cgroup memory usage unavailable")
+                raise StitchResourceHold("cgroup memory usage unavailable")
     try:
         cpus = len(os.sched_getaffinity(0))
     except AttributeError:
         cpus = os.cpu_count() or 1
     cpus = min(cpus, cgroup_cpu_limit() or cpus)
     load = os.getloadavg()[0]
-    if memory < STITCH_MIN_MEMORY or load > 1.5 * max(1, cpus):
-        raise StitchHold("NAS memory or load critical")
+    # Read the operator overrides on every call: the mid-job refresh re-checks
+    # them at the same rate the fixed values used to be read.
+    if memory < stitch_min_memory_bytes() or load > stitch_max_load_per_cpu() * max(1, cpus):
+        raise StitchResourceHold("NAS memory or load critical")
     if not os.path.ismount(str(cfg.output_dir)):
-        raise StitchHold("NAS output root is not mounted")
+        raise StitchResourceHold("NAS output root is not mounted")
     if shutil.disk_usage(cfg.output_dir).free < max(cfg.min_free_bytes, 1024**3) + int(input_bytes * 2.2):
-        raise StitchHold("NAS free-space reserve reached")
+        raise StitchResourceHold("NAS free-space reserve reached")
 
 
 def stitch_priority():
     import shutil
     if not sys.platform.startswith("linux") or not shutil.which("nice") or not shutil.which("ionice"):
-        raise StitchHold("Linux nice/ionice required for stitch lane")
+        raise StitchResourceHold("Linux nice/ionice required for stitch lane")
     tid = threading.get_native_id()
     os.setpriority(os.PRIO_PROCESS, tid, 19)
     subprocess.run(["ionice", "-c", "3", "-p", str(tid)], check=True,
@@ -47772,6 +47834,10 @@ def stitch_measure_error(exc):
     try:
         return StitchMeasureError(type(exc).__name__)
     except ValueError:
+        # The two typed hold kinds keep the existing proof diagnostic
+        # vocabulary; they are ordinary holds for measurement purposes.
+        if isinstance(exc, StitchHold):
+            return StitchMeasureError.STITCH_HOLD
         return StitchMeasureError.IO if isinstance(exc, OSError) else StitchMeasureError.UNEXPECTED
 
 
@@ -48536,10 +48602,10 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
     plan = task["plan"]
     if (plan.get("policy") != STITCH_POLICY or plan.get("revision") != STITCH_REVISION
             or plan.get("corpus_sha256") != STITCH_CORPUS_SHA or plan.get("keep_policy_sha256") != CLEANUP_KEEP28_POLICY_SHA256):
-        raise StitchHold("unapproved V85 policy identity")
+        raise StitchTaskFailure("unapproved V85 policy identity")
     clips, joins = plan["clips"], plan["joins"]
     if not 1 <= len(clips) <= 200 or len(joins) != len(clips) - 1 or len(plan.get("eligible", [])) != len(clips) or sum(c["size_bytes"] for c in clips) > STITCH_MAX_INPUT:
-        raise StitchHold("unbounded assembly unit")
+        raise StitchTaskFailure("unbounded assembly unit")
     folder = "_V85r_proof_keep28_v2/" if kind is StitchRunKind.PROOF else "_V85r_keep28/"
     suffix = "/proof-" + STITCH_PROOF_SOURCE_SHA[:16] if kind is StitchRunKind.PROOF else ""
     if kind is StitchRunKind.PROOF and hasattr(proof_stop,"evidence_context"):
@@ -48547,7 +48613,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
         suffix += "/run-"+proof_stop.run_id
     expected = clips[0]["relative_path"].split("/")[0] + folder + str(plan["recording_id"]) + "/"
     if (not plan["output_folder"].startswith(expected) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}-00-00Z" + re.escape(suffix), plan["output_folder"][len(expected):])):
-        raise StitchHold("output must be in the stream's new versioned sibling folder")
+        raise StitchTaskFailure("output must be in the stream's new versioned sibling folder")
     stop = proof_stop if kind is StitchRunKind.PROOF else StitchStop(cfg, stop_event, task if admitted is None else None, kind)
     deadline = (stop.deadline if kind is StitchRunKind.PROOF else min(time.monotonic() + 7000,
         time.monotonic() + (parse_certification_timestamp(task["expires_at"], "stitch lease")
@@ -48589,7 +48655,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
         if admitted is None:
             inputs = plan.get("feature_inputs", [])
             if len(inputs) != len(clips):
-                raise StitchHold("V85r feature metadata missing")
+                raise StitchTaskFailure("V85r feature metadata missing")
             clips = [dict(c, feature_input=f) for c, f in zip(clips, inputs)]
         for index in range(1, len(clips)):
             a, b = clips[index-1:index+1]
@@ -48680,18 +48746,18 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
             pins, error = cleanup_pins()
             key = cleanup_folder_key(clip["relative_path"], "raw")
             if error or pins["folders"].get(key) != plan["stream_id"] or clip["stream_id"] != plan["stream_id"]:
-                raise StitchHold("raw folder is not owned by approved stream")
+                raise StitchTaskFailure("raw folder is not owned by approved stream")
             start, end, _ = pins["windows"][plan["stream_id"]]
             a = parse_certification_timestamp(clip["start_at"], "source start")
             b = parse_certification_timestamp(clip["end_at"], "source end")
             if a < start or b > end or b <= a:
-                raise StitchHold("source crosses keep boundary")
+                raise StitchTaskFailure("source crosses keep boundary")
             path, info, _ = stitch_hash(cfg, clip["relative_path"], clip["size_bytes"], clip["sha256"], stop)
             if sys.platform.startswith("linux"):
                 fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
                 resources.callback(os.close, fd)
                 if cleanup_identity(os.fstat(fd)) != cleanup_identity(info):
-                    raise StitchHold("source identity changed before native audit")
+                    raise StitchTaskFailure("source identity changed before native audit")
                 path = Path("/proc/%d/fd/%d" % (os.getpid(), fd))
             sidecar, scinfo = confined_regular_file(cfg.output_dir, clip["relative_path"] + ".stoarama.json")
             clip.update(frozen_identity=cleanup_identity(info), frozen_sidecar_identity=cleanup_identity(scinfo), _path=path)
@@ -50503,6 +50569,29 @@ def stitch_register(cfg, inventory, task_id, result):
     log("INFO", "V85r task=%s registered outputs=%d retained=%d" % (task_id, len(result["outputs"]), len(result["left_out"])))
 
 
+def stitch_hold_task(cfg, inventory, task, reason):
+    """Report a terminal task-data hold once and never re-lease the hour.
+
+    There are no outputs to register locally, so this posts the result only and
+    leaves the task in the server's terminal `held` state with the reason
+    recorded. No readiness/cleanup-plan path runs.
+    """
+    result = dict(policy=STITCH_POLICY, lease_token=task["lease_token"], plan_sha256=task["plan_sha256"],
+                  outputs=[], repairs=[], left_out=[c["source_id"] for c in task["plan"]["clips"]],
+                  seams=[dict(policy=STITCH_POLICY, decision="hold", join=False, nomination=False,
+                              status="HELD_task_data", reason=reason[:200], frozen=False,
+                              left_id=task["plan"]["clips"][n]["source_id"],
+                              right_id=task["plan"]["clips"][n + 1]["source_id"])
+                         for n in range(len(task["plan"]["clips"]) - 1)],
+                  error=reason[:1000])
+    ack = restore_api(cfg, "/account/connections/stitch/%d/result" % task["id"], result)
+    if ack.get("recorded") is not True or ack.get("id") != task["id"]:
+        raise StitchHold("server held-result registration not acknowledged")
+    stitch_journal(inventory, task["id"], task["plan_sha256"], result, registered=True)
+    STITCH_STATUS.update(state="held", task_id=task["id"], held_reason=reason[:300], completed_at=utc_now())
+    log("WARN", "V85r task=%s held on task data: %s" % (task["id"], reason[:300]))
+
+
 def stitch_once(cfg, inventory, stop_event):
     if not getattr(cfg, "stitch_enabled", False):
         return 30
@@ -50533,9 +50622,22 @@ def stitch_once(cfg, inventory, stop_event):
     stitch_resources(cfg, sum(c["size_bytes"] for c in task["plan"]["clips"]))
     result = stitch_journal(inventory, task["id"], task["plan_sha256"])
     if result is None:
-        stitch_corpus(cfg)
-        tools = stitch_v85r_tools(cfg, time.monotonic() + BENCHMARK_TOOL_INSTALL_SEC, stop_event)
-        result = stitch_build(cfg, inventory, task, stop_event, tools)
+        try:
+            stitch_corpus(cfg)
+            tools = stitch_v85r_tools(cfg, time.monotonic() + BENCHMARK_TOOL_INSTALL_SEC, stop_event)
+            result = stitch_build(cfg, inventory, task, stop_event, tools)
+        except StitchResourceHold:
+            # Host conditions (memory, load, free disk, lost mount, maintenance
+            # fence, cancellation) release the lease without a result and retry
+            # later. A plain StitchHold also propagates untouched: it is
+            # transient or environmental, never this hour's own data.
+            raise
+        except (StitchTaskFailure, MediaCertificationError) as exc:
+            # This hour's own bytes are unusable: missing/invalid sidecar,
+            # unreadable media metadata, or a plan whose data no longer matches.
+            # Report it once instead of re-leasing the same hour forever.
+            stitch_hold_task(cfg, inventory, task, str(exc))
+            return 30
     result["lease_token"] = task["lease_token"]
     stitch_journal(inventory, task["id"], task["plan_sha256"], result)
     stitch_register(cfg, inventory, task["id"], result)

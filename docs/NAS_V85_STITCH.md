@@ -166,6 +166,23 @@ additionally requires the effective stitch flag, `NAS_CLEANUP_DELETION_ENABLED`,
 scope `deletion_approved`, receipts and every existing fresh inclusion/output
 proof and retirement gate.
 
+## Resource admission overrides
+
+The resource gate is checked before every lease and again by the 5s mid-job
+refresh. Two container variables adjust it without editing the pinned client:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `STOARAMA_STITCH_MIN_MEMORY_BYTES` | `402653184` (384 MiB) | Minimum free memory, integer bytes |
+| `STOARAMA_STITCH_MAX_LOAD_PER_CPU` | `1.5` | Maximum load1 per usable CPU, float |
+
+Defaults are exactly the previously hard-coded values, so an unset environment
+behaves as before. A non-numeric, non-finite or non-positive value fails the
+process at startup with a clear error; there is no silent fallback to the
+default. Both variables govern the pre-lease check and the refresh, so a running
+job is re-evaluated under the configured limits. A resource hold is never
+reported as a task result: it releases the lease and retries later.
+
 ## One-stream pilot procedure (operator action after review)
 
 No commands below were run against production for this PR.

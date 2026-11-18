@@ -117,3 +117,80 @@ func TestNASStitchUnretiredPlanWouldBlockTheLane(t *testing.T) {
 		t.Fatalf("undeleted plan did not hold the lane: %s", w.Body.String())
 	}
 }
+
+// The client reports a deterministic per-task failure exactly once, with every
+// input left out and every seam a hold (no outputs). That must be a valid,
+// terminal `held` task, not a 400 the client would retry forever.
+func TestNASStitchTaskDataHoldIsAcceptedAndTerminal(t *testing.T) {
+	f, p, q := newNASStitchTaskFixture(t)
+	f.s.cfg.NASStitchEnabled = true
+	// Mirror the client's stitch_hold_task payload exactly.
+	held := nasStitchResult{Policy: nasStitchPolicy, Token: q.Token, PlanSHA: q.PlanSHA,
+		Outputs: []nasStitchOutput{}, Repairs: []nasStitchRepair{},
+		LeftOut: []int64{p.Clips[0].SourceID, p.Clips[1].SourceID, p.Clips[2].SourceID},
+		Seams: []nasStitchDecision{
+			{Policy: nasStitchPolicy, LeftID: p.Clips[0].SourceID, RightID: p.Clips[1].SourceID, Status: "HELD_task_data", Decision: "hold", Reason: "stitch sidecar is invalid"},
+			{Policy: nasStitchPolicy, LeftID: p.Clips[1].SourceID, RightID: p.Clips[2].SourceID, Status: "HELD_task_data", Decision: "hold", Reason: "stitch sidecar is invalid"},
+		},
+		Error: "stitch sidecar is invalid"}
+	if items, err := validateNASStitchResult(p, held); err != nil || len(items) != 0 {
+		t.Fatalf("held result not valid terminal evidence: %v %v", items, err)
+	}
+	raw, err := json.Marshal(held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body any
+	if err = json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	if w := cleanupCall(t, f.s.handleAccountNASStitchResult, 47, 5, "id", "7", body); w.Code != 200 {
+		t.Fatalf("held result rejected: %d %s", w.Code, w.Body.String())
+	}
+	var state string
+	var planID *int64
+	if err = f.pool.QueryRow(f.ctx, `SELECT state,cleanup_plan_id FROM nas_stitch_tasks WHERE id=7`).Scan(&state, &planID); err != nil {
+		t.Fatal(err)
+	}
+	if state != "held" || planID != nil {
+		t.Fatalf("held task not terminal: %q %v", state, planID)
+	}
+	// The reason is recorded verbatim on the immutable result.
+	var stored []byte
+	if err = f.pool.QueryRow(f.ctx, `SELECT result FROM nas_stitch_tasks WHERE id=7`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	var round nasStitchResult
+	if err = json.Unmarshal(stored, &round); err != nil || !strings.Contains(round.Error, "sidecar") {
+		t.Fatalf("held reason not recorded: %s %v", stored, err)
+	}
+	// `held` is terminal for the hour: no re-lease, and the lane moves on.
+	hourPlan, _ := json.Marshal(p)
+	if _, err = f.pool.Exec(f.ctx, `INSERT INTO nas_stitch_tasks(id,scope_id,recording_id,hour_at,plan,plan_sha256) VALUES(8,1,2,'2026-09-20T01:00Z',$1,$2)`, string(hourPlan), q.PlanSHA); err != nil {
+		t.Fatal(err)
+	}
+	w := cleanupCall(t, f.s.handleAccountNASStitchLease, 47, 5, "", "", map[string]any{})
+	var lease struct {
+		Task *nasStitchTask `json:"task"`
+	}
+	if json.Unmarshal(w.Body.Bytes(), &lease) != nil || lease.Task == nil || lease.Task.ID != 8 {
+		t.Fatalf("held hour was re-leased or blocked the lane: %s", w.Body.String())
+	}
+}
+
+// Held results are idempotent: a lost ACK repeats without mutating evidence.
+func TestNASStitchTaskDataHoldReplayIsIdempotent(t *testing.T) {
+	f, p, q := newNASStitchTaskFixture(t)
+	f.s.cfg.NASStitchEnabled = true
+	held := nasStitchResult{Policy: nasStitchPolicy, Token: q.Token, PlanSHA: q.PlanSHA,
+		Outputs: []nasStitchOutput{}, Repairs: []nasStitchRepair{}, LeftOut: []int64{1, 2, 3},
+		Seams: []nasStitchDecision{
+			{Policy: nasStitchPolicy, LeftID: p.Clips[0].SourceID, RightID: p.Clips[1].SourceID, Status: "HELD_task_data", Decision: "hold", Reason: "bad media"},
+			{Policy: nasStitchPolicy, LeftID: p.Clips[1].SourceID, RightID: p.Clips[2].SourceID, Status: "HELD_task_data", Decision: "hold", Reason: "bad media"},
+		}, Error: "bad media"}
+	for n := 0; n < 3; n++ {
+		if w := cleanupCall(t, f.s.handleAccountNASStitchResult, 47, 5, "id", "7", held); w.Code != 200 {
+			t.Fatalf("replay %d: %d %s", n, w.Code, w.Body.String())
+		}
+	}
+}
