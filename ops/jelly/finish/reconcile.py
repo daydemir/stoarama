@@ -35,7 +35,7 @@ def main():
             attempts = attempt_paths(args.state, record)
             digest = binding(args.state)
             if args.inspect:
-                print(json.dumps({'latch_sha256': digest, 'journal': record, 'attempts': [p.name for p in attempts], 'attempts': [p.name for p in attempts]}))
+                print(json.dumps({'latch_sha256': digest, 'journal': record, 'attempts': [p.name for p in attempts]}))
                 return 0
             authority_bytes, evidence_bytes = args.authority.read_bytes(), args.evidence.read_bytes()
             authority, evidence = json.loads(authority_bytes), json.loads(evidence_bytes)
