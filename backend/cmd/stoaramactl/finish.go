@@ -102,32 +102,33 @@ const (
 )
 
 type finishStatus struct {
-	RefreshAdmittedItems        int              `json:"refresh_admitted_items"`
-	RefreshHeldItems            int              `json:"refresh_held_items"`
-	RefreshHold                 finishLateHold   `json:"refresh_hold_reason,omitempty"`
-	NASStorageBudgetAt          *time.Time       `json:"nas_storage_budget_at,omitempty"`
-	NASSpaceClientVersion       string           `json:"nas_storage_client_version"`
-	ImportedHistoricalInventory int              `json:"imported_historical_inventory"`
-	ImportedEarlyUnknown        int              `json:"imported_early_unknown"`
-	ImportedLateUnknown         int              `json:"imported_late_unknown"`
-	NASSpaceCheckedAt           time.Time        `json:"nas_space_checked_at"`
-	NASFreeBytes                *int64           `json:"nas_storage_free_bytes,omitempty"`
-	NASSpaceReportedAt          *time.Time       `json:"nas_storage_reported_at,omitempty"`
-	LateTierHold                finishLateHold   `json:"late_tier_hold_reason,omitempty"`
-	LateTierBudgetBytes         int64            `json:"late_tier_budget_bytes"`
-	QueueReservedBytes          int64            `json:"queue_reserved_bytes"`
-	Schema                      string           `json:"schema"`
-	UpdatedAt                   time.Time        `json:"updated_at"`
-	Stop                        finishStop       `json:"stop_reason,omitempty"`
-	QueueDepth                  int64            `json:"queue_depth"`
-	ItemsPerMinute              float64          `json:"items_per_min"`
-	Copy                        finishCopy       `json:"copy"`
-	Holds                       map[string]int64 `json:"holds_by_reason"`
-	CleanupShouldRun            bool             `json:"cleanup_should_run"`
-	CleanupReason               string           `json:"cleanup_reason"`
-	ImportedItems               int              `json:"imported_items"`
-	ImportedManifests           int              `json:"imported_manifests"`
-	Exhausted                   bool             `json:"candidates_exhausted"`
+	RefreshAdmittedItems        int                    `json:"refresh_admitted_items"`
+	RefreshHeldItems            int                    `json:"refresh_held_items"`
+	RefreshHold                 finishLateHold         `json:"refresh_hold_reason,omitempty"`
+	NASStorageBudgetAt          *time.Time             `json:"nas_storage_budget_at,omitempty"`
+	NASSpaceClientVersion       string                 `json:"nas_storage_client_version"`
+	ImportedHistoricalInventory int                    `json:"imported_historical_inventory"`
+	ImportedEarlyUnknown        int                    `json:"imported_early_unknown"`
+	ImportedLateUnknown         int                    `json:"imported_late_unknown"`
+	NASSpaceCheckedAt           time.Time              `json:"nas_space_checked_at"`
+	NASFreeBytes                *int64                 `json:"nas_storage_free_bytes,omitempty"`
+	NASSpaceReportedAt          *time.Time             `json:"nas_storage_reported_at,omitempty"`
+	LateTierHold                finishLateHold         `json:"late_tier_hold_reason,omitempty"`
+	LateTierBudgetBytes         int64                  `json:"late_tier_budget_bytes"`
+	QueueReservedBytes          int64                  `json:"queue_reserved_bytes"`
+	Schema                      string                 `json:"schema"`
+	UpdatedAt                   time.Time              `json:"updated_at"`
+	DatabaseFailure             *finishDatabaseFailure `json:"database_failure,omitempty"`
+	Stop                        finishStop             `json:"stop_reason,omitempty"`
+	QueueDepth                  int64                  `json:"queue_depth"`
+	ItemsPerMinute              float64                `json:"items_per_min"`
+	Copy                        finishCopy             `json:"copy"`
+	Holds                       map[string]int64       `json:"holds_by_reason"`
+	CleanupShouldRun            bool                   `json:"cleanup_should_run"`
+	CleanupReason               string                 `json:"cleanup_reason"`
+	ImportedItems               int                    `json:"imported_items"`
+	ImportedManifests           int                    `json:"imported_manifests"`
+	Exhausted                   bool                   `json:"candidates_exhausted"`
 }
 
 func finishFresh(t, now time.Time) bool {
@@ -206,7 +207,7 @@ func finishCheck(ctx context.Context, pool *pgxpool.Pool, s finishSafety, c fini
 		if errors.Is(err, pgx.ErrNoRows) {
 			return finishRecoveryStale
 		}
-		return finishDatabase
+		return finishDBError(finishRecoveryQuery, 0, err)
 	}
 	if s.RecoveryCheckedAt.IsZero() || time.Since(s.RecoveryCheckedAt) > finishRecoveryAge || time.Until(s.RecoveryCheckedAt) > 30*time.Second || !s.RecoveryCheckedAt.After(newestIssued) || s.RecoveryIssued < 0 || s.RecoveryVerified != s.RecoveryIssued || issued != s.RecoveryIssued || planSHA != s.RecoveryPlanSHA {
 		return finishRecoveryStale
@@ -236,7 +237,7 @@ func finishCheck(ctx context.Context, pool *pgxpool.Pool, s finishSafety, c fini
 	var unknown bool
 	err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_plans WHERE mode='enabled' AND NOT(id=ANY($1::bigint[]))) OR EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled' AND NOT(id=ANY($2::bigint[])))`, s.KnownPlans, s.KnownBatches).Scan(&unknown)
 	if err != nil {
-		return finishDatabase
+		return finishDBError(finishEnabledQuery, 0, err)
 	}
 	if unknown {
 		return finishUnknownPlan
@@ -261,11 +262,18 @@ WHERE c.purged_at IS NULL AND c.clip_start_at<w.end_at AND c.clip_end_at>w.start
  AND NOT EXISTS(SELECT 1 FROM nas_r2_copy_items q WHERE q.connection_id=13 AND q.kind='raw' AND q.source_id=c.id)
  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_incident_sources i WHERE i.clip_id=c.id)
  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_incident_roster i WHERE (i.kind='raw' AND i.source_id=c.id) OR (i.bucket=c.bucket AND i.object_key=c.object_key))
- AND NOT EXISTS(SELECT 1 FROM nas_cleanup_reserved_files f WHERE f.kind='raw' AND f.source_id=c.id)
  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id WHERE h.clip_id=c.id AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued)))
  AND NOT EXISTS(SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='raw' AND x.source_id=c.id)
  AND NOT EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.kind='raw' AND x.source_id=c.id)`
 const finishCandidateSelectSQL = `SELECT c.id,c.recording_id,r.stream_id,c.bucket,c.object_key,c.display_path,c.size_bytes,lower(c.sha256),c.clip_start_at,c.clip_end_at `
+
+// Fence the selective catalog/inventory/hold joins before the indexed reservation
+// function. Otherwise PostgreSQL pushes that function down to every catalog row.
+func finishCandidateSQL(predicate string) string {
+	return finishWindowSQL + `, eligible(id,recording_id,stream_id,bucket,object_key,display_path,size_bytes,sha256,clip_start_at,clip_end_at) AS MATERIALIZED (` +
+		finishCandidateSelectSQL + finishEligibleSQL + ` AND ` + predicate +
+		`) SELECT * FROM eligible c WHERE NOT nas_cleanup_file_reserved('raw',c.id) ORDER BY c.stream_id,c.id LIMIT $3`
+}
 
 func finishPolicyJSON() ([]byte, error) {
 	_, windows, err := api.Keep28Policy()
@@ -317,12 +325,12 @@ func finishCandidates(ctx context.Context, pool *pgxpool.Pool, limit int) ([]api
 	} {
 		tx, err := beginFinishCandidateTx(ctx, pool)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, finishDBError(finishCandidateBegin, selection.tier, err)
 		}
-		rows, err := tx.Query(ctx, finishWindowSQL+finishCandidateSelectSQL+finishEligibleSQL+` AND `+selection.predicate+` ORDER BY r.stream_id,c.id LIMIT $3`, data, api.NASR2CopyMaxFile, limit)
+		rows, err := tx.Query(ctx, finishCandidateSQL(selection.predicate), data, api.NASR2CopyMaxFile, limit)
 		if err != nil {
 			rollbackFinishCandidateTx(tx)
-			return nil, 0, err
+			return nil, 0, finishDBError(finishCandidateQuery, selection.tier, err)
 		}
 		items := []api.NASR2CopyItem{}
 		for rows.Next() {
@@ -330,7 +338,7 @@ func finishCandidates(ctx context.Context, pool *pgxpool.Pool, limit int) ([]api
 			if err = rows.Scan(&i.SourceID, &i.RecordingID, &i.StreamID, &i.Bucket, &i.ObjectKey, &i.RelativePath, &i.SizeBytes, &i.SHA256, &i.StartAt, &i.EndAt); err != nil {
 				rows.Close()
 				rollbackFinishCandidateTx(tx)
-				return nil, 0, err
+				return nil, 0, finishDBError(finishCandidateScan, selection.tier, err)
 			}
 			items = append(items, i)
 		}
@@ -338,11 +346,11 @@ func finishCandidates(ctx context.Context, pool *pgxpool.Pool, limit int) ([]api
 		rows.Close()
 		if err != nil {
 			rollbackFinishCandidateTx(tx)
-			return nil, 0, err
+			return nil, 0, finishDBError(finishCandidateQuery, selection.tier, err)
 		}
 		if err = tx.Commit(ctx); err != nil {
 			rollbackFinishCandidateTx(tx)
-			return nil, 0, err
+			return nil, 0, finishDBError(finishCandidateCommit, selection.tier, err)
 		}
 		if len(items) > 0 {
 			return items, selection.tier, nil
@@ -451,18 +459,19 @@ func finishTickWithRefresh(ctx context.Context, pool *pgxpool.Pool, safetyPath, 
 				stop = finishImport
 			}
 			status.Stop = stop
+			errors.As(err, &status.DatabaseFailure)
 			status.CleanupShouldRun = false
 			status.CleanupReason = "safety_stop"
 		}
 	}()
 	conn, e := pool.Acquire(ctx)
 	if e != nil {
-		return status, finishDatabase
+		return status, finishDBError(finishPoolAcquire, 0, e)
 	}
 	defer conn.Release()
 	var locked bool
 	if e = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, finishLock).Scan(&locked); e != nil {
-		return status, finishDatabase
+		return status, finishDBError(finishTickLock, 0, e)
 	}
 	if !locked {
 		return status, finishBusy
@@ -491,16 +500,16 @@ func finishTickWithRefresh(ctx context.Context, pool *pgxpool.Pool, safetyPath, 
 			return status, e
 		}
 		if e = finishDepth(ctx, pool, &status); e != nil {
-			return status, finishDatabase
+			return status, finishDBError(finishQueueDepth, 0, e)
 		}
 		if e = finishCleanupValve(ctx, pool, &status); e != nil {
-			return status, finishDatabase
+			return status, finishDBError(finishStorageQuery, 0, e)
 		}
 		if !refreshFed {
 			refreshFed = true
 			var refreshDepth int
 			if e = pool.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE connection_id=13 AND state IN ('refresh_pending','refresh_leased')`).Scan(&refreshDepth); e != nil {
-				return status, finishDatabase
+				return status, finishDBError(finishRefreshDepth, 0, e)
 			}
 			slots := finishRefreshShare(int(status.QueueDepth), refreshDepth)
 			n, feedErr := feedKeep28Refresh(ctx, pool, refresh, slots, &status)
@@ -511,7 +520,7 @@ func finishTickWithRefresh(ctx context.Context, pool *pgxpool.Pool, safetyPath, 
 			status.ImportedItems += n
 			if n > 0 {
 				if e = finishDepth(ctx, pool, &status); e != nil {
-					return status, finishDatabase
+					return status, finishDBError(finishQueueDepth, 0, e)
 				}
 			}
 		}
@@ -531,7 +540,7 @@ func finishTickWithRefresh(ctx context.Context, pool *pgxpool.Pool, safetyPath, 
 			if errors.Is(e, finishEvidence) {
 				return status, e
 			}
-			return status, finishDatabase
+			return status, finishDBError(finishCandidateQuery, 0, e)
 		}
 		if len(items) == 0 {
 			status.Exhausted = true
@@ -539,7 +548,7 @@ func finishTickWithRefresh(ctx context.Context, pool *pgxpool.Pool, safetyPath, 
 		}
 		if tier == finishLateUnknown {
 			if e = finishCleanupValve(ctx, pool, &status); e != nil {
-				return status, finishDatabase
+				return status, finishDBError(finishStorageQuery, 0, e)
 			}
 			if !api.SupportsNASStorageBudget(status.NASSpaceClientVersion) {
 				status.LateTierHold = finishLateClientUnknown
@@ -557,7 +566,7 @@ func finishTickWithRefresh(ctx context.Context, pool *pgxpool.Pool, safetyPath, 
 				return status, nil
 			}
 			if e = pool.QueryRow(ctx, finishLateDebitsSQL, status.NASSpaceCheckedAt.Add(-finishLateDebitWindow)).Scan(&status.QueueReservedBytes); e != nil {
-				return status, finishDatabase
+				return status, finishDBError(finishDebitQuery, 0, e)
 			}
 
 			status.LateTierBudgetBytes = max(int64(0), *status.NASFreeBytes-api.NASR2CopyFloor-api.NASR2CopyRangeBytes-status.QueueReservedBytes)
@@ -657,13 +666,21 @@ func runFinish(ctx context.Context, cfg config.Config, args []string) int {
 			pool.Close()
 		}
 	}
+	if err != nil && status.DatabaseFailure == nil && status.Stop == finishDatabase {
+		err = finishDBError(finishPoolOpen, 0, err)
+		errors.As(err, &status.DatabaseFailure)
+	}
 	if finishWriteStatus(*out, status) != nil {
 		fmt.Fprintln(os.Stderr, finishOutput)
 		return 1
 	}
 	_ = json.NewEncoder(os.Stdout).Encode(status)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, status.Stop)
+		if status.DatabaseFailure != nil {
+			fmt.Fprintln(os.Stderr, status.DatabaseFailure)
+		} else {
+			fmt.Fprintln(os.Stderr, status.Stop)
+		}
 		return 1
 	}
 	return 0

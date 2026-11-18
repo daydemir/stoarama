@@ -76,3 +76,29 @@ else:
 
 if __name__ == '__main__':
     unittest.main()
+
+class StderrTailTest(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(Path(__file__).parent))
+        import tick
+        self.tick = tick
+
+    def test_failed_attempt_retains_bounded_redacted_tail(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            code = "import sys;sys.stderr.write('x'*100000+'\\npostgres://user:SECRET@host/db\\n'+'cause=statement_timeout tier=1 sqlstate=57014\\n');sys.exit(1)"
+            rc = self.tick.run_cli([sys.executable, '-c', code], path)
+            self.assertEqual(rc, 1)
+            tail = json.loads((path / 'cli-stderr.json').read_text())
+            self.assertTrue(tail['truncated'])
+            self.assertLessEqual(len(tail['tail'].encode()), self.tick.STDERR_TAIL_BYTES)
+            self.assertNotIn('SECRET', tail['tail'])
+            self.assertIn('sqlstate=57014', tail['tail'])
+            self.assertEqual((path / 'cli-stderr.json').stat().st_mode & 0o777, 0o600)
+
+    def test_timeout_still_retains_tail(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.tick.run_cli([sys.executable, '-c', "import sys,time;print('before_timeout',file=sys.stderr,flush=True);time.sleep(10)"], path, timeout=0.2)
+            self.assertIn('before_timeout', json.loads((path / 'cli-stderr.json').read_text())['tail'])

@@ -4,6 +4,8 @@ import argparse
 from contextlib import ExitStack
 import json
 import os
+import re
+import threading
 from pathlib import Path
 import subprocess
 from admission import Attempt, Latched, publish
@@ -11,6 +13,48 @@ from admission import Attempt, Latched, publish
 STOPS = {'evidence_unavailable', 'cleanup_recovery_problems', 'unknown_enabled_cleanup',
          'copy_mismatch_latched', 'shutdown_or_recovery_failed', 'deletion_master_mismatch',
          'database_unavailable', 'recovery_evidence_stale', 'manifest_import_failed', 'tick_already_running'}
+
+
+STDERR_TAIL_BYTES = 8192
+
+
+def run_cli(command, attempt, timeout=270):
+    """Drain stderr without unbounded memory/disk; retain even on timeout."""
+    tail = bytearray()
+    truncated = False
+    def drain(pipe):
+        nonlocal truncated
+        with pipe:
+            while True:
+                chunk = pipe.read(4096)
+                if not chunk:
+                    return
+                tail.extend(chunk)
+                if len(tail) > STDERR_TAIL_BYTES:
+                    truncated = True
+                    del tail[:-STDERR_TAIL_BYTES]
+    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    reader = threading.Thread(target=drain, args=(process.stderr,), daemon=True)
+    reader.start()
+    try:
+        return process.wait(timeout=timeout)
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        reader.join()
+        # Drop a partial first line so truncation cannot leave a URL credential
+        # without its scheme. Redact URLs and known environment secrets locally.
+        raw = bytes(tail)
+        if truncated:
+            raw = raw.partition(b'\n')[2]
+        text = raw.decode('utf-8', errors='replace')
+        text = re.sub(r'(?i)\b(?:postgres(?:ql)?|https?)://\S+', '[redacted-url]', text)
+        for key, value in os.environ.items():
+            if value and len(value) >= 4 and any(x in key.upper() for x in ('TOKEN', 'PASSWORD', 'SECRET', 'DATABASE_URL', 'API_KEY')):
+                text = text.replace(value, '[redacted]')
+        publish(attempt / 'cli-stderr.json', {'tail': text, 'limit_bytes': STDERR_TAIL_BYTES,
+                                             'truncated': truncated})
 
 
 def main():
@@ -48,9 +92,8 @@ def main():
             if args.refresh_picks is not None:
                 command += ['--refresh-picks', str(args.refresh_picks),
                             '--expected-refresh-picks-sha256', args.expected_refresh_picks_sha256]
-            result = subprocess.run(command,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=270)
-            publish(attempt.path / 'result.json', {'returncode': result.returncode})
+            returncode = run_cli(command, attempt.path)
+            publish(attempt.path / 'result.json', {'returncode': returncode})
             reason = 'current_status_unavailable'
             # This path did not exist before THIS invocation. Never report an old
             # reason if CLI startup/status publication failed. Same-filesystem
@@ -60,7 +103,7 @@ def main():
                 raise ValueError('invalid status')
             if current.get('stop_reason') in STOPS:
                 reason = current['stop_reason']
-            elif result.returncode or current.get('stop_reason'):
+            elif returncode or current.get('stop_reason'):
                 reason = 'manifest_import_failed'
             else:
                 if current.get('schema') != 'stoarama.finish-status.v1' or not isinstance(current.get('updated_at'), str):
