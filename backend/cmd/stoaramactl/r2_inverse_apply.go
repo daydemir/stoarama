@@ -35,15 +35,15 @@ type inverseDeleteStore interface {
 	deleteOnce(context.Context, *inverseDeleteAuthority) error
 }
 type inverseDrainEvidence struct {
-	Proof                  inverseDrainProof         `json:"proof"`
-	Bucket                 string                    `json:"bucket"`
-	EndpointSHA256         string                    `json:"endpoint_sha256"`
-	FenceActivatedAt       time.Time                 `json:"fence_activated_at"`
-	DrainNotBefore         time.Time                 `json:"drain_not_before"`
-	ObservedAt             time.Time                 `json:"observed_at"`
-	DeployedWriterCoverage string                    `json:"deployed_writer_coverage_evidence"`
-	AcceptedPUTCompletion  string                    `json:"accepted_put_completion_evidence"`
-	KeyPolicy              *inverseKeyPolicyEvidence `json:"key_policy,omitempty"`
+	Proof                  inverseDrainProof           `json:"proof"`
+	Bucket                 string                      `json:"bucket"`
+	EndpointSHA256         string                      `json:"endpoint_sha256"`
+	FenceActivatedAt       time.Time                   `json:"fence_activated_at"`
+	DrainNotBefore         time.Time                   `json:"drain_not_before"`
+	ObservedAt             time.Time                   `json:"observed_at"`
+	DeployedWriterCoverage string                      `json:"deployed_writer_coverage_evidence"`
+	AcceptedPUTCompletion  string                      `json:"accepted_put_completion_evidence"`
+	FencePolicy            *inverseFencePolicyEvidence `json:"fence_policy,omitempty"`
 }
 type inverseLane uint8
 
@@ -60,12 +60,13 @@ type inverseApplyOptions struct {
 	Workers                                                                            int
 }
 type inverseApplySummary struct {
-	Deleted          int64   `json:"deleted"`
-	Reconciled       int64   `json:"reconciled"`
-	AmbiguousHeld    int64   `json:"ambiguous_held"`
-	Bytes            int64   `json:"bytes"`
-	ElapsedSeconds   float64 `json:"elapsed_seconds"`
-	ObjectsPerSecond float64 `json:"objects_per_second"`
+	Deleted          int64        `json:"deleted"`
+	Reconciled       int64        `json:"reconciled"`
+	AmbiguousHeld    int64        `json:"ambiguous_held"`
+	LastModifiedHeld r2RetireStat `json:"last_modified_held"`
+	Bytes            int64        `json:"bytes"`
+	ElapsedSeconds   float64      `json:"elapsed_seconds"`
+	ObjectsPerSecond float64      `json:"objects_per_second"`
 }
 type inverseRawTarget struct {
 	ID, StreamID    int64
@@ -122,14 +123,21 @@ func (a *inverseApplier) checkEvidence(ctx context.Context, q r2RetireQuerier) e
 		return err
 	}
 	var activated, deadline, now time.Time
-	var blocked bool
-	err = q.QueryRow(ctx, `SELECT activated_at,drain_not_before,clock_timestamp(),r2_retirement_writes_blocked($1,$2)
- FROM r2_retirement_writer_fences WHERE bucket=$1 AND endpoint_sha256=$2 FOR SHARE`, a.store.Bucket(), a.store.EndpointSHA256()).Scan(&activated, &deadline, &now, &blocked)
+	var blocked, recorderReplay bool
+	err = q.QueryRow(ctx, `SELECT activated_at,drain_not_before,clock_timestamp(),r2_retirement_writes_blocked($1,$2),
+ EXISTS(SELECT 1 FROM recordings WHERE status='active') OR EXISTS(SELECT 1 FROM recording_jobs WHERE status IN ('pending','leased'))
+ FROM r2_retirement_writer_fences WHERE bucket=$1 AND endpoint_sha256=$2 FOR SHARE`, a.store.Bucket(), a.store.EndpointSHA256()).Scan(&activated, &deadline, &now, &blocked, &recorderReplay)
 	if err != nil {
 		return fmt.Errorf("exact 0198 writer fence required: %w", err)
 	}
+	if recorderReplay {
+		return errors.New("R2 recorder replay is active or queued; batch cannot run")
+	}
 	if !blocked || !now.After(deadline) || e.Bucket != a.store.Bucket() || e.EndpointSHA256 != a.store.EndpointSHA256() || !e.FenceActivatedAt.Equal(activated) || !e.DrainNotBefore.Equal(deadline) || !e.ObservedAt.After(deadline) || e.ObservedAt.After(now) {
 		return errors.New("writer drain or controller evidence missing, stale or outside exact fence")
+	}
+	if !activated.Truncate(time.Second).Equal(inverseRetirementCutoff()) {
+		return errors.New("live fence activation differs from the owner-approved object cutoff")
 	}
 	if err = e.validateProof(a.opts); err != nil {
 		return err
@@ -305,7 +313,7 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	if err != nil {
 		return t, err
 	}
-	if e.SizeBytes > a.opts.Budget24h-charged {
+	if a.opts.Budget24h > 0 && e.SizeBytes > a.opts.Budget24h-charged {
 		return t, errors.New("rolling 24h inverse budget exhausted")
 	}
 	// Independent committed transaction. Never use an outer network transaction's
@@ -501,8 +509,8 @@ func runR2InverseLane(ctx context.Context, cfg config.Config, args []string, lan
 	fs.IntVar(&o.Workers, "workers", 16, "concurrent keys (1..64, at least two DB connections remain reserved)")
 	fs.IntVar(&o.MaxItems, "max-items", 100, "maximum new objects")
 	fs.Int64Var(&o.MaxBytes, "max-bytes", 0, "maximum new intent bytes this run")
-	fs.Int64Var(&o.Budget24h, "budget-24h-bytes", 0, "maximum charged bytes in previous24h")
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || o.MaxItems < 1 || o.Workers < 1 || o.Workers > 64 || o.MaxBytes <= 0 || o.Budget24h <= 0 || o.Ledger == "" {
+	fs.Int64Var(&o.Budget24h, "budget-24h-bytes", 0, "maximum charged bytes in previous24h (0 = unlimited; per-run bounds still apply)")
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || o.MaxItems < 1 || o.Workers < 1 || o.Workers > 64 || o.MaxBytes <= 0 || o.Budget24h < 0 || o.Ledger == "" {
 		log.Fatal("invalid bounded r2-inverse apply options")
 	}
 	pool := mustOpenPool(ctx, cfg)
@@ -535,7 +543,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		}
 	}
 
-	if o.Workers < 1 || o.Workers > 64 || o.MaxItems < 1 || o.MaxBytes <= 0 || o.Budget24h <= 0 {
+	if o.Workers < 1 || o.Workers > 64 || o.MaxItems < 1 || o.MaxBytes <= 0 || o.Budget24h < 0 {
 		return result, errors.New("invalid bounded apply options")
 	}
 	// One session connection and one independent issuance connection must stay
@@ -703,6 +711,10 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		if e.Class != want || existing[e.Key] {
 			continue
 		}
+		if !inverseLastModifiedAllowed(e.LastModified, summary.CreatedAt, time.Now().UTC()) {
+			result.LastModifiedHeld.add(e.SizeBytes)
+			continue
+		}
 		if o.Lane == inverseNASKeep28 {
 			if _, dup := candidates[e.Key]; dup {
 				return result, errors.New("duplicate keep28 partition key")
@@ -738,6 +750,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	var first error
 	var mu sync.Mutex
 	var deleted, bytes atomic.Int64
+	var modifiedHeld, modifiedBytes atomic.Int64
 	for range o.Workers {
 		wg.Add(1)
 		go func() {
@@ -752,6 +765,11 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 					bytes.Add(e.SizeBytes)
 				}
 				if err != nil {
+					var modifiedErr inverseLastModifiedError
+					if errors.As(err, &modifiedErr) {
+						modifiedHeld.Add(1)
+						modifiedBytes.Add(e.SizeBytes)
+					}
 					mu.Lock()
 					if first == nil {
 						first = err
@@ -775,6 +793,8 @@ send:
 	wg.Wait()
 	result.Deleted = deleted.Load()
 	result.Bytes = bytes.Load()
+	result.LastModifiedHeld.Objects += modifiedHeld.Load()
+	result.LastModifiedHeld.Bytes += modifiedBytes.Load()
 	result.ElapsedSeconds = time.Since(started).Seconds()
 	result.ObjectsPerSecond = float64(result.Deleted) / result.ElapsedSeconds
 	return result, first

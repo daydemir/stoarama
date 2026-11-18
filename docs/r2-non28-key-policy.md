@@ -1,5 +1,9 @@
 # B1 non-keep28 key-policy proof
 
+Historical contract, superseded by the reviewed
+[owner fence policy](r2-owner-fence-policy.md). The executor rejects
+`non28_key_policy_v1`; the text below records the former argument and evidence.
+
 This is an explicit alternative to accepted-PUT completion for **B1 non-keep28
 managed RAW keys only**. It makes no claim that external requests have completed.
 B2, delivery, collated outputs, unknown keys and NAS-custody decisions cannot use

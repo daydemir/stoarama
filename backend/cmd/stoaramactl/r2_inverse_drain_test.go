@@ -1,72 +1,72 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
-func TestR2InverseDrainProofScopeAndEvidence(t *testing.T) {
-	activation := time.Date(2026, 11, 12, 14, 28, 47, 0, time.UTC)
-	deadline := activation.Add(7*24*time.Hour + 2*time.Minute)
-	path := filepath.Join(t.TempDir(), "reviewed-evidence.json")
-	if err := os.WriteFile(path, []byte(`{"synthetic":true}`), 0600); err != nil {
+func inverseUseOwnerFenceEvidence(t *testing.T, o *inverseApplyOptions) {
+	t.Helper()
+	var e inverseDrainEvidence
+	if err := inverseReadPinned(o.DrainEvidence, o.DrainSHA, &e); err != nil {
 		t.Fatal(err)
 	}
-	digest, err := inverseFileSHA(path)
+	e.Proof = inverseOwnerFenceProof
+	e.AcceptedPUTCompletion, e.DeployedWriterCoverage = "", ""
+	e.FencePolicy = &inverseFencePolicyEvidence{PartitionSHA256: o.ManifestSHA, SummarySHA256: o.SummarySHA, LastModifiedBefore: inverseRetirementCutoff(), OwnerDecision: inverseEvidenceReference{Path: "../../../docs/records/r2-owner-fence-policy-20261118.md", SHA256: inverseOwnerDecisionSHA256}, ResidualAcceptance: inverseApprovedFenceResidual}
+	data, err := json.Marshal(e)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref := inverseEvidenceReference{Path: path, SHA256: digest}
+	o.DrainEvidence = filepath.Join(t.TempDir(), "owner-policy.json")
+	if err = os.WriteFile(o.DrainEvidence, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	o.DrainSHA, err = inverseFileSHA(o.DrainEvidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestR2InverseDrainProofScopeAndEvidence(t *testing.T) {
+	activation := inverseRetirementCutoff().Add(37031 * time.Microsecond)
+	deadline := activation.Add(6 * 24 * time.Hour)
 	o := inverseApplyOptions{ManifestSHA: r2tSHA, SummarySHA: r2tSHA}
 	valid := func() inverseDrainEvidence {
-		return inverseDrainEvidence{Proof: inverseNon28KeyPolicyProof, FenceActivatedAt: activation, DrainNotBefore: deadline, ObservedAt: deadline.Add(time.Minute),
-			KeyPolicy: &inverseKeyPolicyEvidence{PartitionSHA256: r2tSHA, SummarySHA256: r2tSHA, CanaryEvidence: ref, ManagedPUTAnalytics: ref, OperatorSigningEvidence: ref, OperatorSigningStoppedAt: activation, OperatorSigningObservedThrough: deadline.Add(time.Minute), ResidualAcceptance: inverseApprovedKeyResidual}}
+		return inverseDrainEvidence{Proof: inverseOwnerFenceProof, Bucket: "stoarama", FenceActivatedAt: activation, DrainNotBefore: deadline, ObservedAt: deadline.Add(time.Minute), FencePolicy: &inverseFencePolicyEvidence{PartitionSHA256: r2tSHA, SummarySHA256: r2tSHA, LastModifiedBefore: inverseRetirementCutoff(), OwnerDecision: inverseEvidenceReference{Path: "../../../docs/records/r2-owner-fence-policy-20261118.md", SHA256: inverseOwnerDecisionSHA256}, ResidualAcceptance: inverseApprovedFenceResidual}}
 	}
-	if err := valid().validateProof(o); err != nil {
-		t.Fatal(err)
+	for _, lane := range []inverseLane{inverseOutsideKeep28, inverseNASKeep28} {
+		opts := o
+		opts.Lane = lane
+		if err := valid().validateProof(opts); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for _, tc := range []struct {
 		name   string
 		mutate func(*inverseDrainEvidence, *inverseApplyOptions)
 	}{
-		{"B2", func(_ *inverseDrainEvidence, o *inverseApplyOptions) { o.Lane = inverseNASKeep28 }},
 		{"missing route", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.Proof = "" }},
-		{"unknown route", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.Proof = "quiet_window" }},
-		{"missing policy", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.KeyPolicy = nil }},
-		{"mixed proof", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.AcceptedPUTCompletion = "expired" }},
-		{"changed partition", func(_ *inverseDrainEvidence, o *inverseApplyOptions) { o.ManifestSHA = "changed" }},
-		{"changed summary", func(_ *inverseDrainEvidence, o *inverseApplyOptions) { o.SummarySHA = "changed" }},
-		{"missing canary", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
-			e.KeyPolicy.CanaryEvidence = inverseEvidenceReference{}
+		{"retired route", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.Proof = "non28_key_policy_v1" }},
+		{"missing policy", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.FencePolicy = nil }},
+		{"completion claim", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.AcceptedPUTCompletion = "completed" }},
+		{"coverage claim", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.DeployedWriterCoverage = "covered" }},
+		{"bucket", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.Bucket = "other" }},
+		{"different fence second", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
+			e.FenceActivatedAt = e.FenceActivatedAt.Add(time.Second)
 		}},
-		{"missing analytics", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
-			e.KeyPolicy.ManagedPUTAnalytics = inverseEvidenceReference{}
+		{"cutoff", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
+			e.FencePolicy.LastModifiedBefore = e.FencePolicy.LastModifiedBefore.Add(time.Second)
 		}},
-		{"missing operator", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
-			e.KeyPolicy.OperatorSigningEvidence = inverseEvidenceReference{}
-		}},
-		{"old residual cannot waive current contract", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
-			e.KeyPolicy.ResidualAcceptance = "approved_key_overwrite_reappearance_delivery_order_v1"
-		}},
-		{"unaccepted residual", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.KeyPolicy.ResidualAcceptance = "" }},
-		{"wrong evidence digest", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
-			e.KeyPolicy.CanaryEvidence.SHA256 = r2tSHA
-		}},
-		{"unavailable evidence", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
-			e.KeyPolicy.OperatorSigningEvidence.Path = path + ".missing"
-		}},
-		{"stale operator observation", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
-			e.KeyPolicy.OperatorSigningObservedThrough = e.ObservedAt.Add(-time.Second)
-		}},
-		{"late signer", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
-			e.KeyPolicy.OperatorSigningStoppedAt = deadline.Add(-time.Hour)
-		}},
-		{"missing signer time", func(e *inverseDrainEvidence, _ *inverseApplyOptions) {
-			e.KeyPolicy.OperatorSigningStoppedAt = time.Time{}
-		}},
-		{"shortened fence", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.DrainNotBefore = deadline.Add(-time.Minute) }},
+		{"deadline before activation", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.DrainNotBefore = e.FenceActivatedAt }},
+		{"partition", func(_ *inverseDrainEvidence, o *inverseApplyOptions) { o.ManifestSHA = "changed" }},
+		{"summary", func(_ *inverseDrainEvidence, o *inverseApplyOptions) { o.SummarySHA = "changed" }},
+		{"race not accepted", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.FencePolicy.ResidualAcceptance = "" }},
+		{"owner record hash", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.FencePolicy.OwnerDecision.SHA256 = r2tSHA }},
+		{"owner record missing", func(e *inverseDrainEvidence, _ *inverseApplyOptions) { e.FencePolicy.OwnerDecision.Path += ".missing" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := valid()
@@ -78,15 +78,30 @@ func TestR2InverseDrainProofScopeAndEvidence(t *testing.T) {
 		})
 	}
 	completion := inverseDrainEvidence{Proof: inversePUTCompletionProof, AcceptedPUTCompletion: "terminal provider evidence", DeployedWriterCoverage: "complete writer coverage"}
-	for _, lane := range []inverseLane{inverseOutsideKeep28, inverseNASKeep28} {
-		opts := o
-		opts.Lane = lane
-		if err := completion.validateProof(opts); err != nil {
-			t.Fatal(err)
-		}
+	if err := completion.validateProof(o); err != nil {
+		t.Fatal(err)
 	}
-	completion.KeyPolicy = valid().KeyPolicy
+	completion.FencePolicy = valid().FencePolicy
 	if err := completion.validateProof(o); err == nil {
 		t.Fatal("mixed completion route accepted")
+	}
+}
+
+func TestR2InverseLastModifiedCutoff(t *testing.T) {
+	cutoff := inverseRetirementCutoff()
+	now := cutoff.Add(time.Hour)
+	if !inverseLastModifiedAllowed(cutoff.Add(-time.Nanosecond), now, now) {
+		t.Fatal("pre-fence object required seven days")
+	}
+	for _, modified := range []time.Time{{}, cutoff, cutoff.Add(time.Nanosecond), now.Add(time.Hour)} {
+		if inverseLastModifiedAllowed(modified, now, now) {
+			t.Fatal("unsafe LastModified accepted", modified)
+		}
+	}
+	if inverseLastModifiedAllowed(cutoff.Add(-time.Second), cutoff.Add(-2*time.Second), now) {
+		t.Fatal("post-partition object accepted")
+	}
+	if inverseLastModifiedAllowed(cutoff.Add(-time.Second), now, cutoff.Add(-2*time.Second)) {
+		t.Fatal("future object accepted")
 	}
 }

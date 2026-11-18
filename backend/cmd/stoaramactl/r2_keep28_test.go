@@ -73,6 +73,105 @@ func TestKeep28ExecutorFreshCustodyAndNoReplay(t *testing.T) {
 	}
 }
 
+func TestKeep28UnlimitedBudgetRetainsAccounting(t *testing.T) {
+	f := newKeep28Fixture(t)
+	inverseUseOwnerFenceEvidence(t, &f.options)
+	const charged = 6_000_000_000_000
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_inverse_budget_minutes(bucket,minute,charged_bytes) VALUES('stoarama',date_trunc('minute',clock_timestamp()),$1)`, int64(charged)); err != nil {
+		t.Fatal(err)
+	}
+	f.options.Budget24h = 5_000_000_000_000
+	if _, err := applyInverse(f.ctx, f.pool, f.sdk, f.options); err == nil || f.deletes() != 0 {
+		t.Fatal("positive exhausted budget reached wire", err)
+	}
+	f.options.Budget24h = 0
+	result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
+	if err != nil || result.Deleted != 1 || f.deletes() != 1 {
+		t.Fatalf("unlimited above 5 TB: %+v %v provider=%d", result, err, f.deletes())
+	}
+	var got int64
+	if err = f.pool.QueryRow(f.ctx, `SELECT sum(charged_bytes) FROM r2_inverse_budget_minutes WHERE bucket='stoarama'`).Scan(&got); err != nil || got != charged+100 {
+		t.Fatal("unlimited budget lost accounting", got, err)
+	}
+}
+
+func TestKeep28LastModifiedCutoffReportsHeldBytes(t *testing.T) {
+	for _, modified := range []time.Time{{}, inverseRetirementCutoff(), inverseRetirementCutoff().Add(time.Second), time.Now().Add(time.Hour)} {
+		t.Run(modified.Format(time.RFC3339Nano), func(t *testing.T) {
+			f := newKeep28Fixture(t)
+			e := f.entry()
+			e.LastModified = modified
+			data, err := json.Marshal(e)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = os.WriteFile(f.options.Manifest, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			f.options.ManifestSHA, _ = inverseFileSHA(f.options.Manifest)
+			inverseUseOwnerFenceEvidence(t, &f.options)
+			result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
+			if err != nil || result.Deleted != 0 || result.LastModifiedHeld.Objects != 1 || result.LastModifiedHeld.Bytes != 100 || f.deletes() != 0 {
+				t.Fatalf("cutoff hold: %+v err=%v provider=%d", result, err, f.deletes())
+			}
+		})
+	}
+}
+
+func TestKeep28ChangedHeadReportsHeldBytesAndStops(t *testing.T) {
+	f := newKeep28Fixture(t)
+	inverseUseOwnerFenceEvidence(t, &f.options)
+	f.store.mu.Lock()
+	o := f.store.objects[f.key]
+	o.LastModified = inverseRetirementCutoff()
+	f.store.objects[f.key] = o
+	f.store.mu.Unlock()
+	result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
+	if err == nil || result.Deleted != 0 || result.LastModifiedHeld.Objects != 1 || result.LastModifiedHeld.Bytes != 100 || f.deletes() != 0 {
+		t.Fatalf("changed HEAD: %+v err=%v provider=%d", result, err, f.deletes())
+	}
+}
+
+func TestKeep28OwnerFenceEvidenceBinding(t *testing.T) {
+	f := newKeep28Fixture(t)
+	inverseUseOwnerFenceEvidence(t, &f.options)
+	a := f.applier(t)
+	var original inverseDrainEvidence
+	if err := inverseReadPinned(a.opts.DrainEvidence, a.opts.DrainSHA, &original); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.checkEvidence(f.ctx, f.pool); err != nil {
+		t.Fatal("valid owner evidence", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*inverseDrainEvidence)
+	}{
+		{"bucket", func(e *inverseDrainEvidence) { e.Bucket = "other" }},
+		{"endpoint", func(e *inverseDrainEvidence) { e.EndpointSHA256 = r2tSHA }},
+		{"activation", func(e *inverseDrainEvidence) { e.FenceActivatedAt = e.FenceActivatedAt.Add(time.Microsecond) }},
+		{"deadline", func(e *inverseDrainEvidence) { e.DrainNotBefore = e.DrainNotBefore.Add(time.Second) }},
+		{"observation before deadline", func(e *inverseDrainEvidence) { e.ObservedAt = e.DrainNotBefore }},
+		{"future observation", func(e *inverseDrainEvidence) { e.ObservedAt = time.Now().Add(time.Hour) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := original
+			tc.mutate(&e)
+			data, err := json.Marshal(e)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = os.WriteFile(a.opts.DrainEvidence, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			a.opts.DrainSHA, _ = inverseFileSHA(a.opts.DrainEvidence)
+			if err = a.checkEvidence(f.ctx, f.pool); err == nil || f.deletes() != 0 {
+				t.Fatal("unbound owner evidence accepted", err)
+			}
+		})
+	}
+}
+
 type keep28Fixture struct {
 	ctx     context.Context
 	pool    *pgxpool.Pool
@@ -111,7 +210,7 @@ func newKeep28FixtureCount(t *testing.T, count int) keep28Fixture {
 	w := windows[3]
 	exec(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path) VALUES(9000001,30,1,'https://test.invalid','stoarama',$1,100,'etag',repeat('b',64),$2,$2,$3,'keep28/1.mp4')`, f.key, w.Start.Add(time.Hour), w.Start.Add(2*time.Hour))
 	exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at,server_received_at,file_ctime_ns,file_inode,file_device,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256) VALUES(13,9000001,30,'keep28/1.mp4',100,repeat('b',64),'present',clock_timestamp()-interval '1 hour',clock_timestamp(),clock_timestamp()-interval '2 hours',1,2,3,'keep28/1.mp4.stoarama.json',50,repeat('c',64))`)
-	object := r2.ObjectInfo{Key: f.key, ETag: "etag", SizeBytes: 100, LastModified: time.Now().UTC().Add(-8 * 24 * time.Hour).Truncate(time.Second)}
+	object := r2.ObjectInfo{Key: f.key, ETag: "etag", SizeBytes: 100, LastModified: inverseRetirementCutoff().Add(-time.Second)}
 	f.store = &inverseFakeStore{objects: map[string]r2.ObjectInfo{f.key: object}}
 	for n := 2; n <= count; n++ {
 		key := fmt.Sprintf("managed/acct-47/keep28/%d.mp4", n)
@@ -132,7 +231,7 @@ func newKeep28FixtureCount(t *testing.T, count int) keep28Fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = tx.Exec(ctx, `SET LOCAL session_replication_role=replica; UPDATE r2_retirement_writer_fences SET activated_at=clock_timestamp()-interval '8 days',drain_not_before=clock_timestamp()-interval '1 hour'`)
+	_, err = tx.Exec(ctx, `SET LOCAL session_replication_role=replica; UPDATE r2_retirement_writer_fences SET activated_at='2026-11-12T14:28:47.037031Z',drain_not_before=clock_timestamp()-interval '1 hour'`)
 	if err != nil {
 		t.Fatal(err)
 	}

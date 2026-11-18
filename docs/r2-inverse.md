@@ -53,13 +53,15 @@ stoaramactl r2-inverse apply \
   --picks PICKS --ledger PRIVATE_LEDGER \
   --drain-evidence DRAIN_JSON --expected-drain-evidence-sha256 DRAIN_SHA \
   --workers 16 --max-items 100 --max-bytes CANARY_BYTES \
-  --budget-24h-bytes CONTROLLER_BUDGET
+  --budget-24h-bytes 0
 ```
 
-The budget is explicit, configurable, and includes unresolved intents. It is
-conservatively charged by minute over the preceding 24h, with no owner-class 5 TB
-cap. The default 100-object limit is the canary size; subsequent tick calls may
-increase `--max-items` and the per-run byte bound within the daily budget.
+The rolling budget defaults to unlimited (`--budget-24h-bytes 0`) for both inverse
+and NAS-backed keep28 apply. A positive value sets an optional limit; negative
+values are rejected. Byte accounting, including unresolved intents, remains
+conservatively charged by minute over the preceding 24h in either mode. The
+default 100-object limit is the canary size; subsequent tick calls may increase
+`--max-items` and the required positive per-run byte bound.
 Only raw keys with one certain catalog identity and no protection are eligible.
 Collated, KE, keep28, tools, delivery, held and unknown keys are never deleted.
 The partition and picks must match the pinned policy and be no older than 24h.
@@ -71,7 +73,7 @@ ledger. The network phase takes the metadata barrier first in shared mode, then
 ordered joined/admission locks, allowing independent keys to run concurrently. A common live delivery predicate includes content/path aliases
 and current collated-output dependencies without relying on a refreshed source
 cache; admission of those protections and output membership changes is fenced. It exercises the installed purge guards before DELETE, rolls
-that probe back, HEAD-checks listing/catalog ETag, size and seven-day age, and
+that probe back, HEAD-checks listing/catalog ETag, size and the fixed pre-fence LastModified cutoff, and
 rechecks live protections, controller drain evidence and migration 0198 at the
 wire. The private concrete executor verifier issues authority only after these checks
 and independently commits a permanent one-issuance row. No exported approval
@@ -99,18 +101,18 @@ all deployed writer coverage and completion of externally accepted PUTs.
 A string claiming completion or capability expiry does not establish that fact.
 The implementation agent creates none of this production evidence.
 
-B1 alone also accepts the explicit `non28_key_policy_v1` route described in
-[the key-policy proof contract](r2-non28-key-policy.md). It binds this partition
-and summary, pinned canary/analytics/operator evidence, the operator signing window and
-the expressly accepted overwrite/reappearance/delivery-order/historical-issuance residual. It does
-not claim external PUT completion. B2 rejects this route. All other live
-fence, hold, incident, delivery and tool-prefix checks remain mandatory.
+Both executors accept the explicit `owner_fence_policy_20261118_v1` route in
+[the owner fence policy contract](r2-owner-fence-policy.md). It replaces the old
+B1-only key-policy route, pins the committed owner decision and this partition
+and summary, and explicitly accepts the final HEAD/unconditional DELETE race
+without claiming external PUT completion. Exact live fence binding, six live
+wire/capability vetoes, source identity, holds and B2 NAS custody remain mandatory.
 
-Controller canary gate after Nov 19 14:30:47Z AND actual drain evidence:
+Controller canary gate after migration 0210 and fresh bound owner evidence:
 
 1. Record baseline provider bucket bytes and object count using the controller's
    read-only metrics. Pin exactly 100 eligible raw keys and their total bytes.
-2. Run one 100-object batch with an explicit byte cap and 24h budget. On any error,
+2. Run one 100-object batch with an explicit per-run byte cap and `--budget-24h-bytes 0`. On any error,
    preserve evidence; reconcile existing intents by HEAD before continuing.
 3. Require 100 distinct absent ledger keys = 100 DB absent events = 100 provider
    removals, and HEAD 404 for all 100. Provider bucket bytes must fall; account for
@@ -178,8 +180,8 @@ Deniz's November 17 order to delete group 3 that is on the NAS supersedes the
 stitch-proof prerequisite **only for this keep28 RAW lane**. This new command
 accepts no stitch-proof and never calls the legacy stitch-gated retirement
 entry point. The old `r2-retire` command and its stitch-proof gate are unchanged.
-Final HEAD identity and seven-day age, mature immutable 0198 fence (earliest
-November 19 14:30:47Z), and substantiated pinned drain evidence still apply.
+Final HEAD identity, the strict pre-fence cutoff, the immutable 0198 fence with
+its owner-adjusted 0210 deadline, and pinned owner evidence still apply.
 
 Only the sole production controller may deploy and run this command. Use the
 same 100-object canary gate, but reconcile **B2** DB events, B2 ledger and exact

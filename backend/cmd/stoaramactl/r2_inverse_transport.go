@@ -22,6 +22,12 @@ type inverseDeleteBinding struct {
 	LastModified                                           time.Time
 }
 
+type inverseLastModifiedError struct{}
+
+func (inverseLastModifiedError) Error() string {
+	return "listing/HEAD LastModified missing, changed, future or outside the pre-fence cutoff"
+}
+
 // Only the concrete executor verifier below can issue this private capability.
 // Copies share consumption state, and the DB independently forbids reminting.
 type inverseDeleteAuthority struct {
@@ -83,11 +89,11 @@ func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverse
 		return err
 	}
 	item := r2RetireItem{r2RetireCandidate: r2RetireCandidate{SizeBytes: e.SizeBytes, SHA256: target.SHA, ETag: e.ETag}}
-	if err = r2RetireValidateGuardHead(head, item, target.ETag, 7*24*time.Hour, now); err != nil {
+	if err = r2RetireValidateGuardIdentity(head, item, target.ETag); err != nil {
 		return err
 	}
-	if e.LastModified.IsZero() || !head.LastModified.Equal(e.LastModified) || !e.LastModified.Before(now.Add(-7*24*time.Hour)) || !e.LastModified.Before(a.summary.CreatedAt) {
-		return errors.New("listing LastModified missing, changed or too young")
+	if !head.LastModified.Equal(e.LastModified) || !inverseLastModifiedAllowed(e.LastModified, a.summary.CreatedAt, now) {
+		return inverseLastModifiedError{}
 	}
 	if err = a.store.RequireNoMultipartUploads(ctx); err != nil {
 		return err

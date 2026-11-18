@@ -140,7 +140,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 	for n := range count {
 		key := fmt.Sprintf("managed/acct-47/ordinary/%04d.mp4", n)
 		etag := fmt.Sprintf("etag-%04d", n)
-		store.objects[key] = r2.ObjectInfo{Key: key, ETag: etag, SizeBytes: 100, LastModified: time.Now().UTC().Add(-8 * 24 * time.Hour).Truncate(time.Second)}
+		store.objects[key] = r2.ObjectInfo{Key: key, ETag: etag, SizeBytes: 100, LastModified: inverseRetirementCutoff().Add(-time.Second)}
 		exec(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path) VALUES($1,30,1,'https://test.invalid','stoarama',$2,100,$3,repeat('b',64),'2026-06-01','2026-06-01','2026-06-01 00:01:00','ordinary/'||$4)`, 9000000+n, key, etag, fmt.Sprintf("%04d.mp4", n))
 	}
 	exec(`INSERT INTO recording_collation_hours(id,hour_id,batch_id,generation,recording_id,local_date,delivery_hour,status,manifest_object_key,manifest_sha256,manifest,source_clip_count,included_clip_count,excluded_clip_count,join_count,split_count)
@@ -155,7 +155,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = tx.Exec(ctx, `SET LOCAL session_replication_role=replica; UPDATE r2_retirement_writer_fences SET activated_at=clock_timestamp()-interval '8 days'; UPDATE r2_retirement_writer_fences SET drain_not_before=activated_at+interval '7 days 2 minutes'`); err != nil {
+	if _, err = tx.Exec(ctx, `SET LOCAL session_replication_role=replica; UPDATE r2_retirement_writer_fences SET activated_at='2026-11-12T14:28:47.037031Z'; UPDATE r2_retirement_writer_fences SET drain_not_before=clock_timestamp()-interval '1 hour'`); err != nil {
 		t.Fatal(err)
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -257,30 +257,14 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 		return runID
 	}
-	t.Run("B1_key_policy_without_completion_claim", func(t *testing.T) {
+	t.Run("owner_policy_without_completion_claim", func(t *testing.T) {
 		a, _ := build(1)
 		a.ledger.close()
-		e := drain
-		e.Proof = inverseNon28KeyPolicyProof
-		e.AcceptedPUTCompletion = ""
-		e.DeployedWriterCoverage = ""
-		e.KeyPolicy = &inverseKeyPolicyEvidence{PartitionSHA256: a.opts.ManifestSHA, SummarySHA256: a.opts.SummarySHA, CanaryEvidence: inverseEvidenceReference{Path: drainPath, SHA256: drainSHA}, ManagedPUTAnalytics: inverseEvidenceReference{Path: drainPath, SHA256: drainSHA}, OperatorSigningEvidence: inverseEvidenceReference{Path: drainPath, SHA256: drainSHA}, OperatorSigningStoppedAt: activated, OperatorSigningObservedThrough: e.ObservedAt, ResidualAcceptance: inverseApprovedKeyResidual}
-		data, err := json.Marshal(e)
-		if err != nil {
-			t.Fatal(err)
-		}
-		a.opts.DrainEvidence = filepath.Join(filepath.Dir(a.opts.Manifest), "key-policy.json")
-		if err = os.WriteFile(a.opts.DrainEvidence, data, 0600); err != nil {
-			t.Fatal(err)
-		}
-		a.opts.DrainSHA, err = inverseFileSHA(a.opts.DrainEvidence)
-		if err != nil {
-			t.Fatal(err)
-		}
+		inverseUseOwnerFenceEvidence(t, &a.opts)
 		before := providerDeletes()
 		result, err := applyInverse(ctx, pool, sdk, a.opts)
 		if err != nil || result.Deleted != 1 || providerDeletes()-before != 1 {
-			t.Fatalf("key-policy batch %+v err %v", result, err)
+			t.Fatalf("owner-policy batch %+v err %v", result, err)
 		}
 	})
 	t.Run("changed_provider_identity_never_reaches_DELETE", func(t *testing.T) {
@@ -1029,11 +1013,32 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 	t.Run("budget", func(t *testing.T) {
 		a, _ := build(2)
 		a.ledger.close()
+		a.opts.Budget24h = -1
+		before := providerDeletes()
+		if _, err := applyInverse(ctx, pool, sdk, a.opts); err == nil || providerDeletes() != before {
+			t.Fatal("negative budget accepted", err)
+		}
 		a.opts.Budget24h = 1
-		before := store.calls
-		_, err := applyInverse(ctx, pool, store, a.opts)
-		if err == nil || store.calls != before {
+		_, err := applyInverse(ctx, pool, sdk, a.opts)
+		if err == nil || providerDeletes() != before {
 			t.Fatal("budget exceeded", err)
+		}
+		a.opts.Budget24h = 0
+		a.opts.MaxItems = 1
+		result, err := applyInverse(ctx, pool, sdk, a.opts)
+		if err != nil || result.Deleted != 1 || providerDeletes()-before != 1 {
+			t.Fatalf("unlimited budget crossed item bound: %+v %v", result, err)
+		}
+		a.opts.MaxItems = 2
+		a.opts.MaxBytes = 99
+		result, err = applyInverse(ctx, pool, sdk, a.opts)
+		if err != nil || result.Deleted != 0 || providerDeletes()-before != 1 {
+			t.Fatalf("unlimited budget crossed byte bound: %+v %v", result, err)
+		}
+		a.opts.MaxBytes = 100
+		result, err = applyInverse(ctx, pool, sdk, a.opts)
+		if err != nil || result.Deleted != 1 || providerDeletes()-before != 2 {
+			t.Fatalf("unlimited budget did not resume: %+v %v", result, err)
 		}
 	})
 	t.Run("private_authority_cannot_replay_or_remint", func(t *testing.T) {

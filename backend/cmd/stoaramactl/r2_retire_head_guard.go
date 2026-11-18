@@ -69,7 +69,7 @@ func r2RetireCheckStoppedWriters(ctx context.Context, q r2RetireQuerier, bucket 
 	return nil
 }
 
-func r2RetireValidateGuardHead(h r2.ObjectHead, it r2RetireItem, catalogETag string, minAge time.Duration, now time.Time) error {
+func r2RetireValidateGuardIdentity(h r2.ObjectHead, it r2RetireItem, catalogETag string) error {
 	// Trim only transport ETag quotes. An empty identity is never authority.
 	expected := strings.Trim(it.ETag, `"`)
 	if expected == "" || strings.Trim(catalogETag, `"`) != expected || strings.Trim(h.ETag, `"`) != expected {
@@ -77,6 +77,13 @@ func r2RetireValidateGuardHead(h r2.ObjectHead, it r2RetireItem, catalogETag str
 	}
 	if h.SizeBytes != it.SizeBytes || (h.SHA256Metadata != "" && !strings.EqualFold(h.SHA256Metadata, it.SHA256)) {
 		return errors.New("HEAD size/SHA metadata differs from manifest/catalog")
+	}
+	return nil
+}
+
+func r2RetireValidateGuardHead(h r2.ObjectHead, it r2RetireItem, catalogETag string, minAge time.Duration, now time.Time) error {
+	if err := r2RetireValidateGuardIdentity(h, it, catalogETag); err != nil {
+		return err
 	}
 	if minAge < 7*24*time.Hour || h.LastModified.IsZero() || !h.LastModified.Before(now.Add(-minAge)) {
 		return errors.New("HEAD LastModified missing, future or too recent")
