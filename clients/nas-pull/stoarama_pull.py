@@ -48652,7 +48652,15 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                     raw_proof = current.proof()
                 proof["inputs"].append(dict(clip_id=clip["source_id"], sha256=clip["sha256"], size_bytes=clip["size_bytes"],
                                              packet_chain_sha256=source["chain"], packets=source["count"], frames=source["count"],
-                                             repaired=False, retirement_held=clip["source_id"] in held, raw_proof=raw_proof))
+                                             repaired=False,
+                                             # Owner rule: keep28 raw on the NAS is never deleted because of
+                                             # stitching. Production therefore always reports every input as
+                                             # retirement-held, so readiness always ends
+                                             # completed_no_retirement and the single lane is never left busy by
+                                             # an undeleted cleanup plan. The isolated proof lane is not the
+                                             # stitch lane and keeps its seam-derived value.
+                                             retirement_held=True if kind is StitchRunKind.PRODUCTION else clip["source_id"] in held,
+                                             raw_proof=raw_proof))
             if kind is StitchRunKind.PROOF:
                 proof["media_seconds"] = float(cumulative)
             if kind is StitchRunKind.PRODUCTION:

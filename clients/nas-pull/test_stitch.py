@@ -322,7 +322,7 @@ class StitchIntegrationTests(unittest.TestCase):
         self.assertEqual([c['clip_id'] for c in output['inputs']],[1,2])
         self.assertTrue(all(output[key] for key in ('full_decode','seam_decode','native_audit','packet_chain')))
 
-    def test_stitch_register_then_delete_only_fully_included(self):
+    def test_stitch_register_never_permits_local_raw_deletion(self):
         result=self.build()
         self.assertEqual(result['left_out'],[3,4])
         self.assertEqual(len(result['repairs']),1)
@@ -330,6 +330,9 @@ class StitchIntegrationTests(unittest.TestCase):
         self.assertTrue(result['repairs'][0]['synthesized_timestamps'])
         self.assertEqual(len(result['outputs']),1)
         self.assertEqual([p['clip_id'] for p in result['outputs'][0]['inputs']],[1,2])
+        # Owner rule: keep28 raw is never deleted because of stitching, so every
+        # reported input is retirement-held and no cleanup plan is ever made.
+        self.assertTrue(all(p['retirement_held'] for p in result['outputs'][0]['inputs']))
         # Even a server mistakenly offering a cleanup task before registration
         # cannot pass the independent local receipt gate.
         with mock.patch.object(pull,'restore_api',side_effect=self.api):
@@ -337,9 +340,12 @@ class StitchIntegrationTests(unittest.TestCase):
             self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
             pull.stitch_register(self.cfg,self.inventory,7,result)
             pull.cleanup_process_task(self.cfg,self.inventory,self.stop,self.cleanup_task(result))
-        self.assertFalse((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
-        for c in self.clips[1:]: self.assertTrue((self.cfg.output_dir/c['relative_path']).exists())
-        self.assertTrue((self.cfg.state_dir/pull.CLEANUP_LEDGER_NAME).exists())
+        # Registration still refuses the deletion: the durable receipt proves the
+        # server accepted the outputs, and the proof retains every source.
+        self.assertIn('raw source lacks full inclusion',
+                      pull.stitch_output_recheck(self.cfg,self.cleanup_task(result)['item']))
+        for c in self.clips: self.assertTrue((self.cfg.output_dir/c['relative_path']).exists())
+        self.assertEqual(list(self.cfg.state_dir.glob(pull.CLEANUP_LEDGER_NAME)),[])
 
     def test_fresh_output_rehash_refuses_tamper_and_local_switch(self):
         result=self.build(); task=self.cleanup_task(result)
@@ -351,19 +357,27 @@ class StitchIntegrationTests(unittest.TestCase):
         with mock.patch.object(pull,'restore_api',side_effect=self.api): pull.cleanup_process_task(self.cfg,self.inventory,self.stop,task)
         self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
 
-    def test_switch_off_during_output_rehash_keeps_raw(self):
+    def test_held_input_is_refused_before_any_output_rehash(self):
         result=self.build(); task=self.cleanup_task(result)
         with mock.patch.object(pull,'restore_api',side_effect=self.api): pull.stitch_register(self.cfg,self.inventory,7,result)
-        real=pull.hash_certification_file
-        def flip(*a,**k):
-            out=real(*a,**k); self.cfg.stitch_delete_enabled=False; return out
-        with mock.patch.object(pull,'hash_certification_file',side_effect=flip):
-            self.assertIn('switch off',pull.stitch_output_recheck(self.cfg,task['item']))
-        self.cfg.stitch_delete_enabled=True
-        with mock.patch.object(pull,'hash_certification_file',side_effect=flip), \
-                mock.patch.object(pull,'restore_api',side_effect=self.api):
-            pull.cleanup_process_task(self.cfg,self.inventory,self.stop,task)
+        # A held input is refused before the (slow) output rehash, so no
+        # deletion work is ever started for a source that must be retained.
+        with mock.patch.object(pull,'hash_certification_file') as rehash:
+            self.assertIn('raw source lacks full inclusion',
+                          pull.stitch_output_recheck(self.cfg,task['item']))
+            rehash.assert_not_called()
         self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
+
+    def test_held_inputs_always_refuse_the_retirement_permit(self):
+        # Every stitch input is retirement-held now, so the permit request is
+        # always refused locally even with all switches on and a fresh rehash.
+        result=self.build(); task=self.cleanup_task(result)
+        with mock.patch.object(pull,'restore_api',side_effect=self.api): pull.stitch_register(self.cfg,self.inventory,7,result)
+        self.assertTrue(all(p['retirement_held'] for p in result['outputs'][0]['inputs']))
+        self.assertIn('raw source lacks full inclusion',
+                      pull.stitch_output_recheck(self.cfg,task['item']))
+        self.assertIn('raw source lacks full inclusion',
+                      pull.stitch_output_recheck(self.cfg,task['item'],execution=False))
 
     def test_switch_off_at_unlink_boundary_keeps_raw(self):
         result=self.build(); task=self.cleanup_task(result)
@@ -408,16 +422,25 @@ class StitchIntegrationTests(unittest.TestCase):
         with mock.patch.object(pull,'restore_api',side_effect=self.api) as api:
             pull.stitch_once(self.cfg,self.inventory,self.stop)
         self.assertEqual(api.call_count,2)
-        self.assertIsNone(pull.stitch_output_recheck(self.cfg,self.cleanup_task(result)['item']))
+        # The registration gate accepts the held inputs; the deletion gate
+        # still refuses, so the reconciling client never deletes raw.
+        self.assertIn('raw source lacks full inclusion',
+                      pull.stitch_output_recheck(self.cfg,self.cleanup_task(result)['item']))
         for c in self.clips:self.assertTrue((self.cfg.output_dir/c['relative_path']).exists())
 
-    def test_dry_run_checks_inclusion_while_local_deletion_is_disabled(self):
+    def test_dry_run_retains_every_stitched_source(self):
         result=self.build();task=self.cleanup_task(result)
         with mock.patch.object(pull,'restore_api',side_effect=self.api):pull.stitch_register(self.cfg,self.inventory,7,result)
         self.cfg.stitch_delete_enabled=False
         task.pop('approved_proof')
-        self.assertIsNone(pull.cleanup_guard_refusal(task,result['outputs'][0]['inputs'][0]['raw_proof'],self.cfg))
+        self.assertIn('raw source lacks full inclusion',
+                      pull.cleanup_guard_refusal(task, result['outputs'][0]['inputs'][0]['raw_proof'], self.cfg))
         self.assertIn('switch off',pull.stitch_output_recheck(self.cfg,task['item']))
+        self.cfg.stitch_delete_enabled=True
+        # The lane may be exercised, but a held source is never a deletion
+        # candidate even with every switch on and an approved proof.
+        self.assertIn('raw source lacks full inclusion',
+                      pull.stitch_output_recheck(self.cfg,task['item']))
 
     def test_v85r_status_hold_splits_output_and_retains_both_raw_endpoints(self):
         self.task['plan']['feature_inputs']=[dict(clip_id=c['source_id']) for c in self.clips]
@@ -461,21 +484,26 @@ class StitchIntegrationTests(unittest.TestCase):
             try:
                 self.assertTrue(building.wait(5))
                 self.assertEqual(pull.NAS_MEDIA_FENCE.writers, 0)
-                # A real proven-inclusion retirement finishes while the native
-                # build is deliberately still blocked, rather than timing out.
-                pull.cleanup_process_task(self.cfg, self.inventory, self.stop, self.cleanup_task(result), lane=lane)
-                self.assertFalse((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
+                # The execution lane drains while the native build is still
+                # blocked, rather than timing out behind it.
+                lived = []
+                lane.run(lambda: lived.append(True))
+                self.assertEqual(lived, [True])
                 self.assertTrue(worker.is_alive())
                 resume.set()
                 worker.join(5)
                 self.assertFalse(worker.is_alive())
                 self.assertEqual(len(errors), 1)
                 self.assertIsInstance(errors[0], pull.StitchHold)
+                # Even a lane that drained never offers a held stitch source
+                # for deletion.
+                pull.cleanup_process_task(self.cfg, self.inventory, self.stop, self.cleanup_task(result), lane=lane)
+                self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
             finally:
                 resume.set()
                 worker.join(5)
                 lane.close()
-        for clip in self.clips[1:]:
+        for clip in self.clips:
             self.assertTrue((self.cfg.output_dir/clip['relative_path']).exists())
 
     def test_cleanup_lane_cancels_running_native_child_without_waiting_for_it(self):
