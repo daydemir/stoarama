@@ -58,15 +58,16 @@ type inverseEntry struct {
 	Reason string       `json:"reason"`
 }
 type inverseSummary struct {
-	Version        int                           `json:"version"`
-	Bucket         string                        `json:"bucket"`
-	EndpointSHA256 string                        `json:"endpoint_sha256"`
-	CreatedAt      time.Time                     `json:"created_at"`
-	PolicySHA256   string                        `json:"policy_sha256"`
-	PicksSHA256    string                        `json:"picks_sha256"`
-	Total          r2RetireStat                  `json:"total"`
-	Classes        map[inverseClass]r2RetireStat `json:"classes"`
-	ReadOnly       bool                          `json:"read_only"`
+	Version              int                           `json:"version"`
+	Bucket               string                        `json:"bucket"`
+	EndpointSHA256       string                        `json:"endpoint_sha256"`
+	CreatedAt            time.Time                     `json:"created_at"`
+	PolicySHA256         string                        `json:"policy_sha256"`
+	PicksSHA256          string                        `json:"picks_sha256"`
+	Total                r2RetireStat                  `json:"total"`
+	LastModifiedExcluded r2RetireStat                  `json:"last_modified_excluded"`
+	Classes              map[inverseClass]r2RetireStat `json:"classes"`
+	ReadOnly             bool                          `json:"read_only"`
 }
 
 // A path alias of any KE stream remains protected even when its catalog row
@@ -292,6 +293,9 @@ func partitionInverse(ctx context.Context, store inverseLister, p inverseProtect
 		stat.add(o.SizeBytes)
 		sum.Classes[class] = stat
 		sum.Total.add(o.SizeBytes)
+		if !inverseLastModifiedAllowed(o.LastModified, sum.CreatedAt, sum.CreatedAt) {
+			sum.LastModifiedExcluded.add(o.SizeBytes)
+		}
 		return nil
 	})
 	if err != nil {

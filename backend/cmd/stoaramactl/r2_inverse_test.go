@@ -73,6 +73,27 @@ func TestR2InversePartitionAllClassesAndReconciliation(t *testing.T) {
 		t.Fatal(entries)
 	}
 }
+
+func TestR2InversePartitionLastModifiedCountsAreOrthogonal(t *testing.T) {
+	p := inverseTestProtection()
+	w := p.Windows[3]
+	start, end := w.Start.Add(-time.Hour), w.Start.Add(-time.Minute)
+	p.Identities["ke"] = []inverseIdentity{{StreamID: 4}}
+	p.Identities["eligible"] = []inverseIdentity{{StreamID: 3, Path: "file", Timezone: "UTC", Start: &start, End: &end}}
+	listing := inverseTestListing{
+		{Key: "ke", SizeBytes: 10, LastModified: inverseRetirementCutoff()},
+		{Key: "unknown", SizeBytes: 20},
+		{Key: "eligible", SizeBytes: 30, LastModified: inverseRetirementCutoff().Add(-time.Second)},
+	}
+	var out bytes.Buffer
+	sum, err := partitionInverse(context.Background(), listing, p, "policy", &out)
+	if err != nil || sum.Total.Objects != 3 || sum.Total.Bytes != 60 || sum.LastModifiedExcluded.Objects != 2 || sum.LastModifiedExcluded.Bytes != 30 {
+		t.Fatalf("cutoff accounting: %+v %v", sum, err)
+	}
+	if sum.Classes[inverseKE].Objects != 1 || sum.Classes[inverseUnknown].Objects != 1 || sum.Classes[inverseDeletable].Objects != 1 {
+		t.Fatal("cutoff accounting replaced protection classes", sum.Classes)
+	}
+}
 func TestR2InverseProtectionAliasesAndUncertainty(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

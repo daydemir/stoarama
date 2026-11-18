@@ -10,24 +10,22 @@ type inverseDrainProof string
 
 const (
 	inversePUTCompletionProof  inverseDrainProof = "accepted_put_completion_v1"
-	inverseNon28KeyPolicyProof inverseDrainProof = "non28_key_policy_v1"
+	inverseOwnerFenceProof     inverseDrainProof = "owner_fence_policy_20261118_v1"
+	inverseOwnerDecisionSHA256                   = "5996aaeeaf90d128ee0ead06be876fe0365d41c5a7610f9f72c7ad09a83bdccb"
 )
 
-type inverseKeyPolicyResidual string
+type inverseFenceResidual string
 
-// This is an explicit B1-only acceptance of an already-issued PUT racing the
-// final HEAD/unconditional DELETE. It is not evidence of remote completion.
-const inverseApprovedKeyResidual inverseKeyPolicyResidual = "approved_non28_key_overwrite_reappearance_delivery_and_historical_issuance_v1"
+// Owner acceptance of a PUT racing final HEAD/unconditional DELETE or
+// reappearing afterward. This never claims external PUT completion.
+const inverseApprovedFenceResidual inverseFenceResidual = "owner_accepted_head_delete_overwrite_reappearance_v1"
 
-type inverseKeyPolicyEvidence struct {
-	PartitionSHA256                string                   `json:"partition_sha256"`
-	SummarySHA256                  string                   `json:"summary_sha256"`
-	CanaryEvidence                 inverseEvidenceReference `json:"canary_evidence"`
-	ManagedPUTAnalytics            inverseEvidenceReference `json:"managed_put_analytics"`
-	OperatorSigningEvidence        inverseEvidenceReference `json:"operator_signing_evidence"`
-	OperatorSigningStoppedAt       time.Time                `json:"operator_signing_stopped_at"`
-	OperatorSigningObservedThrough time.Time                `json:"operator_signing_observed_through"`
-	ResidualAcceptance             inverseKeyPolicyResidual `json:"residual_acceptance"`
+type inverseFencePolicyEvidence struct {
+	PartitionSHA256    string                   `json:"partition_sha256"`
+	SummarySHA256      string                   `json:"summary_sha256"`
+	LastModifiedBefore time.Time                `json:"last_modified_before"`
+	OwnerDecision      inverseEvidenceReference `json:"owner_decision"`
+	ResidualAcceptance inverseFenceResidual     `json:"residual_acceptance"`
 }
 
 type inverseEvidenceReference struct {
@@ -49,30 +47,33 @@ func (r inverseEvidenceReference) verify() error {
 	return nil
 }
 
+func inverseRetirementCutoff() time.Time {
+	return time.Date(2026, 11, 12, 14, 28, 47, 0, time.UTC)
+}
+
+func inverseLastModifiedAllowed(modified, partition, now time.Time) bool {
+	return !modified.IsZero() && modified.Before(inverseRetirementCutoff()) && modified.Before(partition) && modified.Before(now)
+}
+
 func (e inverseDrainEvidence) validateProof(o inverseApplyOptions) error {
 	switch e.Proof {
 	case inversePUTCompletionProof:
-		if e.KeyPolicy != nil || strings.TrimSpace(e.AcceptedPUTCompletion) == "" || strings.TrimSpace(e.DeployedWriterCoverage) == "" {
-			return errors.New("accepted-PUT completion evidence missing or mixed with key-policy proof")
+		if e.FencePolicy != nil || strings.TrimSpace(e.AcceptedPUTCompletion) == "" || strings.TrimSpace(e.DeployedWriterCoverage) == "" {
+			return errors.New("accepted-PUT completion evidence missing or mixed with owner policy")
 		}
-	case inverseNon28KeyPolicyProof:
-		p := e.KeyPolicy
-		if o.Lane != inverseOutsideKeep28 || p == nil || e.AcceptedPUTCompletion != "" {
-			return errors.New("key-policy proof is exclusive to B1 non-keep28 RAW")
+	case inverseOwnerFenceProof:
+		p := e.FencePolicy
+		if p == nil || e.AcceptedPUTCompletion != "" || e.DeployedWriterCoverage != "" {
+			return errors.New("owner fence policy must not claim PUT completion or writer coverage")
 		}
-		if !r2RetireLowerHex64(p.PartitionSHA256) || p.PartitionSHA256 != o.ManifestSHA || !r2RetireLowerHex64(p.SummarySHA256) || p.SummarySHA256 != o.SummarySHA || p.ResidualAcceptance != inverseApprovedKeyResidual {
-			return errors.New("key-policy partition binding, canary evidence or residual acceptance missing")
+		if e.Bucket != "stoarama" || !e.FenceActivatedAt.Truncate(time.Second).Equal(inverseRetirementCutoff()) || !p.LastModifiedBefore.Equal(inverseRetirementCutoff()) || !e.DrainNotBefore.After(e.FenceActivatedAt) {
+			return errors.New("owner fence policy cutoff or activation differs")
 		}
-		for _, ref := range []inverseEvidenceReference{p.CanaryEvidence, p.ManagedPUTAnalytics, p.OperatorSigningEvidence} {
-			if err := ref.verify(); err != nil {
-				return err
-			}
+		if !r2RetireLowerHex64(p.PartitionSHA256) || p.PartitionSHA256 != o.ManifestSHA || !r2RetireLowerHex64(p.SummarySHA256) || p.SummarySHA256 != o.SummarySHA || p.ResidualAcceptance != inverseApprovedFenceResidual || p.OwnerDecision.SHA256 != inverseOwnerDecisionSHA256 {
+			return errors.New("owner fence policy partition binding, decision or race acceptance missing")
 		}
-		// Preserve the immutable fence minimum. B1 does not infer completion or
-		// a historical issuance census from it. The controller substantiates
-		// its current canary/analytics records and two-hour no-signing window.
-		if !e.DrainNotBefore.Equal(e.FenceActivatedAt.Add(7*24*time.Hour+2*time.Minute)) || p.OperatorSigningStoppedAt.IsZero() || p.OperatorSigningStoppedAt.After(e.ObservedAt.Add(-2*time.Hour)) || p.OperatorSigningObservedThrough.IsZero() || !p.OperatorSigningObservedThrough.Equal(e.ObservedAt) {
-			return errors.New("key-policy fence or operator no-signing window not substantiated")
+		if err := p.OwnerDecision.verify(); err != nil {
+			return err
 		}
 	default:
 		return errors.New("explicit supported writer proof required")
