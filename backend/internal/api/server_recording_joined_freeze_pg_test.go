@@ -36,6 +36,8 @@ func requireJoinedTestReplicationRole(t *testing.T, pool *pgxpool.Pool) {
 }
 
 var joinedMigrationNames = []string{
+	// Defer with 0167; the final MigrateUp applies both in dependency order.
+	"0209_nas_cleanup_permanent_holds.sql",
 	"0208_nas_storage_v6_binding.sql",
 	"0207_nas_cleanup_reservation_lookup.sql",
 	"0206_nas_cleanup_manifest_keys.sql",
