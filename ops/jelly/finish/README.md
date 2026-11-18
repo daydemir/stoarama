@@ -25,7 +25,7 @@ every state are excluded from ordinary import; blocked work is never requeued.
 Verified work is unchanged except for the explicit bounded verify-only refresh
 lane described below. Live
 source validation, holds, destination ambiguity and queue equality stay in the
-existing exact-manifest importer. Partial imports resume idempotently. An advisory
+existing exact-manifest importer. Partial imports remain stopped until explicit controller reconciliation. An advisory
 lock excludes concurrent feeders. Existing queue IDs/order are preserved.
 
 Tier 3 requires fresh storage data and at least 300 GB headroom above the 2 TB
@@ -180,7 +180,7 @@ time, then install D. A v4 observation packet is not late-budget eligible.
 
 1. Build the merged CLI on Jelly using `darma storage check` then
    `darma run --slot -- go -C backend build -o <install>/stoaramactl ./cmd/stoaramactl`.
-   Copy `tick.py` and `refresh_recovery.py` to the private install directory. Do not reuse or modify the
+   Copy `tick.py`, `refresh_recovery.py`, `admission.py` and `reconcile.py` to the private install directory. Do not reuse or modify the
    cleanup runner's code/state/launchd job. Create a separate private state dir.
 2. Provide the executable safety collector described above. Configure credentials
    non-interactively for the CLI and collector using existing controller auth;
@@ -239,7 +239,7 @@ time, then install D. A v4 observation packet is not late-budget eligible.
 | `status_write_failed` | CLI could not publish status; stderr only. Repair storage. Dead-man sees the old timestamp. |
 
 Every CLI stop exits nonzero; wrapper alerts with `darma msg`. Dependency failure
-also alerts and leaves the last CLI status age unchanged. State directory/lock failures also alert. A failed invocation without its own
+also alerts and publishes a stop. State directory/lock failures also alert. A failed invocation without its own
 status reports `current_status_unavailable`, never a prior stop reason.
 Raw subprocess errors
 are suppressed to keep credential-bearing URLs out of logs/notifications.
@@ -311,3 +311,60 @@ custody to B2 removal. Repeated hashing and imperfect timing are accepted bounde
 waste while enabled. No refresh counter or enable flag grants DELETE authority;
 B2 still checks exact fresh locked custody, policy/holds, HEAD7d, mature0198 fence,
 substantiated drain evidence, durable intent/ledger and its own single-use token.
+
+## Durable admission and reconciliation
+
+Both wrappers retain their existing lane flocks. A short shared `admission.lock`
+serializes journal transitions and status publication, without serializing the
+30-minute verifier with ordinary feeding. `admission.json` records an active
+attempt **before any subprocess**. A failed or interrupted attempt stops both
+lanes until controller reconciliation. Later launches exit nonzero, start no
+subprocess and never overwrite failure evidence or publish success. An in-flight
+sibling cannot publish success after the other lane latches a failure.
+
+Each failed attempt retains its private `tick-<id>` / `recovery-<id>` directory:
+input evidence, original CLI status/verifier output, return code if available,
+and failure reason. Raw verifier detail stays private, out of canonical status
+and logs. Successful scratch attempts are removed. Existing failed status or
+recovery evidence is archived under `legacy-<id>` and latches first installation;
+absence of a new journal never erases a legacy failure. A full-disk failure to
+record a result leaves the pre-subprocess active marker unresolved, blocking retry.
+
+Only the sole controller, at a newly authorized boundary, may reconcile. First
+stop admission and reconcile the actual attempt's entire committed queue subset,
+including terminal rows, against pre-attempt identities and manifest/policy
+hashes. Counters and queue-depth differences are insufficient. Preserve the
+read-only extraction and actual before/after comparison as the evidence artifact;
+never delete/requeue work or remove any hold to make it pass.
+
+`python3 <install>/reconcile.py --state <state> --inspect` acquires **both** lane
+flocks, refuses running work, and prints the exact `latch_sha256` and journal.
+Bind two retained JSON artifacts to that digest:
+
+- Authority: `controller` (identity), `authority` (new explicit root authority),
+  `latch_sha256`.
+- Evidence: `latch_sha256`, `queue_reconciled: true`, and `reconciled_attempts`
+  listing every directory in the journal's `active` map. Include the actual
+  queue extraction/comparison and its hashes in this artifact. The controller
+  is responsible for reviewing that evidence; the command validates bindings,
+  not production truth.
+
+Then run `python3 <install>/reconcile.py --state <state>
+--expected-latch-sha256 <digest> --authority <authority.json>
+--evidence <evidence.json>` as one command. It refuses changed bytes or running
+work, durably records controller, OS UID, time, full stopped journal and both
+artifact SHA256s under `reconciliations/`, and clears admission only. All failed
+attempts and canonical errors remain. The digest covers every active attempt's
+evidence, so an in-flight outcome cannot be omitted from reconciliation.
+
+Resumption is **recovery first**: ticks remain blocked without relatching until
+one actual recovery invocation succeeds. Then normal feeding may resume, using
+fresh evidence. Neither periodic launch can reconcile, restore last-good data,
+or restamp the old recovery timestamp. No command here grants production GO.
+
+The ordinary selection and live loader independently consult immutable incident
+source IDs and roster identities/keys, including collated dependencies. Migration
+`0209_nas_cleanup_permanent_holds.sql` adds unconditional DELETE/TRUNCATE rejection
+on source holds. No legitimate removal lifecycle exists: releases use append-only
+receipts. Incident roster/source views are immutable VALUES views from 0202 and
+already reject DELETE/TRUNCATE. There is no data rewrite or role exemption.

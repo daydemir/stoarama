@@ -25,7 +25,7 @@ if sys.argv[1:]==['nas-r2-copy','status','--json']:
 else:
     assert sys.argv[sys.argv.index('--refresh-picks')+1].endswith('picks.json')
     assert sys.argv[sys.argv.index('--expected-refresh-picks-sha256')+1]=='a'*64
-    Path(sys.argv[sys.argv.index('--status')+1]).write_text('{"queue_depth":10000}')
+    Path(sys.argv[sys.argv.index('--status')+1]).write_text('{"schema":"stoarama.finish-status.v1","updated_at":"2026-11-17T07:00:00Z","queue_depth":10000}')
 ''')
                 darma = root / 'darma'
                 darma.write_text('#!/bin/sh\necho "$*" > "' + str(root / 'notification') + '"\n')
@@ -38,7 +38,7 @@ else:
                 self.assertEqual(result.returncode, 0 if success else 1)
                 self.assertNotIn(b'SECRET', result.stdout + result.stderr)
                 self.assertEqual((root / 'notification').exists(), not success)
-                self.assertEqual((root / 'state/status.json').exists(), success)
+                self.assertTrue((root / 'state/status.json').exists())
 
     def test_state_failure_and_stale_status_alert_current_failure(self):
         wrapper = Path(__file__).with_name('tick.py')
@@ -65,6 +65,10 @@ else:
                                          '--safety-collector', str(collector), '--notify-agent', 'deniz'],
                                         env={**os.environ, 'PATH': str(root) + ':' + os.environ['PATH']}, capture_output=True)
                 self.assertEqual(result.returncode, 1)
+                if failure == 'status':
+                    self.assertFalse((root / 'notification').exists())
+                    self.assertEqual(json.loads((state / 'status.json').read_text())['stop_reason'], 'copy_mismatch_latched')
+                    continue
                 notification = (root / 'notification').read_text()
                 self.assertNotIn('copy_mismatch_latched', notification)
                 self.assertIn('current_status_unavailable' if failure == 'status' else 'dependency_failed', notification)

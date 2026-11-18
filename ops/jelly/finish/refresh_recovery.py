@@ -7,11 +7,11 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import tempfile
 from datetime import datetime
 import re
 
 from tick import notify
+from admission import Attempt, Latched, publish
 
 FIELDS = ('plan_id', 'plan_sha256', 'delete_ever_issued', 'verified', 'problems', 'checked_at')
 
@@ -30,19 +30,6 @@ def validate_checked_at(value):
     datetime.fromisoformat(normalized)
 
 
-def publish(path, record):
-    with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as output:
-        temp = Path(output.name)
-        try:
-            json.dump(record, output)
-            output.flush()
-            os.fsync(output.fileno())
-            output.close()
-            os.replace(temp, path)
-        finally:
-            temp.unlink(missing_ok=True)
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--cli', required=True, type=Path)
@@ -52,14 +39,16 @@ def main():
     ap.add_argument('--notify-agent', required=True)
     args = ap.parse_args()
     reason = 'recovery_refresh_failed'
-    try:
-        with ExitStack() as stack:
+    attempt = None
+    with ExitStack() as stack:
+        try:
             args.state.mkdir(parents=True, exist_ok=True, mode=0o700)
             lock = stack.enter_context((args.state / 'recovery.lock').open('a'))
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                return 0
+                return 1
+            attempt = Attempt(args.state, 'recovery')
             source = subprocess.run([str(args.plan_source)], capture_output=True, timeout=30, check=True)
             source_record=json.loads(source.stdout)
             if not isinstance(source_record,dict):
@@ -67,13 +56,16 @@ def main():
             plan = source_record['plan_id']
             if type(plan) is not int or plan <= 0:
                 raise ValueError('invalid plan')
+            publish(attempt.path / 'plan.json', {'plan_id': plan})
             # Keep potentially credential-bearing stderr and raw problem detail
             # out of logs and the published record. The CLI owns checked_at.
-            with tempfile.TemporaryFile() as output:
+            with (attempt.path / 'verifier.json').open('w+b') as output:
+                os.chmod(output.name, 0o600)
                 result = subprocess.run([str(args.cli), 'nas-cleanup', 'verify-recovery', '--plan-id', str(plan)],
                                         stdout=output, stderr=subprocess.DEVNULL, timeout=1800)
                 output.seek(0)
                 raw = output.read(2 * 1024 * 1024 + 1)
+            publish(attempt.path / 'result.json', {'returncode': result.returncode})
             if len(raw) > 2 * 1024 * 1024:
                 raise ValueError('oversize report')
             record = json.loads(raw)
@@ -92,21 +84,28 @@ def main():
                       and record['verified'] == record['delete_ever_issued'])
             if not passed and record['problems'] == 0:
                 raise ValueError('verifier failed without problem report')
-            publish(args.state / 'recovery.json', record)
-            if passed:
-                publish(args.state / 'recovery-last-good.json', record)
+            publish(attempt.path / 'report.json', record)
+            reason = '' if passed else 'cleanup_recovery_problems'
+            if attempt.finish(reason, record):
                 return 0
-            reason = 'cleanup_recovery_problems'
-    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
-        try:
-            publish(args.state / 'recovery.json', {'refresh_error': reason})
-        except OSError:
-            # Unlink needs no replacement allocation. A full disk must not leave
-            # the previous success consumable after a failed verification.
+            notify(args.notify_agent, reason or 'recovery_refresh_failed')
+            return 1
+        except Latched:
+            print('finish admission_latched', flush=True)
+            return 1
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            reason = reason or 'recovery_refresh_failed'
             try:
-                (args.state / 'recovery.json').unlink(missing_ok=True)
+                if attempt is not None:
+                    attempt.finish(reason, {})
+                publish(args.state / 'recovery.json', {'refresh_error': reason})
             except OSError:
-                reason = 'recovery_invalidation_failed'
+                # Unlink needs no replacement allocation. A full disk must not leave
+                # the previous success consumable after a failed verification.
+                try:
+                    (args.state / 'recovery.json').unlink(missing_ok=True)
+                except OSError:
+                    reason = 'recovery_invalidation_failed'
     notify(args.notify_agent, reason)
     return 1
 

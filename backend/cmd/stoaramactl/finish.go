@@ -240,6 +240,8 @@ WHERE c.purged_at IS NULL AND c.clip_start_at<w.end_at AND c.clip_end_at>w.start
  AND coalesce(nullif(s.local_timezone,''),r.cron_timezone,'')=w.timezone
  AND c.bucket<>'' AND c.object_key LIKE 'managed/%' AND c.size_bytes>0 AND c.size_bytes<=$2 AND lower(c.sha256) ~ '^[a-f0-9]{64}$' AND c.display_path<>''
  AND NOT EXISTS(SELECT 1 FROM nas_r2_copy_items q WHERE q.connection_id=13 AND q.kind='raw' AND q.source_id=c.id)
+ AND NOT EXISTS(SELECT 1 FROM nas_cleanup_incident_sources i WHERE i.clip_id=c.id)
+ AND NOT EXISTS(SELECT 1 FROM nas_cleanup_incident_roster i WHERE (i.kind='raw' AND i.source_id=c.id) OR (i.bucket=c.bucket AND i.object_key=c.object_key))
  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_reserved_files f WHERE f.kind='raw' AND f.source_id=c.id)
  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id WHERE h.clip_id=c.id AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued)))
  AND NOT EXISTS(SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='raw' AND x.source_id=c.id)

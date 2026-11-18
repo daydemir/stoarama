@@ -23,6 +23,8 @@ func nasCopyQueueFixture(t *testing.T, count int, apply bool) (*pgxpool.Pool, *p
 	pool := joinedPurgeTestPool(t, "nas_copy_queue")
 	ctx := context.Background()
 	_, err := pool.Exec(ctx, `CREATE TABLE connections(id bigint PRIMARY KEY);
+CREATE TABLE nas_cleanup_incident_roster(kind text,source_id bigint,bucket text,object_key text,raw_source_ids bigint[]);
+CREATE VIEW nas_cleanup_incident_sources AS SELECT DISTINCT unnest(raw_source_ids) clip_id FROM nas_cleanup_incident_roster;
 CREATE TABLE streams(id bigint PRIMARY KEY,local_timezone text);
 CREATE TABLE recordings(id bigint PRIMARY KEY,account_id bigint,stream_id bigint,cron_timezone text);
 CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint,bucket text,object_key text,sha256 text,size_bytes bigint,display_path text,clip_start_at timestamptz,clip_end_at timestamptz,purged_at timestamptz);
