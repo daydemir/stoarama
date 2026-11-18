@@ -65,7 +65,7 @@ func feedKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefreshO
 	var scanAt *time.Time
 	var scanID int64
 	if err := pool.QueryRow(ctx, `SELECT enabled,scan_custody_at,scan_source_id FROM r2_keep28_refresh_control`).Scan(&enabled, &scanAt, &scanID); err != nil {
-		return 0, finishKnownDBError(finishRefreshControl, err)
+		return 0, finishDBError(finishRefreshControl, 0, err)
 	}
 	if !enabled {
 		return 0, nil
@@ -103,7 +103,7 @@ func feedKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefreshO
 	}
 	catalog, err := beginFinishCandidateTx(ctx, pool)
 	if err != nil {
-		return 0, finishKnownDBError(finishRefreshCatalogBegin, err)
+		return 0, finishDBError(finishRefreshCatalogBegin, 0, err)
 	}
 	defer rollbackFinishCandidateTx(catalog)
 	rows, err := catalog.Query(ctx, `SELECT q.item,coalesce(c.etag,''),LEAST(n.verified_at,n.server_received_at),c.id FROM nas_r2_copy_items q JOIN recording_clips c ON c.id=q.source_id
@@ -111,7 +111,7 @@ func feedKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefreshO
  WHERE c.bucket='stoarama' AND c.purged_at IS NULL AND q.connection_id=13 AND q.kind='raw' AND q.state='verified' AND q.blocked_reason='' AND q.policy_sha256=$1
  AND `+finishRefreshExactSQL+` ORDER BY ($2::timestamptz IS NOT NULL AND (LEAST(n.verified_at,n.server_received_at),c.id)<=($2,$3::bigint)),LEAST(n.verified_at,n.server_received_at),c.id LIMIT $4`, policy, scanAt, scanID, finishTarget)
 	if err != nil {
-		return 0, finishKnownDBError(finishRefreshCatalogSelect, err)
+		return 0, finishDBError(finishRefreshCatalogSelect, 0, err)
 	}
 	type candidate struct {
 		item      api.NASR2CopyItem
@@ -125,21 +125,21 @@ func feedKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefreshO
 		var c candidate
 		if err = rows.Scan(&data, &c.etag, &c.custodyAt, &c.sourceID); err != nil {
 			rows.Close()
-			return 0, finishKnownDBError(finishRefreshCatalogSelect, err)
+			return 0, finishDBError(finishRefreshCatalogSelect, 0, err)
 		}
 		if err = json.Unmarshal(data, &c.item); err != nil {
 			rows.Close()
-			return 0, finishKnownDBError(finishRefreshCatalogSelect, err)
+			return 0, err
 		}
 		candidates = append(candidates, c)
 	}
 	err = rows.Err()
 	rows.Close()
 	if err != nil {
-		return 0, finishKnownDBError(finishRefreshCatalogSelect, err)
+		return 0, finishDBError(finishRefreshCatalogSelect, 0, err)
 	}
 	if err = catalog.Commit(ctx); err != nil {
-		return 0, finishKnownDBError(finishRefreshCatalogCommit, err)
+		return 0, finishDBError(finishRefreshCatalogCommit, 0, err)
 	}
 	// Advance the bounded catalog page before per-key work, including rejects
 	// or a process stop. Circular expiry/source ordering visits later work on
@@ -149,7 +149,7 @@ func feedKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefreshO
 		last := candidates[len(candidates)-1]
 		tag, err := pool.Exec(ctx, `UPDATE r2_keep28_refresh_control SET scan_custody_at=$1,scan_source_id=$2 WHERE singleton AND enabled`, last.custodyAt, last.sourceID)
 		if err != nil {
-			return 0, finishKnownDBError(finishRefreshCursor, err)
+			return 0, finishDBError(finishRefreshCursor, 0, err)
 		}
 		if tag.RowsAffected() != 1 {
 			status.RefreshHold = finishRefreshDisabled
@@ -187,11 +187,11 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 	}
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	defer rollbackFinishCandidateTx(tx)
 	if _, err = tx.Exec(ctx, `SET LOCAL statement_timeout='10s'; SET LOCAL lock_timeout='2s'; SET LOCAL work_mem='16MB'`); err != nil {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	if err = inverseProtectionBarrier(ctx, tx); err != nil {
 		return false, finishKnownDBError(finishRefreshAdmission, err)
@@ -201,13 +201,13 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 	}
 	var current int64
 	if err = tx.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch`).Scan(&current); err != nil {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	if current != epoch {
 		return false, errors.New("refresh catalog changed; retry with fresh picks/catalog")
 	}
 	if _, err = tx.Exec(ctx, `SELECT lock_nas_r2_copy_key($1,$2)`, i.Bucket, i.ObjectKey); err != nil {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	e := inverseEntry{ObjectInfo: r2.ObjectInfo{Key: i.ObjectKey, ETag: etag, SizeBytes: i.SizeBytes}, Class: inverseKeep28}
 	target, err := loadInverseRawTarget(ctx, tx, i.Bucket, p, inverseNASKeep28, e)
@@ -219,18 +219,18 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 	}
 	var recording int64
 	if err = tx.QueryRow(ctx, `SELECT recording_id FROM recording_clips WHERE id=$1`, target.ID).Scan(&recording); err != nil {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	if target.ID != i.SourceID || recording != i.RecordingID || target.StreamID != i.StreamID || target.Path != i.RelativePath || target.Size != i.SizeBytes || target.SHA != i.SHA256 || !target.Identity.Start.Equal(i.StartAt) || !target.Identity.End.Equal(i.EndAt) {
 		return false, nil
 	}
 	var held bool
 	if err = tx.QueryRow(ctx, inverseRawHeldSQL, target.ID, i.Bucket, i.ObjectKey, "", target.Path, target.SHA, target.Size).Scan(&held); err != nil || held {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	var exact bool
 	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_clips c JOIN nas_inventory_files n ON n.clip_id=c.id WHERE c.id=$1 AND `+finishRefreshExactSQL+`)`, i.SourceID).Scan(&exact); err != nil || !exact {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	data, _ := json.Marshal(i)
 	var id int64
@@ -239,17 +239,17 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 		return false, nil
 	}
 	if err != nil {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	var total, refresh int
 	if err = tx.QueryRow(ctx, `SELECT count(*),count(*) FILTER(WHERE state IN ('refresh_pending','refresh_leased')) FROM nas_r2_copy_items WHERE connection_id=13 AND state IN ('pending','leased','refresh_pending','refresh_leased')`).Scan(&total, &refresh); err != nil {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	if total >= finishTarget || refresh >= finishRefreshTarget {
 		return false, nil
 	}
 	if err = finishCleanupValve(ctx, tx, status); err != nil {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	if !api.SupportsNASStorageBudget(status.NASSpaceClientVersion) {
 		status.RefreshHold = finishLateClientUnknown
@@ -265,7 +265,7 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 	}
 	var charged int64
 	if err = tx.QueryRow(ctx, finishLateDebitsSQL, status.NASSpaceCheckedAt.Add(-finishLateDebitWindow)).Scan(&charged); err != nil {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	status.QueueReservedBytes = charged
 	if i.SizeBytes > max(int64(0), *status.NASFreeBytes-api.NASR2CopyFloor-api.NASR2CopyRangeBytes-charged) {
@@ -274,18 +274,18 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 	}
 	var enabled bool
 	if err = tx.QueryRow(ctx, `SELECT enabled FROM r2_keep28_refresh_control FOR SHARE`).Scan(&enabled); err != nil || !enabled {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	picks, err := loadR2RetirePicks(o.Picks)
 	if err != nil {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, err
 	}
 	if picks.SHA256 != o.PicksSHA {
 		return false, errors.New("refresh picks changed")
 	}
 	_, err = tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='refresh_pending',work_mode='verify_existing',lease_token=NULL,lease_expires_at=NULL,range_until=NULL,range_id=NULL,range_length=0,updated_at=clock_timestamp() WHERE id=$1`, id)
 	if err != nil {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
-	return true, finishKnownDBError(finishRefreshAdmission, tx.Commit(ctx))
+	return true, finishDBError(finishRefreshAdmission, 0, tx.Commit(ctx))
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -27,6 +29,7 @@ func TestFinishDatabaseFailureDoesNotExposeDriverSecrets(t *testing.T) {
 		{&net.DNSError{Err: "SECRET", Name: "SECRET"}, finishDBDNS, ""},
 		{&net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}, finishDBRefused, ""},
 		{net.ErrClosed, finishDBClosed, ""},
+		{io.ErrUnexpectedEOF, finishDBClosed, ""},
 	} {
 		err := finishDBError(finishCandidateQuery, finishExactInventory, test.err)
 		var failure *finishDatabaseFailure
@@ -122,5 +125,31 @@ func TestFinishRefreshAndImportDatabaseDiagnostics(t *testing.T) {
 	validation := errors.New("identity mismatch")
 	if got := finishKnownDBError(finishImportSource, validation); got != validation {
 		t.Fatal("validation became a database failure")
+	}
+}
+
+func TestFinishDroppedConnectionAndUnknownDriverDiagnostics(t *testing.T) {
+	for _, statement := range []finishStatement{finishRefreshCatalogSelect, finishImportInsert} {
+		err := finishDBError(statement, 0, fmt.Errorf("driver read: %w", io.ErrUnexpectedEOF))
+		if statement == finishImportInsert {
+			err = finishImportFailure(finishExactInventory, err)
+		}
+		var failure *finishDatabaseFailure
+		if !errors.As(err, &failure) || failure.Cause != finishDBClosed || failure.Statement != statement {
+			t.Fatalf("dropped connection hidden: %v", err)
+		}
+		data, _ := json.Marshal(finishStatus{DatabaseFailure: failure})
+		var status finishStatus
+		if err := json.Unmarshal(data, &status); err != nil || status.DatabaseFailure.Cause != finishDBClosed {
+			t.Fatalf("durable connection cause lost: %s %v", data, err)
+		}
+		if statement == finishImportInsert && (failure.Tier != finishExactInventory || !errors.Is(err, finishImport)) {
+			t.Fatal("partial import disposition/tier lost")
+		}
+	}
+	unknown := finishDBError(finishImportInsert, finishExactInventory, errors.New("driver-only secret"))
+	var failure *finishDatabaseFailure
+	if !errors.As(unknown, &failure) || failure.Statement != finishImportInsert || failure.Cause != finishDBOther || strings.Contains(failure.Error(), "secret") {
+		t.Fatalf("unrecognized driver boundary lost: %v", unknown)
 	}
 }

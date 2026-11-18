@@ -75,6 +75,9 @@ func (e *finishDatabaseFailure) Error() string {
 }
 func (e *finishDatabaseFailure) Unwrap() []error { return []error{finishDatabase, e.err} }
 func finishDBError(statement finishStatement, tier finishTier, err error) error {
+	if err == nil {
+		return nil
+	}
 	var existing *finishDatabaseFailure
 	if errors.As(err, &existing) {
 		return err
@@ -109,7 +112,7 @@ func finishDBError(statement finishStatement, tier finishTier, err error) error 
 		e.Cause = finishDBRefused
 	case errors.As(err, &network) && network.Timeout():
 		e.Cause = finishDBNetworkTimeout
-	case errors.Is(err, io.EOF), errors.Is(err, net.ErrClosed):
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, net.ErrClosed):
 		e.Cause = finishDBClosed
 	case errors.As(err, &connect), errors.As(err, &network):
 		e.Cause = finishDBConnection
