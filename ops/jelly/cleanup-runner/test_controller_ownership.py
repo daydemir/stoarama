@@ -6,11 +6,66 @@ import tempfile
 import threading
 from contextlib import ExitStack
 import unittest
+from cli_exec_guard import guard_test_module
+
+
+def setUpModule():
+    guard_test_module()
 
 
 class ControllerOwnershipTests(unittest.TestCase):
+    def test_failure_stop_is_atomic_owner_bound_and_preserves_existing_stop(self):
+        with tempfile.TemporaryDirectory() as root:
+            job, _ = self.job(root)
+            job.status['owner_id'] = '00000000-0000-0000-0000-000000000001'
+            job.write_failure_stop()
+            stop = job.root / 'STOP'
+            report = json.loads(stop.read_bytes())
+            self.assertEqual(report['schema'], 'stoarama.cleanup-stop.v1')
+            self.assertEqual(report['reason'], 'failure')
+            self.assertEqual(report['owner_id'], job.status['owner_id'])
+            self.assertEqual(stop.stat().st_mode & 0o777, 0o600)
+            for raw in (b'', b'foreign STOP', stop.read_bytes()):
+                stop.write_bytes(raw)
+                before = stop.stat()
+                job.write_failure_stop()
+                self.assertEqual(stop.read_bytes(), raw)
+                self.assertEqual(stop.stat().st_ino, before.st_ino)
+                self.assertEqual(stop.stat().st_mtime_ns, before.st_mtime_ns)
+
+    def test_zero_issued_dry_run_is_verified_without_publishing_checkpoint(self):
+        with tempfile.TemporaryDirectory() as root:
+            job, plan = self.job(root)
+            job.status.update(recovery_plan_id=1440, recovery_plan_sha256='c'*64)
+            before = dict(job.status)
+            report = dict(plan_id=42, plan_sha256='b'*64, items=1, delete_ever_issued=0,
+                          verified=0, problems=0, checked_at=NOW.isoformat())
+            proc = type('Result', (), dict(returncode=0, stdout=json.dumps(report).encode()))()
+            with patch.object(r, 'bound_launcher', return_value=Path('/fixture/stoaramactl.bin')), patch.object(r.subprocess, 'run') as run, patch.object(r, 'utcnow', return_value=NOW):
+                run.return_value = proc
+                job.recovery(plan)
+                self.assertEqual(run.call_args.args[0][0], '/fixture/stoaramactl.bin')
+            self.assertEqual(job.status, before)
+            self.assertFalse((job.root / 'recovery-42.json').exists())
+            self.assertIn('zero-issued dry_run: verified, not published', (job.root / 'runner.jsonl').read_text())
+
+    def test_missing_verifier_timestamp_is_a_named_contract_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            job, plan = self.job(root)
+            report = dict(plan_id=42, plan_sha256='b'*64, items=1, delete_ever_issued=0,
+                          verified=0, problems=0)
+            proc = type('Result', (), dict(returncode=0, stdout=json.dumps(report).encode()))()
+            with patch.object(r, 'bound_launcher', return_value=Path('/fixture/stoaramactl.bin')), patch.object(r.subprocess, 'run') as run:
+                run.return_value = proc
+                with self.assertRaisesRegex(r.Halt, 'recovery verifier contract: required field missing'):
+                    job.recovery(plan)
+
     def job(self, root):
+        resolver = patch.object(r, 'bound_launcher', return_value=Path('/fixture/stoaramactl.bin'))
+        resolver.start()
+        self.addCleanup(resolver.stop)
         job = r.Runner(Path('.'), Path(root))
+        job.status['owner_id'] = '00000000-0000-0000-0000-000000000001'
         job.owner_validated = True
         job.admission = FINISH_ADMISSION
         job.finish_state = Path(root) / 'finish'

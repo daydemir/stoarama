@@ -11,6 +11,7 @@ import re
 
 from tick import notify
 from admission import Attempt, Latched, publish
+from cli_binding import bound_launcher
 
 FIELDS = ('plan_id', 'plan_sha256', 'delete_ever_issued', 'verified', 'problems', 'checked_at')
 
@@ -43,6 +44,7 @@ def main():
         try:
             args.state.mkdir(parents=True, exist_ok=True, mode=0o700)
             attempt = Attempt.start(args.state, 'recovery', stack)
+            args.cli = bound_launcher(args.cli)
             source = subprocess.run([str(args.plan_source)], capture_output=True, timeout=30, check=True)
             source_record=json.loads(source.stdout)
             if not isinstance(source_record,dict):
@@ -89,7 +91,7 @@ def main():
                 notify(args.notify_agent, 'admission_publication_failed')
             print('finish admission_latched', flush=True)
             return 1
-        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
             reason = reason or 'recovery_refresh_failed'
             try:
                 if attempt is not None:

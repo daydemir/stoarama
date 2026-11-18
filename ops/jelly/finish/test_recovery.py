@@ -1,3 +1,4 @@
+from cli_binding_fixture import environment as binding_environment
 import json
 import os
 from pathlib import Path
@@ -5,6 +6,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from cli_exec_guard import guard_test_module
+
+
+def setUpModule():
+    guard_test_module()
 
 
 class RecoveryRefreshTest(unittest.TestCase):
@@ -26,7 +32,7 @@ class RecoveryRefreshTest(unittest.TestCase):
                     executable.chmod(0o700)
                 result = subprocess.run([sys.executable, str(script), '--cli', str(cli), '--state', str(root / 'state'),
                                          '--plan-source', str(source), '--notify-agent', 'deniz'],
-                                        env={**os.environ, 'PATH': str(root) + ':' + os.environ['PATH']}, capture_output=True)
+                                        env={**os.environ, **binding_environment(root, cli), 'PATH': str(root) + ':' + os.environ['PATH']}, capture_output=True)
                 self.assertEqual(result.returncode, 0 if success else 1)
                 saved = (root / 'state/recovery.json').read_text()
                 self.assertNotIn('SECRET', saved)

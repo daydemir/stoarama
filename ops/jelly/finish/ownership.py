@@ -18,12 +18,18 @@ def digest(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
-def validate_stop(raw, owner, now):
+def parse_stop(raw, owner, now):
     stop = json.loads(raw)
     require(stop['schema'] == 'stoarama.cleanup-stop.v1'
             and stop['owner_id'] == owner['owner_id']
-            and stop['reason'] == 'natural_boundary'
+            and stop['reason'] in {'natural_boundary', 'failure'}
             and timestamp(stop['created_at']) <= now)
+    return stop
+
+
+def validate_stop(raw, owner, now):
+    # Failure containment is valid STOP syntax but never healthy feed evidence.
+    require(parse_stop(raw, owner, now)['reason'] == 'natural_boundary')
 
 
 def owner_plan(status, owner):

@@ -1,3 +1,4 @@
+from cli_binding_fixture import environment as binding_environment
 import importlib.util
 import json
 import os
@@ -6,6 +7,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from cli_exec_guard import guard_test_module
+
+
+def setUpModule():
+    guard_test_module()
 
 
 class WrapperTest(unittest.TestCase):
@@ -34,7 +40,7 @@ else:
                 result = subprocess.run([sys.executable, str(wrapper), '--cli', str(cli), '--state', str(root / 'state'),
                                          '--safety-collector', str(collector), '--notify-agent', 'deniz',
                                          '--refresh-picks', str(root/'picks.json'), '--expected-refresh-picks-sha256', 'a'*64],
-                                        env={**os.environ, 'PATH': str(root) + ':' + os.environ['PATH']}, capture_output=True)
+                                        env={**os.environ, **binding_environment(root, cli), 'PATH': str(root) + ':' + os.environ['PATH']}, capture_output=True)
                 self.assertEqual(result.returncode, 0 if success else 1)
                 self.assertNotIn(b'SECRET', result.stdout + result.stderr)
                 self.assertEqual((root / 'notification').exists(), not success)
@@ -63,7 +69,7 @@ else:
                     executable.chmod(0o700)
                 result = subprocess.run([sys.executable, str(wrapper), '--cli', str(cli), '--state', str(state),
                                          '--safety-collector', str(collector), '--notify-agent', 'deniz'],
-                                        env={**os.environ, 'PATH': str(root) + ':' + os.environ['PATH']}, capture_output=True)
+                                        env={**os.environ, **binding_environment(root, cli), 'PATH': str(root) + ':' + os.environ['PATH']}, capture_output=True)
                 self.assertEqual(result.returncode, 1)
                 if failure == 'status':
                     self.assertFalse((root / 'notification').exists())

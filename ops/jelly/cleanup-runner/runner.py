@@ -16,11 +16,15 @@ import subprocess
 import sys
 import time
 import threading
+import tempfile
 from contextlib import contextmanager
 from fractions import Fraction
 from datetime import datetime, timezone
 import urllib.error
 import urllib.request
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cli_binding import bound_launcher, ContractError as CLIBindingError
 
 API = 'https://stoarama-api.onrender.com'
 POLICY = 'backend/internal/api/nas_cleanup_keep28_policy.json'
@@ -993,13 +997,15 @@ class Runner:
 
         def check():
             try:
-                proc = subprocess.run(['/Users/jelly/tmp-safeguards/stoaramactl', 'nas-cleanup', 'verify-recovery',
+                proc = subprocess.run([str(bound_launcher()), 'nas-cleanup', 'verify-recovery',
                     '--plan-id', str(plan['id']), '--backend-api-url', API],
                     env=os.environ.copy(), capture_output=True, timeout=1800)
             except subprocess.TimeoutExpired:
                 raise ReadFailure('recovery CLI timeout') from None
             except OSError:
                 raise Halt('recovery CLI unavailable') from None
+            except CLIBindingError:
+                raise Halt('recovery CLI binding invalid') from None
             try:
                 summary = json.loads(proc.stdout)
             except (ValueError, UnicodeError):
@@ -1007,6 +1013,9 @@ class Runner:
                 if proc.returncode:
                     raise ReadFailure('recovery CLI read failed') from None
                 raise Halt('invalid recovery summary') from None
+            require(isinstance(summary, dict) and all(key in summary for key in (
+                    'plan_id', 'plan_sha256', 'items', 'delete_ever_issued',
+                    'verified', 'problems', 'checked_at')), 'recovery verifier contract: required field missing')
             require(summary['plan_id'] == plan['id'] and summary['plan_sha256'] == plan['plan_sha256']
                     and summary['items'] == len(plan['items']) and summary['delete_ever_issued'] == issued,
                     'R2 recovery report identity differs')
@@ -1020,6 +1029,15 @@ class Runner:
         r = self.read('recovery verification', check)
         require(r['verified'] == issued and r['problems'] == 0, 'R2 recovery verification failed')
         require(timestamp(r['checked_at']) <= utcnow(), 'recovery time is in the future')
+        if plan['mode'] == 'dry_run' and issued == 0:
+            require(all(row['delete_ever_issued'] is False for row in results(plan)),
+                    'recovery verifier contract: invalid issuance flag')
+            with (self.root / 'runner.jsonl').open('a') as output:
+                output.write(json.dumps(dict(at=utcnow().isoformat(), phase='recovery_not_published',
+                    plan_id=plan['id'], plan_sha256=plan['plan_sha256'],
+                    reason='zero-issued dry_run: verified, not published', report=r)) + '\n')
+                output.flush(); os.fsync(output.fileno())
+            return  # Preserve the last real execution checkpoint and its report.
         path = self.root / ('recovery-' + str(plan['id']) + '.json')
         tmp = path.with_suffix('.tmp')
         with tmp.open('w') as output:
@@ -1167,8 +1185,8 @@ class Runner:
                 return
             if self.stopped():
                 break
-            # Admission is read-only on the NAS and still happens with master
-            # OFF. Never prepare more than one successor. Its own independent
+            # Admission is read-only on the NAS under the controller's master.
+            # Never prepare more than one successor. Its own independent
             # verification and every enable gate run after this plan closes.
             if self.status.get('next_plan') is None:
                 # A lost response/crash must not silently admit another plan
@@ -1223,9 +1241,35 @@ class Runner:
         except Exception:
             critical('failure state write failed')
         try:
-            (self.root / 'STOP').touch(mode=0o600)
+            self.write_failure_stop()
         except Exception:
             critical('STOP write failed')
+
+    def write_failure_stop(self):
+        with (self.root / 'ownership.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            owner_id = self.status['owner_id']
+            require(isinstance(owner_id, str) and re.fullmatch('[a-f0-9-]{36}', owner_id),
+                    'failure STOP ownership is unavailable')
+            raw = (json.dumps(dict(schema='stoarama.cleanup-stop.v1', owner_id=owner_id,
+                                   reason='failure', created_at=utcnow().isoformat()), sort_keys=True) + '\n').encode()
+            fd, name = tempfile.mkstemp(prefix='.failure-stop-', dir=self.root)
+            try:
+                with os.fdopen(fd, 'wb') as output:
+                    output.write(raw); output.flush(); os.fsync(output.fileno())
+                # Exclusive publication preserves every existing STOP, even an
+                # empty/foreign file or a concurrent controller's stronger stop.
+                try:
+                    os.link(name, self.root / 'STOP')
+                except FileExistsError:
+                    return
+                directory = os.open(self.root, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            finally:
+                os.unlink(name)
 
 
 def main():

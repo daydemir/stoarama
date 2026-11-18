@@ -267,10 +267,36 @@ def submit(api, label, rows, receipts, rejected, atomic=False):
         submit(api, label + 'b', rows[mid:], receipts, rejected, atomic=atomic)
         return
     detail = service(api, 'GET', 'plans/' + str(result['id']))
-    assert detail['mode'] == 'dry_run' and detail['master_deletion_enabled'] is False and detail['policy_current'] is True
-    assert {(i['kind'], i['source_id']) for i in detail['items']} == {(r['kind'], r['source_id']) for r in rows}
-    receipts.append({'id': result['id'], 'label': label, 'stream_id': rows[0]['stream_id'], 'plan_sha256': result['plan_sha256'], 'items': len(rows), 'bytes': sum(r['size_bytes'] for r in rows)})
+    validate_admission(result, detail, label, rows)
+    receipts.append({'id': result['id'], 'label': label, 'stream_id': rows[0]['stream_id'], 'plan_sha256': result['plan_sha256'], 'items': len(rows), 'bytes': sum(r['size_bytes'] for r in rows), 'master_deletion_enabled': detail['master_deletion_enabled']})
     print(json.dumps({'phase': 'plan_admitted_dry_run', **receipts[-1]}), flush=True)
+
+
+def validate_admission(result, detail, label, rows):
+    # Admission is unarmed and read-only regardless of the global master.
+    # Only the runner's independent enable gates may arm this plan.
+    try:
+        expected = [(r['kind'], r['source_id']) for r in rows]
+        actual = [(i['kind'], i['source_id']) for i in detail['items']]
+        reports = detail['results']
+        valid = (type(detail['master_deletion_enabled']) is bool
+                 and type(result['id']) is int and result['id'] > 0
+                 and detail['id'] == result['id'] and detail['label'] == label
+                 and re.fullmatch('[a-f0-9]{64}', result['plan_sha256'])
+                 and detail['plan_sha256'] == result['plan_sha256']
+                 and detail['mode'] == 'dry_run' and detail['policy_current'] is True
+                 and detail['policy_sha256'] == POLICY_SHA and detail['allow_nas_only'] is False
+                 and detail['approval_reason'] == '' and detail['approved_until'] is None
+                 and len(expected) == len(set(expected)) == len(actual) == len(set(actual))
+                 and set(expected) == set(actual) and len(reports) == len(expected)
+                 and all(type(r['ordinal']) is int for r in reports)
+                 and sorted(r['ordinal'] for r in reports) == list(range(1, len(expected) + 1))
+                 and all(r['delete_ever_issued'] is False
+                         and r['state'] in (None, 'pending', 'leased', 'would_delete') for r in reports))
+    except (KeyError, TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise RuntimeError('admitted plan contract differs; reconcile its label before retrying')
 
 
 def main():
