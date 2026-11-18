@@ -55,6 +55,21 @@ def stop_status(state: Path, reason: str) -> None:
             'updated_at': datetime.now(timezone.utc).isoformat(), 'stop_reason': reason})
 
 
+def interrupted(state: Path, record: dict, lane: str, finishing: bool = False) -> bool:
+    for active in record['active']:
+        if active == lane:
+            if not finishing:
+                return True
+            continue
+        with (state / LANES[active]).open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            return True
+    return False
+
+
 class Attempt:
     def __init__(self, state: Path, lane: str):
         self.state = state
@@ -66,6 +81,7 @@ class Attempt:
             else:
                 record = {'failed': False, 'active': {}}
                 # Upgrade must not erase the already-recorded failed D attempt.
+                legacy = None
                 for name in ('status.json', 'recovery.json'):
                     path = state / name
                     if path.exists():
@@ -74,9 +90,15 @@ class Attempt:
                             raise ValueError('invalid previous status')
                         if (previous.get('stop_reason') or previous.get('refresh_error')
                                 or previous.get('problems', 0) > 0):
-                            legacy = state / ('legacy-' + uuid.uuid4().hex)
-                            legacy.mkdir(mode=0o700)
-                            publish(legacy / name, previous)
+                            if legacy is None:
+                                legacy = state / ('legacy-' + uuid.uuid4().hex)
+                                legacy.mkdir(mode=0o700)
+                            with (legacy / name).open('xb') as archived:
+                                os.chmod(archived.name, 0o600)
+                                archived.write(path.read_bytes())
+                                archived.flush()
+                                os.fsync(archived.fileno())
+                            sync_dir(legacy)
                             record['failed'] = True
                             record['active']['legacy'] = legacy.name
                 publish(journal, record)
@@ -84,16 +106,7 @@ class Attempt:
                 raise Latched()
             # A durable active marker precedes every subprocess. Under the lane
             # flock, a previous own marker is necessarily an interrupted attempt.
-            for active in record['active']:
-                if active == lane:
-                    record['failed'] = True
-                else:
-                    with (state / LANES[active]).open('a') as lock:
-                        try:
-                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        except BlockingIOError:
-                            continue
-                        record['failed'] = True
+            record['failed'] = interrupted(state, record, lane)
             if record['failed']:
                 publish(journal, record)
                 stop_status(state, 'evidence_unavailable')
@@ -114,7 +127,7 @@ class Attempt:
                 with path.open('rb') as evidence:
                     os.fsync(evidence.fileno())
             sync_dir(self.path)
-            failed = bool(reason) or record['failed']
+            failed = bool(reason) or record['failed'] or interrupted(self.state, record, self.lane, finishing=True)
             if failed:
                 reason = reason or 'evidence_unavailable'
                 record['failed'] = True

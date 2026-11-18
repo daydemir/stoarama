@@ -161,3 +161,47 @@ class AdmissionTest(unittest.TestCase):
                 self.assertEqual(self.invoke(tick, self.ok), (1, 0))
                 self.assertEqual((self.state / filename).read_text(), original)
                 self.assertEqual(json.loads(next(self.state.glob('legacy-*/*')).read_text()), record)
+
+    def test_interrupted_sibling_cannot_publish_success_in_either_direction(self):
+        import fcntl
+        for interrupted_lane in ('tick', 'recovery'):
+            for failed_write in (False, True):
+                with self.subTest(lane=interrupted_lane, failed_write=failed_write), tempfile.TemporaryDirectory() as temp:
+                    state = Path(temp)
+                    with (state / 'lock').open('a') as tick_lock, (state / 'recovery.lock').open('a') as recovery_lock:
+                        locks = {'tick': tick_lock, 'recovery': recovery_lock}
+                        for lock in locks.values():
+                            fcntl.flock(lock, fcntl.LOCK_EX)
+                        attempts = {lane: admission.Attempt(state, lane) for lane in admission.LANES}
+                        failed = attempts[interrupted_lane]
+                        admission.publish(failed.path / 'result.json', {'imported_items': 2, 'problems': 1})
+                        if failed_write:
+                            original = admission.publish
+                            def full(path, record):
+                                if path == state / 'admission.json' and record.get('failed'):
+                                    raise OSError('full disk')
+                                original(path, record)
+                            with patch.object(admission, 'publish', side_effect=full), self.assertRaises(OSError):
+                                failed.finish('dependency_failed', {})
+                        fcntl.flock(locks[interrupted_lane], fcntl.LOCK_UN)
+                        other = 'recovery' if interrupted_lane == 'tick' else 'tick'
+                        self.assertFalse(attempts[other].finish('', self.report))
+                        self.assertTrue(admission.load(state)['failed'])
+                        self.assertIn('stop_reason', json.loads((state / 'status.json').read_text()))
+                        if other == 'recovery':
+                            self.assertNotIn('problems', json.loads((state / 'recovery.json').read_text()))
+
+    def test_both_legacy_failures_are_byte_preserved_and_bound(self):
+        status = b'{ "stop_reason" : "manifest_import_failed", "imported_items": 2 }\n'
+        report = b'{ "problems": 1 }\n'
+        (self.state / 'status.json').write_bytes(status)
+        (self.state / 'recovery.json').write_bytes(report)
+        self.assertEqual(self.invoke(tick, self.ok), (1, 0))
+        active = admission.load(self.state)['active']
+        self.assertEqual(len(active), 1)
+        legacy = self.state / active['legacy']
+        self.assertEqual((legacy / 'status.json').read_bytes(), status)
+        self.assertEqual((legacy / 'recovery.json').read_bytes(), report)
+        digest = admission.binding(self.state)
+        (legacy / 'status.json').write_bytes(b'changed partial import evidence')
+        self.assertNotEqual(admission.binding(self.state), digest)

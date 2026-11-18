@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -54,19 +55,35 @@ func TestFinishPermanentIncidentsWithoutReservations(t *testing.T) {
 	policy, windows, _ := api.Keep28Policy()
 	window := windows[3]
 	header := nasCopyHeader{PolicySHA256: policy}
-	items := make([]api.NASR2CopyItem, 0, len(ids)+1)
+	items := make([]api.NASR2CopyItem, 0, len(ids)+25)
 	for _, id := range ids {
-		i := api.NASR2CopyItem{Kind: api.NASR2CopyRaw, SourceID: id, RecordingID: 2, StreamID: 3, Bucket: "bucket", ObjectKey: "managed/incident-" + time.Unix(id, 0).Format("150405") + ".mp4", RelativePath: "incident/" + time.Unix(id, 0).Format("20060102150405") + ".mp4", SizeBytes: 100, SHA256: strings.Repeat("a", 64), StartAt: window.Start, EndAt: window.Start.Add(time.Minute)}
+		i := api.NASR2CopyItem{Kind: api.NASR2CopyRaw, SourceID: id, RecordingID: 2, StreamID: 3, Bucket: "bucket", ObjectKey: fmt.Sprintf("managed/incident-%d.mp4", id), RelativePath: fmt.Sprintf("incident/%d.mp4", id), SizeBytes: 100, SHA256: strings.Repeat("a", 64), StartAt: window.Start, EndAt: window.Start.Add(time.Minute)}
 		items = append(items, i)
 	}
-	// Key-only alias has no incident source identity.
-	alias := items[0]
-	alias.SourceID = 9000001
-	alias.RelativePath = "incident/key-alias.mp4"
-	if err = pool.QueryRow(ctx, `SELECT bucket,object_key FROM nas_cleanup_incident_roster WHERE source_id=1278687 AND kind='raw'`).Scan(&alias.Bucket, &alias.ObjectKey); err != nil {
+	// Every nonempty roster key gets a new raw catalog identity, independent
+	// of incident source IDs. Joined keys additionally fail the raw-only domain.
+	rows, err := pool.Query(ctx, `SELECT bucket,object_key FROM nas_cleanup_incident_roster WHERE object_key<>'' ORDER BY kind,source_id`)
+	if err != nil {
 		t.Fatal(err)
 	}
-	items = append(items, alias)
+	aliases := 0
+	for rows.Next() {
+		alias := items[0]
+		alias.SourceID = int64(9000001 + aliases)
+		alias.RelativePath = fmt.Sprintf("incident/key-alias-%d.mp4", aliases)
+		if err = rows.Scan(&alias.Bucket, &alias.ObjectKey); err != nil {
+			t.Fatal(err)
+		}
+		items = append(items, alias)
+		aliases++
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	if aliases != 25 {
+		t.Fatalf("key coverage=%d", aliases)
+	}
 	for _, i := range items {
 		if _, err = pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,bucket,object_key,sha256,size_bytes,display_path,clip_start_at,clip_end_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, i.SourceID, i.RecordingID, i.Bucket, i.ObjectKey, i.SHA256, i.SizeBytes, i.RelativePath, i.StartAt, i.EndAt); err != nil {
 			t.Fatal(err)
@@ -94,11 +111,13 @@ func TestFinishPermanentIncidentsWithoutReservations(t *testing.T) {
 		for _, i := range items {
 			if err = queueNASR2CopyItem(ctx, pool, header, strings.Repeat("b", 64), i, true); err == nil {
 				t.Fatalf("incident imported held=%v source=%d", held, i.SourceID)
+			} else if strings.HasPrefix(i.ObjectKey, "managed/") && !strings.Contains(err.Error(), "held") {
+				t.Fatalf("refusal was not the live hold veto: source=%d err=%v", i.SourceID, err)
 			}
 		}
 	}
 	var queued, sources, reservations int
-	if err = pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM nas_r2_copy_items),(SELECT count(*) FROM recording_clips),(SELECT count(*) FROM nas_cleanup_reserved_files)`).Scan(&queued, &sources, &reservations); err != nil || queued != 0 || sources != 293 || reservations != 0 {
+	if err = pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM nas_r2_copy_items),(SELECT count(*) FROM recording_clips),(SELECT count(*) FROM nas_cleanup_reserved_files)`).Scan(&queued, &sources, &reservations); err != nil || queued != 0 || sources != len(items) || reservations != 0 {
 		t.Fatalf("unexpected writes queue=%d sources=%d reservations=%d %v", queued, sources, reservations, err)
 	}
 }
