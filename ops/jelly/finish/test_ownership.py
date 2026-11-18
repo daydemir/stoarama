@@ -86,6 +86,15 @@ class OwnershipTests(unittest.TestCase):
                 with self.assertRaises((ValueError, KeyError)):
                     self.collect(parts)
 
+    def test_plan_selection_can_repair_report_without_admitting_feed(self):
+        parts = fixture()
+        parts[2].update(refresh_error='failed')
+        result = assemble_owned(*parts, now=NOW, running=True, selecting=True)
+        self.assertEqual(result, {'recovery_plan_id': 1440})
+        with self.assertRaises(ValueError): self.collect(parts)
+        parts = list(parts); parts[2] = None; parts[3] = None
+        self.assertEqual(assemble_owned(*parts, now=NOW, running=True, selecting=True), result)
+
     def test_dead_owner_cannot_allow_enabled_plan(self):
         with self.assertRaises(ValueError): self.collect(fixture(), running=False)
 

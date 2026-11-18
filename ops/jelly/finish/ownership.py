@@ -1,4 +1,5 @@
 """Read-only ownership proof shared by collection, plan selection and monitoring."""
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -23,7 +24,7 @@ def owner_plan(status, owner):
     return pid
 
 
-def assemble_owned(status, owner, recovery, runner_report, api, db, now, running):
+def assemble_owned(status, owner, recovery, runner_report, api, db, now, running, selecting=False):
     require(owner['schema'] == 'stoarama.cleanup-owner.v1'
             and re.fullmatch('[a-f0-9-]{36}', owner['owner_id'])
             and status['owner_id'] == owner['owner_id'])
@@ -59,6 +60,13 @@ def assemble_owned(status, owner, recovery, runner_report, api, db, now, running
     local = db['r2_copy']
     require(count(local['mismatch_latched']) == 0)
     require(all(isinstance(k, str) and count(v) == v for k, v in local['holds_by_reason'].items()))
+    if selecting:
+        # Selection is not feeding evidence: after explicit D reconciliation it
+        # identifies the DB-bound checkpoint so the real verifier can repair a
+        # failed/missing/expired report. It never admits a tick or clears a latch.
+        require(settled['sha256'] == status['recovery_history'][str(checkpoint)]['sha256']
+                and settled['issued'] == status['recovery_history'][str(checkpoint)]['issued'])
+        return {'recovery_plan_id': checkpoint}
     # A D failure must dominate even when the runner has a newer success.
     require('refresh_error' not in recovery and recovery['problems'] == 0
             and recovery['verified'] == recovery['delete_ever_issued'])
@@ -66,6 +74,8 @@ def assemble_owned(status, owner, recovery, runner_report, api, db, now, running
     prior = history[str(recovery['plan_id'])]
     require(prior['sha256'] == recovery['plan_sha256']
             and prior['issued'] == recovery['delete_ever_issued'])
+    fresh(recovery['checked_at'], now, 7 * 3600)
+    require(timestamp(recovery['checked_at']) > timestamp(db['plans'][str(recovery['plan_id'])]['newest_issued_at']))
     report = recovery if recovery['plan_id'] == checkpoint else runner_report
     require(report['plan_id'] == checkpoint and report['plan_sha256'] == settled['sha256']
             and report['problems'] == 0
@@ -105,11 +115,11 @@ def collect(root, repo, recovery_path, owner_sha256, now, plan_source=False):
             command = subprocess.run(['/bin/ps', '-p', str(status['runner_pid']), '-o', 'command='],
                                      capture_output=True, text=True, timeout=5, check=True).stdout
             require(str(repo / 'ops/jelly/cleanup-runner/runner.py') in command)
-        recovery = json.loads(recovery_path.read_bytes())
         admission = json.loads((recovery_path.parent / 'admission.json').read_bytes())
         require(admission['failed'] is False and (plan_source or admission['recovery_required'] is False))
+        recovery = None if plan_source else json.loads(recovery_path.read_bytes())
         checkpoint = status['recovery_plan_id']
-        runner_report = json.loads((root / ('recovery-' + str(checkpoint) + '.json')).read_bytes())
+        runner_report = None if plan_source else json.loads((root / ('recovery-' + str(checkpoint) + '.json')).read_bytes())
         pid = owner_plan(status, owner)
         ids = sorted(set([pid, checkpoint] + [int(k) for k in status['recovery_history']]))
         require(all(type(i) is int and i > 0 for i in ids))
@@ -150,4 +160,5 @@ SELECT jsonb_build_object(
             require(fact['sha256'] == old['sha256'] and fact['issued'] == old['issued'])
             if int(old_id) != checkpoint:
                 require(fact['mode'] == 'retired')
-        return assemble_owned(status, owner, recovery, runner_report, api, db, now, running)
+        return assemble_owned(status, owner, recovery, runner_report, api, db,
+                              datetime.now(timezone.utc), running, selecting=plan_source)

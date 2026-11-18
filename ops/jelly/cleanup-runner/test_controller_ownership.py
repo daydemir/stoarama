@@ -18,6 +18,7 @@ class ControllerOwnershipTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             job, plan = self.job(root)
             job.active = lambda: dict(plans=[], batches=0)
+            plan['master_deletion_enabled'] = False
             job.plan = lambda _: plan
             job.api = lambda *_: self.fail('ON cannot mutate')
             with self.assertRaises(r.Halt): job.master(True)
@@ -53,6 +54,7 @@ class ControllerOwnershipTests(unittest.TestCase):
         for latch in ('last_error', 'recovery_error', 'shutdown_or_recovery_failed'):
             with tempfile.TemporaryDirectory() as root:
                 job, _ = self.job(root)
+                job.owner_validated = False
                 job.status[latch] = True if latch.endswith('failed') else 'latched'
                 status = json.dumps(job.status)
                 (job.root / 'status.json').write_text(status)
@@ -78,6 +80,43 @@ class ControllerOwnershipTests(unittest.TestCase):
             self.assertEqual(status['current_plan'], 42)
             self.assertEqual(status['recovery_plan_id'], 42)
             self.assertEqual(json.loads((job.root / 'recovery-42.json').read_bytes()), report)
+
+    def test_actual_dryrun_and_on_share_controller_master(self):
+        with tempfile.TemporaryDirectory() as root:
+            job, plan = self.job(root)
+            job.active = lambda: dict(plans=[], batches=0)
+            job.plan = lambda _: plan
+            self.assertEqual(job.await_dry(42), plan)
+            job.master(True)
+            plan['master_deletion_enabled'] = False
+            with self.assertRaises(r.Halt): job.await_dry(42)
+
+    def test_live_heartbeat_failure_takes_owned_stop_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            job, plan = self.job(root)
+            job.status.update(shutdown_or_recovery_failed=True, recovery_error='ownership heartbeat failed')
+            job.plan = lambda _: plan
+            with patch.object(job, 'master') as stop, patch.object(job, 'drain'), patch.object(job, 'recovery'), patch.object(job, 'alert'):
+                with self.assertRaises(r.Halt): job.monitor(42)
+                job.fail('live ownership failure requires shutdown')
+                stop.assert_called_once_with(False, emergency=True)
+            self.assertTrue(json.loads((job.root / 'status.json').read_bytes())['shutdown_or_recovery_failed'])
+
+    def test_start_holds_snapshot_through_pid_publication(self):
+        with tempfile.TemporaryDirectory() as root:
+            job, plan = self.job(root)
+            job.status['last_error'] = None
+            path = job.root / 'status.json'
+            path.write_text(json.dumps(job.status))
+            def validate():
+                job.status['runner_pid'] = r.os.getpid()
+                with (job.root / 'ownership.lock').open('a') as observer:
+                    with self.assertRaises(BlockingIOError):
+                        r.fcntl.flock(observer, r.fcntl.LOCK_SH | r.fcntl.LOCK_NB)
+            with patch.object(job, 'validate_owner', side_effect=validate):
+                job.start()
+            self.assertEqual(json.loads(path.read_bytes())['runner_pid'], r.os.getpid())
+            job.lock.close()
 
     def test_runner_has_no_render_capability(self):
         text = Path(r.__file__).read_text()

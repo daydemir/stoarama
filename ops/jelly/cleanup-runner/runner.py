@@ -30,7 +30,7 @@ PLAN_CAP = 100_000_000_000
 RECOVERY = {'r2_sha_verified', 'r2_md5_etag_matched'}
 REASON = ('Deniz standing approval 2026-11-11: NAS files outside pinned keep28 only; '
           'server dry run + independent verification PASS; verified R2 copies retained; '
-          '5 TB/24h; one plan; master OFF between batches.')
+          '5 TB/24h; one owned plan; controller-managed global master.')
 
 
 class Halt(Exception):
@@ -55,9 +55,6 @@ class RequestConflict(Halt):
 
 class LockHeld(Exception):
     """Another runner owns the master switch; leave it alone."""
-
-
-ON_CONFIRM_WAIT_SEC = 300
 
 
 def require(ok, message):
@@ -334,6 +331,23 @@ class Runner:
         self.ownership_unreadable = False
         self.owner_validated = False
         self.status = {'current_plan': None, 'last_error': None}
+
+    def start(self):
+        # Collection sees either the old idle state or the new flock+PID, never
+        # an acquired execution lock paired with the previous process identity.
+        self.root = self.root.expanduser()
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with (self.root / 'ownership.lock').open('a') as snapshot:
+            fcntl.flock(snapshot, fcntl.LOCK_EX)
+            self.initialize()
+            self.check_restart()
+            self.validate_owner()
+            self._save(self.status.get('phase', 'stopped'))
+
+    def check_restart(self):
+        require(not self.status.get('last_error') and not self.status.get('recovery_error')
+                and not self.status.get('shutdown_or_recovery_failed'),
+                'failure is latched; owner must review before restart')
 
     def initialize(self):
         # Keep all startup I/O inside main's fail-safe, with usable in-memory state.
@@ -750,7 +764,7 @@ class Runner:
             if self.stopped():
                 return None
             p = self.plan(pid)
-            require(p['master_deletion_enabled'] is False, 'master unexpectedly ON during dry run')
+            require(p['master_deletion_enabled'] is True, 'controller runtime master is OFF')
             if dry_state(p):
                 return p
             require(time.monotonic() < deadline, 'dry run timed out')
@@ -972,6 +986,8 @@ class Runner:
 
     def monitor(self, pid):
         while True:
+            require(not self.status.get('shutdown_or_recovery_failed') and not self.status.get('recovery_error'),
+                    'live ownership failure requires shutdown')
             p = self.plan(pid)
             self.record_refusals(p)
             state = execution_state(p)
@@ -999,10 +1015,9 @@ class Runner:
 
     def run(self):
         # A rejected kickstart is read-only, including the outer failure handler.
-        require(not self.status.get('last_error') and not self.status.get('recovery_error')
-                and not self.status.get('shutdown_or_recovery_failed'),
-                'failure is latched; owner must review before restart')
-        self.validate_owner()
+        self.check_restart()
+        if not self.owner_validated:
+            self.validate_owner()
         active = self.active()
         pid = self.status['current_plan']
         if not active['plans']:
@@ -1091,7 +1106,7 @@ class Runner:
         self.save('stopped')
 
     def fail(self, error):
-        if not self.owner_validated or self.ownership_unreadable or self.status.get('last_error') or self.status.get('recovery_error') or self.status.get('shutdown_or_recovery_failed'):
+        if not self.owner_validated or self.ownership_unreadable or self.status.get('last_error'):
             self.alert('STOPPED: existing failure requires owner review')
             return
         self.status.update(phase='failed', last_error=error)
@@ -1135,7 +1150,7 @@ def main():
     os.umask(0o077)
     runner = Runner(args.repo, args.state, args.dry_run)
     try:
-        runner.initialize()
+        runner.start()
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: setattr(runner, 'stopping', True))
         with runner.heartbeat():

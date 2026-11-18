@@ -31,7 +31,7 @@ def fixture():
                delete_ever_issued=False, updated_at=NOW.isoformat())
     p = dict(id=42, items=[item], results=[row], mode='dry_run', policy_current=True,
              policy_sha256=r.POLICY_SHA, plan_sha256='b'*64, allow_nas_only=False,
-             master_deletion_enabled=False, approval_reason='', approved_until=(NOW+timedelta(hours=24)).isoformat())
+             master_deletion_enabled=True, approval_reason='', approved_until=(NOW+timedelta(hours=24)).isoformat())
     c = copy.deepcopy(item)
     c['sources'] = [dict(source_id=1, stream_id=3, bucket='stoarama', start_at=item['start_at'], end_at=item['end_at'])]
     return p, dict(items=[c], protected_overlap=0,delivery_keep_overlap=0)

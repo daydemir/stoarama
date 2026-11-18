@@ -62,7 +62,9 @@ before releasing current_plan. The finish CLI binds that checkpoint to the DB's
 unchanged issued count/newest update; it independently checks the owner ID/digest
 against the DB. A D success for an explicitly recorded preceding checkpoint may
 coexist with a newer runner checkpoint; the collector uses the newest checkpoint's
-real report until D refreshes it. D failures always stop; older IDs outside the
+real report until D refreshes it. D failures always stop feeding; after explicit D reconciliation, plan-source
+selects only the DB-bound checkpoint without consuming the failed report, so a
+real verifier can replace it. Selection is never feeding evidence. Older IDs outside the
 recorded chain never count. D's refresh selects this same settled plan, so normal
 active issuance cannot invalidate its report. No last-good fallback is read.
 
@@ -83,3 +85,9 @@ clear latches, retry held items, remove guards, or launch old wrappers against a
 changed ownership state. The old COPY-only collector is reusable only after a new
 review has rebound an actually idle held boundary. Preserve both sets of files
 and all new reports; binary/file rollback alone is not operational rollback.
+
+Startup acquires the snapshot lock before the execution flock and holds it
+through restart-latch/manifest validation and durable PID publication. Rejected
+starts preserve the prior bytes; collectors cannot see a new flock with old PID.
+A live heartbeat failure raises a terminal execution check and takes the owned
+pause/drain path; it is distinct from a preexisting restart latch.
