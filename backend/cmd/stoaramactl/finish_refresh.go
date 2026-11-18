@@ -83,15 +83,15 @@ func feedKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefreshO
 	}
 	init, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
-		return 0, finishKnownDBError(finishRefreshInitialize, err)
+		return 0, finishDBError(finishRefreshInitialize, 0, err)
 	}
 	defer rollbackFinishCandidateTx(init)
 	if err = inverseProtectionBarrier(ctx, init); err != nil {
-		return 0, finishKnownDBError(finishRefreshInitialize, err)
+		return 0, finishDBError(finishRefreshInitialize, 0, err)
 	}
 	var epoch int64
 	if err = init.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch`).Scan(&epoch); err != nil {
-		return 0, finishKnownDBError(finishRefreshInitialize, err)
+		return 0, finishDBError(finishRefreshInitialize, 0, err)
 	}
 	// KE folder discovery is shared with B2 and protected by its catalog epoch.
 	protection, err := loadInverseApplyProtection(ctx, init, "stoarama", picks, windows)
@@ -99,7 +99,7 @@ func feedKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefreshO
 		return 0, finishKnownDBError(finishRefreshInitialize, err)
 	}
 	if err = init.Commit(ctx); err != nil {
-		return 0, finishKnownDBError(finishRefreshInitialize, err)
+		return 0, finishDBError(finishRefreshInitialize, 0, err)
 	}
 	catalog, err := beginFinishCandidateTx(ctx, pool)
 	if err != nil {
@@ -194,10 +194,10 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	if err = inverseProtectionBarrier(ctx, tx); err != nil {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	if err = inverseProtectionLocks(ctx, tx, false); err != nil {
-		return false, finishKnownDBError(finishRefreshAdmission, err)
+		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	var current int64
 	if err = tx.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch`).Scan(&current); err != nil {

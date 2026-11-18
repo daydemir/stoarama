@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -151,5 +152,23 @@ func TestFinishDroppedConnectionAndUnknownDriverDiagnostics(t *testing.T) {
 	var failure *finishDatabaseFailure
 	if !errors.As(unknown, &failure) || failure.Statement != finishImportInsert || failure.Cause != finishDBOther || strings.Contains(failure.Error(), "secret") {
 		t.Fatalf("unrecognized driver boundary lost: %v", unknown)
+	}
+}
+
+func TestFinishRefreshInitializationRetainsUnrecognizedSQLFailure(t *testing.T) {
+	f := newKeep28Fixture(t)
+	if err := setKeep28Refresh(f.ctx, f.pool, true); err != nil {
+		t.Fatal(err)
+	}
+	// Inject a missing-row driver failure only in the disposable test DB;
+	// production epoch deletion remains guarded and no guard is changed by this PR.
+	if _, err := f.pool.Exec(f.ctx, `BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM r2_inverse_ke_epoch; COMMIT`); err != nil {
+		t.Fatal(err)
+	}
+	options := finishRefreshOptions{Picks: f.options.Picks, PicksSHA: f.picksSHA(t)}
+	_, err := feedKeep28Refresh(f.ctx, f.pool, options, 1, &finishStatus{})
+	var failure *finishDatabaseFailure
+	if !errors.Is(err, pgx.ErrNoRows) || !errors.As(err, &failure) || failure.Statement != finishRefreshInitialize || failure.Cause != finishDBOther {
+		t.Fatalf("initialization SQL failure lost: %v", err)
 	}
 }

@@ -114,7 +114,7 @@ func finishDBError(statement finishStatement, tier finishTier, err error) error 
 		e.Cause = finishDBNetworkTimeout
 	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, net.ErrClosed):
 		e.Cause = finishDBClosed
-	case errors.As(err, &connect), errors.As(err, &network):
+	case errors.As(err, &connect), errors.As(err, &network), pgconn.SafeToRetry(err):
 		e.Cause = finishDBConnection
 	}
 	return e
