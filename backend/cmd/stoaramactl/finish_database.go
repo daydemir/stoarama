@@ -18,6 +18,7 @@ const (
 	finishPoolOpen             finishStatement = "pool_open"
 	finishPoolAcquire          finishStatement = "pool_acquire"
 	finishTickLock             finishStatement = "tick_lock"
+	finishOwnerQuery           finishStatement = "cleanup_owner_binding"
 	finishRecoveryQuery        finishStatement = "recovery_binding"
 	finishEnabledQuery         finishStatement = "enabled_cleanup"
 	finishQueueDepth           finishStatement = "queue_depth"

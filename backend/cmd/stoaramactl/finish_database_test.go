@@ -168,3 +168,25 @@ func TestFinishRefreshInitializationRetainsUnrecognizedSQLFailure(t *testing.T) 
 		t.Fatalf("initialization SQL failure lost: %v", err)
 	}
 }
+
+func TestFinishCleanupOwnerDatabaseDiagnostic(t *testing.T) {
+	pool, safety, copy := finishFixture(t, 0)
+	s, c, err := finishReadEvidence(safety, copy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.CleanupOwner = &finishCleanupOwner{PlanID: 99, PlanSHA: strings.Repeat("d", 64)}
+	s.KnownPlans = []int64{99}
+	s.Master = true
+	s.ExpectedMaster = true
+	finishTestJSON(t, safety, s)
+	finishTestJSON(t, copy, c)
+	if _, err = pool.Exec(context.Background(), `ALTER TABLE nas_cleanup_plans RENAME COLUMN account_id TO fixture_missing_account_id`); err != nil {
+		t.Fatal(err)
+	}
+	status, err := finishTick(context.Background(), pool, safety, copy)
+	f := status.DatabaseFailure
+	if !errors.Is(err, finishDatabase) || f == nil || f.Statement != finishOwnerQuery || f.SQLState != "42703" {
+		t.Fatalf("owner lookup diagnostic lost: %+v %v", status, err)
+	}
+}

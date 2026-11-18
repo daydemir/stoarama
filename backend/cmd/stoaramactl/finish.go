@@ -219,7 +219,7 @@ func finishCheck(ctx context.Context, pool *pgxpool.Pool, s finishSafety, c fini
 		}
 		var matches bool
 		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_plans WHERE id=$1 AND plan_sha256=$2 AND account_id=47 AND connection_id=13 AND mode IN ('dry_run','enabled','paused','retired'))`, owner.PlanID, owner.PlanSHA).Scan(&matches); err != nil {
-			return finishDatabase
+			return finishDBError(finishOwnerQuery, 0, err)
 		}
 		if !matches {
 			return finishUnknownPlan
