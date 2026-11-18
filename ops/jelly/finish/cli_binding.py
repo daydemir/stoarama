@@ -129,6 +129,15 @@ def bound_cli():
     return Path(load()['binary']['path'])
 
 
+def exec_bound_cli(arguments):
+    # Do not retain a verified path across DB work or other blocking steps.
+    record = load()
+    path = record['binary']['path']
+    argv = [path] + list(arguments)
+    require(digest(path) == record['binary']['sha256'], 'binary changed immediately before exec')
+    os.execv(path, argv)
+
+
 def bound_launcher(requested=None):
     path = Path(load()['launcher']['path'])
     require(requested is None or Path(requested) == path, 'caller selected a different CLI')

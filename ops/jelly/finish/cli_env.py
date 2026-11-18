@@ -3,11 +3,10 @@ import os
 import subprocess
 import sys
 import urllib.parse
-from cli_binding import bound_cli
+from cli_binding import exec_bound_cli
 
 
 def main():
-    cli = bound_cli()
     u = urllib.parse.urlsplit(os.environ['DATABASE_URL'])
     opts = ('-c role=stoarama -c statement_timeout=10000 -c lock_timeout=2000 '
             '-c work_mem=16MB -c jit=off -c max_parallel_workers_per_gather=0 '
@@ -31,7 +30,7 @@ def main():
     query['options'] = opts
     os.environ['DATABASE_URL'] = urllib.parse.urlunsplit(u._replace(query=urllib.parse.urlencode(query)))
     os.environ['PGOPTIONS'] = opts
-    os.execv(str(cli), [str(cli)] + sys.argv[1:])
+    exec_bound_cli(sys.argv[1:])
 
 
 if __name__ == '__main__':

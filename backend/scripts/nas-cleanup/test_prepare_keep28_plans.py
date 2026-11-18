@@ -4,7 +4,12 @@ import json
 from pathlib import Path
 import urllib.error
 import io
+import sys
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'ops/jelly/finish'))
+from cli_exec_guard import install_guard
+install_guard()
 
 import prepare_keep28_plans as k
 

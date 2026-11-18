@@ -4,12 +4,48 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+import subprocess
 from unittest.mock import patch
 import cli_binding as binding
 from cli_binding_fixture import environment
+from cli_exec_guard import install_guard
+
+install_guard()
 
 
 class BindingTests(unittest.TestCase):
+    def test_exec_rechecks_actual_bytes_immediately_and_uses_the_bound_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, self.fixture(root)), patch.object(binding.os, 'execv') as execute:
+                validated = binding.load()
+                binding.exec_bound_cli(['nas-cleanup', 'verify-recovery'])
+                path = str(root/'stoaramactl.bin')
+                execute.assert_called_once_with(path, [path, 'nas-cleanup', 'verify-recovery'])
+                execute.reset_mock()
+                (root/'stoaramactl.bin').write_text('changed before exec')
+                with patch.object(binding, 'load', return_value=validated), self.assertRaisesRegex(binding.ContractError, 'immediately before exec'):
+                    binding.exec_bound_cli(['nas-cleanup', 'verify-recovery'])
+                execute.assert_not_called()
+
+    def test_execution_guard_blocks_another_named_cli_and_retired_bytes_under_any_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = self.fixture(root)
+            marker = root/'executed'
+            wrong = root/'stoaramactl_other'
+            wrong.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\n')
+            wrong.chmod(0o700)
+            with patch.dict(os.environ, env), self.assertRaises(AssertionError):
+                subprocess.run([str(wrong)], check=True)
+            self.assertFalse(marker.exists())
+            alias = root/'verifier_alias'
+            alias.write_bytes(wrong.read_bytes())
+            alias.chmod(0o700)
+            with patch.object(binding, 'digest', return_value=binding.RETIRED_CLI_SHA256), self.assertRaisesRegex(AssertionError, 'retired'):
+                subprocess.run([str(alias)], check=True)
+            self.assertFalse(marker.exists())
+
     def fixture(self, root):
         launcher = root / 'stoaramactl'
         launcher.write_text('#!/bin/sh\nexit 0\n')

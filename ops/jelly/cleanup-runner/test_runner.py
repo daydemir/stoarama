@@ -14,6 +14,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'finish'))
+from cli_exec_guard import install_guard
+install_guard()
+
 spec = importlib.util.spec_from_file_location('runner', Path(__file__).with_name('runner.py'))
 r = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(r)
