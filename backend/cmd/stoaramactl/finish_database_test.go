@@ -92,3 +92,35 @@ func TestFinishCandidateReservationLookupRetainsOrdinalVeto(t *testing.T) {
 		t.Fatalf("unbounded reservation expansion: %s", explain)
 	}
 }
+
+func TestFinishRefreshAndImportDatabaseDiagnostics(t *testing.T) {
+	t.Run("refresh_control_query", func(t *testing.T) {
+		pool, safety, copy := finishFixture(t, 1)
+		if _, err := pool.Exec(context.Background(), `DROP TABLE r2_keep28_refresh_control`); err != nil {
+			t.Fatal(err)
+		}
+		status, err := finishTickWithRefresh(context.Background(), pool, safety, copy, finishRefreshOptions{Picks: "not-read-before-control"})
+		f := status.DatabaseFailure
+		if !errors.Is(err, finishDatabase) || f == nil || f.Statement != finishRefreshControl || f.SQLState != "42P01" || status.ImportedItems != 0 {
+			t.Fatalf("refresh error hidden: %+v %v", status, err)
+		}
+	})
+	t.Run("import_insert", func(t *testing.T) {
+		pool, safety, copy := finishFixture(t, 1)
+		if _, err := pool.Exec(context.Background(), `CREATE FUNCTION fail_import() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'secret driver detail'; END $$; CREATE TRIGGER fail_import BEFORE INSERT ON nas_r2_copy_items FOR EACH ROW EXECUTE FUNCTION fail_import()`); err != nil {
+			t.Fatal(err)
+		}
+		status, err := finishTick(context.Background(), pool, safety, copy)
+		f := status.DatabaseFailure
+		if !errors.Is(err, finishImport) || status.Stop != finishImport || f == nil || f.Statement != finishImportInsert || f.SQLState != "P0001" || f.Tier != finishLateUnknown || status.ImportedItems != 0 {
+			t.Fatalf("import error hidden: %+v %v", status, err)
+		}
+		if strings.Contains(f.Error(), "secret") {
+			t.Fatal("raw driver text escaped")
+		}
+	})
+	validation := errors.New("identity mismatch")
+	if got := finishKnownDBError(finishImportSource, validation); got != validation {
+		t.Fatal("validation became a database failure")
+	}
+}

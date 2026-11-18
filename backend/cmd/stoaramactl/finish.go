@@ -602,7 +602,7 @@ func finishTickWithRefresh(ctx context.Context, pool *pgxpool.Pool, safetyPath, 
 			return status, e
 		}
 		if e = queueNASR2Copy(ctx, pool, h, digest, validated, true); e != nil {
-			return status, finishImport
+			return status, finishImportFailure(tier, e)
 		}
 		switch tier {
 		case finishExactInventory:

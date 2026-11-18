@@ -291,11 +291,11 @@ type nasCopyDB interface {
 
 func queueNASR2CopyItem(ctx context.Context, pool nasCopyDB, h nasCopyHeader, manifestSHA string, i api.NASR2CopyItem, apply bool) error {
 	if err := ctx.Err(); err != nil {
-		return err
+		return finishKnownDBError(finishImportBegin, err)
 	}
 	tx, err := api.BeginNASR2CopyTx(ctx, pool)
 	if err != nil {
-		return err
+		return finishKnownDBError(finishImportBegin, err)
 	}
 	defer func() {
 		// Cancellation must not skip rollback. A broken connection still has
@@ -305,7 +305,7 @@ func queueNASR2CopyItem(ctx context.Context, pool nasCopyDB, h nasCopyHeader, ma
 		_ = tx.Rollback(cleanup)
 	}()
 	if _, err = api.LoadNASR2CopySource(ctx, tx, i); err != nil {
-		return err
+		return finishKnownDBError(finishImportSource, err)
 	}
 	if !apply {
 		return tx.Rollback(ctx)
@@ -314,13 +314,13 @@ func queueNASR2CopyItem(ctx context.Context, pool nasCopyDB, h nasCopyHeader, ma
 	var old []byte
 	err = tx.QueryRow(ctx, `INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item) VALUES(13,$1,$2,$3,$4,$5) ON CONFLICT(connection_id,kind,source_id) DO UPDATE SET source_id=excluded.source_id RETURNING item`, i.Kind, i.SourceID, manifestSHA, h.PolicySHA256, data).Scan(&old)
 	if err != nil {
-		return err
+		return finishKnownDBError(finishImportInsert, err)
 	}
 	var existing api.NASR2CopyItem
 	if json.Unmarshal(old, &existing) != nil || existing != i {
 		return errors.New("queued source identity differs; preserved")
 	}
-	return tx.Commit(ctx)
+	return finishKnownDBError(finishImportCommit, tx.Commit(ctx))
 }
 
 func queueNASR2Copy(ctx context.Context, pool nasCopyDB, h nasCopyHeader, manifestSHA string, items []api.NASR2CopyItem, apply bool) error {

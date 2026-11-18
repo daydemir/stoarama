@@ -15,19 +15,30 @@ import (
 type finishStatement string
 
 const (
-	finishPoolOpen        finishStatement = "pool_open"
-	finishPoolAcquire     finishStatement = "pool_acquire"
-	finishTickLock        finishStatement = "tick_lock"
-	finishRecoveryQuery   finishStatement = "recovery_binding"
-	finishEnabledQuery    finishStatement = "enabled_cleanup"
-	finishQueueDepth      finishStatement = "queue_depth"
-	finishStorageQuery    finishStatement = "storage_budget"
-	finishRefreshDepth    finishStatement = "refresh_depth"
-	finishDebitQuery      finishStatement = "late_debits"
-	finishCandidateBegin  finishStatement = "candidate_begin"
-	finishCandidateQuery  finishStatement = "candidate_select"
-	finishCandidateScan   finishStatement = "candidate_scan"
-	finishCandidateCommit finishStatement = "candidate_commit"
+	finishPoolOpen             finishStatement = "pool_open"
+	finishPoolAcquire          finishStatement = "pool_acquire"
+	finishTickLock             finishStatement = "tick_lock"
+	finishRecoveryQuery        finishStatement = "recovery_binding"
+	finishEnabledQuery         finishStatement = "enabled_cleanup"
+	finishQueueDepth           finishStatement = "queue_depth"
+	finishStorageQuery         finishStatement = "storage_budget"
+	finishRefreshDepth         finishStatement = "refresh_depth"
+	finishDebitQuery           finishStatement = "late_debits"
+	finishCandidateBegin       finishStatement = "candidate_begin"
+	finishCandidateQuery       finishStatement = "candidate_select"
+	finishCandidateScan        finishStatement = "candidate_scan"
+	finishCandidateCommit      finishStatement = "candidate_commit"
+	finishRefreshControl       finishStatement = "refresh_control"
+	finishRefreshInitialize    finishStatement = "refresh_initialize"
+	finishRefreshCatalogBegin  finishStatement = "refresh_catalog_begin"
+	finishRefreshCatalogSelect finishStatement = "refresh_catalog_select"
+	finishRefreshCatalogCommit finishStatement = "refresh_catalog_commit"
+	finishRefreshCursor        finishStatement = "refresh_cursor"
+	finishRefreshAdmission     finishStatement = "refresh_admission"
+	finishImportBegin          finishStatement = "import_begin"
+	finishImportSource         finishStatement = "import_source"
+	finishImportInsert         finishStatement = "import_insert"
+	finishImportCommit         finishStatement = "import_commit"
 )
 
 type finishDBCause string
@@ -104,4 +115,30 @@ func finishDBError(statement finishStatement, tier finishTier, err error) error 
 		e.Cause = finishDBConnection
 	}
 	return e
+}
+
+// Validation/identity errors keep their original handling. Only recognized DB
+// failures acquire database diagnostics; no arbitrary error text is exported.
+func finishKnownDBError(statement finishStatement, err error) error {
+	if err == nil {
+		return nil
+	}
+	wrapped := finishDBError(statement, 0, err)
+	var failure *finishDatabaseFailure
+	if errors.As(wrapped, &failure) && failure.Cause != finishDBOther {
+		return wrapped
+	}
+	return err
+}
+
+func finishImportFailure(tier finishTier, err error) error {
+	var failure *finishDatabaseFailure
+	if errors.As(err, &failure) {
+		annotated := *failure
+		annotated.Tier = tier
+		err = &annotated
+	}
+	// Imports can commit a subset before a DB failure. Retain import-failed
+	// disposition, the exact manifest, and the underlying DB diagnostic together.
+	return fmt.Errorf("%w: %w", finishImport, err)
 }
