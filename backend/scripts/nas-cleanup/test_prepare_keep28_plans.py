@@ -8,10 +8,14 @@ import sys
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'ops/jelly/finish'))
-from cli_exec_guard import install_guard
+from cli_exec_guard import install_guard, guard_test_module
 install_guard()
 
 import prepare_keep28_plans as k
+
+
+def setUpModule():
+    guard_test_module()
 
 
 def row(sid, kind, n, size=1, purged=False):

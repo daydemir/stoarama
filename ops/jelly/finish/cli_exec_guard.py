@@ -47,3 +47,32 @@ def install_guard(log=None):
                     output.write(json.dumps(proof, sort_keys=True) + '\n')
     sys.addaudithook(audit)
     return events
+
+
+def guard_environment(root):
+    """Install the same test guard before a fresh Python child runs any code."""
+    folder = Path(root).resolve() / 'python-exec-guard'
+    folder.mkdir(exist_ok=True)
+    (folder / 'sitecustomize.py').write_text(
+        'import os\n'
+        'try:\n'
+        '    from cli_exec_guard import install_guard\n'
+        '    install_guard()\n'
+        'except BaseException:\n'
+        '    os._exit(125)\n')
+    paths = [str(folder), str(Path(__file__).resolve().parent)]
+    if os.environ.get('PYTHONPATH'):
+        paths.append(os.environ['PYTHONPATH'])
+    return dict(PYTHONPATH=os.pathsep.join(paths))
+
+
+def guard_test_module():
+    import tempfile
+    import unittest
+    from unittest.mock import patch
+    install_guard()
+    root = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(root.cleanup)
+    change = patch.dict(os.environ, guard_environment(root.name))
+    change.start()
+    unittest.addModuleCleanup(change.stop)

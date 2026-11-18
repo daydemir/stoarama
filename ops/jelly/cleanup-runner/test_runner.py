@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'finish'))
-from cli_exec_guard import install_guard
+from cli_exec_guard import install_guard, guard_test_module
 install_guard()
 
 spec = importlib.util.spec_from_file_location('runner', Path(__file__).with_name('runner.py'))
@@ -31,6 +31,7 @@ WINDOWS = {3: (r.timestamp('2026-09-01T00:00:00+00:00'), r.timestamp('2026-09-29
 _bound_cli_fixture = patch.object(r, 'bound_launcher', return_value=Path('/fixture/stoaramactl.bin'))
 
 def setUpModule():
+    guard_test_module()
     _bound_cli_fixture.start()
 
 def tearDownModule():

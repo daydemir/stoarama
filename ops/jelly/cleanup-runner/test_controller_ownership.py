@@ -6,6 +6,11 @@ import tempfile
 import threading
 from contextlib import ExitStack
 import unittest
+from cli_exec_guard import guard_test_module
+
+
+def setUpModule():
+    guard_test_module()
 
 
 class ControllerOwnershipTests(unittest.TestCase):

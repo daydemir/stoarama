@@ -5,15 +5,38 @@ from pathlib import Path
 import tempfile
 import unittest
 import subprocess
+import sys
 from unittest.mock import patch
 import cli_binding as binding
 from cli_binding_fixture import environment
-from cli_exec_guard import install_guard
+from cli_exec_guard import install_guard, guard_test_module
 
 install_guard()
 
 
+def setUpModule():
+    guard_test_module()
+
+
 class BindingTests(unittest.TestCase):
+    def test_fresh_python_child_cannot_exec_another_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = self.fixture(root)
+            marker = root/'executed'
+            wrong = root/'stoaramactl_other'
+            wrong.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\n')
+            wrong.chmod(0o700)
+            for operation in ('os.execv(sys.argv[1], [sys.argv[1]])',
+                              'subprocess.run([sys.argv[1]], check=True)'):
+                with self.subTest(operation=operation):
+                    result = subprocess.run(
+                        [sys.executable, '-c', 'import os,sys,subprocess; ' + operation, str(wrong)],
+                        env={**os.environ, **env}, capture_output=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(b'AssertionError', result.stderr)
+                    self.assertFalse(marker.exists())
+
     def test_exec_rechecks_actual_bytes_immediately_and_uses_the_bound_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

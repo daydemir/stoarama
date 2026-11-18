@@ -2,6 +2,7 @@
 import hashlib
 import json
 from pathlib import Path
+from cli_exec_guard import guard_environment
 
 
 def pin(path):
@@ -20,4 +21,5 @@ def environment(root, launcher):
     path = root / 'cli-binding.json'
     raw = json.dumps(record).encode()
     path.write_bytes(raw)
-    return dict(STOARAMA_CLI_BINDING=str(path), STOARAMA_CLI_BINDING_SHA256=hashlib.sha256(raw).hexdigest())
+    return dict(guard_environment(root), STOARAMA_CLI_BINDING=str(path),
+                STOARAMA_CLI_BINDING_SHA256=hashlib.sha256(raw).hexdigest())

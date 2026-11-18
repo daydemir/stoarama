@@ -7,6 +7,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from cli_exec_guard import guard_test_module
+
+
+def setUpModule():
+    guard_test_module()
 
 
 class WrapperTest(unittest.TestCase):
