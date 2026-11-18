@@ -47,7 +47,6 @@ type inverseIdentity struct {
 	Start, End *time.Time
 	Timezone   string
 	Kind       string
-	Sources    int
 }
 type inverseProtection struct {
 	Identities     map[string][]inverseIdentity
@@ -62,9 +61,6 @@ type inverseProtection struct {
 	// ReviewedDelivery lifts the obsolete bare-delivery ownership veto. It is set
 	// ONLY by the owner fence policy, never by legacy/default RAW behavior.
 	ReviewedDelivery bool
-	// Unknown is the shared uncertainty set the RAW classification computes. The
-	// collated path must respect it rather than bypass it.
-	Unknown map[string]bool
 }
 type inverseEntry struct {
 	r2.ObjectInfo
@@ -108,6 +104,21 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 		}
 	}
 	identities := p.Identities[o.Key]
+	// Collated outputs and RAW clips are disjoint key namespaces. A collated key is
+	// classified from the reviewed output map alone, never from a RAW identity list
+	// and never with a RAW loader.
+	collatedIdentity := false
+	for _, id := range identities {
+		if id.Kind == "collated" {
+			collatedIdentity = true
+		}
+	}
+	if x, ok := p.Collated[o.Key]; ok || collatedIdentity {
+		if !p.ReviewedCollated {
+			return inverseHeld, "collated_deferred"
+		}
+		return p.classifyCollated(o, x, ok)
+	}
 	for _, id := range identities {
 		for _, component := range strings.Split(id.Path, "/") {
 			if p.KEFolders[component] {
@@ -126,17 +137,8 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 	// keys carry one collated row plus one row per RAW source; the sources are
 	// assessed by the collated path, and the output's own row is judged here so
 	// the shared unknown veto is never bypassed.
-	collated := false
-	for _, id := range identities {
-		if id.Kind == "collated" {
-			collated = true
-		}
-	}
 	unknown := false
 	for _, id := range identities {
-		if collated && id.Kind == "source" {
-			continue
-		}
 		if p.identityUncertain(id) {
 			unknown = true
 			continue
@@ -145,9 +147,6 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 		if id.Start.Before(w.End) && id.End.After(w.Start) {
 			return inverseKeep28, "pinned_window_overlap"
 		}
-	}
-	if collated {
-		return p.classifyCollated(o, unknown)
 	}
 	if len(identities) > 1 {
 		unknown = true
@@ -198,11 +197,40 @@ type inverseClassifierInput struct {
 	HoldCovered []string
 }
 
+// inverseClassifierQueries are the identity queries whose column reads the frozen
+// input set must cover, together with the alias→table mapping they use. A test
+// parses these and fails if a referenced column is not declared as an epoch- or
+// hold-covered input, so a column added to a classifier identity query later
+// cannot silently escape the freeze. Live hold queries are deliberately excluded:
+// they are per-key vetoes re-evaluated under lock at every wire boundary, not
+// batch-frozen inputs.
+var inverseClassifierQueries = []struct {
+	Name    string
+	SQL     string
+	Aliases map[string]string
+}{
+	{Name: "inverseCatalogSQL", SQL: inverseCatalogSQL, Aliases: map[string]string{
+		"c": "recording_clips", "r": "recordings", "s": "streams",
+		"o": "recording_collation_outputs", "h": "recording_collation_hours",
+	}},
+	{Name: "inverseNonrawColumns", SQL: inverseNonrawColumns, Aliases: map[string]string{
+		"o": "recording_collation_outputs", "r": "recordings", "s": "streams",
+		"oo": "recording_collation_outputs", "rr": "recordings", "rc": "recording_clips",
+	}},
+	// The per-key locked reload reads the remaining target identity inputs
+	// (etag, sha256, purged_at) and is scanned for the same reason.
+	{Name: "inverseRawTargetSQL", SQL: inverseRawTargetSQL, Aliases: map[string]string{
+		"c": "recording_clips", "r": "recordings", "s": "streams",
+	}},
+}
+
 var inverseClassifierInputs = []inverseClassifierInput{
 	{"recording_clips", []string{"bucket", "recording_id", "object_key", "display_path", "etag", "size_bytes", "sha256", "clip_start_at", "clip_end_at"}, []string{"purged_at"}},
 	{Table: "recording_collation_outputs", Columns: []string{"object_key", "nas_relative_path", "collation_hour_id", "source_clip_ids", "sha256", "size_bytes", "start_at", "end_at", "r2_verified_at"}},
 	{Table: "recording_collation_hours", Columns: []string{"recording_id"}},
-	{Table: "recordings", Columns: []string{"stream_id", "cron_timezone", "account_id"}},
+	// account_id is a B2 keep28 account scope, not a collated classifier input; it
+	// is enforced by the keep28 scope query and its own epoch/fence coverage.
+	{Table: "recordings", Columns: []string{"stream_id", "cron_timezone"}},
 	{Table: "streams", Columns: []string{"local_timezone"}},
 }
 

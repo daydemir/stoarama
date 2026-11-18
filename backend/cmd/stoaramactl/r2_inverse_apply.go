@@ -179,6 +179,41 @@ const inverseRawTargetSQL = `SELECT c.id,coalesce(r.stream_id,0),c.size_bytes,lo
  coalesce(nullif(s.local_timezone,''),r.cron_timezone,'') FROM recording_clips c JOIN recordings r ON r.id=c.recording_id
  LEFT JOIN streams s ON s.id=r.stream_id WHERE c.bucket=$1 AND c.object_key=$2 AND c.purged_at IS NULL AND NOT EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.object_key=c.object_key) FOR UPDATE OF c FOR SHARE OF r`
 
+// lockInverseRawSourceClosure takes the SAME RAW row lock the single-key RAW path
+// takes (FOR UPDATE on recording_clips), in ascending id order, over every RAW
+// source a collated output depends on. Ordinary cleanup admission locks those
+// rows FOR KEY SHARE and purge writes purged_at, both of which conflict with this
+// lock, so the closure stays frozen from here through the wire DELETE. One lock
+// order (id ascending), one code path, no collated-only variant.
+func lockInverseRawSourceClosure(ctx context.Context, tx pgx.Tx, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	rows, err := tx.Query(ctx, `SELECT c.id FROM recording_clips c WHERE c.id=ANY($1::bigint[]) ORDER BY c.id FOR UPDATE`, ids)
+	if err != nil {
+		return err
+	}
+	locked := 0
+	for rows.Next() {
+		var id int64
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		locked++
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	if locked != len(ids) {
+		// A missing source is uncertainty; never proceed on a partial closure.
+		return fmt.Errorf("%w: source closure identity changed", errInverseNonrawIneligible)
+	}
+	return nil
+}
+
 var errInverseRawIneligible = errors.New("raw target ineligible")
 
 func (a *inverseApplier) loadTarget(ctx context.Context, tx pgx.Tx, e inverseEntry) (inverseRawTarget, error) {
@@ -679,6 +714,13 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	var protection inverseProtection
 	if o.Lane == inverseNonrawCollated {
 		// Collated selection needs live catalog mapping facts, not just KE paths.
+		// That load reads the whole catalog, so it gets the same statement budget
+		// the read-only partition uses; the role's 10s default would time out and,
+		// worse, hold the epoch row FOR SHARE while failing. It stays one
+		// transaction on one connection, as before.
+		if _, err = initTx.Exec(ctx, "SET LOCAL statement_timeout = '"+r2InversePartitionStatementTimeout+"'"); err != nil {
+			return result, err
+		}
 		protection, err = loadInverseProtectionMode(ctx, initTx, store.Bucket(), picks, windows, true)
 	} else {
 		protection, err = loadInverseApplyProtection(ctx, initTx, store.Bucket(), picks, windows)

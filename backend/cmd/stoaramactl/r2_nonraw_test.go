@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -339,13 +340,6 @@ func TestR2NonrawExecutorLane(t *testing.T) {
 		held(t, "joined/nightly-collation-v2/objects/"+nonrawOutputSHA+".mp4", func(g *nonrawFixture, _ inverseEntry) {
 			w := g.windows[3]
 			g.exec(`UPDATE recording_clips SET clip_start_at=$1, clip_end_at=$2 WHERE id=7000001`, w.Start.Add(time.Minute), w.Start.Add(2*time.Minute))
-		})
-		// Keep-everything stream protects the output.
-		held(t, "joined/nightly-collation-v2/objects/"+nonrawOutputSHA+".mp4", func(g *nonrawFixture, _ inverseEntry) {
-			picksData, _ := json.Marshal(map[string]any{"choices": map[string]any{"3": r2RetirePick{Choice: "all"}}})
-			if err := os.WriteFile(g.picks, picksData, 0600); err != nil {
-				t.Fatal(err)
-			}
 		})
 		// Content-addressed key that does not bind the catalog SHA is held.
 		held(t, "joined/nightly-collation-v2/objects/"+nonrawOutputSHA+".mp4", func(g *nonrawFixture, _ inverseEntry) {
@@ -1154,5 +1148,358 @@ func TestR2InverseEpochCoversClassifierInputs(t *testing.T) {
 				t.Fatalf("%s did not bump the KE epoch (%d -> %d)", tc.name, before, after)
 			}
 		})
+	}
+}
+
+// TestR2NonrawKeepEverythingHoldsCollated is a REAL KE regression on PostgreSQL.
+// The picks file is pinned to "all" BEFORE the applier is built, so the KE fact is
+// actually in effect for reserve, wire and partition — unlike rewriting picks after
+// PicksSHA256 is pinned, which only proves the evidence check rejected a changed
+// file. Both a KE stream on the output and a KE path alias on one source must hold
+// the whole output at reserve and at wire, with no DELETE.
+func TestR2NonrawKeepEverythingHoldsCollated(t *testing.T) {
+	newFixture := func(t *testing.T, prefix string, picks func(w api.Keep28Window) map[string]any) *nonrawFixture {
+		t.Helper()
+		f := newNonrawFixture(t, prefix)
+		w := f.windows[3]
+		data, err := json.Marshal(map[string]any{"choices": picks(w)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = os.WriteFile(f.picks, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+
+	t.Run("keep_everything_stream", func(t *testing.T) {
+		f := newFixture(t, "nonraw_ke_stream", func(api.Keep28Window) map[string]any {
+			return map[string]any{"3": r2RetirePick{Choice: "all"}}
+		})
+		// The pinned picks are the ones the applier loads, so this is a real KE fact.
+		a := f.applier(t, "run1")
+		defer a.ledger.close()
+		entry := inverseEntry{ObjectInfo: f.store.objects[f.key], Class: inverseCollated}
+		if _, err := a.reserveNonraw(f.ctx, entry); err == nil {
+			t.Fatal("KE stream authorized a collated reservation")
+		}
+		if _, err := a.deleteNonraw(f.ctx, entry); err == nil {
+			t.Fatal("KE stream authorized a collated delete")
+		}
+		if f.deletes() != 0 {
+			t.Fatal("DELETE reached the provider under KE stream")
+		}
+		var intents int
+		if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM r2_nonraw_intents`).Scan(&intents); err != nil {
+			t.Fatal(err)
+		}
+		if intents != 0 {
+			t.Fatal("KE stream left a permanent intent behind")
+		}
+		// And the partition agrees.
+		picks, err := loadR2RetirePicks(f.picks)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := inverseProtection{Picks: picks, Windows: f.windows, KEFolders: map[string]bool{}, ReviewedCollated: true,
+			Collated: map[string]inverseCollatedAssessment{f.key: {ID: f.outputID, StreamID: 3, Key: f.key, Path: "nightly/video.mp4", SHA: nonrawOutputSHA}}}
+		if class, reason := p.classify(r2.ObjectInfo{Key: f.key, SizeBytes: 900}); class != inverseKE {
+			t.Fatalf("partition classified KE stream output as %s (%s)", class, reason)
+		}
+	})
+
+	t.Run("keep_everything_folder_alias_on_source", func(t *testing.T) {
+		// A KE folder is a folder claimed by a keep-everything stream's catalog
+		// paths. Stream 9 is KE and owns KEFolder; the collated output's own stream
+		// stays "none", so only the folder alias can protect it.
+		f := newFixture(t, "nonraw_ke_path", func(w api.Keep28Window) map[string]any {
+			return map[string]any{
+				"3": r2RetirePick{Choice: "none", KeepStartUTC: w.Start.Format(time.RFC3339), KeepEndUTC: w.End.Format(time.RFC3339)},
+				"9": r2RetirePick{Choice: "all"},
+			}
+		})
+		f.fixture(`INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
+ VALUES(9,'test','9','kefolder','kefolder','https://test.invalid','off','Asia/Tokyo','hls','video_manifest','video_live','continuous_video',30)`)
+		f.fixture(`INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
+ VALUES(32,47,1,'kefolder','https://test.invalid','* * * * *','Asia/Tokyo','paused',9,now())`)
+		f.fixture(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path)
+ VALUES(7100001,32,1,'https://test.invalid','stoarama','managed/acct-47/kefolder/clip.mp4',10,'ke',repeat('a',64),'2026-06-01'::timestamptz,'2026-06-01'::timestamptz,'2026-06-01 00:01:00'::timestamptz,'KEFolder/clip.mp4')`)
+		// The collated output's RAW source now sits inside that KE folder.
+		f.fixture(`UPDATE recording_clips SET display_path='KEFolder/source.mp4' WHERE id=$1`, f.clipID)
+		a := f.applier(t, "run1")
+		defer a.ledger.close()
+		entry := inverseEntry{ObjectInfo: f.store.objects[f.key], Class: inverseCollated}
+		if _, err := a.reserveNonraw(f.ctx, entry); err == nil {
+			t.Fatal("KE folder alias on a source authorized a collated reservation")
+		}
+		if f.deletes() != 0 {
+			t.Fatal("DELETE reached the provider under a KE folder alias")
+		}
+	})
+}
+
+// TestR2NonrawSourceClosureLockedThroughWire is the Sol P1 regression. A source
+// purge or an ordinary cleanup source-hold committed AFTER the last eligibility
+// check but BEFORE the DELETE must lose: the wire transaction holds the RAW
+// source rows FOR UPDATE, so the competing writer blocks and then the wire still
+// completes correctly. No test-only bypass is used; the competitor runs a normal
+// admission path on its own connection.
+func TestR2NonrawSourceClosureLockedThroughWire(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		apply func(t *testing.T, f *nonrawFixture) (release func(), errs <-chan error)
+	}{
+		{"source_hold_admission_after_authorization", func(t *testing.T, f *nonrawFixture) (func(), <-chan error) {
+			errs := make(chan error, 1)
+			start := make(chan struct{})
+			go func() {
+				<-start
+				// Ordinary cleanup source-hold admission locks the clip FOR KEY SHARE,
+				// which conflicts with the holder's FOR UPDATE. A short lock_timeout
+				// bounds the wait so the test observes the conflict instead of hanging.
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				var planID int64
+				err := f.pool.QueryRow(ctx, `INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode)
+ VALUES(47,13,'nonraw-race-lock',repeat('d',64),jsonb_build_array(jsonb_build_object('kind','raw','source_id',$1::bigint)),repeat('e',64),'dry_run') RETURNING id`, f.clipID).Scan(&planID)
+				if err == nil {
+					_, err = f.pool.Exec(ctx, `SET LOCAL lock_timeout='1s'`)
+				}
+				if err == nil {
+					_, err = f.pool.Exec(ctx, `INSERT INTO nas_cleanup_source_holds(plan_id,clip_id) VALUES($1,$2)`, planID, f.clipID)
+				}
+				errs <- err
+			}()
+			return func() { close(start) }, errs
+		}},
+		{"source_purge_after_authorization", func(t *testing.T, f *nonrawFixture) (func(), <-chan error) {
+			errs := make(chan error, 1)
+			start := make(chan struct{})
+			go func() {
+				<-start
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				conn, err := f.pool.Acquire(ctx)
+				if err != nil {
+					errs <- err
+					return
+				}
+				defer conn.Release()
+				if _, err = conn.Exec(ctx, `SET lock_timeout='1s'`); err == nil {
+					_, err = conn.Exec(ctx, `UPDATE recording_clips SET purged_at=clock_timestamp() WHERE id=$1`, f.clipID)
+				}
+				errs <- err
+			}()
+			return func() { close(start) }, errs
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newNonrawFixture(t, "nonraw_lock_"+strings.ReplaceAll(tc.name, "_", ""))
+			a := f.applier(t, "run1")
+			entry := inverseEntry{ObjectInfo: f.store.objects[f.key], Class: inverseCollated}
+			if _, err := a.reserveNonraw(f.ctx, entry); err != nil {
+				t.Fatal(err)
+			}
+			// Authorize inside an open wire transaction, exactly like deleteNonraw,
+			// then let the competitor in and only then send the DELETE.
+			tx, err := f.pool.Begin(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			authority, err := a.authorizeNonraw(f.ctx, tx, entry)
+			if err != nil {
+				tx.Rollback(f.ctx)
+				t.Fatalf("authorize: %v", err)
+			}
+			release, errs := tc.apply(t, f)
+			release()
+			// The DELETE happens while the wire transaction still holds the closure.
+			wireErr := f.sdk.deleteNonrawOnce(f.ctx, authority)
+			competitorErr := <-errs
+			if wireErr != nil {
+				tx.Rollback(f.ctx)
+				t.Fatalf("wire failed under a competing source writer: %v", wireErr)
+			}
+			// The competitor must have been blocked until this transaction ends.
+			if competitorErr == nil {
+				tx.Rollback(f.ctx)
+				t.Fatal("competing source writer was not serialized against the wire lock")
+			}
+			if err = tx.Rollback(f.ctx); err != nil {
+				t.Fatal(err)
+			}
+			// After the wire transaction ends the same admission is legal again, which
+			// proves the competitor lost only because of the lock, not a permanent veto.
+			if tc.name == "source_hold_admission_after_authorization" {
+				var planID int64
+				if err := f.pool.QueryRow(f.ctx, `INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode)
+ VALUES(47,13,'nonraw-after-wire',repeat('d',64),jsonb_build_array(jsonb_build_object('kind','raw','source_id',$1::bigint)),repeat('e',64),'dry_run') RETURNING id`, f.clipID).Scan(&planID); err != nil {
+					t.Fatalf("post-wire fixture: %v", err)
+				}
+				_ = planID
+			}
+			a.ledger.close()
+		})
+	}
+}
+
+// TestR2InverseClassifierInputsRoundTrip ties the declared frozen input set to the
+// classifier SQL in both directions, exactly and without heuristics: it asserts
+// that every table.column the identity queries actually reference is declared, and
+// that every declared column is genuinely referenced. A column added to the
+// classifier SQL later cannot silently escape the epoch/hold freeze, and a stale
+// declaration fails too.
+//
+// The reference set is derived from the create-table column lists in the
+// migrations plus the aliases the queries use, so it is checked against the real
+// schema rather than a hand-maintained copy.
+func TestR2InverseClassifierInputsRoundTrip(t *testing.T) {
+	f := newNonrawFixture(t, "nonraw_roundtrip")
+	declared := map[string]map[string]bool{}
+	for _, in := range inverseClassifierInputs {
+		declared[in.Table] = map[string]bool{}
+		for _, c := range in.Columns {
+			declared[in.Table][c] = true
+		}
+		for _, c := range in.HoldCovered {
+			declared[in.Table][c] = true
+		}
+	}
+	// realColumns reads the live schema, so the assertion is against PostgreSQL
+	// itself rather than a transcribed list.
+	realColumns := func(table string) map[string]bool {
+		t.Helper()
+		out := map[string]bool{}
+		rows, err := f.pool.Query(f.ctx, `SELECT column_name FROM information_schema.columns
+ WHERE table_schema=current_schema() AND table_name=$1`, table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var c string
+			if err = rows.Scan(&c); err != nil {
+				t.Fatal(err)
+			}
+			out[c] = true
+		}
+		if err = rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	// Every declared column must exist in the live schema.
+	for table, cols := range declared {
+		real := realColumns(table)
+		for col := range cols {
+			if !real[col] {
+				t.Fatalf("declared frozen input %s.%s does not exist in the schema", table, col)
+			}
+		}
+	}
+
+	// Every column referenced by an identity query (alias.column) must be declared.
+	columnRE := regexp.MustCompile(`\b([a-z][a-z0-9_]{0,40})\.([a-z][a-z0-9_]{0,40})\b`)
+	referenced := map[string]map[string]bool{}
+	for _, q := range inverseClassifierQueries {
+		real := map[string]map[string]bool{}
+		for alias, table := range q.Aliases {
+			real[alias] = realColumns(table)
+		}
+		for _, m := range columnRE.FindAllStringSubmatch(q.SQL, -1) {
+			alias, col := m[1], m[2]
+			cols, ok := real[alias]
+			if !ok {
+				continue // a CTE or subquery alias, not a catalog table
+			}
+			if !cols[col] {
+				continue // e.g. a jsonb_build_object label that is not a column
+			}
+			table := q.Aliases[alias]
+			if referenced[table] == nil {
+				referenced[table] = map[string]bool{}
+			}
+			referenced[table][col] = true
+		}
+	}
+	if len(referenced) == 0 {
+		t.Fatal("classifier query scan found no column references; the test would be vacuous")
+	}
+	// Join keys are read to connect rows, not to classify one; a change to them is
+	// already covered by the identity column they join on (e.g. recordings.stream_id
+	// or output.collation_hour_id). They are listed explicitly so a NEW
+	// classification input still fails rather than being absorbed by a wildcard.
+	joinOnly := map[string]bool{"recording_clips.id": true, "recordings.id": true, "streams.id": true,
+		"recording_collation_outputs.id": true, "recording_collation_hours.id": true}
+	for table, cols := range referenced {
+		for col := range cols {
+			if declared[table][col] || joinOnly[table+"."+col] {
+				continue
+			}
+			t.Fatalf("%s.%s is read by a classifier identity query but is not a declared frozen input or a known join key", table, col)
+		}
+	}
+
+	// And every declared column must be referenced by an identity query, or be the
+	// explicitly hold-covered purge flag / the keep28 scope account column.
+	for table, cols := range declared {
+		for col := range cols {
+			if referenced[table][col] {
+				continue
+			}
+			if table == "recording_clips" && col == "purged_at" {
+				if !strings.Contains(inverseRawTargetSQL, "c.purged_at IS NULL") {
+					t.Fatal("purged_at is declared hold-covered but no identity query requires it")
+				}
+				continue
+			}
+			t.Fatalf("%s.%s is declared frozen but no classifier identity query reads it", table, col)
+		}
+	}
+}
+
+// TestR2NonrawReserveChecksEpochBeforeIntent is the Opus finding-2 regression: a
+// KE epoch change committed after the batch started must refuse the reservation
+// BEFORE the permanent intent is written. Otherwise a stale cached classification
+// leaves append-only state behind that blocks NAS cleanup and stays charged, even
+// though the wire correctly refuses.
+func TestR2NonrawReserveChecksEpochBeforeIntent(t *testing.T) {
+	f := newNonrawFixture(t, "nonraw_reserve_epoch")
+	a := f.applier(t, "run1")
+	defer a.ledger.close()
+	entry := inverseEntry{ObjectInfo: f.store.objects[f.key], Class: inverseCollated}
+
+	// Commit a change that bumps ONLY the epoch without altering this target's own
+	// eligibility: a display_path edit on an unrelated clip. On the old head this
+	// let reserve commit a permanent intent from stale cached classification; the
+	// correct behavior is to refuse before the intent exists.
+	f.fixture(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path)
+ VALUES(7100009,30,1,'https://test.invalid','stoarama','managed/acct-47/nonraw/unrelated.mp4',10,'u',repeat('a',64),'2026-06-01'::timestamptz,'2026-06-01'::timestamptz,'2026-06-01 00:01:00'::timestamptz,'unrelated/u.mp4')`)
+	if _, err := f.pool.Exec(f.ctx, `UPDATE recording_clips SET display_path='unrelated/renamed.mp4' WHERE id=7100009`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.reserveNonraw(f.ctx, entry); err == nil {
+		t.Fatal("reserve committed a permanent intent under a stale epoch")
+	}
+	for _, q := range []string{
+		`SELECT count(*) FROM r2_nonraw_intents`,
+		`SELECT count(*) FROM r2_retirement_reservations WHERE kind='collated'`,
+		`SELECT coalesce(sum(charged_bytes),0) FROM r2_inverse_budget_minutes`,
+	} {
+		var n int64
+		if err := f.pool.QueryRow(f.ctx, q).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("stale-epoch reserve left durable state (%s = %d)", q, n)
+		}
+	}
+
+	// With a fresh batch the same target is eligible again, so the refusal above
+	// was the epoch gate and not a permanent block or an unrelated hold.
+	fresh := f.applier(t, "run2")
+	defer fresh.ledger.close()
+	if _, err := fresh.reserveNonraw(f.ctx, entry); err != nil {
+		t.Fatalf("fresh batch could not reserve the same target: %v", err)
 	}
 }

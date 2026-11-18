@@ -61,11 +61,15 @@ type inverseCollatedAssessment struct {
 	Start, End *time.Time
 	Timezone   string
 	Shared     bool
-	Held       bool
-	Sources    []inverseCollatedSource
-	Reason     string
-	Keep28     bool
-	Choice     string
+	// RawIdentities counts recording_clips rows sharing this object key. A key
+	// must belong to exactly one namespace: a collated lane must never retire a
+	// RAW clip's key, whose RAW holds and purged_at it would not satisfy.
+	RawIdentities int64
+	Held          bool
+	Sources       []inverseCollatedSource
+	Reason        string
+	Keep28        bool
+	Choice        string
 }
 
 // $1 is the bucket. The jsonb source aggregate is built in the same statement so
@@ -73,6 +77,7 @@ type inverseCollatedAssessment struct {
 const inverseNonrawColumns = `
  o.id,o.object_key,coalesce(r.stream_id,0),o.size_bytes,lower(o.sha256),o.nas_relative_path,o.r2_verified_at,
  o.start_at,o.end_at,coalesce(nullif(s.local_timezone,''),r.cron_timezone,''),
+ (SELECT count(*) FROM recording_clips rc WHERE rc.bucket=$1 AND rc.object_key=o.object_key),
  (SELECT count(*) FROM recording_collation_outputs d WHERE d.object_key=o.object_key),
  cardinality(o.source_clip_ids),
  (SELECT count(*) FROM (SELECT DISTINCT unnest(o.source_clip_ids)) u),
@@ -109,31 +114,36 @@ LEFT JOIN streams s ON s.id=r.stream_id`
 
 const inverseNonrawTargetSQL = inverseNonrawBatchSQL + ` WHERE o.object_key=$2 FOR SHARE OF o`
 
-// classifyCollated is the partition-side answer for a key with a collated
-// catalog identity. Default (unreviewed) behavior stays exactly as before.
-func (p inverseProtection) classifyCollated(o r2.ObjectInfo, identityUncertain bool) (inverseClass, string) {
+// classifyCollated is the partition-side answer for a collated key. The caller
+// reaches here only from the collated branch of classify, so a RAW identity can
+// never be read as a collated one. Default (unreviewed) behavior is unchanged.
+func (p inverseProtection) classifyCollated(o r2.ObjectInfo, x inverseCollatedAssessment, mapped bool) (inverseClass, string) {
 	if strings.HasPrefix(o.Key, inverseToolsPrefix) {
 		return inverseTools, "pinned_stitch_tools"
 	}
-	// Default behavior is byte-for-byte what it was: collated stays deferred.
-	if !p.ReviewedCollated {
+	if !p.ReviewedCollated || !mapped {
 		return inverseHeld, "collated_deferred"
-	}
-	// Under the reviewed scope, respect the shared unknown veto before any
-	// eligibility. An identity the RAW path already judged uncertain must never
-	// gain eligibility merely by being collated.
-	if identityUncertain || p.Unknown[o.Key] {
-		return inverseUnknown, "uncertain_policy_or_identity"
-	}
-	x, ok := p.Collated[o.Key]
-	if !ok {
-		return inverseUnknown, "no_collated_catalog_output"
 	}
 	if x.StreamID > 0 && p.Picks.Choices[x.StreamID].Choice == "all" {
 		return inverseKE, "keep_everything_stream"
 	}
+	// A KE folder alias on the output's own stored path protects it. These are
+	// catalog facts, so they are read here rather than trusted from the batch.
+	for _, component := range strings.Split(x.Path, "/") {
+		if p.KEFolders[component] {
+			return inverseKE, "keep_everything_path"
+		}
+	}
 	if x.Reason != "" {
 		return inverseHeld, x.Reason
+	}
+	// Eligibility needs a positively mapped, content-addressed identity. An
+	// assessment without a bound catalog SHA is not mapping authority.
+	if x.ID <= 0 || !r2RetireLowerHex64(x.SHA) {
+		return inverseUnknown, "no_collated_catalog_output"
+	}
+	if m := inverseCollatedKeyRE.FindStringSubmatch(o.Key); m == nil || m[2] != strings.ToLower(x.SHA) {
+		return inverseHeld, "content_addressed_key_mismatch"
 	}
 	if x.Keep28 {
 		// Neither owner ACKs nor copied RAW sources prove a current hashed
@@ -147,13 +157,14 @@ func (p inverseProtection) classifyCollated(o r2.ObjectInfo, identityUncertain b
 func scanCollated(rows pgx.Rows) (inverseCollatedAssessment, error) {
 	var x inverseCollatedAssessment
 	var sourceJSON string
-	var shared, card, distinct, resolved int64
+	var shared, card, distinct, resolved, rawIdentities int64
 	if err := rows.Scan(&x.ID, &x.Key, &x.StreamID, &x.SizeBytes, &x.SHA, &x.Path, &x.VerifiedAt,
-		&x.Start, &x.End, &x.Timezone,
+		&x.Start, &x.End, &x.Timezone, &rawIdentities,
 		&shared, &card, &distinct, &resolved, &sourceJSON, &x.Held); err != nil {
 		return x, err
 	}
 	x.Shared = shared != 1
+	x.RawIdentities = rawIdentities
 	if err := json.Unmarshal([]byte(sourceJSON), &x.Sources); err != nil {
 		return x, err
 	}
@@ -180,6 +191,10 @@ func assessCollated(p inverseProtection, x inverseCollatedAssessment) inverseCol
 	}
 	if x.Shared {
 		x.Reason = "shared_collated_object_key"
+		return x
+	}
+	if x.RawIdentities != 0 {
+		x.Reason = "key_also_raw_identity"
 		return x
 	}
 	if x.VerifiedAt.IsZero() {
@@ -327,6 +342,22 @@ func (a *inverseApplier) reserveNonraw(ctx context.Context, e inverseEntry) (inv
 	for _, s := range t.Sources {
 		ids = append(ids, s.ID)
 	}
+	// Hold the RAW source closure under the shared RAW row lock for the rest of
+	// this transaction, so a purge or cleanup source-hold cannot slip in between
+	// the eligibility read and the committed reservation.
+	if err = lockInverseRawSourceClosure(ctx, tx, ids); err != nil {
+		return t, err
+	}
+	// The classifier reads cached KE folders, picks and windows. Checking the
+	// epoch BEFORE the permanent intent is written means a stale cached
+	// classification can never leave append-only state behind.
+	var epoch int64
+	if err = tx.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`).Scan(&epoch); err != nil {
+		return t, err
+	}
+	if epoch != a.keEpoch {
+		return t, errors.New("KE catalog identity changed; refresh partition before further wire attempts")
+	}
 	var charged int64
 	if err = tx.QueryRow(ctx, `SELECT coalesce(sum(charged_bytes),0) FROM r2_inverse_budget_minutes WHERE bucket=$1 AND minute>=date_trunc('minute',clock_timestamp()-interval '24 hours')`, a.store.Bucket()).Scan(&charged); err != nil {
 		return t, err
@@ -463,6 +494,17 @@ func (a *inverseApplier) prepareNonrawWire(ctx context.Context, tx pgx.Tx, e inv
 		if err != nil {
 			return err
 		}
+		// One lock path: the same RAW row locks the single-key RAW wire takes,
+		// over the whole source closure, held by this transaction across the final
+		// check and the DELETE. A purge or cleanup source hold therefore cannot
+		// commit after authorization.
+		ids := make([]int64, 0, len(loaded.Sources))
+		for _, src := range loaded.Sources {
+			ids = append(ids, src.ID)
+		}
+		if err = lockInverseRawSourceClosure(ctx, tx, ids); err != nil {
+			return err
+		}
 		t = loaded
 		return nil
 	})
@@ -500,8 +542,9 @@ func (a *inverseApplier) authorizeNonraw(ctx context.Context, tx pgx.Tx, e inver
 	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
 		return nil, err
 	}
-	item := r2RetireItem{r2RetireCandidate: r2RetireCandidate{SizeBytes: e.SizeBytes, SHA256: t.SHA, ETag: e.ETag}}
-	if err = r2RetireValidateGuardIdentity(head, item, e.ETag); err != nil {
+	// A collated output has NO catalog ETag column, so a dedicated contract is
+	// used instead of passing a stand-in into the RAW catalog-ETag slot.
+	if err = r2RetireValidateCollatedGuardIdentity(head, e.ETag, e.SizeBytes, t.SHA); err != nil {
 		return nil, err
 	}
 	// Pre-fence cutoff on the listing AND the final HEAD. No seven-day age is

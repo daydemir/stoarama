@@ -295,13 +295,21 @@ func TestR2InverseCatalogPathBoundsAndDeferredCollated(t *testing.T) {
 	b := w.Start.Add(-24 * time.Hour)
 	identity := inverseIdentity{StreamID: 3, Path: "KEFolder/footage.mp4", Timezone: "UTC", Start: &a, End: &b, Kind: "collated"}
 	p.Identities["joined/hash.mp4"] = []inverseIdentity{identity}
-	if got, _ := p.classify(r2.ObjectInfo{Key: "joined/hash.mp4"}); got != inverseKE {
+	// Unreviewed default: a collated key is deferred regardless of its identity.
+	if got, _ := p.classify(r2.ObjectInfo{Key: "joined/hash.mp4"}); got != inverseHeld {
 		t.Fatal(got)
+	}
+	// Under the reviewed collated scope, a KE path alias on the output protects it.
+	p.ReviewedCollated = true
+	p.Collated = map[string]inverseCollatedAssessment{"joined/hash.mp4": {Key: "joined/hash.mp4", Path: "KEFolder/footage.mp4", StreamID: 3, Start: &a, End: &b, Timezone: "UTC", SHA: "x"}}
+	if got, _ := p.classify(r2.ObjectInfo{Key: "joined/hash.mp4"}); got != inverseKE {
+		t.Fatalf("KE path alias not protected: %s", got)
 	}
 	identity.Path = "ordinary/file.mp4"
 	p.Identities["joined/hash.mp4"] = []inverseIdentity{identity}
-	if got, _ := p.classify(r2.ObjectInfo{Key: "joined/hash.mp4"}); got != inverseHeld {
-		t.Fatal(got)
+	p.Collated["joined/hash.mp4"] = inverseCollatedAssessment{Key: "joined/hash.mp4", Path: "ordinary/file.mp4", StreamID: 3, Start: &a, End: &b, Timezone: "UTC", SHA: "x"}
+	if got, _ := p.classify(r2.ObjectInfo{Key: "joined/hash.mp4"}); got == inverseCollated || got == inverseDeletable {
+		t.Fatalf("unmapped collated key became eligible: %s", got)
 	}
 	for _, year := range []int{1, 1970, 2019, 2028, 2099} {
 		for _, kind := range []string{"raw", "source"} {
