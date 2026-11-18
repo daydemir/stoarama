@@ -428,8 +428,7 @@ func (s *Server) stitchPlanNext(ctx context.Context, tx pgx.Tx) (nasStitchTask, 
  JOIN recording_clips c ON c.recording_id=r.id JOIN nas_inventory_files n ON n.clip_id=c.id AND n.connection_id=13 AND n.state='present' AND n.sha256=c.sha256 AND n.size_bytes=c.size_bytes
  WHERE NOT s.paused AND s.approved_until>now() AND NOT EXISTS(SELECT 1 FROM nas_cleanup_frozen_streams f WHERE f.stream_id=s.stream_id) AND c.clip_start_at>=s.start_at AND c.clip_end_at<=s.end_at
  AND NOT EXISTS(SELECT 1 FROM nas_stitch_tasks t WHERE t.recording_id=r.id AND t.hour_at=date_trunc('hour',c.clip_start_at))
- AND NOT EXISTS(SELECT 1 FROM recording_clips c2 LEFT JOIN nas_inventory_files n2 ON n2.clip_id=c2.id AND n2.connection_id=13 AND n2.state='present' AND n2.relative_path=c2.display_path AND n2.sha256=c2.sha256 AND n2.size_bytes=c2.size_bytes
- WHERE c2.recording_id=r.id AND c2.clip_start_at>=date_trunc('hour',c.clip_start_at) AND c2.clip_start_at<date_trunc('hour',c.clip_start_at)+interval '1 hour' AND c2.clip_start_at>=s.start_at AND c2.clip_end_at<=s.end_at AND n2.clip_id IS NULL)
+ AND NOT EXISTS(`+nasStitchHourMissingClipsSQL+`)
  ORDER BY c.clip_start_at,c.id,s.id LIMIT 1`).Scan(&sid, &t.Plan.StreamID, &t.Plan.RecordingID, &hour, &start, &end)
 	if err != nil {
 		return t, err
