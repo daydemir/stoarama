@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -370,6 +371,15 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
 	changedReplay := request
 	changedReplay.RequestID = strings.Repeat("d", 32)
 	batch(changedReplay, "reconcile", false, http.StatusOK)
+	changedReplay = request
+	changedReplay.Proof = bytes.Replace(request.Proof, []byte(`[100,`), []byte(`[100.0,`), 1)
+	if bytes.Equal(changedReplay.Proof, request.Proof) {
+		t.Fatal("fixture did not change the proof's numeric spelling")
+	}
+	if w := cleanupCall(t, s.handleAccountNASCleanupObserve, 47, 47, "itemId", fmt.Sprint(task.ItemID), changedReplay, session); w.Code != http.StatusConflict {
+		t.Fatalf("changed numeric spelling on single replay: %d %s", w.Code, w.Body.String())
+	}
+	batch(changedReplay, "", false, http.StatusConflict)
 	if abort.lists.Load() != lists || abort.heads.Load() != heads {
 		t.Fatal("different replay body performed an abort provider check")
 	}
