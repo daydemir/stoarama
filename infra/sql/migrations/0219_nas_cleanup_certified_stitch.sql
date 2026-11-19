@@ -123,6 +123,23 @@ CREATE TRIGGER nas_stitch_r2_aborted_absence BEFORE INSERT OR UPDATE OR DELETE O
 CREATE TRIGGER nas_stitch_r2_aborted_absence_truncate BEFORE TRUNCATE ON nas_stitch_r2_aborted_absences
  FOR EACH STATEMENT EXECUTE FUNCTION guard_nas_stitch_r2_truncate();
 
+-- Older controllers accepted a bare 404, including delete markers. Keep the
+-- original observation and require an independently recorded strict one.
+ALTER TABLE nas_stitch_r2_stage_retirements ADD COLUMN strict_absence_observed_at timestamptz
+ CHECK(strict_absence_observed_at IS NULL OR
+  (absence_observed_at IS NOT NULL AND strict_absence_observed_at>=absence_observed_at));
+CREATE OR REPLACE FUNCTION guard_nas_stitch_r2_stage_retirement() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF TG_OP='INSERT' AND NEW.absence_observed_at IS NULL AND NEW.strict_absence_observed_at IS NULL THEN RETURN NEW; END IF;
+ IF TG_OP='UPDATE' AND NEW.object_id=OLD.object_id AND NEW.issued_at=OLD.issued_at
+  AND OLD.strict_absence_observed_at IS NULL AND NEW.absence_observed_at IS NOT NULL
+  AND (OLD.absence_observed_at IS NULL OR
+   (NEW.absence_observed_at=OLD.absence_observed_at AND NEW.strict_absence_observed_at IS NOT NULL)) THEN
+  RETURN NEW;
+ END IF;
+ RAISE EXCEPTION 'stitch staging retirement intent and absence observations are one-shot' USING ERRCODE='55000';
+END $$;
+
 CREATE FUNCTION nas_cleanup_certified_stitch_staging_absent(certificate jsonb) RETURNS boolean LANGUAGE sql STABLE AS $$
  SELECT EXISTS(SELECT 1 FROM nas_stitch_r2_certificates c
   WHERE c.hour_id=(certificate->>'hour_id')::bigint AND c.attempt=(certificate->>'attempt')::int
@@ -131,7 +148,7 @@ CREATE FUNCTION nas_cleanup_certified_stitch_staging_absent(certificate jsonb) R
    AND NOT EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects o
     LEFT JOIN nas_stitch_r2_stage_retirements retired ON retired.object_id=o.id AND o.state='staged'
     LEFT JOIN nas_stitch_r2_aborted_absences aborted ON aborted.object_id=o.id AND o.state='aborted'
-    WHERE o.hour_id=c.hour_id AND retired.absence_observed_at IS NULL AND aborted.object_id IS NULL))
+    WHERE o.hour_id=c.hour_id AND retired.strict_absence_observed_at IS NULL AND aborted.object_id IS NULL))
 $$;
 
 -- Preserve 0201's locks and ordinary veto. Only an exact, finished B2 item

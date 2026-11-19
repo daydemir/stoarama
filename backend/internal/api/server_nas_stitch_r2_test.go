@@ -522,23 +522,30 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		!strings.Contains(err.Error(), "reconciliation") {
 		t.Fatal("ambiguous staging delete allowed a second wire attempt", err)
 	}
-	t.Run("certified NAS cleanup waits for exact R2 retirement", func(t *testing.T) {
-		testCertifiedStitchNASCleanup(t, s, id, sourceKey, &abort, func() {
-			for _, mode := range []int32{1, 2} {
-				stageHeadResponse.Store(mode)
-				if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, true); err == nil {
-					t.Fatalf("ambiguous staged HEAD authorized absence in provider case %d", mode)
-				}
-			}
-			stageHeadResponse.Store(0)
-			if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, true); err != nil {
-				t.Fatalf("staging retirement could not reconcile exact absence: %v", err)
-			}
-			if err := pool.QueryRow(ctx, `SELECT nas_cleanup_certified_stitch_staging_absent(certificate)
+	tx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `UPDATE nas_stitch_r2_stage_retirements
+ SET absence_observed_at=statement_timestamp(),strict_absence_observed_at=statement_timestamp() WHERE object_id=123`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT nas_cleanup_certified_stitch_staging_absent(certificate)
  FROM nas_stitch_r2_certified_raw WHERE clip_id=901`).Scan(&stagingAbsent); err != nil || stagingAbsent {
-				t.Fatalf("unresolved abort on the earlier attempt cleared staging: %v %v", stagingAbsent, err)
-			}
-			for _, mode := range []int32{0, 1, 2, 4, 5} {
+		t.Fatalf("unresolved abort on the earlier attempt cleared staging: %v %v", stagingAbsent, err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("certified NAS cleanup waits for exact R2 retirement", func(t *testing.T) {
+		var legacyObservedAt time.Time
+		if err := pool.QueryRow(ctx, `UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=clock_timestamp()
+ WHERE object_id=123 RETURNING absence_observed_at`).Scan(&legacyObservedAt); err != nil {
+			t.Fatal(err)
+		}
+		testCertifiedStitchNASCleanup(t, s, id, sourceKey, &abort, func() {
+			for _, mode := range []int32{0, 1, 2, 4, 5, 6, 7} {
 				abort.response.Store(mode)
 				if err := store.RetireStitchStage(ctx, 122, sha, time.Time{}, true); err == nil {
 					t.Fatalf("unconfirmed aborted stage accepted in provider case %d", mode)
@@ -555,12 +562,33 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
  EXISTS(SELECT 1 FROM nas_stitch_r2_stage_retirements WHERE object_id=122)`).Scan(&receipt, &deletionIntent); err != nil || !receipt || deletionIntent {
 				t.Fatalf("aborted reconciliation did not preserve evidence separation: %v %v %v", receipt, deletionIntent, err)
 			}
+			for _, mode := range []int32{1, 2} {
+				stageHeadResponse.Store(mode)
+				if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, true); err == nil {
+					t.Fatalf("ambiguous staged HEAD supplemented a legacy receipt in provider case %d", mode)
+				}
+			}
+			if err := pool.QueryRow(ctx, `SELECT nas_cleanup_certified_stitch_staging_absent(certificate)
+ FROM nas_stitch_r2_certified_raw WHERE clip_id=901`).Scan(&stagingAbsent); err != nil || stagingAbsent {
+				t.Fatalf("legacy staged receipt without strict confirmation cleared NAS gate: %v %v", stagingAbsent, err)
+			}
+			stageHeadResponse.Store(0)
+			if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, true); err != nil {
+				t.Fatalf("staging retirement could not reconcile exact absence: %v", err)
+			}
+			var originalPreserved bool
+			if err := pool.QueryRow(ctx, `SELECT absence_observed_at=$1 AND strict_absence_observed_at>=absence_observed_at
+ FROM nas_stitch_r2_stage_retirements WHERE object_id=123`, legacyObservedAt).
+				Scan(&originalPreserved); err != nil || !originalPreserved {
+				t.Fatalf("strict staging reconciliation changed the legacy observation: %v %v", originalPreserved, err)
+			}
 		})
 	})
 	for _, change := range []string{
 		`DELETE FROM nas_stitch_r2_stage_retirements WHERE object_id=123`,
 		`UPDATE nas_stitch_r2_stage_retirements SET object_id=456 WHERE object_id=123`,
 		`UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=NULL WHERE object_id=123`,
+		`UPDATE nas_stitch_r2_stage_retirements SET strict_absence_observed_at=NULL WHERE object_id=123`,
 	} {
 		if _, err := pool.Exec(ctx, change); err == nil || !strings.Contains(err.Error(), "one-shot") {
 			t.Fatal("staging retirement reservation history could be erased or reassigned", err)
@@ -586,14 +614,20 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, a
 		w.Header().Set("Content-Type", "application/xml")
 		if r.Method == http.MethodGet && r.URL.Path == "/stoarama" && query.Has("uploads") &&
 			strings.HasPrefix(query.Get("prefix"), "stitch-staging/") {
-			if query.Get("prefix") == abortKey {
+			bucket, prefix := "stoarama", query.Get("prefix")
+			if prefix == abortKey {
 				abort.lists.Add(1)
-				if abort.response.Load() == 0 {
-					fmt.Fprintf(w, "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated><Upload><Key>%s</Key><UploadId>still-live</UploadId></Upload></ListMultipartUploadsResult>", abortKey)
+				switch abort.response.Load() {
+				case 0:
+					fmt.Fprintf(w, "<ListMultipartUploadsResult><Bucket>%s</Bucket><Prefix>%s</Prefix><IsTruncated>false</IsTruncated><Upload><Key>%s</Key><UploadId>still-live</UploadId></Upload></ListMultipartUploadsResult>", bucket, prefix, abortKey)
 					return
+				case 6:
+					prefix = "stitch-staging/wrong-prefix"
+				case 7:
+					bucket = "wrong-bucket"
 				}
 			}
-			fmt.Fprint(w, "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>")
+			fmt.Fprintf(w, "<ListMultipartUploadsResult><Bucket>%s</Bucket><Prefix>%s</Prefix><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>", bucket, prefix)
 			return
 		}
 		if r.URL.Path == "/stoarama/"+abortKey {
@@ -617,7 +651,7 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, a
 				w.Header().Set("x-amz-error-code", "NoSuchBucket")
 				w.WriteHeader(http.StatusNotFound)
 			default:
-				t.Error("abort reconciliation performed HEAD with a live multipart upload")
+				t.Error("abort reconciliation performed HEAD without a matching empty multipart listing")
 				w.WriteHeader(http.StatusInternalServerError)
 			}
 			return

@@ -1118,7 +1118,7 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 	env := &cleanupObserveEnv{session: cleanupAdmissionSession(r, req.ClientVersion), dryRunOnly: dryRunOnly, freshRequests: map[int64]bool{id: fresh}}
 	if req.Outcome == "match" {
 		env.prefetched = s.cleanupPrefetchRecovery(ctx, cid, map[int64]string{id: req.MD5})
-		s.cleanupPrefetchAbortedStitchAbsences(ctx, cid, []int64{id}, env)
+		s.cleanupPrefetchAbortedStitchAbsences(ctx, cid, []cleanupBatchObservation{{ItemID: id, cleanupObserve: req}}, env)
 	}
 	if cleanupObservationExpired(ctx) {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")

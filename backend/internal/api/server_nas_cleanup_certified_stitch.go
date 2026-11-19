@@ -83,20 +83,27 @@ const cleanupAbortedStitchTargetsSQL = `SELECT o.id,o.bucket,o.endpoint_sha256,o
  LEFT JOIN nas_stitch_r2_aborted_absences a ON a.object_id=o.id
  WHERE o.state='aborted' AND `
 
-func (s *Server) cleanupPrefetchAbortedStitchAbsences(ctx context.Context, cid int64, ids []int64, env *cleanupObserveEnv) {
+func (s *Server) cleanupPrefetchAbortedStitchAbsences(ctx context.Context, cid int64, observations []cleanupBatchObservation, env *cleanupObserveEnv) {
 	if s.r2 == nil || !s.cfg.NASCleanupDeletionEnabled || cid != 13 || env.dryRunOnly ||
-		env.session.version != nasCleanupCertifiedStitchVersion || len(ids) == 0 {
+		env.session.version != nasCleanupCertifiedStitchVersion || len(observations) == 0 {
+		return
+	}
+	requested, err := json.Marshal(observations)
+	if err != nil {
 		return
 	}
 	rows, err := s.pool.Query(ctx, cleanupAbortedStitchTargetsSQL+`o.hour_id IN (
  SELECT (m.item#>>'{stitch_certificate,hour_id}')::bigint
- FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id
+ FROM jsonb_array_elements($1::jsonb) request
+ JOIN nas_cleanup_items i ON i.id=(request->>'item_id')::bigint AND i.attempt=(request->>'attempt')::bigint
+ JOIN nas_cleanup_plans p ON p.id=i.plan_id AND p.plan_sha256=request->>'plan_sha256'
  CROSS JOIN LATERAL (SELECT coalesce(i.item,p.manifest->(i.ordinal-1)) item) m
- WHERE i.id=ANY($1) AND p.connection_id=$2 AND p.mode='enabled' AND p.approved_until>clock_timestamp()
+ WHERE p.connection_id=$2 AND p.mode='enabled' AND p.approved_until>clock_timestamp()
  AND i.lease_connection_id=$2 AND i.lease_client_version=$3 AND i.lease_client_boot_id=$4
  AND (i.state='leased' AND i.lease_expires_at>clock_timestamp()
-    OR i.state='delete_issued' AND i.permit_expires_at>clock_timestamp())
- AND m.item->>'permit_reason'=$5)`, ids, cid, env.session.version, env.session.boot, nasCleanupCertifiedStitchReason)
+    OR i.state='delete_issued' AND i.permit_expires_at>clock_timestamp()
+     AND request ? 'request_id' AND i.outcome=request-'item_id')
+ AND m.item->>'permit_reason'=$5)`, requested, cid, env.session.version, env.session.boot, nasCleanupCertifiedStitchReason)
 	if err != nil {
 		return // No provider evidence will be available for the permit check.
 	}

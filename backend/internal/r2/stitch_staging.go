@@ -341,9 +341,9 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	var key, etag, version string
 	var size int64
 	var modified time.Time
-	var issued, absent bool
+	var issued, strictAbsent bool
 	err = tx.QueryRow(ctx, `SELECT o.object_key,o.etag,coalesce(o.version_id,''),o.size_bytes,o.last_modified,
- d.issued_at IS NOT NULL,d.absence_observed_at IS NOT NULL
+ d.issued_at IS NOT NULL,d.strict_absence_observed_at IS NOT NULL
  FROM nas_stitch_r2_stage_objects o JOIN nas_stitch_r2_hours h ON h.id=o.hour_id AND h.attempt=o.attempt
  JOIN nas_stitch_r2_certificates c ON c.hour_id=h.id AND c.attempt=h.attempt
   AND c.plan_sha256=h.plan_sha256 AND c.manifest_sha256=h.staged_manifest_sha256
@@ -360,28 +360,21 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
     OR (j.sha256=o.sha256 AND j.size_bytes=o.size_bytes))
   AND NOT EXISTS(SELECT 1 FROM recording_clips raw WHERE (raw.bucket=o.bucket AND raw.object_key=o.object_key)
     OR (raw.display_path<>'' AND raw.display_path=o.relative_path))
- FOR SHARE OF o,h,c,q`, objectID, sha, c.bucket, c.EndpointSHA256()).Scan(&key, &etag, &version, &size, &modified, &issued, &absent)
+ FOR SHARE OF o,h,c,q`, objectID, sha, c.bucket, c.EndpointSHA256()).Scan(&key, &etag, &version, &size, &modified, &issued, &strictAbsent)
 	if err != nil {
 		return errors.New("stitch stage lacks exact NAS custody, drain, or dependency clearance")
 	}
 	if version != "" {
 		return errors.New("staging conditional delete proof covers only unversioned objects")
 	}
-	if absent {
+	if strictAbsent {
 		return nil
 	}
 	if issued != reconcile {
 		return errors.New("stitch stage retirement state differs; issued targets require reconciliation")
 	}
 	if reconcile {
-		if err := c.requireStitchStageAbsent(ctx, key); err != nil {
-			return err
-		}
-		if _, err = tx.Exec(ctx, `UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=clock_timestamp()
- WHERE object_id=$1 AND absence_observed_at IS NULL`, objectID); err != nil {
-			return err
-		}
-		return tx.Commit(ctx)
+		return c.confirmStitchStageRetirement(ctx, tx, objectID, key)
 	}
 	head, err := c.Head(ctx, key)
 	if err != nil || cleanETag(head.ETag) != cleanETag(etag) || head.VersionID != version ||
@@ -414,12 +407,21 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	}); err != nil {
 		return errors.New("stitch stage delete outcome unconfirmed; reconcile only")
 	}
+	return c.confirmStitchStageRetirement(ctx, tx, objectID, key)
+}
+
+func (c *Client) confirmStitchStageRetirement(ctx context.Context, tx pgx.Tx, objectID int64, key string) error {
 	if err := c.requireStitchStageAbsent(ctx, key); err != nil {
-		return errors.New("stitch stage delete absence unconfirmed; reconcile only")
+		return fmt.Errorf("stitch stage delete absence unconfirmed; reconcile only: %w", err)
 	}
-	if _, err = tx.Exec(ctx, `UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=clock_timestamp()
- WHERE object_id=$1 AND absence_observed_at IS NULL`, objectID); err != nil {
+	tag, err := tx.Exec(ctx, `WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS at)
+ UPDATE nas_stitch_r2_stage_retirements d SET absence_observed_at=coalesce(d.absence_observed_at,observed.at),
+ strict_absence_observed_at=observed.at FROM observed WHERE d.object_id=$1 AND d.strict_absence_observed_at IS NULL`, objectID)
+	if err != nil {
 		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("strict stitch stage absence was not recorded")
 	}
 	return tx.Commit(ctx)
 }
@@ -467,7 +469,8 @@ func (c *Client) VerifyAbortedStitchStageAbsence(ctx context.Context, bucket, en
 	uploads, err := c.s3.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
 		Bucket: aws.String(c.bucket), Prefix: aws.String(key), MaxUploads: aws.Int32(1),
 	}, c.stitchStageObservationOptions)
-	if err != nil || uploads.IsTruncated == nil || *uploads.IsTruncated || len(uploads.Uploads) != 0 {
+	if err != nil || aws.ToString(uploads.Bucket) != c.bucket || aws.ToString(uploads.Prefix) != key ||
+		uploads.IsTruncated == nil || *uploads.IsTruncated || len(uploads.Uploads) != 0 || len(uploads.CommonPrefixes) != 0 {
 		return errors.New("aborted stitch stage multipart work has not drained")
 	}
 	return c.requireStitchStageAbsent(ctx, key)

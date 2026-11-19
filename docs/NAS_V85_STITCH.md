@@ -360,7 +360,9 @@ certification, read and write grant drain, a live drained writer fence,
 a fresh exact-bucket conditional DELETE proof, and dependency checks.
 The current provider proof applies to unversioned objects. An ambiguous
 delete retains its one-shot intent and blocks fence removal and conflicting
-dependencies until the controller observes absence.
+dependencies until the controller observes absence. For NAS raw cleanup,
+reconcile legacy staged absence receipts once with the current command to
+record a strict HEAD confirmation alongside the original observation.
 
 The same reconcile command can record absence for an aborted stage, including
 one from an earlier attempt. It requires the exact stage identity, writer

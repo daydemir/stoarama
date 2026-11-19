@@ -839,6 +839,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 	valid := make([]bool, len(req.Observations))
 	ids := []int64{}
 	md5s := map[int64]string{}
+	var matches []cleanupBatchObservation
 	for n, o := range req.Observations {
 		if first[o.ItemID] != n {
 			continue
@@ -851,10 +852,11 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		if o.Outcome == "match" {
 			ids = append(ids, o.ItemID)
 			md5s[o.ItemID] = o.MD5
+			matches = append(matches, o)
 		}
 	}
 	env := &cleanupObserveEnv{session: cleanupAdmissionSession(r, req.ClientVersion), dryRunOnly: dryRunOnly, freshRequests: freshRequests, prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
-	s.cleanupPrefetchAbortedStitchAbsences(ctx, cid, ids, env)
+	s.cleanupPrefetchAbortedStitchAbsences(ctx, cid, matches, env)
 	if cleanupObservationExpired(ctx) {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
 		return
