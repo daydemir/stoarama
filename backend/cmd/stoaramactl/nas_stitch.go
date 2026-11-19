@@ -17,7 +17,12 @@ import (
 
 func runNASStitch(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) == 0 {
-		log.Fatal("usage: nas-stitch status|proof-plan|verify-proof|approve|pause|import-corpus")
+		log.Fatal("usage: nas-stitch status|proof-plan|verify-proof|approve|pause|import-corpus|backlog")
+	}
+	switch args[0] {
+	case "backlog":
+		runNASStitchBacklog(ctx, cfg, args[1:])
+		return
 	}
 	fs := flag.NewFlagSet("nas-stitch "+args[0], flag.ExitOnError)
 	base := fs.String("backend-api-url", defaultBackendAPIURL(), "backend URL")
@@ -96,6 +101,6 @@ func runNASStitch(ctx context.Context, cfg config.Config, args []string) {
 		}
 		fmt.Println(string(body))
 	default:
-		log.Fatal("usage: nas-stitch status|proof-plan|verify-proof|approve|pause|import-corpus")
+		log.Fatal("usage: nas-stitch status|proof-plan|verify-proof|approve|pause|import-corpus|backlog")
 	}
 }

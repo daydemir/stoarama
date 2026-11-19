@@ -1212,7 +1212,6 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		StitchProofTaskID:       proofMode,
 		StitchProofActivationID: proofActivation,
 		StitchEnabled:           connectionID == 13 && s.cfg.NASStitchEnabled,
-		StitchDeletionEnabled:   connectionID == 13 && s.cfg.NASStitchDeletionEnabled,
 		OK:                      true, JoinedDeliveryAccepted: joinedDeliveryAccepted, CleanupReleaseGeneration: cleanupReleaseGeneration,
 		JoinedProtocolVersion: desiredProtocol, JoinedProtocolGeneration: desiredGeneration,
 	})

@@ -160,6 +160,14 @@ class MediaCertificationError(RuntimeError):
     pass
 
 
+class MediaCertificationResourceError(MediaCertificationError):
+    """The source changed during observation and needs a fresh read."""
+
+
+class CleanupSourceDataError(RuntimeError):
+    """Stable source or sidecar data cannot satisfy the frozen proof."""
+
+
 class ToolProcessError(MediaCertificationError):
     """Bounded, private subprocess evidence; its raw stderr is never reported."""
     def __init__(self, returncode, stderr):
@@ -778,6 +786,10 @@ class Config:
             raise SystemExit("invalid NAS inventory scan cadence")
         if self.min_free_bytes < 1:
             raise SystemExit("STOARAMA_MIN_FREE_BYTES must be positive")
+        # Parse the stitch resource overrides at startup so a typo fails the
+        # process with a clear error instead of holding every lease later.
+        stitch_min_memory_bytes()
+        stitch_max_load_per_cpu()
 
 
 def boot_id():
@@ -2685,9 +2697,14 @@ class CleanupFile:
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fds[-1])
         self.files.append((name, fd, frozen))
         info = os.fstat(fd)
-        if (not stat_module.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_dev != self.root_identity[0]
+        if (not stat_module.S_ISREG(info.st_mode) or info.st_dev != self.root_identity[0]
                 or cleanup_identity(info) != frozen):
             raise RuntimeError("cleanup file differs from exact audited identity")
+        if info.st_nlink != 1:
+            current = os.stat(name, dir_fd=self.fds[-1], follow_symlinks=False)
+            if cleanup_identity(current) != frozen or current.st_nlink != info.st_nlink:
+                raise RuntimeError("cleanup link identity changed")
+            raise CleanupSourceDataError("cleanup source or sidecar must have exactly one link")
 
     def list_parent(self):
         started = time.monotonic()
@@ -2742,7 +2759,7 @@ class CleanupFile:
             opened = os.fstat(fd)
             if (not stat_module.S_ISREG(current.st_mode) or current.st_nlink != 1 or opened.st_nlink != 1
                     or cleanup_identity(current) != frozen or cleanup_identity(opened) != frozen):
-                raise RuntimeError("cleanup file identity changed")
+                raise MediaCertificationResourceError("cleanup file identity changed")
 
     def proof(self):
         started = time.monotonic()
@@ -2766,7 +2783,8 @@ class CleanupFile:
                 if n:
                     sidecar_bytes += block
                     if len(sidecar_bytes) > 1024 * 1024:
-                        raise RuntimeError("cleanup sidecar exceeds bound")
+                        self.check_paths()
+                        raise CleanupSourceDataError("cleanup sidecar exceeds bound")
             hashes.append(digest.hexdigest())
             if md5 is not None:
                 self.media_md5 = md5.hexdigest()
@@ -2779,16 +2797,21 @@ class CleanupFile:
         proof = {"root": self.root_identity, "ancestors": self.ancestors, "identity": self.item["frozen_identity"],
                  "sha256": hashes[0], "parent_members_sha256": before_members}
         if self.item["sidecar_required"]:
-            sidecar = json.loads(sidecar_bytes)
+            try:
+                sidecar = json.loads(sidecar_bytes)
+            except (ValueError, RecursionError) as exc:
+                raise CleanupSourceDataError("cleanup sidecar JSON is invalid") from exc
             binding = {"clip_id": self.item["source_id"], "recording_id": self.item["recording_id"],
                        "relative_path": self.item["relative_path"], "size_bytes": self.item["size_bytes"], "sha256": self.item["sha256"]}
-            if type(sidecar.get("schema_version")) is not int or sidecar["schema_version"] not in (1, 2) or any(type(sidecar.get(k)) is not type(v) or sidecar[k] != v for k, v in binding.items()):
-                raise RuntimeError("cleanup sidecar does not bind exact source identity")
+            if (not isinstance(sidecar, dict) or type(sidecar.get("schema_version")) is not int
+                    or sidecar["schema_version"] not in (1, 2)
+                    or any(type(sidecar.get(k)) is not type(v) or sidecar[k] != v for k, v in binding.items())):
+                raise CleanupSourceDataError("cleanup sidecar does not bind exact source identity")
             for field in ("clip_start_at", "clip_end_at"):
                 actual = parse_certification_timestamp(sidecar.get(field), field)
                 expected = parse_certification_timestamp(self.item["start_at" if field == "clip_start_at" else "end_at"], field)
                 if actual != expected:
-                    raise RuntimeError("cleanup sidecar registered interval differs from catalog")
+                    raise CleanupSourceDataError("cleanup sidecar registered interval differs from catalog")
                 binding[field] = expected.isoformat()
             proof["sidecar"] = {"identity": self.item["frozen_sidecar_identity"], "sha256": hashes[1], "binding": binding}
         self.stage_timings["proof_ms"] = (time.monotonic() - started) * 1000
@@ -2825,10 +2848,7 @@ class CleanupFile:
             self.check_paths()
             self.check_active()
             if self.item.get("permit_reason"):
-                # Stitched retirement: read the live switches at the unlink itself.
-                switch = stitch_switch_refusal(self.cfg, True)
-                if switch:
-                    raise CleanupPermitRefused("local_guard", "client deletion guard refused; not unlinked: " + switch)
+                raise CleanupPermitRefused("local_guard", "client deletion guard preserves stitch sources")
             self.unlink_attempted = True
             os.unlink(self.name, dir_fd=self.fds[-1])
             self.media_unlinked = True
@@ -17204,7 +17224,7 @@ def delivery_keep_key_held(key):
     return low < 32825 and packed[low * 32:(low + 1) * 32] == wanted
 
 
-def cleanup_guard_refusal(task, proof, cfg=None):
+def cleanup_guard_refusal(task, proof):
     """None when this exact file is independently outside its keep window; else why not."""
     item = task.get("item", {})
     try:
@@ -17212,10 +17232,8 @@ def cleanup_guard_refusal(task, proof, cfg=None):
             return "DELIVERY KEEP HOLD: exact delivery key/dependency must remain"
     except Exception as exc:
         return "delivery keep check unavailable: %s" % str(exc)[:160]
-    if task.get("item", {}).get("permit_reason"):
-        if cfg is None:
-            return "stitched inclusion needs local output readback"
-        return stitch_output_recheck(cfg, task["item"], execution=task.get("approved_proof") is not None)
+    if item.get("permit_reason"):
+        return "client deletion guard preserves stitch sources"
     pins, error = cleanup_pins()
     if error is not None:
         return "pinned keep-window files failed verification: %s" % error
@@ -17957,7 +17975,7 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner, timings,
             # reported as a conflict observation (an outcome every server
             # accepts), never would_delete, so enabling its plan fails up front
             # instead of pausing mid-run. Local caps apply to execution only.
-            refusal = cleanup_timed(timings, "guard_ms", cleanup_guard_refusal, task, proof, cfg)
+            refusal = cleanup_timed(timings, "guard_ms", cleanup_guard_refusal, task, proof)
             if refusal is None and task.get("approved_proof") is not None:
                 refusal = cleanup_timed(timings, "caps_ms", cleanup_local_caps, inventory, task["item"].get("size_bytes"))
             if refusal:
@@ -17989,15 +18007,10 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner, timings,
                     # Re-check immediately before unlink, reserve one deletion
                     # against the local caps, then write the durable intent line.
                     # Any failure here leaves the files untouched.
-                    refusal = cleanup_timed(timings, "guard_ms", cleanup_guard_refusal, task, proof, cfg) or cleanup_timed(
+                    refusal = cleanup_timed(timings, "guard_ms", cleanup_guard_refusal, task, proof) or cleanup_timed(
                         timings, "caps_ms", cleanup_local_caps, inventory, item.get("size_bytes"), {"item_id": item_id, "plan_sha256": task["plan_sha256"], "relative_path": item["relative_path"]})
                     if refusal:
                         raise CleanupPermitRefused("local_guard", "client deletion guard refused; not unlinked: " + refusal)
-                    if item.get("permit_reason"):
-                        # Final switch read at the unlink boundary for stitched retirement.
-                        switch = stitch_switch_refusal(cfg, True)
-                        if switch:
-                            raise CleanupPermitRefused("local_guard", "client deletion guard refused; not unlinked: " + switch)
                     ledger = {"item_id": item_id, "attempt": attempt, "plan_id": task.get("plan_id"), "plan_sha256": task["plan_sha256"],
                               "proof_sha256": receipt["proof_sha256"], "relative_path": item["relative_path"],
                               "sidecar_relative_path": item["relative_path"] + ".stoarama.json" if item.get("sidecar_required") else None,
@@ -18796,7 +18809,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
         try:
             for task, (current, proof), timing in zip(tasks, opened, timings):
                 stage = CleanupStage.GUARD
-                refusal = cleanup_timed(timing, "guard_ms", cleanup_guard_refusal, task, proof, cfg)
+                refusal = cleanup_timed(timing, "guard_ms", cleanup_guard_refusal, task, proof)
                 if refusal:
                     raise CleanupPermitRefused("local_guard", refusal)
                 stage = CleanupStage.UNLINK
@@ -18879,7 +18892,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
                     if {k:v for k,v in proof.items() if k != "parent_members_sha256"} != {k:v for k,v in task["approved_proof"].items() if k != "parent_members_sha256"}:
                         raise CleanupResponseError("cleanup dry-run proof changed; KEEP")
                     stage = CleanupStage.GUARD
-                    refusal = cleanup_timed(timing, "guard_ms", cleanup_guard_refusal, task, proof, cfg)
+                    refusal = cleanup_timed(timing, "guard_ms", cleanup_guard_refusal, task, proof)
                     if refusal:
                         raise CleanupPermitRefused("local_guard", refusal)
                     progress("proof_ready", task, timing)
@@ -18949,7 +18962,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
                             current.permit_max_age_sec = CLEANUP_EXECUTION_OBSERVE_BUDGET_SEC
                             current.deadline = min(current.deadline, permit_started + CLEANUP_PERMIT_MAX_AGE_SEC)
                             stage = CleanupStage.GUARD
-                            refusal = cleanup_timed(timing, "guard_ms", cleanup_guard_refusal, task, proof, cfg)
+                            refusal = cleanup_timed(timing, "guard_ms", cleanup_guard_refusal, task, proof)
                             if refusal:
                                 raise CleanupPermitRefused("local_guard", refusal)
                             stage = CleanupStage.UNLINK
@@ -19290,11 +19303,9 @@ def parse_certification_timestamp(value, field):
     normalized = match[1] + fraction + ("+00:00" if match[3] == "Z" else match[3])
     try:
         parsed = datetime.datetime.fromisoformat(normalized)
-    except ValueError as exc:
-        raise MediaCertificationError(f"{field} must be an ISO-8601 timestamp") from exc
-    if parsed.tzinfo is None:
-        raise MediaCertificationError(f"{field} must include a timezone")
-    return parsed.astimezone(datetime.timezone.utc)
+        return parsed.astimezone(datetime.timezone.utc)
+    except (ValueError, OverflowError) as exc:
+        raise MediaCertificationError(f"{field} must be a representable ISO-8601 timestamp") from exc
 
 
 def certification_timestamp_microseconds(value, field):
@@ -19353,7 +19364,7 @@ def hash_certification_file(root, relative_path, expected_size, expected_sha):
     try:
         opened_before = os.fstat(descriptor)
         if certification_identity(opened_before) != certification_identity(path_before):
-            raise MediaCertificationError("media identity changed before hashing")
+            raise MediaCertificationResourceError("media identity changed before hashing")
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
             if not chunk:
@@ -19369,7 +19380,7 @@ def hash_certification_file(root, relative_path, expected_size, expected_sha):
         or certification_identity(opened_after) != certification_identity(path_after)
         or actual_size != path_after.st_size
     ):
-        raise MediaCertificationError("media identity changed while hashing")
+        raise MediaCertificationResourceError("media identity changed while hashing")
     actual_sha = digest.hexdigest()
     if actual_size != expected_size or actual_sha != expected_sha:
         raise MediaCertificationError("media bytes do not match the sidecar")
@@ -19933,7 +19944,7 @@ def hash_certification_file_cancellable(root, relative_path, expected_size, expe
     try:
         opened_before = os.fstat(descriptor)
         if certification_identity(opened_before) != certification_identity(path_before):
-            raise MediaCertificationError("media identity changed before hashing")
+            raise MediaCertificationResourceError("media identity changed before hashing")
         while True:
             if cancel.is_set(): raise InventoryScanStopped("certification yielded to delivery")
             chunk = os.read(descriptor, 1024 * 1024)
@@ -19947,9 +19958,9 @@ def hash_certification_file_cancellable(root, relative_path, expected_size, expe
         path_after = path.stat()
         parent_after = path.parent.stat()
         if certification_identity(opened_before) != certification_identity(opened_after) or certification_identity(opened_after) != certification_identity(path_after):
-            raise MediaCertificationError("media identity changed while hashing")
+            raise MediaCertificationResourceError("media identity changed while hashing")
         if certification_identity(parent_before) != certification_identity(parent_after):
-            raise MediaCertificationError("media directory changed while hashing")
+            raise MediaCertificationResourceError("media directory changed while hashing")
         if actual_size != expected_size or digest.hexdigest() != expected_sha:
             raise MediaCertificationError("media bytes do not match frozen manifest")
         os.lseek(descriptor, 0, os.SEEK_SET)
@@ -47095,12 +47106,63 @@ STITCH_POLICY = "v85r"
 STITCH_REVISION = "v85r-rebuilt-1"
 STITCH_CORPUS_SHA = "5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b"
 STITCH_MAX_INPUT = 2_500_000_000
-STITCH_MIN_MEMORY = 384 * 1024 * 1024
+# Today's values, kept as the defaults of the two operator overrides below. Both
+# the pre-lease gate and the 5s mid-job refresh read them through these
+# functions, so a hosted worker with different headroom can be admitted without
+# editing the pinned client.
+STITCH_DEFAULT_MIN_MEMORY_BYTES = 384 * 1024 * 1024
+STITCH_DEFAULT_MAX_LOAD_PER_CPU = 1.5
+STITCH_MIN_MEMORY_ENV = "STOARAMA_STITCH_MIN_MEMORY_BYTES"
+STITCH_MAX_LOAD_PER_CPU_ENV = "STOARAMA_STITCH_MAX_LOAD_PER_CPU"
+
+
+def stitch_min_memory_bytes():
+    """Minimum free memory in bytes. Fail fast: never fall back silently."""
+    raw = os.environ.get(STITCH_MIN_MEMORY_ENV, "").strip()
+    if not raw:
+        return STITCH_DEFAULT_MIN_MEMORY_BYTES
+    try:
+        value = int(raw, 10)
+    except ValueError as exc:
+        raise SystemExit("%s must be an integer number of bytes" % STITCH_MIN_MEMORY_ENV) from exc
+    if value <= 0:
+        raise SystemExit("%s must be positive" % STITCH_MIN_MEMORY_ENV)
+    return value
+
+
+def stitch_max_load_per_cpu():
+    """Maximum load1 per CPU. Fail fast: never fall back silently."""
+    raw = os.environ.get(STITCH_MAX_LOAD_PER_CPU_ENV, "").strip()
+    if not raw:
+        return STITCH_DEFAULT_MAX_LOAD_PER_CPU
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise SystemExit("%s must be a number" % STITCH_MAX_LOAD_PER_CPU_ENV) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise SystemExit("%s must be a positive finite number" % STITCH_MAX_LOAD_PER_CPU_ENV)
+    return value
+
+
 STITCH_ACTIVE = threading.Event()
 STITCH_STATUS = CleanupStatus()
 
 
 class StitchHold(RuntimeError):
+    pass
+
+
+# Two mutually exclusive hold kinds. RESOURCE holds describe the host right now
+# (memory, load, free disk, a lost mount, a maintenance fence); the task is fine
+# and must be retried later, so they never post a result. TASK holds describe
+# this hour's own bytes (a missing/invalid sidecar, unreadable media metadata, a
+# plan whose data no longer matches), so they are terminal for this hour and the
+# client reports every input as left out instead of re-leasing forever.
+class StitchResourceHold(StitchHold):
+    pass
+
+
+class StitchTaskFailure(StitchHold):
     pass
 
 
@@ -47112,7 +47174,8 @@ class StitchNativeFailure(StitchHold):
 
 def stitch_check(stop):
     if stop.is_set():
-        raise StitchHold("stitch cancelled or expired")
+        # Stop objects carry their latch reason; a bare Event does not.
+        raise StitchHold(getattr(stop, "reason", "") or "stitch cancelled or expired")
 
 
 def stitch_read(source, size, stop):
@@ -47166,7 +47229,11 @@ def stitch_directory_entries(descriptor, stop):
 
 
 def stitch_resources(cfg, input_bytes=0):
-    """Unknown resource telemetry is HOLD. Consult cgroup headroom as well."""
+    """Unknown resource telemetry is HOLD. Consult cgroup headroom as well.
+
+    Every failure here is a host condition, not the task's data: it releases the
+    lease without a result and retries later.
+    """
     import shutil
     _, memory = meminfo_bytes(_read_text("/proc/meminfo"))
     try:
@@ -47182,25 +47249,27 @@ def stitch_resources(cfg, input_bytes=0):
             memory = min(memory, limit - used)
         except (OSError, ValueError):
             if cgroup_memory_limit():
-                raise StitchHold("cgroup memory usage unavailable")
+                raise StitchResourceHold("cgroup memory usage unavailable")
     try:
         cpus = len(os.sched_getaffinity(0))
     except AttributeError:
         cpus = os.cpu_count() or 1
     cpus = min(cpus, cgroup_cpu_limit() or cpus)
     load = os.getloadavg()[0]
-    if memory < STITCH_MIN_MEMORY or load > 1.5 * max(1, cpus):
-        raise StitchHold("NAS memory or load critical")
+    # Read the operator overrides on every call: the mid-job refresh re-checks
+    # them at the same rate the fixed values used to be read.
+    if memory < stitch_min_memory_bytes() or load > stitch_max_load_per_cpu() * max(1, cpus):
+        raise StitchResourceHold("NAS memory or load critical")
     if not os.path.ismount(str(cfg.output_dir)):
-        raise StitchHold("NAS output root is not mounted")
+        raise StitchResourceHold("NAS output root is not mounted")
     if shutil.disk_usage(cfg.output_dir).free < max(cfg.min_free_bytes, 1024**3) + int(input_bytes * 2.2):
-        raise StitchHold("NAS free-space reserve reached")
+        raise StitchResourceHold("NAS free-space reserve reached")
 
 
 def stitch_priority():
     import shutil
     if not sys.platform.startswith("linux") or not shutil.which("nice") or not shutil.which("ionice"):
-        raise StitchHold("Linux nice/ionice required for stitch lane")
+        raise StitchResourceHold("Linux nice/ionice required for stitch lane")
     tid = threading.get_native_id()
     os.setpriority(os.PRIO_PROCESS, tid, 19)
     subprocess.run(["ionice", "-c", "3", "-p", str(tid)], check=True,
@@ -47772,6 +47841,10 @@ def stitch_measure_error(exc):
     try:
         return StitchMeasureError(type(exc).__name__)
     except ValueError:
+        # The two typed hold kinds keep the existing proof diagnostic
+        # vocabulary; they are ordinary holds for measurement purposes.
+        if isinstance(exc, StitchHold):
+            return StitchMeasureError.STITCH_HOLD
         return StitchMeasureError.IO if isinstance(exc, OSError) else StitchMeasureError.UNEXPECTED
 
 
@@ -48413,17 +48486,18 @@ def stitch_repair_annexb(nals, drop_vcl=0, upto=None):
     return b''.join(b'\x00\x00\x00\x01' + n for n in nals[:end]), len(vcl) - drop_vcl
 
 
-def stitch_repair_local(cfg, clip, source, directory, tools, deadline, stop):
+def stitch_repair_local(clip, directory, stage_file, tools, deadline, stop):
     """Labeled partial recovery, always excluded from raw retirement/V85 joins."""
     if clip["size_bytes"] > 16 * 1024 * 1024:
         return None
-    with open(source, "rb") as f:
-        head = f.read(48)
-        if not stitch_repair_signature(head):
-            return None
-        data = head + f.read(16 * 1024 * 1024)
-    if len(data) != clip["size_bytes"]:
-        raise StitchHold("repair input size changed")
+    with CleanupFile(directory.cfg, clip, stop, deadline) as current:
+        with os.fdopen(current.files[0][1], "rb", closefd=False) as source:
+            data = source.read(clip["size_bytes"] + 1)
+        current.check_paths()
+    if len(data) != clip["size_bytes"] or hashlib.sha256(data).hexdigest() != clip["sha256"]:
+        raise MediaCertificationResourceError("repair input differs from frozen source")
+    if not stitch_repair_signature(data[:48]):
+        return None
     nals, stopmsg, gaps, gap_indices = stitch_repair_mdat(data)
     del data
     sps = next((n for n in nals if n[0] & 0x1f == 7), None)
@@ -48452,9 +48526,7 @@ def stitch_repair_local(cfg, clip, source, directory, tools, deadline, stop):
             continue
         size, sha = sha256_file(temporary)
         name = "repaired-%d-%s.mp4" % (clip["source_id"], sha)
-        directory.publish(temporary.name, name)
         relative = directory.relative + "/" + name
-        hash_certification_file(cfg.output_dir, relative, size, sha)
         proof = dict(policy=STITCH_POLICY, provenance=stitch_v85r_provenance(tools, stop), clip_id=clip["source_id"], original_sha256=clip["sha256"], original_size_bytes=clip["size_bytes"],
                      relative_path=relative, sha256=sha, size_bytes=size, method="mdat_annexb_vui_prefix_v1",
                      fps=str(fps), fps_src="vui", frames=count, duration_seconds=float(duration),
@@ -48462,53 +48534,10 @@ def stitch_repair_local(cfg, clip, source, directory, tools, deadline, stop):
                      synthesized_timestamps=True, complete_original=False, full_decode=True, fsynced=True, readback_sha256=sha)
         sidecar = work / "repair.proof.partial.json"
         sidecar.write_bytes(cleanup_json_bytes(proof))
-        directory.publish(sidecar.name, name + ".repair.json")
+        stage_file(temporary.name, name)
+        stage_file(sidecar.name, name + ".repair.json")
         return proof
     return None
-
-
-def stitch_switch_refusal(cfg, execution=True):
-    if not getattr(cfg, "stitch_enabled", False) or (execution and not getattr(cfg, "stitch_delete_enabled", False)):
-        return "local stitch/deletion switch off"
-    return None
-
-
-def stitch_output_recheck(cfg, item, execution=True):
-    """Independent local deletion gate; a server boolean is never sufficient."""
-    switch = stitch_switch_refusal(cfg, execution)
-    if switch:
-        return switch
-    try:
-        if item.get("permit_reason") != "stitched_included" or item.get("kind") != "raw":
-            return "unsupported stitch deletion reason"
-        path = item["stitch_output_path"]
-        marker, _ = confined_regular_file(cfg.output_dir, path + ".registered.json")
-        if marker.stat().st_size > 4096:
-            return "oversized registration receipt"
-        registration = json.loads(marker.read_text())
-        if (registration.get("recorded") is not True or registration.get("task_id") != item.get("stitch_task_id")
-                or registration.get("sha256") != item["stitch_output_sha256"]):
-            return "server registration receipt missing"
-        # The durable local proof was written only after all native verification.
-        proof_path, _ = confined_regular_file(cfg.output_dir, path + ".proof.json")
-        if proof_path.stat().st_size > 1024 * 1024:
-            return "oversized stitch proof"
-        proof = json.loads(proof_path.read_text())
-        if (proof.get("policy") != STITCH_POLICY or proof.get("provenance", {}).get("manifest_sha256") != V85R_MANIFEST_SHA
-                or proof.get("relative_path") != path or proof.get("sha256") != item["stitch_output_sha256"]
-                or proof.get("size_bytes") != item["stitch_output_size_bytes"]
-                or not all(proof.get(k) is True for k in ("full_decode", "seam_decode", "packet_chain", "native_audit", "original_sources_no_audio", "fsynced"))):
-            return "durable output proof mismatch"
-        included = [p for p in proof.get("inputs", []) if p.get("clip_id") == item["source_id"] and not p.get("retirement_held", True)]
-        if (len(included) != 1 or included[0].get("sha256") != item["sha256"] or included[0].get("size_bytes") != item["size_bytes"]
-                or included[0].get("repaired") is not False or included[0].get("frames", 0) <= 0
-                or included[0].get("frames") != included[0].get("packets") or not included[0].get("packet_chain_sha256")):
-            return "raw source lacks full inclusion"
-        hash_certification_file(cfg.output_dir, path, item["stitch_output_size_bytes"], item["stitch_output_sha256"])
-        # Switches may flip during the (slow) rehash: re-read them afterwards.
-        return stitch_switch_refusal(cfg, execution)
-    except Exception as exc:
-        return "output fresh readback failed: " + str(exc)[:200]
 
 
 def stitch_checkpoint(cfg, task):
@@ -48534,12 +48563,16 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
         if proof_stop is None or proof_stop.task is not task or proof_stop.deadline is None:
             raise StitchHold("proof requires its original attempt deadline")
     plan = task["plan"]
+    pins, pin_error = cleanup_pins()
+    if pin_error:
+        raise StitchResourceHold("stitch policy pins unavailable")
     if (plan.get("policy") != STITCH_POLICY or plan.get("revision") != STITCH_REVISION
             or plan.get("corpus_sha256") != STITCH_CORPUS_SHA or plan.get("keep_policy_sha256") != CLEANUP_KEEP28_POLICY_SHA256):
-        raise StitchHold("unapproved V85 policy identity")
+        raise StitchTaskFailure("unapproved V85 policy identity")
     clips, joins = plan["clips"], plan["joins"]
-    if not 1 <= len(clips) <= 200 or len(joins) != len(clips) - 1 or len(plan.get("eligible", [])) != len(clips) or sum(c["size_bytes"] for c in clips) > STITCH_MAX_INPUT:
-        raise StitchHold("unbounded assembly unit")
+    input_bytes = sum(c["size_bytes"] for c in clips)
+    if not 1 <= len(clips) <= 200 or len(joins) != len(clips) - 1 or len(plan.get("eligible", [])) != len(clips) or input_bytes > STITCH_MAX_INPUT:
+        raise StitchTaskFailure("unbounded assembly unit")
     folder = "_V85r_proof_keep28_v2/" if kind is StitchRunKind.PROOF else "_V85r_keep28/"
     suffix = "/proof-" + STITCH_PROOF_SOURCE_SHA[:16] if kind is StitchRunKind.PROOF else ""
     if kind is StitchRunKind.PROOF and hasattr(proof_stop,"evidence_context"):
@@ -48547,7 +48580,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
         suffix += "/run-"+proof_stop.run_id
     expected = clips[0]["relative_path"].split("/")[0] + folder + str(plan["recording_id"]) + "/"
     if (not plan["output_folder"].startswith(expected) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}-00-00Z" + re.escape(suffix), plan["output_folder"][len(expected):])):
-        raise StitchHold("output must be in the stream's new versioned sibling folder")
+        raise StitchTaskFailure("output must be in the stream's new versioned sibling folder")
     stop = proof_stop if kind is StitchRunKind.PROOF else StitchStop(cfg, stop_event, task if admitted is None else None, kind)
     deadline = (stop.deadline if kind is StitchRunKind.PROOF else min(time.monotonic() + 7000,
         time.monotonic() + (parse_certification_timestamp(task["expires_at"], "stitch lease")
@@ -48572,24 +48605,40 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
         directory_type = StitchProofDirectory if kind is StitchRunKind.PROOF else StitchDirectory
         directory = resources.enter_context(directory_type(cfg, plan["output_folder"], task["id"], stop))
         work = directory.path
+        pending = []
+        descriptor = directory.fds[-1]
+        stage_prefix = ".stitch-%d-pending-" % task["id"]
+
+        def stage_file(temporary, name):
+            stage = stage_prefix + str(len(pending))
+            os.rename(temporary, stage, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+            pending.append((stage, name))
+
         def clear_scratch():
             names = ["concat.txt", "run.partial.mp4", "proof.partial.json", "output.json", "output.packets", "output.hidden", "output.frames", "repair.h264", "repair.partial.mp4", "repair.frames", "repair.proof.partial.json", "v85r-request.json", "v85r-decision.json"]
             if kind is StitchRunKind.PROOF:
                 names = ["concat.txt", "run.partial.mp4", "proof.partial.json", "v85r-request.json"]
             else:
                 names += ["source-%03d.%s" % (n, suffix) for n in range(len(clips)) for suffix in ("json", "packets", "hidden", "frames")]
-            for name in names:
+                # At most one run or repair per input, with one sidecar each.
+                names += [stage_prefix + str(n) for n in range(2 * len(clips))]
+            for name in set(names).intersection(os.listdir(descriptor)):
                 try:
                     os.unlink(name, dir_fd=directory.fds[-1])
                 except FileNotFoundError:
                     pass
             os.fsync(directory.fds[-1])
         resources.callback(clear_scratch)
+        if kind is StitchRunKind.PRODUCTION:
+            # Reclaim abandoned private stages before checking the build's
+            # full reservation. An interrupted batch can use that headroom.
+            clear_scratch()
+            stitch_resources(cfg, input_bytes)
         held = set()
         if admitted is None:
             inputs = plan.get("feature_inputs", [])
             if len(inputs) != len(clips):
-                raise StitchHold("V85r feature metadata missing")
+                raise StitchTaskFailure("V85r feature metadata missing")
             clips = [dict(c, feature_input=f) for c, f in zip(clips, inputs)]
         for index in range(1, len(clips)):
             a, b = clips[index-1:index+1]
@@ -48639,9 +48688,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
             stitch_audit_output(ffmpeg, ffprobe, output, sources, work, deadline, stop)
             size, sha = stitch_proof_digest(output, stop) if kind is StitchRunKind.PROOF else sha256_file(output)
             name = "proof.mp4" if kind is StitchRunKind.PROOF else "run-%03d-%s.mp4" % (run_index, sha)
-            published = directory.publish(output.name, name)
             relative = plan["output_folder"] + "/" + name
-            stitch_hash(cfg, relative, size, sha, stop)  # reopen after fsync
             proof = dict(policy=STITCH_POLICY, provenance=provenance, relative_path=relative, sha256=sha, size_bytes=size, inputs=[], full_decode=True,
                          seam_decode=True, packet_chain=True, native_audit=True, original_sources_no_audio=True,
                          readback_sha256=sha, fsynced=True)
@@ -48652,15 +48699,26 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                     raw_proof = current.proof()
                 proof["inputs"].append(dict(clip_id=clip["source_id"], sha256=clip["sha256"], size_bytes=clip["size_bytes"],
                                              packet_chain_sha256=source["chain"], packets=source["count"], frames=source["count"],
-                                             repaired=False, retirement_held=clip["source_id"] in held, raw_proof=raw_proof))
+                                             repaired=False,
+                                             # Owner rule: keep28 raw on the NAS is never deleted because of
+                                             # stitching. Production therefore always reports every input as
+                                             # retirement-held, so readiness always ends
+                                             # completed_no_retirement and the single lane is never left busy by
+                                             # an undeleted cleanup plan. The isolated proof lane is not the
+                                             # stitch lane and keeps its seam-derived value.
+                                             retirement_held=True if kind is StitchRunKind.PRODUCTION else clip["source_id"] in held,
+                                             raw_proof=raw_proof))
             if kind is StitchRunKind.PROOF:
                 proof["media_seconds"] = float(cumulative)
-            if kind is StitchRunKind.PRODUCTION:
+                directory.publish(output.name, name)
+                stitch_hash(cfg, relative, size, sha, stop)
+                STITCH_STATUS.add("outputs_verified")
+            else:
                 proof_temp = work / "proof.partial.json"
                 proof_temp.write_bytes(cleanup_json_bytes(proof))
-                directory.publish(proof_temp.name, name + ".proof.json")
+                stage_file(output.name, name)
+                stage_file(proof_temp.name, name + ".proof.json")
             result["outputs"].append(proof)
-            STITCH_STATUS.add("outputs_verified")
             run_index += 1
             sources, run_clips = [], []
 
@@ -48669,29 +48727,28 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                 raise StitchHold(stop.reason or "stitch cancelled")
             clip = dict(original)
             # Reuse the independent pinned folder/keep-window map for scope.
-            pins, error = cleanup_pins()
             key = cleanup_folder_key(clip["relative_path"], "raw")
-            if error or pins["folders"].get(key) != plan["stream_id"] or clip["stream_id"] != plan["stream_id"]:
-                raise StitchHold("raw folder is not owned by approved stream")
+            if pins["folders"].get(key) != plan["stream_id"] or clip["stream_id"] != plan["stream_id"]:
+                raise StitchTaskFailure("raw folder is not owned by approved stream")
             start, end, _ = pins["windows"][plan["stream_id"]]
             a = parse_certification_timestamp(clip["start_at"], "source start")
             b = parse_certification_timestamp(clip["end_at"], "source end")
             if a < start or b > end or b <= a:
-                raise StitchHold("source crosses keep boundary")
+                raise StitchTaskFailure("source crosses keep boundary")
             path, info, _ = stitch_hash(cfg, clip["relative_path"], clip["size_bytes"], clip["sha256"], stop)
             if sys.platform.startswith("linux"):
                 fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
                 resources.callback(os.close, fd)
                 if cleanup_identity(os.fstat(fd)) != cleanup_identity(info):
-                    raise StitchHold("source identity changed before native audit")
+                    raise MediaCertificationResourceError("source identity changed before native audit")
                 path = Path("/proc/%d/fd/%d" % (os.getpid(), fd))
-            sidecar, scinfo = confined_regular_file(cfg.output_dir, clip["relative_path"] + ".stoarama.json")
+            _, scinfo = confined_regular_file(cfg.output_dir, clip["relative_path"] + ".stoarama.json")
             clip.update(frozen_identity=cleanup_identity(info), frozen_sidecar_identity=cleanup_identity(scinfo), _path=path)
             if not plan["eligible"][index] or (admitted is not None and not admitted(clip)):
                 if kind is StitchRunKind.PROOF:
                     raise StitchHold("proof source is ineligible")
                 flush()
-                repaired = stitch_repair_local(cfg, clip, path, directory, tools, deadline, stop)
+                repaired = stitch_repair_local(clip, directory, stage_file, tools, deadline, stop)
                 if repaired:
                     result["repairs"].append(repaired)
                 result["left_out"].append(clip["source_id"])
@@ -48704,7 +48761,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                 if kind is StitchRunKind.PROOF or stop.is_set():
                     raise
                 flush()
-                repaired = stitch_repair_local(cfg, clip, path, directory, tools, deadline, stop)
+                repaired = stitch_repair_local(clip, directory, stage_file, tools, deadline, stop)
                 if repaired:
                     result["repairs"].append(repaired)
                 result["left_out"].append(clip["source_id"])
@@ -48718,6 +48775,19 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
         flush()
         if kind is StitchRunKind.PROOF:
             stitch_proof_complete(cfg, task, result, work, stop)
+        else:
+            # A late task-data failure must leave no canonical media without
+            # a result. Publish only after every source and repair is checked.
+            # Publication failures can be retried with the same final names.
+            try:
+                for stage, name in pending:
+                    stitch_check(stop)
+                    directory.publish(stage, name)
+                for output in result["outputs"] + result["repairs"]:
+                    stitch_hash(cfg, output["relative_path"], output["size_bytes"], output["sha256"], stop)
+            except MediaCertificationError as exc:
+                raise MediaCertificationResourceError("stitch output publication needs a fresh read") from exc
+            STITCH_STATUS.add("outputs_verified", len(result["outputs"]))
     if kind is StitchRunKind.PRODUCTION:
         stitch_journal(inventory, task["id"], task["plan_sha256"], result)
     return result
@@ -50495,6 +50565,53 @@ def stitch_register(cfg, inventory, task_id, result):
     log("INFO", "V85r task=%s registered outputs=%d retained=%d" % (task_id, len(result["outputs"]), len(result["left_out"])))
 
 
+def stitch_hold_task(cfg, inventory, task, reason):
+    """Report a terminal task-data hold once and never re-lease the hour.
+
+    There are no outputs to register locally, so this posts the result only and
+    leaves the task in the server's terminal `held` state with the reason
+    recorded. No readiness/cleanup-plan path runs.
+    """
+    result = dict(policy=STITCH_POLICY, lease_token=task["lease_token"], plan_sha256=task["plan_sha256"],
+                  outputs=[], repairs=[], left_out=[c["source_id"] for c in task["plan"]["clips"]],
+                  seams=[dict(policy=STITCH_POLICY, decision="hold", join=False, nomination=False,
+                              status="HELD_task_data", reason=reason[:200], frozen=False,
+                              left_id=task["plan"]["clips"][n]["source_id"],
+                              right_id=task["plan"]["clips"][n + 1]["source_id"])
+                         for n in range(len(task["plan"]["clips"]) - 1)],
+                  error=reason[:1000])
+    ack = restore_api(cfg, "/account/connections/stitch/%d/result" % task["id"], result)
+    if ack.get("recorded") is not True or ack.get("id") != task["id"]:
+        raise StitchHold("server held-result registration not acknowledged")
+    stitch_journal(inventory, task["id"], task["plan_sha256"], result, registered=True)
+    STITCH_STATUS.update(state="held", task_id=task["id"], held_reason=reason[:300], completed_at=utc_now())
+    log("WARN", "V85r task=%s held on task data: %s" % (task["id"], reason[:300]))
+
+
+def stitch_missing_source_leaf(cfg, task, cause):
+    if not isinstance(cause, FileNotFoundError) or not cause.filename:
+        return False
+    missing = Path(cause.filename)
+    root = cfg.output_dir.resolve()
+    for clip in task["plan"]["clips"]:
+        raw = root / clip["relative_path"]
+        if missing in (raw, stitch_sidecar_path(raw)):
+            return missing.parent.is_dir()
+    return False
+
+
+def stitch_release(cfg, task):
+    try:
+        response = restore_api(cfg, "/account/connections/stitch/%d/checkpoint" % task["id"],
+                               dict(lease_token=task["lease_token"], plan_sha256=task["plan_sha256"], release=True),
+                               timeout=CLEANUP_EXECUTION_OBSERVE_SEC)
+        if response.get("released") is True:
+            return
+    except Exception:
+        pass
+    log("WARN", "V85r lease release unavailable. The original lease expiry still applies.")
+
+
 def stitch_once(cfg, inventory, stop_event):
     if not getattr(cfg, "stitch_enabled", False):
         return 30
@@ -50513,6 +50630,9 @@ def stitch_once(cfg, inventory, stop_event):
             # An uncommitted expired lease needs its new token below. An
             # already committed result always answers idempotently first.
     stitch_resources(cfg)
+    _, pin_error = cleanup_pins()
+    if pin_error:
+        raise StitchResourceHold("stitch policy pins unavailable")
     if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
         raise StitchHold("stitch cancelled while cleanup executing")
     if stop_event.is_set() or not cfg.stitch_enabled:
@@ -50522,12 +50642,30 @@ def stitch_once(cfg, inventory, stop_event):
     if task is None:
         return max(30, min(600, response.get("retry_after_sec", 300)))
     STITCH_STATUS.update(task_id=task["id"], state="working", started_at=utc_now())
-    stitch_resources(cfg, sum(c["size_bytes"] for c in task["plan"]["clips"]))
-    result = stitch_journal(inventory, task["id"], task["plan_sha256"])
-    if result is None:
-        stitch_corpus(cfg)
-        tools = stitch_v85r_tools(cfg, time.monotonic() + BENCHMARK_TOOL_INSTALL_SEC, stop_event)
-        result = stitch_build(cfg, inventory, task, stop_event, tools)
+    try:
+        result = stitch_journal(inventory, task["id"], task["plan_sha256"])
+        if result is None:
+            stitch_corpus(cfg)
+            tools = stitch_v85r_tools(cfg, time.monotonic() + BENCHMARK_TOOL_INSTALL_SEC, stop_event)
+            result = stitch_build(cfg, inventory, task, stop_event, tools)
+    except MediaCertificationResourceError:
+        stitch_release(cfg, task)
+        raise
+    except (StitchTaskFailure, MediaCertificationError, CleanupSourceDataError) as exc:
+        if not os.path.ismount(str(cfg.output_dir)):
+            stitch_release(cfg, task)
+            raise StitchResourceHold("NAS output root is not mounted") from None
+        cause = exc.__cause__
+        if isinstance(cause, OSError) and not stitch_missing_source_leaf(cfg, task, cause):
+            stitch_release(cfg, task)
+            raise StitchResourceHold("NAS source I/O unavailable") from exc
+        stitch_hold_task(cfg, inventory, task, str(exc))
+        return 30
+    except Exception:
+        # No result has been submitted on this attempt. Return only its exact
+        # lease so a transient build failure does not occupy the shared lane.
+        stitch_release(cfg, task)
+        raise
     result["lease_token"] = task["lease_token"]
     stitch_journal(inventory, task["id"], task["plan_sha256"], result)
     stitch_register(cfg, inventory, task["id"], result)

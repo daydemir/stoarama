@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"path"
@@ -308,13 +307,7 @@ func (s *Server) handleAccountNASStitchLease(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, 500, "begin stitch lease")
 		return
 	}
-	var releaseFreeze func()
-	defer func() {
-		tx.Rollback(ctx)
-		if releaseFreeze != nil {
-			releaseFreeze()
-		}
-	}()
+	defer tx.Rollback(ctx)
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasStitchFence); err != nil {
 		util.WriteError(w, 500, "stitch fence failed")
 		return
@@ -325,14 +318,10 @@ func (s *Server) handleAccountNASStitchLease(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, 503, "cleanup source fence unavailable")
 		return
 	}
-	if releaseFreeze, err = s.stitchAdvanceRetirement(ctx, tx); err != nil {
-		util.WriteError(w, 409, err.Error())
-		return
-	}
 	var busy bool
-	// One lane across clients/reboots; an ambiguous result expires back to the
-	// *same* immutable task. Pending cleanup must drain before more media grows.
-	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_tasks WHERE (state='leased' AND lease_expires_at>now()) OR (state='verified' AND (cleanup_plan_id IS NULL OR EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=cleanup_plan_id AND state<>'deleted')))) OR EXISTS(SELECT 1 FROM nas_cleanup_frozen_streams)`).Scan(&busy)
+	// One lane across clients and reboots. Wait for the durable receipt after
+	// result acceptance. Legacy plans already passed that gate and stay intact.
+	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_tasks WHERE (state='leased' AND lease_expires_at>now()) OR (state='verified' AND cleanup_plan_id IS NULL)) OR EXISTS(SELECT 1 FROM nas_cleanup_frozen_streams)`).Scan(&busy)
 	if err != nil {
 		util.WriteError(w, 500, "stitch lane lookup failed")
 		return
@@ -395,9 +384,21 @@ func (s *Server) handleAccountNASStitchCheckpoint(w http.ResponseWriter, r *http
 	var req struct {
 		Token   string `json:"lease_token"`
 		PlanSHA string `json:"plan_sha256"`
+		Release bool   `json:"release"`
 	}
 	if cid != 13 || util.DecodeJSON(r, &req) != nil {
 		util.WriteError(w, 400, "stitch checkpoint identity required")
+		return
+	}
+	if req.Release {
+		tag, err := s.pool.Exec(ctx, `UPDATE nas_stitch_tasks
+ SET state='pending',lease_token=NULL,lease_expires_at=NULL,updated_at=now()
+ WHERE id=$1 AND lease_token=$2 AND plan_sha256=$3 AND state='leased' AND lease_expires_at>clock_timestamp()`, id, req.Token, req.PlanSHA)
+		if err != nil || tag.RowsAffected() != 1 {
+			util.WriteError(w, 409, "stitch lease release identity unavailable")
+			return
+		}
+		util.WriteJSON(w, 200, map[string]any{"continue": false, "released": true})
 		return
 	}
 	var allowed bool
@@ -428,9 +429,9 @@ func (s *Server) stitchPlanNext(ctx context.Context, tx pgx.Tx) (nasStitchTask, 
  JOIN recording_clips c ON c.recording_id=r.id JOIN nas_inventory_files n ON n.clip_id=c.id AND n.connection_id=13 AND n.state='present' AND n.sha256=c.sha256 AND n.size_bytes=c.size_bytes
  WHERE NOT s.paused AND s.approved_until>now() AND NOT EXISTS(SELECT 1 FROM nas_cleanup_frozen_streams f WHERE f.stream_id=s.stream_id) AND c.clip_start_at>=s.start_at AND c.clip_end_at<=s.end_at
  AND NOT EXISTS(SELECT 1 FROM nas_stitch_tasks t WHERE t.recording_id=r.id AND t.hour_at=date_trunc('hour',c.clip_start_at))
- AND NOT EXISTS(SELECT 1 FROM recording_clips c2 LEFT JOIN nas_inventory_files n2 ON n2.clip_id=c2.id AND n2.connection_id=13 AND n2.state='present' AND n2.relative_path=c2.display_path AND n2.sha256=c2.sha256 AND n2.size_bytes=c2.size_bytes
- WHERE c2.recording_id=r.id AND c2.clip_start_at>=date_trunc('hour',c.clip_start_at) AND c2.clip_start_at<date_trunc('hour',c.clip_start_at)+interval '1 hour' AND c2.clip_start_at>=s.start_at AND c2.clip_end_at<=s.end_at AND n2.clip_id IS NULL)
- ORDER BY c.clip_start_at,c.id,s.id LIMIT 1`).Scan(&sid, &t.Plan.StreamID, &t.Plan.RecordingID, &hour, &start, &end)
+ AND `+nasStitchHourPresentSQL+`
+ AND (SELECT `+nasStitchHourBoundsSQL+` FROM recording_clips c2 WHERE `+nasStitchHourClipsSQL+`)
+ ORDER BY c.clip_start_at,c.id,s.id LIMIT 1`, nasStitchMaxClips, nasStitchMaxBytes).Scan(&sid, &t.Plan.StreamID, &t.Plan.RecordingID, &hour, &start, &end)
 	if err != nil {
 		return t, err
 	}
@@ -442,7 +443,7 @@ func (s *Server) stitchPlanNext(ctx context.Context, tx pgx.Tx) (nasStitchTask, 
 	if !ok || start.Before(kw.start) || end.After(kw.end) {
 		return t, errors.New("scope no longer inside keep policy")
 	}
-	rows, err := tx.Query(ctx, `SELECT c.id FROM recording_clips c WHERE c.recording_id=$1 AND c.clip_start_at>=$2 AND c.clip_start_at<$3 AND c.clip_start_at>=$4 AND c.clip_end_at<=$5 ORDER BY c.clip_start_at,c.id LIMIT 201`, t.Plan.RecordingID, hour, hour.Add(time.Hour), start, end)
+	rows, err := tx.Query(ctx, `SELECT c.id FROM recording_clips c WHERE c.recording_id=$1 AND c.clip_start_at>=$2 AND c.clip_start_at<$3 AND c.clip_start_at>=$4 AND c.clip_end_at<=$5 ORDER BY c.clip_start_at,c.id LIMIT $6`, t.Plan.RecordingID, hour, hour.Add(time.Hour), start, end, nasStitchMaxClips+1)
 	if err != nil {
 		return t, err
 	}
@@ -461,7 +462,7 @@ func (s *Server) stitchPlanNext(ctx context.Context, tx pgx.Tx) (nasStitchTask, 
 	if err != nil {
 		return t, err
 	}
-	if len(ids) == 0 || len(ids) > 200 {
+	if len(ids) == 0 || len(ids) > nasStitchMaxClips {
 		return t, errors.New("assembly unit outside 1..200 clip bound")
 	}
 	var total int64
@@ -716,86 +717,10 @@ func (s *Server) handleAccountNASStitchResult(w http.ResponseWriter, r *http.Req
 	util.WriteJSON(w, 200, map[string]any{"recorded": true, "id": id})
 }
 
-// The original cleanup permit, budget, R2 recovery and receipt path remains the
-// only unlink authority. Scope approval can advance its dry-run plan unattended.
-func (s *Server) stitchAdvanceRetirement(ctx context.Context, tx pgx.Tx) (func(), error) {
-	if !s.cfg.NASStitchEnabled || !s.cfg.NASStitchDeletionEnabled || !s.cfg.NASCleanupDeletionEnabled {
-		return nil, nil
-	}
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
-		return nil, err
-	}
-	if _, err := cleanupLockConnection(ctx, tx, 13); err != nil {
-		return nil, err
-	}
-	// Close only this lane's cleanly completed plan so the shared one-plan
-	// cap permits its successor. Issued R2 recovery holds remain permanent.
-	if _, err := tx.Exec(ctx, `UPDATE nas_cleanup_plans p SET mode='paused',approved_until=NULL,approval_reason='stitch retirement complete'
- WHERE p.mode='enabled' AND EXISTS(SELECT 1 FROM nas_stitch_tasks t WHERE t.cleanup_plan_id=p.id)
- AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.state<>'deleted')`); err != nil {
-		return nil, err
-	}
-	var id int64
-	var until time.Time
-	err := tx.QueryRow(ctx, `SELECT p.id,s.approved_until FROM nas_stitch_tasks t JOIN nas_stitch_scopes s ON s.id=t.scope_id JOIN nas_cleanup_plans p ON p.id=t.cleanup_plan_id WHERE t.state='verified' AND p.mode='dry_run' AND s.deletion_approved AND NOT s.paused AND s.approved_until>now() AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.state<>'would_delete') ORDER BY t.id LIMIT 1 FOR UPDATE OF p`).Scan(&id, &until)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if code, _ := cleanupEnableGates(ctx, tx, id); code != 0 {
-		return nil, nil
-	}
-	if until.After(time.Now().Add(nasCleanupMaxApproval)) {
-		until = time.Now().Add(nasCleanupMaxApproval)
-	}
-	release, err := s.cleanupActivateRankings(ctx, tx, id)
-	if err != nil {
-		return release, err
-	}
-	if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='enabled',approval_reason='owner scoped stitched_included',approved_until=$2 WHERE id=$1`, id, until); err != nil {
-		return release, err
-	}
-	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='pending',lease_expires_at=NULL WHERE plan_id=$1`, id)
-	return release, err
-}
+// Legacy stitched cleanup plans are evidence only. The ordinary cleanup
+// master still governs ordinary, independently authorized cleanup items.
 func (s *Server) stitchDeletionMaster(i nasCleanupItem) bool {
-	return s.cfg.NASCleanupDeletionEnabled && (i.PermitReason == "" || (i.PermitReason == nasStitchReason && s.cfg.NASStitchEnabled && s.cfg.NASStitchDeletionEnabled))
-}
-func (s *Server) stitchInclusionCurrent(ctx context.Context, q interface {
-	QueryRow(context.Context, string, ...any) pgx.Row
-}, i nasCleanupItem) error {
-	if i.Kind != "raw" || i.PermitReason != nasStitchReason || i.StitchTaskID <= 0 {
-		return errors.New("unsupported stitched retirement")
-	}
-	if !s.cfg.NASStitchEnabled {
-		return errors.New("NAS stitch switch off")
-	}
-	var plan, result []byte
-	var active bool
-	err := q.QueryRow(ctx, `SELECT t.plan,t.result,NOT s.paused AND s.deletion_approved AND s.approved_until>now() FROM nas_stitch_tasks t JOIN nas_stitch_scopes s ON s.id=t.scope_id JOIN nas_stitch_outputs o ON o.task_id=t.id WHERE t.id=$1 AND t.state='verified' AND o.relative_path=$2 AND o.sha256=$3 AND o.size_bytes=$4 FOR SHARE OF s,t,o`, i.StitchTaskID, i.StitchOutputPath, i.StitchOutputSHA, i.StitchOutputSize).Scan(&plan, &result, &active)
-	if err != nil || !active {
-		return errors.New("verified output or owner stream deletion approval absent")
-	}
-	var p nasStitchPlan
-	var r nasStitchResult
-	if json.Unmarshal(plan, &p) != nil || json.Unmarshal(result, &r) != nil {
-		return errors.New("invalid stitch evidence")
-	}
-	items, err := validateNASStitchResult(p, r)
-	if err != nil {
-		return err
-	}
-	if err := deliveryNASUnheld(ctx, q, i); err != nil {
-		return err
-	}
-	for _, c := range items {
-		if c.SourceID == i.SourceID && c.SHA256 == i.SHA256 && c.SizeBytes == i.SizeBytes && c.StitchOutputSHA == i.StitchOutputSHA && c.StitchOutputPath == i.StitchOutputPath && c.StreamID == i.StreamID && c.RelativePath == i.RelativePath {
-			return nil
-		}
-	}
-	return errors.New("raw clip has no full source inclusion proof")
+	return s.cfg.NASCleanupDeletionEnabled && i.PermitReason == ""
 }
 
 func (s *Server) recordNASStitchStatus(ctx context.Context, cid int64, raw json.RawMessage) {
@@ -810,8 +735,8 @@ func (s *Server) recordNASStitchStatus(ctx context.Context, cid int64, raw json.
 	_, _ = s.pool.Exec(ctx, `UPDATE connections SET nas_stitch_status=$2::jsonb,nas_stitch_status_at=now() WHERE id=$1`, cid, string(raw))
 }
 
-// Local registration receipts must be durable before cleanup work is visible.
-// A crash/lost ACK repeats this transition; it never creates another plan.
+// The local registration receipt must be durable before releasing the lane.
+// Older immutable result bodies are still replayable, with all raw retained.
 func (s *Server) handleAccountNASStitchReady(w http.ResponseWriter, r *http.Request) {
 	cid, ok := s.nasRestoreConnection(r.Context(), w, r)
 	if !ok {
@@ -839,9 +764,8 @@ func (s *Server) handleAccountNASStitchReady(w http.ResponseWriter, r *http.Requ
 	defer tx.Rollback(ctx)
 	var plan, result []byte
 	var state, token, sha string
-	var active bool
 	var pid *int64
-	err = tx.QueryRow(ctx, `SELECT t.plan,t.result,t.state,t.lease_token,t.plan_sha256,t.cleanup_plan_id,NOT s.paused AND s.approved_until>now() FROM nas_stitch_tasks t JOIN nas_stitch_scopes s ON s.id=t.scope_id WHERE t.id=$1 FOR UPDATE OF t FOR SHARE OF s`, id).Scan(&plan, &result, &state, &token, &sha, &pid, &active)
+	err = tx.QueryRow(ctx, `SELECT plan,result,state,lease_token,plan_sha256,cleanup_plan_id FROM nas_stitch_tasks WHERE id=$1 FOR UPDATE`, id).Scan(&plan, &result, &state, &token, &sha, &pid)
 	if err != nil || req.Token != token || req.PlanSHA != sha || (state != "verified" && state != "held" && state != "completed_no_retirement") {
 		util.WriteError(w, 409, "stitch readiness identity differs")
 		return
@@ -856,50 +780,13 @@ func (s *Server) handleAccountNASStitchReady(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, 500, "stitch evidence unavailable")
 		return
 	}
-	items, err := validateNASStitchResult(p, q)
-	if err != nil {
+	if _, err = validateNASStitchResult(p, q); err != nil {
 		util.WriteError(w, 409, err.Error())
 		return
 	}
-	// Holds can arrive after the immutable stitch plan/result. Retain those
-	// sources while accepting the verified outputs and releasing the lane;
-	// they must not strand every later stitch task at readiness.
-	retire := items[:0]
-	for _, item := range items {
-		held, err := deliveryNASHeld(ctx, tx, item)
-		if err != nil {
-			util.WriteError(w, 503, err.Error())
-			return
-		}
-		if !held {
-			retire = append(retire, item)
-		}
-	}
-	items = retire
-	if len(items) == 0 {
-		// Finishing without retirement grants no deletion authority. A scope
-		// pause must not strand durable outputs in the shared media lane.
-		if _, err = tx.Exec(ctx, `UPDATE nas_stitch_tasks SET state='completed_no_retirement',updated_at=now() WHERE id=$1`, id); err != nil {
-			util.WriteError(w, 500, "non-retiring completion failed")
-			return
-		}
-	} else {
-		if !s.cfg.NASStitchEnabled || !active {
-			util.WriteError(w, 409, "stitch scope inactive")
-			return
-		}
-		for n := range items {
-			items[n].StitchTaskID = id
-		}
-		planID, _, err := persistNASCleanupPlan(ctx, tx, fmt.Sprintf("v85-stitch-%d", id), items)
-		if err != nil {
-			util.WriteError(w, 409, "cleanup admission: "+err.Error())
-			return
-		}
-		if _, err = tx.Exec(ctx, `UPDATE nas_stitch_tasks SET cleanup_plan_id=$2 WHERE id=$1`, id, planID); err != nil {
-			util.WriteError(w, 500, "readiness link failed")
-			return
-		}
+	if _, err = tx.Exec(ctx, `UPDATE nas_stitch_tasks SET state='completed_no_retirement',updated_at=now() WHERE id=$1`, id); err != nil {
+		util.WriteError(w, 500, "non-retiring completion failed")
+		return
 	}
 	if tx.Commit(ctx) != nil {
 		util.WriteError(w, 500, "readiness commit failed")
