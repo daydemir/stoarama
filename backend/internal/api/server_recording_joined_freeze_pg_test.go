@@ -38,6 +38,8 @@ func requireJoinedTestReplicationRole(t *testing.T, pool *pgxpool.Pool) {
 var joinedMigrationNames = []string{
 	// Defer with 0167; the final MigrateUp applies both in dependency order.
 	"0215_nas_stitch_lease_key.sql",
+	// Replaces the reservation guard over the deferred cleanup tables.
+	"0216_r2_reservation_guard_index.sql",
 	"0214_nas_stitch_local_only.sql",
 	"0210_r2_owner_fence_timing.sql",
 	"0209_nas_cleanup_permanent_holds.sql",
