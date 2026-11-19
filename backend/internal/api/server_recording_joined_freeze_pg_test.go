@@ -36,6 +36,8 @@ func requireJoinedTestReplicationRole(t *testing.T, pool *pgxpool.Pool) {
 }
 
 var joinedMigrationNames = []string{
+	// Owner keep holds guard the deferred retirement reservation table.
+	"0220_r2_owner_keep_prefixes.sql",
 	// The R2 stitch handoff depends on the deferred stitch and writer-fence tables.
 	"0217_nas_stitch_r2_handoff.sql",
 	// Defer with 0167; the final MigrateUp applies both in dependency order.

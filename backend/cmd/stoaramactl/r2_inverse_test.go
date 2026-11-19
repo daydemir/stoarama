@@ -186,6 +186,7 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
  CREATE TABLE r2_object_retirements(bucket text,object_key text);
  CREATE TABLE nas_restore_requests(clip_id bigint,state text);
  CREATE TABLE recording_joined_source_snapshots(clip_id bigint);
+ CREATE TABLE r2_owner_keep_prefixes(bucket text,prefix text);
  CREATE TABLE recording_joined_snapshot_scopes(recording_id bigint,recording_job_id bigint,high_water_clip_id bigint,batch_record_id bigint);
  CREATE TABLE recording_joined_batches(id bigint,state text);
  CREATE TABLE recording_joined_dry_run_scopes(recording_id bigint,recording_job_id bigint,high_water_clip_id bigint);
