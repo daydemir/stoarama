@@ -403,8 +403,11 @@ or changed output keeps the raw.
 
 Apply 0219 with the NAS deletion master off. Before preparing a certified
 dry run, verify the updated API on every serving instance, the exact
-`r2-copy-v7-certified-stitch` NAS client, the updated Jelly gates and the
-keep-28 controller with #565's first-write gate deployed.
+`r2-copy-v7-certified-stitch` NAS client, and the updated Jelly gates. Verify
+the deployed keep-28 controller closes admission at the first DELETE write,
+including when admission closes while the keep-28 transport is dialing.
+#565 establishes that behavior for the outside-keep-28 lane. The keep-28
+transport needs its own implementation and regression test before rollout.
 Keep the ordinary R2 recovery verifier and its Jelly runner on ordinary
 plans. Certified plans use connection 13's replacement readback for their
 dry-run and deletion evidence. Pause certified dry runs and enabled plans
