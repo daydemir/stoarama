@@ -48,8 +48,8 @@ BEGIN
  RETURN NEW;
 END $$;
 -- Sort after the existing admission trigger, which acquires the writer fence.
-CREATE TRIGGER nas_stitch_r2_stage_native_guard BEFORE INSERT ON nas_stitch_r2_stage_objects
- FOR EACH ROW EXECUTE FUNCTION guard_nas_stitch_r2_native_stage();
+CREATE TRIGGER nas_stitch_r2_stage_native_guard BEFORE INSERT OR UPDATE ON nas_stitch_r2_stage_objects
+ FOR EACH ROW WHEN (NEW.state<>'aborted') EXECUTE FUNCTION guard_nas_stitch_r2_native_stage();
 
 CREATE FUNCTION nas_stitch_r2_native_proof(h nas_stitch_r2_hours) RETURNS boolean
 LANGUAGE sql IMMUTABLE AS $$
@@ -59,6 +59,26 @@ LANGUAGE sql IMMUTABLE AS $$
    THEN h.staged_manifest->'outputs' ELSE '[]'::jsonb END) output
  );
 $$;
+
+CREATE FUNCTION nas_stitch_r2_native_copy_ready(stage_id bigint, manifest_digest text) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+ SELECT EXISTS (
+  SELECT 1 FROM nas_stitch_r2_stage_objects o JOIN nas_stitch_r2_hours h ON h.id=o.hour_id AND h.attempt=o.attempt
+  WHERE o.id=$1 AND o.state='staged' AND h.state='staged' AND h.staged_manifest_sha256=$2
+   AND nas_stitch_r2_native_proof(h)
+ );
+$$;
+
+CREATE FUNCTION guard_nas_stitch_r2_native_copy() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF NOT nas_stitch_r2_native_copy_ready(NEW.source_id,NEW.manifest_sha256) THEN
+  RAISE EXCEPTION 'reviewed Durham copy toolchain required' USING ERRCODE='55000';
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER nas_stitch_r2_native_copy_guard BEFORE UPDATE OF lease_token,lease_expires_at ON nas_r2_copy_items
+ FOR EACH ROW WHEN (NEW.kind='stitch_output' AND NEW.state='leased')
+ EXECUTE FUNCTION guard_nas_stitch_r2_native_copy();
 
 ALTER FUNCTION nas_stitch_r2_certificate_receipt(bigint, integer, text, text)
  RENAME TO nas_stitch_r2_copy_custody_receipt;

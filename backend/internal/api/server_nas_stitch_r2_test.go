@@ -326,8 +326,8 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	}
 	legacyResult := result
 	legacyResult.Outputs = append([]nasStitchOutput(nil), result.Outputs...)
-	_, legacy := stitchUnitFixture()
-	legacyResult.Outputs[0].Provenance = legacy.Outputs[0].Provenance
+	_, legacyProof := stitchUnitFixture()
+	legacyResult.Outputs[0].Provenance = legacyProof.Outputs[0].Provenance
 	legacyBody, err := json.Marshal(legacyResult)
 	if err != nil {
 		t.Fatal(err)
@@ -367,6 +367,22 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 			if _, err := tx.Exec(ctx, `UPDATE nas_stitch_r2_hours
  SET state='staged',staged_manifest=$3,staged_manifest_sha256=$2 WHERE id=$1`, id, manifest, altered.body); err != nil {
 				t.Fatal(err)
+			}
+			if altered.name == "legacy_toolchain" {
+				var copyReady bool
+				if err := tx.QueryRow(ctx, `SELECT nas_stitch_r2_native_copy_ready(123,$1)`, manifest).Scan(&copyReady); err != nil || copyReady {
+					t.Fatal("legacy output entered the NAS copy queue", err)
+				}
+				probe, err := tx.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = probe.Exec(ctx, `UPDATE nas_r2_copy_items SET lease_expires_at=clock_timestamp()+interval '1 minute'
+ WHERE id=$1`, copyID)
+				probe.Rollback(ctx)
+				if err == nil || !strings.Contains(err.Error(), "reviewed Durham copy toolchain required") {
+					t.Fatal("predecessor renewed a legacy NAS copy", err)
+				}
 			}
 			if _, err := tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',lease_token=NULL,lease_expires_at=NULL,
  completion='downloaded',stitch_receipt=$2,stitch_result_sha256=repeat('a',64),etag=$3,version_id=$4,committed_bytes=$5

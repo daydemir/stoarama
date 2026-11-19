@@ -318,10 +318,7 @@ func (s *Server) nasR2CopyPrepare(w http.ResponseWriter, r *http.Request, cid in
 	}
 	copyKind := "q.kind='raw'"
 	if stitch {
-		copyKind += ` OR (q.kind='stitch_output' AND EXISTS(
- SELECT 1 FROM nas_stitch_r2_stage_objects o JOIN nas_stitch_r2_hours h ON h.id=o.hour_id AND h.attempt=o.attempt
- WHERE o.id=q.source_id AND o.state='staged' AND h.state='staged' AND h.staged_manifest_sha256=q.manifest_sha256
-  AND nas_stitch_r2_native_proof(h)))`
+		copyKind += ` OR (q.kind='stitch_output' AND nas_stitch_r2_native_copy_ready(q.source_id,q.manifest_sha256))`
 	}
 	err = tx.QueryRow(ctx, `SELECT q.id,q.item,q.policy_sha256,q.work_mode FROM nas_r2_copy_items q CROSS JOIN r2_keep28_refresh_control control WHERE connection_id=$1 AND (`+copyKind+`) AND
  (state='pending' OR (state='leased' AND lease_expires_at<clock_timestamp()) OR ($2 AND control.enabled AND (state='refresh_pending' OR (state='refresh_leased' AND lease_expires_at<clock_timestamp()))))
