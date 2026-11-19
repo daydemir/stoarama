@@ -55,6 +55,17 @@ const (
 	inverseNonrawCollated
 )
 
+// class is the partition class a lane deletes.
+func (l inverseLane) class() inverseClass {
+	switch l {
+	case inverseNASKeep28:
+		return inverseKeep28
+	case inverseNonrawCollated:
+		return inverseCollated
+	}
+	return inverseDeletable
+}
+
 type inverseApplyOptions struct {
 	Lane                                                                               inverseLane
 	Manifest, ManifestSHA, Summary, SummarySHA, Picks, Ledger, DrainEvidence, DrainSHA string
@@ -244,7 +255,8 @@ func (a *inverseApplier) rawReviewedDelivery() bool {
 
 // rawHeldSQL never derives SQL from operator input: it removes the one delivery
 // clause only when the reviewed owner fence policy selected this run. Every other
-// live veto in inverseRawHeldSQL stays in force.
+// live veto in inverseRawHeldSQL stays in force, including the exact public
+// delivery page keys, which no scope waives.
 func (a *inverseApplier) rawHeldSQL() string {
 	if !a.rawReviewedDelivery() {
 		return inverseRawHeldSQL
@@ -283,11 +295,7 @@ func loadInverseRawTarget(ctx context.Context, tx pgx.Tx, bucket string, protect
 	p.Identities = map[string][]inverseIdentity{e.Key: {t.Identity}}
 	p.Held = map[string]bool{}
 	p.Delivery = map[string]bool{}
-	want := inverseDeletable
-	if lane == inverseNASKeep28 {
-		want = inverseKeep28
-	}
-	if class, _ := p.classify(e.ObjectInfo); class != want {
+	if class, _ := p.classify(e.ObjectInfo); class != lane.class() {
 		return t, fmt.Errorf("%w: target is no longer in the requested raw lane", errInverseRawIneligible)
 	}
 	if lane == inverseNASKeep28 {
@@ -313,6 +321,7 @@ const inverseRawHeldSQL = `SELECT
  OR EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds WHERE bucket=$2 AND object_key=$3 AND released_at IS NULL)
  OR EXISTS(SELECT 1 FROM nas_r2_copy_items WHERE (state<>'verified' OR blocked_reason<>'') AND item->>'bucket'=$2 AND item->>'object_key'=$3)
  OR r2_inverse_delivery_held($1,$2,$3,$5,$6,$7)
+ OR EXISTS(SELECT 1 FROM delivery_keep_holds k WHERE k.bucket=$2 AND k.object_key=$3)
  OR EXISTS(SELECT 1 FROM nas_restore_requests WHERE clip_id=$1 AND state IN ('pending','leased'))
  OR EXISTS(SELECT 1 FROM recording_joined_source_snapshots WHERE clip_id=$1)
  OR EXISTS(SELECT 1 FROM recording_joined_snapshot_scopes s JOIN recording_joined_batches b ON b.id=s.batch_record_id AND b.state='snapshotting' JOIN recording_clips c ON c.id=$1 WHERE s.recording_id=c.recording_id AND s.recording_job_id=c.recording_job_id AND c.id<=s.high_water_clip_id)
@@ -850,16 +859,9 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		if err = json.Unmarshal(scanner.Bytes(), &e); err != nil {
 			return result, err
 		}
-		want := inverseDeletable
-		switch o.Lane {
-		case inverseNASKeep28:
-			want = inverseKeep28
-		case inverseNonrawCollated:
-			// Collated candidates carry their own typed class; they are never the
-			// RAW deletable class and never reach loadInverseRawTarget.
-			want = inverseCollated
-		}
-		if e.Class != want || existing[e.Key] {
+		// Collated candidates carry their own typed class; they are never the RAW
+		// deletable class and never reach loadInverseRawTarget.
+		if e.Class != o.Lane.class() || existing[e.Key] {
 			continue
 		}
 		// A nonpositive size can never reserve; selecting it would abort the batch.

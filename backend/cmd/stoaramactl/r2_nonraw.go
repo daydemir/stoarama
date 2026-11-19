@@ -91,6 +91,7 @@ const inverseNonrawColumns = `
    JOIN recording_clips c ON c.id=sid JOIN recordings rr ON rr.id=c.recording_id
    LEFT JOIN streams s ON s.id=rr.stream_id WHERE oo.id=o.id),
  EXISTS(SELECT 1 FROM nas_cleanup_incident_roster i WHERE i.bucket=$1 AND i.object_key=o.object_key)
+  OR EXISTS(SELECT 1 FROM delivery_keep_holds k WHERE k.bucket=$1 AND k.object_key=o.object_key)
   OR EXISTS(SELECT 1 FROM nas_cleanup_reserved_files f WHERE f.kind='raw' AND f.source_id=ANY(o.source_clip_ids))
   OR EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id
     WHERE h.clip_id=ANY(o.source_clip_ids) AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items it

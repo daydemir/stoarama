@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/api"
+	"github.com/daydemir/stoarama/backend/internal/r2"
 )
 
 func (f *nonrawFixture) collatedEntry() inverseEntry {
@@ -183,4 +184,43 @@ func TestR2NonrawReassessesAfterSourceLock(t *testing.T) {
 	if err = f.pool.QueryRow(f.ctx, `SELECT count(*) FROM r2_retirement_reservations WHERE object_key=$1`, f.key).Scan(&reservations); err != nil || reservations != 0 {
 		t.Fatalf("reservations %d %v", reservations, err)
 	}
+}
+
+// The job refuses to start deleting when any candidate of its lane is a public
+// delivery page key, and counts only its own lane's class.
+func TestR2InverseJobPageKeepOverlap(t *testing.T) {
+	f := newNonrawFixture(t, "nonraw_page_keep_job")
+	manifest := filepath.Join(f.root, "partition.jsonl")
+	out, err := os.Create(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := json.NewEncoder(out)
+	for _, e := range []inverseEntry{
+		{ObjectInfo: r2.ObjectInfo{Key: f.key}, Class: inverseCollated},
+		{ObjectInfo: r2.ObjectInfo{Key: "joined/nightly-collation-v2/objects/other.mp4"}, Class: inverseCollated},
+		{ObjectInfo: r2.ObjectInfo{Key: "managed/acct-47/raw.mp4"}, Class: inverseDeletable},
+		{ObjectInfo: r2.ObjectInfo{Key: "managed/acct-47/held.mp4"}, Class: inverseDelivery},
+	} {
+		if err = enc.Encode(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out.Close()
+	check := func(lane inverseLane, candidates int, held, overlap int64) {
+		t.Helper()
+		c, h, o, err := inverseJobPageKeepOverlap(f.ctx, f.pool, "stoarama", manifest, lane)
+		if err != nil || c != candidates || h != held || o != overlap {
+			t.Fatalf("lane %d: candidates %d held %d overlap %d err %v", lane, c, h, o, err)
+		}
+	}
+	// Migrations seed the live page's keep set; count from that baseline.
+	var base int64
+	if err = f.pool.QueryRow(f.ctx, `SELECT count(*) FROM delivery_keep_holds WHERE bucket='stoarama'`).Scan(&base); err != nil {
+		t.Fatal(err)
+	}
+	check(inverseNonrawCollated, 2, base, 0)
+	f.exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',900,'video_collated'),('stoarama','managed/acct-47/held.mp4','hold',1,'metadata')`, f.key)
+	check(inverseNonrawCollated, 2, base+2, 1)
+	check(inverseOutsideKeep28, 1, base+2, 0)
 }

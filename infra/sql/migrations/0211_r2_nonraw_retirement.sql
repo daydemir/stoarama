@@ -1,6 +1,8 @@
 -- Reviewed non-raw (collated) R2 retirement, owner scope 2026-11-18.
 --
 -- Deniz, 2026-11-17, verbatim: "i'm ok with breaking public links"
+-- Deniz, 2026-11-12: keep up only the links on the public delivery page. Those
+-- exact keys (delivery_keep_holds) stay protected; this scope never waives them.
 -- Deniz, 2026-11-18 approximately 16:05Z, verbatim:
 -- 'lets just go faster now, as long as we're only deleting footage that is all of / 1. not in the keep everythign set / 2. not in the 28 days set AND not on the NAS (ie waiting to be transferred) / then just delete it all now no need to limit 5tb / day'
 -- Root's later clarification (2026-11-18) puts joined/best14-20261021/ in
@@ -101,44 +103,9 @@ ALTER TABLE r2_inverse_intents
  ADD COLUMN retirement_class text NOT NULL DEFAULT ''::text
  CHECK (retirement_class IN ('', 'owner_delivery_scope_20261118_v1'));
 
--- 0190 called this guard on the reservation AND on the final retirement receipt.
--- The receipt table has no retirement_class column, so the receipt looks up the
--- exact reservation. The exemption is one reviewed class with a matching typed
--- intent in the matching namespace and identical identity; every other class,
--- every legacy intent and every untyped retirement stays strictly vetoed.
-CREATE OR REPLACE FUNCTION guard_delivery_r2_retirement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
- IF TG_TABLE_NAME='r2_retirement_reservations' THEN
-  IF NEW.retirement_class='owner_delivery_scope_20261118_v1' AND NEW.kind='collated'
-   AND EXISTS(SELECT 1 FROM r2_nonraw_intents i WHERE i.bucket=NEW.bucket AND i.object_key=NEW.object_key
-     AND i.source_id=NEW.source_id AND i.size_bytes=NEW.size_bytes AND i.sha256=NEW.sha256
-     AND i.manifest_sha256=NEW.manifest_sha256) THEN RETURN NEW; END IF;
-  -- RAW has no sha256 column in its ledger, so its exact identity is source,
-  -- key, size and the trimmed ETag the intent and the source row both carry.
-  IF NEW.retirement_class='owner_delivery_scope_20261118_v1' AND NEW.kind='raw'
-   AND EXISTS(SELECT 1 FROM r2_inverse_intents i JOIN recording_clips c ON c.id=i.source_id
-     WHERE i.bucket=NEW.bucket AND i.object_key=NEW.object_key AND i.source_id=NEW.source_id
-     AND i.size_bytes=NEW.size_bytes AND i.manifest_sha256=NEW.manifest_sha256
-     AND lower(c.sha256)=NEW.sha256 AND c.bucket=i.bucket AND c.object_key=i.object_key
-     AND btrim(c.etag,'"')=btrim(i.etag,'"')
-     AND i.retirement_class='owner_delivery_scope_20261118_v1') THEN RETURN NEW; END IF;
- ELSE
-  IF EXISTS(SELECT 1 FROM r2_retirement_reservations r WHERE r.kind=NEW.kind AND r.source_id=NEW.source_id
-     AND r.bucket=NEW.bucket AND r.object_key=NEW.object_key AND r.size_bytes=NEW.size_bytes
-     AND r.sha256=NEW.sha256 AND r.manifest_sha256=NEW.manifest_sha256
-     AND r.retirement_class='owner_delivery_scope_20261118_v1'
-     AND (EXISTS(SELECT 1 FROM r2_nonraw_intents i WHERE i.bucket=NEW.bucket AND i.object_key=NEW.object_key
-       AND i.source_id=NEW.source_id AND i.size_bytes=NEW.size_bytes AND i.sha256=NEW.sha256
-       AND i.manifest_sha256=NEW.manifest_sha256)
-      OR EXISTS(SELECT 1 FROM r2_inverse_intents i JOIN recording_clips c ON c.id=i.source_id
-       WHERE i.bucket=NEW.bucket AND i.object_key=NEW.object_key AND i.source_id=NEW.source_id
-       AND i.size_bytes=NEW.size_bytes AND i.manifest_sha256=NEW.manifest_sha256
-       AND lower(c.sha256)=NEW.sha256 AND btrim(c.etag,'"')=btrim(i.etag,'"')
-       AND i.retirement_class='owner_delivery_scope_20261118_v1'))) THEN RETURN NEW; END IF;
- END IF;
- IF EXISTS(SELECT 1 FROM delivery_keep_holds h WHERE h.bucket=NEW.bucket AND h.object_key=NEW.object_key) THEN
-  RAISE EXCEPTION 'DELIVERY KEEP HOLD: R2 retirement forbidden'; END IF;
- RETURN NEW;
-END $$;
+-- 0190's guard_delivery_r2_retirement stays exactly as installed: no retirement
+-- class waives an exact delivery_keep_holds key. Deniz, 2026-11-12: keep up only
+-- the links on the public delivery page; those exact keys are these holds.
 
 -- /0201's admission guard was one AFTER statement function over every row. Once
 -- any reviewed delivery-scope key is legitimately reserved, that global form

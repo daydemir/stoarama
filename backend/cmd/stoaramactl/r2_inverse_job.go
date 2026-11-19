@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -66,6 +67,16 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string) {
 	store, err := newInverseSDKStore(ctx, archiveR2Config(cfg, pool))
 	if err != nil {
 		log.Fatal(err)
+	}
+	// Deniz, 2026-11-12: keep up only the links on the public delivery page.
+	// Before any delete, no candidate this job can select may be one of them.
+	candidates, pageKeep, overlap, err := inverseJobPageKeepOverlap(ctx, pool, store.Bucket(), filepath.Join(partition, "partition.jsonl"), lane)
+	if err != nil {
+		log.Fatal(err)
+	}
+	printInverseJob(map[string]any{"step": "page_keep_check", "candidates": candidates, "page_keep_holds": pageKeep, "overlap": overlap})
+	if overlap != 0 {
+		log.Fatal("partition candidates include public delivery page keys")
 	}
 	o := inverseApplyOptions{Lane: lane, Manifest: filepath.Join(partition, "partition.jsonl"), Summary: filepath.Join(partition, "summary.json"), Picks: *picks, Ledger: filepath.Join(*work, "ledger.jsonl"), Workers: *workers, MaxItems: *items, MaxBytes: *maxBytes}
 	if o.ManifestSHA, err = inverseFileSHA(o.Manifest); err != nil {
@@ -210,4 +221,32 @@ func errorText(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// inverseJobPageKeepOverlap counts the lane's partition candidates, the exact
+// public delivery page keys on record, and the candidates that are page keys.
+func inverseJobPageKeepOverlap(ctx context.Context, pool *pgxpool.Pool, bucket, manifest string, lane inverseLane) (int, int64, int64, error) {
+	f, err := os.Open(manifest)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	var keys []string
+	for scanner.Scan() {
+		var e inverseEntry
+		if err = json.Unmarshal(scanner.Bytes(), &e); err != nil {
+			return 0, 0, 0, err
+		}
+		if e.Class == lane.class() {
+			keys = append(keys, e.Key)
+		}
+	}
+	if err = scanner.Err(); err != nil {
+		return 0, 0, 0, err
+	}
+	var held, overlap int64
+	err = pool.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE object_key=ANY($2::text[])) FROM delivery_keep_holds WHERE bucket=$1`, bucket, keys).Scan(&held, &overlap)
+	return len(keys), held, overlap, err
 }

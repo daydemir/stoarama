@@ -175,29 +175,20 @@ func TestR2NonrawMigrationScope(t *testing.T) {
 // TestR2NonrawDeliveryGuardIsTypedAndScoped proves the 0190 exemption needs the
 // reviewed class AND an exact matching typed intent, on both the reservation and
 // the final receipt, and that ordinary delivery holds are still refused.
-func TestR2NonrawDeliveryGuardIsTypedAndScoped(t *testing.T) {
+// TestR2NonrawPageKeepHoldIsAbsolute pins 0190 as the only delivery guard: an
+// exact delivery_keep_holds key (a public delivery page link) refuses every
+// reservation and receipt, including the reviewed class with a typed intent.
+func TestR2NonrawPageKeepHoldIsAbsolute(t *testing.T) {
 	f := newNonrawFixture(t, "nonraw_guard")
 	f.exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',900,'metadata')`, f.key)
-
-	_, err := f.pool.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) VALUES('collated',$1,'stoarama',$2,900,$3,$4)`, f.outputID, f.key, nonrawOutputSHA, strings.Repeat("d", 64))
-	if err == nil {
-		t.Fatal("ordinary collated reservation bypassed the delivery hold")
-	}
-	_, err = f.pool.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class) VALUES('collated',$1,'stoarama',$2,900,$3,$4,$5)`, f.outputID, f.key, nonrawOutputSHA, strings.Repeat("d", 64), inverseNonrawRetirementClass)
-	if err == nil {
-		t.Fatal("reviewed class without a matching typed intent bypassed the delivery hold")
-	}
 	f.insertIntent(t, strings.Repeat("d", 64))
-	_, err = f.pool.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class) VALUES('collated',$1,'stoarama',$2,900,$3,$4,$5)`, f.outputID, f.key, nonrawOutputSHA, strings.Repeat("d", 64), inverseNonrawRetirementClass)
-	if err != nil {
-		t.Fatalf("reviewed reservation with matching intent refused: %v", err)
+	for _, class := range []string{"", inverseNonrawRetirementClass} {
+		if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class) VALUES('collated',$1,'stoarama',$2,900,$3,$4,$5)`, f.outputID, f.key, nonrawOutputSHA, strings.Repeat("d", 64), class); err == nil {
+			t.Fatalf("class %q reserved a public delivery page key", class)
+		}
 	}
-	if _, err = f.pool.Exec(f.ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256) VALUES('collated',$1,3,'stoarama',$2,900,$3,$4,'none',$5,$6)`, f.outputID, f.key, nonrawOutputSHA, inverseNonrawReason, strings.Repeat("d", 64), f.policy); err != nil {
-		t.Fatalf("exact final receipt refused: %v", err)
-	}
-	// A receipt for a different identity must not inherit the exemption.
-	if _, err = f.pool.Exec(f.ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256) VALUES('collated',$1,3,'stoarama',$2,901,$3,$4,'none',$5,$6)`, f.outputID, f.key, nonrawOutputSHA, inverseNonrawReason, strings.Repeat("d", 64), f.policy); err == nil {
-		t.Fatal("mismatched receipt inherited the reviewed exemption")
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256) VALUES('collated',$1,3,'stoarama',$2,900,$3,$4,'none',$5,$6)`, f.outputID, f.key, nonrawOutputSHA, inverseNonrawReason, strings.Repeat("d", 64), f.policy); err == nil {
+		t.Fatal("receipt retired a public delivery page key")
 	}
 }
 
@@ -217,7 +208,6 @@ func (f *nonrawFixture) insertIntent(t *testing.T, manifest string) {
 // five caller tables must still succeed, while a NEW overlapping write fails.
 func TestR2NonrawAdmissionAllowsUnrelatedFutureHolds(t *testing.T) {
 	f := newNonrawFixture(t, "nonraw_admission")
-	f.exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',900,'metadata')`, f.key)
 	f.insertIntent(t, strings.Repeat("d", 64))
 	f.exec(`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class) VALUES('collated',$1,'stoarama',$2,900,$3,$4,$5)`, f.outputID, f.key, nonrawOutputSHA, strings.Repeat("d", 64), inverseNonrawRetirementClass)
 
@@ -284,10 +274,28 @@ func TestR2NonrawExecutorLane(t *testing.T) {
 	// A delivery dependency is an ownership veto, not a protection: under the
 	// reviewed scope the mapped output is still eligible. The dependency row is
 	// what makes it footage; the bare hold alone would never be identity.
+	t.Run("exact_page_keep_hold_is_absolute_in_reviewed_scope", func(t *testing.T) {
+		g := newNonrawFixture(t, "nonraw_page_keep")
+		g.exec(`INSERT INTO delivery_keep_output_dependencies(output_id,recording_id) VALUES($1,30)`, g.outputID)
+		g.exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',900,'metadata')`, g.key)
+		a := g.applier(t, "run1")
+		defer a.ledger.close()
+		if ok, err := a.deleteNonraw(g.ctx, inverseEntry{ObjectInfo: r2.ObjectInfo{Key: g.key, ETag: "collated-etag", SizeBytes: 900, LastModified: inverseRetirementCutoff().Add(-time.Second)}, Class: inverseCollated}); err == nil || ok || g.deletes() != 0 {
+			t.Fatalf("public delivery page key reached DELETE: ok=%v err=%v deletes=%d", ok, err, g.deletes())
+		}
+		var intents int
+		if err := g.pool.QueryRow(g.ctx, `SELECT count(*) FROM r2_nonraw_intents WHERE object_key=$1`, g.key).Scan(&intents); err != nil || intents != 0 {
+			t.Fatalf("page keep key left intents %d %v", intents, err)
+		}
+		p := inverseProtection{PageKeep: map[string]bool{g.key: true}, ReviewedCollated: true, ReviewedDelivery: true}
+		if class, reason := p.classify(r2.ObjectInfo{Key: g.key, SizeBytes: 900}); class != inverseDelivery || reason != "delivery_page_keep" {
+			t.Fatalf("partition classified a page keep key as %s (%s)", class, reason)
+		}
+	})
+
 	t.Run("delivery_dependency_is_not_a_protection_in_reviewed_scope", func(t *testing.T) {
 		g := newNonrawFixture(t, "nonraw_delivery_scope")
 		g.exec(`INSERT INTO delivery_keep_output_dependencies(output_id,recording_id) VALUES($1,30)`, g.outputID)
-		g.exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',900,'metadata')`, g.key)
 		a := g.applier(t, "run1")
 		ok, err := a.deleteNonraw(g.ctx, inverseEntry{ObjectInfo: r2.ObjectInfo{Key: g.key, ETag: "collated-etag", SizeBytes: 900, LastModified: inverseRetirementCutoff().Add(-time.Second)}, Class: inverseCollated})
 		if err != nil || !ok || g.deletes() != 1 {
@@ -776,6 +784,10 @@ func (f *rawDeliveryFixture) entry(i int) inverseEntry {
 func TestR2RawReviewedDeliveryIsEligible(t *testing.T) {
 	key := "managed/acct-47/delivery/000.mp4"
 	f := newRawDeliveryFixture(t, "raw_delivery_pos", key)
+	// Delivery through a source hold, not an exact page link: the fixture's exact
+	// key hold is replaced so only the reviewed-scope waiver is under test.
+	f.seed(`DELETE FROM delivery_keep_holds WHERE object_key=$1`, key)
+	f.seed(`INSERT INTO delivery_nas_source_holds(clip_id) VALUES(9100000)`)
 	a := f.applier(t, true)
 	ok, err := a.delete(f.ctx, f.entry(0))
 	if err != nil || !ok || f.deletes() != 1 {
@@ -800,6 +812,15 @@ func TestR2RawReviewedDeliveryIsEligible(t *testing.T) {
 // scope, with a mismatched identity, or with an untyped/legacy intent, the exact
 // delivery hold still wins and no DELETE happens.
 func TestR2RawDeliveryVetoesStayStrict(t *testing.T) {
+	t.Run("exact_page_keep_key_vetoes_in_reviewed_scope", func(t *testing.T) {
+		key := "managed/acct-47/delivery/050.mp4"
+		f := newRawDeliveryFixture(t, "raw_delivery_page_keep", key)
+		a := f.applier(t, true)
+		defer a.ledger.close()
+		if ok, err := a.delete(f.ctx, f.entry(0)); err == nil || ok || f.deletes() != 0 {
+			t.Fatalf("reviewed scope deleted a public delivery page key: ok=%v err=%v deletes=%d", ok, err, f.deletes())
+		}
+	})
 	t.Run("legacy_default_scope_still_vetoes", func(t *testing.T) {
 		key := "managed/acct-47/delivery/100.mp4"
 		f := newRawDeliveryFixture(t, "raw_delivery_legacy", key)

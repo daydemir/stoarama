@@ -51,9 +51,12 @@ type inverseIdentity struct {
 type inverseProtection struct {
 	Identities     map[string][]inverseIdentity
 	Held, Delivery map[string]bool
-	KEFolders      map[string]bool
-	Windows        map[int64]api.Keep28Window
-	Picks          r2RetirePicks
+	// PageKeep is the exact key set of delivery_keep_holds: every link on the
+	// public delivery page. No owner scope waives it.
+	PageKeep  map[string]bool
+	KEFolders map[string]bool
+	Windows   map[int64]api.Keep28Window
+	Picks     r2RetirePicks
 	// ReviewedCollated selects the explicit non-raw partition scope. It is opt-in
 	// so default partition/apply output is unchanged for B1/B2.
 	ReviewedCollated bool
@@ -91,6 +94,11 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 	// the catalog or an owner scope says about them.
 	if strings.HasPrefix(o.Key, inverseToolsPrefix) {
 		return inverseTools, "pinned_stitch_tools"
+	}
+	// Deniz, 2026-11-12: keep up only the links on the public delivery page.
+	// Those exact keys stay delivery in every scope, reviewed or not.
+	if p.PageKeep[o.Key] {
+		return inverseDelivery, "delivery_page_keep"
 	}
 	if p.Held[o.Key] {
 		return inverseHeld, "live_hold"
@@ -275,6 +283,7 @@ WITH held_sources AS (
  ON s.recording_id=c.recording_id AND s.recording_job_id=c.recording_job_id AND c.id<=s.high_water_clip_id
  UNION SELECT item->>'bucket',item->>'object_key' FROM nas_r2_copy_items WHERE state='blocked'
 ) SELECT object_key FROM held_keys WHERE bucket=$1`
+const inversePageKeepSQL = `SELECT object_key FROM delivery_keep_holds WHERE bucket=$1`
 const inverseDeliverySQL = `
 WITH delivery_outputs AS (
  SELECT o.object_key,o.source_clip_ids FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id
@@ -301,7 +310,7 @@ func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string
 // reviewed non-raw scope is explicitly selected. Default callers keep the exact
 // previous classification, where collated keys are deferred and delivery holds.
 func loadInverseProtectionMode(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks, windows map[int64]api.Keep28Window, reviewed bool) (inverseProtection, error) {
-	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, KEFolders: map[string]bool{}, Windows: windows, Picks: picks, ReviewedCollated: reviewed, ReviewedDelivery: reviewed}
+	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, PageKeep: map[string]bool{}, KEFolders: map[string]bool{}, Windows: windows, Picks: picks, ReviewedCollated: reviewed, ReviewedDelivery: reviewed}
 	rows, err := q.Query(ctx, inverseCatalogSQL, bucket)
 	if err != nil {
 		return p, err
@@ -331,7 +340,7 @@ func loadInverseProtectionMode(ctx context.Context, q r2RetireQuerier, bucket st
 	for _, set := range []struct {
 		sql  string
 		keys map[string]bool
-	}{{inverseHeldSQL, p.Held}, {inverseDeliverySQL, p.Delivery}} {
+	}{{inverseHeldSQL, p.Held}, {inverseDeliverySQL, p.Delivery}, {inversePageKeepSQL, p.PageKeep}} {
 		rows, err = q.Query(ctx, set.sql, bucket)
 		if err != nil {
 			return p, err
