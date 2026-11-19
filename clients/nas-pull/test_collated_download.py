@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import io
+import mmap
 import os
 import sys
 import tempfile
@@ -267,9 +268,12 @@ class CollatedDownloadTests(unittest.TestCase):
         self.assertNotIn("failed_output_id", reports[0])
         self.assertEqual(reports[1]["failed_output_id"], 7)
 
-    @unittest.skipUnless(sys.platform.startswith("linux"), "production NAS path watch uses Linux inotify")
-    def test_handoff_withholds_success_when_earlier_file_is_modified_in_place(self):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "production NAS path watch uses Linux read leases")
+    def test_handoff_blocks_writes_through_a_hard_link_to_an_already_checked_file(self):
         self.enable_handoff()
+        self.assertTrue(self.drain())
+        alias = Path(self.tmp.name) / "hard-link-outside-share"
+        os.link(self.final, alias)
         self.assertTrue(self.drain())
         second = self.final.with_name(self.final.name.replace("_part_04_", "_part_05_"))
         second.write_bytes(self.body)
@@ -277,7 +281,7 @@ class CollatedDownloadTests(unittest.TestCase):
         second_relative = str(second.relative_to(self.cfg.output_dir / "joined"))
         expected_file = [info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino, info.st_dev]
         challenge = {"id": 8, "manifest_sha256": "b" * 64, "mount": self.item["handoff_mount"], "files": [
-            [7, REL, self.acks[0]["handoff_readback"]],
+            [7, REL, self.acks[-1]["handoff_readback"]],
             [8, second_relative, expected_file],
         ]}
         sent = []
@@ -290,8 +294,8 @@ class CollatedDownloadTests(unittest.TestCase):
         open_directory = pull.open_collated_dir
         def mutate(cfg, relative, **kwargs):
             if relative == second_relative:
-                with self.final.open("r+b") as file:
-                    file.write(b"changed")
+                with self.assertRaises(BlockingIOError):
+                    os.open(alias, os.O_RDWR | os.O_NONBLOCK)
             return open_directory(cfg, relative, **kwargs)
 
         with mock.patch.object(pull, "request_json", side_effect=request), \
@@ -300,6 +304,22 @@ class CollatedDownloadTests(unittest.TestCase):
             with self.assertRaisesRegex(pull.CollatedDownloadStopped, "changed during path check"):
                 pull.check_collated_handoff_paths(self.cfg, threading.Event())
         self.assertEqual(sent, [])
+        with alias.open("r+b") as file:
+            file.write(b"write after check")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "production NAS path watch uses Linux read leases")
+    def test_handoff_refuses_a_file_with_a_preexisting_writable_mapping(self):
+        self.enable_handoff()
+        self.assertTrue(self.drain())
+        challenge = {"id": 8, "manifest_sha256": "b" * 64, "mount": self.item["handoff_mount"],
+                     "files": [[7, REL, self.acks[0]["handoff_readback"]]]}
+        with self.final.open("r+b") as file:
+            writable_mapping = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_WRITE)
+        with writable_mapping, mock.patch.object(pull, "request_json", return_value={"check": challenge}) as request, \
+                mock.patch.object(pull.os.path, "ismount", return_value=True):
+            with self.assertRaisesRegex(pull.CollatedDownloadStopped, "file is writable during path check"):
+                pull.check_collated_handoff_paths(self.cfg, threading.Event())
+        self.assertEqual([call.args[1] for call in request.call_args_list], ["GET"])
 
     def test_handoff_refuses_unmounted_root(self):
         self.enable_handoff()

@@ -24036,11 +24036,13 @@ class CollatedHandoffMount:
             raise CollatedDownloadStopped("collated handoff reached the R2 copy free-space reserve")
 
 
-def open_collated_dir(cfg, relative_path, create=True, *, mount=None):
+def open_collated_dir(cfg, relative_path, create=True, *, mount=None, watch=None):
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.dup(mount.fd) if mount is not None else os.open(cfg.output_dir, flags)
     try:
         for part in (JOINED_ROOT, *relative_path.split("/")[:-1]):
+            if watch is not None:
+                watch.add(descriptor, part)
             try:
                 child = os.open(part, flags, dir_fd=descriptor)
             except FileNotFoundError:
@@ -24290,35 +24292,88 @@ def report_collated_error(cfg, output_id, exc, handoff=False):
 
 
 class CollatedHandoffPathWatch:
-    # Linux inotify events for writes, metadata, names and directory changes.
-    # Unmount and queue overflow are also reported even without these flags.
+    # Linux inotify watches names, including their ancestors. Read leases
+    # separately protect each inode against writes through aliases and mmap.
     CHANGE_EVENTS = 0x00000FCE
+    LOST_WATCH_EVENTS = 0x0000EC00  # Unmount, queue overflow, ignored, delete/move self.
+    EVENT_HEADER = struct.Struct("iIII")
 
-    def __init__(self):
+    def __init__(self, file_count):
         if not sys.platform.startswith("linux"):
-            raise CollatedDownloadStopped("NAS handoff path checks require Linux inotify")
+            raise CollatedDownloadStopped("NAS handoff path checks require Linux inotify and read leases")
         import ctypes
-        self.libc = ctypes.CDLL(None, use_errno=True)
-        self.get_errno = ctypes.get_errno
-        self.fd = self.libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
-        if self.fd < 0:
-            raise OSError(self.get_errno(), "open NAS handoff change watch")
+        import resource
+        self.resources = ExitStack()
+        self.names = {}
+        try:
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            needed = file_count + len(os.listdir("/proc/self/fd")) + 128
+            if soft != resource.RLIM_INFINITY and soft < needed:
+                if hard != resource.RLIM_INFINITY and hard < needed:
+                    raise CollatedDownloadStopped("NAS handoff path check cannot keep every approved file open")
+                resource.setrlimit(resource.RLIMIT_NOFILE, (needed, hard))
+                self.resources.callback(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+            previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGIO})
+            self.resources.callback(self.restore_signals, previous)
+            self.owner = struct.pack("ii", 0, threading.get_native_id())  # Linux F_OWNER_TID.
+            self.libc = ctypes.CDLL(None, use_errno=True)
+            self.fd = self.libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+            if self.fd < 0:
+                raise OSError(ctypes.get_errno(), "open NAS handoff change watch")
+            self.resources.callback(os.close, self.fd)
+            self.get_errno = ctypes.get_errno
+        except BaseException:
+            self.resources.close()
+            raise
 
-    def add(self, directory_fd):
+    @staticmethod
+    def restore_signals(previous):
+        while signal.SIGIO in signal.sigpending():
+            signal.sigwait({signal.SIGIO})
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+    def add(self, directory_fd, child_name):
         name = ("/proc/self/fd/%d" % directory_fd).encode("ascii")
-        if self.libc.inotify_add_watch(self.fd, name, self.CHANGE_EVENTS) < 0:
+        descriptor = self.libc.inotify_add_watch(self.fd, name, self.CHANGE_EVENTS)
+        if descriptor < 0:
             raise OSError(self.get_errno(), "watch NAS handoff path directory")
+        self.names.setdefault(descriptor, set()).add(os.fsencode(child_name))
+
+    def hold(self, file_fd):
+        if signal.SIGIO in signal.sigpending():
+            raise CollatedDownloadStopped("NAS handoff file changed during path check")
+        lease_fd = os.dup(file_fd)
+        try:
+            # Python before 3.13 does not expose Linux F_SETOWN_EX.
+            fcntl.fcntl(lease_fd, getattr(fcntl, "F_SETOWN_EX", 15), self.owner)
+            fcntl.fcntl(lease_fd, fcntl.F_SETLEASE, fcntl.F_RDLCK)
+        except BlockingIOError as exc:
+            os.close(lease_fd)
+            raise CollatedDownloadStopped("NAS handoff file is writable during path check") from exc
+        except BaseException:
+            os.close(lease_fd)
+            raise
+        self.resources.callback(os.close, lease_fd)
 
     def require_unchanged(self):
-        try:
-            events = os.read(self.fd, 4096)
-        except BlockingIOError:
-            return
-        if events:
-            raise CollatedDownloadStopped("NAS handoff file or directory changed during path check")
+        while True:
+            try:
+                events = os.read(self.fd, 65536)
+            except BlockingIOError:
+                break
+            offset = 0
+            while offset < len(events):
+                descriptor, mask, _, size = self.EVENT_HEADER.unpack_from(events, offset)
+                offset += self.EVENT_HEADER.size
+                name = events[offset:offset + size].split(b"\0", 1)[0]
+                offset += size
+                if mask & self.LOST_WATCH_EVENTS or name in self.names.get(descriptor, ()):
+                    raise CollatedDownloadStopped("NAS handoff file or directory changed during path check")
+        if signal.SIGIO in signal.sigpending():
+            raise CollatedDownloadStopped("NAS handoff file changed during path check")
 
     def close(self):
-        os.close(self.fd)
+        self.resources.close()
 
 
 def check_collated_handoff_paths(cfg, stop_event):
@@ -24354,28 +24409,31 @@ def check_collated_handoff_paths(cfg, stop_event):
     failed = None
     watch = None
     try:
-        watch = CollatedHandoffPathWatch()
+        watch = CollatedHandoffPathWatch(len(paths))
         for output_id, relative, identity in paths:
             if stop_event.is_set():
                 raise CollatedDownloadStopped("NAS handoff path check stopped")
             try:
-                parent = open_collated_dir(cfg, relative, create=False, mount=mount)
+                parent = open_collated_dir(cfg, relative, create=False, mount=mount, watch=watch)
                 try:
                     directory = relative.rsplit("/", 1)[0]
                     stamp = certification_identity(os.fstat(parent))
                     previous = directories.get(directory)
                     if previous is None:
-                        watch.add(parent)
                         directories[directory] = (relative, stamp)
                     elif previous[1] != stamp:
                         raise CollatedDownloadStopped("NAS handoff directory changed during path check")
                     filename = relative.rsplit("/", 1)[1]
+                    watch.add(parent, filename)
                     fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
                     try:
                         mount.check_child(fd)
+                        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+                            raise ExistingFileMismatch("NAS handoff path is not a regular file")
+                        watch.hold(fd)
                         info = os.fstat(fd)
                         observed = [info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino, info.st_dev]
-                        if not stat_module.S_ISREG(info.st_mode) or observed != identity:
+                        if observed != identity:
                             failed = output_id
                     finally:
                         os.close(fd)

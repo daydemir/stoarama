@@ -59,10 +59,12 @@ reconciliation. Receipts from preceding rounds remain as history.
 When the final recheck completes, rerun the preview with
 `--request-final-check`. The NAS checks the path and current device, inode,
 size and timestamps of every approved output against the completed readbacks.
-It checks directory and mount identity around the sweep and uses Linux
-inotify to reject file writes or directory changes during the check. This check only
-visits the approved paths, so unrelated raw tree changes cannot prevent it
-from completing.
+The checker keeps every approved file open under a Linux read lease. An
+existing writable mapping or a writer trying to open a file during the
+check blocks success. It also watches the approved path components with
+inotify and verifies the pinned mount before reporting. The NAS process
+must be able to open one descriptor per approved output and acquire a
+read lease on each file.
 
 Export with `--export-file-list delivery-nas-file-list.json` after this
 check completes. Export requires the complete approved roster and one
