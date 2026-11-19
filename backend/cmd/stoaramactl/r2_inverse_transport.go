@@ -142,6 +142,22 @@ type inverseSDKStore struct {
 	transport http.RoundTripper
 }
 
+// newInverseDeleteHTTPTransport carries every DELETE over its own fresh HTTP/1.1
+// connection. HTTP/2 is neither offered nor negotiated: Go's HTTP/2 client
+// resends a refused stream inside one RoundTrip, below the one-DELETE guard. A
+// fresh connection also never meets a provider closing an idle one under it.
+func newInverseDeleteHTTPTransport() *http.Transport {
+	return awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
+		t.ForceAttemptHTTP2 = false
+		t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+		t.Protocols = new(http.Protocols)
+		t.Protocols.SetHTTP1(true)
+		t.TLSClientConfig = t.TLSClientConfig.Clone()
+		t.TLSClientConfig.NextProtos = []string{"http/1.1"}
+		t.DisableKeepAlives = true
+	}).GetTransport()
+}
+
 func newInverseSDKStore(ctx context.Context, cfg r2.Config) (*inverseSDKStore, error) {
 	reader, err := r2.New(ctx, cfg)
 	if err != nil {
@@ -151,13 +167,7 @@ func newInverseSDKStore(ctx context.Context, cfg r2.Config) (*inverseSDKStore, e
 	if region == "" {
 		region = "auto"
 	}
-	// HTTP/1.1 only. Go's HTTP/2 client resends a refused stream inside one
-	// RoundTrip, below the one-DELETE guard; HTTP/1.1 never resends a DELETE
-	// once any byte of it was written.
-	transport := awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
-		t.ForceAttemptHTTP2 = false
-		t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
-	}).GetTransport()
+	transport := newInverseDeleteHTTPTransport()
 	sdk := s3.NewFromConfig(aws.Config{Region: region, Credentials: credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")}, func(o *s3.Options) {
 		o.UsePathStyle = true
 		o.BaseEndpoint = aws.String(cfg.Endpoint)
@@ -174,26 +184,27 @@ func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDele
 		o.Retryer = aws.NopRetryer{}
 		o.HTTPClient = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	})
-	if err != nil && transport.written.Load() && transport.status.Load() == 0 {
+	if err != nil && transport.connected.Load() && !transport.answered.Load() {
 		return fmt.Errorf("%w: %w", errInverseWireAmbiguous, err)
 	}
 	return err
 }
 
-// errInverseWireAmbiguous marks a DELETE whose whole request was written and
-// for which no response status ever arrived (EOF, reset, response timeout).
-// Only that key is in doubt: it stays held and is never retransmitted. A veto,
-// a failed dial or write, and any received status (403, 503, ...) are never
-// this error and stop the job.
-var errInverseWireAmbiguous = errors.New("DELETE written but no response; result unknown")
+// errInverseWireAmbiguous marks a DELETE that got its own connection to the
+// provider and never received a single response byte: the connection dropped
+// while sending or awaiting the answer, or the answer timed out. The request
+// may or may not have reached the provider, so only that key is in doubt: it
+// stays held and is never retransmitted. A veto, a failed dial or TLS
+// handshake, and any response byte at all (403, 503, a cut status line) are
+// never this error and stop the job.
+var errInverseWireAmbiguous = errors.New("DELETE connection dropped before any response; result unknown")
 
 type inverseDeleteTransport struct {
-	base             http.RoundTripper
-	authority        *inverseDeleteAuthority
-	bucket, endpoint string
-	attempted        atomic.Bool
-	written          atomic.Bool
-	status           atomic.Int64
+	base                http.RoundTripper
+	authority           *inverseDeleteAuthority
+	bucket, endpoint    string
+	attempted           atomic.Bool
+	connected, answered atomic.Bool
 }
 
 func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -205,14 +216,13 @@ func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, e
 	}
 	req.Header.Del("Idempotency-Key")
 	req.Header.Del("X-Idempotency-Key")
-	trace := &httptrace.ClientTrace{WroteRequest: func(w httptrace.WroteRequestInfo) {
-		if w.Err == nil {
-			t.written.Store(true)
-		}
-	}}
+	trace := &httptrace.ClientTrace{
+		GotConn:              func(httptrace.GotConnInfo) { t.connected.Store(true) },
+		GotFirstResponseByte: func() { t.answered.Store(true) },
+	}
 	response, err := t.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
 	if response != nil {
-		t.status.Store(int64(response.StatusCode))
+		t.answered.Store(true)
 	}
 	return response, err
 }

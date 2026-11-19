@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -73,6 +74,7 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string) {
 		total.Deleted += result.Deleted
 		total.Bytes += result.Bytes
 		total.WireAmbiguous = append(total.WireAmbiguous, result.WireAmbiguous...)
+		total.AmbiguousHeld = result.AmbiguousHeld
 		printInverseJob(map[string]any{"step": "batch", "batch": n, "result": result, "total": total, "error": errorText(err)})
 		if err != nil {
 			log.Fatal(err)
@@ -109,6 +111,8 @@ func runInverseJobBatch(ctx context.Context, pool *pgxpool.Pool, store inverseDe
  WHERE i.bucket=$1 AND i.drain_evidence_sha256=$2`, store.Bucket(), o.DrainSHA).Scan(&n, &absent, &absentBytes, &attempts, &unresolved); err != nil {
 		return false, result, errors.Join(applyErr, err)
 	}
+	// Compare key sets in one byte order; the database orders by its collation.
+	sort.Strings(unresolved)
 	printInverseJob(map[string]any{"step": "readback", "evidence_sha256": o.DrainSHA, "intents": n, "absent": absent, "absent_bytes": absentBytes, "attempts": attempts, "unresolved": unresolved})
 	wire := errors.Is(applyErr, errInverseWireAmbiguous)
 	if applyErr != nil && !wire {

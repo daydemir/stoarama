@@ -401,7 +401,9 @@ func (a *inverseApplier) delete(ctx, admit context.Context, e inverseEntry) (boo
 	_, err := a.reserve(reserving, e)
 	stopReserving()
 	if err != nil {
-		if admit.Err() != nil {
+		// Only a wait that closed admission cancelled is not this key's own
+		// failure; any gate failure is reported even if admission also closed.
+		if admit.Err() != nil && errors.Is(err, context.Canceled) {
 			return false, errInverseAdmissionClosed
 		}
 		return false, err

@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -38,10 +40,11 @@ type inverseFakeStore struct {
 	// closes the connection after reading it, "403"/"503" answer completely,
 	// "503-truncated" cuts the error body, "slow" never answers in time.
 	wire map[string]string
-	// onDelete runs on the server for every DELETE before it answers.
-	onDelete     func(string)
-	beforeHead   func(context.Context, string) error
-	beforeDelete func(string) error
+	// onDelete runs on the server for every DELETE before it answers, and
+	// onAnswered after the answer (or the dropped connection) is sent.
+	onDelete, onAnswered func(string)
+	beforeHead           func(context.Context, string) error
+	beforeDelete         func(string) error
 }
 
 func (s *inverseFakeStore) setLost(lost bool)      { s.mu.Lock(); defer s.mu.Unlock(); s.lost = lost }
@@ -453,7 +456,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 	// server before it answers each DELETE.
 	setWire := func(modes map[string]string, hook func(string)) {
 		store.mu.Lock()
-		store.wire, store.onDelete = modes, hook
+		store.wire, store.onDelete, store.onAnswered = modes, hook, nil
 		store.mu.Unlock()
 	}
 	t.Run("lost_response_holds_only_its_key", func(t *testing.T) {
@@ -478,12 +481,13 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				time.Sleep(300 * time.Millisecond)
 			})
 		})
-		go func() {
-			<-siblingOnWire
-			// The lost answer is a closed connection; signal once it is sent.
-			time.Sleep(50 * time.Millisecond)
-			close(lostAnswered)
-		}()
+		store.mu.Lock()
+		store.onAnswered = func(key string) {
+			if key == lost {
+				close(lostAnswered)
+			}
+		}
+		store.mu.Unlock()
 		done, first, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(dir, "evidence-1.json"))
 		setWire(nil, nil)
 		if err != nil || done || !slices.Equal(first.WireAmbiguous, []string{lost}) || first.Deleted < 1 || first.Deleted >= 39 {
@@ -506,7 +510,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 	})
 	t.Run("received_status_or_veto_stops_the_job", func(t *testing.T) {
 		dir := t.TempDir()
-		for _, mode := range []string{"403", "503", "503-truncated"} {
+		for _, mode := range []string{"403", "503", "503-truncated", "503-headers-cut"} {
 			a, entries := build(2)
 			a.ledger.close()
 			setWire(map[string]string{entries[0].Key: mode}, nil)
@@ -609,9 +613,39 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 	})
 	t.Run("delete_transport_never_speaks_HTTP2", func(t *testing.T) {
-		tr, ok := sdk.transport.(*http.Transport)
-		if !ok || tr.ForceAttemptHTTP2 || tr.TLSNextProto == nil || len(tr.TLSNextProto) != 0 {
-			t.Fatalf("delete transport may negotiate HTTP/2: %T", sdk.transport)
+		// An HTTP/2-capable TLS server must still be spoken to in HTTP/1.1, on
+		// a fresh connection for every DELETE.
+		var protos []string
+		var connections atomic.Int64
+		server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			protos = append(protos, req.Proto)
+			w.WriteHeader(204)
+		}))
+		server.EnableHTTP2 = true
+		server.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+			if s == http.StateNew {
+				connections.Add(1)
+			}
+		}
+		server.StartTLS()
+		defer server.Close()
+		tr := newInverseDeleteHTTPTransport()
+		tr.TLSClientConfig.RootCAs = x509.NewCertPool()
+		tr.TLSClientConfig.RootCAs.AddCert(server.Certificate())
+		client := &http.Client{Transport: tr}
+		for range 2 {
+			req, _ := http.NewRequest(http.MethodDelete, server.URL+"/stoarama/key", nil)
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.ProtoMajor != 1 || resp.StatusCode != 204 {
+				t.Fatalf("DELETE answered over %s with %d", resp.Proto, resp.StatusCode)
+			}
+		}
+		if !slices.Equal(protos, []string{"HTTP/1.1", "HTTP/1.1"}) || connections.Load() != 2 {
+			t.Fatalf("server saw %v over %d connections", protos, connections.Load())
 		}
 	})
 	t.Run("protection_changed_during_HEAD", func(t *testing.T) {
@@ -1489,7 +1523,7 @@ func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*inverseSDKStor
 		if req.Method == http.MethodDelete {
 			deleted.Add(1)
 			store.mu.Lock()
-			mode, hook := store.wire[key], store.onDelete
+			mode, hook, answered := store.wire[key], store.onDelete, store.onAnswered
 			if store.lost {
 				mode = "eof"
 			}
@@ -1500,9 +1534,16 @@ func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*inverseSDKStor
 			if hook != nil {
 				hook(key)
 			}
+			if answered != nil {
+				defer answered(key)
+			}
 			switch mode {
 			case "eof":
 				c, _, _ := w.(http.Hijacker).Hijack()
+				c.Close()
+			case "503-headers-cut":
+				c, _, _ := w.(http.Hijacker).Hijack()
+				c.Write([]byte("HTTP/1.1 503 Service Unavailable\r\nContent-Ty"))
 				c.Close()
 			case "slow":
 				<-req.Context().Done()
