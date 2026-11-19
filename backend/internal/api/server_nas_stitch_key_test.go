@@ -366,68 +366,90 @@ func TestNASStitchLegacyReclaimFencesPriorDedicatedAttempt(t *testing.T) {
 	}
 }
 
-func TestNASStitchDedicatedLeaseRechecksScopePauseAfterKeyWait(t *testing.T) {
-	f, _, _ := newNASStitchTaskFixture(t)
-	f.s.cfg.NASStitchEnabled = true
-	keyID, _, _, err := mintAccountAPIKey(f.ctx, f.pool, 47, "scope fixture", accountScopeNASStitch, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = f.pool.Exec(f.ctx, "UPDATE nas_stitch_tasks SET state='pending',lease_token=NULL,lease_expires_at=NULL WHERE id=7"); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(f.ctx, 6*time.Second)
-	defer cancel()
-	blocker, err := f.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer blocker.Rollback(f.ctx)
-	if _, err = blocker.Exec(ctx, "SELECT id FROM account_api_keys WHERE id=$1 FOR NO KEY UPDATE", keyID); err != nil {
-		t.Fatal(err)
-	}
-	principal := accountPrincipal{AccountID: 47, APIKeyID: &keyID, KeyScopes: []string{string(accountScopeNASStitch)}}
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/stitch/lease", nil).
-		WithContext(context.WithValue(ctx, accountPrincipalContextKey, principal))
-	response := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		w := httptest.NewRecorder()
-		f.s.handleAccountNASStitchLease(w, req)
-		response <- w
-	}()
-	pid := int32(blocker.Conn().PgConn().PID())
-	for {
-		var blocked bool
-		err := f.pool.QueryRow(ctx, `SELECT EXISTS(
+func TestNASStitchDedicatedLeaseRechecksAfterAuthorizationWait(t *testing.T) {
+	for _, tc := range []struct {
+		name, lockSQL string
+		lockID        func(int64) int64
+		keyDeadline   bool
+	}{
+		{"pause during key lock", "SELECT id FROM account_api_keys WHERE id=$1 FOR NO KEY UPDATE", func(key int64) int64 { return key }, false},
+		{"key expires during scope lock", "SELECT id FROM nas_stitch_scopes WHERE id=$1 FOR NO KEY UPDATE", func(int64) int64 { return 1 }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, _, _ := newNASStitchTaskFixture(t)
+			f.s.cfg.NASStitchEnabled = true
+			keyID, _, _, err := mintAccountAPIKey(f.ctx, f.pool, 47, "scope fixture", accountScopeNASStitch, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = f.pool.Exec(f.ctx, "UPDATE nas_stitch_tasks SET state='pending',lease_token=NULL,lease_expires_at=NULL WHERE id=7"); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(f.ctx, 6*time.Second)
+			defer cancel()
+			blocker, err := f.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer blocker.Rollback(f.ctx)
+			if _, err = blocker.Exec(ctx, tc.lockSQL, tc.lockID(keyID)); err != nil {
+				t.Fatal(err)
+			}
+			if tc.keyDeadline {
+				if _, err = f.pool.Exec(ctx, `UPDATE account_api_keys SET expires_at=clock_timestamp()+interval '1 second' WHERE id=$1`, keyID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			principal := accountPrincipal{AccountID: 47, APIKeyID: &keyID, KeyScopes: []string{string(accountScopeNASStitch)}}
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/stitch/lease", nil).
+				WithContext(context.WithValue(ctx, accountPrincipalContextKey, principal))
+			response := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				w := httptest.NewRecorder()
+				f.s.handleAccountNASStitchLease(w, req)
+				response <- w
+			}()
+			pid := int32(blocker.Conn().PgConn().PID())
+			for {
+				var blocked bool
+				err := f.pool.QueryRow(ctx, `SELECT EXISTS(
  SELECT FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))`, pid).Scan(&blocked)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if blocked {
-			break
-		}
-		select {
-		case <-response:
-			t.Fatal("lease bypassed the active key lock")
-		case <-time.After(5 * time.Millisecond):
-		}
-	}
-	if _, err = f.pool.Exec(ctx, "UPDATE nas_stitch_scopes SET paused=true WHERE id=1"); err != nil {
-		t.Fatal(err)
-	}
-	if err = blocker.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	w := <-response
-	var lease struct{ Task *nasStitchTask }
-	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &lease) != nil || lease.Task != nil {
-		t.Fatalf("lease disclosed a paused scope: %d %s", w.Code, w.Body.String())
-	}
-	var unchanged bool
-	err = f.pool.QueryRow(ctx, `SELECT state='pending' AND lease_token IS NULL AND lease_api_key_id IS NULL
+				if err != nil {
+					t.Fatal(err)
+				}
+				if blocked {
+					break
+				}
+				select {
+				case <-response:
+					t.Fatal("lease bypassed the authorization row lock")
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+			if tc.keyDeadline {
+				_, err = f.pool.Exec(ctx, `SELECT pg_sleep(greatest(0,extract(epoch FROM
+ expires_at-clock_timestamp()))+0.02) FROM account_api_keys WHERE id=$1`, keyID)
+			} else {
+				_, err = f.pool.Exec(ctx, "UPDATE nas_stitch_scopes SET paused=true WHERE id=1")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = blocker.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			w := <-response
+			var lease struct{ Task *nasStitchTask }
+			if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &lease) != nil || lease.Task != nil {
+				t.Fatalf("lease disclosed a plan after authorization expired: %d %s", w.Code, w.Body.String())
+			}
+			var unchanged bool
+			err = f.pool.QueryRow(ctx, `SELECT state='pending' AND lease_token IS NULL AND lease_api_key_id IS NULL
  FROM nas_stitch_tasks WHERE id=7`).Scan(&unchanged)
-	if err != nil || !unchanged {
-		t.Fatalf("paused scope committed a lease: %v", err)
+			if err != nil || !unchanged {
+				t.Fatalf("authorization wait committed a lease: %v", err)
+			}
+		})
 	}
 }
 

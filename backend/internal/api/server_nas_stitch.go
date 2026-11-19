@@ -283,7 +283,7 @@ func (s *Server) handleAdminNASStitchPause(w http.ResponseWriter, r *http.Reques
 }
 func (s *Server) handleAdminNASStitchStatus(w http.ResponseWriter, r *http.Request) {
 	var raw []byte
-	err := s.pool.QueryRow(r.Context(), `SELECT jsonb_build_object('policy','v85r','revision','v85r-rebuilt-1','scopes',coalesce((SELECT jsonb_agg(s ORDER BY id) FROM nas_stitch_scopes s),'[]'),'tasks',coalesce((SELECT jsonb_agg(t) FROM (SELECT id,scope_id,recording_id,hour_at,state,attempt,plan_sha256,CASE WHEN lease_api_key_attempt=attempt THEN lease_api_key_id END AS lease_api_key_id,cleanup_plan_id,registration_abandoned_at,registration_abandoned_reason,updated_at FROM nas_stitch_tasks ORDER BY (state='verified' AND cleanup_plan_id IS NULL AND registration_abandoned_at IS NULL) DESC,id DESC LIMIT 100) t),'[]'),'client',(SELECT nas_stitch_status FROM connections WHERE id=13))`).Scan(&raw)
+	err := s.pool.QueryRow(r.Context(), `SELECT jsonb_build_object('policy','v85r','revision','v85r-rebuilt-1','scopes',coalesce((SELECT jsonb_agg(s ORDER BY id) FROM nas_stitch_scopes s),'[]'),'tasks',coalesce((SELECT jsonb_agg(t ORDER BY t.awaiting_receipt DESC,t.id DESC) FROM (SELECT id,scope_id,recording_id,hour_at,state,attempt,plan_sha256,CASE WHEN lease_api_key_attempt=attempt THEN lease_api_key_id END AS lease_api_key_id,cleanup_plan_id,registration_abandoned_at,registration_abandoned_reason,updated_at,(state='verified' AND cleanup_plan_id IS NULL AND registration_abandoned_at IS NULL) AS awaiting_receipt FROM nas_stitch_tasks ORDER BY awaiting_receipt DESC,id DESC LIMIT 100) t),'[]'),'client',(SELECT nas_stitch_status FROM connections WHERE id=13))`).Scan(&raw)
 	if err != nil {
 		util.WriteError(w, 500, "stitch status unavailable")
 		return
@@ -361,13 +361,22 @@ func (s *Server) handleAccountNASStitchLease(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, 403, "stitch key no longer active")
 		return
 	}
+	// Hold the scope through issuance so a pause cannot pass this decision.
+	if _, err := tx.Exec(ctx, `SELECT s.id FROM nas_stitch_tasks t
+ JOIN nas_stitch_scopes s ON s.id=t.scope_id WHERE t.id=$1 FOR SHARE OF s`, t.ID); err != nil {
+		util.WriteError(w, 503, "stitch scope lock unavailable")
+		return
+	}
+	// Both clocks can expire during a lock wait. Evaluate them together in
+	// a fresh statement after the key, task and scope locks are already held.
 	var approved bool
 	err = tx.QueryRow(ctx, `
-WITH scope AS MATERIALIZED (
- SELECT s.paused,s.approved_until FROM nas_stitch_tasks t
- JOIN nas_stitch_scopes s ON s.id=t.scope_id WHERE t.id=$1 FOR SHARE OF s
-)
-SELECT NOT paused AND approved_until>clock_timestamp() FROM scope`, t.ID).Scan(&approved)
+WITH decision AS MATERIALIZED (SELECT clock_timestamp() AS at)
+SELECT NOT s.paused AND s.approved_until > d.at AND k.revoked_at IS NULL
+ AND (k.expires_at IS NULL OR k.expires_at > d.at)
+ FROM nas_stitch_tasks t JOIN nas_stitch_scopes s ON s.id=t.scope_id
+ JOIN account_api_keys k ON k.id=$2 CROSS JOIN decision d WHERE t.id=$1`,
+		t.ID, caller.keyID).Scan(&approved)
 	if err != nil {
 		util.WriteError(w, 503, "stitch scope unavailable")
 		return
