@@ -132,8 +132,10 @@ hashes the complete payload of each packet using SHA-256 and writes the
 original stream, DTS, PTS, duration and byte count beside the digest.
 
 The verifier requires clean EOF on both pipes, successful FFmpeg exit and
-an active build deadline. An incomplete ledger or subprocess failure aborts
-the build before publication. The source and output ledger comparison,
+an active build deadline. An incomplete ledger aborts the build before
+publication. After a source decode exits unsuccessfully with intact pipe
+framing, the original verifier must independently reject the source before
+the worker can retain it or try repair. The source and output ledger comparison,
 packet inventory, independently seeked seam decodes and durable whole-file
 readback still run. Proof builds, their readback checks, repairs, and pixel
 formats outside the parity matrix use the original framehash command.

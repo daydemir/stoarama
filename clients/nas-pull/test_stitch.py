@@ -47,8 +47,7 @@ class StitchFrameLedgerTests(unittest.TestCase):
         for metadata, raw in ((row, b"abc"), (header + row[:-1], b"abc"),
                               (header + row, b"ab"), (header + row, b"abcd"),
                               (header + row.replace(b", 3,", b", -3,"), b"abc"),
-                              (header + row.replace(b"0,", b"1,", 1), b"abc"),
-                              (header, b"")):
+                              (header + row.replace(b"0,", b"1,", 1), b"abc")):
             with self.subTest(metadata=metadata, raw=raw), self.assertRaises(pull.StitchFrameLedgerError):
                 pull.stitch_hash_frame_stream(io.BytesIO(metadata), io.BytesIO(raw),
                                               io.BytesIO(), threading.Event())
@@ -64,16 +63,29 @@ class StitchFrameLedgerTests(unittest.TestCase):
                 "with open(sys.argv[sys.argv.index('-i') + 1], 'w') as f: f.write(str(os.getpid()))\n"
                 "fd = int(sys.argv[-1].rsplit(':', 1)[1])\n" + behavior)
             child.chmod(0o700)
-            with self.assertRaises(pull.StitchFrameLedgerError):
-                pull.stitch_stream_frames(str(child), pid, root / "ledger",
-                                          time.monotonic() + deadline_seconds, stop)
+            with mock.patch.object(pull, "stitch_frames") as reference:
+                with self.assertRaises(pull.StitchFrameLedgerError):
+                    pull.stitch_stream_frames(str(child), pid, root / "ledger",
+                                              time.monotonic() + deadline_seconds, stop,
+                                              confirm_source_rejection=True)
             with self.assertRaises(ChildProcessError):
                 os.waitpid(int(pid.read_text()), os.WNOHANG)
+            return reference.call_count
 
     def test_child_exit_after_complete_ledger_is_fatal(self):
-        self.run_child("os.write(1, b'#tb 0: 1/1000\\n0, 0, 0, 1, 3, 0x12345678\\n')\n"
-                       "os.write(fd, b'abc')\n"
-                       "sys.exit(1)\n", threading.Event(), 5)
+        attempts = self.run_child("os.write(1, b'#tb 0: 1/1000\\n0, 0, 0, 1, 3, 0x12345678\\n')\n"
+                                  "os.write(fd, b'abc')\n"
+                                  "sys.exit(1)\n", threading.Event(), 5)
+        self.assertEqual(attempts, 1)
+
+    def test_truncated_stream_cannot_be_classified_as_source_rejection(self):
+        attempts = self.run_child("os.write(1, b'#tb 0: 1/1000\\n0, 0, 0, 1, 4, 0x12345678\\n')\n"
+                                  "os.write(fd, b'abc')\n"
+                                  "sys.exit(1)\n", threading.Event(), 5)
+        self.assertEqual(attempts, 0)
+
+    def test_successful_child_must_produce_at_least_one_frame(self):
+        self.assertEqual(self.run_child("sys.exit(0)\n", threading.Event(), 5), 0)
 
     def test_stalled_child_is_cancelled_and_reaped(self):
         stop = threading.Event()
@@ -417,10 +429,10 @@ class StitchIntegrationTests(unittest.TestCase):
 
     def test_verifier_failure_on_second_source_aborts_before_publication(self):
         original = pull.stitch_stream_frames
-        def read_frames(*args):
+        def read_frames(*args, **kwargs):
             if args[2].name == "source-001.frames":
                 raise pull.StitchFrameLedgerError("test pipe failure")
-            return original(*args)
+            return original(*args, **kwargs)
         with mock.patch.object(pull, "stitch_stream_frames", side_effect=read_frames), \
                 mock.patch.object(pull, "stitch_repair_local") as repair:
             with self.assertRaisesRegex(pull.StitchFrameLedgerError, "test pipe failure"):
@@ -430,6 +442,40 @@ class StitchIntegrationTests(unittest.TestCase):
         self.assertEqual(list(output.glob("run-*")), [])
         self.assertEqual(list(output.glob(".stitch-*-pending-*")), [])
         self.assertTrue(all((self.cfg.output_dir / clip["relative_path"]).exists() for clip in self.clips))
+
+    def test_verified_decoder_rejection_retains_damaged_source_and_publishes_good_runs(self):
+        # Preserve the MP4 inventory and damage one non-key VCL packet.
+        clip = self.clips[1]
+        path = self.cfg.output_dir / clip["relative_path"]
+        packets = json.loads(subprocess.check_output([self.tools["ffprobe"], "-v", "error", "-show_packets",
+            "-show_entries", "packet=pos,size,flags", "-of", "json", str(path)]))["packets"]
+        packet = next(p for p in packets if "K" not in p["flags"] and int(p["size"]) >= 16)
+        data = bytearray(path.read_bytes())
+        cursor, end = int(packet["pos"]), int(packet["pos"]) + int(packet["size"])
+        while cursor < end:
+            length = int.from_bytes(data[cursor:cursor + 4], "big")
+            assert 0 < length <= end - cursor - 4
+            cursor += 4
+            if data[cursor] & 31 == 1:
+                data[cursor + 1:cursor + length] = bytes(length - 1)
+                break
+            cursor += length
+        else:
+            self.fail("fixture has no non-key VCL packet")
+        path.write_bytes(data)
+        clip["sha256"] = hashlib.sha256(data).hexdigest()
+        sidecar = Path(str(path) + ".stoarama.json")
+        body = json.loads(sidecar.read_text())
+        body["sha256"] = clip["sha256"]
+        sidecar.write_text(json.dumps(body))
+        self.task["plan"].update(clips=self.clips[:2], joins=[True], eligible=[True, True])
+        with mock.patch.object(pull, "stitch_frames", wraps=pull.stitch_frames) as reference:
+            result = self.build()
+        reference.assert_called_once()
+        self.assertEqual(reference.call_args.args[2], os.devnull)
+        self.assertEqual(result["left_out"], [clip["source_id"]])
+        self.assertEqual(len(result["outputs"]), 1)
+        self.assertTrue(path.exists())
 
     def test_b_frame_start_edit_is_conserved_through_real_remux_and_decode(self):
         for clip in self.clips[:2]:

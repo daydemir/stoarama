@@ -25902,12 +25902,13 @@ def run_measured(command, deadline, stop_event, stdout_path=None, niced=True, *,
                 return
 
     guard = threading.Thread(target=watchdog, name="benchmark-watchdog", daemon=True)
-    guard.start()
     try:
         try:
+            guard.start()
+            drained = None
             if drain_stdout:
                 with process.stdout:
-                    drain_stdout(process.stdout)
+                    drained = drain_stdout(process.stdout)
         except BaseException:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -25922,7 +25923,8 @@ def run_measured(command, deadline, stop_event, stdout_path=None, niced=True, *,
         stderr_tail = stderr_file.read().decode("utf-8", "replace").strip()
     finally:
         done.set()
-        guard.join(timeout=2)
+        if guard.ident is not None:
+            guard.join(timeout=2)
         if stdout_path:
             stdout_file.close()
         stderr_file.close()
@@ -25932,6 +25934,8 @@ def run_measured(command, deadline, stop_event, stdout_path=None, niced=True, *,
         "max_rss_kb": int(usage.ru_maxrss if sys.platform != "darwin" else usage.ru_maxrss // 1024),
         "returncode": process.returncode, "stderr": stderr_tail,
     }
+    if drain_stdout:
+        measured["drained"] = drained
     if killed["reason"] == "deadline":
         raise BenchmarkDeadline("benchmark deadline reached")
     if killed["reason"] == "shutdown":
@@ -48203,11 +48207,12 @@ def stitch_hash_frame_stream(metadata, raw, ledger, stop):
             digest.update(block)
         ledger.write(b", ".join(fields[:5] + [digest.hexdigest().encode("ascii")]) + b"\n")
         frames += 1
-    if not frames or stitch_read(raw, 1, stop):
-        raise StitchFrameLedgerError("empty or trailing decoded frame data")
+    if stitch_read(raw, 1, stop):
+        raise StitchFrameLedgerError("trailing decoded frame data")
+    return frames
 
 
-def stitch_stream_frames(ffmpeg, source, target, deadline, stop):
+def stitch_stream_frames(ffmpeg, source, target, deadline, stop, *, confirm_source_rejection=False):
     # Tee sends the same rawvideo packet to both synchronous, flushed muxers.
     # Read its size before draining rawvideo so packets larger than the pipe fit.
     read_fd, write_fd = os.pipe()
@@ -48221,8 +48226,17 @@ def stitch_stream_frames(ffmpeg, source, target, deadline, stop):
             stitch_check(stop)
         except (StitchHold, BenchmarkError, OSError) as exc:
             raise StitchFrameLedgerError("streamed frame verification interrupted") from exc
-        if time.monotonic() >= deadline or measured["returncode"] != 0:
-            raise StitchFrameLedgerError("strict frame verification failed: " + measured["stderr"][:200])
+    if time.monotonic() >= deadline:
+        raise StitchFrameLedgerError("streamed frame verification expired")
+    if measured["returncode"] != 0:
+        # A sound stream can still end in a genuine strict decode rejection.
+        # Only the independent original verifier may classify that source as
+        # rejected. Its success cannot authorize this failed streamed audit.
+        if confirm_source_rejection and measured["returncode"] > 0:
+            stitch_frames(ffmpeg, source, os.devnull, deadline, stop)
+        raise StitchFrameLedgerError("strict frame verification failed: " + measured["stderr"][:200])
+    if measured["drained"] == 0:
+        raise StitchFrameLedgerError("empty decoded frame stream")
 
 
 STITCH_STREAMED_FRAME_FORMATS = frozenset({
@@ -48231,9 +48245,9 @@ STITCH_STREAMED_FRAME_FORMATS = frozenset({
 })
 
 
-def stitch_audit_frames(ffmpeg, source, target, pixel_format, deadline, stop):
+def stitch_audit_frames(ffmpeg, source, target, pixel_format, deadline, stop, *, confirm_source_rejection=False):
     if stop.kind is StitchRunKind.PRODUCTION and pixel_format in STITCH_STREAMED_FRAME_FORMATS:
-        stitch_stream_frames(ffmpeg, source, target, deadline, stop)
+        stitch_stream_frames(ffmpeg, source, target, deadline, stop, confirm_source_rejection=confirm_source_rejection)
     else:
         stitch_frames(ffmpeg, source, target, deadline, stop)
 
@@ -48417,7 +48431,7 @@ def stitch_audit_source(ffmpeg, ffprobe, source, work, index, deadline, stop):
     stitch_packets(ffprobe, source, hidden, deadline, stop, hidden=True)
     stitch_editlist_records(json.loads(stitch_read_path(prefix.with_suffix(".json"), 1024 * 1024, stop).decode("utf-8")),
                             stitch_packet_rows(packets, stop), stitch_packet_rows(hidden, stop))
-    stitch_audit_frames(ffmpeg, source, frames, signature[4], deadline, stop)
+    stitch_audit_frames(ffmpeg, source, frames, signature[4], deadline, stop, confirm_source_rejection=True)
     return stitch_source_inventory(signature, packets, frames, stop)
 
 
