@@ -67,6 +67,55 @@ class CleanupTests(unittest.TestCase):
     def opened(self):
         return pull.CleanupFile(self.cfg, self.item, threading.Event(), time.monotonic()+20)
 
+    def certified_replacement(self):
+        self.pins = self.fixture_pins('2026-08-31T00:00:00+00:00', '2026-09-28T00:00:00+00:00')
+        replacement = self.cfg.output_dir / 'stitched-output.mp4'
+        replacement.write_bytes(b'certified output')
+        output = dict(relative_path=replacement.name, size_bytes=replacement.stat().st_size,
+                      sha256=hashlib.sha256(replacement.read_bytes()).hexdigest(),
+                      identity=pull.cleanup_identity(replacement.stat()))
+        self.item.update(permit_reason=pull.CLEANUP_CERTIFIED_STITCH_REASON,
+                         stitch_certificate=dict(hour_id=1, attempt=1, output=output),
+                         stitch_raw_sidecar=dict(size_bytes=self.sidecar.stat().st_size,
+                                                 sha256=hashlib.sha256(self.sidecar.read_bytes()).hexdigest()))
+        self.item.pop("frozen_identity")
+        self.item.pop("frozen_sidecar_identity")
+        return replacement, output
+
+    def test_certified_replacement_is_kept_when_exact_raw_is_unlinked(self):
+        replacement, output = self.certified_replacement()
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_CERTIFIED_STITCH_VERSION):
+            with self.opened() as current:
+                proof = current.proof()
+                self.assertEqual(proof['stitch_replacement'], output)
+                self.assertIsNone(pull.cleanup_guard_refusal(self.task, proof))
+                self.assertIsNotNone(pull.cleanup_guard_refusal(self.task, dict(proof, stitch_replacement=None)))
+                current.delete_exact(proof)
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.sidecar.exists())
+        self.assertEqual(replacement.read_bytes(), b'certified output')
+
+    def test_certified_replacement_refuses_older_client_wrong_bytes_and_replacement(self):
+        replacement, output = self.certified_replacement()
+        with self.assertRaisesRegex(RuntimeError, 'reviewed certified stitch'):
+            with self.opened():
+                self.fail('old client opened typed cleanup target')
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_CERTIFIED_STITCH_VERSION):
+            correct_sha = output['sha256']
+            output['sha256'] = '0' * 64
+            with self.opened() as current, self.assertRaisesRegex(RuntimeError, 'replacement bytes differ'):
+                current.proof()
+            output['sha256'] = correct_sha
+            with self.opened() as current:
+                proof = current.proof()
+                replacement.rename(replacement.with_suffix('.previous'))
+                replacement.write_bytes(b'certified output')
+                with self.assertRaisesRegex(RuntimeError, 'identity changed'):
+                    current.delete_exact(proof)
+                self.assertFalse(current.unlink_attempted)
+        self.assertTrue(self.path.exists())
+        self.assertTrue(self.sidecar.exists())
+
     def test_readonly_worker_exact_proof_and_durable_ack(self):
         calls=[]
         def api(cfg,path,body, **kwargs):

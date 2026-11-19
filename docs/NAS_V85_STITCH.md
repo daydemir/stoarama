@@ -112,8 +112,8 @@ registration receipts after the server accepts its result. A second readiness
 ACK records `completed_no_retirement` and releases the lane. A lost ACK is
 reconciled from the SQLite FULL/WAL journal before new work.
 
-Every ordinary stitch retains its raw inputs. The API and client refuse
-stitch-derived deletion permits, including legacy registered results.
+NAS-local stitches retain their raw inputs. The API and client refuse
+legacy stitch deletion permits, including legacy registered results.
 Migration 0214 requires old stitch cleanup plans to be disabled and their
 issued permits to have expired before opening the local stitch lane.
 Preserve existing SQLite journals, outputs, ledgers and plans. Ordinary NAS
@@ -360,13 +360,63 @@ certification, read and write grant drain, a live drained writer fence,
 a fresh exact-bucket conditional DELETE proof, and dependency checks.
 The current provider proof applies to unversioned objects. An ambiguous
 delete retains its one-shot intent and blocks fence removal and conflicting
-dependencies until the controller observes absence.
+dependencies until the controller observes absence. For NAS raw cleanup,
+reconcile legacy staged absence receipts once with the current command to
+record a strict HEAD confirmation alongside the original observation.
+
+The same reconcile command can record absence for an aborted stage, including
+one from an earlier attempt. It requires the exact stage identity, writer
+drain, an empty multipart listing for the key, and HTTP 404 from HEAD. An
+abort after possible multipart completion remains held because that request
+can still have an unresolved outcome.
 
 ```sh
 stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --apply \
   --conditional-delete-proof PROOF.json --expected-delete-proof-sha256 PROOF_SHA
 stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --reconcile
 ```
+
+### Release certified raw on the NAS
+
+The Durham producer always sends `retirement_held: true`. The connection-13
+certificate releases the exact inputs in the same transaction. The
+`nas_stitch_r2_certified_raw` view exposes that released set. Each clip maps
+to the certified output that contains it, including when an hour has several
+outputs.
+
+Keep the original files on the NAS through the controller's keep-28 R2 DELETE
+and confirming HEAD. After the exact reservation, intent, attempt, retirement
+receipt and absence event are durable, the clip appears in
+`nas_cleanup_certified_stitch_raw`. An unresolved R2 DELETE keeps the original
+on the NAS.
+
+Use `stoaramactl nas-cleanup prepare --input MANIFEST.json` with the usual
+label and items in a separate plan. Request
+`{"kind":"certified_stitch_raw","source_id":901}` for an exact eligible clip.
+The API derives the replacement proof and original sidecar digest and uses the
+existing dry run, plan approval, source freeze, delivery veto and deletion
+budget. NAS deletion also requires recorded absence for every staging object
+from every attempt for that hour. Before issuing or replaying a permit, the API
+checks each aborted stage's writer grant drain, lists multipart uploads for its
+exact key prefix, and requires an unambiguous HEAD 404 for that key. Hours with
+no aborted stages require no provider reads for this check. The initial dry run
+records the raw and sidecar identities from the NAS and hashes them against the
+exact recorded evidence, including raws copied after the frozen inventory audit. Before asking for a
+permit the client rechecks those files and hashes the retained output. It
+rechecks the open files and pathnames immediately before unlink. A missing
+or changed output keeps the raw.
+
+Apply 0219 with the NAS deletion master off. Before preparing a certified
+dry run, verify the updated API on every serving instance, the exact
+`r2-copy-v7-certified-stitch` NAS client, and the updated Jelly gates. Verify
+the deployed keep-28 controller closes admission at the first DELETE write,
+including when admission closes while the keep-28 transport is dialing.
+#565 establishes that behavior for the outside-keep-28 lane. The keep-28
+transport needs its own implementation and regression test before rollout.
+Keep the ordinary R2 recovery verifier and its Jelly runner on ordinary
+plans. Certified plans use connection 13's replacement readback for their
+dry-run and deletion evidence. Pause certified dry runs and enabled plans
+and drain live permits before rolling either side back.
 
 Provision the pinned x86 tools, bundle and corpus offline in the Durham
 guest. Verify execution of each pinned tool and the direct network

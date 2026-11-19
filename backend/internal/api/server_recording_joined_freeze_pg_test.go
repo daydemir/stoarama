@@ -36,6 +36,8 @@ func requireJoinedTestReplicationRole(t *testing.T, pool *pgxpool.Pool) {
 }
 
 var joinedMigrationNames = []string{
+	// The certified NAS cleanup exception depends on the deferred handoff and keep-28 ledger.
+	"0219_nas_cleanup_certified_stitch.sql",
 	// The joined batch release replaces the deferred joined retention guard.
 	"0218_r2_joined_batch_release.sql",
 	// The R2 stitch handoff depends on the deferred stitch and writer-fence tables.

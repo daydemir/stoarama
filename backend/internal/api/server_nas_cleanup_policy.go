@@ -110,6 +110,15 @@ func (p *nasCleanupPolicy) outside(stream int64, a, b time.Time) bool {
 	return !(a.Before(w.end) && b.After(w.start))
 }
 
+func (p *nasCleanupPolicy) permitsCleanup(i nasCleanupItem, start, end time.Time) bool {
+	if i.PermitReason == nasCleanupCertifiedStitchReason {
+		w, ok := p.Streams[i.StreamID]
+		return ok && i.StitchCertificate != nil && i.Kind == "raw" && start.Before(end) &&
+			!start.Before(w.start) && !end.After(w.end)
+	}
+	return i.PermitReason == "" && p.outside(i.StreamID, start, end)
+}
+
 // Replays select.py for one stream: per local day, the union of seconds covered
 // by clips that are not collation-quarantined (no R2 availability requirement);
 // candidates run from the first recorded day-13 to the last recorded day; the
@@ -191,8 +200,13 @@ func (s *Server) cleanupCurrentPolicyCheck(ctx context.Context, q interface {
 	if err := deliveryNASUnheld(ctx, q, i); err != nil {
 		return err
 	}
-	if i.PermitReason != "" {
+	if i.PermitReason != "" && i.PermitReason != nasCleanupCertifiedStitchReason {
 		return errors.New("stitch retirement disabled")
+	}
+	if i.PermitReason == nasCleanupCertifiedStitchReason {
+		if err := cleanupCheckCertifiedStitch(ctx, q, i, !dryRun); err != nil {
+			return err
+		}
 	}
 	report, err := s.cleanupReport(ctx)
 	if err != nil || !report.permits(i) {
@@ -209,8 +223,8 @@ func (s *Server) cleanupCurrentPolicyCheck(ctx context.Context, q interface {
 	if window.Timezone != i.Timezone {
 		return errors.New("canonical timezone changed")
 	}
-	if !policy.outside(i.StreamID, i.StartAt, i.EndAt) {
-		return errors.New("current media bounds overlap KEEP")
+	if !policy.permitsCleanup(i, i.StartAt, i.EndAt) {
+		return errors.New("current media bounds overlap KEEP or are outside the certified keep window")
 	}
 	rankingStarted := time.Now()
 	var best []byte
@@ -270,7 +284,7 @@ func (s *Server) cleanupCurrentPolicyCheck(ctx context.Context, q interface {
 		}
 		var sid, a, b int64
 		var tz, bucket string
-		if json.Unmarshal(row[2], &sid) != nil || json.Unmarshal(row[3], &a) != nil || json.Unmarshal(row[4], &b) != nil || json.Unmarshal(row[5], &tz) != nil || json.Unmarshal(row[10], &bucket) != nil || bucket != i.Bucket || sid != i.StreamID || tz != i.Timezone || !policy.outside(sid, time.UnixMicro(a), time.UnixMicro(b)) {
+		if json.Unmarshal(row[2], &sid) != nil || json.Unmarshal(row[3], &a) != nil || json.Unmarshal(row[4], &b) != nil || json.Unmarshal(row[5], &tz) != nil || json.Unmarshal(row[10], &bucket) != nil || bucket != i.Bucket || sid != i.StreamID || tz != i.Timezone || !policy.permitsCleanup(i, time.UnixMicro(a), time.UnixMicro(b)) {
 			return errors.New("current source intersects KEEP or is unknown")
 		}
 	}
