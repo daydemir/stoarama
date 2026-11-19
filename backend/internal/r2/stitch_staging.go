@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -289,6 +290,9 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	if c.writerDB == nil || objectID <= 0 {
 		return errors.New("stitch stage retirement requires the exact operator target")
 	}
+	// The transaction, including its fence locks, must outlive the wire attempt.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	conn, err := c.writerDB.Acquire(ctx)
 	if err != nil {
 		return err
@@ -303,7 +307,10 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(context.Background())
+	if _, err = tx.Exec(ctx, `SET LOCAL idle_in_transaction_session_timeout='90s'`); err != nil {
+		return err
+	}
 	if _, err = tx.Exec(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`); err != nil {
 		return err
 	}
@@ -343,6 +350,9 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	if err != nil {
 		return errors.New("stitch stage lacks exact NAS custody, drain, or dependency clearance")
 	}
+	if version != "" {
+		return errors.New("staging conditional delete proof covers only unversioned objects")
+	}
 	if absent {
 		return nil
 	}
@@ -378,7 +388,16 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	if _, err = c.writerDB.Exec(ctx, `INSERT INTO nas_stitch_r2_stage_retirements(object_id) VALUES($1)`, objectID); err != nil {
 		return err
 	}
-	if err := c.deleteStitchStageExact(ctx, key, etag, version); err != nil {
+	if err := c.deleteStitchStageExact(ctx, key, etag, func(wireCtx context.Context) error {
+		now, err := c.stitchStageDeleteFence(wireCtx, tx)
+		if err != nil {
+			return err
+		}
+		if !proofExpires.After(now) {
+			return errors.New("conditional staging delete proof expired before transport")
+		}
+		return nil
+	}); err != nil {
 		return errors.New("stitch stage delete outcome unconfirmed; reconcile only")
 	}
 	if _, err = c.Head(ctx, key); !IsNotFound(err) {
@@ -403,15 +422,29 @@ func (c *Client) stitchStageDeleteFence(ctx context.Context, tx pgx.Tx) (time.Ti
 	return now, nil
 }
 
-func (c *Client) deleteStitchStageExact(ctx context.Context, key, etag, version string) error {
+func (c *Client) deleteStitchStageExact(ctx context.Context, key, etag string, check func(context.Context) error) error {
 	in := &s3.DeleteObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key),
 		IfMatch: aws.String(`"` + cleanETag(etag) + `"`)}
-	if version != "" {
-		in.VersionId = aws.String(version)
-	}
 	_, err := c.s3.DeleteObject(ctx, in, func(o *s3.Options) {
 		noStitchStageRetries(o)
-		o.HTTPClient = &http.Client{Transport: c.deleteTransport, CheckRedirect: refuseRetirementRedirect}
+		o.HTTPClient = &http.Client{Transport: &stitchStageDeleteTransport{base: c.deleteTransport, check: check},
+			CheckRedirect: refuseRetirementRedirect}
 	})
 	return err
+}
+
+type stitchStageDeleteTransport struct {
+	base  http.RoundTripper
+	check func(context.Context) error
+	used  atomic.Bool
+}
+
+func (t *stitchStageDeleteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method != http.MethodDelete || !t.used.CompareAndSwap(false, true) {
+		return nil, errors.New("staging transport allows one DELETE")
+	}
+	if err := t.check(req.Context()); err != nil {
+		return nil, err
+	}
+	return t.base.RoundTrip(req)
 }

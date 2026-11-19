@@ -241,6 +241,11 @@ ALTER TABLE nas_stitch_r2_hours ADD COLUMN staged_manifest jsonb CHECK(jsonb_typ
  ADD COLUMN staged_manifest_sha256 text CHECK(staged_manifest_sha256 ~ '^[a-f0-9]{64}$');
 ALTER TABLE nas_stitch_r2_hours ADD CHECK(state NOT IN ('staged','certified')
  OR (attempt>0 AND staged_manifest IS NOT NULL AND staged_manifest_sha256 IS NOT NULL));
+CREATE TRIGGER nas_stitch_r2_manifest_immutable
+ BEFORE UPDATE OF staged_manifest,staged_manifest_sha256 ON nas_stitch_r2_hours
+ FOR EACH ROW WHEN (OLD.staged_manifest IS NOT NULL AND
+  ROW(OLD.staged_manifest,OLD.staged_manifest_sha256) IS DISTINCT FROM ROW(NEW.staged_manifest,NEW.staged_manifest_sha256))
+ EXECUTE FUNCTION guard_nas_stitch_evidence();
 
 ALTER TABLE nas_r2_copy_items DROP CONSTRAINT nas_r2_copy_items_kind_check,
  ADD CHECK(kind IN ('raw','collated','stitch_output'));
@@ -267,7 +272,10 @@ CREATE TRIGGER nas_r2_stitch_copy_evidence_guard BEFORE UPDATE OR DELETE ON nas_
 CREATE FUNCTION nas_stitch_r2_exact_copy_receipt(q nas_r2_copy_items, o nas_stitch_r2_stage_objects) RETURNS boolean
 LANGUAGE sql IMMUTABLE AS $$
  SELECT COALESCE(q.kind='stitch_output' AND q.state='verified' AND q.connection_id=13 AND q.source_id=o.id
-  AND q.stitch_result_sha256 IS NOT NULL AND q.completion IN ('downloaded','verified_in_place')
+  AND q.etag=o.etag AND coalesce(q.version_id,'')=coalesce(o.version_id,'')
+  AND q.stitch_result_sha256 IS NOT NULL
+  AND ((q.completion='downloaded' AND q.committed_bytes=o.size_bytes)
+       OR (q.completion='verified_in_place' AND q.committed_bytes=0))
   AND q.item @> jsonb_build_object('kind','stitch_output','source_id',o.id,'bucket',o.bucket,'object_key',o.object_key,
    'relative_path',o.relative_path,'size_bytes',o.size_bytes,'sha256',o.sha256)
   AND q.stitch_receipt @> jsonb_build_object('relative_path',o.relative_path,'size_bytes',o.size_bytes,'sha256',o.sha256,'fsynced',true)
@@ -283,21 +291,54 @@ LANGUAGE sql IMMUTABLE AS $$
   ELSE false END, false);
 $$;
 
+CREATE FUNCTION nas_stitch_r2_certificate_receipt(hour_id bigint, attempt_number integer, plan_digest text, manifest_digest text)
+RETURNS jsonb LANGUAGE sql STABLE AS $$
+ WITH hour AS (
+  SELECT h.* FROM nas_stitch_r2_hours h WHERE h.id=$1 AND h.attempt=$2 AND h.state='staged'
+   AND h.plan_sha256=$3 AND h.staged_manifest_sha256=$4
+   AND h.staged_manifest->>'plan_sha256'=$3 AND h.staged_manifest->>'lease_token'=h.lease_token
+   AND h.staged_manifest->>'policy'=h.plan->>'policy' AND h.staged_manifest->>'error'=''
+   AND jsonb_typeof(h.staged_manifest->'seams') IN ('array','null')
+   AND jsonb_array_length(CASE WHEN jsonb_typeof(h.staged_manifest->'seams')='array'
+    THEN h.staged_manifest->'seams' ELSE '[]'::jsonb END)=jsonb_array_length(h.plan->'clips')-1
+   AND h.staged_manifest->'left_out' IN ('[]'::jsonb,'null'::jsonb)
+   AND h.staged_manifest->'repairs' IN ('[]'::jsonb,'null'::jsonb)
+   AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(h.staged_manifest->'seams')='array'
+    THEN h.staged_manifest->'seams' ELSE '[]'::jsonb END) seam
+    WHERE COALESCE(seam->>'decision','') NOT IN ('join','split'))
+ ), outputs AS (
+  SELECT value AS entry FROM hour h
+  CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(h.staged_manifest->'outputs')='array'
+   THEN h.staged_manifest->'outputs' ELSE '[]'::jsonb END)
+ ), inputs AS (
+  SELECT value AS proof FROM outputs
+  CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(entry->'inputs')='array'
+   THEN entry->'inputs' ELSE '[]'::jsonb END)
+ )
+ SELECT jsonb_build_object('objects',jsonb_agg(jsonb_build_object('object_key',o.object_key,'etag',o.etag,
+  'version_id',o.version_id,'last_modified',o.last_modified,'readback',q.stitch_receipt) ORDER BY o.id))
+ FROM hour h CROSS JOIN outputs
+ JOIN nas_stitch_r2_stage_objects o ON o.hour_id=$1 AND o.attempt=$2 AND o.state='staged'
+  AND entry @> jsonb_build_object('relative_path',o.relative_path,'size_bytes',o.size_bytes,'sha256',o.sha256)
+ JOIN nas_r2_copy_items q ON q.connection_id=13 AND q.kind='stitch_output' AND q.source_id=o.id
+  AND q.manifest_sha256=$4 AND nas_stitch_r2_exact_copy_receipt(q,o)
+ WHERE (SELECT count(*) FROM inputs)=jsonb_array_length(h.plan->'clips')
+  AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(h.plan->'clips') c
+   WHERE NOT EXISTS(SELECT 1 FROM inputs WHERE proof @> jsonb_build_object('clip_id',c->'source_id',
+    'size_bytes',c->'size_bytes','sha256',c->'sha256','repaired',false,'retirement_held',true)))
+ HAVING count(*)>0 AND count(DISTINCT o.id)=count(*) AND count(*)=(SELECT count(*) FROM outputs)
+  AND count(*)=(SELECT count(*) FROM nas_stitch_r2_stage_objects o WHERE o.hour_id=$1 AND o.attempt=$2 AND o.state='staged')
+$$;
+
 CREATE FUNCTION add_nas_stitch_r2_certificate() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE expected jsonb; covered boolean;
+DECLARE expected jsonb;
 BEGIN
  PERFORM pg_advisory_xact_lock(7343226011173);
  IF NOT nas_stitch_r2_has_exact_input_set(NEW.hour_id) THEN
   RAISE EXCEPTION 'NAS stitch input coverage changed';
  END IF;
- SELECT jsonb_agg(jsonb_build_object('object_key',o.object_key,'etag',o.etag,'version_id',o.version_id,
-    'last_modified',o.last_modified,'readback',q.stitch_receipt) ORDER BY o.id),
-  bool_and(COALESCE(q.manifest_sha256=NEW.manifest_sha256 AND nas_stitch_r2_exact_copy_receipt(q,o),false))
- INTO expected,covered
- FROM nas_stitch_r2_stage_objects o LEFT JOIN nas_r2_copy_items q
-  ON q.connection_id=13 AND q.kind='stitch_output' AND q.source_id=o.id
- WHERE o.hour_id=NEW.hour_id AND o.attempt=NEW.attempt AND o.state='staged';
- IF NOT COALESCE(covered,false) OR NEW.receipt IS DISTINCT FROM jsonb_build_object('objects',expected) THEN
+ expected:=nas_stitch_r2_certificate_receipt(NEW.hour_id,NEW.attempt,NEW.plan_sha256,NEW.manifest_sha256);
+ IF expected IS NULL OR NEW.receipt IS DISTINCT FROM expected THEN
   RAISE EXCEPTION 'NAS stitch certificate lacks exact pulled output coverage';
  END IF;
  UPDATE nas_stitch_r2_hours SET state='certified'
@@ -359,9 +400,19 @@ CREATE TABLE nas_stitch_r2_stage_retirements (
  CHECK(absence_observed_at IS NULL OR absence_observed_at>=issued_at)
 );
 
+CREATE FUNCTION guard_nas_stitch_r2_stage_retirement() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF TG_OP='INSERT' AND NEW.absence_observed_at IS NULL THEN RETURN NEW; END IF;
+ IF TG_OP='UPDATE' AND NEW.object_id=OLD.object_id AND NEW.issued_at=OLD.issued_at
+  AND OLD.absence_observed_at IS NULL AND NEW.absence_observed_at IS NOT NULL THEN RETURN NEW; END IF;
+ RAISE EXCEPTION 'stitch staging retirement intent is one-shot' USING ERRCODE='55000';
+END $$;
+CREATE TRIGGER nas_stitch_r2_stage_retirement_guard BEFORE INSERT OR UPDATE OR DELETE ON nas_stitch_r2_stage_retirements
+ FOR EACH ROW EXECUTE FUNCTION guard_nas_stitch_r2_stage_retirement();
+
 DO $$ DECLARE t text; BEGIN
  FOREACH t IN ARRAY ARRAY['nas_stitch_r2_hours','nas_stitch_r2_stage_objects','nas_stitch_r2_parts',
-  'nas_stitch_r2_certificates','nas_stitch_r2_stage_retirements','nas_r2_copy_items'] LOOP
+  'nas_stitch_r2_certificates','nas_stitch_r2_stage_retirements','nas_r2_copy_items','r2_retirement_writer_fences'] LOOP
   EXECUTE format('CREATE TRIGGER nas_stitch_evidence_truncate BEFORE TRUNCATE ON %I'
     ' FOR EACH STATEMENT EXECUTE FUNCTION guard_nas_stitch_r2_truncate()',t);
  END LOOP;

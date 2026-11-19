@@ -78,16 +78,23 @@ func finishNASR2StitchCopy(ctx context.Context, tx pgx.Tx, task nasR2CopyTask, r
 	if err != nil || tag.RowsAffected() != 1 {
 		return errors.New("stitch copy lease or manifest changed")
 	}
-	_, err = tx.Exec(ctx, `WITH proof AS (
- SELECT count(*) AS n, bool_and(COALESCE(q.manifest_sha256=$4 AND nas_stitch_r2_exact_copy_receipt(q,o),false)) AS complete,
-  jsonb_agg(jsonb_build_object('object_key',o.object_key,'etag',o.etag,'version_id',o.version_id,
-    'last_modified',o.last_modified,'readback',q.stitch_receipt) ORDER BY o.id) AS objects
- FROM nas_stitch_r2_stage_objects o LEFT JOIN nas_r2_copy_items q
-  ON q.connection_id=13 AND q.kind='stitch_output' AND q.source_id=o.id
- WHERE o.hour_id=$1 AND o.attempt=$2 AND o.state='staged'
- )
+	var accepted bool
+	err = tx.QueryRow(ctx, `WITH proof AS MATERIALIZED (
+ SELECT nas_stitch_r2_certificate_receipt($1,$2,$3,$4) AS receipt
+ ), certified AS (
  INSERT INTO nas_stitch_r2_certificates(hour_id,connection_id,attempt,plan_sha256,manifest_sha256,receipt)
- SELECT $1,13,$2,$3,$4,jsonb_build_object('objects',objects) FROM proof WHERE n>0 AND complete`,
-		staged.hourID, staged.attempt, staged.plan, staged.manifest)
-	return err
+ SELECT $1,13,$2,$3,$4,receipt FROM proof WHERE receipt IS NOT NULL RETURNING 1
+ )
+ SELECT EXISTS(SELECT 1 FROM certified) OR EXISTS(
+  SELECT 1 FROM nas_stitch_r2_stage_objects o JOIN nas_r2_copy_items q
+   ON q.connection_id=13 AND q.kind='stitch_output' AND q.source_id=o.id
+  WHERE o.hour_id=$1 AND o.attempt=$2 AND o.state='staged' AND q.manifest_sha256=$4
+   AND q.state<>'verified')`, staged.hourID, staged.attempt, staged.plan, staged.manifest).Scan(&accepted)
+	if err != nil {
+		return err
+	}
+	if !accepted {
+		return errors.New("complete NAS custody differs from the stored Durham manifest")
+	}
+	return nil
 }

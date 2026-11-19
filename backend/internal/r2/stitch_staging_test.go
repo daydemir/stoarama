@@ -95,11 +95,11 @@ func TestStitchMultipartExemptionRequiresAllPagesAndExactUpload(t *testing.T) {
 	}
 }
 
-func TestStitchStageDeleteBindsQuotedETagAndVersion(t *testing.T) {
+func TestStitchStageDeleteChecksFenceAtQuotedUnversionedWireRequest(t *testing.T) {
 	const key = "stitch-staging/00000000-0000-0000-0000-000000000001/output.mp4"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete || r.URL.Path != "/bucket/"+key ||
-			r.Header.Get("If-Match") != `"stage-etag"` || r.URL.Query().Get("versionId") != "exact-version" {
+			r.Header.Get("If-Match") != `"stage-etag"` || r.URL.Query().Has("versionId") {
 			t.Error("staging DELETE differs from the exact generation")
 			w.WriteHeader(http.StatusPreconditionFailed)
 			return
@@ -112,7 +112,13 @@ func TestStitchStageDeleteBindsQuotedETagAndVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := client.deleteStitchStageExact(ctx, key, "stage-etag", "exact-version"); err != nil {
+	denied := errors.New("fake fence unavailable")
+	if err := client.deleteStitchStageExact(ctx, key, "stage-etag", func(context.Context) error {
+		return denied
+	}); !errors.Is(err, denied) {
+		t.Fatalf("staging request ignored the transport fence: %v", err)
+	}
+	if err := client.deleteStitchStageExact(ctx, key, "stage-etag", func(context.Context) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 }

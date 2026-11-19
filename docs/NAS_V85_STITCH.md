@@ -358,7 +358,8 @@ Keep the custody lane gated during rollback and until both executors enforce
 holds. Retire staged outputs through the separate controller command after
 certification, read and write grant drain, a live drained writer fence,
 a fresh exact-bucket conditional DELETE proof, and dependency checks.
-A previously issued delete can be reconciled by observing absence.
+The current provider proof applies to unversioned objects. A previously issued
+delete can be reconciled by observing absence.
 
 ```sh
 stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --apply \

@@ -151,7 +151,6 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		t.Fatalf("exact held hour not claimable: %v", err)
 	}
 
-	manifest := strings.Repeat("b", 64)
 	exec(`UPDATE nas_stitch_r2_hours SET state='leased',attempt=1,lease_api_key_id=47,lease_token=repeat('e',64),
  lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, id)
 	exec(`INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes)
@@ -187,12 +186,22 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("exact staging grant was refused: %d", response.StatusCode)
 	}
+	if _, err := pool.Exec(ctx, `TRUNCATE r2_retirement_writer_fences`); err == nil || !strings.Contains(err.Error(), "evidence is durable") {
+		t.Fatal("TRUNCATE bypassed the writer fence with a live grant", err)
+	}
 	for i := 0; i < 2; i++ {
 		if err := store.FinishStitchStage(ctx, lease, 123); err != nil {
 			t.Fatalf("initial or resumed multipart completion: %v", err)
 		}
 	}
-	exec(`UPDATE nas_stitch_r2_hours SET state='staged',staged_manifest='{}',staged_manifest_sha256=$2 WHERE id=$1`, id, manifest)
+	result := nasStitchResult{Policy: nasStitchPolicy, PlanSHA: planDigest, Token: lease.Token,
+		Outputs: []nasStitchOutput{{Path: plan.OutputFolder + "/run-000-" + sha + ".mp4", Size: int64(len(media)), SHA: sha,
+			Inputs: []nasStitchInputProof{{ID: 901, SHA: sha, Size: int64(len(media)), RetirementHeld: true}}}}}
+	stagedManifest, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := cleanupSHA(stagedManifest)
 	var copyID int64
 	var key string
 	if err := pool.QueryRow(ctx, `SELECT object_key FROM nas_stitch_r2_stage_objects WHERE id=123`).Scan(&key); err != nil {
@@ -216,23 +225,46 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		t.Fatal(err)
 	}
 
-	// A malformed SQL receipt and its matching outer JSON must not authorize
-	// the certificate trigger directly.
-	tx, err = pool.Begin(ctx)
+	receipt, err := json.Marshal(request.StitchReceipt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',lease_token=NULL,lease_expires_at=NULL,
- completion='downloaded',stitch_receipt='{}',stitch_result_sha256=repeat('a',64) WHERE id=$1`, copyID); err != nil {
-		t.Fatal(err)
+	for _, altered := range []struct {
+		name, payload, etag, version, body string
+		committed                          int64
+	}{
+		{"empty_receipt", "{}", "stage-etag", "", string(stagedManifest), 100},
+		{"wrong_etag", string(receipt), "other-etag", "", string(stagedManifest), 100},
+		{"wrong_version", string(receipt), "stage-etag", "other-version", string(stagedManifest), 100},
+		{"wrong_byte_count", string(receipt), "stage-etag", "", string(stagedManifest), 0},
+		{"empty_manifest", string(receipt), "stage-etag", "", "{}", 100},
+	} {
+		t.Run(altered.name, func(t *testing.T) {
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if _, err := tx.Exec(ctx, `UPDATE nas_stitch_r2_hours
+ SET state='staged',staged_manifest=$3,staged_manifest_sha256=$2 WHERE id=$1`, id, manifest, altered.body); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',lease_token=NULL,lease_expires_at=NULL,
+ completion='downloaded',stitch_receipt=$2,stitch_result_sha256=repeat('a',64),etag=$3,version_id=$4,committed_bytes=$5
+ WHERE id=$1`, copyID, altered.payload, altered.etag, altered.version, altered.committed); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO nas_stitch_r2_certificates(hour_id,connection_id,attempt,plan_sha256,manifest_sha256,receipt)
+ SELECT $1,13,1,$2,$3,jsonb_build_object('objects',jsonb_build_array(jsonb_build_object('object_key',o.object_key,
+  'etag',o.etag,'version_id',o.version_id,'last_modified',o.last_modified,'readback',q.stitch_receipt)))
+ FROM nas_stitch_r2_stage_objects o JOIN nas_r2_copy_items q ON q.source_id=o.id AND q.kind='stitch_output'
+ WHERE o.id=123`, id, planDigest, manifest); err == nil || !strings.Contains(err.Error(), "pulled output coverage") {
+				t.Fatal("altered NAS evidence passed the certificate guard", err)
+			}
+		})
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO nas_stitch_r2_certificates(hour_id,connection_id,attempt,plan_sha256,manifest_sha256,receipt)
- SELECT $1,13,1,$2,$3,jsonb_build_object('objects',jsonb_build_array(jsonb_build_object('object_key',object_key,
-  'etag',etag,'version_id',version_id,'last_modified',last_modified,'readback','{}'::jsonb)))
- FROM nas_stitch_r2_stage_objects WHERE id=123`, id, planDigest, manifest); err == nil || !strings.Contains(err.Error(), "pulled output coverage") {
-		t.Fatal("malformed NAS receipt passed the certificate guard", err)
-	}
-	tx.Rollback(ctx)
+	exec(`UPDATE nas_stitch_r2_hours SET state='staged',staged_manifest=$3,staged_manifest_sha256=$2 WHERE id=$1`,
+		id, manifest, string(stagedManifest))
 
 	s := &Server{pool: pool, r2: store, cfg: config.Config{NASR2CopyEnabled: true}}
 	exec(`UPDATE connections SET client_version=$1 WHERE id=13`, NASR2CopyPagedClientVersion)
@@ -329,6 +361,15 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	}
 	if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, true); err != nil {
 		t.Fatalf("already-confirmed staging retirement could not reconcile: %v", err)
+	}
+	for _, change := range []string{
+		`DELETE FROM nas_stitch_r2_stage_retirements WHERE object_id=123`,
+		`UPDATE nas_stitch_r2_stage_retirements SET object_id=456 WHERE object_id=123`,
+		`UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=NULL WHERE object_id=123`,
+	} {
+		if _, err := pool.Exec(ctx, change); err == nil || !strings.Contains(err.Error(), "one-shot") {
+			t.Fatal("staging retirement reservation history could be erased or reassigned", err)
+		}
 	}
 }
 
