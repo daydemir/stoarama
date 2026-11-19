@@ -19,10 +19,13 @@ import (
 // r2-inverse job (RAW) and job-keep28 run one inverse lane next to the database
 // and bucket, as a provider one-off job. The executor serializes reserves and
 // spends one round trip per statement, so it must not run across a slow home
-// link. The job takes a fresh read-only partition, then runs bounded apply
-// batches. Each batch gets fresh owner-fence evidence and an exact readback of
-// the lane's own tables. A DELETE that lost its response holds only its own
-// key, permanently. Any other failure stops the job; nothing is retried.
+// link. The job takes a fresh read-only partition and stores it as the bucket's
+// reusable one, or with --reuse-partition restores that stored partition while
+// it is fresh and its protection inputs are unchanged. It then runs bounded
+// apply batches. Each batch gets fresh owner-fence evidence and an exact
+// readback of the lane's own tables. A DELETE that lost its response holds
+// only its own key, permanently. Any other failure stops the job; only the
+// confirming HEAD, a read, is retried.
 func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane inverseLane) {
 	f, err := parseInverseJobFlags(args, lane)
 	if err != nil {
@@ -42,21 +45,16 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane
 	if err = os.Mkdir(f.work, 0700); err != nil {
 		log.Fatal(err)
 	}
-	partition := filepath.Join(f.work, "partition")
-	sum, err := writeInversePartition(ctx, cfg, f.picks, partition)
-	if err != nil {
-		log.Fatal(err)
-	}
-	// Bind the approved digest to the bytes the partition actually read; every
-	// apply re-reads the picks file and must match this summary digest.
-	if sum.PicksSHA256 != f.picksSHA {
-		log.Fatal("partition read owner picks other than the approved digest")
-	}
-	printInverseJob(map[string]any{"step": "partition", "summary": sum})
 	store, err := newInverseSDKStore(ctx, archiveR2Config(cfg, pool))
 	if err != nil {
 		log.Fatal(err)
 	}
+	partition := filepath.Join(f.work, "partition")
+	sum, digest, err := inverseJobPartition(ctx, cfg, pool, store, f, partition)
+	if err != nil {
+		log.Fatal(err)
+	}
+	printInverseJob(map[string]any{"step": "partition", "partition_sha256": digest, "reused": f.reuse != "", "summary": sum})
 	o := inverseApplyOptions{Lane: lane, Manifest: filepath.Join(partition, "partition.jsonl"), Summary: filepath.Join(partition, "summary.json"), Picks: f.picks, Ledger: filepath.Join(f.work, "ledger.jsonl"), Workers: f.workers, MaxItems: f.items, MaxBytes: f.maxBytes, Budget24h: f.budget24h}
 	if o.ManifestSHA, err = inverseFileSHA(o.Manifest); err != nil {
 		log.Fatal(err)
@@ -94,13 +92,33 @@ func (t *inverseApplySummary) addBatch(r inverseApplySummary) {
 	t.AmbiguousHeld, t.HeldAbsent, t.LastModifiedHeld = r.AmbiguousHeld, r.HeldAbsent, r.LastModifiedHeld
 }
 
-type inverseJobFlags struct {
-	picks, picksSHA, owner, work string
-	workers, items, batches      int
-	maxBytes, budget24h          int64
+// inverseJobPartition writes and stores a fresh partition, or restores the
+// stored one f.reuse names, and returns its summary and digest.
+func inverseJobPartition(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, store inverseLister, f inverseJobFlags, dir string) (inverseSummary, string, error) {
+	if f.reuse != "" {
+		sum, err := reuseInversePartition(ctx, pool, store, f.picks, f.reuse, dir)
+		return sum, f.reuse, err
+	}
+	sum, err := writeInversePartition(ctx, cfg, f.picks, dir)
+	if err != nil {
+		return sum, "", err
+	}
+	// Bind the approved digest to the bytes the partition actually read; every
+	// apply re-reads the picks file and must match this summary digest.
+	if sum.PicksSHA256 != f.picksSHA {
+		return sum, "", errors.New("partition read owner picks other than the approved digest")
+	}
+	digest, err := storeInversePartition(ctx, pool, dir)
+	return sum, digest, err
 }
 
-const inverseJobUsage = "usage: stoaramactl r2-inverse job|job-keep28 --picks FILE --expected-picks-sha256 HEX --owner-decision FILE --work DIR [--workers N --max-items N --max-bytes N --budget-24h-bytes N --batches N]; job-keep28 requires --max-bytes and --budget-24h-bytes"
+type inverseJobFlags struct {
+	picks, picksSHA, owner, work, reuse string
+	workers, items, batches             int
+	maxBytes, budget24h                 int64
+}
+
+const inverseJobUsage = "usage: stoaramactl r2-inverse job|job-keep28 --picks FILE --expected-picks-sha256 HEX --owner-decision FILE --work DIR [--reuse-partition HEX --workers N --max-items N --max-bytes N --budget-24h-bytes N --batches N]; job-keep28 requires --max-bytes and --budget-24h-bytes"
 
 // parseInverseJobFlags reads job flags; --help prints them with their lane's
 // defaults and exits 0. RAW keeps its large batches and no rolling budget.
@@ -117,6 +135,7 @@ func parseInverseJobFlags(args []string, lane inverseLane) (inverseJobFlags, err
 	fs.StringVar(&f.picksSHA, "expected-picks-sha256", "", "independently approved owner picks digest")
 	fs.StringVar(&f.owner, "owner-decision", "", "owner decision record pinned by the executor")
 	fs.StringVar(&f.work, "work", "", "new working directory")
+	fs.StringVar(&f.reuse, "reuse-partition", "", "partition_sha256 of the stored partition to reuse instead of relisting the bucket")
 	fs.IntVar(&f.workers, "workers", 16, "concurrent keys per batch (1..64, at least two DB connections remain reserved)")
 	fs.IntVar(&f.items, "max-items", items, "maximum new objects per batch")
 	fs.Int64Var(&f.maxBytes, "max-bytes", maxBytes, "maximum new intent bytes per batch (required for job-keep28)")
@@ -127,7 +146,7 @@ func parseInverseJobFlags(args []string, lane inverseLane) (inverseJobFlags, err
 	}
 	budgetSet := false
 	fs.Visit(func(fl *flag.Flag) { budgetSet = budgetSet || fl.Name == "budget-24h-bytes" })
-	if fs.NArg() != 0 || f.picks == "" || !r2RetireLowerHex64(f.picksSHA) || f.owner == "" || f.work == "" || f.workers < 1 || f.workers > 64 || f.items < 1 || f.maxBytes <= 0 || f.budget24h < 0 || f.batches < 1 || (lane == inverseNASKeep28 && !budgetSet) {
+	if fs.NArg() != 0 || f.picks == "" || !r2RetireLowerHex64(f.picksSHA) || f.owner == "" || f.work == "" || (f.reuse != "" && !r2RetireLowerHex64(f.reuse)) || f.workers < 1 || f.workers > 64 || f.items < 1 || f.maxBytes <= 0 || f.budget24h < 0 || f.batches < 1 || (lane == inverseNASKeep28 && !budgetSet) {
 		return f, errors.New(inverseJobUsage)
 	}
 	return f, nil

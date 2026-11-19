@@ -81,7 +81,12 @@ callback or generic R2 delete API is added. Repeated verification cannot remint
 authority. The entire per-key network phase has a 30-second deadline, including
 HEAD, multipart inspection and confirming HEAD; timeout retains the intent for
 reconciliation. There is one DELETE attempt, no SDK replay or redirects. Success requires
-a confirming 404. Receipt and raw purged_at publication happens separately with
+a confirming 404. The confirming HEAD is a read, so it alone retries: up to 4
+attempts in the SDK's standard retry mode, each bounded by its own 4-second
+timeout, with jittered backoff of at most 2 seconds, all inside the key's network
+deadline (and, for keep-28, custody end). Only timeouts, connection errors, 5xx and
+throttling retry. A 200 means the object remains: it fails at once. When every
+attempt fails, the job stops and the key stays held, as a lost response does. Receipt and raw purged_at publication happens separately with
 exclusive admission locks, without upgrading a network transaction's locks.
 
 An existing intent is never retransmitted, including a crash before wire. On
@@ -215,6 +220,39 @@ the B2 tables, as `r2-inverse job` does for B1. Its batches default to the
 100-object canary size, and it refuses to start without explicit `--max-bytes`
 and `--budget-24h-bytes` (0 = unlimited). Both jobs refuse more workers than the
 database pool allows before writing any partition or evidence.
+
+## Job restart
+
+A job's `--work` directory is lost with its one-off Render container. So after
+writing and sealing a fresh partition, `job` and `job-keep28` store it, gzipped,
+as the bucket endpoint's one reusable partition in `r2_inverse_partitions`
+(migration 0226), replacing the previous one, and print its `partition_sha256` in
+the `partition` step. It lives in PostgreSQL, not R2: under the writer fence every
+new R2 write is refused, and an ungated operator PUT would break the drain the
+executor relies on.
+
+To restart without relisting the bucket, pass that digest as
+`--reuse-partition HEX`. The job then restores the stored partition into its new
+`--work` directory and stops unless all of these hold:
+
+- the restored `partition.jsonl` has exactly that digest;
+- its summary names the same bucket, endpoint, Keep-28 policy and approved picks;
+- it is fresh by the same 24-hour rule every batch applies ("partition is stale
+  or future-dated", by database time);
+- its classification inputs are unchanged. The summary's `protection_sha256`
+  digests the KE epoch and the exact owner keep prefixes, KE folders, live hold
+  set, delivery holds and joined releases, read with the partition's own SQL. The
+  job reads them again and requires an equal digest.
+
+That check is sufficient because those sets are every classification input
+besides the pinned picks and policy and the catalog rows, and the KE epoch
+advances on every catalog identity change KE path discovery reads. Identity
+fields the epoch does not version (clip span, timezone) only affect their own
+key, and each candidate's identity is reloaded and reclassified under lock at
+reserve and again at the wire. The reused partition only proposes candidates:
+reserve's database checks, live holds, custody and the wire HEAD identity check
+still run for every key, so a key held after the reuse check is still refused.
+On any refusal, run the job without `--reuse-partition` to take a fresh partition.
 
 Deniz's November 17 order to delete group 3 that is on the NAS supersedes the
 stitch-proof prerequisite **only for this keep28 RAW lane**. This new command

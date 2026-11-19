@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -57,7 +58,24 @@ type inverseProtection struct {
 	KEFolders      map[string]bool
 	Windows        map[int64]api.Keep28Window
 	Picks          r2RetirePicks
+	// KEEpoch versions catalog identity: it advances on every change to the
+	// raw and collated identities KE path discovery reads.
+	KEEpoch int64
 }
+
+// holdsSHA256 digests every classification input outside the catalog rows and
+// the picks and policy the summary pins: the KE epoch, which versions those
+// rows, and the exact owner keep, KE folder, hold, delivery and joined release
+// sets. Equal digests mean those inputs are unchanged.
+func (p inverseProtection) holdsSHA256() (string, error) {
+	data, err := json.Marshal([]any{p.KEEpoch, p.OwnerKeepPrefixes, p.KEFolders, p.Held, p.Delivery, p.JoinedReleased})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
 type inverseEntry struct {
 	r2.ObjectInfo
 	Class  inverseClass `json:"class"`
@@ -76,6 +94,25 @@ type inverseSummary struct {
 	LastModifiedExcluded r2RetireStat                  `json:"last_modified_excluded"`
 	Classes              map[inverseClass]r2RetireStat `json:"classes"`
 	ReadOnly             bool                          `json:"read_only"`
+	// ProtectionSHA256 is the classification's holdsSHA256, so a restart can
+	// prove those inputs unchanged before it reuses this partition.
+	ProtectionSHA256 string `json:"protection_sha256"`
+}
+
+// matches requires a partition of this bucket endpoint, policy and picks.
+func (s inverseSummary) matches(store inverseLister, policy, picks string) error {
+	if s.Version != 1 || s.Bucket != store.Bucket() || s.EndpointSHA256 != store.EndpointSHA256() || s.PolicySHA256 != policy || s.PicksSHA256 != picks || !s.ReadOnly {
+		return errors.New("partition metadata differs")
+	}
+	return nil
+}
+
+// fresh requires a partition at most 24h old by the database clock now.
+func (s inverseSummary) fresh(now time.Time) error {
+	if now.Sub(s.CreatedAt) > 24*time.Hour || s.CreatedAt.After(now) {
+		return errors.New("partition is stale or future-dated")
+	}
+	return nil
 }
 
 // A path alias of any KE stream remains protected even when its catalog row
@@ -215,8 +252,13 @@ UNION SELECT object_key FROM delivery_outputs
 UNION SELECT c.object_key FROM delivery_outputs o CROSS JOIN LATERAL unnest(o.source_clip_ids) source_id
  JOIN recording_clips c ON c.id=source_id WHERE c.bucket=$1`
 
+// loadInverseProtection loads the full catalog identities on top of
+// loadInverseHolds.
 func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks, windows map[int64]api.Keep28Window) (inverseProtection, error) {
-	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, JoinedReleased: map[string]bool{}, KEFolders: map[string]bool{}, Windows: windows, Picks: picks}
+	p, err := loadInverseHolds(ctx, q, bucket, picks, windows)
+	if err != nil {
+		return p, err
+	}
 	rows, err := q.Query(ctx, inverseCatalogSQL, bucket)
 	if err != nil {
 		return p, err
@@ -236,11 +278,18 @@ func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string
 	}
 	err = rows.Err()
 	rows.Close()
+	return p, err
+}
+
+// loadInverseHolds loads every classification input except the catalog rows,
+// which the KE epoch versions. It is cheap next to the catalog and listing.
+func loadInverseHolds(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks, windows map[int64]api.Keep28Window) (inverseProtection, error) {
+	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, JoinedReleased: map[string]bool{}, Windows: windows, Picks: picks}
+	err := q.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch`).Scan(&p.KEEpoch)
 	if err != nil {
 		return p, err
 	}
-	p.KEFolders, err = loadInverseKEFolders(ctx, q, bucket, picks)
-	if err != nil {
+	if p.KEFolders, err = loadInverseKEFolders(ctx, q, bucket, picks); err != nil {
 		return p, err
 	}
 	if p.OwnerKeepPrefixes, err = loadInverseOwnerKeepPrefixes(ctx, q, bucket); err != nil {
@@ -250,7 +299,7 @@ func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string
 		sql  string
 		keys map[string]bool
 	}{{inverseHeldSQL, p.Held}, {inverseDeliverySQL, p.Delivery}, {inverseJoinedReleasedSQL, p.JoinedReleased}} {
-		rows, err = q.Query(ctx, set.sql, bucket)
+		rows, err := q.Query(ctx, set.sql, bucket)
 		if err != nil {
 			return p, err
 		}
@@ -286,13 +335,17 @@ func partitionInverse(ctx context.Context, store inverseLister, p inverseProtect
 	for _, class := range inverseClasses {
 		sum.Classes[class] = r2RetireStat{}
 	}
+	var err error
+	if sum.ProtectionSHA256, err = p.holdsSHA256(); err != nil {
+		return sum, err
+	}
 	encoder := json.NewEncoder(out)
 	// R2 can return a key after its descendants (X.json.sig before X.json).
 	// Track identity independently of order, without retaining every key string.
 	// A 128-bit SHA-256 prefix collision also fails closed, never drops an entry.
 	seen := map[[16]byte]struct{}{}
 	previous := ""
-	err := store.ListPrefix(ctx, "", 0, func(o r2.ObjectInfo) error {
+	err = store.ListPrefix(ctx, "", 0, func(o r2.ObjectInfo) error {
 		digest := sha256.Sum256([]byte(o.Key))
 		identity := [16]byte(digest[:16])
 		_, duplicate := seen[identity]

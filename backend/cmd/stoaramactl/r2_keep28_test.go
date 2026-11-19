@@ -1315,6 +1315,12 @@ func TestKeep28JobCLIDispatchAndLimits(t *testing.T) {
 	if err != nil || raw.items != 5000 || raw.maxBytes != 1<<40 || raw.budget24h != 0 {
 		t.Fatalf("RAW job defaults changed: %+v %v", raw, err)
 	}
+	for reuse, ok := range map[string]bool{strings.Repeat("b", 64): true, "B" + strings.Repeat("b", 63): false, "bb": false} {
+		f, err := parseInverseJobFlags([]string{"--picks", "p", "--expected-picks-sha256", strings.Repeat("a", 64), "--owner-decision", "o", "--work", "w", "--reuse-partition", reuse}, inverseOutsideKeep28)
+		if (err == nil) != ok || ok && f.reuse != reuse {
+			t.Fatalf("--reuse-partition %q: %+v %v", reuse, f, err)
+		}
+	}
 	dir := t.TempDir()
 	picks := filepath.Join(dir, "picks.json")
 	if err = os.WriteFile(picks, []byte(`{"choices":{}}`), 0600); err != nil {

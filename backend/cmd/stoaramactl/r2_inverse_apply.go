@@ -34,7 +34,22 @@ type inverseReader interface {
 type inverseDeleteStore interface {
 	inverseReader
 	deleteOnce(context.Context, *inverseDeleteAuthority) error
+	// confirmAbsent HEADs a key after its answered DELETE; nil only on 404.
+	confirmAbsent(context.Context, string) error
 }
+
+// inverseAbsence reads a confirming HEAD's outcome: only a 404 confirms the
+// DELETE, and an object that answers is still there.
+func inverseAbsence(err error) error {
+	switch {
+	case r2.IsNotFound(err):
+		return nil
+	case err == nil:
+		return errors.New("object remains after DELETE")
+	}
+	return err
+}
+
 type inverseDrainEvidence struct {
 	Proof                  inverseDrainProof           `json:"proof"`
 	Bucket                 string                      `json:"bucket"`
@@ -161,10 +176,7 @@ func (a *inverseApplier) checkEvidence(ctx context.Context, q r2RetireQuerier) e
 	if err = e.validateProof(a.opts); err != nil {
 		return err
 	}
-	if now.Sub(a.summary.CreatedAt) > 24*time.Hour || a.summary.CreatedAt.After(now) {
-		return errors.New("partition is stale or future-dated")
-	}
-	return nil
+	return a.summary.fresh(now)
 }
 func inverseProtectionBarrier(ctx context.Context, tx pgx.Tx) error {
 	// First lock: a waiting B1 transaction owns nothing a legacy mutator needs.
@@ -491,11 +503,7 @@ func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGat
 		return false, err
 	}
 	defer stop()
-
-	if _, err = a.store.Head(ctx, e.Key); !r2.IsNotFound(err) {
-		if err == nil {
-			err = errors.New("object remains after DELETE")
-		}
+	if err = a.store.(inverseDeleteStore).confirmAbsent(ctx, e.Key); err != nil {
 		return false, err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -643,8 +651,8 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	if err != nil {
 		return result, err
 	}
-	if summary.Version != 1 || summary.Bucket != store.Bucket() || summary.EndpointSHA256 != store.EndpointSHA256() || summary.PolicySHA256 != policy || summary.PicksSHA256 != picks.SHA256 || !summary.ReadOnly {
-		return result, errors.New("partition metadata differs")
+	if err = summary.matches(store, policy, picks.SHA256); err != nil {
+		return result, err
 	}
 	lock, err := pool.Acquire(ctx)
 	if err != nil {

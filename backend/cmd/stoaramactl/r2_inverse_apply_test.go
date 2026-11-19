@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/smithy-go"
 	"github.com/daydemir/stoarama/backend/internal/api"
 	"github.com/daydemir/stoarama/backend/internal/db"
@@ -44,8 +45,11 @@ type inverseFakeStore struct {
 	// onDelete runs on the server for every DELETE before it answers, and
 	// onAnswered after the answer (or the dropped connection) is sent.
 	onDelete, onAnswered func(string)
-	beforeHead           func(context.Context, string) error
-	beforeDelete         func(string) error
+	// onHead picks how the loopback server answers a HEAD: "slow" never
+	// answers in time, "503" fails it, anything else answers normally.
+	onHead       func(string) string
+	beforeHead   func(context.Context, string) error
+	beforeDelete func(string) error
 	// headWithoutSHA omits the optional SHA-256 metadata from loopback HEADs.
 	headWithoutSHA bool
 }
@@ -82,6 +86,10 @@ func (s *inverseFakeStore) Head(ctx context.Context, key string) (r2.ObjectHead,
 	}
 	// Like R2, HEAD reports Last-Modified as an HTTP date in whole seconds.
 	return r2.ObjectHead{ETag: o.ETag, SizeBytes: o.SizeBytes, LastModified: o.LastModified.Truncate(time.Second)}, nil
+}
+func (s *inverseFakeStore) confirmAbsent(ctx context.Context, key string) error {
+	_, err := s.Head(ctx, key)
+	return inverseAbsence(err)
 }
 func (s *inverseFakeStore) deleteOnce(ctx context.Context, authority *inverseDeleteAuthority) error {
 	key := authority.binding.Key
@@ -1540,6 +1548,163 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			}
 		}
 	})
+	t.Run("restart_reuses_only_a_fresh_unchanged_partition", func(t *testing.T) {
+		// seal stores build(n)'s partition as the job does, with the holds
+		// digest read now in its summary.
+		seal := func(n int, created time.Time) (inverseApplyOptions, []inverseEntry) {
+			t.Helper()
+			a, entries := build(n)
+			a.ledger.close()
+			p, err := loadInverseHolds(ctx, pool, "stoarama", picks, windows)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a.summary.CreatedAt = created
+			if a.summary.ProtectionSHA256, err = p.holdsSHA256(); err != nil {
+				t.Fatal(err)
+			}
+			data, _ := json.Marshal(a.summary)
+			if err = os.WriteFile(a.opts.Summary, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if a.opts.SummarySHA, err = inverseFileSHA(a.opts.Summary); err != nil {
+				t.Fatal(err)
+			}
+			digest, err := storeInversePartition(ctx, pool, filepath.Dir(a.opts.Manifest))
+			if err != nil || digest != a.opts.ManifestSHA {
+				t.Fatal("stored", digest, err)
+			}
+			return a.opts, entries
+		}
+		reuse := func(digest string) (string, error) {
+			dir := filepath.Join(t.TempDir(), "partition")
+			_, err := reuseInversePartition(ctx, pool, store, picksPath, digest, dir)
+			return dir, err
+		}
+		t.Run("fresh_unchanged_reuse_still_meets_the_live_gate", func(t *testing.T) {
+			o, entries := seal(2, time.Now().UTC())
+			dir, err := reuse(o.ManifestSHA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			o.Manifest, o.Summary = filepath.Join(dir, "partition.jsonl"), filepath.Join(dir, "summary.json")
+			if got, _ := inverseFileSHA(o.Summary); got != o.SummarySHA {
+				t.Fatal("restored summary differs")
+			}
+			// A hold that arrives after the reuse check is still a live veto.
+			held := entries[1].Key
+			exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`, held)
+			o.Workers = 1
+			before := providerDeletes()
+			result, err := applyInverse(ctx, pool, sdk, o)
+			store.mu.Lock()
+			_, present := store.objects[held]
+			store.mu.Unlock()
+			if err == nil || !strings.Contains(err.Error(), "live key protection veto") || result.Deleted != 1 || providerDeletes()-before != 1 || !present {
+				t.Fatalf("reused run %+v %v, held key present %v", result, err, present)
+			}
+		})
+		t.Run("digest_mismatch", func(t *testing.T) {
+			o, _ := seal(1, time.Now().UTC())
+			if _, err := reuse(strings.Repeat("0", 64)); err == nil {
+				t.Fatal("reused an unknown digest")
+			}
+			exec(`UPDATE r2_inverse_partitions SET partition_sha256=repeat('f',64) WHERE partition_sha256=$1`, o.ManifestSHA)
+			if _, err := reuse(strings.Repeat("f", 64)); err == nil || !strings.Contains(err.Error(), "differs from its digest") {
+				t.Fatal("reused a partition other than its digest", err)
+			}
+		})
+		t.Run("stale", func(t *testing.T) {
+			o, _ := seal(1, time.Now().UTC().Add(-25*time.Hour))
+			if _, err := reuse(o.ManifestSHA); err == nil || !strings.Contains(err.Error(), "stale") {
+				t.Fatal("reused a stale partition", err)
+			}
+		})
+		for name, change := range map[string]string{
+			"KE_epoch":      `UPDATE r2_inverse_ke_epoch SET epoch=epoch+1`,
+			"owner_keep":    `INSERT INTO r2_owner_keep_prefixes(bucket,prefix,decision) VALUES('stoarama','reuse-test/','test')`,
+			"delivery_hold": `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama','unrelated/reuse.mp4','hold',100,'metadata')`,
+		} {
+			t.Run("changed_"+name, func(t *testing.T) {
+				o, _ := seal(1, time.Now().UTC())
+				exec(change)
+				if _, err := reuse(o.ManifestSHA); err == nil || !strings.Contains(err.Error(), "protection inputs changed") {
+					t.Fatal("reused after a protection change", err)
+				}
+			})
+		}
+	})
+	t.Run("confirming_HEAD_retries_transient_reads_only", func(t *testing.T) {
+		sdk.confirm = awshttp.NewBuildableClient().WithTimeout(200 * time.Millisecond)
+		defer func() { sdk.confirm = awshttp.NewBuildableClient().WithTimeout(inverseConfirmAttemptTimeout) }()
+		for _, c := range []struct {
+			name  string
+			wire  string
+			heads []string
+			err   string
+		}{
+			{"timeouts_then_404", "", []string{"slow", "slow"}, ""},
+			{"5xx_then_404", "", []string{"503"}, ""},
+			{"persistent_timeouts_hold_the_key", "", slices.Repeat([]string{"slow"}, inverseConfirmAttempts), "confirming head"},
+			{"object_remains_is_never_retried", "kept", nil, "object remains after DELETE"},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				// A confirmed key lets the batch go on to the next one.
+				n := 1
+				if c.err == "" {
+					n = 2
+				}
+				a, entries := build(n)
+				a.ledger.close()
+				e := entries[0]
+				var sent atomic.Bool
+				var heads atomic.Int64
+				store.mu.Lock()
+				store.wire = map[string]string{e.Key: c.wire}
+				store.onDelete = func(key string) { sent.Store(sent.Load() || key == e.Key) }
+				store.onHead = func(key string) string {
+					if key != e.Key || !sent.Load() {
+						return ""
+					}
+					if n := int(heads.Add(1)); n <= len(c.heads) {
+						return c.heads[n-1]
+					}
+					return ""
+				}
+				store.mu.Unlock()
+				defer func() {
+					store.mu.Lock()
+					store.wire, store.onDelete, store.onHead = nil, nil, nil
+					store.mu.Unlock()
+				}()
+				before := providerDeletes()
+				result, err := applyInverse(ctx, pool, sdk, a.opts)
+				if providerDeletes()-before != int64(n) {
+					t.Fatal("DELETEs sent", providerDeletes()-before, "for keys", n)
+				}
+				if want := int64(len(c.heads) + 1); c.err == "" && (err != nil || result.Deleted != 2 || heads.Load() != want) {
+					t.Fatalf("confirmed %+v %v after %d HEADs, want %d", result, err, heads.Load(), want)
+				}
+				if c.err == "" {
+					return
+				}
+				if err == nil || !strings.Contains(err.Error(), c.err) || result.Deleted != 0 || heads.Load() != int64(max(len(c.heads), 1)) {
+					t.Fatalf("unconfirmed %+v %v after %d HEADs", result, err, heads.Load())
+				}
+				var held bool
+				if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_attempts WHERE bucket='stoarama' AND object_key=$1) AND NOT EXISTS(SELECT 1 FROM r2_inverse_events WHERE bucket='stoarama' AND object_key=$1)`, e.Key).Scan(&held); err != nil || !held {
+					t.Fatal("unconfirmed key not held", held, err)
+				}
+				if c.wire != "" {
+					return
+				}
+				result, err = applyInverse(ctx, pool, sdk, a.opts)
+				if err != nil || !slices.Contains(result.HeldAbsent, e.Key) || providerDeletes()-before != 1 {
+					t.Fatalf("restart %+v %v", result, err)
+				}
+			})
+		}
+	})
 	t.Run("worker_pool_rate_with_durable_DB_and_ledger", func(t *testing.T) {
 		a, _ := build(1024)
 		a.ledger.close()
@@ -1635,6 +1800,19 @@ func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*inverseSDKStor
 				w.WriteHeader(204)
 			}
 			return
+		}
+		store.mu.Lock()
+		onHead := store.onHead
+		store.mu.Unlock()
+		if req.Method == http.MethodHead && onHead != nil {
+			switch onHead(key) {
+			case "slow":
+				<-req.Context().Done()
+				return
+			case "503":
+				w.WriteHeader(503)
+				return
+			}
 		}
 		store.mu.Lock()
 		defer store.mu.Unlock()
