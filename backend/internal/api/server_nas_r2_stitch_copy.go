@@ -12,11 +12,27 @@ import (
 )
 
 type nasR2StitchReceipt struct {
-	RelativePath string   `json:"relative_path"`
-	SHA          string   `json:"sha256"`
-	Bytes        int64    `json:"size_bytes"`
-	Identity     [5]int64 `json:"identity"`
-	Fsynced      bool     `json:"fsynced"`
+	RelativePath string                  `json:"relative_path"`
+	SHA          string                  `json:"sha256"`
+	Bytes        int64                   `json:"size_bytes"`
+	Identity     nasR2StitchFileIdentity `json:"identity"`
+	Fsynced      bool                    `json:"fsynced"`
+}
+
+type nasR2StitchFileIdentity [5]int64
+
+func (identity *nasR2StitchFileIdentity) UnmarshalJSON(data []byte) error {
+	var fields []*int64
+	if err := json.Unmarshal(data, &fields); err != nil || len(fields) != len(identity) {
+		return errors.New("stitch receipt identity requires five integers")
+	}
+	for i, field := range fields {
+		if field == nil {
+			return errors.New("stitch receipt identity requires five integers")
+		}
+		identity[i] = *field
+	}
+	return nil
 }
 
 type nasR2StitchObject struct {

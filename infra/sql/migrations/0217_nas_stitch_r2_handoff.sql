@@ -52,8 +52,8 @@ LANGUAGE sql STABLE AS $$
    AND (SELECT count(*) FROM recording_clips c WHERE c.recording_id=h.recording_id
     AND c.clip_start_at>=h.hour_at AND c.clip_start_at<h.hour_at+interval '1 hour')
      = jsonb_array_length(h.plan->'clips')
-   AND (SELECT count(DISTINCT p->'source_id') FROM jsonb_array_elements(h.plan->'clips') p)
-     = jsonb_array_length(h.plan->'clips')
+   AND (SELECT count(DISTINCT (p->>'source_id')::bigint) FROM jsonb_array_elements(h.plan->'clips') p
+    WHERE jsonb_typeof(p->'source_id')='number')=jsonb_array_length(h.plan->'clips')
    AND EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds i WHERE i.hour_id=h.id AND i.released_at IS NULL
     HAVING count(*)=jsonb_array_length(h.plan->'clips') AND sum(i.size_bytes)=h.input_bytes)
    AND NOT EXISTS(
@@ -228,6 +228,9 @@ CREATE TRIGGER nas_stitch_r2_stage_guard BEFORE INSERT OR UPDATE OR DELETE ON na
 
 CREATE FUNCTION guard_r2_stitch_fence_transition() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'R2 stitch fence transition requires READ COMMITTED' USING ERRCODE='55000';
+ END IF;
  IF NOT pg_try_advisory_xact_lock(7343226011187)
   OR EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects
    WHERE state IN ('starting','uploading','completing') OR grants_drain_at>=clock_timestamp())
@@ -336,7 +339,7 @@ RETURNS jsonb LANGUAGE sql STABLE AS $$
 $$;
 
 CREATE FUNCTION add_nas_stitch_r2_certificate() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE expected jsonb;
+DECLARE expected jsonb; locked_pairs bigint;
 BEGIN
  IF current_setting('transaction_isolation')<>'read committed' THEN
   RAISE EXCEPTION 'NAS stitch certification requires READ COMMITTED' USING ERRCODE='55000';
@@ -347,6 +350,11 @@ BEGIN
   JOIN recording_clips c ON c.id=i.catalog_clip_id
   JOIN nas_inventory_files f ON f.connection_id=13 AND f.clip_id=c.id
   WHERE i.hour_id=NEW.hour_id AND i.released_at IS NULL ORDER BY c.id FOR SHARE OF c,f;
+ GET DIAGNOSTICS locked_pairs=ROW_COUNT;
+ IF locked_pairs<>(SELECT count(*) FROM nas_stitch_r2_input_holds i
+  WHERE i.hour_id=NEW.hour_id AND i.released_at IS NULL) THEN
+  RAISE EXCEPTION 'NAS stitch input custody pairs could not be locked';
+ END IF;
  IF NOT nas_stitch_r2_has_exact_input_set(NEW.hour_id) THEN
   RAISE EXCEPTION 'NAS stitch input coverage changed';
  END IF;
@@ -445,7 +453,7 @@ CREATE TRIGGER nas_stitch_stage_collated_dependency
  BEFORE INSERT OR UPDATE OF object_key,nas_relative_path,sha256,size_bytes ON recording_collation_outputs
  FOR EACH ROW EXECUTE FUNCTION guard_nas_stitch_r2_stage_dependency();
 CREATE TRIGGER nas_stitch_stage_raw_dependency
- BEFORE INSERT OR UPDATE OF bucket,object_key,display_path,sha256,size_bytes ON recording_clips
+ AFTER INSERT OR UPDATE OF bucket,object_key,display_path,storage_destination_id ON recording_clips
  FOR EACH ROW EXECUTE FUNCTION guard_nas_stitch_r2_stage_dependency();
 
 DO $$ DECLARE t text; BEGIN

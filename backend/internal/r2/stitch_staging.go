@@ -303,7 +303,7 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 		return errors.New("R2 retirement lane busy")
 	}
 	defer conn.Exec(context.Background(), `SELECT pg_advisory_unlock(7343226011173)`)
-	tx, err := conn.Begin(ctx)
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return err
 	}

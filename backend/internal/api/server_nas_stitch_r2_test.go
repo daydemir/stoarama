@@ -256,6 +256,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		{"empty_manifest", string(receipt), "stage-etag", "", "{}", 100},
 		{"duplicate_disposition", string(receipt), "stage-etag", "", string(duplicateInputs), 100},
 		{"duplicate_plan", string(receipt), "stage-etag", "", string(duplicateInputs), 100},
+		{"mixed_type_duplicate", string(receipt), "stage-etag", "", string(duplicateInputs), 100},
 	} {
 		t.Run(altered.name, func(t *testing.T) {
 			tx, err := pool.Begin(ctx)
@@ -264,12 +265,13 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 			}
 			defer tx.Rollback(ctx)
 			wantError := "pulled output coverage"
-			if altered.name == "duplicate_plan" {
+			if altered.name == "duplicate_plan" || altered.name == "mixed_type_duplicate" {
 				if _, err := tx.Exec(ctx, `ALTER TABLE nas_stitch_r2_hours DISABLE TRIGGER nas_stitch_r2_hour_plan_immutable`); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := tx.Exec(ctx, `UPDATE nas_stitch_r2_hours SET plan=jsonb_set(plan,'{clips,1}',plan->'clips'->0)
- WHERE id=$1`, id); err != nil {
+				if _, err := tx.Exec(ctx, `UPDATE nas_stitch_r2_hours SET plan=jsonb_set(plan,'{clips,1}',
+ CASE WHEN $2::boolean THEN jsonb_set(plan->'clips'->0,'{source_id}',to_jsonb(plan->'clips'->0->>'source_id'))
+ ELSE plan->'clips'->0 END) WHERE id=$1`, id, altered.name == "mixed_type_duplicate"); err != nil {
 					t.Fatal(err)
 				}
 				wantError = "input coverage changed"
@@ -360,6 +362,38 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		t.Fatal("changed input coverage no longer blocks reservation")
 	}
 	exec(`UPDATE recording_clips SET clip_end_at=$1 WHERE id=901`, end)
+
+	exec(`DELETE FROM nas_inventory_files WHERE connection_id=13 AND clip_id=902`)
+	lockClip, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockClip.Rollback(ctx)
+	var lockPID int32
+	if err := lockClip.QueryRow(ctx, `SELECT pg_backend_pid() FROM recording_clips WHERE id=901 FOR UPDATE`).Scan(&lockPID); err != nil {
+		t.Fatal(err)
+	}
+	posted := make(chan int, 1)
+	go func() { posted <- post(47, request) }()
+	for deadline := time.Now().Add(time.Second); ; {
+		var waiting bool
+		err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))`, lockPID).Scan(&waiting)
+		if err != nil || time.Now().After(deadline) {
+			t.Fatalf("certificate did not wait at its inventory pair lock: %v", err)
+		}
+		if waiting {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at)
+ VALUES(13,902,30,'fixture/raw2.mp4',100,$1,'present',now(),now())`, sha)
+	if err := lockClip.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-posted; got != http.StatusConflict {
+		t.Fatalf("certificate accepted an inventory row inserted after its lock snapshot: %d", got)
+	}
 	if got := post(47, request); got != http.StatusOK {
 		t.Fatalf("connection 13 certificate rejected: %d", got)
 	}
@@ -401,16 +435,34 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	exec(`ALTER TABLE nas_r2_copy_items DISABLE TRIGGER nas_r2_stitch_copy_evidence_guard;
  UPDATE nas_r2_copy_items SET stitch_read_grants_until=clock_timestamp()-interval '1 second' WHERE kind='stitch_output';
  ALTER TABLE nas_r2_copy_items ENABLE TRIGGER nas_r2_stitch_copy_evidence_guard;`)
+	staleFence, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer staleFence.Rollback(ctx)
+	var initialIntents int
+	if err := staleFence.QueryRow(ctx, `SELECT count(*) FROM nas_stitch_r2_stage_retirements`).Scan(&initialIntents); err != nil ||
+		initialIntents != 0 {
+		t.Fatal("could not establish an old snapshot before staging DELETE", err)
+	}
 	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil ||
 		!strings.Contains(err.Error(), "outcome unconfirmed") {
 		t.Fatalf("expected the provider to lose the DELETE result after both grants drained: %v", err)
 	}
+	if _, err := staleFence.Exec(ctx, `DELETE FROM r2_retirement_writer_fences`); err == nil || !strings.Contains(err.Error(), "READ COMMITTED") {
+		t.Fatal("stale transaction snapshot removed the writer fence", err)
+	}
+	staleFence.Rollback(ctx)
 	if _, err := pool.Exec(ctx, `DELETE FROM r2_retirement_writer_fences`); err == nil || !strings.Contains(err.Error(), "have not drained") {
 		t.Fatal("unresolved staging delete allowed writer fence removal", err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind)
  VALUES('stoarama',$1,'stage-etag',100,'metadata')`, key); err == nil || !strings.Contains(err.Error(), "protects dependency admission") {
 		t.Fatal("unresolved staging delete allowed a conflicting delivery hold", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_clips SET object_key=$1,display_path='' WHERE id=901`, item.RelativePath); err == nil ||
+		!strings.Contains(err.Error(), "protects dependency admission") {
+		t.Fatal("derived raw path bypassed unresolved stage dependency", err)
 	}
 	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil ||
 		!strings.Contains(err.Error(), "reconciliation") {
@@ -485,4 +537,22 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha string) *httptest.S
 			w.WriteHeader(http.StatusBadRequest)
 		}
 	}))
+}
+
+func TestNASR2StitchReceiptIdentityRejectsJSONNormalization(t *testing.T) {
+	for _, data := range []string{
+		`[100,1,2,3]`, `[100,1,2,3,0,9]`, `[100,1,2,3,null]`, `[100,1.0,2,3,0]`, `[100,"1",2,3,0]`, `null`,
+	} {
+		var receipt nasR2StitchReceipt
+		if err := json.Unmarshal([]byte(`{"identity":`+data+`}`), &receipt); err == nil {
+			t.Fatalf("accepted non-exact NAS file identity %s", data)
+		}
+	}
+	var receipt nasR2StitchReceipt
+	if err := json.Unmarshal([]byte(`{"identity":[100,1,2,3,0]}`), &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Identity != [5]int64{100, 1, 2, 3, 0} {
+		t.Fatal("exact receipt identity did not round-trip")
+	}
 }
