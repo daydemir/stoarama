@@ -660,8 +660,8 @@ func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer blocker.Rollback(ctx)
 	if _, err := blocker.Exec(ctx, `SELECT id FROM recording_qualification_runs WHERE id=$1 FOR UPDATE`, runID); err != nil {
-		_ = blocker.Rollback(ctx)
 		t.Fatal(err)
 	}
 	applyResult := make(chan struct {
@@ -676,14 +676,16 @@ func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
 		}{recorder, resultPlan}
 	}()
 	waitJoinedDatabaseCondition(t, pool, `SELECT EXISTS(SELECT 1 FROM pg_locks
-		WHERE locktype='advisory' AND classid=137 AND objid=1 AND granted)`)
+		WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database())
+		AND locktype='advisory' AND classid=137 AND objid=1 AND objsubid=2 AND mode='ExclusiveLock' AND granted)`)
 	purgeResult := make(chan error, 1)
 	go func() {
 		_, purgeErr := pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=$1`, clipID)
 		purgeResult <- purgeErr
 	}()
 	waitJoinedDatabaseCondition(t, pool, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity
-		WHERE pid<>pg_backend_pid() AND wait_event_type='Lock' AND query LIKE 'UPDATE recording_clips SET purged_at=now()%')`)
+		WHERE datname=current_database() AND pid<>pg_backend_pid() AND wait_event_type='Lock'
+		AND query LIKE 'UPDATE recording_clips SET purged_at=now()%')`)
 	if err := blocker.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
