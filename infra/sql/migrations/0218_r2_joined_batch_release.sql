@@ -89,9 +89,14 @@ $$;
 -- A new operator retention hold serializes with R2 retirement: it takes the
 -- protection locks that reservations hold exclusively and the RAW wire holds
 -- shared, then refuses an hour whose source already has an unresolved RAW
--- intent, since that DELETE may already be on the wire.
+-- intent, since that DELETE may already be on the wire. Moving a hold to
+-- another hour is admitted the same way for its destination hour.
 CREATE FUNCTION guard_r2_joined_retention_hold_admission() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+ -- The check below must see what committed before the locks were granted.
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'joined retention hold admission requires READ COMMITTED';
+ END IF;
  PERFORM pg_advisory_xact_lock(7343226011103);
  PERFORM pg_advisory_xact_lock(7343226011101);
  IF EXISTS(SELECT 1 FROM recording_joined_sources src JOIN r2_inverse_intents i ON i.source_id=src.clip_id
@@ -101,7 +106,7 @@ BEGIN
  END IF;
  RETURN NEW;
 END $$;
-CREATE TRIGGER r2_joined_retention_hold_admission BEFORE INSERT ON recording_joined_source_retention_holds
+CREATE TRIGGER r2_joined_retention_hold_admission BEFORE INSERT OR UPDATE OF hour_record_id ON recording_joined_source_retention_holds
  FOR EACH ROW EXECUTE FUNCTION guard_r2_joined_retention_hold_admission();
 ALTER TABLE recording_joined_source_retention_holds ENABLE ALWAYS TRIGGER r2_joined_retention_hold_admission;
 

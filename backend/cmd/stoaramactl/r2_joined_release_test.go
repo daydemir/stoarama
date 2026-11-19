@@ -208,6 +208,20 @@ func TestR2JoinedBatchRelease(t *testing.T) {
 	if _, err = pool.Exec(ctx, `INSERT INTO recording_joined_source_retention_holds(hour_record_id,reason_code) VALUES(901,'late_hold')`); err == nil || !strings.Contains(err.Error(), "already issued") {
 		t.Fatalf("late retention hold over an issued retirement: %v", err)
 	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_joined_source_retention_holds SET hour_record_id=901 WHERE hour_record_id=900`); err == nil || !strings.Contains(err.Error(), "already issued") {
+		t.Fatalf("moved retention hold over an issued retirement: %v", err)
+	}
+	rr, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = rr.Exec(ctx, `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = rr.Exec(ctx, `INSERT INTO recording_joined_source_retention_holds(hour_record_id,reason_code) VALUES(900,'rr_hold')`); err == nil || !strings.Contains(err.Error(), "READ COMMITTED") {
+		t.Fatalf("repeatable-read retention hold: %v", err)
+	}
+	rr.Rollback(ctx)
 	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=1`); err != nil {
 		t.Fatalf("RAW purge of a released source refused: %v", err)
 	}
