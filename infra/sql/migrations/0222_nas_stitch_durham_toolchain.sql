@@ -40,6 +40,13 @@ CREATE TRIGGER nas_stitch_r2_native_lease_guard BEFORE UPDATE OF attempt,lease_t
 
 CREATE FUNCTION guard_nas_stitch_r2_native_stage() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+ -- Preserve a provider response for a write whose issuance committed before
+ -- the upgrade. Recording its upload ID or object identity grants no new write.
+ IF TG_OP='UPDATE' AND NEW.grants_drain_at IS NOT DISTINCT FROM OLD.grants_drain_at AND
+  ((OLD.state='starting' AND OLD.start_issued_at IS NOT NULL AND NEW.state='uploading') OR
+   (OLD.state='completing' AND NEW.state='staged')) THEN
+  RETURN NEW;
+ END IF;
  PERFORM 1 FROM nas_stitch_r2_hours h WHERE h.id=NEW.hour_id AND h.attempt=NEW.attempt
   AND nas_stitch_r2_native_attempt(h) FOR SHARE;
  IF NOT FOUND THEN
@@ -68,6 +75,25 @@ LANGUAGE sql STABLE AS $$
    AND nas_stitch_r2_native_proof(h)
  );
 $$;
+
+-- Keep preserved legacy queue entries out of the predecessor's priority
+-- scan as well. Leave receipts and read-grant drain evidence intact.
+UPDATE nas_r2_copy_items q SET state='blocked',last_error='stitch_toolchain_legacy'
+ WHERE q.kind='stitch_output' AND q.state IN ('pending','leased')
+  AND NOT nas_stitch_r2_native_copy_ready(q.source_id,q.manifest_sha256);
+
+CREATE FUNCTION guard_nas_stitch_r2_native_copy_enrollment() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF NOT EXISTS (
+  SELECT 1 FROM nas_stitch_r2_stage_objects o JOIN nas_stitch_r2_hours h ON h.id=o.hour_id AND h.attempt=o.attempt
+  WHERE o.id=NEW.source_id AND o.state='staged' AND nas_stitch_r2_native_attempt(h)
+ ) THEN
+  RAISE EXCEPTION 'reviewed Durham copy source required' USING ERRCODE='55000';
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER nas_stitch_r2_native_copy_enrollment BEFORE INSERT ON nas_r2_copy_items
+ FOR EACH ROW WHEN (NEW.kind='stitch_output') EXECUTE FUNCTION guard_nas_stitch_r2_native_copy_enrollment();
 
 CREATE FUNCTION guard_nas_stitch_r2_native_copy() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
