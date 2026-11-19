@@ -75,7 +75,7 @@ func TestNativeStitchClaimSelectsEligibleConnectionBeforeLimitAndFencesLease(t *
 		taskID int64
 		clip   stitchcert.ManifestClip
 	}
-	makeTask := func(recordingID, jobID, clipID, priority int64) frozenTask {
+	makeTask := func(recordingID, jobID, clipID, priority int64, zone *time.Location) frozenTask {
 		if _, e := pool.Exec(ctx, `INSERT INTO recordings(id,account_id,name,status,delivery) VALUES($1,47,'recording','active','nas_pull')`, recordingID); e != nil {
 			t.Fatal(e)
 		}
@@ -85,7 +85,7 @@ func TestNativeStitchClaimSelectsEligibleConnectionBeforeLimitAndFencesLease(t *
 			t.Fatal(e)
 		}
 		generation := captureGenerationFingerprint(&token)
-		clip := stitchcert.ManifestClip{Ordinal: 1, ClipID: clipID, RecordingID: recordingID, RecordingJobID: jobID, RelativePath: path, SizeBytes: 4, SHA256: strings.Repeat("a", 64), ClipStartAt: start, ClipEndAt: end, CaptureGeneration: *generation, CaptureSequence: 1}
+		clip := stitchcert.ManifestClip{Ordinal: 1, ClipID: clipID, RecordingID: recordingID, RecordingJobID: jobID, RelativePath: path, SizeBytes: 4, SHA256: strings.Repeat("a", 64), ClipStartAt: start.In(zone), ClipEndAt: end.In(zone), CaptureGeneration: *generation, CaptureSequence: 1}
 		manifest, _ := json.Marshal([]stitchcert.ManifestClip{clip})
 		sha, _, _ := stitchcert.CanonicalSHA([]stitchcert.ManifestClip{clip})
 		var taskID int64
@@ -98,8 +98,9 @@ func TestNativeStitchClaimSelectsEligibleConnectionBeforeLimitAndFencesLease(t *
 		}
 		return frozenTask{taskID: taskID, clip: clip}
 	}
-	other := makeTask(71, 91, 11, 1)
-	eligible := makeTask(72, 92, 12, 2)
+	other := makeTask(71, 91, 11, 1, time.UTC)
+	// A task frozen by a planner in a different zone retains its original digest.
+	eligible := makeTask(72, 92, 12, 2, time.FixedZone("planner", 5*3600+30*60))
 	if _, err = pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,seen_generation) VALUES($1,$2,$3,$4,4,repeat('a',64),'present','g2'),($5,$6,$7,$8,4,repeat('a',64),'present','g1')`, connectionTwo, other.clip.ClipID, other.clip.RecordingID, other.clip.RelativePath, connectionOne, eligible.clip.ClipID, eligible.clip.RecordingID, eligible.clip.RelativePath); err != nil {
 		t.Fatal(err)
 	}

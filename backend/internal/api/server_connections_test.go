@@ -560,7 +560,7 @@ func TestNASStitchHeartbeatSwitches(t *testing.T) {
 					t.Fatalf("heartbeat: %d %s", w.Code, w.Body.String())
 				}
 				if response["stitch_enabled"] != (connectionID == 13 && enabled) ||
-					response["stitch_deletion_enabled"] != (connectionID == 13 && deletion) {
+					response["stitch_deletion_enabled"] != false {
 					t.Fatalf("connection=%d enabled=%v deletion=%v: %s", connectionID, enabled, deletion, w.Body.String())
 				}
 			}

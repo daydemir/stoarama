@@ -34,6 +34,15 @@ func (a *inverseApplier) eventTable() string {
 	}
 	return "r2_inverse_events"
 }
+func (a *inverseApplier) attemptTable() string {
+	switch a.opts.Lane {
+	case inverseNASKeep28:
+		return "r2_keep28_attempts"
+	case inverseNonrawCollated:
+		return "r2_nonraw_attempts"
+	}
+	return "r2_inverse_attempts"
+}
 func (a *inverseApplier) retirementReason() string {
 	switch a.opts.Lane {
 	case inverseNASKeep28:

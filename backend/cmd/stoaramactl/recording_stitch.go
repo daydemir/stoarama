@@ -257,9 +257,11 @@ func planOneNativeStitch(ctx context.Context, tx pgx.Tx, c stitchPlanCandidate, 
 		return "rejected", "late_or_changed_clips"
 	}
 	var existingState, existingSHA string
-	err = tx.QueryRow(ctx, `SELECT state,clip_manifest_sha256 FROM recording_native_stitch_tasks WHERE account_id=$1 AND recording_job_id=$2 AND policy_version=$3 FOR UPDATE`, c.AccountID, c.JobID, stitchcert.PolicyVersion).Scan(&existingState, &existingSHA)
+	var existingRaw []byte
+	err = tx.QueryRow(ctx, `SELECT state,clip_manifest_sha256,clip_manifest FROM recording_native_stitch_tasks WHERE account_id=$1 AND recording_job_id=$2 AND policy_version=$3 FOR UPDATE`, c.AccountID, c.JobID, stitchcert.PolicyVersion).Scan(&existingState, &existingSHA, &existingRaw)
 	if err == nil {
-		if existingSHA == manifestSHA {
+		var existing []stitchcert.ManifestClip
+		if json.Unmarshal(existingRaw, &existing) == nil && stitchcert.MatchesFrozenManifest(clips, existing, existingSHA) {
 			return "existing", ""
 		}
 		if existingState == "pending" && apply {
@@ -316,6 +318,7 @@ func loadPlannerManifest(ctx context.Context, tx pgx.Tx, accountID, recordingID,
 			return nil, "", 0, fmt.Errorf("noncanonical clip")
 		}
 		c.Ordinal = len(clips) + 1
+		c.ClipStartAt, c.ClipEndAt = c.ClipStartAt.UTC(), c.ClipEndAt.UTC()
 		c.CaptureGeneration = plannerGeneration(token)
 		c.CaptureSequence = *seq
 		if attempt != nil {

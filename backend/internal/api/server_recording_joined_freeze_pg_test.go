@@ -39,6 +39,10 @@ var joinedMigrationNames = []string{
 	// Defer with 0167; the final MigrateUp applies both in dependency order.
 	"0212_r2_classifier_input_epoch.sql",
 	"0211_r2_nonraw_retirement.sql",
+	"0215_nas_stitch_lease_key.sql",
+	// Replaces the reservation guard over the deferred cleanup tables.
+	"0216_r2_reservation_guard_index.sql",
+	"0214_nas_stitch_local_only.sql",
 	"0210_r2_owner_fence_timing.sql",
 	"0209_nas_cleanup_permanent_holds.sql",
 	"0208_nas_storage_v6_binding.sql",
@@ -95,6 +99,10 @@ var joinedMigrationNames = []string{
 	"0177_nas_cleanup_reserved_files.sql",
 	"0178_nas_cleanup_reconciliation.sql",
 	"0179_nas_v85r_stitch.sql",
+	// Replaces 0198's function and probes the deferred writer-fence tables.
+	"0213_r2_writes_blocked_indexes.sql",
+	// Verifies the collation-output key index; the outputs table is deferred above.
+	"0215_r2_collation_output_key_index.sql",
 }
 
 type joinedFixtureMigrationPhase uint8

@@ -230,6 +230,30 @@ func CanonicalSHA(v any) (string, []byte, error) {
 	return hex.EncodeToString(s[:]), b, nil
 }
 
+// Equal compares clip identity independently of timestamp display offsets.
+func (c ManifestClip) Equal(other ManifestClip) bool {
+	if !c.ClipStartAt.Equal(other.ClipStartAt) || !c.ClipEndAt.Equal(other.ClipEndAt) {
+		return false
+	}
+	c.ClipStartAt, c.ClipEndAt = other.ClipStartAt, other.ClipEndAt
+	return c == other
+}
+
+// MatchesFrozenManifest checks the original digest before comparing clip
+// identities, so tasks frozen with local timestamp offsets can still run.
+func MatchesFrozenManifest(current, frozen []ManifestClip, digest string) bool {
+	frozenDigest, _, err := CanonicalSHA(frozen)
+	if err != nil || frozenDigest != digest || len(current) != len(frozen) {
+		return false
+	}
+	for i := range current {
+		if !current[i].Equal(frozen[i]) {
+			return false
+		}
+	}
+	return true
+}
+
 func ValidateManifest(clips []ManifestClip, recordingID, jobID int64, start, end time.Time) (int64, error) {
 	if len(clips) < 1 || len(clips) > MaxClips || !end.After(start) {
 		return 0, fmt.Errorf("invalid bounded manifest")

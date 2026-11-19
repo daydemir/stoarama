@@ -107,27 +107,69 @@ child exits. Outputs, provenance and source media are preserved. Directory file
 descriptors, `O_NOFOLLOW`, same-device checks and Linux parent `/proc/.../fd`
 paths confine child reads/writes. Symlinks and conflicting outputs stop work.
 
-Server output rows/proofs are append-only. Local durable registration receipts
-are written only after the server registration ACK. A second readiness ACK then
-admits an existing cleanup dry-run plan containing **only** fully included
-originals; cleanup cannot race ahead of the local receipts. A lost ACK is
-reconciled from the SQLite FULL/WAL journal before new work. The stitch lane
-never unlinks raw itself.
+Server output rows and proofs are append-only. The worker writes durable local
+registration receipts after the server accepts its result. A second readiness
+ACK records `completed_no_retirement` and releases the lane. A lost ACK is
+reconciled from the SQLite FULL/WAL journal before new work.
 
-`stitched_included` is a new permit reason, which may apply inside keep28 only
-when the registered source proof and current owner scope both still agree. It
-uses the existing exact-file cleanup rehash, R2 recovery-copy verification,
-source holds, 30-second permit, receipt replay, append-only deletion ledger,
-shared 5 TB/24h byte budget and local file/byte caps. It never grants NAS-only
-retirement. A purged/missing R2 raw copy keeps the NAS raw even if stitched.
-R2 objects are neither overwritten nor deleted by this worker.
+Every ordinary stitch retains its raw inputs. The API and client refuse
+stitch-derived deletion permits, including legacy registered results.
+Migration 0214 requires old stitch cleanup plans to be disabled and their
+issued permits to have expired before opening the local stitch lane.
+Preserve existing SQLite journals, outputs, ledgers and plans. Ordinary NAS
+cleanup and R2 retirement retain their separate authority.
 
-Before each raw unlink, the client independently requires its local registration
-receipt, exact complete inclusion proof, effective client switches, and a fresh
-whole output rehash. An output/source mismatch or missing receipt blocks unlink.
-The common cleanup machinery auto-pauses execution on anomalies. Failed/paused
-retirement blocks further growing work in this single lane until reconciled;
-do not erase SQLite journals, outputs, ledgers or plans to restart it.
+## Decoded frame verification
+
+The ordinary audit still strictly decodes each source and each assembled
+output independently through EOF. The [original V85r audit](https://github.com/daydemir/stoarama/pull/446)
+uses FFmpeg's rawvideo encoder and the framehash muxer to compute SHA-256
+for each decoded packet. For the qualified H.264 pixel formats, the same
+decode, stream mapping, frame timing and rawvideo encoding feed a
+synchronous FFmpeg tee. One branch emits frame metadata before the other
+writes the exact packet bytes. There is no pixel-format override. Python
+hashes the complete payload of each packet using SHA-256 and writes the
+original stream, DTS, PTS, duration and byte count beside the digest.
+
+The verifier requires clean EOF on both pipes, successful FFmpeg exit and
+an active build deadline. An incomplete ledger aborts the build before
+publication. After a source decode exits unsuccessfully with intact pipe
+framing, the original verifier must independently reject the source before
+the worker can retain it or try repair. The source and output ledger comparison,
+packet inventory, independently seeked seam decodes and durable whole-file
+readback still run. Proof builds, their readback checks, repairs, and pixel
+formats outside the parity matrix use the original framehash command.
+
+## Dedicated Durham credential
+
+After the dedicated-key deployment and explicit owner approval, an operator
+session can issue a key with `POST /api/v1/admin/nas-stitch/key`. The response
+shows the token once. Save it through the approved secret workflow. It grants
+only the ordinary stitch lease, checkpoint, result and readiness POSTs.
+Provision the pinned tools and corpus offline. The existing admin key-ID
+revocation route revokes this key independently of connection 13. Older API
+binaries cannot authenticate the dedicated key's stored digest.
+
+The operator CLI can issue the same fixed account-47 credential with
+`stoaramactl nas-stitch mint-durham-key` using the operator database connection.
+Supply the owner authorization reference and an inherited writable pipe from
+the approved 1Password sink. The CLI emits the bearer only through that pipe.
+The browser and CLI share the one-active-key guard and audit transaction.
+Pause both browser and CLI issuance whenever any serving controller lacks
+the shared guard, including after a rollback. Resume once every serving
+controller runs the guard.
+If issuance or vault acknowledgement is uncertain, reconcile the recorded
+key ID and vault item before any further issuance attempt.
+
+A result awaiting its durable receipt keeps the shared stitch lane occupied.
+If a dedicated key is revoked or expires in that window, the operator status
+lists outstanding registrations first and shows each exact plan digest, owner
+key ID and abandonment marker. An authorized operator
+can record abandonment with `POST /api/v1/admin/nas-stitch/{id}/abandon-registration`
+and the exact `plan_sha256` and `reason`. This preserves the output and frozen
+result, records who released the lane, and leaves the abandoned hour without a
+readiness receipt. Older binaries ignore the marker and can block the lane
+again after a rollback.
 
 ## Resource controls and restart
 
@@ -148,23 +190,33 @@ pull, inventory and cleanup behavior does not enable V85r when its switches are
 off. Stitch progress/errors ride the heartbeat (`connections.nas_stitch_status`)
 and the existing redacted client-log upload (V85/stitch topics included).
 
-The authenticated heartbeat returns `stitch_enabled` from server
-`NAS_STITCH_ENABLED` and `stitch_deletion_enabled` from server
-`NAS_STITCH_DELETION_ENABLED`, for **connection 13 only**. Other connections
-receive false. The client starts OFF and re-evaluates both on every heartbeat
-(normally every 30 seconds). Missing, unknown or failed responses revoke
-authority; only JSON boolean true enables a flag. Unset container variables
-`STOARAMA_V85_STITCH_ENABLED` / `STOARAMA_V85_STITCH_DELETION_ENABLED` follow the
-server; explicit `false` vetoes the corresponding flag locally. Explicit `true`
-also follows the server and cannot override OFF. No Container Manager edit is
-needed when these variables are unset. Unknown local values fail closed.
+The authenticated heartbeat sends `stitch_enabled` to connection 13 from
+`NAS_STITCH_ENABLED`. It sends `stitch_deletion_enabled=false` for every client.
+The client starts OFF and re-evaluates stitching on every heartbeat, normally
+every 30 seconds. `STOARAMA_V85_STITCH_ENABLED=false` vetoes stitching locally.
+Any response other than an authenticated explicit enable revokes authority.
 
 Server stitching OFF blocks new leases and cancels the current native child
-through the existing stop/watchdog path, as checkpoint `continue:false` does.
-A later ON permits a new job but cannot revive the cancelled child. Deletion
-additionally requires the effective stitch flag, `NAS_CLEANUP_DELETION_ENABLED`,
-scope `deletion_approved`, receipts and every existing fresh inclusion/output
-proof and retirement gate.
+through the same watchdog as checkpoint `continue:false`. A later ON permits a
+new job with a fresh lease.
+
+## Resource admission overrides
+
+The resource gate is checked before every lease and again by the 5s mid-job
+refresh. Two container variables adjust it without editing the pinned client:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `STOARAMA_STITCH_MIN_MEMORY_BYTES` | `402653184` (384 MiB) | Minimum free memory, integer bytes |
+| `STOARAMA_STITCH_MAX_LOAD_PER_CPU` | `1.5` | Maximum load1 per usable CPU, float |
+
+Defaults are exactly the previously hard-coded values, so an unset environment
+behaves as before. A non-numeric, non-finite or non-positive value fails the
+process at startup with a clear error; there is no silent fallback to the
+default. Both variables govern the pre-lease check and the refresh, so a running
+job is re-evaluated under the configured limits. A resource hold returns the
+exact lease through the checkpoint endpoint before retrying. A failed return
+leaves the original lease expiry in force.
 
 ## One-stream pilot procedure (operator action after review)
 
@@ -173,7 +225,7 @@ No commands below were run against production for this PR.
 1. Use the recovered exact gzip export, verify both compressed/uncompressed
    pins and the manifest census, and verify the bundled source/hash alias vetoes. Do not bypass hash validation.
    Replay/admit a representative production unit with the NAS's pinned FFmpeg
-   before any deletion. This PR's synthetic corpus adapter is
+   before scaling the pilot. The synthetic corpus adapter is
    test-only and cannot admit production media.
 2. Deploy migration/API and a reviewed client candidate through the existing
    release process. Verify `nice` and `ionice` exist inside the NAS container.
@@ -191,33 +243,15 @@ No commands below were run against production for this PR.
    ```sh
    stoaramactl nas-stitch approve --stream-id STREAM \
      --start START --end END --approved-until EXPIRY \
-     --reason 'Deniz approval reference' --approve-deletion
+     --reason 'Deniz approval reference'
    ```
 
-   `--approve-deletion` records the owner's intent for this exact scope; it does
-   not turn on deletion. Approvals expire within 180 days. Missing
-   this flag leaves raw retained; scopes are immutable, so choose the intended
-   authority explicitly before starting. Do not submit overlapping scopes.
-4. Use `stoaramactl nas-stitch status`, NAS heartbeat and client logs. Check the
-   new output SHA, raw exception list, recovered-prefix provenance and the common
-   cleanup plan's complete `would_delete`/verified R2 evidence. Missing corpus,
-   unsupported native layouts, audio and missing recovery copies are HOLD.
-5. After reviewing that exact pilot, set server
-   `NAS_STITCH_DELETION_ENABLED=true` last; the next successful heartbeat
-   enables client deletion unless explicitly vetoed locally. The existing
-   `NAS_CLEANUP_DELETION_ENABLED` must also be on. No extra per-hour approval is
-   needed within the owner's scope: each verified unit completes the common
-   dry run, passes the common one-plan/budget gates, then is armed for at most
-   24 hours and the remaining scope lifetime. Existing cleanup work has the
-   same shared caps. Completion closes only this lane's cleanly deleted plan;
-   R2 recovery holds persist. Verify ledger/receipts and measured NAS headroom.
-6. Stop stitching with server `NAS_STITCH_ENABLED=false` or
-   `stoaramactl nas-stitch pause --scope-id ID`. To stop retirement while keeping
-   stitching enabled, set `NAS_STITCH_DELETION_ENABLED=false`. The heartbeat
-   revokes client authority; checkpoint polling also stops inactive work.
-   Pause prevents new work and new grants; an already issued exact-file
-   permit retains its existing <=30-second lifetime. Reconcile an anomaly using
-   the common cleanup report/recheck tools; never widen an inclusion claim.
+   Approvals expire within 180 days. Scope bounds are immutable.
+4. Check the output hash, source dispositions, recovered-prefix provenance and
+   `completed_no_retirement` in `stoaramactl nas-stitch status` and the client logs.
+5. Stop stitching with server `NAS_STITCH_ENABLED=false` or
+   `stoaramactl nas-stitch pause --scope-id ID`. The heartbeat and checkpoint
+   revoke running work when stitching is disabled.
 
 ## Limits and estimate
 
@@ -251,14 +285,6 @@ unused execution-lease return, and #450 operations documentation move are
 integrated. #453's Jelly cleanup runner is operationally independent; this
 worker remains NAS-local. Never build it on Jelly.
 
-Stitch retirement activation now calls the same committed-freeze publication,
-source-writer drain and replay/cache activation as ordinary cleanup, under the
-public cleanup fence. Both fresh stitched permits and the common cleanup lease,
-observe, receipt and reconciliation paths retain session binding, serial caps,
-15-second permit-observation deadlines, R2 recovery evidence and lease returns.
-The stitched inclusion check replaces only the outside-keep decision: a missing
-or changed activation/cache generation cannot grant a fresh permit.
-
 No writer fence spans a stitch build. All scratch/output writes stay inside the
 new versioned sibling tree; raw inputs are read-only, directory/file descriptors
 are pinned, and source/output proofs are freshly read back. Cleanup can acquire
@@ -285,7 +311,7 @@ release, mutate production, merge, or deploy.
 
 Regression coverage includes real PostgreSQL freeze/cached-generation changes,
 source-write refusal, checkpoint identity/stream/switch behavior, shared reviewed
-session gates, a deliberately blocked build concurrent with actual included-raw
-retirement, and cancellation of a live native child after lane acquisition.
+session gates, retirement refusal on replay, and cancellation of a live native child after
+a lane acquisition.
 The stitch migration remains **0179_nas_v85r_stitch.sql**, with main's cleanup
 freeze migrations 0180/0181. Joined lifecycle fixtures apply them in order.

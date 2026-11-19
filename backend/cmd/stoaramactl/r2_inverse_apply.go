@@ -289,7 +289,7 @@ func loadInverseRawTarget(ctx context.Context, tx pgx.Tx, bucket string, protect
 }
 
 const inverseRawHeldSQL = `SELECT
- EXISTS(SELECT 1 FROM nas_cleanup_reserved_files WHERE kind='raw' AND source_id=$1)
+ nas_cleanup_file_reserved('raw',$1)
  OR EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id WHERE h.clip_id=$1 AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND (i.delete_ever_issued OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed')))))
  OR EXISTS(SELECT 1 FROM nas_cleanup_incident_sources WHERE clip_id=$1)
  OR EXISTS(SELECT 1 FROM nas_cleanup_incident_roster WHERE bucket=$2 AND object_key=$3)
@@ -742,22 +742,25 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		return result, err
 	}
 	// An existing intent is NEVER resubmitted, regardless of manifest or ledger.
-	// Only confirmed absence can advance it to a receipt on restart.
+	// Only confirmed absence after our own issued DELETE can advance it to a
+	// receipt on restart. An intent that never issued a DELETE is never retired:
+	// if its object is gone, someone else removed it, so stop before any new work.
 	existing := map[string]bool{}
-	rows, err := pool.Query(ctx, `SELECT i.object_key,i.size_bytes,i.manifest_sha256,i.endpoint_sha256,EXISTS(SELECT 1 FROM `+a.eventTable()+` e WHERE e.bucket=i.bucket AND e.object_key=i.object_key AND e.event='absent') FROM `+a.intentTable()+` i WHERE i.bucket=$1`, store.Bucket())
+	rows, err := pool.Query(ctx, `SELECT i.object_key,i.size_bytes,i.manifest_sha256,i.endpoint_sha256,EXISTS(SELECT 1 FROM `+a.eventTable()+` e WHERE e.bucket=i.bucket AND e.object_key=i.object_key AND e.event='absent'),EXISTS(SELECT 1 FROM `+a.attemptTable()+` t WHERE t.bucket=i.bucket AND t.object_key=i.object_key) FROM `+a.intentTable()+` i WHERE i.bucket=$1`, store.Bucket())
 	if err != nil {
 		return result, err
 	}
 	type pending struct {
 		e        inverseEntry
 		manifest string
+		issued   bool
 	}
 	var pendingItems []pending
 	for rows.Next() {
 		var key, manifest, endpoint string
 		var size int64
-		var done bool
-		if err = rows.Scan(&key, &size, &manifest, &endpoint, &done); err != nil {
+		var done, issued bool
+		if err = rows.Scan(&key, &size, &manifest, &endpoint, &done, &issued); err != nil {
 			rows.Close()
 			return result, err
 		}
@@ -778,7 +781,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 			}
 		}
 		if !done {
-			pendingItems = append(pendingItems, pending{inverseEntry{ObjectInfo: r2.ObjectInfo{Key: key, SizeBytes: size}}, manifest})
+			pendingItems = append(pendingItems, pending{inverseEntry{ObjectInfo: r2.ObjectInfo{Key: key, SizeBytes: size}}, manifest, issued})
 		}
 	}
 	err = rows.Err()
@@ -793,6 +796,9 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		probeCtx, probeCancel := context.WithTimeout(ctx, inverseNetworkTimeout)
 		_, err = store.Head(probeCtx, p.e.Key)
 		probeCancel()
+		if !p.issued && r2.IsNotFound(err) {
+			return result, fmt.Errorf("intent %s never issued a DELETE but its object is absent; held for review", p.e.Key)
+		}
 		if r2.IsNotFound(err) {
 			if o.Lane == inverseNonrawCollated {
 				err = a.publishNonrawAbsent(ctx, p.e, p.manifest, true)
@@ -835,6 +841,10 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 			want = inverseCollated
 		}
 		if e.Class != want || existing[e.Key] {
+			continue
+		}
+		// A nonpositive size can never reserve; selecting it would abort the batch.
+		if e.SizeBytes <= 0 {
 			continue
 		}
 		if !inverseLastModifiedAllowed(e.LastModified, summary.CreatedAt, time.Now().UTC()) {
