@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestNASStitchDedicatedKeyThroughRouter(t *testing.T) {
@@ -546,12 +547,31 @@ func TestDurhamKeyMintSingleLiveWriter(t *testing.T) {
 	for _, browser := range []bool{false, true} {
 		t.Run(fmt.Sprintf("browser=%t", browser), func(t *testing.T) {
 			f := durhamMintFixture(t)
+			config := f.pool.Config()
+			config.ConnConfig.RuntimeParams["default_transaction_isolation"] = "repeatable read"
+			mintPool, err := pgxpool.NewWithConfig(f.ctx, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mintPool.Close()
+			f.s.pool = mintPool
+			blocker, err := f.pool.Begin(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer blocker.Rollback(f.ctx)
+			var blockerPID int32
+			if err := blocker.QueryRow(f.ctx,
+				`SELECT pg_backend_pid() FROM (SELECT pg_advisory_xact_lock($1)) locked`, nasStitchKeyMintLock).
+				Scan(&blockerPID); err != nil {
+				t.Fatal(err)
+			}
 			start := make(chan struct{})
 			results := make(chan bool, 2)
 			cli := func() {
 				<-start
 				var secret bytes.Buffer
-				id, err := MintDurhamStitchKeyTo(f.ctx, f.pool, "operator@fixture", "owner-approved fixture", &secret)
+				id, err := MintDurhamStitchKeyTo(f.ctx, mintPool, "operator@fixture", "owner-approved fixture", &secret)
 				if err == nil && (id <= 0 || !strings.HasPrefix(secret.String(), "sir_")) {
 					t.Error("successful mint did not deliver its credential")
 				}
@@ -578,6 +598,20 @@ func TestDurhamKeyMintSingleLiveWriter(t *testing.T) {
 			go cli()
 			go second()
 			close(start)
+			for waitUntil := time.Now().Add(4 * time.Second); ; {
+				var waiting int
+				err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid))`, blockerPID).Scan(&waiting)
+				if err != nil || time.Now().After(waitUntil) {
+					t.Fatalf("issuer did not reach the blocked mint guard: %d %v", waiting, err)
+				}
+				if waiting == 2 {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err := blocker.Commit(f.ctx); err != nil {
+				t.Fatal(err)
+			}
 			if (<-results) == (<-results) {
 				t.Fatal("expected exactly one successful mint")
 			}

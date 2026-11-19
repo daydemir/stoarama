@@ -2,6 +2,8 @@ package main
 
 import (
 	"os"
+	"os/exec"
+	"strconv"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -43,4 +45,24 @@ func TestDurhamCredentialPipeRejectsRegularFilesAndReadEndpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	sink.Close()
+}
+
+func TestDurhamCredentialPipeRejectsTruncatedStandardDescriptors(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("requires a wider Go int than the OS descriptor")
+	}
+	if os.Getenv("STOARAMA_TEST_DURHAM_FD_CHILD") == "1" {
+		for _, std := range []int{1, 2} {
+			alias := int((int64(1) << 32) | int64(std))
+			if _, err := durhamCredentialPipe(alias); err == nil {
+				t.Fatalf("accepted descriptor alias %d of piped standard descriptor %d", alias, std)
+			}
+		}
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDurhamCredentialPipeRejectsTruncatedStandardDescriptors$")
+	cmd.Env = append(os.Environ(), "STOARAMA_TEST_DURHAM_FD_CHILD=1")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatal(err, string(output))
+	}
 }

@@ -67,14 +67,14 @@ type durhamStitchKey struct {
 }
 
 type durhamStitchMintDB interface {
-	Begin(context.Context) (pgx.Tx, error)
+	BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
 }
 
 func issueDurhamStitchKey(
 	ctx context.Context, db durhamStitchMintDB, actor, authorization string, method durhamStitchMintMethod,
 ) (durhamStitchKey, error) {
 	var key durhamStitchKey
-	tx, err := db.Begin(ctx)
+	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return key, err
 	}

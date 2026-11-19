@@ -13,12 +13,13 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/api"
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sys/unix"
 )
 
 func durhamCredentialPipe(fd int) (*os.File, error) {
 	const invalid = "Durham credential output must be an inherited writable pipe descriptor above 2"
-	if fd < 3 {
+	if fd < 3 || int64(fd) > 1<<31-1 {
 		return nil, errors.New(invalid)
 	}
 	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
@@ -55,9 +56,15 @@ func runMintDurhamStitchKey(ctx context.Context, cfg config.Config, args []strin
 	if hostErr != nil || userErr != nil || host == "" || operator.Username == "" {
 		log.Fatal("local operator identity unavailable")
 	}
-	pool, err := r2RetireOpenPool(ctx, cfg, false)
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("operator database configuration is invalid")
+	}
+	poolCfg.MaxConns, poolCfg.MinConns = 1, 0
+	poolCfg.ConnConfig.RuntimeParams["application_name"] = "stoarama-durham-key-issuer"
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		log.Fatal("operator database pool unavailable")
 	}
 	defer pool.Close()
 	mintCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
