@@ -48,6 +48,9 @@ type inverseIdentity struct {
 type inverseProtection struct {
 	Identities     map[string][]inverseIdentity
 	Held, Delivery map[string]bool
+	// OwnerKeepPrefixes are durable owner keep holds on whole key prefixes. A
+	// key under one is kept whatever its catalog status.
+	OwnerKeepPrefixes []string
 	// JoinedReleased holds clips whose every joined snapshot belongs to a batch
 	// the owner released to the RAW lane. Only their outside-window part leaves.
 	JoinedReleased map[string]bool
@@ -76,6 +79,12 @@ type inverseSummary struct {
 // A path alias of any KE stream remains protected even when its catalog row
 // is missing. Match complete folder components, never a partial name.
 func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
+	// An owner keep prefix wins over every other answer.
+	for _, prefix := range p.OwnerKeepPrefixes {
+		if strings.HasPrefix(o.Key, prefix) {
+			return inverseKE, "owner_keep_prefix"
+		}
+	}
 	if p.Held[o.Key] {
 		return inverseHeld, "live_hold"
 	}
@@ -230,6 +239,9 @@ func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string
 	}
 	p.KEFolders, err = loadInverseKEFolders(ctx, q, bucket, picks)
 	if err != nil {
+		return p, err
+	}
+	if p.OwnerKeepPrefixes, err = loadInverseOwnerKeepPrefixes(ctx, q, bucket); err != nil {
 		return p, err
 	}
 	for _, set := range []struct {
@@ -454,4 +466,21 @@ func loadInverseKEFolders(ctx context.Context, q r2RetireQuerier, bucket string,
 		folders[folder] = true
 	}
 	return folders, rows.Err()
+}
+
+func loadInverseOwnerKeepPrefixes(ctx context.Context, q r2RetireQuerier, bucket string) ([]string, error) {
+	rows, err := q.Query(ctx, `SELECT prefix FROM r2_owner_keep_prefixes WHERE bucket=$1 ORDER BY prefix`, bucket)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var prefixes []string
+	for rows.Next() {
+		var prefix string
+		if err = rows.Scan(&prefix); err != nil {
+			return nil, err
+		}
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes, rows.Err()
 }

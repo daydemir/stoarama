@@ -36,6 +36,8 @@ func requireJoinedTestReplicationRole(t *testing.T, pool *pgxpool.Pool) {
 }
 
 var joinedMigrationNames = []string{
+	// Owner keep holds guard the deferred retirement reservation table.
+	"0220_r2_owner_keep_prefixes.sql",
 	// The certified NAS cleanup exception depends on the deferred handoff and keep-28 ledger.
 	"0219_nas_cleanup_certified_stitch.sql",
 	// The joined batch release replaces the deferred joined retention guard.

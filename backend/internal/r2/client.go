@@ -676,6 +676,12 @@ func (c *Client) DeleteObject(ctx context.Context, key string) error {
 
 // DeleteObjectOnce performs exactly one unconditional wire attempt. A lost
 // response is ambiguous: retirement must retain its intent and re-HEAD on resume.
+// The caller must first commit the guarded r2_retirement_reservations row for
+// this exact key and insert its guarded r2_object_retirements receipt in the
+// still-open transaction it commits after the DELETE: both writes are where
+// owner keep holds, delivery holds and the other retirement guards refuse the
+// key, so the guards run before the wire. New lanes use the inverse executor,
+// whose wire authority is bound to the exact key and its guarded reservation.
 func (c *Client) DeleteObjectOnce(ctx context.Context, key string, authority *stitchproof.Authority) error {
 	if err := authority.RequireWire(c.bucket, c.EndpointSHA256()); err != nil {
 		return err
