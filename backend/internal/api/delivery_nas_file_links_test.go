@@ -17,7 +17,8 @@ func TestDeliveryPublicFileLinksMatchOldFileURLs(t *testing.T) {
 		t.Fatalf("old link forms differ: %+v", numeric)
 	}
 	if numeric.PinnedDirectDownloadURL != want+"?direct=1&generation="+generation+"&download=1" ||
-		!strings.Contains(numeric.TicketURL, "/ticket/17?generation=") {
+		!strings.Contains(numeric.TicketURL, "/ticket/17?sha256=") ||
+		!strings.Contains(numeric.PinnedTicketURL, "/ticket/17?generation=") {
 		t.Fatalf("original detail and downloader aliases differ: %+v", numeric)
 	}
 	for _, kinds := range [][]string{{"video_collated", "video_assembly"}, {"video_assembly", "video_collated"}} {
@@ -33,5 +34,18 @@ func TestDeliveryPublicFileLinksMatchOldFileURLs(t *testing.T) {
 	}
 	if !strings.Contains(alias.FileURL, "/sha256%3A") || alias.Identity != numeric.Identity {
 		t.Fatalf("non-numeric alias drifted: %+v", alias)
+	}
+	other := object
+	other.Path = "folder/other.mp4"
+	for _, order := range [][]globalDeliveryObject{{object, other}, {other, object}} {
+		keep := DeliveryKeepSnapshot{Objects: map[string]DeliveryKeepIdentity{}}
+		for _, alias := range order {
+			if err := keep.add(alias, "video_collated"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if keep.Objects[object.Key].Path != object.Path {
+			t.Fatal("numeric aliases selected different canonical paths")
+		}
 	}
 }

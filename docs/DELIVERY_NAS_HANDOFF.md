@@ -59,7 +59,8 @@ reconciliation. Receipts from preceding rounds remain as history.
 When the final recheck completes, rerun the preview with
 `--request-final-check`. The NAS checks the path and current device, inode,
 size and timestamps of every approved output against the completed readbacks.
-It checks directory and mount identity around the sweep. This check only
+It checks directory and mount identity around the sweep and uses Linux
+inotify to reject file writes or directory changes during the check. This check only
 visits the approved paths, so unrelated raw tree changes cannot prevent it
 from completing.
 
@@ -71,7 +72,7 @@ If publication is delayed, request another metadata check before cutover.
 
 The list includes former file, playback, download and ticket links,
 including public aliases for the same object. URL variants with extra query
-parameters can be looked up by their canonical public file pathname.
+parameters can be looked up by the decoded ID in the public file or ticket path.
 Paths are relative to the NAS share and include size and SHA-256. Export
 refuses an incomplete verification or a changed public registry.
 

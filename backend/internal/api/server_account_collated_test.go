@@ -344,6 +344,18 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	if code, _ := do(s.handleAccountCollatedDownload, http.MethodGet, "/x", nil, params); code != 200 {
 		t.Fatalf("handoff backoff withheld independent ordinary copy: %d", code)
 	}
+	if code, _ := do(s.handleAccountCollatedError, http.MethodPost, "/x", map[string]any{"output_id": 106, "error": "test ordinary copy backoff"}, nil); code != 200 {
+		t.Fatalf("report ordinary error code=%d", code)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE delivery_nas_handoff_errors SET next_attempt_at=now()-interval '1 second' WHERE output_id=106`); err != nil {
+		t.Fatal(err)
+	}
+	if ids := feedIDs(); fmt.Sprint(ids) != "[102 106]" {
+		t.Fatalf("ordinary error suppressed approved handoff receipt: %v", ids)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM recording_collation_output_errors WHERE output_id=106`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE clip_storage_billing_contracts SET mode='nas_pull_monthly' WHERE clip_id=5000;
  UPDATE delivery_nas_handoff_errors SET next_attempt_at=now()-interval '1 second' WHERE output_id=106`); err != nil {
 		t.Fatal(err)

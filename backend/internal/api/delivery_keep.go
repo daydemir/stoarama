@@ -36,6 +36,7 @@ type DeliveryPublicFile struct {
 	PinnedDownloadURL       string
 	DirectDownloadURL       string
 	PinnedDirectDownloadURL string
+	PinnedTicketURL         string
 }
 
 func deliveryPublicFile(id, generation string, object globalDeliveryObject) DeliveryPublicFile {
@@ -47,9 +48,10 @@ func deliveryPublicFile(id, generation string, object globalDeliveryObject) Deli
 		Identity: DeliveryKeepIdentity{Key: object.Key, ETag: strings.Trim(object.ETag, `"`),
 			Size: object.SizeBytes, SHA256: object.SHA256, Path: object.Path, RecordingID: object.RecordingID,
 			Kind: "video_collated"},
-		FileURL:       fileURL,
-		PinnedFileURL: fileURL + "?generation=" + url.QueryEscape(generation),
-		TicketURL:     route + "/ticket/" + escapedID + "?" + query.Encode(),
+		FileURL:         fileURL,
+		PinnedFileURL:   fileURL + "?generation=" + url.QueryEscape(generation),
+		TicketURL:       route + "/ticket/" + escapedID + "?sha256=" + url.QueryEscape(object.SHA256),
+		PinnedTicketURL: route + "/ticket/" + escapedID + "?" + query.Encode(),
 	}
 	file.DownloadURL = fileURL + "?download=1"
 	file.PinnedDownloadURL = fileURL + "?download=1&generation=" + url.QueryEscape(generation)
@@ -185,6 +187,9 @@ func (s *DeliveryKeepSnapshot) add(o globalDeliveryObject, kind string) error {
 		// A nonnumeric alias is not a separate assembly when the same
 		// physical object also has a canonical collated file ID.
 		if old.Kind == "video_collated" && x.Kind == "video_assembly" {
+			return nil
+		}
+		if old.Kind == x.Kind && (old.Path < x.Path || (old.Path == x.Path && old.RecordingID <= x.RecordingID)) {
 			return nil
 		}
 	}

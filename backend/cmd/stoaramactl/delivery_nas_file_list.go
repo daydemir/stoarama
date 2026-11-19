@@ -23,6 +23,7 @@ type deliveryNASFileLink struct {
 	FormerPinnedDownloadURL       string `json:"former_pinned_download_url"`
 	FormerDirectDownloadURL       string `json:"former_direct_download_url"`
 	FormerPinnedDirectDownloadURL string `json:"former_pinned_direct_download_url"`
+	FormerPinnedTicketURL         string `json:"former_pinned_ticket_url"`
 }
 
 type deliveryNASFileList struct {
@@ -75,7 +76,7 @@ func deliveryNASCollectFileList(ctx context.Context, db r2RetireQuerier, summary
 			seen[file.FileURL] = true
 			list.Files = append(list.Files, deliveryNASFileLink{
 				file.FileURL, file.PinnedFileURL, file.TicketURL, "joined/" + path, bytes, sha,
-				file.DownloadURL, file.PinnedDownloadURL, file.DirectDownloadURL, file.PinnedDirectDownloadURL,
+				file.DownloadURL, file.PinnedDownloadURL, file.DirectDownloadURL, file.PinnedDirectDownloadURL, file.PinnedTicketURL,
 			})
 		}
 		count++

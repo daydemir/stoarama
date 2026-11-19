@@ -24289,6 +24289,38 @@ def report_collated_error(cfg, output_id, exc, handoff=False):
         log("WARN", "collated error report failed: %s" % report_exc)
 
 
+class CollatedHandoffPathWatch:
+    # Linux inotify events for writes, metadata, names and directory changes.
+    # Unmount and queue overflow are also reported even without these flags.
+    CHANGE_EVENTS = 0x00000FCE
+
+    def __init__(self):
+        if not sys.platform.startswith("linux"):
+            raise CollatedDownloadStopped("NAS handoff path checks require Linux inotify")
+        import ctypes
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        self.get_errno = ctypes.get_errno
+        self.fd = self.libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self.fd < 0:
+            raise OSError(self.get_errno(), "open NAS handoff change watch")
+
+    def add(self, directory_fd):
+        name = ("/proc/self/fd/%d" % directory_fd).encode("ascii")
+        if self.libc.inotify_add_watch(self.fd, name, self.CHANGE_EVENTS) < 0:
+            raise OSError(self.get_errno(), "watch NAS handoff path directory")
+
+    def require_unchanged(self):
+        try:
+            events = os.read(self.fd, 4096)
+        except BlockingIOError:
+            return
+        if events:
+            raise CollatedDownloadStopped("NAS handoff file or directory changed during path check")
+
+    def close(self):
+        os.close(self.fd)
+
+
 def check_collated_handoff_paths(cfg, stop_event):
     target = "/account/collated/handoff-check"
     response = request_json(cfg, "GET", target, read_limit=(8 << 20) + 4096)
@@ -24320,7 +24352,9 @@ def check_collated_handoff_paths(cfg, stop_event):
     mount = CollatedHandoffMount(cfg, mount_pin)
     directories = {}
     failed = None
+    watch = None
     try:
+        watch = CollatedHandoffPathWatch()
         for output_id, relative, identity in paths:
             if stop_event.is_set():
                 raise CollatedDownloadStopped("NAS handoff path check stopped")
@@ -24329,7 +24363,11 @@ def check_collated_handoff_paths(cfg, stop_event):
                 try:
                     directory = relative.rsplit("/", 1)[0]
                     stamp = certification_identity(os.fstat(parent))
-                    if directories.setdefault(directory, (relative, stamp))[1] != stamp:
+                    previous = directories.get(directory)
+                    if previous is None:
+                        watch.add(parent)
+                        directories[directory] = (relative, stamp)
+                    elif previous[1] != stamp:
                         raise CollatedDownloadStopped("NAS handoff directory changed during path check")
                     filename = relative.rsplit("/", 1)[1]
                     fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
@@ -24358,6 +24396,8 @@ def check_collated_handoff_paths(cfg, stop_event):
                 finally:
                     os.close(parent)
         mount.check()
+        if failed is None:
+            watch.require_unchanged()
         if stop_event.is_set():
             raise CollatedDownloadStopped("NAS handoff path check stopped")
         report = {"id": check_id, "manifest_sha256": digest, "mount": mount_pin}
@@ -24366,6 +24406,8 @@ def check_collated_handoff_paths(cfg, stop_event):
         request_json(cfg, "POST", target, body=report)
         log("INFO", "NAS handoff path check %d %s" % (check_id, "complete" if failed is None else "withheld output %d" % failed))
     finally:
+        if watch is not None:
+            watch.close()
         os.close(mount.fd)
 
 

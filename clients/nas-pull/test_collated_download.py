@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import io
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -257,12 +258,48 @@ class CollatedDownloadTests(unittest.TestCase):
                 reports.append(kwargs["body"])
                 return {"ok": True}
 
-            with mock.patch.object(pull, "request_json", side_effect=request), \
+            watcher = (mock.patch.object(pull, "CollatedHandoffPathWatch", wraps=pull.CollatedHandoffPathWatch)
+                       if sys.platform.startswith("linux") else mock.patch.object(pull, "CollatedHandoffPathWatch"))
+            with watcher, mock.patch.object(pull, "request_json", side_effect=request), \
                     mock.patch.object(pull.os.path, "ismount", return_value=True):
                 pull.check_collated_handoff_paths(self.cfg, threading.Event())
 
         self.assertNotIn("failed_output_id", reports[0])
         self.assertEqual(reports[1]["failed_output_id"], 7)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "production NAS path watch uses Linux inotify")
+    def test_handoff_withholds_success_when_earlier_file_is_modified_in_place(self):
+        self.enable_handoff()
+        self.assertTrue(self.drain())
+        second = self.final.with_name(self.final.name.replace("_part_04_", "_part_05_"))
+        second.write_bytes(self.body)
+        info = second.stat()
+        second_relative = str(second.relative_to(self.cfg.output_dir / "joined"))
+        expected_file = [info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino, info.st_dev]
+        challenge = {"id": 8, "manifest_sha256": "b" * 64, "mount": self.item["handoff_mount"], "files": [
+            [7, REL, self.acks[0]["handoff_readback"]],
+            [8, second_relative, expected_file],
+        ]}
+        sent = []
+        def request(cfg, method, path, **kwargs):
+            if method == "GET":
+                return {"check": challenge}
+            sent.append(kwargs["body"])
+            return {"ok": True}
+
+        open_directory = pull.open_collated_dir
+        def mutate(cfg, relative, **kwargs):
+            if relative == second_relative:
+                with self.final.open("r+b") as file:
+                    file.write(b"changed")
+            return open_directory(cfg, relative, **kwargs)
+
+        with mock.patch.object(pull, "request_json", side_effect=request), \
+                mock.patch.object(pull.os.path, "ismount", return_value=True), \
+                mock.patch.object(pull, "open_collated_dir", side_effect=mutate):
+            with self.assertRaisesRegex(pull.CollatedDownloadStopped, "changed during path check"):
+                pull.check_collated_handoff_paths(self.cfg, threading.Event())
+        self.assertEqual(sent, [])
 
     def test_handoff_refuses_unmounted_root(self):
         self.enable_handoff()

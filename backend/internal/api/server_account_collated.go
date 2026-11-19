@@ -142,8 +142,8 @@ FROM delivered`
 // collatedNotBackedOffSQL withholds outputs whose last delivery failed until
 // their backoff expires.
 const collatedNotBackedOffSQL = `
-	  AND NOT EXISTS (SELECT 1 FROM recording_collation_output_errors e
-	    WHERE e.output_id=o.id AND e.connection_id=$1 AND e.next_attempt_at>now())`
+	  AND (handoff.output_id IS NOT NULL OR NOT EXISTS (SELECT 1 FROM recording_collation_output_errors e
+	    WHERE e.output_id=o.id AND e.connection_id=$1 AND e.next_attempt_at>now()))`
 
 func (s *Server) collatedPullConnection(w http.ResponseWriter, r *http.Request) (int64, accountPrincipal, bool) {
 	principal, ok := accountPrincipalFromContext(r.Context())
