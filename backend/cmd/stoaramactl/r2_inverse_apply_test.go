@@ -684,9 +684,12 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		// An HTTP/2-capable TLS server must still be spoken to in HTTP/1.1, on
 		// a fresh connection for every DELETE.
 		var protos []string
+		var protosMu sync.Mutex
 		var connections atomic.Int64
 		server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			protosMu.Lock()
 			protos = append(protos, req.Proto)
+			protosMu.Unlock()
 			w.WriteHeader(204)
 		}))
 		server.EnableHTTP2 = true
@@ -711,6 +714,8 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				t.Fatalf("DELETE answered over %s with %d", resp.Proto, resp.StatusCode)
 			}
 		}
+		protosMu.Lock()
+		defer protosMu.Unlock()
 		if !slices.Equal(protos, []string{"HTTP/1.1", "HTTP/1.1"}) || connections.Load() != 2 {
 			t.Fatalf("server saw %v over %d connections", protos, connections.Load())
 		}

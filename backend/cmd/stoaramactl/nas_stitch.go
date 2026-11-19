@@ -129,10 +129,10 @@ func runNASStitch(ctx context.Context, cfg config.Config, args []string) {
 
 func runDurhamStageRetirement(ctx context.Context, cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("nas-stitch retire-durham-stage", flag.ExitOnError)
-	id := fs.Int64("object-id", 0, "exact certified Durham staging object ID")
-	digest := fs.String("sha256", "", "certified whole-file SHA-256")
+	id := fs.Int64("object-id", 0, "exact Durham staging object ID")
+	digest := fs.String("sha256", "", "staging object SHA-256")
 	apply := fs.Bool("apply", false, "authorize one stage-only wire attempt")
-	reconcile := fs.Bool("reconcile", false, "record absence of an already issued staging target")
+	reconcile := fs.Bool("reconcile", false, "record absence of an already issued staging target or drained abort")
 	proof := fs.String("conditional-delete-proof", "", "reviewed provider conditional DELETE proof")
 	proofSHA := fs.String("expected-delete-proof-sha256", "", "expected SHA-256 of the reviewed provider proof")
 	fs.Parse(args)

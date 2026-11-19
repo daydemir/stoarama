@@ -53,10 +53,16 @@ type inverseProtection struct {
 	Held, Delivery map[string]bool
 	// PageKeep is the exact key set of delivery_keep_holds: every link on the
 	// public delivery page. No owner scope waives it.
-	PageKeep  map[string]bool
-	KEFolders map[string]bool
-	Windows   map[int64]api.Keep28Window
-	Picks     r2RetirePicks
+	PageKeep map[string]bool
+	// OwnerKeepPrefixes are durable owner keep holds on whole key prefixes. A
+	// key under one is kept whatever its catalog status.
+	OwnerKeepPrefixes []string
+	// JoinedReleased holds clips whose every joined snapshot belongs to a batch
+	// the owner released to the RAW lane. Only their outside-window part leaves.
+	JoinedReleased map[string]bool
+	KEFolders      map[string]bool
+	Windows        map[int64]api.Keep28Window
+	Picks          r2RetirePicks
 	// ReviewedCollated selects the explicit non-raw partition scope. It is opt-in
 	// so default partition/apply output is unchanged for B1/B2.
 	ReviewedCollated bool
@@ -94,6 +100,12 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 	// the catalog or an owner scope says about them.
 	if strings.HasPrefix(o.Key, inverseToolsPrefix) {
 		return inverseTools, "pinned_stitch_tools"
+	}
+	// An owner keep prefix wins over every other answer.
+	for _, prefix := range p.OwnerKeepPrefixes {
+		if strings.HasPrefix(o.Key, prefix) {
+			return inverseKE, "owner_keep_prefix"
+		}
 	}
 	// Deniz, 2026-11-12: keep up only the links on the public delivery page.
 	// Those exact keys stay delivery in every scope, reviewed or not.
@@ -153,6 +165,9 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 		}
 		w := p.Windows[id.StreamID]
 		if id.Start.Before(w.End) && id.End.After(w.Start) {
+			if p.JoinedReleased[o.Key] {
+				return inverseHeld, "joined_source_snapshot"
+			}
 			return inverseKeep28, "pinned_window_overlap"
 		}
 	}
@@ -276,14 +291,19 @@ WITH held_sources AS (
  UNION SELECT $1,o.object_key FROM recording_collation_outputs o WHERE EXISTS(SELECT 1 FROM nas_cleanup_incident_sources i WHERE i.clip_id=ANY(o.source_clip_ids))
  UNION SELECT c.bucket,c.object_key FROM recording_clips c JOIN nas_restore_requests r ON r.clip_id=c.id WHERE r.state IN ('pending','leased')
  UNION SELECT c.bucket,c.object_key FROM recording_clips c JOIN recording_joined_source_snapshots s ON s.clip_id=c.id
+ WHERE NOT r2_joined_source_released(c.id)
  UNION SELECT c.bucket,c.object_key FROM recording_clips c JOIN recording_joined_snapshot_scopes s
  ON s.recording_id=c.recording_id AND s.recording_job_id=c.recording_job_id AND c.id<=s.high_water_clip_id
  JOIN recording_joined_batches b ON b.id=s.batch_record_id AND b.state='snapshotting'
  UNION SELECT c.bucket,c.object_key FROM recording_clips c JOIN recording_joined_dry_run_scopes s
  ON s.recording_id=c.recording_id AND s.recording_job_id=c.recording_job_id AND c.id<=s.high_water_clip_id
- UNION SELECT item->>'bucket',item->>'object_key' FROM nas_r2_copy_items WHERE state='blocked'
+ WHERE NOT r2_joined_source_released(c.id)
+ UNION SELECT item->>'bucket',item->>'object_key' FROM nas_r2_copy_items WHERE state<>'verified' OR blocked_reason<>''
+ UNION SELECT bucket,object_key FROM nas_stitch_r2_input_holds WHERE released_at IS NULL
 ) SELECT object_key FROM held_keys WHERE bucket=$1`
 const inversePageKeepSQL = `SELECT object_key FROM delivery_keep_holds WHERE bucket=$1`
+const inverseJoinedReleasedSQL = `SELECT DISTINCT c.object_key FROM recording_joined_source_snapshots s JOIN recording_clips c ON c.id=s.clip_id
+WHERE c.bucket=$1 AND r2_joined_source_released(c.id)`
 const inverseDeliverySQL = `
 WITH delivery_outputs AS (
  SELECT o.object_key,o.source_clip_ids FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id
@@ -310,7 +330,7 @@ func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string
 // reviewed non-raw scope is explicitly selected. Default callers keep the exact
 // previous classification, where collated keys are deferred and delivery holds.
 func loadInverseProtectionMode(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks, windows map[int64]api.Keep28Window, reviewed bool) (inverseProtection, error) {
-	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, PageKeep: map[string]bool{}, KEFolders: map[string]bool{}, Windows: windows, Picks: picks, ReviewedCollated: reviewed, ReviewedDelivery: reviewed}
+	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, PageKeep: map[string]bool{}, JoinedReleased: map[string]bool{}, KEFolders: map[string]bool{}, Windows: windows, Picks: picks, ReviewedCollated: reviewed, ReviewedDelivery: reviewed}
 	rows, err := q.Query(ctx, inverseCatalogSQL, bucket)
 	if err != nil {
 		return p, err
@@ -337,10 +357,13 @@ func loadInverseProtectionMode(ctx context.Context, q r2RetireQuerier, bucket st
 	if err != nil {
 		return p, err
 	}
+	if p.OwnerKeepPrefixes, err = loadInverseOwnerKeepPrefixes(ctx, q, bucket); err != nil {
+		return p, err
+	}
 	for _, set := range []struct {
 		sql  string
 		keys map[string]bool
-	}{{inverseHeldSQL, p.Held}, {inverseDeliverySQL, p.Delivery}, {inversePageKeepSQL, p.PageKeep}} {
+	}{{inverseHeldSQL, p.Held}, {inverseDeliverySQL, p.Delivery}, {inversePageKeepSQL, p.PageKeep}, {inverseJoinedReleasedSQL, p.JoinedReleased}} {
 		rows, err = q.Query(ctx, set.sql, bucket)
 		if err != nil {
 			return p, err
@@ -570,4 +593,21 @@ func loadInverseKEFolders(ctx context.Context, q r2RetireQuerier, bucket string,
 		folders[folder] = true
 	}
 	return folders, rows.Err()
+}
+
+func loadInverseOwnerKeepPrefixes(ctx context.Context, q r2RetireQuerier, bucket string) ([]string, error) {
+	rows, err := q.Query(ctx, `SELECT prefix FROM r2_owner_keep_prefixes WHERE bucket=$1 ORDER BY prefix`, bucket)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var prefixes []string
+	for rows.Next() {
+		var prefix string
+		if err = rows.Scan(&prefix); err != nil {
+			return nil, err
+		}
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes, rows.Err()
 }

@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,7 +24,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func TestDurhamHoldReleasedOnlyByCommittedNASCertificate(t *testing.T) {
+func TestR2StitchDurhamHoldReleasedOnlyByCommittedNASCertificate(t *testing.T) {
 	ctx := context.Background()
 	dsn := os.Getenv("STOARAMA_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -31,7 +32,11 @@ func TestDurhamHoldReleasedOnlyByCommittedNASCertificate(t *testing.T) {
 	}
 	media := bytes.Repeat([]byte{'x'}, 100)
 	sha := cleanupSHA(media)
-	provider := durhamStageTestProvider(t, media, sha)
+	const abortGeneration = "f5238abd-6063-4441-a712-a9647d10b986"
+	abortKey := "stitch-staging/" + abortGeneration + "/" + sha + ".mp4"
+	var abort durhamStageAbortProbe
+	var stageHeadResponse atomic.Int32
+	provider := durhamStageTestProvider(t, media, sha, abortKey, &abort, &stageHeadResponse)
 	defer provider.Close()
 	admin, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -91,6 +96,10 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 
 	exec(`INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until)
  VALUES(1,3,$1,$1::timestamptz+interval '6 hours','test',clock_timestamp()+interval '1 hour')`, hour)
+	bestStart := windows[3].Start.AddDate(0, 0, 7)
+	exec(`INSERT INTO recording_clips(recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,
+ fire_at,clip_start_at,clip_end_at,display_path) VALUES(30,1,$1,'stoarama','managed/keep-ranking.mp4',100,
+ 'test-etag',repeat('c',64),$2,$2,$3,'fixture/keep-ranking.mp4')`, provider.URL, bestStart, bestStart.AddDate(0, 0, 14))
 	endpoint := cleanupSHA([]byte(provider.URL))
 	exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, endpoint)
 	store, err := r2.New(ctx, r2.Config{Bucket: "stoarama", Endpoint: provider.URL,
@@ -152,11 +161,51 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	if err := pool.QueryRow(ctx, nasDurhamClaimSQL).Scan(&id, &attempt, &raw, &planDigest); err != nil || attempt != 0 {
 		t.Fatalf("exact held hour not claimable: %v", err)
 	}
+	t.Run("an issued local lease drains before Durham can claim", func(t *testing.T) {
+		var localID int64
+		if err := pool.QueryRow(ctx, `INSERT INTO nas_stitch_tasks(scope_id,recording_id,hour_at,plan,plan_sha256,
+ state,attempt,lease_token,lease_expires_at) VALUES(1,30,$1,$2,$3,'leased',3,repeat('d',64),clock_timestamp()+interval '1 hour')
+ RETURNING id`, hour, string(raw), planDigest).Scan(&localID); err != nil {
+			t.Fatal(err)
+		}
+		exec(`UPDATE nas_stitch_r2_control SET enabled=true;
+ UPDATE account_api_keys SET scopes=ARRAY['stoarama.nas_stitch'],secret_hash='nas-stitch:'||repeat('a',64) WHERE id=47`)
+		server := &Server{pool: pool}
+		w := cleanupCall(t, func(w http.ResponseWriter, r *http.Request) {
+			server.handleDurhamStitchLease(w, r, nasStitchCaller{keyID: 47, accountID: 47, dedicated: true})
+		}, 47, 47, "", "", nil)
+		if w.Code != 200 || !strings.Contains(w.Body.String(), `"task":null`) {
+			t.Fatal("Durham competed with an issued local lease", w.Code, w.Body.String())
+		}
+		var found int
+		if err := pool.QueryRow(ctx, `SELECT attempt FROM nas_stitch_r2_hours WHERE id=$1`, id).Scan(&found); err != nil || found != 0 {
+			t.Fatal("waiting for the local lease changed the Durham attempt", found, err)
+		}
+		exec(`UPDATE nas_stitch_tasks SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, localID)
+		exec(`UPDATE nas_stitch_r2_control SET enabled=false;
+ UPDATE account_api_keys SET scopes=ARRAY['stoarama.pull'],secret_hash='fixture-key' WHERE id=47`)
+	})
 
 	exec(`UPDATE nas_stitch_r2_hours SET state='leased',attempt=1,lease_api_key_id=47,lease_token=repeat('e',64),
- lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, id)
+ lease_expires_at=clock_timestamp()+interval '1 minute',lease_toolchain_attempt=1,lease_toolchain_sha256=$2
+ WHERE id=$1`, id, nasDurhamManifestSHA)
+	exec(`INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,generation,relative_path,sha256,size_bytes)
+ OVERRIDING SYSTEM VALUE VALUES(122,$1,1,47,'stoarama',$2,$3,'fixture/aborted.mp4',$4,100)`,
+		id, endpoint, abortGeneration, sha)
+	exec(`UPDATE nas_stitch_r2_stage_objects SET state='uploading',upload_id='earlier-abort',start_issued_at=clock_timestamp(),
+ grants_drain_at=clock_timestamp()-interval '1 second' WHERE id=122;
+ UPDATE nas_stitch_r2_stage_objects SET state='aborted' WHERE id=122`)
+	exec(`UPDATE nas_stitch_r2_hours SET attempt=2,lease_toolchain_attempt=2,lease_toolchain_sha256=$2 WHERE id=$1`, id, nasDurhamManifestSHA)
+	t.Run("predecessor cannot reuse the native lease profile", func(t *testing.T) {
+		// The previous binary replaces the attempt and token without knowing the profile columns.
+		if _, err := pool.Exec(ctx, `UPDATE nas_stitch_r2_hours SET state='leased',attempt=3,lease_api_key_id=47,
+ lease_token=repeat('f',64),lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, id); err == nil ||
+			!strings.Contains(err.Error(), "reviewed Durham lease toolchain required") {
+			t.Fatal("legacy reclaim inherited the native profile", err)
+		}
+	})
 	const insertStage = `INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes)
- OVERRIDING SYSTEM VALUE VALUES(123,$1,1,47,'stoarama',$2,$3,$4,100)`
+ OVERRIDING SYSTEM VALUE VALUES(123,$1,2,47,'stoarama',$2,$3,$4,100)`
 	outputPath := plan.OutputFolder + "/run-000-" + sha + ".mp4"
 	staleAdmission, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
@@ -184,7 +233,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		t.Fatal("committed starting stage allowed fence removal", err)
 	}
 	exec(`UPDATE nas_stitch_r2_control SET enabled=true,max_staging_bytes=1000000`)
-	lease := r2.StitchStageLease{HourID: id, APIKeyID: 47, Attempt: 1, Token: strings.Repeat("e", 64), PlanSHA: planDigest}
+	lease := r2.StitchStageLease{HourID: id, APIKeyID: 47, Attempt: 2, Token: strings.Repeat("e", 64), PlanSHA: planDigest, Toolchain: nasDurhamManifestSHA}
 	foreign := lease
 	foreign.APIKeyID++
 	if _, err := store.StartStitchStage(ctx, foreign, 123); err == nil {
@@ -224,6 +273,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	result := nasStitchResult{Policy: nasStitchPolicy, PlanSHA: planDigest, Token: lease.Token,
 		Seams: []nasStitchDecision{{Decision: "join"}},
 		Outputs: []nasStitchOutput{{Path: plan.OutputFolder + "/run-000-" + sha + ".mp4", Size: int64(len(media)), SHA: sha,
+			Provenance: reviewedDurhamProvenance(),
 			Inputs: []nasStitchInputProof{{ID: 901, SHA: sha, Size: int64(len(media)), RetirementHeld: true},
 				{ID: 902, SHA: sha, Size: int64(len(media)), RetirementHeld: true}}}}}
 	stagedManifest, err := json.Marshal(result)
@@ -253,6 +303,14 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
  RETURNING id`, manifest, cleanupPolicySHA, string(data), request.Token).Scan(&copyID); err != nil {
 		t.Fatal(err)
 	}
+	t.Run("split outputs certify together and cover their own clips", func(t *testing.T) {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		testCertifiedStitchSplitOutput(t, tx, id, copyID, endpoint, result, item, request)
+	})
 
 	receipt, err := json.Marshal(request.StitchReceipt)
 	if err != nil {
@@ -266,6 +324,14 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	if err != nil {
 		t.Fatal(err)
 	}
+	legacyResult := result
+	legacyResult.Outputs = append([]nasStitchOutput(nil), result.Outputs...)
+	_, legacyProof := stitchUnitFixture()
+	legacyResult.Outputs[0].Provenance = legacyProof.Outputs[0].Provenance
+	legacyBody, err := json.Marshal(legacyResult)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, altered := range []struct {
 		name, payload, etag, version, body string
 		committed                          int64
@@ -274,6 +340,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		{"wrong_etag", string(receipt), "other-etag", "", string(stagedManifest), 100},
 		{"wrong_version", string(receipt), "stage-etag", "other-version", string(stagedManifest), 100},
 		{"wrong_byte_count", string(receipt), "stage-etag", "", string(stagedManifest), 0},
+		{"legacy_toolchain", string(receipt), "stage-etag", "", string(legacyBody), 100},
 		{"empty_manifest", string(receipt), "stage-etag", "", "{}", 100},
 		{"duplicate_disposition", string(receipt), "stage-etag", "", string(duplicateInputs), 100},
 		{"duplicate_plan", string(receipt), "stage-etag", "", string(duplicateInputs), 100},
@@ -301,13 +368,29 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
  SET state='staged',staged_manifest=$3,staged_manifest_sha256=$2 WHERE id=$1`, id, manifest, altered.body); err != nil {
 				t.Fatal(err)
 			}
+			if altered.name == "legacy_toolchain" {
+				var copyReady bool
+				if err := tx.QueryRow(ctx, `SELECT nas_stitch_r2_native_copy_ready(123,$1)`, manifest).Scan(&copyReady); err != nil || copyReady {
+					t.Fatal("legacy output entered the NAS copy queue", err)
+				}
+				probe, err := tx.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = probe.Exec(ctx, `UPDATE nas_r2_copy_items SET lease_expires_at=clock_timestamp()+interval '1 minute'
+ WHERE id=$1`, copyID)
+				probe.Rollback(ctx)
+				if err == nil || !strings.Contains(err.Error(), "reviewed Durham copy toolchain required") {
+					t.Fatal("predecessor renewed a legacy NAS copy", err)
+				}
+			}
 			if _, err := tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',lease_token=NULL,lease_expires_at=NULL,
  completion='downloaded',stitch_receipt=$2,stitch_result_sha256=repeat('a',64),etag=$3,version_id=$4,committed_bytes=$5
  WHERE id=$1`, copyID, altered.payload, altered.etag, altered.version, altered.committed); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO nas_stitch_r2_certificates(hour_id,connection_id,attempt,plan_sha256,manifest_sha256,receipt)
- SELECT $1,13,1,$2,$3,jsonb_build_object('objects',jsonb_build_array(jsonb_build_object('object_key',o.object_key,
+ SELECT $1,13,o.attempt,$2,$3,jsonb_build_object('objects',jsonb_build_array(jsonb_build_object('object_key',o.object_key,
   'etag',o.etag,'version_id',o.version_id,'last_modified',o.last_modified,'readback',q.stitch_receipt)))
  FROM nas_stitch_r2_stage_objects o JOIN nas_r2_copy_items q ON q.source_id=o.id AND q.kind='stitch_output'
  WHERE o.id=123`, id, planDigest, manifest); err == nil || !strings.Contains(err.Error(), wantError) {
@@ -319,6 +402,46 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		id, manifest, string(stagedManifest))
 
 	s := &Server{pool: pool, r2: store, cfg: config.Config{NASR2CopyEnabled: true}}
+	t.Run("server controls staged copies on the reviewed NAS release", func(t *testing.T) {
+		exec(`UPDATE nas_r2_copy_items SET state='pending',lease_token=NULL,lease_expires_at=NULL WHERE id=$1`, copyID)
+		for _, check := range []struct {
+			version                 string
+			master, capability, get bool
+		}{
+			{NASR2CopyPagedClientVersion, true, true, false},
+			{nasCleanupCertifiedStitchVersion, false, true, false},
+			{nasCleanupCertifiedStitchVersion, true, false, true},
+		} {
+			exec(`UPDATE connections SET client_version=$1 WHERE id=13`, check.version)
+			s.cfg.NASStitchEnabled = check.master
+			w := cleanupCall(t, s.handleNASR2CopyLease, 47, 47, "", "", nasR2CopyControl{
+				FreeBytes: request.FreeBytes, AcceptStitch: check.capability,
+			}, "fixture-boot "+check.version)
+			var reply struct{ Task *nasR2CopyTask }
+			if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &reply) != nil || (reply.Task != nil) != check.get {
+				t.Fatalf("staged copy gate differs for %+v: %d %s", check, w.Code, w.Body.String())
+			}
+			if check.get {
+				if reply.Task.Item.Kind != NASR2CopyStitchOutput || reply.Task.ID != copyID {
+					t.Fatal("reviewed client got a different staged output")
+				}
+				request.Token = reply.Task.Token
+			}
+		}
+		w := cleanupCall(t, s.handleAdminNASStitchStatus, 47, 47, "", "", nil)
+		var status struct {
+			Copy struct {
+				Control           string `json:"control"`
+				Version           string `json:"client_version"`
+				ServerEnabled     bool   `json:"server_enabled"`
+				MaintenanceActive bool   `json:"maintenance_active"`
+			} `json:"durham_copy"`
+		}
+		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &status) != nil || status.Copy.Control != "server" ||
+			status.Copy.Version != nasCleanupCertifiedStitchVersion || !status.Copy.ServerEnabled || status.Copy.MaintenanceActive {
+			t.Fatal("operator status did not show the effective server gate", w.Code, w.Body.String())
+		}
+	})
 	exec(`UPDATE connections SET client_version=$1 WHERE id=13`, NASR2CopyPagedClientVersion)
 	startRange := nasR2CopyControl{Token: request.Token, FreeBytes: request.FreeBytes, Length: item.SizeBytes}
 	rangeResponse := cleanupCall(t, s.handleNASR2CopyRange, 47, 47, "id", fmt.Sprint(copyID), startRange, "fixture-boot "+NASR2CopyPagedClientVersion)
@@ -363,6 +486,10 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	}
 	if err := reserve(); err == nil {
 		t.Fatal("certificate rollback released the raw")
+	}
+	var eligible int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM nas_stitch_r2_certified_raw WHERE hour_id=$1`, id).Scan(&eligible); err != nil || eligible != 0 {
+		t.Fatalf("rolled-back certificate exposed NAS cleanup eligibility: %d %v", eligible, err)
 	}
 
 	post := func(principal int64, req nasR2CopyControl) int {
@@ -431,6 +558,15 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
  WHERE hour_id=$1 AND plan_sha256=$2 AND manifest_sha256=$3`, id, planDigest, manifest).Scan(&certificates); err != nil || certificates != 1 {
 		t.Fatalf("expected one exact durable certificate, got %d: %v", certificates, err)
 	}
+	legacy := cleanupCall(t, s.handleAccountNASStitchLease, 47, 47, "", "", nil)
+	var legacyResponse struct {
+		Task  *nasStitchTask
+		Retry int `json:"retry_after_sec"`
+	}
+	if legacy.Code != 200 || json.Unmarshal(legacy.Body.Bytes(), &legacyResponse) != nil ||
+		legacyResponse.Task != nil || legacyResponse.Retry != 60 {
+		t.Fatal("local stitch lane did not yield to the enabled Durham queue", legacy.Code, legacy.Body.String())
+	}
 	if err := reserve(); err != nil {
 		t.Fatalf("committed certificate failed to release the hold: %v", err)
 	}
@@ -470,6 +606,11 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		!strings.Contains(err.Error(), "outcome unconfirmed") {
 		t.Fatalf("expected the provider to lose the DELETE result after both grants drained: %v", err)
 	}
+	var stagingAbsent bool
+	if err := pool.QueryRow(ctx, `SELECT nas_cleanup_certified_stitch_staging_absent(certificate)
+ FROM nas_stitch_r2_certified_raw WHERE clip_id=901`).Scan(&stagingAbsent); err != nil || stagingAbsent {
+		t.Fatalf("unconfirmed staging DELETE became NAS unlink authority: %v %v", stagingAbsent, err)
+	}
 	if _, err := staleFence.Exec(ctx, `DELETE FROM r2_retirement_writer_fences`); err == nil || !strings.Contains(err.Error(), "READ COMMITTED") {
 		t.Fatal("stale transaction snapshot removed the writer fence", err)
 	}
@@ -489,13 +630,73 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		!strings.Contains(err.Error(), "reconciliation") {
 		t.Fatal("ambiguous staging delete allowed a second wire attempt", err)
 	}
-	if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, true); err != nil {
-		t.Fatalf("staging retirement could not reconcile exact absence: %v", err)
+	tx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `UPDATE nas_stitch_r2_stage_retirements
+ SET absence_observed_at=statement_timestamp(),strict_absence_observed_at=statement_timestamp() WHERE object_id=123`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT nas_cleanup_certified_stitch_staging_absent(certificate)
+ FROM nas_stitch_r2_certified_raw WHERE clip_id=901`).Scan(&stagingAbsent); err != nil || stagingAbsent {
+		t.Fatalf("unresolved abort on the earlier attempt cleared staging: %v %v", stagingAbsent, err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("certified NAS cleanup waits for exact R2 retirement", func(t *testing.T) {
+		var legacyObservedAt time.Time
+		if err := pool.QueryRow(ctx, `UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=clock_timestamp()
+ WHERE object_id=123 RETURNING absence_observed_at`).Scan(&legacyObservedAt); err != nil {
+			t.Fatal(err)
+		}
+		testCertifiedStitchNASCleanup(t, s, id, sourceKey, &abort, func() {
+			for _, mode := range []int32{0, 1, 2, 4, 5, 6, 7, 8, 9} {
+				abort.response.Store(mode)
+				if err := store.RetireStitchStage(ctx, 122, sha, time.Time{}, true); err == nil {
+					t.Fatalf("unconfirmed aborted stage accepted in provider case %d", mode)
+				}
+			}
+			abort.response.Store(3)
+			for range 2 {
+				if err := store.RetireStitchStage(ctx, 122, sha, time.Time{}, true); err != nil {
+					t.Fatalf("clean aborted stage absence or exact replay refused: %v", err)
+				}
+			}
+			var receipt, deletionIntent bool
+			if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_r2_aborted_absences WHERE object_id=122),
+ EXISTS(SELECT 1 FROM nas_stitch_r2_stage_retirements WHERE object_id=122)`).Scan(&receipt, &deletionIntent); err != nil || !receipt || deletionIntent {
+				t.Fatalf("aborted reconciliation did not preserve evidence separation: %v %v %v", receipt, deletionIntent, err)
+			}
+			for _, mode := range []int32{1, 2} {
+				stageHeadResponse.Store(mode)
+				if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, true); err == nil {
+					t.Fatalf("ambiguous staged HEAD supplemented a legacy receipt in provider case %d", mode)
+				}
+			}
+			if err := pool.QueryRow(ctx, `SELECT nas_cleanup_certified_stitch_staging_absent(certificate)
+ FROM nas_stitch_r2_certified_raw WHERE clip_id=901`).Scan(&stagingAbsent); err != nil || stagingAbsent {
+				t.Fatalf("legacy staged receipt without strict confirmation cleared NAS gate: %v %v", stagingAbsent, err)
+			}
+			stageHeadResponse.Store(0)
+			if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, true); err != nil {
+				t.Fatalf("staging retirement could not reconcile exact absence: %v", err)
+			}
+			var originalPreserved bool
+			if err := pool.QueryRow(ctx, `SELECT absence_observed_at=$1 AND strict_absence_observed_at>=absence_observed_at
+ FROM nas_stitch_r2_stage_retirements WHERE object_id=123`, legacyObservedAt).
+				Scan(&originalPreserved); err != nil || !originalPreserved {
+				t.Fatalf("strict staging reconciliation changed the legacy observation: %v %v", originalPreserved, err)
+			}
+		})
+	})
 	for _, change := range []string{
 		`DELETE FROM nas_stitch_r2_stage_retirements WHERE object_id=123`,
 		`UPDATE nas_stitch_r2_stage_retirements SET object_id=456 WHERE object_id=123`,
 		`UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=NULL WHERE object_id=123`,
+		`UPDATE nas_stitch_r2_stage_retirements SET strict_absence_observed_at=NULL WHERE object_id=123`,
 	} {
 		if _, err := pool.Exec(ctx, change); err == nil || !strings.Contains(err.Error(), "one-shot") {
 			t.Fatal("staging retirement reservation history could be erased or reassigned", err)
@@ -503,7 +704,11 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	}
 }
 
-func durhamStageTestProvider(t *testing.T, media []byte, sha string) *httptest.Server {
+type durhamStageAbortProbe struct {
+	response, lists, heads atomic.Int32
+}
+
+func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, abort *durhamStageAbortProbe, stageHeadResponse *atomic.Int32) *httptest.Server {
 	t.Helper()
 	var mu sync.Mutex
 	var started, part, completed, deleted bool
@@ -517,7 +722,51 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha string) *httptest.S
 		w.Header().Set("Content-Type", "application/xml")
 		if r.Method == http.MethodGet && r.URL.Path == "/stoarama" && query.Has("uploads") &&
 			strings.HasPrefix(query.Get("prefix"), "stitch-staging/") {
-			fmt.Fprint(w, "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>")
+			bucket, prefix := "stoarama", query.Get("prefix")
+			markers := ""
+			if prefix == abortKey {
+				abort.lists.Add(1)
+				switch abort.response.Load() {
+				case 0:
+					fmt.Fprintf(w, "<ListMultipartUploadsResult><Bucket>%s</Bucket><Prefix>%s</Prefix><IsTruncated>false</IsTruncated><Upload><Key>%s</Key><UploadId>still-live</UploadId></Upload></ListMultipartUploadsResult>", bucket, prefix, abortKey)
+					return
+				case 6:
+					prefix = "stitch-staging/wrong-prefix"
+				case 7:
+					bucket = "wrong-bucket"
+				case 8:
+					markers = "<KeyMarker>past-key</KeyMarker>"
+				case 9:
+					markers = "<UploadIdMarker>past-upload</UploadIdMarker>"
+				}
+			}
+			fmt.Fprintf(w, "<ListMultipartUploadsResult><Bucket>%s</Bucket><Prefix>%s</Prefix>%s<IsTruncated>false</IsTruncated></ListMultipartUploadsResult>", bucket, prefix, markers)
+			return
+		}
+		if r.URL.Path == "/stoarama/"+abortKey {
+			if r.Method != http.MethodHead {
+				t.Errorf("abort reconciliation attempted %s", r.Method)
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			abort.heads.Add(1)
+			switch abort.response.Load() {
+			case 1:
+				w.WriteHeader(http.StatusServiceUnavailable)
+			case 2:
+				w.WriteHeader(http.StatusOK)
+			case 3:
+				w.WriteHeader(http.StatusNotFound)
+			case 4:
+				w.Header().Set("x-amz-delete-marker", "true")
+				w.WriteHeader(http.StatusNotFound)
+			case 5:
+				w.Header().Set("x-amz-error-code", "NoSuchBucket")
+				w.WriteHeader(http.StatusNotFound)
+			default:
+				t.Error("abort reconciliation performed HEAD without a matching empty multipart listing")
+				w.WriteHeader(http.StatusInternalServerError)
+			}
 			return
 		}
 		if !strings.HasPrefix(r.URL.Path, "/stoarama/stitch-staging/") {
@@ -547,6 +796,12 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha string) *httptest.S
 			deleted = true
 			w.WriteHeader(http.StatusServiceUnavailable)
 		case r.Method == http.MethodHead && deleted:
+			switch stageHeadResponse.Load() {
+			case 1:
+				w.Header().Set("x-amz-delete-marker", "true")
+			case 2:
+				w.Header().Set("x-amz-error-code", "NoSuchBucket")
+			}
 			w.WriteHeader(http.StatusNotFound)
 		case r.Method == http.MethodHead && completed:
 			w.Header().Set("ETag", `"stage-etag"`)

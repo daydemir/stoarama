@@ -16,7 +16,10 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
+
+import durham_stitch
 
 ROOT = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('v85r_pull', ROOT/'stoarama_pull.py')
@@ -123,6 +126,65 @@ class V85rTests(unittest.TestCase):
             with self.subTest(case=case['case']):
                 self.assertEqual(runner.decide(c, row, row['source_bindings'], bad, human, set()),
                                  tuple(case['expected']))
+
+    def test_durham_rejects_unbound_lease_and_recovered_attempt(self):
+        expires = "2099-01-01T00:00:00+00:00"
+        for recovered in (False, True):
+            with self.subTest(recovered=recovered), tempfile.TemporaryDirectory() as state:
+                state = Path(state)
+                task = {"id": 1, "expires_at": expires}
+                saved = state / "worker-1" / "attempt.json"
+                if recovered:
+                    saved.parent.mkdir(mode=0o700)
+                    saved.write_text(json.dumps(task))
+                http = SimpleNamespace(
+                    stop=SimpleNamespace(wait=mock.Mock(side_effect=[False, True])),
+                    post=mock.Mock(return_value={"source": "r2", "task": task}),
+                    v85r=SimpleNamespace(manifest="native"),
+                )
+                with mock.patch.object(durham_stitch.pull, "stitch_priority"), mock.patch.object(
+                    durham_stitch, "process_task"
+                ) as process:
+                    durham_stitch.run_worker(http, 1, state, {})
+                    process.assert_not_called()
+                self.assertEqual(saved.exists(), recovered)
+
+    def test_durham_resume_checks_the_serving_api_before_io(self):
+        http = SimpleNamespace(
+            post=mock.Mock(return_value={"state": "leased"}),
+            v85r=SimpleNamespace(manifest="native"),
+        )
+        task = dict(id=1, attempt=1, lease_token="lease", plan_sha256="plan")
+        with self.assertRaisesRegex(durham_stitch.DurhamError, "API toolchain differs"):
+            durham_stitch.process_task(http, task, None, None, None, None)
+        self.assertEqual(http.post.call_count, 1)
+
+    @unittest.skipUnless(os.environ.get("V85R_DURHAM_TEST_BUNDLE"), "generated Durham bundle required")
+    def test_native_durham_bundle_replays_frozen_october_evidence(self):
+        pins = json.loads((ROOT / "v85r/durham-arm64.json").read_bytes())
+        blob = Path(os.environ["V85R_DURHAM_TEST_BUNDLE"]).read_bytes()
+        self.assertEqual(len(blob), pins["bundle_size_bytes"])
+        with tempfile.TemporaryDirectory() as state:
+            bundle = pull.stitch_unpack_v85r(blob, pins["bundle_sha256"], pins["manifest_sha256"], state, threading.Event())
+            native_source = (bundle / "runner.py").read_bytes()
+            legacy_source = (ROOT / "v85r/runner.py").read_bytes()
+            self.assertEqual(native_source.count(b"remeasure-linux-arm64"), 2)
+            self.assertEqual(native_source.replace(b"remeasure-linux-arm64", b"remeasure-linux-amd64"), legacy_source)
+            self.assertFalse((bundle / "remeasure-linux-amd64").exists())
+            evaluator = (bundle / "remeasure-linux-arm64").read_bytes()
+            self.assertEqual(hashlib.sha256(evaluator).hexdigest(), pins["evaluator_sha256"])
+            self.assertEqual(int.from_bytes(evaluator[18:20], "little"), 183)
+
+            spec = importlib.util.spec_from_file_location("v85r_durham_runner", bundle / "runner.py")
+            native = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(native)
+            classifier = native.classifier()
+            bad, human = classifier.C.load_vetoes(bundle / "source71.json", bundle / "human12.json")
+            for case in self.recorded_rows():
+                row = case["row"]
+                with self.subTest(case=case["case"]):
+                    actual = native.decide(classifier, row, row["source_bindings"], bad, human, set())
+                    self.assertEqual(actual, tuple(case["expected"]))
 
     def stationary_row(self):
         row = copy.deepcopy(self.recorded_rows()[0]['row'])

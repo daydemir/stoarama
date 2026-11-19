@@ -903,6 +903,7 @@ class Runner:
           WHERE account_id=47 AND connection_id=13 AND mode='dry_run'
           AND id<>""" + str(self.status['current_plan'] or 0) + """
           AND report_sha256='""" + POLICY_SHA + """' AND label NOT LIKE '%-nasonly-%' AND EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=p.id)
+          AND NOT p.manifest @> '[{"permit_reason":"durham_stitch_certified"}]'::jsonb
           AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=p.id
             AND (state<>'would_delete' OR delete_ever_issued OR updated_at<=now()-interval '20 hours'))""" +
           (" AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(p.manifest) e WHERE (e->>'stream_id')::bigint IN (" + excluded + "))" if excluded else ''))
@@ -939,6 +940,7 @@ class Runner:
         excluded = ','.join(str(int(k)) for k in self.status.get('excluded_streams', {}))
         pending = self.query("""SELECT count(*) FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id
           WHERE p.account_id=47 AND p.connection_id=13 AND i.state<>'deleted'
+          AND NOT p.manifest @> '[{"permit_reason":"durham_stitch_certified"}]'::jsonb
           AND (p.mode<>'retired' OR i.delete_ever_issued)""" +
           (" AND NOT (p.mode='dry_run' AND NOT i.delete_ever_issued AND i.state='would_delete' AND i.recovery IN (" + ','.join("'" + value + "'" for value in sorted(RECOVERY)) + ") AND (coalesce(i.item,p.manifest->(i.ordinal-1))->>'stream_id')::bigint IN (" + excluded + "))" if excluded else ''))
         require(pending == 0, 'no eligible work but reserved or uncertain files remain')

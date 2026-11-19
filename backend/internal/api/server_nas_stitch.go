@@ -26,6 +26,10 @@ const nasStitchRevision = "v85r-rebuilt-1"
 const nasStitchCorpusSHA = "5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b"
 const nasStitchReason = "stitched_included"
 const nasStitchFence int64 = 7343226011110
+
+const nasLocalStitchInFlightSQL = `EXISTS(SELECT 1 FROM nas_stitch_tasks
+ WHERE (state='leased' AND lease_expires_at>clock_timestamp())
+ OR (state='verified' AND cleanup_plan_id IS NULL AND registration_abandoned_at IS NULL))`
 const nasStitchMaxBytes int64 = 2500000000
 
 type nasStitchEdge struct {
@@ -75,12 +79,13 @@ type nasStitchPlan struct {
 	FeatureInputs []collation.Clip  `json:"feature_inputs"`
 }
 type nasStitchTask struct {
-	ID      int64         `json:"id"`
-	Attempt int           `json:"attempt"`
-	Token   string        `json:"lease_token"`
-	Expires time.Time     `json:"expires_at"`
-	PlanSHA string        `json:"plan_sha256"`
-	Plan    nasStitchPlan `json:"plan"`
+	ID        int64         `json:"id"`
+	Attempt   int           `json:"attempt"`
+	Token     string        `json:"lease_token"`
+	Expires   time.Time     `json:"expires_at"`
+	PlanSHA   string        `json:"plan_sha256"`
+	Plan      nasStitchPlan `json:"plan"`
+	Toolchain string        `json:"toolchain,omitempty"`
 }
 type nasStitchDecision struct {
 	Policy        string `json:"policy"`
@@ -97,7 +102,9 @@ type nasStitchDecision struct {
 type nasStitchProvenance struct {
 	OctoberRecovered bool   `json:"october_ffmpeg_recovered"`
 	Policy           string `json:"policy"`
+	Architecture     string `json:"architecture,omitempty"`
 	ManifestSHA      string `json:"manifest_sha256"`
+	EvaluatorSHA     string `json:"evaluator_sha256,omitempty"`
 	FFmpegVersion    string `json:"ffmpeg_version"`
 	FFprobeVersion   string `json:"ffprobe_version"`
 	FFmpegSHA        string `json:"ffmpeg_sha256"`
@@ -283,7 +290,22 @@ func (s *Server) handleAdminNASStitchPause(w http.ResponseWriter, r *http.Reques
 }
 func (s *Server) handleAdminNASStitchStatus(w http.ResponseWriter, r *http.Request) {
 	var raw []byte
-	err := s.pool.QueryRow(r.Context(), `SELECT jsonb_build_object('policy','v85r','revision','v85r-rebuilt-1','scopes',coalesce((SELECT jsonb_agg(s ORDER BY id) FROM nas_stitch_scopes s),'[]'),'tasks',coalesce((SELECT jsonb_agg(t ORDER BY t.awaiting_receipt DESC,t.id DESC) FROM (SELECT id,scope_id,recording_id,hour_at,state,attempt,plan_sha256,CASE WHEN lease_api_key_attempt=attempt THEN lease_api_key_id END AS lease_api_key_id,cleanup_plan_id,registration_abandoned_at,registration_abandoned_reason,updated_at,(state='verified' AND cleanup_plan_id IS NULL AND registration_abandoned_at IS NULL) AS awaiting_receipt FROM nas_stitch_tasks ORDER BY awaiting_receipt DESC,id DESC LIMIT 100) t),'[]'),'client',(SELECT nas_stitch_status FROM connections WHERE id=13))`).Scan(&raw)
+	err := s.pool.QueryRow(r.Context(), `WITH client AS (
+ SELECT client_version,last_seen_at,nas_stitch_status FROM connections WHERE id=13
+)
+SELECT jsonb_build_object('policy','v85r','revision','v85r-rebuilt-1',
+ 'scopes',coalesce((SELECT jsonb_agg(s ORDER BY id) FROM nas_stitch_scopes s),'[]'),
+ 'tasks',coalesce((SELECT jsonb_agg(t ORDER BY t.awaiting_receipt DESC,t.id DESC) FROM (
+  SELECT id,scope_id,recording_id,hour_at,state,attempt,plan_sha256,
+   CASE WHEN lease_api_key_attempt=attempt THEN lease_api_key_id END AS lease_api_key_id,cleanup_plan_id,
+   registration_abandoned_at,registration_abandoned_reason,updated_at,
+   (state='verified' AND cleanup_plan_id IS NULL AND registration_abandoned_at IS NULL) AS awaiting_receipt
+  FROM nas_stitch_tasks ORDER BY awaiting_receipt DESC,id DESC LIMIT 100) t),'[]'),
+ 'client',(SELECT nas_stitch_status FROM client),
+ 'durham_copy',jsonb_build_object('control','server','client_version',(SELECT client_version FROM client),
+  'last_seen_at',(SELECT last_seen_at FROM client),'server_enabled',$1::boolean,
+  'maintenance_active',EXISTS(SELECT 1 FROM nas_cleanup_maintenance WHERE active)))`,
+		s.nasR2StitchCopyEnabled(nasCleanupCertifiedStitchVersion)).Scan(&raw)
 	if err != nil {
 		util.WriteError(w, 500, "stitch status unavailable")
 		return
@@ -300,9 +322,8 @@ func (s *Server) handleAccountNASStitchLease(w http.ResponseWriter, r *http.Requ
 		util.WriteJSON(w, 200, map[string]any{"task": nil, "retry_after_sec": 300})
 		return
 	}
-	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
-		if !caller.dedicated {
-			util.WriteError(w, 403, "dedicated Durham key required")
+	if r.Header.Get("X-Stoarama-Stitch-Source") != "" {
+		if !requireDurhamProfile(w, r, caller) {
 			return
 		}
 		s.handleDurhamStitchLease(w, r, caller)
@@ -329,7 +350,9 @@ func (s *Server) handleAccountNASStitchLease(w http.ResponseWriter, r *http.Requ
 	var busy bool
 	// One lane across clients and reboots. Wait for the durable receipt after
 	// result acceptance. Legacy plans already passed that gate and stay intact.
-	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_tasks WHERE (state='leased' AND lease_expires_at>now()) OR (state='verified' AND cleanup_plan_id IS NULL AND registration_abandoned_at IS NULL)) OR EXISTS(SELECT 1 FROM nas_cleanup_frozen_streams)`).Scan(&busy)
+	err = tx.QueryRow(ctx, `SELECT `+nasLocalStitchInFlightSQL+`
+ OR EXISTS(SELECT 1 FROM nas_cleanup_frozen_streams)
+ OR EXISTS(SELECT 1 FROM nas_stitch_r2_control WHERE enabled)`).Scan(&busy)
 	if err != nil {
 		util.WriteError(w, 500, "stitch lane lookup failed")
 		return
@@ -425,9 +448,8 @@ func (s *Server) handleAccountNASStitchCheckpoint(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
-	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
-		if !caller.dedicated {
-			util.WriteError(w, 403, "dedicated Durham key required")
+	if r.Header.Get("X-Stoarama-Stitch-Source") != "" {
+		if !requireDurhamProfile(w, r, caller) {
 			return
 		}
 		s.handleDurhamStitchCheckpoint(w, r, caller, id)
@@ -680,7 +702,7 @@ func validateNASStitchProof(p nasStitchPlan, q nasStitchResult, origin nasStitch
 	}
 	var included []nasCleanupItem
 	for _, o := range q.Outputs {
-		if o.Policy != nasStitchPolicy || !validNASStitchProvenance(o.Provenance) || !validCleanupPath(o.Path) || path.Dir(o.Path) != p.OutputFolder || paths[o.Path] || !stitchSHA(o.SHA) || o.ReadbackSHA != o.SHA || o.Size <= 0 || o.Size > nasStitchMaxBytes+nasStitchMaxBytes/10 || !o.FullDecode || !o.SeamDecode || !o.PacketChain || !o.NativeAudit || !o.NoAudio || !o.Fsynced || len(o.Inputs) == 0 {
+		if o.Policy != nasStitchPolicy || !validNASStitchProvenance(o.Provenance, origin) || !validCleanupPath(o.Path) || path.Dir(o.Path) != p.OutputFolder || paths[o.Path] || !stitchSHA(o.SHA) || o.ReadbackSHA != o.SHA || o.Size <= 0 || o.Size > nasStitchMaxBytes+nasStitchMaxBytes/10 || !o.FullDecode || !o.SeamDecode || !o.PacketChain || !o.NativeAudit || !o.NoAudio || !o.Fsynced || len(o.Inputs) == 0 {
 			return nil, errors.New("complete durable native output verification required")
 		}
 		paths[o.Path] = true
@@ -739,7 +761,7 @@ func validateNASStitchProof(p nasStitchPlan, q nasStitchResult, origin nasStitch
 		for _, id := range q.LeftOut {
 			left = left || id == r.ID
 		}
-		if r.Policy != nasStitchPolicy || !validNASStitchProvenance(r.Provenance) || !ok || !left || repairSeen[r.ID] || r.OriginalSHA != c.SHA256 || r.OriginalSize != c.SizeBytes || !validCleanupPath(r.Path) || path.Dir(r.Path) != p.OutputFolder || !strings.HasPrefix(path.Base(r.Path), "repaired-") || !stitchSHA(r.SHA) || r.Size <= 0 || r.Size > 32<<20 || r.ReadbackSHA != r.SHA || r.Method != "mdat_annexb_vui_prefix_v1" || r.FPSSource != "vui" || !r.Synthesized || r.Complete || !r.FullDecode || !r.Fsynced || r.Frames <= 0 || r.Duration < 1 || r.Duration > 60 || len(r.Note) > 1000 {
+		if r.Policy != nasStitchPolicy || !validNASStitchProvenance(r.Provenance, origin) || !ok || !left || repairSeen[r.ID] || r.OriginalSHA != c.SHA256 || r.OriginalSize != c.SizeBytes || !validCleanupPath(r.Path) || path.Dir(r.Path) != p.OutputFolder || !strings.HasPrefix(path.Base(r.Path), "repaired-") || !stitchSHA(r.SHA) || r.Size <= 0 || r.Size > 32<<20 || r.ReadbackSHA != r.SHA || r.Method != "mdat_annexb_vui_prefix_v1" || r.FPSSource != "vui" || !r.Synthesized || r.Complete || !r.FullDecode || !r.Fsynced || r.Frames <= 0 || r.Duration < 1 || r.Duration > 60 || len(r.Note) > 1000 {
 			return nil, errors.New("partial repair provenance incomplete or wrongly included")
 		}
 		repairSeen[r.ID] = true
@@ -758,9 +780,8 @@ func (s *Server) handleAccountNASStitchResult(w http.ResponseWriter, r *http.Req
 	if !ok {
 		return
 	}
-	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
-		if !caller.dedicated {
-			util.WriteError(w, 403, "dedicated Durham key required")
+	if r.Header.Get("X-Stoarama-Stitch-Source") != "" {
+		if !requireDurhamProfile(w, r, caller) {
 			return
 		}
 		s.handleDurhamStitchResult(w, r, caller, id)
@@ -848,7 +869,7 @@ func (s *Server) handleAccountNASStitchResult(w http.ResponseWriter, r *http.Req
 // Legacy stitched cleanup plans are evidence only. The ordinary cleanup
 // master still governs ordinary, independently authorized cleanup items.
 func (s *Server) stitchDeletionMaster(i nasCleanupItem) bool {
-	return s.cfg.NASCleanupDeletionEnabled && i.PermitReason == ""
+	return s.cfg.NASCleanupDeletionEnabled && (i.PermitReason == "" || i.PermitReason == nasCleanupCertifiedStitchReason)
 }
 
 func (s *Server) recordNASStitchStatus(ctx context.Context, cid int64, raw json.RawMessage) {
@@ -874,9 +895,8 @@ func (s *Server) handleAccountNASStitchReady(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
-	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
-		if !caller.dedicated {
-			util.WriteError(w, 403, "dedicated Durham key required")
+	if r.Header.Get("X-Stoarama-Stitch-Source") != "" {
+		if !requireDurhamProfile(w, r, caller) {
 			return
 		}
 		s.handleDurhamStitchStatus(w, r, caller, id)
@@ -935,8 +955,20 @@ func (s *Server) handleAccountNASStitchReady(w http.ResponseWriter, r *http.Requ
 	util.WriteJSON(w, 200, map[string]any{"ready": true, "id": id})
 }
 
-func validNASStitchProvenance(p nasStitchProvenance) bool {
-	return p.OctoberRecovered && p.Policy == nasStitchPolicy && p.ManifestSHA == nasStitchManifestSHA && p.FFmpegVersion == "N-126826-gc0e8b139fd-20260924" && p.FFprobeVersion == "N-126826-gc0e8b139fd-20260924" && p.FFmpegSHA == "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b" && p.FFprobeSHA == "9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c"
+func reviewedDurhamProvenance() nasStitchProvenance {
+	return nasStitchProvenance{
+		Policy: nasStitchPolicy, Architecture: "linux-arm64",
+		ManifestSHA: nasDurhamManifestSHA, EvaluatorSHA: nasDurhamEvaluatorSHA,
+		FFmpegVersion: nasDurhamToolVersion, FFprobeVersion: nasDurhamToolVersion,
+		FFmpegSHA: nasDurhamFFmpegSHA, FFprobeSHA: nasDurhamFFprobeSHA,
+	}
+}
+
+func validNASStitchProvenance(p nasStitchProvenance, origin nasStitchProofOrigin) bool {
+	if origin == nasStitchOnDurham {
+		return p == reviewedDurhamProvenance()
+	}
+	return p.Architecture == "" && p.EvaluatorSHA == "" && p.OctoberRecovered && p.Policy == nasStitchPolicy && p.ManifestSHA == nasStitchManifestSHA && p.FFmpegVersion == "N-126826-gc0e8b139fd-20260924" && p.FFprobeVersion == "N-126826-gc0e8b139fd-20260924" && p.FFmpegSHA == "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b" && p.FFprobeSHA == "9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c"
 }
 
 // GET capabilities only; no cloud writes, no release or arbitrary object paths.

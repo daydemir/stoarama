@@ -112,8 +112,8 @@ registration receipts after the server accepts its result. A second readiness
 ACK records `completed_no_retirement` and releases the lane. A lost ACK is
 reconciled from the SQLite FULL/WAL journal before new work.
 
-Every ordinary stitch retains its raw inputs. The API and client refuse
-stitch-derived deletion permits, including legacy registered results.
+NAS-local stitches retain their raw inputs. The API and client refuse
+legacy stitch deletion permits, including legacy registered results.
 Migration 0214 requires old stitch cleanup plans to be disabled and their
 issued permits to have expired before opening the local stitch lane.
 Preserve existing SQLite journals, outputs, ledgers and plans. Ordinary NAS
@@ -341,8 +341,60 @@ attempt and part journals survive a worker restart within the lease.
 Ambiguous multipart start or completion keeps the ledger and stage budget
 reserved for controller reconciliation. Keep unknown multipart uploads gated.
 
-On the NAS, connection 13 opts into staged output with
-`STOARAMA_R2_COPY_STITCH_OUTPUT_ENABLED=true` in the existing copy service.
+Durham uses the native Linux ARM64 profile in
+`clients/nas-pull/v85r/durham-arm64.json`. The previous production installer
+selected the October amd64 profile and ran its evaluator and media tools
+through QEMU. The offline ARM64 benchmark used the Debian 7.1.5 media tools and
+the evaluator built from the same pinned Go sources. The ARM64 bundle carries
+the same corpus and classifier, with both evaluator calls aimed at the native
+binary. The worker verifies the bundle, executable machine types and tool
+SHA-256 values before requesting a lease. The bundle also pins the resolved
+ARM64 loader and shared library hashes. The worker verifies the loaded
+dependency set before startup and before building an hour. A package or
+library update that changes the set stops the worker until the new build
+has been reviewed and replayed. The API binds the profile to the exact
+lease attempt. The worker checks that identity on lease, at resume and
+before processing. PostgreSQL requires matching output provenance when
+issuing a certificate, including when the API is rolled back.
+
+Build the native bundle with Go 1.26.5 and the exact signed-index Debian
+`ffmpeg_7.1.5-0+deb13u1_arm64.deb`:
+
+```sh
+python3 -B clients/nas-pull/v85r/build_durham.py \
+  --ffmpeg-deb "$DEB" --out "$RELEASE/durham-arm64.tar.gz"
+```
+
+Merge using `[skip render]`. The R2 controller owns API deployment and
+migration 0222. Pause the Durham queue and turn off API stitching before
+upgrading or rolling back. Record the serving API revision and migration set
+and reconcile expired attempts, stage grants and unresolved multipart
+operations before opening a window. Drain leased NAS output copies before
+rollback. An issued copy lease can still renew and certify after the API stitch
+switch is off. Preserve legacy staged results and their
+input holds.
+
+On the existing Debian ARM64 guest, install the signed
+`ffmpeg=7:7.1.5-0+deb13u1` package with the reviewed dependencies. Install the
+reviewed `stoarama_pull.py`, `durham_stitch.py`, and systemd unit. Put the
+profile JSON and generated bundle in the root-owned
+`/opt/stoarama-stitch/v85r/`. Keep the private systemd credential, service user,
+direct API and R2 origins, and macOS boot cron. The unit clears QEMU and
+dynamic-loader overrides and reserves 512 MiB of available guest memory.
+Check startup and pin verification with the queue off. Open work only after
+the matching API and schema are serving. The NAS-local client and proof
+replay use the October profile.
+
+The API grants staged output leases to connection 13 on
+`r2-copy-v7-certified-stitch` while both `NAS_STITCH_ENABLED` and
+`NAS_R2_COPY_ENABLED` are true. The client leaves the legacy opt-in out of its
+request, so a rolled-back API can continue raw copies without leasing staged
+outputs. `stoaramactl nas-stitch status` reports the heartbeat version and time,
+server switches and maintenance hold in `durham_copy`. Enable the Durham queue
+before enabling API stitching. The queue blocks new NAS-local leases, and
+Durham waits for existing NAS-local work and outstanding registration to drain.
+Keep the queue enabled until the pilot receipt commits and turn off API stitching
+before pausing the Durham queue.
 It downloads to a private partial, verifies the size and full SHA-256,
 publishes create-only, syncs the file and directory, then reopens and hashes
 the published file before certifying. The last exact output receipt commits
@@ -360,7 +412,15 @@ certification, read and write grant drain, a live drained writer fence,
 a fresh exact-bucket conditional DELETE proof, and dependency checks.
 The current provider proof applies to unversioned objects. An ambiguous
 delete retains its one-shot intent and blocks fence removal and conflicting
-dependencies until the controller observes absence.
+dependencies until the controller observes absence. For NAS raw cleanup,
+reconcile legacy staged absence receipts once with the current command to
+record a strict HEAD confirmation alongside the original observation.
+
+The same reconcile command can record absence for an aborted stage, including
+one from an earlier attempt. It requires the exact stage identity, writer
+drain, an empty multipart listing for the key, and HTTP 404 from HEAD. An
+abort after possible multipart completion remains held because that request
+can still have an unresolved outcome.
 
 ```sh
 stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --apply \
@@ -368,13 +428,48 @@ stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --apply \
 stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --reconcile
 ```
 
-Provision the pinned x86 tools, bundle and corpus offline in the Durham
-guest. Verify execution of each pinned tool and the direct network
-path before enabling the service. Install the reviewed unit and client under
-their root-owned guest paths, configure the direct API base and R2 origin
-in `/etc/stoarama-stitch/worker.env`, and use systemd `LoadCredential` with
-the private provisioned bearer file. Use macOS boot cron as the existing
-Durham owner to run `durham-start.sh`. Confirm unattended starts with the
-approved release before admitting work. The controller sets the staging
-reservation to fit the existing storage and billing allowance and verifies
-a single hour through NAS custody before opening the four-worker queue.
+### Release certified raw on the NAS
+
+The Durham producer always sends `retirement_held: true`. The connection-13
+certificate releases the exact inputs in the same transaction. The
+`nas_stitch_r2_certified_raw` view exposes that released set. Each clip maps
+to the certified output that contains it, including when an hour has several
+outputs.
+
+Keep the original files on the NAS through the controller's keep-28 R2 DELETE
+and confirming HEAD. After the exact reservation, intent, attempt, retirement
+receipt and absence event are durable, the clip appears in
+`nas_cleanup_certified_stitch_raw`. An unresolved R2 DELETE keeps the original
+on the NAS.
+
+Use `stoaramactl nas-cleanup prepare --input MANIFEST.json` with the usual
+label and items in a separate plan. Request
+`{"kind":"certified_stitch_raw","source_id":901}` for an exact eligible clip.
+The API derives the replacement proof and original sidecar digest and uses the
+existing dry run, plan approval, source freeze, delivery veto and deletion
+budget. NAS deletion also requires recorded absence for every staging object
+from every attempt for that hour. Before issuing or replaying a permit, the API
+checks each aborted stage's writer grant drain, lists multipart uploads for its
+exact key prefix, and requires an unambiguous HEAD 404 for that key. Hours with
+no aborted stages require no provider reads for this check. The initial dry run
+records the raw and sidecar identities from the NAS and hashes them against the
+exact recorded evidence, including raws copied after the frozen inventory audit. Before asking for a
+permit the client rechecks those files and hashes the retained output. It
+rechecks the open files and pathnames immediately before unlink. A missing
+or changed output keeps the raw.
+
+Apply 0219 with the NAS deletion master off. Before preparing a certified
+dry run, verify the updated API on every serving instance, the exact
+`r2-copy-v7-certified-stitch` NAS client, and the updated Jelly gates. Verify
+the deployed keep-28 controller closes admission at the first DELETE write,
+including when admission closes while the keep-28 transport is dialing.
+#565 establishes that behavior for the outside-keep-28 lane. The keep-28
+transport needs its own implementation and regression test before rollout.
+Keep the ordinary R2 recovery verifier and its Jelly runner on ordinary
+plans. Certified plans use connection 13's replacement readback for their
+dry-run and deletion evidence. Pause certified dry runs and enabled plans
+and drain live permits before rolling either side back.
+
+Before opening the queue beyond the pilot, verify that one full hour from a
+non-keep-everything stream has a connection-13 certificate and exact R2
+retirement evidence. Leave NAS deletion off during this rollout.

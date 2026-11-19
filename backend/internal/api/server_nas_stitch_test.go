@@ -93,7 +93,9 @@ CREATE TABLE IF NOT EXISTS account_api_keys(
  id bigserial PRIMARY KEY, account_id bigint NOT NULL, key_prefix text, secret_hash text,
  label text, scopes text[], revoked_at timestamptz, expires_at timestamptz,
  last_used_at timestamptz, updated_at timestamptz
-);`); err != nil {
+);
+CREATE TABLE nas_stitch_r2_control(enabled boolean NOT NULL);
+INSERT INTO nas_stitch_r2_control VALUES(false);`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.pool.Exec(f.ctx, `INSERT INTO account_api_keys(id,account_id,secret_hash,scopes)
@@ -180,6 +182,63 @@ func TestNASStitchCheckpointAndLeasePauseUnderCleanupFreeze(t *testing.T) {
 	checkpoint(q.Token, true)
 	f.s.cfg.NASStitchEnabled = false
 	checkpoint(q.Token, false)
+}
+
+func TestR2StitchDurhamRequiresBidirectionalProfileProtocol(t *testing.T) {
+	for _, test := range []struct {
+		source, manifest string
+		dedicated        bool
+		code             int
+	}{
+		{"r2-v1", nasDurhamManifestSHA, true, http.StatusConflict},
+		{"r2-v2", "", true, http.StatusConflict},
+		{"r2-v2", nasStitchManifestSHA, true, http.StatusConflict},
+		{"r2-v2", nasDurhamManifestSHA, false, http.StatusForbidden},
+		{"r2-v2", nasDurhamManifestSHA, true, http.StatusOK},
+	} {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPost, "/account/connections/stitch/lease", nil)
+		r.Header.Set("X-Stoarama-Stitch-Source", test.source)
+		r.Header.Set("X-Stoarama-Stitch-Toolchain", test.manifest)
+		if ok := requireDurhamProfile(w, r, nasStitchCaller{dedicated: test.dedicated}); ok != (test.code == http.StatusOK) || w.Code != test.code {
+			t.Fatalf("profile gate for %+v: %t %d", test, ok, w.Code)
+		}
+	}
+}
+
+func TestDurhamProofRequiresOneNativeToolchain(t *testing.T) {
+	plan, proof := stitchUnitFixture()
+	for i := range proof.Outputs[0].Inputs {
+		proof.Outputs[0].Inputs[i].RawProof = nil
+		proof.Outputs[0].Inputs[i].RetirementHeld = true
+	}
+	if _, err := validateNASStitchProof(plan, proof, nasStitchOnDurham); err == nil {
+		t.Fatal("Durham accepted the legacy amd64 package")
+	}
+	native := reviewedDurhamProvenance()
+	proof.Outputs[0].Provenance = native
+	if _, err := validateNASStitchProof(plan, proof, nasStitchOnDurham); err != nil {
+		t.Fatal(err)
+	}
+	if validNASStitchProvenance(native, nasStitchOnNAS) {
+		t.Fatal("the NAS-local lane accepted the Durham toolchain")
+	}
+	for _, change := range []func(*nasStitchProvenance){
+		func(p *nasStitchProvenance) { p.Architecture = "linux-amd64" },
+		func(p *nasStitchProvenance) { p.OctoberRecovered = true },
+		func(p *nasStitchProvenance) { p.ManifestSHA = nasStitchManifestSHA },
+		func(p *nasStitchProvenance) { p.EvaluatorSHA = "" },
+		func(p *nasStitchProvenance) { p.FFmpegSHA = p.FFprobeSHA },
+		func(p *nasStitchProvenance) { p.FFprobeSHA = p.FFmpegSHA },
+		func(p *nasStitchProvenance) { p.FFprobeVersion = "unreviewed" },
+	} {
+		mixed := native
+		change(&mixed)
+		proof.Outputs[0].Provenance = mixed
+		if _, err := validateNASStitchProof(plan, proof, nasStitchOnDurham); err == nil {
+			t.Fatal("Durham accepted mismatched toolchain evidence", mixed)
+		}
+	}
 }
 
 func TestNASStitchRejectsInventedCorpusAndOffLeavesQueueUntouched(t *testing.T) {

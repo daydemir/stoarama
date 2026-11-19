@@ -118,6 +118,9 @@ type nasCleanupItem struct {
 	SidecarRequired   bool      `json:"sidecar_required"`
 	Frozen            [5]int64  `json:"frozen_identity"`
 	FrozenSidecar     [5]int64  `json:"frozen_sidecar_identity"`
+
+	StitchCertificate *nasCleanupStitchCertificate `json:"stitch_certificate,omitempty"`
+	StitchRawSidecar  *nasCleanupStitchSidecar     `json:"stitch_raw_sidecar,omitempty"`
 }
 type nasCleanupReport struct {
 	RegisteredSnapshotAt time.Time `json:"registered_snapshot_at"`
@@ -243,6 +246,7 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	ctx := r.Context()
+	certifiedPlan := req.Items[0].Kind == nasCleanupCertifiedStitchKind
 	report, err := s.cleanupReport(ctx)
 	if err != nil {
 		util.WriteError(w, 409, err.Error())
@@ -260,8 +264,9 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 	}
 	defer tx.Rollback(ctx)
 	var exists bool
-	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM connections WHERE id=13 AND account_id=47 AND kind='nas_pull')`).Scan(&exists); err != nil || !exists {
-		util.WriteError(w, 409, "NAS connection unavailable")
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM connections WHERE id=13 AND account_id=47 AND kind='nas_pull'
+ AND (NOT $1 OR client_version=$2))`, certifiedPlan, nasCleanupCertifiedStitchVersion).Scan(&exists); err != nil || !exists {
+		util.WriteError(w, 409, "NAS connection or required cleanup client unavailable")
 		return
 	}
 	// Serialize admissions before taking catalog locks; persistence checks
@@ -274,10 +279,22 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 	items := []nasCleanupItem{}
 	seen := map[string]bool{}
 	for _, sel := range req.Items {
-		i, e := cleanupCatalogItem(ctx, tx, sel.Kind, sel.SourceID, s.r2.Bucket())
+		kind := sel.Kind
+		certified := kind == nasCleanupCertifiedStitchKind
+		if certified != certifiedPlan {
+			util.WriteError(w, 400, "certified stitch cleanup uses a separate plan")
+			return
+		}
+		if certified {
+			kind = "raw"
+		}
+		i, e := cleanupCatalogItem(ctx, tx, kind, sel.SourceID, s.r2.Bucket())
+		if e == nil && certified {
+			e = loadNASCleanupStitchCertificate(ctx, tx, &i)
+		}
 		// Early admission filter only; every observation rechecks the file and
 		// all of its sources against the window and the live best14 replay.
-		if e != nil || !report.permits(i) || seen[i.RelativePath] || !policy.outside(i.StreamID, i.StartAt, i.EndAt) {
+		if e != nil || !report.permits(i) || seen[i.RelativePath] || !policy.permitsCleanup(i, i.StartAt, i.EndAt) {
 			util.WriteError(w, 409, "source identity is unknown, duplicated, outside its stream's folders or inside the keep28 window")
 			return
 		}
@@ -292,9 +309,11 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 		util.WriteJSON(w, 409, map[string]any{"error": "plan exceeds the per-plan deletion cap", "plan_bytes": planBytes, "max_plan_bytes": nasCleanupMaxPlanBytes})
 		return
 	}
-	if err = s.bindCleanupFrozenInventory(ctx, items); err != nil {
-		util.WriteError(w, 409, err.Error())
-		return
+	if !certifiedPlan {
+		if err = s.bindCleanupFrozenInventory(ctx, items); err != nil {
+			util.WriteError(w, 409, err.Error())
+			return
+		}
 	}
 	id, sha, err := persistNASCleanupPlan(ctx, tx, req.Label, items)
 	if err != nil {
@@ -657,6 +676,7 @@ FROM nas_cleanup_plans p
 JOIN LATERAL (
  SELECT candidate.* FROM nas_cleanup_items candidate
  WHERE candidate.plan_id=p.id AND candidate.state='pending'
+ AND ($6 OR candidate.item->>'permit_reason' IS DISTINCT FROM 'durham_stitch_certified')
  ORDER BY candidate.attempt,candidate.id LIMIT 1 FOR UPDATE SKIP LOCKED
 ) i ON true
 WHERE p.connection_id=$1 AND p.report_sha256=$3 AND p.id=ANY($4)
@@ -783,7 +803,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		var task cleanupTask
 		var raw, approved []byte
 		var mode string
-		err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, allowExecution, cleanupPolicySHA, plans, groupIDs).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode)
+		err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, allowExecution, cleanupPolicySHA, plans, groupIDs, req.ClientVersion == nasCleanupCertifiedStitchVersion).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode)
 		if errors.Is(err, pgx.ErrNoRows) {
 			break
 		}
@@ -896,6 +916,9 @@ func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID str
 		if err = json.Unmarshal(raw, &task.Item); err != nil {
 			return nil, err
 		}
+		if task.Item.PermitReason == nasCleanupCertifiedStitchReason && version != nasCleanupCertifiedStitchVersion {
+			continue
+		}
 		if mode == "enabled" {
 			if !sessionDeadline.After(time.Now()) {
 				continue
@@ -923,8 +946,21 @@ func validCleanupProof(raw []byte, i nasCleanupItem) bool {
 			SHA      string                     `json:"sha256"`
 			Binding  map[string]json.RawMessage `json:"binding"`
 		} `json:"sidecar"`
+
+		Replacement *nasCleanupStitchOutput `json:"stitch_replacement"`
 	}
-	if len(raw) > 16384 || json.Unmarshal(raw, &p) != nil || p.Root[0] <= 0 || p.Root[1] <= 0 || len(p.Ancestors) != len(strings.Split(i.RelativePath, "/"))-1 || p.Identity != i.Frozen || p.Identity[4] != p.Root[0] || p.SHA != i.SHA256 || len(p.ParentMembers) != 64 || !lowerHex(p.ParentMembers) {
+	if len(raw) > 16384 || json.Unmarshal(raw, &p) != nil || p.Root[0] <= 0 || p.Root[1] <= 0 || len(p.Ancestors) != len(strings.Split(i.RelativePath, "/"))-1 || p.Identity[4] != p.Root[0] || p.SHA != i.SHA256 || len(p.ParentMembers) != 64 || !lowerHex(p.ParentMembers) {
+		return false
+	}
+	certified := i.PermitReason == nasCleanupCertifiedStitchReason
+	if certified {
+		if i.StitchCertificate == nil || i.StitchRawSidecar == nil || !i.SidecarRequired ||
+			p.Identity[0] != i.SizeBytes || p.Identity[1] <= 0 || p.Identity[2] <= 0 || p.Identity[3] <= 0 ||
+			p.Replacement == nil || *p.Replacement != i.StitchCertificate.Output ||
+			p.Replacement.Identity[4] != p.Root[0] || p.Replacement.Identity[3] == p.Identity[3] {
+			return false
+		}
+	} else if p.Replacement != nil || p.Identity != i.Frozen {
 		return false
 	}
 	for _, a := range p.Ancestors {
@@ -933,7 +969,16 @@ func validCleanupProof(raw []byte, i nasCleanupItem) bool {
 		}
 	}
 	if i.SidecarRequired {
-		if p.Sidecar == nil || p.Sidecar.Identity != i.FrozenSidecar || len(p.Sidecar.SHA) != 64 || !lowerHex(p.Sidecar.SHA) {
+		if p.Sidecar == nil || len(p.Sidecar.SHA) != 64 || !lowerHex(p.Sidecar.SHA) {
+			return false
+		}
+		id := p.Sidecar.Identity
+		if certified {
+			if id[0] != i.StitchRawSidecar.Size || id[1] <= 0 || id[2] <= 0 || id[3] <= 0 || id[4] != p.Root[0] ||
+				id[3] == p.Replacement.Identity[3] || id[3] == p.Identity[3] || p.Sidecar.SHA != i.StitchRawSidecar.SHA {
+				return false
+			}
+		} else if id != i.FrozenSidecar {
 			return false
 		}
 		want := map[string]any{"clip_id": i.SourceID, "recording_id": i.RecordingID, "relative_path": i.RelativePath, "size_bytes": i.SizeBytes, "sha256": i.SHA256}
@@ -959,11 +1004,8 @@ func validCleanupProof(raw []byte, i nasCleanupItem) bool {
 	return true
 }
 
-// cleanupMayIssue is the only path to a deletion permit. A permit requires an
-// enabled, unexpired plan, the backend master switch, the exact dry-run file
-// proof and a fresh streamed-SHA-verified R2 recovery copy. nas_only_at_check
-// (and every other recovery state) never yields a permit; see
-// handleAdminNASCleanupControl before ever changing that.
+// A permit requires an enabled, unexpired plan, the master switch, the same
+// physical file from the dry run, and the recovery proof for that item class.
 func cleanupMayIssue(mode string, master bool, until *time.Time, sameFile bool, recovery string) bool {
 	return mode == "enabled" && master && until != nil && until.After(time.Now()) && sameFile && cleanupRecoveryPermits(mode, recovery)
 }
@@ -1076,6 +1118,7 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 	env := &cleanupObserveEnv{session: cleanupAdmissionSession(r, req.ClientVersion), dryRunOnly: dryRunOnly, freshRequests: map[int64]bool{id: fresh}}
 	if req.Outcome == "match" {
 		env.prefetched = s.cleanupPrefetchRecovery(ctx, cid, map[int64]string{id: req.MD5})
+		s.cleanupPrefetchAbortedStitchAbsences(ctx, cid, []cleanupBatchObservation{{ItemID: id, cleanupObserve: req}}, env)
 	}
 	if cleanupObservationExpired(ctx) {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
@@ -1173,6 +1216,10 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	if json.Unmarshal(raw, &item) != nil {
 		return cleanupObserveError(500, "invalid cleanup manifest")
 	}
+	certified := item.PermitReason == nasCleanupCertifiedStitchReason
+	if certified && (cid != 13 || env.session.version != nasCleanupCertifiedStitchVersion) {
+		return cleanupObserveError(409, "reviewed certified stitch cleanup client required")
+	}
 	held, err := deliveryNASHeld(ctx, tx, item)
 	if err != nil {
 		return cleanupObserveError(503, "delivery NAS hold check unavailable; retry")
@@ -1194,8 +1241,13 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		// unexpired and the master switch is on; otherwise the caller gets the
 		// non-deleting reconcile answer below.
 		if state == "delete_issued" && req.RequestID != "" && req.Outcome == "match" && permitUntil != nil && permitUntil.After(time.Now()) && nasSpaceAuditJSONEqual(oldOutcome, retryBody) &&
-			mode == "enabled" && until != nil && until.After(time.Now()) && s.stitchDeletionMaster(item) {
-			return cleanupObserveResult{status: 200, body: map[string]any{"delivery_keep_checked": true, "action": "delete_issued", "delete": true, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": oldRecovery, "expires_at": permitUntil.UTC(), "plan_paused": false, "replayed": true}}
+			mode == "enabled" && until != nil && until.After(time.Now()) && s.stitchDeletionMaster(item) &&
+			(!certified || oldRecovery == nasCleanupCertifiedStitchRecovery && cleanupCheckCertifiedStitch(ctx, tx, item, true) == nil &&
+				env.certifiedStitchAbortsAbsent(ctx, tx, item)) {
+			now := time.Now()
+			if permitUntil.After(now) && until.After(now) && sessionDeadline.After(now) {
+				return cleanupObserveResult{status: 200, body: map[string]any{"delivery_keep_checked": true, "action": "delete_issued", "delete": true, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": oldRecovery, "expires_at": permitUntil.UTC(), "plan_paused": false, "replayed": true}}
+			}
 		}
 		if state != "delete_issued" && state != "deleted" && nasSpaceAuditJSONEqual(oldOutcome, retryBody) {
 			if mode == "dry_run" && state == "would_delete" && oldRecovery == "r2_present_unverified" {
@@ -1266,6 +1318,8 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		bitem.Frozen = [5]int64{}
 		bitem.FrozenSidecar = [5]int64{}
 		bitem.PermitReason = ""
+		bitem.StitchCertificate = nil
+		bitem.StitchRawSidecar = nil
 		bitem.StitchTaskID = 0
 		bitem.StitchOutputPath = ""
 		bitem.StitchOutputSHA = ""
@@ -1290,7 +1344,10 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 				action = "keep"
 				policyReason = e.Error()
 			} else {
-				pre, ok := s.cleanupRecoveryFor(id, item, mode, evidence, req.MD5, env)
+				pre, ok := cleanupPrefetchedRecovery{recovery: nasCleanupCertifiedStitchRecovery, method: "nas_replacement_readback"}, true
+				if !certified {
+					pre, ok = s.cleanupRecoveryFor(id, item, mode, evidence, req.MD5, env)
+				}
 				if !ok {
 					// Never do R2 I/O while holding observation locks.
 					return cleanupObserveResult{status: 503, body: map[string]any{"error": "recovery check not ready; retry", "retryable": true}}
@@ -1312,6 +1369,9 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 					policyReason = "R2 MD5/ETag match disagreed with the full SHA-256 audit"
 				}
 				if lease.After(time.Now()) && cleanupMayIssue(mode, s.stitchDeletionMaster(item), until, cleanupSameFileProof(oldProof, req.Proof), recovery) {
+					if certified && !env.certifiedStitchAbortsAbsent(ctx, tx, item) {
+						return cleanupObserveResult{status: 503, body: map[string]any{"error": "aborted staging absence could not be verified", "retryable": true}}
+					}
 					allowed, e := env.budgetAllows(ctx, tx, item.SizeBytes)
 					if e != nil {
 						return cleanupObserveError(500, "cleanup deletion budget unavailable")

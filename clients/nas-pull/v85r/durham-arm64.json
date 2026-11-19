@@ -1,0 +1,19 @@
+{
+  "architecture": "linux-arm64",
+  "bundle_sha256": "b2256943d1201b054aa6c7fc0784479b750e01fae1af8ef791873888f840298d",
+  "bundle_size_bytes": 1701128,
+  "evaluator_sha256": "0c90ed4c9527e0f9b6eedc432b71dd581a4dac0f758850988df80d2e684b2fed",
+  "evaluator_size_bytes": 3932286,
+  "manifest_sha256": "7d6e12320e3a1ac48a2a390d4d9842b7a9d68116d235e49dae5ad9c82288ce51",
+  "media_tool_version": "7.1.5-0+deb13u1",
+  "tools": {
+    "ffmpeg": {
+      "sha256": "74f28ebfa9c5758614c9457e680bb13610ba6d11f22858c4e3259751b383294d",
+      "size_bytes": 395728
+    },
+    "ffprobe": {
+      "sha256": "501fbdc51c0b8fa4ecc90d0562c678262eef62b0141806940d186f0b71f9f1c4",
+      "size_bytes": 272112
+    }
+  }
+}

@@ -193,7 +193,14 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
  CREATE TABLE r2_retirement_reservations(bucket text,object_key text);
  CREATE TABLE r2_object_retirements(bucket text,object_key text);
  CREATE TABLE nas_restore_requests(clip_id bigint,state text);
- CREATE TABLE recording_joined_source_snapshots(clip_id bigint);
+ CREATE TABLE recording_joined_source_snapshots(clip_id bigint,batch_record_id bigint DEFAULT 1);
+ CREATE TABLE r2_joined_batch_releases(batch_record_id bigint);
+ CREATE TABLE nas_stitch_r2_input_holds(bucket text,object_key text,released_at timestamptz);
+ CREATE FUNCTION r2_joined_source_released(p_clip_id bigint) RETURNS boolean LANGUAGE sql STABLE AS $f$
+  SELECT EXISTS(SELECT 1 FROM recording_joined_source_snapshots s WHERE s.clip_id=p_clip_id)
+   AND NOT EXISTS(SELECT 1 FROM recording_joined_source_snapshots s WHERE s.clip_id=p_clip_id
+    AND NOT EXISTS(SELECT 1 FROM r2_joined_batch_releases r WHERE r.batch_record_id=s.batch_record_id)) $f$;
+ CREATE TABLE r2_owner_keep_prefixes(bucket text,prefix text);
  CREATE TABLE recording_joined_snapshot_scopes(recording_id bigint,recording_job_id bigint,high_water_clip_id bigint,batch_record_id bigint);
  CREATE TABLE recording_joined_batches(id bigint,state text);
  CREATE TABLE recording_joined_dry_run_scopes(recording_id bigint,recording_job_id bigint,high_water_clip_id bigint);

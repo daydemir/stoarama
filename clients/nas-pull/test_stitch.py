@@ -450,18 +450,22 @@ class StitchIntegrationTests(unittest.TestCase):
     def test_durham_strict_build_uses_private_scratch_without_nas_mount(self):
         self.task["plan"].update(clips=self.clips[:2], joins=[True], eligible=[True, True], feature_inputs=[{}, {}])
         self.cfg.durham_checkpoint = mock.Mock()
+        self.cfg.durham_v85r = mock.Mock()
+        provenance = {"architecture": "linux-arm64"}
+        self.cfg.durham_v85r.verify.return_value = (self.cfg.state_dir, provenance)
         for clip in self.clips[:2]:
             (self.cfg.output_dir / (clip["relative_path"] + ".stoarama.json")).unlink()
         score = dict(policy="v85r", join=True, nomination=True, decision="join",
                      status="APPROVED85_nomination_requires_runtime_native_join_checks")
         with mock.patch.object(pull.os.path, "ismount", return_value=False), \
-                mock.patch.object(pull, "stitch_v85r_bundle"), \
                 mock.patch.object(pull, "stitch_v85r_measure", return_value=score):
             result = pull.stitch_build(self.cfg, self.inventory, self.task, self.stop, self.tools,
                                        kind=pull.StitchRunKind.DURHAM_R2)
         self.cfg.durham_checkpoint.assert_called_with(self.task)
+        self.cfg.durham_v85r.verify.assert_called_once()
         self.assertEqual(len(result["outputs"]), 1)
         output, = result["outputs"]
+        self.assertEqual(output["provenance"], provenance)
         self.assertEqual([proof["clip_id"] for proof in output["inputs"]], [1, 2])
         self.assertTrue(all(proof["retirement_held"] and "raw_proof" not in proof for proof in output["inputs"]))
         self.assertEqual(hashlib.sha256((self.cfg.output_dir / output["relative_path"]).read_bytes()).hexdigest(),
