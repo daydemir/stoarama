@@ -9,9 +9,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
-	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -20,8 +20,8 @@ import (
 // trip per statement, so it must not run across a slow home link. The job takes
 // a fresh read-only partition, then runs bounded apply batches. Each batch gets
 // fresh owner-fence evidence and an exact database readback. A DELETE that lost
-// its response holds only its own key, and the next batch's startup settles it.
-// Any other failure stops the job; nothing is retried.
+// its response holds only its own key, permanently. Any other failure stops the
+// job; nothing is retried.
 func runR2InverseJob(ctx context.Context, cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("r2-inverse job", flag.ExitOnError)
 	picks := fs.String("picks", "", "owner picks")
@@ -72,6 +72,7 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string) {
 		done, result, err := runInverseJobBatch(ctx, pool, store, o, *owner, filepath.Join(*work, fmt.Sprintf("evidence-%03d.json", n)))
 		total.Deleted += result.Deleted
 		total.Bytes += result.Bytes
+		total.WireAmbiguous = append(total.WireAmbiguous, result.WireAmbiguous...)
 		printInverseJob(map[string]any{"step": "batch", "batch": n, "result": result, "total": total, "error": errorText(err)})
 		if err != nil {
 			log.Fatal(err)
@@ -85,14 +86,13 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string) {
 }
 
 // runInverseJobBatch runs one bounded apply batch. It reports done when a clean
-// batch selected nothing. A batch whose only failures are lost DELETE responses
-// returns no error once its readback proves just those keys are unresolved, as
-// long as it also deleted something; a batch that deletes nothing stops the job.
+// batch selected nothing. Unresolved intents from earlier batches stay held;
+// the executor's startup stops if one that never reached the wire is gone. A
+// batch whose only failures are lost DELETE responses returns no error once its
+// readback proves exactly those keys are unresolved, as long as it also deleted
+// something; a batch that deletes nothing stops the job.
 func runInverseJobBatch(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteStore, o inverseApplyOptions, owner, evidencePath string) (bool, inverseApplySummary, error) {
-	pending, err := requireInverseUnissuedIntentsPresent(ctx, pool, store)
-	if err != nil {
-		return false, inverseApplySummary{}, err
-	}
+	var err error
 	if o.DrainSHA, err = writeInverseOwnerEvidence(ctx, pool, store, o, owner, evidencePath); err != nil {
 		return false, inverseApplySummary{}, err
 	}
@@ -100,7 +100,7 @@ func runInverseJobBatch(ctx context.Context, pool *pgxpool.Pool, store inverseDe
 	result, applyErr := applyInverse(ctx, pool, store, o)
 	// Read this batch's durable outcomes on every path, including a failed one.
 	var n, absent, absentBytes, attempts int64
-	var unresolved []string
+	unresolved := []string{}
 	if err = pool.QueryRow(ctx, `SELECT count(*),count(v.object_key),coalesce(sum(i.size_bytes) FILTER (WHERE v.object_key IS NOT NULL),0),count(a.object_key),
  coalesce(array_agg(i.object_key ORDER BY i.object_key) FILTER (WHERE v.object_key IS NULL),'{}')
  FROM r2_inverse_intents i
@@ -114,11 +114,8 @@ func runInverseJobBatch(ctx context.Context, pool *pgxpool.Pool, store inverseDe
 	if applyErr != nil && !wire {
 		return false, result, applyErr
 	}
-	if result.Reconciled+result.AmbiguousHeld != pending {
-		return false, result, fmt.Errorf("held intents changed: reconciled %d, ambiguous %d, expected %d", result.Reconciled, result.AmbiguousHeld, pending)
-	}
-	if absent != result.Deleted || absentBytes != result.Bytes || attempts != n || n-absent != result.WireAmbiguous {
-		return false, result, fmt.Errorf("database batch evidence differs: intents %d absent %d bytes %d attempts %d", n, absent, absentBytes, attempts)
+	if absent != result.Deleted || absentBytes != result.Bytes || attempts != n || !slices.Equal(unresolved, result.WireAmbiguous) {
+		return false, result, fmt.Errorf("database batch evidence differs: intents %d absent %d bytes %d attempts %d unresolved %v", n, absent, absentBytes, attempts, unresolved)
 	}
 	if wire {
 		if result.Deleted == 0 {
@@ -128,49 +125,6 @@ func runInverseJobBatch(ctx context.Context, pool *pgxpool.Pool, store inverseDe
 		return false, result, nil
 	}
 	return result.Deleted == 0, result, nil
-}
-
-// An unresolved intent is never retransmitted. At startup the executor records
-// absence for a sent one that HEADs as missing, since that is the DELETE's own
-// outcome. An intent that never reached the wire cannot explain an absence, so
-// require each to still exist: an outside deletion must not retire a held key.
-// It returns the number of unresolved intents.
-func requireInverseUnissuedIntentsPresent(ctx context.Context, pool *pgxpool.Pool, store inverseReader) (int64, error) {
-	rows, err := pool.Query(ctx, `SELECT i.object_key,EXISTS(SELECT 1 FROM r2_inverse_attempts a WHERE a.bucket=i.bucket AND a.object_key=i.object_key) FROM r2_inverse_intents i
- WHERE i.bucket=$1 AND NOT EXISTS(SELECT 1 FROM r2_inverse_events v WHERE v.bucket=i.bucket AND v.object_key=i.object_key AND v.event='absent') ORDER BY 1`, store.Bucket())
-	if err != nil {
-		return 0, err
-	}
-	var pending int64
-	var keys []string
-	for rows.Next() {
-		var key string
-		var issued bool
-		if err = rows.Scan(&key, &issued); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		pending++
-		if !issued {
-			keys = append(keys, key)
-		}
-	}
-	rows.Close()
-	if err = rows.Err(); err != nil {
-		return 0, err
-	}
-	for _, key := range keys {
-		probe, cancel := context.WithTimeout(ctx, inverseNetworkTimeout)
-		_, err = store.Head(probe, key)
-		cancel()
-		if r2.IsNotFound(err) {
-			return 0, fmt.Errorf("held intent %s is absent at the provider; review before any batch", key)
-		}
-		if err != nil {
-			return 0, err
-		}
-	}
-	return pending, nil
 }
 
 // writeInverseOwnerEvidence writes owner-fence evidence observed now from the

@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/r2"
@@ -61,29 +60,4 @@ func TestR2InverseJobEvidenceAndHeldIntentGate(t *testing.T) {
 		t.Fatal("evidence accepted a different endpoint's fence")
 	}
 
-	// An intent that never reached the wire must still exist before any batch.
-	if n, err := requireInverseUnissuedIntentsPresent(ctx, pool, store); err != nil || n != 0 {
-		t.Fatalf("no intents: %d %v", n, err)
-	}
-	const key = "managed/acct-47/held/0001.mp4"
-	store.objects[key] = r2.ObjectInfo{Key: key, ETag: "etag", SizeBytes: 100, LastModified: inverseRetirementCutoff().Add(-time.Hour)}
-	if _, err = pool.Exec(ctx, `INSERT INTO r2_inverse_intents(bucket,object_key,source_id,size_bytes,etag,last_modified,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice,endpoint_sha256,stream_id)
- VALUES('stoarama',$1,5399,100,'etag','2026-11-01',repeat('a',64),'060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811',repeat('b',64),repeat('c',64),'none',$2,3)`, key, store.EndpointSHA256()); err != nil {
-		t.Fatal(err)
-	}
-	if n, err := requireInverseUnissuedIntentsPresent(ctx, pool, store); err != nil || n != 1 {
-		t.Fatalf("held intent present: %d %v", n, err)
-	}
-	delete(store.objects, key)
-	if _, err := requireInverseUnissuedIntentsPresent(ctx, pool, store); err == nil || !strings.Contains(err.Error(), "is absent at the provider") {
-		t.Fatalf("held intent absent: %v", err)
-	}
-	// Once its DELETE was sent, absence is that DELETE's own outcome; the
-	// executor's startup records it, so the job counts it without a HEAD.
-	if _, err = pool.Exec(ctx, `INSERT INTO r2_inverse_attempts(bucket,object_key) VALUES('stoarama',$1)`, key); err != nil {
-		t.Fatal(err)
-	}
-	if n, err := requireInverseUnissuedIntentsPresent(ctx, pool, store); err != nil || n != 1 {
-		t.Fatalf("sent intent absent: %d %v", n, err)
-	}
 }

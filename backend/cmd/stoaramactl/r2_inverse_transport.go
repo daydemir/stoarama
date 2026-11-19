@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptrace"
 	"sync/atomic"
 	"time"
 
@@ -149,7 +151,13 @@ func newInverseSDKStore(ctx context.Context, cfg r2.Config) (*inverseSDKStore, e
 	if region == "" {
 		region = "auto"
 	}
-	transport := awshttp.NewBuildableClient().GetTransport()
+	// HTTP/1.1 only. Go's HTTP/2 client resends a refused stream inside one
+	// RoundTrip, below the one-DELETE guard; HTTP/1.1 never resends a DELETE
+	// once any byte of it was written.
+	transport := awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
+		t.ForceAttemptHTTP2 = false
+		t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	}).GetTransport()
 	sdk := s3.NewFromConfig(aws.Config{Region: region, Credentials: credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")}, func(o *s3.Options) {
 		o.UsePathStyle = true
 		o.BaseEndpoint = aws.String(cfg.Endpoint)
@@ -166,23 +174,26 @@ func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDele
 		o.Retryer = aws.NopRetryer{}
 		o.HTTPClient = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	})
-	if err != nil && transport.sent.Load() {
+	if err != nil && transport.written.Load() && transport.status.Load() == 0 {
 		return fmt.Errorf("%w: %w", errInverseWireAmbiguous, err)
 	}
 	return err
 }
 
-// errInverseWireAmbiguous marks a DELETE that passed every check and reached
-// the provider connection without a usable response. Only that key is in
-// doubt: it stays held, is never retransmitted, and a later startup records it
-// absent or keeps holding it. A veto before the wire is never this error.
-var errInverseWireAmbiguous = errors.New("DELETE reached the provider; result unknown")
+// errInverseWireAmbiguous marks a DELETE whose whole request was written and
+// for which no response status ever arrived (EOF, reset, response timeout).
+// Only that key is in doubt: it stays held and is never retransmitted. A veto,
+// a failed dial or write, and any received status (403, 503, ...) are never
+// this error and stop the job.
+var errInverseWireAmbiguous = errors.New("DELETE written but no response; result unknown")
 
 type inverseDeleteTransport struct {
 	base             http.RoundTripper
 	authority        *inverseDeleteAuthority
 	bucket, endpoint string
-	attempted, sent  atomic.Bool
+	attempted        atomic.Bool
+	written          atomic.Bool
+	status           atomic.Int64
 }
 
 func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -194,6 +205,14 @@ func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, e
 	}
 	req.Header.Del("Idempotency-Key")
 	req.Header.Del("X-Idempotency-Key")
-	t.sent.Store(true)
-	return t.base.RoundTrip(req)
+	trace := &httptrace.ClientTrace{WroteRequest: func(w httptrace.WroteRequestInfo) {
+		if w.Err == nil {
+			t.written.Store(true)
+		}
+	}}
+	response, err := t.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
+	if response != nil {
+		t.status.Store(int64(response.StatusCode))
+	}
+	return response, err
 }

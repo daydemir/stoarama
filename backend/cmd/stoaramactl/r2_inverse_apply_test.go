@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,13 +28,18 @@ import (
 )
 
 type inverseFakeStore struct {
-	endpointSHA  string
-	mu           sync.Mutex
-	objects      map[string]r2.ObjectInfo
-	calls        int
-	lost         bool
-	lostKey      string
-	delay        time.Duration
+	endpointSHA string
+	mu          sync.Mutex
+	objects     map[string]r2.ObjectInfo
+	calls       int
+	lost        bool
+	delay       time.Duration
+	// wire sets how the loopback SDK server answers a DELETE of a key: "eof"
+	// closes the connection after reading it, "403"/"503" answer completely,
+	// "503-truncated" cuts the error body, "slow" never answers in time.
+	wire map[string]string
+	// onDelete runs on the server for every DELETE before it answers.
+	onDelete     func(string)
 	beforeHead   func(context.Context, string) error
 	beforeDelete func(string) error
 }
@@ -136,7 +142,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
  INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at) VALUES(30,47,1,'inverse','https://test.invalid','* * * * *','Asia/Tokyo','paused',3,now());
  INSERT INTO recording_qualification_runs(id,account_id,definition_version,definition_jsonb,target_recording_count,window_sequence_start_at) VALUES(1,47,'inverse-fixture','{}',50,'2026-06-01');`)
 	// The last two sources carry fixed delivery holds; build() never reaches them.
-	const count = 1250
+	const count = 1400
 	store := &inverseFakeStore{objects: map[string]r2.ObjectInfo{}}
 	sdk, providerDeletes := inverseSDKTestStore(t, store)
 	store.endpointSHA = sdk.EndpointSHA256()
@@ -362,81 +368,250 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		if qerr := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM r2_inverse_events WHERE object_key=$1),(SELECT purged_at IS NOT NULL FROM recording_clips WHERE object_key=$1)`, entries[0].Key).Scan(&absent, &purged); qerr != nil {
 			t.Fatal(qerr)
 		}
-		if err == nil || !strings.Contains(err.Error(), "never issued a DELETE") || s.Reconciled != 0 || s.Deleted != 0 || absent != 0 || purged || store.calls != before {
+		if err == nil || !strings.Contains(err.Error(), "never issued a DELETE") || s.Deleted != 0 || absent != 0 || purged || store.calls != before {
 			t.Fatalf("%+v %v absent%d purged%t calls%d", s, err, absent, purged, store.calls)
 		}
 	})
-	t.Run("lost_response_reconciles_without_retransmit", func(t *testing.T) {
-		a, _ := build(1)
+	t.Run("held_key_replaced_at_the_provider_stops_startup", func(t *testing.T) {
+		a, entries := build(1)
+		if _, err := a.reserve(ctx, entries[0]); err != nil {
+			t.Fatal(err)
+		}
+		a.ledger.close()
+		store.mu.Lock()
+		original := store.objects[entries[0].Key]
+		replaced := original
+		replaced.ETag = "replaced-etag"
+		store.objects[entries[0].Key] = replaced
+		store.mu.Unlock()
+		before := store.calls
+		_, err := applyInverse(ctx, pool, store, a.opts)
+		store.mu.Lock()
+		store.objects[entries[0].Key] = original
+		store.mu.Unlock()
+		if err == nil || !strings.Contains(err.Error(), "names a different object") || store.calls != before {
+			t.Fatalf("replaced held object: %v calls %d", err, store.calls-before)
+		}
+	})
+	t.Run("attempt_without_a_sent_DELETE_stays_held_when_removed_outside", func(t *testing.T) {
+		// An attempt row commits before the wire. If the process stops there and
+		// the object later disappears for any other reason, nothing may retire it.
+		a, entries := build(1)
+		if _, err := a.reserve(ctx, entries[0]); err != nil {
+			t.Fatal(err)
+		}
+		a.ledger.close()
+		if _, err := pool.Exec(ctx, `INSERT INTO r2_inverse_attempts(bucket,object_key) VALUES('stoarama',$1)`, entries[0].Key); err != nil {
+			t.Fatal(err)
+		}
+		store.mu.Lock()
+		delete(store.objects, entries[0].Key)
+		store.mu.Unlock()
+		before := store.calls
+		s, err := applyInverse(ctx, pool, store, a.opts)
+		var events, receipts int
+		var purged bool
+		if qerr := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM r2_inverse_events WHERE object_key=$1),(SELECT count(*) FROM r2_object_retirements WHERE object_key=$1),(SELECT purged_at IS NOT NULL FROM recording_clips WHERE object_key=$1)`, entries[0].Key).Scan(&events, &receipts, &purged); qerr != nil {
+			t.Fatal(qerr)
+		}
+		if err != nil || s.AmbiguousHeld < 1 || store.calls != before || events != 0 || receipts != 0 || purged {
+			t.Fatalf("%+v %v calls%d events%d receipts%d purged%t", s, err, store.calls, events, receipts, purged)
+		}
+	})
+	t.Run("lost_response_stays_held_without_retransmit", func(t *testing.T) {
+		// The object is gone, but an attempt row cannot prove this executor
+		// removed it: the key stays held, unretired and never resent.
+		a, entries := build(1)
 		a.ledger.close()
 		store.setLost(true)
 		_, err := applyInverse(ctx, pool, store, a.opts)
 		store.setLost(false)
-		if err == nil {
-			t.Fatal("lost response accepted")
+		if !errors.Is(err, errInverseWireAmbiguous) {
+			t.Fatalf("lost response: %v", err)
 		}
 		before := store.calls
 		s, err := applyInverse(ctx, pool, store, a.opts)
-		if err != nil || s.Reconciled != 1 || store.calls != before {
-			t.Fatalf("%+v %v calls%d", s, err, store.calls)
+		var events, receipts int
+		if qerr := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM r2_inverse_events WHERE object_key=$1),(SELECT count(*) FROM r2_object_retirements WHERE object_key=$1)`, entries[0].Key).Scan(&events, &receipts); qerr != nil {
+			t.Fatal(qerr)
+		}
+		if err != nil || s.AmbiguousHeld < 1 || store.calls != before || events != 0 || receipts != 0 {
+			t.Fatalf("%+v %v calls%d events%d receipts%d", s, err, store.calls, events, receipts)
 		}
 	})
-	t.Run("lost_response_finishes_in_flight_and_job_settles_it", func(t *testing.T) {
-		// Production shape: R2 closes one DELETE connection (EOF) while seven
-		// other workers have DELETEs outstanding. Only that key may stay
-		// unresolved; the next batch records it absent without retransmitting.
+	owner := filepath.Join("..", "..", "..", "docs", "records", "r2-owner-fence-policy-20261118.md")
+	unresolved := func(t *testing.T, manifest string) []string {
+		t.Helper()
+		keys := []string{}
+		if err := pool.QueryRow(ctx, `SELECT coalesce(array_agg(i.object_key ORDER BY i.object_key),'{}') FROM r2_inverse_intents i
+ WHERE i.manifest_sha256=$1 AND NOT EXISTS(SELECT 1 FROM r2_inverse_events v WHERE v.bucket=i.bucket AND v.object_key=i.object_key AND v.event='absent')`, manifest).Scan(&keys); err != nil {
+			t.Fatal(err)
+		}
+		return keys
+	}
+	// setWire installs server answers; the barrier hook (if any) runs on the
+	// server before it answers each DELETE.
+	setWire := func(modes map[string]string, hook func(string)) {
+		store.mu.Lock()
+		store.wire, store.onDelete = modes, hook
+		store.mu.Unlock()
+	}
+	t.Run("lost_response_holds_only_its_key", func(t *testing.T) {
+		// Production shape: R2 drops one DELETE connection (EOF) while a sibling
+		// DELETE is provably on the wire. The sibling must finish and publish;
+		// only the lost key stays unresolved, held for good and never resent.
 		a, entries := build(40)
 		a.ledger.close()
-		owner := filepath.Join("..", "..", "..", "docs", "records", "r2-owner-fence-policy-20261118.md")
 		dir := t.TempDir()
 		lost := entries[2].Key
-		unresolved := func() []string {
-			t.Helper()
-			var keys []string
-			if err := pool.QueryRow(ctx, `SELECT coalesce(array_agg(i.object_key ORDER BY i.object_key),'{}') FROM r2_inverse_intents i
- WHERE i.manifest_sha256=$1 AND NOT EXISTS(SELECT 1 FROM r2_inverse_events v WHERE v.bucket=i.bucket AND v.object_key=i.object_key AND v.event='absent')`, a.opts.ManifestSHA).Scan(&keys); err != nil {
-				t.Fatal(err)
+		siblingOnWire, lostAnswered := make(chan struct{}), make(chan struct{})
+		var sibling sync.Once
+		setWire(map[string]string{lost: "eof"}, func(key string) {
+			if key == lost {
+				<-siblingOnWire
+				return
 			}
-			return keys
-		}
-		store.lostKey, store.delay = lost, 5*time.Millisecond
+			sibling.Do(func() {
+				close(siblingOnWire)
+				<-lostAnswered
+				// Give the lost DELETE's worker time to see its error and halt.
+				time.Sleep(300 * time.Millisecond)
+			})
+		})
+		go func() {
+			<-siblingOnWire
+			// The lost answer is a closed connection; signal once it is sent.
+			time.Sleep(50 * time.Millisecond)
+			close(lostAnswered)
+		}()
 		done, first, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(dir, "evidence-1.json"))
-		store.lostKey, store.delay = "", 0
-		if err != nil || done || first.WireAmbiguous != 1 || first.Deleted < 1 || first.Deleted >= 39 {
+		setWire(nil, nil)
+		if err != nil || done || !slices.Equal(first.WireAmbiguous, []string{lost}) || first.Deleted < 1 || first.Deleted >= 39 {
 			t.Fatalf("lost-response batch: done %v %+v %v", done, first, err)
 		}
-		if got := unresolved(); len(got) != 1 || got[0] != lost {
+		if got := unresolved(t, a.opts.ManifestSHA); !slices.Equal(got, []string{lost}) {
 			t.Fatalf("in-flight deletes were stranded: %v", got)
 		}
 		before := providerDeletes()
 		done, second, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(dir, "evidence-2.json"))
-		if err != nil || done || second.Reconciled != 1 || second.Deleted != 39-first.Deleted || providerDeletes()-before != second.Deleted {
-			t.Fatalf("settling batch: done %v %+v %v deletes %d", done, second, err, providerDeletes()-before)
-		}
-		if got := unresolved(); len(got) != 0 {
-			t.Fatalf("unresolved after settling: %v", got)
+		if err != nil || done || second.Deleted != 39-first.Deleted || providerDeletes()-before != second.Deleted {
+			t.Fatalf("next batch: done %v %+v %v deletes %d", done, second, err, providerDeletes()-before)
 		}
 		if done, last, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(dir, "evidence-3.json")); err != nil || !done || last.Deleted != 0 {
 			t.Fatalf("final batch: done %v %+v %v", done, last, err)
 		}
-
-		// A veto before the wire is not a lost response, and stops the job.
-		b, _ := build(1)
-		b.ledger.close()
+		if got := unresolved(t, a.opts.ManifestSHA); !slices.Equal(got, []string{lost}) {
+			t.Fatalf("lost key was settled or resent: %v", got)
+		}
+	})
+	t.Run("received_status_or_veto_stops_the_job", func(t *testing.T) {
+		dir := t.TempDir()
+		for _, mode := range []string{"403", "503", "503-truncated"} {
+			a, entries := build(2)
+			a.ledger.close()
+			setWire(map[string]string{entries[0].Key: mode}, nil)
+			_, _, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(dir, "evidence-"+mode+".json"))
+			setWire(nil, nil)
+			if err == nil || errors.Is(err, errInverseWireAmbiguous) {
+				t.Fatalf("%s answer continued the job: %v", mode, err)
+			}
+		}
+		// A veto before the wire.
+		a, _ := build(1)
+		a.ledger.close()
 		store.beforeDelete = func(string) error { return errors.New("vetoed before the wire") }
-		_, _, err = runInverseJobBatch(ctx, pool, store, b.opts, owner, filepath.Join(dir, "evidence-4.json"))
+		_, _, err := runInverseJobBatch(ctx, pool, store, a.opts, owner, filepath.Join(dir, "evidence-veto.json"))
 		store.beforeDelete = nil
 		if err == nil || errors.Is(err, errInverseWireAmbiguous) {
 			t.Fatalf("pre-wire veto: %v", err)
 		}
-		// A lost response in a batch that deleted nothing stops the job too.
-		c, _ := build(1)
-		c.ledger.close()
-		store.setLost(true)
-		_, _, err = runInverseJobBatch(ctx, pool, store, c.opts, owner, filepath.Join(dir, "evidence-5.json"))
-		store.setLost(false)
+		// A lost response in a batch that deleted nothing.
+		b, entries := build(1)
+		b.ledger.close()
+		setWire(map[string]string{entries[0].Key: "eof"}, nil)
+		_, _, err = runInverseJobBatch(ctx, pool, sdk, b.opts, owner, filepath.Join(dir, "evidence-empty.json"))
+		setWire(nil, nil)
 		if !errors.Is(err, errInverseWireAmbiguous) {
 			t.Fatalf("lost response with no deletes continued: %v", err)
+		}
+	})
+	t.Run("lost_response_with_a_sibling_403_stops_the_job", func(t *testing.T) {
+		a, entries := build(2)
+		a.ledger.close()
+		lost, refused := entries[0].Key, entries[1].Key
+		both := sync.WaitGroup{}
+		both.Add(2)
+		setWire(map[string]string{lost: "eof", refused: "403"}, func(string) { both.Done(); both.Wait() })
+		_, result, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(t.TempDir(), "evidence.json"))
+		setWire(nil, nil)
+		if err == nil || errors.Is(err, errInverseWireAmbiguous) || !slices.Equal(result.WireAmbiguous, []string{lost}) {
+			t.Fatalf("mixed failure: %+v %v", result, err)
+		}
+	})
+	t.Run("response_timeout_is_a_lost_response", func(t *testing.T) {
+		a, entries := build(1)
+		a.ledger.close()
+		setWire(map[string]string{entries[0].Key: "slow"}, nil)
+		timed, cancel := context.WithTimeout(ctx, 3*time.Second)
+		_, err := applyInverse(timed, pool, sdk, a.opts)
+		cancel()
+		setWire(nil, nil)
+		if !errors.Is(err, errInverseWireAmbiguous) {
+			t.Fatalf("response timeout: %v", err)
+		}
+	})
+	t.Run("closed_admission_aborts_a_key_waiting_on_its_reservation", func(t *testing.T) {
+		// Reservations serialize on one protection lock, so a sibling's hard
+		// failure reaches a waiting key through admission: the wait aborts and
+		// nothing durable is written for that key.
+		a, entries := build(1)
+		defer a.ledger.close()
+		e := entries[0]
+		blocker, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer blocker.Rollback(ctx)
+		var pid int
+		if err = blocker.QueryRow(ctx, `SELECT pg_backend_pid() FROM (SELECT lock_nas_r2_copy_key('stoarama',$1)) l`, e.Key).Scan(&pid); err != nil {
+			t.Fatal(err)
+		}
+		admit, closeAdmission := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		before := providerDeletes()
+		go func() { _, err := a.delete(ctx, admit, e); done <- err }()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			var waiting bool
+			if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+			if waiting {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("key never waited on its reservation lock")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		closeAdmission()
+		select {
+		case err = <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("closed admission did not abort the reservation wait")
+		}
+		var intents int
+		if qerr := pool.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1`, e.Key).Scan(&intents); qerr != nil {
+			t.Fatal(qerr)
+		}
+		if !errors.Is(err, errInverseAdmissionClosed) || intents != 0 || providerDeletes() != before {
+			t.Fatalf("admission: err %v intents %d deletes %d", err, intents, providerDeletes()-before)
+		}
+	})
+	t.Run("delete_transport_never_speaks_HTTP2", func(t *testing.T) {
+		tr, ok := sdk.transport.(*http.Transport)
+		if !ok || tr.ForceAttemptHTTP2 || tr.TLSNextProto == nil || len(tr.TLSNextProto) != 0 {
+			t.Fatalf("delete transport may negotiate HTTP/2: %T", sdk.transport)
 		}
 	})
 	t.Run("protection_changed_during_HEAD", func(t *testing.T) {
@@ -597,7 +772,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					return nil
 				}
 				before := store.calls
-				ok, err := a.delete(ctx, e)
+				ok, err := a.delete(ctx, ctx, e)
 				store.beforeDelete = nil
 				if err != nil || !ok || store.calls != before+1 {
 					t.Fatalf("wire result %v %v", ok, err)
@@ -648,7 +823,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 		move(target.ID, target.ID+100000)
 		defer move(target.ID+100000, target.ID)
-		if err = a.publishAbsent(ctx, e, a.opts.ManifestSHA, true); err == nil {
+		if err = a.publishAbsent(ctx, e, a.opts.ManifestSHA); err == nil {
 			t.Fatal("missing source published completion")
 		}
 		var events int
@@ -686,7 +861,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					t.Fatal(err)
 				}
 				done := make(chan error, 1)
-				go func() { _, err := a.delete(ctx, e); done <- err }()
+				go func() { _, err := a.delete(ctx, ctx, e); done <- err }()
 				deadline := time.Now().Add(3 * time.Second)
 				for {
 					var held bool
@@ -767,7 +942,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 		done := make(chan error, 1)
-		go func() { _, err := a.delete(ctx, e); done <- err }()
+		go func() { _, err := a.delete(ctx, ctx, e); done <- err }()
 		deadline := time.Now().Add(3 * time.Second)
 		for {
 			var waiting bool
@@ -822,7 +997,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				if err = stale.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1`, e.Key).Scan(&count); err != nil || count != 0 {
 					t.Fatal(count, err)
 				}
-				if _, err = a.delete(ctx, e); err != nil {
+				if _, err = a.delete(ctx, ctx, e); err != nil {
 					t.Fatal(err)
 				}
 				_, err = stale.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`, e.Key)
@@ -855,7 +1030,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 						exec(copyInsert, e.Key, "blocked", policy)
 						_, err = stale.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) SELECT 'raw',id,bucket,object_key,size_bytes,sha256,repeat('a',64) FROM recording_clips WHERE object_key=$1`, e.Key)
 					} else {
-						if _, err = a.delete(ctx, e); err != nil {
+						if _, err = a.delete(ctx, ctx, e); err != nil {
 							t.Fatal(err)
 						}
 						_, err = stale.Exec(ctx, copyInsert, e.Key, admission, policy)
@@ -1171,7 +1346,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			})
 		}
 	})
-	t.Run("network_deadline_releases_locks_and_reconciles", func(t *testing.T) {
+	t.Run("network_deadline_releases_locks_and_holds", func(t *testing.T) {
 		for _, afterDelete := range []bool{false, true} {
 			t.Run(strconv.FormatBool(afterDelete), func(t *testing.T) {
 				a, entries := build(1)
@@ -1195,7 +1370,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					}
 					return nil
 				}
-				_, err := a.delete(timed, e)
+				_, err := a.delete(timed, ctx, e)
 				cancel()
 				store.beforeHead = nil
 				if err == nil {
@@ -1218,7 +1393,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				before := store.calls
 				a.ledger.close()
 				result, err := applyInverse(ctx, pool, store, a.opts)
-				if err != nil || store.calls != before || (afterDelete && result.Reconciled < 1) {
+				if err != nil || store.calls != before || (afterDelete && result.AmbiguousHeld < 1) {
 					t.Fatalf("restart %+v %v", result, err)
 				}
 			})
@@ -1311,6 +1486,40 @@ func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*inverseSDKStor
 			return
 		}
 		key := strings.TrimPrefix(req.URL.Path, "/stoarama/")
+		if req.Method == http.MethodDelete {
+			deleted.Add(1)
+			store.mu.Lock()
+			mode, hook := store.wire[key], store.onDelete
+			if store.lost {
+				mode = "eof"
+			}
+			if mode == "" || mode == "eof" || mode == "slow" {
+				delete(store.objects, key)
+			}
+			store.mu.Unlock()
+			if hook != nil {
+				hook(key)
+			}
+			switch mode {
+			case "eof":
+				c, _, _ := w.(http.Hijacker).Hijack()
+				c.Close()
+			case "slow":
+				<-req.Context().Done()
+			case "403", "503":
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(map[string]int{"403": 403, "503": 503}[mode])
+				fmt.Fprint(w, `<Error><Code>Refused</Code><Message>test</Message></Error>`)
+			case "503-truncated":
+				w.Header().Set("Content-Type", "application/xml")
+				w.Header().Set("Content-Length", "500")
+				w.WriteHeader(503)
+				fmt.Fprint(w, `<Error><Code>Slow`)
+			default:
+				w.WriteHeader(204)
+			}
+			return
+		}
 		store.mu.Lock()
 		defer store.mu.Unlock()
 		o, ok := store.objects[key]
@@ -1325,16 +1534,6 @@ func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*inverseSDKStor
 			w.Header().Set("Last-Modified", o.LastModified.Format(http.TimeFormat))
 			w.Header().Set("x-amz-meta-sha256", strings.Repeat("b", 64))
 			w.WriteHeader(200)
-		case http.MethodDelete:
-			deleted.Add(1)
-			delete(store.objects, key)
-			time.Sleep(store.delay)
-			if store.lost || key == store.lostKey {
-				c, _, _ := w.(http.Hijacker).Hijack()
-				c.Close()
-				return
-			}
-			w.WriteHeader(204)
 		default:
 			w.WriteHeader(400)
 		}
