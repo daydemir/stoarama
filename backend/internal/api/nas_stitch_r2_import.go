@@ -134,13 +134,11 @@ func PlanDurhamStitchHoldSet(ctx context.Context, tx pgx.Tx, scopes []int64, buc
  HAVING date_trunc('hour',c.clip_start_at,'UTC')>=s.start_at
   AND date_trunc('hour',c.clip_start_at,'UTC')+interval '1 hour'<=s.end_at
   AND count(*) BETWEEN 1 AND 200 AND sum(c.size_bytes)<=2500000000
-  AND bool_and(c.clip_end_at<=date_trunc('hour',c.clip_start_at,'UTC')+interval '1 hour'
+  AND bool_and(c.clip_end_at>c.clip_start_at AND c.clip_end_at<=s.end_at
    AND c.purged_at IS NULL AND c.bucket=$2 AND rtrim(c.endpoint,'/')=$3
    AND c.object_key LIKE 'managed/%' AND c.etag<>'' AND c.size_bytes>0 AND f.clip_id IS NOT NULL)
  ), chosen AS (
  SELECT DISTINCT ON (h.recording,h.hour) h.* FROM hours h
- WHERE NOT EXISTS(SELECT 1 FROM recording_clips c WHERE c.recording_id=h.recording
-  AND c.clip_start_at<h.hour AND c.clip_end_at>h.hour)
  ORDER BY h.recording,h.hour,h.scope
  )
  SELECT scope,recording,stream,start_at,end_at,hour FROM chosen ORDER BY bytes DESC,hour,recording LIMIT $4`,
