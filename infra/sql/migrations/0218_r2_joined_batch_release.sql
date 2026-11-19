@@ -8,6 +8,9 @@
 
 CREATE TABLE r2_joined_batch_releases (
  batch_record_id bigint PRIMARY KEY REFERENCES recording_joined_batches(id) ON DELETE RESTRICT,
+ -- Pinned to the one batch the owner released; another needs a new migration.
+ batch_id text NOT NULL CHECK(batch_id='goodplus-20260821-generation-1'),
+ generation integer NOT NULL CHECK(generation=1),
  decision text NOT NULL CHECK(decision<>''),
  released_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
@@ -21,21 +24,58 @@ CREATE TRIGGER r2_joined_batch_release_immutable BEFORE UPDATE OR DELETE ON r2_j
 CREATE TRIGGER r2_joined_batch_release_no_truncate BEFORE TRUNCATE ON r2_joined_batch_releases
  FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_joined_batch_release_immutable();
 
-INSERT INTO r2_joined_batch_releases(batch_record_id,decision)
-SELECT id,'Deniz 2026-11-19: "Release 1.15 TB (Recommended)"; outside-window raw only, keep-everything and keep-28 stay held'
+-- The owner released a frozen batch. If it exists but has moved on, the
+-- decision no longer describes it: fail rather than release or skip silently.
+DO $$ BEGIN
+ IF EXISTS(SELECT 1 FROM recording_joined_batches WHERE batch_id='goodplus-20260821-generation-1' AND generation=1 AND state<>'frozen') THEN
+  RAISE EXCEPTION 'goodplus-20260821-generation-1 is no longer frozen; the owner release does not apply';
+ END IF;
+END $$;
+INSERT INTO r2_joined_batch_releases(batch_record_id,batch_id,generation,decision)
+SELECT id,batch_id,generation,'Deniz 2026-11-19: "Release 1.15 TB (Recommended)"; outside-window raw only, keep-everything and keep-28 stay held'
 FROM recording_joined_batches WHERE batch_id='goodplus-20260821-generation-1' AND generation=1 AND state='frozen';
 
--- r2_joined_source_released is true when every snapshot of a clip belongs to a
--- released batch and no snapshotting or dry-run scope covers it.
+-- r2_joined_source_released is true only when every joined claim on the clip is
+-- released: each snapshot belongs to a released batch that is still frozen and
+-- still matches the live clip exactly; no operator retention hold covers an
+-- hour a snapshot is allocated to; no snapshotting scope covers it; and no
+-- dry-run scope covers it unless that dry run's batch is frozen (0155's rule).
 CREATE FUNCTION r2_joined_source_released(p_clip_id bigint) RETURNS boolean LANGUAGE sql STABLE AS $$
  SELECT EXISTS(SELECT 1 FROM recording_joined_source_snapshots s WHERE s.clip_id=p_clip_id)
-  AND NOT EXISTS(SELECT 1 FROM recording_joined_source_snapshots s WHERE s.clip_id=p_clip_id
-   AND NOT EXISTS(SELECT 1 FROM r2_joined_batch_releases r WHERE r.batch_record_id=s.batch_record_id))
+  AND NOT EXISTS(SELECT 1 FROM recording_joined_source_snapshots s JOIN recording_clips c ON c.id=s.clip_id
+   WHERE s.clip_id=p_clip_id AND NOT coalesce(
+    EXISTS(SELECT 1 FROM r2_joined_batch_releases r JOIN recording_joined_batches b ON b.id=r.batch_record_id
+     WHERE r.batch_record_id=s.batch_record_id AND b.batch_id=r.batch_id AND b.generation=r.generation AND b.state='frozen')
+    AND s.recording_id=c.recording_id AND s.bucket=c.bucket AND s.object_key=c.object_key
+    AND s.size_bytes=c.size_bytes AND lower(s.sha256)=lower(c.sha256) AND btrim(s.ingest_etag,'"')=btrim(c.etag,'"')
+    AND s.start_at=c.clip_start_at AND s.end_at=c.clip_end_at, false))
+  AND NOT EXISTS(SELECT 1 FROM recording_joined_source_snapshots s
+   JOIN recording_joined_sources src ON src.source_snapshot_id=s.id AND src.clip_id=s.clip_id
+   JOIN recording_joined_source_retention_holds h ON h.hour_record_id=src.hour_record_id
+   WHERE s.clip_id=p_clip_id)
+  AND NOT EXISTS(SELECT 1 FROM recording_clips c JOIN recording_joined_snapshot_scopes scope
+   ON scope.recording_id=c.recording_id AND scope.recording_job_id=c.recording_job_id AND c.id<=scope.high_water_clip_id
+   JOIN recording_joined_batches batch ON batch.id=scope.batch_record_id AND batch.state='snapshotting'
+   WHERE c.id=p_clip_id)
+  AND NOT EXISTS(SELECT 1 FROM recording_clips c JOIN recording_joined_dry_run_scopes scope
+   ON scope.recording_id=c.recording_id AND scope.recording_job_id=c.recording_job_id AND c.id<=scope.high_water_clip_id
+   JOIN recording_joined_dry_runs run ON run.id=scope.dry_run_id
+   WHERE c.id=p_clip_id AND NOT EXISTS(SELECT 1 FROM recording_joined_batches batch
+    WHERE batch.batch_id=run.batch_id AND batch.connection_id=run.connection_id AND batch.generation=run.generation
+     AND batch.state IN ('frozen','index_sealed','published')))
 $$;
 
--- Same body as 0155 except the purge transition: a clip whose every snapshot
--- belongs to a released batch, and that no live scope covers, may gain
--- purged_at. Deletion, id changes and scoped identity stay refused.
+-- The purge exemption belongs to the R2 RAW lane only: the clip must be
+-- released and carry that lane's exact durable intent for this object.
+CREATE FUNCTION r2_joined_raw_retirement_released(p_clip_id bigint, p_bucket text, p_key text) RETURNS boolean LANGUAGE sql STABLE AS $$
+ SELECT r2_joined_source_released(p_clip_id)
+  AND EXISTS(SELECT 1 FROM r2_inverse_intents i WHERE i.source_id=p_clip_id AND i.bucket=p_bucket AND i.object_key=p_key)
+$$;
+
+-- Same body as 0155 except the purge transition. A released source with the
+-- R2 RAW lane's exact intent may gain purged_at. The verified path must now be
+-- explicitly true: 0155 let an unset setting through as NULL. Deletion, id
+-- changes and scoped identity stay refused.
 CREATE OR REPLACE FUNCTION guard_recording_joined_clip_retention() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE target_clip_id BIGINT; clip_recording BIGINT; clip_job BIGINT; old_scoped BOOLEAN; new_scoped BOOLEAN := FALSE;
   protected BOOLEAN; purge_transition BOOLEAN := FALSE;
@@ -66,10 +106,10 @@ BEGIN
   protected := EXISTS(SELECT 1 FROM recording_joined_source_snapshots s WHERE s.clip_id=target_clip_id) OR old_scoped;
   IF (TG_OP='DELETE' OR NEW.id IS DISTINCT FROM OLD.id) AND protected
   THEN RAISE EXCEPTION 'joined frozen source is retention protected'; END IF;
-  IF purge_transition AND protected AND NOT (
+  IF purge_transition AND protected AND NOT coalesce(
       (current_setting('stoarama.joined_source_purge', true) = 'verified'
        AND recording_joined_source_purge_eligible(OLD.id, OLD.recording_id, OLD.recording_job_id))
-      OR (NOT old_scoped AND r2_joined_source_released(OLD.id)))
+      OR r2_joined_raw_retirement_released(OLD.id, OLD.bucket, OLD.object_key), false)
   THEN RAISE EXCEPTION 'joined frozen source is retention protected'; END IF;
   IF TG_OP='UPDATE' AND (old_scoped OR new_scoped) AND ROW(NEW.recording_id,NEW.recording_job_id,NEW.storage_destination_id,
       NEW.endpoint,NEW.bucket,NEW.object_key,NEW.etag,NEW.size_bytes,NEW.sha256,NEW.clip_start_at,NEW.clip_end_at,NEW.created_at)
