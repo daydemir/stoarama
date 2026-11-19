@@ -32,3 +32,32 @@ The JSON is local media evidence. A delivery handoff also needs to reconcile
 the manifest with the current catalog, recheck the exact NAS copy and verify
 recipient access before any delivery hold can be changed. This verifier
 does not change the catalog, R2, the delivery page or NAS holds.
+
+## Record a verified observation
+
+Use the reviewed Linux FFmpeg and FFprobe pair pinned in CI. Put the exact
+verifier and support scripts from the deployed verifier revision
+`c39a169478de3c710a3aab2dce5fc3f89714f817` in a dedicated directory. The
+command verifies both scripts and both executables before using them.
+
+```sh
+stoaramactl delivery-source-coverage --output-id "$output_id" --fetch-r2 \
+  --verifier-dir "$verified_scripts" --ffmpeg "$ffmpeg" --ffprobe "$ffprobe"
+```
+
+Select a collated output in the approved NAS handoff roster. The command
+reads the exact catalog-pinned manifest, output and all ordered raw clips.
+It uses private scratch space for the downloaded media and one part's decoded
+audio. It verifies hashes before running the media comparison. Exact local
+copies can also be supplied using `--manifest` and `--media-dir`.
+
+The default invocation prints the new observation. With `--record`, it
+rechecks the catalog and appends the verified per-source results in one
+transaction. Each observation includes the executable and evidence digests.
+A later confirmed failure supersedes an older positive observation.
+
+`delivery_source_coverage_certified` exposes positive observations only while
+the raw identity, manifest, ordered membership and output still match the
+catalog, and the output has an exact connection-13 custody certificate. It
+withholds ambiguous outputs. The certificate does not authorize a hold
+release or an R2 or NAS deletion.
