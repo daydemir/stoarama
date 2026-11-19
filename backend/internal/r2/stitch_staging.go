@@ -70,7 +70,7 @@ func (c *Client) StartStitchStage(ctx context.Context, lease StitchStageLease, i
 	if c.writerDB == nil {
 		return o, errors.New("stitch staging requires a durable writer ledger")
 	}
-	tx, err := c.writerDB.Begin(ctx)
+	tx, err := c.writerDB.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return o, err
 	}
@@ -116,7 +116,7 @@ func (c *Client) PresignStitchStagePart(ctx context.Context, lease StitchStageLe
 	if err != nil || len(digest) != 32 || hex.EncodeToString(digest) != sha {
 		return PresignedRequest{}, errors.New("stitch part requires its exact SHA-256")
 	}
-	tx, err := c.writerDB.Begin(ctx)
+	tx, err := c.writerDB.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return PresignedRequest{}, err
 	}
@@ -178,7 +178,7 @@ func (c *Client) FinishStitchStage(ctx context.Context, lease StitchStageLease, 
 	if c.writerDB == nil {
 		return errors.New("stitch staging requires a durable writer ledger")
 	}
-	tx, err := c.writerDB.Begin(ctx)
+	tx, err := c.writerDB.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return err
 	}

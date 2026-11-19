@@ -198,7 +198,7 @@ func durhamStitchCapability(cap r2.PresignedRequest) map[string]any {
 }
 
 func (s *Server) durhamStitchCheckpoint(ctx context.Context, caller nasStitchCaller, lease r2.StitchStageLease, req durhamStitchCheckpoint) (any, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return nil, err
 	}

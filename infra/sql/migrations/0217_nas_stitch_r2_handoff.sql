@@ -210,6 +210,9 @@ BEGIN
   END IF;
   RETURN NEW;
  END IF;
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'R2 stitch staging admission requires READ COMMITTED' USING ERRCODE='55000';
+ END IF;
  PERFORM pg_advisory_xact_lock_shared(7343226011187);
  IF NEW.state<>'starting' OR NEW.upload_id IS NOT NULL OR NEW.etag IS NOT NULL
   OR NEW.version_id IS NOT NULL OR NEW.last_modified IS NOT NULL OR NEW.grants_drain_at IS NOT NULL
@@ -231,8 +234,11 @@ BEGIN
  IF current_setting('transaction_isolation')<>'read committed' THEN
   RAISE EXCEPTION 'R2 stitch fence transition requires READ COMMITTED' USING ERRCODE='55000';
  END IF;
- IF NOT pg_try_advisory_xact_lock(7343226011187)
-  OR EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects
+ IF NOT pg_try_advisory_xact_lock(7343226011187) THEN
+  RAISE EXCEPTION 'R2 stitch staging admission is busy' USING ERRCODE='55P03';
+ END IF;
+ -- Take a fresh READ COMMITTED snapshot after acquiring the transition lock.
+ IF EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects
    WHERE state IN ('starting','uploading','completing') OR grants_drain_at>=clock_timestamp())
   OR EXISTS(SELECT 1 FROM nas_stitch_r2_stage_retirements WHERE absence_observed_at IS NULL) THEN
   RAISE EXCEPTION 'R2 stitch staging writers or unresolved retirements have not drained';

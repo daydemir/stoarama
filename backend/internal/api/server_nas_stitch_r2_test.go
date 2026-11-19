@@ -102,10 +102,6 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil || !strings.Contains(err.Error(), "writer fence and drain") {
 		t.Fatal("staging retirement accepted an undrained fence", err)
 	}
-	// Model the controller's preexisting matured fence in this disposable schema.
-	exec(`ALTER TABLE r2_retirement_writer_fences DISABLE TRIGGER r2_writer_fence_transition;
- UPDATE r2_retirement_writer_fences SET drain_not_before=clock_timestamp()-interval '1 second';
- ALTER TABLE r2_retirement_writer_fences ENABLE TRIGGER r2_writer_fence_transition;`)
 
 	planTx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
@@ -159,9 +155,34 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 
 	exec(`UPDATE nas_stitch_r2_hours SET state='leased',attempt=1,lease_api_key_id=47,lease_token=repeat('e',64),
  lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, id)
-	exec(`INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes)
- OVERRIDING SYSTEM VALUE VALUES(123,$1,1,47,'stoarama',$2,$3,$4,100)`,
-		id, endpoint, plan.OutputFolder+"/run-000-"+sha+".mp4", sha)
+	const insertStage = `INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes)
+ OVERRIDING SYSTEM VALUE VALUES(123,$1,1,47,'stoarama',$2,$3,$4,100)`
+	outputPath := plan.OutputFolder + "/run-000-" + sha + ".mp4"
+	staleAdmission, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer staleAdmission.Rollback(ctx)
+	var oldFence bool
+	if err := staleAdmission.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_retirement_writer_fences)`).Scan(&oldFence); err != nil || !oldFence {
+		t.Fatal("staging admission did not establish its old fence snapshot", err)
+	}
+	exec(`DELETE FROM r2_retirement_writer_fences`)
+	if _, err := staleAdmission.Exec(ctx, insertStage, id, endpoint, outputPath, sha); err == nil ||
+		!strings.Contains(err.Error(), "staging admission requires READ COMMITTED") {
+		t.Fatal("stale staging snapshot admitted a writer after fence removal", err)
+	}
+	staleAdmission.Rollback(ctx)
+	exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, endpoint)
+	// Model the controller's preexisting matured fence in this disposable schema.
+	exec(`ALTER TABLE r2_retirement_writer_fences DISABLE TRIGGER r2_writer_fence_transition;
+ UPDATE r2_retirement_writer_fences SET drain_not_before=clock_timestamp()-interval '1 second';
+ ALTER TABLE r2_retirement_writer_fences ENABLE TRIGGER r2_writer_fence_transition;`)
+	exec(insertStage, id, endpoint, outputPath, sha)
+	if _, err := pool.Exec(ctx, `DELETE FROM r2_retirement_writer_fences`); err == nil ||
+		!strings.Contains(err.Error(), "have not drained") {
+		t.Fatal("committed starting stage allowed fence removal", err)
+	}
 	exec(`UPDATE nas_stitch_r2_control SET enabled=true,max_staging_bytes=1000000`)
 	lease := r2.StitchStageLease{HourID: id, APIKeyID: 47, Attempt: 1, Token: strings.Repeat("e", 64), PlanSHA: planDigest}
 	foreign := lease
