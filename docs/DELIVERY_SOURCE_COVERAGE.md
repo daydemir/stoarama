@@ -38,7 +38,8 @@ does not change the catalog, R2, the delivery page or NAS holds.
 Use the reviewed Linux FFmpeg and FFprobe pair pinned in CI. Put the exact
 verifier and support scripts from the deployed verifier revision
 `c39a169478de3c710a3aab2dce5fc3f89714f817` in a dedicated directory. The
-command verifies both scripts and both executables before using them.
+command verifies private copies of both scripts and both executables before
+running them with the system Python at `/usr/bin/python3`.
 
 ```sh
 stoaramactl delivery-source-coverage --output-id "$output_id" --fetch-r2 \
@@ -57,7 +58,7 @@ transaction. Each observation includes the executable and evidence digests.
 A later confirmed failure supersedes an older positive observation.
 
 `delivery_source_coverage_certified` exposes positive observations only while
-the raw identity, manifest, ordered membership and output still match the
-catalog, and the output has an exact connection-13 custody certificate. It
+the raw identity, manifest, hour, batch, part and output span still match
+the catalog, the ordered membership is unchanged, and the output has an exact connection-13 custody certificate. It
 withholds ambiguous outputs. The certificate does not authorize a hold
 release or an R2 or NAS deletion.

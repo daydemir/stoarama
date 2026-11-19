@@ -22,6 +22,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -37,6 +38,7 @@ type deliveryCoverageTarget struct {
 	ManifestKey, ManifestSHA, HourID, BatchID string
 	Bucket, ETag                              string
 	SourceIDs                                 []int64
+	Start, End                                time.Time
 	Output                                    deliveryCoverageOutput
 }
 
@@ -104,7 +106,7 @@ func readDeliveryCoverageTarget(ctx context.Context, q r2RetireQuerier, id int64
 	t := deliveryCoverageTarget{OutputID: id}
 	err := q.QueryRow(ctx, `
  SELECT h.id,h.recording_id,h.manifest_object_key,h.manifest_sha256,h.hour_id,h.batch_id,
-        o.source_clip_ids,o.part,o.parts,o.object_key,o.nas_relative_path,o.sha256,o.size_bytes,p.bucket,p.etag
+        o.source_clip_ids,o.part,o.parts,o.object_key,o.nas_relative_path,o.sha256,o.size_bytes,o.start_at,o.end_at,p.bucket,p.etag
  FROM delivery_nas_handoff_outputs p
  JOIN recording_collation_outputs o ON o.id=p.output_id AND o.object_key=p.object_key
   AND o.nas_relative_path=p.nas_relative_path AND o.sha256=p.sha256 AND o.size_bytes=p.size_bytes
@@ -112,7 +114,7 @@ func readDeliveryCoverageTarget(ctx context.Context, q r2RetireQuerier, id int64
  JOIN recordings rec ON rec.id=h.recording_id AND rec.account_id=47
  WHERE o.id=$1 AND h.generation=2 AND h.status='collated'`, id).Scan(
 		&t.CollationHourID, &t.RecordingID, &t.ManifestKey, &t.ManifestSHA, &t.HourID, &t.BatchID, &t.SourceIDs,
-		&t.Output.Part, &t.Output.Parts, &t.Output.Key, &t.Output.Path, &t.Output.SHA, &t.Output.Bytes, &t.Bucket, &t.ETag)
+		&t.Output.Part, &t.Output.Parts, &t.Output.Key, &t.Output.Path, &t.Output.SHA, &t.Output.Bytes, &t.Start, &t.End, &t.Bucket, &t.ETag)
 	if errors.Is(err, pgx.ErrNoRows) {
 		err = errors.New("no approved source-coverage output matches the current catalog")
 	}
@@ -120,7 +122,7 @@ func readDeliveryCoverageTarget(ctx context.Context, q r2RetireQuerier, id int64
 }
 
 func readCoveragePinnedDocument(path, digest string) ([]byte, error) {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -142,31 +144,34 @@ func readCoveragePinnedDocument(path, digest string) ([]byte, error) {
 	return raw, nil
 }
 
-func coverageTool(path, want string) (string, error) {
-	path, err := filepath.Abs(path)
+func copyPinnedCoverageTool(path, destination, want string) error {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW, 0)
 	if err != nil {
-		return "", err
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
+		return err
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return "", err
+		return err
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 || info.Size() > 512<<20 {
-		return "", errors.New("coverage media tool is not a regular executable")
+	const maxToolBytes = 512 << 20
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 || info.Size() <= 0 || info.Size() > maxToolBytes {
+		return errors.New("coverage media tool is not a bounded regular executable")
 	}
+	dst, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0500)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
 	sum := sha256.New()
-	if _, err := io.Copy(sum, f); err != nil {
-		return "", err
+	size, err := io.Copy(io.MultiWriter(dst, sum), io.LimitReader(f, maxToolBytes+1))
+	if err != nil {
+		return err
 	}
-	if hex.EncodeToString(sum.Sum(nil)) != want {
-		return "", errors.New("coverage media tool differs from the reviewed executable")
+	if size != info.Size() || hex.EncodeToString(sum.Sum(nil)) != want {
+		return errors.New("coverage media tool differs from the reviewed executable")
 	}
-	return path, nil
+	return dst.Close()
 }
 
 func loadCoverageManifest(target deliveryCoverageTarget, manifestPath string) (collation.HourManifest, []byte, error) {
@@ -181,7 +186,9 @@ func loadCoverageManifest(target deliveryCoverageTarget, manifestPath string) (c
 	}
 	output := manifest.Outputs[target.Output.Part-1]
 	if output.ObjectKey != target.Output.Key || output.SHA256 != target.Output.SHA || output.SizeBytes != target.Output.Bytes ||
-		output.NASRelativePath != target.Output.Path || output.Parts != target.Output.Parts || !slices.Equal(output.SourceClipIDs, target.SourceIDs) {
+		output.NASRelativePath != target.Output.Path || output.Parts != target.Output.Parts ||
+		!output.StartUTC.Truncate(time.Microsecond).Equal(target.Start) || !output.EndUTC.Truncate(time.Microsecond).Equal(target.End) ||
+		!slices.Equal(output.SourceClipIDs, target.SourceIDs) {
 		return manifest, nil, errors.New("approved output or ordered sources differ from the frozen manifest")
 	}
 	return manifest, manifestRaw, nil
@@ -193,14 +200,6 @@ func verifyDeliveryCoverage(ctx context.Context, target deliveryCoverageTarget, 
 		return nil, err
 	}
 	output := manifest.Outputs[target.Output.Part-1]
-	ffmpeg, err = coverageTool(ffmpeg, deliveryCoverageFFmpegSHA)
-	if err != nil {
-		return nil, err
-	}
-	ffprobe, err = coverageTool(ffprobe, deliveryCoverageFFprobeSHA)
-	if err != nil {
-		return nil, err
-	}
 	mediaDir, err = filepath.Abs(mediaDir)
 	if err != nil {
 		return nil, err
@@ -210,6 +209,14 @@ func verifyDeliveryCoverage(ctx context.Context, target deliveryCoverageTarget, 
 		return nil, err
 	}
 	defer os.RemoveAll(scratch)
+	pinnedFFmpeg := filepath.Join(scratch, "ffmpeg")
+	pinnedFFprobe := filepath.Join(scratch, "ffprobe")
+	if err := copyPinnedCoverageTool(ffmpeg, pinnedFFmpeg, deliveryCoverageFFmpegSHA); err != nil {
+		return nil, err
+	}
+	if err := copyPinnedCoverageTool(ffprobe, pinnedFFprobe, deliveryCoverageFFprobeSHA); err != nil {
+		return nil, err
+	}
 	for _, file := range []struct{ name, sha string }{
 		{"delivery_coverage.py", deliveryCoverageVerifierSHA},
 		{"stoarama_pull.py", deliveryCoverageSupportSHA},
@@ -227,12 +234,12 @@ func verifyDeliveryCoverage(ctx context.Context, target deliveryCoverageTarget, 
 		return nil, err
 	}
 	args := []string{"-B", filepath.Join(scratch, "delivery_coverage.py"), "--manifest", frozenManifest,
-		"--manifest-sha256", target.ManifestSHA, "--part", strconv.Itoa(output.Part), "--ffmpeg", ffmpeg, "--ffprobe", ffprobe,
+		"--manifest-sha256", target.ManifestSHA, "--part", strconv.Itoa(output.Part), "--ffmpeg", pinnedFFmpeg, "--ffprobe", pinnedFFprobe,
 		filepath.Join(mediaDir, "output.mp4")}
 	for _, id := range output.SourceClipIDs {
 		args = append(args, filepath.Join(mediaDir, fmt.Sprintf("raw-%d.mp4", id)))
 	}
-	cmd := exec.CommandContext(ctx, "python3", args...)
+	cmd := exec.CommandContext(ctx, "/usr/bin/python3", args...)
 	cmd.Dir = scratch
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "TMPDIR=" + scratch, "LANG=C"}
 	cmd.Stderr = os.Stderr
@@ -368,15 +375,19 @@ func storeDeliveryCoverage(ctx context.Context, tx pgx.Tx, target deliveryCovera
 	}
 	if current.CollationHourID != target.CollationHourID || current.RecordingID != target.RecordingID ||
 		current.ManifestKey != target.ManifestKey || current.ManifestSHA != target.ManifestSHA || current.Output != target.Output ||
+		current.HourID != target.HourID || current.BatchID != target.BatchID ||
+		!current.Start.Equal(target.Start) || !current.End.Equal(target.End) ||
 		current.Bucket != target.Bucket || current.ETag != target.ETag ||
 		!slices.Equal(current.SourceIDs, target.SourceIDs) {
 		return errors.New("delivery catalog changed while proving coverage")
 	}
 	var runID int64
 	err = tx.QueryRow(ctx, `
- INSERT INTO delivery_source_coverage_runs(output_id,collation_hour_id,source_clip_ids,manifest_object_key,manifest_sha256,evidence_sha256,media_evidence)
- VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+ INSERT INTO delivery_source_coverage_runs(output_id,collation_hour_id,source_clip_ids,manifest_object_key,manifest_sha256,
+  hour_id,batch_id,part,parts,output_start_at,output_end_at,evidence_sha256,media_evidence)
+ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
 		target.OutputID, target.CollationHourID, target.SourceIDs, target.ManifestKey, target.ManifestSHA,
+		target.HourID, target.BatchID, target.Output.Part, target.Output.Parts, target.Start, target.End,
 		fmt.Sprintf("%x", sha256.Sum256(raw)), raw).Scan(&runID)
 	if err != nil {
 		return err

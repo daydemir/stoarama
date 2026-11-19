@@ -1,12 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestDeliverySourceCoverageRequiresLatestProofAndExactNASReadback(t *testing.T) {
@@ -24,17 +30,17 @@ func TestDeliverySourceCoverageRequiresLatestProofAndExactNASReadback(t *testing
  CREATE TABLE recording_collation_hours(id bigint PRIMARY KEY,recording_id bigint,generation int,status text,
    manifest_object_key text,manifest_sha256 text,hour_id text,batch_id text);
  CREATE TABLE recording_collation_outputs(id bigint PRIMARY KEY,collation_hour_id bigint,part int,parts int,object_key text,
-   nas_relative_path text,sha256 text,size_bytes bigint,source_clip_ids bigint[]);
+   nas_relative_path text,sha256 text,size_bytes bigint,source_clip_ids bigint[],start_at timestamptz,end_at timestamptz);
  CREATE TABLE delivery_keep_holds(bucket text,object_key text,kind text,etag text,size_bytes bigint,sha256 text);
  CREATE TABLE recording_collation_output_acks(output_id bigint,connection_id bigint,nas_relative_path text,size_bytes bigint,sha256 text);
  CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint,bucket text,object_key text,etag text,
    sha256 text,size_bytes bigint,display_path text,clip_start_at timestamptz,clip_end_at timestamptz);
- CREATE TABLE r2_object_retirements(kind text,source_id bigint,bucket text,object_key text,sha256 text);
+ CREATE TABLE r2_object_retirements(kind text,source_id bigint,bucket text,object_key text,sha256 text,size_bytes bigint);
  INSERT INTO connections VALUES(13,47,'nas_pull');
  INSERT INTO recordings VALUES(2,47);
  INSERT INTO recording_collation_hours VALUES(3,2,2,'collated','manifest.json',repeat('b',64),'fixture-hour','fixture-batch');
  INSERT INTO recording_collation_outputs VALUES(4,3,1,1,'joined/goodplus-test/objects/demo.mp4',
-   'f/July/26-Sunday/f_hour_01_000000-005900.mp4',repeat('c',64),100,ARRAY[5]);
+   'f/July/26-Sunday/f_hour_01_000000-005900.mp4',repeat('c',64),100,ARRAY[5],'2026-08-05T00:00Z','2026-08-05T00:01Z');
  INSERT INTO recording_clips VALUES(5,2,'stoarama','raw/demo.mp4','raw-etag',repeat('d',64),88,
    'test/raw.mp4','2026-08-05T00:00Z','2026-08-05T00:01Z');
  `)
@@ -71,7 +77,7 @@ func TestDeliverySourceCoverageRequiresLatestProofAndExactNASReadback(t *testing
 	report := deliveryCoverageReport{SchemaVersion: 1, ManifestSHA: target.ManifestSHA, HourID: target.HourID,
 		BatchID: target.BatchID, Output: target.Output, VerifierSHA: deliveryCoverageVerifierSHA,
 		SupportSHA: deliveryCoverageSupportSHA, FFmpegSHA: deliveryCoverageFFmpegSHA, FFprobeSHA: deliveryCoverageFFprobeSHA}
-	write := func(row deliveryCoverageObservation) {
+	record := func(row deliveryCoverageObservation) error {
 		t.Helper()
 		report.Sources = []deliveryCoverageObservation{row}
 		raw, err := json.Marshal(report)
@@ -88,9 +94,13 @@ func TestDeliverySourceCoverageRequiresLatestProofAndExactNASReadback(t *testing
 		}
 		defer tx.Rollback(ctx)
 		if err := storeDeliveryCoverage(ctx, tx, target, parsed, raw); err != nil {
-			t.Fatal(err)
+			return err
 		}
-		if err := tx.Commit(ctx); err != nil {
+		return tx.Commit(ctx)
+	}
+	write := func(row deliveryCoverageObservation) {
+		t.Helper()
+		if err := record(row); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -129,10 +139,72 @@ func TestDeliverySourceCoverageRequiresLatestProofAndExactNASReadback(t *testing
 	want(0)
 	execSQL("UPDATE recording_collation_outputs SET source_clip_ids=ARRAY[5] WHERE id=4")
 	want(1)
+	for _, drift := range []struct{ change, restore string }{
+		{"UPDATE recording_collation_outputs SET parts=2 WHERE id=4", "UPDATE recording_collation_outputs SET parts=1 WHERE id=4"},
+		{"UPDATE recording_collation_outputs SET part=2,parts=2 WHERE id=4", "UPDATE recording_collation_outputs SET part=1,parts=1 WHERE id=4"},
+		{"UPDATE recording_collation_outputs SET end_at=end_at+interval '1 second' WHERE id=4", "UPDATE recording_collation_outputs SET end_at=end_at-interval '1 second' WHERE id=4"},
+		{"UPDATE recording_collation_hours SET hour_id='other-hour' WHERE id=3", "UPDATE recording_collation_hours SET hour_id='fixture-hour' WHERE id=3"},
+		{"UPDATE recording_collation_hours SET batch_id='other-batch' WHERE id=3", "UPDATE recording_collation_hours SET batch_id='fixture-batch' WHERE id=3"},
+	} {
+		execSQL(drift.change)
+		want(0)
+		if err := record(row); err == nil || !strings.Contains(err.Error(), "catalog changed") {
+			t.Fatalf("recording did not reject catalog drift after %s: %v", drift.change, err)
+		}
+		execSQL(drift.restore)
+		want(1)
+	}
+	execSQL(`INSERT INTO recording_collation_outputs
+	 SELECT 6,collation_hour_id,2,2,object_key||'.other',nas_relative_path||'.other',sha256,size_bytes,
+	        source_clip_ids,start_at,end_at FROM recording_collation_outputs WHERE id=4`)
+	want(0)
+	execSQL("DELETE FROM recording_collation_outputs WHERE id=6")
+	want(1)
+	execSQL(`INSERT INTO r2_object_retirements
+	 SELECT 'collated',4,bucket,object_key,sha256,size_bytes FROM delivery_nas_handoff_outputs WHERE output_id=4`)
+	want(1)
+	execSQL("UPDATE r2_object_retirements SET size_bytes=99")
+	want(0)
+	execSQL("UPDATE r2_object_retirements SET size_bytes=100,source_id=6")
+	want(0)
+	execSQL("UPDATE r2_object_retirements SET source_id=4,object_key='other-key'")
+	want(0)
+	execSQL("DELETE FROM r2_object_retirements")
+	want(1)
 	passed := row
 	row.Verdict, row.Tracks, row.Reason = deliveryCoverageUnproven, nil, "visible audio mismatch"
 	write(row)
 	want(0)
 	write(passed)
 	want(1)
+}
+
+func TestDeliveryCoverageCopiesOnlyPinnedRegularExecutables(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "tool")
+	copy := filepath.Join(dir, "verified")
+	payload := []byte("reviewed media tool")
+	digest := fmt.Sprintf("%x", sha256.Sum256(payload))
+	if err := os.WriteFile(source, payload, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyPinnedCoverageTool(source, copy, digest); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source, []byte("different tool"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(copy); err != nil || !bytes.Equal(data, payload) {
+		t.Fatalf("the verified executable followed source mutation: %q, %v", data, err)
+	}
+	fifo := filepath.Join(dir, "fifo")
+	if err := unix.Mkfifo(fifo, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyPinnedCoverageTool(fifo, filepath.Join(dir, "rejected"), digest); err == nil {
+		t.Fatal("accepted a non-regular executable")
+	}
+	if _, err := readCoveragePinnedDocument(fifo, digest); err == nil {
+		t.Fatal("accepted a non-regular document")
+	}
 }
