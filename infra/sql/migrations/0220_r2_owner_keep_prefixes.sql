@@ -4,6 +4,9 @@
 -- Deniz, 2026-11-19, on streams 854 and 537, verbatim: "These two are actually
 -- for my thesis. That's what that extra data probably is from: March to June.
 -- That's for my thesis data so let's actually keep that for now."
+-- Deniz, 2026-11-19, on streams 78 and 415, verbatim: "yes keep for now",
+-- answering whether they should be kept as thesis data like 854 and 537
+-- (1.62 TB from the same March to June period).
 
 CREATE TABLE r2_owner_keep_prefixes (
  bucket text NOT NULL CHECK(bucket<>''),
@@ -127,7 +130,9 @@ ALTER TABLE nas_stitch_r2_stage_retirements ENABLE ALWAYS TRIGGER r2_owner_keep_
 -- fails this migration instead of landing silently.
 INSERT INTO r2_owner_keep_prefixes(bucket,prefix,decision) VALUES
  ('stoarama','raw/stream/854/','Deniz 2026-11-19: "These two are actually for my thesis. That''s what that extra data probably is from: March to June. That''s for my thesis data so let''s actually keep that for now."'),
- ('stoarama','raw/stream/537/','Deniz 2026-11-19: "These two are actually for my thesis. That''s what that extra data probably is from: March to June. That''s for my thesis data so let''s actually keep that for now."');
+ ('stoarama','raw/stream/537/','Deniz 2026-11-19: "These two are actually for my thesis. That''s what that extra data probably is from: March to June. That''s for my thesis data so let''s actually keep that for now."'),
+ ('stoarama','raw/stream/78/','Deniz 2026-11-19: "yes keep for now", answering whether streams 78 (Daechi Station, Seoul) and 415 (Sebyeong Bridge, Busan) should be kept as thesis data like 854 and 537 (1.62 TB, March to June).'),
+ ('stoarama','raw/stream/415/','Deniz 2026-11-19: "yes keep for now", answering whether streams 78 (Daechi Station, Seoul) and 415 (Sebyeong Bridge, Busan) should be kept as thesis data like 854 and 537 (1.62 TB, March to June).');
 
 ALTER TABLE r2_owner_keep_prefixes ENABLE ALWAYS TRIGGER r2_owner_keep_prefix_immutable;
 ALTER TABLE r2_owner_keep_prefixes ENABLE ALWAYS TRIGGER r2_owner_keep_prefix_no_truncate;

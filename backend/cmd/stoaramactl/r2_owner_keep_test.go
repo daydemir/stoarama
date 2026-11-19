@@ -18,9 +18,11 @@ func TestR2OwnerKeepPrefixes(t *testing.T) {
 	if err := db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir()); err != nil {
 		t.Fatal(err)
 	}
-	var decision string
-	if err := pool.QueryRow(ctx, `SELECT decision FROM r2_owner_keep_prefixes WHERE bucket='stoarama' AND prefix='raw/stream/854/'`).Scan(&decision); err != nil || !strings.Contains(decision, "for my thesis") {
-		t.Fatalf("854 hold %q %v", decision, err)
+	for prefix, words := range map[string]string{"raw/stream/854/": "for my thesis", "raw/stream/537/": "for my thesis", "raw/stream/78/": "yes keep for now", "raw/stream/415/": "yes keep for now"} {
+		var decision string
+		if err := pool.QueryRow(ctx, `SELECT decision FROM r2_owner_keep_prefixes WHERE bucket='stoarama' AND prefix=$1`, prefix).Scan(&decision); err != nil || !strings.Contains(decision, words) {
+			t.Fatalf("%s hold %q %v", prefix, decision, err)
+		}
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO r2_owner_keep_prefixes(bucket,prefix,decision) VALUES('stoarama','Raw/no-slash','x')`); err == nil {
 		t.Fatal("malformed prefix accepted")
@@ -36,7 +38,7 @@ func TestR2OwnerKeepPrefixes(t *testing.T) {
 		t.Fatalf("repeatable-read admission: %v", err)
 	}
 	rr.Rollback(ctx)
-	for _, key := range []string{"raw/stream/854/2026/04/12/segment-1775969171803.mp4", "raw/stream/537/2026/04/18/segment-1776481123345.mp4"} {
+	for _, key := range []string{"raw/stream/854/2026/04/12/segment-1775969171803.mp4", "raw/stream/537/2026/04/18/segment-1776481123345.mp4", "raw/stream/78/2026/05/01/segment-1777600000000.mp4", "raw/stream/415/2026/06/01/segment-1780300000000.mp4"} {
 		for _, table := range []string{"r2_inverse_attempts", "r2_keep28_attempts"} {
 			if _, err := pool.Exec(ctx, `INSERT INTO `+table+`(bucket,object_key) VALUES('stoarama',$1)`, key); err == nil || !strings.Contains(err.Error(), "OWNER KEEP HOLD") {
 				t.Fatalf("%s accepted %s: %v", table, key, err)
@@ -59,13 +61,13 @@ func TestR2OwnerKeepPrefixes(t *testing.T) {
 		}
 	}
 	prefixes, err := loadInverseOwnerKeepPrefixes(ctx, pool, "stoarama")
-	if err != nil || len(prefixes) != 2 {
+	if err != nil || len(prefixes) != 4 {
 		t.Fatalf("prefixes %v %v", prefixes, err)
 	}
 	p := inverseTestProtection()
 	p.OwnerKeepPrefixes = prefixes
 	p.Held["raw/stream/537/held.mp4"] = true
-	for _, key := range []string{"raw/stream/854/2026/03/23/segment-1.mp4", "raw/stream/537/held.mp4"} {
+	for _, key := range []string{"raw/stream/854/2026/03/23/segment-1.mp4", "raw/stream/537/held.mp4", "raw/stream/78/2026/04/01/segment-1.mp4", "raw/stream/415/2026/06/28/segment-1.mp4"} {
 		if class, reason := p.classify(r2.ObjectInfo{Key: key, SizeBytes: 1}); class != inverseKE || reason != "owner_keep_prefix" {
 			t.Fatalf("%s classified %s (%s)", key, class, reason)
 		}
