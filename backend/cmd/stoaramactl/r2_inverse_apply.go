@@ -245,6 +245,7 @@ const inverseRawHeldSQL = `SELECT
  OR EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds WHERE bucket=$2 AND object_key=$3 AND released_at IS NULL)
  OR EXISTS(SELECT 1 FROM nas_r2_copy_items WHERE (state<>'verified' OR blocked_reason<>'') AND item->>'bucket'=$2 AND item->>'object_key'=$3)
  OR r2_inverse_delivery_held($1,$2,$3,$5,$6,$7)
+ OR r2_owner_keep_held($2,$3)
  OR EXISTS(SELECT 1 FROM nas_restore_requests WHERE clip_id=$1 AND state IN ('pending','leased'))
  OR EXISTS(SELECT 1 FROM recording_joined_source_snapshots WHERE clip_id=$1)
  OR EXISTS(SELECT 1 FROM recording_joined_snapshot_scopes s JOIN recording_joined_batches b ON b.id=s.batch_record_id AND b.state='snapshotting' JOIN recording_clips c ON c.id=$1 WHERE s.recording_id=c.recording_id AND s.recording_job_id=c.recording_job_id AND c.id<=s.high_water_clip_id)
@@ -827,6 +828,9 @@ send:
 func loadInverseApplyProtection(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks, windows map[int64]api.Keep28Window) (inverseProtection, error) {
 	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, KEFolders: map[string]bool{}, Picks: picks, Windows: windows}
 	var err error
-	p.KEFolders, err = loadInverseKEFolders(ctx, q, bucket, picks)
+	if p.KEFolders, err = loadInverseKEFolders(ctx, q, bucket, picks); err != nil {
+		return p, err
+	}
+	p.OwnerKeepPrefixes, err = loadInverseOwnerKeepPrefixes(ctx, q, bucket)
 	return p, err
 }
