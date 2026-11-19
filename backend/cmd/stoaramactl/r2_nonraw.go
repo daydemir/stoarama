@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptrace"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -438,7 +439,7 @@ func (a *inverseApplier) proveNonrawReceipt(ctx context.Context, tx pgx.Tx, t in
 	return nil
 }
 
-func (a *inverseApplier) publishNonrawAbsent(ctx context.Context, e inverseEntry, manifest string, reconciled bool) error {
+func (a *inverseApplier) publishNonrawAbsent(ctx context.Context, e inverseEntry, manifest string) error {
 	tx, err := a.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return err
@@ -459,7 +460,7 @@ func (a *inverseApplier) publishNonrawAbsent(ctx context.Context, e inverseEntry
  SELECT 'collated',o.id,i.stream_id,i.bucket,i.object_key,i.size_bytes,i.sha256,$4,i.choice,i.manifest_sha256,i.policy_sha256,$5
  FROM r2_nonraw_intents i JOIN recording_collation_outputs o ON o.id=i.source_id
  WHERE i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 ON CONFLICT DO NOTHING`,
-		a.store.Bucket(), e.Key, manifest, inverseNonrawReason, reconciled); err != nil {
+		a.store.Bucket(), e.Key, manifest, inverseNonrawReason, false); err != nil {
 		return err
 	}
 	var receipt bool
@@ -481,10 +482,22 @@ func (a *inverseApplier) publishNonrawAbsent(ctx context.Context, e inverseEntry
 	return a.record(e, inverseAbsent, manifest)
 }
 
-func (a *inverseApplier) deleteNonraw(ctx context.Context, e inverseEntry) (bool, error) {
+// deleteNonraw runs one collated key under the same admission and send gates as
+// delete.
+func (a *inverseApplier) deleteNonraw(ctx, admit context.Context, send *inverseSendGate, e inverseEntry) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, inverseNetworkTimeout)
 	defer cancel()
-	if _, err := a.reserveNonraw(ctx, e); err != nil {
+	if admit.Err() != nil {
+		return false, errInverseAdmissionClosed
+	}
+	reserving, stopReserving := context.WithCancel(ctx)
+	defer context.AfterFunc(admit, stopReserving)()
+	_, err := a.reserveNonraw(reserving, e)
+	stopReserving()
+	if err != nil {
+		if admit.Err() != nil && errors.Is(err, context.Canceled) {
+			return false, errInverseAdmissionClosed
+		}
 		return false, err
 	}
 	if err := a.record(e, inverseIntent, a.opts.ManifestSHA); err != nil {
@@ -495,9 +508,12 @@ func (a *inverseApplier) deleteNonraw(ctx context.Context, e inverseEntry) (bool
 		return false, err
 	}
 	defer tx.Rollback(context.Background())
-	authority, err := a.authorizeNonraw(ctx, tx, e)
+	authority, err := a.authorizeNonraw(ctx, tx, e, send)
 	if err != nil {
 		return false, err
+	}
+	if send.isClosed() {
+		return false, errInverseAdmissionClosed
 	}
 	if err = a.store.(inverseNonrawStore).deleteNonrawOnce(ctx, authority); err != nil {
 		return false, fmt.Errorf("single DELETE result ambiguous; intent retained, never retransmit: %w", err)
@@ -511,7 +527,10 @@ func (a *inverseApplier) deleteNonraw(ctx context.Context, e inverseEntry) (bool
 	if err = tx.Commit(ctx); err != nil {
 		return false, err
 	}
-	return true, a.publishNonrawAbsent(ctx, e, a.opts.ManifestSHA, false)
+	if err = a.publishNonrawAbsent(ctx, e, a.opts.ManifestSHA); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // authorizeNonraw issues the single-use capability only after every live check,
@@ -543,7 +562,7 @@ func (a *inverseApplier) prepareNonrawWire(ctx context.Context, tx pgx.Tx, e inv
 	return t, err
 }
 
-func (a *inverseApplier) authorizeNonraw(ctx context.Context, tx pgx.Tx, e inverseEntry) (*inverseNonrawAuthority, error) {
+func (a *inverseApplier) authorizeNonraw(ctx context.Context, tx pgx.Tx, e inverseEntry, gate *inverseSendGate) (*inverseNonrawAuthority, error) {
 	if a.opts.Lane != inverseNonrawCollated {
 		return nil, errors.New("nonraw authority requires the collated lane")
 	}
@@ -595,7 +614,7 @@ func (a *inverseApplier) authorizeNonraw(ctx context.Context, tx pgx.Tx, e inver
 	if tag.RowsAffected() != 1 {
 		return nil, errors.New("nonraw wire authority was already issued; reconcile only")
 	}
-	return &inverseNonrawAuthority{binding: binding, applier: a, tx: tx, entry: e, used: &atomic.Bool{}}, nil
+	return &inverseNonrawAuthority{binding: binding, applier: a, tx: tx, entry: e, used: &atomic.Bool{}, gate: gate}, nil
 }
 
 // inverseWireGuardKey is the collated durable-intent guard. It reuses the RAW
@@ -643,6 +662,7 @@ type inverseNonrawAuthority struct {
 	tx      pgx.Tx
 	entry   inverseEntry
 	used    *atomic.Bool
+	gate    *inverseSendGate
 }
 
 func (a *inverseNonrawAuthority) check(ctx context.Context, bucket, endpoint string) error {
@@ -684,11 +704,19 @@ func (s *inverseSDKStore) deleteNonrawOnce(ctx context.Context, a *inverseNonraw
 	if err := a.check(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
 		return err
 	}
-	transport := &inverseNonrawTransport{base: s.transport, authority: a, bucket: s.Bucket(), endpoint: s.EndpointSHA256()}
+	template, ok := s.transport.(*http.Transport)
+	if !ok {
+		return errors.New("nonraw DELETE needs the HTTP/1.1 transport template")
+	}
+	wire := &inverseWire{gate: a.gate}
+	transport := &inverseNonrawTransport{base: wire.transport(template), authority: a, bucket: s.Bucket(), endpoint: s.EndpointSHA256(), wire: wire}
 	_, err := s.sdk.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.Bucket()), Key: aws.String(a.binding.Key)}, func(o *s3.Options) {
 		o.Retryer = aws.NopRetryer{}
 		o.HTTPClient = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	})
+	if err != nil && wire.lost() {
+		return fmt.Errorf("%w: %w", errInverseWireAmbiguous, err)
+	}
 	return err
 }
 
@@ -697,6 +725,7 @@ type inverseNonrawTransport struct {
 	authority        *inverseNonrawAuthority
 	bucket, endpoint string
 	attempted        atomic.Bool
+	wire             *inverseWire
 }
 
 func (t *inverseNonrawTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -708,5 +737,10 @@ func (t *inverseNonrawTransport) RoundTrip(req *http.Request) (*http.Response, e
 	}
 	req.Header.Del("Idempotency-Key")
 	req.Header.Del("X-Idempotency-Key")
-	return t.base.RoundTrip(req)
+	trace := &httptrace.ClientTrace{GotFirstResponseByte: func() { t.wire.answered.Store(true) }}
+	response, err := t.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
+	if response != nil {
+		t.wire.answered.Store(true)
+	}
+	return response, err
 }

@@ -38,7 +38,7 @@ func TestR2NonrawHeadLastModifiedSecondPrecision(t *testing.T) {
 	f.store.mu.Unlock()
 	a := f.applier(t, "run1")
 	defer a.ledger.close()
-	if ok, err := a.deleteNonraw(f.ctx, f.collatedEntry()); err != nil || !ok || f.deletes() != 1 {
+	if ok, err := a.deleteNonraw(f.ctx, f.ctx, &inverseSendGate{}, f.collatedEntry()); err != nil || !ok || f.deletes() != 1 {
 		t.Fatalf("millisecond listing time: ok=%v err=%v deletes=%d", ok, err, f.deletes())
 	}
 }
@@ -63,7 +63,7 @@ func TestR2NonrawJoinedDryRunScopeHoldsSource(t *testing.T) {
  VALUES('00000000-0000-0000-0000-00000000000a',30,1,'2026-06-01',1,8000001,$1)`, tc.highWater)
 			a := f.applier(t, "run1")
 			defer a.ledger.close()
-			ok, err := a.deleteNonraw(f.ctx, f.collatedEntry())
+			ok, err := a.deleteNonraw(f.ctx, f.ctx, &inverseSendGate{}, f.collatedEntry())
 			if tc.held {
 				if err == nil || ok || f.deletes() != 0 || f.nonrawIntents(t) != 0 {
 					t.Fatalf("dry-run scope did not hold: ok=%v err=%v deletes=%d", ok, err, f.deletes())
@@ -95,7 +95,7 @@ func TestR2NonrawRequiresOwnerFenceProof(t *testing.T) {
 	f.drainSHA, _ = inverseFileSHA(f.drain)
 	a := f.applier(t, "run1")
 	defer a.ledger.close()
-	if _, err := a.deleteNonraw(f.ctx, f.collatedEntry()); err == nil || !strings.Contains(err.Error(), "owner fence policy proof") || f.deletes() != 0 || f.nonrawIntents(t) != 0 {
+	if _, err := a.deleteNonraw(f.ctx, f.ctx, &inverseSendGate{}, f.collatedEntry()); err == nil || !strings.Contains(err.Error(), "owner fence policy proof") || f.deletes() != 0 || f.nonrawIntents(t) != 0 {
 		t.Fatalf("completion proof authorized the collated lane: %v deletes=%d", err, f.deletes())
 	}
 }

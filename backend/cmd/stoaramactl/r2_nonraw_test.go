@@ -251,7 +251,7 @@ func TestR2NonrawExecutorLane(t *testing.T) {
 
 	t.Run("positive", func(t *testing.T) {
 		before := f.deletes()
-		ok, err := applier.deleteNonraw(f.ctx, entry)
+		ok, err := applier.deleteNonraw(f.ctx, f.ctx, &inverseSendGate{}, entry)
 		if err != nil || !ok || f.deletes() != before+1 {
 			t.Fatalf("ok=%v err=%v deletes=%d", ok, err, f.deletes())
 		}
@@ -266,7 +266,7 @@ func TestR2NonrawExecutorLane(t *testing.T) {
 	})
 
 	t.Run("prior_attempt_never_redeletes", func(t *testing.T) {
-		if _, err := applier.deleteNonraw(f.ctx, entry); err == nil {
+		if _, err := applier.deleteNonraw(f.ctx, f.ctx, &inverseSendGate{}, entry); err == nil {
 			t.Fatal("already-issued key was retransmitted")
 		}
 	})
@@ -280,7 +280,7 @@ func TestR2NonrawExecutorLane(t *testing.T) {
 		g.exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',900,'metadata')`, g.key)
 		a := g.applier(t, "run1")
 		defer a.ledger.close()
-		if ok, err := a.deleteNonraw(g.ctx, inverseEntry{ObjectInfo: r2.ObjectInfo{Key: g.key, ETag: "collated-etag", SizeBytes: 900, LastModified: inverseRetirementCutoff().Add(-time.Second)}, Class: inverseCollated}); err == nil || ok || g.deletes() != 0 {
+		if ok, err := a.deleteNonraw(g.ctx, g.ctx, &inverseSendGate{}, inverseEntry{ObjectInfo: r2.ObjectInfo{Key: g.key, ETag: "collated-etag", SizeBytes: 900, LastModified: inverseRetirementCutoff().Add(-time.Second)}, Class: inverseCollated}); err == nil || ok || g.deletes() != 0 {
 			t.Fatalf("public delivery page key reached DELETE: ok=%v err=%v deletes=%d", ok, err, g.deletes())
 		}
 		var intents int
@@ -297,7 +297,7 @@ func TestR2NonrawExecutorLane(t *testing.T) {
 		g := newNonrawFixture(t, "nonraw_delivery_scope")
 		g.exec(`INSERT INTO delivery_keep_output_dependencies(output_id,recording_id) VALUES($1,30)`, g.outputID)
 		a := g.applier(t, "run1")
-		ok, err := a.deleteNonraw(g.ctx, inverseEntry{ObjectInfo: r2.ObjectInfo{Key: g.key, ETag: "collated-etag", SizeBytes: 900, LastModified: inverseRetirementCutoff().Add(-time.Second)}, Class: inverseCollated})
+		ok, err := a.deleteNonraw(g.ctx, g.ctx, &inverseSendGate{}, inverseEntry{ObjectInfo: r2.ObjectInfo{Key: g.key, ETag: "collated-etag", SizeBytes: 900, LastModified: inverseRetirementCutoff().Add(-time.Second)}, Class: inverseCollated})
 		if err != nil || !ok || g.deletes() != 1 {
 			t.Fatalf("reviewed delivery output not retired: ok=%v err=%v deletes=%d", ok, err, g.deletes())
 		}
@@ -327,7 +327,7 @@ func TestR2NonrawExecutorLane(t *testing.T) {
 				entry := inverseEntry{ObjectInfo: r2.ObjectInfo{Key: key, ETag: "collated-etag", SizeBytes: 900, LastModified: inverseRetirementCutoff().Add(-time.Second)}, Class: inverseCollated}
 				a := g.applier(t, "run1")
 				mutate(g, entry)
-				if _, err := a.deleteNonraw(g.ctx, entry); err == nil || g.deletes() != 0 {
+				if _, err := a.deleteNonraw(g.ctx, g.ctx, &inverseSendGate{}, entry); err == nil || g.deletes() != 0 {
 					t.Fatalf("%s reached DELETE: %v deletes=%d", key, err, g.deletes())
 				}
 				var intents int
@@ -574,7 +574,7 @@ func TestR2NonrawWireProtectionRace(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer tx.Rollback(f.ctx)
-		if _, err = a.authorizeNonraw(f.ctx, tx, entry); err == nil {
+		if _, err = a.authorizeNonraw(f.ctx, tx, entry, &inverseSendGate{}); err == nil {
 			t.Fatal("KE epoch change after reservation still authorized wire")
 		}
 		if f.deletes() != 0 {
@@ -605,7 +605,7 @@ func TestR2NonrawWireProtectionRace(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer tx.Rollback(f.ctx)
-		if _, err = a.authorizeNonraw(f.ctx, tx, entry); err == nil {
+		if _, err = a.authorizeNonraw(f.ctx, tx, entry, &inverseSendGate{}); err == nil {
 			t.Fatal("live hold added after reservation still authorized wire")
 		}
 		if f.deletes() != 0 {
@@ -789,7 +789,7 @@ func TestR2RawReviewedDeliveryIsEligible(t *testing.T) {
 	f.seed(`DELETE FROM delivery_keep_holds WHERE object_key=$1`, key)
 	f.seed(`INSERT INTO delivery_nas_source_holds(clip_id) VALUES(9100000)`)
 	a := f.applier(t, true)
-	ok, err := a.delete(f.ctx, f.entry(0))
+	ok, err := a.delete(f.ctx, f.ctx, &inverseSendGate{}, f.entry(0))
 	if err != nil || !ok || f.deletes() != 1 {
 		t.Fatalf("reviewed RAW delivery not retired: ok=%v err=%v deletes=%d", ok, err, f.deletes())
 	}
@@ -817,7 +817,7 @@ func TestR2RawDeliveryVetoesStayStrict(t *testing.T) {
 		f := newRawDeliveryFixture(t, "raw_delivery_page_keep", key)
 		a := f.applier(t, true)
 		defer a.ledger.close()
-		if ok, err := a.delete(f.ctx, f.entry(0)); err == nil || ok || f.deletes() != 0 {
+		if ok, err := a.delete(f.ctx, f.ctx, &inverseSendGate{}, f.entry(0)); err == nil || ok || f.deletes() != 0 {
 			t.Fatalf("reviewed scope deleted a public delivery page key: ok=%v err=%v deletes=%d", ok, err, f.deletes())
 		}
 	})
@@ -826,7 +826,7 @@ func TestR2RawDeliveryVetoesStayStrict(t *testing.T) {
 		f := newRawDeliveryFixture(t, "raw_delivery_legacy", key)
 		a := f.applier(t, false)
 		defer a.ledger.close()
-		if ok, err := a.delete(f.ctx, f.entry(0)); err == nil || ok || f.deletes() != 0 {
+		if ok, err := a.delete(f.ctx, f.ctx, &inverseSendGate{}, f.entry(0)); err == nil || ok || f.deletes() != 0 {
 			t.Fatalf("legacy scope deleted a delivery-held RAW key: ok=%v err=%v deletes=%d", ok, err, f.deletes())
 		}
 	})
@@ -928,7 +928,7 @@ func TestR2NonrawOutputIntervalReloadedAtWire(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer tx.Rollback(f.ctx)
-			if _, err = a.authorizeNonraw(f.ctx, tx, entry); err == nil {
+			if _, err = a.authorizeNonraw(f.ctx, tx, entry, &inverseSendGate{}); err == nil {
 				t.Fatalf("%s: wire authorized after the output interval changed", tc.name)
 			}
 			if f.deletes() != 0 {
@@ -951,7 +951,7 @@ func TestR2NonrawOutputIntervalReloadedAtWire(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer tx.Rollback(f.ctx)
-		if _, err = a.authorizeNonraw(f.ctx, tx, entry); err != nil {
+		if _, err = a.authorizeNonraw(f.ctx, tx, entry, &inverseSendGate{}); err != nil {
 			t.Fatalf("unchanged output refused: %v", err)
 		}
 		a.ledger.close()
@@ -1204,7 +1204,7 @@ func TestR2NonrawKeepEverythingHoldsCollated(t *testing.T) {
 		if _, err := a.reserveNonraw(f.ctx, entry); err == nil {
 			t.Fatal("KE stream authorized a collated reservation")
 		}
-		if _, err := a.deleteNonraw(f.ctx, entry); err == nil {
+		if _, err := a.deleteNonraw(f.ctx, f.ctx, &inverseSendGate{}, entry); err == nil {
 			t.Fatal("KE stream authorized a collated delete")
 		}
 		if f.deletes() != 0 {
@@ -1327,7 +1327,7 @@ func TestR2NonrawSourceClosureLockedThroughWire(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			authority, err := a.authorizeNonraw(f.ctx, tx, entry)
+			authority, err := a.authorizeNonraw(f.ctx, tx, entry, &inverseSendGate{})
 			if err != nil {
 				tx.Rollback(f.ctx)
 				t.Fatalf("authorize: %v", err)
