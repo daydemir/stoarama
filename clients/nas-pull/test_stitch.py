@@ -6,6 +6,7 @@ cannot enter the production pinned export. No fixture uses real NAS data.
 import datetime
 import hashlib
 import importlib.util
+import io
 import itertools
 import json
 import os
@@ -24,6 +25,114 @@ spec = importlib.util.spec_from_file_location('stitch_pull', Path(__file__).with
 pull = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pull)
 ORIGINAL_CHECKPOINT = pull.stitch_checkpoint
+
+
+class StitchFrameLedgerTests(unittest.TestCase):
+    def test_short_reads_hash_the_exact_bytes_from_each_frame(self):
+        class ShortReader(io.BytesIO):
+            def read(self, length):
+                return super().read(min(length, 7))
+
+        data = b"an odd-sized frame"
+        ledger = io.BytesIO()
+        row = b"0, -2, -1, 1, %d, 0x12345678\n" % len(data)
+        pull.stitch_hash_frame_stream(io.BytesIO(b"#tb 0: 1/1000\n" + row), ShortReader(data),
+                                      ledger, threading.Event())
+        self.assertEqual(ledger.getvalue(), b"#tb 0: 1/1000\n" +
+                         row.replace(b"0x12345678", hashlib.sha256(data).hexdigest().encode()))
+
+    def test_incomplete_malformed_and_excess_stream_data_fail(self):
+        header = b"#tb 0: 1/1000\n"
+        row = b"0, 0, 0, 1, 3, 0x12345678\n"
+        for metadata, raw in ((row, b"abc"), (header + row[:-1], b"abc"),
+                              (header + row, b"ab"), (header + row, b"abcd"),
+                              (header + row.replace(b", 3,", b", -3,"), b"abc"),
+                              (header + row.replace(b"0,", b"1,", 1), b"abc"),
+                              (header, b"")):
+            with self.subTest(metadata=metadata, raw=raw), self.assertRaises(pull.StitchFrameLedgerError):
+                pull.stitch_hash_frame_stream(io.BytesIO(metadata), io.BytesIO(raw),
+                                              io.BytesIO(), threading.Event())
+
+    def run_child(self, behavior, stop, deadline_seconds):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            child = root / "ffmpeg"
+            pid = root / "pid"
+            child.write_text(
+                "#!" + sys.executable + "\n"
+                "import os, sys, time\n"
+                "with open(sys.argv[sys.argv.index('-i') + 1], 'w') as f: f.write(str(os.getpid()))\n"
+                "fd = int(sys.argv[-1].rsplit(':', 1)[1])\n" + behavior)
+            child.chmod(0o700)
+            with self.assertRaises(pull.StitchFrameLedgerError):
+                pull.stitch_stream_frames(str(child), pid, root / "ledger",
+                                          time.monotonic() + deadline_seconds, stop)
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(int(pid.read_text()), os.WNOHANG)
+
+    def test_child_exit_after_complete_ledger_is_fatal(self):
+        self.run_child("os.write(1, b'#tb 0: 1/1000\\n0, 0, 0, 1, 3, 0x12345678\\n')\n"
+                       "os.write(fd, b'abc')\n"
+                       "sys.exit(1)\n", threading.Event(), 5)
+
+    def test_stalled_child_is_cancelled_and_reaped(self):
+        stop = threading.Event()
+        cancel = threading.Timer(0.4, stop.set)
+        cancel.start()
+        try:
+            self.run_child("time.sleep(30)\n", stop, 5)
+        finally:
+            cancel.cancel()
+            cancel.join()
+
+    def test_child_that_closes_both_pipes_still_has_to_exit_by_deadline(self):
+        self.run_child("os.write(1, b'#tb 0: 1/1000\\n0, 0, 0, 1, 3, 0x12345678\\n')\n"
+                       "os.write(fd, b'abc')\n"
+                       "os.close(1)\n"
+                       "os.close(fd)\n"
+                       "time.sleep(30)\n", threading.Event(), 0.8)
+
+    def test_proof_and_unqualified_formats_keep_the_original_framehash_command(self):
+        source, target = Path("/source"), Path("/target")
+        original = ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode",
+                    "-threads", "1", "-filter_threads", "1", "-i", str(source), "-map", "0:v:0",
+                    "-fps_mode", "passthrough", "-enc_time_base", "demux", "-f", "framehash",
+                    "-hash", "sha256", "-y", str(target)]
+        for kind, pixel_format in ((pull.StitchRunKind.PROOF, "yuv420p"),
+                                   (pull.StitchRunKind.PRODUCTION, "gray")):
+            stop = SimpleNamespace(kind=kind)
+            with self.subTest(kind=kind), mock.patch.object(pull, "stitch_run") as run:
+                pull.stitch_audit_frames("ffmpeg", source, target, pixel_format, 1, stop)
+                run.assert_called_once_with(original, 1, stop)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs FFmpeg and FFprobe")
+    def test_full_frame_ledgers_match_across_h264_representations(self):
+        # Each frame is larger than the pipe buffer and uses reordered timestamps.
+        def records(path):
+            with path.open() as source:
+                return [tuple(value.strip() for value in line.split(",")) for line in source
+                        if line.startswith("#tb ") or not line.startswith("#")]
+
+        ffmpeg = shutil.which("ffmpeg")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, legacy, streamed = (root / name for name in ("raw.mp4", "legacy", "streamed"))
+            for pixel_format in sorted(pull.STITCH_STREAMED_FRAME_FORMATS):
+                with self.subTest(pixel_format=pixel_format):
+                    subprocess.run([ffmpeg, "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+                                    "testsrc2=size=638x360:rate=30000/1001", "-frames:v", "8",
+                                    "-threads", "1", "-c:v", "libx264", "-pix_fmt", pixel_format,
+                                    "-bf", "2", "-y", str(source)], check=True)
+                    probe = subprocess.check_output([shutil.which("ffprobe"), "-v", "error", "-select_streams",
+                        "v:0", "-show_entries", "stream=pix_fmt", "-of", "csv=p=0", str(source)], text=True)
+                    self.assertEqual(probe.strip(), pixel_format)
+                    stop = threading.Event()
+                    deadline = time.monotonic() + 30
+                    pull.stitch_frames(ffmpeg, source, legacy, deadline, stop)
+                    pull.stitch_stream_frames(ffmpeg, source, streamed, deadline, stop)
+                    rows = records(streamed)
+                    self.assertEqual(len(rows), 9)
+                    self.assertEqual(rows, records(legacy))
 
 
 class StitchSwitchTests(unittest.TestCase):
@@ -305,6 +414,22 @@ class StitchIntegrationTests(unittest.TestCase):
             self.assertEqual(timeout,pull.CLEANUP_EXECUTION_OBSERVE_SEC)
             return dict(ack,delivery_keep_checked=True,action='delete_issued',delete=True,expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
         return dict(ack,ok=True)
+
+    def test_verifier_failure_on_second_source_aborts_before_publication(self):
+        original = pull.stitch_stream_frames
+        def read_frames(*args):
+            if args[2].name == "source-001.frames":
+                raise pull.StitchFrameLedgerError("test pipe failure")
+            return original(*args)
+        with mock.patch.object(pull, "stitch_stream_frames", side_effect=read_frames), \
+                mock.patch.object(pull, "stitch_repair_local") as repair:
+            with self.assertRaisesRegex(pull.StitchFrameLedgerError, "test pipe failure"):
+                self.build()
+        repair.assert_not_called()
+        output = self.cfg.output_dir / self.task["plan"]["output_folder"]
+        self.assertEqual(list(output.glob("run-*")), [])
+        self.assertEqual(list(output.glob(".stitch-*-pending-*")), [])
+        self.assertTrue(all((self.cfg.output_dir / clip["relative_path"]).exists() for clip in self.clips))
 
     def test_b_frame_start_edit_is_conserved_through_real_remux_and_decode(self):
         for clip in self.clips[:2]:

@@ -119,6 +119,25 @@ issued permits to have expired before opening the local stitch lane.
 Preserve existing SQLite journals, outputs, ledgers and plans. Ordinary NAS
 cleanup and R2 retirement retain their separate authority.
 
+## Decoded frame verification
+
+The ordinary audit still strictly decodes each source and each assembled
+output independently through EOF. The [original V85r audit](https://github.com/daydemir/stoarama/pull/446)
+uses FFmpeg's rawvideo encoder and the framehash muxer to compute SHA-256
+for each decoded packet. For the qualified H.264 pixel formats, the same
+decode, stream mapping, frame timing and rawvideo encoding feed a
+synchronous FFmpeg tee. One branch emits frame metadata before the other
+writes the exact packet bytes. There is no pixel-format override. Python
+hashes the complete payload of each packet using SHA-256 and writes the
+original stream, DTS, PTS, duration and byte count beside the digest.
+
+The verifier requires clean EOF on both pipes, successful FFmpeg exit and
+an active build deadline. An incomplete ledger or subprocess failure aborts
+the build before publication. The source and output ledger comparison,
+packet inventory, independently seeked seam decodes and durable whole-file
+readback still run. Proof builds, their readback checks, repairs, and pixel
+formats outside the parity matrix use the original framehash command.
+
 ## Dedicated Durham credential
 
 After the dedicated-key deployment and explicit owner approval, an operator
