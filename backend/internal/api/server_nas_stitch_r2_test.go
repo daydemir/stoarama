@@ -530,7 +530,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
  FROM nas_stitch_r2_certified_raw WHERE clip_id=901`).Scan(&stagingAbsent); err != nil || stagingAbsent {
 				t.Fatalf("unresolved abort on the earlier attempt cleared staging: %v %v", stagingAbsent, err)
 			}
-			for _, mode := range []int32{0, 1, 2, 4} {
+			for _, mode := range []int32{0, 1, 2, 4, 5} {
 				abortResponse.Store(mode)
 				if err := store.RetireStitchStage(ctx, 122, sha, time.Time{}, true); err == nil {
 					t.Fatalf("unconfirmed aborted stage accepted in provider case %d", mode)
@@ -596,6 +596,9 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, a
 				w.WriteHeader(http.StatusNotFound)
 			case 4:
 				w.Header().Set("x-amz-delete-marker", "true")
+				w.WriteHeader(http.StatusNotFound)
+			case 5:
+				w.Header().Set("x-amz-error-code", "NoSuchBucket")
 				w.WriteHeader(http.StatusNotFound)
 			default:
 				t.Error("abort reconciliation performed HEAD with a live multipart upload")

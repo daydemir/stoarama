@@ -466,6 +466,10 @@ func (c *Client) observeAbortedStitchStage(ctx context.Context, tx pgx.Tx, objec
 		response.Response.Header.Get("x-amz-delete-marker") != "" {
 		return false, errors.New("aborted stitch stage absence remains unconfirmed")
 	}
+	codes := response.Response.Header.Values("x-amz-error-code")
+	if len(codes) > 1 || (len(codes) == 1 && codes[0] != "NotFound" && codes[0] != "NoSuchKey" && codes[0] != "404") {
+		return false, errors.New("aborted stitch stage HEAD returned a conflicting provider error")
+	}
 	_, err = tx.Exec(ctx, `INSERT INTO nas_stitch_r2_aborted_absences(object_id) VALUES($1)`, objectID)
 	return err == nil, err
 }

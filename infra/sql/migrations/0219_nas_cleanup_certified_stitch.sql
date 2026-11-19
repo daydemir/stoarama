@@ -101,7 +101,7 @@ CREATE TRIGGER nas_stitch_r2_abort_phase BEFORE INSERT OR UPDATE ON nas_stitch_r
 CREATE VIEW nas_stitch_r2_aborts_awaiting_absence AS
  SELECT id,bucket,endpoint_sha256,object_key,sha256,grants_drain_at
  FROM nas_stitch_r2_stage_objects WHERE state='aborted' AND version_id IS NULL AND
-  ((aborted_from IS NULL OR aborted_from='starting') AND start_issued_at IS NULL AND upload_id IS NULL
+  (aborted_from='starting' AND start_issued_at IS NULL AND upload_id IS NULL
    OR aborted_from='uploading' AND start_issued_at IS NOT NULL AND upload_id IS NOT NULL);
 
 CREATE TABLE nas_stitch_r2_aborted_absences (

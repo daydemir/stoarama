@@ -39,6 +39,13 @@ func testCertifiedStitchSplitOutput(t *testing.T, tx pgx.Tx, hourID, firstCopyID
 	exec(`UPDATE nas_stitch_r2_stage_objects SET state='uploading',upload_id='ambiguous-fixture',start_issued_at=clock_timestamp() WHERE id=125;
  UPDATE nas_stitch_r2_stage_objects SET state='completing' WHERE id=125;
  UPDATE nas_stitch_r2_stage_objects SET state='aborted' WHERE id=125`)
+	exec(`INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes)
+ OVERRIDING SYSTEM VALUE VALUES(126,$1,2,47,'stoarama',$2,$3,$4,$5)`,
+		hourID, endpoint, second.RelativePath+".historic-abort", second.SHA256, second.SizeBytes)
+	// Recreate an abort from before the origin and Start marker were protected.
+	exec(`ALTER TABLE nas_stitch_r2_stage_objects DISABLE TRIGGER nas_stitch_r2_abort_phase;
+ UPDATE nas_stitch_r2_stage_objects SET state='aborted' WHERE id=126;
+ ALTER TABLE nas_stitch_r2_stage_objects ENABLE TRIGGER nas_stitch_r2_abort_phase`)
 	if err := tx.QueryRow(ctx, `SELECT object_key FROM nas_stitch_r2_stage_objects WHERE id=124`).Scan(&second.ObjectKey); err != nil {
 		t.Fatal(err)
 	}
@@ -88,9 +95,9 @@ func testCertifiedStitchSplitOutput(t *testing.T, tx pgx.Tx, hourID, firstCopyID
  UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=clock_timestamp() WHERE object_id IN (123,124);
  INSERT INTO nas_stitch_r2_aborted_absences(object_id) VALUES(122)`)
 	var observable bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_r2_aborts_awaiting_absence WHERE id=125)`).
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_r2_aborts_awaiting_absence WHERE id IN (125,126))`).
 		Scan(&observable); err != nil || observable {
-		t.Fatalf("ambiguous completion could be certified absent: %v %v", observable, err)
+		t.Fatalf("ambiguous completion or untracked abort could be certified absent: %v %v", observable, err)
 	}
 	var absent bool
 	if err := tx.QueryRow(ctx, `SELECT nas_cleanup_certified_stitch_staging_absent(certificate)
