@@ -50594,6 +50594,18 @@ def stitch_hold_task(cfg, inventory, task, reason):
     log("WARN", "V85r task=%s held on task data: %s" % (task["id"], reason[:300]))
 
 
+def stitch_missing_source_leaf(cfg, task, cause):
+    if not isinstance(cause, FileNotFoundError) or not cause.filename:
+        return False
+    missing = Path(cause.filename)
+    root = cfg.output_dir.resolve()
+    for clip in task["plan"]["clips"]:
+        raw = root / clip["relative_path"]
+        if missing in (raw, stitch_sidecar_path(raw)):
+            return missing.parent.is_dir()
+    return False
+
+
 def stitch_once(cfg, inventory, stop_event):
     if not getattr(cfg, "stitch_enabled", False):
         return 30
@@ -50643,7 +50655,7 @@ def stitch_once(cfg, inventory, stop_event):
             if not os.path.ismount(str(cfg.output_dir)):
                 raise StitchResourceHold("NAS output root is not mounted") from None
             cause = exc.__cause__
-            if isinstance(cause, OSError) and not isinstance(cause, (FileNotFoundError, NotADirectoryError)):
+            if isinstance(cause, OSError) and not stitch_missing_source_leaf(cfg, task, cause):
                 raise StitchResourceHold("NAS source I/O unavailable") from exc
             # Otherwise this hour's own bytes are unusable: missing/invalid
             # sidecar, unreadable media metadata, or a plan whose data no longer

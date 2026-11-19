@@ -599,7 +599,7 @@ class StitchTaskDataHoldTests(unittest.TestCase):
     def test_missing_sidecar_reports_every_input_left_out_once(self):
         # The real sidecar read fails for a clip whose .stoarama.json is absent.
         def build(cfg, inventory, task, stop, tools):
-            raise pull.MediaCertificationError("stitch sidecar is missing") from FileNotFoundError()
+            pull.confined_regular_file(cfg.output_dir, self.clips[0]['relative_path'] + '.stoarama.json')
         self.patch_common(build)
         self.assertEqual(pull.stitch_once(self.cfg, self.inventory, self.stop), 30)
         results = [body for path, body in self.calls if path.endswith('/result')]
@@ -608,7 +608,7 @@ class StitchTaskDataHoldTests(unittest.TestCase):
         self.assertEqual(results[0]['repairs'], [])
         self.assertEqual(results[0]['left_out'], [1, 2, 3])
         self.assertEqual([s['decision'] for s in results[0]['seams']], ['hold', 'hold'])
-        self.assertIn('sidecar', results[0]['error'])
+        self.assertIn('media path is unavailable', results[0]['error'])
         self.assertNotIn('/ready', [path for path, _ in self.calls])
         # The hold is journalled as registered, so a restart never re-leases it.
         with self.inventory.lock:
@@ -617,12 +617,21 @@ class StitchTaskDataHoldTests(unittest.TestCase):
 
     def test_missing_raw_holds_only_this_hour(self):
         def build(cfg, inventory, task, stop, tools):
-            raise pull.MediaCertificationError("media path is unavailable") from NotADirectoryError()
+            pull.confined_regular_file(cfg.output_dir, self.clips[0]['relative_path'])
         self.patch_common(build)
         self.assertEqual(pull.stitch_once(self.cfg, self.inventory, self.stop), 30)
         results = [body for path, body in self.calls if path.endswith('/result')]
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]['left_out'], [1, 2, 3])
+
+    def test_missing_source_folder_keeps_the_hour_retryable(self):
+        (self.cfg.output_dir/'stream/day').rmdir()
+        def build(cfg, inventory, task, stop, tools):
+            pull.confined_regular_file(cfg.output_dir, self.clips[0]['relative_path'])
+        self.patch_common(build)
+        with self.assertRaises(pull.StitchResourceHold):
+            pull.stitch_once(self.cfg, self.inventory, self.stop)
+        self.assertEqual([path for path, _ in self.calls], ['/account/connections/stitch/lease'])
 
     def test_typed_task_failure_is_held_and_reported(self):
         def build(cfg, inventory, task, stop, tools):
