@@ -134,6 +134,13 @@ END $$;
 CREATE TRIGGER nas_stitch_r2_input_hold_guard BEFORE INSERT OR UPDATE OR DELETE ON nas_stitch_r2_input_holds
  FOR EACH ROW EXECUTE FUNCTION guard_nas_stitch_r2_hold();
 
+CREATE FUNCTION guard_nas_stitch_r2_truncate() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ RAISE EXCEPTION 'R2 stitch evidence is durable' USING ERRCODE='55000';
+END $$;
+CREATE TRIGGER nas_stitch_r2_input_hold_truncate BEFORE TRUNCATE ON nas_stitch_r2_input_holds
+ FOR EACH STATEMENT EXECUTE FUNCTION guard_nas_stitch_r2_truncate();
+
 CREATE FUNCTION guard_r2_retirement_stitch_input() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
  IF current_setting('transaction_isolation')<>'read committed'
@@ -235,6 +242,47 @@ ALTER TABLE nas_stitch_r2_hours ADD COLUMN staged_manifest jsonb CHECK(jsonb_typ
 ALTER TABLE nas_stitch_r2_hours ADD CHECK(state NOT IN ('staged','certified')
  OR (attempt>0 AND staged_manifest IS NOT NULL AND staged_manifest_sha256 IS NOT NULL));
 
+ALTER TABLE nas_r2_copy_items DROP CONSTRAINT nas_r2_copy_items_kind_check,
+ ADD CHECK(kind IN ('raw','collated','stitch_output'));
+ALTER TABLE nas_r2_copy_items ADD COLUMN stitch_receipt jsonb CHECK(
+ stitch_receipt IS NULL OR (kind='stitch_output' AND state='verified' AND jsonb_typeof(stitch_receipt)='object')),
+ ADD COLUMN stitch_result_sha256 text CHECK(stitch_result_sha256 ~ '^[a-f0-9]{64}$'),
+ ADD COLUMN stitch_read_grants_until timestamptz CHECK(kind='stitch_output' OR stitch_read_grants_until IS NULL);
+
+CREATE FUNCTION guard_nas_r2_stitch_copy_evidence() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF OLD.kind='stitch_output' AND (TG_OP='DELETE' OR OLD.state='verified') THEN
+  RAISE EXCEPTION 'NAS stitch copy evidence is durable' USING ERRCODE='55000';
+ END IF;
+ IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+ IF OLD.stitch_read_grants_until IS NOT NULL AND
+  (NEW.stitch_read_grants_until IS NULL OR NEW.stitch_read_grants_until<OLD.stitch_read_grants_until) THEN
+  RAISE EXCEPTION 'NAS stitch read grant drain cannot regress' USING ERRCODE='55000';
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER nas_r2_stitch_copy_evidence_guard BEFORE UPDATE OR DELETE ON nas_r2_copy_items
+ FOR EACH ROW EXECUTE FUNCTION guard_nas_r2_stitch_copy_evidence();
+
+CREATE FUNCTION nas_stitch_r2_exact_copy_receipt(q nas_r2_copy_items, o nas_stitch_r2_stage_objects) RETURNS boolean
+LANGUAGE sql IMMUTABLE AS $$
+ SELECT COALESCE(q.kind='stitch_output' AND q.state='verified' AND q.connection_id=13 AND q.source_id=o.id
+  AND q.stitch_result_sha256 IS NOT NULL AND q.completion IN ('downloaded','verified_in_place')
+  AND q.item @> jsonb_build_object('kind','stitch_output','source_id',o.id,'bucket',o.bucket,'object_key',o.object_key,
+   'relative_path',o.relative_path,'size_bytes',o.size_bytes,'sha256',o.sha256)
+  AND q.stitch_receipt @> jsonb_build_object('relative_path',o.relative_path,'size_bytes',o.size_bytes,'sha256',o.sha256,'fsynced',true)
+  AND CASE WHEN jsonb_typeof(q.stitch_receipt->'identity')='array' THEN
+   jsonb_array_length(q.stitch_receipt->'identity')=5
+   AND q.stitch_receipt#>'{identity,0}'=to_jsonb(o.size_bytes)
+   AND q.stitch_receipt#>>'{identity,1}' ~ '^[1-9][0-9]{0,18}$'
+   AND q.stitch_receipt#>>'{identity,2}' ~ '^[1-9][0-9]{0,18}$'
+   AND q.stitch_receipt#>>'{identity,3}' ~ '^[1-9][0-9]{0,18}$'
+   AND q.stitch_receipt#>>'{identity,4}' ~ '^[0-9]{1,19}$'
+   AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(q.stitch_receipt->'identity') member
+    WHERE jsonb_typeof(member)<>'number')
+  ELSE false END, false);
+$$;
+
 CREATE FUNCTION add_nas_stitch_r2_certificate() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE expected jsonb; covered boolean;
 BEGIN
@@ -244,7 +292,7 @@ BEGIN
  END IF;
  SELECT jsonb_agg(jsonb_build_object('object_key',o.object_key,'etag',o.etag,'version_id',o.version_id,
     'last_modified',o.last_modified,'readback',q.stitch_receipt) ORDER BY o.id),
-  bool_and(COALESCE(q.state='verified' AND q.stitch_receipt IS NOT NULL AND q.manifest_sha256=NEW.manifest_sha256,false))
+  bool_and(COALESCE(q.manifest_sha256=NEW.manifest_sha256 AND nas_stitch_r2_exact_copy_receipt(q,o),false))
  INTO expected,covered
  FROM nas_stitch_r2_stage_objects o LEFT JOIN nas_r2_copy_items q
   ON q.connection_id=13 AND q.kind='stitch_output' AND q.source_id=o.id
@@ -288,11 +336,6 @@ CREATE TABLE nas_stitch_r2_parts (
 CREATE TRIGGER nas_stitch_r2_part_immutable BEFORE UPDATE OR DELETE ON nas_stitch_r2_parts
  FOR EACH ROW EXECUTE FUNCTION guard_nas_stitch_evidence();
 
-ALTER TABLE nas_r2_copy_items DROP CONSTRAINT nas_r2_copy_items_kind_check,
- ADD CHECK(kind IN ('raw','collated','stitch_output'));
-ALTER TABLE nas_r2_copy_items ADD COLUMN stitch_receipt jsonb CHECK(
- stitch_receipt IS NULL OR (kind='stitch_output' AND state='verified' AND jsonb_typeof(stitch_receipt)='object')),
- ADD COLUMN stitch_result_sha256 text CHECK(stitch_result_sha256 ~ '^[a-f0-9]{64}$');
 
 -- A server rollback may still authenticate the dedicated key. Once the R2
 -- phase is live it cannot use the old claim path to receive a NAS-local plan.
@@ -315,3 +358,11 @@ CREATE TABLE nas_stitch_r2_stage_retirements (
  absence_observed_at timestamptz,
  CHECK(absence_observed_at IS NULL OR absence_observed_at>=issued_at)
 );
+
+DO $$ DECLARE t text; BEGIN
+ FOREACH t IN ARRAY ARRAY['nas_stitch_r2_hours','nas_stitch_r2_stage_objects','nas_stitch_r2_parts',
+  'nas_stitch_r2_certificates','nas_stitch_r2_stage_retirements','nas_r2_copy_items'] LOOP
+  EXECUTE format('CREATE TRIGGER nas_stitch_evidence_truncate BEFORE TRUNCATE ON %I'
+    ' FOR EACH STATEMENT EXECUTE FUNCTION guard_nas_stitch_r2_truncate()',t);
+ END LOOP;
+END $$;

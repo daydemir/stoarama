@@ -79,7 +79,7 @@ func finishNASR2StitchCopy(ctx context.Context, tx pgx.Tx, task nasR2CopyTask, r
 		return errors.New("stitch copy lease or manifest changed")
 	}
 	_, err = tx.Exec(ctx, `WITH proof AS (
- SELECT count(*) AS n, bool_and(COALESCE(q.state='verified' AND q.stitch_receipt IS NOT NULL AND q.manifest_sha256=$4,false)) AS complete,
+ SELECT count(*) AS n, bool_and(COALESCE(q.manifest_sha256=$4 AND nas_stitch_r2_exact_copy_receipt(q,o),false)) AS complete,
   jsonb_agg(jsonb_build_object('object_key',o.object_key,'etag',o.etag,'version_id',o.version_id,
     'last_modified',o.last_modified,'readback',q.stitch_receipt) ORDER BY o.id) AS objects
  FROM nas_stitch_r2_stage_objects o LEFT JOIN nas_r2_copy_items q

@@ -285,7 +285,7 @@ func (c *Client) recordStitchStage(ctx context.Context, o StitchStageUpload) err
 
 // RetireStitchStage is an operator-only one-shot retirement of an isolated
 // generation. A previously issued delete can only be reconciled by absence.
-func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha string, reconcile bool) error {
+func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha string, proofExpires time.Time, reconcile bool) error {
 	if c.writerDB == nil || objectID <= 0 {
 		return errors.New("stitch stage retirement requires the exact operator target")
 	}
@@ -307,6 +307,19 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	if _, err = tx.Exec(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`); err != nil {
 		return err
 	}
+	if !reconcile {
+		observed := time.Now()
+		dbNow, err := c.stitchStageDeleteFence(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if !proofExpires.After(dbNow) {
+			return errors.New("fresh conditional staging delete proof required")
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, observed.Add(proofExpires.Sub(dbNow)))
+		defer cancel()
+	}
 	var key, etag, version string
 	var size int64
 	var modified time.Time
@@ -317,10 +330,12 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
  JOIN nas_stitch_r2_certificates c ON c.hour_id=h.id AND c.attempt=h.attempt
   AND c.plan_sha256=h.plan_sha256 AND c.manifest_sha256=h.staged_manifest_sha256
  JOIN nas_r2_copy_items q ON q.kind='stitch_output' AND q.source_id=o.id AND q.connection_id=13
-  AND q.state='verified' AND q.stitch_receipt IS NOT NULL AND q.manifest_sha256=c.manifest_sha256
+  AND q.manifest_sha256=c.manifest_sha256 AND nas_stitch_r2_exact_copy_receipt(q,o)
  LEFT JOIN nas_stitch_r2_stage_retirements d ON d.object_id=o.id
  WHERE o.id=$1 AND o.sha256=$2 AND o.bucket=$3 AND o.endpoint_sha256=$4
   AND o.state='staged' AND h.state='certified' AND COALESCE(o.grants_drain_at,'infinity')<clock_timestamp()
+  AND COALESCE(q.stitch_read_grants_until,'-infinity')<clock_timestamp()
+  AND COALESCE(q.range_until,'-infinity')<clock_timestamp()
   AND NOT EXISTS(SELECT 1 FROM delivery_keep_holds k WHERE (k.bucket=o.bucket AND k.object_key=o.object_key)
     OR k.relative_path=o.relative_path OR (k.sha256=o.sha256 AND k.size_bytes=o.size_bytes))
   AND NOT EXISTS(SELECT 1 FROM recording_collation_outputs j WHERE j.object_key=o.object_key OR j.nas_relative_path=o.relative_path)
@@ -355,21 +370,15 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	if err != nil || uploads.IsTruncated == nil || *uploads.IsTruncated || len(uploads.Uploads) != 0 {
 		return errors.New("stitch stage multipart work has not drained")
 	}
+	if _, err := c.stitchStageDeleteFence(ctx, tx); err != nil {
+		return err
+	}
 	// Commit the one-shot reservation on a second connection while the
 	// outer lock and dependency epoch remain held through the wire attempt.
 	if _, err = c.writerDB.Exec(ctx, `INSERT INTO nas_stitch_r2_stage_retirements(object_id) VALUES($1)`, objectID); err != nil {
 		return err
 	}
-	// The key is derived from a single admitted generation. No stage writer
-	// can issue another PUT/complete after it is staged, even after deletion.
-	in := &s3.DeleteObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key), IfMatch: aws.String(etag)}
-	if version != "" {
-		in.VersionId = aws.String(version)
-	}
-	if _, err = c.s3.DeleteObject(ctx, in, func(o *s3.Options) {
-		noStitchStageRetries(o)
-		o.HTTPClient = &http.Client{Transport: c.deleteTransport, CheckRedirect: refuseRetirementRedirect}
-	}); err != nil {
+	if err := c.deleteStitchStageExact(ctx, key, etag, version); err != nil {
 		return errors.New("stitch stage delete outcome unconfirmed; reconcile only")
 	}
 	if _, err = c.Head(ctx, key); !IsNotFound(err) {
@@ -380,4 +389,29 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func (c *Client) stitchStageDeleteFence(ctx context.Context, tx pgx.Tx) (time.Time, error) {
+	var now time.Time
+	var blocked bool
+	err := tx.QueryRow(ctx, `SELECT clock_timestamp(),r2_retirement_writes_blocked($1,$2)
+ FROM r2_retirement_writer_fences WHERE bucket=$1 AND endpoint_sha256=$2 FOR SHARE`,
+		c.bucket, c.EndpointSHA256()).Scan(&now, &blocked)
+	if err != nil || !blocked {
+		return time.Time{}, errors.New("exact live R2 writer fence and drain required for staging retirement")
+	}
+	return now, nil
+}
+
+func (c *Client) deleteStitchStageExact(ctx context.Context, key, etag, version string) error {
+	in := &s3.DeleteObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key),
+		IfMatch: aws.String(`"` + cleanETag(etag) + `"`)}
+	if version != "" {
+		in.VersionId = aws.String(version)
+	}
+	_, err := c.s3.DeleteObject(ctx, in, func(o *s3.Options) {
+		noStitchStageRetries(o)
+		o.HTTPClient = &http.Client{Transport: c.deleteTransport, CheckRedirect: refuseRetirementRedirect}
+	})
+	return err
 }

@@ -605,7 +605,13 @@ func (s *Server) handleNASR2CopyRange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rangeID := hex.EncodeToString(nonce)
-	if _, err := tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET range_until=$2,range_id=$3,range_length=$4,lease_expires_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, t.ID, issuedAt.Add(10*time.Second), rangeID, req.Length); err != nil || tx.Commit(r.Context()) != nil {
+	rangeUpdate := `UPDATE nas_r2_copy_items SET range_until=$2,range_id=$3,range_length=$4,lease_expires_at=clock_timestamp()+interval '30 seconds'`
+	if t.Item.Kind == NASR2CopyStitchOutput {
+		// Signing can finish up to ten seconds after reservation. The URL and
+		// transfer each have ten seconds, plus a network drain margin.
+		rangeUpdate += `,stitch_read_grants_until=greatest(stitch_read_grants_until,clock_timestamp()+interval '2 minutes 30 seconds')`
+	}
+	if _, err := tx.Exec(r.Context(), rangeUpdate+` WHERE id=$1`, t.ID, issuedAt.Add(10*time.Second), rangeID, req.Length); err != nil || tx.Commit(r.Context()) != nil {
 		util.WriteError(w, 503, "copy range commit failed")
 		return
 	}

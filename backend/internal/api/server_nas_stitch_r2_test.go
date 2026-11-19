@@ -87,6 +87,19 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
  VALUES(1,3,$1,$1::timestamptz+interval '6 hours','test',clock_timestamp()+interval '1 hour')`, hour)
 	endpoint := cleanupSHA([]byte(provider.URL))
 	exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, endpoint)
+	store, err := r2.New(ctx, r2.Config{Bucket: "stoarama", Endpoint: provider.URL,
+		AccessKey: "test", SecretKey: "test", WriterDB: pool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofExpiry := time.Now().Add(time.Hour)
+	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil || !strings.Contains(err.Error(), "writer fence and drain") {
+		t.Fatal("staging retirement accepted an undrained fence", err)
+	}
+	// Model the controller's preexisting matured fence in this disposable schema.
+	exec(`ALTER TABLE r2_retirement_writer_fences DISABLE TRIGGER r2_writer_fence_transition;
+ UPDATE r2_retirement_writer_fences SET drain_not_before=clock_timestamp()-interval '1 second';
+ ALTER TABLE r2_retirement_writer_fences ENABLE TRIGGER r2_writer_fence_transition;`)
 
 	planTx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
@@ -127,6 +140,9 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	if err := reserve(); err == nil || !strings.Contains(err.Error(), "active R2 stitch input hold") {
 		t.Fatal("stale reservation path did not obey the hold", err)
 	}
+	if _, err := pool.Exec(ctx, `TRUNCATE nas_stitch_r2_input_holds`); err == nil || !strings.Contains(err.Error(), "evidence is durable") {
+		t.Fatal("TRUNCATE bypassed durable input holds", err)
+	}
 	var id int64
 	var attempt int
 	var raw []byte
@@ -142,11 +158,6 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
  OVERRIDING SYSTEM VALUE VALUES(123,$1,1,47,'stoarama',$2,$3,$4,100)`,
 		id, endpoint, plan.OutputFolder+"/run-000-"+sha+".mp4", sha)
 	exec(`UPDATE nas_stitch_r2_control SET enabled=true,max_staging_bytes=1000000`)
-	store, err := r2.New(ctx, r2.Config{Bucket: "stoarama", Endpoint: provider.URL,
-		AccessKey: "test", SecretKey: "test", WriterDB: pool})
-	if err != nil {
-		t.Fatal(err)
-	}
 	lease := r2.StitchStageLease{HourID: id, APIKeyID: 47, Attempt: 1, Token: strings.Repeat("e", 64), PlanSHA: planDigest}
 	foreign := lease
 	foreign.APIKeyID++
@@ -205,6 +216,39 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		t.Fatal(err)
 	}
 
+	// A malformed SQL receipt and its matching outer JSON must not authorize
+	// the certificate trigger directly.
+	tx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',lease_token=NULL,lease_expires_at=NULL,
+ completion='downloaded',stitch_receipt='{}',stitch_result_sha256=repeat('a',64) WHERE id=$1`, copyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO nas_stitch_r2_certificates(hour_id,connection_id,attempt,plan_sha256,manifest_sha256,receipt)
+ SELECT $1,13,1,$2,$3,jsonb_build_object('objects',jsonb_build_array(jsonb_build_object('object_key',object_key,
+  'etag',etag,'version_id',version_id,'last_modified',last_modified,'readback','{}'::jsonb)))
+ FROM nas_stitch_r2_stage_objects WHERE id=123`, id, planDigest, manifest); err == nil || !strings.Contains(err.Error(), "pulled output coverage") {
+		t.Fatal("malformed NAS receipt passed the certificate guard", err)
+	}
+	tx.Rollback(ctx)
+
+	s := &Server{pool: pool, r2: store, cfg: config.Config{NASR2CopyEnabled: true}}
+	exec(`UPDATE connections SET client_version=$1 WHERE id=13`, NASR2CopyPagedClientVersion)
+	startRange := nasR2CopyControl{Token: request.Token, FreeBytes: request.FreeBytes, Length: item.SizeBytes}
+	rangeResponse := cleanupCall(t, s.handleNASR2CopyRange, 47, 47, "id", fmt.Sprint(copyID), startRange, "fixture-boot "+NASR2CopyPagedClientVersion)
+	var grant struct {
+		RangeID string `json:"range_id"`
+	}
+	if rangeResponse.Code != http.StatusOK || json.Unmarshal(rangeResponse.Body.Bytes(), &grant) != nil || grant.RangeID == "" {
+		t.Fatalf("NAS copy range was not granted: %d", rangeResponse.Code)
+	}
+	startRange.RangeID = grant.RangeID
+	if w := cleanupCall(t, s.handleNASR2CopyCheckpoint, 47, 47, "id", fmt.Sprint(copyID), startRange); w.Code != http.StatusOK {
+		t.Fatalf("NAS copy range did not acknowledge: %d", w.Code)
+	}
+
 	// The worker can have published and fsynced the NAS file before the server
 	// transaction is lost. In that case the next attempt must retain the hold.
 	tx, err = pool.Begin(ctx)
@@ -221,7 +265,6 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		t.Fatal("certificate rollback released the raw")
 	}
 
-	s := &Server{pool: pool, r2: store, cfg: config.Config{NASR2CopyEnabled: true}}
 	post := func(principal int64, req nasR2CopyControl) int {
 		out := cleanupCall(t, s.handleNASR2CopyResult, 47, principal, "id", fmt.Sprint(copyID), req)
 		if out.Code >= 500 {
@@ -259,27 +302,58 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	if err := reserve(); err != nil {
 		t.Fatalf("committed certificate failed to release the hold: %v", err)
 	}
-	if err := store.RetireStitchStage(ctx, 123, sha, false); err == nil {
-		t.Fatal("certificate bypassed the pending upload grants")
+	var readGrantStillLive bool
+	if err := pool.QueryRow(ctx, `SELECT range_until IS NULL AND stitch_read_grants_until>clock_timestamp()
+ FROM nas_r2_copy_items WHERE id=$1`, copyID).Scan(&readGrantStillLive); err != nil || !readGrantStillLive {
+		t.Fatal("copy completion shortened the signed range drain", err)
+	}
+	if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, false); err == nil || !strings.Contains(err.Error(), "conditional staging delete proof") {
+		t.Fatal("staging retirement accepted missing provider evidence", err)
+	}
+	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil || !strings.Contains(err.Error(), "drain") {
+		t.Fatal("certificate bypassed the pending signed grants", err)
+	}
+	// Advance only the stored grant clocks in this disposable schema to test
+	// retirement without waiting for the full network drain windows.
+	exec(`ALTER TABLE nas_stitch_r2_stage_objects DISABLE TRIGGER nas_stitch_r2_stage_guard;
+ UPDATE nas_stitch_r2_stage_objects SET grants_drain_at=clock_timestamp()-interval '1 second' WHERE id=123;
+ ALTER TABLE nas_stitch_r2_stage_objects ENABLE TRIGGER nas_stitch_r2_stage_guard;`)
+	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil || !strings.Contains(err.Error(), "drain") {
+		t.Fatal("staging retirement ignored the outstanding signed NAS read grant", err)
+	}
+	exec(`ALTER TABLE nas_r2_copy_items DISABLE TRIGGER nas_r2_stitch_copy_evidence_guard;
+ UPDATE nas_r2_copy_items SET stitch_read_grants_until=clock_timestamp()-interval '1 second' WHERE kind='stitch_output';
+ ALTER TABLE nas_r2_copy_items ENABLE TRIGGER nas_r2_stitch_copy_evidence_guard;`)
+	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err != nil {
+		t.Fatalf("certified stage did not retire after both grants drained: %v", err)
+	}
+	if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, true); err != nil {
+		t.Fatalf("already-confirmed staging retirement could not reconcile: %v", err)
 	}
 }
 
 func durhamStageTestProvider(t *testing.T, media []byte, sha string) *httptest.Server {
 	t.Helper()
 	var mu sync.Mutex
-	var started, part, completed bool
+	var started, part, completed, deleted bool
+	var modified time.Time
 	sum := sha256.Sum256(media)
 	checksum := base64.StdEncoding.EncodeToString(sum[:])
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
+		query := r.URL.Query()
+		w.Header().Set("Content-Type", "application/xml")
+		if r.Method == http.MethodGet && r.URL.Path == "/stoarama" && query.Has("uploads") &&
+			strings.HasPrefix(query.Get("prefix"), "stitch-staging/") {
+			fmt.Fprint(w, "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>")
+			return
+		}
 		if !strings.HasPrefix(r.URL.Path, "/stoarama/stitch-staging/") {
 			t.Error("typed staging request escaped its namespace")
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		query := r.URL.Query()
-		w.Header().Set("Content-Type", "application/xml")
 		switch {
 		case r.Method == http.MethodPost && query.Has("uploads") && !started:
 			started = true
@@ -296,10 +370,16 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha string) *httptest.S
 			fmt.Fprintf(w, "<ListPartsResult><IsTruncated>false</IsTruncated><Part><PartNumber>1</PartNumber><ETag>&#34;part-etag&#34;</ETag><Size>%d</Size><ChecksumSHA256>%s</ChecksumSHA256></Part></ListPartsResult>", len(media), checksum)
 		case r.Method == http.MethodPost && query.Get("uploadId") == "provider-fixture" && r.Header.Get("If-None-Match") == "*" && part && !completed:
 			completed = true
+			modified = time.Now().UTC().Truncate(time.Second)
 			fmt.Fprint(w, "<CompleteMultipartUploadResult><ETag>&#34;stage-etag&#34;</ETag></CompleteMultipartUploadResult>")
+		case r.Method == http.MethodDelete && completed && !deleted && r.Header.Get("If-Match") == `"stage-etag"`:
+			deleted = true
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodHead && deleted:
+			w.WriteHeader(http.StatusNotFound)
 		case r.Method == http.MethodHead && completed:
 			w.Header().Set("ETag", `"stage-etag"`)
-			w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+			w.Header().Set("Last-Modified", modified.Format(http.TimeFormat))
 			w.Header().Set("Content-Length", fmt.Sprint(len(media)))
 			w.Header().Set("X-Amz-Meta-Sha256", sha)
 		default:

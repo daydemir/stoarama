@@ -94,3 +94,25 @@ func TestStitchMultipartExemptionRequiresAllPagesAndExactUpload(t *testing.T) {
 		})
 	}
 }
+
+func TestStitchStageDeleteBindsQuotedETagAndVersion(t *testing.T) {
+	const key = "stitch-staging/00000000-0000-0000-0000-000000000001/output.mp4"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/bucket/"+key ||
+			r.Header.Get("If-Match") != `"stage-etag"` || r.URL.Query().Get("versionId") != "exact-version" {
+			t.Error("staging DELETE differs from the exact generation")
+			w.WriteHeader(http.StatusPreconditionFailed)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	ctx := context.Background()
+	client, err := New(ctx, Config{Bucket: "bucket", Endpoint: server.URL, AccessKey: "fake", SecretKey: "fake"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.deleteStitchStageExact(ctx, key, "stage-etag", "exact-version"); err != nil {
+		t.Fatal(err)
+	}
+}

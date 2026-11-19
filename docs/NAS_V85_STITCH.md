@@ -356,11 +356,13 @@ excludes staging keys. A paginated multipart check at startup and before wire
 authorization exempts only registered bucket, key and provider upload IDs.
 Keep the custody lane gated during rollback and until both executors enforce
 holds. Retire staged outputs through the separate controller command after
-certification, grant drain, exact provider generation and dependency checks.
+certification, read and write grant drain, a live drained writer fence,
+a fresh exact-bucket conditional DELETE proof, and dependency checks.
 A previously issued delete can be reconciled by observing absence.
 
 ```sh
-stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --apply
+stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --apply \
+  --conditional-delete-proof PROOF.json --expected-delete-proof-sha256 PROOF_SHA
 stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --reconcile
 ```
 

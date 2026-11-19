@@ -133,6 +133,8 @@ func runDurhamStageRetirement(ctx context.Context, cfg config.Config, args []str
 	digest := fs.String("sha256", "", "certified whole-file SHA-256")
 	apply := fs.Bool("apply", false, "authorize one stage-only wire attempt")
 	reconcile := fs.Bool("reconcile", false, "record absence of an already issued staging target")
+	proof := fs.String("conditional-delete-proof", "", "reviewed provider conditional DELETE proof")
+	proofSHA := fs.String("expected-delete-proof-sha256", "", "expected SHA-256 of the reviewed provider proof")
 	fs.Parse(args)
 	if fs.NArg() != 0 || *id <= 0 || !r2RetireLowerHex64(*digest) || *apply == *reconcile {
 		log.Fatal("exact object ID, SHA-256 and one of --apply or --reconcile required")
@@ -147,7 +149,14 @@ func runDurhamStageRetirement(ctx context.Context, cfg config.Config, args []str
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err = store.RetireStitchStage(ctx, *id, *digest, *reconcile); err != nil {
+	var proofExpires time.Time
+	if *apply {
+		proofExpires, err = r2RetireDeleteProofExpiry(*proof, *proofSHA, store.Bucket(), store.EndpointSHA256(), false, time.Now())
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	if err := store.RetireStitchStage(ctx, *id, *digest, proofExpires, *reconcile); err != nil {
 		log.Fatal(err)
 	}
 	printJSON(map[string]any{"object_id": *id, "absence_confirmed": true})
