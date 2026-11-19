@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -165,14 +166,23 @@ func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDele
 		o.Retryer = aws.NopRetryer{}
 		o.HTTPClient = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	})
+	if err != nil && transport.sent.Load() {
+		return fmt.Errorf("%w: %w", errInverseWireAmbiguous, err)
+	}
 	return err
 }
+
+// errInverseWireAmbiguous marks a DELETE that passed every check and reached
+// the provider connection without a usable response. Only that key is in
+// doubt: it stays held, is never retransmitted, and a later startup records it
+// absent or keeps holding it. A veto before the wire is never this error.
+var errInverseWireAmbiguous = errors.New("DELETE reached the provider; result unknown")
 
 type inverseDeleteTransport struct {
 	base             http.RoundTripper
 	authority        *inverseDeleteAuthority
 	bucket, endpoint string
-	attempted        atomic.Bool
+	attempted, sent  atomic.Bool
 }
 
 func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -184,5 +194,6 @@ func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, e
 	}
 	req.Header.Del("Idempotency-Key")
 	req.Header.Del("X-Idempotency-Key")
+	t.sent.Store(true)
 	return t.base.RoundTrip(req)
 }

@@ -63,6 +63,7 @@ type inverseApplySummary struct {
 	Deleted          int64        `json:"deleted"`
 	Reconciled       int64        `json:"reconciled"`
 	AmbiguousHeld    int64        `json:"ambiguous_held"`
+	WireAmbiguous    int64        `json:"wire_ambiguous"`
 	LastModifiedHeld r2RetireStat `json:"last_modified_held"`
 	Bytes            int64        `json:"bytes"`
 	ElapsedSeconds   float64      `json:"elapsed_seconds"`
@@ -753,20 +754,23 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 			return result, err
 		}
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// The first failure stops dispatch only. Deletes already in flight finish
+	// under their own deadline; cancelling them would strand DELETEs the
+	// provider may already have taken.
+	stop, halt := context.WithCancel(ctx)
+	defer halt()
 	queue := make(chan inverseEntry)
 	var wg sync.WaitGroup
 	var first error
 	var mu sync.Mutex
-	var deleted, bytes atomic.Int64
+	var deleted, bytes, wireAmbiguous atomic.Int64
 	var modifiedHeld, modifiedBytes atomic.Int64
 	for range o.Workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for e := range queue {
-				if ctx.Err() != nil {
+				if stop.Err() != nil {
 					return
 				}
 				ok, err := a.delete(ctx, e)
@@ -780,12 +784,18 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 						modifiedHeld.Add(1)
 						modifiedBytes.Add(e.SizeBytes)
 					}
+					wire := errors.Is(err, errInverseWireAmbiguous)
+					if wire {
+						wireAmbiguous.Add(1)
+					}
+					// Report any other failure over a lost response, so callers
+					// see wire ambiguity only when it is the sole failure.
 					mu.Lock()
-					if first == nil {
+					if first == nil || !wire && errors.Is(first, errInverseWireAmbiguous) {
 						first = err
-						cancel()
 					}
 					mu.Unlock()
+					halt()
 					return
 				}
 			}
@@ -795,13 +805,14 @@ send:
 	for _, e := range jobs {
 		select {
 		case queue <- e:
-		case <-ctx.Done():
+		case <-stop.Done():
 			break send
 		}
 	}
 	close(queue)
 	wg.Wait()
 	result.Deleted = deleted.Load()
+	result.WireAmbiguous = wireAmbiguous.Load()
 	result.Bytes = bytes.Load()
 	result.LastModifiedHeld.Objects += modifiedHeld.Load()
 	result.LastModifiedHeld.Bytes += modifiedBytes.Load()

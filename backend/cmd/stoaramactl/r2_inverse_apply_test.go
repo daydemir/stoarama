@@ -32,6 +32,7 @@ type inverseFakeStore struct {
 	objects      map[string]r2.ObjectInfo
 	calls        int
 	lost         bool
+	lostKey      string
 	delay        time.Duration
 	beforeHead   func(context.Context, string) error
 	beforeDelete func(string) error
@@ -88,7 +89,7 @@ func (s *inverseFakeStore) deleteOnce(ctx context.Context, authority *inverseDel
 	s.calls++
 	delete(s.objects, key)
 	if s.lost {
-		return errors.New("lost response")
+		return fmt.Errorf("%w: lost response", errInverseWireAmbiguous)
 	}
 	return nil
 }
@@ -134,7 +135,8 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
  INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc) VALUES(1,47,'test','https://test.invalid','auto','stoarama','fixture',decode('00','hex'));
  INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at) VALUES(30,47,1,'inverse','https://test.invalid','* * * * *','Asia/Tokyo','paused',3,now());
  INSERT INTO recording_qualification_runs(id,account_id,definition_version,definition_jsonb,target_recording_count,window_sequence_start_at) VALUES(1,47,'inverse-fixture','{}',50,'2026-06-01');`)
-	const count = 1200
+	// The last two sources carry fixed delivery holds; build() never reaches them.
+	const count = 1250
 	store := &inverseFakeStore{objects: map[string]r2.ObjectInfo{}}
 	sdk, providerDeletes := inverseSDKTestStore(t, store)
 	store.endpointSHA = sdk.EndpointSHA256()
@@ -379,6 +381,64 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatalf("%+v %v calls%d", s, err, store.calls)
 		}
 	})
+	t.Run("lost_response_finishes_in_flight_and_job_settles_it", func(t *testing.T) {
+		// Production shape: R2 closes one DELETE connection (EOF) while seven
+		// other workers have DELETEs outstanding. Only that key may stay
+		// unresolved; the next batch records it absent without retransmitting.
+		a, entries := build(40)
+		a.ledger.close()
+		owner := filepath.Join("..", "..", "..", "docs", "records", "r2-owner-fence-policy-20261118.md")
+		dir := t.TempDir()
+		lost := entries[2].Key
+		unresolved := func() []string {
+			t.Helper()
+			var keys []string
+			if err := pool.QueryRow(ctx, `SELECT coalesce(array_agg(i.object_key ORDER BY i.object_key),'{}') FROM r2_inverse_intents i
+ WHERE i.manifest_sha256=$1 AND NOT EXISTS(SELECT 1 FROM r2_inverse_events v WHERE v.bucket=i.bucket AND v.object_key=i.object_key AND v.event='absent')`, a.opts.ManifestSHA).Scan(&keys); err != nil {
+				t.Fatal(err)
+			}
+			return keys
+		}
+		store.lostKey, store.delay = lost, 5*time.Millisecond
+		done, first, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(dir, "evidence-1.json"))
+		store.lostKey, store.delay = "", 0
+		if err != nil || done || first.WireAmbiguous != 1 || first.Deleted < 1 || first.Deleted >= 39 {
+			t.Fatalf("lost-response batch: done %v %+v %v", done, first, err)
+		}
+		if got := unresolved(); len(got) != 1 || got[0] != lost {
+			t.Fatalf("in-flight deletes were stranded: %v", got)
+		}
+		before := providerDeletes()
+		done, second, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(dir, "evidence-2.json"))
+		if err != nil || done || second.Reconciled != 1 || second.Deleted != 39-first.Deleted || providerDeletes()-before != second.Deleted {
+			t.Fatalf("settling batch: done %v %+v %v deletes %d", done, second, err, providerDeletes()-before)
+		}
+		if got := unresolved(); len(got) != 0 {
+			t.Fatalf("unresolved after settling: %v", got)
+		}
+		if done, last, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(dir, "evidence-3.json")); err != nil || !done || last.Deleted != 0 {
+			t.Fatalf("final batch: done %v %+v %v", done, last, err)
+		}
+
+		// A veto before the wire is not a lost response, and stops the job.
+		b, _ := build(1)
+		b.ledger.close()
+		store.beforeDelete = func(string) error { return errors.New("vetoed before the wire") }
+		_, _, err = runInverseJobBatch(ctx, pool, store, b.opts, owner, filepath.Join(dir, "evidence-4.json"))
+		store.beforeDelete = nil
+		if err == nil || errors.Is(err, errInverseWireAmbiguous) {
+			t.Fatalf("pre-wire veto: %v", err)
+		}
+		// A lost response in a batch that deleted nothing stops the job too.
+		c, _ := build(1)
+		c.ledger.close()
+		store.setLost(true)
+		_, _, err = runInverseJobBatch(ctx, pool, store, c.opts, owner, filepath.Join(dir, "evidence-5.json"))
+		store.setLost(false)
+		if !errors.Is(err, errInverseWireAmbiguous) {
+			t.Fatalf("lost response with no deletes continued: %v", err)
+		}
+	})
 	t.Run("protection_changed_during_HEAD", func(t *testing.T) {
 		a, entries := build(1)
 		a.ledger.close()
@@ -438,8 +498,8 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					case "output_content":
 						exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256) SELECT 'stoarama',$1,'hold',size_bytes,'metadata',sha256 FROM recording_collation_outputs WHERE id=$2`, placeholder, outputID)
 					case "output_cached_source":
-						exec(`UPDATE recording_collation_outputs SET source_clip_ids=array_append(source_clip_ids,9001199::bigint) WHERE id=$1`, outputID)
-						exec(`INSERT INTO delivery_nas_source_holds(clip_id) VALUES(9001199)`)
+						exec(`UPDATE recording_collation_outputs SET source_clip_ids=array_append(source_clip_ids,$2::bigint) WHERE id=$1`, outputID, int64(9000000+count-1))
+						exec(`INSERT INTO delivery_nas_source_holds(clip_id) VALUES($1)`, int64(9000000+count-1))
 					case "output_path":
 						exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,relative_path) SELECT 'stoarama',$1,'hold',100,'metadata',regexp_replace(nas_relative_path,'^joined/','') FROM recording_collation_outputs WHERE id=$2`, placeholder, outputID)
 					}
@@ -507,9 +567,9 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				case "collated_key":
 					query = `UPDATE recording_collation_outputs SET object_key=$1 WHERE id=10000001`
 				case "delivery_output_cached_source":
-					exec(`UPDATE recording_collation_outputs SET source_clip_ids=array_append(source_clip_ids,9001198::bigint) WHERE id=10000001`)
+					exec(`UPDATE recording_collation_outputs SET source_clip_ids=array_append(source_clip_ids,$1::bigint) WHERE id=10000001`, int64(9000000+count-2))
 					query = `INSERT INTO delivery_nas_source_holds(clip_id) VALUES($1)`
-					arg = int64(9001198)
+					arg = int64(9000000 + count - 2)
 				case "held_output_source":
 					exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256) SELECT 'stoarama','datasets/test/late-source-output','hold',size_bytes,'metadata',sha256 FROM recording_collation_outputs WHERE id=10000008 ON CONFLICT DO NOTHING`)
 					query = `UPDATE recording_collation_outputs SET source_clip_ids=array_append(source_clip_ids,$1::bigint) WHERE id=10000008`
@@ -1268,7 +1328,8 @@ func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*inverseSDKStor
 		case http.MethodDelete:
 			deleted.Add(1)
 			delete(store.objects, key)
-			if store.lost {
+			time.Sleep(store.delay)
+			if store.lost || key == store.lostKey {
 				c, _, _ := w.(http.Hijacker).Hijack()
 				c.Close()
 				return
