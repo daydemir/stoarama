@@ -112,10 +112,12 @@ registration receipts after the server accepts its result. A second readiness
 ACK records `completed_no_retirement` and releases the lane. A lost ACK is
 reconciled from the SQLite FULL/WAL journal before new work.
 
-Every ordinary stitch retains its raw inputs. The server refuses stitch-based
-retirement even if an older journal replays unheld evidence or an older cleanup
-plan still exists. Preserve existing SQLite journals, outputs, ledgers and
-plans. Ordinary NAS cleanup and R2 retirement retain their separate authority.
+Every ordinary stitch retains its raw inputs. The API and client refuse
+stitch-derived deletion permits, including legacy registered results.
+Migration 0214 requires old stitch cleanup plans to be disabled and their
+issued permits to have expired before opening the local stitch lane.
+Preserve existing SQLite journals, outputs, ledgers and plans. Ordinary NAS
+cleanup and R2 retirement retain their separate authority.
 
 ## Resource controls and restart
 

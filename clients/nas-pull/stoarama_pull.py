@@ -2848,10 +2848,7 @@ class CleanupFile:
             self.check_paths()
             self.check_active()
             if self.item.get("permit_reason"):
-                # Stitched retirement: read the live switches at the unlink itself.
-                switch = stitch_switch_refusal(self.cfg, True)
-                if switch:
-                    raise CleanupPermitRefused("local_guard", "client deletion guard refused; not unlinked: " + switch)
+                raise CleanupPermitRefused("local_guard", "client deletion guard preserves stitch sources")
             self.unlink_attempted = True
             os.unlink(self.name, dir_fd=self.fds[-1])
             self.media_unlinked = True
@@ -17227,7 +17224,7 @@ def delivery_keep_key_held(key):
     return low < 32825 and packed[low * 32:(low + 1) * 32] == wanted
 
 
-def cleanup_guard_refusal(task, proof, cfg=None):
+def cleanup_guard_refusal(task, proof):
     """None when this exact file is independently outside its keep window; else why not."""
     item = task.get("item", {})
     try:
@@ -17235,10 +17232,8 @@ def cleanup_guard_refusal(task, proof, cfg=None):
             return "DELIVERY KEEP HOLD: exact delivery key/dependency must remain"
     except Exception as exc:
         return "delivery keep check unavailable: %s" % str(exc)[:160]
-    if task.get("item", {}).get("permit_reason"):
-        if cfg is None:
-            return "stitched inclusion needs local output readback"
-        return stitch_output_recheck(cfg, task["item"], execution=task.get("approved_proof") is not None)
+    if item.get("permit_reason"):
+        return "client deletion guard preserves stitch sources"
     pins, error = cleanup_pins()
     if error is not None:
         return "pinned keep-window files failed verification: %s" % error
@@ -17980,7 +17975,7 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner, timings,
             # reported as a conflict observation (an outcome every server
             # accepts), never would_delete, so enabling its plan fails up front
             # instead of pausing mid-run. Local caps apply to execution only.
-            refusal = cleanup_timed(timings, "guard_ms", cleanup_guard_refusal, task, proof, cfg)
+            refusal = cleanup_timed(timings, "guard_ms", cleanup_guard_refusal, task, proof)
             if refusal is None and task.get("approved_proof") is not None:
                 refusal = cleanup_timed(timings, "caps_ms", cleanup_local_caps, inventory, task["item"].get("size_bytes"))
             if refusal:
@@ -18012,15 +18007,10 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner, timings,
                     # Re-check immediately before unlink, reserve one deletion
                     # against the local caps, then write the durable intent line.
                     # Any failure here leaves the files untouched.
-                    refusal = cleanup_timed(timings, "guard_ms", cleanup_guard_refusal, task, proof, cfg) or cleanup_timed(
+                    refusal = cleanup_timed(timings, "guard_ms", cleanup_guard_refusal, task, proof) or cleanup_timed(
                         timings, "caps_ms", cleanup_local_caps, inventory, item.get("size_bytes"), {"item_id": item_id, "plan_sha256": task["plan_sha256"], "relative_path": item["relative_path"]})
                     if refusal:
                         raise CleanupPermitRefused("local_guard", "client deletion guard refused; not unlinked: " + refusal)
-                    if item.get("permit_reason"):
-                        # Final switch read at the unlink boundary for stitched retirement.
-                        switch = stitch_switch_refusal(cfg, True)
-                        if switch:
-                            raise CleanupPermitRefused("local_guard", "client deletion guard refused; not unlinked: " + switch)
                     ledger = {"item_id": item_id, "attempt": attempt, "plan_id": task.get("plan_id"), "plan_sha256": task["plan_sha256"],
                               "proof_sha256": receipt["proof_sha256"], "relative_path": item["relative_path"],
                               "sidecar_relative_path": item["relative_path"] + ".stoarama.json" if item.get("sidecar_required") else None,
@@ -18819,7 +18809,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
         try:
             for task, (current, proof), timing in zip(tasks, opened, timings):
                 stage = CleanupStage.GUARD
-                refusal = cleanup_timed(timing, "guard_ms", cleanup_guard_refusal, task, proof, cfg)
+                refusal = cleanup_timed(timing, "guard_ms", cleanup_guard_refusal, task, proof)
                 if refusal:
                     raise CleanupPermitRefused("local_guard", refusal)
                 stage = CleanupStage.UNLINK
@@ -18902,7 +18892,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
                     if {k:v for k,v in proof.items() if k != "parent_members_sha256"} != {k:v for k,v in task["approved_proof"].items() if k != "parent_members_sha256"}:
                         raise CleanupResponseError("cleanup dry-run proof changed; KEEP")
                     stage = CleanupStage.GUARD
-                    refusal = cleanup_timed(timing, "guard_ms", cleanup_guard_refusal, task, proof, cfg)
+                    refusal = cleanup_timed(timing, "guard_ms", cleanup_guard_refusal, task, proof)
                     if refusal:
                         raise CleanupPermitRefused("local_guard", refusal)
                     progress("proof_ready", task, timing)
@@ -18972,7 +18962,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
                             current.permit_max_age_sec = CLEANUP_EXECUTION_OBSERVE_BUDGET_SEC
                             current.deadline = min(current.deadline, permit_started + CLEANUP_PERMIT_MAX_AGE_SEC)
                             stage = CleanupStage.GUARD
-                            refusal = cleanup_timed(timing, "guard_ms", cleanup_guard_refusal, task, proof, cfg)
+                            refusal = cleanup_timed(timing, "guard_ms", cleanup_guard_refusal, task, proof)
                             if refusal:
                                 raise CleanupPermitRefused("local_guard", refusal)
                             stage = CleanupStage.UNLINK
@@ -48548,50 +48538,6 @@ def stitch_repair_local(clip, directory, stage_file, tools, deadline, stop):
         stage_file(sidecar.name, name + ".repair.json")
         return proof
     return None
-
-
-def stitch_switch_refusal(cfg, execution=True):
-    if not getattr(cfg, "stitch_enabled", False) or (execution and not getattr(cfg, "stitch_delete_enabled", False)):
-        return "local stitch/deletion switch off"
-    return None
-
-
-def stitch_output_recheck(cfg, item, execution=True):
-    """Independent local deletion gate; a server boolean is never sufficient."""
-    switch = stitch_switch_refusal(cfg, execution)
-    if switch:
-        return switch
-    try:
-        if item.get("permit_reason") != "stitched_included" or item.get("kind") != "raw":
-            return "unsupported stitch deletion reason"
-        path = item["stitch_output_path"]
-        marker, _ = confined_regular_file(cfg.output_dir, path + ".registered.json")
-        if marker.stat().st_size > 4096:
-            return "oversized registration receipt"
-        registration = json.loads(marker.read_text())
-        if (registration.get("recorded") is not True or registration.get("task_id") != item.get("stitch_task_id")
-                or registration.get("sha256") != item["stitch_output_sha256"]):
-            return "server registration receipt missing"
-        # The durable local proof was written only after all native verification.
-        proof_path, _ = confined_regular_file(cfg.output_dir, path + ".proof.json")
-        if proof_path.stat().st_size > 1024 * 1024:
-            return "oversized stitch proof"
-        proof = json.loads(proof_path.read_text())
-        if (proof.get("policy") != STITCH_POLICY or proof.get("provenance", {}).get("manifest_sha256") != V85R_MANIFEST_SHA
-                or proof.get("relative_path") != path or proof.get("sha256") != item["stitch_output_sha256"]
-                or proof.get("size_bytes") != item["stitch_output_size_bytes"]
-                or not all(proof.get(k) is True for k in ("full_decode", "seam_decode", "packet_chain", "native_audit", "original_sources_no_audio", "fsynced"))):
-            return "durable output proof mismatch"
-        included = [p for p in proof.get("inputs", []) if p.get("clip_id") == item["source_id"] and not p.get("retirement_held", True)]
-        if (len(included) != 1 or included[0].get("sha256") != item["sha256"] or included[0].get("size_bytes") != item["size_bytes"]
-                or included[0].get("repaired") is not False or included[0].get("frames", 0) <= 0
-                or included[0].get("frames") != included[0].get("packets") or not included[0].get("packet_chain_sha256")):
-            return "raw source lacks full inclusion"
-        hash_certification_file(cfg.output_dir, path, item["stitch_output_size_bytes"], item["stitch_output_sha256"])
-        # Switches may flip during the (slow) rehash: re-read them afterwards.
-        return stitch_switch_refusal(cfg, execution)
-    except Exception as exc:
-        return "output fresh readback failed: " + str(exc)[:200]
 
 
 def stitch_checkpoint(cfg, task):
