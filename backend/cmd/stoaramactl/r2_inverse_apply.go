@@ -226,7 +226,7 @@ func loadInverseRawTarget(ctx context.Context, tx pgx.Tx, bucket string, protect
 }
 
 const inverseRawHeldSQL = `SELECT
- EXISTS(SELECT 1 FROM nas_cleanup_reserved_files WHERE kind='raw' AND source_id=$1)
+ nas_cleanup_file_reserved('raw',$1)
  OR EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id WHERE h.clip_id=$1 AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND (i.delete_ever_issued OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed')))))
  OR EXISTS(SELECT 1 FROM nas_cleanup_incident_sources WHERE clip_id=$1)
  OR EXISTS(SELECT 1 FROM nas_cleanup_incident_roster WHERE bucket=$2 AND object_key=$3)

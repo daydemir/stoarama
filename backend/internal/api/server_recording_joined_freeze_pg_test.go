@@ -96,6 +96,8 @@ var joinedMigrationNames = []string{
 	"0179_nas_v85r_stitch.sql",
 	// Replaces 0198's function and probes the deferred writer-fence tables.
 	"0213_r2_writes_blocked_indexes.sql",
+	// Verifies the collation-output key index; the outputs table is deferred above.
+	"0215_r2_collation_output_key_index.sql",
 }
 
 type joinedFixtureMigrationPhase uint8
