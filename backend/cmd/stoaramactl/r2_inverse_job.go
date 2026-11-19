@@ -9,9 +9,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
-	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -19,8 +20,9 @@ import (
 // a provider one-off job. The executor serializes reserves and spends one round
 // trip per statement, so it must not run across a slow home link. The job takes
 // a fresh read-only partition, then runs bounded apply batches. Each batch gets
-// fresh owner-fence evidence and an exact database readback. The first failure
-// stops the job; nothing is retried.
+// fresh owner-fence evidence and an exact database readback. A DELETE that lost
+// its response holds only its own key, permanently. Any other failure stops the
+// job; nothing is retried.
 func runR2InverseJob(ctx context.Context, cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("r2-inverse job", flag.ExitOnError)
 	picks := fs.String("picks", "", "owner picks")
@@ -71,6 +73,8 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string) {
 		done, result, err := runInverseJobBatch(ctx, pool, store, o, *owner, filepath.Join(*work, fmt.Sprintf("evidence-%03d.json", n)))
 		total.Deleted += result.Deleted
 		total.Bytes += result.Bytes
+		total.WireAmbiguous = append(total.WireAmbiguous, result.WireAmbiguous...)
+		total.AmbiguousHeld, total.HeldAbsent = result.AmbiguousHeld, result.HeldAbsent
 		printInverseJob(map[string]any{"step": "batch", "batch": n, "result": result, "total": total, "error": errorText(err)})
 		if err != nil {
 			log.Fatal(err)
@@ -84,74 +88,47 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string) {
 }
 
 // runInverseJobBatch runs one bounded apply batch. It reports done when a clean
-// batch selected nothing.
+// batch selected nothing. Unresolved intents from earlier batches stay held;
+// the executor's startup stops if one that never reached the wire is gone. A
+// batch whose only failures are lost DELETE responses returns no error once its
+// readback proves exactly those keys are unresolved, as long as it also deleted
+// something; a batch that deletes nothing stops the job.
 func runInverseJobBatch(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteStore, o inverseApplyOptions, owner, evidencePath string) (bool, inverseApplySummary, error) {
-	pending, err := requireInversePendingIntentsPresent(ctx, pool, store)
-	if err != nil {
-		return false, inverseApplySummary{}, err
-	}
+	var err error
 	if o.DrainSHA, err = writeInverseOwnerEvidence(ctx, pool, store, o, owner, evidencePath); err != nil {
 		return false, inverseApplySummary{}, err
 	}
 	o.DrainEvidence = evidencePath
 	result, applyErr := applyInverse(ctx, pool, store, o)
 	// Read this batch's durable outcomes on every path, including a failed one.
-	var n, bytes, absent, attempts int64
-	var unresolved []string
-	if err = pool.QueryRow(ctx, `SELECT count(*),coalesce(sum(i.size_bytes),0),count(v.object_key),count(a.object_key),
+	var n, absent, absentBytes, attempts int64
+	unresolved := []string{}
+	if err = pool.QueryRow(ctx, `SELECT count(*),count(v.object_key),coalesce(sum(i.size_bytes) FILTER (WHERE v.object_key IS NOT NULL),0),count(a.object_key),
  coalesce(array_agg(i.object_key ORDER BY i.object_key) FILTER (WHERE v.object_key IS NULL),'{}')
  FROM r2_inverse_intents i
  LEFT JOIN r2_inverse_events v ON v.bucket=i.bucket AND v.object_key=i.object_key AND v.event='absent'
  LEFT JOIN r2_inverse_attempts a ON a.bucket=i.bucket AND a.object_key=i.object_key
- WHERE i.bucket=$1 AND i.drain_evidence_sha256=$2`, store.Bucket(), o.DrainSHA).Scan(&n, &bytes, &absent, &attempts, &unresolved); err != nil {
+ WHERE i.bucket=$1 AND i.drain_evidence_sha256=$2`, store.Bucket(), o.DrainSHA).Scan(&n, &absent, &absentBytes, &attempts, &unresolved); err != nil {
 		return false, result, errors.Join(applyErr, err)
 	}
-	printInverseJob(map[string]any{"step": "readback", "evidence_sha256": o.DrainSHA, "intents": n, "bytes": bytes, "absent": absent, "attempts": attempts, "unresolved": unresolved})
-	if applyErr != nil {
+	// Compare key sets in one byte order; the database orders by its collation.
+	sort.Strings(unresolved)
+	printInverseJob(map[string]any{"step": "readback", "evidence_sha256": o.DrainSHA, "intents": n, "absent": absent, "absent_bytes": absentBytes, "attempts": attempts, "unresolved": unresolved})
+	wire := errors.Is(applyErr, errInverseWireAmbiguous)
+	if applyErr != nil && !wire {
 		return false, result, applyErr
 	}
-	if result.Reconciled != 0 || result.AmbiguousHeld != pending {
-		return false, result, fmt.Errorf("held intents changed: reconciled %d, ambiguous %d, expected %d", result.Reconciled, result.AmbiguousHeld, pending)
+	if absent != result.Deleted || absentBytes != result.Bytes || attempts != n || !slices.Equal(unresolved, result.WireAmbiguous) {
+		return false, result, fmt.Errorf("database batch evidence differs: intents %d absent %d bytes %d attempts %d unresolved %v", n, absent, absentBytes, attempts, unresolved)
 	}
-	if n != result.Deleted || bytes != result.Bytes || absent != n || attempts != n {
-		return false, result, fmt.Errorf("database batch evidence differs: intents %d bytes %d absent %d attempts %d", n, bytes, absent, attempts)
+	if wire {
+		if result.Deleted == 0 {
+			return false, result, applyErr
+		}
+		printInverseJob(map[string]any{"step": "wire_ambiguous", "held": unresolved, "error": applyErr.Error()})
+		return false, result, nil
 	}
 	return result.Deleted == 0, result, nil
-}
-
-// An unresolved intent is never retransmitted; at startup the executor records
-// absence for any that HEAD as missing. Require every one to still exist so a
-// held key cannot be retired by an outside deletion.
-func requireInversePendingIntentsPresent(ctx context.Context, pool *pgxpool.Pool, store inverseReader) (int64, error) {
-	rows, err := pool.Query(ctx, `SELECT i.object_key FROM r2_inverse_intents i WHERE i.bucket=$1 AND NOT EXISTS(SELECT 1 FROM r2_inverse_events v WHERE v.bucket=i.bucket AND v.object_key=i.object_key AND v.event='absent') ORDER BY 1`, store.Bucket())
-	if err != nil {
-		return 0, err
-	}
-	var keys []string
-	for rows.Next() {
-		var key string
-		if err = rows.Scan(&key); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		keys = append(keys, key)
-	}
-	rows.Close()
-	if err = rows.Err(); err != nil {
-		return 0, err
-	}
-	for _, key := range keys {
-		probe, cancel := context.WithTimeout(ctx, inverseNetworkTimeout)
-		_, err = store.Head(probe, key)
-		cancel()
-		if r2.IsNotFound(err) {
-			return 0, fmt.Errorf("held intent %s is absent at the provider; review before any batch", key)
-		}
-		if err != nil {
-			return 0, err
-		}
-	}
-	return int64(len(keys)), nil
 }
 
 // writeInverseOwnerEvidence writes owner-fence evidence observed now from the

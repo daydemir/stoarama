@@ -400,7 +400,7 @@ func TestKeep28RejectsChangedProofWithSameExpiry(t *testing.T) {
 		})
 	}
 }
-func TestKeep28LostResponseReconcilesWithoutReplay(t *testing.T) {
+func TestKeep28LostResponseStaysHeldWithoutReplay(t *testing.T) {
 	f := newKeep28Fixture(t)
 	f.store.setLost(true)
 	if _, err := applyInverse(f.ctx, f.pool, f.sdk, f.options); err == nil {
@@ -408,8 +408,8 @@ func TestKeep28LostResponseReconcilesWithoutReplay(t *testing.T) {
 	}
 	f.store.setLost(false)
 	result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
-	if err != nil || result.Reconciled != 1 || result.Deleted != 0 || f.deletes() != 1 {
-		t.Fatalf("reconcile %+v %v deletes=%d", result, err, f.deletes())
+	if err != nil || result.AmbiguousHeld != 1 || result.Deleted != 0 || f.deletes() != 1 {
+		t.Fatalf("held %+v %v deletes=%d", result, err, f.deletes())
 	}
 }
 func TestKeep28ExistingPresentIntentNeverReissues(t *testing.T) {

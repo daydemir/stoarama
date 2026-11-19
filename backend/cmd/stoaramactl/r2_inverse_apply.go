@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -60,9 +61,12 @@ type inverseApplyOptions struct {
 	Workers                                                                            int
 }
 type inverseApplySummary struct {
-	Deleted          int64        `json:"deleted"`
-	Reconciled       int64        `json:"reconciled"`
-	AmbiguousHeld    int64        `json:"ambiguous_held"`
+	Deleted       int64 `json:"deleted"`
+	AmbiguousHeld int64 `json:"ambiguous_held"`
+	// HeldAbsent lists held keys, issued before this run, whose objects are gone.
+	// They stay held and unretired; this only reports them.
+	HeldAbsent       []string     `json:"held_absent"`
+	WireAmbiguous    []string     `json:"wire_ambiguous"`
 	LastModifiedHeld r2RetireStat `json:"last_modified_held"`
 	Bytes            int64        `json:"bytes"`
 	ElapsedSeconds   float64      `json:"elapsed_seconds"`
@@ -393,11 +397,30 @@ func (g *inverseWireGuard) check(ctx context.Context, binding inverseDeleteBindi
 
 const inverseNetworkTimeout = 30 * time.Second
 
-func (a *inverseApplier) delete(ctx context.Context, e inverseEntry) (bool, error) {
+// errInverseAdmissionClosed reports a key that wrote nothing because a sibling
+// already stopped the batch. It is never a failure of its own.
+var errInverseAdmissionClosed = errors.New("batch stopped before this key was reserved")
+
+// delete runs one key. admit closes on any sibling failure: a key not yet
+// reserved, or still waiting on its reservation locks, writes nothing and stops.
+// send closes on a hard failure only: a reserved key then stops before its
+// first DELETE and stays held. A DELETE already sent finishes confirmation.
+func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGate, e inverseEntry) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, inverseNetworkTimeout)
 	defer cancel()
-	_, err := a.reserve(ctx, e)
+	if admit.Err() != nil {
+		return false, errInverseAdmissionClosed
+	}
+	reserving, stopReserving := context.WithCancel(ctx)
+	defer context.AfterFunc(admit, stopReserving)()
+	_, err := a.reserve(reserving, e)
+	stopReserving()
 	if err != nil {
+		// Only a wait that closed admission cancelled is not this key's own
+		// failure; any gate failure is reported even if admission also closed.
+		if admit.Err() != nil && errors.Is(err, context.Canceled) {
+			return false, errInverseAdmissionClosed
+		}
 		return false, err
 	}
 	if err = a.record(e, inverseIntent, a.opts.ManifestSHA); err != nil {
@@ -414,6 +437,9 @@ func (a *inverseApplier) delete(ctx context.Context, e inverseEntry) (bool, erro
 			return false, authErr
 		}
 		defer authority.cancel()
+		if send.isClosed() {
+			return false, errInverseAdmissionClosed
+		}
 		ctx = authority.ctx
 		err = a.store.(keep28DeleteStore).deleteKeep28Once(ctx, authority)
 		if err == nil {
@@ -425,9 +451,12 @@ func (a *inverseApplier) delete(ctx context.Context, e inverseEntry) (bool, erro
 			ctx = confirming
 		}
 	} else {
-		authority, authErr := a.authorize(ctx, tx, e)
+		authority, authErr := a.authorize(ctx, tx, e, send)
 		if authErr != nil {
 			return false, authErr
+		}
+		if send.isClosed() {
+			return false, errInverseAdmissionClosed
 		}
 		err = a.store.(inverseDeleteStore).deleteOnce(ctx, authority)
 	}
@@ -444,9 +473,12 @@ func (a *inverseApplier) delete(ctx context.Context, e inverseEntry) (bool, erro
 	if err = tx.Commit(ctx); err != nil {
 		return false, err
 	}
-	return true, a.publishAbsent(ctx, e, a.opts.ManifestSHA, false)
+	if err = a.publishAbsent(ctx, e, a.opts.ManifestSHA); err != nil {
+		return false, err
+	}
+	return true, nil
 }
-func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, manifest string, reconciled bool) error {
+func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, manifest string) error {
 	tx, err := a.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return err
@@ -477,7 +509,7 @@ func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, mani
 	_, err = tx.Exec(ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256,already_absent)
  SELECT 'raw',c.id,i.stream_id,c.bucket,c.object_key,c.size_bytes,lower(c.sha256),'`+a.retirementReason()+`',i.choice,$3,i.policy_sha256,$4
  FROM recording_clips c JOIN recordings r ON r.id=c.recording_id JOIN `+a.intentTable()+` i ON i.source_id=c.id
- WHERE i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 ON CONFLICT DO NOTHING`, a.store.Bucket(), e.Key, manifest, reconciled)
+ WHERE i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 ON CONFLICT DO NOTHING`, a.store.Bucket(), e.Key, manifest, false)
 	if err != nil {
 		return err
 	}
@@ -642,7 +674,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	// receipt on restart. An intent that never issued a DELETE is never retired:
 	// if its object is gone, someone else removed it, so stop before any new work.
 	existing := map[string]bool{}
-	rows, err := pool.Query(ctx, `SELECT i.object_key,i.size_bytes,i.manifest_sha256,i.endpoint_sha256,EXISTS(SELECT 1 FROM `+a.eventTable()+` e WHERE e.bucket=i.bucket AND e.object_key=i.object_key AND e.event='absent'),EXISTS(SELECT 1 FROM `+a.attemptTable()+` t WHERE t.bucket=i.bucket AND t.object_key=i.object_key) FROM `+a.intentTable()+` i WHERE i.bucket=$1`, store.Bucket())
+	rows, err := pool.Query(ctx, `SELECT i.object_key,i.size_bytes,i.etag,i.last_modified,i.manifest_sha256,i.endpoint_sha256,EXISTS(SELECT 1 FROM `+a.eventTable()+` e WHERE e.bucket=i.bucket AND e.object_key=i.object_key AND e.event='absent'),EXISTS(SELECT 1 FROM `+a.attemptTable()+` t WHERE t.bucket=i.bucket AND t.object_key=i.object_key) FROM `+a.intentTable()+` i WHERE i.bucket=$1`, store.Bucket())
 	if err != nil {
 		return result, err
 	}
@@ -653,10 +685,11 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	}
 	var pendingItems []pending
 	for rows.Next() {
-		var key, manifest, endpoint string
+		var key, etag, manifest, endpoint string
 		var size int64
+		var modified time.Time
 		var done, issued bool
-		if err = rows.Scan(&key, &size, &manifest, &endpoint, &done, &issued); err != nil {
+		if err = rows.Scan(&key, &size, &etag, &modified, &manifest, &endpoint, &done, &issued); err != nil {
 			rows.Close()
 			return result, err
 		}
@@ -677,7 +710,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 			}
 		}
 		if !done {
-			pendingItems = append(pendingItems, pending{inverseEntry{ObjectInfo: r2.ObjectInfo{Key: key, SizeBytes: size}}, manifest, issued})
+			pendingItems = append(pendingItems, pending{inverseEntry{ObjectInfo: r2.ObjectInfo{Key: key, SizeBytes: size, ETag: etag, LastModified: modified}}, manifest, issued})
 		}
 	}
 	err = rows.Err()
@@ -689,22 +722,25 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		if err = a.record(p.e, inverseIntent, p.manifest); err != nil {
 			return result, err
 		}
+		// An unresolved intent is never retransmitted and never retired here: an
+		// attempt row cannot prove this executor's DELETE removed the object. A
+		// key that never reached the wire must still exist; if it is gone,
+		// something else deleted it. A present object must still be the one the
+		// intent named. Either difference needs review.
 		probeCtx, probeCancel := context.WithTimeout(ctx, inverseNetworkTimeout)
-		_, err = store.Head(probeCtx, p.e.Key)
+		head, err := store.Head(probeCtx, p.e.Key)
 		probeCancel()
-		if !p.issued && r2.IsNotFound(err) {
+		switch {
+		case r2.IsNotFound(err) && !p.issued:
 			return result, fmt.Errorf("intent %s never issued a DELETE but its object is absent; held for review", p.e.Key)
-		}
-		if r2.IsNotFound(err) {
-			if err = a.publishAbsent(ctx, p.e, p.manifest, true); err != nil {
-				return result, err
-			}
-			result.Reconciled++
-		} else if err != nil {
+		case r2.IsNotFound(err):
+			result.HeldAbsent = append(result.HeldAbsent, p.e.Key)
+		case err != nil:
 			return result, err
-		} else {
-			result.AmbiguousHeld++
+		case strings.Trim(head.ETag, `"`) != strings.Trim(p.e.ETag, `"`) || head.SizeBytes != p.e.SizeBytes || !head.LastModified.Equal(p.e.LastModified.Truncate(time.Second)):
+			return result, fmt.Errorf("held intent %s now names a different object; held for review", p.e.Key)
 		}
+		result.AmbiguousHeld++
 	}
 	f, err := os.Open(o.Manifest)
 	if err != nil {
@@ -765,26 +801,32 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 			return result, err
 		}
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// Any failure closes admission to new reservations. A hard failure also
+	// closes the send gate, so no reserved key sends its first DELETE after it.
+	// Deletes already sent finish under their own deadline; cancelling them
+	// would strand DELETEs the provider may already have taken.
+	stop, halt := context.WithCancel(ctx)
+	defer halt()
+	send := &inverseSendGate{}
 	queue := make(chan inverseEntry)
 	var wg sync.WaitGroup
 	var first error
 	var mu sync.Mutex
 	var deleted, bytes atomic.Int64
+	var wireAmbiguous []string
 	var modifiedHeld, modifiedBytes atomic.Int64
 	for range o.Workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for e := range queue {
-				if ctx.Err() != nil {
-					return
-				}
-				ok, err := a.delete(ctx, e)
+				ok, err := a.delete(ctx, stop, send, e)
 				if ok {
 					deleted.Add(1)
 					bytes.Add(e.SizeBytes)
+				}
+				if errors.Is(err, errInverseAdmissionClosed) {
+					return
 				}
 				if err != nil {
 					var modifiedErr inverseLastModifiedError
@@ -792,12 +834,21 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 						modifiedHeld.Add(1)
 						modifiedBytes.Add(e.SizeBytes)
 					}
+					wire := errors.Is(err, errInverseWireAmbiguous)
+					// Report any other failure over a lost response, so callers
+					// see wire ambiguity only when it is the sole failure.
 					mu.Lock()
-					if first == nil {
+					if wire {
+						wireAmbiguous = append(wireAmbiguous, e.Key)
+					}
+					if first == nil || !wire && errors.Is(first, errInverseWireAmbiguous) {
 						first = err
-						cancel()
 					}
 					mu.Unlock()
+					if !wire {
+						send.close()
+					}
+					halt()
 					return
 				}
 			}
@@ -807,13 +858,15 @@ send:
 	for _, e := range jobs {
 		select {
 		case queue <- e:
-		case <-ctx.Done():
+		case <-stop.Done():
 			break send
 		}
 	}
 	close(queue)
 	wg.Wait()
 	result.Deleted = deleted.Load()
+	sort.Strings(wireAmbiguous)
+	result.WireAmbiguous = wireAmbiguous
 	result.Bytes = bytes.Load()
 	result.LastModifiedHeld.Objects += modifiedHeld.Load()
 	result.LastModifiedHeld.Bytes += modifiedBytes.Load()
