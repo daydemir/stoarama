@@ -120,6 +120,7 @@ type nasCleanupItem struct {
 	FrozenSidecar     [5]int64  `json:"frozen_sidecar_identity"`
 
 	StitchCertificate *nasCleanupStitchCertificate `json:"stitch_certificate,omitempty"`
+	StitchRawSidecar  *nasCleanupStitchSidecar     `json:"stitch_raw_sidecar,omitempty"`
 }
 type nasCleanupReport struct {
 	RegisteredSnapshotAt time.Time `json:"registered_snapshot_at"`
@@ -274,10 +275,15 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	items := []nasCleanupItem{}
+	certifiedPlan := req.Items[0].Kind == nasCleanupCertifiedStitchKind
 	seen := map[string]bool{}
 	for _, sel := range req.Items {
 		kind := sel.Kind
 		certified := kind == nasCleanupCertifiedStitchKind
+		if certified != certifiedPlan {
+			util.WriteError(w, 400, "certified stitch cleanup uses a separate plan")
+			return
+		}
 		if certified {
 			kind = "raw"
 		}
@@ -302,9 +308,11 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 		util.WriteJSON(w, 409, map[string]any{"error": "plan exceeds the per-plan deletion cap", "plan_bytes": planBytes, "max_plan_bytes": nasCleanupMaxPlanBytes})
 		return
 	}
-	if err = s.bindCleanupFrozenInventory(ctx, items); err != nil {
-		util.WriteError(w, 409, err.Error())
-		return
+	if !certifiedPlan {
+		if err = s.bindCleanupFrozenInventory(ctx, items); err != nil {
+			util.WriteError(w, 409, err.Error())
+			return
+		}
 	}
 	id, sha, err := persistNASCleanupPlan(ctx, tx, req.Label, items)
 	if err != nil {
@@ -940,16 +948,18 @@ func validCleanupProof(raw []byte, i nasCleanupItem) bool {
 
 		Replacement *nasCleanupStitchOutput `json:"stitch_replacement"`
 	}
-	if len(raw) > 16384 || json.Unmarshal(raw, &p) != nil || p.Root[0] <= 0 || p.Root[1] <= 0 || len(p.Ancestors) != len(strings.Split(i.RelativePath, "/"))-1 || p.Identity != i.Frozen || p.Identity[4] != p.Root[0] || p.SHA != i.SHA256 || len(p.ParentMembers) != 64 || !lowerHex(p.ParentMembers) {
+	if len(raw) > 16384 || json.Unmarshal(raw, &p) != nil || p.Root[0] <= 0 || p.Root[1] <= 0 || len(p.Ancestors) != len(strings.Split(i.RelativePath, "/"))-1 || p.Identity[4] != p.Root[0] || p.SHA != i.SHA256 || len(p.ParentMembers) != 64 || !lowerHex(p.ParentMembers) {
 		return false
 	}
-	if i.PermitReason == nasCleanupCertifiedStitchReason {
-		if i.StitchCertificate == nil || p.Replacement == nil || *p.Replacement != i.StitchCertificate.Output ||
-			p.Replacement.Identity[4] != p.Root[0] || p.Replacement.Identity[3] == i.Frozen[3] ||
-			p.Replacement.Identity[3] == i.FrozenSidecar[3] {
+	certified := i.PermitReason == nasCleanupCertifiedStitchReason
+	if certified {
+		if i.StitchCertificate == nil || i.StitchRawSidecar == nil || !i.SidecarRequired ||
+			p.Identity[0] != i.SizeBytes || p.Identity[1] <= 0 || p.Identity[2] <= 0 || p.Identity[3] <= 0 ||
+			p.Replacement == nil || *p.Replacement != i.StitchCertificate.Output ||
+			p.Replacement.Identity[4] != p.Root[0] || p.Replacement.Identity[3] == p.Identity[3] {
 			return false
 		}
-	} else if p.Replacement != nil {
+	} else if p.Replacement != nil || p.Identity != i.Frozen {
 		return false
 	}
 	for _, a := range p.Ancestors {
@@ -958,7 +968,16 @@ func validCleanupProof(raw []byte, i nasCleanupItem) bool {
 		}
 	}
 	if i.SidecarRequired {
-		if p.Sidecar == nil || p.Sidecar.Identity != i.FrozenSidecar || len(p.Sidecar.SHA) != 64 || !lowerHex(p.Sidecar.SHA) {
+		if p.Sidecar == nil || len(p.Sidecar.SHA) != 64 || !lowerHex(p.Sidecar.SHA) {
+			return false
+		}
+		id := p.Sidecar.Identity
+		if certified {
+			if id[0] != i.StitchRawSidecar.Size || id[1] <= 0 || id[2] <= 0 || id[3] <= 0 || id[4] != p.Root[0] ||
+				id[3] == p.Replacement.Identity[3] || id[3] == p.Identity[3] || p.Sidecar.SHA != i.StitchRawSidecar.SHA {
+				return false
+			}
+		} else if id != i.FrozenSidecar {
 			return false
 		}
 		want := map[string]any{"clip_id": i.SourceID, "recording_id": i.RecordingID, "relative_path": i.RelativePath, "size_bytes": i.SizeBytes, "sha256": i.SHA256}
@@ -1294,6 +1313,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		bitem.FrozenSidecar = [5]int64{}
 		bitem.PermitReason = ""
 		bitem.StitchCertificate = nil
+		bitem.StitchRawSidecar = nil
 		bitem.StitchTaskID = 0
 		bitem.StitchOutputPath = ""
 		bitem.StitchOutputSHA = ""

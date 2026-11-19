@@ -29,10 +29,17 @@ type nasCleanupStitchCertificate struct {
 	Output   nasCleanupStitchOutput `json:"output"`
 }
 
+type nasCleanupStitchSidecar struct {
+	Size int64  `json:"size_bytes"`
+	SHA  string `json:"sha256"`
+}
+
 func loadNASCleanupStitchCertificate(ctx context.Context, tx pgx.Tx, item *nasCleanupItem) error {
 	var certificate nasCleanupStitchCertificate
-	err := tx.QueryRow(ctx, `SELECT certificate FROM nas_cleanup_certified_stitch_raw
- WHERE clip_id=$1 AND bucket=$2 AND object_key=$3`, item.SourceID, item.Bucket, item.ObjectKey).Scan(&certificate)
+	var sidecar nasCleanupStitchSidecar
+	err := tx.QueryRow(ctx, `SELECT certificate,sidecar_size,sidecar_sha
+ FROM nas_cleanup_certified_stitch_raw WHERE clip_id=$1 AND bucket=$2 AND object_key=$3`,
+		item.SourceID, item.Bucket, item.ObjectKey).Scan(&certificate, &sidecar.Size, &sidecar.SHA)
 	output := certificate.Output
 	if err != nil || certificate.HourID <= 0 || certificate.Attempt <= 0 || !stitchSHA(certificate.Plan) ||
 		!stitchSHA(certificate.Manifest) || !validCleanupPath(output.Path) || !stitchSHA(output.SHA) ||
@@ -42,6 +49,7 @@ func loadNASCleanupStitchCertificate(ctx context.Context, tx pgx.Tx, item *nasCl
 	}
 	item.PermitReason = nasCleanupCertifiedStitchReason
 	item.StitchCertificate = &certificate
+	item.StitchRawSidecar = &sidecar
 	return nil
 }
 

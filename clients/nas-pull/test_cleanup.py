@@ -75,7 +75,11 @@ class CleanupTests(unittest.TestCase):
                       sha256=hashlib.sha256(replacement.read_bytes()).hexdigest(),
                       identity=pull.cleanup_identity(replacement.stat()))
         self.item.update(permit_reason=pull.CLEANUP_CERTIFIED_STITCH_REASON,
-                         stitch_certificate=dict(hour_id=1, attempt=1, output=output))
+                         stitch_certificate=dict(hour_id=1, attempt=1, output=output),
+                         stitch_raw_sidecar=dict(size_bytes=self.sidecar.stat().st_size,
+                                                 sha256=hashlib.sha256(self.sidecar.read_bytes()).hexdigest()))
+        self.item.pop("frozen_identity")
+        self.item.pop("frozen_sidecar_identity")
         return replacement, output
 
     def test_certified_replacement_is_kept_when_exact_raw_is_unlinked(self):

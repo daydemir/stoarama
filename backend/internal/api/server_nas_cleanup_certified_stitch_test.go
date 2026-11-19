@@ -8,7 +8,77 @@ import (
 	"path"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 )
+
+// Run in a rolled-back transaction so the multipart fixture can then complete
+// its original single-output handoff through the provider.
+func testCertifiedStitchSplitOutput(t *testing.T, tx pgx.Tx, hourID, firstCopyID int64, endpoint string,
+	result nasStitchResult, first NASR2CopyItem, firstRequest nasR2CopyControl) {
+	t.Helper()
+	ctx := context.Background()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := tx.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	second := first
+	second.SourceID = 124
+	second.RelativePath = strings.Replace(first.RelativePath, "run-000-", "run-001-", 1)
+	exec(`INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes)
+ OVERRIDING SYSTEM VALUE VALUES(124,$1,1,47,'stoarama',$2,$3,$4,$5)`,
+		hourID, endpoint, second.RelativePath, second.SHA256, second.SizeBytes)
+	exec(`UPDATE nas_stitch_r2_stage_objects SET state='uploading',upload_id='split-fixture' WHERE id=124;
+ UPDATE nas_stitch_r2_stage_objects SET state='completing' WHERE id=124;
+ UPDATE nas_stitch_r2_stage_objects SET state='staged',etag='second-etag',last_modified=clock_timestamp() WHERE id=124`)
+	if err := tx.QueryRow(ctx, `SELECT object_key FROM nas_stitch_r2_stage_objects WHERE id=124`).Scan(&second.ObjectKey); err != nil {
+		t.Fatal(err)
+	}
+	clip := result.Outputs[0]
+	firstOutput, secondOutput := clip, clip
+	firstOutput.Inputs = clip.Inputs[:1]
+	secondOutput.Inputs, secondOutput.Path = clip.Inputs[1:], second.RelativePath
+	result.Outputs = []nasStitchOutput{firstOutput, secondOutput}
+	result.Seams = []nasStitchDecision{{Decision: "split"}}
+	manifest, _ := json.Marshal(result)
+	sha := cleanupSHA(manifest)
+	exec(`UPDATE nas_stitch_r2_hours SET state='staged',staged_manifest=$2,staged_manifest_sha256=$3 WHERE id=$1`,
+		hourID, string(manifest), sha)
+	exec(`UPDATE nas_r2_copy_items SET manifest_sha256=$2 WHERE id=$1`, firstCopyID, sha)
+	secondItem, _ := json.Marshal(second)
+	secondRequest := firstRequest
+	secondRequest.Token = strings.Repeat("f", 64)
+	secondProof := *firstRequest.StitchReceipt
+	secondProof.RelativePath = second.RelativePath
+	secondProof.Identity[3]++
+	secondRequest.StitchReceipt = &secondProof
+	var secondCopyID int64
+	if err := tx.QueryRow(ctx, `INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,
+ policy_sha256,item,state,lease_token,lease_expires_at,etag)
+ VALUES(13,'stitch_output',124,$1,$2,$3,'leased',$4,clock_timestamp()+interval '2 minutes','second-etag')
+ RETURNING id`, sha, cleanupPolicySHA, string(secondItem), secondRequest.Token).Scan(&secondCopyID); err != nil {
+		t.Fatal(err)
+	}
+	if err := finishNASR2StitchCopy(ctx, tx, nasR2CopyTask{ID: firstCopyID, Item: first}, firstRequest); err != nil {
+		t.Fatal(err)
+	}
+	var eligible int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM nas_stitch_r2_certified_raw WHERE hour_id=$1`, hourID).Scan(&eligible); err != nil || eligible != 0 {
+		t.Fatalf("partial split result exposed custody: %d %v", eligible, err)
+	}
+	if err := finishNASR2StitchCopy(ctx, tx, nasR2CopyTask{ID: secondCopyID, Item: second}, secondRequest); err != nil {
+		t.Fatal(err)
+	}
+	for index, want := range []string{first.RelativePath, second.RelativePath} {
+		var path string
+		if err := tx.QueryRow(ctx, `SELECT certificate#>>'{output,relative_path}' FROM nas_stitch_r2_certified_raw
+ WHERE hour_id=$1 AND clip_id=$2`, hourID, 901+index).Scan(&path); err != nil || path != want {
+			t.Fatalf("clip mapped to wrong split output: got %q, want %q, %v", path, want, err)
+		}
+	}
+}
 
 func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key string) {
 	t.Helper()
@@ -33,7 +103,8 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
  manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice,custody)
  SELECT c.bucket,c.object_key,c.endpoint_sha256,c.stream_id,c.clip_id,c.size_bytes,c.etag,now(),
   repeat('a',64),$2,repeat('b',64),repeat('b',64),'st',jsonb_build_object(
-   'ConnectionID',13,'SourceID',c.clip_id,'Path',c.relative_path,'SizeBytes',c.size_bytes,'SHA',c.sha256)
+   'ConnectionID',13,'SourceID',c.clip_id,'Path',c.relative_path,'SizeBytes',c.size_bytes,'SHA',c.sha256,
+   'SidecarPath',c.relative_path||'.stoarama.json','SidecarSize',50,'SidecarSHA',repeat('f',64))
  FROM nas_stitch_r2_certified_raw c WHERE c.hour_id=$1 AND c.clip_id=901`, hourID, cleanupPolicySHA)
 	exec(`INSERT INTO r2_keep28_attempts(bucket,object_key) VALUES('stoarama',$1)`, key)
 	count(ready, 0)
@@ -77,13 +148,24 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
 	if err := save.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
-	id, digest, err := persistNASCleanupPlan(ctx, tx, "certified-raw", []nasCleanupItem{item})
-	if err != nil {
+	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	s.nasCleanupReportCache = &nasCleanupReport{}
+	report := fmt.Sprintf(`{"complete_node_actions":[{"path":%q,"owner_stream_ids":[3]}]}`, path.Dir(item.RelativePath))
+	if err := json.Unmarshal([]byte(report), s.nasCleanupReportCache); err != nil {
 		t.Fatal(err)
 	}
+	prepare := cleanupCall(t, s.handleAdminNASCleanupCreate, 47, 47, "", "",
+		map[string]any{"label": "certified-raw", "items": []map[string]any{{"kind": nasCleanupCertifiedStitchKind, "source_id": item.SourceID}}})
+	var prepared struct {
+		ID     int64  `json:"id"`
+		Digest string `json:"plan_sha256"`
+	}
+	if prepare.Code != http.StatusOK || json.Unmarshal(prepare.Body.Bytes(), &prepared) != nil || prepared.ID <= 0 {
+		t.Fatalf("prepare certified raw with live proof and no legacy frozen index: %d %s", prepare.Code, prepare.Body.String())
+	}
+	id, digest := prepared.ID, prepared.Digest
 	proof := map[string]any{}
 	if err := json.Unmarshal(fixtureProof(item), &proof); err != nil {
 		t.Fatal(err)
@@ -119,11 +201,6 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
 		t.Fatalf("certified cleanup task not leased: %v", tasks)
 	}
 	task := tasks[0]
-	s.nasCleanupReportCache = &nasCleanupReport{}
-	report := fmt.Sprintf(`{"complete_node_actions":[{"path":%q,"owner_stream_ids":[3]}]}`, path.Dir(item.RelativePath))
-	if err := json.Unmarshal([]byte(report), s.nasCleanupReportCache); err != nil {
-		t.Fatal(err)
-	}
 	session := "fixture-boot " + nasCleanupCertifiedStitchVersion
 	observe := func(req cleanupObserve, action string, deleting bool) {
 		t.Helper()

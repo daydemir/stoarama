@@ -39,7 +39,8 @@ CREATE VIEW nas_stitch_r2_certified_raw AS
 -- Never create a cleanup reservation before B2 finishes. B2 needs its exact
 -- physical raw custody on the NAS through the R2 deletion and absence check.
 CREATE VIEW nas_cleanup_certified_stitch_raw AS
- SELECT c.* FROM nas_stitch_r2_certified_raw c
+ SELECT c.*,(intent.custody->>'SidecarSize')::bigint AS sidecar_size,intent.custody->>'SidecarSHA' AS sidecar_sha
+ FROM nas_stitch_r2_certified_raw c
  JOIN r2_keep28_intents intent ON intent.bucket=c.bucket AND intent.object_key=c.object_key
   AND intent.source_id=c.clip_id AND intent.stream_id=c.stream_id AND intent.size_bytes=c.size_bytes
   AND btrim(intent.etag,'"')=btrim(c.etag,'"') AND intent.endpoint_sha256=c.endpoint_sha256
@@ -48,17 +49,20 @@ CREATE VIEW nas_cleanup_certified_stitch_raw AS
    'Path',c.relative_path,'SizeBytes',c.size_bytes,'SHA',c.sha256)
  JOIN r2_retirement_reservations reserved ON reserved.kind='raw' AND reserved.source_id=c.clip_id
   AND reserved.bucket=c.bucket AND reserved.object_key=c.object_key AND reserved.size_bytes=c.size_bytes
-  AND reserved.sha256=c.sha256 AND reserved.manifest_sha256=intent.manifest_sha256
+  AND reserved.sha256=c.sha256 AND reserved.manifest_sha256=intent.manifest_sha256 AND reserved.retirement_class=''
  JOIN r2_keep28_attempts attempt ON attempt.bucket=intent.bucket AND attempt.object_key=intent.object_key
   AND attempt.issued_at>=intent.created_at
  JOIN r2_object_retirements retired ON retired.kind='raw' AND retired.source_id=c.clip_id
   AND retired.stream_id=c.stream_id AND retired.bucket=c.bucket AND retired.object_key=c.object_key
   AND retired.reason='keep28_exact_nas' AND retired.manifest_sha256=intent.manifest_sha256
   AND retired.policy_sha256=intent.policy_sha256 AND retired.choice=intent.choice
-  AND retired.size_bytes=c.size_bytes AND retired.sha256=c.sha256
+  AND retired.size_bytes=c.size_bytes AND retired.sha256=c.sha256 AND NOT retired.already_absent
  JOIN r2_keep28_events absent ON absent.bucket=intent.bucket AND absent.object_key=intent.object_key
   AND absent.event='absent' AND absent.observed_at>=attempt.issued_at
  WHERE c.purged_at IS NOT NULL
+  AND intent.custody->>'SidecarPath'=c.relative_path||'.stoarama.json'
+  AND (intent.custody->>'SidecarSize')::bigint BETWEEN 1 AND 1048576
+  AND intent.custody->>'SidecarSHA' ~ '^[a-f0-9]{64}$'
   AND NOT EXISTS(SELECT 1 FROM nas_cleanup_incident_sources hold WHERE hold.clip_id=c.clip_id)
   AND NOT EXISTS(SELECT 1 FROM nas_cleanup_incident_files hold WHERE hold.kind='raw' AND hold.source_id=c.clip_id)
   AND NOT EXISTS(SELECT 1 FROM nas_cleanup_incident_roster hold WHERE hold.bucket=c.bucket AND hold.object_key=c.object_key);
@@ -72,7 +76,8 @@ CREATE FUNCTION nas_cleanup_exact_certified_stitch(item jsonb) RETURNS boolean L
     'relative_path',c.relative_path,'size_bytes',c.size_bytes,'sha256',c.sha256,'sidecar_required',true)
    AND item->'source_ids'=to_jsonb(ARRAY[c.clip_id])
    AND (item->>'start_at')::timestamptz=c.start_at AND (item->>'end_at')::timestamptz=c.end_at
-   AND item->'stitch_certificate'=c.certificate)
+   AND item->'stitch_certificate'=c.certificate
+   AND item->'stitch_raw_sidecar'=jsonb_build_object('size_bytes',c.sidecar_size,'sha256',c.sidecar_sha))
 $$;
 
 CREATE FUNCTION nas_cleanup_certified_stitch_staging_absent(certificate jsonb) RETURNS boolean LANGUAGE sql STABLE AS $$
@@ -134,6 +139,8 @@ BEGIN
   OR NEW.permit_expires_at IS NULL OR NEW.permit_expires_at<=clock_timestamp()
   OR (OLD.proof-'parent_members_sha256') IS DISTINCT FROM (NEW.proof-'parent_members_sha256')
   OR NEW.proof->'stitch_replacement' IS DISTINCT FROM item->'stitch_certificate'->'output'
+  OR NEW.proof#>'{sidecar,sha256}' IS DISTINCT FROM item#>'{stitch_raw_sidecar,sha256}'
+  OR NEW.proof#>'{sidecar,identity,0}' IS DISTINCT FROM item#>'{stitch_raw_sidecar,size_bytes}'
   OR NOT nas_cleanup_certified_stitch_staging_absent(item->'stitch_certificate')
   OR NOT coalesce(nas_cleanup_exact_certified_stitch(item),false) THEN
    RAISE EXCEPTION 'NAS raw permit requires exact confirmed stitch custody and completed keep-28 retirement';

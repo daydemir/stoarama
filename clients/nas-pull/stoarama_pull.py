@@ -2689,12 +2689,16 @@ class CleanupFile:
             parent = os.fstat(self.fds[-1])
             self.directory_key = (parent.st_dev, parent.st_ino)
             self.directory = CLEANUP_DIRECTORIES.enter(self.directory_key)
-            self.open_file(self.name, self.item["frozen_identity"])
+            certified = self.item.get("permit_reason") == CLEANUP_CERTIFIED_STITCH_REASON
+            self.open_file(self.name, None if certified else self.item["frozen_identity"])
             if self.item["sidecar_required"]:
-                self.open_file(self.name + ".stoarama.json", self.item["frozen_sidecar_identity"])
-            if self.item.get("permit_reason") == CLEANUP_CERTIFIED_STITCH_REASON:
-                if CLIENT_VERSION != CLEANUP_CERTIFIED_STITCH_VERSION or self.item["kind"] != "raw":
+                self.open_file(self.name + ".stoarama.json", None if certified else self.item["frozen_sidecar_identity"])
+            if certified:
+                if CLIENT_VERSION != CLEANUP_CERTIFIED_STITCH_VERSION or self.item["kind"] != "raw" or not self.item["sidecar_required"]:
                     raise RuntimeError("reviewed certified stitch cleanup client required")
+                if (self.files[0][2][0] != self.item["size_bytes"] or
+                        self.files[1][2][0] != self.item["stitch_raw_sidecar"]["size_bytes"]):
+                    raise RuntimeError("raw or sidecar bytes differ from R2 retirement custody")
                 output = self.item["stitch_certificate"]["output"]
                 if output["relative_path"] in (raw, raw + ".stoarama.json"):
                     raise RuntimeError("certified replacement aliases a cleanup target")
@@ -2714,6 +2718,9 @@ class CleanupFile:
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fds[-1])
         self.files.append((name, fd, frozen))
         info = os.fstat(fd)
+        if frozen is None:
+            frozen = cleanup_identity(info)
+            self.files[-1] = (name, fd, frozen)
         if (not stat_module.S_ISREG(info.st_mode) or info.st_dev != self.root_identity[0]
                 or cleanup_identity(info) != frozen):
             raise RuntimeError("cleanup file differs from exact audited identity")
@@ -2813,7 +2820,7 @@ class CleanupFile:
         if hashes[0] != self.item["sha256"] or not self.namespace_unchanged(before_names, before_seq, after_names):
             raise RuntimeError("cleanup content or directory changed")
         self.proof_names, self.proof_seq = before_names, before_seq
-        proof = {"root": self.root_identity, "ancestors": self.ancestors, "identity": self.item["frozen_identity"],
+        proof = {"root": self.root_identity, "ancestors": self.ancestors, "identity": self.files[0][2],
                  "sha256": hashes[0], "parent_members_sha256": before_members}
         if self.item["sidecar_required"]:
             try:
@@ -2832,8 +2839,10 @@ class CleanupFile:
                 if actual != expected:
                     raise CleanupSourceDataError("cleanup sidecar registered interval differs from catalog")
                 binding[field] = expected.isoformat()
-            proof["sidecar"] = {"identity": self.item["frozen_sidecar_identity"], "sha256": hashes[1], "binding": binding}
+            proof["sidecar"] = {"identity": self.files[1][2], "sha256": hashes[1], "binding": binding}
         if self.replacement is not None:
+            if hashes[1] != self.item["stitch_raw_sidecar"]["sha256"]:
+                raise CleanupSourceDataError("raw sidecar differs from R2 retirement custody")
             # Hash the retained bytes before asking for a permit, then keep
             # the open inode and recheck its pathname at both unlink calls.
             fd = self.replacement.files[0][1]

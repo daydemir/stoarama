@@ -383,13 +383,17 @@ receipt and absence event are durable, the clip appears in
 on the NAS.
 
 Use `stoaramactl nas-cleanup prepare --input MANIFEST.json` with the usual
-label and items. Request `{"kind":"certified_stitch_raw","source_id":901}` for
-an exact eligible clip. The API derives the replacement proof and uses the
+label and items in a separate plan. Request
+`{"kind":"certified_stitch_raw","source_id":901}` for an exact eligible clip.
+The API derives the replacement proof and original sidecar digest and uses the
 existing dry run, plan approval, source freeze, delivery veto and deletion
 budget. NAS deletion also requires recorded staging absence for every output
-of the certified attempt. The NAS client reads and hashes the exact retained
-output before the permit and rechecks its open file and pathname immediately
-before unlinking the raw and sidecar. A missing or changed output keeps the raw.
+of the certified attempt. The initial dry run records the raw and sidecar
+identities from the NAS and hashes them against the exact recorded evidence,
+including raws copied after the frozen inventory audit. Before asking for a
+permit the client rechecks those files and hashes the retained output. It
+rechecks the open files and pathnames immediately before unlink. A missing
+or changed output keeps the raw.
 
 Apply 0219 with the NAS deletion master off. Verify the updated API and the
 exact `r2-copy-v7-certified-stitch` NAS client before arming an approved plan.

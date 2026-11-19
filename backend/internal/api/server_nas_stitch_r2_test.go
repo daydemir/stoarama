@@ -257,6 +257,14 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
  RETURNING id`, manifest, cleanupPolicySHA, string(data), request.Token).Scan(&copyID); err != nil {
 		t.Fatal(err)
 	}
+	t.Run("split outputs certify together and cover their own clips", func(t *testing.T) {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		testCertifiedStitchSplitOutput(t, tx, id, copyID, endpoint, result, item, request)
+	})
 
 	receipt, err := json.Marshal(request.StitchReceipt)
 	if err != nil {
