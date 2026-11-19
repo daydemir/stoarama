@@ -123,6 +123,26 @@ class DeliveryCoverageTest(unittest.TestCase):
                 self.assertIn(reason, result.stderr)
                 self.assertEqual(result.stdout, "")
 
+    def test_rejects_truncated_movie_clock_and_muted_audio_track(self):
+        def truncate_movie(data, header, edit):
+            movie = data.index(b"mvhd") + 4
+            self.assertEqual(data[movie], 0)
+            struct.pack_into(">I", data, movie + 16, 1)
+
+        def mute_audio(data, header, edit):
+            audio = data.index(b"tkhd", header) + 4
+            self.assertEqual(data[audio], 0)
+            struct.pack_into(">h", data, audio + 36, 0)
+
+        for name, change, reason in (("short-movie", truncate_movie, "movie duration"),
+                                     ("muted", mute_audio, "playback rate or volume")):
+            with self.subTest(name=name):
+                output = self.mutated_video("delivery", name, change)
+                result = self.verify(output, "one", "two")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(reason, result.stderr)
+                self.assertEqual(result.stdout, "")
+
     def test_shorter_output_edit_leaves_only_earlier_source_proven(self):
         def shorten(data, header, edit):
             for offset in (header + 20, edit + 8):
@@ -136,6 +156,19 @@ class DeliveryCoverageTest(unittest.TestCase):
         self.assertEqual(first["verdict"], "proven")
         self.assertEqual(second["verdict"], "not_proven")
         self.assertNotIn("tracks", second)
+
+    def test_malformed_second_source_handler_preserves_first_source_proof(self):
+        def alter_handler(data, header, edit):
+            handler = data.index(b"hdlr", header) + 4
+            data[handler + 8] = 255
+
+        second = self.mutated_video("two", "handler", alter_handler)
+        result = self.verify("delivery", "one", second, members=("one", second))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        first, second = json.loads(result.stdout)["sources"]
+        self.assertEqual(first["verdict"], "proven")
+        self.assertEqual(second["verdict"], "not_proven")
+        self.assertIn("track and probe layout differ", second["reason"])
 
     def test_rejects_unbounded_manifest_without_waiting_for_fifo_writer(self):
         fifo = self.root / "manifest.fifo"

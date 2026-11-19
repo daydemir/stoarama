@@ -39,6 +39,7 @@ AUDIO_CONFIG = ("codec_name", "codec_tag_string", "profile", "extradata_hash",
 AAC_SAMPLE_RATES = (96000, 88200, 64000, 48000, 44100, 32000, 24000,
                     22050, 16000, 12000, 11025, 8000, 7350)
 AAC_FRAME_SAMPLES = 1024
+UNITY_MATRIX = (65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824)
 TIMEOUT = 1800
 METADATA_LIMIT = 128 * 1024 * 1024
 MANIFEST_LIMIT = 8 * 1024 * 1024
@@ -234,6 +235,7 @@ class Edit:
     offset: int
     start: int
     end: Fraction
+    display_size: tuple
 
 
 def media_edits(source, tracks):
@@ -246,20 +248,34 @@ def media_edits(source, tracks):
     for header in stitch_editlist_metadata(source.path, threading.Event(), all_tracks=True):
         media = bytes.fromhex(header["media_header"])
         tkhd = bytes.fromhex(header["track_header"])
-        handler = {"vide": "video", "soun": "audio"}.get(bytes.fromhex(header["handler"])[8:12].decode("ascii"))
+        mvhd = bytes.fromhex(header["movie_header"])
+        handler = {b"vide": "video", b"soun": "audio"}.get(bytes.fromhex(header["handler"])[8:12])
         require(handler in tracks and handler not in edits, "MP4 track and probe layout differ")
         require(int.from_bytes(tkhd[1:4], "big") & 3 == 3, "MP4 track is disabled or excluded from playback")
         require(tracks[handler].track_id == number(tkhd, 12), "MP4 track identifiers differ")
         clock = number(media, 12)
         require(clock and tracks[handler].time_base == Fraction(1, clock), "MP4 track clock differs")
-        movie_clock = number(bytes.fromhex(header["movie_header"]), 12)
+        movie_clock = number(mvhd, 12)
+        movie_duration = number(mvhd, 16, duration=True)
         track_duration = number(tkhd, 20, duration=True)
-        require(movie_clock > 0 and track_duration > 0, "missing MP4 movie clock or track duration")
+        require(movie_clock > 0 and movie_duration >= track_duration > 0,
+                "MP4 movie duration does not cover its track")
+        movie_rate_offset = 20 + 12 * mvhd[0]
+        track_volume_offset = 36 + 12 * tkhd[0]
+        movie_rate, movie_volume = struct.unpack_from(">ih", mvhd, movie_rate_offset)
+        track_volume = struct.unpack_from(">h", tkhd, track_volume_offset)[0]
+        require((movie_rate, movie_volume) == (65536, 256)
+                and track_volume == (256 if handler == "audio" else 0),
+                "unsupported MP4 playback rate or volume")
+        require(struct.unpack_from(">9i", mvhd, movie_rate_offset + 16) == UNITY_MATRIX
+                and struct.unpack_from(">9i", tkhd, track_volume_offset + 4) == UNITY_MATRIX,
+                "unsupported MP4 display transform")
+        display_size = struct.unpack_from(">II", tkhd, track_volume_offset + 40)
         raw = header["edit_list"]
         if raw is None:
             end = min(Fraction(track_duration * clock, movie_clock), number(media, 16, duration=True))
             require(end > 0, "missing MP4 media duration")
-            edits[handler] = Edit(0, 0, end)
+            edits[handler] = Edit(0, 0, end, display_size)
             continue
         data = bytes.fromhex(raw)
         require(len(data) >= 8 and data[0] in (0, 1) and data[1:4] == bytes(3), "unsupported MP4 edit header")
@@ -275,7 +291,7 @@ def media_edits(source, tracks):
         start = Fraction(entries[0][0] * clock, movie_clock) if count == 2 else 0
         end = start + Fraction(duration * clock, movie_clock)
         require(int(start) == start, "fractional start of leading empty MP4 edit")
-        edits[handler] = Edit(int(start) - media_start, int(start), end)
+        edits[handler] = Edit(int(start) - media_start, int(start), end, display_size)
     require(edits.keys() == tracks.keys(), "MP4 track and probe layout differ")
     return edits
 
@@ -310,7 +326,7 @@ def video_frames(ffmpeg, ffprobe, source, track, edit):
         frames.append(Frame(int(row["pts"]), packet, duration))
     hashes = tool_output([ffmpeg, *DECODE, "-copyts", "-filter_threads", "1", *MOV_INPUT,
                           "-i", source.path, "-map", "0:v:0", "-fps_mode", "passthrough",
-                          "-enc_time_base", "demux", "-pix_fmt", "+" + track.config["pix_fmt"],
+                          "-enc_time_base", f"{track.time_base.numerator}:{track.time_base.denominator}", "-pix_fmt", "+" + track.config["pix_fmt"],
                           "-c:v", "rawvideo", "-threads:v", "1", "-f", "framehash",
                           "-hash", "sha256", "-"], source.fd)
     time_base = None
@@ -566,8 +582,11 @@ def manifest_part(manifest, part):
     return output, [selected[identifier] for identifier in order]
 
 
-def prove_source(stack, ffmpeg, ffprobe, source, tracks, mapping, output, target_tracks, target_video, target_audio):
+def prove_source(stack, ffmpeg, ffprobe, source, tracks, mapping, output, target_tracks,
+                 target_edits, target_video, target_audio):
     edits = media_edits(source, tracks)
+    require(edits["video"].display_size == target_edits["video"].display_size,
+            "output MP4 video display geometry differs")
     require(first_video_idr(source, tracks["video"]), "source does not start at an H.264 IDR")
     result = {}
     for kind, track in tracks.items():
@@ -626,7 +645,7 @@ def prove_part(manifest, part, paths, ffmpeg, ffprobe):
             try:
                 with ExitStack() as raw_stack:
                     facts = prove_source(raw_stack, ffmpeg, ffprobe, source, tracks, mapping,
-                                         output, target_tracks, target_video, target_audio)
+                                         output, target_tracks, target_edits, target_video, target_audio)
             except (CoverageError, MediaCertificationError, StitchHold, KeyError, struct.error) as error:
                 row.update(verdict="not_proven", reason=str(error))
             else:
