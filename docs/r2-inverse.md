@@ -165,10 +165,14 @@ path/size/SHA. The complete proof is persisted with the permanent B2 intent and
 compared again under lock, including timestamps and sidecar. Old October 30
 inventory does not qualify. The final inventory row stays locked through DELETE
 and confirming HEAD404. Each PostgreSQL clock sample fixes custody expiry as
-one absolute local monotonic instant; every network handoff ends at the
-earliest such instant or the existing 30-second cap, and its timers are set to
-that instant, so neither a pause after sampling nor local wall-clock skew can
-extend authority.
+one absolute local monotonic instant, 2 seconds early (`keep28CustodyMargin`).
+The authority keeps the running minimum across every sample, and every later
+handoff (first request byte, socket write deadline, confirming HEAD) ends at it
+or the existing 30-second cap, so neither a pause after sampling nor local
+wall-clock skew can extend authority. Residual: local time cannot observe the
+database clock after the last sample. If PostgreSQL's clock steps forward by
+more than the margin after that sample, or the host suspends while its
+monotonic clock stops, DB-time expiry can arrive before the local deadline.
 
 Migration 0204 creates independent `r2_keep28_intents`, `r2_keep28_attempts`,
 `r2_keep28_events` and a pending-source identity guard. Ordinary reservations

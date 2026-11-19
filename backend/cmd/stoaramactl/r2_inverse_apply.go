@@ -455,7 +455,7 @@ func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGat
 		}
 		return false, fmt.Errorf("single DELETE failed; intent retained, never retransmit: %w", err)
 	}
-	// Confirmation runs inside what is left of the authority's bound.
+	// Confirmation ends at the running custody minimum, sampled again here.
 	ctx, stop, err := authority.bound(authority.ctx)
 	if err != nil {
 		return false, err

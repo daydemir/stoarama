@@ -424,7 +424,7 @@ func TestKeep28CustodyDeadlineIsFixedAtSampling(t *testing.T) {
 	// lifetime and the monotonic sample time may place custody end, and a pause
 	// between the sample and the timer made from it must not move it.
 	c := keep28DBClock{utc: time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC), observed: time.Now()}
-	want := c.observed.Add(3 * time.Second)
+	want := c.observed.Add(time.Second) // 3s of custody less the 2s margin
 	time.Sleep(200 * time.Millisecond)
 	ctx, cancel := context.WithDeadline(context.Background(), c.deadline(c.utc.Add(3*time.Second)))
 	defer cancel()
@@ -432,7 +432,7 @@ func TestKeep28CustodyDeadlineIsFixedAtSampling(t *testing.T) {
 		t.Fatalf("custody end moved with the pause: %v, want %v", got, want)
 	}
 	stale := keep28DBClock{utc: c.utc, observed: time.Now().Add(-2 * time.Second)}
-	if end := stale.deadline(c.utc.Add(time.Second)); end.After(time.Now()) {
+	if end := stale.deadline(c.utc.Add(time.Second + keep28CustodyMargin)); end.After(time.Now()) {
 		t.Fatalf("expired handoff gained time: %v", time.Until(end))
 	}
 }
@@ -460,7 +460,7 @@ func TestKeep28DeadlinesNeverOutliveCustody(t *testing.T) {
 	}
 	_, auth := f.keep28Authorized(t, f.applier(t), &inverseSendGate{})
 	// Custody expiry as a local instant, never earlier than the true one: the
-	// local reading follows the database's.
+	// local reading follows the database's. Deadlines keep a 2s margin from it.
 	expiry := func() time.Time {
 		t.Helper()
 		var now time.Time
@@ -470,7 +470,7 @@ func TestKeep28DeadlinesNeverOutliveCustody(t *testing.T) {
 		return time.Now().Add(auth.custody.Expiry.Sub(now))
 	}
 	authorized, _ := auth.ctx.Deadline()
-	if authorized.After(auth.custodyEnd) || authorized.After(expiry()) {
+	if authorized.After(auth.custodyEnd) || authorized.After(expiry().Add(-2*time.Second)) {
 		t.Fatalf("authority outlives custody: deadline %v, custody end %v", authorized, auth.custodyEnd)
 	}
 	time.Sleep(300 * time.Millisecond)
@@ -494,7 +494,7 @@ func TestKeep28DeadlinesNeverOutliveCustody(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadline, ok := wire.Load().(time.Time)
-	if !ok || !deadline.Equal(auth.custodyEnd) || deadline.After(expiry()) {
+	if !ok || !deadline.Equal(auth.custodyEnd) || deadline.After(expiry().Add(-2*time.Second)) {
 		t.Fatalf("wire outlives custody: deadline %v, custody end %v", deadline, auth.custodyEnd)
 	}
 }
@@ -649,6 +649,67 @@ func TestKeep28WireDeadlineAndCustodyLock(t *testing.T) {
 	result, err = applyInverse(f.ctx, f.pool, f.sdk, f.options)
 	if err != nil || result.AmbiguousHeld != 1 || !slices.Equal(result.HeldAbsent, []string{f.key}) || f.deletes() != 1 {
 		t.Fatalf("expiry replay %+v %v", result, err)
+	}
+}
+
+// slowClockTx delays one armed DB clock read after its local observation, as a
+// slow network or scheduler would, which makes that sample the tightest.
+type slowClockTx struct {
+	pgx.Tx
+	armed *atomic.Bool
+}
+
+func (t slowClockTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if sql == `SELECT clock_timestamp()` && t.armed.CompareAndSwap(true, false) {
+		time.Sleep(600 * time.Millisecond)
+	}
+	return t.Tx.QueryRow(ctx, sql, args...)
+}
+
+// A delayed intermediate clock read gives the tightest custody end. Every later
+// handoff keeps it: the wire's socket deadline and the confirming bound.
+func TestKeep28HandoffsKeepTheTightestSample(t *testing.T) {
+	f := newKeep28Fixture(t)
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '23 hours 59 minutes 50 seconds',server_received_at=clock_timestamp()`); err != nil {
+		t.Fatal(err)
+	}
+	tx, auth := f.keep28Authorized(t, f.applier(t), &inverseSendGate{})
+	armed := &atomic.Bool{}
+	auth.guard.tx = slowClockTx{Tx: tx, armed: armed}
+	var wire atomic.Value
+	template := newInverseDeleteHTTPTransport()
+	dial := template.DialContext
+	template.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return deadlineSpyConn{Conn: conn, set: &wire}, nil
+	}
+	original := f.sdk.transport
+	f.sdk.transport = template
+	defer func() { f.sdk.transport = original }()
+	armed.Store(true)
+	if err := f.sdk.deleteOnce(auth.ctx, auth); err != nil || armed.Load() {
+		t.Fatalf("delete %v, delayed clock read pending %v", err, armed.Load())
+	}
+	// An undelayed sample places custody end about 600 ms after the delayed one.
+	clock, err := keep28Clock(f.ctx, f.pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tightest := clock.deadline(auth.custody.Expiry).Add(-500 * time.Millisecond)
+	deadline, ok := wire.Load().(time.Time)
+	if !ok || deadline.After(tightest) {
+		t.Fatalf("socket deadline %v later than the tightest sample %v", deadline, tightest)
+	}
+	confirming, cancel, err := auth.bound(auth.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	if got, _ := confirming.Deadline(); got.After(tightest) {
+		t.Fatalf("confirming deadline %v later than the tightest sample %v", got, tightest)
 	}
 }
 
@@ -838,7 +899,7 @@ func TestKeep28FirstByteNeverLeavesAfterCustody(t *testing.T) {
 	for _, pause := range []string{"after_connection", "inside_write"} {
 		t.Run(pause, func(t *testing.T) {
 			f := newKeep28Fixture(t)
-			if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '23 hours 59 minutes 57 seconds',server_received_at=clock_timestamp()`); err != nil {
+			if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '23 hours 59 minutes 55 seconds',server_received_at=clock_timestamp()`); err != nil {
 				t.Fatal(err)
 			}
 			_, auth := f.keep28Authorized(t, f.applier(t), &inverseSendGate{})

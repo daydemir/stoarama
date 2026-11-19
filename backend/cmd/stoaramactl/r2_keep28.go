@@ -104,11 +104,17 @@ func keep28Clock(ctx context.Context, q r2RetireQuerier) (keep28DBClock, error) 
 	return c, err
 }
 
-// deadline is the local monotonic instant at which this sample says expiry
-// arrives. It is fixed when sampled, so however late a timer is made from it,
-// it never moves. observed precedes the DB read, so the instant errs early.
+// keep28CustodyMargin ends local authority this long before the sampled DB
+// expiry. Custody lasts up to 24 hours, so 2s costs nothing; it absorbs a
+// PostgreSQL clock step or host stall after the last sample, up to its size.
+const keep28CustodyMargin = 2 * time.Second
+
+// deadline is the local monotonic instant, keep28CustodyMargin before this
+// sample says expiry arrives. It is fixed when sampled, so however late a timer
+// is made from it, it never moves. observed precedes the DB read, so the
+// instant errs early.
 func (c keep28DBClock) deadline(expiry time.Time) time.Time {
-	return c.observed.Add(expiry.Sub(c.utc))
+	return c.observed.Add(expiry.Sub(c.utc) - keep28CustodyMargin)
 }
 
 // proveKeep28 relocks the NAS custody behind a keep-28 intent and requires it
@@ -155,22 +161,22 @@ func (a *inverseDeleteAuthority) checkCustody(ctx context.Context) error {
 	return err
 }
 
-// custodyDeadline samples the DB clock before every network handoff and returns
-// the earliest custody end across every sample. A newer DB clock can bring that
-// instant forward, never push it back.
+// custodyDeadline samples the DB clock at every custody check and network
+// handoff and keeps custodyEnd as the running minimum across every sample, so
+// each later handoff (first byte, socket deadline, confirming HEAD) ends no
+// later than the tightest one. A newer sample can bring it forward, never back.
 func (a *inverseDeleteAuthority) custodyDeadline(ctx context.Context) (time.Time, error) {
 	clock, err := keep28Clock(ctx, a.guard.tx)
 	if err != nil {
 		return time.Time{}, err
 	}
-	end := a.custodyEnd
-	if sampled := clock.deadline(a.custody.Expiry); sampled.Before(end) {
-		end = sampled
+	if sampled := clock.deadline(a.custody.Expiry); sampled.Before(a.custodyEnd) {
+		a.custodyEnd = sampled
 	}
-	if !time.Now().Before(end) {
-		return end, errors.New("NAS custody expired at network boundary")
+	if !time.Now().Before(a.custodyEnd) {
+		return a.custodyEnd, errors.New("NAS custody expired at network boundary")
 	}
-	return end, nil
+	return a.custodyEnd, nil
 }
 
 // bound ends network work at custody end; the parent context keeps the key's

@@ -971,7 +971,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				deadline := time.Now().Add(3 * time.Second)
 				for {
 					var held bool
-					if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND classid::bigint*4294967296+objid::bigint=7343226011103 AND granted AND pid<>pg_backend_pid())`).Scan(&held); err != nil {
+					if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND locktype='advisory' AND classid::bigint::numeric*4294967296+objid::bigint::numeric=7343226011103 AND granted AND pid<>pg_backend_pid())`).Scan(&held); err != nil {
 						t.Fatal(err)
 					}
 					if held {
@@ -992,7 +992,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					t.Fatal("legacy plan mutation upgraded locks", err)
 				}
 				var upgraded bool
-				if err = legacy.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid() AND classid::bigint*4294967296+objid::bigint=7343226011103)`).Scan(&upgraded); err != nil || upgraded {
+				if err = legacy.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND locktype='advisory' AND pid=pg_backend_pid() AND classid::bigint::numeric*4294967296+objid::bigint::numeric=7343226011103)`).Scan(&upgraded); err != nil || upgraded {
 					t.Fatal("cleanup acquired admission lock", upgraded, err)
 				}
 				if err = legacy.Commit(ctx); err != nil {
@@ -1064,7 +1064,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 		var held bool
-		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND granted AND ((classid::bigint*4294967296+objid::bigint)=ANY(ARRAY[7343226011103,7343226011101]::bigint[]) OR(classid=137 AND objid=1 AND objsubid=2)))`).Scan(&held); err != nil || held {
+		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND locktype='advisory' AND granted AND ((classid::bigint::numeric*4294967296+objid::bigint::numeric)=ANY(ARRAY[7343226011103,7343226011101]::numeric[]) OR(classid=137 AND objid=1 AND objsubid=2)))`).Scan(&held); err != nil || held {
 			t.Fatal("waiting B1 owns later locks", held, err)
 		}
 		admissionCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
