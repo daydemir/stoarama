@@ -584,7 +584,7 @@ func (a *inverseApplier) authorizeNonraw(ctx context.Context, tx pgx.Tx, e inver
 	if !head.LastModified.Equal(e.LastModified.Truncate(time.Second)) || !inverseLastModifiedAllowed(e.LastModified, a.summary.CreatedAt, now) {
 		return nil, inverseLastModifiedError{}
 	}
-	if err = a.store.RequireNoMultipartUploads(ctx); err != nil {
+	if err = a.checkMultipart(ctx, tx); err != nil {
 		return nil, err
 	}
 	tag, err := a.pool.Exec(ctx, `INSERT INTO r2_nonraw_attempts(bucket,object_key) VALUES($1,$2) ON CONFLICT DO NOTHING`, binding.Bucket, binding.Key)

@@ -567,9 +567,13 @@ func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, mani
 	// is only authorized when that reservation is the reviewed-scope one.
 	// The class comes from the durable intent being published, never from the
 	// current run, so a legacy intent (empty class) reconciles under any proof.
-	exactClass := ` AND (i.retirement_class='' OR EXISTS(SELECT 1 FROM r2_retirement_reservations v WHERE v.kind='raw' AND v.source_id=r.source_id
+	// Only RAW-lane intents carry a class; keep-28 intents never take one.
+	exactClass := ""
+	if a.opts.Lane == inverseOutsideKeep28 {
+		exactClass = ` AND (i.retirement_class='' OR EXISTS(SELECT 1 FROM r2_retirement_reservations v WHERE v.kind='raw' AND v.source_id=r.source_id
   AND v.bucket=r.bucket AND v.object_key=r.object_key AND v.size_bytes=r.size_bytes AND v.sha256=r.sha256
   AND v.manifest_sha256=r.manifest_sha256 AND v.retirement_class=i.retirement_class))`
+	}
 	var receipt bool
 	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_object_retirements r JOIN `+a.intentTable()+` i ON r.bucket=i.bucket AND r.object_key=i.object_key JOIN recording_clips c ON c.id=i.source_id
  WHERE i.bucket=$1 AND i.object_key=$2 AND r.kind='raw' AND r.reason='`+a.retirementReason()+`' AND r.source_id=$3 AND r.stream_id=i.stream_id AND r.size_bytes=i.size_bytes AND r.sha256=lower(c.sha256) AND r.choice=i.choice AND r.manifest_sha256=$4 AND r.policy_sha256=i.policy_sha256`+exactClass+`)`, a.store.Bucket(), e.Key, sourceID, manifest).Scan(&receipt)
