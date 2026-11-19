@@ -25871,6 +25871,8 @@ def run_measured(command, deadline, stop_event, stdout_path=None, niced=True, *,
     stdout_file = (open(stdout_path, "wb") if stdout_path else
                    subprocess.PIPE if drain_stdout else subprocess.DEVNULL)
     started = time.monotonic()
+    done = threading.Event()
+    killed = {"reason": ""}
     try:
         if time.monotonic() >= deadline:
             raise BenchmarkDeadline("benchmark deadline reached")
@@ -25887,9 +25889,6 @@ def run_measured(command, deadline, stop_event, stdout_path=None, niced=True, *,
     finally:
         for writer in child_writers:
             writer.close()
-    killed = {"reason": ""}
-    done = threading.Event()
-
     def watchdog():
         while not done.wait(0.5):
             reason = "deadline" if time.monotonic() >= deadline else ("shutdown" if stop_event.is_set() else "")
@@ -25901,14 +25900,12 @@ def run_measured(command, deadline, stop_event, stdout_path=None, niced=True, *,
                     pass
                 return
 
-    guard = threading.Thread(target=watchdog, name="benchmark-watchdog", daemon=True)
+    guard = None
     try:
         try:
+            guard = threading.Thread(target=watchdog, name="benchmark-watchdog", daemon=True)
             guard.start()
-            drained = None
-            if drain_stdout:
-                with process.stdout:
-                    drained = drain_stdout(process.stdout)
+            drained = drain_stdout(process.stdout) if drain_stdout else None
         except BaseException:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -25923,8 +25920,10 @@ def run_measured(command, deadline, stop_event, stdout_path=None, niced=True, *,
         stderr_tail = stderr_file.read().decode("utf-8", "replace").strip()
     finally:
         done.set()
-        if guard.ident is not None:
+        if guard is not None and guard.ident is not None:
             guard.join(timeout=2)
+        if process.stdout is not None:
+            process.stdout.close()
         if stdout_path:
             stdout_file.close()
         stderr_file.close()
@@ -47553,12 +47552,15 @@ def stitch_proof_request(cfg, path, stop, timeout=HEARTBEAT_TIMEOUT_SEC):
     return result
 
 
-def stitch_run(args, deadline, stop, stdout=None):
-    # The worker thread is already nice19/idle; explicitly apply the same
-    # priorities to FFmpeg and ffprobe children. No '-t' silent ionice fallback.
+def stitch_native_command(args):
+    # Match the worker's nice19/idle priority for native tools.
     prefix = ["nice", "-n", "19", "ionice", "-c", "3"] if sys.platform.startswith("linux") else []
+    return prefix + list(args)
+
+
+def stitch_run(args, deadline, stop, stdout=None):
     stitch_check(stop)
-    measured = run_measured(prefix + list(args), deadline, stop, stdout_path=stdout, niced=False)
+    measured = run_measured(stitch_native_command(args), deadline, stop, stdout_path=stdout, niced=False)
     if getattr(stop, "kind", None) is StitchRunKind.PROOF:
         stop.measurements.append(dict(argv=list(map(str, args)), returncode=measured["returncode"], wall_s=measured.get("wall_s"), cpu_s=measured.get("cpu_s")))
     if measured["returncode"] != 0:
@@ -48164,9 +48166,12 @@ def stitch_frame_command(ffmpeg, source):
             "-fps_mode", "passthrough", "-enc_time_base", "demux"]
 
 
+def stitch_framehash_command(ffmpeg, source, target):
+    return stitch_frame_command(ffmpeg, source) + ["-f", "framehash", "-hash", "sha256", "-y", str(target)]
+
+
 def stitch_frames(ffmpeg, source, target, deadline, stop):
-    stitch_run(stitch_frame_command(ffmpeg, source) +
-               ["-f", "framehash", "-hash", "sha256", "-y", str(target)], deadline, stop)
+    stitch_run(stitch_framehash_command(ffmpeg, source, target), deadline, stop)
 
 
 class StitchFrameLedgerError(RuntimeError):
@@ -48219,9 +48224,8 @@ def stitch_stream_frames(ffmpeg, source, target, deadline, stop, *, confirm_sour
     with os.fdopen(read_fd, "rb") as raw, os.fdopen(write_fd, "wb") as raw_writer, target.open("wb") as ledger:
         tee = "[f=framecrc:flush_packets=1]pipe:1|[f=rawvideo:flush_packets=1]pipe:%d" % raw_writer.fileno()
         args = stitch_frame_command(ffmpeg, source) + ["-c:v", "rawvideo", "-f", "tee", tee]
-        prefix = ["nice", "-n", "19", "ionice", "-c", "3"] if sys.platform.startswith("linux") else []
         try:
-            measured = run_measured(prefix + args, deadline, stop, niced=False, child_writers=(raw_writer,),
+            measured = run_measured(stitch_native_command(args), deadline, stop, niced=False, child_writers=(raw_writer,),
                                     drain_stdout=lambda metadata: stitch_hash_frame_stream(metadata, raw, ledger, stop))
             stitch_check(stop)
         except (StitchHold, BenchmarkError, OSError) as exc:
@@ -48232,11 +48236,24 @@ def stitch_stream_frames(ffmpeg, source, target, deadline, stop, *, confirm_sour
         # A sound stream can still end in a genuine strict decode rejection.
         # Only the independent original verifier may classify that source as
         # rejected. Its success cannot authorize this failed streamed audit.
-        if confirm_source_rejection and measured["returncode"] > 0:
-            stitch_frames(ffmpeg, source, os.devnull, deadline, stop)
+        if confirm_source_rejection and stitch_invalid_media_exit(measured):
+            original = stitch_framehash_command(ffmpeg, source, os.devnull)
+            reference = run_measured(stitch_native_command(original), deadline, stop, niced=False)
+            stitch_check(stop)
+            if time.monotonic() < deadline and stitch_invalid_media_exit(reference):
+                raise StitchHold("strict source decode rejected invalid media")
         raise StitchFrameLedgerError("strict frame verification failed: " + measured["stderr"][:200])
     if measured["drained"] == 0:
         raise StitchFrameLedgerError("empty decoded frame stream")
+
+
+def stitch_invalid_media_exit(measured):
+    # The pinned CLI returns AVERROR_INVALIDDATA as an eight-bit process status.
+    # Older CLI builds return 1. Require the decoder's invalid-input diagnostic
+    # as well; a signal, launcher failure or arbitrary muxer failure is fatal.
+    invalid_data = (-int.from_bytes(b"INDA", "little")) & 0xff
+    return (measured["returncode"] in (1, invalid_data)
+            and "Invalid data found when processing input" in measured["stderr"])
 
 
 STITCH_STREAMED_FRAME_FORMATS = frozenset({

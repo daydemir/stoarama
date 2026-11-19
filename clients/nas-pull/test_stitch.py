@@ -11,6 +11,7 @@ import itertools
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -52,7 +53,7 @@ class StitchFrameLedgerTests(unittest.TestCase):
                 pull.stitch_hash_frame_stream(io.BytesIO(metadata), io.BytesIO(raw),
                                               io.BytesIO(), threading.Event())
 
-    def run_child(self, behavior, stop, deadline_seconds):
+    def run_child(self, behavior, stop, deadline_seconds, reference_status=0):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             child = root / "ffmpeg"
@@ -63,20 +64,37 @@ class StitchFrameLedgerTests(unittest.TestCase):
                 "with open(sys.argv[sys.argv.index('-i') + 1], 'w') as f: f.write(str(os.getpid()))\n"
                 "fd = int(sys.argv[-1].rsplit(':', 1)[1])\n" + behavior)
             child.chmod(0o700)
-            with mock.patch.object(pull, "stitch_frames") as reference:
+            run = pull.run_measured
+            references = []
+            def measure(args, *rest, **kwargs):
+                if "framehash" in args:
+                    references.append(args)
+                    return dict(returncode=reference_status, stderr="Invalid data found when processing input")
+                return run(args, *rest, **kwargs)
+            with mock.patch.object(pull, "run_measured", side_effect=measure):
                 with self.assertRaises(pull.StitchFrameLedgerError):
                     pull.stitch_stream_frames(str(child), pid, root / "ledger",
                                               time.monotonic() + deadline_seconds, stop,
                                               confirm_source_rejection=True)
             with self.assertRaises(ChildProcessError):
                 os.waitpid(int(pid.read_text()), os.WNOHANG)
-            return reference.call_count
+            return len(references)
 
     def test_child_exit_after_complete_ledger_is_fatal(self):
         attempts = self.run_child("os.write(1, b'#tb 0: 1/1000\\n0, 0, 0, 1, 3, 0x12345678\\n')\n"
                                   "os.write(fd, b'abc')\n"
                                   "sys.exit(1)\n", threading.Event(), 5)
-        self.assertEqual(attempts, 1)
+        self.assertEqual(attempts, 0)
+
+    def test_confirming_child_signal_and_launcher_error_are_fatal(self):
+        for status in (-signal.SIGSEGV, 127, 0):
+            with self.subTest(status=status):
+                attempts = self.run_child(
+                    "os.write(1, b'#tb 0: 1/1000\\n0, 0, 0, 1, 3, 0x12345678\\n')\n"
+                    "os.write(fd, b'abc')\n"
+                    "sys.stderr.write('Invalid data found when processing input')\n"
+                    "sys.exit(1)\n", threading.Event(), 5, reference_status=status)
+                self.assertEqual(attempts, 1)
 
     def test_truncated_stream_cannot_be_classified_as_source_rejection(self):
         attempts = self.run_child("os.write(1, b'#tb 0: 1/1000\\n0, 0, 0, 1, 4, 0x12345678\\n')\n"
@@ -469,10 +487,11 @@ class StitchIntegrationTests(unittest.TestCase):
         body["sha256"] = clip["sha256"]
         sidecar.write_text(json.dumps(body))
         self.task["plan"].update(clips=self.clips[:2], joins=[True], eligible=[True, True])
-        with mock.patch.object(pull, "stitch_frames", wraps=pull.stitch_frames) as reference:
+        with mock.patch.object(pull, "run_measured", wraps=pull.run_measured) as native:
             result = self.build()
-        reference.assert_called_once()
-        self.assertEqual(reference.call_args.args[2], os.devnull)
+        references = [call.args[0] for call in native.call_args_list if "framehash" in call.args[0]]
+        self.assertEqual(len(references), 1)
+        self.assertEqual(references[0][-1], os.devnull)
         self.assertEqual(result["left_out"], [clip["source_id"]])
         self.assertEqual(len(result["outputs"]), 1)
         self.assertTrue(path.exists())
