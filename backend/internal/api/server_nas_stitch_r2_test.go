@@ -23,7 +23,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func TestDurhamHoldReleasedOnlyByCommittedNASCertificate(t *testing.T) {
+func TestR2StitchDurhamHoldReleasedOnlyByCommittedNASCertificate(t *testing.T) {
 	ctx := context.Background()
 	dsn := os.Getenv("STOARAMA_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -91,6 +91,10 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 
 	exec(`INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until)
  VALUES(1,3,$1,$1::timestamptz+interval '6 hours','test',clock_timestamp()+interval '1 hour')`, hour)
+	bestStart := windows[3].Start.AddDate(0, 0, 7)
+	exec(`INSERT INTO recording_clips(recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,
+ fire_at,clip_start_at,clip_end_at,display_path) VALUES(30,1,$1,'stoarama','managed/keep-ranking.mp4',100,
+ 'test-etag',repeat('c',64),$2,$2,$3,'fixture/keep-ranking.mp4')`, provider.URL, bestStart, bestStart.AddDate(0, 0, 14))
 	endpoint := cleanupSHA([]byte(provider.URL))
 	exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, endpoint)
 	store, err := r2.New(ctx, r2.Config{Bucket: "stoarama", Endpoint: provider.URL,
@@ -364,6 +368,10 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	if err := reserve(); err == nil {
 		t.Fatal("certificate rollback released the raw")
 	}
+	var eligible int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM nas_stitch_r2_certified_raw WHERE hour_id=$1`, id).Scan(&eligible); err != nil || eligible != 0 {
+		t.Fatalf("rolled-back certificate exposed NAS cleanup eligibility: %d %v", eligible, err)
+	}
 
 	post := func(principal int64, req nasR2CopyControl) int {
 		out := cleanupCall(t, s.handleNASR2CopyResult, 47, principal, "id", fmt.Sprint(copyID), req)
@@ -470,6 +478,11 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		!strings.Contains(err.Error(), "outcome unconfirmed") {
 		t.Fatalf("expected the provider to lose the DELETE result after both grants drained: %v", err)
 	}
+	var stagingAbsent bool
+	if err := pool.QueryRow(ctx, `SELECT nas_cleanup_certified_stitch_staging_absent(certificate)
+ FROM nas_stitch_r2_certified_raw WHERE clip_id=901`).Scan(&stagingAbsent); err != nil || stagingAbsent {
+		t.Fatalf("unconfirmed staging DELETE became NAS unlink authority: %v %v", stagingAbsent, err)
+	}
 	if _, err := staleFence.Exec(ctx, `DELETE FROM r2_retirement_writer_fences`); err == nil || !strings.Contains(err.Error(), "READ COMMITTED") {
 		t.Fatal("stale transaction snapshot removed the writer fence", err)
 	}
@@ -501,6 +514,9 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 			t.Fatal("staging retirement reservation history could be erased or reassigned", err)
 		}
 	}
+	t.Run("certified NAS cleanup waits for exact R2 retirement", func(t *testing.T) {
+		testCertifiedStitchNASCleanup(t, s, id, sourceKey)
+	})
 }
 
 func durhamStageTestProvider(t *testing.T, media []byte, sha string) *httptest.Server {

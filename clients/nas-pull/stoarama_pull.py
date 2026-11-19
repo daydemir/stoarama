@@ -45,6 +45,9 @@ from typing import NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 CLIENT_VERSION = "development"
+CLEANUP_CERTIFIED_STITCH_VERSION = "r2-copy-v7-certified-stitch"
+CLEANUP_CERTIFIED_STITCH_REASON = "durham_stitch_certified"
+CLEANUP_CERTIFIED_STITCH_RECOVERY = "nas_stitch_certified"
 CLEANUP_RECONCILIATION_PROTOCOL = 1
 CLEANUP_REFUSAL_PROTOCOL = 1
 CANDIDATE_UPDATE_LOCK = threading.Lock()
@@ -2646,6 +2649,7 @@ class CleanupFile:
         self.directory = None
         self.proof_names = None
         self.proof_seq = None
+        self.replacement = None
         # MD5 of the media bytes, computed in the same read as their SHA-256.
         # It is not part of the proof; protocol-2 servers use it to match the
         # R2 single-part ETag instead of downloading the recovery copy.
@@ -2688,6 +2692,19 @@ class CleanupFile:
             self.open_file(self.name, self.item["frozen_identity"])
             if self.item["sidecar_required"]:
                 self.open_file(self.name + ".stoarama.json", self.item["frozen_sidecar_identity"])
+            if self.item.get("permit_reason") == CLEANUP_CERTIFIED_STITCH_REASON:
+                if CLIENT_VERSION != CLEANUP_CERTIFIED_STITCH_VERSION or self.item["kind"] != "raw":
+                    raise RuntimeError("reviewed certified stitch cleanup client required")
+                output = self.item["stitch_certificate"]["output"]
+                if output["relative_path"] in (raw, raw + ".stoarama.json"):
+                    raise RuntimeError("certified replacement aliases a cleanup target")
+                self.replacement = CleanupFile(
+                    self.cfg, dict(output, frozen_identity=output["identity"], sidecar_required=False),
+                    self.stop_event, self.deadline)
+                self.replacement.__enter__()
+                if self.replacement.root_identity != self.root_identity or any(
+                        frozen[3:] == output["identity"][3:] for _, _, frozen in self.files):
+                    raise RuntimeError("certified replacement is outside the cleanup mount or aliases a target")
             return self
         except BaseException:
             self.__exit__(None, None, None)
@@ -2760,6 +2777,8 @@ class CleanupFile:
             if (not stat_module.S_ISREG(current.st_mode) or current.st_nlink != 1 or opened.st_nlink != 1
                     or cleanup_identity(current) != frozen or cleanup_identity(opened) != frozen):
                 raise MediaCertificationResourceError("cleanup file identity changed")
+        if self.replacement is not None:
+            self.replacement.check_paths()
 
     def proof(self):
         started = time.monotonic()
@@ -2814,6 +2833,23 @@ class CleanupFile:
                     raise CleanupSourceDataError("cleanup sidecar registered interval differs from catalog")
                 binding[field] = expected.isoformat()
             proof["sidecar"] = {"identity": self.item["frozen_sidecar_identity"], "sha256": hashes[1], "binding": binding}
+        if self.replacement is not None:
+            # Hash the retained bytes before asking for a permit, then keep
+            # the open inode and recheck its pathname at both unlink calls.
+            fd = self.replacement.files[0][1]
+            os.lseek(fd, 0, os.SEEK_SET)
+            digest = hashlib.sha256()
+            while True:
+                self.check_active()
+                block = os.read(fd, 1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+            self.check_paths()
+            output = self.item["stitch_certificate"]["output"]
+            if digest.hexdigest() != output["sha256"]:
+                raise CleanupSourceDataError("certified replacement bytes differ")
+            proof["stitch_replacement"] = output
         self.stage_timings["proof_ms"] = (time.monotonic() - started) * 1000
         return proof
 
@@ -2847,7 +2883,9 @@ class CleanupFile:
             check_namespace()
             self.check_paths()
             self.check_active()
-            if self.item.get("permit_reason"):
+            reason = self.item.get("permit_reason")
+            if reason and (reason != CLEANUP_CERTIFIED_STITCH_REASON or self.replacement is None
+                           or not certified_cleanup_replacement(self.item, proof)):
                 raise CleanupPermitRefused("local_guard", "client deletion guard preserves stitch sources")
             self.unlink_attempted = True
             os.unlink(self.name, dir_fd=self.fds[-1])
@@ -2863,6 +2901,9 @@ class CleanupFile:
             os.fsync(self.fds[-1])
 
     def __exit__(self, *_args):
+        if self.replacement is not None:
+            self.replacement.__exit__(None, None, None)
+            self.replacement = None
         for _, fd, _ in reversed(self.files):
             os.close(fd)
         for fd in reversed(self.fds):
@@ -17224,6 +17265,13 @@ def delivery_keep_key_held(key):
     return low < 32825 and packed[low * 32:(low + 1) * 32] == wanted
 
 
+def certified_cleanup_replacement(item, proof):
+    certificate = item.get("stitch_certificate")
+    return (CLIENT_VERSION == CLEANUP_CERTIFIED_STITCH_VERSION and item.get("kind") == "raw"
+            and isinstance(certificate, dict) and isinstance(certificate.get("output"), dict)
+            and isinstance(proof, dict) and proof.get("stitch_replacement") == certificate["output"])
+
+
 def cleanup_guard_refusal(task, proof):
     """None when this exact file is independently outside its keep window; else why not."""
     item = task.get("item", {})
@@ -17232,7 +17280,9 @@ def cleanup_guard_refusal(task, proof):
             return "DELIVERY KEEP HOLD: exact delivery key/dependency must remain"
     except Exception as exc:
         return "delivery keep check unavailable: %s" % str(exc)[:160]
-    if item.get("permit_reason"):
+    reason = item.get("permit_reason")
+    certified = reason == CLEANUP_CERTIFIED_STITCH_REASON and certified_cleanup_replacement(item, proof)
+    if reason and not certified:
         return "client deletion guard preserves stitch sources"
     pins, error = cleanup_pins()
     if error is not None:
@@ -17267,6 +17317,8 @@ def cleanup_guard_refusal(task, proof):
             return "unsupported cleanup kind %r" % kind
         if not end > start:
             return "clip interval is empty"
+        if certified:
+            return None if keep_start <= start < end <= keep_end else "certified raw is outside its pinned keep window"
         if start < keep_end and end > keep_start:
             return "clip %s..%s overlaps stream %d keep window %s..%s" % (
                 start.isoformat(), end.isoformat(), stream, keep_start.isoformat(), keep_end.isoformat())
@@ -17797,7 +17849,10 @@ def cleanup_verified_ack(task, proof, decision):
         and isinstance(decision, dict)
         and decision.get("delete") is False
         and decision.get("action") == "would_delete"
-        and decision.get("recovery") in ("r2_sha_verified", "r2_md5_etag_matched")
+        and (decision.get("recovery") in ("r2_sha_verified", "r2_md5_etag_matched")
+             or (decision.get("recovery") == CLEANUP_CERTIFIED_STITCH_RECOVERY
+                 and task.get("item", {}).get("permit_reason") == CLEANUP_CERTIFIED_STITCH_REASON
+                 and certified_cleanup_replacement(task["item"], proof)))
         and type(decision.get("item_id")) is int
         and decision["item_id"] == task["item_id"]
         and type(decision.get("attempt")) is int
@@ -17829,6 +17884,10 @@ def cleanup_check_permit(cfg, fenced, task, proof, decision, started):
         raise CleanupPermitRefused("proof_mismatch", "cleanup deletion permit does not match exact current proof; not unlinked")
     if decision.get("delivery_keep_checked") is not True:
         raise CleanupPermitRefused("local_guard", "delivery keep holds not checked; not unlinked")
+    if task.get("item", {}).get("permit_reason") == CLEANUP_CERTIFIED_STITCH_REASON and (
+            decision.get("recovery") != CLEANUP_CERTIFIED_STITCH_RECOVERY
+            or not certified_cleanup_replacement(task["item"], proof)):
+        raise CleanupPermitRefused("local_guard", "permit does not bind certified replacement custody")
     expiry = parse_certification_timestamp(decision.get("expires_at"), "cleanup permit")
     if expiry <= datetime.datetime.now(datetime.timezone.utc):
         raise CleanupPermitRefused("permit_expired", "cleanup deletion permit expired; not unlinked")
@@ -18201,7 +18260,7 @@ CLEANUP_V6_VERSIONS: frozenset[str] = frozenset((CLEANUP_GROUP_VERSION, "r2-copy
 CLEANUP_BULK_VERSION = "cleanup-batch-v7"
 CLEANUP_TRUTH_VERSION = "cleanup-batch-v8"
 CLEANUP_FRESH_PERMIT_VERSION = "v85r-nas-proof-v2.2"
-CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v2", "r2-copy-v3", "r2-copy-v4", "r2-copy-v5", "r2-copy-v6", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
+CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, CLEANUP_CERTIFIED_STITCH_VERSION, "r2-copy-v2", "r2-copy-v3", "r2-copy-v4", "r2-copy-v5", "r2-copy-v6", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
 CLEANUP_GROUP_VERSIONS: frozenset[str] = CLEANUP_V6_VERSIONS | CLEANUP_BULK_VERSIONS
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
@@ -18219,7 +18278,7 @@ CLEANUP_RETRYABLE_ATTEMPTS = 8
 def cleanup_execution_group_size():
     # One lease/permit clock per file. NAS syscall latency must never consume
     # another file's short authority window. Historical releases retain v7.
-    return 1 if CLIENT_VERSION in (CLEANUP_FRESH_PERMIT_VERSION, "r2-copy-v4", "r2-copy-v5", "r2-copy-v6") else CLEANUP_EXECUTION_GROUP
+    return 1 if CLIENT_VERSION in (CLEANUP_FRESH_PERMIT_VERSION, CLEANUP_CERTIFIED_STITCH_VERSION, "r2-copy-v4", "r2-copy-v5", "r2-copy-v6") else CLEANUP_EXECUTION_GROUP
 
 
 class CleanupProtocolUnsupported(RuntimeError):

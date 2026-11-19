@@ -124,10 +124,11 @@ type cleanupObserveEnv struct {
 // the exact generation the dry run proved (r2_etag_bound). The dry run proved
 // it either by a full download + SHA-256 (r2_sha_verified) or by a single-part
 // ETag equal to both the catalogued upload ETag and the NAS client's MD5
-// (r2_md5_etag_matched); enable accepts either. Every other state
-// (nas_only_at_check, unchecked, conflict, ...) never permits.
+// (r2_md5_etag_matched); enable accepts either. Certified Durham raws carry
+// their own exact NAS replacement proof, after durable R2 absence.
 func cleanupRecoveryPermits(mode, recovery string) bool {
-	return recovery == "r2_sha_verified" || (mode == "enabled" && recovery == "r2_etag_bound")
+	return recovery == "r2_sha_verified" ||
+		(mode == "enabled" && (recovery == "r2_etag_bound" || recovery == nasCleanupCertifiedStitchRecovery))
 }
 
 // cleanupExpireLeasesSQL returns expired leases of a connection to pending
@@ -449,9 +450,15 @@ func cleanupEnableGates(ctx context.Context, tx pgx.Tx, id int64) (int, map[stri
 		return 409, map[string]any{"error": "cleanup maintenance gate unavailable or active"}
 	}
 	var bad int
-	err := tx.QueryRow(ctx, `SELECT count(*) FROM nas_cleanup_items WHERE plan_id=$1 AND (state<>'would_delete' OR proof IS NULL OR updated_at<now()-interval '24 hours' OR recovery NOT IN ('r2_sha_verified','r2_md5_etag_matched') OR coalesce(recovery_evidence->>'etag','')='')`, id).Scan(&bad)
+	err := tx.QueryRow(ctx, `SELECT count(*) FROM nas_cleanup_items i WHERE plan_id=$1 AND
+ (state<>'would_delete' OR proof IS NULL OR updated_at<now()-interval '24 hours' OR
+  CASE WHEN i.item->>'permit_reason'=$2 THEN
+   recovery<>$3 OR proof->'stitch_replacement' IS NULL
+    OR proof->'stitch_replacement' IS DISTINCT FROM i.item->'stitch_certificate'->'output'
+  ELSE recovery NOT IN ('r2_sha_verified','r2_md5_etag_matched') OR coalesce(recovery_evidence->>'etag','')='' END)`,
+		id, nasCleanupCertifiedStitchReason, nasCleanupCertifiedStitchRecovery).Scan(&bad)
 	if err != nil || bad != 0 {
-		return 409, map[string]any{"error": "fresh complete dry run with a verified R2 recovery copy (and its ETag evidence) for every item required"}
+		return 409, map[string]any{"error": "fresh complete dry run with a verified R2 recovery copy or exact certified NAS replacement for every item required"}
 	}
 	// Under the exclusive public cleanup fence, so two concurrent enables are
 	// serialized and the second sees the first.
@@ -989,8 +996,9 @@ func (s *Server) cleanupPrefetchRecovery(ctx context.Context, cid int64, md5s ma
  CASE WHEN m.item->>'kind'='raw' THEN coalesce((SELECT lower(btrim(btrim(c.etag),'"')) FROM recording_clips c WHERE c.id=(m.item->>'source_id')::bigint),'') ELSE '' END
  FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id CROSS JOIN LATERAL (SELECT coalesce(i.item,p.manifest->(i.ordinal-1)) item) m
  WHERE i.id=ANY($1) AND p.connection_id=$2 AND
+ coalesce(m.item->>'permit_reason','')<>$3 AND
  (i.state='leased' AND p.mode IN ('dry_run','enabled') OR
-  i.state='would_delete' AND p.mode='dry_run' AND i.recovery='r2_present_unverified' AND NOT i.delete_ever_issued)`, ids, cid)
+  i.state='would_delete' AND p.mode='dry_run' AND i.recovery='r2_present_unverified' AND NOT i.delete_ever_issued)`, ids, cid, nasCleanupCertifiedStitchReason)
 	if err != nil {
 		log.Printf("nas cleanup recovery prefetch: %v", err)
 		return out

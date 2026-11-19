@@ -112,8 +112,8 @@ registration receipts after the server accepts its result. A second readiness
 ACK records `completed_no_retirement` and releases the lane. A lost ACK is
 reconciled from the SQLite FULL/WAL journal before new work.
 
-Every ordinary stitch retains its raw inputs. The API and client refuse
-stitch-derived deletion permits, including legacy registered results.
+NAS-local stitches retain their raw inputs. The API and client refuse
+legacy stitch deletion permits, including legacy registered results.
 Migration 0214 requires old stitch cleanup plans to be disabled and their
 issued permits to have expired before opening the local stitch lane.
 Preserve existing SQLite journals, outputs, ledgers and plans. Ordinary NAS
@@ -367,6 +367,36 @@ stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --apply \
   --conditional-delete-proof PROOF.json --expected-delete-proof-sha256 PROOF_SHA
 stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --reconcile
 ```
+
+### Release certified raw on the NAS
+
+The Durham producer always sends `retirement_held: true`. The connection-13
+certificate releases the exact inputs in the same transaction. The
+`nas_stitch_r2_certified_raw` view exposes that released set. Each clip maps
+to the certified output that contains it, including when an hour has several
+outputs.
+
+Keep the original files on the NAS through the controller's keep-28 R2 DELETE
+and confirming HEAD. After the exact reservation, intent, attempt, retirement
+receipt and absence event are durable, the clip appears in
+`nas_cleanup_certified_stitch_raw`. An unresolved R2 DELETE keeps the original
+on the NAS.
+
+Use `stoaramactl nas-cleanup prepare --input MANIFEST.json` with the usual
+label and items. Request `{"kind":"certified_stitch_raw","source_id":901}` for
+an exact eligible clip. The API derives the replacement proof and uses the
+existing dry run, plan approval, source freeze, delivery veto and deletion
+budget. NAS deletion also requires recorded staging absence for every output
+of the certified attempt. The NAS client reads and hashes the exact retained
+output before the permit and rechecks its open file and pathname immediately
+before unlinking the raw and sidecar. A missing or changed output keeps the raw.
+
+Apply 0219 with the NAS deletion master off. Verify the updated API and the
+exact `r2-copy-v7-certified-stitch` NAS client before arming an approved plan.
+Keep the ordinary R2 recovery verifier and its Jelly runner on ordinary
+plans. Certified plans use connection 13's replacement readback for their
+dry-run and deletion evidence. Pause issuance and drain live permits before
+rolling either side back.
 
 Provision the pinned x86 tools, bundle and corpus offline in the Durham
 guest. Verify execution of each pinned tool and the direct network
