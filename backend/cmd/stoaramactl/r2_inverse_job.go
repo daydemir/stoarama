@@ -74,7 +74,7 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string) {
 		total.Deleted += result.Deleted
 		total.Bytes += result.Bytes
 		total.WireAmbiguous = append(total.WireAmbiguous, result.WireAmbiguous...)
-		total.AmbiguousHeld = result.AmbiguousHeld
+		total.AmbiguousHeld, total.HeldAbsent = result.AmbiguousHeld, result.HeldAbsent
 		printInverseJob(map[string]any{"step": "batch", "batch": n, "result": result, "total": total, "error": errorText(err)})
 		if err != nil {
 			log.Fatal(err)

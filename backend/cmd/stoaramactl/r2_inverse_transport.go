@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -38,6 +39,37 @@ type inverseDeleteAuthority struct {
 	binding inverseDeleteBinding
 	guard   *inverseWireGuard
 	used    *atomic.Bool
+	gate    *inverseSendGate
+}
+
+// inverseSendGate closes when a batch hits a hard failure. A DELETE whose first
+// request byte is not yet written never sends after that; closing waits for a
+// first write already under way.
+type inverseSendGate struct {
+	mu     sync.RWMutex
+	closed bool
+}
+
+func (g *inverseSendGate) close() {
+	g.mu.Lock()
+	g.closed = true
+	g.mu.Unlock()
+}
+
+func (g *inverseSendGate) isClosed() bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.closed
+}
+
+// first runs a DELETE's first write unless the gate has closed.
+func (g *inverseSendGate) first(write func() (int, error)) (int, error) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if g.closed {
+		return 0, errInverseAdmissionClosed
+	}
+	return write()
 }
 
 func (a *inverseDeleteAuthority) requireWire(ctx context.Context, bucket, endpoint string) error {
@@ -109,7 +141,7 @@ func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverse
 	}
 	return nil
 }
-func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntry) (*inverseDeleteAuthority, error) {
+func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntry, gate *inverseSendGate) (*inverseDeleteAuthority, error) {
 	if a.opts.Lane != inverseOutsideKeep28 {
 		return nil, errors.New("B1 authority cannot authorize B2")
 	}
@@ -134,7 +166,7 @@ func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntr
 	if tag.RowsAffected() != 1 {
 		return nil, errors.New("inverse wire authority was already issued; reconcile only")
 	}
-	return &inverseDeleteAuthority{binding: binding, guard: guard, used: &atomic.Bool{}}, nil
+	return &inverseDeleteAuthority{binding: binding, guard: guard, used: &atomic.Bool{}, gate: gate}, nil
 }
 
 type inverseSDKStore struct {
@@ -184,7 +216,7 @@ func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDele
 	if !ok {
 		return errors.New("inverse DELETE needs the HTTP/1.1 transport template")
 	}
-	wire := &inverseWire{}
+	wire := &inverseWire{gate: authority.gate}
 	transport := &inverseDeleteTransport{base: wire.transport(template), authority: authority, bucket: s.Bucket(), endpoint: s.EndpointSHA256(), wire: wire}
 	_, err := s.sdk.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.Bucket()), Key: aws.String(authority.binding.Key)}, func(o *s3.Options) {
 		o.Retryer = aws.NopRetryer{}
@@ -207,6 +239,7 @@ var errInverseWireAmbiguous = errors.New("DELETE sent but no response; result un
 
 // inverseWire records what one DELETE's own connection did.
 type inverseWire struct {
+	gate                         *inverseSendGate
 	wrote, writeFailed, answered atomic.Bool
 }
 
@@ -228,7 +261,7 @@ func (w *inverseWire) transport(template *http.Transport) *http.Transport {
 		}
 		return &inverseWireConn{Conn: conn, wire: w}, nil
 	}
-	config := t.TLSClientConfig
+	config, handshake := t.TLSClientConfig, t.TLSHandshakeTimeout
 	t.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		raw, err := dial(ctx, network, addr)
 		if err != nil {
@@ -242,7 +275,9 @@ func (w *inverseWire) transport(template *http.Transport) *http.Transport {
 			}
 		}
 		conn := tls.Client(raw, c)
-		if err = conn.HandshakeContext(ctx); err != nil {
+		bounded, cancel := context.WithTimeout(ctx, handshake)
+		defer cancel()
+		if err = conn.HandshakeContext(bounded); err != nil {
 			raw.Close()
 			return nil, err
 		}
@@ -257,7 +292,14 @@ type inverseWireConn struct {
 }
 
 func (c *inverseWireConn) Write(p []byte) (int, error) {
-	n, err := c.Conn.Write(p)
+	write := func() (int, error) { return c.Conn.Write(p) }
+	var n int
+	var err error
+	if c.wire.wrote.Load() || c.wire.writeFailed.Load() {
+		n, err = write()
+	} else {
+		n, err = c.wire.gate.first(write)
+	}
 	if err != nil || n < len(p) {
 		c.wire.writeFailed.Store(true)
 	} else {

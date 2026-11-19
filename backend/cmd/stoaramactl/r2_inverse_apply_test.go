@@ -82,6 +82,9 @@ func (s *inverseFakeStore) deleteOnce(ctx context.Context, authority *inverseDel
 	if err := authority.requireWire(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
 		return err
 	}
+	if authority.gate.isClosed() {
+		return errInverseAdmissionClosed
+	}
 	if s.beforeDelete != nil {
 		if err := s.beforeDelete(key); err != nil {
 			return err
@@ -601,7 +604,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		admit, closeAdmission := context.WithCancel(ctx)
 		done := make(chan error, 1)
 		before := providerDeletes()
-		go func() { _, err := a.delete(ctx, admit, ctx, e); done <- err }()
+		go func() { _, err := a.delete(ctx, admit, &inverseSendGate{}, e); done <- err }()
 		deadline := time.Now().Add(10 * time.Second)
 		for {
 			var waiting bool
@@ -633,8 +636,8 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 	t.Run("closed_send_gate_stops_a_reserved_key_before_its_first_DELETE", func(t *testing.T) {
 		a, entries := build(1)
 		defer a.ledger.close()
-		closed, closeSend := context.WithCancel(ctx)
-		closeSend()
+		closed := &inverseSendGate{}
+		closed.close()
 		before := store.calls
 		_, err := a.delete(ctx, ctx, closed, entries[0])
 		var intents, attempts int
@@ -644,6 +647,33 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		// Reserved and authorized, never sent: the key stays held for good.
 		if !errors.Is(err, errInverseAdmissionClosed) || store.calls != before || intents != 1 || attempts != 1 {
 			t.Fatalf("send gate: err %v deletes %d intents %d attempts %d", err, store.calls-before, intents, attempts)
+		}
+	})
+	t.Run("send_gate_closed_after_authorize_stops_the_first_write", func(t *testing.T) {
+		// The gate closes while this DELETE is past every check and dialing:
+		// its first request byte is refused, so nothing reaches the provider.
+		a, entries := build(1)
+		defer a.ledger.close()
+		e := entries[0]
+		a.store = sdk
+		if _, err := a.reserve(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		gate := &inverseSendGate{}
+		authority, err := a.authorize(ctx, tx, e, gate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gate.close()
+		before := providerDeletes()
+		err = sdk.deleteOnce(ctx, authority)
+		if !errors.Is(err, errInverseAdmissionClosed) || errors.Is(err, errInverseWireAmbiguous) || providerDeletes() != before {
+			t.Fatalf("closed gate: %v deletes %d", err, providerDeletes()-before)
 		}
 	})
 	t.Run("delete_transport_never_speaks_HTTP2", func(t *testing.T) {
@@ -666,7 +696,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		tr := newInverseDeleteHTTPTransport()
 		tr.TLSClientConfig.RootCAs = x509.NewCertPool()
 		tr.TLSClientConfig.RootCAs.AddCert(server.Certificate())
-		for _, client := range []*http.Client{{Transport: tr}, {Transport: (&inverseWire{}).transport(tr)}} {
+		for _, client := range []*http.Client{{Transport: tr}, {Transport: (&inverseWire{gate: &inverseSendGate{}}).transport(tr)}} {
 			req, _ := http.NewRequest(http.MethodDelete, server.URL+"/stoarama/key", nil)
 			resp, err := client.Do(req)
 			if err != nil {
@@ -839,7 +869,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					return nil
 				}
 				before := store.calls
-				ok, err := a.delete(ctx, ctx, ctx, e)
+				ok, err := a.delete(ctx, ctx, &inverseSendGate{}, e)
 				store.beforeDelete = nil
 				if err != nil || !ok || store.calls != before+1 {
 					t.Fatalf("wire result %v %v", ok, err)
@@ -928,7 +958,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					t.Fatal(err)
 				}
 				done := make(chan error, 1)
-				go func() { _, err := a.delete(ctx, ctx, ctx, e); done <- err }()
+				go func() { _, err := a.delete(ctx, ctx, &inverseSendGate{}, e); done <- err }()
 				deadline := time.Now().Add(3 * time.Second)
 				for {
 					var held bool
@@ -1009,7 +1039,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 		done := make(chan error, 1)
-		go func() { _, err := a.delete(ctx, ctx, ctx, e); done <- err }()
+		go func() { _, err := a.delete(ctx, ctx, &inverseSendGate{}, e); done <- err }()
 		deadline := time.Now().Add(3 * time.Second)
 		for {
 			var waiting bool
@@ -1064,7 +1094,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				if err = stale.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1`, e.Key).Scan(&count); err != nil || count != 0 {
 					t.Fatal(count, err)
 				}
-				if _, err = a.delete(ctx, ctx, ctx, e); err != nil {
+				if _, err = a.delete(ctx, ctx, &inverseSendGate{}, e); err != nil {
 					t.Fatal(err)
 				}
 				_, err = stale.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`, e.Key)
@@ -1097,7 +1127,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 						exec(copyInsert, e.Key, "blocked", policy)
 						_, err = stale.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) SELECT 'raw',id,bucket,object_key,size_bytes,sha256,repeat('a',64) FROM recording_clips WHERE object_key=$1`, e.Key)
 					} else {
-						if _, err = a.delete(ctx, ctx, ctx, e); err != nil {
+						if _, err = a.delete(ctx, ctx, &inverseSendGate{}, e); err != nil {
 							t.Fatal(err)
 						}
 						_, err = stale.Exec(ctx, copyInsert, e.Key, admission, policy)
@@ -1383,11 +1413,11 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer tx.Rollback(ctx)
-				authority, err := a.authorize(ctx, tx, e)
+				authority, err := a.authorize(ctx, tx, e, &inverseSendGate{})
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err = a.authorize(ctx, tx, e); err == nil {
+				if _, err = a.authorize(ctx, tx, e, &inverseSendGate{}); err == nil {
 					t.Fatal("durable authority reminted")
 				}
 				before := providerDeletes()
@@ -1437,7 +1467,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					}
 					return nil
 				}
-				_, err := a.delete(timed, ctx, ctx, e)
+				_, err := a.delete(timed, ctx, &inverseSendGate{}, e)
 				cancel()
 				store.beforeHead = nil
 				if err == nil {
@@ -1635,14 +1665,58 @@ func (c failingWriteConn) Write(p []byte) (int, error) {
 // A lost response needs a request its connection accepted in full and no
 // response byte; a failed write never qualifies, even with nothing read back.
 func TestR2InverseWireLostNeedsAcceptedRequest(t *testing.T) {
-	sent := &inverseWire{}
+	sent := &inverseWire{gate: &inverseSendGate{}}
 	(&inverseWireConn{Conn: failingWriteConn{}, wire: sent}).Write([]byte("DELETE"))
-	failed := &inverseWire{}
+	failed := &inverseWire{gate: &inverseSendGate{}}
 	(&inverseWireConn{Conn: failingWriteConn{err: syscall.EPIPE}, wire: failed}).Write([]byte("DELETE"))
-	answered := &inverseWire{}
+	answered := &inverseWire{gate: &inverseSendGate{}}
 	(&inverseWireConn{Conn: failingWriteConn{}, wire: answered}).Write([]byte("DELETE"))
 	answered.answered.Store(true)
 	if !sent.lost() || failed.lost() || answered.lost() || (&inverseWire{}).lost() {
 		t.Fatalf("lost: sent %v failed %v answered %v unsent %v", sent.lost(), failed.lost(), answered.lost(), (&inverseWire{}).lost())
+	}
+}
+
+type blockingWriteConn struct {
+	net.Conn
+	release chan struct{}
+}
+
+func (c blockingWriteConn) Write(p []byte) (int, error) {
+	<-c.release
+	return len(p), nil
+}
+
+// Closing the gate waits for a first write already under way, and refuses one
+// that has not started.
+func TestR2InverseSendGateOrdersFirstWrites(t *testing.T) {
+	gate := &inverseSendGate{}
+	release := make(chan struct{})
+	under := &inverseWire{gate: gate}
+	wrote := make(chan error, 1)
+	go func() {
+		_, err := (&inverseWireConn{Conn: blockingWriteConn{release: release}, wire: under}).Write([]byte("DELETE"))
+		wrote <- err
+	}()
+	// Wait until the first write holds the gate.
+	for gate.mu.TryLock() {
+		gate.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	closed := make(chan struct{})
+	go func() { gate.close(); close(closed) }()
+	select {
+	case <-closed:
+		t.Fatal("gate closed under a first write in progress")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	<-closed
+	if err := <-wrote; err != nil || !under.wrote.Load() {
+		t.Fatalf("first write under way: %v", err)
+	}
+	late := &inverseWire{gate: gate}
+	if _, err := (&inverseWireConn{Conn: failingWriteConn{}, wire: late}).Write([]byte("DELETE")); !errors.Is(err, errInverseAdmissionClosed) || late.lost() {
+		t.Fatalf("first write after close: %v", err)
 	}
 }

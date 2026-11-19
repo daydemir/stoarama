@@ -393,7 +393,7 @@ var errInverseAdmissionClosed = errors.New("batch stopped before this key was re
 // reserved, or still waiting on its reservation locks, writes nothing and stops.
 // send closes on a hard failure only: a reserved key then stops before its
 // first DELETE and stays held. A DELETE already sent finishes confirmation.
-func (a *inverseApplier) delete(ctx, admit, send context.Context, e inverseEntry) (bool, error) {
+func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGate, e inverseEntry) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, inverseNetworkTimeout)
 	defer cancel()
 	if admit.Err() != nil {
@@ -425,7 +425,7 @@ func (a *inverseApplier) delete(ctx, admit, send context.Context, e inverseEntry
 			return false, authErr
 		}
 		defer authority.cancel()
-		if send.Err() != nil {
+		if send.isClosed() {
 			return false, errInverseAdmissionClosed
 		}
 		ctx = authority.ctx
@@ -439,11 +439,11 @@ func (a *inverseApplier) delete(ctx, admit, send context.Context, e inverseEntry
 			ctx = confirming
 		}
 	} else {
-		authority, authErr := a.authorize(ctx, tx, e)
+		authority, authErr := a.authorize(ctx, tx, e, send)
 		if authErr != nil {
 			return false, authErr
 		}
-		if send.Err() != nil {
+		if send.isClosed() {
 			return false, errInverseAdmissionClosed
 		}
 		err = a.store.(inverseDeleteStore).deleteOnce(ctx, authority)
@@ -795,8 +795,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	// would strand DELETEs the provider may already have taken.
 	stop, halt := context.WithCancel(ctx)
 	defer halt()
-	send, haltSends := context.WithCancel(ctx)
-	defer haltSends()
+	send := &inverseSendGate{}
 	queue := make(chan inverseEntry)
 	var wg sync.WaitGroup
 	var first error
@@ -835,7 +834,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 					}
 					mu.Unlock()
 					if !wire {
-						haltSends()
+						send.close()
 					}
 					halt()
 					return
