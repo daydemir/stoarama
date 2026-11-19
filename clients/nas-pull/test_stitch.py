@@ -338,8 +338,11 @@ class StitchIntegrationTests(unittest.TestCase):
 
         def change_before_repair(*args):
             body = bytearray(raw.read_bytes())
-            body[-1] ^= 1
+            body[44] ^= 1
             raw.write_bytes(body)
+            # Model an unchanged inode stat snapshot so the exact bounded
+            # byte check must catch the altered signature.
+            args[0]["frozen_identity"] = pull.cleanup_identity(raw.stat())
             return repair(*args)
 
         with mock.patch.object(pull, "stitch_repair_local", side_effect=change_before_repair):
@@ -367,13 +370,16 @@ class StitchIntegrationTests(unittest.TestCase):
             with self.assertRaisesRegex(pull.StitchResourceHold, "space fixture"):
                 self.build()
 
-    def test_stable_source_hardlink_is_task_data(self):
-        raw = self.cfg.output_dir / self.clips[0]["relative_path"]
-        alias = raw.with_name("alias.mp4")
-        os.link(raw, alias)
-        with self.assertRaises(pull.CleanupSourceDataError):
-            self.build()
-        self.assertEqual(raw.stat().st_nlink, 2)
+    def test_stable_source_hardlink_is_task_data_in_runs_and_repairs(self):
+        for clip in (self.clips[0], self.clips[2]):
+            with self.subTest(clip=clip["source_id"]):
+                raw = self.cfg.output_dir / clip["relative_path"]
+                alias = raw.with_name("alias.mp4")
+                os.link(raw, alias)
+                with self.assertRaises(pull.CleanupSourceDataError):
+                    self.build()
+                self.assertEqual(raw.stat().st_nlink, 2)
+                alias.unlink()
 
     def test_stitch_register_never_permits_local_raw_deletion(self):
         result=self.build()

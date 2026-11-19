@@ -2759,7 +2759,7 @@ class CleanupFile:
             opened = os.fstat(fd)
             if (not stat_module.S_ISREG(current.st_mode) or current.st_nlink != 1 or opened.st_nlink != 1
                     or cleanup_identity(current) != frozen or cleanup_identity(opened) != frozen):
-                raise RuntimeError("cleanup file identity changed")
+                raise MediaCertificationResourceError("cleanup file identity changed")
 
     def proof(self):
         started = time.monotonic()
@@ -48496,17 +48496,18 @@ def stitch_repair_annexb(nals, drop_vcl=0, upto=None):
     return b''.join(b'\x00\x00\x00\x01' + n for n in nals[:end]), len(vcl) - drop_vcl
 
 
-def stitch_repair_local(clip, source, directory, stage_file, tools, deadline, stop):
+def stitch_repair_local(clip, directory, stage_file, tools, deadline, stop):
     """Labeled partial recovery, always excluded from raw retirement/V85 joins."""
     if clip["size_bytes"] > 16 * 1024 * 1024:
         return None
-    with open(source, "rb") as f:
-        head = f.read(48)
-        if not stitch_repair_signature(head):
-            return None
-        data = head + f.read(16 * 1024 * 1024)
+    with CleanupFile(directory.cfg, clip, stop, deadline) as current:
+        with os.fdopen(current.files[0][1], "rb", closefd=False) as source:
+            data = source.read(clip["size_bytes"] + 1)
+        current.check_paths()
     if len(data) != clip["size_bytes"] or hashlib.sha256(data).hexdigest() != clip["sha256"]:
         raise MediaCertificationResourceError("repair input differs from frozen source")
+    if not stitch_repair_signature(data[:48]):
+        return None
     nals, stopmsg, gaps, gap_indices = stitch_repair_mdat(data)
     del data
     sps = next((n for n in nals if n[0] & 0x1f == 7), None)
@@ -48801,7 +48802,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                 if kind is StitchRunKind.PROOF:
                     raise StitchHold("proof source is ineligible")
                 flush()
-                repaired = stitch_repair_local(clip, path, directory, stage_file, tools, deadline, stop)
+                repaired = stitch_repair_local(clip, directory, stage_file, tools, deadline, stop)
                 if repaired:
                     result["repairs"].append(repaired)
                 result["left_out"].append(clip["source_id"])
@@ -48814,7 +48815,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                 if kind is StitchRunKind.PROOF or stop.is_set():
                     raise
                 flush()
-                repaired = stitch_repair_local(clip, path, directory, stage_file, tools, deadline, stop)
+                repaired = stitch_repair_local(clip, directory, stage_file, tools, deadline, stop)
                 if repaired:
                     result["repairs"].append(repaired)
                 result["left_out"].append(clip["source_id"])
