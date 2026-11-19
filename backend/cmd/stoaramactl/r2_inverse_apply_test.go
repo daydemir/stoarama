@@ -1711,6 +1711,72 @@ func TestR2InverseWireZeroByteWriteIsNotLost(t *testing.T) {
 	}
 }
 
+// lateWriteConn resumes a write only after the wire deadline has passed.
+type lateWriteConn struct {
+	net.Conn
+	until time.Time
+}
+
+func (c lateWriteConn) Write(p []byte) (int, error) {
+	time.Sleep(time.Until(c.until) + 20*time.Millisecond)
+	return c.Conn.Write(p)
+}
+
+// deadlineBlindConn ignores socket deadlines, as a wrapped conn might.
+type deadlineBlindConn struct{ net.Conn }
+
+func (deadlineBlindConn) SetWriteDeadline(time.Time) error { return nil }
+
+// No first request byte leaves at or after the wire deadline: a write that
+// starts late is refused even by a conn blind to deadlines, and one that
+// stalls past it is refused by the socket. Neither wrote, so neither is a
+// lost response.
+func TestR2InverseWireDeadlineRefusesFirstByte(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	for _, stalled := range []bool{false, true} {
+		client, err := net.Dial("tcp", listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		server, err := listener.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire := &inverseWire{gate: &inverseSendGate{}, deadline: time.Now().Add(-time.Millisecond)}
+		var conn net.Conn = deadlineBlindConn{client}
+		if stalled {
+			wire.deadline = time.Now().Add(100 * time.Millisecond)
+			conn = lateWriteConn{Conn: client, until: wire.deadline}
+		}
+		_, writeErr := wire.track(conn).Write([]byte("DELETE /stoarama/key HTTP/1.1\r\n\r\n"))
+		client.Close()
+		received, _ := io.ReadAll(server)
+		server.Close()
+		if writeErr == nil || len(received) != 0 || wire.wrote.Load() || wire.lost() {
+			t.Fatalf("stalled=%v: %v, server received %q", stalled, writeErr, received)
+		}
+	}
+}
+
+// The job holds only the very keys the executor reports: equal counts with a
+// different held key stop it.
+func TestR2InverseJobReadbackComparesHeldKeys(t *testing.T) {
+	lost := fmt.Errorf("%w: test", errInverseWireAmbiguous)
+	result := inverseApplySummary{Deleted: 1, Bytes: 100, WireAmbiguous: []string{"managed/a"}}
+	readback := inverseBatchReadback{Intents: 2, Absent: 1, AbsentBytes: 100, Attempts: 2, Unresolved: []string{"managed/a"}}
+	if done, err := readback.settle(result, lost); err != nil || done {
+		t.Fatalf("matching readback: %v %v", done, err)
+	}
+	readback.Unresolved = []string{"managed/b"}
+	if _, err := readback.settle(result, lost); err == nil || !strings.Contains(err.Error(), "evidence differs") {
+		t.Fatalf("different held key continued the job: %v", err)
+	}
+}
+
 type blockingWriteConn struct {
 	net.Conn
 	release chan struct{}

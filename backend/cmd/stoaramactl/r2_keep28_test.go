@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/daydemir/stoarama/backend/internal/api"
+	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/jackc/pgx/v5"
@@ -14,7 +15,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -730,5 +733,201 @@ func TestKeep28JobBatchHoldsOnlyTheLostKey(t *testing.T) {
 	done, second, err := runInverseJobBatch(f.ctx, f.pool, f.sdk, f.options, owner, filepath.Join(dir, "evidence-2.json"))
 	if err != nil || !done || second.Deleted != 0 || second.AmbiguousHeld != 1 || !slices.Equal(second.HeldAbsent, []string{f.key}) || f.deletes() != 4 {
 		t.Fatalf("next batch: done %v %+v %v deletes=%d", done, second, err, f.deletes())
+	}
+}
+
+// stallConn holds a DELETE's connection where a slow writer could resume after
+// custody expiry. It counts only the bytes its socket accepted, and its Close
+// waits for a write under way so HTTP cancellation cannot win that race.
+type stallConn struct {
+	net.Conn
+	stall   func()
+	sent    *atomic.Int64
+	writing sync.Mutex
+}
+
+func (c *stallConn) Write(p []byte) (int, error) {
+	c.writing.Lock()
+	defer c.writing.Unlock()
+	c.stall()
+	n, err := c.Conn.Write(p)
+	c.sent.Add(int64(n))
+	return n, err
+}
+func (c *stallConn) Close() error {
+	c.writing.Lock()
+	defer c.writing.Unlock()
+	return c.Conn.Close()
+}
+
+// A writer that resumes after custody expiry sends no request byte: neither
+// one paused after acquiring its connection nor one paused inside its write.
+func TestKeep28FirstByteNeverLeavesAfterCustody(t *testing.T) {
+	for _, pause := range []string{"after_connection", "inside_write"} {
+		t.Run(pause, func(t *testing.T) {
+			f := newKeep28Fixture(t)
+			if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '23 hours 59 minutes 57 seconds',server_received_at=clock_timestamp()`); err != nil {
+				t.Fatal(err)
+			}
+			_, auth := f.keep28Authorized(t, f.applier(t), &inverseSendGate{})
+			// The request deadline never outlives the authority's custody bound.
+			expired := func() { <-auth.ctx.Done(); time.Sleep(50 * time.Millisecond) }
+			var sent atomic.Int64
+			var once sync.Once
+			template := newInverseDeleteHTTPTransport()
+			dial := template.DialContext
+			template.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				conn, err := dial(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				stall := func() {}
+				if pause == "inside_write" {
+					stall = func() { once.Do(expired) }
+				}
+				return &stallConn{Conn: conn, stall: stall, sent: &sent}, nil
+			}
+			original := f.sdk.transport
+			f.sdk.transport = template
+			defer func() { f.sdk.transport = original }()
+			ctx := auth.ctx
+			if pause == "after_connection" {
+				ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: func(httptrace.GotConnInfo) { expired() }})
+			}
+			err := f.sdk.deleteOnce(ctx, auth)
+			if err == nil || errors.Is(err, errInverseWireAmbiguous) || sent.Load() != 0 || f.deletes() != 0 {
+				t.Fatalf("%s: %v, %d request bytes accepted, deletes=%d", pause, err, sent.Load(), f.deletes())
+			}
+		})
+	}
+}
+
+// readRacesCancelConn cancels the DELETE as its first response bytes arrive
+// and returns them only after the round trip has given up on cancellation.
+type readRacesCancelConn struct {
+	net.Conn
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (c *readRacesCancelConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.once.Do(func() { c.cancel(); time.Sleep(200 * time.Millisecond) })
+	}
+	return n, err
+}
+
+// A 503 whose bytes the socket delivered as cancellation ended the round trip
+// is a hard failure, never a hold-only lost response.
+func TestKeep28ResponseRacingCancellationIsAHardFailure(t *testing.T) {
+	f := newKeep28Fixture(t)
+	f.setWire(map[string]string{f.key: "503"}, nil)
+	_, auth := f.keep28Authorized(t, f.applier(t), &inverseSendGate{})
+	ctx, cancel := context.WithCancel(auth.ctx)
+	defer cancel()
+	template := newInverseDeleteHTTPTransport()
+	dial := template.DialContext
+	template.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &readRacesCancelConn{Conn: conn, cancel: cancel}, nil
+	}
+	original := f.sdk.transport
+	f.sdk.transport = template
+	defer func() { f.sdk.transport = original }()
+	err := f.sdk.deleteOnce(ctx, auth)
+	if err == nil || errors.Is(err, errInverseWireAmbiguous) || f.deletes() != 1 {
+		t.Fatalf("answered DELETE: %v deletes=%d", err, f.deletes())
+	}
+}
+
+// Absence publication resolves the exact intended source: once the clip's
+// parent recording names another stream, it commits no receipt, no absent
+// event and no purge; the unchanged source publishes.
+func TestKeep28PublishAbsentRefusesChangedParentStream(t *testing.T) {
+	f := newKeep28Fixture(t)
+	a := f.applier(t)
+	e := f.entry()
+	if _, err := a.reserve(f.ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	outcome := func() (receipts, events int, purged bool) {
+		t.Helper()
+		if err := f.pool.QueryRow(f.ctx, `SELECT (SELECT count(*) FROM r2_object_retirements WHERE object_key=$1),(SELECT count(*) FROM r2_keep28_events WHERE object_key=$1),(SELECT purged_at IS NOT NULL FROM recording_clips WHERE object_key=$1)`, f.key).Scan(&receipts, &events, &purged); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if _, err := f.pool.Exec(f.ctx, `UPDATE recordings SET stream_id=NULL WHERE id=30`); err != nil {
+		t.Fatal(err)
+	}
+	err := a.publishAbsent(f.ctx, e, a.opts.ManifestSHA)
+	if receipts, events, purged := outcome(); err == nil || !strings.Contains(err.Error(), "exact source") || receipts != 0 || events != 0 || purged {
+		t.Fatalf("changed stream published: %v receipts %d events %d purged %v", err, receipts, events, purged)
+	}
+	if _, err = f.pool.Exec(f.ctx, `UPDATE recordings SET stream_id=3 WHERE id=30`); err != nil {
+		t.Fatal(err)
+	}
+	err = a.publishAbsent(f.ctx, e, a.opts.ManifestSHA)
+	if receipts, events, purged := outcome(); err != nil || receipts != 1 || events != 1 || !purged {
+		t.Fatalf("exact source: %v receipts %d events %d purged %v", err, receipts, events, purged)
+	}
+}
+
+// job-keep28 dispatches to the keep-28 limits: a 100-object default batch and
+// no run without explicit per-batch and rolling 24h byte limits. An oversized
+// worker pool stops before any work directory, partition or evidence exists.
+func TestKeep28JobCLIDispatchAndLimits(t *testing.T) {
+	if args := os.Getenv("STOARAMA_TEST_R2_INVERSE_ARGS"); args != "" {
+		runR2Inverse(context.Background(), config.Config{DatabaseURL: os.Getenv("STOARAMA_TEST_DATABASE_URL")}, strings.Split(args, "\n"))
+		t.Fatal("r2-inverse returned without stopping")
+	}
+	raw, err := parseInverseJobFlags([]string{"--picks", "p", "--expected-picks-sha256", strings.Repeat("a", 64), "--owner-decision", "o", "--work", "w"}, inverseOutsideKeep28)
+	if err != nil || raw.items != 5000 || raw.maxBytes != 1<<40 || raw.budget24h != 0 {
+		t.Fatalf("RAW job defaults changed: %+v %v", raw, err)
+	}
+	dir := t.TempDir()
+	picks := filepath.Join(dir, "picks.json")
+	if err = os.WriteFile(picks, []byte(`{"choices":{}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	digest, _ := inverseFileSHA(picks)
+	work := filepath.Join(dir, "work")
+	base := []string{"--picks", picks, "--expected-picks-sha256", digest, "--owner-decision", "owner.md", "--work", work}
+	keep28, err := parseInverseJobFlags(append(base, "--max-bytes", "10000", "--budget-24h-bytes", "0"), inverseNASKeep28)
+	if err != nil || keep28.items != 100 || keep28.maxBytes != 10000 || keep28.budget24h != 0 {
+		t.Fatalf("keep-28 job defaults: %+v %v", keep28, err)
+	}
+	run := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command(os.Args[0], "-test.run=^TestKeep28JobCLIDispatchAndLimits$")
+		cmd.Env = append(os.Environ(), "STOARAMA_TEST_R2_INVERSE_ARGS="+strings.Join(args, "\n"))
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatalf("%v ran: %s", args, output)
+		}
+		if _, statErr := os.Stat(work); !os.IsNotExist(statErr) {
+			t.Fatalf("%v created its work directory before refusing: %s", args, output)
+		}
+		return string(output)
+	}
+	for _, missing := range [][]string{{}, {"--max-bytes", "10000"}, {"--budget-24h-bytes", "0"}} {
+		if out := run(append(append([]string{"job-keep28"}, base...), missing...)...); !strings.Contains(out, "job-keep28 requires --max-bytes and --budget-24h-bytes") {
+			t.Fatalf("job-keep28 %v: %s", missing, out)
+		}
+	}
+	if os.Getenv("STOARAMA_TEST_DATABASE_URL") == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL for the worker capacity check")
+	}
+	// The same arguments pass RAW parsing and reach the capacity check:
+	// dispatch, not the flags, chose the keep-28 limits.
+	if out := run(append(append([]string{"job"}, base...), "--workers", "19")...); !strings.Contains(out, "workers exceed database capacity") {
+		t.Fatalf("RAW job: %s", out)
+	}
+	if out := run(append(append([]string{"job-keep28"}, base...), "--max-bytes", "10000", "--budget-24h-bytes", "0", "--workers", "19")...); !strings.Contains(out, "workers exceed database capacity") {
+		t.Fatalf("oversized workers: %s", out)
 	}
 }

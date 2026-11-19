@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -24,44 +25,40 @@ import (
 // the lane's own tables. A DELETE that lost its response holds only its own
 // key, permanently. Any other failure stops the job; nothing is retried.
 func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane inverseLane) {
-	fs := flag.NewFlagSet("r2-inverse job", flag.ExitOnError)
-	picks := fs.String("picks", "", "owner picks")
-	picksSHA := fs.String("expected-picks-sha256", "", "independently approved owner picks digest")
-	owner := fs.String("owner-decision", "", "owner decision record pinned by the executor")
-	work := fs.String("work", "", "new working directory")
-	workers := fs.Int("workers", 16, "concurrent keys per batch")
-	items := fs.Int("max-items", 5000, "maximum new objects per batch")
-	maxBytes := fs.Int64("max-bytes", 1<<40, "maximum new intent bytes per batch")
-	batches := fs.Int("batches", 1, "maximum batches")
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *picks == "" || !r2RetireLowerHex64(*picksSHA) || *owner == "" || *work == "" || *items < 1 || *maxBytes <= 0 || *batches < 1 {
-		log.Fatal("usage: stoaramactl r2-inverse job|job-keep28 --picks FILE --expected-picks-sha256 HEX --owner-decision FILE --work DIR [--workers N --max-items N --max-bytes N --batches N]")
+	f, err := parseInverseJobFlags(args, lane)
+	if err != nil {
+		log.Fatal(err)
 	}
 	// The partition and every apply check derive from this file, so it must be
 	// the owner-approved picks, pinned independently of the file itself.
-	if digest, err := inverseFileSHA(*picks); err != nil || digest != *picksSHA {
+	if digest, err := inverseFileSHA(f.picks); err != nil || digest != f.picksSHA {
 		log.Fatal("owner picks differ from the approved digest")
 	}
-	if err := os.Mkdir(*work, 0700); err != nil {
+	pool := mustOpenPool(ctx, cfg)
+	defer pool.Close()
+	// Refuse an oversized worker pool before any partition or evidence exists.
+	if err = inverseWorkersFit(pool, f.workers); err != nil {
 		log.Fatal(err)
 	}
-	partition := filepath.Join(*work, "partition")
-	sum, err := writeInversePartition(ctx, cfg, *picks, partition)
+	if err = os.Mkdir(f.work, 0700); err != nil {
+		log.Fatal(err)
+	}
+	partition := filepath.Join(f.work, "partition")
+	sum, err := writeInversePartition(ctx, cfg, f.picks, partition)
 	if err != nil {
 		log.Fatal(err)
 	}
 	// Bind the approved digest to the bytes the partition actually read; every
 	// apply re-reads the picks file and must match this summary digest.
-	if sum.PicksSHA256 != *picksSHA {
+	if sum.PicksSHA256 != f.picksSHA {
 		log.Fatal("partition read owner picks other than the approved digest")
 	}
 	printInverseJob(map[string]any{"step": "partition", "summary": sum})
-	pool := mustOpenPool(ctx, cfg)
-	defer pool.Close()
 	store, err := newInverseSDKStore(ctx, archiveR2Config(cfg, pool))
 	if err != nil {
 		log.Fatal(err)
 	}
-	o := inverseApplyOptions{Lane: lane, Manifest: filepath.Join(partition, "partition.jsonl"), Summary: filepath.Join(partition, "summary.json"), Picks: *picks, Ledger: filepath.Join(*work, "ledger.jsonl"), Workers: *workers, MaxItems: *items, MaxBytes: *maxBytes}
+	o := inverseApplyOptions{Lane: lane, Manifest: filepath.Join(partition, "partition.jsonl"), Summary: filepath.Join(partition, "summary.json"), Picks: f.picks, Ledger: filepath.Join(f.work, "ledger.jsonl"), Workers: f.workers, MaxItems: f.items, MaxBytes: f.maxBytes, Budget24h: f.budget24h}
 	if o.ManifestSHA, err = inverseFileSHA(o.Manifest); err != nil {
 		log.Fatal(err)
 	}
@@ -69,8 +66,8 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane
 		log.Fatal(err)
 	}
 	total := inverseApplySummary{}
-	for n := 1; n <= *batches; n++ {
-		done, result, err := runInverseJobBatch(ctx, pool, store, o, *owner, filepath.Join(*work, fmt.Sprintf("evidence-%03d.json", n)))
+	for n := 1; n <= f.batches; n++ {
+		done, result, err := runInverseJobBatch(ctx, pool, store, o, f.owner, filepath.Join(f.work, fmt.Sprintf("evidence-%03d.json", n)))
 		total.Deleted += result.Deleted
 		total.Bytes += result.Bytes
 		total.WireAmbiguous = append(total.WireAmbiguous, result.WireAmbiguous...)
@@ -87,6 +84,40 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane
 	printInverseJob(map[string]any{"step": "batch_limit", "total": total})
 }
 
+type inverseJobFlags struct {
+	picks, picksSHA, owner, work string
+	workers, items, batches      int
+	maxBytes, budget24h          int64
+}
+
+const inverseJobUsage = "usage: stoaramactl r2-inverse job|job-keep28 --picks FILE --expected-picks-sha256 HEX --owner-decision FILE --work DIR [--workers N --max-items N --max-bytes N --budget-24h-bytes N --batches N]; job-keep28 requires --max-bytes and --budget-24h-bytes"
+
+// parseInverseJobFlags reads job flags. RAW keeps its large batches and no
+// rolling budget. Keep-28 defaults to the 100-object canary batch and runs only
+// with an explicit per-batch byte cap and rolling 24h budget (0 = unlimited).
+func parseInverseJobFlags(args []string, lane inverseLane) (inverseJobFlags, error) {
+	f := inverseJobFlags{}
+	items, maxBytes, budget := 5000, int64(1<<40), int64(0)
+	if lane == inverseNASKeep28 {
+		items, maxBytes, budget = 100, 0, -1
+	}
+	fs := flag.NewFlagSet("r2-inverse job", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.StringVar(&f.picks, "picks", "", "owner picks")
+	fs.StringVar(&f.picksSHA, "expected-picks-sha256", "", "independently approved owner picks digest")
+	fs.StringVar(&f.owner, "owner-decision", "", "owner decision record pinned by the executor")
+	fs.StringVar(&f.work, "work", "", "new working directory")
+	fs.IntVar(&f.workers, "workers", 16, "concurrent keys per batch (1..64, at least two DB connections remain reserved)")
+	fs.IntVar(&f.items, "max-items", items, "maximum new objects per batch")
+	fs.Int64Var(&f.maxBytes, "max-bytes", maxBytes, "maximum new intent bytes per batch")
+	fs.Int64Var(&f.budget24h, "budget-24h-bytes", budget, "maximum charged bytes in previous 24h (0 = unlimited)")
+	fs.IntVar(&f.batches, "batches", 1, "maximum batches")
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || f.picks == "" || !r2RetireLowerHex64(f.picksSHA) || f.owner == "" || f.work == "" || f.workers < 1 || f.workers > 64 || f.items < 1 || f.maxBytes <= 0 || f.budget24h < 0 || f.batches < 1 {
+		return f, errors.New(inverseJobUsage)
+	}
+	return f, nil
+}
+
 // runInverseJobBatch runs one bounded apply batch. It reports done when a clean
 // batch selected nothing. Unresolved intents from earlier batches stay held;
 // the executor's startup stops if one that never reached the wire is gone. A
@@ -101,34 +132,48 @@ func runInverseJobBatch(ctx context.Context, pool *pgxpool.Pool, store inverseDe
 	o.DrainEvidence = evidencePath
 	result, applyErr := applyInverse(ctx, pool, store, o)
 	// Read this batch's durable outcomes on every path, including a failed one.
-	var n, absent, absentBytes, attempts int64
-	unresolved := []string{}
+	r := inverseBatchReadback{Unresolved: []string{}}
 	if err = pool.QueryRow(ctx, `SELECT count(*),count(v.object_key),coalesce(sum(i.size_bytes) FILTER (WHERE v.object_key IS NOT NULL),0),count(a.object_key),
  coalesce(array_agg(i.object_key ORDER BY i.object_key) FILTER (WHERE v.object_key IS NULL),'{}')
  FROM `+o.Lane.intentTable()+` i
  LEFT JOIN `+o.Lane.eventTable()+` v ON v.bucket=i.bucket AND v.object_key=i.object_key AND v.event='absent'
  LEFT JOIN `+o.Lane.attemptTable()+` a ON a.bucket=i.bucket AND a.object_key=i.object_key
- WHERE i.bucket=$1 AND i.drain_evidence_sha256=$2`, store.Bucket(), o.DrainSHA).Scan(&n, &absent, &absentBytes, &attempts, &unresolved); err != nil {
+ WHERE i.bucket=$1 AND i.drain_evidence_sha256=$2`, store.Bucket(), o.DrainSHA).Scan(&r.Intents, &r.Absent, &r.AbsentBytes, &r.Attempts, &r.Unresolved); err != nil {
 		return false, result, errors.Join(applyErr, err)
 	}
 	// Compare key sets in one byte order; the database orders by its collation.
-	sort.Strings(unresolved)
-	printInverseJob(map[string]any{"step": "readback", "evidence_sha256": o.DrainSHA, "intents": n, "absent": absent, "absent_bytes": absentBytes, "attempts": attempts, "unresolved": unresolved})
+	sort.Strings(r.Unresolved)
+	printInverseJob(map[string]any{"step": "readback", "evidence_sha256": o.DrainSHA, "intents": r.Intents, "absent": r.Absent, "absent_bytes": r.AbsentBytes, "attempts": r.Attempts, "unresolved": r.Unresolved})
+	done, err := r.settle(result, applyErr)
+	return done, result, err
+}
+
+// inverseBatchReadback is one batch's durable outcome, read from the lane's
+// tables by the batch's own evidence digest.
+type inverseBatchReadback struct {
+	Intents, Absent, AbsentBytes, Attempts int64
+	Unresolved                             []string
+}
+
+// settle accepts a batch only when the database proves exactly what the
+// executor reports: every absence and byte, an attempt per intent, and the very
+// keys it holds as lost responses, not just as many of them.
+func (r inverseBatchReadback) settle(result inverseApplySummary, applyErr error) (bool, error) {
 	wire := errors.Is(applyErr, errInverseWireAmbiguous)
 	if applyErr != nil && !wire {
-		return false, result, applyErr
+		return false, applyErr
 	}
-	if absent != result.Deleted || absentBytes != result.Bytes || attempts != n || !slices.Equal(unresolved, result.WireAmbiguous) {
-		return false, result, fmt.Errorf("database batch evidence differs: intents %d absent %d bytes %d attempts %d unresolved %v", n, absent, absentBytes, attempts, unresolved)
+	if r.Absent != result.Deleted || r.AbsentBytes != result.Bytes || r.Attempts != r.Intents || !slices.Equal(r.Unresolved, result.WireAmbiguous) {
+		return false, fmt.Errorf("database batch evidence differs: intents %d absent %d bytes %d attempts %d unresolved %v", r.Intents, r.Absent, r.AbsentBytes, r.Attempts, r.Unresolved)
 	}
 	if wire {
 		if result.Deleted == 0 {
-			return false, result, applyErr
+			return false, applyErr
 		}
-		printInverseJob(map[string]any{"step": "wire_ambiguous", "held": unresolved, "error": applyErr.Error()})
-		return false, result, nil
+		printInverseJob(map[string]any{"step": "wire_ambiguous", "held": r.Unresolved, "error": applyErr.Error()})
+		return false, nil
 	}
-	return result.Deleted == 0, result, nil
+	return result.Deleted == 0, nil
 }
 
 // writeInverseOwnerEvidence writes owner-fence evidence observed now from the

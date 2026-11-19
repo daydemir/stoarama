@@ -450,7 +450,10 @@ func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGat
 		return false, errInverseAdmissionClosed
 	}
 	if err = a.store.(inverseDeleteStore).deleteOnce(authority.ctx, authority); err != nil {
-		return false, fmt.Errorf("single DELETE result ambiguous; intent retained, never retransmit: %w", err)
+		if errors.Is(err, errInverseWireAmbiguous) {
+			return false, fmt.Errorf("single DELETE result ambiguous; intent retained, never retransmit: %w", err)
+		}
+		return false, fmt.Errorf("single DELETE failed; intent retained, never retransmit: %w", err)
 	}
 	// Confirmation runs inside what is left of the authority's bound.
 	ctx, stop, err := authority.bound(authority.ctx)
@@ -566,6 +569,16 @@ func runR2InverseLane(ctx context.Context, cfg config.Config, args []string, lan
 	}
 }
 
+// inverseWorkersFit keeps one session connection and one independent issuance
+// connection available even when every worker owns a transaction or waits for
+// admission.
+func inverseWorkersFit(pool *pgxpool.Pool, workers int) error {
+	if workers > int(pool.Config().MaxConns)-2 {
+		return errors.New("workers exceed database capacity with session and issuance connections reserved")
+	}
+	return nil
+}
+
 func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, o inverseApplyOptions) (inverseApplySummary, error) {
 	started := time.Now()
 	result := inverseApplySummary{}
@@ -578,10 +591,8 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	if o.Workers < 1 || o.Workers > 64 || o.MaxItems < 1 || o.MaxBytes <= 0 || o.Budget24h < 0 {
 		return result, errors.New("invalid bounded apply options")
 	}
-	// One session connection and one independent issuance connection must stay
-	// available even when every worker owns a transaction or waits for admission.
-	if o.Workers > int(pool.Config().MaxConns)-2 {
-		return result, errors.New("workers exceed database capacity with session and issuance connections reserved")
+	if err := inverseWorkersFit(pool, o.Workers); err != nil {
+		return result, err
 	}
 	var summary inverseSummary
 	if err := inverseReadPinned(o.Summary, o.SummarySHA, &summary); err != nil {

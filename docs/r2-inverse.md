@@ -174,14 +174,22 @@ and the conservative byte budget remain shared protections. B2 issues its
 single-use authority from its own lane tables and adds the custody proof and
 custody deadline to every check, but sends over the same one-attempt first-wire
 transport as B1: a fresh HTTP/1.1 connection per DELETE, the batch send gate on
-the first request byte, and the same lost-response classification. A B2 key
-whose DELETE lost its response stays held and is never retransmitted. An
+the first request byte, and the same lost-response classification. The first
+request byte is refused at or after the DELETE's deadline, which for B2 is never
+later than custody expiry, and the socket write deadline is set to that instant.
+A response counts as received when its first byte is read from the connection;
+a failed DELETE is classified only after its connection is closed and any read
+under way has returned. A B2 key whose DELETE lost its response stays held and
+is never retransmitted. An
 existing B2 intent is never retransmitted, even after a stop before wire.
 Restart treats held B2 intents exactly as B1's: an issued key whose object is
 gone is reported `held_absent`, an unissued one stops the run, and a present
 object must still match and remains `ambiguous_held`. `r2-inverse job-keep28`
 runs B2 batches with the same per-batch owner evidence and exact readback, over
-the B2 tables, as `r2-inverse job` does for B1.
+the B2 tables, as `r2-inverse job` does for B1. Its batches default to the
+100-object canary size, and it refuses to start without explicit `--max-bytes`
+and `--budget-24h-bytes` (0 = unlimited). Both jobs refuse more workers than the
+database pool allows before writing any partition or evidence.
 
 Deniz's November 17 order to delete group 3 that is on the NAS supersedes the
 stitch-proof prerequisite **only for this keep28 RAW lane**. This new command

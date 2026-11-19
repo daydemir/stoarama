@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptrace"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -244,7 +243,7 @@ func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDele
 		o.Retryer = aws.NopRetryer{}
 		o.HTTPClient = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	})
-	if err != nil && wire.lost() {
+	if err != nil && wire.lostAfterClose() {
 		return fmt.Errorf("%w: %w", errInverseWireAmbiguous, err)
 	}
 	return err
@@ -259,14 +258,61 @@ func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDele
 // cut status line) are never this error and stop the job.
 var errInverseWireAmbiguous = errors.New("DELETE sent but no response; result unknown")
 
-// inverseWire records what one DELETE's own connection did.
+// errInverseWireDeadline refuses a first request byte at or after the DELETE's
+// deadline. Nothing was written; it is never a lost response.
+var errInverseWireDeadline = errors.New("DELETE deadline passed before its first request byte")
+
+// inverseWire records what one DELETE's own connection did. deadline, when set,
+// is the instant from which no first request byte may leave; for keep-28 it is
+// no later than custody expiry. answered is set by the connection read itself;
+// reading is held across every read so classification can wait one out.
 type inverseWire struct {
 	gate                         *inverseSendGate
+	deadline                     time.Time
 	wrote, writeFailed, answered atomic.Bool
+	mu                           sync.Mutex
+	conn                         net.Conn
+	reading                      sync.RWMutex
 }
 
 func (w *inverseWire) lost() bool {
 	return w.wrote.Load() && !w.writeFailed.Load() && !w.answered.Load()
+}
+
+// lostAfterClose classifies a failed DELETE only after its connection is closed
+// and any read under way has returned: a response byte the socket delivered
+// always counts, even when cancellation ended the round trip first.
+func (w *inverseWire) lostAfterClose() bool {
+	w.mu.Lock()
+	conn := w.conn
+	w.mu.Unlock()
+	if conn != nil {
+		conn.Close()
+	}
+	w.reading.Lock()
+	defer w.reading.Unlock()
+	return w.lost()
+}
+
+// track records the DELETE's connection and routes its bytes through w.
+func (w *inverseWire) track(conn net.Conn) net.Conn {
+	w.mu.Lock()
+	w.conn = conn
+	w.mu.Unlock()
+	return &inverseWireConn{Conn: conn, wire: w}
+}
+
+// beforeFirst runs under the send gate's read lock. It refuses the first
+// request byte at or after the deadline and makes the socket refuse it too,
+// should the writer stall past that instant.
+func (w *inverseWire) beforeFirst(conn net.Conn) error {
+	if w.deadline.IsZero() {
+		return nil
+	}
+	if !time.Now().Before(w.deadline) {
+		return errInverseWireDeadline
+	}
+	return conn.SetWriteDeadline(w.deadline)
 }
 
 // transport clones the template so this DELETE dials its own connection and
@@ -281,7 +327,7 @@ func (w *inverseWire) transport(template *http.Transport) *http.Transport {
 		if err != nil {
 			return nil, err
 		}
-		return &inverseWireConn{Conn: conn, wire: w}, nil
+		return w.track(conn), nil
 	}
 	config, handshake := t.TLSClientConfig, t.TLSHandshakeTimeout
 	t.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -303,7 +349,7 @@ func (w *inverseWire) transport(template *http.Transport) *http.Transport {
 			raw.Close()
 			return nil, err
 		}
-		return &inverseWireConn{Conn: conn, wire: w}, nil
+		return w.track(conn), nil
 	}
 	return t
 }
@@ -325,12 +371,29 @@ func (c *inverseWireConn) Write(p []byte) (int, error) {
 	if c.wire.wrote.Load() || c.wire.writeFailed.Load() {
 		n, err = write()
 	} else {
-		n, err = c.wire.gate.first(write)
+		n, err = c.wire.gate.first(func() (int, error) {
+			if err := c.wire.beforeFirst(c.Conn); err != nil {
+				return 0, err
+			}
+			return write()
+		})
 	}
 	if err != nil || n < len(p) {
 		c.wire.writeFailed.Store(true)
 	} else {
 		c.wire.wrote.Store(true)
+	}
+	return n, err
+}
+
+// Read marks the DELETE answered on its first response byte, before the HTTP
+// layer sees it.
+func (c *inverseWireConn) Read(p []byte) (int, error) {
+	c.wire.reading.RLock()
+	defer c.wire.reading.RUnlock()
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.wire.answered.Store(true)
 	}
 	return n, err
 }
@@ -354,8 +417,9 @@ func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, e
 	if err != nil {
 		return nil, err
 	}
-	trace := &httptrace.ClientTrace{GotFirstResponseByte: func() { t.wire.answered.Store(true) }}
-	req = req.Clone(httptrace.WithClientTrace(bounded, trace))
+	// Set before the round trip dials: the first write happens after it.
+	t.wire.deadline, _ = bounded.Deadline()
+	req = req.Clone(bounded)
 	req.Header.Del("Idempotency-Key")
 	req.Header.Del("X-Idempotency-Key")
 	response, err := t.base.RoundTrip(req)
@@ -363,7 +427,6 @@ func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, e
 		cancel()
 		return nil, err
 	}
-	t.wire.answered.Store(true)
 	response.Body = &inverseResponseBody{ReadCloser: response.Body, cancel: cancel}
 	return response, nil
 }
