@@ -510,9 +510,13 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		!strings.Contains(err.Error(), "reconciliation") {
 		t.Fatal("ambiguous staging delete allowed a second wire attempt", err)
 	}
-	if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, true); err != nil {
-		t.Fatalf("staging retirement could not reconcile exact absence: %v", err)
-	}
+	t.Run("certified NAS cleanup waits for exact R2 retirement", func(t *testing.T) {
+		testCertifiedStitchNASCleanup(t, s, id, sourceKey, func() {
+			if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, true); err != nil {
+				t.Fatalf("staging retirement could not reconcile exact absence: %v", err)
+			}
+		})
+	})
 	for _, change := range []string{
 		`DELETE FROM nas_stitch_r2_stage_retirements WHERE object_id=123`,
 		`UPDATE nas_stitch_r2_stage_retirements SET object_id=456 WHERE object_id=123`,
@@ -522,9 +526,6 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 			t.Fatal("staging retirement reservation history could be erased or reassigned", err)
 		}
 	}
-	t.Run("certified NAS cleanup waits for exact R2 retirement", func(t *testing.T) {
-		testCertifiedStitchNASCleanup(t, s, id, sourceKey)
-	})
 }
 
 func durhamStageTestProvider(t *testing.T, media []byte, sha string) *httptest.Server {

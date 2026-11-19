@@ -54,6 +54,14 @@ class OwnershipTests(unittest.TestCase):
             self.assertEqual(result['recovery_issued_items'], 1860)
             self.assertEqual(result['cleanup_owner']['plan_sha256'], 'b'*64)
 
+    def test_certified_stitch_client_retains_ordinary_finish_ownership(self):
+        parts = fixture()
+        parts[5]['version'] = 'r2-copy-v7-certified-stitch'
+        self.assertEqual(self.collect(parts)['known_enabled_plans'], [1441])
+        parts[5]['version'] += '-unknown'
+        with self.assertRaises(ValueError):
+            self.collect(parts)
+
     def test_dry_run_enable_pause_retire_transitions(self):
         for mode in ('dry_run', 'enabled', 'paused', 'retired'):
             parts = fixture()

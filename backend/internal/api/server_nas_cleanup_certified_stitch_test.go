@@ -33,6 +33,10 @@ func testCertifiedStitchSplitOutput(t *testing.T, tx pgx.Tx, hourID, firstCopyID
 	exec(`UPDATE nas_stitch_r2_stage_objects SET state='uploading',upload_id='split-fixture' WHERE id=124;
  UPDATE nas_stitch_r2_stage_objects SET state='completing' WHERE id=124;
  UPDATE nas_stitch_r2_stage_objects SET state='staged',etag='second-etag',last_modified=clock_timestamp() WHERE id=124`)
+	exec(`INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes)
+ OVERRIDING SYSTEM VALUE VALUES(125,$1,1,47,'stoarama',$2,$3,$4,$5)`,
+		hourID, endpoint, second.RelativePath+".aborted", second.SHA256, second.SizeBytes)
+	exec(`UPDATE nas_stitch_r2_stage_objects SET state='aborted' WHERE id=125`)
 	if err := tx.QueryRow(ctx, `SELECT object_key FROM nas_stitch_r2_stage_objects WHERE id=124`).Scan(&second.ObjectKey); err != nil {
 		t.Fatal(err)
 	}
@@ -78,9 +82,16 @@ func testCertifiedStitchSplitOutput(t *testing.T, tx pgx.Tx, hourID, firstCopyID
 			t.Fatalf("clip mapped to wrong split output: got %q, want %q, %v", path, want, err)
 		}
 	}
+	exec(`INSERT INTO nas_stitch_r2_stage_retirements(object_id) VALUES(123),(124);
+ UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=clock_timestamp() WHERE object_id IN (123,124)`)
+	var absent bool
+	if err := tx.QueryRow(ctx, `SELECT nas_cleanup_certified_stitch_staging_absent(certificate)
+ FROM nas_stitch_r2_certified_raw WHERE hour_id=$1 AND clip_id=901`, hourID).Scan(&absent); err != nil || absent {
+		t.Fatalf("aborted staging object with unknown outcome cleared the NAS gate: %v %v", absent, err)
+	}
 }
 
-func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key string) {
+func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key string, confirmStageAbsent func()) {
 	t.Helper()
 	ctx, pool := context.Background(), s.pool
 	exec := func(sql string, args ...any) {
@@ -108,15 +119,38 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
  FROM nas_stitch_r2_certified_raw c WHERE c.hour_id=$1 AND c.clip_id=901`, hourID, cleanupPolicySHA)
 	exec(`INSERT INTO r2_keep28_attempts(bucket,object_key) VALUES('stoarama',$1)`, key)
 	count(ready, 0)
-	exec(`INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256)
- SELECT 'raw',c.clip_id,c.stream_id,c.bucket,c.object_key,c.size_bytes,c.sha256,'keep28_exact_nas','st',repeat('a',64),$2
- FROM nas_stitch_r2_certified_raw c WHERE c.hour_id=$1 AND c.clip_id=901`, hourID, cleanupPolicySHA)
+	const retirement = `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256,already_absent)
+ SELECT 'raw',c.clip_id,c.stream_id,c.bucket,c.object_key,c.size_bytes,c.sha256,'keep28_exact_nas','st',repeat('a',64),$2,$3
+ FROM nas_stitch_r2_certified_raw c WHERE c.hour_id=$1 AND c.clip_id=901`
+	const absent = `INSERT INTO r2_keep28_events(bucket,object_key,event) VALUES('stoarama',$1,'absent')`
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, retirement, hourID, cleanupPolicySHA, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE recording_clips SET purged_at=clock_timestamp() WHERE id=901`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, absent, key); err != nil {
+		t.Fatal(err)
+	}
+	var reconciled int
+	if err := tx.QueryRow(ctx, ready, hourID).Scan(&reconciled); err != nil || reconciled != 0 {
+		t.Fatalf("reconciled raw absence became cleanup authority: %v %v", reconciled, err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	exec(retirement, hourID, cleanupPolicySHA, false)
 	exec(`UPDATE recording_clips SET purged_at=clock_timestamp() WHERE id=901`)
 	count(ready, 0)
-	exec(`INSERT INTO r2_keep28_events(bucket,object_key,event) VALUES('stoarama',$1,'absent')`, key)
+	exec(absent, key)
 	count(ready, 1)
 
-	tx, err := pool.Begin(ctx)
+	tx, err = pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +164,7 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
 	}
 	item.Frozen = [5]int64{100, 1, 2, 90, item.StitchCertificate.Output.Identity[4]}
 	item.FrozenSidecar = [5]int64{50, 1, 2, 91, item.Frozen[4]}
-	if err := cleanupCheckCertifiedStitch(ctx, tx, item, true); err != nil {
+	if err := cleanupCheckCertifiedStitch(ctx, tx, item, false); err != nil {
 		t.Fatal(err)
 	}
 	forged := item
@@ -156,6 +190,7 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
 	if err := json.Unmarshal([]byte(report), s.nasCleanupReportCache); err != nil {
 		t.Fatal(err)
 	}
+	exec(`UPDATE connections SET client_version=$1 WHERE id=13`, nasCleanupCertifiedStitchVersion)
 	prepare := cleanupCall(t, s.handleAdminNASCleanupCreate, 47, 47, "", "",
 		map[string]any{"label": "certified-raw", "items": []map[string]any{{"kind": nasCleanupCertifiedStitchKind, "source_id": item.SourceID}}})
 	var prepared struct {
@@ -166,6 +201,10 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
 		t.Fatalf("prepare certified raw with live proof and no legacy frozen index: %d %s", prepare.Code, prepare.Body.String())
 	}
 	id, digest := prepared.ID, prepared.Digest
+	if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='leased',lease_connection_id=13,lease_client_version=$2 WHERE plan_id=$1`,
+		id, NASR2CopyPagedClientVersion); err == nil {
+		t.Fatal("stale lease SQL consumed a certified dry run")
+	}
 	proof := map[string]any{}
 	if err := json.Unmarshal(fixtureProof(item), &proof); err != nil {
 		t.Fatal(err)
@@ -234,6 +273,10 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
 	}
 	s.cfg.NASCleanupDeletionEnabled = true
 	defer func() { s.cfg.NASCleanupDeletionEnabled = false }()
+	if code := control("enabled"); code != http.StatusConflict {
+		t.Fatalf("unconfirmed staging absence allowed enable: %d", code)
+	}
+	confirmStageAbsent()
 	if code := control("enabled"); code != http.StatusOK {
 		t.Fatalf("exact dry run could not be enabled: %d", code)
 	}

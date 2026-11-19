@@ -395,12 +395,14 @@ permit the client rechecks those files and hashes the retained output. It
 rechecks the open files and pathnames immediately before unlink. A missing
 or changed output keeps the raw.
 
-Apply 0219 with the NAS deletion master off. Verify the updated API and the
-exact `r2-copy-v7-certified-stitch` NAS client before arming an approved plan.
+Apply 0219 with the NAS deletion master off. Before preparing a certified
+dry run, verify the updated API on every serving instance, the exact
+`r2-copy-v7-certified-stitch` NAS client, the updated Jelly gates and the
+keep-28 controller with #565's first-write gate deployed.
 Keep the ordinary R2 recovery verifier and its Jelly runner on ordinary
 plans. Certified plans use connection 13's replacement readback for their
-dry-run and deletion evidence. Pause issuance and drain live permits before
-rolling either side back.
+dry-run and deletion evidence. Pause certified dry runs and enabled plans
+and drain live permits before rolling either side back.
 
 Provision the pinned x86 tools, bundle and corpus offline in the Durham
 guest. Verify execution of each pinned tool and the direct network

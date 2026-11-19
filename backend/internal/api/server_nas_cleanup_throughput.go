@@ -449,16 +449,31 @@ func cleanupEnableGates(ctx context.Context, tx pgx.Tx, id int64) (int, map[stri
 	if err := cleanupMaintenanceCheck(ctx, tx); err != nil {
 		return 409, map[string]any{"error": "cleanup maintenance gate unavailable or active"}
 	}
-	var bad int
-	err := tx.QueryRow(ctx, `SELECT count(*) FROM nas_cleanup_items i WHERE plan_id=$1 AND
- (state<>'would_delete' OR proof IS NULL OR updated_at<now()-interval '24 hours' OR
+	var bad, certified int
+	err := tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE
+  state<>'would_delete' OR proof IS NULL OR updated_at<now()-interval '24 hours' OR
   CASE WHEN i.item->>'permit_reason'=$2 THEN
    recovery<>$3 OR proof->'stitch_replacement' IS NULL
     OR proof->'stitch_replacement' IS DISTINCT FROM i.item->'stitch_certificate'->'output'
-  ELSE recovery NOT IN ('r2_sha_verified','r2_md5_etag_matched') OR coalesce(recovery_evidence->>'etag','')='' END)`,
-		id, nasCleanupCertifiedStitchReason, nasCleanupCertifiedStitchRecovery).Scan(&bad)
+  ELSE recovery NOT IN ('r2_sha_verified','r2_md5_etag_matched') OR coalesce(recovery_evidence->>'etag','')='' END),
+ count(*) FILTER (WHERE i.item->>'permit_reason'=$2) FROM nas_cleanup_items i WHERE plan_id=$1`,
+		id, nasCleanupCertifiedStitchReason, nasCleanupCertifiedStitchRecovery).Scan(&bad, &certified)
 	if err != nil || bad != 0 {
-		return 409, map[string]any{"error": "fresh complete dry run with a verified R2 recovery copy or exact certified NAS replacement for every item required"}
+		if certified != 0 {
+			return 409, map[string]any{"error": "fresh complete dry run with exact certified NAS replacement for every item required"}
+		}
+		return 409, map[string]any{"error": "fresh complete dry run with a verified R2 recovery copy (and its ETag evidence) for every item required"}
+	}
+	if certified != 0 {
+		var ready bool
+		err := tx.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM nas_cleanup_items
+ WHERE plan_id=$1 AND item->>'permit_reason'=$2 AND
+  (NOT coalesce(nas_cleanup_exact_certified_stitch(item),false)
+   OR NOT nas_cleanup_certified_stitch_staging_absent(item->'stitch_certificate')))`,
+			id, nasCleanupCertifiedStitchReason).Scan(&ready)
+		if err != nil || !ready {
+			return 409, map[string]any{"error": "exact raw and staging R2 absence required before enabling certified cleanup"}
+		}
 	}
 	// Under the exclusive public cleanup fence, so two concurrent enables are
 	// serialized and the second sees the first.

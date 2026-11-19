@@ -246,6 +246,7 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	ctx := r.Context()
+	certifiedPlan := req.Items[0].Kind == nasCleanupCertifiedStitchKind
 	report, err := s.cleanupReport(ctx)
 	if err != nil {
 		util.WriteError(w, 409, err.Error())
@@ -263,8 +264,9 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 	}
 	defer tx.Rollback(ctx)
 	var exists bool
-	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM connections WHERE id=13 AND account_id=47 AND kind='nas_pull')`).Scan(&exists); err != nil || !exists {
-		util.WriteError(w, 409, "NAS connection unavailable")
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM connections WHERE id=13 AND account_id=47 AND kind='nas_pull'
+ AND (NOT $1 OR client_version=$2))`, certifiedPlan, nasCleanupCertifiedStitchVersion).Scan(&exists); err != nil || !exists {
+		util.WriteError(w, 409, "NAS connection or required cleanup client unavailable")
 		return
 	}
 	// Serialize admissions before taking catalog locks; persistence checks
@@ -275,7 +277,6 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	items := []nasCleanupItem{}
-	certifiedPlan := req.Items[0].Kind == nasCleanupCertifiedStitchKind
 	seen := map[string]bool{}
 	for _, sel := range req.Items {
 		kind := sel.Kind

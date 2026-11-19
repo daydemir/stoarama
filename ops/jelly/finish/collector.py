@@ -15,6 +15,7 @@ PLAN = 1440
 PLAN_SHA = '78b86990e0a45715deb9383226cff6ff5f01e6159f3d8eaf8b6d41bb39e38697'
 HELD_ERROR = 'plan paused for a non-expiry reason'
 CLOSE_SHA = '4c89d452abcb9f3ea4c9a138e8bf211b5a298b23ad204b265303de4bbedf3cb4'
+NAS_CLIENT_VERSIONS = frozenset(('r2-copy-v6', 'r2-copy-v7-certified-stitch'))
 STOP = ("stoarama sole controller: intentional natural-boundary STOP\n"
         "operation=copy527-natural-boundary\n"
         "owner=1bd1e5c8-cde9-4155-affe-6ba81fd2ab16\n"
@@ -66,7 +67,7 @@ def assemble(status, recovery, api, db, master_at, now):
     checked = timestamp(recovery['checked_at'])
     require(checked > timestamp(db['newest_issued_at']))
     fresh(recovery['checked_at'], now, 7 * 3600)
-    require(db['version'] == 'r2-copy-v6' and isinstance(db['boot'], str) and bool(db['boot']))
+    require(db['version'] in NAS_CLIENT_VERSIONS and isinstance(db['boot'], str) and bool(db['boot']))
     fresh(db['cleanup_at'], now)
     local = db['r2_copy']
     require(isinstance(local, dict) and isinstance(local['holds_by_reason'], dict))

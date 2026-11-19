@@ -87,8 +87,7 @@ CREATE FUNCTION nas_cleanup_certified_stitch_staging_absent(certificate jsonb) R
    AND EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects o WHERE o.hour_id=c.hour_id AND o.attempt=c.attempt AND o.state='staged')
    AND NOT EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects o
     LEFT JOIN nas_stitch_r2_stage_retirements retired ON retired.object_id=o.id
-    WHERE o.hour_id=c.hour_id AND o.attempt=c.attempt AND o.state<>'aborted'
-     AND retired.absence_observed_at IS NULL))
+    WHERE o.hour_id=c.hour_id AND o.attempt=c.attempt AND retired.absence_observed_at IS NULL))
 $$;
 
 -- Preserve 0201's locks and ordinary veto. Only an exact, finished B2 item
@@ -119,6 +118,10 @@ END $$;
 CREATE FUNCTION guard_nas_cleanup_certified_stitch_permit() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE item jsonb; plan nas_cleanup_plans;
 BEGIN
+ IF NEW.state='leased' AND NEW.item->>'permit_reason'='durham_stitch_certified'
+  AND (NEW.lease_connection_id IS DISTINCT FROM 13 OR NEW.lease_client_version IS DISTINCT FROM 'r2-copy-v7-certified-stitch') THEN
+  RAISE EXCEPTION 'certified stitch cleanup lease requires the reviewed connection-13 client';
+ END IF;
  IF NEW.state<>'delete_issued' AND (NOT NEW.delete_ever_issued OR (TG_OP='UPDATE' AND OLD.delete_ever_issued)) THEN
   RETURN NEW;
  END IF;

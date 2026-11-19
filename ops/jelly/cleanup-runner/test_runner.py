@@ -1403,6 +1403,28 @@ class RecoveryRetryTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('STOARAMA_TEST_DATABASE_URL'), 'local scratch Postgres required')
 class SummaryQueryTests(unittest.TestCase):
+    def test_picker_leaves_certified_stitch_plans_to_their_controller(self):
+        psql = shutil.which('psql') or '/opt/homebrew/opt/postgresql@17/bin/psql'
+        setup = """BEGIN;
+        CREATE TEMP TABLE nas_cleanup_plans(id bigint,account_id bigint,connection_id bigint,manifest jsonb,
+          mode text,report_sha256 text,label text);
+        CREATE TEMP TABLE nas_cleanup_items(plan_id bigint,state text,delete_ever_issued boolean,updated_at timestamptz);
+        INSERT INTO nas_cleanup_plans VALUES
+          (1,47,13,'[{"permit_reason":"durham_stitch_certified"}]','dry_run','%s','certified'),
+          (2,47,13,'[{"kind":"raw"}]','dry_run','%s','ordinary');
+        INSERT INTO nas_cleanup_items VALUES (1,'would_delete',false,now()),(2,'would_delete',false,now());
+        """ % (r.POLICY_SHA, r.POLICY_SHA)
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            def query(sql):
+                output = subprocess.run(
+                    [psql, '-XqAt', '-v', 'ON_ERROR_STOP=1', os.environ['STOARAMA_TEST_DATABASE_URL']],
+                    input=(setup + sql + ';ROLLBACK;').encode(), capture_output=True, timeout=15, check=True,
+                )
+                return json.loads(output.stdout)
+            job.query = query
+            self.assertEqual(r.Runner.pick(job, lookahead=True), 2)
+
     def test_actual_sql_keeps_receipt_scope_budget_and_legacy_manifest_facts(self):
         psql=shutil.which('psql') or '/opt/homebrew/opt/postgresql@17/bin/psql'
         setup="""BEGIN;
