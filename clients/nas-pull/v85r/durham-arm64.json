@@ -1,10 +1,10 @@
 {
   "architecture": "linux-arm64",
-  "bundle_sha256": "150899c1fe490e1bbce0fa1ad1c3ffe280863f08e6207da6ee13ce658c007152",
-  "bundle_size_bytes": 1692194,
+  "bundle_sha256": "b2256943d1201b054aa6c7fc0784479b750e01fae1af8ef791873888f840298d",
+  "bundle_size_bytes": 1701128,
   "evaluator_sha256": "0c90ed4c9527e0f9b6eedc432b71dd581a4dac0f758850988df80d2e684b2fed",
   "evaluator_size_bytes": 3932286,
-  "manifest_sha256": "c973fbf6167978c37decb80e30cc4c71a6f41c63f33bbc87ebe4097d756f2750",
+  "manifest_sha256": "7d6e12320e3a1ac48a2a390d4d9842b7a9d68116d235e49dae5ad9c82288ce51",
   "media_tool_version": "7.1.5-0+deb13u1",
   "tools": {
     "ffmpeg": {

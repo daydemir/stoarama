@@ -16,7 +16,10 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
+
+import durham_stitch
 
 ROOT = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('v85r_pull', ROOT/'stoarama_pull.py')
@@ -123,6 +126,38 @@ class V85rTests(unittest.TestCase):
             with self.subTest(case=case['case']):
                 self.assertEqual(runner.decide(c, row, row['source_bindings'], bad, human, set()),
                                  tuple(case['expected']))
+
+    def test_durham_rejects_unbound_lease_and_recovered_attempt(self):
+        expires = "2099-01-01T00:00:00+00:00"
+        for recovered in (False, True):
+            with self.subTest(recovered=recovered), tempfile.TemporaryDirectory() as state:
+                state = Path(state)
+                task = {"id": 1, "expires_at": expires}
+                saved = state / "worker-1" / "attempt.json"
+                if recovered:
+                    saved.parent.mkdir(mode=0o700)
+                    saved.write_text(json.dumps(task))
+                http = SimpleNamespace(
+                    stop=SimpleNamespace(wait=mock.Mock(side_effect=[False, True])),
+                    post=mock.Mock(return_value={"source": "r2", "task": task}),
+                    v85r=SimpleNamespace(manifest="native"),
+                )
+                with mock.patch.object(durham_stitch.pull, "stitch_priority"), mock.patch.object(
+                    durham_stitch, "process_task"
+                ) as process:
+                    durham_stitch.run_worker(http, 1, state, {})
+                    process.assert_not_called()
+                self.assertEqual(saved.exists(), recovered)
+
+    def test_durham_resume_checks_the_serving_api_before_io(self):
+        http = SimpleNamespace(
+            post=mock.Mock(return_value={"state": "leased"}),
+            v85r=SimpleNamespace(manifest="native"),
+        )
+        task = dict(id=1, attempt=1, lease_token="lease", plan_sha256="plan")
+        with self.assertRaisesRegex(durham_stitch.DurhamError, "API toolchain differs"):
+            durham_stitch.process_task(http, task, None, None, None, None)
+        self.assertEqual(http.post.call_count, 1)
 
     @unittest.skipUnless(os.environ.get("V85R_DURHAM_TEST_BUNDLE"), "generated Durham bundle required")
     def test_native_durham_bundle_replays_frozen_october_evidence(self):

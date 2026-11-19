@@ -10,6 +10,7 @@ import platform
 import shutil
 import signal
 import sqlite3
+import subprocess
 import sys
 import threading
 from types import SimpleNamespace
@@ -20,6 +21,26 @@ import stoarama_pull as pull
 
 class DurhamError(RuntimeError):
     pass
+
+
+def media_libraries(tools, stop):
+    resolved = set()
+    for path in tools.values():
+        pull.stitch_check(stop)
+        output = subprocess.check_output(
+            ["/usr/bin/ldd", path], text=True, timeout=15, env={"LC_ALL": "C"}
+        )
+        for line in output.splitlines():
+            parts = line.strip().partition(" => ")[2] or line.strip()
+            library, address = parts.split()
+            if library == "linux-vdso.so.1":
+                continue
+            if not address.startswith("(0x") or not Path(library).is_absolute():
+                raise DurhamError("Durham loader dependency is unresolved")
+            resolved.add(Path(library).resolve(strict=True))
+    if not resolved:
+        raise DurhamError("Durham media libraries are missing")
+    return {str(path): pull.stitch_proof_digest(path, stop)[1] for path in sorted(resolved)}
 
 
 class DurhamV85r:
@@ -51,10 +72,15 @@ class DurhamV85r:
     def verify(self, tools, stop):
         if tools != self.tools:
             raise DurhamError("Durham media tool path differs")
-        for name, path in tools.items():
-            pin = self.pins["tools"][name]
-            self.verify_executable(Path(path), pin["size_bytes"], pin["sha256"], stop)
         bundle = pull.stitch_unpack_v85r(self.bundle, self.pins["bundle_sha256"], self.manifest, self.state, stop)
+        media = json.loads((bundle / "media-toolchain.json").read_bytes())
+        if media["tools"] != self.pins["tools"] or media["version"] != self.pins["media_tool_version"]:
+            raise DurhamError("Durham media manifest differs from the profile")
+        for name, path in tools.items():
+            pin = media["tools"][name]
+            self.verify_executable(Path(path), pin["size_bytes"], pin["sha256"], stop)
+        if media_libraries(tools, stop) != media["libraries"]:
+            raise DurhamError("Durham media library identity differs")
         self.verify_executable(bundle / "remeasure-linux-arm64", self.pins["evaluator_size_bytes"],
                                self.pins["evaluator_sha256"], stop)
         return bundle, dict(
@@ -101,7 +127,8 @@ class DurhamHTTP:
     def post(self, path, body):
         connection, response = self.request(self.api + "/account/connections/stitch/" + path,
             self.api_host, "POST", {"Authorization": "Bearer " + self.token,
-            "Content-Type": "application/json", "X-Stoarama-Stitch-Source": "r2-v1",
+            "Content-Type": "application/json", "User-Agent": "stoarama-operator/1",
+            "X-Stoarama-Stitch-Source": "r2-v2",
             "X-Stoarama-Stitch-Toolchain": self.v85r.manifest}, pull.cleanup_json_bytes(body))
         with response:
             try:
@@ -115,7 +142,7 @@ class DurhamHTTP:
     def transfer(self, cap, method, payload=None):
         if cap["method"] != method:
             raise DurhamError("Durham signed method differs")
-        headers = {}
+        headers = {"User-Agent": "stoarama-operator/1"}
         for name, values in cap["headers"].items():
             if not isinstance(values, list) or len(values) != 1:
                 raise DurhamError("Durham signed header differs")
@@ -207,6 +234,8 @@ def upload_output(http, task, cfg, result):
 
 def process_task(http, task, root, state, inventory, tools):
     status = task_request(http, task, "ready")
+    if status.get("toolchain") != http.v85r.manifest:
+        raise DurhamError("Durham API toolchain differs")
     if status["state"] in ("staged", "held", "certified"):
         return
     scratch = root / "media"
@@ -252,10 +281,14 @@ def run_worker(http, slot, state, tools):
                     if response.get("source") != "r2":
                         raise DurhamError("Durham lease is not R2 backed")
                     task = response["task"]
+                    if task.get("toolchain") != http.v85r.manifest:
+                        raise DurhamError("Durham lease toolchain differs")
                     work.mkdir(mode=0o700, exist_ok=True)
                     write_json(saved, task)
                 expires = pull.parse_certification_timestamp(task["expires_at"], "Durham lease")
                 if expires > datetime.datetime.now(datetime.timezone.utc):
+                    if task.get("toolchain") != http.v85r.manifest:
+                        raise DurhamError("saved Durham lease toolchain differs")
                     process_task(http, task, work, state, inventory, tools)
                 if work.exists():
                     shutil.rmtree(work)

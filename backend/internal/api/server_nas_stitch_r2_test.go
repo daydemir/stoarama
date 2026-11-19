@@ -194,7 +194,21 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	exec(`UPDATE nas_stitch_r2_stage_objects SET state='uploading',upload_id='earlier-abort',start_issued_at=clock_timestamp(),
  grants_drain_at=clock_timestamp()-interval '1 second' WHERE id=122;
  UPDATE nas_stitch_r2_stage_objects SET state='aborted' WHERE id=122`)
-	exec(`UPDATE nas_stitch_r2_hours SET attempt=2 WHERE id=$1`, id)
+	exec(`UPDATE nas_stitch_r2_hours SET attempt=2,lease_toolchain_attempt=2,lease_toolchain_sha256=$2 WHERE id=$1`, id, nasDurhamManifestSHA)
+	t.Run("reclaimed legacy lease does not inherit the native profile", func(t *testing.T) {
+		// The previous binary replaces the attempt and token without knowing the profile columns.
+		token := strings.Repeat("f", 64)
+		exec(`UPDATE nas_stitch_r2_hours SET state='leased',attempt=3,lease_api_key_id=47,lease_token=$2,
+ lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, id, token)
+		defer exec(`UPDATE nas_stitch_r2_hours SET attempt=2,lease_token=repeat('e',64) WHERE id=$1`, id)
+		server := &Server{pool: pool}
+		w := cleanupCall(t, func(w http.ResponseWriter, r *http.Request) {
+			server.handleDurhamStitchStatus(w, r, nasStitchCaller{keyID: 47, accountID: 47}, id)
+		}, 47, 47, "", "", durhamStitchCheckpoint{Attempt: 3, Token: token, PlanSHA: planDigest})
+		if w.Code != http.StatusConflict {
+			t.Fatalf("legacy reclaim inherited a native ready response: %d %s", w.Code, w.Body.String())
+		}
+	})
 	const insertStage = `INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes)
  OVERRIDING SYSTEM VALUE VALUES(123,$1,2,47,'stoarama',$2,$3,$4,100)`
 	outputPath := plan.OutputFolder + "/run-000-" + sha + ".mp4"
@@ -224,7 +238,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		t.Fatal("committed starting stage allowed fence removal", err)
 	}
 	exec(`UPDATE nas_stitch_r2_control SET enabled=true,max_staging_bytes=1000000`)
-	lease := r2.StitchStageLease{HourID: id, APIKeyID: 47, Attempt: 2, Token: strings.Repeat("e", 64), PlanSHA: planDigest}
+	lease := r2.StitchStageLease{HourID: id, APIKeyID: 47, Attempt: 2, Token: strings.Repeat("e", 64), PlanSHA: planDigest, Toolchain: nasDurhamManifestSHA}
 	foreign := lease
 	foreign.APIKeyID++
 	if _, err := store.StartStitchStage(ctx, foreign, 123); err == nil {
@@ -264,6 +278,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	result := nasStitchResult{Policy: nasStitchPolicy, PlanSHA: planDigest, Token: lease.Token,
 		Seams: []nasStitchDecision{{Decision: "join"}},
 		Outputs: []nasStitchOutput{{Path: plan.OutputFolder + "/run-000-" + sha + ".mp4", Size: int64(len(media)), SHA: sha,
+			Provenance: reviewedDurhamProvenance(),
 			Inputs: []nasStitchInputProof{{ID: 901, SHA: sha, Size: int64(len(media)), RetirementHeld: true},
 				{ID: 902, SHA: sha, Size: int64(len(media)), RetirementHeld: true}}}}}
 	stagedManifest, err := json.Marshal(result)
@@ -314,6 +329,14 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	if err != nil {
 		t.Fatal(err)
 	}
+	legacyResult := result
+	legacyResult.Outputs = append([]nasStitchOutput(nil), result.Outputs...)
+	_, legacy := stitchUnitFixture()
+	legacyResult.Outputs[0].Provenance = legacy.Outputs[0].Provenance
+	legacyBody, err := json.Marshal(legacyResult)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, altered := range []struct {
 		name, payload, etag, version, body string
 		committed                          int64
@@ -322,6 +345,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		{"wrong_etag", string(receipt), "other-etag", "", string(stagedManifest), 100},
 		{"wrong_version", string(receipt), "stage-etag", "other-version", string(stagedManifest), 100},
 		{"wrong_byte_count", string(receipt), "stage-etag", "", string(stagedManifest), 0},
+		{"legacy_toolchain", string(receipt), "stage-etag", "", string(legacyBody), 100},
 		{"empty_manifest", string(receipt), "stage-etag", "", "{}", 100},
 		{"duplicate_disposition", string(receipt), "stage-etag", "", string(duplicateInputs), 100},
 		{"duplicate_plan", string(receipt), "stage-etag", "", string(duplicateInputs), 100},

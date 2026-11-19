@@ -348,8 +348,14 @@ through QEMU. The offline ARM64 benchmark used the Debian 7.1.5 media tools and
 the evaluator built from the same pinned Go sources. The ARM64 bundle carries
 the same corpus and classifier, with both evaluator calls aimed at the native
 binary. The worker verifies the bundle, executable machine types and tool
-SHA-256 values before reporting that profile to the API. The API binds the
-profile at lease and requires all of its pins on Durham output proof.
+SHA-256 values before requesting a lease. The bundle also pins the resolved
+ARM64 loader and shared library hashes. The worker verifies the loaded
+dependency set before startup and before building an hour. A package or
+library update that changes the set stops the worker until the new build
+has been reviewed and replayed. The API binds the profile to the exact
+lease attempt. The worker checks that identity on lease, at resume and
+before processing. PostgreSQL requires matching output provenance when
+issuing a certificate, including when the API is rolled back.
 
 Build the native bundle with Go 1.26.5 and the exact signed-index Debian
 `ffmpeg_7.1.5-0+deb13u1_arm64.deb`:
@@ -359,14 +365,25 @@ python3 -B clients/nas-pull/v85r/build_durham.py \
   --ffmpeg-deb "$DEB" --out "$RELEASE/durham-arm64.tar.gz"
 ```
 
-With the Durham queue and API stitch switch off, install the exact Debian
-package and its signed dependencies in the existing Debian ARM64 guest.
-Install the reviewed `stoarama_pull.py`, `durham_stitch.py`, and systemd unit.
-Put the reviewed profile JSON and generated bundle in
-`/opt/stoarama-stitch/v85r/`, owned by root. The systemd unit clears QEMU and
-dynamic-loader overrides. Keep the existing key, service user and boot cron.
-Check worker startup and the exact pin verification before opening the next
-pilot window. The NAS-local client and proof replay use their October profile.
+Merge using `[skip render]`. The R2 controller owns API deployment and
+migration 0222. Pause the Durham queue and turn off API stitching before
+upgrading or rolling back. Record the serving API revision and migration set
+and reconcile expired attempts, stage grants and unresolved multipart
+operations before opening a window. Drain leased NAS output copies before
+rollback. An issued copy lease can still renew and certify after the API stitch
+switch is off. Preserve legacy staged results and their
+input holds.
+
+On the existing Debian ARM64 guest, install the signed
+`ffmpeg=7:7.1.5-0+deb13u1` package with the reviewed dependencies. Install the
+reviewed `stoarama_pull.py`, `durham_stitch.py`, and systemd unit. Put the
+profile JSON and generated bundle in the root-owned
+`/opt/stoarama-stitch/v85r/`. Keep the private systemd credential, service user,
+direct API and R2 origins, and macOS boot cron. The unit clears QEMU and
+dynamic-loader overrides and reserves 512 MiB of available guest memory.
+Check startup and pin verification with the queue off. Open work only after
+the matching API and schema are serving. The NAS-local client and proof
+replay use the October profile.
 
 The API grants staged output leases to connection 13 on
 `r2-copy-v7-certified-stitch` while both `NAS_STITCH_ENABLED` and
@@ -453,13 +470,6 @@ plans. Certified plans use connection 13's replacement readback for their
 dry-run and deletion evidence. Pause certified dry runs and enabled plans
 and drain live permits before rolling either side back.
 
-Provision the pinned x86 tools, bundle and corpus offline in the Durham
-guest. Verify execution of each pinned tool and the direct network
-path before enabling the service. Install the reviewed unit and client under
-their root-owned guest paths, configure the direct API base and R2 origin
-in `/etc/stoarama-stitch/worker.env`, and use systemd `LoadCredential` with
-the private provisioned bearer file. Use macOS boot cron as the existing
-Durham owner to run `durham-start.sh`. Confirm unattended starts with the
-approved release before admitting work. The controller sets the staging
-reservation to fit the existing storage and billing allowance and verifies
-a single hour through NAS custody before opening the four-worker queue.
+Before opening the queue beyond the pilot, verify that one full hour from a
+non-keep-everything stream has a connection-13 certificate and exact R2
+retirement evidence. Leave NAS deletion off during this rollout.

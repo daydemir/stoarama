@@ -184,6 +184,28 @@ func TestNASStitchCheckpointAndLeasePauseUnderCleanupFreeze(t *testing.T) {
 	checkpoint(q.Token, false)
 }
 
+func TestR2StitchDurhamRequiresBidirectionalProfileProtocol(t *testing.T) {
+	for _, test := range []struct {
+		source, manifest string
+		dedicated        bool
+		code             int
+	}{
+		{"r2-v1", nasDurhamManifestSHA, true, http.StatusConflict},
+		{"r2-v2", "", true, http.StatusConflict},
+		{"r2-v2", nasStitchManifestSHA, true, http.StatusConflict},
+		{"r2-v2", nasDurhamManifestSHA, false, http.StatusForbidden},
+		{"r2-v2", nasDurhamManifestSHA, true, http.StatusOK},
+	} {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPost, "/account/connections/stitch/lease", nil)
+		r.Header.Set("X-Stoarama-Stitch-Source", test.source)
+		r.Header.Set("X-Stoarama-Stitch-Toolchain", test.manifest)
+		if ok := requireDurhamProfile(w, r, nasStitchCaller{dedicated: test.dedicated}); ok != (test.code == http.StatusOK) || w.Code != test.code {
+			t.Fatalf("profile gate for %+v: %t %d", test, ok, w.Code)
+		}
+	}
+}
+
 func TestDurhamProofRequiresOneNativeToolchain(t *testing.T) {
 	plan, proof := stitchUnitFixture()
 	for i := range proof.Outputs[0].Inputs {
@@ -193,12 +215,7 @@ func TestDurhamProofRequiresOneNativeToolchain(t *testing.T) {
 	if _, err := validateNASStitchProof(plan, proof, nasStitchOnDurham); err == nil {
 		t.Fatal("Durham accepted the legacy amd64 package")
 	}
-	native := nasStitchProvenance{
-		Policy: nasStitchPolicy, Architecture: "linux-arm64",
-		ManifestSHA: nasDurhamManifestSHA, EvaluatorSHA: nasDurhamEvaluatorSHA,
-		FFmpegVersion: nasDurhamToolVersion, FFprobeVersion: nasDurhamToolVersion,
-		FFmpegSHA: nasDurhamFFmpegSHA, FFprobeSHA: nasDurhamFFprobeSHA,
-	}
+	native := reviewedDurhamProvenance()
 	proof.Outputs[0].Provenance = native
 	if _, err := validateNASStitchProof(plan, proof, nasStitchOnDurham); err != nil {
 		t.Fatal(err)

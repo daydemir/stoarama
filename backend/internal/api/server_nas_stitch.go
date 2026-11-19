@@ -79,12 +79,13 @@ type nasStitchPlan struct {
 	FeatureInputs []collation.Clip  `json:"feature_inputs"`
 }
 type nasStitchTask struct {
-	ID      int64         `json:"id"`
-	Attempt int           `json:"attempt"`
-	Token   string        `json:"lease_token"`
-	Expires time.Time     `json:"expires_at"`
-	PlanSHA string        `json:"plan_sha256"`
-	Plan    nasStitchPlan `json:"plan"`
+	ID        int64         `json:"id"`
+	Attempt   int           `json:"attempt"`
+	Token     string        `json:"lease_token"`
+	Expires   time.Time     `json:"expires_at"`
+	PlanSHA   string        `json:"plan_sha256"`
+	Plan      nasStitchPlan `json:"plan"`
+	Toolchain string        `json:"toolchain,omitempty"`
 }
 type nasStitchDecision struct {
 	Policy        string `json:"policy"`
@@ -321,13 +322,8 @@ func (s *Server) handleAccountNASStitchLease(w http.ResponseWriter, r *http.Requ
 		util.WriteJSON(w, 200, map[string]any{"task": nil, "retry_after_sec": 300})
 		return
 	}
-	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
-		if !caller.dedicated {
-			util.WriteError(w, 403, "dedicated Durham key required")
-			return
-		}
-		if r.Header.Get("X-Stoarama-Stitch-Toolchain") != nasDurhamManifestSHA {
-			util.WriteError(w, http.StatusConflict, "reviewed native Durham toolchain required")
+	if r.Header.Get("X-Stoarama-Stitch-Source") != "" {
+		if !requireDurhamProfile(w, r, caller) {
 			return
 		}
 		s.handleDurhamStitchLease(w, r, caller)
@@ -452,9 +448,8 @@ func (s *Server) handleAccountNASStitchCheckpoint(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
-	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
-		if !caller.dedicated {
-			util.WriteError(w, 403, "dedicated Durham key required")
+	if r.Header.Get("X-Stoarama-Stitch-Source") != "" {
+		if !requireDurhamProfile(w, r, caller) {
 			return
 		}
 		s.handleDurhamStitchCheckpoint(w, r, caller, id)
@@ -785,9 +780,8 @@ func (s *Server) handleAccountNASStitchResult(w http.ResponseWriter, r *http.Req
 	if !ok {
 		return
 	}
-	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
-		if !caller.dedicated {
-			util.WriteError(w, 403, "dedicated Durham key required")
+	if r.Header.Get("X-Stoarama-Stitch-Source") != "" {
+		if !requireDurhamProfile(w, r, caller) {
 			return
 		}
 		s.handleDurhamStitchResult(w, r, caller, id)
@@ -901,9 +895,8 @@ func (s *Server) handleAccountNASStitchReady(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
-	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
-		if !caller.dedicated {
-			util.WriteError(w, 403, "dedicated Durham key required")
+	if r.Header.Get("X-Stoarama-Stitch-Source") != "" {
+		if !requireDurhamProfile(w, r, caller) {
 			return
 		}
 		s.handleDurhamStitchStatus(w, r, caller, id)
@@ -962,14 +955,18 @@ func (s *Server) handleAccountNASStitchReady(w http.ResponseWriter, r *http.Requ
 	util.WriteJSON(w, 200, map[string]any{"ready": true, "id": id})
 }
 
+func reviewedDurhamProvenance() nasStitchProvenance {
+	return nasStitchProvenance{
+		Policy: nasStitchPolicy, Architecture: "linux-arm64",
+		ManifestSHA: nasDurhamManifestSHA, EvaluatorSHA: nasDurhamEvaluatorSHA,
+		FFmpegVersion: nasDurhamToolVersion, FFprobeVersion: nasDurhamToolVersion,
+		FFmpegSHA: nasDurhamFFmpegSHA, FFprobeSHA: nasDurhamFFprobeSHA,
+	}
+}
+
 func validNASStitchProvenance(p nasStitchProvenance, origin nasStitchProofOrigin) bool {
 	if origin == nasStitchOnDurham {
-		return p == (nasStitchProvenance{
-			Policy: nasStitchPolicy, Architecture: "linux-arm64",
-			ManifestSHA: nasDurhamManifestSHA, EvaluatorSHA: nasDurhamEvaluatorSHA,
-			FFmpegVersion: nasDurhamToolVersion, FFprobeVersion: nasDurhamToolVersion,
-			FFmpegSHA: nasDurhamFFmpegSHA, FFprobeSHA: nasDurhamFFprobeSHA,
-		})
+		return p == reviewedDurhamProvenance()
 	}
 	return p.Architecture == "" && p.EvaluatorSHA == "" && p.OctoberRecovered && p.Policy == nasStitchPolicy && p.ManifestSHA == nasStitchManifestSHA && p.FFmpegVersion == "N-126826-gc0e8b139fd-20260924" && p.FFprobeVersion == "N-126826-gc0e8b139fd-20260924" && p.FFmpegSHA == "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b" && p.FFprobeSHA == "9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c"
 }

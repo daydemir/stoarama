@@ -22,9 +22,9 @@ import (
 const StitchStagePartBytes = 16 << 20
 
 type StitchStageLease struct {
-	HourID, APIKeyID int64
-	Attempt          int
-	Token, PlanSHA   string
+	HourID, APIKeyID          int64
+	Attempt                   int
+	Token, PlanSHA, Toolchain string
 }
 
 type StitchStageUpload struct {
@@ -47,9 +47,9 @@ func (c *Client) stitchStageWriter(ctx context.Context, tx pgx.Tx, lease StitchS
  ON f.bucket=o.bucket AND f.endpoint_sha256=o.endpoint_sha256
  WHERE o.id=$1 AND o.hour_id=$2 AND o.attempt=$3 AND o.api_key_id=$4 AND h.attempt=o.attempt
   AND h.lease_api_key_id=o.api_key_id AND h.lease_token=$5 AND h.plan_sha256=$6
-  AND o.bucket=$7 AND o.endpoint_sha256=$8
+  AND o.bucket=$7 AND o.endpoint_sha256=$8 AND h.lease_toolchain_sha256=$9 AND h.lease_toolchain_attempt=h.attempt
  FOR UPDATE OF o FOR SHARE OF h,s,k,control,f`, id, lease.HourID, lease.Attempt, lease.APIKeyID,
-		lease.Token, lease.PlanSHA, c.bucket, c.EndpointSHA256()).Scan(&o.ID, &o.Size, &o.State, &o.key, &o.upload, &o.sha)
+		lease.Token, lease.PlanSHA, c.bucket, c.EndpointSHA256(), lease.Toolchain).Scan(&o.ID, &o.Size, &o.State, &o.key, &o.upload, &o.sha)
 	if err != nil {
 		return o, 0, err
 	}

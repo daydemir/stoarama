@@ -33,7 +33,7 @@ def build_evaluator():
     with tempfile.TemporaryDirectory(prefix="durham-arm64-build-") as scratch:
         target = Path(scratch) / EVALUATOR
         subprocess.run(
-            ["go", "build", "-trimpath", "-ldflags=-s -w -buildid=", "-o", str(target), "./cmd/remeasure"],
+            ["go", "build", "-buildvcs=false", "-trimpath", "-ldflags=-s -w -buildid=", "-o", str(target), "./cmd/remeasure"],
             cwd=ROOT / "producer", check=True, env=dict(
                 os.environ, CGO_ENABLED="0", GOOS="linux", GOARCH="arm64",
                 GOARM64="v8.0", GOTOOLCHAIN="go1.26.5",
@@ -42,7 +42,7 @@ def build_evaluator():
         return target.read_bytes()
 
 
-def make_bundle(evaluator):
+def make_bundle(evaluator, tools, libraries):
     if not elf_arm64(evaluator) or digest(evaluator) != EVALUATOR_SHA256:
         raise ValueError("native evaluator differs from the reviewed ARM64 build")
     manifest = json.loads((ROOT / "manifest.json").read_bytes())
@@ -57,6 +57,8 @@ def make_bundle(evaluator):
         raise ValueError("unexpected V85r runner evaluator binding")
     files["runner.py"] = runner.replace(LEGACY_EVALUATOR.encode(), EVALUATOR.encode())
     files[EVALUATOR] = evaluator
+    media = {"version": DEBIAN_VERSION, "tools": tools, "libraries": libraries}
+    files["media-toolchain.json"] = (json.dumps(media, indent=2, sort_keys=True) + "\n").encode()
     manifest["files"] = {name: digest(body) for name, body in files.items()}
     body = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
     files["manifest.json"] = body
@@ -103,12 +105,20 @@ def go_pins(pins):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ffmpeg-deb", required=True, type=Path)
+    parser.add_argument("--libraries", type=Path, default=ROOT / "durham-arm64-libraries.sha256")
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--evaluator", type=Path, help="reuse the exact verified ARM64 build")
     parser.add_argument("--write-pins", action="store_true")
     args = parser.parse_args()
     evaluator = args.evaluator.read_bytes() if args.evaluator else build_evaluator()
-    bundle, manifest = make_bundle(evaluator)
+    libraries = {}
+    for line in args.libraries.read_text().splitlines():
+        sha, name = line.split("  ", 1)
+        if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha) or not Path(name).is_absolute() or name in libraries:
+            raise ValueError("invalid Durham library SHA-256 list")
+        libraries[name] = sha
+    tools = media_tool_pins(args.ffmpeg_deb)
+    bundle, manifest = make_bundle(evaluator, tools, libraries)
     pins = {
         "architecture": "linux-arm64",
         "bundle_sha256": digest(bundle),
@@ -117,7 +127,7 @@ def main():
         "evaluator_sha256": EVALUATOR_SHA256,
         "evaluator_size_bytes": len(evaluator),
         "media_tool_version": DEBIAN_VERSION,
-        "tools": media_tool_pins(args.ffmpeg_deb),
+        "tools": tools,
     }
     expected = json.dumps(pins, indent=2, sort_keys=True) + "\n"
     go = go_pins(pins)
