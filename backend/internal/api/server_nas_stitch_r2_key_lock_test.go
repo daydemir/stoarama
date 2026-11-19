@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func TestDurhamStitchImportBoundsHeldInputs(t *testing.T) {
+func TestR2StitchImportBoundsHeldInputs(t *testing.T) {
 	for inputs, ok := range map[int]bool{1000: true, 1001: false} {
 		set := DurhamStitchHoldSet{Bucket: "stoarama", EndpointSHA: strings.Repeat("a", 64)}
 		for left := inputs; left > 0; left -= 200 {

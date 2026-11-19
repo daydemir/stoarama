@@ -103,7 +103,7 @@ const (
 
 // Old binaries and in-flight transactions straddle the deploy. Each side of the
 // stitch/retirement handshake must still see the other across 0223.
-func TestStitchKeyLockCutoverKeepsHoldsOrdered(t *testing.T) {
+func TestR2StitchKeyLockCutoverKeepsHoldsOrdered(t *testing.T) {
 	ctx := context.Background()
 	t.Run("hold_written_by_the_old_trigger", func(t *testing.T) {
 		pool := stitchCutoverFixture(t)
