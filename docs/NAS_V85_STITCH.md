@@ -155,8 +155,9 @@ The operator CLI can issue the same fixed account-47 credential with
 Supply the owner authorization reference and an inherited writable pipe from
 the approved 1Password sink. The CLI emits the bearer only through that pipe.
 The browser and CLI share the one-active-key guard and audit transaction.
-Run the CLI after every serving controller has that guard. Pause issuance
-during a rollback to an earlier build.
+Pause both browser and CLI issuance whenever any serving controller lacks
+the shared guard, including after a rollback. Resume once every serving
+controller runs the guard.
 If issuance or vault acknowledgement is uncertain, reconcile the recorded
 key ID and vault item before any further issuance attempt.
 

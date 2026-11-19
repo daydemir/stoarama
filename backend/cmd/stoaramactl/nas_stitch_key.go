@@ -18,7 +18,7 @@ import (
 )
 
 func durhamCredentialPipe(fd int) (*os.File, error) {
-	const invalid = "Durham credential output must be an inherited writable pipe descriptor above 2"
+	const invalid = "Durham credential output must be an inherited writable pipe separate from standard output and error"
 	if fd < 3 || int64(fd) > 1<<31-1 {
 		return nil, errors.New(invalid)
 	}
@@ -26,16 +26,21 @@ func durhamCredentialPipe(fd int) (*os.File, error) {
 	if err != nil || flags&unix.O_ACCMODE != unix.O_WRONLY {
 		return nil, errors.New(invalid)
 	}
-	file := os.NewFile(uintptr(fd), "durham-credential-pipe")
-	if file == nil {
+	var pipe unix.Stat_t
+	if err := unix.Fstat(fd, &pipe); err != nil || pipe.Mode&unix.S_IFMT != unix.S_IFIFO {
 		return nil, errors.New(invalid)
 	}
-	stat, err := file.Stat()
-	if err != nil || stat.Mode()&os.ModeType != os.ModeNamedPipe {
-		file.Close()
-		return nil, errors.New(invalid)
+	for _, standard := range []int{unix.Stdout, unix.Stderr} {
+		var stream unix.Stat_t
+		err := unix.Fstat(standard, &stream)
+		if errors.Is(err, unix.EBADF) {
+			continue
+		}
+		if err != nil || (pipe.Dev == stream.Dev && pipe.Ino == stream.Ino) {
+			return nil, errors.New(invalid)
+		}
 	}
-	return file, nil
+	return os.NewFile(uintptr(fd), "durham-credential-pipe"), nil
 }
 
 func runMintDurhamStitchKey(ctx context.Context, cfg config.Config, args []string) {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"strconv"
@@ -24,6 +25,7 @@ func TestDurhamCredentialPipeRejectsRegularFilesAndReadEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer unix.Close(fileFD)
 	if _, err := durhamCredentialPipe(fileFD); err == nil {
 		t.Fatal("accepted regular credential file")
 	}
@@ -64,5 +66,29 @@ func TestDurhamCredentialPipeRejectsTruncatedStandardDescriptors(t *testing.T) {
 	cmd.Env = append(os.Environ(), "STOARAMA_TEST_DURHAM_FD_CHILD=1")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatal(err, string(output))
+	}
+}
+
+func TestDurhamCredentialPipeRejectsDuplicatedStandardPipes(t *testing.T) {
+	if os.Getenv("STOARAMA_TEST_DURHAM_DUP_CHILD") == "1" {
+		for _, std := range []int{1, 2} {
+			duplicate, err := unix.Dup(std)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = durhamCredentialPipe(duplicate)
+			unix.Close(duplicate)
+			if err == nil {
+				t.Fatalf("accepted a duplicate of standard descriptor %d", std)
+			}
+		}
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDurhamCredentialPipeRejectsDuplicatedStandardPipes$")
+	cmd.Env = append(os.Environ(), "STOARAMA_TEST_DURHAM_DUP_CHILD=1")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err, stdout.String(), stderr.String())
 	}
 }
