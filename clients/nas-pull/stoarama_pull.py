@@ -25886,9 +25886,7 @@ def run_measured(command, deadline, stop_event, stdout_path=None, niced=True, *,
         if stdout_path:
             stdout_file.close()
         raise
-    finally:
-        for writer in child_writers:
-            writer.close()
+
     def watchdog():
         while not done.wait(0.5):
             reason = "deadline" if time.monotonic() >= deadline else ("shutdown" if stop_event.is_set() else "")
@@ -25903,6 +25901,8 @@ def run_measured(command, deadline, stop_event, stdout_path=None, niced=True, *,
     guard = None
     try:
         try:
+            for writer in child_writers:
+                writer.close()
             guard = threading.Thread(target=watchdog, name="benchmark-watchdog", daemon=True)
             guard.start()
             drained = drain_stdout(process.stdout) if drain_stdout else None

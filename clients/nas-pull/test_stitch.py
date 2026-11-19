@@ -102,6 +102,30 @@ class StitchFrameLedgerTests(unittest.TestCase):
                                   "sys.exit(1)\n", threading.Event(), 5)
         self.assertEqual(attempts, 0)
 
+    def test_pipe_close_failure_after_launch_reaps_child_and_closes_stdout(self):
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "rb"), os.fdopen(write_fd, "wb") as raw_writer:
+            writer = mock.Mock()
+            writer.fileno.return_value = raw_writer.fileno()
+            writer.close.side_effect = OSError("parent pipe close failed")
+            processes = []
+            popen = subprocess.Popen
+
+            def launch(*args, **kwargs):
+                process = popen(*args, **kwargs)
+                processes.append(process)
+                return process
+
+            with mock.patch.object(pull.subprocess, "Popen", side_effect=launch):
+                with self.assertRaisesRegex(OSError, "parent pipe close failed"):
+                    pull.run_measured([sys.executable, "-c", "import time; time.sleep(30)"],
+                                      time.monotonic() + 5, threading.Event(), niced=False,
+                                      drain_stdout=lambda stream: None, child_writers=(writer,))
+            process, = processes
+            self.assertTrue(process.stdout.closed)
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(process.pid, os.WNOHANG)
+
     def test_successful_child_must_produce_at_least_one_frame(self):
         self.assertEqual(self.run_child("sys.exit(0)\n", threading.Event(), 5), 0)
 
