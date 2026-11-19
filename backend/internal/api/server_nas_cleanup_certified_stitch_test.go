@@ -106,7 +106,7 @@ func testCertifiedStitchSplitOutput(t *testing.T, tx pgx.Tx, hourID, firstCopyID
 	}
 }
 
-func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key string, confirmStageAbsent func()) {
+func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key string, abort *durhamStageAbortProbe, confirmStageAbsent func()) {
 	t.Helper()
 	ctx, pool := context.Background(), s.pool
 	exec := func(sql string, args ...any) {
@@ -273,7 +273,11 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
 		Attempt: task.Attempt, PlanSHA: digest, Outcome: "match", Proof: proofBytes,
 		RequestID: strings.Repeat("1", 32), ClientVersion: nasCleanupCertifiedStitchVersion,
 	}
+	dryRunLists, dryRunHeads := abort.lists.Load(), abort.heads.Load()
 	observe(request, "would_delete", false)
+	if abort.lists.Load() != dryRunLists || abort.heads.Load() != dryRunHeads {
+		t.Fatal("certified dry run performed abort provider checks")
+	}
 	control := func(mode string) int {
 		t.Helper()
 		w := cleanupCall(t, s.handleAdminNASCleanupControl, 47, 47, "id", fmt.Sprint(id),
@@ -311,11 +315,52 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
 		}
 	}
 	request.Attempt = task.Attempt
-	request.RequestID = strings.Repeat("2", 32)
+	for n, mode := range []int32{0, 2, 4, 5} {
+		abort.response.Store(mode)
+		request.RequestID = strings.Repeat(fmt.Sprint(n+2), 32)
+		lists, heads := abort.lists.Load(), abort.heads.Load()
+		w := cleanupCall(t, s.handleAccountNASCleanupObserve, 47, 47, "itemId", fmt.Sprint(task.ItemID), request, session)
+		if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "aborted staging absence") {
+			t.Fatalf("abort receipt bypassed live provider check in case %d: %d %s", mode, w.Code, w.Body.String())
+		}
+		if mode != 0 {
+			heads++
+		}
+		if abort.lists.Load() != lists+1 || abort.heads.Load() != heads {
+			t.Fatalf("wrong exact abort provider requests in case %d", mode)
+		}
+	}
+	abort.response.Store(3)
+	request.RequestID = strings.Repeat("6", 32)
 	observe(request, "delete_issued", true)
 	observe(request, "delete_issued", true)
-	s.cfg.NASCleanupDeletionEnabled = false
+	abort.response.Store(0)
 	observe(request, "reconcile", false)
+	batch := func(action string, deleting bool) {
+		t.Helper()
+		w := cleanupCall(t, s.handleAccountNASCleanupObserveBatch, 47, 47, "", "",
+			map[string]any{"client_version": nasCleanupCertifiedStitchVersion, "observations": []cleanupBatchObservation{{ItemID: task.ItemID, cleanupObserve: request}}}, session)
+		var response struct {
+			Results []struct {
+				Action string
+				Delete bool
+				Status int
+			}
+		}
+		if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &response) != nil || len(response.Results) != 1 ||
+			response.Results[0].Action != action || response.Results[0].Delete != deleting || response.Results[0].Status != http.StatusOK {
+			t.Fatalf("batch replay wanted %s: %d %s", action, w.Code, w.Body.String())
+		}
+	}
+	batch("reconcile", false)
+	abort.response.Store(3)
+	batch("delete_issued", true)
+	s.cfg.NASCleanupDeletionEnabled = false
+	lists, heads := abort.lists.Load(), abort.heads.Load()
+	observe(request, "reconcile", false)
+	if abort.lists.Load() != lists || abort.heads.Load() != heads {
+		t.Fatal("master-off replay performed abort provider checks")
+	}
 	receipt := cleanupReceipt{Attempt: task.Attempt, PlanSHA: digest, ProofSHA: cleanupSHA(proofBytes), Outcome: "deleted"}
 	for range 2 {
 		w := cleanupCall(t, s.handleAccountNASCleanupResult, 47, 47, "itemId", fmt.Sprint(task.ItemID), receipt, session)

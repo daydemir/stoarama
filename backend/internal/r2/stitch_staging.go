@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -372,10 +373,9 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	if issued != reconcile {
 		return errors.New("stitch stage retirement state differs; issued targets require reconciliation")
 	}
-	head, err := c.Head(ctx, key)
 	if reconcile {
-		if !IsNotFound(err) {
-			return errors.New("stitch stage absence remains unconfirmed")
+		if err := c.requireStitchStageAbsent(ctx, key); err != nil {
+			return err
 		}
 		if _, err = tx.Exec(ctx, `UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=clock_timestamp()
  WHERE object_id=$1 AND absence_observed_at IS NULL`, objectID); err != nil {
@@ -383,6 +383,7 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 		}
 		return tx.Commit(ctx)
 	}
+	head, err := c.Head(ctx, key)
 	if err != nil || cleanETag(head.ETag) != cleanETag(etag) || head.VersionID != version ||
 		head.SizeBytes != size || head.SHA256Metadata != sha || !head.LastModified.Equal(modified) {
 		return errors.New("stitch stage generation differs")
@@ -413,7 +414,7 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	}); err != nil {
 		return errors.New("stitch stage delete outcome unconfirmed; reconcile only")
 	}
-	if _, err = c.Head(ctx, key); !IsNotFound(err) {
+	if err := c.requireStitchStageAbsent(ctx, key); err != nil {
 		return errors.New("stitch stage delete absence unconfirmed; reconcile only")
 	}
 	if _, err = tx.Exec(ctx, `UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=clock_timestamp()
@@ -450,28 +451,47 @@ func (c *Client) observeAbortedStitchStage(ctx context.Context, tx pgx.Tx, objec
 	if _, err := c.stitchStageDeleteFence(ctx, tx); err != nil {
 		return false, err
 	}
-	requestOptions := func(o *s3.Options) {
-		noStitchStageRetries(o)
-		o.HTTPClient = &http.Client{Transport: c.deleteTransport, CheckRedirect: refuseRetirementRedirect}
-	}
-	uploads, err := c.s3.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
-		Bucket: aws.String(c.bucket), Prefix: aws.String(key), MaxUploads: aws.Int32(1),
-	}, requestOptions)
-	if err != nil || uploads.IsTruncated == nil || *uploads.IsTruncated || len(uploads.Uploads) != 0 {
-		return false, errors.New("aborted stitch stage multipart work has not drained")
-	}
-	_, err = c.s3.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)}, requestOptions)
-	var response *awshttp.ResponseError
-	if !IsNotFound(err) || !errors.As(err, &response) || response.HTTPStatusCode() != http.StatusNotFound ||
-		response.Response.Header.Get("x-amz-delete-marker") != "" {
-		return false, errors.New("aborted stitch stage absence remains unconfirmed")
-	}
-	codes := response.Response.Header.Values("x-amz-error-code")
-	if len(codes) > 1 || (len(codes) == 1 && codes[0] != "NotFound" && codes[0] != "NoSuchKey" && codes[0] != "404") {
-		return false, errors.New("aborted stitch stage HEAD returned a conflicting provider error")
+	if err := c.VerifyAbortedStitchStageAbsence(ctx, c.bucket, c.EndpointSHA256(), key); err != nil {
+		return false, err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO nas_stitch_r2_aborted_absences(object_id) VALUES($1)`, objectID)
 	return err == nil, err
+}
+
+// VerifyAbortedStitchStageAbsence is a provider-only check. The caller must
+// establish that this exact stage generation is terminal and its grants drained.
+func (c *Client) VerifyAbortedStitchStageAbsence(ctx context.Context, bucket, endpointSHA, key string) error {
+	if bucket != c.bucket || endpointSHA != c.EndpointSHA256() || !strings.HasPrefix(key, "stitch-staging/") {
+		return errors.New("aborted stitch stage provider identity differs")
+	}
+	uploads, err := c.s3.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
+		Bucket: aws.String(c.bucket), Prefix: aws.String(key), MaxUploads: aws.Int32(1),
+	}, c.stitchStageObservationOptions)
+	if err != nil || uploads.IsTruncated == nil || *uploads.IsTruncated || len(uploads.Uploads) != 0 {
+		return errors.New("aborted stitch stage multipart work has not drained")
+	}
+	return c.requireStitchStageAbsent(ctx, key)
+}
+
+func (c *Client) stitchStageObservationOptions(o *s3.Options) {
+	noStitchStageRetries(o)
+	o.HTTPClient = &http.Client{Transport: c.deleteTransport, CheckRedirect: refuseRetirementRedirect}
+}
+
+func (c *Client) requireStitchStageAbsent(ctx context.Context, key string) error {
+	_, err := c.s3.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(c.bucket), Key: aws.String(key),
+	}, c.stitchStageObservationOptions)
+	var response *awshttp.ResponseError
+	if !IsNotFound(err) || !errors.As(err, &response) || response.HTTPStatusCode() != http.StatusNotFound ||
+		len(response.Response.Header.Values("x-amz-delete-marker")) != 0 {
+		return errors.New("stitch stage absence remains unconfirmed")
+	}
+	codes := response.Response.Header.Values("x-amz-error-code")
+	if len(codes) > 1 || (len(codes) == 1 && codes[0] != "NotFound" && codes[0] != "NoSuchKey" && codes[0] != "404") {
+		return errors.New("stitch stage HEAD returned a conflicting provider error")
+	}
+	return nil
 }
 
 func (c *Client) stitchStageDeleteFence(ctx context.Context, tx pgx.Tx) (time.Time, error) {

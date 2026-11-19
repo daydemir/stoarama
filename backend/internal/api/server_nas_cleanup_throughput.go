@@ -117,6 +117,8 @@ type cleanupObserveEnv struct {
 	budgetHeld bool
 	issued     int64
 	prefetched map[int64]cleanupPrefetchedRecovery
+	// Only exact aborted stages verified by R2 in this observation request.
+	abortedStitchAbsences map[cleanupAbortedStitchTarget]bool
 }
 
 // cleanupRecoveryPermits: a permit needs a full streamed-SHA verification
@@ -852,6 +854,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		}
 	}
 	env := &cleanupObserveEnv{session: cleanupAdmissionSession(r, req.ClientVersion), dryRunOnly: dryRunOnly, freshRequests: freshRequests, prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
+	s.cleanupPrefetchAbortedStitchAbsences(ctx, cid, ids, env)
 	if cleanupObservationExpired(ctx) {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
 		return

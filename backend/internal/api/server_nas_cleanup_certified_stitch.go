@@ -68,3 +68,80 @@ func cleanupCheckCertifiedStitch(ctx context.Context, q interface {
 	}
 	return nil
 }
+
+type cleanupAbortedStitchTarget struct {
+	id                       int64
+	bucket, endpointSHA, key string
+}
+
+// Include every aborted row, even when it lacks a receipt or safe abort
+// provenance. Such a row must never disappear from the permit check.
+const cleanupAbortedStitchTargetsSQL = `SELECT o.id,o.bucket,o.endpoint_sha256,o.object_key,
+ safe.id IS NOT NULL AND a.object_id IS NOT NULL AND coalesce(safe.grants_drain_at,'-infinity')<clock_timestamp()
+ FROM nas_stitch_r2_stage_objects o
+ LEFT JOIN nas_stitch_r2_aborts_awaiting_absence safe ON safe.id=o.id
+ LEFT JOIN nas_stitch_r2_aborted_absences a ON a.object_id=o.id
+ WHERE o.state='aborted' AND `
+
+func (s *Server) cleanupPrefetchAbortedStitchAbsences(ctx context.Context, cid int64, ids []int64, env *cleanupObserveEnv) {
+	if s.r2 == nil || !s.cfg.NASCleanupDeletionEnabled || cid != 13 || env.dryRunOnly ||
+		env.session.version != nasCleanupCertifiedStitchVersion || len(ids) == 0 {
+		return
+	}
+	rows, err := s.pool.Query(ctx, cleanupAbortedStitchTargetsSQL+`o.hour_id IN (
+ SELECT (m.item#>>'{stitch_certificate,hour_id}')::bigint
+ FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id
+ CROSS JOIN LATERAL (SELECT coalesce(i.item,p.manifest->(i.ordinal-1)) item) m
+ WHERE i.id=ANY($1) AND p.connection_id=$2 AND p.mode='enabled' AND p.approved_until>clock_timestamp()
+ AND i.lease_connection_id=$2 AND i.lease_client_version=$3 AND i.lease_client_boot_id=$4
+ AND (i.state='leased' AND i.lease_expires_at>clock_timestamp()
+    OR i.state='delete_issued' AND i.permit_expires_at>clock_timestamp())
+ AND m.item->>'permit_reason'=$5)`, ids, cid, env.session.version, env.session.boot, nasCleanupCertifiedStitchReason)
+	if err != nil {
+		return // No provider evidence will be available for the permit check.
+	}
+	var targets []cleanupAbortedStitchTarget
+	for rows.Next() {
+		var target cleanupAbortedStitchTarget
+		var drained bool
+		if err := rows.Scan(&target.id, &target.bucket, &target.endpointSHA, &target.key, &drained); err != nil {
+			rows.Close()
+			return
+		}
+		if drained {
+			targets = append(targets, target)
+		}
+	}
+	if rows.Err() != nil || len(targets) == 0 {
+		return
+	}
+	env.abortedStitchAbsences = make(map[cleanupAbortedStitchTarget]bool, len(targets))
+	for _, target := range targets {
+		if ctx.Err() != nil {
+			break
+		}
+		if err := s.r2.VerifyAbortedStitchStageAbsence(ctx, target.bucket, target.endpointSHA, target.key); err == nil {
+			env.abortedStitchAbsences[target] = true
+		}
+	}
+}
+
+func (e *cleanupObserveEnv) certifiedStitchAbortsAbsent(ctx context.Context, tx pgx.Tx, item nasCleanupItem) bool {
+	if item.StitchCertificate == nil {
+		return false
+	}
+	rows, err := tx.Query(ctx, cleanupAbortedStitchTargetsSQL+`o.hour_id=$1`, item.StitchCertificate.HourID)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var target cleanupAbortedStitchTarget
+		var drained bool
+		if err := rows.Scan(&target.id, &target.bucket, &target.endpointSHA, &target.key, &drained); err != nil ||
+			!drained || !e.abortedStitchAbsences[target] {
+			return false
+		}
+	}
+	return rows.Err() == nil
+}

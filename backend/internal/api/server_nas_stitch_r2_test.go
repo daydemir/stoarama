@@ -34,8 +34,9 @@ func TestR2StitchDurhamHoldReleasedOnlyByCommittedNASCertificate(t *testing.T) {
 	sha := cleanupSHA(media)
 	const abortGeneration = "f5238abd-6063-4441-a712-a9647d10b986"
 	abortKey := "stitch-staging/" + abortGeneration + "/" + sha + ".mp4"
-	var abortResponse atomic.Int32
-	provider := durhamStageTestProvider(t, media, sha, abortKey, &abortResponse)
+	var abort durhamStageAbortProbe
+	var stageHeadResponse atomic.Int32
+	provider := durhamStageTestProvider(t, media, sha, abortKey, &abort, &stageHeadResponse)
 	defer provider.Close()
 	admin, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -522,7 +523,14 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		t.Fatal("ambiguous staging delete allowed a second wire attempt", err)
 	}
 	t.Run("certified NAS cleanup waits for exact R2 retirement", func(t *testing.T) {
-		testCertifiedStitchNASCleanup(t, s, id, sourceKey, func() {
+		testCertifiedStitchNASCleanup(t, s, id, sourceKey, &abort, func() {
+			for _, mode := range []int32{1, 2} {
+				stageHeadResponse.Store(mode)
+				if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, true); err == nil {
+					t.Fatalf("ambiguous staged HEAD authorized absence in provider case %d", mode)
+				}
+			}
+			stageHeadResponse.Store(0)
 			if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, true); err != nil {
 				t.Fatalf("staging retirement could not reconcile exact absence: %v", err)
 			}
@@ -531,12 +539,12 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 				t.Fatalf("unresolved abort on the earlier attempt cleared staging: %v %v", stagingAbsent, err)
 			}
 			for _, mode := range []int32{0, 1, 2, 4, 5} {
-				abortResponse.Store(mode)
+				abort.response.Store(mode)
 				if err := store.RetireStitchStage(ctx, 122, sha, time.Time{}, true); err == nil {
 					t.Fatalf("unconfirmed aborted stage accepted in provider case %d", mode)
 				}
 			}
-			abortResponse.Store(3)
+			abort.response.Store(3)
 			for range 2 {
 				if err := store.RetireStitchStage(ctx, 122, sha, time.Time{}, true); err != nil {
 					t.Fatalf("clean aborted stage absence or exact replay refused: %v", err)
@@ -560,7 +568,11 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	}
 }
 
-func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, abortResponse *atomic.Int32) *httptest.Server {
+type durhamStageAbortProbe struct {
+	response, lists, heads atomic.Int32
+}
+
+func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, abort *durhamStageAbortProbe, stageHeadResponse *atomic.Int32) *httptest.Server {
 	t.Helper()
 	var mu sync.Mutex
 	var started, part, completed, deleted bool
@@ -574,9 +586,12 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, a
 		w.Header().Set("Content-Type", "application/xml")
 		if r.Method == http.MethodGet && r.URL.Path == "/stoarama" && query.Has("uploads") &&
 			strings.HasPrefix(query.Get("prefix"), "stitch-staging/") {
-			if query.Get("prefix") == abortKey && abortResponse.Load() == 0 {
-				fmt.Fprintf(w, "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated><Upload><Key>%s</Key><UploadId>still-live</UploadId></Upload></ListMultipartUploadsResult>", abortKey)
-				return
+			if query.Get("prefix") == abortKey {
+				abort.lists.Add(1)
+				if abort.response.Load() == 0 {
+					fmt.Fprintf(w, "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated><Upload><Key>%s</Key><UploadId>still-live</UploadId></Upload></ListMultipartUploadsResult>", abortKey)
+					return
+				}
 			}
 			fmt.Fprint(w, "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>")
 			return
@@ -587,7 +602,8 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, a
 				w.WriteHeader(http.StatusMethodNotAllowed)
 				return
 			}
-			switch abortResponse.Load() {
+			abort.heads.Add(1)
+			switch abort.response.Load() {
 			case 1:
 				w.WriteHeader(http.StatusServiceUnavailable)
 			case 2:
@@ -633,6 +649,12 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, a
 			deleted = true
 			w.WriteHeader(http.StatusServiceUnavailable)
 		case r.Method == http.MethodHead && deleted:
+			switch stageHeadResponse.Load() {
+			case 1:
+				w.Header().Set("x-amz-delete-marker", "true")
+			case 2:
+				w.Header().Set("x-amz-error-code", "NoSuchBucket")
+			}
 			w.WriteHeader(http.StatusNotFound)
 		case r.Method == http.MethodHead && completed:
 			w.Header().Set("ETag", `"stage-etag"`)

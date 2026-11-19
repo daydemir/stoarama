@@ -394,9 +394,12 @@ label and items in a separate plan. Request
 The API derives the replacement proof and original sidecar digest and uses the
 existing dry run, plan approval, source freeze, delivery veto and deletion
 budget. NAS deletion also requires recorded absence for every staging object
-from every attempt for that hour. The initial dry run records the raw and sidecar
-identities from the NAS and hashes them against the exact recorded evidence,
-including raws copied after the frozen inventory audit. Before asking for a
+from every attempt for that hour. Before issuing or replaying a permit, the API
+checks each aborted stage's writer grant drain, lists multipart uploads for its
+exact key prefix, and requires an unambiguous HEAD 404 for that key. Hours with
+no aborted stages require no provider reads for this check. The initial dry run
+records the raw and sidecar identities from the NAS and hashes them against the
+exact recorded evidence, including raws copied after the frozen inventory audit. Before asking for a
 permit the client rechecks those files and hashes the retained output. It
 rechecks the open files and pathnames immediately before unlink. A missing
 or changed output keeps the raw.
