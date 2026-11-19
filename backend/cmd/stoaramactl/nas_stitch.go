@@ -17,9 +17,12 @@ import (
 
 func runNASStitch(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) == 0 {
-		log.Fatal("usage: nas-stitch status|proof-plan|verify-proof|approve|pause|import-corpus|backlog")
+		log.Fatal("usage: nas-stitch status|proof-plan|verify-proof|approve|pause|import-corpus|backlog|mint-durham-key")
 	}
 	switch args[0] {
+	case "mint-durham-key":
+		runMintDurhamStitchKey(ctx, cfg, args[1:])
+		return
 	case "backlog":
 		runNASStitchBacklog(ctx, cfg, args[1:])
 		return

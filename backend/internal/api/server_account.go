@@ -1264,6 +1264,10 @@ func (s *Server) insertAccountAuthEvent(ctx context.Context, accountID int64, ap
 }
 
 func (s *Server) insertAccountAuthEventTx(ctx context.Context, tx pgx.Tx, accountID int64, apiKeyID *int64, eventType, actorType, actorRef string, detail map[string]any) error {
+	return insertAccountAuthEventTx(ctx, tx, accountID, apiKeyID, eventType, actorType, actorRef, detail)
+}
+
+func insertAccountAuthEventTx(ctx context.Context, tx pgx.Tx, accountID int64, apiKeyID *int64, eventType, actorType, actorRef string, detail map[string]any) error {
 	var keyID any
 	if apiKeyID != nil {
 		keyID = *apiKeyID

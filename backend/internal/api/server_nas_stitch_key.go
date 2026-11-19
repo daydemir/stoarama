@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"slices"
 	"strings"
@@ -15,6 +16,8 @@ import (
 const (
 	nasStitchAccountID     int64 = 47
 	nasStitchKeyHashPrefix       = "nas-stitch:"
+	nasStitchKeyLabel            = "Durham NAS stitch"
+	nasStitchKeyMintLock   int64 = 7343226011191
 )
 
 func isNASStitchKey(p accountPrincipal) bool {
@@ -35,27 +38,96 @@ func (s *Server) handleAdminNASStitchKeyMint(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusForbidden, "operator session required")
 		return
 	}
-	ctx := r.Context()
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, "could not begin stitch key issuance")
+	key, err := issueDurhamStitchKey(r.Context(), s.pool, p.Email, "", durhamMintBrowser)
+	if errors.Is(err, errDurhamStitchKeyActive) {
+		util.WriteError(w, http.StatusConflict, "an active Durham stitch key already exists")
 		return
 	}
-	defer tx.Rollback(ctx)
-	const label = "Durham NAS stitch"
-	id, prefix, token, err := mintAccountAPIKey(ctx, tx, nasStitchAccountID, label, accountScopeNASStitch, nil)
 	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, "could not mint the dedicated stitch key")
-		return
-	}
-	if err := s.insertAccountAuthEventTx(ctx, tx, nasStitchAccountID, &id, "api_key_created", "operator", p.Email, map[string]any{
-		"label": label, "key_prefix": prefix, "scope": accountScopeNASStitch,
-	}); err != nil || tx.Commit(ctx) != nil {
-		util.WriteError(w, http.StatusInternalServerError, "could not commit stitch key issuance")
+		util.WriteError(w, http.StatusInternalServerError, "Durham stitch key issuance unavailable")
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	util.WriteJSON(w, http.StatusCreated, map[string]any{"id": id, "key_prefix": prefix, "token": token, "label": label, "scopes": []accountAPIKeyScope{accountScopeNASStitch}})
+	util.WriteJSON(w, http.StatusCreated, map[string]any{"id": key.id, "key_prefix": key.prefix,
+		"token": key.token, "label": nasStitchKeyLabel, "scopes": []accountAPIKeyScope{accountScopeNASStitch}})
+}
+
+type durhamStitchMintMethod string
+
+const (
+	durhamMintBrowser durhamStitchMintMethod = "admin_session"
+	durhamMintCLI     durhamStitchMintMethod = "stoaramactl"
+)
+
+var errDurhamStitchKeyActive = errors.New("an active Durham stitch key already exists")
+
+type durhamStitchKey struct {
+	id            int64
+	prefix, token string
+}
+
+type durhamStitchMintDB interface {
+	Begin(context.Context) (pgx.Tx, error)
+}
+
+func issueDurhamStitchKey(
+	ctx context.Context, db durhamStitchMintDB, actor, authorization string, method durhamStitchMintMethod,
+) (durhamStitchKey, error) {
+	var key durhamStitchKey
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return key, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasStitchKeyMintLock); err != nil {
+		return key, err
+	}
+	var active bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM account_api_keys
+ WHERE account_id=$1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>clock_timestamp())
+  AND ($2=ANY(scopes) OR starts_with(secret_hash,$3)))`, nasStitchAccountID, string(accountScopeNASStitch),
+		nasStitchKeyHashPrefix).Scan(&active); err != nil {
+		return key, err
+	}
+	if active {
+		return key, errDurhamStitchKeyActive
+	}
+	var databaseActor string
+	if err := tx.QueryRow(ctx, `SELECT current_user`).Scan(&databaseActor); err != nil {
+		return key, err
+	}
+	key.id, key.prefix, key.token, err = mintAccountAPIKey(ctx, tx, nasStitchAccountID, nasStitchKeyLabel, accountScopeNASStitch, nil)
+	if err != nil {
+		return durhamStitchKey{}, err
+	}
+	if err := insertAccountAuthEventTx(ctx, tx, nasStitchAccountID, &key.id, "api_key_created", "operator", actor, map[string]any{
+		"label": nasStitchKeyLabel, "key_prefix": key.prefix, "scope": accountScopeNASStitch,
+		"method": method, "database_actor": databaseActor, "authorization_reference": authorization,
+	}); err != nil {
+		return durhamStitchKey{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return durhamStitchKey{id: key.id}, err
+	}
+	return key, nil
+}
+
+// MintDurhamStitchKeyTo writes only the newly committed token to the caller's
+// private credential sink. The returned ID allows reconciliation on delivery
+// or ambiguous commit failure. Only the operator CLI supplies this sink.
+func MintDurhamStitchKeyTo(ctx context.Context, db durhamStitchMintDB, actor, authorization string, sink io.Writer) (int64, error) {
+	actor, authorization = strings.TrimSpace(actor), strings.TrimSpace(authorization)
+	if actor == "" || len(actor) > 200 || authorization == "" || len(authorization) > 500 || sink == nil {
+		return 0, errors.New("operator identity, owner authorization and private sink required")
+	}
+	key, err := issueDurhamStitchKey(ctx, db, actor, authorization, durhamMintCLI)
+	if err != nil {
+		return key.id, err
+	}
+	if n, err := io.WriteString(sink, key.token+"\n"); err != nil || n != len(key.token)+1 {
+		return key.id, errors.New("Durham credential delivery failed")
+	}
+	return key.id, nil
 }
 
 // Abandonment frees the shared lane after credential loss without accepting

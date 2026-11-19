@@ -150,6 +150,14 @@ Provision the pinned tools and corpus offline. The existing admin key-ID
 revocation route revokes this key independently of connection 13. Older API
 binaries cannot authenticate the dedicated key's stored digest.
 
+The operator CLI can issue the same fixed account-47 credential with
+`stoaramactl nas-stitch mint-durham-key` using the operator database connection.
+Supply the owner authorization reference and an inherited writable pipe from
+the approved 1Password sink. The CLI emits the bearer only through that pipe.
+The browser and CLI share the one-active-key guard and audit transaction.
+If issuance or vault acknowledgement is uncertain, reconcile the recorded
+key ID and vault item before any further issuance attempt.
+
 A result awaiting its durable receipt keeps the shared stitch lane occupied.
 If a dedicated key is revoked or expires in that window, the operator status
 lists outstanding registrations first and shows each exact plan digest, owner
