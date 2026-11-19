@@ -225,7 +225,7 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 		return false, nil
 	}
 	var held bool
-	if err = tx.QueryRow(ctx, inverseRawHeldSQL, target.ID, i.Bucket, i.ObjectKey, "", target.Path, target.SHA, target.Size).Scan(&held); err != nil || held {
+	if err = tx.QueryRow(ctx, inverseRawHeldSQL, target.ID, i.Bucket, i.ObjectKey, "", target.Path, target.SHA, target.Size, false).Scan(&held); err != nil || held {
 		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	var exact bool

@@ -36,6 +36,8 @@ func requireJoinedTestReplicationRole(t *testing.T, pool *pgxpool.Pool) {
 }
 
 var joinedMigrationNames = []string{
+	// The joined batch release replaces the deferred joined retention guard.
+	"0218_r2_joined_batch_release.sql",
 	// The R2 stitch handoff depends on the deferred stitch and writer-fence tables.
 	"0217_nas_stitch_r2_handoff.sql",
 	// Defer with 0167; the final MigrateUp applies both in dependency order.
