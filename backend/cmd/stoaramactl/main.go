@@ -139,6 +139,8 @@ func main() {
 		runNASVerifiedPurge(ctx, cfg, os.Args[2:])
 	case "delivery-nas-handoff":
 		runDeliveryNASHandoff(ctx, cfg, os.Args[2:])
+	case "delivery-source-coverage":
+		runDeliveryCoverage(ctx, cfg, os.Args[2:])
 	case "delivery-keep":
 		runDeliveryKeep(ctx, cfg, os.Args[2:])
 	case "r2-inverse":
