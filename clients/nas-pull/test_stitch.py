@@ -599,7 +599,7 @@ class StitchTaskDataHoldTests(unittest.TestCase):
     def test_missing_sidecar_reports_every_input_left_out_once(self):
         # The real sidecar read fails for a clip whose .stoarama.json is absent.
         def build(cfg, inventory, task, stop, tools):
-            raise pull.MediaCertificationError("stitch sidecar is invalid")
+            raise pull.MediaCertificationError("stitch sidecar is missing") from FileNotFoundError()
         self.patch_common(build)
         self.assertEqual(pull.stitch_once(self.cfg, self.inventory, self.stop), 30)
         results = [body for path, body in self.calls if path.endswith('/result')]
@@ -614,6 +614,15 @@ class StitchTaskDataHoldTests(unittest.TestCase):
         with self.inventory.lock:
             row = self.inventory.db.execute('SELECT registered FROM stitch_jobs WHERE task_id=7').fetchone()
         self.assertEqual(row[0], 1)
+
+    def test_missing_raw_holds_only_this_hour(self):
+        def build(cfg, inventory, task, stop, tools):
+            raise pull.MediaCertificationError("media path is unavailable") from NotADirectoryError()
+        self.patch_common(build)
+        self.assertEqual(pull.stitch_once(self.cfg, self.inventory, self.stop), 30)
+        results = [body for path, body in self.calls if path.endswith('/result')]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['left_out'], [1, 2, 3])
 
     def test_typed_task_failure_is_held_and_reported(self):
         def build(cfg, inventory, task, stop, tools):

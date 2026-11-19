@@ -48761,12 +48761,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                 if cleanup_identity(os.fstat(fd)) != cleanup_identity(info):
                     raise StitchTaskFailure("source identity changed before native audit")
                 path = Path("/proc/%d/fd/%d" % (os.getpid(), fd))
-            try:
-                _, scinfo = confined_regular_file(cfg.output_dir, clip["relative_path"] + ".stoarama.json")
-            except MediaCertificationError as exc:
-                if isinstance(exc.__cause__, FileNotFoundError):
-                    raise StitchTaskFailure("stitch sidecar is missing") from None
-                raise
+            _, scinfo = confined_regular_file(cfg.output_dir, clip["relative_path"] + ".stoarama.json")
             clip.update(frozen_identity=cleanup_identity(info), frozen_sidecar_identity=cleanup_identity(scinfo), _path=path)
             if not plan["eligible"][index] or (admitted is not None and not admitted(clip)):
                 if kind is StitchRunKind.PROOF:
@@ -50648,7 +50643,7 @@ def stitch_once(cfg, inventory, stop_event):
             if not os.path.ismount(str(cfg.output_dir)):
                 raise StitchResourceHold("NAS output root is not mounted") from None
             cause = exc.__cause__
-            if isinstance(cause, OSError):
+            if isinstance(cause, OSError) and not isinstance(cause, (FileNotFoundError, NotADirectoryError)):
                 raise StitchResourceHold("NAS source I/O unavailable") from exc
             # Otherwise this hour's own bytes are unusable: missing/invalid
             # sidecar, unreadable media metadata, or a plan whose data no longer

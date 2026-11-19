@@ -4,9 +4,7 @@
 -- (read-only, exact object, no upload). The 0187 writer fence therefore must not
 -- gate the stitch lane: without this migration every pending/leased
 -- nas_stitch_tasks row and every nas_stitch_outputs row raises while the fence
--- is active, and because keep28 raw on the NAS is never deleted for stitching,
--- the lane-busy check (a verified task with an undeleted cleanup plan) would
--- keep the single lane busy forever after its first task.
+-- is active. Ordinary readiness retains each input and releases the lane.
 --
 -- Only the two stitch triggers are removed. Every other 0187 trigger stays.
 --
