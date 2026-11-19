@@ -411,6 +411,19 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 		t.Fatalf("handoff check challenge code=%d result=%v", code, pathCheck)
 	}
 	challenge := pathCheck["check"].(map[string]any)
+	checkStatusPath := fmt.Sprintf("%s?check_id=%d", deliveryNASHandoffCheckPath, int64(challenge["id"].(float64)))
+	expectCheckStatus := func(want string) {
+		t.Helper()
+		code, result := do(s.handleAccountDeliveryNASHandoffCheck, http.MethodGet, checkStatusPath, nil, nil)
+		if code != http.StatusOK || result["status"] != want {
+			t.Fatalf("handoff check status code=%d result=%v want=%s", code, result, want)
+		}
+	}
+	expectCheckStatus("pending")
+	_, freezePage := do(s.handleAccountCollated, http.MethodGet, "/api/v1/account/collated?handoff_readback=1", nil, nil)
+	if freezePage["policy"].(map[string]any)["handoff_check"] != true {
+		t.Fatalf("active check did not request a client drain: %v", freezePage)
+	}
 	if code, _ := do(s.handleAccountDeliveryNASHandoffCheck, http.MethodPost, deliveryNASHandoffCheckPath,
 		map[string]any{"id": challenge["id"], "manifest_sha256": challenge["manifest_sha256"], "mount": []int64{5, 100}}, nil); code != 409 {
 		t.Fatalf("unapproved mount accepted at check completion: %d", code)
@@ -421,9 +434,15 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 			t.Fatalf("path check completion or replay code=%d", code)
 		}
 	}
+	expectCheckStatus("accepted")
 	if code, result := do(s.handleAccountDeliveryNASHandoffCheck, http.MethodGet, deliveryNASHandoffCheckPath, nil, nil); code != 200 || result["check"] != nil {
 		t.Fatalf("completed handoff check reissued code=%d result=%v", code, result)
 	}
+
+	if _, err := pool.Exec(ctx, "INSERT INTO delivery_nas_handoff_rounds(roster_sha256,round) VALUES($1,2)", sha); err != nil {
+		t.Fatal(err)
+	}
+	expectCheckStatus("superseded")
 
 	// A prefix longer than the scan page is withheld, but the cursor must reach
 	// the later deliverable output. Duplicated sources cannot duplicate outputs.

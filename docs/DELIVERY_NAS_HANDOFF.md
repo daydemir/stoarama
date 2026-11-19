@@ -57,14 +57,25 @@ missing file can be copied and a conflicting final file is preserved for
 reconciliation. Receipts from preceding rounds remain as history.
 
 When the final recheck completes, rerun the preview with
-`--request-final-check`. The NAS checks the path and current device, inode,
-size and timestamps of every approved output against the completed readbacks.
-The checker keeps every approved file open under a Linux read lease. An
-existing writable mapping or a writer trying to open a file during the
-check blocks success. It also watches the approved path components with
-inotify and verifies the pinned mount before reporting. The NAS process
-must be able to open one descriptor per approved output and acquire a
-read lease on each file.
+`--request-final-check`. The verified NAS client saves the request and drains
+its writers. Its existing service restart takes the NAS client process lock
+and checks every approved path before starting writers again. The finalizer
+can also be run with `delivery-handoff-check` in the same NAS client environment
+when the normal process is stopped.
+
+The check binds current device, inode, size and timestamps to the complete
+SHA-256 readback round. It holds a Linux read lease on each file, watches
+the approved path components with inotify, and verifies the pinned mount.
+The process lock stays held through the API's acceptance. If the response is
+lost, the saved request blocks other client writers until the server confirms
+acceptance or a newer check or readback round supersedes it. Use the matching
+client release throughout recovery.
+
+The controller confirms that the NAS client owns mutations to the approved
+paths and their ancestors. Other users and jobs can read those paths during
+cutover. If a separate writer can change them, keep the cutover paused.
+The client must be able to open and lease one file descriptor per approved
+output.
 
 Export with `--export-file-list delivery-nas-file-list.json` after this
 check completes. Export requires the complete approved roster and one

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/daydemir/stoarama/backend/internal/util"
 	"github.com/jackc/pgx/v5"
@@ -14,15 +15,17 @@ const deliveryNASHandoffCheckMaxBytes = 8 << 20
 
 // Both methods use the active roster and its latest readback round. The
 // challenge is issued only after that round has every exact NAS receipt.
+const deliveryNASHandoffCheckSupersededSQL = `EXISTS(SELECT 1 FROM delivery_nas_handoff_rounds newer
+ WHERE newer.roster_sha256=q.roster_sha256 AND newer.round>q.round)
+ OR EXISTS(SELECT 1 FROM delivery_nas_handoff_checks newer
+  WHERE newer.roster_sha256=q.roster_sha256 AND newer.round=q.round AND newer.id>q.id)`
+
 const deliveryNASHandoffActiveCheckSQL = `
  FROM delivery_nas_handoff_checks q
  JOIN connections c ON c.id=13 AND c.delivery_nas_handoff_enabled
   AND c.delivery_nas_handoff_roster_sha256=q.roster_sha256
  JOIN delivery_nas_handoff_mounts m ON m.roster_sha256=q.roster_sha256
- WHERE NOT EXISTS(SELECT 1 FROM delivery_nas_handoff_rounds newer
-  WHERE newer.roster_sha256=q.roster_sha256 AND newer.round>q.round)
- AND NOT EXISTS(SELECT 1 FROM delivery_nas_handoff_checks superseded
-  WHERE superseded.roster_sha256=q.roster_sha256 AND superseded.round=q.round AND superseded.id>q.id)`
+ WHERE NOT (` + deliveryNASHandoffCheckSupersededSQL + `)`
 
 type deliveryNASHandoffCheckResult struct {
 	ID           int64    `json:"id"`
@@ -42,6 +45,27 @@ func (s *Server) handleAccountDeliveryNASHandoffCheck(w http.ResponseWriter, r *
 	}
 	ctx := r.Context()
 	if r.Method == http.MethodGet {
+		if raw := r.URL.Query().Get("check_id"); raw != "" {
+			id, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || id <= 0 {
+				util.WriteError(w, http.StatusBadRequest, "invalid NAS handoff check ID")
+				return
+			}
+			var status string
+			err = s.pool.QueryRow(ctx, `SELECT CASE WHEN `+deliveryNASHandoffCheckSupersededSQL+`
+ THEN 'superseded' WHEN q.checked_at IS NOT NULL THEN 'accepted' ELSE 'pending' END
+ FROM delivery_nas_handoff_checks q WHERE q.id=$1`, id).Scan(&status)
+			if errors.Is(err, pgx.ErrNoRows) {
+				util.WriteError(w, http.StatusNotFound, "NAS handoff check not found")
+				return
+			}
+			if err != nil {
+				util.WriteError(w, http.StatusServiceUnavailable, "read NAS handoff check status")
+				return
+			}
+			util.WriteJSON(w, http.StatusOK, map[string]string{"status": status})
+			return
+		}
 		var result struct {
 			deliveryNASHandoffCheckResult
 			Files json.RawMessage `json:"files"`

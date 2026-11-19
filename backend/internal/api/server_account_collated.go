@@ -189,7 +189,8 @@ func (s *Server) handleAccountCollated(w http.ResponseWriter, r *http.Request) {
 	}
 	var policy collatedPolicy
 	if err := s.pool.QueryRow(r.Context(), `SELECT collated_delivery_enabled OR ($2 AND delivery_nas_handoff_enabled),
-        collated_download_bytes_per_sec,collated_download_parallel,($2 AND delivery_nas_handoff_enabled)
+        collated_download_bytes_per_sec,collated_download_parallel,
+        ($2 AND connections.id=13 AND EXISTS(SELECT 1 `+deliveryNASHandoffActiveCheckSQL+` AND q.checked_at IS NULL))
 		FROM connections WHERE id=$1`, connectionID, collatedHandoffClient(r)).Scan(&policy.Enabled, &policy.DownloadBytesPerSec, &policy.DownloadParallel, &policy.HandoffCheck); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "load collated policy")
 		return

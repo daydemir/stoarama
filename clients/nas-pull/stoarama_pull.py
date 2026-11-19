@@ -1888,6 +1888,7 @@ class Runtime:
         self.cursor_id = max(0, int(progress.get("after_id", 0)))
         self.collated_after_id = 0
         self.collated_next_poll = 0.0
+        self.handoff_final_check_requested = threading.Event()
         self.clips_pulled = max(0, int(progress.get("clips_pulled", 0)))
         self.bytes_pulled = max(0, int(progress.get("bytes_pulled", 0)))
         self.phase = Phase.STARTING
@@ -19238,7 +19239,11 @@ def set_idle_unless_capacity_blocked(runtime):
     runtime.set_phase(Phase.BLOCKED if runtime.is_capacity_blocked() else Phase.IDLE)
 
 
-def acquire_lock(cfg):
+def collated_handoff_pending(cfg):
+    return cfg.state_dir / "delivery-nas-handoff-pending.json"
+
+
+def acquire_lock(cfg, *, handoff_finalizer=False):
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     handle = open(cfg.lock_file, "a+", encoding="utf-8")
     try:
@@ -19246,6 +19251,9 @@ def acquire_lock(cfg):
     except BlockingIOError as exc:
         handle.close()
         raise RuntimeError("another NAS pull client already holds %s" % cfg.lock_file) from exc
+    if not handoff_finalizer and os.path.lexists(collated_handoff_pending(cfg)):
+        handle.close()
+        raise RuntimeError("NAS handoff acceptance is unresolved; rerun delivery-handoff-check before starting writers")
     return handle
 
 
@@ -24376,12 +24384,28 @@ class CollatedHandoffPathWatch:
         self.resources.close()
 
 
-def check_collated_handoff_paths(cfg, stop_event):
-    target = "/account/collated/handoff-check"
-    response = request_json(cfg, "GET", target, read_limit=(8 << 20) + 4096)
+def fetch_collated_handoff_check(cfg):
+    response = request_json(cfg, "GET", "/account/collated/handoff-check", read_limit=(8 << 20) + 4096)
     if not isinstance(response, dict) or set(response) != {"check"}:
         raise ValueError("invalid NAS handoff path check response")
-    check = response["check"]
+    return response["check"]
+
+
+def check_collated_handoff_paths(cfg, stop_event):
+    target = "/account/collated/handoff-check"
+    pending = collated_handoff_pending(cfg)
+    recovering = os.path.lexists(pending)
+    if recovering:
+        fd = os.open(pending, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as journal:
+            if not stat_module.S_ISREG(os.fstat(journal.fileno()).st_mode):
+                raise ValueError("NAS handoff journal is not a regular file")
+            raw = journal.read((8 << 20) + 4097)
+        if len(raw) > (8 << 20) + 4096:
+            raise ValueError("NAS handoff pending check exceeds its bound")
+        check = json.loads(raw)
+    else:
+        check = fetch_collated_handoff_check(cfg)
     if check is None:
         return
     if not isinstance(check, dict) or set(check) != {"id", "manifest_sha256", "mount", "files"}:
@@ -24392,6 +24416,15 @@ def check_collated_handoff_paths(cfg, stop_event):
             or any(type(value) is not int or value < 0 for value in mount_pin) or mount_pin[1] == 0
             or not isinstance(files, list) or not 1 <= len(files) <= 20000):
         raise ValueError("invalid NAS handoff path check bounds")
+    if recovering:
+        decision = request_json(cfg, "GET", "%s?check_id=%d" % (target, check_id), read_limit=4096)
+        if decision in ({"status": "accepted"}, {"status": "superseded"}):
+            pending.unlink()
+            fsync_dir(pending.parent)
+            log("INFO", "NAS handoff path check %d %s" % (check_id, decision["status"]))
+            return
+        if decision != {"status": "pending"}:
+            raise RuntimeError("NAS handoff check acceptance is unresolved")
     paths = []
     previous = 0
     for row in files:
@@ -24461,12 +24494,29 @@ def check_collated_handoff_paths(cfg, stop_event):
         report = {"id": check_id, "manifest_sha256": digest, "mount": mount_pin}
         if failed is not None:
             report["failed_output_id"] = failed
-        request_json(cfg, "POST", target, body=report)
-        log("INFO", "NAS handoff path check %d %s" % (check_id, "complete" if failed is None else "withheld output %d" % failed))
+        # Keep the process writer lock through the authoritative outcome. The
+        # durable journal blocks all normal writer starts if the outcome is lost.
+        atomic_write(pending, json.dumps(check, separators=(",", ":")).encode("utf-8"))
+        reply = request_json(cfg, "POST", target, body=report)
+        if reply != {"ok": True}:
+            raise RuntimeError("NAS handoff check acceptance is unresolved")
+        outcome = "complete" if failed is None else "withheld output %d" % failed
+        pending.unlink()
+        fsync_dir(pending.parent)
+        log("INFO", "NAS handoff path check %d %s" % (check_id, outcome))
     finally:
         if watch is not None:
             watch.close()
         os.close(mount.fd)
+
+
+def finalize_collated_handoff(cfg):
+    if cfg.dry_run:
+        raise ValueError("delivery-handoff-check requires the active NAS configuration")
+    cfg.validate()
+    # The normal daemon and offline media writers all take this same lock.
+    with acquire_lock(cfg, handoff_finalizer=True):
+        check_collated_handoff_paths(cfg, threading.Event())
 
 
 def drain_collated(cfg, runtime, stop_event):
@@ -24482,6 +24532,14 @@ def drain_collated(cfg, runtime, stop_event):
     if not isinstance(page, dict) or set(page) != {"policy", "items", "next_after_id"} or not isinstance(page["items"], list):
         raise RuntimeError("collated response is invalid")
     policy = valid_collated_policy(page["policy"])
+    if policy["handoff_check"]:
+        check = fetch_collated_handoff_check(cfg)
+        if check is not None:
+            # Persist the challenge before draining. Confirmation itself only
+            # runs on the next process start, before any media writer starts.
+            atomic_write(collated_handoff_pending(cfg), json.dumps(check, separators=(",", ":")).encode("utf-8"))
+            runtime.handoff_final_check_requested.set()
+            return False
     next_id = page["next_after_id"]
     if type(next_id) is not int or next_id < 0 or (next_id != 0 and next_id <= runtime.collated_after_id):
         raise RuntimeError("collated cursor is invalid")
@@ -24490,11 +24548,6 @@ def drain_collated(cfg, runtime, stop_event):
         raise RuntimeError("collated item outside cursor page")
     runtime.collated_after_id = next_id
     if not policy["enabled"] or not items:
-        if policy["handoff_check"] and next_id == 0 and not stop_event.is_set():
-            try:
-                check_collated_handoff_paths(cfg, stop_event)
-            except CollatedDownloadStopped as exc:
-                log("INFO", str(exc))
         return False
     limiter = ByteRateLimiter(policy["download_bytes_per_sec"])
     delivered = []
@@ -52416,7 +52469,15 @@ def mark_capacity_blocked_audit_healthy(cfg, runtime, storage_checked, audit_rep
 def run(cfg):
     CLIENT_LOG_RING.configure(cfg)
     cfg.validate()
-    lock_handle = acquire_lock(cfg)
+    lock_handle = acquire_lock(cfg, handoff_finalizer=True)
+    try:
+        if os.path.lexists(collated_handoff_pending(cfg)):
+            if cfg.dry_run:
+                raise RuntimeError("NAS handoff acceptance is unresolved in dry-run mode")
+            check_collated_handoff_paths(cfg, threading.Event())
+    except BaseException:
+        lock_handle.close()
+        raise
     _pins, pins_error = cleanup_pins()
     if pins_error is not None:
         # Deletion stays refused for this whole process; every other lane runs.
@@ -52493,11 +52554,11 @@ def run(cfg):
         benchmark_worker = threading.Thread(target=benchmark_loop, args=(cfg, runtime, stop_event), daemon=True)
         benchmark_worker.start()
     try:
-        while not stop_event.is_set():
+        while not (stop_event.is_set() or runtime.handoff_final_check_requested.is_set()):
             # No delivery page is active at this boundary. A staged candidate
             # may replace the process even when storage/list work is failing,
             # provided the inventory thread has reached its stop checkpoint.
-            if update_can_exec(update_ready, inventory_worker, stop_event, joined_worker, cleanup_worker, copy_worker):
+            if not runtime.handoff_final_check_requested.is_set() and update_can_exec(update_ready, inventory_worker, stop_event, joined_worker, cleanup_worker, copy_worker):
                 runtime.set_phase(Phase.UPDATING)
                 exec_candidate(cfg, runtime)
             if not heartbeat.is_alive():
@@ -52539,7 +52600,7 @@ def run(cfg):
                     # not resurrect the previous client indefinitely.
                     mark_runtime(cfg, runtime, "healthy")
                     runtime.stable_marked = True
-                if update_can_exec(update_ready, inventory_worker, stop_event, joined_worker, cleanup_worker, copy_worker):
+                if not runtime.handoff_final_check_requested.is_set() and update_can_exec(update_ready, inventory_worker, stop_event, joined_worker, cleanup_worker, copy_worker):
                     runtime.set_phase(Phase.UPDATING)
                     exec_candidate(cfg, runtime)
                 set_idle_unless_capacity_blocked(runtime)
@@ -53987,7 +54048,7 @@ def r2_copy_loop(cfg, runtime, inventory, stop):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Stoarama NAS pull client")
-    parser.add_argument("command", nargs="?", choices=("run", "check", "version", "self-update", "certify", "copy-manifest"), default="run")
+    parser.add_argument("command", nargs="?", choices=("run", "check", "version", "self-update", "certify", "copy-manifest", "delivery-handoff-check"), default="run")
     parser.add_argument("--manifest", default="")
     parser.add_argument("--expected-sha256", default="")
     parser.add_argument("--max-bytes", type=int, default=0)
@@ -54002,6 +54063,9 @@ def main(argv=None):
         print(CLIENT_VERSION)
         return 0
     cfg = Config()
+    if args.command == "delivery-handoff-check":
+        finalize_collated_handoff(cfg)
+        return 0
     if args.command == "copy-manifest":
         print(json.dumps(copy_r2_manifest(cfg, args.manifest, args.expected_sha256, args.max_bytes), sort_keys=True))
         return 0

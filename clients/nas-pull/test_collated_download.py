@@ -42,6 +42,7 @@ class CollatedDownloadTests(unittest.TestCase):
         self.cfg = SimpleNamespace(
             api_base="https://stoarama.test/api/v1", api_key="sir_test", origin="https://stoarama.test",
             output_dir=root / "clips", state_dir=root, min_free_bytes=100, dry_run=False, poll_interval_sec=10,
+            lock_file=root / "client.lock", validate=lambda: None,
         )
         self.body = os.urandom(3 * pull.COLLATED_CHUNK_BYTES + 17)
         self.item = {
@@ -56,6 +57,7 @@ class CollatedDownloadTests(unittest.TestCase):
         self.runtime.capacity_blocked = False
         self.runtime.collated_after_id = 0
         self.runtime.collated_next_poll = 0.0
+        self.runtime.handoff_final_check_requested = threading.Event()
         self.requests = []
         self.acks = []
         self.errors = []
@@ -320,6 +322,49 @@ class CollatedDownloadTests(unittest.TestCase):
             with self.assertRaisesRegex(pull.CollatedDownloadStopped, "file is writable during path check"):
                 pull.check_collated_handoff_paths(self.cfg, threading.Event())
         self.assertEqual([call.args[1] for call in request.call_args_list], ["GET"])
+
+    def test_handoff_feed_drains_before_starting_other_delivery(self):
+        challenge = {"id": 8, "manifest_sha256": "b" * 64, "mount": [1, 2], "files": [[7, REL, [1, 2, 3, 4, 1]]]}
+        page = {"policy": {"enabled": True, "download_bytes_per_sec": 1 << 30, "download_parallel": 2,
+                           "handoff_check": True}, "items": [dict(self.item)], "next_after_id": 7}
+        with mock.patch.object(pull, "request_json", side_effect=[page, {"check": challenge}]), \
+                mock.patch.object(pull, "download_collated_item") as download:
+            self.assertFalse(pull.drain_collated(self.cfg, self.runtime, threading.Event()))
+        self.assertTrue(self.runtime.handoff_final_check_requested.is_set())
+        self.assertEqual(pull.read_json(pull.collated_handoff_pending(self.cfg), None), challenge)
+        download.assert_not_called()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "production NAS path watch uses Linux read leases")
+    def test_handoff_writer_lock_survives_a_lost_completion_response(self):
+        self.enable_handoff()
+        self.assertTrue(self.drain())
+        challenge = {"id": 8, "manifest_sha256": "b" * 64, "mount": self.item["handoff_mount"],
+                     "files": [[7, REL, self.acks[0]["handoff_readback"]]]}
+
+        def lost_reply(cfg, method, path, **kwargs):
+            if method == "GET":
+                return {"check": challenge}
+            with self.assertRaisesRegex(RuntimeError, "another NAS pull client"):
+                pull.acquire_lock(self.cfg)
+            self.assertTrue(pull.collated_handoff_pending(self.cfg).is_file())
+            raise TimeoutError("response lost")
+
+        with pull.acquire_lock(self.cfg):
+            with self.assertRaisesRegex(RuntimeError, "another NAS pull client"):
+                pull.finalize_collated_handoff(self.cfg)
+        with mock.patch.object(pull, "request_json", side_effect=lost_reply), \
+                mock.patch.object(pull.os.path, "ismount", return_value=True):
+            with self.assertRaises(TimeoutError):
+                pull.finalize_collated_handoff(self.cfg)
+
+        with self.assertRaisesRegex(RuntimeError, "acceptance is unresolved"):
+            pull.acquire_lock(self.cfg)
+        with mock.patch.object(pull, "request_json", return_value={"status": "accepted"}) as request:
+            pull.finalize_collated_handoff(self.cfg)
+        self.assertEqual(request.call_args.args[1:], ("GET", "/account/collated/handoff-check?check_id=8"))
+        self.assertFalse(pull.collated_handoff_pending(self.cfg).exists())
+        with pull.acquire_lock(self.cfg):
+            pass
 
     def test_handoff_refuses_unmounted_root(self):
         self.enable_handoff()
