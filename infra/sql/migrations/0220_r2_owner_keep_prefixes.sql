@@ -31,6 +31,9 @@ $$;
 -- write: writers take it shared, a new hold takes it exclusively.
 CREATE FUNCTION guard_r2_owner_keep_retirement() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'R2 owner keep check requires READ COMMITTED';
+ END IF;
  PERFORM pg_advisory_xact_lock_shared(7343226011220);
  IF r2_owner_keep_held(NEW.bucket,NEW.object_key) THEN
   RAISE EXCEPTION 'R2 OWNER KEEP HOLD: retirement forbidden for %', NEW.object_key;
@@ -53,6 +56,9 @@ END $$;
 CREATE FUNCTION guard_r2_owner_keep_purge() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
  IF OLD.purged_at IS NULL AND NEW.purged_at IS NOT NULL THEN
+  IF current_setting('transaction_isolation')<>'read committed' THEN
+   RAISE EXCEPTION 'R2 owner keep check requires READ COMMITTED';
+  END IF;
   PERFORM pg_advisory_xact_lock_shared(7343226011220);
   IF r2_owner_keep_held(OLD.bucket,OLD.object_key) OR r2_owner_keep_held(NEW.bucket,NEW.object_key) THEN
    RAISE EXCEPTION 'R2 OWNER KEEP HOLD: purge forbidden for %', OLD.object_key;
@@ -84,7 +90,9 @@ BEGIN
   OR EXISTS(SELECT 1 FROM r2_inverse_intents i WHERE i.bucket=NEW.bucket AND starts_with(i.object_key,NEW.prefix)
     AND NOT EXISTS(SELECT 1 FROM r2_inverse_events v WHERE v.bucket=i.bucket AND v.object_key=i.object_key AND v.event='absent'))
   OR EXISTS(SELECT 1 FROM r2_keep28_intents i WHERE i.bucket=NEW.bucket AND starts_with(i.object_key,NEW.prefix)
-    AND NOT EXISTS(SELECT 1 FROM r2_keep28_events v WHERE v.bucket=i.bucket AND v.object_key=i.object_key AND v.event='absent')) THEN
+    AND NOT EXISTS(SELECT 1 FROM r2_keep28_events v WHERE v.bucket=i.bucket AND v.object_key=i.object_key AND v.event='absent'))
+  OR EXISTS(SELECT 1 FROM nas_stitch_r2_stage_retirements r JOIN nas_stitch_r2_stage_objects o ON o.id=r.object_id
+    WHERE r.absence_observed_at IS NULL AND o.bucket=NEW.bucket AND starts_with(o.object_key,NEW.prefix)) THEN
   RAISE EXCEPTION 'R2 owner keep hold % overlaps a pending R2 retirement', NEW.prefix;
  END IF;
  RETURN NEW;
@@ -97,13 +105,16 @@ ALTER TABLE r2_owner_keep_prefixes ENABLE ALWAYS TRIGGER r2_owner_keep_admission
 -- not be under an owner keep prefix either.
 CREATE FUNCTION guard_r2_owner_keep_stage_retirement() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'R2 owner keep check requires READ COMMITTED';
+ END IF;
  PERFORM pg_advisory_xact_lock_shared(7343226011220);
  IF EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects o WHERE o.id=NEW.object_id AND r2_owner_keep_held(o.bucket,o.object_key)) THEN
   RAISE EXCEPTION 'R2 OWNER KEEP HOLD: stage retirement forbidden for object %', NEW.object_id;
  END IF;
  RETURN NEW;
 END $$;
-CREATE TRIGGER r2_owner_keep_stage_retirement BEFORE INSERT ON nas_stitch_r2_stage_retirements
+CREATE TRIGGER r2_owner_keep_stage_retirement BEFORE INSERT OR UPDATE OF object_id ON nas_stitch_r2_stage_retirements
  FOR EACH ROW EXECUTE FUNCTION guard_r2_owner_keep_stage_retirement();
 ALTER TABLE nas_stitch_r2_stage_retirements ENABLE ALWAYS TRIGGER r2_owner_keep_stage_retirement;
 

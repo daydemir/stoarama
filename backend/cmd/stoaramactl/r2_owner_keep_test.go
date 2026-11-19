@@ -176,3 +176,62 @@ func TestR2OwnerKeepStopsTheExecutor(t *testing.T) {
 		}
 	})
 }
+
+// A staging retirement in flight blocks a new hold over it, a held object
+// cannot gain a staging retirement by reassignment, and guarded writes under
+// Repeatable Read are refused before they rely on a stale snapshot.
+func TestR2OwnerKeepStagingAndIsolation(t *testing.T) {
+	f := newKeep28Fixture(t)
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(f.ctx, `SET LOCAL session_replication_role=replica`); err != nil {
+		t.Fatal(err)
+	}
+	var free, held int64
+	if err = tx.QueryRow(f.ctx, `INSERT INTO nas_stitch_r2_stage_objects(hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes) VALUES(1,1,1,'stoarama',repeat('a',64),'h/1.mp4',repeat('b',64),10) RETURNING id`).Scan(&free); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.QueryRow(f.ctx, `INSERT INTO nas_stitch_r2_stage_objects(hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes) VALUES(1,1,1,'stoarama',repeat('a',64),'h/2.mp4',repeat('c',64),10) RETURNING id`).Scan(&held); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(f.ctx, `INSERT INTO nas_stitch_r2_stage_retirements(object_id) VALUES($1)`, free); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	// An unresolved staging retirement blocks a hold over its key.
+	if _, err = f.pool.Exec(f.ctx, `INSERT INTO r2_owner_keep_prefixes(bucket,prefix,decision) VALUES('stoarama','stitch-staging/','late hold')`); err == nil || !strings.Contains(err.Error(), "overlaps a pending R2 retirement") {
+		t.Fatalf("hold over an unresolved staging retirement: %v", err)
+	}
+	// Repeatable Read writers are refused by the guards themselves.
+	rr, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rr.Rollback(f.ctx)
+	if _, err = rr.Exec(f.ctx, `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = rr.Exec(f.ctx, `INSERT INTO r2_inverse_attempts(bucket,object_key) VALUES('stoarama','managed/acct-47/other/rr.mp4')`); err == nil || !strings.Contains(err.Error(), "READ COMMITTED") {
+		t.Fatalf("repeatable-read ledger write: %v", err)
+	}
+	rr.Rollback(f.ctx)
+	// Reassigning a staging retirement to a held object is refused, even in replica mode.
+	if _, err = f.pool.Exec(f.ctx, `INSERT INTO r2_owner_keep_prefixes(bucket,prefix,decision) SELECT 'stoarama',left(object_key,length('stitch-staging/')+37),'test hold' FROM nas_stitch_r2_stage_objects WHERE id=$1`, held); err != nil {
+		t.Fatal(err)
+	}
+	move, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer move.Rollback(f.ctx)
+	if _, err = move.Exec(f.ctx, `SET LOCAL session_replication_role=replica`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = move.Exec(f.ctx, `UPDATE nas_stitch_r2_stage_retirements SET object_id=$1 WHERE object_id=$2`, held, free); err == nil || !strings.Contains(err.Error(), "OWNER KEEP HOLD") {
+		t.Fatalf("staging retirement reassigned to a held object: %v", err)
+	}
+}
