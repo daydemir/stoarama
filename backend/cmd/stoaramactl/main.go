@@ -263,7 +263,7 @@ func usage() {
 	  stoaramactl nas-benchmark report --connection-id ID [--limit 5 --json]
 	  stoaramactl nas-benchmark request --connection-id ID [--recording-id ID --window-start RFC3339]
 	  stoaramactl joined-source-purge run [--batch-id ID --hour-record-id N --apply --check-r2 --limit N --rate 10 --require-nas=true --sha-every 50 --log PATH --json]
-	  stoaramactl delivery-nas-handoff --roster FILE --expected-roster-sha256 SHA --picks FILE --expected-picks-sha256 SHA [--apply | --start-final-recheck | --export-file-list FILE]
+	  stoaramactl delivery-nas-handoff --roster FILE --expected-roster-sha256 SHA --picks FILE --expected-picks-sha256 SHA [--apply --approved-root-device N --approved-root-inode N | --start-final-recheck | --request-final-check | --export-file-list FILE]
   stoaramactl collation-v2 plan|run|register|put-worklist (see: stoaramactl collation-v2)
 	  stoaramactl joined-source-purge hold --hour-record-id N --reason CODE [--note TEXT] | holds [--json]
 	  stoaramactl do-spend report [--json]

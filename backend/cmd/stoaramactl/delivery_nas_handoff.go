@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -76,7 +77,6 @@ SELECT jsonb_build_object('bucket','stoarama','object_key',k.object_key,'size_by
     OR k.sha256 NOT IN ('',o.sha256) OR o.sha256 !~ '^[a-f0-9]{64}$' THEN 'catalog and delivery hold identity differ'
   WHEN EXISTS(SELECT 1 FROM r2_object_retirements t WHERE t.kind='collated' AND t.source_id=o.id)
     THEN 'the R2 object is retired'
-  WHEN NOT nas_delivery_allowed(13,'collated',o.id) THEN 'the existing NAS delivery fence withholds the output'
   ELSE '' END
 FROM delivery_keep_holds k
 JOIN recording_collation_outputs o ON o.object_key=k.object_key
@@ -111,7 +111,7 @@ func deliveryNASReadRoster(path, expected string) ([]byte, error) {
 }
 
 func queueDeliveryNASHandoff(ctx context.Context, tx pgx.Tx, approved []byte, windows []deliveryNASWindow,
-	summary deliveryNASManifestSummary, apply bool) (deliveryNASManifestSummary, error) {
+	summary deliveryNASManifestSummary, mount *[2]int64) (deliveryNASManifestSummary, error) {
 	if _, err := tx.Exec(ctx, "SET LOCAL TIME ZONE 'UTC'; SET LOCAL statement_timeout='45s'; SET LOCAL lock_timeout='2s'"); err != nil {
 		return summary, err
 	}
@@ -126,6 +126,7 @@ func queueDeliveryNASHandoff(ctx context.Context, tx pgx.Tx, approved []byte, wi
 	defer rows.Close()
 	read := bufio.NewReader(bytes.NewReader(approved))
 	seen := map[int64]bool{}
+	var outputIDs []int64
 	pins := make([][]any, 0)
 	for rows.Next() {
 		var canonical, relative, blocker string
@@ -133,12 +134,15 @@ func queueDeliveryNASHandoff(ctx context.Context, tx pgx.Tx, approved []byte, wi
 			return summary, err
 		}
 		line, err := read.ReadString('\n')
-		if err != nil || line != canonical+"\n" {
-			return summary, fmt.Errorf("live delivery roster differs from the approved SHA-256 at row %d", summary.Rows+1)
+		var want, row deliveryNASManifestRow
+		if json.Unmarshal([]byte(canonical), &row) != nil {
+			return summary, errors.New("live delivery roster produced invalid JSON")
 		}
-		var row deliveryNASManifestRow
-		if err := json.Unmarshal([]byte(canonical), &row); err != nil {
-			return summary, err
+		if err != nil || json.Unmarshal([]byte(line), &want) != nil {
+			return summary, fmt.Errorf("live roster contains unexpected delivery output %d", row.OutputID)
+		}
+		if line != canonical+"\n" {
+			return summary, fmt.Errorf("approved delivery output %d differs from live output %d", want.OutputID, row.OutputID)
 		}
 		if blocker != "" {
 			return summary, fmt.Errorf("delivery output %d is blocked: %s", row.OutputID, blocker)
@@ -147,6 +151,7 @@ func queueDeliveryNASHandoff(ctx context.Context, tx pgx.Tx, approved []byte, wi
 			return summary, fmt.Errorf("delivery output %d is ambiguous or outside the copy contract", row.OutputID)
 		}
 		seen[row.OutputID] = true
+		outputIDs = append(outputIDs, row.OutputID)
 		pins = append(pins, []any{canonical, relative, summary.RosterSHA, summary.PicksSHA})
 		summary.Rows++
 		summary.Bytes += row.Bytes
@@ -154,10 +159,23 @@ func queueDeliveryNASHandoff(ctx context.Context, tx pgx.Tx, approved []byte, wi
 	if err := rows.Err(); err != nil {
 		return summary, err
 	}
-	if _, err := read.ReadByte(); summary.Rows == 0 || !errors.Is(err, io.EOF) {
-		return summary, errors.New("live delivery roster is empty or missing approved rows")
+	if line, err := read.ReadString('\n'); !errors.Is(err, io.EOF) || line != "" {
+		var expected deliveryNASManifestRow
+		if json.Unmarshal([]byte(line), &expected) != nil {
+			return summary, errors.New("approved delivery roster has an invalid final row")
+		}
+		return summary, fmt.Errorf("approved delivery output %d is absent from the live roster", expected.OutputID)
 	}
-	if apply {
+	if summary.Rows == 0 {
+		return summary, errors.New("live delivery roster is empty")
+	}
+	if err := checkDeliveryNASRosterFences(ctx, tx, outputIDs); err != nil {
+		return summary, err
+	}
+	if mount != nil {
+		if err := pinDeliveryNASHandoffMount(ctx, tx, summary.RosterSHA, *mount); err != nil {
+			return summary, err
+		}
 		if err := insertDeliveryNASHandoff(ctx, tx, pins); err != nil {
 			return summary, err
 		}
@@ -172,6 +190,44 @@ func queueDeliveryNASHandoff(ctx context.Context, tx pgx.Tx, approved []byte, wi
 		summary.Queued = true
 	}
 	return summary, nil
+}
+
+func checkDeliveryNASRosterFences(ctx context.Context, tx pgx.Tx, outputs []int64) error {
+	// The same live predicate used by feed admission evaluates every source
+	// clip. Bound each statement independently and keep one catalog snapshot.
+	for batch := range slices.Chunk(outputs, 128) {
+		var blocked []int64
+		err := tx.QueryRow(ctx, `
+ SELECT coalesce(array_agg(output_id ORDER BY output_id),'{}'::bigint[])
+ FROM unnest($1::bigint[]) output_id
+ WHERE NOT nas_delivery_allowed(13,'collated',output_id)`, batch).Scan(&blocked)
+		if err != nil {
+			return err
+		}
+		if len(blocked) > 0 {
+			return fmt.Errorf("existing NAS delivery fence withholds outputs %v", blocked)
+		}
+	}
+	return nil
+}
+
+func pinDeliveryNASHandoffMount(ctx context.Context, tx pgx.Tx, roster string, mount [2]int64) error {
+	if mount[0] < 0 || mount[1] <= 0 {
+		return errors.New("the controller-approved NAS device and root inode are required")
+	}
+	if _, err := tx.Exec(ctx, `
+ INSERT INTO delivery_nas_handoff_mounts(roster_sha256,device,inode)
+ VALUES($1,$2,$3) ON CONFLICT(roster_sha256) DO NOTHING`, roster, mount[0], mount[1]); err != nil {
+		return err
+	}
+	var current [2]int64
+	if err := tx.QueryRow(ctx, `SELECT device,inode FROM delivery_nas_handoff_mounts WHERE roster_sha256=$1`, roster).Scan(&current[0], &current[1]); err != nil {
+		return err
+	}
+	if current != mount {
+		return errors.New("the approved roster is already bound to a different NAS root")
+	}
+	return nil
 }
 
 func insertDeliveryNASHandoff(ctx context.Context, tx pgx.Tx, pins [][]any) error {
@@ -211,21 +267,23 @@ func insertDeliveryNASHandoff(ctx context.Context, tx pgx.Tx, pins [][]any) erro
 	return nil
 }
 
+const deliveryNASCompleteRoundSQL = `
+WITH prior AS (
+ SELECT coalesce(max(round),0) AS round FROM delivery_nas_handoff_rounds WHERE roster_sha256=$1
+), complete AS (
+ SELECT count(*)=$3 AND coalesce(sum(p.size_bytes),0)=$4 AS ready
+ FROM delivery_nas_handoff_outputs p
+ JOIN delivery_nas_handoff_copyable live ON live.output_id=p.output_id
+ JOIN delivery_nas_handoff_readbacks r ON r.output_id=p.output_id AND r.round=live.round
+  AND r.connection_id=13 AND r.size_bytes=p.size_bytes AND r.device=live.device AND r.root_inode=live.inode
+ JOIN recording_collation_output_acks a ON a.output_id=p.output_id AND a.connection_id=13
+  AND a.nas_relative_path=p.nas_relative_path AND a.sha256=p.sha256 AND a.size_bytes=p.size_bytes
+ WHERE p.roster_sha256=$1 AND p.picks_sha256=$2
+)`
+
 func startDeliveryNASFinalRecheck(ctx context.Context, tx pgx.Tx, summary deliveryNASManifestSummary) (int64, error) {
 	var round int64
-	err := tx.QueryRow(ctx, `
- WITH prior AS (
-  SELECT coalesce(max(round),0) AS round FROM delivery_nas_handoff_rounds WHERE roster_sha256=$1
- ), complete AS (
-  SELECT count(*)=$3 AND coalesce(sum(p.size_bytes),0)=$4 AS ready
-  FROM delivery_nas_handoff_outputs p
-  JOIN delivery_nas_handoff_copyable live ON live.output_id=p.output_id
-  JOIN delivery_nas_handoff_readbacks r ON r.output_id=p.output_id AND r.round=live.round
-    AND r.connection_id=13 AND r.size_bytes=p.size_bytes
-  JOIN recording_collation_output_acks a ON a.output_id=p.output_id AND a.connection_id=13
-    AND a.nas_relative_path=p.nas_relative_path AND a.sha256=p.sha256 AND a.size_bytes=p.size_bytes
-  WHERE p.roster_sha256=$1 AND p.picks_sha256=$2
- )
+	err := tx.QueryRow(ctx, deliveryNASCompleteRoundSQL+`
  INSERT INTO delivery_nas_handoff_rounds(roster_sha256,round)
  SELECT $1,prior.round+1 FROM prior,complete WHERE complete.ready
   AND EXISTS(SELECT 1 FROM connections WHERE id=13 AND delivery_nas_handoff_enabled
@@ -233,6 +291,34 @@ func startDeliveryNASFinalRecheck(ctx context.Context, tx pgx.Tx, summary delive
  RETURNING round`, summary.RosterSHA, summary.PicksSHA, summary.Rows, summary.Bytes).Scan(&round)
 	if errors.Is(err, pgx.ErrNoRows) {
 		err = errors.New("the active roster must finish its prior NAS readback round before final recheck")
+	}
+	return round, err
+}
+
+func requestDeliveryNASFinalCheck(ctx context.Context, tx pgx.Tx, summary deliveryNASManifestSummary) (int64, error) {
+	var round int64
+	err := tx.QueryRow(ctx, deliveryNASCompleteRoundSQL+`,
+ ready AS (
+  SELECT prior.round,jsonb_agg(jsonb_build_array(p.output_id,p.nas_relative_path,
+    jsonb_build_array(r.size_bytes,r.mtime_ns,r.ctime_ns,r.inode,r.device)) ORDER BY p.output_id) manifest
+  FROM prior,complete,delivery_nas_handoff_outputs p
+  JOIN delivery_nas_handoff_readbacks r ON r.output_id=p.output_id AND r.connection_id=13
+  WHERE p.roster_sha256=$1 AND p.picks_sha256=$2 AND prior.round>0 AND r.round=prior.round AND complete.ready
+   AND EXISTS(SELECT 1 FROM connections c WHERE c.id=13 AND c.delivery_nas_handoff_enabled
+    AND c.delivery_nas_handoff_roster_sha256=$1)
+  GROUP BY prior.round
+ ), requested AS (
+  INSERT INTO delivery_nas_handoff_checks(roster_sha256,round,manifest,manifest_sha256)
+  SELECT $1,round,manifest,encode(sha256(convert_to(manifest::text,'UTF8')),'hex') FROM ready
+  ON CONFLICT(roster_sha256,round) WHERE checked_at IS NULL DO NOTHING RETURNING round
+ )
+ SELECT round FROM requested
+ UNION ALL SELECT ready.round FROM ready JOIN delivery_nas_handoff_checks existing
+  ON existing.roster_sha256=$1 AND existing.round=ready.round AND existing.manifest=ready.manifest
+   AND existing.checked_at IS NULL
+ `, summary.RosterSHA, summary.PicksSHA, summary.Rows, summary.Bytes).Scan(&round)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = errors.New("the complete final NAS readback round is required before requesting the path check")
 	}
 	return round, err
 }
@@ -256,10 +342,22 @@ func runDeliveryNASHandoff(ctx context.Context, cfg config.Config, args []string
 	picksPath := fs.String("picks", "", "the owner picks used to build the reviewed roster")
 	picksSHA := fs.String("expected-picks-sha256", "", "SHA-256 of the reviewed owner picks")
 	apply := fs.Bool("apply", false, "queue the reviewed copies after live roster verification")
+	rootDevice := fs.Int64("approved-root-device", -1, "device of the controller-verified NAS root")
+	rootInode := fs.Int64("approved-root-inode", 0, "inode of the controller-verified NAS root")
 	export := fs.String("export-file-list", "", "write the verified public file list to a new JSON file")
 	recheck := fs.Bool("start-final-recheck", false, "start a fresh readback of every approved NAS path")
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *roster == "" || *picksPath == "" || (*apply && (*export != "" || *recheck)) || (*export != "" && *recheck) {
-		log.Fatal("delivery-nas-handoff --roster FILE --expected-roster-sha256 SHA --picks FILE --expected-picks-sha256 SHA [--apply | --start-final-recheck | --export-file-list FILE]")
+	check := fs.Bool("request-final-check", false, "check approved NAS paths after the final readback")
+	if err := fs.Parse(args); err != nil {
+		log.Fatal(err)
+	}
+	actions := 0
+	for _, selected := range []bool{*apply, *recheck, *check, *export != ""} {
+		if selected {
+			actions++
+		}
+	}
+	if fs.NArg() != 0 || *roster == "" || *picksPath == "" || actions > 1 || (*apply && (*rootDevice < 0 || *rootInode <= 0)) {
+		log.Fatal("delivery-nas-handoff --roster FILE --expected-roster-sha256 SHA --picks FILE --expected-picks-sha256 SHA [--apply --approved-root-device N --approved-root-inode N | --start-final-recheck | --request-final-check | --export-file-list FILE]")
 	}
 	approved, err := deliveryNASReadRoster(*roster, *expected)
 	if err != nil {
@@ -276,13 +374,13 @@ func runDeliveryNASHandoff(ctx context.Context, cfg config.Config, args []string
 	if err != nil {
 		log.Fatal(err)
 	}
-	pool, err := r2RetireOpenPool(ctx, cfg, !*apply && !*recheck)
+	pool, err := r2RetireOpenPool(ctx, cfg, !*apply && !*recheck && !*check)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer pool.Close()
 	mode := pgx.ReadOnly
-	if *apply || *recheck {
+	if *apply || *recheck || *check {
 		mode = pgx.ReadWrite
 	}
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{AccessMode: mode, IsoLevel: pgx.RepeatableRead})
@@ -290,13 +388,23 @@ func runDeliveryNASHandoff(ctx context.Context, cfg config.Config, args []string
 		log.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
+	var mount *[2]int64
+	if *apply {
+		mount = &[2]int64{*rootDevice, *rootInode}
+	}
 	summary, err := queueDeliveryNASHandoff(ctx, tx, approved, windows,
-		deliveryNASManifestSummary{RosterSHA: *expected, PicksSHA: *picksSHA}, *apply)
+		deliveryNASManifestSummary{RosterSHA: *expected, PicksSHA: *picksSHA}, mount)
 	if err != nil {
 		log.Fatal(err)
 	}
 	if *recheck {
 		summary.VerificationRound, err = startDeliveryNASFinalRecheck(ctx, tx, summary)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	if *check {
+		summary.VerificationRound, err = requestDeliveryNASFinalCheck(ctx, tx, summary)
 		if err != nil {
 			log.Fatal(err)
 		}

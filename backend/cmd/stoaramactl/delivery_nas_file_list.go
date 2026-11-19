@@ -13,14 +13,16 @@ import (
 )
 
 type deliveryNASFileLink struct {
-	FormerURL               string `json:"former_url"`
-	FormerPinnedURL         string `json:"former_pinned_url"`
-	FormerTicketURL         string `json:"former_ticket_url"`
-	NASRelativePath         string `json:"nas_relative_path"`
-	SizeBytes               int64  `json:"size_bytes"`
-	SHA256                  string `json:"sha256"`
-	FormerDownloadURL       string `json:"former_download_url"`
-	FormerPinnedDownloadURL string `json:"former_pinned_download_url"`
+	FormerURL                     string `json:"former_url"`
+	FormerPinnedURL               string `json:"former_pinned_url"`
+	FormerTicketURL               string `json:"former_ticket_url"`
+	NASRelativePath               string `json:"nas_relative_path"`
+	SizeBytes                     int64  `json:"size_bytes"`
+	SHA256                        string `json:"sha256"`
+	FormerDownloadURL             string `json:"former_download_url"`
+	FormerPinnedDownloadURL       string `json:"former_pinned_download_url"`
+	FormerDirectDownloadURL       string `json:"former_direct_download_url"`
+	FormerPinnedDirectDownloadURL string `json:"former_pinned_direct_download_url"`
 }
 
 type deliveryNASFileList struct {
@@ -36,16 +38,10 @@ func deliveryNASCollectFileList(ctx context.Context, db r2RetireQuerier, summary
 		return list, errors.New("current public delivery generation is unavailable")
 	}
 	rows, err := db.Query(ctx, `
- SELECT p.output_id,p.recording_id,p.object_key,p.etag,p.sha256,p.size_bytes,p.nas_relative_path,d.device,d.root_inode
- FROM delivery_nas_handoff_outputs p JOIN delivery_nas_handoff_copyable live ON live.output_id=p.output_id
- JOIN delivery_nas_handoff_readbacks d ON d.output_id=p.output_id AND d.connection_id=13 AND d.size_bytes=p.size_bytes
-  AND d.round=live.round AND d.round>0
- JOIN delivery_nas_handoff_rounds verification ON verification.roster_sha256=p.roster_sha256 AND verification.round=d.round
-  AND d.observed_at>=verification.started_at
- JOIN recording_collation_output_acks a ON a.output_id=p.output_id AND a.connection_id=13
-  AND a.nas_relative_path=p.nas_relative_path AND a.sha256=p.sha256 AND a.size_bytes=p.size_bytes
- WHERE p.roster_sha256=$1 AND p.picks_sha256=$2
- ORDER BY p.object_key`, summary.RosterSHA, summary.PicksSHA)
+ SELECT output_id,recording_id,object_key,etag,sha256,size_bytes,nas_relative_path,device,root_inode,check_id
+ FROM delivery_nas_handoff_certified
+ WHERE roster_sha256=$1 AND picks_sha256=$2
+ ORDER BY object_key`, summary.RosterSHA, summary.PicksSHA)
 	if err != nil {
 		return list, err
 	}
@@ -53,17 +49,19 @@ func deliveryNASCollectFileList(ctx context.Context, db r2RetireQuerier, summary
 	count, total := 0, int64(0)
 	seen := make(map[string]bool)
 	var mount [2]int64
+	var observedCheck int64
 	for rows.Next() {
 		var outputID, recording, bytes int64
 		var key, etag, sha, path string
 		var current [2]int64
-		if err := rows.Scan(&outputID, &recording, &key, &etag, &sha, &bytes, &path, &current[0], &current[1]); err != nil {
+		var checkID int64
+		if err := rows.Scan(&outputID, &recording, &key, &etag, &sha, &bytes, &path, &current[0], &current[1], &checkID); err != nil {
 			return list, err
 		}
 		if count == 0 {
-			mount = current
-		} else if current != mount {
-			return list, errors.New("the final NAS readbacks span different mounted roots")
+			mount, observedCheck = current, checkID
+		} else if current != mount || checkID != observedCheck {
+			return list, errors.New("the certified outputs span different mounted roots or NAS path checks")
 		}
 		files := keep.PublicFiles[key]
 		if len(files) == 0 || !api.ValidCollatedNASPath(path) {
@@ -77,7 +75,7 @@ func deliveryNASCollectFileList(ctx context.Context, db r2RetireQuerier, summary
 			seen[file.FileURL] = true
 			list.Files = append(list.Files, deliveryNASFileLink{
 				file.FileURL, file.PinnedFileURL, file.TicketURL, "joined/" + path, bytes, sha,
-				file.DownloadURL, file.PinnedDownloadURL,
+				file.DownloadURL, file.PinnedDownloadURL, file.DirectDownloadURL, file.PinnedDirectDownloadURL,
 			})
 		}
 		count++
@@ -87,7 +85,7 @@ func deliveryNASCollectFileList(ctx context.Context, db r2RetireQuerier, summary
 		return list, err
 	}
 	if count != summary.Rows || total != summary.Bytes {
-		return list, fmt.Errorf("NAS handoff readbacks cover %d of %d outputs", count, summary.Rows)
+		return list, fmt.Errorf("current NAS readbacks and completed path check cover %d of %d outputs", count, summary.Rows)
 	}
 	sort.Slice(list.Files, func(i, j int) bool { return list.Files[i].FormerURL < list.Files[j].FormerURL })
 	return list, nil

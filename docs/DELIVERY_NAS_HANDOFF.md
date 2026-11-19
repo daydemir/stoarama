@@ -30,8 +30,11 @@ that order. A predecessor client continues using its ordinary collated
 feed after the migration and API deploy.
 
 Check the active mount's free space and reserve before queuing. Run the
-same command with `--apply` to queue and enable only the approved roster
-on connection 13. The import is atomic and repeatable. The ordinary
+same command with `--apply --approved-root-device DEVICE --approved-root-inode INODE`
+to queue and enable only the approved roster on connection 13. The controller
+takes that identity from a verified observation of the active `/clips` mount,
+such as the latest confirmed connection-13 NAS cleanup proof. The roster pin
+survives client restart and every verification round. The import is atomic and repeatable. The ordinary
 collated-delivery switch keeps its existing setting. Pause the handoff
 independently with `stoaramactl delivery-nas-handoff pause-copy`.
 
@@ -54,19 +57,29 @@ missing file can be copied and a conflicting final file is preserved for
 reconciliation. Receipts from preceding rounds remain as history.
 
 When the final recheck completes, rerun the preview with
-`--export-file-list delivery-nas-file-list.json`. The export requires the
-complete approved roster and one mounted-root identity in the current
-round. It matches each output to its former public file, playback,
-download and ticket links, including aliases that share the same object.
-URL variants with extra query parameters can be looked up by their
-canonical public file pathname. It writes paths relative to the NAS share and
-includes size and SHA-256. It refuses an incomplete readback set or a
-changed public registry.
+`--request-final-check`. The NAS checks the path and current device, inode,
+size and timestamps of every approved output against the completed readbacks.
+It checks directory and mount identity around the sweep. This check only
+visits the approved paths, so unrelated raw tree changes cannot prevent it
+from completing.
+
+Export with `--export-file-list delivery-nas-file-list.json` after this
+check completes. Export requires the complete approved roster and one
+mounted-root identity in the current verification round. If a file is
+missing or has changed, start a new final recheck to repair and certify it.
+If publication is delayed, request another metadata check before cutover.
+
+The list includes former file, playback, download and ticket links,
+including public aliases for the same object. URL variants with extra query
+parameters can be looked up by their canonical public file pathname.
+Paths are relative to the NAS share and include size and SHA-256. Export
+refuses an incomplete verification or a changed public registry.
 
 The controller publishes the file list on stoarama.com and retires the old
 page. The manifest gives recipients file locations for their existing NAS
 handoff. It contains no new hosting endpoint, signed R2 token, or absolute
 server path. Until the controller publishes it, keep the old page and its
 holds in place. Assembly retirement is handled separately by the
-controller. Raw-source coverage and the existing retirement gates are
+controller. The controller can use `delivery_nas_handoff_certified` to check the exact
+copy identity. Raw-source coverage and the existing retirement gates are
 independent of these NAS delivery-copy receipts.

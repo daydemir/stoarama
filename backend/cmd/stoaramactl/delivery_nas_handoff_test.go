@@ -25,7 +25,7 @@ CREATE TABLE delivery_keep_holds(bucket text,object_key text,kind text,etag text
 CREATE TABLE recording_collation_output_acks(output_id bigint,connection_id bigint,nas_relative_path text,size_bytes bigint,sha256 text);
 CREATE TABLE r2_object_retirements(kind text,source_id bigint);
 CREATE FUNCTION nas_delivery_allowed(bigint,text,bigint) RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT true $$;
-INSERT INTO connections VALUES(13,47,'nas_pull');
+INSERT INTO connections(id,account_id,kind) VALUES(13,47,'nas_pull');
 INSERT INTO recordings VALUES(1,47,100,'nas_pull'),(2,47,200,'nas_pull');
 INSERT INTO recording_collation_hours VALUES (11,1,2,'collated'),(12,2,2,'collated');
 INSERT INTO recording_collation_outputs
@@ -74,9 +74,13 @@ INSERT INTO delivery_keep_holds SELECT 'stoarama',object_key,
 			t.Fatal(err)
 		}
 		defer tx.Rollback(ctx)
+		var mount *[2]int64
+		if apply {
+			mount = &[2]int64{5, 9}
+		}
 		sum, err := queueDeliveryNASHandoff(ctx, tx, []byte(raw), windows, deliveryNASManifestSummary{
 			RosterSHA: strings.Repeat("b", 64), PicksSHA: strings.Repeat("c", 64),
-		}, apply)
+		}, mount)
 		if err != nil {
 			return sum, err
 		}
@@ -136,6 +140,26 @@ INSERT INTO delivery_keep_holds SELECT 'stoarama',object_key,
 	if _, err := pool.Exec(ctx, `
  INSERT INTO delivery_nas_handoff_readbacks(output_id,round,connection_id,size_bytes,mtime_ns,ctime_ns,inode,device,root_inode)
  VALUES (1,1,13,100,2,3,4,5,9)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deliveryNASCollectFileList(ctx, pool, summary, keep); err == nil {
+		t.Fatal("file list exported without a post-readback path check")
+	}
+	tx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if round, err := requestDeliveryNASFinalCheck(ctx, tx, summary); err != nil || round != 1 {
+		tx.Rollback(ctx)
+		t.Fatalf("request final check round=%d err=%v", round, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deliveryNASCollectFileList(ctx, pool, summary, keep); err == nil {
+		t.Fatal("file list exported before the NAS completed the path check")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE delivery_nas_handoff_checks SET checked_at=clock_timestamp() WHERE round=1`); err != nil {
 		t.Fatal(err)
 	}
 	list, err := deliveryNASCollectFileList(ctx, pool, summary, keep)

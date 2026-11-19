@@ -71,15 +71,17 @@ type collatedPolicy struct {
 	Enabled             bool  `json:"enabled"`
 	DownloadBytesPerSec int64 `json:"download_bytes_per_sec"`
 	DownloadParallel    int   `json:"download_parallel"`
+	HandoffCheck        bool  `json:"handoff_check,omitempty"`
 }
 
 type collatedItem struct {
-	OutputID        int64  `json:"output_id"`
-	NASRelativePath string `json:"nas_relative_path"`
-	SizeBytes       int64  `json:"size_bytes"`
-	SHA256          string `json:"sha256"`
-	DownloadPath    string `json:"download_path"`
-	HandoffRound    *int64 `json:"handoff_readback_round,omitempty"`
+	OutputID        int64     `json:"output_id"`
+	NASRelativePath string    `json:"nas_relative_path"`
+	SizeBytes       int64     `json:"size_bytes"`
+	SHA256          string    `json:"sha256"`
+	DownloadPath    string    `json:"download_path"`
+	HandoffRound    *int64    `json:"handoff_readback_round,omitempty"`
+	HandoffMount    *[2]int64 `json:"handoff_mount,omitempty"`
 }
 
 // collatedEligibleSQL selects outputs this connection still needs: newest
@@ -92,6 +94,8 @@ const collatedEligibilitySQL = `
 	JOIN connections conn ON conn.id=$1 AND conn.kind='nas_pull' AND r.account_id=conn.account_id
 	LEFT JOIN delivery_nas_handoff_copyable handoff ON conn.id=13 AND $2::boolean AND conn.delivery_nas_handoff_enabled AND handoff.output_id=o.id
 	  AND handoff.roster_sha256=conn.delivery_nas_handoff_roster_sha256
+ AND NOT EXISTS (SELECT 1 FROM delivery_nas_handoff_errors error
+   WHERE error.output_id=o.id AND error.round=handoff.round AND error.next_attempt_at>now())
 	WHERE r.delivery='nas_pull'
 	  AND (
 	   handoff.output_id IS NOT NULL OR (
@@ -126,12 +130,13 @@ const collatedFeedSQL = `WITH page AS MATERIALIZED (
  WHERE r.delivery='nas_pull' AND (conn.collated_delivery_enabled OR ($2::boolean AND conn.delivery_nas_handoff_enabled)) AND o.id>$3
  ORDER BY o.id LIMIT 1000
 ), eligible AS MATERIALIZED (
- SELECT o.id,o.nas_relative_path,o.size_bytes,o.sha256,handoff.round AS handoff_readback_round FROM page
+ SELECT o.id,o.nas_relative_path,o.size_bytes,o.sha256,handoff.round AS handoff_readback_round,
+        CASE WHEN handoff.output_id IS NOT NULL THEN ARRAY[handoff.device,handoff.inode] END AS handoff_mount FROM page
  JOIN recording_collation_outputs o ON o.id=page.id ` + collatedEligibilitySQL + collatedNotBackedOffSQL + ` ORDER BY o.id LIMIT $5
 ), delivered AS (
  SELECT * FROM eligible WHERE nas_delivery_allowed($1,'collated',id) ORDER BY id LIMIT $4
 )
-SELECT coalesce(jsonb_agg(jsonb_build_object('output_id',id,'nas_relative_path',nas_relative_path,'size_bytes',size_bytes,'sha256',sha256,'handoff_readback_round',handoff_readback_round) ORDER BY id),'[]'::jsonb),coalesce((SELECT max(id) FROM eligible HAVING count(*)=$5),(SELECT max(id) FROM page),0)
+SELECT coalesce(jsonb_agg(jsonb_build_object('output_id',id,'nas_relative_path',nas_relative_path,'size_bytes',size_bytes,'sha256',sha256,'handoff_readback_round',handoff_readback_round,'handoff_mount',handoff_mount) ORDER BY id),'[]'::jsonb),coalesce((SELECT max(id) FROM eligible HAVING count(*)=$5),(SELECT max(id) FROM page),0)
 FROM delivered`
 
 // collatedNotBackedOffSQL withholds outputs whose last delivery failed until
@@ -184,8 +189,8 @@ func (s *Server) handleAccountCollated(w http.ResponseWriter, r *http.Request) {
 	}
 	var policy collatedPolicy
 	if err := s.pool.QueryRow(r.Context(), `SELECT collated_delivery_enabled OR ($2 AND delivery_nas_handoff_enabled),
-        collated_download_bytes_per_sec,collated_download_parallel
-		FROM connections WHERE id=$1`, connectionID, collatedHandoffClient(r)).Scan(&policy.Enabled, &policy.DownloadBytesPerSec, &policy.DownloadParallel); err != nil {
+        collated_download_bytes_per_sec,collated_download_parallel,($2 AND delivery_nas_handoff_enabled)
+		FROM connections WHERE id=$1`, connectionID, collatedHandoffClient(r)).Scan(&policy.Enabled, &policy.DownloadBytesPerSec, &policy.DownloadParallel, &policy.HandoffCheck); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "load collated policy")
 		return
 	}
@@ -290,7 +295,7 @@ func recordCollatedHandoffReadback(ctx context.Context, tx pgx.Tx, connection, o
 	identity nasR2StitchFileIdentity) (bool, error) {
 	if _, err := tx.Exec(ctx, `
  INSERT INTO delivery_nas_handoff_readbacks(output_id,connection_id,size_bytes,mtime_ns,ctime_ns,inode,device,round,root_inode)
- SELECT o.output_id,$2,$3,$4,$5,$6,$7,o.round,$9 FROM delivery_nas_handoff_copyable o WHERE o.output_id=$1 AND o.round=$8
+ SELECT o.output_id,$2,$3,$4,$5,$6,$7,o.round,$9 FROM delivery_nas_handoff_copyable o WHERE o.output_id=$1 AND o.round=$8 AND o.device=$7 AND o.inode=$9
   AND NOT EXISTS (SELECT 1 FROM r2_object_retirements r WHERE r.kind='collated' AND r.source_id=o.output_id)
   AND EXISTS(SELECT 1 FROM connections c WHERE c.id=$2 AND c.delivery_nas_handoff_enabled
     AND c.delivery_nas_handoff_roster_sha256=o.roster_sha256)
@@ -302,7 +307,7 @@ func recordCollatedHandoffReadback(ctx context.Context, tx pgx.Tx, connection, o
 	err := tx.QueryRow(ctx, `SELECT EXISTS(
  SELECT 1 FROM delivery_nas_handoff_readbacks r JOIN delivery_nas_handoff_copyable live USING(output_id,round)
  WHERE output_id=$1 AND connection_id=$2 AND round=$8
- AND ROW(size_bytes,mtime_ns,ctime_ns,inode,device,root_inode)=ROW($3::bigint,$4::bigint,$5::bigint,$6::bigint,$7::bigint,$9::bigint)
+ AND ROW(r.size_bytes,r.mtime_ns,r.ctime_ns,r.inode,r.device,r.root_inode)=ROW($3::bigint,$4::bigint,$5::bigint,$6::bigint,$7::bigint,$9::bigint)
  )`, output, connection, identity[0], identity[1], identity[2], identity[3], identity[4], round, rootInode).Scan(&same)
 	return same, err
 }
@@ -417,6 +422,28 @@ func (s *Server) handleAccountCollatedError(w http.ResponseWriter, r *http.Reque
 	}
 	if len(msg) > collatedMaxErrorBytes {
 		msg = strings.ToValidUTF8(msg[:collatedMaxErrorBytes], "")
+	}
+	if collatedHandoffClient(r) {
+		tag, err := s.pool.Exec(r.Context(), `
+ INSERT INTO delivery_nas_handoff_errors(output_id,round,failure_count,last_error,next_attempt_at)
+ SELECT o.output_id,o.round,1,$3,clock_timestamp()+interval '2 minutes'
+ FROM delivery_nas_handoff_copyable o JOIN connections c ON c.id=$1 AND c.id=13 AND c.delivery_nas_handoff_enabled
+  AND c.delivery_nas_handoff_roster_sha256=o.roster_sha256
+ WHERE o.output_id=$2
+ ON CONFLICT(output_id,round) DO UPDATE SET
+  failure_count=delivery_nas_handoff_errors.failure_count+1,last_error=excluded.last_error,
+  next_attempt_at=clock_timestamp()+least(interval '6 hours',interval '1 minute'*
+   power(2,least(delivery_nas_handoff_errors.failure_count+1,9)))`, connectionID, req.OutputID, msg)
+		if err != nil {
+			util.WriteError(w, http.StatusServiceUnavailable, "record NAS handoff error")
+			return
+		}
+		if tag.RowsAffected() != 1 {
+			util.WriteError(w, http.StatusNotFound, "handoff output not found")
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
 	}
 	var outputID any
 	if req.OutputID > 0 {

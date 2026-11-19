@@ -810,7 +810,7 @@ def cleanup_session_headers(path):
     return {}
 
 
-def request_json(cfg, method, path_or_url, base=None, body=None, timeout=HTTP_TIMEOUT_SEC, authenticate=True):
+def request_json(cfg, method, path_or_url, base=None, body=None, timeout=HTTP_TIMEOUT_SEC, authenticate=True, *, read_limit=None):
     base = cfg.api_base if base is None else base
     url = path_or_url if path_or_url.startswith("http") else base + path_or_url
     data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -825,7 +825,9 @@ def request_json(cfg, method, path_or_url, base=None, body=None, timeout=HTTP_TI
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             remember_response_secrets(response)
-            raw = response.read()
+            raw = response.read() if read_limit is None else response.read(read_limit + 1)
+            if read_limit is not None and len(raw) > read_limit:
+                raise RuntimeError("JSON response exceeds its bound")
     except urllib.error.HTTPError as exc:
         remember_response_secrets(exc)
         raise
@@ -23920,8 +23922,11 @@ def valid_collated_relative_path(value):
 
 
 def valid_collated_policy(raw):
-    if not isinstance(raw, dict) or set(raw) != {"enabled", "download_bytes_per_sec", "download_parallel"}:
+    fields = {"enabled", "download_bytes_per_sec", "download_parallel"}
+    if not isinstance(raw, dict) or set(raw) not in (fields, fields | {"handoff_check"}):
         raise ValueError("collated policy is invalid")
+    if "handoff_check" in raw and raw["handoff_check"] is not True:
+        raise ValueError("collated handoff policy is invalid")
     enabled, rate, parallel = raw["enabled"], raw["download_bytes_per_sec"], raw["download_parallel"]
     if (
         type(enabled) is not bool or type(rate) is not int or type(parallel) is not int
@@ -23929,17 +23934,21 @@ def valid_collated_policy(raw):
         or not 1 <= parallel <= COLLATED_MAX_PARALLEL
     ):
         raise ValueError("collated policy is invalid")
-    return {"enabled": enabled, "download_bytes_per_sec": rate, "download_parallel": parallel}
+    return {"enabled": enabled, "download_bytes_per_sec": rate, "download_parallel": parallel,
+            "handoff_check": raw.get("handoff_check", False)}
 
 
 def valid_collated_item(raw):
     fields = {"output_id", "nas_relative_path", "size_bytes", "sha256", "download_path"}
-    if not isinstance(raw, dict) or set(raw) not in (fields, fields | {"handoff_readback_round"}):
+    if not isinstance(raw, dict) or set(raw) not in (fields, fields | {"handoff_readback_round", "handoff_mount"}):
         raise ValueError("collated item has invalid fields")
     round_id = raw.get("handoff_readback_round")
     handoff = "handoff_readback_round" in raw
-    if handoff and (type(round_id) is not int or not 0 <= round_id < 2**63):
-        raise ValueError("collated handoff readback capability is invalid")
+    mount = raw.get("handoff_mount")
+    if handoff and (type(round_id) is not int or not 0 <= round_id < 2**63
+                    or not isinstance(mount, list) or len(mount) != 2
+                    or any(type(value) is not int or value < 0 for value in mount) or mount[1] == 0):
+        raise ValueError("collated handoff readback capability or mount pin is invalid")
     output_id, size = raw["output_id"], raw["size_bytes"]
     if type(output_id) is not int or output_id < 1:
         raise ValueError("collated item has invalid output_id")
@@ -23953,7 +23962,7 @@ def valid_collated_item(raw):
     return {
         "output_id": output_id, "nas_relative_path": valid_collated_relative_path(raw["nas_relative_path"]),
         "size_bytes": size, "sha256": valid_sha256(raw["sha256"], "collated item"), "download_path": raw["download_path"],
-        "handoff_readback": handoff, "handoff_readback_round": round_id,
+        "handoff_readback": handoff, "handoff_readback_round": round_id, "handoff_mount": mount,
     }
 
 
@@ -23978,12 +23987,14 @@ class ByteRateLimiter:
 class CollatedHandoffMount:
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, approved):
         self.root = cfg.output_dir
         self.floor = max(R2_COPY_FLOOR, cfg.min_free_bytes) + R2_COPY_SPACE_GUARD
         self.fd = os.open(self.root, self.flags)
         try:
             self.identity = self.mount_identity(self.fd)
+            if tuple(approved) != self.identity[:2]:
+                raise CollatedDownloadStopped("collated handoff mount differs from the approved share")
             self.check()
         except BaseException:
             os.close(self.fd)
@@ -24278,6 +24289,86 @@ def report_collated_error(cfg, output_id, exc, handoff=False):
         log("WARN", "collated error report failed: %s" % report_exc)
 
 
+def check_collated_handoff_paths(cfg, stop_event):
+    target = "/account/collated/handoff-check"
+    response = request_json(cfg, "GET", target, read_limit=(8 << 20) + 4096)
+    if not isinstance(response, dict) or set(response) != {"check"}:
+        raise ValueError("invalid NAS handoff path check response")
+    check = response["check"]
+    if check is None:
+        return
+    if not isinstance(check, dict) or set(check) != {"id", "manifest_sha256", "mount", "files"}:
+        raise ValueError("invalid NAS handoff path check")
+    check_id, mount_pin, files = check["id"], check["mount"], check["files"]
+    digest = valid_sha256(check["manifest_sha256"], "NAS handoff path check")
+    if (type(check_id) is not int or check_id <= 0 or not isinstance(mount_pin, list) or len(mount_pin) != 2
+            or any(type(value) is not int or value < 0 for value in mount_pin) or mount_pin[1] == 0
+            or not isinstance(files, list) or not 1 <= len(files) <= 20000):
+        raise ValueError("invalid NAS handoff path check bounds")
+    paths = []
+    previous = 0
+    for row in files:
+        if not isinstance(row, list) or len(row) != 3:
+            raise ValueError("invalid NAS handoff path check row")
+        output_id, relative, identity = row
+        if (type(output_id) is not int or output_id <= previous or not isinstance(identity, list)
+                or len(identity) != 5 or any(type(value) is not int or value <= 0 for value in identity[:4])
+                or identity[4] != mount_pin[0]):
+            raise ValueError("invalid NAS handoff path check identity")
+        previous = output_id
+        paths.append((output_id, valid_collated_relative_path(relative), identity))
+    mount = CollatedHandoffMount(cfg, mount_pin)
+    directories = {}
+    failed = None
+    try:
+        for output_id, relative, identity in paths:
+            if stop_event.is_set():
+                raise CollatedDownloadStopped("NAS handoff path check stopped")
+            try:
+                parent = open_collated_dir(cfg, relative, create=False, mount=mount)
+                try:
+                    directory = relative.rsplit("/", 1)[0]
+                    stamp = certification_identity(os.fstat(parent))
+                    if directories.setdefault(directory, (relative, stamp))[1] != stamp:
+                        raise CollatedDownloadStopped("NAS handoff directory changed during path check")
+                    filename = relative.rsplit("/", 1)[1]
+                    fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                    try:
+                        mount.check_child(fd)
+                        info = os.fstat(fd)
+                        observed = [info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino, info.st_dev]
+                        if not stat_module.S_ISREG(info.st_mode) or observed != identity:
+                            failed = output_id
+                    finally:
+                        os.close(fd)
+                finally:
+                    os.close(parent)
+            except (FileNotFoundError, NotADirectoryError, ExistingFileMismatch):
+                failed = output_id
+            if failed is not None:
+                break
+        if failed is None:
+            for relative, wanted in directories.values():
+                if stop_event.is_set():
+                    raise CollatedDownloadStopped("NAS handoff path check stopped")
+                parent = open_collated_dir(cfg, relative, create=False, mount=mount)
+                try:
+                    if certification_identity(os.fstat(parent)) != wanted:
+                        raise CollatedDownloadStopped("NAS handoff directory changed during path check")
+                finally:
+                    os.close(parent)
+        mount.check()
+        if stop_event.is_set():
+            raise CollatedDownloadStopped("NAS handoff path check stopped")
+        report = {"id": check_id, "manifest_sha256": digest, "mount": mount_pin}
+        if failed is not None:
+            report["failed_output_id"] = failed
+        request_json(cfg, "POST", target, body=report)
+        log("INFO", "NAS handoff path check %d %s" % (check_id, "complete" if failed is None else "withheld output %d" % failed))
+    finally:
+        os.close(mount.fd)
+
+
 def drain_collated(cfg, runtime, stop_event):
     """Deliver one page of collated outputs. Returns True when any output landed."""
     if cfg.dry_run:
@@ -24299,6 +24390,11 @@ def drain_collated(cfg, runtime, stop_event):
         raise RuntimeError("collated item outside cursor page")
     runtime.collated_after_id = next_id
     if not policy["enabled"] or not items:
+        if policy["handoff_check"] and next_id == 0 and not stop_event.is_set():
+            try:
+                check_collated_handoff_paths(cfg, stop_event)
+            except CollatedDownloadStopped as exc:
+                log("INFO", str(exc))
         return False
     limiter = ByteRateLimiter(policy["download_bytes_per_sec"])
     delivered = []
@@ -24309,7 +24405,7 @@ def drain_collated(cfg, runtime, stop_event):
         mount = None
         try:
             if item["handoff_readback"]:
-                mount = CollatedHandoffMount(cfg)
+                mount = CollatedHandoffMount(cfg, item["handoff_mount"])
             needed = collated_bytes_needed(cfg, item, mount=mount)
             storage = mount.storage() if mount is not None else storage_status(cfg)
             floor = mount.floor if mount is not None and needed else 0

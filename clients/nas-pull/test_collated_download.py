@@ -210,8 +210,23 @@ class CollatedDownloadTests(unittest.TestCase):
         self.assertEqual(self.requests, [])
         self.assertEqual(len(self.acks), 1)
 
+    def enable_handoff(self):
+        root = self.cfg.output_dir.stat()
+        self.item.update(handoff_readback_round=0, handoff_mount=[root.st_dev, root.st_ino],
+                         download_path=self.item["download_path"] + "?handoff_readback=1")
+
+    def test_handoff_rejects_replacement_mount_in_new_round(self):
+        self.enable_handoff()
+        self.assertTrue(self.drain())
+        self.cfg.output_dir.rename(self.cfg.output_dir.with_name("replaced"))
+        self.cfg.output_dir.mkdir()
+        self.item["handoff_readback_round"] = 1
+        self.assertFalse(self.drain())
+        self.assertEqual(len(self.acks), 1)
+        self.assertFalse(self.final.exists())
+
     def test_handoff_reports_exact_final_file_identity_on_copy_and_existing(self):
-        self.item.update(handoff_readback_round=0, download_path=self.item["download_path"] + "?handoff_readback=1")
+        self.enable_handoff()
         self.assertTrue(self.drain())
         self.assertEqual(len(self.requests), 1)
         stat = self.final.stat()
@@ -223,14 +238,40 @@ class CollatedDownloadTests(unittest.TestCase):
         self.assertEqual(self.requests, [])
         self.assertEqual(self.acks[1]["handoff_readback"], expected)
 
+    def test_handoff_path_check_requires_each_readback_file_to_still_exist(self):
+        self.enable_handoff()
+        self.assertTrue(self.drain())
+        body = self.acks[0]
+        observation = {"id": 8, "manifest_sha256": "b" * 64, "mount": self.item["handoff_mount"],
+                       "files": [[7, REL, body["handoff_readback"]]]}
+        route = "/account/collated/handoff-check"
+        reports = []
+        for exists in (True, False):
+            if not exists:
+                self.final.unlink()
+
+            def request(cfg, method, path, **kwargs):
+                self.assertEqual(path, route)
+                if method == "GET":
+                    return {"check": observation}
+                reports.append(kwargs["body"])
+                return {"ok": True}
+
+            with mock.patch.object(pull, "request_json", side_effect=request), \
+                    mock.patch.object(pull.os.path, "ismount", return_value=True):
+                pull.check_collated_handoff_paths(self.cfg, threading.Event())
+
+        self.assertNotIn("failed_output_id", reports[0])
+        self.assertEqual(reports[1]["failed_output_id"], 7)
+
     def test_handoff_refuses_unmounted_root(self):
-        self.item.update(handoff_readback_round=0, download_path=self.item["download_path"] + "?handoff_readback=1")
+        self.enable_handoff()
         self.assertFalse(self.drain(mounted=False))
         self.assertEqual(self.acks, [])
         self.assertFalse(self.final.exists())
 
     def test_handoff_rechecks_space_before_writing_a_chunk(self):
-        self.item.update(handoff_readback_round=0, download_path=self.item["download_path"] + "?handoff_readback=1")
+        self.enable_handoff()
         original = pull.CollatedHandoffMount.require_space
         free = {"available": True, "free_bytes": pull.R2_COPY_FLOOR}
         def running_out(mount, next_bytes):
@@ -244,7 +285,7 @@ class CollatedDownloadTests(unittest.TestCase):
         self.assertFalse(self.final.exists())
 
     def test_handoff_does_not_report_a_replaced_final(self):
-        self.item.update(handoff_readback_round=0, download_path=self.item["download_path"] + "?handoff_readback=1")
+        self.enable_handoff()
         actual = pull.hash_collated_entry
 
         def replace_after_readback(directory_fd, name, stop_event, *, durable=False, mount=None):

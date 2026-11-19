@@ -285,6 +285,9 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO delivery_keep_holds VALUES ('stoarama',$1,'video_assembly','e106',1000,$2)`, handoffKey, sha); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(ctx, `INSERT INTO delivery_nas_handoff_mounts VALUES($1,5,99)`, sha); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `INSERT INTO delivery_nas_handoff_outputs
 	  (output_id,recording_id,roster_sha256,picks_sha256,bucket,object_key,etag,size_bytes,sha256,nas_relative_path)
 	  SELECT id,1,$1,$1,'stoarama',object_key,'e106',size_bytes,sha256,nas_relative_path
@@ -332,6 +335,19 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE delivery_keep_holds SET etag='e106' WHERE object_key=$1`, handoffKey); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE clip_storage_billing_contracts SET mode='nas_collated_hold' WHERE clip_id=5000`); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := do(s.handleAccountCollatedError, http.MethodPost, handoffURL, map[string]any{"output_id": 106, "error": "test handoff backoff"}, nil); code != 200 {
+		t.Fatalf("report handoff error code=%d", code)
+	}
+	if code, _ := do(s.handleAccountCollatedDownload, http.MethodGet, "/x", nil, params); code != 200 {
+		t.Fatalf("handoff backoff withheld independent ordinary copy: %d", code)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE clip_storage_billing_contracts SET mode='nas_pull_monthly' WHERE clip_id=5000;
+ UPDATE delivery_nas_handoff_errors SET next_attempt_at=now()-interval '1 second' WHERE output_id=106`); err != nil {
+		t.Fatal(err)
+	}
 	handoffAck := map[string]any{"output_id": 106, "nas_relative_path": dir + "17_170001-180001.mp4", "size_bytes": 1000, "sha256": sha}
 	if code, _ := do(s.handleAccountCollatedAck, http.MethodPost, "/x", handoffAck, nil); code != 200 {
 		t.Fatalf("ordinary ACK code=%d", code)
@@ -370,6 +386,31 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	}
 	if code, _ := do(s.handleAccountCollatedAck, http.MethodPost, handoffURL, handoffAck, nil); code != 200 {
 		t.Fatalf("fresh round readback code=%d", code)
+	}
+
+	if _, err := pool.Exec(ctx, `
+ WITH m(body) AS (VALUES ('[[106,"fixture",[1000,2,3,44,5]]]'::jsonb))
+ INSERT INTO delivery_nas_handoff_checks(roster_sha256,round,manifest,manifest_sha256)
+ SELECT $1,1,body,encode(sha256(convert_to(body::text,'UTF8')),'hex') FROM m`, sha); err != nil {
+		t.Fatal(err)
+	}
+	code, pathCheck := do(s.handleAccountDeliveryNASHandoffCheck, http.MethodGet, deliveryNASHandoffCheckPath, nil, nil)
+	if code != 200 || pathCheck["check"] == nil {
+		t.Fatalf("handoff check challenge code=%d result=%v", code, pathCheck)
+	}
+	challenge := pathCheck["check"].(map[string]any)
+	if code, _ := do(s.handleAccountDeliveryNASHandoffCheck, http.MethodPost, deliveryNASHandoffCheckPath,
+		map[string]any{"id": challenge["id"], "manifest_sha256": challenge["manifest_sha256"], "mount": []int64{5, 100}}, nil); code != 409 {
+		t.Fatalf("unapproved mount accepted at check completion: %d", code)
+	}
+	payload := map[string]any{"id": challenge["id"], "manifest_sha256": challenge["manifest_sha256"], "mount": []int64{5, 99}}
+	for range 2 {
+		if code, _ := do(s.handleAccountDeliveryNASHandoffCheck, http.MethodPost, deliveryNASHandoffCheckPath, payload, nil); code != 200 {
+			t.Fatalf("path check completion or replay code=%d", code)
+		}
+	}
+	if code, result := do(s.handleAccountDeliveryNASHandoffCheck, http.MethodGet, deliveryNASHandoffCheckPath, nil, nil); code != 200 || result["check"] != nil {
+		t.Fatalf("completed handoff check reissued code=%d result=%v", code, result)
 	}
 
 	// A prefix longer than the scan page is withheld, but the cursor must reach

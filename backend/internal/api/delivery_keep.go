@@ -28,12 +28,14 @@ type DeliveryKeepIdentity struct {
 	Kind        string `json:"kind"`
 }
 type DeliveryPublicFile struct {
-	Identity          DeliveryKeepIdentity
-	FileURL           string
-	PinnedFileURL     string
-	TicketURL         string
-	DownloadURL       string
-	PinnedDownloadURL string
+	Identity                DeliveryKeepIdentity
+	FileURL                 string
+	PinnedFileURL           string
+	TicketURL               string
+	DownloadURL             string
+	PinnedDownloadURL       string
+	DirectDownloadURL       string
+	PinnedDirectDownloadURL string
 }
 
 func deliveryPublicFile(id, generation string, object globalDeliveryObject) DeliveryPublicFile {
@@ -51,6 +53,8 @@ func deliveryPublicFile(id, generation string, object globalDeliveryObject) Deli
 	}
 	file.DownloadURL = fileURL + "?download=1"
 	file.PinnedDownloadURL = fileURL + "?download=1&generation=" + url.QueryEscape(generation)
+	file.DirectDownloadURL = fileURL + "?direct=1&download=1"
+	file.PinnedDirectDownloadURL = fileURL + "?direct=1&generation=" + url.QueryEscape(generation) + "&download=1"
 	return file
 }
 
@@ -174,8 +178,15 @@ func readPublicDeliveryKeep(ctx context.Context, store DeliveryKeepStore, includ
 }
 func (s *DeliveryKeepSnapshot) add(o globalDeliveryObject, kind string) error {
 	x := DeliveryKeepIdentity{Key: o.Key, ETag: strings.Trim(o.ETag, `"`), Size: o.SizeBytes, SHA256: o.SHA256, Path: o.Path, RecordingID: o.RecordingID, Kind: kind}
-	if old, ok := s.Objects[x.Key]; ok && (old.ETag != x.ETag || old.Size != x.Size || old.SHA256 != x.SHA256) {
-		return errors.New("delivery aliases disagree")
+	if old, ok := s.Objects[x.Key]; ok {
+		if old.ETag != x.ETag || old.Size != x.Size || old.SHA256 != x.SHA256 {
+			return errors.New("delivery aliases disagree")
+		}
+		// A nonnumeric alias is not a separate assembly when the same
+		// physical object also has a canonical collated file ID.
+		if old.Kind == "video_collated" && x.Kind == "video_assembly" {
+			return nil
+		}
 	}
 	s.Objects[x.Key] = x
 	return nil
