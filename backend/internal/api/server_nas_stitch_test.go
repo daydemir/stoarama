@@ -184,6 +184,46 @@ func TestNASStitchCheckpointAndLeasePauseUnderCleanupFreeze(t *testing.T) {
 	checkpoint(q.Token, false)
 }
 
+func TestDurhamProofRequiresOneNativeToolchain(t *testing.T) {
+	plan, proof := stitchUnitFixture()
+	for i := range proof.Outputs[0].Inputs {
+		proof.Outputs[0].Inputs[i].RawProof = nil
+		proof.Outputs[0].Inputs[i].RetirementHeld = true
+	}
+	if _, err := validateNASStitchProof(plan, proof, nasStitchOnDurham); err == nil {
+		t.Fatal("Durham accepted the legacy amd64 package")
+	}
+	native := nasStitchProvenance{
+		Policy: nasStitchPolicy, Architecture: "linux-arm64",
+		ManifestSHA: nasDurhamManifestSHA, EvaluatorSHA: nasDurhamEvaluatorSHA,
+		FFmpegVersion: nasDurhamToolVersion, FFprobeVersion: nasDurhamToolVersion,
+		FFmpegSHA: nasDurhamFFmpegSHA, FFprobeSHA: nasDurhamFFprobeSHA,
+	}
+	proof.Outputs[0].Provenance = native
+	if _, err := validateNASStitchProof(plan, proof, nasStitchOnDurham); err != nil {
+		t.Fatal(err)
+	}
+	if validNASStitchProvenance(native, nasStitchOnNAS) {
+		t.Fatal("the NAS-local lane accepted the Durham toolchain")
+	}
+	for _, change := range []func(*nasStitchProvenance){
+		func(p *nasStitchProvenance) { p.Architecture = "linux-amd64" },
+		func(p *nasStitchProvenance) { p.OctoberRecovered = true },
+		func(p *nasStitchProvenance) { p.ManifestSHA = nasStitchManifestSHA },
+		func(p *nasStitchProvenance) { p.EvaluatorSHA = "" },
+		func(p *nasStitchProvenance) { p.FFmpegSHA = p.FFprobeSHA },
+		func(p *nasStitchProvenance) { p.FFprobeSHA = p.FFmpegSHA },
+		func(p *nasStitchProvenance) { p.FFprobeVersion = "unreviewed" },
+	} {
+		mixed := native
+		change(&mixed)
+		proof.Outputs[0].Provenance = mixed
+		if _, err := validateNASStitchProof(plan, proof, nasStitchOnDurham); err == nil {
+			t.Fatal("Durham accepted mismatched toolchain evidence", mixed)
+		}
+	}
+}
+
 func TestNASStitchRejectsInventedCorpusAndOffLeavesQueueUntouched(t *testing.T) {
 	f := newCleanupFixture(t, 1)
 	stitchMigration(t, f)

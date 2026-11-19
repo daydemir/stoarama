@@ -124,6 +124,33 @@ class V85rTests(unittest.TestCase):
                 self.assertEqual(runner.decide(c, row, row['source_bindings'], bad, human, set()),
                                  tuple(case['expected']))
 
+    @unittest.skipUnless(os.environ.get("V85R_DURHAM_TEST_BUNDLE"), "generated Durham bundle required")
+    def test_native_durham_bundle_replays_frozen_october_evidence(self):
+        pins = json.loads((ROOT / "v85r/durham-arm64.json").read_bytes())
+        blob = Path(os.environ["V85R_DURHAM_TEST_BUNDLE"]).read_bytes()
+        self.assertEqual(len(blob), pins["bundle_size_bytes"])
+        with tempfile.TemporaryDirectory() as state:
+            bundle = pull.stitch_unpack_v85r(blob, pins["bundle_sha256"], pins["manifest_sha256"], state, threading.Event())
+            native_source = (bundle / "runner.py").read_bytes()
+            legacy_source = (ROOT / "v85r/runner.py").read_bytes()
+            self.assertEqual(native_source.count(b"remeasure-linux-arm64"), 2)
+            self.assertEqual(native_source.replace(b"remeasure-linux-arm64", b"remeasure-linux-amd64"), legacy_source)
+            self.assertFalse((bundle / "remeasure-linux-amd64").exists())
+            evaluator = (bundle / "remeasure-linux-arm64").read_bytes()
+            self.assertEqual(hashlib.sha256(evaluator).hexdigest(), pins["evaluator_sha256"])
+            self.assertEqual(int.from_bytes(evaluator[18:20], "little"), 183)
+
+            spec = importlib.util.spec_from_file_location("v85r_durham_runner", bundle / "runner.py")
+            native = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(native)
+            classifier = native.classifier()
+            bad, human = classifier.C.load_vetoes(bundle / "source71.json", bundle / "human12.json")
+            for case in self.recorded_rows():
+                row = case["row"]
+                with self.subTest(case=case["case"]):
+                    actual = native.decide(classifier, row, row["source_bindings"], bad, human, set())
+                    self.assertEqual(actual, tuple(case["expected"]))
+
     def stationary_row(self):
         row = copy.deepcopy(self.recorded_rows()[0]['row'])
         spatial = row['spatial_temporal_diagnostic']

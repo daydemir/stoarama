@@ -11,6 +11,7 @@ StateDirectory=stoarama-durham-stitch
 StateDirectoryMode=0700
 Environment=STOARAMA_STATE_DIR=/var/lib/stoarama-durham-stitch
 EnvironmentFile=/etc/stoarama-stitch/worker.env
+UnsetEnvironment=QEMU_LD_PREFIX QEMU_CPU LD_PRELOAD LD_LIBRARY_PATH
 LoadCredential=stoarama-api-key:/etc/stoarama-stitch/stoarama-api-key
 ExecStart=/usr/bin/python3 -B /opt/stoarama-stitch/durham_stitch.py
 Restart=on-failure

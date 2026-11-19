@@ -341,6 +341,33 @@ attempt and part journals survive a worker restart within the lease.
 Ambiguous multipart start or completion keeps the ledger and stage budget
 reserved for controller reconciliation. Keep unknown multipart uploads gated.
 
+Durham uses the native Linux ARM64 profile in
+`clients/nas-pull/v85r/durham-arm64.json`. The previous production installer
+selected the October amd64 profile and ran its evaluator and media tools
+through QEMU. The offline ARM64 benchmark used the Debian 7.1.5 media tools and
+the evaluator built from the same pinned Go sources. The ARM64 bundle carries
+the same corpus and classifier, with both evaluator calls aimed at the native
+binary. The worker verifies the bundle, executable machine types and tool
+SHA-256 values before reporting that profile to the API. The API binds the
+profile at lease and requires all of its pins on Durham output proof.
+
+Build the native bundle with Go 1.26.5 and the exact signed-index Debian
+`ffmpeg_7.1.5-0+deb13u1_arm64.deb`:
+
+```sh
+python3 -B clients/nas-pull/v85r/build_durham.py \
+  --ffmpeg-deb "$DEB" --out "$RELEASE/durham-arm64.tar.gz"
+```
+
+With the Durham queue and API stitch switch off, install the exact Debian
+package and its signed dependencies in the existing Debian ARM64 guest.
+Install the reviewed `stoarama_pull.py`, `durham_stitch.py`, and systemd unit.
+Put the reviewed profile JSON and generated bundle in
+`/opt/stoarama-stitch/v85r/`, owned by root. The systemd unit clears QEMU and
+dynamic-loader overrides. Keep the existing key, service user and boot cron.
+Check worker startup and the exact pin verification before opening the next
+pilot window. The NAS-local client and proof replay use their October profile.
+
 The API grants staged output leases to connection 13 on
 `r2-copy-v7-certified-stitch` while both `NAS_STITCH_ENABLED` and
 `NAS_R2_COPY_ENABLED` are true. The client leaves the legacy opt-in out of its

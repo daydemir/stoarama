@@ -6,9 +6,11 @@ from http.client import HTTPException, HTTPSConnection
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import signal
 import sqlite3
+import sys
 import threading
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -20,12 +22,57 @@ class DurhamError(RuntimeError):
     pass
 
 
+class DurhamV85r:
+    def __init__(self, state):
+        if sys.platform != "linux" or platform.machine() != "aarch64":
+            raise DurhamError("Durham requires a native Linux ARM64 guest")
+        profile_dir = Path(__file__).resolve().parent / "v85r"
+        self.pins = json.loads((profile_dir / "durham-arm64.json").read_bytes())
+        if self.pins["architecture"] != "linux-arm64":
+            raise DurhamError("Durham toolchain architecture differs")
+        with (profile_dir / "durham-arm64.tar.gz").open("rb") as source:
+            self.bundle = source.read(self.pins["bundle_size_bytes"] + 1)
+        if len(self.bundle) != self.pins["bundle_size_bytes"]:
+            raise DurhamError("Durham toolchain bundle size differs")
+        self.state = state
+        self.manifest = self.pins["manifest_sha256"]
+        self.tools = {name: "/usr/bin/" + name for name in ("ffmpeg", "ffprobe")}
+
+    @staticmethod
+    def verify_executable(path, size, sha, stop):
+        if path.is_symlink() or not os.access(path, os.X_OK):
+            raise DurhamError("Durham tool must be a pinned executable")
+        with path.open("rb") as source:
+            header = source.read(20)
+        if (header[:6] != b"\x7fELF\x02\x01" or int.from_bytes(header[18:20], "little") != 183
+                or pull.stitch_proof_digest(path, stop) != (size, sha)):
+            raise DurhamError("Durham native executable identity differs")
+
+    def verify(self, tools, stop):
+        if tools != self.tools:
+            raise DurhamError("Durham media tool path differs")
+        for name, path in tools.items():
+            pin = self.pins["tools"][name]
+            self.verify_executable(Path(path), pin["size_bytes"], pin["sha256"], stop)
+        bundle = pull.stitch_unpack_v85r(self.bundle, self.pins["bundle_sha256"], self.manifest, self.state, stop)
+        self.verify_executable(bundle / "remeasure-linux-arm64", self.pins["evaluator_size_bytes"],
+                               self.pins["evaluator_sha256"], stop)
+        return bundle, dict(
+            policy=pull.STITCH_POLICY, architecture="linux-arm64", manifest_sha256=self.manifest,
+            evaluator_sha256=self.pins["evaluator_sha256"], october_ffmpeg_recovered=False,
+            ffmpeg_version=self.pins["media_tool_version"], ffprobe_version=self.pins["media_tool_version"],
+            ffmpeg_sha256=self.pins["tools"]["ffmpeg"]["sha256"],
+            ffprobe_sha256=self.pins["tools"]["ffprobe"]["sha256"],
+        )
+
+
 class DurhamHTTP:
-    def __init__(self, api, r2_origin, token, stop):
+    def __init__(self, api, r2_origin, token, stop, v85r):
         self.api = api.rstrip("/")
         self.api_host = self.origin(urlsplit(self.api))
         self.r2_host = self.origin(urlsplit(r2_origin))
         self.token, self.stop = token, stop
+        self.v85r = v85r
 
     @staticmethod
     def origin(url):
@@ -54,7 +101,8 @@ class DurhamHTTP:
     def post(self, path, body):
         connection, response = self.request(self.api + "/account/connections/stitch/" + path,
             self.api_host, "POST", {"Authorization": "Bearer " + self.token,
-            "Content-Type": "application/json", "X-Stoarama-Stitch-Source": "r2-v1"}, pull.cleanup_json_bytes(body))
+            "Content-Type": "application/json", "X-Stoarama-Stitch-Source": "r2-v1",
+            "X-Stoarama-Stitch-Toolchain": self.v85r.manifest}, pull.cleanup_json_bytes(body))
         with response:
             try:
                 raw = response.read(2 * 1024 * 1024 + 1)
@@ -164,7 +212,7 @@ def process_task(http, task, root, state, inventory, tools):
     scratch = root / "media"
     scratch.mkdir(mode=0o700, exist_ok=True)
     cfg = SimpleNamespace(output_dir=scratch, state_dir=state, min_free_bytes=1024**3, stitch_enabled=True,
-                          durham_checkpoint=lambda t: task_checkpoint(http, t))
+                          durham_v85r=http.v85r, durham_checkpoint=lambda t: task_checkpoint(http, t))
     result_file = root / "result.json"
     if result_file.exists():
         result = json.loads(result_file.read_bytes())
@@ -231,20 +279,14 @@ def main():
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
-    direct = DurhamHTTP(os.environ["STOARAMA_API_BASE"], os.environ["STOARAMA_R2_ORIGIN"], key, stop)
-    tools_dir = state / "tools" / ("v85r-ffmpeg-" + pull.V85R_TOOL_VERSION)
-    tools = {}
-    for name, (sha, size) in pull.V85R_TOOLS.items():
-        tool = tools_dir / name
-        if pull.stitch_proof_digest(tool, stop) != (size, sha):
-            raise DurhamError("Durham offline tool pin differs")
-        tools[name] = str(tool)
+    v85r = DurhamV85r(state)
+    v85r.verify(v85r.tools, stop)
+    direct = DurhamHTTP(os.environ["STOARAMA_API_BASE"], os.environ["STOARAMA_R2_ORIGIN"], key, stop, v85r)
     with sqlite3.connect(state / "inventory.sqlite3") as db:
         if not db.execute("SELECT 1 FROM v85r_stitch_corpus_meta WHERE sha=?", (pull.STITCH_CORPUS_SHA,)).fetchone():
             raise DurhamError("Durham offline corpus pin differs")
-    pull.stitch_v85r_bundle(state, stop)
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        workers = [pool.submit(run_worker, direct, n, state, tools) for n in range(1, 5)]
+        workers = [pool.submit(run_worker, direct, n, state, v85r.tools) for n in range(1, 5)]
         done, _ = concurrent.futures.wait(workers, return_when=concurrent.futures.FIRST_COMPLETED)
         stop.set()
         for worker in done:
