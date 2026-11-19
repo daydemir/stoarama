@@ -19,6 +19,19 @@ import (
 
 const nasDurhamParallelHours = 4
 
+func requireDurhamProfile(w http.ResponseWriter, r *http.Request, caller nasStitchCaller) bool {
+	if !caller.dedicated {
+		util.WriteError(w, http.StatusForbidden, "dedicated Durham key required")
+		return false
+	}
+	if r.Header.Get("X-Stoarama-Stitch-Source") != "r2-v2" ||
+		r.Header.Get("X-Stoarama-Stitch-Toolchain") != nasDurhamManifestSHA {
+		util.WriteError(w, http.StatusConflict, "reviewed native Durham toolchain required")
+		return false
+	}
+	return true
+}
+
 const nasDurhamClaimSQL = `
 SELECT h.id,h.attempt,h.plan,h.plan_sha256
  FROM nas_stitch_r2_hours h JOIN nas_stitch_scopes s ON s.id=h.scope_id
@@ -93,14 +106,15 @@ func (s *Server) handleDurhamStitchLease(w http.ResponseWriter, r *http.Request,
 	}
 	t.Attempt++
 	t.Token = hex.EncodeToString(nonce[:])
+	t.Toolchain = nasDurhamManifestSHA
 	err = tx.QueryRow(ctx, `WITH decision AS MATERIALIZED (SELECT clock_timestamp() AS at)
- UPDATE nas_stitch_r2_hours h SET state='leased',attempt=$2,lease_token=$3,lease_api_key_id=$4,
+ UPDATE nas_stitch_r2_hours h SET state='leased',attempt=$2,lease_token=$3,lease_api_key_id=$4,lease_toolchain_sha256=$5,lease_toolchain_attempt=$2,
   lease_expires_at=least(d.at+interval '2 hours',s.approved_until,coalesce(k.expires_at,'infinity'))
  FROM nas_stitch_scopes s,account_api_keys k,decision d
  WHERE h.id=$1 AND s.id=h.scope_id AND k.id=$4
   AND NOT s.paused AND s.approved_until>d.at AND k.revoked_at IS NULL
   AND (k.expires_at IS NULL OR k.expires_at>d.at)
- RETURNING h.lease_expires_at`, t.ID, t.Attempt, t.Token, caller.keyID).Scan(&t.Expires)
+ RETURNING h.lease_expires_at`, t.ID, t.Attempt, t.Token, caller.keyID, t.Toolchain).Scan(&t.Expires)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteJSON(w, 200, noTask)
 		return
@@ -141,8 +155,8 @@ func lockDurhamStitchAttempt(ctx context.Context, tx pgx.Tx, caller nasStitchCal
 	err := tx.QueryRow(ctx, `SELECT h.plan FROM nas_stitch_r2_hours h
  JOIN nas_stitch_scopes s ON s.id=h.scope_id CROSS JOIN nas_stitch_r2_control control
  WHERE h.id=$1 AND h.attempt=$2 AND h.lease_api_key_id=$3
-  AND h.lease_token=$4 AND h.plan_sha256=$5
- FOR UPDATE OF h FOR SHARE OF s,control`, lease.HourID, lease.Attempt, caller.keyID, lease.Token, lease.PlanSHA).Scan(&plan)
+  AND h.lease_token=$4 AND h.plan_sha256=$5 AND h.lease_toolchain_sha256=$6 AND h.lease_toolchain_attempt=h.attempt
+ FOR UPDATE OF h FOR SHARE OF s,control`, lease.HourID, lease.Attempt, caller.keyID, lease.Token, lease.PlanSHA, lease.Toolchain).Scan(&plan)
 	if err != nil || !caller.lockActive(ctx, tx) {
 		return 0, nil, errors.New("Durham stitch attempt is unavailable")
 	}
@@ -169,7 +183,7 @@ func (s *Server) handleDurhamStitchCheckpoint(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, 503, "Durham stitch store unavailable")
 		return
 	}
-	lease := r2.StitchStageLease{HourID: id, APIKeyID: caller.keyID, Attempt: req.Attempt, Token: req.Token, PlanSHA: req.PlanSHA}
+	lease := r2.StitchStageLease{HourID: id, APIKeyID: caller.keyID, Attempt: req.Attempt, Token: req.Token, PlanSHA: req.PlanSHA, Toolchain: nasDurhamManifestSHA}
 	ctx := r.Context()
 	var response any
 	var err error
@@ -219,7 +233,8 @@ func (s *Server) durhamStitchCheckpoint(ctx context.Context, caller nasStitchCal
 		return map[string]bool{"continue": true}, tx.Commit(ctx)
 	case durhamStitchRelease:
 		tag, err := tx.Exec(ctx, `UPDATE nas_stitch_r2_hours SET state='pending',lease_api_key_id=NULL,
- lease_expires_at=NULL,lease_token=NULL WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects
+ lease_expires_at=NULL,lease_token=NULL,lease_toolchain_sha256=NULL,lease_toolchain_attempt=NULL
+ WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects
   WHERE hour_id=$1 AND attempt=$2 AND state<>'aborted')`, lease.HourID, lease.Attempt)
 		if err != nil || tag.RowsAffected() != 1 {
 			return nil, errors.New("staging exists for the Durham attempt")
@@ -304,8 +319,8 @@ func (s *Server) handleDurhamStitchResult(w http.ResponseWriter, r *http.Request
 	var old []byte
 	var state string
 	err = tx.QueryRow(ctx, `SELECT staged_manifest,state FROM nas_stitch_r2_hours
- WHERE id=$1 AND attempt=$2 AND lease_api_key_id=$3 AND lease_token=$4 AND plan_sha256=$5 FOR UPDATE`,
-		id, req.Attempt, caller.keyID, req.Result.Token, req.Result.PlanSHA).Scan(&old, &state)
+ WHERE id=$1 AND attempt=$2 AND lease_api_key_id=$3 AND lease_token=$4 AND plan_sha256=$5 AND lease_toolchain_sha256=$6 AND lease_toolchain_attempt=attempt FOR UPDATE`,
+		id, req.Attempt, caller.keyID, req.Result.Token, req.Result.PlanSHA, nasDurhamManifestSHA).Scan(&old, &state)
 	if err != nil || !caller.lockActive(ctx, tx) {
 		util.WriteError(w, 409, "Durham stitch result identity differs")
 		return
@@ -319,7 +334,7 @@ func (s *Server) handleDurhamStitchResult(w http.ResponseWriter, r *http.Request
 		util.WriteError(w, 409, "Durham stitch result replay differs")
 		return
 	}
-	lease := r2.StitchStageLease{HourID: id, APIKeyID: caller.keyID, Attempt: req.Attempt, Token: req.Result.Token, PlanSHA: req.Result.PlanSHA}
+	lease := r2.StitchStageLease{HourID: id, APIKeyID: caller.keyID, Attempt: req.Attempt, Token: req.Result.Token, PlanSHA: req.Result.PlanSHA, Toolchain: nasDurhamManifestSHA}
 	_, raw, err := lockDurhamStitchAttempt(ctx, tx, caller, lease)
 	var plan nasStitchPlan
 	if err != nil || json.Unmarshal(raw, &plan) != nil {
@@ -400,11 +415,11 @@ func (s *Server) handleDurhamStitchStatus(w http.ResponseWriter, r *http.Request
 	defer tx.Rollback(ctx)
 	var state string
 	err = tx.QueryRow(ctx, `SELECT state FROM nas_stitch_r2_hours
- WHERE id=$1 AND attempt=$2 AND lease_api_key_id=$3 AND lease_token=$4 AND plan_sha256=$5 FOR SHARE`,
-		id, req.Attempt, caller.keyID, req.Token, req.PlanSHA).Scan(&state)
+ WHERE id=$1 AND attempt=$2 AND lease_api_key_id=$3 AND lease_token=$4 AND plan_sha256=$5 AND lease_toolchain_sha256=$6 AND lease_toolchain_attempt=attempt FOR SHARE`,
+		id, req.Attempt, caller.keyID, req.Token, req.PlanSHA, nasDurhamManifestSHA).Scan(&state)
 	if err != nil || !caller.lockActive(ctx, tx) || tx.Commit(ctx) != nil {
 		util.WriteError(w, 409, "Durham status identity differs")
 		return
 	}
-	util.WriteJSON(w, 200, map[string]any{"state": state, "ready": state == "certified"})
+	util.WriteJSON(w, 200, map[string]any{"state": state, "ready": state == "certified", "toolchain": nasDurhamManifestSHA})
 }

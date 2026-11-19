@@ -15,8 +15,8 @@ import tarfile
 root = Path(__file__).resolve().parent
 subprocess.run(['go','build','-trimpath','-ldflags=-s -w -buildid=','-o',str(root/'remeasure-linux-amd64'),'./cmd/remeasure'],
                cwd=root/'producer', env=dict(os.environ,CGO_ENABLED='0',GOOS='linux',GOARCH='amd64',GOAMD64='v1',GOTOOLCHAIN='go1.26.5'),check=True)
-files = {str(p.relative_to(root)):p.read_bytes() for p in sorted(root.rglob('*'))
-         if p.is_file() and p.name not in ('manifest.json','build.py','README.md','.gitignore') and '__pycache__' not in p.parts}
+members = json.loads((root/'manifest.json').read_bytes())['files']
+files = {name: (root/name).read_bytes() for name in members}
 manifest = dict(policy='v85r', files={n:hashlib.sha256(v).hexdigest() for n,v in files.items()},
                 upstream_veto_sha256={'source71.json': 'e40e51284fbe2ec6d6da7f4bf8a5cb7bbd50478f7b2f7d46ee94c299c0dbe07f', 'human12.json': 'd09e6aee5deadbbd1421ce14fdcc236dbf1b08ca40e21cd39a70951f988e0e60', 'visual6.json': 'ca882d93697e3e99066a412b512124cc7ff758f38f77364dda2df6d58ec63883'},
                 original_linux_evaluator_sha256='edd5ad0cbba75444489d2d1cbd62ed6c6bc9b38adaca38c1819f1d8ae57aeb00',

@@ -316,9 +316,13 @@ func (s *Server) nasR2CopyPrepare(w http.ResponseWriter, r *http.Request, cid in
 	if active >= NASR2CopyWorkers {
 		return task, nil, "", true
 	}
-	err = tx.QueryRow(ctx, `SELECT q.id,q.item,q.policy_sha256,q.work_mode FROM nas_r2_copy_items q CROSS JOIN r2_keep28_refresh_control control WHERE connection_id=$1 AND (kind='raw' OR ($3 AND kind='stitch_output')) AND
+	copyKind := "q.kind='raw'"
+	if stitch {
+		copyKind += ` OR (q.kind='stitch_output' AND nas_stitch_r2_native_copy_ready(q.source_id,q.manifest_sha256))`
+	}
+	err = tx.QueryRow(ctx, `SELECT q.id,q.item,q.policy_sha256,q.work_mode FROM nas_r2_copy_items q CROSS JOIN r2_keep28_refresh_control control WHERE connection_id=$1 AND (`+copyKind+`) AND
  (state='pending' OR (state='leased' AND lease_expires_at<clock_timestamp()) OR ($2 AND control.enabled AND (state='refresh_pending' OR (state='refresh_leased' AND lease_expires_at<clock_timestamp()))))
- ORDER BY (q.kind<>'stitch_output'),(q.work_mode=control.last_mode),CASE WHEN q.work_mode='verify_existing' THEN q.updated_at END,q.id LIMIT 1 FOR UPDATE OF q SKIP LOCKED`, cid, verify, stitch).Scan(&task.ID, &data, &task.PolicySHA256, &task.WorkMode)
+ ORDER BY (q.kind<>'stitch_output'),(q.work_mode=control.last_mode),CASE WHEN q.work_mode='verify_existing' THEN q.updated_at END,q.id LIMIT 1 FOR UPDATE OF q SKIP LOCKED`, cid, verify).Scan(&task.ID, &data, &task.PolicySHA256, &task.WorkMode)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return task, nil, "", true
 	}

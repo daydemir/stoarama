@@ -47747,26 +47747,29 @@ def stitch_frozen(inventory, previous, clip, stop):
 def stitch_v85r_bundle(state_dir, stop):
     """Install only the embedded pinned members; verify each file before use."""
     import base64
+    stitch_check(stop)
+    return stitch_unpack_v85r(base64.b85decode(V85R_BUNDLE), V85R_BUNDLE_SHA, V85R_MANIFEST_SHA, state_dir, stop)
+
+
+def stitch_unpack_v85r(blob, bundle_sha, manifest_sha, state_dir, stop):
     import gzip
     import io
     import tarfile
     stitch_check(stop)
-    blob = base64.b85decode(V85R_BUNDLE)
-    stitch_check(stop)
-    if hashlib.sha256(blob).hexdigest() != V85R_BUNDLE_SHA:
+    if hashlib.sha256(blob).hexdigest() != bundle_sha:
         raise StitchHold("V85r bundle hash differs")
     stitch_check(stop)
-    root = Path(state_dir)/"tools"/("v85r-" + V85R_MANIFEST_SHA)
+    root = Path(state_dir)/"tools"/("v85r-" + manifest_sha)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     expanded = gzip.decompress(blob)
     stitch_check(stop)
     with tarfile.open(fileobj=io.BytesIO(expanded), mode="r:") as archive:
         with archive.extractfile("manifest.json") as source:
             manifest_body = b"".join(stitch_read_chunks(source, stop))
-        if hashlib.sha256(manifest_body).hexdigest() != V85R_MANIFEST_SHA:
+        if hashlib.sha256(manifest_body).hexdigest() != manifest_sha:
             raise StitchHold("V85r manifest hash differs")
         manifest = json.loads(manifest_body)
-        pins = dict(manifest["files"], **{"manifest.json": V85R_MANIFEST_SHA})
+        pins = dict(manifest["files"], **{"manifest.json": manifest_sha})
         if manifest["policy"] != STITCH_POLICY or set(archive.getnames()) != set(pins):
             raise StitchHold("V85r bundle membership differs")
         for member in archive:
@@ -48794,10 +48797,14 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
         raise StitchHold(stop.reason or "stitch cancelled")
     result = dict(policy=STITCH_POLICY, lease_token=task.get("lease_token", ""), plan_sha256=task["plan_sha256"], outputs=[], repairs=[], left_out=[], seams=[], error="")
     with stitch_measure_stage(stop, StitchMeasureStage.PROVENANCE):
-        provenance = stitch_v85r_provenance(tools, stop)
+        if kind is StitchRunKind.DURHAM_R2:
+            root, provenance = cfg.durham_v85r.verify(tools, stop)
+        else:
+            provenance = stitch_v85r_provenance(tools, stop)
     stitch_check(stop)
-    with stitch_measure_stage(stop, StitchMeasureStage.BUNDLE):
-        root = stitch_v85r_bundle(cfg.state_dir, stop) if admitted is None else None
+    if kind is not StitchRunKind.DURHAM_R2:
+        with stitch_measure_stage(stop, StitchMeasureStage.BUNDLE):
+            root = stitch_v85r_bundle(cfg.state_dir, stop) if admitted is None else None
     stitch_check(stop)
     ffmpeg, ffprobe = tools["ffmpeg"], tools["ffprobe"]
     # Deterministic owner directory allows an interrupted task to be rebuilt

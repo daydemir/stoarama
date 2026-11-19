@@ -79,12 +79,13 @@ type nasStitchPlan struct {
 	FeatureInputs []collation.Clip  `json:"feature_inputs"`
 }
 type nasStitchTask struct {
-	ID      int64         `json:"id"`
-	Attempt int           `json:"attempt"`
-	Token   string        `json:"lease_token"`
-	Expires time.Time     `json:"expires_at"`
-	PlanSHA string        `json:"plan_sha256"`
-	Plan    nasStitchPlan `json:"plan"`
+	ID        int64         `json:"id"`
+	Attempt   int           `json:"attempt"`
+	Token     string        `json:"lease_token"`
+	Expires   time.Time     `json:"expires_at"`
+	PlanSHA   string        `json:"plan_sha256"`
+	Plan      nasStitchPlan `json:"plan"`
+	Toolchain string        `json:"toolchain,omitempty"`
 }
 type nasStitchDecision struct {
 	Policy        string `json:"policy"`
@@ -101,7 +102,9 @@ type nasStitchDecision struct {
 type nasStitchProvenance struct {
 	OctoberRecovered bool   `json:"october_ffmpeg_recovered"`
 	Policy           string `json:"policy"`
+	Architecture     string `json:"architecture,omitempty"`
 	ManifestSHA      string `json:"manifest_sha256"`
+	EvaluatorSHA     string `json:"evaluator_sha256,omitempty"`
 	FFmpegVersion    string `json:"ffmpeg_version"`
 	FFprobeVersion   string `json:"ffprobe_version"`
 	FFmpegSHA        string `json:"ffmpeg_sha256"`
@@ -319,9 +322,8 @@ func (s *Server) handleAccountNASStitchLease(w http.ResponseWriter, r *http.Requ
 		util.WriteJSON(w, 200, map[string]any{"task": nil, "retry_after_sec": 300})
 		return
 	}
-	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
-		if !caller.dedicated {
-			util.WriteError(w, 403, "dedicated Durham key required")
+	if r.Header.Get("X-Stoarama-Stitch-Source") != "" {
+		if !requireDurhamProfile(w, r, caller) {
 			return
 		}
 		s.handleDurhamStitchLease(w, r, caller)
@@ -446,9 +448,8 @@ func (s *Server) handleAccountNASStitchCheckpoint(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
-	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
-		if !caller.dedicated {
-			util.WriteError(w, 403, "dedicated Durham key required")
+	if r.Header.Get("X-Stoarama-Stitch-Source") != "" {
+		if !requireDurhamProfile(w, r, caller) {
 			return
 		}
 		s.handleDurhamStitchCheckpoint(w, r, caller, id)
@@ -701,7 +702,7 @@ func validateNASStitchProof(p nasStitchPlan, q nasStitchResult, origin nasStitch
 	}
 	var included []nasCleanupItem
 	for _, o := range q.Outputs {
-		if o.Policy != nasStitchPolicy || !validNASStitchProvenance(o.Provenance) || !validCleanupPath(o.Path) || path.Dir(o.Path) != p.OutputFolder || paths[o.Path] || !stitchSHA(o.SHA) || o.ReadbackSHA != o.SHA || o.Size <= 0 || o.Size > nasStitchMaxBytes+nasStitchMaxBytes/10 || !o.FullDecode || !o.SeamDecode || !o.PacketChain || !o.NativeAudit || !o.NoAudio || !o.Fsynced || len(o.Inputs) == 0 {
+		if o.Policy != nasStitchPolicy || !validNASStitchProvenance(o.Provenance, origin) || !validCleanupPath(o.Path) || path.Dir(o.Path) != p.OutputFolder || paths[o.Path] || !stitchSHA(o.SHA) || o.ReadbackSHA != o.SHA || o.Size <= 0 || o.Size > nasStitchMaxBytes+nasStitchMaxBytes/10 || !o.FullDecode || !o.SeamDecode || !o.PacketChain || !o.NativeAudit || !o.NoAudio || !o.Fsynced || len(o.Inputs) == 0 {
 			return nil, errors.New("complete durable native output verification required")
 		}
 		paths[o.Path] = true
@@ -760,7 +761,7 @@ func validateNASStitchProof(p nasStitchPlan, q nasStitchResult, origin nasStitch
 		for _, id := range q.LeftOut {
 			left = left || id == r.ID
 		}
-		if r.Policy != nasStitchPolicy || !validNASStitchProvenance(r.Provenance) || !ok || !left || repairSeen[r.ID] || r.OriginalSHA != c.SHA256 || r.OriginalSize != c.SizeBytes || !validCleanupPath(r.Path) || path.Dir(r.Path) != p.OutputFolder || !strings.HasPrefix(path.Base(r.Path), "repaired-") || !stitchSHA(r.SHA) || r.Size <= 0 || r.Size > 32<<20 || r.ReadbackSHA != r.SHA || r.Method != "mdat_annexb_vui_prefix_v1" || r.FPSSource != "vui" || !r.Synthesized || r.Complete || !r.FullDecode || !r.Fsynced || r.Frames <= 0 || r.Duration < 1 || r.Duration > 60 || len(r.Note) > 1000 {
+		if r.Policy != nasStitchPolicy || !validNASStitchProvenance(r.Provenance, origin) || !ok || !left || repairSeen[r.ID] || r.OriginalSHA != c.SHA256 || r.OriginalSize != c.SizeBytes || !validCleanupPath(r.Path) || path.Dir(r.Path) != p.OutputFolder || !strings.HasPrefix(path.Base(r.Path), "repaired-") || !stitchSHA(r.SHA) || r.Size <= 0 || r.Size > 32<<20 || r.ReadbackSHA != r.SHA || r.Method != "mdat_annexb_vui_prefix_v1" || r.FPSSource != "vui" || !r.Synthesized || r.Complete || !r.FullDecode || !r.Fsynced || r.Frames <= 0 || r.Duration < 1 || r.Duration > 60 || len(r.Note) > 1000 {
 			return nil, errors.New("partial repair provenance incomplete or wrongly included")
 		}
 		repairSeen[r.ID] = true
@@ -779,9 +780,8 @@ func (s *Server) handleAccountNASStitchResult(w http.ResponseWriter, r *http.Req
 	if !ok {
 		return
 	}
-	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
-		if !caller.dedicated {
-			util.WriteError(w, 403, "dedicated Durham key required")
+	if r.Header.Get("X-Stoarama-Stitch-Source") != "" {
+		if !requireDurhamProfile(w, r, caller) {
 			return
 		}
 		s.handleDurhamStitchResult(w, r, caller, id)
@@ -895,9 +895,8 @@ func (s *Server) handleAccountNASStitchReady(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
-	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
-		if !caller.dedicated {
-			util.WriteError(w, 403, "dedicated Durham key required")
+	if r.Header.Get("X-Stoarama-Stitch-Source") != "" {
+		if !requireDurhamProfile(w, r, caller) {
 			return
 		}
 		s.handleDurhamStitchStatus(w, r, caller, id)
@@ -956,8 +955,20 @@ func (s *Server) handleAccountNASStitchReady(w http.ResponseWriter, r *http.Requ
 	util.WriteJSON(w, 200, map[string]any{"ready": true, "id": id})
 }
 
-func validNASStitchProvenance(p nasStitchProvenance) bool {
-	return p.OctoberRecovered && p.Policy == nasStitchPolicy && p.ManifestSHA == nasStitchManifestSHA && p.FFmpegVersion == "N-126826-gc0e8b139fd-20260924" && p.FFprobeVersion == "N-126826-gc0e8b139fd-20260924" && p.FFmpegSHA == "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b" && p.FFprobeSHA == "9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c"
+func reviewedDurhamProvenance() nasStitchProvenance {
+	return nasStitchProvenance{
+		Policy: nasStitchPolicy, Architecture: "linux-arm64",
+		ManifestSHA: nasDurhamManifestSHA, EvaluatorSHA: nasDurhamEvaluatorSHA,
+		FFmpegVersion: nasDurhamToolVersion, FFprobeVersion: nasDurhamToolVersion,
+		FFmpegSHA: nasDurhamFFmpegSHA, FFprobeSHA: nasDurhamFFprobeSHA,
+	}
+}
+
+func validNASStitchProvenance(p nasStitchProvenance, origin nasStitchProofOrigin) bool {
+	if origin == nasStitchOnDurham {
+		return p == reviewedDurhamProvenance()
+	}
+	return p.Architecture == "" && p.EvaluatorSHA == "" && p.OctoberRecovered && p.Policy == nasStitchPolicy && p.ManifestSHA == nasStitchManifestSHA && p.FFmpegVersion == "N-126826-gc0e8b139fd-20260924" && p.FFprobeVersion == "N-126826-gc0e8b139fd-20260924" && p.FFmpegSHA == "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b" && p.FFprobeSHA == "9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c"
 }
 
 // GET capabilities only; no cloud writes, no release or arbitrary object paths.

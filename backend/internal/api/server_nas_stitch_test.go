@@ -184,6 +184,63 @@ func TestNASStitchCheckpointAndLeasePauseUnderCleanupFreeze(t *testing.T) {
 	checkpoint(q.Token, false)
 }
 
+func TestR2StitchDurhamRequiresBidirectionalProfileProtocol(t *testing.T) {
+	for _, test := range []struct {
+		source, manifest string
+		dedicated        bool
+		code             int
+	}{
+		{"r2-v1", nasDurhamManifestSHA, true, http.StatusConflict},
+		{"r2-v2", "", true, http.StatusConflict},
+		{"r2-v2", nasStitchManifestSHA, true, http.StatusConflict},
+		{"r2-v2", nasDurhamManifestSHA, false, http.StatusForbidden},
+		{"r2-v2", nasDurhamManifestSHA, true, http.StatusOK},
+	} {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPost, "/account/connections/stitch/lease", nil)
+		r.Header.Set("X-Stoarama-Stitch-Source", test.source)
+		r.Header.Set("X-Stoarama-Stitch-Toolchain", test.manifest)
+		if ok := requireDurhamProfile(w, r, nasStitchCaller{dedicated: test.dedicated}); ok != (test.code == http.StatusOK) || w.Code != test.code {
+			t.Fatalf("profile gate for %+v: %t %d", test, ok, w.Code)
+		}
+	}
+}
+
+func TestDurhamProofRequiresOneNativeToolchain(t *testing.T) {
+	plan, proof := stitchUnitFixture()
+	for i := range proof.Outputs[0].Inputs {
+		proof.Outputs[0].Inputs[i].RawProof = nil
+		proof.Outputs[0].Inputs[i].RetirementHeld = true
+	}
+	if _, err := validateNASStitchProof(plan, proof, nasStitchOnDurham); err == nil {
+		t.Fatal("Durham accepted the legacy amd64 package")
+	}
+	native := reviewedDurhamProvenance()
+	proof.Outputs[0].Provenance = native
+	if _, err := validateNASStitchProof(plan, proof, nasStitchOnDurham); err != nil {
+		t.Fatal(err)
+	}
+	if validNASStitchProvenance(native, nasStitchOnNAS) {
+		t.Fatal("the NAS-local lane accepted the Durham toolchain")
+	}
+	for _, change := range []func(*nasStitchProvenance){
+		func(p *nasStitchProvenance) { p.Architecture = "linux-amd64" },
+		func(p *nasStitchProvenance) { p.OctoberRecovered = true },
+		func(p *nasStitchProvenance) { p.ManifestSHA = nasStitchManifestSHA },
+		func(p *nasStitchProvenance) { p.EvaluatorSHA = "" },
+		func(p *nasStitchProvenance) { p.FFmpegSHA = p.FFprobeSHA },
+		func(p *nasStitchProvenance) { p.FFprobeSHA = p.FFmpegSHA },
+		func(p *nasStitchProvenance) { p.FFprobeVersion = "unreviewed" },
+	} {
+		mixed := native
+		change(&mixed)
+		proof.Outputs[0].Provenance = mixed
+		if _, err := validateNASStitchProof(plan, proof, nasStitchOnDurham); err == nil {
+			t.Fatal("Durham accepted mismatched toolchain evidence", mixed)
+		}
+	}
+}
+
 func TestNASStitchRejectsInventedCorpusAndOffLeavesQueueUntouched(t *testing.T) {
 	f := newCleanupFixture(t, 1)
 	stitchMigration(t, f)
