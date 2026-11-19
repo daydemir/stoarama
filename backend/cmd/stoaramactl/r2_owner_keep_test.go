@@ -25,6 +25,17 @@ func TestR2OwnerKeepPrefixes(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO r2_owner_keep_prefixes(bucket,prefix,decision) VALUES('stoarama','Raw/no-slash','x')`); err == nil {
 		t.Fatal("malformed prefix accepted")
 	}
+	rr, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = rr.Exec(ctx, `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = rr.Exec(ctx, `INSERT INTO r2_owner_keep_prefixes(bucket,prefix,decision) VALUES('stoarama','raw/stream/999/','x')`); err == nil || !strings.Contains(err.Error(), "READ COMMITTED") {
+		t.Fatalf("repeatable-read admission: %v", err)
+	}
+	rr.Rollback(ctx)
 	for _, key := range []string{"raw/stream/854/2026/04/12/segment-1775969171803.mp4", "raw/stream/537/2026/04/18/segment-1776481123345.mp4"} {
 		for _, table := range []string{"r2_inverse_attempts", "r2_keep28_attempts"} {
 			if _, err := pool.Exec(ctx, `INSERT INTO `+table+`(bucket,object_key) VALUES('stoarama',$1)`, key); err == nil || !strings.Contains(err.Error(), "OWNER KEEP HOLD") {
@@ -129,6 +140,39 @@ func TestR2OwnerKeepStopsTheExecutor(t *testing.T) {
 		}
 		if _, err = f.pool.Exec(f.ctx, `UPDATE recording_clips SET purged_at=now() WHERE object_key=$1`, f.key); err == nil || !strings.Contains(err.Error(), "OWNER KEEP HOLD") {
 			t.Fatalf("held clip purge: %v", err)
+		}
+		// Moving the key out from under the hold in the same update still trips it.
+		moved, err := f.pool.Begin(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer moved.Rollback(f.ctx)
+		if _, err = moved.Exec(f.ctx, `SET LOCAL session_replication_role=replica`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = moved.Exec(f.ctx, `UPDATE recording_clips SET object_key='managed/acct-47/elsewhere/1.mp4',purged_at=now() WHERE object_key=$1`, f.key); err == nil || !strings.Contains(err.Error(), "OWNER KEEP HOLD") {
+			t.Fatalf("held clip moved and purged: %v", err)
+		}
+	})
+	t.Run("stage_retirement_under_a_held_prefix_is_refused", func(t *testing.T) {
+		f := newKeep28Fixture(t)
+		if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_owner_keep_prefixes(bucket,prefix,decision) VALUES('stoarama','stitch-staging/','test hold')`); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := f.pool.Begin(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(f.ctx)
+		if _, err = tx.Exec(f.ctx, `SET LOCAL session_replication_role=replica`); err != nil {
+			t.Fatal(err)
+		}
+		var id int64
+		if err = tx.QueryRow(f.ctx, `INSERT INTO nas_stitch_r2_stage_objects(hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes) VALUES(1,1,1,'stoarama',repeat('a',64),'h/1.mp4',repeat('b',64),10) RETURNING id`).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = tx.Exec(f.ctx, `INSERT INTO nas_stitch_r2_stage_retirements(object_id) VALUES($1)`, id); err == nil || !strings.Contains(err.Error(), "OWNER KEEP HOLD") {
+			t.Fatalf("stage retirement under a held prefix: %v", err)
 		}
 	})
 }
