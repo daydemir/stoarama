@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,16 +14,24 @@ import (
 	"os"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/api"
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/r2"
 )
 
 func runNASStitch(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) == 0 {
-		log.Fatal("usage: nas-stitch status|proof-plan|verify-proof|approve|pause|import-corpus|backlog|mint-durham-key")
+		log.Fatal("usage: nas-stitch status|proof-plan|verify-proof|approve|pause|import-corpus|backlog|mint-durham-key|import-durham|retire-durham-stage")
 	}
 	switch args[0] {
 	case "mint-durham-key":
 		runMintDurhamStitchKey(ctx, cfg, args[1:])
+		return
+	case "import-durham":
+		runDurhamHoldImport(ctx, cfg, args[1:])
+		return
+	case "retire-durham-stage":
+		runDurhamStageRetirement(ctx, cfg, args[1:])
 		return
 	case "backlog":
 		runNASStitchBacklog(ctx, cfg, args[1:])
@@ -106,4 +116,78 @@ func runNASStitch(ctx context.Context, cfg config.Config, args []string) {
 	default:
 		log.Fatal("usage: nas-stitch status|proof-plan|verify-proof|approve|pause|import-corpus|backlog")
 	}
+}
+
+func runDurhamStageRetirement(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("nas-stitch retire-durham-stage", flag.ExitOnError)
+	id := fs.Int64("object-id", 0, "exact certified Durham staging object ID")
+	digest := fs.String("sha256", "", "certified whole-file SHA-256")
+	apply := fs.Bool("apply", false, "authorize one stage-only wire attempt")
+	reconcile := fs.Bool("reconcile", false, "record absence of an already issued staging target")
+	fs.Parse(args)
+	if fs.NArg() != 0 || *id <= 0 || !r2RetireLowerHex64(*digest) || *apply == *reconcile {
+		log.Fatal("exact object ID, SHA-256 and one of --apply or --reconcile required")
+	}
+	pool, err := r2RetireOpenPool(ctx, cfg, false)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
+	store, err := r2.New(ctx, r2.Config{WriterDB: pool, Endpoint: cfg.R2Endpoint, Region: cfg.R2Region,
+		Bucket: cfg.R2Bucket, AccessKey: cfg.R2AccessKeyID, SecretKey: cfg.R2SecretAccessKey})
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err = store.RetireStitchStage(ctx, *id, *digest, *reconcile); err != nil {
+		log.Fatal(err)
+	}
+	printJSON(map[string]any{"object_id": *id, "absence_confirmed": true})
+}
+
+func runDurhamHoldImport(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("nas-stitch import-durham", flag.ExitOnError)
+	input := fs.String("input", "", "reviewed exact Durham hold manifest")
+	expected := fs.String("sha256", "", "independently reviewed manifest SHA-256")
+	fs.Parse(args)
+	if fs.NArg() != 0 || *input == "" || !r2RetireLowerHex64(*expected) {
+		log.Fatal("reviewed Durham manifest and SHA-256 are required")
+	}
+	file, err := os.Open(*input)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() < 1 || info.Size() > 1<<30 {
+		log.Fatal("Durham hold manifest is not a bounded regular file")
+	}
+	digest := sha256.New()
+	decoder := json.NewDecoder(io.TeeReader(io.LimitReader(file, info.Size()), digest))
+	decoder.DisallowUnknownFields()
+	var manifest api.DurhamStitchHoldSet
+	if err := decoder.Decode(&manifest); err != nil {
+		log.Fatal("invalid Durham hold manifest")
+	}
+	var extra json.RawMessage
+	if decoder.Decode(&extra) != io.EOF || hex.EncodeToString(digest.Sum(nil)) != *expected {
+		log.Fatal("Durham hold manifest differs from reviewed digest")
+	}
+	pool, err := r2RetireOpenPool(ctx, cfg, false)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	holds, err := api.ImportDurhamStitchHoldSet(ctx, tx, manifest)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Fatal(err)
+	}
+	printJSON(map[string]any{"hours": len(manifest.Hours), "holds": holds, "manifest_sha256": *expected})
 }

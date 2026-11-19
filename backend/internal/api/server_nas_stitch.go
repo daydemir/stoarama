@@ -300,6 +300,14 @@ func (s *Server) handleAccountNASStitchLease(w http.ResponseWriter, r *http.Requ
 		util.WriteJSON(w, 200, map[string]any{"task": nil, "retry_after_sec": 300})
 		return
 	}
+	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
+		if !caller.dedicated {
+			util.WriteError(w, 403, "dedicated Durham key required")
+			return
+		}
+		s.handleDurhamStitchLease(w, r, caller)
+		return
+	}
 	ctx, cancel := cleanupExecutionContext(r.Context())
 	defer cancel()
 	tx, err := s.pool.Begin(ctx)
@@ -415,6 +423,14 @@ func (s *Server) handleAccountNASStitchCheckpoint(w http.ResponseWriter, r *http
 	}
 	id, ok := parseInt64Path(w, r, "id")
 	if !ok {
+		return
+	}
+	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
+		if !caller.dedicated {
+			util.WriteError(w, 403, "dedicated Durham key required")
+			return
+		}
+		s.handleDurhamStitchCheckpoint(w, r, caller, id)
 		return
 	}
 	var req struct {
@@ -596,7 +612,18 @@ func (s *Server) stitchPlanNext(ctx context.Context, tx pgx.Tx) (nasStitchTask, 
 	return t, err
 }
 
+type nasStitchProofOrigin uint8
+
+const (
+	nasStitchOnNAS nasStitchProofOrigin = iota
+	nasStitchOnDurham
+)
+
 func validateNASStitchResult(p nasStitchPlan, q nasStitchResult) ([]nasCleanupItem, error) {
+	return validateNASStitchProof(p, q, nasStitchOnNAS)
+}
+
+func validateNASStitchProof(p nasStitchPlan, q nasStitchResult, origin nasStitchProofOrigin) ([]nasCleanupItem, error) {
 	if p.Policy != nasStitchPolicy || p.Revision != nasStitchRevision || q.Policy != nasStitchPolicy || len(p.Eligible) != len(p.Clips) || len(p.Joins) != len(p.Clips)-1 || len(q.Seams) != len(p.Joins) || len(p.Frozen) != len(p.Joins) {
 		return nil, errors.New("incomplete policy admission")
 	}
@@ -656,20 +683,26 @@ func validateNASStitchResult(p nasStitchPlan, q nasStitchResult) ([]nasCleanupIt
 			if !ok || !p.Eligible[pos] || seen[proof.ID] || proof.SHA != c.SHA256 || proof.Size != c.SizeBytes || !stitchSHA(proof.PacketSHA) || proof.Packets <= 0 || proof.Frames != proof.Packets || proof.Repaired || (prev >= 0 && (pos != prev+1 || !q.Seams[prev].Join)) {
 				return nil, errors.New("missing, repaired, duplicate or unqualified inclusion proof")
 			}
-			// Freeze the exact physical NAS identity for existing cleanup machinery.
-			var physical struct {
-				Identity [5]int64 `json:"identity"`
-				Sidecar  struct {
+			if origin == nasStitchOnDurham {
+				if !proof.RetirementHeld || len(proof.RawProof) != 0 && string(proof.RawProof) != "null" {
+					return nil, errors.New("Durham can only attest its local decode and holds")
+				}
+			} else {
+				// Freeze the exact physical NAS identity for existing cleanup machinery.
+				var physical struct {
 					Identity [5]int64 `json:"identity"`
-				} `json:"sidecar"`
-			}
-			if json.Unmarshal(proof.RawProof, &physical) != nil {
-				return nil, errors.New("raw physical proof missing")
-			}
-			c.Frozen = physical.Identity
-			c.FrozenSidecar = physical.Sidecar.Identity
-			if !validCleanupProof(proof.RawProof, c) {
-				return nil, errors.New("raw physical proof differs")
+					Sidecar  struct {
+						Identity [5]int64 `json:"identity"`
+					} `json:"sidecar"`
+				}
+				if json.Unmarshal(proof.RawProof, &physical) != nil {
+					return nil, errors.New("raw physical proof missing")
+				}
+				c.Frozen = physical.Identity
+				c.FrozenSidecar = physical.Sidecar.Identity
+				if !validCleanupProof(proof.RawProof, c) {
+					return nil, errors.New("raw physical proof differs")
+				}
 			}
 			c.PermitReason = nasStitchReason
 			c.StitchOutputPath = o.Path
@@ -715,6 +748,14 @@ func (s *Server) handleAccountNASStitchResult(w http.ResponseWriter, r *http.Req
 	}
 	id, ok := parseInt64Path(w, r, "id")
 	if !ok {
+		return
+	}
+	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
+		if !caller.dedicated {
+			util.WriteError(w, 403, "dedicated Durham key required")
+			return
+		}
+		s.handleDurhamStitchResult(w, r, caller, id)
 		return
 	}
 	var q nasStitchResult
@@ -823,6 +864,14 @@ func (s *Server) handleAccountNASStitchReady(w http.ResponseWriter, r *http.Requ
 	}
 	id, ok := parseInt64Path(w, r, "id")
 	if !ok {
+		return
+	}
+	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
+		if !caller.dedicated {
+			util.WriteError(w, 403, "dedicated Durham key required")
+			return
+		}
+		s.handleDurhamStitchStatus(w, r, caller, id)
 		return
 	}
 	var req struct {

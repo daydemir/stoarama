@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
@@ -95,8 +96,9 @@ func nasR2CopyReadyError(w http.ResponseWriter, err error) {
 type NASR2CopyKind string
 
 const (
-	NASR2CopyRaw      NASR2CopyKind = "raw"
-	NASR2CopyCollated NASR2CopyKind = "collated"
+	NASR2CopyRaw          NASR2CopyKind = "raw"
+	NASR2CopyCollated     NASR2CopyKind = "collated"
+	NASR2CopyStitchOutput NASR2CopyKind = "stitch_output"
 )
 
 // NASR2CopyItem is transport-independent so collated custody can be added later.
@@ -121,9 +123,9 @@ func ValidateNASR2CopyItem(i NASR2CopyItem) error {
 		return err
 	}
 	w, ok := windows[i.StreamID]
-	if !ok || (i.Kind != "raw" && i.Kind != "collated") || i.SourceID <= 0 || i.RecordingID <= 0 ||
+	if !ok || (i.Kind != NASR2CopyRaw && i.Kind != NASR2CopyCollated && i.Kind != NASR2CopyStitchOutput) || i.SourceID <= 0 || i.RecordingID <= 0 ||
 		i.SizeBytes <= 0 || i.SizeBytes > NASR2CopyMaxFile || len(i.SHA256) != 64 || !lowerHex(i.SHA256) ||
-		!validNASRelativePath(i.RelativePath) || nasInventoryExcludedPath(i.RelativePath) ||
+		!validNASRelativePath(i.RelativePath) || (i.Kind != NASR2CopyStitchOutput && nasInventoryExcludedPath(i.RelativePath)) ||
 		strings.ContainsRune(i.RelativePath, 0) || strings.HasPrefix(i.RelativePath, ".") ||
 		i.StartAt.IsZero() || !i.EndAt.After(i.StartAt) || !i.StartAt.Before(w.End) || !i.EndAt.After(w.Start) {
 		return errors.New("invalid copy identity or object outside pinned keep28; no item may be silently omitted")
@@ -133,8 +135,12 @@ func ValidateNASR2CopyItem(i NASR2CopyItem) error {
 			return errors.New("hidden copy path")
 		}
 	}
-	if i.Kind == "raw" && (!strings.HasPrefix(i.ObjectKey, "managed/") || i.Bucket == "") {
+	if i.Kind == NASR2CopyRaw && (!strings.HasPrefix(i.ObjectKey, "managed/") || i.Bucket == "") {
 		return errors.New("invalid raw copy key")
+	}
+	if i.Kind == NASR2CopyStitchOutput && (i.Bucket == "" || !strings.HasPrefix(i.ObjectKey, "stitch-staging/") ||
+		!durhamStitchOutputPath(path.Dir(i.RelativePath), i.RelativePath, i.SHA256)) {
+		return errors.New("invalid stitch output copy identity")
 	}
 	return nil
 }
@@ -154,7 +160,14 @@ func LoadNASR2CopySource(ctx context.Context, tx pgx.Tx, i NASR2CopyItem) (json.
 	if err := ValidateNASR2CopyItem(i); err != nil {
 		return nil, errors.Join(errNASR2CopySourceIdentity, err)
 	}
-	if i.Kind != "raw" {
+	if i.Kind == NASR2CopyStitchOutput {
+		if _, err := loadNASR2StagedObject(ctx, tx, i); err != nil {
+			return nil, err
+		}
+		return json.Marshal(map[string]any{"clip_id": i.SourceID, "recording_id": i.RecordingID,
+			"relative_path": i.RelativePath, "sha256": i.SHA256, "size_bytes": i.SizeBytes})
+	}
+	if i.Kind != NASR2CopyRaw {
 		return nil, fmt.Errorf("%w: %s", errNASR2CopySourceIdentity, "collated custody requires follow-up support")
 	}
 	var stream, size int64
@@ -251,6 +264,8 @@ func nasR2CopyReady(ctx context.Context, tx pgx.Tx) error {
 }
 
 type nasR2CopyControl struct {
+	AcceptStitch    bool                 `json:"accept_stitch_output,omitempty"`
+	StitchReceipt   *nasR2StitchReceipt  `json:"stitch_receipt,omitempty"`
 	VerifyExisting  bool                 `json:"verify_existing"`
 	Token           string               `json:"token"`
 	RangeID         string               `json:"range_id,omitempty"`
@@ -274,7 +289,7 @@ type nasR2CopyTask struct {
 
 // Preparation holds only short database row locks. It commits before HEAD;
 // admission and maintenance must revalidate everything that can change.
-func (s *Server) nasR2CopyPrepare(w http.ResponseWriter, r *http.Request, cid int64, verify bool) (nasR2CopyTask, []byte, NASR2CopyBlockReason, bool) {
+func (s *Server) nasR2CopyPrepare(w http.ResponseWriter, r *http.Request, cid int64, verify, stitch bool) (nasR2CopyTask, []byte, NASR2CopyBlockReason, bool) {
 	var task nasR2CopyTask
 	var data []byte
 	ctx := r.Context()
@@ -296,9 +311,9 @@ func (s *Server) nasR2CopyPrepare(w http.ResponseWriter, r *http.Request, cid in
 	if active >= NASR2CopyWorkers {
 		return task, nil, "", true
 	}
-	err = tx.QueryRow(ctx, `SELECT q.id,q.item,q.policy_sha256,q.work_mode FROM nas_r2_copy_items q CROSS JOIN r2_keep28_refresh_control control WHERE connection_id=$1 AND kind='raw' AND
+	err = tx.QueryRow(ctx, `SELECT q.id,q.item,q.policy_sha256,q.work_mode FROM nas_r2_copy_items q CROSS JOIN r2_keep28_refresh_control control WHERE connection_id=$1 AND (kind='raw' OR ($3 AND kind='stitch_output')) AND
  (state='pending' OR (state='leased' AND lease_expires_at<clock_timestamp()) OR ($2 AND control.enabled AND (state='refresh_pending' OR (state='refresh_leased' AND lease_expires_at<clock_timestamp()))))
- ORDER BY (q.work_mode=control.last_mode),CASE WHEN q.work_mode='verify_existing' THEN q.updated_at END,q.id LIMIT 1 FOR UPDATE OF q SKIP LOCKED`, cid, verify).Scan(&task.ID, &data, &task.PolicySHA256, &task.WorkMode)
+ ORDER BY (q.kind<>'stitch_output'),(q.work_mode=control.last_mode),CASE WHEN q.work_mode='verify_existing' THEN q.updated_at END,q.id LIMIT 1 FOR UPDATE OF q SKIP LOCKED`, cid, verify, stitch).Scan(&task.ID, &data, &task.PolicySHA256, &task.WorkMode)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return task, nil, "", true
 	}
@@ -339,15 +354,15 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 	// A concurrent grant can consume the prepared row. Retry a bounded number
 	// of candidates without making the client hold for a normal admission race.
 	for attempt := 0; attempt < NASR2CopyWorkers; attempt++ {
-		if !s.nasR2CopyLeaseAttempt(w, r, cid, req.VerifyExisting) {
+		if !s.nasR2CopyLeaseAttempt(w, r, cid, req.VerifyExisting, req.AcceptStitch) {
 			return
 		}
 	}
 	util.WriteError(w, 409, "copy queue changed during preparation; retryable")
 }
 
-func (s *Server) nasR2CopyLeaseAttempt(w http.ResponseWriter, r *http.Request, cid int64, verify bool) bool {
-	task, data, reason, ok := s.nasR2CopyPrepare(w, r, cid, verify)
+func (s *Server) nasR2CopyLeaseAttempt(w http.ResponseWriter, r *http.Request, cid int64, verify, stitch bool) bool {
+	task, data, reason, ok := s.nasR2CopyPrepare(w, r, cid, verify, stitch)
 	if !ok {
 		return false
 	}
@@ -406,8 +421,8 @@ func (s *Server) nasR2CopyLeaseAttempt(w http.ResponseWriter, r *http.Request, c
 		return false
 	}
 	var id int64
-	err = tx.QueryRow(ctx, `SELECT id FROM nas_r2_copy_items WHERE id=$1 AND connection_id=$2 AND kind='raw' AND item=$3::jsonb AND policy_sha256=$4 AND
- (state='pending' OR (state='leased' AND lease_expires_at<clock_timestamp()) OR (state='refresh_pending' OR (state='refresh_leased' AND lease_expires_at<clock_timestamp()))) AND work_mode=$5 FOR UPDATE SKIP LOCKED`, task.ID, cid, data, task.PolicySHA256, task.WorkMode).Scan(&id)
+	err = tx.QueryRow(ctx, `SELECT id FROM nas_r2_copy_items WHERE id=$1 AND connection_id=$2 AND kind=$6 AND item=$3::jsonb AND policy_sha256=$4 AND
+ (state='pending' OR (state='leased' AND lease_expires_at<clock_timestamp()) OR (state='refresh_pending' OR (state='refresh_leased' AND lease_expires_at<clock_timestamp()))) AND work_mode=$5 FOR UPDATE SKIP LOCKED`, task.ID, cid, data, task.PolicySHA256, task.WorkMode, task.Item.Kind).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return true
 	}
@@ -422,6 +437,16 @@ func (s *Server) nasR2CopyLeaseAttempt(w http.ResponseWriter, r *http.Request, c
 			util.WriteError(w, 503, "copy source lookup unavailable; retryable")
 		}
 		return false
+	}
+	if task.Item.Kind == NASR2CopyStitchOutput && reason == "" {
+		staged, err := loadNASR2StagedObject(ctx, tx, task.Item)
+		if err != nil {
+			util.WriteError(w, 503, "stitch copy generation unavailable")
+			return false
+		}
+		if !staged.matches(head) {
+			reason = NASR2CopyR2Identity
+		}
 	}
 	if reason == NASR2CopySourceChanged {
 		return true
@@ -601,6 +626,18 @@ func (s *Server) handleNASR2CopyResult(w http.ResponseWriter, r *http.Request) {
 	}
 	if t.WorkMode == NASR2VerifyExisting && (req.Completion != NASR2CopyVerifiedInPlace || req.DownloadedBytes != 0 || req.CommittedBytes != 0) {
 		util.WriteError(w, 400, "refresh requires verify-in-place without download")
+		return
+	}
+	if t.Item.Kind == NASR2CopyStitchOutput {
+		if err := finishNASR2StitchCopy(r.Context(), tx, t, req); err != nil || tx.Commit(r.Context()) != nil {
+			util.WriteError(w, 409, "exact NAS stitch readback unavailable or certificate busy")
+			return
+		}
+		util.WriteJSON(w, 200, map[string]any{"verified": true})
+		return
+	}
+	if req.StitchReceipt != nil {
+		util.WriteError(w, 400, "stitch receipt supplied for raw copy")
 		return
 	}
 	// Existing inventory publication is the custody proof, never a result claim.

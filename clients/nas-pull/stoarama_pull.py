@@ -47249,7 +47249,7 @@ def stitch_directory_entries(descriptor, stop):
         stitch_check(stop)
 
 
-def stitch_resources(cfg, input_bytes=0):
+def stitch_resources(cfg, input_bytes=0, *, local_scratch=False):
     """Unknown resource telemetry is HOLD. Consult cgroup headroom as well.
 
     Every failure here is a host condition, not the task's data: it releases the
@@ -47281,7 +47281,11 @@ def stitch_resources(cfg, input_bytes=0):
     # them at the same rate the fixed values used to be read.
     if memory < stitch_min_memory_bytes() or load > stitch_max_load_per_cpu() * max(1, cpus):
         raise StitchResourceHold("NAS memory or load critical")
-    if not os.path.ismount(str(cfg.output_dir)):
+    if local_scratch:
+        info = os.lstat(cfg.output_dir)
+        if not stat_module.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise StitchResourceHold("Durham scratch root must be private")
+    elif not os.path.ismount(str(cfg.output_dir)):
         raise StitchResourceHold("NAS output root is not mounted")
     if shutil.disk_usage(cfg.output_dir).free < max(cfg.min_free_bytes, 1024**3) + int(input_bytes * 2.2):
         raise StitchResourceHold("NAS free-space reserve reached")
@@ -47300,6 +47304,7 @@ def stitch_priority():
 class StitchRunKind(Enum):
     PRODUCTION = "production"
     PROOF = "proof"
+    DURHAM_R2 = "durham_r2"
 
 
 def stitch_seconds_ns(seconds):
@@ -47359,6 +47364,10 @@ class StitchStop(StitchDeadline):
 
     def refresh(self):
         try:
+            if self.kind is StitchRunKind.DURHAM_R2:
+                stitch_resources(self.cfg, local_scratch=True)
+                self.cfg.durham_checkpoint(self.task)
+                return
             stitch_resources(self.cfg)
             if self.kind is StitchRunKind.PROOF:
                 stitch_proof_space(self.cfg, self.task, self)
@@ -48756,11 +48765,14 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                     pass
             os.fsync(directory.fds[-1])
         resources.callback(clear_scratch)
-        if kind is StitchRunKind.PRODUCTION:
+        if kind is not StitchRunKind.PROOF:
             # Reclaim abandoned private stages before checking the build's
             # full reservation. An interrupted batch can use that headroom.
             clear_scratch()
-            stitch_resources(cfg, input_bytes)
+            if kind is StitchRunKind.DURHAM_R2:
+                stitch_resources(cfg, input_bytes, local_scratch=True)
+            else:
+                stitch_resources(cfg, input_bytes)
         held = set()
         if admitted is None:
             inputs = plan.get("feature_inputs", [])
@@ -48833,7 +48845,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                                              # completed_no_retirement and the single lane is never left busy by
                                              # an undeleted cleanup plan. The isolated proof lane is not the
                                              # stitch lane and keeps its seam-derived value.
-                                             retirement_held=True if kind is StitchRunKind.PRODUCTION else clip["source_id"] in held,
+                                             retirement_held=True if kind is not StitchRunKind.PROOF else clip["source_id"] in held,
                                              raw_proof=raw_proof))
             if kind is StitchRunKind.PROOF:
                 proof["media_seconds"] = float(cumulative)
@@ -48915,7 +48927,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
             except MediaCertificationError as exc:
                 raise MediaCertificationResourceError("stitch output publication needs a fresh read") from exc
             STITCH_STATUS.add("outputs_verified", len(result["outputs"]))
-    if kind is StitchRunKind.PRODUCTION:
+    if kind is not StitchRunKind.PROOF:
         stitch_journal(inventory, task["id"], task["plan_sha256"], result)
     return result
 
@@ -53241,8 +53253,14 @@ def valid_r2_copy_task(task):
         raise ValueError("invalid copy token/policy")
     r2_copy_work_mode(task)
     item, clip = task["item"], task["clip"]
-    if item.get("kind") != "raw":
-        raise ValueError("collated copy custody is blocked")
+    if item.get("kind") not in ("raw", "stitch_output"):
+        raise ValueError("unsupported copy custody kind")
+    if item["kind"] == "stitch_output" and (not re.fullmatch(
+            r"[^/]+_V85r_keep28/[1-9][0-9]*/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-00-00Z/run-[0-9]{3}-[0-9a-f]{64}\.mp4",
+            item["relative_path"]) or not item["relative_path"].endswith("-" + item["sha256"] + ".mp4")
+            or not item["object_key"].startswith("stitch-staging/")
+            or r2_copy_work_mode(task) is not R2CopyWorkMode.COPY):
+        raise ValueError("unbound stitch copy output")
     for name in ("source_id", "recording_id", "stream_id", "size_bytes"):
         if type(item.get(name)) is not int or item[name] <= 0:
             raise ValueError("invalid copy identity")
@@ -53480,24 +53498,36 @@ def _execute_r2_copy(cfg, runtime, inventory, stop, task, control):
             size, digest, info = r2_copy_hash(final_fd, guard)
             if size != item["size_bytes"] or digest.hexdigest() != item["sha256"]:
                 raise R2CopyBlocked(R2CopyBlockReason.FINAL)
-            payload = r2_copy_sidecar(parent, name, task["clip"], guard)
+            stitch_output = item["kind"] == "stitch_output"
+            if stitch_output:
+                guard.disk()
+                os.fsync(final_fd)
+                os.fsync(parent)
+            else:
+                payload = r2_copy_sidecar(parent, name, task["clip"], guard)
             guard.check(remote=True)
             _, current = confined_regular_file(cfg.output_dir, item["relative_path"])
-            if cleanup_identity(current) != cleanup_identity(info):
+            identity = cleanup_identity(info)
+            if cleanup_identity(current) != identity:
                 raise R2CopyBlocked(R2CopyBlockReason.PATH)
-            inventory._upsert(task["clip"], "present", utc_now_precise(), info.st_mtime_ns,
-                              file_identity=(info.st_ctime_ns, info.st_ino, info.st_dev),
-                              sidecar_evidence=(item["relative_path"] + ".stoarama.json", len(payload), hashlib.sha256(payload).hexdigest()))
-            rows = inventory._rows("dirty=1 AND clip_id=?", (item["source_id"],), 1)
-            control.request_json(R2CopyControlOperation.INVENTORY, "/account/connections/inventory", timeout=R2_COPY_TIMEOUT, body={
-                "generation": "live", "dataset_schema": INVENTORY_DATASET_SCHEMA,
-                "root_exclusions": list(INVENTORY_ROOT_EXCLUSIONS), "complete": False, "files": inventory._reports(rows)})
-            inventory._mark_clean(rows)
+            result = {"token": task["token"], "free_bytes": r2_copy_resources(cfg, runtime),
+                      "completion": "downloaded" if committed else "verified_in_place",
+                      "downloaded_bytes": downloaded, "committed_bytes": committed}
+            if stitch_output:
+                result["stitch_receipt"] = dict(relative_path=item["relative_path"], sha256=item["sha256"],
+                                                size_bytes=size, identity=identity, fsynced=True)
+            else:
+                inventory._upsert(task["clip"], "present", utc_now_precise(), info.st_mtime_ns,
+                                  file_identity=(info.st_ctime_ns, info.st_ino, info.st_dev),
+                                  sidecar_evidence=(item["relative_path"] + ".stoarama.json", len(payload), hashlib.sha256(payload).hexdigest()))
+                rows = inventory._rows("dirty=1 AND clip_id=?", (item["source_id"],), 1)
+                control.request_json(R2CopyControlOperation.INVENTORY, "/account/connections/inventory", timeout=R2_COPY_TIMEOUT, body={
+                    "generation": "live", "dataset_schema": INVENTORY_DATASET_SCHEMA,
+                    "root_exclusions": list(INVENTORY_ROOT_EXCLUSIONS), "complete": False, "files": inventory._reports(rows)})
+                inventory._mark_clean(rows)
             guard.check(remote=True)
             control.request_json(R2CopyControlOperation.RESULT, "/account/connections/r2-copy/%d/result" % task["id"],
-                         body={"token": task["token"], "free_bytes": r2_copy_resources(cfg, runtime),
-                               "completion": "downloaded" if committed else "verified_in_place",
-                               "downloaded_bytes": downloaded, "committed_bytes": committed}, timeout=R2_COPY_TIMEOUT)
+                                 body=result, timeout=R2_COPY_TIMEOUT)
             with R2_COPY_TELEMETRY.lock:
                 if verify_only:
                     R2_COPY_TELEMETRY.refreshed += 1
@@ -53520,8 +53550,11 @@ def r2_copy_worker(cfg, runtime, inventory, stop, worker):
             wait = 60
             try:
                 free = r2_copy_resources(cfg, runtime)
+                request = {"free_bytes": free, "verify_existing": True}
+                if os.environ.get("STOARAMA_R2_COPY_STITCH_OUTPUT_ENABLED") == "true":
+                    request["accept_stitch_output"] = True
                 response = control.request_json(R2CopyControlOperation.LEASE, "/account/connections/r2-copy/lease",
-                                        body={"free_bytes": free, "verify_existing": True})
+                                                body=request)
                 if response.get("blocked") is True:
                     log("ERROR", "R2 copy server blocked id=%s reason=%s; key protected" % (response.get("id"), response.get("reason")))
                     wait = 0

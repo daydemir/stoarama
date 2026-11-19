@@ -3,6 +3,8 @@ package r2
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -86,4 +88,42 @@ func (c *Client) RequireNoMultipartUploads(ctx context.Context) error {
 		return errors.New("R2 multipart uploads have not drained")
 	}
 	return nil
+}
+
+// RequireNoMultipartOutsideStitchStaging retains the provider-side veto for
+// every upload other than an exact, durably bound stitch staging attempt.
+func (c *Client) RequireNoMultipartOutsideStitchStaging(
+	ctx context.Context, known func(context.Context, string, string) (bool, error),
+) error {
+	request := &s3.ListMultipartUploadsInput{Bucket: aws.String(c.bucket), MaxUploads: aws.Int32(1000)}
+	type marker struct{ key, upload string }
+	seen := map[marker]bool{}
+	for {
+		page, err := c.s3.ListMultipartUploads(ctx, request)
+		if err != nil || page.IsTruncated == nil {
+			return errors.New("R2 multipart inventory unavailable or incomplete")
+		}
+		for _, object := range page.Uploads {
+			key, upload := aws.ToString(object.Key), aws.ToString(object.UploadId)
+			if !strings.HasPrefix(key, "stitch-staging/") || upload == "" {
+				return errors.New("R2 multipart uploads have not drained")
+			}
+			exempt, err := known(ctx, key, upload)
+			if err != nil {
+				return fmt.Errorf("check R2 stitch upload identity: %w", err)
+			}
+			if !exempt {
+				return errors.New("unregistered R2 stitch multipart upload")
+			}
+		}
+		if !aws.ToBool(page.IsTruncated) {
+			return nil
+		}
+		next := marker{aws.ToString(page.NextKeyMarker), aws.ToString(page.NextUploadIdMarker)}
+		if next.key == "" || next.upload == "" || seen[next] {
+			return errors.New("R2 multipart inventory has an invalid continuation")
+		}
+		seen[next] = true
+		request.KeyMarker, request.UploadIdMarker = page.NextKeyMarker, page.NextUploadIdMarker
+	}
 }

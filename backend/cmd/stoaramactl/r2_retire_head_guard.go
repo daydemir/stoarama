@@ -18,7 +18,7 @@ type r2RetireSingleDeleteStore interface {
 
 // Operator acknowledgment never waives these known writer destinations.
 func r2RetireCheckUngatedPrefix(key string) error {
-	for _, prefix := range []string{"repaired/", "nas-releases/", "relay-releases/", "staging/", "nas-probes/", "nas-space-audits/", ".stoarama-verify/", "r2-retire-probes/"} {
+	for _, prefix := range []string{"repaired/", "nas-releases/", "relay-releases/", "staging/", "stitch-staging/", "nas-probes/", "nas-space-audits/", ".stoarama-verify/", "r2-retire-probes/"} {
 		if strings.HasPrefix(key, prefix) {
 			return fmt.Errorf("key overlaps ungated writer prefix %s; acknowledgment cannot waive prefix exclusion", prefix)
 		}
