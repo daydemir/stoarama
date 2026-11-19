@@ -28,6 +28,12 @@ func (a *inverseApplier) eventTable() string {
 	}
 	return "r2_inverse_events"
 }
+func (a *inverseApplier) attemptTable() string {
+	if a.opts.Lane == inverseNASKeep28 {
+		return "r2_keep28_attempts"
+	}
+	return "r2_inverse_attempts"
+}
 func (a *inverseApplier) retirementReason() string {
 	if a.opts.Lane == inverseNASKeep28 {
 		return "keep28_exact_nas"

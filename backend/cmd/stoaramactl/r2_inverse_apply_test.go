@@ -340,6 +340,30 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatalf("%+v %v calls%d", s, err, store.calls)
 		}
 	})
+	t.Run("unissued_intent_stays_held_when_object_vanishes", func(t *testing.T) {
+		a, entries := build(1)
+		if _, err := a.reserve(ctx, entries[0]); err != nil {
+			t.Fatal(err)
+		}
+		a.ledger.close()
+		store.mu.Lock()
+		object := store.objects[entries[0].Key]
+		delete(store.objects, entries[0].Key)
+		store.mu.Unlock()
+		before := store.calls
+		s, err := applyInverse(ctx, pool, store, a.opts)
+		store.mu.Lock()
+		store.objects[entries[0].Key] = object
+		store.mu.Unlock()
+		var absent int
+		var purged bool
+		if qerr := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM r2_inverse_events WHERE object_key=$1),(SELECT purged_at IS NOT NULL FROM recording_clips WHERE object_key=$1)`, entries[0].Key).Scan(&absent, &purged); qerr != nil {
+			t.Fatal(qerr)
+		}
+		if err == nil || !strings.Contains(err.Error(), "never issued a DELETE") || s.Reconciled != 0 || s.Deleted != 0 || absent != 0 || purged || store.calls != before {
+			t.Fatalf("%+v %v absent%d purged%t calls%d", s, err, absent, purged, store.calls)
+		}
+	})
 	t.Run("lost_response_reconciles_without_retransmit", func(t *testing.T) {
 		a, _ := build(1)
 		a.ledger.close()
