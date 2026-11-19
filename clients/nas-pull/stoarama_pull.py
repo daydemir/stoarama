@@ -25857,7 +25857,8 @@ def _niced(command):
     return prefix + list(command)
 
 
-def run_measured(command, deadline, stop_event, stdout_path=None, niced=True):
+def run_measured(command, deadline, stop_event, stdout_path=None, niced=True, *,
+                 drain_stdout=None, child_writers=()):
     """Run one child to completion; return wall, CPU and peak RSS from wait4.
 
     The child gets its own process group and is killed at the deadline or on
@@ -25867,22 +25868,24 @@ def run_measured(command, deadline, stop_event, stdout_path=None, niced=True):
     if remaining <= 0:
         raise BenchmarkDeadline("benchmark deadline reached")
     stderr_file = tempfile.TemporaryFile()
-    stdout_file = open(stdout_path, "wb") if stdout_path else subprocess.DEVNULL
+    stdout_file = (open(stdout_path, "wb") if stdout_path else
+                   subprocess.PIPE if drain_stdout else subprocess.DEVNULL)
     started = time.monotonic()
+    done = threading.Event()
+    killed = {"reason": ""}
     try:
         if time.monotonic() >= deadline:
             raise BenchmarkDeadline("benchmark deadline reached")
         if stop_event.is_set():
             raise BenchmarkError("client shutting down")
         process = subprocess.Popen(_niced(command) if niced else list(command), stdin=subprocess.DEVNULL,
-                                   stdout=stdout_file, stderr=stderr_file, start_new_session=True)
+                                   stdout=stdout_file, stderr=stderr_file, start_new_session=True,
+                                   pass_fds=tuple(writer.fileno() for writer in child_writers))
     except BaseException:
         stderr_file.close()
         if stdout_path:
             stdout_file.close()
         raise
-    killed = {"reason": ""}
-    done = threading.Event()
 
     def watchdog():
         while not done.wait(0.5):
@@ -25895,25 +25898,43 @@ def run_measured(command, deadline, stop_event, stdout_path=None, niced=True):
                     pass
                 return
 
-    guard = threading.Thread(target=watchdog, name="benchmark-watchdog", daemon=True)
-    guard.start()
+    guard = None
     try:
-        _, status, usage = os.wait4(process.pid, 0)
-        process.returncode = os.waitstatus_to_exitcode(status)
+        try:
+            for writer in child_writers:
+                writer.close()
+            guard = threading.Thread(target=watchdog, name="benchmark-watchdog", daemon=True)
+            guard.start()
+            drained = drain_stdout(process.stdout) if drain_stdout else None
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            raise
+        finally:
+            _, status, usage = os.wait4(process.pid, 0)
+            process.returncode = os.waitstatus_to_exitcode(status)
+        stderr_file.seek(0, os.SEEK_END)
+        stderr_file.seek(max(0, stderr_file.tell() - 400))
+        stderr_tail = stderr_file.read().decode("utf-8", "replace").strip()
     finally:
         done.set()
-        guard.join(timeout=2)
+        if guard is not None and guard.ident is not None:
+            guard.join(timeout=2)
+        if process.stdout is not None:
+            process.stdout.close()
         if stdout_path:
             stdout_file.close()
-    stderr_file.seek(0)
-    stderr_tail = stderr_file.read()[-400:].decode("utf-8", "replace").strip()
-    stderr_file.close()
+        stderr_file.close()
     wall = time.monotonic() - started
     measured = {
         "wall_s": wall, "cpu_s": usage.ru_utime + usage.ru_stime,
         "max_rss_kb": int(usage.ru_maxrss if sys.platform != "darwin" else usage.ru_maxrss // 1024),
         "returncode": process.returncode, "stderr": stderr_tail,
     }
+    if drain_stdout:
+        measured["drained"] = drained
     if killed["reason"] == "deadline":
         raise BenchmarkDeadline("benchmark deadline reached")
     if killed["reason"] == "shutdown":
@@ -47531,12 +47552,15 @@ def stitch_proof_request(cfg, path, stop, timeout=HEARTBEAT_TIMEOUT_SEC):
     return result
 
 
-def stitch_run(args, deadline, stop, stdout=None):
-    # The worker thread is already nice19/idle; explicitly apply the same
-    # priorities to FFmpeg and ffprobe children. No '-t' silent ionice fallback.
+def stitch_native_command(args):
+    # Match the worker's nice19/idle priority for native tools.
     prefix = ["nice", "-n", "19", "ionice", "-c", "3"] if sys.platform.startswith("linux") else []
+    return prefix + list(args)
+
+
+def stitch_run(args, deadline, stop, stdout=None):
     stitch_check(stop)
-    measured = run_measured(prefix + list(args), deadline, stop, stdout_path=stdout, niced=False)
+    measured = run_measured(stitch_native_command(args), deadline, stop, stdout_path=stdout, niced=False)
     if getattr(stop, "kind", None) is StitchRunKind.PROOF:
         stop.measurements.append(dict(argv=list(map(str, args)), returncode=measured["returncode"], wall_s=measured.get("wall_s"), cpu_s=measured.get("cpu_s")))
     if measured["returncode"] != 0:
@@ -48136,10 +48160,113 @@ def stitch_packets(ffprobe, source, target, deadline, stop, hidden=False):
                 "-of", "compact=p=0", str(source)], deadline, stop, target)
 
 
+def stitch_frame_command(ffmpeg, source):
+    return [ffmpeg, "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode",
+            "-threads", "1", "-filter_threads", "1", "-i", str(source), "-map", "0:v:0",
+            "-fps_mode", "passthrough", "-enc_time_base", "demux"]
+
+
+def stitch_framehash_command(ffmpeg, source, target):
+    return stitch_frame_command(ffmpeg, source) + ["-f", "framehash", "-hash", "sha256", "-y", str(target)]
+
+
 def stitch_frames(ffmpeg, source, target, deadline, stop):
-    stitch_run([ffmpeg, "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode",
-                "-threads", "1", "-filter_threads", "1", "-i", str(source), "-map", "0:v:0",
-                "-fps_mode", "passthrough", "-enc_time_base", "demux", "-f", "framehash", "-hash", "sha256", "-y", str(target)], deadline, stop)
+    stitch_run(stitch_framehash_command(ffmpeg, source, target), deadline, stop)
+
+
+class StitchFrameLedgerError(RuntimeError):
+    """Abort the entire build when the frame verifier cannot prove its result."""
+
+
+def stitch_hash_frame_stream(metadata, raw, ledger, stop):
+    time_base = None
+    frames = 0
+    while True:
+        stitch_check(stop)
+        line = metadata.readline(1024)
+        stitch_check(stop)
+        if not line:
+            break
+        if not line.endswith(b"\n"):
+            raise StitchFrameLedgerError("unterminated frame ledger line")
+        if line.startswith(b"#") and not frames:
+            if line.startswith(b"#tb"):
+                if time_base or not re.fullmatch(rb"#tb 0: [1-9][0-9]*/[1-9][0-9]*\n", line):
+                    raise StitchFrameLedgerError("invalid frame ledger time base")
+                time_base = line
+                ledger.write(line)
+            continue
+        fields = [value.strip() for value in line.rstrip().split(b",")]
+        if (not time_base or len(fields) != 6 or fields[0] != b"0"
+                or any(not re.fullmatch(rb"-?[0-9]+", value) for value in fields[1:4])
+                or not re.fullmatch(rb"[1-9][0-9]*", fields[4])
+                or not re.fullmatch(rb"0x[0-9a-f]{8}", fields[5])):
+            raise StitchFrameLedgerError("invalid frame ledger row")
+        remaining = int(fields[4])
+        digest = hashlib.sha256()
+        while remaining:
+            block = stitch_read(raw, min(remaining, 256 * 1024), stop)
+            if not block:
+                raise StitchFrameLedgerError("truncated decoded frame")
+            remaining -= len(block)
+            digest.update(block)
+        ledger.write(b", ".join(fields[:5] + [digest.hexdigest().encode("ascii")]) + b"\n")
+        frames += 1
+    if stitch_read(raw, 1, stop):
+        raise StitchFrameLedgerError("trailing decoded frame data")
+    return frames
+
+
+def stitch_stream_frames(ffmpeg, source, target, deadline, stop, *, confirm_source_rejection=False):
+    # Tee sends the same rawvideo packet to both synchronous, flushed muxers.
+    # Read its size before draining rawvideo so packets larger than the pipe fit.
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd, "rb") as raw, os.fdopen(write_fd, "wb") as raw_writer, target.open("wb") as ledger:
+        tee = "[f=framecrc:flush_packets=1]pipe:1|[f=rawvideo:flush_packets=1]pipe:%d" % raw_writer.fileno()
+        args = stitch_frame_command(ffmpeg, source) + ["-c:v", "rawvideo", "-f", "tee", tee]
+        try:
+            measured = run_measured(stitch_native_command(args), deadline, stop, niced=False, child_writers=(raw_writer,),
+                                    drain_stdout=lambda metadata: stitch_hash_frame_stream(metadata, raw, ledger, stop))
+            stitch_check(stop)
+        except (StitchHold, BenchmarkError, OSError) as exc:
+            raise StitchFrameLedgerError("streamed frame verification interrupted") from exc
+    if time.monotonic() >= deadline:
+        raise StitchFrameLedgerError("streamed frame verification expired")
+    if measured["returncode"] != 0:
+        # A sound stream can still end in a genuine strict decode rejection.
+        # Only the independent original verifier may classify that source as
+        # rejected. Its success cannot authorize this failed streamed audit.
+        if confirm_source_rejection and stitch_invalid_media_exit(measured):
+            original = stitch_framehash_command(ffmpeg, source, os.devnull)
+            reference = run_measured(stitch_native_command(original), deadline, stop, niced=False)
+            stitch_check(stop)
+            if time.monotonic() < deadline and stitch_invalid_media_exit(reference):
+                raise StitchHold("strict source decode rejected invalid media")
+        raise StitchFrameLedgerError("strict frame verification failed: " + measured["stderr"][:200])
+    if measured["drained"] == 0:
+        raise StitchFrameLedgerError("empty decoded frame stream")
+
+
+def stitch_invalid_media_exit(measured):
+    # The pinned CLI returns AVERROR_INVALIDDATA as an eight-bit process status.
+    # Older CLI builds return 1. Require the decoder's invalid-input diagnostic
+    # as well; a signal, launcher failure or arbitrary muxer failure is fatal.
+    invalid_data = (-int.from_bytes(b"INDA", "little")) & 0xff
+    return (measured["returncode"] in (1, invalid_data)
+            and "Invalid data found when processing input" in measured["stderr"])
+
+
+STITCH_STREAMED_FRAME_FORMATS = frozenset({
+    "yuv420p", "yuv422p", "yuv444p", "yuvj420p", "yuvj422p", "yuvj444p",
+    "yuv420p10le", "yuv422p10le", "yuv444p10le",
+})
+
+
+def stitch_audit_frames(ffmpeg, source, target, pixel_format, deadline, stop, *, confirm_source_rejection=False):
+    if stop.kind is StitchRunKind.PRODUCTION and pixel_format in STITCH_STREAMED_FRAME_FORMATS:
+        stitch_stream_frames(ffmpeg, source, target, deadline, stop, confirm_source_rejection=confirm_source_rejection)
+    else:
+        stitch_frames(ffmpeg, source, target, deadline, stop)
 
 
 def stitch_frame_rows(file, stop):
@@ -48321,7 +48448,7 @@ def stitch_audit_source(ffmpeg, ffprobe, source, work, index, deadline, stop):
     stitch_packets(ffprobe, source, hidden, deadline, stop, hidden=True)
     stitch_editlist_records(json.loads(stitch_read_path(prefix.with_suffix(".json"), 1024 * 1024, stop).decode("utf-8")),
                             stitch_packet_rows(packets, stop), stitch_packet_rows(hidden, stop))
-    stitch_frames(ffmpeg, source, frames, deadline, stop)
+    stitch_audit_frames(ffmpeg, source, frames, signature[4], deadline, stop, confirm_source_rejection=True)
     return stitch_source_inventory(signature, packets, frames, stop)
 
 
@@ -48359,7 +48486,7 @@ def stitch_audit_output(ffmpeg, ffprobe, output, sources, work, deadline, stop):
     stitch_packets(ffprobe, output, hidden, deadline, stop, hidden=True)
     stitch_editlist_records(json.loads(stitch_read_path(work / "output.json", 1024 * 1024, stop).decode("utf-8")),
                             stitch_packet_rows(packets, stop), stitch_packet_rows(hidden, stop))
-    stitch_frames(ffmpeg, output, frames, deadline, stop)
+    stitch_audit_frames(ffmpeg, output, frames, signature[4], deadline, stop)
     stitch_output_inventory(signature, sources, packets, frames, stop)
     # Full strict EOF decode above includes every frame. Decode each seam again
     # with an independent seek to exercise keyframe/preroll behavior.

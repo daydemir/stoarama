@@ -6,10 +6,12 @@ cannot enter the production pinned export. No fixture uses real NAS data.
 import datetime
 import hashlib
 import importlib.util
+import io
 import itertools
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -24,6 +26,167 @@ spec = importlib.util.spec_from_file_location('stitch_pull', Path(__file__).with
 pull = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pull)
 ORIGINAL_CHECKPOINT = pull.stitch_checkpoint
+
+
+class StitchFrameLedgerTests(unittest.TestCase):
+    def test_short_reads_hash_the_exact_bytes_from_each_frame(self):
+        class ShortReader(io.BytesIO):
+            def read(self, length):
+                return super().read(min(length, 7))
+
+        data = b"an odd-sized frame"
+        ledger = io.BytesIO()
+        row = b"0, -2, -1, 1, %d, 0x12345678\n" % len(data)
+        pull.stitch_hash_frame_stream(io.BytesIO(b"#tb 0: 1/1000\n" + row), ShortReader(data),
+                                      ledger, threading.Event())
+        self.assertEqual(ledger.getvalue(), b"#tb 0: 1/1000\n" +
+                         row.replace(b"0x12345678", hashlib.sha256(data).hexdigest().encode()))
+
+    def test_incomplete_malformed_and_excess_stream_data_fail(self):
+        header = b"#tb 0: 1/1000\n"
+        row = b"0, 0, 0, 1, 3, 0x12345678\n"
+        for metadata, raw in ((row, b"abc"), (header + row[:-1], b"abc"),
+                              (header + row, b"ab"), (header + row, b"abcd"),
+                              (header + row.replace(b", 3,", b", -3,"), b"abc"),
+                              (header + row.replace(b"0,", b"1,", 1), b"abc")):
+            with self.subTest(metadata=metadata, raw=raw), self.assertRaises(pull.StitchFrameLedgerError):
+                pull.stitch_hash_frame_stream(io.BytesIO(metadata), io.BytesIO(raw),
+                                              io.BytesIO(), threading.Event())
+
+    def run_child(self, behavior, stop, deadline_seconds, reference_status=0):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            child = root / "ffmpeg"
+            pid = root / "pid"
+            child.write_text(
+                "#!" + sys.executable + "\n"
+                "import os, sys, time\n"
+                "with open(sys.argv[sys.argv.index('-i') + 1], 'w') as f: f.write(str(os.getpid()))\n"
+                "fd = int(sys.argv[-1].rsplit(':', 1)[1])\n" + behavior)
+            child.chmod(0o700)
+            run = pull.run_measured
+            references = []
+            def measure(args, *rest, **kwargs):
+                if "framehash" in args:
+                    references.append(args)
+                    return dict(returncode=reference_status, stderr="Invalid data found when processing input")
+                return run(args, *rest, **kwargs)
+            with mock.patch.object(pull, "run_measured", side_effect=measure):
+                with self.assertRaises(pull.StitchFrameLedgerError):
+                    pull.stitch_stream_frames(str(child), pid, root / "ledger",
+                                              time.monotonic() + deadline_seconds, stop,
+                                              confirm_source_rejection=True)
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(int(pid.read_text()), os.WNOHANG)
+            return len(references)
+
+    def test_child_exit_after_complete_ledger_is_fatal(self):
+        attempts = self.run_child("os.write(1, b'#tb 0: 1/1000\\n0, 0, 0, 1, 3, 0x12345678\\n')\n"
+                                  "os.write(fd, b'abc')\n"
+                                  "sys.exit(1)\n", threading.Event(), 5)
+        self.assertEqual(attempts, 0)
+
+    def test_confirming_child_signal_and_launcher_error_are_fatal(self):
+        for status in (-signal.SIGSEGV, 127, 0):
+            with self.subTest(status=status):
+                attempts = self.run_child(
+                    "os.write(1, b'#tb 0: 1/1000\\n0, 0, 0, 1, 3, 0x12345678\\n')\n"
+                    "os.write(fd, b'abc')\n"
+                    "sys.stderr.write('Invalid data found when processing input')\n"
+                    "sys.exit(1)\n", threading.Event(), 5, reference_status=status)
+                self.assertEqual(attempts, 1)
+
+    def test_truncated_stream_cannot_be_classified_as_source_rejection(self):
+        attempts = self.run_child("os.write(1, b'#tb 0: 1/1000\\n0, 0, 0, 1, 4, 0x12345678\\n')\n"
+                                  "os.write(fd, b'abc')\n"
+                                  "sys.exit(1)\n", threading.Event(), 5)
+        self.assertEqual(attempts, 0)
+
+    def test_pipe_close_failure_after_launch_reaps_child_and_closes_stdout(self):
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "rb"), os.fdopen(write_fd, "wb") as raw_writer:
+            writer = mock.Mock()
+            writer.fileno.return_value = raw_writer.fileno()
+            writer.close.side_effect = OSError("parent pipe close failed")
+            processes = []
+            popen = subprocess.Popen
+
+            def launch(*args, **kwargs):
+                process = popen(*args, **kwargs)
+                processes.append(process)
+                return process
+
+            with mock.patch.object(pull.subprocess, "Popen", side_effect=launch):
+                with self.assertRaisesRegex(OSError, "parent pipe close failed"):
+                    pull.run_measured([sys.executable, "-c", "import time; time.sleep(30)"],
+                                      time.monotonic() + 5, threading.Event(), niced=False,
+                                      drain_stdout=lambda stream: None, child_writers=(writer,))
+            process, = processes
+            self.assertTrue(process.stdout.closed)
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(process.pid, os.WNOHANG)
+
+    def test_successful_child_must_produce_at_least_one_frame(self):
+        self.assertEqual(self.run_child("sys.exit(0)\n", threading.Event(), 5), 0)
+
+    def test_stalled_child_is_cancelled_and_reaped(self):
+        stop = threading.Event()
+        cancel = threading.Timer(0.4, stop.set)
+        cancel.start()
+        try:
+            self.run_child("time.sleep(30)\n", stop, 5)
+        finally:
+            cancel.cancel()
+            cancel.join()
+
+    def test_child_that_closes_both_pipes_still_has_to_exit_by_deadline(self):
+        self.run_child("os.write(1, b'#tb 0: 1/1000\\n0, 0, 0, 1, 3, 0x12345678\\n')\n"
+                       "os.write(fd, b'abc')\n"
+                       "os.close(1)\n"
+                       "os.close(fd)\n"
+                       "time.sleep(30)\n", threading.Event(), 0.8)
+
+    def test_proof_and_unqualified_formats_keep_the_original_framehash_command(self):
+        source, target = Path("/source"), Path("/target")
+        original = ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode",
+                    "-threads", "1", "-filter_threads", "1", "-i", str(source), "-map", "0:v:0",
+                    "-fps_mode", "passthrough", "-enc_time_base", "demux", "-f", "framehash",
+                    "-hash", "sha256", "-y", str(target)]
+        for kind, pixel_format in ((pull.StitchRunKind.PROOF, "yuv420p"),
+                                   (pull.StitchRunKind.PRODUCTION, "gray")):
+            stop = SimpleNamespace(kind=kind)
+            with self.subTest(kind=kind), mock.patch.object(pull, "stitch_run") as run:
+                pull.stitch_audit_frames("ffmpeg", source, target, pixel_format, 1, stop)
+                run.assert_called_once_with(original, 1, stop)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs FFmpeg and FFprobe")
+    def test_full_frame_ledgers_match_across_h264_representations(self):
+        # Each frame is larger than the pipe buffer and uses reordered timestamps.
+        def records(path):
+            with path.open() as source:
+                return [tuple(value.strip() for value in line.split(",")) for line in source
+                        if line.startswith("#tb ") or not line.startswith("#")]
+
+        ffmpeg = shutil.which("ffmpeg")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, legacy, streamed = (root / name for name in ("raw.mp4", "legacy", "streamed"))
+            for pixel_format in sorted(pull.STITCH_STREAMED_FRAME_FORMATS):
+                with self.subTest(pixel_format=pixel_format):
+                    subprocess.run([ffmpeg, "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+                                    "testsrc2=size=638x360:rate=30000/1001", "-frames:v", "8",
+                                    "-threads", "1", "-c:v", "libx264", "-pix_fmt", pixel_format,
+                                    "-bf", "2", "-y", str(source)], check=True)
+                    probe = subprocess.check_output([shutil.which("ffprobe"), "-v", "error", "-select_streams",
+                        "v:0", "-show_entries", "stream=pix_fmt", "-of", "csv=p=0", str(source)], text=True)
+                    self.assertEqual(probe.strip(), pixel_format)
+                    stop = threading.Event()
+                    deadline = time.monotonic() + 30
+                    pull.stitch_frames(ffmpeg, source, legacy, deadline, stop)
+                    pull.stitch_stream_frames(ffmpeg, source, streamed, deadline, stop)
+                    rows = records(streamed)
+                    self.assertEqual(len(rows), 9)
+                    self.assertEqual(rows, records(legacy))
 
 
 class StitchSwitchTests(unittest.TestCase):
@@ -305,6 +468,57 @@ class StitchIntegrationTests(unittest.TestCase):
             self.assertEqual(timeout,pull.CLEANUP_EXECUTION_OBSERVE_SEC)
             return dict(ack,delivery_keep_checked=True,action='delete_issued',delete=True,expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
         return dict(ack,ok=True)
+
+    def test_verifier_failure_on_second_source_aborts_before_publication(self):
+        original = pull.stitch_stream_frames
+        def read_frames(*args, **kwargs):
+            if args[2].name == "source-001.frames":
+                raise pull.StitchFrameLedgerError("test pipe failure")
+            return original(*args, **kwargs)
+        with mock.patch.object(pull, "stitch_stream_frames", side_effect=read_frames), \
+                mock.patch.object(pull, "stitch_repair_local") as repair:
+            with self.assertRaisesRegex(pull.StitchFrameLedgerError, "test pipe failure"):
+                self.build()
+        repair.assert_not_called()
+        output = self.cfg.output_dir / self.task["plan"]["output_folder"]
+        self.assertEqual(list(output.glob("run-*")), [])
+        self.assertEqual(list(output.glob(".stitch-*-pending-*")), [])
+        self.assertTrue(all((self.cfg.output_dir / clip["relative_path"]).exists() for clip in self.clips))
+
+    def test_verified_decoder_rejection_retains_damaged_source_and_publishes_good_runs(self):
+        # Preserve the MP4 inventory and damage one non-key VCL packet.
+        clip = self.clips[1]
+        path = self.cfg.output_dir / clip["relative_path"]
+        packets = json.loads(subprocess.check_output([self.tools["ffprobe"], "-v", "error", "-show_packets",
+            "-show_entries", "packet=pos,size,flags", "-of", "json", str(path)]))["packets"]
+        packet = next(p for p in packets if "K" not in p["flags"] and int(p["size"]) >= 16)
+        data = bytearray(path.read_bytes())
+        cursor, end = int(packet["pos"]), int(packet["pos"]) + int(packet["size"])
+        while cursor < end:
+            length = int.from_bytes(data[cursor:cursor + 4], "big")
+            assert 0 < length <= end - cursor - 4
+            cursor += 4
+            if data[cursor] & 31 == 1:
+                data[cursor + 1:cursor + length] = bytes(length - 1)
+                break
+            cursor += length
+        else:
+            self.fail("fixture has no non-key VCL packet")
+        path.write_bytes(data)
+        clip["sha256"] = hashlib.sha256(data).hexdigest()
+        sidecar = Path(str(path) + ".stoarama.json")
+        body = json.loads(sidecar.read_text())
+        body["sha256"] = clip["sha256"]
+        sidecar.write_text(json.dumps(body))
+        self.task["plan"].update(clips=self.clips[:2], joins=[True], eligible=[True, True])
+        with mock.patch.object(pull, "run_measured", wraps=pull.run_measured) as native:
+            result = self.build()
+        references = [call.args[0] for call in native.call_args_list if "framehash" in call.args[0]]
+        self.assertEqual(len(references), 1)
+        self.assertEqual(references[0][-1], os.devnull)
+        self.assertEqual(result["left_out"], [clip["source_id"]])
+        self.assertEqual(len(result["outputs"]), 1)
+        self.assertTrue(path.exists())
 
     def test_b_frame_start_edit_is_conserved_through_real_remux_and_decode(self):
         for clip in self.clips[:2]:
