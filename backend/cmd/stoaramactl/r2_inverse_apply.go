@@ -28,7 +28,7 @@ type inverseReader interface {
 	inverseLister
 	Head(context.Context, string) (r2.ObjectHead, error)
 	EndpointSHA256() string
-	RequireNoMultipartUploads(context.Context) error
+	RequireNoMultipartOutsideStitchStaging(context.Context, func(context.Context, string, string) (bool, error)) error
 }
 type inverseDeleteStore interface {
 	inverseReader
@@ -82,6 +82,16 @@ type inverseApplier struct {
 	summary    inverseSummary
 	protection inverseProtection
 	ledger     *inverseLedger
+}
+
+func (a *inverseApplier) checkMultipart(ctx context.Context, q r2RetireQuerier) error {
+	return a.store.RequireNoMultipartOutsideStitchStaging(ctx, func(ctx context.Context, key, uploadID string) (bool, error) {
+		var known bool
+		err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects
+ WHERE bucket=$1 AND endpoint_sha256=$2 AND object_key=$3 AND upload_id=$4
+   AND state IN ('uploading','completing'))`, a.store.Bucket(), a.store.EndpointSHA256(), key, uploadID).Scan(&known)
+		return known, err
+	})
 }
 
 func inverseFileSHA(path string) (string, error) {
@@ -232,6 +242,7 @@ const inverseRawHeldSQL = `SELECT
  OR EXISTS(SELECT 1 FROM nas_cleanup_incident_roster WHERE bucket=$2 AND object_key=$3)
  OR EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE bucket=$2 AND object_key=$3 AND NOT (kind='raw' AND source_id=$1 AND manifest_sha256=$4))
  OR EXISTS(SELECT 1 FROM r2_object_retirements WHERE bucket=$2 AND object_key=$3)
+ OR EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds WHERE bucket=$2 AND object_key=$3 AND released_at IS NULL)
  OR EXISTS(SELECT 1 FROM nas_r2_copy_items WHERE (state<>'verified' OR blocked_reason<>'') AND item->>'bucket'=$2 AND item->>'object_key'=$3)
  OR r2_inverse_delivery_held($1,$2,$3,$5,$6,$7)
  OR EXISTS(SELECT 1 FROM nas_restore_requests WHERE clip_id=$1 AND state IN ('pending','leased'))
@@ -620,7 +631,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		return result, err
 	}
 	probeCtx, probeCancel := context.WithTimeout(ctx, inverseNetworkTimeout)
-	err = store.RequireNoMultipartUploads(probeCtx)
+	err = a.checkMultipart(probeCtx, pool)
 	probeCancel()
 	if err != nil {
 		return result, err

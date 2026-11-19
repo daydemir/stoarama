@@ -100,7 +100,7 @@ func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverse
 	if !head.LastModified.Equal(e.LastModified.Truncate(time.Second)) || !inverseLastModifiedAllowed(e.LastModified, a.summary.CreatedAt, now) {
 		return inverseLastModifiedError{}
 	}
-	if err = a.store.RequireNoMultipartUploads(ctx); err != nil {
+	if err = a.checkMultipart(ctx, tx); err != nil {
 		return err
 	}
 	return nil

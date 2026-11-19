@@ -43,7 +43,11 @@ func (s *inverseFakeStore) EndpointSHA256() string { return s.endpointSHA }
 func (s *inverseFakeStore) ListPrefix(context.Context, string, int, func(r2.ObjectInfo) error) error {
 	return errors.New("apply must not relist")
 }
-func (s *inverseFakeStore) RequireNoMultipartUploads(context.Context) error { return nil }
+func (s *inverseFakeStore) RequireNoMultipartOutsideStitchStaging(
+	context.Context, func(context.Context, string, string) (bool, error),
+) error {
+	return nil
+}
 func (s *inverseFakeStore) Head(ctx context.Context, key string) (r2.ObjectHead, error) {
 	if s.delay > 0 {
 		select {
