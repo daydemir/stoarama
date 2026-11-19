@@ -347,9 +347,9 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
 	if abort.lists.Load() != lists || abort.heads.Load() != heads {
 		t.Fatal("stale observation performed an abort provider check")
 	}
-	for n, mode := range []int32{0, 2, 4, 5, 6, 7} {
+	for n, mode := range []int32{0, 2, 4, 5, 6, 7, 8, 9} {
 		abort.response.Store(mode)
-		request.RequestID = strings.Repeat(fmt.Sprint(n+2), 32)
+		request.RequestID = fmt.Sprintf("%032x", n+2)
 		lists, heads := abort.lists.Load(), abort.heads.Load()
 		w := cleanupCall(t, s.handleAccountNASCleanupObserve, 47, 47, "itemId", fmt.Sprint(task.ItemID), request, session)
 		if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "aborted staging absence") {

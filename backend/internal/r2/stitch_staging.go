@@ -469,7 +469,11 @@ func (c *Client) VerifyAbortedStitchStageAbsence(ctx context.Context, bucket, en
 	uploads, err := c.s3.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
 		Bucket: aws.String(c.bucket), Prefix: aws.String(key), MaxUploads: aws.Int32(1),
 	}, c.stitchStageObservationOptions)
+	// Only a first and final page can establish that the exact listing is empty.
 	if err != nil || aws.ToString(uploads.Bucket) != c.bucket || aws.ToString(uploads.Prefix) != key ||
+		aws.ToString(uploads.KeyMarker) != "" || aws.ToString(uploads.UploadIdMarker) != "" ||
+		aws.ToString(uploads.NextKeyMarker) != "" || aws.ToString(uploads.NextUploadIdMarker) != "" ||
+		aws.ToString(uploads.Delimiter) != "" || (uploads.MaxUploads != nil && *uploads.MaxUploads != 1) ||
 		uploads.IsTruncated == nil || *uploads.IsTruncated || len(uploads.Uploads) != 0 || len(uploads.CommonPrefixes) != 0 {
 		return errors.New("aborted stitch stage multipart work has not drained")
 	}

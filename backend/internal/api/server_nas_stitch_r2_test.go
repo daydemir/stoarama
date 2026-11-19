@@ -545,7 +545,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 			t.Fatal(err)
 		}
 		testCertifiedStitchNASCleanup(t, s, id, sourceKey, &abort, func() {
-			for _, mode := range []int32{0, 1, 2, 4, 5, 6, 7} {
+			for _, mode := range []int32{0, 1, 2, 4, 5, 6, 7, 8, 9} {
 				abort.response.Store(mode)
 				if err := store.RetireStitchStage(ctx, 122, sha, time.Time{}, true); err == nil {
 					t.Fatalf("unconfirmed aborted stage accepted in provider case %d", mode)
@@ -615,6 +615,7 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, a
 		if r.Method == http.MethodGet && r.URL.Path == "/stoarama" && query.Has("uploads") &&
 			strings.HasPrefix(query.Get("prefix"), "stitch-staging/") {
 			bucket, prefix := "stoarama", query.Get("prefix")
+			markers := ""
 			if prefix == abortKey {
 				abort.lists.Add(1)
 				switch abort.response.Load() {
@@ -625,9 +626,13 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, a
 					prefix = "stitch-staging/wrong-prefix"
 				case 7:
 					bucket = "wrong-bucket"
+				case 8:
+					markers = "<KeyMarker>past-key</KeyMarker>"
+				case 9:
+					markers = "<UploadIdMarker>past-upload</UploadIdMarker>"
 				}
 			}
-			fmt.Fprintf(w, "<ListMultipartUploadsResult><Bucket>%s</Bucket><Prefix>%s</Prefix><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>", bucket, prefix)
+			fmt.Fprintf(w, "<ListMultipartUploadsResult><Bucket>%s</Bucket><Prefix>%s</Prefix>%s<IsTruncated>false</IsTruncated></ListMultipartUploadsResult>", bucket, prefix, markers)
 			return
 		}
 		if r.URL.Path == "/stoarama/"+abortKey {
