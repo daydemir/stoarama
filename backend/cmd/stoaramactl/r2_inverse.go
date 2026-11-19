@@ -51,9 +51,12 @@ type inverseProtection struct {
 	// OwnerKeepPrefixes are durable owner keep holds on whole key prefixes. A
 	// key under one is kept whatever its catalog status.
 	OwnerKeepPrefixes []string
-	KEFolders         map[string]bool
-	Windows           map[int64]api.Keep28Window
-	Picks             r2RetirePicks
+	// JoinedReleased holds clips whose every joined snapshot belongs to a batch
+	// the owner released to the RAW lane. Only their outside-window part leaves.
+	JoinedReleased map[string]bool
+	KEFolders      map[string]bool
+	Windows        map[int64]api.Keep28Window
+	Picks          r2RetirePicks
 }
 type inverseEntry struct {
 	r2.ObjectInfo
@@ -120,6 +123,9 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 			continue
 		}
 		if id.Start.Before(w.End) && id.End.After(w.Start) {
+			if p.JoinedReleased[o.Key] {
+				return inverseHeld, "joined_source_snapshot"
+			}
 			return inverseKeep28, "pinned_window_overlap"
 		}
 		if r2RetireEffectiveChoice(p.Picks.Choices[id.StreamID], true, w) == "" {
@@ -177,13 +183,18 @@ WITH held_sources AS (
  UNION SELECT $1,o.object_key FROM recording_collation_outputs o WHERE EXISTS(SELECT 1 FROM nas_cleanup_incident_sources i WHERE i.clip_id=ANY(o.source_clip_ids))
  UNION SELECT c.bucket,c.object_key FROM recording_clips c JOIN nas_restore_requests r ON r.clip_id=c.id WHERE r.state IN ('pending','leased')
  UNION SELECT c.bucket,c.object_key FROM recording_clips c JOIN recording_joined_source_snapshots s ON s.clip_id=c.id
+ WHERE NOT r2_joined_source_released(c.id)
  UNION SELECT c.bucket,c.object_key FROM recording_clips c JOIN recording_joined_snapshot_scopes s
  ON s.recording_id=c.recording_id AND s.recording_job_id=c.recording_job_id AND c.id<=s.high_water_clip_id
  JOIN recording_joined_batches b ON b.id=s.batch_record_id AND b.state='snapshotting'
  UNION SELECT c.bucket,c.object_key FROM recording_clips c JOIN recording_joined_dry_run_scopes s
  ON s.recording_id=c.recording_id AND s.recording_job_id=c.recording_job_id AND c.id<=s.high_water_clip_id
- UNION SELECT item->>'bucket',item->>'object_key' FROM nas_r2_copy_items WHERE state='blocked'
+ WHERE NOT r2_joined_source_released(c.id)
+ UNION SELECT item->>'bucket',item->>'object_key' FROM nas_r2_copy_items WHERE state<>'verified' OR blocked_reason<>''
+ UNION SELECT bucket,object_key FROM nas_stitch_r2_input_holds WHERE released_at IS NULL
 ) SELECT object_key FROM held_keys WHERE bucket=$1`
+const inverseJoinedReleasedSQL = `SELECT DISTINCT c.object_key FROM recording_joined_source_snapshots s JOIN recording_clips c ON c.id=s.clip_id
+WHERE c.bucket=$1 AND r2_joined_source_released(c.id)`
 const inverseDeliverySQL = `
 WITH delivery_outputs AS (
  SELECT o.object_key,o.source_clip_ids FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id
@@ -203,7 +214,7 @@ UNION SELECT c.object_key FROM delivery_outputs o CROSS JOIN LATERAL unnest(o.so
  JOIN recording_clips c ON c.id=source_id WHERE c.bucket=$1`
 
 func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks, windows map[int64]api.Keep28Window) (inverseProtection, error) {
-	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, KEFolders: map[string]bool{}, Windows: windows, Picks: picks}
+	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, JoinedReleased: map[string]bool{}, KEFolders: map[string]bool{}, Windows: windows, Picks: picks}
 	rows, err := q.Query(ctx, inverseCatalogSQL, bucket)
 	if err != nil {
 		return p, err
@@ -236,7 +247,7 @@ func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string
 	for _, set := range []struct {
 		sql  string
 		keys map[string]bool
-	}{{inverseHeldSQL, p.Held}, {inverseDeliverySQL, p.Delivery}} {
+	}{{inverseHeldSQL, p.Held}, {inverseDeliverySQL, p.Delivery}, {inverseJoinedReleasedSQL, p.JoinedReleased}} {
 		rows, err = q.Query(ctx, set.sql, bucket)
 		if err != nil {
 			return p, err
