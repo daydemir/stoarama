@@ -5,12 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestNASStitchDedicatedKeyThroughRouter(t *testing.T) {
@@ -85,7 +88,13 @@ VALUES(1,1,48,$1,clock_timestamp()+interval '1 hour')`, hashSecret("operator-fix
 		return body.ID, body.Token
 	}
 	id, worker := issue()
-	otherID, other := issue()
+	post(mint, "", nil, http.StatusConflict)
+	// Lease ownership still needs two principals. Only the first is issued
+	// through the production single-active-key workflow.
+	otherID, _, other, err := mintAccountAPIKey(f.ctx, f.pool, 47, "second worker fixture", accountScopeNASStitch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var legacyMatch bool
 	if err := f.pool.QueryRow(f.ctx, "SELECT EXISTS(SELECT 1 FROM account_api_keys WHERE secret_hash=$1)",
 		hashSecret(worker)).Scan(&legacyMatch); err != nil || legacyMatch {
@@ -210,7 +219,7 @@ VALUES(1,1,48,$1,clock_timestamp()+interval '1 hour')`, hashSecret("operator-fix
  (SELECT count(*) FROM account_auth_events WHERE account_id=47 AND event_type='api_key_created'),
  (SELECT count(*) FROM account_auth_events WHERE account_id=47 AND event_type='nas_stitch_registration_abandoned')
  FROM nas_stitch_tasks t WHERE t.id=8`).Scan(&state, &abandoned, &legacyUnbound, &outputs, &creationAudits, &abandonAudits)
-	if err != nil || state != "verified" || !abandoned || !legacyUnbound || outputs != 1 || creationAudits != 2 || abandonAudits != 1 {
+	if err != nil || state != "verified" || !abandoned || !legacyUnbound || outputs != 1 || creationAudits != 1 || abandonAudits != 1 {
 		t.Fatalf("lost or duplicated abandonment evidence: %s %t %t %d %d %d %v", state, abandoned, legacyUnbound, outputs, creationAudits, abandonAudits, err)
 	}
 }
@@ -531,5 +540,130 @@ func TestNASStitchLeaseWaitsForResultCrossingExpiry(t *testing.T) {
 	var response struct{ Task *nasStitchTask }
 	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &response) != nil || response.Task != nil {
 		t.Fatalf("lease bypassed durable readiness: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDurhamKeyMintSingleLiveWriter(t *testing.T) {
+	for _, browser := range []bool{false, true} {
+		t.Run(fmt.Sprintf("browser=%t", browser), func(t *testing.T) {
+			f := durhamMintFixture(t)
+			config := f.pool.Config()
+			config.ConnConfig.RuntimeParams["default_transaction_isolation"] = "repeatable read"
+			mintPool, err := pgxpool.NewWithConfig(f.ctx, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mintPool.Close()
+			f.s.pool = mintPool
+			blocker, err := f.pool.Begin(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer blocker.Rollback(f.ctx)
+			var blockerPID int32
+			if err := blocker.QueryRow(f.ctx,
+				`SELECT pg_backend_pid() FROM (SELECT pg_advisory_xact_lock($1)) locked`, nasStitchKeyMintLock).
+				Scan(&blockerPID); err != nil {
+				t.Fatal(err)
+			}
+			start := make(chan struct{})
+			results := make(chan bool, 2)
+			cli := func() {
+				<-start
+				var secret bytes.Buffer
+				id, err := MintDurhamStitchKeyTo(f.ctx, mintPool, "operator@fixture", "owner-approved fixture", &secret)
+				if err == nil && (id <= 0 || !strings.HasPrefix(secret.String(), "sir_")) {
+					t.Error("successful mint did not deliver its credential")
+				}
+				if err != nil && secret.Len() != 0 {
+					t.Error("rejected mint wrote to its credential sink")
+				}
+				results <- err == nil
+			}
+			second := cli
+			if browser {
+				second = func() {
+					<-start
+					req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/nas-stitch/key", nil)
+					p := accountPrincipal{Role: accountRoleAdmin, SessionID: ptrInt64(1), Email: "operator@example.test"}
+					req = req.WithContext(context.WithValue(f.ctx, accountPrincipalContextKey, p))
+					out := httptest.NewRecorder()
+					f.s.handleAdminNASStitchKeyMint(out, req)
+					if out.Code != http.StatusCreated && out.Code != http.StatusConflict {
+						t.Errorf("unexpected browser status %d", out.Code)
+					}
+					results <- out.Code == http.StatusCreated
+				}
+			}
+			go cli()
+			go second()
+			close(start)
+			for waitUntil := time.Now().Add(4 * time.Second); ; {
+				var waiting int
+				err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid))`, blockerPID).Scan(&waiting)
+				if err != nil || time.Now().After(waitUntil) {
+					t.Fatalf("issuer did not reach the blocked mint guard: %d %v", waiting, err)
+				}
+				if waiting == 2 {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err := blocker.Commit(f.ctx); err != nil {
+				t.Fatal(err)
+			}
+			if (<-results) == (<-results) {
+				t.Fatal("expected exactly one successful mint")
+			}
+			assertDurhamMintCounts(t, f, 1)
+		})
+	}
+}
+
+func TestDurhamKeyMintAuditFailureAndBrokenPipe(t *testing.T) {
+	f := durhamMintFixture(t)
+	if _, err := f.pool.Exec(f.ctx, `ALTER TABLE account_auth_events ADD CHECK(event_type<>'api_key_created')`); err != nil {
+		t.Fatal(err)
+	}
+	var secret bytes.Buffer
+	if id, err := MintDurhamStitchKeyTo(f.ctx, f.pool, "operator@fixture", "owner-approved fixture", &secret); id != 0 || err == nil || secret.Len() != 0 {
+		t.Fatal("audit failure leaked or committed issuance")
+	}
+	assertDurhamMintCounts(t, f, 0)
+	if _, err := f.pool.Exec(f.ctx, `ALTER TABLE account_auth_events DROP CONSTRAINT account_auth_events_event_type_check`); err != nil {
+		t.Fatal(err)
+	}
+	reader, sink := io.Pipe()
+	reader.Close()
+	defer sink.Close()
+	id, err := MintDurhamStitchKeyTo(f.ctx, f.pool, "operator@fixture", "owner-approved fixture", sink)
+	if id <= 0 || err == nil {
+		t.Fatal("broken sink did not preserve the committed ID for reconciliation")
+	}
+	assertDurhamMintCounts(t, f, 1)
+	if _, err := MintDurhamStitchKeyTo(f.ctx, f.pool, "operator@fixture", "owner-approved fixture", &secret); err != errDurhamStitchKeyActive || secret.Len() != 0 {
+		t.Fatal("recovery issued a second active key")
+	}
+}
+
+func durhamMintFixture(t *testing.T) *cleanupFixture {
+	t.Helper()
+	f, _, _ := newNASStitchTaskFixture(t)
+	if _, err := f.pool.Exec(f.ctx, `CREATE TABLE account_auth_events(account_id bigint,api_key_id bigint,
+ event_type text,actor_type text,actor_ref text,detail_jsonb jsonb);
+ ALTER SEQUENCE account_api_keys_id_seq RESTART WITH 100`); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+func assertDurhamMintCounts(t *testing.T, f *cleanupFixture, want int) {
+	t.Helper()
+	var keys, events int
+	err := f.pool.QueryRow(f.ctx, `SELECT
+ (SELECT count(*) FROM account_api_keys WHERE account_id=47 AND revoked_at IS NULL AND scopes=ARRAY[$1]::text[]),
+ (SELECT count(*) FROM account_auth_events WHERE account_id=47 AND event_type='api_key_created')`, string(accountScopeNASStitch)).Scan(&keys, &events)
+	if err != nil || keys != want || events != want {
+		t.Fatalf("live keys %d audit events %d expected %d, err %v", keys, events, want, err)
 	}
 }
