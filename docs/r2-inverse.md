@@ -170,11 +170,18 @@ each network handoff by the earlier of custody expiry and the existing
 
 Migration 0204 creates independent `r2_keep28_intents`, `r2_keep28_attempts`,
 `r2_keep28_events` and a pending-source identity guard. Ordinary reservations
-and the conservative byte budget remain shared protections. B2 uses its own
-concrete verifier, single-use authority and exact one-attempt transport; no B1
-token grants B2 authority. An existing B2 intent is never retransmitted, even
-after a stop before wire. Restart publishes only a confirming HEAD404 against
-the exact persisted source/receipt; a present object remains `ambiguous_held`.
+and the conservative byte budget remain shared protections. B2 issues its
+single-use authority from its own lane tables and adds the custody proof and
+custody deadline to every check, but sends over the same one-attempt first-wire
+transport as B1: a fresh HTTP/1.1 connection per DELETE, the batch send gate on
+the first request byte, and the same lost-response classification. A B2 key
+whose DELETE lost its response stays held and is never retransmitted. An
+existing B2 intent is never retransmitted, even after a stop before wire.
+Restart treats held B2 intents exactly as B1's: an issued key whose object is
+gone is reported `held_absent`, an unissued one stops the run, and a present
+object must still match and remains `ambiguous_held`. `r2-inverse job-keep28`
+runs B2 batches with the same per-batch owner evidence and exact readback, over
+the B2 tables, as `r2-inverse job` does for B1.
 
 Deniz's November 17 order to delete group 3 that is on the NAS supersedes the
 stitch-proof prerequisite **only for this keep28 RAW lane**. This new command

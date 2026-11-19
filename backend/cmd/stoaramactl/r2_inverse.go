@@ -364,7 +364,11 @@ func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 		return
 	}
 	if len(args) > 0 && args[0] == "job" {
-		runR2InverseJob(ctx, cfg, args[1:])
+		runR2InverseJob(ctx, cfg, args[1:], inverseOutsideKeep28)
+		return
+	}
+	if len(args) > 0 && args[0] == "job-keep28" {
+		runR2InverseJob(ctx, cfg, args[1:], inverseNASKeep28)
 		return
 	}
 	const usage = "usage: stoaramactl r2-inverse partition --picks FILE --out DIR (read-only full bucket partition)"

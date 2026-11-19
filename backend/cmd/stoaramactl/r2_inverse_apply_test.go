@@ -1686,6 +1686,31 @@ func TestR2InverseWireLostNeedsAcceptedRequest(t *testing.T) {
 	}
 }
 
+type shortWriteConn struct{ net.Conn }
+
+func (shortWriteConn) Write([]byte) (int, error) { return 0, nil }
+
+// A zero-byte write carries no request byte: an empty one neither passes a
+// closed gate nor counts as sent, and one that wrote nothing of its bytes is a
+// failed write. Neither is a lost response.
+func TestR2InverseWireZeroByteWriteIsNotLost(t *testing.T) {
+	gate := &inverseSendGate{}
+	gate.close()
+	empty := &inverseWire{gate: gate}
+	conn := &inverseWireConn{Conn: failingWriteConn{}, wire: empty}
+	if n, err := conn.Write(nil); n != 0 || err != nil || empty.wrote.Load() || empty.lost() {
+		t.Fatalf("empty write: %d %v wrote %v", n, err, empty.wrote.Load())
+	}
+	if _, err := conn.Write([]byte("DELETE")); !errors.Is(err, errInverseAdmissionClosed) || empty.lost() {
+		t.Fatalf("first write after an empty one passed a closed gate: %v", err)
+	}
+	short := &inverseWire{gate: &inverseSendGate{}}
+	(&inverseWireConn{Conn: shortWriteConn{}, wire: short}).Write([]byte("DELETE"))
+	if short.lost() || !short.writeFailed.Load() {
+		t.Fatal("a write that sent no byte counted as a lost response")
+	}
+}
+
 type blockingWriteConn struct {
 	net.Conn
 	release chan struct{}

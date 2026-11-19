@@ -16,14 +16,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// r2-inverse job runs the RAW inverse lane next to the database and bucket, as
-// a provider one-off job. The executor serializes reserves and spends one round
-// trip per statement, so it must not run across a slow home link. The job takes
-// a fresh read-only partition, then runs bounded apply batches. Each batch gets
-// fresh owner-fence evidence and an exact database readback. A DELETE that lost
-// its response holds only its own key, permanently. Any other failure stops the
-// job; nothing is retried.
-func runR2InverseJob(ctx context.Context, cfg config.Config, args []string) {
+// r2-inverse job (RAW) and job-keep28 run one inverse lane next to the database
+// and bucket, as a provider one-off job. The executor serializes reserves and
+// spends one round trip per statement, so it must not run across a slow home
+// link. The job takes a fresh read-only partition, then runs bounded apply
+// batches. Each batch gets fresh owner-fence evidence and an exact readback of
+// the lane's own tables. A DELETE that lost its response holds only its own
+// key, permanently. Any other failure stops the job; nothing is retried.
+func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane inverseLane) {
 	fs := flag.NewFlagSet("r2-inverse job", flag.ExitOnError)
 	picks := fs.String("picks", "", "owner picks")
 	picksSHA := fs.String("expected-picks-sha256", "", "independently approved owner picks digest")
@@ -34,7 +34,7 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string) {
 	maxBytes := fs.Int64("max-bytes", 1<<40, "maximum new intent bytes per batch")
 	batches := fs.Int("batches", 1, "maximum batches")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *picks == "" || !r2RetireLowerHex64(*picksSHA) || *owner == "" || *work == "" || *items < 1 || *maxBytes <= 0 || *batches < 1 {
-		log.Fatal("usage: stoaramactl r2-inverse job --picks FILE --expected-picks-sha256 HEX --owner-decision FILE --work DIR [--workers N --max-items N --max-bytes N --batches N]")
+		log.Fatal("usage: stoaramactl r2-inverse job|job-keep28 --picks FILE --expected-picks-sha256 HEX --owner-decision FILE --work DIR [--workers N --max-items N --max-bytes N --batches N]")
 	}
 	// The partition and every apply check derive from this file, so it must be
 	// the owner-approved picks, pinned independently of the file itself.
@@ -61,7 +61,7 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	o := inverseApplyOptions{Lane: inverseOutsideKeep28, Manifest: filepath.Join(partition, "partition.jsonl"), Summary: filepath.Join(partition, "summary.json"), Picks: *picks, Ledger: filepath.Join(*work, "ledger.jsonl"), Workers: *workers, MaxItems: *items, MaxBytes: *maxBytes}
+	o := inverseApplyOptions{Lane: lane, Manifest: filepath.Join(partition, "partition.jsonl"), Summary: filepath.Join(partition, "summary.json"), Picks: *picks, Ledger: filepath.Join(*work, "ledger.jsonl"), Workers: *workers, MaxItems: *items, MaxBytes: *maxBytes}
 	if o.ManifestSHA, err = inverseFileSHA(o.Manifest); err != nil {
 		log.Fatal(err)
 	}
@@ -105,9 +105,9 @@ func runInverseJobBatch(ctx context.Context, pool *pgxpool.Pool, store inverseDe
 	unresolved := []string{}
 	if err = pool.QueryRow(ctx, `SELECT count(*),count(v.object_key),coalesce(sum(i.size_bytes) FILTER (WHERE v.object_key IS NOT NULL),0),count(a.object_key),
  coalesce(array_agg(i.object_key ORDER BY i.object_key) FILTER (WHERE v.object_key IS NULL),'{}')
- FROM r2_inverse_intents i
- LEFT JOIN r2_inverse_events v ON v.bucket=i.bucket AND v.object_key=i.object_key AND v.event='absent'
- LEFT JOIN r2_inverse_attempts a ON a.bucket=i.bucket AND a.object_key=i.object_key
+ FROM `+o.Lane.intentTable()+` i
+ LEFT JOIN `+o.Lane.eventTable()+` v ON v.bucket=i.bucket AND v.object_key=i.object_key AND v.event='absent'
+ LEFT JOIN `+o.Lane.attemptTable()+` a ON a.bucket=i.bucket AND a.object_key=i.object_key
  WHERE i.bucket=$1 AND i.drain_evidence_sha256=$2`, store.Bucket(), o.DrainSHA).Scan(&n, &absent, &absentBytes, &attempts, &unresolved); err != nil {
 		return false, result, errors.Join(applyErr, err)
 	}

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -33,13 +34,19 @@ func (inverseLastModifiedError) Error() string {
 	return "listing/HEAD LastModified missing, changed, future or outside the pre-fence cutoff"
 }
 
-// Only the concrete executor verifier below can issue this private capability.
-// Copies share consumption state, and the DB independently forbids reminting.
+// Only the concrete executor verifier below can issue this private capability,
+// for either lane. Copies share consumption state, and the DB independently
+// forbids reminting. ctx bounds this key's network work; on the keep-28 lane it
+// also ends at NAS custody expiry, and custody is the proof the intent carries.
 type inverseDeleteAuthority struct {
 	binding inverseDeleteBinding
 	guard   *inverseWireGuard
 	used    *atomic.Bool
 	gate    *inverseSendGate
+	ctx     context.Context
+	cancel  context.CancelFunc
+	custody keep28Custody
+	clock   keep28DBClock
 }
 
 // inverseSendGate closes when a batch hits a hard failure. A DELETE whose first
@@ -79,19 +86,23 @@ func (a *inverseDeleteAuthority) requireWire(ctx context.Context, bucket, endpoi
 	return a.check(ctx, bucket, endpoint)
 }
 func (a *inverseDeleteAuthority) check(ctx context.Context, bucket, endpoint string) error {
-	if a.guard == nil || a.guard.a.opts.Lane != inverseOutsideKeep28 || bucket != a.binding.Bucket || endpoint != a.binding.EndpointSHA256 {
+	if a.guard == nil || bucket != a.binding.Bucket || endpoint != a.binding.EndpointSHA256 {
 		return errors.New("inverse wire binding differs")
 	}
 	if err := a.guard.check(ctx, a.binding); err != nil {
 		return err
 	}
+	lane := a.guard.a.opts.Lane
 	var issued bool
-	err := a.guard.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_attempts WHERE bucket=$1 AND object_key=$2)`, bucket, a.binding.Key).Scan(&issued)
+	err := a.guard.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM `+lane.attemptTable()+` WHERE bucket=$1 AND object_key=$2)`, bucket, a.binding.Key).Scan(&issued)
 	if err != nil {
 		return err
 	}
 	if !issued {
 		return errors.New("durable wire issuance missing")
+	}
+	if lane == inverseNASKeep28 {
+		return a.checkCustody(ctx)
 	}
 	return nil
 }
@@ -141,32 +152,43 @@ func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverse
 	}
 	return nil
 }
+
+// authorize issues one key's single-use DELETE authority on the applier's lane.
+// Keep-28 adds its NAS custody proof and bounds the authority by its expiry.
 func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntry, gate *inverseSendGate) (*inverseDeleteAuthority, error) {
-	if a.opts.Lane != inverseOutsideKeep28 {
-		return nil, errors.New("B1 authority cannot authorize B2")
-	}
 	target, err := a.prepareWireTarget(ctx, tx, e)
 	if err != nil {
 		return nil, err
 	}
+	var custody keep28Custody
+	var clock keep28DBClock
+	limit := inverseNetworkTimeout
+	if a.opts.Lane == inverseNASKeep28 {
+		if custody, clock, err = a.proveKeep28(ctx, tx, e, target); err != nil {
+			return nil, err
+		}
+		limit = min(limit, clock.remaining(custody.Expiry))
+	}
+	ctx, cancel := context.WithTimeout(ctx, limit)
+	fail := func(err error) (*inverseDeleteAuthority, error) { cancel(); return nil, err }
 	if err = a.checkWireHead(ctx, tx, e, target); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	guard := &inverseWireGuard{a, tx, target, e}
 	binding := guard.binding()
 	if err = guard.check(ctx, binding); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	// Independent commit precedes capability issuance. Even another verifier or
 	// process cannot remint authority after any ambiguous/crashed wire attempt.
-	tag, err := a.pool.Exec(ctx, `INSERT INTO r2_inverse_attempts(bucket,object_key) VALUES($1,$2) ON CONFLICT DO NOTHING`, binding.Bucket, binding.Key)
+	tag, err := a.pool.Exec(ctx, `INSERT INTO `+a.opts.Lane.attemptTable()+`(bucket,object_key) VALUES($1,$2) ON CONFLICT DO NOTHING`, binding.Bucket, binding.Key)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
 	if tag.RowsAffected() != 1 {
-		return nil, errors.New("inverse wire authority was already issued; reconcile only")
+		return fail(errors.New("inverse wire authority was already issued; reconcile only"))
 	}
-	return &inverseDeleteAuthority{binding: binding, guard: guard, used: &atomic.Bool{}, gate: gate}, nil
+	return &inverseDeleteAuthority{binding: binding, guard: guard, used: &atomic.Bool{}, gate: gate, ctx: ctx, cancel: cancel, custody: custody, clock: clock}, nil
 }
 
 type inverseSDKStore struct {
@@ -292,6 +314,11 @@ type inverseWireConn struct {
 }
 
 func (c *inverseWireConn) Write(p []byte) (int, error) {
+	// An empty write carries no request byte: it neither passes the gate nor
+	// counts as a request the connection accepted.
+	if len(p) == 0 {
+		return c.Conn.Write(p)
+	}
 	write := func() (int, error) { return c.Conn.Write(p) }
 	var n int
 	var err error
@@ -323,12 +350,29 @@ func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, e
 	if err := t.authority.check(req.Context(), t.bucket, t.endpoint); err != nil {
 		return nil, err
 	}
+	bounded, cancel, err := t.authority.bound(req.Context())
+	if err != nil {
+		return nil, err
+	}
+	trace := &httptrace.ClientTrace{GotFirstResponseByte: func() { t.wire.answered.Store(true) }}
+	req = req.Clone(httptrace.WithClientTrace(bounded, trace))
 	req.Header.Del("Idempotency-Key")
 	req.Header.Del("X-Idempotency-Key")
-	trace := &httptrace.ClientTrace{GotFirstResponseByte: func() { t.wire.answered.Store(true) }}
-	response, err := t.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
-	if response != nil {
-		t.wire.answered.Store(true)
+	response, err := t.base.RoundTrip(req)
+	if err != nil {
+		cancel()
+		return nil, err
 	}
-	return response, err
+	t.wire.answered.Store(true)
+	response.Body = &inverseResponseBody{ReadCloser: response.Body, cancel: cancel}
+	return response, nil
 }
+
+// inverseResponseBody holds the bounded request context open until the SDK has
+// read the answer.
+type inverseResponseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *inverseResponseBody) Close() error { defer b.cancel(); return b.ReadCloser.Close() }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,10 +11,14 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -386,7 +391,7 @@ func TestKeep28RejectsChangedProofWithSameExpiry(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer tx.Rollback(f.ctx)
-			auth, err := a.authorizeKeep28(f.ctx, tx, e)
+			auth, err := a.authorize(f.ctx, tx, e, &inverseSendGate{})
 			if err == nil {
 				auth.cancel()
 				t.Fatal("changed proof accepted")
@@ -398,18 +403,6 @@ func TestKeep28RejectsChangedProofWithSameExpiry(t *testing.T) {
 				t.Fatal("changed proof reached provider")
 			}
 		})
-	}
-}
-func TestKeep28LostResponseStaysHeldWithoutReplay(t *testing.T) {
-	f := newKeep28Fixture(t)
-	f.store.setLost(true)
-	if _, err := applyInverse(f.ctx, f.pool, f.sdk, f.options); err == nil {
-		t.Fatal("lost response reported success")
-	}
-	f.store.setLost(false)
-	result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
-	if err != nil || result.AmbiguousHeld != 1 || result.Deleted != 0 || f.deletes() != 1 {
-		t.Fatalf("held %+v %v deletes=%d", result, err, f.deletes())
 	}
 }
 func TestKeep28ExistingPresentIntentNeverReissues(t *testing.T) {
@@ -450,16 +443,16 @@ func TestKeep28AuthorityCopiesCannotReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(f.ctx)
-	auth, err := a.authorizeKeep28(f.ctx, tx, e)
+	auth, err := a.authorize(f.ctx, tx, e, &inverseSendGate{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer auth.cancel()
 	copy := *auth
-	if err = f.sdk.deleteKeep28Once(auth.ctx, auth); err != nil {
+	if err = f.sdk.deleteOnce(auth.ctx, auth); err != nil {
 		t.Fatal(err)
 	}
-	if err = f.sdk.deleteKeep28Once(copy.ctx, &copy); err == nil {
+	if err = f.sdk.deleteOnce(copy.ctx, &copy); err == nil {
 		t.Fatal("copied authority replayed")
 	}
 	if f.deletes() != 1 {
@@ -467,43 +460,6 @@ func TestKeep28AuthorityCopiesCannotReplay(t *testing.T) {
 	}
 }
 
-type keep28RoundTripFunc func(*http.Request) (*http.Response, error)
-
-func (f keep28RoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-func TestKeep28WireDeadlineAndCustodyLock(t *testing.T) {
-	f := newKeep28Fixture(t)
-	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '23 hours 59 minutes 55 seconds',server_received_at=clock_timestamp()`); err != nil {
-		t.Fatal(err)
-	}
-	var observed atomic.Bool
-	f.sdk.transport = keep28RoundTripFunc(func(req *http.Request) (*http.Response, error) {
-		deadline, ok := req.Context().Deadline()
-		if !ok || time.Until(deadline) > 5*time.Second {
-			t.Error("wire lacks custody deadline")
-		}
-		tx, err := f.pool.Begin(f.ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer tx.Rollback(f.ctx)
-		if _, err = tx.Exec(f.ctx, `SET LOCAL lock_timeout='100ms'; UPDATE nas_inventory_files SET state='missing' WHERE clip_id=9000001`); err == nil {
-			t.Error("custody row unlocked at wire")
-		}
-		observed.Store(true)
-		<-req.Context().Done()
-		return nil, req.Context().Err()
-	})
-	if _, err := applyInverse(f.ctx, f.pool, f.sdk, f.options); err == nil {
-		t.Fatal("expected custody expiry")
-	}
-	if !observed.Load() || f.deletes() != 0 {
-		t.Fatalf("wire deadline observation=%v deletes=%d", observed.Load(), f.deletes())
-	}
-	result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
-	if err != nil || result.AmbiguousHeld != 1 || f.deletes() != 0 {
-		t.Fatalf("expiry replay %+v %v", result, err)
-	}
-}
 func TestKeep28HoldsAndClassVetoes(t *testing.T) {
 	for name, sql := range map[string]string{
 		"delivery":       `INSERT INTO delivery_nas_source_holds(clip_id) VALUES(9000001)`,
@@ -557,5 +513,222 @@ func TestKeep28SelectionTrailsOldestFreshCustody(t *testing.T) {
 		if _, err = f.pool.Exec(f.ctx, sql); err == nil {
 			t.Fatalf("B2 history mutable: %s", sql)
 		}
+	}
+}
+
+// setWire installs loopback server answers and a server-side DELETE hook.
+func (f keep28Fixture) setWire(modes map[string]string, hook func(string)) {
+	f.store.mu.Lock()
+	defer f.store.mu.Unlock()
+	f.store.wire, f.store.onDelete = modes, hook
+}
+
+// The keep-28 DELETE crosses the same first-wire transport as RAW: only a
+// request its connection accepted in full with no response byte is a lost
+// response, held for good; any response byte stops the job. Restart never
+// resends either one.
+func TestKeep28WireOutcomes(t *testing.T) {
+	for _, mode := range []string{"eof", "503", "503-truncated", "503-headers-cut"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newKeep28Fixture(t)
+			f.setWire(map[string]string{f.key: mode}, nil)
+			result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
+			lost := mode == "eof"
+			if err == nil || errors.Is(err, errInverseWireAmbiguous) != lost || slices.Equal(result.WireAmbiguous, []string{f.key}) != lost || result.Deleted != 0 || f.deletes() != 1 {
+				t.Fatalf("%s: %+v %v deletes=%d", mode, result, err, f.deletes())
+			}
+			f.setWire(nil, nil)
+			result, err = applyInverse(f.ctx, f.pool, f.sdk, f.options)
+			if err != nil || result.AmbiguousHeld != 1 || slices.Equal(result.HeldAbsent, []string{f.key}) != lost || result.Deleted != 0 || f.deletes() != 1 {
+				t.Fatalf("%s restart: %+v %v deletes=%d", mode, result, err, f.deletes())
+			}
+		})
+	}
+}
+
+// A slow answer is a lost response, cut at custody expiry rather than the
+// 30-second cap, while the custody row stays locked on the wire.
+func TestKeep28WireDeadlineAndCustodyLock(t *testing.T) {
+	f := newKeep28Fixture(t)
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '23 hours 59 minutes 55 seconds',server_received_at=clock_timestamp()`); err != nil {
+		t.Fatal(err)
+	}
+	var unlocked atomic.Value
+	f.setWire(map[string]string{f.key: "slow"}, func(string) {
+		tx, err := f.pool.Begin(f.ctx)
+		if err != nil {
+			unlocked.Store(err.Error())
+			return
+		}
+		defer tx.Rollback(f.ctx)
+		if _, err = tx.Exec(f.ctx, `SET LOCAL lock_timeout='100ms'; UPDATE nas_inventory_files SET state='missing' WHERE clip_id=9000001`); err == nil {
+			unlocked.Store("custody row unlocked at wire")
+		}
+	})
+	started := time.Now()
+	result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
+	f.setWire(nil, nil)
+	if !errors.Is(err, errInverseWireAmbiguous) || time.Since(started) > 15*time.Second || !slices.Equal(result.WireAmbiguous, []string{f.key}) || f.deletes() != 1 || unlocked.Load() != nil {
+		t.Fatalf("slow answer: %+v %v after %v deletes=%d lock=%v", result, err, time.Since(started), f.deletes(), unlocked.Load())
+	}
+	result, err = applyInverse(f.ctx, f.pool, f.sdk, f.options)
+	if err != nil || result.AmbiguousHeld != 1 || !slices.Equal(result.HeldAbsent, []string{f.key}) || f.deletes() != 1 {
+		t.Fatalf("expiry replay %+v %v", result, err)
+	}
+}
+
+// keep28Authorized reserves the fixture key and issues its authority over a
+// fresh network transaction.
+func (f keep28Fixture) keep28Authorized(t *testing.T, a *inverseApplier, gate *inverseSendGate) (pgx.Tx, *inverseDeleteAuthority) {
+	t.Helper()
+	e := f.entry()
+	if _, err := a.reserve(f.ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.pool.BeginTx(f.ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { tx.Rollback(f.ctx) })
+	auth, err := a.authorize(f.ctx, tx, e, gate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(auth.cancel)
+	return tx, auth
+}
+
+// The gate closes while the DELETE is past every check and dialing: its first
+// request byte is refused, nothing reaches the provider, and the key stays held.
+func TestKeep28SendGateClosedDuringDialSendsNothing(t *testing.T) {
+	f := newKeep28Fixture(t)
+	a := f.applier(t)
+	gate := &inverseSendGate{}
+	tx, auth := f.keep28Authorized(t, a, gate)
+	dialing, release := make(chan struct{}), make(chan struct{})
+	template := newInverseDeleteHTTPTransport()
+	dial := template.DialContext
+	template.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		close(dialing)
+		<-release
+		return dial(ctx, network, addr)
+	}
+	original := f.sdk.transport
+	f.sdk.transport = template
+	done := make(chan error, 1)
+	go func() { done <- f.sdk.deleteOnce(auth.ctx, auth) }()
+	waitFor(t, dialing, "the DELETE dial")
+	gate.close()
+	close(release)
+	err := <-done
+	f.sdk.transport = original
+	if !errors.Is(err, errInverseAdmissionClosed) || errors.Is(err, errInverseWireAmbiguous) || f.deletes() != 0 {
+		t.Fatalf("closed gate: %v deletes=%d", err, f.deletes())
+	}
+	tx.Rollback(f.ctx)
+	a.ledger.close()
+	result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
+	if err != nil || result.AmbiguousHeld != 1 || len(result.HeldAbsent) != 0 || result.Deleted != 0 || f.deletes() != 0 {
+		t.Fatalf("restart: %+v %v deletes=%d", result, err, f.deletes())
+	}
+}
+
+// A keep-28 authority is spoken over HTTP/1.1 on a fresh connection, even to an
+// HTTP/2-capable TLS server.
+func TestKeep28DeleteNeverSpeaksHTTP2(t *testing.T) {
+	f := newKeep28Fixture(t)
+	_, auth := f.keep28Authorized(t, f.applier(t), &inverseSendGate{})
+	var protos []string
+	var protosMu sync.Mutex
+	var connections atomic.Int64
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		protosMu.Lock()
+		protos = append(protos, req.Proto)
+		protosMu.Unlock()
+		w.WriteHeader(204)
+	}))
+	server.EnableHTTP2 = true
+	server.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			connections.Add(1)
+		}
+	}
+	server.StartTLS()
+	defer server.Close()
+	tr := newInverseDeleteHTTPTransport()
+	tr.TLSClientConfig.RootCAs = x509.NewCertPool()
+	tr.TLSClientConfig.RootCAs.AddCert(server.Certificate())
+	wire := &inverseWire{gate: auth.gate}
+	client := &http.Client{Transport: &inverseDeleteTransport{base: wire.transport(tr), authority: auth, bucket: f.sdk.Bucket(), endpoint: f.sdk.EndpointSHA256(), wire: wire}}
+	req, _ := http.NewRequestWithContext(auth.ctx, http.MethodDelete, server.URL+"/stoarama/"+f.key+"?x-id=DeleteObject", nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	protosMu.Lock()
+	defer protosMu.Unlock()
+	if resp.ProtoMajor != 1 || resp.StatusCode != 204 || !slices.Equal(protos, []string{"HTTP/1.1"}) || connections.Load() != 1 || wire.lost() {
+		t.Fatalf("DELETE over %s (%d), server saw %v over %d connections", resp.Proto, resp.StatusCode, protos, connections.Load())
+	}
+}
+
+// Startup covers the keep-28 tables: an intent that never issued a DELETE but
+// whose object is gone stops the run before any new work.
+func TestKeep28UnissuedAbsentIntentStopsStartup(t *testing.T) {
+	f := newKeep28Fixture(t)
+	a := f.applier(t)
+	if _, err := a.reserve(f.ctx, f.entry()); err != nil {
+		t.Fatal(err)
+	}
+	a.ledger.close()
+	f.store.mu.Lock()
+	delete(f.store.objects, f.key)
+	f.store.mu.Unlock()
+	if _, err := applyInverse(f.ctx, f.pool, f.sdk, f.options); err == nil || !strings.Contains(err.Error(), "never issued a DELETE") || f.deletes() != 0 {
+		t.Fatalf("unissued absent intent: %v deletes=%d", err, f.deletes())
+	}
+}
+
+// A keep-28 job batch with one lost response deletes the rest, and its readback
+// of the keep-28 tables proves exactly that key unresolved. The next batch
+// reports it issued and absent, never resends it, and finds nothing else.
+func TestKeep28JobBatchHoldsOnlyTheLostKey(t *testing.T) {
+	f := newKeep28FixtureCount(t, 4)
+	file, err := os.Create(f.options.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for n := 1; n <= 4; n++ {
+		f.store.mu.Lock()
+		object := f.store.objects[fmt.Sprintf("managed/acct-47/keep28/%d.mp4", n)]
+		f.store.mu.Unlock()
+		if err = json.NewEncoder(file).Encode(inverseEntry{ObjectInfo: object, Class: inverseKeep28}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	file.Close()
+	f.options.ManifestSHA, _ = inverseFileSHA(f.options.Manifest)
+	// One worker in verified_at order: keys 2-4 first, the fresher key 1 last.
+	f.setWire(map[string]string{f.key: "eof"}, nil)
+	owner := filepath.Join("..", "..", "..", "docs", "records", "r2-owner-fence-policy-20261118.md")
+	dir := t.TempDir()
+	done, first, err := runInverseJobBatch(f.ctx, f.pool, f.sdk, f.options, owner, filepath.Join(dir, "evidence-1.json"))
+	f.setWire(nil, nil)
+	if err != nil || done || first.Deleted != 3 || !slices.Equal(first.WireAmbiguous, []string{f.key}) || f.deletes() != 4 {
+		t.Fatalf("lost-response batch: done %v %+v %v deletes=%d", done, first, err, f.deletes())
+	}
+	var unresolved []string
+	var attempts, events, raw int
+	if err = f.pool.QueryRow(f.ctx, `SELECT (SELECT coalesce(array_agg(i.object_key ORDER BY i.object_key),'{}') FROM r2_keep28_intents i WHERE NOT EXISTS(SELECT 1 FROM r2_keep28_events v WHERE v.bucket=i.bucket AND v.object_key=i.object_key AND v.event='absent')),
+ (SELECT count(*) FROM r2_keep28_attempts),(SELECT count(*) FROM r2_keep28_events),(SELECT count(*) FROM r2_inverse_intents)`).Scan(&unresolved, &attempts, &events, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(unresolved, []string{f.key}) || attempts != 4 || events != 3 || raw != 0 {
+		t.Fatalf("keep-28 tables: unresolved %v attempts %d events %d RAW intents %d", unresolved, attempts, events, raw)
+	}
+	done, second, err := runInverseJobBatch(f.ctx, f.pool, f.sdk, f.options, owner, filepath.Join(dir, "evidence-2.json"))
+	if err != nil || !done || second.Deleted != 0 || second.AmbiguousHeld != 1 || !slices.Equal(second.HeldAbsent, []string{f.key}) || f.deletes() != 4 {
+		t.Fatalf("next batch: done %v %+v %v deletes=%d", done, second, err, f.deletes())
 	}
 }
