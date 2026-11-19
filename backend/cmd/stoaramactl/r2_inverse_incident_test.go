@@ -41,20 +41,25 @@ func TestR2InverseCanonicalIncidentMigration(t *testing.T) {
 	ctx := context.Background()
 	pool := joinedPurgeTestPool(t, "inverse_incident_roster")
 	// Install the actual prior schema first, preserving the dependent view OIDs.
-	pre := t.TempDir()
+	const incidentMigration = "0202_r2_incident_roster.sql"
+	pre, upgrade := t.TempDir(), t.TempDir()
 	entries, err := os.ReadDir(joinedPurgeMigrationsDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, entry := range entries {
-		if !strings.HasSuffix(entry.Name(), ".sql") || entry.Name() == "0202_r2_incident_roster.sql" {
+		if !strings.HasSuffix(entry.Name(), ".sql") || entry.Name() > incidentMigration {
 			continue
 		}
 		source, err := filepath.Abs(filepath.Join(joinedPurgeMigrationsDir(), entry.Name()))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err = os.Symlink(source, filepath.Join(pre, entry.Name())); err != nil {
+		dir := pre
+		if entry.Name() == incidentMigration {
+			dir = upgrade
+		}
+		if err = os.Symlink(source, filepath.Join(dir, entry.Name())); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -78,7 +83,7 @@ func TestR2InverseCanonicalIncidentMigration(t *testing.T) {
 	if _, err = applier.Exec(ctx, `SELECT pg_advisory_lock(7343226011173)`); err != nil {
 		t.Fatal(err)
 	}
-	err = db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir())
+	err = db.MigrateUp(ctx, pool, upgrade)
 	if _, unlockErr := applier.Exec(ctx, `SELECT pg_advisory_unlock(7343226011173)`); unlockErr != nil {
 		t.Fatal(unlockErr)
 	}
@@ -94,7 +99,7 @@ func TestR2InverseCanonicalIncidentMigration(t *testing.T) {
 	if _, err = otherMigration.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011173)`); err != nil {
 		t.Fatal(err)
 	}
-	if err = db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir()); err != nil {
+	if err = db.MigrateUp(ctx, pool, upgrade); err != nil {
 		t.Fatal(err)
 	}
 	// A migration's shared guard still prevents a new exclusive applier.
@@ -109,6 +114,9 @@ func TestR2InverseCanonicalIncidentMigration(t *testing.T) {
 		t.Fatal("migration admitted concurrent apply", admitted, err)
 	}
 	if err = otherMigration.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir()); err != nil {
 		t.Fatal(err)
 	}
 	var filesAfter, sourcesAfter uint32
