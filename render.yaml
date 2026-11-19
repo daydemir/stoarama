@@ -77,6 +77,8 @@ services:
     buildCommand: |
       set -euo pipefail
       go build -o bin/stoarama-api ./cmd/stoarama-api
+      # One-off jobs run R2 executors next to the database, not across a home link.
+      go build -o bin/stoaramactl ./cmd/stoaramactl
       bash ./scripts/install-pinned-media-tools.sh
     startCommand: ./bin/stoarama-api
     # Fail a new release before cutover if legacy/stale recorder identity data

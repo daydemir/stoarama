@@ -63,7 +63,8 @@ func (s *inverseFakeStore) Head(ctx context.Context, key string) (r2.ObjectHead,
 	if !ok {
 		return r2.ObjectHead{}, &smithy.GenericAPIError{Code: "NotFound"}
 	}
-	return r2.ObjectHead{ETag: o.ETag, SizeBytes: o.SizeBytes, LastModified: o.LastModified}, nil
+	// Like R2, HEAD reports Last-Modified as an HTTP date in whole seconds.
+	return r2.ObjectHead{ETag: o.ETag, SizeBytes: o.SizeBytes, LastModified: o.LastModified.Truncate(time.Second)}, nil
 }
 func (s *inverseFakeStore) deleteOnce(ctx context.Context, authority *inverseDeleteAuthority) error {
 	key := authority.binding.Key
@@ -140,7 +141,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 	for n := range count {
 		key := fmt.Sprintf("managed/acct-47/ordinary/%04d.mp4", n)
 		etag := fmt.Sprintf("etag-%04d", n)
-		store.objects[key] = r2.ObjectInfo{Key: key, ETag: etag, SizeBytes: 100, LastModified: inverseRetirementCutoff().Add(-time.Second)}
+		store.objects[key] = r2.ObjectInfo{Key: key, ETag: etag, SizeBytes: 100, LastModified: inverseRetirementCutoff().Add(-1500 * time.Millisecond)}
 		exec(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path) VALUES($1,30,1,'https://test.invalid','stoarama',$2,100,$3,repeat('b',64),'2026-06-01','2026-06-01','2026-06-01 00:01:00','ordinary/'||$4)`, 9000000+n, key, etag, fmt.Sprintf("%04d.mp4", n))
 	}
 	exec(`INSERT INTO recording_collation_hours(id,hour_id,batch_id,generation,recording_id,local_date,delivery_hour,status,manifest_object_key,manifest_sha256,manifest,source_clip_count,included_clip_count,excluded_clip_count,join_count,split_count)
@@ -337,6 +338,30 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		s, err := applyInverse(ctx, pool, store, a.opts)
 		if err != nil || s.AmbiguousHeld != 1 || store.calls != before {
 			t.Fatalf("%+v %v calls%d", s, err, store.calls)
+		}
+	})
+	t.Run("unissued_intent_stays_held_when_object_vanishes", func(t *testing.T) {
+		a, entries := build(1)
+		if _, err := a.reserve(ctx, entries[0]); err != nil {
+			t.Fatal(err)
+		}
+		a.ledger.close()
+		store.mu.Lock()
+		object := store.objects[entries[0].Key]
+		delete(store.objects, entries[0].Key)
+		store.mu.Unlock()
+		before := store.calls
+		s, err := applyInverse(ctx, pool, store, a.opts)
+		store.mu.Lock()
+		store.objects[entries[0].Key] = object
+		store.mu.Unlock()
+		var absent int
+		var purged bool
+		if qerr := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM r2_inverse_events WHERE object_key=$1),(SELECT purged_at IS NOT NULL FROM recording_clips WHERE object_key=$1)`, entries[0].Key).Scan(&absent, &purged); qerr != nil {
+			t.Fatal(qerr)
+		}
+		if err == nil || !strings.Contains(err.Error(), "never issued a DELETE") || s.Reconciled != 0 || s.Deleted != 0 || absent != 0 || purged || store.calls != before {
+			t.Fatalf("%+v %v absent%d purged%t calls%d", s, err, absent, purged, store.calls)
 		}
 	})
 	t.Run("lost_response_reconciles_without_retransmit", func(t *testing.T) {
