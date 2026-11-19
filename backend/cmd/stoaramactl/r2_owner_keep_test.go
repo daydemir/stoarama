@@ -186,6 +186,7 @@ func TestR2OwnerKeepStagingAndIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback(f.ctx)
 	if _, err = tx.Exec(f.ctx, `SET LOCAL session_replication_role=replica`); err != nil {
 		t.Fatal(err)
 	}
@@ -233,5 +234,22 @@ func TestR2OwnerKeepStagingAndIsolation(t *testing.T) {
 	}
 	if _, err = move.Exec(f.ctx, `UPDATE nas_stitch_r2_stage_retirements SET object_id=$1 WHERE object_id=$2`, held, free); err == nil || !strings.Contains(err.Error(), "OWNER KEEP HOLD") {
 		t.Fatalf("staging retirement reassigned to a held object: %v", err)
+	}
+	move.Rollback(f.ctx)
+	// Nor away from its object, which would hide an in-flight DELETE from admission.
+	var spare int64
+	away, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer away.Rollback(f.ctx)
+	if _, err = away.Exec(f.ctx, `SET LOCAL session_replication_role=replica`); err != nil {
+		t.Fatal(err)
+	}
+	if err = away.QueryRow(f.ctx, `INSERT INTO nas_stitch_r2_stage_objects(hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes) VALUES(1,1,1,'stoarama',repeat('a',64),'h/3.mp4',repeat('d',64),10) RETURNING id`).Scan(&spare); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = away.Exec(f.ctx, `UPDATE nas_stitch_r2_stage_retirements SET object_id=$1 WHERE object_id=$2`, spare, free); err == nil || !strings.Contains(err.Error(), "cannot change its object") {
+		t.Fatalf("staging retirement moved away from its object: %v", err)
 	}
 }

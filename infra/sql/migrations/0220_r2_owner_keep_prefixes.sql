@@ -108,6 +108,11 @@ BEGIN
  IF current_setting('transaction_isolation')<>'read committed' THEN
   RAISE EXCEPTION 'R2 owner keep check requires READ COMMITTED';
  END IF;
+ -- A retirement stays attached to the object whose DELETE it authorizes,
+ -- so admission always sees it; reassignment is refused in every mode.
+ IF TG_OP='UPDATE' AND NEW.object_id IS DISTINCT FROM OLD.object_id THEN
+  RAISE EXCEPTION 'R2 OWNER KEEP HOLD: a stage retirement cannot change its object';
+ END IF;
  PERFORM pg_advisory_xact_lock_shared(7343226011220);
  IF EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects o WHERE o.id=NEW.object_id AND r2_owner_keep_held(o.bucket,o.object_key)) THEN
   RAISE EXCEPTION 'R2 OWNER KEEP HOLD: stage retirement forbidden for object %', NEW.object_id;
