@@ -11,7 +11,7 @@ import (
 // The reservation guard's indexed functions must agree with the views they
 // replace for every kind, source and issuance shape, and the guard must still
 // refuse a reserved source.
-func TestR2ReservationGuardIndexedLookupMatchesViews(t *testing.T) {
+func TestR2InverseReservationGuardIndexedLookupMatchesViews(t *testing.T) {
 	ctx := context.Background()
 	pool := joinedPurgeTestPool(t, "reservation_guard_index")
 	if err := db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir()); err != nil {
