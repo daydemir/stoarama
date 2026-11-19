@@ -49,6 +49,7 @@ func TestNASStitchBacklogCommandIsReadOnlyJSON(t *testing.T) {
 	base := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
 	setup := []string{
 		`CREATE TABLE streams(id bigint PRIMARY KEY,local_timezone text)`,
+		`CREATE TABLE nas_cleanup_frozen_streams(stream_id bigint)`,
 		`CREATE TABLE recordings(id bigint PRIMARY KEY,account_id bigint,stream_id bigint,cron_timezone text)`,
 		`CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint,object_key text,sha256 text,size_bytes bigint,display_path text,clip_start_at timestamptz,clip_end_at timestamptz,bucket text)`,
 		`CREATE TABLE nas_inventory_files(connection_id bigint,clip_id bigint,recording_id bigint,relative_path text,size_bytes bigint,sha256 text,state text,client_updated_at timestamptz)`,
@@ -107,7 +108,7 @@ func TestNASStitchBacklogCommandIsReadOnlyJSON(t *testing.T) {
 	if s.StreamID != 999 || s.RecordingHours != 2 || s.ReadyHours != 2 || s.MissingClipsHours != 0 {
 		t.Fatalf("counts: %+v", s)
 	}
-	if s.TaskHoursByState["pending"] != 1 || s.RemainingReadyHours != 1 {
+	if s.TaskHoursByState["pending"] != 1 || s.RemainingReadyHours != 1 || s.RemainingReadyInputBytes != 3 {
 		t.Fatalf("task state/remaining: %+v", s)
 	}
 	if report.Total.RecordingHours != 2 || report.Total.ReadyHours != 2 {

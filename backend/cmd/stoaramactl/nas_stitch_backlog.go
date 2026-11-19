@@ -60,12 +60,13 @@ func runNASStitchBacklog(ctx context.Context, cfg config.Config, args []string) 
 	poolConfig.MinConns = 0
 	poolConfig.ConnConfig.RuntimeParams["application_name"] = "stoarama-nas-stitch-backlog"
 	poolConfig.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
+	poolConfig.ConnConfig.RuntimeParams["timezone"] = "UTC"
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		log.Fatalf("connect database: %v", err)
 	}
 	defer pool.Close()
-	tx, err := pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		log.Fatalf("begin backlog transaction: %v", err)
 	}

@@ -59,10 +59,10 @@ func TestNASStitchBacklogCountsHoursLikeThePlanner(t *testing.T) {
  VALUES(1,999,'2026-09-19T00:00Z','2026-09-21T00:00Z','backlog fixture',now()+interval '1 hour',false)`); err != nil {
 		t.Fatal(err)
 	}
-	// A prior terminal task on the last hour exercises the by-state counts.
+	// A prior task whose raws are no longer present must not subtract from ready work.
 	plan, _ := json.Marshal(nasStitchPlan{Policy: nasStitchPolicy, Revision: nasStitchRevision})
 	if _, err := f.pool.Exec(f.ctx, `INSERT INTO nas_stitch_tasks(id,scope_id,recording_id,hour_at,plan,plan_sha256,state)
- VALUES(1,1,99,$1,$2,$3,'held')`, base.Add(2*time.Hour), string(plan), fmt.Sprintf("%064d", 1)); err != nil {
+ VALUES(1,1,99,$1,$2,$3,'held')`, base.Add(time.Hour), string(plan), fmt.Sprintf("%064d", 1)); err != nil {
 		t.Fatal(err)
 	}
 	before := backlogRowCounts(t, f.pool)
@@ -94,8 +94,7 @@ func TestNASStitchBacklogCountsHoursLikeThePlanner(t *testing.T) {
 	if s.TaskHoursByState["held"] != 1 || len(s.TaskHoursByState) != 1 {
 		t.Fatalf("task states differ: %+v", s.TaskHoursByState)
 	}
-	// Ready hours minus already-tasked hours is what the lane can plan next.
-	if s.RemainingReadyHours != 1 {
+	if s.RemainingReadyHours != 2 || s.RemainingReadyInputBytes != 9 {
 		t.Fatalf("remaining ready hours: %+v", s)
 	}
 	// The total aggregates every reported stream, so assert this stream's share
@@ -111,9 +110,34 @@ func TestNASStitchBacklogCountsHoursLikeThePlanner(t *testing.T) {
 	if plannerReady != s.ReadyHours {
 		t.Fatalf("backlog and planner disagree on ready hours: %d vs %d", plannerReady, s.ReadyHours)
 	}
-	// Read-only: nothing changed.
 	if after := backlogRowCounts(t, f.pool); after != before {
 		t.Fatalf("backlog report wrote rows: %s -> %s", before, after)
+	}
+
+	// Two disjoint scopes must not count the recording hour between them.
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_stitch_scopes SET paused=true WHERE id=1;
+INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until) VALUES
+(2,999,'2026-09-20T00:09Z','2026-09-20T00:30Z','partial hour',now()+interval '1 hour'),
+(3,999,'2026-09-20T02:00Z','2026-09-20T02:30Z','separate hour',now()+interval '1 hour')`); err != nil {
+		t.Fatal(err)
+	}
+	report, err = NASStitchBacklog(f.ctx, f.pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := backlogStream(t, report, 999); s.RecordingHours != 2 || s.ReadyHours != 2 ||
+		s.RemainingReadyHours != 2 || s.RemainingReadyInputBytes != 6 || len(s.TaskHoursByState) != 0 {
+		t.Fatalf("disjoint scopes differ: %+v", s)
+	}
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO nas_cleanup_frozen_streams(plan_id,stream_id) VALUES(999,999)`); err != nil {
+		t.Fatal(err)
+	}
+	report, err = NASStitchBacklog(f.ctx, f.pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := backlogStream(t, report, 999); !report.CleanupFreezeActive || s.ReadyHours != 2 || s.RemainingReadyHours != 0 {
+		t.Fatalf("freeze did not block admission while preserving inventory counts: %+v", s)
 	}
 }
 
@@ -222,7 +246,7 @@ SELECT count(DISTINCT date_trunc('hour',c.clip_start_at))
  JOIN recording_clips c ON c.recording_id=r.id AND c.clip_start_at>=s.start_at AND c.clip_end_at<=s.end_at
  JOIN nas_inventory_files n ON n.clip_id=c.id AND n.connection_id=13 AND n.state='present' AND n.sha256=c.sha256 AND n.size_bytes=c.size_bytes
  WHERE NOT s.paused AND s.approved_until>now() AND s.stream_id=$1
- AND NOT EXISTS(`+nasStitchHourMissingClipsSQL+`)`, streamID).Scan(&ready); err != nil {
+ AND `+nasStitchHourPresentSQL, streamID).Scan(&ready); err != nil {
 		t.Fatal(err)
 	}
 	return ready

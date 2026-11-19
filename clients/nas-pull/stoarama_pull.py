@@ -48600,6 +48600,9 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
         if proof_stop is None or proof_stop.task is not task or proof_stop.deadline is None:
             raise StitchHold("proof requires its original attempt deadline")
     plan = task["plan"]
+    pins, pin_error = cleanup_pins()
+    if pin_error:
+        raise StitchResourceHold("stitch policy pins unavailable")
     if (plan.get("policy") != STITCH_POLICY or plan.get("revision") != STITCH_REVISION
             or plan.get("corpus_sha256") != STITCH_CORPUS_SHA or plan.get("keep_policy_sha256") != CLEANUP_KEEP28_POLICY_SHA256):
         raise StitchTaskFailure("unapproved V85 policy identity")
@@ -48743,9 +48746,8 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                 raise StitchHold(stop.reason or "stitch cancelled")
             clip = dict(original)
             # Reuse the independent pinned folder/keep-window map for scope.
-            pins, error = cleanup_pins()
             key = cleanup_folder_key(clip["relative_path"], "raw")
-            if error or pins["folders"].get(key) != plan["stream_id"] or clip["stream_id"] != plan["stream_id"]:
+            if pins["folders"].get(key) != plan["stream_id"] or clip["stream_id"] != plan["stream_id"]:
                 raise StitchTaskFailure("raw folder is not owned by approved stream")
             start, end, _ = pins["windows"][plan["stream_id"]]
             a = parse_certification_timestamp(clip["start_at"], "source start")
@@ -48759,7 +48761,12 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                 if cleanup_identity(os.fstat(fd)) != cleanup_identity(info):
                     raise StitchTaskFailure("source identity changed before native audit")
                 path = Path("/proc/%d/fd/%d" % (os.getpid(), fd))
-            sidecar, scinfo = confined_regular_file(cfg.output_dir, clip["relative_path"] + ".stoarama.json")
+            try:
+                _, scinfo = confined_regular_file(cfg.output_dir, clip["relative_path"] + ".stoarama.json")
+            except MediaCertificationError as exc:
+                if isinstance(exc.__cause__, FileNotFoundError):
+                    raise StitchTaskFailure("stitch sidecar is missing") from None
+                raise
             clip.update(frozen_identity=cleanup_identity(info), frozen_sidecar_identity=cleanup_identity(scinfo), _path=path)
             if not plan["eligible"][index] or (admitted is not None and not admitted(clip)):
                 if kind is StitchRunKind.PROOF:
@@ -50610,6 +50617,9 @@ def stitch_once(cfg, inventory, stop_event):
             # An uncommitted expired lease needs its new token below. An
             # already committed result always answers idempotently first.
     stitch_resources(cfg)
+    _, pin_error = cleanup_pins()
+    if pin_error:
+        raise StitchResourceHold("stitch policy pins unavailable")
     if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
         raise StitchHold("stitch cancelled while cleanup executing")
     if stop_event.is_set() or not cfg.stitch_enabled:
@@ -50637,6 +50647,9 @@ def stitch_once(cfg, inventory, stop_event):
             # this hour's data: release and retry rather than holding the hour.
             if not os.path.ismount(str(cfg.output_dir)):
                 raise StitchResourceHold("NAS output root is not mounted") from None
+            cause = exc.__cause__
+            if isinstance(cause, OSError):
+                raise StitchResourceHold("NAS source I/O unavailable") from exc
             # Otherwise this hour's own bytes are unusable: missing/invalid
             # sidecar, unreadable media metadata, or a plan whose data no longer
             # matches. Report it once instead of re-leasing the same hour forever.

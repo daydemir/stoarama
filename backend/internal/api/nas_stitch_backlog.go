@@ -8,240 +8,181 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// nasStitchHourMissingClipsSQL is the exact per-hour NAS presence predicate
-// stitchPlanNext uses. It requires the outer query to alias the scope window as
-// s, the recording as r and one clip of that hour as c, and it is true when at
-// least one clip of that hour (inside the scope window) has no present NAS
-// inventory row bound to its display path, size and SHA-256.
-//
-// The read-only backlog report below evaluates the same predicate; it must never
-// be copied, because the two answers would silently diverge.
-const nasStitchHourMissingClipsSQL = `SELECT 1 FROM recording_clips c2 LEFT JOIN nas_inventory_files n2 ON n2.clip_id=c2.id AND n2.connection_id=13 AND n2.state='present' AND n2.relative_path=c2.display_path AND n2.sha256=c2.sha256 AND n2.size_bytes=c2.size_bytes
- WHERE c2.recording_id=r.id AND c2.clip_start_at>=date_trunc('hour',c.clip_start_at) AND c2.clip_start_at<date_trunc('hour',c.clip_start_at)+interval '1 hour' AND c2.clip_start_at>=s.start_at AND c2.clip_end_at<=s.end_at AND n2.clip_id IS NULL`
+const nasStitchMaxClips = 200
 
-// nasStitchHourPresentSQL is the same "every clip is exactly on the NAS" test,
-// written positively so a report can count ready hours in one pass.
-const nasStitchHourPresentSQL = `NOT EXISTS(` + nasStitchHourMissingClipsSQL + `)`
+// These predicates are shared by the lease planner and the read-only report.
+const nasStitchExactNASInventorySQL = `n2.clip_id=c2.id AND n2.connection_id=13 AND n2.state='present'
+ AND n2.relative_path=c2.display_path AND n2.sha256=c2.sha256 AND n2.size_bytes=c2.size_bytes`
+const nasStitchHourClipsSQL = `c2.recording_id=r.id AND c2.clip_start_at>=date_trunc('hour',c.clip_start_at)
+ AND c2.clip_start_at<date_trunc('hour',c.clip_start_at)+interval '1 hour'
+ AND c2.clip_start_at>=s.start_at AND c2.clip_end_at<=s.end_at`
+const nasStitchHourPresentSQL = `NOT EXISTS(SELECT 1 FROM recording_clips c2
+ LEFT JOIN nas_inventory_files n2 ON ` + nasStitchExactNASInventorySQL + `
+ WHERE ` + nasStitchHourClipsSQL + ` AND n2.clip_id IS NULL)`
+const nasStitchHourBoundsSQL = `count(*) BETWEEN 1 AND $1
+ AND bool_and(c2.size_bytes>0 AND c2.clip_end_at>c2.clip_start_at) AND sum(c2.size_bytes)<=$2`
 
 type nasStitchBacklogQuerier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
-// NASStitchBacklogStream is one stream's stitching backlog.
+// NASStitchBacklogStream is one stream's backlog. WindowFrom and WindowTo
+// enclose the selected scopes. Clips between disjoint scopes are excluded.
 type NASStitchBacklogStream struct {
-	StreamID   int64     `json:"stream_id"`
-	WindowFrom time.Time `json:"window_start"`
-	WindowTo   time.Time `json:"window_end"`
-	// WindowSource is "scope" for an approved nas_stitch_scopes window and
-	// "keep28_policy" for the pinned policy fallback.
-	WindowSource      string         `json:"window_source"`
-	ScopeIDs          []int64        `json:"scope_ids,omitempty"`
-	RecordingHours    int            `json:"recording_hours"`
-	ReadyHours        int            `json:"ready_hours"`
-	MissingClipsHours int            `json:"missing_clips_hours"`
-	TaskHoursByState  map[string]int `json:"task_hours_by_state"`
-	// RemainingReadyHours is ready hours with no task yet: what the lane can
-	// actually plan next.
-	RemainingReadyHours int `json:"remaining_ready_hours"`
+	StreamID                 int64          `json:"stream_id"`
+	WindowFrom               time.Time      `json:"window_start"`
+	WindowTo                 time.Time      `json:"window_end"`
+	WindowSource             string         `json:"window_source"`
+	ScopeIDs                 []int64        `json:"scope_ids,omitempty"`
+	RecordingHours           int            `json:"recording_hours"`
+	ReadyHours               int            `json:"ready_hours"`
+	MissingClipsHours        int            `json:"missing_clips_hours"`
+	TaskHoursByState         map[string]int `json:"task_hours_by_state"`
+	RemainingReadyHours      int            `json:"remaining_ready_hours"`
+	RemainingReadyInputBytes int64          `json:"remaining_ready_input_bytes"`
 }
 
-// NASStitchBacklogReport is the whole read-only answer.
 type NASStitchBacklogReport struct {
-	Policy  string                   `json:"policy"`
-	Source  string                   `json:"window_source"`
-	Observe time.Time                `json:"observed_at"`
-	Streams []NASStitchBacklogStream `json:"streams"`
-	Total   NASStitchBacklogStream   `json:"total"`
+	Policy              string                   `json:"policy"`
+	Source              string                   `json:"window_source"`
+	Observe             time.Time                `json:"observed_at"`
+	CleanupFreezeActive bool                     `json:"cleanup_freeze_active"`
+	Streams             []NASStitchBacklogStream `json:"streams"`
+	Total               NASStitchBacklogStream   `json:"total"`
 }
 
 type nasStitchBacklogWindow struct {
-	streamID   int64
-	start, end time.Time
-	source     string
-	scopeIDs   []int64
+	scopeID, streamID int64
+	start, end        time.Time
 }
 
-// NASStitchBacklog counts stitchable hours without writing anything. It uses
-// the current approved nas_stitch_scopes windows, and falls back to the pinned
-// keep28 policy windows when no scope is approved. Only reads.
+// NASStitchBacklog counts recording/hour units with exact NAS inventory. The
+// keep28 view, used without a live scope, is a capacity estimate; it grants no
+// lease authority. Remaining units exclude existing tasks and per-hour bounds.
 func NASStitchBacklog(ctx context.Context, q nasStitchBacklogQuerier) (NASStitchBacklogReport, error) {
-	report := NASStitchBacklogReport{Policy: nasStitchPolicy, Streams: []NASStitchBacklogStream{}}
-	report.Observe = time.Now().UTC()
-	windows, err := nasStitchBacklogWindows(ctx, q)
+	report := NASStitchBacklogReport{
+		Policy: nasStitchPolicy, Observe: time.Now().UTC(),
+		Streams: []NASStitchBacklogStream{},
+		Total:   NASStitchBacklogStream{TaskHoursByState: map[string]int{}},
+	}
+	windows, source, err := nasStitchBacklogWindows(ctx, q)
 	if err != nil {
 		return report, err
 	}
+	report.Source = source
 	if len(windows) == 0 {
 		return report, nil
 	}
-	report.Source = windows[0].source
-	ids := make([]int64, len(windows))
-	starts := make([]time.Time, len(windows))
-	ends := make([]time.Time, len(windows))
-	for n, w := range windows {
-		ids[n], starts[n], ends[n] = w.streamID, w.start, w.end
+	entries := make(map[int64]*NASStitchBacklogStream)
+	ids := make([]int64, 0, len(windows))
+	starts, ends := make([]time.Time, 0, len(windows)), make([]time.Time, 0, len(windows))
+	for _, w := range windows {
+		ids, starts, ends = append(ids, w.streamID), append(starts, w.start), append(ends, w.end)
+		e := entries[w.streamID]
+		if e == nil {
+			e = &NASStitchBacklogStream{StreamID: w.streamID, WindowSource: source, WindowFrom: w.start.UTC(), WindowTo: w.end.UTC()}
+			entries[w.streamID] = e
+		}
+		if w.start.Before(e.WindowFrom) {
+			e.WindowFrom = w.start.UTC()
+		}
+		if w.end.After(e.WindowTo) {
+			e.WindowTo = w.end.UTC()
+		}
+		if w.scopeID != 0 {
+			e.ScopeIDs = append(e.ScopeIDs, w.scopeID)
+		}
 	}
-	// One pass over every window. c is one clip per hour (the planner's own
-	// shape), so nasStitchHourPresentSQL is evaluated exactly as the planner
-	// evaluates it.
+
 	rows, err := q.Query(ctx, `
-WITH w AS (SELECT * FROM unnest($1::bigint[],$2::timestamptz[],$3::timestamptz[]) AS w(stream_id,start_at,end_at)),
-hours AS (
- SELECT s.stream_id,r.id AS recording_id,date_trunc('hour',c.clip_start_at) AS hour_at,count(*) AS clips
+WITH w AS (
+ SELECT DISTINCT stream_id,start_at,end_at
+ FROM unnest($3::bigint[],$4::timestamptz[],$5::timestamptz[]) AS windows(stream_id,start_at,end_at)
+), scoped AS (
+ SELECT s.stream_id,r.id AS recording_id,date_trunc('hour',c2.clip_start_at) AS hour_at,
+        bool_and(n2.clip_id IS NOT NULL) AS nas_present,
+        (`+nasStitchHourBoundsSQL+`) AS bounded,
+        sum(c2.size_bytes) AS bytes
  FROM w s JOIN recordings r ON r.stream_id=s.stream_id AND r.account_id=47
- JOIN recording_clips c ON c.recording_id=r.id AND c.clip_start_at>=s.start_at AND c.clip_end_at<=s.end_at
- GROUP BY 1,2,3),
-ready AS (
- SELECT DISTINCT s.stream_id,r.id AS recording_id,date_trunc('hour',c.clip_start_at) AS hour_at
- FROM w s JOIN recordings r ON r.stream_id=s.stream_id AND r.account_id=47
- JOIN recording_clips c ON c.recording_id=r.id AND c.clip_start_at>=s.start_at AND c.clip_end_at<=s.end_at
- JOIN nas_inventory_files n ON n.clip_id=c.id AND n.connection_id=13 AND n.state='present' AND n.sha256=c.sha256 AND n.size_bytes=c.size_bytes
- WHERE `+nasStitchHourPresentSQL+`)
+ JOIN recording_clips c2 ON c2.recording_id=r.id AND c2.clip_start_at>=s.start_at AND c2.clip_end_at<=s.end_at
+ LEFT JOIN nas_inventory_files n2 ON `+nasStitchExactNASInventorySQL+`
+ GROUP BY s.stream_id,s.start_at,s.end_at,r.id,date_trunc('hour',c2.clip_start_at)
+), hours AS (
+ SELECT stream_id,recording_id,hour_at,bool_or(nas_present) AS nas_present,
+        max(bytes) FILTER(WHERE nas_present AND bounded) AS ready_bytes
+ FROM scoped GROUP BY stream_id,recording_id,hour_at
+), by_state AS (
+ SELECT h.stream_id,t.state,count(*) AS hours
+ FROM hours h JOIN nas_stitch_tasks t USING(recording_id,hour_at) GROUP BY h.stream_id,t.state
+)
 SELECT s.stream_id,
  (SELECT count(*) FROM hours h WHERE h.stream_id=s.stream_id),
- (SELECT count(*) FROM ready d WHERE d.stream_id=s.stream_id)
-FROM w s ORDER BY s.stream_id`, ids, starts, ends)
+ (SELECT count(*) FROM hours h WHERE h.stream_id=s.stream_id AND h.nas_present),
+ coalesce((SELECT jsonb_object_agg(state,hours) FROM by_state b WHERE b.stream_id=s.stream_id),'{}'),
+ count(h.ready_bytes) FILTER(WHERE t.id IS NULL),
+ coalesce(sum(h.ready_bytes) FILTER(WHERE t.id IS NULL),0)::bigint,
+ EXISTS(SELECT 1 FROM nas_cleanup_frozen_streams)
+FROM (SELECT DISTINCT stream_id FROM w) s
+LEFT JOIN hours h ON h.stream_id=s.stream_id
+ AND NOT EXISTS(SELECT 1 FROM nas_cleanup_frozen_streams f WHERE f.stream_id=h.stream_id)
+LEFT JOIN nas_stitch_tasks t USING(recording_id,hour_at)
+GROUP BY s.stream_id ORDER BY s.stream_id`, nasStitchMaxClips, nasStitchMaxBytes, ids, starts, ends)
 	if err != nil {
 		return report, err
 	}
-	type counts struct{ recording, ready int }
-	byStream := map[int64]*counts{}
-	var order []int64
+	defer rows.Close()
 	for rows.Next() {
-		var sid int64
-		var c counts
-		if err = rows.Scan(&sid, &c.recording, &c.ready); err != nil {
-			rows.Close()
+		var streamID int64
+		var recording, ready, remaining int
+		var states map[string]int
+		var bytes int64
+		if err := rows.Scan(&streamID, &recording, &ready, &states, &remaining, &bytes, &report.CleanupFreezeActive); err != nil {
 			return report, err
 		}
-		byStream[sid] = &c
-		order = append(order, sid)
-	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return report, err
-	}
-	rows.Close()
-	// Existing tasks for these windows, by state. Tasks are keyed to their
-	// recording's stream, so a window change cannot hide an existing hour.
-	tasks := map[int64]map[string]int{}
-	taskRows, err := q.Query(ctx, `
-WITH w AS (SELECT * FROM unnest($1::bigint[],$2::timestamptz[],$3::timestamptz[]) AS w(stream_id,start_at,end_at)),
-task AS (
- SELECT DISTINCT s.stream_id,t.state,date_trunc('hour',t.hour_at) AS hour_at
- FROM w s JOIN recordings r ON r.stream_id=s.stream_id AND r.account_id=47
- JOIN nas_stitch_tasks t ON t.recording_id=r.id AND t.hour_at>=s.start_at AND t.hour_at<s.end_at)
-SELECT stream_id,state,count(*) FROM task GROUP BY 1,2 ORDER BY 1,2`, ids, starts, ends)
-	if err != nil {
-		return report, err
-	}
-	for taskRows.Next() {
-		var sid int64
-		var state string
-		var n int
-		if err = taskRows.Scan(&sid, &state, &n); err != nil {
-			taskRows.Close()
-			return report, err
-		}
-		if tasks[sid] == nil {
-			tasks[sid] = map[string]int{}
-		}
-		tasks[sid][state] += n
-	}
-	if err = taskRows.Err(); err != nil {
-		taskRows.Close()
-		return report, err
-	}
-	taskRows.Close()
-
-	report.Total = NASStitchBacklogStream{TaskHoursByState: map[string]int{}}
-	for _, w := range windows {
-		c := byStream[w.streamID]
-		if c == nil {
-			c = &counts{}
-		}
-		byState := tasks[w.streamID]
-		if byState == nil {
-			byState = map[string]int{}
-		}
-		tasked := 0
-		for _, n := range byState {
-			tasked += n
-		}
-		entry := NASStitchBacklogStream{
-			StreamID: w.streamID, WindowFrom: w.start.UTC(), WindowTo: w.end.UTC(), WindowSource: w.source,
-			ScopeIDs: w.scopeIDs, RecordingHours: c.recording, ReadyHours: c.ready,
-			MissingClipsHours: c.recording - c.ready, TaskHoursByState: byState,
-		}
-		if remaining := c.ready - tasked; remaining > 0 {
-			entry.RemainingReadyHours = remaining
-		}
-		report.Streams = append(report.Streams, entry)
-		report.Total.RecordingHours += entry.RecordingHours
-		report.Total.ReadyHours += entry.ReadyHours
-		report.Total.MissingClipsHours += entry.MissingClipsHours
-		report.Total.RemainingReadyHours += entry.RemainingReadyHours
-		for state, n := range byState {
+		e := entries[streamID]
+		e.RecordingHours, e.ReadyHours, e.MissingClipsHours = recording, ready, recording-ready
+		e.TaskHoursByState, e.RemainingReadyHours, e.RemainingReadyInputBytes = states, remaining, bytes
+		report.Streams = append(report.Streams, *e)
+		report.Total.RecordingHours += recording
+		report.Total.ReadyHours += ready
+		report.Total.MissingClipsHours += recording - ready
+		report.Total.RemainingReadyHours += remaining
+		report.Total.RemainingReadyInputBytes += bytes
+		for state, n := range states {
 			report.Total.TaskHoursByState[state] += n
 		}
 	}
-	sort.Slice(report.Streams, func(a, b int) bool { return report.Streams[a].StreamID < report.Streams[b].StreamID })
-	return report, nil
+	return report, rows.Err()
 }
 
-// nasStitchBacklogWindows prefers live approved scopes and otherwise returns the
-// pinned keep28 policy windows. Both are read-only views of existing authority.
-func nasStitchBacklogWindows(ctx context.Context, q nasStitchBacklogQuerier) ([]nasStitchBacklogWindow, error) {
+func nasStitchBacklogWindows(ctx context.Context, q nasStitchBacklogQuerier) ([]nasStitchBacklogWindow, string, error) {
 	rows, err := q.Query(ctx, `SELECT id,stream_id,start_at,end_at FROM nas_stitch_scopes
  WHERE NOT paused AND approved_until>now() ORDER BY stream_id,id`)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	byStream := map[int64]*nasStitchBacklogWindow{}
-	var order []int64
+	defer rows.Close()
+	var windows []nasStitchBacklogWindow
 	for rows.Next() {
-		var id, sid int64
-		var start, end time.Time
-		if err = rows.Scan(&id, &sid, &start, &end); err != nil {
-			rows.Close()
-			return nil, err
+		var w nasStitchBacklogWindow
+		if err := rows.Scan(&w.scopeID, &w.streamID, &w.start, &w.end); err != nil {
+			return nil, "", err
 		}
-		w := byStream[sid]
-		if w == nil {
-			w = &nasStitchBacklogWindow{streamID: sid, start: start, end: end, source: "scope"}
-			byStream[sid] = w
-			order = append(order, sid)
-		}
-		// Overlapping approved scopes for one stream widen the reported window
-		// only; the planner still emits one task per (recording,hour).
-		if start.Before(w.start) {
-			w.start = start
-		}
-		if end.After(w.end) {
-			w.end = end
-		}
-		w.scopeIDs = append(w.scopeIDs, id)
+		windows = append(windows, w)
 	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return nil, err
+	if err := rows.Err(); err != nil {
+		return nil, "", err
 	}
-	rows.Close()
-	if len(order) != 0 {
-		windows := make([]nasStitchBacklogWindow, 0, len(order))
-		for _, sid := range order {
-			windows = append(windows, *byStream[sid])
-		}
-		return windows, nil
+	if len(windows) != 0 {
+		return windows, "scope", nil
 	}
 	_, policy, err := Keep28Policy()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	windows := make([]nasStitchBacklogWindow, 0, len(policy))
 	for sid, w := range policy {
-		windows = append(windows, nasStitchBacklogWindow{streamID: sid, start: w.Start, end: w.End, source: "keep28_policy"})
+		windows = append(windows, nasStitchBacklogWindow{streamID: sid, start: w.Start, end: w.End})
 	}
 	sort.Slice(windows, func(a, b int) bool { return windows[a].streamID < windows[b].streamID })
-	return windows, nil
+	return windows, "keep28_policy", nil
 }

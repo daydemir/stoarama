@@ -1183,7 +1183,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		// unexpired and the master switch is on; otherwise the caller gets the
 		// non-deleting reconcile answer below.
 		if state == "delete_issued" && req.RequestID != "" && req.Outcome == "match" && permitUntil != nil && permitUntil.After(time.Now()) && nasSpaceAuditJSONEqual(oldOutcome, retryBody) &&
-			mode == "enabled" && until != nil && until.After(time.Now()) && s.stitchDeletionMaster(item) && (item.PermitReason == "" || s.stitchInclusionCurrent(ctx, tx, item) == nil) {
+			mode == "enabled" && until != nil && until.After(time.Now()) && s.stitchDeletionMaster(item) {
 			return cleanupObserveResult{status: 200, body: map[string]any{"delivery_keep_checked": true, "action": "delete_issued", "delete": true, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": oldRecovery, "expires_at": permitUntil.UTC(), "plan_paused": false, "replayed": true}}
 		}
 		if state != "delete_issued" && state != "deleted" && nasSpaceAuditJSONEqual(oldOutcome, retryBody) {

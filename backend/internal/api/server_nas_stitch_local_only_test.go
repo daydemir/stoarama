@@ -87,34 +87,30 @@ func TestNASStitchHeldInputsCompleteWithoutRetirementAndReleaseTheLane(t *testin
 	}
 }
 
-// A verified task whose cleanup plan still exists and is undeleted is exactly
-// the busy condition the held-input rule avoids. Prove the fixture would have
-// wedged the lane without it, so this test keeps its meaning.
-func TestNASStitchUnretiredPlanWouldBlockTheLane(t *testing.T) {
-	f, p, q := newNASStitchTaskFixture(t)
+// Old clients and journals can replay the original unheld evidence, but only
+// the server decides whether the registered output confers cleanup authority.
+func TestNASStitchLegacyResultStaysLocalWithDeletionSwitchesOn(t *testing.T) {
+	f, _, q := newNASStitchTaskFixture(t)
 	f.s.cfg.NASStitchEnabled = true
-	// Retirable evidence creates a plan that keep28 never drains.
-	p.Clips[0].PermitReason = nasStitchReason
-	if w := cleanupCall(t, f.s.handleAccountNASStitchResult, 47, 5, "id", "7", q); w.Code != 200 {
-		t.Fatalf("retirable result: %d %s", w.Code, w.Body.String())
+	f.s.cfg.NASStitchDeletionEnabled = true
+	f.s.cfg.NASCleanupDeletionEnabled = true
+	if q.Outputs[0].Inputs[0].RetirementHeld {
+		t.Fatal("fixture must carry legacy unheld evidence")
 	}
-	if w := cleanupCall(t, f.s.handleAccountNASStitchReady, 47, 5, "id", "7", map[string]any{"lease_token": q.Token, "plan_sha256": q.PlanSHA, "outputs_ready": true}); w.Code != 200 {
-		t.Fatalf("retirable readiness: %d %s", w.Code, w.Body.String())
+	for range 2 {
+		if w := cleanupCall(t, f.s.handleAccountNASStitchResult, 47, 5, "id", "7", q); w.Code != 200 {
+			t.Fatalf("legacy result: %d %s", w.Code, w.Body.String())
+		}
+		w := cleanupCall(t, f.s.handleAccountNASStitchReady, 47, 5, "id", "7", map[string]any{"lease_token": q.Token, "plan_sha256": q.PlanSHA, "outputs_ready": true})
+		if w.Code != 200 {
+			t.Fatalf("legacy readiness: %d %s", w.Code, w.Body.String())
+		}
 	}
+	var state string
 	var planID *int64
-	if err := f.pool.QueryRow(f.ctx, `SELECT cleanup_plan_id FROM nas_stitch_tasks WHERE id=7`).Scan(&planID); err != nil || planID == nil {
-		t.Fatalf("retirable readiness made no plan: %v %v", planID, err)
-	}
-	hourPlan, _ := json.Marshal(p)
-	if _, err := f.pool.Exec(f.ctx, `INSERT INTO nas_stitch_tasks(id,scope_id,recording_id,hour_at,plan,plan_sha256) VALUES(8,1,2,'2026-09-20T01:00Z',$1,$2)`, string(hourPlan), q.PlanSHA); err != nil {
-		t.Fatal(err)
-	}
-	w := cleanupCall(t, f.s.handleAccountNASStitchLease, 47, 5, "", "", map[string]any{})
-	var lease struct {
-		Task *nasStitchTask `json:"task"`
-	}
-	if json.Unmarshal(w.Body.Bytes(), &lease) != nil || lease.Task != nil {
-		t.Fatalf("undeleted plan did not hold the lane: %s", w.Body.String())
+	var plans int
+	if err := f.pool.QueryRow(f.ctx, `SELECT state,cleanup_plan_id,(SELECT count(*) FROM nas_cleanup_plans) FROM nas_stitch_tasks WHERE id=7`).Scan(&state, &planID, &plans); err != nil || state != "completed_no_retirement" || planID != nil || plans != 0 {
+		t.Fatalf("legacy reporting conferred retirement authority: %s %v %d %v", state, planID, plans, err)
 	}
 }
 

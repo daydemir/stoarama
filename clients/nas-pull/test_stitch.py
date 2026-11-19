@@ -625,6 +625,21 @@ class StitchTaskDataHoldTests(unittest.TestCase):
         self.assertEqual(results[0]['left_out'], [1, 2, 3])
         self.assertIn('not owned', results[0]['error'])
 
+    def test_mounted_share_io_failure_posts_no_terminal_result(self):
+        def build(cfg, inventory, task, stop, tools):
+            raise pull.MediaCertificationError("media path is unavailable") from PermissionError("fixture")
+        self.patch_common(build)
+        with self.assertRaises(pull.StitchResourceHold):
+            pull.stitch_once(self.cfg, self.inventory, self.stop)
+        self.assertEqual([path for path, _ in self.calls], ['/account/connections/stitch/lease'])
+
+    def test_invalid_policy_pins_leave_the_task_queue_untouched(self):
+        self.patch_common(AssertionError("build should not run"))
+        with mock.patch.object(pull, 'cleanup_pins', return_value=(None, "fixture pin error")):
+            with self.assertRaises(pull.StitchResourceHold):
+                pull.stitch_once(self.cfg, self.inventory, self.stop)
+        self.assertEqual(self.calls, [])
+
     def test_resource_hold_posts_no_result_and_releases_for_later(self):
         for hold in (pull.StitchResourceHold('NAS memory or load critical'), pull.StitchHold('stitch cancelled'),
                      pull.StitchNativeFailure(9), OSError('inventory unavailable')):
