@@ -375,12 +375,9 @@ func storeDeliveryCoverage(ctx context.Context, tx pgx.Tx, target deliveryCovera
 	var runID int64
 	err = tx.QueryRow(ctx, `
  INSERT INTO delivery_source_coverage_runs(output_id,collation_hour_id,source_clip_ids,manifest_object_key,manifest_sha256,evidence_sha256,media_evidence)
- VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(output_id,evidence_sha256) DO NOTHING RETURNING id`,
+ VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
 		target.OutputID, target.CollationHourID, target.SourceIDs, target.ManifestKey, target.ManifestSHA,
 		fmt.Sprintf("%x", sha256.Sum256(raw)), raw).Scan(&runID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil
-	}
 	if err != nil {
 		return err
 	}
@@ -436,7 +433,9 @@ func deliveryCoverageCommand(ctx context.Context, cfg config.Config, output int6
 		return err
 	}
 	if fetch {
-		store, err := r2.New(ctx, archiveR2Config(cfg, pool))
+		archive := archiveR2Config(cfg, nil)
+		archive.UserAgent = "stoarama-operator/1"
+		store, err := r2.New(ctx, archive)
 		if err != nil {
 			return err
 		}
