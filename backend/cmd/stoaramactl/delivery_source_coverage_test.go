@@ -38,7 +38,7 @@ func TestDeliverySourceCoverageRequiresLatestProofAndExactNASReadback(t *testing
  INSERT INTO recording_clips VALUES(5,2,'stoarama','raw/demo.mp4','raw-etag',repeat('d',64),88,
    'test/raw.mp4','2026-08-05T00:00Z','2026-08-05T00:01Z');
  `)
-	for _, name := range []string{"0224_delivery_nas_handoff.sql", "0225_delivery_source_coverage.sql"} {
+	for _, name := range []string{"0224_delivery_nas_handoff.sql", "0227_delivery_source_coverage.sql"} {
 		data, err := os.ReadFile("../../../infra/sql/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
