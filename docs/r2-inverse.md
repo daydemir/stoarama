@@ -169,10 +169,20 @@ one absolute local monotonic instant, 2 seconds early (`keep28CustodyMargin`).
 The authority keeps the running minimum across every sample, and every later
 handoff (first request byte, socket write deadline, confirming HEAD) ends at it
 or the existing 30-second cap, so neither a pause after sampling nor local
-wall-clock skew can extend authority. Residual: local time cannot observe the
-database clock after the last sample. If PostgreSQL's clock steps forward by
-more than the margin after that sample, or the host suspends while its
-monotonic clock stops, DB-time expiry can arrive before the local deadline.
+wall-clock skew can extend authority. Reservation admits a key only when its
+custody outlasts one network timeout plus the margin. A shorter key is counted
+as `custody_short` and skipped before any reservation, intent, budget charge or
+ledger record, and fresh custody retries it.
+
+Custody is a 24-hour freshness policy on an existing, verified NAS copy, not a
+physical deadline. The requirement is that custody is valid at the last
+PostgreSQL sample with at least the 2-second margin to spare. The accepted
+residuals, which have no data-loss consequence and get no further machinery:
+
+- the provider executing an already-accepted DELETE after expiry, bounded by
+  the 30-second network timeout;
+- a PostgreSQL clock step larger than the margin after the last sample;
+- a host suspend during which the monotonic clock stops.
 
 Migration 0204 creates independent `r2_keep28_intents`, `r2_keep28_attempts`,
 `r2_keep28_events` and a pending-source identity guard. Ordinary reservations

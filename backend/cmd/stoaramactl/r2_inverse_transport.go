@@ -160,18 +160,19 @@ func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntr
 	if err != nil {
 		return nil, err
 	}
+	// The parent carries the key's network deadline; keep-28 also ends at
+	// custody end, an absolute instant fixed when sampled.
 	var custody keep28Custody
 	var custodyEnd time.Time
-	deadline := time.Now().Add(inverseNetworkTimeout)
+	var cancel context.CancelFunc
 	if a.opts.Lane == inverseNASKeep28 {
 		if custody, custodyEnd, err = a.proveKeep28(ctx, tx, e, target); err != nil {
 			return nil, err
 		}
-		if custodyEnd.Before(deadline) {
-			deadline = custodyEnd
-		}
+		ctx, cancel = context.WithDeadline(ctx, custodyEnd)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
 	}
-	ctx, cancel := context.WithDeadline(ctx, deadline)
 	fail := func(err error) (*inverseDeleteAuthority, error) { cancel(); return nil, err }
 	if err = a.checkWireHead(ctx, tx, e, target); err != nil {
 		return fail(err)

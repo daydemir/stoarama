@@ -450,14 +450,11 @@ func (c deadlineSpyConn) SetWriteDeadline(d time.Time) error {
 
 // Neither the authority's deadline nor the wire's first-byte and socket
 // deadline lies past custody expiry, measured against the database clock
-// reaching that expiry. A pause separates the authority's clock sample from
-// the transport's, and the transport runs without a parent deadline, so its
-// own timer must land exactly on the earliest custody end.
+// reaching that expiry. Without a parent deadline, the authority's timer is
+// custody end exactly. A pause separates its clock sample from the
+// transport's, which must also land exactly on the earliest custody end.
 func TestKeep28DeadlinesNeverOutliveCustody(t *testing.T) {
 	f := newKeep28Fixture(t)
-	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '23 hours 59 minutes 50 seconds',server_received_at=clock_timestamp()`); err != nil {
-		t.Fatal(err)
-	}
 	_, auth := f.keep28Authorized(t, f.applier(t), &inverseSendGate{})
 	// Custody expiry as a local instant, never earlier than the true one: the
 	// local reading follows the database's. Deadlines keep a 2s margin from it.
@@ -470,7 +467,7 @@ func TestKeep28DeadlinesNeverOutliveCustody(t *testing.T) {
 		return time.Now().Add(auth.custody.Expiry.Sub(now))
 	}
 	authorized, _ := auth.ctx.Deadline()
-	if authorized.After(auth.custodyEnd) || authorized.After(expiry().Add(-2*time.Second)) {
+	if !authorized.Equal(auth.custodyEnd) || authorized.After(expiry().Add(-2*time.Second)) {
 		t.Fatalf("authority outlives custody: deadline %v, custody end %v", authorized, auth.custodyEnd)
 	}
 	time.Sleep(300 * time.Millisecond)
@@ -621,13 +618,14 @@ func TestKeep28WireOutcomes(t *testing.T) {
 	}
 }
 
-// A slow answer is a lost response, cut at custody expiry rather than the
-// 30-second cap, while the custody row stays locked on the wire.
+// A slow answer is a lost response, cut at custody end rather than the
+// 30-second cap, while the custody row stays locked on the wire. Reserve admits
+// only a key with a network timeout of custody to spare, so an earlier clock
+// sample leaves the authority 3s here.
 func TestKeep28WireDeadlineAndCustodyLock(t *testing.T) {
 	f := newKeep28Fixture(t)
-	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '23 hours 59 minutes 55 seconds',server_received_at=clock_timestamp()`); err != nil {
-		t.Fatal(err)
-	}
+	a := f.applier(t)
+	tx, auth := f.keep28Authorized(t, a, &inverseSendGate{})
 	var unlocked atomic.Value
 	f.setWire(map[string]string{f.key: "slow"}, func(string) {
 		tx, err := f.pool.Begin(f.ctx)
@@ -640,15 +638,53 @@ func TestKeep28WireDeadlineAndCustodyLock(t *testing.T) {
 			unlocked.Store("custody row unlocked at wire")
 		}
 	})
+	auth.custodyEnd = time.Now().Add(3 * time.Second)
 	started := time.Now()
-	result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
+	err := f.sdk.deleteOnce(auth.ctx, auth)
 	f.setWire(nil, nil)
-	if !errors.Is(err, errInverseWireAmbiguous) || time.Since(started) > 15*time.Second || !slices.Equal(result.WireAmbiguous, []string{f.key}) || f.deletes() != 1 || unlocked.Load() != nil {
-		t.Fatalf("slow answer: %+v %v after %v deletes=%d lock=%v", result, err, time.Since(started), f.deletes(), unlocked.Load())
+	if !errors.Is(err, errInverseWireAmbiguous) || time.Since(started) > 15*time.Second || f.deletes() != 1 || unlocked.Load() != nil {
+		t.Fatalf("slow answer: %v after %v deletes=%d lock=%v", err, time.Since(started), f.deletes(), unlocked.Load())
 	}
-	result, err = applyInverse(f.ctx, f.pool, f.sdk, f.options)
+	tx.Rollback(f.ctx)
+	a.ledger.close()
+	result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
 	if err != nil || result.AmbiguousHeld != 1 || !slices.Equal(result.HeldAbsent, []string{f.key}) || f.deletes() != 1 {
 		t.Fatalf("expiry replay %+v %v", result, err)
+	}
+}
+
+// A key whose custody could end within one network timeout plus the margin is
+// skipped before any reservation, intent, budget charge or ledger record, and
+// is not a batch failure. Once custody is fresh, the next run deletes it.
+func TestKeep28ShortCustodySkipsBeforeAnyWrite(t *testing.T) {
+	for _, left := range []string{"1.75 seconds", "31.5 seconds"} {
+		t.Run(left, func(t *testing.T) {
+			f := newKeep28Fixture(t)
+			if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '24 hours'+$1::interval,server_received_at=clock_timestamp()`, left); err != nil {
+				t.Fatal(err)
+			}
+			result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
+			var durable int
+			if qerr := f.pool.QueryRow(f.ctx, `SELECT (SELECT count(*) FROM r2_retirement_reservations)+(SELECT count(*) FROM r2_keep28_intents)+(SELECT count(*) FROM r2_keep28_attempts)+(SELECT count(*) FROM r2_inverse_budget_minutes)`).Scan(&durable); qerr != nil {
+				t.Fatal(qerr)
+			}
+			ledger, lerr := openKeep28Ledger(f.options.Ledger)
+			if lerr != nil {
+				t.Fatal(lerr)
+			}
+			records := len(ledger.seen)
+			ledger.close()
+			if err != nil || result.Deleted != 0 || result.CustodyShort != (r2RetireStat{Objects: 1, Bytes: 100}) || durable != 0 || records != 0 || f.deletes() != 0 {
+				t.Fatalf("short custody: %+v %v durable %d ledger %d deletes %d", result, err, durable, records, f.deletes())
+			}
+			if _, err = f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '1 hour'`); err != nil {
+				t.Fatal(err)
+			}
+			result, err = applyInverse(f.ctx, f.pool, f.sdk, f.options)
+			if err != nil || result.Deleted != 1 || result.CustodyShort.Objects != 0 || f.deletes() != 1 {
+				t.Fatalf("fresh custody: %+v %v deletes %d", result, err, f.deletes())
+			}
+		})
 	}
 }
 
@@ -670,9 +706,6 @@ func (t slowClockTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.
 // handoff keeps it: the wire's socket deadline and the confirming bound.
 func TestKeep28HandoffsKeepTheTightestSample(t *testing.T) {
 	f := newKeep28Fixture(t)
-	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '23 hours 59 minutes 50 seconds',server_received_at=clock_timestamp()`); err != nil {
-		t.Fatal(err)
-	}
 	tx, auth := f.keep28Authorized(t, f.applier(t), &inverseSendGate{})
 	armed := &atomic.Bool{}
 	auth.guard.tx = slowClockTx{Tx: tx, armed: armed}
@@ -899,12 +932,12 @@ func TestKeep28FirstByteNeverLeavesAfterCustody(t *testing.T) {
 	for _, pause := range []string{"after_connection", "inside_write"} {
 		t.Run(pause, func(t *testing.T) {
 			f := newKeep28Fixture(t)
-			if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '23 hours 59 minutes 55 seconds',server_received_at=clock_timestamp()`); err != nil {
-				t.Fatal(err)
-			}
 			_, auth := f.keep28Authorized(t, f.applier(t), &inverseSendGate{})
-			// The request deadline never outlives the authority's custody bound.
-			expired := func() { <-auth.ctx.Done(); time.Sleep(50 * time.Millisecond) }
+			// An earlier clock sample leaves 2s of custody; the writer resumes
+			// only once that custody end has passed.
+			end := time.Now().Add(2 * time.Second)
+			auth.custodyEnd = end
+			expired := func() { time.Sleep(time.Until(end) + 50*time.Millisecond) }
 			var sent atomic.Int64
 			var once sync.Once
 			template := newInverseDeleteHTTPTransport()

@@ -68,6 +68,9 @@ type inverseApplySummary struct {
 	HeldAbsent       []string     `json:"held_absent"`
 	WireAmbiguous    []string     `json:"wire_ambiguous"`
 	LastModifiedHeld r2RetireStat `json:"last_modified_held"`
+	// CustodyShort counts keep-28 keys skipped before any write because their
+	// custody could end before a DELETE finishes; fresh custody retries them.
+	CustodyShort     r2RetireStat `json:"custody_short"`
 	Bytes            int64        `json:"bytes"`
 	ElapsedSeconds   float64      `json:"elapsed_seconds"`
 	ObjectsPerSecond float64      `json:"objects_per_second"`
@@ -329,6 +332,15 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 		if err != nil {
 			return t, err
 		}
+		// Admit only a key that can finish inside custody: one network timeout
+		// must fit before the margin-early custody end. Nothing is written yet.
+		clock, err := keep28Clock(ctx, tx)
+		if err != nil {
+			return t, err
+		}
+		if clock.deadline(c.Expiry).Before(time.Now().Add(inverseNetworkTimeout)) {
+			return t, errKeep28CustodyShort
+		}
 		custody = &c
 	}
 	var charged int64
@@ -406,6 +418,11 @@ func (g *inverseWireGuard) check(ctx context.Context, binding inverseDeleteBindi
 }
 
 const inverseNetworkTimeout = 30 * time.Second
+
+// errKeep28CustodyShort skips a keep-28 key whose custody ends within one
+// network timeout plus keep28CustodyMargin. It writes nothing durable and is
+// not a batch failure: the key is retried once its custody is refreshed.
+var errKeep28CustodyShort = errors.New("NAS custody too short to finish a DELETE; skipped before any write")
 
 // errInverseAdmissionClosed reports a key that wrote nothing because a sibling
 // already stopped the batch. It is never a failure of its own.
@@ -814,6 +831,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	var deleted, bytes atomic.Int64
 	var wireAmbiguous []string
 	var modifiedHeld, modifiedBytes atomic.Int64
+	var custodyShort r2RetireStat
 	for range o.Workers {
 		wg.Add(1)
 		go func() {
@@ -826,6 +844,12 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 				}
 				if errors.Is(err, errInverseAdmissionClosed) {
 					return
+				}
+				if errors.Is(err, errKeep28CustodyShort) {
+					mu.Lock()
+					custodyShort.add(e.SizeBytes)
+					mu.Unlock()
+					continue
 				}
 				if err != nil {
 					var modifiedErr inverseLastModifiedError
@@ -869,6 +893,7 @@ send:
 	result.Bytes = bytes.Load()
 	result.LastModifiedHeld.Objects += modifiedHeld.Load()
 	result.LastModifiedHeld.Bytes += modifiedBytes.Load()
+	result.CustodyShort = custodyShort
 	result.ElapsedSeconds = time.Since(started).Seconds()
 	result.ObjectsPerSecond = float64(result.Deleted) / result.ElapsedSeconds
 	return result, first
