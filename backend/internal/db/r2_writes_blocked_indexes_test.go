@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -244,33 +245,44 @@ func TestR2WritesBlockedExpiryProbesUseIndexes(t *testing.T) {
  ANALYZE recording_upload_intents; ANALYZE nas_restore_requests`); err != nil {
 		t.Fatal(err)
 	}
-	for _, q := range []struct{ table, column string }{
-		{"recording_upload_intents", "expires_at"},
-		{"nas_restore_requests", "put_expires_at"},
-	} {
-		var raw []byte
-		subquery := fmt.Sprintf(`WITH expiry_cutoff AS MATERIALIZED (SELECT LEAST(now(), clock_timestamp()) AS cutoff)
- SELECT COALESCE((SELECT max(%s) FROM %s)>cutoff,false) FROM expiry_cutoff`, q.column, q.table)
-		if err := pool.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+subquery).Scan(&raw); err != nil {
-			t.Fatal(err)
-		}
-		plan := string(raw)
-		backwardIndex := (strings.Contains(plan, `"Node Type": "Index Only Scan"`) || strings.Contains(plan, `"Node Type": "Index Scan"`)) &&
-			strings.Contains(plan, `"Scan Direction": "Backward"`)
-		if !backwardIndex {
-			t.Fatalf("%s did not scan backward: %s", subquery, plan)
-		}
-		if !strings.Contains(plan, "r2wb_"+q.table) {
-			t.Fatalf("%s missed its index: %s", subquery, plan)
-		}
-		if strings.Contains(plan, "Seq Scan") {
-			t.Fatalf("%s still seq scans: %s", subquery, plan)
-		}
-	}
-	// A mature fence makes the installed function evaluate the writer vetoes.
+	// Inspect the deployed body with a matching fence so the plan executes
+	// both expiry probes. EXPLAIN on the function call hides its nested plan.
 	endpoint := strings.Repeat("a", 64)
 	if _, err := pool.Exec(ctx, `INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256,drain_not_before) VALUES('b',$1,now()-interval '1 minute')`, endpoint); err != nil {
 		t.Fatal(err)
+	}
+	var body string
+	if err := pool.QueryRow(ctx, `SELECT prosrc FROM pg_proc WHERE oid='r2_retirement_writes_blocked(text,text)'::regprocedure`).Scan(&body); err != nil {
+		t.Fatal(err)
+	}
+	body = strings.Replace(body, "bucket=b AND endpoint_sha256=endpoint", "bucket=$1 AND endpoint_sha256=$2", 1)
+	var raw []byte
+	if err := pool.QueryRow(ctx, "EXPLAIN (ANALYZE, FORMAT JSON) "+body, "b", endpoint).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	type planNode struct {
+		IndexName string     `json:"Index Name"`
+		Direction string     `json:"Scan Direction"`
+		Loops     int        `json:"Actual Loops"`
+		Children  []planNode `json:"Plans"`
+	}
+	var explain []struct{ Plan planNode }
+	if err := json.Unmarshal(raw, &explain); err != nil || len(explain) != 1 {
+		t.Fatalf("decode plan: %v, %s", err, raw)
+	}
+	indexes := make(map[string]bool)
+	nodes := []planNode{explain[0].Plan}
+	for len(nodes) > 0 {
+		node := nodes[len(nodes)-1]
+		nodes = append(nodes[:len(nodes)-1], node.Children...)
+		if node.IndexName != "" && node.Direction == "Backward" && node.Loops > 0 {
+			indexes[node.IndexName] = true
+		}
+	}
+	for _, index := range []string{"r2wb_recording_upload_intents_expires_at", "r2wb_nas_restore_requests_put_expires_at"} {
+		if !indexes[index] {
+			t.Fatalf("did not execute backward scan of %s: %s", index, raw)
+		}
 	}
 	start := time.Now()
 	var blocked bool
@@ -280,6 +292,18 @@ func TestR2WritesBlockedExpiryProbesUseIndexes(t *testing.T) {
 	t.Logf("mature-fence predicate with 50k expired rows per index took %s", time.Since(start))
 	if !blocked {
 		t.Fatal("an expired backlog vetoed a mature fence")
+	}
+	// Inject a backward step only at the final clock read. No system clock
+	// changes are required and every writer probe still runs as installed.
+	backwardStep := strings.Replace(body, "clock_floor < clock_timestamp()", "clock_floor < clock_floor - interval '1 second'", 1)
+	if backwardStep == body {
+		t.Fatal("deployed predicate did not recheck the clock after the writer probes")
+	}
+	if err := pool.QueryRow(ctx, backwardStep, "b", endpoint).Scan(&blocked); err != nil {
+		t.Fatal(err)
+	}
+	if blocked {
+		t.Fatal("a backward clock step after the writer probes allowed retirement")
 	}
 }
 

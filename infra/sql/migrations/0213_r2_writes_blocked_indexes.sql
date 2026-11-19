@@ -53,26 +53,28 @@ END $$;
 -- Compare the latest expiry to the cutoff outside the two large-table
 -- subqueries. PostgreSQL can retrieve each max() with a backward index scan.
 -- An empty table or all-NULL expiry yields false, as with the original EXISTS.
--- Sample one cutoff for all five expiry probes. Using the earlier clock means
--- a long transaction keeps its veto, and a backward wall-clock step before
--- the check cannot let transaction time prematurely clear a writer.
--- The exact fence still uses the strict wall-clock deadline. The function's
--- signature, volatility, ownership and grants are unchanged.
+-- Sample one cutoff for all five expiry probes. The earlier clock retains
+-- vetoes in long transactions and across backward wall-clock steps. Materialize
+-- the decision before reading the wall clock again. At that final check the
+-- wall clock must still be past both the cutoff and the exact fence deadline.
+-- The function's signature, volatility, ownership and grants are unchanged.
 CREATE OR REPLACE FUNCTION r2_retirement_writes_blocked(b text, endpoint text)
 RETURNS boolean LANGUAGE sql AS $$
  WITH expiry_cutoff AS MATERIALIZED (
    SELECT LEAST(now(), clock_timestamp()) AS cutoff
- )
- SELECT EXISTS(SELECT 1 FROM r2_retirement_writer_fences
+ ), writer_check AS MATERIALIZED (
+   SELECT GREATEST(cutoff, drain_not_before) AS clock_floor,
+   NOT (
+     EXISTS(SELECT 1 FROM r2_retirement_writer_operations WHERE completed_at IS NULL)
+     OR EXISTS(SELECT 1 FROM r2_retirement_writer_capabilities WHERE expires_at>cutoff)
+     OR COALESCE((SELECT max(expires_at) FROM recording_upload_intents)>cutoff,false)
+     OR EXISTS(SELECT 1 FROM upload_intents WHERE expires_at>cutoff)
+     OR EXISTS(SELECT 1 FROM capture_session_leases WHERE lease_expires_at>cutoff)
+     OR COALESCE((SELECT max(put_expires_at) FROM nas_restore_requests)>cutoff,false)
+   ) AS allowed
+   FROM expiry_cutoff CROSS JOIN r2_retirement_writer_fences
    WHERE bucket=b AND endpoint_sha256=endpoint
-     AND drain_not_before<clock_timestamp())
- AND NOT (
-   EXISTS(SELECT 1 FROM r2_retirement_writer_operations WHERE completed_at IS NULL)
-   OR EXISTS(SELECT 1 FROM r2_retirement_writer_capabilities WHERE expires_at>cutoff)
-   OR COALESCE((SELECT max(expires_at) FROM recording_upload_intents)>cutoff,false)
-   OR EXISTS(SELECT 1 FROM upload_intents WHERE expires_at>cutoff)
-   OR EXISTS(SELECT 1 FROM capture_session_leases WHERE lease_expires_at>cutoff)
-   OR COALESCE((SELECT max(put_expires_at) FROM nas_restore_requests)>cutoff,false)
+     AND drain_not_before<clock_timestamp()
  )
- FROM expiry_cutoff;
+ SELECT COALESCE((SELECT allowed AND clock_floor < clock_timestamp() FROM writer_check), false);
 $$;
