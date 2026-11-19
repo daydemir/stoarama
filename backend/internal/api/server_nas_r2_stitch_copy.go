@@ -54,7 +54,7 @@ func loadNASR2StagedObject(ctx context.Context, tx pgx.Tx, item NASR2CopyItem) (
  FROM nas_stitch_r2_stage_objects o JOIN nas_stitch_r2_hours h ON h.id=o.hour_id AND h.attempt=o.attempt
  JOIN nas_stitch_scopes s ON s.id=h.scope_id
  WHERE o.id=$1 AND o.bucket=$2 AND o.object_key=$3 AND o.relative_path=$4 AND o.sha256=$5 AND o.size_bytes=$6
-  AND h.recording_id=$7 AND s.stream_id=$8 AND o.state='staged' AND h.state='staged'`,
+  AND h.recording_id=$7 AND s.stream_id=$8 AND o.state='staged' AND h.state='staged' AND nas_stitch_r2_native_proof(h)`,
 		item.SourceID, item.Bucket, item.ObjectKey, item.RelativePath, item.SHA256, item.SizeBytes, item.RecordingID, item.StreamID).
 		Scan(&o.hourID, &o.attempt, &o.plan, &o.manifest, &o.etag, &o.version, &o.modified, &o.size, &o.sha)
 	if errors.Is(err, pgx.ErrNoRows) {

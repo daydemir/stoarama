@@ -13,7 +13,7 @@ import subprocess
 import tarfile
 
 root = Path(__file__).resolve().parent
-subprocess.run(['go','build','-buildvcs=false','-trimpath','-ldflags=-s -w -buildid=','-o',str(root/'remeasure-linux-amd64'),'./cmd/remeasure'],
+subprocess.run(['go','build','-trimpath','-ldflags=-s -w -buildid=','-o',str(root/'remeasure-linux-amd64'),'./cmd/remeasure'],
                cwd=root/'producer', env=dict(os.environ,CGO_ENABLED='0',GOOS='linux',GOARCH='amd64',GOAMD64='v1',GOTOOLCHAIN='go1.26.5'),check=True)
 members = json.loads((root/'manifest.json').read_bytes())['files']
 files = {name: (root/name).read_bytes() for name in members}

@@ -13,7 +13,7 @@ Environment=STOARAMA_STATE_DIR=/var/lib/stoarama-durham-stitch
 Environment=STOARAMA_STITCH_MIN_MEMORY_BYTES=536870912
 Environment=STOARAMA_STITCH_MAX_LOAD_PER_CPU=1.5
 EnvironmentFile=/etc/stoarama-stitch/worker.env
-UnsetEnvironment=QEMU_LD_PREFIX QEMU_CPU LD_PRELOAD LD_LIBRARY_PATH
+UnsetEnvironment=QEMU_LD_PREFIX QEMU_CPU LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT
 LoadCredential=stoarama-api-key:/etc/stoarama-stitch/stoarama-api-key
 ExecStart=/usr/bin/python3 -B /opt/stoarama-stitch/durham_stitch.py
 Restart=on-failure

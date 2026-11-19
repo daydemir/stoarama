@@ -187,7 +187,8 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	})
 
 	exec(`UPDATE nas_stitch_r2_hours SET state='leased',attempt=1,lease_api_key_id=47,lease_token=repeat('e',64),
- lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, id)
+ lease_expires_at=clock_timestamp()+interval '1 minute',lease_toolchain_attempt=1,lease_toolchain_sha256=$2
+ WHERE id=$1`, id, nasDurhamManifestSHA)
 	exec(`INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,generation,relative_path,sha256,size_bytes)
  OVERRIDING SYSTEM VALUE VALUES(122,$1,1,47,'stoarama',$2,$3,'fixture/aborted.mp4',$4,100)`,
 		id, endpoint, abortGeneration, sha)
@@ -195,18 +196,12 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
  grants_drain_at=clock_timestamp()-interval '1 second' WHERE id=122;
  UPDATE nas_stitch_r2_stage_objects SET state='aborted' WHERE id=122`)
 	exec(`UPDATE nas_stitch_r2_hours SET attempt=2,lease_toolchain_attempt=2,lease_toolchain_sha256=$2 WHERE id=$1`, id, nasDurhamManifestSHA)
-	t.Run("reclaimed legacy lease does not inherit the native profile", func(t *testing.T) {
+	t.Run("predecessor cannot reuse the native lease profile", func(t *testing.T) {
 		// The previous binary replaces the attempt and token without knowing the profile columns.
-		token := strings.Repeat("f", 64)
-		exec(`UPDATE nas_stitch_r2_hours SET state='leased',attempt=3,lease_api_key_id=47,lease_token=$2,
- lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, id, token)
-		defer exec(`UPDATE nas_stitch_r2_hours SET attempt=2,lease_token=repeat('e',64) WHERE id=$1`, id)
-		server := &Server{pool: pool}
-		w := cleanupCall(t, func(w http.ResponseWriter, r *http.Request) {
-			server.handleDurhamStitchStatus(w, r, nasStitchCaller{keyID: 47, accountID: 47}, id)
-		}, 47, 47, "", "", durhamStitchCheckpoint{Attempt: 3, Token: token, PlanSHA: planDigest})
-		if w.Code != http.StatusConflict {
-			t.Fatalf("legacy reclaim inherited a native ready response: %d %s", w.Code, w.Body.String())
+		if _, err := pool.Exec(ctx, `UPDATE nas_stitch_r2_hours SET state='leased',attempt=3,lease_api_key_id=47,
+ lease_token=repeat('f',64),lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, id); err == nil ||
+			!strings.Contains(err.Error(), "reviewed Durham lease toolchain required") {
+			t.Fatal("legacy reclaim inherited the native profile", err)
 		}
 	})
 	const insertStage = `INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes)

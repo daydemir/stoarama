@@ -301,6 +301,8 @@ def run_worker(http, slot, state, tools):
 
 
 def main():
+    if any(key.startswith(("LD_", "QEMU_")) for key in os.environ):
+        raise DurhamError("Durham service loader overrides are set")
     state = Path(os.environ["STOARAMA_STATE_DIR"]).resolve(strict=True)
     info = state.stat()
     if info.st_uid != os.getuid() or info.st_mode & 0o077:
