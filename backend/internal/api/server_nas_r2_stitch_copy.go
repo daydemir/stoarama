@@ -56,7 +56,8 @@ func finishNASR2StitchCopy(ctx context.Context, tx pgx.Tx, task nasR2CopyTask, r
 	receipt := req.StitchReceipt
 	if receipt == nil || !receipt.Fsynced || receipt.RelativePath != task.Item.RelativePath ||
 		receipt.SHA != task.Item.SHA256 || receipt.Bytes != task.Item.SizeBytes ||
-		receipt.Identity[0] != receipt.Bytes || receipt.Identity[1] <= 0 || receipt.Identity[2] <= 0 || receipt.Identity[3] <= 0 || req.Completion == "" {
+		receipt.Identity[0] != receipt.Bytes || receipt.Identity[1] <= 0 || receipt.Identity[2] <= 0 || receipt.Identity[3] <= 0 ||
+		receipt.Identity[4] < 0 || req.Completion == "" {
 		return errors.New("exact durable stitch output readback required")
 	}
 	staged, err := loadNASR2StagedObject(ctx, tx, task.Item)
@@ -77,6 +78,12 @@ func finishNASR2StitchCopy(ctx context.Context, tx pgx.Tx, task nasR2CopyTask, r
 		task.ID, req.Completion, req.CommittedBytes, string(body), staged.manifest, nasR2StitchResultSHA(req))
 	if err != nil || tag.RowsAffected() != 1 {
 		return errors.New("stitch copy lease or manifest changed")
+	}
+	var exact bool
+	err = tx.QueryRow(ctx, `SELECT nas_stitch_r2_exact_copy_receipt(q,o) FROM nas_r2_copy_items q
+ JOIN nas_stitch_r2_stage_objects o ON o.id=q.source_id WHERE q.id=$1`, task.ID).Scan(&exact)
+	if err != nil || !exact {
+		return errors.New("NAS copy receipt differs from the exact staged generation")
 	}
 	var accepted bool
 	err = tx.QueryRow(ctx, `WITH proof AS MATERIALIZED (

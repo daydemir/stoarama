@@ -52,6 +52,8 @@ LANGUAGE sql STABLE AS $$
    AND (SELECT count(*) FROM recording_clips c WHERE c.recording_id=h.recording_id
     AND c.clip_start_at>=h.hour_at AND c.clip_start_at<h.hour_at+interval '1 hour')
      = jsonb_array_length(h.plan->'clips')
+   AND (SELECT count(DISTINCT p->'source_id') FROM jsonb_array_elements(h.plan->'clips') p)
+     = jsonb_array_length(h.plan->'clips')
    AND EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds i WHERE i.hour_id=h.id AND i.released_at IS NULL
     HAVING count(*)=jsonb_array_length(h.plan->'clips') AND sum(i.size_bytes)=h.input_bytes)
    AND NOT EXISTS(
@@ -228,8 +230,9 @@ CREATE FUNCTION guard_r2_stitch_fence_transition() RETURNS trigger LANGUAGE plpg
 BEGIN
  IF NOT pg_try_advisory_xact_lock(7343226011187)
   OR EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects
-   WHERE state IN ('starting','uploading','completing') OR grants_drain_at>=clock_timestamp()) THEN
-  RAISE EXCEPTION 'R2 stitch staging writers have not drained';
+   WHERE state IN ('starting','uploading','completing') OR grants_drain_at>=clock_timestamp())
+  OR EXISTS(SELECT 1 FROM nas_stitch_r2_stage_retirements WHERE absence_observed_at IS NULL) THEN
+  RAISE EXCEPTION 'R2 stitch staging writers or unresolved retirements have not drained';
  END IF;
  IF TG_OP='DELETE' THEN RETURN OLD; END IF;
  RETURN NEW;
@@ -322,10 +325,12 @@ RETURNS jsonb LANGUAGE sql STABLE AS $$
   AND entry @> jsonb_build_object('relative_path',o.relative_path,'size_bytes',o.size_bytes,'sha256',o.sha256)
  JOIN nas_r2_copy_items q ON q.connection_id=13 AND q.kind='stitch_output' AND q.source_id=o.id
   AND q.manifest_sha256=$4 AND nas_stitch_r2_exact_copy_receipt(q,o)
- WHERE (SELECT count(*) FROM inputs)=jsonb_array_length(h.plan->'clips')
-  AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(h.plan->'clips') c
-   WHERE NOT EXISTS(SELECT 1 FROM inputs WHERE proof @> jsonb_build_object('clip_id',c->'source_id',
-    'size_bytes',c->'size_bytes','sha256',c->'sha256','repaired',false,'retirement_held',true)))
+ WHERE (SELECT count(*) FROM inputs)=(SELECT count(*) FROM nas_stitch_r2_input_holds i
+   WHERE i.hour_id=h.id AND i.released_at IS NULL)
+  AND NOT EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds i
+   WHERE i.hour_id=h.id AND i.released_at IS NULL AND (SELECT count(*) FROM inputs
+    WHERE proof @> jsonb_build_object('clip_id',i.catalog_clip_id,'size_bytes',i.size_bytes,
+     'sha256',i.sha256,'repaired',false,'retirement_held',true))<>1)
  HAVING count(*)>0 AND count(DISTINCT o.id)=count(*) AND count(*)=(SELECT count(*) FROM outputs)
   AND count(*)=(SELECT count(*) FROM nas_stitch_r2_stage_objects o WHERE o.hour_id=$1 AND o.attempt=$2 AND o.state='staged')
 $$;
@@ -333,7 +338,15 @@ $$;
 CREATE FUNCTION add_nas_stitch_r2_certificate() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE expected jsonb;
 BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'NAS stitch certification requires READ COMMITTED' USING ERRCODE='55000';
+ END IF;
  PERFORM pg_advisory_xact_lock(7343226011173);
+ PERFORM 1 FROM r2_inverse_ke_epoch FOR SHARE;
+ PERFORM c.id FROM nas_stitch_r2_input_holds i
+  JOIN recording_clips c ON c.id=i.catalog_clip_id
+  JOIN nas_inventory_files f ON f.connection_id=13 AND f.clip_id=c.id
+  WHERE i.hour_id=NEW.hour_id AND i.released_at IS NULL ORDER BY c.id FOR SHARE OF c,f;
  IF NOT nas_stitch_r2_has_exact_input_set(NEW.hour_id) THEN
   RAISE EXCEPTION 'NAS stitch input coverage changed';
  END IF;
@@ -399,6 +412,8 @@ CREATE TABLE nas_stitch_r2_stage_retirements (
  absence_observed_at timestamptz,
  CHECK(absence_observed_at IS NULL OR absence_observed_at>=issued_at)
 );
+CREATE INDEX nas_stitch_r2_stage_unresolved ON nas_stitch_r2_stage_retirements(object_id)
+ WHERE absence_observed_at IS NULL;
 
 CREATE FUNCTION guard_nas_stitch_r2_stage_retirement() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -409,6 +424,29 @@ BEGIN
 END $$;
 CREATE TRIGGER nas_stitch_r2_stage_retirement_guard BEFORE INSERT OR UPDATE OR DELETE ON nas_stitch_r2_stage_retirements
  FOR EACH ROW EXECUTE FUNCTION guard_nas_stitch_r2_stage_retirement();
+
+-- The protection epoch fences these admissions during the wire attempt.
+-- Its committed intent also protects the exact generation after timeout.
+CREATE FUNCTION guard_nas_stitch_r2_stage_dependency() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE entry jsonb:=to_jsonb(NEW);
+BEGIN
+ IF EXISTS(SELECT 1 FROM nas_stitch_r2_stage_retirements d JOIN nas_stitch_r2_stage_objects o ON o.id=d.object_id
+  WHERE d.absence_observed_at IS NULL AND (
+   (o.object_key=entry->>'object_key' AND (entry->>'bucket' IS NULL OR o.bucket=entry->>'bucket'))
+   OR o.relative_path=coalesce(entry->>'relative_path',entry->>'nas_relative_path',entry->>'display_path')
+   OR (TG_TABLE_NAME<>'recording_clips' AND o.sha256=entry->>'sha256' AND o.size_bytes::text=entry->>'size_bytes'))) THEN
+  RAISE EXCEPTION 'unresolved stitch staging retirement protects dependency admission' USING ERRCODE='55000';
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER nas_stitch_stage_delivery_dependency BEFORE INSERT OR UPDATE ON delivery_keep_holds
+ FOR EACH ROW EXECUTE FUNCTION guard_nas_stitch_r2_stage_dependency();
+CREATE TRIGGER nas_stitch_stage_collated_dependency
+ BEFORE INSERT OR UPDATE OF object_key,nas_relative_path,sha256,size_bytes ON recording_collation_outputs
+ FOR EACH ROW EXECUTE FUNCTION guard_nas_stitch_r2_stage_dependency();
+CREATE TRIGGER nas_stitch_stage_raw_dependency
+ BEFORE INSERT OR UPDATE OF bucket,object_key,display_path,sha256,size_bytes ON recording_clips
+ FOR EACH ROW EXECUTE FUNCTION guard_nas_stitch_r2_stage_dependency();
 
 DO $$ DECLARE t text; BEGIN
  FOREACH t IN ARRAY ARRAY['nas_stitch_r2_hours','nas_stitch_r2_stage_objects','nas_stitch_r2_parts',

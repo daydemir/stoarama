@@ -345,7 +345,10 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
   AND COALESCE(q.range_until,'-infinity')<clock_timestamp()
   AND NOT EXISTS(SELECT 1 FROM delivery_keep_holds k WHERE (k.bucket=o.bucket AND k.object_key=o.object_key)
     OR k.relative_path=o.relative_path OR (k.sha256=o.sha256 AND k.size_bytes=o.size_bytes))
-  AND NOT EXISTS(SELECT 1 FROM recording_collation_outputs j WHERE j.object_key=o.object_key OR j.nas_relative_path=o.relative_path)
+  AND NOT EXISTS(SELECT 1 FROM recording_collation_outputs j WHERE j.object_key=o.object_key OR j.nas_relative_path=o.relative_path
+    OR (j.sha256=o.sha256 AND j.size_bytes=o.size_bytes))
+  AND NOT EXISTS(SELECT 1 FROM recording_clips raw WHERE (raw.bucket=o.bucket AND raw.object_key=o.object_key)
+    OR (raw.display_path<>'' AND raw.display_path=o.relative_path))
  FOR SHARE OF o,h,c,q`, objectID, sha, c.bucket, c.EndpointSHA256()).Scan(&key, &etag, &version, &size, &modified, &issued, &absent)
 	if err != nil {
 		return errors.New("stitch stage lacks exact NAS custody, drain, or dependency clearance")
