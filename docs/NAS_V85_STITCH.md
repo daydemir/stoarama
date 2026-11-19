@@ -119,6 +119,25 @@ issued permits to have expired before opening the local stitch lane.
 Preserve existing SQLite journals, outputs, ledgers and plans. Ordinary NAS
 cleanup and R2 retirement retain their separate authority.
 
+## Dedicated Durham credential
+
+After the dedicated-key deployment and explicit owner approval, an operator
+session can issue a key with `POST /api/v1/admin/nas-stitch/key`. The response
+shows the token once. Save it through the approved secret workflow. It grants
+only the ordinary stitch lease, checkpoint, result and readiness POSTs.
+Provision the pinned tools and corpus offline. The existing admin key-ID
+revocation route revokes this key independently of connection 13. Older API
+binaries cannot authenticate the dedicated key's stored digest.
+
+A result awaiting its durable receipt keeps the shared stitch lane occupied.
+If a dedicated key is revoked or expires in that window, the operator status
+includes the abandonment marker for any recovered task. An authorized operator
+can record abandonment with `POST /api/v1/admin/nas-stitch/{id}/abandon-registration`
+and the exact `plan_sha256` and `reason`. This preserves the output and frozen
+result, records who released the lane, and leaves the abandoned hour without a
+readiness receipt. Older binaries ignore the marker and can block the lane
+again after a rollback.
+
 ## Resource controls and restart
 
 One lane runs at **nice 19 / ionice idle**, including Python hashing; missing

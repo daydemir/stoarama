@@ -37,7 +37,7 @@ CREATE TABLE account_api_keys(id bigint PRIMARY KEY,account_id bigint,secret_has
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err = f.pool.Exec(f.ctx, `INSERT INTO account_api_keys(id,account_id,secret_hash,scopes) VALUES(5,47,$1,'{}')`, hashSecret("fixture-key")); err != nil {
+			if _, err = f.pool.Exec(f.ctx, `INSERT INTO account_api_keys(id,account_id,secret_hash,scopes) VALUES(5,47,$1,ARRAY['stoarama.read'])`, hashSecret("fixture-key")); err != nil {
 				t.Fatal(err)
 			}
 			lock, err := f.pool.Begin(f.ctx)
