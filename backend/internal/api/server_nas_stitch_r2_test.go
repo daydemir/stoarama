@@ -93,6 +93,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
  'source-2-etag',$2,$3,$3,$4,'fixture/raw2.mp4')`, provider.URL, sha, end, end.Add(time.Minute))
 	exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at)
  VALUES(13,902,30,'fixture/raw2.mp4',100,$1,'present',now(),now())`, sha)
+	extra := addDurhamHours(t, pool, hour, provider.URL, sha)
 
 	exec(`INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until)
  VALUES(1,3,$1,$1::timestamptz+interval '6 hours','test',clock_timestamp()+interval '1 hour')`, hour)
@@ -542,7 +543,9 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	if got := <-posted; got != http.StatusConflict {
 		t.Fatalf("certificate accepted an inventory row inserted after its lock snapshot: %d", got)
 	}
-	if got := post(47, request); got != http.StatusOK {
+	certify := func() int { return post(47, request) }
+	testStitchReceiptNeverWaits(t, pool, certify, sourceKey)
+	if got := testStitchCertKeyContention(t, pool, certify, 901, sourceKey, "managed/keep-ranking.mp4", extra); got != http.StatusOK {
 		t.Fatalf("connection 13 certificate rejected: %d", got)
 	}
 	if got := post(47, request); got != http.StatusOK {
@@ -602,10 +605,18 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		initialIntents != 0 {
 		t.Fatal("could not establish an old snapshot before staging DELETE", err)
 	}
+	release := holdSessionLock(t, pool, stitchStageGuard(123))
+	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil || !strings.Contains(err.Error(), "stitch stage retirement busy") {
+		t.Fatal("a concurrent staging retirement invocation was admitted", err)
+	}
+	release()
+	// A running RAW batch owns the executors' outer lock; staging proceeds.
+	release = holdSessionLock(t, pool, "7343226011173")
 	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil ||
 		!strings.Contains(err.Error(), "outcome unconfirmed") {
 		t.Fatalf("expected the provider to lose the DELETE result after both grants drained: %v", err)
 	}
+	release()
 	var stagingAbsent bool
 	if err := pool.QueryRow(ctx, `SELECT nas_cleanup_certified_stitch_staging_absent(certificate)
  FROM nas_stitch_r2_certified_raw WHERE clip_id=901`).Scan(&stagingAbsent); err != nil || stagingAbsent {
@@ -660,11 +671,14 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 				}
 			}
 			abort.response.Store(3)
+			// Another staged object's retirement never fences this one.
+			release := holdSessionLock(t, pool, stitchStageGuard(123))
 			for range 2 {
 				if err := store.RetireStitchStage(ctx, 122, sha, time.Time{}, true); err != nil {
 					t.Fatalf("clean aborted stage absence or exact replay refused: %v", err)
 				}
 			}
+			release()
 			var receipt, deletionIntent bool
 			if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_r2_aborted_absences WHERE object_id=122),
  EXISTS(SELECT 1 FROM nas_stitch_r2_stage_retirements WHERE object_id=122)`).Scan(&receipt, &deletionIntent); err != nil || !receipt || deletionIntent {

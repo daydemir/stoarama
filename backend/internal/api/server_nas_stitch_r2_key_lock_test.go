@@ -1,0 +1,278 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func TestDurhamStitchImportBoundsHeldInputs(t *testing.T) {
+	set := DurhamStitchHoldSet{Bucket: "stoarama", EndpointSHA: strings.Repeat("a", 64),
+		Hours: make([]DurhamStitchHour, durhamStitchMaxImportInputs/nasStitchMaxClips+1)}
+	for i := range set.Hours {
+		set.Hours[i].Inputs = make([]DurhamStitchInput, nasStitchMaxClips)
+	}
+	// The bound is checked before the transaction is touched.
+	if _, err := ImportDurhamStitchHoldSet(context.Background(), nil, set); err == nil || !strings.Contains(err.Error(), "bounded") {
+		t.Fatalf("import accepted more inputs than its key locks may hold: %v", err)
+	}
+}
+
+// rawRetirementKey replays inverse reserve (or wire) up to its ledger write:
+// epoch, protection locks, copy key, clip row, then the held check.
+func rawRetirementKey(ctx context.Context, pool *pgxpool.Pool, key string, wire bool) (pgx.Tx, error) {
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return nil, err
+	}
+	protection := `SELECT pg_advisory_xact_lock(7343226011103),pg_advisory_xact_lock(7343226011101)`
+	if wire {
+		protection = `SELECT pg_advisory_xact_lock_shared(7343226011103),pg_advisory_xact_lock_shared(7343226011101)`
+	}
+	var held bool
+	for _, step := range []string{`SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`, `SELECT pg_advisory_xact_lock_shared(137,1)`, protection} {
+		if _, err = tx.Exec(ctx, step); err != nil {
+			tx.Rollback(context.Background())
+			return nil, err
+		}
+	}
+	if _, err = tx.Exec(ctx, `SELECT lock_nas_r2_copy_key('stoarama',$1)`, key); err == nil {
+		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds h WHERE h.bucket=c.bucket AND h.object_key=c.object_key AND h.released_at IS NULL)
+ FROM recording_clips c WHERE c.bucket='stoarama' AND c.object_key=$1 FOR UPDATE OF c`, key).Scan(&held)
+	}
+	if err == nil && held {
+		err = errors.New("live key protection veto")
+	}
+	if err == nil && !wire {
+		_, err = tx.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
+ SELECT 'raw',id,bucket,object_key,size_bytes,lower(sha256),repeat('a',64) FROM recording_clips WHERE bucket='stoarama' AND object_key=$1`, key)
+	}
+	if err != nil {
+		tx.Rollback(context.Background())
+		return nil, err
+	}
+	return tx, nil
+}
+
+func backendPID(t *testing.T, tx pgx.Tx) uint32 {
+	t.Helper()
+	var pid uint32
+	if err := tx.QueryRow(context.Background(), `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	return pid
+}
+
+// blockedBy waits until a backend waits on holder and returns its PID.
+func blockedBy(t *testing.T, pool *pgxpool.Pool, holder uint32, what string) uint32 {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		var waiter uint32
+		err := pool.QueryRow(context.Background(), `SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid))`, holder).Scan(&waiter)
+		if err == nil {
+			return waiter
+		}
+		if !errors.Is(err, pgx.ErrNoRows) || time.Now().After(deadline) {
+			t.Fatalf("%s never waited: %v", what, err)
+		}
+	}
+}
+
+func within[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case value := <-ch:
+		return value
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s waited", what)
+		panic("unreachable")
+	}
+}
+
+// The receipt owns its copy row, so a busy epoch or input key refuses it at
+// once; the client retries.
+func testStitchReceiptNeverWaits(t *testing.T, pool *pgxpool.Pool, post func() int, inputKey string) {
+	t.Helper()
+	ctx := context.Background()
+	for _, holder := range []string{`SELECT lock_nas_r2_copy_key('stoarama','` + inputKey + `')`, `SELECT 1 FROM r2_inverse_ke_epoch FOR UPDATE`} {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = tx.Exec(ctx, holder); err != nil {
+			t.Fatal(err)
+		}
+		code := make(chan int, 1)
+		go func() { code <- post() }()
+		if got := within(t, code, "receipt behind "+holder); got != http.StatusConflict {
+			t.Fatalf("receipt crossed %s: %d", holder, got)
+		}
+		tx.Rollback(ctx)
+	}
+}
+
+type durhamExtraHours struct {
+	keys      []string
+	importSet func(context.Context) error
+}
+
+// addDurhamHours stores two further whole hours whose keys sort against their
+// plan order, and returns their later planned import.
+func addDurhamHours(t *testing.T, pool *pgxpool.Pool, hour time.Time, endpoint, sha string) durhamExtraHours {
+	t.Helper()
+	ctx := context.Background()
+	var hours durhamExtraHours
+	for n, start := range []time.Time{hour.Add(time.Hour), hour.Add(time.Hour + time.Minute), hour.Add(2 * time.Hour), hour.Add(2*time.Hour + time.Minute)} {
+		id, key, path := 911+n, fmt.Sprintf("managed/durham-%c.mp4", 'z'-n), fmt.Sprintf("fixture/extra-%d.mp4", n)
+		hours.keys = append(hours.keys, key)
+		if _, err := pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,
+ fire_at,clip_start_at,clip_end_at,display_path) VALUES($1,30,1,$2,'stoarama',$3,100,'extra-etag',$4,$5,$5,$6,$7)`,
+			id, endpoint, key, sha, start, start.Add(time.Minute), path); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at)
+ VALUES(13,$1,30,$2,100,$3,'present',now(),now())`, id, path, sha); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hours.importSet = func(ctx context.Context) error {
+		plan, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+		if err != nil {
+			return err
+		}
+		defer plan.Rollback(context.Background())
+		set, err := PlanDurhamStitchHoldSet(ctx, plan, []int64{1}, "stoarama", endpoint, 2)
+		if err != nil || len(set.Hours) != 2 {
+			return fmt.Errorf("extra Durham hours not planned: %w", err)
+		}
+		tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(context.Background())
+		if _, err = ImportDurhamStitchHoldSet(ctx, tx, set); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+	return hours
+}
+
+// testStitchCertKeyContention holds the certificate open at its clip row
+// lock, after it owns the epoch and the hour's input keys. Unrelated RAW keys
+// and a multi-hour import proceed meanwhile; a same-key reservation waits and
+// then sees every input released.
+func testStitchCertKeyContention(t *testing.T, pool *pgxpool.Pool, post func() int, clipID int64, inputKey, freeKey string, extra durhamExtraHours) int {
+	t.Helper()
+	ctx := context.Background()
+	// A running RAW batch owns the executors' outer lock throughout.
+	defer holdSessionLock(t, pool, "7343226011173")()
+	// Another RAW key and row stay locked across the whole certificate.
+	other, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Rollback(ctx)
+	if _, err = other.Exec(ctx, `SELECT lock_nas_r2_copy_key('stoarama',$1)`, freeKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = other.Exec(ctx, `SELECT 1 FROM recording_clips WHERE object_key=$1 FOR UPDATE`, freeKey); err != nil {
+		t.Fatal(err)
+	}
+	clip, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clip.Rollback(ctx)
+	if _, err = clip.Exec(ctx, `SELECT 1 FROM recording_clips WHERE id=$1 FOR UPDATE`, clipID); err != nil {
+		t.Fatal(err)
+	}
+	code := make(chan int, 1)
+	go func() { code <- post() }()
+	cert := blockedBy(t, pool, backendPID(t, clip), "certificate at its clip row")
+	if _, err = pool.Exec(ctx, `SELECT 1 FROM r2_inverse_ke_epoch FOR UPDATE NOWAIT`); err == nil || !strings.Contains(err.Error(), "could not obtain lock") {
+		t.Fatalf("catalog epoch changed under an open certificate: %v", err)
+	}
+
+	for _, wire := range []bool{false, true} {
+		unrelated := make(chan error, 1)
+		go func() {
+			tx, err := rawRetirementKey(ctx, pool, extra.keys[0], wire)
+			if err == nil {
+				tx.Rollback(ctx)
+			}
+			unrelated <- err
+		}()
+		if err = within(t, unrelated, "unrelated RAW key"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The import's hold waits only for an in-flight same-key reservation.
+	if _, err = pool.Exec(ctx, `UPDATE nas_stitch_r2_control SET enabled=false`); err != nil {
+		t.Fatal(err)
+	}
+	race, err := rawRetirementKey(ctx, pool, extra.keys[1], false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imported := make(chan error, 1)
+	go func() { imported <- extra.importSet(ctx) }()
+	blockedBy(t, pool, backendPID(t, race), "import behind a same-key reservation")
+	race.Rollback(ctx)
+	if err = within(t, imported, "multi-hour import beside an open certificate"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE nas_stitch_r2_control SET enabled=true`); err != nil {
+		t.Fatal(err)
+	}
+
+	type reservation struct {
+		tx  pgx.Tx
+		err error
+	}
+	same := make(chan reservation, 1)
+	go func() {
+		tx, err := rawRetirementKey(ctx, pool, inputKey, false)
+		same <- reservation{tx, err}
+	}()
+	blockedBy(t, pool, cert, "same-key reservation")
+	if err = clip.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := within(t, code, "certificate")
+	reserved := within(t, same, "same-key reservation after the certificate")
+	if got == http.StatusOK && reserved.err != nil {
+		t.Fatalf("same-key reservation saw partly released coverage: %v", reserved.err)
+	}
+	if reserved.tx != nil {
+		reserved.tx.Rollback(ctx)
+	}
+	return got
+}
+
+func stitchStageGuard(objectID int64) string {
+	return fmt.Sprintf("hashtextextended('%d',7343226011222)", objectID)
+}
+
+func holdSessionLock(t *testing.T, pool *pgxpool.Pool, key string) func() {
+	t.Helper()
+	conn, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(context.Background(), `SELECT pg_advisory_lock(`+key+`)`); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		conn.Exec(context.Background(), `SELECT pg_advisory_unlock(`+key+`)`)
+		conn.Release()
+	}
+}

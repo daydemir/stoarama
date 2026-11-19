@@ -655,6 +655,155 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatalf("send gate: err %v deletes %d intents %d attempts %d", err, store.calls-before, intents, attempts)
 		}
 	})
+	t.Run("stitch_hold_admission_conflicts_only_on_its_key", func(t *testing.T) {
+		// Another executor's outer lock never fences stitch hold admission.
+		batch, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer batch.Release()
+		if _, err = batch.Exec(ctx, `SELECT pg_advisory_lock($1)`, r2RetireAdvisoryLockKey); err != nil {
+			t.Fatal(err)
+		}
+		defer batch.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, r2RetireAdvisoryLockKey)
+		a, entries := build(5)
+		defer a.ledger.close()
+		held, free, attempted, wired, other := entries[0], entries[1], entries[2], entries[3], entries[4]
+		var hourID int64
+		exec(`INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until) VALUES(70,3,'2026-06-01','2026-06-02','key locks',now()+interval '1 day')`)
+		if err = pool.QueryRow(ctx, `INSERT INTO nas_stitch_r2_hours(scope_id,recording_id,hour_at,plan,plan_sha256,input_bytes) VALUES(70,30,'2026-06-01','{}',repeat('f',64),100) RETURNING id`).Scan(&hourID); err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at)
+ SELECT 13,id,30,display_path,100,repeat('b',64),'present',now(),now() FROM recording_clips WHERE object_key=$1`, e.Key)
+		}
+		admit := func(ctx context.Context, tx pgx.Tx, e inverseEntry) error {
+			_, err := tx.Exec(ctx, `INSERT INTO nas_stitch_r2_input_holds(hour_id,bucket,object_key,catalog_clip_id,sha256,size_bytes,etag)
+ SELECT $1,bucket,object_key,id,repeat('b',64),100,etag FROM recording_clips WHERE object_key=$2`, hourID, e.Key)
+			return err
+		}
+		admitAlone := func(e inverseEntry) error {
+			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if err = admit(ctx, tx, e); err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		}
+		// Executors older than any Go-side key lock only write the ledgers.
+		stale := []string{
+			`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
+ SELECT 'raw',id,bucket,object_key,100,repeat('b',64),repeat('a',64) FROM recording_clips WHERE object_key=$1`,
+			`INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256)
+ SELECT 'raw',id,3,bucket,object_key,100,repeat('b',64),'outside_keep28_no_nas_copy','none',repeat('a',64),repeat('a',64) FROM recording_clips WHERE object_key=$1`,
+		}
+		prompt := func() (context.Context, context.CancelFunc) { return context.WithTimeout(ctx, 5*time.Second) }
+
+		// A committed reservation and pre-wire attempt veto later admission.
+		if _, err = a.reserve(ctx, attempted); err != nil {
+			t.Fatal(err)
+		}
+		wire, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The attempt commits on a second connection while this wire owns the
+		// copy key; a ledger trigger that waited for that key would hang here.
+		waitless, cancel := prompt()
+		if _, err = a.authorize(waitless, wire, attempted, &inverseSendGate{}); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		wire.Rollback(ctx)
+		if err = admitAlone(attempted); err == nil || !strings.Contains(err.Error(), "already has R2 retirement history") {
+			t.Fatalf("committed pre-wire attempt did not veto hold admission: %v", err)
+		}
+
+		// An open RAW wire owns its key and row; admission elsewhere never waits.
+		if _, err = a.reserve(ctx, wired); err != nil {
+			t.Fatal(err)
+		}
+		wire, err = pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = a.prepareWireTarget(ctx, wire, wired); err != nil {
+			t.Fatal(err)
+		}
+		importing, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer importing.Rollback(ctx)
+		waitless, cancel = prompt()
+		if err = admit(waitless, importing, other); err != nil {
+			t.Fatalf("hold admission waited on an unrelated open wire: %v", err)
+		}
+		cancel()
+		if err = importing.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err = admitAlone(wired); err == nil || !strings.Contains(err.Error(), "already has R2 retirement history") {
+			t.Fatalf("hold admitted a key with an open wire: %v", err)
+		}
+		wire.Rollback(ctx)
+
+		// An open import fences only its own key.
+		importing, err = pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer importing.Rollback(ctx)
+		if err = admit(ctx, importing, held); err != nil {
+			t.Fatal(err)
+		}
+		before := store.calls
+		waitless, cancel = prompt()
+		if ok, err := a.delete(waitless, waitless, &inverseSendGate{}, free); !ok || err != nil || store.calls-before != 1 {
+			t.Fatalf("unrelated RAW reserve and wire waited on an open import: %v %v", ok, err)
+		}
+		cancel()
+		waitless, cancel = prompt()
+		for _, query := range stale {
+			if _, err = pool.Exec(waitless, query, held.Key); err == nil || !strings.Contains(err.Error(), "hold admission is busy") {
+				t.Fatalf("stale ledger INSERT crossed an open import: %v", err)
+			}
+		}
+		cancel()
+		// Same-key RAW waits on the held clip row, then sees the committed hold.
+		var importPID uint32
+		if err = importing.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&importPID); err != nil {
+			t.Fatal(err)
+		}
+		reserved := make(chan error, 1)
+		go func() { _, err := a.reserve(ctx, held); reserved <- err }()
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+			var waiting bool
+			if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))`, importPID).Scan(&waiting); err != nil || time.Now().After(deadline) {
+				t.Fatalf("same-key RAW reserve did not wait for the open import: %v", err)
+			}
+			if waiting {
+				break
+			}
+		}
+		if err = importing.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err = <-reserved; err == nil || !strings.Contains(err.Error(), "live key protection veto") {
+			t.Fatalf("RAW reserved a committed hold: %v", err)
+		}
+		for _, query := range stale {
+			if _, err = pool.Exec(ctx, query, held.Key); err == nil || !strings.Contains(err.Error(), "active R2 stitch input hold") {
+				t.Fatalf("stale ledger INSERT crossed a committed hold: %v", err)
+			}
+		}
+	})
 	t.Run("send_gate_closed_after_authorize_stops_the_first_write", func(t *testing.T) {
 		// The gate closes while this DELETE is past every check and dialing:
 		// its first request byte is refused, so nothing reaches the provider.

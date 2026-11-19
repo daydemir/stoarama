@@ -32,15 +32,23 @@ type DurhamStitchInput struct {
 	Size   int64  `json:"size_bytes"`
 }
 
+// One import holds one advisory lock per input until commit. This bound keeps
+// it well inside PostgreSQL's shared lock table; plan larger sets in parts.
+const durhamStitchMaxImportInputs = 4000
+
 func ImportDurhamStitchHoldSet(ctx context.Context, tx pgx.Tx, set DurhamStitchHoldSet) (int, error) {
-	if set.Bucket == "" || !stitchSHA(set.EndpointSHA) || len(set.Hours) < 1 || len(set.Hours) > 20000 {
+	inputs := 0
+	for _, hour := range set.Hours {
+		inputs += len(hour.Inputs)
+	}
+	if set.Bucket == "" || !stitchSHA(set.EndpointSHA) || len(set.Hours) < 1 || inputs > durhamStitchMaxImportInputs {
 		return 0, errors.New("bounded exact Durham hold set required")
 	}
-	for _, lock := range []int64{7343226011173, 7343226011189} {
-		var owns bool
-		if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1)`, lock).Scan(&owns); err != nil || !owns {
-			return 0, errors.New("retirement or another stitch import is active")
-		}
+	// Each hold keeps its own key lock until commit. Imports serialize on 1189;
+	// retirement of other keys proceeds.
+	var owns bool
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(7343226011189)`).Scan(&owns); err != nil || !owns {
+		return 0, errors.New("another stitch import is active")
 	}
 	var safe bool
 	if err := tx.QueryRow(ctx, `SELECT NOT c.enabled AND EXISTS(SELECT 1 FROM r2_retirement_writer_fences f
