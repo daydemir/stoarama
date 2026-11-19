@@ -48272,7 +48272,7 @@ STITCH_STREAMED_FRAME_FORMATS = frozenset({
 
 
 def stitch_audit_frames(ffmpeg, source, target, pixel_format, deadline, stop, *, confirm_source_rejection=False):
-    if stop.kind is StitchRunKind.PRODUCTION and pixel_format in STITCH_STREAMED_FRAME_FORMATS:
+    if stop.kind in (StitchRunKind.PRODUCTION, StitchRunKind.DURHAM_R2) and pixel_format in STITCH_STREAMED_FRAME_FORMATS:
         stitch_stream_frames(ffmpeg, source, target, deadline, stop, confirm_source_rejection=confirm_source_rejection)
     else:
         stitch_frames(ffmpeg, source, target, deadline, stop)
@@ -48624,7 +48624,7 @@ def stitch_repair_annexb(nals, drop_vcl=0, upto=None):
 
 def stitch_repair_local(clip, directory, stage_file, tools, deadline, stop):
     """Labeled partial recovery, always excluded from raw retirement/V85 joins."""
-    if clip["size_bytes"] > 16 * 1024 * 1024:
+    if getattr(stop, "kind", None) is StitchRunKind.DURHAM_R2 or clip["size_bytes"] > 16 * 1024 * 1024:
         return None
     with CleanupFile(directory.cfg, clip, stop, deadline) as current:
         with os.fdopen(current.files[0][1], "rb", closefd=False) as source:
@@ -48832,21 +48832,18 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                          seam_decode=True, packet_chain=True, native_audit=True, original_sources_no_audio=True,
                          readback_sha256=sha, fsynced=True)
             for clip, source in zip(run_clips, sources):
-                # Fresh input hash and exact physical sidecar proof after all
-                # child reads; a changed source invalidates the entire run.
-                with CleanupFile(cfg, clip, stop, deadline) as current:
-                    raw_proof = current.proof()
-                proof["inputs"].append(dict(clip_id=clip["source_id"], sha256=clip["sha256"], size_bytes=clip["size_bytes"],
-                                             packet_chain_sha256=source["chain"], packets=source["count"], frames=source["count"],
-                                             repaired=False,
-                                             # Owner rule: keep28 raw on the NAS is never deleted because of
-                                             # stitching. Production therefore always reports every input as
-                                             # retirement-held, so readiness always ends
-                                             # completed_no_retirement and the single lane is never left busy by
-                                             # an undeleted cleanup plan. The isolated proof lane is not the
-                                             # stitch lane and keeps its seam-derived value.
-                                             retirement_held=True if kind is not StitchRunKind.PROOF else clip["source_id"] in held,
-                                             raw_proof=raw_proof))
+                evidence = dict(clip_id=clip["source_id"], sha256=clip["sha256"], size_bytes=clip["size_bytes"],
+                                packet_chain_sha256=source["chain"], packets=source["count"], frames=source["count"],
+                                repaired=False,
+                                retirement_held=kind is not StitchRunKind.PROOF or clip["source_id"] in held)
+                # Durham attests the verified bytes in private local scratch.
+                # Connection 13 supplies NAS custody separately after pulling.
+                if kind is StitchRunKind.DURHAM_R2:
+                    stitch_hash(cfg, clip["relative_path"], clip["size_bytes"], clip["sha256"], stop)
+                else:
+                    with CleanupFile(cfg, clip, stop, deadline) as current:
+                        evidence["raw_proof"] = current.proof()
+                proof["inputs"].append(evidence)
             if kind is StitchRunKind.PROOF:
                 proof["media_seconds"] = float(cumulative)
                 directory.publish(output.name, name)
@@ -48881,8 +48878,10 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                 if cleanup_identity(os.fstat(fd)) != cleanup_identity(info):
                     raise MediaCertificationResourceError("source identity changed before native audit")
                 path = Path("/proc/%d/fd/%d" % (os.getpid(), fd))
-            _, scinfo = confined_regular_file(cfg.output_dir, clip["relative_path"] + ".stoarama.json")
-            clip.update(frozen_identity=cleanup_identity(info), frozen_sidecar_identity=cleanup_identity(scinfo), _path=path)
+            if kind is not StitchRunKind.DURHAM_R2:
+                _, scinfo = confined_regular_file(cfg.output_dir, clip["relative_path"] + ".stoarama.json")
+                clip.update(frozen_identity=cleanup_identity(info), frozen_sidecar_identity=cleanup_identity(scinfo))
+            clip["_path"] = path
             if not plan["eligible"][index] or (admitted is not None and not admitted(clip)):
                 if kind is StitchRunKind.PROOF:
                     raise StitchHold("proof source is ineligible")

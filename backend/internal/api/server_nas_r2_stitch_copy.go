@@ -47,6 +47,11 @@ func loadNASR2StagedObject(ctx context.Context, tx pgx.Tx, item NASR2CopyItem) (
 	return o, err
 }
 
+func nasR2StitchResultSHA(req nasR2CopyControl) string {
+	body, _ := json.Marshal(req)
+	return cleanupSHA(body)
+}
+
 func finishNASR2StitchCopy(ctx context.Context, tx pgx.Tx, task nasR2CopyTask, req nasR2CopyControl) error {
 	receipt := req.StitchReceipt
 	if receipt == nil || !receipt.Fsynced || receipt.RelativePath != task.Item.RelativePath ||
@@ -67,9 +72,9 @@ func finishNASR2StitchCopy(ctx context.Context, tx pgx.Tx, task nasR2CopyTask, r
 	}
 	body, _ := json.Marshal(receipt)
 	tag, err := tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',verified_at=clock_timestamp(),
- lease_token=NULL,lease_expires_at=NULL,completion=$2,committed_bytes=$3,stitch_receipt=$4,updated_at=clock_timestamp()
+ lease_token=NULL,lease_expires_at=NULL,completion=$2,committed_bytes=$3,stitch_receipt=$4,stitch_result_sha256=$6,updated_at=clock_timestamp()
  WHERE id=$1 AND kind='stitch_output' AND manifest_sha256=$5 AND lease_expires_at>clock_timestamp()`,
-		task.ID, req.Completion, req.CommittedBytes, string(body), staged.manifest)
+		task.ID, req.Completion, req.CommittedBytes, string(body), staged.manifest, nasR2StitchResultSHA(req))
 	if err != nil || tag.RowsAffected() != 1 {
 		return errors.New("stitch copy lease or manifest changed")
 	}

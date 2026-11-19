@@ -121,9 +121,6 @@ def fetch_clip(http, cfg, task, clip):
             connection.close()
     if pull.stitch_proof_digest(path, http.stop) != expected:
         raise DurhamError("cached Durham source size or SHA-256 differs")
-    write_json(Path(str(path) + ".stoarama.json"), dict(schema_version=1, clip_id=clip["source_id"],
-        recording_id=clip["recording_id"], relative_path=relative, size_bytes=expected[0], sha256=expected[1],
-        clip_start_at=clip["start_at"], clip_end_at=clip["end_at"]))
 
 
 def upload_output(http, task, cfg, result):
@@ -177,9 +174,6 @@ def process_task(http, task, root, state, inventory, tools):
         for clip in clips:
             fetch_clip(http, cfg, task, clip)
         result = pull.stitch_build(cfg, inventory, task, http.stop, tools, kind=pull.StitchRunKind.DURHAM_R2)
-        for output in result["outputs"]:
-            for source in output["inputs"]:
-                source.pop("raw_proof")
         write_json(result_file, result)
     if (result["outputs"] and not result["left_out"] and not result["repairs"] and not result["error"]
             and all(seam["decision"] != "hold" for seam in result["seams"])):

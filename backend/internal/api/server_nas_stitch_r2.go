@@ -22,35 +22,15 @@ const nasDurhamParallelHours = 4
 const nasDurhamClaimSQL = `
 SELECT h.id,h.attempt,h.plan,h.plan_sha256
  FROM nas_stitch_r2_hours h JOIN nas_stitch_scopes s ON s.id=h.scope_id
- JOIN LATERAL (
-  SELECT count(*) AS clips,COALESCE(sum(x.size_bytes),0) AS bytes
-  FROM (
-   SELECT DISTINCT ON (i.bucket,i.object_key) i.bucket,i.object_key,i.size_bytes
-    FROM nas_stitch_r2_input_holds i
-    WHERE i.hour_id=h.id AND i.released_at IS NULL
-      AND NOT EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds other
-       WHERE other.bucket=i.bucket AND other.object_key=i.object_key AND other.released_at IS NULL AND other.hour_id<>h.id)
-    ORDER BY i.bucket,i.object_key,i.catalog_clip_id
-  ) x
- ) rank ON true
- WHERE (h.state='pending' OR (h.state='leased' AND h.lease_expires_at<=clock_timestamp()))
+ WHERE h.state IN ('pending','leased')
+  AND (h.state='pending' OR (h.lease_expires_at<=clock_timestamp()
+   AND NOT EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects o
+    WHERE o.hour_id=h.id AND o.attempt=h.attempt AND o.state<>'aborted')))
   AND NOT s.paused AND s.approved_until>clock_timestamp()
   AND NOT EXISTS(SELECT 1 FROM nas_cleanup_frozen_streams f WHERE f.stream_id=s.stream_id)
   AND jsonb_array_length(h.plan->'clips') BETWEEN 1 AND 200
-  AND jsonb_array_length(h.plan->'clips') = (SELECT count(*) FROM nas_stitch_r2_input_holds i WHERE i.hour_id=h.id AND i.released_at IS NULL)
-  AND NOT EXISTS (
-    SELECT 1 FROM jsonb_array_elements(h.plan->'clips') p
-    WHERE NOT EXISTS (
-      SELECT 1 FROM nas_stitch_r2_input_holds i
-       JOIN recording_clips c ON c.id=i.catalog_clip_id AND c.bucket=i.bucket AND c.object_key=i.object_key
-       JOIN nas_inventory_files f ON f.connection_id=13 AND f.clip_id=c.id AND f.state='present'
-       WHERE i.hour_id=h.id AND i.catalog_clip_id=(p->>'source_id')::bigint
-        AND c.purged_at IS NULL AND c.etag=i.etag AND c.sha256=i.sha256 AND c.size_bytes=i.size_bytes
-        AND f.relative_path=c.display_path AND f.size_bytes=i.size_bytes AND f.sha256=i.sha256
-        AND i.sha256=p->>'sha256' AND i.size_bytes=(p->>'size_bytes')::bigint AND i.released_at IS NULL
-    )
-  )
- ORDER BY rank.bytes DESC,h.hour_at,h.id LIMIT 1 FOR UPDATE OF h FOR SHARE OF s`
+  AND nas_stitch_r2_has_exact_input_set(h.id)
+ ORDER BY h.input_bytes DESC,h.hour_at,h.id LIMIT 1 FOR UPDATE OF h FOR SHARE OF s`
 
 func (s *Server) handleDurhamStitchLease(w http.ResponseWriter, r *http.Request, caller nasStitchCaller) {
 	ctx, cancel := cleanupExecutionContext(r.Context())
@@ -61,6 +41,10 @@ func (s *Server) handleDurhamStitchLease(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasStitchFence); err != nil {
+		util.WriteError(w, 503, "Durham stitch lane unavailable")
+		return
+	}
 	var enabled bool
 	if err := tx.QueryRow(ctx, `SELECT enabled FROM nas_stitch_r2_control WHERE singleton FOR SHARE`).Scan(&enabled); err != nil {
 		util.WriteError(w, 503, "Durham stitch control unavailable")
@@ -69,10 +53,6 @@ func (s *Server) handleDurhamStitchLease(w http.ResponseWriter, r *http.Request,
 	noTask := map[string]any{"task": nil, "retry_after_sec": 60}
 	if !enabled {
 		util.WriteJSON(w, 200, noTask)
-		return
-	}
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasStitchFence); err != nil {
-		util.WriteError(w, 503, "Durham stitch lane unavailable")
 		return
 	}
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
@@ -237,10 +217,11 @@ func (s *Server) durhamStitchCheckpoint(ctx context.Context, caller nasStitchCal
 	case durhamStitchContinue:
 		return map[string]bool{"continue": true}, tx.Commit(ctx)
 	case durhamStitchRelease:
-		_, err = tx.Exec(ctx, `UPDATE nas_stitch_r2_hours SET state='pending',lease_api_key_id=NULL,
- lease_expires_at=NULL,lease_token=NULL WHERE id=$1`, lease.HourID)
-		if err != nil {
-			return nil, err
+		tag, err := tx.Exec(ctx, `UPDATE nas_stitch_r2_hours SET state='pending',lease_api_key_id=NULL,
+ lease_expires_at=NULL,lease_token=NULL WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects
+  WHERE hour_id=$1 AND attempt=$2 AND state<>'aborted')`, lease.HourID, lease.Attempt)
+		if err != nil || tag.RowsAffected() != 1 {
+			return nil, errors.New("staging exists for the Durham attempt")
 		}
 		return map[string]bool{"released": true}, tx.Commit(ctx)
 	case durhamStitchInput:

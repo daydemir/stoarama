@@ -12,23 +12,32 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/api"
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/jackc/pgx/v5"
 )
 
 func runNASStitch(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) == 0 {
-		log.Fatal("usage: nas-stitch status|proof-plan|verify-proof|approve|pause|import-corpus|backlog|mint-durham-key|import-durham|retire-durham-stage")
+		log.Fatal("usage: nas-stitch status|proof-plan|verify-proof|approve|pause|import-corpus|backlog|mint-durham-key|plan-durham|import-durham|control-durham|retire-durham-stage")
 	}
 	switch args[0] {
 	case "mint-durham-key":
 		runMintDurhamStitchKey(ctx, cfg, args[1:])
 		return
+	case "plan-durham":
+		runDurhamHoldPlan(ctx, cfg, args[1:])
+		return
 	case "import-durham":
 		runDurhamHoldImport(ctx, cfg, args[1:])
+		return
+	case "control-durham":
+		runDurhamQueueControl(ctx, cfg, args[1:])
 		return
 	case "retire-durham-stage":
 		runDurhamStageRetirement(ctx, cfg, args[1:])
@@ -190,4 +199,84 @@ func runDurhamHoldImport(ctx context.Context, cfg config.Config, args []string) 
 		log.Fatal(err)
 	}
 	printJSON(map[string]any{"hours": len(manifest.Hours), "holds": holds, "manifest_sha256": *expected})
+}
+
+func runDurhamQueueControl(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("nas-stitch control-durham", flag.ExitOnError)
+	enable := fs.Bool("enable", false, "admit R2-backed Durham stitch attempts")
+	pause := fs.Bool("pause", false, "stop new grants and lease admission")
+	maxBytes := fs.Int64("max-staging-bytes", 0, "controller-approved peak staging reservation")
+	fs.Parse(args)
+	if fs.NArg() != 0 || *enable == *pause || (*enable && *maxBytes <= 0) || (*pause && *maxBytes != 0) {
+		log.Fatal("choose --pause or --enable with an approved --max-staging-bytes")
+	}
+	pool, err := r2RetireOpenPool(ctx, cfg, false)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
+	tag, err := pool.Exec(ctx, `UPDATE nas_stitch_r2_control SET enabled=$1,
+ max_staging_bytes=CASE WHEN $1 THEN $2 ELSE max_staging_bytes END
+ WHERE singleton AND (NOT $1 OR EXISTS(
+   SELECT 1 FROM nas_stitch_r2_input_holds WHERE released_at IS NULL))`, *enable, *maxBytes)
+	if err != nil || tag.RowsAffected() != 1 {
+		log.Fatal("Durham control unavailable or no reviewed input holds")
+	}
+	printJSON(map[string]any{"enabled": *enable})
+}
+
+func runDurhamHoldPlan(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("nas-stitch plan-durham", flag.ExitOnError)
+	scopeText := fs.String("scope-ids", "", "comma-separated approved scope IDs")
+	limit := fs.Int("max-hours", 1, "maximum whole R2-backed hours to plan")
+	out := fs.String("out", "", "new private hold manifest file")
+	fs.Parse(args)
+	if fs.NArg() != 0 || *out == "" {
+		log.Fatal("approved scope IDs and a new output manifest are required")
+	}
+	var scopes []int64
+	for _, value := range strings.Split(*scopeText, ",") {
+		id, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if err != nil || id <= 0 {
+			log.Fatal("scope IDs must be positive integers")
+		}
+		scopes = append(scopes, id)
+	}
+	pool, err := r2RetireOpenPool(ctx, cfg, true)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	manifest, err := api.PlanDurhamStitchHoldSet(ctx, tx, scopes, cfg.R2Bucket, cfg.R2Endpoint, *limit)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Fatal(err)
+	}
+	if len(manifest.Hours) == 0 {
+		log.Fatal("no whole R2-backed hours in the selected scopes")
+	}
+	file, err := os.OpenFile(*out, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		log.Fatal(err)
+	}
+	digest := sha256.New()
+	if err := json.NewEncoder(io.MultiWriter(file, digest)).Encode(manifest); err != nil {
+		file.Close()
+		log.Fatal(err)
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		log.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		log.Fatal(err)
+	}
+	printJSON(map[string]any{"hours": len(manifest.Hours), "manifest_sha256": hex.EncodeToString(digest.Sum(nil))})
 }

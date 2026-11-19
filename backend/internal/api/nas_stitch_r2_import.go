@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -33,14 +32,6 @@ type DurhamStitchInput struct {
 	Size   int64  `json:"size_bytes"`
 }
 
-type durhamInputRow struct {
-	purged                                     bool
-	id                                         int64
-	bucket, key, endpoint, etag, sha, relative string
-	size                                       int64
-	start, end                                 time.Time
-}
-
 func ImportDurhamStitchHoldSet(ctx context.Context, tx pgx.Tx, set DurhamStitchHoldSet) (int, error) {
 	if set.Bucket == "" || !stitchSHA(set.EndpointSHA) || len(set.Hours) < 1 || len(set.Hours) > 20000 {
 		return 0, errors.New("bounded exact Durham hold set required")
@@ -65,17 +56,9 @@ func ImportDurhamStitchHoldSet(ctx context.Context, tx pgx.Tx, set DurhamStitchH
 	count := 0
 	for n, hour := range set.Hours {
 		var plan nasStitchPlan
-		if json.Unmarshal(hour.Plan, &plan) != nil || len(plan.Clips) < 1 || len(plan.Clips) > nasStitchMaxClips ||
-			len(hour.Inputs) != len(plan.Clips) || len(plan.FeatureInputs) != len(plan.Clips) ||
-			len(plan.Eligible) != len(plan.Clips) || len(plan.Joins) != len(plan.Clips)-1 || len(plan.Frozen) != len(plan.Joins) ||
-			hour.ScopeID <= 0 || hour.Hour.IsZero() || !hour.Hour.Equal(hour.Hour.Truncate(time.Hour)) ||
-			plan.Policy != nasStitchPolicy || plan.Revision != nasStitchRevision || plan.CorpusSHA != nasStitchCorpusSHA || plan.KeepSHA != cleanupPolicySHA {
+		if json.Unmarshal(hour.Plan, &plan) != nil || len(hour.Inputs) < 1 || len(hour.Inputs) > nasStitchMaxClips ||
+			hour.ScopeID <= 0 || hour.Hour.IsZero() || !hour.Hour.Equal(hour.Hour.Truncate(time.Hour)) {
 			return 0, fmt.Errorf("invalid Durham plan at ordinal %d", n)
-		}
-		expectedFolder := strings.Split(plan.Clips[0].RelativePath, "/")[0] + "_V85r_keep28/" +
-			strconv.FormatInt(plan.RecordingID, 10) + "/" + hour.Hour.UTC().Format("2006-01-02T15-04-05Z")
-		if !validCleanupPath(expectedFolder) || plan.OutputFolder != expectedFolder {
-			return 0, fmt.Errorf("invalid Durham output namespace at ordinal %d", n)
 		}
 		keep, ok := policy.Streams[plan.StreamID]
 		if !ok {
@@ -86,50 +69,30 @@ func ImportDurhamStitchHoldSet(ctx context.Context, tx pgx.Tx, set DurhamStitchH
  JOIN recordings r ON r.stream_id=s.stream_id WHERE s.id=$1 AND s.stream_id=$2 AND r.id=$3 AND r.account_id=47
  AND NOT s.paused AND s.approved_until>clock_timestamp() FOR SHARE OF s`,
 			hour.ScopeID, plan.StreamID, plan.RecordingID).Scan(&start, &end)
-		if err != nil || start.Before(keep.start) || end.After(keep.end) {
-			return 0, fmt.Errorf("Durham scope unavailable at ordinal %d", n)
+		if err != nil || start.Before(keep.start) || end.After(keep.end) || hour.Hour.Before(start) || hour.Hour.Add(time.Hour).After(end) {
+			return 0, fmt.Errorf("Durham whole-hour scope unavailable at ordinal %d", n)
 		}
-		rows, err := tx.Query(ctx, `SELECT id,bucket,object_key,endpoint,etag,lower(sha256),size_bytes,display_path,clip_start_at,clip_end_at,purged_at IS NOT NULL
- FROM recording_clips WHERE recording_id=$1 AND clip_start_at>=$2 AND clip_start_at<$3
- AND clip_start_at>=$4 AND clip_end_at<=$5 ORDER BY clip_start_at,id LIMIT $6`,
-			plan.RecordingID, hour.Hour, hour.Hour.Add(time.Hour), start, end, nasStitchMaxClips+1)
+		frozen := nasStitchTask{Plan: nasStitchPlan{StreamID: plan.StreamID, RecordingID: plan.RecordingID}}
+		frozen, err = buildNASStitchPlan(ctx, tx, frozen, start, end, hour.Hour, set.Bucket, nasStitchOnDurham, true)
 		if err != nil {
 			return 0, err
 		}
-		catalog, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (durhamInputRow, error) {
-			var c durhamInputRow
-			err := row.Scan(&c.id, &c.bucket, &c.key, &c.endpoint, &c.etag, &c.sha, &c.size, &c.relative, &c.start, &c.end, &c.purged)
-			return c, err
-		})
-		if err != nil || len(catalog) != len(plan.Clips) {
-			return 0, fmt.Errorf("Durham hour has incomplete catalog coverage at ordinal %d", n)
+		body, err := json.Marshal(frozen.Plan)
+		if err != nil || !nasSpaceAuditJSONEqual(body, hour.Plan) || len(hour.Inputs) != len(frozen.Plan.Clips) {
+			return 0, fmt.Errorf("Durham plan differs from the canonical catalog plan at ordinal %d", n)
 		}
-		var bytes int64
-		for i, clip := range plan.Clips {
-			c, input, feature := catalog[i], hour.Inputs[i], plan.FeatureInputs[i]
-			if c.purged || c.id != clip.SourceID || c.id != input.ClipID || c.id != feature.ClipID || c.bucket != set.Bucket ||
-				cleanupSHA([]byte(strings.TrimRight(c.endpoint, "/"))) != set.EndpointSHA ||
-				c.key != input.Key || c.etag != input.ETag || c.sha != clip.SHA256 || c.sha != input.SHA ||
-				c.size != clip.SizeBytes || c.size != input.Size || c.relative != clip.RelativePath ||
-				clip.RecordingID != plan.RecordingID || feature.RecordingID != plan.RecordingID ||
-				feature.SHA256 != c.sha || feature.SizeBytes != c.size || !c.start.Equal(clip.StartAt) || !c.end.Equal(clip.EndAt) ||
-				!c.start.Equal(feature.StartUTC) || !c.end.Equal(feature.EndUTC) ||
-				!validCleanupPath(c.relative) || !c.end.After(c.start) || !stitchSHA(c.sha) ||
-				c.size <= 0 || c.size > nasStitchMaxBytes || !plan.Eligible[i] || feature.NominalSeconds <= 0 {
-				return 0, fmt.Errorf("Durham frozen input changed at hour %d clip %d", n, i)
+		var inputBytes int64
+		for i, clip := range frozen.Plan.Clips {
+			input := hour.Inputs[i]
+			inputBytes += clip.SizeBytes
+			if input.ClipID != clip.SourceID || input.Key != clip.ObjectKey || input.SHA != clip.SHA256 || input.Size != clip.SizeBytes ||
+				!strings.HasPrefix(input.Key, "managed/") || input.ETag == "" {
+				return 0, fmt.Errorf("Durham frozen input differs at hour %d clip %d", n, i)
 			}
-			bytes += c.size
 		}
-		if bytes > nasStitchMaxBytes {
-			return 0, fmt.Errorf("Durham hour exceeds bounded input size at ordinal %d", n)
-		}
-		if err := validateDurhamFrozenEdges(ctx, tx, plan); err != nil {
-			return 0, err
-		}
-		body, _ := json.Marshal(plan)
 		var id int64
-		if err := tx.QueryRow(ctx, `INSERT INTO nas_stitch_r2_hours(scope_id,recording_id,hour_at,plan,plan_sha256)
- VALUES($1,$2,$3,$4,$5) RETURNING id`, hour.ScopeID, plan.RecordingID, hour.Hour, string(body), cleanupSHA(body)).Scan(&id); err != nil {
+		if err := tx.QueryRow(ctx, `INSERT INTO nas_stitch_r2_hours(scope_id,recording_id,hour_at,plan,plan_sha256,input_bytes)
+ VALUES($1,$2,$3,$4,$5,$6) RETURNING id`, hour.ScopeID, plan.RecordingID, hour.Hour, string(body), cleanupSHA(body), inputBytes).Scan(&id); err != nil {
 			return 0, err
 		}
 		_, err = tx.CopyFrom(ctx, pgx.Identifier{"nas_stitch_r2_input_holds"},
@@ -141,42 +104,83 @@ func ImportDurhamStitchHoldSet(ctx context.Context, tx pgx.Tx, set DurhamStitchH
 		if err != nil {
 			return 0, err
 		}
+		var exact bool
+		if err := tx.QueryRow(ctx, `SELECT nas_stitch_r2_has_exact_input_set($1)`, id).Scan(&exact); err != nil || !exact {
+			return 0, fmt.Errorf("Durham hour has incomplete or changed R2 coverage at ordinal %d", n)
+		}
 		count += len(hour.Inputs)
 	}
 	return count, nil
 }
 
-func validateDurhamFrozenEdges(ctx context.Context, tx pgx.Tx, plan nasStitchPlan) error {
-	ids, hashes, sizes := make([]int64, 0, len(plan.Clips)), make([]string, 0, len(plan.Clips)), make([]int64, 0, len(plan.Clips))
-	for _, clip := range plan.Clips {
-		ids, hashes, sizes = append(ids, clip.SourceID), append(hashes, clip.SHA256), append(sizes, clip.SizeBytes)
+// PlanDurhamStitchHoldSet records a read-only snapshot for controller review.
+// Import revalidates the complete snapshot before publishing any holds.
+func PlanDurhamStitchHoldSet(ctx context.Context, tx pgx.Tx, scopes []int64, bucket, endpoint string, limit int) (DurhamStitchHoldSet, error) {
+	set := DurhamStitchHoldSet{Bucket: bucket, EndpointSHA: cleanupSHA([]byte(strings.TrimRight(endpoint, "/")))}
+	if len(scopes) == 0 || len(scopes) > 400 || bucket == "" || endpoint == "" || limit < 1 || limit > 20000 {
+		return set, errors.New("bounded selected Durham scopes required")
 	}
-	rows, err := tx.Query(ctx, `SELECT e.witness FROM generate_series(1,cardinality($1::bigint[])-1) g(n)
- LEFT JOIN nas_stitch_edges e ON e.left_id=($1::bigint[])[n] AND e.left_sha=($2::text[])[n] AND e.left_size=($3::bigint[])[n]
-  AND e.right_id=($1::bigint[])[n+1] AND e.right_sha=($2::text[])[n+1] AND e.right_size=($3::bigint[])[n+1] AND e.recording_id=$4
- ORDER BY n`, ids, hashes, sizes, plan.RecordingID)
+	rows, err := tx.Query(ctx, `WITH hours AS (
+ SELECT s.id AS scope,r.id AS recording,s.stream_id AS stream,s.start_at,s.end_at,
+  date_trunc('hour',c.clip_start_at,'UTC') AS hour,sum(c.size_bytes) AS bytes
+ FROM nas_stitch_scopes s JOIN recordings r ON r.stream_id=s.stream_id AND r.account_id=47
+ JOIN recording_clips c ON c.recording_id=r.id AND c.clip_start_at>=s.start_at AND c.clip_start_at<s.end_at
+ LEFT JOIN nas_inventory_files f ON f.connection_id=13 AND f.clip_id=c.id AND f.state='present'
+  AND f.size_bytes=c.size_bytes AND f.sha256=c.sha256 AND f.relative_path=c.display_path
+ WHERE s.id=ANY($1) AND NOT s.paused AND s.approved_until>clock_timestamp()
+  AND NOT EXISTS(SELECT 1 FROM nas_stitch_r2_hours h WHERE h.recording_id=r.id
+   AND h.hour_at=date_trunc('hour',c.clip_start_at,'UTC'))
+ GROUP BY s.id,r.id,6
+ HAVING date_trunc('hour',c.clip_start_at,'UTC')>=s.start_at
+  AND date_trunc('hour',c.clip_start_at,'UTC')+interval '1 hour'<=s.end_at
+  AND count(*) BETWEEN 1 AND 200 AND sum(c.size_bytes)<=2500000000
+  AND bool_and(c.clip_end_at<=date_trunc('hour',c.clip_start_at,'UTC')+interval '1 hour'
+   AND c.purged_at IS NULL AND c.bucket=$2 AND rtrim(c.endpoint,'/')=$3
+   AND c.object_key LIKE 'managed/%' AND c.etag<>'' AND c.size_bytes>0 AND f.clip_id IS NOT NULL)
+ ), chosen AS (
+ SELECT DISTINCT ON (h.recording,h.hour) h.* FROM hours h
+ WHERE NOT EXISTS(SELECT 1 FROM recording_clips c WHERE c.recording_id=h.recording
+  AND c.clip_start_at<h.hour AND c.clip_end_at>h.hour)
+ ORDER BY h.recording,h.hour,h.scope
+ )
+ SELECT scope,recording,stream,start_at,end_at,hour FROM chosen ORDER BY bytes DESC,hour,recording LIMIT $4`,
+		scopes, bucket, strings.TrimRight(endpoint, "/"), limit)
 	if err != nil {
-		return err
+		return set, err
 	}
-	defer rows.Close()
-	for n := 0; rows.Next(); n++ {
-		var frozen []byte
-		if err := rows.Scan(&frozen); err != nil {
-			return err
+	type slot struct {
+		scope, recording, stream int64
+		start, end, hour         time.Time
+	}
+	slots, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (slot, error) {
+		var value slot
+		err := row.Scan(&value.scope, &value.recording, &value.stream, &value.start, &value.end, &value.hour)
+		return value, err
+	})
+	if err != nil {
+		return set, err
+	}
+	for _, candidate := range slots {
+		task := nasStitchTask{Plan: nasStitchPlan{StreamID: candidate.stream, RecordingID: candidate.recording}}
+		task, err = buildNASStitchPlan(ctx, tx, task, candidate.start, candidate.end, candidate.hour, bucket, nasStitchOnDurham, false)
+		if err != nil {
+			return set, err
 		}
-		join := plan.Clips[n].EndAt.Equal(plan.Clips[n+1].StartAt)
-		if len(frozen) > 0 {
-			edge, err := parseNASStitchEdge(frozen)
-			if err != nil || !nasSpaceAuditJSONEqual(frozen, plan.Frozen[n]) {
-				return errors.New("Durham frozen witness differs")
+		var hour DurhamStitchHour
+		hour.ScopeID, hour.Hour = candidate.scope, candidate.hour.UTC()
+		hour.Plan, err = json.Marshal(task.Plan)
+		if err != nil {
+			return set, err
+		}
+		for _, clip := range task.Plan.Clips {
+			var etag string
+			if err := tx.QueryRow(ctx, `SELECT etag FROM recording_clips WHERE id=$1`, clip.SourceID).Scan(&etag); err != nil {
+				return set, err
 			}
-			join = join && edge.Nomination
-		} else if len(plan.Frozen[n]) > 0 && string(plan.Frozen[n]) != "null" {
-			return errors.New("Durham plan contains an unrecognized frozen witness")
+			hour.Inputs = append(hour.Inputs, DurhamStitchInput{ClipID: clip.SourceID, Key: clip.ObjectKey,
+				ETag: etag, SHA: clip.SHA256, Size: clip.SizeBytes})
 		}
-		if join != plan.Joins[n] {
-			return errors.New("Durham plan join metadata differs")
-		}
+		set.Hours = append(set.Hours, hour)
 	}
-	return rows.Err()
+	return set, nil
 }

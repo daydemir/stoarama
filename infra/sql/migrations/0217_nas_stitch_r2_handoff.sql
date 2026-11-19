@@ -8,6 +8,7 @@ CREATE TABLE nas_stitch_r2_hours (
  hour_at timestamptz NOT NULL CHECK(hour_at=date_trunc('hour',hour_at,'UTC')),
  plan jsonb NOT NULL CHECK(jsonb_typeof(plan)='object'),
  plan_sha256 text NOT NULL CHECK(plan_sha256 ~ '^[a-f0-9]{64}$'),
+ input_bytes bigint NOT NULL CHECK(input_bytes BETWEEN 1 AND 2500000000),
  state nas_stitch_r2_hour_state NOT NULL DEFAULT 'pending',
  attempt integer NOT NULL DEFAULT 0 CHECK(attempt>=0),
  lease_api_key_id bigint REFERENCES account_api_keys(id),
@@ -19,8 +20,11 @@ CREATE TABLE nas_stitch_r2_hours (
 );
 
 CREATE TRIGGER nas_stitch_r2_hour_plan_immutable
- BEFORE UPDATE OF scope_id,recording_id,hour_at,plan,plan_sha256 OR DELETE ON nas_stitch_r2_hours
+ BEFORE UPDATE OF scope_id,recording_id,hour_at,plan,plan_sha256,input_bytes OR DELETE ON nas_stitch_r2_hours
  FOR EACH ROW EXECUTE FUNCTION guard_nas_stitch_evidence();
+
+CREATE INDEX nas_stitch_r2_hour_queue_order ON nas_stitch_r2_hours(input_bytes DESC,hour_at,id)
+ WHERE state IN ('pending','leased');
 
 CREATE TABLE nas_stitch_r2_input_holds (
  hour_id bigint NOT NULL REFERENCES nas_stitch_r2_hours(id),
@@ -35,6 +39,41 @@ CREATE TABLE nas_stitch_r2_input_holds (
 );
 CREATE INDEX nas_stitch_r2_input_holds_live_key ON nas_stitch_r2_input_holds(bucket,object_key)
  WHERE released_at IS NULL;
+
+CREATE FUNCTION nas_stitch_r2_has_exact_input_set(hour_id bigint) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+ SELECT EXISTS (
+  SELECT 1 FROM nas_stitch_r2_hours h
+  JOIN nas_stitch_scopes s ON s.id=h.scope_id
+  JOIN recordings r ON r.id=h.recording_id AND r.stream_id=s.stream_id AND r.account_id=47
+  WHERE h.id=$1 AND h.hour_at>=s.start_at AND h.hour_at+interval '1 hour'<=s.end_at
+   AND NOT EXISTS(SELECT 1 FROM recording_clips c WHERE c.recording_id=h.recording_id
+    AND c.clip_start_at<h.hour_at AND c.clip_end_at>h.hour_at)
+   AND (SELECT count(*) FROM recording_clips c WHERE c.recording_id=h.recording_id
+    AND c.clip_start_at>=h.hour_at AND c.clip_start_at<h.hour_at+interval '1 hour')
+     = jsonb_array_length(h.plan->'clips')
+   AND EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds i WHERE i.hour_id=h.id AND i.released_at IS NULL
+    HAVING count(*)=jsonb_array_length(h.plan->'clips') AND sum(i.size_bytes)=h.input_bytes)
+   AND NOT EXISTS(
+    SELECT 1 FROM jsonb_array_elements(h.plan->'clips') p
+    WHERE NOT EXISTS(
+     SELECT 1 FROM nas_stitch_r2_input_holds i
+     JOIN recording_clips c ON c.id=i.catalog_clip_id AND c.bucket=i.bucket AND c.object_key=i.object_key
+     JOIN r2_retirement_writer_fences fence ON fence.bucket=c.bucket
+     JOIN nas_inventory_files f ON f.connection_id=13 AND f.clip_id=c.id AND f.state='present'
+     WHERE i.hour_id=h.id AND i.catalog_clip_id=(p->>'source_id')::bigint AND i.released_at IS NULL
+      AND c.recording_id=h.recording_id AND c.clip_start_at>=h.hour_at
+      AND c.clip_start_at<h.hour_at+interval '1 hour' AND c.clip_end_at<=h.hour_at+interval '1 hour'
+      AND c.clip_start_at=(p->>'start_at')::timestamptz AND c.clip_end_at=(p->>'end_at')::timestamptz
+      AND c.display_path=p->>'relative_path' AND c.purged_at IS NULL AND c.etag=i.etag
+      AND encode(sha256(convert_to(rtrim(c.endpoint,'/'),'UTF8')),'hex')=fence.endpoint_sha256
+      AND lower(c.sha256)=i.sha256 AND c.size_bytes=i.size_bytes
+      AND f.relative_path=c.display_path AND f.size_bytes=i.size_bytes AND lower(f.sha256)=i.sha256
+      AND i.sha256=p->>'sha256' AND i.size_bytes=(p->>'size_bytes')::bigint
+    )
+   )
+ )
+$$;
 
 CREATE TABLE nas_stitch_r2_certificates (
  hour_id bigint PRIMARY KEY REFERENCES nas_stitch_r2_hours(id),
@@ -200,6 +239,9 @@ CREATE FUNCTION add_nas_stitch_r2_certificate() RETURNS trigger LANGUAGE plpgsql
 DECLARE expected jsonb; covered boolean;
 BEGIN
  PERFORM pg_advisory_xact_lock(7343226011173);
+ IF NOT nas_stitch_r2_has_exact_input_set(NEW.hour_id) THEN
+  RAISE EXCEPTION 'NAS stitch input coverage changed';
+ END IF;
  SELECT jsonb_agg(jsonb_build_object('object_key',o.object_key,'etag',o.etag,'version_id',o.version_id,
     'last_modified',o.last_modified,'readback',q.stitch_receipt) ORDER BY o.id),
   bool_and(COALESCE(q.state='verified' AND q.stitch_receipt IS NOT NULL AND q.manifest_sha256=NEW.manifest_sha256,false))
@@ -249,15 +291,17 @@ CREATE TRIGGER nas_stitch_r2_part_immutable BEFORE UPDATE OR DELETE ON nas_stitc
 ALTER TABLE nas_r2_copy_items DROP CONSTRAINT nas_r2_copy_items_kind_check,
  ADD CHECK(kind IN ('raw','collated','stitch_output'));
 ALTER TABLE nas_r2_copy_items ADD COLUMN stitch_receipt jsonb CHECK(
- stitch_receipt IS NULL OR (kind='stitch_output' AND state='verified' AND jsonb_typeof(stitch_receipt)='object'));
+ stitch_receipt IS NULL OR (kind='stitch_output' AND state='verified' AND jsonb_typeof(stitch_receipt)='object')),
+ ADD COLUMN stitch_result_sha256 text CHECK(stitch_result_sha256 ~ '^[a-f0-9]{64}$');
 
 -- A server rollback may still authenticate the dedicated key. Once the R2
 -- phase is live it cannot use the old claim path to receive a NAS-local plan.
 CREATE FUNCTION guard_nas_stitch_r2_phase() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
  IF NEW.state='leased' AND NEW.lease_token IS DISTINCT FROM OLD.lease_token AND
-  EXISTS(SELECT 1 FROM nas_stitch_r2_control WHERE singleton AND enabled) AND
-  (NEW.lease_api_key_id IS NOT NULL OR EXISTS(SELECT 1 FROM nas_stitch_r2_hours WHERE state<>'certified')) THEN
+  ((NEW.lease_api_key_id IS NOT NULL AND NEW.lease_api_key_attempt=NEW.attempt)
+   OR EXISTS(SELECT 1 FROM nas_stitch_r2_hours h
+    WHERE h.state<>'certified' OR (h.recording_id=NEW.recording_id AND h.hour_at=NEW.hour_at))) THEN
   RAISE EXCEPTION 'Durham R2 phase excludes NAS-local claims';
  END IF;
  RETURN NEW;

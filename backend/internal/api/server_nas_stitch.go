@@ -515,6 +515,20 @@ func (s *Server) stitchPlanNext(ctx context.Context, tx pgx.Tx) (nasStitchTask, 
 	if err != nil {
 		return t, err
 	}
+	if s.r2 == nil {
+		return t, errors.New("recovery store unavailable")
+	}
+	t, err = buildNASStitchPlan(ctx, tx, t, start, end, hour, s.r2.Bucket(), nasStitchOnNAS, true)
+	if err != nil {
+		return t, err
+	}
+	raw, _ := json.Marshal(t.Plan)
+	t.PlanSHA = cleanupSHA(raw)
+	err = tx.QueryRow(ctx, `INSERT INTO nas_stitch_tasks(scope_id,recording_id,hour_at,plan,plan_sha256) VALUES($1,$2,$3,$4,$5) RETURNING id`, sid, t.Plan.RecordingID, hour, string(raw), t.PlanSHA).Scan(&t.ID)
+	return t, err
+}
+
+func buildNASStitchPlan(ctx context.Context, tx pgx.Tx, t nasStitchTask, start, end, hour time.Time, bucket string, origin nasStitchProofOrigin, lockCatalog bool) (nasStitchTask, error) {
 	policy, err := cleanupEmbeddedPolicy()
 	if err != nil {
 		return t, err
@@ -547,10 +561,7 @@ func (s *Server) stitchPlanNext(ctx context.Context, tx pgx.Tx) (nasStitchTask, 
 	}
 	var total int64
 	for _, id := range ids {
-		if s.r2 == nil {
-			return t, errors.New("recovery store unavailable")
-		}
-		item, err := cleanupCatalogItem(ctx, tx, "raw", id, s.r2.Bucket())
+		item, err := readCleanupCatalogItem(ctx, tx, "raw", id, bucket, lockCatalog)
 		if err != nil {
 			return t, err
 		}
@@ -563,7 +574,7 @@ func (s *Server) stitchPlanNext(ctx context.Context, tx pgx.Tx) (nasStitchTask, 
 		}
 		var feature collation.Clip
 		feature.ClipID, feature.RecordingID, feature.SHA256, feature.SizeBytes, feature.StartUTC, feature.EndUTC = item.SourceID, item.RecordingID, item.SHA256, item.SizeBytes, item.StartAt, item.EndAt
-		if err = tx.QueryRow(ctx, `SELECT coalesce(c.recording_job_id,0),coalesce(c.capture_attempt_id::text,''),coalesce(c.capture_lease_token::text,''),coalesce(c.capture_sequence,0),r.clip_duration_sec::float8 FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE c.id=$1`, id).Scan(&feature.JobID, &feature.CaptureAttemptID, &feature.CaptureLeaseToken, &feature.CaptureSequence, &feature.NominalSeconds); err != nil {
+		if err = tx.QueryRow(ctx, `SELECT coalesce(c.recording_job_id,0),coalesce(c.capture_attempt_id::text,''),CASE WHEN $2::boolean THEN coalesce(encode(sha256(convert_to(c.capture_lease_token::text,'UTF8')),'hex'),'') ELSE coalesce(c.capture_lease_token::text,'') END,coalesce(c.capture_sequence,0),r.clip_duration_sec::float8 FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE c.id=$1`, id, origin == nasStitchOnDurham).Scan(&feature.JobID, &feature.CaptureAttemptID, &feature.CaptureLeaseToken, &feature.CaptureSequence, &feature.NominalSeconds); err != nil {
 			return t, err
 		}
 		if feature.NominalSeconds <= 0 {
@@ -606,10 +617,7 @@ func (s *Server) stitchPlanNext(ctx context.Context, tx pgx.Tx) (nasStitchTask, 
 	// New versioned sibling tree; never replace raw or previous joined output.
 	first := strings.Split(t.Plan.Clips[0].RelativePath, "/")[0]
 	t.Plan.OutputFolder = first + "_V85r_keep28/" + strconv.FormatInt(t.Plan.RecordingID, 10) + "/" + hour.UTC().Format("2006-01-02T15-04-05Z")
-	raw, _ := json.Marshal(t.Plan)
-	t.PlanSHA = cleanupSHA(raw)
-	err = tx.QueryRow(ctx, `INSERT INTO nas_stitch_tasks(scope_id,recording_id,hour_at,plan,plan_sha256) VALUES($1,$2,$3,$4,$5) RETURNING id`, sid, t.Plan.RecordingID, hour, string(raw), t.PlanSHA).Scan(&t.ID)
-	return t, err
+	return t, nil
 }
 
 type nasStitchProofOrigin uint8

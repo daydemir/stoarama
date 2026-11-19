@@ -315,3 +315,62 @@ session gates, retirement refusal on replay, and cancellation of a live native c
 a lane acquisition.
 The stitch migration remains **0179_nas_v85r_stitch.sql**, with main's cleanup
 freeze migrations 0180/0181. Joined lifecycle fixtures apply them in order.
+
+## Durham R2 handoff
+
+Durham works only on reviewed whole-hour plans backed by R2 and exact raw
+custody on NAS connection 13. The read-only planner emits a private manifest
+and prints its SHA-256. Review that manifest before import. Import with the
+queue paused, under retirement lock `7343226011173`. It recomputes the frozen
+plan, verifies every catalog identity, and atomically adds
+`public.nas_stitch_r2_input_holds` and the corresponding hour rows.
+
+```sh
+stoaramactl nas-stitch plan-durham --scope-ids IDS --max-hours N --out HOLD.json
+stoaramactl nas-stitch import-durham --input HOLD.json --sha256 SHA
+stoaramactl nas-stitch control-durham --enable --max-staging-bytes BYTES
+stoaramactl nas-stitch control-durham --pause
+```
+
+Four Durham workers claim distinct hours, preferring distinct R2 bytes that
+the hour can release. The worker connects directly to the Stoarama API and
+the configured R2 origin over TLS. It receives exact GET and multipart-part
+capabilities for its own lease. Stoarama creates and completes uploads only
+for the unique `stitch-staging/<generation>/<sha256>.mp4` key. The private
+attempt and part journals survive a worker restart within the lease.
+Ambiguous multipart start or completion keeps the ledger and stage budget
+reserved for controller reconciliation. Keep unknown multipart uploads gated.
+
+On the NAS, connection 13 opts into staged output with
+`STOARAMA_R2_COPY_STITCH_OUTPUT_ENABLED=true` in the existing copy service.
+It downloads to a private partial, verifies the size and full SHA-256,
+publishes create-only, syncs the file and directory, then reopens and hashes
+the published file before certifying. The last exact output receipt commits
+the hour certificate and releases the input holds in the same transaction.
+A failed or held seam, omitted clip, repair, or source identity change keeps
+the input holds live. The keep-28 executor still requires fresh exact raw
+NAS custody before it may delete a released raw.
+
+Keep the existing writer fence and cutoff in place. Standard R2 retirement
+excludes staging keys. A paginated multipart check at startup and before wire
+authorization exempts only registered bucket, key and provider upload IDs.
+Keep the custody lane gated during rollback and until both executors enforce
+holds. Retire staged outputs through the separate controller command after
+certification, grant drain, exact provider generation and dependency checks.
+A previously issued delete can be reconciled by observing absence.
+
+```sh
+stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --apply
+stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --reconcile
+```
+
+Provision the pinned x86 tools, bundle and corpus offline in the Durham
+guest. Verify execution of each pinned tool and the direct network
+path before enabling the service. Install the reviewed unit and client under
+their root-owned guest paths, configure the direct API base and R2 origin
+in `/etc/stoarama-stitch/worker.env`, and use systemd `LoadCredential` with
+the private provisioned bearer file. Use macOS boot cron as the existing
+Durham owner to run `durham-start.sh`. Confirm unattended starts with the
+approved release before admitting work. The controller sets the staging
+reservation to fit the existing storage and billing allowance and verifies
+a single hour through NAS custody before opening the four-worker queue.

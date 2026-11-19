@@ -60,6 +60,35 @@ class R2CopyWorkerTests(unittest.TestCase):
     def run_copy(self):
         pull.execute_r2_copy(self.cfg, self.runtime, self.inventory, self.stop, self.task, self.control_client)
 
+    def test_staged_stitch_certifies_published_bytes_and_reopens_after_lost_result(self):
+        output = "fixture_V85r_keep28/2/2026-09-20T00-00-00Z/run-000-%s.mp4" % self.item["sha256"]
+        self.item.update(kind="stitch_output", object_key="stitch-staging/generation/output.mp4", relative_path=output)
+        self.clip["relative_path"] = output
+        published = self.cfg.output_dir / output
+        receipts = []
+        def control(operation, path, **kwargs):
+            if path.endswith("/result"):
+                receipt = kwargs["body"]["stitch_receipt"]
+                self.assertEqual(published.read_bytes(), self.body)
+                self.assertEqual(receipt["identity"], pull.cleanup_identity(published.stat()))
+                self.assertEqual(receipt["sha256"], self.item["sha256"])
+                self.assertTrue(receipt["fsynced"])
+                receipts.append(receipt)
+                if len(receipts) == 1:
+                    raise pull.R2CopyHold("interrupted result")
+            self.assertFalse(path.endswith("/inventory"))
+            return self.control(operation, path, **kwargs)
+        with mock.patch.object(pull, "r2_copy_range", side_effect=self.transfer), \
+                mock.patch.object(self.control_client, "request_json", side_effect=control):
+            with self.assertRaises(pull.R2CopyHold):
+                self.run_copy()
+        with mock.patch.object(pull, "r2_copy_range", side_effect=AssertionError("staged output was downloaded twice")), \
+                mock.patch.object(self.control_client, "request_json", side_effect=control):
+            self.run_copy()
+        self.assertEqual(len(receipts), 2)
+        self.assertEqual(receipts[0], receipts[1])
+        self.assertFalse(Path(str(published) + ".stoarama.json").exists())
+
     def test_verify_only_missing_parent_and_media_never_create_or_download(self):
         self.task["work_mode"] = "verify_existing"
         parent = self.cfg.output_dir / "p"
