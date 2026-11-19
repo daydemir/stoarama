@@ -848,7 +848,7 @@ func (s *Server) handleAccountNASStitchResult(w http.ResponseWriter, r *http.Req
 // Legacy stitched cleanup plans are evidence only. The ordinary cleanup
 // master still governs ordinary, independently authorized cleanup items.
 func (s *Server) stitchDeletionMaster(i nasCleanupItem) bool {
-	return s.cfg.NASCleanupDeletionEnabled && i.PermitReason == ""
+	return s.cfg.NASCleanupDeletionEnabled && (i.PermitReason == "" || i.PermitReason == nasCleanupCertifiedStitchReason)
 }
 
 func (s *Server) recordNASStitchStatus(ctx context.Context, cid int64, raw json.RawMessage) {

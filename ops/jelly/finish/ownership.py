@@ -9,7 +9,7 @@ import re
 import subprocess
 import urllib.request
 
-from collector import timestamp, fresh, count, require, PLAN, PLAN_SHA, CLOSE_SHA
+from collector import timestamp, fresh, count, require, PLAN, PLAN_SHA, CLOSE_SHA, NAS_CLIENT_VERSIONS
 
 POLICY_SHA = '060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811'
 
@@ -72,7 +72,7 @@ def assemble_owned(status, owner, recovery, runner_report, api, db, now, running
     require(plan['mode'] in ('dry_run', 'enabled', 'paused', 'retired'))
     require(plan['uncertain'] == 0 and db['inventory_mismatches'] == 0
             and db['replay_failed'] == 0 and db['replay_pending'] == 0)
-    require(db['version'] == 'r2-copy-v6' and db['boot'])
+    require(db['version'] in NAS_CLIENT_VERSIONS and db['boot'])
     fresh(db['cleanup_at'], now)
     local = db['r2_copy']
     require(count(local['mismatch_latched']) == 0)
