@@ -1,0 +1,25 @@
+[Unit]
+Description=Durham direct R2 stitch worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stoarama-stitch
+Group=stoarama-stitch
+StateDirectory=stoarama-durham-stitch
+StateDirectoryMode=0700
+Environment=STOARAMA_STATE_DIR=/var/lib/stoarama-durham-stitch
+EnvironmentFile=/etc/stoarama-stitch/worker.env
+LoadCredential=stoarama-api-key:/etc/stoarama-stitch/stoarama-api-key
+ExecStart=/usr/bin/python3 -B /opt/stoarama-stitch/durham_stitch.py
+Restart=on-failure
+RestartSec=15s
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

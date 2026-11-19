@@ -190,16 +190,27 @@ func (s *Server) cleanupReport(ctx context.Context) (nasCleanupReport, error) {
 func cleanupCatalogItem(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, kind string, id int64, bucket string) (nasCleanupItem, error) {
+	return readCleanupCatalogItem(ctx, q, kind, id, bucket, true)
+}
+
+func readCleanupCatalogItem(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, kind string, id int64, bucket string, lock bool) (nasCleanupItem, error) {
 	i := nasCleanupItem{Kind: kind, SourceID: id}
-	var query string
+	var query, lockRow string
 	switch kind {
 	case "raw":
-		query = `SELECT c.recording_id,r.stream_id,c.display_path,c.size_bytes,lower(c.sha256),c.object_key,c.bucket,c.clip_start_at,c.clip_end_at,coalesce(nullif(s.local_timezone,''),r.cron_timezone),ARRAY[c.id] FROM recording_clips c JOIN recordings r ON r.id=c.recording_id JOIN streams s ON s.id=r.stream_id WHERE r.account_id=47 AND c.id=$1 AND c.bucket=$2 FOR SHARE OF c`
+		query = `SELECT c.recording_id,r.stream_id,c.display_path,c.size_bytes,lower(c.sha256),c.object_key,c.bucket,c.clip_start_at,c.clip_end_at,coalesce(nullif(s.local_timezone,''),r.cron_timezone),ARRAY[c.id] FROM recording_clips c JOIN recordings r ON r.id=c.recording_id JOIN streams s ON s.id=r.stream_id WHERE r.account_id=47 AND c.id=$1 AND c.bucket=$2`
+		lockRow = " FOR SHARE OF c"
 		i.SidecarRequired = true
 	case "collated":
-		query = `SELECT h.recording_id,r.stream_id,'joined/'||o.nas_relative_path,o.size_bytes,lower(o.sha256),o.object_key,$2::text,o.start_at,o.end_at,coalesce(nullif(s.local_timezone,''),r.cron_timezone),o.source_clip_ids FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id JOIN recordings r ON r.id=h.recording_id JOIN streams s ON s.id=r.stream_id WHERE r.account_id=47 AND o.id=$1 FOR SHARE OF o`
+		query = `SELECT h.recording_id,r.stream_id,'joined/'||o.nas_relative_path,o.size_bytes,lower(o.sha256),o.object_key,$2::text,o.start_at,o.end_at,coalesce(nullif(s.local_timezone,''),r.cron_timezone),o.source_clip_ids FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id JOIN recordings r ON r.id=h.recording_id JOIN streams s ON s.id=r.stream_id WHERE r.account_id=47 AND o.id=$1`
+		lockRow = " FOR SHARE OF o"
 	default:
 		return i, errors.New("unsupported cleanup kind; KEEP")
+	}
+	if lock {
+		query += lockRow
 	}
 	err := q.QueryRow(ctx, query, id, bucket).Scan(&i.RecordingID, &i.StreamID, &i.RelativePath, &i.SizeBytes, &i.SHA256, &i.ObjectKey, &i.Bucket, &i.StartAt, &i.EndAt, &i.Timezone, &i.SourceIDs)
 	if err != nil {

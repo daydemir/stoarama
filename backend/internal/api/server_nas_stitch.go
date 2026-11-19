@@ -300,6 +300,14 @@ func (s *Server) handleAccountNASStitchLease(w http.ResponseWriter, r *http.Requ
 		util.WriteJSON(w, 200, map[string]any{"task": nil, "retry_after_sec": 300})
 		return
 	}
+	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
+		if !caller.dedicated {
+			util.WriteError(w, 403, "dedicated Durham key required")
+			return
+		}
+		s.handleDurhamStitchLease(w, r, caller)
+		return
+	}
 	ctx, cancel := cleanupExecutionContext(r.Context())
 	defer cancel()
 	tx, err := s.pool.Begin(ctx)
@@ -417,6 +425,14 @@ func (s *Server) handleAccountNASStitchCheckpoint(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
+	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
+		if !caller.dedicated {
+			util.WriteError(w, 403, "dedicated Durham key required")
+			return
+		}
+		s.handleDurhamStitchCheckpoint(w, r, caller, id)
+		return
+	}
 	var req struct {
 		Token   string `json:"lease_token"`
 		PlanSHA string `json:"plan_sha256"`
@@ -499,6 +515,20 @@ func (s *Server) stitchPlanNext(ctx context.Context, tx pgx.Tx) (nasStitchTask, 
 	if err != nil {
 		return t, err
 	}
+	if s.r2 == nil {
+		return t, errors.New("recovery store unavailable")
+	}
+	t, err = buildNASStitchPlan(ctx, tx, t, start, end, hour, s.r2.Bucket(), nasStitchOnNAS, true)
+	if err != nil {
+		return t, err
+	}
+	raw, _ := json.Marshal(t.Plan)
+	t.PlanSHA = cleanupSHA(raw)
+	err = tx.QueryRow(ctx, `INSERT INTO nas_stitch_tasks(scope_id,recording_id,hour_at,plan,plan_sha256) VALUES($1,$2,$3,$4,$5) RETURNING id`, sid, t.Plan.RecordingID, hour, string(raw), t.PlanSHA).Scan(&t.ID)
+	return t, err
+}
+
+func buildNASStitchPlan(ctx context.Context, tx pgx.Tx, t nasStitchTask, start, end, hour time.Time, bucket string, origin nasStitchProofOrigin, lockCatalog bool) (nasStitchTask, error) {
 	policy, err := cleanupEmbeddedPolicy()
 	if err != nil {
 		return t, err
@@ -531,10 +561,7 @@ func (s *Server) stitchPlanNext(ctx context.Context, tx pgx.Tx) (nasStitchTask, 
 	}
 	var total int64
 	for _, id := range ids {
-		if s.r2 == nil {
-			return t, errors.New("recovery store unavailable")
-		}
-		item, err := cleanupCatalogItem(ctx, tx, "raw", id, s.r2.Bucket())
+		item, err := readCleanupCatalogItem(ctx, tx, "raw", id, bucket, lockCatalog)
 		if err != nil {
 			return t, err
 		}
@@ -547,7 +574,7 @@ func (s *Server) stitchPlanNext(ctx context.Context, tx pgx.Tx) (nasStitchTask, 
 		}
 		var feature collation.Clip
 		feature.ClipID, feature.RecordingID, feature.SHA256, feature.SizeBytes, feature.StartUTC, feature.EndUTC = item.SourceID, item.RecordingID, item.SHA256, item.SizeBytes, item.StartAt, item.EndAt
-		if err = tx.QueryRow(ctx, `SELECT coalesce(c.recording_job_id,0),coalesce(c.capture_attempt_id::text,''),coalesce(c.capture_lease_token::text,''),coalesce(c.capture_sequence,0),r.clip_duration_sec::float8 FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE c.id=$1`, id).Scan(&feature.JobID, &feature.CaptureAttemptID, &feature.CaptureLeaseToken, &feature.CaptureSequence, &feature.NominalSeconds); err != nil {
+		if err = tx.QueryRow(ctx, `SELECT coalesce(c.recording_job_id,0),coalesce(c.capture_attempt_id::text,''),CASE WHEN $2::boolean THEN coalesce(encode(sha256(convert_to(c.capture_lease_token::text,'UTF8')),'hex'),'') ELSE coalesce(c.capture_lease_token::text,'') END,coalesce(c.capture_sequence,0),r.clip_duration_sec::float8 FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE c.id=$1`, id, origin == nasStitchOnDurham).Scan(&feature.JobID, &feature.CaptureAttemptID, &feature.CaptureLeaseToken, &feature.CaptureSequence, &feature.NominalSeconds); err != nil {
 			return t, err
 		}
 		if feature.NominalSeconds <= 0 {
@@ -590,13 +617,21 @@ func (s *Server) stitchPlanNext(ctx context.Context, tx pgx.Tx) (nasStitchTask, 
 	// New versioned sibling tree; never replace raw or previous joined output.
 	first := strings.Split(t.Plan.Clips[0].RelativePath, "/")[0]
 	t.Plan.OutputFolder = first + "_V85r_keep28/" + strconv.FormatInt(t.Plan.RecordingID, 10) + "/" + hour.UTC().Format("2006-01-02T15-04-05Z")
-	raw, _ := json.Marshal(t.Plan)
-	t.PlanSHA = cleanupSHA(raw)
-	err = tx.QueryRow(ctx, `INSERT INTO nas_stitch_tasks(scope_id,recording_id,hour_at,plan,plan_sha256) VALUES($1,$2,$3,$4,$5) RETURNING id`, sid, t.Plan.RecordingID, hour, string(raw), t.PlanSHA).Scan(&t.ID)
-	return t, err
+	return t, nil
 }
 
+type nasStitchProofOrigin uint8
+
+const (
+	nasStitchOnNAS nasStitchProofOrigin = iota
+	nasStitchOnDurham
+)
+
 func validateNASStitchResult(p nasStitchPlan, q nasStitchResult) ([]nasCleanupItem, error) {
+	return validateNASStitchProof(p, q, nasStitchOnNAS)
+}
+
+func validateNASStitchProof(p nasStitchPlan, q nasStitchResult, origin nasStitchProofOrigin) ([]nasCleanupItem, error) {
 	if p.Policy != nasStitchPolicy || p.Revision != nasStitchRevision || q.Policy != nasStitchPolicy || len(p.Eligible) != len(p.Clips) || len(p.Joins) != len(p.Clips)-1 || len(q.Seams) != len(p.Joins) || len(p.Frozen) != len(p.Joins) {
 		return nil, errors.New("incomplete policy admission")
 	}
@@ -656,20 +691,26 @@ func validateNASStitchResult(p nasStitchPlan, q nasStitchResult) ([]nasCleanupIt
 			if !ok || !p.Eligible[pos] || seen[proof.ID] || proof.SHA != c.SHA256 || proof.Size != c.SizeBytes || !stitchSHA(proof.PacketSHA) || proof.Packets <= 0 || proof.Frames != proof.Packets || proof.Repaired || (prev >= 0 && (pos != prev+1 || !q.Seams[prev].Join)) {
 				return nil, errors.New("missing, repaired, duplicate or unqualified inclusion proof")
 			}
-			// Freeze the exact physical NAS identity for existing cleanup machinery.
-			var physical struct {
-				Identity [5]int64 `json:"identity"`
-				Sidecar  struct {
+			if origin == nasStitchOnDurham {
+				if !proof.RetirementHeld || len(proof.RawProof) != 0 && string(proof.RawProof) != "null" {
+					return nil, errors.New("Durham can only attest its local decode and holds")
+				}
+			} else {
+				// Freeze the exact physical NAS identity for existing cleanup machinery.
+				var physical struct {
 					Identity [5]int64 `json:"identity"`
-				} `json:"sidecar"`
-			}
-			if json.Unmarshal(proof.RawProof, &physical) != nil {
-				return nil, errors.New("raw physical proof missing")
-			}
-			c.Frozen = physical.Identity
-			c.FrozenSidecar = physical.Sidecar.Identity
-			if !validCleanupProof(proof.RawProof, c) {
-				return nil, errors.New("raw physical proof differs")
+					Sidecar  struct {
+						Identity [5]int64 `json:"identity"`
+					} `json:"sidecar"`
+				}
+				if json.Unmarshal(proof.RawProof, &physical) != nil {
+					return nil, errors.New("raw physical proof missing")
+				}
+				c.Frozen = physical.Identity
+				c.FrozenSidecar = physical.Sidecar.Identity
+				if !validCleanupProof(proof.RawProof, c) {
+					return nil, errors.New("raw physical proof differs")
+				}
 			}
 			c.PermitReason = nasStitchReason
 			c.StitchOutputPath = o.Path
@@ -715,6 +756,14 @@ func (s *Server) handleAccountNASStitchResult(w http.ResponseWriter, r *http.Req
 	}
 	id, ok := parseInt64Path(w, r, "id")
 	if !ok {
+		return
+	}
+	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
+		if !caller.dedicated {
+			util.WriteError(w, 403, "dedicated Durham key required")
+			return
+		}
+		s.handleDurhamStitchResult(w, r, caller, id)
 		return
 	}
 	var q nasStitchResult
@@ -823,6 +872,14 @@ func (s *Server) handleAccountNASStitchReady(w http.ResponseWriter, r *http.Requ
 	}
 	id, ok := parseInt64Path(w, r, "id")
 	if !ok {
+		return
+	}
+	if r.Header.Get("X-Stoarama-Stitch-Source") == "r2-v1" {
+		if !caller.dedicated {
+			util.WriteError(w, 403, "dedicated Durham key required")
+			return
+		}
+		s.handleDurhamStitchStatus(w, r, caller, id)
 		return
 	}
 	var req struct {
