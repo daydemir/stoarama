@@ -60,13 +60,14 @@ func (s *Server) handleDurhamStitchLease(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	var active int
-	err = tx.QueryRow(ctx, `SELECT count(*) FROM nas_stitch_r2_hours
- WHERE state='leased' AND lease_expires_at>clock_timestamp()`).Scan(&active)
+	var localBusy bool
+	err = tx.QueryRow(ctx, `SELECT count(*),`+nasLocalStitchInFlightSQL+` FROM nas_stitch_r2_hours
+ WHERE state='leased' AND lease_expires_at>clock_timestamp()`).Scan(&active, &localBusy)
 	if err != nil {
 		util.WriteError(w, 503, "Durham stitch queue unavailable")
 		return
 	}
-	if active >= nasDurhamParallelHours {
+	if localBusy || active >= nasDurhamParallelHours {
 		util.WriteJSON(w, 200, noTask)
 		return
 	}

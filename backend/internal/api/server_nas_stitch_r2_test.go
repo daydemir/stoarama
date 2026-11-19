@@ -161,6 +161,30 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	if err := pool.QueryRow(ctx, nasDurhamClaimSQL).Scan(&id, &attempt, &raw, &planDigest); err != nil || attempt != 0 {
 		t.Fatalf("exact held hour not claimable: %v", err)
 	}
+	t.Run("an issued local lease drains before Durham can claim", func(t *testing.T) {
+		var localID int64
+		if err := pool.QueryRow(ctx, `INSERT INTO nas_stitch_tasks(scope_id,recording_id,hour_at,plan,plan_sha256,
+ state,attempt,lease_token,lease_expires_at) VALUES(1,30,$1,$2,$3,'leased',3,repeat('d',64),clock_timestamp()+interval '1 hour')
+ RETURNING id`, hour, string(raw), planDigest).Scan(&localID); err != nil {
+			t.Fatal(err)
+		}
+		exec(`UPDATE nas_stitch_r2_control SET enabled=true;
+ UPDATE account_api_keys SET scopes=ARRAY['stoarama.nas_stitch'],secret_hash='nas-stitch:'||repeat('a',64) WHERE id=47`)
+		server := &Server{pool: pool}
+		w := cleanupCall(t, func(w http.ResponseWriter, r *http.Request) {
+			server.handleDurhamStitchLease(w, r, nasStitchCaller{keyID: 47, accountID: 47, dedicated: true})
+		}, 47, 47, "", "", nil)
+		if w.Code != 200 || !strings.Contains(w.Body.String(), `"task":null`) {
+			t.Fatal("Durham competed with an issued local lease", w.Code, w.Body.String())
+		}
+		var found int
+		if err := pool.QueryRow(ctx, `SELECT attempt FROM nas_stitch_r2_hours WHERE id=$1`, id).Scan(&found); err != nil || found != 0 {
+			t.Fatal("waiting for the local lease changed the Durham attempt", found, err)
+		}
+		exec(`UPDATE nas_stitch_tasks SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, localID)
+		exec(`UPDATE nas_stitch_r2_control SET enabled=false;
+ UPDATE account_api_keys SET scopes=ARRAY['stoarama.pull'],secret_hash='fixture-key' WHERE id=47`)
+	})
 
 	exec(`UPDATE nas_stitch_r2_hours SET state='leased',attempt=1,lease_api_key_id=47,lease_token=repeat('e',64),
  lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, id)
@@ -343,6 +367,46 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		id, manifest, string(stagedManifest))
 
 	s := &Server{pool: pool, r2: store, cfg: config.Config{NASR2CopyEnabled: true}}
+	t.Run("server controls staged copies on the reviewed NAS release", func(t *testing.T) {
+		exec(`UPDATE nas_r2_copy_items SET state='pending',lease_token=NULL,lease_expires_at=NULL WHERE id=$1`, copyID)
+		for _, check := range []struct {
+			version                 string
+			master, capability, get bool
+		}{
+			{NASR2CopyPagedClientVersion, true, true, false},
+			{nasCleanupCertifiedStitchVersion, false, true, false},
+			{nasCleanupCertifiedStitchVersion, true, false, true},
+		} {
+			exec(`UPDATE connections SET client_version=$1 WHERE id=13`, check.version)
+			s.cfg.NASStitchEnabled = check.master
+			w := cleanupCall(t, s.handleNASR2CopyLease, 47, 47, "", "", nasR2CopyControl{
+				FreeBytes: request.FreeBytes, AcceptStitch: check.capability,
+			}, "fixture-boot "+check.version)
+			var reply struct{ Task *nasR2CopyTask }
+			if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &reply) != nil || (reply.Task != nil) != check.get {
+				t.Fatalf("staged copy gate differs for %+v: %d %s", check, w.Code, w.Body.String())
+			}
+			if check.get {
+				if reply.Task.Item.Kind != NASR2CopyStitchOutput || reply.Task.ID != copyID {
+					t.Fatal("reviewed client got a different staged output")
+				}
+				request.Token = reply.Task.Token
+			}
+		}
+		w := cleanupCall(t, s.handleAdminNASStitchStatus, 47, 47, "", "", nil)
+		var status struct {
+			Copy struct {
+				Control           string `json:"control"`
+				Version           string `json:"client_version"`
+				ServerEnabled     bool   `json:"server_enabled"`
+				MaintenanceActive bool   `json:"maintenance_active"`
+			} `json:"durham_copy"`
+		}
+		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &status) != nil || status.Copy.Control != "server" ||
+			status.Copy.Version != nasCleanupCertifiedStitchVersion || !status.Copy.ServerEnabled || status.Copy.MaintenanceActive {
+			t.Fatal("operator status did not show the effective server gate", w.Code, w.Body.String())
+		}
+	})
 	exec(`UPDATE connections SET client_version=$1 WHERE id=13`, NASR2CopyPagedClientVersion)
 	startRange := nasR2CopyControl{Token: request.Token, FreeBytes: request.FreeBytes, Length: item.SizeBytes}
 	rangeResponse := cleanupCall(t, s.handleNASR2CopyRange, 47, 47, "id", fmt.Sprint(copyID), startRange, "fixture-boot "+NASR2CopyPagedClientVersion)
@@ -458,6 +522,15 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM nas_stitch_r2_certificates
  WHERE hour_id=$1 AND plan_sha256=$2 AND manifest_sha256=$3`, id, planDigest, manifest).Scan(&certificates); err != nil || certificates != 1 {
 		t.Fatalf("expected one exact durable certificate, got %d: %v", certificates, err)
+	}
+	legacy := cleanupCall(t, s.handleAccountNASStitchLease, 47, 47, "", "", nil)
+	var legacyResponse struct {
+		Task  *nasStitchTask
+		Retry int `json:"retry_after_sec"`
+	}
+	if legacy.Code != 200 || json.Unmarshal(legacy.Body.Bytes(), &legacyResponse) != nil ||
+		legacyResponse.Task != nil || legacyResponse.Retry != 60 {
+		t.Fatal("local stitch lane did not yield to the enabled Durham queue", legacy.Code, legacy.Body.String())
 	}
 	if err := reserve(); err != nil {
 		t.Fatalf("committed certificate failed to release the hold: %v", err)
