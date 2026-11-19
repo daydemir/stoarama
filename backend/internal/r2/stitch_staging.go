@@ -12,6 +12,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/jackc/pgx/v5"
@@ -314,6 +315,15 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	if _, err = tx.Exec(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`); err != nil {
 		return err
 	}
+	if reconcile {
+		found, err := c.observeAbortedStitchStage(ctx, tx, objectID, sha)
+		if err != nil {
+			return err
+		}
+		if found {
+			return tx.Commit(ctx)
+		}
+	}
 	if !reconcile {
 		observed := time.Now()
 		dbNow, err := c.stitchStageDeleteFence(ctx, tx)
@@ -411,6 +421,53 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// observeAbortedStitchStage only records R2 absence. An abort after a possible
+// multipart completion is ambiguous even when a HEAD currently returns 404.
+func (c *Client) observeAbortedStitchStage(ctx context.Context, tx pgx.Tx, objectID int64, sha string) (bool, error) {
+	var key string
+	var drained, observed bool
+	err := tx.QueryRow(ctx, `SELECT o.object_key,
+  safe.id IS NOT NULL AND coalesce(safe.grants_drain_at,'-infinity')<clock_timestamp(),a.object_id IS NOT NULL
+ FROM nas_stitch_r2_stage_objects o
+ LEFT JOIN nas_stitch_r2_aborts_awaiting_absence safe ON safe.id=o.id
+ LEFT JOIN nas_stitch_r2_aborted_absences a ON a.object_id=o.id
+ WHERE o.id=$1 AND o.sha256=$2 AND o.bucket=$3 AND o.endpoint_sha256=$4 AND o.state='aborted'
+ FOR SHARE OF o`, objectID, sha, c.bucket, c.EndpointSHA256()).Scan(&key, &drained, &observed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if observed {
+		return true, nil
+	}
+	if !drained {
+		return false, errors.New("aborted stitch stage writer drain or multipart outcome is unconfirmed")
+	}
+	if _, err := c.stitchStageDeleteFence(ctx, tx); err != nil {
+		return false, err
+	}
+	requestOptions := func(o *s3.Options) {
+		noStitchStageRetries(o)
+		o.HTTPClient = &http.Client{Transport: c.deleteTransport, CheckRedirect: refuseRetirementRedirect}
+	}
+	uploads, err := c.s3.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
+		Bucket: aws.String(c.bucket), Prefix: aws.String(key), MaxUploads: aws.Int32(1),
+	}, requestOptions)
+	if err != nil || uploads.IsTruncated == nil || *uploads.IsTruncated || len(uploads.Uploads) != 0 {
+		return false, errors.New("aborted stitch stage multipart work has not drained")
+	}
+	_, err = c.s3.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)}, requestOptions)
+	var response *awshttp.ResponseError
+	if !IsNotFound(err) || !errors.As(err, &response) || response.HTTPStatusCode() != http.StatusNotFound ||
+		response.Response.Header.Get("x-amz-delete-marker") != "" {
+		return false, errors.New("aborted stitch stage absence remains unconfirmed")
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO nas_stitch_r2_aborted_absences(object_id) VALUES($1)`, objectID)
+	return err == nil, err
 }
 
 func (c *Client) stitchStageDeleteFence(ctx context.Context, tx pgx.Tx) (time.Time, error) {

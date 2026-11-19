@@ -28,15 +28,17 @@ func testCertifiedStitchSplitOutput(t *testing.T, tx pgx.Tx, hourID, firstCopyID
 	second.SourceID = 124
 	second.RelativePath = strings.Replace(first.RelativePath, "run-000-", "run-001-", 1)
 	exec(`INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes)
- OVERRIDING SYSTEM VALUE VALUES(124,$1,1,47,'stoarama',$2,$3,$4,$5)`,
+ OVERRIDING SYSTEM VALUE VALUES(124,$1,2,47,'stoarama',$2,$3,$4,$5)`,
 		hourID, endpoint, second.RelativePath, second.SHA256, second.SizeBytes)
 	exec(`UPDATE nas_stitch_r2_stage_objects SET state='uploading',upload_id='split-fixture' WHERE id=124;
  UPDATE nas_stitch_r2_stage_objects SET state='completing' WHERE id=124;
  UPDATE nas_stitch_r2_stage_objects SET state='staged',etag='second-etag',last_modified=clock_timestamp() WHERE id=124`)
 	exec(`INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes)
- OVERRIDING SYSTEM VALUE VALUES(125,$1,1,47,'stoarama',$2,$3,$4,$5)`,
+ OVERRIDING SYSTEM VALUE VALUES(125,$1,2,47,'stoarama',$2,$3,$4,$5)`,
 		hourID, endpoint, second.RelativePath+".aborted", second.SHA256, second.SizeBytes)
-	exec(`UPDATE nas_stitch_r2_stage_objects SET state='aborted' WHERE id=125`)
+	exec(`UPDATE nas_stitch_r2_stage_objects SET state='uploading',upload_id='ambiguous-fixture',start_issued_at=clock_timestamp() WHERE id=125;
+ UPDATE nas_stitch_r2_stage_objects SET state='completing' WHERE id=125;
+ UPDATE nas_stitch_r2_stage_objects SET state='aborted' WHERE id=125`)
 	if err := tx.QueryRow(ctx, `SELECT object_key FROM nas_stitch_r2_stage_objects WHERE id=124`).Scan(&second.ObjectKey); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +85,13 @@ func testCertifiedStitchSplitOutput(t *testing.T, tx pgx.Tx, hourID, firstCopyID
 		}
 	}
 	exec(`INSERT INTO nas_stitch_r2_stage_retirements(object_id) VALUES(123),(124);
- UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=clock_timestamp() WHERE object_id IN (123,124)`)
+ UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=clock_timestamp() WHERE object_id IN (123,124);
+ INSERT INTO nas_stitch_r2_aborted_absences(object_id) VALUES(122)`)
+	var observable bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_r2_aborts_awaiting_absence WHERE id=125)`).
+		Scan(&observable); err != nil || observable {
+		t.Fatalf("ambiguous completion could be certified absent: %v %v", observable, err)
+	}
 	var absent bool
 	if err := tx.QueryRow(ctx, `SELECT nas_cleanup_certified_stitch_staging_absent(certificate)
  FROM nas_stitch_r2_certified_raw WHERE hour_id=$1 AND clip_id=901`, hourID).Scan(&absent); err != nil || absent {

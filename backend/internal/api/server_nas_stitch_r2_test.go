@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,7 +32,10 @@ func TestR2StitchDurhamHoldReleasedOnlyByCommittedNASCertificate(t *testing.T) {
 	}
 	media := bytes.Repeat([]byte{'x'}, 100)
 	sha := cleanupSHA(media)
-	provider := durhamStageTestProvider(t, media, sha)
+	const abortGeneration = "f5238abd-6063-4441-a712-a9647d10b986"
+	abortKey := "stitch-staging/" + abortGeneration + "/" + sha + ".mp4"
+	var abortResponse atomic.Int32
+	provider := durhamStageTestProvider(t, media, sha, abortKey, &abortResponse)
 	defer provider.Close()
 	admin, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -159,8 +163,15 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 
 	exec(`UPDATE nas_stitch_r2_hours SET state='leased',attempt=1,lease_api_key_id=47,lease_token=repeat('e',64),
  lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, id)
+	exec(`INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,generation,relative_path,sha256,size_bytes)
+ OVERRIDING SYSTEM VALUE VALUES(122,$1,1,47,'stoarama',$2,$3,'fixture/aborted.mp4',$4,100)`,
+		id, endpoint, abortGeneration, sha)
+	exec(`UPDATE nas_stitch_r2_stage_objects SET state='uploading',upload_id='earlier-abort',start_issued_at=clock_timestamp(),
+ grants_drain_at=clock_timestamp()-interval '1 second' WHERE id=122;
+ UPDATE nas_stitch_r2_stage_objects SET state='aborted' WHERE id=122`)
+	exec(`UPDATE nas_stitch_r2_hours SET attempt=2 WHERE id=$1`, id)
 	const insertStage = `INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes)
- OVERRIDING SYSTEM VALUE VALUES(123,$1,1,47,'stoarama',$2,$3,$4,100)`
+ OVERRIDING SYSTEM VALUE VALUES(123,$1,2,47,'stoarama',$2,$3,$4,100)`
 	outputPath := plan.OutputFolder + "/run-000-" + sha + ".mp4"
 	staleAdmission, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
@@ -188,7 +199,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		t.Fatal("committed starting stage allowed fence removal", err)
 	}
 	exec(`UPDATE nas_stitch_r2_control SET enabled=true,max_staging_bytes=1000000`)
-	lease := r2.StitchStageLease{HourID: id, APIKeyID: 47, Attempt: 1, Token: strings.Repeat("e", 64), PlanSHA: planDigest}
+	lease := r2.StitchStageLease{HourID: id, APIKeyID: 47, Attempt: 2, Token: strings.Repeat("e", 64), PlanSHA: planDigest}
 	foreign := lease
 	foreign.APIKeyID++
 	if _, err := store.StartStitchStage(ctx, foreign, 123); err == nil {
@@ -319,7 +330,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 				t.Fatal(err)
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO nas_stitch_r2_certificates(hour_id,connection_id,attempt,plan_sha256,manifest_sha256,receipt)
- SELECT $1,13,1,$2,$3,jsonb_build_object('objects',jsonb_build_array(jsonb_build_object('object_key',o.object_key,
+ SELECT $1,13,o.attempt,$2,$3,jsonb_build_object('objects',jsonb_build_array(jsonb_build_object('object_key',o.object_key,
   'etag',o.etag,'version_id',o.version_id,'last_modified',o.last_modified,'readback',q.stitch_receipt)))
  FROM nas_stitch_r2_stage_objects o JOIN nas_r2_copy_items q ON q.source_id=o.id AND q.kind='stitch_output'
  WHERE o.id=123`, id, planDigest, manifest); err == nil || !strings.Contains(err.Error(), wantError) {
@@ -515,6 +526,27 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 			if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, true); err != nil {
 				t.Fatalf("staging retirement could not reconcile exact absence: %v", err)
 			}
+			if err := pool.QueryRow(ctx, `SELECT nas_cleanup_certified_stitch_staging_absent(certificate)
+ FROM nas_stitch_r2_certified_raw WHERE clip_id=901`).Scan(&stagingAbsent); err != nil || stagingAbsent {
+				t.Fatalf("unresolved abort on the earlier attempt cleared staging: %v %v", stagingAbsent, err)
+			}
+			for _, mode := range []int32{0, 1, 2, 4} {
+				abortResponse.Store(mode)
+				if err := store.RetireStitchStage(ctx, 122, sha, time.Time{}, true); err == nil {
+					t.Fatalf("unconfirmed aborted stage accepted in provider case %d", mode)
+				}
+			}
+			abortResponse.Store(3)
+			for range 2 {
+				if err := store.RetireStitchStage(ctx, 122, sha, time.Time{}, true); err != nil {
+					t.Fatalf("clean aborted stage absence or exact replay refused: %v", err)
+				}
+			}
+			var receipt, deletionIntent bool
+			if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_r2_aborted_absences WHERE object_id=122),
+ EXISTS(SELECT 1 FROM nas_stitch_r2_stage_retirements WHERE object_id=122)`).Scan(&receipt, &deletionIntent); err != nil || !receipt || deletionIntent {
+				t.Fatalf("aborted reconciliation did not preserve evidence separation: %v %v %v", receipt, deletionIntent, err)
+			}
 		})
 	})
 	for _, change := range []string{
@@ -528,7 +560,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	}
 }
 
-func durhamStageTestProvider(t *testing.T, media []byte, sha string) *httptest.Server {
+func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, abortResponse *atomic.Int32) *httptest.Server {
 	t.Helper()
 	var mu sync.Mutex
 	var started, part, completed, deleted bool
@@ -542,7 +574,33 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha string) *httptest.S
 		w.Header().Set("Content-Type", "application/xml")
 		if r.Method == http.MethodGet && r.URL.Path == "/stoarama" && query.Has("uploads") &&
 			strings.HasPrefix(query.Get("prefix"), "stitch-staging/") {
+			if query.Get("prefix") == abortKey && abortResponse.Load() == 0 {
+				fmt.Fprintf(w, "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated><Upload><Key>%s</Key><UploadId>still-live</UploadId></Upload></ListMultipartUploadsResult>", abortKey)
+				return
+			}
 			fmt.Fprint(w, "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>")
+			return
+		}
+		if r.URL.Path == "/stoarama/"+abortKey {
+			if r.Method != http.MethodHead {
+				t.Errorf("abort reconciliation attempted %s", r.Method)
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			switch abortResponse.Load() {
+			case 1:
+				w.WriteHeader(http.StatusServiceUnavailable)
+			case 2:
+				w.WriteHeader(http.StatusOK)
+			case 3:
+				w.WriteHeader(http.StatusNotFound)
+			case 4:
+				w.Header().Set("x-amz-delete-marker", "true")
+				w.WriteHeader(http.StatusNotFound)
+			default:
+				t.Error("abort reconciliation performed HEAD with a live multipart upload")
+				w.WriteHeader(http.StatusInternalServerError)
+			}
 			return
 		}
 		if !strings.HasPrefix(r.URL.Path, "/stoarama/stitch-staging/") {

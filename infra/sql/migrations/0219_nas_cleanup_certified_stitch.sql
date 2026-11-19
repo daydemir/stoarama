@@ -80,14 +80,58 @@ CREATE FUNCTION nas_cleanup_exact_certified_stitch(item jsonb) RETURNS boolean L
    AND item->'stitch_raw_sidecar'=jsonb_build_object('size_bytes',c.sidecar_size,'sha256',c.sidecar_sha))
 $$;
 
+-- A terminal abort does not record whether a completion could already have
+-- reached R2. Preserve that transition before allowing absence-only checks.
+ALTER TABLE nas_stitch_r2_stage_objects ADD COLUMN aborted_from nas_stitch_r2_stage_state;
+CREATE FUNCTION record_nas_stitch_r2_abort_phase() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF TG_OP='UPDATE' AND OLD.start_issued_at IS NOT NULL AND NEW.start_issued_at IS DISTINCT FROM OLD.start_issued_at THEN
+  RAISE EXCEPTION 'stitch multipart start issuance is immutable';
+ END IF;
+ IF TG_OP='UPDATE' AND NEW.state='aborted' AND OLD.state<>'aborted' THEN
+  NEW.aborted_from:=OLD.state;
+ ELSIF NEW.aborted_from IS NOT NULL AND (TG_OP='INSERT' OR NEW.aborted_from IS DISTINCT FROM OLD.aborted_from) THEN
+  RAISE EXCEPTION 'stitch abort origin is recorded by the stage transition';
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER nas_stitch_r2_abort_phase BEFORE INSERT OR UPDATE ON nas_stitch_r2_stage_objects
+ FOR EACH ROW EXECUTE FUNCTION record_nas_stitch_r2_abort_phase();
+
+CREATE VIEW nas_stitch_r2_aborts_awaiting_absence AS
+ SELECT id,bucket,endpoint_sha256,object_key,sha256,grants_drain_at
+ FROM nas_stitch_r2_stage_objects WHERE state='aborted' AND version_id IS NULL AND
+  ((aborted_from IS NULL OR aborted_from='starting') AND start_issued_at IS NULL AND upload_id IS NULL
+   OR aborted_from='uploading' AND start_issued_at IS NOT NULL AND upload_id IS NOT NULL);
+
+CREATE TABLE nas_stitch_r2_aborted_absences (
+ object_id bigint PRIMARY KEY REFERENCES nas_stitch_r2_stage_objects(id),
+ observed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE FUNCTION guard_nas_stitch_r2_aborted_absence() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF TG_OP<>'INSERT' OR NOT EXISTS(
+  SELECT 1 FROM nas_stitch_r2_aborts_awaiting_absence
+  WHERE id=NEW.object_id AND coalesce(grants_drain_at,'-infinity')<NEW.observed_at
+   AND NEW.observed_at<=clock_timestamp()) THEN
+  RAISE EXCEPTION 'aborted stitch absence requires a drained terminal abort and is immutable';
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER nas_stitch_r2_aborted_absence BEFORE INSERT OR UPDATE OR DELETE ON nas_stitch_r2_aborted_absences
+ FOR EACH ROW EXECUTE FUNCTION guard_nas_stitch_r2_aborted_absence();
+CREATE TRIGGER nas_stitch_r2_aborted_absence_truncate BEFORE TRUNCATE ON nas_stitch_r2_aborted_absences
+ FOR EACH STATEMENT EXECUTE FUNCTION guard_nas_stitch_r2_truncate();
+
 CREATE FUNCTION nas_cleanup_certified_stitch_staging_absent(certificate jsonb) RETURNS boolean LANGUAGE sql STABLE AS $$
  SELECT EXISTS(SELECT 1 FROM nas_stitch_r2_certificates c
   WHERE c.hour_id=(certificate->>'hour_id')::bigint AND c.attempt=(certificate->>'attempt')::int
    AND c.plan_sha256=certificate->>'plan_sha256' AND c.manifest_sha256=certificate->>'manifest_sha256'
    AND EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects o WHERE o.hour_id=c.hour_id AND o.attempt=c.attempt AND o.state='staged')
    AND NOT EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects o
-    LEFT JOIN nas_stitch_r2_stage_retirements retired ON retired.object_id=o.id
-    WHERE o.hour_id=c.hour_id AND o.attempt=c.attempt AND retired.absence_observed_at IS NULL))
+    LEFT JOIN nas_stitch_r2_stage_retirements retired ON retired.object_id=o.id AND o.state='staged'
+    LEFT JOIN nas_stitch_r2_aborted_absences aborted ON aborted.object_id=o.id AND o.state='aborted'
+    WHERE o.hour_id=c.hour_id AND retired.absence_observed_at IS NULL AND aborted.object_id IS NULL))
 $$;
 
 -- Preserve 0201's locks and ordinary veto. Only an exact, finished B2 item

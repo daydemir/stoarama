@@ -362,6 +362,12 @@ The current provider proof applies to unversioned objects. An ambiguous
 delete retains its one-shot intent and blocks fence removal and conflicting
 dependencies until the controller observes absence.
 
+The same reconcile command can record absence for an aborted stage, including
+one from an earlier attempt. It requires the exact stage identity, writer
+drain, an empty multipart listing for the key, and HTTP 404 from HEAD. An
+abort after possible multipart completion remains held because that request
+can still have an unresolved outcome.
+
 ```sh
 stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --apply \
   --conditional-delete-proof PROOF.json --expected-delete-proof-sha256 PROOF_SHA
@@ -387,8 +393,8 @@ label and items in a separate plan. Request
 `{"kind":"certified_stitch_raw","source_id":901}` for an exact eligible clip.
 The API derives the replacement proof and original sidecar digest and uses the
 existing dry run, plan approval, source freeze, delivery veto and deletion
-budget. NAS deletion also requires recorded staging absence for every output
-of the certified attempt. The initial dry run records the raw and sidecar
+budget. NAS deletion also requires recorded absence for every staging object
+from every attempt for that hour. The initial dry run records the raw and sidecar
 identities from the NAS and hashes them against the exact recorded evidence,
 including raws copied after the frozen inventory audit. Before asking for a
 permit the client rechecks those files and hashes the retained output. It
