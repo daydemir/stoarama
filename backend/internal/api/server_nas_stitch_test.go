@@ -93,7 +93,10 @@ CREATE TABLE IF NOT EXISTS account_api_keys(
  id bigserial PRIMARY KEY, account_id bigint NOT NULL, key_prefix text, secret_hash text,
  label text, scopes text[], revoked_at timestamptz, expires_at timestamptz,
  last_used_at timestamptz, updated_at timestamptz
-);`); err != nil {
+);
+CREATE TABLE nas_stitch_r2_control(enabled boolean NOT NULL);
+INSERT INTO nas_stitch_r2_control VALUES(false);
+CREATE TABLE nas_stitch_r2_hours(state text NOT NULL);`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.pool.Exec(f.ctx, `INSERT INTO account_api_keys(id,account_id,secret_hash,scopes)

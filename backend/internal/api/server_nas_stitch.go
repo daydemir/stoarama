@@ -283,7 +283,21 @@ func (s *Server) handleAdminNASStitchPause(w http.ResponseWriter, r *http.Reques
 }
 func (s *Server) handleAdminNASStitchStatus(w http.ResponseWriter, r *http.Request) {
 	var raw []byte
-	err := s.pool.QueryRow(r.Context(), `SELECT jsonb_build_object('policy','v85r','revision','v85r-rebuilt-1','scopes',coalesce((SELECT jsonb_agg(s ORDER BY id) FROM nas_stitch_scopes s),'[]'),'tasks',coalesce((SELECT jsonb_agg(t ORDER BY t.awaiting_receipt DESC,t.id DESC) FROM (SELECT id,scope_id,recording_id,hour_at,state,attempt,plan_sha256,CASE WHEN lease_api_key_attempt=attempt THEN lease_api_key_id END AS lease_api_key_id,cleanup_plan_id,registration_abandoned_at,registration_abandoned_reason,updated_at,(state='verified' AND cleanup_plan_id IS NULL AND registration_abandoned_at IS NULL) AS awaiting_receipt FROM nas_stitch_tasks ORDER BY awaiting_receipt DESC,id DESC LIMIT 100) t),'[]'),'client',(SELECT nas_stitch_status FROM connections WHERE id=13))`).Scan(&raw)
+	err := s.pool.QueryRow(r.Context(), `WITH client AS (
+ SELECT client_version,nas_stitch_status FROM connections WHERE id=13
+)
+SELECT jsonb_build_object('policy','v85r','revision','v85r-rebuilt-1',
+ 'scopes',coalesce((SELECT jsonb_agg(s ORDER BY id) FROM nas_stitch_scopes s),'[]'),
+ 'tasks',coalesce((SELECT jsonb_agg(t ORDER BY t.awaiting_receipt DESC,t.id DESC) FROM (
+  SELECT id,scope_id,recording_id,hour_at,state,attempt,plan_sha256,
+   CASE WHEN lease_api_key_attempt=attempt THEN lease_api_key_id END AS lease_api_key_id,cleanup_plan_id,
+   registration_abandoned_at,registration_abandoned_reason,updated_at,
+   (state='verified' AND cleanup_plan_id IS NULL AND registration_abandoned_at IS NULL) AS awaiting_receipt
+  FROM nas_stitch_tasks ORDER BY awaiting_receipt DESC,id DESC LIMIT 100) t),'[]'),
+ 'client',(SELECT nas_stitch_status FROM client),
+ 'durham_copy',jsonb_build_object('control','server','client_version',(SELECT client_version FROM client),
+  'enabled',$1::boolean AND coalesce((SELECT client_version=$2 FROM client),false)))`,
+		s.nasR2StitchCopyEnabled(nasCleanupCertifiedStitchVersion), nasCleanupCertifiedStitchVersion).Scan(&raw)
 	if err != nil {
 		util.WriteError(w, 500, "stitch status unavailable")
 		return
@@ -329,7 +343,11 @@ func (s *Server) handleAccountNASStitchLease(w http.ResponseWriter, r *http.Requ
 	var busy bool
 	// One lane across clients and reboots. Wait for the durable receipt after
 	// result acceptance. Legacy plans already passed that gate and stay intact.
-	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_tasks WHERE (state='leased' AND lease_expires_at>now()) OR (state='verified' AND cleanup_plan_id IS NULL AND registration_abandoned_at IS NULL)) OR EXISTS(SELECT 1 FROM nas_cleanup_frozen_streams)`).Scan(&busy)
+	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_tasks
+ WHERE (state='leased' AND lease_expires_at>now()) OR (state='verified' AND cleanup_plan_id IS NULL AND registration_abandoned_at IS NULL))
+ OR EXISTS(SELECT 1 FROM nas_cleanup_frozen_streams)
+ OR EXISTS(SELECT 1 FROM nas_stitch_r2_control WHERE enabled)
+ OR EXISTS(SELECT 1 FROM nas_stitch_r2_hours WHERE state<>'certified')`).Scan(&busy)
 	if err != nil {
 		util.WriteError(w, 500, "stitch lane lookup failed")
 		return

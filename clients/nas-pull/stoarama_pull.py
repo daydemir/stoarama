@@ -53618,7 +53618,7 @@ def r2_copy_worker(cfg, runtime, inventory, stop, worker):
             try:
                 free = r2_copy_resources(cfg, runtime)
                 request = {"free_bytes": free, "verify_existing": True}
-                if os.environ.get("STOARAMA_R2_COPY_STITCH_OUTPUT_ENABLED") == "true":
+                if CLIENT_VERSION == CLEANUP_CERTIFIED_STITCH_VERSION:
                     request["accept_stitch_output"] = True
                 response = control.request_json(R2CopyControlOperation.LEASE, "/account/connections/r2-copy/lease",
                                                 body=request)

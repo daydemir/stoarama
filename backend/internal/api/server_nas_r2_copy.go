@@ -249,6 +249,10 @@ func (s *Server) nasR2CopyConnection(w http.ResponseWriter, r *http.Request, pur
 	return cid, true
 }
 
+func (s *Server) nasR2StitchCopyEnabled(version string) bool {
+	return version == nasCleanupCertifiedStitchVersion && s.cfg.NASStitchEnabled && s.cfg.NASR2CopyEnabled && s.r2 != nil
+}
+
 // Ordinary cleanup is outside the same pinned window that copy intersects.
 // Maintenance remains exclusive; per-source holds below also veto special
 // stitched-source retirement. No global plan/lease/permit veto is necessary.
@@ -351,10 +355,12 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, 409, "copy free-space floor")
 		return
 	}
+	version, _ := nasRequestWorkVersion(r, nasConnectionCopy)
+	stitch := req.AcceptStitch && s.nasR2StitchCopyEnabled(version)
 	// A concurrent grant can consume the prepared row. Retry a bounded number
 	// of candidates without making the client hold for a normal admission race.
 	for attempt := 0; attempt < NASR2CopyWorkers; attempt++ {
-		if !s.nasR2CopyLeaseAttempt(w, r, cid, req.VerifyExisting, req.AcceptStitch) {
+		if !s.nasR2CopyLeaseAttempt(w, r, cid, req.VerifyExisting, stitch) {
 			return
 		}
 	}
