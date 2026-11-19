@@ -103,6 +103,8 @@ func TestR2CollationKeyIndexAcceptsOnlyExactPrecreatedDefinition(t *testing.T) {
 		{`CREATE INDEX CONCURRENTLY r2_collation_outputs_object_key ON recording_collation_outputs(object_key) WHERE id>0`, false},
 		{`CREATE INDEX CONCURRENTLY r2_collation_outputs_object_key ON recording_collation_outputs USING hash(object_key)`, false},
 		{`CREATE INDEX CONCURRENTLY r2_collation_outputs_object_key ON recording_collation_outputs(lower(object_key))`, false},
+		{`CREATE INDEX CONCURRENTLY r2_collation_outputs_object_key ON recording_collation_outputs(object_key COLLATE "C")`, false},
+		{`CREATE INDEX CONCURRENTLY r2_collation_outputs_object_key ON recording_collation_outputs(object_key text_pattern_ops)`, false},
 	} {
 		pool := r2CollationKeySchema(t)
 		ctx := context.Background()
