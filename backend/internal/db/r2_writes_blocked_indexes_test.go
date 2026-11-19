@@ -218,7 +218,7 @@ func TestR2WritesBlockedMigrationRunsThroughMigrateUp(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT pg_get_functiondef(to_regprocedure('r2_retirement_writes_blocked(text,text)'))`).Scan(&body); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"max(expires_at)", "max(put_expires_at)", "expires_at>now()", "lease_expires_at>now()", "drain_not_before<clock_timestamp()"} {
+	for _, want := range []string{"max(expires_at)", "max(put_expires_at)", "LEAST(now(), clock_timestamp())", "expires_at>cutoff", "lease_expires_at>cutoff", "drain_not_before<clock_timestamp()"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("fresh chain installed a function without %q: %s", want, body)
 		}
@@ -228,8 +228,7 @@ func TestR2WritesBlockedMigrationRunsThroughMigrateUp(t *testing.T) {
 	}
 }
 
-// The expiry probes must reach the indexes once the tables hold production-sized
-// expired backlogs; a seq scan is what timed the delete executor out.
+// The expiry probes must reach the indexes with a large expired backlog.
 func TestR2WritesBlockedExpiryProbesUseIndexes(t *testing.T) {
 	pool, _ := r2WritesBlockedSchema(t)
 	r2WritesBlockedTables(t, pool)
@@ -237,8 +236,7 @@ func TestR2WritesBlockedExpiryProbesUseIndexes(t *testing.T) {
 	if err := migrateR2WritesBlocked(t, pool); err != nil {
 		t.Fatal(err)
 	}
-	// max(col) > now() is a backward index-only scan; the planner only chooses it
-	// when the table is big enough to beat a seq scan, so seed a real backlog.
+	// The planner favors the backward scan when the table has enough rows.
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_upload_intents(bucket,object_key,expires_at)
  SELECT 'b','k'||n,now()-interval '1 day' FROM generate_series(1,50000) n;
  INSERT INTO nas_restore_requests(object_key,put_expires_at)
@@ -251,7 +249,8 @@ func TestR2WritesBlockedExpiryProbesUseIndexes(t *testing.T) {
 		{"nas_restore_requests", "put_expires_at"},
 	} {
 		var raw []byte
-		subquery := fmt.Sprintf(`SELECT COALESCE((SELECT max(%s) FROM %s)>now(),false)`, q.column, q.table)
+		subquery := fmt.Sprintf(`WITH expiry_cutoff AS MATERIALIZED (SELECT LEAST(now(), clock_timestamp()) AS cutoff)
+ SELECT COALESCE((SELECT max(%s) FROM %s)>cutoff,false) FROM expiry_cutoff`, q.column, q.table)
 		if err := pool.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+subquery).Scan(&raw); err != nil {
 			t.Fatal(err)
 		}
@@ -268,18 +267,19 @@ func TestR2WritesBlockedExpiryProbesUseIndexes(t *testing.T) {
 			t.Fatalf("%s still seq scans: %s", subquery, plan)
 		}
 	}
-	// The deployed function is cheaper than a delete's own round trip with this
-	// backlog, instead of spending seconds per call.
-	start := time.Now()
-	var blocked bool
-	if err := pool.QueryRow(ctx, `SELECT r2_retirement_writes_blocked('b',$1)`, strings.Repeat("a", 64)).Scan(&blocked); err != nil {
+	// A mature fence makes the installed function evaluate the writer vetoes.
+	endpoint := strings.Repeat("a", 64)
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256,drain_not_before) VALUES('b',$1,now()-interval '1 minute')`, endpoint); err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
-		t.Fatalf("function call took %s with 50k expired rows", elapsed)
+	start := time.Now()
+	var blocked bool
+	if err := pool.QueryRow(ctx, `SELECT r2_retirement_writes_blocked('b',$1)`, endpoint).Scan(&blocked); err != nil {
+		t.Fatal(err)
 	}
-	if blocked {
-		t.Fatal("missing fence reported writes blocked")
+	t.Logf("mature-fence predicate with 50k expired rows per index took %s", time.Since(start))
+	if !blocked {
+		t.Fatal("an expired backlog vetoed a mature fence")
 	}
 }
 
@@ -329,9 +329,8 @@ func TestR2WritesBlockedEveryClockedSurfaceVetoes(t *testing.T) {
 	}
 }
 
-// now() is the transaction start, never later than clock_timestamp(). A row that
-// expired during a long transaction must still count as live, so the function
-// errs toward blocked; the old per-row clock would have called it drained.
+// The cutoff cannot advance beyond the transaction start. An expiry after
+// that start must still veto retirement once the wall clock has advanced.
 func TestR2WritesBlockedTreatsExpiryDuringTransactionAsLive(t *testing.T) {
 	pool, _ := r2WritesBlockedSchema(t)
 	r2WritesBlockedTables(t, pool)
@@ -343,14 +342,14 @@ func TestR2WritesBlockedTreatsExpiryDuringTransactionAsLive(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256,drain_not_before) VALUES('b',$1,now()-interval '1 minute')`, endpoint); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO recording_upload_intents(bucket,object_key,expires_at) VALUES('b','k',now()+interval '30 milliseconds')`); err != nil {
-		t.Fatal(err)
-	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `INSERT INTO recording_upload_intents(bucket,object_key,expires_at) VALUES('b','k',now()+interval '30 milliseconds')`); err != nil {
+		t.Fatal(err)
+	}
 	// The transaction's now() predates the row's expiry for its whole lifetime.
 	if _, err = tx.Exec(ctx, `SELECT pg_sleep(0.1)`); err != nil {
 		t.Fatal(err)

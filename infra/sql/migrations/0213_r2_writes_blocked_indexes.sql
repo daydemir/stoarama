@@ -50,34 +50,29 @@ BEGIN
  END IF;
 END $$;
 
--- The 0198 function without a VOLATILE per-row clock in any expiry probe. The
--- R2 delete executor timed out at about 8.9s because both a bare and an
--- InitPlan-wrapped clock_timestamp() left these probes seq-scanning: the planner
--- cannot estimate or index on a VOLATILE value. Two shapes reach the indexes
--- above instead:
---  * max(col) > now() for the two indexed tables. max(x) > T is equivalent to
---    EXISTS(x > T) and an index-only or backward index scan finds it in one row;
---    NULL from an empty table coalesces to false, exactly like EXISTS.
---  * EXISTS(col > now()) for the other three clocked tables.
--- This is equally or more conservative than the per-row clock. now() is the
--- transaction start, which is never later than clock_timestamp(). With that
--- earlier time more rows count as live writers, so the function returns TRUE
--- (writes blocked, safe to delete) only in a subset of the cases where it
--- returned TRUE before. It never returns TRUE when the old one returned FALSE.
--- writer_operations has no clock and the fence-row drain_not_before check keeps
--- clock_timestamp() unchanged. Signature, language, default VOLATILE volatility,
--- owner and grants are unchanged.
+-- Compare the latest expiry to the cutoff outside the two large-table
+-- subqueries. PostgreSQL can retrieve each max() with a backward index scan.
+-- An empty table or all-NULL expiry yields false, as with the original EXISTS.
+-- Sample one cutoff for all five expiry probes. Using the earlier clock means
+-- a long transaction keeps its veto, and a backward wall-clock step before
+-- the check cannot let transaction time prematurely clear a writer.
+-- The exact fence still uses the strict wall-clock deadline. The function's
+-- signature, volatility, ownership and grants are unchanged.
 CREATE OR REPLACE FUNCTION r2_retirement_writes_blocked(b text, endpoint text)
 RETURNS boolean LANGUAGE sql AS $$
+ WITH expiry_cutoff AS MATERIALIZED (
+   SELECT LEAST(now(), clock_timestamp()) AS cutoff
+ )
  SELECT EXISTS(SELECT 1 FROM r2_retirement_writer_fences
    WHERE bucket=b AND endpoint_sha256=endpoint
      AND drain_not_before<clock_timestamp())
  AND NOT (
    EXISTS(SELECT 1 FROM r2_retirement_writer_operations WHERE completed_at IS NULL)
-   OR EXISTS(SELECT 1 FROM r2_retirement_writer_capabilities WHERE expires_at>now())
-   OR COALESCE((SELECT max(expires_at) FROM recording_upload_intents)>now(),false)
-   OR EXISTS(SELECT 1 FROM upload_intents WHERE expires_at>now())
-   OR EXISTS(SELECT 1 FROM capture_session_leases WHERE lease_expires_at>now())
-   OR COALESCE((SELECT max(put_expires_at) FROM nas_restore_requests)>now(),false)
- );
+   OR EXISTS(SELECT 1 FROM r2_retirement_writer_capabilities WHERE expires_at>cutoff)
+   OR COALESCE((SELECT max(expires_at) FROM recording_upload_intents)>cutoff,false)
+   OR EXISTS(SELECT 1 FROM upload_intents WHERE expires_at>cutoff)
+   OR EXISTS(SELECT 1 FROM capture_session_leases WHERE lease_expires_at>cutoff)
+   OR COALESCE((SELECT max(put_expires_at) FROM nas_restore_requests)>cutoff,false)
+ )
+ FROM expiry_cutoff;
 $$;
