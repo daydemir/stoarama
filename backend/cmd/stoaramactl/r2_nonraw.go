@@ -40,6 +40,33 @@ func inverseCollatedPrefixAllowed(key string) bool {
 		strings.HasPrefix(key, "joined/best14-20261021/")
 }
 
+// inverseConfidentRepairPrefix holds the delivery page's confident repairs:
+// lossless joins of original delivery parts, with no catalog row (0225).
+const inverseConfidentRepairPrefix = "experimental/stitching-confident-repairs/"
+
+// inverseNonrawKind is the ledger kind a nonraw key retires under. A collated
+// output is keyed by its catalog id; a confident repair, which has no catalog
+// row, by its owner exemption id.
+type inverseNonrawKind string
+
+const (
+	inverseNonrawKindCollated inverseNonrawKind = "collated"
+	inverseNonrawKindRepair   inverseNonrawKind = "delivery_repair"
+)
+
+// inverseNonrawKindOf picks the loader for a key from its family. The loader,
+// not the prefix, is the mapping authority: it still needs an exact catalog
+// output or an exact open exemption.
+func inverseNonrawKindOf(key string) (inverseNonrawKind, bool) {
+	switch {
+	case inverseCollatedPrefixAllowed(key):
+		return inverseNonrawKindCollated, true
+	case strings.HasPrefix(key, inverseConfidentRepairPrefix):
+		return inverseNonrawKindRepair, true
+	}
+	return "", false
+}
+
 type inverseCollatedSource struct {
 	ID       int64      `json:"id"`
 	StreamID int64      `json:"stream_id"`
@@ -72,6 +99,25 @@ type inverseCollatedAssessment struct {
 	Reason        string
 	Keep28        bool
 	Choice        string
+	Kind          inverseNonrawKind
+	// Exemption is the key's open owner exemption class, empty when none, and
+	// ExemptETag the exact page ETag that exemption binds.
+	Exemption  deliveryExemptionClass
+	ExemptETag string
+}
+
+// keep28Held reports whether the pinned window still protects the output. Only
+// an open in_window exemption, whose gate needs NAS custody, lifts it.
+func (x inverseCollatedAssessment) keep28Held() bool {
+	return x.Keep28 && x.Exemption != deliveryExemptInWindow
+}
+
+// reason is the partition and receipt reason the output retires under.
+func (x inverseCollatedAssessment) reason() string {
+	if x.Exemption != "" {
+		return x.Exemption.receiptReason()
+	}
+	return inverseNonrawReason
 }
 
 // $1 is the bucket. The jsonb source aggregate is built in the same statement so
@@ -91,8 +137,7 @@ const inverseNonrawColumns = `
    FROM recording_collation_outputs oo CROSS JOIN LATERAL unnest(oo.source_clip_ids) sid
    JOIN recording_clips c ON c.id=sid JOIN recordings rr ON rr.id=c.recording_id
    LEFT JOIN streams s ON s.id=rr.stream_id WHERE oo.id=o.id),
- EXISTS(SELECT 1 FROM nas_cleanup_incident_roster i WHERE i.bucket=$1 AND i.object_key=o.object_key)
-  OR EXISTS(SELECT 1 FROM delivery_keep_holds k WHERE k.bucket=$1 AND k.object_key=o.object_key)
+ r2_nonraw_key_held($1,o.object_key,'collated',o.id)
   OR EXISTS(SELECT 1 FROM nas_cleanup_reserved_files f WHERE f.kind='raw' AND f.source_id=ANY(o.source_clip_ids))
   OR EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id
     WHERE h.clip_id=ANY(o.source_clip_ids) AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items it
@@ -107,22 +152,53 @@ const inverseNonrawColumns = `
     WHERE c.id=ANY(o.source_clip_ids))
   OR EXISTS(SELECT 1 FROM recording_clips c JOIN recording_joined_dry_run_scopes ds
     ON ds.recording_id=c.recording_id AND ds.recording_job_id=c.recording_job_id AND c.id<=ds.high_water_clip_id
-    WHERE c.id=ANY(o.source_clip_ids))
-  OR EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.bucket=$1 AND x.object_key=o.object_key)
-  OR EXISTS(SELECT 1 FROM nas_r2_copy_items ci WHERE (ci.state<>'verified' OR ci.blocked_reason<>'')
-    AND ci.item->>'bucket'=$1 AND ci.item->>'object_key'=o.object_key)
-  OR EXISTS(SELECT 1 FROM r2_nonraw_intents ni WHERE ni.bucket=$1 AND ni.object_key=o.object_key AND ni.source_id<>o.id)
-  OR EXISTS(SELECT 1 FROM r2_inverse_intents ri WHERE ri.bucket=$1 AND ri.object_key=o.object_key)
-  OR EXISTS(SELECT 1 FROM r2_retirement_reservations rv WHERE rv.bucket=$1 AND rv.object_key=o.object_key
-    AND NOT (rv.kind='collated' AND rv.source_id=o.id))`
+    WHERE c.id=ANY(o.source_clip_ids)),
+ coalesce(x.class::text,''),coalesce(x.etag,'')`
 
 const inverseNonrawBatchSQL = `SELECT` + inverseNonrawColumns + `
 FROM recording_collation_outputs o
 JOIN recording_collation_hours h ON h.id=o.collation_hour_id
 JOIN recordings r ON r.id=h.recording_id
-LEFT JOIN streams s ON s.id=r.stream_id`
+LEFT JOIN streams s ON s.id=r.stream_id
+LEFT JOIN r2_delivery_exemptions x ON x.bucket=$1 AND x.object_key=o.object_key AND r2_delivery_exempt(x.bucket,x.object_key)`
 
 const inverseNonrawTargetSQL = inverseNonrawBatchSQL + ` WHERE o.object_key=$2 FOR SHARE OF o`
+
+// A confident repair's identity is its open exemption and the exact page row it
+// binds; it has no catalog output and no RAW sources. Every input is re-read
+// under lock at reserve and at wire, and the page row is share-locked so its
+// identity cannot change before the DELETE.
+const inverseRepairBatchSQL = `SELECT x.id,h.object_key,coalesce(r.stream_id,0),h.size_bytes,h.sha256,h.relative_path,h.imported_at,
+ (SELECT count(*) FROM recording_clips rc WHERE rc.bucket=$1 AND rc.object_key=h.object_key),
+ (SELECT count(*) FROM recording_collation_outputs d WHERE d.object_key=h.object_key),
+ r2_nonraw_key_held($1,h.object_key,'delivery_repair',x.id),x.class::text,x.etag
+FROM r2_delivery_exemptions x JOIN delivery_keep_holds h ON h.bucket=x.bucket AND h.object_key=x.object_key
+LEFT JOIN recordings r ON r.id=h.recording_id
+WHERE x.bucket=$1 AND x.class='confident_repair' AND r2_delivery_exempt(x.bucket,x.object_key)`
+
+const inverseRepairTargetSQL = inverseRepairBatchSQL + ` AND x.object_key=$2 FOR SHARE OF x,h`
+
+// inverseNonrawLoader is the only per-kind part of the nonraw lane: how a key's
+// identity is loaded and assessed, and how its absence is bound back to it.
+type inverseNonrawLoader struct {
+	batchSQL, targetSQL string
+	scan                func(pgx.Rows) (inverseCollatedAssessment, error)
+	assess              func(inverseProtection, inverseCollatedAssessment) inverseCollatedAssessment
+	// absentSQL selects the intent's source id only while the intent still names
+	// the exact identity it reserved ($1 bucket, $2 key, $3 manifest, $4 endpoint).
+	absentSQL string
+}
+
+var inverseNonrawLoaders = map[inverseNonrawKind]inverseNonrawLoader{
+	inverseNonrawKindCollated: {inverseNonrawBatchSQL, inverseNonrawTargetSQL, scanCollated, assessCollated, `SELECT o.id FROM r2_nonraw_intents i
+ JOIN recording_collation_outputs o ON o.id=i.source_id
+ WHERE i.kind='collated' AND i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 AND i.endpoint_sha256=$4
+ AND o.object_key=i.object_key AND o.size_bytes=i.size_bytes AND lower(o.sha256)=i.sha256 FOR SHARE OF o`},
+	inverseNonrawKindRepair: {inverseRepairBatchSQL, inverseRepairTargetSQL, scanRepair, assessRepair, `SELECT x.id FROM r2_nonraw_intents i
+ JOIN r2_delivery_exemptions x ON x.id=i.source_id
+ WHERE i.kind='delivery_repair' AND i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 AND i.endpoint_sha256=$4
+ AND x.bucket=i.bucket AND x.object_key=i.object_key AND x.size_bytes=i.size_bytes AND x.etag=btrim(i.etag,'"')`},
+}
 
 // classifyCollated is the partition-side answer for a collated key. The caller
 // reaches here only from the collated branch of classify, so a RAW identity can
@@ -152,16 +228,16 @@ func (p inverseProtection) classifyCollated(o r2.ObjectInfo, x inverseCollatedAs
 	if x.ID <= 0 || !r2RetireLowerHex64(x.SHA) {
 		return inverseUnknown, "no_collated_catalog_output"
 	}
-	if m := inverseCollatedKeyRE.FindStringSubmatch(o.Key); m == nil || m[2] != strings.ToLower(x.SHA) {
+	if m := inverseCollatedKeyRE.FindStringSubmatch(o.Key); x.Kind == inverseNonrawKindCollated && (m == nil || m[2] != strings.ToLower(x.SHA)) {
 		return inverseHeld, "content_addressed_key_mismatch"
 	}
-	if x.Keep28 {
+	if x.keep28Held() {
 		// Neither owner ACKs nor copied RAW sources prove a current hashed
 		// inventory of this output, so keep28 collated footage stays held.
 		return inverseHeld, "keep28_nonraw_no_fresh_nas_inventory"
 	}
 	// A delivery hold on mapped footage is an ownership veto, not a protection.
-	return inverseCollated, inverseNonrawReason
+	return inverseCollated, x.reason()
 }
 
 func scanCollated(rows pgx.Rows) (inverseCollatedAssessment, error) {
@@ -170,9 +246,10 @@ func scanCollated(rows pgx.Rows) (inverseCollatedAssessment, error) {
 	var shared, card, distinct, resolved, rawIdentities int64
 	if err := rows.Scan(&x.ID, &x.Key, &x.StreamID, &x.SizeBytes, &x.SHA, &x.Path, &x.VerifiedAt,
 		&x.Start, &x.End, &x.Timezone, &rawIdentities,
-		&shared, &card, &distinct, &resolved, &sourceJSON, &x.Held); err != nil {
+		&shared, &card, &distinct, &resolved, &sourceJSON, &x.Held, &x.Exemption, &x.ExemptETag); err != nil {
 		return x, err
 	}
+	x.Kind = inverseNonrawKindCollated
 	x.Shared = shared != 1
 	x.RawIdentities = rawIdentities
 	if err := json.Unmarshal([]byte(sourceJSON), &x.Sources); err != nil {
@@ -182,6 +259,36 @@ func scanCollated(rows pgx.Rows) (inverseCollatedAssessment, error) {
 		x.Reason = "collated_sources_empty_duplicate_or_unresolved"
 	}
 	return x, nil
+}
+
+func scanRepair(rows pgx.Rows) (inverseCollatedAssessment, error) {
+	x := inverseCollatedAssessment{Kind: inverseNonrawKindRepair}
+	var outputs int64
+	err := rows.Scan(&x.ID, &x.Key, &x.StreamID, &x.SizeBytes, &x.SHA, &x.Path, &x.VerifiedAt,
+		&x.RawIdentities, &outputs, &x.Held, &x.Exemption, &x.ExemptETag)
+	x.Shared = outputs != 0
+	return x, err
+}
+
+// assessRepair holds a confident repair unless it is a lone page key with a
+// complete identity on a decided stream. It has no interval: the owner approved
+// every confident repair once the page is down, so no window applies.
+func assessRepair(p inverseProtection, x inverseCollatedAssessment) inverseCollatedAssessment {
+	switch choice := p.Picks.Choices[x.StreamID].Choice; {
+	case !strings.HasPrefix(x.Key, inverseConfidentRepairPrefix):
+		x.Reason = "unsupported_repair_prefix"
+	case x.Shared:
+		x.Reason = "repair_key_also_collated_output"
+	case x.RawIdentities != 0:
+		x.Reason = "key_also_raw_identity"
+	case x.Held:
+		x.Reason = "live_hold"
+	case x.StreamID <= 0 || !r2RetireLowerHex64(x.SHA) || x.Path == "":
+		x.Reason = "repair_identity_incomplete"
+	case choice != "all" && choice != "none" && choice != "st" && choice != "keep":
+		x.Reason = "repair_stream_undecided"
+	}
+	return x
 }
 
 // assessCollated applies KE and pinned keep28 to ONE output using fresh picks and
@@ -280,20 +387,31 @@ func assessCollated(p inverseProtection, x inverseCollatedAssessment) inverseCol
 // loadInverseCollatedTargets assesses every catalog output once per batch so the
 // partition can report each object individually. Reports never authorize wire.
 func loadInverseCollatedTargets(ctx context.Context, q r2RetireQuerier, bucket string, p inverseProtection) (map[string]inverseCollatedAssessment, error) {
-	rows, err := q.Query(ctx, inverseNonrawBatchSQL, bucket)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	out := map[string]inverseCollatedAssessment{}
-	for rows.Next() {
-		x, err := scanCollated(rows)
-		if err != nil {
+	for _, kind := range []inverseNonrawKind{inverseNonrawKindCollated, inverseNonrawKindRepair} {
+		loader := inverseNonrawLoaders[kind]
+		if err := func() error {
+			rows, err := q.Query(ctx, loader.batchSQL, bucket)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				x, err := loader.scan(rows)
+				if err != nil {
+					return err
+				}
+				if _, dup := out[x.Key]; dup && kind == inverseNonrawKindRepair {
+					return fmt.Errorf("confident repair %s is also a collated output key", x.Key)
+				}
+				out[x.Key] = loader.assess(p, x)
+			}
+			return rows.Err()
+		}(); err != nil {
 			return nil, err
 		}
-		out[x.Key] = assessCollated(p, x)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // loadNonrawTarget reloads the exact output under lock. A partition assessment is
@@ -301,14 +419,19 @@ func loadInverseCollatedTargets(ctx context.Context, q r2RetireQuerier, bucket s
 // are all re-derived here and again at the wire.
 func (a *inverseApplier) loadNonrawTarget(ctx context.Context, tx pgx.Tx, e inverseEntry) (inverseCollatedAssessment, error) {
 	var t inverseCollatedAssessment
-	rows, err := tx.Query(ctx, inverseNonrawTargetSQL, a.store.Bucket(), e.Key)
+	kind, ok := inverseNonrawKindOf(e.Key)
+	if !ok {
+		return t, fmt.Errorf("%w: key is in no nonraw family", errInverseNonrawIneligible)
+	}
+	loader := inverseNonrawLoaders[kind]
+	rows, err := tx.Query(ctx, loader.targetSQL, a.store.Bucket(), e.Key)
 	if err != nil {
 		return t, err
 	}
 	n := 0
 	for rows.Next() {
 		n++
-		if t, err = scanCollated(rows); err != nil {
+		if t, err = loader.scan(rows); err != nil {
 			rows.Close()
 			return t, err
 		}
@@ -318,9 +441,13 @@ func (a *inverseApplier) loadNonrawTarget(ctx context.Context, tx pgx.Tx, e inve
 	if err != nil {
 		return t, err
 	}
-	t = assessCollated(a.protection, t)
-	if n != 1 || t.ID <= 0 || t.SizeBytes <= 0 || t.SizeBytes != e.SizeBytes || t.Reason != "" || t.Keep28 {
-		return t, fmt.Errorf("%w: collated identity absent, protected, unresolved or changed (%s)", errInverseNonrawIneligible, t.Reason)
+	t = loader.assess(a.protection, t)
+	if n != 1 || t.ID <= 0 || t.SizeBytes <= 0 || t.SizeBytes != e.SizeBytes || t.Reason != "" || t.keep28Held() {
+		return t, fmt.Errorf("%w: %s identity absent, protected, unresolved or changed (%s)", errInverseNonrawIneligible, kind, t.Reason)
+	}
+	// An exemption binds the exact page object; the listed object must be it.
+	if t.Exemption != "" && strings.Trim(e.ETag, `"`) != t.ExemptETag {
+		return t, fmt.Errorf("%w: listed ETag differs from the exempt page identity", errInverseNonrawIneligible)
 	}
 	t.Choice = a.protection.Picks.Choices[t.StreamID].Choice
 	if t.Choice == "all" {
@@ -401,15 +528,15 @@ func (a *inverseApplier) reserveNonraw(ctx context.Context, e inverseEntry) (inv
 	// Typed immutable intent BEFORE the shared reservation, in ONE transaction,
 	// with no network access before commit.
 	if _, err = tx.Exec(ctx, `INSERT INTO r2_nonraw_intents(bucket,object_key,endpoint_sha256,kind,stream_id,source_id,source_ids,size_bytes,sha256,nas_relative_path,etag,last_modified,verification_at,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,retirement_class,choice)
- VALUES($1,$2,$3,'collated',$4,$5,$6::bigint[],$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+ VALUES($1,$2,$3,$19,$4,$5,$6::bigint[],$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
 		a.store.Bucket(), e.Key, a.store.EndpointSHA256(), t.StreamID, t.ID, ids,
 		e.SizeBytes, t.SHA, t.Path, e.ETag, e.LastModified, t.VerifiedAt,
 		a.opts.ManifestSHA, a.summary.PolicySHA256, a.summary.PicksSHA256, a.opts.DrainSHA,
-		inverseNonrawRetirementClass, t.Choice); err != nil {
+		inverseNonrawRetirementClass, t.Choice, string(t.Kind)); err != nil {
 		return t, err
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class)
- VALUES('collated',$1,$2,$3,$4,$5,$6,$7)`, t.ID, a.store.Bucket(), e.Key, e.SizeBytes, t.SHA, a.opts.ManifestSHA, inverseNonrawRetirementClass); err != nil {
+ VALUES($8,$1,$2,$3,$4,$5,$6,$7)`, t.ID, a.store.Bucket(), e.Key, e.SizeBytes, t.SHA, a.opts.ManifestSHA, inverseNonrawRetirementClass, string(t.Kind)); err != nil {
 		return t, err
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO r2_inverse_budget_minutes(bucket,minute,charged_bytes) VALUES($1,date_trunc('minute',clock_timestamp()),$2) ON CONFLICT(bucket,minute) DO UPDATE SET charged_bytes=r2_inverse_budget_minutes.charged_bytes+excluded.charged_bytes`, a.store.Bucket(), e.SizeBytes); err != nil {
@@ -425,8 +552,8 @@ func (a *inverseApplier) proveNonrawReceipt(ctx context.Context, tx pgx.Tx, t in
 		return err
 	}
 	_, proofErr := tx.Exec(ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256,already_absent)
- VALUES('collated',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,false)`,
-		t.ID, t.StreamID, a.store.Bucket(), e.Key, e.SizeBytes, t.SHA, inverseNonrawReason, t.Choice, a.opts.ManifestSHA, a.summary.PolicySHA256)
+ VALUES($11,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,false)`,
+		t.ID, t.StreamID, a.store.Bucket(), e.Key, e.SizeBytes, t.SHA, t.reason(), t.Choice, a.opts.ManifestSHA, a.summary.PolicySHA256, string(t.Kind))
 	if _, err := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT nonraw_receipt_proof`); err != nil {
 		return err
 	}
@@ -439,7 +566,7 @@ func (a *inverseApplier) proveNonrawReceipt(ctx context.Context, tx pgx.Tx, t in
 	return nil
 }
 
-func (a *inverseApplier) publishNonrawAbsent(ctx context.Context, e inverseEntry, manifest string) error {
+func (a *inverseApplier) publishNonrawAbsent(ctx context.Context, e inverseEntry, t inverseCollatedAssessment, manifest string) error {
 	tx, err := a.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return err
@@ -449,25 +576,21 @@ func (a *inverseApplier) publishNonrawAbsent(ctx context.Context, e inverseEntry
 		return err
 	}
 	var sourceID int64
-	if err = tx.QueryRow(ctx, `SELECT o.id FROM r2_nonraw_intents i
- JOIN recording_collation_outputs o ON o.id=i.source_id
- WHERE i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 AND i.endpoint_sha256=$4
- AND o.object_key=i.object_key AND o.size_bytes=i.size_bytes AND lower(o.sha256)=i.sha256 FOR SHARE OF o`,
+	if err = tx.QueryRow(ctx, inverseNonrawLoaders[t.Kind].absentSQL,
 		a.store.Bucket(), e.Key, manifest, a.store.EndpointSHA256()).Scan(&sourceID); err != nil {
-		return fmt.Errorf("nonraw absence publication requires exact catalog output: %w", err)
+		return fmt.Errorf("nonraw absence publication requires the exact %s identity: %w", t.Kind, err)
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256,already_absent)
- SELECT 'collated',o.id,i.stream_id,i.bucket,i.object_key,i.size_bytes,i.sha256,$4,i.choice,i.manifest_sha256,i.policy_sha256,$5
- FROM r2_nonraw_intents i JOIN recording_collation_outputs o ON o.id=i.source_id
- WHERE i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 ON CONFLICT DO NOTHING`,
-		a.store.Bucket(), e.Key, manifest, inverseNonrawReason, false); err != nil {
+ SELECT i.kind,i.source_id,i.stream_id,i.bucket,i.object_key,i.size_bytes,i.sha256,$4,i.choice,i.manifest_sha256,i.policy_sha256,false
+ FROM r2_nonraw_intents i WHERE i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 ON CONFLICT DO NOTHING`,
+		a.store.Bucket(), e.Key, manifest, t.reason()); err != nil {
 		return err
 	}
 	var receipt bool
 	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_object_retirements r JOIN r2_nonraw_intents i
  ON r.bucket=i.bucket AND r.object_key=i.object_key WHERE i.bucket=$1 AND i.object_key=$2
- AND r.kind='collated' AND r.reason=$3 AND r.source_id=$4 AND r.manifest_sha256=$5)`,
-		a.store.Bucket(), e.Key, inverseNonrawReason, sourceID, manifest).Scan(&receipt); err != nil {
+ AND r.kind=i.kind AND r.kind=$6 AND r.reason=$3 AND r.source_id=$4 AND r.manifest_sha256=$5)`,
+		a.store.Bucket(), e.Key, t.reason(), sourceID, manifest, string(t.Kind)).Scan(&receipt); err != nil {
 		return err
 	}
 	if !receipt {
@@ -492,7 +615,7 @@ func (a *inverseApplier) deleteNonraw(ctx, admit context.Context, send *inverseS
 	}
 	reserving, stopReserving := context.WithCancel(ctx)
 	defer context.AfterFunc(admit, stopReserving)()
-	_, err := a.reserveNonraw(reserving, e)
+	t, err := a.reserveNonraw(reserving, e)
 	stopReserving()
 	if err != nil {
 		if admit.Err() != nil && errors.Is(err, context.Canceled) {
@@ -527,7 +650,7 @@ func (a *inverseApplier) deleteNonraw(ctx, admit context.Context, send *inverseS
 	if err = tx.Commit(ctx); err != nil {
 		return false, err
 	}
-	if err = a.publishNonrawAbsent(ctx, e, a.opts.ManifestSHA); err != nil {
+	if err = a.publishNonrawAbsent(ctx, e, t, a.opts.ManifestSHA); err != nil {
 		return false, err
 	}
 	return true, nil

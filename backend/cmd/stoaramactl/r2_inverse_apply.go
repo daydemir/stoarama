@@ -925,7 +925,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 			if _, dup := candidates[e.Key]; dup {
 				return result, errors.New("duplicate collated partition key")
 			}
-			if !inverseCollatedPrefixAllowed(e.Key) {
+			if _, ok := inverseNonrawKindOf(e.Key); !ok {
 				continue
 			}
 			candidates[e.Key] = e

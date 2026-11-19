@@ -52,8 +52,10 @@ type inverseProtection struct {
 	Identities     map[string][]inverseIdentity
 	Held, Delivery map[string]bool
 	// PageKeep is the exact key set of delivery_keep_holds: every link on the
-	// public delivery page. No owner scope waives it.
+	// public delivery page. No owner scope waives it; only an owner exemption
+	// whose class gate is open (Exempt) does.
 	PageKeep map[string]bool
+	Exempt   map[string]deliveryExemptionClass
 	// OwnerKeepPrefixes are durable owner keep holds on whole key prefixes. A
 	// key under one is kept whatever its catalog status.
 	OwnerKeepPrefixes []string
@@ -108,8 +110,9 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 		}
 	}
 	// Deniz, 2026-11-12: keep up only the links on the public delivery page.
-	// Those exact keys stay delivery in every scope, reviewed or not.
-	if p.PageKeep[o.Key] {
+	// Those exact keys stay delivery in every scope, reviewed or not, until the
+	// owner exempts the key and its class gate opens (0225).
+	if _, exempt := p.Exempt[o.Key]; p.PageKeep[o.Key] && !exempt {
 		return inverseDelivery, "delivery_page_keep"
 	}
 	if p.Held[o.Key] {
@@ -302,6 +305,7 @@ WITH held_sources AS (
  UNION SELECT bucket,object_key FROM nas_stitch_r2_input_holds WHERE released_at IS NULL
 ) SELECT object_key FROM held_keys WHERE bucket=$1`
 const inversePageKeepSQL = `SELECT object_key FROM delivery_keep_holds WHERE bucket=$1`
+const inverseExemptSQL = `SELECT object_key,class::text FROM r2_delivery_exemptions WHERE bucket=$1 AND r2_delivery_exempt(bucket,object_key)`
 const inverseJoinedReleasedSQL = `SELECT DISTINCT c.object_key FROM recording_joined_source_snapshots s JOIN recording_clips c ON c.id=s.clip_id
 WHERE c.bucket=$1 AND r2_joined_source_released(c.id)`
 const inverseDeliverySQL = `
@@ -330,7 +334,7 @@ func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string
 // reviewed non-raw scope is explicitly selected. Default callers keep the exact
 // previous classification, where collated keys are deferred and delivery holds.
 func loadInverseProtectionMode(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks, windows map[int64]api.Keep28Window, reviewed bool) (inverseProtection, error) {
-	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, PageKeep: map[string]bool{}, JoinedReleased: map[string]bool{}, KEFolders: map[string]bool{}, Windows: windows, Picks: picks, ReviewedCollated: reviewed, ReviewedDelivery: reviewed}
+	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, PageKeep: map[string]bool{}, Exempt: map[string]deliveryExemptionClass{}, JoinedReleased: map[string]bool{}, KEFolders: map[string]bool{}, Windows: windows, Picks: picks, ReviewedCollated: reviewed, ReviewedDelivery: reviewed}
 	rows, err := q.Query(ctx, inverseCatalogSQL, bucket)
 	if err != nil {
 		return p, err
@@ -358,6 +362,9 @@ func loadInverseProtectionMode(ctx context.Context, q r2RetireQuerier, bucket st
 		return p, err
 	}
 	if p.OwnerKeepPrefixes, err = loadInverseOwnerKeepPrefixes(ctx, q, bucket); err != nil {
+		return p, err
+	}
+	if p.Exempt, err = loadInverseExempt(ctx, q, bucket); err != nil {
 		return p, err
 	}
 	for _, set := range []struct {
@@ -393,6 +400,24 @@ func loadInverseProtectionMode(ctx context.Context, q r2RetireQuerier, bucket st
 		}
 	}
 	return p, nil
+}
+
+// loadInverseExempt reads the page keys whose owner exemption is open now.
+func loadInverseExempt(ctx context.Context, q r2RetireQuerier, bucket string) (map[string]deliveryExemptionClass, error) {
+	rows, err := q.Query(ctx, inverseExemptSQL, bucket)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]deliveryExemptionClass{}
+	for rows.Next() {
+		var key, class string
+		if err = rows.Scan(&key, &class); err != nil {
+			return nil, err
+		}
+		out[key] = deliveryExemptionClass(class)
+	}
+	return out, rows.Err()
 }
 
 type inverseLister interface {
@@ -491,6 +516,14 @@ func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 	}
 	if len(args) > 0 && args[0] == "job" {
 		runR2InverseJob(ctx, cfg, args[1:])
+		return
+	}
+	if len(args) > 0 && args[0] == "exempt" {
+		runR2InverseExempt(ctx, cfg, args[1:])
+		return
+	}
+	if len(args) > 0 && args[0] == "page-retired" {
+		runR2InversePageRetired(ctx, cfg, args[1:])
 		return
 	}
 	const usage = "usage: stoaramactl r2-inverse partition --picks FILE --out DIR [--owner-footage-scope] (read-only full bucket partition)"

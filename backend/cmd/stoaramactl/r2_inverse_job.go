@@ -201,7 +201,7 @@ func errorText(err error) string {
 }
 
 // inverseJobPageKeepOverlap counts the lane's partition candidates, the exact
-// public delivery page keys on record, and the candidates that are page keys.
+// protected public delivery page keys, and the candidates that are such keys.
 func inverseJobPageKeepOverlap(ctx context.Context, pool *pgxpool.Pool, bucket, manifest string, lane inverseLane) (int, int64, int64, error) {
 	f, err := os.Open(manifest)
 	if err != nil {
@@ -224,6 +224,7 @@ func inverseJobPageKeepOverlap(ctx context.Context, pool *pgxpool.Pool, bucket, 
 		return 0, 0, 0, err
 	}
 	var held, overlap int64
-	err = pool.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE object_key=ANY($2::text[])) FROM delivery_keep_holds WHERE bucket=$1`, bucket, keys).Scan(&held, &overlap)
+	// An exempt key whose class gate is open is no longer a protected page key.
+	err = pool.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE object_key=ANY($2::text[])) FROM delivery_keep_holds WHERE bucket=$1 AND NOT r2_delivery_exempt(bucket,object_key)`, bucket, keys).Scan(&held, &overlap)
 	return len(keys), held, overlap, err
 }

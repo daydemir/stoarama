@@ -200,3 +200,87 @@ load can hold the worker entirely. Selection and startup memory at full
 cardinality remain unmeasured: B2 retains the report's keep28 entries in memory,
 and both lanes read their historical intents and ledger. Use bounded controller
 batches and measure startup/RSS before scaling.
+
+## Delivery page exemptions (0225)
+
+Every link on the public delivery page is a `delivery_keep_holds` row, and no
+lane may retire one. Migration 0225 lets exactly the page keys Deniz later
+approved for deletion lose that protection, one class at a time, and only while
+the class's gate is open. The gate lives in SQL (`r2_delivery_exempt`), so the
+0190 reservation/receipt guard, the RAW delivery closure, the collated lane and
+any stale binary all read the same answer.
+
+| Class | Page rows | Gate |
+| --- | --- | --- |
+| `outside_window` | `video_collated` under `joined/goodplus-*` or `joined/nightly-collation-v2/`, outside every keep window (4,348, 0.582 TB) | open once seeded |
+| `confident_repair` | `video_assembly` under `experimental/stitching-confident-repairs/`, no catalog row (9,232, 3.377 TB) | page retirement marker exists |
+| `in_window` | `video_collated` inside a keep window (10,893, 2.347 TB) | page retirement marker exists **and** the exact output is NAS-certified (`r2_delivery_nas_certified`) |
+
+An exemption binds the exact `(bucket, object_key, etag, size_bytes)` of the
+live page row and stores the class's verbatim owner decision and the roster
+SHA-256. It is append-only. If the page row's identity ever drifts, the key is
+held again. Keep-everything delivery videos (1.0 TB) are never exempted: the
+seed command refuses any key whose stream is `all` in the pinned picks, and the
+lane refuses it again. `r2_delivery_nas_certified(output_id, bucket, key, etag,
+size, sha256)` returns false until the follow-up to the stitching thread's NAS
+handoff (#574, 0224) binds it to `delivery_nas_handoff_certified`: an exact
+match on output_id, bucket, object_key, etag, size_bytes and sha256 with
+connection_id 13. Until then `in_window` stays closed.
+
+Exempt keys still need everything else the collated lane checks: the owner
+fence evidence, KE, a decided stream choice, live holds, the KE epoch, a
+per-key HEAD identity against the listed ETag and size (which must equal the
+exemption's), one durable intent and attempt per key, a fresh HTTP/1.1
+connection per DELETE behind the send gate, and the job's exact batch
+readback. A lost reply holds only its own key. Confident repairs retire under
+kind `delivery_repair`, keyed by exemption id; outside- and in-window videos
+retire as `collated`. Receipts carry `owner_delivery_page_<class>`.
+
+### Controller order
+
+1. Build a class roster read-only (below), pin its SHA-256, then seed it:
+   `stoaramactl r2-inverse exempt --class CLASS --roster FILE
+   --expected-roster-sha256 HEX --picks docs/records/r2-picks-20261118.json
+   --expected-picks-sha256 HEX`. The whole roster is admitted in one
+   transaction, or nothing is.
+2. `outside_window` can be seeded and retired now:
+   `stoaramactl r2-inverse job --lane collated ...`.
+3. Handoff (a) and (b): the in-window videos are copied and certified on the
+   NAS and the static CSV+JSON manifest of old links to NAS paths is published.
+4. Handoff (c): take the old page down, then run
+   `stoaramactl r2-inverse page-retired` once. This opens `confident_repair`.
+5. Seed `confident_repair` and run the collated job. Seed `in_window` once the
+   0224 follow-up certifies the copies; until then it stays held.
+
+### Read-only roster queries
+
+The in-window roster at `records/delivery-inwindow-roster-20261119/` (SHA-256
+`da4a4a7f4c98409ad0927878ad9995327f2a749d717e1e47b276e19cec06e8ca`) is already
+pinned. The other two use the same picks list. Generate it from the pinned picks
+file; this reproduces the in-window query's `VALUES` list byte for byte:
+
+```sh
+jq -r '[.choices | to_entries[] | select(.value.choice // "" != "")
+ | "(\(.key),'"'"'\(.value.choice)'"'"','"'"'\(.value.keep_start_utc)'"'"'::timestamptz,'"'"'\(.value.keep_end_utc)'"'"'::timestamptz)"] | join(",")' \
+ docs/records/r2-picks-20261118.json
+```
+
+Put its output in place of `PICKS`, and run each query in `psql` inside
+`BEGIN READ ONLY; … ROLLBACK;`. Each writes JSONL sorted by key.
+
+`outside_window`: the same page family as the in-window roster, on a decided
+non-KE stream, with no overlap with that stream's keep window.
+
+```sql
+\copy (WITH picks(stream_id,choice,ws,we) AS (VALUES PICKS), c AS (SELECT h.object_key,h.size_bytes,h.etag,o.id output_id,o.sha256,o.start_at,o.end_at,hr.recording_id,r.stream_id FROM delivery_keep_holds h JOIN recording_collation_outputs o ON o.object_key=h.object_key JOIN recording_collation_hours hr ON hr.id=o.collation_hour_id JOIN recordings r ON r.id=hr.recording_id JOIN picks p ON p.stream_id=r.stream_id WHERE h.bucket='stoarama' AND h.kind='video_collated' AND (h.object_key LIKE 'joined/goodplus-%' OR h.object_key LIKE 'joined/nightly-collation-v2/%') AND p.choice<>'all' AND p.ws IS NOT NULL AND NOT (o.start_at < p.we AND o.end_at > p.ws)) SELECT jsonb_build_object('bucket','stoarama','object_key',object_key,'size_bytes',size_bytes,'etag',etag,'output_id',output_id,'sha256',sha256,'start_at',start_at,'end_at',end_at,'recording_id',recording_id,'stream_id',stream_id)::text FROM c ORDER BY object_key) TO 'outside-window-roster.jsonl'
+```
+
+`confident_repair`: every page repair on a decided non-KE stream.
+
+```sql
+\copy (WITH picks(stream_id,choice,ws,we) AS (VALUES PICKS) SELECT jsonb_build_object('bucket',h.bucket,'object_key',h.object_key,'size_bytes',h.size_bytes,'etag',h.etag,'sha256',h.sha256,'recording_id',h.recording_id,'stream_id',r.stream_id)::text FROM delivery_keep_holds h JOIN recordings r ON r.id=h.recording_id JOIN picks p ON p.stream_id=r.stream_id WHERE h.bucket='stoarama' AND h.kind='video_assembly' AND h.object_key LIKE 'experimental/stitching-confident-repairs/%' AND p.choice IN ('none','st','keep') ORDER BY h.object_key) TO 'confident-repair-roster.jsonl'
+```
+
+Expect 4,348 rows / 0.582 TB and 9,232 rows / 3.377 TB. A shortfall means some
+keys are on a keep-everything or undecided stream; they stay on the page and in
+R2. Report the difference to Deniz rather than widening a query.

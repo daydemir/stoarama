@@ -201,6 +201,8 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
    AND NOT EXISTS(SELECT 1 FROM recording_joined_source_snapshots s WHERE s.clip_id=p_clip_id
     AND NOT EXISTS(SELECT 1 FROM r2_joined_batch_releases r WHERE r.batch_record_id=s.batch_record_id)) $f$;
  CREATE TABLE r2_owner_keep_prefixes(bucket text,prefix text);
+ CREATE TABLE r2_delivery_exemptions(bucket text,object_key text,class text);
+ CREATE FUNCTION r2_delivery_exempt(text,text) RETURNS boolean LANGUAGE sql AS $f$ SELECT false $f$;
  CREATE TABLE recording_joined_snapshot_scopes(recording_id bigint,recording_job_id bigint,high_water_clip_id bigint,batch_record_id bigint);
  CREATE TABLE recording_joined_batches(id bigint,state text);
  CREATE TABLE recording_joined_dry_run_scopes(recording_id bigint,recording_job_id bigint,high_water_clip_id bigint);
