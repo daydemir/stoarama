@@ -19308,11 +19308,9 @@ def parse_certification_timestamp(value, field):
     normalized = match[1] + fraction + ("+00:00" if match[3] == "Z" else match[3])
     try:
         parsed = datetime.datetime.fromisoformat(normalized)
-    except ValueError as exc:
-        raise MediaCertificationError(f"{field} must be an ISO-8601 timestamp") from exc
-    if parsed.tzinfo is None:
-        raise MediaCertificationError(f"{field} must include a timezone")
-    return parsed.astimezone(datetime.timezone.utc)
+        return parsed.astimezone(datetime.timezone.utc)
+    except (ValueError, OverflowError) as exc:
+        raise MediaCertificationError(f"{field} must be a representable ISO-8601 timestamp") from exc
 
 
 def certification_timestamp_microseconds(value, field):
@@ -19951,7 +19949,7 @@ def hash_certification_file_cancellable(root, relative_path, expected_size, expe
     try:
         opened_before = os.fstat(descriptor)
         if certification_identity(opened_before) != certification_identity(path_before):
-            raise MediaCertificationError("media identity changed before hashing")
+            raise MediaCertificationResourceError("media identity changed before hashing")
         while True:
             if cancel.is_set(): raise InventoryScanStopped("certification yielded to delivery")
             chunk = os.read(descriptor, 1024 * 1024)
@@ -19965,7 +19963,7 @@ def hash_certification_file_cancellable(root, relative_path, expected_size, expe
         path_after = path.stat()
         parent_after = path.parent.stat()
         if certification_identity(opened_before) != certification_identity(opened_after) or certification_identity(opened_after) != certification_identity(path_after):
-            raise MediaCertificationError("media identity changed while hashing")
+            raise MediaCertificationResourceError("media identity changed while hashing")
         if certification_identity(parent_before) != certification_identity(parent_after):
             raise MediaCertificationResourceError("media directory changed while hashing")
         if actual_size != expected_size or digest.hexdigest() != expected_sha:
@@ -48773,7 +48771,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                 fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
                 resources.callback(os.close, fd)
                 if cleanup_identity(os.fstat(fd)) != cleanup_identity(info):
-                    raise StitchTaskFailure("source identity changed before native audit")
+                    raise MediaCertificationResourceError("source identity changed before native audit")
                 path = Path("/proc/%d/fd/%d" % (os.getpid(), fd))
             _, scinfo = confined_regular_file(cfg.output_dir, clip["relative_path"] + ".stoarama.json")
             clip.update(frozen_identity=cleanup_identity(info), frozen_sidecar_identity=cleanup_identity(scinfo), _path=path)

@@ -653,25 +653,34 @@ class StitchTaskDataHoldTests(unittest.TestCase):
         self.assertEqual(self.calls[-1][1]["error"], "cleanup sidecar JSON is invalid")
         self.assertTrue(raw.is_file() and sidecar.is_file())
 
-    def test_sibling_write_during_source_hash_releases_without_holding_hour(self):
+    def test_source_or_directory_change_during_hash_releases_without_holding_hour(self):
         item = self.clips[0]
         raw = self.cfg.output_dir / item["relative_path"]
-        raw.write_bytes(b"a" * 10)
-        digest = hashlib.sha256(raw.read_bytes()).hexdigest()
         sibling = raw.parent / "new-sibling"
         read = os.read
-        def publish_during_read(fd, size):
-            if not sibling.exists():
-                sibling.write_bytes(b"new")
-            return read(fd, size)
-        def build(cfg, inventory, task, stop, tools):
-            with mock.patch.object(pull.os, "read", side_effect=publish_during_read):
-                pull.hash_certification_file_cancellable(cfg.output_dir, item["relative_path"], 10, digest, stop)
-        self.patch_common(build)
-        with self.assertRaises(pull.MediaCertificationResourceError):
-            pull.stitch_once(self.cfg, self.inventory, self.stop)
-        self.assertTrue(self.calls[-1][1]["release"])
-        self.assertFalse(any(path.endswith("/result") for path, _ in self.calls))
+        for changed in (sibling, raw):
+            with self.subTest(changed=changed.name):
+                self.calls.clear()
+                raw.write_bytes(b"a" * 10)
+                digest = hashlib.sha256(raw.read_bytes()).hexdigest()
+                changed_once = False
+
+                def publish_during_read(fd, size):
+                    nonlocal changed_once
+                    if not changed_once:
+                        changed_once = True
+                        changed.write_bytes(b"new")
+                    return read(fd, size)
+
+                def build(cfg, inventory, task, stop, tools):
+                    with mock.patch.object(pull.os, "read", side_effect=publish_during_read):
+                        pull.hash_certification_file_cancellable(cfg.output_dir, item["relative_path"], 10, digest, stop)
+
+                self.patch_common(build)
+                with self.assertRaises(pull.MediaCertificationResourceError):
+                    pull.stitch_once(self.cfg, self.inventory, self.stop)
+                self.assertTrue(self.calls[-1][1]["release"])
+                self.assertFalse(any(path.endswith("/result") for path, _ in self.calls))
 
     def test_typed_task_failure_is_held_and_reported(self):
         def build(cfg, inventory, task, stop, tools):
