@@ -92,7 +92,9 @@ func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverse
 	if err = r2RetireValidateGuardIdentity(head, item, target.ETag); err != nil {
 		return err
 	}
-	if !head.LastModified.Equal(e.LastModified) || !inverseLastModifiedAllowed(e.LastModified, a.summary.CreatedAt, now) {
+	// HEAD's Last-Modified is an HTTP date in whole seconds; listings carry
+	// milliseconds. R2 floors the listing time, so compare at second precision.
+	if !head.LastModified.Equal(e.LastModified.Truncate(time.Second)) || !inverseLastModifiedAllowed(e.LastModified, a.summary.CreatedAt, now) {
 		return inverseLastModifiedError{}
 	}
 	if err = a.store.RequireNoMultipartUploads(ctx); err != nil {

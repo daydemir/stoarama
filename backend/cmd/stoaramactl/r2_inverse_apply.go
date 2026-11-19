@@ -711,6 +711,10 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		if e.Class != want || existing[e.Key] {
 			continue
 		}
+		// A nonpositive size can never reserve; selecting it would abort the batch.
+		if e.SizeBytes <= 0 {
+			continue
+		}
 		if !inverseLastModifiedAllowed(e.LastModified, summary.CreatedAt, time.Now().UTC()) {
 			result.LastModifiedHeld.add(e.SizeBytes)
 			continue

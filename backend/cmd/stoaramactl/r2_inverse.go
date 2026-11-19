@@ -340,6 +340,10 @@ func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 		runR2InverseApply(ctx, cfg, args[1:])
 		return
 	}
+	if len(args) > 0 && args[0] == "job" {
+		runR2InverseJob(ctx, cfg, args[1:])
+		return
+	}
 	const usage = "usage: stoaramactl r2-inverse partition --picks FILE --out DIR (read-only full bucket partition)"
 	if len(args) == 0 || args[0] != "partition" {
 		log.Fatal(usage)
@@ -350,36 +354,47 @@ func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 	if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 || *picksPath == "" || *out == "" {
 		log.Fatal(usage)
 	}
-	picks, err := loadR2RetirePicks(*picksPath)
+	sum, err := writeInversePartition(ctx, cfg, *picksPath, *out)
 	if err != nil {
 		log.Fatal(err)
 	}
+	data, _ := json.MarshalIndent(sum, "", "  ")
+	fmt.Println(string(data))
+}
+
+// writeInversePartition writes a read-only full-bucket partition and its
+// summary into a new directory.
+func writeInversePartition(ctx context.Context, cfg config.Config, picksPath, out string) (inverseSummary, error) {
+	picks, err := loadR2RetirePicks(picksPath)
+	if err != nil {
+		return inverseSummary{}, err
+	}
 	policy, windows, err := api.Keep28Policy()
 	if err != nil {
-		log.Fatal(err)
+		return inverseSummary{}, err
 	}
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
 	// Enforced read-only at PostgreSQL, independently of CLI control flow.
 	tx, err := beginInversePartitionTx(ctx, pool)
 	if err != nil {
-		log.Fatal(err)
+		return inverseSummary{}, err
 	}
 	defer tx.Rollback(ctx)
 	protection, err := loadInverseProtection(ctx, tx, cfg.R2Bucket, picks, windows)
 	if err != nil {
-		log.Fatal(err)
+		return inverseSummary{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
-		log.Fatal(err)
+		return inverseSummary{}, err
 	}
 	store := mustArchiveR2Client(ctx, cfg, pool)
-	if err = os.Mkdir(*out, 0700); err != nil {
-		log.Fatal(err)
+	if err = os.Mkdir(out, 0700); err != nil {
+		return inverseSummary{}, err
 	}
-	f, err := os.OpenFile(filepath.Join(*out, "partition.jsonl"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(filepath.Join(out, "partition.jsonl"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
-		log.Fatal(err)
+		return inverseSummary{}, err
 	}
 	sum, err := partitionInverse(ctx, store, protection, policy, f)
 	if err == nil {
@@ -390,16 +405,13 @@ func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 		err = closeErr
 	}
 	if err != nil {
-		log.Fatal(err)
+		return inverseSummary{}, err
 	}
 	data, err := json.MarshalIndent(sum, "", "  ")
 	if err == nil {
-		err = os.WriteFile(filepath.Join(*out, "summary.json"), append(data, '\n'), 0600)
+		err = os.WriteFile(filepath.Join(out, "summary.json"), append(data, '\n'), 0600)
 	}
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println(string(data))
+	return sum, err
 }
 
 // Both full partition and bounded apply use the same KE path normalization and
