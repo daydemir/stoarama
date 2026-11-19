@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -133,6 +134,10 @@ func TestR2JoinedBatchRelease(t *testing.T) {
 	if _, err = pool.Exec(ctx, `INSERT INTO r2_joined_batch_releases(batch_record_id,batch_id,generation,decision) VALUES(6,'decoy',1,'x')`); err == nil {
 		t.Fatal("a second batch was released")
 	}
+	replica(t, ctx, pool, `INSERT INTO recording_joined_batches(id,batch_id,generation,state) VALUES(8,'goodplus-20260821-generation-1-copy',1,'frozen')`)
+	if _, err = pool.Exec(ctx, `INSERT INTO r2_joined_batch_releases(batch_record_id,batch_id,generation,decision) VALUES(8,'goodplus-20260821-generation-1',1,'x')`); err == nil || !strings.Contains(err.Error(), "own frozen batch record") {
+		t.Fatalf("decoy record under the pinned label: %v", err)
+	}
 	released := func(id int64) bool {
 		var ok bool
 		if err := pool.QueryRow(ctx, `SELECT r2_joined_source_released($1)`, id).Scan(&ok); err != nil {
@@ -187,7 +192,22 @@ func TestR2JoinedBatchRelease(t *testing.T) {
 	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=8`); err == nil {
 		t.Fatal("a keep-28 intent purged a released source")
 	}
-	intent("r2_inverse_intents", "", "", 1)
+	// Production order: reserve writes the RAW intent, then probes the purge.
+	a, entry := releaseApplier(t, ctx, pool, keys[1])
+	if _, err = a.reserve(ctx, entry); err != nil {
+		t.Fatalf("fresh released source could not be reserved: %v", err)
+	}
+	if decoy, decoyEntry := releaseApplier(t, ctx, pool, keys[2]); true {
+		if _, err = decoy.reserve(ctx, decoyEntry); err == nil {
+			t.Fatal("a source the decoy batch still claims was reserved")
+		}
+	}
+	// With its intent pending, no new operator hold may land on its hour.
+	replica(t, ctx, pool, `INSERT INTO recording_joined_hours(id,batch_record_id) VALUES(901,5)`,
+		`INSERT INTO recording_joined_sources(id,source_snapshot_id,clip_id,hour_record_id) VALUES(9002,15,1,901)`)
+	if _, err = pool.Exec(ctx, `INSERT INTO recording_joined_source_retention_holds(hour_record_id,reason_code) VALUES(901,'late_hold')`); err == nil || !strings.Contains(err.Error(), "already issued") {
+		t.Fatalf("late retention hold over an issued retirement: %v", err)
+	}
 	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=1`); err != nil {
 		t.Fatalf("RAW purge of a released source refused: %v", err)
 	}
@@ -205,15 +225,16 @@ func TestR2JoinedBatchRelease(t *testing.T) {
 	}
 }
 
-// The migration refuses to run if the named batch exists but is no longer frozen.
+// The migration refuses to run if the named batch exists but is not the frozen
+// generation the owner released.
 func TestR2JoinedBatchReleaseRefusesAdvancedBatch(t *testing.T) {
 	ctx := context.Background()
 	pool := joinedPurgeTestPool(t, "joined_release_advanced")
 	migrateBefore(t, ctx, pool)
 	relaxJoined(t, ctx, pool)
-	replica(t, ctx, pool, `INSERT INTO recording_joined_batches(id,batch_id,generation,state) VALUES(5,'goodplus-20260821-generation-1',1,'index_sealed')`)
-	if err := db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir()); err == nil || !strings.Contains(err.Error(), "no longer frozen") {
-		t.Fatalf("advanced batch: %v", err)
+	replica(t, ctx, pool, `INSERT INTO recording_joined_batches(id,batch_id,generation,state) VALUES(5,'goodplus-20260821-generation-1',2,'frozen')`)
+	if err := db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir()); err == nil || !strings.Contains(err.Error(), "not the frozen generation-1 batch") {
+		t.Fatalf("unexpected generation: %v", err)
 	}
 }
 
@@ -238,4 +259,75 @@ func TestR2JoinedReleasedKeepsKeep28Held(t *testing.T) {
 	if class, _ := p.classify(r2.ObjectInfo{Key: "out", SizeBytes: 1}); class != inverseDeletable {
 		t.Fatalf("released outside-window source classified %s", class)
 	}
+}
+
+// releaseApplier builds a minimal RAW-lane applier for one catalog key, with
+// real drain evidence, partition files, picks and protection, so a test can
+// drive reserve exactly as production does.
+func releaseApplier(t *testing.T, ctx context.Context, pool *pgxpool.Pool, key string) (*inverseApplier, inverseEntry) {
+	t.Helper()
+	policy, windows, err := api.Keep28Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	w := windows[3]
+	picksPath := filepath.Join(root, "picks.json")
+	picksData, _ := json.Marshal(map[string]any{"choices": map[string]any{"3": r2RetirePick{Choice: "none", KeepStartUTC: w.Start.Format(time.RFC3339), KeepEndUTC: w.End.Format(time.RFC3339)}}})
+	if err = os.WriteFile(picksPath, picksData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	picks, err := loadR2RetirePicks(picksPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &inverseFakeStore{endpointSHA: strings.Repeat("c", 64), objects: map[string]r2.ObjectInfo{}}
+	entry := inverseEntry{ObjectInfo: r2.ObjectInfo{Key: key, ETag: "etag", SizeBytes: 100, LastModified: inverseRetirementCutoff().Add(-1500 * time.Millisecond)}, Class: inverseDeletable}
+	store.objects[key] = entry.ObjectInfo
+	var fences int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM r2_retirement_writer_fences`).Scan(&fences); err != nil {
+		t.Fatal(err)
+	}
+	if fences == 0 {
+		replica(t, ctx, pool, `INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256,activated_at,drain_not_before) VALUES('stoarama','`+store.endpointSHA+`','2026-11-12T14:28:47.037031Z',clock_timestamp()-interval '1 hour')`)
+	}
+	var activated, deadline time.Time
+	if err = pool.QueryRow(ctx, `SELECT activated_at,drain_not_before FROM r2_retirement_writer_fences`).Scan(&activated, &deadline); err != nil {
+		t.Fatal(err)
+	}
+	drain := inverseDrainEvidence{Proof: inversePUTCompletionProof, Bucket: "stoarama", EndpointSHA256: store.endpointSHA, FenceActivatedAt: activated, DrainNotBefore: deadline, ObservedAt: time.Now().UTC(), DeployedWriterCoverage: "test fixture all admissions checked", AcceptedPUTCompletion: "test fixture no provider PUTs accepted"}
+	drainPath := filepath.Join(root, "drain.json")
+	data, _ := json.Marshal(drain)
+	if err = os.WriteFile(drainPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	drainSHA, _ := inverseFileSHA(drainPath)
+	manifest := filepath.Join(root, "partition.jsonl")
+	data, _ = json.Marshal(entry)
+	if err = os.WriteFile(manifest, append(data, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifestSHA, _ := inverseFileSHA(manifest)
+	sum := inverseSummary{Version: 1, Bucket: "stoarama", EndpointSHA256: store.endpointSHA, CreatedAt: time.Now().UTC(), PolicySHA256: policy, PicksSHA256: picks.SHA256, ReadOnly: true}
+	summaryPath := filepath.Join(root, "summary.json")
+	data, _ = json.Marshal(sum)
+	if err = os.WriteFile(summaryPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	summarySHA, _ := inverseFileSHA(summaryPath)
+	o := inverseApplyOptions{Lane: inverseOutsideKeep28, Manifest: manifest, ManifestSHA: manifestSHA, Summary: summaryPath, SummarySHA: summarySHA, Picks: picksPath, Ledger: filepath.Join(root, "ledger.jsonl"), DrainEvidence: drainPath, DrainSHA: drainSHA, MaxItems: 1, MaxBytes: 100, Workers: 1}
+	p, err := loadInverseProtection(ctx, pool, "stoarama", picks, windows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := openInverseLedger(o.Ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ledger.close() })
+	var epoch int64
+	if err = pool.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch`).Scan(&epoch); err != nil {
+		t.Fatal(err)
+	}
+	return &inverseApplier{pool: pool, store: store, opts: o, summary: sum, protection: p, ledger: ledger, keEpoch: epoch}, entry
 }

@@ -23,12 +23,26 @@ CREATE TRIGGER r2_joined_batch_release_immutable BEFORE UPDATE OR DELETE ON r2_j
  FOR EACH ROW EXECUTE FUNCTION guard_r2_joined_batch_release_immutable();
 CREATE TRIGGER r2_joined_batch_release_no_truncate BEFORE TRUNCATE ON r2_joined_batch_releases
  FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_joined_batch_release_immutable();
+-- A release row must name the frozen batch it pins, never a decoy record.
+CREATE FUNCTION guard_r2_joined_batch_release_target() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF NOT EXISTS(SELECT 1 FROM recording_joined_batches b WHERE b.id=NEW.batch_record_id
+   AND b.batch_id=NEW.batch_id AND b.generation=NEW.generation AND b.state='frozen') THEN
+  RAISE EXCEPTION 'R2 joined batch release must name its own frozen batch record';
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_joined_batch_release_target BEFORE INSERT ON r2_joined_batch_releases
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_joined_batch_release_target();
+ALTER TABLE r2_joined_batch_releases ENABLE ALWAYS TRIGGER r2_joined_batch_release_target;
+ALTER TABLE r2_joined_batch_releases ENABLE ALWAYS TRIGGER r2_joined_batch_release_immutable;
+ALTER TABLE r2_joined_batch_releases ENABLE ALWAYS TRIGGER r2_joined_batch_release_no_truncate;
 
 -- The owner released a frozen batch. If it exists but has moved on, the
 -- decision no longer describes it: fail rather than release or skip silently.
 DO $$ BEGIN
- IF EXISTS(SELECT 1 FROM recording_joined_batches WHERE batch_id='goodplus-20260821-generation-1' AND generation=1 AND state<>'frozen') THEN
-  RAISE EXCEPTION 'goodplus-20260821-generation-1 is no longer frozen; the owner release does not apply';
+ IF EXISTS(SELECT 1 FROM recording_joined_batches WHERE batch_id='goodplus-20260821-generation-1' AND (generation<>1 OR state<>'frozen')) THEN
+  RAISE EXCEPTION 'goodplus-20260821-generation-1 is not the frozen generation-1 batch the owner released';
  END IF;
 END $$;
 INSERT INTO r2_joined_batch_releases(batch_record_id,batch_id,generation,decision)
@@ -71,6 +85,25 @@ CREATE FUNCTION r2_joined_raw_retirement_released(p_clip_id bigint, p_bucket tex
  SELECT r2_joined_source_released(p_clip_id)
   AND EXISTS(SELECT 1 FROM r2_inverse_intents i WHERE i.source_id=p_clip_id AND i.bucket=p_bucket AND i.object_key=p_key)
 $$;
+
+-- A new operator retention hold serializes with R2 retirement: it takes the
+-- protection locks that reservations hold exclusively and the RAW wire holds
+-- shared, then refuses an hour whose source already has an unresolved RAW
+-- intent, since that DELETE may already be on the wire.
+CREATE FUNCTION guard_r2_joined_retention_hold_admission() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ PERFORM pg_advisory_xact_lock(7343226011103);
+ PERFORM pg_advisory_xact_lock(7343226011101);
+ IF EXISTS(SELECT 1 FROM recording_joined_sources src JOIN r2_inverse_intents i ON i.source_id=src.clip_id
+   WHERE src.hour_record_id=NEW.hour_record_id
+   AND NOT EXISTS(SELECT 1 FROM r2_inverse_events v WHERE v.bucket=i.bucket AND v.object_key=i.object_key AND v.event='absent')) THEN
+  RAISE EXCEPTION 'R2 retirement already issued for a source of joined hour %; the hold cannot protect it', NEW.hour_record_id;
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_joined_retention_hold_admission BEFORE INSERT ON recording_joined_source_retention_holds
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_joined_retention_hold_admission();
+ALTER TABLE recording_joined_source_retention_holds ENABLE ALWAYS TRIGGER r2_joined_retention_hold_admission;
 
 -- Same body as 0155 except the purge transition. A released source with the
 -- R2 RAW lane's exact intent may gain purged_at. The verified path must now be

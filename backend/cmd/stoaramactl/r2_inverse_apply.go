@@ -250,6 +250,24 @@ const inverseRawHeldSQL = `SELECT
  OR EXISTS(SELECT 1 FROM recording_joined_snapshot_scopes s JOIN recording_joined_batches b ON b.id=s.batch_record_id AND b.state='snapshotting' JOIN recording_clips c ON c.id=$1 WHERE s.recording_id=c.recording_id AND s.recording_job_id=c.recording_job_id AND c.id<=s.high_water_clip_id)
  OR (EXISTS(SELECT 1 FROM recording_joined_dry_run_scopes s JOIN recording_clips c ON c.id=$1 WHERE s.recording_id=c.recording_id AND s.recording_job_id=c.recording_job_id AND c.id<=s.high_water_clip_id) AND NOT ($8 AND r2_joined_source_released($1)))`
 
+// probeInversePurge exercises every installed purge trigger before wire
+// deletion; all effects are rolled back. The source row is already locked.
+func probeInversePurge(ctx context.Context, tx pgx.Tx, id int64) error {
+	if _, err := tx.Exec(ctx, `SAVEPOINT inverse_purge_probe`); err != nil {
+		return err
+	}
+	_, probeErr := tx.Exec(ctx, `UPDATE recording_clips SET purged_at=clock_timestamp() WHERE id=$1`, id)
+	_, rollbackErr := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT inverse_purge_probe`)
+	if probeErr != nil {
+		return fmt.Errorf("pre-delete purge veto: %w", probeErr)
+	}
+	if rollbackErr != nil {
+		return rollbackErr
+	}
+	_, err := tx.Exec(ctx, `RELEASE SAVEPOINT inverse_purge_probe`)
+	return err
+}
+
 func (a *inverseApplier) checkTarget(ctx context.Context, tx pgx.Tx, t inverseRawTarget, e inverseEntry, purgeProbe bool) error {
 	if err := a.checkEvidence(ctx, tx); err != nil {
 		return err
@@ -271,22 +289,7 @@ func (a *inverseApplier) checkTarget(ctx context.Context, tx pgx.Tx, t inverseRa
 		return errors.New("live key protection veto")
 	}
 	if purgeProbe {
-		// Exercise every installed purge trigger before wire deletion; all effects
-		// are rolled back. The source row was locked before this savepoint.
-		if _, err := tx.Exec(ctx, `SAVEPOINT inverse_purge_probe`); err != nil {
-			return err
-		}
-		_, probeErr := tx.Exec(ctx, `UPDATE recording_clips SET purged_at=clock_timestamp() WHERE id=$1`, t.ID)
-		_, rollbackErr := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT inverse_purge_probe`)
-		if probeErr != nil {
-			return fmt.Errorf("pre-delete purge veto: %w", probeErr)
-		}
-		if rollbackErr != nil {
-			return rollbackErr
-		}
-		if _, err := tx.Exec(ctx, `RELEASE SAVEPOINT inverse_purge_probe`); err != nil {
-			return err
-		}
+		return probeInversePurge(ctx, tx, t.ID)
 	}
 	return nil
 }
@@ -310,7 +313,9 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	if err != nil {
 		return t, err
 	}
-	if err = a.checkTarget(ctx, tx, t, e, true); err != nil {
+	// The purge probe runs after this reservation's intent exists, below: a
+	// released joined source admits its purge only for the RAW lane's intent.
+	if err = a.checkTarget(ctx, tx, t, e, false); err != nil {
 		return t, err
 	}
 	var custody *keep28Custody
@@ -352,6 +357,9 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	intentSQL += `)`
 	_, err = tx.Exec(ctx, intentSQL, intentArgs...)
 	if err != nil {
+		return t, err
+	}
+	if err = probeInversePurge(ctx, tx, t.ID); err != nil {
 		return t, err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO r2_inverse_budget_minutes(bucket,minute,charged_bytes) VALUES($1,date_trunc('minute',clock_timestamp()),$2) ON CONFLICT(bucket,minute) DO UPDATE SET charged_bytes=r2_inverse_budget_minutes.charged_bytes+excluded.charged_bytes`, a.store.Bucket(), e.SizeBytes)
