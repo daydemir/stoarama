@@ -49,8 +49,9 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string) {
 		log.Fatal(err)
 	}
 	partition := filepath.Join(*work, "partition")
-	// Only the collated lane classifies mapped collated footage separately.
-	sum, err := writeInversePartition(ctx, cfg, *picks, partition, lane == inverseNonrawCollated)
+	// The job always runs under owner-fence evidence, so both lanes partition in
+	// the reviewed owner scope: RAW delivery keys and mapped collated footage.
+	sum, err := writeInversePartition(ctx, cfg, *picks, partition, true)
 	if err != nil {
 		log.Fatal(err)
 	}

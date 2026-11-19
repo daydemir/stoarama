@@ -42,6 +42,7 @@ func inverseCollatedPrefixAllowed(key string) bool {
 type inverseCollatedSource struct {
 	ID       int64      `json:"id"`
 	StreamID int64      `json:"stream_id"`
+	Key      string     `json:"key"`
 	Path     string     `json:"path"`
 	Start    *time.Time `json:"start"`
 	End      *time.Time `json:"end"`
@@ -84,7 +85,7 @@ const inverseNonrawColumns = `
  (SELECT count(*) FROM recording_clips c JOIN recordings rr ON rr.id=c.recording_id
    WHERE c.id=ANY(o.source_clip_ids) AND c.purged_at IS NULL AND c.bucket=$1),
  (SELECT coalesce(jsonb_agg(jsonb_build_object('id',c.id,'stream_id',coalesce(rr.stream_id,0),
-    'path',coalesce(c.display_path,''),'start',c.clip_start_at,'end',c.clip_end_at,
+    'key',c.object_key,'path',coalesce(c.display_path,''),'start',c.clip_start_at,'end',c.clip_end_at,
     'tz',coalesce(nullif(s.local_timezone,''),rr.cron_timezone,'')) ORDER BY c.id),'[]'::jsonb)
    FROM recording_collation_outputs oo CROSS JOIN LATERAL unnest(oo.source_clip_ids) sid
    JOIN recording_clips c ON c.id=sid JOIN recordings rr ON rr.id=c.recording_id
@@ -98,6 +99,13 @@ const inverseNonrawColumns = `
   OR EXISTS(SELECT 1 FROM nas_restore_requests n JOIN recording_clips c ON c.id=n.clip_id
     WHERE c.id=ANY(o.source_clip_ids) AND n.state IN ('pending','leased'))
   OR EXISTS(SELECT 1 FROM recording_joined_source_snapshots n WHERE n.clip_id=ANY(o.source_clip_ids))
+  OR EXISTS(SELECT 1 FROM recording_clips c JOIN recording_joined_snapshot_scopes js
+    ON js.recording_id=c.recording_id AND js.recording_job_id=c.recording_job_id AND c.id<=js.high_water_clip_id
+    JOIN recording_joined_batches jb ON jb.id=js.batch_record_id AND jb.state='snapshotting'
+    WHERE c.id=ANY(o.source_clip_ids))
+  OR EXISTS(SELECT 1 FROM recording_clips c JOIN recording_joined_dry_run_scopes ds
+    ON ds.recording_id=c.recording_id AND ds.recording_job_id=c.recording_job_id AND c.id<=ds.high_water_clip_id
+    WHERE c.id=ANY(o.source_clip_ids))
   OR EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.bucket=$1 AND x.object_key=o.object_key)
   OR EXISTS(SELECT 1 FROM nas_r2_copy_items ci WHERE (ci.state<>'verified' OR ci.blocked_reason<>'')
     AND ci.item->>'bucket'=$1 AND ci.item->>'object_key'=o.object_key)
@@ -231,6 +239,14 @@ func assessCollated(p inverseProtection, x inverseCollatedAssessment) inverseCol
 		}
 	}
 	for _, s := range x.Sources {
+		// The RAW classifier protects a KE folder in either the R2 key or the
+		// catalog path; a source must be protected the same way.
+		for _, component := range strings.Split(s.Key, "/") {
+			if p.KEFolders[component] {
+				x.Reason = "keep_everything_path"
+				return x
+			}
+		}
 		for _, component := range strings.Split(s.Path, "/") {
 			if p.KEFolders[component] {
 				x.Reason = "keep_everything_catalog_path"
@@ -348,6 +364,21 @@ func (a *inverseApplier) reserveNonraw(ctx context.Context, e inverseEntry) (inv
 	if err = lockInverseRawSourceClosure(ctx, tx, ids); err != nil {
 		return t, err
 	}
+	// A purge or hold may have committed while the locks were awaited. Reassess
+	// in a fresh statement under the locks before anything durable is written.
+	locked, err := a.loadNonrawTarget(ctx, tx, e)
+	if err != nil {
+		return locked, err
+	}
+	if locked.ID != t.ID || len(locked.Sources) != len(ids) {
+		return locked, fmt.Errorf("%w: source closure changed while locking", errInverseNonrawIneligible)
+	}
+	for n, s := range locked.Sources {
+		if s.ID != ids[n] {
+			return locked, fmt.Errorf("%w: source closure changed while locking", errInverseNonrawIneligible)
+		}
+	}
+	t = locked
 	// The classifier reads cached KE folders, picks and windows. Checking the
 	// epoch BEFORE the permanent intent is written means a stale cached
 	// classification can never leave append-only state behind.
@@ -549,7 +580,8 @@ func (a *inverseApplier) authorizeNonraw(ctx context.Context, tx pgx.Tx, e inver
 	}
 	// Pre-fence cutoff on the listing AND the final HEAD. No seven-day age is
 	// invented from the owner's pinned scope.
-	if !head.LastModified.Equal(e.LastModified) || !inverseLastModifiedAllowed(e.LastModified, a.summary.CreatedAt, now) {
+	// HEAD's Last-Modified is whole seconds; R2 floors the listing time.
+	if !head.LastModified.Equal(e.LastModified.Truncate(time.Second)) || !inverseLastModifiedAllowed(e.LastModified, a.summary.CreatedAt, now) {
 		return nil, inverseLastModifiedError{}
 	}
 	if err = a.store.RequireNoMultipartUploads(ctx); err != nil {

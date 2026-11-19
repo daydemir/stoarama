@@ -149,6 +149,11 @@ func (a *inverseApplier) checkEvidence(ctx context.Context, q r2RetireQuerier) e
 	if err = e.validateProof(a.opts); err != nil {
 		return err
 	}
+	// The collated lane waives exact delivery holds under the reviewed owner
+	// scope only; legacy PUT-completion proof never authorizes it.
+	if a.opts.Lane == inverseNonrawCollated && e.Proof != inverseOwnerFenceProof {
+		return errors.New("collated lane requires the owner fence policy proof")
+	}
 	if now.Sub(a.summary.CreatedAt) > 24*time.Hour || a.summary.CreatedAt.After(now) {
 		return errors.New("partition is stale or future-dated")
 	}
@@ -549,12 +554,11 @@ func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, mani
 	// The receipt has no retirement_class column, so it must resolve through the
 	// exact reservation that carries the reviewed class. A RAW reviewed retirement
 	// is only authorized when that reservation is the reviewed-scope one.
-	exactClass := ""
-	if a.rawReviewedDelivery() {
-		exactClass = ` AND EXISTS(SELECT 1 FROM r2_retirement_reservations v WHERE v.kind='raw' AND v.source_id=r.source_id
+	// The class comes from the durable intent being published, never from the
+	// current run, so a legacy intent (empty class) reconciles under any proof.
+	exactClass := ` AND (i.retirement_class='' OR EXISTS(SELECT 1 FROM r2_retirement_reservations v WHERE v.kind='raw' AND v.source_id=r.source_id
   AND v.bucket=r.bucket AND v.object_key=r.object_key AND v.size_bytes=r.size_bytes AND v.sha256=r.sha256
-  AND v.manifest_sha256=r.manifest_sha256 AND v.retirement_class='` + inverseNonrawRetirementClass + `')`
-	}
+  AND v.manifest_sha256=r.manifest_sha256 AND v.retirement_class=i.retirement_class))`
 	var receipt bool
 	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_object_retirements r JOIN `+a.intentTable()+` i ON r.bucket=i.bucket AND r.object_key=i.object_key JOIN recording_clips c ON c.id=i.source_id
  WHERE i.bucket=$1 AND i.object_key=$2 AND r.kind='raw' AND r.reason='`+a.retirementReason()+`' AND r.source_id=$3 AND r.stream_id=i.stream_id AND r.size_bytes=i.size_bytes AND r.sha256=lower(c.sha256) AND r.choice=i.choice AND r.manifest_sha256=$4 AND r.policy_sha256=i.policy_sha256`+exactClass+`)`, a.store.Bucket(), e.Key, sourceID, manifest).Scan(&receipt)
