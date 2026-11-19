@@ -164,8 +164,8 @@ class MediaCertificationResourceError(MediaCertificationError):
     """The source changed during observation and needs a fresh read."""
 
 
-class CleanupSidecarDataError(RuntimeError):
-    """Stable sidecar bytes cannot represent the frozen source."""
+class CleanupSourceDataError(RuntimeError):
+    """Stable source or sidecar data cannot satisfy the frozen proof."""
 
 
 class ToolProcessError(MediaCertificationError):
@@ -2697,9 +2697,11 @@ class CleanupFile:
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fds[-1])
         self.files.append((name, fd, frozen))
         info = os.fstat(fd)
-        if (not stat_module.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_dev != self.root_identity[0]
+        if (not stat_module.S_ISREG(info.st_mode) or info.st_dev != self.root_identity[0]
                 or cleanup_identity(info) != frozen):
             raise RuntimeError("cleanup file differs from exact audited identity")
+        if info.st_nlink != 1:
+            raise CleanupSourceDataError("cleanup source or sidecar must have exactly one link")
 
     def list_parent(self):
         started = time.monotonic()
@@ -2779,7 +2781,7 @@ class CleanupFile:
                     sidecar_bytes += block
                     if len(sidecar_bytes) > 1024 * 1024:
                         self.check_paths()
-                        raise CleanupSidecarDataError("cleanup sidecar exceeds bound")
+                        raise CleanupSourceDataError("cleanup sidecar exceeds bound")
             hashes.append(digest.hexdigest())
             if md5 is not None:
                 self.media_md5 = md5.hexdigest()
@@ -2795,18 +2797,18 @@ class CleanupFile:
             try:
                 sidecar = json.loads(sidecar_bytes)
             except (ValueError, RecursionError) as exc:
-                raise CleanupSidecarDataError("cleanup sidecar JSON is invalid") from exc
+                raise CleanupSourceDataError("cleanup sidecar JSON is invalid") from exc
             binding = {"clip_id": self.item["source_id"], "recording_id": self.item["recording_id"],
                        "relative_path": self.item["relative_path"], "size_bytes": self.item["size_bytes"], "sha256": self.item["sha256"]}
             if (not isinstance(sidecar, dict) or type(sidecar.get("schema_version")) is not int
                     or sidecar["schema_version"] not in (1, 2)
                     or any(type(sidecar.get(k)) is not type(v) or sidecar[k] != v for k, v in binding.items())):
-                raise CleanupSidecarDataError("cleanup sidecar does not bind exact source identity")
+                raise CleanupSourceDataError("cleanup sidecar does not bind exact source identity")
             for field in ("clip_start_at", "clip_end_at"):
                 actual = parse_certification_timestamp(sidecar.get(field), field)
                 expected = parse_certification_timestamp(self.item["start_at" if field == "clip_start_at" else "end_at"], field)
                 if actual != expected:
-                    raise CleanupSidecarDataError("cleanup sidecar registered interval differs from catalog")
+                    raise CleanupSourceDataError("cleanup sidecar registered interval differs from catalog")
                 binding[field] = expected.isoformat()
             proof["sidecar"] = {"identity": self.item["frozen_sidecar_identity"], "sha256": hashes[1], "binding": binding}
         self.stage_timings["proof_ms"] = (time.monotonic() - started) * 1000
@@ -48491,7 +48493,7 @@ def stitch_repair_annexb(nals, drop_vcl=0, upto=None):
     return b''.join(b'\x00\x00\x00\x01' + n for n in nals[:end]), len(vcl) - drop_vcl
 
 
-def stitch_repair_local(cfg, clip, source, directory, tools, deadline, stop):
+def stitch_repair_local(clip, source, directory, stage_file, tools, deadline, stop):
     """Labeled partial recovery, always excluded from raw retirement/V85 joins."""
     if clip["size_bytes"] > 16 * 1024 * 1024:
         return None
@@ -48530,9 +48532,7 @@ def stitch_repair_local(cfg, clip, source, directory, tools, deadline, stop):
             continue
         size, sha = sha256_file(temporary)
         name = "repaired-%d-%s.mp4" % (clip["source_id"], sha)
-        directory.publish(temporary.name, name)
         relative = directory.relative + "/" + name
-        hash_certification_file(cfg.output_dir, relative, size, sha)
         proof = dict(policy=STITCH_POLICY, provenance=stitch_v85r_provenance(tools, stop), clip_id=clip["source_id"], original_sha256=clip["sha256"], original_size_bytes=clip["size_bytes"],
                      relative_path=relative, sha256=sha, size_bytes=size, method="mdat_annexb_vui_prefix_v1",
                      fps=str(fps), fps_src="vui", frames=count, duration_seconds=float(duration),
@@ -48540,7 +48540,8 @@ def stitch_repair_local(cfg, clip, source, directory, tools, deadline, stop):
                      synthesized_timestamps=True, complete_original=False, full_decode=True, fsynced=True, readback_sha256=sha)
         sidecar = work / "repair.proof.partial.json"
         sidecar.write_bytes(cleanup_json_bytes(proof))
-        directory.publish(sidecar.name, name + ".repair.json")
+        stage_file(temporary.name, name)
+        stage_file(sidecar.name, name + ".repair.json")
         return proof
     return None
 
@@ -48653,12 +48654,24 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
         directory_type = StitchProofDirectory if kind is StitchRunKind.PROOF else StitchDirectory
         directory = resources.enter_context(directory_type(cfg, plan["output_folder"], task["id"], stop))
         work = directory.path
+        pending = []
+        descriptor = directory.fds[-1]
+        stage_prefix = ".stitch-%d-pending-" % task["id"]
+
+        def stage_file(temporary, name):
+            stage = stage_prefix + str(len(pending))
+            os.rename(temporary, stage, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+            pending.append((stage, name))
+
         def clear_scratch():
             names = ["concat.txt", "run.partial.mp4", "proof.partial.json", "output.json", "output.packets", "output.hidden", "output.frames", "repair.h264", "repair.partial.mp4", "repair.frames", "repair.proof.partial.json", "v85r-request.json", "v85r-decision.json"]
             if kind is StitchRunKind.PROOF:
                 names = ["concat.txt", "run.partial.mp4", "proof.partial.json", "v85r-request.json"]
             else:
                 names += ["source-%03d.%s" % (n, suffix) for n in range(len(clips)) for suffix in ("json", "packets", "hidden", "frames")]
+                # At most one run or repair per input, with one sidecar each.
+                stages = {stage_prefix + str(n) for n in range(2 * len(clips))}
+                names += stages.intersection(os.listdir(descriptor))
             for name in names:
                 try:
                     os.unlink(name, dir_fd=directory.fds[-1])
@@ -48720,9 +48733,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
             stitch_audit_output(ffmpeg, ffprobe, output, sources, work, deadline, stop)
             size, sha = stitch_proof_digest(output, stop) if kind is StitchRunKind.PROOF else sha256_file(output)
             name = "proof.mp4" if kind is StitchRunKind.PROOF else "run-%03d-%s.mp4" % (run_index, sha)
-            published = directory.publish(output.name, name)
             relative = plan["output_folder"] + "/" + name
-            stitch_hash(cfg, relative, size, sha, stop)  # reopen after fsync
             proof = dict(policy=STITCH_POLICY, provenance=provenance, relative_path=relative, sha256=sha, size_bytes=size, inputs=[], full_decode=True,
                          seam_decode=True, packet_chain=True, native_audit=True, original_sources_no_audio=True,
                          readback_sha256=sha, fsynced=True)
@@ -48744,12 +48755,15 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                                              raw_proof=raw_proof))
             if kind is StitchRunKind.PROOF:
                 proof["media_seconds"] = float(cumulative)
-            if kind is StitchRunKind.PRODUCTION:
+                directory.publish(output.name, name)
+                stitch_hash(cfg, relative, size, sha, stop)
+                STITCH_STATUS.add("outputs_verified")
+            else:
                 proof_temp = work / "proof.partial.json"
                 proof_temp.write_bytes(cleanup_json_bytes(proof))
-                directory.publish(proof_temp.name, name + ".proof.json")
+                stage_file(output.name, name)
+                stage_file(proof_temp.name, name + ".proof.json")
             result["outputs"].append(proof)
-            STITCH_STATUS.add("outputs_verified")
             run_index += 1
             sources, run_clips = [], []
 
@@ -48774,12 +48788,14 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                     raise MediaCertificationResourceError("source identity changed before native audit")
                 path = Path("/proc/%d/fd/%d" % (os.getpid(), fd))
             _, scinfo = confined_regular_file(cfg.output_dir, clip["relative_path"] + ".stoarama.json")
+            if info.st_nlink != 1 or scinfo.st_nlink != 1:
+                raise CleanupSourceDataError("cleanup source or sidecar must have exactly one link")
             clip.update(frozen_identity=cleanup_identity(info), frozen_sidecar_identity=cleanup_identity(scinfo), _path=path)
             if not plan["eligible"][index] or (admitted is not None and not admitted(clip)):
                 if kind is StitchRunKind.PROOF:
                     raise StitchHold("proof source is ineligible")
                 flush()
-                repaired = stitch_repair_local(cfg, clip, path, directory, tools, deadline, stop)
+                repaired = stitch_repair_local(clip, path, directory, stage_file, tools, deadline, stop)
                 if repaired:
                     result["repairs"].append(repaired)
                 result["left_out"].append(clip["source_id"])
@@ -48792,7 +48808,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                 if kind is StitchRunKind.PROOF or stop.is_set():
                     raise
                 flush()
-                repaired = stitch_repair_local(cfg, clip, path, directory, tools, deadline, stop)
+                repaired = stitch_repair_local(clip, path, directory, stage_file, tools, deadline, stop)
                 if repaired:
                     result["repairs"].append(repaired)
                 result["left_out"].append(clip["source_id"])
@@ -48806,6 +48822,19 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
         flush()
         if kind is StitchRunKind.PROOF:
             stitch_proof_complete(cfg, task, result, work, stop)
+        else:
+            # A late task-data failure must leave no canonical media without
+            # a result. Publish only after every source and repair is checked.
+            # Publication failures can be retried with the same final names.
+            try:
+                for stage, name in pending:
+                    stitch_check(stop)
+                    directory.publish(stage, name)
+                for output in result["outputs"] + result["repairs"]:
+                    stitch_hash(cfg, output["relative_path"], output["size_bytes"], output["sha256"], stop)
+            except MediaCertificationError as exc:
+                raise MediaCertificationResourceError("stitch output publication needs a fresh read") from exc
+            STITCH_STATUS.add("outputs_verified", len(result["outputs"]))
     if kind is StitchRunKind.PRODUCTION:
         stitch_journal(inventory, task["id"], task["plan_sha256"], result)
     return result
@@ -50670,7 +50699,7 @@ def stitch_once(cfg, inventory, stop_event):
     except MediaCertificationResourceError:
         stitch_release(cfg, task)
         raise
-    except (StitchTaskFailure, MediaCertificationError, CleanupSidecarDataError) as exc:
+    except (StitchTaskFailure, MediaCertificationError, CleanupSourceDataError) as exc:
         if not os.path.ismount(str(cfg.output_dir)):
             stitch_release(cfg, task)
             raise StitchResourceHold("NAS output root is not mounted") from None

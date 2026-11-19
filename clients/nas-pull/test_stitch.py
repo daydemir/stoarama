@@ -322,6 +322,24 @@ class StitchIntegrationTests(unittest.TestCase):
         self.assertEqual([c['clip_id'] for c in output['inputs']],[1,2])
         self.assertTrue(all(output[key] for key in ('full_decode','seam_decode','native_audit','packet_chain')))
 
+    def test_late_bad_sidecar_leaves_earlier_run_unpublished(self):
+        self.task["plan"]["joins"] = [False, False, False]
+        raw = self.cfg.output_dir / self.clips[1]["relative_path"]
+        pull.stitch_sidecar_path(raw).write_bytes(b"{not valid JSON")
+        with self.assertRaises(pull.CleanupSourceDataError):
+            self.build()
+        output = self.cfg.output_dir / self.task["plan"]["output_folder"]
+        self.assertEqual(list(output.iterdir()), [])
+        self.assertTrue(raw.is_file())
+
+    def test_stable_source_hardlink_is_task_data(self):
+        raw = self.cfg.output_dir / self.clips[0]["relative_path"]
+        alias = raw.with_name("alias.mp4")
+        os.link(raw, alias)
+        with self.assertRaises(pull.CleanupSourceDataError):
+            self.build()
+        self.assertEqual(raw.stat().st_nlink, 2)
+
     def test_stitch_register_never_permits_local_raw_deletion(self):
         result=self.build()
         self.assertEqual(result['left_out'],[3,4])

@@ -53,6 +53,8 @@ CREATE TABLE clip_transfer_jobs(id bigint PRIMARY KEY,status text NOT NULL DEFAU
 CREATE TABLE inference_box_jobs(id bigint PRIMARY KEY,status text NOT NULL DEFAULT 'done');
 CREATE TABLE nas_restore_requests(id bigint PRIMARY KEY,state text NOT NULL DEFAULT 'done',put_expires_at timestamptz);
 CREATE TABLE nas_stitch_tasks(id bigint PRIMARY KEY,state text NOT NULL DEFAULT 'pending');
+CREATE TABLE nas_cleanup_plans(id bigint PRIMARY KEY,mode text NOT NULL,manifest jsonb NOT NULL);
+CREATE TABLE nas_cleanup_items(plan_id bigint NOT NULL,permit_expires_at timestamptz);
 CREATE TABLE recording_native_stitch_tasks(id bigint PRIMARY KEY,state text NOT NULL DEFAULT 'pending');
 CREATE TABLE recording_presentation_v2_probe_tasks(id bigint PRIMARY KEY,state text NOT NULL DEFAULT 'done');
 CREATE TABLE recording_joined_batches(id bigint PRIMARY KEY,state text NOT NULL DEFAULT 'done');
@@ -101,8 +103,31 @@ CREATE TABLE upload_intents(id bigint PRIMARY KEY,bucket text,expires_at timesta
 			t.Fatalf("pre-0214 write escaped the writer fence: %s", stmt)
 		}
 	}
+	if _, err = pool.Exec(ctx, `
+INSERT INTO nas_cleanup_plans VALUES (1,'enabled','[{"permit_reason":"stitched_included"}]'), (2,'enabled','[{"kind":"raw"}]');
+INSERT INTO nas_cleanup_items VALUES (1,clock_timestamp()+interval '2 minutes');`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, string(localOnly)); err == nil || !strings.Contains(err.Error(), "nas_cleanup_no_stitch_retirement") {
+		t.Fatalf("0214 must refuse an enabled legacy stitch cleanup plan: %v", err)
+	}
+	if _, err = pool.Exec(ctx, "UPDATE nas_cleanup_plans SET mode='paused' WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, string(localOnly)); err == nil || !strings.Contains(err.Error(), "wait for existing NAS stitch delete permits") {
+		t.Fatalf("0214 must refuse unexpired legacy stitch permits: %v", err)
+	}
+	if _, err = pool.Exec(ctx, "UPDATE nas_cleanup_items SET permit_expires_at=clock_timestamp()-interval '1 second'"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = pool.Exec(ctx, string(localOnly)); err != nil {
 		t.Fatalf("apply 0214: %v", err)
+	}
+	if _, err = pool.Exec(ctx, "UPDATE nas_cleanup_plans SET mode='enabled' WHERE id=1"); err == nil {
+		t.Fatal("previous API could re-enable a stitch retirement plan after 0214")
+	}
+	if _, err = pool.Exec(ctx, "UPDATE nas_cleanup_plans SET mode='enabled' WHERE id=2"); err != nil {
+		t.Fatalf("ordinary cleanup plan could not be enabled: %v", err)
 	}
 	blockedWrites, err := os.ReadFile(filepath.Join("..", "..", "..", "infra", "sql", "migrations", "0198_r2_blocked_writes.sql"))
 	if err != nil {

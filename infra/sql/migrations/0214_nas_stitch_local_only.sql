@@ -6,6 +6,24 @@
 -- nas_stitch_tasks row and every nas_stitch_outputs row raises while the fence
 -- is active. Ordinary readiness retains each input and releases the lane.
 --
+-- Retire the old NAS permit path before opening the stitch writer lane. The
+-- previous API can still serve after the pre-deploy transaction commits.
+-- Validating the constraint fences old plan activation and waits for any
+-- in-flight permit transaction holding a plan lock. A previously issued
+-- permit must expire before the migration can release the old writer fence.
+ALTER TABLE nas_cleanup_plans ADD CONSTRAINT nas_cleanup_no_stitch_retirement
+ CHECK (mode <> 'enabled' OR NOT (manifest @> '[{"permit_reason":"stitched_included"}]'::jsonb));
+
+DO $$ BEGIN
+ IF EXISTS (
+  SELECT 1 FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id
+  WHERE i.permit_expires_at > clock_timestamp()
+    AND p.manifest @> '[{"permit_reason":"stitched_included"}]'::jsonb
+ ) THEN
+  RAISE EXCEPTION 'wait for existing NAS stitch delete permits to expire before deploying';
+ END IF;
+END $$;
+
 -- Only the two stitch triggers are removed. Every other 0187 trigger stays.
 --
 -- Functions that read these tables (grep for r2_retirement_writers_drained and
