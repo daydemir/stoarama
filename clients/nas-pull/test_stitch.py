@@ -332,6 +332,41 @@ class StitchIntegrationTests(unittest.TestCase):
         self.assertEqual(list(output.iterdir()), [])
         self.assertTrue(raw.is_file())
 
+    def test_repair_source_change_retries_before_publishing(self):
+        raw = self.cfg.output_dir / self.clips[2]["relative_path"]
+        repair = pull.stitch_repair_local
+
+        def change_before_repair(*args):
+            body = bytearray(raw.read_bytes())
+            body[-1] ^= 1
+            raw.write_bytes(body)
+            return repair(*args)
+
+        with mock.patch.object(pull, "stitch_repair_local", side_effect=change_before_repair):
+            with self.assertRaisesRegex(pull.MediaCertificationResourceError, "repair input differs"):
+                self.build()
+        output = self.cfg.output_dir / self.task["plan"]["output_folder"]
+        self.assertEqual(list(output.iterdir()), [])
+
+    def test_abandoned_stages_reclaimed_before_build_space_check(self):
+        output = self.cfg.output_dir / self.task["plan"]["output_folder"]
+        output.mkdir(parents=True)
+        orphan = output / ".stitch-7-pending-0"
+        orphan.write_bytes(b"old private stage")
+        unrelated = output / ".stitch-9-pending-0"
+        unrelated.write_bytes(b"other task")
+
+        def reserve(cfg, size=0):
+            if not size:
+                return
+            self.assertFalse(orphan.exists())
+            self.assertTrue(unrelated.is_file())
+            raise pull.StitchResourceHold("space fixture")
+
+        with mock.patch.object(pull, "stitch_resources", side_effect=reserve):
+            with self.assertRaisesRegex(pull.StitchResourceHold, "space fixture"):
+                self.build()
+
     def test_stable_source_hardlink_is_task_data(self):
         raw = self.cfg.output_dir / self.clips[0]["relative_path"]
         alias = raw.with_name("alias.mp4")

@@ -2701,6 +2701,9 @@ class CleanupFile:
                 or cleanup_identity(info) != frozen):
             raise RuntimeError("cleanup file differs from exact audited identity")
         if info.st_nlink != 1:
+            current = os.stat(name, dir_fd=self.fds[-1], follow_symlinks=False)
+            if cleanup_identity(current) != frozen or current.st_nlink != info.st_nlink:
+                raise RuntimeError("cleanup link identity changed")
             raise CleanupSourceDataError("cleanup source or sidecar must have exactly one link")
 
     def list_parent(self):
@@ -48502,8 +48505,8 @@ def stitch_repair_local(clip, source, directory, stage_file, tools, deadline, st
         if not stitch_repair_signature(head):
             return None
         data = head + f.read(16 * 1024 * 1024)
-    if len(data) != clip["size_bytes"]:
-        raise StitchHold("repair input size changed")
+    if len(data) != clip["size_bytes"] or hashlib.sha256(data).hexdigest() != clip["sha256"]:
+        raise MediaCertificationResourceError("repair input differs from frozen source")
     nals, stopmsg, gaps, gap_indices = stitch_repair_mdat(data)
     del data
     sps = next((n for n in nals if n[0] & 0x1f == 7), None)
@@ -48620,7 +48623,8 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
             or plan.get("corpus_sha256") != STITCH_CORPUS_SHA or plan.get("keep_policy_sha256") != CLEANUP_KEEP28_POLICY_SHA256):
         raise StitchTaskFailure("unapproved V85 policy identity")
     clips, joins = plan["clips"], plan["joins"]
-    if not 1 <= len(clips) <= 200 or len(joins) != len(clips) - 1 or len(plan.get("eligible", [])) != len(clips) or sum(c["size_bytes"] for c in clips) > STITCH_MAX_INPUT:
+    input_bytes = sum(c["size_bytes"] for c in clips)
+    if not 1 <= len(clips) <= 200 or len(joins) != len(clips) - 1 or len(plan.get("eligible", [])) != len(clips) or input_bytes > STITCH_MAX_INPUT:
         raise StitchTaskFailure("unbounded assembly unit")
     folder = "_V85r_proof_keep28_v2/" if kind is StitchRunKind.PROOF else "_V85r_keep28/"
     suffix = "/proof-" + STITCH_PROOF_SOURCE_SHA[:16] if kind is StitchRunKind.PROOF else ""
@@ -48670,15 +48674,19 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
             else:
                 names += ["source-%03d.%s" % (n, suffix) for n in range(len(clips)) for suffix in ("json", "packets", "hidden", "frames")]
                 # At most one run or repair per input, with one sidecar each.
-                stages = {stage_prefix + str(n) for n in range(2 * len(clips))}
-                names += stages.intersection(os.listdir(descriptor))
-            for name in names:
+                names += [stage_prefix + str(n) for n in range(2 * len(clips))]
+            for name in set(names).intersection(os.listdir(descriptor)):
                 try:
                     os.unlink(name, dir_fd=directory.fds[-1])
                 except FileNotFoundError:
                     pass
             os.fsync(directory.fds[-1])
         resources.callback(clear_scratch)
+        if kind is StitchRunKind.PRODUCTION:
+            # Reclaim abandoned private stages before checking the build's
+            # full reservation. An interrupted batch can use that headroom.
+            clear_scratch()
+            stitch_resources(cfg, input_bytes)
         held = set()
         if admitted is None:
             inputs = plan.get("feature_inputs", [])
@@ -48788,8 +48796,6 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                     raise MediaCertificationResourceError("source identity changed before native audit")
                 path = Path("/proc/%d/fd/%d" % (os.getpid(), fd))
             _, scinfo = confined_regular_file(cfg.output_dir, clip["relative_path"] + ".stoarama.json")
-            if info.st_nlink != 1 or scinfo.st_nlink != 1:
-                raise CleanupSourceDataError("cleanup source or sidecar must have exactly one link")
             clip.update(frozen_identity=cleanup_identity(info), frozen_sidecar_identity=cleanup_identity(scinfo), _path=path)
             if not plan["eligible"][index] or (admitted is not None and not admitted(clip)):
                 if kind is StitchRunKind.PROOF:
@@ -50690,7 +50696,6 @@ def stitch_once(cfg, inventory, stop_event):
         return max(30, min(600, response.get("retry_after_sec", 300)))
     STITCH_STATUS.update(task_id=task["id"], state="working", started_at=utc_now())
     try:
-        stitch_resources(cfg, sum(c["size_bytes"] for c in task["plan"]["clips"]))
         result = stitch_journal(inventory, task["id"], task["plan_sha256"])
         if result is None:
             stitch_corpus(cfg)
