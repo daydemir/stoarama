@@ -61,12 +61,12 @@ func TestValidCollatedNASPathPinsContract(t *testing.T) {
 		"recordings/339/joined/2026-09-24/339_2026-09-25_hour_16_161446-170012.mp4",
 	}
 	for _, p := range good {
-		if !validCollatedNASPath(p) {
+		if !ValidCollatedNASPath(p) {
 			t.Fatalf("rejected %s", p)
 		}
 	}
 	for _, p := range bad {
-		if validCollatedNASPath(p) {
+		if ValidCollatedNASPath(p) {
 			t.Fatalf("accepted %s", p)
 		}
 	}
@@ -99,17 +99,18 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		CREATE TABLE connections(id BIGINT PRIMARY KEY,account_id BIGINT NOT NULL,kind TEXT NOT NULL,api_key_id BIGINT,updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
 		CREATE TABLE recordings(id BIGINT PRIMARY KEY,account_id BIGINT NOT NULL,delivery TEXT NOT NULL);
-		CREATE TABLE recording_collation_hours(id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,local_date DATE NOT NULL,delivery_hour SMALLINT NOT NULL,generation INTEGER NOT NULL);
+		CREATE TABLE recording_collation_hours(id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,local_date DATE NOT NULL,delivery_hour SMALLINT NOT NULL,generation INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'collated');
 		CREATE TABLE recording_collation_outputs(id BIGINT PRIMARY KEY,collation_hour_id BIGINT NOT NULL REFERENCES recording_collation_hours(id),part INTEGER NOT NULL,
 		  object_key TEXT NOT NULL,nas_relative_path TEXT NOT NULL UNIQUE,size_bytes BIGINT NOT NULL,sha256 TEXT NOT NULL,
 		  source_clip_ids BIGINT[] NOT NULL);
 		CREATE TABLE recording_clips(id bigint PRIMARY KEY,display_path text);
+		CREATE TABLE delivery_keep_holds(bucket text,object_key text,kind text,etag text,size_bytes bigint,sha256 text,PRIMARY KEY(bucket,object_key));
 		CREATE TABLE clip_storage_billing_contracts(clip_id BIGINT PRIMARY KEY,mode TEXT NOT NULL,authoritative BOOLEAN NOT NULL DEFAULT true);
 		INSERT INTO clip_storage_billing_contracts(clip_id,mode) SELECT g,'nas_collated_hold' FROM generate_series(1,1000) g;
 		INSERT INTO clip_storage_billing_contracts(clip_id,mode) VALUES(5000,'nas_pull_monthly');
 		INSERT INTO connections(id,account_id,kind,api_key_id) VALUES(13,47,'nas_pull',5),(14,48,'nas_pull',6);
 		INSERT INTO recordings VALUES(1,47,'nas_pull'),(2,47,'managed'),(3,48,'nas_pull');
-		INSERT INTO recording_collation_hours VALUES(10,1,'2026-07-26',6,2),(11,1,'2026-07-26',6,3),(12,1,'2026-07-26',7,2),(13,2,'2026-07-26',6,2),(14,3,'2026-07-26',6,2);
+		INSERT INTO recording_collation_hours(id,recording_id,local_date,delivery_hour,generation) VALUES(10,1,'2026-07-26',6,2),(11,1,'2026-07-26',6,3),(12,1,'2026-07-26',7,2),(13,2,'2026-07-26',6,2),(14,3,'2026-07-26',6,2);
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -125,6 +126,13 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, string(body)); err != nil {
 		t.Fatalf("apply 0174: %v", err)
+	}
+	body, err = os.ReadFile("../../../infra/sql/migrations/0224_delivery_nas_handoff.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(body)); err != nil {
+		t.Fatalf("apply 0224: %v", err)
 	}
 	installDeliveryFenceTestSchema(t, pool)
 	sha := strings.Repeat("a", 64)
@@ -175,7 +183,7 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	}
 	feedIDs := func() []int64 {
 		t.Helper()
-		code, out := do(s.handleAccountCollated, http.MethodGet, "/api/v1/account/collated?limit=10", nil, nil)
+		code, out := do(s.handleAccountCollated, http.MethodGet, "/api/v1/account/collated?limit=10&handoff_readback=1", nil, nil)
 		if code != 200 {
 			t.Fatalf("feed code=%d out=%v", code, out)
 		}
@@ -268,6 +276,102 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 		t.Fatalf("retired output download code=%d", code)
 	}
 
+	// The handoff admits just the approved output and binds its R2 ETag before
+	// presigning. An assembly hold or a divergent live hold cannot authorize it.
+	const handoffKey = "joined/goodplus-20260821-generation-1/objects/106.mp4"
+	if _, err := pool.Exec(ctx, `UPDATE recording_collation_outputs SET object_key=$1 WHERE id=106`, handoffKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO delivery_keep_holds VALUES ('stoarama',$1,'video_assembly','e106',1000,$2)`, handoffKey, sha); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO delivery_nas_handoff_outputs
+	  (output_id,recording_id,roster_sha256,picks_sha256,bucket,object_key,etag,size_bytes,sha256,nas_relative_path)
+	  SELECT id,1,$1,$1,'stoarama',object_key,'e106',size_bytes,sha256,nas_relative_path
+	  FROM recording_collation_outputs WHERE id=106`, sha); err != nil {
+		t.Fatal(err)
+	}
+	if ids := feedIDs(); fmt.Sprint(ids) != "[102]" {
+		t.Fatalf("assembly hold admitted to handoff: %v", ids)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE delivery_keep_holds SET kind='video_collated' WHERE object_key=$1`, handoffKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET delivery_nas_handoff_enabled=true,delivery_nas_handoff_roster_sha256=$1,collated_delivery_enabled=false WHERE id=13`, sha); err != nil {
+		t.Fatal(err)
+	}
+	if ids := feedIDs(); fmt.Sprint(ids) != "[106]" {
+		t.Fatalf("handoff-only did not isolate its roster: %v", ids)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET collated_delivery_enabled=true WHERE id=13`); err != nil {
+		t.Fatal(err)
+	}
+	if ids := feedIDs(); fmt.Sprint(ids) != "[102 106]" {
+		t.Fatalf("approved handoff missing: %v", ids)
+	}
+	heads := s.joinedOutputStorage.(fakeCollatedStore).heads
+	heads[handoffKey] = r2.ObjectHead{ETag: "drifted", SizeBytes: 1000}
+	params := map[string]string{"outputId": "106"}
+	if code, _ := do(s.handleAccountCollatedDownload, http.MethodGet, "/x", nil, params); code != 404 {
+		t.Fatalf("predecessor client can download handoff output: %d", code)
+	}
+	const handoffURL = "/x?handoff_readback=1"
+	if code, _ := do(s.handleAccountCollatedDownload, http.MethodGet, handoffURL, nil, params); code != 409 {
+		t.Fatalf("drifted handoff ETag download code=%d", code)
+	}
+	heads[handoffKey] = r2.ObjectHead{ETag: "e106", SizeBytes: 1000}
+	if code, out := do(s.handleAccountCollatedDownload, http.MethodGet, handoffURL, nil, params); code != 200 || out["if_match"] != `"e106"` {
+		t.Fatalf("approved handoff download code=%d out=%v", code, out)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE delivery_keep_holds SET etag='drifted' WHERE object_key=$1`, handoffKey); err != nil {
+		t.Fatal(err)
+	}
+	if ids := feedIDs(); fmt.Sprint(ids) != "[102]" {
+		t.Fatalf("drifted handoff hold still in feed: %v", ids)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE delivery_keep_holds SET etag='e106' WHERE object_key=$1`, handoffKey); err != nil {
+		t.Fatal(err)
+	}
+	handoffAck := map[string]any{"output_id": 106, "nas_relative_path": dir + "17_170001-180001.mp4", "size_bytes": 1000, "sha256": sha}
+	if code, _ := do(s.handleAccountCollatedAck, http.MethodPost, "/x", handoffAck, nil); code != 200 {
+		t.Fatalf("ordinary ACK code=%d", code)
+	}
+	if ids := feedIDs(); fmt.Sprint(ids) != "[102 106]" {
+		t.Fatalf("ordinary ACK suppressed fresh handoff readback: %v", ids)
+	}
+	handoffAck["handoff_readback"] = []int64{1000, 2, 3, 4, 5}
+	handoffAck["handoff_readback_round"] = 0
+	handoffAck["handoff_root_inode"] = 99
+	if code, _ := do(s.handleAccountCollatedAck, http.MethodPost, "/x", handoffAck, nil); code != 400 {
+		t.Fatalf("unnegotiated handoff ACK code=%d", code)
+	}
+	for range 2 {
+		if code, _ := do(s.handleAccountCollatedAck, http.MethodPost, handoffURL, handoffAck, nil); code != 200 {
+			t.Fatalf("valid handoff ACK code=%d", code)
+		}
+	}
+	handoffAck["handoff_readback"] = []int64{1000, 2, 3, 44, 5}
+	if code, _ := do(s.handleAccountCollatedAck, http.MethodPost, handoffURL, handoffAck, nil); code != 409 {
+		t.Fatalf("different file identity replaced receipt: %d", code)
+	}
+	if ids := feedIDs(); fmt.Sprint(ids) != "[102]" {
+		t.Fatalf("current handoff receipt left pending output: %v", ids)
+	}
+
+	if _, err := pool.Exec(ctx, `INSERT INTO delivery_nas_handoff_rounds(roster_sha256,round) VALUES($1,1)`, sha); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := do(s.handleAccountCollatedAck, http.MethodPost, handoffURL, handoffAck, nil); code != 409 {
+		t.Fatalf("preceding readback round accepted after recheck starts: %d", code)
+	}
+	handoffAck["handoff_readback_round"] = 1
+	if ids := feedIDs(); fmt.Sprint(ids) != "[102 106]" {
+		t.Fatalf("fresh round did not offer the approved output: %v", ids)
+	}
+	if code, _ := do(s.handleAccountCollatedAck, http.MethodPost, handoffURL, handoffAck, nil); code != 200 {
+		t.Fatalf("fresh round readback code=%d", code)
+	}
+
 	// A prefix longer than the scan page is withheld, but the cursor must reach
 	// the later deliverable output. Duplicated sources cannot duplicate outputs.
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_collation_outputs
@@ -283,7 +387,7 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	oracleSQL := strings.Replace(collatedEligibleSQL,
 		"JOIN unnest(o.source_clip_ids) source_id ON source_id=hold.clip_id WHERE hold.mode=",
 		"WHERE hold.clip_id=ANY(o.source_clip_ids) AND hold.mode=", 1)
-	rows, err := pool.Query(ctx, `SELECT o.id `+oracleSQL+collatedNotBackedOffSQL+` ORDER BY o.id`, int64(13))
+	rows, err := pool.Query(ctx, `SELECT o.id `+oracleSQL+collatedNotBackedOffSQL+` ORDER BY o.id`, int64(13), false)
 	if err != nil {
 		t.Fatal(err)
 	}

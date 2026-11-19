@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,7 +27,36 @@ type DeliveryKeepIdentity struct {
 	RecordingID int64  `json:"recording_id,omitempty"`
 	Kind        string `json:"kind"`
 }
+type DeliveryPublicFile struct {
+	Identity          DeliveryKeepIdentity
+	FileURL           string
+	PinnedFileURL     string
+	TicketURL         string
+	DownloadURL       string
+	PinnedDownloadURL string
+}
+
+func deliveryPublicFile(id, generation string, object globalDeliveryObject) DeliveryPublicFile {
+	route := "https://stoarama.com" + publicGlobalDeliveryAPI
+	query := url.Values{"generation": {generation}, "sha256": {object.SHA256}, "path": {object.Path}}
+	escapedID := strings.ReplaceAll(url.QueryEscape(id), "+", "%20")
+	fileURL := route + "/file/" + escapedID
+	file := DeliveryPublicFile{
+		Identity: DeliveryKeepIdentity{Key: object.Key, ETag: strings.Trim(object.ETag, `"`),
+			Size: object.SizeBytes, SHA256: object.SHA256, Path: object.Path, RecordingID: object.RecordingID,
+			Kind: "video_collated"},
+		FileURL:       fileURL,
+		PinnedFileURL: fileURL + "?generation=" + url.QueryEscape(generation),
+		TicketURL:     route + "/ticket/" + escapedID + "?" + query.Encode(),
+	}
+	file.DownloadURL = fileURL + "?download=1"
+	file.PinnedDownloadURL = fileURL + "?download=1&generation=" + url.QueryEscape(generation)
+	return file
+}
+
 type DeliveryKeepSnapshot struct {
+	PublicGeneration   string
+	PublicFiles        map[string][]DeliveryPublicFile
 	OutputDependencies map[int64]int64
 	Objects            map[string]DeliveryKeepIdentity
 	SHA256             string
@@ -40,9 +70,23 @@ type DeliveryKeepStore interface {
 // path contract used by the serving API, including supporting assets and both
 // current and generation-pinned registry objects. Never infer a keep prefix.
 func ReadPublicDeliveryKeep(ctx context.Context, store DeliveryKeepStore) (DeliveryKeepSnapshot, error) {
+	return readPublicDeliveryKeep(ctx, store, false)
+}
+
+// ReadPublicDeliveryKeepWithLinks adds each former URL to the checked snapshot
+// for the delivery NAS file-list export.
+func ReadPublicDeliveryKeepWithLinks(ctx context.Context, store DeliveryKeepStore) (DeliveryKeepSnapshot, error) {
+	return readPublicDeliveryKeep(ctx, store, true)
+}
+
+func readPublicDeliveryKeep(ctx context.Context, store DeliveryKeepStore, includeLinks bool) (DeliveryKeepSnapshot, error) {
 	out := DeliveryKeepSnapshot{Objects: map[string]DeliveryKeepIdentity{}}
+	if includeLinks {
+		out.PublicFiles = map[string][]DeliveryPublicFile{}
+	}
+	const registryPointer = globalDeliveryPrefix + "public/current.json"
 	var current *globalDeliveryRegistry
-	for _, key := range []string{globalDeliveryPrefix + "public/current.json", ""} {
+	for _, key := range []string{registryPointer, ""} {
 		if key == "" {
 			key = globalDeliveryPrefix + "public/generations/" + current.Generation + ".json"
 		}
@@ -90,6 +134,10 @@ func ReadPublicDeliveryKeep(ctx context.Context, store DeliveryKeepStore) (Deliv
 			kind := "video_assembly"
 			if _, err := strconv.ParseInt(id, 10, 64); err == nil {
 				kind = "video_collated"
+			}
+			if includeLinks && key == registryPointer {
+				out.PublicFiles[o.Key] = append(out.PublicFiles[o.Key], deliveryPublicFile(id, registry.Generation, o))
+				out.PublicGeneration = registry.Generation
 			}
 			if err := out.add(o, kind); err != nil {
 				return out, err

@@ -137,6 +137,8 @@ func main() {
 		runNASSelectedVerify(ctx, cfg, os.Args[2:])
 	case "nas-verified-purge":
 		runNASVerifiedPurge(ctx, cfg, os.Args[2:])
+	case "delivery-nas-handoff":
+		runDeliveryNASHandoff(ctx, cfg, os.Args[2:])
 	case "delivery-keep":
 		runDeliveryKeep(ctx, cfg, os.Args[2:])
 	case "r2-inverse":
@@ -261,7 +263,8 @@ func usage() {
 	  stoaramactl nas-benchmark report --connection-id ID [--limit 5 --json]
 	  stoaramactl nas-benchmark request --connection-id ID [--recording-id ID --window-start RFC3339]
 	  stoaramactl joined-source-purge run [--batch-id ID --hour-record-id N --apply --check-r2 --limit N --rate 10 --require-nas=true --sha-every 50 --log PATH --json]
-	  stoaramactl collation-v2 plan|run|register|put-worklist (see: stoaramactl collation-v2)
+	  stoaramactl delivery-nas-handoff --roster FILE --expected-roster-sha256 SHA --picks FILE --expected-picks-sha256 SHA [--apply | --start-final-recheck | --export-file-list FILE]
+  stoaramactl collation-v2 plan|run|register|put-worklist (see: stoaramactl collation-v2)
 	  stoaramactl joined-source-purge hold --hour-record-id N --reason CODE [--note TEXT] | holds [--json]
 	  stoaramactl do-spend report [--json]
 	  stoaramactl do-spend check [--dry-run]

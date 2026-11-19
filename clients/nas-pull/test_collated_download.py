@@ -67,13 +67,13 @@ class CollatedDownloadTests(unittest.TestCase):
                 return {"policy": policy or {"enabled": True, "download_bytes_per_sec": 1 << 30, "download_parallel": 2},
                         "items": items if items is not None else [dict(self.item)],
                         "next_after_id": max((i["output_id"] for i in (items if items is not None else [self.item])), default=0)}
-            if path.startswith("/api/v1/account/collated/") and path.endswith("/download"):
+            if path.startswith("/api/v1/account/collated/") and path.partition("?")[0].endswith("/download"):
                 return {"url": "https://r2.test/obj", "etag": "e1", "if_match": '"e1"',
                         "size_bytes": self.item["size_bytes"], "sha256": self.item["sha256"], "expires_in_sec": 3600}
-            if path == "/account/collated/ack":
+            if path.partition("?")[0] == "/account/collated/ack":
                 self.acks.append(body)
                 return {"ok": True, "already_verified": False}
-            if path == "/account/collated/error":
+            if path.partition("?")[0] == "/account/collated/error":
                 self.errors.append(body)
                 return {"ok": True}
             raise AssertionError(path)
@@ -84,12 +84,14 @@ class CollatedDownloadTests(unittest.TestCase):
         start = int(request.get_header("Range").split("=")[1].rstrip("-"))
         return Response(self.body, start, len(self.body))
 
-    def drain(self, **kwargs):
+    def drain(self, *, mounted=True, **kwargs):
         self.runtime.collated_after_id = 0
         self.runtime.collated_next_poll = 0.0
         with mock.patch.object(pull, "request_json", side_effect=self.fake_request_json(**kwargs)), \
                 mock.patch.object(pull, "open_joined_url", side_effect=self.fake_open), \
-                mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**13, "free_bytes": 10**13}):
+                mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**13, "free_bytes": 10**13}), \
+                mock.patch.object(pull.os.path, "ismount", return_value=mounted), \
+                mock.patch.object(pull.CollatedHandoffMount, "storage", return_value={"available": True, "free_bytes": 10**13}):
             return pull.drain_collated(self.cfg, self.runtime, threading.Event())
 
     def test_cursor_advances_empty_pages_and_revisits_after_exhaustion(self):
@@ -100,7 +102,7 @@ class CollatedDownloadTests(unittest.TestCase):
             for expected in (1000, 2000, 0, 1000):
                 self.assertFalse(pull.drain_collated(self.cfg, self.runtime, threading.Event()))
                 self.assertEqual(self.runtime.collated_after_id, expected)
-        self.assertEqual([call.args[2].split("after_id=")[1] for call in request.call_args_list], ["0", "1000", "2000", "0"])
+        self.assertEqual([call.args[2].split("after_id=")[1].split("&")[0] for call in request.call_args_list], ["0", "1000", "2000", "0"])
 
     def test_joined_loop_paces_advancing_empty_pages(self):
         stop = threading.Event()
@@ -208,6 +210,56 @@ class CollatedDownloadTests(unittest.TestCase):
         self.assertEqual(self.requests, [])
         self.assertEqual(len(self.acks), 1)
 
+    def test_handoff_reports_exact_final_file_identity_on_copy_and_existing(self):
+        self.item.update(handoff_readback_round=0, download_path=self.item["download_path"] + "?handoff_readback=1")
+        self.assertTrue(self.drain())
+        self.assertEqual(len(self.requests), 1)
+        stat = self.final.stat()
+        expected = [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino, stat.st_dev]
+        self.assertEqual(self.acks[0]["handoff_readback"], expected)
+
+        self.requests.clear()
+        self.assertTrue(self.drain())
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.acks[1]["handoff_readback"], expected)
+
+    def test_handoff_refuses_unmounted_root(self):
+        self.item.update(handoff_readback_round=0, download_path=self.item["download_path"] + "?handoff_readback=1")
+        self.assertFalse(self.drain(mounted=False))
+        self.assertEqual(self.acks, [])
+        self.assertFalse(self.final.exists())
+
+    def test_handoff_rechecks_space_before_writing_a_chunk(self):
+        self.item.update(handoff_readback_round=0, download_path=self.item["download_path"] + "?handoff_readback=1")
+        original = pull.CollatedHandoffMount.require_space
+        free = {"available": True, "free_bytes": pull.R2_COPY_FLOOR}
+        def running_out(mount, next_bytes):
+            if next_bytes == 4096:
+                return
+            with mock.patch.object(pull.CollatedHandoffMount, "storage", return_value=free):
+                original(mount, next_bytes)
+        with mock.patch.object(pull.CollatedHandoffMount, "require_space", running_out):
+            self.assertFalse(self.drain())
+        self.assertEqual(self.acks, [])
+        self.assertFalse(self.final.exists())
+
+    def test_handoff_does_not_report_a_replaced_final(self):
+        self.item.update(handoff_readback_round=0, download_path=self.item["download_path"] + "?handoff_readback=1")
+        actual = pull.hash_collated_entry
+
+        def replace_after_readback(directory_fd, name, stop_event, *, durable=False, mount=None):
+            result = actual(directory_fd, name, stop_event, durable=durable, mount=mount)
+            if durable:
+                alternate = self.final.with_name("replacement")
+                alternate.write_bytes(self.body)
+                os.replace(alternate, self.final)
+            return result
+
+        with mock.patch.object(pull, "hash_collated_entry", side_effect=replace_after_readback):
+            self.assertFalse(self.drain())
+        self.assertEqual(self.acks, [])
+        self.assertIn("handoff path changed", self.errors[0]["error"])
+
     def test_existing_different_final_is_never_overwritten(self):
         self.final.parent.mkdir(parents=True)
         self.final.write_bytes(b"someone else's bytes")
@@ -255,9 +307,9 @@ class CollatedDownloadTests(unittest.TestCase):
         gate = threading.Event()
         original = pull.download_collated_item
 
-        def slow(cfg, item, limiter, stop_event):
+        def slow(cfg, item, limiter, stop_event, **kwargs):
             gate.wait(2)
-            return original(cfg, item, limiter, stop_event)
+            return original(cfg, item, limiter, stop_event, **kwargs)
         with mock.patch.object(pull, "request_json", side_effect=self.fake_request_json(items=[dict(self.item), second])), \
                 mock.patch.object(pull, "open_joined_url", side_effect=self.fake_open), \
                 mock.patch.object(pull, "download_collated_item", side_effect=slow), \
