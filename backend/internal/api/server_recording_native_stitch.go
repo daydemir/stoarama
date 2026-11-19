@@ -70,6 +70,7 @@ func loadNativeStitchManifest(ctx context.Context, q nativeStitchQueryer, accoun
 			return nil, "", 0, fmt.Errorf("window clip lacks capture generation")
 		}
 		c.Ordinal = len(clips) + 1
+		c.ClipStartAt, c.ClipEndAt = c.ClipStartAt.UTC(), c.ClipEndAt.UTC()
 		c.CaptureGeneration = *generation
 		c.CaptureSequence = *sequence
 		if attempt != nil {
@@ -210,8 +211,8 @@ func (s *Server) handleAccountNativeStitchClaim(w http.ResponseWriter, r *http.R
 			util.WriteError(w, 500, "invalid frozen stitch manifest")
 			return
 		}
-		current, currentSHA, _, loadErr := loadNativeStitchManifest(r.Context(), tx, p.AccountID, candidate.out.RecordingID, candidate.out.RecordingJobID, candidate.out.WindowStartAt, candidate.out.WindowEndAt)
-		if loadErr != nil || currentSHA != candidate.out.ClipManifestSHA256 || len(current) != len(candidate.out.Clips) {
+		current, _, _, loadErr := loadNativeStitchManifest(r.Context(), tx, p.AccountID, candidate.out.RecordingID, candidate.out.RecordingJobID, candidate.out.WindowStartAt, candidate.out.WindowEndAt)
+		if loadErr != nil || !stitchcert.MatchesFrozenManifest(current, candidate.out.Clips, candidate.out.ClipManifestSHA256) {
 			_, _ = tx.Exec(r.Context(), `UPDATE recording_native_stitch_tasks SET state='stale',last_reason_code='server_manifest_changed' WHERE id=$1`, candidate.out.TaskID)
 			continue
 		}
@@ -440,7 +441,7 @@ func (s *Server) handleAccountNativeStitchComplete(w http.ResponseWriter, r *htt
 	}
 	for i, c := range report.Clips {
 		signatureSHA, signatureJSON, signatureErr := stitchcert.CanonicalSHA(c.NativeSignature)
-		if c.ManifestClip != frozen[i] || !nativeStitchHex64(c.SidecarSHA256) || !nativeStitchHex64(c.NativeSignatureSHA256) || signatureErr != nil || len(signatureJSON) > 64<<10 || signatureSHA != c.NativeSignatureSHA256 || !validNativeFileIdentity(c.FileIdentity) || c.FileIdentity.Size != c.SizeBytes || (c.StrictDecode != "passed" && c.StrictDecode != "failed" && c.StrictDecode != "unknown") {
+		if !c.ManifestClip.Equal(frozen[i]) || !nativeStitchHex64(c.SidecarSHA256) || !nativeStitchHex64(c.NativeSignatureSHA256) || signatureErr != nil || len(signatureJSON) > 64<<10 || signatureSHA != c.NativeSignatureSHA256 || !validNativeFileIdentity(c.FileIdentity) || c.FileIdentity.Size != c.SizeBytes || (c.StrictDecode != "passed" && c.StrictDecode != "failed" && c.StrictDecode != "unknown") {
 			util.WriteError(w, 409, "clip evidence differs from frozen manifest")
 			return
 		}
@@ -557,8 +558,8 @@ func (s *Server) handleAccountNativeStitchComplete(w http.ResponseWriter, r *htt
 		}
 	}
 	if revalidateExactMedia {
-		current, currentSHA, _, e := loadNativeStitchManifest(r.Context(), tx, p.AccountID, recordingID, jobID, start, end)
-		if e != nil || currentSHA != manifestSHA || len(current) != len(frozen) {
+		current, _, _, e := loadNativeStitchManifest(r.Context(), tx, p.AccountID, recordingID, jobID, start, end)
+		if e != nil || !stitchcert.MatchesFrozenManifest(current, frozen, manifestSHA) {
 			util.WriteError(w, 409, "server manifest changed")
 			return
 		}

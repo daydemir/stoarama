@@ -322,7 +322,66 @@ class StitchIntegrationTests(unittest.TestCase):
         self.assertEqual([c['clip_id'] for c in output['inputs']],[1,2])
         self.assertTrue(all(output[key] for key in ('full_decode','seam_decode','native_audit','packet_chain')))
 
-    def test_stitch_register_then_delete_only_fully_included(self):
+    def test_late_bad_sidecar_leaves_earlier_run_unpublished(self):
+        self.task["plan"]["joins"] = [False, False, False]
+        raw = self.cfg.output_dir / self.clips[1]["relative_path"]
+        pull.stitch_sidecar_path(raw).write_bytes(b"{not valid JSON")
+        with self.assertRaises(pull.CleanupSourceDataError):
+            self.build()
+        output = self.cfg.output_dir / self.task["plan"]["output_folder"]
+        self.assertEqual(list(output.iterdir()), [])
+        self.assertTrue(raw.is_file())
+
+    def test_repair_source_change_retries_before_publishing(self):
+        raw = self.cfg.output_dir / self.clips[2]["relative_path"]
+        repair = pull.stitch_repair_local
+
+        def change_before_repair(*args):
+            body = bytearray(raw.read_bytes())
+            body[44] ^= 1
+            raw.write_bytes(body)
+            # Model an unchanged inode stat snapshot so the exact bounded
+            # byte check must catch the altered signature.
+            args[0]["frozen_identity"] = pull.cleanup_identity(raw.stat())
+            return repair(*args)
+
+        with mock.patch.object(pull, "stitch_repair_local", side_effect=change_before_repair):
+            with self.assertRaisesRegex(pull.MediaCertificationResourceError, "repair input differs"):
+                self.build()
+        output = self.cfg.output_dir / self.task["plan"]["output_folder"]
+        self.assertEqual(list(output.iterdir()), [])
+
+    def test_abandoned_stages_reclaimed_before_build_space_check(self):
+        output = self.cfg.output_dir / self.task["plan"]["output_folder"]
+        output.mkdir(parents=True)
+        orphan = output / ".stitch-7-pending-0"
+        orphan.write_bytes(b"old private stage")
+        unrelated = output / ".stitch-9-pending-0"
+        unrelated.write_bytes(b"other task")
+
+        def reserve(cfg, size=0):
+            if not size:
+                return
+            self.assertFalse(orphan.exists())
+            self.assertTrue(unrelated.is_file())
+            raise pull.StitchResourceHold("space fixture")
+
+        with mock.patch.object(pull, "stitch_resources", side_effect=reserve):
+            with self.assertRaisesRegex(pull.StitchResourceHold, "space fixture"):
+                self.build()
+
+    def test_stable_source_hardlink_is_task_data_in_runs_and_repairs(self):
+        for clip in (self.clips[0], self.clips[2]):
+            with self.subTest(clip=clip["source_id"]):
+                raw = self.cfg.output_dir / clip["relative_path"]
+                alias = raw.with_name("alias.mp4")
+                os.link(raw, alias)
+                with self.assertRaises(pull.CleanupSourceDataError):
+                    self.build()
+                self.assertEqual(raw.stat().st_nlink, 2)
+                alias.unlink()
+
+    def test_stitch_register_never_permits_local_raw_deletion(self):
         result=self.build()
         self.assertEqual(result['left_out'],[3,4])
         self.assertEqual(len(result['repairs']),1)
@@ -330,68 +389,35 @@ class StitchIntegrationTests(unittest.TestCase):
         self.assertTrue(result['repairs'][0]['synthesized_timestamps'])
         self.assertEqual(len(result['outputs']),1)
         self.assertEqual([p['clip_id'] for p in result['outputs'][0]['inputs']],[1,2])
-        # Even a server mistakenly offering a cleanup task before registration
-        # cannot pass the independent local receipt gate.
-        with mock.patch.object(pull,'restore_api',side_effect=self.api):
-            pull.cleanup_process_task(self.cfg,self.inventory,self.stop,self.cleanup_task(result))
-            self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
-            pull.stitch_register(self.cfg,self.inventory,7,result)
-            pull.cleanup_process_task(self.cfg,self.inventory,self.stop,self.cleanup_task(result))
-        self.assertFalse((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
-        for c in self.clips[1:]: self.assertTrue((self.cfg.output_dir/c['relative_path']).exists())
-        self.assertTrue((self.cfg.state_dir/pull.CLEANUP_LEDGER_NAME).exists())
+        # Owner rule: keep28 raw is never deleted because of stitching, so every
+        # reported input is retirement-held and no cleanup plan is ever made.
+        self.assertTrue(all(p['retirement_held'] for p in result['outputs'][0]['inputs']))
+        with mock.patch.object(pull, "restore_api", side_effect=self.api):
+            pull.stitch_register(self.cfg, self.inventory, 7, result)
+        self.assertTrue(all((self.cfg.output_dir / c["relative_path"]).is_file() for c in self.clips))
 
-    def test_fresh_output_rehash_refuses_tamper_and_local_switch(self):
-        result=self.build(); task=self.cleanup_task(result)
-        with mock.patch.object(pull,'restore_api',side_effect=self.api): pull.stitch_register(self.cfg,self.inventory,7,result)
-        self.cfg.stitch_delete_enabled=False
-        self.assertIn('switch off',pull.stitch_output_recheck(self.cfg,task['item']))
-        self.cfg.stitch_delete_enabled=True
-        output=self.cfg.output_dir/result['outputs'][0]['relative_path'];output.write_bytes(b'corrupt')
-        with mock.patch.object(pull,'restore_api',side_effect=self.api): pull.cleanup_process_task(self.cfg,self.inventory,self.stop,task)
-        self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
-
-    def test_switch_off_during_output_rehash_keeps_raw(self):
-        result=self.build(); task=self.cleanup_task(result)
-        with mock.patch.object(pull,'restore_api',side_effect=self.api): pull.stitch_register(self.cfg,self.inventory,7,result)
-        real=pull.hash_certification_file
-        def flip(*a,**k):
-            out=real(*a,**k); self.cfg.stitch_delete_enabled=False; return out
-        with mock.patch.object(pull,'hash_certification_file',side_effect=flip):
-            self.assertIn('switch off',pull.stitch_output_recheck(self.cfg,task['item']))
-        self.cfg.stitch_delete_enabled=True
-        with mock.patch.object(pull,'hash_certification_file',side_effect=flip), \
-                mock.patch.object(pull,'restore_api',side_effect=self.api):
-            pull.cleanup_process_task(self.cfg,self.inventory,self.stop,task)
-        self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
-
-    def test_switch_off_at_unlink_boundary_keeps_raw(self):
-        result=self.build(); task=self.cleanup_task(result)
-        with mock.patch.object(pull,'restore_api',side_effect=self.api): pull.stitch_register(self.cfg,self.inventory,7,result)
-        real=pull.cleanup_local_caps
-        def flip(*a,**k):
-            out=real(*a,**k)
-            if len(a)>2: self.cfg.stitch_delete_enabled=False
-            return out
-        with mock.patch.object(pull,'cleanup_local_caps',side_effect=flip), \
-                mock.patch.object(pull,'restore_api',side_effect=self.api):
-            pull.cleanup_process_task(self.cfg,self.inventory,self.stop,task)
-        self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
-
-    def test_switch_off_during_ledger_intent_keeps_raw(self):
-        result=self.build(); task=self.cleanup_task(result)
-        with mock.patch.object(pull,'restore_api',side_effect=self.api): pull.stitch_register(self.cfg,self.inventory,7,result)
-        real=pull.cleanup_ledger_append
-        def flip(cfg,entry,*a,**k):
-            out=real(cfg,entry,*a,**k)
-            if entry.get('event')=='intent': self.cfg.stitch_delete_enabled=False
-            return out
-        with mock.patch.object(pull,'cleanup_ledger_append',side_effect=flip), \
-                mock.patch.object(pull,'restore_api',side_effect=self.api):
-            pull.cleanup_process_task(self.cfg,self.inventory,self.stop,task)
-        raw=self.cfg.output_dir/self.clips[0]['relative_path']
-        self.assertTrue(raw.exists())
-        if task['item'].get('sidecar_required'): self.assertTrue(os.path.exists(str(raw)+'.stoarama.json'))
+    def test_registered_legacy_stitch_permit_refuses_raw_and_sidecar_at_unlink(self):
+        result = self.build()
+        output = result["outputs"][0]
+        output["inputs"][0]["retirement_held"] = False
+        output_path = self.cfg.output_dir / output["relative_path"]
+        Path(str(output_path) + ".proof.json").write_bytes(pull.cleanup_json_bytes(output))
+        with mock.patch.object(pull, "restore_api", side_effect=self.api):
+            pull.stitch_register(self.cfg, self.inventory, 7, result)
+        self.assertTrue(Path(str(output_path) + ".registered.json").is_file())
+        self.assertTrue(self.cfg.stitch_enabled and self.cfg.stitch_delete_enabled)
+        task = self.cleanup_task(result)
+        raw = self.cfg.output_dir / task["item"]["relative_path"]
+        with mock.patch.object(pull, "restore_api", side_effect=self.api):
+            pull.cleanup_process_task(self.cfg, self.inventory, self.stop, task)
+        self.assertEqual(list(self.cfg.state_dir.glob(pull.CLEANUP_LEDGER_NAME)), [])
+        self.assertIn("preserves stitch sources", pull.cleanup_guard_refusal(task, task["approved_proof"]))
+        with pull.CleanupFile(self.cfg, task["item"], self.stop, time.monotonic() + 10) as source:
+            proof = source.proof()
+            with self.assertRaisesRegex(pull.CleanupPermitRefused, "preserves stitch sources"):
+                source.delete_exact(proof)
+            self.assertFalse(source.unlink_attempted)
+        self.assertTrue(raw.is_file() and pull.stitch_sidecar_path(raw).is_file())
 
     def test_crash_after_publication_before_journal_rebuilds_without_raw_loss(self):
         with mock.patch.object(pull,'stitch_journal',side_effect=RuntimeError('simulated crash')):
@@ -408,16 +434,7 @@ class StitchIntegrationTests(unittest.TestCase):
         with mock.patch.object(pull,'restore_api',side_effect=self.api) as api:
             pull.stitch_once(self.cfg,self.inventory,self.stop)
         self.assertEqual(api.call_count,2)
-        self.assertIsNone(pull.stitch_output_recheck(self.cfg,self.cleanup_task(result)['item']))
-        for c in self.clips:self.assertTrue((self.cfg.output_dir/c['relative_path']).exists())
-
-    def test_dry_run_checks_inclusion_while_local_deletion_is_disabled(self):
-        result=self.build();task=self.cleanup_task(result)
-        with mock.patch.object(pull,'restore_api',side_effect=self.api):pull.stitch_register(self.cfg,self.inventory,7,result)
-        self.cfg.stitch_delete_enabled=False
-        task.pop('approved_proof')
-        self.assertIsNone(pull.cleanup_guard_refusal(task,result['outputs'][0]['inputs'][0]['raw_proof'],self.cfg))
-        self.assertIn('switch off',pull.stitch_output_recheck(self.cfg,task['item']))
+        self.assertTrue(all((self.cfg.output_dir / c["relative_path"]).is_file() for c in self.clips))
 
     def test_v85r_status_hold_splits_output_and_retains_both_raw_endpoints(self):
         self.task['plan']['feature_inputs']=[dict(clip_id=c['source_id']) for c in self.clips]
@@ -461,21 +478,26 @@ class StitchIntegrationTests(unittest.TestCase):
             try:
                 self.assertTrue(building.wait(5))
                 self.assertEqual(pull.NAS_MEDIA_FENCE.writers, 0)
-                # A real proven-inclusion retirement finishes while the native
-                # build is deliberately still blocked, rather than timing out.
-                pull.cleanup_process_task(self.cfg, self.inventory, self.stop, self.cleanup_task(result), lane=lane)
-                self.assertFalse((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
+                # The execution lane drains while the native build is still
+                # blocked, rather than timing out behind it.
+                lived = []
+                lane.run(lambda: lived.append(True))
+                self.assertEqual(lived, [True])
                 self.assertTrue(worker.is_alive())
                 resume.set()
                 worker.join(5)
                 self.assertFalse(worker.is_alive())
                 self.assertEqual(len(errors), 1)
                 self.assertIsInstance(errors[0], pull.StitchHold)
+                # Even a lane that drained never offers a held stitch source
+                # for deletion.
+                pull.cleanup_process_task(self.cfg, self.inventory, self.stop, self.cleanup_task(result), lane=lane)
+                self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
             finally:
                 resume.set()
                 worker.join(5)
                 lane.close()
-        for clip in self.clips[1:]:
+        for clip in self.clips:
             self.assertTrue((self.cfg.output_dir/clip['relative_path']).exists())
 
     def test_cleanup_lane_cancels_running_native_child_without_waiting_for_it(self):
@@ -524,6 +546,316 @@ class StitchIntegrationTests(unittest.TestCase):
         self.task['plan']['policy']=pull.STITCH_POLICY
         (self.cfg.output_dir/'stream_V85r_keep28').symlink_to(self.cfg.state_dir,target_is_directory=True)
         with self.assertRaises(OSError):self.build()
+
+
+class StitchTaskDataHoldTests(unittest.TestCase):
+    """A deterministic per-task failure is reported once; a host condition is not."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.cfg = SimpleNamespace(output_dir=root/'clips', state_dir=root/'state', inventory_file=root/'state/inventory.sqlite3',
+                                   dry_run=False, stitch_enabled=True, stitch_delete_enabled=True, min_free_bytes=1)
+        self.cfg.state_dir.mkdir(); (self.cfg.output_dir/'stream/day').mkdir(parents=True)
+        self.inventory = pull.Inventory(self.cfg)
+        self.addCleanup(self.inventory.close)
+        self.stop = threading.Event()
+        self.clips = [dict(kind='raw', source_id=n, recording_id=22, stream_id=33, source_ids=[n],
+                           relative_path='stream/day/%d.mp4' % n, size_bytes=10, sha256='a'*64,
+                           sidecar_required=True, start_at='2026-09-01T00:00:00Z', end_at='2026-09-01T00:01:00Z',
+                           frozen_identity=[0]*5, frozen_sidecar_identity=[0]*5) for n in (1,2,3)]
+        self.task = dict(id=7, lease_token='f'*64, plan_sha256='a'*64,
+            expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=2)).isoformat(),
+            plan=dict(policy=pull.STITCH_POLICY, revision=pull.STITCH_REVISION, corpus_sha256=pull.STITCH_CORPUS_SHA,
+                      keep_policy_sha256=pull.CLEANUP_KEEP28_POLICY_SHA256, stream_id=33, recording_id=22,
+                      clips=self.clips, joins=[True, True], eligible=[True]*3,
+                      output_folder='stream_V85r_keep28/22/2026-09-01T00-00-00Z'))
+        self.calls = []
+        def api(cfg, path, body, timeout=None):
+            self.calls.append((path, body))
+            if path.endswith('/lease'):
+                return dict(task=self.task, retry_after_sec=0)
+            if body.get('release'):
+                return dict(continue_=False, released=True)
+            return dict(recorded=True, id=7)
+        self.api = api
+
+    def patch_common(self, build):
+        patches = [mock.patch.object(pull, 'restore_api', side_effect=self.api),
+                   mock.patch.object(pull, 'stitch_journal', wraps=pull.stitch_journal),
+                   mock.patch.object(pull, 'stitch_corpus'),
+                   mock.patch.object(pull, 'stitch_v85r_tools', return_value={}),
+                   mock.patch.object(pull, 'stitch_resources'),
+                   mock.patch.object(pull.os.path, 'ismount', return_value=True),
+                   mock.patch.object(pull.NAS_MEDIA_FENCE, 'wait_maintenance', return_value=True),
+                   mock.patch.object(pull, 'stitch_build', side_effect=build),
+                   mock.patch.object(pull, 'log')]
+        for patch in patches: patch.start(); self.addCleanup(patch.stop)
+
+    def test_missing_sidecar_reports_every_input_left_out_once(self):
+        # The real sidecar read fails for a clip whose .stoarama.json is absent.
+        def build(cfg, inventory, task, stop, tools):
+            pull.confined_regular_file(cfg.output_dir, self.clips[0]['relative_path'] + '.stoarama.json')
+        self.patch_common(build)
+        self.assertEqual(pull.stitch_once(self.cfg, self.inventory, self.stop), 30)
+        results = [body for path, body in self.calls if path.endswith('/result')]
+        self.assertEqual(len(results), 1, self.calls)
+        self.assertEqual(results[0]['outputs'], [])
+        self.assertEqual(results[0]['repairs'], [])
+        self.assertEqual(results[0]['left_out'], [1, 2, 3])
+        self.assertEqual([s['decision'] for s in results[0]['seams']], ['hold', 'hold'])
+        self.assertIn('media path is unavailable', results[0]['error'])
+        self.assertNotIn('/ready', [path for path, _ in self.calls])
+        # The hold is journalled as registered, so a restart never re-leases it.
+        with self.inventory.lock:
+            row = self.inventory.db.execute('SELECT registered FROM stitch_jobs WHERE task_id=7').fetchone()
+        self.assertEqual(row[0], 1)
+
+    def test_missing_raw_holds_only_this_hour(self):
+        def build(cfg, inventory, task, stop, tools):
+            pull.confined_regular_file(cfg.output_dir, self.clips[0]['relative_path'])
+        self.patch_common(build)
+        self.assertEqual(pull.stitch_once(self.cfg, self.inventory, self.stop), 30)
+        results = [body for path, body in self.calls if path.endswith('/result')]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['left_out'], [1, 2, 3])
+
+    def test_missing_source_folder_keeps_the_hour_retryable(self):
+        (self.cfg.output_dir/'stream/day').rmdir()
+        def build(cfg, inventory, task, stop, tools):
+            pull.confined_regular_file(cfg.output_dir, self.clips[0]['relative_path'])
+        self.patch_common(build)
+        with self.assertRaises(pull.StitchResourceHold):
+            pull.stitch_once(self.cfg, self.inventory, self.stop)
+        self.assertTrue(self.calls[-1][1]['release'])
+        self.assertFalse(any(path.endswith('/result') for path, _ in self.calls))
+
+    def test_malformed_stable_sidecar_is_a_terminal_task_hold(self):
+        item = dict(self.clips[0])
+        raw = self.cfg.output_dir / item["relative_path"]
+        sidecar = pull.stitch_sidecar_path(raw)
+        raw.write_bytes(b"a" * 10)
+        sidecar.write_bytes(b"{not valid JSON")
+        item.update(sha256=hashlib.sha256(raw.read_bytes()).hexdigest(),
+                    frozen_identity=pull.cleanup_identity(raw.stat()),
+                    frozen_sidecar_identity=pull.cleanup_identity(sidecar.stat()))
+        def build(cfg, inventory, task, stop, tools):
+            with pull.CleanupFile(cfg, item, stop, time.monotonic() + 10) as source:
+                source.proof()
+        self.patch_common(build)
+        self.assertEqual(pull.stitch_once(self.cfg, self.inventory, self.stop), 30)
+        self.assertEqual(self.calls[-1][1]["error"], "cleanup sidecar JSON is invalid")
+        self.assertTrue(raw.is_file() and sidecar.is_file())
+
+    def test_source_or_directory_change_during_hash_releases_without_holding_hour(self):
+        item = self.clips[0]
+        raw = self.cfg.output_dir / item["relative_path"]
+        sibling = raw.parent / "new-sibling"
+        read = os.read
+        for changed in (sibling, raw):
+            with self.subTest(changed=changed.name):
+                self.calls.clear()
+                raw.write_bytes(b"a" * 10)
+                digest = hashlib.sha256(raw.read_bytes()).hexdigest()
+                changed_once = False
+
+                def publish_during_read(fd, size):
+                    nonlocal changed_once
+                    if not changed_once:
+                        changed_once = True
+                        changed.write_bytes(b"new")
+                    return read(fd, size)
+
+                def build(cfg, inventory, task, stop, tools):
+                    with mock.patch.object(pull.os, "read", side_effect=publish_during_read):
+                        pull.hash_certification_file_cancellable(cfg.output_dir, item["relative_path"], 10, digest, stop)
+
+                self.patch_common(build)
+                with self.assertRaises(pull.MediaCertificationResourceError):
+                    pull.stitch_once(self.cfg, self.inventory, self.stop)
+                self.assertTrue(self.calls[-1][1]["release"])
+                self.assertFalse(any(path.endswith("/result") for path, _ in self.calls))
+
+    def test_typed_task_failure_is_held_and_reported(self):
+        def build(cfg, inventory, task, stop, tools):
+            raise pull.StitchTaskFailure("raw folder is not owned by approved stream")
+        self.patch_common(build)
+        self.assertEqual(pull.stitch_once(self.cfg, self.inventory, self.stop), 30)
+        results = [body for path, body in self.calls if path.endswith('/result')]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['left_out'], [1, 2, 3])
+        self.assertIn('not owned', results[0]['error'])
+
+    def test_mounted_share_io_failure_posts_no_terminal_result(self):
+        def build(cfg, inventory, task, stop, tools):
+            raise pull.MediaCertificationError("media path is unavailable") from PermissionError("fixture")
+        self.patch_common(build)
+        with self.assertRaises(pull.StitchResourceHold):
+            pull.stitch_once(self.cfg, self.inventory, self.stop)
+        self.assertTrue(self.calls[-1][1]['release'])
+        self.assertFalse(any(path.endswith('/result') for path, _ in self.calls))
+
+    def test_invalid_policy_pins_leave_the_task_queue_untouched(self):
+        self.patch_common(AssertionError("build should not run"))
+        with mock.patch.object(pull, 'cleanup_pins', return_value=(None, "fixture pin error")):
+            with self.assertRaises(pull.StitchResourceHold):
+                pull.stitch_once(self.cfg, self.inventory, self.stop)
+        self.assertEqual(self.calls, [])
+
+    def test_resource_hold_posts_no_result_and_releases_for_later(self):
+        for hold in (pull.StitchResourceHold('NAS memory or load critical'), pull.StitchHold('stitch cancelled'),
+                     pull.StitchNativeFailure(9), OSError('inventory unavailable')):
+            with self.subTest(hold=type(hold).__name__):
+                self.calls.clear()
+                def build(cfg, inventory, task, stop, tools, hold=hold):
+                    raise hold
+                with mock.patch.object(pull, 'restore_api', side_effect=self.api), \
+                        mock.patch.object(pull, 'stitch_corpus'), \
+                        mock.patch.object(pull, 'stitch_v85r_tools', return_value={}), \
+                        mock.patch.object(pull, 'stitch_resources'), \
+                        mock.patch.object(pull.os.path, 'ismount', return_value=True), \
+                        mock.patch.object(pull.NAS_MEDIA_FENCE, 'wait_maintenance', return_value=True), \
+                        mock.patch.object(pull, 'stitch_build', side_effect=build), \
+                        mock.patch.object(pull, 'log'):
+                    with self.assertRaises(Exception):
+                        pull.stitch_once(self.cfg, self.inventory, self.stop)
+                self.assertEqual([p for p, _ in self.calls if p.endswith('/result')], [])
+                with self.inventory.lock:
+                    row = self.inventory.db.execute('SELECT result FROM stitch_jobs WHERE task_id=7').fetchone()
+                self.assertTrue(row is None or row[0] is None, row)
+
+    def test_resource_hold_kinds_are_distinct_types(self):
+        # A string match could never separate these; they are independent types.
+        self.assertTrue(issubclass(pull.StitchResourceHold, pull.StitchHold))
+        self.assertTrue(issubclass(pull.StitchTaskFailure, pull.StitchHold))
+        self.assertFalse(issubclass(pull.StitchResourceHold, pull.StitchTaskFailure))
+        self.assertFalse(issubclass(pull.StitchTaskFailure, pull.StitchResourceHold))
+        self.assertFalse(issubclass(pull.StitchNativeFailure, pull.StitchTaskFailure))
+        self.assertFalse(issubclass(OSError, pull.StitchTaskFailure))
+        # The real resource gate raises the resource type, never the task type.
+        for text in ('NAS memory or load critical','NAS output root is not mounted','NAS free-space reserve reached'):
+            with self.subTest(text=text):
+                with mock.patch.object(pull, 'meminfo_bytes', return_value=(0, 0)):
+                    with self.assertRaises(pull.StitchResourceHold):
+                        pull.stitch_resources(SimpleNamespace(output_dir=Path('/nonexistent-mount'), min_free_bytes=1))
+
+    def test_lost_mount_mid_build_is_a_resource_hold_not_a_task_hold(self):
+        # A media read failing because the share vanished must release and retry,
+        # never terminally hold the hour's data.
+        def build(cfg, inventory, task, stop, tools):
+            raise pull.MediaCertificationError("media path is unavailable")
+        with mock.patch.object(pull, 'restore_api', side_effect=self.api), \
+                mock.patch.object(pull, 'stitch_corpus'), \
+                mock.patch.object(pull, 'stitch_v85r_tools', return_value={}), \
+                mock.patch.object(pull, 'stitch_resources'), \
+                mock.patch.object(pull.os.path, 'ismount', return_value=False), \
+                mock.patch.object(pull.NAS_MEDIA_FENCE, 'wait_maintenance', return_value=True), \
+                mock.patch.object(pull, 'stitch_build', side_effect=build), \
+                mock.patch.object(pull, 'log'):
+            with self.assertRaises(pull.StitchResourceHold):
+                pull.stitch_once(self.cfg, self.inventory, self.stop)
+        self.assertEqual([p for p, _ in self.calls if p.endswith('/result')], [])
+        with self.inventory.lock:
+            row = self.inventory.db.execute('SELECT result FROM stitch_jobs WHERE task_id=7').fetchone()
+        self.assertTrue(row is None or row[0] is None, row)
+
+    def test_mid_job_refresh_resource_hold_does_not_post_a_result(self):
+        # The 5s refresh latches the same typed hold, which the lane then
+        # releases without a result.
+        stop = pull.StitchStop(self.cfg, self.stop, self.task)
+        with mock.patch.object(pull, 'stitch_resources', side_effect=pull.StitchResourceHold('NAS memory or load critical')), \
+                mock.patch.object(pull, 'stitch_checkpoint'):
+            stop.refresh()
+        self.assertIn('memory or load', stop.reason)
+        self.assertTrue(issubclass(pull.StitchResourceHold, pull.StitchHold))
+
+
+class StitchResourceOverrideTests(unittest.TestCase):
+    """Env overrides with exactly today's defaults; fail fast, never fall back."""
+    def resources(self, memory=8 << 30, load=0.0, cpus=4, free=64 << 30, min_free=1, mounted=True, env=None):
+        cfg = SimpleNamespace(output_dir=Path('/fixture/clips'), min_free_bytes=min_free,
+                              stitch_enabled=True, stitch_proof_enabled=False)
+        patches = [mock.patch.object(pull, 'meminfo_bytes', return_value=(0, memory)),
+                   mock.patch.object(pull, 'cgroup_memory_limit', return_value=None),
+                   mock.patch.object(pull.os, 'getloadavg', return_value=(load, 0, 0)),
+                   mock.patch.object(pull.os.path, 'ismount', return_value=mounted),
+                   mock.patch.object(shutil, 'disk_usage',
+                                     return_value=SimpleNamespace(free=free, total=free, used=0)),
+                   mock.patch.object(pull.os, 'sched_getaffinity', return_value=set(range(cpus)), create=True),
+                   mock.patch.object(pull, 'cgroup_cpu_limit', return_value=None),
+                   mock.patch.dict(os.environ, env or {}, clear=False)]
+        for patch in patches: patch.start(); self.addCleanup(patch.stop)
+        for name in (pull.STITCH_MIN_MEMORY_ENV, pull.STITCH_MAX_LOAD_PER_CPU_ENV):
+            if env is None or name not in env:
+                os.environ.pop(name, None)
+        return cfg
+
+    def test_defaults_are_exactly_todays_values(self):
+        self.resources(env={})
+        self.assertEqual(pull.stitch_min_memory_bytes(), 384 * 1024 * 1024)
+        self.assertEqual(pull.stitch_min_memory_bytes(), 402653184)
+        self.assertEqual(pull.stitch_max_load_per_cpu(), 1.5)
+
+    def test_overrides_are_parsed_and_applied_to_the_gate(self):
+        cfg = self.resources(memory=256 << 20, load=3.0, cpus=4,
+                             env={pull.STITCH_MIN_MEMORY_ENV: '134217728',
+                                  pull.STITCH_MAX_LOAD_PER_CPU_ENV: '2.5'})
+        self.assertEqual(pull.stitch_min_memory_bytes(), 134217728)
+        self.assertEqual(pull.stitch_max_load_per_cpu(), 2.5)
+        # 256 MiB < default 384 MiB, but the override admits this worker.
+        pull.stitch_resources(cfg)
+        # The same host still refuses under the defaults.
+        os.environ.pop(pull.STITCH_MIN_MEMORY_ENV)
+        with self.assertRaises(pull.StitchResourceHold):
+            pull.stitch_resources(cfg)
+
+    def test_load_override_is_used_by_the_same_gate(self):
+        cfg = self.resources(load=2.0, cpus=4, env={pull.STITCH_MAX_LOAD_PER_CPU_ENV: '2.5'})
+        pull.stitch_resources(cfg)
+        os.environ[pull.STITCH_MAX_LOAD_PER_CPU_ENV] = '0.4'
+        with self.assertRaises(pull.StitchResourceHold):
+            pull.stitch_resources(cfg)
+
+    def test_non_numeric_or_non_positive_values_fail_fast(self):
+        for name, bad in ((pull.STITCH_MIN_MEMORY_ENV, 'lots'), (pull.STITCH_MIN_MEMORY_ENV, '0'),
+                          (pull.STITCH_MIN_MEMORY_ENV, '-1'), (pull.STITCH_MIN_MEMORY_ENV, '1.5'),
+                          (pull.STITCH_MAX_LOAD_PER_CPU_ENV, 'fast'), (pull.STITCH_MAX_LOAD_PER_CPU_ENV, '0'),
+                          (pull.STITCH_MAX_LOAD_PER_CPU_ENV, '-0.5'), (pull.STITCH_MAX_LOAD_PER_CPU_ENV, 'nan'),
+                          (pull.STITCH_MAX_LOAD_PER_CPU_ENV, 'inf')):
+            with self.subTest(name=name, bad=bad):
+                self.resources(env={name: bad})
+                with self.assertRaises(SystemExit) as raised:
+                    pull.stitch_resources(SimpleNamespace(output_dir=Path('/fixture/clips'), min_free_bytes=1))
+                self.assertIn(name, str(raised.exception))
+
+    def test_startup_validation_rejects_bad_overrides_before_any_lease(self):
+        for name, bad in ((pull.STITCH_MIN_MEMORY_ENV, 'many'), (pull.STITCH_MAX_LOAD_PER_CPU_ENV, '0')):
+            with self.subTest(name=name), mock.patch.dict(os.environ, {
+                    'STOARAMA_API_BASE': 'https://fixture.invalid', 'STOARAMA_API_KEY': 'fixture-key',
+                    name: bad}, clear=True):
+                with self.assertRaises(SystemExit) as raised:
+                    pull.Config().validate()
+                self.assertIn(name, str(raised.exception))
+
+    def test_startup_validation_accepts_absent_and_valid_overrides(self):
+        for env in ({}, {pull.STITCH_MIN_MEMORY_ENV: '134217728', pull.STITCH_MAX_LOAD_PER_CPU_ENV: '2'}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, dict({
+                    'STOARAMA_API_BASE': 'https://fixture.invalid', 'STOARAMA_API_KEY': 'fixture-key'}, **env), clear=True):
+                pull.Config().validate()
+
+    def test_mid_job_refresh_reads_the_overrides_too(self):
+        # The 5s refresh calls the same gate, so an operator override governs a
+        # running job and not only the pre-lease check.
+        cfg = self.resources(memory=256 << 20, env={pull.STITCH_MIN_MEMORY_ENV: '134217728'})
+        stop = pull.StitchStop(cfg, threading.Event())
+        with mock.patch.object(pull, 'stitch_checkpoint'):
+            stop.refresh()
+        self.assertFalse(stop.is_set(), stop.reason)
+        os.environ.pop(pull.STITCH_MIN_MEMORY_ENV)
+        with mock.patch.object(pull, 'stitch_checkpoint'):
+            stop.refresh()
+        self.assertTrue(stop.is_set())
+        self.assertIn('memory or load', stop.reason)
 
 
 if __name__=='__main__': unittest.main()
