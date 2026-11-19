@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,7 @@ from stoarama_pull import (
     cancellable_tool_output,
     certification_identity,
     StitchHold,
+    stitch_editlist_metadata,
     stitch_proof_json,
 )
 
@@ -39,6 +41,8 @@ AAC_SAMPLE_RATES = (96000, 88200, 64000, 48000, 44100, 32000, 24000,
 AAC_FRAME_SAMPLES = 1024
 TIMEOUT = 1800
 METADATA_LIMIT = 128 * 1024 * 1024
+MANIFEST_LIMIT = 8 * 1024 * 1024
+PACKET_LIMIT = 500_000
 
 
 class CoverageError(ValueError):
@@ -71,7 +75,7 @@ def fields(row, names):
 
 class Input:
     def __init__(self, stack, path, expected=None):
-        self.file = stack.enter_context(os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb"))
+        self.file = stack.enter_context(os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb"))
         self.fd = self.file.fileno()
         before = os.fstat(self.fd)
         require(stat.S_ISREG(before.st_mode) and before.st_size > 0, "input is not a nonempty regular file")
@@ -149,11 +153,12 @@ class Track:
     time_base: Fraction
     packets: list
     positions: dict
+    track_id: int
 
 
-def tool_output(command, fd, limit=METADATA_LIMIT):
+def tool_output(command, fd, limit=METADATA_LIMIT, *, stdout_file=None):
     return cancellable_tool_output(command, threading.Event(), TIMEOUT, stdout_limit=limit,
-                                   pass_fds=(fd,), reject_stderr=True)
+                                   pass_fds=(fd,), reject_stderr=True, stdout_file=stdout_file)
 
 
 def probe(ffprobe, source, *args):
@@ -162,11 +167,26 @@ def probe(ffprobe, source, *args):
     return json.loads(raw)
 
 
+def read_packet_rows(ffprobe, source):
+    with tempfile.TemporaryFile() as rows:
+        tool_output([ffprobe, "-v", "error", *MOV_INPUT, "-ignore_editlist", "1",
+                     "-show_packets", "-show_data_hash", "sha256", "-show_entries",
+                     "packet=stream_index,pts,dts,duration,size,pos,flags,data_hash:packet_side_data",
+                     "-of", "compact=p=0", source.path], source.fd, stdout_file=rows)
+        rows.seek(0)
+        for count, line in enumerate(rows, 1):
+            require(count <= PACKET_LIMIT and len(line) <= 1024, "packet metadata exceeds bound")
+            pairs = [entry.split("=", 1) for entry in line.decode("ascii").strip().split("|")]
+            require(len(pairs) == 8 and all(len(pair) == 2 for pair in pairs),
+                    "unsupported packet metadata or side data")
+            fields = dict(pairs)
+            require(set(fields) == {"stream_index", "pts", "dts", "duration", "size", "pos", "flags", "data_hash"},
+                    "incomplete packet metadata")
+            yield fields
+
+
 def read_tracks(ffprobe, source):
-    data = probe(ffprobe, source, "-ignore_editlist", "1", "-show_streams", "-show_packets",
-                 "-show_data_hash", "sha256",
-                 "-show_entries", "stream:packet=stream_index,pts,dts,duration,size,pos,flags,data_hash"
-                 ":packet_side_data")
+    data = probe(ffprobe, source, "-ignore_editlist", "1", "-show_streams", "-show_data_hash", "sha256")
     tracks = {}
     by_index = {}
     for stream in data["streams"]:
@@ -187,7 +207,7 @@ def read_tracks(ffprobe, source):
                     == ("aac", "mp4a", "LC") and int(config["sample_rate"]) in AAC_SAMPLE_RATES
                     and (int(config["channels"]), config["channel_layout"]) in ((1, "mono"), (2, "stereo")),
                     "unsupported AAC configuration")
-        track = Track(config, Fraction(stream["time_base"]), [], {})
+        track = Track(config, Fraction(stream["time_base"]), [], {}, int(stream["id"], 16))
         require(track.time_base > 0, "invalid track time base")
         if kind == "audio":
             require(track.time_base == Fraction(1, int(config["sample_rate"])),
@@ -197,8 +217,8 @@ def read_tracks(ffprobe, source):
         require(index not in by_index, "duplicate stream index")
         by_index[index] = track
     require("video" in tracks, "input has no video track")
-    for row in data["packets"]:
-        track = by_index[row["stream_index"]]
+    for row in read_packet_rows(ffprobe, source):
+        track = by_index[int(row["stream_index"])]
         packet = Packet.parse(row, source.size)
         require(packet.position not in track.positions
                 and (not track.packets or packet.dts > track.packets[-1].dts),
@@ -207,6 +227,57 @@ def read_tracks(ffprobe, source):
         track.packets.append(packet)
     require(all(track.packets for track in tracks.values()), "track has no packets")
     return tracks
+
+
+@dataclass(frozen=True)
+class Edit:
+    offset: int
+    start: int
+    end: Fraction
+
+
+def media_edits(source, tracks):
+    def number(header, offset, duration=False):
+        require(header and header[0] in (0, 1), "unsupported MP4 clock header")
+        wide = header[0] == 1
+        return struct.unpack_from(">Q" if wide and duration else ">I", header, offset + 8 * wide)[0]
+
+    edits = {}
+    for header in stitch_editlist_metadata(source.path, threading.Event(), all_tracks=True):
+        media = bytes.fromhex(header["media_header"])
+        tkhd = bytes.fromhex(header["track_header"])
+        handler = {"vide": "video", "soun": "audio"}.get(bytes.fromhex(header["handler"])[8:12].decode("ascii"))
+        require(handler in tracks and handler not in edits, "MP4 track and probe layout differ")
+        require(int.from_bytes(tkhd[1:4], "big") & 3 == 3, "MP4 track is disabled or excluded from playback")
+        require(tracks[handler].track_id == number(tkhd, 12), "MP4 track identifiers differ")
+        clock = number(media, 12)
+        require(clock and tracks[handler].time_base == Fraction(1, clock), "MP4 track clock differs")
+        movie_clock = number(bytes.fromhex(header["movie_header"]), 12)
+        track_duration = number(tkhd, 20, duration=True)
+        require(movie_clock > 0 and track_duration > 0, "missing MP4 movie clock or track duration")
+        raw = header["edit_list"]
+        if raw is None:
+            end = min(Fraction(track_duration * clock, movie_clock), number(media, 16, duration=True))
+            require(end > 0, "missing MP4 media duration")
+            edits[handler] = Edit(0, 0, end)
+            continue
+        data = bytes.fromhex(raw)
+        require(len(data) >= 8 and data[0] in (0, 1) and data[1:4] == bytes(3), "unsupported MP4 edit header")
+        decoder = struct.Struct(">Qqi" if data[0] else ">Iii")
+        count = int.from_bytes(data[4:8], "big")
+        require(count in (1, 2) and len(data) == 8 + count * decoder.size, "unsupported MP4 edit list shape")
+        entries = list(decoder.iter_unpack(data[8:]))
+        require(all(segment > 0 and rate == 65536 for segment, _, rate in entries),
+                "unsupported MP4 dwell or non-unit edit rate")
+        duration, media_start, _ = entries[-1]
+        require(media_start >= 0 and (count == 1 or entries[0][1] == -1), "unsupported MP4 media edits")
+        require(sum(segment for segment, _, _ in entries) == track_duration, "MP4 edit and track durations differ")
+        start = Fraction(entries[0][0] * clock, movie_clock) if count == 2 else 0
+        end = start + Fraction(duration * clock, movie_clock)
+        require(int(start) == start, "fractional start of leading empty MP4 edit")
+        edits[handler] = Edit(int(start) - media_start, int(start), end)
+    require(edits.keys() == tracks.keys(), "MP4 track and probe layout differ")
+    return edits
 
 
 def first_video_idr(source, track):
@@ -225,7 +296,7 @@ def first_video_idr(source, track):
     return False
 
 
-def video_frames(ffmpeg, ffprobe, source, track):
+def video_frames(ffmpeg, ffprobe, source, track, edit):
     data = probe(ffprobe, source, "-select_streams", "v:0", "-show_frames",
                  "-show_entries", "frame=pts,pkt_pos,duration,pkt_duration,width,height,pix_fmt")
     frames = []
@@ -259,18 +330,23 @@ def video_frames(ffmpeg, ffprobe, source, track):
         require(pts == frame.pts and (previous_pts is None or pts > previous_pts),
                 "video presentation order is ambiguous")
         previous_pts = pts
+        offset = edit.offset
+        require(pts == track.packets[frame.packet].pts + offset, "video edit differs from packet presentation")
         duration = frame.duration
         if index + 1 < len(frames):
             duration = min(duration, frames[index + 1].pts - pts)
-        require(duration > 0, "invalid video presentation interval")
-        result[frame.packet] = (frame.pts, duration, digest)
+        start = max(pts, edit.start)
+        end = min(pts + duration, edit.end)
+        if end > start:
+            result[frame.packet] = (start, end - start, digest)
+    require(result, "no video frames visible through the MP4 edits")
     return result
 
 
-def audio_blocks(ffprobe, source, track):
-    data = probe(ffprobe, source, "-codec:a", "aac_fixed", "-select_streams", "a:0", "-show_packets", "-show_frames",
+def audio_blocks(ffprobe, source, track, edit):
+    data = probe(ffprobe, source, "-select_streams", "a:0", "-show_packets", "-show_frames",
                  "-show_entries", "packet=pts,pos,duration:packet_side_data=side_data_type,skip_samples,discard_padding"
-                 ":frame=pts,pkt_pos,nb_samples,channels,channel_layout,sample_fmt")
+                 ":frame=pts,pkt_pos,nb_samples,channels,channel_layout")
     packets = {}
     blocks = {}
     offset = 0
@@ -289,15 +365,20 @@ def audio_blocks(ffprobe, source, track):
         index = track.positions[int(row["pkt_pos"])]
         pts, duration, skip, discard = packets[index]
         samples = int(row["nb_samples"])
+        require(pts == track.packets[index].pts + edit.offset,
+                "AAC edit differs from packet presentation")
         require(index not in blocks and int(row["pts"]) == pts + skip
                 and 0 <= skip < AAC_FRAME_SAMPLES and 0 <= discard < AAC_FRAME_SAMPLES
                 and AAC_FRAME_SAMPLES - skip - discard == samples > 0
                 and int(row["channels"]) == int(track.config["channels"])
-                and row["channel_layout"] == track.config["channel_layout"] and row["sample_fmt"] == "s32p",
+                and row["channel_layout"] == track.config["channel_layout"],
                 "unsupported AAC edit or changing sample format")
-        visible = min(samples, duration - skip)
-        require(visible > 0, "invalid AAC presentation interval")
-        blocks[index] = AudioBlock(pts + skip, skip, visible, samples, offset)
+        start = pts + skip
+        end = pts + min(skip + samples, duration)
+        require(start >= edit.start, "unsupported partial AAC start edit")
+        end = min(end, int(edit.end))
+        require(end > start, "invalid AAC presentation interval")
+        blocks[index] = AudioBlock(start, skip, end - start, samples, offset)
         offset += samples
     require(blocks and list(blocks) == sorted(blocks), "audio presentation order is ambiguous")
     previous_end = None
@@ -307,19 +388,32 @@ def audio_blocks(ffprobe, source, track):
     return blocks, offset
 
 
-def audio_pcm(stack, ffmpeg, ffprobe, source, track):
-    blocks, samples = audio_blocks(ffprobe, source, track)
+def audio_pcm(stack, ffmpeg, ffprobe, source, track, edit):
+    blocks, samples = audio_blocks(ffprobe, source, track, edit)
     frame_size = int(track.config["channels"]) * 4
     expected = samples * frame_size
     pcm = stack.enter_context(tempfile.TemporaryFile())
     os.lseek(source.fd, 0, os.SEEK_SET)
-    command = [ffmpeg, *DECODE, *MOV_INPUT, "-c:a", "aac_fixed", "-i", source.path,
-               "-map", "0:a:0", "-c:a", "pcm_s32le", "-fs", str(expected + 1), "-f", "s32le", "-"]
-    # Stop once the decode exceeds the independently counted sample bytes.
-    process = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=pcm,
-                             stderr=subprocess.PIPE, env={"PATH": os.defpath}, pass_fds=(source.fd,),
-                             timeout=TIMEOUT, check=False)
-    require(process.returncode == 0 and not process.stderr, "strict integer AAC decode failed")
+    command = [ffmpeg, *DECODE, "-hide_banner", "-v", "info", "-copyts", *MOV_INPUT,
+               "-c:a", "aac_fixed", "-i", source.path, "-map", "0:a:0", "-af", "ashowinfo",
+               "-c:a", "pcm_s32le", "-fs", str(expected + 1), "-f", "s32le", "-"]
+    # Bind PCM byte offsets to the exact integer decoder's own frame geometry.
+    with tempfile.TemporaryFile() as log:
+        process = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=pcm, stderr=log,
+                                 env={"PATH": os.defpath}, pass_fds=(source.fd,), timeout=TIMEOUT, check=False)
+        require(process.returncode == 0, "strict integer AAC decode failed")
+        log.seek(0)
+        reported = (line for line in log if b"Parsed_ashowinfo_" in line)
+        for block in blocks.values():
+            line = next(reported, b"")
+            row = dict(re.findall(rb"([a-z_]+):([^ ]+)", line))
+            require(row.get(b"pts") == str(block.pts).encode("ascii")
+                    and row.get(b"nb_samples") == str(block.decoded_samples).encode("ascii")
+                    and row.get(b"fmt") == b"s32p"
+                    and row.get(b"rate") == track.config["sample_rate"].encode("ascii")
+                    and row.get(b"channels") == str(track.config["channels"]).encode("ascii"),
+                    "integer AAC decode frame geometry differs")
+        require(not next(reported, b""), "integer AAC decode emitted extra frames")
     require(os.fstat(pcm.fileno()).st_size == expected, "AAC decode did not match sample counts")
     return pcm.fileno(), blocks, frame_size
 
@@ -361,11 +455,19 @@ def packet_mapping(source, output, start):
     require(source.config == output.config and len(target) == len(source.packets),
             "output codec configuration or track packet count differs")
     delta = target[0].pts * output.time_base - source.packets[0].pts * source.time_base
-    for original, delivered in zip(source.packets, target):
+    extension = Fraction(0)
+    for index, (original, delivered) in enumerate(zip(source.packets, target)):
         require(original.content() == delivered.content(), "output packet bytes or flags differ")
-        require(delivered.pts * output.time_base - original.pts * source.time_base == delta,
-                "output packet presentation mapping is not constant")
-    return end, delta
+        require(delivered.pts * output.time_base - original.pts * source.time_base == delta
+                and delivered.dts * output.time_base - original.dts * source.time_base == delta,
+                "output packet PTS/DTS mapping is not constant")
+        duration_change = delivered.duration * output.time_base - original.duration * source.time_base
+        if duration_change:
+            require(start + index + 1 < len(output.packets) and index + 1 == len(source.packets)
+                    and duration_change > 0 and delivered.dts + delivered.duration == output.packets[start + index + 1].dts,
+                    "output packet duration differs outside a seam extension")
+            extension = duration_change
+    return end, delta, extension
 
 
 def prove_video(source, output, start, count, source_base, output_base):
@@ -383,8 +485,9 @@ def prove_video(source, output, start, count, source_base, output_base):
     extras = sum(index in output for index in range(start, start + count)) - len(pairs)
     last = pairs[-1]
     return delta, {"frame_count": len(pairs), "extra_output_frames": extras,
-                   "time_base": str(source_base), "first_pts": pairs[0][1], "end_pts": last[1] + last[2],
-                   "frame_chain_sha256": digest_rows(pairs)}
+                   "time_base": str(source_base), "first_pts": str(pairs[0][1]), "end_pts": str(last[1] + last[2]),
+                   "frame_chain_sha256": digest_rows((i, str(pts), str(duration), sha)
+                                                       for i, pts, duration, sha in pairs)}
 
 
 def prove_audio(ffmpeg, source_file, output_file, source_track, output_track, source, output, start):
@@ -463,50 +566,73 @@ def manifest_part(manifest, part):
     return output, [selected[identifier] for identifier in order]
 
 
+def prove_source(stack, ffmpeg, ffprobe, source, tracks, mapping, output, target_tracks, target_video, target_audio):
+    edits = media_edits(source, tracks)
+    require(first_video_idr(source, tracks["video"]), "source does not start at an H.264 IDR")
+    result = {}
+    for kind, track in tracks.items():
+        target_track = target_tracks[kind]
+        start, packet_delta, packet_extension = mapping[kind]
+        if kind == "video":
+            visible = video_frames(ffmpeg, ffprobe, source, track, edits[kind])
+            delta, facts = prove_video(visible, target_video, start, len(track.packets),
+                                       track.time_base, target_track.time_base)
+        else:
+            pcm = audio_pcm(stack, ffmpeg, ffprobe, source, track, edits[kind])
+            delta, facts = prove_audio(ffmpeg, source, output, track, target_track, pcm, target_audio, start)
+        result[kind] = dict(
+            facts, packet_count=len(track.packets), packet_start=start,
+            packet_chain_sha256=digest_rows((packet.pts, packet.dts, packet.duration,
+                                            packet.content()) for packet in track.packets),
+            packet_time_shift=str(packet_delta), visible_time_shift=str(delta),
+            last_packet_duration_extension=str(packet_extension),
+            codec_config_sha256=digest_rows([track.config]),
+        )
+    if "audio" in tracks:
+        shifts = [Fraction(result[kind]["visible_time_shift"]) for kind in ("video", "audio")]
+        require(abs(shifts[0] - shifts[1]) <= Fraction(1, 1000), "audio/video placement differs by over 1 ms")
+    return result
+
+
 def prove_part(manifest, part, paths, ffmpeg, ffprobe):
     target, candidates = manifest_part(manifest, part)
     require(len(paths) == len(candidates) + 1, "supply the output followed by every source in manifest order")
     with ExitStack() as stack:
         output = Input(stack, paths[0], target)
         target_tracks = read_tracks(ffprobe, output)
-        target_video = video_frames(ffmpeg, ffprobe, output, target_tracks["video"])
-        target_audio = audio_pcm(stack, ffmpeg, ffprobe, output, target_tracks["audio"]) if "audio" in target_tracks else None
+        target_edits = media_edits(output, target_tracks)
+        target_audio = (audio_pcm(stack, ffmpeg, ffprobe, output, target_tracks["audio"], target_edits["audio"])
+                        if "audio" in target_tracks else None)
+        target_video = video_frames(ffmpeg, ffprobe, output, target_tracks["video"], target_edits["video"])
         starts = dict.fromkeys(target_tracks, 0)
-        result = []
-        for ordinal, (path, candidate) in enumerate(zip(paths[1:], candidates), 1):
-            with ExitStack() as raw_stack:
-                source = Input(raw_stack, path, candidate)
-                tracks = read_tracks(ffprobe, source)
-                require(tracks.keys() == target_tracks.keys(), "source and output have different track layouts")
-                require(first_video_idr(source, tracks["video"]), "source does not start at an H.264 IDR")
-                row = {"source": candidate, "ordinal": ordinal, "tracks": {}}
-                for kind, track in tracks.items():
-                    target_track = target_tracks[kind]
-                    start = starts[kind]
-                    end, packet_delta = packet_mapping(track, target_track, start)
-                    if kind == "video":
-                        visible = video_frames(ffmpeg, ffprobe, source, track)
-                        delta, facts = prove_video(visible, target_video, start, len(track.packets),
-                                                   track.time_base, target_track.time_base)
-                    else:
-                        pcm = audio_pcm(raw_stack, ffmpeg, ffprobe, source, track)
-                        delta, facts = prove_audio(ffmpeg, source, output, track, target_track,
-                                                  pcm, target_audio, start)
-                    row["tracks"][kind] = dict(
-                        facts, packet_count=len(track.packets), packet_start=start,
-                        packet_chain_sha256=digest_rows((packet.pts, packet.dts, packet.duration,
-                                                        packet.content()) for packet in track.packets),
-                        packet_time_shift=str(packet_delta), visible_time_shift=str(delta),
-                        codec_config_sha256=digest_rows([track.config]),
-                    )
-                    starts[kind] = end
-                if "audio" in tracks:
-                    shifts = [Fraction(row["tracks"][kind]["visible_time_shift"]) for kind in ("video", "audio")]
-                    require(abs(shifts[0] - shifts[1]) <= Fraction(1, 1000), "audio/video placement differs by over 1 ms")
-                source.check()
-                result.append(row)
+        mapped = []
+        for path, candidate in zip(paths[1:], candidates):
+            source = Input(stack, path, candidate)
+            tracks = read_tracks(ffprobe, source)
+            require(tracks.keys() == target_tracks.keys(), "source and output have different track layouts")
+            mapping = {}
+            for kind, track in tracks.items():
+                start = starts[kind]
+                end, packet_delta, packet_extension = packet_mapping(track, target_tracks[kind], start)
+                mapping[kind] = (start, packet_delta, packet_extension)
+                starts[kind] = end
+            mapped.append((candidate, source, tracks, mapping))
         require(all(starts[kind] == len(track.packets) for kind, track in target_tracks.items()),
                 "output contains unmapped packets")
+
+        result = []
+        for ordinal, (candidate, source, tracks, mapping) in enumerate(mapped, 1):
+            row = {"source": candidate, "ordinal": ordinal}
+            try:
+                with ExitStack() as raw_stack:
+                    facts = prove_source(raw_stack, ffmpeg, ffprobe, source, tracks, mapping,
+                                         output, target_tracks, target_video, target_audio)
+            except (CoverageError, MediaCertificationError, StitchHold, KeyError, struct.error) as error:
+                row.update(verdict="not_proven", reason=str(error))
+            else:
+                row.update(verdict="proven", tracks=facts)
+            source.check()
+            result.append(row)
         output.check()
     return target, result
 
@@ -522,7 +648,12 @@ def main():
                         help="exact local output bytes followed by all its sources in manifest order")
     args = parser.parse_args()
     try:
-        manifest_bytes = args.manifest.read_bytes()
+        with os.fdopen(os.open(args.manifest, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as file:
+            info = os.fstat(file.fileno())
+            require(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= MANIFEST_LIMIT,
+                    "manifest must be a bounded regular file")
+            manifest_bytes = file.read(MANIFEST_LIMIT + 1)
+            require(len(manifest_bytes) == info.st_size, "manifest changed during read")
         require(good_sha(args.manifest_sha256) and sha256(manifest_bytes) == args.manifest_sha256,
                 "manifest differs from the pinned SHA-256")
         manifest = stitch_proof_json(manifest_bytes)
@@ -544,10 +675,11 @@ def main():
             "ffmpeg_sha256": pins[0].sha,
             "ffprobe_sha256": pins[1].sha,
             "verifier_sha256": sha256(Path(__file__).read_bytes()),
+            "verifier_support_sha256": sha256(Path(__file__).with_name("stoarama_pull.py").read_bytes()),
             "sources": rows,
         }, sort_keys=True, separators=(",", ":")))
     except (MediaCertificationError, StitchHold, OSError, ValueError, TypeError, KeyError,
-            IndexError, subprocess.SubprocessError) as error:
+            IndexError, struct.error, subprocess.SubprocessError) as error:
         print(f"delivery coverage unproven: {error}", file=sys.stderr)
         return 1
     return 0

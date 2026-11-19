@@ -19612,7 +19612,7 @@ def stable_native_signature_v1(probe_streams, format_name):
 
 
 def cancellable_tool_output(command, cancel, timeout, stdout_limit=1024 * 1024, stderr_limit=64 * 1024,
-                            pass_fds=(), *, reject_stderr=False):
+                            pass_fds=(), *, reject_stderr=False, stdout_file=None):
     """Bounded child group: cancellation cannot strand ffmpeg descendants."""
     if stdout_limit < 0 or stderr_limit < 0:
         raise MediaCertificationError("media verification output bound is invalid")
@@ -19626,22 +19626,27 @@ def cancellable_tool_output(command, cancel, timeout, stdout_limit=1024 * 1024, 
     stdout = bytearray()
     stderr = bytearray()
 
-    def drain(stream, destination, limit):
+    def drain(stream, destination, limit, file=None):
+        count = 0
         try:
             while True:
                 chunk = stream.read(64 * 1024)
                 if not chunk:
                     return
-                remaining = max(0, limit + 1 - len(destination))
-                if remaining:
-                    destination.extend(chunk[:remaining])
-                if len(destination) > limit or len(chunk) > remaining:
+                count += len(chunk)
+                if count > limit:
                     exceeded.set()
+                elif file is not None:
+                    file.write(chunk)
+                else:
+                    destination.extend(chunk)
+        except OSError:
+            exceeded.set()
         finally:
             stream.close()
 
     readers = [
-        threading.Thread(target=drain, args=(process.stdout, stdout, stdout_limit), name="native-stitch-stdout", daemon=True),
+        threading.Thread(target=drain, args=(process.stdout, stdout, stdout_limit, stdout_file), name="native-stitch-stdout", daemon=True),
         threading.Thread(target=drain, args=(process.stderr, stderr, stderr_limit), name="native-stitch-stderr", daemon=True),
     ]
     for reader in readers:
@@ -48376,7 +48381,7 @@ def stitch_probe(ffprobe, source, target, deadline, stop):
     return signature
 
 
-def stitch_editlist_metadata(source, stop):
+def stitch_editlist_metadata(source, stop, *, all_tracks=False):
     """Read bounded metadata from the already pinned, catalog-hashed descriptor."""
     stitch_check(stop)
     with open(source, "rb") as media:
@@ -48429,12 +48434,22 @@ def stitch_editlist_metadata(source, stop):
         if b'moof' in top:
             raise StitchHold("fragmented MP4 requires separate native qualification")
         movie = boxes(*one(top, b'moov'))
-        track = boxes(*one(movie, b'trak'))
-        mdia = boxes(*one(track, b'mdia'))
-        edits = boxes(*one(track, b'edts'))
-        return dict(movie_header=payload(one(movie, b'mvhd')), track_header=payload(one(track, b'tkhd')),
-                    media_header=payload(one(mdia, b'mdhd')), handler=payload(one(mdia, b'hdlr')),
-                    edit_list=payload(one(edits, b'elst')))
+        def track_metadata(box):
+            track = boxes(*box)
+            mdia = boxes(*one(track, b'mdia'))
+            edit_list = None
+            if not all_tracks or b'edts' in track:
+                edits = boxes(*one(track, b'edts'))
+                edit_list = payload(one(edits, b'elst'))
+            return dict(movie_header=payload(one(movie, b'mvhd')), track_header=payload(one(track, b'tkhd')),
+                        media_header=payload(one(mdia, b'mdhd')), handler=payload(one(mdia, b'hdlr')),
+                        edit_list=edit_list)
+
+        if all_tracks:
+            if len(movie.get(b'trak', [])) not in (1, 2) or b'mvex' in movie:
+                raise StitchHold("unsupported MP4 track count or fragmentation")
+            return [track_metadata(track) for track in movie[b'trak']]
+        return track_metadata(one(movie, b'trak'))
 
 
 def stitch_editlist_records(document, packets, hidden):
