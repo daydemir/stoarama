@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -92,27 +91,32 @@ type inverseJobFlags struct {
 
 const inverseJobUsage = "usage: stoaramactl r2-inverse job|job-keep28 --picks FILE --expected-picks-sha256 HEX --owner-decision FILE --work DIR [--workers N --max-items N --max-bytes N --budget-24h-bytes N --batches N]; job-keep28 requires --max-bytes and --budget-24h-bytes"
 
-// parseInverseJobFlags reads job flags. RAW keeps its large batches and no
-// rolling budget. Keep-28 defaults to the 100-object canary batch and runs only
-// with an explicit per-batch byte cap and rolling 24h budget (0 = unlimited).
+// parseInverseJobFlags reads job flags; --help prints them with their lane's
+// defaults and exits 0. RAW keeps its large batches and no rolling budget.
+// Keep-28 defaults to the 100-object canary batch and runs only with an
+// explicit per-batch byte cap and rolling 24h budget (0 = unlimited).
 func parseInverseJobFlags(args []string, lane inverseLane) (inverseJobFlags, error) {
 	f := inverseJobFlags{}
-	items, maxBytes, budget := 5000, int64(1<<40), int64(0)
+	name, items, maxBytes := "r2-inverse job", 5000, int64(1<<40)
 	if lane == inverseNASKeep28 {
-		items, maxBytes, budget = 100, 0, -1
+		name, items, maxBytes = "r2-inverse job-keep28", 100, 0
 	}
-	fs := flag.NewFlagSet("r2-inverse job", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	fs.StringVar(&f.picks, "picks", "", "owner picks")
 	fs.StringVar(&f.picksSHA, "expected-picks-sha256", "", "independently approved owner picks digest")
 	fs.StringVar(&f.owner, "owner-decision", "", "owner decision record pinned by the executor")
 	fs.StringVar(&f.work, "work", "", "new working directory")
 	fs.IntVar(&f.workers, "workers", 16, "concurrent keys per batch (1..64, at least two DB connections remain reserved)")
 	fs.IntVar(&f.items, "max-items", items, "maximum new objects per batch")
-	fs.Int64Var(&f.maxBytes, "max-bytes", maxBytes, "maximum new intent bytes per batch")
-	fs.Int64Var(&f.budget24h, "budget-24h-bytes", budget, "maximum charged bytes in previous 24h (0 = unlimited)")
+	fs.Int64Var(&f.maxBytes, "max-bytes", maxBytes, "maximum new intent bytes per batch (required for job-keep28)")
+	fs.Int64Var(&f.budget24h, "budget-24h-bytes", 0, "maximum charged bytes in previous 24h, 0 = unlimited (required for job-keep28)")
 	fs.IntVar(&f.batches, "batches", 1, "maximum batches")
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || f.picks == "" || !r2RetireLowerHex64(f.picksSHA) || f.owner == "" || f.work == "" || f.workers < 1 || f.workers > 64 || f.items < 1 || f.maxBytes <= 0 || f.budget24h < 0 || f.batches < 1 {
+	if err := fs.Parse(args); err != nil {
+		return f, err
+	}
+	budgetSet := false
+	fs.Visit(func(fl *flag.Flag) { budgetSet = budgetSet || fl.Name == "budget-24h-bytes" })
+	if fs.NArg() != 0 || f.picks == "" || !r2RetireLowerHex64(f.picksSHA) || f.owner == "" || f.work == "" || f.workers < 1 || f.workers > 64 || f.items < 1 || f.maxBytes <= 0 || f.budget24h < 0 || f.batches < 1 || (lane == inverseNASKeep28 && !budgetSet) {
 		return f, errors.New(inverseJobUsage)
 	}
 	return f, nil

@@ -419,15 +419,83 @@ func TestKeep28ExistingPresentIntentNeverReissues(t *testing.T) {
 		t.Fatalf("present intent replay: %+v %v", result, err)
 	}
 }
-func TestKeep28CustodyClockConsumesHandoffTime(t *testing.T) {
+func TestKeep28CustodyDeadlineIsFixedAtSampling(t *testing.T) {
 	// DB UTC can differ arbitrarily from local wall time. Only DB-relative
-	// lifetime and monotonic elapsed duration may bound the wire.
-	c := keep28DBClock{utc: time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC), observed: time.Now().Add(-2 * time.Second)}
-	if rem := c.remaining(c.utc.Add(time.Second)); rem > 0 {
-		t.Fatalf("expired handoff gained time: %v", rem)
+	// lifetime and the monotonic sample time may place custody end, and a pause
+	// between the sample and the timer made from it must not move it.
+	c := keep28DBClock{utc: time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC), observed: time.Now()}
+	want := c.observed.Add(3 * time.Second)
+	time.Sleep(200 * time.Millisecond)
+	ctx, cancel := context.WithDeadline(context.Background(), c.deadline(c.utc.Add(3*time.Second)))
+	defer cancel()
+	if got, _ := ctx.Deadline(); !got.Equal(want) {
+		t.Fatalf("custody end moved with the pause: %v, want %v", got, want)
 	}
-	if rem := c.remaining(c.utc.Add(5 * time.Second)); rem <= 0 || rem > 3*time.Second {
-		t.Fatalf("local wall clock used: %v", rem)
+	stale := keep28DBClock{utc: c.utc, observed: time.Now().Add(-2 * time.Second)}
+	if end := stale.deadline(c.utc.Add(time.Second)); end.After(time.Now()) {
+		t.Fatalf("expired handoff gained time: %v", time.Until(end))
+	}
+}
+
+// deadlineSpyConn records the socket write deadline the wire sets.
+type deadlineSpyConn struct {
+	net.Conn
+	set *atomic.Value
+}
+
+func (c deadlineSpyConn) SetWriteDeadline(d time.Time) error {
+	c.set.Store(d)
+	return c.Conn.SetWriteDeadline(d)
+}
+
+// Neither the authority's deadline nor the wire's first-byte and socket
+// deadline lies past custody expiry, measured against the database clock
+// reaching that expiry. A pause separates the authority's clock sample from
+// the transport's, and the transport runs without a parent deadline, so its
+// own timer must land exactly on the earliest custody end.
+func TestKeep28DeadlinesNeverOutliveCustody(t *testing.T) {
+	f := newKeep28Fixture(t)
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '23 hours 59 minutes 50 seconds',server_received_at=clock_timestamp()`); err != nil {
+		t.Fatal(err)
+	}
+	_, auth := f.keep28Authorized(t, f.applier(t), &inverseSendGate{})
+	// Custody expiry as a local instant, never earlier than the true one: the
+	// local reading follows the database's.
+	expiry := func() time.Time {
+		t.Helper()
+		var now time.Time
+		if err := f.pool.QueryRow(f.ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+			t.Fatal(err)
+		}
+		return time.Now().Add(auth.custody.Expiry.Sub(now))
+	}
+	authorized, _ := auth.ctx.Deadline()
+	if authorized.After(auth.custodyEnd) || authorized.After(expiry()) {
+		t.Fatalf("authority outlives custody: deadline %v, custody end %v", authorized, auth.custodyEnd)
+	}
+	time.Sleep(300 * time.Millisecond)
+	var wire atomic.Value
+	template := newInverseDeleteHTTPTransport()
+	dial := template.DialContext
+	template.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return deadlineSpyConn{Conn: conn, set: &wire}, nil
+	}
+	original := f.sdk.transport
+	f.sdk.transport = template
+	defer func() { f.sdk.transport = original }()
+	// An earlier clock sample: custody end now precedes the transport's fresh
+	// sample, so the wire deadline must equal it exactly.
+	auth.custodyEnd = time.Now().Add(3 * time.Second)
+	if err := f.sdk.deleteOnce(f.ctx, auth); err != nil {
+		t.Fatal(err)
+	}
+	deadline, ok := wire.Load().(time.Time)
+	if !ok || !deadline.Equal(auth.custodyEnd) || deadline.After(expiry()) {
+		t.Fatalf("wire outlives custody: deadline %v, custody end %v", deadline, auth.custodyEnd)
 	}
 }
 
@@ -539,6 +607,10 @@ func TestKeep28WireOutcomes(t *testing.T) {
 			lost := mode == "eof"
 			if err == nil || errors.Is(err, errInverseWireAmbiguous) != lost || slices.Equal(result.WireAmbiguous, []string{f.key}) != lost || result.Deleted != 0 || f.deletes() != 1 {
 				t.Fatalf("%s: %+v %v deletes=%d", mode, result, err, f.deletes())
+			}
+			// Only a lost response may tell the operator the result is ambiguous.
+			if text := err.Error(); strings.Contains(text, "ambiguous") != lost || strings.Contains(text, "single DELETE failed") == lost {
+				t.Fatalf("%s: operator text %q", mode, text)
 			}
 			f.setWire(nil, nil)
 			result, err = applyInverse(f.ctx, f.pool, f.sdk, f.options)
@@ -861,17 +933,23 @@ func TestKeep28PublishAbsentRefusesChangedParentStream(t *testing.T) {
 		}
 		return
 	}
-	if _, err := f.pool.Exec(f.ctx, `UPDATE recordings SET stream_id=NULL WHERE id=30`); err != nil {
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
+ SELECT 4,provider,'4','other','other',source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps FROM streams WHERE id=3`); err != nil {
+		t.Fatal(err)
+	}
+	for _, stream := range []string{"4", "NULL"} {
+		if _, err := f.pool.Exec(f.ctx, `UPDATE recordings SET stream_id=`+stream+` WHERE id=30`); err != nil {
+			t.Fatal(err)
+		}
+		err := a.publishAbsent(f.ctx, e, a.opts.ManifestSHA)
+		if receipts, events, purged := outcome(); err == nil || !strings.Contains(err.Error(), "exact source") || receipts != 0 || events != 0 || purged {
+			t.Fatalf("stream %s published: %v receipts %d events %d purged %v", stream, err, receipts, events, purged)
+		}
+	}
+	if _, err := f.pool.Exec(f.ctx, `UPDATE recordings SET stream_id=3 WHERE id=30`); err != nil {
 		t.Fatal(err)
 	}
 	err := a.publishAbsent(f.ctx, e, a.opts.ManifestSHA)
-	if receipts, events, purged := outcome(); err == nil || !strings.Contains(err.Error(), "exact source") || receipts != 0 || events != 0 || purged {
-		t.Fatalf("changed stream published: %v receipts %d events %d purged %v", err, receipts, events, purged)
-	}
-	if _, err = f.pool.Exec(f.ctx, `UPDATE recordings SET stream_id=3 WHERE id=30`); err != nil {
-		t.Fatal(err)
-	}
-	err = a.publishAbsent(f.ctx, e, a.opts.ManifestSHA)
 	if receipts, events, purged := outcome(); err != nil || receipts != 1 || events != 1 || !purged {
 		t.Fatalf("exact source: %v receipts %d events %d purged %v", err, receipts, events, purged)
 	}
@@ -901,11 +979,20 @@ func TestKeep28JobCLIDispatchAndLimits(t *testing.T) {
 	if err != nil || keep28.items != 100 || keep28.maxBytes != 10000 || keep28.budget24h != 0 {
 		t.Fatalf("keep-28 job defaults: %+v %v", keep28, err)
 	}
-	run := func(args ...string) string {
-		t.Helper()
+	invoke := func(args ...string) (string, error) {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestKeep28JobCLIDispatchAndLimits$")
 		cmd.Env = append(os.Environ(), "STOARAMA_TEST_R2_INVERSE_ARGS="+strings.Join(args, "\n"))
 		output, err := cmd.CombinedOutput()
+		return string(output), err
+	}
+	for command, want := range map[string]string{"job": "(default 5000)", "job-keep28": "(default 100)"} {
+		if out, err := invoke(command, "--help"); err != nil || !strings.Contains(out, "Usage of r2-inverse "+command+":") || !strings.Contains(out, "-max-items") || !strings.Contains(out, want) {
+			t.Fatalf("%s --help: %v %s", command, err, out)
+		}
+	}
+	run := func(args ...string) string {
+		t.Helper()
+		output, err := invoke(args...)
 		if err == nil {
 			t.Fatalf("%v ran: %s", args, output)
 		}

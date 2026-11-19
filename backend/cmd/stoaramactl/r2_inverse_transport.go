@@ -36,16 +36,17 @@ func (inverseLastModifiedError) Error() string {
 // Only the concrete executor verifier below can issue this private capability,
 // for either lane. Copies share consumption state, and the DB independently
 // forbids reminting. ctx bounds this key's network work; on the keep-28 lane it
-// also ends at NAS custody expiry, and custody is the proof the intent carries.
+// also ends at custodyEnd, the local instant NAS custody expires, and custody
+// is the proof the intent carries.
 type inverseDeleteAuthority struct {
-	binding inverseDeleteBinding
-	guard   *inverseWireGuard
-	used    *atomic.Bool
-	gate    *inverseSendGate
-	ctx     context.Context
-	cancel  context.CancelFunc
-	custody keep28Custody
-	clock   keep28DBClock
+	binding    inverseDeleteBinding
+	guard      *inverseWireGuard
+	used       *atomic.Bool
+	gate       *inverseSendGate
+	ctx        context.Context
+	cancel     context.CancelFunc
+	custody    keep28Custody
+	custodyEnd time.Time
 }
 
 // inverseSendGate closes when a batch hits a hard failure. A DELETE whose first
@@ -160,15 +161,17 @@ func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntr
 		return nil, err
 	}
 	var custody keep28Custody
-	var clock keep28DBClock
-	limit := inverseNetworkTimeout
+	var custodyEnd time.Time
+	deadline := time.Now().Add(inverseNetworkTimeout)
 	if a.opts.Lane == inverseNASKeep28 {
-		if custody, clock, err = a.proveKeep28(ctx, tx, e, target); err != nil {
+		if custody, custodyEnd, err = a.proveKeep28(ctx, tx, e, target); err != nil {
 			return nil, err
 		}
-		limit = min(limit, clock.remaining(custody.Expiry))
+		if custodyEnd.Before(deadline) {
+			deadline = custodyEnd
+		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, limit)
+	ctx, cancel := context.WithDeadline(ctx, deadline)
 	fail := func(err error) (*inverseDeleteAuthority, error) { cancel(); return nil, err }
 	if err = a.checkWireHead(ctx, tx, e, target); err != nil {
 		return fail(err)
@@ -187,7 +190,7 @@ func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntr
 	if tag.RowsAffected() != 1 {
 		return fail(errors.New("inverse wire authority was already issued; reconcile only"))
 	}
-	return &inverseDeleteAuthority{binding: binding, guard: guard, used: &atomic.Bool{}, gate: gate, ctx: ctx, cancel: cancel, custody: custody, clock: clock}, nil
+	return &inverseDeleteAuthority{binding: binding, guard: guard, used: &atomic.Bool{}, gate: gate, ctx: ctx, cancel: cancel, custody: custody, custodyEnd: custodyEnd}, nil
 }
 
 type inverseSDKStore struct {

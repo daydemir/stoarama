@@ -103,36 +103,42 @@ func keep28Clock(ctx context.Context, q r2RetireQuerier) (keep28DBClock, error) 
 	err := q.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&c.utc)
 	return c, err
 }
-func (c keep28DBClock) remaining(expiry time.Time) time.Duration {
-	return expiry.Sub(c.utc) - time.Since(c.observed)
+
+// deadline is the local monotonic instant at which this sample says expiry
+// arrives. It is fixed when sampled, so however late a timer is made from it,
+// it never moves. observed precedes the DB read, so the instant errs early.
+func (c keep28DBClock) deadline(expiry time.Time) time.Time {
+	return c.observed.Add(expiry.Sub(c.utc))
 }
 
 // proveKeep28 relocks the NAS custody behind a keep-28 intent and requires it
-// to equal the proof persisted with that intent, with lifetime left.
-func (a *inverseApplier) proveKeep28(ctx context.Context, tx pgx.Tx, e inverseEntry, target inverseRawTarget) (keep28Custody, keep28DBClock, error) {
+// to equal the proof persisted with that intent. It returns the local instant
+// custody ends, which must still be ahead.
+func (a *inverseApplier) proveKeep28(ctx context.Context, tx pgx.Tx, e inverseEntry, target inverseRawTarget) (keep28Custody, time.Time, error) {
 	custody, err := a.lockKeep28Custody(ctx, tx, target)
 	if err != nil {
-		return custody, keep28DBClock{}, err
+		return custody, time.Time{}, err
 	}
 	var data []byte
 	if err = tx.QueryRow(ctx, `SELECT custody FROM r2_keep28_intents WHERE bucket=$1 AND object_key=$2`, a.store.Bucket(), e.Key).Scan(&data); err != nil {
-		return custody, keep28DBClock{}, err
+		return custody, time.Time{}, err
 	}
 	var intended keep28Custody
 	if err = json.Unmarshal(data, &intended); err != nil {
-		return custody, keep28DBClock{}, err
+		return custody, time.Time{}, err
 	}
 	if custody != intended {
-		return custody, keep28DBClock{}, errors.New("custody proof changed after durable intent")
+		return custody, time.Time{}, errors.New("custody proof changed after durable intent")
 	}
 	clock, err := keep28Clock(ctx, tx)
 	if err != nil {
-		return custody, clock, err
+		return custody, time.Time{}, err
 	}
-	if clock.remaining(custody.Expiry) <= 0 {
-		return custody, clock, errors.New("NAS custody expired before wire")
+	end := clock.deadline(custody.Expiry)
+	if !time.Now().Before(end) {
+		return custody, end, errors.New("NAS custody expired before wire")
 	}
-	return custody, clock, nil
+	return custody, end, nil
 }
 
 // checkCustody runs at the transport, under the network transaction: the locked
@@ -145,35 +151,38 @@ func (a *inverseDeleteAuthority) checkCustody(ctx context.Context) error {
 	if c != a.custody {
 		return errors.New("locked custody proof changed")
 	}
-	_, err = a.custodyRemaining(ctx)
+	_, err = a.custodyDeadline(ctx)
 	return err
 }
 
-// custodyRemaining samples the DB clock before every network handoff. A newer
-// DB clock can shorten, never extend, the lifetime measured from the original
-// monotonic sample.
-func (a *inverseDeleteAuthority) custodyRemaining(ctx context.Context) (time.Duration, error) {
+// custodyDeadline samples the DB clock before every network handoff and returns
+// the earliest custody end across every sample. A newer DB clock can bring that
+// instant forward, never push it back.
+func (a *inverseDeleteAuthority) custodyDeadline(ctx context.Context) (time.Time, error) {
 	clock, err := keep28Clock(ctx, a.guard.tx)
 	if err != nil {
-		return 0, err
+		return time.Time{}, err
 	}
-	remaining := min(a.clock.remaining(a.custody.Expiry), clock.remaining(a.custody.Expiry))
-	if remaining <= 0 {
-		return 0, errors.New("NAS custody expired at network boundary")
+	end := a.custodyEnd
+	if sampled := clock.deadline(a.custody.Expiry); sampled.Before(end) {
+		end = sampled
 	}
-	return remaining, nil
+	if !time.Now().Before(end) {
+		return end, errors.New("NAS custody expired at network boundary")
+	}
+	return end, nil
 }
 
-// bound limits network work to what is left of keep-28 custody. RAW carries no
-// custody; its work is bounded by the key's network deadline alone.
+// bound ends network work at custody end; the parent context keeps the key's
+// network deadline. RAW carries no custody and is bounded by the parent alone.
 func (a *inverseDeleteAuthority) bound(ctx context.Context) (context.Context, context.CancelFunc, error) {
 	if a.guard.a.opts.Lane != inverseNASKeep28 {
 		return ctx, func() {}, nil
 	}
-	remaining, err := a.custodyRemaining(ctx)
+	end, err := a.custodyDeadline(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	bounded, cancel := context.WithTimeout(ctx, min(inverseNetworkTimeout, remaining))
+	bounded, cancel := context.WithDeadline(ctx, end)
 	return bounded, cancel, nil
 }

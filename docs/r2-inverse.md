@@ -164,9 +164,11 @@ both verified and server-received timestamps within 24 hours, exact sidecar
 path/size/SHA. The complete proof is persisted with the permanent B2 intent and
 compared again under lock, including timestamps and sidecar. Old October 30
 inventory does not qualify. The final inventory row stays locked through DELETE
-and confirming HEAD404. PostgreSQL time and monotonic elapsed duration bound
-each network handoff by the earlier of custody expiry and the existing
-30-second cap; local wall-clock skew cannot extend authority.
+and confirming HEAD404. Each PostgreSQL clock sample fixes custody expiry as
+one absolute local monotonic instant; every network handoff ends at the
+earliest such instant or the existing 30-second cap, and its timers are set to
+that instant, so neither a pause after sampling nor local wall-clock skew can
+extend authority.
 
 Migration 0204 creates independent `r2_keep28_intents`, `r2_keep28_attempts`,
 `r2_keep28_events` and a pending-source identity guard. Ordinary reservations
