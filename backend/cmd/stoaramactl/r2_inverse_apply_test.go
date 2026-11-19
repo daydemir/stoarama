@@ -666,9 +666,9 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer batch.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, r2RetireAdvisoryLockKey)
-		a, entries := build(5)
+		a, entries := build(7)
 		defer a.ledger.close()
-		held, free, attempted, wired, other := entries[0], entries[1], entries[2], entries[3], entries[4]
+		held, free, attempted, wired, other, unrelated, behind := entries[0], entries[1], entries[2], entries[3], entries[4], entries[5], entries[6]
 		var hourID int64
 		exec(`INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until) VALUES(70,3,'2026-06-01','2026-06-02','key locks',now()+interval '1 day')`)
 		if err = pool.QueryRow(ctx, `INSERT INTO nas_stitch_r2_hours(scope_id,recording_id,hour_at,plan,plan_sha256,input_bytes) VALUES(70,30,'2026-06-01','{}',repeat('f',64),100) RETURNING id`).Scan(&hourID); err != nil {
@@ -754,7 +754,15 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 		wire.Rollback(ctx)
 
-		// An open import fences only its own key.
+		// An open import fences only its own key. Same-key reserve never waits
+		// on it while owning the wide protection locks: it rolls back and skips.
+		durable := func(e inverseEntry) int {
+			var n int
+			if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM r2_retirement_reservations WHERE object_key=$1)+(SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1)`, e.Key).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			return n
+		}
 		importing, err = pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 		if err != nil {
 			t.Fatal(err)
@@ -763,45 +771,80 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		if err = admit(ctx, importing, held); err != nil {
 			t.Fatal(err)
 		}
-		before := store.calls
 		waitless, cancel = prompt()
-		if ok, err := a.delete(waitless, waitless, &inverseSendGate{}, free); !ok || err != nil || store.calls-before != 1 {
-			t.Fatalf("unrelated RAW reserve and wire waited on an open import: %v %v", ok, err)
+		if _, err = a.reserve(waitless, held); !errors.Is(err, errInverseStitchConflict) || !strings.Contains(err.Error(), "hold admission in progress") || durable(held) != 0 {
+			t.Fatalf("same-key RAW reserve did not skip an open import: %v", err)
 		}
-		cancel()
-		waitless, cancel = prompt()
 		for _, query := range stale {
 			if _, err = pool.Exec(waitless, query, held.Key); err == nil || !strings.Contains(err.Error(), "hold admission is busy") {
 				t.Fatalf("stale ledger INSERT crossed an open import: %v", err)
 			}
 		}
 		cancel()
-		// Same-key RAW waits on the held clip row, then sees the committed hold.
-		var importPID uint32
-		if err = importing.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&importPID); err != nil {
-			t.Fatal(err)
+		before := store.calls
+		waitless, cancel = prompt()
+		if ok, err := a.delete(waitless, waitless, &inverseSendGate{}, free); !ok || err != nil || store.calls-before != 1 {
+			t.Fatalf("unrelated RAW reserve and wire waited on an open import: %v %v", ok, err)
 		}
-		reserved := make(chan error, 1)
-		go func() { _, err := a.reserve(ctx, held); reserved <- err }()
-		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-			var waiting bool
-			if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))`, importPID).Scan(&waiting); err != nil || time.Now().After(deadline) {
-				t.Fatalf("same-key RAW reserve did not wait for the open import: %v", err)
-			}
-			if waiting {
-				break
-			}
-		}
+		cancel()
 		if err = importing.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if err = <-reserved; err == nil || !strings.Contains(err.Error(), "live key protection veto") {
-			t.Fatalf("RAW reserved a committed hold: %v", err)
+		if _, err = a.reserve(ctx, held); !errors.Is(err, errInverseStitchConflict) || !strings.Contains(err.Error(), "committed hold") || durable(held) != 0 {
+			t.Fatalf("RAW did not skip a committed hold: %v", err)
 		}
 		for _, query := range stale {
 			if _, err = pool.Exec(ctx, query, held.Key); err == nil || !strings.Contains(err.Error(), "active R2 stitch input hold") {
 				t.Fatalf("stale ledger INSERT crossed a committed hold: %v", err)
 			}
+		}
+
+		// A certificate owns its held inputs' copy keys and rows. Same-key
+		// reserve skips at once; an unrelated key proceeds meanwhile.
+		certifying, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer certifying.Rollback(ctx)
+		if _, err = certifying.Exec(ctx, `SELECT lock_nas_r2_copy_key('stoarama',$1),(SELECT count(*) FROM (SELECT 1 FROM recording_clips WHERE object_key=$1 FOR SHARE) c)`, held.Key); err != nil {
+			t.Fatal(err)
+		}
+		waitless, cancel = prompt()
+		if _, err = a.reserve(waitless, held); !errors.Is(err, errInverseStitchConflict) || !strings.Contains(err.Error(), "committed hold") {
+			t.Fatalf("same-key RAW reserve did not skip an open certificate: %v", err)
+		}
+		before = store.calls
+		if ok, err := a.delete(waitless, waitless, &inverseSendGate{}, unrelated); !ok || err != nil || store.calls-before != 1 {
+			t.Fatalf("unrelated RAW key waited on an open certificate: %v %v", ok, err)
+		}
+		cancel()
+		certifying.Rollback(ctx)
+
+		// Any other owner of an unheld key is awaited with no protection lock
+		// held: an unrelated reserve started behind that wait proceeds.
+		busy, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer busy.Rollback(ctx)
+		if _, err = busy.Exec(ctx, `SELECT 1 FROM recording_clips WHERE object_key=$1 FOR UPDATE`, other.Key); err != nil {
+			t.Fatal(err)
+		}
+		awaited := make(chan error, 1)
+		go func() { _, err := a.reserve(ctx, other); awaited <- err }()
+		waitBlockedBy(t, pool, stitchBackendPID(t, busy), "same-key reserve behind another row owner")
+		var wide bool
+		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND (classid::bigint*4294967296+objid::bigint)=ANY(ARRAY[7343226011103,7343226011101]::bigint[]))`).Scan(&wide); err != nil || wide {
+			t.Fatalf("waiting reserve kept its protection locks: %v %v", wide, err)
+		}
+		waitless, cancel = prompt()
+		if _, err = a.reserve(waitless, behind); err != nil || durable(behind) != 2 {
+			t.Fatalf("unrelated reserve queued behind a same-key wait: %v", err)
+		}
+		cancel()
+		busy.Rollback(ctx)
+		if err = within(t, awaited, "awaited reserve"); err != nil || durable(other) != 2 {
+			t.Fatalf("awaited reserve did not complete: %v", err)
 		}
 	})
 	t.Run("send_gate_closed_after_authorize_stops_the_first_write", func(t *testing.T) {

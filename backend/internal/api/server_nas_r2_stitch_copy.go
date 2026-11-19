@@ -80,17 +80,16 @@ func finishNASR2StitchCopy(ctx context.Context, tx pgx.Tx, task nasR2CopyTask, r
 	if err != nil {
 		return err
 	}
-	// This transaction owns the copy row, so it never waits for the
-	// certificate's locks: it takes the epoch and the hour's input keys in
-	// the certificate's order, all or nothing, and the client retries.
+	// This transaction owns the copy row, so it never waits: it takes every
+	// lock the certificate needs (epoch, input keys in hash order, input pairs,
+	// hour) without waiting, all or nothing, and the client retries.
 	var locked bool
 	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_ke_epoch FOR SHARE SKIP LOCKED)
  AND (SELECT lock_nas_r2_copy_keys(array_agg(bucket),array_agg(object_key),false)
-  FROM nas_stitch_r2_input_holds WHERE hour_id=$1 AND released_at IS NULL)`, staged.hourID).Scan(&locked); err != nil || !locked {
+  FROM nas_stitch_r2_input_holds WHERE hour_id=$1 AND released_at IS NULL)
+ AND lock_nas_stitch_r2_inputs($1,false)
+ AND EXISTS(SELECT 1 FROM nas_stitch_r2_hours WHERE id=$1 FOR UPDATE SKIP LOCKED)`, staged.hourID).Scan(&locked); err != nil || !locked {
 		return errors.New("retirement holds are busy")
-	}
-	if _, err = tx.Exec(ctx, `SELECT id FROM nas_stitch_r2_hours WHERE id=$1 FOR UPDATE`, staged.hourID); err != nil {
-		return err
 	}
 	body, _ := json.Marshal(receipt)
 	tag, err := tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',verified_at=clock_timestamp(),

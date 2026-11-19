@@ -22,6 +22,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -65,6 +66,8 @@ type inverseApplySummary struct {
 	Selected      int64 `json:"selected"`
 	Deleted       int64 `json:"deleted"`
 	AmbiguousHeld int64 `json:"ambiguous_held"`
+	// StitchSkipped counts keys a Durham stitch hold owned before reserve.
+	StitchSkipped int64 `json:"stitch_skipped"`
 	// HeldAbsent lists held keys, issued before this run, whose objects are gone.
 	// They stay held and unretired; this only reports them.
 	HeldAbsent       []string     `json:"held_absent"`
@@ -189,16 +192,88 @@ func inverseProtectionLocks(ctx context.Context, tx pgx.Tx, shared bool) error {
 
 const inverseRawTargetSQL = `SELECT c.id,coalesce(r.stream_id,0),c.size_bytes,lower(c.sha256),coalesce(c.etag,''),c.display_path,c.clip_start_at,c.clip_end_at,
  coalesce(nullif(s.local_timezone,''),r.cron_timezone,'') FROM recording_clips c JOIN recordings r ON r.id=c.recording_id
- LEFT JOIN streams s ON s.id=r.stream_id WHERE c.bucket=$1 AND c.object_key=$2 AND c.purged_at IS NULL AND NOT EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.object_key=c.object_key) FOR UPDATE OF c FOR SHARE OF r`
+ LEFT JOIN streams s ON s.id=r.stream_id WHERE c.bucket=$1 AND c.object_key=$2 AND c.purged_at IS NULL AND NOT EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.object_key=c.object_key) `
+
+// inverseRowLock is how a target's source row is locked.
+type inverseRowLock string
+
+const (
+	inverseRowWait inverseRowLock = `FOR UPDATE OF c FOR SHARE OF r`
+	// Reserve never waits on the row while it owns the wide protection locks.
+	inverseRowNoWait inverseRowLock = `FOR UPDATE OF c NOWAIT FOR SHARE OF r`
+)
 
 var errInverseRawIneligible = errors.New("raw target ineligible")
 
-func (a *inverseApplier) loadTarget(ctx context.Context, tx pgx.Tx, e inverseEntry) (inverseRawTarget, error) {
-	return loadInverseRawTarget(ctx, tx, a.store.Bucket(), a.protection, a.opts.Lane, e)
+// errInverseStitchConflict reports a key that a Durham stitch hold owns or is
+// admitting, found before reserve wrote anything durable. The batch skips it.
+var errInverseStitchConflict = errors.New("R2 key held by Durham stitching; skipped")
+
+// 0223's ledger trigger raises exactly these for a held or admitting key.
+var inverseStitchLedgerOutcomes = []pgconn.PgError{
+	{Code: "55000", Message: "active R2 stitch input hold"},
+	{Code: "55P03", Message: "stitch input hold admission is busy"},
 }
-func loadInverseRawTarget(ctx context.Context, tx pgx.Tx, bucket string, protection inverseProtection, lane inverseLane, e inverseEntry) (inverseRawTarget, error) {
+
+const inverseStitchHeldSQL = `EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds WHERE bucket=$1 AND object_key=$2 AND released_at IS NULL)`
+
+func inverseStitchLedgerError(err error) error {
+	var pg *pgconn.PgError
+	if errors.As(err, &pg) {
+		for _, outcome := range inverseStitchLedgerOutcomes {
+			if pg.Code == outcome.Code && pg.Message == outcome.Message {
+				return fmt.Errorf("%w: %s", errInverseStitchConflict, pg.Message)
+			}
+		}
+	}
+	return err
+}
+
+// errInverseKeyBusy is a copy key or source row owned outside stitching.
+var errInverseKeyBusy = errors.New("R2 key or source row busy outside stitching")
+
+// keyContention rolls back a reserve that met a busy copy key or source row,
+// releasing its wide protection locks, then names the owner: a stitch hold or
+// hold admission is skipped, any other owner is awaited.
+func (a *inverseApplier) keyContention(ctx context.Context, tx pgx.Tx, key string) error {
+	if err := tx.Rollback(ctx); err != nil {
+		return err
+	}
+	var held, admitting bool
+	err := a.pool.QueryRow(ctx, `SELECT `+inverseStitchHeldSQL+`,NOT pg_try_advisory_xact_lock_shared(nas_stitch_r2_hold_lock($1,$2))`,
+		a.store.Bucket(), key).Scan(&held, &admitting)
+	switch {
+	case err != nil:
+		return err
+	case held:
+		return fmt.Errorf("%w: committed hold", errInverseStitchConflict)
+	case admitting:
+		return fmt.Errorf("%w: hold admission in progress", errInverseStitchConflict)
+	}
+	return errInverseKeyBusy
+}
+
+// awaitKey waits for another owner of the key and its row while this executor
+// holds no protection lock, so unrelated reserves never queue behind it.
+func (a *inverseApplier) awaitKey(ctx context.Context, key string) error {
+	tx, err := a.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.Background())
+	if _, err = tx.Exec(ctx, `SELECT lock_nas_r2_copy_key($1,$2)`, a.store.Bucket(), key); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `SELECT 1 FROM recording_clips WHERE bucket=$1 AND object_key=$2 FOR UPDATE`, a.store.Bucket(), key)
+	return err
+}
+
+func (a *inverseApplier) loadTarget(ctx context.Context, tx pgx.Tx, e inverseEntry) (inverseRawTarget, error) {
+	return loadInverseRawTarget(ctx, tx, a.store.Bucket(), a.protection, a.opts.Lane, e, inverseRowWait)
+}
+func loadInverseRawTarget(ctx context.Context, tx pgx.Tx, bucket string, protection inverseProtection, lane inverseLane, e inverseEntry, lock inverseRowLock) (inverseRawTarget, error) {
 	t := inverseRawTarget{}
-	rows, err := tx.Query(ctx, inverseRawTargetSQL, bucket, e.Key)
+	rows, err := tx.Query(ctx, inverseRawTargetSQL+string(lock), bucket, e.Key)
 	if err != nil {
 		return t, err
 	}
@@ -304,6 +379,17 @@ func (a *inverseApplier) checkTarget(ctx context.Context, tx pgx.Tx, t inverseRa
 	return nil
 }
 func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRawTarget, error) {
+	for {
+		t, err := a.reserveOnce(ctx, e)
+		if !errors.Is(err, errInverseKeyBusy) {
+			return t, err
+		}
+		if err = a.awaitKey(ctx, e.Key); err != nil {
+			return t, err
+		}
+	}
+}
+func (a *inverseApplier) reserveOnce(ctx context.Context, e inverseEntry) (inverseRawTarget, error) {
 	t := inverseRawTarget{}
 	tx, err := a.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
@@ -316,12 +402,25 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	if err = inverseProtectionLocks(ctx, tx, false); err != nil {
 		return t, err
 	}
-	if _, err = tx.Exec(ctx, `SELECT lock_nas_r2_copy_key($1,$2)`, a.store.Bucket(), e.Key); err != nil {
+	var keyed, held bool
+	if err = tx.QueryRow(ctx, `SELECT lock_nas_r2_copy_keys(ARRAY[$1::text],ARRAY[$2::text],false)`, a.store.Bucket(), e.Key).Scan(&keyed); err != nil {
 		return t, err
 	}
-	t, err = a.loadTarget(ctx, tx, e)
+	if !keyed {
+		return t, a.keyContention(ctx, tx, e.Key)
+	}
+	t, err = loadInverseRawTarget(ctx, tx, a.store.Bucket(), a.protection, a.opts.Lane, e, inverseRowNoWait)
+	if pg := (*pgconn.PgError)(nil); errors.As(err, &pg) && pg.Code == "55P03" {
+		return t, a.keyContention(ctx, tx, e.Key)
+	}
 	if err != nil {
 		return t, err
+	}
+	if err = tx.QueryRow(ctx, `SELECT `+inverseStitchHeldSQL, a.store.Bucket(), e.Key).Scan(&held); err != nil {
+		return t, err
+	}
+	if held {
+		return t, fmt.Errorf("%w: committed hold", errInverseStitchConflict)
 	}
 	// The purge probe runs after this reservation's intent exists, below: a
 	// released joined source admits its purge only for the RAW lane's intent.
@@ -368,7 +467,7 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	// connection or assume its rollback can discard this source reservation.
 	_, err = tx.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) VALUES('raw',$1,$2,$3,$4,$5,$6)`, t.ID, a.store.Bucket(), e.Key, e.SizeBytes, t.SHA, a.opts.ManifestSHA)
 	if err != nil {
-		return t, err
+		return t, inverseStitchLedgerError(err)
 	}
 	intentSQL := `INSERT INTO ` + a.opts.Lane.intentTable() + `(bucket,object_key,source_id,size_bytes,etag,last_modified,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice,endpoint_sha256,stream_id`
 	intentArgs := []any{a.store.Bucket(), e.Key, t.ID, e.SizeBytes, e.ETag, e.LastModified, a.opts.ManifestSHA, a.summary.PolicySHA256, a.summary.PicksSHA256, a.opts.DrainSHA, a.protection.Picks.Choices[t.StreamID].Choice, a.store.EndpointSHA256(), t.StreamID}
@@ -387,7 +486,7 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	intentSQL += `)`
 	_, err = tx.Exec(ctx, intentSQL, intentArgs...)
 	if err != nil {
-		return t, err
+		return t, inverseStitchLedgerError(err)
 	}
 	if err = probeInversePurge(ctx, tx, t.ID); err != nil {
 		return t, err
@@ -843,7 +942,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	var mu sync.Mutex
 	var deleted, bytes atomic.Int64
 	var wireAmbiguous []string
-	var modifiedHeld, modifiedBytes atomic.Int64
+	var modifiedHeld, modifiedBytes, stitchSkipped atomic.Int64
 	var custodyShort r2RetireStat
 	for range o.Workers {
 		wg.Add(1)
@@ -858,10 +957,15 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 				if errors.Is(err, errInverseAdmissionClosed) {
 					return
 				}
+				// Only selection or reserve report these, before anything durable.
 				if errors.Is(err, errKeep28CustodyShort) {
 					mu.Lock()
 					custodyShort.add(e.SizeBytes)
 					mu.Unlock()
+					continue
+				}
+				if errors.Is(err, errInverseStitchConflict) {
+					stitchSkipped.Add(1)
 					continue
 				}
 				if err != nil {
@@ -902,6 +1006,7 @@ send:
 	wg.Wait()
 	result.Selected = int64(len(jobs))
 	result.Deleted = deleted.Load()
+	result.StitchSkipped = stitchSkipped.Load()
 	sort.Strings(wireAmbiguous)
 	result.WireAmbiguous = wireAmbiguous
 	result.Bytes = bytes.Load()

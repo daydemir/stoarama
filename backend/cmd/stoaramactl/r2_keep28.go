@@ -86,7 +86,8 @@ const keep28AdmissionCustody = keep28CustodyMargin + inverseNetworkTimeout
 // exact, complete evidence, the predicates the custody lock enforces, so a
 // legacy row without sidecar evidence is simply ineligible. A report is never
 // wire authority; every identity and proof is subsequently reloaded under locks,
-// and reserve requires the identity observed here.
+// and reserve requires the identity observed here. Committed stitch input holds
+// are left out so they never fill a batch.
 func (a *inverseApplier) selectKeep28(ctx context.Context, entries map[string]inverseEntry) ([]inverseEntry, error) {
 	rows, err := a.pool.Query(ctx, `SELECT c.object_key,c.id,c.size_bytes,c.display_path,lower(c.sha256),n.sidecar_size_bytes,n.sidecar_sha256
  FROM recording_clips c JOIN nas_inventory_files n ON n.connection_id=$2 AND n.clip_id=c.id
@@ -96,6 +97,7 @@ func (a *inverseApplier) selectKeep28(ctx context.Context, entries map[string]in
  AND n.verified_at<=clock_timestamp()+interval '5 minutes'
  AND n.sidecar_relative_path=c.display_path||'.stoarama.json' AND n.sidecar_size_bytes>0 AND n.sidecar_sha256 ~ '^[a-f0-9]{64}$'
  AND LEAST(n.verified_at,n.server_received_at)>clock_timestamp()-interval '24 hours'+make_interval(secs=>$3)
+ AND NOT EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds h WHERE h.bucket=c.bucket AND h.object_key=c.object_key AND h.released_at IS NULL)
  ORDER BY n.verified_at,c.id`, a.store.Bucket(), int64(13), keep28AdmissionCustody.Seconds())
 	if err != nil {
 		return nil, err

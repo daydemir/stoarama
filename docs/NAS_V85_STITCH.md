@@ -322,8 +322,9 @@ Durham works only on reviewed whole-hour plans backed by R2 and exact raw
 custody on NAS connection 13. The read-only planner emits a private manifest
 and prints its SHA-256. Review that manifest before import. Import with the
 queue paused; imports serialize with each other, not with R2 retirement. Each
-input holds its own key lock until commit, so one import takes at most 4,000
-inputs; choose `--max-hours` to fit. It recomputes the frozen
+input holds its own key lock until commit, so one import takes at most 1,000
+inputs; choose `--max-hours` to fit. Older importers and direct SQL bypass
+this cap, so roll out the capped importer before importing again. It recomputes the frozen
 plan, verifies every catalog identity, and atomically adds
 `public.nas_stitch_r2_input_holds` and the corresponding hour rows.
 

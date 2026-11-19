@@ -2,6 +2,11 @@
 -- object. Retirement executors keep their own outer lock 7343226011173; no
 -- stitch step takes it any more.
 
+-- A hold written under 0217's trigger owns 1173/1189 but no per-key lock, and
+-- a ledger insert under the new trigger cannot see it before it commits. Drain
+-- every in-flight hold write before either trigger changes.
+LOCK TABLE nas_stitch_r2_input_holds IN SHARE MODE;
+
 -- Hold admission and every retirement ledger insert meet on this per-key lock.
 -- It is not lock_nas_r2_copy_key: inverse wire commits its attempt on a second
 -- connection while its first still owns that key, so a ledger trigger must not
@@ -72,10 +77,14 @@ BEGIN
  RETURN NEW;
 END $$;
 
+-- Executors skip a key on exactly these two outcomes: 55P03 'stitch input
+-- hold admission is busy' and 55000 'active R2 stitch input hold'.
 CREATE OR REPLACE FUNCTION guard_r2_retirement_stitch_input() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
- IF current_setting('transaction_isolation')<>'read committed'
-  OR NOT pg_try_advisory_xact_lock_shared(nas_stitch_r2_hold_lock(NEW.bucket,NEW.object_key)) THEN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'R2 retirement ledger requires READ COMMITTED' USING ERRCODE='55000';
+ END IF;
+ IF NOT pg_try_advisory_xact_lock_shared(nas_stitch_r2_hold_lock(NEW.bucket,NEW.object_key)) THEN
   RAISE EXCEPTION 'stitch input hold admission is busy' USING ERRCODE='55P03';
  END IF;
  IF EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds h
@@ -85,10 +94,24 @@ BEGIN
  RETURN NEW;
 END $$;
 
+-- Locks the hour's live input clip/inventory pairs in clip order. Without
+-- wait it skips busy rows and reports false; the caller then rolls back.
+CREATE FUNCTION lock_nas_stitch_r2_inputs(hour bigint,wait boolean) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE locked bigint;
+BEGIN
+ EXECUTE 'SELECT c.id FROM nas_stitch_r2_input_holds i
+  JOIN recording_clips c ON c.id=i.catalog_clip_id
+  JOIN nas_inventory_files f ON f.connection_id=13 AND f.clip_id=c.id
+  WHERE i.hour_id=$1 AND i.released_at IS NULL ORDER BY c.id FOR SHARE OF c,f'
+  ||CASE WHEN wait THEN '' ELSE ' SKIP LOCKED' END USING hour;
+ GET DIAGNOSTICS locked=ROW_COUNT;
+ RETURN locked=(SELECT count(*) FROM nas_stitch_r2_input_holds i WHERE i.hour_id=hour AND i.released_at IS NULL);
+END $$;
+
 -- Same order as inverse reserve and wire: epoch, then copy keys, then rows. A
--- same-key reservation waits for this commit and then sees every input released.
+-- same-key reservation finds the key busy, or sees every input released.
 CREATE OR REPLACE FUNCTION add_nas_stitch_r2_certificate() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE expected jsonb; locked_pairs bigint;
+DECLARE expected jsonb;
 BEGIN
  IF current_setting('transaction_isolation')<>'read committed' THEN
   RAISE EXCEPTION 'NAS stitch certification requires READ COMMITTED' USING ERRCODE='55000';
@@ -96,13 +119,7 @@ BEGIN
  PERFORM 1 FROM r2_inverse_ke_epoch FOR SHARE;
  PERFORM lock_nas_r2_copy_keys(array_agg(bucket),array_agg(object_key),true)
   FROM nas_stitch_r2_input_holds WHERE hour_id=NEW.hour_id AND released_at IS NULL;
- PERFORM c.id FROM nas_stitch_r2_input_holds i
-  JOIN recording_clips c ON c.id=i.catalog_clip_id
-  JOIN nas_inventory_files f ON f.connection_id=13 AND f.clip_id=c.id
-  WHERE i.hour_id=NEW.hour_id AND i.released_at IS NULL ORDER BY c.id FOR SHARE OF c,f;
- GET DIAGNOSTICS locked_pairs=ROW_COUNT;
- IF locked_pairs<>(SELECT count(*) FROM nas_stitch_r2_input_holds i
-  WHERE i.hour_id=NEW.hour_id AND i.released_at IS NULL) THEN
+ IF NOT lock_nas_stitch_r2_inputs(NEW.hour_id,true) THEN
   RAISE EXCEPTION 'NAS stitch input custody pairs could not be locked';
  END IF;
  IF NOT nas_stitch_r2_has_exact_input_set(NEW.hour_id) THEN

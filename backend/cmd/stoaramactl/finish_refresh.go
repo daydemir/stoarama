@@ -210,7 +210,7 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	e := inverseEntry{ObjectInfo: r2.ObjectInfo{Key: i.ObjectKey, ETag: etag, SizeBytes: i.SizeBytes}, Class: inverseKeep28}
-	target, err := loadInverseRawTarget(ctx, tx, i.Bucket, p, inverseNASKeep28, e)
+	target, err := loadInverseRawTarget(ctx, tx, i.Bucket, p, inverseNASKeep28, e, inverseRowWait)
 	if errors.Is(err, errInverseRawIneligible) {
 		return false, nil
 	}

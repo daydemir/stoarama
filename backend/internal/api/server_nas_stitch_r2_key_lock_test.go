@@ -14,19 +14,20 @@ import (
 )
 
 func TestDurhamStitchImportBoundsHeldInputs(t *testing.T) {
-	set := DurhamStitchHoldSet{Bucket: "stoarama", EndpointSHA: strings.Repeat("a", 64),
-		Hours: make([]DurhamStitchHour, durhamStitchMaxImportInputs/nasStitchMaxClips+1)}
-	for i := range set.Hours {
-		set.Hours[i].Inputs = make([]DurhamStitchInput, nasStitchMaxClips)
-	}
-	// The bound is checked before the transaction is touched.
-	if _, err := ImportDurhamStitchHoldSet(context.Background(), nil, set); err == nil || !strings.Contains(err.Error(), "bounded") {
-		t.Fatalf("import accepted more inputs than its key locks may hold: %v", err)
+	for inputs, ok := range map[int]bool{1000: true, 1001: false} {
+		set := DurhamStitchHoldSet{Bucket: "stoarama", EndpointSHA: strings.Repeat("a", 64)}
+		for left := inputs; left > 0; left -= 200 {
+			set.Hours = append(set.Hours, DurhamStitchHour{Inputs: make([]DurhamStitchInput, min(left, 200))})
+		}
+		if err := durhamStitchHoldSetBounded(set); (err == nil) != ok {
+			t.Fatalf("import bound at %d inputs: %v", inputs, err)
+		}
 	}
 }
 
-// rawRetirementKey replays inverse reserve (or wire) up to its ledger write:
-// epoch, protection locks, copy key, clip row, then the held check.
+// rawRetirementKey replays the deployed inverse reserve (or wire), which
+// waits for its copy key and row, up to its ledger write: epoch, protection
+// locks, copy key, clip row, then the held check.
 func rawRetirementKey(ctx context.Context, pool *pgxpool.Pool, key string, wire bool) (pgx.Tx, error) {
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
@@ -96,24 +97,45 @@ func within[T any](t *testing.T, ch <-chan T, what string) T {
 	}
 }
 
-// The receipt owns its copy row, so a busy epoch or input key refuses it at
-// once; the client retries.
-func testStitchReceiptNeverWaits(t *testing.T, pool *pgxpool.Pool, post func() int, inputKey string) {
+// The receipt owns its copy row, so any busy lock the certificate needs
+// refuses it at once and frees the copy row; the client retries.
+func testStitchReceiptNeverWaits(t *testing.T, pool *pgxpool.Pool, post func() int, copyID, hourID int64, inputKey string) {
 	t.Helper()
 	ctx := context.Background()
-	for _, holder := range []string{`SELECT lock_nas_r2_copy_key('stoarama','` + inputKey + `')`, `SELECT 1 FROM r2_inverse_ke_epoch FOR UPDATE`} {
+	for _, holder := range []struct {
+		name, sql string
+		args      []any
+	}{
+		{"input key", `SELECT lock_nas_r2_copy_key('stoarama',$1)`, []any{inputKey}},
+		{"catalog epoch", `SELECT 1 FROM r2_inverse_ke_epoch FOR UPDATE`, nil},
+		{"hour", `SELECT 1 FROM nas_stitch_r2_hours WHERE id=$1 FOR UPDATE`, []any{hourID}},
+		{"input clip", `SELECT 1 FROM recording_clips WHERE object_key=$1 FOR UPDATE`, []any{inputKey}},
+		{"input inventory", `SELECT 1 FROM nas_inventory_files f JOIN recording_clips c ON c.id=f.clip_id
+ WHERE f.connection_id=13 AND c.object_key=$1 FOR UPDATE OF f`, []any{inputKey}},
+	} {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err = tx.Exec(ctx, holder); err != nil {
+		defer tx.Rollback(ctx)
+		if _, err = tx.Exec(ctx, holder.sql, holder.args...); err != nil {
 			t.Fatal(err)
 		}
 		code := make(chan int, 1)
+		began := time.Now()
 		go func() { code <- post() }()
-		if got := within(t, code, "receipt behind "+holder); got != http.StatusConflict {
-			t.Fatalf("receipt crossed %s: %d", holder, got)
+		// Request lock timeouts end a wait too; only an immediate refusal counts.
+		if got := within(t, code, "receipt behind its "+holder.name); got != http.StatusConflict || time.Since(began) > time.Second {
+			t.Fatalf("receipt waited on or crossed its busy %s: %d after %v", holder.name, got, time.Since(began))
 		}
+		copyRow, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = copyRow.Exec(ctx, `SELECT 1 FROM nas_r2_copy_items WHERE id=$1 FOR UPDATE NOWAIT`, copyID); err != nil {
+			t.Fatalf("receipt kept the copy row behind its busy %s: %v", holder.name, err)
+		}
+		copyRow.Rollback(ctx)
 		tx.Rollback(ctx)
 	}
 }
@@ -165,11 +187,11 @@ func addDurhamHours(t *testing.T, pool *pgxpool.Pool, hour time.Time, endpoint, 
 	return hours
 }
 
-// testStitchCertKeyContention holds the certificate open at its clip row
-// lock, after it owns the epoch and the hour's input keys. Unrelated RAW keys
-// and a multi-hour import proceed meanwhile; a same-key reservation waits and
-// then sees every input released.
-func testStitchCertKeyContention(t *testing.T, pool *pgxpool.Pool, post func() int, clipID int64, inputKey, freeKey string, extra durhamExtraHours) int {
+// testStitchCertKeyContention holds a certificate open: it owns the epoch,
+// the hour's input keys and their rows. Unrelated RAW keys and a multi-hour
+// import proceed meanwhile; a deployed same-key reserve waits and then sees
+// every input released.
+func testStitchCertKeyContention(t *testing.T, pool *pgxpool.Pool, certify func(pgx.Tx) error, inputKey, freeKey string, extra durhamExtraHours) error {
 	t.Helper()
 	ctx := context.Background()
 	// A running RAW batch owns the executors' outer lock throughout.
@@ -186,17 +208,14 @@ func testStitchCertKeyContention(t *testing.T, pool *pgxpool.Pool, post func() i
 	if _, err = other.Exec(ctx, `SELECT 1 FROM recording_clips WHERE object_key=$1 FOR UPDATE`, freeKey); err != nil {
 		t.Fatal(err)
 	}
-	clip, err := pool.Begin(ctx)
+	cert, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer clip.Rollback(ctx)
-	if _, err = clip.Exec(ctx, `SELECT 1 FROM recording_clips WHERE id=$1 FOR UPDATE`, clipID); err != nil {
-		t.Fatal(err)
+	defer cert.Rollback(ctx)
+	if err = certify(cert); err != nil {
+		return err
 	}
-	code := make(chan int, 1)
-	go func() { code <- post() }()
-	cert := blockedBy(t, pool, backendPID(t, clip), "certificate at its clip row")
 	if _, err = pool.Exec(ctx, `SELECT 1 FROM r2_inverse_ke_epoch FOR UPDATE NOWAIT`); err == nil || !strings.Contains(err.Error(), "could not obtain lock") {
 		t.Fatalf("catalog epoch changed under an open certificate: %v", err)
 	}
@@ -243,19 +262,16 @@ func testStitchCertKeyContention(t *testing.T, pool *pgxpool.Pool, post func() i
 		tx, err := rawRetirementKey(ctx, pool, inputKey, false)
 		same <- reservation{tx, err}
 	}()
-	blockedBy(t, pool, cert, "same-key reservation")
-	if err = clip.Commit(ctx); err != nil {
-		t.Fatal(err)
+	blockedBy(t, pool, backendPID(t, cert), "same-key reservation")
+	if err = cert.Commit(ctx); err != nil {
+		return err
 	}
-	got := within(t, code, "certificate")
 	reserved := within(t, same, "same-key reservation after the certificate")
-	if got == http.StatusOK && reserved.err != nil {
+	if reserved.err != nil {
 		t.Fatalf("same-key reservation saw partly released coverage: %v", reserved.err)
 	}
-	if reserved.tx != nil {
-		reserved.tx.Rollback(ctx)
-	}
-	return got
+	reserved.tx.Rollback(ctx)
+	return nil
 }
 
 func stitchStageGuard(objectID int64) string {

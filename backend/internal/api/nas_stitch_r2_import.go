@@ -32,17 +32,26 @@ type DurhamStitchInput struct {
 	Size   int64  `json:"size_bytes"`
 }
 
-// One import holds one advisory lock per input until commit. This bound keeps
-// it well inside PostgreSQL's shared lock table; plan larger sets in parts.
-const durhamStitchMaxImportInputs = 4000
+// One import holds one advisory lock per input until commit. Production has
+// 64 locks per transaction x 103 connections, about 6,592 shared lock slots
+// with ~550 in use. 1,000 inputs (about 16 hours of 60 clips) leaves most of
+// the table to everyone else; plan larger sets in parts.
+const durhamStitchMaxImportInputs = 1000
 
-func ImportDurhamStitchHoldSet(ctx context.Context, tx pgx.Tx, set DurhamStitchHoldSet) (int, error) {
+func durhamStitchHoldSetBounded(set DurhamStitchHoldSet) error {
 	inputs := 0
 	for _, hour := range set.Hours {
 		inputs += len(hour.Inputs)
 	}
 	if set.Bucket == "" || !stitchSHA(set.EndpointSHA) || len(set.Hours) < 1 || inputs > durhamStitchMaxImportInputs {
-		return 0, errors.New("bounded exact Durham hold set required")
+		return errors.New("bounded exact Durham hold set required")
+	}
+	return nil
+}
+
+func ImportDurhamStitchHoldSet(ctx context.Context, tx pgx.Tx, set DurhamStitchHoldSet) (int, error) {
+	if err := durhamStitchHoldSetBounded(set); err != nil {
+		return 0, err
 	}
 	// Each hold keeps its own key lock until commit. Imports serialize on 1189;
 	// retirement of other keys proceeds.
