@@ -131,7 +131,8 @@ binaries cannot authenticate the dedicated key's stored digest.
 
 A result awaiting its durable receipt keeps the shared stitch lane occupied.
 If a dedicated key is revoked or expires in that window, the operator status
-includes the abandonment marker for any recovered task. An authorized operator
+lists outstanding registrations first and shows each exact plan digest, owner
+key ID and abandonment marker. An authorized operator
 can record abandonment with `POST /api/v1/admin/nas-stitch/{id}/abandon-registration`
 and the exact `plan_sha256` and `reason`. This preserves the output and frozen
 result, records who released the lane, and leaves the abandoned hour without a

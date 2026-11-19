@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"slices"
 	"strings"
@@ -94,15 +95,23 @@ func (s *Server) handleAdminNASStitchAbandonRegistration(w http.ResponseWriter, 
 	var oldReason *string
 	err = tx.QueryRow(ctx, `SELECT lease_api_key_id,registration_abandoned_reason
  FROM nas_stitch_tasks WHERE id=$1 AND plan_sha256=$2 AND state='verified'
- AND cleanup_plan_id IS NULL AND lease_api_key_id IS NOT NULL FOR UPDATE`, id, req.PlanSHA).Scan(&owner, &oldReason)
-	if err != nil {
+ AND cleanup_plan_id IS NULL AND lease_api_key_id IS NOT NULL AND lease_api_key_attempt=attempt FOR UPDATE`, id, req.PlanSHA).Scan(&owner, &oldReason)
+	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, 409, "no matching verified dedicated stitch task")
+		return
+	}
+	if err != nil {
+		util.WriteError(w, 503, "stitch recovery unavailable")
 		return
 	}
 	caller := nasStitchCaller{keyID: owner, accountID: nasStitchAccountID, dedicated: true}
 	active, err := caller.keyActive(ctx, tx)
-	if err != nil || active {
+	if errors.Is(err, pgx.ErrNoRows) || active {
 		util.WriteError(w, 409, "stitch recovery requires a revoked or expired dedicated key")
+		return
+	}
+	if err != nil {
+		util.WriteError(w, 503, "stitch recovery key lookup unavailable")
 		return
 	}
 	if oldReason != nil && *oldReason != req.Reason {
