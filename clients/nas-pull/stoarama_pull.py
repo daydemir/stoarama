@@ -19611,7 +19611,8 @@ def stable_native_signature_v1(probe_streams, format_name):
     return {"schema_version": 1, "format_name": format_name, "streams": canonical}
 
 
-def cancellable_tool_output(command, cancel, timeout, stdout_limit=1024 * 1024, stderr_limit=64 * 1024, pass_fds=()):
+def cancellable_tool_output(command, cancel, timeout, stdout_limit=1024 * 1024, stderr_limit=64 * 1024,
+                            pass_fds=(), *, reject_stderr=False):
     """Bounded child group: cancellation cannot strand ffmpeg descendants."""
     if stdout_limit < 0 or stderr_limit < 0:
         raise MediaCertificationError("media verification output bound is invalid")
@@ -19690,7 +19691,7 @@ def cancellable_tool_output(command, cancel, timeout, stdout_limit=1024 * 1024, 
         failure = MediaCertificationError("media verification output exceeded its bound")
     if failure is not None:
         raise failure
-    if process.returncode:
+    if process.returncode or (reject_stderr and stderr):
         raise ToolProcessError(process.returncode, bytes(stderr))
     return bytes(stdout)
 
