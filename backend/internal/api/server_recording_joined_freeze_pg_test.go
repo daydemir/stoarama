@@ -94,6 +94,8 @@ var joinedMigrationNames = []string{
 	"0177_nas_cleanup_reserved_files.sql",
 	"0178_nas_cleanup_reconciliation.sql",
 	"0179_nas_v85r_stitch.sql",
+	// Replaces 0198's function and probes the deferred writer-fence tables.
+	"0213_r2_writes_blocked_indexes.sql",
 }
 
 type joinedFixtureMigrationPhase uint8
