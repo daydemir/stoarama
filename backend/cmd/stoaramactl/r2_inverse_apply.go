@@ -61,8 +61,11 @@ type inverseApplyOptions struct {
 	Workers                                                                            int
 }
 type inverseApplySummary struct {
-	Deleted          int64        `json:"deleted"`
-	AmbiguousHeld    int64        `json:"ambiguous_held"`
+	Deleted       int64 `json:"deleted"`
+	AmbiguousHeld int64 `json:"ambiguous_held"`
+	// HeldAbsent lists held keys, issued before this run, whose objects are gone.
+	// They stay held and unretired; this only reports them.
+	HeldAbsent       []string     `json:"held_absent"`
 	WireAmbiguous    []string     `json:"wire_ambiguous"`
 	LastModifiedHeld r2RetireStat `json:"last_modified_held"`
 	Bytes            int64        `json:"bytes"`
@@ -386,11 +389,11 @@ const inverseNetworkTimeout = 30 * time.Second
 // already stopped the batch. It is never a failure of its own.
 var errInverseAdmissionClosed = errors.New("batch stopped before this key was reserved")
 
-// delete runs one key. admit closes when a sibling fails: a key not yet reserved,
-// or still waiting on its reservation locks, writes nothing and stops. A key whose
-// intent is durable finishes: its own gates are rechecked under lock before the
-// wire, and stopping it there would only strand a permanent hold.
-func (a *inverseApplier) delete(ctx, admit context.Context, e inverseEntry) (bool, error) {
+// delete runs one key. admit closes on any sibling failure: a key not yet
+// reserved, or still waiting on its reservation locks, writes nothing and stops.
+// send closes on a hard failure only: a reserved key then stops before its
+// first DELETE and stays held. A DELETE already sent finishes confirmation.
+func (a *inverseApplier) delete(ctx, admit, send context.Context, e inverseEntry) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, inverseNetworkTimeout)
 	defer cancel()
 	if admit.Err() != nil {
@@ -422,6 +425,9 @@ func (a *inverseApplier) delete(ctx, admit context.Context, e inverseEntry) (boo
 			return false, authErr
 		}
 		defer authority.cancel()
+		if send.Err() != nil {
+			return false, errInverseAdmissionClosed
+		}
 		ctx = authority.ctx
 		err = a.store.(keep28DeleteStore).deleteKeep28Once(ctx, authority)
 		if err == nil {
@@ -436,6 +442,9 @@ func (a *inverseApplier) delete(ctx, admit context.Context, e inverseEntry) (boo
 		authority, authErr := a.authorize(ctx, tx, e)
 		if authErr != nil {
 			return false, authErr
+		}
+		if send.Err() != nil {
+			return false, errInverseAdmissionClosed
 		}
 		err = a.store.(inverseDeleteStore).deleteOnce(ctx, authority)
 	}
@@ -713,6 +722,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		case r2.IsNotFound(err) && !p.issued:
 			return result, fmt.Errorf("intent %s never issued a DELETE but its object is absent; held for review", p.e.Key)
 		case r2.IsNotFound(err):
+			result.HeldAbsent = append(result.HeldAbsent, p.e.Key)
 		case err != nil:
 			return result, err
 		case strings.Trim(head.ETag, `"`) != strings.Trim(p.e.ETag, `"`) || head.SizeBytes != p.e.SizeBytes || !head.LastModified.Equal(p.e.LastModified.Truncate(time.Second)):
@@ -779,11 +789,14 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 			return result, err
 		}
 	}
-	// The first failure stops dispatch only. Deletes already in flight finish
-	// under their own deadline; cancelling them would strand DELETEs the
-	// provider may already have taken.
+	// Any failure closes admission to new reservations. A hard failure also
+	// closes the send gate, so no reserved key sends its first DELETE after it.
+	// Deletes already sent finish under their own deadline; cancelling them
+	// would strand DELETEs the provider may already have taken.
 	stop, halt := context.WithCancel(ctx)
 	defer halt()
+	send, haltSends := context.WithCancel(ctx)
+	defer haltSends()
 	queue := make(chan inverseEntry)
 	var wg sync.WaitGroup
 	var first error
@@ -796,7 +809,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		go func() {
 			defer wg.Done()
 			for e := range queue {
-				ok, err := a.delete(ctx, stop, e)
+				ok, err := a.delete(ctx, stop, send, e)
 				if ok {
 					deleted.Add(1)
 					bytes.Add(e.SizeBytes)
@@ -821,6 +834,9 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 						first = err
 					}
 					mu.Unlock()
+					if !wire {
+						haltSends()
+					}
 					halt()
 					return
 				}

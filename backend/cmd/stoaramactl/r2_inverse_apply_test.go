@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -102,6 +103,17 @@ func (s *inverseFakeStore) deleteOnce(ctx context.Context, authority *inverseDel
 	}
 	return nil
 }
+
+// waitFor bounds a test barrier: a schedule that never reaches it fails the
+// test instead of hanging it.
+func waitFor(t *testing.T, ch <-chan struct{}, what string) {
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Errorf("timed out waiting for %s", what)
+	}
+}
+
 func TestR2InverseExecutorLifecycle(t *testing.T) {
 	ctx := context.Background()
 	schemaPool := joinedPurgeTestPool(t, "inverse_apply")
@@ -471,13 +483,13 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		var sibling sync.Once
 		setWire(map[string]string{lost: "eof"}, func(key string) {
 			if key == lost {
-				<-siblingOnWire
+				waitFor(t, siblingOnWire, "a sibling DELETE on the wire")
 				return
 			}
 			sibling.Do(func() {
 				close(siblingOnWire)
-				<-lostAnswered
-				// Give the lost DELETE's worker time to see its error and halt.
+				waitFor(t, lostAnswered, "the lost DELETE's dropped connection")
+				// Give the lost DELETE's worker time to see its error.
 				time.Sleep(300 * time.Millisecond)
 			})
 		})
@@ -543,9 +555,15 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		a, entries := build(2)
 		a.ledger.close()
 		lost, refused := entries[0].Key, entries[1].Key
-		both := sync.WaitGroup{}
-		both.Add(2)
-		setWire(map[string]string{lost: "eof", refused: "403"}, func(string) { both.Done(); both.Wait() })
+		arrived := map[string]chan struct{}{lost: make(chan struct{}), refused: make(chan struct{})}
+		setWire(map[string]string{lost: "eof", refused: "403"}, func(key string) {
+			close(arrived[key])
+			for other, ch := range arrived {
+				if other != key {
+					waitFor(t, ch, "both DELETEs on the wire")
+				}
+			}
+		})
 		_, result, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(t.TempDir(), "evidence.json"))
 		setWire(nil, nil)
 		if err == nil || errors.Is(err, errInverseWireAmbiguous) || !slices.Equal(result.WireAmbiguous, []string{lost}) {
@@ -583,7 +601,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		admit, closeAdmission := context.WithCancel(ctx)
 		done := make(chan error, 1)
 		before := providerDeletes()
-		go func() { _, err := a.delete(ctx, admit, e); done <- err }()
+		go func() { _, err := a.delete(ctx, admit, ctx, e); done <- err }()
 		deadline := time.Now().Add(10 * time.Second)
 		for {
 			var waiting bool
@@ -612,6 +630,22 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatalf("admission: err %v intents %d deletes %d", err, intents, providerDeletes()-before)
 		}
 	})
+	t.Run("closed_send_gate_stops_a_reserved_key_before_its_first_DELETE", func(t *testing.T) {
+		a, entries := build(1)
+		defer a.ledger.close()
+		closed, closeSend := context.WithCancel(ctx)
+		closeSend()
+		before := store.calls
+		_, err := a.delete(ctx, ctx, closed, entries[0])
+		var intents, attempts int
+		if qerr := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1),(SELECT count(*) FROM r2_inverse_attempts WHERE object_key=$1)`, entries[0].Key).Scan(&intents, &attempts); qerr != nil {
+			t.Fatal(qerr)
+		}
+		// Reserved and authorized, never sent: the key stays held for good.
+		if !errors.Is(err, errInverseAdmissionClosed) || store.calls != before || intents != 1 || attempts != 1 {
+			t.Fatalf("send gate: err %v deletes %d intents %d attempts %d", err, store.calls-before, intents, attempts)
+		}
+	})
 	t.Run("delete_transport_never_speaks_HTTP2", func(t *testing.T) {
 		// An HTTP/2-capable TLS server must still be spoken to in HTTP/1.1, on
 		// a fresh connection for every DELETE.
@@ -632,8 +666,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		tr := newInverseDeleteHTTPTransport()
 		tr.TLSClientConfig.RootCAs = x509.NewCertPool()
 		tr.TLSClientConfig.RootCAs.AddCert(server.Certificate())
-		client := &http.Client{Transport: tr}
-		for range 2 {
+		for _, client := range []*http.Client{{Transport: tr}, {Transport: (&inverseWire{}).transport(tr)}} {
 			req, _ := http.NewRequest(http.MethodDelete, server.URL+"/stoarama/key", nil)
 			resp, err := client.Do(req)
 			if err != nil {
@@ -806,7 +839,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					return nil
 				}
 				before := store.calls
-				ok, err := a.delete(ctx, ctx, e)
+				ok, err := a.delete(ctx, ctx, ctx, e)
 				store.beforeDelete = nil
 				if err != nil || !ok || store.calls != before+1 {
 					t.Fatalf("wire result %v %v", ok, err)
@@ -895,7 +928,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					t.Fatal(err)
 				}
 				done := make(chan error, 1)
-				go func() { _, err := a.delete(ctx, ctx, e); done <- err }()
+				go func() { _, err := a.delete(ctx, ctx, ctx, e); done <- err }()
 				deadline := time.Now().Add(3 * time.Second)
 				for {
 					var held bool
@@ -976,7 +1009,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 		done := make(chan error, 1)
-		go func() { _, err := a.delete(ctx, ctx, e); done <- err }()
+		go func() { _, err := a.delete(ctx, ctx, ctx, e); done <- err }()
 		deadline := time.Now().Add(3 * time.Second)
 		for {
 			var waiting bool
@@ -1031,7 +1064,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				if err = stale.QueryRow(ctx, `SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1`, e.Key).Scan(&count); err != nil || count != 0 {
 					t.Fatal(count, err)
 				}
-				if _, err = a.delete(ctx, ctx, e); err != nil {
+				if _, err = a.delete(ctx, ctx, ctx, e); err != nil {
 					t.Fatal(err)
 				}
 				_, err = stale.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`, e.Key)
@@ -1064,7 +1097,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 						exec(copyInsert, e.Key, "blocked", policy)
 						_, err = stale.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) SELECT 'raw',id,bucket,object_key,size_bytes,sha256,repeat('a',64) FROM recording_clips WHERE object_key=$1`, e.Key)
 					} else {
-						if _, err = a.delete(ctx, ctx, e); err != nil {
+						if _, err = a.delete(ctx, ctx, ctx, e); err != nil {
 							t.Fatal(err)
 						}
 						_, err = stale.Exec(ctx, copyInsert, e.Key, admission, policy)
@@ -1404,7 +1437,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					}
 					return nil
 				}
-				_, err := a.delete(timed, ctx, e)
+				_, err := a.delete(timed, ctx, ctx, e)
 				cancel()
 				store.beforeHead = nil
 				if err == nil {
@@ -1585,4 +1618,31 @@ func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*inverseSDKStor
 		t.Fatal(err)
 	}
 	return client, deleted.Load
+}
+
+type failingWriteConn struct {
+	net.Conn
+	err error
+}
+
+func (c failingWriteConn) Write(p []byte) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
+	return len(p), nil
+}
+
+// A lost response needs a request its connection accepted in full and no
+// response byte; a failed write never qualifies, even with nothing read back.
+func TestR2InverseWireLostNeedsAcceptedRequest(t *testing.T) {
+	sent := &inverseWire{}
+	(&inverseWireConn{Conn: failingWriteConn{}, wire: sent}).Write([]byte("DELETE"))
+	failed := &inverseWire{}
+	(&inverseWireConn{Conn: failingWriteConn{err: syscall.EPIPE}, wire: failed}).Write([]byte("DELETE"))
+	answered := &inverseWire{}
+	(&inverseWireConn{Conn: failingWriteConn{}, wire: answered}).Write([]byte("DELETE"))
+	answered.answered.Store(true)
+	if !sent.lost() || failed.lost() || answered.lost() || (&inverseWire{}).lost() {
+		t.Fatalf("lost: sent %v failed %v answered %v unsent %v", sent.lost(), failed.lost(), answered.lost(), (&inverseWire{}).lost())
+	}
 }

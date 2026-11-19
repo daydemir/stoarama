@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"sync/atomic"
@@ -179,32 +180,98 @@ func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDele
 	if err := authority.requireWire(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
 		return err
 	}
-	transport := &inverseDeleteTransport{base: s.transport, authority: authority, bucket: s.Bucket(), endpoint: s.EndpointSHA256()}
+	template, ok := s.transport.(*http.Transport)
+	if !ok {
+		return errors.New("inverse DELETE needs the HTTP/1.1 transport template")
+	}
+	wire := &inverseWire{}
+	transport := &inverseDeleteTransport{base: wire.transport(template), authority: authority, bucket: s.Bucket(), endpoint: s.EndpointSHA256(), wire: wire}
 	_, err := s.sdk.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.Bucket()), Key: aws.String(authority.binding.Key)}, func(o *s3.Options) {
 		o.Retryer = aws.NopRetryer{}
 		o.HTTPClient = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	})
-	if err != nil && transport.connected.Load() && !transport.answered.Load() {
+	if err != nil && wire.lost() {
 		return fmt.Errorf("%w: %w", errInverseWireAmbiguous, err)
 	}
 	return err
 }
 
-// errInverseWireAmbiguous marks a DELETE that got its own connection to the
-// provider and never received a single response byte: the connection dropped
-// while sending or awaiting the answer, or the answer timed out. The request
-// may or may not have reached the provider, so only that key is in doubt: it
-// stays held and is never retransmitted. A veto, a failed dial or TLS
-// handshake, and any response byte at all (403, 503, a cut status line) are
-// never this error and stop the job.
-var errInverseWireAmbiguous = errors.New("DELETE connection dropped before any response; result unknown")
+// errInverseWireAmbiguous marks a DELETE whose request its own connection
+// accepted in full, with no write error, and which then received not one
+// response byte: the connection dropped while awaiting the answer, or the
+// answer timed out. The request may or may not have reached the provider, so
+// only that key is in doubt: it stays held and is never retransmitted. A veto,
+// a failed dial, handshake or write, and any response byte at all (403, 503, a
+// cut status line) are never this error and stop the job.
+var errInverseWireAmbiguous = errors.New("DELETE sent but no response; result unknown")
+
+// inverseWire records what one DELETE's own connection did.
+type inverseWire struct {
+	wrote, writeFailed, answered atomic.Bool
+}
+
+func (w *inverseWire) lost() bool {
+	return w.wrote.Load() && !w.writeFailed.Load() && !w.answered.Load()
+}
+
+// transport clones the template so this DELETE dials its own connection and
+// every byte the HTTP layer writes passes through w. TLS is set up here so the
+// recorder sees request bytes only, never handshake or close alerts.
+func (w *inverseWire) transport(template *http.Transport) *http.Transport {
+	t := template.Clone()
+	t.Proxy = nil
+	dial := t.DialContext
+	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &inverseWireConn{Conn: conn, wire: w}, nil
+	}
+	config := t.TLSClientConfig
+	t.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		raw, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		c := config.Clone()
+		if c.ServerName == "" {
+			if c.ServerName, _, err = net.SplitHostPort(addr); err != nil {
+				raw.Close()
+				return nil, err
+			}
+		}
+		conn := tls.Client(raw, c)
+		if err = conn.HandshakeContext(ctx); err != nil {
+			raw.Close()
+			return nil, err
+		}
+		return &inverseWireConn{Conn: conn, wire: w}, nil
+	}
+	return t
+}
+
+type inverseWireConn struct {
+	net.Conn
+	wire *inverseWire
+}
+
+func (c *inverseWireConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if err != nil || n < len(p) {
+		c.wire.writeFailed.Store(true)
+	} else {
+		c.wire.wrote.Store(true)
+	}
+	return n, err
+}
 
 type inverseDeleteTransport struct {
-	base                http.RoundTripper
-	authority           *inverseDeleteAuthority
-	bucket, endpoint    string
-	attempted           atomic.Bool
-	connected, answered atomic.Bool
+	base             http.RoundTripper
+	authority        *inverseDeleteAuthority
+	bucket, endpoint string
+	attempted        atomic.Bool
+	wire             *inverseWire
 }
 
 func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -216,13 +283,10 @@ func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, e
 	}
 	req.Header.Del("Idempotency-Key")
 	req.Header.Del("X-Idempotency-Key")
-	trace := &httptrace.ClientTrace{
-		GotConn:              func(httptrace.GotConnInfo) { t.connected.Store(true) },
-		GotFirstResponseByte: func() { t.answered.Store(true) },
-	}
+	trace := &httptrace.ClientTrace{GotFirstResponseByte: func() { t.wire.answered.Store(true) }}
 	response, err := t.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
 	if response != nil {
-		t.answered.Store(true)
+		t.wire.answered.Store(true)
 	}
 	return response, err
 }
