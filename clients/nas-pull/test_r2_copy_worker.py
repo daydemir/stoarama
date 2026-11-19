@@ -194,7 +194,7 @@ class R2CopyWorkerTests(unittest.TestCase):
         self.assertEqual(waits, [0, 0, 60])
         logged.assert_any_call("WARN", "R2 copy control HTTP 409; holding")
 
-    def test_only_reviewed_release_advertises_staged_copy_without_dsm_setting(self):
+    def test_worker_omits_legacy_stage_opt_in_for_api_rollback(self):
         for version in ("r2-copy-v6", pull.CLEANUP_CERTIFIED_STITCH_VERSION):
             with self.subTest(version=version):
                 control = mock.MagicMock()
@@ -204,11 +204,11 @@ class R2CopyWorkerTests(unittest.TestCase):
                 stop.wait.side_effect = [False, True]
                 with mock.patch.object(pull, "R2CopyControl", return_value=control), \
                         mock.patch.object(pull, "r2_copy_resources", return_value=10), \
-                        mock.patch.object(pull, "CLIENT_VERSION", version):
+                        mock.patch.object(pull, "CLIENT_VERSION", version), \
+                        mock.patch.dict(os.environ, {"STOARAMA_R2_COPY_STITCH_OUTPUT_ENABLED": "true"}):
                     pull.r2_copy_worker(self.cfg, self.runtime, self.inventory, stop, 0)
                 request = control.request_json.call_args.kwargs["body"]
-                self.assertEqual(request.get("accept_stitch_output", False),
-                                 version == pull.CLEANUP_CERTIFIED_STITCH_VERSION)
+                self.assertNotIn("accept_stitch_output", request)
 
     def test_stop_during_range_releases_reservation_and_preserves_partial(self):
         def stop(cfg, task, offset, length, guard, fd, digest):

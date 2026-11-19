@@ -53617,9 +53617,9 @@ def r2_copy_worker(cfg, runtime, inventory, stop, worker):
             wait = 60
             try:
                 free = r2_copy_resources(cfg, runtime)
+                # The API uses the admitted client version for Durham. Leaving
+                # the old opt-in absent also keeps staged leases off on rollback.
                 request = {"free_bytes": free, "verify_existing": True}
-                if CLIENT_VERSION == CLEANUP_CERTIFIED_STITCH_VERSION:
-                    request["accept_stitch_output"] = True
                 response = control.request_json(R2CopyControlOperation.LEASE, "/account/connections/r2-copy/lease",
                                                 body=request)
                 if response.get("blocked") is True:

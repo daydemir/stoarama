@@ -341,13 +341,16 @@ attempt and part journals survive a worker restart within the lease.
 Ambiguous multipart start or completion keeps the ledger and stage budget
 reserved for controller reconciliation. Keep unknown multipart uploads gated.
 
-Connection 13's `r2-copy-v7-certified-stitch` client advertises staged output
-support. The API grants those leases only while both `NAS_STITCH_ENABLED` and
-`NAS_R2_COPY_ENABLED` are true. `stoaramactl nas-stitch status` reports the
-connection's heartbeat version and effective gate in `durham_copy`. Keep the
-Durham queue enabled until the pilot receipt commits and turn off the API
-stitching switch before reopening the NAS-local lane. The local lane stays idle
-while the Durham queue is enabled or an admitted Durham hour is unfinished.
+The API grants staged output leases to connection 13 on
+`r2-copy-v7-certified-stitch` while both `NAS_STITCH_ENABLED` and
+`NAS_R2_COPY_ENABLED` are true. The client leaves the legacy opt-in out of its
+request, so a rolled-back API can continue raw copies without leasing staged
+outputs. `stoaramactl nas-stitch status` reports the heartbeat version and time,
+server switches and maintenance hold in `durham_copy`. Enable the Durham queue
+before enabling API stitching. The queue blocks new NAS-local leases, and
+Durham waits for existing NAS-local work and outstanding registration to drain.
+Keep the queue enabled until the pilot receipt commits and turn off API stitching
+before pausing the Durham queue.
 It downloads to a private partial, verifies the size and full SHA-256,
 publishes create-only, syncs the file and directory, then reopens and hashes
 the published file before certifying. The last exact output receipt commits

@@ -26,6 +26,10 @@ const nasStitchRevision = "v85r-rebuilt-1"
 const nasStitchCorpusSHA = "5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b"
 const nasStitchReason = "stitched_included"
 const nasStitchFence int64 = 7343226011110
+
+const nasLocalStitchInFlightSQL = `EXISTS(SELECT 1 FROM nas_stitch_tasks
+ WHERE (state='leased' AND lease_expires_at>clock_timestamp())
+ OR (state='verified' AND cleanup_plan_id IS NULL AND registration_abandoned_at IS NULL))`
 const nasStitchMaxBytes int64 = 2500000000
 
 type nasStitchEdge struct {
@@ -284,7 +288,7 @@ func (s *Server) handleAdminNASStitchPause(w http.ResponseWriter, r *http.Reques
 func (s *Server) handleAdminNASStitchStatus(w http.ResponseWriter, r *http.Request) {
 	var raw []byte
 	err := s.pool.QueryRow(r.Context(), `WITH client AS (
- SELECT client_version,nas_stitch_status FROM connections WHERE id=13
+ SELECT client_version,last_seen_at,nas_stitch_status FROM connections WHERE id=13
 )
 SELECT jsonb_build_object('policy','v85r','revision','v85r-rebuilt-1',
  'scopes',coalesce((SELECT jsonb_agg(s ORDER BY id) FROM nas_stitch_scopes s),'[]'),
@@ -296,8 +300,9 @@ SELECT jsonb_build_object('policy','v85r','revision','v85r-rebuilt-1',
   FROM nas_stitch_tasks ORDER BY awaiting_receipt DESC,id DESC LIMIT 100) t),'[]'),
  'client',(SELECT nas_stitch_status FROM client),
  'durham_copy',jsonb_build_object('control','server','client_version',(SELECT client_version FROM client),
-  'enabled',$1::boolean AND coalesce((SELECT client_version=$2 FROM client),false)))`,
-		s.nasR2StitchCopyEnabled(nasCleanupCertifiedStitchVersion), nasCleanupCertifiedStitchVersion).Scan(&raw)
+  'last_seen_at',(SELECT last_seen_at FROM client),'server_enabled',$1::boolean,
+  'maintenance_active',EXISTS(SELECT 1 FROM nas_cleanup_maintenance WHERE active)))`,
+		s.nasR2StitchCopyEnabled(nasCleanupCertifiedStitchVersion)).Scan(&raw)
 	if err != nil {
 		util.WriteError(w, 500, "stitch status unavailable")
 		return
@@ -343,11 +348,9 @@ func (s *Server) handleAccountNASStitchLease(w http.ResponseWriter, r *http.Requ
 	var busy bool
 	// One lane across clients and reboots. Wait for the durable receipt after
 	// result acceptance. Legacy plans already passed that gate and stay intact.
-	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_tasks
- WHERE (state='leased' AND lease_expires_at>now()) OR (state='verified' AND cleanup_plan_id IS NULL AND registration_abandoned_at IS NULL))
+	err = tx.QueryRow(ctx, `SELECT `+nasLocalStitchInFlightSQL+`
  OR EXISTS(SELECT 1 FROM nas_cleanup_frozen_streams)
- OR EXISTS(SELECT 1 FROM nas_stitch_r2_control WHERE enabled)
- OR EXISTS(SELECT 1 FROM nas_stitch_r2_hours WHERE state<>'certified')`).Scan(&busy)
+ OR EXISTS(SELECT 1 FROM nas_stitch_r2_control WHERE enabled)`).Scan(&busy)
 	if err != nil {
 		util.WriteError(w, 500, "stitch lane lookup failed")
 		return

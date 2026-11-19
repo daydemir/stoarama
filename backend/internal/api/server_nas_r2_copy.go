@@ -268,6 +268,7 @@ func nasR2CopyReady(ctx context.Context, tx pgx.Tx) error {
 }
 
 type nasR2CopyControl struct {
+	// Decode the former client flag for compatibility. Admission uses the verified client version.
 	AcceptStitch    bool                 `json:"accept_stitch_output,omitempty"`
 	StitchReceipt   *nasR2StitchReceipt  `json:"stitch_receipt,omitempty"`
 	VerifyExisting  bool                 `json:"verify_existing"`
@@ -356,7 +357,7 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	version, _ := nasRequestWorkVersion(r, nasConnectionCopy)
-	stitch := req.AcceptStitch && s.nasR2StitchCopyEnabled(version)
+	stitch := s.nasR2StitchCopyEnabled(version)
 	// A concurrent grant can consume the prepared row. Retry a bounded number
 	// of candidates without making the client hold for a normal admission race.
 	for attempt := 0; attempt < NASR2CopyWorkers; attempt++ {

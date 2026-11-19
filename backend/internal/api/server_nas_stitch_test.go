@@ -95,8 +95,7 @@ CREATE TABLE IF NOT EXISTS account_api_keys(
  last_used_at timestamptz, updated_at timestamptz
 );
 CREATE TABLE nas_stitch_r2_control(enabled boolean NOT NULL);
-INSERT INTO nas_stitch_r2_control VALUES(false);
-CREATE TABLE nas_stitch_r2_hours(state text NOT NULL);`); err != nil {
+INSERT INTO nas_stitch_r2_control VALUES(false);`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.pool.Exec(f.ctx, `INSERT INTO account_api_keys(id,account_id,secret_hash,scopes)
