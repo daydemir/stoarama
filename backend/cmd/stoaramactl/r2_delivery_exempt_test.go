@@ -20,8 +20,12 @@ import (
 const exemptRepairKey = "experimental/stitching-confident-repairs/20261009/30/" + nonrawOutputSHA + "/30_hour_01_parts_01_02_v799.mp4"
 
 func (f *nonrawFixture) pageHold(key, etag, kind string, size int64) {
+	f.pageHoldSHA(key, etag, kind, size, nonrawOutputSHA)
+}
+
+func (f *nonrawFixture) pageHoldSHA(key, etag, kind string, size int64, sha string) {
 	f.exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,recording_id,kind,sha256,relative_path)
- VALUES('stoarama',$1,$2,$3,30,$4,$5,'30_nonraw/June/Monday/30_hour_01_part_01.mp4')`, key, etag, size, kind, nonrawOutputSHA)
+ VALUES('stoarama',$1,$2,$3,30,$4,$5,'30_nonraw/June/Monday/30_hour_01_part_01.mp4')`, key, etag, size, kind, sha)
 }
 
 // withPageKeys adds the two page keys the lane tests retire: the catalog output
@@ -117,10 +121,11 @@ func TestR2NonrawExemptionAdmitsOnlyExactIdentity(t *testing.T) {
 func TestR2NonrawExemptionClassGates(t *testing.T) {
 	f := newNonrawFixture(t, "exempt_gates")
 	f.withPageKeys()
-	inWindow := "joined/goodplus-20260821-generation-1/objects/" + nonrawOutputSHA + "-in.mp4"
-	f.pageHold(inWindow, "in-etag", "video_collated", 300)
+	inSHA := strings.Repeat("e", 64)
+	inWindow := "joined/goodplus-20260821-generation-1/objects/" + inSHA + ".mp4"
+	f.pageHoldSHA(inWindow, "in-etag", "video_collated", 300, inSHA)
 	f.fixture(`INSERT INTO recording_collation_outputs(id,collation_hour_id,part,parts,object_key,nas_relative_path,size_bytes,sha256,start_at,end_at,source_clip_ids,r2_verified_at)
- VALUES(10000003,1,3,3,$1,'nightly/in.mp4',300,$2,'2026-06-01','2026-06-01 00:01:00',ARRAY[7000001]::bigint[],'2026-06-02T00:00:00Z')`, inWindow, nonrawOutputSHA)
+ VALUES(10000003,1,3,3,$1,'nightly/in.mp4',300,$2,'2026-06-01','2026-06-01 00:01:00',ARRAY[7000001]::bigint[],'2026-06-02T00:00:00Z')`, inWindow, inSHA)
 	f.mustSeed(t, deliveryExemptOutsideWindow, collatedRow(f))
 	f.mustSeed(t, deliveryExemptConfidentRepair, repairRow())
 	f.mustSeed(t, deliveryExemptInWindow, deliveryExemptionRow{Bucket: "stoarama", ObjectKey: inWindow, ETag: "in-etag", SizeBytes: 300})
@@ -145,9 +150,9 @@ func TestR2NonrawExemptionClassGates(t *testing.T) {
  RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT p_output_id=%d AND p_bucket='stoarama' AND p_key='%s' AND p_etag='%s' AND p_size=%d AND p_sha256='%s' $$`, output, inWindow, etag, size, sha))
 	}
 	for _, wrong := range []func(){
-		func() { certify(f.outputID, "in-etag", 300, nonrawOutputSHA) },
-		func() { certify(10000003, "other", 300, nonrawOutputSHA) },
-		func() { certify(10000003, "in-etag", 301, nonrawOutputSHA) },
+		func() { certify(f.outputID, "in-etag", 300, inSHA) },
+		func() { certify(10000003, "other", 300, inSHA) },
+		func() { certify(10000003, "in-etag", 301, inSHA) },
 		func() { certify(10000003, "in-etag", 300, strings.Repeat("c", 64)) },
 	} {
 		wrong()
@@ -155,7 +160,7 @@ func TestR2NonrawExemptionClassGates(t *testing.T) {
 			t.Fatal("in_window opened on a mismatched NAS certificate")
 		}
 	}
-	certify(10000003, "in-etag", 300, nonrawOutputSHA)
+	certify(10000003, "in-etag", 300, inSHA)
 	if !f.exempt(t, inWindow) {
 		t.Fatal("in_window stayed closed with the page down and NAS custody")
 	}

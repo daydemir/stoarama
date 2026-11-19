@@ -122,6 +122,8 @@ func (f *nonrawFixture) fixture(query string, args ...any) {
 	if err != nil {
 		panic(err)
 	}
+	// Release the connection on a failed fixture, or pool cleanup hangs.
+	defer tx.Rollback(f.ctx)
 	if _, err = tx.Exec(f.ctx, `SET LOCAL session_replication_role=replica`); err != nil {
 		panic(err)
 	}
