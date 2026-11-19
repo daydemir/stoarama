@@ -57,7 +57,8 @@ CREATE TRIGGER delivery_source_coverage_clips_no_truncate
  FOR EACH STATEMENT EXECUTE FUNCTION reject_delivery_source_coverage_mutation();
 
 -- Bind the latest complete observation to current raw and output identities.
--- An ambiguous duplicate collation candidate or newer failed result withholds
+-- Run IDs are reserved before media verification starts. An ambiguous
+-- duplicate collation candidate or newer failed result withholds
 -- evidence. Historical delivery holds may be withdrawn after a separate
 -- handoff, so the durable custody check uses the exact approval and readback.
 CREATE VIEW delivery_source_coverage_certified AS
@@ -93,4 +94,11 @@ WHERE p.proven
       OR (retired.bucket=selected.bucket AND retired.object_key=selected.object_key))
     AND ROW(retired.kind,retired.source_id,retired.bucket,retired.object_key,retired.sha256,retired.size_bytes)
      IS DISTINCT FROM ROW('collated'::text,o.id,selected.bucket,selected.object_key,selected.sha256,selected.size_bytes)
+ )
+ AND NOT EXISTS (
+  SELECT 1 FROM r2_object_retirements retired
+  WHERE ((retired.kind='raw' AND retired.source_id=p.clip_id)
+      OR (retired.bucket=p.bucket AND retired.object_key=p.object_key))
+    AND ROW(retired.kind,retired.source_id,retired.bucket,retired.object_key,retired.sha256,retired.size_bytes)
+     IS DISTINCT FROM ROW('raw'::text,p.clip_id,p.bucket,p.object_key,p.sha256,p.size_bytes)
  );

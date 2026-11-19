@@ -368,7 +368,15 @@ func parseDeliveryCoverageReport(raw []byte, target deliveryCoverageTarget) (del
 	return report, nil
 }
 
-func storeDeliveryCoverage(ctx context.Context, tx pgx.Tx, target deliveryCoverageTarget, report deliveryCoverageReport, raw []byte) error {
+// Reserve precedence before reading or verifying media. A slower earlier run
+// can append its evidence later without superseding a newer observation.
+func reserveDeliveryCoverageRun(ctx context.Context, q r2RetireQuerier) (int64, error) {
+	var id int64
+	err := q.QueryRow(ctx, `SELECT nextval(pg_get_serial_sequence('delivery_source_coverage_runs','id'))`).Scan(&id)
+	return id, err
+}
+
+func storeDeliveryCoverage(ctx context.Context, tx pgx.Tx, runID int64, target deliveryCoverageTarget, report deliveryCoverageReport, raw []byte) error {
 	current, err := readDeliveryCoverageTarget(ctx, tx, target.OutputID)
 	if err != nil {
 		return err
@@ -381,14 +389,14 @@ func storeDeliveryCoverage(ctx context.Context, tx pgx.Tx, target deliveryCovera
 		!slices.Equal(current.SourceIDs, target.SourceIDs) {
 		return errors.New("delivery catalog changed while proving coverage")
 	}
-	var runID int64
-	err = tx.QueryRow(ctx, `
- INSERT INTO delivery_source_coverage_runs(output_id,collation_hour_id,source_clip_ids,manifest_object_key,manifest_sha256,
+	_, err = tx.Exec(ctx, `
+ INSERT INTO delivery_source_coverage_runs(id,output_id,collation_hour_id,source_clip_ids,manifest_object_key,manifest_sha256,
   hour_id,batch_id,part,parts,output_start_at,output_end_at,evidence_sha256,media_evidence)
- VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
-		target.OutputID, target.CollationHourID, target.SourceIDs, target.ManifestKey, target.ManifestSHA,
+ OVERRIDING SYSTEM VALUE
+ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+		runID, target.OutputID, target.CollationHourID, target.SourceIDs, target.ManifestKey, target.ManifestSHA,
 		target.HourID, target.BatchID, target.Output.Part, target.Output.Parts, target.Start, target.End,
-		fmt.Sprintf("%x", sha256.Sum256(raw)), raw).Scan(&runID)
+		fmt.Sprintf("%x", sha256.Sum256(raw)), raw)
 	if err != nil {
 		return err
 	}
@@ -443,6 +451,13 @@ func deliveryCoverageCommand(ctx context.Context, cfg config.Config, output int6
 	if err != nil {
 		return err
 	}
+	var runID int64
+	if record {
+		runID, err = reserveDeliveryCoverageRun(ctx, pool)
+		if err != nil {
+			return err
+		}
+	}
 	if fetch {
 		archive := archiveR2Config(cfg, nil)
 		archive.UserAgent = "stoarama-operator/1"
@@ -475,7 +490,7 @@ func deliveryCoverageCommand(ctx context.Context, cfg config.Config, output int6
 			return err
 		}
 		defer tx.Rollback(ctx)
-		if err := storeDeliveryCoverage(ctx, tx, target, report, raw); err != nil {
+		if err := storeDeliveryCoverage(ctx, tx, runID, target, report, raw); err != nil {
 			return err
 		}
 		if err := tx.Commit(ctx); err != nil {

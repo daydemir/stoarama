@@ -77,7 +77,15 @@ func TestDeliverySourceCoverageRequiresLatestProofAndExactNASReadback(t *testing
 	report := deliveryCoverageReport{SchemaVersion: 1, ManifestSHA: target.ManifestSHA, HourID: target.HourID,
 		BatchID: target.BatchID, Output: target.Output, VerifierSHA: deliveryCoverageVerifierSHA,
 		SupportSHA: deliveryCoverageSupportSHA, FFmpegSHA: deliveryCoverageFFmpegSHA, FFprobeSHA: deliveryCoverageFFprobeSHA}
-	record := func(row deliveryCoverageObservation) error {
+	reserve := func() int64 {
+		t.Helper()
+		id, err := reserveDeliveryCoverageRun(ctx, pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	record := func(runID int64, row deliveryCoverageObservation) error {
 		t.Helper()
 		report.Sources = []deliveryCoverageObservation{row}
 		raw, err := json.Marshal(report)
@@ -93,14 +101,14 @@ func TestDeliverySourceCoverageRequiresLatestProofAndExactNASReadback(t *testing
 			t.Fatal(err)
 		}
 		defer tx.Rollback(ctx)
-		if err := storeDeliveryCoverage(ctx, tx, target, parsed, raw); err != nil {
+		if err := storeDeliveryCoverage(ctx, tx, runID, target, parsed, raw); err != nil {
 			return err
 		}
 		return tx.Commit(ctx)
 	}
 	write := func(row deliveryCoverageObservation) {
 		t.Helper()
-		if err := record(row); err != nil {
+		if err := record(reserve(), row); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -148,7 +156,7 @@ func TestDeliverySourceCoverageRequiresLatestProofAndExactNASReadback(t *testing
 	} {
 		execSQL(drift.change)
 		want(0)
-		if err := record(row); err == nil || !strings.Contains(err.Error(), "catalog changed") {
+		if err := record(reserve(), row); err == nil || !strings.Contains(err.Error(), "catalog changed") {
 			t.Fatalf("recording did not reject catalog drift after %s: %v", drift.change, err)
 		}
 		execSQL(drift.restore)
@@ -171,9 +179,24 @@ func TestDeliverySourceCoverageRequiresLatestProofAndExactNASReadback(t *testing
 	want(0)
 	execSQL("DELETE FROM r2_object_retirements")
 	want(1)
+	execSQL(`INSERT INTO r2_object_retirements
+	 SELECT 'raw',id,bucket,object_key,sha256,size_bytes FROM recording_clips WHERE id=5`)
+	want(1)
+	execSQL("UPDATE r2_object_retirements SET size_bytes=87")
+	want(0)
+	execSQL("UPDATE r2_object_retirements SET size_bytes=88,source_id=6")
+	want(0)
+	execSQL("DELETE FROM r2_object_retirements")
+	want(1)
+
 	passed := row
+	earlier := reserve()
 	row.Verdict, row.Tracks, row.Reason = deliveryCoverageUnproven, nil, "visible audio mismatch"
 	write(row)
+	want(0)
+	if err := record(earlier, passed); err != nil {
+		t.Fatal(err)
+	}
 	want(0)
 	write(passed)
 	want(1)
