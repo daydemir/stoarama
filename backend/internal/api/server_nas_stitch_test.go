@@ -88,12 +88,26 @@ func TestNASStitchResultRequiresCompleteExactInclusion(t *testing.T) {
 }
 func stitchMigration(t *testing.T, f *cleanupFixture) {
 	t.Helper()
-	b, err := os.ReadFile("../../../infra/sql/migrations/0179_nas_v85r_stitch.sql")
-	if err != nil {
+	if _, err := f.pool.Exec(f.ctx, `
+CREATE TABLE IF NOT EXISTS account_api_keys(
+ id bigserial PRIMARY KEY, account_id bigint NOT NULL, key_prefix text, secret_hash text,
+ label text, scopes text[], revoked_at timestamptz, expires_at timestamptz,
+ last_used_at timestamptz, updated_at timestamptz
+);`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = f.pool.Exec(f.ctx, string(b)); err != nil {
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO account_api_keys(id,account_id,secret_hash,scopes)
+ VALUES(5,47,$1,ARRAY['stoarama.pull']) ON CONFLICT(id) DO NOTHING`, hashSecret("fixture-key")); err != nil {
 		t.Fatal(err)
+	}
+	for _, file := range []string{"0179_nas_v85r_stitch.sql", "0215_nas_stitch_lease_key.sql"} {
+		b, err := os.ReadFile("../../../infra/sql/migrations/" + file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = f.pool.Exec(f.ctx, string(b)); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 func newNASStitchTaskFixture(t *testing.T) (*cleanupFixture, nasStitchPlan, nasStitchResult) {

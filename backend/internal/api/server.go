@@ -472,6 +472,8 @@ func (s *Server) router() http.Handler {
 			admin.Post("/accounts/{id}/demote-admin", s.handleAdminAccountDemote)
 			admin.Get("/accounts/{id}/api-keys", s.handleAdminAccountAPIKeys)
 			admin.Post("/api-keys/{id}/revoke", s.handleAdminAPIKeyRevoke)
+			admin.Post("/nas-stitch/key", s.handleAdminNASStitchKeyMint)
+			admin.Post("/nas-stitch/{id}/abandon-registration", s.handleAdminNASStitchAbandonRegistration)
 			admin.Get("/storage-destinations", s.handleAdminStorageDestinationsList)
 			admin.Post("/storage-destinations", s.handleAdminStorageDestinationCreate)
 			admin.Delete("/storage-destinations/{id}", s.handleAdminStorageDestinationDelete)

@@ -85,7 +85,7 @@ func pullPathAllowed(method, path string) bool {
 		return true
 	// Admit only the NAS stitch protocol; handlers retain connection, scope,
 	// lease, source-freeze and independent deletion authorization checks.
-	case method == http.MethodPost && (path == "/api/v1/account/connections/stitch/lease" || pullStitchTaskRe.MatchString(path)):
+	case nasStitchKeyPathAllowed(method, path):
 		return true
 	case method == http.MethodGet && (path == "/api/v1/account/connections/stitch/proof" || path == "/api/v1/account/connections/stitch/corpus" || path == "/api/v1/account/connections/stitch/tools/ffmpeg" || path == "/api/v1/account/connections/stitch/tools/ffprobe"):
 		return true

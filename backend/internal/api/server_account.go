@@ -23,11 +23,14 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
+type accountAPIKeyScope string
+
 const (
-	accountScopeRead  = "stoarama.read"
-	accountScopePull  = "stoarama.pull"
-	accountRoleMember = "member"
-	accountRoleAdmin  = "admin"
+	accountScopeRead                         = "stoarama.read"
+	accountScopePull                         = "stoarama.pull"
+	accountScopeNASStitch accountAPIKeyScope = "stoarama.nas_stitch"
+	accountRoleMember                        = "member"
+	accountRoleAdmin                         = "admin"
 )
 
 type accountPrincipal struct {
@@ -163,7 +166,14 @@ func (s *Server) authenticateAccountRequest(r *http.Request) (accountPrincipal, 
 	if got := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(got, "Bearer ") {
 		token := strings.TrimSpace(strings.TrimPrefix(got, "Bearer "))
 		if token != "" {
-			return s.lookupAccountAPIKey(r.Context(), token)
+			principal, err := s.lookupAccountAPIKey(r.Context(), token)
+			if err != nil {
+				return accountPrincipal{}, err
+			}
+			if isNASStitchKey(principal) && (!validNASStitchKey(principal) || !nasStitchKeyPathAllowed(r.Method, r.URL.Path)) {
+				return accountPrincipal{}, errors.New("stitch key is limited to the ordinary NAS stitch routes")
+			}
+			return principal, nil
 		}
 	}
 	if c, err := r.Cookie(accountSessionCookie); err == nil {
@@ -233,19 +243,28 @@ func (s *Server) lookupAccountSession(ctx context.Context, raw string) (accountP
 
 func (s *Server) lookupAccountAPIKey(ctx context.Context, raw string) (accountPrincipal, error) {
 	hash := hashSecret(raw)
+	stitchHash := nasStitchKeyHashPrefix + hash
 	var p accountPrincipal
 	var keyID int64
+	var dedicatedHash bool
 	err := s.pool.QueryRow(ctx, `
-		SELECT a.id, a.email, a.name, a.role, k.id, k.scopes
+		SELECT a.id, a.email, a.name, a.role, k.id, k.scopes, k.secret_hash=$2
 		FROM account_api_keys k
 		JOIN accounts a ON a.id=k.account_id
-		WHERE k.secret_hash=$1
+		WHERE k.secret_hash IN ($1,$2)
 		  AND k.revoked_at IS NULL
 		  AND (k.expires_at IS NULL OR k.expires_at > now())
 		  AND a.status='active'
-	`, hash).Scan(&p.AccountID, &p.Email, &p.Name, &p.Role, &keyID, &p.KeyScopes)
+	`, hash, stitchHash).Scan(&p.AccountID, &p.Email, &p.Name, &p.Role, &keyID, &p.KeyScopes, &dedicatedHash)
 	if err != nil {
 		return accountPrincipal{}, err
+	}
+	if len(p.KeyScopes) != 1 {
+		return accountPrincipal{}, errors.New("invalid stored account key scope")
+	}
+	scope := accountAPIKeyScope(p.KeyScopes[0])
+	if !scope.valid() || dedicatedHash != (scope == accountScopeNASStitch) {
+		return accountPrincipal{}, errors.New("invalid stored account key scope or hash format")
 	}
 	p.AuthType = "api_key"
 	p.APIKeyID = &keyID
@@ -761,16 +780,33 @@ type accountAPIKeyMinter interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
+func (scope accountAPIKeyScope) valid() bool {
+	switch scope {
+	case accountScopeRead, accountScopePull, accountScopeNASStitch:
+		return true
+	default:
+		return false
+	}
+}
+
 // mintAccountAPIKey generates a sir_ token, stores its hash under the given single
 // scope, and returns (keyID, key_prefix, token). The token is shown ONCE by the
 // caller and never persisted in cleartext. The caller writes the audit event.
-func mintAccountAPIKey(ctx context.Context, q accountAPIKeyMinter, accountID int64, label, scope string, expiresAt *time.Time) (int64, string, string, error) {
+func mintAccountAPIKey(ctx context.Context, q accountAPIKeyMinter, accountID int64, label string, scope accountAPIKeyScope, expiresAt *time.Time) (int64, string, string, error) {
+	if !scope.valid() {
+		return 0, "", "", errors.New("unsupported account API key scope")
+	}
 	rawKey, err := generateSecret(36)
 	if err != nil {
 		return 0, "", "", fmt.Errorf("generate api key: %w", err)
 	}
 	token := "sir_" + rawKey
 	hash := hashSecret(token)
+	if scope == accountScopeNASStitch {
+		// The old API looks up only the raw token's hex digest. A dedicated
+		// key must remain unrecognizable to it during a rollback.
+		hash = nasStitchKeyHashPrefix + hash
+	}
 	prefix := token
 	if len(prefix) > 16 {
 		prefix = prefix[:16]
@@ -780,7 +816,7 @@ func mintAccountAPIKey(ctx context.Context, q accountAPIKeyMinter, accountID int
 		INSERT INTO account_api_keys (account_id, key_prefix, secret_hash, label, scopes, expires_at)
 		VALUES ($1, $2, $3, $4, ARRAY[$5]::text[], $6)
 		RETURNING id
-	`, accountID, prefix, hash, label, scope, expiresAt).Scan(&keyID); err != nil {
+	`, accountID, prefix, hash, label, string(scope), expiresAt).Scan(&keyID); err != nil {
 		return 0, "", "", err
 	}
 	return keyID, prefix, token, nil
