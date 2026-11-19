@@ -47,6 +47,11 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Bind the approved digest to the bytes the partition actually read; every
+	// apply re-reads the picks file and must match this summary digest.
+	if sum.PicksSHA256 != *picksSHA {
+		log.Fatal("partition read owner picks other than the approved digest")
+	}
 	printInverseJob(map[string]any{"step": "partition", "summary": sum})
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
