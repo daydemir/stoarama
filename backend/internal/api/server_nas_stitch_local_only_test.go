@@ -6,6 +6,26 @@ import (
 	"testing"
 )
 
+func TestNASStitchCheckpointReleasesOnlyTheMatchingLease(t *testing.T) {
+	f, _, q := newNASStitchTaskFixture(t)
+	f.s.cfg.NASStitchEnabled = true
+	release := func(token string) int {
+		body := map[string]any{"lease_token": token, "plan_sha256": q.PlanSHA, "release": true}
+		return cleanupCall(t, f.s.handleAccountNASStitchCheckpoint, 47, 5, "id", "7", body).Code
+	}
+	if release("wrong") != 409 || release(q.Token) != 200 || release(q.Token) != 409 {
+		t.Fatal("lease release accepted stale identity or refused the active attempt")
+	}
+	w := cleanupCall(t, f.s.handleAccountNASStitchLease, 47, 5, "", "", nil)
+	var lease struct {
+		Task *nasStitchTask `json:"task"`
+	}
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &lease) != nil || lease.Task == nil ||
+		lease.Task.ID != 7 || lease.Task.PlanSHA != q.PlanSHA || lease.Task.Token == q.Token {
+		t.Fatalf("exact hour was not reissued with a fresh token: %s", w.Body.String())
+	}
+}
+
 // The NAS stitch client always reports retirement_held=true for every input
 // (owner rule: keep28 raw on the NAS is never deleted because of stitching).
 // That sends readiness to completed_no_retirement, so the single lane is never

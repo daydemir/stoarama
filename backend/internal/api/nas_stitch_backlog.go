@@ -75,9 +75,11 @@ func NASStitchBacklog(ctx context.Context, q nasStitchBacklogQuerier) (NASStitch
 	}
 	entries := make(map[int64]*NASStitchBacklogStream)
 	ids := make([]int64, 0, len(windows))
+	scopeIDs := make([]int64, 0, len(windows))
 	starts, ends := make([]time.Time, 0, len(windows)), make([]time.Time, 0, len(windows))
 	for _, w := range windows {
 		ids, starts, ends = append(ids, w.streamID), append(starts, w.start), append(ends, w.end)
+		scopeIDs = append(scopeIDs, w.scopeID)
 		e := entries[w.streamID]
 		if e == nil {
 			e = &NASStitchBacklogStream{StreamID: w.streamID, WindowSource: source, WindowFrom: w.start.UTC(), WindowTo: w.end.UTC()}
@@ -96,20 +98,23 @@ func NASStitchBacklog(ctx context.Context, q nasStitchBacklogQuerier) (NASStitch
 
 	rows, err := q.Query(ctx, `
 WITH w AS (
- SELECT DISTINCT stream_id,start_at,end_at
- FROM unnest($3::bigint[],$4::timestamptz[],$5::timestamptz[]) AS windows(stream_id,start_at,end_at)
+ SELECT stream_id,start_at,end_at,scope_id
+ FROM unnest($3::bigint[],$4::timestamptz[],$5::timestamptz[],$6::bigint[]) AS windows(stream_id,start_at,end_at,scope_id)
 ), scoped AS (
- SELECT s.stream_id,r.id AS recording_id,date_trunc('hour',c2.clip_start_at) AS hour_at,
+ SELECT s.stream_id,s.scope_id,r.id AS recording_id,date_trunc('hour',c2.clip_start_at) AS hour_at,
         bool_and(n2.clip_id IS NOT NULL) AS nas_present,
         (`+nasStitchHourBoundsSQL+`) AS bounded,
-        sum(c2.size_bytes) AS bytes
+        sum(c2.size_bytes) AS bytes,
+        min(c2.clip_start_at) AS first_clip_start,
+        (array_agg(c2.id ORDER BY c2.clip_start_at,c2.id))[1] AS first_clip_id
  FROM w s JOIN recordings r ON r.stream_id=s.stream_id AND r.account_id=47
  JOIN recording_clips c2 ON c2.recording_id=r.id AND c2.clip_start_at>=s.start_at AND c2.clip_end_at<=s.end_at
  LEFT JOIN nas_inventory_files n2 ON `+nasStitchExactNASInventorySQL+`
- GROUP BY s.stream_id,s.start_at,s.end_at,r.id,date_trunc('hour',c2.clip_start_at)
+ GROUP BY s.stream_id,s.scope_id,s.start_at,s.end_at,r.id,date_trunc('hour',c2.clip_start_at)
 ), hours AS (
  SELECT stream_id,recording_id,hour_at,bool_or(nas_present) AS nas_present,
-        max(bytes) FILTER(WHERE nas_present AND bounded) AS ready_bytes
+        (array_agg(bytes ORDER BY first_clip_start,first_clip_id,scope_id)
+         FILTER(WHERE nas_present AND bounded))[1] AS ready_bytes
  FROM scoped GROUP BY stream_id,recording_id,hour_at
 ), by_state AS (
  SELECT h.stream_id,t.state,count(*) AS hours
@@ -124,9 +129,9 @@ SELECT s.stream_id,
  EXISTS(SELECT 1 FROM nas_cleanup_frozen_streams)
 FROM (SELECT DISTINCT stream_id FROM w) s
 LEFT JOIN hours h ON h.stream_id=s.stream_id
- AND NOT EXISTS(SELECT 1 FROM nas_cleanup_frozen_streams f WHERE f.stream_id=h.stream_id)
+ AND NOT EXISTS(SELECT 1 FROM nas_cleanup_frozen_streams)
 LEFT JOIN nas_stitch_tasks t USING(recording_id,hour_at)
-GROUP BY s.stream_id ORDER BY s.stream_id`, nasStitchMaxClips, nasStitchMaxBytes, ids, starts, ends)
+GROUP BY s.stream_id ORDER BY s.stream_id`, nasStitchMaxClips, nasStitchMaxBytes, ids, starts, ends, scopeIDs)
 	if err != nil {
 		return report, err
 	}

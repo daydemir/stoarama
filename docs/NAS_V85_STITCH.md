@@ -160,8 +160,9 @@ Defaults are exactly the previously hard-coded values, so an unset environment
 behaves as before. A non-numeric, non-finite or non-positive value fails the
 process at startup with a clear error; there is no silent fallback to the
 default. Both variables govern the pre-lease check and the refresh, so a running
-job is re-evaluated under the configured limits. A resource hold is never
-reported as a task result: it releases the lease and retries later.
+job is re-evaluated under the configured limits. A resource hold returns the
+exact lease through the checkpoint endpoint before retrying. A failed return
+leaves the original lease expiry in force.
 
 ## One-stream pilot procedure (operator action after review)
 

@@ -160,6 +160,14 @@ class MediaCertificationError(RuntimeError):
     pass
 
 
+class MediaCertificationResourceError(MediaCertificationError):
+    """The source changed during observation and needs a fresh read."""
+
+
+class CleanupSidecarDataError(RuntimeError):
+    """Stable sidecar bytes cannot represent the frozen source."""
+
+
 class ToolProcessError(MediaCertificationError):
     """Bounded, private subprocess evidence; its raw stderr is never reported."""
     def __init__(self, returncode, stderr):
@@ -2770,7 +2778,8 @@ class CleanupFile:
                 if n:
                     sidecar_bytes += block
                     if len(sidecar_bytes) > 1024 * 1024:
-                        raise RuntimeError("cleanup sidecar exceeds bound")
+                        self.check_paths()
+                        raise CleanupSidecarDataError("cleanup sidecar exceeds bound")
             hashes.append(digest.hexdigest())
             if md5 is not None:
                 self.media_md5 = md5.hexdigest()
@@ -2783,16 +2792,21 @@ class CleanupFile:
         proof = {"root": self.root_identity, "ancestors": self.ancestors, "identity": self.item["frozen_identity"],
                  "sha256": hashes[0], "parent_members_sha256": before_members}
         if self.item["sidecar_required"]:
-            sidecar = json.loads(sidecar_bytes)
+            try:
+                sidecar = json.loads(sidecar_bytes)
+            except (ValueError, RecursionError) as exc:
+                raise CleanupSidecarDataError("cleanup sidecar JSON is invalid") from exc
             binding = {"clip_id": self.item["source_id"], "recording_id": self.item["recording_id"],
                        "relative_path": self.item["relative_path"], "size_bytes": self.item["size_bytes"], "sha256": self.item["sha256"]}
-            if type(sidecar.get("schema_version")) is not int or sidecar["schema_version"] not in (1, 2) or any(type(sidecar.get(k)) is not type(v) or sidecar[k] != v for k, v in binding.items()):
-                raise RuntimeError("cleanup sidecar does not bind exact source identity")
+            if (not isinstance(sidecar, dict) or type(sidecar.get("schema_version")) is not int
+                    or sidecar["schema_version"] not in (1, 2)
+                    or any(type(sidecar.get(k)) is not type(v) or sidecar[k] != v for k, v in binding.items())):
+                raise CleanupSidecarDataError("cleanup sidecar does not bind exact source identity")
             for field in ("clip_start_at", "clip_end_at"):
                 actual = parse_certification_timestamp(sidecar.get(field), field)
                 expected = parse_certification_timestamp(self.item["start_at" if field == "clip_start_at" else "end_at"], field)
                 if actual != expected:
-                    raise RuntimeError("cleanup sidecar registered interval differs from catalog")
+                    raise CleanupSidecarDataError("cleanup sidecar registered interval differs from catalog")
                 binding[field] = expected.isoformat()
             proof["sidecar"] = {"identity": self.item["frozen_sidecar_identity"], "sha256": hashes[1], "binding": binding}
         self.stage_timings["proof_ms"] = (time.monotonic() - started) * 1000
@@ -19357,7 +19371,7 @@ def hash_certification_file(root, relative_path, expected_size, expected_sha):
     try:
         opened_before = os.fstat(descriptor)
         if certification_identity(opened_before) != certification_identity(path_before):
-            raise MediaCertificationError("media identity changed before hashing")
+            raise MediaCertificationResourceError("media identity changed before hashing")
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
             if not chunk:
@@ -19373,7 +19387,7 @@ def hash_certification_file(root, relative_path, expected_size, expected_sha):
         or certification_identity(opened_after) != certification_identity(path_after)
         or actual_size != path_after.st_size
     ):
-        raise MediaCertificationError("media identity changed while hashing")
+        raise MediaCertificationResourceError("media identity changed while hashing")
     actual_sha = digest.hexdigest()
     if actual_size != expected_size or actual_sha != expected_sha:
         raise MediaCertificationError("media bytes do not match the sidecar")
@@ -19953,7 +19967,7 @@ def hash_certification_file_cancellable(root, relative_path, expected_size, expe
         if certification_identity(opened_before) != certification_identity(opened_after) or certification_identity(opened_after) != certification_identity(path_after):
             raise MediaCertificationError("media identity changed while hashing")
         if certification_identity(parent_before) != certification_identity(parent_after):
-            raise MediaCertificationError("media directory changed while hashing")
+            raise MediaCertificationResourceError("media directory changed while hashing")
         if actual_size != expected_size or digest.hexdigest() != expected_sha:
             raise MediaCertificationError("media bytes do not match frozen manifest")
         os.lseek(descriptor, 0, os.SEEK_SET)
@@ -50606,6 +50620,18 @@ def stitch_missing_source_leaf(cfg, task, cause):
     return False
 
 
+def stitch_release(cfg, task):
+    try:
+        response = restore_api(cfg, "/account/connections/stitch/%d/checkpoint" % task["id"],
+                               dict(lease_token=task["lease_token"], plan_sha256=task["plan_sha256"], release=True),
+                               timeout=CLEANUP_EXECUTION_OBSERVE_SEC)
+        if response.get("released") is True:
+            return
+    except Exception:
+        pass
+    log("WARN", "V85r lease release unavailable. The original lease expiry still applies.")
+
+
 def stitch_once(cfg, inventory, stop_event):
     if not getattr(cfg, "stitch_enabled", False):
         return 30
@@ -50636,32 +50662,31 @@ def stitch_once(cfg, inventory, stop_event):
     if task is None:
         return max(30, min(600, response.get("retry_after_sec", 300)))
     STITCH_STATUS.update(task_id=task["id"], state="working", started_at=utc_now())
-    stitch_resources(cfg, sum(c["size_bytes"] for c in task["plan"]["clips"]))
-    result = stitch_journal(inventory, task["id"], task["plan_sha256"])
-    if result is None:
-        try:
+    try:
+        stitch_resources(cfg, sum(c["size_bytes"] for c in task["plan"]["clips"]))
+        result = stitch_journal(inventory, task["id"], task["plan_sha256"])
+        if result is None:
             stitch_corpus(cfg)
             tools = stitch_v85r_tools(cfg, time.monotonic() + BENCHMARK_TOOL_INSTALL_SEC, stop_event)
             result = stitch_build(cfg, inventory, task, stop_event, tools)
-        except StitchResourceHold:
-            # Host conditions (memory, load, free disk, lost mount, maintenance
-            # fence, cancellation) release the lease without a result and retry
-            # later. A plain StitchHold also propagates untouched: it is
-            # transient or environmental, never this hour's own data.
-            raise
-        except (StitchTaskFailure, MediaCertificationError) as exc:
-            # A mount that vanished under a running read is a host condition, not
-            # this hour's data: release and retry rather than holding the hour.
-            if not os.path.ismount(str(cfg.output_dir)):
-                raise StitchResourceHold("NAS output root is not mounted") from None
-            cause = exc.__cause__
-            if isinstance(cause, OSError) and not stitch_missing_source_leaf(cfg, task, cause):
-                raise StitchResourceHold("NAS source I/O unavailable") from exc
-            # Otherwise this hour's own bytes are unusable: missing/invalid
-            # sidecar, unreadable media metadata, or a plan whose data no longer
-            # matches. Report it once instead of re-leasing the same hour forever.
-            stitch_hold_task(cfg, inventory, task, str(exc))
-            return 30
+    except MediaCertificationResourceError:
+        stitch_release(cfg, task)
+        raise
+    except (StitchTaskFailure, MediaCertificationError, CleanupSidecarDataError) as exc:
+        if not os.path.ismount(str(cfg.output_dir)):
+            stitch_release(cfg, task)
+            raise StitchResourceHold("NAS output root is not mounted") from None
+        cause = exc.__cause__
+        if isinstance(cause, OSError) and not stitch_missing_source_leaf(cfg, task, cause):
+            stitch_release(cfg, task)
+            raise StitchResourceHold("NAS source I/O unavailable") from exc
+        stitch_hold_task(cfg, inventory, task, str(exc))
+        return 30
+    except Exception:
+        # No result has been submitted on this attempt. Return only its exact
+        # lease so a transient build failure does not occupy the shared lane.
+        stitch_release(cfg, task)
+        raise
     result["lease_token"] = task["lease_token"]
     stitch_journal(inventory, task["id"], task["plan_sha256"], result)
     stitch_register(cfg, inventory, task["id"], result)

@@ -384,9 +384,21 @@ func (s *Server) handleAccountNASStitchCheckpoint(w http.ResponseWriter, r *http
 	var req struct {
 		Token   string `json:"lease_token"`
 		PlanSHA string `json:"plan_sha256"`
+		Release bool   `json:"release"`
 	}
 	if cid != 13 || util.DecodeJSON(r, &req) != nil {
 		util.WriteError(w, 400, "stitch checkpoint identity required")
+		return
+	}
+	if req.Release {
+		tag, err := s.pool.Exec(ctx, `UPDATE nas_stitch_tasks
+ SET state='pending',lease_token=NULL,lease_expires_at=NULL,updated_at=now()
+ WHERE id=$1 AND lease_token=$2 AND plan_sha256=$3 AND state='leased' AND lease_expires_at>clock_timestamp()`, id, req.Token, req.PlanSHA)
+		if err != nil || tag.RowsAffected() != 1 {
+			util.WriteError(w, 409, "stitch lease release identity unavailable")
+			return
+		}
+		util.WriteJSON(w, 200, map[string]any{"continue": false, "released": true})
 		return
 	}
 	var allowed bool

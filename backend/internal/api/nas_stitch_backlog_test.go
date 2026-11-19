@@ -117,8 +117,9 @@ func TestNASStitchBacklogCountsHoursLikeThePlanner(t *testing.T) {
 	// Two disjoint scopes must not count the recording hour between them.
 	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_stitch_scopes SET paused=true WHERE id=1;
 INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until) VALUES
-(2,999,'2026-09-20T00:09Z','2026-09-20T00:30Z','partial hour',now()+interval '1 hour'),
-(3,999,'2026-09-20T02:00Z','2026-09-20T02:30Z','separate hour',now()+interval '1 hour')`); err != nil {
+(2,999,'2026-09-20T00:00Z','2026-09-20T00:05Z','first partial hour',now()+interval '1 hour'),
+(3,999,'2026-09-20T02:00Z','2026-09-20T02:30Z','separate hour',now()+interval '1 hour'),
+(4,999,'2026-09-20T00:00Z','2026-09-20T00:30Z','overlapping larger hour',now()+interval '1 hour')`); err != nil {
 		t.Fatal(err)
 	}
 	report, err = NASStitchBacklog(f.ctx, f.pool)
@@ -129,7 +130,7 @@ INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until
 		s.RemainingReadyHours != 2 || s.RemainingReadyInputBytes != 6 || len(s.TaskHoursByState) != 0 {
 		t.Fatalf("disjoint scopes differ: %+v", s)
 	}
-	if _, err := f.pool.Exec(f.ctx, `INSERT INTO nas_cleanup_frozen_streams(plan_id,stream_id) VALUES(999,999)`); err != nil {
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO nas_cleanup_frozen_streams(plan_id,stream_id) VALUES(999,3)`); err != nil {
 		t.Fatal(err)
 	}
 	report, err = NASStitchBacklog(f.ctx, f.pool)

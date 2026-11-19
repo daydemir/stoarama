@@ -581,6 +581,8 @@ class StitchTaskDataHoldTests(unittest.TestCase):
             self.calls.append((path, body))
             if path.endswith('/lease'):
                 return dict(task=self.task, retry_after_sec=0)
+            if body.get('release'):
+                return dict(continue_=False, released=True)
             return dict(recorded=True, id=7)
         self.api = api
 
@@ -631,7 +633,45 @@ class StitchTaskDataHoldTests(unittest.TestCase):
         self.patch_common(build)
         with self.assertRaises(pull.StitchResourceHold):
             pull.stitch_once(self.cfg, self.inventory, self.stop)
-        self.assertEqual([path for path, _ in self.calls], ['/account/connections/stitch/lease'])
+        self.assertTrue(self.calls[-1][1]['release'])
+        self.assertFalse(any(path.endswith('/result') for path, _ in self.calls))
+
+    def test_malformed_stable_sidecar_is_a_terminal_task_hold(self):
+        item = dict(self.clips[0])
+        raw = self.cfg.output_dir / item["relative_path"]
+        sidecar = pull.stitch_sidecar_path(raw)
+        raw.write_bytes(b"a" * 10)
+        sidecar.write_bytes(b"{not valid JSON")
+        item.update(sha256=hashlib.sha256(raw.read_bytes()).hexdigest(),
+                    frozen_identity=pull.cleanup_identity(raw.stat()),
+                    frozen_sidecar_identity=pull.cleanup_identity(sidecar.stat()))
+        def build(cfg, inventory, task, stop, tools):
+            with pull.CleanupFile(cfg, item, stop, time.monotonic() + 10) as source:
+                source.proof()
+        self.patch_common(build)
+        self.assertEqual(pull.stitch_once(self.cfg, self.inventory, self.stop), 30)
+        self.assertEqual(self.calls[-1][1]["error"], "cleanup sidecar JSON is invalid")
+        self.assertTrue(raw.is_file() and sidecar.is_file())
+
+    def test_sibling_write_during_source_hash_releases_without_holding_hour(self):
+        item = self.clips[0]
+        raw = self.cfg.output_dir / item["relative_path"]
+        raw.write_bytes(b"a" * 10)
+        digest = hashlib.sha256(raw.read_bytes()).hexdigest()
+        sibling = raw.parent / "new-sibling"
+        read = os.read
+        def publish_during_read(fd, size):
+            if not sibling.exists():
+                sibling.write_bytes(b"new")
+            return read(fd, size)
+        def build(cfg, inventory, task, stop, tools):
+            with mock.patch.object(pull.os, "read", side_effect=publish_during_read):
+                pull.hash_certification_file_cancellable(cfg.output_dir, item["relative_path"], 10, digest, stop)
+        self.patch_common(build)
+        with self.assertRaises(pull.MediaCertificationResourceError):
+            pull.stitch_once(self.cfg, self.inventory, self.stop)
+        self.assertTrue(self.calls[-1][1]["release"])
+        self.assertFalse(any(path.endswith("/result") for path, _ in self.calls))
 
     def test_typed_task_failure_is_held_and_reported(self):
         def build(cfg, inventory, task, stop, tools):
@@ -649,7 +689,8 @@ class StitchTaskDataHoldTests(unittest.TestCase):
         self.patch_common(build)
         with self.assertRaises(pull.StitchResourceHold):
             pull.stitch_once(self.cfg, self.inventory, self.stop)
-        self.assertEqual([path for path, _ in self.calls], ['/account/connections/stitch/lease'])
+        self.assertTrue(self.calls[-1][1]['release'])
+        self.assertFalse(any(path.endswith('/result') for path, _ in self.calls))
 
     def test_invalid_policy_pins_leave_the_task_queue_untouched(self):
         self.patch_common(AssertionError("build should not run"))
