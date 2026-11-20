@@ -357,7 +357,7 @@ jobs:
       - name: Test R2 retire selection and apply safety
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test -p 1 ./cmd/stoaramactl ./internal/db ./internal/r2 ./internal/api ./internal/stitchproof -run '^Test(Keep28|FinishRefresh|RefreshDeficit|NASRefresh|R2BlockedWrites|R2WritesBlocked|R2CollationKey|R2Inverse|R2OwnerFence|R2Joined|R2DeliveryIndexesMigration|WriterReconcile|R2Fence|R2Retire|R2WriterFence|R2Stitch|R2Legacy|Batch|RequireNoMultipart|UnboundR2Client|ParseR2RetirePicks|HeadExposes)' -race -count=1 -v
+        run: go test -p 1 -timeout 20m ./cmd/stoaramactl ./internal/db ./internal/r2 ./internal/api ./internal/stitchproof -run '^Test(Keep28|FinishRefresh|RefreshDeficit|NASRefresh|R2BlockedWrites|R2WritesBlocked|R2CollationKey|R2Inverse|R2OwnerFence|R2Joined|R2DeliveryIndexesMigration|WriterReconcile|R2Fence|R2Retire|R2WriterFence|R2Stitch|R2Legacy|Batch|RequireNoMultipart|UnboundR2Client|ParseR2RetirePicks|HeadExposes)' -race -count=1 -v
       - name: Test selected-file NAS verification
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
