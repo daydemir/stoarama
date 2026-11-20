@@ -213,41 +213,64 @@ func (s *Server) deliveryPageRetired(ctx context.Context) (bool, error) {
 // retirement is arming, then records a lease that retirement must drain. The
 // returned release must run after the response's last write; callers defer it.
 // A caller that cannot prove the page is serving refuses: fail closed.
-func (s *Server) admitPublicDelivery(w http.ResponseWriter, r *http.Request) (release func(), ok bool) {
+// admitPublicDelivery admits one public reader and returns the SAME bounded
+// context every subsequent public gate and storage call must use.
+//
+// The bound starts BEFORE the admission SQL, not after it. A slow admission
+// acknowledgment can otherwise consume the lease window and then let a further
+// upstream read run past the durable lease. Starting it here means the whole
+// response — admission, gate reads and every public storage read — is bounded by
+// one deadline strictly shorter than the lease, and an admission that consumed
+// the budget is refused before any storage is opened.
+func (s *Server) admitPublicDelivery(w http.ResponseWriter, r *http.Request) (ctx context.Context, release func(), ok bool) {
+	ctx, cancel := leaseBoundContext(r.Context())
 	gate, err := s.deliveryGate()
 	if err != nil {
+		cancel()
 		util.WriteError(w, http.StatusServiceUnavailable, "Delivery availability is unavailable. Reload to retry.")
-		return nil, false
+		return nil, nil, false
 	}
-	retired, serving, err := gate.DeliveryServing(r.Context())
+	retired, serving, err := gate.DeliveryServing(ctx)
 	if err != nil {
+		cancel()
 		util.WriteError(w, http.StatusServiceUnavailable, "Delivery availability is unavailable. Reload to retry.")
-		return nil, false
+		return nil, nil, false
 	}
 	if retired {
+		cancel()
 		util.WriteError(w, http.StatusGone, "This dataset has been retired. See the published file list for NAS paths.")
-		return nil, false
+		return nil, nil, false
 	}
 	if !serving {
+		cancel()
 		util.WriteError(w, http.StatusServiceUnavailable, "This dataset is being taken offline. Reload in a few minutes.")
-		return nil, false
+		return nil, nil, false
 	}
 	id, err := newDeliveryReaderID()
 	if err != nil {
+		cancel()
 		util.WriteError(w, http.StatusServiceUnavailable, "Delivery availability is unavailable. Reload to retry.")
-		return nil, false
+		return nil, nil, false
 	}
-	if err = gate.AdmitPublicReader(r.Context(), id); err != nil {
+	if err = gate.AdmitPublicReader(ctx, id); err != nil {
+		cancel()
 		// A 55000 is retirement arming in this instant: refuse as not serving.
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "55000" {
 			util.WriteError(w, http.StatusServiceUnavailable, "This dataset is being taken offline. Reload in a few minutes.")
-			return nil, false
+			return nil, nil, false
 		}
 		util.WriteError(w, http.StatusServiceUnavailable, "Delivery availability is unavailable. Reload to retry.")
-		return nil, false
+		return nil, nil, false
 	}
-	return func() {
+	// Refuse an acknowledgment that consumed the response budget: opening storage
+	// after the deadline would run under an expired lease.
+	if ctx.Err() != nil {
+		cancel()
+		util.WriteError(w, http.StatusServiceUnavailable, "This dataset is being taken offline. Reload in a few minutes.")
+		return nil, nil, false
+	}
+	return ctx, func() {
 		// Push every byte this handler wrote onto the socket BEFORE dropping the
 		// lease, so the lease spans the response through its last body write and
 		// not merely through the handler's return. net/http's own final flush
@@ -256,9 +279,10 @@ func (s *Server) admitPublicDelivery(w http.ResponseWriter, r *http.Request) (re
 			f.Flush()
 		}
 		// The request context is done by now; the lease is still ours to drop.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = gate.ReleasePublicReader(ctx, id)
+		cancel()
+		rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer rcancel()
+		_ = gate.ReleasePublicReader(rctx, id)
 	}, true
 }
 
@@ -469,13 +493,34 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 			}
 		}
 		if s.pool != nil {
-			// REAL publish fence: one short transaction, held only for the serving
-			// recheck, the keep validation and the observation. Any quiesce or
-			// retirement that committed during the read is seen here, so a cold
-			// load that read an old generation cannot publish after arming.
+			// FINAL publish fence: one short transaction that decides the allowed
+			// generation, revalidates the keep snapshot and records the
+			// observation, and the cache mutation happens INSIDE it so the commit
+			// is the publication point. A cleanup batch that started during the
+			// read is therefore seen here (fenced() is rechecked), and a failed
+			// commit can never leave a published cache entry behind.
 			f, err := s.beginDeliveryFence(ctx)
 			if err != nil {
 				return nil, err
+			}
+			fenced, err := f.fenced(ctx)
+			if err != nil {
+				f.rollback()
+				return nil, err
+			}
+			if fenced {
+				const reviewed = "c4049f6dc0f940be8b7eb8b9bef6f42f"
+				if generation != reviewed {
+					f.rollback()
+					return nil, errors.New("public publication deferred during NAS cleanup")
+				}
+				// The resolved generation was substituted BEFORE the read; if the
+				// batch started during the read, the object actually read must
+				// already be the reviewed generation or the publication is refused.
+				if result.Generation != reviewed {
+					f.rollback()
+					return nil, errors.New("public publication deferred during NAS cleanup")
+				}
 			}
 			if err = RequireDeliveryKeep(ctx, f.tx, keep); err != nil {
 				f.rollback()
@@ -488,9 +533,18 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 					return nil, errors.New("delivery serving generation record unavailable")
 				}
 			}
+			// Publish the cache entry while the fence still holds the public lock,
+			// so arming and any other cold put serialize with this exact mutation.
+			s.publishDeliveryRegistry(public, generation, &result)
 			if err = f.commit(ctx); err != nil {
+				// Undo the just-published entry: a failed commit must never leave
+				// a cache entry that the database did not accept. The entry is
+				// keyed by the registry's OWN generation, which is what publish
+				// stored for the current case.
+				s.unpublishDeliveryRegistry(public, generation, result.Generation)
 				return nil, err
 			}
+			return &result, nil
 		}
 	}
 	// Publish under the mutex, which is taken only for these few assignments.
@@ -605,6 +659,27 @@ func (s *Server) cachedDeliveryRegistry(public bool, generation string) (*global
 	return nil, false
 }
 
+// unpublishDeliveryRegistry removes a cache entry that was published inside a
+// fence whose commit then failed, so a failed commit never leaves a servable
+// entry behind. It only clears the entry for this exact generation.
+func (s *Server) unpublishDeliveryRegistry(public bool, requestedGeneration, storedGeneration string) {
+	s.globalDeliveryMu.Lock()
+	defer s.globalDeliveryMu.Unlock()
+	if !public {
+		s.globalDeliveryRegistry = nil
+		return
+	}
+	if requestedGeneration != "" {
+		if r := s.publicPinnedDeliveryRegistry; r != nil && r.Generation == requestedGeneration {
+			s.publicPinnedDeliveryRegistry = nil
+		}
+		return
+	}
+	if r := s.publicGlobalDeliveryRegistry; r != nil && r.Generation == storedGeneration {
+		s.publicGlobalDeliveryRegistry = nil
+	}
+}
+
 // publishDeliveryRegistry stores a freshly loaded registry under the mutex.
 func (s *Server) publishDeliveryRegistry(public bool, generation string, result *globalDeliveryRegistry) {
 	s.globalDeliveryMu.Lock()
@@ -625,7 +700,7 @@ func (s *Server) publishDeliveryRegistry(public bool, generation string, result 
 func (s *Server) handleGlobalDeliveryPage(w http.ResponseWriter, r *http.Request) {
 	// Every public delivery response admits exactly one reader lease and holds it
 	// until its last socket write, so retirement cannot commit mid-response.
-	release, ok := s.admitPublicDelivery(w, r)
+	_, release, ok := s.admitPublicDelivery(w, r)
 	if !ok {
 		return
 	}
@@ -643,7 +718,7 @@ func (s *Server) handleGlobalDeliveryPage(w http.ResponseWriter, r *http.Request
 	writeHTML(w, body)
 }
 func (s *Server) handleGlobalDeliveryStatic(w http.ResponseWriter, r *http.Request) {
-	release, ok := s.admitPublicDelivery(w, r)
+	_, release, ok := s.admitPublicDelivery(w, r)
 	if !ok {
 		return
 	}
@@ -679,16 +754,12 @@ func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Reques
 	var release func()
 	if public {
 		var ok bool
-		if release, ok = s.admitPublicDelivery(w, r); !ok {
+		// The bound started before admission and is reused for every public
+		// storage read below; no second, later-starting deadline is derived.
+		if ctx, release, ok = s.admitPublicDelivery(w, r); !ok {
 			return
 		}
 		defer release()
-		// Every public storage read is bounded by a deadline strictly shorter
-		// than the reader lease, so a stalled HEAD/open fails and releases the
-		// lease instead of outliving it.
-		bounded, cancel := leaseBoundContext(ctx)
-		defer cancel()
-		ctx = bounded
 	}
 	registry, err := s.loadGlobalDeliveryRegistryScope(ctx, public, r.URL.Query().Get("generation"))
 	if err != nil {
@@ -823,13 +894,10 @@ func (s *Server) handleGlobalDeliveryTicket(w http.ResponseWriter, r *http.Reque
 	var release func()
 	if public {
 		var ok bool
-		if release, ok = s.admitPublicDelivery(w, r); !ok {
+		if ctx, release, ok = s.admitPublicDelivery(w, r); !ok {
 			return
 		}
 		defer release()
-		bounded, cancel := leaseBoundContext(ctx)
-		defer cancel()
-		ctx = bounded
 	}
 	object, ok := s.globalDeliveryFile(ctx, w, r)
 	if !ok {
@@ -878,17 +946,12 @@ func (s *Server) handleGlobalDeliveryFile(w http.ResponseWriter, r *http.Request
 	var release func()
 	if public {
 		var ok bool
-		if release, ok = s.admitPublicDelivery(w, r); !ok {
+		// One bound for admission plus the whole streamed body, through its last
+		// socket write, so a stalled body cannot outlive the durable lease.
+		if ctx, release, ok = s.admitPublicDelivery(w, r); !ok {
 			return
 		}
-		// Held across the whole streamed body, through its last socket write.
 		defer release()
-		// The whole read and body copy run under a deadline shorter than the
-		// lease, so a stalled body is cancelled and the handler returns (dropping
-		// the lease) before the lease can expire.
-		bounded, cancel := leaseBoundContext(ctx)
-		defer cancel()
-		ctx = bounded
 	}
 	object, ok := s.globalDeliveryFile(ctx, w, r)
 	if !ok {

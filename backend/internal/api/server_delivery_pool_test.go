@@ -366,3 +366,115 @@ func (p *pausedRegistryStore) OpenExact(ctx context.Context, key, etag, version 
 	}
 	return io.NopCloser(bytes.NewReader(p.body)), nil
 }
+
+// TestDeliveryFinalFenceSeesCleanupStartedDuringRead is the (1) interleaving: a
+// cold load reads an unreviewed generation, a NAS cleanup batch starts DURING that
+// read, and the FINAL fence must see it and refuse to publish the unreviewed
+// generation. A final fence that skipped fenced() would publish it.
+func TestDeliveryFinalFenceSeesCleanupStartedDuringRead(t *testing.T) {
+	pool := deliveryExemptionTestPool(t)
+	ctx := context.Background()
+	// A serving registry whose generation is NOT the reviewed cleanup generation.
+	reg := publicDeliveryRegistryFixture()
+	body, err := json.Marshal(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range reg.Assets {
+		if _, err := pool.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256)
+ VALUES('stoarama',$1,btrim($2,'"'),$3,'asset',$4)`, o.Key, o.ETag, o.SizeBytes, o.SHA256); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, o := range reg.Files {
+		if _, err := pool.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256)
+ VALUES('stoarama',$1,btrim($2,'"'),$3,'video_collated',$4)`, o.Key, o.ETag, o.SizeBytes, o.SHA256); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The read pauses after it has fetched the object, before the final fence.
+	store := &pausedRegistryStore{body: body, size: int64(len(body)), paused: make(chan struct{}, 1), release: make(chan struct{})}
+	s := &Server{pool: pool, globalDeliveryStore: store, deliveryPublic: poolDeliveryGate{pool}}
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.loadGlobalDeliveryRegistryScope(ctx, true, "")
+		done <- err
+	}()
+	select {
+	case <-store.paused:
+	case <-time.After(20 * time.Second):
+		t.Fatal("cold load never paused")
+	}
+	// A cleanup batch starts while the unreviewed generation is in flight.
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,mode,approved_until)
+ VALUES(77,'enabled',clock_timestamp()+interval '1 hour')`); err != nil {
+		t.Fatal(err)
+	}
+	close(store.release)
+	err = <-done
+	if err == nil {
+		t.Fatal("an unreviewed generation was published after cleanup began during its read")
+	}
+	if !strings.Contains(err.Error(), "deferred during NAS cleanup") {
+		t.Fatalf("unexpected refusal: %v", err)
+	}
+	if _, found := s.cachedDeliveryRegistry(true, ""); found {
+		t.Fatal("a refused publication left a cache entry")
+	}
+}
+
+// TestDeliveryAdmissionDelayCannotShiftReadPastLease is the (2) regression: the
+// response bound starts BEFORE admission, so a delayed admission acknowledgment
+// cannot let a later storage read run past the durable lease. The store must never
+// be opened when admission consumed the budget.
+func TestDeliveryAdmissionDelayCannotShiftReadPastLease(t *testing.T) {
+	original := deliveryPublicResponseBudget
+	deliveryPublicResponseBudget = 250 * time.Millisecond
+	t.Cleanup(func() { deliveryPublicResponseBudget = original })
+
+	reg := publicDeliveryRegistryFixture()
+	store := &globalDeliveryTestStore{body: []byte("hello")}
+	// A gate that delays admission past the budget, then succeeds.
+	gate := &slowAdmitGate{delay: 400 * time.Millisecond, inner: newDeliveryPublicFixture()}
+	s := &Server{globalDeliveryStore: store, publicGlobalDeliveryRegistry: reg,
+		publicGlobalDeliveryRegistryAt: time.Now(), publicPinnedDeliveryRegistry: reg, deliveryPublic: gate}
+	file := reg.Files["1"]
+	w := httptest.NewRecorder()
+	// A cold route so the handler would open storage if it proceeded.
+	start := time.Now()
+	s.handleGlobalDeliveryFile(w, httptest.NewRequest(http.MethodGet, publicGlobalDeliveryAPI+"/file/1?sha256="+file.SHA256, nil))
+	elapsed := time.Since(start)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("a slow admission surfaced as %d, want a bounded refusal", w.Code)
+	}
+	if store.opened.Load() != 0 {
+		t.Fatalf("storage was opened after the admission consumed the budget (%d opens)", store.opened.Load())
+	}
+	if elapsed > deliveryPublicResponseBudget+2*time.Second {
+		t.Fatalf("a slow admission was not bounded: %v", elapsed)
+	}
+}
+
+// slowAdmitGate delays admission past the response budget, then delegates.
+type slowAdmitGate struct {
+	delay time.Duration
+	inner *deliveryPublicFixture
+}
+
+func (g *slowAdmitGate) DeliveryServing(ctx context.Context) (bool, bool, error) {
+	return g.inner.DeliveryServing(ctx)
+}
+func (g *slowAdmitGate) AdmitPublicReader(ctx context.Context, id string) error {
+	select {
+	case <-time.After(g.delay):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return g.inner.AdmitPublicReader(ctx, id)
+}
+func (g *slowAdmitGate) ReleasePublicReader(ctx context.Context, id string) error {
+	return g.inner.ReleasePublicReader(ctx, id)
+}
+func (g *slowAdmitGate) RecordPublicDeliveryTicket(ctx context.Context, o globalDeliveryObject, s string, t time.Duration) (bool, error) {
+	return g.inner.RecordPublicDeliveryTicket(ctx, o, s, t)
+}

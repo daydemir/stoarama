@@ -229,62 +229,47 @@ func TestR2NonrawExemptionAdmitsOnlyExactIdentity(t *testing.T) {
 	}
 }
 
-// TestR2NonrawExemptionClassGates: each class opens only on its own condition.
+// TestR2NonrawExemptionClassGates: only outside_window opens; confident_repair and
+// in_window are HARD-CLOSED in code, so no seeding, no committed retirement and no
+// caller-supplied certificate can open them.
 func TestR2NonrawExemptionClassGates(t *testing.T) {
 	f := newNonrawFixture(t, "exempt_gates")
 	f.withPageKeys()
-	inSHA := strings.Repeat("e", 64)
-	inWindow := "joined/goodplus-20260821-generation-1/objects/" + inSHA + ".mp4"
-	f.pageHoldSHA(inWindow, "in-etag", "video_collated", 300, inSHA)
-	f.fixture(`INSERT INTO recording_collation_outputs(id,collation_hour_id,part,parts,object_key,nas_relative_path,size_bytes,sha256,start_at,end_at,source_clip_ids,r2_verified_at)
- VALUES(10000003,1,3,3,$1,'nightly/in.mp4',300,$2,$3,$4,ARRAY[7000001]::bigint[],'2026-06-02T00:00:00Z')`, inWindow, inSHA, f.windows[3].Start.Add(time.Hour).Format(time.RFC3339), f.windows[3].Start.Add(2*time.Hour).Format(time.RFC3339))
+	// outside_window seeds and opens on its own exact approval.
 	f.mustSeed(t, deliveryExemptOutsideWindow, collatedRow(f))
-	f.mustSeed(t, deliveryExemptConfidentRepair, repairRow())
-	f.mustSeed(t, deliveryExemptInWindow, deliveryExemptionRow{Bucket: "stoarama", ObjectKey: inWindow, ETag: "in-etag", SizeBytes: 300})
-
 	if !f.exempt(t, f.key) {
 		t.Fatal("outside_window is not open once seeded")
 	}
-	if f.exempt(t, exemptRepairKey) || f.exempt(t, inWindow) {
-		t.Fatal("a page-retirement class opened while the page is up")
+	// The hard-closed classes refuse at validate, approve and seed even with a
+	// perfect page identity and a committed retirement.
+	for _, class := range []deliveryExemptionClass{deliveryExemptConfidentRepair, deliveryExemptInWindow} {
+		rows := []deliveryExemptionRow{repairRow()}
+		picks, err := loadR2RetirePicks(f.picks)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := validateDeliveryExemptions(f.ctx, f.pool, class, rows, picks); err == nil || !strings.Contains(err.Error(), "hard-closed") {
+			t.Fatalf("%s validated despite being hard-closed: %v", class, err)
+		}
+		if err := f.seed(t, class, rows...); err == nil || !strings.Contains(err.Error(), "hard-closed") {
+			t.Fatalf("%s seeded despite being hard-closed: %v", class, err)
+		}
 	}
-	// There is exactly one retirement state, and it is the same row the serving
-	// routes refuse on. Until it exists no gate opens; once it exists the function
-	// and the gate agree immediately.
-	var retired bool
-	if err := f.pool.QueryRow(f.ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil || retired {
-		t.Fatalf("a serving page reported retired: %v %v", retired, err)
+	// Seed the closed classes directly at the SQL layer to prove even an exact row
+	// cannot open them, then retire the page.
+	f.fixture(`INSERT INTO r2_delivery_exemption_approvals(class,roster_sha256,decision) VALUES('confident_repair',repeat('7',64),'x')`)
+	f.fixture(`INSERT INTO r2_delivery_exemptions(bucket,object_key,etag,size_bytes,class,approval_id,decision,roster_sha256)
+ SELECT 'stoarama',$1,'repair-etag',700,'confident_repair',id,'x',repeat('7',64) FROM r2_delivery_exemption_approvals WHERE roster_sha256=repeat('7',64)`, exemptRepairKey)
+	if f.exempt(t, exemptRepairKey) {
+		t.Fatal("confident_repair opened while the page is up")
 	}
 	f.retirePage()
+	var retired bool
 	if err := f.pool.QueryRow(f.ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil || !retired {
 		t.Fatalf("the committed retirement state did not retire the page: %v %v", retired, err)
 	}
-	if !f.exempt(t, exemptRepairKey) {
-		t.Fatal("confident_repair stayed closed after the page came down")
-	}
-	if f.exempt(t, inWindow) {
-		t.Fatal("in_window opened without NAS custody")
-	}
-	// The 0224 follow-up's hook, certifying one exact identity. A certificate for
-	// any other output, ETag, size or content leaves the key held.
-	certify := func(output int64, etag string, size int64, sha string) {
-		f.exec(fmt.Sprintf(`CREATE OR REPLACE FUNCTION r2_delivery_nas_certified(p_output_id bigint,p_bucket text,p_key text,p_etag text,p_size bigint,p_sha256 text)
- RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT p_output_id=%d AND p_bucket='stoarama' AND p_key='%s' AND p_etag='%s' AND p_size=%d AND p_sha256='%s' $$`, output, inWindow, etag, size, sha))
-	}
-	for _, wrong := range []func(){
-		func() { certify(f.outputID, "in-etag", 300, inSHA) },
-		func() { certify(10000003, "other", 300, inSHA) },
-		func() { certify(10000003, "in-etag", 301, inSHA) },
-		func() { certify(10000003, "in-etag", 300, strings.Repeat("c", 64)) },
-	} {
-		wrong()
-		if f.exempt(t, inWindow) {
-			t.Fatal("in_window opened on a mismatched NAS certificate")
-		}
-	}
-	certify(10000003, "in-etag", 300, inSHA)
-	if !f.exempt(t, inWindow) {
-		t.Fatal("in_window stayed closed with the page down and NAS custody")
+	if f.exempt(t, exemptRepairKey) {
+		t.Fatal("confident_repair opened after retirement despite being hard-closed")
 	}
 	if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,'again')`, pageGeneration); err == nil {
 		t.Fatal("a second page retirement marker landed")
@@ -345,7 +330,11 @@ func TestR2NonrawExemptionHeldKeysRefuseStaleLedgerWrites(t *testing.T) {
 		t.Fatal("RAW delivery closure released a non-exempt page key")
 	}
 	f.mustSeed(t, deliveryExemptOutsideWindow, collatedRow(f))
-	f.mustSeed(t, deliveryExemptConfidentRepair, repairRow())
+	// confident_repair is hard-closed, so it cannot even be seeded; write its row
+	// directly to prove the SQL gate still refuses it at the ledger.
+	f.fixture(`INSERT INTO r2_delivery_exemption_approvals(class,roster_sha256,decision) VALUES('confident_repair',repeat('7',64),'x')`)
+	f.fixture(`INSERT INTO r2_delivery_exemptions(bucket,object_key,etag,size_bytes,class,approval_id,decision,roster_sha256)
+ SELECT 'stoarama',$1,'repair-etag',700,'confident_repair',id,'x',repeat('7',64) FROM r2_delivery_exemption_approvals WHERE roster_sha256=repeat('7',64)`, exemptRepairKey)
 	if !refused(ledger("delivery_repair", exemptRepairKey, 1, 700, nonrawOutputSHA)) {
 		t.Fatal("a confident repair reached the ledger while the page is up")
 	}
@@ -363,8 +352,9 @@ func TestR2NonrawExemptionHeldKeysRefuseStaleLedgerWrites(t *testing.T) {
 		t.Fatal("RAW delivery closure released an exempt key")
 	}
 	f.retirePage()
-	if err := ledger("delivery_repair", exemptRepairKey, 1, 700, nonrawOutputSHA); err != nil {
-		t.Fatalf("exact confident repair refused after page retirement: %v", err)
+	// Even after retirement the hard-closed repair class stays refused at the ledger.
+	if !refused(ledger("delivery_repair", exemptRepairKey, 1, 700, nonrawOutputSHA)) {
+		t.Fatal("a hard-closed confident repair reached the ledger after retirement")
 	}
 	// A repair retires only under its own key family.
 	if err := ledger("delivery_repair", f.key, 2, 900, nonrawOutputSHA); err == nil || !strings.Contains(err.Error(), "kind_prefix") {
@@ -465,11 +455,10 @@ func (f *nonrawFixture) runBatch(t *testing.T, name string, lane inverseLane, en
 	return result, err
 }
 
-// TestR2NonrawExemptionLaneRetiresBothClasses runs the reviewed collated lane end
-// to end over an outside-window page video (catalog row) and a confident repair
-// (no catalog row): each stays on the provider until its gate opens, then leaves
-// through one audited DELETE with an exact typed receipt.
-func TestR2NonrawExemptionLaneRetiresBothClasses(t *testing.T) {
+// TestR2NonrawExemptionLaneRetiresOutsideWindow proves the reviewed collated lane
+// retires an outside_window page video end to end, while the hard-closed
+// confident_repair class stays on the provider and off the wire.
+func TestR2NonrawExemptionLaneRetiresOutsideWindow(t *testing.T) {
 	f := newNonrawFixture(t, "exempt_lane")
 	f.withPageKeys()
 	collated := inverseEntry{ObjectInfo: f.store.objects[f.key], Class: inverseCollated}
@@ -495,13 +484,6 @@ func TestR2NonrawExemptionLaneRetiresBothClasses(t *testing.T) {
 	}
 
 	f.mustSeed(t, deliveryExemptOutsideWindow, collatedRow(f))
-	f.mustSeed(t, deliveryExemptConfidentRepair, repairRow())
-	if class, reason := classify(exemptRepairKey); class != inverseDelivery {
-		t.Fatalf("confident repair left the page keep while the page is up: %s (%s)", class, reason)
-	}
-	if _, err := f.runBatch(t, "page_up", inverseNonrawCollated, repair); !errors.Is(err, errInverseNonrawIneligible) || f.deletes() != 0 {
-		t.Fatalf("confident repair reached the wire while the page is up: %v", err)
-	}
 	if class, reason := classify(f.key); class != inverseCollated || reason != "owner_delivery_page_outside_window" {
 		t.Fatalf("exempt page video classified %s (%s)", class, reason)
 	}
@@ -510,35 +492,25 @@ func TestR2NonrawExemptionLaneRetiresBothClasses(t *testing.T) {
 		t.Fatalf("outside_window batch: %+v %v deletes=%d", result, err, f.deletes())
 	}
 
+	// Retire the page. confident_repair is hard-closed, so even then the repair
+	// stays held and never reaches the wire.
 	f.retirePage()
-	if class, reason := classify(exemptRepairKey); class != inverseCollated || reason != "owner_delivery_page_confident_repair" {
-		t.Fatalf("exempt confident repair classified %s (%s)", class, reason)
+	if _, err := f.runBatch(t, "repair_held", inverseNonrawCollated, repair); !errors.Is(err, errInverseNonrawIneligible) {
+		t.Fatalf("a hard-closed repair reached the wire: %v", err)
 	}
-	result, err = f.runBatch(t, "confident_repair", inverseNonrawCollated, repair)
-	if err != nil || result.Deleted != 1 || result.Bytes != 700 || f.deletes() != 2 {
-		t.Fatalf("confident_repair batch: %+v %v deletes=%d", result, err, f.deletes())
+	if _, present := f.store.objects[exemptRepairKey]; !present {
+		t.Fatal("the hard-closed confident repair was removed from the provider")
 	}
-	var exemptionID int64
-	if err = f.pool.QueryRow(f.ctx, `SELECT id FROM r2_delivery_exemptions WHERE object_key=$1`, exemptRepairKey).Scan(&exemptionID); err != nil {
+	// The outside_window receipt is exact.
+	var kind, reason string
+	var source int64
+	if err = f.pool.QueryRow(f.ctx, `SELECT r.kind,r.source_id,r.reason FROM r2_object_retirements r
+ JOIN r2_nonraw_intents i USING(bucket,object_key) JOIN r2_nonraw_attempts USING(bucket,object_key)
+ JOIN r2_nonraw_events e USING(bucket,object_key) WHERE r.object_key=$1 AND i.kind=r.kind AND e.event='absent'`, f.key).Scan(&kind, &source, &reason); err != nil {
 		t.Fatal(err)
 	}
-	for key, want := range map[string][3]any{
-		f.key:           {"collated", f.outputID, "owner_delivery_page_outside_window"},
-		exemptRepairKey: {"delivery_repair", exemptionID, "owner_delivery_page_confident_repair"},
-	} {
-		var kind, reason string
-		var source int64
-		if err = f.pool.QueryRow(f.ctx, `SELECT r.kind,r.source_id,r.reason FROM r2_object_retirements r
- JOIN r2_nonraw_intents i USING(bucket,object_key) JOIN r2_nonraw_attempts USING(bucket,object_key)
- JOIN r2_nonraw_events e USING(bucket,object_key) WHERE r.object_key=$1 AND i.kind=r.kind AND e.event='absent'`, key).Scan(&kind, &source, &reason); err != nil {
-			t.Fatalf("%s: %v", key, err)
-		}
-		if kind != want[0] || source != want[1] || reason != want[2] {
-			t.Fatalf("%s receipt %s/%d/%s", key, kind, source, reason)
-		}
-	}
-	if _, present := f.store.objects[exemptRepairKey]; present {
-		t.Fatal("confident repair is still on the provider")
+	if kind != "collated" || source != f.outputID || reason != "owner_delivery_page_outside_window" {
+		t.Fatalf("outside_window receipt %s/%d/%s", kind, source, reason)
 	}
 }
 
@@ -548,19 +520,23 @@ func TestR2NonrawExemptionLaneRetiresBothClasses(t *testing.T) {
 func TestR2NonrawExemptionRepairIdentityAndKeepEverything(t *testing.T) {
 	f := newNonrawFixture(t, "exempt_repair_hold")
 	f.withPageKeys()
-	f.mustSeed(t, deliveryExemptConfidentRepair, repairRow())
+	// The class is hard-closed, so it cannot be seeded at all; a direct SQL row is
+	// the strongest case, and the repair still must not reach the wire.
+	f.fixture(`INSERT INTO r2_delivery_exemption_approvals(class,roster_sha256,decision) VALUES('confident_repair',repeat('7',64),'x')`)
+	f.fixture(`INSERT INTO r2_delivery_exemptions(bucket,object_key,etag,size_bytes,class,approval_id,decision,roster_sha256)
+ SELECT 'stoarama',$1,'repair-etag',700,'confident_repair',id,'x',repeat('7',64) FROM r2_delivery_exemption_approvals WHERE roster_sha256=repeat('7',64)`, exemptRepairKey)
 	f.retirePage()
 	moved := inverseEntry{ObjectInfo: f.store.objects[exemptRepairKey], Class: inverseCollated}
 	moved.ETag = "rewritten"
-	if _, err := f.runBatch(t, "etag", inverseNonrawCollated, moved); !errors.Is(err, errInverseNonrawIneligible) || !strings.Contains(err.Error(), "listed ETag") || f.deletes() != 0 {
-		t.Fatalf("a repair with another ETag reached the wire: %v", err)
+	if _, err := f.runBatch(t, "etag", inverseNonrawCollated, moved); !errors.Is(err, errInverseNonrawIneligible) || f.deletes() != 0 {
+		t.Fatalf("a hard-closed repair with another ETag reached the wire: %v", err)
 	}
 	data, _ := json.Marshal(map[string]any{"choices": map[string]any{"3": r2RetirePick{Choice: "all"}}})
 	if err := os.WriteFile(f.picks, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.runBatch(t, "keep_everything", inverseNonrawCollated, inverseEntry{ObjectInfo: f.store.objects[exemptRepairKey], Class: inverseCollated}); !errors.Is(err, errInverseNonrawIneligible) || !strings.Contains(err.Error(), "keep-everything") || f.deletes() != 0 {
-		t.Fatalf("a keep-everything stream's repair reached the wire: %v", err)
+	if _, err := f.runBatch(t, "keep_everything", inverseNonrawCollated, inverseEntry{ObjectInfo: f.store.objects[exemptRepairKey], Class: inverseCollated}); !errors.Is(err, errInverseNonrawIneligible) || f.deletes() != 0 {
+		t.Fatalf("a hard-closed repair reached the wire: %v", err)
 	}
 	var intents int
 	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM r2_nonraw_intents`).Scan(&intents); err != nil || intents != 0 {
@@ -618,15 +594,22 @@ func TestR2NonrawExemptionNeverReleasesDerivedRAW(t *testing.T) {
 	f.pageHoldSHA(inWindow, "in-etag", "video_collated", 300, inSHA)
 	f.fixture(`INSERT INTO recording_collation_outputs(id,collation_hour_id,part,parts,object_key,nas_relative_path,size_bytes,sha256,start_at,end_at,source_clip_ids,r2_verified_at)
  VALUES(10000003,1,3,3,$1,'nightly/in.mp4',300,$2,$3,$4,ARRAY[7000001]::bigint[],'2026-06-02T00:00:00Z')`, inWindow, inSHA, f.windows[3].Start.Add(time.Hour).Format(time.RFC3339), f.windows[3].Start.Add(2*time.Hour).Format(time.RFC3339))
+	// outside_window is seeded normally; the two hard-closed classes are written
+	// directly at SQL to prove even an exact row cannot open them.
 	f.mustSeed(t, deliveryExemptOutsideWindow, collatedRow(f))
-	f.mustSeed(t, deliveryExemptConfidentRepair, repairRow())
-	f.mustSeed(t, deliveryExemptInWindow, deliveryExemptionRow{Bucket: "stoarama", ObjectKey: inWindow, ETag: "in-etag", SizeBytes: 300})
+	f.fixture(`INSERT INTO r2_delivery_exemption_approvals(class,roster_sha256,decision) VALUES('confident_repair',repeat('7',64),'x'),('in_window',repeat('8',64),'x')`)
+	f.fixture(`INSERT INTO r2_delivery_exemptions(bucket,object_key,etag,size_bytes,class,approval_id,decision,roster_sha256)
+ SELECT 'stoarama',$1,'repair-etag',700,'confident_repair',id,'x',repeat('7',64) FROM r2_delivery_exemption_approvals WHERE roster_sha256=repeat('7',64)`, exemptRepairKey)
+	f.fixture(`INSERT INTO r2_delivery_exemptions(bucket,object_key,etag,size_bytes,class,approval_id,decision,roster_sha256)
+ SELECT 'stoarama',$1,'in-etag',300,'in_window',id,'x',repeat('8',64) FROM r2_delivery_exemption_approvals WHERE roster_sha256=repeat('8',64)`, inWindow)
 	f.retirePage()
-	f.exec(`CREATE OR REPLACE FUNCTION r2_delivery_nas_certified(p_output_id bigint,p_bucket text,p_key text,p_etag text,p_size bigint,p_sha256 text)
- RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT true $$`)
-	for _, key := range []string{f.key, exemptRepairKey, inWindow} {
-		if !f.exempt(t, key) {
-			t.Fatalf("%s: gate not open", key)
+	// Only outside_window opens; the hard-closed classes stay closed.
+	if !f.exempt(t, f.key) {
+		t.Fatal("outside_window gate not open")
+	}
+	for _, key := range []string{exemptRepairKey, inWindow} {
+		if f.exempt(t, key) {
+			t.Fatalf("%s: a hard-closed gate opened", key)
 		}
 	}
 	var derived bool
@@ -712,9 +695,10 @@ func TestR2NonrawExemptionClassMustMatchLiveClassifier(t *testing.T) {
 	if exemptions != 0 || approvals != 1 {
 		t.Fatalf("refused seed wrote %d exemptions and %d approvals", exemptions, approvals)
 	}
-	// The same roster under its real class is accepted.
-	if err = f.seed(t, deliveryExemptInWindow, inRow); err != nil {
-		t.Fatalf("in-window roster refused under its own class: %v", err)
+	// The same roster under its real class is refused too: in_window is
+	// hard-closed, so neither class may admit it.
+	if err = f.seed(t, deliveryExemptInWindow, inRow); err == nil || !strings.Contains(err.Error(), "hard-closed") {
+		t.Fatalf("in_window admitted the roster despite being hard-closed: %v", err)
 	}
 }
 
@@ -1188,10 +1172,10 @@ func TestR2NonrawExemptionValidateIsReadOnlyAndClassifierExact(t *testing.T) {
 			t.Fatalf("%s validated a mixed-source in-window output", class)
 		}
 	}
-	// The in_window class is the classifier's answer for it, so that one passes
-	// validation (its gate still stays closed until NAS custody and retirement).
-	if n, err := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptInWindow, []deliveryExemptionRow{collatedRow(f)}, picks); err != nil || n != 1 {
-		t.Fatalf("in_window mixed output did not validate as in_window: %d %v", n, err)
+	// The in_window class is the classifier's answer for it, but it is hard-closed,
+	// so validation refuses it as well: the class cannot be proven here.
+	if n, err := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptInWindow, []deliveryExemptionRow{collatedRow(f)}, picks); err == nil || n != 0 || !strings.Contains(err.Error(), "hard-closed") {
+		t.Fatalf("in_window was not hard-closed at validation: %d %v", n, err)
 	}
 	// And the seed step refuses the same wrong class, so validation and seeding
 	// can never disagree. The only row a seed may leave is its owner approval,
@@ -1227,9 +1211,9 @@ func TestR2NonrawExemptionRepairKeepsKeFolder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The repair is clean and validates on its own.
-	if n, err := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptConfidentRepair, []deliveryExemptionRow{repairRow()}, picks); err != nil || n != 1 {
-		t.Fatalf("clean repair did not validate: %d %v", n, err)
+	// The repair class is hard-closed, so even a clean repair does not validate.
+	if n, err := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptConfidentRepair, []deliveryExemptionRow{repairRow()}, picks); err == nil || n != 0 || !strings.Contains(err.Error(), "hard-closed") {
+		t.Fatalf("confident_repair was not hard-closed at validation: %d %v", n, err)
 	}
 	// Put a KE folder name in the repair's stored relative path. The seed's own
 	// classifier must now hold it, so validate and seed both refuse.
@@ -1358,9 +1342,10 @@ func TestR2NonrawExemptionApprovalValidatesExactRoster(t *testing.T) {
 	if _, err := recordDeliveryExemptionApproval(f.ctx, f.pool, deliveryExemptOutsideWindow, badDigest, deliveryExemptionDecisions[deliveryExemptOutsideWindow], bad, picks); err == nil {
 		t.Fatal("a roster that does not match its live identity was approved")
 	}
-	// The wrong class is refused too: the in-window output is not outside_window.
-	if _, err := recordDeliveryExemptionApproval(f.ctx, f.pool, deliveryExemptInWindow, digest, deliveryExemptionDecisions[deliveryExemptInWindow], good, picks); err == nil || !strings.Contains(err.Error(), "outside_window") {
-		t.Fatalf("an outside_window roster was approved as in_window: %v", err)
+	// in_window is hard-closed, so an outside_window roster may never be approved
+	// under it at all.
+	if _, err := recordDeliveryExemptionApproval(f.ctx, f.pool, deliveryExemptInWindow, digest, deliveryExemptionDecisions[deliveryExemptInWindow], good, picks); err == nil || !strings.Contains(err.Error(), "hard-closed") {
+		t.Fatalf("in_window approved a roster despite being hard-closed: %v", err)
 	}
 	// A digest with no bytes is not evidence.
 	if _, err := recordDeliveryExemptionApproval(f.ctx, f.pool, deliveryExemptOutsideWindow, digest, "x", nil, picks); err == nil {

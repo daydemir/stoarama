@@ -430,17 +430,25 @@ ALTER TABLE r2_delivery_download_tickets ENABLE ALWAYS TRIGGER r2_delivery_downl
 -- in_window and every derivative release closed. That is the correct outcome
 -- when authoritative drain cannot be proved, not a condition to route around.
 CREATE FUNCTION guard_r2_delivery_page_retirement() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE live_readers bigint; live_capabilities bigint; armed boolean;
+DECLARE live_readers bigint; live_capabilities bigint; armed boolean; own_xact boolean;
  a r2_delivery_cutover_authority; page_derivatives bigint;
 BEGIN
  IF current_setting('transaction_isolation')<>'read committed' THEN
   RAISE EXCEPTION 'page retirement requires READ COMMITTED' USING ERRCODE='55000';
  END IF;
  PERFORM pg_advisory_xact_lock(r2_delivery_public_lock());
- SELECT EXISTS(SELECT 1 FROM r2_delivery_page_quiesce) INTO armed;
- IF NOT armed THEN
+ -- The arm must be a DIFFERENT, separately committed transaction. Seeing our
+ -- own uncommitted arm here would let one transaction arm and retire in a single
+ -- step, defeating the staged order. xmin of the arm row must not be ours.
+ SELECT true, q.xmin::text = pg_current_xact_id()::text INTO armed, own_xact
+  FROM r2_delivery_page_quiesce q WHERE q.singleton;
+ IF armed IS NULL THEN
   RAISE EXCEPTION 'page retirement requires the committed quiesce state'
    USING ERRCODE='55000', HINT='run r2-inverse page-quiesce first';
+ END IF;
+ IF own_xact THEN
+  RAISE EXCEPTION 'page retirement requires the quiesce state to be committed by a SEPARATE transaction'
+   USING ERRCODE='55000', HINT='commit page-quiesce first; do not arm and retire in one transaction';
  END IF;
  SELECT * INTO a FROM r2_delivery_cutover_authority WHERE singleton;
  IF NOT FOUND THEN
@@ -493,15 +501,22 @@ ALTER TABLE r2_delivery_page_retirement ENABLE ALWAYS TRIGGER r2_delivery_page_r
 -- cannot be a time in the future when the evidence is written. Both refusals are
 -- SQL, so a caller's paraphrase cannot satisfy them.
 CREATE FUNCTION guard_r2_delivery_cutover_authority() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE serving text;
+DECLARE serving text; arm_xact text; arm_own boolean;
 BEGIN
  IF current_setting('transaction_isolation')<>'read committed' THEN
   RAISE EXCEPTION 'cutover authority requires READ COMMITTED' USING ERRCODE='55000';
  END IF;
  PERFORM pg_advisory_xact_lock(r2_delivery_public_lock());
- IF NOT EXISTS(SELECT 1 FROM r2_delivery_page_quiesce) THEN
+ -- The arm must be committed by a SEPARATE transaction: seeing an uncommitted arm
+ -- from this same transaction would let one transaction arm and record authority.
+ SELECT q.xmin::text = pg_current_xact_id()::text INTO arm_own FROM r2_delivery_page_quiesce q WHERE q.singleton;
+ IF arm_own IS NULL THEN
   RAISE EXCEPTION 'cutover authority requires the committed quiesce state'
    USING ERRCODE='55000', HINT='arm the page first; authority recorded before arming proves nothing about the cutover';
+ END IF;
+ IF arm_own THEN
+  RAISE EXCEPTION 'cutover authority requires the quiesce state to be committed by a SEPARATE transaction'
+   USING ERRCODE='55000', HINT='commit page-quiesce first; do not arm and record authority in one transaction';
  END IF;
  -- Bind the authority to the generation the serving API actually loaded as the
  -- unpinned current registry (r2_delivery_serving_generation), never to an import
@@ -541,18 +556,29 @@ ALTER TABLE r2_delivery_cutover_authority ENABLE ALWAYS TRIGGER r2_delivery_cuto
 
 -- True only for an exempt exact page key whose class gate is open now. A class
 -- without a gate branch yields NULL and stays held.
+-- True only for an exact page key whose class gate is open now.
+--
+-- outside_window opens once its row is seeded and approved; it needs no external
+-- fact, so it is already fully gated by its own exact approval plus the mandatory
+-- derived RAW delivery guard elsewhere.
+--
+-- confident_repair and in_window are HARD-CLOSED here, in code, not merely
+-- dependent on an operator not writing a digest-shaped claim. No authoritative
+-- evidence format or issuer exists in this repo to prove the pointer was not
+-- replaced or that a direct-from-R2 transfer actually ended, and
+-- r2_delivery_nas_certified is a false stub. Rather than trust a caller, every
+-- branch for those two classes returns false, so no seeding, no authority row and
+-- no caller-supplied digest can open them. 0231 stays false.
+CREATE FUNCTION r2_delivery_class_open(p_class r2_delivery_exemption_class) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
+ SELECT p_class = 'outside_window'
+$$;
+
+-- Kept for its documented contract but never able to open a closed class.
 CREATE FUNCTION r2_delivery_exempt(p_bucket text, p_key text) RETURNS boolean LANGUAGE sql STABLE AS $$
  SELECT EXISTS(SELECT 1 FROM r2_delivery_exemptions x
   JOIN delivery_keep_holds h ON h.bucket=x.bucket AND h.object_key=x.object_key
   WHERE x.bucket=p_bucket AND x.object_key=p_key AND h.etag=x.etag AND h.size_bytes=x.size_bytes
-  AND CASE x.class
-   WHEN 'outside_window' THEN true
-   WHEN 'confident_repair' THEN r2_delivery_page_retired()
-   WHEN 'in_window' THEN r2_delivery_page_retired()
-    AND EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.object_key=x.object_key
-     AND o.size_bytes=x.size_bytes AND lower(o.sha256)=h.sha256
-     AND r2_delivery_nas_certified(o.id,x.bucket,x.object_key,x.etag,x.size_bytes,h.sha256))
-  END)
+  AND r2_delivery_class_open(x.class))
 $$;
 
 -- 0190's guard on every reservation and receipt, for every lane and binary: an

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -245,8 +246,10 @@ func TestDeliveryPageRetirementIsTheServingState(t *testing.T) {
 	if !retired {
 		t.Fatal("the committed retirement state did not move r2_delivery_page_retired()")
 	}
-	if !exempt {
-		t.Fatal("retirement did not open the confident_repair gate")
+	// confident_repair is HARD-CLOSED: no authoritative evidence issuer exists, so
+	// even a committed retirement and a perfectly exact exemption cannot open it.
+	if exempt {
+		t.Fatal("confident_repair opened despite being hard-closed")
 	}
 
 	// Every public delivery route now refuses, current and pinned alike.
@@ -655,5 +658,78 @@ func TestDeliveryPageRetirementAuthorityBindsServingGeneration(t *testing.T) {
 	// (a later rewrite is refused), so the binding cannot be moved post-arming.
 	if _, err := pool2.Exec(ctx2, `UPDATE r2_delivery_serving_generation SET generation=$1 WHERE singleton`, other); err == nil {
 		t.Fatal("serving generation was rewritten after quiesce")
+	}
+}
+
+// TestDeliveryPageRetirementRequiresSeparatelyCommittedArm is the (3) regression:
+// a single transaction that inserts the arm and the retirement together must be
+// refused, because the arm is not separately committed. The same statements in two
+// transactions succeed. This is the actual staged order, not an EXISTS that sees
+// our own uncommitted arm.
+func TestDeliveryPageRetirementRequiresSeparatelyCommittedArm(t *testing.T) {
+	pool := deliveryExemptionTestPool(t)
+	ctx := context.Background()
+	generation := repeatHex('c', 32)
+	// Precondition: an observed serving generation and a passed authority, so the
+	// only remaining question is whether the arm is separately committed.
+	seedServingGeneration(t, pool, generation)
+	// The authority itself requires a committed arm, so arm first.
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: pre-arm')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_cutover_authority(
+ generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
+ legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,
+ transfer_bound_at,transfer_evidence_sha256,approval_sha256)
+ VALUES($1,'test',clock_timestamp()-interval '10 minutes',repeat('a',64),clock_timestamp()-interval '10 minutes',
+  repeat('b',64),clock_timestamp()-interval '10 minutes',repeat('c',64),repeat('d',64),
+  clock_timestamp()-interval '10 minutes',repeat('e',64),repeat('f',64))`, generation); err != nil {
+		t.Fatal(err)
+	}
+	// A SECOND schema proves the same-transaction arm is refused from scratch.
+	pool2 := deliveryExemptionTestPool(t)
+	ctx2 := context.Background()
+	seedServingGeneration(t, pool2, generation)
+	tx2, err := pool2.BeginTx(ctx2, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx2.Rollback(ctx2)
+	if _, err = tx2.Exec(ctx2, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: same transaction')`); err != nil {
+		t.Fatalf("arm in a transaction was refused: %v", err)
+	}
+	// Writing the authority in the SAME transaction as the arm is refused: the
+	// authority also requires a separately committed arm, so a single transaction
+	// can never assemble the staged proof.
+	_, authErr := tx2.Exec(ctx2, `INSERT INTO r2_delivery_cutover_authority(
+ generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
+ legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,
+ transfer_bound_at,transfer_evidence_sha256,approval_sha256)
+ VALUES($1,'test',clock_timestamp()-interval '10 minutes',repeat('a',64),clock_timestamp()-interval '10 minutes',
+  repeat('b',64),clock_timestamp()-interval '10 minutes',repeat('c',64),repeat('d',64),
+  clock_timestamp()-interval '10 minutes',repeat('e',64),repeat('f',64))`, generation)
+	if authErr == nil || !strings.Contains(authErr.Error(), "SEPARATE transaction") {
+		t.Fatalf("authority was written on an uncommitted arm: %v", authErr)
+	}
+	// And retirement in that same transaction is refused for the same reason: no
+	// committed arm, hence no authority, hence the staged proof is absent.
+	if _, err = tx2.Exec(ctx2, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,'test: same transaction')`, generation); err == nil {
+		t.Fatal("retirement was accepted in the same transaction as the arm")
+	}
+	if err = tx2.Rollback(ctx2); err != nil {
+		t.Fatal(err)
+	}
+	// One transaction on the first pool: arm then retire. Must be refused.
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	// With a separately committed arm, retirement succeeds.
+	if _, err = tx.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,'test: separate')`, generation); err != nil {
+		t.Fatalf("a separately committed arm did not permit retirement: %v", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -248,6 +248,9 @@ func recordDeliveryExemptionApproval(ctx context.Context, pool *pgxpool.Pool, cl
 	if len(rows) == 0 {
 		return out, errors.New("an approval needs the exact roster bytes; a digest alone is not evidence")
 	}
+	if err := deliveryClassHardClosed(class); err != nil {
+		return out, err
+	}
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return out, err
@@ -276,6 +279,9 @@ func recordDeliveryExemptionApproval(ctx context.Context, pool *pgxpool.Pool, cl
 func seedDeliveryExemptions(ctx context.Context, pool *pgxpool.Pool, class deliveryExemptionClass, rows []deliveryExemptionRow, rosterSHA string, picks r2RetirePicks) (int64, error) {
 	if _, ok := deliveryExemptionDecisions[class]; !ok {
 		return 0, fmt.Errorf("unknown exemption class %q", class)
+	}
+	if err := deliveryClassHardClosed(class); err != nil {
+		return 0, err
 	}
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
@@ -311,6 +317,18 @@ func seedDeliveryExemptions(ctx context.Context, pool *pgxpool.Pool, class deliv
 		return 0, fmt.Errorf("seeded %d of %d roster rows", tag.RowsAffected(), len(rows))
 	}
 	return tag.RowsAffected(), tx.Commit(ctx)
+}
+
+// deliveryClassHardClosed refuses the classes that this repository cannot prove.
+// No authoritative evidence issuer exists to show the pointer is unchanged or
+// that a direct-from-R2 transfer ended, so these stay closed in code rather than
+// trusting a caller not to pass a digest-shaped claim. outside_window needs no
+// external fact and is not closed here.
+func deliveryClassHardClosed(class deliveryExemptionClass) error {
+	if class == deliveryExemptConfidentRepair || class == deliveryExemptInWindow {
+		return fmt.Errorf("class %s is hard-closed: no authoritative evidence issuer exists in this repo, so it cannot be proven and stays closed", class)
+	}
+	return nil
 }
 
 // deliveryPageKindFits is the exact page kind and key family each exemption class
@@ -447,6 +465,9 @@ func checkDeliveryExemptionRoster(ctx context.Context, tx pgx.Tx, class delivery
 func validateDeliveryExemptions(ctx context.Context, pool *pgxpool.Pool, class deliveryExemptionClass, rows []deliveryExemptionRow, picks r2RetirePicks) (int, error) {
 	if _, ok := deliveryExemptionDecisions[class]; !ok {
 		return 0, fmt.Errorf("unknown exemption class %q", class)
+	}
+	if err := deliveryClassHardClosed(class); err != nil {
+		return 0, err
 	}
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {

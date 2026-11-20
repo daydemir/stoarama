@@ -411,9 +411,18 @@ this lane.
 
 | Class | Page rows | Gate |
 | --- | --- | --- |
-| `outside_window` | `video_collated` under `joined/goodplus-*` or `joined/nightly-collation-v2/`, outside every keep window (4,348, 0.582 TB) | open once seeded |
-| `confident_repair` | `video_assembly` under `experimental/stitching-confident-repairs/`, no catalog row (9,232, 3.377 TB) | the page is retired (`r2_delivery_page_retired()`) |
-| `in_window` | `video_collated` inside a keep window (10,893, 2.347 TB) | the page is retired **and** the exact output is NAS-certified (`r2_delivery_nas_certified`) |
+| `outside_window` | `video_collated` under `joined/goodplus-*` or `joined/nightly-collation-v2/`, outside every keep window (4,348, 0.582 TB) | open once seeded and approved; independent of the cutover authority |
+| `confident_repair` | `video_assembly` under `experimental/stitching-confident-repairs/`, no catalog row (9,232, 3.377 TB) | **HARD-CLOSED in code** |
+| `in_window` | `video_collated` inside a keep window (10,893, 2.347 TB) | **HARD-CLOSED in code** |
+
+`confident_repair` and `in_window` are closed by `r2_delivery_class_open()` returning
+true only for `outside_window`, and by `validate`, `approve` and `seed` refusing
+those classes outright. This is deliberate: no authoritative evidence format or
+issuer exists in this repo to prove the serving pointer was not replaced or that a
+direct-from-R2 transfer actually ended, and `r2_delivery_nas_certified` is a false
+stub. Rather than trust a caller not to pass a digest-shaped claim, the classes
+cannot open at all. The same applies to page retirement and 0231. Opening either
+requires an authoritative evidence issuer that does not yet exist.
 
 An exemption binds the exact `(bucket, object_key, etag, size_bytes)` of the
 live page row, the class's verbatim owner decision and the roster SHA-256, and it
