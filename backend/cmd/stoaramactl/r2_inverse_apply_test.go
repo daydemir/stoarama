@@ -46,6 +46,8 @@ type inverseFakeStore struct {
 	onDelete, onAnswered func(string)
 	beforeHead           func(context.Context, string) error
 	beforeDelete         func(string) error
+	// headWithoutSHA omits the optional SHA-256 metadata from loopback HEADs.
+	headWithoutSHA bool
 }
 
 func (s *inverseFakeStore) setLost(lost bool)      { s.mu.Lock(); defer s.mu.Unlock(); s.lost = lost }
@@ -971,7 +973,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				deadline := time.Now().Add(3 * time.Second)
 				for {
 					var held bool
-					if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND classid::bigint*4294967296+objid::bigint=7343226011103 AND granted AND pid<>pg_backend_pid())`).Scan(&held); err != nil {
+					if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND locktype='advisory' AND objsubid=1 AND classid::bigint::numeric*4294967296+objid::bigint::numeric=7343226011103 AND granted AND pid<>pg_backend_pid())`).Scan(&held); err != nil {
 						t.Fatal(err)
 					}
 					if held {
@@ -992,7 +994,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					t.Fatal("legacy plan mutation upgraded locks", err)
 				}
 				var upgraded bool
-				if err = legacy.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid() AND classid::bigint*4294967296+objid::bigint=7343226011103)`).Scan(&upgraded); err != nil || upgraded {
+				if err = legacy.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND locktype='advisory' AND pid=pg_backend_pid() AND objsubid=1 AND classid::bigint::numeric*4294967296+objid::bigint::numeric=7343226011103)`).Scan(&upgraded); err != nil || upgraded {
 					t.Fatal("cleanup acquired admission lock", upgraded, err)
 				}
 				if err = legacy.Commit(ctx); err != nil {
@@ -1044,7 +1046,8 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer mutator.Rollback(ctx)
-		if _, err = mutator.Exec(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR UPDATE`); err != nil {
+		var mutatorPID int
+		if err = mutator.QueryRow(ctx, `SELECT pg_backend_pid() FROM (SELECT epoch FROM r2_inverse_ke_epoch FOR UPDATE) e`).Scan(&mutatorPID); err != nil {
 			t.Fatal(err)
 		}
 		done := make(chan error, 1)
@@ -1052,7 +1055,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		deadline := time.Now().Add(3 * time.Second)
 		for {
 			var waiting bool
-			if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE%')`).Scan(&waiting); err != nil {
+			if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)) AND wait_event_type='Lock' AND query LIKE '%SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE%')`, mutatorPID).Scan(&waiting); err != nil {
 				t.Fatal(err)
 			}
 			if waiting {
@@ -1064,7 +1067,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 		var held bool
-		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND granted AND ((classid::bigint*4294967296+objid::bigint)=ANY(ARRAY[7343226011103,7343226011101]::bigint[]) OR(classid=137 AND objid=1 AND objsubid=2)))`).Scan(&held); err != nil || held {
+		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND locktype='advisory' AND granted AND ((objsubid=1 AND (classid::bigint::numeric*4294967296+objid::bigint::numeric)=ANY(ARRAY[7343226011103,7343226011101]::numeric[])) OR(classid=137 AND objid=1 AND objsubid=2)))`).Scan(&held); err != nil || held {
 			t.Fatal("waiting B1 owns later locks", held, err)
 		}
 		admissionCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -1645,7 +1648,9 @@ func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*inverseSDKStor
 			w.Header().Set("ETag", `"`+o.ETag+`"`)
 			w.Header().Set("Content-Length", strconv.FormatInt(o.SizeBytes, 10))
 			w.Header().Set("Last-Modified", o.LastModified.Format(http.TimeFormat))
-			w.Header().Set("x-amz-meta-sha256", strings.Repeat("b", 64))
+			if !store.headWithoutSHA {
+				w.Header().Set("x-amz-meta-sha256", strings.Repeat("b", 64))
+			}
 			w.WriteHeader(200)
 		default:
 			w.WriteHeader(400)
@@ -1683,6 +1688,116 @@ func TestR2InverseWireLostNeedsAcceptedRequest(t *testing.T) {
 	answered.answered.Store(true)
 	if !sent.lost() || failed.lost() || answered.lost() || (&inverseWire{}).lost() {
 		t.Fatalf("lost: sent %v failed %v answered %v unsent %v", sent.lost(), failed.lost(), answered.lost(), (&inverseWire{}).lost())
+	}
+}
+
+type shortWriteConn struct{ net.Conn }
+
+func (shortWriteConn) Write([]byte) (int, error) { return 0, nil }
+
+// A zero-byte write carries no request byte: an empty one neither passes a
+// closed gate nor counts as sent, and one that wrote nothing of its bytes is a
+// failed write. Neither is a lost response.
+func TestR2InverseWireZeroByteWriteIsNotLost(t *testing.T) {
+	gate := &inverseSendGate{}
+	gate.close()
+	empty := &inverseWire{gate: gate}
+	conn := &inverseWireConn{Conn: failingWriteConn{}, wire: empty}
+	if n, err := conn.Write(nil); n != 0 || err != nil || empty.wrote.Load() || empty.lost() {
+		t.Fatalf("empty write: %d %v wrote %v", n, err, empty.wrote.Load())
+	}
+	if _, err := conn.Write([]byte("DELETE")); !errors.Is(err, errInverseAdmissionClosed) || empty.lost() {
+		t.Fatalf("first write after an empty one passed a closed gate: %v", err)
+	}
+	short := &inverseWire{gate: &inverseSendGate{}}
+	(&inverseWireConn{Conn: shortWriteConn{}, wire: short}).Write([]byte("DELETE"))
+	if short.lost() || !short.writeFailed.Load() {
+		t.Fatal("a write that sent no byte counted as a lost response")
+	}
+}
+
+// lateWriteConn resumes a write only after the wire deadline has passed.
+type lateWriteConn struct {
+	net.Conn
+	until time.Time
+}
+
+func (c lateWriteConn) Write(p []byte) (int, error) {
+	time.Sleep(time.Until(c.until) + 20*time.Millisecond)
+	return c.Conn.Write(p)
+}
+
+// deadlineBlindConn ignores socket deadlines, as a wrapped conn might.
+type deadlineBlindConn struct{ net.Conn }
+
+func (deadlineBlindConn) SetWriteDeadline(time.Time) error { return nil }
+
+// No first request byte leaves at or after the wire deadline: a write that
+// starts late is refused even by a conn blind to deadlines, and one that
+// stalls past it is refused by the socket. Neither wrote, so neither is a
+// lost response.
+func TestR2InverseWireDeadlineRefusesFirstByte(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	for _, stalled := range []bool{false, true} {
+		client, err := net.Dial("tcp", listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		server, err := listener.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire := &inverseWire{gate: &inverseSendGate{}, deadline: time.Now().Add(-time.Millisecond)}
+		var conn net.Conn = deadlineBlindConn{client}
+		if stalled {
+			wire.deadline = time.Now().Add(100 * time.Millisecond)
+			conn = lateWriteConn{Conn: client, until: wire.deadline}
+		}
+		_, writeErr := wire.track(conn).Write([]byte("DELETE /stoarama/key HTTP/1.1\r\n\r\n"))
+		client.Close()
+		received, _ := io.ReadAll(server)
+		server.Close()
+		if writeErr == nil || len(received) != 0 || wire.wrote.Load() || wire.lost() {
+			t.Fatalf("stalled=%v: %v, server received %q", stalled, writeErr, received)
+		}
+	}
+}
+
+// The job holds only the very keys the executor reports: equal counts with a
+// different held key stop it.
+func TestR2InverseJobReadbackComparesHeldKeys(t *testing.T) {
+	lost := fmt.Errorf("%w: test", errInverseWireAmbiguous)
+	result := inverseApplySummary{Deleted: 1, Bytes: 100, WireAmbiguous: []string{"managed/a"}}
+	readback := inverseBatchReadback{Intents: 2, Absent: 1, AbsentBytes: 100, Attempts: 2, Unresolved: []string{"managed/a"}}
+	if done, err := readback.settle(result, lost); err != nil || done {
+		t.Fatalf("matching readback: %v %v", done, err)
+	}
+	readback.Unresolved = []string{"managed/b"}
+	if _, err := readback.settle(result, lost); err == nil || !strings.Contains(err.Error(), "evidence differs") {
+		t.Fatalf("different held key continued the job: %v", err)
+	}
+	// Done means nothing new was selected: a batch whose selected keys were all
+	// skipped for short custody, deleting none, is not done.
+	if done, err := (inverseBatchReadback{Unresolved: []string{}}).settle(inverseApplySummary{Selected: 1, CustodyShort: r2RetireStat{Objects: 1, Bytes: 100}, WireAmbiguous: []string{}}, nil); err != nil || done {
+		t.Fatalf("skipped-only batch: done %v %v", done, err)
+	}
+	if done, err := (inverseBatchReadback{Unresolved: []string{}}).settle(inverseApplySummary{WireAmbiguous: []string{}}, nil); err != nil || !done {
+		t.Fatalf("empty batch: done %v %v", done, err)
+	}
+}
+
+// Job totals sum every batch's counts; held keys are the latest snapshot.
+func TestR2InverseJobTotalsAddBatches(t *testing.T) {
+	total := inverseApplySummary{}
+	total.addBatch(inverseApplySummary{Selected: 3, Deleted: 2, Bytes: 200, CustodyShort: r2RetireStat{Objects: 1, Bytes: 100}, WireAmbiguous: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}})
+	total.addBatch(inverseApplySummary{Selected: 1, Deleted: 1, Bytes: 100, AmbiguousHeld: 1, HeldAbsent: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}})
+	// last_modified_held comes from the partition every batch rereads: a snapshot.
+	if total.Selected != 4 || total.Deleted != 3 || total.Bytes != 300 || total.CustodyShort != (r2RetireStat{Objects: 1, Bytes: 100}) || total.LastModifiedHeld != (r2RetireStat{Objects: 2, Bytes: 200}) || !slices.Equal(total.WireAmbiguous, []string{"managed/a"}) || total.AmbiguousHeld != 1 || !slices.Equal(total.HeldAbsent, []string{"managed/a"}) {
+		t.Fatalf("job totals: %+v", total)
 	}
 }
 

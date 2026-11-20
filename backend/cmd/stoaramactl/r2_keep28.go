@@ -4,20 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
-	"net/http"
-	"sync/atomic"
+	"fmt"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5"
 )
 
 // Closed table selection: no operator-supplied identifier enters SQL. B1 stays
 // in its existing namespace; ordinary reservations and byte charges are shared.
-func (a *inverseApplier) intentTable() string {
-	switch a.opts.Lane {
+func (l inverseLane) intentTable() string {
+	switch l {
 	case inverseNASKeep28:
 		return "r2_keep28_intents"
 	case inverseNonrawCollated:
@@ -25,8 +21,8 @@ func (a *inverseApplier) intentTable() string {
 	}
 	return "r2_inverse_intents"
 }
-func (a *inverseApplier) eventTable() string {
-	switch a.opts.Lane {
+func (l inverseLane) eventTable() string {
+	switch l {
 	case inverseNASKeep28:
 		return "r2_keep28_events"
 	case inverseNonrawCollated:
@@ -34,8 +30,8 @@ func (a *inverseApplier) eventTable() string {
 	}
 	return "r2_inverse_events"
 }
-func (a *inverseApplier) attemptTable() string {
-	switch a.opts.Lane {
+func (l inverseLane) attemptTable() string {
+	switch l {
 	case inverseNASKeep28:
 		return "r2_keep28_attempts"
 	case inverseNonrawCollated:
@@ -43,8 +39,8 @@ func (a *inverseApplier) attemptTable() string {
 	}
 	return "r2_inverse_attempts"
 }
-func (a *inverseApplier) retirementReason() string {
-	switch a.opts.Lane {
+func (l inverseLane) retirementReason() string {
+	switch l {
 	case inverseNASKeep28:
 		return "keep28_exact_nas"
 	case inverseNonrawCollated:
@@ -60,12 +56,26 @@ type keep28Custody struct {
 	VerifiedAt, ReceivedAt, Expiry            time.Time
 }
 
+// keep28Identity is the source and custody identity selection observed for a
+// key. Reserve requires the locked custody to carry the very same one.
+type keep28Identity struct {
+	SourceID, SizeBytes, SidecarSize int64
+	Path, SHA, SidecarSHA            string
+}
+
+func (c keep28Custody) identity() keep28Identity {
+	return keep28Identity{SourceID: c.SourceID, SizeBytes: c.SizeBytes, SidecarSize: c.SidecarSize, Path: c.Path, SHA: c.SHA, SidecarSHA: c.SidecarSHA}
+}
+
+// lockKeep28Custody locks and reads the exact custody proof. An aged proof is
+// still read in full and returned with errR2RetireNASProofAged, so callers can
+// compare it before treating it as aged.
 func (a *inverseApplier) lockKeep28Custody(ctx context.Context, tx pgx.Tx, t inverseRawTarget) (keep28Custody, error) {
 	c := keep28Custody{ConnectionID: 13, SourceID: t.ID, SizeBytes: t.Size, Path: t.Path, SHA: t.SHA}
 	item := r2RetireItem{r2RetireCandidate: r2RetireCandidate{Kind: "raw", SourceID: t.ID, SizeBytes: t.Size, SHA256: t.SHA, RelativePath: t.Path}}
-	expiry, err := r2RetireLockNASIdentity(ctx, tx, item, c.ConnectionID)
+	expiry, fresh, err := r2RetireLockNASProof(ctx, tx, item, c.ConnectionID)
 	if err != nil {
-		return c, err
+		return c, fmt.Errorf("exact present NAS identity no longer lockable: %w", err)
 	}
 	// The row is already FOR SHARE locked; capture the entire proof in a locked
 	// read too. A changed sidecar/timestamp cannot hide behind an unchanged expiry.
@@ -73,18 +83,32 @@ func (a *inverseApplier) lockKeep28Custody(ctx context.Context, tx pgx.Tx, t inv
 	c.VerifiedAt = c.VerifiedAt.UTC()
 	c.ReceivedAt = c.ReceivedAt.UTC()
 	c.Expiry = expiry.UTC()
+	if err == nil && !fresh {
+		err = fmt.Errorf("exact present NAS identity no longer lockable: %w", errR2RetireNASProofAged)
+	}
 	return c, err
 }
 
-// Selection trails fresh custody in verified_at order. A report is never wire
-// authority; every identity and proof is subsequently reloaded under locks.
+// keep28AdmissionCustody is the custody a key needs left to be selected: one
+// network timeout plus the margin, the same rule reserve enforces under lock.
+// A shorter key would only be skipped, so it takes no item or byte allowance.
+const keep28AdmissionCustody = keep28CustodyMargin + inverseNetworkTimeout
+
+// Selection trails fresh custody in verified_at order. The join admits only
+// exact, complete evidence, the predicates the custody lock enforces, so a
+// legacy row without sidecar evidence is simply ineligible. A report is never
+// wire authority; every identity and proof is subsequently reloaded under locks,
+// and reserve requires the identity observed here.
 func (a *inverseApplier) selectKeep28(ctx context.Context, entries map[string]inverseEntry) ([]inverseEntry, error) {
-	rows, err := a.pool.Query(ctx, `SELECT c.object_key`+r2RetireRawExactSQL+`
+	rows, err := a.pool.Query(ctx, `SELECT c.object_key,c.id,c.size_bytes,c.display_path,lower(c.sha256),n.sidecar_size_bytes,n.sidecar_sha256
  FROM recording_clips c JOIN nas_inventory_files n ON n.connection_id=$2 AND n.clip_id=c.id
  JOIN recordings r ON r.id=c.recording_id
  WHERE c.bucket=$1 AND c.purged_at IS NULL AND r.account_id=47
- AND n.state='present' AND n.verified_at>=clock_timestamp()-interval '24 hours'
- ORDER BY n.verified_at,c.id`, a.store.Bucket(), int64(13))
+ AND n.state='present' AND n.relative_path=c.display_path AND n.sha256=lower(c.sha256) AND n.size_bytes=c.size_bytes
+ AND n.verified_at<=clock_timestamp()+interval '5 minutes'
+ AND n.sidecar_relative_path=c.display_path||'.stoarama.json' AND n.sidecar_size_bytes>0 AND n.sidecar_sha256 ~ '^[a-f0-9]{64}$'
+ AND LEAST(n.verified_at,n.server_received_at)>clock_timestamp()-interval '24 hours'+make_interval(secs=>$3)
+ ORDER BY n.verified_at,c.id`, a.store.Bucket(), int64(13), keep28AdmissionCustody.Seconds())
 	if err != nil {
 		return nil, err
 	}
@@ -92,13 +116,14 @@ func (a *inverseApplier) selectKeep28(ctx context.Context, entries map[string]in
 	jobs := []inverseEntry{}
 	var bytes int64
 	for rows.Next() {
-		var key, path string
-		var exact bool
-		if err = rows.Scan(&key, &exact, &path); err != nil {
+		var key string
+		var id keep28Identity
+		if err = rows.Scan(&key, &id.SourceID, &id.SizeBytes, &id.Path, &id.SHA, &id.SidecarSize, &id.SidecarSHA); err != nil {
 			return nil, err
 		}
 		e, ok := entries[key]
-		if !ok || !exact || e.SizeBytes <= 0 {
+		e.Selected = id
+		if !ok || e.SizeBytes <= 0 {
 			continue
 		}
 		if e.SizeBytes > a.opts.MaxBytes-bytes {
@@ -120,86 +145,53 @@ func keep28Clock(ctx context.Context, q r2RetireQuerier) (keep28DBClock, error) 
 	err := q.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&c.utc)
 	return c, err
 }
-func (c keep28DBClock) remaining(expiry time.Time) time.Duration {
-	return expiry.Sub(c.utc) - time.Since(c.observed)
+
+// keep28CustodyMargin ends local authority this long before the sampled DB
+// expiry. Custody lasts up to 24 hours, so 2s costs nothing; it absorbs a
+// PostgreSQL clock step or host stall after the last sample, up to its size.
+const keep28CustodyMargin = 2 * time.Second
+
+// deadline is the local monotonic instant, keep28CustodyMargin before this
+// sample says expiry arrives. It is fixed when sampled, so however late a timer
+// is made from it, it never moves. observed precedes the DB read, so the
+// instant errs early.
+func (c keep28DBClock) deadline(expiry time.Time) time.Time {
+	return c.observed.Add(expiry.Sub(c.utc) - keep28CustodyMargin)
 }
 
-type keep28DeleteStore interface {
-	inverseReader
-	deleteKeep28Once(context.Context, *keep28DeleteAuthority) error
-}
-
-// B2 cannot be passed to B1 transport. Full proof and exact intent are checked
-// by this concrete verifier, with one permanent issuance across process loss.
-type keep28DeleteAuthority struct {
-	guard   *inverseWireGuard
-	binding inverseDeleteBinding
-	custody keep28Custody
-	clock   keep28DBClock
-	used    *atomic.Bool
-	ctx     context.Context
-	cancel  context.CancelFunc
-}
-
-func (a *inverseApplier) authorizeKeep28(ctx context.Context, tx pgx.Tx, e inverseEntry) (*keep28DeleteAuthority, error) {
-	if a.opts.Lane != inverseNASKeep28 {
-		return nil, errors.New("B2 authority requires keep28 lane")
-	}
-	target, err := a.prepareWireTarget(ctx, tx, e)
-	if err != nil {
-		return nil, err
-	}
+// proveKeep28 relocks the NAS custody behind a keep-28 intent and requires it
+// to equal the proof persisted with that intent. It returns the local instant
+// custody ends, which must still be ahead.
+func (a *inverseApplier) proveKeep28(ctx context.Context, tx pgx.Tx, e inverseEntry, target inverseRawTarget) (keep28Custody, time.Time, error) {
 	custody, err := a.lockKeep28Custody(ctx, tx, target)
 	if err != nil {
-		return nil, err
+		return custody, time.Time{}, err
 	}
 	var data []byte
 	if err = tx.QueryRow(ctx, `SELECT custody FROM r2_keep28_intents WHERE bucket=$1 AND object_key=$2`, a.store.Bucket(), e.Key).Scan(&data); err != nil {
-		return nil, err
+		return custody, time.Time{}, err
 	}
 	var intended keep28Custody
 	if err = json.Unmarshal(data, &intended); err != nil {
-		return nil, err
+		return custody, time.Time{}, err
 	}
 	if custody != intended {
-		return nil, errors.New("custody proof changed after durable intent")
+		return custody, time.Time{}, errors.New("custody proof changed after durable intent")
 	}
 	clock, err := keep28Clock(ctx, tx)
 	if err != nil {
-		return nil, err
+		return custody, time.Time{}, err
 	}
-	if clock.remaining(custody.Expiry) <= 0 {
-		return nil, errors.New("NAS custody expired before wire")
+	end := clock.deadline(custody.Expiry)
+	if !time.Now().Before(end) {
+		return custody, end, errors.New("NAS custody expired before wire")
 	}
-	bounded, cancel := context.WithTimeout(ctx, min(inverseNetworkTimeout, clock.remaining(custody.Expiry)))
-	fail := func(err error) (*keep28DeleteAuthority, error) { cancel(); return nil, err }
-	if err = a.checkWireHead(bounded, tx, e, target); err != nil {
-		return fail(err)
-	}
-	guard := &inverseWireGuard{a, tx, target, e}
-	binding := guard.binding()
-	if err = guard.check(bounded, binding); err != nil {
-		return fail(err)
-	}
-	tag, err := a.pool.Exec(bounded, `INSERT INTO r2_keep28_attempts(bucket,object_key) VALUES($1,$2) ON CONFLICT DO NOTHING`, binding.Bucket, binding.Key)
-	if err != nil {
-		return fail(err)
-	}
-	if tag.RowsAffected() != 1 {
-		return fail(errors.New("B2 wire authority already issued; reconcile only"))
-	}
-	return &keep28DeleteAuthority{guard: guard, binding: binding, custody: custody, clock: clock, used: &atomic.Bool{}, ctx: bounded, cancel: cancel}, nil
+	return custody, end, nil
 }
-func (a *keep28DeleteAuthority) check(ctx context.Context, bucket, endpoint string) error {
-	if a == nil || a.guard == nil || a.guard.a.opts.Lane != inverseNASKeep28 || bucket != a.binding.Bucket || endpoint != a.binding.EndpointSHA256 {
-		return errors.New("B2 authority binding differs")
-	}
-	if a.clock.remaining(a.custody.Expiry) <= 0 {
-		return errors.New("NAS custody expired during handoff")
-	}
-	if err := a.guard.check(ctx, a.binding); err != nil {
-		return err
-	}
+
+// checkCustody runs at the transport, under the network transaction: the locked
+// custody row must still equal the intent's proof, with lifetime left.
+func (a *inverseDeleteAuthority) checkCustody(ctx context.Context) error {
 	c, err := a.guard.a.lockKeep28Custody(ctx, a.guard.tx, a.guard.t)
 	if err != nil {
 		return err
@@ -207,89 +199,38 @@ func (a *keep28DeleteAuthority) check(ctx context.Context, bucket, endpoint stri
 	if c != a.custody {
 		return errors.New("locked custody proof changed")
 	}
-	var issued bool
-	if err = a.guard.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_keep28_attempts WHERE bucket=$1 AND object_key=$2)`, bucket, a.binding.Key).Scan(&issued); err != nil {
-		return err
-	}
-	if !issued {
-		return errors.New("durable B2 issuance missing")
-	}
-	clock, err := keep28Clock(ctx, a.guard.tx)
-	if err != nil {
-		return err
-	}
-	if min(a.clock.remaining(a.custody.Expiry), clock.remaining(a.custody.Expiry)) <= 0 {
-		return errors.New("NAS custody expired at transport")
-	}
-	return nil
-}
-func (s *inverseSDKStore) deleteKeep28Once(ctx context.Context, a *keep28DeleteAuthority) error {
-	if a == nil || a.used == nil || !a.used.CompareAndSwap(false, true) {
-		return errors.New("B2 authority absent or consumed")
-	}
-	if err := a.check(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
-		return err
-	}
-	transport := &keep28DeleteTransport{base: s.transport, authority: a, bucket: s.Bucket(), endpoint: s.EndpointSHA256()}
-	_, err := s.sdk.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.Bucket()), Key: aws.String(a.binding.Key)}, func(o *s3.Options) {
-		o.Retryer = aws.NopRetryer{}
-		o.HTTPClient = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	})
+	_, err = a.custodyDeadline(ctx)
 	return err
 }
 
-type keep28DeleteTransport struct {
-	base             http.RoundTripper
-	authority        *keep28DeleteAuthority
-	bucket, endpoint string
-	attempted        atomic.Bool
-}
-
-func (t *keep28DeleteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.Method != http.MethodDelete || req.URL.Path != "/"+t.bucket+"/"+t.authority.binding.Key || req.URL.RawQuery != "x-id=DeleteObject" || !t.attempted.CompareAndSwap(false, true) {
-		return nil, errors.New("B2 transport permits one exact DELETE")
-	}
-	if err := t.authority.check(req.Context(), t.bucket, t.endpoint); err != nil {
-		return nil, err
-	}
-	bounded, cancel, err := t.authority.bound(req.Context())
-	if err != nil {
-		return nil, err
-	}
-	req = req.Clone(bounded)
-	req.Header.Del("Idempotency-Key")
-	req.Header.Del("X-Idempotency-Key")
-	response, err := t.base.RoundTrip(req)
-	if err != nil {
-		cancel()
-		return response, err
-	}
-	if response.Body == nil {
-		cancel()
-	} else {
-		response.Body = &keep28ResponseBody{ReadCloser: response.Body, cancel: cancel}
-	}
-	return response, nil
-}
-
-// Sample before every network handoff. A newer DB clock can shorten, never
-// extend, the lifetime measured from the original monotonic sample.
-func (a *keep28DeleteAuthority) bound(ctx context.Context) (context.Context, context.CancelFunc, error) {
+// custodyDeadline samples the DB clock at every custody check and network
+// handoff and keeps custodyEnd as the running minimum across every sample, so
+// each later handoff (first byte, socket deadline, confirming HEAD) ends no
+// later than the tightest one. A newer sample can bring it forward, never back.
+func (a *inverseDeleteAuthority) custodyDeadline(ctx context.Context) (time.Time, error) {
 	clock, err := keep28Clock(ctx, a.guard.tx)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if sampled := clock.deadline(a.custody.Expiry); sampled.Before(a.custodyEnd) {
+		a.custodyEnd = sampled
+	}
+	if !time.Now().Before(a.custodyEnd) {
+		return a.custodyEnd, errors.New("NAS custody expired at network boundary")
+	}
+	return a.custodyEnd, nil
+}
+
+// bound ends network work at custody end; the parent context keeps the key's
+// network deadline. RAW carries no custody and is bounded by the parent alone.
+func (a *inverseDeleteAuthority) bound(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	if a.guard.a.opts.Lane != inverseNASKeep28 {
+		return ctx, func() {}, nil
+	}
+	end, err := a.custodyDeadline(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	remaining := min(a.clock.remaining(a.custody.Expiry), clock.remaining(a.custody.Expiry))
-	if remaining <= 0 {
-		return nil, nil, errors.New("NAS custody expired at network boundary")
-	}
-	bounded, cancel := context.WithTimeout(ctx, min(inverseNetworkTimeout, remaining))
+	bounded, cancel := context.WithDeadline(ctx, end)
 	return bounded, cancel, nil
 }
-
-type keep28ResponseBody struct {
-	io.ReadCloser
-	cancel context.CancelFunc
-}
-
-func (b *keep28ResponseBody) Close() error { defer b.cancel(); return b.ReadCloser.Close() }

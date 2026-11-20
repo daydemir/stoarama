@@ -74,6 +74,8 @@ type inverseEntry struct {
 	r2.ObjectInfo
 	Class  inverseClass `json:"class"`
 	Reason string       `json:"reason"`
+	// Selected is the identity keep-28 selection observed; never serialized.
+	Selected keep28Identity `json:"-"`
 }
 type inverseSummary struct {
 	Version              int                           `json:"version"`
@@ -457,7 +459,7 @@ func partitionInverse(ctx context.Context, store inverseLister, p inverseProtect
 		seen[identity] = struct{}{}
 		previous = o.Key
 		class, reason := p.classify(o)
-		if err := encoder.Encode(inverseEntry{o, class, reason}); err != nil {
+		if err := encoder.Encode(inverseEntry{ObjectInfo: o, Class: class, Reason: reason}); err != nil {
 			return err
 		}
 		stat := sum.Classes[class]
@@ -516,7 +518,15 @@ func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 		return
 	}
 	if len(args) > 0 && args[0] == "job" {
-		runR2InverseJob(ctx, cfg, args[1:])
+		runR2InverseJob(ctx, cfg, args[1:], inverseOutsideKeep28)
+		return
+	}
+	if len(args) > 0 && args[0] == "job-keep28" {
+		runR2InverseJob(ctx, cfg, args[1:], inverseNASKeep28)
+		return
+	}
+	if len(args) > 0 && args[0] == "job-collated" {
+		runR2InverseJob(ctx, cfg, args[1:], inverseNonrawCollated)
 		return
 	}
 	if len(args) > 0 && args[0] == "exempt" {
