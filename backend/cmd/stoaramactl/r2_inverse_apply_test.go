@@ -1927,7 +1927,14 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				var heads atomic.Int64
 				store.mu.Lock()
 				store.wire = map[string]string{e.Key: c.wire}
-				store.onDelete = func(key string) { sent.Store(sent.Load() || key == e.Key) }
+				// The latch is monotone: eight workers call this concurrently, so
+				// a read-modify-write store would let another key's DELETE store
+				// false after the key under test stored true.
+				store.onDelete = func(key string) {
+					if key == e.Key {
+						sent.Store(true)
+					}
+				}
 				store.onHead = func(key string) string {
 					if key != e.Key || !sent.Load() {
 						return ""
