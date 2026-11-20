@@ -279,6 +279,72 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 			t.Fatalf("refused claim changed the bound attempt: %d %q %v", attempt, stamp, err)
 		}
 	})
+	t.Run("predecessor cannot insert an already leased hour", func(t *testing.T) {
+		// 0222 armed the guard on UPDATE only, so a row that arrives leased met
+		// no toolchain check at all. A direct insert is still a fresh bind.
+		var nativeStamp string
+		if err := pool.QueryRow(ctx, `SELECT nas_stitch_r2_native_profile()->>'manifest_sha256'`).Scan(&nativeStamp); err != nil {
+			t.Fatal(err)
+		}
+		const insertLeased = `INSERT INTO nas_stitch_r2_hours(scope_id,recording_id,hour_at,plan,plan_sha256,input_bytes,
+ state,attempt,lease_api_key_id,lease_token,lease_expires_at,lease_toolchain_sha256,lease_toolchain_attempt)
+ VALUES(1,30,$1,$2::jsonb,$3,100,'leased',1,47,repeat('c',64),clock_timestamp()+interval '1 minute',$4,$5)`
+		for _, test := range []struct {
+			name, stamp string
+			bound       any
+		}{
+			{"superseded v2 digest", nativeStamp, 1},
+			{"no stamp at all", "", nil},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback(ctx)
+				stamp := any(test.stamp)
+				if test.stamp == "" {
+					stamp = nil
+				}
+				if _, err := tx.Exec(ctx, insertLeased, hour.Add(2*time.Hour), string(raw), planDigest, stamp, test.bound); err == nil ||
+					!strings.Contains(err.Error(), "reviewed Durham lease toolchain required") {
+					t.Fatal("already-leased insert bypassed the AAC bind", err)
+				}
+			})
+		}
+		// The same direct bind with the active stamp is ordinary and admitted.
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx, insertLeased, hour.Add(2*time.Hour), string(raw), planDigest, nasDurhamManifestSHA, 1); err != nil {
+			t.Fatalf("active AAC bind was refused on insert: %v", err)
+		}
+	})
+	t.Run("predecessor cannot promote a prepopulated v2 hour to leased", func(t *testing.T) {
+		// 0222 fired only on attempt/lease_token writes, so a row parked with the
+		// superseded digest already stamped could be promoted by a state-only
+		// UPDATE that never touched the stamp columns.
+		var nativeStamp string
+		if err := pool.QueryRow(ctx, `SELECT nas_stitch_r2_native_profile()->>'manifest_sha256'`).Scan(&nativeStamp); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx, `UPDATE nas_stitch_r2_hours SET state='pending',attempt=4,
+ lease_api_key_id=47,lease_token=repeat('f',64),lease_expires_at=clock_timestamp()+interval '1 minute',
+ lease_toolchain_attempt=4,lease_toolchain_sha256=$2 WHERE id=$1`, id, nativeStamp); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE nas_stitch_r2_hours SET state='leased' WHERE id=$1`, id); err == nil ||
+			!strings.Contains(err.Error(), "reviewed Durham lease toolchain required") {
+			t.Fatal("state-only promote inherited the superseded v2 digest", err)
+		}
+	})
 	const insertStage = `INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes)
  OVERRIDING SYSTEM VALUE VALUES(123,$1,2,47,'stoarama',$2,$3,$4,100)`
 	outputPath := plan.OutputFolder + "/run-000-" + sha + ".mp4"

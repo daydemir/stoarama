@@ -34,8 +34,12 @@ LANGUAGE sql IMMUTABLE AS $$
 $$;
 
 -- A predecessor that replays its own old digest cannot take a fresh lease.
--- The stamp columns are in the fired set so a rewrite of the digest alone is
--- also a new bind rather than an inherited one.
+-- 0222 watched only attempt and lease_token on UPDATE, so two writes reached a
+-- leased row without ever consulting the toolchain: a direct INSERT that
+-- arrived already leased, and a state-only UPDATE whose prepopulated stamp was
+-- never edited. Both are new binds, so the replacement trigger fires on INSERT
+-- and on any write that leaves the row leased, and every such row must carry
+-- the active AAC stamp for its own attempt.
 CREATE OR REPLACE FUNCTION guard_nas_stitch_r2_native_lease() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
  IF NOT nas_stitch_r2_aac_attempt(NEW) THEN
@@ -45,10 +49,8 @@ BEGIN
 END $$;
 DROP TRIGGER nas_stitch_r2_native_lease_guard ON nas_stitch_r2_hours;
 CREATE TRIGGER nas_stitch_r2_native_lease_guard
- BEFORE UPDATE OF attempt,lease_token,lease_toolchain_sha256,lease_toolchain_attempt ON nas_stitch_r2_hours
- FOR EACH ROW WHEN (NEW.state='leased' AND
-  ROW(NEW.attempt,NEW.lease_token,NEW.lease_toolchain_sha256,NEW.lease_toolchain_attempt)
-   IS DISTINCT FROM ROW(OLD.attempt,OLD.lease_token,OLD.lease_toolchain_sha256,OLD.lease_toolchain_attempt))
+ BEFORE INSERT OR UPDATE OF state,attempt,lease_token,lease_toolchain_sha256,lease_toolchain_attempt ON nas_stitch_r2_hours
+ FOR EACH ROW WHEN (NEW.state='leased')
  EXECUTE FUNCTION guard_nas_stitch_r2_native_lease();
 
 -- New staging authority requires the active bind; the late provider-response
