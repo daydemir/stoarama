@@ -136,14 +136,16 @@ func TestR2InversePreIssuanceHonorsTheWireDeadlineNotAdmission(t *testing.T) {
 	})
 }
 
-// commitAckDelay slows the return of an already acknowledged COMMIT, so the
-// server's success can reach the caller after the pre-issuance bound expired
-// while the wire context stays healthy. The attempt is durable either way.
-// Matching happens per query on the context TraceQueryStart returns, so it is
-// safe under concurrent use and touches no production code.
+// commitAckDelay blocks the return of an already acknowledged COMMIT until the
+// traced context really expires, so the server's success reaches the caller
+// late while the wire context stays healthy. It records that a successful
+// COMMIT hook was observed, so the case can prove the ack actually happened
+// rather than merely that some deadline error surfaced. Matching happens per
+// query on the context TraceQueryStart returns, so it is safe under concurrent
+// use and touches no production code.
 type commitAckDelay struct {
-	delay time.Duration
-	armed atomic.Bool
+	armed    atomic.Bool
+	observed atomic.Bool
 }
 
 type commitAckKey struct{}
@@ -156,15 +158,32 @@ func (c *commitAckDelay) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data 
 }
 
 func (c *commitAckDelay) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
-	// The COMMIT was acknowledged (Err is nil); only its return is late.
-	if data.Err == nil && ctx.Value(commitAckKey{}) == true {
-		time.Sleep(c.delay)
+	if ctx.Value(commitAckKey{}) != true || data.Err != nil {
+		return
 	}
+	// The COMMIT was acknowledged with no error; only its return is late. Hold
+	// it until the traced context itself expires, which this test bounds.
+	c.observed.Store(true)
+	<-ctx.Done()
 }
+
+// stalledDeadlineContext reports a deadline that has already passed while its
+// Done channel never closes and Err stays nil, exactly as a late timer delivery
+// looks to a caller. An Err-only guard would let this context through.
+type stalledDeadlineContext struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c stalledDeadlineContext) Deadline() (time.Time, bool) { return c.deadline, true }
+func (c stalledDeadlineContext) Done() <-chan struct{}       { return nil }
+func (c stalledDeadlineContext) Err() error                  { return nil }
 
 // An attempt COMMIT acknowledged after admission expired must not mint
 // authority: the durable attempt stays held for reconciliation and no DELETE
-// leaves. An ambiguous COMMIT is still its own hard stop.
+// leaves. The case requires an observed successful COMMIT hook that is held
+// until the traced context really expires, so it proves the post-acknowledgement
+// refusal rather than any earlier deadline error.
 func TestR2InverseLateAcknowledgedAttemptCommitNeverMints(t *testing.T) {
 	f := newKeep28Fixture(t)
 	a := f.applier(t)
@@ -172,7 +191,7 @@ func TestR2InverseLateAcknowledgedAttemptCommitNeverMints(t *testing.T) {
 	if _, err := a.reserve(f.ctx, e); err != nil {
 		t.Fatal(err)
 	}
-	tracer := &commitAckDelay{delay: 900 * time.Millisecond}
+	tracer := &commitAckDelay{}
 	config := f.pool.Config()
 	config.ConnConfig = config.ConnConfig.Copy()
 	config.ConnConfig.Tracer = tracer
@@ -185,7 +204,7 @@ func TestR2InverseLateAcknowledgedAttemptCommitNeverMints(t *testing.T) {
 	tracer.armed.Store(true)
 	// Admission expires while the wire parent stays healthy, so only the late
 	// acknowledgement can end pre-issuance.
-	admitCtx, cancelAdmit := context.WithTimeout(f.ctx, 300*time.Millisecond)
+	admitCtx, cancelAdmit := context.WithTimeout(f.ctx, 400*time.Millisecond)
 	defer cancelAdmit()
 	wireCtx, cancelWire := context.WithTimeout(f.ctx, 30*time.Second)
 	defer cancelWire()
@@ -193,11 +212,21 @@ func TestR2InverseLateAcknowledgedAttemptCommitNeverMints(t *testing.T) {
 	if err == nil {
 		t.Fatal("a late acknowledged attempt COMMIT still issued wire authority")
 	}
-	if wireCtx.Err() != nil {
-		t.Fatal("the wire deadline ended the case instead of the admission bound")
+	if !tracer.observed.Load() {
+		t.Fatal("no successful COMMIT hook was observed, so the case never exercised a late acknowledgement")
+	}
+	if admitCtx.Err() == nil {
+		t.Fatal("admission did not actually expire, so the acknowledgement was never late")
+	}
+	// Explicit post-acknowledgement refusal, not merely some deadline error.
+	if !errors.Is(err, errInverseLateAttemptCommit) {
+		t.Fatalf("late acknowledgement was not reported as its own refusal: %v", err)
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("late acknowledgement was not reported as the expired pre-issuance bound: %v", err)
+		t.Fatalf("late acknowledgement did not preserve the deadline meaning: %v", err)
+	}
+	if wireCtx.Err() != nil {
+		t.Fatal("the wire deadline ended the case instead of the admission bound")
 	}
 	if strings.Contains(err.Error(), "COMMIT outcome unknown") {
 		t.Fatalf("an acknowledged COMMIT was reported as ambiguous: %v", err)
@@ -213,6 +242,34 @@ func TestR2InverseLateAcknowledgedAttemptCommitNeverMints(t *testing.T) {
 	err = f.authorizeOver(t, a, f.ctx, f.ctx, e)
 	if err == nil || !strings.Contains(err.Error(), "already issued") {
 		t.Fatalf("a durable late-acknowledged attempt was re-minted: %v", err)
+	}
+}
+
+// A context timer delivered late leaves Err nil past its deadline. The guard
+// must still refuse, using the real monotonic clock against the context's own
+// deadline, so a lagging timer cannot re-enable the wire.
+func TestR2InversePreIssuanceExpiredResistsLateTimerDelivery(t *testing.T) {
+	stalled := stalledDeadlineContext{Context: context.Background(), deadline: time.Now().Add(-time.Second)}
+	if stalled.Err() != nil {
+		t.Fatal("the sentinel reported an error, so it cannot stand for a late timer")
+	}
+	if err := inversePreIssuanceExpired(stalled); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a past deadline with no timer delivery was not refused: %v", err)
+	}
+	// A live bound is still not expired, and an explicit error keeps its own
+	// meaning.
+	if err := inversePreIssuanceExpired(context.Background()); err != nil {
+		t.Fatalf("an unbounded context was refused: %v", err)
+	}
+	live, cancelLive := context.WithTimeout(context.Background(), time.Minute)
+	defer cancelLive()
+	if err := inversePreIssuanceExpired(live); err != nil {
+		t.Fatalf("a live bound was refused: %v", err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := inversePreIssuanceExpired(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("an explicit cancel lost its meaning: %v", err)
 	}
 }
 

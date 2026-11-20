@@ -228,7 +228,7 @@ func (a *inverseApplier) authorize(admitCtx, wireCtx context.Context, tx pgx.Tx,
 	}
 	// Nothing is minted once the wire deadline has passed: authority that can
 	// never send must not exist, so this fails before the attempt insert.
-	if err = preIssue.Err(); err != nil {
+	if err = inversePreIssuanceExpired(preIssue); err != nil {
 		return fail(fmt.Errorf("pre-issuance ended before wire authority could be issued: %w", err))
 	}
 	// Independent commit precedes capability issuance. Even another verifier or
@@ -242,13 +242,38 @@ func (a *inverseApplier) authorize(admitCtx, wireCtx context.Context, tx pgx.Tx,
 	// durable attempt stays held: it is never retried, and no DELETE may mint
 	// from authority that outlived its bound. Only an *acknowledged* commit
 	// reaches this check; an ambiguous one already failed above and is held.
-	if err = preIssue.Err(); err != nil {
-		return fail(fmt.Errorf("wire authority outlived its pre-issuance bound: %w", err))
+	if err = inversePreIssuanceExpired(preIssue); err != nil {
+		return fail(fmt.Errorf("%w: %w", errInverseLateAttemptCommit, err))
 	}
 	if issued != 1 {
 		return fail(errors.New("inverse wire authority was already issued; reconcile only"))
 	}
 	return &inverseDeleteAuthority{binding: binding, guard: guard, used: &atomic.Bool{}, gate: gate, ctx: ctx, cancel: cancel, custody: custody, custodyEnd: custodyEnd}, nil
+}
+
+// errInverseLateAttemptCommit reports a wire attempt COMMIT its server
+// acknowledged after the pre-issuance bound had already passed. It always wraps
+// context.DeadlineExceeded, so the deadline meaning is preserved, and it is
+// deliberately distinct from an ambiguous COMMIT: that one never reaches this
+// check, because an unknown outcome is held before any authority could exist.
+var errInverseLateAttemptCommit = errors.New("wire attempt committed after its pre-issuance bound")
+
+// inversePreIssuanceExpired reports whether the effective pre-issuance bound has
+// passed. A context timer can be delivered late, so Err() alone stays nil for a
+// while after the deadline; comparing the monotonic wall clock against the
+// context's own deadline closes that window instead of re-enabling the wire.
+func inversePreIssuanceExpired(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return nil
+	}
+	if !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 // issueAttempt records the wire attempt in its own transaction, so it commits
