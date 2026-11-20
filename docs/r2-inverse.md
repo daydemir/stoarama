@@ -87,18 +87,47 @@ publication attempt) gets its own 2 minutes. A timeout retains the intent for
 reconciliation. There is one DELETE attempt, no SDK replay or redirects. A DELETE
 whose request was fully written but which got no answer by its deadline is a lost
 response: only its key is held. Success requires
-a confirming 404 for the exact key. The confirming HEAD is a read, so it alone
-retries, in the executor's own loop rather than the SDK's: at most 4 attempts of
-at most 4 seconds each, with full-jitter backoff of at most 2 seconds between
-them, under its own 22-second deadline inside the key's network deadline (and,
-for keep-28, custody end). Each attempt is one request on its own fresh HTTP/1.1
-connection with keep-alives off, so neither the transport nor the SDK can turn
-one attempt into two: four attempts send exactly four HEADs. Only timeouts,
-connection errors, 429, every 5xx (including a proxy's 520-599) and throttling
-retry, and a provider's `X-Amz-Retry-After` never stretches the
-backoff. It follows no redirect: a 404 from anywhere but the key cannot confirm
-it. A 200 means the object remains: it fails at once. When every attempt fails,
-the job stops and the key stays held, as a lost response does.
+a confirming 404 for the exact key. Every read the job makes is safe to repeat,
+so one bounded policy covers them all: a LIST page, a multipart inventory page,
+the pre-DELETE identity HEAD and the confirming HEAD each retry in the executor's
+own loop rather than the SDK's (which is disabled on these paths, so the caps are
+real). Each gets at most 4 tries with jittered backoff of at most 2 seconds
+between them, and each honors the provider's own floor: `Retry-After` as delta
+seconds or an HTTP date, and R2's millisecond `X-Amz-Retry-After`. A suggestion
+past the 30-second cap, or past what is left of that read's budget, stops the read
+cleanly instead — the retry is never sent early. A header value is clamped, so a
+hostile duration cannot overflow. The confirming HEAD keeps its reviewed
+22-second deadline inside the key's network deadline (and, for keep-28, custody
+end); the pre-DELETE HEAD keeps the existing 30-second network bound it already
+had; a LIST or multipart page attempt is finite on its own (60 seconds) even when
+the command has no deadline — that bounds one page, never the whole bucket
+listing — and a retried page keeps its `ContinuationToken`/markers, so it never
+relists from the first page. The LIST loop and multipart eligibility and
+continuation validation are the existing `r2.Client` code, reached through narrow
+read options. Each confirming attempt is one request on its own fresh HTTP/1.1
+connection with keep-alives off, so neither the transport nor the SDK can turn one
+attempt into two. Only timeouts, connection errors, 429, every 5xx (including a
+proxy's 520-599) and throttling retry. The confirming HEAD follows no redirect: a
+404 from anywhere but the key cannot confirm it. A 200 means the object remains:
+it fails at once. When every attempt fails, the job stops and the key stays held,
+as a lost response does. Anything read before the DELETE was issued stays held and
+unpublished; no read failure ever retries the DELETE.
+
+One rate limiter belongs to the job's single store and is shared by every worker
+and every read type. A 429 — or any transient status carrying `Retry-After` — sets
+a job-wide cooldown, so every reader waits for the same instant and the job does
+not re-create the herd that caused the throttle. The cooldown is published on the
+store, never while holding a database lock. A reader that waited re-reads the gate
+on every wake, so an extension published while it slept extends its wait; readers
+the cooldown releases leave staggered inside one jitter window. A throttle on the
+final permitted try, or a `Retry-After` past the cap or past the read's own
+budget, still sets the cooldown before that reader stops, so the job's subsequent
+new reads stay fenced. The cooldown ends early when the job's context is
+cancelled. The pre-DELETE HEAD is the one read that runs while the key's shared
+protection locks are held; that is deliberate, because it is the exact identity
+and `LastModified` authority for the DELETE. It adds no new bound: it lives inside
+the wire transaction's existing network budget and holds only shared locks, so the
+tradeoff is bounded sharing, not extended custody.
 
 A publication step whose parent context ended first — the job cancelled or its
 deadline passed before the step's own 2-minute bound — stops the job and holds

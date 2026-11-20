@@ -518,6 +518,41 @@ func (c *Client) PutMultipart(ctx context.Context, key, contentType string, body
 	return cleanETag(aws.ToString(out.ETag)), nil
 }
 
+// ReadOptions narrows one read to a caller's own transport and retry policy.
+// The zero value keeps the client's reviewed defaults, so unrelated callers are
+// unchanged. A caller that needs a real attempt cap sets Retryer to a nop
+// retryer and drives its own loop.
+type ReadOptions struct {
+	HTTPClient *http.Client
+	Retryer    aws.Retryer
+}
+
+func (o ReadOptions) apply(opts *s3.Options) {
+	if o.HTTPClient != nil {
+		opts.HTTPClient = o.HTTPClient
+	}
+	if o.Retryer != nil {
+		opts.Retryer = o.Retryer
+	}
+}
+
+// HeadWithOptions reads one key's exact identity with the caller's read options.
+func (c *Client) HeadWithOptions(ctx context.Context, key string, read ReadOptions) (ObjectHead, error) {
+	out, err := c.s3.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+	}, read.apply)
+	if err != nil {
+		return ObjectHead{}, fmt.Errorf("head object %s: %w", key, err)
+	}
+	return objectHead(out), nil
+}
+
+// objectHead normalizes one provider HEAD answer for every caller.
+func objectHead(out *s3.HeadObjectOutput) ObjectHead {
+	return ObjectHead{LastModified: aws.ToTime(out.LastModified), ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId)), SHA256Metadata: strings.TrimSpace(out.Metadata["sha256"])}
+}
+
 func (c *Client) Head(ctx context.Context, key string) (ObjectHead, error) {
 	out, err := c.s3.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(c.bucket),
@@ -526,7 +561,7 @@ func (c *Client) Head(ctx context.Context, key string) (ObjectHead, error) {
 	if err != nil {
 		return ObjectHead{}, fmt.Errorf("head object %s: %w", key, err)
 	}
-	return ObjectHead{LastModified: aws.ToTime(out.LastModified), ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId)), SHA256Metadata: strings.TrimSpace(out.Metadata["sha256"])}, nil
+	return objectHead(out), nil
 }
 
 // HeadExact resolves one immutable generation and refuses a changed ETag.
@@ -625,10 +660,32 @@ func (c *Client) Open(ctx context.Context, key string) (io.ReadCloser, error) {
 }
 
 func (c *Client) ListPrefix(ctx context.Context, prefix string, limit int, fn func(ObjectInfo) error) error {
+	return c.ListPrefixWithOptions(ctx, prefix, limit, ReadOptions{}, fn)
+}
+
+// ListPrefixWithOptions paginates the bucket under the caller's read options.
+// Each page is one request; a caller that caps attempts disables the SDK retryer
+// and passes its own HTTP client.
+func (c *Client) ListPrefixWithOptions(ctx context.Context, prefix string, limit int, read ReadOptions, fn func(ObjectInfo) error) error {
+	return c.ListPrefixWithPage(ctx, prefix, limit, func(ctx context.Context, in *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error) {
+		return c.ListObjectsPage(ctx, in, read)
+	}, fn)
+}
+
+// ListObjectsPage reads exactly one LIST page under the caller's read options.
+func (c *Client) ListObjectsPage(ctx context.Context, in *s3.ListObjectsV2Input, read ReadOptions) (*s3.ListObjectsV2Output, error) {
+	return c.s3.ListObjectsV2(ctx, in, read.apply)
+}
+
+// ListPrefixWithPage runs the reviewed LIST loop, taking one page from the
+// caller. The caller decides how many tries one page gets and what transport
+// carries them; this loop alone keeps the continuation token, advances it and
+// validates that it advances.
+func (c *Client) ListPrefixWithPage(ctx context.Context, prefix string, limit int, page func(context.Context, *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error), fn func(ObjectInfo) error) error {
 	var token *string
 	seen := 0
 	for {
-		out, err := c.s3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		out, err := page(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(c.bucket),
 			Prefix:            aws.String(prefix),
 			ContinuationToken: token,
