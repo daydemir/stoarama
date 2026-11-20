@@ -74,9 +74,11 @@ func backendPID(t *testing.T, tx pgx.Tx) uint32 {
 // blockedBy waits until a backend waits on holder and returns its PID.
 func blockedBy(t *testing.T, pool *pgxpool.Pool, holder uint32, what string) uint32 {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
 		var waiter uint32
-		err := pool.QueryRow(context.Background(), `SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid))`, holder).Scan(&waiter)
+		err := pool.QueryRow(ctx, `SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid))`, holder).Scan(&waiter)
 		if err == nil {
 			return waiter
 		}
@@ -99,9 +101,11 @@ func within[T any](t *testing.T, ch <-chan T, what string) T {
 
 // The receipt owns its copy row, so any busy lock the certificate needs
 // refuses it at once and frees the copy row; the client retries.
-func testStitchReceiptNeverWaits(t *testing.T, pool *pgxpool.Pool, post func() int, copyID, hourID int64, inputKey string) {
+func testStitchReceiptNeverWaits(t *testing.T, pool *pgxpool.Pool, post func() int, copyID, hourID int64, inputKey, secondKey string) {
 	t.Helper()
-	ctx := context.Background()
+	// Bounded: a starved pool or a stuck lock fails here instead of hanging CI.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
 	for _, holder := range []struct {
 		name, sql string
 		args      []any
@@ -112,6 +116,8 @@ func testStitchReceiptNeverWaits(t *testing.T, pool *pgxpool.Pool, post func() i
 		{"input clip", `SELECT 1 FROM recording_clips WHERE object_key=$1 FOR UPDATE`, []any{inputKey}},
 		{"input inventory", `SELECT 1 FROM nas_inventory_files f JOIN recording_clips c ON c.id=f.clip_id
  WHERE f.connection_id=13 AND c.object_key=$1 FOR UPDATE OF f`, []any{inputKey}},
+		{"connection 13", `SELECT 1 FROM connections WHERE id=13 FOR UPDATE`, nil},
+		{"second input hold", `SELECT 1 FROM nas_stitch_r2_input_holds WHERE object_key=$1 FOR UPDATE`, []any{secondKey}},
 	} {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
@@ -136,6 +142,15 @@ func testStitchReceiptNeverWaits(t *testing.T, pool *pgxpool.Pool, post func() i
 			t.Fatalf("receipt kept the copy row behind its busy %s: %v", holder.name, err)
 		}
 		copyRow.Rollback(ctx)
+		var verified bool
+		var certificates, released int
+		if err = pool.QueryRow(ctx, `SELECT (SELECT state='verified' FROM nas_r2_copy_items WHERE id=$1),
+ (SELECT count(*) FROM nas_stitch_r2_certificates WHERE hour_id=$2),
+ (SELECT count(*) FROM nas_stitch_r2_input_holds WHERE hour_id=$2 AND released_at IS NOT NULL)`, copyID, hourID).
+			Scan(&verified, &certificates, &released); err != nil || verified || certificates != 0 || released != 0 {
+			t.Fatalf("refused receipt behind its busy %s left durable state: verified %v certificates %d released %d %v",
+				holder.name, verified, certificates, released, err)
+		}
 		tx.Rollback(ctx)
 	}
 }
@@ -149,7 +164,9 @@ type durhamExtraHours struct {
 // plan order, and returns their later planned import.
 func addDurhamHours(t *testing.T, pool *pgxpool.Pool, hour time.Time, endpoint, sha string) durhamExtraHours {
 	t.Helper()
-	ctx := context.Background()
+	// Bounded: a starved pool or a stuck lock fails here instead of hanging CI.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
 	var hours durhamExtraHours
 	for n, start := range []time.Time{hour.Add(time.Hour), hour.Add(time.Hour + time.Minute), hour.Add(2 * time.Hour), hour.Add(2*time.Hour + time.Minute)} {
 		id, key, path := 911+n, fmt.Sprintf("managed/durham-%c.mp4", 'z'-n), fmt.Sprintf("fixture/extra-%d.mp4", n)
@@ -193,7 +210,9 @@ func addDurhamHours(t *testing.T, pool *pgxpool.Pool, hour time.Time, endpoint, 
 // every input released.
 func testStitchCertKeyContention(t *testing.T, pool *pgxpool.Pool, certify func(pgx.Tx) error, inputKey, freeKey string, extra durhamExtraHours) error {
 	t.Helper()
-	ctx := context.Background()
+	// Bounded: a starved pool or a stuck lock fails here instead of hanging CI.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
 	// A running RAW batch owns the executors' outer lock throughout.
 	defer holdSessionLock(t, pool, "7343226011173")()
 	// Another RAW key and row stay locked across the whole certificate.
@@ -280,11 +299,13 @@ func stitchStageGuard(objectID int64) string {
 
 func holdSessionLock(t *testing.T, pool *pgxpool.Pool, key string) func() {
 	t.Helper()
-	conn, err := pool.Acquire(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = conn.Exec(context.Background(), `SELECT pg_advisory_lock(`+key+`)`); err != nil {
+	if _, err = conn.Exec(ctx, `SELECT pg_advisory_lock(`+key+`)`); err != nil {
 		t.Fatal(err)
 	}
 	return func() {

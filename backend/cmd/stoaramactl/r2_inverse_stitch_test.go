@@ -274,3 +274,36 @@ func TestKeep28PostIntentStitchConflictHalts(t *testing.T) {
 		t.Fatalf("post-intent key lost its durable intent: %d %v", intents, err)
 	}
 }
+
+// Keep-28 reserve locks the NAS custody row after the protection locks. A busy
+// custody row is awaited with no protection lock held.
+func TestKeep28ReserveAwaitsCustodyWithoutProtectionLocks(t *testing.T) {
+	f := newKeep28Fixture(t)
+	a := f.applier(t)
+	publication, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publication.Rollback(f.ctx)
+	if _, err = publication.Exec(f.ctx, `SELECT 1 FROM nas_inventory_files WHERE clip_id=9000001 FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	reserved := make(chan error, 1)
+	go func() { _, err := a.reserve(f.ctx, f.entry(t)); reserved <- err }()
+	waitBlockedBy(t, f.pool, stitchBackendPID(t, publication), "keep-28 reserve behind its custody row")
+	mutator, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mutator.Rollback(f.ctx)
+	prompt, cancel := context.WithTimeout(f.ctx, 5*time.Second)
+	defer cancel()
+	if _, err = mutator.Exec(prompt, `SELECT pg_advisory_xact_lock(7343226011103),pg_advisory_xact_lock(7343226011101)`); err != nil {
+		t.Fatalf("legacy mutator queued behind a reserve awaiting custody: %v", err)
+	}
+	mutator.Rollback(f.ctx)
+	publication.Rollback(f.ctx)
+	if err = within(t, reserved, "keep-28 reserve behind its custody row"); err != nil || keep28Durable(t, f, f.key) != 2 {
+		t.Fatalf("keep-28 reserve did not complete after custody freed: %v", err)
+	}
+}

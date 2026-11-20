@@ -61,20 +61,23 @@ func (c keep28Custody) identity() keep28Identity {
 func (a *inverseApplier) lockKeep28Custody(ctx context.Context, tx pgx.Tx, t inverseRawTarget) (keep28Custody, error) {
 	c := keep28Custody{ConnectionID: 13, SourceID: t.ID, SizeBytes: t.Size, Path: t.Path, SHA: t.SHA}
 	item := r2RetireItem{r2RetireCandidate: r2RetireCandidate{Kind: "raw", SourceID: t.ID, SizeBytes: t.Size, SHA256: t.SHA, RelativePath: t.Path}}
-	expiry, fresh, err := r2RetireLockNASProof(ctx, tx, item, c.ConnectionID)
+	// Admission holds the protection locks here, so it never waits on custody.
+	custody := inverseWait{`SELECT 1 FROM nas_inventory_files WHERE connection_id=$1 AND clip_id=$2 FOR SHARE`, []any{c.ConnectionID, c.SourceID}}
+	expiry, fresh, err := r2RetireLockNASProof(ctx, tx, item, c.ConnectionID, r2RetireShareNoWait)
 	if err != nil {
-		return c, fmt.Errorf("exact present NAS identity no longer lockable: %w", err)
+		return c, inverseRowBusy(fmt.Errorf("exact present NAS identity no longer lockable: %w", err), custody)
 	}
 	// The row is already FOR SHARE locked; capture the entire proof in a locked
 	// read too. A changed sidecar/timestamp cannot hide behind an unchanged expiry.
-	err = tx.QueryRow(ctx, `SELECT state,verified_at,server_received_at,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256 FROM nas_inventory_files WHERE connection_id=$1 AND clip_id=$2 AND relative_path=$3 AND size_bytes=$4 AND sha256=$5 FOR SHARE`, c.ConnectionID, c.SourceID, c.Path, c.SizeBytes, c.SHA).Scan(&c.State, &c.VerifiedAt, &c.ReceivedAt, &c.SidecarPath, &c.SidecarSize, &c.SidecarSHA)
+	err = tx.QueryRow(ctx, `SELECT state,verified_at,server_received_at,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256 FROM nas_inventory_files WHERE connection_id=$1 AND clip_id=$2 AND relative_path=$3 AND size_bytes=$4 AND sha256=$5 FOR SHARE NOWAIT`, c.ConnectionID, c.SourceID, c.Path, c.SizeBytes, c.SHA).Scan(&c.State, &c.VerifiedAt, &c.ReceivedAt, &c.SidecarPath, &c.SidecarSize, &c.SidecarSHA)
 	c.VerifiedAt = c.VerifiedAt.UTC()
 	c.ReceivedAt = c.ReceivedAt.UTC()
 	c.Expiry = expiry.UTC()
+	// The row is share-locked; the sidecar read above cannot hide a change.
 	if err == nil && !fresh {
-		err = fmt.Errorf("exact present NAS identity no longer lockable: %w", errR2RetireNASProofAged)
+		return c, fmt.Errorf("exact present NAS identity no longer lockable: %w", errR2RetireNASProofAged)
 	}
-	return c, err
+	return c, inverseRowBusy(err, custody)
 }
 
 // keep28AdmissionCustody is the custody a key needs left to be selected: one

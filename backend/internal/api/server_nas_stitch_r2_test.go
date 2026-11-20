@@ -38,6 +38,7 @@ func TestR2StitchDurhamHoldReleasedOnlyByCommittedNASCertificate(t *testing.T) {
 	var stageHeadResponse atomic.Int32
 	provider := durhamStageTestProvider(t, media, sha, abortKey, &abort, &stageHeadResponse)
 	defer provider.Close()
+	defer abort.release()
 	admin, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -53,6 +54,9 @@ func TestR2StitchDurhamHoldReleasedOnlyByCommittedNASCertificate(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	// The lock contention helpers hold several sessions open at once; pgxpool's
+	// default (NumCPU, 4 on CI) starves the code under test.
+	cfg.MaxConns = 16
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -519,7 +523,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at)
  VALUES(13,902,30,'fixture/raw2.mp4',100,$1,'present',now(),now())`, sha)
 	exec(`UPDATE nas_r2_copy_items SET lease_expires_at=clock_timestamp()+interval '2 minutes' WHERE id=$1`, copyID)
-	testStitchReceiptNeverWaits(t, pool, func() int { return post(47, request) }, copyID, id, sourceKey)
+	testStitchReceiptNeverWaits(t, pool, func() int { return post(47, request) }, copyID, id, sourceKey, "managed/durham-fixture-2.mp4")
 	if err := testStitchCertKeyContention(t, pool, func(tx pgx.Tx) error {
 		return finishNASR2StitchCopy(ctx, tx, nasR2CopyTask{ID: copyID, Item: item}, request)
 	}, sourceKey, "managed/keep-ranking.mp4", extra); err != nil {
@@ -598,7 +602,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		t.Fatal("a concurrent staging retirement invocation was admitted", err)
 	}
 	abort.holdDelete.Store(false)
-	close(abort.deleteRelease)
+	abort.release()
 	if err := within(t, racing, "first staging retirement"); err == nil || !strings.Contains(err.Error(), "outcome unconfirmed") {
 		t.Fatalf("expected the provider to lose the DELETE result after both grants drained: %v", err)
 	}
@@ -709,11 +713,17 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 
 type durhamStageAbortProbe struct {
 	response, lists, heads atomic.Int32
-	// Object DELETEs are counted; while holdDelete is set one waits for release.
+	// Object DELETEs are counted. While holdDelete is set they wait for
+	// release; the first closes deleteEntered.
 	deletes                      atomic.Int32
 	holdDelete                   atomic.Bool
 	deleteEntered, deleteRelease chan struct{}
+	entered, released            sync.Once
 }
+
+// release frees every held DELETE; the test defers it ahead of the server's
+// Close so a regression fails instead of hanging.
+func (p *durhamStageAbortProbe) release() { p.released.Do(func() { close(p.deleteRelease) }) }
 
 func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, abort *durhamStageAbortProbe, stageHeadResponse *atomic.Int32) *httptest.Server {
 	t.Helper()
@@ -726,7 +736,7 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, a
 		if r.Method == http.MethodDelete && !r.URL.Query().Has("uploadId") {
 			abort.deletes.Add(1)
 			if abort.holdDelete.Load() {
-				abort.deleteEntered <- struct{}{}
+				abort.entered.Do(func() { close(abort.deleteEntered) })
 				<-abort.deleteRelease
 			}
 		}

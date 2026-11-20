@@ -114,7 +114,7 @@ func (a *inverseApplier) prepareWireTarget(ctx context.Context, tx pgx.Tx, e inv
 	if err := inverseProtectionLocks(ctx, tx, true); err != nil {
 		return inverseRawTarget{}, err
 	}
-	if _, err := tx.Exec(ctx, `SELECT lock_nas_r2_copy_key($1,$2)`, a.store.Bucket(), e.Key); err != nil {
+	if err := lockInverseCopyKey(ctx, tx, a.store.Bucket(), e.Key); err != nil {
 		return inverseRawTarget{}, err
 	}
 	target, err := a.loadTarget(ctx, tx, e)

@@ -306,13 +306,21 @@ func r2RetireDecideForScope(c r2RetireCandidate, scope r2RetireScope, windows ma
 	return r2RetireDecideMode(c, scope.Bucket, windows, picks, scope.NASBacked)
 }
 
+// r2RetireNASLock is how the exact NAS identity row is share-locked.
+type r2RetireNASLock string
+
+const (
+	r2RetireShare       r2RetireNASLock = "FOR SHARE"
+	r2RetireShareNoWait r2RetireNASLock = "FOR SHARE NOWAIT"
+)
+
 // errR2RetireNASProofAged reports an exact, present NAS proof that has aged out
 // of its 24-hour freshness window. A changed identity, sidecar or state, or a
 // future verification, is never this error.
 var errR2RetireNASProofAged = errors.New("NAS proof aged out of its 24-hour window")
 
-func r2RetireLockNASIdentity(ctx context.Context, q r2RetireQuerier, it r2RetireItem, connectionID int64) (time.Time, error) {
-	expiry, fresh, err := r2RetireLockNASProof(ctx, q, it, connectionID)
+func r2RetireLockNASIdentity(ctx context.Context, q r2RetireQuerier, it r2RetireItem, connectionID int64, lock r2RetireNASLock) (time.Time, error) {
+	expiry, fresh, err := r2RetireLockNASProof(ctx, q, it, connectionID, lock)
 	if err == nil && !fresh {
 		err = errR2RetireNASProofAged
 	}
@@ -326,7 +334,7 @@ func r2RetireLockNASIdentity(ctx context.Context, q r2RetireQuerier, it r2Retire
 // selection whatever its age, and reports its expiry and whether it is still
 // fresh, so a caller can compare the proof before classifying its age. A changed
 // identity, sidecar path or state, or a future verification, locks no row.
-func r2RetireLockNASProof(ctx context.Context, q r2RetireQuerier, it r2RetireItem, connectionID int64) (time.Time, bool, error) {
+func r2RetireLockNASProof(ctx context.Context, q r2RetireQuerier, it r2RetireItem, connectionID int64, lock r2RetireNASLock) (time.Time, bool, error) {
 	// The supported apply path is RAW only.
 	if it.Kind != "raw" {
 		return time.Time{}, false, errors.New("NAS custody lock requires RAW identity")
@@ -339,7 +347,7 @@ func r2RetireLockNASProof(ctx context.Context, q r2RetireQuerier, it r2RetireIte
  AND n.sha256=$2 AND n.size_bytes=$3 AND n.clip_id=$4 AND n.relative_path=$5
  AND n.verified_at<=clock_timestamp()+interval '5 minutes'
  AND n.sidecar_relative_path=$5||'.stoarama.json' AND n.sidecar_size_bytes>0 AND n.sidecar_sha256 ~ '^[a-f0-9]{64}$'
- FOR SHARE`, connectionID, it.SHA256, it.SizeBytes, it.SourceID, it.RelativePath).Scan(&expiry, &fresh)
+ `+string(lock), connectionID, it.SHA256, it.SizeBytes, it.SourceID, it.RelativePath).Scan(&expiry, &fresh)
 	return expiry, fresh, err
 }
 

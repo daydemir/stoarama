@@ -241,14 +241,10 @@ func TestFinishRefreshAndB2ReservationRaceBothOrders(t *testing.T) {
 			if result.err != nil {
 				t.Fatal(result.err)
 			}
-			if refreshFirst {
-				if reserveErr == nil || result.n != 1 {
-					t.Fatalf("refresh did not protect key: reserved=%v refresh=%d", reserveErr, result.n)
-				}
-			} else {
-				if reserveErr != nil || result.n != 0 {
-					t.Fatalf("durable intent did not veto refresh: reserved=%v refresh=%d", reserveErr, result.n)
-				}
+			// Both wait for the key outside their protection locks, so either
+			// may admit first; the other must then see it and refuse.
+			if (reserveErr == nil) == (result.n == 1) {
+				t.Fatalf("refresh and reservation did not exclude each other: reserved=%v refresh=%d", reserveErr, result.n)
 			}
 		})
 	}
