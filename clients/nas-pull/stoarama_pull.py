@@ -810,7 +810,7 @@ def cleanup_session_headers(path):
     return {}
 
 
-def request_json(cfg, method, path_or_url, base=None, body=None, timeout=HTTP_TIMEOUT_SEC, authenticate=True):
+def request_json(cfg, method, path_or_url, base=None, body=None, timeout=HTTP_TIMEOUT_SEC, authenticate=True, *, read_limit=None):
     base = cfg.api_base if base is None else base
     url = path_or_url if path_or_url.startswith("http") else base + path_or_url
     data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -825,7 +825,9 @@ def request_json(cfg, method, path_or_url, base=None, body=None, timeout=HTTP_TI
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             remember_response_secrets(response)
-            raw = response.read()
+            raw = response.read() if read_limit is None else response.read(read_limit + 1)
+            if read_limit is not None and len(raw) > read_limit:
+                raise RuntimeError("JSON response exceeds its bound")
     except urllib.error.HTTPError as exc:
         remember_response_secrets(exc)
         raise
@@ -1886,6 +1888,7 @@ class Runtime:
         self.cursor_id = max(0, int(progress.get("after_id", 0)))
         self.collated_after_id = 0
         self.collated_next_poll = 0.0
+        self.handoff_final_check_requested = threading.Event()
         self.clips_pulled = max(0, int(progress.get("clips_pulled", 0)))
         self.bytes_pulled = max(0, int(progress.get("bytes_pulled", 0)))
         self.phase = Phase.STARTING
@@ -2125,7 +2128,7 @@ class Runtime:
         with self.lock:
             self.joined_transfer = None
 
-    def reserve_joined_storage(self, cfg, storage, expected_bytes):
+    def reserve_joined_storage(self, cfg, storage, expected_bytes, *, min_floor=0):
         """Reserve one joined range only when it cannot consume raw headroom."""
         available = bool(storage.get("available"))
         free_bytes = int(storage.get("free_bytes", 0)) if available else 0
@@ -2136,7 +2139,7 @@ class Runtime:
                 cfg.min_free_bytes + JOINED_RAW_HEADROOM_BYTES
                 + (CAPACITY_RESUME_HYSTERESIS_BYTES if self.capacity_blocked else 0)
             )
-            if not available or usable_free < threshold:
+            if not available or usable_free < max(threshold, min_floor):
                 return False
             self.capacity_reserved_bytes += expected_bytes
             return True
@@ -19236,7 +19239,11 @@ def set_idle_unless_capacity_blocked(runtime):
     runtime.set_phase(Phase.BLOCKED if runtime.is_capacity_blocked() else Phase.IDLE)
 
 
-def acquire_lock(cfg):
+def collated_handoff_pending(cfg):
+    return cfg.state_dir / "delivery-nas-handoff-pending.json"
+
+
+def acquire_lock(cfg, *, handoff_finalizer=False):
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     handle = open(cfg.lock_file, "a+", encoding="utf-8")
     try:
@@ -19244,6 +19251,9 @@ def acquire_lock(cfg):
     except BlockingIOError as exc:
         handle.close()
         raise RuntimeError("another NAS pull client already holds %s" % cfg.lock_file) from exc
+    if not handoff_finalizer and os.path.lexists(collated_handoff_pending(cfg)):
+        handle.close()
+        raise RuntimeError("NAS handoff acceptance is unresolved; rerun delivery-handoff-check before starting writers")
     return handle
 
 
@@ -23920,8 +23930,11 @@ def valid_collated_relative_path(value):
 
 
 def valid_collated_policy(raw):
-    if not isinstance(raw, dict) or set(raw) != {"enabled", "download_bytes_per_sec", "download_parallel"}:
+    fields = {"enabled", "download_bytes_per_sec", "download_parallel"}
+    if not isinstance(raw, dict) or set(raw) not in (fields, fields | {"handoff_check"}):
         raise ValueError("collated policy is invalid")
+    if "handoff_check" in raw and raw["handoff_check"] is not True:
+        raise ValueError("collated handoff policy is invalid")
     enabled, rate, parallel = raw["enabled"], raw["download_bytes_per_sec"], raw["download_parallel"]
     if (
         type(enabled) is not bool or type(rate) is not int or type(parallel) is not int
@@ -23929,22 +23942,35 @@ def valid_collated_policy(raw):
         or not 1 <= parallel <= COLLATED_MAX_PARALLEL
     ):
         raise ValueError("collated policy is invalid")
-    return {"enabled": enabled, "download_bytes_per_sec": rate, "download_parallel": parallel}
+    return {"enabled": enabled, "download_bytes_per_sec": rate, "download_parallel": parallel,
+            "handoff_check": raw.get("handoff_check", False)}
 
 
 def valid_collated_item(raw):
-    if not isinstance(raw, dict) or set(raw) != {"output_id", "nas_relative_path", "size_bytes", "sha256", "download_path"}:
+    fields = {"output_id", "nas_relative_path", "size_bytes", "sha256", "download_path"}
+    if not isinstance(raw, dict) or set(raw) not in (fields, fields | {"handoff_readback_round", "handoff_mount"}):
         raise ValueError("collated item has invalid fields")
+    round_id = raw.get("handoff_readback_round")
+    handoff = "handoff_readback_round" in raw
+    mount = raw.get("handoff_mount")
+    if handoff and (type(round_id) is not int or not 0 <= round_id < 2**63
+                    or not isinstance(mount, list) or len(mount) != 2
+                    or any(type(value) is not int or value < 0 for value in mount) or mount[1] == 0):
+        raise ValueError("collated handoff readback capability or mount pin is invalid")
     output_id, size = raw["output_id"], raw["size_bytes"]
     if type(output_id) is not int or output_id < 1:
         raise ValueError("collated item has invalid output_id")
     if type(size) is not int or not 1 <= size <= COLLATED_MAX_BYTES:
         raise ValueError("collated item has invalid size_bytes")
-    if raw["download_path"] != "/api/v1/account/collated/%d/download" % output_id:
+    expected = "/api/v1/account/collated/%d/download" % output_id
+    if handoff:
+        expected += "?handoff_readback=1"
+    if raw["download_path"] != expected:
         raise ValueError("collated item has invalid download_path")
     return {
         "output_id": output_id, "nas_relative_path": valid_collated_relative_path(raw["nas_relative_path"]),
         "size_bytes": size, "sha256": valid_sha256(raw["sha256"], "collated item"), "download_path": raw["download_path"],
+        "handoff_readback": handoff, "handoff_readback_round": round_id, "handoff_mount": mount,
     }
 
 
@@ -23966,16 +23992,72 @@ class ByteRateLimiter:
             raise CollatedDownloadStopped("collated download stopped")
 
 
-def open_collated_dir(cfg, relative_path, create=True):
+class CollatedHandoffMount:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def __init__(self, cfg, approved):
+        self.root = cfg.output_dir
+        self.floor = max(R2_COPY_FLOOR, cfg.min_free_bytes) + R2_COPY_SPACE_GUARD
+        self.fd = os.open(self.root, self.flags)
+        try:
+            self.identity = self.mount_identity(self.fd)
+            if tuple(approved) != self.identity[:2]:
+                raise CollatedDownloadStopped("collated handoff mount differs from the approved share")
+            self.check()
+        except BaseException:
+            os.close(self.fd)
+            raise
+
+    @staticmethod
+    def mount_identity(fd):
+        info = os.fstat(fd)
+        mount_id = None
+        if sys.platform.startswith("linux"):
+            with open("/proc/self/fdinfo/%d" % fd, encoding="ascii") as metadata:
+                mount_id = next((row.split()[1] for row in metadata if row.startswith("mnt_id:")), None)
+            if mount_id is None:
+                raise CollatedDownloadStopped("collated handoff mount identity is unavailable")
+        return info.st_dev, info.st_ino, mount_id
+
+    def check(self):
+        if not os.path.ismount(self.root):
+            raise CollatedDownloadStopped("collated handoff root is not mounted")
+        current = os.open(self.root, self.flags)
+        try:
+            if self.mount_identity(current) != self.identity:
+                raise CollatedDownloadStopped("collated handoff root mount changed")
+        finally:
+            os.close(current)
+
+    def check_child(self, fd):
+        device, _, mount_id = self.mount_identity(fd)
+        if (device, mount_id) != (self.identity[0], self.identity[2]):
+            raise ExistingFileMismatch("collated handoff path crosses a different mount")
+
+    def storage(self):
+        self.check()
+        usage = os.fstatvfs(self.fd)
+        return {"available": True, "free_bytes": usage.f_bavail * (usage.f_frsize or usage.f_bsize)}
+
+    def require_space(self, next_bytes):
+        if self.storage()["free_bytes"] < self.floor + next_bytes:
+            raise CollatedDownloadStopped("collated handoff reached the R2 copy free-space reserve")
+
+
+def open_collated_dir(cfg, relative_path, create=True, *, mount=None, watch=None):
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(str(cfg.output_dir), flags)
+    descriptor = os.dup(mount.fd) if mount is not None else os.open(cfg.output_dir, flags)
     try:
         for part in (JOINED_ROOT, *relative_path.split("/")[:-1]):
+            if watch is not None:
+                watch.add(descriptor, part)
             try:
                 child = os.open(part, flags, dir_fd=descriptor)
             except FileNotFoundError:
                 if not create:
                     raise
+                if mount is not None:
+                    mount.require_space(4096)
                 try:
                     os.mkdir(part, mode=0o755, dir_fd=descriptor)
                 except FileExistsError:
@@ -23984,31 +24066,57 @@ def open_collated_dir(cfg, relative_path, create=True):
                 child = os.open(part, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = child
+            if mount is not None:
+                mount.check_child(descriptor)
         return descriptor
     except BaseException:
         os.close(descriptor)
         raise
 
 
-def hash_collated_entry(directory_fd, name, stop_event):
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(name, flags, dir_fd=directory_fd)
+def hash_collated_descriptor(descriptor, directory_fd, name, stop_event, *, mount=None, durable=False, limit=None):
+    """Hash one already-open collated inode and prove it stayed that inode.
+
+    The caller keeps ownership of the descriptor: handoff recovery must retain
+    the exact read-back inode until its final name is linked. `limit` bounds the
+    bytes read so a growing entry is rejected instead of hashed forever.
+    """
     digest = hashlib.sha256()
     size = 0
+    before = os.fstat(descriptor)
+    if mount is not None:
+        mount.check_child(descriptor)
+    if not stat_module.S_ISREG(before.st_mode):
+        raise ExistingFileMismatch("collated entry is not a regular file")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        if stop_event.is_set():
+            raise CollatedDownloadStopped("collated hashing stopped")
+        chunk = os.read(descriptor, COLLATED_CHUNK_BYTES * 8)
+        if not chunk:
+            break
+        size += len(chunk)
+        if limit is not None and size > limit:
+            raise ExistingFileMismatch("collated entry exceeds its approved size")
+        digest.update(chunk)
+    if durable:
+        os.fsync(descriptor)
+        os.fsync(directory_fd)
+    after = os.fstat(descriptor)
+    final = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    identity = certification_identity(after)
+    if certification_identity(before) != identity or certification_identity(final) != identity:
+        raise ExistingFileMismatch("collated entry changed during readback")
+    return size, digest.hexdigest(), after
+
+
+def hash_collated_entry(directory_fd, name, stop_event, *, mount=None, durable=False):
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
     try:
-        if not stat_module.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ExistingFileMismatch("collated entry is not a regular file")
-        while True:
-            if stop_event.is_set():
-                raise CollatedDownloadStopped("collated hashing stopped")
-            chunk = os.read(descriptor, COLLATED_CHUNK_BYTES * 8)
-            if not chunk:
-                break
-            size += len(chunk)
-            digest.update(chunk)
+        return hash_collated_descriptor(descriptor, directory_fd, name, stop_event, durable=durable, mount=mount)
     finally:
         os.close(descriptor)
-    return size, digest.hexdigest()
 
 
 def collated_entry_stat(directory_fd, name):
@@ -24037,7 +24145,7 @@ def prepare_collated_download(cfg, item):
     return {"url": url, "if_match": prepared["if_match"], "etag": etag}
 
 
-def append_collated_bytes(prepared, descriptor, digest, start, item, limiter, stop_event):
+def append_collated_bytes(prepared, descriptor, digest, start, item, limiter, stop_event, *, mount=None):
     headers = {"User-Agent": USER_AGENT, "If-Match": prepared["if_match"], "Range": "bytes=%d-" % start}
     request = urllib.request.Request(prepared["url"], method="GET", headers=headers)
     with open_joined_url(request) as response:
@@ -24060,6 +24168,8 @@ def append_collated_bytes(prepared, descriptor, digest, start, item, limiter, st
             block = response.read(want)
             if not block:
                 break
+            if mount is not None:
+                mount.require_space(len(block))
             offset = 0
             while offset < len(block):
                 offset += os.write(descriptor, block[offset:])
@@ -24069,34 +24179,175 @@ def append_collated_bytes(prepared, descriptor, digest, start, item, limiter, st
             raise RuntimeError("collated body length mismatch")
 
 
+def recoverable_collated_candidate(part, item, mount):
+    """An exact-size private handoff partial may already hold every approved byte.
+
+    Recovery publishes that inode through its descriptor, which needs Linux
+    linkat, so other platforms keep the ordinary byte-reserving path instead of
+    a source-pathname link.
+    """
+    return (mount is not None and sys.platform.startswith("linux") and part is not None
+            and part.st_size == item["size_bytes"] and part.st_nlink == 1)
+
+
+def retained_collated_identity(descriptor, directory_fd, part_name, identity):
+    """Require the retained descriptor and its current name to be recorded identity.
+
+    Both are compared to the identity captured after the durable readback, not
+    merely to each other: a same-size replacement of the staged name would
+    otherwise pass while holding different bytes.
+    """
+    opened = os.fstat(descriptor)
+    if certification_identity(opened) != identity:
+        raise ExistingFileMismatch("collated handoff candidate descriptor changed after readback")
+    current = collated_entry_stat(directory_fd, part_name)
+    if (current is None or current.st_nlink != 1
+            or certification_identity(current) != identity):
+        raise ExistingFileMismatch("collated handoff candidate changed after readback")
+
+
+def reset_collated_candidate(descriptor, directory_fd, part_name, stop_event, *, mount=None, identity=None):
+    """Empty the verified private candidate we opened; it is never unlinked by name."""
+    if mount is not None:
+        mount.check()
+    if stop_event.is_set():
+        raise CollatedDownloadStopped("collated handoff stopped before clearing an unapproved partial")
+    retained_collated_identity(descriptor, directory_fd, part_name, identity)
+    os.ftruncate(descriptor, 0)
+    os.fsync(descriptor)
+    os.fsync(directory_fd)
+
+
+def link_collated_descriptor(item, directory_fd, name, descriptor, part_name, stop_event, *, mount=None, identity=None):
+    """Link the verified open inode to its final name; recovery never links a path."""
+    if mount is not None:
+        mount.check()
+    if stop_event.is_set():
+        raise CollatedDownloadStopped("collated handoff stopped before publishing its recovered partial")
+    retained_collated_identity(descriptor, directory_fd, part_name, identity)
+    try:
+        # AT_SYMLINK_FOLLOW on the descriptor path binds the destination to the
+        # exact inode that was verified, so a staged name swapped after readback
+        # can neither publish unverified bytes nor be overwritten by them. The
+        # kernel resolves it only while that inode still has a name, so losing
+        # the last one fails here instead of publishing anything.
+        os.link("/proc/self/fd/%d" % descriptor, name, dst_dir_fd=directory_fd, follow_symlinks=True)
+    except FileExistsError:
+        size, digest, _ = hash_collated_entry(directory_fd, name, stop_event, mount=mount)
+        if size != item["size_bytes"] or digest != item["sha256"]:
+            raise ExistingFileMismatch("collated final appeared with different bytes: %s" % item["nas_relative_path"])
+    except FileNotFoundError:
+        raise ExistingFileMismatch("collated handoff candidate was already unlinked; deferring its publication")
+    # The verified partial keeps its hidden name on purpose: it is a hard link
+    # to the published final and shares the same data blocks, so unlinking it
+    # would add the only non-atomic pathname deletion to this publication.
+    os.fsync(directory_fd)
+
+
+def publish_collated_candidate(item, directory_fd, name, part_name, stop_event, *, mount=None):
+    """Publish a fully synced private handoff partial without fetching payload bytes.
+
+    The partial may already hold every approved byte when a crash lands between
+    its sync and the final link. It is published only when its exact size and
+    SHA-256 match the approved output; anything else is left for a reservation
+    that accounts for the bytes it would really write.
+    """
+    if not sys.platform.startswith("linux"):
+        raise CollatedDownloadStopped("collated handoff partial recovery requires Linux linkat")
+    # O_RDWR only for this recovery candidate: an unapproved partial is reset
+    # through the descriptor that was verified, never by name.
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        descriptor = os.open(part_name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        raise ExistingFileMismatch("collated handoff candidate changed after admission")
+    try:
+        opened = os.fstat(descriptor)
+        if mount is not None:
+            mount.check_child(descriptor)
+        if (not stat_module.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                or opened.st_size != item["size_bytes"]):
+            raise ExistingFileMismatch("collated handoff candidate changed after admission")
+        # One descriptor stays open from admission through readback and
+        # publication, so every check below describes the inode actually linked.
+        size, digest, info = hash_collated_descriptor(
+            descriptor, directory_fd, part_name, stop_event, durable=True, mount=mount, limit=item["size_bytes"],
+        )
+        if size != item["size_bytes"]:
+            raise ExistingFileMismatch("collated handoff candidate changed during readback")
+        if info.st_nlink != 1 or not stat_module.S_ISREG(info.st_mode):
+            raise ExistingFileMismatch("collated handoff candidate is not a private regular file")
+        if digest != item["sha256"]:
+            reset_collated_candidate(
+                descriptor, directory_fd, part_name, stop_event, mount=mount, identity=certification_identity(info),
+            )
+            raise ExistingFileMismatch("collated handoff candidate differs from the approved output; a full reservation follows")
+        link_collated_descriptor(
+            item, directory_fd, name, descriptor, part_name, stop_event,
+            mount=mount, identity=certification_identity(info),
+        )
+    finally:
+        os.close(descriptor)
+
+
+def link_collated_final(item, directory_fd, name, part_name, stop_event, *, mount=None):
+    """Link a freshly fetched private partial to its final name without overwriting."""
+    if mount is not None:
+        mount.check()
+    try:
+        os.link(part_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+    except FileExistsError:
+        size, digest, _ = hash_collated_entry(directory_fd, name, stop_event, mount=mount)
+        if size != item["size_bytes"] or digest != item["sha256"]:
+            raise ExistingFileMismatch("collated final appeared with different bytes: %s" % item["nas_relative_path"])
+    os.unlink(part_name, dir_fd=directory_fd)
+    os.fsync(directory_fd)
+
+
 @NAS_MEDIA_FENCE.background_delivery
-def download_collated_item(cfg, item, limiter, stop_event):
+def download_collated_item(cfg, item, limiter, stop_event, *, mount=None, reserved=None):
     """Place one output at its contract path. Returns True when bytes were fetched."""
     relative = item["nas_relative_path"]
     name = relative.split("/")[-1]
     part_name = ".%s.collated-%d.part" % (name, item["output_id"])
-    directory_fd = open_collated_dir(cfg, relative)
+    reserved_payload = None if reserved is None else max(0, int(reserved))
+    directory_fd = open_collated_dir(cfg, relative, mount=mount)
     try:
         if collated_entry_stat(directory_fd, name) is not None:
-            size, digest = hash_collated_entry(directory_fd, name, stop_event)
+            size, digest, _ = hash_collated_entry(directory_fd, name, stop_event, mount=mount)
             if size != item["size_bytes"] or digest != item["sha256"]:
                 raise ExistingFileMismatch("existing collated file differs; it is never overwritten: %s" % relative)
-            part = collated_entry_stat(directory_fd, part_name)
-            if part is not None:
-                os.unlink(part_name, dir_fd=directory_fd)
-                os.fsync(directory_fd)
+            # A handoff readback leaves any .part exactly as found: a recovered
+            # partial is a hard link to this final and shares its data blocks.
+            if not item["handoff_readback"]:
+                part = collated_entry_stat(directory_fd, part_name)
+                if part is not None:
+                    os.unlink(part_name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+            return False
+        if reserved_payload == 0:
+            # Only a handoff candidate that already holds every approved byte
+            # proceeds here; fetching would spend bytes never reserved.
+            publish_collated_candidate(item, directory_fd, name, part_name, stop_event, mount=mount)
             return False
         prepared = prepare_collated_download(cfg, item)
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(part_name, flags, 0o644, dir_fd=directory_fd)
         try:
             opened = os.fstat(descriptor)
+            if mount is not None:
+                mount.check_child(descriptor)
             if not stat_module.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
                 raise ExistingFileMismatch("collated partial is not a private regular file")
             start = opened.st_size
             if start >= item["size_bytes"]:
-                os.ftruncate(descriptor, 0)
                 start = 0
+            # Bind the bytes to write to the count reserved at admission so a
+            # partial that shrank or vanished never fetches unreserved bytes.
+            if reserved_payload is not None and reserved_payload < item["size_bytes"] - start:
+                raise ExistingFileMismatch("collated partial changed after admission; its payload was not reserved")
+            if start == 0 and opened.st_size:
+                os.ftruncate(descriptor, 0)
             digest = hashlib.sha256()
             os.lseek(descriptor, 0, os.SEEK_SET)
             remaining = start
@@ -24108,7 +24359,7 @@ def download_collated_item(cfg, item, limiter, stop_event):
                 remaining -= len(chunk)
             os.lseek(descriptor, start, os.SEEK_SET)
             try:
-                append_collated_bytes(prepared, descriptor, digest, start, item, limiter, stop_event)
+                append_collated_bytes(prepared, descriptor, digest, start, item, limiter, stop_event, mount=mount)
             finally:
                 os.fsync(descriptor)
             if digest.hexdigest() != item["sha256"] or os.fstat(descriptor).st_size != item["size_bytes"]:
@@ -24117,52 +24368,337 @@ def download_collated_item(cfg, item, limiter, stop_event):
                 raise RuntimeError("collated checksum mismatch; partial restarted")
         finally:
             os.close(descriptor)
-        try:
-            os.link(part_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
-        except FileExistsError:
-            size, digest = hash_collated_entry(directory_fd, name, stop_event)
-            if size != item["size_bytes"] or digest != item["sha256"]:
-                raise ExistingFileMismatch("collated final appeared with different bytes: %s" % relative)
-        os.unlink(part_name, dir_fd=directory_fd)
-        os.fsync(directory_fd)
+        link_collated_final(item, directory_fd, name, part_name, stop_event, mount=mount)
         return True
     finally:
         os.close(directory_fd)
 
 
-def collated_bytes_needed(cfg, item):
-    """Bytes still to be written for item: 0 when its final exists, the rest of a partial."""
+def collated_bytes_needed(cfg, item, *, mount=None):
+    """Bytes still to be written for item: 0 when its final exists, the rest of a partial.
+
+    Under a handoff mount an exact-size private partial may already hold every
+    approved byte: a crash can land after its sync and before the final link, so
+    it reserves no payload bytes and is verified rather than fetched.
+    """
     relative = item["nas_relative_path"]
     name = relative.split("/")[-1]
     try:
-        directory_fd = open_collated_dir(cfg, relative, create=False)
+        directory_fd = open_collated_dir(cfg, relative, create=False, mount=mount)
     except FileNotFoundError:
         return item["size_bytes"]
     try:
         if collated_entry_stat(directory_fd, name) is not None:
             return 0
         part = collated_entry_stat(directory_fd, ".%s.collated-%d.part" % (name, item["output_id"]))
-        if part is None or part.st_size >= item["size_bytes"]:
+        if part is None:
+            return item["size_bytes"]
+        if recoverable_collated_candidate(part, item, mount):
+            return 0
+        if part.st_size >= item["size_bytes"]:
             return item["size_bytes"]
         return item["size_bytes"] - part.st_size
     finally:
         os.close(directory_fd)
 
 
-def ack_collated_item(cfg, item):
-    request_json(cfg, "POST", "/account/collated/ack", body={
+def ack_collated_item(cfg, item, stop_event, *, mount=None):
+    path = "/account/collated/ack"
+    body = {
         "output_id": item["output_id"], "nas_relative_path": item["nas_relative_path"],
         "size_bytes": item["size_bytes"], "sha256": item["sha256"],
-    })
+    }
+    if item["handoff_readback"]:
+        if mount is None:
+            raise CollatedDownloadStopped("collated handoff readback requires its admitted mount")
+        mount.check()
+        relative = item["nas_relative_path"]
+        directory_fd = open_collated_dir(cfg, relative, create=False, mount=mount)
+        try:
+            size, digest, info = hash_collated_entry(directory_fd, relative.split("/")[-1], stop_event, durable=True, mount=mount)
+            if size != item["size_bytes"] or digest != item["sha256"]:
+                raise ExistingFileMismatch("final handoff bytes differ from the approved output")
+            # Reopen the canonical directory from the NAS root to check that
+            # a renamed/replaced directory cannot attest a detached file.
+            current_fd = open_collated_dir(cfg, relative, create=False, mount=mount)
+            try:
+                current = os.stat(relative.split("/")[-1], dir_fd=current_fd, follow_symlinks=False)
+                if certification_identity(info) != certification_identity(current):
+                    raise ExistingFileMismatch("handoff path changed during readback")
+            finally:
+                os.close(current_fd)
+        finally:
+            os.close(directory_fd)
+        mount.check()
+        if stop_event.is_set():
+            raise CollatedDownloadStopped("collated handoff stopped before reporting")
+        body["handoff_readback"] = [size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino, info.st_dev]
+        body["handoff_readback_round"] = item["handoff_readback_round"]
+        body["handoff_root_inode"] = mount.identity[1]
+        path += "?handoff_readback=1"
+    request_json(cfg, "POST", path, body=body)
 
 
-def report_collated_error(cfg, output_id, exc):
+def report_collated_error(cfg, output_id, exc, handoff=False):
     try:
-        request_json(cfg, "POST", "/account/collated/error", body={
+        path = "/account/collated/error"
+        if handoff:
+            path += "?handoff_readback=1"
+        request_json(cfg, "POST", path, body={
             "output_id": int(output_id), "error": ("%s: %s" % (type(exc).__name__, exc))[:1000],
         })
     except Exception as report_exc:
         log("WARN", "collated error report failed: %s" % report_exc)
+
+
+class CollatedHandoffPathWatch:
+    # Linux inotify watches names, including their ancestors. Read leases
+    # separately protect each inode against writes through aliases and mmap.
+    CHANGE_EVENTS = 0x00000FCE
+    LOST_WATCH_EVENTS = 0x0000EC00  # Unmount, queue overflow, ignored, delete/move self.
+    EVENT_HEADER = struct.Struct("iIII")
+
+    def __init__(self, file_count):
+        if not sys.platform.startswith("linux"):
+            raise CollatedDownloadStopped("NAS handoff path checks require Linux inotify and read leases")
+        import ctypes
+        import resource
+        self.resources = ExitStack()
+        self.names = {}
+        try:
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            needed = file_count + len(os.listdir("/proc/self/fd")) + 128
+            if soft != resource.RLIM_INFINITY and soft < needed:
+                if hard != resource.RLIM_INFINITY and hard < needed:
+                    raise CollatedDownloadStopped("NAS handoff path check cannot keep every approved file open")
+                resource.setrlimit(resource.RLIMIT_NOFILE, (needed, hard))
+                self.resources.callback(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+            previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGIO})
+            self.resources.callback(self.restore_signals, previous)
+            self.owner = struct.pack("ii", 0, threading.get_native_id())  # Linux F_OWNER_TID.
+            self.libc = ctypes.CDLL(None, use_errno=True)
+            self.fd = self.libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+            if self.fd < 0:
+                raise OSError(ctypes.get_errno(), "open NAS handoff change watch")
+            self.resources.callback(os.close, self.fd)
+            self.get_errno = ctypes.get_errno
+        except BaseException:
+            self.resources.close()
+            raise
+
+    @staticmethod
+    def restore_signals(previous):
+        while signal.SIGIO in signal.sigpending():
+            signal.sigwait({signal.SIGIO})
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+    def add(self, directory_fd, child_name):
+        name = ("/proc/self/fd/%d" % directory_fd).encode("ascii")
+        descriptor = self.libc.inotify_add_watch(self.fd, name, self.CHANGE_EVENTS)
+        if descriptor < 0:
+            raise OSError(self.get_errno(), "watch NAS handoff path directory")
+        self.names.setdefault(descriptor, set()).add(os.fsencode(child_name))
+
+    def hold(self, file_fd):
+        if signal.SIGIO in signal.sigpending():
+            raise CollatedDownloadStopped("NAS handoff file changed during path check")
+        lease_fd = os.dup(file_fd)
+        try:
+            # Python before 3.13 does not expose Linux F_SETOWN_EX.
+            fcntl.fcntl(lease_fd, getattr(fcntl, "F_SETOWN_EX", 15), self.owner)
+            fcntl.fcntl(lease_fd, fcntl.F_SETLEASE, fcntl.F_RDLCK)
+        except BlockingIOError as exc:
+            os.close(lease_fd)
+            raise CollatedDownloadStopped("NAS handoff file is writable during path check") from exc
+        except BaseException:
+            os.close(lease_fd)
+            raise
+        self.resources.callback(os.close, lease_fd)
+
+    def require_unchanged(self):
+        while True:
+            try:
+                events = os.read(self.fd, 65536)
+            except BlockingIOError:
+                break
+            offset = 0
+            while offset < len(events):
+                descriptor, mask, _, size = self.EVENT_HEADER.unpack_from(events, offset)
+                offset += self.EVENT_HEADER.size
+                name = events[offset:offset + size].split(b"\0", 1)[0]
+                offset += size
+                if mask & self.LOST_WATCH_EVENTS or name in self.names.get(descriptor, ()):
+                    raise CollatedDownloadStopped("NAS handoff file or directory changed during path check")
+        if signal.SIGIO in signal.sigpending():
+            raise CollatedDownloadStopped("NAS handoff file changed during path check")
+
+    def close(self):
+        self.resources.close()
+
+
+def fetch_collated_handoff_check(cfg):
+    response = request_json(cfg, "GET", "/account/collated/handoff-check", read_limit=(8 << 20) + 4096)
+    if not isinstance(response, dict) or set(response) != {"check"}:
+        raise ValueError("invalid NAS handoff path check response")
+    return response["check"]
+
+
+def collated_handoff_binding(check):
+    if not isinstance(check, dict) or not {"id", "manifest_sha256", "mount"} <= check.keys():
+        raise ValueError("invalid NAS handoff check identity")
+    check_id, mount_pin = check["id"], check["mount"]
+    digest = valid_sha256(check["manifest_sha256"], "NAS handoff path check")
+    if (type(check_id) is not int or check_id <= 0 or not isinstance(mount_pin, list) or len(mount_pin) != 2
+            or any(type(value) is not int or value < 0 for value in mount_pin) or mount_pin[1] == 0):
+        raise ValueError("invalid NAS handoff check identity")
+    return {"id": check_id, "manifest_sha256": digest, "mount": mount_pin}
+
+
+def require_collated_handoff_release(cfg):
+    # On a network failure the pinned bootstrap executes its cached current
+    # slot. That slot must already contain the release that reads this journal.
+    if (cfg.is_candidate or not cfg.current_file.is_file()
+            or hashlib.sha256(cfg.current_file.read_bytes()).hexdigest() != executing_release_sha256(cfg)):
+        raise CollatedDownloadStopped("NAS handoff final check requires the verified release in the current client slot")
+
+
+def persist_collated_handoff(cfg, binding):
+    require_collated_handoff_release(cfg)
+    # The pinned bootstrap rolls back only "running" and "self_update". Mark
+    # this drained state durably before a journal could block a predecessor.
+    runtime = read_json(cfg.runtime_file, {})
+    runtime["exit"] = "delivery_handoff_check"
+    atomic_write(cfg.runtime_file, json.dumps(runtime, separators=(",", ":")).encode("utf-8"))
+    atomic_write(collated_handoff_pending(cfg), json.dumps(binding, separators=(",", ":")).encode("utf-8"))
+
+
+def check_collated_handoff_paths(cfg, stop_event):
+    target = "/account/collated/handoff-check"
+    pending = collated_handoff_pending(cfg)
+    recovering = os.path.lexists(pending)
+    previous = None
+    if recovering:
+        fd = os.open(pending, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as journal:
+            if not stat_module.S_ISREG(os.fstat(journal.fileno()).st_mode):
+                raise ValueError("NAS handoff journal is not a regular file")
+            raw = journal.read(4097)
+        if len(raw) > 4096:
+            raise ValueError("NAS handoff pending identity exceeds its bound")
+        binding = collated_handoff_binding(json.loads(raw))
+        decision = request_json(cfg, "GET", "%s?check_id=%d" % (target, binding["id"]), read_limit=4096)
+        if decision == {"status": "pending"}:
+            previous = binding
+        elif decision not in ({"status": "accepted"}, {"status": "superseded"}, {"status": "cancelled"}):
+            raise RuntimeError("NAS handoff check acceptance is unresolved")
+    check = fetch_collated_handoff_check(cfg)
+    if check is None:
+        if previous is not None:
+            raise RuntimeError("NAS handoff check is pending without an active challenge")
+        if recovering:
+            pending.unlink()
+            fsync_dir(pending.parent)
+        return
+    if not isinstance(check, dict) or set(check) != {"id", "manifest_sha256", "mount", "files"}:
+        raise ValueError("invalid NAS handoff path check")
+    binding = collated_handoff_binding(check)
+    if previous is not None and previous != binding:
+        raise RuntimeError("NAS handoff pending challenge changed")
+    check_id, mount_pin, files = binding["id"], binding["mount"], check["files"]
+    if not isinstance(files, list) or not 1 <= len(files) <= 20000:
+        raise ValueError("invalid NAS handoff path check bounds")
+    paths = []
+    previous = 0
+    for row in files:
+        if not isinstance(row, list) or len(row) != 3:
+            raise ValueError("invalid NAS handoff path check row")
+        output_id, relative, identity = row
+        if (type(output_id) is not int or output_id <= previous or not isinstance(identity, list)
+                or len(identity) != 5 or any(type(value) is not int or value <= 0 for value in identity[:4])
+                or identity[4] != mount_pin[0]):
+            raise ValueError("invalid NAS handoff path check identity")
+        previous = output_id
+        paths.append((output_id, valid_collated_relative_path(relative), identity))
+    mount = CollatedHandoffMount(cfg, mount_pin)
+    directories = {}
+    failed = None
+    watch = None
+    try:
+        watch = CollatedHandoffPathWatch(len(paths))
+        for output_id, relative, identity in paths:
+            if stop_event.is_set():
+                raise CollatedDownloadStopped("NAS handoff path check stopped")
+            try:
+                parent = open_collated_dir(cfg, relative, create=False, mount=mount, watch=watch)
+                try:
+                    directory = relative.rsplit("/", 1)[0]
+                    stamp = certification_identity(os.fstat(parent))
+                    previous = directories.get(directory)
+                    if previous is None:
+                        directories[directory] = (relative, stamp)
+                    elif previous[1] != stamp:
+                        raise CollatedDownloadStopped("NAS handoff directory changed during path check")
+                    filename = relative.rsplit("/", 1)[1]
+                    watch.add(parent, filename)
+                    fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                    try:
+                        mount.check_child(fd)
+                        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+                            raise ExistingFileMismatch("NAS handoff path is not a regular file")
+                        watch.hold(fd)
+                        info = os.fstat(fd)
+                        observed = [info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino, info.st_dev]
+                        if observed != identity:
+                            failed = output_id
+                    finally:
+                        os.close(fd)
+                finally:
+                    os.close(parent)
+            except (FileNotFoundError, NotADirectoryError, ExistingFileMismatch):
+                failed = output_id
+            if failed is not None:
+                break
+        if failed is None:
+            for relative, wanted in directories.values():
+                if stop_event.is_set():
+                    raise CollatedDownloadStopped("NAS handoff path check stopped")
+                parent = open_collated_dir(cfg, relative, create=False, mount=mount)
+                try:
+                    if certification_identity(os.fstat(parent)) != wanted:
+                        raise CollatedDownloadStopped("NAS handoff directory changed during path check")
+                finally:
+                    os.close(parent)
+        mount.check()
+        if failed is None:
+            watch.require_unchanged()
+        if stop_event.is_set():
+            raise CollatedDownloadStopped("NAS handoff path check stopped")
+        report = dict(binding)
+        if failed is not None:
+            report["failed_output_id"] = failed
+        # Keep the process writer lock through the authoritative outcome. The
+        # durable journal blocks all normal writer starts if the outcome is lost.
+        persist_collated_handoff(cfg, binding)
+        reply = request_json(cfg, "POST", target, body=report)
+        if not isinstance(reply, dict) or set(reply) != {"ok"} or reply["ok"] is not True:
+            raise RuntimeError("NAS handoff check acceptance is unresolved")
+        outcome = "complete" if failed is None else "withheld output %d" % failed
+        pending.unlink()
+        fsync_dir(pending.parent)
+        log("INFO", "NAS handoff path check %d %s" % (check_id, outcome))
+    finally:
+        if watch is not None:
+            watch.close()
+        os.close(mount.fd)
+
+
+def finalize_collated_handoff(cfg):
+    if cfg.dry_run:
+        raise ValueError("delivery-handoff-check requires the active NAS configuration")
+    cfg.validate()
+    # The normal daemon and offline media writers all take this same lock.
+    with acquire_lock(cfg, handoff_finalizer=True):
+        check_collated_handoff_paths(cfg, threading.Event())
 
 
 def drain_collated(cfg, runtime, stop_event):
@@ -24174,10 +24710,14 @@ def drain_collated(cfg, runtime, stop_event):
         return False
     # This lane's idle/error pacing is independent of joined-download progress.
     runtime.collated_next_poll = now + min(cfg.poll_interval_sec, 10)
-    page = request_json(cfg, "GET", "/account/collated?limit=%d&after_id=%d" % (COLLATED_PAGE_LIMIT, runtime.collated_after_id))
+    page = request_json(cfg, "GET", "/account/collated?limit=%d&after_id=%d&handoff_readback=1" % (COLLATED_PAGE_LIMIT, runtime.collated_after_id))
     if not isinstance(page, dict) or set(page) != {"policy", "items", "next_after_id"} or not isinstance(page["items"], list):
         raise RuntimeError("collated response is invalid")
     policy = valid_collated_policy(page["policy"])
+    if policy["handoff_check"] and not cfg.is_candidate:
+        require_collated_handoff_release(cfg)
+        runtime.handoff_final_check_requested.set()
+        return False
     next_id = page["next_after_id"]
     if type(next_id) is not int or next_id < 0 or (next_id != 0 and next_id <= runtime.collated_after_id):
         raise RuntimeError("collated cursor is invalid")
@@ -24193,22 +24733,32 @@ def drain_collated(cfg, runtime, stop_event):
     def deliver(item):
         if stop_event.is_set():
             return
-        # Reserve the whole output in the shared runtime ledger so parallel
-        # collated downloads and raw delivery never overcommit the same bytes.
-        needed = collated_bytes_needed(cfg, item)
-        if not runtime.reserve_joined_storage(cfg, storage_status(cfg), needed):
-            raise CollatedDownloadStopped("collated delivery yielded to the NAS free-space reserve")
+        mount = None
         try:
-            fetched = download_collated_item(cfg, item, limiter, stop_event)
-            ack_collated_item(cfg, item)
+            if item["handoff_readback"]:
+                mount = CollatedHandoffMount(cfg, item["handoff_mount"])
+            needed = collated_bytes_needed(cfg, item, mount=mount)
+            storage = mount.storage() if mount is not None else storage_status(cfg)
+            floor = mount.floor if mount is not None and needed else 0
+            if not runtime.reserve_joined_storage(cfg, storage, needed, min_floor=floor):
+                raise CollatedDownloadStopped("collated delivery yielded to the NAS free-space reserve")
+            try:
+                fetched = download_collated_item(
+                    cfg, item, limiter, stop_event, mount=mount,
+                    reserved=needed if mount is not None else None,
+                )
+                ack_collated_item(cfg, item, stop_event, mount=mount)
+            finally:
+                runtime.release_storage_reservation(needed)
         except CollatedDownloadStopped:
             raise
         except Exception as exc:
             log("WARN", "collated output_id=%d deferred: %s" % (item["output_id"], exc))
-            report_collated_error(cfg, item["output_id"], exc)
+            report_collated_error(cfg, item["output_id"], exc, item["handoff_readback"])
             return
         finally:
-            runtime.release_storage_reservation(needed)
+            if mount is not None:
+                os.close(mount.fd)
         delivered.append(item["output_id"])
         log("INFO", "collated output_id=%d bytes=%d saved=%s%s" % (
             item["output_id"], item["size_bytes"], cfg.output_dir / JOINED_ROOT / item["nas_relative_path"],
@@ -52100,7 +52650,15 @@ def mark_capacity_blocked_audit_healthy(cfg, runtime, storage_checked, audit_rep
 def run(cfg):
     CLIENT_LOG_RING.configure(cfg)
     cfg.validate()
-    lock_handle = acquire_lock(cfg)
+    lock_handle = acquire_lock(cfg, handoff_finalizer=True)
+    try:
+        if os.path.lexists(collated_handoff_pending(cfg)):
+            if cfg.dry_run:
+                raise RuntimeError("NAS handoff acceptance is unresolved in dry-run mode")
+            check_collated_handoff_paths(cfg, threading.Event())
+    except BaseException:
+        lock_handle.close()
+        raise
     _pins, pins_error = cleanup_pins()
     if pins_error is not None:
         # Deletion stays refused for this whole process; every other lane runs.
@@ -52177,11 +52735,11 @@ def run(cfg):
         benchmark_worker = threading.Thread(target=benchmark_loop, args=(cfg, runtime, stop_event), daemon=True)
         benchmark_worker.start()
     try:
-        while not stop_event.is_set():
+        while not (stop_event.is_set() or runtime.handoff_final_check_requested.is_set()):
             # No delivery page is active at this boundary. A staged candidate
             # may replace the process even when storage/list work is failing,
             # provided the inventory thread has reached its stop checkpoint.
-            if update_can_exec(update_ready, inventory_worker, stop_event, joined_worker, cleanup_worker, copy_worker):
+            if not runtime.handoff_final_check_requested.is_set() and update_can_exec(update_ready, inventory_worker, stop_event, joined_worker, cleanup_worker, copy_worker):
                 runtime.set_phase(Phase.UPDATING)
                 exec_candidate(cfg, runtime)
             if not heartbeat.is_alive():
@@ -52223,7 +52781,7 @@ def run(cfg):
                     # not resurrect the previous client indefinitely.
                     mark_runtime(cfg, runtime, "healthy")
                     runtime.stable_marked = True
-                if update_can_exec(update_ready, inventory_worker, stop_event, joined_worker, cleanup_worker, copy_worker):
+                if not runtime.handoff_final_check_requested.is_set() and update_can_exec(update_ready, inventory_worker, stop_event, joined_worker, cleanup_worker, copy_worker):
                     runtime.set_phase(Phase.UPDATING)
                     exec_candidate(cfg, runtime)
                 set_idle_unless_capacity_blocked(runtime)
@@ -52277,7 +52835,11 @@ def run(cfg):
         elif not joined_stuck:
             inventory.close()
         if not joined_stuck:
-            lock_handle.close()
+            try:
+                if runtime.handoff_final_check_requested.is_set():
+                    check_collated_handoff_paths(cfg, threading.Event())
+            finally:
+                lock_handle.close()
         else:
             raise RuntimeError("joined delivery worker did not stop")
     return 0
@@ -53671,7 +54233,7 @@ def r2_copy_loop(cfg, runtime, inventory, stop):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Stoarama NAS pull client")
-    parser.add_argument("command", nargs="?", choices=("run", "check", "version", "self-update", "certify", "copy-manifest"), default="run")
+    parser.add_argument("command", nargs="?", choices=("run", "check", "version", "self-update", "certify", "copy-manifest", "delivery-handoff-check"), default="run")
     parser.add_argument("--manifest", default="")
     parser.add_argument("--expected-sha256", default="")
     parser.add_argument("--max-bytes", type=int, default=0)
@@ -53686,6 +54248,9 @@ def main(argv=None):
         print(CLIENT_VERSION)
         return 0
     cfg = Config()
+    if args.command == "delivery-handoff-check":
+        finalize_collated_handoff(cfg)
+        return 0
     if args.command == "copy-manifest":
         print(json.dumps(copy_r2_manifest(cfg, args.manifest, args.expected_sha256, args.max_bytes), sort_keys=True))
         return 0

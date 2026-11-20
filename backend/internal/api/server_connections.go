@@ -95,6 +95,8 @@ func pullPathAllowed(method, path string) bool {
 		return true
 	case method == http.MethodPost && pullSelectedVerifyResultRe.MatchString(path):
 		return true
+	case (method == http.MethodGet || method == http.MethodPost) && path == deliveryNASHandoffCheckPath:
+		return true
 	case method == http.MethodGet && path == "/api/v1/account/collated":
 		return true
 	case method == http.MethodPost && (path == "/api/v1/account/collated/ack" || path == "/api/v1/account/collated/error"):
