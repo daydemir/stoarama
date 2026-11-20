@@ -145,12 +145,12 @@ func (f *nonrawFixture) exempt(t *testing.T, key string) bool {
 // when the page is taken down, recorded for the record on the retirement row.
 const pageGeneration = "0123456789abcdef0123456789abcdef"
 
-// seedServingGeneration records the pinned serving registry row the authority
-// admission trigger binds to, so a fixture's generation is the live one.
+// seedServingGeneration records the generation the serving API observed as the
+// current pointer, which is what the authority admission binds to. It must run
+// while the page still serves.
 func (f *nonrawFixture) seedServingGeneration(generation string) {
-	f.exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,recording_id,kind,sha256,relative_path)
- VALUES('stoarama',$1,'gen-etag',1,0,'registry',repeat('0',64),'') ON CONFLICT(bucket,object_key) DO NOTHING`,
-		"datasets/global-street-scores-delivery/47/public/generations/"+generation+".json")
+	f.exec(`INSERT INTO r2_delivery_serving_generation(singleton,generation)
+ VALUES(true,$1) ON CONFLICT(singleton) DO UPDATE SET generation=excluded.generation`, generation)
 }
 
 // writeCutoverEvidence inserts reviewed cutover authority with distinct per-fact
@@ -992,14 +992,14 @@ func TestR2NonrawPageRetiredRefusesLiveTickets(t *testing.T) {
 	// One recorded capability, still live, minted before arming.
 	f.exec(`INSERT INTO r2_delivery_download_tickets(bucket,object_key,etag,size_bytes,object_path_sha256,expires_at)
  VALUES('stoarama','joined/x.mp4','e',1,repeat('a',64),clock_timestamp()+interval '5 minutes')`)
+	f.seedServingGeneration(pageGeneration)
 	f.exec(`INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: the old page is down')`)
 	// No cutover authority yet: refused, and a live capability could not be
 	// retired anyway.
 	if _, err := retire(); err == nil || !strings.Contains(err.Error(), "cutover authority") {
 		t.Fatalf("retirement without cutover authority was not refused: %v", err)
 	}
-	// Reviewed authority bound to the live serving generation, deadline already past.
-	f.seedServingGeneration(pageGeneration)
+	// Reviewed authority bound to the observed serving generation, deadline past.
 	f.writeCutoverEvidence(pageGeneration)
 	var retired bool
 	if _, err := retire(); err == nil || !strings.Contains(err.Error(), "unexpired") {
@@ -1302,11 +1302,11 @@ func TestR2NonrawPageRetirementStagedProof(t *testing.T) {
 	// serves; only then is retirement armed.
 	f.exec(`INSERT INTO r2_delivery_public_readers(reader_id,expires_at) VALUES(repeat('a',32),clock_timestamp()+interval '2 minutes')`)
 	f.exec(`INSERT INTO r2_delivery_download_tickets(bucket,object_key,etag,size_bytes,object_path_sha256,expires_at) VALUES('stoarama','x','e',1,repeat('a',64),clock_timestamp()+interval '2 minutes')`)
-	f.exec(`INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: staged proof')`)
-	// Reviewed cutover authority bound to the live serving generation, deadline
-	// already past, so the only remaining holds are the live reader and the live
-	// capability.
 	f.seedServingGeneration(pageGeneration)
+	f.exec(`INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: staged proof')`)
+	// Reviewed cutover authority bound to the observed serving generation,
+	// deadline already past, so the only remaining holds are the live reader and
+	// the live capability.
 	f.writeCutoverEvidence(pageGeneration)
 	if _, err := retire(); err == nil || !strings.Contains(err.Error(), "admitted public readers") {
 		t.Fatalf("retirement with a live reader was not refused: %v", err)

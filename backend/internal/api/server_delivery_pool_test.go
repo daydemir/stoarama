@@ -129,3 +129,51 @@ type registryDeliveryStore struct {
 func (r *registryDeliveryStore) Head(context.Context, string) (r2.ObjectHead, error) {
 	return r2.ObjectHead{ETag: "etag", SizeBytes: r.size}, nil
 }
+
+// TestDeliveryServingGenerationRecordsOnlyTheCurrentPointer proves the API records
+// the generation it actually loaded as the unpinned current pointer, and does not
+// record a pinned read. Retirement's authority binds to that row.
+func TestDeliveryServingGenerationRecordsOnlyTheCurrentPointer(t *testing.T) {
+	pool := deliveryExemptionTestPool(t)
+	ctx := context.Background()
+	reg := publicDeliveryRegistryFixture()
+	body, err := json.Marshal(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range reg.Assets {
+		if _, err := pool.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256)
+ VALUES('stoarama',$1,btrim($2,'"'),$3,'asset',$4)`, o.Key, o.ETag, o.SizeBytes, o.SHA256); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, o := range reg.Files {
+		if _, err := pool.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256)
+ VALUES('stoarama',$1,btrim($2,'"'),$3,'video_collated',$4)`, o.Key, o.ETag, o.SizeBytes, o.SHA256); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := &registryDeliveryStore{size: int64(len(body))}
+	store.body = body
+	s := &Server{pool: pool, globalDeliveryStore: store, deliveryPublic: poolDeliveryGate{pool}}
+	// A pinned read must NOT record the pointer.
+	if _, err := s.loadGlobalDeliveryRegistryScope(ctx, true, reg.Generation); err != nil {
+		t.Fatal(err)
+	}
+	var observed int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_delivery_serving_generation`).Scan(&observed); err != nil || observed != 0 {
+		t.Fatalf("a pinned read recorded the serving generation: %d %v", observed, err)
+	}
+	// A cold current load DOES record the generation it served from
+	// public/current.json.
+	if _, err := s.loadGlobalDeliveryRegistryScope(ctx, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	var generation string
+	if err := pool.QueryRow(ctx, `SELECT generation FROM r2_delivery_serving_generation WHERE singleton`).Scan(&generation); err != nil {
+		t.Fatalf("current load did not record the serving generation: %v", err)
+	}
+	if generation != reg.Generation {
+		t.Fatalf("recorded %s, served %s", generation, reg.Generation)
+	}
+}

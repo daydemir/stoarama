@@ -467,6 +467,16 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 			}
 		}
 		if fence != nil {
+			// Record which generation the serving path actually observed as the
+			// unpinned CURRENT pointer. This is the only thing retirement's
+			// cutover authority binds to; import order over holds is not a pointer.
+			// A pinned read never writes it.
+			if generation == "" {
+				if _, err = fence.Exec(ctx, `INSERT INTO r2_delivery_serving_generation(singleton,generation)
+ VALUES(true,$1) ON CONFLICT(singleton) DO UPDATE SET generation=excluded.generation,observed_at=clock_timestamp()`, result.Generation); err != nil {
+					return nil, errors.New("delivery serving generation record unavailable")
+				}
+			}
 			if err = fence.Commit(ctx); err != nil {
 				return nil, errors.New("public publication fence unavailable")
 			}

@@ -190,6 +190,9 @@ func TestDeliveryPageRetirementIsTheServingState(t *testing.T) {
  VALUES(repeat('c',32),'test: retire early')`); err == nil || !strings.Contains(err.Error(), "quiesce") {
 		t.Fatalf("retirement without quiesce was not refused in SQL: %v", err)
 	}
+	// The serving API records which generation it observed as the current pointer
+	// while it still serves; retirement is bound to that, never to import order.
+	seedServingGeneration(t, pool, repeatHex('c', 32))
 	// Arm retirement: every new public reader is now refused, and no exemption
 	// class opens yet.
 	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: arming')`); err != nil {
@@ -285,9 +288,6 @@ func repeatHex(c byte, n int) string { return strings.Repeat(string(c), n) }
 // write time; nothing here can revise it afterwards.
 func writeCutoverAuthorityWithin(t *testing.T, pool *pgxpool.Pool, generation string, bound time.Time) {
 	t.Helper()
-	// The authority must be bound to the live serving generation, so record the
-	// pinned generation row it is admitted against.
-	seedServingGeneration(t, pool, generation)
 	if _, err := pool.Exec(context.Background(), `INSERT INTO r2_delivery_cutover_authority(
  generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
  legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,
@@ -300,13 +300,13 @@ func writeCutoverAuthorityWithin(t *testing.T, pool *pgxpool.Pool, generation st
 	}
 }
 
-// seedServingGeneration records the pinned generation row the authority is
-// admitted against.
+// seedServingGeneration records the generation the serving API observed as the
+// unpinned current registry pointer, which is what the authority is admitted
+// against. It models the API's own successful public/current.json load.
 func seedServingGeneration(t *testing.T, pool *pgxpool.Pool, generation string) {
 	t.Helper()
-	if _, err := pool.Exec(context.Background(), `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256)
- VALUES('stoarama',$1,'gen-etag',1,'registry',repeat('0',64)) ON CONFLICT(bucket,object_key) DO NOTHING`,
-		globalDeliveryPrefix+"public/generations/"+generation+".json"); err != nil {
+	if _, err := pool.Exec(context.Background(), `INSERT INTO r2_delivery_serving_generation(singleton,generation)
+ VALUES(true,$1) ON CONFLICT(singleton) DO UPDATE SET generation=excluded.generation`, generation); err != nil {
 		t.Fatalf("seed serving generation: %v", err)
 	}
 }
@@ -345,6 +345,8 @@ func TestDeliveryPageRetirementPausesAdmittedReader(t *testing.T) {
 		t.Fatalf("streaming response holds %d leases: %v", live, err)
 	}
 
+	// The serving API observed the current generation before arming.
+	seedServingGeneration(t, pool, repeatHex('a', 32))
 	// Arm retirement while the response is paused. New readers are refused, the
 	// paused one keeps its lease.
 	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: paused reader')`); err != nil {
@@ -464,6 +466,7 @@ func TestDeliveryPageRetirementCommitsAfterDerivedDeadline(t *testing.T) {
 	pool := deliveryExemptionTestPool(t)
 	ctx := context.Background()
 	generation := repeatHex('d', 32)
+	seedServingGeneration(t, pool, generation)
 	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: committed')`); err != nil {
 		t.Fatal(err)
 	}
@@ -490,6 +493,7 @@ func TestDeliveryPageRetirementTicketBoundary(t *testing.T) {
  VALUES('stoarama','original/x.mp4','e',5,repeat('a',64),clock_timestamp()+interval '5 minutes')`); err != nil {
 		t.Fatal(err)
 	}
+	seedServingGeneration(t, pool, generation)
 	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: ticket boundary')`); err != nil {
 		t.Fatal(err)
 	}
@@ -576,16 +580,13 @@ func TestDeliveryPublicLockMatchesSQL(t *testing.T) {
 }
 
 // TestDeliveryPageRetirementAuthorityBindsServingGeneration: the authority row is
-// bound to the live serving registry generation, not to a second string the
-// caller picks, and one artifact cannot stand in for several facts.
+// bound to the generation the serving API OBSERVED as the current pointer, never
+// to import order over holds, and one artifact cannot stand in for several facts.
 func TestDeliveryPageRetirementAuthorityBindsServingGeneration(t *testing.T) {
 	pool := deliveryExemptionTestPool(t)
 	ctx := context.Background()
 	serving := repeatHex('a', 32)
 	other := repeatHex('9', 32)
-	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: generation binding')`); err != nil {
-		t.Fatal(err)
-	}
 	insert := func(generation string, grant, origin, cache, rollback, transfer, approval string) error {
 		_, err := pool.Exec(ctx, `INSERT INTO r2_delivery_cutover_authority(
  generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
@@ -596,25 +597,63 @@ func TestDeliveryPageRetirementAuthorityBindsServingGeneration(t *testing.T) {
 			generation, grant, origin, cache, rollback, transfer, approval)
 		return err
 	}
-	// No live serving generation row: the authority cannot be bound, so it is refused.
-	if err := insert(serving, repeatHex('1', 64), repeatHex('2', 64), repeatHex('3', 64), repeatHex('4', 64), repeatHex('5', 64), repeatHex('6', 64)); err == nil || !strings.Contains(err.Error(), "live serving registry generation") {
-		t.Fatalf("authority with no live serving generation was accepted: %v", err)
+	// Plenty of imported holds, in an order that would point at a DIFFERENT
+	// generation: none of them is the pointer, so the authority cannot be bound
+	// and is refused. This is exactly the "latest imported hold" guess the gate no
+	// longer makes.
+	if _, err := pool.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256)
+ VALUES('stoarama',$1,'e',1,'registry',repeat('0',64)),
+ ('stoarama',$2,'e',1,'registry',repeat('0',64))`,
+		globalDeliveryPrefix+"public/generations/"+other+".json",
+		globalDeliveryPrefix+"public/generations/"+serving+".json"); err != nil {
+		t.Fatal(err)
 	}
-	seedServingGeneration(t, pool, serving)
-	// A generation other than the live serving one is refused.
-	if err := insert(other, repeatHex('1', 64), repeatHex('2', 64), repeatHex('3', 64), repeatHex('4', 64), repeatHex('5', 64), repeatHex('6', 64)); err == nil || !strings.Contains(err.Error(), "not the live serving generation") {
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: generation binding')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := insert(serving, repeatHex('1', 64), repeatHex('2', 64), repeatHex('3', 64), repeatHex('4', 64), repeatHex('5', 64), repeatHex('6', 64)); err == nil || !strings.Contains(err.Error(), "observed serving generation") {
+		t.Fatalf("authority with no observed serving generation was accepted: %v", err)
+	}
+
+	// In a fresh schema, the serving path's own observation is what binds, and a
+	// different generation is refused against it.
+	pool2 := deliveryExemptionTestPool(t)
+	ctx2 := context.Background()
+	// Only the serving path may record the observation, and only while serving.
+	if _, err := pool2.Exec(ctx2, `INSERT INTO r2_delivery_serving_generation(singleton,generation) VALUES(true,$1)`, serving); err != nil {
+		t.Fatal(err)
+	}
+	insert2 := func(generation, grant, origin, cache, rollback, transfer, approval string) error {
+		_, err := pool2.Exec(ctx2, `INSERT INTO r2_delivery_cutover_authority(
+ generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
+ legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,
+ transfer_bound_at,transfer_evidence_sha256,approval_sha256)
+ VALUES($1,'test',clock_timestamp()-interval '10 minutes',$2,clock_timestamp()-interval '10 minutes',$3,
+  clock_timestamp()-interval '10 minutes',$4,$5,clock_timestamp()-interval '10 minutes',$6,$7)`,
+			generation, grant, origin, cache, rollback, transfer, approval)
+		return err
+	}
+	if _, err := pool2.Exec(ctx2, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: bound')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := insert2(other, repeatHex('1', 64), repeatHex('2', 64), repeatHex('3', 64), repeatHex('4', 64), repeatHex('5', 64), repeatHex('6', 64)); err == nil || !strings.Contains(err.Error(), "not the observed serving generation") {
 		t.Fatalf("authority for a non-serving generation was accepted: %v", err)
 	}
 	// One artifact reused for several facts is refused.
-	if err := insert(serving, repeatHex('1', 64), repeatHex('1', 64), repeatHex('3', 64), repeatHex('4', 64), repeatHex('5', 64), repeatHex('6', 64)); err == nil {
+	if err := insert2(serving, repeatHex('1', 64), repeatHex('1', 64), repeatHex('3', 64), repeatHex('4', 64), repeatHex('5', 64), repeatHex('6', 64)); err == nil {
 		t.Fatal("authority reused one evidence digest for two facts")
 	}
 	// The approval digest may not equal an evidence digest.
-	if err := insert(serving, repeatHex('1', 64), repeatHex('2', 64), repeatHex('3', 64), repeatHex('4', 64), repeatHex('5', 64), repeatHex('1', 64)); err == nil {
+	if err := insert2(serving, repeatHex('1', 64), repeatHex('2', 64), repeatHex('3', 64), repeatHex('4', 64), repeatHex('5', 64), repeatHex('1', 64)); err == nil {
 		t.Fatal("authority reused an evidence digest as the approval digest")
 	}
 	// A complete, distinct, correctly bound record is admitted.
-	if err := insert(serving, repeatHex('1', 64), repeatHex('2', 64), repeatHex('3', 64), repeatHex('4', 64), repeatHex('5', 64), repeatHex('6', 64)); err != nil {
+	if err := insert2(serving, repeatHex('1', 64), repeatHex('2', 64), repeatHex('3', 64), repeatHex('4', 64), repeatHex('5', 64), repeatHex('6', 64)); err != nil {
 		t.Fatalf("a complete bound authority was refused: %v", err)
+	}
+	// Once observed, the serving generation cannot be observed again after quiesce
+	// (a later rewrite is refused), so the binding cannot be moved post-arming.
+	if _, err := pool2.Exec(ctx2, `UPDATE r2_delivery_serving_generation SET generation=$1 WHERE singleton`, other); err == nil {
+		t.Fatal("serving generation was rewritten after quiesce")
 	}
 }

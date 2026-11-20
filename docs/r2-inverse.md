@@ -549,10 +549,19 @@ retire as `collated`. Receipts carry `owner_delivery_page_<class>`.
       evidence digest. Timestamps are canonicalized as RFC3339Nano, so the
       approval covers the exact instants the row stores (no truncation).
 
-      The authority is bound to the generation the page was actually serving:
-      the admission trigger requires it to equal the live pinned generation row,
-      and retirement compares against that one row, so it is one bound fact, not
-      two caller strings agreeing.
+      The authority is bound to the generation the SERVING API observed as the
+      unpinned current pointer. A successful `public/current.json` load writes
+      `r2_delivery_serving_generation` under the shared public lock; a pinned read
+      never writes it, and no import or hold order can move it. The admission
+      trigger requires the authority's generation to equal that observed row, and
+      retirement compares against the one admitted row, so it is one bound fact,
+      not two caller strings agreeing and not whichever hold was imported last.
+
+      What that binding does and does not prove: it proves the serving binary
+      loaded that generation from `public/current.json`. It does not prove the R2
+      object still names it now — the object remains the pointer and a separate
+      writer could replace it — and it cannot be recorded once the page is
+      quiesced, so it cannot be moved after arming.
 
       **Provenance, stated plainly.** This row records that an operator produced
       and pinned evidence in the reviewed sequence below. PostgreSQL does not

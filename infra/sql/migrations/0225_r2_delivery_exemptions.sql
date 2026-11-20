@@ -61,6 +61,41 @@ CREATE TABLE r2_delivery_page_quiesce (
  armed_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
+-- The ONE row that records which public registry generation the serving API
+-- actually loaded and served. It is written by the API's own successful
+-- `public/current.json` load, the same object and validator the request path
+-- uses, under the shared public lock, and only for the unpinned CURRENT
+-- generation. A pinned-generation read never writes it, and no import or hold
+-- order can move it. Retirement's cutover authority is bound to this row, so the
+-- generation is the one the serving binary observed as the pointer, not a guess
+-- from whichever hold row was imported last.
+--
+-- This is an observation of the pointer's content by the serving path. It is not
+-- a claim that the R2 object is unchanged now: that object remains the pointer,
+-- and a separate writer could replace it. What it removes is the false "latest
+-- imported hold" inference.
+CREATE TABLE r2_delivery_serving_generation (
+ singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
+ generation text NOT NULL CHECK(generation ~ '^[a-f0-9]{32}$'),
+ observed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE FUNCTION guard_r2_delivery_serving_generation() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'serving generation observation requires READ COMMITTED' USING ERRCODE='55000';
+ END IF;
+ PERFORM pg_advisory_xact_lock_shared(r2_delivery_public_lock());
+ IF NOT r2_delivery_public_serving() THEN
+  RAISE EXCEPTION 'the public delivery page is not serving'
+   USING ERRCODE='55000', HINT='no serving generation may be observed after quiesce';
+ END IF;
+ NEW.observed_at := clock_timestamp();
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_delivery_serving_generation_write BEFORE INSERT OR UPDATE ON r2_delivery_serving_generation
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_serving_generation();
+ALTER TABLE r2_delivery_serving_generation ENABLE ALWAYS TRIGGER r2_delivery_serving_generation_write;
+
 -- The reviewed, immutable cutover evidence: the ONE place the facts the API
 -- cannot observe are recorded, and the only thing that lets a retirement be
 -- proved at all. Every field is an artifact the operator produced outside this
@@ -210,6 +245,11 @@ CREATE FUNCTION guard_r2_delivery_exemption_immutable() RETURNS trigger LANGUAGE
 BEGIN
  RAISE EXCEPTION 'R2 delivery exemptions, approvals, the quiesce state and the page retirement state are append-only';
 END $$;
+-- Never removed or rewritten wholesale: the observed pointer is not a cache.
+CREATE TRIGGER r2_delivery_serving_generation_keep BEFORE DELETE OR TRUNCATE ON r2_delivery_serving_generation
+ FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_delivery_exemption_immutable();
+ALTER TABLE r2_delivery_serving_generation ENABLE ALWAYS TRIGGER r2_delivery_serving_generation_keep;
+
 DO $$ DECLARE t text; BEGIN
  FOREACH t IN ARRAY ARRAY['r2_delivery_exemptions','r2_delivery_exemption_approvals','r2_delivery_page_quiesce','r2_delivery_page_retirement','r2_delivery_cutover_authority'] LOOP
   EXECUTE format('CREATE TRIGGER %s_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_exemption_immutable()',t,t);
@@ -447,20 +487,17 @@ BEGIN
   RAISE EXCEPTION 'cutover authority requires the committed quiesce state'
    USING ERRCODE='55000', HINT='arm the page first; authority recorded before arming proves nothing about the cutover';
  END IF;
- -- Bind the authority to the generation the public page was actually serving, not
- -- to a second string the caller asserts. The row is admitted only while it still
- -- equals the live registry generation recorded by the last successful load (the
- -- delivery_keep_holds registry row), so a mismatched or invented generation is
- -- refused here rather than surfacing later as a caller-string comparison.
- SELECT h.object_key INTO serving FROM delivery_keep_holds h
-  WHERE h.bucket='stoarama' AND h.object_key LIKE 'datasets/global-street-scores-delivery/47/public/generations/%'
-  ORDER BY h.imported_at DESC LIMIT 1;
+ -- Bind the authority to the generation the serving API actually loaded as the
+ -- unpinned current registry (r2_delivery_serving_generation), never to an import
+ -- order over holds. If the serving path never recorded a generation, there is
+ -- nothing to bind to and the authority is refused.
+ SELECT g.generation INTO serving FROM r2_delivery_serving_generation g WHERE g.singleton;
  IF serving IS NULL THEN
-  RAISE EXCEPTION 'cutover authority requires a live serving registry generation'
-   USING ERRCODE='55000', HINT='no pinned generation row was loaded; retiring cannot be bound to a serving generation';
+  RAISE EXCEPTION 'cutover authority requires an observed serving generation'
+   USING ERRCODE='55000', HINT='the serving API has not recorded a public/current.json generation; retirement cannot be bound to one';
  END IF;
- IF NEW.generation <> substring(serving from '([a-f0-9]{32})') THEN
-  RAISE EXCEPTION 'cutover authority generation % is not the live serving generation', NEW.generation
+ IF NEW.generation <> serving THEN
+  RAISE EXCEPTION 'cutover authority generation % is not the observed serving generation', NEW.generation
    USING ERRCODE='55000';
  END IF;
  IF NEW.transfer_bound_at > clock_timestamp() THEN
