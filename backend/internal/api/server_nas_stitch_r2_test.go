@@ -658,6 +658,11 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 			{"evidence pins other picks", func(e *r2.StitchStageEvidence, _ *r2.StitchStagePicks) {
 				e.PicksSHA256 = strings.Repeat("e", 64)
 			}, "different owner picks"},
+			// A subsecond drift in the activation is a different fence, never a
+			// rounded match: the reviewed evidence must name the row's own stamp.
+			{"subsecond fence drift", func(e *r2.StitchStageEvidence, _ *r2.StitchStagePicks) {
+				e.FenceActivatedAt = e.FenceActivatedAt.Add(time.Microsecond)
+			}, "different writer fence"},
 			{"retirement has no picks", func(_ *r2.StitchStageEvidence, p *r2.StitchStagePicks) {
 				*p = r2.StitchStagePicks{}
 			}, "different owner picks"},

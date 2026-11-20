@@ -563,8 +563,13 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	if err != nil {
 		return err
 	}
-	if !fence.ActivatedAt.Truncate(time.Second).Equal(ev.FenceActivatedAt.Truncate(time.Second)) ||
-		!fence.DrainNotBefore.Truncate(time.Second).Equal(ev.DrainNotBefore.Truncate(time.Second)) {
+	// The fence activation and drain deadline are compared exactly, never
+	// truncated. Both values come from the same timestamptz row, whose
+	// microsecond precision survives the round trip unchanged, and the reviewed
+	// evidence must name that row's own stamps. A subsecond difference is a
+	// different fence, so it is refused rather than rounded into a match.
+	if !fence.ActivatedAt.Equal(ev.FenceActivatedAt) ||
+		!fence.DrainNotBefore.Equal(ev.DrainNotBefore) {
 		return errors.New("stitch stage evidence names a different writer fence")
 	}
 	if !dbNow.After(fence.DrainNotBefore) {
@@ -581,10 +586,19 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	if !clear {
 		return errors.New("stitch stage source provenance is protected, undecided or unproven")
 	}
-	// One wire deadline covers the exact HEAD and the DELETE's first byte.
+	// One wire deadline covers the exact HEAD and the DELETE's first byte. It is
+	// fixed here, before any pre-issuance read, and every pre-issuance step and
+	// the independent attempt commit are bounded by it as well, so none of them
+	// can consume authority that has already expired. A slower caller deadline
+	// never extends it; an earlier one still wins.
 	deadline := time.Now().Add(stitchStageWireTimeout)
+	if parent, ok := ctx.Deadline(); ok && parent.Before(deadline) {
+		deadline = parent
+	}
+	preIssue, stopPreIssue := context.WithDeadline(ctx, deadline)
+	defer stopPreIssue()
 	// The exact-key multipart inventory must be empty before any HEAD.
-	if err := c.stitchStageNoMultipart(ctx, t.Key); err != nil {
+	if err := c.stitchStageNoMultipart(preIssue, t.Key); err != nil {
 		return err
 	}
 	head, err := wire.ExactHead(ctx, t, deadline)
@@ -595,19 +609,52 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 		head.SizeBytes != t.SizeBytes || head.SHA256Metadata != t.SHA256 || !head.LastModified.Equal(t.LastModified) {
 		return errors.New("stitch stage generation differs")
 	}
-	if _, err := c.stitchStageDeleteFence(ctx, tx); err != nil {
+	if _, err := c.stitchStageDeleteFence(preIssue, tx); err != nil {
 		return err
 	}
+	// Nothing is minted once the wire bound has passed: authority that could
+	// never send must not exist, so this fails before the attempt insert.
+	if err := stitchStagePreIssuanceExpired(preIssue); err != nil {
+		return fmt.Errorf("stitch stage pre-issuance ended before wire authority could be issued: %w", err)
+	}
 	// Commit the one-shot reservation on a second connection while the outer
-	// session lock and the writer-fence and epoch locks remain held.
-	if _, err = c.writerDB.Exec(ctx, `INSERT INTO nas_stitch_r2_stage_retirements(object_id) VALUES($1)`, objectID); err != nil {
+	// session lock and the writer-fence and epoch locks remain held. It is
+	// bounded by the same pre-issuance bound.
+	if _, err = c.writerDB.Exec(preIssue, `INSERT INTO nas_stitch_r2_stage_retirements(object_id) VALUES($1)`, objectID); err != nil {
 		return err
+	}
+	// The attempt COMMIT is a separate connection and can acknowledge after the
+	// bound expired. That durable intent stays held: it is never retried, edited
+	// or reissued, and no DELETE may come from authority that outlived its
+	// bound. Only an *acknowledged* commit reaches here; an unknown one already
+	// failed above and is held the same way.
+	if err := stitchStagePreIssuanceExpired(preIssue); err != nil {
+		return fmt.Errorf("stitch stage delete intent is held after a late attempt commit and is never reissued: %w", err)
 	}
 	recheck := func(ctx context.Context) error { return c.stitchStageWireRecheck(ctx, tx, t, ev) }
 	if err := wire.DeleteOnce(ctx, t, deadline, recheck); err != nil {
-		return fmt.Errorf("stitch stage delete outcome unconfirmed; reconcile only: %w", err)
+		return fmt.Errorf("stitch stage delete outcome unconfirmed; the intent is held and never reissued: %w", err)
 	}
 	return c.confirmStitchStageRetirement(ctx, tx, objectID, t.Key)
+}
+
+// stitchStagePreIssuanceExpired reports whether the effective pre-issuance
+// bound has passed. A context timer can be delivered late, so Err() alone stays
+// nil for a while after the deadline; comparing the monotonic wall clock
+// against the context's own deadline closes that window instead of re-enabling
+// the wire.
+func stitchStagePreIssuanceExpired(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return nil
+	}
+	if !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 // matchesEvidence requires the reviewed document to be exactly the derivation
@@ -771,8 +818,9 @@ func (c *Client) stitchStageWireRecheck(ctx context.Context, tx pgx.Tx, t Stitch
 	if err != nil {
 		return err
 	}
-	if !fence.ActivatedAt.Truncate(time.Second).Equal(ev.FenceActivatedAt.Truncate(time.Second)) ||
-		!now.After(fence.DrainNotBefore) {
+	// Same exact-stamp binding as the pre-wire check: a subsecond difference in
+	// the activation is a different fence, not the reviewed one.
+	if !fence.ActivatedAt.Equal(ev.FenceActivatedAt) || !now.After(fence.DrainNotBefore) {
 		return errors.New("stitch stage fence or drain changed before the wire")
 	}
 	return nil
@@ -789,7 +837,7 @@ func (c *Client) confirmStitchStageRetirement(ctx context.Context, tx pgx.Tx, ob
 		return fmt.Errorf("stitch stage absence unconfirmed: %w", err)
 	}
 	if err := c.requireStitchStageAbsent(ctx, key); err != nil {
-		return fmt.Errorf("stitch stage delete absence unconfirmed; reconcile only: %w", err)
+		return fmt.Errorf("stitch stage delete absence unconfirmed; the held intent is never reissued: %w", err)
 	}
 	tag, err := tx.Exec(ctx, `WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS at)
  UPDATE nas_stitch_r2_stage_retirements d SET absence_observed_at=coalesce(d.absence_observed_at,observed.at),

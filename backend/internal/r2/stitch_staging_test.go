@@ -239,3 +239,44 @@ func TestStitchStageAbsenceIsNotPublishedWhileTheExactKeyCanStillAppear(t *testi
 		})
 	}
 }
+
+// The stage path must never mint or send authority that has already outlived
+// its wire bound. The pre-issuance gate is the same shape the RAW lanes proved
+// in #572: a delayed context timer is not trusted, so the monotonic clock is
+// compared against the bound itself before the attempt commit and again after
+// an acknowledged one.
+func TestStitchStagePreIssuanceRefusesAnExpiredBound(t *testing.T) {
+	// A live bound is admitted, so an ordinary run never trips the gate.
+	live, liveCancel := context.WithDeadline(context.Background(), time.Now().Add(time.Minute))
+	defer liveCancel()
+	if err := stitchStagePreIssuanceExpired(live); err != nil {
+		t.Fatalf("live pre-issuance bound was refused: %v", err)
+	}
+	// A bound that has passed is refused even though no timer has fired yet and
+	// ctx.Err() is still nil: this is the delayed-timer window the gate closes.
+	// A real deadline context may already have delivered its timer by the time
+	// this runs, so the window is modelled exactly instead of raced for.
+	if err := stitchStagePreIssuanceExpired(pastBound{}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired pre-issuance bound was admitted: %v", err)
+	}
+	// An explicit cancellation is preserved as itself, never mistaken for a
+	// timeout, so a caller can tell a real abort from a late commit.
+	cancelled, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	if err := stitchStagePreIssuanceExpired(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation was not preserved: %v", err)
+	}
+	// No deadline at all cannot be expired; the caller supplies the bound.
+	if err := stitchStagePreIssuanceExpired(context.Background()); err != nil {
+		t.Fatalf("unbounded context was refused: %v", err)
+	}
+}
+
+// pastBound is a context whose deadline has already elapsed while its own
+// Err() still reports nil, exactly the late-timer delivery the pre-issuance
+// gate must not trust.
+type pastBound struct{ context.Context }
+
+func (pastBound) Deadline() (time.Time, bool) { return time.Now().Add(-time.Second), true }
+func (pastBound) Err() error                  { return nil }
+func (pastBound) Value(any) any               { return nil }

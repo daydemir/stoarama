@@ -413,9 +413,11 @@ Keep the custody lane gated during rollback and until both executors enforce
 holds. Retire staged outputs through the separate controller command after
 certification, read and write grant drain, a live drained writer fence,
 exact evidence, and dependency checks. An ambiguous delete retains its
-one-shot intent and blocks fence removal and conflicting dependencies until
-the controller observes absence. For NAS raw cleanup, reconcile legacy staged
-absence receipts once with the current command to record a strict HEAD
+one-shot intent permanently: it is never reissued, edited or re-derived, it
+blocks fence removal and conflicting dependencies, and a later read-only
+observation of absence never publishes it. Only an invocation whose own DELETE
+was answered may publish a strict absence. For NAS raw cleanup, reconcile legacy
+staged absence receipts once with the current command to record a strict HEAD
 confirmation alongside the original observation.
 
 ### Stage retirement premise
@@ -443,6 +445,23 @@ single-attempt transport unchanged:
 - publication also requires a complete, exact-key multipart inventory that is
   empty. A `404` alone is never enough: an unfinished upload for the same key
   could still recreate the object after the observation.
+
+One earliest bound governs every step that can issue. The 30-second wire
+deadline is fixed before the first pre-issuance read, and the exact-key
+multipart inventory, the fence read and the independently committed attempt
+all run under it, so a slow check or a late commit can never consume an
+authority that has already expired. The gate compares the wall clock against
+the bound itself rather than trusting a delayed context timer, before the
+attempt commit and again after an acknowledged one. A late or unknown commit
+leaves the intent held and sends zero DELETEs; an unknown commit is held the
+same way. The confirmation budget after an answered DELETE stays independent
+of that wire deadline, and no DELETE is ever retried.
+
+The live fence is bound by its exact stamps. `activated_at` and
+`drain_not_before` are compared without truncation: both come from the same
+`timestamptz` row, whose microsecond precision survives the round trip, and
+the reviewed evidence must name that row's own values, so a subsecond drift is
+a different fence rather than a rounded match.
 
 One provider endpoint, taken from the committed stage row. That row's
 `endpoint_sha256` is the authority, not whatever the operator's process config
