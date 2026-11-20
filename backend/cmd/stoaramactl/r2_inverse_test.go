@@ -207,7 +207,7 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
  CREATE TABLE recording_joined_batches(id bigint,state text);
  CREATE TABLE recording_joined_dry_run_scopes(recording_id bigint,recording_job_id bigint,high_water_clip_id bigint);
  CREATE TABLE nas_r2_copy_items(item jsonb,state text,blocked_reason text);
- CREATE TABLE delivery_keep_holds(bucket text,object_key text,relative_path text DEFAULT '',sha256 text DEFAULT '',size_bytes bigint DEFAULT 1);
+ CREATE TABLE delivery_keep_holds(bucket text,object_key text,relative_path text DEFAULT '',sha256 text DEFAULT '',size_bytes bigint DEFAULT 1,etag text DEFAULT 'etag');
  CREATE TABLE delivery_nas_source_holds(clip_id bigint);
  CREATE TABLE delivery_keep_output_dependencies(output_id bigint,recording_id bigint);
  CREATE TABLE nas_cleanup_incident_files(kind text,source_id bigint);

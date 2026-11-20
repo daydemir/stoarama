@@ -432,22 +432,45 @@ func (c *inverseWireConn) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// inverseWireAuthority is what one DELETE's transport may check: the live
+// binding check and the send gate. Both the RAW/keep-28 authority and the
+// collated authority implement it, so every lane sends over the ONE audited
+// transport rather than a weaker copy.
+type inverseWireAuthority interface {
+	check(context.Context, string, string) error
+	sendGate() *inverseSendGate
+	wireKey() string
+	bounded(context.Context) (context.Context, context.CancelFunc, error)
+}
+
+func (a *inverseDeleteAuthority) sendGate() *inverseSendGate { return a.gate }
+func (a *inverseDeleteAuthority) wireKey() string            { return a.binding.Key }
+
+// inverseNonrawAuthority denies the deadline boundary outright: the collated
+// lane's parent context already carries the key's network deadline, and a
+// nonraw key has no NAS custody to end at.
+func (a *inverseNonrawAuthority) sendGate() *inverseSendGate { return a.gate }
+func (a *inverseNonrawAuthority) wireKey() string            { return a.binding.Key }
+func (a *inverseNonrawAuthority) bounded(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	return ctx, func() {}, nil
+}
+
 type inverseDeleteTransport struct {
 	base             http.RoundTripper
-	authority        *inverseDeleteAuthority
+	authority        inverseWireAuthority
 	bucket, endpoint string
 	attempted        atomic.Bool
 	wire             *inverseWire
 }
 
 func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.Method != http.MethodDelete || req.URL.Path != "/"+t.bucket+"/"+t.authority.binding.Key || req.URL.RawQuery != "x-id=DeleteObject" || !t.attempted.CompareAndSwap(false, true) {
+	if req.Method != http.MethodDelete || req.URL.Path != "/"+t.bucket+"/"+t.authority.wireKey() || req.URL.RawQuery != "x-id=DeleteObject" || !t.attempted.CompareAndSwap(false, true) {
 		return nil, errors.New("inverse transport permits one exact DELETE")
 	}
 	if err := t.authority.check(req.Context(), t.bucket, t.endpoint); err != nil {
 		return nil, err
 	}
-	bounded, cancel, err := t.authority.bound(req.Context())
+	bounded, cancel, err := t.authority.bounded(req.Context())
 	if err != nil {
 		return nil, err
 	}

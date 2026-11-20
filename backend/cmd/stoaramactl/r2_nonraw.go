@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/http/httptrace"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -453,10 +452,33 @@ func (a *inverseApplier) loadNonrawTarget(ctx context.Context, tx pgx.Tx, e inve
 	if t.Choice == "all" {
 		return t, fmt.Errorf("%w: keep-everything stream", errInverseNonrawIneligible)
 	}
+	// For an exempt delivery page key, the PAGE RECORDING's own stream must be
+	// decided too, not only the catalog output's: a page row can name a
+	// keep-everything or undecided stream while the output names a decided one.
+	if t.Exemption != "" {
+		pageStream, found, err := a.pageRecordingStream(ctx, tx, e.Key)
+		if err != nil {
+			return t, err
+		}
+		if !found || !deliveryPageStreamDecided(a.protection.Picks, a.protection.Windows, pageStream) {
+			return t, fmt.Errorf("%w: page recording stream %d has no positive non-keep-everything decision", errInverseNonrawIneligible, pageStream)
+		}
+	}
 	if class, reason := a.protection.classify(e.ObjectInfo); class != inverseCollated {
 		return t, fmt.Errorf("%w: reclassified %s (%s)", errInverseNonrawIneligible, class, reason)
 	}
 	return t, nil
+}
+
+// pageRecordingStream reads the live stream the delivery page recording row
+// names for an exact page key. found is false when the key has no page row.
+func (a *inverseApplier) pageRecordingStream(ctx context.Context, q r2RetireQuerier, key string) (stream int64, found bool, err error) {
+	err = q.QueryRow(ctx, `SELECT coalesce(rec.stream_id,0) FROM delivery_keep_holds h
+ LEFT JOIN recordings rec ON rec.id=h.recording_id WHERE h.bucket=$1 AND h.object_key=$2`, a.store.Bucket(), key).Scan(&stream)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	return stream, err == nil, err
 }
 
 var errInverseNonrawIneligible = errors.New("collated target ineligible")
@@ -824,46 +846,29 @@ func (s *inverseSDKStore) deleteNonrawOnce(ctx context.Context, a *inverseNonraw
 	if a == nil || a.used == nil || !a.used.CompareAndSwap(false, true) {
 		return errors.New("nonraw authority absent or consumed")
 	}
-	if err := a.check(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
+	return s.deleteOnceWith(ctx, a)
+}
+
+// deleteOnceWith sends one DELETE through the ONE audited transport every lane
+// shares: a fresh HTTP/1.1 connection, the batch send gate on the first request
+// byte, the first-write deadline, no redirects, and a lost-response
+// classification only after the connection is closed and any read has returned.
+func (s *inverseSDKStore) deleteOnceWith(ctx context.Context, authority inverseWireAuthority) error {
+	if err := authority.check(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
 		return err
 	}
 	template, ok := s.transport.(*http.Transport)
 	if !ok {
-		return errors.New("nonraw DELETE needs the HTTP/1.1 transport template")
+		return errors.New("inverse DELETE needs the HTTP/1.1 transport template")
 	}
-	wire := &inverseWire{gate: a.gate}
-	transport := &inverseNonrawTransport{base: wire.transport(template), authority: a, bucket: s.Bucket(), endpoint: s.EndpointSHA256(), wire: wire}
-	_, err := s.sdk.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.Bucket()), Key: aws.String(a.binding.Key)}, func(o *s3.Options) {
+	wire := &inverseWire{gate: authority.sendGate()}
+	transport := &inverseDeleteTransport{base: wire.transport(template), authority: authority, bucket: s.Bucket(), endpoint: s.EndpointSHA256(), wire: wire}
+	_, err := s.sdk.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.Bucket()), Key: aws.String(authority.wireKey())}, func(o *s3.Options) {
 		o.Retryer = aws.NopRetryer{}
 		o.HTTPClient = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	})
-	if err != nil && wire.lost() {
+	if err != nil && wire.lostAfterClose() {
 		return fmt.Errorf("%w: %w", errInverseWireAmbiguous, err)
 	}
 	return err
-}
-
-type inverseNonrawTransport struct {
-	base             http.RoundTripper
-	authority        *inverseNonrawAuthority
-	bucket, endpoint string
-	attempted        atomic.Bool
-	wire             *inverseWire
-}
-
-func (t *inverseNonrawTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.Method != http.MethodDelete || req.URL.Path != "/"+t.bucket+"/"+t.authority.binding.Key || req.URL.RawQuery != "x-id=DeleteObject" || !t.attempted.CompareAndSwap(false, true) {
-		return nil, errors.New("nonraw transport permits one exact DELETE")
-	}
-	if err := t.authority.check(req.Context(), t.bucket, t.endpoint); err != nil {
-		return nil, err
-	}
-	req.Header.Del("Idempotency-Key")
-	req.Header.Del("X-Idempotency-Key")
-	trace := &httptrace.ClientTrace{GotFirstResponseByte: func() { t.wire.answered.Store(true) }}
-	response, err := t.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
-	if response != nil {
-		t.wire.answered.Store(true)
-	}
-	return response, err
 }

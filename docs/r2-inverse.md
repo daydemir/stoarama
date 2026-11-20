@@ -257,15 +257,31 @@ this lane.
 | Class | Page rows | Gate |
 | --- | --- | --- |
 | `outside_window` | `video_collated` under `joined/goodplus-*` or `joined/nightly-collation-v2/`, outside every keep window (4,348, 0.582 TB) | open once seeded |
-| `confident_repair` | `video_assembly` under `experimental/stitching-confident-repairs/`, no catalog row (9,232, 3.377 TB) | page retirement marker exists |
-| `in_window` | `video_collated` inside a keep window (10,893, 2.347 TB) | page retirement marker exists **and** the exact output is NAS-certified (`r2_delivery_nas_certified`) |
+| `confident_repair` | `video_assembly` under `experimental/stitching-confident-repairs/`, no catalog row (9,232, 3.377 TB) | the page is really down (`r2_delivery_page_retired()`) |
+| `in_window` | `video_collated` inside a keep window (10,893, 2.347 TB) | the page is really down **and** the exact output is NAS-certified (`r2_delivery_nas_certified`) |
 
 An exemption binds the exact `(bucket, object_key, etag, size_bytes)` of the
-live page row and stores the class's verbatim owner decision and the roster
-SHA-256. It is append-only. If the page row's identity ever drifts, the key is
-held again. Keep-everything delivery videos (1.0 TB) are never exempted: the
-seed command refuses any key whose stream is `all` in the pinned picks, and the
-lane refuses it again. `r2_delivery_nas_certified(output_id, bucket, key, etag,
+live page row, the class's verbatim owner decision and the roster SHA-256, and it
+references the append-only owner approval for **that class and roster digest**
+(`r2_delivery_exemption_approvals`). A roster digest approved for one class can
+never be replayed under another, and the seed recomputes each row's class with
+the collated executor's own live classifier (inside vs outside the stream's keep
+window, or a confident repair) and refuses the whole roster on any disagree. It
+is append-only. If the page row's identity ever drifts, the key is held again;
+the partition compares the listing's ETag and size against the exempt identity
+before reporting a candidate.
+
+Seeding requires a positive, window-bound, non-keep-everything owner decision
+for the page recording's stream *and* for the output's own stream; a missing
+pick is refused. At deletion time the page recording's stream is rechecked live,
+so a page row on a keep-everything or undecided stream holds the key even when
+the catalog output names a decided one. Dependency-only collated outputs that
+are not page keys follow the 2026-11-18 owner scope, but anything whose NAS copy
+is still pending or blocked ("waiting to be transferred") stays held. Footage
+already verified on the NAS is not excluded by that rule.
+Keep-everything delivery videos (1.0 TB) are never exempted: the seed command
+refuses any key whose stream is `all` in the pinned picks, and the lane refuses
+it again. `r2_delivery_nas_certified(output_id, bucket, key, etag,
 size, sha256)` returns false until the follow-up to the stitching thread's NAS
 handoff (#574, 0224) binds it to `delivery_nas_handoff_certified`: an exact
 match on output_id, bucket, object_key, etag, size_bytes and sha256 with
@@ -292,7 +308,12 @@ retire as `collated`. Receipts carry `owner_delivery_page_<class>`.
 3. Handoff (a) and (b): the in-window videos are copied and certified on the
    NAS and the static CSV+JSON manifest of old links to NAS paths is published.
 4. Handoff (c): take the old page down, then run
-   `stoaramactl r2-inverse page-retired` once. This opens `confident_repair`.
+   `stoaramactl r2-inverse page-retired --generation HEX32 --registry-state
+   disabled|retired` once. The marker is inert on its own: `r2_delivery_page_retired()`
+   is true only when the marker exists **and** the exact serving generation it
+   names is recorded disabled or retired in `r2_delivery_page_registry_events`.
+   The command records that state and refuses to write the marker unless the
+   function already returns true. This opens `confident_repair`.
 5. Seed `confident_repair` and run the collated job. Seed `in_window` once the
    0224 follow-up certifies the copies; until then it stays held.
 

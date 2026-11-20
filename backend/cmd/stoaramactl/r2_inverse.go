@@ -48,6 +48,13 @@ type inverseIdentity struct {
 	Timezone   string
 	Kind       string
 }
+
+// inversePageIdentity is the exact delivery page identity an exemption binds.
+type inversePageIdentity struct {
+	ETag      string
+	SizeBytes int64
+}
+
 type inverseProtection struct {
 	Identities     map[string][]inverseIdentity
 	Held, Delivery map[string]bool
@@ -56,6 +63,10 @@ type inverseProtection struct {
 	// whose class gate is open (Exempt) does.
 	PageKeep map[string]bool
 	Exempt   map[string]deliveryExemptionClass
+	// ExemptIdentity is each open exemption's bound page identity. A listing
+	// whose ETag or size differs from it is never a candidate: the exemption
+	// covers one exact object, not the key.
+	ExemptIdentity map[string]inversePageIdentity
 	// OwnerKeepPrefixes are durable owner keep holds on whole key prefixes. A
 	// key under one is kept whatever its catalog status.
 	OwnerKeepPrefixes []string
@@ -110,9 +121,15 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 	}
 	// Deniz, 2026-11-12: keep up only the links on the public delivery page.
 	// Those exact keys stay delivery in every scope, reviewed or not, until the
-	// owner exempts the key and its class gate opens (0225).
-	if _, exempt := p.Exempt[o.Key]; p.PageKeep[o.Key] && !exempt {
-		return inverseDelivery, "delivery_page_keep"
+	// owner exempts the key and its class gate opens (0225). The exemption binds
+	// one exact identity: a listing whose ETag or size drifted from it is held.
+	if p.PageKeep[o.Key] {
+		if _, exempt := p.Exempt[o.Key]; !exempt {
+			return inverseDelivery, "delivery_page_keep"
+		}
+		if id, bound := p.ExemptIdentity[o.Key]; bound && (strings.Trim(o.ETag, `"`) != id.ETag || o.SizeBytes != id.SizeBytes) {
+			return inverseDelivery, "delivery_exemption_identity_drift"
+		}
 	}
 	if p.Held[o.Key] {
 		return inverseHeld, "live_hold"
@@ -308,7 +325,9 @@ WITH held_sources AS (
  UNION SELECT bucket,object_key FROM nas_stitch_r2_input_holds WHERE released_at IS NULL
 ) SELECT object_key FROM held_keys WHERE bucket=$1`
 const inversePageKeepSQL = `SELECT object_key FROM delivery_keep_holds WHERE bucket=$1`
-const inverseExemptSQL = `SELECT object_key,class::text FROM r2_delivery_exemptions WHERE bucket=$1 AND r2_delivery_exempt(bucket,object_key)`
+const inverseExemptSQL = `SELECT x.object_key,x.class::text,h.etag,h.size_bytes FROM r2_delivery_exemptions x
+ JOIN delivery_keep_holds h ON h.bucket=x.bucket AND h.object_key=x.object_key
+ WHERE x.bucket=$1 AND r2_delivery_exempt(x.bucket,x.object_key)`
 const inverseJoinedReleasedSQL = `SELECT DISTINCT c.object_key FROM recording_joined_source_snapshots s JOIN recording_clips c ON c.id=s.clip_id
 WHERE c.bucket=$1 AND r2_joined_source_released(c.id)`
 const inverseDeliverySQL = `
@@ -337,7 +356,7 @@ func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string
 // reviewed non-raw scope is explicitly selected. Default callers keep the exact
 // previous classification, where collated keys are deferred and delivery holds.
 func loadInverseProtectionMode(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks, windows map[int64]api.Keep28Window, reviewed bool) (inverseProtection, error) {
-	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, PageKeep: map[string]bool{}, Exempt: map[string]deliveryExemptionClass{}, JoinedReleased: map[string]bool{}, KEFolders: map[string]bool{}, Windows: windows, Picks: picks, ReviewedCollated: reviewed}
+	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, PageKeep: map[string]bool{}, Exempt: map[string]deliveryExemptionClass{}, ExemptIdentity: map[string]inversePageIdentity{}, JoinedReleased: map[string]bool{}, KEFolders: map[string]bool{}, Windows: windows, Picks: picks, ReviewedCollated: reviewed}
 	rows, err := q.Query(ctx, inverseCatalogSQL, bucket)
 	if err != nil {
 		return p, err
@@ -367,7 +386,7 @@ func loadInverseProtectionMode(ctx context.Context, q r2RetireQuerier, bucket st
 	if p.OwnerKeepPrefixes, err = loadInverseOwnerKeepPrefixes(ctx, q, bucket); err != nil {
 		return p, err
 	}
-	if p.Exempt, err = loadInverseExempt(ctx, q, bucket); err != nil {
+	if p.Exempt, p.ExemptIdentity, err = loadInverseExempt(ctx, q, bucket); err != nil {
 		return p, err
 	}
 	for _, set := range []struct {
@@ -405,22 +424,25 @@ func loadInverseProtectionMode(ctx context.Context, q r2RetireQuerier, bucket st
 	return p, nil
 }
 
-// loadInverseExempt reads the page keys whose owner exemption is open now.
-func loadInverseExempt(ctx context.Context, q r2RetireQuerier, bucket string) (map[string]deliveryExemptionClass, error) {
+// loadInverseExempt reads the page keys whose owner exemption is open now, with
+// the exact page identity each exemption binds.
+func loadInverseExempt(ctx context.Context, q r2RetireQuerier, bucket string) (map[string]deliveryExemptionClass, map[string]inversePageIdentity, error) {
 	rows, err := q.Query(ctx, inverseExemptSQL, bucket)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
-	out := map[string]deliveryExemptionClass{}
+	out, identities := map[string]deliveryExemptionClass{}, map[string]inversePageIdentity{}
 	for rows.Next() {
-		var key, class string
-		if err = rows.Scan(&key, &class); err != nil {
-			return nil, err
+		var key, class, etag string
+		var size int64
+		if err = rows.Scan(&key, &class, &etag, &size); err != nil {
+			return nil, nil, err
 		}
 		out[key] = deliveryExemptionClass(class)
+		identities[key] = inversePageIdentity{ETag: strings.Trim(etag, `"`), SizeBytes: size}
 	}
-	return out, rows.Err()
+	return out, identities, rows.Err()
 }
 
 type inverseLister interface {

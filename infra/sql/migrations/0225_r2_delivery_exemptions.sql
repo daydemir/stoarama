@@ -22,17 +22,50 @@
 -- refuses any key whose stream is keep-everything.
 
 CREATE TYPE r2_delivery_exemption_class AS ENUM ('outside_window','confident_repair','in_window');
+CREATE TYPE r2_delivery_page_registry_state AS ENUM ('serving','disabled','retired');
 
--- Set once, when the old delivery page is taken down (handoff step c).
+-- The public page is served from the delivery registry object
+-- (datasets/global-street-scores-delivery/<account>/public/current.json), which
+-- lives outside PostgreSQL. A retirement marker may therefore never be trusted
+-- on its own: the serving generation's state is recorded here, append-only, and
+-- every gate reads its latest state live. 'serving' is the default record; the
+-- controller records 'disabled' only after the page stops serving, and may
+-- record 'retired' once the generation object itself is gone.
+CREATE TABLE r2_delivery_page_registry_events (
+ id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+ generation text NOT NULL CHECK (generation ~ '^[a-f0-9]{32}$'),
+ state r2_delivery_page_registry_state NOT NULL,
+ decision text NOT NULL CHECK(decision<>''),
+ recorded_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX r2_delivery_page_registry_latest ON r2_delivery_page_registry_events(generation, id DESC);
+
+-- Set once, when the old delivery page is taken down (handoff step c). The
+-- marker names the exact serving generation it retires; it is inert until that
+-- generation is recorded disabled or retired.
 CREATE TABLE r2_delivery_page_retirement (
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
+ generation text NOT NULL CHECK(generation ~ '^[a-f0-9]{32}$'),
  decision text NOT NULL CHECK(decision<>''),
  retired_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
+-- The owner approval each class was seeded from: one append-only row per
+-- (class, roster digest). Every exemption row must name a matching approval, so
+-- an approved roster digest can never be replayed under another class.
+CREATE TABLE r2_delivery_exemption_approvals (
+ id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+ class r2_delivery_exemption_class NOT NULL,
+ roster_sha256 text NOT NULL CHECK(roster_sha256 ~ '^[a-f0-9]{64}$'),
+ decision text NOT NULL CHECK(decision<>''),
+ created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+ UNIQUE(class, roster_sha256)
+);
+
 -- One exemption per exact page key. etag and size_bytes must equal the live
 -- delivery_keep_holds row, both at admission and every time the exemption is
--- consulted; any drift keeps the key held.
+-- consulted; any drift keeps the key held. approval_id binds the row to the
+-- owner approval for its own class and roster digest.
 CREATE TABLE r2_delivery_exemptions (
  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
  bucket text NOT NULL,
@@ -40,6 +73,7 @@ CREATE TABLE r2_delivery_exemptions (
  etag text NOT NULL CHECK(etag<>''),
  size_bytes bigint NOT NULL CHECK(size_bytes>0),
  class r2_delivery_exemption_class NOT NULL,
+ approval_id bigint NOT NULL REFERENCES r2_delivery_exemption_approvals(id),
  decision text NOT NULL CHECK(decision<>''),
  roster_sha256 text NOT NULL CHECK(roster_sha256 ~ '^[a-f0-9]{64}$'),
  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -48,10 +82,10 @@ CREATE TABLE r2_delivery_exemptions (
 
 CREATE FUNCTION guard_r2_delivery_exemption_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
- RAISE EXCEPTION 'R2 delivery exemptions and the page retirement marker are append-only';
+ RAISE EXCEPTION 'R2 delivery exemptions, approvals and the page retirement marker are append-only';
 END $$;
 DO $$ DECLARE t text; BEGIN
- FOREACH t IN ARRAY ARRAY['r2_delivery_exemptions','r2_delivery_page_retirement'] LOOP
+ FOREACH t IN ARRAY ARRAY['r2_delivery_exemptions','r2_delivery_exemption_approvals','r2_delivery_page_retirement','r2_delivery_page_registry_events'] LOOP
   EXECUTE format('CREATE TRIGGER %s_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_exemption_immutable()',t,t);
   EXECUTE format('CREATE TRIGGER %s_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_delivery_exemption_immutable()',t,t);
   EXECUTE format('ALTER TABLE %I ENABLE ALWAYS TRIGGER %s_immutable',t,t);
@@ -60,7 +94,8 @@ DO $$ DECLARE t text; BEGIN
 END $$;
 
 -- Admission reads the live page row, so it must see what committed before it.
--- Each class names the exact page kind and key family the owner decided on.
+-- Each class names the exact page kind and key family the owner decided on, and
+-- every row must reference the owner approval for THAT class and roster digest.
 CREATE FUNCTION guard_r2_delivery_exemption_admission() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE h delivery_keep_holds;
 BEGIN
@@ -70,6 +105,10 @@ BEGIN
  SELECT * INTO h FROM delivery_keep_holds WHERE bucket=NEW.bucket AND object_key=NEW.object_key FOR SHARE;
  IF NOT FOUND OR h.etag<>NEW.etag OR h.size_bytes<>NEW.size_bytes THEN
   RAISE EXCEPTION 'R2 delivery exemption needs the exact live page identity of %', NEW.object_key;
+ END IF;
+ IF NOT EXISTS(SELECT 1 FROM r2_delivery_exemption_approvals a WHERE a.id=NEW.approval_id
+    AND a.class=NEW.class AND a.roster_sha256=NEW.roster_sha256 AND a.decision=NEW.decision) THEN
+  RAISE EXCEPTION 'R2 delivery exemption % must name its own class/roster approval', NEW.object_key;
  END IF;
  IF NOT ((NEW.class='confident_repair' AND h.kind='video_assembly'
     AND starts_with(NEW.object_key,'experimental/stitching-confident-repairs/'))
@@ -92,6 +131,23 @@ ALTER TABLE r2_delivery_exemptions ENABLE ALWAYS TRIGGER r2_delivery_exemption_a
 CREATE FUNCTION r2_delivery_nas_certified(p_output_id bigint, p_bucket text, p_key text, p_etag text, p_size bigint, p_sha256 text)
 RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT false $$;
 
+-- True only when the public delivery page is really down, checked live on every
+-- call. Two independent facts must both hold, and neither may be inferred from
+-- the other:
+--  1. the one-shot retirement marker exists, and
+--  2. the exact serving generation it names was recorded disabled or retired.
+-- The page is served from the R2 registry object, not from PostgreSQL, so the
+-- marker alone can never mean the page is down. The latest recorded state for
+-- the marker's generation must be 'disabled' or 'retired'; a generation with no
+-- such record (including one only ever recorded as 'serving') keeps every
+-- page-retirement gate closed.
+CREATE FUNCTION r2_delivery_page_retired() RETURNS boolean LANGUAGE sql STABLE AS $$
+ SELECT EXISTS(
+  SELECT 1 FROM r2_delivery_page_retirement r
+  WHERE (SELECT e.state FROM r2_delivery_page_registry_events e
+         WHERE e.generation=r.generation ORDER BY e.id DESC LIMIT 1) IN ('disabled','retired'))
+$$;
+
 -- True only for an exempt exact page key whose class gate is open now. A class
 -- without a gate branch yields NULL and stays held.
 CREATE FUNCTION r2_delivery_exempt(p_bucket text, p_key text) RETURNS boolean LANGUAGE sql STABLE AS $$
@@ -100,8 +156,8 @@ CREATE FUNCTION r2_delivery_exempt(p_bucket text, p_key text) RETURNS boolean LA
   WHERE x.bucket=p_bucket AND x.object_key=p_key AND h.etag=x.etag AND h.size_bytes=x.size_bytes
   AND CASE x.class
    WHEN 'outside_window' THEN true
-   WHEN 'confident_repair' THEN EXISTS(SELECT 1 FROM r2_delivery_page_retirement)
-   WHEN 'in_window' THEN EXISTS(SELECT 1 FROM r2_delivery_page_retirement)
+   WHEN 'confident_repair' THEN r2_delivery_page_retired()
+   WHEN 'in_window' THEN r2_delivery_page_retired()
     AND EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.object_key=x.object_key
      AND o.size_bytes=x.size_bytes AND lower(o.sha256)=h.sha256
      AND r2_delivery_nas_certified(o.id,x.bucket,x.object_key,x.etag,x.size_bytes,h.sha256))

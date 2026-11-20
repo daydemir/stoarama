@@ -1003,7 +1003,7 @@ func TestKeep28HandoffsKeepTheTightestSample(t *testing.T) {
 	if !ok || deadline.After(tightest) {
 		t.Fatalf("socket deadline %v later than the tightest sample %v", deadline, tightest)
 	}
-	confirming, cancel, err := auth.bound(auth.ctx)
+	confirming, cancel, err := auth.bounded(auth.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
