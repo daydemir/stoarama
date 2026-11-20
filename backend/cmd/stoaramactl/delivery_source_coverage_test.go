@@ -171,7 +171,9 @@ func TestDeliverySourceCoverageRequiresLatestProofAndExactNASReadback(t *testing
 	execSQL(`INSERT INTO r2_object_retirements
 	 SELECT 'collated',4,123,bucket,object_key,sha256,size_bytes FROM delivery_nas_handoff_outputs WHERE output_id=4`)
 	want(1)
-	execSQL("UPDATE r2_object_retirements SET size_bytes=99")
+	execSQL("UPDATE r2_object_retirements SET stream_id=124")
+	want(0)
+	execSQL("UPDATE r2_object_retirements SET stream_id=123,size_bytes=99")
 	want(0)
 	execSQL("UPDATE r2_object_retirements SET size_bytes=100,source_id=6")
 	want(0)
