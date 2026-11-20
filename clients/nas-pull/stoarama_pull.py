@@ -48105,6 +48105,17 @@ def stitch_measure_diagnostic(stop, stderr):
         StitchMeasureHoldReason(value["h"]))
 
 
+def stitch_measure_argv(root, request, stop):
+    args = ([sys.executable, "-I", "-B", str(root/"runner.py"), str(request)]
+            if getattr(stop, "kind", None) is not StitchRunKind.PROOF
+            else stitch_measure_driver_argv(root, request, stop))
+    if getattr(stop, "kind", None) is StitchRunKind.DURHAM_R2:
+        # -B alone still reads a stale __pycache__ whose validation fields
+        # match, so the archived classifier runs with no cache directory.
+        args[1:1] = ["-X", "pycache_prefix=/dev/null"]
+    return args
+
+
 def stitch_v85r_measure(cfg, inventory, previous, clip, tools, work, deadline, stop, root):
     def source(c, side):
         with stitch_measure_stage(stop, StitchMeasureStage.SOURCE, side):
@@ -48129,9 +48140,7 @@ def stitch_v85r_measure(cfg, inventory, previous, clip, tools, work, deadline, s
         (work/"v85r-request.json").write_bytes(cleanup_json_bytes(request))
         stitch_check(stop)
     with stitch_measure_stage(stop, StitchMeasureStage.DRIVER):
-        args = ([sys.executable, "-I", "-B", str(root/"runner.py"), str(work/"v85r-request.json")]
-                if getattr(stop, "kind", None) is not StitchRunKind.PROOF
-                else stitch_measure_driver_argv(root, work/"v85r-request.json", stop))
+        args = stitch_measure_argv(root, work/"v85r-request.json", stop)
         measured = stitch_run(args, min(deadline,time.monotonic()+390), stop, work/"v85r-decision.json")
         if getattr(stop, "kind", None) is StitchRunKind.PROOF:
             stitch_measure_diagnostic(stop, measured["stderr"])

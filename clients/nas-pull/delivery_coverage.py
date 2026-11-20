@@ -339,9 +339,18 @@ def read_tracks(ffprobe, source):
 
 
 def probe_headers(ffprobe, source):
-    """Header-only readback for classification: no packet inventory is kept."""
+    """Header-only readback for classification: no packet inventory is kept.
+
+    The two-track validation below is only about AAC dispatch, so an inventory
+    with no audio stream maps to an empty result and the caller keeps its
+    established video-only audit. Audio absence is read from the fully parsed
+    streams, never inferred from a probe that failed.
+    """
     data = probe(ffprobe, source, "-ignore_editlist", "1", "-show_streams", "-show_data_hash", "sha256")
-    tracks, _ = track_headers(data["streams"])
+    streams = data["streams"]
+    if not any(stream.get("codec_type") == "audio" for stream in streams):
+        return {}
+    tracks, _ = track_headers(streams)
     return tracks
 
 

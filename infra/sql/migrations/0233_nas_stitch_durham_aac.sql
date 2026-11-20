@@ -4,7 +4,7 @@
 CREATE FUNCTION nas_stitch_r2_aac_profile() RETURNS jsonb
 LANGUAGE sql IMMUTABLE AS $$
   SELECT nas_stitch_r2_native_profile() || jsonb_build_object(
-   'manifest_sha256','ab1103b38ab74dd426ded52448bb2f301965596387dff5146dc9e88748f5229a',
+   'manifest_sha256','4094354775553480b2cab8aae5b5cf9c67b73a1fab83df165a71393e6d9f531e',
    'audio_proof','aac-lc-primed-pcm-v1');
 $$;
 

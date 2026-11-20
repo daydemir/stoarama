@@ -11,8 +11,11 @@ import json
 import os
 from pathlib import Path
 import platform
+import py_compile
 import subprocess
 import sqlite3
+import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -166,6 +169,109 @@ class V85rTests(unittest.TestCase):
         worker.manifest = "a" * 64
         worker.pins = json.loads((ROOT / "v85r/durham-arm64.json").read_bytes())
         return worker
+
+    def pinned_bundle(self, base):
+        """A synthetic bundle whose media member names the copied worker bytes."""
+        sources = build_durham.worker_source_pins(base)
+        media = build_durham.media_toolchain(json.loads(
+            (ROOT / "v85r/durham-arm64.json").read_bytes())["tools"], {"lib": "1" * 64})
+        media["sources"] = sources
+        files = {"media-toolchain.json": (json.dumps(media, indent=2, sort_keys=True) + "\n").encode()}
+        manifest = {"policy": "v85r", "files": {name: hashlib.sha256(body).hexdigest()
+                                                for name, body in files.items()}}
+        files["manifest.json"] = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as packed:
+            for name, body in sorted(files.items()):
+                info = tarfile.TarInfo(name)
+                info.size, info.mode = len(body), 0o600
+                packed.addfile(info, io.BytesIO(body))
+        compressed = io.BytesIO()
+        with gzip.GzipFile(filename="", fileobj=compressed, mode="wb", mtime=0) as output:
+            output.write(archive.getbuffer())
+        blob = compressed.getvalue()
+        profile = Path(base) / "v85r"
+        profile.mkdir(mode=0o700)
+        (profile / "durham-arm64.tar.gz").write_bytes(blob)
+        (profile / "durham-arm64.json").write_bytes(json.dumps(dict(
+            json.loads((ROOT / "v85r/durham-arm64.json").read_bytes()),
+            bundle_sha256=hashlib.sha256(blob).hexdigest(), bundle_size_bytes=len(blob),
+            manifest_sha256=hashlib.sha256(files["manifest.json"]).hexdigest()), sort_keys=True).encode())
+        return sources
+
+    def run_direct(self, base, env):
+        """Run the real direct-__main__ entry exactly as the unit does."""
+        return subprocess.run([sys.executable, "-E", "-s", "-B", str(base / "durham_stitch.py")],
+                              cwd=base, capture_output=True, text=True, timeout=300, env=env)
+
+    def test_preloaded_helpers_are_refused_by_the_verified_entry(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            base = Path(scratch).resolve()
+            self.copy_worker_sources(base)
+            self.pinned_bundle(base)
+            # This module imported durham_stitch by name, so the canonical
+            # helper is already loaded and the verified entry must refuse.
+            self.assertIn("stoarama_pull", sys.modules)
+            with self.assertRaisesRegex(durham_stitch.DurhamError, "already loaded"):
+                durham_stitch.verified_startup(base)
+
+    def test_direct_main_ignores_an_unchecked_stale_pyc_for_a_verified_source(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            base = Path(scratch).resolve()
+            self.copy_worker_sources(base)
+            self.pinned_bundle(base)
+            # A .pyc compiled UNCHECKED_HASH is never validated against its
+            # source, so -B alone would execute it even after a verified digest.
+            sentinel = base / "sentinel.py"
+            sentinel.write_bytes(b"raise SystemExit('cached fixture executed')\n")
+            py_compile.compile(str(sentinel), doraise=True, cfile=importlib.util.cache_from_source(
+                str(base / "stoarama_pull.py")), invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+            control = subprocess.run([sys.executable, "-B", "-c", "import stoarama_pull"],
+                                     cwd=base, capture_output=True, text=True, timeout=120)
+            self.assertEqual(control.returncode, 1)
+            self.assertIn("cached fixture executed", control.stderr)
+            env = {key: value for key, value in os.environ.items() if key != "STOARAMA_STATE_DIR"}
+            direct = self.run_direct(base, env)
+            # The verified entry runs the checked source and reaches main's own
+            # state lookup, never the cached sentinel and never a NameError.
+            self.assertNotEqual(direct.returncode, 0)
+            self.assertNotIn("cached fixture executed", direct.stderr)
+            self.assertNotIn("NameError", direct.stderr)
+            self.assertIn("STOARAMA_STATE_DIR", direct.stderr)
+            (base / "delivery_coverage.py").write_bytes(b"# changed\n")
+            tampered = self.run_direct(base, env)
+            self.assertNotEqual(tampered.returncode, 0)
+            self.assertIn("Durham worker source identity differs", tampered.stderr)
+            self.assertNotIn("cached fixture executed", tampered.stderr)
+
+    def test_direct_main_refuses_unbounded_pins_and_special_files(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            base = Path(scratch).resolve()
+            self.copy_worker_sources(base)
+            self.pinned_bundle(base)
+            pins = json.loads((base / "v85r/durham-arm64.json").read_bytes())
+            env = {key: value for key, value in os.environ.items() if key != "STOARAMA_STATE_DIR"}
+            for size, reason in ((0, "pins differ"), (1024 ** 3, "pins differ")):
+                (base / "v85r/durham-arm64.json").write_bytes(
+                    json.dumps(dict(pins, bundle_size_bytes=size)).encode())
+                ran = self.run_direct(base, env)
+                self.assertNotEqual(ran.returncode, 0)
+                self.assertIn("Durham toolchain " + reason, ran.stderr)
+            (base / "v85r/durham-arm64.json").write_bytes(json.dumps(pins).encode())
+            # A FIFO swapped in for the bundle fails promptly, not by blocking.
+            bundle = base / "v85r/durham-arm64.tar.gz"
+            bundle.unlink()
+            os.mkfifo(bundle)
+            ran = self.run_direct(base, env)
+            self.assertNotEqual(ran.returncode, 0)
+            self.assertIn("resolved regular file", ran.stderr)
+
+    def test_imported_main_refuses_to_lease_without_verified_startup(self):
+        self.assertIsNone(durham_stitch._VERIFIED)
+        with mock.patch.object(durham_stitch, "run_worker") as worker:
+            with self.assertRaisesRegex(durham_stitch.DurhamError, "not loaded from verified"):
+                durham_stitch.main()
+            worker.assert_not_called()
 
     def copy_worker_sources(self, base):
         for name in durham_stitch.WORKER_SOURCES:
@@ -354,6 +460,19 @@ class V85rTests(unittest.TestCase):
         unit = (ROOT / "stoarama-durham-stitch.service").read_text()
         self.assertIn("ExecStart=/usr/bin/python3 -E -s -B /opt/stoarama-stitch/durham_stitch.py\n", unit)
         self.assertNotIn("python3 -B ", unit)
+
+    def test_only_the_durham_measure_child_disables_its_bytecode_cache(self):
+        for kind, expected in ((pull.StitchRunKind.DURHAM_R2, True),
+                               (pull.StitchRunKind.PRODUCTION, False)):
+            stop = SimpleNamespace(kind=kind)
+            args = pull.stitch_measure_argv(ROOT / "v85r", ROOT / "request.json", stop)
+            self.assertEqual(args[1], "-I")
+            self.assertIn("-B", args)
+            self.assertEqual(["-X", "pycache_prefix=/dev/null"] if expected else [] ,
+                             args[1:1] + ([] if args[1] == "-X" else []) if False else (
+                                 ["-X", "pycache_prefix=/dev/null"] if "-X" in args else []))
+            self.assertEqual("-X" in args, expected)
+            self.assertEqual(args[-1], str(ROOT / "request.json"))
 
     @unittest.skipUnless(os.environ.get("V85R_DURHAM_TEST_BUNDLE"), "generated Durham bundle required")
     def test_native_durham_bundle_replays_frozen_october_evidence(self):

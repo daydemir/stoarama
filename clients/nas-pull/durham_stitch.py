@@ -1,8 +1,11 @@
 """Durham's dedicated direct R2 stitch worker."""
 import concurrent.futures
 import datetime
+import gzip
 import hashlib
 from http.client import HTTPException, HTTPSConnection
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -10,13 +13,19 @@ import platform
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
+import tarfile
 import threading
+import types
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
-import stoarama_pull as pull
+if __name__ != "__main__":
+    # Only fixtures and tests import this module by name. The service entry
+    # point below loads every helper from its verified source buffer instead.
+    import stoarama_pull as pull
 
 
 class DurhamError(RuntimeError):
@@ -27,6 +36,145 @@ class DurhamError(RuntimeError):
 # worker scripts whose bytes must match its pinned source digests.
 AUDIO_PROOF = "aac-lc-primed-pcm-v1"
 WORKER_SOURCES = ("delivery_coverage.py", "durham_aac.py", "durham_stitch.py", "stoarama_pull.py")
+# Startup loads exactly these, in dependency order, from checked bytes.
+HELPER_MODULES = ("stoarama_pull", "delivery_coverage", "durham_aac")
+PIN_FILE, BUNDLE_FILE = "durham-arm64.json", "durham-arm64.tar.gz"
+PIN_LIMIT, SOURCE_LIMIT, EXPANSION_LIMIT = 64 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024
+# Set only by the verified direct-__main__ entry, never by a by-name import.
+_VERIFIED = None
+
+
+def bounded_bytes(path, limit):
+    """The one bounded read of a pinned, resolved, non-symlink regular file.
+
+    ``O_NONBLOCK`` makes a file swapped for a FIFO fail here instead of
+    blocking startup, and the live inode is compared before and after.
+    """
+    if path.is_symlink() or not path.is_file() or os.path.realpath(path) != str(path):
+        raise DurhamError("Durham pinned file must be a resolved regular file")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before, chunks, size = os.fstat(descriptor), [], 0
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise DurhamError("Durham pinned file must be a resolved regular file")
+        while size <= limit:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+            size += len(block)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if size > limit:
+        raise DurhamError("Durham pinned file exceeds its bound")
+    if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (
+            before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns):
+        raise DurhamError("Durham pinned file changed while read")
+    return b"".join(chunks)
+
+
+def verify_worker_sources(sources, files, digest):
+    """Require exactly the four pinned, resolved, non-symlink scripts.
+
+    ``digest`` maps one path to its ``(size, sha256)``; the startup passes its
+    single-read buffers and later rechecks pass the stop-aware proof digest.
+    """
+    if (not isinstance(sources, dict) or set(sources) != set(WORKER_SOURCES)
+            or not isinstance(files, dict) or set(files) != set(WORKER_SOURCES)):
+        raise DurhamError("Durham worker source set differs")
+    for name, path in sorted(files.items()):
+        pin = sources[name]
+        if (not isinstance(pin, str) or len(pin) != 64
+                or any(c not in "0123456789abcdef" for c in pin)):
+            raise DurhamError("Durham worker source pin differs")
+        if path.is_symlink() or not path.is_file() or os.path.realpath(path) != str(path):
+            raise DurhamError("Durham worker source must be a resolved regular file")
+        if digest(path)[1] != pin:
+            raise DurhamError("Durham worker source identity differs")
+    return dict(sources)
+
+
+def exec_verified(name, path, body):
+    """Compile and run one checked buffer under a canonical module identity."""
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    module = types.ModuleType(name)
+    module.__file__, module.__loader__ = str(path), spec.loader
+    module.__package__, module.__spec__ = "", spec
+    sys.modules[name] = module
+    try:
+        exec(compile(body, str(path), "exec"), module.__dict__)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def verified_startup(root):
+    """Load the helpers from the exact bytes the pinned bundle names.
+
+    ``-B`` only suppresses new bytecode writes; it still permits a stale
+    ``__pycache__`` read once a source's size and mtime were vouched for. This
+    standard-library-only entry therefore refuses an already imported helper,
+    checks bundle, manifest, media-toolchain member and the four reviewed
+    sources, then executes those very buffers before any lease activity.
+    """
+    if set(sys.modules) & set(HELPER_MODULES):
+        raise DurhamError("Durham application modules are already loaded")
+    pins = json.loads(bounded_bytes(root / "v85r" / PIN_FILE, PIN_LIMIT))
+    if not isinstance(pins, dict) or pins.get("architecture") != "linux-arm64":
+        raise DurhamError("Durham toolchain architecture differs")
+    if (type(pins.get("bundle_size_bytes")) is not int or not 0 < pins["bundle_size_bytes"] <= SOURCE_LIMIT
+            or not isinstance(pins.get("bundle_sha256"), str)
+            or not isinstance(pins.get("manifest_sha256"), str)
+            or not isinstance(pins.get("tools"), dict)):
+        raise DurhamError("Durham toolchain pins differ")
+    bundle = bounded_bytes(root / "v85r" / BUNDLE_FILE, pins["bundle_size_bytes"])
+    if (len(bundle) != pins["bundle_size_bytes"]
+            or hashlib.sha256(bundle).hexdigest() != pins["bundle_sha256"]):
+        raise DurhamError("Durham toolchain bundle size or hash differs")
+    with gzip.GzipFile(fileobj=io.BytesIO(bundle)) as packed:
+        expanded = packed.read(EXPANSION_LIMIT + 1)
+    if len(expanded) > EXPANSION_LIMIT:
+        raise DurhamError("Durham toolchain archive exceeds its bound")
+    members = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(expanded), mode="r:") as archive:
+            names = set(archive.getnames())
+            for name in ("manifest.json", "media-toolchain.json"):
+                member = archive.getmember(name)
+                if not member.isfile() or member.size > SOURCE_LIMIT:
+                    raise DurhamError("Durham toolchain archive member is unsafe")
+                with archive.extractfile(member) as source:
+                    members[name] = source.read(SOURCE_LIMIT + 1)
+                if len(members[name]) != member.size:
+                    raise DurhamError("Durham toolchain archive member differs")
+    except (KeyError, tarfile.TarError, OSError) as exc:
+        raise DurhamError("Durham toolchain archive membership differs") from exc
+    if hashlib.sha256(members["manifest.json"]).hexdigest() != pins["manifest_sha256"]:
+        raise DurhamError("Durham toolchain manifest hash differs")
+    manifest = json.loads(members["manifest.json"])
+    if (not isinstance(manifest, dict) or manifest.get("policy") != "v85r"
+            or not isinstance(manifest.get("files"), dict)
+            or names != set(manifest["files"]) | {"manifest.json"}):
+        raise DurhamError("Durham toolchain manifest membership differs")
+    media_body = members["media-toolchain.json"]
+    if hashlib.sha256(media_body).hexdigest() != manifest["files"].get("media-toolchain.json"):
+        raise DurhamError("Durham media manifest hash differs")
+    media = json.loads(media_body)
+    if (not isinstance(media, dict) or media.get("tools") != pins["tools"]
+            or media.get("version") != pins.get("media_tool_version")
+            or media.get("audio_proof") != AUDIO_PROOF):
+        raise DurhamError("Durham media manifest differs from the profile")
+    bodies = {}
+
+    def digest(path):
+        bodies[str(path)] = bounded_bytes(path, SOURCE_LIMIT)
+        return len(bodies[str(path)]), hashlib.sha256(bodies[str(path)]).hexdigest()
+
+    verify_worker_sources(media.get("sources"), {name: root / name for name in WORKER_SOURCES}, digest)
+    return tuple(exec_verified(name, root / (name + ".py"), bodies[str(root / (name + ".py"))])
+                 for name in HELPER_MODULES)
 
 
 def media_libraries(tools, stop):
@@ -88,18 +236,8 @@ class DurhamV85r:
         the manifest and bundle SHA, so an edited, missing, extra or swapped
         worker script cannot be admitted.
         """
-        if not isinstance(sources, dict) or set(sources) != set(WORKER_SOURCES):
-            raise DurhamError("Durham worker source set differs")
-        for name, path in sorted(self.source_files().items()):
-            pin = sources[name]
-            if (not isinstance(pin, str) or len(pin) != 64
-                    or any(c not in "0123456789abcdef" for c in pin)):
-                raise DurhamError("Durham worker source pin differs")
-            if path.is_symlink() or not path.is_file() or os.path.realpath(path) != str(path):
-                raise DurhamError("Durham worker source must be a resolved regular file")
-            if pull.stitch_proof_digest(path, stop)[1] != pin:
-                raise DurhamError("Durham worker source identity differs")
-        return dict(sources)
+        return verify_worker_sources(
+            sources, self.source_files(), lambda path: pull.stitch_proof_digest(path, stop))
 
     def recheck_sources(self, stop):
         """Re-verify the pinned worker scripts against the accepted digests."""
@@ -356,6 +494,10 @@ def run_worker(http, slot, state, tools):
 
 
 def main():
+    if _VERIFIED is None or _VERIFIED[0] is not pull:
+        # An import by name exposes only pure helpers; leasing requires the
+        # verified direct __main__ startup.
+        raise DurhamError("Durham helpers were not loaded from verified sources")
     if any(key.startswith(("LD_", "QEMU_")) for key in os.environ):
         raise DurhamError("Durham service loader overrides are set")
     state = Path(os.environ["STOARAMA_STATE_DIR"]).resolve(strict=True)
@@ -383,5 +525,14 @@ def main():
             worker.result()
 
 
-if __name__ == "__main__":
+def entry(root):
+    """The real service entry: verified helper sources, then the worker."""
+    global _VERIFIED, pull
+    verified = verified_startup(root)
+    pull = verified[0]
+    _VERIFIED = verified
     main()
+
+
+if __name__ == "__main__":
+    entry(Path(__file__).resolve().parent)
