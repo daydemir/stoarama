@@ -330,6 +330,11 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 		return t, err
 	}
 	defer tx.Rollback(context.Background())
+	// The step's own bound replaces the role's statement_timeout, whose 57014
+	// would end a lock wait publication also takes; only a cancel then stops it.
+	if _, err = tx.Exec(ctx, `SET LOCAL statement_timeout = 0`); err != nil {
+		return t, err
+	}
 	if err = inverseProtectionBarrier(ctx, tx); err != nil {
 		return t, err
 	}

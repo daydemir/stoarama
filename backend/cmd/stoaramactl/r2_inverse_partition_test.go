@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -59,32 +58,6 @@ func TestR2InverseFreshPartitionRequiresTheApprovedPicks(t *testing.T) {
 
 // The CLI requires the picks file on disk to be the approved digest before it
 // reads anything: a replacement file must not ride along on the old digest.
-func TestR2InverseApprovedPicksDigestIsRequired(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "picks.json")
-	if err := os.WriteFile(path, []byte(`{"choices":{}}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	approved, err := inverseFileSHA(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = approvedInversePicks(path, approved); err != nil {
-		t.Fatal(err)
-	}
-	if err = os.WriteFile(path, []byte(`{"choices":{"3":{"choice":"all"}}}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err = approvedInversePicks(path, approved); err == nil || !strings.Contains(err.Error(), "approved digest") {
-		t.Fatalf("swapped picks file accepted: %v", err)
-	}
-	if err = approvedInversePicks(filepath.Join(dir, "absent.json"), approved); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("missing picks file: %v", err)
-	}
-}
-
-// The job CLI refuses a swapped picks file for both a fresh partition and a
-// reused one, before it opens a pool, reads a partition or restores one.
 func TestR2InverseJobCLIRequiresThePicksDigest(t *testing.T) {
 	if args := os.Getenv("STOARAMA_TEST_R2_INVERSE_JOB_ARGS"); args != "" {
 		runR2Inverse(context.Background(), config.Config{DatabaseURL: os.Getenv("STOARAMA_TEST_DATABASE_URL")}, strings.Split(args, "\n"))

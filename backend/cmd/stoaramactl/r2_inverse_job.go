@@ -56,16 +56,25 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane
 		log.Fatal(err)
 	}
 	printInverseJob(map[string]any{"step": "partition", "partition_sha256": digest, "reused": f.reuse != "", "summary": sum})
-	o := inverseApplyOptions{Lane: lane, Manifest: filepath.Join(partition, "partition.jsonl"), Summary: filepath.Join(partition, "summary.json"), Picks: f.picks, Ledger: filepath.Join(f.work, "ledger.jsonl"), Workers: f.workers, MaxItems: f.items, MaxBytes: f.maxBytes, Budget24h: f.budget24h}
-	if o.ManifestSHA, err = inverseFileSHA(o.Manifest); err != nil {
-		log.Fatal(err)
-	}
-	if o.SummarySHA, err = inverseFileSHA(o.Summary); err != nil {
+	o, err := inverseJobApplyOptions(f, lane, partition, digest)
+	if err != nil {
 		log.Fatal(err)
 	}
 	if err = runInverseJobBatches(ctx, pool, store, o, f.owner, f.work, f.batches); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// inverseJobApplyOptions binds the job's apply steps to the digest the
+// partition step returned, never one re-derived from disk: the existing
+// apply-time hash check then rejects a partition file changed in between.
+func inverseJobApplyOptions(f inverseJobFlags, lane inverseLane, partition, digest string) (inverseApplyOptions, error) {
+	o := inverseApplyOptions{Lane: lane, Manifest: filepath.Join(partition, "partition.jsonl"), Summary: filepath.Join(partition, "summary.json"), Picks: f.picks, Ledger: filepath.Join(f.work, "ledger.jsonl"), Workers: f.workers, MaxItems: f.items, MaxBytes: f.maxBytes, Budget24h: f.budget24h, ManifestSHA: digest}
+	var err error
+	if o.SummarySHA, err = inverseFileSHA(o.Summary); err != nil {
+		return o, err
+	}
+	return o, nil
 }
 
 // inverseJobStalledBatches caps consecutive batches that held keys and
@@ -137,19 +146,6 @@ func inverseJobPartition(ctx context.Context, cfg config.Config, pool *pgxpool.P
 	}
 	digest, err := storeInversePartition(ctx, pool, dir)
 	return sum, digest, err
-}
-
-// approvedInversePicks requires the on-disk picks file to be the independently
-// approved digest before anything is read from it.
-func approvedInversePicks(picks, approved string) error {
-	digest, err := inverseFileSHA(picks)
-	if err != nil {
-		return err
-	}
-	if digest != approved {
-		return errors.New("owner picks differ from the approved digest")
-	}
-	return nil
 }
 
 type inverseJobFlags struct {

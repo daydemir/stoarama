@@ -111,6 +111,11 @@ func (a *inverseDeleteAuthority) check(ctx context.Context, bucket, endpoint str
 }
 
 func (a *inverseApplier) prepareWireTarget(ctx context.Context, tx pgx.Tx, e inverseEntry) (inverseRawTarget, error) {
+	// The step's own bound replaces the role's statement_timeout, whose 57014
+	// would end a lock wait publication also takes; only a cancel then stops it.
+	if _, err := tx.Exec(ctx, `SET LOCAL statement_timeout = 0`); err != nil {
+		return inverseRawTarget{}, err
+	}
 	if err := inverseProtectionBarrier(ctx, tx); err != nil {
 		return inverseRawTarget{}, err
 	}

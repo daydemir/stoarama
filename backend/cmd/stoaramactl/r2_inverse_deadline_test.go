@@ -111,6 +111,88 @@ func TestKeep28PublicationOverridesTheRoleStatementTimeout(t *testing.T) {
 	<-released
 }
 
+// A role's statement_timeout must not end a reservation or a wire preparation
+// that waits on the advisory lock publication also takes: each step replaces it
+// with its own 2-minute bound before any lock wait, so the key waits and
+// succeeds while a sibling holds the lock for 700 ms.
+func TestR2InverseReserveAndWireOverrideTheRoleStatementTimeout(t *testing.T) {
+	for name, tc := range map[string]struct {
+		pre  func(*testing.T, *inverseApplier, keep28Fixture, inverseEntry)
+		wait func(*testing.T, *inverseApplier, keep28Fixture, inverseEntry) error
+	}{
+		"reserve": {wait: func(t *testing.T, a *inverseApplier, f keep28Fixture, e inverseEntry) error {
+			a.pool = f.briefPool(t)
+			_, err := a.reserve(f.ctx, e)
+			return err
+		}},
+		"wire": {
+			// The reservation is not the step under test: it runs before the
+			// lock is taken and under the fixture's own pool, so only wire
+			// preparation meets the wait.
+			pre: func(t *testing.T, a *inverseApplier, f keep28Fixture, e inverseEntry) {
+				if _, err := a.reserve(f.ctx, e); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wait: func(t *testing.T, a *inverseApplier, f keep28Fixture, e inverseEntry) error {
+				a.pool = f.briefPool(t)
+				tx, err := a.pool.Begin(f.ctx)
+				if err != nil {
+					return err
+				}
+				defer tx.Rollback(f.ctx)
+				_, err = a.prepareWireTarget(f.ctx, tx, e)
+				return err
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newKeep28Fixture(t)
+			a := f.applier(t)
+			e := f.entry(t)
+			if tc.pre != nil {
+				tc.pre(t, a, f, e)
+			}
+			holder, err := f.pool.Begin(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = holder.Exec(f.ctx, `SELECT pg_advisory_xact_lock(7343226011103)`); err != nil {
+				t.Fatal(err)
+			}
+			released := make(chan struct{})
+			go func() {
+				time.Sleep(700 * time.Millisecond)
+				holder.Rollback(f.ctx)
+				close(released)
+			}()
+			err = tc.wait(t, a, f, e)
+			<-released
+			if err != nil {
+				t.Fatalf("%s under the role's statement_timeout: %v", name, err)
+			}
+		})
+	}
+}
+
+// briefPool opens the fixture's pool with a role-level statement_timeout far
+// below the lock wait these steps meet.
+func (f keep28Fixture) briefPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	config := f.pool.Config()
+	config.ConnConfig.RuntimeParams["statement_timeout"] = "300ms"
+	pool, err := pgxpool.NewWithConfig(f.ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	var timeout string
+	if err = pool.QueryRow(f.ctx, `SHOW statement_timeout`).Scan(&timeout); err != nil || timeout != "300ms" {
+		t.Fatalf("fixture role timeout %q: %v", timeout, err)
+	}
+	return pool
+}
+
 // A parent cancel or deadline ends the job; it is not an unpublished key. Only
 // the publication step's own 2-minute bound expiring holds the key.
 func TestR2InversePublicationParentDeadlineStopsTheJob(t *testing.T) {
@@ -164,5 +246,51 @@ func TestR2InversePublicationParentDeadlineStopsTheJob(t *testing.T) {
 	var absent bool
 	if err = f.pool.QueryRow(f.ctx, `SELECT EXISTS(SELECT 1 FROM r2_keep28_events WHERE bucket='stoarama' AND object_key=$1)`, e.Key).Scan(&absent); err != nil || absent {
 		t.Fatalf("stopped publication wrote an absence: %v", err)
+	}
+}
+
+// A parent deadline that ends during publication's backoff, after an attempt
+// already counted as held, still stops the job: the key is never reported as
+// held by a run that stopped. A role lock_timeout makes the first attempt a
+// transient lock loss, so the parent expires in the retry wait.
+func TestR2InversePublicationParentDeadlineDuringBackoffStopsTheJob(t *testing.T) {
+	f := newKeep28Fixture(t)
+	a := f.applier(t)
+	e := f.entry(t)
+	if _, err := a.reserve(f.ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(f.ctx)
+	if _, err = holder.Exec(f.ctx, `SELECT pg_advisory_xact_lock(7343226011103)`); err != nil {
+		t.Fatal(err)
+	}
+	config := f.pool.Config()
+	config.ConnConfig = config.ConnConfig.Copy()
+	config.ConnConfig.RuntimeParams["lock_timeout"] = "300ms"
+	brief, err := pgxpool.NewWithConfig(f.ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer brief.Close()
+	a.pool = brief
+	parent, cancel := context.WithTimeout(f.ctx, 700*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err = a.publishConfirmed(parent, e)
+	if err == nil || inverseKeyHeld(err) || errors.Is(err, errInverseUnpublished) {
+		t.Fatalf("parent deadline during backoff held the key: %v", err)
+	}
+	// It waited past the first attempt's lock loss into the retry wait.
+	if elapsed := time.Since(started); elapsed < 600*time.Millisecond {
+		t.Fatalf("returned after %v, before the parent deadline could end the backoff", elapsed)
+	}
+	// Nothing was published, and no attempt exhausted the step's own bound.
+	var absent bool
+	if err = f.pool.QueryRow(f.ctx, `SELECT EXISTS(SELECT 1 FROM r2_keep28_events WHERE bucket='stoarama' AND object_key=$1)`, e.Key).Scan(&absent); err != nil || absent {
+		t.Fatalf("stopped backoff wrote an absence: %v", err)
 	}
 }

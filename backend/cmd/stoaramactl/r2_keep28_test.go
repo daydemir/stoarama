@@ -903,7 +903,15 @@ func TestKeep28DeletePathComposesParentAndCustodyDeadlines(t *testing.T) {
 	for _, custodyWins := range []bool{true, false} {
 		t.Run(map[bool]string{true: "custody_wins", false: "parent_wins"}[custodyWins], func(t *testing.T) {
 			f := newKeep28Fixture(t)
-			if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '24 hours'+interval '34 seconds',server_received_at=clock_timestamp()`); err != nil {
+			// Parent-wins needs custody ample enough that no setup delay can
+			// turn reserve into a custody-short skip: only the explicit parent
+			// deadline decides that case. Custody-wins keeps custody near, as it
+			// must beat the later parent deadline.
+			custody := "interval '24 hours'+interval '34 seconds'"
+			if !custodyWins {
+				custody = "interval '24 hours'+interval '300 seconds'"
+			}
+			if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-`+custody+`,server_received_at=clock_timestamp()`); err != nil {
 				t.Fatal(err)
 			}
 			tracer := &slowSampleTracer{}
