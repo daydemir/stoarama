@@ -207,8 +207,12 @@ Every link on the public delivery page is a `delivery_keep_holds` row, and no
 lane may retire one. Migration 0225 lets exactly the page keys Deniz later
 approved for deletion lose that protection, one class at a time, and only while
 the class's gate is open. The gate lives in SQL (`r2_delivery_exempt`), so the
-0190 reservation/receipt guard, the RAW delivery closure, the collated lane and
-any stale binary all read the same answer.
+0190 reservation/receipt guard, the collated lane and any stale binary all read
+the same answer. Only these exact delivery objects are exempted. The derived
+RAW delivery guard (`r2_inverse_delivery_held`) stays mandatory in every lane
+and mode, in the partition and at live authorize: a RAW source of a delivery
+output is released only by the separate reviewed per-source consumer, never by
+this lane.
 
 | Class | Page rows | Gate |
 | --- | --- | --- |

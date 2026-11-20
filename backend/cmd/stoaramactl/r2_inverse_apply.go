@@ -70,7 +70,6 @@ func (l inverseLane) class() inverseClass {
 type inverseApplyOptions struct {
 	Lane                                                                               inverseLane
 	Manifest, ManifestSHA, Summary, SummarySHA, Picks, Ledger, DrainEvidence, DrainSHA string
-	ReviewedDelivery                                                                   bool
 	MaxItems                                                                           int
 	MaxBytes, Budget24h                                                                int64
 	Workers                                                                            int
@@ -250,27 +249,6 @@ func (a *inverseApplier) loadTarget(ctx context.Context, tx pgx.Tx, e inverseEnt
 	return loadInverseRawTarget(ctx, tx, a.store.Bucket(), a.protection, a.opts.Lane, e)
 }
 
-// rawReviewedDelivery is the single gate for RAW delivery eligibility. It is true
-// only for the B1 outside-keep28 lane under the reviewed owner fence policy, so
-// legacy/default RAW behavior and B2 keep28 never gain it.
-func (a *inverseApplier) rawReviewedDelivery() bool {
-	return a.opts.ReviewedDelivery && a.opts.Lane == inverseOutsideKeep28
-}
-
-// rawHeldSQL never derives SQL from operator input: it removes the one delivery
-// clause only when the reviewed owner fence policy selected this run. Every other
-// live veto in inverseRawHeldSQL stays in force, including the exact public
-// delivery page keys, which no scope waives.
-func (a *inverseApplier) rawHeldSQL() string {
-	if !a.rawReviewedDelivery() {
-		return inverseRawHeldSQL
-	}
-	// Keep the positional placeholders referenced so binding stays identical;
-	// only the reviewed delivery clause becomes unconditionally false.
-	return strings.Replace(inverseRawHeldSQL,
-		"r2_inverse_delivery_held($1,$2,$3,$5,$6,$7)",
-		"(false AND $5::text IS NOT NULL AND $6::text IS NOT NULL AND $7::bigint IS NOT NULL)", 1)
-}
 func loadInverseRawTarget(ctx context.Context, tx pgx.Tx, bucket string, protection inverseProtection, lane inverseLane, e inverseEntry) (inverseRawTarget, error) {
 	t := inverseRawTarget{}
 	rows, err := tx.Query(ctx, inverseRawTargetSQL, bucket, e.Key)
@@ -325,7 +303,6 @@ const inverseRawHeldSQL = `SELECT
  OR EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds WHERE bucket=$2 AND object_key=$3 AND released_at IS NULL)
  OR EXISTS(SELECT 1 FROM nas_r2_copy_items WHERE (state<>'verified' OR blocked_reason<>'') AND item->>'bucket'=$2 AND item->>'object_key'=$3)
  OR r2_inverse_delivery_held($1,$2,$3,$5,$6,$7)
- OR EXISTS(SELECT 1 FROM delivery_keep_holds k WHERE k.bucket=$2 AND k.object_key=$3)
  OR r2_owner_keep_held($2,$3)
  OR EXISTS(SELECT 1 FROM nas_restore_requests WHERE clip_id=$1 AND state IN ('pending','leased'))
  OR (EXISTS(SELECT 1 FROM recording_joined_source_snapshots WHERE clip_id=$1) AND NOT ($8 AND r2_joined_source_released($1)))
@@ -364,7 +341,7 @@ func (a *inverseApplier) checkTarget(ctx context.Context, tx pgx.Tx, t inverseRa
 	var held bool
 	// A released joined batch frees its snapshots for the RAW lane only; the
 	// keep-28 lane keeps every snapshot as a hold.
-	if err := tx.QueryRow(ctx, a.rawHeldSQL(), t.ID, a.store.Bucket(), e.Key, a.opts.ManifestSHA, t.Path, t.SHA, t.Size, a.opts.Lane == inverseOutsideKeep28).Scan(&held); err != nil {
+	if err := tx.QueryRow(ctx, inverseRawHeldSQL, t.ID, a.store.Bucket(), e.Key, a.opts.ManifestSHA, t.Path, t.SHA, t.Size, a.opts.Lane == inverseOutsideKeep28).Scan(&held); err != nil {
 		return err
 	}
 	if held {
@@ -416,43 +393,29 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	if a.opts.Budget24h > 0 && e.SizeBytes > a.opts.Budget24h-charged {
 		return t, errors.New("rolling 24h inverse budget exhausted")
 	}
-	// Typed intent BEFORE the shared reservation, in the same transaction, so the
-	// reviewed delivery class and its exact intent always exist together. Only the
-	// reviewed owner fence policy sets the class; legacy B1/B2 intents keep ''.
-	cols := []string{"bucket", "object_key", "source_id", "size_bytes", "etag", "last_modified", "manifest_sha256", "policy_sha256", "picks_sha256", "drain_evidence_sha256", "choice", "endpoint_sha256", "stream_id"}
-	args := []any{a.store.Bucket(), e.Key, t.ID, e.SizeBytes, e.ETag, e.LastModified, a.opts.ManifestSHA, a.summary.PolicySHA256, a.summary.PicksSHA256, a.opts.DrainSHA, a.protection.Picks.Choices[t.StreamID].Choice, a.store.EndpointSHA256(), t.StreamID}
-	if a.rawReviewedDelivery() {
-		cols = append(cols, "retirement_class")
-		args = append(args, inverseNonrawRetirementClass)
+	// Independent committed transaction. Never use an outer network transaction's
+	// connection or assume its rollback can discard this source reservation.
+	_, err = tx.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) VALUES('raw',$1,$2,$3,$4,$5,$6)`, t.ID, a.store.Bucket(), e.Key, e.SizeBytes, t.SHA, a.opts.ManifestSHA)
+	if err != nil {
+		return t, err
 	}
+	intentSQL := `INSERT INTO ` + a.intentTable() + `(bucket,object_key,source_id,size_bytes,etag,last_modified,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice,endpoint_sha256,stream_id`
+	intentArgs := []any{a.store.Bucket(), e.Key, t.ID, e.SizeBytes, e.ETag, e.LastModified, a.opts.ManifestSHA, a.summary.PolicySHA256, a.summary.PicksSHA256, a.opts.DrainSHA, a.protection.Picks.Choices[t.StreamID].Choice, a.store.EndpointSHA256(), t.StreamID}
 	if custody != nil {
 		data, marshalErr := json.Marshal(custody)
 		if marshalErr != nil {
 			return t, marshalErr
 		}
-		cols = append(cols, "custody")
-		args = append(args, data)
+		intentSQL += `,custody`
+		intentArgs = append(intentArgs, data)
 	}
-	placeholders := make([]string, len(args))
-	for i := range args {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	intentSQL += `) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13`
+	if custody != nil {
+		intentSQL += `,$14`
 	}
-	// No network access happens before this commit.
-	if _, err = tx.Exec(ctx, `INSERT INTO `+a.intentTable()+`(`+strings.Join(cols, ",")+`) VALUES(`+strings.Join(placeholders, ",")+`)`, args...); err != nil {
-		return t, err
-	}
-	// Independent committed transaction. Never use an outer network transaction's
-	// connection or assume its rollback can discard this source reservation.
-	reservationSQL := `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256`
-	reservationArgs := []any{t.ID, a.store.Bucket(), e.Key, e.SizeBytes, t.SHA, a.opts.ManifestSHA}
-	values := ` VALUES('raw',$1,$2,$3,$4,$5,$6`
-	if a.rawReviewedDelivery() {
-		reservationSQL += `,retirement_class`
-		values += `,$7`
-		reservationArgs = append(reservationArgs, inverseNonrawRetirementClass)
-	}
-	reservationSQL += `)` + values + `)`
-	if _, err = tx.Exec(ctx, reservationSQL, reservationArgs...); err != nil {
+	intentSQL += `)`
+	_, err = tx.Exec(ctx, intentSQL, intentArgs...)
+	if err != nil {
 		return t, err
 	}
 	if err = probeInversePurge(ctx, tx, t.ID); err != nil {
@@ -614,21 +577,9 @@ func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, mani
 	if err != nil {
 		return err
 	}
-	// The receipt has no retirement_class column, so it must resolve through the
-	// exact reservation that carries the reviewed class. A RAW reviewed retirement
-	// is only authorized when that reservation is the reviewed-scope one.
-	// The class comes from the durable intent being published, never from the
-	// current run, so a legacy intent (empty class) reconciles under any proof.
-	// Only RAW-lane intents carry a class; keep-28 intents never take one.
-	exactClass := ""
-	if a.opts.Lane == inverseOutsideKeep28 {
-		exactClass = ` AND (i.retirement_class='' OR EXISTS(SELECT 1 FROM r2_retirement_reservations v WHERE v.kind='raw' AND v.source_id=r.source_id
-  AND v.bucket=r.bucket AND v.object_key=r.object_key AND v.size_bytes=r.size_bytes AND v.sha256=r.sha256
-  AND v.manifest_sha256=r.manifest_sha256 AND v.retirement_class=i.retirement_class))`
-	}
 	var receipt bool
 	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_object_retirements r JOIN `+a.intentTable()+` i ON r.bucket=i.bucket AND r.object_key=i.object_key JOIN recording_clips c ON c.id=i.source_id
- WHERE i.bucket=$1 AND i.object_key=$2 AND r.kind='raw' AND r.reason='`+a.retirementReason()+`' AND r.source_id=$3 AND r.stream_id=i.stream_id AND r.size_bytes=i.size_bytes AND r.sha256=lower(c.sha256) AND r.choice=i.choice AND r.manifest_sha256=$4 AND r.policy_sha256=i.policy_sha256`+exactClass+`)`, a.store.Bucket(), e.Key, sourceID, manifest).Scan(&receipt)
+ WHERE i.bucket=$1 AND i.object_key=$2 AND r.kind='raw' AND r.reason='`+a.retirementReason()+`' AND r.source_id=$3 AND r.stream_id=i.stream_id AND r.size_bytes=i.size_bytes AND r.sha256=lower(c.sha256) AND r.choice=i.choice AND r.manifest_sha256=$4 AND r.policy_sha256=i.policy_sha256)`, a.store.Bucket(), e.Key, sourceID, manifest).Scan(&receipt)
 	if err != nil {
 		return err
 	}
@@ -716,16 +667,6 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	var summary inverseSummary
 	if err := inverseReadPinned(o.Summary, o.SummarySHA, &summary); err != nil {
 		return result, err
-	}
-	// Legacy/default RAW behavior is unchanged: the obsolete delivery veto is
-	// lifted ONLY for the explicitly reviewed owner fence policy, and only on the
-	// B1 outside-keep28 lane. No other proof shape can reach this.
-	var evidence inverseDrainEvidence
-	if err := inverseReadPinned(o.DrainEvidence, o.DrainSHA, &evidence); err != nil {
-		return result, err
-	}
-	if o.Lane == inverseOutsideKeep28 && evidence.Proof == inverseOwnerFenceProof {
-		o.ReviewedDelivery = true
 	}
 	sha, err := inverseFileSHA(o.Manifest)
 	if err != nil {

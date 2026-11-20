@@ -96,12 +96,8 @@ ALTER TABLE r2_object_retirements ADD CONSTRAINT r2_object_retirements_collated_
          OR object_key LIKE 'joined/nightly-collation-v2/%'
          OR object_key LIKE 'joined/best14-20261021/%')));
 
--- RAW delivery eligibility needs the same typed provenance as collated: an
--- exact owner-scoped intent that carries the reviewed class. Legacy B1 intents
--- keep the empty class, so they can never inherit this exemption.
-ALTER TABLE r2_inverse_intents
- ADD COLUMN retirement_class text NOT NULL DEFAULT ''::text
- CHECK (retirement_class IN ('', 'owner_delivery_scope_20261118_v1'));
+-- RAW keys gain nothing here: the derived RAW delivery guard stays mandatory
+-- in every lane and mode.
 
 -- 0190's guard_delivery_r2_retirement stays exactly as installed: no retirement
 -- class waives an exact delivery_keep_holds key. Deniz, 2026-11-12: keep up only

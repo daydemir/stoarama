@@ -69,9 +69,6 @@ type inverseProtection struct {
 	// so default partition/apply output is unchanged for B1/B2.
 	ReviewedCollated bool
 	Collated         map[string]inverseCollatedAssessment
-	// ReviewedDelivery lifts the obsolete bare-delivery ownership veto. It is set
-	// ONLY by the owner fence policy, never by legacy/default RAW behavior.
-	ReviewedDelivery bool
 }
 type inverseEntry struct {
 	r2.ObjectInfo
@@ -118,14 +115,6 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 	if p.Held[o.Key] {
 		return inverseHeld, "live_hold"
 	}
-	if p.Delivery[o.Key] && !p.ReviewedCollated && !p.ReviewedDelivery {
-		return inverseDelivery, "delivery_hold_pending_owner"
-	}
-	for _, component := range strings.Split(o.Key, "/") {
-		if p.KEFolders[component] {
-			return inverseKE, "keep_everything_path"
-		}
-	}
 	identities := p.Identities[o.Key]
 	// Collated outputs and RAW clips are disjoint key namespaces. A collated key is
 	// classified from the reviewed output map alone, never from a RAW identity list
@@ -136,11 +125,23 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 			collatedIdentity = true
 		}
 	}
-	if x, ok := p.Collated[o.Key]; ok || collatedIdentity {
+	x, mapped := p.Collated[o.Key]
+	nonraw := mapped || collatedIdentity
+	// The derived delivery closure holds every RAW key in every scope. Only the
+	// reviewed nonraw lane judges its own collated outputs and repairs.
+	if p.Delivery[o.Key] && !(p.ReviewedCollated && nonraw) {
+		return inverseDelivery, "delivery_hold_pending_owner"
+	}
+	for _, component := range strings.Split(o.Key, "/") {
+		if p.KEFolders[component] {
+			return inverseKE, "keep_everything_path"
+		}
+	}
+	if nonraw {
 		if !p.ReviewedCollated {
 			return inverseHeld, "collated_deferred"
 		}
-		return p.classifyCollated(o, x, ok)
+		return p.classifyCollated(o, x, mapped)
 	}
 	for _, id := range identities {
 		for _, component := range strings.Split(id.Path, "/") {
@@ -334,7 +335,7 @@ func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string
 // reviewed non-raw scope is explicitly selected. Default callers keep the exact
 // previous classification, where collated keys are deferred and delivery holds.
 func loadInverseProtectionMode(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks, windows map[int64]api.Keep28Window, reviewed bool) (inverseProtection, error) {
-	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, PageKeep: map[string]bool{}, Exempt: map[string]deliveryExemptionClass{}, JoinedReleased: map[string]bool{}, KEFolders: map[string]bool{}, Windows: windows, Picks: picks, ReviewedCollated: reviewed, ReviewedDelivery: reviewed}
+	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, PageKeep: map[string]bool{}, Exempt: map[string]deliveryExemptionClass{}, JoinedReleased: map[string]bool{}, KEFolders: map[string]bool{}, Windows: windows, Picks: picks, ReviewedCollated: reviewed}
 	rows, err := q.Query(ctx, inverseCatalogSQL, bucket)
 	if err != nil {
 		return p, err

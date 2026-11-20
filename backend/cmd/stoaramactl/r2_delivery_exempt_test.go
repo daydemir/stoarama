@@ -217,8 +217,9 @@ func TestR2NonrawExemptionHeldKeysRefuseStaleLedgerWrites(t *testing.T) {
 	if err := ledger("collated", f.key, f.outputID, 900, nonrawOutputSHA); err != nil {
 		t.Fatalf("exact exempt key refused: %v", err)
 	}
-	if held(f.key) {
-		t.Fatal("RAW delivery closure still holds an exempt exact key")
+	// The derived RAW delivery guard never reads exemptions.
+	if !held(f.key) {
+		t.Fatal("RAW delivery closure released an exempt key")
 	}
 	f.retirePage()
 	if err := ledger("delivery_repair", exemptRepairKey, 1, 700, nonrawOutputSHA); err != nil {
@@ -289,7 +290,7 @@ func TestR2NonrawExemptionSeedCommand(t *testing.T) {
 
 // runBatch runs one real collated job batch over entries, with fresh owner-fence
 // evidence and the job's exact durable readback.
-func (f *nonrawFixture) runBatch(t *testing.T, name string, entries ...inverseEntry) (inverseApplySummary, error) {
+func (f *nonrawFixture) runBatch(t *testing.T, name string, lane inverseLane, entries ...inverseEntry) (inverseApplySummary, error) {
 	t.Helper()
 	picks, err := loadR2RetirePicks(f.picks)
 	if err != nil {
@@ -305,7 +306,7 @@ func (f *nonrawFixture) runBatch(t *testing.T, name string, entries ...inverseEn
 		manifest = append(append(manifest, line...), '\n')
 	}
 	summary, _ := json.Marshal(inverseSummary{Version: 1, Bucket: "stoarama", EndpointSHA256: f.sdk.EndpointSHA256(), CreatedAt: time.Now().UTC(), PolicySHA256: f.policy, PicksSHA256: picks.SHA256, ReadOnly: true})
-	o := inverseApplyOptions{Lane: inverseNonrawCollated, Manifest: filepath.Join(dir, "partition.jsonl"), Summary: filepath.Join(dir, "summary.json"), Picks: f.picks, Ledger: filepath.Join(dir, "ledger.jsonl"), Workers: 2, MaxItems: 10, MaxBytes: 1 << 30}
+	o := inverseApplyOptions{Lane: lane, Manifest: filepath.Join(dir, "partition.jsonl"), Summary: filepath.Join(dir, "summary.json"), Picks: f.picks, Ledger: filepath.Join(dir, "ledger.jsonl"), Workers: 2, MaxItems: 10, MaxBytes: 1 << 30}
 	for path, data := range map[string][]byte{o.Manifest: manifest, o.Summary: summary} {
 		if err = os.WriteFile(path, data, 0600); err != nil {
 			t.Fatal(err)
@@ -342,7 +343,7 @@ func TestR2NonrawExemptionLaneRetiresBothClasses(t *testing.T) {
 	if class, reason := classify(f.key); class != inverseDelivery || reason != "delivery_page_keep" {
 		t.Fatalf("unexempt page video classified %s (%s)", class, reason)
 	}
-	if _, err := f.runBatch(t, "unexempt", collated); !errors.Is(err, errInverseNonrawIneligible) || f.deletes() != 0 {
+	if _, err := f.runBatch(t, "unexempt", inverseNonrawCollated, collated); !errors.Is(err, errInverseNonrawIneligible) || f.deletes() != 0 {
 		t.Fatalf("unexempt page video reached the wire: %v deletes=%d", err, f.deletes())
 	}
 
@@ -351,13 +352,13 @@ func TestR2NonrawExemptionLaneRetiresBothClasses(t *testing.T) {
 	if class, reason := classify(exemptRepairKey); class != inverseDelivery {
 		t.Fatalf("confident repair left the page keep while the page is up: %s (%s)", class, reason)
 	}
-	if _, err := f.runBatch(t, "page_up", repair); !errors.Is(err, errInverseNonrawIneligible) || f.deletes() != 0 {
+	if _, err := f.runBatch(t, "page_up", inverseNonrawCollated, repair); !errors.Is(err, errInverseNonrawIneligible) || f.deletes() != 0 {
 		t.Fatalf("confident repair reached the wire while the page is up: %v", err)
 	}
 	if class, reason := classify(f.key); class != inverseCollated || reason != "owner_delivery_page_outside_window" {
 		t.Fatalf("exempt page video classified %s (%s)", class, reason)
 	}
-	result, err := f.runBatch(t, "outside_window", collated)
+	result, err := f.runBatch(t, "outside_window", inverseNonrawCollated, collated)
 	if err != nil || result.Deleted != 1 || f.deletes() != 1 {
 		t.Fatalf("outside_window batch: %+v %v deletes=%d", result, err, f.deletes())
 	}
@@ -366,7 +367,7 @@ func TestR2NonrawExemptionLaneRetiresBothClasses(t *testing.T) {
 	if class, reason := classify(exemptRepairKey); class != inverseCollated || reason != "owner_delivery_page_confident_repair" {
 		t.Fatalf("exempt confident repair classified %s (%s)", class, reason)
 	}
-	result, err = f.runBatch(t, "confident_repair", repair)
+	result, err = f.runBatch(t, "confident_repair", inverseNonrawCollated, repair)
 	if err != nil || result.Deleted != 1 || result.Bytes != 700 || f.deletes() != 2 {
 		t.Fatalf("confident_repair batch: %+v %v deletes=%d", result, err, f.deletes())
 	}
@@ -404,14 +405,14 @@ func TestR2NonrawExemptionRepairIdentityAndKeepEverything(t *testing.T) {
 	f.retirePage()
 	moved := inverseEntry{ObjectInfo: f.store.objects[exemptRepairKey], Class: inverseCollated}
 	moved.ETag = "rewritten"
-	if _, err := f.runBatch(t, "etag", moved); !errors.Is(err, errInverseNonrawIneligible) || !strings.Contains(err.Error(), "listed ETag") || f.deletes() != 0 {
+	if _, err := f.runBatch(t, "etag", inverseNonrawCollated, moved); !errors.Is(err, errInverseNonrawIneligible) || !strings.Contains(err.Error(), "listed ETag") || f.deletes() != 0 {
 		t.Fatalf("a repair with another ETag reached the wire: %v", err)
 	}
 	data, _ := json.Marshal(map[string]any{"choices": map[string]any{"3": r2RetirePick{Choice: "all"}}})
 	if err := os.WriteFile(f.picks, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.runBatch(t, "keep_everything", inverseEntry{ObjectInfo: f.store.objects[exemptRepairKey], Class: inverseCollated}); !errors.Is(err, errInverseNonrawIneligible) || !strings.Contains(err.Error(), "keep-everything") || f.deletes() != 0 {
+	if _, err := f.runBatch(t, "keep_everything", inverseNonrawCollated, inverseEntry{ObjectInfo: f.store.objects[exemptRepairKey], Class: inverseCollated}); !errors.Is(err, errInverseNonrawIneligible) || !strings.Contains(err.Error(), "keep-everything") || f.deletes() != 0 {
 		t.Fatalf("a keep-everything stream's repair reached the wire: %v", err)
 	}
 	var intents int
@@ -432,5 +433,106 @@ func TestR2NonrawExemptionOnlyInWindowLiftsKeep28(t *testing.T) {
 		if got, reason := p.classify(r2.ObjectInfo{Key: key, SizeBytes: 1}); got != want {
 			t.Fatalf("%q: keep28 output classified %s (%s)", class, got, reason)
 		}
+	}
+}
+
+// TestR2NonrawExemptionNeverReleasesDerivedRAW: with every exemption class
+// seeded and every gate open, a RAW source of a delivery output is still held
+// by the derived RAW delivery guard in an owner-fence (delivery mode) run: in
+// the partition, at reserve and at live authorize, with no durable row and no
+// DELETE. Only the separate reviewed per-source consumer may release it.
+func TestR2NonrawExemptionNeverReleasesDerivedRAW(t *testing.T) {
+	f := newNonrawFixture(t, "exempt_raw_source")
+	const rawKey = "managed/acct-47/nonraw/source.mp4"
+	f.store.objects[rawKey] = r2.ObjectInfo{Key: rawKey, ETag: "src-etag", SizeBytes: 500, LastModified: inverseRetirementCutoff().Add(-time.Second)}
+	raw := inverseEntry{ObjectInfo: f.store.objects[rawKey], Class: inverseDeletable}
+	classify := func() (inverseClass, string) {
+		t.Helper()
+		picks, err := loadR2RetirePicks(f.picks)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, err := loadInverseProtectionMode(f.ctx, f.pool, "stoarama", picks, f.windows, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p.classify(raw.ObjectInfo)
+	}
+	// Control: before the page holds exist, the source is ordinary RAW footage.
+	if class, reason := classify(); class != inverseDeletable {
+		t.Fatalf("control: RAW source classified %s (%s)", class, reason)
+	}
+
+	// The collated output that contains the source becomes a page video; all
+	// three classes are seeded and every gate is opened.
+	f.withPageKeys()
+	inSHA := strings.Repeat("e", 64)
+	inWindow := "joined/goodplus-20260821-generation-1/objects/" + inSHA + ".mp4"
+	f.pageHoldSHA(inWindow, "in-etag", "video_collated", 300, inSHA)
+	f.fixture(`INSERT INTO recording_collation_outputs(id,collation_hour_id,part,parts,object_key,nas_relative_path,size_bytes,sha256,start_at,end_at,source_clip_ids,r2_verified_at)
+ VALUES(10000003,1,3,3,$1,'nightly/in.mp4',300,$2,'2026-06-01','2026-06-01 00:01:00',ARRAY[7000001]::bigint[],'2026-06-02T00:00:00Z')`, inWindow, inSHA)
+	f.mustSeed(t, deliveryExemptOutsideWindow, collatedRow(f))
+	f.mustSeed(t, deliveryExemptConfidentRepair, repairRow())
+	f.mustSeed(t, deliveryExemptInWindow, deliveryExemptionRow{Bucket: "stoarama", ObjectKey: inWindow, ETag: "in-etag", SizeBytes: 300})
+	f.retirePage()
+	f.exec(`CREATE OR REPLACE FUNCTION r2_delivery_nas_certified(p_output_id bigint,p_bucket text,p_key text,p_etag text,p_size bigint,p_sha256 text)
+ RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT true $$`)
+	for _, key := range []string{f.key, exemptRepairKey, inWindow} {
+		if !f.exempt(t, key) {
+			t.Fatalf("%s: gate not open", key)
+		}
+	}
+	var derived bool
+	if err := f.pool.QueryRow(f.ctx, `SELECT r2_inverse_delivery_held($1,'stoarama',$2,'source/source.mp4',repeat('c',64),500)`, f.clipID, rawKey).Scan(&derived); err != nil || !derived {
+		t.Fatalf("RAW source is not derived-held by its delivery output: %v %v", derived, err)
+	}
+
+	if class, reason := classify(); class != inverseDelivery {
+		t.Fatalf("partition classified a derived-held RAW source %s (%s)", class, reason)
+	}
+	if _, err := f.runBatch(t, "raw_lane", inverseOutsideKeep28, raw); err == nil || f.deletes() != 0 {
+		t.Fatalf("delivery-mode RAW batch reached the wire: %v deletes=%d", err, f.deletes())
+	}
+
+	// Live authorize, directly, under the owner fence policy.
+	picks, err := loadR2RetirePicks(f.picks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	protection, err := loadInverseApplyProtection(f.ctx, f.pool, "stoarama", picks, f.windows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := openInverseLedger(filepath.Join(f.root, "raw-authorize.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.close()
+	var epoch int64
+	if err = f.pool.QueryRow(f.ctx, `SELECT epoch FROM r2_inverse_ke_epoch`).Scan(&epoch); err != nil {
+		t.Fatal(err)
+	}
+	a := &inverseApplier{pool: f.pool, store: f.sdk, protection: protection, ledger: ledger, keEpoch: epoch,
+		opts:    inverseApplyOptions{Lane: inverseOutsideKeep28, Picks: f.picks, DrainEvidence: f.drain, DrainSHA: f.drainSHA, ManifestSHA: strings.Repeat("d", 64), SummarySHA: strings.Repeat("c", 64)},
+		summary: inverseSummary{Version: 1, Bucket: "stoarama", EndpointSHA256: f.sdk.EndpointSHA256(), CreatedAt: time.Now().UTC(), PolicySHA256: f.policy, PicksSHA256: picks.SHA256, ReadOnly: true}}
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.authorize(f.ctx, tx, raw, &inverseSendGate{})
+	_ = tx.Rollback(f.ctx)
+	if err == nil || !strings.Contains(err.Error(), "live key protection veto") {
+		t.Fatalf("live authorize did not veto the derived-held RAW source: %v", err)
+	}
+
+	var rows int
+	if err = f.pool.QueryRow(f.ctx, `SELECT (SELECT count(*) FROM r2_retirement_reservations WHERE object_key=$1)
+ +(SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1)+(SELECT count(*) FROM r2_inverse_attempts WHERE object_key=$1)
+ +(SELECT count(*) FROM r2_object_retirements WHERE object_key=$1)
+ +(SELECT count(*) FROM recording_clips WHERE object_key=$1 AND purged_at IS NOT NULL)`, rawKey).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("derived-held RAW source left %d durable writes (%v)", rows, err)
+	}
+	if _, present := f.store.objects[rawKey]; !present {
+		t.Fatal("RAW source left the provider")
 	}
 }

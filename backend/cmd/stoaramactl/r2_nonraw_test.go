@@ -289,7 +289,7 @@ func TestR2NonrawExecutorLane(t *testing.T) {
 		if err := g.pool.QueryRow(g.ctx, `SELECT count(*) FROM r2_nonraw_intents WHERE object_key=$1`, g.key).Scan(&intents); err != nil || intents != 0 {
 			t.Fatalf("page keep key left intents %d %v", intents, err)
 		}
-		p := inverseProtection{PageKeep: map[string]bool{g.key: true}, ReviewedCollated: true, ReviewedDelivery: true}
+		p := inverseProtection{PageKeep: map[string]bool{g.key: true}, ReviewedCollated: true}
 		if class, reason := p.classify(r2.ObjectInfo{Key: g.key, SizeBytes: 900}); class != inverseDelivery || reason != "delivery_page_keep" {
 			t.Fatalf("partition classified a page keep key as %s (%s)", class, reason)
 		}
@@ -436,7 +436,7 @@ func TestR2InverseToolsPrefixIsNeverDeletable(t *testing.T) {
 	variants := map[string]inverseProtection{}
 	variants["default"] = base
 	reviewed := base
-	reviewed.ReviewedCollated, reviewed.ReviewedDelivery = true, true
+	reviewed.ReviewedCollated = true
 	variants["reviewed_owner_scope"] = reviewed
 	mapped := reviewed
 	mapped.Collated = map[string]inverseCollatedAssessment{}
@@ -728,7 +728,7 @@ func (f *rawDeliveryFixture) exec(query string, args ...any) {
 }
 
 // applier builds a B1 outside-keep28 applier. Reviewed selects the owner fence
-// policy, which is the only thing that can grant RAW delivery eligibility.
+// policy; it never lifts a RAW delivery hold.
 func (f *rawDeliveryFixture) applier(t *testing.T, reviewed bool) *inverseApplier {
 	t.Helper()
 	picks, err := loadR2RetirePicks(f.picks)
@@ -751,7 +751,7 @@ func (f *rawDeliveryFixture) applier(t *testing.T, reviewed bool) *inverseApplie
 	}
 	f.drainSHA, _ = inverseFileSHA(f.drain)
 	summary := inverseSummary{Version: 1, Bucket: "stoarama", EndpointSHA256: f.sdk.EndpointSHA256(), CreatedAt: time.Now().UTC(), PolicySHA256: f.policy, PicksSHA256: picks.SHA256, ReadOnly: true}
-	o := inverseApplyOptions{Lane: inverseOutsideKeep28, Manifest: f.root + "/partition.jsonl", ManifestSHA: strings.Repeat("d", 64), Summary: f.root + "/summary.json", SummarySHA: strings.Repeat("c", 64), Picks: f.picks, Ledger: filepath.Join(f.root, "ledger-"+fmt.Sprint(reviewed)+".jsonl"), DrainEvidence: f.drain, DrainSHA: f.drainSHA, MaxItems: 100, MaxBytes: 1 << 30, Workers: 2, ReviewedDelivery: reviewed}
+	o := inverseApplyOptions{Lane: inverseOutsideKeep28, Manifest: f.root + "/partition.jsonl", ManifestSHA: strings.Repeat("d", 64), Summary: f.root + "/summary.json", SummarySHA: strings.Repeat("c", 64), Picks: f.picks, Ledger: filepath.Join(f.root, "ledger-"+fmt.Sprint(reviewed)+".jsonl"), DrainEvidence: f.drain, DrainSHA: f.drainSHA, MaxItems: 100, MaxBytes: 1 << 30, Workers: 2}
 	protection, err := loadInverseProtection(f.ctx, f.pool, "stoarama", picks, windowsForTest(t))
 	if err != nil {
 		t.Fatal(err)
@@ -780,34 +780,24 @@ func (f *rawDeliveryFixture) entry(i int) inverseEntry {
 	return inverseEntry{ObjectInfo: f.store.objects[f.keys[i]], Class: inverseDeletable}
 }
 
-// TestR2RawReviewedDeliveryIsEligible is the positive case: an exact-key delivery
-// hold on a mapped RAW clip is eligible under the reviewed owner fence policy,
-// through a typed RAW intent plus the matching reviewed reservation class.
-func TestR2RawReviewedDeliveryIsEligible(t *testing.T) {
+// TestR2RawReviewedDeliveryStaysHeld: the owner fence policy never lifts the
+// derived RAW delivery guard. A RAW clip that a delivery output's source hold
+// protects is refused at reserve with no durable row and no DELETE.
+func TestR2RawReviewedDeliveryStaysHeld(t *testing.T) {
 	key := "managed/acct-47/delivery/000.mp4"
-	f := newRawDeliveryFixture(t, "raw_delivery_pos", key)
-	// Delivery through a source hold, not an exact page link: the fixture's exact
-	// key hold is replaced so only the reviewed-scope waiver is under test.
+	f := newRawDeliveryFixture(t, "raw_delivery_held", key)
+	// Delivery through a source hold, not an exact page link.
 	f.seed(`DELETE FROM delivery_keep_holds WHERE object_key=$1`, key)
 	f.seed(`INSERT INTO delivery_nas_source_holds(clip_id) VALUES(9100000)`)
 	a := f.applier(t, true)
-	ok, err := a.delete(f.ctx, f.ctx, &inverseSendGate{}, f.entry(0))
-	if err != nil || !ok || f.deletes() != 1 {
-		t.Fatalf("reviewed RAW delivery not retired: ok=%v err=%v deletes=%d", ok, err, f.deletes())
+	defer a.ledger.close()
+	if ok, err := a.delete(f.ctx, f.ctx, &inverseSendGate{}, f.entry(0)); err == nil || ok || f.deletes() != 0 {
+		t.Fatalf("owner fence scope deleted a delivery-held RAW key: ok=%v err=%v deletes=%d", ok, err, f.deletes())
 	}
-	var class string
-	if err = f.pool.QueryRow(f.ctx, `SELECT retirement_class FROM r2_retirement_reservations WHERE kind='raw' AND object_key=$1`, key).Scan(&class); err != nil || class != inverseNonrawRetirementClass {
-		t.Fatalf("reservation class %q err %v", class, err)
+	var rows int
+	if err := f.pool.QueryRow(f.ctx, `SELECT (SELECT count(*) FROM r2_retirement_reservations WHERE object_key=$1)+(SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1)`, key).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("delivery-held RAW key left %d durable rows (%v)", rows, err)
 	}
-	var intentClass string
-	if err = f.pool.QueryRow(f.ctx, `SELECT retirement_class FROM r2_inverse_intents WHERE object_key=$1`, key).Scan(&intentClass); err != nil || intentClass != inverseNonrawRetirementClass {
-		t.Fatalf("intent class %q err %v", intentClass, err)
-	}
-	var receipts int
-	if err = f.pool.QueryRow(f.ctx, `SELECT count(*) FROM r2_object_retirements WHERE object_key=$1 AND kind='raw'`, key).Scan(&receipts); err != nil || receipts != 1 {
-		t.Fatalf("receipt %d err %v", receipts, err)
-	}
-	a.ledger.close()
 }
 
 // TestR2RawDeliveryVetoesStayStrict is the negative case: without the reviewed
@@ -841,39 +831,6 @@ func TestR2RawDeliveryVetoesStayStrict(t *testing.T) {
 		if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class)
  SELECT 'raw',c.id,'stoarama',c.object_key,c.size_bytes,lower(c.sha256),repeat('d',64),$2 FROM recording_clips c WHERE c.object_key=$1`, key, inverseNonrawRetirementClass); err == nil {
 			t.Fatal("reviewed class without a typed intent bypassed the delivery hold")
-		}
-	})
-
-	t.Run("wrong_scope_class_on_typed_intent_vetoes", func(t *testing.T) {
-		key := "managed/acct-47/delivery/300.mp4"
-		f := newRawDeliveryFixture(t, "raw_delivery_wrongclass", key)
-		// A typed intent with an empty (legacy) class must not authorize the class.
-		if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_inverse_intents(bucket,object_key,endpoint_sha256,stream_id,source_id,size_bytes,etag,last_modified,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice,retirement_class)
- SELECT 'stoarama',c.object_key,$2,3,c.id,c.size_bytes,c.etag,'2026-11-01T00:00:00Z',repeat('d',64),$3,repeat('e',64),repeat('a',64),'none','' FROM recording_clips c WHERE c.object_key=$1`, key, f.sdk.EndpointSHA256(), f.policy); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class)
- SELECT 'raw',c.id,'stoarama',c.object_key,c.size_bytes,lower(c.sha256),repeat('d',64),$2 FROM recording_clips c WHERE c.object_key=$1`, key, inverseNonrawRetirementClass); err == nil {
-			t.Fatal("empty-class intent authorized the reviewed retirement class")
-		}
-	})
-
-	t.Run("mismatched_identity_does_not_inherit_exemption", func(t *testing.T) {
-		key := "managed/acct-47/delivery/400.mp4"
-		f := newRawDeliveryFixture(t, "raw_delivery_mismatch", key)
-		var other int64 = 9100999
-		otherKey := "managed/acct-47/delivery/other.mp4"
-		f.seed(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path)
- VALUES($1,30,1,'https://test.invalid','stoarama',$2,100,'other-etag',repeat('b',64),'2026-06-01'::timestamptz,'2026-06-01'::timestamptz,'2026-06-01 00:01:00'::timestamptz,'delivery/other.mp4')`, other, otherKey)
-		// A typed reviewed intent for a DIFFERENT key/source must not exempt this
-		// delivery-held key: the exemption is exact identity, never the class alone.
-		if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_inverse_intents(bucket,object_key,endpoint_sha256,stream_id,source_id,size_bytes,etag,last_modified,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice,retirement_class)
- VALUES('stoarama',$1,$2,3,$3,100,'other-etag','2026-11-01T00:00:00Z',repeat('d',64),$4,repeat('e',64),repeat('a',64),'none',$5)`, otherKey, f.sdk.EndpointSHA256(), other, f.policy, inverseNonrawRetirementClass); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class)
- SELECT 'raw',c.id,'stoarama',c.object_key,c.size_bytes,lower(c.sha256),repeat('d',64),$2 FROM recording_clips c WHERE c.object_key=$1`, key, inverseNonrawRetirementClass); err == nil {
-			t.Fatal("mismatched identity inherited the reviewed exemption")
 		}
 	})
 }

@@ -110,7 +110,9 @@ $$;
 
 -- 0190's guard on every reservation and receipt, for every lane and binary: an
 -- exact page key is refused unless it is exempt now and the row names the
--- page's exact size and content.
+-- page's exact size and content. Exemptions cover only these exact delivery
+-- objects; the derived RAW delivery guard (r2_inverse_delivery_held) is
+-- unchanged and holds every RAW source in every mode.
 CREATE OR REPLACE FUNCTION guard_delivery_r2_retirement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
  IF EXISTS(SELECT 1 FROM delivery_keep_holds h WHERE h.bucket=NEW.bucket AND h.object_key=NEW.object_key
    AND NOT (h.size_bytes=NEW.size_bytes AND h.sha256=NEW.sha256 AND r2_delivery_exempt(h.bucket,h.object_key))) THEN
@@ -118,21 +120,6 @@ CREATE OR REPLACE FUNCTION guard_delivery_r2_retirement() RETURNS trigger LANGUA
  END IF;
  RETURN NEW;
 END $$;
-
--- 0201's RAW delivery closure: the exact-key clause yields only for an exempt
--- key. Every derived clause (sources, path and content aliases, dependencies)
--- is unchanged.
-CREATE OR REPLACE FUNCTION r2_inverse_delivery_held(i bigint,b text,k text,p text,sha text,n bigint) RETURNS boolean LANGUAGE sql STABLE AS $$
- SELECT delivery_nas_held('raw',i,p,sha,n)
- OR EXISTS(SELECT 1 FROM delivery_keep_holds WHERE bucket=b AND object_key=k AND NOT r2_delivery_exempt(b,k))
- OR EXISTS(SELECT 1 FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id
-  WHERE o.source_clip_ids @> ARRAY[i] AND (
-   EXISTS(SELECT 1 FROM delivery_nas_source_holds d WHERE d.clip_id=ANY(o.source_clip_ids))
-   OR EXISTS(SELECT 1 FROM delivery_keep_holds d WHERE d.object_key=o.object_key)
-   OR EXISTS(SELECT 1 FROM delivery_keep_holds d WHERE d.relative_path<>'' AND d.relative_path IN(o.nas_relative_path,regexp_replace(o.nas_relative_path,'^joined/','')))
-   OR EXISTS(SELECT 1 FROM delivery_keep_holds d WHERE d.sha256<>'' AND d.sha256=o.sha256 AND d.size_bytes=o.size_bytes)
-   OR EXISTS(SELECT 1 FROM delivery_keep_output_dependencies d WHERE d.output_id=o.id AND d.recording_id=h.recording_id)))
-$$;
 
 -- Confident repairs have no catalog row. They retire under their own kind,
 -- keyed by the exemption id, so no repair can be mistaken for a collated
