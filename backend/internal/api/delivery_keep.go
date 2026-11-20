@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,7 +27,42 @@ type DeliveryKeepIdentity struct {
 	RecordingID int64  `json:"recording_id,omitempty"`
 	Kind        string `json:"kind"`
 }
+type DeliveryPublicFile struct {
+	Identity                DeliveryKeepIdentity
+	FileURL                 string
+	PinnedFileURL           string
+	TicketURL               string
+	DownloadURL             string
+	PinnedDownloadURL       string
+	DirectDownloadURL       string
+	PinnedDirectDownloadURL string
+	PinnedTicketURL         string
+}
+
+func deliveryPublicFile(id, generation string, object globalDeliveryObject) DeliveryPublicFile {
+	route := "https://stoarama.com" + publicGlobalDeliveryAPI
+	query := url.Values{"generation": {generation}, "sha256": {object.SHA256}, "path": {object.Path}}
+	escapedID := strings.ReplaceAll(url.QueryEscape(id), "+", "%20")
+	fileURL := route + "/file/" + escapedID
+	file := DeliveryPublicFile{
+		Identity: DeliveryKeepIdentity{Key: object.Key, ETag: strings.Trim(object.ETag, `"`),
+			Size: object.SizeBytes, SHA256: object.SHA256, Path: object.Path, RecordingID: object.RecordingID,
+			Kind: "video_collated"},
+		FileURL:         fileURL,
+		PinnedFileURL:   fileURL + "?generation=" + url.QueryEscape(generation),
+		TicketURL:       route + "/ticket/" + escapedID + "?sha256=" + url.QueryEscape(object.SHA256),
+		PinnedTicketURL: route + "/ticket/" + escapedID + "?" + query.Encode(),
+	}
+	file.DownloadURL = fileURL + "?download=1"
+	file.PinnedDownloadURL = fileURL + "?download=1&generation=" + url.QueryEscape(generation)
+	file.DirectDownloadURL = fileURL + "?direct=1&download=1"
+	file.PinnedDirectDownloadURL = fileURL + "?direct=1&generation=" + url.QueryEscape(generation) + "&download=1"
+	return file
+}
+
 type DeliveryKeepSnapshot struct {
+	PublicGeneration   string
+	PublicFiles        map[string][]DeliveryPublicFile
 	OutputDependencies map[int64]int64
 	Objects            map[string]DeliveryKeepIdentity
 	SHA256             string
@@ -40,9 +76,23 @@ type DeliveryKeepStore interface {
 // path contract used by the serving API, including supporting assets and both
 // current and generation-pinned registry objects. Never infer a keep prefix.
 func ReadPublicDeliveryKeep(ctx context.Context, store DeliveryKeepStore) (DeliveryKeepSnapshot, error) {
+	return readPublicDeliveryKeep(ctx, store, false)
+}
+
+// ReadPublicDeliveryKeepWithLinks adds each former URL to the checked snapshot
+// for the delivery NAS file-list export.
+func ReadPublicDeliveryKeepWithLinks(ctx context.Context, store DeliveryKeepStore) (DeliveryKeepSnapshot, error) {
+	return readPublicDeliveryKeep(ctx, store, true)
+}
+
+func readPublicDeliveryKeep(ctx context.Context, store DeliveryKeepStore, includeLinks bool) (DeliveryKeepSnapshot, error) {
 	out := DeliveryKeepSnapshot{Objects: map[string]DeliveryKeepIdentity{}}
+	if includeLinks {
+		out.PublicFiles = map[string][]DeliveryPublicFile{}
+	}
+	const registryPointer = globalDeliveryPrefix + "public/current.json"
 	var current *globalDeliveryRegistry
-	for _, key := range []string{globalDeliveryPrefix + "public/current.json", ""} {
+	for _, key := range []string{registryPointer, ""} {
 		if key == "" {
 			key = globalDeliveryPrefix + "public/generations/" + current.Generation + ".json"
 		}
@@ -91,6 +141,10 @@ func ReadPublicDeliveryKeep(ctx context.Context, store DeliveryKeepStore) (Deliv
 			if _, err := strconv.ParseInt(id, 10, 64); err == nil {
 				kind = "video_collated"
 			}
+			if includeLinks && key == registryPointer {
+				out.PublicFiles[o.Key] = append(out.PublicFiles[o.Key], deliveryPublicFile(id, registry.Generation, o))
+				out.PublicGeneration = registry.Generation
+			}
 			if err := out.add(o, kind); err != nil {
 				return out, err
 			}
@@ -126,8 +180,18 @@ func ReadPublicDeliveryKeep(ctx context.Context, store DeliveryKeepStore) (Deliv
 }
 func (s *DeliveryKeepSnapshot) add(o globalDeliveryObject, kind string) error {
 	x := DeliveryKeepIdentity{Key: o.Key, ETag: strings.Trim(o.ETag, `"`), Size: o.SizeBytes, SHA256: o.SHA256, Path: o.Path, RecordingID: o.RecordingID, Kind: kind}
-	if old, ok := s.Objects[x.Key]; ok && (old.ETag != x.ETag || old.Size != x.Size || old.SHA256 != x.SHA256) {
-		return errors.New("delivery aliases disagree")
+	if old, ok := s.Objects[x.Key]; ok {
+		if old.ETag != x.ETag || old.Size != x.Size || old.SHA256 != x.SHA256 {
+			return errors.New("delivery aliases disagree")
+		}
+		// A nonnumeric alias is not a separate assembly when the same
+		// physical object also has a canonical collated file ID.
+		if old.Kind == "video_collated" && x.Kind == "video_assembly" {
+			return nil
+		}
+		if old.Kind == x.Kind && (old.Path < x.Path || (old.Path == x.Path && old.RecordingID <= x.RecordingID)) {
+			return nil
+		}
 	}
 	s.Objects[x.Key] = x
 	return nil
