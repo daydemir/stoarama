@@ -24074,36 +24074,49 @@ def open_collated_dir(cfg, relative_path, create=True, *, mount=None, watch=None
         raise
 
 
+def hash_collated_descriptor(descriptor, directory_fd, name, stop_event, *, mount=None, durable=False, limit=None):
+    """Hash one already-open collated inode and prove it stayed that inode.
+
+    The caller keeps ownership of the descriptor: handoff recovery must retain
+    the exact read-back inode until its final name is linked. `limit` bounds the
+    bytes read so a growing entry is rejected instead of hashed forever.
+    """
+    digest = hashlib.sha256()
+    size = 0
+    before = os.fstat(descriptor)
+    if mount is not None:
+        mount.check_child(descriptor)
+    if not stat_module.S_ISREG(before.st_mode):
+        raise ExistingFileMismatch("collated entry is not a regular file")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        if stop_event.is_set():
+            raise CollatedDownloadStopped("collated hashing stopped")
+        chunk = os.read(descriptor, COLLATED_CHUNK_BYTES * 8)
+        if not chunk:
+            break
+        size += len(chunk)
+        if limit is not None and size > limit:
+            raise ExistingFileMismatch("collated entry exceeds its approved size")
+        digest.update(chunk)
+    if durable:
+        os.fsync(descriptor)
+        os.fsync(directory_fd)
+    after = os.fstat(descriptor)
+    final = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    identity = certification_identity(after)
+    if certification_identity(before) != identity or certification_identity(final) != identity:
+        raise ExistingFileMismatch("collated entry changed during readback")
+    return size, digest.hexdigest(), after
+
+
 def hash_collated_entry(directory_fd, name, stop_event, *, mount=None, durable=False):
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     descriptor = os.open(name, flags, dir_fd=directory_fd)
-    digest = hashlib.sha256()
-    size = 0
     try:
-        before = os.fstat(descriptor)
-        if mount is not None:
-            mount.check_child(descriptor)
-        if not stat_module.S_ISREG(before.st_mode):
-            raise ExistingFileMismatch("collated entry is not a regular file")
-        while True:
-            if stop_event.is_set():
-                raise CollatedDownloadStopped("collated hashing stopped")
-            chunk = os.read(descriptor, COLLATED_CHUNK_BYTES * 8)
-            if not chunk:
-                break
-            size += len(chunk)
-            digest.update(chunk)
-        if durable:
-            os.fsync(descriptor)
-            os.fsync(directory_fd)
-        after = os.fstat(descriptor)
-        final = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        identity = certification_identity(after)
-        if certification_identity(before) != identity or certification_identity(final) != identity:
-            raise ExistingFileMismatch("collated entry changed during readback")
+        return hash_collated_descriptor(descriptor, directory_fd, name, stop_event, durable=durable, mount=mount)
     finally:
         os.close(descriptor)
-    return size, digest.hexdigest(), after
 
 
 def collated_entry_stat(directory_fd, name):
@@ -24166,6 +24179,79 @@ def append_collated_bytes(prepared, descriptor, digest, start, item, limiter, st
             raise RuntimeError("collated body length mismatch")
 
 
+def recoverable_collated_candidate(part, item, mount):
+    """An exact-size private handoff partial may already hold every approved byte.
+
+    Recovery publishes that inode through its descriptor, which needs Linux
+    linkat, so other platforms keep the ordinary byte-reserving path instead of
+    a source-pathname link.
+    """
+    return (mount is not None and sys.platform.startswith("linux") and part is not None
+            and part.st_size == item["size_bytes"] and part.st_nlink == 1)
+
+
+def collated_name_is_descriptor(directory_fd, name, descriptor):
+    """True only while `name` still refers to the inode held by `descriptor`."""
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    opened = os.fstat(descriptor)
+    return (stat_module.S_ISREG(current.st_mode)
+            and (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino))
+
+
+def retained_collated_identity(descriptor, directory_fd, part_name, identity):
+    """Require the retained descriptor and its current name to be recorded identity.
+
+    Both are compared to the identity captured after the durable readback, not
+    merely to each other: a same-size replacement of the staged name would
+    otherwise pass while holding different bytes.
+    """
+    opened = os.fstat(descriptor)
+    if certification_identity(opened) != identity:
+        raise ExistingFileMismatch("collated handoff candidate descriptor changed after readback")
+    current = collated_entry_stat(directory_fd, part_name)
+    if (current is None or current.st_nlink != 1
+            or certification_identity(current) != identity):
+        raise ExistingFileMismatch("collated handoff candidate changed after readback")
+
+
+def reset_collated_candidate(descriptor, directory_fd, part_name, stop_event, *, mount=None, identity=None):
+    """Empty the verified private candidate we opened; it is never unlinked by name."""
+    if mount is not None:
+        mount.check()
+    if stop_event.is_set():
+        raise CollatedDownloadStopped("collated handoff stopped before clearing an unapproved partial")
+    retained_collated_identity(descriptor, directory_fd, part_name, identity)
+    os.ftruncate(descriptor, 0)
+    os.fsync(descriptor)
+    os.fsync(directory_fd)
+
+
+def link_collated_descriptor(item, directory_fd, name, descriptor, part_name, stop_event, *, mount=None, identity=None):
+    """Link the verified open inode to its final name; recovery never links a path."""
+    if mount is not None:
+        mount.check()
+    if stop_event.is_set():
+        raise CollatedDownloadStopped("collated handoff stopped before publishing its recovered partial")
+    retained_collated_identity(descriptor, directory_fd, part_name, identity)
+    try:
+        # AT_SYMLINK_FOLLOW on the descriptor path binds the destination to the
+        # exact inode that was verified, so a staged name swapped after readback
+        # can neither publish unverified bytes nor be overwritten by them.
+        os.link("/proc/self/fd/%d" % descriptor, name, dst_dir_fd=directory_fd, follow_symlinks=True)
+    except FileExistsError:
+        size, digest, _ = hash_collated_entry(directory_fd, name, stop_event, mount=mount)
+        if size != item["size_bytes"] or digest != item["sha256"]:
+            raise ExistingFileMismatch("collated final appeared with different bytes: %s" % item["nas_relative_path"])
+    except FileNotFoundError:
+        raise ExistingFileMismatch("collated handoff candidate was already unlinked; deferring its publication")
+    if collated_name_is_descriptor(directory_fd, part_name, descriptor):
+        os.unlink(part_name, dir_fd=directory_fd)
+    os.fsync(directory_fd)
+
+
 def publish_collated_candidate(item, directory_fd, name, part_name, stop_event, *, mount=None):
     """Publish a fully synced private handoff partial without fetching payload bytes.
 
@@ -24174,37 +24260,48 @@ def publish_collated_candidate(item, directory_fd, name, part_name, stop_event, 
     SHA-256 match the approved output; anything else is left for a reservation
     that accounts for the bytes it would really write.
     """
-    candidate = collated_entry_stat(directory_fd, part_name)
-    if candidate is None or candidate.st_size != item["size_bytes"] or candidate.st_nlink != 1:
+    if not sys.platform.startswith("linux"):
+        raise CollatedDownloadStopped("collated handoff partial recovery requires Linux linkat")
+    # O_RDWR only for this recovery candidate: an unapproved partial is reset
+    # through the descriptor that was verified, never by name.
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        descriptor = os.open(part_name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
         raise ExistingFileMismatch("collated handoff candidate changed after admission")
-    size, digest, info = hash_collated_entry(directory_fd, part_name, stop_event, durable=True, mount=mount)
-    if size != item["size_bytes"]:
-        raise ExistingFileMismatch("collated handoff candidate changed during readback")
-    if info.st_nlink != 1 or not stat_module.S_ISREG(info.st_mode):
-        raise ExistingFileMismatch("collated handoff candidate is not a private regular file")
-    if digest != item["sha256"]:
-        current = collated_entry_stat(directory_fd, part_name)
-        if current is None or current.st_nlink != 1 or certification_identity(current) != certification_identity(info):
-            raise ExistingFileMismatch("collated handoff candidate changed after readback")
-        os.unlink(part_name, dir_fd=directory_fd)
-        os.fsync(directory_fd)
-        raise ExistingFileMismatch("collated handoff candidate differs from the approved output; a full reservation follows")
-    if stop_event.is_set():
-        raise CollatedDownloadStopped("collated handoff stopped before publishing its recovered partial")
-    link_collated_final(item, directory_fd, name, part_name, stop_event, mount=mount, identity=certification_identity(info))
+    try:
+        opened = os.fstat(descriptor)
+        if mount is not None:
+            mount.check_child(descriptor)
+        if (not stat_module.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                or opened.st_size != item["size_bytes"]):
+            raise ExistingFileMismatch("collated handoff candidate changed after admission")
+        # One descriptor stays open from admission through readback and
+        # publication, so every check below describes the inode actually linked.
+        size, digest, info = hash_collated_descriptor(
+            descriptor, directory_fd, part_name, stop_event, durable=True, mount=mount, limit=item["size_bytes"],
+        )
+        if size != item["size_bytes"]:
+            raise ExistingFileMismatch("collated handoff candidate changed during readback")
+        if info.st_nlink != 1 or not stat_module.S_ISREG(info.st_mode):
+            raise ExistingFileMismatch("collated handoff candidate is not a private regular file")
+        if digest != item["sha256"]:
+            reset_collated_candidate(
+                descriptor, directory_fd, part_name, stop_event, mount=mount, identity=certification_identity(info),
+            )
+            raise ExistingFileMismatch("collated handoff candidate differs from the approved output; a full reservation follows")
+        link_collated_descriptor(
+            item, directory_fd, name, descriptor, part_name, stop_event,
+            mount=mount, identity=certification_identity(info),
+        )
+    finally:
+        os.close(descriptor)
 
 
-def link_collated_final(item, directory_fd, name, part_name, stop_event, *, mount=None, identity=None):
-    """Link a verified private partial to its final name without overwriting anything."""
+def link_collated_final(item, directory_fd, name, part_name, stop_event, *, mount=None):
+    """Link a freshly fetched private partial to its final name without overwriting."""
     if mount is not None:
         mount.check()
-    if identity is not None:
-        # The candidate must still be the same private inode at the moment of
-        # publication; a same-size replacement would publish unverified bytes.
-        current = collated_entry_stat(directory_fd, part_name)
-        if (current is None or current.st_nlink != 1 or not stat_module.S_ISREG(current.st_mode)
-                or certification_identity(current) != identity):
-            raise ExistingFileMismatch("collated partial changed before publication")
     try:
         os.link(part_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
     except FileExistsError:
@@ -24301,7 +24398,7 @@ def collated_bytes_needed(cfg, item, *, mount=None):
         part = collated_entry_stat(directory_fd, ".%s.collated-%d.part" % (name, item["output_id"]))
         if part is None:
             return item["size_bytes"]
-        if part.st_size == item["size_bytes"] and mount is not None and part.st_nlink == 1:
+        if recoverable_collated_candidate(part, item, mount):
             return 0
         if part.st_size >= item["size_bytes"]:
             return item["size_bytes"]

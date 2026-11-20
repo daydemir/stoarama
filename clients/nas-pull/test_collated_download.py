@@ -340,6 +340,7 @@ class CollatedDownloadTests(unittest.TestCase):
                 pull.check_collated_handoff_paths(self.cfg, threading.Event())
         self.assertEqual([call.args[1] for call in request.call_args_list], ["GET"])
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "recovered handoff partials publish through Linux linkat")
     def test_handoff_publishes_a_synced_full_partial_with_zero_payload_reservation(self):
         self.enable_handoff()
         size = len(self.body)
@@ -361,6 +362,7 @@ class CollatedDownloadTests(unittest.TestCase):
         self.assertEqual(self.runtime.capacity_reserved_bytes, 0)
         self.assert_ack_matches_final()
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "recovered handoff partials publish through Linux linkat")
     def test_handoff_corrupt_full_partial_clears_and_defers_to_next_reservation(self):
         self.enable_handoff()
         size = len(self.body)
@@ -370,7 +372,9 @@ class CollatedDownloadTests(unittest.TestCase):
         self.assertEqual(self.requests, [])
         self.assertEqual(self.acks, [])
         self.assertFalse(self.final.exists())
-        self.assertFalse(self.part.exists())
+        # The corrupt inode is emptied in place, never unlinked by name, so the
+        # next reservation starts a fresh full write.
+        self.assertEqual(self.part.stat().st_size, 0)
         self.assertIn("full reservation follows", self.errors[0]["error"])
         self.assertEqual(self.runtime.capacity_reserved_bytes, 0)
 
@@ -381,6 +385,7 @@ class CollatedDownloadTests(unittest.TestCase):
         self.assertEqual(self.final.read_bytes(), self.body)
         self.assert_ack_matches_final()
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "recovered handoff partials publish through Linux linkat")
     def test_handoff_zero_reservation_never_fetches_when_the_candidate_vanishes(self):
         self.enable_handoff()
         size = len(self.body)
@@ -401,6 +406,7 @@ class CollatedDownloadTests(unittest.TestCase):
         self.assertEqual(self.runtime.capacity_reserved_bytes, 0)
         self.assertIn("after admission", self.errors[0]["error"])
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "recovered handoff partials publish through Linux linkat")
     def test_handoff_never_fetches_more_than_the_reserved_partial_remainder(self):
         self.enable_handoff()
         size = len(self.body)
@@ -428,6 +434,99 @@ class CollatedDownloadTests(unittest.TestCase):
         self.assertEqual(self.requests, [])
         self.assertEqual(self.final.read_bytes(), self.body)
         self.assert_ack_matches_final()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "recovered handoff partials publish through Linux linkat")
+    def test_handoff_links_the_verified_inode_when_the_staged_name_is_swapped(self):
+        self.enable_handoff()
+        size = len(self.body)
+        self.part.parent.mkdir(parents=True)
+        self.part.write_bytes(self.body)
+        replacement = b"r" * size
+        actual_link = os.link
+        staged = str(self.part)
+
+        def swap(src, dst, **kwargs):
+            if src.startswith("/proc/self/fd/"):
+                alternate = self.part.with_name("swapped")
+                alternate.write_bytes(replacement)
+                os.replace(alternate, staged)
+            return actual_link(src, dst, **kwargs)
+
+        with mock.patch.object(pull.os, "link", side_effect=swap):
+            self.assertTrue(self.drain(free=self.handoff_floor() + size - 1))
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.final.read_bytes(), self.body)
+        self.assertEqual(self.final.stat().st_nlink, 1)
+        # The replacement keeps its staged name and its own inode.
+        self.assertEqual(self.part.read_bytes(), replacement)
+        self.assertNotEqual(self.part.stat().st_ino, self.final.stat().st_ino)
+        self.assert_ack_matches_final()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "recovered handoff partials publish through Linux linkat")
+    def test_handoff_defers_when_the_verified_inode_was_already_unlinked(self):
+        self.enable_handoff()
+        size = len(self.body)
+        self.part.parent.mkdir(parents=True)
+        self.part.write_bytes(self.body)
+        actual_link = os.link
+        staged = str(self.part)
+
+        # The verified inode is already unlinked when publication starts, so
+        # linkat has no name to follow: defer with no final and no bytes lost.
+        def refuse_descriptor_link(src, dst, **kwargs):
+            if src.startswith("/proc/self/fd/"):
+                os.unlink(staged)
+                raise FileNotFoundError(2, "No such file or directory", src)
+            return actual_link(src, dst, **kwargs)
+
+        with mock.patch.object(pull.os, "link", side_effect=refuse_descriptor_link):
+            self.assertFalse(self.drain(free=self.handoff_floor() + size - 1))
+        self.assertEqual(self.acks, [])
+        self.assertFalse(self.final.exists())
+        self.assertFalse(self.part.exists())
+        self.assertIn("already unlinked", self.errors[0]["error"])
+        self.assertEqual(self.runtime.capacity_reserved_bytes, 0)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "recovered handoff partials publish through Linux linkat")
+    def test_handoff_corrupt_candidate_keeps_its_bytes_when_clearing_is_not_safe(self):
+        self.enable_handoff()
+        size = len(self.body)
+        self.part.parent.mkdir(parents=True)
+        self.part.write_bytes(b"c" * size)
+        stop_event = threading.Event()
+        real_hash = pull.hash_collated_descriptor
+
+        def hash_then_stop(descriptor, directory_fd, name, event, **kwargs):
+            result = real_hash(descriptor, directory_fd, name, event, **kwargs)
+            stop_event.set()
+            return result
+
+        directory_fd = os.open(self.part.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with mock.patch.object(pull, "hash_collated_descriptor", side_effect=hash_then_stop):
+                with self.assertRaises(pull.CollatedDownloadStopped):
+                    pull.publish_collated_candidate(
+                        self.item, directory_fd, self.final.name, self.part.name, stop_event, mount=None,
+                    )
+            self.assertFalse(self.final.exists())
+            self.assertEqual(self.part.read_bytes(), b"c" * size)
+
+            def changed_mount():
+                return SimpleNamespace(
+                    check_child=lambda fd: None,
+                    check=lambda: (_ for _ in ()).throw(
+                        pull.CollatedDownloadStopped("collated handoff root mount changed")),
+                )
+
+            with self.assertRaises(pull.CollatedDownloadStopped):
+                pull.publish_collated_candidate(
+                    self.item, directory_fd, self.final.name, self.part.name, threading.Event(),
+                    mount=changed_mount(),
+                )
+        finally:
+            os.close(directory_fd)
+        self.assertFalse(self.final.exists())
+        self.assertEqual(self.part.read_bytes(), b"c" * size)
 
     def test_handoff_feed_drains_before_starting_other_delivery(self):
         page = {"policy": {"enabled": True, "download_bytes_per_sec": 1 << 30, "download_parallel": 2,
