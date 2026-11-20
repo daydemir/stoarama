@@ -352,6 +352,8 @@ func (s *Server) router() http.Handler {
 			account.Get("/collated/{outputId}/download", s.handleAccountCollatedDownload)
 			account.Post("/collated/ack", s.handleAccountCollatedAck)
 			account.Post("/collated/error", s.handleAccountCollatedError)
+			account.Get("/collated/handoff-check", s.handleAccountDeliveryNASHandoffCheck)
+			account.Post("/collated/handoff-check", s.handleAccountDeliveryNASHandoffCheck)
 			// Heartbeat is called by the pull client with its scoped key, so it lives
 			// in the key-OR-session group and is allowlisted in pullPathAllowed.
 			account.Post("/connections/heartbeat", s.handleAccountConnectionHeartbeat)
