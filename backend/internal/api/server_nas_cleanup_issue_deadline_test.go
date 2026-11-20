@@ -46,8 +46,8 @@ func TestNASCleanupDatabaseClockRefusesLatePermitWrite(t *testing.T) {
 	defer cancel()
 	req := cleanupObserve{Attempt: task.Attempt, PlanSHA: task.PlanSHA, Outcome: "match", Proof: fixtureProof(task.Item)}
 	result := f.s.cleanupObserveOne(ctx, tx, 13, task.ItemID, req, &cleanupObserveEnv{
-		master:  cleanupMasterOn(f.ctx, tx),
-		session: cleanupClientSession{boot: "fixture-boot", version: nasCleanupExecutionClientVersion}, prefetched: prefetched,
+		authority: cleanupAuthorityTentative,
+		session:   cleanupClientSession{boot: "fixture-boot", version: nasCleanupExecutionClientVersion}, prefetched: prefetched,
 	})
 	if !tracer.delayed || result.status != 503 || result.write || result.body["delete"] == true {
 		t.Fatalf("late write granted authority: %+v", result)

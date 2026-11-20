@@ -5,11 +5,25 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// cleanupMasterRoleMu serializes the 0229 tests: nas_cleanup_master_writer is a
+// cluster-wide role, so one test creating, inspecting or dropping it must not
+// interleave with another. Other packages' fixtures create it too, which is why
+// the fresh-creation case only runs when it can prove the role was absent.
+var cleanupMasterRoleMu sync.Mutex
+
+func lockCleanupMasterRole(t *testing.T) func() {
+	t.Helper()
+	cleanupMasterRoleMu.Lock()
+	return cleanupMasterRoleMu.Unlock
+}
 
 // applyCleanupMasterMigration runs migration 0229 inside a fresh, isolated
 // schema owned by role, in one transaction, exactly as the migrator does.
@@ -40,6 +54,7 @@ func applyCleanupMasterMigration(t *testing.T, admin *pgx.Conn, ctx context.Cont
 // CREATE on the schema for the transfer), and must fail rather than fall back
 // to the migrator as the history recorder owner.
 func TestNASCleanupMasterMigrationRequiresDedicatedWriterOwner(t *testing.T) {
+	defer lockCleanupMasterRole(t)()
 	dsn := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
 	if dsn == "" {
 		t.Skip("set STOARAMA_TEST_DATABASE_URL")
@@ -135,6 +150,7 @@ func TestNASCleanupMasterMigrationRequiresDedicatedWriterOwner(t *testing.T) {
 // or object ownership to another role, so 0229 must refuse such a migrator
 // instead of failing somewhere in the transfer.
 func TestNASCleanupMasterMigrationRequiresSchemaOwnership(t *testing.T) {
+	defer lockCleanupMasterRole(t)()
 	dsn := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
 	if dsn == "" {
 		t.Skip("set STOARAMA_TEST_DATABASE_URL")
@@ -199,6 +215,7 @@ func TestNASCleanupMasterMigrationRequiresSchemaOwnership(t *testing.T) {
 // the migration verifies the effective privilege and fails closed rather than
 // silently leaving the insert-only recorder able to create objects.
 func TestNASCleanupMasterMigrationRefusesInheritedCreateForTheWriter(t *testing.T) {
+	defer lockCleanupMasterRole(t)()
 	dsn := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
 	if dsn == "" {
 		t.Skip("set STOARAMA_TEST_DATABASE_URL")
@@ -276,5 +293,104 @@ func TestNASCleanupMasterMigrationStatesItsPostgresFloor(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("0229 no longer asserts %q", want)
 		}
+	}
+}
+
+// The production-shaped path: the migration must create the dedicated writer
+// itself and leave the recorder owned by it with no effective CREATE. The role is
+// cluster-wide, so this runs in its own throwaway database under the package lock
+// and skips honestly when another package already created the role: with the role
+// present the fresh-creation statement is not exercised, and claiming otherwise
+// would be a false pass.
+func TestNASCleanupMasterMigrationCreatesFreshWriterAsSchemaOwner(t *testing.T) {
+	defer lockCleanupMasterRole(t)()
+	dsn := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if dsn == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	admin, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	// The role is cluster-wide. Run only when it is absent, or when it exists but
+	// owns nothing (a leftover from an earlier run of this package): then dropping
+	// it here cannot disturb another package's objects, and the migration's own
+	// CREATE ROLE statement is genuinely exercised.
+	var owners int
+	if err := admin.QueryRow(ctx, `SELECT count(*) FROM pg_shdepend d JOIN pg_roles r ON r.oid=d.refobjid WHERE r.rolname='nas_cleanup_master_writer' AND d.deptype='o'`).Scan(&owners); err != nil {
+		t.Fatal(err)
+	}
+	if owners != 0 {
+		t.Skip("nas_cleanup_master_writer owns objects created by another test; the fresh-creation statement cannot be isolated without disturbing them")
+	}
+	if _, err := admin.Exec(ctx, `DROP ROLE IF EXISTS nas_cleanup_master_writer`); err != nil {
+		t.Fatalf("cannot isolate the writer role: %v", err)
+	}
+	owner := fmt.Sprintf("nas_mig_fresh_owner_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, `CREATE ROLE `+owner+` NOLOGIN CREATEROLE`); err != nil {
+		t.Fatal(err)
+	}
+	dbName := fmt.Sprintf("stoarama_fresh_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, `DROP DATABASE IF EXISTS `+dbName); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, `CREATE DATABASE `+dbName); err != nil {
+		t.Fatalf("create isolated database: %v", err)
+	}
+	defer func() {
+		// Order matters: dropping the database first removes the schema and its
+		// dependent recorder, which is what lets the roles go.
+		_, _ = admin.Exec(context.Background(), `DROP DATABASE IF EXISTS `+dbName)
+		_, _ = admin.Exec(context.Background(), `DROP ROLE IF EXISTS nas_cleanup_master_writer`)
+		_, _ = admin.Exec(context.Background(), `DROP ROLE IF EXISTS `+owner)
+	}()
+	schema := "fresh"
+	dbCfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbCfg.Database = dbName
+	// The migrated objects live in this schema; make it the session default so
+	// the recorder's trigger can resolve them the way the API does.
+	dbCfg.RuntimeParams["search_path"] = schema
+	conn, err := pgx.ConnectConfig(ctx, dbCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	if _, err := conn.Exec(ctx, `CREATE SCHEMA `+schema+` AUTHORIZATION `+owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyCleanupMasterMigration(t, conn, ctx, schema, owner); err != nil {
+		t.Fatalf("fresh-writer migration as schema owner: %v", err)
+	}
+	var recorderOwner string
+	if err := conn.QueryRow(ctx, `SELECT pg_get_userbyid(proowner) FROM pg_proc WHERE proname='record_nas_cleanup_master' AND pronamespace=$1::regnamespace`, schema).Scan(&recorderOwner); err != nil {
+		t.Fatal(err)
+	}
+	if recorderOwner != "nas_cleanup_master_writer" {
+		t.Fatalf("fresh recorder owned by %q", recorderOwner)
+	}
+	var canCreate bool
+	if err := conn.QueryRow(ctx, `SELECT has_schema_privilege('nas_cleanup_master_writer',$1,'CREATE')`, schema).Scan(&canCreate); err != nil {
+		t.Fatal(err)
+	}
+	if canCreate {
+		t.Fatal("freshly created writer retained CREATE")
+	}
+	// The recorder works end to end under the fresh owner: a master flip appends
+	// exactly one new history row on top of the migration's initial one.
+	if _, err := conn.Exec(ctx, `UPDATE nas_cleanup_master SET enabled=true,actor='t',reason='r'`); err != nil {
+		t.Fatalf("recorder did not append under the fresh owner: %v", err)
+	}
+	var rows int
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM nas_cleanup_master_history`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Fatalf("history rows after one flip: %d", rows)
 	}
 }

@@ -49,10 +49,19 @@ CREATE TRIGGER nas_cleanup_master_no_truncate BEFORE TRUNCATE ON nas_cleanup_mas
 -- caller's search_path nor a later CREATE in another schema can redirect the
 -- write. The guard rejects every insert that does not come from the recorder.
 --
--- Provenance is load-bearing: if the dedicated role cannot be created or
--- assumed, this migration FAILS. Falling back to the migrating role as the
--- recorder owner would make the actor on every history row the runtime role,
--- which is exactly the evidence a compromised runtime could forge.
+-- What the separation actually buys: the API runtime role can only reach history
+-- through this trigger, and a plain application write cannot forge an audit row.
+-- It is NOT tamper resistance against the table owner or a superuser. The
+-- migration usually runs as that owner (AUTO_MIGRATE runs it as the runtime
+-- role), and whoever owns the master and history tables can drop or alter the
+-- triggers and edit rows directly. Treat the history as an audit trail that a
+-- compromised *runtime* cannot forge, not as evidence against the database
+-- owner.
+--
+-- Provenance is still load-bearing: if the dedicated role cannot be created or
+-- assumed, this migration FAILS rather than falling back to the migrating role.
+-- The writer role is what keeps the recorder's own identity distinct from the
+-- role that inserts master rows.
 --
 -- Migrator privileges (see docs/NAS_CLEANUP.md). This migration states them as
 -- assertions instead of assuming them, so a wrong migrator fails with the exact

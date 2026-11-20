@@ -1195,29 +1195,86 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
 		return
 	}
+	// Two passes at most: the tentative pass does all blocking work and may
+	// buffer a permit; the authoritative master read is last, and if it is OFF
+	// that pass is rolled back whole and the request is re-run under the denied
+	// posture, which produces exactly the ordinary OFF answers (recorded
+	// would-delete, pause, reconcile) through the same code path.
+	authority := cleanupAuthorityTentative
+	for pass := 0; pass < 2; pass++ {
+		result, ok := s.cleanupObserveRequest(ctx, w, cid, id, req, env, authority)
+		if !ok {
+			return
+		}
+		if result == nil {
+			// The authoritative read found OFF: nothing was committed. Re-run the
+			// same request once under the denied posture.
+			authority = cleanupAuthorityDenied
+			continue
+		}
+		if cleanupObservationExpired(ctx) {
+			cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
+			return
+		}
+		if result.status == 503 {
+			w.Header().Set("Retry-After", "1")
+		}
+		util.WriteJSON(w, result.status, result.body)
+		return
+	}
+	// Both passes saw OFF through a path that still produced no answer; fail
+	// closed rather than serve a tentative result.
+	util.WriteError(w, 503, "cleanup observation authority unavailable")
+}
+
+// cleanupObserveRequest runs one whole observation transaction. It returns
+// ok=false after it has already written the response, and (nil, true) when the
+// authoritative read found OFF so the caller must retry under the denied
+// posture.
+func (s *Server) cleanupObserveRequest(ctx context.Context, w http.ResponseWriter, cid, id int64, req cleanupObserve, env *cleanupObserveEnv, authority cleanupAuthority) (*cleanupObserveResult, bool) {
+	env.authority = authority
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		cleanupObservationFailure(w, ctx, 500, "cleanup observation begin failed")
-		return
+		return nil, false
 	}
 	defer tx.Rollback(ctx)
+	// All blocking work — the item/plan fences, the freeze replay, the catalog
+	// and policy checks, the budget advisory lock and the tentative item write —
+	// completes before the authoritative master read. The read is the last
+	// statement this transaction runs apart from COMMIT, and its row lock is held
+	// through that commit, so an emergency OFF waits only for a decision that has
+	// already committed to minting authority.
 	result := s.cleanupObserveOne(ctx, tx, cid, id, req, env)
 	if cleanupObservationExpired(ctx) {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
-		return
+		return nil, false
 	}
-	if result.status == 200 && result.write && tx.Commit(ctx) != nil {
-		cleanupObservationFailure(w, ctx, 500, "cleanup observation save failed")
-		return
+	if authority == cleanupAuthorityTentative && result.status == 200 && cleanupAffirmative(result.body) {
+		var on bool
+		if err = tx.QueryRow(ctx, cleanupMasterReadSQL).Scan(&on); err != nil {
+			cleanupObservationFailure(w, ctx, 503, "cleanup master control unavailable")
+			return nil, false
+		}
+		if !on {
+			// Discard the tentative permit and every write with it.
+			if err = tx.Rollback(ctx); err != nil {
+				cleanupObservationFailure(w, ctx, 500, "cleanup observation save failed")
+				return nil, false
+			}
+			// The request ID was registered, so a denied retry must not be
+			// treated as a first submission: it is the same request.
+			env.freshRequests[id] = env.freshRequests[id]
+			return nil, true
+		}
 	}
-	if cleanupObservationExpired(ctx) {
-		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
-		return
+	if result.status == 200 && result.write {
+		if err = tx.Commit(ctx); err != nil {
+			cleanupObservationFailure(w, ctx, 500, "cleanup observation save failed")
+			return nil, false
+		}
 	}
-	if result.status == 503 {
-		w.Header().Set("Retry-After", "1")
-	}
-	util.WriteJSON(w, result.status, result.body)
+	return &result, true
 }
 
 type cleanupObserveResult struct {
@@ -1316,9 +1373,10 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 			(!certified || oldRecovery == nasCleanupCertifiedStitchRecovery && cleanupCheckCertifiedStitch(ctx, tx, item, true) == nil &&
 				env.certifiedStitchAbortsAbsent(ctx, tx, item)) {
 			now := time.Now()
-			// The master is read last, after every check above and every fence
-			// this transaction already holds.
-			if permitUntil.After(now) && until.After(now) && sessionDeadline.After(now) && stitchDeletionMaster(env.deletionMaster(ctx, tx), item) {
+			// Authority is the posture the caller decided at its transaction
+			// boundary; this function never reads or locks the master switch, so
+			// an affirmative replay is exactly as durable as the caller's ON.
+			if permitUntil.After(now) && until.After(now) && sessionDeadline.After(now) && stitchDeletionMaster(env.authority == cleanupAuthorityTentative, item) {
 				return cleanupObserveResult{status: 200, body: map[string]any{"delivery_keep_checked": true, "action": "delete_issued", "delete": true, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": oldRecovery, "expires_at": permitUntil.UTC(), "plan_paused": false, "replayed": true}}
 			}
 		}
@@ -1442,7 +1500,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 					policyReason = "R2 MD5/ETag match disagreed with the full SHA-256 audit"
 				}
 				if lease.After(time.Now()) && cleanupPermitShape(mode, until, cleanupSameFileProof(oldProof, req.Proof), recovery) &&
-					stitchDeletionMaster(env.deletionMaster(ctx, tx), item) {
+					stitchDeletionMaster(env.authority == cleanupAuthorityTentative, item) {
 					if certified && !env.certifiedStitchAbortsAbsent(ctx, tx, item) {
 						return cleanupObserveResult{status: 503, body: map[string]any{"error": "aborted staging absence could not be verified", "retryable": true}}
 					}

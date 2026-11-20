@@ -92,7 +92,21 @@ an immutable `nas_cleanup_master_history` row (time, the authenticated
 server-side actor, the operator's `claimed_by` name, old and new state, reason);
 history and control rows cannot be deleted, truncated or edited outside that
 path, only the recorder function may append history, and the triggers are
-`ENABLE ALWAYS`.
+`ENABLE ALWAYS`. Treat that as protection against a *runtime* path that skips
+the control, not against the table owner or a superuser, who can still alter the
+triggers (see the migration notes below).
+
+Operationally, `master off` is retroactive only for *decisions*: once the flip
+commits, no new API admission can mint a permit, lease, enable or advance,
+because each of those takes the master row lock and reads it before writing
+authority. Permits issued before the flip are not recalled — a valid, unexpired
+permit may still finish its unlink, and one that is never used simply expires
+(30 s for the permit, or with its 30-minute lease). It is therefore not a kill
+switch for in-flight filesystem work: to guarantee no deletion continues, pause
+the plan or batch first and drain, then flip OFF. The same ordering applies when
+migrating: run with the legacy gate OFF, drain outstanding permits and leases,
+apply the migration, cut over, and turn the new switch ON only if cleanup should
+continue.
 
 The controller credential is read only from `NAS_CLEANUP_CONTROLLER_TOKEN`;
 there is no token flag, so it never lands in shell history or a process listing.
@@ -126,17 +140,26 @@ while plan and batch reports return an error instead of a false OFF and
 otherwise keep `master_deletion_enabled`. Turning it on bypasses nothing: plan
 approval, batch digests, the 5 TB/day cap and per-file permits are unchanged.
 
-Two consequences are load-bearing and easy to get wrong:
+Three consequences are load-bearing and easy to get wrong:
 
-- **A decision lives exactly as long as its row lock.** A batched observation
-  runs each item in its own savepoint, and rolling a savepoint back releases
-  every lock taken after it. A replayed permit returns `write=false`, so its
-  savepoint is rolled back; the ON it read must not survive that. The cached
-  decision is therefore only reused while the `FOR SHARE` row lock is verifiably
-  still held on that connection. Otherwise the switch is re-read, and a read
-  that cannot be shown to hold a live row lock is OFF (no authority without a
-  valid lock). This is why a cached ON can never outlive an OFF that committed
-  between two items of the same batch.
+- **Authority is decided at a transaction boundary, not cached in Go.** Nothing
+  in the process remembers an earlier ON. A request does all potentially
+  blocking work first — the scoped item/plan fences, the best-14 rank replay and
+  cache writes, aborted-stage lookup, the per-item savepoints and their tentative
+  item mutations, and the budget advisory lock taken explicitly in the outer
+  transaction before any per-item savepoint — and only then runs the single
+  authoritative `SELECT enabled FROM nas_cleanup_master FOR SHARE` as the last
+  statement except the commit. That row lock is held through the commit.
+- **An OFF preliminary read means nothing tentative escapes.** If the
+  authoritative read is OFF, the whole pass is rolled back: no buffered
+  affirmative replay, no tentative permit, no pause it claimed, is committed.
+  The request is then re-run under a denied posture, which produces exactly the
+  ordinary OFF answers (a recorded would-delete that auto-pauses an enabled plan,
+  and `reconcile` for an affirmative replay) through the same code path as any
+  other OFF. Buffered work — including an exact affirmative replay that arrived
+  inside a savepoint whose rollback would have released the lock — therefore
+  cannot outlive the authority that justified it. The budget counter only moves
+  for a pass that commits, so a discarded pass never skews the rolling cap.
 - **Nothing may wait on a row after the master lock is taken.** Enabling a plan
   resets all of its items to `pending`, and batch advance does the same to the
   next plan. Both fence those item rows (`SELECT … FOR UPDATE`, ascending) and
@@ -146,11 +169,13 @@ Two consequences are load-bearing and easy to get wrong:
   make an emergency OFF queue behind an item waiter.
 
 `stoaramactl nas-cleanup r2-retire cancel-joined-writers` uses the same
-discipline. Its apply transaction takes the shared cleanup public fence — the
-fence every enable and batch advance takes exclusively — then reads the master
-`FOR SHARE`, and only then re-checks the global-idle window. The window cannot
-change while that fence is held, so a plan that was enabled during the wait can
-never be retired as if it were idle.
+discipline. Its apply transaction takes the cleanup public fence **exclusively**
+— every enable and batch advance takes that fence exclusively, and every lease
+and observation takes it shared — so the retirement serializes against dry-run
+leases as well as against authority minting. It then reads the master `FOR
+SHARE` and only then probes the global-idle window. The window cannot change
+while the exclusive fence is held, so a plan enabled, or work leased, during the
+wait can never be retired as if it were idle.
 
 #### Migration 0229 privileges
 
@@ -186,10 +211,26 @@ inherits from another role counts and fails the migration — and it holds no
 `UPDATE`, `DELETE` or `TRUNCATE` on history. A failure rolls the whole migration
 back, leaving no tables behind.
 
-No superuser is required, and the API's runtime role needs none of this: it only
-inserts/updates `nas_cleanup_master`, and the `SECURITY DEFINER` recorder
-appends history on its behalf. Startup depends on nothing in this migration
-beyond the applied schema.
+No superuser is required, and the API's runtime role needs none of this
+*beyond what `AUTO_MIGRATE` implies*: it only inserts/updates
+`nas_cleanup_master` and the `SECURITY DEFINER` recorder appends history on its
+behalf. Startup depends on nothing in this migration beyond the applied schema.
+
+Be precise about what the separation buys, because it is easy to overclaim:
+
+- **The writer role is trigger separation, not a second trust domain.** It keeps
+  the recorder's own identity distinct from whatever role inserts/updates master
+  rows, so the recorder cannot be reached except through the master trigger and
+  a plain application insert cannot forge an audit row.
+- **Under `AUTO_MIGRATE` the runtime role is the migrator, so it typically owns
+  the master and history tables** (it migrates at startup with its own
+  credentials). The recorder stays owned by `nas_cleanup_master_writer`; the
+  tables do not. An operator-run migration makes the operator the table owner.
+- **This is not tamper resistance against that owner or a superuser.** Whoever
+  owns the tables can drop or alter the triggers and edit or delete rows
+  directly, and nothing in this design prevents it. Treat the history as an
+  audit trail a compromised *runtime* cannot forge, not as evidence against the
+  database owner.
 
 If the migration fails on the recorder role, grant the dedicated role and
 re-run the deploy:

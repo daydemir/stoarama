@@ -80,40 +80,17 @@ func cleanupMasterOnTx(ctx context.Context, tx pgx.Tx) bool {
 	return on
 }
 
-// cleanupMasterLockedSQL reports whether this backend still holds the FOR SHARE
-// row lock on the master control. to_regclass is NULL (never an error) when the
-// table is missing, so an unavailable control fails closed without aborting the
-// caller's transaction. A row lock taken after a savepoint is released by that
-// savepoint's rollback, which is exactly what a cached decision must not
-// outlive.
-const cleanupMasterLockedSQL = `SELECT EXISTS(SELECT 1 FROM pg_locks
- WHERE locktype='relation' AND relation=to_regclass('nas_cleanup_master')
- AND mode='RowShareLock' AND granted AND pid=pg_backend_pid())`
+// cleanupMasterReadSQL is the one authoritative read of the deletion master
+// switch: `FOR SHARE`, on the transaction that will commit, after every
+// potentially blocking step. Its row lock lives until that commit, so an
+// emergency OFF waits only for a decision that already holds it.
+const cleanupMasterReadSQL = `SELECT enabled FROM nas_cleanup_master FOR SHARE`
 
-// cleanupLockProbe answers a yes/no pg_locks question without endangering the
-// caller's transaction: the probe runs in its own savepoint, so any error (a
-// missing table, a permission problem, an aborted statement) rolls back only
-// the probe and answers "not held". Every caller treats that as OFF.
-func cleanupLockProbe(ctx context.Context, tx pgx.Tx, query string, args ...any) bool {
-	save, err := tx.Begin(ctx)
-	if err != nil {
-		return false
-	}
-	var held bool
-	if err = save.QueryRow(ctx, query, args...).Scan(&held); err != nil {
-		_ = save.Rollback(ctx)
-		return false
-	}
-	if save.Commit(ctx) != nil {
-		return false
-	}
-	return held
-}
-
-// cleanupMasterLockHeld reports whether the master row lock is held on this
-// connection right now.
-func cleanupMasterLockHeld(ctx context.Context, tx pgx.Tx) bool {
-	return cleanupLockProbe(ctx, tx, cleanupMasterLockedSQL)
+// cleanupAffirmative reports whether one buffered observation result would hand
+// the client deletion authority. Only these results justify taking the master
+// row lock at the end of the request.
+func cleanupAffirmative(body map[string]any) bool {
+	return body["delete"] == true || body["replayed"] == true
 }
 
 // cleanupMasterMaybeOn is the cheap, non-blocking pre-check: it reads the

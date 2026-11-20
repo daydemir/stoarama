@@ -354,7 +354,7 @@ func TestNASCleanupDryRunKeepsRecoveryBudgetAndRefusesEnableRace(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(f.ctx)
-	result := f.s.cleanupObserveOne(f.ctx, tx, 13, task.ItemID, cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: task.Attempt, PlanSHA: task.PlanSHA, Outcome: "match", Proof: fixtureProof(task.Item)}, &cleanupObserveEnv{master: cleanupMasterOn(f.ctx, tx), dryRunOnly: true})
+	result := f.s.cleanupObserveOne(f.ctx, tx, 13, task.ItemID, cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: task.Attempt, PlanSHA: task.PlanSHA, Outcome: "match", Proof: fixtureProof(task.Item)}, &cleanupObserveEnv{authority: cleanupAuthorityTentative, dryRunOnly: true})
 	if result.status != 503 || result.body["retryable"] != true || result.write {
 		t.Fatalf("issued under dry-run context: %+v", result)
 	}

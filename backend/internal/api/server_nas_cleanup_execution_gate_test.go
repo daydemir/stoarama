@@ -215,7 +215,7 @@ func TestNASCleanupRolledBackCheckpointNeverMintsFirstPermit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(f.ctx)
-	result := f.s.cleanupObserveOne(f.ctx, tx, 13, task.ItemID, req, &cleanupObserveEnv{master: cleanupMasterOn(f.ctx, tx), session: cleanupClientSession{boot: "fixture-boot", version: nasCleanupExecutionClientVersion}, freshRequests: map[int64]bool{task.ItemID: true}, prefetched: prefetched})
+	result := f.s.cleanupObserveOne(f.ctx, tx, 13, task.ItemID, req, &cleanupObserveEnv{authority: cleanupAuthorityTentative, session: cleanupClientSession{boot: "fixture-boot", version: nasCleanupExecutionClientVersion}, freshRequests: map[int64]bool{task.ItemID: true}, prefetched: prefetched})
 	if result.status != 200 || result.body["delete"] != true {
 		t.Fatalf("original observation: %+v", result)
 	}

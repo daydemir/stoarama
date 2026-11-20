@@ -349,7 +349,7 @@ func seedLegacyBatchPermit(t *testing.T, f *cleanupFixture, task cleanupTask, ob
 	}
 	defer tx.Rollback(f.ctx)
 	result := f.s.cleanupObserveOne(f.ctx, tx, 13, task.ItemID, observation, &cleanupObserveEnv{
-		master:        cleanupMasterOn(f.ctx, tx),
+		authority:     cleanupAuthorityTentative,
 		session:       cleanupClientSession{boot: "fixture-boot", version: f.version},
 		freshRequests: map[int64]bool{task.ItemID: true}, prefetched: prefetched,
 	})

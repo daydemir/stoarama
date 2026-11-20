@@ -101,7 +101,7 @@ func TestNASCleanupDryRunMD5ETagRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := h.s.cleanupObserveOne(h.ctx, tx, 13, ht[0].ItemID, cleanupObserve{Attempt: ht[0].Attempt, PlanSHA: ht[0].PlanSHA, Outcome: "match", Proof: fixtureProof(ht[0].Item)}, &cleanupObserveEnv{master: cleanupMasterOn(h.ctx, tx)})
+	r := h.s.cleanupObserveOne(h.ctx, tx, 13, ht[0].ItemID, cleanupObserve{Attempt: ht[0].Attempt, PlanSHA: ht[0].PlanSHA, Outcome: "match", Proof: fixtureProof(ht[0].Item)}, &cleanupObserveEnv{authority: cleanupAuthorityTentative})
 	tx.Rollback(h.ctx)
 	if r.status != 200 || r.body["recovery"] != "unchecked" {
 		t.Fatalf("no recovery store: %d %v", r.status, r.body)
@@ -173,7 +173,7 @@ func TestNASCleanupDryRunRecoveryIsParallelBoundedAndOutsideLocks(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := g.s.cleanupObserveOne(g.ctx, tx, 13, tasks[0].ItemID, cleanupObserve{Attempt: tasks[0].Attempt, PlanSHA: tasks[0].PlanSHA, Outcome: "match", Proof: fixtureProof(tasks[0].Item)}, &cleanupObserveEnv{master: cleanupMasterOn(g.ctx, tx)})
+	r := g.s.cleanupObserveOne(g.ctx, tx, 13, tasks[0].ItemID, cleanupObserve{Attempt: tasks[0].Attempt, PlanSHA: tasks[0].PlanSHA, Outcome: "match", Proof: fixtureProof(tasks[0].Item)}, &cleanupObserveEnv{authority: cleanupAuthorityTentative})
 	tx.Rollback(context.Background())
 	if gets, heads := g.bucket.counts(); r.status != 503 || gets != 0 || heads != 0 {
 		t.Fatalf("observation without prefetch: %d gets %d heads %d", r.status, gets, heads)
@@ -427,7 +427,7 @@ func TestNASCleanupDryRunRecoveryRecheckFencesChanges(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			env.master = cleanupMasterOn(f.ctx, tx)
+			env.authority = cleanupAuthorityTentative
 			result := f.s.cleanupObserveOne(f.ctx, tx, 13, id, req, env)
 			if result.write || result.body["delete"] == true {
 				t.Fatalf("changed evidence used: %+v", result)

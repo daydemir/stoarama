@@ -135,20 +135,36 @@ func TestNASCleanupMasterDispatchMethodsURLsAndControllerCredential(t *testing.T
 func TestNASCleanupMasterDispatchRequiresRequestedTypedState(t *testing.T) {
 	cfg := config.Config{NASCleanupControllerToken: "controller-token-32-bytes-long-000000"}
 	for name, reply := range map[string]map[string]any{
-		"state unchanged":     masterReply(false, false),
-		"opposite of request": masterReply(true, false),
-		"no after":            {"changed": true},
-		"after without bool":  {"before": map[string]any{"enabled": false}, "after": map[string]any{"actor": "x"}},
-		"wrong after type":    {"after": "on"},
-		"empty reply":         {},
-		"status-only shape":   {"ok": true},
-		"other enabled value": {"after": map[string]any{"enabled": "true"}},
+		"state unchanged":             masterReply(false, false),
+		"opposite of request":         masterReply(true, false),
+		"no after":                    {"changed": true},
+		"after without bool":          {"before": map[string]any{"enabled": false}, "after": map[string]any{"actor": "x"}},
+		"wrong after type":            {"after": "on"},
+		"empty reply":                 {},
+		"status-only shape":           {"ok": true},
+		"other enabled value":         {"after": map[string]any{"enabled": "true"}},
+		"explicit null":               {"after": map[string]any{"enabled": nil}},
+		"null after":                  {"after": nil},
+		"before but no after enabled": {"before": map[string]any{"enabled": false}, "after": map[string]any{}},
 	} {
 		do := func(method, base, token, path string, body any) (map[string]any, error) {
 			return reply, nil
 		}
 		if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"on", "--reason", "why", "--backend-api-url", "https://api.test"}, do); err == nil {
 			t.Fatalf("%s accepted as a proven ON", name)
+		}
+	}
+	// A missing or null after.enabled must fail for OFF too, not read as false.
+	for name, reply := range map[string]map[string]any{
+		"off with null enabled":    {"after": map[string]any{"enabled": nil}, "changed": true},
+		"off with no after":        {"changed": true},
+		"off with no after object": {"ok": true},
+	} {
+		do := func(method, base, token, path string, body any) (map[string]any, error) {
+			return reply, nil
+		}
+		if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"off", "--reason", "why", "--backend-api-url", "https://api.test"}, do); err == nil {
+			t.Fatalf("%s accepted as a proven OFF", name)
 		}
 	}
 	// A repeated ON (nothing to change) still proves the switch is ON.
@@ -187,6 +203,10 @@ func TestNASCleanupMasterDispatchStopsOnFlagErrors(t *testing.T) {
 		{"off", "--reason", "stop", "--backend"},
 		{"off", "--reason", "stop", "extra"},
 		{"agent", "--reason", "stop"},
+		{"off", "--reason", "a", "--reason", "b", "--backend-api-url", "https://api.test"},
+		{"off", "--reason=a", "--reason=b", "--backend-api-url", "https://api.test"},
+		{"status", "--backend-api-url", "https://a.test", "--backend-api-url", "https://b.test"},
+		{"status", "--backend-api-url=https://a.test", "--backend-api-url=https://b.test"},
 		{},
 	} {
 		if err := nasCleanupMasterDispatch(context.Background(), cfg, args, do); err == nil {
@@ -333,5 +353,56 @@ func TestNASCleanupMasterRequestRefusesRedirectsAndLeaksNothing(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "controller-token") {
 		t.Fatalf("error leaked the credential: %v", err)
+	}
+}
+
+// A controller status read is a bodyless GET. The coding error of attaching a
+// payload to it must fail locally instead of reaching the server.
+func TestNASCleanupMasterRequestGetCarriesNoBody(t *testing.T) {
+	var reached int
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached++
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"enabled":false}`))
+	}))
+	defer origin.Close()
+	oldTransport := nasCleanupMasterTransport
+	nasCleanupMasterTransport = origin.Client().Transport
+	defer func() { nasCleanupMasterTransport = oldTransport }()
+	ctx := context.Background()
+	if _, err := nasCleanupMasterRequest(ctx, http.MethodGet, origin.URL, "controller-token-32-bytes-long-000000", nasCleanupMasterPath, map[string]any{"enabled": true}); err == nil {
+		t.Fatal("a GET with a body was allowed")
+	}
+	if reached != 0 {
+		t.Fatalf("a body-carrying GET reached the server: %d", reached)
+	}
+	if _, err := nasCleanupMasterRequest(ctx, http.MethodGet, origin.URL, "controller-token-32-bytes-long-000000", nasCleanupMasterPath, nil); err != nil {
+		t.Fatalf("bodyless GET rejected: %v", err)
+	}
+	if reached != 1 {
+		t.Fatalf("bodyless GET did not reach the server: %d", reached)
+	}
+}
+
+// Repeated flags are refused before dispatch; a single occurrence still works.
+func TestNASCleanupMasterRepeatedFlag(t *testing.T) {
+	for _, args := range [][]string{
+		{"--reason", "a", "--reason", "b"},
+		{"--reason=a", "--reason=b"},
+		{"--backend-api-url", "https://a.test", "--backend-api-url", "https://b.test"},
+		{"--backend-api-url=https://a.test", "--backend-api-url=https://b.test"},
+	} {
+		if err := nasCleanupMasterRepeatedFlag(args); err == nil {
+			t.Fatalf("repeated flag %v accepted", args)
+		}
+	}
+	for _, args := range [][]string{
+		{"--reason", "a"},
+		{"--reason", "a", "--backend-api-url", "https://api.test"},
+		{"--unknown", "--unknown"},
+	} {
+		if err := nasCleanupMasterRepeatedFlag(args); err != nil {
+			t.Fatalf("distinct/unknown flags %v refused: %v", args, err)
+		}
 	}
 }

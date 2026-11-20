@@ -13,10 +13,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// cleanupMasterReadSQL is the authoritative FOR SHARE read. It is the only
-// statement allowed to take the master row lock on a deletion path.
-const cleanupMasterReadSQL = `SELECT enabled FROM nas_cleanup_master FOR SHARE`
-
 // cleanupMasterLocksWhileWaiting counts backends that already hold the master
 // row lock and are now blocked on some other fence. Every one of them would
 // make an emergency OFF queue behind that fence, which is exactly the latency
@@ -255,6 +251,18 @@ func (o *cleanupQueryOrder) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d 
 }
 
 func (o *cleanupQueryOrder) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// since returns the SQL of every statement after position i.
+func (o *cleanupQueryOrder) since(i int) []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if i+1 >= len(o.sql) {
+		return nil
+	}
+	out := make([]string, len(o.sql)-i-1)
+	copy(out, o.sql[i+1:])
+	return out
+}
 
 // index returns the first statement containing every fragment, or -1.
 func (o *cleanupQueryOrder) index(fragments ...string) int {
@@ -561,4 +569,67 @@ func planModes(t *testing.T, pool interface {
 		t.Fatal(err)
 	}
 	return modes
+}
+
+// The authoritative master read must be the last statement that can block before
+// the commit: no SQL and no lock acquisition may follow it, or an emergency OFF
+// queues behind that work. This traces a real execution observation and requires
+// the read to come after the fences, the rank replay, the aborted-stage lookup and
+// the tentative item write, with only COMMIT/ROLLBACK after it.
+func TestNASCleanupObservationDoesNoSQLOrLockingAfterTheMasterRead(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	plan, sha, _ := f.admit("order-after-master", syntheticFiles(100, 4, 10))
+	f.dryRun()
+	setCleanupMaster(t, f.s, true)
+	if code, body := f.enableBatch([]int64{plan}, []string{sha}, 2); code != 200 {
+		t.Fatalf("batch enable: %d %s", code, body)
+	}
+	tasks := f.leaseV2(8, 1, int64(1)<<40, "")
+	if len(tasks) == 0 || tasks[0].ApprovedProof == nil {
+		t.Fatalf("no execution task: %+v", tasks)
+	}
+	task := tasks[0]
+	ctx, cancel := context.WithTimeout(f.ctx, 60*time.Second)
+	defer cancel()
+	order := &cleanupQueryOrder{}
+	cfg := f.pool.Config()
+	cfg.ConnConfig.Tracer = order
+	traced, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer traced.Close()
+	// The traced pool backs the real handler, including its R2 prefetch.
+	f.s = &Server{pool: traced, r2: f.s.r2, cfg: f.s.cfg, nasCleanupReportCache: f.s.nasCleanupReportCache}
+	results := f.observe([]cleanupTask{task}, nil)
+	if len(results) != 1 || results[0].Status != 200 || !results[0].Delete {
+		t.Fatalf("observation did not issue: %+v", results)
+	}
+	master := order.index(cleanupMasterReadSQL)
+	if master < 0 {
+		t.Fatalf("no authoritative master read: %v", order.sql)
+	}
+	for _, earlier := range []struct {
+		name  string
+		match []string
+	}{
+		{"item fence", []string{"FOR UPDATE OF i"}},
+		{"budget advisory lock", []string{"pg_advisory_xact_lock($"}},
+		{"tentative item write", []string{"UPDATE nas_cleanup_items"}},
+	} {
+		at := order.index(earlier.match...)
+		if at < 0 {
+			t.Fatalf("this observation never ran its %s", earlier.name)
+		}
+		if at > master {
+			t.Fatalf("%s at %d ran after the master read at %d", earlier.name, at, master)
+		}
+	}
+	for _, sql := range order.since(master) {
+		upper := strings.ToUpper(strings.TrimSpace(sql))
+		if strings.HasPrefix(upper, "COMMIT") || strings.HasPrefix(upper, "ROLLBACK") {
+			continue
+		}
+		t.Fatalf("SQL after the master read: %q", sql)
+	}
 }

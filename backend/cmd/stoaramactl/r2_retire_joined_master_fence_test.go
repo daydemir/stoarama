@@ -129,14 +129,12 @@ func TestR2JoinedCancelApplyIdleFenceReadsMasterOnTheApplyTransaction(t *testing
 	}
 }
 
-// The idle window can change while the apply transaction waits for its locks:
-// a plan enable that already read the master ON can commit an enabled plan and
-// then an OFF can land ahead of the apply transaction in the master lock queue.
-// Reading OFF alone would accept a window that is no longer idle. The fence
-// therefore holds the cleanup public fence (which every enable/advance path
-// takes exclusively) and re-checks the window after reading the master, so the
-// retirement can never write while a cleanup plan is enabled.
-func TestR2JoinedCancelIdleWindowIsNotStaleAcrossTheMasterWait(t *testing.T) {
+// The idle probe must be serialized against every cleanup path, not only against
+// enable/advance: a lease or a dry-run observation takes the public fence shared,
+// so an exclusive fence is what makes the window stable. This starts a shared
+// public-fence holder (the shape of a lease/observation), and requires the apply
+// fence to wait for it rather than probe a window that can still change.
+func TestR2JoinedCancelFenceSerializesAgainstSharedCleanupReaders(t *testing.T) {
 	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
 	if databaseURL == "" {
 		t.Skip("set STOARAMA_TEST_DATABASE_URL to run the joined-writer fence regression")
@@ -148,13 +146,11 @@ func TestR2JoinedCancelIdleWindowIsNotStaleAcrossTheMasterWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer admin.Close()
-	schema := fmt.Sprintf("joined_idle_stale_%d", time.Now().UnixNano())
+	schema := fmt.Sprintf("joined_fence_shared_%d", time.Now().UnixNano())
 	if _, err := admin.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
 		t.Fatal(err)
 	}
 	var conns []*pgx.Conn
-	// Close every connection before dropping: DROP waits for open sessions that
-	// still hold locks on the schema's objects.
 	t.Cleanup(func() {
 		for _, c := range conns {
 			c.Close(context.Background())
@@ -181,43 +177,19 @@ func TestR2JoinedCancelIdleWindowIsNotStaleAcrossTheMasterWait(t *testing.T) {
 		CREATE TABLE nas_cleanup_batches(id bigint PRIMARY KEY, mode text NOT NULL);
 		CREATE TABLE nas_cleanup_items(id bigint PRIMARY KEY, state text NOT NULL);
 		CREATE TABLE nas_cleanup_master(singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), enabled boolean NOT NULL);
-		INSERT INTO nas_cleanup_master(enabled) VALUES(true);
+		INSERT INTO nas_cleanup_master(enabled) VALUES(false);
 	`); err != nil {
 		t.Fatal(err)
 	}
-	waitForLock := func(pid uint32, doing string) {
-		t.Helper()
-		deadline := time.Now().Add(10 * time.Second)
-		var last string
-		for time.Now().Before(deadline) {
-			var waiting bool
-			if err := setup.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND wait_event_type='Lock')`, int32(pid)).Scan(&waiting); err != nil {
-				t.Fatal(err)
-			}
-			if waiting {
-				return
-			}
-			_ = setup.QueryRow(ctx, `SELECT state||'/'||coalesce(wait_event_type,'-')||'/'||left(coalesce(query,''),40) FROM pg_stat_activity WHERE pid=$1`, int32(pid)).Scan(&last)
-			time.Sleep(5 * time.Millisecond)
-		}
-		t.Fatalf("%s never queued on its lock (last state %q)", doing, last)
-	}
-
-	// E: a plan enable. It takes the exclusive public fence (as every enable
-	// path does) and reads the master ON, so its window is still open.
-	enable := connect()
-	if _, err := enable.Exec(ctx, `BEGIN`); err != nil {
+	// A shared holder, exactly as a lease/dry-run observation fences itself.
+	reader := connect()
+	if _, err := reader.Exec(ctx, `BEGIN`); err != nil {
 		t.Fatal(err)
 	}
-	defer enable.Exec(context.Background(), `ROLLBACK`)
-	if _, err := enable.Exec(ctx, `SELECT pg_advisory_xact_lock(7343226011101)`); err != nil {
+	defer reader.Exec(context.Background(), `ROLLBACK`)
+	if _, err := reader.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011101)`); err != nil {
 		t.Fatal(err)
 	}
-	var on bool
-	if err := enable.QueryRow(ctx, `SELECT enabled FROM nas_cleanup_master FOR SHARE`).Scan(&on); err != nil || !on {
-		t.Fatalf("enable master read: %t %v", on, err)
-	}
-	// A: the apply transaction, which must wait on E's public fence.
 	apply := connect()
 	applyTx, err := apply.Begin(ctx)
 	if err != nil {
@@ -226,39 +198,89 @@ func TestR2JoinedCancelIdleWindowIsNotStaleAcrossTheMasterWait(t *testing.T) {
 	defer applyTx.Rollback(context.Background())
 	applyDone := make(chan error, 1)
 	go func() { applyDone <- r2JoinedApplyIdleFence(ctx, applyTx) }()
-	waitForLock(apply.PgConn().PID(), "the apply transaction")
+	// It must queue on the fence rather than complete against a changing window.
+	deadline := time.Now().Add(10 * time.Second)
+	queued := false
+	for time.Now().Before(deadline) {
+		var waiting bool
+		if err := setup.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND wait_event_type='Lock')`, int32(apply.PgConn().PID())).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			queued = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !queued {
+		t.Fatal("the apply fence did not serialize against a shared cleanup reader")
+	}
+	if _, err := reader.Exec(ctx, `COMMIT`); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-applyDone; err != nil {
+		t.Fatalf("apply fence with an idle window after the reader finished: %v", err)
+	}
+}
 
-	// E commits an enabled plan and flips the master OFF (an emergency OFF does
-	// not pause plans) while the apply transaction waits on the fence.
-	if _, err := enable.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,mode) VALUES(1,'enabled')`); err != nil {
-		t.Fatal(err)
+// A lease or observation that is still outstanding is not idle, and the check
+// now runs under the exclusive fence. Removing either property fails this.
+func TestR2JoinedCancelRefusesOutstandingCleanupWork(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL to run the joined-writer fence regression")
 	}
-	if _, err := enable.Exec(ctx, `UPDATE nas_cleanup_master SET enabled=false`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := enable.Exec(ctx, `COMMIT`); err != nil {
-		t.Fatal(err)
-	}
-	err = <-applyDone
-	if err == nil {
-		t.Fatal("a stale idle window was accepted with an enabled plan committed during the wait")
-	}
-	if !strings.Contains(err.Error(), "global-idle") {
-		t.Fatalf("wrong refusal for the stale window: %v", err)
-	}
-	if rbErr := applyTx.Rollback(ctx); rbErr != nil {
-		t.Fatal(rbErr)
-	}
-	// The same fence with an idle window still refuses when the master is ON.
-	if _, err := setup.Exec(ctx, `DELETE FROM nas_cleanup_plans; UPDATE nas_cleanup_master SET enabled=true`); err != nil {
-		t.Fatal(err)
-	}
-	tx2, err := apply.Begin(ctx)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	admin, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx2.Rollback(context.Background())
-	if err := r2JoinedApplyIdleFence(ctx, tx2); err == nil || !strings.Contains(err.Error(), "master OFF") {
-		t.Fatalf("master ON accepted for joined writer retirement: %v", err)
+	defer admin.Close()
+	schema := fmt.Sprintf("joined_fence_busy_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = admin.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`) }()
+	cfg, err := pgx.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.RuntimeParams["search_path"] = schema
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE nas_cleanup_plans(id bigint PRIMARY KEY, mode text NOT NULL);
+		CREATE TABLE nas_cleanup_batches(id bigint PRIMARY KEY, mode text NOT NULL);
+		CREATE TABLE nas_cleanup_items(id bigint PRIMARY KEY, state text NOT NULL);
+		CREATE TABLE nas_cleanup_master(singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), enabled boolean NOT NULL);
+		INSERT INTO nas_cleanup_master(enabled) VALUES(false);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	for name, sql := range map[string]string{
+		"enabled plan":  `INSERT INTO nas_cleanup_plans(id,mode) VALUES(1,'enabled')`,
+		"enabled batch": `INSERT INTO nas_cleanup_batches(id,mode) VALUES(1,'enabled')`,
+		"leased item":   `INSERT INTO nas_cleanup_items(id,state) VALUES(1,'leased')`,
+		"issued permit": `INSERT INTO nas_cleanup_items(id,state) VALUES(1,'delete_issued')`,
+	} {
+		if _, err := conn.Exec(ctx, `DELETE FROM nas_cleanup_plans; DELETE FROM nas_cleanup_batches; DELETE FROM nas_cleanup_items`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ferr := r2JoinedApplyIdleFence(ctx, tx)
+		tx.Rollback(ctx)
+		if ferr == nil || !strings.Contains(ferr.Error(), "global-idle") {
+			t.Fatalf("%s was treated as an idle window: %v", name, ferr)
+		}
 	}
 }

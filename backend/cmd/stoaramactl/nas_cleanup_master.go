@@ -82,20 +82,50 @@ func nasCleanupMasterBaseURL(raw string) (string, error) {
 	return "https://" + u.Host, nil
 }
 
-// nasCleanupMasterChange is the typed state the API reports for the master
-// control. Only the authoritative `after.enabled` value proves a change landed.
+// nasCleanupMasterChange is the typed reply the API returns for a master flip.
+// Only the authoritative `after.enabled` value proves the requested state, so
+// every field is a pointer: a missing field and an explicit JSON null both
+// decode to nil and are refused identically for OFF and ON. A plain bool would
+// silently accept either as false and "confirm" an OFF that never happened.
 type nasCleanupMasterChange struct {
-	Before struct {
-		Enabled bool `json:"enabled"`
+	Before *struct {
+		Enabled *bool `json:"enabled"`
 	} `json:"before"`
-	After struct {
-		Enabled   bool   `json:"enabled"`
-		ChangedAt string `json:"changed_at"`
-		Actor     string `json:"actor"`
-		ClaimedBy string `json:"claimed_by"`
-		Reason    string `json:"reason"`
+	After *struct {
+		Enabled   *bool   `json:"enabled"`
+		ChangedAt *string `json:"changed_at"`
+		Actor     *string `json:"actor"`
+		ClaimedBy *string `json:"claimed_by"`
+		Reason    *string `json:"reason"`
 	} `json:"after"`
 	Changed bool `json:"changed"`
+}
+
+// nasCleanupMasterRepeatedFlag refuses any flag supplied more than once, in
+// either `--flag value` or `--flag=value` form. Only the two flags this command
+// defines are considered, so the check can run before parsing and without a
+// flag set.
+func nasCleanupMasterRepeatedFlag(args []string) error {
+	seen := map[string]bool{}
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "-") || arg == "-" || arg == "--" {
+			continue
+		}
+		name := strings.TrimLeft(arg, "-")
+		if n := strings.IndexByte(name, '='); n >= 0 {
+			name = name[:n]
+		}
+		switch name {
+		case "reason", "backend-api-url":
+		default:
+			continue // unknown flags are the flag set's error, not ours
+		}
+		if seen[name] {
+			return errors.New("--" + name + " given more than once")
+		}
+		seen[name] = true
+	}
+	return nil
 }
 
 // nasCleanupMasterDispatch is the testable command body: it parses args and
@@ -109,6 +139,12 @@ func nasCleanupMasterDispatch(ctx context.Context, cfg config.Config, args []str
 	action := nasCleanupMasterAction(args[0])
 	if action != nasCleanupMasterStatus && action != nasCleanupMasterOn && action != nasCleanupMasterOff {
 		return errors.New(nasCleanupMasterUsage)
+	}
+	// Reject a repeated flag before parsing: Go's flag package silently keeps
+	// the last value, so `--reason a --reason b` would hide which reason the
+	// operator meant to record.
+	if err := nasCleanupMasterRepeatedFlag(args[1:]); err != nil {
+		return err
 	}
 	fs := flag.NewFlagSet("nas-cleanup master "+args[0], flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -165,21 +201,28 @@ func nasCleanupMasterDispatch(ctx context.Context, cfg config.Config, args []str
 	if err != nil {
 		return err
 	}
-	if want := action == nasCleanupMasterOn; state.After.Enabled != want {
-		return fmt.Errorf("master %s not applied: server reports enabled=%t", action, state.After.Enabled)
+	if want := action == nasCleanupMasterOn; *state.After.Enabled != want {
+		return fmt.Errorf("master %s not applied: server reports enabled=%t", action, *state.After.Enabled)
 	}
 	printJSON(out)
 	return nil
 }
 
+// nasCleanupMasterState decodes the typed reply and requires the authoritative
+// `after.enabled` boolean to be present as a boolean. A missing `after`, a
+// missing field, an explicit JSON null and a non-boolean (such as the string
+// "true") are all refused: none of them proves the requested state.
 func nasCleanupMasterState(out map[string]any) (nasCleanupMasterChange, error) {
 	var state nasCleanupMasterChange
 	raw, err := json.Marshal(out)
-	if err != nil || json.Unmarshal(raw, &state) != nil {
+	if err != nil {
 		return state, errors.New("master response not understood")
 	}
-	if _, ok := out["after"]; !ok {
-		return state, errors.New("master response has no authoritative state")
+	if err = json.Unmarshal(raw, &state); err != nil {
+		return state, errors.New("master response not understood")
+	}
+	if state.After == nil || state.After.Enabled == nil {
+		return state, errors.New("master response has no authoritative enabled state")
 	}
 	return state, nil
 }
@@ -196,10 +239,15 @@ func nasCleanupMasterRefuseRedirect(*http.Request, []*http.Request) error {
 
 // nasCleanupMasterRequest performs the controller request itself. It refuses
 // every redirect so the bearer credential can never be replayed to another
-// origin or path, and it surfaces the HTTP status as an error.
+// origin or path, and it surfaces the HTTP status as an error. A status read is
+// a bodyless GET: sending a body with GET is meaningless and some proxies
+// reject it, so it is refused here rather than at the server.
 func nasCleanupMasterRequest(ctx context.Context, method, base, token, path string, payload any) (map[string]any, error) {
 	if strings.TrimSpace(method) == "" || strings.TrimSpace(token) == "" {
 		return nil, errors.New("controller request needs a method and credential")
+	}
+	if strings.EqualFold(method, http.MethodGet) && payload != nil {
+		return nil, errors.New("a controller status read carries no body")
 	}
 	endpoint, err := nasCleanupMasterBaseURL(base)
 	if err != nil {
