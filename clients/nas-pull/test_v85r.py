@@ -462,17 +462,12 @@ class V85rTests(unittest.TestCase):
         self.assertNotIn("python3 -B ", unit)
 
     def test_only_the_durham_measure_child_disables_its_bytecode_cache(self):
-        for kind, expected in ((pull.StitchRunKind.DURHAM_R2, True),
-                               (pull.StitchRunKind.PRODUCTION, False)):
+        tail = [str(ROOT / "v85r/runner.py"), str(ROOT / "request.json")]
+        for kind, expected in ((pull.StitchRunKind.DURHAM_R2,
+                                [sys.executable, "-X", "pycache_prefix=/dev/null", "-I", "-B", *tail]),
+                               (pull.StitchRunKind.PRODUCTION, [sys.executable, "-I", "-B", *tail])):
             stop = SimpleNamespace(kind=kind)
-            args = pull.stitch_measure_argv(ROOT / "v85r", ROOT / "request.json", stop)
-            self.assertEqual(args[1], "-I")
-            self.assertIn("-B", args)
-            self.assertEqual(["-X", "pycache_prefix=/dev/null"] if expected else [] ,
-                             args[1:1] + ([] if args[1] == "-X" else []) if False else (
-                                 ["-X", "pycache_prefix=/dev/null"] if "-X" in args else []))
-            self.assertEqual("-X" in args, expected)
-            self.assertEqual(args[-1], str(ROOT / "request.json"))
+            self.assertEqual(pull.stitch_measure_argv(ROOT / "v85r", ROOT / "request.json", stop), expected)
 
     @unittest.skipUnless(os.environ.get("V85R_DURHAM_TEST_BUNDLE"), "generated Durham bundle required")
     def test_native_durham_bundle_replays_frozen_october_evidence(self):
