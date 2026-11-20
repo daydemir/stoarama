@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -23,6 +24,7 @@ import (
 	webassets "github.com/daydemir/stoarama/backend/web"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -31,9 +33,22 @@ import (
 // every pinned generation.
 var errDeliveryPageRetired = errors.New("the public delivery page is retired")
 
+// errDeliveryPageNotServing means retirement is being armed: the quiesce state is
+// committed, so no NEW public request may start, but the page is not retired yet
+// and no exemption class has opened. The API answers 503, not 410.
+var errDeliveryPageNotServing = errors.New("the public delivery page is not serving")
+
 const globalDeliveryPrefix = "datasets/global-street-scores-delivery/47/"
 const publicGlobalDeliveryAPI = "/api/v1/global-street-scores-delivery"
 const globalDeliveryAPI = "/api/v1/account/global-street-scores-delivery"
+
+// deliveryPublicReaderTTL bounds one admitted public response's lease. It is the
+// hard ceiling on how long a crashed or abandoned response can delay retirement:
+// the lease is deleted as soon as the handler returns, so the normal case is
+// milliseconds, and this bound is only reached by a process that died mid-write.
+// It is longer than the API's 60s WriteTimeout, so a slow but live response never
+// loses its lease before its last socket write returns.
+const deliveryPublicReaderTTL = 2 * time.Minute
 
 type globalDeliveryObject struct {
 	Key         string `json:"key"`
@@ -65,81 +80,187 @@ type globalDeliveryObjectStore interface {
 	PresignGetExactDownloadRequest(context.Context, string, string, string, string, time.Duration) (r2.PresignedRequest, error)
 }
 
-// deliveryRetirementReader answers the one question the public serving path
-// asks: is the old delivery page retired right now? The pool implementation reads
-// r2_delivery_page_retired() live on every call; there is no cache.
-type deliveryRetirementReader interface {
-	DeliveryPageRetired(context.Context) (bool, error)
-}
-
-type poolDeliveryRetirement struct{ q deliveryKeepQuerier }
-
-func (p poolDeliveryRetirement) DeliveryPageRetired(ctx context.Context) (bool, error) {
-	var retired bool
-	if err := p.q.QueryRow(ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil {
-		return false, errors.New("delivery retirement state unavailable")
-	}
-	return retired, nil
-}
-
-// deliveryTicketLedger records a public download capability under the same lock
-// retirement takes, so a capability can never outlive the page that issued it.
-type deliveryTicketLedger interface {
+// deliveryPublicGate is the ONE shared/exclusive admission the public delivery
+// origin uses. The exclusive side is retirement (guard_r2_delivery_page_retirement
+// in 0225); the shared side is every public read, every ticket and publication.
+// The pool implementation is the product path; tests provide a stub. There is no
+// cache: retirement is a serving fact read live, and a reader that cannot prove
+// the page is serving is refused.
+type deliveryPublicGate interface {
+	// DeliveryServing reports the live serving state: (retired, serving).
+	DeliveryServing(context.Context) (bool, bool, error)
+	// AdmitPublicReader records one lease before the first body byte.
+	AdmitPublicReader(context.Context, string) error
+	// ReleasePublicReader drops this response's lease after its last write.
+	ReleasePublicReader(context.Context, string) error
+	// RecordPublicDeliveryTicket records a capability, or reports the page is
+	// no longer serving, in the same statement that checks it.
 	RecordPublicDeliveryTicket(context.Context, globalDeliveryObject, string, time.Duration) (bool, error)
 }
 
-type poolDeliveryTickets struct{ pool *pgxpool.Pool }
+type poolDeliveryGate struct{ pool *pgxpool.Pool }
 
-func (p poolDeliveryTickets) RecordPublicDeliveryTicket(ctx context.Context, object globalDeliveryObject, pathSHA string, ttl time.Duration) (bool, error) {
-	tx, err := p.pool.Begin(ctx)
+// DeliveryServing reads both live facts in one statement. r2_delivery_public_serving()
+// is the SQL function the retirement trigger also requires, so the API and the
+// arm gate can never disagree.
+func (p poolDeliveryGate) DeliveryServing(ctx context.Context) (bool, bool, error) {
+	var retired, serving bool
+	if err := p.pool.QueryRow(ctx, `SELECT r2_delivery_page_retired(),r2_delivery_public_serving()`).Scan(&retired, &serving); err != nil {
+		return false, false, errors.New("delivery serving state unavailable")
+	}
+	return retired, serving, nil
+}
+
+// AdmitPublicReader commits one lease row before the handler reads any registry,
+// metadata, ticket or file. 0225's admission trigger takes the shared public lock
+// and refuses unless the page is serving at that instant, so a reader admitted
+// after quiesce is impossible and an admitted reader is visible to retirement.
+func (p poolDeliveryGate) AdmitPublicReader(ctx context.Context, readerID string) error {
+	_, err := p.pool.Exec(ctx, `INSERT INTO r2_delivery_public_readers(reader_id,expires_at)
+ VALUES($1,clock_timestamp()+$2::interval)`, readerID, deliveryPublicReaderTTL.String())
 	if err != nil {
-		return false, errors.New("delivery ticket ledger unavailable")
+		return err
 	}
-	defer tx.Rollback(context.Background())
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, deliveryTicketLock); err != nil {
-		return false, err
-	}
+	return nil
+}
+
+// ReleasePublicReader drops the lease. It uses a background context on purpose:
+// the request context is already cancelled by the time a streamed response ends,
+// and a failed release must not leave the page retired forever — the lease's own
+// expiry bounds that anyway.
+func (p poolDeliveryGate) ReleasePublicReader(ctx context.Context, readerID string) error {
+	_, err := p.pool.Exec(ctx, `DELETE FROM r2_delivery_public_readers WHERE reader_id=$1`, readerID)
+	return err
+}
+
+// deliveryPublicLock is r2_delivery_public_lock() in 0225, the ONE advisory key
+// shared by public reader admission, capability minting and registry publication
+// and taken exclusively by quiesce and retirement. It is a Go constant as well
+// because the API must take it without depending on the function existing in a
+// fixture schema, exactly as the neighbouring cleanup fence does. The two values
+// are asserted equal by TestDeliveryPublicLockMatchesSQL.
+const deliveryPublicLock int64 = 7343226011104
+
+// deliveryTicketTTL is the capability lifetime the page has always handed out.
+const deliveryTicketTTL = 5 * time.Minute
+
+// deliveryTicketTransferTTL is how long after a capability's own expiry a
+// transfer it authorised may still be reading bytes. A provider does not cut a
+// transfer that has already started, so retirement waits for this too. It is
+// recorded per ticket as last_byte_by, and the retirement trigger refuses while
+// any is unexpired, measured on the database clock.
+const deliveryTicketTransferTTL = 2 * time.Minute
+
+// RecordPublicDeliveryTicket writes the capability row in one statement. 0225's
+// admission trigger takes the shared public lock and requires the page to be
+// serving, so the row and the capability it describes cannot be separated from
+// retirement: either the row commits before retirement's exclusive lock, and
+// retirement drains it, or retirement wins and this statement raises instead.
+func (p poolDeliveryGate) RecordPublicDeliveryTicket(ctx context.Context, object globalDeliveryObject, pathSHA string, ttl time.Duration) (bool, error) {
 	var id int64
-	err = tx.QueryRow(ctx, `INSERT INTO r2_delivery_download_tickets(bucket,object_key,etag,size_bytes,object_path_sha256,expires_at)
- SELECT $1,$2,$3,$4,$5,clock_timestamp()+$6::interval
- WHERE NOT r2_delivery_page_retired() RETURNING id`,
-		"stoarama", object.Key, strings.Trim(object.ETag, `"`), object.SizeBytes, pathSHA, ttl.String()).Scan(&id)
+	err := p.pool.QueryRow(ctx, `INSERT INTO r2_delivery_download_tickets(bucket,object_key,etag,size_bytes,object_path_sha256,expires_at,last_byte_by)
+ SELECT $1,$2,$3,$4,$5,clock_timestamp()+$6::interval,clock_timestamp()+$7::interval
+ WHERE r2_delivery_public_serving() RETURNING id`,
+		"stoarama", object.Key, strings.Trim(object.ETag, `"`), object.SizeBytes, pathSHA,
+		ttl.String(), (ttl + deliveryTicketTransferTTL).String()).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
-		return false, err
+		// 55000 is the admission trigger refusing: the page stopped serving
+		// between the check and the insert. That is a refusal, not an outage.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "55000" {
+			return false, nil
+		}
+		return false, errors.New("delivery ticket ledger unavailable")
 	}
-	return true, tx.Commit(ctx)
+	return true, nil
+}
+
+// deliveryGate resolves the gate: the test stub when set, otherwise the pool.
+func (s *Server) deliveryGate() (deliveryPublicGate, error) {
+	if s.deliveryPublic != nil {
+		return s.deliveryPublic, nil
+	}
+	if s.pool == nil {
+		return nil, errors.New("delivery serving state unavailable")
+	}
+	return poolDeliveryGate{s.pool}, nil
 }
 
 // deliveryPageRetired reads the committed serving state live, on every call.
 // There is no cache and no bypass: retirement is a serving fact, not a claim.
 func (s *Server) deliveryPageRetired(ctx context.Context) (bool, error) {
-	if s.deliveryRetirement != nil {
-		return s.deliveryRetirement.DeliveryPageRetired(ctx)
+	gate, err := s.deliveryGate()
+	if err != nil {
+		return false, err
 	}
-	if s.pool == nil {
-		return false, errors.New("delivery retirement state unavailable")
-	}
-	return poolDeliveryRetirement{s.pool}.DeliveryPageRetired(ctx)
+	retired, _, err := gate.DeliveryServing(ctx)
+	return retired, err
 }
 
-// refuseRetiredPublicDelivery refuses a public delivery request while the page is
-// retired, before any HTML, registry, ticket or file byte is produced. A reader
-// that cannot answer refuses too: a serving path that cannot prove the page is up
-// must not serve it.
-func (s *Server) refuseRetiredPublicDelivery(w http.ResponseWriter, r *http.Request) bool {
-	retired, err := s.deliveryPageRetired(r.Context())
+// admitPublicDelivery is the ONE public admission for every delivery route. It
+// reads the live serving state, refuses with 410 when retired and 503 while
+// retirement is arming, then records a lease that retirement must drain. The
+// returned release must run after the response's last write; callers defer it.
+// A caller that cannot prove the page is serving refuses: fail closed.
+func (s *Server) admitPublicDelivery(w http.ResponseWriter, r *http.Request) (release func(), ok bool) {
+	gate, err := s.deliveryGate()
 	if err != nil {
 		util.WriteError(w, http.StatusServiceUnavailable, "Delivery availability is unavailable. Reload to retry.")
-		return true
+		return nil, false
+	}
+	retired, serving, err := gate.DeliveryServing(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "Delivery availability is unavailable. Reload to retry.")
+		return nil, false
 	}
 	if retired {
 		util.WriteError(w, http.StatusGone, "This dataset has been retired. See the published file list for NAS paths.")
-		return true
+		return nil, false
 	}
-	return false
+	if !serving {
+		util.WriteError(w, http.StatusServiceUnavailable, "This dataset is being taken offline. Reload in a few minutes.")
+		return nil, false
+	}
+	id, err := newDeliveryReaderID()
+	if err != nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "Delivery availability is unavailable. Reload to retry.")
+		return nil, false
+	}
+	if err = gate.AdmitPublicReader(r.Context(), id); err != nil {
+		// A 55000 is retirement arming in this instant: refuse as not serving.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "55000" {
+			util.WriteError(w, http.StatusServiceUnavailable, "This dataset is being taken offline. Reload in a few minutes.")
+			return nil, false
+		}
+		util.WriteError(w, http.StatusServiceUnavailable, "Delivery availability is unavailable. Reload to retry.")
+		return nil, false
+	}
+	return func() {
+		// Push every byte this handler wrote onto the socket BEFORE dropping the
+		// lease, so the lease spans the response through its last body write and
+		// not merely through the handler's return. net/http's own final flush
+		// after return writes only the terminating chunk, no body bytes.
+		if f, isFlusher := w.(http.Flusher); isFlusher {
+			f.Flush()
+		}
+		// The request context is done by now; the lease is still ours to drop.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = gate.ReleasePublicReader(ctx, id)
+	}, true
+}
+
+// newDeliveryReaderID is a 128-bit random lease id, the table's only key.
+func newDeliveryReaderID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 func (s *Server) globalDeliveryObjectStore() globalDeliveryObjectStore {
@@ -195,10 +316,11 @@ func (s *Server) loadGlobalDeliveryRegistry(ctx context.Context) (*globalDeliver
 	return s.loadGlobalDeliveryRegistryScope(ctx, false, "")
 }
 func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public bool, generation string) (*globalDeliveryRegistry, error) {
-	// A retired page serves nothing at all: no registry, for any generation. This
-	// check runs before the cleanup fence, before the cached current and pinned
-	// registries, and before any object read, so retirement cannot be bypassed by
-	// a warm cache or by pinning the generation that was serving.
+	// A retired page serves nothing at all: no registry, for any generation. A
+	// page being quiesced admits no NEW reader either. This check runs before the
+	// cleanup fence, before the cached current and pinned registries, and before
+	// any object read, so retirement cannot be bypassed by a warm cache or by
+	// pinning the generation that was serving.
 	if public {
 		retired, err := s.deliveryPageRetired(ctx)
 		if err != nil {
@@ -206,6 +328,17 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 		}
 		if retired {
 			return nil, errDeliveryPageRetired
+		}
+		gate, err := s.deliveryGate()
+		if err != nil {
+			return nil, err
+		}
+		_, serving, err := gate.DeliveryServing(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !serving {
+			return nil, errDeliveryPageNotServing
 		}
 	}
 	// While cleanup permits can be outstanding, serve the immutable reviewed
@@ -217,6 +350,13 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 			return nil, errors.New("public cleanup fence unavailable")
 		}
 		defer fence.Rollback(ctx)
+		// Publication is one more shared public read: it takes the same public
+		// lock every reader and ticket takes, so arming and retirement serialize
+		// against it and cannot commit while a publication is between its
+		// serving check and its hold write.
+		if _, err = fence.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, deliveryPublicLock); err != nil {
+			return nil, errors.New("public publication fence unavailable")
+		}
 		if _, err = fence.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011101)`); err != nil {
 			return nil, errors.New("public cleanup fence unavailable")
 		}
@@ -324,9 +464,13 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 	return &result, nil
 }
 func (s *Server) handleGlobalDeliveryPage(w http.ResponseWriter, r *http.Request) {
-	if s.refuseRetiredPublicDelivery(w, r) {
+	// Every public delivery response admits exactly one reader lease and holds it
+	// until its last socket write, so retirement cannot commit mid-response.
+	release, ok := s.admitPublicDelivery(w, r)
+	if !ok {
 		return
 	}
+	defer release()
 	pageName := "global-delivery/index.html"
 	if r.URL.Path == "/global-street-scores-delivery/files" {
 		pageName = "global-delivery/files.html"
@@ -340,9 +484,11 @@ func (s *Server) handleGlobalDeliveryPage(w http.ResponseWriter, r *http.Request
 	writeHTML(w, body)
 }
 func (s *Server) handleGlobalDeliveryStatic(w http.ResponseWriter, r *http.Request) {
-	if s.refuseRetiredPublicDelivery(w, r) {
+	release, ok := s.admitPublicDelivery(w, r)
+	if !ok {
 		return
 	}
+	defer release()
 	name := chi.URLParam(r, "*")
 	if name == "" || strings.Contains(name, "..") || strings.HasPrefix(name, "/") {
 		http.NotFound(w, r)
@@ -367,10 +513,25 @@ func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Reques
 	if !public && !authorizeGlobalDelivery(w, r) {
 		return
 	}
+	// A private account response is not the public origin: it takes no lease and
+	// reads no serving state, so the owner's own tooling still works after
+	// retirement. The public route admits and holds one lease for its whole body.
+	var release func()
+	if public {
+		var ok bool
+		if release, ok = s.admitPublicDelivery(w, r); !ok {
+			return
+		}
+		defer release()
+	}
 	registry, err := s.loadGlobalDeliveryRegistryScope(r.Context(), public, r.URL.Query().Get("generation"))
 	if err != nil {
 		if errors.Is(err, errDeliveryPageRetired) {
 			util.WriteError(w, http.StatusGone, "This dataset has been retired. See the published file list for NAS paths.")
+			return
+		}
+		if errors.Is(err, errDeliveryPageNotServing) {
+			util.WriteError(w, http.StatusServiceUnavailable, "This dataset is being taken offline. Reload in a few minutes.")
 			return
 		}
 		util.WriteError(w, http.StatusServiceUnavailable, "Verified dataset metadata is temporarily unavailable. Reload to retry.")
@@ -439,10 +600,17 @@ func (s *Server) globalDeliveryFile(w http.ResponseWriter, r *http.Request) (glo
 	if !public && !authorizeGlobalDelivery(w, r) {
 		return globalDeliveryObject{}, false
 	}
+	// The caller owns the reader lease and holds it across the response body. A
+	// ticket lookup is metadata only, but it still runs inside that lease so a
+	// retirement cannot arm between admission and the capability row.
 	registry, err := s.loadGlobalDeliveryRegistryScope(r.Context(), public, r.URL.Query().Get("generation"))
 	if err != nil {
 		if errors.Is(err, errDeliveryPageRetired) {
 			util.WriteError(w, http.StatusGone, "This dataset has been retired. See the published file list for NAS paths.")
+			return globalDeliveryObject{}, false
+		}
+		if errors.Is(err, errDeliveryPageNotServing) {
+			util.WriteError(w, http.StatusServiceUnavailable, "This dataset is being taken offline. Reload in a few minutes.")
 			return globalDeliveryObject{}, false
 		}
 		util.WriteError(w, http.StatusServiceUnavailable, "Verified file registry unavailable.")
@@ -472,28 +640,27 @@ func (s *Server) globalDeliveryFile(w http.ResponseWriter, r *http.Request) (glo
 	return object, true
 }
 
-// deliveryTicketLock serializes minting a public download capability against page
-// retirement. A ticket minted under the shared lock commits before retirement can
-// check its drain; retirement under the exclusive lock makes every later mint see
-// the retired row and refuse. Neither side can leave a live capability unrecorded.
-const deliveryTicketLock int64 = 7343226011104
-
-// deliveryTicketTTL is the capability lifetime the page has always handed out.
-const deliveryTicketTTL = 5 * time.Minute
-
-// deliveryTicketLedger opens the transaction that records a public download
-// capability. The pool is the ledger in production; tests provide a stub.
+// recordPublicTickets records a public capability against the live serving gate.
+// 0225's ticket trigger takes the shared public lock and requires the page to be
+// serving, so the row and the capability cannot be separated from retirement.
 func (s *Server) recordPublicTickets(ctx context.Context, object globalDeliveryObject, pathSHA string) (bool, error) {
-	if s.deliveryTickets != nil {
-		return s.deliveryTickets.RecordPublicDeliveryTicket(ctx, object, pathSHA, deliveryTicketTTL)
+	gate, err := s.deliveryGate()
+	if err != nil {
+		return false, err
 	}
-	if s.pool == nil {
-		return false, errors.New("delivery ticket ledger unavailable")
-	}
-	return poolDeliveryTickets{s.pool}.RecordPublicDeliveryTicket(ctx, object, pathSHA, deliveryTicketTTL)
+	return gate.RecordPublicDeliveryTicket(ctx, object, pathSHA, deliveryTicketTTL)
 }
 
 func (s *Server) handleGlobalDeliveryTicket(w http.ResponseWriter, r *http.Request) {
+	public := strings.HasPrefix(r.URL.Path, publicGlobalDeliveryAPI+"/")
+	var release func()
+	if public {
+		var ok bool
+		if release, ok = s.admitPublicDelivery(w, r); !ok {
+			return
+		}
+		defer release()
+	}
 	object, ok := s.globalDeliveryFile(w, r)
 	if !ok {
 		return
@@ -515,14 +682,14 @@ func (s *Server) handleGlobalDeliveryTicket(w http.ResponseWriter, r *http.Reque
 	pathSHA := sha256.Sum256([]byte(storageURL.EscapedPath()))
 	// A public capability is recorded before it is handed out, so a retirement
 	// that follows is guaranteed to see and drain it.
-	if strings.HasPrefix(r.URL.Path, publicGlobalDeliveryAPI+"/") {
+	if public {
 		minted, err := s.recordPublicTickets(r.Context(), object, hex.EncodeToString(pathSHA[:]))
 		if err != nil {
 			util.WriteError(w, http.StatusServiceUnavailable, "Download capability unavailable.")
 			return
 		}
 		if !minted {
-			util.WriteError(w, http.StatusGone, "This dataset has been retired. See the published file list for NAS paths.")
+			util.WriteError(w, http.StatusServiceUnavailable, "This dataset is being taken offline. Reload in a few minutes.")
 			return
 		}
 	}
@@ -536,6 +703,16 @@ func (s *Server) handleGlobalDeliveryTicket(w http.ResponseWriter, r *http.Reque
 	util.WriteJSON(w, http.StatusOK, map[string]any{"transport": "r2-direct", "url": capability.URL, "storage_host": storageURL.Hostname(), "object_path_sha256": hex.EncodeToString(pathSHA[:]), "expires_at": time.Now().Add(deliveryTicketTTL).Unix(), "required_headers": headers, "etag": `"` + strings.Trim(object.ETag, `"`) + `"`, "sha256": object.SHA256, "size_bytes": object.SizeBytes, "filename": path.Base(object.Path), "ttl_seconds": int(deliveryTicketTTL.Seconds())})
 }
 func (s *Server) handleGlobalDeliveryFile(w http.ResponseWriter, r *http.Request) {
+	public := strings.HasPrefix(r.URL.Path, publicGlobalDeliveryAPI+"/")
+	var release func()
+	if public {
+		var ok bool
+		if release, ok = s.admitPublicDelivery(w, r); !ok {
+			return
+		}
+		// Held across the whole streamed body, through its last socket write.
+		defer release()
+	}
 	object, ok := s.globalDeliveryFile(w, r)
 	if !ok {
 		return

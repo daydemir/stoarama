@@ -352,10 +352,14 @@ approval is recorded first, by its own command with the owner's decision text;
 seeding only consumes it and refuses a roster with no approval for its exact
 class, digest and decision. The seed also recomputes each row's class with the
 collated executor's own live classifier (inside vs outside the stream's keep
-window, or a confident repair) and refuses the whole roster on any disagree. It
-is append-only. If the page row's identity ever drifts, the key is held again;
-the partition compares the listing's ETag and size against the exempt identity
-before reporting a candidate.
+window, or a confident repair) and refuses the whole roster on any disagree. The
+read-only `r2-inverse validate` step runs that SAME decision before any approval
+exists, so the owner only ever approves a digest the wire would accept; the
+documented roster SQL is candidate generation, never validation. Exemptions,
+approvals, the quiesce row and the retirement row are append-only. If the page
+row's identity ever drifts, the key is held again; the partition compares the
+listing's ETag and size against the exempt identity before reporting a
+candidate.
 
 Seeding requires a positive, window-bound, non-keep-everything owner decision
 for the page recording's stream *and* for the output's own stream; a missing
@@ -384,31 +388,129 @@ retire as `collated`. Receipts carry `owner_delivery_page_<class>`.
 
 ### Controller order
 
-1. Build a class roster read-only (below) and pin its SHA-256. Record the
-   owner's approval for that digest as its own step, under exactly one class:
-   `stoaramactl r2-inverse approve --class CLASS --roster-sha256 HEX
-   --decision TEXT`. Seeding never creates an approval.
-2. Seed the class from the pinned roster:
+0. Take the old public page's **legacy origins** out of traffic first. Nothing in
+   this section can make an origin that is still in front of the page stop
+   serving: the API enforces the retirement state on its own routes, and any
+   handled origin must be removed by whoever owns it. Prove the removal, not a
+   promise:
+
+   - every legacy hostname/CDN route/redirect/custom domain that resolves to the
+     delivery page or its R2 keys is removed or returns nothing, checked with
+     `dig`/`curl -sSI` from off-host and recorded with the timestamp;
+   - the R2 bucket has no public bucket-level domain, no worker route and no
+     lifecycle rule that republishes the delivery prefix;
+   - `public/current.json` still names the generation this run retires, so the
+     retired generation and the removed origin are the same object.
+
+   **No rollback to a legacy origin after arming.** `page-quiesce` is the point
+   of no return: the numbers below describe the only safe path forward.
+
+1. Build a class roster read-only (below) and pin its SHA-256. The roster SQL
+   only GENERATES candidates. Before the owner sees a digest, run the read-only
+   validator, which applies the collated executor's own live classifier and
+   writes nothing:
+
+   ```
+   stoaramactl r2-inverse validate --class CLASS --roster FILE \
+     --expected-roster-sha256 HEX --picks docs/records/r2-picks-20261118.json \
+     --expected-picks-sha256 HEX
+   ```
+
+   It refuses the whole roster on the first candidate the classifier holds, so a
+   mixed-source window (any source in the pinned window makes the output
+   `in_window`), a keep-everything page or output stream, a KE folder component
+   in the stored path, an identity drift or any other hold cannot be approved as
+   the wrong class. A candidate roster the validator refuses is not approved
+   again with a widened query: report the difference to Deniz.
+2. Record the owner's approval for the validated digest as its own step, under
+   exactly one class: `stoaramactl r2-inverse approve --class CLASS
+   --roster-sha256 HEX --decision TEXT`. Seeding never creates an approval.
+3. Seed the class from the pinned roster:
    `stoaramactl r2-inverse exempt --class CLASS --roster FILE
    --expected-roster-sha256 HEX --picks docs/records/r2-picks-20261118.json
    --expected-picks-sha256 HEX`. The whole roster is admitted in one
    transaction, or nothing is, and every row references the approval recorded
-   above for that class and digest.
-3. `outside_window` can be seeded and retired now:
+   above for that class and digest. It re-runs the same decision the validator
+   ran, so a roster that changed after validation is refused.
+4. `outside_window` can be seeded and retired now:
    `stoaramactl r2-inverse job-collated ...`.
-4. Handoff (a) and (b): the in-window videos are copied and certified on the
+5. Handoff (a) and (b): the in-window videos are copied and certified on the
    NAS and the static CSV+JSON manifest of old links to NAS paths is published.
-5. Handoff (c): take the old page down, then run
-   `stoaramactl r2-inverse page-retired --generation HEX32 --decision TEXT`
-   once. Every public delivery route reads that one committed row live, so the
-   command *is* the page going down: the page, its metadata, download tickets
-   and file responses all refuse from then on, for the current and for every
-   pinned generation. It refuses while any issued download ticket is still
-   unexpired, so the outstanding capabilities drain first.
-   `r2_delivery_page_retired()` reads exactly that row. This opens
-   `confident_repair`.
-6. Seed `confident_repair` and run the collated job. Seed `in_window` once the
+6. Handoff (c), in this order, with the provider drain assumption stated:
+
+   a. **Arm.** `stoaramactl r2-inverse page-quiesce --reason TEXT` (once). From
+      this commit every public delivery route refuses a NEW request with 503 and
+      admits no reader, ticket or publication; the readers already admitted
+      finish their response under their own lease. No exemption class opens yet
+      and the page is not retired. This is the point of no return.
+   b. **Let the last untracked five-minute URL drain with a verifiable
+      timestamp.** Every capability the page handed out is a
+      `r2_delivery_download_tickets` row with `expires_at` (the provider's
+      capability TTL, 5 minutes) and `last_byte_by` (capability + a 2-minute
+      in-flight transfer bound, since a provider does not cut a transfer that
+      already started). Record the database clock and the latest
+      `last_byte_by`:
+
+      ```sql
+      SELECT clock_timestamp() AS now, max(last_byte_by) AS last_byte_by,
+             count(*) FILTER (WHERE last_byte_by > clock_timestamp()) AS still_transferring
+      FROM r2_delivery_download_tickets;
+      ```
+
+      Wait until `still_transferring` is 0 and `now` is after the latest
+      `last_byte_by` by the record's own margin. A URL a recipient saved before
+      arming still works until its provider expiry: it cannot be revoked, only
+      drained, and this is the only evidence that it has.
+
+   c. **Retire.** `stoaramactl r2-inverse page-retired --generation HEX32
+      --decision TEXT` (once). The row is proved **in SQL** under the exclusive
+      public lock: 0225's trigger refuses it unless the quiesce row exists, no
+      admitted reader lease is unexpired and no capability's `last_byte_by` is
+      unexpired. A hand-written INSERT, an older binary or a second process is
+      refused for the same reasons, so there is no split-brain CLI-only check.
+      `r2_delivery_page_retired()` reads exactly that row, and every public
+      delivery route refuses 410 from then on for the current and every pinned
+      generation. This opens `confident_repair`.
+
+7. Seed `confident_repair` and run the collated job. Seed `in_window` once the
    0224 follow-up certifies the copies; until then it stays held.
+
+#### Lifetime and bounds of the admission
+
+- **Readers.** Each public response holds one `r2_delivery_public_readers` row
+  from just before its first registry read to after its last socket write. The
+  row is a lease with a 2-minute expiry, longer than the API's 60s write
+  timeout, so a live slow response never loses it and a crashed one delays
+  retirement by at most 2 minutes. The API holds no database connection and no
+  lock while streaming.
+- **Tickets.** Each capability is one `r2_delivery_download_tickets` row, written
+  in the same statement as the capability under the shared public lock, and
+  never past `last_byte_by`.
+- **The lock.** `r2_delivery_public_lock()` is one advisory key: shared for
+  reader admission, ticket minting and registry publication, exclusive for arming
+  and retirement. It is never held across a socket and never held while waiting
+  for a pool connection another reader needs, so there is no nested-lookup
+  deadlock: the lease row, not the lock, spans the transfer.
+- **Failure bounds.** A reader that cannot prove the page is serving refuses
+  (fail closed: 503). A retirement that cannot prove the drain refuses. Nothing
+  here is cached: the quiesce and retirement rows are read live on every public
+  request.
+
+#### Remaining provider drain assumptions (stated, not hidden)
+
+- A presigned URL already returned to a recipient is not revocable. The drain
+  above relies on the provider refusing it after `expires_at` and on
+  `last_byte_by` covering a transfer that started just before expiry. It assumes
+  the provider honours presign expiry within its documented skew and applies no
+  longer cache to the signed URL.
+- An origin removed in step 0 keeps its own caches for as long as that owner
+  configures. Removing the route is necessary; it is not proof that an edge cache
+  has purged. The retired R2 objects remain readable to anyone holding a
+  still-valid presign until `last_byte_by`, which is why the drain is verified and
+  recorded rather than assumed.
+- The API's own review counts every request that reaches it. A legacy origin that
+  keeps serving the OLD static page from its own cache never reaches the API and
+  is outside this mechanism; step 0 is the only control for it.
 
 ### Read-only roster queries
 
@@ -442,3 +544,11 @@ non-KE stream, with no overlap with that stream's keep window.
 Expect 4,348 rows / 0.582 TB and 9,232 rows / 3.377 TB. A shortfall means some
 keys are on a keep-everything or undecided stream; they stay on the page and in
 R2. Report the difference to Deniz rather than widening a query.
+
+**These queries only generate candidates.** The `outside_window` query cannot
+see a source closure that straddles the stream's window: it tests the output's
+own interval, while the classifier marks the output `in_window` when ANY source
+overlaps. It also cannot see a KE folder component in the stored path, a page
+stream decided `all`, or any live hold. Every candidate must therefore pass
+`r2-inverse validate` before its digest is approved; a row the validator refuses
+is not a shortfall to widen around, it is a key that stays on the page.

@@ -437,7 +437,16 @@ func loadInverseProtectionMode(ctx context.Context, q r2RetireQuerier, bucket st
 	}
 	err = rows.Err()
 	rows.Close()
-	return p, err
+	if err != nil {
+		return p, err
+	}
+	if reviewed {
+		p.Collated, err = loadInverseCollatedTargets(ctx, q, bucket, p)
+		if err != nil {
+			return p, err
+		}
+	}
+	return p, nil
 }
 
 // loadInverseHolds loads every classification input except the catalog rows,
@@ -647,8 +656,16 @@ func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 		runR2InverseExempt(ctx, cfg, args[1:])
 		return
 	}
+	if len(args) > 0 && args[0] == "validate" {
+		runR2InverseValidate(ctx, cfg, args[1:])
+		return
+	}
 	if len(args) > 0 && args[0] == "approve" {
 		runR2InverseApprove(ctx, cfg, args[1:])
+		return
+	}
+	if len(args) > 0 && args[0] == "page-quiesce" {
+		runR2InversePageQuiesce(ctx, cfg, args[1:])
 		return
 	}
 	if len(args) > 0 && args[0] == "page-retired" {

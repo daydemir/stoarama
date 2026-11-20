@@ -111,13 +111,20 @@ CREATE TABLE streams(id bigint PRIMARY KEY,local_timezone text);CREATE TABLE rec
 		t.Fatal(err)
 	}
 	installDeliveryFenceTestSchema(t, pool)
-	// RequireDeliveryKeep now refuses to publish while the page is retired, so this
-	// fixture needs the one serving state. It starts serving (no row).
+	// RequireDeliveryKeep now refuses to publish while the page is quiesced or
+	// retired, so this fixture needs the serving state. It starts serving: no
+	// quiesce row and no retirement row.
 	if _, err := pool.Exec(ctx, `CREATE TABLE r2_delivery_page_retirement(
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),generation text NOT NULL,decision text NOT NULL,
  retired_at timestamptz NOT NULL DEFAULT clock_timestamp());
+ CREATE TABLE r2_delivery_page_quiesce(
+ singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),reason text NOT NULL,
+ armed_at timestamptz NOT NULL DEFAULT clock_timestamp());
  CREATE FUNCTION r2_delivery_page_retired() RETURNS boolean LANGUAGE sql STABLE AS $$
-  SELECT EXISTS(SELECT 1 FROM r2_delivery_page_retirement) $$`); err != nil {
+  SELECT EXISTS(SELECT 1 FROM r2_delivery_page_retirement) $$;
+ CREATE FUNCTION r2_delivery_public_serving() RETURNS boolean LANGUAGE sql STABLE AS $$
+  SELECT NOT EXISTS(SELECT 1 FROM r2_delivery_page_quiesce)
+     AND NOT EXISTS(SELECT 1 FROM r2_delivery_page_retirement) $$`); err != nil {
 		t.Fatal(err)
 	}
 	return pool

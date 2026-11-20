@@ -39,18 +39,51 @@ type globalDeliveryTestStore struct {
 	opened, presigned int
 }
 
-// deliveryRetirementFixture stands in for r2_delivery_page_retired() in unit
-// tests. Production reads the committed row from the pool on every request.
-type deliveryRetirementFixture struct{ retired bool }
-
-func (f *deliveryRetirementFixture) DeliveryPageRetired(context.Context) (bool, error) {
-	return f.retired, nil
+// deliveryPublicFixture stands in for the live public delivery gate in unit
+// tests. Production reads the committed serving state from the pool on every
+// request, records one lease per response and records capabilities.
+//
+// It reproduces the SQL contract, so the unit tests exercise the same
+// shared/exclusive semantics: retired and quiesced both stop new readers,
+// admission and capability records are refused while either is set, and it
+// exposes the reader set so a test can prove retirement observed it.
+type deliveryPublicFixture struct {
+	retired, quiesced bool
+	minted            int
+	// readers is the live lease set; a test may pin one to hold retirement.
+	readers map[string]bool
+	// hold, when set, makes AdmitPublicReader block until it is closed, so a
+	// test can prove a retirement attempt waits for an admitted reader instead
+	// of racing it.
+	hold chan struct{}
 }
 
-type deliveryTicketFixture struct{ minted, retired int }
+func newDeliveryPublicFixture() *deliveryPublicFixture {
+	return &deliveryPublicFixture{readers: map[string]bool{}}
+}
 
-func (f *deliveryTicketFixture) RecordPublicDeliveryTicket(context.Context, globalDeliveryObject, string, time.Duration) (bool, error) {
-	if f.retired != 0 {
+func (f *deliveryPublicFixture) DeliveryServing(context.Context) (bool, bool, error) {
+	return f.retired, !f.retired && !f.quiesced, nil
+}
+
+func (f *deliveryPublicFixture) AdmitPublicReader(_ context.Context, id string) error {
+	if f.hold != nil {
+		<-f.hold
+	}
+	if f.retired || f.quiesced {
+		return errors.New("the public delivery page is not serving")
+	}
+	f.readers[id] = true
+	return nil
+}
+
+func (f *deliveryPublicFixture) ReleasePublicReader(_ context.Context, id string) error {
+	delete(f.readers, id)
+	return nil
+}
+
+func (f *deliveryPublicFixture) RecordPublicDeliveryTicket(context.Context, globalDeliveryObject, string, time.Duration) (bool, error) {
+	if f.retired || f.quiesced {
 		return false, nil
 	}
 	f.minted++
@@ -234,7 +267,7 @@ func TestPublicGlobalDeliveryScopedAnonymousAndPresentation(t *testing.T) {
 	delete(reg.Assets, "/fixture.txt")
 	m := &globalDeliveryTestStore{body: []byte("hello")}
 	s := &Server{globalDeliveryStore: m, publicGlobalDeliveryRegistry: reg, publicGlobalDeliveryRegistryAt: time.Now(),
-		deliveryRetirement: &deliveryRetirementFixture{}, deliveryTickets: &deliveryTicketFixture{}}
+		deliveryPublic: newDeliveryPublicFixture()}
 	w := httptest.NewRecorder()
 	s.handleGlobalDeliveryAsset(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/metadata?path=/public/catalog.json", "", nil))
 	if w.Code != 200 {
@@ -281,7 +314,7 @@ func TestPublicGlobalDeliveryEncodedFileIDThroughRouter(t *testing.T) {
 	reg.Files["sha256:"+file.SHA256] = file
 	store := &globalDeliveryTestStore{body: []byte("hello")}
 	s := &Server{globalDeliveryStore: store, publicGlobalDeliveryRegistry: reg, publicGlobalDeliveryRegistryAt: time.Now(),
-		deliveryRetirement: &deliveryRetirementFixture{}, deliveryTickets: &deliveryTicketFixture{}}
+		deliveryPublic: newDeliveryPublicFixture()}
 	router := chi.NewRouter()
 	router.Get(publicGlobalDeliveryAPI+"/ticket/{fileID}", s.handleGlobalDeliveryTicket)
 	for _, tc := range []struct {
@@ -335,9 +368,9 @@ func publicDeliveryRegistryFixture() *globalDeliveryRegistry {
 func TestPublicDeliveryRetirementRefusesEveryRoute(t *testing.T) {
 	reg := publicDeliveryRegistryFixture()
 	store := &globalDeliveryTestStore{body: []byte("hello")}
-	retirement := &deliveryRetirementFixture{}
+	retirement := newDeliveryPublicFixture()
 	s := &Server{globalDeliveryStore: store, publicGlobalDeliveryRegistry: reg, publicGlobalDeliveryRegistryAt: time.Now(),
-		publicPinnedDeliveryRegistry: reg, deliveryRetirement: retirement, deliveryTickets: &deliveryTicketFixture{}}
+		publicPinnedDeliveryRegistry: reg, deliveryPublic: retirement}
 	router := publicDeliveryRouter(s)
 	file := reg.Files["1"]
 
@@ -389,24 +422,44 @@ func TestPublicDeliveryRetirementRefusesEveryRoute(t *testing.T) {
 	if err := RequireDeliveryKeep(context.Background(), retiredKeepQuerier{}, broadcast); err == nil || !strings.Contains(err.Error(), "retired") {
 		t.Fatalf("retired page accepted republication: %v", err)
 	}
+	// An armed page refuses republication too, and says so as arming, not
+	// retirement: the page has not gone down yet.
+	if err := RequireDeliveryKeep(context.Background(), quiescedKeepQuerier{}, broadcast); err == nil || !strings.Contains(err.Error(), "quiesced") {
+		t.Fatalf("quiesced page accepted republication: %v", err)
+	}
 }
 
 // retiredKeepQuerier answers the publication gate the way a retired page does.
 type retiredKeepQuerier struct{}
 
 func (retiredKeepQuerier) QueryRow(context.Context, string, ...any) pgx.Row {
-	return deliveryKeepRow{retired: true}
+	return deliveryKeepRow{retired: true, serving: false}
 }
 
-type deliveryKeepRow struct{ retired bool }
+// quiescedKeepQuerier answers it the way an armed but not yet retired page does:
+// publication is refused, and the refusal is not retirement.
+type quiescedKeepQuerier struct{}
+
+func (quiescedKeepQuerier) QueryRow(context.Context, string, ...any) pgx.Row {
+	return deliveryKeepRow{retired: false, serving: false}
+}
+
+// deliveryKeepRow answers the two-bool serving-state row (retired, serving).
+type deliveryKeepRow struct{ retired, serving bool }
 
 func (r deliveryKeepRow) Scan(dest ...any) error {
-	for _, d := range dest {
-		switch v := d.(type) {
-		case *bool:
-			*v = r.retired
-		default:
+	if len(dest) != 2 {
+		return errors.New("unexpected scan arity")
+	}
+	for i, d := range dest {
+		v, ok := d.(*bool)
+		if !ok {
 			return errors.New("unexpected scan destination")
+		}
+		if i == 0 {
+			*v = r.retired
+		} else {
+			*v = r.serving
 		}
 	}
 	return nil

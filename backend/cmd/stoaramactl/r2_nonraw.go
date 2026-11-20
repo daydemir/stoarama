@@ -213,11 +213,11 @@ func (p inverseProtection) classifyCollated(o r2.ObjectInfo, x inverseCollatedAs
 		return inverseKE, "keep_everything_stream"
 	}
 	// A KE folder alias on the output's own stored path protects it. These are
-	// catalog facts, so they are read here rather than trusted from the batch.
-	for _, component := range strings.Split(x.Path, "/") {
-		if p.KEFolders[component] {
-			return inverseKE, "keep_everything_path"
-		}
+	// catalog facts, so they are read here rather than trusted from the batch,
+	// and assessRepair applies the same rule to a confident repair's stored path
+	// so a seed can never approve a row execution would refuse.
+	if p.keepEverythingPathComponent(x.Path) {
+		return inverseKE, "keep_everything_path"
 	}
 	if x.Reason != "" {
 		return inverseHeld, x.Reason
@@ -272,6 +272,11 @@ func scanRepair(rows pgx.Rows) (inverseCollatedAssessment, error) {
 // assessRepair holds a confident repair unless it is a lone page key with a
 // complete identity on a decided stream. It has no interval: the owner approved
 // every confident repair once the page is down, so no window applies.
+//
+// A KE folder component in the repair's stored path (or its R2 key) protects it
+// exactly as it does for a collated output. Execution re-checks this in
+// classifyCollated before the wire, so the seed must apply the same rule here or
+// it would approve a roster row the executor then refuses.
 func assessRepair(p inverseProtection, x inverseCollatedAssessment) inverseCollatedAssessment {
 	switch choice := p.Picks.Choices[x.StreamID].Choice; {
 	case !strings.HasPrefix(x.Key, inverseConfidentRepairPrefix):
@@ -286,8 +291,24 @@ func assessRepair(p inverseProtection, x inverseCollatedAssessment) inverseColla
 		x.Reason = "repair_identity_incomplete"
 	case choice != "all" && choice != "none" && choice != "st" && choice != "keep":
 		x.Reason = "repair_stream_undecided"
+	case p.keepEverythingPathComponent(x.Path):
+		x.Reason = "keep_everything_path"
+	case p.keepEverythingPathComponent(x.Key):
+		x.Reason = "keep_everything_path"
 	}
 	return x
+}
+
+// keepEverythingPathComponent reports whether any complete folder component of
+// path names a KE stream folder. It matches whole components, never a partial
+// name, so the same path rule the RAW and collated classifiers use is shared.
+func (p inverseProtection) keepEverythingPathComponent(path string) bool {
+	for _, component := range strings.Split(path, "/") {
+		if p.KEFolders[component] {
+			return true
+		}
+	}
+	return false
 }
 
 // assessCollated applies KE and pinned keep28 to ONE output using fresh picks and

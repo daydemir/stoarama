@@ -360,6 +360,7 @@ INSERT INTO recordings VALUES (30,47,3,'UTC'),(40,47,4,'UTC'),(50,47,5,'UTC'),(6
 	// hand-rolled fixture predates 0225, so it stubs the read as "serving"; the
 	// real function and its enforcement are covered against the migration itself.
 	exec(`CREATE FUNCTION r2_delivery_page_retired() RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT false $$`)
+	exec(`CREATE FUNCTION r2_delivery_public_serving() RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT true $$`)
 	windows := map[int64]api.Keep28Window{
 		3: r2tWindow(t, 3, "Asia/Tokyo", "2026-09-12", "2026-10-10"),
 		4: r2tWindow(t, 4, "America/Los_Angeles", "2026-09-12", "2026-10-10"),

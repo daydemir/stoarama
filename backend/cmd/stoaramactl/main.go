@@ -282,8 +282,10 @@ func usage() {
   stoaramactl r2-inverse partition --picks FILE --out DIR (read-only full bucket)
   stoaramactl r2-inverse apply|apply-keep28 --manifest FILE --expected-sha256 SHA [bounded executor options]
   stoaramactl r2-inverse exempt --class outside_window|confident_repair|in_window --roster FILE --expected-roster-sha256 SHA --picks FILE --expected-picks-sha256 SHA
+  stoaramactl r2-inverse validate --class outside_window|confident_repair|in_window --roster FILE --expected-roster-sha256 SHA --picks FILE --expected-picks-sha256 SHA (read-only; run before approve)
   stoaramactl r2-inverse approve --class CLASS --roster-sha256 HEX --decision TEXT (record the owner approval; run before exempt)
-  stoaramactl r2-inverse page-retired --generation HEX32 --decision TEXT (once, after the old delivery page is taken down)
+  stoaramactl r2-inverse page-quiesce --reason TEXT (arm retirement: stop admitting new public readers)
+  stoaramactl r2-inverse page-retired --generation HEX32 --decision TEXT (once, after page-quiesce and the reader/capability drain)
 	  stoaramactl r2-retire reconcile-writers --out FILE [--bucket stoarama] (read-only)
 	  stoaramactl r2-retire plan --picks FILE --out DIR [--nas-backed --connection-id 13 --sample 200 --grace 168h --json]
 	  stoaramactl r2-retire apply --manifest FILE --expected-sha256 SHA --max-bytes N [--budget-24h-bytes N --ledger PATH --rate 10 --skip-ineligible --json]

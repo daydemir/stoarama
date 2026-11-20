@@ -249,81 +249,17 @@ func recordDeliveryExemptionApproval(ctx context.Context, pool *pgxpool.Pool, cl
 // decision. 0225's admission trigger checks each row's exact live page identity,
 // its class shape and its own class/roster approval.
 func seedDeliveryExemptions(ctx context.Context, pool *pgxpool.Pool, class deliveryExemptionClass, rows []deliveryExemptionRow, rosterSHA string, picks r2RetirePicks) (int64, error) {
-	_, ok := deliveryExemptionDecisions[class]
-	if !ok {
+	if _, ok := deliveryExemptionDecisions[class]; !ok {
 		return 0, fmt.Errorf("unknown exemption class %q", class)
-	}
-	_, windows, err := api.Keep28Policy()
-	if err != nil {
-		return 0, err
-	}
-	buckets, keys, etags, sizes := make([]string, len(rows)), make([]string, len(rows)), make([]string, len(rows)), make([]int64, len(rows))
-	for n, row := range rows {
-		buckets[n], keys[n], etags[n], sizes[n] = row.Bucket, row.ObjectKey, row.ETag, row.SizeBytes
 	}
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback(context.Background())
-	// The page recording's stream and the output's own stream must both be
-	// decided, so a keep-everything or undecided stream is refused before any
-	// row is written. The page stream is read live, not from the roster.
-	pageStreams := map[string]int64{}
-	pageIdentities := map[string]inversePageIdentity{}
-	streamRows, err := tx.Query(ctx, `SELECT h.object_key,coalesce(rec.stream_id,0),h.etag,h.size_bytes FROM delivery_keep_holds h
- LEFT JOIN recordings rec ON rec.id=h.recording_id WHERE h.bucket=$1 AND h.object_key=ANY($2::text[])`, rows[0].Bucket, keys)
+	buckets, keys, etags, sizes, err := checkDeliveryExemptionRoster(ctx, tx, class, rows, picks)
 	if err != nil {
 		return 0, err
-	}
-	for streamRows.Next() {
-		var key string
-		var stream, size int64
-		var etag string
-		if err = streamRows.Scan(&key, &stream, &etag, &size); err != nil {
-			streamRows.Close()
-			return 0, err
-		}
-		pageStreams[key] = stream
-		pageIdentities[key] = inversePageIdentity{ETag: strings.Trim(etag, `"`), SizeBytes: size}
-	}
-	err = streamRows.Err()
-	streamRows.Close()
-	if err != nil {
-		return 0, err
-	}
-	protection, err := loadInverseProtectionMode(ctx, tx, rows[0].Bucket, picks, windows, true)
-	if err != nil {
-		return 0, err
-	}
-	for _, row := range rows {
-		if row.Bucket != rows[0].Bucket {
-			return 0, errors.New("a class roster must name exactly one bucket")
-		}
-		if !deliveryPageStreamDecided(picks, windows, pageStreams[row.ObjectKey]) {
-			return 0, fmt.Errorf("roster key %s has no positive non-keep-everything page stream decision", row.ObjectKey)
-		}
-		page, pageKnown := pageIdentities[row.ObjectKey]
-		if !pageKnown || page.ETag != strings.Trim(row.ETag, `"`) || page.SizeBytes != row.SizeBytes {
-			return 0, fmt.Errorf("roster key %s does not name its exact live page identity", row.ObjectKey)
-		}
-		x, err := loadSeedAssessment(ctx, tx, rows[0].Bucket, row.ObjectKey, protection)
-		if err != nil {
-			return 0, fmt.Errorf("roster key %s has no live collated or repair assessment: %w", row.ObjectKey, err)
-		}
-		computed, known := deliveryExemptionClassOf(x, true)
-		if !known {
-			return 0, fmt.Errorf("roster key %s has no live collated or repair assessment", row.ObjectKey)
-		}
-		if x.Reason != "" {
-			return 0, fmt.Errorf("roster key %s is held by the live classifier (%s)", row.ObjectKey, x.Reason)
-		}
-		if x.StreamID > 0 && !deliveryPageStreamDecided(picks, windows, x.StreamID) {
-			return 0, fmt.Errorf("roster key %s has no positive non-keep-everything decision for its own stream", row.ObjectKey)
-		}
-		if computed != class {
-			return 0, fmt.Errorf("roster key %s is %s under the live classifier, not %s", row.ObjectKey, computed, class)
-		}
 	}
 	// Seeding CONSUMES the owner's approval; it never creates one. The approval
 	// must already exist for exactly this class and roster digest, and its own
@@ -350,6 +286,122 @@ func seedDeliveryExemptions(ctx context.Context, pool *pgxpool.Pool, class deliv
 		return 0, fmt.Errorf("seeded %d of %d roster rows", tag.RowsAffected(), len(rows))
 	}
 	return tag.RowsAffected(), tx.Commit(ctx)
+}
+
+// checkDeliveryExemptionRoster is the ONE roster decision, shared by seeding and
+// by the read-only validate step. It reads the live catalog through the collated
+// executor's own batch statement and derives every row's class with the
+// executor's own assess function, so neither an approved roster nor an operator
+// preview can see a weaker answer than the wire. It returns the column vectors
+// the insert uses. It writes nothing.
+//
+// The checks, in order, are exactly why a mixed-source window and a
+// keep-everything page stream cannot pass:
+//   - the page recording's live stream must carry a positive, window-bound,
+//     non-keep-everything owner decision;
+//   - the roster ETag and size must equal the live page row's exact identity;
+//   - the key must have a live collated or repair assessment with no reason;
+//   - the output's own stream must also be positively decided;
+//   - the classifier's class must equal the requested one. assessCollated marks
+//     the output keep28 when ANY source overlaps a pinned window, so a mixed
+//     source closure is in_window and can never be admitted as outside_window.
+func checkDeliveryExemptionRoster(ctx context.Context, tx pgx.Tx, class deliveryExemptionClass, rows []deliveryExemptionRow, picks r2RetirePicks) (buckets, keys, etags []string, sizes []int64, err error) {
+	if len(rows) == 0 {
+		return nil, nil, nil, nil, errors.New("roster is empty")
+	}
+	_, windows, err := api.Keep28Policy()
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	buckets, keys, etags, sizes = make([]string, len(rows)), make([]string, len(rows)), make([]string, len(rows)), make([]int64, len(rows))
+	for n, row := range rows {
+		buckets[n], keys[n], etags[n], sizes[n] = row.Bucket, row.ObjectKey, row.ETag, row.SizeBytes
+	}
+	// The page recording's stream and the output's own stream must both be
+	// decided, so a keep-everything or undecided stream is refused before any
+	// row is written. The page stream is read live, not from the roster.
+	pageStreams := map[string]int64{}
+	pageIdentities := map[string]inversePageIdentity{}
+	streamRows, err := tx.Query(ctx, `SELECT h.object_key,coalesce(rec.stream_id,0),h.etag,h.size_bytes FROM delivery_keep_holds h
+ LEFT JOIN recordings rec ON rec.id=h.recording_id WHERE h.bucket=$1 AND h.object_key=ANY($2::text[])`, rows[0].Bucket, keys)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	for streamRows.Next() {
+		var key string
+		var stream, size int64
+		var etag string
+		if err = streamRows.Scan(&key, &stream, &etag, &size); err != nil {
+			streamRows.Close()
+			return nil, nil, nil, nil, err
+		}
+		pageStreams[key] = stream
+		pageIdentities[key] = inversePageIdentity{ETag: strings.Trim(etag, `"`), SizeBytes: size}
+	}
+	err = streamRows.Err()
+	streamRows.Close()
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	protection, err := loadInverseProtectionMode(ctx, tx, rows[0].Bucket, picks, windows, true)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	for _, row := range rows {
+		if row.Bucket != rows[0].Bucket {
+			return nil, nil, nil, nil, errors.New("a class roster must name exactly one bucket")
+		}
+		page, pageKnown := pageIdentities[row.ObjectKey]
+		if !pageKnown || page.ETag != strings.Trim(row.ETag, `"`) || page.SizeBytes != row.SizeBytes {
+			return nil, nil, nil, nil, fmt.Errorf("roster key %s does not name its exact live page identity", row.ObjectKey)
+		}
+		if !deliveryPageStreamDecided(picks, windows, pageStreams[row.ObjectKey]) {
+			return nil, nil, nil, nil, fmt.Errorf("roster key %s has no positive non-keep-everything page stream decision", row.ObjectKey)
+		}
+		x, err := loadSeedAssessment(ctx, tx, rows[0].Bucket, row.ObjectKey, protection)
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("roster key %s has no live collated or repair assessment: %w", row.ObjectKey, err)
+		}
+		computed, known := deliveryExemptionClassOf(x, true)
+		if !known {
+			return nil, nil, nil, nil, fmt.Errorf("roster key %s has no live collated or repair assessment", row.ObjectKey)
+		}
+		if x.Reason != "" {
+			return nil, nil, nil, nil, fmt.Errorf("roster key %s is held by the live classifier (%s)", row.ObjectKey, x.Reason)
+		}
+		if x.StreamID > 0 && !deliveryPageStreamDecided(picks, windows, x.StreamID) {
+			return nil, nil, nil, nil, fmt.Errorf("roster key %s has no positive non-keep-everything decision for its own stream", row.ObjectKey)
+		}
+		if computed != class {
+			return nil, nil, nil, nil, fmt.Errorf("roster key %s is %s under the live classifier, not %s", row.ObjectKey, computed, class)
+		}
+	}
+	return buckets, keys, etags, sizes, nil
+}
+
+// validateDeliveryExemptions is the read-only step that must run before the
+// owner approves a roster digest. It applies the SAME decision seeding applies,
+// in a read-only snapshot, and writes nothing: it records no approval, seeds no
+// row and grants no authority. It exists because the documented roster SQL only
+// generates candidates; whether a candidate passes is the classifier's answer,
+// and this is that answer without the side effect.
+func validateDeliveryExemptions(ctx context.Context, pool *pgxpool.Pool, class deliveryExemptionClass, rows []deliveryExemptionRow, picks r2RetirePicks) (int, error) {
+	if _, ok := deliveryExemptionDecisions[class]; !ok {
+		return 0, fmt.Errorf("unknown exemption class %q", class)
+	}
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(context.Background())
+	if _, _, _, _, err = checkDeliveryExemptionRoster(ctx, tx, class, rows, picks); err != nil {
+		return 0, err
+	}
+	// Prove the transaction really is read-only before reporting success.
+	if _, err = tx.Exec(ctx, `SET TRANSACTION READ ONLY`); err != nil {
+		return 0, err
+	}
+	return len(rows), tx.Rollback(ctx)
 }
 
 // runR2InverseApprove records the owner's approval for one roster digest, under
@@ -411,25 +463,80 @@ func runR2InverseExempt(ctx context.Context, cfg config.Config, args []string) {
 	fmt.Println(string(data))
 }
 
-// retireDeliveryPage sets the committed serving state inside tx, then proves with
-// the same live function every serving route and every gate reads that the page is
-// down. It refuses while any issued download capability is still unexpired, so the
-// outstanding tickets are drained rather than left live behind a retired page.
+// runR2InverseValidate is the read-only pre-approval check. The documented roster
+// queries only GENERATE candidates; this applies the same live classifier the
+// collated executor uses, so a mixed-source window, a keep-everything page
+// stream or a key held for any other reason is refused before the owner is asked
+// to approve a digest. It writes nothing, records no approval and grants no
+// authority: approval and seeding remain separate human steps.
+func runR2InverseValidate(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("r2-inverse validate", flag.ExitOnError)
+	className := fs.String("class", "", "outside_window, confident_repair or in_window")
+	roster := fs.String("roster", "", "candidate JSONL roster: bucket, object_key, etag, size_bytes")
+	rosterSHA := fs.String("expected-roster-sha256", "", "candidate roster digest")
+	picksPath := fs.String("picks", "", "owner picks")
+	picksSHA := fs.String("expected-picks-sha256", "", "approved owner picks digest")
+	const usage = "usage: stoaramactl r2-inverse validate --class outside_window|confident_repair|in_window --roster FILE --expected-roster-sha256 HEX --picks FILE --expected-picks-sha256 HEX (read-only; run before approve)"
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *roster == "" || *picksPath == "" {
+		log.Fatal(usage)
+	}
+	class := deliveryExemptionClass(*className)
+	if _, ok := deliveryExemptionDecisions[class]; !ok {
+		log.Fatal(usage)
+	}
+	rows, err := readDeliveryExemptionRoster(*roster, *rosterSHA)
+	if err != nil {
+		log.Fatal(err)
+	}
+	picks, err := loadR2RetirePicks(*picksPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if picks.SHA256 != *picksSHA {
+		log.Fatal("owner picks differ from the approved digest")
+	}
+	pool := mustOpenPool(ctx, cfg)
+	defer pool.Close()
+	validated, err := validateDeliveryExemptions(ctx, pool, class, rows, picks)
+	if err != nil {
+		log.Fatal(err)
+	}
+	data, _ := json.Marshal(map[string]any{"class": class, "roster_sha256": *rosterSHA, "validated": validated, "read_only": true, "approval_recorded": false})
+	fmt.Println(string(data))
+}
+
+// retireDeliveryPage commits the ONE destructive predicate inside tx, after the
+// SQL trigger has independently proved quiesce, reader drain and capability
+// drain. It takes the exclusive public lock first, so no ticket, no admission and
+// no registry publication can interleave between the proofs and the row, then
+// proves with the same live function every serving route and every gate reads
+// that the page is down.
 func retireDeliveryPage(ctx context.Context, tx pgx.Tx, generation, decision string) (string, error) {
 	if !r2RetireLowerHex32(generation) || strings.TrimSpace(decision) == "" {
 		return "", errors.New("a retirement needs its serving generation and the owner's decision")
 	}
-	// Serialize against ticket minting: after this exclusive lock, no new public
-	// capability can be recorded, so the drain below is complete.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, 7343226011104); err != nil {
+	// Serialize against ticket minting, reader admission, publication and this
+	// same command. After this exclusive lock no new public capability can be
+	// recorded and no new reader admitted, so the proof below is complete.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(r2_delivery_public_lock())`); err != nil {
 		return "", err
 	}
-	var live int64
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM r2_delivery_download_tickets WHERE expires_at>clock_timestamp()`).Scan(&live); err != nil {
+	// Evidence for the operator: the SQL trigger is the authority, but its refusal
+	// is clearer when the counts are reported first. Neither count can retire.
+	var armed, liveReaders, liveTickets int64
+	if err := tx.QueryRow(ctx, `SELECT (SELECT count(*) FROM r2_delivery_page_quiesce),
+ (SELECT count(*) FROM r2_delivery_public_readers WHERE expires_at>clock_timestamp()),
+ (SELECT count(*) FROM r2_delivery_download_tickets WHERE last_byte_by>clock_timestamp())`).Scan(&armed, &liveReaders, &liveTickets); err != nil {
 		return "", err
 	}
-	if live != 0 {
-		return "", fmt.Errorf("refusing to retire the page while %d issued download tickets are still unexpired; wait for them to expire", live)
+	if armed == 0 {
+		return "", errors.New("refusing to retire the page: it is not quiesced; run r2-inverse page-quiesce and let admitted readers drain")
+	}
+	if liveReaders != 0 {
+		return "", fmt.Errorf("refusing to retire the page while %d admitted public readers are still unexpired; retry after their leases expire", liveReaders)
+	}
+	if liveTickets != 0 {
+		return "", fmt.Errorf("refusing to retire the page while %d download capabilities may still be transferring; retry after their last-byte bound", liveTickets)
 	}
 	var at string
 	if err := tx.QueryRow(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,$2) RETURNING retired_at::text`,
@@ -441,6 +548,59 @@ func retireDeliveryPage(ctx context.Context, tx pgx.Tx, generation, decision str
 		return "", errors.New("the retirement row did not take effect; refusing to report the page down")
 	}
 	return at, nil
+}
+
+// quiesceDeliveryPage commits the staging state that stops every NEW public
+// reader. It is not the page going down: no exemption class opens, the page row
+// is untouched, and the only effect is that new public requests are refused with
+// 503 while the readers already admitted finish. It is the point of no return for
+// rollback, so the runbook treats it as arming.
+func quiesceDeliveryPage(ctx context.Context, tx pgx.Tx, reason string) (string, error) {
+	if strings.TrimSpace(reason) == "" {
+		return "", errors.New("quiescing the page needs its reason and owner decision")
+	}
+	// The exclusive lock makes arming atomic against admission and tickets, so
+	// no reader or capability can slip in after the state commits.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(r2_delivery_public_lock())`); err != nil {
+		return "", err
+	}
+	var at string
+	if err := tx.QueryRow(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES($1) RETURNING armed_at::text`, reason).Scan(&at); err != nil {
+		return "", err
+	}
+	var serving bool
+	if err := tx.QueryRow(ctx, `SELECT r2_delivery_public_serving()`).Scan(&serving); err != nil || serving {
+		return "", errors.New("the quiesce row did not take effect; refusing to report the page armed")
+	}
+	return at, nil
+}
+
+// runR2InversePageQuiesce arms retirement. It is a separate, deliberate step so
+// the runbook can prove the legacy origins are gone and the last five-minute URL
+// has drained before the destructive row can exist at all.
+func runR2InversePageQuiesce(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("r2-inverse page-quiesce", flag.ExitOnError)
+	reason := fs.String("reason", "", "why the page is being armed for retirement, and the owner decision")
+	const usage = "usage: stoaramactl r2-inverse page-quiesce --reason TEXT (arm retirement; stop admitting new public readers; not reversible)"
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || strings.TrimSpace(*reason) == "" {
+		log.Fatal(usage)
+	}
+	pool := mustOpenPool(ctx, cfg)
+	defer pool.Close()
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	at, err := quiesceDeliveryPage(ctx, tx, *reason)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		log.Fatal(err)
+	}
+	data, _ := json.Marshal(map[string]any{"page_quiesced_at": at, "reason": *reason})
+	fmt.Println(string(data))
 }
 
 // runR2InversePageRetired sets the committed serving state that takes the old

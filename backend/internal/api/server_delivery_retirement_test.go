@@ -1,12 +1,15 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -180,6 +183,52 @@ func TestDeliveryPageRetirementIsTheServingState(t *testing.T) {
 		}
 	}
 
+	// A direct retirement insert is REFUSED while the page is not quiesced: the
+	// destructive predicate is proved in SQL, not asserted by the caller.
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
+ VALUES(repeat('c',32),'test: retire early')`); err == nil || !strings.Contains(err.Error(), "quiesce") {
+		t.Fatalf("retirement without quiesce was not refused in SQL: %v", err)
+	}
+	// Arm retirement: every new public reader is now refused, and no exemption
+	// class opens yet.
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: arming')`); err != nil {
+		t.Fatal(err)
+	}
+	var serving bool
+	if err := pool.QueryRow(ctx, `SELECT r2_delivery_public_serving(),r2_delivery_page_retired()`).Scan(&serving, &retired); err != nil {
+		t.Fatal(err)
+	}
+	if serving || retired {
+		t.Fatalf("after quiesce: serving=%v retired=%v, want serving=false retired=false", serving, retired)
+	}
+	for _, r := range requests {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest(r.method, r.target, nil))
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("quiesced page: %s served %d, want 503", r.name, w.Code)
+		}
+	}
+	// The capabilities the serving loop minted are still live, so retirement is
+	// refused until they drain. That refusal is the point: age them past their
+	// transfer bound (test-only) and retirement may proceed.
+	var liveTickets int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_delivery_download_tickets WHERE last_byte_by>clock_timestamp()`).Scan(&liveTickets); err != nil {
+		t.Fatal(err)
+	}
+	if liveTickets == 0 {
+		t.Fatal("the serving loop minted no recorded capability")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
+ VALUES(repeat('c',32),'test: retire before drain')`); err == nil || !strings.Contains(err.Error(), "transferring") {
+		t.Fatalf("retirement with live capabilities was not refused in SQL: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
+ VALUES(repeat('f',32),'test: retire with a live reader')`); err == nil || !strings.Contains(err.Error(), "transferring") {
+		t.Fatalf("live capability retirement was not refused: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE r2_delivery_download_tickets SET expires_at=clock_timestamp()-interval '1 minute',last_byte_by=clock_timestamp()-interval '1 second'`); err != nil {
+		t.Fatal(err)
+	}
 	// Take the page down: the one committed serving state, then the live function
 	// and the confident_repair gate must agree in the same breath.
 	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
@@ -211,5 +260,200 @@ func TestDeliveryPageRetirementIsTheServingState(t *testing.T) {
 	// And republication is refused while retired.
 	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES(repeat('d',32),'again')`); err == nil {
 		t.Fatal("a second retirement state landed")
+	}
+	// The staging and retirement states are append-only facts: no caller can
+	// un-arm or un-retire the page.
+	for _, q := range []string{`DELETE FROM r2_delivery_page_quiesce`, `TRUNCATE r2_delivery_page_quiesce`,
+		`UPDATE r2_delivery_page_quiesce SET reason='x'`, `DELETE FROM r2_delivery_page_retirement`,
+		`UPDATE r2_delivery_page_retirement SET decision='x'`} {
+		if _, err := pool.Exec(ctx, q); err == nil {
+			t.Fatalf("state change %q succeeded", q)
+		}
+	}
+}
+
+// TestDeliveryPageRetirementPausesAdmittedReader is the serialization regression:
+// a real public file response is paused mid-body by its object store, retirement
+// is attempted while it is provably admitted and streaming, and the same INSERT
+// that was refused then commits once the response wrote its last byte.
+func TestDeliveryPageRetirementPausesAdmittedReader(t *testing.T) {
+	pool := deliveryExemptionTestPool(t)
+	ctx := context.Background()
+	reg := publicDeliveryRegistryFixture()
+	store := newPausedDeliveryStore([]byte("hello"))
+	s := &Server{pool: pool, globalDeliveryStore: store,
+		publicGlobalDeliveryRegistry: reg, publicGlobalDeliveryRegistryAt: time.Now(), publicPinnedDeliveryRegistry: reg}
+	router := publicDeliveryRouter(s)
+	file := reg.Files["1"]
+
+	// Serve the file in its own goroutine; its body blocks after the first chunk.
+	done := make(chan int, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, publicGlobalDeliveryAPI+"/file/1?sha256="+file.SHA256, nil))
+		done <- w.Code
+	}()
+	<-store.streaming
+	var live int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_delivery_public_readers WHERE expires_at>clock_timestamp()`).Scan(&live); err != nil || live != 1 {
+		t.Fatalf("streaming response holds %d leases: %v", live, err)
+	}
+
+	// Arm retirement while the response is paused. New readers are refused, the
+	// paused one keeps its lease.
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: paused reader')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_public_readers(reader_id,expires_at)
+ VALUES('ffffffffffffffffffffffffffffffff',clock_timestamp()+interval '1 minute')`); err == nil {
+		t.Fatal("a new reader was admitted after quiesce")
+	}
+	// Retirement is refused while the paused response holds its lease.
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
+ VALUES(repeat('a',32),'test: retire during a streaming response')`); err == nil || !strings.Contains(err.Error(), "admitted public readers") {
+		t.Fatalf("retirement during a streaming response was not refused: %v", err)
+	}
+	// A fresh public request is refused before it reaches storage.
+	before := store.openedCount()
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, publicGlobalDeliveryAPI+"/file/1?sha256="+file.SHA256, nil))
+	if w.Code != http.StatusServiceUnavailable || store.openedCount() != before {
+		t.Fatalf("quiesced page admitted a new reader: %d, opened %d", w.Code, store.openedCount()-before)
+	}
+
+	// Release the body: the handler writes its last byte, then drops its lease.
+	close(store.release)
+	if code := <-done; code != http.StatusOK {
+		t.Fatalf("paused response finished with %d", code)
+	}
+	if live := store.leaseCount(t, pool); live != 0 {
+		t.Fatalf("the response did not release its lease: %d", live)
+	}
+	// The same statement that was refused now commits.
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
+ VALUES(repeat('a',32),'test: retire after the last byte')`); err != nil {
+		t.Fatalf("retirement after the drain was refused: %v", err)
+	}
+	var retired, serving bool
+	if err := pool.QueryRow(ctx, `SELECT r2_delivery_page_retired(),r2_delivery_public_serving()`).Scan(&retired, &serving); err != nil || !retired || serving {
+		t.Fatalf("drained retirement did not take effect: retired=%v serving=%v %v", retired, serving, err)
+	}
+}
+
+// TestDeliveryPageRetirementTicketBoundary is the capability boundary proof: a
+// ticket whose capability has expired but whose in-flight transfer bound has not
+// still refuses retirement, and retirement commits only after last_byte_by.
+func TestDeliveryPageRetirementTicketBoundary(t *testing.T) {
+	pool := deliveryExemptionTestPool(t)
+	ctx := context.Background()
+	insert := func(label string, expires, lastByte string) error {
+		_, err := pool.Exec(ctx, `INSERT INTO r2_delivery_download_tickets(bucket,object_key,etag,size_bytes,object_path_sha256,expires_at,last_byte_by)
+ VALUES('stoarama','original/x.mp4','e',5,repeat('a',64),clock_timestamp()+$1::interval,clock_timestamp()+$2::interval)`, expires, lastByte)
+		return err
+	}
+	// Capability expired, transfer bound still open (t1), and one whose whole
+	// capability is live (t2). Both are minted while the page still serves.
+	if err := insert("t1", "-30 seconds", "30 seconds"); err != nil {
+		t.Fatal(err)
+	}
+	if err := insert("t2", "5 minutes", "7 minutes"); err != nil {
+		t.Fatal(err)
+	}
+	// Arm retirement only after the capabilities exist, as the runbook does.
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: ticket boundary')`); err != nil {
+		t.Fatal(err)
+	}
+	// A capability minted after quiesce is refused by SQL itself.
+	if err := insert("t0", "5 minutes", "7 minutes"); err == nil {
+		t.Fatal("a capability was minted after quiesce")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
+ VALUES(repeat('b',32),'test: expired capability, live transfer')`); err == nil || !strings.Contains(err.Error(), "transferring") {
+		t.Fatalf("retirement ignored a live transfer bound: %v", err)
+	}
+	// Age t1 out entirely (the expired-capability/expired-transfer case) and keep
+	// t2 fully live, so the refusal below is the live capability's alone.
+	if _, err := pool.Exec(ctx, `UPDATE r2_delivery_download_tickets SET expires_at=clock_timestamp()-interval '1 second',last_byte_by=clock_timestamp()-interval '1 second'
+ WHERE id=(SELECT min(id) FROM r2_delivery_download_tickets)`); err != nil {
+		t.Fatal(err)
+	}
+	var liveTransfer int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_delivery_download_tickets WHERE last_byte_by>clock_timestamp()`).Scan(&liveTransfer); err != nil || liveTransfer != 1 {
+		t.Fatalf("expected exactly the live t2 capability, got %d: %v", liveTransfer, err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
+ VALUES(repeat('b',32),'test: live capability')`); err == nil || !strings.Contains(err.Error(), "transferring") {
+		t.Fatalf("retirement ignored a live capability: %v", err)
+	}
+	// Now drain everything and retire.
+	if _, err := pool.Exec(ctx, `UPDATE r2_delivery_download_tickets SET expires_at=clock_timestamp()-interval '1 second',last_byte_by=clock_timestamp()-interval '1 second'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
+ VALUES(repeat('b',32),'test: drained')`); err != nil {
+		t.Fatalf("retirement after the capability drain was refused: %v", err)
+	}
+}
+
+// pausedDeliveryStore serves a body that blocks mid-stream, so a response can be
+// proven to be admitted and still writing its last bytes when retirement runs.
+type pausedDeliveryStore struct {
+	globalDeliveryTestStore
+	release   chan struct{}
+	streaming chan struct{}
+	once      sync.Once
+}
+
+func newPausedDeliveryStore(body []byte) *pausedDeliveryStore {
+	return &pausedDeliveryStore{release: make(chan struct{}), streaming: make(chan struct{})}
+}
+
+func (p *pausedDeliveryStore) OpenExact(ctx context.Context, key, etag, version string) (io.ReadCloser, error) {
+	p.opened++
+	return &pausedReader{Reader: bytes.NewReader(bytes.Repeat([]byte("hello"), 64)), store: p}, nil
+}
+
+func (p *pausedDeliveryStore) openedCount() int { return p.opened }
+
+// leaseCount is how many admission leases the pool still has unexpired.
+func (p *pausedDeliveryStore) leaseCount(t *testing.T, pool *pgxpool.Pool) int64 {
+	t.Helper()
+	var live int64
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM r2_delivery_public_readers WHERE expires_at>clock_timestamp()`).Scan(&live); err != nil {
+		t.Fatal(err)
+	}
+	return live
+}
+
+// pausedReader yields one chunk, signals that it is streaming, waits for the
+// test to release it, then yields the rest. Because io.CopyN writes each chunk
+// before reading the next, the response is mid-body while it waits.
+type pausedReader struct {
+	*bytes.Reader
+	store *pausedDeliveryStore
+}
+
+func (r *pausedReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if n > 0 {
+		r.store.once.Do(func() { close(r.store.streaming) })
+		<-r.store.release
+	}
+	return n, err
+}
+
+func (r *pausedReader) Close() error { return nil }
+
+// TestDeliveryPublicLockMatchesSQL pins the Go constant to 0225's function, so
+// the API's publication lock and the migration's admission/retirement lock can
+// never drift apart.
+func TestDeliveryPublicLockMatchesSQL(t *testing.T) {
+	pool := deliveryExemptionTestPool(t)
+	var sqlLock int64
+	if err := pool.QueryRow(context.Background(), `SELECT r2_delivery_public_lock()`).Scan(&sqlLock); err != nil {
+		t.Fatal(err)
+	}
+	if sqlLock != deliveryPublicLock {
+		t.Fatalf("Go deliveryPublicLock %d != SQL r2_delivery_public_lock() %d", deliveryPublicLock, sqlLock)
 	}
 }

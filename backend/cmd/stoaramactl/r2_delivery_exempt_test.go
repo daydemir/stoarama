@@ -17,6 +17,7 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/api"
 	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/jackc/pgx/v5"
 )
 
 // The fixture's confident repair: a delivery page video_assembly object with no
@@ -107,9 +108,12 @@ func (f *nonrawFixture) exempt(t *testing.T, key string) bool {
 // when the page is taken down, recorded for the record on the retirement row.
 const pageGeneration = "0123456789abcdef0123456789abcdef"
 
-// retirePage sets the one committed serving state, exactly what
-// r2-inverse page-retired writes and what every public handler reads live.
+// retirePage arms then commits the one serving state, exactly the staged path
+// r2-inverse page-quiesce then page-retired runs and every public handler reads
+// live. There are no readers or capabilities in the fixture, so the drain is
+// already complete.
 func (f *nonrawFixture) retirePage() {
+	f.exec(`INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: arming the old page down')`)
 	f.exec(`INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,'test: the old page is down')`, pageGeneration)
 }
 
@@ -898,45 +902,50 @@ func TestR2NonrawPartitionComparesExemptIdentity(t *testing.T) {
 	}
 }
 
-// TestR2NonrawPageRetiredRefusesLiveTickets: taking the page down refuses while
-// an issued download capability is still unexpired, so retirement drains the
-// outstanding tickets instead of leaving them live behind a retired page. Exactly
-// one committed state is written, and only then does the gate read retired.
+// TestR2NonrawPageRetiredRefusesLiveTickets: taking the page down is proved in
+// SQL, in the staged order. It refuses before quiesce, refuses a live reader,
+// refuses a capability that may still be transferring even after its own
+// capability expiry, and commits only once everything has drained.
 func TestR2NonrawPageRetiredRefusesLiveTickets(t *testing.T) {
 	f := newNonrawFixture(t, "exempt_page_cli")
-	f.exec(`INSERT INTO r2_delivery_download_tickets(bucket,object_key,etag,size_bytes,object_path_sha256,expires_at)
- VALUES('stoarama','joined/x.mp4','e',1,repeat('a',64),clock_timestamp()+interval '5 minutes')`)
-	// Deferred from the start: a failing assertion must release the connection,
-	// or the fixture's pool cleanup hangs waiting for it.
-	tx, err := f.pool.Begin(f.ctx)
-	if err != nil {
-		t.Fatal(err)
+	retire := func() (string, error) {
+		tx, err := f.pool.Begin(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Deferred from the start: a failing assertion must release the
+		// connection, or the fixture's pool cleanup hangs waiting for it.
+		defer tx.Rollback(f.ctx)
+		at, err := retireDeliveryPage(f.ctx, tx, pageGeneration, "test: the old page is down")
+		if err != nil {
+			return "", err
+		}
+		if err = tx.Commit(f.ctx); err != nil {
+			return "", err
+		}
+		return at, nil
 	}
-	defer tx.Rollback(f.ctx)
-	if _, err = retireDeliveryPage(f.ctx, tx, pageGeneration, "test: the old page is down"); err == nil || !strings.Contains(err.Error(), "unexpired") {
-		t.Fatalf("retirement ignored a live ticket: %v", err)
+	if _, err := retire(); err == nil || !strings.Contains(err.Error(), "not quiesced") {
+		t.Fatalf("retirement without quiesce was not refused: %v", err)
 	}
-	if err = tx.Rollback(f.ctx); err != nil {
-		t.Fatal(err)
+	// A capability that has EXPIRED at the provider but whose transfer bound is
+	// still open: retirement must wait for the bytes, not just the presign.
+	f.exec(`INSERT INTO r2_delivery_download_tickets(bucket,object_key,etag,size_bytes,object_path_sha256,expires_at,last_byte_by)
+ VALUES('stoarama','joined/x.mp4','e',1,repeat('a',64),clock_timestamp()-interval '1 second',clock_timestamp()+interval '5 minutes')`)
+	f.exec(`INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: the old page is down')`)
+	if _, err := retire(); err == nil || !strings.Contains(err.Error(), "transferring") {
+		t.Fatalf("retirement ignored a live transfer bound: %v", err)
 	}
 	var retired bool
-	if err = f.pool.QueryRow(f.ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil || retired {
+	if err := f.pool.QueryRow(f.ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil || retired {
 		t.Fatalf("a refused retirement retired the page: %v %v", retired, err)
 	}
-	// Expired tickets are already dead at the provider, so the page can come down.
-	f.fixture(`UPDATE r2_delivery_download_tickets SET expires_at=clock_timestamp()-interval '1 second'`)
-	tx, err = f.pool.Begin(f.ctx)
-	if err != nil {
-		t.Fatal(err)
+	// Drain the last byte; the same call now commits, exactly once.
+	f.fixture(`UPDATE r2_delivery_download_tickets SET last_byte_by=clock_timestamp()-interval '1 second'`)
+	if at, err := retire(); err != nil || at == "" {
+		t.Fatalf("retirement refused after the drain: %q %v", at, err)
 	}
-	defer tx.Rollback(f.ctx)
-	if _, err = retireDeliveryPage(f.ctx, tx, pageGeneration, "test: the old page is down"); err != nil {
-		t.Fatalf("retirement refused with only expired tickets: %v", err)
-	}
-	if err = tx.Commit(f.ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err = f.pool.QueryRow(f.ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil || !retired {
+	if err := f.pool.QueryRow(f.ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil || !retired {
 		t.Fatalf("the committed retirement did not take effect: %v %v", retired, err)
 	}
 	// One committed state, append-only and unrepeatable.
@@ -1062,5 +1071,181 @@ func TestR2NonrawSeedDecisionBindsThePageStream(t *testing.T) {
 	}
 	if !f.exempt(t, f.key) {
 		t.Fatal("outside_window did not open")
+	}
+}
+
+// TestR2NonrawExemptionValidateIsReadOnlyAndClassifierExact: the pre-approval
+// validation runs the executor's own classifier, refuses a mixed-source window
+// the roster SQL alone would hand over, and writes nothing at all — no
+// approval, no exemption, no state change.
+func TestR2NonrawExemptionValidateIsReadOnlyAndClassifierExact(t *testing.T) {
+	f := newNonrawFixture(t, "exempt_validate")
+	f.withPageKeys()
+	picks, err := loadR2RetirePicks(f.picks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A clean outside-window roster row validates, and the read-only step leaves
+	// no approval and no exemption behind: it grants no authority.
+	if after := f.counts(t); after != [3]int64{0, 0, 0} {
+		t.Fatalf("fixture started dirty: %v", after)
+	}
+	if n, err := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptOutsideWindow, []deliveryExemptionRow{collatedRow(f)}, picks); err != nil || n != 1 {
+		t.Fatalf("clean roster did not validate: %d %v", n, err)
+	}
+	if after := f.counts(t); after != [3]int64{0, 0, 0} {
+		t.Fatalf("validation wrote state: %v", after)
+	}
+
+	// Now move one RAW source into the pinned window. The workload is a MIX: the
+	// output straddles the window boundary, so the classifier marks it in_window.
+	// It must not validate as outside_window, and it must not validate as
+	// confident_repair either.
+	w := f.windows[3]
+	f.fixture(`UPDATE recording_clips SET clip_start_at=$1,clip_end_at=$2 WHERE id=$3`,
+		w.Start.Add(-30*time.Minute).Format(time.RFC3339), w.Start.Add(30*time.Minute).Format(time.RFC3339), f.clipID)
+	// The output's own interval still sits outside the window, so only the source
+	// closure decides the class: this is exactly the mixed case the roster SQL
+	// cannot see.
+	for _, class := range []deliveryExemptionClass{deliveryExemptOutsideWindow, deliveryExemptConfidentRepair} {
+		if _, err := validateDeliveryExemptions(f.ctx, f.pool, class, []deliveryExemptionRow{collatedRow(f)}, picks); err == nil {
+			t.Fatalf("%s validated a mixed-source in-window output", class)
+		}
+	}
+	// The in_window class is the classifier's answer for it, so that one passes
+	// validation (its gate still stays closed until NAS custody and retirement).
+	if n, err := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptInWindow, []deliveryExemptionRow{collatedRow(f)}, picks); err != nil || n != 1 {
+		t.Fatalf("in_window mixed output did not validate as in_window: %d %v", n, err)
+	}
+	// And the seed step refuses the same wrong class, so validation and seeding
+	// can never disagree. The only row a seed may leave is its owner approval,
+	// which its own separate approve step writes; no exemption may exist.
+	if err := f.seed(t, deliveryExemptOutsideWindow, collatedRow(f)); err == nil {
+		t.Fatal("the seed admitted the mixed-source output as outside_window")
+	}
+	if after := f.counts(t); after[1] != 0 || after[2] != 0 {
+		t.Fatalf("a refused seed wrote an exemption: %v", after)
+	}
+}
+
+// counts is the durable state validation and refused seeds must never touch.
+func (f *nonrawFixture) counts(t *testing.T) [3]int64 {
+	t.Helper()
+	var approvals, exemptions, retirements int64
+	if err := f.pool.QueryRow(f.ctx, `SELECT (SELECT count(*) FROM r2_delivery_exemption_approvals),
+ (SELECT count(*) FROM r2_delivery_exemptions),(SELECT count(*) FROM r2_delivery_page_retirement)`).
+		Scan(&approvals, &exemptions, &retirements); err != nil {
+		t.Fatal(err)
+	}
+	return [3]int64{approvals, exemptions, retirements}
+}
+
+// TestR2NonrawExemptionRepairKeepsKeFolder: a confident repair whose stored path
+// contains a keep-everything folder component is refused by the seed's classifier
+// for the same reason execution refuses it, so a roster can never be approved
+// with a row the wire would hold.
+func TestR2NonrawExemptionRepairKeepsKeFolder(t *testing.T) {
+	f := newNonrawFixture(t, "exempt_repair_ke")
+	f.withPageKeys()
+	picks, err := loadR2RetirePicks(f.picks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The repair is clean and validates on its own.
+	if n, err := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptConfidentRepair, []deliveryExemptionRow{repairRow()}, picks); err != nil || n != 1 {
+		t.Fatalf("clean repair did not validate: %d %v", n, err)
+	}
+	// Put a KE folder name in the repair's stored relative path. The seed's own
+	// classifier must now hold it, so validate and seed both refuse.
+	keFolder := "KE_Repair_Folder"
+	f.fixture(`UPDATE delivery_keep_holds SET relative_path=$1 WHERE bucket='stoarama' AND object_key=$2`,
+		keFolder+"/June/Monday/30_hour_01_part_01.mp4", exemptRepairKey)
+	// Make the folder a KE folder by naming it on a keep-everything stream's
+	// catalog path; the fixture's stream 3 is decided "none", so add a KE stream.
+	f.fixture(`INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
+ VALUES(4,'test','4','ke','ke','https://test.invalid','off','Asia/Tokyo','hls','video_manifest','video_live','continuous_video',30)`)
+	f.fixture(`INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
+ VALUES(31,47,1,'ke','https://test.invalid','* * * * *','Asia/Tokyo','paused',4,now())`)
+	f.fixture(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path)
+ VALUES(7100001,31,1,'https://test.invalid','stoarama','managed/acct-47/ke/'||$1||'/clip.mp4',10,'ke-etag',repeat('d',64),'2026-06-01','2026-06-01 00:00:00','2026-06-01 00:01:00',$1||'/clip.mp4')`, keFolder)
+	kePicks := filepath.Join(t.TempDir(), "ke-picks.json")
+	data, _ := json.Marshal(map[string]any{"choices": map[string]any{
+		"3": r2RetirePick{Choice: "none", KeepStartUTC: f.windows[3].Start.Format(time.RFC3339), KeepEndUTC: f.windows[3].End.Format(time.RFC3339)},
+		"4": r2RetirePick{Choice: "all"},
+	}})
+	if err := os.WriteFile(kePicks, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	kePicksLoaded, err := loadR2RetirePicks(kePicks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptConfidentRepair, []deliveryExemptionRow{repairRow()}, kePicksLoaded); err == nil || n != 0 {
+		t.Fatalf("a repair inside a KE folder validated: %d %v", n, err)
+	}
+	// The seed refuses it too, and the classifier's reason is the KE path rule the
+	// collated lane applies, not some other hold.
+	p, err := loadInverseProtectionMode(f.ctx, f.pool, "stoarama", kePicksLoaded, f.windows, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := loadSeedAssessment(f.ctx, f.pool, "stoarama", exemptRepairKey, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := assessRepair(p, x); got.Reason != "keep_everything_path" {
+		t.Fatalf("repair with a KE folder in its stored path assessed %q", got.Reason)
+	}
+}
+
+// TestR2NonrawPageRetirementStagedProof: the CLI's own retirement path proves the
+// staged order in SQL. Without quiesce it refuses; with quiesce but a live reader
+// or a live capability it refuses; once both drain, the same call commits and
+// r2_delivery_page_retired() agrees.
+func TestR2NonrawPageRetirementStagedProof(t *testing.T) {
+	f := newNonrawFixture(t, "exempt_page_retire")
+	retire := func() (string, error) {
+		tx, err := f.pool.BeginTx(f.ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(f.ctx)
+		at, err := retireDeliveryPage(f.ctx, tx, pageGeneration, "test: staged proof")
+		if err != nil {
+			return "", err
+		}
+		if err = tx.Commit(f.ctx); err != nil {
+			return "", err
+		}
+		return at, nil
+	}
+	if _, err := retire(); err == nil || !strings.Contains(err.Error(), "not quiesced") {
+		t.Fatalf("retirement without quiesce was not refused: %v", err)
+	}
+	// A reader lease and a live capability both exist while the page still
+	// serves; only then is retirement armed.
+	f.exec(`INSERT INTO r2_delivery_public_readers(reader_id,expires_at) VALUES(repeat('a',32),clock_timestamp()+interval '2 minutes')`)
+	f.exec(`INSERT INTO r2_delivery_download_tickets(bucket,object_key,etag,size_bytes,object_path_sha256,expires_at,last_byte_by) VALUES('stoarama','x','e',1,repeat('a',64),clock_timestamp()+interval '2 minutes',clock_timestamp()+interval '3 minutes')`)
+	f.exec(`INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: staged proof')`)
+	if _, err := retire(); err == nil || !strings.Contains(err.Error(), "admitted public readers") {
+		t.Fatalf("retirement with a live reader was not refused: %v", err)
+	}
+	f.exec(`DELETE FROM r2_delivery_public_readers`)
+	if _, err := retire(); err == nil || !strings.Contains(err.Error(), "transferring") {
+		t.Fatalf("retirement with a live capability was not refused: %v", err)
+	}
+	f.exec(`DELETE FROM r2_delivery_download_tickets`)
+	at, err := retire()
+	if err != nil || at == "" {
+		t.Fatalf("drained retirement did not commit: %q %v", at, err)
+	}
+	var retired bool
+	if err := f.pool.QueryRow(f.ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil || !retired {
+		t.Fatalf("r2_delivery_page_retired() disagrees with the committed row: %v %v", retired, err)
+	}
+	// The direct insert path is refused for the same reasons the CLI path is: an
+	// operator cannot bypass the staged proof by writing the row by hand.
+	if _, err := retire(); err == nil {
+		t.Fatal("a second retirement committed")
 	}
 }

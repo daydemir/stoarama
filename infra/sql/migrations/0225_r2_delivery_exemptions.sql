@@ -30,6 +30,12 @@ CREATE TYPE r2_delivery_exemption_class AS ENUM ('outside_window','confident_rep
 -- the current and for every pinned generation. Retirement is therefore a serving
 -- fact the server enforces, never a claim recorded from CLI arguments. The row
 -- names the generation that was serving when it was written, for the record.
+--
+-- This row is the DESTRUCTIVE PREDICATE. It cannot exist until the proof is
+-- committed, and the proof is enforced in SQL by guard_r2_delivery_page_retirement
+-- below, not by the CLI: a quiesce row, zero unexpired public reader leases, and
+-- zero download capabilities that could still be transferring. r2_delivery_page_retired()
+-- reads only this row, so no exemption class opens a moment early.
 CREATE TABLE r2_delivery_page_retirement (
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
  generation text NOT NULL CHECK(generation ~ '^[a-f0-9]{32}$'),
@@ -37,10 +43,43 @@ CREATE TABLE r2_delivery_page_retirement (
  retired_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
+-- The staging state that arms retirement. Committing this row is the point of
+-- no return: from then on every public delivery route refuses a NEW request
+-- (503, reload later), because r2_delivery_public_serving() is false, while the
+-- readers admitted before it finish their response. It is deliberately a
+-- separate, non-destructive fact: the page is not retired yet, no exemption
+-- class is open, and the rollback window is documented as closed in
+-- docs/r2-inverse.md. The retirement trigger refuses to run without it.
+CREATE TABLE r2_delivery_page_quiesce (
+ singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
+ reason text NOT NULL CHECK(reason<>''),
+ armed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+-- One admitted public response, from before its first byte to after its last
+-- socket write. A response records itself here before it reads a registry, a
+-- metadata asset, a ticket or a file, and deletes the row after its body is
+-- written. The row is a LEASE with a hard expiry, so a crashed or abandoned
+-- response delays retirement by at most that lease and never wedges it. The
+-- retirement trigger refuses while any lease is unexpired, so retirement cannot
+-- commit in the middle of a response; the API never holds a database connection
+-- or a lock while streaming, only this row.
+CREATE TABLE r2_delivery_public_readers (
+ reader_id text PRIMARY KEY CHECK(reader_id ~ '^[a-f0-9]{32}$'),
+ admitted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+ expires_at timestamptz NOT NULL,
+ CHECK(expires_at > admitted_at)
+);
+CREATE INDEX r2_delivery_public_readers_live ON r2_delivery_public_readers(expires_at);
+
 -- Every download capability the public page hands out, so retirement can drain
--- them instead of leaving presigned URLs live. A ticket is minted only while the
--- page is serving; page-retired refuses to commit while any unreturned ticket is
--- still unexpired, and an expired ticket is already dead at the provider.
+-- them instead of leaving presigned URLs live. A row is written in the same
+-- transaction, under the same lock, as the capability it describes, so a
+-- capability can never outlive its record. expires_at is the provider's own
+-- capability expiry; last_byte_by adds the maximum in-flight transfer bound,
+-- because a provider does not cut a transfer that already started when the
+-- capability expires. Retirement refuses until last_byte_by has passed, measured
+-- on the database clock, so it can never retire while a transfer may still be
+-- reading bytes.
 CREATE TABLE r2_delivery_download_tickets (
  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
  bucket text NOT NULL,
@@ -49,9 +88,12 @@ CREATE TABLE r2_delivery_download_tickets (
  size_bytes bigint NOT NULL CHECK(size_bytes>0),
  object_path_sha256 text NOT NULL CHECK(object_path_sha256 ~ '^[a-f0-9]{64}$'),
  issued_at timestamptz NOT NULL DEFAULT clock_timestamp(),
- expires_at timestamptz NOT NULL
+ expires_at timestamptz NOT NULL,
+ last_byte_by timestamptz NOT NULL,
+ CHECK(last_byte_by >= expires_at)
 );
 CREATE INDEX r2_delivery_download_tickets_live ON r2_delivery_download_tickets(expires_at);
+CREATE INDEX r2_delivery_download_tickets_transferring ON r2_delivery_download_tickets(last_byte_by);
 
 -- The owner approval each roster was approved for: one append-only row per
 -- ROSTER DIGEST, recorded by its own command step before any seeding. The digest
@@ -86,10 +128,10 @@ CREATE TABLE r2_delivery_exemptions (
 
 CREATE FUNCTION guard_r2_delivery_exemption_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
- RAISE EXCEPTION 'R2 delivery exemptions, approvals and the page retirement state are append-only';
+ RAISE EXCEPTION 'R2 delivery exemptions, approvals, the quiesce state and the page retirement state are append-only';
 END $$;
 DO $$ DECLARE t text; BEGIN
- FOREACH t IN ARRAY ARRAY['r2_delivery_exemptions','r2_delivery_exemption_approvals','r2_delivery_page_retirement'] LOOP
+ FOREACH t IN ARRAY ARRAY['r2_delivery_exemptions','r2_delivery_exemption_approvals','r2_delivery_page_quiesce','r2_delivery_page_retirement'] LOOP
   EXECUTE format('CREATE TRIGGER %s_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_exemption_immutable()',t,t);
   EXECUTE format('CREATE TRIGGER %s_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_delivery_exemption_immutable()',t,t);
   EXECUTE format('ALTER TABLE %I ENABLE ALWAYS TRIGGER %s_immutable',t,t);
@@ -164,6 +206,105 @@ RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT false $$;
 CREATE FUNCTION r2_delivery_page_retired() RETURNS boolean LANGUAGE sql STABLE AS $$
  SELECT EXISTS(SELECT 1 FROM r2_delivery_page_retirement)
 $$;
+
+-- True while the page may serve a NEW request. It is false from the moment the
+-- staging quiesce row commits and stays false once the page is retired. The API
+-- reads it live before admitting a reader, so neither the quiesce state nor the
+-- retired state can be bypassed by a warm cache, a pinned generation or a
+-- direct storage read. It is also the SQL-side arm gate: the retirement trigger
+-- requires this to be false, so retirement is impossible without a committed
+-- quiesce.
+CREATE FUNCTION r2_delivery_public_serving() RETURNS boolean LANGUAGE sql STABLE AS $$
+ SELECT NOT EXISTS(SELECT 1 FROM r2_delivery_page_quiesce)
+    AND NOT EXISTS(SELECT 1 FROM r2_delivery_page_retirement)
+$$;
+
+-- The exclusive side of the shared/exclusive public admission this migration
+-- implements. Every admitted public response holds ONE short shared transaction
+-- (pg_advisory_xact_lock_shared) for the registry/metadata/ticket decision, and
+-- releases it before streaming; its r2_delivery_public_readers lease row is what
+-- spans the byte transfer. Retirement takes this same lock exclusively, so it
+-- serializes against registry publication, ticket minting and admission without
+-- ever waiting on a socket. A plain SELECT keeps it in one place, so the server
+-- and the CLI cannot disagree about the key.
+CREATE FUNCTION r2_delivery_public_lock() RETURNS bigint LANGUAGE sql IMMUTABLE AS $$ SELECT 7343226011104::bigint $$;
+
+-- A public reader lease is admitted only while the page may serve, in the same
+-- statement that writes it. READ COMMITTED is required so an earlier snapshot
+-- cannot admit a reader after a quiesce committed.
+CREATE FUNCTION guard_r2_delivery_public_reader() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'a public delivery reader lease requires READ COMMITTED' USING ERRCODE='55000';
+ END IF;
+ PERFORM pg_advisory_xact_lock_shared(r2_delivery_public_lock());
+ IF NOT r2_delivery_public_serving() THEN
+  RAISE EXCEPTION 'the public delivery page is not serving'
+   USING ERRCODE='55000', HINT='retire/quiesce is in progress; no new public reader is admitted';
+ END IF;
+ IF NEW.expires_at<=clock_timestamp() OR NEW.expires_at>clock_timestamp()+interval '10 minutes' THEN
+  RAISE EXCEPTION 'public reader lease must expire within ten minutes';
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_delivery_public_reader_admission BEFORE INSERT ON r2_delivery_public_readers
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_public_reader();
+ALTER TABLE r2_delivery_public_readers ENABLE ALWAYS TRIGGER r2_delivery_public_reader_admission;
+
+-- A ticket row is written in the same transaction as its capability, while the
+-- page serves, under the shared public lock: retirement's exclusive lock then
+-- cannot commit between the page check and the row, and no ticket can be minted
+-- after retirement armed. last_byte_by is at least the capability expiry.
+CREATE FUNCTION guard_r2_delivery_download_ticket() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'a public delivery ticket requires READ COMMITTED' USING ERRCODE='55000';
+ END IF;
+ PERFORM pg_advisory_xact_lock_shared(r2_delivery_public_lock());
+ IF NOT r2_delivery_public_serving() THEN
+  RAISE EXCEPTION 'the public delivery page is not serving'
+   USING ERRCODE='55000', HINT='no download capability may be minted after quiesce or retirement';
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_delivery_download_ticket_admission BEFORE INSERT ON r2_delivery_download_tickets
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_download_ticket();
+ALTER TABLE r2_delivery_download_tickets ENABLE ALWAYS TRIGGER r2_delivery_download_ticket_admission;
+
+-- Retirement is the destructive predicate and it is proved HERE, in SQL, under
+-- the exclusive public lock, never by a caller's claim:
+--   1. the page must be quiesced (the staging fact committed first);
+--   2. no admitted public reader lease may be unexpired (every response that was
+--      streaming has finished, judged on the database clock);
+--   3. no download capability may still be transferring (its last_byte_by has
+--      passed), so a presigned URL cannot outlive the page.
+-- The INSERT itself is refused otherwise, so a stale, older or hand-run binary
+-- cannot retire the page early. Retiring twice is refused by the singleton key.
+CREATE FUNCTION guard_r2_delivery_page_retirement() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE live_readers bigint; live_capabilities bigint; armed boolean;
+BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'page retirement requires READ COMMITTED' USING ERRCODE='55000';
+ END IF;
+ PERFORM pg_advisory_xact_lock(r2_delivery_public_lock());
+ SELECT EXISTS(SELECT 1 FROM r2_delivery_page_quiesce) INTO armed;
+ IF NOT armed THEN
+  RAISE EXCEPTION 'page retirement requires the committed quiesce state'
+   USING ERRCODE='55000', HINT='run r2-inverse page-quiesce first and let admitted readers drain';
+ END IF;
+ SELECT count(*) INTO live_readers FROM r2_delivery_public_readers WHERE expires_at>clock_timestamp();
+ IF live_readers<>0 THEN
+  RAISE EXCEPTION 'refusing page retirement: % admitted public readers are still unexpired', live_readers;
+ END IF;
+ SELECT count(*) INTO live_capabilities FROM r2_delivery_download_tickets WHERE last_byte_by>clock_timestamp();
+ IF live_capabilities<>0 THEN
+  RAISE EXCEPTION 'refusing page retirement: % download capabilities may still be transferring', live_capabilities;
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_delivery_page_retirement_proof BEFORE INSERT ON r2_delivery_page_retirement
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_page_retirement();
+ALTER TABLE r2_delivery_page_retirement ENABLE ALWAYS TRIGGER r2_delivery_page_retirement_proof;
 
 -- True only for an exempt exact page key whose class gate is open now. A class
 -- without a gate branch yields NULL and stays held.
