@@ -44,6 +44,64 @@ func wideLocksFreeWithin(t *testing.T, pool *pgxpool.Pool, limit time.Duration) 
 	return tryWideLocks(t, pool)
 }
 
+// Batch initialization loads the KE path set and the owner keeps once, under
+// both wide cleanup locks. Before its own bound, a session holding
+// r2_owner_keep_prefixes ACCESS EXCLUSIVE made that read queue with the wide
+// locks still held, so no other writer could take them for as long as the
+// holder lived. The transaction-local bound turns that into SQLSTATE 55P03, so
+// admission rolls back, awaits outside, and retries.
+func TestR2InverseApplyInitializationBoundsProtectionReads(t *testing.T) {
+	f := newKeep28Fixture(t)
+	picks, err := loadR2RetirePicks(f.options.Picks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, windows, err := api.Keep28Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := releaseOnce(func() { holder.Rollback(context.Background()) })
+	defer release()
+	// The owner-keep read is one of the two sets initialization loads.
+	if _, err = holder.Exec(f.ctx, `LOCK TABLE r2_owner_keep_prefixes IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	type admitted struct {
+		protection inverseProtection
+		epoch      int64
+		err        error
+	}
+	done := make(chan admitted, 1)
+	go func() {
+		var epoch int64
+		p, err := loadInverseApplyAdmission(f.ctx, f.pool, f.sdk, picks, windows, &epoch)
+		done <- admitted{p, epoch, err}
+	}()
+	// The held table keeps initialization from finishing: it retries outside
+	// the wide locks instead of queueing behind the holder.
+	time.Sleep(4 * inverseLockTimeout)
+	select {
+	case got := <-done:
+		t.Fatalf("initialization finished under a held owner-keep table: %+v", got)
+	default:
+	}
+	if !wideLocksFreeWithin(t, f.pool, time.Second) {
+		t.Fatal("no writer could take 7343226011103/7343226011101 within 1s while initialization retried behind its table lock")
+	}
+	release()
+	got := within(t, done, "initialization after its holder released")
+	if got.err != nil {
+		t.Fatalf("initialization did not succeed after its holder released: %v", got.err)
+	}
+	if got.epoch <= 0 || got.protection.Picks.SHA256 == "" {
+		t.Fatalf("initialization returned no usable protection: epoch %d", got.epoch)
+	}
+}
+
 // releaseOnce makes a holder release safe to call twice: the deferred release
 // and the explicit one the bounded case needs.
 func releaseOnce(release func()) func() {
@@ -96,10 +154,18 @@ func unboundedSameStatement(t *testing.T, ctx context.Context, pool *pgxpool.Poo
 		t.Fatal(err)
 	}
 	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	// stop cancels the waiting statement and joins it before rolling back: one
+	// transaction cannot take Rollback while its Exec is still in flight.
 	var once sync.Once
 	stop = func() {
 		once.Do(func() {
 			cancel()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Error("the unbound statement never returned after its cancel")
+			}
 			tx.Rollback(context.Background())
 		})
 	}
@@ -114,11 +180,11 @@ func unboundedSameStatement(t *testing.T, ctx context.Context, pool *pgxpool.Poo
 		`SELECT pg_advisory_xact_lock` + mode + `(7343226011101)`,
 	} {
 		if _, err = tx.Exec(ctx, step); err != nil {
-			stop()
+			cancel()
+			tx.Rollback(context.Background())
 			t.Fatal(err)
 		}
 	}
-	done := make(chan error, 1)
 	go func() {
 		_, err := tx.Exec(runCtx, stmt, args...)
 		done <- err

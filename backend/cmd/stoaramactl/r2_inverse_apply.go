@@ -270,6 +270,35 @@ type inverseBusy []inverseWait
 
 func (inverseBusy) Error() string { return "R2 retirement admission lock busy" }
 
+// inverseBusyCause is a lock refusal that named no lock: a bound statement
+// lost its wait, so admission backs off outside the wide locks instead. It
+// still keeps PostgreSQL's own cause, so a caller that runs past the retry
+// bound can tell a real lock loss from any other failure.
+type inverseBusyCause struct {
+	inverseBusy
+	cause error
+}
+
+func (e *inverseBusyCause) Unwrap() error { return e.cause }
+
+// As lets errors.As still read the unnamed busy result from this wrapper.
+func (e *inverseBusyCause) As(target any) bool {
+	if p, ok := target.(*inverseBusy); ok {
+		*p = e.inverseBusy
+		return true
+	}
+	return false
+}
+
+// inverseBusyCauseOf returns the lock refusal a busy admission carried.
+func inverseBusyCauseOf(err error) error {
+	var caused *inverseBusyCause
+	if errors.As(err, &caused) {
+		return caused.cause
+	}
+	return nil
+}
+
 // inverseContentionBackoff is the pause between attempts when a lock bound
 // refused a statement without naming the lock. The attempt itself names nothing
 // in that case, so admission frees the wide locks and waits outside them.
@@ -347,7 +376,10 @@ func admitInverse[T any](ctx context.Context, begin func(context.Context) (pgx.T
 		}
 		last = busy
 		if attempts >= inverseAdmissionRetries {
-			return value, busyFailure(attempts, busy, nil)
+			// Keep the refused lock's own cause: a caller that publishes a
+			// confirmed absence must still see a real lock loss, never a
+			// generic deadline, to decide between retry and a held key.
+			return value, busyFailure(attempts, busy, inverseBusyCauseOf(err))
 		}
 		if err = busy.await(ctx, begin); err != nil {
 			if ctx.Err() != nil {
@@ -433,10 +465,13 @@ func lockInverseCopyKey(ctx context.Context, tx pgx.Tx, bucket, key string) erro
 	return nil
 }
 
-// inverseRowBusy turns a NOWAIT miss into a wait for that row.
+// inverseRowBusy turns a NOWAIT miss into a wait for that row. The refusal is
+// kept as the cause, so a caller that exhausts its retry bound can still tell a
+// real PostgreSQL lock refusal from any other failure. An exact stitch trigger
+// outcome is never a plain row wait and keeps its own hard meaning.
 func inverseRowBusy(err error, wait inverseWait) error {
-	if inverseLockBusy(err) {
-		return inverseBusy{wait}
+	if inverseLockBusy(err) && !inverseStitchRefusal(err) {
+		return &inverseBusyCause{inverseBusy{wait}, err}
 	}
 	return err
 }
@@ -479,13 +514,14 @@ func inverseLockContention(err error) bool {
 // inverseContention turns a bound lock wait into contention, so admission takes
 // its existing path: roll back, wait outside, retry inside the deadline. It
 // names no wait because the refused statement does not say which lock it wanted;
-// admission backs off outside the wide locks instead.
+// admission backs off outside the wide locks instead. An exact stitch refusal is
+// never contention: it is that key's own durable outcome, kept as it is.
 func inverseContention(err error) error {
 	var busy inverseBusy
-	if !inverseLockContention(err) || errors.As(err, &busy) {
+	if !inverseLockContention(err) || errors.As(err, &busy) || inverseStitchRefusal(err) {
 		return err
 	}
-	return inverseBusy{}
+	return &inverseBusyCause{cause: err}
 }
 
 // The parent recording needs no row lock: 0201's identity trigger and the
@@ -504,6 +540,22 @@ var errInverseStitchConflict = errors.New("R2 key held by Durham stitching; skip
 var inverseStitchLedgerOutcomes = []pgconn.PgError{
 	{Code: "55000", Message: "active R2 stitch input hold"},
 	{Code: "55P03", Message: "stitch input hold admission is busy"},
+}
+
+// inverseStitchRefusal reports the trigger's own exact outcomes. Both share a
+// SQLSTATE with plain contention, so only the exact code and message pair keeps
+// the stitch meaning; every other 55P03 stays a lock refusal.
+func inverseStitchRefusal(err error) bool {
+	var pg *pgconn.PgError
+	if !errors.As(err, &pg) {
+		return false
+	}
+	for _, outcome := range inverseStitchLedgerOutcomes {
+		if pg.Code == outcome.Code && pg.Message == outcome.Message {
+			return true
+		}
+	}
+	return false
 }
 
 const inverseStitchHeldSQL = `EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds WHERE bucket=$1 AND object_key=$2 AND released_at IS NULL)`
@@ -886,9 +938,14 @@ const (
 // parent cancel or deadline stops the job and holds nothing, because the 404
 // that confirmed the DELETE is not this step's failure. An explicit cancel
 // (57014: publication disables the role's statement_timeout, so only a cancel
-// raises it), a refusal or an inconsistent publication is never transient.
+// raises it), a refusal or an inconsistent publication is never transient. An
+// exact stitch trigger outcome keeps its own hard meaning even though it shares
+// 55P03 with a lock refusal: it is a durable conflict, not a lock wait.
 func inverseDBTransient(parent, step context.Context, err error) bool {
 	if parent.Err() != nil {
+		return false
+	}
+	if inverseStitchRefusal(err) {
 		return false
 	}
 	var pgErr *pgconn.PgError
@@ -1208,27 +1265,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	}
 	defer ledger.close()
 	var keEpoch int64
-	protection, err := admitInverse(ctx, inverseBegin(pool), func(ctx context.Context) (inverseProtection, error) {
-		initTx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-		if err != nil {
-			return inverseProtection{}, err
-		}
-		defer initTx.Rollback(context.Background())
-		if err = inverseProtectionBarrier(ctx, initTx); err != nil {
-			return inverseProtection{}, err
-		}
-		if err = inverseProtectionLocks(ctx, initTx, true); err != nil {
-			return inverseProtection{}, err
-		}
-		if err = initTx.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`).Scan(&keEpoch); err != nil {
-			return inverseProtection{}, err
-		}
-		protection, err := loadInverseApplyProtection(ctx, initTx, store.Bucket(), picks, windows)
-		if err != nil {
-			return protection, err
-		}
-		return protection, initTx.Commit(ctx)
-	})
+	protection, err := loadInverseApplyAdmission(ctx, pool, store, picks, windows, &keEpoch)
 	if err != nil {
 		return result, err
 	}
@@ -1484,6 +1521,44 @@ send:
 	result.ElapsedSeconds = time.Since(started).Seconds()
 	result.ObjectsPerSecond = float64(result.Deleted) / result.ElapsedSeconds
 	return result, first
+}
+
+// loadInverseApplyAdmission is the batch's admission: it takes the wide
+// cleanup locks, bounds every later lock wait, then loads the KE path set and
+// the owner keeps under those locks. Every statement after the wide locks runs
+// with the transaction-local lock bound, so a busy table becomes SQLSTATE 55P03
+// and admission rolls back, awaits it outside, then retries. keEpoch receives
+// the catalog epoch the loaded protection was read at.
+func loadInverseApplyAdmission(ctx context.Context, pool *pgxpool.Pool, store inverseReader, picks r2RetirePicks, windows map[int64]api.Keep28Window, keEpoch *int64) (inverseProtection, error) {
+	return admitInverse(ctx, inverseBegin(pool), func(ctx context.Context) (inverseProtection, error) {
+		initTx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			return inverseProtection{}, err
+		}
+		defer initTx.Rollback(context.Background())
+		if err = inverseProtectionBarrier(ctx, initTx); err != nil {
+			return inverseProtection{}, err
+		}
+		if err = inverseProtectionLocks(ctx, initTx, true); err != nil {
+			return inverseProtection{}, err
+		}
+		// Initialization holds both wide cleanup locks from here on, so every
+		// later table or row wait must fail at once instead of queueing behind
+		// them. Admission then awaits that lock outside and retries.
+		if err = boundInverseLocks(ctx, initTx); err != nil {
+			return inverseProtection{}, err
+		}
+		if err = initTx.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`).Scan(keEpoch); err != nil {
+			return inverseProtection{}, inverseContention(err)
+		}
+		protection, err := loadInverseApplyProtection(ctx, initTx, store.Bucket(), picks, windows)
+		if err != nil {
+			// Only PostgreSQL's own lock refusal is contention; the attempt is
+			// rolled back by the deferred rollback before admission awaits.
+			return protection, inverseContention(err)
+		}
+		return protection, initTx.Commit(ctx)
+	})
 }
 
 // Apply loads only the small KE path set, not the full4M-row catalog. Every raw

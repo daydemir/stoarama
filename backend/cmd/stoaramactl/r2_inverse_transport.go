@@ -174,7 +174,18 @@ func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverse
 // cancelled with, the admission attempt. Keep-28 adds its NAS custody proof and
 // bounds both by its expiry.
 func (a *inverseApplier) authorize(admitCtx, wireCtx context.Context, tx pgx.Tx, e inverseEntry, gate *inverseSendGate) (*inverseDeleteAuthority, error) {
-	target, err := a.prepareWireTarget(admitCtx, tx, e)
+	// The key's own network budget starts here, before its locks are prepared.
+	// Every pre-issuance step holds the wide cleanup locks, so preflight that
+	// outlived the wire deadline could never issue: bound each one by the
+	// earliest of admission, the parent's deadline and the network timeout.
+	// Keep-28 tightens the same bound to custody end once it is proven.
+	deadline := time.Now().Add(inverseNetworkTimeout)
+	if parent, ok := wireCtx.Deadline(); ok && parent.Before(deadline) {
+		deadline = parent
+	}
+	preIssue, stopPreIssue := context.WithDeadline(admitCtx, deadline)
+	defer stopPreIssue()
+	target, err := a.prepareWireTarget(preIssue, tx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -182,30 +193,23 @@ func (a *inverseApplier) authorize(admitCtx, wireCtx context.Context, tx pgx.Tx,
 	var custody keep28Custody
 	var custodyEnd time.Time
 	if a.opts.Lane == inverseNASKeep28 {
-		if custody, custodyEnd, err = a.proveKeep28(admitCtx, tx, e, target); err != nil {
+		if custody, custodyEnd, err = a.proveKeep28(preIssue, tx, e, target); err != nil {
 			return nil, err
 		}
+		tightened, stop := context.WithDeadline(preIssue, custodyEnd)
+		defer stop()
+		preIssue = tightened
+		if custodyEnd.Before(deadline) {
+			deadline = custodyEnd
+		}
 	}
-	// The key's own network budget starts once its locks are held, and ends at
-	// custody end when that is tighter. wireCtx carries the job's parent
-	// deadline, so an earlier parent bound still wins.
-	deadline := time.Now().Add(inverseNetworkTimeout)
-	if a.opts.Lane == inverseNASKeep28 && custodyEnd.Before(deadline) {
-		deadline = custodyEnd
-	}
+	// The returned authority carries wireCtx, which outlives admission and is
+	// never cancelled with it; an earlier parent bound still wins.
 	ctx, cancel := context.WithDeadline(wireCtx, deadline)
 	fail := func(err error) (*inverseDeleteAuthority, error) { cancel(); return nil, err }
 	// Every check before issuance and the attempt insert itself are admission
-	// work: they run under the admission deadline, so none of them can outlive
-	// it while the wire transaction holds the wide cleanup locks. Keep-28 also
-	// stops them at custody end. Only the returned authority carries the wire
-	// context, bounded by the network deadline and by custody.
-	preIssue := admitCtx
-	if a.opts.Lane == inverseNASKeep28 {
-		var stop context.CancelFunc
-		preIssue, stop = context.WithDeadline(admitCtx, custodyEnd)
-		defer stop()
-	}
+	// work under the pre-issuance bound: none of them can outlive the wire
+	// deadline while the wire transaction holds the wide cleanup locks.
 	if err = a.checkWireHead(preIssue, tx, e, target); err != nil {
 		return fail(err)
 	}
@@ -213,6 +217,11 @@ func (a *inverseApplier) authorize(admitCtx, wireCtx context.Context, tx pgx.Tx,
 	binding := guard.binding()
 	if err = guard.check(preIssue, binding); err != nil {
 		return fail(err)
+	}
+	// Nothing is minted once the wire deadline has passed: authority that can
+	// never send must not exist, so this fails before the attempt insert.
+	if err = preIssue.Err(); err != nil {
+		return fail(fmt.Errorf("pre-issuance ended before wire authority could be issued: %w", err))
 	}
 	// Independent commit precedes capability issuance. Even another verifier or
 	// process cannot remint authority after any ambiguous/crashed wire attempt.
