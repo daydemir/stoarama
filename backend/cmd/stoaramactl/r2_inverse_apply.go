@@ -22,6 +22,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -82,8 +83,11 @@ type inverseApplySummary struct {
 	AmbiguousHeld int64 `json:"ambiguous_held"`
 	// HeldAbsent lists held keys, issued before this run, whose objects are gone.
 	// They stay held and unretired; this only reports them.
-	HeldAbsent       []string     `json:"held_absent"`
-	WireAmbiguous    []string     `json:"wire_ambiguous"`
+	HeldAbsent    []string `json:"held_absent"`
+	WireAmbiguous []string `json:"wire_ambiguous"`
+	// Unpublished lists keys whose DELETE was confirmed by a 404 but whose
+	// absence could not be published. Like WireAmbiguous they stay held.
+	Unpublished      []string     `json:"unpublished"`
 	LastModifiedHeld r2RetireStat `json:"last_modified_held"`
 	// CustodyShort counts keep-28 keys skipped before any write because their
 	// custody could end before a DELETE finishes; fresh custody retries them.
@@ -442,7 +446,64 @@ func (g *inverseWireGuard) check(ctx context.Context, binding inverseDeleteBindi
 	return nil
 }
 
-const inverseNetworkTimeout = 30 * time.Second
+// One key's network calls and database steps have separate bounds, so lock
+// waits never spend the network budget. The network calls (identity HEAD, the
+// single DELETE, the confirming HEAD and its retries) share
+// inverseNetworkTimeout from when the wire transaction holds its locks;
+// keep-28 also ends them at custody end. Each database step (reservation, wire
+// preparation, the wire commit, each publication attempt) gets
+// inverseDBTimeout: it may queue behind sibling protection locks.
+const (
+	inverseNetworkTimeout = 30 * time.Second
+	inverseDBTimeout      = 2 * time.Minute
+	// inversePublishAttempts bounds publication of a confirmed absence.
+	inversePublishAttempts = 3
+)
+
+// inverseStep names the step of one key that failed, so a stop says where.
+type inverseStep string
+
+const (
+	inverseStepReserve inverseStep = "reserve"
+	inverseStepWire    inverseStep = "wire"
+	inverseStepHead    inverseStep = "head"
+	inverseStepCommit  inverseStep = "commit"
+	inverseStepPublish inverseStep = "publish"
+)
+
+type inverseStepError struct {
+	step inverseStep
+	key  string
+	err  error
+}
+
+func (e *inverseStepError) Error() string { return fmt.Sprintf("%s %s: %v", e.step, e.key, e.err) }
+func (e *inverseStepError) Unwrap() error { return e.err }
+
+// errInverseUnpublished marks a key whose DELETE a 404 confirmed but whose
+// absence a database timeout or lock contention kept from being published.
+// Like a lost response it holds only that key, issued and unresolved, and is
+// never resent.
+var errInverseUnpublished = errors.New("DELETE confirmed absent but absence unpublished; key held, never retransmit")
+
+// inverseKeyHeld reports a failure that holds only its own key.
+func inverseKeyHeld(err error) bool {
+	return errors.Is(err, errInverseWireAmbiguous) || errors.Is(err, errInverseUnpublished)
+}
+
+// inverseDBTransient reports a database timeout or lock contention, never a
+// refusal or an inconsistent publication.
+func inverseDBTransient(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "55P03", "40P01", "40001", "57014": // lock_not_available, deadlock, serialization, statement timeout
+			return true
+		}
+		return false
+	}
+	return pgconn.Timeout(err)
+}
 
 // errKeep28CustodyShort skips a keep-28 key whose custody ends within one
 // network timeout plus keep28CustodyMargin. It writes nothing durable and is
@@ -457,13 +518,17 @@ var errInverseAdmissionClosed = errors.New("batch stopped before this key was re
 // reserved, or still waiting on its reservation locks, writes nothing and stops.
 // send closes on a hard failure only: a reserved key then stops before its
 // first DELETE and stays held. A DELETE already sent finishes confirmation.
+// Every failure names its step and key.
 func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGate, e inverseEntry) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, inverseNetworkTimeout)
-	defer cancel()
 	if admit.Err() != nil {
 		return false, errInverseAdmissionClosed
 	}
-	reserving, stopReserving := context.WithCancel(ctx)
+	fail := func(step inverseStep, err error) (bool, error) {
+		return false, &inverseStepError{step, e.Key, err}
+	}
+	db, cancel := context.WithTimeout(ctx, inverseDBTimeout)
+	defer cancel()
+	reserving, stopReserving := context.WithCancel(db)
 	defer context.AfterFunc(admit, stopReserving)()
 	_, err := a.reserve(reserving, e)
 	stopReserving()
@@ -473,19 +538,19 @@ func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGat
 		if admit.Err() != nil && errors.Is(err, context.Canceled) {
 			return false, errInverseAdmissionClosed
 		}
-		return false, err
+		return fail(inverseStepReserve, err)
 	}
 	if err = a.record(e, inverseIntent, a.opts.ManifestSHA); err != nil {
-		return false, err
+		return fail(inverseStepReserve, err)
 	}
-	tx, err := a.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	tx, err := a.pool.BeginTx(db, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
-		return false, err
+		return fail(inverseStepWire, err)
 	}
 	defer tx.Rollback(context.Background())
 	authority, err := a.authorize(ctx, tx, e, send)
 	if err != nil {
-		return false, err
+		return fail(inverseStepWire, err)
 	}
 	defer authority.cancel()
 	if send.isClosed() {
@@ -493,26 +558,60 @@ func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGat
 	}
 	if err = a.store.(inverseDeleteStore).deleteOnce(authority.ctx, authority); err != nil {
 		if errors.Is(err, errInverseWireAmbiguous) {
-			return false, fmt.Errorf("single DELETE result ambiguous; intent retained, never retransmit: %w", err)
+			return fail(inverseStepWire, fmt.Errorf("single DELETE result ambiguous; intent retained, never retransmit: %w", err))
 		}
-		return false, fmt.Errorf("single DELETE failed; intent retained, never retransmit: %w", err)
+		return fail(inverseStepWire, fmt.Errorf("single DELETE failed; intent retained, never retransmit: %w", err))
 	}
 	// Confirmation ends at the running custody minimum, sampled again here.
-	ctx, stop, err := authority.bound(authority.ctx)
+	confirming, stop, err := authority.bound(authority.ctx)
 	if err != nil {
-		return false, err
+		return fail(inverseStepHead, err)
 	}
-	defer stop()
-	if err = a.store.(inverseDeleteStore).confirmAbsent(ctx, e.Key); err != nil {
-		return false, err
+	err = a.store.(inverseDeleteStore).confirmAbsent(confirming, e.Key)
+	stop()
+	if err != nil {
+		return fail(inverseStepHead, err)
 	}
-	if err = tx.Commit(ctx); err != nil {
-		return false, err
+	// The key is gone; what follows is bookkeeping. The wire transaction holds
+	// only locks, and publication must wait for it to release them.
+	committing, cancel := context.WithTimeout(ctx, inverseDBTimeout)
+	err = tx.Commit(committing)
+	cancel()
+	if err != nil {
+		return fail(inverseStepCommit, inverseHoldUnpublished(err))
 	}
-	if err = a.publishAbsent(ctx, e, a.opts.ManifestSHA); err != nil {
-		return false, err
+	if err = a.publishConfirmed(ctx, e); err != nil {
+		return fail(inverseStepPublish, err)
 	}
 	return true, nil
+}
+
+// inverseHoldUnpublished turns a transient database failure after a confirmed
+// DELETE into errInverseUnpublished; any other failure stays a hard one.
+func inverseHoldUnpublished(err error) error {
+	if inverseDBTransient(err) {
+		return fmt.Errorf("%w: %w", errInverseUnpublished, err)
+	}
+	return err
+}
+
+// publishConfirmed publishes a confirmed absence, retrying a database timeout
+// or lock contention, each attempt under its own inverseDBTimeout.
+// publishAbsent is idempotent, so a retry after an unacknowledged commit is safe.
+func (a *inverseApplier) publishConfirmed(ctx context.Context, e inverseEntry) error {
+	for attempt := 1; ; attempt++ {
+		db, cancel := context.WithTimeout(ctx, inverseDBTimeout)
+		err := a.publishAbsent(db, e, a.opts.ManifestSHA)
+		cancel()
+		if err == nil || !inverseDBTransient(err) || attempt == inversePublishAttempts {
+			return inverseHoldUnpublished(err)
+		}
+		select {
+		case <-ctx.Done():
+			return inverseHoldUnpublished(err)
+		case <-time.After(time.Duration(attempt) * time.Second):
+		}
+	}
 }
 func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, manifest string) error {
 	tx, err := a.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
@@ -850,7 +949,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	var first error
 	var mu sync.Mutex
 	var deleted, bytes atomic.Int64
-	var wireAmbiguous []string
+	var wireAmbiguous, unpublished []string
 	var modifiedHeld, modifiedBytes atomic.Int64
 	var custodyShort r2RetireStat
 	for range o.Workers {
@@ -873,23 +972,27 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 					continue
 				}
 				if err != nil {
+					log.Printf("r2-inverse key failed: %v", err)
 					var modifiedErr inverseLastModifiedError
 					if errors.As(err, &modifiedErr) {
 						modifiedHeld.Add(1)
 						modifiedBytes.Add(e.SizeBytes)
 					}
-					wire := errors.Is(err, errInverseWireAmbiguous)
-					// Report any other failure over a lost response, so callers
-					// see wire ambiguity only when it is the sole failure.
+					held := inverseKeyHeld(err)
+					// Report any other failure over a held key, so callers see
+					// a held key only when holding is the sole failure.
 					mu.Lock()
-					if wire {
+					switch {
+					case errors.Is(err, errInverseWireAmbiguous):
 						wireAmbiguous = append(wireAmbiguous, e.Key)
+					case errors.Is(err, errInverseUnpublished):
+						unpublished = append(unpublished, e.Key)
 					}
-					if first == nil || !wire && errors.Is(first, errInverseWireAmbiguous) {
+					if first == nil || !held && inverseKeyHeld(first) {
 						first = err
 					}
 					mu.Unlock()
-					if !wire {
+					if !held {
 						send.close()
 					}
 					halt()
@@ -912,6 +1015,8 @@ send:
 	result.Deleted = deleted.Load()
 	sort.Strings(wireAmbiguous)
 	result.WireAmbiguous = wireAmbiguous
+	sort.Strings(unpublished)
+	result.Unpublished = unpublished
 	result.Bytes = bytes.Load()
 	result.LastModifiedHeld.Objects += modifiedHeld.Load()
 	result.LastModifiedHeld.Bytes += modifiedBytes.Load()

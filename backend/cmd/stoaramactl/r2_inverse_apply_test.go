@@ -599,6 +599,110 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatalf("response timeout: %v", err)
 		}
 	})
+	t.Run("deadline_bound_DELETE_without_reply_is_ambiguous", func(t *testing.T) {
+		// The DELETE's own network deadline, not a cancelled parent, ends a
+		// fully written request that never got an answer: the key is held.
+		a, entries := build(1)
+		defer a.ledger.close()
+		e := entries[0]
+		a.store = sdk
+		if _, err := a.reserve(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		authority, err := a.authorize(ctx, tx, e, &inverseSendGate{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer authority.cancel()
+		if deadline, ok := authority.ctx.Deadline(); !ok || time.Until(deadline) > inverseNetworkTimeout {
+			t.Fatal("DELETE is not bound by the network deadline")
+		}
+		// As if the network budget were nearly spent.
+		near, cancel := context.WithTimeout(authority.ctx, time.Second)
+		defer cancel()
+		authority.ctx = near
+		setWire(map[string]string{e.Key: "slow"}, nil)
+		before := providerDeletes()
+		err = sdk.deleteOnce(near, authority)
+		setWire(nil, nil)
+		if !errors.Is(err, errInverseWireAmbiguous) || !errors.Is(near.Err(), context.DeadlineExceeded) || providerDeletes()-before != 1 {
+			t.Fatalf("deadline-bound DELETE: %v (context %v)", err, near.Err())
+		}
+	})
+	t.Run("publication_outlasts_a_shared_lock_holder", func(t *testing.T) {
+		// Production shape (full-004): a sibling holds 7343226011101 shared
+		// past the old 30s key budget after this key's DELETE is confirmed.
+		// Publication waits for its exclusive lock under its own database
+		// bound and succeeds once the holder releases; the batch goes on.
+		a, _ := build(2)
+		a.ledger.close()
+		a.opts.Workers = 1
+		holder, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer holder.Rollback(ctx)
+		released := make(chan struct{})
+		var once sync.Once
+		setWire(nil, func(string) {
+			once.Do(func() {
+				if _, err := holder.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011101)`); err != nil {
+					t.Error(err)
+				}
+				go func() {
+					time.Sleep(inverseNetworkTimeout + 5*time.Second)
+					holder.Rollback(ctx)
+					close(released)
+				}()
+			})
+		})
+		before := providerDeletes()
+		result, err := applyInverse(ctx, pool, sdk, a.opts)
+		setWire(nil, nil)
+		select {
+		case <-released:
+		default:
+			t.Fatal("batch finished while the holder still held its lock")
+		}
+		if err != nil || result.Deleted != 2 || providerDeletes()-before != 2 || len(unresolved(t, a.opts.ManifestSHA)) != 0 {
+			t.Fatalf("publication behind a long shared holder: %+v %v", result, err)
+		}
+	})
+	t.Run("persistent_publication_failure_holds_only_its_key", func(t *testing.T) {
+		a, entries := build(2)
+		a.ledger.close()
+		busy := entries[0].Key
+		exec(fmt.Sprintf(`CREATE SEQUENCE inverse_publish_busy;
+ CREATE FUNCTION inverse_publish_busy() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN
+  IF NEW.object_key='%s' THEN PERFORM nextval('inverse_publish_busy'); RAISE EXCEPTION 'test lock contention' USING ERRCODE='55P03'; END IF;
+  RETURN NEW;
+ END $f$;
+ CREATE TRIGGER inverse_publish_busy BEFORE INSERT ON r2_inverse_events FOR EACH ROW EXECUTE FUNCTION inverse_publish_busy();`, busy))
+		before := providerDeletes()
+		done, result, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(t.TempDir(), "evidence.json"))
+		exec(`DROP TRIGGER inverse_publish_busy ON r2_inverse_events; DROP FUNCTION inverse_publish_busy()`)
+		var tries int
+		if qerr := pool.QueryRow(ctx, `SELECT last_value FROM inverse_publish_busy`).Scan(&tries); qerr != nil {
+			t.Fatal(qerr)
+		}
+		exec(`DROP SEQUENCE inverse_publish_busy`)
+		if err != nil || done || result.Deleted != 1 || !slices.Equal(result.Unpublished, []string{busy}) || len(result.WireAmbiguous) != 0 || providerDeletes()-before != 2 || tries != inversePublishAttempts {
+			t.Fatalf("unpublished batch: done %v %+v %v after %d publications", done, result, err, tries)
+		}
+		if got := unresolved(t, a.opts.ManifestSHA); !slices.Equal(got, []string{busy}) {
+			t.Fatalf("unpublished key not held: %v", got)
+		}
+		// Held for good: a restart reports it and never sends it again.
+		restart, err := applyInverse(ctx, pool, sdk, a.opts)
+		if err != nil || !slices.Contains(restart.HeldAbsent, busy) || providerDeletes()-before != 2 || !slices.Equal(unresolved(t, a.opts.ManifestSHA), []string{busy}) {
+			t.Fatalf("restart %+v %v", restart, err)
+		}
+	})
 	t.Run("closed_admission_aborts_a_key_waiting_on_its_reservation", func(t *testing.T) {
 		// Reservations serialize on one protection lock, so a sibling's hard
 		// failure reaches a waiting key through admission: the wait aborts and
@@ -1957,6 +2061,17 @@ func TestR2InverseJobReadbackComparesHeldKeys(t *testing.T) {
 	readback.Unresolved = []string{"managed/b"}
 	if _, err := readback.settle(result, lost); err == nil || !strings.Contains(err.Error(), "evidence differs") {
 		t.Fatalf("different held key continued the job: %v", err)
+	}
+	// An unpublished absence is held exactly like a lost response.
+	unpublished := fmt.Errorf("%w: test", errInverseUnpublished)
+	result.Unpublished = []string{"managed/0"}
+	readback = inverseBatchReadback{Intents: 3, Absent: 1, AbsentBytes: 100, Attempts: 3, Unresolved: []string{"managed/0", "managed/a"}}
+	if done, err := readback.settle(result, unpublished); err != nil || done {
+		t.Fatalf("matching unpublished readback: %v %v", done, err)
+	}
+	readback.Unresolved = []string{"managed/a"}
+	if _, err := readback.settle(result, unpublished); err == nil || !strings.Contains(err.Error(), "evidence differs") {
+		t.Fatalf("unpublished key missing from readback continued the job: %v", err)
 	}
 	// Done means nothing new was selected: a batch whose selected keys were all
 	// skipped for short custody, deleting none, is not done.

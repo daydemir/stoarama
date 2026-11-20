@@ -459,9 +459,9 @@ func (c deadlineSpyConn) SetWriteDeadline(d time.Time) error {
 
 // Neither the authority's deadline nor the wire's first-byte and socket
 // deadline lies past custody expiry, measured against the database clock
-// reaching that expiry. Without a parent deadline, the authority's timer is
-// custody end exactly. A pause separates its clock sample from the
-// transport's, which must also land exactly on the earliest custody end.
+// reaching that expiry. The authority's timer is the earlier of the network
+// timeout and custody end. A pause separates its clock sample from the
+// transport's, which must land exactly on the earliest custody end.
 func TestKeep28DeadlinesNeverOutliveCustody(t *testing.T) {
 	f := newKeep28Fixture(t)
 	_, auth := f.keep28Authorized(t, f.applier(t), &inverseSendGate{})
@@ -476,7 +476,7 @@ func TestKeep28DeadlinesNeverOutliveCustody(t *testing.T) {
 		return time.Now().Add(auth.custody.Expiry.Sub(now))
 	}
 	authorized, _ := auth.ctx.Deadline()
-	if !authorized.Equal(auth.custodyEnd) || authorized.After(expiry().Add(-2*time.Second)) {
+	if authorized.After(auth.custodyEnd) || time.Until(authorized) > inverseNetworkTimeout || authorized.After(expiry().Add(-2*time.Second)) {
 		t.Fatalf("authority outlives custody: deadline %v, custody end %v", authorized, auth.custodyEnd)
 	}
 	time.Sleep(300 * time.Millisecond)

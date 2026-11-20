@@ -24,8 +24,9 @@ import (
 // it is fresh and its protection inputs are unchanged. It then runs bounded
 // apply batches. Each batch gets fresh owner-fence evidence and an exact
 // readback of the lane's own tables. A DELETE that lost its response holds
-// only its own key, permanently. Any other failure stops the job; only the
-// confirming HEAD, a read, is retried.
+// only its own key, permanently, and so does a confirmed DELETE whose absence
+// could not be published. Any other failure stops the job. Only reads and
+// bookkeeping retry: the confirming HEAD and publication of a confirmed absence.
 func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane inverseLane) {
 	f, err := parseInverseJobFlags(args, lane)
 	if err != nil {
@@ -89,6 +90,7 @@ func (t *inverseApplySummary) addBatch(r inverseApplySummary) {
 	t.CustodyShort.Objects += r.CustodyShort.Objects
 	t.CustodyShort.Bytes += r.CustodyShort.Bytes
 	t.WireAmbiguous = append(t.WireAmbiguous, r.WireAmbiguous...)
+	t.Unpublished = append(t.Unpublished, r.Unpublished...)
 	t.AmbiguousHeld, t.HeldAbsent, t.LastModifiedHeld = r.AmbiguousHeld, r.HeldAbsent, r.LastModifiedHeld
 }
 
@@ -191,20 +193,21 @@ type inverseBatchReadback struct {
 
 // settle accepts a batch only when the database proves exactly what the
 // executor reports: every absence and byte, an attempt per intent, and the very
-// keys it holds as lost responses, not just as many of them.
+// keys it holds as lost responses or unpublished absences, not just as many.
 func (r inverseBatchReadback) settle(result inverseApplySummary, applyErr error) (bool, error) {
-	wire := errors.Is(applyErr, errInverseWireAmbiguous)
-	if applyErr != nil && !wire {
+	held := inverseKeyHeld(applyErr)
+	if applyErr != nil && !held {
 		return false, applyErr
 	}
-	if r.Absent != result.Deleted || r.AbsentBytes != result.Bytes || r.Attempts != r.Intents || !slices.Equal(r.Unresolved, result.WireAmbiguous) {
+	unresolved := slices.Sorted(slices.Values(slices.Concat(result.WireAmbiguous, result.Unpublished)))
+	if r.Absent != result.Deleted || r.AbsentBytes != result.Bytes || r.Attempts != r.Intents || !slices.Equal(r.Unresolved, unresolved) {
 		return false, fmt.Errorf("database batch evidence differs: intents %d absent %d bytes %d attempts %d unresolved %v", r.Intents, r.Absent, r.AbsentBytes, r.Attempts, r.Unresolved)
 	}
-	if wire {
+	if held {
 		if result.Deleted == 0 {
 			return false, applyErr
 		}
-		printInverseJob(map[string]any{"step": "wire_ambiguous", "held": r.Unresolved, "error": applyErr.Error()})
+		printInverseJob(map[string]any{"step": "held", "held": r.Unresolved, "error": applyErr.Error()})
 		return false, nil
 	}
 	// Done only when nothing new was eligible: a batch whose keys were all

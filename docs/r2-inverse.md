@@ -78,16 +78,28 @@ rechecks live protections, controller drain evidence and migration 0198 at the
 wire. The private concrete executor verifier issues authority only after these checks
 and independently commits a permanent one-issuance row. No exported approval
 callback or generic R2 delete API is added. Repeated verification cannot remint
-authority. The entire per-key network phase has a 30-second deadline, including
-HEAD, multipart inspection and confirming HEAD; timeout retains the intent for
-reconciliation. There is one DELETE attempt, no SDK replay or redirects. Success requires
+authority. Each key's network calls and database steps have separate bounds, so
+waiting on a sibling's protection locks never spends the network budget. The
+network phase (identity HEAD, multipart inspection, the DELETE and the confirming
+HEAD) has a 30-second deadline from when the wire transaction holds its locks.
+Each database step (reservation, wire preparation, the wire commit, each
+publication attempt) gets its own 2 minutes. A timeout retains the intent for
+reconciliation. There is one DELETE attempt, no SDK replay or redirects. A DELETE
+whose request was fully written but which got no answer by its deadline is a lost
+response: only its key is held. Success requires
 a confirming 404. The confirming HEAD is a read, so it alone retries: up to 4
 attempts in the SDK's standard retry mode, each bounded by its own 4-second
 timeout, with jittered backoff of at most 2 seconds, all inside the key's network
 deadline (and, for keep-28, custody end). Only timeouts, connection errors, 5xx and
 throttling retry. A 200 means the object remains: it fails at once. When every
-attempt fails, the job stops and the key stays held, as a lost response does. Receipt and raw purged_at publication happens separately with
-exclusive admission locks, without upgrading a network transaction's locks.
+attempt fails, the job stops and the key stays held, as a lost response does.
+Receipt and raw purged_at publication happens separately with exclusive admission
+locks, without upgrading a network transaction's locks. It is bookkeeping for a
+key a 404 already confirmed gone, so it retries a database timeout or lock
+contention up to 3 times. If those all fail, the key is held exactly like a lost
+response: issued, unresolved, reported in `unpublished`, never resent, and the
+batch's readback must name it among the unresolved keys. Every failing key logs
+its step (`reserve`, `wire`, `head`, `commit` or `publish`) and key.
 
 An existing intent is never retransmitted, including a crash before wire. On
 restart, a 404 reconciles its receipt and ledger; a present object stays held as

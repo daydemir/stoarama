@@ -156,24 +156,28 @@ func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverse
 
 // authorize issues one key's single-use DELETE authority on the applier's lane.
 // Keep-28 adds its NAS custody proof and bounds the authority by its expiry.
+// Preparing the wire transaction waits on protection locks under its own
+// inverseDBTimeout; the key's network budget starts once it holds them.
 func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntry, gate *inverseSendGate) (*inverseDeleteAuthority, error) {
-	target, err := a.prepareWireTarget(ctx, tx, e)
+	db, cancelDB := context.WithTimeout(ctx, inverseDBTimeout)
+	defer cancelDB()
+	target, err := a.prepareWireTarget(db, tx, e)
 	if err != nil {
 		return nil, err
 	}
-	// The parent carries the key's network deadline; keep-28 also ends at
-	// custody end, an absolute instant fixed when sampled.
+	// Keep-28 also ends at custody end, an absolute instant fixed when sampled.
 	var custody keep28Custody
 	var custodyEnd time.Time
-	var cancel context.CancelFunc
 	if a.opts.Lane == inverseNASKeep28 {
-		if custody, custodyEnd, err = a.proveKeep28(ctx, tx, e, target); err != nil {
+		if custody, custodyEnd, err = a.proveKeep28(db, tx, e, target); err != nil {
 			return nil, err
 		}
-		ctx, cancel = context.WithDeadline(ctx, custodyEnd)
-	} else {
-		ctx, cancel = context.WithCancel(ctx)
 	}
+	deadline := time.Now().Add(inverseNetworkTimeout)
+	if a.opts.Lane == inverseNASKeep28 && custodyEnd.Before(deadline) {
+		deadline = custodyEnd
+	}
+	ctx, cancel := context.WithDeadline(ctx, deadline)
 	fail := func(err error) (*inverseDeleteAuthority, error) { cancel(); return nil, err }
 	if err = a.checkWireHead(ctx, tx, e, target); err != nil {
 		return fail(err)
