@@ -313,6 +313,20 @@ func seedDeliveryExemptions(ctx context.Context, pool *pgxpool.Pool, class deliv
 	return tag.RowsAffected(), tx.Commit(ctx)
 }
 
+// deliveryPageKindFits is the exact page kind and key family each exemption class
+// covers, the same shape 0225's admission trigger enforces. A repair is a
+// video_assembly under the confident-repair prefix; both window classes are a
+// video_collated under the reviewed collated families.
+func deliveryPageKindFits(kind string, class deliveryExemptionClass, key string) bool {
+	switch class {
+	case deliveryExemptConfidentRepair:
+		return kind == "video_assembly" && strings.HasPrefix(key, inverseConfidentRepairPrefix)
+	case deliveryExemptOutsideWindow, deliveryExemptInWindow:
+		return kind == "video_collated" && inverseCollatedPrefixAllowed(key)
+	}
+	return false
+}
+
 // checkDeliveryExemptionRoster is the ONE roster decision, shared by seeding and
 // by the read-only validate step. It reads the live catalog through the collated
 // executor's own batch statement and derives every row's class with the
@@ -347,7 +361,11 @@ func checkDeliveryExemptionRoster(ctx context.Context, tx pgx.Tx, class delivery
 	// row is written. The page stream is read live, not from the roster.
 	pageStreams := map[string]int64{}
 	pageIdentities := map[string]inversePageIdentity{}
-	streamRows, err := tx.Query(ctx, `SELECT h.object_key,coalesce(rec.stream_id,0),h.etag,h.size_bytes FROM delivery_keep_holds h
+	// The exact page kind and key family each roster key must be is a catalog
+	// fact, read live here so a repair cannot be admitted as a collated video or
+	// the reverse by naming the other class.
+	pageKinds := map[string]string{}
+	streamRows, err := tx.Query(ctx, `SELECT h.object_key,coalesce(rec.stream_id,0),h.etag,h.size_bytes,h.kind FROM delivery_keep_holds h
  LEFT JOIN recordings rec ON rec.id=h.recording_id WHERE h.bucket=$1 AND h.object_key=ANY($2::text[])`, rows[0].Bucket, keys)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -355,13 +373,14 @@ func checkDeliveryExemptionRoster(ctx context.Context, tx pgx.Tx, class delivery
 	for streamRows.Next() {
 		var key string
 		var stream, size int64
-		var etag string
-		if err = streamRows.Scan(&key, &stream, &etag, &size); err != nil {
+		var etag, kind string
+		if err = streamRows.Scan(&key, &stream, &etag, &size, &kind); err != nil {
 			streamRows.Close()
 			return nil, nil, nil, nil, err
 		}
 		pageStreams[key] = stream
 		pageIdentities[key] = inversePageIdentity{ETag: strings.Trim(etag, `"`), SizeBytes: size}
+		pageKinds[key] = kind
 	}
 	err = streamRows.Err()
 	streamRows.Close()
@@ -390,6 +409,21 @@ func checkDeliveryExemptionRoster(ctx context.Context, tx pgx.Tx, class delivery
 		computed, known := deliveryExemptionClassOf(x, true)
 		if !known {
 			return nil, nil, nil, nil, fmt.Errorf("roster key %s has no live collated or repair assessment", row.ObjectKey)
+		}
+		// The page row's exact kind and key family must match the requested class,
+		// in SQL shape as well as in the classifier's answer.
+		if !deliveryPageKindFits(pageKinds[row.ObjectKey], class, row.ObjectKey) {
+			return nil, nil, nil, nil, fmt.Errorf("roster key %s is page kind %q, which does not fit class %s", row.ObjectKey, pageKinds[row.ObjectKey], class)
+		}
+		// The catalog size must equal the page size and the roster size: a roster
+		// or page that drifted from the catalog identity is not authority.
+		if x.SizeBytes != page.SizeBytes || x.SizeBytes != row.SizeBytes {
+			return nil, nil, nil, nil, fmt.Errorf("roster key %s catalog size %d differs from its page/roster size", row.ObjectKey, x.SizeBytes)
+		}
+		// A KE folder component in the output's own stored path protects it, the
+		// same rule execution applies before the wire.
+		if protection.keepEverythingPathComponent(x.Path) || protection.keepEverythingPathComponent(row.ObjectKey) {
+			return nil, nil, nil, nil, fmt.Errorf("roster key %s has a keep-everything folder component", row.ObjectKey)
 		}
 		if x.Reason != "" {
 			return nil, nil, nil, nil, fmt.Errorf("roster key %s is held by the live classifier (%s)", row.ObjectKey, x.Reason)

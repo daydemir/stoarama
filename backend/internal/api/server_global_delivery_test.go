@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,9 +35,13 @@ func globalDeliveryTestRegistry() *globalDeliveryRegistry {
 	return &globalDeliveryRegistry{SchemaVersion: 1, AccountID: 47, RecordingIDs: ids, Assets: map[string]globalDeliveryObject{"/fixture.txt": o}, Files: map[string]globalDeliveryObject{"1": f}}
 }
 
+// globalDeliveryTestStore counts every storage touch. The counters are atomic
+// because the public serving path calls them from concurrent handler goroutines
+// in the pool and retirement tests; a plain int here is a real data race, not
+// just a test artifact.
 type globalDeliveryTestStore struct {
 	body              []byte
-	opened, presigned int
+	opened, presigned atomic.Int64
 }
 
 // deliveryPublicFixture stands in for the live public delivery gate in unit
@@ -98,15 +103,15 @@ func (m *globalDeliveryTestStore) HeadExact(context.Context, string, string, str
 }
 func (m *globalDeliveryTestStore) Get(context.Context, string) ([]byte, error) { return m.body, nil }
 func (m *globalDeliveryTestStore) OpenExact(context.Context, string, string, string) (io.ReadCloser, error) {
-	m.opened++
+	m.opened.Add(1)
 	return io.NopCloser(bytes.NewReader(m.body)), nil
 }
 func (m *globalDeliveryTestStore) OpenExactRange(_ context.Context, _ string, _ string, _ string, a, b int64) (io.ReadCloser, error) {
-	m.opened++
+	m.opened.Add(1)
 	return io.NopCloser(bytes.NewReader(m.body[a : b+1])), nil
 }
 func (m *globalDeliveryTestStore) PresignGetExactDownloadRequest(context.Context, string, string, string, string, time.Duration) (r2.PresignedRequest, error) {
-	m.presigned++
+	m.presigned.Add(1)
 	return r2.PresignedRequest{URL: "https://test.r2.cloudflarestorage.com/bucket/a%20b.mp4?X-Amz-Expires=300", Method: "GET", Headers: http.Header{"If-Match": {`"etag"`}, "Host": {"test.r2.cloudflarestorage.com"}}}, nil
 }
 func globalDeliveryTestRequest(method, target, id string, p *accountPrincipal) *http.Request {
@@ -187,10 +192,10 @@ func TestGlobalDeliveryAssetSHAGuardAndExactLookup(t *testing.T) {
 	if w.Code != 409 {
 		t.Fatalf("changed payload %d", w.Code)
 	}
-	before := m.opened
+	before := m.opened.Load()
 	w = httptest.NewRecorder()
 	s.handleGlobalDeliveryAsset(w, globalDeliveryTestRequest("GET", "/?path=../secrets.env", "", p))
-	if w.Code != 404 || m.opened != before {
+	if w.Code != 404 || m.opened.Load() != before {
 		t.Fatal("unregistered path reached storage")
 	}
 }
@@ -206,7 +211,7 @@ func TestGlobalDeliveryTicketExpectedSHAAndScopedCapability(t *testing.T) {
 			t.Fatalf("invalid claim %d", w.Code)
 		}
 	}
-	if m.presigned != 0 {
+	if m.presigned.Load() != 0 {
 		t.Fatal("bad claim minted access")
 	}
 	w := httptest.NewRecorder()
@@ -237,10 +242,10 @@ func TestGlobalDeliveryRangeAndHEADPreserveGeneration(t *testing.T) {
 	if w.Code != 206 || w.Body.String() != "ell" || w.Header().Get("Content-Range") != "bytes 1-3/5" {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
-	before := m.opened
+	before := m.opened.Load()
 	w = httptest.NewRecorder()
 	s.handleGlobalDeliveryFile(w, globalDeliveryTestRequest("HEAD", "/", "1", p))
-	if w.Code != 200 || w.Body.Len() != 0 || m.opened != before {
+	if w.Code != 200 || w.Body.Len() != 0 || m.opened.Load() != before {
 		t.Fatal("HEAD opened payload")
 	}
 }
@@ -285,7 +290,7 @@ func TestPublicGlobalDeliveryScopedAnonymousAndPresentation(t *testing.T) {
 	}
 	w = httptest.NewRecorder()
 	s.handleGlobalDeliveryTicket(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/ticket/1?sha256="+reg.Files["1"].SHA256+"&path=other.mp4", "1", nil))
-	if w.Code != 409 || m.presigned != 0 {
+	if w.Code != 409 || m.presigned.Load() != 0 {
 		t.Fatal("arbitrary presentation accepted", w.Code)
 	}
 	w = httptest.NewRecorder()
@@ -401,7 +406,7 @@ func TestPublicDeliveryRetirementRefusesEveryRoute(t *testing.T) {
 	if _, err := s.loadGlobalDeliveryRegistryScope(context.Background(), true, reg.Generation); err != nil {
 		t.Fatal(err)
 	}
-	before, presignedBefore := store.opened, store.presigned
+	before, presignedBefore := store.opened.Load(), store.presigned.Load()
 	retirement.retired = true
 	for _, r := range requests {
 		w := httptest.NewRecorder()
@@ -411,11 +416,11 @@ func TestPublicDeliveryRetirementRefusesEveryRoute(t *testing.T) {
 		}
 	}
 	// A retired page never reaches storage, and mints no capability.
-	if store.opened != before {
-		t.Fatalf("retired page opened %d storage objects", store.opened-before)
+	if got := store.opened.Load(); got != before {
+		t.Fatalf("retired page opened %d storage objects", got-before)
 	}
-	if store.presigned != presignedBefore {
-		t.Fatalf("retired page minted %d capabilities", store.presigned-presignedBefore)
+	if got := store.presigned.Load(); got != presignedBefore {
+		t.Fatalf("retired page minted %d capabilities", got-presignedBefore)
 	}
 	// Republication is refused while retired.
 	broadcast := DeliveryKeepSnapshot{Objects: map[string]DeliveryKeepIdentity{"dataset": {Key: "dataset", ETag: "e", Size: 1, Kind: "asset"}}}

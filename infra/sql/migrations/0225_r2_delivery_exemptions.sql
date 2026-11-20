@@ -61,6 +61,22 @@ CREATE TABLE r2_delivery_page_quiesce (
  armed_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
+-- Arming takes the EXCLUSIVE public fence and requires READ COMMITTED, so a
+-- hand-run INSERT, an old binary or a second process serializes against reader
+-- admission, ticket minting and publication exactly as the CLI does. Without this
+-- a direct INSERT could arm while a reader was mid-admission.
+CREATE FUNCTION guard_r2_delivery_page_quiesce() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'arming the page requires READ COMMITTED' USING ERRCODE='55000';
+ END IF;
+ PERFORM pg_advisory_xact_lock(r2_delivery_public_lock());
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_delivery_page_quiesce_arm BEFORE INSERT ON r2_delivery_page_quiesce
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_page_quiesce();
+ALTER TABLE r2_delivery_page_quiesce ENABLE ALWAYS TRIGGER r2_delivery_page_quiesce_arm;
+
 -- The ONE row that records which public registry generation the serving API
 -- actually loaded and served. It is written by the API's own successful
 -- `public/current.json` load, the same object and validator the request path
@@ -499,6 +515,13 @@ BEGIN
  IF NEW.generation <> serving THEN
   RAISE EXCEPTION 'cutover authority generation % is not the observed serving generation', NEW.generation
    USING ERRCODE='55000';
+ END IF;
+ -- Every instant must be a real, already-past instant. A missing or zeroed
+ -- timestamp is a missing fact, not evidence, so it is refused rather than
+ -- silently contributing a harmless value to the derived deadline.
+ IF NEW.legacy_grant_boundary_at <= '1970-01-01' OR NEW.transfer_bound_at <= '1970-01-01'
+  OR NEW.legacy_origin_removed_at <= '1970-01-01' OR NEW.cache_expired_at <= '1970-01-01' THEN
+  RAISE EXCEPTION 'cutover authority timestamps must be real, non-zero instants';
  END IF;
  IF NEW.transfer_bound_at > clock_timestamp() THEN
   RAISE EXCEPTION 'verified transfer bound % is in the future; it is not verified evidence', NEW.transfer_bound_at;

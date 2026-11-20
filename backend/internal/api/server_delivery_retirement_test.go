@@ -250,7 +250,7 @@ func TestDeliveryPageRetirementIsTheServingState(t *testing.T) {
 	}
 
 	// Every public delivery route now refuses, current and pinned alike.
-	before, presignedBefore := store.opened, store.presigned
+	before, presignedBefore := store.opened.Load(), store.presigned.Load()
 	for _, r := range requests {
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, httptest.NewRequest(r.method, r.target, nil))
@@ -258,8 +258,8 @@ func TestDeliveryPageRetirementIsTheServingState(t *testing.T) {
 			t.Fatalf("retired page: %s served %d", r.name, w.Code)
 		}
 	}
-	if store.opened != before || store.presigned != presignedBefore {
-		t.Fatalf("retired page reached storage (opened %d, presigned %d)", store.opened-before, store.presigned-presignedBefore)
+	if store.opened.Load() != before || store.presigned.Load() != presignedBefore {
+		t.Fatalf("retired page reached storage (opened %d, presigned %d)", store.opened.Load()-before, store.presigned.Load()-presignedBefore)
 	}
 	// And republication is refused while retired.
 	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES(repeat('d',32),'again')`); err == nil {
@@ -530,11 +530,11 @@ func newPausedDeliveryStore(body []byte) *pausedDeliveryStore {
 }
 
 func (p *pausedDeliveryStore) OpenExact(ctx context.Context, key, etag, version string) (io.ReadCloser, error) {
-	p.opened++
+	p.opened.Add(1)
 	return &pausedReader{Reader: bytes.NewReader(bytes.Repeat([]byte("hello"), 64)), store: p}, nil
 }
 
-func (p *pausedDeliveryStore) openedCount() int { return p.opened }
+func (p *pausedDeliveryStore) openedCount() int64 { return p.opened.Load() }
 
 // leaseCount is how many admission leases the pool still has unexpired.
 func (p *pausedDeliveryStore) leaseCount(t *testing.T, pool *pgxpool.Pool) int64 {

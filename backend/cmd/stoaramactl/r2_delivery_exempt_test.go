@@ -1460,3 +1460,73 @@ func TestDeliveryCutoverCanonicalPreservesSubsecondAndDistinctEvidence(t *testin
 		t.Fatalf("authority before quiesce was accepted: %v", err)
 	}
 }
+
+// TestR2NonrawExemptionValidateCatalogSizeAndOutputKEPath: the shared
+// approve/validate/seed decision refuses a roster whose catalog size drifted from
+// the page/roster size, and one whose COLLATED OUTPUT has a keep-everything folder
+// in its own stored path — changing only that one field each time.
+func TestR2NonrawExemptionValidateCatalogSizeAndOutputKEPath(t *testing.T) {
+	f := newNonrawFixture(t, "exempt_catalog_size_ke")
+	f.withPageKeys()
+	picks, err := loadR2RetirePicks(f.picks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []deliveryExemptionRow{collatedRow(f)}
+	// Control: the clean roster validates.
+	if n, err := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptOutsideWindow, rows, picks); err != nil || n != 1 {
+		t.Fatalf("clean roster did not validate: %d %v", n, err)
+	}
+	// Change ONLY the catalog output's size so it no longer equals the page and
+	// roster size. Nothing else moves.
+	f.fixture(`UPDATE recording_collation_outputs SET size_bytes=901 WHERE id=$1`, f.outputID)
+	if n, err := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptOutsideWindow, rows, picks); err == nil || n != 0 {
+		t.Fatalf("a catalog size drift validated: %d %v", n, err)
+	}
+	digest := approvalDigest(deliveryExemptOutsideWindow, rows)
+	if _, err := recordDeliveryExemptionApproval(f.ctx, f.pool, deliveryExemptOutsideWindow, digest, deliveryExemptionDecisions[deliveryExemptOutsideWindow], rows, picks); err == nil {
+		t.Fatal("a catalog size drift was approved")
+	}
+	if err := f.seed(t, deliveryExemptOutsideWindow, rows...); err == nil {
+		t.Fatal("a catalog size drift seeded")
+	}
+	// Restore the size; now change ONLY the output's stored path to sit in a KE
+	// folder. The classifier must hold it, so validate, approve and seed all
+	// refuse.
+	f.fixture(`UPDATE recording_collation_outputs SET size_bytes=900 WHERE id=$1`, f.outputID)
+	keFolder := "KE_Output_Folder"
+	f.fixture(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path)
+ VALUES(7200001,30,1,'https://test.invalid','stoarama','managed/acct-47/ke2/clip.mp4',10,'ke2-etag',repeat('e',64),'2026-06-01','2026-06-01 00:00:00','2026-06-01 00:01:00',$1||'/clip.mp4')`, keFolder)
+	f.fixture(`UPDATE recording_collation_outputs SET nas_relative_path=$1 WHERE id=$2`, keFolder+"/nightly/video.mp4", f.outputID)
+	// A second, keep-everything stream whose catalog path names the folder, so the
+	// folder is a real KE folder the classifier discovers.
+	f.fixture(`INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
+ VALUES(88,'test','88','keout','keout','https://test.invalid','off','Asia/Tokyo','hls','video_manifest','video_live','continuous_video',30)`)
+	f.fixture(`INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
+ VALUES(32,47,1,'keout','https://test.invalid','* * * * *','Asia/Tokyo','paused',88,now())`)
+	f.fixture(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path)
+ VALUES(7200002,32,1,'https://test.invalid','stoarama','managed/acct-47/keout/clip.mp4',10,'keout-etag',repeat('f',64),'2026-06-01','2026-06-01 00:00:00','2026-06-01 00:01:00',$1||'/keout.mp4')`, keFolder)
+	kePicks := filepath.Join(t.TempDir(), "ke-output-picks.json")
+	data, _ := json.Marshal(map[string]any{"choices": map[string]any{
+		"3":  r2RetirePick{Choice: "none", KeepStartUTC: f.windows[3].Start.Format(time.RFC3339), KeepEndUTC: f.windows[3].End.Format(time.RFC3339)},
+		"88": r2RetirePick{Choice: "all"},
+	}})
+	if err := os.WriteFile(kePicks, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadR2RetirePicks(kePicks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptOutsideWindow, rows, loaded); err == nil || n != 0 {
+		t.Fatalf("an output in a KE folder validated: %d %v", n, err)
+	}
+	if _, err := recordDeliveryExemptionApproval(f.ctx, f.pool, deliveryExemptOutsideWindow, digest, deliveryExemptionDecisions[deliveryExemptOutsideWindow], rows, loaded); err == nil {
+		t.Fatal("an output in a KE folder was approved")
+	}
+	// The seed over the same picks refuses too; it must not be shown a weaker
+	// view than validate and approve.
+	if _, err := seedDeliveryExemptions(f.ctx, f.pool, deliveryExemptOutsideWindow, rows, f.ensureApprovalDirect(t, deliveryExemptOutsideWindow, rows), loaded); err == nil {
+		t.Fatal("an output in a KE folder seeded")
+	}
+}

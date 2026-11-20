@@ -46,9 +46,18 @@ const globalDeliveryAPI = "/api/v1/account/global-street-scores-delivery"
 // hard ceiling on how long a crashed or abandoned response can delay retirement:
 // the lease is deleted as soon as the handler returns, so the normal case is
 // milliseconds, and this bound is only reached by a process that died mid-write.
-// It is longer than the API's 60s WriteTimeout, so a slow but live response never
-// loses its lease before its last socket write returns.
 const deliveryPublicReaderTTL = 2 * time.Minute
+
+// deliveryPublicResponseBudget is the deadline every public storage read runs
+// under, and it is STRICTLY shorter than the lease. It is a var only so a test
+// can shrink it; production never assigns it. A stalled HEAD, registry
+// fetch, asset read, file open/range or stalled body is therefore cancelled by
+// this context and the handler returns (releasing its lease) BEFORE the durable
+// lease could expire, so a stalled read can never outlive the very lease that
+// retirement drains against. HTTP WriteTimeout is not used for this: it does not
+// bound a read that never completes, and it is a server-wide setting rather than
+// this response's admission.
+var deliveryPublicResponseBudget = 90 * time.Second
 
 type globalDeliveryObject struct {
 	Key         string `json:"key"`
@@ -253,6 +262,16 @@ func (s *Server) admitPublicDelivery(w http.ResponseWriter, r *http.Request) (re
 	}, true
 }
 
+// leaseBoundContext derives the context every public storage read runs under. It
+// ends at the response budget, strictly shorter than the reader lease, so a
+// stalled read is cancelled and the handler returns (and releases its lease)
+// before the lease can expire. Every storage call on a public route takes this
+// context; none relies on HTTP WriteTimeout, which bounds neither a read that
+// never completes nor this response's admission.
+func leaseBoundContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, deliveryPublicResponseBudget)
+}
+
 // newDeliveryReaderID is a 128-bit random lease id, the table's only key.
 func newDeliveryReaderID() (string, error) {
 	var b [16]byte
@@ -336,63 +355,55 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 			return nil, errDeliveryPageNotServing
 		}
 	}
-	// Serve a warm cache entry without touching the pool at all.
-	if hit, found := s.cachedDeliveryRegistry(public, generation); found {
-		return hit, nil
+	// A private load may serve a warm entry without touching the pool: it is not
+	// the public origin and has no cleanup fence to honour.
+	if !public {
+		if hit, found := s.cachedDeliveryRegistry(public, generation); found {
+			return hit, nil
+		}
 	}
-	// ONE transaction carries the cleanup fence, the public lock, the serving
-	// recheck under that lock, the object read AND the keep validation. The
-	// registry mutex is NOT held here and is NOT held across any of it, so a
-	// quiesce or retirement never waits behind a network read or a second pool
-	// connection this handler would otherwise need. It is taken only for the
-	// short publish and cache-read windows below.
-	var fence pgx.Tx
+	// Two SHORT fence transactions bracket the object read. Neither is held across
+	// a network call: the first resolves the reviewed generation and a warm hit,
+	// the read runs with NO connection and NO lock held, and the second rechecks
+	// the serving state, validates the keep snapshot on its own transaction and
+	// records the observation. This is what lets a quiesce commit promptly while a
+	// cold load is outstanding, and it keeps the registry mutex off every read.
 	if public && s.pool != nil {
-		var err error
-		if fence, err = s.pool.Begin(ctx); err != nil {
-			return nil, errors.New("public cleanup fence unavailable")
-		}
-		defer fence.Rollback(context.Background())
-		if _, err = fence.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, deliveryPublicLock); err != nil {
-			return nil, errors.New("public publication fence unavailable")
-		}
-		// Recheck the serving state UNDER the shared lock: a quiesce or
-		// retirement that committed between the preflight above and this lock is
-		// seen now, so a cold load cannot begin serving after arming.
-		var retired, serving bool
-		if err = fence.QueryRow(ctx, `SELECT r2_delivery_page_retired(),r2_delivery_public_serving()`).Scan(&retired, &serving); err != nil {
-			return nil, errors.New("public delivery serving state unavailable")
-		}
-		if retired {
-			return nil, errDeliveryPageRetired
-		}
-		if !serving {
-			return nil, errDeliveryPageNotServing
-		}
-		// While cleanup permits can be outstanding, serve the immutable reviewed
-		// public generation. A direct registry publication cannot introduce a new
-		// protected source midway through a separately approved deletion batch.
-		if _, err = fence.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011101)`); err != nil {
-			return nil, errors.New("public cleanup fence unavailable")
-		}
-		var fenced bool
-		err = fence.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_plans p WHERE p.mode='enabled' AND p.approved_until>now()) OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.delete_ever_issued AND i.updated_at>now()-interval '2 minutes')`).Scan(&fenced)
+		f, err := s.beginDeliveryFence(ctx)
 		if err != nil {
-			return nil, errors.New("public cleanup fence unavailable")
+			return nil, err
+		}
+		// Resolve the reviewed generation while the fence is held, then release
+		// the connection before any storage read.
+		var fenced bool
+		if fenced, err = f.fenced(ctx); err != nil {
+			f.rollback()
+			return nil, err
 		}
 		if fenced {
 			const reviewed = "c4049f6dc0f940be8b7eb8b9bef6f42f"
 			if generation != "" && generation != reviewed {
+				f.rollback()
 				return nil, errors.New("public publication deferred during NAS cleanup")
 			}
 			generation = reviewed
 		}
-	}
-	// The cleanup fence may have substituted the reviewed generation, so check the
-	// warm cache once more for THAT generation before any object read. A pinned
-	// registry already loaded for the reviewed generation is served from memory.
-	if hit, found := s.cachedDeliveryRegistry(public, generation); found {
-		return hit, nil
+		// A warm entry for the RESOLVED generation is served from memory; nothing
+		// is published or observed on that path, so release the fence and return.
+		if hit, found := s.cachedDeliveryRegistry(true, generation); found {
+			f.rollback()
+			return hit, nil
+		}
+		if err = f.release(ctx); err != nil {
+			return nil, err
+		}
+	} else if s.pool == nil {
+		// No pool (unit stubs): there is no cleanup fence to honour, so a warm
+		// entry is served directly. Production always has a pool and always
+		// resolves the fence above.
+		if hit, found := s.cachedDeliveryRegistry(public, generation); found {
+			return hit, nil
+		}
 	}
 	store := s.globalDeliveryObjectStore()
 	if store == nil {
@@ -409,6 +420,8 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 			key = globalDeliveryPrefix + "public/generations/" + generation + ".json"
 		}
 	}
+	// The object read runs with NO fence transaction and NO registry mutex held,
+	// so a quiesce behind it never waits on storage I/O this request owns.
 	head, err := store.Head(ctx, key)
 	if err != nil || head.SizeBytes <= 0 || head.SizeBytes > 64<<20 {
 		return nil, errors.New("dataset registry unavailable")
@@ -455,36 +468,112 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 				return nil, err
 			}
 		}
-		if fence != nil {
-			// Validate on the SAME transaction that holds the locks and the
-			// reader's place, never on a second pool acquire.
-			if err = RequireDeliveryKeep(ctx, fence, keep); err != nil {
+		if s.pool != nil {
+			// REAL publish fence: one short transaction, held only for the serving
+			// recheck, the keep validation and the observation. Any quiesce or
+			// retirement that committed during the read is seen here, so a cold
+			// load that read an old generation cannot publish after arming.
+			f, err := s.beginDeliveryFence(ctx)
+			if err != nil {
 				return nil, err
 			}
-		} else if s.pool != nil {
-			if err = RequireDeliveryKeep(ctx, s.pool, keep); err != nil {
+			if err = RequireDeliveryKeep(ctx, f.tx, keep); err != nil {
+				f.rollback()
 				return nil, err
 			}
-		}
-		if fence != nil {
-			// Record which generation the serving path actually observed as the
-			// unpinned CURRENT pointer. This is the only thing retirement's
-			// cutover authority binds to; import order over holds is not a pointer.
-			// A pinned read never writes it.
 			if generation == "" {
-				if _, err = fence.Exec(ctx, `INSERT INTO r2_delivery_serving_generation(singleton,generation)
+				if _, err = f.tx.Exec(ctx, `INSERT INTO r2_delivery_serving_generation(singleton,generation)
  VALUES(true,$1) ON CONFLICT(singleton) DO UPDATE SET generation=excluded.generation,observed_at=clock_timestamp()`, result.Generation); err != nil {
+					f.rollback()
 					return nil, errors.New("delivery serving generation record unavailable")
 				}
 			}
-			if err = fence.Commit(ctx); err != nil {
-				return nil, errors.New("public publication fence unavailable")
+			if err = f.commit(ctx); err != nil {
+				return nil, err
 			}
 		}
 	}
 	// Publish under the mutex, which is taken only for these few assignments.
 	s.publishDeliveryRegistry(public, generation, &result)
 	return &result, nil
+}
+
+// deliveryFence is ONE short transaction that holds the shared public lock, the
+// cleanup fence and the serving recheck together, and is released before any
+// object read. It is a pointer so a caller can drop it early; every exit path
+// rolls back a still-open transaction so no connection or lock leaks.
+type deliveryFence struct {
+	pool *pgxpool.Pool
+	tx   pgx.Tx
+}
+
+// beginDeliveryFence opens the fence transaction and takes the shared public lock
+// and the serving recheck under it.
+func (s *Server) beginDeliveryFence(ctx context.Context) (*deliveryFence, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, errors.New("public cleanup fence unavailable")
+	}
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, deliveryPublicLock); err != nil {
+		tx.Rollback(context.Background())
+		return nil, errors.New("public publication fence unavailable")
+	}
+	var retired, serving bool
+	if err = tx.QueryRow(ctx, `SELECT r2_delivery_page_retired(),r2_delivery_public_serving()`).Scan(&retired, &serving); err != nil {
+		tx.Rollback(context.Background())
+		return nil, errors.New("public delivery serving state unavailable")
+	}
+	if retired {
+		tx.Rollback(context.Background())
+		return nil, errDeliveryPageRetired
+	}
+	if !serving {
+		tx.Rollback(context.Background())
+		return nil, errDeliveryPageNotServing
+	}
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011101)`); err != nil {
+		tx.Rollback(context.Background())
+		return nil, errors.New("public cleanup fence unavailable")
+	}
+	return &deliveryFence{pool: s.pool, tx: tx}, nil
+}
+
+// fenced reports whether a separately approved cleanup batch is outstanding.
+func (f *deliveryFence) fenced(ctx context.Context) (bool, error) {
+	var fenced bool
+	if err := f.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_plans p WHERE p.mode='enabled' AND p.approved_until>now()) OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.delete_ever_issued AND i.updated_at>now()-interval '2 minutes')`).Scan(&fenced); err != nil {
+		return false, errors.New("public cleanup fence unavailable")
+	}
+	return fenced, nil
+}
+
+// release drops the fence transaction without publishing anything, freeing its
+// connection and locks before a storage read.
+func (f *deliveryFence) release(ctx context.Context) error {
+	err := f.tx.Rollback(context.Background())
+	f.tx = nil
+	if err != nil {
+		return errors.New("public publication fence unavailable")
+	}
+	return nil
+}
+
+// rollback drops a still-open fence; it is safe on nil and after release.
+func (f *deliveryFence) rollback() {
+	if f == nil || f.tx == nil {
+		return
+	}
+	_ = f.tx.Rollback(context.Background())
+	f.tx = nil
+}
+
+func (f *deliveryFence) commit(ctx context.Context) error {
+	err := f.tx.Commit(ctx)
+	f.tx = nil
+	if err != nil {
+		return errors.New("public publication fence unavailable")
+	}
+	return nil
 }
 
 // cachedDeliveryRegistry returns a warm cache entry, holding the mutex only for
@@ -586,6 +675,7 @@ func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Reques
 	// A private account response is not the public origin: it takes no lease and
 	// reads no serving state, so the owner's own tooling still works after
 	// retirement. The public route admits and holds one lease for its whole body.
+	ctx := r.Context()
 	var release func()
 	if public {
 		var ok bool
@@ -593,8 +683,14 @@ func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		defer release()
+		// Every public storage read is bounded by a deadline strictly shorter
+		// than the reader lease, so a stalled HEAD/open fails and releases the
+		// lease instead of outliving it.
+		bounded, cancel := leaseBoundContext(ctx)
+		defer cancel()
+		ctx = bounded
 	}
-	registry, err := s.loadGlobalDeliveryRegistryScope(r.Context(), public, r.URL.Query().Get("generation"))
+	registry, err := s.loadGlobalDeliveryRegistryScope(ctx, public, r.URL.Query().Get("generation"))
 	if err != nil {
 		if errors.Is(err, errDeliveryPageRetired) {
 			util.WriteError(w, http.StatusGone, "This dataset has been retired. See the published file list for NAS paths.")
@@ -613,7 +709,7 @@ func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Reques
 		http.NotFound(w, r)
 		return
 	}
-	body, err := s.globalDeliveryObjectStore().OpenExact(r.Context(), object.Key, object.ETag, object.VersionID)
+	body, err := s.globalDeliveryObjectStore().OpenExact(ctx, object.Key, object.ETag, object.VersionID)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, "Dataset asset identity changed. Reload to retry.")
 		return
@@ -665,7 +761,7 @@ func globalDeliveryFileID(r *http.Request) string {
 	}
 	return id
 }
-func (s *Server) globalDeliveryFile(w http.ResponseWriter, r *http.Request) (globalDeliveryObject, bool) {
+func (s *Server) globalDeliveryFile(ctx context.Context, w http.ResponseWriter, r *http.Request) (globalDeliveryObject, bool) {
 	public := strings.HasPrefix(r.URL.Path, publicGlobalDeliveryAPI+"/")
 	if !public && !authorizeGlobalDelivery(w, r) {
 		return globalDeliveryObject{}, false
@@ -673,7 +769,7 @@ func (s *Server) globalDeliveryFile(w http.ResponseWriter, r *http.Request) (glo
 	// The caller owns the reader lease and holds it across the response body. A
 	// ticket lookup is metadata only, but it still runs inside that lease so a
 	// retirement cannot arm between admission and the capability row.
-	registry, err := s.loadGlobalDeliveryRegistryScope(r.Context(), public, r.URL.Query().Get("generation"))
+	registry, err := s.loadGlobalDeliveryRegistryScope(ctx, public, r.URL.Query().Get("generation"))
 	if err != nil {
 		if errors.Is(err, errDeliveryPageRetired) {
 			util.WriteError(w, http.StatusGone, "This dataset has been retired. See the published file list for NAS paths.")
@@ -702,7 +798,7 @@ func (s *Server) globalDeliveryFile(w http.ResponseWriter, r *http.Request) (glo
 	if public && strings.HasPrefix(r.URL.Path, publicGlobalDeliveryAPI+"/ticket/") {
 		return object, true
 	}
-	head, err := s.globalDeliveryObjectStore().HeadExact(r.Context(), object.Key, object.ETag, object.VersionID)
+	head, err := s.globalDeliveryObjectStore().HeadExact(ctx, object.Key, object.ETag, object.VersionID)
 	if err != nil || head.SizeBytes != object.SizeBytes {
 		util.WriteError(w, http.StatusConflict, "The recorded R2 file is unavailable or changed.")
 		return globalDeliveryObject{}, false
@@ -723,6 +819,7 @@ func (s *Server) recordPublicTickets(ctx context.Context, object globalDeliveryO
 
 func (s *Server) handleGlobalDeliveryTicket(w http.ResponseWriter, r *http.Request) {
 	public := strings.HasPrefix(r.URL.Path, publicGlobalDeliveryAPI+"/")
+	ctx := r.Context()
 	var release func()
 	if public {
 		var ok bool
@@ -730,8 +827,11 @@ func (s *Server) handleGlobalDeliveryTicket(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		defer release()
+		bounded, cancel := leaseBoundContext(ctx)
+		defer cancel()
+		ctx = bounded
 	}
-	object, ok := s.globalDeliveryFile(w, r)
+	object, ok := s.globalDeliveryFile(ctx, w, r)
 	if !ok {
 		return
 	}
@@ -739,7 +839,7 @@ func (s *Server) handleGlobalDeliveryTicket(w http.ResponseWriter, r *http.Reque
 		util.WriteError(w, http.StatusBadRequest, "Expected SHA-256 is required.")
 		return
 	}
-	capability, err := s.globalDeliveryObjectStore().PresignGetExactDownloadRequest(r.Context(), object.Key, object.ETag, object.VersionID, path.Base(object.Path), deliveryTicketTTL)
+	capability, err := s.globalDeliveryObjectStore().PresignGetExactDownloadRequest(ctx, object.Key, object.ETag, object.VersionID, path.Base(object.Path), deliveryTicketTTL)
 	if err != nil {
 		util.WriteError(w, http.StatusServiceUnavailable, "Download capability unavailable.")
 		return
@@ -753,7 +853,7 @@ func (s *Server) handleGlobalDeliveryTicket(w http.ResponseWriter, r *http.Reque
 	// A public capability is recorded before it is handed out, so a retirement
 	// that follows is guaranteed to see and drain it.
 	if public {
-		minted, err := s.recordPublicTickets(r.Context(), object, hex.EncodeToString(pathSHA[:]))
+		minted, err := s.recordPublicTickets(ctx, object, hex.EncodeToString(pathSHA[:]))
 		if err != nil {
 			util.WriteError(w, http.StatusServiceUnavailable, "Download capability unavailable.")
 			return
@@ -774,6 +874,7 @@ func (s *Server) handleGlobalDeliveryTicket(w http.ResponseWriter, r *http.Reque
 }
 func (s *Server) handleGlobalDeliveryFile(w http.ResponseWriter, r *http.Request) {
 	public := strings.HasPrefix(r.URL.Path, publicGlobalDeliveryAPI+"/")
+	ctx := r.Context()
 	var release func()
 	if public {
 		var ok bool
@@ -782,8 +883,14 @@ func (s *Server) handleGlobalDeliveryFile(w http.ResponseWriter, r *http.Request
 		}
 		// Held across the whole streamed body, through its last socket write.
 		defer release()
+		// The whole read and body copy run under a deadline shorter than the
+		// lease, so a stalled body is cancelled and the handler returns (dropping
+		// the lease) before the lease can expire.
+		bounded, cancel := leaseBoundContext(ctx)
+		defer cancel()
+		ctx = bounded
 	}
-	object, ok := s.globalDeliveryFile(w, r)
+	object, ok := s.globalDeliveryFile(ctx, w, r)
 	if !ok {
 		return
 	}
@@ -816,9 +923,9 @@ func (s *Server) handleGlobalDeliveryFile(w http.ResponseWriter, r *http.Request
 	}
 	var body io.ReadCloser
 	if part == nil {
-		body, err = store.OpenExact(r.Context(), object.Key, object.ETag, object.VersionID)
+		body, err = store.OpenExact(ctx, object.Key, object.ETag, object.VersionID)
 	} else {
-		body, err = store.OpenExactRange(r.Context(), object.Key, object.ETag, object.VersionID, part.start, part.end)
+		body, err = store.OpenExactRange(ctx, object.Key, object.ETag, object.VersionID, part.start, part.end)
 	}
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, "R2 file changed while opening.")

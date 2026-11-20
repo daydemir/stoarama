@@ -1,11 +1,15 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -124,6 +128,18 @@ func TestDeliveryRegistryColdLoadAndQuiesceDoNotDeadlock(t *testing.T) {
 type registryDeliveryStore struct {
 	globalDeliveryTestStore
 	size int64
+	// stallOpen makes OpenExact block until its context ends, modelling a public
+	// read that never completes.
+	stallOpen bool
+}
+
+func (r *registryDeliveryStore) OpenExact(ctx context.Context, key, etag, version string) (io.ReadCloser, error) {
+	// Only the media object stalls; the registry object must still load.
+	if r.stallOpen && !strings.HasPrefix(key, globalDeliveryPrefix) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return r.globalDeliveryTestStore.OpenExact(ctx, key, etag, version)
 }
 
 func (r *registryDeliveryStore) Head(context.Context, string) (r2.ObjectHead, error) {
@@ -176,4 +192,177 @@ func TestDeliveryServingGenerationRecordsOnlyTheCurrentPointer(t *testing.T) {
 	if generation != reg.Generation {
 		t.Fatalf("recorded %s, served %s", generation, reg.Generation)
 	}
+}
+
+// TestDeliveryPublicReadIsBoundedByItsLease is the (1) regression: a public read
+// that stalls forever must be cancelled by the response budget, which is shorter
+// than the reader lease, so the handler returns and releases its lease instead of
+// outliving it (and instead of depending on HTTP WriteTimeout).
+func TestDeliveryPublicReadIsBoundedByItsLease(t *testing.T) {
+	if deliveryPublicResponseBudget >= deliveryPublicReaderTTL {
+		t.Fatalf("response budget %v is not shorter than the lease %v", deliveryPublicResponseBudget, deliveryPublicReaderTTL)
+	}
+	// Shrink the budget for this test only; it must still be shorter than the
+	// lease, and the handler must still be bounded by it.
+	original := deliveryPublicResponseBudget
+	deliveryPublicResponseBudget = 300 * time.Millisecond
+	t.Cleanup(func() { deliveryPublicResponseBudget = original })
+	pool := deliveryExemptionTestPool(t)
+	ctx := context.Background()
+	reg := publicDeliveryRegistryFixture()
+	body, err := json.Marshal(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range reg.Assets {
+		if _, err := pool.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256)
+ VALUES('stoarama',$1,btrim($2,'"'),$3,'asset',$4)`, o.Key, o.ETag, o.SizeBytes, o.SHA256); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, o := range reg.Files {
+		if _, err := pool.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256)
+ VALUES('stoarama',$1,btrim($2,'"'),$3,'video_collated',$4)`, o.Key, o.ETag, o.SizeBytes, o.SHA256); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := &registryDeliveryStore{size: int64(len(body))}
+	store.body = body
+	// A file open that blocks until its context ends: the store honours the
+	// deadline the handler derived from its lease.
+	store.stallOpen = true
+	s := &Server{pool: pool, globalDeliveryStore: store, deliveryPublic: poolDeliveryGate{pool}}
+	file := reg.Files["1"]
+	// Prewarm the registry so the stall is only in the file body.
+	if _, err := s.loadGlobalDeliveryRegistryScope(ctx, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	// The fixture file id is "1"; confirm it is present before the stall test.
+	if _, ok := reg.Files["1"]; !ok {
+		t.Fatal("fixture file missing")
+	}
+	router := publicDeliveryRouter(s)
+	start := time.Now()
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, publicGlobalDeliveryAPI+"/file/1?sha256="+file.SHA256, nil))
+	if elapsed := time.Since(start); elapsed > deliveryPublicResponseBudget+5*time.Second {
+		t.Fatalf("a stalled read was not bounded by its lease budget: %v", elapsed)
+	}
+	if w.Code != http.StatusConflict && w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("a stall surfaced as %d, want a bounded failure", w.Code)
+	}
+	var live int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_delivery_public_readers`).Scan(&live); err != nil || live != 0 {
+		t.Fatalf("stalled read left %d leases behind: %v", live, err)
+	}
+}
+
+// TestDeliveryQuiesceWaitsForPausedReadsDeterministically runs real concurrent
+// cold loads against a tiny pool, deterministically pauses each inside its storage
+// read, arms the page while they are outstanding, and proves the quiesce commits
+// (finds a free connection) and every paused read then finishes and releases its
+// lease. No sleeps decide the outcome: the reads signal when they are paused, and
+// the test arms only after both signals.
+func TestDeliveryQuiesceWaitsForPausedReadsDeterministically(t *testing.T) {
+	pool := tinyDeliveryPool(t)
+	ctx := context.Background()
+	reg := publicDeliveryRegistryFixture()
+	body, err := json.Marshal(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range reg.Assets {
+		if _, err := pool.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256)
+ VALUES('stoarama',$1,btrim($2,'"'),$3,'asset',$4)`, o.Key, o.ETag, o.SizeBytes, o.SHA256); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, o := range reg.Files {
+		if _, err := pool.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256)
+ VALUES('stoarama',$1,btrim($2,'"'),$3,'video_collated',$4)`, o.Key, o.ETag, o.SizeBytes, o.SHA256); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Two independent paused registries, so both cold loads can be inside their
+	// read at the same time.
+	store := &pausedRegistryStore{body: body, size: int64(len(body)), paused: make(chan struct{}, 2), release: make(chan struct{})}
+	s := &Server{pool: pool, globalDeliveryStore: store, deliveryPublic: poolDeliveryGate{pool}}
+
+	var wg sync.WaitGroup
+	codes := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, codes[i] = s.loadGlobalDeliveryRegistryScope(ctx, true, "")
+		}(i)
+	}
+	// Wait until BOTH cold loads are paused inside storage.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-store.paused:
+		case <-time.After(20 * time.Second):
+			t.Fatal("cold load never paused inside storage")
+		}
+	}
+	// Arm while both are paused. This must commit: the loads each hold one of the
+	// two connections for their own transaction and never need a second.
+	armed := make(chan error, 1)
+	go func() {
+		_, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: concurrent arming')`)
+		armed <- err
+	}()
+	select {
+	case err := <-armed:
+		if err != nil {
+			t.Fatalf("quiesce with paused reads outstanding failed: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("quiesce deadlocked behind paused cold loads")
+	}
+	// Release the reads. Each one read an object while the page was still
+	// serving, but armed before its publish fence, so it must REFUSE to publish:
+	// a load that lost the race to arming cannot repopulate the cache. The point
+	// is that quiesce committed promptly and nothing hung.
+	close(store.release)
+	wg.Wait()
+	for i, err := range codes {
+		if !errors.Is(err, errDeliveryPageNotServing) {
+			t.Fatalf("cold load %d published after arming: %v", i, err)
+		}
+	}
+	// A cache entry cannot exist after that: nothing was published.
+	if _, found := s.cachedDeliveryRegistry(true, ""); found {
+		t.Fatal("an armed page published a cached registry")
+	}
+	if _, err := s.loadGlobalDeliveryRegistryScope(ctx, true, ""); err == nil {
+		t.Fatal("a new cold load succeeded after quiesce")
+	}
+}
+
+// pausedRegistryStore pauses the registry object's OpenExact until released.
+type pausedRegistryStore struct {
+	globalDeliveryTestStore
+	body    []byte
+	size    int64
+	paused  chan struct{}
+	release chan struct{}
+}
+
+func (p *pausedRegistryStore) Head(context.Context, string) (r2.ObjectHead, error) {
+	return r2.ObjectHead{ETag: "etag", SizeBytes: p.size}, nil
+}
+
+func (p *pausedRegistryStore) OpenExact(ctx context.Context, key, etag, version string) (io.ReadCloser, error) {
+	p.opened.Add(1)
+	select {
+	case p.paused <- struct{}{}:
+	default:
+	}
+	select {
+	case <-p.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return io.NopCloser(bytes.NewReader(p.body)), nil
 }
