@@ -20,11 +20,16 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/r2"
 )
 
-// readResponseError carries a provider's status and headers, as the SDK's HTTP
+// readResponseError carries a provider's 429 and headers, as the SDK's HTTP
 // response error does.
 func readResponseError(header http.Header) error {
-	response := &http.Response{StatusCode: http.StatusTooManyRequests, Header: header, Body: io.NopCloser(strings.NewReader(""))}
-	return &awshttp.ResponseError{ResponseError: &smithyhttp.ResponseError{Response: &smithyhttp.Response{Response: response}, Err: errors.New("throttled")}}
+	return readStatusError(http.StatusTooManyRequests, header)
+}
+
+// readStatusError carries any provider status and headers.
+func readStatusError(status int, header http.Header) error {
+	response := &http.Response{StatusCode: status, Header: header, Body: io.NopCloser(strings.NewReader(""))}
+	return &awshttp.ResponseError{ResponseError: &smithyhttp.ResponseError{Response: &smithyhttp.Response{Response: response}, Err: errors.New("provider status")}}
 }
 
 // readScriptServer answers each read from a script keyed by request kind, so a
@@ -535,18 +540,29 @@ func TestR2InverseListPageAttemptIsFiniteWithoutParentDeadline(t *testing.T) {
 // The multipart inventory is a read too: one throttled page is retried in place
 // with the same markers, and the existing eligibility checks still decide.
 func TestR2InverseMultipartInventoryRetriesOnePage(t *testing.T) {
+	const key = "stitch-staging/a/one.mp4"
 	var calls atomic.Int64
+	var mu sync.Mutex
+	markers := []string{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		n := calls.Add(1)
 		w.Header().Set("Content-Type", "application/xml")
-		page := req.URL.Query().Get("key-marker")
+		keyMarker := req.URL.Query().Get("key-marker")
+		uploadMarker := req.URL.Query().Get("upload-id-marker")
+		mu.Lock()
+		markers = append(markers, keyMarker+"|"+uploadMarker)
+		mu.Unlock()
 		if n == 1 {
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
-		if page == "" {
-			fmt.Fprintf(w, `<ListMultipartUploadsResult><Upload><Key>stitch-staging/a/one.mp4</Key><UploadId>a</UploadId></Upload><IsTruncated>true</IsTruncated><NextKeyMarker>stitch-staging/a/one.mp4</NextKeyMarker><NextUploadIdMarker>a</NextUploadIdMarker></ListMultipartUploadsResult>`)
+		if keyMarker == "" {
+			fmt.Fprintf(w, `<ListMultipartUploadsResult><Upload><Key>%s</Key><UploadId>a</UploadId></Upload><IsTruncated>true</IsTruncated><NextKeyMarker>%s</NextKeyMarker><NextUploadIdMarker>a</NextUploadIdMarker></ListMultipartUploadsResult>`, key, key)
 			return
+		}
+		// The retried page and the advancing page both carry the exact markers.
+		if keyMarker != key || uploadMarker != "a" {
+			t.Errorf("page %d markers %q/%q, want %q/a", n, keyMarker, uploadMarker, key)
 		}
 		fmt.Fprint(w, `<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>`)
 	}))
@@ -556,14 +572,19 @@ func TestR2InverseMultipartInventoryRetriesOnePage(t *testing.T) {
 		t.Fatal(err)
 	}
 	var seen atomic.Int64
-	if err := client.RequireNoMultipartOutsideStitchStaging(context.Background(), func(_ context.Context, key, upload string) (bool, error) {
+	if err := client.RequireNoMultipartOutsideStitchStaging(context.Background(), func(_ context.Context, k, upload string) (bool, error) {
 		seen.Add(1)
-		return key == "stitch-staging/a/one.mp4" && upload == "a", nil
+		return k == key && upload == "a", nil
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if calls.Load() != 3 || seen.Load() != 1 {
 		t.Fatalf("%d inventory requests, %d identity checks: want a retried first page then page two", calls.Load(), seen.Load())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(markers) != 3 || markers[0] != "|" || markers[1] != "|" || markers[2] != key+"|a" {
+		t.Fatalf("markers %v: the retried page or the continuation lost its marker", markers)
 	}
 }
 
@@ -585,15 +606,36 @@ func TestR2InverseReadGateRespectsContext(t *testing.T) {
 // A prolonged cooldown also ends a read that is already waiting, rather than
 // letting it send its next attempt.
 func TestR2InverseReadStopsInCooldownWhenContextEnds(t *testing.T) {
-	script := &readScriptServer{answer: func(kind, marker string, attempt int) (int, http.Header) {
-		return http.StatusTooManyRequests, http.Header{"Retry-After": []string{"20"}}
-	}}
-	store := newReadScriptStore(t, script)
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	store := newReadScriptStore(t, &readScriptServer{})
+	// A sibling publishes a real cooldown as its first answer. Its own cap is
+	// above the floor, so this is a cooldown, not a latch.
+	sibling := make(chan struct{})
+	go func() {
+		defer close(sibling)
+		_ = store.read(context.Background(), inverseReadPolicy{attempts: 1, maxBackoff: inverseReadMaxBackoff, maxRetryAfter: inverseReadMaxRetryAfter}, "head sibling", func(context.Context) error {
+			return readResponseError(http.Header{"Retry-After": []string{"20"}})
+		})
+	}()
+	<-sibling
+	if got := store.readGate().publishedCooldown(); got < 19*time.Second {
+		t.Fatalf("sibling published %v, want about 20s", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	_, err := store.Head(ctx, "managed/a.mp4")
-	if err == nil || script.count() != 1 {
-		t.Fatalf("read sent %d attempts during a cooldown: %v", script.count(), err)
+	started := time.Now()
+	err := store.read(ctx, inverseListReadPolicy, "list", func(context.Context) error {
+		t.Error("the SDK ran inside a cooldown")
+		return nil
+	})
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cooldown wait ended with %v, want the context's own error", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("cooldown wait took %v", elapsed)
+	}
+	// Nothing was handed to the SDK: the count is zero operations invoked.
+	if !strings.Contains(err.Error(), "after 0 attempts") {
+		t.Fatalf("a gate failure reported a phantom attempt: %v", err)
 	}
 }
 
@@ -660,5 +702,198 @@ func TestR2InverseSmallRetryAfterKeepsBoundedJitterAndCooldown(t *testing.T) {
 	}
 	if waited := <-sibling; waited < 400*time.Millisecond {
 		t.Fatalf("a sibling read left after %v, inside the shared cooldown", waited)
+	}
+}
+
+// A bare 503 with no Retry-After publishes the shared minimum cooldown, so a
+// distinct sibling read type is held after both an early and a terminal 503.
+func TestR2InverseBare503PublishesSharedCooldown(t *testing.T) {
+	for name, attempts := range map[string]int{"early": 4, "terminal": 1} {
+		t.Run(name, func(t *testing.T) {
+			store := newReadScriptStore(t, &readScriptServer{})
+			// A short, deterministic minimum: half to full of maxBackoff.
+			policy := inverseReadPolicy{attempts: attempts, maxBackoff: 400 * time.Millisecond, maxRetryAfter: inverseReadMaxRetryAfter}
+			sends := atomic.Int64{}
+			headErr := store.read(context.Background(), policy, "head a", func(context.Context) error {
+				sends.Add(1)
+				return readStatusError(http.StatusServiceUnavailable, http.Header{})
+			})
+			if headErr == nil {
+				t.Fatal("a bare 503 read succeeded")
+			}
+			if sends.Load() != int64(attempts) {
+				t.Fatalf("%d bare-503 sends, want exactly %d", sends.Load(), attempts)
+			}
+			// The 503 published a floor even though this reader stopped.
+			if got := store.readGate().publishedCooldown(); got < 150*time.Millisecond {
+				t.Fatalf("%s 503 published only %v of cooldown", name, got)
+			}
+			// A distinct sibling read type is held by it before it can run.
+			waited := make(chan time.Duration, 1)
+			go func() {
+				begin := time.Now()
+				_ = store.read(context.Background(), inverseListReadPolicy, "sibling list", func(context.Context) error { return nil })
+				waited <- time.Since(begin)
+			}()
+			select {
+			case d := <-waited:
+				if d < 100*time.Millisecond {
+					t.Fatalf("%s 503 did not hold a sibling: it left after %v", name, d)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("sibling read never finished")
+			}
+		})
+	}
+}
+
+// An overflowing positive decimal is a real, very long floor, not an absent
+// hint: both seconds and R2 milliseconds saturate at the parse clamp. Values
+// beyond int64 and beyond uint64 both count. A malformed or signed value keeps
+// its "no hint" meaning, and an HTTP date still parses.
+func TestR2InverseRetryAfterOverflowSaturates(t *testing.T) {
+	beyondInt64 := "9223372036854775808"   // math.MaxInt64 + 1
+	beyondUint64 := "18446744073709551616" // math.MaxUint64 + 1
+	for name, tc := range map[string]struct {
+		header http.Header
+		want   time.Duration
+	}{
+		"seconds beyond int64":  {http.Header{"Retry-After": []string{beyondInt64}}, 24 * time.Hour},
+		"seconds beyond uint64": {http.Header{"Retry-After": []string{beyondUint64}}, 24 * time.Hour},
+		"millis beyond int64":   {http.Header{"X-Amz-Retry-After": []string{beyondInt64}}, 24 * time.Hour},
+		"millis beyond uint64":  {http.Header{"X-Amz-Retry-After": []string{beyondUint64}}, 24 * time.Hour},
+		"huge seconds":          {http.Header{"Retry-After": []string{"9223372036854775807"}}, 24 * time.Hour},
+		"huge millis":           {http.Header{"X-Amz-Retry-After": []string{"9223372036854775807"}}, 24 * time.Hour},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, ok := inverseReadRetryAfter(readResponseError(tc.header))
+			if !ok || got != tc.want {
+				t.Fatalf("parsed %v (ok=%v), want %v as a saturated floor", got, ok, tc.want)
+			}
+		})
+	}
+	// Malformed and signed input keeps "no hint".
+	for _, raw := range []string{"-5", "later", "1.5", " 5x", "+7"} {
+		if _, ok := inverseReadRetryAfter(readResponseError(http.Header{"Retry-After": []string{raw}})); ok {
+			t.Fatalf("%q was read as a numeric floor", raw)
+		}
+	}
+	// An HTTP date still parses.
+	at := time.Now().Add(3 * time.Second).UTC().Format(http.TimeFormat)
+	got, ok := inverseReadRetryAfter(readResponseError(http.Header{"Retry-After": []string{at}}))
+	if !ok || got <= 0 || got > 4*time.Second {
+		t.Fatalf("HTTP date parsed %v (ok=%v)", got, ok)
+	}
+}
+
+// When both headers are present the longest valid floor wins, so a short
+// standard hint never undercuts R2's own millisecond ask.
+func TestR2InverseRetryAfterChoosesLongestFloor(t *testing.T) {
+	got, ok := inverseReadRetryAfter(readResponseError(http.Header{
+		"Retry-After":       []string{"1"},
+		"X-Amz-Retry-After": []string{"2500"},
+	}))
+	if !ok || got != 2500*time.Millisecond {
+		t.Fatalf("coexisting headers chose %v (ok=%v), want the longer 2500ms", got, ok)
+	}
+	// The reverse direction also holds.
+	got, ok = inverseReadRetryAfter(readResponseError(http.Header{
+		"Retry-After":       []string{"7"},
+		"X-Amz-Retry-After": []string{"10"},
+	}))
+	if !ok || got != 7*time.Second {
+		t.Fatalf("coexisting headers chose %v (ok=%v), want the longer 7s", got, ok)
+	}
+	// An invalid longer field does not hide a valid one.
+	got, ok = inverseReadRetryAfter(readResponseError(http.Header{
+		"Retry-After":       []string{"4"},
+		"X-Amz-Retry-After": []string{"nonsense"},
+	}))
+	if !ok || got != 4*time.Second {
+		t.Fatalf("invalid R2 hint hid the standard one: %v (ok=%v)", got, ok)
+	}
+}
+
+// A definitive confirming 200 must never become a retry, even if a short
+// attempt deadline expires at the same moment: the classification reads the
+// returned error, not the context.
+func TestR2InverseDefinitiveAnswerIsNeverRetried(t *testing.T) {
+	store := newReadScriptStore(t, &readScriptServer{})
+	policy := inverseReadPolicy{attempts: 4, maxBackoff: 10 * time.Millisecond, maxRetryAfter: inverseReadMaxRetryAfter}
+	sends := atomic.Int64{}
+	// A 200 from the confirming HEAD is "object remains": definitive, not
+	// transient. A deadline on the attempt must not change that.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := store.read(ctx, policy, "confirming head managed/a.mp4", func(attemptCtx context.Context) error {
+		sends.Add(1)
+		// Let the attempt's own deadline pass, then answer definitively.
+		if deadline, ok := attemptCtx.Deadline(); ok {
+			time.Sleep(time.Until(deadline) + 5*time.Millisecond)
+		}
+		return errors.New("object remains after DELETE")
+	})
+	if err == nil || !strings.Contains(err.Error(), "object remains") {
+		t.Fatalf("definitive answer lost: %v", err)
+	}
+	if sends.Load() != 1 {
+		t.Fatalf("%d invocation(s) for a definitive answer, want exactly 1", sends.Load())
+	}
+}
+
+// Gate failures before the SDK call report operations actually invoked, which is
+// zero for an already latched gate, and never a phantom attempt.
+func TestR2InverseGateFailureReportsInvokedOperations(t *testing.T) {
+	store := newReadScriptStore(t, &readScriptServer{})
+	store.readGate().close()
+	err := store.read(context.Background(), inverseHeadReadPolicy, "head a", func(context.Context) error {
+		t.Error("the SDK ran behind a latched gate")
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "after 0 attempts") {
+		t.Fatalf("latched gate reported: %v", err)
+	}
+}
+
+// The standalone partition dispatch reads through the bounded inverse store:
+// a throttled continuation page retries in place and the listing still covers
+// the bucket once.
+func TestR2InversePartitionDispatchUsesBoundedReader(t *testing.T) {
+	script := &readScriptServer{answer: func(kind, marker string, attempt int) (int, http.Header) {
+		if attempt == 1 && kind == "list" {
+			return http.StatusTooManyRequests, http.Header{"Retry-After": []string{"0"}}
+		}
+		return http.StatusOK, nil
+	}}
+	store := newReadScriptStore(t, script)
+	// The same seam writeInversePartition now uses: a store that is an
+	// inverseLister, into the existing directory entry point.
+	var out bytes.Buffer
+	sum, err := partitionInverse(context.Background(), store, inverseTestProtection(), "policy", &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Total.Objects != 2 || sum.Total.Bytes != 30 {
+		t.Fatalf("partition %+v", sum.Total)
+	}
+	if script.attempts("list", "page1") != 2 || script.attempts("list", "page2") != 2 {
+		t.Fatalf("page attempts %d/%d, want one retry each", script.attempts("list", "page1"), script.attempts("list", "page2"))
+	}
+}
+
+// The dispatch itself passes a real inverse store, not a raw r2.Client.
+func TestR2InversePartitionDispatchStoreType(t *testing.T) {
+	store, err := newInverseSDKStore(context.Background(), r2.Config{Bucket: "stoarama", Endpoint: "http://127.0.0.1:1", AccessKey: "test", SecretKey: "test", Region: "auto"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lister inverseLister = store
+	if lister.Bucket() != "stoarama" || lister.EndpointSHA256() == "" {
+		t.Fatalf("bounded store does not carry the archived bucket/endpoint: %q %q", lister.Bucket(), lister.EndpointSHA256())
+	}
+	if _, ok := lister.(interface {
+		ListPrefix(context.Context, string, int, func(r2.ObjectInfo) error) error
+	}); !ok {
+		t.Fatal("bounded store is not a lister")
 	}
 }

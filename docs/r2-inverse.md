@@ -69,8 +69,19 @@ The tick can generate a new read-only partition when its current one expires.
 
 Each new key commits an ordinary source reservation and a permanent key intent
 before wire, charges its byte budget, and fsyncs a private append-only JSONL
-ledger. The network phase takes the metadata barrier first in shared mode, then
-ordered joined/admission locks, allowing independent keys to run concurrently. A common live delivery predicate includes content/path aliases
+ledger. The network phase's lock order, which an operator should read as the
+runbook, is: the KE epoch row `FOR SHARE` first as the barrier, then the global
+protection advisory locks in **shared** mode (137/1 and the two protection keys),
+then the **exclusive** per-key COPY advisory lock for this object, then the clip
+row `FOR UPDATE`. Wire preparation (the identity HEAD, multipart inventory,
+target load and guards) runs under that order, prepared with its own database
+step budget before the existing 30-second network budget starts. The wire
+transaction commits, and rolls back, separately from the reservation that came
+before it and from publication that follows. Keys hold only shared global locks,
+so independent keys still run concurrently; only the per-key COPY advisory and
+that key's clip row are exclusive. The startup multipart inventory is the one
+read outside the protection transaction, and it runs under the apply session's
+advisory lock, before any key reserves. A common live delivery predicate includes content/path aliases
 and current collated-output dependencies without relying on a refreshed source
 cache; admission of those protections and output membership changes is fenced. It exercises the installed purge guards before DELETE, rolls
 that probe back, HEAD-checks listing/catalog ETag, size and the fixed pre-fence LastModified cutoff, and
@@ -113,12 +124,21 @@ keep-alives off and HTTP/2 refused, and no read follows a redirect, so the
 attempt count is the physical request count and a published cooldown never
 finishes with a stray hop. Only timeouts, connection errors, 429, every 5xx
 (including a proxy's 520-599) and throttling retry; a bare 503 with no
-`Retry-After` retries under the same bounded jitter. The confirming HEAD follows
+`Retry-After` retries under the same bounded jitter and publishes the same shared
+minimum cooldown a bare 429 does, on an early or a terminal try alike. When both
+`Retry-After` and `X-Amz-Retry-After` are present the longest valid floor wins, so
+a short standard hint never undercuts R2's own ask, and an overflowing positive
+decimal saturates at the clamp instead of reading as absent. The confirming HEAD follows
 no redirect: a 404 from anywhere but the key cannot confirm it. A 200 means the
 object remains: it fails at once. A pre-DELETE read failure issues no DELETE
 attempt at all. A final confirming failure keeps a key whose DELETE was already
 issued unconfirmed and held — never absent, and never resent; the job stops
 through its existing clean abort path.
+
+The standalone `r2-inverse partition` command reads through this same bounded
+store, built from the identical archived bucket, endpoint and environment config,
+so a throttled page retries in place during a partition exactly as it does inside
+a job.
 
 One rate limiter belongs to the job's single store and is shared by every worker
 and every read type. A 429 — or any transient status carrying `Retry-After` — sets

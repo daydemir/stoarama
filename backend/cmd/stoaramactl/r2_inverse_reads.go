@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"math"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
@@ -92,6 +91,7 @@ var inverseHeadReadPolicy = inverseReadPolicy{
 type inverseReadGate struct {
 	mu      sync.Mutex
 	until   time.Time
+	setAt   time.Time
 	closed  bool
 	changed chan struct{}
 }
@@ -132,6 +132,7 @@ func (g *inverseReadGate) pause(d time.Duration) {
 		return
 	}
 	g.until = until
+	g.setAt = time.Now()
 	close(g.changed)
 	g.changed = make(chan struct{})
 }
@@ -142,6 +143,17 @@ func (g *inverseReadGate) untilNow() (time.Time, bool, chan struct{}) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.until, g.closed, g.changed
+}
+
+// publishedCooldown reports the cooldown's own duration as published, ignoring
+// time already spent, which is what a test needs to see a floor was set at all.
+func (g *inverseReadGate) publishedCooldown() time.Duration {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.until.IsZero() {
+		return 0
+	}
+	return max(g.until.Sub(g.setAt), 0)
 }
 
 // remaining reports how long every new read must still wait, and whether the
@@ -213,7 +225,9 @@ func (s *inverseSDKStore) readGate() *inverseReadGate {
 // millisecond X-Amz-Retry-After), and never retries earlier than that: a floor
 // past what is left of this read's budget stops this read cleanly, and a floor
 // past the retry cap fences the whole job. A clean stop is an ordinary error, so
-// the job takes its existing abort path.
+// the job takes its existing abort path. Every count it reports is an operation
+// actually invoked: a gate failure before the SDK is called reports the count so
+// far, which is zero when the gate is already latched.
 func (s *inverseSDKStore) read(ctx context.Context, p inverseReadPolicy, what string, op func(context.Context) error) error {
 	gate := s.readGate()
 	if p.timeout > 0 {
@@ -221,12 +235,20 @@ func (s *inverseSDKStore) read(ctx context.Context, p inverseReadPolicy, what st
 		ctx, cancel = context.WithTimeout(ctx, p.timeout)
 		defer cancel()
 	}
-	fail := func(tries int, err error) error {
-		return fmt.Errorf("%s after %d attempts: %w", what, tries, err)
+	fail := func(invoked int, err error) error {
+		return fmt.Errorf("%s after %d attempts: %w", what, invoked, err)
 	}
+	invoked := 0
 	for tries := 1; ; tries++ {
 		if err := gate.wait(ctx); err != nil {
-			return fail(tries, err)
+			// The SDK was never called: report the operations actually invoked,
+			// not this loop's iteration, so a latched gate says zero.
+			return fail(invoked, err)
+		}
+		if err := ctx.Err(); err != nil {
+			// Same rule: nothing is handed to the transport once the command has
+			// ended, so this is not an extra physical attempt either.
+			return fail(invoked, fmt.Errorf("%w: operation not invoked", err))
 		}
 		// Every attempt carries its own deadline, so no attempt outlives the
 		// policy even when the command has no deadline of its own.
@@ -234,19 +256,24 @@ func (s *inverseSDKStore) read(ctx context.Context, p inverseReadPolicy, what st
 		if p.attemptTimeout > 0 {
 			attemptCtx, cancel = context.WithTimeout(ctx, p.attemptTimeout)
 		}
+		invoked++
 		err := op(attemptCtx)
-		ownTimeout := attemptCtx.Err() != nil && ctx.Err() == nil
+		// The attempt's own deadline is transient only when the provider gave no
+		// definitive answer. Classify from the error the operation returned, never
+		// from the context alone: a 200 that outlived a short attempt deadline is
+		// still "object remains" and must not become a retry.
+		ownTimeout := ctx.Err() == nil && inverseOwnDeadlineError(err)
 		cancel()
 		if err == nil {
 			return nil
 		}
 		terminal := tries == p.attempts
 		if !terminal && inverseConfirmRetryable.IsErrorRetryable(err) != aws.TrueTernary && !ownTimeout {
-			return fail(tries, err)
+			return fail(invoked, err)
 		}
 		wait, fence, latch, stop := inverseReadWait(ctx, p, err)
-		// A throttle fences the job even when this reader stops here, so a
-		// terminal 429 or a long floor cannot leave the next read unfenced.
+		// Provider trouble fences the job even when this reader stops here, so a
+		// terminal 429 or bare 503 cannot leave the next read unfenced.
 		switch {
 		case latch:
 			gate.close()
@@ -254,20 +281,43 @@ func (s *inverseSDKStore) read(ctx context.Context, p inverseReadPolicy, what st
 			gate.pause(wait)
 		}
 		if stop != nil {
-			return fail(tries, stop)
+			return fail(invoked, stop)
 		}
 		if terminal {
-			return fail(tries, err)
+			return fail(invoked, err)
 		}
 		if !fence {
-			// Any other transient read failure waits only for its own key.
+			// Any other transient read failure waits only for its own key. A
+			// cancel during that wait is the job's own error, kept as such.
 			select {
 			case <-ctx.Done():
-				return fail(tries, err)
+				return fail(invoked, ctx.Err())
 			case <-time.After(wait):
 			}
 		}
 	}
+}
+
+// inverseOwnDeadlineError reports a failed attempt that timed out at its own
+// deadline: the operation itself carries a timeout or deadline error and the
+// parent context is still healthy. A definitive provider answer is never this,
+// whatever the attempt context's own state.
+func inverseOwnDeadlineError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	return errors.As(err, &timeoutErr) && timeoutErr.Timeout()
+}
+
+// inverseProviderTrouble reports a provider-wide status: a throttle or any
+// server-side failure. Those publish the shared cooldown, because they say the
+// provider is unwell, not that one key lost a connection.
+func inverseProviderTrouble(status int) bool {
+	return status == http.StatusTooManyRequests || (status >= 500 && status <= 599)
 }
 
 // inverseReadWait decides how long a failed read waits, whether that wait fences
@@ -276,18 +326,19 @@ func (s *inverseSDKStore) read(ctx context.Context, p inverseReadPolicy, what st
 // does not degrade to the cap — a worker deep in a LIST would be released into
 // the same throttle — it latches the gate shut, so the job issues no further
 // reads. A floor past what is left of this read's budget still fences the job for
-// the provider's real ask and stops only this read.
+// the provider's real ask and stops only this read. A bare 503 without a floor
+// publishes the same minimum shared cooldown a bare 429 does.
 func inverseReadWait(ctx context.Context, p inverseReadPolicy, err error) (time.Duration, bool, bool, error) {
-	throttle := inverseReadStatus(err) == http.StatusTooManyRequests
-	// A throttle always fences the job for a real interval, even without a
-	// header and even when a reader stops: half to full backoff.
+	fence := inverseProviderTrouble(inverseReadStatus(err))
+	// Provider trouble always fences the job for a real minimum interval, even
+	// without a header and even when a reader stops: half to full backoff.
 	wait := rand.N(p.maxBackoff)
-	if throttle {
+	if fence {
 		wait = p.maxBackoff/2 + rand.N(p.maxBackoff/2)
 	}
 	retryAfter, ok := inverseReadRetryAfter(err)
 	if !ok {
-		return wait, throttle, false, nil
+		return wait, fence, false, nil
 	}
 	switch {
 	case retryAfter > p.maxRetryAfter:
@@ -316,43 +367,82 @@ func inverseReadStatus(err error) int {
 	return 0
 }
 
+// inverseRetryAfterDuration parses one Retry-After value: delta seconds, or an
+// HTTP date. A positive decimal that overflows int64 — seconds or R2's
+// milliseconds — is still a real provider floor, so it saturates instead of being
+// read as absent. Only ASCII decimal digits count, so a malformed or signed value
+// keeps its existing "no hint" meaning and an HTTP date keeps its parse.
+func inverseRetryAfterDuration(raw string, unit time.Duration) (time.Duration, bool) {
+	const maxWait = 24 * time.Hour
+	if raw == "" {
+		return 0, false
+	}
+	if isASCIIDigits(raw) {
+		value, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			// Beyond uint64: overwhelmingly long, so it is the maximum wait,
+			// never absent.
+			if errors.Is(err, strconv.ErrRange) {
+				return maxWait, true
+			}
+			return 0, false
+		}
+		if value == 0 {
+			return 0, true
+		}
+		// Saturate before multiplying, in the header's own unit.
+		if value > uint64(maxWait/unit) {
+			return maxWait, true
+		}
+		return time.Duration(value) * unit, true
+	}
+	if unit == time.Second {
+		if at, err := http.ParseTime(raw); err == nil {
+			if wait := time.Until(at); wait > 0 {
+				return min(wait, maxWait), true
+			}
+			return 0, true
+		}
+	}
+	return 0, false
+}
+
+// isASCIIDigits reports an unsigned positive decimal, the only numeric form a
+// Retry-After header may take.
+func isASCIIDigits(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	for _, r := range raw {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // inverseReadRetryAfter reads the provider's own floor for the next try.
 // Retry-After is delta seconds or an HTTP date; R2 answers a throttled request
-// with X-Amz-Retry-After in milliseconds. Every value is clamped so the parse
-// itself can never overflow a Duration.
+// with X-Amz-Retry-After in milliseconds. Both may be present: the longest valid
+// floor wins, so a short standard hint never undercuts R2's own ask. Every value
+// is clamped so the parse itself can never overflow a Duration, and an
+// overflowing positive decimal saturates at the clamp rather than reading as
+// absent.
 func inverseReadRetryAfter(err error) (time.Duration, bool) {
 	var responseErr *awshttp.ResponseError
 	if !errors.As(err, &responseErr) || responseErr.Response == nil || responseErr.Response.Response == nil {
 		return 0, false
 	}
 	header := responseErr.Response.Header
-	const maxSeconds = int64(24 * 60 * 60)
-	if raw := strings.TrimSpace(header.Get("Retry-After")); raw != "" {
-		if seconds, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil {
-			if seconds <= 0 {
-				return 0, true
-			}
-			return time.Duration(min(seconds, maxSeconds)) * time.Second, true
-		}
-		if at, parseErr := http.ParseTime(raw); parseErr == nil {
-			wait := time.Until(at)
-			if wait <= 0 {
-				return 0, true
-			}
-			return min(wait, 24*time.Hour), true
-		}
-	}
-	if raw := strings.TrimSpace(header.Get("X-Amz-Retry-After")); raw != "" {
-		if millis, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil {
-			if millis <= 0 {
-				return 0, true
-			}
-			// Saturate before multiplying: millis can be near int64 max.
-			if millis > int64(math.MaxInt64/time.Millisecond) {
-				return 24 * time.Hour, true
-			}
-			return min(time.Duration(millis)*time.Millisecond, 24*time.Hour), true
-		}
+	seconds, secondsOK := inverseRetryAfterDuration(strings.TrimSpace(header.Get("Retry-After")), time.Second)
+	millis, millisOK := inverseRetryAfterDuration(strings.TrimSpace(header.Get("X-Amz-Retry-After")), time.Millisecond)
+	switch {
+	case secondsOK && millisOK:
+		return max(seconds, millis), true
+	case secondsOK:
+		return seconds, true
+	case millisOK:
+		return millis, true
 	}
 	return 0, false
 }
