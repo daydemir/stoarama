@@ -32,6 +32,14 @@ const nasLocalStitchInFlightSQL = `EXISTS(SELECT 1 FROM nas_stitch_tasks
  OR (state='verified' AND cleanup_plan_id IS NULL AND registration_abandoned_at IS NULL))`
 const nasStitchMaxBytes int64 = 2500000000
 
+const nasStitchAudioProofRule = "aac-lc-primed-pcm-v1"
+const nasStitchAACFrameSamples int64 = 1024
+const nasStitchAACPacketLimit int64 = 500000
+
+// Mirrors delivery_coverage.AAC_SAMPLE_RATES; only these rates have a pinned
+// AAC-LC sampling index in the reviewed adapter.
+var nasStitchAACSampleRates = map[int64]bool{96000: true, 88200: true, 64000: true, 48000: true, 44100: true, 32000: true, 24000: true, 22050: true, 16000: true, 12000: true, 11025: true, 8000: true, 7350: true}
+
 type nasStitchEdge struct {
 	SourceKey [2]struct {
 		ID   int64
@@ -109,17 +117,35 @@ type nasStitchProvenance struct {
 	FFprobeVersion   string `json:"ffprobe_version"`
 	FFmpegSHA        string `json:"ffmpeg_sha256"`
 	FFprobeSHA       string `json:"ffprobe_sha256"`
+	// Only an exact version string is ever admitted; the reviewed Durham package
+	// below still omits it, so AAC stays inactive until the next pin.
+	AudioProof string `json:"audio_proof,omitempty"`
 }
+
+// nasStitchAudioProof mirrors the Python adapter's exact per-input AAC fields.
+// PrimerPackets is a pointer so an absent key can never be read as an attested
+// zero-primer fact.
+type nasStitchAudioProof struct {
+	Packets       int64  `json:"packets"`
+	PacketChain   string `json:"packet_chain_sha256"`
+	SampleRate    int64  `json:"sample_rate"`
+	SampleCount   int64  `json:"sample_count"`
+	PCMChain      string `json:"pcm_chain_sha256"`
+	Rule          string `json:"rule"`
+	PrimerPackets *int64 `json:"primer_packets"`
+}
+
 type nasStitchInputProof struct {
-	RetirementHeld bool            `json:"retirement_held"`
-	ID             int64           `json:"clip_id"`
-	SHA            string          `json:"sha256"`
-	Size           int64           `json:"size_bytes"`
-	PacketSHA      string          `json:"packet_chain_sha256"`
-	Packets        int64           `json:"packets"`
-	Frames         int64           `json:"frames"`
-	Repaired       bool            `json:"repaired"`
-	RawProof       json.RawMessage `json:"raw_proof"`
+	RetirementHeld bool                 `json:"retirement_held"`
+	ID             int64                `json:"clip_id"`
+	SHA            string               `json:"sha256"`
+	Size           int64                `json:"size_bytes"`
+	PacketSHA      string               `json:"packet_chain_sha256"`
+	Packets        int64                `json:"packets"`
+	Frames         int64                `json:"frames"`
+	Repaired       bool                 `json:"repaired"`
+	RawProof       json.RawMessage      `json:"raw_proof"`
+	AudioProof     *nasStitchAudioProof `json:"audio_proof,omitempty"`
 }
 type nasStitchOutput struct {
 	Policy      string                `json:"policy"`
@@ -653,6 +679,63 @@ func validateNASStitchResult(p nasStitchPlan, q nasStitchResult) ([]nasCleanupIt
 	return validateNASStitchProof(p, q, nasStitchOnNAS)
 }
 
+// validateNASStitchAudioProof is the single typed gate for the output audio
+// attestation. A reviewed Durham package that advertises the primed-PCM
+// capability may emit AAC outputs and ordinary video-only outputs; every other
+// profile stays video-only, and an AAC claim needs the exact per-input proof.
+func validateNASStitchAudioProof(o nasStitchOutput, origin nasStitchProofOrigin) error {
+	capable := false
+	if origin == nasStitchOnDurham {
+		// Provenance equality already pins the exact package; only the reviewed
+		// capability string can unlock audio.
+		capable = o.Provenance.AudioProof == nasStitchAudioProofRule
+	} else if o.Provenance.AudioProof != "" {
+		return errors.New("NAS-local lane cannot attest audio")
+	}
+	if o.NoAudio {
+		// Video-only output: a per-input AAC attestation would contradict it,
+		// even on a capable profile.
+		for _, proof := range o.Inputs {
+			if proof.AudioProof != nil {
+				return errors.New("audio-absent output carries input audio proof")
+			}
+		}
+		return nil
+	}
+	if !capable {
+		return errors.New("AAC output requires the reviewed Durham primed-PCM capability")
+	}
+	if len(o.Inputs) == 0 {
+		return errors.New("AAC output has no proven inputs")
+	}
+	rate := int64(0)
+	for n, proof := range o.Inputs {
+		a := proof.AudioProof
+		// primer_packets must be explicit; absent is not an attested zero.
+		if a == nil || a.PrimerPackets == nil || !stitchSHA(a.PacketChain) || !stitchSHA(a.PCMChain) || a.Packets <= 0 || a.Packets > nasStitchAACPacketLimit || a.SampleCount <= 0 || a.SampleCount > a.Packets*nasStitchAACFrameSamples {
+			return errors.New("input AAC proof is not exact")
+		}
+		primer := *a.PrimerPackets
+		if n == 0 {
+			if a.Rule != "standalone_exact" || primer != 0 {
+				return errors.New("first AAC input must be standalone exact")
+			}
+		} else if a.Rule != "seam_primed" || primer != 1 {
+			return errors.New("each later AAC input must be seam primed")
+		}
+		if n == 0 {
+			rate = a.SampleRate
+		}
+		if a.SampleRate != rate {
+			return errors.New("input AAC sample rates differ")
+		}
+	}
+	if !nasStitchAACSampleRates[rate] {
+		return errors.New("unsupported AAC sample rate")
+	}
+	return nil
+}
+
 func validateNASStitchProof(p nasStitchPlan, q nasStitchResult, origin nasStitchProofOrigin) ([]nasCleanupItem, error) {
 	if p.Policy != nasStitchPolicy || p.Revision != nasStitchRevision || q.Policy != nasStitchPolicy || len(p.Eligible) != len(p.Clips) || len(p.Joins) != len(p.Clips)-1 || len(q.Seams) != len(p.Joins) || len(p.Frozen) != len(p.Joins) {
 		return nil, errors.New("incomplete policy admission")
@@ -702,8 +785,11 @@ func validateNASStitchProof(p nasStitchPlan, q nasStitchResult, origin nasStitch
 	}
 	var included []nasCleanupItem
 	for _, o := range q.Outputs {
-		if o.Policy != nasStitchPolicy || !validNASStitchProvenance(o.Provenance, origin) || !validCleanupPath(o.Path) || path.Dir(o.Path) != p.OutputFolder || paths[o.Path] || !stitchSHA(o.SHA) || o.ReadbackSHA != o.SHA || o.Size <= 0 || o.Size > nasStitchMaxBytes+nasStitchMaxBytes/10 || !o.FullDecode || !o.SeamDecode || !o.PacketChain || !o.NativeAudit || !o.NoAudio || !o.Fsynced || len(o.Inputs) == 0 {
+		if o.Policy != nasStitchPolicy || !validNASStitchProvenance(o.Provenance, origin) || !validCleanupPath(o.Path) || path.Dir(o.Path) != p.OutputFolder || paths[o.Path] || !stitchSHA(o.SHA) || o.ReadbackSHA != o.SHA || o.Size <= 0 || o.Size > nasStitchMaxBytes+nasStitchMaxBytes/10 || !o.FullDecode || !o.SeamDecode || !o.PacketChain || !o.NativeAudit || !o.Fsynced || len(o.Inputs) == 0 {
 			return nil, errors.New("complete durable native output verification required")
+		}
+		if err := validateNASStitchAudioProof(o, origin); err != nil {
+			return nil, err
 		}
 		paths[o.Path] = true
 		prev := -1
@@ -968,7 +1054,9 @@ func validNASStitchProvenance(p nasStitchProvenance, origin nasStitchProofOrigin
 	if origin == nasStitchOnDurham {
 		return p == reviewedDurhamProvenance()
 	}
-	return p.Architecture == "" && p.EvaluatorSHA == "" && p.OctoberRecovered && p.Policy == nasStitchPolicy && p.ManifestSHA == nasStitchManifestSHA && p.FFmpegVersion == "N-126826-gc0e8b139fd-20260924" && p.FFprobeVersion == "N-126826-gc0e8b139fd-20260924" && p.FFmpegSHA == "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b" && p.FFprobeSHA == "9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c"
+	// NAS-local never attests audio: an explicit capability is rejected rather
+	// than ignored so a mixed profile cannot drift in.
+	return p.AudioProof == "" && p.Architecture == "" && p.EvaluatorSHA == "" && p.OctoberRecovered && p.Policy == nasStitchPolicy && p.ManifestSHA == nasStitchManifestSHA && p.FFmpegVersion == "N-126826-gc0e8b139fd-20260924" && p.FFprobeVersion == "N-126826-gc0e8b139fd-20260924" && p.FFmpegSHA == "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b" && p.FFprobeSHA == "9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c"
 }
 
 // GET capabilities only; no cloud writes, no release or arbitrary object paths.
