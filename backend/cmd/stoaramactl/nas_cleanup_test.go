@@ -107,10 +107,87 @@ func TestNASCleanupMasterDispatchMethodsURLsAndControllerCredential(t *testing.T
 	// Without a controller credential nothing is sent: the service token is
 	// never a fallback.
 	noCredential := config.Config{ServiceToken: cfg.ServiceToken, APIToken: cfg.APIToken}
-	if err := nasCleanupMasterDispatch(context.Background(), noCredential, []string{"off", "--reason", "x"}, do); err == nil {
+	if err := nasCleanupMasterDispatch(context.Background(), noCredential, []string{"off", "--reason", "x", "--backend-api-url", "https://api.test"}, do); err == nil {
 		t.Fatal("master change dispatched without the controller credential")
 	}
 	if len(got) != 0 {
 		t.Fatalf("dispatch without controller credential: %+v", got)
+	}
+}
+
+// A flag error (unknown flag or --help) must stop the command before a
+// credential is resolved or anything is sent: an abbreviated or mistyped
+// invocation must never flip deletion authority.
+func TestNASCleanupMasterDispatchStopsOnFlagErrors(t *testing.T) {
+	sent := 0
+	do := func(method, base, token, path string, body any) map[string]any {
+		sent++
+		return map[string]any{"ok": true}
+	}
+	cfg := config.Config{NASCleanupControllerToken: "controller-token-32-bytes-long-000000"}
+	for _, args := range [][]string{
+		{"off", "--reason", "stop", "--help"},
+		{"off", "--reason", "stop", "-h"},
+		{"status", "--help"},
+		{"off", "--reason", "stop", "--api-token", "controller-token-32-bytes-long-000000"},
+		{"off", "--reason", "stop", "--unknown-flag"},
+		{"off", "--reason"},
+	} {
+		if err := nasCleanupMasterDispatch(context.Background(), cfg, args, do); err == nil {
+			t.Fatalf("flag error %v accepted", args)
+		}
+	}
+	if sent != 0 {
+		t.Fatalf("a flag error still sent %d request(s)", sent)
+	}
+}
+
+// The controller credential comes only from the environment. A token on the
+// command line would be visible in shell history and process listings, so the
+// flag is gone and its presence is a hard error, not a silent fallback.
+func TestNASCleanupMasterDispatchRejectsTokenFlag(t *testing.T) {
+	sent := 0
+	do := func(method, base, token, path string, body any) map[string]any {
+		sent++
+		return map[string]any{"ok": true}
+	}
+	if err := nasCleanupMasterDispatch(context.Background(), config.Config{}, []string{"status", "--api-token", "fixture-token-32-bytes-long-0000000", "--backend-api-url", "https://api.test"}, do); err == nil {
+		t.Fatal("token-on-command-line flag accepted")
+	}
+	if err := nasCleanupMasterDispatch(context.Background(), config.Config{}, []string{"off", "--reason", "x", "--token", "fixture-token-32-bytes-long-0000000", "--backend-api-url", "https://api.test"}, do); err == nil {
+		t.Fatal("token-on-command-line alias accepted")
+	}
+	if sent != 0 {
+		t.Fatalf("token flag still dispatched: %d", sent)
+	}
+}
+
+// The controller credential must never cross a plaintext or redirectable
+// connection, so only a bare HTTPS origin is accepted.
+func TestNASCleanupMasterDispatchRequiresHTTPSOrigin(t *testing.T) {
+	sent := 0
+	do := func(method, base, token, path string, body any) map[string]any {
+		sent++
+		return map[string]any{"ok": true}
+	}
+	cfg := config.Config{NASCleanupControllerToken: "controller-token-32-bytes-long-000000"}
+	for _, base := range []string{
+		"http://api.test",
+		"api.test",
+		"https://user:pass@api.test",
+		"https://api.test/path",
+		"https://api.test/?q=1",
+		"https://api.test/#f",
+		"",
+	} {
+		if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"status", "--backend-api-url", base}, do); err == nil {
+			t.Fatalf("unsafe backend URL %q accepted", base)
+		}
+	}
+	if sent != 0 {
+		t.Fatalf("unsafe backend URL still dispatched: %d", sent)
+	}
+	if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"status", "--backend-api-url", "https://api.test"}, do); err != nil || sent != 1 {
+		t.Fatalf("HTTPS origin rejected: %v sent=%d", err, sent)
 	}
 }

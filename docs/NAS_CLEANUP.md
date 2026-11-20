@@ -94,17 +94,56 @@ history and control rows cannot be deleted, truncated or edited outside that
 path, only the recorder function may append history, and the triggers are
 `ENABLE ALWAYS`.
 
+The controller credential is read only from `NAS_CLEANUP_CONTROLLER_TOKEN`;
+there is no token flag, so it never lands in shell history or a process listing.
+`--backend-api-url` (or `BACKEND_API_URL`) must be a bare HTTPS origin: the CLI
+refuses plaintext, credentials in the URL, a path, a query or a fragment, and
+any flag parse error — `--help` included — stops the command before a
+credential is resolved or a request is sent.
+
 The API reads the switch live, inside the same transaction as each decision it
 guards (plan and batch enable, batch advance, execution lease, permit issue and
 permit replay), and never caches it. It reads `FOR SHARE` last — only after
 every fence and lock that transaction needs, immediately before the guarded
 write — so turning it off waits for in-flight decisions that already read ON
 without waiting on fences or pool checkouts, and fails closed on a read error.
-Once `master off` returns, no further lease or permit is issued. A missing or
-unreadable control is OFF for decisions, while plan and batch reports return an
-error instead of a false OFF and otherwise keep `master_deletion_enabled`.
-Turning it on bypasses nothing: plan approval, batch digests, the 5 TB/day cap
-and per-file permits are unchanged.
+A path that can never mint deletion authority never locks the control at all:
+read-only dry-run observations and leases that offer no execution files do not
+take the master row lock, and the batch observation takes its budget advisory
+lock before the master. Once `master off` returns, no further lease or permit
+is issued. A missing or unreadable control is OFF for decisions, while plan and
+batch reports return an error instead of a false OFF and otherwise keep
+`master_deletion_enabled`. Turning it on bypasses nothing: plan approval, batch
+digests, the 5 TB/day cap and per-file permits are unchanged.
+
+#### Migration 0229 privileges
+
+`0229_nas_cleanup_master.sql` establishes the history provenance chain, so it
+refuses to run when it cannot bind the recorder to a dedicated owner. The
+migrator role needs, in one transaction:
+
+- ownership of the schema it migrates (to create the tables, functions and
+  triggers);
+- `CREATEROLE`, or a pre-existing `nas_cleanup_master_writer` role granted to
+  it `WITH SET TRUE`. Membership alone is not enough: a role granted
+  `WITH SET FALSE` cannot be assumed, and the migration fails instead of
+  falling back to the migrator as the recorder owner;
+- ability to hand the new role `CREATE` on the schema for the ownership
+  transfer; the migration grants it and revokes it in the same transaction.
+
+No superuser is required, and the API's runtime role needs none of this: it only
+inserts/updates `nas_cleanup_master`, and the `SECURITY DEFINER` recorder
+appends history on its behalf. Startup depends on nothing in this migration
+beyond the applied schema.
+
+If the migration fails on the recorder role, grant the dedicated role and
+re-run the deploy:
+
+```sql
+CREATE ROLE nas_cleanup_master_writer NOLOGIN;   -- once per cluster
+GRANT nas_cleanup_master_writer TO <migrator> WITH SET TRUE;
+```
+
 
 ### Belt-and-braces safeguards (safety council, 2026-11)
 

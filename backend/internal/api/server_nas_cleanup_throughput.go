@@ -116,9 +116,15 @@ type cleanupObserveEnv struct {
 	// can issue a permit meanwhile.
 	budgetHeld bool
 	issued     int64
-	// master is the deletion master switch, read FOR SHARE in the top-level
-	// transaction (never a savepoint) before any permit decision.
+	// master is the deletion master switch, read FOR SHARE in the transaction
+	// (never a savepoint that has already rolled back) and only on an
+	// execution path that can hand out deletion authority, after every fence
+	// and row lock. root is the top-level transaction that owns the budget
+	// lock and the master row lock; a batched observation sets it so a
+	// per-observation savepoint rollback can never release either lock.
 	master     bool
+	masterRead bool
+	root       pgx.Tx
 	prefetched map[int64]cleanupPrefetchedRecovery
 	// Only exact aborted stages verified by R2 in this observation request.
 	abortedStitchAbsences map[cleanupAbortedStitchTarget]bool
@@ -283,6 +289,44 @@ func (e *cleanupObserveEnv) budgetAllows(ctx context.Context, tx pgx.Tx, size in
 	}
 	e.issued += size
 	return true, nil
+}
+
+// holdBudget takes the running-deletion-budget advisory lock and the issued
+// total it guards, at most once per transaction. It is a blocking fence, so it
+// is always taken before the master switch is read.
+func (e *cleanupObserveEnv) holdBudget(ctx context.Context, tx pgx.Tx) {
+	if e == nil || e.budgetHeld {
+		return
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupBudgetLock); err != nil {
+		return
+	}
+	if err := tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&e.issued); err != nil {
+		return
+	}
+	e.budgetHeld = true
+}
+
+// deletionMaster reports whether deletion authority may be minted, reading the
+// master switch FOR SHARE only on an execution path and only after every
+// blocking fence and row lock (including the budget lock above). It reads at
+// most once per transaction and keeps the row lock until commit, so an
+// emergency OFF waits only for decisions already minting authority. A dry-run
+// path never reaches here and never locks the control. The read always runs on
+// the top-level transaction: a savepoint rollback would release its lock.
+func (e *cleanupObserveEnv) deletionMaster(ctx context.Context, tx pgx.Tx) bool {
+	if e == nil {
+		return cleanupMasterOn(ctx, tx)
+	}
+	if !e.masterRead {
+		owner := e.root
+		if owner == nil {
+			owner = tx
+		}
+		e.holdBudget(ctx, owner)
+		e.master, e.masterRead = cleanupMasterOn(ctx, owner), true
+	}
+	return e.master
 }
 
 type cleanupExecutionRanking struct {
@@ -942,8 +986,13 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		util.WriteJSON(w, 503, map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true})
 		return
 	}
-	env.master = cleanupMasterOn(ctx, tx)
-	if anyEnabled && env.master {
+	// A dry run (no enabled item in the batch) never touches the master switch,
+	// so it can never delay an emergency OFF. On the execution path the
+	// non-blocking peek is advisory; the budget advisory lock is a blocking
+	// fence, so it is taken first and the authoritative FOR SHARE read of the
+	// master is deferred to the first permit decision
+	// (cleanupObserveEnv.deletionMaster), after every row lock.
+	if anyEnabled && cleanupMasterMaybeOn(ctx, tx) {
 		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupBudgetLock); err == nil {
 			err = tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&env.issued)
 		}
@@ -953,6 +1002,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		}
 		env.budgetHeld = true
 	}
+	env.root = tx
 	for n, o := range req.Observations {
 		if !valid[n] {
 			continue

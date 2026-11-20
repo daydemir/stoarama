@@ -965,3 +965,29 @@ func TestNASCleanupControllerCredentialIsDistinct(t *testing.T) {
 		}
 	}
 }
+
+// The bootstrap-token digest allowlist must also reject the cleanup controller
+// credential: a hashed runner credential that aliases the only route to
+// deletion authority would let the runner reach the master switch.
+func TestJoinedWorkerBootstrapHashesRejectCleanupControllerCredential(t *testing.T) {
+	const bootstrap = "joined-bootstrap-credential-32-bytes"
+	const signing = "joined-signing-credential-32-bytes-ok"
+	const controller = "nas-cleanup-controller-credential-32-byte"
+	digest := sha256.Sum256([]byte(controller))
+	cfg := Config{
+		JoinedWorkerBootstrapToken:  bootstrap,
+		JoinedWorkerBootstrapHashes: hex.EncodeToString(digest[:]),
+		JoinedWorkerSigningKey:      signing,
+		NASCleanupControllerToken:   controller,
+	}
+	if err := cfg.ValidateJoined(); err == nil {
+		t.Fatal("controller credential accepted as a hashed bootstrap token")
+	}
+	// The same digest for an unrelated credential stays valid: the rule is
+	// aliasing, not a blanket ban on the allowlist.
+	other := sha256.Sum256([]byte("some-unrelated-runner-credential-32b"))
+	cfg.JoinedWorkerBootstrapHashes = hex.EncodeToString(other[:])
+	if err := cfg.ValidateJoined(); err != nil {
+		t.Fatalf("unrelated hashed bootstrap token rejected: %v", err)
+	}
+}

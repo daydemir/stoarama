@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/user"
 	"strings"
@@ -21,7 +23,7 @@ const (
 	nasCleanupMasterOff    nasCleanupMasterAction = "off"
 )
 
-const nasCleanupMasterUsage = `usage: nas-cleanup master status | master on|off --reason "..."`
+const nasCleanupMasterUsage = `usage: nas-cleanup master status | master on|off --reason "..." [--backend-api-url URL]`
 
 const nasCleanupMasterPath = "/api/v1/service/nas-cleanup/master"
 
@@ -40,31 +42,57 @@ func nasCleanupMasterBody(action nasCleanupMasterAction, reason, claimedBy strin
 }
 
 // nasCleanupMasterControllerToken is the separate credential that may flip
-// deletion authority. The runner's service token is deliberately not a
-// fallback: an absent controller token fails closed.
+// deletion authority. It is read only from the environment: a token on the
+// command line would land in shell history and process listings. The runner's
+// service token is deliberately not a fallback: an absent controller token
+// fails closed.
 func nasCleanupMasterControllerToken(cfg config.Config) string {
 	return strings.TrimSpace(cfg.NASCleanupControllerToken)
 }
 
+// nasCleanupMasterBaseURL accepts only an absolute HTTPS origin without
+// credentials, query or fragment: the controller credential must never travel
+// over plaintext or to a redirectable path.
+func nasCleanupMasterBaseURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", errors.New("master changes require an explicit --backend-api-url or BACKEND_API_URL")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" ||
+		(u.Path != "" && u.Path != "/") {
+		return "", errors.New("backend URL must be an HTTPS origin without credentials, path, query or fragment")
+	}
+	return raw, nil
+}
+
 // nasCleanupMasterDispatch is the testable command body: it parses args and
-// performs the exact GET/POST against nasCleanupMasterPath.
+// performs the exact GET/POST against nasCleanupMasterPath. Any flag parse
+// error (including --help) returns before a credential is resolved or a
+// request is sent.
 func nasCleanupMasterDispatch(ctx context.Context, cfg config.Config, args []string, do func(method, base, token, path string, body any) map[string]any) error {
 	if len(args) < 1 {
 		return errors.New(nasCleanupMasterUsage)
 	}
 	action := nasCleanupMasterAction(args[0])
+	if action != nasCleanupMasterStatus && action != nasCleanupMasterOn && action != nasCleanupMasterOff {
+		return errors.New(nasCleanupMasterUsage)
+	}
 	fs := flag.NewFlagSet("nas-cleanup master "+args[0], flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	reason := fs.String("reason", "", "audited reason; on/off only")
-	base := fs.String("backend-api-url", defaultBackendAPIURL(), "backend URL")
-	token := fs.String("api-token", "", "controller API token (default NAS_CLEANUP_CONTROLLER_TOKEN)")
-	_ = fs.Parse(args[1:])
+	base := fs.String("backend-api-url", defaultBackendAPIURL(), "backend HTTPS origin; defaults to BACKEND_API_URL")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
 	if fs.NArg() != 0 {
 		return errors.New(nasCleanupMasterUsage)
 	}
-	credential := strings.TrimSpace(*token)
-	if credential == "" {
-		credential = nasCleanupMasterControllerToken(cfg)
+	endpoint, err := nasCleanupMasterBaseURL(*base)
+	if err != nil {
+		return err
 	}
+	credential := nasCleanupMasterControllerToken(cfg)
 	if credential == "" {
 		return errors.New("master changes require the controller credential (NAS_CLEANUP_CONTROLLER_TOKEN)")
 	}
@@ -72,7 +100,7 @@ func nasCleanupMasterDispatch(ctx context.Context, cfg config.Config, args []str
 		if *reason != "" {
 			return errors.New(nasCleanupMasterUsage)
 		}
-		printJSON(do(http.MethodGet, *base, credential, nasCleanupMasterPath, nil))
+		printJSON(do(http.MethodGet, endpoint, credential, nasCleanupMasterPath, nil))
 		return nil
 	}
 	u, err := user.Current()
@@ -87,7 +115,7 @@ func nasCleanupMasterDispatch(ctx context.Context, cfg config.Config, args []str
 	if err != nil {
 		return err
 	}
-	printJSON(do(http.MethodPost, *base, credential, nasCleanupMasterPath, body))
+	printJSON(do(http.MethodPost, endpoint, credential, nasCleanupMasterPath, body))
 	return nil
 }
 

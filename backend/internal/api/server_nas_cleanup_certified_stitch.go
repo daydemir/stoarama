@@ -83,8 +83,14 @@ const cleanupAbortedStitchTargetTables = ` FROM nas_stitch_r2_stage_objects o
  LEFT JOIN nas_stitch_r2_aborted_absences a ON a.object_id=o.id`
 
 func (s *Server) cleanupPrefetchAbortedStitchAbsences(ctx context.Context, cid int64, observations []cleanupBatchObservation, env *cleanupObserveEnv) {
-	if s.r2 == nil || !cleanupMasterOn(ctx, s.pool) || cid != 13 || env.dryRunOnly ||
+	// Prefetch is outside every transaction and holds no locks, so it uses the
+	// plain advisory read: it must never take the master row lock ahead of an
+	// emergency OFF.
+	if s.r2 == nil || cid != 13 || env.dryRunOnly ||
 		env.session.version != nasCleanupCertifiedStitchVersion || len(observations) == 0 {
+		return
+	}
+	if on, err := cleanupMasterEnabled(ctx, s.pool); err != nil || !on {
 		return
 	}
 	requested, err := json.Marshal(observations)

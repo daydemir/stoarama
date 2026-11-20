@@ -520,7 +520,7 @@ func (c Config) ValidateJoined() error {
 				return fmt.Errorf("joined worker credentials must differ from service, database, and storage credentials")
 			}
 		}
-		hashProtected := append(append([]string(nil), protected...), bootstrap, signing, operator, strings.TrimSpace(c.JoinedRecordingWorkerToken))
+		hashProtected := append(append([]string(nil), protected...), bootstrap, signing, operator, strings.TrimSpace(c.JoinedRecordingWorkerToken), strings.TrimSpace(c.NASCleanupControllerToken))
 		for _, digest := range bootstrapSHA256s {
 			for _, credential := range hashProtected {
 				credential = strings.TrimSpace(credential)

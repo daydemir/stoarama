@@ -414,17 +414,8 @@ func runR2JoinedWriterCancel(ctx context.Context, cfg config.Config, args []stri
 	if _, err = applyTx.Exec(ctx, `SET LOCAL statement_timeout='30s';SET LOCAL lock_timeout='5s';SET LOCAL work_mem='16MB';SET LOCAL timezone='UTC'`); err != nil {
 		log.Fatal("joined writer apply configuration failed")
 	}
-	var idle bool
-	if err = applyTx.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM nas_cleanup_plans WHERE mode='enabled') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE state IN ('leased','delete_issued'))`).Scan(&idle); err != nil || !idle {
-		log.Fatal("joined writer retirement requires controller global-idle window")
-	}
-	// The authoritative master read is FOR SHARE inside this transaction, so it
-	// holds until commit: a flip to ON waits for this retirement, and a flip
-	// that committed first is seen here. The earlier requireWindow read is only
-	// preview evidence.
-	var masterHeld bool
-	if err = applyTx.QueryRow(ctx, `SELECT enabled FROM nas_cleanup_master FOR SHARE`).Scan(&masterHeld); err != nil || masterHeld {
-		log.Fatal("joined writer retirement requires the cleanup master OFF (locked for this transaction)")
+	if err = r2JoinedApplyIdleFence(ctx, applyTx); err != nil {
+		log.Fatal(err)
 	}
 	body, err := json.Marshal(evidence)
 	if err != nil {
@@ -448,4 +439,23 @@ func runR2JoinedWriterCancel(ctx context.Context, cfg config.Config, args []stri
 		log.Fatal("joined writer commit recorded in database; local receipt failed, inspect run ", run)
 	}
 	log.Printf("joined writer run %s committed %d audited terminal transitions; other writer gates unchanged", run, changed)
+}
+
+// r2JoinedApplyIdleFence is the apply transaction's authority gate. The idle
+// check runs first (it only reads cleanup state), and the master is read FOR
+// SHARE inside this same transaction, on this same connection, so the lock
+// holds until commit: an emergency OFF waits for this retirement, and a flip
+// that committed first is seen here. Reading the master through the pool
+// instead would take the lock on another connection and hold nothing, so the
+// write could proceed with the master ON.
+func r2JoinedApplyIdleFence(ctx context.Context, tx pgx.Tx) error {
+	var idle bool
+	if err := tx.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM nas_cleanup_plans WHERE mode='enabled') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE state IN ('leased','delete_issued'))`).Scan(&idle); err != nil || !idle {
+		return errors.New("joined writer retirement requires controller global-idle window")
+	}
+	var masterHeld bool
+	if err := tx.QueryRow(ctx, `SELECT enabled FROM nas_cleanup_master FOR SHARE`).Scan(&masterHeld); err != nil || masterHeld {
+		return errors.New("joined writer retirement requires the cleanup master OFF (locked for this transaction)")
+	}
+	return nil
 }

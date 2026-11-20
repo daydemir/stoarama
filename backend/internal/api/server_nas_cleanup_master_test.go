@@ -172,26 +172,26 @@ func TestNASCleanupMasterRejectsServiceTokenAndFailsClosed(t *testing.T) {
 	s.cfg.ServiceToken = service
 	s.cfg.APIToken = service
 	s.cfg.NASCleanupControllerToken = controller
-	mux := s.requireCleanupControllerAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(204)
-	}))
-	call := func(token string) int {
-		req := httptest.NewRequest("POST", "/api/v1/service/nas-cleanup/master", nil)
+	// Drive the mounted router, not the handler: the guard is the wiring under
+	// test, so a route mounted back on the service credential must fail here.
+	router := s.router()
+	call := func(path, token string) int {
+		req := httptest.NewRequest("POST", path, strings.NewReader(`{"enabled":true,"claimed_by":"ops@jelly","reason":"router probe"}`))
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
 		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, req)
+		router.ServeHTTP(w, req)
 		return w.Code
 	}
-	if code := call(service); code != 401 {
-		t.Fatalf("runner service token flipped the master: %d", code)
+	if code := call("/api/v1/service/nas-cleanup/master", service); code != 401 {
+		t.Fatalf("runner service token flipped the master through the router: %d", code)
 	}
-	if code := call(controller); code != 204 {
-		t.Fatalf("controller token rejected: %d", code)
-	}
-	if code := call(""); code != 401 {
+	if code := call("/api/v1/service/nas-cleanup/master", ""); code != 401 {
 		t.Fatalf("anonymous master call: %d", code)
+	}
+	if code := call("/api/v1/service/nas-cleanup/master", controller); code != 200 {
+		t.Fatalf("controller token rejected by the router: %d", code)
 	}
 	for name, mutate := range map[string]func(*Server){
 		"unconfigured":  func(b *Server) { b.cfg.NASCleanupControllerToken = "" },
@@ -209,15 +209,6 @@ func TestNASCleanupMasterRejectsServiceTokenAndFailsClosed(t *testing.T) {
 		}
 	}
 	// The authenticated principal, not the caller's claim, is the actor.
-	guarded := s.requireCleanupControllerAuth(http.HandlerFunc(s.handleAdminNASCleanupMasterSet))
-	b, _ := json.Marshal(map[string]any{"enabled": true, "claimed_by": "ops@jelly", "reason": "controller flip"})
-	req := httptest.NewRequest("POST", "/api/v1/service/nas-cleanup/master", bytes.NewReader(b))
-	req.Header.Set("Authorization", "Bearer "+controller)
-	w := httptest.NewRecorder()
-	guarded.ServeHTTP(w, req)
-	if w.Code != 200 {
-		t.Fatalf("controller flip: %d %s", w.Code, w.Body.String())
-	}
 	var actor, claimed string
 	if err := pool.QueryRow(context.Background(), `SELECT actor,claimed_by FROM nas_cleanup_master`).Scan(&actor, &claimed); err != nil || actor != nasCleanupControllerActor || claimed != "ops@jelly" {
 		t.Fatalf("actor %q claimed %q %v", actor, claimed, err)
