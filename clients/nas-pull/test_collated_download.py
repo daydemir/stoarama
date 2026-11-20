@@ -91,15 +91,29 @@ class CollatedDownloadTests(unittest.TestCase):
         start = int(request.get_header("Range").split("=")[1].rstrip("-"))
         return Response(self.body, start, len(self.body))
 
-    def drain(self, *, mounted=True, **kwargs):
+    def drain(self, *, mounted=True, free=None, **kwargs):
         self.runtime.collated_after_id = 0
         self.runtime.collated_next_poll = 0.0
+        storage = {"available": True, "free_bytes": 10**13 if free is None else free}
         with mock.patch.object(pull, "request_json", side_effect=self.fake_request_json(**kwargs)), \
                 mock.patch.object(pull, "open_joined_url", side_effect=self.fake_open), \
-                mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**13, "free_bytes": 10**13}), \
+                mock.patch.object(pull, "storage_status", return_value=dict(storage, total_bytes=10**13)), \
                 mock.patch.object(pull.os.path, "ismount", return_value=mounted), \
-                mock.patch.object(pull.CollatedHandoffMount, "storage", return_value={"available": True, "free_bytes": 10**13}):
+                mock.patch.object(pull.CollatedHandoffMount, "storage", return_value=storage):
             return pull.drain_collated(self.cfg, self.runtime, threading.Event())
+
+    def handoff_floor(self):
+        return max(pull.R2_COPY_FLOOR, self.cfg.min_free_bytes) + pull.R2_COPY_SPACE_GUARD
+
+    def handoff_threshold(self):
+        return self.cfg.min_free_bytes + pull.JOINED_RAW_HEADROOM_BYTES
+
+    def assert_ack_matches_final(self):
+        stat = self.final.stat()
+        self.assertEqual(len(self.acks), 1)
+        self.assertEqual(self.acks[0]["handoff_readback"],
+                         [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino, stat.st_dev])
+        self.assertEqual(self.acks[0]["handoff_readback_round"], 0)
 
     def test_cursor_advances_empty_pages_and_revisits_after_exhaustion(self):
         policy = {"enabled": True, "download_bytes_per_sec": 1 << 20, "download_parallel": 1}
@@ -325,6 +339,95 @@ class CollatedDownloadTests(unittest.TestCase):
             with self.assertRaisesRegex(pull.CollatedDownloadStopped, "file is writable during path check"):
                 pull.check_collated_handoff_paths(self.cfg, threading.Event())
         self.assertEqual([call.args[1] for call in request.call_args_list], ["GET"])
+
+    def test_handoff_publishes_a_synced_full_partial_with_zero_payload_reservation(self):
+        self.enable_handoff()
+        size = len(self.body)
+        self.part.parent.mkdir(parents=True)
+        self.part.write_bytes(self.body)
+        reserved = []
+        original = pull.Runtime.reserve_joined_storage
+
+        def record(runtime, cfg, storage, expected_bytes, **kwargs):
+            reserved.append(expected_bytes)
+            return original(runtime, cfg, storage, expected_bytes, **kwargs)
+
+        with mock.patch.object(pull.Runtime, "reserve_joined_storage", record):
+            self.assertTrue(self.drain(free=self.handoff_floor() + size - 1))
+        self.assertEqual(reserved, [0])
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.final.read_bytes(), self.body)
+        self.assertFalse(self.part.exists())
+        self.assertEqual(self.runtime.capacity_reserved_bytes, 0)
+        self.assert_ack_matches_final()
+
+    def test_handoff_corrupt_full_partial_clears_and_defers_to_next_reservation(self):
+        self.enable_handoff()
+        size = len(self.body)
+        self.part.parent.mkdir(parents=True)
+        self.part.write_bytes(b"c" * size)
+        self.assertFalse(self.drain(free=self.handoff_floor() + size - 1))
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.acks, [])
+        self.assertFalse(self.final.exists())
+        self.assertFalse(self.part.exists())
+        self.assertIn("full reservation follows", self.errors[0]["error"])
+        self.assertEqual(self.runtime.capacity_reserved_bytes, 0)
+
+        self.requests.clear()
+        self.errors.clear()
+        self.assertTrue(self.drain(free=10**13))
+        self.assertEqual(self.requests[0]["Range"], "bytes=0-")
+        self.assertEqual(self.final.read_bytes(), self.body)
+        self.assert_ack_matches_final()
+
+    def test_handoff_zero_reservation_never_fetches_when_the_candidate_vanishes(self):
+        self.enable_handoff()
+        size = len(self.body)
+        self.part.parent.mkdir(parents=True)
+        self.part.write_bytes(self.body)
+        original = pull.download_collated_item
+
+        def vanish(cfg, item, limiter, stop_event, **kwargs):
+            self.assertEqual(kwargs["reserved"], 0)
+            self.part.unlink()
+            return original(cfg, item, limiter, stop_event, **kwargs)
+
+        with mock.patch.object(pull, "download_collated_item", side_effect=vanish):
+            self.assertFalse(self.drain(free=self.handoff_floor() + size - 1))
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.acks, [])
+        self.assertFalse(self.final.exists())
+        self.assertEqual(self.runtime.capacity_reserved_bytes, 0)
+        self.assertIn("after admission", self.errors[0]["error"])
+
+    def test_handoff_never_fetches_more_than_the_reserved_partial_remainder(self):
+        self.enable_handoff()
+        size = len(self.body)
+        self.part.parent.mkdir(parents=True)
+        self.part.write_bytes(self.body[:size - 1000])
+        original = pull.download_collated_item
+
+        def grow(cfg, item, limiter, stop_event, **kwargs):
+            self.assertEqual(kwargs["reserved"], 1000)
+            self.part.write_bytes(self.body)
+            return original(cfg, item, limiter, stop_event, **kwargs)
+
+        with mock.patch.object(pull, "download_collated_item", side_effect=grow):
+            self.assertFalse(self.drain(free=10**13))
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.acks, [])
+        self.assertFalse(self.final.exists())
+        self.assertEqual(self.part.read_bytes(), self.body)
+        self.assertIn("not reserved", self.errors[0]["error"])
+        self.assertEqual(self.runtime.capacity_reserved_bytes, 0)
+
+        # The grown partial is now the exact approved candidate and publishes
+        # under the next (zero-payload) reservation without a GET.
+        self.assertTrue(self.drain(free=self.handoff_floor() + size - 1))
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.final.read_bytes(), self.body)
+        self.assert_ack_matches_final()
 
     def test_handoff_feed_drains_before_starting_other_delivery(self):
         page = {"policy": {"enabled": True, "download_bytes_per_sec": 1 << 30, "download_parallel": 2,

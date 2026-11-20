@@ -24166,12 +24166,62 @@ def append_collated_bytes(prepared, descriptor, digest, start, item, limiter, st
             raise RuntimeError("collated body length mismatch")
 
 
+def publish_collated_candidate(item, directory_fd, name, part_name, stop_event, *, mount=None):
+    """Publish a fully synced private handoff partial without fetching payload bytes.
+
+    The partial may already hold every approved byte when a crash lands between
+    its sync and the final link. It is published only when its exact size and
+    SHA-256 match the approved output; anything else is left for a reservation
+    that accounts for the bytes it would really write.
+    """
+    candidate = collated_entry_stat(directory_fd, part_name)
+    if candidate is None or candidate.st_size != item["size_bytes"] or candidate.st_nlink != 1:
+        raise ExistingFileMismatch("collated handoff candidate changed after admission")
+    size, digest, info = hash_collated_entry(directory_fd, part_name, stop_event, durable=True, mount=mount)
+    if size != item["size_bytes"]:
+        raise ExistingFileMismatch("collated handoff candidate changed during readback")
+    if info.st_nlink != 1 or not stat_module.S_ISREG(info.st_mode):
+        raise ExistingFileMismatch("collated handoff candidate is not a private regular file")
+    if digest != item["sha256"]:
+        current = collated_entry_stat(directory_fd, part_name)
+        if current is None or current.st_nlink != 1 or certification_identity(current) != certification_identity(info):
+            raise ExistingFileMismatch("collated handoff candidate changed after readback")
+        os.unlink(part_name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        raise ExistingFileMismatch("collated handoff candidate differs from the approved output; a full reservation follows")
+    if stop_event.is_set():
+        raise CollatedDownloadStopped("collated handoff stopped before publishing its recovered partial")
+    link_collated_final(item, directory_fd, name, part_name, stop_event, mount=mount, identity=certification_identity(info))
+
+
+def link_collated_final(item, directory_fd, name, part_name, stop_event, *, mount=None, identity=None):
+    """Link a verified private partial to its final name without overwriting anything."""
+    if mount is not None:
+        mount.check()
+    if identity is not None:
+        # The candidate must still be the same private inode at the moment of
+        # publication; a same-size replacement would publish unverified bytes.
+        current = collated_entry_stat(directory_fd, part_name)
+        if (current is None or current.st_nlink != 1 or not stat_module.S_ISREG(current.st_mode)
+                or certification_identity(current) != identity):
+            raise ExistingFileMismatch("collated partial changed before publication")
+    try:
+        os.link(part_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+    except FileExistsError:
+        size, digest, _ = hash_collated_entry(directory_fd, name, stop_event, mount=mount)
+        if size != item["size_bytes"] or digest != item["sha256"]:
+            raise ExistingFileMismatch("collated final appeared with different bytes: %s" % item["nas_relative_path"])
+    os.unlink(part_name, dir_fd=directory_fd)
+    os.fsync(directory_fd)
+
+
 @NAS_MEDIA_FENCE.background_delivery
-def download_collated_item(cfg, item, limiter, stop_event, *, mount=None):
+def download_collated_item(cfg, item, limiter, stop_event, *, mount=None, reserved=None):
     """Place one output at its contract path. Returns True when bytes were fetched."""
     relative = item["nas_relative_path"]
     name = relative.split("/")[-1]
     part_name = ".%s.collated-%d.part" % (name, item["output_id"])
+    reserved_payload = None if reserved is None else max(0, int(reserved))
     directory_fd = open_collated_dir(cfg, relative, mount=mount)
     try:
         if collated_entry_stat(directory_fd, name) is not None:
@@ -24182,6 +24232,11 @@ def download_collated_item(cfg, item, limiter, stop_event, *, mount=None):
             if part is not None:
                 os.unlink(part_name, dir_fd=directory_fd)
                 os.fsync(directory_fd)
+            return False
+        if reserved_payload == 0:
+            # Only a handoff candidate that already holds every approved byte
+            # proceeds here; fetching would spend bytes never reserved.
+            publish_collated_candidate(item, directory_fd, name, part_name, stop_event, mount=mount)
             return False
         prepared = prepare_collated_download(cfg, item)
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -24194,8 +24249,13 @@ def download_collated_item(cfg, item, limiter, stop_event, *, mount=None):
                 raise ExistingFileMismatch("collated partial is not a private regular file")
             start = opened.st_size
             if start >= item["size_bytes"]:
-                os.ftruncate(descriptor, 0)
                 start = 0
+            # Bind the bytes to write to the count reserved at admission so a
+            # partial that shrank or vanished never fetches unreserved bytes.
+            if reserved_payload is not None and reserved_payload < item["size_bytes"] - start:
+                raise ExistingFileMismatch("collated partial changed after admission; its payload was not reserved")
+            if start == 0 and opened.st_size:
+                os.ftruncate(descriptor, 0)
             digest = hashlib.sha256()
             os.lseek(descriptor, 0, os.SEEK_SET)
             remaining = start
@@ -24216,23 +24276,19 @@ def download_collated_item(cfg, item, limiter, stop_event, *, mount=None):
                 raise RuntimeError("collated checksum mismatch; partial restarted")
         finally:
             os.close(descriptor)
-        if mount is not None:
-            mount.check()
-        try:
-            os.link(part_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
-        except FileExistsError:
-            size, digest, _ = hash_collated_entry(directory_fd, name, stop_event, mount=mount)
-            if size != item["size_bytes"] or digest != item["sha256"]:
-                raise ExistingFileMismatch("collated final appeared with different bytes: %s" % relative)
-        os.unlink(part_name, dir_fd=directory_fd)
-        os.fsync(directory_fd)
+        link_collated_final(item, directory_fd, name, part_name, stop_event, mount=mount)
         return True
     finally:
         os.close(directory_fd)
 
 
 def collated_bytes_needed(cfg, item, *, mount=None):
-    """Bytes still to be written for item: 0 when its final exists, the rest of a partial."""
+    """Bytes still to be written for item: 0 when its final exists, the rest of a partial.
+
+    Under a handoff mount an exact-size private partial may already hold every
+    approved byte: a crash can land after its sync and before the final link, so
+    it reserves no payload bytes and is verified rather than fetched.
+    """
     relative = item["nas_relative_path"]
     name = relative.split("/")[-1]
     try:
@@ -24243,7 +24299,11 @@ def collated_bytes_needed(cfg, item, *, mount=None):
         if collated_entry_stat(directory_fd, name) is not None:
             return 0
         part = collated_entry_stat(directory_fd, ".%s.collated-%d.part" % (name, item["output_id"]))
-        if part is None or part.st_size >= item["size_bytes"]:
+        if part is None:
+            return item["size_bytes"]
+        if part.st_size == item["size_bytes"] and mount is not None and part.st_nlink == 1:
+            return 0
+        if part.st_size >= item["size_bytes"]:
             return item["size_bytes"]
         return item["size_bytes"] - part.st_size
     finally:
@@ -24591,7 +24651,10 @@ def drain_collated(cfg, runtime, stop_event):
             if not runtime.reserve_joined_storage(cfg, storage, needed, min_floor=floor):
                 raise CollatedDownloadStopped("collated delivery yielded to the NAS free-space reserve")
             try:
-                fetched = download_collated_item(cfg, item, limiter, stop_event, mount=mount)
+                fetched = download_collated_item(
+                    cfg, item, limiter, stop_event, mount=mount,
+                    reserved=needed if mount is not None else None,
+                )
                 ack_collated_item(cfg, item, stop_event, mount=mount)
             finally:
                 runtime.release_storage_reservation(needed)
