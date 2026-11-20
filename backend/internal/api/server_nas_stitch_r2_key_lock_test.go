@@ -190,6 +190,147 @@ type durhamExtraHours struct {
 	importSet func(context.Context) error
 }
 
+// copyClaimFree reports whether another session can take the copy queue right
+// now: the admission lock 7343226011192, whose shared holders are every renewal
+// running together and every completion holding its copy row.
+func copyClaimFree(t *testing.T, pool *pgxpool.Pool) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	var free bool
+	if err = tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1)`, nasR2CopyLock).Scan(&free); err != nil {
+		return false
+	}
+	return free
+}
+
+// copyClaimFreeWithin reports whether another session could take the copy queue
+// at some point inside limit.
+func copyClaimFreeWithin(t *testing.T, pool *pgxpool.Pool, limit time.Duration) bool {
+	t.Helper()
+	for deadline := time.Now().Add(limit); time.Now().Before(deadline); time.Sleep(2 * time.Millisecond) {
+		if copyClaimFree(t, pool) {
+			return true
+		}
+	}
+	return copyClaimFree(t, pool)
+}
+
+// A completion request owns its copy row from nasR2CopyActive on, and holds it
+// across the table preflight and the whole receipt. It must never wait on a
+// table or row lock while it holds that row: the bound taken with it turns any
+// such wait into SQLSTATE 55P03, which the receipt reports as busy, so cleanup
+// always gets the queue and the client retries. Each case holds the conflicting
+// lock from another session and proves all three: another session can take the
+// copy queue within one second, the request reports busy rather than succeeding
+// or hanging, and the same statement with no bound waits under the row instead.
+//
+// Checkpoint and range keep their own contract, so this covers only the
+// completion/receipt entry, which is the one that takes allowStitchReplay.
+func testStitchReceiptLockBound(t *testing.T, pool *pgxpool.Pool, post func() int, copyID int64) {
+	t.Helper()
+	// Bounded: a starved pool or a stuck lock fails here instead of hanging CI.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	for _, holder := range []struct {
+		name, sql string
+		args      []any
+		// request is the statement the receipt itself runs at this point.
+		request string
+	}{
+		// The receipt preflight and the certificate trigger both take ROW SHARE
+		// on the inventory table, which an EXCLUSIVE holder refuses. SKIP LOCKED
+		// does not help: a table-level conflict is still a wait.
+		{"nas_inventory_files_table", `LOCK TABLE nas_inventory_files IN EXCLUSIVE MODE`, nil,
+			`LOCK TABLE nas_inventory_files IN ROW SHARE MODE`},
+		// The certificate trigger reads the catalog epoch FOR SHARE, so its
+		// table lock is refused by the same mode.
+		{"r2_inverse_ke_epoch_table", `LOCK TABLE r2_inverse_ke_epoch IN EXCLUSIVE MODE`, nil,
+			`LOCK TABLE r2_inverse_ke_epoch IN ROW SHARE MODE`},
+		// The request's own copy row, held by another session first.
+		{"copy_row", `SELECT id FROM nas_r2_copy_items WHERE id=$1 FOR UPDATE`, []any{copyID},
+			`SELECT id FROM nas_r2_copy_items WHERE id=$1 FOR UPDATE`},
+	} {
+		holder := holder
+		t.Run(holder.name, func(t *testing.T) {
+			t.Run("bounded", func(t *testing.T) {
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback(ctx)
+				if _, err = tx.Exec(ctx, holder.sql, holder.args...); err != nil {
+					t.Fatal(err)
+				}
+				code := make(chan int, 1)
+				began := time.Now()
+				go func() { code <- post() }()
+				if got := within(t, code, "receipt behind its "+holder.name); got != http.StatusConflict || time.Since(began) > time.Second {
+					t.Fatalf("receipt waited on or crossed its busy %s: %d after %v", holder.name, got, time.Since(began))
+				}
+				if !copyClaimFreeWithin(t, pool, time.Second) {
+					t.Fatalf("receipt kept its claim within 1s behind its busy %s", holder.name)
+				}
+				var verified bool
+				if err = pool.QueryRow(ctx, `SELECT state='verified' FROM nas_r2_copy_items WHERE id=$1`, copyID).Scan(&verified); err != nil || verified {
+					t.Fatalf("refused receipt behind its busy %s left durable state: verified %v %v", holder.name, verified, err)
+				}
+			})
+			// Removing the bound is what makes the difference. The failure is
+			// reproduced with the request's own statement in a transaction that
+			// holds the same copy row, so the real receipt's durable state is
+			// untouched: with no bound that statement waits under the row.
+			t.Run("without_the_bound", func(t *testing.T) {
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback(ctx)
+				if _, err = tx.Exec(ctx, holder.sql, holder.args...); err != nil {
+					t.Fatal(err)
+				}
+				receiptCtx, stop := context.WithCancel(ctx)
+				defer stop()
+				waited := make(chan error, 1)
+				go func() {
+					receipt, err := pool.Begin(receiptCtx)
+					if err != nil {
+						waited <- err
+						return
+					}
+					defer receipt.Rollback(context.Background())
+					// The whole claim the completion entry takes, in its order:
+					// the shared copy-admission lock, then its own copy row. Then
+					// its own statement with no lock bound.
+					if _, err = receipt.Exec(receiptCtx, `SELECT pg_advisory_xact_lock_shared($1)`, nasR2CopyLock); err != nil {
+						waited <- err
+						return
+					}
+					if _, err = receipt.Exec(receiptCtx, `SELECT id FROM nas_r2_copy_items WHERE id=$1 FOR UPDATE`, copyID); err != nil {
+						waited <- err
+						return
+					}
+					_, err = receipt.Exec(receiptCtx, holder.request, holder.args...)
+					waited <- err
+				}()
+				blockedBy(t, pool, backendPID(t, tx), "the receipt's own "+holder.name+" statement with no lock bound")
+				if copyClaimFreeWithin(t, pool, 500*time.Millisecond) {
+					t.Fatalf("without the lock bound another session still took the copy queue behind a busy %s", holder.name)
+				}
+				stop()
+				if err := within(t, waited, "the unbound "+holder.name+" statement"); err == nil {
+					t.Fatalf("without the lock bound the receipt's own %s statement never waited", holder.name)
+				}
+			})
+		})
+	}
+}
+
 // addDurhamHours stores two further whole hours whose keys sort against their
 // plan order, and returns their later planned import.
 func addDurhamHours(t *testing.T, pool *pgxpool.Pool, hour time.Time, endpoint, sha string) durhamExtraHours {

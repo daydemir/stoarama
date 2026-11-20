@@ -251,9 +251,25 @@ type inverseBusy []inverseWait
 
 func (inverseBusy) Error() string { return "R2 retirement admission lock busy" }
 
+// inverseContentionBackoff is the pause between attempts when a lock bound
+// refused a statement without naming the lock. The attempt itself names nothing
+// in that case, so admission frees the wide locks and waits outside them.
+const inverseContentionBackoff = 20 * time.Millisecond
+
 // await waits for each busy lock in turn; begin opens every wait transaction
-// exactly as the caller's admission does.
+// exactly as the caller's admission does. A busy lock that names no wait backs
+// off outside every lock the attempt held instead.
 func (b inverseBusy) await(ctx context.Context, begin func(context.Context) (pgx.Tx, error)) error {
+	if len(b) == 0 {
+		timer := time.NewTimer(inverseContentionBackoff)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	for _, w := range b {
 		tx, err := begin(ctx)
 		if err != nil {
@@ -340,6 +356,9 @@ func admitWire[T any](ctx context.Context, pool *pgxpool.Pool, authorize func(co
 			return zero, err
 		}
 		v, err := authorize(ctx, tx)
+		// A lock the attempt lost after the wide cleanup locks is contention:
+		// roll the wire transaction back so admission waits outside them.
+		err = inverseContention(err)
 		if errors.As(err, new(inverseBusy)) {
 			tx.Rollback(context.Background())
 			tx = nil
@@ -397,11 +416,57 @@ func lockInverseCopyKey(ctx context.Context, tx pgx.Tx, bucket, key string) erro
 
 // inverseRowBusy turns a NOWAIT miss into a wait for that row.
 func inverseRowBusy(err error, wait inverseWait) error {
-	var pg *pgconn.PgError
-	if errors.As(err, &pg) && pg.Code == "55P03" {
+	if inverseLockBusy(err) {
 		return inverseBusy{wait}
 	}
 	return err
+}
+
+// inverseLockTimeout bounds every lock wait once a transaction holds the wide
+// cleanup locks 7343226011103/7343226011101. NOWAIT covers a row but not the
+// table lock the statement still needs, so only a transaction-wide bound stops
+// a table or row wait from queueing while the wide locks are held. With it, any
+// such wait ends as SQLSTATE 55P03 instead.
+const inverseLockTimeout = 100 * time.Millisecond
+
+// boundInverseLocks applies the transaction-wide lock bound. It runs right
+// after the wide cleanup locks, so no later statement in the transaction can
+// wait on a table or row lock.
+func boundInverseLocks(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `SELECT set_config('lock_timeout',$1,true)`, inverseLockTimeout.String())
+	return err
+}
+
+// inverseLockBusy reports a lock wait PostgreSQL refused: a lock_timeout expiry
+// or a NOWAIT miss. Both mean another session owns the lock right now.
+func inverseLockBusy(err error) bool {
+	var pg *pgconn.PgError
+	return errors.As(err, &pg) && pg.Code == "55P03"
+}
+
+// inverseLockContention reports a lock wait our own transaction bound refused.
+// Only PostgreSQL's own refusals count: a trigger may raise 55P03 with its own
+// message, and those exact outcomes (a busy stitch hold admission) keep the
+// meaning they already had, so they are never retried as plain contention.
+func inverseLockContention(err error) bool {
+	var pg *pgconn.PgError
+	if !errors.As(err, &pg) || pg.Code != "55P03" {
+		return false
+	}
+	return strings.HasPrefix(pg.Message, "canceling statement due to lock timeout") ||
+		strings.HasPrefix(pg.Message, "could not obtain lock")
+}
+
+// inverseContention turns a bound lock wait into contention, so admission takes
+// its existing path: roll back, wait outside, retry inside the deadline. It
+// names no wait because the refused statement does not say which lock it wanted;
+// admission backs off outside the wide locks instead.
+func inverseContention(err error) error {
+	var busy inverseBusy
+	if !inverseLockContention(err) || errors.As(err, &busy) {
+		return err
+	}
+	return inverseBusy{}
 }
 
 // The parent recording needs no row lock: 0201's identity trigger and the
@@ -595,7 +660,10 @@ func (a *inverseApplier) checkTarget(ctx context.Context, tx pgx.Tx, t inverseRa
 }
 func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRawTarget, error) {
 	return admitInverse(ctx, inverseBegin(a.pool), func(ctx context.Context) (inverseRawTarget, error) {
-		return a.reserveOnce(ctx, e)
+		t, err := a.reserveOnce(ctx, e)
+		// Any lock the attempt lost after the wide cleanup locks is contention:
+		// the attempt rolled back, so admission waits outside them and retries.
+		return t, inverseContention(err)
 	})
 }
 func (a *inverseApplier) reserveOnce(ctx context.Context, e inverseEntry) (inverseRawTarget, error) {
@@ -611,6 +679,11 @@ func (a *inverseApplier) reserveOnce(ctx context.Context, e inverseEntry) (inver
 	if err = inverseProtectionLocks(ctx, tx, false); err != nil {
 		return t, err
 	}
+	// From here the transaction holds both wide cleanup locks, so every later
+	// table or row wait must fail at once instead of queueing behind them.
+	if err = boundInverseLocks(ctx, tx); err != nil {
+		return t, err
+	}
 	if err = lockInverseCopyKey(ctx, tx, a.store.Bucket(), e.Key); err != nil {
 		return t, a.keyContention(ctx, tx, e.Key, err)
 	}
@@ -619,7 +692,7 @@ func (a *inverseApplier) reserveOnce(ctx context.Context, e inverseEntry) (inver
 	}
 	var held bool
 	if err = tx.QueryRow(ctx, `SELECT `+inverseStitchHeldSQL, a.store.Bucket(), e.Key).Scan(&held); err != nil {
-		return t, err
+		return t, a.keyContention(ctx, tx, e.Key, inverseContention(err))
 	}
 	if held {
 		return t, fmt.Errorf("%w: committed hold", errInverseStitchConflict)
@@ -818,7 +891,7 @@ func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGat
 }
 func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, manifest string) error {
 	_, err := admitInverse(ctx, inverseBegin(a.pool), func(ctx context.Context) (struct{}, error) {
-		return struct{}{}, a.publishAbsentOnce(ctx, e, manifest)
+		return struct{}{}, inverseContention(a.publishAbsentOnce(ctx, e, manifest))
 	})
 	return err
 }
@@ -834,6 +907,12 @@ func (a *inverseApplier) publishAbsentOnce(ctx context.Context, e inverseEntry, 
 		}
 	}
 	if err = inverseProtectionLocks(ctx, tx, false); err != nil {
+		return err
+	}
+	// Publication holds the wide cleanup locks from here on, so the clip row,
+	// the purge update and the receipt insert can never wait behind a session
+	// that needs those same locks.
+	if err = boundInverseLocks(ctx, tx); err != nil {
 		return err
 	}
 	// A receipt and source publication must resolve the exact durable identity.

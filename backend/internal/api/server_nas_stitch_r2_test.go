@@ -526,6 +526,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
  VALUES(13,902,30,'fixture/raw2.mp4',100,$1,'present',now(),now())`, sha)
 	exec(`UPDATE nas_r2_copy_items SET lease_expires_at=clock_timestamp()+interval '2 minutes' WHERE id=$1`, copyID)
 	testStitchReceiptNeverWaits(t, pool, func() int { return post(47, request) }, copyID, id, sourceKey, "managed/durham-fixture-2.mp4")
+	testStitchReceiptLockBound(t, pool, func() int { return post(47, request) }, copyID)
 	if err := testStitchCertKeyContention(t, pool, func(tx pgx.Tx) error {
 		return finishNASR2StitchCopy(ctx, tx, nasR2CopyTask{ID: copyID, Item: item}, request)
 	}, sourceKey, "managed/keep-ranking.mp4", extra); err != nil {

@@ -114,6 +114,11 @@ func (a *inverseApplier) prepareWireTarget(ctx context.Context, tx pgx.Tx, e inv
 	if err := inverseProtectionLocks(ctx, tx, true); err != nil {
 		return inverseRawTarget{}, err
 	}
+	// The wire transaction holds the wide cleanup locks shared from here on, so
+	// every later table or row wait fails at once; admission awaits it outside.
+	if err := boundInverseLocks(ctx, tx); err != nil {
+		return inverseRawTarget{}, err
+	}
 	if err := lockInverseCopyKey(ctx, tx, a.store.Bucket(), e.Key); err != nil {
 		return inverseRawTarget{}, err
 	}
@@ -178,24 +183,58 @@ func (a *inverseApplier) authorize(admitCtx, wireCtx context.Context, tx pgx.Tx,
 	}
 	ctx := wireCtx
 	fail := func(err error) (*inverseDeleteAuthority, error) { cancel(); return nil, err }
-	if err = a.checkWireHead(ctx, tx, e, target); err != nil {
+	// Every check before issuance and the attempt insert itself are admission
+	// work: they run under the admission deadline, so none of them can outlive
+	// it while the wire transaction holds the wide cleanup locks. Keep-28 also
+	// stops them at custody end. Only the returned authority carries the wire
+	// context, bounded by the network deadline and by custody.
+	preIssue := admitCtx
+	if a.opts.Lane == inverseNASKeep28 {
+		var stop context.CancelFunc
+		preIssue, stop = context.WithDeadline(admitCtx, custodyEnd)
+		defer stop()
+	}
+	if err = a.checkWireHead(preIssue, tx, e, target); err != nil {
 		return fail(err)
 	}
 	guard := &inverseWireGuard{a, tx, target, e}
 	binding := guard.binding()
-	if err = guard.check(ctx, binding); err != nil {
+	if err = guard.check(preIssue, binding); err != nil {
 		return fail(err)
 	}
 	// Independent commit precedes capability issuance. Even another verifier or
 	// process cannot remint authority after any ambiguous/crashed wire attempt.
-	tag, err := a.pool.Exec(ctx, `INSERT INTO `+a.opts.Lane.attemptTable()+`(bucket,object_key) VALUES($1,$2) ON CONFLICT DO NOTHING`, binding.Bucket, binding.Key)
+	issued, err := a.issueAttempt(preIssue, binding)
 	if err != nil {
 		return fail(err)
 	}
-	if tag.RowsAffected() != 1 {
+	if issued != 1 {
 		return fail(errors.New("inverse wire authority was already issued; reconcile only"))
 	}
 	return &inverseDeleteAuthority{binding: binding, guard: guard, used: &atomic.Bool{}, gate: gate, ctx: ctx, cancel: cancel, custody: custody, custodyEnd: custodyEnd}, nil
+}
+
+// issueAttempt records the wire attempt in its own transaction, so it commits
+// independently of the wire transaction. That transaction also takes the lock
+// bound: a busy attempt table is contention here, never a wait of the wire
+// transaction that still holds the wide cleanup locks.
+func (a *inverseApplier) issueAttempt(ctx context.Context, binding inverseDeleteBinding) (int64, error) {
+	tx, err := a.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(context.Background())
+	if err = boundInverseLocks(ctx, tx); err != nil {
+		return 0, err
+	}
+	tag, err := tx.Exec(ctx, `INSERT INTO `+a.opts.Lane.attemptTable()+`(bucket,object_key) VALUES($1,$2) ON CONFLICT DO NOTHING`, binding.Bucket, binding.Key)
+	if err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 type inverseSDKStore struct {

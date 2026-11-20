@@ -1749,6 +1749,51 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				done, secondBatch, err, providerDeletes()-before, firstPresent, secondPresent)
 		}
 	})
+	t.Run("raw_selection_drops_a_committed_hold_before_MaxItems", func(t *testing.T) {
+		// A committed Durham hold, not a skip this job remembered, must be left
+		// out at selection: otherwise it spends the batch's whole item allowance
+		// every batch and the keys behind it never run.
+		a, entries := build(2)
+		a.ledger.close()
+		first, second := entries[0], entries[1]
+		a.opts.MaxItems, a.opts.skipped = 1, &inverseSkipSet{}
+		// Earlier subtests in this table own recording 30's 2026-06-01 hour, so
+		// this moves the two keys it just built to a clean hour of their own.
+		exec(`UPDATE recording_clips SET fire_at='2026-06-03',clip_start_at='2026-06-03',clip_end_at='2026-06-03 00:01:00' WHERE object_key=$1 OR object_key=$2`, first.Key, second.Key)
+		exec(`INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until) VALUES(71,3,'2026-06-03','2026-06-04','committed hold',now()+interval '1 day')`)
+		var hourID int64
+		if err := pool.QueryRow(ctx, `INSERT INTO nas_stitch_r2_hours(scope_id,recording_id,hour_at,plan,plan_sha256,input_bytes) VALUES(71,30,'2026-06-03','{}',repeat('f',64),100) RETURNING id`).Scan(&hourID); err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at)
+ SELECT 13,id,30,display_path,100,repeat('b',64),'present',now(),now() FROM recording_clips WHERE object_key=$1`, e.Key)
+		}
+		hold, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = hold.Exec(ctx, `INSERT INTO nas_stitch_r2_input_holds(hour_id,bucket,object_key,catalog_clip_id,sha256,size_bytes,etag)
+ SELECT $1,bucket,object_key,id,repeat('b',64),100,etag FROM recording_clips WHERE object_key=$2`, hourID, first.Key); err != nil {
+			t.Fatal(err)
+		}
+		if err = hold.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		result, err := applyInverse(ctx, pool, store, a.opts)
+		store.mu.Lock()
+		_, firstPresent := store.objects[first.Key]
+		_, secondPresent := store.objects[second.Key]
+		store.mu.Unlock()
+		if err != nil || result.Selected != 1 || result.Deleted != 1 || result.StitchSkipped != 0 || !firstPresent || secondPresent {
+			t.Fatalf("committed hold spent the item allowance: %+v %v first %v second %v", result, err, firstPresent, secondPresent)
+		}
+		var durable int
+		if err = pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM r2_retirement_reservations WHERE object_key=$1)
+ +(SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1)+(SELECT count(*) FROM r2_inverse_attempts WHERE object_key=$1)`, first.Key).Scan(&durable); err != nil || durable != 0 {
+			t.Fatalf("a committed hold wrote durable retirement state: %d %v", durable, err)
+		}
+	})
 	t.Run("private_authority_cannot_replay_or_remint", func(t *testing.T) {
 		for _, lost := range []bool{false, true} {
 			t.Run(strconv.FormatBool(lost), func(t *testing.T) {

@@ -198,7 +198,10 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 		return tx, nil
 	}
 	ok, err := admitInverse(ctx, begin, func(ctx context.Context) (bool, error) {
-		return queueKeep28RefreshOnce(ctx, begin, o, p, epoch, i, etag, policy, status)
+		ok, err := queueKeep28RefreshOnce(ctx, begin, o, p, epoch, i, etag, policy, status)
+		// A lock the attempt lost after the wide cleanup locks is contention:
+		// it rolled back, so admission waits outside them and retries.
+		return ok, inverseContention(err)
 	})
 	return ok, finishDBError(finishRefreshAdmission, 0, err)
 }
@@ -212,6 +215,12 @@ func queueKeep28RefreshOnce(ctx context.Context, begin func(context.Context) (pg
 		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	if err = inverseProtectionLocks(ctx, tx, false); err != nil {
+		return false, finishDBError(finishRefreshAdmission, 0, err)
+	}
+	// Refresh holds the wide cleanup locks from here on. The table lock its own
+	// copy-row update needs, and every row it touches after, must fail at once
+	// instead of queueing behind a session that needs those same wide locks.
+	if err = boundInverseLocks(ctx, tx); err != nil {
 		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	var current int64
