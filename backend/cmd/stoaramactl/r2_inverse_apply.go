@@ -60,7 +60,42 @@ type inverseApplyOptions struct {
 	MaxItems                                                                           int
 	MaxBytes, Budget24h                                                                int64
 	Workers                                                                            int
+	// skipped remembers keys a later batch must not reselect. A key skipped for a
+	// live stitch hold wrote nothing durable, so only this run can tell the next
+	// batch, in the same job, that it was already passed over. Batches of one job
+	// share it; a fresh apply starts empty.
+	skipped *inverseSkipSet
 }
+
+// inverseSkipSet is the keys this job already passed over, shared by its
+// batches and by concurrent workers within a batch.
+type inverseSkipSet struct {
+	mu   sync.Mutex
+	keys map[string]struct{}
+}
+
+func (s *inverseSkipSet) has(key string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.keys[key]
+	return ok
+}
+
+func (s *inverseSkipSet) add(key string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.keys == nil {
+		s.keys = map[string]struct{}{}
+	}
+	s.keys[key] = struct{}{}
+}
+
 type inverseApplySummary struct {
 	// Selected counts the new keys this batch chose to work on.
 	Selected      int64 `json:"selected"`
@@ -139,13 +174,24 @@ func (a *inverseApplier) inverseFenceWait() inverseWait {
 		args: []any{a.store.Bucket(), a.store.EndpointSHA256()}}
 }
 
+// inverseFenceTableWait waits for the fence table's own lock. SELECT ... FOR
+// SHARE needs ROW SHARE on its table, so a session holding the table EXCLUSIVE
+// makes even a NOWAIT row read queue for that table lock.
+func (a *inverseApplier) inverseFenceTableWait() inverseWait {
+	return inverseWait{sql: `LOCK TABLE r2_retirement_writer_fences IN ROW SHARE MODE`}
+}
+
 func (a *inverseApplier) checkEvidence(ctx context.Context, q r2RetireQuerier) error {
 	return a.checkEvidenceLock(ctx, q, `FOR SHARE`)
 }
 
 // checkEvidenceAdmission reads the same fence under the wide protection locks,
-// so it only tries the row: admission awaits a busy fence outside them.
+// so it only tries it: both the table lock the SELECT needs and the row lock
+// are NOWAIT, and admission awaits a busy one outside them.
 func (a *inverseApplier) checkEvidenceAdmission(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, `LOCK TABLE r2_retirement_writer_fences IN ROW SHARE MODE NOWAIT`); err != nil {
+		return inverseRowBusy(err, a.inverseFenceTableWait())
+	}
 	return inverseRowBusy(a.checkEvidenceLock(ctx, tx, `FOR SHARE NOWAIT`), a.inverseFenceWait())
 }
 
@@ -235,9 +281,12 @@ var (
 var errInverseAdmissionBusy = errors.New("R2 retirement admission stayed busy past its retry bound")
 
 // admitInverse retries admit until it reports no busy lock, at most
-// inverseAdmissionRetries times and never past inverseAdmissionDeadline.
-// admit must have rolled its transaction back before it returns inverseBusy.
-func admitInverse[T any](ctx context.Context, begin func(context.Context) (pgx.Tx, error), admit func() (T, error)) (T, error) {
+// inverseAdmissionRetries attempts and never past inverseAdmissionDeadline.
+// admit receives the bounded admission context and must use it for its own
+// transaction and every lock it takes, so pool acquisition, the epoch barrier
+// and each lock acquisition are all inside the deadline. admit must have rolled
+// its transaction back before it returns inverseBusy.
+func admitInverse[T any](ctx context.Context, begin func(context.Context) (pgx.Tx, error), admit func(context.Context) (T, error)) (T, error) {
 	ctx, cancel := context.WithTimeout(ctx, inverseAdmissionDeadline)
 	defer cancel()
 	busyFailure := func(attempts int, busy inverseBusy, cause error) error {
@@ -246,20 +295,30 @@ func admitInverse[T any](ctx context.Context, begin func(context.Context) (pgx.T
 		}
 		return fmt.Errorf("%w: %d waits: %v: %w", errInverseAdmissionBusy, attempts, busy, cause)
 	}
-	for attempts := 0; ; attempts++ {
-		v, err := admit()
+	var last inverseBusy
+	var value T
+	for attempts := 1; ; attempts++ {
+		var err error
+		value, err = admit(ctx)
 		var busy inverseBusy
 		if !errors.As(err, &busy) {
-			return v, err
+			// A lock acquired inside the attempt is bounded by the admission
+			// context, so its expiry is the same named busy failure. A cancelled
+			// admission keeps its own error: a sibling's stop is not contention.
+			if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return value, busyFailure(attempts, last, err)
+			}
+			return value, err
 		}
+		last = busy
 		if attempts >= inverseAdmissionRetries {
-			return v, busyFailure(attempts, busy, nil)
+			return value, busyFailure(attempts, busy, nil)
 		}
 		if err = busy.await(ctx, begin); err != nil {
 			if ctx.Err() != nil {
-				return v, busyFailure(attempts+1, busy, ctx.Err())
+				return value, busyFailure(attempts, busy, ctx.Err())
 			}
-			return v, busyFailure(attempts+1, busy, err)
+			return value, busyFailure(attempts, busy, err)
 		}
 	}
 }
@@ -272,15 +331,15 @@ func inverseBegin(pool *pgxpool.Pool) func(context.Context) (pgx.Tx, error) {
 
 // admitWire opens the wire transaction and authorizes in it, awaiting busy
 // locks outside it between attempts. The caller owns the returned transaction.
-func admitWire[T any](ctx context.Context, pool *pgxpool.Pool, authorize func(pgx.Tx) (T, error)) (pgx.Tx, T, error) {
+func admitWire[T any](ctx context.Context, pool *pgxpool.Pool, authorize func(context.Context, pgx.Tx) (T, error)) (pgx.Tx, T, error) {
 	var tx pgx.Tx
-	v, err := admitInverse(ctx, inverseBegin(pool), func() (T, error) {
+	v, err := admitInverse(ctx, inverseBegin(pool), func(ctx context.Context) (T, error) {
 		var zero T
 		var err error
 		if tx, err = pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}); err != nil {
 			return zero, err
 		}
-		v, err := authorize(tx)
+		v, err := authorize(ctx, tx)
 		if errors.As(err, new(inverseBusy)) {
 			tx.Rollback(context.Background())
 			tx = nil
@@ -364,6 +423,27 @@ var inverseStitchLedgerOutcomes = []pgconn.PgError{
 }
 
 const inverseStitchHeldSQL = `EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds WHERE bucket=$1 AND object_key=$2 AND released_at IS NULL)`
+
+// inverseLiveHeldKeys reports every key a live stitch hold currently owns for
+// the batch's bucket. Selection reads it once, before any item allowance is
+// spent, so a held key is never reselected batch after batch. A hold admitted
+// after this read is still caught at reserve, which skips that one key.
+func (a *inverseApplier) inverseLiveHeldKeys(ctx context.Context) (map[string]bool, error) {
+	held := map[string]bool{}
+	rows, err := a.pool.Query(ctx, `SELECT object_key FROM nas_stitch_r2_input_holds WHERE bucket=$1 AND released_at IS NULL`, a.store.Bucket())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		if err = rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		held[key] = true
+	}
+	return held, rows.Err()
+}
 
 func inverseStitchLedgerError(err error) error {
 	var pg *pgconn.PgError
@@ -514,7 +594,9 @@ func (a *inverseApplier) checkTarget(ctx context.Context, tx pgx.Tx, t inverseRa
 	return nil
 }
 func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRawTarget, error) {
-	return admitInverse(ctx, inverseBegin(a.pool), func() (inverseRawTarget, error) { return a.reserveOnce(ctx, e) })
+	return admitInverse(ctx, inverseBegin(a.pool), func(ctx context.Context) (inverseRawTarget, error) {
+		return a.reserveOnce(ctx, e)
+	})
 }
 func (a *inverseApplier) reserveOnce(ctx context.Context, e inverseEntry) (inverseRawTarget, error) {
 	t := inverseRawTarget{}
@@ -696,8 +778,8 @@ func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGat
 	// nothing else, then revalidates from a fresh transaction.
 	var authority *inverseDeleteAuthority
 	var authErr error
-	tx, authority, authErr = admitWire(ctx, a.pool, func(tx pgx.Tx) (*inverseDeleteAuthority, error) {
-		return a.authorize(ctx, tx, e, send)
+	tx, authority, authErr = admitWire(ctx, a.pool, func(admitCtx context.Context, tx pgx.Tx) (*inverseDeleteAuthority, error) {
+		return a.authorize(admitCtx, ctx, tx, e, send)
 	})
 	if authErr != nil {
 		return false, authErr
@@ -735,7 +817,9 @@ func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGat
 	return true, nil
 }
 func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, manifest string) error {
-	_, err := admitInverse(ctx, inverseBegin(a.pool), func() (struct{}, error) { return struct{}{}, a.publishAbsentOnce(ctx, e, manifest) })
+	_, err := admitInverse(ctx, inverseBegin(a.pool), func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, a.publishAbsentOnce(ctx, e, manifest)
+	})
 	return err
 }
 func (a *inverseApplier) publishAbsentOnce(ctx context.Context, e inverseEntry, manifest string) error {
@@ -845,6 +929,11 @@ func inverseWorkersFit(pool *pgxpool.Pool, workers int) error {
 func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, o inverseApplyOptions) (inverseApplySummary, error) {
 	started := time.Now()
 	result := inverseApplySummary{}
+	// A direct apply is one batch: a skip still has to stay out of its own retry
+	// loop, and a job's batches pass the shared set instead.
+	if o.skipped == nil {
+		o.skipped = &inverseSkipSet{}
+	}
 	if o.Lane != inverseOutsideKeep28 && o.Lane != inverseNASKeep28 {
 		return result, errors.New("unknown inverse lane")
 	}
@@ -900,7 +989,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	}
 	defer ledger.close()
 	var keEpoch int64
-	protection, err := admitInverse(ctx, inverseBegin(pool), func() (inverseProtection, error) {
+	protection, err := admitInverse(ctx, inverseBegin(pool), func(ctx context.Context) (inverseProtection, error) {
 		initTx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 		if err != nil {
 			return inverseProtection{}, err
@@ -1018,6 +1107,13 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	var jobs []inverseEntry
 	candidates := map[string]inverseEntry{}
 	var planned int64
+	// A key a live stitch hold owns, or that this job already skipped, is
+	// dropped before MaxItems or the byte cap applies: otherwise it would spend
+	// the batch's allowance every batch and starve the keys behind it.
+	heldKeys, err := a.inverseLiveHeldKeys(ctx)
+	if err != nil {
+		return result, err
+	}
 	for scanner.Scan() {
 		var e inverseEntry
 		if err = json.Unmarshal(scanner.Bytes(), &e); err != nil {
@@ -1042,7 +1138,13 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 			if _, dup := candidates[e.Key]; dup {
 				return result, errors.New("duplicate keep28 partition key")
 			}
+			if heldKeys[e.Key] || o.skipped.has(e.Key) {
+				continue
+			}
 			candidates[e.Key] = e
+			continue
+		}
+		if heldKeys[e.Key] || o.skipped.has(e.Key) {
 			continue
 		}
 		if len(jobs) >= o.MaxItems || e.SizeBytes > o.MaxBytes-planned {
@@ -1102,6 +1204,9 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 					continue
 				}
 				if errors.Is(err, errInverseStitchConflict) {
+					// This key wrote nothing; remember it so no later batch of
+					// this job spends its whole allowance reselecting it.
+					o.skipped.add(e.Key)
 					stitchSkipped.Add(1)
 					continue
 				}

@@ -81,10 +81,21 @@ func finishNASR2StitchCopy(ctx context.Context, tx pgx.Tx, task nasR2CopyTask, r
 	if err != nil {
 		return err
 	}
-	// This transaction owns the copy row, so it never waits: it takes every
-	// lock the certificate needs (epoch, input keys in hash order, input pairs,
-	// hour, connection 13's key, the holds it releases) without waiting, all
-	// or nothing, and the client retries.
+	// This transaction owns the copy row, so it never waits. It first takes the
+	// table locks its own UPDATE, the certificate INSERT and its release trigger
+	// need, without waiting: nas_r2_copy_items carries the row this call updates,
+	// so another session's SHARE on it must refuse the receipt now rather than
+	// queue its UPDATE behind that lock while holding the copy row.
+	if _, err = tx.Exec(ctx, `LOCK TABLE nas_r2_copy_items,nas_stitch_r2_certificates,nas_stitch_r2_hours,nas_stitch_r2_input_holds IN ROW EXCLUSIVE MODE NOWAIT`); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
+			return errors.New("retirement holds are busy")
+		}
+		return err
+	}
+	// It then takes every other lock the certificate needs (epoch, input keys in
+	// hash order, input pairs, hour, connection 13's key, the holds it releases)
+	// without waiting, all or nothing, and the client retries.
 	var locked bool
 	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_ke_epoch FOR SHARE SKIP LOCKED)
  AND (SELECT lock_nas_r2_copy_keys(array_agg(bucket),array_agg(object_key),false)
@@ -112,16 +123,7 @@ func finishNASR2StitchCopy(ctx context.Context, tx pgx.Tx, task nasR2CopyTask, r
 		return errors.New("NAS copy receipt differs from the exact staged generation")
 	}
 	// The certificate INSERT and its release trigger write the certificate,
-	// hour and input-hold tables. Take those table locks without waiting first:
-	// this transaction already owns the copy row, so a busy table must fail to
-	// the client instead of queueing every other writer behind it.
-	if _, err = tx.Exec(ctx, `LOCK TABLE nas_stitch_r2_certificates,nas_stitch_r2_hours,nas_stitch_r2_input_holds IN ROW EXCLUSIVE MODE NOWAIT`); err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
-			return errors.New("retirement holds are busy")
-		}
-		return err
-	}
+	// hour and input-hold tables. Their locks were already taken above.
 	var accepted bool
 	err = tx.QueryRow(ctx, `WITH proof AS MATERIALIZED (
  SELECT nas_stitch_r2_certificate_receipt($1,$2,$3,$4) AS receipt

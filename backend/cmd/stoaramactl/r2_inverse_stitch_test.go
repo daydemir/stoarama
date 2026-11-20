@@ -408,8 +408,8 @@ func TestR2AdmissionAwaitsWriterFenceOutsideWideLocks(t *testing.T) {
 	defer fence.Rollback(f.ctx)
 	wiring := make(chan error, 1)
 	go func() {
-		tx, _, err := admitWire(f.ctx, f.pool, func(tx pgx.Tx) (*inverseDeleteAuthority, error) {
-			return a.authorize(f.ctx, tx, e, &inverseSendGate{})
+		tx, _, err := admitWire(f.ctx, f.pool, func(ctx context.Context, tx pgx.Tx) (*inverseDeleteAuthority, error) {
+			return a.authorize(ctx, f.ctx, tx, e, &inverseSendGate{})
 		})
 		if tx != nil {
 			tx.Rollback(context.Background())
@@ -428,6 +428,46 @@ func TestR2AdmissionAwaitsWriterFenceOutsideWideLocks(t *testing.T) {
 	}
 }
 
+// The fence row lock alone does not cover the fence table's own lock: while
+// another session holds the table EXCLUSIVE, even a NOWAIT row read queues for
+// that table lock. Admission must therefore try the table lock too, so it never
+// holds 7343226011103 while awaiting the fence table. A legacy delivery hold
+// that needs 1103 must still be able to take it meanwhile.
+func TestR2AdmissionAwaitsWriterFenceTableOutsideWideLocks(t *testing.T) {
+	f := newKeep28Fixture(t)
+	a := f.applier(t)
+	e := f.entry(t)
+	holder, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(f.ctx)
+	if _, err = holder.Exec(f.ctx, `LOCK TABLE r2_retirement_writer_fences IN EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	reserved := make(chan error, 1)
+	go func() { _, err := a.reserve(f.ctx, e); reserved <- err }()
+	waitBlockedBy(t, f.pool, stitchBackendPID(t, holder), "reserve behind the writer fence table")
+	// 1103 and 1101 are advisory (classid 1709, objid 3126902239 and 3126902237).
+	prompt, cancel := context.WithTimeout(f.ctx, 5*time.Second)
+	defer cancel()
+	mutator, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mutator.Rollback(f.ctx)
+	if _, err = mutator.Exec(prompt, `SELECT pg_advisory_xact_lock(7343226011103),pg_advisory_xact_lock(7343226011101)`); err != nil {
+		t.Fatalf("a mutator queued behind admission awaiting the fence table: %v", err)
+	}
+	mutator.Rollback(f.ctx)
+	if err = holder.Rollback(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = within(t, reserved, "reserve behind the writer fence table"); err != nil {
+		t.Fatalf("reserve did not revalidate after the fence table freed: %v", err)
+	}
+}
+
 // Admission retries are bounded: an admission that keeps meeting a busy lock
 // must fail with the named bound instead of looping, and a key whose own
 // deadline expires first must report both that bound and the deadline.
@@ -436,11 +476,11 @@ func TestR2AdmissionRetriesAreBounded(t *testing.T) {
 	// Admission that keeps reporting the same (freely lockable) wait never
 	// settles; only the named cap ends it.
 	attempts := 0
-	_, err := admitInverse(f.ctx, inverseBegin(f.pool), func() (struct{}, error) {
+	_, err := admitInverse(f.ctx, inverseBegin(f.pool), func(context.Context) (struct{}, error) {
 		attempts++
 		return struct{}{}, inverseBusy{{sql: `SELECT pg_advisory_xact_lock(7343226011000)`}}
 	})
-	if !errors.Is(err, errInverseAdmissionBusy) || attempts != inverseAdmissionRetries+1 {
+	if !errors.Is(err, errInverseAdmissionBusy) || attempts != inverseAdmissionRetries {
 		t.Fatalf("retry bound: attempts %d err %v", attempts, err)
 	}
 
@@ -465,5 +505,51 @@ func TestR2AdmissionRetriesAreBounded(t *testing.T) {
 	}
 	if !probeWideLocks(t, f.pool) {
 		t.Fatal("expired admission left the wide protection locks held")
+	}
+}
+
+// The admission deadline bounds every attempt, including the locks it takes
+// inside an attempt, not just the outside waits. A 1103 owner that never lets
+// go must still fail the reserve inside a short deadline while the parent
+// deadline is long.
+func TestR2AdmissionDeadlineBoundsEveryAttempt(t *testing.T) {
+	previous := inverseAdmissionDeadline
+	inverseAdmissionDeadline = 100 * time.Millisecond
+	t.Cleanup(func() { inverseAdmissionDeadline = previous })
+
+	f := newKeep28Fixture(t)
+	a := f.applier(t)
+	e := f.entry(t)
+	owner, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Rollback(f.ctx)
+	if _, err = owner.Exec(f.ctx, `SELECT pg_advisory_xact_lock(7343226011103)`); err != nil {
+		t.Fatal(err)
+	}
+	parent, cancel := context.WithTimeout(f.ctx, time.Minute)
+	defer cancel()
+	started := time.Now()
+	_, err = a.reserve(parent, e)
+	elapsed := time.Since(started)
+	if !errors.Is(err, errInverseAdmissionBusy) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bounded admission did not name its bound and deadline: %v", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("admission overran its own deadline, bounded only by the parent: %v", elapsed)
+	}
+	// Release the stuck owner first: it, not admission, owns 1103 here.
+	if err = owner.Rollback(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	// A cancelled statement makes pgx cancel the backend, which releases its
+	// locks as the session exits; allow that to settle.
+	released := false
+	for deadline := time.Now().Add(5 * time.Second); !released && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		released = probeWideLocks(t, f.pool)
+	}
+	if !released {
+		t.Fatal("bounded admission left the wide protection locks held")
 	}
 }

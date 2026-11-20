@@ -154,9 +154,12 @@ func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverse
 }
 
 // authorize issues one key's single-use DELETE authority on the applier's lane.
+// admitCtx bounds every lock it takes and ends with admission; wireCtx is the
+// key's own network deadline and outlives admission, so the returned authority
+// is never bound by, or cancelled with, the admission attempt.
 // Keep-28 adds its NAS custody proof and bounds the authority by its expiry.
-func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntry, gate *inverseSendGate) (*inverseDeleteAuthority, error) {
-	target, err := a.prepareWireTarget(ctx, tx, e)
+func (a *inverseApplier) authorize(admitCtx, wireCtx context.Context, tx pgx.Tx, e inverseEntry, gate *inverseSendGate) (*inverseDeleteAuthority, error) {
+	target, err := a.prepareWireTarget(admitCtx, tx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -166,13 +169,14 @@ func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntr
 	var custodyEnd time.Time
 	var cancel context.CancelFunc
 	if a.opts.Lane == inverseNASKeep28 {
-		if custody, custodyEnd, err = a.proveKeep28(ctx, tx, e, target); err != nil {
+		if custody, custodyEnd, err = a.proveKeep28(admitCtx, tx, e, target); err != nil {
 			return nil, err
 		}
-		ctx, cancel = context.WithDeadline(ctx, custodyEnd)
+		wireCtx, cancel = context.WithDeadline(wireCtx, custodyEnd)
 	} else {
-		ctx, cancel = context.WithCancel(ctx)
+		wireCtx, cancel = context.WithCancel(wireCtx)
 	}
+	ctx := wireCtx
 	fail := func(err error) (*inverseDeleteAuthority, error) { cancel(); return nil, err }
 	if err = a.checkWireHead(ctx, tx, e, target); err != nil {
 		return fail(err)

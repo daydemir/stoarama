@@ -141,6 +141,10 @@ func testStitchReceiptNeverWaits(t *testing.T, pool *pgxpool.Pool, post func() i
  WHERE f.connection_id=13 AND c.object_key=$1 FOR UPDATE OF f`, []any{inputKey}},
 		{"connection 13", `SELECT 1 FROM connections WHERE id=13 FOR UPDATE`, nil},
 		{"second input hold", `SELECT 1 FROM nas_stitch_r2_input_holds WHERE object_key=$1 FOR UPDATE`, []any{secondKey}},
+		// The receipt's own completion UPDATE needs ROW EXCLUSIVE on the copy
+		// table, so a session holding it in SHARE mode must refuse the receipt
+		// at once instead of queuing that UPDATE behind it with the row held.
+		{"copy table", `LOCK TABLE nas_r2_copy_items IN SHARE MODE`, nil},
 		// The certificate INSERT and its release trigger write these tables, so
 		// the receipt takes their locks without waiting.
 		{"certificate table", `LOCK TABLE nas_stitch_r2_certificates,nas_stitch_r2_hours,nas_stitch_r2_input_holds IN SHARE MODE`, nil},
@@ -288,10 +292,13 @@ func testStitchCertKeyContention(t *testing.T, pool *pgxpool.Pool, certify func(
 		t.Fatal(err)
 	}
 	// Registered before the race so a failed assertion below rolls the race
-	// back instead of leaving its connection checked out for pool.Close.
+	// back instead of leaving its connection checked out for pool.Close. The
+	// explicit defer runs when this helper returns, still before the parent
+	// test's deferred DROP SCHEMA, which would otherwise wait on the race tx.
 	var raced sync.Once
 	releaseRace := func() { raced.Do(func() { _ = race.Rollback(context.Background()) }) }
 	t.Cleanup(releaseRace)
+	defer releaseRace()
 	imported := make(chan error, 1)
 	go func() { imported <- extra.importSet(ctx) }()
 	blockedBy(t, pool, backendPID(t, race), "import behind a same-key reservation")

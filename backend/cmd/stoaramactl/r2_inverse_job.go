@@ -57,7 +57,7 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane
 	if err != nil {
 		log.Fatal(err)
 	}
-	o := inverseApplyOptions{Lane: lane, Manifest: filepath.Join(partition, "partition.jsonl"), Summary: filepath.Join(partition, "summary.json"), Picks: f.picks, Ledger: filepath.Join(f.work, "ledger.jsonl"), Workers: f.workers, MaxItems: f.items, MaxBytes: f.maxBytes, Budget24h: f.budget24h}
+	o := inverseApplyOptions{Lane: lane, Manifest: filepath.Join(partition, "partition.jsonl"), Summary: filepath.Join(partition, "summary.json"), Picks: f.picks, Ledger: filepath.Join(f.work, "ledger.jsonl"), Workers: f.workers, MaxItems: f.items, MaxBytes: f.maxBytes, Budget24h: f.budget24h, skipped: &inverseSkipSet{}}
 	if o.ManifestSHA, err = inverseFileSHA(o.Manifest); err != nil {
 		log.Fatal(err)
 	}
@@ -88,6 +88,7 @@ func (t *inverseApplySummary) addBatch(r inverseApplySummary) {
 	t.Selected += r.Selected
 	t.Deleted += r.Deleted
 	t.Bytes += r.Bytes
+	t.StitchSkipped += r.StitchSkipped
 	t.CustodyShort.Objects += r.CustodyShort.Objects
 	t.CustodyShort.Bytes += r.CustodyShort.Bytes
 	t.WireAmbiguous = append(t.WireAmbiguous, r.WireAmbiguous...)

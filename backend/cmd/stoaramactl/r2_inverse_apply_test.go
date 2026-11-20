@@ -716,7 +716,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		// The attempt commits on a second connection while this wire owns the
 		// copy key; a ledger trigger that waited for that key would hang here.
 		waitless, cancel := prompt()
-		if _, err = a.authorize(waitless, wire, attempted, &inverseSendGate{}); err != nil {
+		if _, err = a.authorize(waitless, waitless, wire, attempted, &inverseSendGate{}); err != nil {
 			t.Fatal(err)
 		}
 		cancel()
@@ -932,8 +932,8 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		wireCtx, wireStop := context.WithCancel(ctx)
 		wiring := make(chan authorized, 1)
 		go func() {
-			tx, _, err := admitWire(wireCtx, pool, func(tx pgx.Tx) (*inverseDeleteAuthority, error) {
-				return a.authorize(wireCtx, tx, fenced, &inverseSendGate{})
+			tx, _, err := admitWire(wireCtx, pool, func(ctx context.Context, tx pgx.Tx) (*inverseDeleteAuthority, error) {
+				return a.authorize(ctx, wireCtx, tx, fenced, &inverseSendGate{})
 			})
 			wiring <- authorized{tx, err}
 		}()
@@ -984,7 +984,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 		defer tx.Rollback(ctx)
 		gate := &inverseSendGate{}
-		authority, err := a.authorize(ctx, tx, e, gate)
+		authority, err := a.authorize(ctx, ctx, tx, e, gate)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1715,6 +1715,40 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatalf("unlimited budget did not resume: %+v %v", result, err)
 		}
 	})
+	t.Run("raw_selection_excludes_held_and_skipped_keys", func(t *testing.T) {
+		// MaxItems=1 and a first key whose hold admission is busy: reserve skips
+		// it before any durable write, and the next batch must spend its only
+		// slot on the key behind it instead of reselecting the skipped one.
+		a, entries := build(2)
+		a.ledger.close()
+		first, second := entries[0], entries[1]
+		a.opts.MaxItems = 1
+		a.opts.skipped = &inverseSkipSet{}
+		admission, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer admission.Release()
+		defer admission.Exec(context.Background(), `SELECT pg_advisory_unlock_all()`)
+		if _, err = admission.Exec(ctx, `SELECT pg_advisory_lock(nas_stitch_r2_hold_lock('stoarama',$1))`, first.Key); err != nil {
+			t.Fatal(err)
+		}
+		dir := t.TempDir()
+		done, firstBatch, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(dir, "evidence-1.json"))
+		if err != nil || done || firstBatch.Selected != 1 || firstBatch.Deleted != 0 || firstBatch.StitchSkipped != 1 {
+			t.Fatalf("first batch spent its slot on a busy hold: done %v %+v %v", done, firstBatch, err)
+		}
+		before := providerDeletes()
+		done, secondBatch, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(dir, "evidence-2.json"))
+		store.mu.Lock()
+		_, firstPresent := store.objects[first.Key]
+		_, secondPresent := store.objects[second.Key]
+		store.mu.Unlock()
+		if err != nil || secondBatch.Deleted != 1 || providerDeletes()-before != 1 || !firstPresent || secondPresent {
+			t.Fatalf("second batch did not delete the key behind a skipped one: done %v %+v %v deletes %d first %v second %v",
+				done, secondBatch, err, providerDeletes()-before, firstPresent, secondPresent)
+		}
+	})
 	t.Run("private_authority_cannot_replay_or_remint", func(t *testing.T) {
 		for _, lost := range []bool{false, true} {
 			t.Run(strconv.FormatBool(lost), func(t *testing.T) {
@@ -1730,11 +1764,11 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer tx.Rollback(ctx)
-				authority, err := a.authorize(ctx, tx, e, &inverseSendGate{})
+				authority, err := a.authorize(ctx, ctx, tx, e, &inverseSendGate{})
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err = a.authorize(ctx, tx, e, &inverseSendGate{}); err == nil {
+				if _, err = a.authorize(ctx, ctx, tx, e, &inverseSendGate{}); err == nil {
 					t.Fatal("durable authority reminted")
 				}
 				before := providerDeletes()
@@ -2098,10 +2132,10 @@ func TestR2InverseJobReadbackComparesHeldKeys(t *testing.T) {
 // Job totals sum every batch's counts; held keys are the latest snapshot.
 func TestR2InverseJobTotalsAddBatches(t *testing.T) {
 	total := inverseApplySummary{}
-	total.addBatch(inverseApplySummary{Selected: 3, Deleted: 2, Bytes: 200, CustodyShort: r2RetireStat{Objects: 1, Bytes: 100}, WireAmbiguous: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}})
-	total.addBatch(inverseApplySummary{Selected: 1, Deleted: 1, Bytes: 100, AmbiguousHeld: 1, HeldAbsent: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}})
+	total.addBatch(inverseApplySummary{Selected: 3, StitchSkipped: 1, Deleted: 2, Bytes: 200, CustodyShort: r2RetireStat{Objects: 1, Bytes: 100}, WireAmbiguous: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}})
+	total.addBatch(inverseApplySummary{Selected: 1, StitchSkipped: 2, Deleted: 1, Bytes: 100, AmbiguousHeld: 1, HeldAbsent: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}})
 	// last_modified_held comes from the partition every batch rereads: a snapshot.
-	if total.Selected != 4 || total.Deleted != 3 || total.Bytes != 300 || total.CustodyShort != (r2RetireStat{Objects: 1, Bytes: 100}) || total.LastModifiedHeld != (r2RetireStat{Objects: 2, Bytes: 200}) || !slices.Equal(total.WireAmbiguous, []string{"managed/a"}) || total.AmbiguousHeld != 1 || !slices.Equal(total.HeldAbsent, []string{"managed/a"}) {
+	if total.Selected != 4 || total.StitchSkipped != 3 || total.Deleted != 3 || total.Bytes != 300 || total.CustodyShort != (r2RetireStat{Objects: 1, Bytes: 100}) || total.LastModifiedHeld != (r2RetireStat{Objects: 2, Bytes: 200}) || !slices.Equal(total.WireAmbiguous, []string{"managed/a"}) || total.AmbiguousHeld != 1 || !slices.Equal(total.HeldAbsent, []string{"managed/a"}) {
 		t.Fatalf("job totals: %+v", total)
 	}
 }

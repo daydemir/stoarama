@@ -119,6 +119,9 @@ func (a *inverseApplier) selectKeep28(ctx context.Context, entries map[string]in
 		if !ok || e.SizeBytes <= 0 {
 			continue
 		}
+		if a.opts.skipped.has(e.Key) {
+			continue
+		}
 		if e.SizeBytes > a.opts.MaxBytes-bytes {
 			continue
 		}

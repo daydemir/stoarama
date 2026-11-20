@@ -403,7 +403,7 @@ func TestKeep28RejectsChangedProofWithSameExpiry(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer tx.Rollback(f.ctx)
-			auth, err := a.authorize(f.ctx, tx, e, &inverseSendGate{})
+			auth, err := a.authorize(f.ctx, f.ctx, tx, e, &inverseSendGate{})
 			if err == nil {
 				auth.cancel()
 				t.Fatal("changed proof accepted")
@@ -520,7 +520,7 @@ func TestKeep28AuthorityCopiesCannotReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(f.ctx)
-	auth, err := a.authorize(f.ctx, tx, e, &inverseSendGate{})
+	auth, err := a.authorize(f.ctx, f.ctx, tx, e, &inverseSendGate{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1026,7 +1026,7 @@ func (f keep28Fixture) keep28Authorized(t *testing.T, a *inverseApplier, gate *i
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { tx.Rollback(f.ctx) })
-	auth, err := a.authorize(f.ctx, tx, e, gate)
+	auth, err := a.authorize(f.ctx, f.ctx, tx, e, gate)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -197,7 +197,7 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 		}
 		return tx, nil
 	}
-	ok, err := admitInverse(ctx, begin, func() (bool, error) {
+	ok, err := admitInverse(ctx, begin, func(ctx context.Context) (bool, error) {
 		return queueKeep28RefreshOnce(ctx, begin, o, p, epoch, i, etag, policy, status)
 	})
 	return ok, finishDBError(finishRefreshAdmission, 0, err)
