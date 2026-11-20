@@ -124,9 +124,10 @@ the whole bucket listing — and a retried page keeps its
 loop and the multipart eligibility and continuation validation are the existing
 `r2.Client` code, reached through a required page function. Every read attempt
 carries an explicit deadline and runs on its own fresh HTTP/1.1 connection with
-keep-alives off and HTTP/2 refused, and no read follows a redirect, so the
-attempt count is the physical request count and a published cooldown never
-finishes with a stray hop. Only timeouts, connection errors, 429, every 5xx
+keep-alives off and HTTP/2 refused, and no read follows a redirect, so an attempt
+never costs an extra hop after a published cooldown and the attempt count is an
+upper bound on physical requests — a callback can fail before its request reaches
+the wire. Only timeouts, connection errors, 429, every 5xx
 (including a proxy's 520-599) and throttling retry; a bare 503 with no
 `Retry-After` retries under the same bounded jitter and publishes the same shared
 minimum cooldown a bare 429 does, on an early or a terminal try alike. When both
@@ -185,8 +186,8 @@ invocations, not a wire count. A failure that never reaches the SDK — a gate t
 is already latched, or a command that ended first — reports the operations it
 actually invoked, so it says `after 0 attempts` and is not a physical request.
 A callback that does run can still fail before its request reaches the wire (a
-refused dial, a failed TLS handshake, a redirect refusal), so the logged count is
-an upper bound on physical requests, never a lower one.
+refused dial, a failed TLS handshake), so the logged count is an upper bound on
+physical requests, never a lower one.
 
 A batch whose only failures held keys continues the job even if it published
 nothing, as when a lock convoy catches every in-flight key at once. Three such
