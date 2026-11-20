@@ -43,7 +43,10 @@ class CollatedDownloadTests(unittest.TestCase):
             api_base="https://stoarama.test/api/v1", api_key="sir_test", origin="https://stoarama.test",
             output_dir=root / "clips", state_dir=root, min_free_bytes=100, dry_run=False, poll_interval_sec=10,
             lock_file=root / "client.lock", runtime_file=root / "runtime.json", validate=lambda: None,
+            current_file=root / "stoarama_pull.py", is_candidate=False,
+            executing_release_sha256=hashlib.sha256(b"fixture release").hexdigest(),
         )
+        self.cfg.current_file.write_bytes(b"fixture release")
         self.body = os.urandom(3 * pull.COLLATED_CHUNK_BYTES + 17)
         self.item = {
             "output_id": 7, "nas_relative_path": REL, "size_bytes": len(self.body),
@@ -375,6 +378,19 @@ class CollatedDownloadTests(unittest.TestCase):
         self.assertFalse(pull.collated_handoff_pending(self.cfg).exists())
         with pull.acquire_lock(self.cfg):
             pass
+
+    def test_handoff_cannot_journal_until_bootstrap_current_slot_matches(self):
+        binding = {"id": 8, "manifest_sha256": "b" * 64, "mount": [1, 2]}
+        self.cfg.is_candidate = True
+        with self.assertRaisesRegex(pull.CollatedDownloadStopped, "current client slot"):
+            pull.persist_collated_handoff(self.cfg, binding)
+        self.assertFalse(pull.collated_handoff_pending(self.cfg).exists())
+
+        self.cfg.is_candidate = False
+        self.cfg.current_file.write_bytes(b"older cached release")
+        with self.assertRaisesRegex(pull.CollatedDownloadStopped, "current client slot"):
+            pull.persist_collated_handoff(self.cfg, binding)
+        self.assertFalse(pull.collated_handoff_pending(self.cfg).exists())
 
     def test_handoff_refuses_unmounted_root(self):
         self.enable_handoff()

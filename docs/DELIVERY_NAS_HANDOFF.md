@@ -71,7 +71,8 @@ The process lock stays held through the API's acceptance. If the response is
 lost, the saved request blocks other client writers until the server confirms
 acceptance, cancellation or supersession, and it checks for a successor
 request before admitting writers. Use the matching client release throughout
-recovery. Pausing the handoff cancels its unanswered final check and lets the
+recovery. Finalization waits until that verified release is installed in
+the NAS bootstrap's current slot. Pausing the handoff cancels its unanswered final check and lets the
 normal client restart.
 
 The controller confirms that the NAS client owns mutations to the approved

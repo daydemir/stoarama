@@ -24402,7 +24402,16 @@ def collated_handoff_binding(check):
     return {"id": check_id, "manifest_sha256": digest, "mount": mount_pin}
 
 
+def require_collated_handoff_release(cfg):
+    # On a network failure the pinned bootstrap executes its cached current
+    # slot. That slot must already contain the release that reads this journal.
+    if (cfg.is_candidate or not cfg.current_file.is_file()
+            or hashlib.sha256(cfg.current_file.read_bytes()).hexdigest() != executing_release_sha256(cfg)):
+        raise CollatedDownloadStopped("NAS handoff final check requires the verified release in the current client slot")
+
+
 def persist_collated_handoff(cfg, binding):
+    require_collated_handoff_release(cfg)
     # The pinned bootstrap rolls back only "running" and "self_update". Mark
     # this drained state durably before a journal could block a predecessor.
     runtime = read_json(cfg.runtime_file, {})
@@ -24553,7 +24562,8 @@ def drain_collated(cfg, runtime, stop_event):
     if not isinstance(page, dict) or set(page) != {"policy", "items", "next_after_id"} or not isinstance(page["items"], list):
         raise RuntimeError("collated response is invalid")
     policy = valid_collated_policy(page["policy"])
-    if policy["handoff_check"]:
+    if policy["handoff_check"] and not cfg.is_candidate:
+        require_collated_handoff_release(cfg)
         runtime.handoff_final_check_requested.set()
         return False
     next_id = page["next_after_id"]
