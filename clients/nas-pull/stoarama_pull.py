@@ -47207,6 +47207,9 @@ STITCH_POLICY = "v85r"
 STITCH_REVISION = "v85r-rebuilt-1"
 STITCH_CORPUS_SHA = "5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b"
 STITCH_MAX_INPUT = 2_500_000_000
+# The already-verified Durham provenance that admits the incremental AAC draft.
+# No current production profile emits it, so the draft stays unreachable.
+STITCH_AUDIO_PROOF = "aac-lc-primed-pcm-v1"
 # Today's values, kept as the defaults of the two operator overrides below. Both
 # the pre-lease gate and the 5s mid-job refresh read them through these
 # functions, so a hosted worker with different headroom can be admitted without
@@ -48777,6 +48780,79 @@ def stitch_checkpoint(cfg, task):
         raise StitchHold("stitch paused by cleanup source freeze or inactive lease/scope")
 
 
+def stitch_cancel(stop):
+    """Adapt a stitch stop object to the empty-method cancel shape verifiers use.
+
+    ``StitchStop`` carries a latch reason and a monitor, not an ``Event.wait``;
+    the delivery proof only needs ``is_set`` plus a bounded ``wait`` that also
+    observes that same latch.
+    """
+    class Cancel:
+        def is_set(self):
+            return stop.is_set()
+
+        def wait(self, timeout):
+            limit = time.monotonic() + max(timeout, 0)
+            while True:
+                if self.is_set():
+                    return True
+                remaining = limit - time.monotonic()
+                if remaining <= 0:
+                    return False
+                time.sleep(min(0.01, remaining))
+
+    return Cancel()
+
+
+def stitch_aac_layout(ffprobe, clip, stop_event, deadline):
+    """Header-only track classification through the delivery verifier.
+
+    Only per-track configuration and time bases are kept: no packet inventory
+    is read or retained for this decision. A cancel or deadline surfaces as the
+    build-level ``StitchHold``; unsupported content stays a distinct error.
+    """
+    import delivery_coverage as coverage
+    expected = {"size_bytes": clip["size_bytes"], "sha256": clip["sha256"]}
+    run = coverage.Run(stitch_cancel(stop_event), deadline)
+    try:
+        with ExitStack() as stack:
+            item = (coverage.Input(stack, expected=expected, run=run, descriptor=clip["_fd"])
+                    if "_fd" in clip else coverage.Input(stack, clip["_path"], expected, run=run))
+            return {kind: dict(config=track.config, time_base=track.time_base)
+                    for kind, track in coverage.probe_headers(ffprobe, item).items()}
+    except coverage.ProofStopped as error:
+        # A real cancel or deadline is a timed-out/cancelled build, never an
+        # unsupported-content verdict.
+        stitch_check(stop_event)
+        raise StitchHold(str(error)) from error
+
+
+def stitch_aac_audio_proof(row):
+    """Per-input AAC proof: exact packet, PCM and primer facts."""
+    return dict(packets=row["packet_count"], packet_chain_sha256=row["packet_chain_sha256"],
+                sample_rate=row["sample_rate"], sample_count=row["sample_count"],
+                pcm_chain_sha256=row["pcm_chain_sha256"], rule=row["rule"],
+                primer_packets=row["seam_primer_packets"])
+
+
+def stitch_aac_seams(ffmpeg, output, offsets, deadline, stop):
+    """Independent strict decodes at the verified cumulative mux offsets.
+
+    The video seam keeps the original unassisted decode. The AAC seam forces
+    the exact integer decoder as an *input* option, so ``-c:a aac_fixed``
+    precedes ``-i``; the output stays the null muxer with an explicit map.
+    """
+    offset = Fraction(0)
+    for wait in offsets[:-1]:
+        offset += Fraction(wait, 1000000)
+        start = "%.6f" % max(0, float(offset) - 2)
+        for decoder, maps in (([], ["-map", "0:v:0"]),
+                              (["-c:a", "aac_fixed"], ["-map", "0:a:0"])):
+            stitch_run([ffmpeg, "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode",
+                        "-threads", "1", "-ss", start, *decoder, "-i", str(output),
+                        "-t", "4", *maps, "-f", "null", "-"], deadline, stop)
+
+
 def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=StitchRunKind.PRODUCTION, proof_stop=None):
     """Read sources, write only the separate versioned sibling directory.
 
@@ -48903,36 +48979,77 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
         if kind is StitchRunKind.PROOF and (len(result["seams"]) != 1 or result["seams"][0].get("decision") != "join"):
             raise StitchHold("proof current-policy seam is not a real join")
         sources, run_clips, run_index = [], [], 0
+        # The incremental AAC draft is admitted only for a Durham R2 task whose
+        # already-verified provenance names the primed-PCM rule. Everything
+        # else, including every current production profile, keeps the original
+        # audio-absent audit byte for byte.
+        aac_mode = (kind is StitchRunKind.DURHAM_R2
+                    and isinstance(provenance, dict)
+                    and provenance.get("audio_proof") == STITCH_AUDIO_PROOF)
 
         def flush():
             nonlocal sources, run_clips, run_index
-            if not sources:
+            if not run_clips:
                 return
             stitch_check(stop)
+            aac = run_clips[0]["_aac"]
             manifest, output = work / "concat.txt", work / "run.partial.mp4"
-            lines, cumulative, previous = [], Fraction(0), 0
-            for clip, source in zip(run_clips, sources):
-                cumulative += source["span"]
-                us = round(cumulative * 1000000)
-                lines.extend([concat_manifest_line(clip["_path"]), "duration %d.%06d\n" % divmod(us - previous, 1000000)])
-                previous = us
-            manifest.write_text("ffconcat version 1.0\n" + "".join(lines))
-            stitch_run([ffmpeg, "-nostdin", "-v", "error", "-xerror", "-protocol_whitelist", MEDIA_CERTIFICATION_PROTOCOLS,
-                        "-f", "concat", "-auto_convert", "0", "-safe", "0", "-i", str(manifest),
-                        "-map", "0:v:0", "-an", "-c:v", "copy", "-threads", "1", "-video_track_timescale",
-                        str(Fraction(sources[0]["signature"][5]).denominator), "-movflags", "+faststart", "-y", str(output)], deadline, stop)
-            stitch_audit_output(ffmpeg, ffprobe, output, sources, work, deadline, stop)
-            size, sha = stitch_proof_digest(output, stop) if kind is StitchRunKind.PROOF else sha256_file(output)
+            if aac:
+                import durham_aac
+                # Only Linux has the retained-parent-fd directory; the portable
+                # fixture publishes at the plain private scratch path instead.
+                pinned = sys.platform.startswith("linux")
+                try:
+                    built = durham_aac.concat_aac(
+                        [dict(size_bytes=clip["size_bytes"], sha256=clip["sha256"], **clip["_input"])
+                         for clip in run_clips], output.name if pinned else output, tools,
+                        cancel=stitch_cancel(stop), deadline=deadline,
+                        directory=descriptor if pinned else None)
+                except Exception as exc:
+                    # A real cancel or deadline is the hold; anything else is an
+                    # unsupported or unproven AAC run that must abort the task.
+                    stitch_check(stop)
+                    raise StitchHold("Durham AAC run is not proven: %s" % exc) from exc
+                size, sha = built["output"]["size_bytes"], built["output"]["sha256"]
+                # The verified cumulative mux offsets are the only seam anchors.
+                offsets = [row["concat_microseconds"] for row in built["inputs"]]
+                stitch_aac_seams(ffmpeg, output, offsets, deadline, stop)
+                cumulative = Fraction(sum(offsets), 1000000)
+            else:
+                lines, cumulative, previous = [], Fraction(0), 0
+                for clip, source in zip(run_clips, sources):
+                    cumulative += source["span"]
+                    us = round(cumulative * 1000000)
+                    lines.extend([concat_manifest_line(clip["_path"]), "duration %d.%06d\n" % divmod(us - previous, 1000000)])
+                    previous = us
+                manifest.write_text("ffconcat version 1.0\n" + "".join(lines))
+                stitch_run([ffmpeg, "-nostdin", "-v", "error", "-xerror", "-protocol_whitelist", MEDIA_CERTIFICATION_PROTOCOLS,
+                            "-f", "concat", "-auto_convert", "0", "-safe", "0", "-i", str(manifest),
+                            "-map", "0:v:0", "-an", "-c:v", "copy", "-threads", "1", "-video_track_timescale",
+                            str(Fraction(sources[0]["signature"][5]).denominator), "-movflags", "+faststart", "-y", str(output)], deadline, stop)
+                stitch_audit_output(ffmpeg, ffprobe, output, sources, work, deadline, stop)
+                size, sha = stitch_proof_digest(output, stop) if kind is StitchRunKind.PROOF else sha256_file(output)
             name = "proof.mp4" if kind is StitchRunKind.PROOF else "run-%03d-%s.mp4" % (run_index, sha)
             relative = plan["output_folder"] + "/" + name
             proof = dict(policy=STITCH_POLICY, provenance=provenance, relative_path=relative, sha256=sha, size_bytes=size, inputs=[], full_decode=True,
-                         seam_decode=True, packet_chain=True, native_audit=True, original_sources_no_audio=True,
+                         seam_decode=True, packet_chain=True, native_audit=True, original_sources_no_audio=not aac,
                          readback_sha256=sha, fsynced=True)
-            for clip, source in zip(run_clips, sources):
+            for index, clip in enumerate(run_clips):
+                if aac:
+                    # The existing video fields keep their meaning and now come
+                    # from the same exact per-input proof as the audio fields.
+                    video = built["inputs"][index]["tracks"]["video"]
+                    packet_chain_sha256, packets, frames = (video["packet_chain_sha256"],
+                                                            video["packet_count"], video["frame_count"])
+                else:
+                    packet_chain_sha256, packets, frames = (sources[index]["chain"],
+                                                            sources[index]["count"], sources[index]["count"])
                 evidence = dict(clip_id=clip["source_id"], sha256=clip["sha256"], size_bytes=clip["size_bytes"],
-                                packet_chain_sha256=source["chain"], packets=source["count"], frames=source["count"],
+                                packet_chain_sha256=packet_chain_sha256, packets=packets, frames=frames,
                                 repaired=False,
                                 retirement_held=kind is not StitchRunKind.PROOF or clip["source_id"] in held)
+                if aac:
+                    evidence["audio_proof"] = stitch_aac_audio_proof(built["inputs"][index]["tracks"]["audio"])
                 # Durham attests the verified bytes in private local scratch.
                 # Connection 13 supplies NAS custody separately after pulling.
                 if kind is StitchRunKind.DURHAM_R2:
@@ -48969,6 +49086,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
             if a < start or b > end or b <= a:
                 raise StitchTaskFailure("source crosses keep boundary")
             path, info, _ = stitch_hash(cfg, clip["relative_path"], clip["size_bytes"], clip["sha256"], stop)
+            fd = None
             if sys.platform.startswith("linux"):
                 fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
                 resources.callback(os.close, fd)
@@ -48978,7 +49096,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
             if kind is not StitchRunKind.DURHAM_R2:
                 _, scinfo = confined_regular_file(cfg.output_dir, clip["relative_path"] + ".stoarama.json")
                 clip.update(frozen_identity=cleanup_identity(info), frozen_sidecar_identity=cleanup_identity(scinfo))
-            clip["_path"] = path
+            clip.update(_path=path, _aac=False)
             if not plan["eligible"][index] or (admitted is not None and not admitted(clip)):
                 if kind is StitchRunKind.PROOF:
                     raise StitchHold("proof source is ineligible")
@@ -48988,22 +49106,51 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                     result["repairs"].append(repaired)
                 result["left_out"].append(clip["source_id"])
                 continue
-            try:
+            header = None
+            if aac_mode:
+                # Header-only classification through the delivery verifier's
+                # own track validation; no packet inventory is retained here.
                 with stitch_measure_stage(stop, StitchMeasureStage.BUILD,
                         StitchMeasureInput.LEFT if index == 0 else StitchMeasureInput.RIGHT):
-                    source = stitch_audit_source(ffmpeg, ffprobe, path, work, index, deadline, stop)
-            except StitchHold as exc:
-                if kind is StitchRunKind.PROOF or stop.is_set():
-                    raise
-                flush()
-                repaired = stitch_repair_local(clip, directory, stage_file, tools, deadline, stop)
-                if repaired:
-                    result["repairs"].append(repaired)
-                result["left_out"].append(clip["source_id"])
-                log("WARN", "V85r source retained clip=%s: %s" % (clip["source_id"], exc))
-                continue
-            if sources and (not result["seams"][index-1].get("join")
-                            or sources[-1]["signature"] != source["signature"]):
+                    try:
+                        header = stitch_aac_layout(ffprobe, dict(clip, _fd=fd) if fd is not None else clip,
+                                                   stop, deadline)
+                    except StitchHold:
+                        raise
+                    except (OSError, ValueError, KeyError) as exc:
+                        stitch_check(stop)
+                        # Unsupported or unproven content aborts the draft task
+                        # rather than being silently dropped from the run.
+                        raise StitchHold("Durham AAC source layout is unsupported: %s" % exc) from exc
+            if header is not None and "audio" in header:
+                # A positively verified two-track input: identical exact track
+                # configuration and time bases join into one AAC run.
+                clip["_aac"] = True
+                clip["_input"] = {"descriptor": fd} if fd is not None else {"path": path}
+                clip["_group"] = ("aac",) + tuple(
+                    (name, tuple(sorted(header[name]["config"].items())), header[name]["time_base"])
+                    for name in ("video", "audio"))
+                source = None
+            else:
+                try:
+                    with stitch_measure_stage(stop, StitchMeasureStage.BUILD,
+                            StitchMeasureInput.LEFT if index == 0 else StitchMeasureInput.RIGHT):
+                        source = stitch_audit_source(ffmpeg, ffprobe, path, work, index, deadline, stop)
+                except StitchHold as exc:
+                    if kind is StitchRunKind.PROOF or stop.is_set():
+                        raise
+                    flush()
+                    repaired = stitch_repair_local(clip, directory, stage_file, tools, deadline, stop)
+                    if repaired:
+                        result["repairs"].append(repaired)
+                    result["left_out"].append(clip["source_id"])
+                    log("WARN", "V85r source retained clip=%s: %s" % (clip["source_id"], exc))
+                    continue
+                clip["_group"] = ("video", source["signature"])
+            if run_clips and (not result["seams"][index-1].get("join")
+                              or run_clips[-1]["_group"] != clip["_group"]):
+                # A split seam, or any change between audio and video-only,
+                # ends the current run.
                 flush()
             sources.append(source)
             run_clips.append(clip)

@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -122,6 +123,32 @@ class AacConcatTest(unittest.TestCase):
         self.assertEqual(offsets, [0, 0])
         self.assertEqual(result["inputs"][1]["tracks"]["audio"]["rule"], "seam_primed")
         self.assertEqual(identity(output), result["output"])
+
+    def test_pinned_directory_publish_uses_the_retained_parent_descriptor(self):
+        # The child cannot see the parent's /proc/self/fd entry; only the Linux
+        # /proc/<parent>/fd form is traversable from a spawned tool. A pinned
+        # descriptor names the directory inode, not the name it was opened
+        # under, so renaming it and putting a fresh empty directory at the old
+        # name separates the two: a path-based publish would fill the fresh
+        # directory while the retained inode stays empty.
+        if not sys.platform.startswith("linux"):
+            self.skipTest("pinned parent directory descriptors are Linux-only")
+        pinned, retained = self.root / "pinned", self.root / "retained"
+        pinned.mkdir()
+        directory = os.open(pinned, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            pinned.rename(retained)
+            pinned.mkdir()
+            # The inputs stay outside the pinned directory.
+            result = aac.concat_aac(self.sources("one.mp4", "two.mp4"), "published.mp4",
+                                    self.tools, directory=directory)
+            self.assertEqual(list(pinned.iterdir()), [])
+        finally:
+            os.close(directory)
+        output = retained / "published.mp4"
+        self.assertEqual(identity(output), result["output"])
+        self.assertEqual([path.name for path in retained.iterdir()
+                          if path.name.startswith(".durham-aac-")], [])
 
     def test_bad_input_identity_leaves_no_output(self):
         output = self.root / "bad-identity.mp4"

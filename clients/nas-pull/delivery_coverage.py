@@ -283,11 +283,15 @@ def read_packet_rows(ffprobe, source):
             yield fields
 
 
-def read_tracks(ffprobe, source):
-    data = probe(ffprobe, source, "-ignore_editlist", "1", "-show_streams", "-show_data_hash", "sha256")
+def track_headers(streams):
+    """Validate one stream probe and return its clocked tracks and index.
+
+    This is the single track-layout validation used by the full packet proof
+    and by header-only classification, which keeps no packet inventory.
+    """
     tracks = {}
     by_index = {}
-    for stream in data["streams"]:
+    for stream in streams:
         kind = stream["codec_type"]
         require(kind in ("video", "audio") and kind not in tracks, "unsupported track layout")
         require(not stream.get("side_data_list")
@@ -315,6 +319,12 @@ def read_tracks(ffprobe, source):
         require(index not in by_index, "duplicate stream index")
         by_index[index] = track
     require("video" in tracks, "input has no video track")
+    return tracks, by_index
+
+
+def read_tracks(ffprobe, source):
+    data = probe(ffprobe, source, "-ignore_editlist", "1", "-show_streams", "-show_data_hash", "sha256")
+    tracks, by_index = track_headers(data["streams"])
     for row in read_packet_rows(ffprobe, source):
         source.run.check()
         track = by_index[int(row["stream_index"])]
@@ -325,6 +335,13 @@ def read_tracks(ffprobe, source):
         track.positions[packet.position] = len(track.packets)
         track.packets.append(packet)
     require(all(track.packets for track in tracks.values()), "track has no packets")
+    return tracks
+
+
+def probe_headers(ffprobe, source):
+    """Header-only readback for classification: no packet inventory is kept."""
+    data = probe(ffprobe, source, "-ignore_editlist", "1", "-show_streams", "-show_data_hash", "sha256")
+    tracks, _ = track_headers(data["streams"])
     return tracks
 
 

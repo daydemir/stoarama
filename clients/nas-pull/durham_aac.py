@@ -11,6 +11,8 @@ object and absolute monotonic deadline. Wiring and admission stay elsewhere.
 """
 import math
 import os
+import stat
+import sys
 import tempfile
 from collections import namedtuple
 from contextlib import ExitStack
@@ -186,14 +188,16 @@ def publish(staged, output, attempt):
             "published output is not the staged inode")
 
 
-def concat_aac(inputs, output, tools, *, cancel=None, deadline=None):
+def concat_aac(inputs, output, tools, *, cancel=None, deadline=None, directory=None):
     """Build and prove one ordered AAC concat into ``output``.
 
     ``inputs`` is an ordered sequence of ``{"path": ...}`` or
     ``{"descriptor": ...}`` entries, each with the exact ``size_bytes`` and
-    ``sha256`` identity. ``output`` is the private scratch path to publish.
-    Returns the exact output identity and the vetted per-input facts. A failed
-    proof or unsupported input raises and leaves no requested output.
+    ``sha256`` identity. ``output`` is the private scratch path to publish, or
+    just its name when the caller already pins the private directory as the
+    ``directory`` descriptor. Returns the exact output identity and the vetted
+    per-input facts. A failed proof or unsupported input raises and leaves no
+    requested output.
     """
     run = coverage.Run(cancel, deadline)
     tools = dict(tools or {})
@@ -202,9 +206,25 @@ def concat_aac(inputs, output, tools, *, cancel=None, deadline=None):
     require(1 <= len(inputs) <= MAX_INPUTS, "between 1 and 200 inputs are supported")
     require(sum(item["size_bytes"] for item in inputs) <= pull.STITCH_MAX_INPUT,
             "inputs exceed the stitch byte limit")
-    output = Path(output)
-    require(output.parent.is_dir() and not output.parent.is_symlink() and not output.is_symlink(),
-            "output parent must be a real private directory")
+    if directory is not None:
+        # Mirror StitchDirectory.path: name the *parent's* retained directory
+        # descriptor so the child opens that pinned fd through the parent's
+        # proc entry. The child's own /proc/self/fd/N is not the parent's fd,
+        # and /dev/fd is not a traversable directory on macOS, so this form is
+        # Linux-only and the portable fixture passes a plain path instead.
+        require(sys.platform.startswith("linux"),
+                "pinned directory output is only available on Linux")
+        require(isinstance(directory, int) and not isinstance(directory, bool) and directory >= 0
+                and stat.S_ISDIR(os.fstat(directory).st_mode),
+                "output parent must be a real private directory")
+        name = Path(output)
+        require(len(name.parts) == 1 and name.name not in ("", ".", ".."),
+                "output must be a single name inside the pinned directory")
+        output = Path("/proc/%d/fd/%d" % (os.getpid(), directory)) / name.name
+    else:
+        output = Path(output)
+        require(output.parent.is_dir() and not output.parent.is_symlink() and not output.is_symlink(),
+                "output parent must be a real private directory")
     # One attempt record for the single cleanup path: it is empty until this
     # call links, so nothing before the link can ever remove a file.
     attempt = {"fd": None, "owned": None}
@@ -274,8 +294,10 @@ def concat_aac(inputs, output, tools, *, cancel=None, deadline=None):
                 require(pull.stitch_proof_digest(output, run) == (size, sha),
                         "published output identity differs")
                 run.check()
-                os.close(attempt["fd"])
-                attempt["fd"] = None
+                # The staged descriptor stays open until the outer finally:
+                # temporary-directory and ExitStack cleanup can still fail
+                # after the return value is evaluated, and that failure must
+                # still be able to release the exact inode it linked.
                 return result
     except BaseException as error:
         # The single cleanup path for every failure, normalized or not: a
