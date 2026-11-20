@@ -76,6 +76,7 @@ JOIN recording_collation_outputs o ON o.id=e.output_id AND o.collation_hour_id=e
 JOIN recording_collation_hours h ON h.id=e.collation_hour_id AND h.recording_id=selected.recording_id
  AND h.generation=2 AND h.status='collated' AND h.manifest_object_key=e.manifest_object_key
  AND h.manifest_sha256=e.manifest_sha256 AND h.hour_id=e.hour_id AND h.batch_id=e.batch_id
+JOIN recordings rec ON rec.id=h.recording_id AND rec.account_id=47
 JOIN recording_clips c ON c.id=p.clip_id AND c.recording_id=h.recording_id AND c.bucket=p.bucket
  AND c.object_key=p.object_key AND c.etag=p.etag AND c.sha256=p.sha256 AND c.size_bytes=p.size_bytes
  AND c.display_path=p.display_path AND c.clip_start_at=p.start_at AND c.clip_end_at=p.end_at
@@ -92,13 +93,13 @@ WHERE p.proven
   SELECT 1 FROM r2_object_retirements retired
   WHERE ((retired.kind='collated' AND retired.source_id=o.id)
       OR (retired.bucket=selected.bucket AND retired.object_key=selected.object_key))
-    AND ROW(retired.kind,retired.source_id,retired.bucket,retired.object_key,retired.sha256,retired.size_bytes)
-     IS DISTINCT FROM ROW('collated'::text,o.id,selected.bucket,selected.object_key,selected.sha256,selected.size_bytes)
+    AND ROW(retired.kind,retired.source_id,retired.stream_id,retired.bucket,retired.object_key,retired.sha256,retired.size_bytes)
+     IS DISTINCT FROM ROW('collated'::text,o.id,rec.stream_id,selected.bucket,selected.object_key,selected.sha256,selected.size_bytes)
  )
  AND NOT EXISTS (
   SELECT 1 FROM r2_object_retirements retired
   WHERE ((retired.kind='raw' AND retired.source_id=p.clip_id)
       OR (retired.bucket=p.bucket AND retired.object_key=p.object_key))
-    AND ROW(retired.kind,retired.source_id,retired.bucket,retired.object_key,retired.sha256,retired.size_bytes)
-     IS DISTINCT FROM ROW('raw'::text,p.clip_id,p.bucket,p.object_key,p.sha256,p.size_bytes)
+    AND ROW(retired.kind,retired.source_id,retired.stream_id,retired.bucket,retired.object_key,retired.sha256,retired.size_bytes)
+     IS DISTINCT FROM ROW('raw'::text,p.clip_id,rec.stream_id,p.bucket,p.object_key,p.sha256,p.size_bytes)
  );

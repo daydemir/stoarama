@@ -26,7 +26,7 @@ func TestDeliverySourceCoverageRequiresLatestProofAndExactNASReadback(t *testing
 	}
 	execSQL(`
  CREATE TABLE connections(id bigint PRIMARY KEY,account_id bigint,kind text);
- CREATE TABLE recordings(id bigint PRIMARY KEY,account_id bigint);
+ CREATE TABLE recordings(id bigint PRIMARY KEY,account_id bigint,stream_id bigint);
  CREATE TABLE recording_collation_hours(id bigint PRIMARY KEY,recording_id bigint,generation int,status text,
    manifest_object_key text,manifest_sha256 text,hour_id text,batch_id text);
  CREATE TABLE recording_collation_outputs(id bigint PRIMARY KEY,collation_hour_id bigint,part int,parts int,object_key text,
@@ -35,9 +35,9 @@ func TestDeliverySourceCoverageRequiresLatestProofAndExactNASReadback(t *testing
  CREATE TABLE recording_collation_output_acks(output_id bigint,connection_id bigint,nas_relative_path text,size_bytes bigint,sha256 text);
  CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint,bucket text,object_key text,etag text,
    sha256 text,size_bytes bigint,display_path text,clip_start_at timestamptz,clip_end_at timestamptz);
- CREATE TABLE r2_object_retirements(kind text,source_id bigint,bucket text,object_key text,sha256 text,size_bytes bigint);
+ CREATE TABLE r2_object_retirements(kind text,source_id bigint,stream_id bigint,bucket text,object_key text,sha256 text,size_bytes bigint);
  INSERT INTO connections VALUES(13,47,'nas_pull');
- INSERT INTO recordings VALUES(2,47);
+ INSERT INTO recordings VALUES(2,47,123);
  INSERT INTO recording_collation_hours VALUES(3,2,2,'collated','manifest.json',repeat('b',64),'fixture-hour','fixture-batch');
  INSERT INTO recording_collation_outputs VALUES(4,3,1,1,'joined/goodplus-test/objects/demo.mp4',
    'f/July/26-Sunday/f_hour_01_000000-005900.mp4',repeat('c',64),100,ARRAY[5],'2026-08-05T00:00Z','2026-08-05T00:01Z');
@@ -169,7 +169,7 @@ func TestDeliverySourceCoverageRequiresLatestProofAndExactNASReadback(t *testing
 	execSQL("DELETE FROM recording_collation_outputs WHERE id=6")
 	want(1)
 	execSQL(`INSERT INTO r2_object_retirements
-	 SELECT 'collated',4,bucket,object_key,sha256,size_bytes FROM delivery_nas_handoff_outputs WHERE output_id=4`)
+	 SELECT 'collated',4,123,bucket,object_key,sha256,size_bytes FROM delivery_nas_handoff_outputs WHERE output_id=4`)
 	want(1)
 	execSQL("UPDATE r2_object_retirements SET size_bytes=99")
 	want(0)
@@ -180,9 +180,11 @@ func TestDeliverySourceCoverageRequiresLatestProofAndExactNASReadback(t *testing
 	execSQL("DELETE FROM r2_object_retirements")
 	want(1)
 	execSQL(`INSERT INTO r2_object_retirements
-	 SELECT 'raw',id,bucket,object_key,sha256,size_bytes FROM recording_clips WHERE id=5`)
+	 SELECT 'raw',id,123,bucket,object_key,sha256,size_bytes FROM recording_clips WHERE id=5`)
 	want(1)
-	execSQL("UPDATE r2_object_retirements SET size_bytes=87")
+	execSQL("UPDATE r2_object_retirements SET stream_id=124")
+	want(0)
+	execSQL("UPDATE r2_object_retirements SET stream_id=123,size_bytes=87")
 	want(0)
 	execSQL("UPDATE r2_object_retirements SET size_bytes=88,source_id=6")
 	want(0)
