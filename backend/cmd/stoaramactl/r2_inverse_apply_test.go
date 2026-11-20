@@ -46,6 +46,8 @@ type inverseFakeStore struct {
 	onDelete, onAnswered func(string)
 	beforeHead           func(context.Context, string) error
 	beforeDelete         func(string) error
+	// headWithoutSHA omits the optional SHA-256 metadata from loopback HEADs.
+	headWithoutSHA bool
 }
 
 func (s *inverseFakeStore) setLost(lost bool)      { s.mu.Lock(); defer s.mu.Unlock(); s.lost = lost }
@@ -1646,7 +1648,9 @@ func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*inverseSDKStor
 			w.Header().Set("ETag", `"`+o.ETag+`"`)
 			w.Header().Set("Content-Length", strconv.FormatInt(o.SizeBytes, 10))
 			w.Header().Set("Last-Modified", o.LastModified.Format(http.TimeFormat))
-			w.Header().Set("x-amz-meta-sha256", strings.Repeat("b", 64))
+			if !store.headWithoutSHA {
+				w.Header().Set("x-amz-meta-sha256", strings.Repeat("b", 64))
+			}
 			w.WriteHeader(200)
 		default:
 			w.WriteHeader(400)
@@ -1789,9 +1793,10 @@ func TestR2InverseJobReadbackComparesHeldKeys(t *testing.T) {
 // Job totals sum every batch's counts; held keys are the latest snapshot.
 func TestR2InverseJobTotalsAddBatches(t *testing.T) {
 	total := inverseApplySummary{}
-	total.addBatch(inverseApplySummary{Selected: 3, Deleted: 2, Bytes: 200, CustodyShort: r2RetireStat{Objects: 1, Bytes: 100}, WireAmbiguous: []string{"managed/a"}})
-	total.addBatch(inverseApplySummary{Selected: 1, Deleted: 1, Bytes: 100, AmbiguousHeld: 1, HeldAbsent: []string{"managed/a"}})
-	if total.Selected != 4 || total.Deleted != 3 || total.Bytes != 300 || total.CustodyShort != (r2RetireStat{Objects: 1, Bytes: 100}) || !slices.Equal(total.WireAmbiguous, []string{"managed/a"}) || total.AmbiguousHeld != 1 || !slices.Equal(total.HeldAbsent, []string{"managed/a"}) {
+	total.addBatch(inverseApplySummary{Selected: 3, Deleted: 2, Bytes: 200, CustodyShort: r2RetireStat{Objects: 1, Bytes: 100}, WireAmbiguous: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}})
+	total.addBatch(inverseApplySummary{Selected: 1, Deleted: 1, Bytes: 100, AmbiguousHeld: 1, HeldAbsent: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}})
+	// last_modified_held comes from the partition every batch rereads: a snapshot.
+	if total.Selected != 4 || total.Deleted != 3 || total.Bytes != 300 || total.CustodyShort != (r2RetireStat{Objects: 1, Bytes: 100}) || total.LastModifiedHeld != (r2RetireStat{Objects: 2, Bytes: 200}) || !slices.Equal(total.WireAmbiguous, []string{"managed/a"}) || total.AmbiguousHeld != 1 || !slices.Equal(total.HeldAbsent, []string{"managed/a"}) {
 		t.Fatalf("job totals: %+v", total)
 	}
 }

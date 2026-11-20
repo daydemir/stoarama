@@ -44,11 +44,15 @@ type keep28Custody struct {
 	VerifiedAt, ReceivedAt, Expiry            time.Time
 }
 
-// keep28Sidecar is the sidecar proof selection observed for a key. Reserve
-// requires the locked custody to carry the very same one.
-type keep28Sidecar struct {
-	SHA  string
-	Size int64
+// keep28Identity is the source and custody identity selection observed for a
+// key. Reserve requires the locked custody to carry the very same one.
+type keep28Identity struct {
+	SourceID, SizeBytes, SidecarSize int64
+	Path, SHA, SidecarSHA            string
+}
+
+func (c keep28Custody) identity() keep28Identity {
+	return keep28Identity{SourceID: c.SourceID, SizeBytes: c.SizeBytes, SidecarSize: c.SidecarSize, Path: c.Path, SHA: c.SHA, SidecarSHA: c.SidecarSHA}
 }
 
 // lockKeep28Custody locks and reads the exact custody proof. An aged proof is
@@ -78,14 +82,19 @@ func (a *inverseApplier) lockKeep28Custody(ctx context.Context, tx pgx.Tx, t inv
 // A shorter key would only be skipped, so it takes no item or byte allowance.
 const keep28AdmissionCustody = keep28CustodyMargin + inverseNetworkTimeout
 
-// Selection trails fresh custody in verified_at order. A report is never wire
-// authority; every identity and proof is subsequently reloaded under locks.
+// Selection trails fresh custody in verified_at order. The join admits only
+// exact, complete evidence, the predicates the custody lock enforces, so a
+// legacy row without sidecar evidence is simply ineligible. A report is never
+// wire authority; every identity and proof is subsequently reloaded under locks,
+// and reserve requires the identity observed here.
 func (a *inverseApplier) selectKeep28(ctx context.Context, entries map[string]inverseEntry) ([]inverseEntry, error) {
-	rows, err := a.pool.Query(ctx, `SELECT c.object_key,n.sidecar_sha256,n.sidecar_size_bytes`+r2RetireRawExactSQL+`
+	rows, err := a.pool.Query(ctx, `SELECT c.object_key,c.id,c.size_bytes,c.display_path,lower(c.sha256),n.sidecar_size_bytes,n.sidecar_sha256
  FROM recording_clips c JOIN nas_inventory_files n ON n.connection_id=$2 AND n.clip_id=c.id
  JOIN recordings r ON r.id=c.recording_id
  WHERE c.bucket=$1 AND c.purged_at IS NULL AND r.account_id=47
- AND n.state='present'
+ AND n.state='present' AND n.relative_path=c.display_path AND n.sha256=lower(c.sha256) AND n.size_bytes=c.size_bytes
+ AND n.verified_at<=clock_timestamp()+interval '5 minutes'
+ AND n.sidecar_relative_path=c.display_path||'.stoarama.json' AND n.sidecar_size_bytes>0 AND n.sidecar_sha256 ~ '^[a-f0-9]{64}$'
  AND LEAST(n.verified_at,n.server_received_at)>clock_timestamp()-interval '24 hours'+make_interval(secs=>$3)
  ORDER BY n.verified_at,c.id`, a.store.Bucket(), int64(13), keep28AdmissionCustody.Seconds())
 	if err != nil {
@@ -95,15 +104,14 @@ func (a *inverseApplier) selectKeep28(ctx context.Context, entries map[string]in
 	jobs := []inverseEntry{}
 	var bytes int64
 	for rows.Next() {
-		var key, path string
-		var sidecar keep28Sidecar
-		var exact bool
-		if err = rows.Scan(&key, &sidecar.SHA, &sidecar.Size, &exact, &path); err != nil {
+		var key string
+		var id keep28Identity
+		if err = rows.Scan(&key, &id.SourceID, &id.SizeBytes, &id.Path, &id.SHA, &id.SidecarSize, &id.SidecarSHA); err != nil {
 			return nil, err
 		}
 		e, ok := entries[key]
-		e.Sidecar = sidecar
-		if !ok || !exact || e.SizeBytes <= 0 {
+		e.Selected = id
+		if !ok || e.SizeBytes <= 0 {
 			continue
 		}
 		if e.SizeBytes > a.opts.MaxBytes-bytes {

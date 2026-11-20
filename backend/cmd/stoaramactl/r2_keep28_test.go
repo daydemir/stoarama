@@ -376,7 +376,8 @@ func (f keep28Fixture) entry(t *testing.T) inverseEntry {
 	f.store.mu.Lock()
 	e := inverseEntry{ObjectInfo: f.store.objects[f.key], Class: inverseKeep28}
 	f.store.mu.Unlock()
-	if err := f.pool.QueryRow(f.ctx, `SELECT sidecar_sha256,sidecar_size_bytes FROM nas_inventory_files WHERE clip_id=9000001`).Scan(&e.Sidecar.SHA, &e.Sidecar.Size); err != nil {
+	id := &e.Selected
+	if err := f.pool.QueryRow(f.ctx, `SELECT c.id,c.size_bytes,c.display_path,lower(c.sha256),n.sidecar_size_bytes,n.sidecar_sha256 FROM recording_clips c JOIN nas_inventory_files n ON n.clip_id=c.id WHERE c.object_key=$1`, f.key).Scan(&id.SourceID, &id.SizeBytes, &id.Path, &id.SHA, &id.SidecarSize, &id.SidecarSHA); err != nil {
 		t.Fatal(err)
 	}
 	return e
@@ -743,9 +744,10 @@ func TestKeep28AgedCustodyIsSkippedChangedIdentityIsNot(t *testing.T) {
 }
 
 // While one key's DELETE is on the wire, a queued key's custody ages out: that
-// key is skipped and the batch finishes. If its sidecar or identity changes
-// instead, even to another valid digest and even with aged custody, the batch
-// halts before that key's DELETE and nothing counts as custody_short.
+// key is skipped and the batch finishes. If its source or custody identity
+// changes instead (another clip under the key, a new media SHA, a new sidecar
+// path or digest), even with aged custody, the batch halts before that key's
+// DELETE and nothing counts as custody_short.
 func TestKeep28QueuedKeyCustodyOutcome(t *testing.T) {
 	for change, sql := range map[string]string{
 		"aged":     `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '24 hours 1 second' WHERE clip_id=9000001`,
@@ -754,30 +756,89 @@ func TestKeep28QueuedKeyCustodyOutcome(t *testing.T) {
 		// Another valid digest: the sidecar selection observed was replaced.
 		"sidecar_digest":      `UPDATE nas_inventory_files SET sidecar_sha256=repeat('d',64) WHERE clip_id=9000001`,
 		"sidecar_digest_aged": `UPDATE nas_inventory_files SET sidecar_sha256=repeat('d',64),verified_at=clock_timestamp()-interval '24 hours 1 second' WHERE clip_id=9000001`,
+		// The key now names clip 3: same size, ETag and digests, its own valid custody.
+		"reassigned_clip": `UPDATE recording_clips SET object_key='managed/acct-47/keep28/moved.mp4' WHERE id=9000001; UPDATE recording_clips SET object_key='managed/acct-47/keep28/1.mp4' WHERE id=9000003`,
+		// The same clip's media SHA changes in catalog and inventory alike.
+		"media_sha": `UPDATE recording_clips SET sha256=repeat('e',64) WHERE id=9000001; UPDATE nas_inventory_files SET sha256=repeat('e',64) WHERE clip_id=9000001`,
 	} {
 		t.Run(change, func(t *testing.T) {
 			// Selection order: the older key 2 first, then key 1 waits queued.
-			f := newKeep28FixtureCount(t, 2)
+			// Clip 3 is outside the partition. HEAD carries no SHA metadata, so
+			// only the identity selection observed can catch a changed source.
+			f := newKeep28FixtureCount(t, 3)
 			f.writeManifest(t, 2)
-			var hookErr atomic.Value
+			f.store.headWithoutSHA = true
+			// The change waits for the epoch row behind key 2's network
+			// transaction, so it commits after key 2 and before key 1 reserves:
+			// protection metadata changes cannot commit while a DELETE holds it.
+			changed := make(chan error, 1)
 			f.setWire(nil, func(key string) {
 				if key == f.key {
 					return
 				}
-				if _, err := f.pool.Exec(f.ctx, sql); err != nil {
-					hookErr.Store(err.Error())
+				pid := make(chan int, 1)
+				go func() {
+					tx, err := f.pool.Begin(f.ctx)
+					if err != nil {
+						pid <- 0
+						changed <- err
+						return
+					}
+					defer tx.Rollback(f.ctx)
+					var id int
+					if err = tx.QueryRow(f.ctx, `SELECT pg_backend_pid()`).Scan(&id); err != nil {
+						pid <- 0
+						changed <- err
+						return
+					}
+					pid <- id
+					if _, err = tx.Exec(f.ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR UPDATE`); err == nil {
+						if _, err = tx.Exec(f.ctx, sql); err == nil {
+							err = tx.Commit(f.ctx)
+						}
+					}
+					changed <- err
+				}()
+				id := <-pid
+				for deadline := time.Now().Add(10 * time.Second); id != 0 && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+					var waiting bool
+					if err := f.pool.QueryRow(f.ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND wait_event_type='Lock')`, id).Scan(&waiting); err != nil || waiting {
+						return
+					}
 				}
 			})
 			result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
 			f.setWire(nil, nil)
-			if hookErr.Load() != nil {
-				t.Fatal(hookErr.Load())
+			select {
+			case changeErr := <-changed:
+				if changeErr != nil {
+					t.Fatal(changeErr)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("the queued key's change never committed")
 			}
 			aged := change == "aged"
 			if (err == nil) != aged || result.Selected != 2 || result.Deleted != 1 || (result.CustodyShort.Objects == 1) != aged || f.deletes() != 1 {
 				t.Fatalf("%s: %+v %v deletes %d", change, result, err, f.deletes())
 			}
 		})
+	}
+}
+
+// A legacy inventory row without sidecar evidence is ineligible, not a batch
+// failure: the eligible key beside it is selected and deleted.
+func TestKeep28SelectionSkipsIncompleteEvidence(t *testing.T) {
+	f := newKeep28FixtureCount(t, 2)
+	f.writeManifest(t, 2)
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET sidecar_relative_path=NULL,sidecar_size_bytes=NULL,sidecar_sha256=NULL WHERE clip_id=9000002`); err != nil {
+		t.Fatal(err)
+	}
+	result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
+	f.store.mu.Lock()
+	_, eligibleLeft := f.store.objects[f.key]
+	f.store.mu.Unlock()
+	if err != nil || result.Selected != 1 || result.Deleted != 1 || eligibleLeft || f.deletes() != 1 {
+		t.Fatalf("legacy row: %+v %v deletes %d", result, err, f.deletes())
 	}
 }
 

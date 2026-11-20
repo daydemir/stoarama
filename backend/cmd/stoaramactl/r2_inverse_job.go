@@ -80,8 +80,10 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane
 	printInverseJob(map[string]any{"step": "batch_limit", "total": total})
 }
 
-// addBatch folds one batch into the job total. Held keys are the latest
-// startup's snapshot, not a sum.
+// addBatch folds one batch into the job total. Selected, deleted, byte and
+// custody_short counts are per batch and sum. Held keys and last_modified_held
+// are snapshots of the latest batch: every batch rereads the same held intents
+// and the same partition, so summing would count them again.
 func (t *inverseApplySummary) addBatch(r inverseApplySummary) {
 	t.Selected += r.Selected
 	t.Deleted += r.Deleted
@@ -89,7 +91,7 @@ func (t *inverseApplySummary) addBatch(r inverseApplySummary) {
 	t.CustodyShort.Objects += r.CustodyShort.Objects
 	t.CustodyShort.Bytes += r.CustodyShort.Bytes
 	t.WireAmbiguous = append(t.WireAmbiguous, r.WireAmbiguous...)
-	t.AmbiguousHeld, t.HeldAbsent = r.AmbiguousHeld, r.HeldAbsent
+	t.AmbiguousHeld, t.HeldAbsent, t.LastModifiedHeld = r.AmbiguousHeld, r.HeldAbsent, r.LastModifiedHeld
 }
 
 type inverseJobFlags struct {

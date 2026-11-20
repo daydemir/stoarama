@@ -62,8 +62,8 @@ type inverseEntry struct {
 	r2.ObjectInfo
 	Class  inverseClass `json:"class"`
 	Reason string       `json:"reason"`
-	// Sidecar is the NAS sidecar keep-28 selection observed; never serialized.
-	Sidecar keep28Sidecar `json:"-"`
+	// Selected is the identity keep-28 selection observed; never serialized.
+	Selected keep28Identity `json:"-"`
 }
 type inverseSummary struct {
 	Version              int                           `json:"version"`

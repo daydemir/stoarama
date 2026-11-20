@@ -335,10 +335,11 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 		if err != nil && !aged {
 			return t, err
 		}
-		// The sidecar selection observed must still be the locked one, whatever
-		// the proof's age: a replaced sidecar is a hard veto, never a skip.
-		if (keep28Sidecar{SHA: c.SidecarSHA, Size: c.SidecarSize}) != e.Sidecar {
-			return t, errors.New("NAS sidecar changed since selection")
+		// The identity selection observed (source, catalog path, size, media
+		// and sidecar digests) must still be the locked one, whatever the
+		// proof's age: any change is a hard veto, never a skip.
+		if c.identity() != e.Selected {
+			return t, errors.New("keep-28 source or custody identity changed since selection")
 		}
 		if aged {
 			// Exact custody that aged out while the key waited is no failure.
