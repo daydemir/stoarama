@@ -26,6 +26,8 @@ spec = importlib.util.spec_from_file_location('v85r_pull', ROOT/'stoarama_pull.p
 pull = importlib.util.module_from_spec(spec); spec.loader.exec_module(pull)
 spec = importlib.util.spec_from_file_location('v85r_runner', ROOT/'v85r/runner.py')
 runner = importlib.util.module_from_spec(spec); spec.loader.exec_module(runner)
+spec = importlib.util.spec_from_file_location('v85r_build_durham', ROOT/'v85r/build_durham.py')
+build_durham = importlib.util.module_from_spec(spec); spec.loader.exec_module(build_durham)
 
 
 class V85rTests(unittest.TestCase):
@@ -159,6 +161,200 @@ class V85rTests(unittest.TestCase):
             durham_stitch.process_task(http, task, None, None, None, None)
         self.assertEqual(http.post.call_count, 1)
 
+    def durham(self):
+        worker = object.__new__(durham_stitch.DurhamV85r)
+        worker.manifest = "a" * 64
+        worker.pins = json.loads((ROOT / "v85r/durham-arm64.json").read_bytes())
+        return worker
+
+    def copy_worker_sources(self, base):
+        for name in durham_stitch.WORKER_SOURCES:
+            (base / name).write_bytes((ROOT / name).read_bytes())
+
+    def test_worker_source_pins_are_the_same_four_exact_files_on_both_sides(self):
+        self.assertEqual(durham_stitch.AUDIO_PROOF, "aac-lc-primed-pcm-v1")
+        self.assertEqual(durham_stitch.AUDIO_PROOF, pull.STITCH_AUDIO_PROOF)
+        self.assertEqual(durham_stitch.AUDIO_PROOF, build_durham.AUDIO_PROOF)
+        self.assertEqual(sorted(durham_stitch.WORKER_SOURCES),
+                         sorted(("delivery_coverage.py", "durham_aac.py", "durham_stitch.py", "stoarama_pull.py")))
+        self.assertEqual(sorted(build_durham.WORKER_SOURCES), sorted(durham_stitch.WORKER_SOURCES))
+        pins = build_durham.worker_source_pins()
+        self.assertEqual(sorted(pins), sorted(durham_stitch.WORKER_SOURCES))
+        for name, sha in pins.items():
+            self.assertRegex(sha, "^[0-9a-f]{64}$")
+            self.assertEqual(sha, hashlib.sha256((ROOT / name).read_bytes()).hexdigest(), name)
+        # Deterministic across calls, and the four reviewed scripts only.
+        self.assertEqual(pins, build_durham.worker_source_pins())
+        with tempfile.TemporaryDirectory() as scratch:
+            base = Path(scratch).resolve()
+            self.copy_worker_sources(base)
+            self.assertEqual(build_durham.worker_source_pins(base), pins)
+            (base / durham_stitch.WORKER_SOURCES[0]).write_bytes(b"# changed\n")
+            changed = build_durham.worker_source_pins(base)
+            self.assertEqual(sorted(changed), sorted(durham_stitch.WORKER_SOURCES))
+            self.assertNotEqual(changed[durham_stitch.WORKER_SOURCES[0]],
+                                pins[durham_stitch.WORKER_SOURCES[0]])
+            for name in durham_stitch.WORKER_SOURCES[1:]:
+                self.assertEqual(changed[name], pins[name])
+
+    def test_media_toolchain_binds_audio_mode_and_worker_sources(self):
+        pins = json.loads((ROOT / "v85r/durham-arm64.json").read_bytes())
+        media = build_durham.media_toolchain(pins["tools"], {"lib": "1" * 64})
+        self.assertEqual(media["audio_proof"], "aac-lc-primed-pcm-v1")
+        self.assertEqual(media["sources"], build_durham.worker_source_pins())
+        self.assertEqual(sorted(media["sources"]), sorted(durham_stitch.WORKER_SOURCES))
+        self.assertEqual(media["tools"], pins["tools"])
+        self.assertEqual(media["version"], pins["media_tool_version"])
+        # The media identity cannot be handed caller-supplied worker digests,
+        # and changed worker bytes change the computed map it would bundle.
+        with self.assertRaises(TypeError):
+            build_durham.media_toolchain(pins["tools"], {"lib": "1" * 64},
+                                         {"durham_aac.py": "0" * 64})
+        with tempfile.TemporaryDirectory() as scratch:
+            base = Path(scratch).resolve()
+            self.copy_worker_sources(base)
+            (base / "durham_aac.py").write_bytes(b"# changed\n")
+            changed = build_durham.worker_source_pins(base)
+            self.assertNotEqual(changed["durham_aac.py"], media["sources"]["durham_aac.py"])
+            self.assertNotEqual(changed, media["sources"])
+
+    def test_verify_media_requires_the_reviewed_audio_mode_and_exact_sources(self):
+        worker = self.durham()
+        media = build_durham.media_toolchain(worker.pins["tools"], {"lib": "1" * 64})
+        sources = worker.verify_media(media, threading.Event())
+        self.assertEqual(sources, build_durham.worker_source_pins())
+        self.assertEqual(worker.recheck_sources(threading.Event()), sources)
+        for mutate in (lambda m: m.update(audio_proof="aac-lc-primed-pcm-v2"),
+                       lambda m: m.pop("audio_proof"),
+                       lambda m: m.update(sources={})):
+            broken = dict(copy.deepcopy(media))
+            mutate(broken)
+            with self.assertRaises(durham_stitch.DurhamError):
+                worker.verify_media(broken, threading.Event())
+
+    def test_changed_missing_extra_or_misbound_worker_source_fails_verification(self):
+        pins = build_durham.worker_source_pins()
+        with tempfile.TemporaryDirectory() as scratch:
+            base = Path(scratch).resolve()
+            self.copy_worker_sources(base)
+            paths = {name: base / name for name in durham_stitch.WORKER_SOURCES}
+            worker = self.durham()
+            with mock.patch.object(durham_stitch.DurhamV85r, "source_files", return_value=paths):
+                self.assertEqual(worker.verify_sources(pins, threading.Event()), pins)
+
+                def broken(mutate, pins, reason):
+                    mutate()
+                    try:
+                        with self.assertRaisesRegex(durham_stitch.DurhamError, reason):
+                            worker.verify_sources(pins, threading.Event())
+                    finally:
+                        for name in durham_stitch.WORKER_SOURCES:
+                            path = base / name
+                            if path.is_symlink():
+                                path.unlink()
+                        for name in ("extra_worker.py", "link.py"):
+                            path = base / name
+                            if path.is_symlink() or path.exists():
+                                path.unlink()
+                        self.copy_worker_sources(base)
+
+                broken(lambda: (base / "stoarama_pull.py").write_bytes(b"# changed\n"),
+                       pins, "worker source identity differs")
+                broken(lambda: (base / "durham_stitch.py").unlink(),
+                       pins, "resolved regular file")
+                broken(lambda: (base / "extra_worker.py").write_text("x\n"),
+                       dict(pins, extra_worker=hashlib.sha256(b"x\n").hexdigest()),
+                       "worker source set differs")
+                swapped = dict(pins)
+                swapped["durham_stitch.py"], swapped["stoarama_pull.py"] = (
+                    pins["stoarama_pull.py"], pins["durham_stitch.py"])
+                broken(lambda: None, swapped, "worker source identity differs")
+                broken(lambda: os.symlink(base / "durham_stitch.py", base / "link.py"),
+                       dict(pins, **{"link.py": pins["durham_stitch.py"]}), "worker source set differs")
+                broken(lambda: (base / "durham_aac.py").unlink() or os.symlink(
+                           base / "durham_stitch.py", base / "durham_aac.py"),
+                       pins, "resolved regular file")
+            with self.assertRaisesRegex(durham_stitch.DurhamError, "not verified"):
+                self.durham().recheck_sources(threading.Event())
+
+    def test_durham_rechecks_pinned_sources_before_stitch_build(self):
+        for reason in ("worker source identity differs", None):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as state:
+                root = Path(state).resolve()
+                http = SimpleNamespace(
+                    post=mock.Mock(return_value={"toolchain": "a" * 64, "state": "leased"}),
+                    stop=threading.Event(),
+                    v85r=SimpleNamespace(manifest="a" * 64,
+                                         recheck_sources=mock.Mock(side_effect=(
+                                             None if reason is None else durham_stitch.DurhamError(reason)))),
+                )
+                task = dict(id=1, attempt=1, lease_token="lease", plan_sha256="plan",
+                            expires_at="2099-01-01T00:00:00+00:00",
+                            plan=dict(clips=[dict(size_bytes=1)]))
+                with mock.patch.object(durham_stitch.pull, "stitch_resources"), \
+                        mock.patch.object(durham_stitch, "fetch_clip"), \
+                        mock.patch.object(durham_stitch.pull, "stitch_build") as build:
+                    if reason is None:
+                        build.side_effect = durham_stitch.DurhamError("stop here")
+                        with self.assertRaisesRegex(durham_stitch.DurhamError, "stop here"):
+                            durham_stitch.process_task(http, task, root, root, None, {})
+                        self.assertEqual(build.call_count, 1)
+                    else:
+                        with self.assertRaisesRegex(durham_stitch.DurhamError, reason):
+                            durham_stitch.process_task(http, task, root, root, None, {})
+                        build.assert_not_called()
+                self.assertEqual(http.v85r.recheck_sources.call_count, 1)
+                self.assertFalse((root / "result.json").exists())
+
+    def test_durham_http_emits_r2_v3_source_and_toolchain_headers(self):
+        seen = {}
+
+        class Response:
+            status = 200
+            def read(self, limit):
+                return b'{"task": null}'
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+
+        class Connection:
+            def __init__(self, host, port, timeout):
+                seen["origin"] = (host, port, timeout)
+            def request(self, method, path, headers=None, body=None):
+                seen.update(method=method, path=path, headers=headers, body=body)
+            def getresponse(self):
+                return Response()
+            def close(self):
+                pass
+
+        manifest = "b" * 64
+        http = durham_stitch.DurhamHTTP("https://api.invalid", "https://r2.invalid", "token",
+                                        threading.Event(), SimpleNamespace(manifest=manifest))
+        with mock.patch.object(durham_stitch, "HTTPSConnection", Connection):
+            self.assertEqual(http.post("lease", {}), {"task": None})
+        self.assertEqual(seen["path"], "/account/connections/stitch/lease")
+        self.assertEqual(seen["headers"]["X-Stoarama-Stitch-Source"], "r2-v3")
+        self.assertEqual(seen["headers"]["X-Stoarama-Stitch-Toolchain"], manifest)
+        self.assertEqual(seen["headers"]["Authorization"], "Bearer token")
+        self.assertEqual(seen["origin"][:2], ("api.invalid", 443))
+
+    def test_durham_provenance_emits_reviewed_audio_proof(self):
+        worker = self.durham()
+        provenance = worker.provenance()
+        self.assertEqual(provenance["audio_proof"], "aac-lc-primed-pcm-v1")
+        self.assertEqual(provenance["architecture"], "linux-arm64")
+        self.assertEqual(provenance["manifest_sha256"], "a" * 64)
+        self.assertEqual(provenance["ffmpeg_sha256"], worker.pins["tools"]["ffmpeg"]["sha256"])
+        self.assertEqual(provenance["ffprobe_sha256"], worker.pins["tools"]["ffprobe"]["sha256"])
+        self.assertFalse(provenance["october_ffmpeg_recovered"])
+        self.assertEqual(provenance["policy"], pull.STITCH_POLICY)
+
+    def test_service_excludes_external_python_environment(self):
+        unit = (ROOT / "stoarama-durham-stitch.service").read_text()
+        self.assertIn("ExecStart=/usr/bin/python3 -E -s -B /opt/stoarama-stitch/durham_stitch.py\n", unit)
+        self.assertNotIn("python3 -B ", unit)
+
     @unittest.skipUnless(os.environ.get("V85R_DURHAM_TEST_BUNDLE"), "generated Durham bundle required")
     def test_native_durham_bundle_replays_frozen_october_evidence(self):
         pins = json.loads((ROOT / "v85r/durham-arm64.json").read_bytes())
@@ -174,6 +370,11 @@ class V85rTests(unittest.TestCase):
             evaluator = (bundle / "remeasure-linux-arm64").read_bytes()
             self.assertEqual(hashlib.sha256(evaluator).hexdigest(), pins["evaluator_sha256"])
             self.assertEqual(int.from_bytes(evaluator[18:20], "little"), 183)
+            media = json.loads((bundle / "media-toolchain.json").read_bytes())
+            self.assertEqual(media["audio_proof"], durham_stitch.AUDIO_PROOF)
+            self.assertEqual(sorted(media["sources"]), sorted(durham_stitch.WORKER_SOURCES))
+            self.assertTrue(all(len(sha) == 64 for sha in media["sources"].values()))
+            self.assertEqual(media["tools"], pins["tools"])
 
             spec = importlib.util.spec_from_file_location("v85r_durham_runner", bundle / "runner.py")
             native = importlib.util.module_from_spec(spec)

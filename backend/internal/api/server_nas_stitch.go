@@ -117,8 +117,9 @@ type nasStitchProvenance struct {
 	FFprobeVersion   string `json:"ffprobe_version"`
 	FFmpegSHA        string `json:"ffmpeg_sha256"`
 	FFprobeSHA       string `json:"ffprobe_sha256"`
-	// Only an exact version string is ever admitted; the reviewed Durham package
-	// below still omits it, so AAC stays inactive until the next pin.
+	// Only the exact reviewed rule string is ever admitted. The pinned Durham
+	// package below now advertises it, so Durham may attest AAC; it remains
+	// absent for every NAS-local and predecessor proof.
 	AudioProof string `json:"audio_proof,omitempty"`
 }
 
@@ -680,9 +681,10 @@ func validateNASStitchResult(p nasStitchPlan, q nasStitchResult) ([]nasCleanupIt
 }
 
 // validateNASStitchAudioProof is the single typed gate for the output audio
-// attestation. A reviewed Durham package that advertises the primed-PCM
-// capability may emit AAC outputs and ordinary video-only outputs; every other
-// profile stays video-only, and an AAC claim needs the exact per-input proof.
+// attestation. The reviewed Durham package now advertises the primed-PCM
+// capability, so it may emit AAC outputs and ordinary video-only outputs.
+// Every other profile stays video-only, and an AAC claim needs the exact
+// per-input proof.
 func validateNASStitchAudioProof(o nasStitchOutput, origin nasStitchProofOrigin) error {
 	capable := false
 	if origin == nasStitchOnDurham {
@@ -1047,6 +1049,11 @@ func reviewedDurhamProvenance() nasStitchProvenance {
 		ManifestSHA: nasDurhamManifestSHA, EvaluatorSHA: nasDurhamEvaluatorSHA,
 		FFmpegVersion: nasDurhamToolVersion, FFprobeVersion: nasDurhamToolVersion,
 		FFmpegSHA: nasDurhamFFmpegSHA, FFprobeSHA: nasDurhamFFprobeSHA,
+		// The reviewed package now carries the exact AAC-LC primed-PCM rule, so
+		// new Durham results may attest audio. Historical rows keep the exact
+		// profile they were staged under; that compatibility is pinned in SQL,
+		// and this route still admits only the current exact provenance.
+		AudioProof: nasStitchAudioProofRule,
 	}
 }
 

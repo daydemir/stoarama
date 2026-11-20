@@ -23,6 +23,12 @@ class DurhamError(RuntimeError):
     pass
 
 
+# The exact AAC mode the media-toolchain.json must name, and the four reviewed
+# worker scripts whose bytes must match its pinned source digests.
+AUDIO_PROOF = "aac-lc-primed-pcm-v1"
+WORKER_SOURCES = ("delivery_coverage.py", "durham_aac.py", "durham_stitch.py", "stoarama_pull.py")
+
+
 def media_libraries(tools, stop):
     resolved = set()
     for path in tools.values():
@@ -69,13 +75,64 @@ class DurhamV85r:
                 or pull.stitch_proof_digest(path, stop) != (size, sha)):
             raise DurhamError("Durham native executable identity differs")
 
+    @staticmethod
+    def source_files():
+        """The four reviewed worker scripts, rooted at this worker's directory."""
+        root = Path(__file__).resolve().parent
+        return {name: root / name for name in WORKER_SOURCES}
+
+    def verify_sources(self, sources, stop):
+        """Require exactly the four pinned, resolved, non-symlink scripts.
+
+        ``sources`` is the bundle's pinned digest map, which is itself bound by
+        the manifest and bundle SHA, so an edited, missing, extra or swapped
+        worker script cannot be admitted.
+        """
+        if not isinstance(sources, dict) or set(sources) != set(WORKER_SOURCES):
+            raise DurhamError("Durham worker source set differs")
+        for name, path in sorted(self.source_files().items()):
+            pin = sources[name]
+            if (not isinstance(pin, str) or len(pin) != 64
+                    or any(c not in "0123456789abcdef" for c in pin)):
+                raise DurhamError("Durham worker source pin differs")
+            if path.is_symlink() or not path.is_file() or os.path.realpath(path) != str(path):
+                raise DurhamError("Durham worker source must be a resolved regular file")
+            if pull.stitch_proof_digest(path, stop)[1] != pin:
+                raise DurhamError("Durham worker source identity differs")
+        return dict(sources)
+
+    def recheck_sources(self, stop):
+        """Re-verify the pinned worker scripts against the accepted digests."""
+        sources = getattr(self, "sources", None)
+        if sources is None:
+            raise DurhamError("Durham worker source pins are not verified")
+        return self.verify_sources(sources, stop)
+
+    def verify_media(self, media, stop):
+        """Bind the AAC mode and the four worker digests in media-toolchain.json."""
+        if media["tools"] != self.pins["tools"] or media["version"] != self.pins["media_tool_version"]:
+            raise DurhamError("Durham media manifest differs from the profile")
+        if media.get("audio_proof") != AUDIO_PROOF:
+            raise DurhamError("Durham audio proof mode differs from the reviewed profile")
+        self.sources = self.verify_sources(media.get("sources"), stop)
+        return self.sources
+
+    def provenance(self):
+        return dict(
+            policy=pull.STITCH_POLICY, architecture="linux-arm64", manifest_sha256=self.manifest,
+            evaluator_sha256=self.pins["evaluator_sha256"], october_ffmpeg_recovered=False,
+            ffmpeg_version=self.pins["media_tool_version"], ffprobe_version=self.pins["media_tool_version"],
+            ffmpeg_sha256=self.pins["tools"]["ffmpeg"]["sha256"],
+            ffprobe_sha256=self.pins["tools"]["ffprobe"]["sha256"],
+            audio_proof=AUDIO_PROOF,
+        )
+
     def verify(self, tools, stop):
         if tools != self.tools:
             raise DurhamError("Durham media tool path differs")
         bundle = pull.stitch_unpack_v85r(self.bundle, self.pins["bundle_sha256"], self.manifest, self.state, stop)
         media = json.loads((bundle / "media-toolchain.json").read_bytes())
-        if media["tools"] != self.pins["tools"] or media["version"] != self.pins["media_tool_version"]:
-            raise DurhamError("Durham media manifest differs from the profile")
+        self.verify_media(media, stop)
         for name, path in tools.items():
             pin = media["tools"][name]
             self.verify_executable(Path(path), pin["size_bytes"], pin["sha256"], stop)
@@ -83,13 +140,7 @@ class DurhamV85r:
             raise DurhamError("Durham media library identity differs")
         self.verify_executable(bundle / "remeasure-linux-arm64", self.pins["evaluator_size_bytes"],
                                self.pins["evaluator_sha256"], stop)
-        return bundle, dict(
-            policy=pull.STITCH_POLICY, architecture="linux-arm64", manifest_sha256=self.manifest,
-            evaluator_sha256=self.pins["evaluator_sha256"], october_ffmpeg_recovered=False,
-            ffmpeg_version=self.pins["media_tool_version"], ffprobe_version=self.pins["media_tool_version"],
-            ffmpeg_sha256=self.pins["tools"]["ffmpeg"]["sha256"],
-            ffprobe_sha256=self.pins["tools"]["ffprobe"]["sha256"],
-        )
+        return bundle, self.provenance()
 
 
 class DurhamHTTP:
@@ -128,7 +179,7 @@ class DurhamHTTP:
         connection, response = self.request(self.api + "/account/connections/stitch/" + path,
             self.api_host, "POST", {"Authorization": "Bearer " + self.token,
             "Content-Type": "application/json", "User-Agent": "stoarama-operator/1",
-            "X-Stoarama-Stitch-Source": "r2-v2",
+            "X-Stoarama-Stitch-Source": "r2-v3",
             "X-Stoarama-Stitch-Toolchain": self.v85r.manifest}, pull.cleanup_json_bytes(body))
         with response:
             try:
@@ -246,6 +297,10 @@ def process_task(http, task, root, state, inventory, tools):
     if result_file.exists():
         result = json.loads(result_file.read_bytes())
     else:
+        # The pinned worker scripts must still be the exact reviewed bytes
+        # before this attempt builds, so a late edit cannot enter a lease's
+        # audio provenance.
+        http.v85r.recheck_sources(http.stop)
         clips = task["plan"]["clips"]
         pull.stitch_resources(cfg, sum(clip["size_bytes"] for clip in clips), local_scratch=True)
         for clip in clips:

@@ -186,6 +186,16 @@ func TestNASStitchCheckpointAndLeasePauseUnderCleanupFreeze(t *testing.T) {
 }
 
 func TestR2StitchDurhamRequiresBidirectionalProfileProtocol(t *testing.T) {
+	// The predecessor package is a known exact pin. It must never be admitted
+	// under the current protocol, and the current generated package must never
+	// be admitted under the predecessor protocol. The generated pin's literal
+	// identity is owned by nas_v85r_durham_pin.go, the profile JSON and the SQL
+	// native-profile function, so this gate only requires that a regeneration
+	// produced a different manifest.
+	const predecessorManifest = "7d6e12320e3a1ac48a2a390d4d9842b7a9d68116d235e49dae5ad9c82288ce51"
+	if nasDurhamManifestSHA == predecessorManifest || !stitchSHA(nasDurhamManifestSHA) {
+		t.Fatalf("reviewed Durham pin did not change from the predecessor: %s", nasDurhamManifestSHA)
+	}
 	for _, test := range []struct {
 		source, manifest string
 		dedicated        bool
@@ -194,8 +204,13 @@ func TestR2StitchDurhamRequiresBidirectionalProfileProtocol(t *testing.T) {
 		{"r2-v1", nasDurhamManifestSHA, true, http.StatusConflict},
 		{"r2-v2", "", true, http.StatusConflict},
 		{"r2-v2", nasStitchManifestSHA, true, http.StatusConflict},
-		{"r2-v2", nasDurhamManifestSHA, false, http.StatusForbidden},
-		{"r2-v2", nasDurhamManifestSHA, true, http.StatusOK},
+		{"r2-v2", predecessorManifest, true, http.StatusConflict},
+		{"r2-v2", nasDurhamManifestSHA, true, http.StatusConflict},
+		{"r2-v3", "", true, http.StatusConflict},
+		{"r2-v3", nasStitchManifestSHA, true, http.StatusConflict},
+		{"r2-v3", predecessorManifest, true, http.StatusConflict},
+		{"r2-v3", nasDurhamManifestSHA, false, http.StatusForbidden},
+		{"r2-v3", nasDurhamManifestSHA, true, http.StatusOK},
 	} {
 		w := httptest.NewRecorder()
 		r := httptest.NewRequest(http.MethodPost, "/account/connections/stitch/lease", nil)
@@ -232,6 +247,9 @@ func TestDurhamProofRequiresOneNativeToolchain(t *testing.T) {
 		func(p *nasStitchProvenance) { p.FFmpegSHA = p.FFprobeSHA },
 		func(p *nasStitchProvenance) { p.FFprobeSHA = p.FFmpegSHA },
 		func(p *nasStitchProvenance) { p.FFprobeVersion = "unreviewed" },
+		// The historical capability-absent profile is not the current one.
+		func(p *nasStitchProvenance) { p.AudioProof = "" },
+		func(p *nasStitchProvenance) { p.AudioProof = "aac-lc-primed-pcm-v2" },
 	} {
 		mixed := native
 		change(&mixed)
@@ -274,14 +292,22 @@ func TestNASStitchAudioProofAdmitsOnlyExactPrimedPCM(t *testing.T) {
 	if err := validateNASStitchAudioProof(proof, nasStitchOnDurham); err != nil {
 		t.Fatalf("exact AAC proof: %v", err)
 	}
-	// The reviewed Durham package has no AAC capability in this slice.
-	if reviewedDurhamProvenance().AudioProof != "" {
-		t.Fatal("reviewed provenance gained an unadvertised AAC capability")
+	// The reviewed Durham package now advertises exactly the primed-PCM rule,
+	// so the current profile can attest AAC.
+	if reviewedDurhamProvenance().AudioProof != nasStitchAudioProofRule {
+		t.Fatalf("reviewed provenance lost its AAC capability: %q", reviewedDurhamProvenance().AudioProof)
 	}
 	legacy := proof
 	legacy.Provenance = reviewedDurhamProvenance()
+	if err := validateNASStitchAudioProof(legacy, nasStitchOnDurham); err != nil {
+		t.Fatalf("reviewed profile refused exact AAC: %v", err)
+	}
+	// A historical profile that omitted the capability stays video-only.
+	predecessor := reviewedDurhamProvenance()
+	predecessor.AudioProof = ""
+	legacy.Provenance = predecessor
 	if err := validateNASStitchAudioProof(legacy, nasStitchOnDurham); err == nil {
-		t.Fatal("legacy profile activated AAC")
+		t.Fatal("capability-absent profile activated AAC")
 	}
 	tests := map[string]func(*nasStitchOutput, *nasStitchProofOrigin){
 		"nas local origin": func(o *nasStitchOutput, origin *nasStitchProofOrigin) { *origin = nasStitchOnNAS },
@@ -360,6 +386,66 @@ func TestNASStitchAudioProofAdmitsOnlyExactPrimedPCM(t *testing.T) {
 	var missing nasStitchInputProof
 	if err := json.Unmarshal([]byte(`{"audio_proof":{"packets":40,"packet_chain_sha256":"`+strings.Repeat("1", 64)+`","sample_rate":48000,"sample_count":40960,"pcm_chain_sha256":"`+strings.Repeat("2", 64)+`","rule":"standalone_exact"}}`), &missing); err != nil || missing.AudioProof == nil || missing.AudioProof.PrimerPackets != nil {
 		t.Fatalf("absent primer_packets decoded as attested: %v %+v", err, missing.AudioProof)
+	}
+}
+
+func TestNASStitchDurhamExactAACAndVideoOnlyProof(t *testing.T) {
+	p, q := stitchUnitFixture()
+	// A Durham result omits raw physical custody and always holds retirement.
+	durham := func() nasStitchResult {
+		d := q
+		d.Outputs = append([]nasStitchOutput(nil), q.Outputs...)
+		o := &d.Outputs[0]
+		o.Provenance = reviewedDurhamProvenance()
+		o.Inputs = append([]nasStitchInputProof(nil), q.Outputs[0].Inputs...)
+		for n := range o.Inputs {
+			o.Inputs[n].RawProof = nil
+			o.Inputs[n].RetirementHeld = true
+		}
+		return d
+	}
+	// Exact two-input AAC join: the typed per-input proof on both inputs.
+	aac := durham()
+	aac.Outputs[0].NoAudio = false
+	for n, proof := range stitchAudioProofFixture() {
+		aac.Outputs[0].Inputs[n].AudioProof = proof.AudioProof
+	}
+	if _, err := validateNASStitchProof(p, aac, nasStitchOnDurham); err != nil {
+		t.Fatalf("exact Durham AAC proof: %v", err)
+	}
+	for name, change := range map[string]func(*nasStitchOutput){
+		"dropped later proof": func(o *nasStitchOutput) { o.Inputs[1].AudioProof = nil },
+		"silent second input": func(o *nasStitchOutput) {
+			o.Inputs[1].AudioProof.Rule, o.Inputs[1].AudioProof.PrimerPackets = "standalone_exact", stitchPrimer(0)
+		},
+		"carried raw custody": func(o *nasStitchOutput) { o.Inputs[0].RawProof = []byte(`{}`) },
+		"audio proof unheld": func(o *nasStitchOutput) {
+			o.Inputs[1].RetirementHeld = false
+		},
+	} {
+		t.Run("reject "+name, func(t *testing.T) {
+			broken := durham()
+			broken.Outputs[0].NoAudio = false
+			for n, proof := range stitchAudioProofFixture() {
+				broken.Outputs[0].Inputs[n].AudioProof = proof.AudioProof
+			}
+			change(&broken.Outputs[0])
+			if _, err := validateNASStitchProof(p, broken, nasStitchOnDurham); err == nil {
+				t.Fatal("inexact Durham AAC proof admitted")
+			}
+		})
+	}
+	// The same capable profile also emits ordinary video-only hours.
+	videoOnly := durham()
+	if !videoOnly.Outputs[0].NoAudio || videoOnly.Outputs[0].Provenance.AudioProof != nasStitchAudioProofRule {
+		t.Fatal("fixture is not the capable video-only shape")
+	}
+	if _, err := validateNASStitchProof(p, videoOnly, nasStitchOnDurham); err != nil {
+		t.Fatalf("capable video-only proof: %v", err)
+	}
+	videoOnly.Outputs[0].Inputs[0].AudioProof = stitchAudioProofFixture()[0].AudioProof
+	if _, err := validateNASStitchProof(p, videoOnly, nasStitchOnDurham); err == nil {
+		t.Fatal("audio-absent output carried typed AAC proof")
 	}
 }
 

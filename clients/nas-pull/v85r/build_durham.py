@@ -19,10 +19,27 @@ EVALUATOR = "remeasure-linux-arm64"
 EVALUATOR_SHA256 = "0c90ed4c9527e0f9b6eedc432b71dd581a4dac0f758850988df80d2e684b2fed"
 DEBIAN_VERSION = "7.1.5-0+deb13u1"
 DEBIAN_FFMPEG_SHA256 = "6ec9c42306df30803c731c9e53300627257fd59d2f5a80b394c14cec5fd6d5ef"
+# The exact AAC mode and the four reviewed worker scripts whose digests are
+# bundled into media-toolchain.json, and so into the manifest and bundle SHA.
+AUDIO_PROOF = "aac-lc-primed-pcm-v1"
+SOURCE_DIR = ROOT.parent
+WORKER_SOURCES = ("delivery_coverage.py", "durham_aac.py", "durham_stitch.py", "stoarama_pull.py")
 
 
 def digest(body):
     return hashlib.sha256(body).hexdigest()
+
+
+def worker_source_pins(source_dir=SOURCE_DIR):
+    """Deterministic SHA-256 map for exactly the four reviewed worker scripts."""
+    base = Path(source_dir)
+    return {name: digest((base / name).read_bytes()) for name in WORKER_SOURCES}
+
+
+def media_toolchain(tools, libraries):
+    """The bundled media identity: tools, libraries, AAC mode and worker pins."""
+    return {"audio_proof": AUDIO_PROOF, "libraries": libraries, "sources": worker_source_pins(),
+            "tools": tools, "version": DEBIAN_VERSION}
 
 
 def elf_arm64(body):
@@ -45,6 +62,7 @@ def build_evaluator():
 def make_bundle(evaluator, tools, libraries):
     if not elf_arm64(evaluator) or digest(evaluator) != EVALUATOR_SHA256:
         raise ValueError("native evaluator differs from the reviewed ARM64 build")
+    media = media_toolchain(tools, libraries)
     manifest = json.loads((ROOT / "manifest.json").read_bytes())
     files = {name: (ROOT / name).read_bytes() for name in manifest["files"] if name != LEGACY_EVALUATOR}
     for name, body in files.items():
@@ -57,7 +75,6 @@ def make_bundle(evaluator, tools, libraries):
         raise ValueError("unexpected V85r runner evaluator binding")
     files["runner.py"] = runner.replace(LEGACY_EVALUATOR.encode(), EVALUATOR.encode())
     files[EVALUATOR] = evaluator
-    media = {"version": DEBIAN_VERSION, "tools": tools, "libraries": libraries}
     files["media-toolchain.json"] = (json.dumps(media, indent=2, sort_keys=True) + "\n").encode()
     manifest["files"] = {name: digest(body) for name, body in files.items()}
     body = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()

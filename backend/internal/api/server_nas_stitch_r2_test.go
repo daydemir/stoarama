@@ -263,6 +263,22 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 			t.Fatal("legacy reclaim inherited the native profile", err)
 		}
 	})
+	t.Run("predecessor cannot claim with its recorded v2 digest", func(t *testing.T) {
+		// This predecessor knows the 0222 digest it was pinned to and stamps it
+		// explicitly, so only the active AAC bind can reject the fresh claim.
+		if _, err := pool.Exec(ctx, `UPDATE nas_stitch_r2_hours SET state='leased',attempt=3,
+ lease_toolchain_attempt=3,lease_toolchain_sha256=nas_stitch_r2_native_profile()->>'manifest_sha256',
+ lease_api_key_id=47,lease_token=repeat('f',64),lease_expires_at=clock_timestamp()+interval '1 minute'
+ WHERE id=$1`, id); err == nil || !strings.Contains(err.Error(), "reviewed Durham lease toolchain required") {
+			t.Fatal("predecessor claimed with the superseded v2 digest", err)
+		}
+		var attempt int
+		var stamp string
+		if err := pool.QueryRow(ctx, `SELECT attempt,lease_toolchain_sha256 FROM nas_stitch_r2_hours WHERE id=$1`, id).
+			Scan(&attempt, &stamp); err != nil || attempt != 2 || stamp != nasDurhamManifestSHA {
+			t.Fatalf("refused claim changed the bound attempt: %d %q %v", attempt, stamp, err)
+		}
+	})
 	const insertStage = `INSERT INTO nas_stitch_r2_stage_objects(id,hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes)
  OVERRIDING SYSTEM VALUE VALUES(123,$1,2,47,'stoarama',$2,$3,$4,100)`
 	outputPath := plan.OutputFolder + "/run-000-" + sha + ".mp4"
@@ -459,6 +475,102 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	}
 	exec(`UPDATE nas_stitch_r2_hours SET state='staged',staged_manifest=$3,staged_manifest_sha256=$2 WHERE id=$1`,
 		id, manifest, string(stagedManifest))
+
+	t.Run("native proof and copy eligibility select provenance by stored digest", func(t *testing.T) {
+		// Historical attempts keep the 0222 stamp; fresh attempts carry the AAC
+		// bind. Whichever digest is stored decides the one full provenance the
+		// staged outputs must match, so mixed or unknown stamps fail closed.
+		for _, test := range []struct {
+			name, stamp, provenance, expression string
+			mixed, native, aac                  bool
+		}{
+			{"legacy v2 stamp", "nas_stitch_r2_native_profile()->>'manifest_sha256'",
+				"nas_stitch_r2_native_profile()", `jsonb_build_array(
+ jsonb_set(staged_manifest->'outputs'->0,'{provenance}',%s))`, false, true, false},
+			{"active aac stamp", "nas_stitch_r2_aac_profile()->>'manifest_sha256'",
+				"nas_stitch_r2_aac_profile()", `jsonb_build_array(
+ jsonb_set(staged_manifest->'outputs'->0,'{provenance}',%s))`, false, true, true},
+			{"mixed output provenance", "nas_stitch_r2_aac_profile()->>'manifest_sha256'",
+				"nas_stitch_r2_aac_profile()", `jsonb_build_array(
+ jsonb_set(staged_manifest->'outputs'->0,'{provenance}',%s),
+ jsonb_set(staged_manifest->'outputs'->0,'{provenance}',nas_stitch_r2_native_profile()))`, true, false, true},
+			{"unknown stamp", "repeat('9',64)",
+				"nas_stitch_r2_aac_profile()", `jsonb_build_array(
+ jsonb_set(staged_manifest->'outputs'->0,'{provenance}',%s))`, false, false, false},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback(ctx)
+				// Rewrite the staged evidence of this disposable schema only; the
+				// manifest immutability trigger guards production history.
+				if _, err := tx.Exec(ctx, `ALTER TABLE nas_stitch_r2_hours DISABLE TRIGGER nas_stitch_r2_manifest_immutable`); err != nil {
+					t.Fatal(err)
+				}
+				digest := strings.Repeat("b", 64)
+				if _, err := tx.Exec(ctx, fmt.Sprintf(`UPDATE nas_stitch_r2_hours SET
+ lease_toolchain_sha256=%s,lease_toolchain_attempt=attempt,staged_manifest_sha256=$2,
+ staged_manifest=jsonb_set(staged_manifest,'{outputs}',`+test.expression+`) WHERE id=$1`,
+					test.stamp, test.provenance), id, digest); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := tx.Exec(ctx, `UPDATE nas_r2_copy_items SET manifest_sha256=$2 WHERE id=$1`, copyID, digest); err != nil {
+					t.Fatal(err)
+				}
+				var proof, aacAttempt, ready bool
+				if err := tx.QueryRow(ctx, `SELECT nas_stitch_r2_native_proof(h),nas_stitch_r2_aac_attempt(h)
+ FROM nas_stitch_r2_hours h WHERE h.id=$1`, id).Scan(&proof, &aacAttempt); err != nil {
+					t.Fatal(err)
+				}
+				if err := tx.QueryRow(ctx, `SELECT nas_stitch_r2_native_copy_ready(123,$1)`, digest).Scan(&ready); err != nil {
+					t.Fatal(err)
+				}
+				if proof != test.native || ready != test.native || aacAttempt != test.aac {
+					t.Fatalf("proof %t copy-ready %t active-aac %t for %+v", proof, ready, aacAttempt, test)
+				}
+				// Renewal of an existing staged copy follows the same predicate.
+				renew, err := tx.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, renewErr := renew.Exec(ctx, `UPDATE nas_r2_copy_items
+ SET lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, copyID)
+				renew.Rollback(ctx)
+				if test.native != (renewErr == nil) || (!test.native && !strings.Contains(renewErr.Error(), "reviewed Durham copy toolchain required")) {
+					t.Fatalf("copy renewal err %v for %+v", renewErr, test)
+				}
+				// New enrollment demands the active AAC bind even when the
+				// historical attempt still proves its own custody.
+				enroll, err := tx.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, enrollErr := enroll.Exec(ctx, `INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,
+ policy_sha256,item) VALUES(13,'stitch_output',123,$1,$2,'{}') ON CONFLICT DO NOTHING`, digest, cleanupPolicySHA)
+				enroll.Rollback(ctx)
+				if test.aac != (enrollErr == nil) || (!test.aac && !strings.Contains(enrollErr.Error(), "reviewed Durham copy source required")) {
+					t.Fatalf("copy enrollment err %v for %+v", enrollErr, test)
+				}
+				if test.name != "legacy v2 stamp" {
+					return
+				}
+				// The historical digest must still carry real custody: the exact
+				// certificate and both input releases commit in this same
+				// disposable transaction, which the caller then rolls back.
+				if err := finishNASR2StitchCopy(ctx, tx, nasR2CopyTask{ID: copyID, Item: item}, request); err != nil {
+					t.Fatalf("historical v2 custody did not certify: %v", err)
+				}
+				var certificates, released int
+				if err := tx.QueryRow(ctx, `SELECT (SELECT count(*) FROM nas_stitch_r2_certificates WHERE hour_id=$1),
+ (SELECT count(*) FROM nas_stitch_r2_input_holds WHERE hour_id=$1 AND released_at IS NOT NULL)`, id).
+					Scan(&certificates, &released); err != nil || certificates != 1 || released != 2 {
+					t.Fatalf("historical v2 certificate %d released %d: %v", certificates, released, err)
+				}
+			})
+		}
+	})
 
 	s := &Server{pool: pool, r2: store, cfg: config.Config{NASR2CopyEnabled: true}}
 	t.Run("server controls staged copies on the reviewed NAS release", func(t *testing.T) {
