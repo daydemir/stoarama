@@ -441,21 +441,46 @@ func runR2JoinedWriterCancel(ctx context.Context, cfg config.Config, args []stri
 	log.Printf("joined writer run %s committed %d audited terminal transitions; other writer gates unchanged", run, changed)
 }
 
-// r2JoinedApplyIdleFence is the apply transaction's authority gate. The idle
-// check runs first (it only reads cleanup state), and the master is read FOR
-// SHARE inside this same transaction, on this same connection, so the lock
-// holds until commit: an emergency OFF waits for this retirement, and a flip
-// that committed first is seen here. Reading the master through the pool
+// r2JoinedApplyIdleFence is the apply transaction's authority gate. The master
+// is read FOR SHARE inside this same transaction, on this same connection, so
+// the lock holds until commit: an emergency OFF waits for this retirement, and
+// a flip that committed first is seen here. Reading the master through the pool
 // instead would take the lock on another connection and hold nothing, so the
 // write could proceed with the master ON.
+//
+// The idle evidence must stay true across the wait for that lock, so the fence
+// is ordered as: shared cleanup public fence, master FOR SHARE, then the idle
+// check. Every path that can make a plan or batch enabled (plan enable, batch
+// enable, batch advance) takes the same public fence exclusively, so while this
+// transaction holds it no authority can appear between the check and the
+// retirement writes. Without the fence an enable could commit an enabled plan
+// during the wait, and without the check after the read this transaction would
+// act on an idle window that had already ended.
 func r2JoinedApplyIdleFence(ctx context.Context, tx pgx.Tx) error {
+	// The same fence every public cleanup authority path honours. Advisory
+	// shared here, exclusive for enable/advance; shared and exclusive conflict.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011101)`); err != nil {
+		return errors.New("joined writer retirement requires the cleanup public fence")
+	}
+	var masterHeld bool
+	if err := tx.QueryRow(ctx, `SELECT enabled FROM nas_cleanup_master FOR SHARE`).Scan(&masterHeld); err != nil {
+		return errors.New("joined writer retirement requires the cleanup master OFF (locked for this transaction)")
+	}
+	if masterHeld {
+		return errors.New("joined writer retirement requires the cleanup master OFF (locked for this transaction)")
+	}
+	// The window must still be idle now that nothing can change it.
+	return r2JoinedIdleCheck(ctx, tx)
+}
+
+// r2JoinedIdleCheck reports the controller global-idle window: no enabled plan
+// or batch and no outstanding lease or issued permit. It only reads cleanup
+// state; r2JoinedApplyIdleFence makes that reading authoritative by holding the
+// cleanup public fence.
+func r2JoinedIdleCheck(ctx context.Context, tx pgx.Tx) error {
 	var idle bool
 	if err := tx.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM nas_cleanup_plans WHERE mode='enabled') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE state IN ('leased','delete_issued'))`).Scan(&idle); err != nil || !idle {
 		return errors.New("joined writer retirement requires controller global-idle window")
-	}
-	var masterHeld bool
-	if err := tx.QueryRow(ctx, `SELECT enabled FROM nas_cleanup_master FOR SHARE`).Scan(&masterHeld); err != nil || masterHeld {
-		return errors.New("joined writer retirement requires the cleanup master OFF (locked for this transaction)")
 	}
 	return nil
 }

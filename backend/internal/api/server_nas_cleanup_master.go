@@ -80,6 +80,42 @@ func cleanupMasterOnTx(ctx context.Context, tx pgx.Tx) bool {
 	return on
 }
 
+// cleanupMasterLockedSQL reports whether this backend still holds the FOR SHARE
+// row lock on the master control. to_regclass is NULL (never an error) when the
+// table is missing, so an unavailable control fails closed without aborting the
+// caller's transaction. A row lock taken after a savepoint is released by that
+// savepoint's rollback, which is exactly what a cached decision must not
+// outlive.
+const cleanupMasterLockedSQL = `SELECT EXISTS(SELECT 1 FROM pg_locks
+ WHERE locktype='relation' AND relation=to_regclass('nas_cleanup_master')
+ AND mode='RowShareLock' AND granted AND pid=pg_backend_pid())`
+
+// cleanupLockProbe answers a yes/no pg_locks question without endangering the
+// caller's transaction: the probe runs in its own savepoint, so any error (a
+// missing table, a permission problem, an aborted statement) rolls back only
+// the probe and answers "not held". Every caller treats that as OFF.
+func cleanupLockProbe(ctx context.Context, tx pgx.Tx, query string, args ...any) bool {
+	save, err := tx.Begin(ctx)
+	if err != nil {
+		return false
+	}
+	var held bool
+	if err = save.QueryRow(ctx, query, args...).Scan(&held); err != nil {
+		_ = save.Rollback(ctx)
+		return false
+	}
+	if save.Commit(ctx) != nil {
+		return false
+	}
+	return held
+}
+
+// cleanupMasterLockHeld reports whether the master row lock is held on this
+// connection right now.
+func cleanupMasterLockHeld(ctx context.Context, tx pgx.Tx) bool {
+	return cleanupLockProbe(ctx, tx, cleanupMasterLockedSQL)
+}
+
 // cleanupMasterMaybeOn is the cheap, non-blocking pre-check: it reads the
 // switch in a savepoint without any row lock, so it can be used before the
 // fences that an emergency OFF must not wait behind. It is advisory only; the

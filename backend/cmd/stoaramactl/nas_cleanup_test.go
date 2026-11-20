@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
@@ -47,6 +48,16 @@ func TestNASCleanupMasterRequiresReasonAndTypedState(t *testing.T) {
 	}
 }
 
+// masterReply builds the exact typed controller reply for one action, so the
+// dispatch tests exercise the same response contract the API serves.
+func masterReply(before bool, on bool) map[string]any {
+	return map[string]any{
+		"before":  map[string]any{"enabled": before},
+		"after":   map[string]any{"enabled": on, "changed_at": "2026-11-20T00:00:00Z", "actor": "nas-cleanup-controller", "claimed_by": "ops@host", "reason": "why"},
+		"changed": before != on,
+	}
+}
+
 // The CLI must dispatch the exact HTTP method and path for each action, and it
 // must not fall back to the service token: deletion authority needs the
 // controller credential.
@@ -56,10 +67,13 @@ func TestNASCleanupMasterDispatchMethodsURLsAndControllerCredential(t *testing.T
 		body                      map[string]any
 	}
 	var got []call
-	do := func(method, base, token, path string, body any) map[string]any {
+	do := func(method, base, token, path string, body any) (map[string]any, error) {
 		payload, _ := body.(map[string]any)
 		got = append(got, call{method, base, token, path, payload})
-		return map[string]any{"ok": true}
+		if payload == nil {
+			return masterReply(true, true), nil
+		}
+		return masterReply(false, payload["enabled"].(bool)), nil
 	}
 	cfg := config.Config{NASCleanupControllerToken: "controller-token-32-bytes-long-000000", ServiceToken: "runner-service-token", APIToken: "runner-service-token"}
 	if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"status", "--backend-api-url", "https://api.test"}, do); err != nil {
@@ -115,14 +129,52 @@ func TestNASCleanupMasterDispatchMethodsURLsAndControllerCredential(t *testing.T
 	}
 }
 
+// A reply that does not carry the requested authoritative state must fail, even
+// when the transport returned 2xx: an operator never sees success for a switch
+// that did not move where they asked.
+func TestNASCleanupMasterDispatchRequiresRequestedTypedState(t *testing.T) {
+	cfg := config.Config{NASCleanupControllerToken: "controller-token-32-bytes-long-000000"}
+	for name, reply := range map[string]map[string]any{
+		"state unchanged":     masterReply(false, false),
+		"opposite of request": masterReply(true, false),
+		"no after":            {"changed": true},
+		"after without bool":  {"before": map[string]any{"enabled": false}, "after": map[string]any{"actor": "x"}},
+		"wrong after type":    {"after": "on"},
+		"empty reply":         {},
+		"status-only shape":   {"ok": true},
+		"other enabled value": {"after": map[string]any{"enabled": "true"}},
+	} {
+		do := func(method, base, token, path string, body any) (map[string]any, error) {
+			return reply, nil
+		}
+		if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"on", "--reason", "why", "--backend-api-url", "https://api.test"}, do); err == nil {
+			t.Fatalf("%s accepted as a proven ON", name)
+		}
+	}
+	// A repeated ON (nothing to change) still proves the switch is ON.
+	do := func(method, base, token, path string, body any) (map[string]any, error) {
+		return masterReply(true, true), nil
+	}
+	if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"on", "--reason", "why", "--backend-api-url", "https://api.test"}, do); err != nil {
+		t.Fatalf("idempotent ON rejected: %v", err)
+	}
+	// A status read needs no state at all.
+	do = func(method, base, token, path string, body any) (map[string]any, error) {
+		return map[string]any{"enabled": false}, nil
+	}
+	if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"status", "--backend-api-url", "https://api.test"}, do); err != nil {
+		t.Fatalf("status read rejected: %v", err)
+	}
+}
+
 // A flag error (unknown flag or --help) must stop the command before a
 // credential is resolved or anything is sent: an abbreviated or mistyped
 // invocation must never flip deletion authority.
 func TestNASCleanupMasterDispatchStopsOnFlagErrors(t *testing.T) {
 	sent := 0
-	do := func(method, base, token, path string, body any) map[string]any {
+	do := func(method, base, token, path string, body any) (map[string]any, error) {
 		sent++
-		return map[string]any{"ok": true}
+		return masterReply(false, false), nil
 	}
 	cfg := config.Config{NASCleanupControllerToken: "controller-token-32-bytes-long-000000"}
 	for _, args := range [][]string{
@@ -132,6 +184,10 @@ func TestNASCleanupMasterDispatchStopsOnFlagErrors(t *testing.T) {
 		{"off", "--reason", "stop", "--api-token", "controller-token-32-bytes-long-000000"},
 		{"off", "--reason", "stop", "--unknown-flag"},
 		{"off", "--reason"},
+		{"off", "--reason", "stop", "--backend"},
+		{"off", "--reason", "stop", "extra"},
+		{"agent", "--reason", "stop"},
+		{},
 	} {
 		if err := nasCleanupMasterDispatch(context.Background(), cfg, args, do); err == nil {
 			t.Fatalf("flag error %v accepted", args)
@@ -142,14 +198,38 @@ func TestNASCleanupMasterDispatchStopsOnFlagErrors(t *testing.T) {
 	}
 }
 
+// `--reason --help` is ambiguous: the value looks like a flag, so it is refused
+// before dispatch rather than recorded as an audited reason.
+func TestNASCleanupMasterDispatchRejectsFlagShapedReason(t *testing.T) {
+	sent := 0
+	do := func(method, base, token, path string, body any) (map[string]any, error) {
+		sent++
+		return masterReply(false, false), nil
+	}
+	cfg := config.Config{NASCleanupControllerToken: "controller-token-32-bytes-long-000000"}
+	for _, args := range [][]string{
+		{"off", "--reason", "--help"},
+		{"off", "--reason=--help"},
+		{"on", "--reason", "--backend-api-url", "https://api.test", "--backend-api-url", "https://api.test"},
+		{"on", "--reason", "-h", "--backend-api-url", "https://api.test"},
+	} {
+		if err := nasCleanupMasterDispatch(context.Background(), cfg, args, do); err == nil {
+			t.Fatalf("flag-shaped reason %v accepted", args)
+		}
+	}
+	if sent != 0 {
+		t.Fatalf("flag-shaped reason still dispatched: %d", sent)
+	}
+}
+
 // The controller credential comes only from the environment. A token on the
 // command line would be visible in shell history and process listings, so the
 // flag is gone and its presence is a hard error, not a silent fallback.
 func TestNASCleanupMasterDispatchRejectsTokenFlag(t *testing.T) {
 	sent := 0
-	do := func(method, base, token, path string, body any) map[string]any {
+	do := func(method, base, token, path string, body any) (map[string]any, error) {
 		sent++
-		return map[string]any{"ok": true}
+		return masterReply(false, false), nil
 	}
 	if err := nasCleanupMasterDispatch(context.Background(), config.Config{}, []string{"status", "--api-token", "fixture-token-32-bytes-long-0000000", "--backend-api-url", "https://api.test"}, do); err == nil {
 		t.Fatal("token-on-command-line flag accepted")
@@ -166,9 +246,9 @@ func TestNASCleanupMasterDispatchRejectsTokenFlag(t *testing.T) {
 // connection, so only a bare HTTPS origin is accepted.
 func TestNASCleanupMasterDispatchRequiresHTTPSOrigin(t *testing.T) {
 	sent := 0
-	do := func(method, base, token, path string, body any) map[string]any {
+	do := func(method, base, token, path string, body any) (map[string]any, error) {
 		sent++
-		return map[string]any{"ok": true}
+		return masterReply(true, true), nil
 	}
 	cfg := config.Config{NASCleanupControllerToken: "controller-token-32-bytes-long-000000"}
 	for _, base := range []string{
@@ -178,6 +258,8 @@ func TestNASCleanupMasterDispatchRequiresHTTPSOrigin(t *testing.T) {
 		"https://api.test/path",
 		"https://api.test/?q=1",
 		"https://api.test/#f",
+		"ftp://api.test",
+		"https:///nohost",
 		"",
 	} {
 		if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"status", "--backend-api-url", base}, do); err == nil {
@@ -189,5 +271,67 @@ func TestNASCleanupMasterDispatchRequiresHTTPSOrigin(t *testing.T) {
 	}
 	if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"status", "--backend-api-url", "https://api.test"}, do); err != nil || sent != 1 {
 		t.Fatalf("HTTPS origin rejected: %v sent=%d", err, sent)
+	}
+	// A trailing slash is the same origin, normalized for the request URL.
+	if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"status", "--backend-api-url", "https://api.test/"}, do); err != nil || sent != 2 {
+		t.Fatalf("HTTPS origin with trailing slash rejected: %v sent=%d", err, sent)
+	}
+}
+
+// The only documented origin env var is BACKEND_API_URL. INFERCTL_API_URL is
+// not documented for the controller credential, so it must never be used.
+func TestNASCleanupMasterDefaultURLIgnoresInferctl(t *testing.T) {
+	t.Setenv("INFERCTL_API_URL", "https://inferctl.test")
+	t.Setenv("BACKEND_API_URL", "")
+	if got := nasCleanupMasterDefaultBaseURL(); got != "" {
+		t.Fatalf("undocumented INFERCTL origin used: %q", got)
+	}
+	sent := 0
+	do := func(method, base, token, path string, body any) (map[string]any, error) {
+		sent++
+		return masterReply(true, true), nil
+	}
+	cfg := config.Config{NASCleanupControllerToken: "controller-token-32-bytes-long-000000"}
+	if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"status"}, do); err == nil || sent != 0 {
+		t.Fatalf("status dispatched with only INFERCTL_API_URL: err=%v sent=%d", err, sent)
+	}
+	t.Setenv("BACKEND_API_URL", "https://documented.test")
+	if got := nasCleanupMasterDefaultBaseURL(); got != "https://documented.test" {
+		t.Fatalf("BACKEND_API_URL not honoured: %q", got)
+	}
+	if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"status"}, do); err != nil || sent != 1 {
+		t.Fatalf("documented default URL rejected: %v sent=%d", err, sent)
+	}
+}
+
+// The dedicated controller request must refuse redirects: a 3xx could replay
+// the bearer credential at another origin or path. Only a status code is ever
+// reported, never a response body that might echo operator text.
+func TestNASCleanupMasterRequestRefusesRedirectsAndLeaksNothing(t *testing.T) {
+	var reached int
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached++
+		w.Write([]byte(`{"after":{"enabled":true}}`))
+	}))
+	defer target.Close()
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/api/v1/service/nas-cleanup/master", http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+	ctx := context.Background()
+	// Trust the disposable TLS origin only; the redirect target is plain HTTP so
+	// following it would be observable even without certificate trust.
+	oldTransport := nasCleanupMasterTransport
+	nasCleanupMasterTransport = origin.Client().Transport
+	defer func() { nasCleanupMasterTransport = oldTransport }()
+	_, err := nasCleanupMasterRequest(ctx, http.MethodGet, origin.URL, "controller-token-32-bytes-long-000000", "/api/v1/service/nas-cleanup/master", nil)
+	if err == nil {
+		t.Fatal("redirect was followed")
+	}
+	if reached != 0 {
+		t.Fatalf("redirect reached the credential's target: %d", reached)
+	}
+	if strings.Contains(err.Error(), "controller-token") {
+		t.Fatalf("error leaked the credential: %v", err)
 	}
 }

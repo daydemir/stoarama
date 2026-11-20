@@ -450,3 +450,115 @@ CREATE TRIGGER cleanup_history_probe_insert BEFORE INSERT ON cleanup_history_pro
 		t.Fatalf("bypass appended history: %d rows, want %d", len(got), before)
 	}
 }
+
+// Plan enable resets every item to pending. That reset must not be the first
+// statement to touch those rows: taking the master row lock before an
+// unprelocked item row would make an emergency OFF queue behind that item
+// waiter. Both enable paths (single plan control, batch advance) must fence the
+// item rows first, so an OFF arriving while they wait on the item succeeds at
+// once and the enable then rolls back instead of arming the plan.
+func TestNASCleanupEnablePathsFenceItemRowsBeforeTheMaster(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		start func(t *testing.T, f *cleanupFixture, ctx context.Context) func() int
+	}{
+		{
+			name: "plan enable",
+			start: func(t *testing.T, f *cleanupFixture, ctx context.Context) func() int {
+				plan, sha, _ := f.admit("p1-item-order", syntheticFiles(100, 2, 10))
+				f.dryRun()
+				return func() int {
+					return cleanupCall(t, f.s.handleAdminNASCleanupControl, 0, 0, "id", strconv.FormatInt(plan, 10),
+						map[string]any{"plan_sha256": sha, "mode": "enabled", "reason": "item fence order"}).Code
+				}
+			},
+		},
+		{
+			name: "batch advance",
+			start: func(t *testing.T, f *cleanupFixture, ctx context.Context) func() int {
+				p1, sha1, _ := f.admit("p1-adv-order-1", syntheticFiles(100, 2, 10))
+				p2, sha2, _ := f.admit("p2-adv-order-2", syntheticFiles(200, 2, 10))
+				f.dryRun()
+				if code, body := f.enableBatch([]int64{p1, p2}, []string{sha1, sha2}, 2); code != 200 {
+					t.Fatalf("batch enable: %d %s", code, body)
+				}
+				if _, err := f.pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='keep' WHERE plan_id=$1`, p1); err != nil {
+					t.Fatal(err)
+				}
+				return func() int {
+					if err := f.s.cleanupAdvanceBatch(ctx); err != nil {
+						t.Fatalf("advance: %v", err)
+					}
+					return 200
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCleanupFixture(t, 24)
+			setCleanupMaster(t, f.s, true)
+			ctx, cancel := context.WithTimeout(f.ctx, 90*time.Second)
+			defer cancel()
+			enable := tc.start(t, f, ctx)
+			// The next plan in order is the one that gets enabled: its first item
+			// is the row a later reset would update.
+			var target int64
+			if err := f.pool.QueryRow(ctx, `SELECT i.id FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id
+ WHERE p.mode='dry_run' ORDER BY p.id,i.ordinal LIMIT 1`).Scan(&target); err != nil {
+				t.Fatal(err)
+			}
+			blocker, err := f.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer blocker.Rollback(context.Background())
+			if _, err = blocker.Exec(ctx, `SELECT id FROM nas_cleanup_items WHERE id=$1 FOR UPDATE`, target); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan int, 1)
+			go func() { done <- enable() }()
+			cleanupWaitBlocked(t, f, blocker.Conn().PgConn().PID())
+			if n := cleanupMasterLocksWhileWaiting(t, f.pool); n != 0 {
+				t.Fatalf("%s held the master row lock while waiting on an item row: %d", tc.name, n)
+			}
+			flipMasterOffWithin(t, f.s, 5*time.Second)
+			if err = blocker.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-done:
+			case <-ctx.Done():
+				t.Fatal("blocked enable never finished")
+			}
+			for _, mode := range planModes(t, f.pool, ctx) {
+				if mode == "enabled" {
+					t.Fatalf("%s armed a plan after the item-contested OFF", tc.name)
+				}
+			}
+		})
+	}
+}
+
+// planModes returns every plan's mode in this fixture's schema.
+func planModes(t *testing.T, pool interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}, ctx context.Context) []string {
+	t.Helper()
+	rows, err := pool.Query(ctx, `SELECT mode FROM nas_cleanup_plans ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var modes []string
+	for rows.Next() {
+		var mode string
+		if err := rows.Scan(&mode); err != nil {
+			t.Fatal(err)
+		}
+		modes = append(modes, mode)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return modes
+}

@@ -505,11 +505,21 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 			util.WriteError(w, 409, "cleanup freeze/replay failed: "+err.Error())
 			return
 		}
+		// Reset every item to pending as a *fence* before the master read: the
+		// rows are locked here, so the guarded write below cannot block on an
+		// unprelocked item row while this transaction already holds the master
+		// row lock. All waiting must be over before that read.
+		if err = cleanupLockPlanItems(ctx, tx, id); err != nil {
+			util.WriteError(w, 500, "cleanup item fence failed")
+			return
+		}
 	}
 	// Read the master FOR SHARE last, immediately before the guarded write, so
 	// an emergency OFF waits only for decisions already past their fences. The
 	// activation above needs its own pool connections; holding the master lock
-	// there would stall OFF behind a pool checkout.
+	// there would stall OFF behind a pool checkout. A plan whose master is OFF
+	// is not enabled: this returns and the deferred Rollback discards every
+	// freeze, gate and lock taken above.
 	if req.Mode == "enabled" && !cleanupMasterOn(ctx, tx) {
 		util.WriteError(w, 409, "NAS deletion master switch is off")
 		return

@@ -130,3 +130,151 @@ func TestNASCleanupMasterMigrationRequiresDedicatedWriterOwner(t *testing.T) {
 		t.Fatalf("failed migration left %d tables behind", tables)
 	}
 }
+
+// Ordinary CREATE on the schema is not schema ownership: it cannot hand CREATE
+// or object ownership to another role, so 0229 must refuse such a migrator
+// instead of failing somewhere in the transfer.
+func TestNASCleanupMasterMigrationRequiresSchemaOwnership(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if dsn == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(ctx)
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	provisioner := "nas_mig_prov_" + suffix
+	creator := "nas_mig_creator_" + suffix
+	schema := "nas_mig_creator_" + suffix
+	for _, sql := range []string{
+		`CREATE ROLE ` + provisioner + ` NOLOGIN`,
+		`CREATE ROLE ` + creator + ` NOLOGIN`,
+		// The schema belongs to the provisioner; the migrator only gets CREATE.
+		`CREATE SCHEMA ` + schema + ` AUTHORIZATION ` + provisioner,
+		`GRANT CREATE, USAGE ON SCHEMA ` + schema + ` TO ` + creator,
+	} {
+		if _, err = admin.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() {
+		_, _ = admin.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
+		_, _ = admin.Exec(context.Background(), `DROP ROLE IF EXISTS `+creator)
+		_, _ = admin.Exec(context.Background(), `DROP ROLE IF EXISTS `+provisioner)
+	}()
+	var exists int
+	if err := admin.QueryRow(ctx, `SELECT count(*) FROM pg_roles WHERE rolname='nas_cleanup_master_writer'`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists == 0 {
+		if _, err = admin.Exec(ctx, `CREATE ROLE nas_cleanup_master_writer NOLOGIN`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = admin.Exec(ctx, `GRANT nas_cleanup_master_writer TO `+creator+` WITH SET TRUE`); err != nil {
+		t.Fatal(err)
+	}
+	err = applyCleanupMasterMigration(t, admin, ctx, schema, creator)
+	if err == nil {
+		t.Fatal("a CREATE-only migrator applied 0229; schema authority is required")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "transfer schema authority") {
+		t.Fatalf("wrong refusal for a non-owner migrator: %v", err)
+	}
+	var tables int
+	if err = admin.QueryRow(ctx, `SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname IN ('nas_cleanup_master','nas_cleanup_master_history')`, schema).Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if tables != 0 {
+		t.Fatalf("failed migration left %d tables behind", tables)
+	}
+}
+
+// The recorder must end up with no effective CREATE on the schema. Revoking the
+// direct grant is not enough when CREATE is inherited through another role, so
+// the migration verifies the effective privilege and fails closed rather than
+// silently leaving the insert-only recorder able to create objects.
+func TestNASCleanupMasterMigrationRefusesInheritedCreateForTheWriter(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if dsn == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(ctx)
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	owner := "nas_mig_inherit_owner_" + suffix
+	grantor := "nas_mig_inherit_grantor_" + suffix
+	schema := "nas_mig_inherit_" + suffix
+	for _, sql := range []string{
+		`CREATE ROLE ` + owner + ` NOLOGIN`,
+		`CREATE ROLE ` + grantor + ` NOLOGIN`,
+		`CREATE SCHEMA ` + schema + ` AUTHORIZATION ` + owner,
+	} {
+		if _, err = admin.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() {
+		_, _ = admin.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
+		_, _ = admin.Exec(context.Background(), `DROP ROLE IF EXISTS `+grantor)
+		_, _ = admin.Exec(context.Background(), `DROP ROLE IF EXISTS `+owner)
+	}()
+	var exists int
+	if err := admin.QueryRow(ctx, `SELECT count(*) FROM pg_roles WHERE rolname='nas_cleanup_master_writer'`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists == 0 {
+		if _, err = admin.Exec(ctx, `CREATE ROLE nas_cleanup_master_writer NOLOGIN`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The writer inherits CREATE from a role created for this test only, so the
+	// migration's own REVOKE cannot take it away.
+	if _, err = admin.Exec(ctx, `GRANT nas_cleanup_master_writer TO `+owner+` WITH SET TRUE;
+		GRANT CREATE ON SCHEMA `+schema+` TO `+grantor+`;
+		GRANT `+grantor+` TO nas_cleanup_master_writer`); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = admin.Exec(context.Background(), `REVOKE `+grantor+` FROM nas_cleanup_master_writer`)
+	}()
+	err = applyCleanupMasterMigration(t, admin, ctx, schema, owner)
+	if err == nil {
+		t.Fatal("migration kept an inherited CREATE for the insert-only recorder")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "create") {
+		t.Fatalf("wrong refusal for an inherited CREATE: %v", err)
+	}
+	var tables int
+	if err = admin.QueryRow(ctx, `SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname IN ('nas_cleanup_master','nas_cleanup_master_history')`, schema).Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if tables != 0 {
+		t.Fatalf("failed migration left %d tables behind", tables)
+	}
+}
+
+// The migration is documented for PostgreSQL 16+, where pg_auth_members
+// carries set_option. Verifying the module-level requirement keeps the doc and
+// the migration from drifting apart.
+func TestNASCleanupMasterMigrationStatesItsPostgresFloor(t *testing.T) {
+	body, err := os.ReadFile("../../../infra/sql/migrations/0229_nas_cleanup_master.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, want := range []string{"server_version_num", "160000", "PostgreSQL 16", "transfer schema authority", "has_schema_privilege"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("0229 no longer asserts %q", want)
+		}
+	}
+}

@@ -54,18 +54,52 @@ CREATE TRIGGER nas_cleanup_master_no_truncate BEFORE TRUNCATE ON nas_cleanup_mas
 -- recorder owner would make the actor on every history row the runtime role,
 -- which is exactly the evidence a compromised runtime could forge.
 --
--- Migrator privileges (see docs/NAS_CLEANUP.md): ownership of the schema (to
--- CREATE objects and transfer the recorder), CREATE on the schema for the new
--- owner at transfer time (granted and revoked below), and either CREATEROLE or
--- a pre-created `nas_cleanup_master_writer` role granted to the migrator WITH
--- SET TRUE. Nothing here needs a superuser, and the API runtime role needs no
--- part of it: it only executes the recorder through its triggers.
+-- Migrator privileges (see docs/NAS_CLEANUP.md). This migration states them as
+-- assertions instead of assuming them, so a wrong migrator fails with the exact
+-- missing authority rather than a mid-transaction privilege error:
+--
+--   * PostgreSQL 16 or newer. `pg_auth_members.set_option` and the rule that a
+--     CREATEROLE role is not automatically able to SET ROLE to a role it
+--     created both start at 16; on an older server this migration cannot tell a
+--     usable membership from an unusable one and would have to guess.
+--   * Authority to grant on the schema being migrated, not ordinary CREATE on
+--     it. CREATE lets a role add objects but never lets it hand CREATE (or
+--     object ownership) to another role, so the recorder transfer needs the
+--     schema owner, a role that can assume it, a holder of CREATE WITH GRANT
+--     OPTION, or a superuser. Refused with "cannot transfer schema authority".
+--   * CREATEROLE, or a pre-created `nas_cleanup_master_writer` granted to the
+--     migrator WITH SET TRUE.
+--
+-- The API runtime role needs no part of this: it only executes the recorder
+-- through its triggers.
 DO $$
 DECLARE
   history_table text := quote_ident(current_schema()) || '.nas_cleanup_master_history';
   history_schema text := quote_ident(current_schema());
   writer name := 'nas_cleanup_master_writer';
+  migrator_is_super boolean;
+  schema_owner name;
 BEGIN
+  IF current_setting('server_version_num')::int < 160000 THEN
+    RAISE EXCEPTION 'migration 0229 requires PostgreSQL 16 or newer (server is %)', current_setting('server_version');
+  END IF;
+  SELECT rolsuper INTO migrator_is_super FROM pg_roles WHERE rolname = current_user;
+  IF NOT coalesce(migrator_is_super, false) THEN
+    SELECT r.rolname INTO schema_owner
+      FROM pg_namespace n JOIN pg_roles r ON r.oid = n.nspowner
+     WHERE n.nspname = current_schema();
+    -- The transfer needs the migrator to be able to GRANT CREATE on this schema
+    -- to the incoming recorder owner. PostgreSQL allows that only for the schema
+    -- owner (or a role that can assume it) or a holder of CREATE WITH GRANT
+    -- OPTION. Plain CREATE can add objects but can never hand the privilege on,
+    -- so it is refused here rather than failing mid-transfer.
+    IF schema_owner IS NULL OR (
+         NOT pg_has_role(current_user, schema_owner, 'MEMBER')
+         AND NOT has_schema_privilege(current_user, current_schema(), 'CREATE WITH GRANT OPTION')) THEN
+      RAISE EXCEPTION 'migrator % cannot transfer schema authority in % (owner %)', current_user, current_schema(), coalesce(schema_owner::text, 'unknown')
+        USING HINT = 'run 0229 as the schema owner (or a member of it, or a holder of CREATE WITH GRANT OPTION); ordinary CREATE on the schema is not enough to hand the recorder its own CREATE';
+    END IF;
+  END IF;
   BEGIN
     CREATE ROLE nas_cleanup_master_writer NOLOGIN;
   EXCEPTION
@@ -166,6 +200,40 @@ ALTER TABLE nas_cleanup_master ENABLE ALWAYS TRIGGER nas_cleanup_master_no_trunc
 ALTER TABLE nas_cleanup_master ENABLE ALWAYS TRIGGER nas_cleanup_master_record;
 ALTER TABLE nas_cleanup_master_history ENABLE ALWAYS TRIGGER nas_cleanup_master_history_guard;
 ALTER TABLE nas_cleanup_master_history ENABLE ALWAYS TRIGGER nas_cleanup_master_history_no_truncate;
+
+-- Verify what the transfer was supposed to achieve, and fail closed if it did
+-- not. These are the properties the earlier statements only intend to establish,
+-- so a permissive default, a pre-existing grant or an inherited membership can
+-- never leave the insert-only recorder able to create objects in this schema.
+DO $$
+DECLARE
+  history_schema name := current_schema();
+  writer name := 'nas_cleanup_master_writer';
+  recorder_owner name;
+BEGIN
+  SELECT r.rolname INTO recorder_owner
+    FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner
+   WHERE p.pronamespace = history_schema::regnamespace
+     AND p.proname = 'record_nas_cleanup_master';
+  IF recorder_owner IS DISTINCT FROM writer THEN
+    RAISE EXCEPTION 'recorder is owned by %, not the dedicated recorder role %', coalesce(recorder_owner::text, 'nobody'), writer;
+  END IF;
+  -- Effective privilege, so ownership, a direct grant and an inherited grant all
+  -- count. The recorder must not be able to create anything here.
+  IF has_schema_privilege(writer, history_schema, 'CREATE') THEN
+    RAISE EXCEPTION 'recorder role % retains effective CREATE on schema %; refusing to keep a broader authority than the insert-only recorder needs', writer, history_schema
+      USING HINT = 'remove the grant or inherited membership that conveys CREATE, then re-run';
+  END IF;
+  IF has_schema_privilege(writer, history_schema, 'CREATE WITH GRANT OPTION') THEN
+    RAISE EXCEPTION 'recorder role % can re-grant CREATE on schema %', writer, history_schema;
+  END IF;
+  -- The recorder is the only writer of history: the runtime role executes it.
+  IF has_table_privilege(writer, history_schema || '.nas_cleanup_master_history', 'UPDATE')
+     OR has_table_privilege(writer, history_schema || '.nas_cleanup_master_history', 'DELETE')
+     OR has_table_privilege(writer, history_schema || '.nas_cleanup_master_history', 'TRUNCATE') THEN
+    RAISE EXCEPTION 'recorder role % holds destructive privileges on the history table', writer;
+  END IF;
+END $$;
 
 INSERT INTO nas_cleanup_master(enabled,actor,reason)
 VALUES(false,'migration 0229','initial state: OFF');

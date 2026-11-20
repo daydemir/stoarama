@@ -291,41 +291,70 @@ func (e *cleanupObserveEnv) budgetAllows(ctx context.Context, tx pgx.Tx, size in
 	return true, nil
 }
 
+// cleanupBudgetLockSQL reports whether this backend still holds the running
+// deletion budget advisory lock (see nasCleanupBudgetLock).
+const cleanupBudgetLockSQL = `SELECT EXISTS(SELECT 1 FROM pg_locks
+ WHERE locktype='advisory' AND granted AND objsubid=1
+ AND (classid::bigint::numeric*4294967296+objid::bigint::numeric)=$1::numeric)`
+
 // holdBudget takes the running-deletion-budget advisory lock and the issued
-// total it guards, at most once per transaction. It is a blocking fence, so it
-// is always taken before the master switch is read.
+// total it guards. It is a blocking fence, so it is always taken before the
+// master switch is read. The advisory lock lives in the transaction that took
+// it, but a per-observation savepoint rollback releases it, so a held marker is
+// only trusted while the lock is verifiably still held; otherwise it is retaken
+// and the issued total re-read before any permit is considered.
 func (e *cleanupObserveEnv) holdBudget(ctx context.Context, tx pgx.Tx) {
-	if e == nil || e.budgetHeld {
+	if e == nil {
 		return
 	}
+	if e.budgetHeld && cleanupLockProbe(ctx, tx, cleanupBudgetLockSQL, nasCleanupBudgetLock) {
+		return
+	}
+	e.budgetHeld = false
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupBudgetLock); err != nil {
 		return
 	}
 	if err := tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&e.issued); err != nil {
 		return
 	}
-	e.budgetHeld = true
+	e.budgetHeld = cleanupLockProbe(ctx, tx, cleanupBudgetLockSQL, nasCleanupBudgetLock)
 }
 
 // deletionMaster reports whether deletion authority may be minted, reading the
 // master switch FOR SHARE only on an execution path and only after every
-// blocking fence and row lock (including the budget lock above). It reads at
-// most once per transaction and keeps the row lock until commit, so an
+// blocking fence and row lock (including the budget lock above), so an
 // emergency OFF waits only for decisions already minting authority. A dry-run
 // path never reaches here and never locks the control. The read always runs on
 // the top-level transaction: a savepoint rollback would release its lock.
+//
+// The decision is bound to the actual lifetime of that lock, not to the batch.
+// A cached ON is authority only while the FOR SHARE row lock justified by it is
+// still held on this connection: a per-observation savepoint rollback releases
+// row locks taken after the savepoint (a replayed permit returns write=false and
+// its savepoint is rolled back), so the next observation must re-read instead of
+// minting a permit from an ON that an OFF has since replaced. A cached OFF is
+// the fail-closed answer and never needs the lock.
 func (e *cleanupObserveEnv) deletionMaster(ctx context.Context, tx pgx.Tx) bool {
 	if e == nil {
 		return cleanupMasterOn(ctx, tx)
 	}
-	if !e.masterRead {
-		owner := e.root
-		if owner == nil {
-			owner = tx
-		}
-		e.holdBudget(ctx, owner)
-		e.master, e.masterRead = cleanupMasterOn(ctx, owner), true
+	owner := e.root
+	if owner == nil {
+		owner = tx
 	}
+	if e.masterRead {
+		if !e.master {
+			return false
+		}
+		if cleanupMasterLockHeld(ctx, owner) {
+			return true
+		}
+	}
+	e.masterRead = true
+	e.holdBudget(ctx, owner)
+	// No authority without a verified live row lock: a read that cannot be
+	// shown to still hold FOR SHARE is treated as OFF.
+	e.master = cleanupMasterOn(ctx, owner) && cleanupMasterLockHeld(ctx, owner)
 	return e.master
 }
 
@@ -1411,6 +1440,12 @@ func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
 	releaseFreeze, err = s.cleanupActivateRankings(ctx, tx, current)
 	if err != nil {
 		return pause("source freeze/replay failed: " + err.Error())
+	}
+	// Fence the new plan's item rows before the master read: the pending reset
+	// below must not be the statement that waits on an unprelocked row while
+	// this transaction holds the master row lock.
+	if err = cleanupLockPlanItems(ctx, tx, current); err != nil {
+		return pause("item fence failed: " + err.Error())
 	}
 	if !cleanupMasterOn(ctx, tx) {
 		return pause("master switch is off")
