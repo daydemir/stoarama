@@ -95,6 +95,10 @@ type inverseApplySummary struct {
 	Bytes            int64        `json:"bytes"`
 	ElapsedSeconds   float64      `json:"elapsed_seconds"`
 	ObjectsPerSecond float64      `json:"objects_per_second"`
+	// partitionRead reports that this batch reconciled its held intents and
+	// read its whole partition, so its held and last_modified_held snapshots
+	// are measurements.
+	partitionRead bool
 }
 type inverseRawTarget struct {
 	ID, StreamID    int64
@@ -949,6 +953,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	if hex.EncodeToString(manifestHash.Sum(nil)) != o.ManifestSHA {
 		return result, errors.New("partition changed while reading")
 	}
+	result.partitionRead = true
 	if o.Lane == inverseNASKeep28 {
 		jobs, err = a.selectKeep28(ctx, candidates)
 		if err != nil {

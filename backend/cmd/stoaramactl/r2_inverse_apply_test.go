@@ -696,6 +696,26 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			return tries
 		}
 	}
+	t.Run("failed_evidence_measures_nothing", func(t *testing.T) {
+		a, _ := build(1)
+		a.ledger.close()
+		dir := t.TempDir()
+		_, read, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(dir, "evidence-1.json"))
+		if err != nil || !read.partitionRead {
+			t.Fatalf("completed batch did not measure: %+v %v", read, err)
+		}
+		_, failed, err := runInverseJobBatch(ctx, pool, sdk, a.opts, filepath.Join(dir, "missing-owner-decision.md"), filepath.Join(dir, "evidence-2.json"))
+		if err == nil || failed.partitionRead {
+			t.Fatalf("refused evidence measured: %+v %v", failed, err)
+		}
+		total := inverseApplySummary{}
+		read.LastModifiedHeld = r2RetireStat{Objects: 1, Bytes: 100}
+		total.addBatch(read)
+		total.addBatch(failed)
+		if total.LastModifiedHeld != read.LastModifiedHeld {
+			t.Fatalf("failed batch erased the measurement: %+v", total.LastModifiedHeld)
+		}
+	})
 	t.Run("indeterminate_publication_COMMIT_stops_the_job", func(t *testing.T) {
 		// The error arrives only after COMMIT is sent: its outcome is not
 		// knowable in general, so it is never retried or held.
@@ -2251,8 +2271,11 @@ func TestR2InverseJobReadbackComparesHeldKeys(t *testing.T) {
 // Job totals sum every batch's counts; held keys are the latest snapshot.
 func TestR2InverseJobTotalsAddBatches(t *testing.T) {
 	total := inverseApplySummary{}
-	total.addBatch(inverseApplySummary{Selected: 3, Deleted: 2, Bytes: 200, CustodyShort: r2RetireStat{Objects: 1, Bytes: 100}, WireAmbiguous: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}})
-	total.addBatch(inverseApplySummary{Selected: 1, Deleted: 1, Bytes: 100, AmbiguousHeld: 1, HeldAbsent: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}})
+	total.addBatch(inverseApplySummary{Selected: 3, Deleted: 2, Bytes: 200, CustodyShort: r2RetireStat{Objects: 1, Bytes: 100}, WireAmbiguous: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}, partitionRead: true})
+	total.addBatch(inverseApplySummary{Selected: 1, Deleted: 1, Bytes: 100, AmbiguousHeld: 1, HeldAbsent: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}, partitionRead: true})
+	// A batch that failed before reading its partition (its evidence was
+	// refused) measured nothing: the last measurement stands.
+	total.addBatch(inverseApplySummary{})
 	// last_modified_held comes from the partition every batch rereads: a snapshot.
 	if total.Selected != 4 || total.Deleted != 3 || total.Bytes != 300 || total.CustodyShort != (r2RetireStat{Objects: 1, Bytes: 100}) || total.LastModifiedHeld != (r2RetireStat{Objects: 2, Bytes: 200}) || !slices.Equal(total.WireAmbiguous, []string{"managed/a"}) || total.AmbiguousHeld != 1 || !slices.Equal(total.HeldAbsent, []string{"managed/a"}) {
 		t.Fatalf("job totals: %+v", total)

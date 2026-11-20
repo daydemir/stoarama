@@ -212,7 +212,8 @@ selection observed (source ID, catalog path, size, media SHA, sidecar digest
 and size) before it considers custody age; any difference, or a changed
 state, stops the batch. A job is done only when a clean batch selected
 nothing. Job totals sum per-batch counts; held keys and `last_modified_held`
-are snapshots of the latest batch.
+are snapshots of the latest batch that read its partition; a batch that failed
+before reading it keeps the last measurement.
 
 Custody is a 24-hour freshness policy on an existing, verified NAS copy, not a
 physical deadline. The requirement is that custody is valid at the last

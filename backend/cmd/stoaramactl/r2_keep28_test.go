@@ -756,7 +756,10 @@ func TestKeep28QueuedKeyCustodyOutcome(t *testing.T) {
 		// Another valid digest: the sidecar selection observed was replaced.
 		"sidecar_digest":      `UPDATE nas_inventory_files SET sidecar_sha256=repeat('d',64) WHERE clip_id=9000001`,
 		"sidecar_digest_aged": `UPDATE nas_inventory_files SET sidecar_sha256=repeat('d',64),verified_at=clock_timestamp()-interval '24 hours 1 second' WHERE clip_id=9000001`,
-		// The key now names clip 3: same size, ETag and digests, its own valid custody.
+		// The key now names clip 3, which already carries clip 1's catalog,
+		// custody and sidecar paths: same size, ETag, paths and digests, its own
+		// valid custody. Only the source ID differs, and moving object keys
+		// leaves the KE epoch alone, so only the identity comparison can halt it.
 		"reassigned_clip": `UPDATE recording_clips SET object_key='managed/acct-47/keep28/moved.mp4' WHERE id=9000001; UPDATE recording_clips SET object_key='managed/acct-47/keep28/1.mp4' WHERE id=9000003`,
 		// The same clip's media SHA changes in catalog and inventory alike.
 		"media_sha": `UPDATE recording_clips SET sha256=repeat('e',64) WHERE id=9000001; UPDATE nas_inventory_files SET sha256=repeat('e',64) WHERE clip_id=9000001`,
@@ -768,6 +771,13 @@ func TestKeep28QueuedKeyCustodyOutcome(t *testing.T) {
 			f := newKeep28FixtureCount(t, 3)
 			f.writeManifest(t, 2)
 			f.store.headWithoutSHA = true
+			if change == "reassigned_clip" {
+				// Before the batch reads its KE epoch, which a path change advances.
+				if _, err := f.pool.Exec(f.ctx, `UPDATE recording_clips SET display_path='keep28/1.mp4' WHERE id=9000003;
+ UPDATE nas_inventory_files SET relative_path='keep28/1.mp4',sidecar_relative_path='keep28/1.mp4.stoarama.json' WHERE clip_id=9000003`); err != nil {
+					t.Fatal(err)
+				}
+			}
 			// The change waits for the epoch row behind key 2's network
 			// transaction, so it commits after key 2 and before key 1 reserves:
 			// protection metadata changes cannot commit while a DELETE holds it.

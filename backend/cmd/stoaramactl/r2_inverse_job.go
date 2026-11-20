@@ -103,8 +103,9 @@ func runInverseJobBatches(ctx context.Context, pool *pgxpool.Pool, store inverse
 
 // addBatch folds one batch into the job total. Selected, deleted, byte and
 // custody_short counts are per batch and sum. Held keys and last_modified_held
-// are snapshots of the latest batch: every batch rereads the same held intents
-// and the same partition, so summing would count them again.
+// are snapshots of the latest batch that read its partition: every batch
+// rereads the same held intents and the same partition, so summing would count
+// them again, and a batch that failed before reading keeps the last measurement.
 func (t *inverseApplySummary) addBatch(r inverseApplySummary) {
 	t.Selected += r.Selected
 	t.Deleted += r.Deleted
@@ -113,7 +114,9 @@ func (t *inverseApplySummary) addBatch(r inverseApplySummary) {
 	t.CustodyShort.Bytes += r.CustodyShort.Bytes
 	t.WireAmbiguous = append(t.WireAmbiguous, r.WireAmbiguous...)
 	t.Unpublished = append(t.Unpublished, r.Unpublished...)
-	t.AmbiguousHeld, t.HeldAbsent, t.LastModifiedHeld = r.AmbiguousHeld, r.HeldAbsent, r.LastModifiedHeld
+	if r.partitionRead {
+		t.AmbiguousHeld, t.HeldAbsent, t.LastModifiedHeld = r.AmbiguousHeld, r.HeldAbsent, r.LastModifiedHeld
+	}
 }
 
 // inverseJobPartition writes and stores a fresh partition, or restores the
