@@ -252,10 +252,12 @@ func (a *inverseApplier) authorize(admitCtx, wireCtx context.Context, tx pgx.Tx,
 }
 
 // errInverseLateAttemptCommit reports a wire attempt COMMIT its server
-// acknowledged after the pre-issuance bound had already passed. It always wraps
-// context.DeadlineExceeded, so the deadline meaning is preserved, and it is
-// deliberately distinct from an ambiguous COMMIT: that one never reaches this
-// check, because an unknown outcome is held before any authority could exist.
+// acknowledged after the pre-issuance bound had already passed. It wraps
+// whatever ended the bound, so an expired bound keeps context.DeadlineExceeded
+// while an explicit cancellation keeps context.Canceled and is never mistaken
+// for a timeout. It is deliberately distinct from an ambiguous COMMIT: that one
+// never reaches this check, because an unknown outcome is held before any
+// authority could exist.
 var errInverseLateAttemptCommit = errors.New("wire attempt committed after its pre-issuance bound")
 
 // inversePreIssuanceExpired reports whether the effective pre-issuance bound has

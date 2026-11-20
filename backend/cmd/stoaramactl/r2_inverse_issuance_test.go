@@ -139,13 +139,18 @@ func TestR2InversePreIssuanceHonorsTheWireDeadlineNotAdmission(t *testing.T) {
 // commitAckDelay blocks the return of an already acknowledged COMMIT until the
 // traced context really expires, so the server's success reaches the caller
 // late while the wire context stays healthy. It records that a successful
-// COMMIT hook was observed, so the case can prove the ack actually happened
-// rather than merely that some deadline error surfaced. Matching happens per
-// query on the context TraceQueryStart returns, so it is safe under concurrent
-// use and touches no production code.
+// COMMIT hook was observed, that the bound was still healthy on entry, and that
+// it then expired while waiting, so the case can prove the expiration happened
+// inside a successful hook rather than before it. Matching happens per query on
+// the context TraceQueryStart returns, so it is safe under concurrent use and
+// touches no production code.
 type commitAckDelay struct {
 	armed    atomic.Bool
 	observed atomic.Bool
+	// liveOnEntry records ctx.Err()==nil as the successful hook is entered.
+	liveOnEntry atomic.Bool
+	// expiredWhileWaiting records that the bound then really expired in here.
+	expiredWhileWaiting atomic.Bool
 }
 
 type commitAckKey struct{}
@@ -161,10 +166,15 @@ func (c *commitAckDelay) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pg
 	if ctx.Value(commitAckKey{}) != true || data.Err != nil {
 		return
 	}
-	// The COMMIT was acknowledged with no error; only its return is late. Hold
-	// it until the traced context itself expires, which this test bounds.
+	// The COMMIT was acknowledged with no error; only its return is late. A
+	// healthy local COMMIT reaches this hook with its bound still live; the test
+	// gives that a wide margin so this never depends on scheduling.
+	c.liveOnEntry.Store(ctx.Err() == nil)
 	c.observed.Store(true)
+	// Hold the acknowledged COMMIT until the traced context itself expires, so
+	// the expiry is this hook's own doing, not the parent's.
 	<-ctx.Done()
+	c.expiredWhileWaiting.Store(ctx.Err() != nil)
 }
 
 // stalledDeadlineContext reports a deadline that has already passed while its
@@ -203,8 +213,10 @@ func TestR2InverseLateAcknowledgedAttemptCommitNeverMints(t *testing.T) {
 	a.pool = pool
 	tracer.armed.Store(true)
 	// Admission expires while the wire parent stays healthy, so only the late
-	// acknowledgement can end pre-issuance.
-	admitCtx, cancelAdmit := context.WithTimeout(f.ctx, 400*time.Millisecond)
+	// acknowledgement can end pre-issuance. One second leaves a wide margin for
+	// the local COMMIT to reach its hook with the bound still live, so the case
+	// proves expiration inside the successful hook rather than before it.
+	admitCtx, cancelAdmit := context.WithTimeout(f.ctx, time.Second)
 	defer cancelAdmit()
 	wireCtx, cancelWire := context.WithTimeout(f.ctx, 30*time.Second)
 	defer cancelWire()
@@ -214,6 +226,14 @@ func TestR2InverseLateAcknowledgedAttemptCommitNeverMints(t *testing.T) {
 	}
 	if !tracer.observed.Load() {
 		t.Fatal("no successful COMMIT hook was observed, so the case never exercised a late acknowledgement")
+	}
+	// The hook must have been entered with the bound healthy and then expired
+	// while it held the acknowledged COMMIT: that is the authored scenario.
+	if !tracer.liveOnEntry.Load() {
+		t.Fatal("the COMMIT hook was entered after the bound had already expired, so the case proved nothing about a late timer")
+	}
+	if !tracer.expiredWhileWaiting.Load() {
+		t.Fatal("the bound never expired inside the successful COMMIT hook")
 	}
 	if admitCtx.Err() == nil {
 		t.Fatal("admission did not actually expire, so the acknowledgement was never late")
