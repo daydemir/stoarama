@@ -101,16 +101,6 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
  fire_at,clip_start_at,clip_end_at,display_path) VALUES(30,1,$1,'stoarama','managed/keep-ranking.mp4',100,
  'test-etag',repeat('c',64),$2,$2,$3,'fixture/keep-ranking.mp4')`, provider.URL, bestStart, bestStart.AddDate(0, 0, 14))
 	endpoint := cleanupSHA([]byte(provider.URL))
-	exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, endpoint)
-	store, err := r2.New(ctx, r2.Config{Bucket: "stoarama", Endpoint: provider.URL,
-		AccessKey: "test", SecretKey: "test", WriterDB: pool})
-	if err != nil {
-		t.Fatal(err)
-	}
-	proofExpiry := time.Now().Add(time.Hour)
-	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil || !strings.Contains(err.Error(), "writer fence and drain") {
-		t.Fatal("staging retirement accepted an undrained fence", err)
-	}
 
 	t.Run("whole clips stay in their UTC start hour", func(t *testing.T) {
 		tx, err := pool.Begin(ctx)
@@ -145,6 +135,9 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 				t.Fatal(err)
 			}
 		}
+		if _, err := tx.Exec(ctx, `INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, endpoint); err != nil {
+			t.Fatal(err)
+		}
 		planned, err := PlanDurhamStitchHoldSet(ctx, tx, []int64{1}, "stoarama", provider.URL, 10)
 		if err != nil || len(planned.Hours) != 3 {
 			t.Fatalf("expected ordinary and two crossing-adjacent hours, with the partial scope hour withheld: %+v %v", planned.Hours, err)
@@ -166,6 +159,17 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 			t.Fatalf("expected four exact holds across three complete groups: %d %v", n, err)
 		}
 	})
+
+	exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, endpoint)
+	store, err := r2.New(ctx, r2.Config{Bucket: "stoarama", Endpoint: provider.URL,
+		AccessKey: "test", SecretKey: "test", WriterDB: pool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofExpiry := time.Now().Add(time.Hour)
+	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil || !strings.Contains(err.Error(), "writer fence and drain") {
+		t.Fatal("staging retirement accepted an undrained fence", err)
+	}
 
 	planTx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
