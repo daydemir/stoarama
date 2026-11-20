@@ -333,6 +333,9 @@ func TestNASCleanupMasterMigrationCreatesFreshWriterAndServesARuntimeRole(t *tes
 	if exists {
 		t.Skip("skipped fresh CREATE ROLE verification: nas_cleanup_master_writer already exists and is not provably this fixture's, so it is never dropped")
 	}
+	// The role is absent and this run is therefore the one that will create it via
+	// the migration. Only that fact authorizes dropping it during cleanup.
+	createdWriter := true
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
 	owner := "nas_mig_fresh_owner_" + suffix
 	runtime := "nas_mig_fresh_runtime_" + suffix
@@ -353,11 +356,16 @@ func TestNASCleanupMasterMigrationCreatesFreshWriterAndServesARuntimeRole(t *tes
 	}
 	defer func() {
 		// Dropping the database first removes the schema and its dependent
-		// recorder, which is what lets the roles go.
+		// recorder, which is what lets the roles go. Only the roles this test
+		// created are dropped: `owner` and `runtime` carry a unique per-run suffix,
+		// and the writer role is only dropped when this run recorded having created
+		// it itself. A role another package owns is never touched.
 		_, _ = admin.Exec(context.Background(), `DROP DATABASE IF EXISTS `+dbName)
-		_, _ = admin.Exec(context.Background(), `DROP ROLE IF EXISTS nas_cleanup_master_writer`)
 		_, _ = admin.Exec(context.Background(), `DROP ROLE IF EXISTS `+runtime)
 		_, _ = admin.Exec(context.Background(), `DROP ROLE IF EXISTS `+owner)
+		if createdWriter {
+			_, _ = admin.Exec(context.Background(), `DROP ROLE IF EXISTS nas_cleanup_master_writer`)
+		}
 	}()
 	schema := "fresh"
 	dbCfg, err := pgx.ParseConfig(dsn)

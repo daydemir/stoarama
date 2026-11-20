@@ -862,3 +862,174 @@ func assertLockedReadThenCommitOnly(t *testing.T, order *cleanupQueryOrder) {
 		t.Fatalf("statements after the locked read before COMMIT/ROLLBACK: %q", after)
 	}
 }
+
+// A positive advance must end with the real locked master read and then only
+// COMMIT. A savepoint-wrapped probe would leave RELEASE as the final statement,
+// which is the shape the transaction boundary forbids.
+func TestNASCleanupAdvanceEndsWithTheRealLockedRead(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	setCleanupMaster(t, f.s, true)
+	p1, sha1, _ := f.admit("adv-final-1", syntheticFiles(100, 2, 10))
+	p2, sha2, _ := f.admit("adv-final-2", syntheticFiles(200, 2, 10))
+	f.dryRun()
+	if code, body := f.enableBatch([]int64{p1, p2}, []string{sha1, sha2}, 2); code != 200 {
+		t.Fatalf("batch enable: %d %s", code, body)
+	}
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET state='keep' WHERE plan_id=$1`, p1); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(f.ctx, 60*time.Second)
+	defer cancel()
+	order := &cleanupQueryOrder{}
+	cfg := f.pool.Config()
+	cfg.ConnConfig.Tracer = order
+	traced, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer traced.Close()
+	s := &Server{pool: traced, r2: f.s.r2, cfg: f.s.cfg, nasCleanupReportCache: f.s.nasCleanupReportCache}
+	if err = s.cleanupAdvanceBatch(ctx); err != nil {
+		t.Fatalf("advance: %v", err)
+	}
+	if mode, _ := f.planMode(p2); mode != "enabled" {
+		t.Fatalf("advance did not enable the next plan: %s", mode)
+	}
+	assertLockedReadThenCommitOnly(t, order)
+}
+
+// The post-OFF pause must do the same: its readable-OFF branch ends with the real
+// locked read and then only COMMIT/ROLLBACK. This traces the helper's own
+// transaction.
+func TestNASCleanupPostOffPauseEndsWithTheRealLockedRead(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	plan, sha, _ := f.admit("pause-final", syntheticFiles(100, 2, 10))
+	f.dryRun()
+	setCleanupMaster(t, f.s, true)
+	if code, body := f.enableBatch([]int64{plan}, []string{sha}, 2); code != 200 {
+		t.Fatalf("batch enable: %d %s", code, body)
+	}
+	ctx, cancel := context.WithTimeout(f.ctx, 60*time.Second)
+	defer cancel()
+	if _, err := f.pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='keep' WHERE plan_id=$1`, plan); err != nil {
+		t.Fatal(err)
+	}
+	var batchID int64
+	if err := f.pool.QueryRow(ctx, `SELECT id FROM nas_cleanup_batches WHERE mode='enabled'`).Scan(&batchID); err != nil {
+		t.Fatal(err)
+	}
+	setCleanupMaster(t, f.s, false)
+	order := &cleanupQueryOrder{}
+	cfg := f.pool.Config()
+	cfg.ConnConfig.Tracer = order
+	traced, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer traced.Close()
+	s := &Server{pool: traced, r2: f.s.r2, cfg: f.s.cfg, nasCleanupReportCache: f.s.nasCleanupReportCache}
+	if err = s.cleanupPauseBatchAfterOff(ctx, batchID, []int64{plan}, "master switch is off"); err != nil {
+		t.Fatalf("pause after OFF: %v", err)
+	}
+	if mode, _ := f.batchMode(); mode != "paused" {
+		t.Fatalf("pause did not land: %s", mode)
+	}
+	assertLockedReadThenCommitOnly(t, order)
+}
+
+// Both observation endpoints must take exactly one initial posture read and carry
+// it through the provider prefetch. A second read inside the prefetch could
+// disagree with the first across a race. This traces a certified observation on
+// each endpoint and counts master reads before any transaction's locked read.
+func TestNASCleanupObservationReadsTheMasterOnceBeforePrefetch(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	f.useClientVersion(nasCleanupCertifiedStitchVersion)
+	plan, sha, _ := f.admit("one-posture", syntheticFiles(100, 2, 10))
+	f.dryRun()
+	setCleanupMaster(t, f.s, true)
+	if code, body := f.enableBatch([]int64{plan}, []string{sha}, 2); code != 200 {
+		t.Fatalf("batch enable: %d %s", code, body)
+	}
+	ctx, cancel := context.WithTimeout(f.ctx, 60*time.Second)
+	defer cancel()
+	tasks := f.leaseV2(8, 1, int64(1)<<40, "")
+	if len(tasks) == 0 {
+		t.Fatalf("no task")
+	}
+	task := tasks[0]
+	order := &cleanupQueryOrder{}
+	cfg := f.pool.Config()
+	cfg.ConnConfig.Tracer = order
+	traced, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer traced.Close()
+	s := &Server{pool: traced, r2: f.s.r2, cfg: f.s.cfg, nasCleanupReportCache: f.s.nasCleanupReportCache}
+	// Observation trace starts here; the count is only of unlocked posture reads,
+	// i.e. reads that are not the locked `FOR SHARE` decision.
+	before := countUnlockedMasterReads(order)
+	_ = cleanupCall(t, s.handleAccountNASCleanupObserve, 47, 5, "itemId", strconv.FormatInt(task.ItemID, 10),
+		cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: task.Attempt,
+			PlanSHA: task.PlanSHA, Outcome: "match", Proof: fixtureProof(task.Item), ClientVersion: f.version},
+		"fixture-boot "+f.version)
+	after := countUnlockedMasterReads(order)
+	if got := after - before; got > 1 {
+		t.Fatalf("the single-item endpoint read the master %d times before its locked decision, want at most 1", got)
+	}
+}
+
+// countUnlockedMasterReads counts posture reads of the control (any read that is
+// not the locked `FOR SHARE` decision).
+func countUnlockedMasterReads(order *cleanupQueryOrder) int {
+	order.mu.Lock()
+	defer order.mu.Unlock()
+	n := 0
+	for _, sql := range order.sql {
+		trimmed := strings.TrimSpace(sql)
+		if !strings.Contains(trimmed, "nas_cleanup_master") {
+			continue
+		}
+		if strings.Contains(trimmed, "FOR SHARE") || strings.Contains(trimmed, "FOR UPDATE") {
+			continue
+		}
+		if strings.HasPrefix(strings.ToUpper(trimmed), "SELECT") {
+			n++
+		}
+	}
+	return n
+}
+
+// A lease request that cannot execute must not trigger the advance, which takes
+// the exclusive public fence and the master row lock. The gate requires a
+// reviewed execution session plus nonzero files AND bytes: a file cap with zero
+// bytes leases nothing, so it must not start the advance either.
+func TestNASCleanupLeaseAdvanceGateRequiresRealExecutionWork(t *testing.T) {
+	cases := []struct {
+		name    string
+		proto   int
+		files   *int
+		bytes   *int64
+		session string
+		want    bool
+	}{
+		{name: "protocol 1 execution session", proto: 1, session: nasCleanupExecutionClientVersion, want: true},
+		{name: "protocol 1 non-execution session", proto: 1, session: "dryrun-only-dev", want: false},
+		{name: "protocol 2 files and bytes", proto: 2, files: cleanupCapFiles(1), bytes: cleanupCapBytes(1), session: nasCleanupExecutionClientVersion, want: true},
+		{name: "protocol 2 zero files", proto: 2, files: cleanupCapFiles(0), bytes: cleanupCapBytes(1), session: nasCleanupExecutionClientVersion, want: false},
+		{name: "protocol 2 zero bytes", proto: 2, files: cleanupCapFiles(4), bytes: cleanupCapBytes(0), session: nasCleanupExecutionClientVersion, want: false},
+		{name: "protocol 2 nil caps", proto: 2, session: nasCleanupExecutionClientVersion, want: false},
+		{name: "protocol 2 non-execution session", proto: 2, files: cleanupCapFiles(1), bytes: cleanupCapBytes(1), session: "dryrun-only-dev", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := cleanupLeaseRequestCanExecute(tc.proto, tc.files, tc.bytes, cleanupClientSession{version: tc.session, boot: "b"})
+			if got != tc.want {
+				t.Fatalf("canExecute=%t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func cleanupCapFiles(v int) *int     { return &v }
+func cleanupCapBytes(v int64) *int64 { return &v }

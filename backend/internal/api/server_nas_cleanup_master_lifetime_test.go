@@ -547,8 +547,26 @@ func TestNASCleanupGroupedLeaseOverflowStillGatedByFinalMaster(t *testing.T) {
 	// one approved task, and its final FOR SHARE queues behind the OFF.
 	leaseDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() { leaseDone <- lease() }()
-	// Give it time to reach the gate, then let the queued OFF commit first.
-	time.Sleep(300 * time.Millisecond)
+	// Synchronize on the real in-window state, not a sleep: wait until a backend is
+	// blocked on the authoritative master FOR SHARE itself. That proves the lease
+	// has already buffered its approved group task and reached the final gate while
+	// the queued OFF is still ahead of it.
+	gateDeadline := time.Now().Add(10 * time.Second)
+	for {
+		var inGate bool
+		if err := f.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+ WHERE datname=current_database() AND wait_event_type='Lock'
+ AND query LIKE '%'||$1||'%')`, "SELECT enabled FROM nas_cleanup_master FOR SHARE").Scan(&inGate); err != nil {
+			t.Fatal(err)
+		}
+		if inGate {
+			break
+		}
+		if time.Now().After(gateDeadline) {
+			t.Fatal("the lease never reached its authoritative master read while buffering an approval")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	if err = holder.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -651,5 +669,70 @@ func TestNASCleanupLeaseReplayExpiredPlanIsNotHandedBack(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("replay did not finish")
+	}
+}
+
+// A fresh certified observation under OFF must still commit the ordinary durable
+// non-deleting observation (the would_delete record plus the plan pause), in both
+// endpoints, without any provider evidence being guessed and without a permit.
+func TestNASCleanupCertifiedFreshObservationUnderOffIsDurable(t *testing.T) {
+	for _, endpoint := range []string{"single", "batch"} {
+		t.Run(endpoint, func(t *testing.T) {
+			f := newCleanupFixture(t, 24)
+			f.useClientVersion(nasCleanupCertifiedStitchVersion)
+			plan, sha, _ := f.admit("cert-off-"+endpoint, syntheticFiles(100, 2, 10))
+			f.dryRun()
+			setCleanupMaster(t, f.s, true)
+			if code, body := f.enableBatch([]int64{plan}, []string{sha}, 2); code != 200 {
+				t.Fatalf("batch enable: %d %s", code, body)
+			}
+			tasks := f.leaseV2(8, 1, int64(1)<<40, "")
+			if len(tasks) == 0 {
+				t.Fatalf("no task")
+			}
+			task := tasks[0]
+			setCleanupMaster(t, f.s, false)
+			before := f.issuedPermits(t, plan)
+			observation := map[string]any{
+				"item_id": task.ItemID, "attempt": task.Attempt, "plan_sha256": task.PlanSHA,
+				"reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match",
+				"proof": fixtureProof(task.Item), "error": "", "client_version": f.version}
+			var body string
+			if endpoint == "single" {
+				w := cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", strconv.FormatInt(task.ItemID, 10),
+					cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: task.Attempt,
+						PlanSHA: task.PlanSHA, Outcome: "match", Proof: fixtureProof(task.Item), ClientVersion: f.version},
+					"fixture-boot "+f.version)
+				if w.Code != 200 {
+					t.Fatalf("observation under OFF: %d %s", w.Code, w.Body.String())
+				}
+				body = w.Body.String()
+			} else {
+				w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{
+					"client_version": f.version, "observations": []map[string]any{observation}}, "fixture-boot "+f.version)
+				if w.Code != 200 {
+					t.Fatalf("batch observation under OFF: %d %s", w.Code, w.Body.String())
+				}
+				body = w.Body.String()
+			}
+			if strings.Contains(body, `"delete":true`) {
+				t.Fatalf("%s observation issued authority under OFF: %s", endpoint, body)
+			}
+			// The durable record is committed: a non-deleting observation and the
+			// ordinary pause, not an aborted preflight.
+			if after := f.issuedPermits(t, plan); after != before {
+				t.Fatalf("%s observation changed permit count under OFF: %d -> %d", endpoint, before, after)
+			}
+			var state string
+			if err := f.pool.QueryRow(f.ctx, `SELECT state FROM nas_cleanup_items WHERE id=$1`, task.ItemID).Scan(&state); err != nil {
+				t.Fatal(err)
+			}
+			if state != "would_delete" {
+				t.Fatalf("%s observation did not durably record a non-deleting observation: %s", endpoint, state)
+			}
+			if mode, reason := f.planMode(plan); mode != "paused" || !strings.Contains(reason, "auto-paused") {
+				t.Fatalf("%s observation did not durably pause: %s %q", endpoint, mode, reason)
+			}
+		})
 	}
 }

@@ -69,27 +69,6 @@ func cleanupMasterRequired(ctx context.Context, tx pgx.Tx) (bool, error) {
 	return on, err
 }
 
-// cleanupMasterProbeLocked is the locked read used where a missing or unreadable
-// control must not abort writes that are already prepared. It takes the FOR SHARE
-// row lock on the caller's transaction, so a readable result is authoritative and
-// its lock lasts to commit; a failed read is contained in a nested scope and
-// reported as an error, which callers treat as "not authorised".
-func cleanupMasterProbeLocked(ctx context.Context, tx pgx.Tx) (bool, error) {
-	save, err := tx.Begin(ctx)
-	if err != nil {
-		return false, err
-	}
-	var on bool
-	if err = save.QueryRow(ctx, cleanupMasterReadSQL).Scan(&on); err != nil {
-		_ = save.Rollback(ctx)
-		return false, err
-	}
-	if err = save.Commit(ctx); err != nil {
-		return false, err
-	}
-	return on, nil
-}
-
 // cleanupMasterOnTx reads the master switch inside a savepoint. A read error
 // (or a missing row) rolls back only that savepoint, so the caller's
 // transaction is never left aborted: read-only dry-run work and batch

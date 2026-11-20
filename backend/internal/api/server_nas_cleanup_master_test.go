@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -481,8 +482,10 @@ func TestNASCleanupMasterOffDoesNotStallBehindFencedHandler(t *testing.T) {
 	}
 }
 
-// Batch auto-pause must still commit when the master read fails: the savepoint
-// keeps the caller's transaction usable.
+// When the master control cannot be read at all, the advance must NOT report
+// success: the decision could not be taken. It returns a distinguishable
+// unavailable error, and the caller's separate negative path records the durable
+// pause. This exercises the exact contract the handlers rely on.
 func TestNASCleanupMasterReadErrorStillPausesBatch(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	p1, sha1, _ := f.admit("autopause-1", syntheticFiles(100, 2, 10))
@@ -499,14 +502,19 @@ func TestNASCleanupMasterReadErrorStillPausesBatch(t *testing.T) {
 	if _, err := f.pool.Exec(f.ctx, `ALTER TABLE nas_cleanup_master RENAME TO nas_cleanup_master_gone`); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.s.cleanupAdvanceBatch(f.ctx); err != nil {
-		t.Fatalf("advance failed instead of pausing: %v", err)
+	err := f.s.cleanupAdvanceBatch(f.ctx)
+	var unavailable *cleanupMasterUnavailable
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("an unreadable master must surface as unavailable, got %v", err)
 	}
-	if mode, reason := f.batchMode(); mode != "paused" || !strings.Contains(reason, "master switch is off") {
-		t.Fatalf("batch not paused on an unreadable master: %s %q", mode, reason)
-	}
+	// Nothing was enabled by the failed advance.
 	if mode, _ := f.planMode(p2); mode != "dry_run" {
 		t.Fatalf("plan enabled with an unreadable master: %s", mode)
+	}
+	// The handler's separate negative path records the durable pause.
+	f.s.cleanupHandleAdvanceError(f.ctx, err)
+	if mode, reason := f.batchMode(); mode != "paused" || !strings.Contains(reason, "master switch is off") {
+		t.Fatalf("batch not paused on an unreadable master: %s %q", mode, reason)
 	}
 }
 

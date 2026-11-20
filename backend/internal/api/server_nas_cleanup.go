@@ -798,7 +798,13 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	// public fence and the master row lock, so a zero-execution-file or dry-only
 	// lease must not start it and thereby delay an emergency OFF.
 	s.cleanupExpireApprovals(ctx)
-	if req.Protocol == 1 || *req.ExecutionFiles > 0 {
+	// Only a request that could actually execute may trigger an advance: advancing
+	// takes the exclusive public fence and the master row lock, so a request that
+	// cannot lease execution work must not start it and delay an emergency OFF.
+	// "Could execute" means a reviewed execution session AND nonzero execution
+	// files AND bytes — not merely the protocol field or a file cap with zero
+	// bytes, which leases nothing.
+	if cleanupLeaseRequestCanExecute(req.Protocol, req.ExecutionFiles, req.ExecutionBytes, cleanupRequestSession(r)) {
 		s.cleanupAdvanceBatchIfIdle(ctx)
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -857,7 +863,10 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 					return
 				}
 			}
-			if err = s.cleanupLeaseAuthorize(ctx, tx, allowExecution, replayed, sessionDeadline); err != nil {
+			// The final read is required because the replay carries a real buffered
+			// approval, exactly as a fresh group does — not because a mutable flag
+			// happens to still be set.
+			if err = s.cleanupLeaseAuthorize(ctx, tx, cleanupHasExecutionTasks(replayed), replayed, sessionDeadline); err != nil {
 				if !errors.Is(err, errCleanupLeaseDenied) {
 					util.WriteError(w, 500, "cleanup lease save failed")
 					return
@@ -1053,6 +1062,21 @@ func cleanupHasExecutionTasks(tasks []cleanupTask) bool {
 }
 
 var errCleanupLeaseDenied = errors.New("cleanup lease authority denied")
+
+// cleanupLeaseRequestCanExecute reports whether a lease request can hand out
+// deletion authority at all. It requires a reviewed execution session, non-nil
+// execution caps, at least one execution file and a positive byte budget: an
+// execution-files cap with zero bytes leases nothing, so it must not trigger the
+// fencing, master-locking advance either.
+func cleanupLeaseRequestCanExecute(protocol int, files *int, bytes *int64, session cleanupClientSession) bool {
+	if protocol == 1 {
+		return nasCleanupSupportsExecution(session.version)
+	}
+	if files == nil || bytes == nil {
+		return false
+	}
+	return *files > 0 && *bytes > 0 && nasCleanupSupportsExecution(session.version)
+}
 
 // cleanupLeaseReplay returns the still-leased, unexpired tasks of an earlier
 // identical lease request (its response was lost), with the same attempt and
@@ -1293,16 +1317,16 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 	// releases no buffered affirmative answer.
 	posture := cleanupInitialPosture(ctx, s.pool)
 	presumedDenied := posture == cleanupAuthorityDenied
+	// Carry the one posture on the env so the provider prefetch reads it instead of
+	// issuing a second master read.
+	env.authority = posture
 	if req.Outcome == "match" {
 		// Recovery evidence is needed either way: a denied observation still records
 		// the exact recovery it proved before declining to permit.
 		env.prefetched = s.cleanupPrefetchRecovery(ctx, cid, map[int64]string{id: req.MD5})
-		// The aborted-stage R2 lookup exists only to prepare a permit, so an
-		// already-OFF switch skips it: that is the issuance-only preflight the
-		// cheap read is allowed to skip. It grants nothing either way.
-		if !presumedDenied {
-			s.cleanupPrefetchAbortedStitchAbsences(ctx, cid, []cleanupBatchObservation{{ItemID: id, cleanupObserve: req}}, env)
-		}
+		// The aborted-stage R2 lookup exists only to prepare a permit; the prefetch
+		// itself stands down on a denied posture, using the posture it was given.
+		s.cleanupPrefetchAbortedStitchAbsences(ctx, cid, []cleanupBatchObservation{{ItemID: id, cleanupObserve: req}}, env)
 	}
 	if cleanupObservationExpired(ctx) {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")

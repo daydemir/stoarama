@@ -890,10 +890,10 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 	// the ordinary non-deleting observations and pause, but skips the
 	// issuance-only aborted-stage preflight instead of guessing evidence.
 	posture := cleanupInitialPosture(ctx, s.pool)
-	env := &cleanupObserveEnv{session: cleanupAdmissionSession(r, req.ClientVersion), dryRunOnly: dryRunOnly, freshRequests: freshRequests, prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
-	if posture == cleanupAuthorityTentative {
-		s.cleanupPrefetchAbortedStitchAbsences(ctx, cid, matches, env)
-	}
+	// The posture is carried on the env, so the provider prefetch reads it rather
+	// than issuing a second master read of its own.
+	env := &cleanupObserveEnv{session: cleanupAdmissionSession(r, req.ClientVersion), dryRunOnly: dryRunOnly, freshRequests: freshRequests, authority: posture, prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
+	s.cleanupPrefetchAbortedStitchAbsences(ctx, cid, matches, env)
 	if cleanupObservationExpired(ctx) {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
 		return
@@ -1363,7 +1363,7 @@ func (s *Server) cleanupAdvanceBatchAfter(ctx context.Context, planID int64) {
 		return
 	}
 	if err := s.cleanupAdvanceBatch(ctx); err != nil {
-		log.Printf("nas cleanup batch advance deferred: %v", err)
+		s.cleanupHandleAdvanceError(ctx, err)
 	}
 }
 
@@ -1378,8 +1378,71 @@ func (s *Server) cleanupAdvanceBatchIfIdle(ctx context.Context) {
 		return
 	}
 	if err := s.cleanupAdvanceBatch(ctx); err != nil {
-		log.Printf("nas cleanup batch advance deferred: %v", err)
+		s.cleanupHandleAdvanceError(ctx, err)
 	}
+}
+
+// cleanupHandleAdvanceError is the separate negative path an advance takes when it
+// could not complete its authoritative decision. Only a truly unavailable control
+// is handled here, by recording the ordinary durable pause in its own fenced
+// transaction. Every other error — a lock failure, a write failure, a failed
+// commit — is a real fault and is surfaced, never suppressed.
+func (s *Server) cleanupHandleAdvanceError(ctx context.Context, err error) {
+	var unavailable *cleanupMasterUnavailable
+	if !errors.As(err, &unavailable) {
+		log.Printf("nas cleanup batch advance deferred: %v", err)
+		return
+	}
+	if pauseErr := s.cleanupPauseBatchUnavailable(ctx, "master switch is off"); pauseErr != nil {
+		log.Printf("nas cleanup batch pause after an unavailable master failed: %v", pauseErr)
+	}
+}
+
+// cleanupMasterUnavailable marks a decision that could not be taken because the
+// control itself was missing or unreadable. It is deliberately distinct from an
+// OFF, from a lock error and from a write/commit failure.
+type cleanupMasterUnavailable struct{ err error }
+
+func (e *cleanupMasterUnavailable) Error() string {
+	return "cleanup master control unavailable: " + e.err.Error()
+}
+func (e *cleanupMasterUnavailable) Unwrap() error { return e.err }
+
+// cleanupPauseBatchUnavailable records the durable pause when the control cannot
+// be read at all, so a rolled-back advance still leaves the batch paused. It
+// reuses the ordinary plan-then-batch fence and roster checks, and deliberately
+// does not revalidate the switch it already knows it cannot read.
+func (s *Server) cleanupPauseBatchUnavailable(ctx context.Context, why string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, nasCleanupPublicFence); err != nil {
+		return err
+	}
+	var batchID int64
+	var ids []int64
+	if err = tx.QueryRow(ctx, `SELECT id,plan_ids FROM nas_cleanup_batches WHERE mode='enabled' AND account_id=47 AND connection_id=13 FOR UPDATE`).Scan(&batchID, &ids); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if err = cleanupLockPlans(ctx, tx, ids); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,
+ approval_reason=left('batch-completed: batch '||$2::text||' plan finished cleanly',500)
+ WHERE id=ANY($1) AND mode='enabled'
+  AND EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=nas_cleanup_plans.id)
+  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=nas_cleanup_plans.id AND i.state NOT IN ('deleted','keep'))`, ids, strconv.FormatInt(batchID, 10)); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, cleanupBatchAutoPauseSQL, batchID, why); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // cleanupPauseBatchAfterOff records, in its own transaction, the non-authority
@@ -1448,34 +1511,24 @@ func (s *Server) cleanupPauseBatchAfterOff(ctx context.Context, batchID int64, p
 	// control: that is the same fail-closed "not authorised" reading the advance
 	// itself uses, and dropping the bookkeeping would leave a rolled-back OFF half
 	// applied. The read error itself is surfaced so callers see the anomaly.
-	// A missing control must not abort these writes, and the read cannot simply be
-	// dropped: it has to be the last statement. It therefore runs in one nested
-	// scope of its own — released only after both writes are already applied — so
-	// an unreadable control degrades to "not authorised" while a readable ON still
-	// discards everything above.
-	on, readErr := cleanupMasterProbeLocked(ctx, tx)
-	if readErr == nil && on {
-		// A deliberate restart happened during the writes: discard them.
-		return nil
+	// One direct locked read, last, with only COMMIT/ROLLBACK after it. A readable
+	// ON discards the writes above (a deliberate restart). A read error is not an
+	// OFF either: it means this revalidation could not be completed, so the writes
+	// are discarded and the caller decides what durable state is still required.
+	on, readErr := cleanupMasterRequired(ctx, tx)
+	if readErr != nil {
+		if rbErr := tx.Rollback(ctx); rbErr != nil {
+			return rbErr
+		}
+		return &cleanupMasterUnavailable{err: readErr}
+	}
+	if on {
+		return nil // rollback discards the writes
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return err
 	}
-	return readErr
-}
-
-// isCleanupMasterUnavailable reports whether the error is the control being
-// missing or unreadable, as opposed to a failure to write.
-func isCleanupMasterUnavailable(err error) bool {
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) {
-		return false
-	}
-	switch pgErr.Code {
-	case "42P01", "42501", "3F000": // undefined table, insufficient privilege, invalid schema
-		return true
-	}
-	return false
+	return nil
 }
 
 // cleanupSamePlanRoster reports whether two ordered plan rosters are identical.
@@ -1618,19 +1671,17 @@ func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
 	if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='pending',lease_expires_at=NULL WHERE plan_id=$1`, current); err != nil {
 		return err
 	}
-	on, readErr := cleanupMasterProbeLocked(ctx, tx)
+	// One direct locked read, and nothing but COMMIT/ROLLBACK after it. A read
+	// error is NOT the same thing as an OFF: it means the decision could not be
+	// taken, so the caller must not treat the advance as handled by a pause whose
+	// own revalidation would fail the same way. That negative case is returned as
+	// a distinguishable error for the caller to record durably.
+	on, readErr := cleanupMasterRequired(ctx, tx)
 	if readErr != nil {
-		// The control is missing or unreadable. That is the same fail-closed "not
-		// authorised" reading used everywhere else, so the advance must not commit:
-		// roll back, then record the ordinary pause in its own fenced transaction.
-		if err = tx.Rollback(ctx); err != nil {
-			return err
+		if rbErr := tx.Rollback(ctx); rbErr != nil {
+			return rbErr
 		}
-		pauseErr := s.cleanupPauseBatchAfterOff(ctx, batchID, ids, "master switch is off")
-		if pauseErr != nil && !isCleanupMasterUnavailable(pauseErr) {
-			return pauseErr
-		}
-		return nil
+		return &cleanupMasterUnavailable{err: readErr}
 	}
 	if !on {
 		// The read just taken is the last statement this transaction runs: the
@@ -1640,19 +1691,7 @@ func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
 		if err = tx.Rollback(ctx); err != nil {
 			return err
 		}
-		// The advance is already rolled back; finish the non-authority bookkeeping
-		// in its own fenced transaction. A database failure is surfaced; an
-		// unreadable control is not a failure to record the pause (the writes land
-		// and the helper reports the read error separately), so it is logged and
-		// the advance is still considered handled.
-		pauseErr := s.cleanupPauseBatchAfterOff(ctx, batchID, ids, "master switch is off")
-		if pauseErr != nil && !isCleanupMasterUnavailable(pauseErr) {
-			return pauseErr
-		}
-		if pauseErr != nil {
-			log.Printf("nas cleanup batch pause recorded with unavailable master control: %v", pauseErr)
-		}
-		return nil
+		return s.cleanupPauseBatchAfterOff(ctx, batchID, ids, "master switch is off")
 	}
 	return tx.Commit(ctx)
 }
@@ -1763,8 +1802,12 @@ func (s *Server) handleAdminNASCleanupBatchEnable(w http.ResponseWriter, r *http
 	}
 	// Enabling the first plan is the ordinary advance step (fresh gates).
 	if err = s.cleanupAdvanceBatch(ctx); err != nil {
-		util.WriteJSON(w, 500, map[string]any{"error": "cleanup batch first plan enable failed; the batch stays enabled and advance is retried on the next lease", "detail": err.Error()})
-		return
+		var unavailable *cleanupMasterUnavailable
+		if !errors.As(err, &unavailable) {
+			util.WriteJSON(w, 500, map[string]any{"error": "cleanup batch first plan enable failed; the batch stays enabled and advance is retried on the next lease", "detail": err.Error()})
+			return
+		}
+		s.cleanupHandleAdvanceError(ctx, err)
 	}
 	var mode, why string
 	if err = s.pool.QueryRow(ctx, `SELECT mode,approval_reason FROM nas_cleanup_batches WHERE id=$1`, id).Scan(&mode, &why); err != nil || mode != "enabled" {
