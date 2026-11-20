@@ -164,17 +164,57 @@ both verified and server-received timestamps within 24 hours, exact sidecar
 path/size/SHA. The complete proof is persisted with the permanent B2 intent and
 compared again under lock, including timestamps and sidecar. Old October 30
 inventory does not qualify. The final inventory row stays locked through DELETE
-and confirming HEAD404. PostgreSQL time and monotonic elapsed duration bound
-each network handoff by the earlier of custody expiry and the existing
-30-second cap; local wall-clock skew cannot extend authority.
+and confirming HEAD404. Each PostgreSQL clock sample fixes custody expiry as
+one absolute local monotonic instant, 2 seconds early (`keep28CustodyMargin`).
+The authority keeps the running minimum across every sample, and every later
+handoff (first request byte, socket write deadline, confirming HEAD) ends at it
+or the existing 30-second cap, so neither a pause after sampling nor local
+wall-clock skew can extend authority. Selection takes only keys whose custody
+outlasts one network timeout plus the margin, so a key custody would skip uses
+no item or byte allowance. Reservation repeats that check under lock: a key
+whose custody shortened or aged out after selection is counted as
+`custody_short` and skipped before any reservation, intent, budget charge or
+ledger record, and fresh custody retries it. Selection admits only exact,
+complete inventory evidence, so a legacy row without sidecar evidence is
+ineligible rather than a batch failure. Reservation requires the identity
+selection observed (source ID, catalog path, size, media SHA, sidecar digest
+and size) before it considers custody age; any difference, or a changed
+state, stops the batch. A job is done only when a clean batch selected
+nothing. Job totals sum per-batch counts; held keys and `last_modified_held`
+are snapshots of the latest batch.
+
+Custody is a 24-hour freshness policy on an existing, verified NAS copy, not a
+physical deadline. The requirement is that custody is valid at the last
+PostgreSQL sample with at least the 2-second margin to spare. The accepted
+residuals, which have no data-loss consequence and get no further machinery:
+
+- the provider executing an already-accepted DELETE after expiry, bounded by
+  the 30-second network timeout;
+- a PostgreSQL clock step larger than the margin after the last sample;
+- a host suspend during which the monotonic clock stops.
 
 Migration 0204 creates independent `r2_keep28_intents`, `r2_keep28_attempts`,
 `r2_keep28_events` and a pending-source identity guard. Ordinary reservations
-and the conservative byte budget remain shared protections. B2 uses its own
-concrete verifier, single-use authority and exact one-attempt transport; no B1
-token grants B2 authority. An existing B2 intent is never retransmitted, even
-after a stop before wire. Restart publishes only a confirming HEAD404 against
-the exact persisted source/receipt; a present object remains `ambiguous_held`.
+and the conservative byte budget remain shared protections. B2 issues its
+single-use authority from its own lane tables and adds the custody proof and
+custody deadline to every check, but sends over the same one-attempt first-wire
+transport as B1: a fresh HTTP/1.1 connection per DELETE, the batch send gate on
+the first request byte, and the same lost-response classification. The first
+request byte is refused at or after the DELETE's deadline, which for B2 is never
+later than custody expiry, and the socket write deadline is set to that instant.
+A response counts as received when its first byte is read from the connection;
+a failed DELETE is classified only after its connection is closed and any read
+under way has returned. A B2 key whose DELETE lost its response stays held and
+is never retransmitted. An
+existing B2 intent is never retransmitted, even after a stop before wire.
+Restart treats held B2 intents exactly as B1's: an issued key whose object is
+gone is reported `held_absent`, an unissued one stops the run, and a present
+object must still match and remains `ambiguous_held`. `r2-inverse job-keep28`
+runs B2 batches with the same per-batch owner evidence and exact readback, over
+the B2 tables, as `r2-inverse job` does for B1. Its batches default to the
+100-object canary size, and it refuses to start without explicit `--max-bytes`
+and `--budget-24h-bytes` (0 = unlimited). Both jobs refuse more workers than the
+database pool allows before writing any partition or evidence.
 
 Deniz's November 17 order to delete group 3 that is on the NAS supersedes the
 stitch-proof prerequisite **only for this keep28 RAW lane**. This new command

@@ -61,6 +61,8 @@ type inverseApplyOptions struct {
 	Workers                                                                            int
 }
 type inverseApplySummary struct {
+	// Selected counts the new keys this batch chose to work on.
+	Selected      int64 `json:"selected"`
 	Deleted       int64 `json:"deleted"`
 	AmbiguousHeld int64 `json:"ambiguous_held"`
 	// HeldAbsent lists held keys, issued before this run, whose objects are gone.
@@ -68,6 +70,9 @@ type inverseApplySummary struct {
 	HeldAbsent       []string     `json:"held_absent"`
 	WireAmbiguous    []string     `json:"wire_ambiguous"`
 	LastModifiedHeld r2RetireStat `json:"last_modified_held"`
+	// CustodyShort counts keep-28 keys skipped before any write because their
+	// custody could end before a DELETE finishes; fresh custody retries them.
+	CustodyShort     r2RetireStat `json:"custody_short"`
 	Bytes            int64        `json:"bytes"`
 	ElapsedSeconds   float64      `json:"elapsed_seconds"`
 	ObjectsPerSecond float64      `json:"objects_per_second"`
@@ -326,8 +331,28 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	var custody *keep28Custody
 	if a.opts.Lane == inverseNASKeep28 {
 		c, err := a.lockKeep28Custody(ctx, tx, t)
+		aged := errors.Is(err, errR2RetireNASProofAged)
+		if err != nil && !aged {
+			return t, err
+		}
+		// The identity selection observed (source, catalog path, size, media
+		// and sidecar digests) must still be the locked one, whatever the
+		// proof's age: any change is a hard veto, never a skip.
+		if c.identity() != e.Selected {
+			return t, errors.New("keep-28 source or custody identity changed since selection")
+		}
+		if aged {
+			// Exact custody that aged out while the key waited is no failure.
+			return t, errKeep28CustodyShort
+		}
+		// Admit only a key that can finish inside custody: one network timeout
+		// must fit before the margin-early custody end. Nothing is written yet.
+		clock, err := keep28Clock(ctx, tx)
 		if err != nil {
 			return t, err
+		}
+		if clock.deadline(c.Expiry).Before(time.Now().Add(inverseNetworkTimeout)) {
+			return t, errKeep28CustodyShort
 		}
 		custody = &c
 	}
@@ -345,7 +370,7 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	if err != nil {
 		return t, err
 	}
-	intentSQL := `INSERT INTO ` + a.intentTable() + `(bucket,object_key,source_id,size_bytes,etag,last_modified,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice,endpoint_sha256,stream_id`
+	intentSQL := `INSERT INTO ` + a.opts.Lane.intentTable() + `(bucket,object_key,source_id,size_bytes,etag,last_modified,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice,endpoint_sha256,stream_id`
 	intentArgs := []any{a.store.Bucket(), e.Key, t.ID, e.SizeBytes, e.ETag, e.LastModified, a.opts.ManifestSHA, a.summary.PolicySHA256, a.summary.PicksSHA256, a.opts.DrainSHA, a.protection.Picks.Choices[t.StreamID].Choice, a.store.EndpointSHA256(), t.StreamID}
 	if custody != nil {
 		data, marshalErr := json.Marshal(custody)
@@ -395,7 +420,7 @@ func (g *inverseWireGuard) check(ctx context.Context, binding inverseDeleteBindi
 		return err
 	}
 	var durable bool
-	err := g.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM `+g.a.intentTable()+` WHERE bucket=$1 AND object_key=$2 AND source_id=$3 AND manifest_sha256=$4 AND drain_evidence_sha256=$5 AND endpoint_sha256=$6 AND size_bytes=$7 AND etag=$8 AND stream_id=$9 AND picks_sha256=$10 AND policy_sha256=$11 AND last_modified=$12)`, binding.Bucket, binding.Key, g.t.ID, g.a.opts.ManifestSHA, g.a.opts.DrainSHA, binding.EndpointSHA256, g.e.SizeBytes, g.e.ETag, g.t.StreamID, binding.PicksSHA256, binding.PolicySHA256, binding.LastModified).Scan(&durable)
+	err := g.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM `+g.a.opts.Lane.intentTable()+` WHERE bucket=$1 AND object_key=$2 AND source_id=$3 AND manifest_sha256=$4 AND drain_evidence_sha256=$5 AND endpoint_sha256=$6 AND size_bytes=$7 AND etag=$8 AND stream_id=$9 AND picks_sha256=$10 AND policy_sha256=$11 AND last_modified=$12)`, binding.Bucket, binding.Key, g.t.ID, g.a.opts.ManifestSHA, g.a.opts.DrainSHA, binding.EndpointSHA256, g.e.SizeBytes, g.e.ETag, g.t.StreamID, binding.PicksSHA256, binding.PolicySHA256, binding.LastModified).Scan(&durable)
 	if err != nil {
 		return err
 	}
@@ -406,6 +431,11 @@ func (g *inverseWireGuard) check(ctx context.Context, binding inverseDeleteBindi
 }
 
 const inverseNetworkTimeout = 30 * time.Second
+
+// errKeep28CustodyShort skips a keep-28 key whose custody ends within one
+// network timeout plus keep28CustodyMargin. It writes nothing durable and is
+// not a batch failure: the key is retried once its custody is refreshed.
+var errKeep28CustodyShort = errors.New("NAS custody too short to finish a DELETE; skipped before any write")
 
 // errInverseAdmissionClosed reports a key that wrote nothing because a sibling
 // already stopped the batch. It is never a failure of its own.
@@ -441,38 +471,26 @@ func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGat
 		return false, err
 	}
 	defer tx.Rollback(context.Background())
-	if a.opts.Lane == inverseNASKeep28 {
-		authority, authErr := a.authorizeKeep28(ctx, tx, e)
-		if authErr != nil {
-			return false, authErr
-		}
-		defer authority.cancel()
-		if send.isClosed() {
-			return false, errInverseAdmissionClosed
-		}
-		ctx = authority.ctx
-		err = a.store.(keep28DeleteStore).deleteKeep28Once(ctx, authority)
-		if err == nil {
-			confirming, cancel, clockErr := authority.bound(ctx)
-			if clockErr != nil {
-				return false, clockErr
-			}
-			defer cancel()
-			ctx = confirming
-		}
-	} else {
-		authority, authErr := a.authorize(ctx, tx, e, send)
-		if authErr != nil {
-			return false, authErr
-		}
-		if send.isClosed() {
-			return false, errInverseAdmissionClosed
-		}
-		err = a.store.(inverseDeleteStore).deleteOnce(ctx, authority)
-	}
+	authority, err := a.authorize(ctx, tx, e, send)
 	if err != nil {
-		return false, fmt.Errorf("single DELETE result ambiguous; intent retained, never retransmit: %w", err)
+		return false, err
 	}
+	defer authority.cancel()
+	if send.isClosed() {
+		return false, errInverseAdmissionClosed
+	}
+	if err = a.store.(inverseDeleteStore).deleteOnce(authority.ctx, authority); err != nil {
+		if errors.Is(err, errInverseWireAmbiguous) {
+			return false, fmt.Errorf("single DELETE result ambiguous; intent retained, never retransmit: %w", err)
+		}
+		return false, fmt.Errorf("single DELETE failed; intent retained, never retransmit: %w", err)
+	}
+	// Confirmation ends at the running custody minimum, sampled again here.
+	ctx, stop, err := authority.bound(authority.ctx)
+	if err != nil {
+		return false, err
+	}
+	defer stop()
 
 	if _, err = a.store.Head(ctx, e.Key); !r2.IsNotFound(err) {
 		if err == nil {
@@ -509,7 +527,7 @@ func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, mani
 	if a.opts.Lane == inverseNASKeep28 {
 		exactSource = ` AND lower(c.sha256)=i.custody->>'SHA' AND c.display_path=i.custody->>'Path' AND EXISTS(SELECT 1 FROM recordings r WHERE r.id=c.recording_id AND r.stream_id=i.stream_id)`
 	}
-	err = tx.QueryRow(ctx, `SELECT c.id FROM `+a.intentTable()+` i JOIN recording_clips c ON c.id=i.source_id
+	err = tx.QueryRow(ctx, `SELECT c.id FROM `+a.opts.Lane.intentTable()+` i JOIN recording_clips c ON c.id=i.source_id
  WHERE i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 AND i.endpoint_sha256=$4
  AND c.bucket=i.bucket AND c.object_key=i.object_key AND c.size_bytes=i.size_bytes AND btrim(c.etag,'"')=btrim(i.etag,'"')
  `+exactSource+` FOR UPDATE OF c`, a.store.Bucket(), e.Key, manifest, a.store.EndpointSHA256()).Scan(&sourceID)
@@ -517,26 +535,26 @@ func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, mani
 		return fmt.Errorf("absence publication requires exact source: %w", err)
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256,already_absent)
- SELECT 'raw',c.id,i.stream_id,c.bucket,c.object_key,c.size_bytes,lower(c.sha256),'`+a.retirementReason()+`',i.choice,$3,i.policy_sha256,$4
- FROM recording_clips c JOIN recordings r ON r.id=c.recording_id JOIN `+a.intentTable()+` i ON i.source_id=c.id
+ SELECT 'raw',c.id,i.stream_id,c.bucket,c.object_key,c.size_bytes,lower(c.sha256),'`+a.opts.Lane.retirementReason()+`',i.choice,$3,i.policy_sha256,$4
+ FROM recording_clips c JOIN recordings r ON r.id=c.recording_id JOIN `+a.opts.Lane.intentTable()+` i ON i.source_id=c.id
  WHERE i.bucket=$1 AND i.object_key=$2 AND i.manifest_sha256=$3 ON CONFLICT DO NOTHING`, a.store.Bucket(), e.Key, manifest, false)
 	if err != nil {
 		return err
 	}
 	var receipt bool
-	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_object_retirements r JOIN `+a.intentTable()+` i ON r.bucket=i.bucket AND r.object_key=i.object_key JOIN recording_clips c ON c.id=i.source_id
- WHERE i.bucket=$1 AND i.object_key=$2 AND r.kind='raw' AND r.reason='`+a.retirementReason()+`' AND r.source_id=$3 AND r.stream_id=i.stream_id AND r.size_bytes=i.size_bytes AND r.sha256=lower(c.sha256) AND r.choice=i.choice AND r.manifest_sha256=$4 AND r.policy_sha256=i.policy_sha256)`, a.store.Bucket(), e.Key, sourceID, manifest).Scan(&receipt)
+	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_object_retirements r JOIN `+a.opts.Lane.intentTable()+` i ON r.bucket=i.bucket AND r.object_key=i.object_key JOIN recording_clips c ON c.id=i.source_id
+ WHERE i.bucket=$1 AND i.object_key=$2 AND r.kind='raw' AND r.reason='`+a.opts.Lane.retirementReason()+`' AND r.source_id=$3 AND r.stream_id=i.stream_id AND r.size_bytes=i.size_bytes AND r.sha256=lower(c.sha256) AND r.choice=i.choice AND r.manifest_sha256=$4 AND r.policy_sha256=i.policy_sha256)`, a.store.Bucket(), e.Key, sourceID, manifest).Scan(&receipt)
 	if err != nil {
 		return err
 	}
 	if !receipt {
 		return errors.New("absence publication requires exact receipt")
 	}
-	_, err = tx.Exec(ctx, `UPDATE recording_clips c SET purged_at=clock_timestamp() FROM `+a.intentTable()+` i WHERE i.bucket=$1 AND i.object_key=$2 AND i.source_id=c.id AND c.purged_at IS NULL`, a.store.Bucket(), e.Key)
+	_, err = tx.Exec(ctx, `UPDATE recording_clips c SET purged_at=clock_timestamp() FROM `+a.opts.Lane.intentTable()+` i WHERE i.bucket=$1 AND i.object_key=$2 AND i.source_id=c.id AND c.purged_at IS NULL`, a.store.Bucket(), e.Key)
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO `+a.eventTable()+`(bucket,object_key,event) VALUES($1,$2,'absent') ON CONFLICT DO NOTHING`, a.store.Bucket(), e.Key)
+	_, err = tx.Exec(ctx, `INSERT INTO `+a.opts.Lane.eventTable()+`(bucket,object_key,event) VALUES($1,$2,'absent') ON CONFLICT DO NOTHING`, a.store.Bucket(), e.Key)
 	if err != nil {
 		return err
 	}
@@ -581,29 +599,30 @@ func runR2InverseLane(ctx context.Context, cfg config.Config, args []string, lan
 	}
 }
 
+// inverseWorkersFit keeps one session connection and one independent issuance
+// connection available even when every worker owns a transaction or waits for
+// admission.
+func inverseWorkersFit(pool *pgxpool.Pool, workers int) error {
+	if workers > int(pool.Config().MaxConns)-2 {
+		return errors.New("workers exceed database capacity with session and issuance connections reserved")
+	}
+	return nil
+}
+
 func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, o inverseApplyOptions) (inverseApplySummary, error) {
 	started := time.Now()
 	result := inverseApplySummary{}
 	if o.Lane != inverseOutsideKeep28 && o.Lane != inverseNASKeep28 {
 		return result, errors.New("unknown inverse lane")
 	}
-	if o.Lane == inverseNASKeep28 {
-		if _, ok := store.(keep28DeleteStore); !ok {
-			return result, errors.New("keep28 transport required")
-		}
-	} else {
-		if _, ok := store.(inverseDeleteStore); !ok {
-			return result, errors.New("B1 transport required")
-		}
+	if _, ok := store.(inverseDeleteStore); !ok {
+		return result, errors.New("inverse DELETE transport required")
 	}
-
 	if o.Workers < 1 || o.Workers > 64 || o.MaxItems < 1 || o.MaxBytes <= 0 || o.Budget24h < 0 {
 		return result, errors.New("invalid bounded apply options")
 	}
-	// One session connection and one independent issuance connection must stay
-	// available even when every worker owns a transaction or waits for admission.
-	if o.Workers > int(pool.Config().MaxConns)-2 {
-		return result, errors.New("workers exceed database capacity with session and issuance connections reserved")
+	if err := inverseWorkersFit(pool, o.Workers); err != nil {
+		return result, err
 	}
 	var summary inverseSummary
 	if err := inverseReadPinned(o.Summary, o.SummarySHA, &summary); err != nil {
@@ -684,7 +703,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	// receipt on restart. An intent that never issued a DELETE is never retired:
 	// if its object is gone, someone else removed it, so stop before any new work.
 	existing := map[string]bool{}
-	rows, err := pool.Query(ctx, `SELECT i.object_key,i.size_bytes,i.etag,i.last_modified,i.manifest_sha256,i.endpoint_sha256,EXISTS(SELECT 1 FROM `+a.eventTable()+` e WHERE e.bucket=i.bucket AND e.object_key=i.object_key AND e.event='absent'),EXISTS(SELECT 1 FROM `+a.attemptTable()+` t WHERE t.bucket=i.bucket AND t.object_key=i.object_key) FROM `+a.intentTable()+` i WHERE i.bucket=$1`, store.Bucket())
+	rows, err := pool.Query(ctx, `SELECT i.object_key,i.size_bytes,i.etag,i.last_modified,i.manifest_sha256,i.endpoint_sha256,EXISTS(SELECT 1 FROM `+a.opts.Lane.eventTable()+` e WHERE e.bucket=i.bucket AND e.object_key=i.object_key AND e.event='absent'),EXISTS(SELECT 1 FROM `+a.opts.Lane.attemptTable()+` t WHERE t.bucket=i.bucket AND t.object_key=i.object_key) FROM `+a.opts.Lane.intentTable()+` i WHERE i.bucket=$1`, store.Bucket())
 	if err != nil {
 		return result, err
 	}
@@ -825,6 +844,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	var deleted, bytes atomic.Int64
 	var wireAmbiguous []string
 	var modifiedHeld, modifiedBytes atomic.Int64
+	var custodyShort r2RetireStat
 	for range o.Workers {
 		wg.Add(1)
 		go func() {
@@ -837,6 +857,12 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 				}
 				if errors.Is(err, errInverseAdmissionClosed) {
 					return
+				}
+				if errors.Is(err, errKeep28CustodyShort) {
+					mu.Lock()
+					custodyShort.add(e.SizeBytes)
+					mu.Unlock()
+					continue
 				}
 				if err != nil {
 					var modifiedErr inverseLastModifiedError
@@ -874,12 +900,14 @@ send:
 	}
 	close(queue)
 	wg.Wait()
+	result.Selected = int64(len(jobs))
 	result.Deleted = deleted.Load()
 	sort.Strings(wireAmbiguous)
 	result.WireAmbiguous = wireAmbiguous
 	result.Bytes = bytes.Load()
 	result.LastModifiedHeld.Objects += modifiedHeld.Load()
 	result.LastModifiedHeld.Bytes += modifiedBytes.Load()
+	result.CustodyShort = custodyShort
 	result.ElapsedSeconds = time.Since(started).Seconds()
 	result.ObjectsPerSecond = float64(result.Deleted) / result.ElapsedSeconds
 	return result, first

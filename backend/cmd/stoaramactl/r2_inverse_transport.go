@@ -5,9 +5,9 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
-	"net/http/httptrace"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,13 +33,20 @@ func (inverseLastModifiedError) Error() string {
 	return "listing/HEAD LastModified missing, changed, future or outside the pre-fence cutoff"
 }
 
-// Only the concrete executor verifier below can issue this private capability.
-// Copies share consumption state, and the DB independently forbids reminting.
+// Only the concrete executor verifier below can issue this private capability,
+// for either lane. Copies share consumption state, and the DB independently
+// forbids reminting. ctx bounds this key's network work; on the keep-28 lane it
+// also ends at custodyEnd, the local instant NAS custody expires, and custody
+// is the proof the intent carries.
 type inverseDeleteAuthority struct {
-	binding inverseDeleteBinding
-	guard   *inverseWireGuard
-	used    *atomic.Bool
-	gate    *inverseSendGate
+	binding    inverseDeleteBinding
+	guard      *inverseWireGuard
+	used       *atomic.Bool
+	gate       *inverseSendGate
+	ctx        context.Context
+	cancel     context.CancelFunc
+	custody    keep28Custody
+	custodyEnd time.Time
 }
 
 // inverseSendGate closes when a batch hits a hard failure. A DELETE whose first
@@ -79,19 +86,23 @@ func (a *inverseDeleteAuthority) requireWire(ctx context.Context, bucket, endpoi
 	return a.check(ctx, bucket, endpoint)
 }
 func (a *inverseDeleteAuthority) check(ctx context.Context, bucket, endpoint string) error {
-	if a.guard == nil || a.guard.a.opts.Lane != inverseOutsideKeep28 || bucket != a.binding.Bucket || endpoint != a.binding.EndpointSHA256 {
+	if a.guard == nil || bucket != a.binding.Bucket || endpoint != a.binding.EndpointSHA256 {
 		return errors.New("inverse wire binding differs")
 	}
 	if err := a.guard.check(ctx, a.binding); err != nil {
 		return err
 	}
+	lane := a.guard.a.opts.Lane
 	var issued bool
-	err := a.guard.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_attempts WHERE bucket=$1 AND object_key=$2)`, bucket, a.binding.Key).Scan(&issued)
+	err := a.guard.tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM `+lane.attemptTable()+` WHERE bucket=$1 AND object_key=$2)`, bucket, a.binding.Key).Scan(&issued)
 	if err != nil {
 		return err
 	}
 	if !issued {
 		return errors.New("durable wire issuance missing")
+	}
+	if lane == inverseNASKeep28 {
+		return a.checkCustody(ctx)
 	}
 	return nil
 }
@@ -141,32 +152,46 @@ func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverse
 	}
 	return nil
 }
+
+// authorize issues one key's single-use DELETE authority on the applier's lane.
+// Keep-28 adds its NAS custody proof and bounds the authority by its expiry.
 func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntry, gate *inverseSendGate) (*inverseDeleteAuthority, error) {
-	if a.opts.Lane != inverseOutsideKeep28 {
-		return nil, errors.New("B1 authority cannot authorize B2")
-	}
 	target, err := a.prepareWireTarget(ctx, tx, e)
 	if err != nil {
 		return nil, err
 	}
+	// The parent carries the key's network deadline; keep-28 also ends at
+	// custody end, an absolute instant fixed when sampled.
+	var custody keep28Custody
+	var custodyEnd time.Time
+	var cancel context.CancelFunc
+	if a.opts.Lane == inverseNASKeep28 {
+		if custody, custodyEnd, err = a.proveKeep28(ctx, tx, e, target); err != nil {
+			return nil, err
+		}
+		ctx, cancel = context.WithDeadline(ctx, custodyEnd)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	fail := func(err error) (*inverseDeleteAuthority, error) { cancel(); return nil, err }
 	if err = a.checkWireHead(ctx, tx, e, target); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	guard := &inverseWireGuard{a, tx, target, e}
 	binding := guard.binding()
 	if err = guard.check(ctx, binding); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	// Independent commit precedes capability issuance. Even another verifier or
 	// process cannot remint authority after any ambiguous/crashed wire attempt.
-	tag, err := a.pool.Exec(ctx, `INSERT INTO r2_inverse_attempts(bucket,object_key) VALUES($1,$2) ON CONFLICT DO NOTHING`, binding.Bucket, binding.Key)
+	tag, err := a.pool.Exec(ctx, `INSERT INTO `+a.opts.Lane.attemptTable()+`(bucket,object_key) VALUES($1,$2) ON CONFLICT DO NOTHING`, binding.Bucket, binding.Key)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
 	if tag.RowsAffected() != 1 {
-		return nil, errors.New("inverse wire authority was already issued; reconcile only")
+		return fail(errors.New("inverse wire authority was already issued; reconcile only"))
 	}
-	return &inverseDeleteAuthority{binding: binding, guard: guard, used: &atomic.Bool{}, gate: gate}, nil
+	return &inverseDeleteAuthority{binding: binding, guard: guard, used: &atomic.Bool{}, gate: gate, ctx: ctx, cancel: cancel, custody: custody, custodyEnd: custodyEnd}, nil
 }
 
 type inverseSDKStore struct {
@@ -222,7 +247,7 @@ func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDele
 		o.Retryer = aws.NopRetryer{}
 		o.HTTPClient = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	})
-	if err != nil && wire.lost() {
+	if err != nil && wire.lostAfterClose() {
 		return fmt.Errorf("%w: %w", errInverseWireAmbiguous, err)
 	}
 	return err
@@ -237,14 +262,61 @@ func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDele
 // cut status line) are never this error and stop the job.
 var errInverseWireAmbiguous = errors.New("DELETE sent but no response; result unknown")
 
-// inverseWire records what one DELETE's own connection did.
+// errInverseWireDeadline refuses a first request byte at or after the DELETE's
+// deadline. Nothing was written; it is never a lost response.
+var errInverseWireDeadline = errors.New("DELETE deadline passed before its first request byte")
+
+// inverseWire records what one DELETE's own connection did. deadline, when set,
+// is the instant from which no first request byte may leave; for keep-28 it is
+// no later than custody expiry. answered is set by the connection read itself;
+// reading is held across every read so classification can wait one out.
 type inverseWire struct {
 	gate                         *inverseSendGate
+	deadline                     time.Time
 	wrote, writeFailed, answered atomic.Bool
+	mu                           sync.Mutex
+	conn                         net.Conn
+	reading                      sync.RWMutex
 }
 
 func (w *inverseWire) lost() bool {
 	return w.wrote.Load() && !w.writeFailed.Load() && !w.answered.Load()
+}
+
+// lostAfterClose classifies a failed DELETE only after its connection is closed
+// and any read under way has returned: a response byte the socket delivered
+// always counts, even when cancellation ended the round trip first.
+func (w *inverseWire) lostAfterClose() bool {
+	w.mu.Lock()
+	conn := w.conn
+	w.mu.Unlock()
+	if conn != nil {
+		conn.Close()
+	}
+	w.reading.Lock()
+	defer w.reading.Unlock()
+	return w.lost()
+}
+
+// track records the DELETE's connection and routes its bytes through w.
+func (w *inverseWire) track(conn net.Conn) net.Conn {
+	w.mu.Lock()
+	w.conn = conn
+	w.mu.Unlock()
+	return &inverseWireConn{Conn: conn, wire: w}
+}
+
+// beforeFirst runs under the send gate's read lock. It refuses the first
+// request byte at or after the deadline and makes the socket refuse it too,
+// should the writer stall past that instant.
+func (w *inverseWire) beforeFirst(conn net.Conn) error {
+	if w.deadline.IsZero() {
+		return nil
+	}
+	if !time.Now().Before(w.deadline) {
+		return errInverseWireDeadline
+	}
+	return conn.SetWriteDeadline(w.deadline)
 }
 
 // transport clones the template so this DELETE dials its own connection and
@@ -259,7 +331,7 @@ func (w *inverseWire) transport(template *http.Transport) *http.Transport {
 		if err != nil {
 			return nil, err
 		}
-		return &inverseWireConn{Conn: conn, wire: w}, nil
+		return w.track(conn), nil
 	}
 	config, handshake := t.TLSClientConfig, t.TLSHandshakeTimeout
 	t.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -281,7 +353,7 @@ func (w *inverseWire) transport(template *http.Transport) *http.Transport {
 			raw.Close()
 			return nil, err
 		}
-		return &inverseWireConn{Conn: conn, wire: w}, nil
+		return w.track(conn), nil
 	}
 	return t
 }
@@ -292,18 +364,40 @@ type inverseWireConn struct {
 }
 
 func (c *inverseWireConn) Write(p []byte) (int, error) {
+	// An empty write carries no request byte: it neither passes the gate nor
+	// counts as a request the connection accepted.
+	if len(p) == 0 {
+		return c.Conn.Write(p)
+	}
 	write := func() (int, error) { return c.Conn.Write(p) }
 	var n int
 	var err error
 	if c.wire.wrote.Load() || c.wire.writeFailed.Load() {
 		n, err = write()
 	} else {
-		n, err = c.wire.gate.first(write)
+		n, err = c.wire.gate.first(func() (int, error) {
+			if err := c.wire.beforeFirst(c.Conn); err != nil {
+				return 0, err
+			}
+			return write()
+		})
 	}
 	if err != nil || n < len(p) {
 		c.wire.writeFailed.Store(true)
 	} else {
 		c.wire.wrote.Store(true)
+	}
+	return n, err
+}
+
+// Read marks the DELETE answered on its first response byte, before the HTTP
+// layer sees it.
+func (c *inverseWireConn) Read(p []byte) (int, error) {
+	c.wire.reading.RLock()
+	defer c.wire.reading.RUnlock()
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.wire.answered.Store(true)
 	}
 	return n, err
 }
@@ -323,12 +417,29 @@ func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, e
 	if err := t.authority.check(req.Context(), t.bucket, t.endpoint); err != nil {
 		return nil, err
 	}
+	bounded, cancel, err := t.authority.bound(req.Context())
+	if err != nil {
+		return nil, err
+	}
+	// Set before the round trip dials: the first write happens after it.
+	t.wire.deadline, _ = bounded.Deadline()
+	req = req.Clone(bounded)
 	req.Header.Del("Idempotency-Key")
 	req.Header.Del("X-Idempotency-Key")
-	trace := &httptrace.ClientTrace{GotFirstResponseByte: func() { t.wire.answered.Store(true) }}
-	response, err := t.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
-	if response != nil {
-		t.wire.answered.Store(true)
+	response, err := t.base.RoundTrip(req)
+	if err != nil {
+		cancel()
+		return nil, err
 	}
-	return response, err
+	response.Body = &inverseResponseBody{ReadCloser: response.Body, cancel: cancel}
+	return response, nil
 }
+
+// inverseResponseBody holds the bounded request context open until the SDK has
+// read the answer.
+type inverseResponseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *inverseResponseBody) Close() error { defer b.cancel(); return b.ReadCloser.Close() }
