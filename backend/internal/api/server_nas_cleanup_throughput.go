@@ -1348,9 +1348,6 @@ func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
 		}
 		return tx.Commit(ctx)
 	}
-	if !cleanupMasterOn(ctx, tx) {
-		return pause("master switch is off")
-	}
 	if until == nil || !until.After(time.Now().Add(time.Minute)) {
 		return pause("approval expired")
 	}
@@ -1358,9 +1355,15 @@ func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
 		why, _ := body["error"].(string)
 		return pause("plan " + strconv.FormatInt(current, 10) + " not enableable: " + why)
 	}
+	// The master is read FOR SHARE only after the activation below: activation
+	// checks out its own pool connections, and holding the master lock across
+	// that would let an emergency OFF wait on pool capacity.
 	releaseFreeze, err = s.cleanupActivateRankings(ctx, tx, current)
 	if err != nil {
 		return pause("source freeze/replay failed: " + err.Error())
+	}
+	if !cleanupMasterOn(ctx, tx) {
+		return pause("master switch is off")
 	}
 	if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='enabled',allow_nas_only=false,approved_until=$2,approval_reason=left('batch '||$3::text||': '||$4::text,500) WHERE id=$1`, current, *until, strconv.FormatInt(batchID, 10), reason); err != nil {
 		return err
@@ -1384,7 +1387,7 @@ func (s *Server) handleAdminNASCleanupBatchEnable(w http.ResponseWriter, r *http
 		ApprovalHours     int     `json:"approval_hours"`
 		AllowLongApproval bool    `json:"allow_long_approval,omitempty"`
 	}
-	if util.DecodeJSON(r, &req) != nil || len(req.BatchSHA) != 64 || !lowerHex(req.BatchSHA) || len(req.Reason) < 1 || len(req.Reason) > 500 || len(req.PlanIDs) < 1 || len(req.PlanIDs) > nasCleanupMaxBatchPlans {
+	if util.DecodeJSON(r, &req) != nil || len(req.BatchSHA) != 64 || !lowerHex(req.BatchSHA) || strings.TrimSpace(req.Reason) == "" || len(req.Reason) > 500 || len(req.PlanIDs) < 1 || len(req.PlanIDs) > nasCleanupMaxBatchPlans {
 		util.WriteError(w, 400, "1 to 500 plan ids, the exact batch digest and a reason required")
 		return
 	}
@@ -1408,7 +1411,9 @@ func (s *Server) handleAdminNASCleanupBatchEnable(w http.ResponseWriter, r *http
 		return
 	}
 	defer tx.Rollback(ctx)
-	if !cleanupMasterOn(ctx, tx) {
+	// Cheap advisory look before the expensive fences: a master that is already
+	// OFF refuses here. This read takes no row lock, so it cannot delay OFF.
+	if !cleanupMasterMaybeOn(ctx, tx) {
 		util.WriteError(w, 409, "NAS deletion master switch is off")
 		return
 	}
@@ -1451,6 +1456,12 @@ func (s *Server) handleAdminNASCleanupBatchEnable(w http.ResponseWriter, r *http
 		util.WriteJSON(w, 409, map[string]any{"error": "batch identity differs", "batch_sha256": digest})
 		return
 	}
+	// Last, immediately before the write that grants authority, so OFF never
+	// waits on a fence or gate this transaction still has to acquire.
+	if !cleanupMasterOn(ctx, tx) {
+		util.WriteError(w, 409, "NAS deletion master switch is off")
+		return
+	}
 	var id int64
 	if err = tx.QueryRow(ctx, `INSERT INTO nas_cleanup_batches(account_id,connection_id,batch_sha256,report_sha256,plan_ids,plan_sha256s,mode,approval_reason,approved_until) VALUES(47,13,$1,$2,$3,$4,'enabled',$5,now()+$6::bigint*interval '1 second') RETURNING id`, req.BatchSHA, cleanupPolicySHA, req.PlanIDs, shas, req.Reason, int64(approval/time.Second)).Scan(&id); err != nil {
 		util.WriteError(w, 500, "cleanup batch save failed")
@@ -1485,7 +1496,7 @@ func (s *Server) handleAdminNASCleanupBatchControl(w http.ResponseWriter, r *htt
 		Mode     string `json:"mode"`
 		Reason   string `json:"reason"`
 	}
-	if util.DecodeJSON(r, &req) != nil || len(req.BatchSHA) != 64 || req.Mode != "paused" || len(req.Reason) < 1 || len(req.Reason) > 500 {
+	if util.DecodeJSON(r, &req) != nil || len(req.BatchSHA) != 64 || req.Mode != "paused" || strings.TrimSpace(req.Reason) == "" || len(req.Reason) > 500 {
 		util.WriteError(w, 400, "exact batch digest, mode paused and reason required")
 		return
 	}
@@ -1533,5 +1544,10 @@ func (s *Server) handleAdminNASCleanupBatchStatus(w http.ResponseWriter, r *http
 		util.WriteError(w, 404, "cleanup batch unavailable")
 		return
 	}
-	util.WriteJSON(w, 200, map[string]any{"id": id, "batch_sha256": sha, "mode": mode, "approval_reason": reason, "approved_until": until, "master_deletion_enabled": cleanupMasterOn(r.Context(), s.pool), "plans": json.RawMessage(plans)})
+	master, err := cleanupMasterEnabled(r.Context(), s.pool)
+	if err != nil {
+		util.WriteError(w, 500, "cleanup master control unavailable")
+		return
+	}
+	util.WriteJSON(w, 200, map[string]any{"id": id, "batch_sha256": sha, "mode": mode, "approval_reason": reason, "approved_until": until, "master_deletion_enabled": master, "plans": json.RawMessage(plans)})
 }

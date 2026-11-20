@@ -357,7 +357,13 @@ func (s *Server) handleAdminNASCleanupStatus(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, 404, "cleanup plan unavailable")
 		return
 	}
-	util.WriteJSON(w, 200, map[string]any{"id": id, "label": label, "plan_sha256": sha, "policy_sha256": binding, "policy_current": binding == cleanupPolicySHA, "mode": mode, "allow_nas_only": allow, "approval_reason": reason, "approved_until": until, "priority": priority, "items": json.RawMessage(manifest), "states": json.RawMessage(jsonStates), "master_deletion_enabled": cleanupMasterOn(r.Context(), s.pool), "results": json.RawMessage(results)})
+	var master bool
+	master, err = cleanupMasterEnabled(r.Context(), s.pool)
+	if err != nil {
+		util.WriteError(w, 500, "cleanup master control unavailable")
+		return
+	}
+	util.WriteJSON(w, 200, map[string]any{"id": id, "label": label, "plan_sha256": sha, "policy_sha256": binding, "policy_current": binding == cleanupPolicySHA, "mode": mode, "allow_nas_only": allow, "approval_reason": reason, "approved_until": until, "priority": priority, "items": json.RawMessage(manifest), "states": json.RawMessage(jsonStates), "master_deletion_enabled": master, "results": json.RawMessage(results)})
 }
 
 // Arming is deliberately not automatic. It requires the exact digest and a
@@ -377,7 +383,7 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 		ApprovalHours     *int `json:"approval_hours,omitempty"`
 		AllowLongApproval bool `json:"allow_long_approval,omitempty"`
 	}
-	if util.DecodeJSON(r, &req) != nil || len(req.PlanSHA) != 64 || !lowerHex(req.PlanSHA) || (req.Mode != "enabled" && req.Mode != "paused" && req.Mode != "dry_run") || len(req.Reason) < 1 || len(req.Reason) > 500 {
+	if util.DecodeJSON(r, &req) != nil || len(req.PlanSHA) != 64 || !lowerHex(req.PlanSHA) || (req.Mode != "enabled" && req.Mode != "paused" && req.Mode != "dry_run") || strings.TrimSpace(req.Reason) == "" || len(req.Reason) > 500 {
 		util.WriteError(w, 400, "exact plan digest,mode and reason required")
 		return
 	}
@@ -415,13 +421,19 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 			releaseFreeze()
 		}
 	}()
+	// Cheap advisory look before the expensive fences: a master that is already
+	// OFF refuses here. This read takes no row lock, so it cannot delay OFF.
+	if req.Mode == "enabled" && !cleanupMasterMaybeOn(ctx, tx) {
+		util.WriteError(w, 409, "NAS deletion master switch is off")
+		return
+	}
 	if req.Mode == "enabled" {
 		// The independent master switch defaults OFF even if an operator arms a
 		// plan. Changing it is a separate audited `nas-cleanup master` action.
-		if !cleanupMasterOn(ctx, tx) {
-			util.WriteError(w, 409, "NAS deletion master switch is off")
-			return
-		}
+		// Order matters for an emergency OFF: every fence and row lock this
+		// transaction needs is taken first, and the master is read FOR SHARE
+		// only at the guarded write below. Reading it before the fences would
+		// make OFF wait for a transaction that is still waiting on the fence.
 		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
 			util.WriteError(w, 500, "public cleanup fence failed")
 			return
@@ -494,6 +506,14 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 			return
 		}
 	}
+	// Read the master FOR SHARE last, immediately before the guarded write, so
+	// an emergency OFF waits only for decisions already past their fences. The
+	// activation above needs its own pool connections; holding the master lock
+	// there would stall OFF behind a pool checkout.
+	if req.Mode == "enabled" && !cleanupMasterOn(ctx, tx) {
+		util.WriteError(w, 409, "NAS deletion master switch is off")
+		return
+	}
 	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode=$2,allow_nas_only=false,approval_reason=$3,approved_until=CASE WHEN $2='enabled' THEN now()+$5::bigint*interval '1 second' END,priority=coalesce($4,priority) WHERE id=$1`, id, req.Mode, req.Reason, req.Priority, int64(approval/time.Second))
 	if err == nil && req.Mode == "enabled" {
 		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='pending',lease_expires_at=NULL WHERE plan_id=$1`, id)
@@ -521,7 +541,7 @@ func (s *Server) handleAdminNASCleanupRetireSuperseded(w http.ResponseWriter, r 
 		Reason        string `json:"reason"`
 		ExpectedPlans *int   `json:"expected_plans,omitempty"`
 	}
-	if util.DecodeJSON(r, &req) != nil || len(req.Reason) < 1 || len(req.Reason) > 500 || (req.ExpectedPlans != nil && *req.ExpectedPlans < 1) {
+	if util.DecodeJSON(r, &req) != nil || strings.TrimSpace(req.Reason) == "" || len(req.Reason) > 500 || (req.ExpectedPlans != nil && *req.ExpectedPlans < 1) {
 		util.WriteError(w, 400, "reason and optional positive expected_plans required")
 		return
 	}

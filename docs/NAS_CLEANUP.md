@@ -76,7 +76,9 @@ The master switch is the durable DB control `nas_cleanup_master` (migration
 0229), not configuration. Deploys and restarts never change it, so a cleanup
 plan and backend deploys can interleave. The former Render env var
 `NAS_CLEANUP_DELETION_ENABLED` is inert. Only the controller flips it, through
-the service-token CLI:
+a separate controller credential (`NAS_CLEANUP_CONTROLLER_TOKEN`) that the
+runner's service token cannot satisfy; the master route fails closed when that
+credential is unset or aliases another credential:
 
 ```sh
 stoaramactl nas-cleanup master status
@@ -84,20 +86,25 @@ stoaramactl nas-cleanup master on --reason "run batch 12"
 stoaramactl nas-cleanup master off --reason "batch 12 finished"
 ```
 
-`on`/`off` require a reason, print the before and after state, and are
+`on`/`off` require a non-blank reason, print the before and after state, and are
 idempotent: repeating the current state changes nothing. Every change appends
-an immutable `nas_cleanup_master_history` row (time, actor `user@host`, old and
-new state, reason); history and control rows cannot be deleted, truncated or
-edited outside that path, and the triggers are `ENABLE ALWAYS`.
+an immutable `nas_cleanup_master_history` row (time, the authenticated
+server-side actor, the operator's `claimed_by` name, old and new state, reason);
+history and control rows cannot be deleted, truncated or edited outside that
+path, only the recorder function may append history, and the triggers are
+`ENABLE ALWAYS`.
 
 The API reads the switch live, inside the same transaction as each decision it
 guards (plan and batch enable, batch advance, execution lease, permit issue and
-permit replay), and never caches it. It reads `FOR SHARE`, so turning it off
-waits for any in-flight decision that already read ON; once `master off`
-returns, no further lease or permit is issued. A missing or unreadable control
-reads as OFF. Plan and batch reports keep `master_deletion_enabled`. Turning it
-on bypasses nothing: plan approval, batch digests, the 5 TB/day cap and per-file
-permits are unchanged.
+permit replay), and never caches it. It reads `FOR SHARE` last — only after
+every fence and lock that transaction needs, immediately before the guarded
+write — so turning it off waits for in-flight decisions that already read ON
+without waiting on fences or pool checkouts, and fails closed on a read error.
+Once `master off` returns, no further lease or permit is issued. A missing or
+unreadable control is OFF for decisions, while plan and batch reports return an
+error instead of a false OFF and otherwise keep `master_deletion_enabled`.
+Turning it on bypasses nothing: plan approval, batch digests, the 5 TB/day cap
+and per-file permits are unchanged.
 
 ### Belt-and-braces safeguards (safety council, 2026-11)
 

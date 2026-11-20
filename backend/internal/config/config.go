@@ -23,6 +23,7 @@ type Config struct {
 	DatabaseURL                      string
 	APIToken                         string
 	ServiceToken                     string
+	NASCleanupControllerToken        string
 	JoinedWorkerBootstrapToken       string
 	JoinedWorkerBootstrapHashes      string
 	JoinedWorkerSigningKey           string
@@ -219,6 +220,7 @@ func Load() (Config, error) {
 		DatabaseURL:                      os.Getenv("DATABASE_URL"),
 		APIToken:                         firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
 		ServiceToken:                     firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
+		NASCleanupControllerToken:        strings.TrimSpace(os.Getenv("NAS_CLEANUP_CONTROLLER_TOKEN")),
 		JoinedWorkerBootstrapToken:       strings.TrimSpace(os.Getenv("JOINED_WORKER_BOOTSTRAP_TOKEN")),
 		JoinedWorkerBootstrapHashes:      os.Getenv("JOINED_WORKER_BOOTSTRAP_TOKEN_SHA256_ALLOWLIST"),
 		JoinedWorkerSigningKey:           strings.TrimSpace(os.Getenv("JOINED_WORKER_SIGNING_KEY")),
@@ -539,6 +541,19 @@ func (c Config) ValidateJoined() error {
 		for _, protected := range append(protected, bootstrap, signing, strings.TrimSpace(c.JoinedRecordingWorkerToken)) {
 			if operator == strings.TrimSpace(protected) {
 				return fmt.Errorf("joined operator credential must differ from service, database, storage, backend, and worker credentials")
+			}
+		}
+	}
+	// The cleanup controller credential is the only way to flip NAS deletion
+	// authority. It must be distinct from every runner credential: a service
+	// token that could also flip the master would defeat the separation.
+	if controller := strings.TrimSpace(c.NASCleanupControllerToken); controller != "" {
+		if len(controller) < 32 {
+			return fmt.Errorf("NAS_CLEANUP_CONTROLLER_TOKEN must be at least 32 bytes when configured")
+		}
+		for _, other := range append(append([]string(nil), protected...), bootstrap, signing, operator, strings.TrimSpace(c.JoinedRecordingWorkerToken), strings.TrimSpace(c.JoinedArchiveWorkerToken), strings.TrimSpace(c.JoinedArchiveCapabilityKey)) {
+			if controller == strings.TrimSpace(other) {
+				return fmt.Errorf("NAS_CLEANUP_CONTROLLER_TOKEN must differ from every other configured credential")
 			}
 		}
 	}

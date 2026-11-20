@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/daydemir/stoarama/backend/internal/config"
 )
 
 func TestOperatorAPIRequestsIdentifyTheClient(t *testing.T) {
@@ -39,8 +41,76 @@ func TestNASCleanupMasterRequiresReasonAndTypedState(t *testing.T) {
 	}
 	for action, want := range map[nasCleanupMasterAction]bool{nasCleanupMasterOn: true, nasCleanupMasterOff: false} {
 		body, err := nasCleanupMasterBody(action, "plan 7", "ops@host")
-		if err != nil || body["enabled"] != want || body["reason"] != "plan 7" || body["actor"] != "ops@host" {
+		if err != nil || body["enabled"] != want || body["reason"] != "plan 7" || body["claimed_by"] != "ops@host" {
 			t.Fatalf("master %s body %v %v", action, body, err)
 		}
+	}
+}
+
+// The CLI must dispatch the exact HTTP method and path for each action, and it
+// must not fall back to the service token: deletion authority needs the
+// controller credential.
+func TestNASCleanupMasterDispatchMethodsURLsAndControllerCredential(t *testing.T) {
+	type call struct {
+		method, base, token, path string
+		body                      map[string]any
+	}
+	var got []call
+	do := func(method, base, token, path string, body any) map[string]any {
+		payload, _ := body.(map[string]any)
+		got = append(got, call{method, base, token, path, payload})
+		return map[string]any{"ok": true}
+	}
+	cfg := config.Config{NASCleanupControllerToken: "controller-token-32-bytes-long-000000", ServiceToken: "runner-service-token", APIToken: "runner-service-token"}
+	if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"status", "--backend-api-url", "https://api.test"}, do); err != nil {
+		t.Fatal(err)
+	}
+	if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"off", "--reason", "stop now", "--backend-api-url", "https://api.test"}, do); err != nil {
+		t.Fatal(err)
+	}
+	if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"on", "--reason", "  start  ", "--backend-api-url", "https://api.test"}, do); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("dispatch calls %+v", got)
+	}
+	if got[0].method != http.MethodGet || got[0].path != "/api/v1/service/nas-cleanup/master" || got[0].base != "https://api.test" || got[0].body != nil {
+		t.Fatalf("status call %+v", got[0])
+	}
+	if got[1].method != http.MethodPost || got[1].path != "/api/v1/service/nas-cleanup/master" || got[1].body["enabled"] != false || got[1].body["reason"] != "stop now" {
+		t.Fatalf("off call %+v", got[1])
+	}
+	if got[2].body["enabled"] != true || got[2].body["reason"] != "start" {
+		t.Fatalf("on call %+v", got[2])
+	}
+	for _, c := range got {
+		if c.token != cfg.NASCleanupControllerToken {
+			t.Fatalf("dispatch used a non-controller credential: %q", c.token)
+		}
+		if _, forged := c.body["actor"]; forged {
+			t.Fatalf("client supplied the authoritative actor: %+v", c.body)
+		}
+	}
+	// Blank reasons are rejected after trimming, and no call is made.
+	got = nil
+	for _, reason := range []string{"", "   ", "\t"} {
+		if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"on", "--reason", reason}, do); err == nil {
+			t.Fatalf("blank reason %q accepted", reason)
+		}
+	}
+	if err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"off"}, do); err == nil {
+		t.Fatal("missing reason accepted")
+	}
+	if len(got) != 0 {
+		t.Fatalf("rejected reason still dispatched: %+v", got)
+	}
+	// Without a controller credential nothing is sent: the service token is
+	// never a fallback.
+	noCredential := config.Config{ServiceToken: cfg.ServiceToken, APIToken: cfg.APIToken}
+	if err := nasCleanupMasterDispatch(context.Background(), noCredential, []string{"off", "--reason", "x"}, do); err == nil {
+		t.Fatal("master change dispatched without the controller credential")
+	}
+	if len(got) != 0 {
+		t.Fatalf("dispatch without controller credential: %+v", got)
 	}
 }

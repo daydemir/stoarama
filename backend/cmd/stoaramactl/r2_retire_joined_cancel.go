@@ -418,6 +418,14 @@ func runR2JoinedWriterCancel(ctx context.Context, cfg config.Config, args []stri
 	if err = applyTx.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM nas_cleanup_plans WHERE mode='enabled') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE state IN ('leased','delete_issued'))`).Scan(&idle); err != nil || !idle {
 		log.Fatal("joined writer retirement requires controller global-idle window")
 	}
+	// The authoritative master read is FOR SHARE inside this transaction, so it
+	// holds until commit: a flip to ON waits for this retirement, and a flip
+	// that committed first is seen here. The earlier requireWindow read is only
+	// preview evidence.
+	var masterHeld bool
+	if err = applyTx.QueryRow(ctx, `SELECT enabled FROM nas_cleanup_master FOR SHARE`).Scan(&masterHeld); err != nil || masterHeld {
+		log.Fatal("joined writer retirement requires the cleanup master OFF (locked for this transaction)")
+	}
 	body, err := json.Marshal(evidence)
 	if err != nil {
 		log.Fatal("owner evidence encoding failed")

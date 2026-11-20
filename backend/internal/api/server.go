@@ -676,6 +676,14 @@ func (s *Server) router() http.Handler {
 			joinedOperator.Put("/recording/joined/gap-only/frozen-authorization", s.handleJoinedGapOnlyFrozenAuthorization)
 		})
 
+		// The master switch is controller-only: deletion authority must not be
+		// reachable with the runner's service token.
+		api.Group(func(controller chi.Router) {
+			controller.Use(s.requireCleanupControllerAuth)
+			controller.Get("/service/nas-cleanup/master", s.handleAdminNASCleanupMasterStatus)
+			controller.Post("/service/nas-cleanup/master", s.handleAdminNASCleanupMasterSet)
+		})
+
 		api.Group(func(service chi.Router) {
 			service.Use(s.requireServiceAuth)
 			service.Post("/service/nas-stitch/scopes", s.handleAdminNASStitchScope)
@@ -686,8 +694,6 @@ func (s *Server) router() http.Handler {
 			service.Post("/service/nas-stitch/readback/validate", s.handleAdminNASStitchReadbackValidate)
 			service.Get("/service/nas-stitch/readback/status", s.handleAdminNASStitchReadbackStatus)
 			service.Post("/service/nas-stitch/corpus", s.handleAdminNASStitchCorpus)
-			service.Get("/service/nas-cleanup/master", s.handleAdminNASCleanupMasterStatus)
-			service.Post("/service/nas-cleanup/master", s.handleAdminNASCleanupMasterSet)
 			service.Post("/service/nas-cleanup/plans", s.handleAdminNASCleanupCreate)
 			service.Get("/service/nas-cleanup/plans/{id}", s.handleAdminNASCleanupStatus)
 			service.Post("/service/nas-cleanup/plans/{id}/control", s.handleAdminNASCleanupControl)

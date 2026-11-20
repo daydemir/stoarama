@@ -944,3 +944,24 @@ func TestNASR2CopyDefaultsOffAndIndependent(t *testing.T) {
 		t.Fatal("copy switch not independently configurable")
 	}
 }
+
+// The cleanup controller credential must be a real distinct secret: too short
+// or aliasing any other credential fails startup rather than silently leaving
+// the master switch reachable with a runner token.
+func TestNASCleanupControllerCredentialIsDistinct(t *testing.T) {
+	const controller = "nas-cleanup-controller-credential-32-byte"
+	if err := (Config{NASCleanupControllerToken: controller}).ValidateJoined(); err != nil {
+		t.Fatalf("distinct controller credential rejected: %v", err)
+	}
+	const service = "runner-service-credential-32-bytes-long"
+	for _, cfg := range []Config{
+		{NASCleanupControllerToken: service, ServiceToken: service},
+		{NASCleanupControllerToken: service, APIToken: service},
+		{NASCleanupControllerToken: controller[:31]},
+		{NASCleanupControllerToken: "joined-operator-credential-32-bytes-long", JoinedOperatorToken: "joined-operator-credential-32-bytes-long"},
+	} {
+		if err := cfg.ValidateJoined(); err == nil {
+			t.Fatalf("unsafe controller credential accepted: %+v", cfg)
+		}
+	}
+}

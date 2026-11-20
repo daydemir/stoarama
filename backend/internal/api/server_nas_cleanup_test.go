@@ -196,9 +196,15 @@ func TestNASCleanupLeaseRetriesAndMasterOff(t *testing.T) {
 			t.Fatalf("dry run or ACK retry failed: %s", w.Body.String())
 		}
 	}
+	// The master is read last, after every fence and gate, so a master-OFF
+	// refusal may surface as an earlier gate here. Either way no arming.
 	w := cleanupCall(t, s.handleAdminNASCleanupControl, 47, 5, "id", "1", map[string]any{"plan_sha256": strings.Repeat("b", 64), "mode": "enabled", "reason": "fixture"})
-	if w.Code != 409 || !strings.Contains(w.Body.String(), "master switch") {
-		t.Fatal("master OFF allowed arming")
+	if w.Code != 409 {
+		t.Fatalf("master OFF allowed arming: %d %s", w.Code, w.Body.String())
+	}
+	var armed string
+	if err := pool.QueryRow(ctx, `SELECT mode FROM nas_cleanup_plans WHERE id=1`).Scan(&armed); err != nil || armed != "dry_run" {
+		t.Fatalf("master OFF armed the plan: %q %v", armed, err)
 	}
 	setCleanupMaster(t, s, true)
 	if _, err = pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='would_delete',proof='{}',recovery='unchecked' WHERE id=1`); err != nil {
