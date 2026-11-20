@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -140,6 +141,9 @@ func testStitchReceiptNeverWaits(t *testing.T, pool *pgxpool.Pool, post func() i
  WHERE f.connection_id=13 AND c.object_key=$1 FOR UPDATE OF f`, []any{inputKey}},
 		{"connection 13", `SELECT 1 FROM connections WHERE id=13 FOR UPDATE`, nil},
 		{"second input hold", `SELECT 1 FROM nas_stitch_r2_input_holds WHERE object_key=$1 FOR UPDATE`, []any{secondKey}},
+		// The certificate INSERT and its release trigger write these tables, so
+		// the receipt takes their locks without waiting.
+		{"certificate table", `LOCK TABLE nas_stitch_r2_certificates,nas_stitch_r2_hours,nas_stitch_r2_input_holds IN SHARE MODE`, nil},
 	} {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
@@ -283,10 +287,15 @@ func testStitchCertKeyContention(t *testing.T, pool *pgxpool.Pool, certify func(
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Registered before the race so a failed assertion below rolls the race
+	// back instead of leaving its connection checked out for pool.Close.
+	var raced sync.Once
+	releaseRace := func() { raced.Do(func() { _ = race.Rollback(context.Background()) }) }
+	t.Cleanup(releaseRace)
 	imported := make(chan error, 1)
 	go func() { imported <- extra.importSet(ctx) }()
 	blockedBy(t, pool, backendPID(t, race), "import behind a same-key reservation")
-	race.Rollback(ctx)
+	releaseRace()
 	if err = within(t, imported, "multi-hour import beside an open certificate"); err != nil {
 		t.Fatal(err)
 	}
@@ -330,8 +339,11 @@ func holdSessionLock(t *testing.T, pool *pgxpool.Pool, key string) func() {
 	if _, err = conn.Exec(ctx, `SELECT pg_advisory_lock(`+key+`)`); err != nil {
 		t.Fatal(err)
 	}
+	var once sync.Once
 	return func() {
-		conn.Exec(context.Background(), `SELECT pg_advisory_unlock(`+key+`)`)
-		conn.Release()
+		once.Do(func() {
+			conn.Exec(context.Background(), `SELECT pg_advisory_unlock(`+key+`)`)
+			conn.Release()
+		})
 	}
 }

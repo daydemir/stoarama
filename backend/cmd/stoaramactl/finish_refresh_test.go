@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/api"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestFinishRefreshFlagAndRequeueKeepsOriginalWork(t *testing.T) {
@@ -320,6 +322,116 @@ func TestFinishRefreshExcludedPrefixDoesNotStarveLiveSource(t *testing.T) {
 			var live, excludedQueued int
 			if err = f.pool.QueryRow(f.ctx, `SELECT count(*) FILTER(WHERE source_id=9000001),count(*) FILTER(WHERE source_id<>9000001) FROM nas_r2_copy_items WHERE state='refresh_pending'`).Scan(&live, &excludedQueued); err != nil || live != 1 || excludedQueued != 0 {
 				t.Fatalf("queued live=%d excluded=%d err=%v", live, excludedQueued, err)
+			}
+		})
+	}
+}
+
+// wideLocksFreeNow reports whether a fresh transaction can take both wide
+// protection locks right now, without waiting.
+func wideLocksFreeNow(t *testing.T, pool *pgxpool.Pool) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	var ok bool
+	if err = tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(7343226011103) AND pg_try_advisory_xact_lock(7343226011101)`).Scan(&ok); err != nil {
+		t.Fatal(err)
+	}
+	return ok
+}
+
+func waitRefreshBlocked(t *testing.T, f keep28Fixture, holder uint32, what string) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		var waiting bool
+		err := f.pool.QueryRow(f.ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))`, holder).Scan(&waiting)
+		if err != nil || time.Now().After(deadline) {
+			t.Fatalf("%s never waited: %v", what, err)
+		}
+		if waiting {
+			return
+		}
+	}
+}
+
+// Refresh admission takes the copy key, the copy row and the refresh-control
+// row after the wide protection locks. Each one is only tried: its owner must
+// be awaited with no wide lock held, so a mutator is never queued behind
+// refresh. The per-key admission is called directly so the scheduling cursor,
+// which runs before them, cannot be what the assertion observes.
+func TestFinishRefreshAdmissionWaitsOutsideWideLocks(t *testing.T) {
+	for _, blocked := range []string{"copy_key", "copy_row", "control_row"} {
+		t.Run(blocked, func(t *testing.T) {
+			f := newKeep28Fixture(t)
+			opts := seedRefreshCandidates(t, f, []int64{100})
+			var itemJSON []byte
+			if err := f.pool.QueryRow(f.ctx, `SELECT item FROM nas_r2_copy_items WHERE connection_id=13 AND kind='raw' AND source_id=9000001`).Scan(&itemJSON); err != nil {
+				t.Fatal(err)
+			}
+			var item api.NASR2CopyItem
+			if err := json.Unmarshal(itemJSON, &item); err != nil {
+				t.Fatal(err)
+			}
+			var etag, policy string
+			if err := f.pool.QueryRow(f.ctx, `SELECT coalesce(c.etag,''),i.policy_sha256 FROM nas_r2_copy_items i JOIN recording_clips c ON c.id=i.source_id WHERE i.source_id=9000001 AND i.connection_id=13`).Scan(&etag, &policy); err != nil {
+				t.Fatal(err)
+			}
+			var epoch int64
+			if err := f.pool.QueryRow(f.ctx, `SELECT epoch FROM r2_inverse_ke_epoch`).Scan(&epoch); err != nil {
+				t.Fatal(err)
+			}
+			picks, err := loadR2RetirePicks(opts.Picks)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, windows, _ := api.Keep28Policy()
+			protection, err := loadInverseApplyProtection(f.ctx, f.pool, "stoarama", picks, windows)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			holder, err := f.pool.Begin(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer holder.Rollback(f.ctx)
+			switch blocked {
+			case "copy_key":
+				_, err = holder.Exec(f.ctx, `SELECT lock_nas_r2_copy_key('stoarama',$1)`, f.key)
+			case "copy_row":
+				_, err = holder.Exec(f.ctx, `SELECT id FROM nas_r2_copy_items WHERE connection_id=13 AND kind='raw' AND source_id=9000001 FOR UPDATE`)
+			case "control_row":
+				_, err = holder.Exec(f.ctx, `SELECT enabled FROM r2_keep28_refresh_control WHERE singleton FOR UPDATE`)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			holderPID := stitchBackendPID(t, holder)
+			type result struct {
+				ok  bool
+				err error
+			}
+			queued := make(chan result, 1)
+			go func() {
+				status := finishStatus{}
+				ok, err := queueKeep28Refresh(f.ctx, f.pool, opts, protection, epoch, item, etag, policy, &status)
+				queued <- result{ok, err}
+			}()
+			waitRefreshBlocked(t, f, holderPID, "refresh behind "+blocked)
+			if !wideLocksFreeNow(t, f.pool) {
+				t.Fatalf("refresh held the wide protection locks while awaiting %s", blocked)
+			}
+			if err = holder.Rollback(f.ctx); err != nil {
+				t.Fatal(err)
+			}
+			got := within(t, queued, "refresh admission")
+			if got.err != nil || !got.ok {
+				t.Fatalf("refresh admission after %s released: %v %v", blocked, got.ok, got.err)
 			}
 		})
 	}

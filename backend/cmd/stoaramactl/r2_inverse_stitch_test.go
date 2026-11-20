@@ -347,3 +347,123 @@ func TestKeep28ReserveIgnoresBusyParentRecording(t *testing.T) {
 		t.Fatalf("keep-28 reserve waited on or refused its busy parent recording: %v", err)
 	}
 }
+
+// probeWideLocks reports whether a fresh transaction can take both wide
+// protection locks right now, without queueing behind the caller.
+func probeWideLocks(t *testing.T, pool *pgxpool.Pool) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	var ok bool
+	if err = tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(7343226011103) AND pg_try_advisory_xact_lock(7343226011101)`).Scan(&ok); err != nil {
+		t.Fatal(err)
+	}
+	return ok
+}
+
+// The writer fence is read after the wide protection locks. Admission only
+// tries it: a busy fence row is awaited holding nothing, then revalidated, so
+// a delivery hold that needs 7343226011103 is never queued behind admission.
+func TestR2AdmissionAwaitsWriterFenceOutsideWideLocks(t *testing.T) {
+	f := newKeep28Fixture(t)
+	a := f.applier(t)
+	e := f.entry(t)
+	var bucket, endpoint string
+	if err := f.pool.QueryRow(f.ctx, `SELECT bucket,endpoint_sha256 FROM r2_retirement_writer_fences`).Scan(&bucket, &endpoint); err != nil {
+		t.Fatal(err)
+	}
+	holdFence := func(t *testing.T) pgx.Tx {
+		t.Helper()
+		tx, err := f.pool.Begin(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = tx.Exec(f.ctx, `SELECT 1 FROM r2_retirement_writer_fences WHERE bucket=$1 AND endpoint_sha256=$2 FOR UPDATE`, bucket, endpoint); err != nil {
+			t.Fatal(err)
+		}
+		return tx
+	}
+
+	fence := holdFence(t)
+	defer fence.Rollback(f.ctx)
+	reserved := make(chan error, 1)
+	go func() { _, err := a.reserve(f.ctx, e); reserved <- err }()
+	waitBlockedBy(t, f.pool, stitchBackendPID(t, fence), "reserve behind the writer fence")
+	if !probeWideLocks(t, f.pool) {
+		t.Fatal("reserve kept the wide protection locks while awaiting the writer fence")
+	}
+	if err := fence.Rollback(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := within(t, reserved, "reserve behind the writer fence"); err != nil {
+		t.Fatalf("reserve did not revalidate after the writer fence: %v", err)
+	}
+
+	fence = holdFence(t)
+	defer fence.Rollback(f.ctx)
+	wiring := make(chan error, 1)
+	go func() {
+		tx, _, err := admitWire(f.ctx, f.pool, func(tx pgx.Tx) (*inverseDeleteAuthority, error) {
+			return a.authorize(f.ctx, tx, e, &inverseSendGate{})
+		})
+		if tx != nil {
+			tx.Rollback(context.Background())
+		}
+		wiring <- err
+	}()
+	waitBlockedBy(t, f.pool, stitchBackendPID(t, fence), "wire behind the writer fence")
+	if !probeWideLocks(t, f.pool) {
+		t.Fatal("wire kept the wide protection locks while awaiting the writer fence")
+	}
+	if err := fence.Rollback(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := within(t, wiring, "wire behind the writer fence"); err != nil {
+		t.Fatalf("wire did not revalidate after the writer fence: %v", err)
+	}
+}
+
+// Admission retries are bounded: an admission that keeps meeting a busy lock
+// must fail with the named bound instead of looping, and a key whose own
+// deadline expires first must report both that bound and the deadline.
+func TestR2AdmissionRetriesAreBounded(t *testing.T) {
+	f := newKeep28Fixture(t)
+	// Admission that keeps reporting the same (freely lockable) wait never
+	// settles; only the named cap ends it.
+	attempts := 0
+	_, err := admitInverse(f.ctx, inverseBegin(f.pool), func() (struct{}, error) {
+		attempts++
+		return struct{}{}, inverseBusy{{sql: `SELECT pg_advisory_xact_lock(7343226011000)`}}
+	})
+	if !errors.Is(err, errInverseAdmissionBusy) || attempts != inverseAdmissionRetries+1 {
+		t.Fatalf("retry bound: attempts %d err %v", attempts, err)
+	}
+
+	a := f.applier(t)
+	e := f.entry(t)
+	owner, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Rollback(f.ctx)
+	if _, err = owner.Exec(f.ctx, `SELECT lock_nas_r2_copy_key('stoarama',$1)`, f.key); err != nil {
+		t.Fatal(err)
+	}
+	prompt, cancel := context.WithTimeout(f.ctx, 2*time.Second)
+	defer cancel()
+	started := time.Now()
+	if _, err = a.reserve(prompt, e); !errors.Is(err, errInverseAdmissionBusy) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired admission did not name its bound and deadline: %v", err)
+	}
+	if time.Since(started) > 15*time.Second {
+		t.Fatalf("expired admission overran its deadline: %v", time.Since(started))
+	}
+	if !probeWideLocks(t, f.pool) {
+		t.Fatal("expired admission left the wide protection locks held")
+	}
+}

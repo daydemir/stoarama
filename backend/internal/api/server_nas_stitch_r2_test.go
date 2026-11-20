@@ -61,7 +61,9 @@ func TestR2StitchDurhamHoldReleasedOnlyByCommittedNASCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pool.Close()
+	// Pool close runs last: the deferred handlers release above must free their
+	// held DELETE and session lock first, or Close waits on a checked-out conn.
+	t.Cleanup(pool.Close)
 	if err := db.MigrateUp(ctx, pool, findMigrationsDir(t)); err != nil {
 		t.Fatal(err)
 	}
@@ -590,6 +592,14 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	// reservation while a RAW batch owns the executors' outer lock. The second
 	// cannot send while the first is on the wire.
 	release := holdSessionLock(t, pool, "7343226011173")
+	// Registered before any assertion: a failure above must release the session
+	// lock, the held DELETE and the staging-race transaction instead of leaving
+	// them checked out for pool.Close.
+	defer release()
+	defer func() {
+		abort.holdDelete.Store(false)
+		abort.release()
+	}()
 	abort.holdDelete.Store(true)
 	racing := make(chan error, 1)
 	go func() { racing <- store.RetireStitchStage(ctx, 123, sha, proofExpiry, false) }()

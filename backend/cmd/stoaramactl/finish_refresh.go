@@ -288,9 +288,15 @@ func queueKeep28RefreshOnce(ctx context.Context, begin func(context.Context) (pg
 		status.RefreshHold = finishLateBudgetHeld
 		return false, nil
 	}
+	// This row is read after the wide locks and the copy row, so it only tries:
+	// admission awaits a busy control row here, holding nothing, and retries.
 	var enabled bool
-	if err = tx.QueryRow(ctx, `SELECT enabled FROM r2_keep28_refresh_control FOR SHARE`).Scan(&enabled); err != nil || !enabled {
-		return false, finishDBError(finishRefreshAdmission, 0, err)
+	const controlRow = `SELECT enabled FROM r2_keep28_refresh_control FOR SHARE`
+	if err = tx.QueryRow(ctx, controlRow+` NOWAIT`).Scan(&enabled); err != nil {
+		return false, finishDBError(finishRefreshAdmission, 0, inverseRowBusy(err, inverseWait{controlRow, nil}))
+	}
+	if !enabled {
+		return false, nil
 	}
 	picks, err := loadR2RetirePicks(o.Picks)
 	if err != nil {

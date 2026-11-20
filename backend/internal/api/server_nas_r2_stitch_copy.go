@@ -9,6 +9,7 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type nasR2StitchReceipt struct {
@@ -109,6 +110,17 @@ func finishNASR2StitchCopy(ctx context.Context, tx pgx.Tx, task nasR2CopyTask, r
  JOIN nas_stitch_r2_stage_objects o ON o.id=q.source_id WHERE q.id=$1`, task.ID).Scan(&exact)
 	if err != nil || !exact {
 		return errors.New("NAS copy receipt differs from the exact staged generation")
+	}
+	// The certificate INSERT and its release trigger write the certificate,
+	// hour and input-hold tables. Take those table locks without waiting first:
+	// this transaction already owns the copy row, so a busy table must fail to
+	// the client instead of queueing every other writer behind it.
+	if _, err = tx.Exec(ctx, `LOCK TABLE nas_stitch_r2_certificates,nas_stitch_r2_hours,nas_stitch_r2_input_holds IN ROW EXCLUSIVE MODE NOWAIT`); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
+			return errors.New("retirement holds are busy")
+		}
+		return err
 	}
 	var accepted bool
 	err = tx.QueryRow(ctx, `WITH proof AS MATERIALIZED (

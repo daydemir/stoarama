@@ -132,7 +132,24 @@ func inverseReadPinned(path, digest string, dst any) error {
 	}
 	return json.Unmarshal(data, dst)
 }
+
+// inverseFenceWait waits for the writer fence that admission found busy.
+func (a *inverseApplier) inverseFenceWait() inverseWait {
+	return inverseWait{sql: `SELECT 1 FROM r2_retirement_writer_fences WHERE bucket=$1 AND endpoint_sha256=$2 FOR SHARE`,
+		args: []any{a.store.Bucket(), a.store.EndpointSHA256()}}
+}
+
 func (a *inverseApplier) checkEvidence(ctx context.Context, q r2RetireQuerier) error {
+	return a.checkEvidenceLock(ctx, q, `FOR SHARE`)
+}
+
+// checkEvidenceAdmission reads the same fence under the wide protection locks,
+// so it only tries the row: admission awaits a busy fence outside them.
+func (a *inverseApplier) checkEvidenceAdmission(ctx context.Context, tx pgx.Tx) error {
+	return inverseRowBusy(a.checkEvidenceLock(ctx, tx, `FOR SHARE NOWAIT`), a.inverseFenceWait())
+}
+
+func (a *inverseApplier) checkEvidenceLock(ctx context.Context, q r2RetireQuerier, lock string) error {
 	picks, err := loadR2RetirePicks(a.opts.Picks)
 	if err != nil {
 		return err
@@ -148,7 +165,7 @@ func (a *inverseApplier) checkEvidence(ctx context.Context, q r2RetireQuerier) e
 	var blocked, recorderReplay bool
 	err = q.QueryRow(ctx, `SELECT activated_at,drain_not_before,clock_timestamp(),r2_retirement_writes_blocked($1,$2),
  EXISTS(SELECT 1 FROM recordings WHERE status='active') OR EXISTS(SELECT 1 FROM recording_jobs WHERE status IN ('pending','leased'))
- FROM r2_retirement_writer_fences WHERE bucket=$1 AND endpoint_sha256=$2 FOR SHARE`, a.store.Bucket(), a.store.EndpointSHA256()).Scan(&activated, &deadline, &now, &blocked, &recorderReplay)
+ FROM r2_retirement_writer_fences WHERE bucket=$1 AND endpoint_sha256=$2 `+lock, a.store.Bucket(), a.store.EndpointSHA256()).Scan(&activated, &deadline, &now, &blocked, &recorderReplay)
 	if err != nil {
 		return fmt.Errorf("exact 0198 writer fence required: %w", err)
 	}
@@ -205,17 +222,44 @@ func (b inverseBusy) await(ctx context.Context, begin func(context.Context) (pgx
 	return nil
 }
 
-// admitInverse retries admit until it reports no busy lock. admit must have
-// rolled its transaction back before it returns inverseBusy.
+// Admission contention is bounded: a lock owned by a stuck session must fail
+// the key or the batch clearly instead of retrying forever.
+var (
+	// A busy lock is normally free after one outside wait. The cap only stops a
+	// pathological live-lock between many workers; it is not a fairness bound.
+	inverseAdmissionRetries  = 200
+	inverseAdmissionDeadline = 2 * time.Minute
+)
+
+// errInverseAdmissionBusy reports admission that never cleared its busy locks.
+var errInverseAdmissionBusy = errors.New("R2 retirement admission stayed busy past its retry bound")
+
+// admitInverse retries admit until it reports no busy lock, at most
+// inverseAdmissionRetries times and never past inverseAdmissionDeadline.
+// admit must have rolled its transaction back before it returns inverseBusy.
 func admitInverse[T any](ctx context.Context, begin func(context.Context) (pgx.Tx, error), admit func() (T, error)) (T, error) {
-	for {
+	ctx, cancel := context.WithTimeout(ctx, inverseAdmissionDeadline)
+	defer cancel()
+	busyFailure := func(attempts int, busy inverseBusy, cause error) error {
+		if cause == nil {
+			return fmt.Errorf("%w: %d waits: %v", errInverseAdmissionBusy, attempts, busy)
+		}
+		return fmt.Errorf("%w: %d waits: %v: %w", errInverseAdmissionBusy, attempts, busy, cause)
+	}
+	for attempts := 0; ; attempts++ {
 		v, err := admit()
 		var busy inverseBusy
 		if !errors.As(err, &busy) {
 			return v, err
 		}
+		if attempts >= inverseAdmissionRetries {
+			return v, busyFailure(attempts, busy, nil)
+		}
 		if err = busy.await(ctx, begin); err != nil {
-			return v, err
+			if ctx.Err() != nil {
+				return v, busyFailure(attempts+1, busy, ctx.Err())
+			}
+			return v, busyFailure(attempts+1, busy, err)
 		}
 	}
 }
@@ -246,23 +290,36 @@ func admitWire[T any](ctx context.Context, pool *pgxpool.Pool, authorize func(pg
 	return tx, v, err
 }
 
-// inverseProtectionLocks queues on 7343226011103, which serializes executors
-// and holds nothing wide yet, then only tries the final fence 7343226011101:
-// its other holders (NAS listing evidence) are awaited outside; see inverseBusy.
+// Lock order is 7343226011103, then 137,1, then the final fence
+// 7343226011101. 1103 serializes executors and is queued on first, while this
+// transaction still holds nothing; a joined freeze takes 137,1 exclusively and
+// may then need 1103, so holding 137,1 while blocking on 1103 would close a
+// cycle. 137,1 and 1101 are therefore only tried: contention returns
+// inverseBusy so admission rolls everything back, awaits that lock outside,
+// then retries.
 func inverseProtectionLocks(ctx context.Context, tx pgx.Tx, shared bool) error {
 	mode := ""
 	if shared {
 		mode = "_shared"
 	}
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(137,1),pg_advisory_xact_lock`+mode+`(7343226011103)`); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock`+mode+`(7343226011103)`); err != nil {
 		return err
 	}
-	var ok bool
-	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock`+mode+`(7343226011101)`).Scan(&ok); err != nil {
-		return err
+	tries := []struct {
+		try  string
+		wait inverseWait
+	}{
+		{`SELECT pg_try_advisory_xact_lock_shared(137,1)`, inverseWait{sql: `SELECT pg_advisory_xact_lock_shared(137,1)`}},
+		{`SELECT pg_try_advisory_xact_lock` + mode + `(7343226011101)`, inverseWait{sql: `SELECT pg_advisory_xact_lock` + mode + `(7343226011101)`}},
 	}
-	if !ok {
-		return inverseBusy{{sql: `SELECT pg_advisory_xact_lock` + mode + `(7343226011101)`}}
+	for _, t := range tries {
+		var ok bool
+		if err := tx.QueryRow(ctx, t.try).Scan(&ok); err != nil {
+			return err
+		}
+		if !ok {
+			return inverseBusy{t.wait}
+		}
 	}
 	return nil
 }
@@ -432,7 +489,7 @@ func probeInversePurge(ctx context.Context, tx pgx.Tx, id int64) error {
 }
 
 func (a *inverseApplier) checkTarget(ctx context.Context, tx pgx.Tx, t inverseRawTarget, e inverseEntry, purgeProbe bool) error {
-	if err := a.checkEvidence(ctx, tx); err != nil {
+	if err := a.checkEvidenceAdmission(ctx, tx); err != nil {
 		return err
 	}
 	var epoch int64

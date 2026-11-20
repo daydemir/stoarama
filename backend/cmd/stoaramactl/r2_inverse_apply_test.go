@@ -927,21 +927,46 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			tx  pgx.Tx
 			err error
 		}
+		// A failed assertion must stop the goroutine and roll its transaction
+		// back, so neither holds a connection when the pool closes.
+		wireCtx, wireStop := context.WithCancel(ctx)
 		wiring := make(chan authorized, 1)
 		go func() {
-			tx, _, err := admitWire(ctx, pool, func(tx pgx.Tx) (*inverseDeleteAuthority, error) {
-				return a.authorize(ctx, tx, fenced, &inverseSendGate{})
+			tx, _, err := admitWire(wireCtx, pool, func(tx pgx.Tx) (*inverseDeleteAuthority, error) {
+				return a.authorize(wireCtx, tx, fenced, &inverseSendGate{})
 			})
 			wiring <- authorized{tx, err}
 		}()
+		collected := false
+		var wiredTx pgx.Tx
+		t.Cleanup(func() {
+			wireStop()
+			if !collected {
+				select {
+				case w := <-wiring:
+					if w.tx != nil {
+						_ = w.tx.Rollback(context.Background())
+					}
+				case <-time.After(30 * time.Second):
+				}
+				return
+			}
+			if wiredTx != nil {
+				_ = wiredTx.Rollback(context.Background())
+			}
+		})
 		waitBlockedBy(t, pool, stitchBackendPID(t, keyOwner), "wire behind another key owner")
 		mutatorProceeds("a wire awaiting its copy key")
 		keyOwner.Rollback(ctx)
 		w := within(t, wiring, "wire behind another key owner")
+		collected, wiredTx = true, w.tx
 		if w.err != nil {
 			t.Fatalf("wire behind another key owner did not authorize: %v", w.err)
 		}
-		w.tx.Rollback(ctx)
+		if err = wiredTx.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+		wiredTx = nil
 	})
 	t.Run("send_gate_closed_after_authorize_stops_the_first_write", func(t *testing.T) {
 		// The gate closes while this DELETE is past every check and dialing:
