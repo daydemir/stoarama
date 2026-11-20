@@ -52,6 +52,12 @@ type inverseDeleteAuthority struct {
 	custodyEnd time.Time
 }
 
+// wireKey is the one exact key this authority may delete.
+func (a *inverseDeleteAuthority) wireKey() string { return a.binding.Key }
+
+// sendGate is the batch gate the RAW executor gave this authority.
+func (a *inverseDeleteAuthority) sendGate() *inverseSendGate { return a.gate }
+
 // inverseSendGate closes when a batch hits a hard failure. A DELETE whose first
 // request byte is not yet written never sends after that; closing waits for a
 // first write already under way.
@@ -344,11 +350,19 @@ func newInverseSDKStore(ctx context.Context, cfg r2.Config) (*inverseSDKStore, e
 }
 
 func (s *inverseSDKStore) confirmAbsent(ctx context.Context, key string) error {
+	return confirmInverseAbsent(ctx, s.sdk, s.confirm, s.Bucket(), key)
+}
+
+// confirmInverseAbsent is the strict confirming-HEAD ladder: only a 404 for the
+// exact key confirms, each attempt is one request on its own fresh connection
+// under its own timeout, only transient provider failures retry, and a redirect
+// or a 200 stops at once. The stage retirement reuses exactly this ladder.
+func confirmInverseAbsent(ctx context.Context, sdk *s3.Client, confirm *http.Client, bucket, key string) error {
 	ctx, cancel := context.WithTimeout(ctx, inverseConfirmTimeout)
 	defer cancel()
 	for attempt := 1; ; attempt++ {
-		_, err := s.sdk.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.Bucket()), Key: aws.String(key)}, func(o *s3.Options) {
-			o.HTTPClient = s.confirm
+		_, err := sdk.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)}, func(o *s3.Options) {
+			o.HTTPClient = confirm
 			o.Retryer = aws.NopRetryer{}
 		})
 		err = inverseAbsence(err)
@@ -366,6 +380,13 @@ func (s *inverseSDKStore) confirmAbsent(ctx context.Context, key string) error {
 	}
 }
 func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDeleteAuthority) error {
+	return s.deleteOneWire(ctx, authority, authority.binding.Key)
+}
+
+// deleteOneWire sends exactly one DELETE for one already-validated target over
+// the audited HTTP/1.1 single-connection transport. A lost answer is reported
+// as ambiguous, never retried. The stage retirement reaches the wire only here.
+func (s *inverseSDKStore) deleteOneWire(ctx context.Context, authority inverseWireTarget, key string) error {
 	if err := authority.requireWire(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
 		return err
 	}
@@ -373,9 +394,9 @@ func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDele
 	if !ok {
 		return errors.New("inverse DELETE needs the HTTP/1.1 transport template")
 	}
-	wire := &inverseWire{gate: authority.gate}
+	wire := &inverseWire{gate: authority.sendGate()}
 	transport := &inverseDeleteTransport{base: wire.transport(template), authority: authority, bucket: s.Bucket(), endpoint: s.EndpointSHA256(), wire: wire}
-	_, err := s.sdk.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.Bucket()), Key: aws.String(authority.binding.Key)}, func(o *s3.Options) {
+	_, err := s.sdk.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.Bucket()), Key: aws.String(key)}, func(o *s3.Options) {
 		o.Retryer = aws.NopRetryer{}
 		o.HTTPClient = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	})
@@ -534,16 +555,30 @@ func (c *inverseWireConn) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// inverseWireTarget is the minimum a single DELETE needs: one exact key, one
+// consumption state, one revalidation against the still-held locks, and one
+// deadline bound. The RAW executor issues it for both lanes; the Durham stage
+// retirement issues its own for one stage object. Nothing else is shared.
+type inverseWireTarget interface {
+	requireWire(context.Context, string, string) error
+	check(context.Context, string, string) error
+	bound(context.Context) (context.Context, context.CancelFunc, error)
+	wireKey() string
+	// sendGate stops a batch's unsent keys; a single-attempt target owns its own
+	// open gate and never closes one.
+	sendGate() *inverseSendGate
+}
+
 type inverseDeleteTransport struct {
 	base             http.RoundTripper
-	authority        *inverseDeleteAuthority
+	authority        inverseWireTarget
 	bucket, endpoint string
 	attempted        atomic.Bool
 	wire             *inverseWire
 }
 
 func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.Method != http.MethodDelete || req.URL.Path != "/"+t.bucket+"/"+t.authority.binding.Key || req.URL.RawQuery != "x-id=DeleteObject" || !t.attempted.CompareAndSwap(false, true) {
+	if req.Method != http.MethodDelete || req.URL.Path != "/"+t.bucket+"/"+t.authority.wireKey() || req.URL.RawQuery != "x-id=DeleteObject" || !t.attempted.CompareAndSwap(false, true) {
 		return nil, errors.New("inverse transport permits one exact DELETE")
 	}
 	if err := t.authority.check(req.Context(), t.bucket, t.endpoint); err != nil {

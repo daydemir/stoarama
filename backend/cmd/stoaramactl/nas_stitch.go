@@ -133,30 +133,60 @@ func runDurhamStageRetirement(ctx context.Context, cfg config.Config, args []str
 	digest := fs.String("sha256", "", "staging object SHA-256")
 	apply := fs.Bool("apply", false, "authorize one stage-only wire attempt")
 	reconcile := fs.Bool("reconcile", false, "record absence of an already issued staging target or drained abort")
-	proof := fs.String("conditional-delete-proof", "", "reviewed provider conditional DELETE proof")
-	proofSHA := fs.String("expected-delete-proof-sha256", "", "expected SHA-256 of the reviewed provider proof")
+	evidence := fs.String("evidence", "", "reviewed exact per-stage retirement evidence")
+	evidenceSHA := fs.String("expected-evidence-sha256", "", "expected SHA-256 of that reviewed evidence")
+	picksPath := fs.String("picks", "", "reviewed owner picks (r2-picks.json)")
+	picksSHA := fs.String("expected-picks-sha256", "", "expected SHA-256 of those reviewed picks")
 	fs.Parse(args)
 	if fs.NArg() != 0 || *id <= 0 || !r2RetireLowerHex64(*digest) || *apply == *reconcile {
 		log.Fatal("exact object ID, SHA-256 and one of --apply or --reconcile required")
+	}
+	if *apply && (!r2RetireLowerHex64(*evidenceSHA) || *evidence == "" || !r2RetireLowerHex64(*picksSHA) || *picksPath == "") {
+		log.Fatal("--apply requires --evidence/--expected-evidence-sha256 and --picks/--expected-picks-sha256")
+	}
+	// The owner picks are read and digest-checked here, never accepted as raw
+	// arrays in the evidence file. The decided and keep-everything stream sets
+	// are reconstructed from the real parser and must equal what the reviewed
+	// evidence claims, so a hand-written array cannot widen the gate.
+	var ev r2.StitchStageEvidence
+	var decision r2.StitchStagePicks
+	if *apply {
+		if err := inverseReadPinned(*evidence, *evidenceSHA, &ev); err != nil {
+			log.Fatal(err)
+		}
+		// A policy or picks failure is fatal: an empty derivation must never
+		// stand in for a decision that could not be read.
+		_, windows, err := api.Keep28Policy()
+		if err != nil {
+			log.Fatal(err)
+		}
+		decision, err = durhamStagePicks(*picksPath, *picksSHA, windows)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 	pool, err := r2RetireOpenPool(ctx, cfg, false)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer pool.Close()
-	store, err := r2.New(ctx, r2.Config{WriterDB: pool, Endpoint: cfg.R2Endpoint, Region: cfg.R2Region,
-		Bucket: cfg.R2Bucket, AccessKey: cfg.R2AccessKeyID, SecretKey: cfg.R2SecretAccessKey})
+	// One exact provider configuration for both clients: the retirement checks
+	// the bucket and endpoint, and the wire must be the same credential-backed
+	// endpoint, so no read and delete can be split across two endpoints.
+	r2cfg := archiveR2Config(cfg, pool)
+	store, err := r2.New(ctx, r2cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
-	var proofExpires time.Time
+	var wire r2.StitchStageWire
 	if *apply {
-		proofExpires, err = r2RetireDeleteProofExpiry(*proof, *proofSHA, store.Bucket(), store.EndpointSHA256(), false, time.Now())
+		sdk, err := newInverseSDKStore(ctx, r2cfg)
 		if err != nil {
 			log.Fatal(err)
 		}
+		wire = &durhamStageWire{store: sdk}
 	}
-	if err := store.RetireStitchStage(ctx, *id, *digest, proofExpires, *reconcile); err != nil {
+	if err := store.RetireStitchStage(ctx, *id, *digest, ev, decision, wire, *reconcile); err != nil {
 		log.Fatal(err)
 	}
 	printJSON(map[string]any{"object_id": *id, "absence_confirmed": true})

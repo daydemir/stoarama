@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -114,9 +115,9 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	if err != nil {
 		t.Fatal(err)
 	}
-	proofExpiry := time.Now().Add(time.Hour)
-	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil || !strings.Contains(err.Error(), "writer fence and drain") {
-		t.Fatal("staging retirement accepted an undrained fence", err)
+	if err := store.RetireStitchStage(ctx, 123, sha, r2.StitchStageEvidence{}, r2.StitchStagePicks{}, nil, false); err == nil ||
+		!strings.Contains(err.Error(), "reviewed evidence") {
+		t.Fatal("staging retirement was admitted without reviewed per-stage evidence", err)
 	}
 
 	planTx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
@@ -292,6 +293,39 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	var key string
 	if err := pool.QueryRow(ctx, `SELECT object_key FROM nas_stitch_r2_stage_objects WHERE id=123`).Scan(&key); err != nil {
 		t.Fatal(err)
+	}
+	wire := apiStageWire{endpoint: provider.URL}
+	// evidence binds one exact stage generation, hour and attempt to the live
+	// fence this disposable schema matured. It is derived here, never accepted
+	// from free text.
+	var fenceAt, fenceDrain time.Time
+	if err := pool.QueryRow(ctx, `SELECT activated_at,drain_not_before FROM r2_retirement_writer_fences
+ WHERE bucket='stoarama' AND endpoint_sha256=$1`, endpoint).Scan(&fenceAt, &fenceDrain); err != nil {
+		t.Fatal(err)
+	}
+	// The stream sets come from a real reviewed picks file, exactly as the CLI
+	// derives them. Nothing is hand-written into the evidence arrays.
+	window := windows[plan.StreamID]
+	picksRaw := fmt.Sprintf(`{"saved_at":"2026-11-19T00:00:00Z","choices":{"%d":{"choice":"st","keep_start_utc":%q,"keep_end_utc":%q}}}`,
+		plan.StreamID, window.Start.Format("2006-01-02 15:04:05Z07:00"), window.End.Format("2006-01-02 15:04:05Z07:00"))
+	picksSHA := cleanupSHA([]byte(picksRaw))
+	// This package cannot call the command layer's picks parser, so the fixture
+	// states the derivation it expects and the command layer's own parser is
+	// covered by its unit tests. The retirement re-derives and compares.
+	decided, ke := []int64{plan.StreamID}, []int64{}
+	decision := func() r2.StitchStagePicks {
+		return r2.StitchStagePicks{SHA256: picksSHA, Decided: decided, KE: ke}
+	}
+	evidence := func() r2.StitchStageEvidence {
+		return r2.StitchStageEvidence{Version: 1, Bucket: "stoarama", EndpointSHA256: endpoint,
+			ObjectID: 123, ObjectKey: key, SHA256: sha, SizeBytes: 100,
+			HourID: id, Attempt: 2, PlanSHA256: planDigest, ManifestSHA256: manifest,
+			FenceActivatedAt: fenceAt, DrainNotBefore: fenceDrain,
+			DeployedWriterCoverage: "fixture: this disposable schema",
+			ExternalWriterRace:     r2.StitchStageExternalWriterRace,
+			PicksSHA256:            picksSHA,
+			DecidedStreamIDs:       decided,
+			KEStreamIDs:            ke}
 	}
 	item := NASR2CopyItem{Kind: NASR2CopyStitchOutput, SourceID: 123, RecordingID: plan.RecordingID, StreamID: plan.StreamID,
 		RelativePath: plan.OutputFolder + "/run-000-" + sha + ".mp4", SHA256: sha, SizeBytes: 100,
@@ -562,10 +596,11 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
  FROM nas_r2_copy_items WHERE id=$1`, copyID).Scan(&readGrantStillLive); err != nil || !readGrantStillLive {
 		t.Fatal("copy completion shortened the signed range drain", err)
 	}
-	if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, false); err == nil || !strings.Contains(err.Error(), "conditional staging delete proof") {
-		t.Fatal("staging retirement accepted missing provider evidence", err)
+	if err := store.RetireStitchStage(ctx, 123, sha, r2.StitchStageEvidence{}, r2.StitchStagePicks{}, nil, false); err == nil ||
+		!strings.Contains(err.Error(), "reviewed evidence") {
+		t.Fatal("staging retirement accepted missing per-stage evidence", err)
 	}
-	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil || !strings.Contains(err.Error(), "drain") {
+	if err := store.RetireStitchStage(ctx, 123, sha, evidence(), decision(), wire, false); err == nil || !strings.Contains(err.Error(), "drain") {
 		t.Fatal("certificate bypassed the pending signed grants", err)
 	}
 	// Advance only the stored grant clocks in this disposable schema to test
@@ -573,12 +608,149 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	exec(`ALTER TABLE nas_stitch_r2_stage_objects DISABLE TRIGGER nas_stitch_r2_stage_guard;
  UPDATE nas_stitch_r2_stage_objects SET grants_drain_at=clock_timestamp()-interval '1 second' WHERE id=123;
  ALTER TABLE nas_stitch_r2_stage_objects ENABLE TRIGGER nas_stitch_r2_stage_guard;`)
-	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil || !strings.Contains(err.Error(), "drain") {
+	if err := store.RetireStitchStage(ctx, 123, sha, evidence(), decision(), wire, false); err == nil || !strings.Contains(err.Error(), "drain") {
 		t.Fatal("staging retirement ignored the outstanding signed NAS read grant", err)
 	}
 	exec(`ALTER TABLE nas_r2_copy_items DISABLE TRIGGER nas_r2_stitch_copy_evidence_guard;
  UPDATE nas_r2_copy_items SET stitch_read_grants_until=clock_timestamp()-interval '1 second' WHERE kind='stitch_output';
  ALTER TABLE nas_r2_copy_items ENABLE TRIGGER nas_r2_stitch_copy_evidence_guard;`)
+	// The evidence and the wire must name one exact bucket and endpoint, and the
+	// stream sets must be the derivation of the pinned picks. Each negative here
+	// is a value an operator could type; none may become authority.
+	t.Run("evidence and picks binding cannot be widened", func(t *testing.T) {
+		mismatched := apiStageWire{endpoint: strings.Replace(provider.URL, "127.0.0.1", "127.0.0.2", 1)}
+		if mismatchEndpoint := evidence(); true {
+			if err := store.RetireStitchStage(ctx, 123, sha, mismatchEndpoint, decision(), mismatched, false); err == nil ||
+				!strings.Contains(err.Error(), "endpoint differs") {
+				t.Fatalf("a wire at another endpoint was admitted: %v", err)
+			}
+		}
+		otherEndpoint := evidence()
+		otherEndpoint.EndpointSHA256 = strings.Repeat("f", 64)
+		if err := store.RetireStitchStage(ctx, 123, sha, otherEndpoint, decision(), wire, false); err == nil ||
+			!strings.Contains(err.Error(), "bind this exact generation") {
+			t.Fatalf("evidence for another endpoint was admitted: %v", err)
+		}
+		// The committed stage row is authoritative. A client built for another
+		// endpoint than the one certification recorded must refuse before any
+		// wire, whatever its own config and the evidence both say.
+		drifted, err := r2.New(ctx, r2.Config{Bucket: "stoarama",
+			Endpoint: strings.Replace(provider.URL, "127.0.0.1", "127.0.0.2", 1), Region: "auto",
+			AccessKey: "fake", SecretKey: "fake", WriterDB: pool})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := drifted.RetireStitchStage(ctx, 123, sha, evidence(), decision(), wire, false); err == nil ||
+			!strings.Contains(err.Error(), "committed endpoint differs") {
+			t.Fatalf("a client configured for another endpoint was admitted: %v", err)
+		}
+		for _, tc := range []struct {
+			name    string
+			change  func(*r2.StitchStageEvidence, *r2.StitchStagePicks)
+			wantErr string
+		}{
+			{"forged decided stream", func(e *r2.StitchStageEvidence, _ *r2.StitchStagePicks) {
+				e.DecidedStreamIDs = []int64{plan.StreamID, 999999}
+			}, "decided streams differ"},
+			{"forged ke stream", func(e *r2.StitchStageEvidence, _ *r2.StitchStagePicks) {
+				e.KEStreamIDs = []int64{plan.StreamID}
+			}, "keep-everything streams differ"},
+			{"evidence pins other picks", func(e *r2.StitchStageEvidence, _ *r2.StitchStagePicks) {
+				e.PicksSHA256 = strings.Repeat("e", 64)
+			}, "different owner picks"},
+			{"retirement has no picks", func(_ *r2.StitchStageEvidence, p *r2.StitchStagePicks) {
+				*p = r2.StitchStagePicks{}
+			}, "different owner picks"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				e, p := evidence(), decision()
+				tc.change(&e, &p)
+				if err := store.RetireStitchStage(ctx, 123, sha, e, p, wire, false); err == nil ||
+					!strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("%s was admitted: %v", tc.name, err)
+				}
+			})
+		}
+	})
+	// Source-side vetoes are authoritative and fail closed even when the stage
+	// key itself is clean. Every case mutates a real committed catalog row in
+	// this disposable schema, with only the append-only guard disabled while
+	// the fixture is installed.
+	t.Run("source-side vetoes fail closed", func(t *testing.T) {
+		base := evidence()
+		// fixture installs and removes a mutation that the append-only evidence
+		// guards would otherwise refuse, so each case starts from a clean schema.
+		fixture := func(table, trigger, install, undo string) func() {
+			return func() {
+				t.Helper()
+				if _, err := pool.Exec(ctx, `ALTER TABLE `+table+` DISABLE TRIGGER `+trigger); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := pool.Exec(ctx, install); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := pool.Exec(ctx, `ALTER TABLE `+table+` ENABLE TRIGGER `+trigger); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if _, err := pool.Exec(ctx, `ALTER TABLE `+table+` DISABLE TRIGGER `+trigger); err != nil {
+						t.Error(err)
+						return
+					}
+					if _, err := pool.Exec(ctx, undo); err != nil {
+						t.Error(err)
+					}
+					if _, err := pool.Exec(ctx, `ALTER TABLE `+table+` ENABLE TRIGGER `+trigger); err != nil {
+						t.Error(err)
+					}
+				})
+			}
+		}
+		for _, tc := range []struct {
+			name string
+			// evidence and picks are changed together, so the binding gate passes
+			// and the refusal must come from the source policy itself.
+			evidence func(r2.StitchStageEvidence) r2.StitchStageEvidence
+			picks    func(r2.StitchStagePicks) r2.StitchStagePicks
+			install  func()
+		}{
+			// The pinned picks do not decide this hour's stream at all.
+			{"undecided stream",
+				func(e r2.StitchStageEvidence) r2.StitchStageEvidence { e.DecidedStreamIDs = []int64{}; return e },
+				func(p r2.StitchStagePicks) r2.StitchStagePicks { p.Decided = []int64{}; return p }, nil},
+			// The pinned picks keep this whole stream, so no stage of it is
+			// retirement authority however clean the stage key looks.
+			{"keep-everything stream",
+				func(e r2.StitchStageEvidence) r2.StitchStageEvidence {
+					e.KEStreamIDs = []int64{plan.StreamID}
+					return e
+				},
+				func(p r2.StitchStagePicks) r2.StitchStagePicks { p.KE = []int64{plan.StreamID}; return p }, nil},
+			// The 0220 owner thesis keep covers the source, not the stage key.
+			{"owner thesis prefix", func(e r2.StitchStageEvidence) r2.StitchStageEvidence { return e },
+				func(p r2.StitchStagePicks) r2.StitchStagePicks { return p },
+				fixture("r2_owner_keep_prefixes", "r2_owner_keep_prefix_immutable",
+					`INSERT INTO r2_owner_keep_prefixes(bucket,prefix,decision)
+ VALUES('stoarama','raw/stream/`+fmt.Sprint(plan.StreamID)+`/','fixture thesis keep')`,
+					`DELETE FROM r2_owner_keep_prefixes WHERE prefix='raw/stream/`+fmt.Sprint(plan.StreamID)+`/'`)},
+			// A committed source that no longer matches its certified hold.
+			{"changed committed source", func(e r2.StitchStageEvidence) r2.StitchStageEvidence { return e },
+				func(p r2.StitchStagePicks) r2.StitchStagePicks { return p },
+				fixture("recording_clips", "r2_inverse_source_identity_fence",
+					`UPDATE recording_clips SET sha256=repeat('b',64) WHERE id=902`,
+					`UPDATE recording_clips SET sha256='`+sha+`' WHERE id=902`)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				if tc.install != nil {
+					tc.install()
+				}
+				if err := store.RetireStitchStage(ctx, 123, sha, tc.evidence(base), tc.picks(decision()), wire, false); err == nil ||
+					!strings.Contains(err.Error(), "provenance") {
+					t.Fatalf("source veto %q was not refused: %v", tc.name, err)
+				}
+			})
+		}
+	})
 	staleFence, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
 		t.Fatal(err)
@@ -603,13 +775,13 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	}()
 	abort.holdDelete.Store(true)
 	racing := make(chan error, 1)
-	go func() { racing <- store.RetireStitchStage(ctx, 123, sha, proofExpiry, false) }()
+	go func() { racing <- store.RetireStitchStage(ctx, 123, sha, evidence(), decision(), wire, false) }()
 	within(t, abort.deleteEntered, "first staging DELETE")
 	var reserved bool
 	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_r2_stage_retirements WHERE object_id=123)`).Scan(&reserved); err != nil || !reserved {
 		t.Fatal("first invocation reached the wire before its one-shot reservation committed", err)
 	}
-	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil || !strings.Contains(err.Error(), "stitch stage retirement busy") {
+	if err := store.RetireStitchStage(ctx, 123, sha, evidence(), decision(), wire, false); err == nil || !strings.Contains(err.Error(), "stitch stage retirement busy") {
 		t.Fatal("a concurrent staging retirement invocation was admitted", err)
 	}
 	abort.holdDelete.Store(false)
@@ -638,7 +810,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		!strings.Contains(err.Error(), "protects dependency admission") {
 		t.Fatal("derived raw path bypassed unresolved stage dependency", err)
 	}
-	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil ||
+	if err := store.RetireStitchStage(ctx, 123, sha, evidence(), decision(), wire, false); err == nil ||
 		!strings.Contains(err.Error(), "reconciliation") {
 		t.Fatal("ambiguous staging delete allowed a second wire attempt", err)
 	}
@@ -670,7 +842,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		testCertifiedStitchNASCleanup(t, s, id, sourceKey, &abort, func() {
 			for _, mode := range []int32{0, 1, 2, 4, 5, 6, 7, 8, 9} {
 				abort.response.Store(mode)
-				if err := store.RetireStitchStage(ctx, 122, sha, time.Time{}, true); err == nil {
+				if err := store.RetireStitchStage(ctx, 122, sha, r2.StitchStageEvidence{}, r2.StitchStagePicks{}, nil, true); err == nil {
 					t.Fatalf("unconfirmed aborted stage accepted in provider case %d", mode)
 				}
 			}
@@ -678,7 +850,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 			// Another staged object's retirement never fences this one.
 			release := holdSessionLock(t, pool, stitchStageGuard(123))
 			for range 2 {
-				if err := store.RetireStitchStage(ctx, 122, sha, time.Time{}, true); err != nil {
+				if err := store.RetireStitchStage(ctx, 122, sha, r2.StitchStageEvidence{}, r2.StitchStagePicks{}, nil, true); err != nil {
 					t.Fatalf("clean aborted stage absence or exact replay refused: %v", err)
 				}
 			}
@@ -690,7 +862,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 			}
 			for _, mode := range []int32{1, 2} {
 				stageHeadResponse.Store(mode)
-				if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, true); err == nil {
+				if err := store.RetireStitchStage(ctx, 123, sha, r2.StitchStageEvidence{}, r2.StitchStagePicks{}, nil, true); err == nil {
 					t.Fatalf("ambiguous staged HEAD supplemented a legacy receipt in provider case %d", mode)
 				}
 			}
@@ -699,7 +871,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 				t.Fatalf("legacy staged receipt without strict confirmation cleared NAS gate: %v %v", stagingAbsent, err)
 			}
 			stageHeadResponse.Store(0)
-			if err := store.RetireStitchStage(ctx, 123, sha, time.Time{}, true); err != nil {
+			if err := store.RetireStitchStage(ctx, 123, sha, r2.StitchStageEvidence{}, r2.StitchStagePicks{}, nil, true); err != nil {
 				t.Fatalf("staging retirement could not reconcile exact absence: %v", err)
 			}
 			var originalPreserved bool
@@ -827,7 +999,7 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, a
 			completed = true
 			modified = time.Now().UTC().Truncate(time.Second)
 			fmt.Fprint(w, "<CompleteMultipartUploadResult><ETag>&#34;stage-etag&#34;</ETag></CompleteMultipartUploadResult>")
-		case r.Method == http.MethodDelete && completed && !deleted && r.Header.Get("If-Match") == `"stage-etag"`:
+		case r.Method == http.MethodDelete && completed && !deleted && r.Header.Get("If-Match") == "" && r.URL.Query().Get("x-id") == "DeleteObject":
 			deleted = true
 			w.WriteHeader(http.StatusServiceUnavailable)
 		case r.Method == http.MethodHead && deleted:
@@ -848,6 +1020,77 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, a
 			w.WriteHeader(http.StatusBadRequest)
 		}
 	}))
+}
+
+// apiStageWire is the api package's test wire: one direct no-redirect HEAD and
+// one direct DELETE, exactly the provider requests the cmd-level audited
+// transport sends. The cmd package owns that transport's regression tests and
+// this package owns the database, lock and evidence path.
+type apiStageWire struct{ endpoint string }
+
+func (w apiStageWire) EndpointSHA256() string { return cleanupSHA([]byte(w.endpoint)) }
+
+// bound refuses any target that does not name this exact endpoint, so a
+// mismatched provider pairing is visible here too.
+func (w apiStageWire) bound(t r2.StitchStageTarget) error {
+	if t.EndpointSHA256 != w.EndpointSHA256() || t.Bucket != "stoarama" {
+		return fmt.Errorf("test wire endpoint/bucket differs: %q %q", t.EndpointSHA256, t.Bucket)
+	}
+	return nil
+}
+
+func (w apiStageWire) client() *http.Client {
+	return &http.Client{Transport: http.DefaultTransport, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+}
+
+func (w apiStageWire) ExactHead(ctx context.Context, t r2.StitchStageTarget, deadline time.Time) (r2.ObjectHead, error) {
+	if err := w.bound(t); err != nil {
+		return r2.ObjectHead{}, err
+	}
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, w.endpoint+"/"+t.Bucket+"/"+t.Key, nil)
+	if err != nil {
+		return r2.ObjectHead{}, err
+	}
+	resp, err := w.client().Do(req)
+	if err != nil {
+		return r2.ObjectHead{}, err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return r2.ObjectHead{}, fmt.Errorf("head status %d", resp.StatusCode)
+	}
+	modified, _ := http.ParseTime(resp.Header.Get("Last-Modified"))
+	size, _ := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+	return r2.ObjectHead{LastModified: modified, ETag: strings.Trim(resp.Header.Get("ETag"), `"`),
+		SizeBytes: size, SHA256Metadata: resp.Header.Get("X-Amz-Meta-Sha256")}, nil
+}
+
+func (w apiStageWire) DeleteOnce(ctx context.Context, t r2.StitchStageTarget, deadline time.Time, recheck func(context.Context) error) error {
+	if err := w.bound(t); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	if err := recheck(ctx); err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, w.endpoint+"/"+t.Bucket+"/"+t.Key+"?x-id=DeleteObject", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := w.client().Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("delete status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func TestNASR2StitchReceiptIdentityRejectsJSONNormalization(t *testing.T) {
