@@ -199,6 +199,15 @@ class V85rTests(unittest.TestCase):
             manifest_sha256=hashlib.sha256(files["manifest.json"]).hexdigest()), sort_keys=True).encode())
         return sources
 
+    def child_env(self):
+        """Service-parity child environment: no state, no loader overrides.
+
+        The unit scrubs QEMU_*/LD_* with UnsetEnvironment; CI runners inherit
+        them, and main refuses them before the intentional missing state dir.
+        """
+        return {key: value for key, value in os.environ.items()
+                if key != "STOARAMA_STATE_DIR" and not key.startswith(("LD_", "QEMU_"))}
+
     def run_direct(self, base, env):
         """Run the real direct-__main__ entry exactly as the unit does."""
         return subprocess.run([sys.executable, "-E", "-s", "-B", str(base / "durham_stitch.py")],
@@ -226,11 +235,13 @@ class V85rTests(unittest.TestCase):
             sentinel.write_bytes(b"raise SystemExit('cached fixture executed')\n")
             py_compile.compile(str(sentinel), doraise=True, cfile=importlib.util.cache_from_source(
                 str(base / "stoarama_pull.py")), invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
-            control = subprocess.run([sys.executable, "-B", "-c", "import stoarama_pull"],
-                                     cwd=base, capture_output=True, text=True, timeout=120)
+            env = self.child_env()
+            # -E -s -B still admits an UNCHECKED_HASH cache written for the
+            # pinned source, so the control proves the stale bytecode is live.
+            control = subprocess.run([sys.executable, "-E", "-s", "-B", "-c", "import stoarama_pull"],
+                                     cwd=base, capture_output=True, text=True, timeout=120, env=env)
             self.assertEqual(control.returncode, 1)
             self.assertIn("cached fixture executed", control.stderr)
-            env = {key: value for key, value in os.environ.items() if key != "STOARAMA_STATE_DIR"}
             direct = self.run_direct(base, env)
             # The verified entry runs the checked source and reaches main's own
             # state lookup, never the cached sentinel and never a NameError.
@@ -250,7 +261,7 @@ class V85rTests(unittest.TestCase):
             self.copy_worker_sources(base)
             self.pinned_bundle(base)
             pins = json.loads((base / "v85r/durham-arm64.json").read_bytes())
-            env = {key: value for key, value in os.environ.items() if key != "STOARAMA_STATE_DIR"}
+            env = self.child_env()
             for size, reason in ((0, "pins differ"), (1024 ** 3, "pins differ")):
                 (base / "v85r/durham-arm64.json").write_bytes(
                     json.dumps(dict(pins, bundle_size_bytes=size)).encode())
