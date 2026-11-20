@@ -177,7 +177,9 @@ func (r inverseBatchReadback) settle(result inverseApplySummary, applyErr error)
 		printInverseJob(map[string]any{"step": "wire_ambiguous", "held": r.Unresolved, "error": applyErr.Error()})
 		return false, nil
 	}
-	return result.Deleted == 0, nil
+	// Done only when nothing new was eligible: a batch whose keys were all
+	// skipped for short custody leaves others for the next batch.
+	return result.Selected == 0, nil
 }
 
 // writeInverseOwnerEvidence writes owner-fence evidence observed now from the

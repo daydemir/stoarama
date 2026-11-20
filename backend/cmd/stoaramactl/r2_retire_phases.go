@@ -306,20 +306,31 @@ func r2RetireDecideForScope(c r2RetireCandidate, scope r2RetireScope, windows ma
 	return r2RetireDecideMode(c, scope.Bucket, windows, picks, scope.NASBacked)
 }
 
+// errR2RetireNASProofAged reports an exact, present NAS proof that has aged out
+// of its 24-hour freshness window. A changed identity, sidecar or state, or a
+// future verification, is never this error.
+var errR2RetireNASProofAged = errors.New("NAS proof aged out of its 24-hour window")
+
 func r2RetireLockNASIdentity(ctx context.Context, q r2RetireQuerier, it r2RetireItem, connectionID int64) (time.Time, error) {
 	// The supported apply path is RAW only. Lock the same exact identity and
 	// sidecar proof used by selection, and carry its expiry to the wire boundary.
+	// The row is locked whatever its age, so an aged proof is told apart from a
+	// changed one; either way it is not lockable custody.
 	if it.Kind != "raw" {
 		return time.Time{}, errors.New("NAS custody lock requires RAW identity")
 	}
 	var expiry time.Time
-	err := q.QueryRow(ctx, `SELECT LEAST(n.verified_at,n.server_received_at)+interval '24 hours'
+	var fresh bool
+	err := q.QueryRow(ctx, `SELECT LEAST(n.verified_at,n.server_received_at)+interval '24 hours',
+ n.verified_at>=clock_timestamp()-interval '24 hours' AND n.server_received_at>=clock_timestamp()-interval '24 hours'
  FROM nas_inventory_files n WHERE n.connection_id=$1 AND n.state='present'
  AND n.sha256=$2 AND n.size_bytes=$3 AND n.clip_id=$4 AND n.relative_path=$5
- AND n.verified_at BETWEEN clock_timestamp()-interval '24 hours' AND clock_timestamp()+interval '5 minutes'
- AND n.server_received_at>=clock_timestamp()-interval '24 hours'
+ AND n.verified_at<=clock_timestamp()+interval '5 minutes'
  AND n.sidecar_relative_path=$5||'.stoarama.json' AND n.sidecar_size_bytes>0 AND n.sidecar_sha256 ~ '^[a-f0-9]{64}$'
- FOR SHARE`, connectionID, it.SHA256, it.SizeBytes, it.SourceID, it.RelativePath).Scan(&expiry)
+ FOR SHARE`, connectionID, it.SHA256, it.SizeBytes, it.SourceID, it.RelativePath).Scan(&expiry, &fresh)
+	if err == nil && !fresh {
+		err = errR2RetireNASProofAged
+	}
 	if err != nil {
 		return time.Time{}, fmt.Errorf("exact present NAS identity no longer lockable: %w", err)
 	}

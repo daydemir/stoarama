@@ -169,10 +169,14 @@ one absolute local monotonic instant, 2 seconds early (`keep28CustodyMargin`).
 The authority keeps the running minimum across every sample, and every later
 handoff (first request byte, socket write deadline, confirming HEAD) ends at it
 or the existing 30-second cap, so neither a pause after sampling nor local
-wall-clock skew can extend authority. Reservation admits a key only when its
-custody outlasts one network timeout plus the margin. A shorter key is counted
-as `custody_short` and skipped before any reservation, intent, budget charge or
-ledger record, and fresh custody retries it.
+wall-clock skew can extend authority. Selection takes only keys whose custody
+outlasts one network timeout plus the margin, so a key custody would skip uses
+no item or byte allowance. Reservation repeats that check under lock: a key
+whose custody shortened or aged out after selection is counted as
+`custody_short` and skipped before any reservation, intent, budget charge or
+ledger record, and fresh custody retries it. A changed identity, sidecar or
+state still stops the batch. A job is done only when a clean batch selected
+nothing.
 
 Custody is a 24-hour freshness policy on an existing, verified NAS copy, not a
 physical deadline. The requirement is that custody is valid at the last

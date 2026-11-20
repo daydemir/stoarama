@@ -653,9 +653,40 @@ func TestKeep28WireDeadlineAndCustodyLock(t *testing.T) {
 	}
 }
 
+// writeManifest makes the partition list keys 1..n.
+func (f *keep28Fixture) writeManifest(t *testing.T, n int) {
+	t.Helper()
+	file, err := os.Create(f.options.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	for i := 1; i <= n; i++ {
+		f.store.mu.Lock()
+		object := f.store.objects[fmt.Sprintf("managed/acct-47/keep28/%d.mp4", i)]
+		f.store.mu.Unlock()
+		if err = json.NewEncoder(file).Encode(inverseEntry{ObjectInfo: object, Class: inverseKeep28}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.options.ManifestSHA, _ = inverseFileSHA(f.options.Manifest)
+}
+
+// durableWrites counts every row a reservation, intent, attempt or budget
+// charge would leave.
+func (f keep28Fixture) durableWrites(t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := f.pool.QueryRow(f.ctx, `SELECT (SELECT count(*) FROM r2_retirement_reservations)+(SELECT count(*) FROM r2_keep28_intents)+(SELECT count(*) FROM r2_keep28_attempts)+(SELECT count(*) FROM r2_inverse_budget_minutes)`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
 // A key whose custody could end within one network timeout plus the margin is
-// skipped before any reservation, intent, budget charge or ledger record, and
-// is not a batch failure. Once custody is fresh, the next run deletes it.
+// never selected, so it takes no allowance, and reserve skips it under lock
+// before any reservation, intent, budget charge or ledger record. Once custody
+// is fresh, the next run deletes it.
 func TestKeep28ShortCustodySkipsBeforeAnyWrite(t *testing.T) {
 	for _, left := range []string{"1.75 seconds", "31.5 seconds"} {
 		t.Run(left, func(t *testing.T) {
@@ -664,25 +695,188 @@ func TestKeep28ShortCustodySkipsBeforeAnyWrite(t *testing.T) {
 				t.Fatal(err)
 			}
 			result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
-			var durable int
-			if qerr := f.pool.QueryRow(f.ctx, `SELECT (SELECT count(*) FROM r2_retirement_reservations)+(SELECT count(*) FROM r2_keep28_intents)+(SELECT count(*) FROM r2_keep28_attempts)+(SELECT count(*) FROM r2_inverse_budget_minutes)`).Scan(&durable); qerr != nil {
-				t.Fatal(qerr)
+			if err != nil || result.Selected != 0 || result.Deleted != 0 || f.durableWrites(t) != 0 || f.deletes() != 0 {
+				t.Fatalf("short custody selected: %+v %v", result, err)
 			}
-			ledger, lerr := openKeep28Ledger(f.options.Ledger)
-			if lerr != nil {
-				t.Fatal(lerr)
+			a := f.applier(t)
+			if _, err = a.reserve(f.ctx, f.entry()); !errors.Is(err, errKeep28CustodyShort) || f.durableWrites(t) != 0 || len(a.ledger.seen) != 0 {
+				t.Fatalf("short custody reserved: %v, %d durable writes", err, f.durableWrites(t))
 			}
-			records := len(ledger.seen)
-			ledger.close()
-			if err != nil || result.Deleted != 0 || result.CustodyShort != (r2RetireStat{Objects: 1, Bytes: 100}) || durable != 0 || records != 0 || f.deletes() != 0 {
-				t.Fatalf("short custody: %+v %v durable %d ledger %d deletes %d", result, err, durable, records, f.deletes())
-			}
+			a.ledger.close()
 			if _, err = f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '1 hour'`); err != nil {
 				t.Fatal(err)
 			}
 			result, err = applyInverse(f.ctx, f.pool, f.sdk, f.options)
 			if err != nil || result.Deleted != 1 || result.CustodyShort.Objects != 0 || f.deletes() != 1 {
 				t.Fatalf("fresh custody: %+v %v deletes %d", result, err, f.deletes())
+			}
+		})
+	}
+}
+
+// Exact custody that ages out between selection and reserve is a skip with no
+// durable write, not "no rows"; a changed sidecar is still a hard veto.
+func TestKeep28AgedCustodyIsSkippedChangedIdentityIsNot(t *testing.T) {
+	f := newKeep28Fixture(t)
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '24 hours'+interval '1 second',server_received_at=clock_timestamp()`); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	a := f.applier(t)
+	if _, err := a.reserve(f.ctx, f.entry()); !errors.Is(err, errKeep28CustodyShort) || f.durableWrites(t) != 0 {
+		t.Fatalf("aged custody: %v, %d durable writes", err, f.durableWrites(t))
+	}
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '1 hour',sidecar_relative_path='other.mp4.stoarama.json'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.reserve(f.ctx, f.entry()); err == nil || errors.Is(err, errKeep28CustodyShort) || f.durableWrites(t) != 0 {
+		t.Fatalf("changed sidecar: %v, %d durable writes", err, f.durableWrites(t))
+	}
+}
+
+// While one key's DELETE is on the wire, a queued key's custody ages out: that
+// key is skipped and the batch finishes. If its sidecar or identity changes
+// instead, the batch halts.
+func TestKeep28QueuedKeyCustodyOutcome(t *testing.T) {
+	for change, sql := range map[string]string{
+		"aged":     `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '24 hours 1 second' WHERE clip_id=9000001`,
+		"sidecar":  `UPDATE nas_inventory_files SET sidecar_relative_path='other.mp4.stoarama.json' WHERE clip_id=9000001`,
+		"identity": `UPDATE nas_inventory_files SET sha256=repeat('a',64) WHERE clip_id=9000001`,
+	} {
+		t.Run(change, func(t *testing.T) {
+			// Selection order: the older key 2 first, then key 1 waits queued.
+			f := newKeep28FixtureCount(t, 2)
+			f.writeManifest(t, 2)
+			var hookErr atomic.Value
+			f.setWire(nil, func(key string) {
+				if key == f.key {
+					return
+				}
+				if _, err := f.pool.Exec(f.ctx, sql); err != nil {
+					hookErr.Store(err.Error())
+				}
+			})
+			result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
+			f.setWire(nil, nil)
+			if hookErr.Load() != nil {
+				t.Fatal(hookErr.Load())
+			}
+			aged := change == "aged"
+			if (err == nil) != aged || result.Selected != 2 || result.Deleted != 1 || (result.CustodyShort.Objects == 1) != aged || f.deletes() != 1 {
+				t.Fatalf("%s: %+v %v deletes %d", change, result, err, f.deletes())
+			}
+		})
+	}
+}
+
+// A job batch never spends its allowance on a key that custody would skip:
+// with one slot, the older short-custody key is passed over and the fresh key
+// deleted, and the job is done only when nothing eligible is left.
+func TestKeep28JobSelectionSkipsShortCustody(t *testing.T) {
+	f := newKeep28FixtureCount(t, 2)
+	f.writeManifest(t, 2)
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '24 hours'+interval '28 seconds',server_received_at=clock_timestamp() WHERE clip_id=9000002`); err != nil {
+		t.Fatal(err)
+	}
+	f.options.MaxItems = 1
+	owner := filepath.Join("..", "..", "..", "docs", "records", "r2-owner-fence-policy-20261118.md")
+	dir := t.TempDir()
+	done, first, err := runInverseJobBatch(f.ctx, f.pool, f.sdk, f.options, owner, filepath.Join(dir, "evidence-1.json"))
+	f.store.mu.Lock()
+	_, freshLeft := f.store.objects[f.key]
+	f.store.mu.Unlock()
+	if err != nil || done || first.Selected != 1 || first.Deleted != 1 || freshLeft || f.deletes() != 1 {
+		t.Fatalf("first batch: done %v %+v %v", done, first, err)
+	}
+	done, second, err := runInverseJobBatch(f.ctx, f.pool, f.sdk, f.options, owner, filepath.Join(dir, "evidence-2.json"))
+	if err != nil || !done || second.Selected != 0 || f.deletes() != 1 {
+		t.Fatalf("second batch: done %v %+v %v", done, second, err)
+	}
+}
+
+// slowSampleTracer delays the nth plain DB clock read on its pool after its
+// local observation, as a slow network or a database clock step would.
+type slowSampleTracer struct {
+	nth   int64
+	delay time.Duration
+	seen  atomic.Int64
+}
+
+func (s *slowSampleTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if data.SQL == `SELECT clock_timestamp()` && s.seen.Add(1) == s.nth {
+		time.Sleep(s.delay)
+	}
+	return ctx
+}
+func (*slowSampleTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// Through the production delete path, with its 30-second parent deadline, the
+// socket deadline is the earlier of the parent deadline and custody end less
+// the margin. Custody wins when the authorization clock sample is delayed 4s,
+// as a database clock step would leave it; otherwise the parent wins.
+func TestKeep28DeletePathComposesParentAndCustodyDeadlines(t *testing.T) {
+	const delay = 4 * time.Second
+	for _, custodyWins := range []bool{true, false} {
+		t.Run(map[bool]string{true: "custody_wins", false: "parent_wins"}[custodyWins], func(t *testing.T) {
+			f := newKeep28Fixture(t)
+			if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '24 hours'+interval '34 seconds',server_received_at=clock_timestamp()`); err != nil {
+				t.Fatal(err)
+			}
+			tracer := &slowSampleTracer{}
+			if custodyWins {
+				// Clock read 1 is reserve's admission sample; 2 is authorization's.
+				tracer.nth, tracer.delay = 2, delay
+			}
+			config := f.pool.Config()
+			config.ConnConfig.Tracer = tracer
+			pool, err := pgxpool.NewWithConfig(f.ctx, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pool.Close()
+			a := f.applier(t)
+			a.pool = pool
+			var wire atomic.Value
+			template := newInverseDeleteHTTPTransport()
+			dial := template.DialContext
+			template.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				conn, err := dial(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				return deadlineSpyConn{Conn: conn, set: &wire}, nil
+			}
+			original := f.sdk.transport
+			f.sdk.transport = template
+			defer func() { f.sdk.transport = original }()
+			called := time.Now()
+			if ok, err := a.delete(f.ctx, f.ctx, &inverseSendGate{}, f.entry()); err != nil || !ok {
+				t.Fatalf("delete: %v %v", ok, err)
+			}
+			deadline, _ := wire.Load().(time.Time)
+			// Custody expiry less the margin as a local instant, bracketed by the
+			// local readings around one database clock read.
+			var dbNow time.Time
+			before := time.Now()
+			if err = f.pool.QueryRow(f.ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
+				t.Fatal(err)
+			}
+			after := time.Now()
+			var expiry time.Time
+			if err = f.pool.QueryRow(f.ctx, `SELECT LEAST(verified_at,server_received_at)+interval '24 hours' FROM nas_inventory_files WHERE clip_id=9000001`).Scan(&expiry); err != nil {
+				t.Fatal(err)
+			}
+			custodyLow, custodyHigh := before.Add(expiry.Sub(dbNow)-2*time.Second), after.Add(expiry.Sub(dbNow)-2*time.Second)
+			parentLow, parentHigh := called.Add(inverseNetworkTimeout), time.Now().Add(inverseNetworkTimeout)
+			if custodyWins {
+				// The delayed sample places custody end up to the delay early.
+				if deadline.After(custodyHigh.Add(-delay)) || deadline.Before(custodyLow.Add(-delay-time.Second)) || !deadline.Before(parentLow) {
+					t.Fatalf("custody should bound the wire: %v, custody end %v..%v less %v, parent from %v", deadline, custodyLow, custodyHigh, delay, parentLow)
+				}
+				return
+			}
+			if deadline.Before(parentLow) || deadline.After(parentHigh) || !deadline.Before(custodyLow) {
+				t.Fatalf("parent should bound the wire: %v, parent %v..%v, custody end from %v", deadline, parentLow, parentHigh, custodyLow)
 			}
 		})
 	}
@@ -864,20 +1058,7 @@ func TestKeep28UnissuedAbsentIntentStopsStartup(t *testing.T) {
 // reports it issued and absent, never resends it, and finds nothing else.
 func TestKeep28JobBatchHoldsOnlyTheLostKey(t *testing.T) {
 	f := newKeep28FixtureCount(t, 4)
-	file, err := os.Create(f.options.Manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for n := 1; n <= 4; n++ {
-		f.store.mu.Lock()
-		object := f.store.objects[fmt.Sprintf("managed/acct-47/keep28/%d.mp4", n)]
-		f.store.mu.Unlock()
-		if err = json.NewEncoder(file).Encode(inverseEntry{ObjectInfo: object, Class: inverseKeep28}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	file.Close()
-	f.options.ManifestSHA, _ = inverseFileSHA(f.options.Manifest)
+	f.writeManifest(t, 4)
 	// One worker in verified_at order: keys 2-4 first, the fresher key 1 last.
 	f.setWire(map[string]string{f.key: "eof"}, nil)
 	owner := filepath.Join("..", "..", "..", "docs", "records", "r2-owner-fence-policy-20261118.md")

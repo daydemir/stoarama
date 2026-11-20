@@ -61,6 +61,8 @@ type inverseApplyOptions struct {
 	Workers                                                                            int
 }
 type inverseApplySummary struct {
+	// Selected counts the new keys this batch chose to work on.
+	Selected      int64 `json:"selected"`
 	Deleted       int64 `json:"deleted"`
 	AmbiguousHeld int64 `json:"ambiguous_held"`
 	// HeldAbsent lists held keys, issued before this run, whose objects are gone.
@@ -329,6 +331,10 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	var custody *keep28Custody
 	if a.opts.Lane == inverseNASKeep28 {
 		c, err := a.lockKeep28Custody(ctx, tx, t)
+		if errors.Is(err, errR2RetireNASProofAged) {
+			// Exact custody that aged out while the key waited is no failure.
+			return t, errKeep28CustodyShort
+		}
 		if err != nil {
 			return t, err
 		}
@@ -887,6 +893,7 @@ send:
 	}
 	close(queue)
 	wg.Wait()
+	result.Selected = int64(len(jobs))
 	result.Deleted = deleted.Load()
 	sort.Strings(wireAmbiguous)
 	result.WireAmbiguous = wireAmbiguous

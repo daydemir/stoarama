@@ -59,6 +59,11 @@ func (a *inverseApplier) lockKeep28Custody(ctx context.Context, tx pgx.Tx, t inv
 	return c, err
 }
 
+// keep28AdmissionCustody is the custody a key needs left to be selected: one
+// network timeout plus the margin, the same rule reserve enforces under lock.
+// A shorter key would only be skipped, so it takes no item or byte allowance.
+const keep28AdmissionCustody = keep28CustodyMargin + inverseNetworkTimeout
+
 // Selection trails fresh custody in verified_at order. A report is never wire
 // authority; every identity and proof is subsequently reloaded under locks.
 func (a *inverseApplier) selectKeep28(ctx context.Context, entries map[string]inverseEntry) ([]inverseEntry, error) {
@@ -66,8 +71,9 @@ func (a *inverseApplier) selectKeep28(ctx context.Context, entries map[string]in
  FROM recording_clips c JOIN nas_inventory_files n ON n.connection_id=$2 AND n.clip_id=c.id
  JOIN recordings r ON r.id=c.recording_id
  WHERE c.bucket=$1 AND c.purged_at IS NULL AND r.account_id=47
- AND n.state='present' AND n.verified_at>=clock_timestamp()-interval '24 hours'
- ORDER BY n.verified_at,c.id`, a.store.Bucket(), int64(13))
+ AND n.state='present'
+ AND LEAST(n.verified_at,n.server_received_at)>clock_timestamp()-interval '24 hours'+make_interval(secs=>$3)
+ ORDER BY n.verified_at,c.id`, a.store.Bucket(), int64(13), keep28AdmissionCustody.Seconds())
 	if err != nil {
 		return nil, err
 	}

@@ -1776,6 +1776,14 @@ func TestR2InverseJobReadbackComparesHeldKeys(t *testing.T) {
 	if _, err := readback.settle(result, lost); err == nil || !strings.Contains(err.Error(), "evidence differs") {
 		t.Fatalf("different held key continued the job: %v", err)
 	}
+	// Done means nothing new was selected: a batch whose selected keys were all
+	// skipped for short custody, deleting none, is not done.
+	if done, err := (inverseBatchReadback{Unresolved: []string{}}).settle(inverseApplySummary{Selected: 1, CustodyShort: r2RetireStat{Objects: 1, Bytes: 100}, WireAmbiguous: []string{}}, nil); err != nil || done {
+		t.Fatalf("skipped-only batch: done %v %v", done, err)
+	}
+	if done, err := (inverseBatchReadback{Unresolved: []string{}}).settle(inverseApplySummary{WireAmbiguous: []string{}}, nil); err != nil || !done {
+		t.Fatalf("empty batch: done %v %v", done, err)
+	}
 }
 
 type blockingWriteConn struct {
