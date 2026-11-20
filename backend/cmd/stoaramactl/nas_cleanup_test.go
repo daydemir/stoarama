@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -404,5 +405,57 @@ func TestNASCleanupMasterRepeatedFlag(t *testing.T) {
 		if err := nasCleanupMasterRepeatedFlag(args); err != nil {
 			t.Fatalf("distinct/unknown flags %v refused: %v", args, err)
 		}
+	}
+}
+
+// The user-facing bug this guards: a real `master status` must reach the wire.
+// dispatch builds the payload, the real transport builds the request. A typed
+// nil map assigned to `any` is a non-nil interface, so the "GET carries no body"
+// guard rejected every real status call. This drives the whole path through an
+// injected local transport: no credentials, no production, no data.
+func TestNASCleanupMasterStatusDispatchesARealBodylessGET(t *testing.T) {
+	type seen struct {
+		method, path string
+		auth         string
+		hasBody      bool
+		length       int64
+	}
+	var got seen
+	var reached int
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached++
+		got = seen{method: r.Method, path: r.URL.Path, auth: r.Header.Get("Authorization"), length: r.ContentLength}
+		if r.Body != nil {
+			b, _ := io.ReadAll(r.Body)
+			got.hasBody = len(b) > 0
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"enabled":false,"changed_at":"2026-11-20T00:00:00Z","actor":"migration 0229","claimed_by":"","reason":"initial state: OFF"}`))
+	}))
+	defer origin.Close()
+	oldTransport := nasCleanupMasterTransport
+	nasCleanupMasterTransport = origin.Client().Transport
+	defer func() { nasCleanupMasterTransport = oldTransport }()
+
+	cfg := config.Config{NASCleanupControllerToken: "synthetic-controller-token-000000000"}
+	err := nasCleanupMasterDispatch(context.Background(), cfg, []string{"status", "--backend-api-url", origin.URL},
+		func(method, base, token, path string, body any) (map[string]any, error) {
+			// The real transport, exactly as runNASCleanupMaster wires it.
+			return nasCleanupMasterRequest(context.Background(), method, base, token, path, body)
+		})
+	if err != nil {
+		t.Fatalf("real status dispatch failed: %v", err)
+	}
+	if reached != 1 {
+		t.Fatalf("status did not reach the wire: %d", reached)
+	}
+	if got.method != http.MethodGet || got.path != "/api/v1/service/nas-cleanup/master" {
+		t.Fatalf("status request: %+v", got)
+	}
+	if got.hasBody || got.length > 0 {
+		t.Fatalf("status GET carried a body: %+v", got)
+	}
+	if got.auth != "Bearer "+cfg.NASCleanupControllerToken {
+		t.Fatalf("status request lost the controller credential")
 	}
 }

@@ -163,7 +163,11 @@ func nasCleanupMasterDispatch(ctx context.Context, cfg config.Config, args []str
 	if action == nasCleanupMasterStatus && strings.TrimSpace(*reason) != "" {
 		return errors.New(nasCleanupMasterUsage)
 	}
-	body := map[string]any(nil)
+	// A status read passes a real untyped nil. A `map[string]any(nil)` assigned
+	// to an `any` parameter is a *non-nil* interface holding a nil map, so the
+	// transport's "GET carries no body" guard would reject every real status
+	// call. Keep the payload in its concrete type and only box it when set.
+	var body map[string]any
 	if action != nasCleanupMasterStatus {
 		u, err := user.Current()
 		if err != nil {
@@ -182,11 +186,13 @@ func nasCleanupMasterDispatch(ctx context.Context, cfg config.Config, args []str
 	if credential == "" {
 		return errors.New("master changes require the controller credential (NAS_CLEANUP_CONTROLLER_TOKEN)")
 	}
+	var payload any
 	method := http.MethodGet
 	if body != nil {
 		method = http.MethodPost
+		payload = body
 	}
-	out, err := do(method, endpoint, credential, nasCleanupMasterPath, body)
+	out, err := do(method, endpoint, credential, nasCleanupMasterPath, payload)
 	if err != nil {
 		return err
 	}

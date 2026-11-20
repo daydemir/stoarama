@@ -93,6 +93,16 @@ func cleanupAffirmative(body map[string]any) bool {
 	return body["delete"] == true || body["replayed"] == true
 }
 
+// cleanupMasterMaybeRead is the cheap, unlocked initial read used to choose a
+// request's posture before any issuance-only preflight. "no lock" is the whole
+// point: it cannot queue behind anything and so cannot delay an OFF. A read
+// error or a missing row answers OFF, which is the safe denied posture. It is
+// never authority: the final pass still reads the switch authoritatively, last.
+func cleanupMasterMaybeRead(ctx context.Context, q queryRower) bool {
+	var on bool
+	return q.QueryRow(ctx, `SELECT enabled FROM nas_cleanup_master`).Scan(&on) == nil && on
+}
+
 // cleanupMasterMaybeOn is the cheap, non-blocking pre-check: it reads the
 // switch in a savepoint without any row lock, so it can be used before the
 // fences that an emergency OFF must not wait behind. It is advisory only; the

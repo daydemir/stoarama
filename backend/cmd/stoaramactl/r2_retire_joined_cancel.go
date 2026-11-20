@@ -414,16 +414,18 @@ func runR2JoinedWriterCancel(ctx context.Context, cfg config.Config, args []stri
 	if _, err = applyTx.Exec(ctx, `SET LOCAL statement_timeout='30s';SET LOCAL lock_timeout='5s';SET LOCAL work_mem='16MB';SET LOCAL timezone='UTC'`); err != nil {
 		log.Fatal("joined writer apply configuration failed")
 	}
-	if err = r2JoinedApplyIdleFence(ctx, applyTx); err != nil {
-		log.Fatal(err)
-	}
 	body, err := json.Marshal(evidence)
 	if err != nil {
 		log.Fatal("owner evidence encoding failed")
 	}
 	var changed int
-	if err = applyTx.QueryRow(ctx, `SELECT r2_retire_dead_joined_batch($1,$2,$3,$4,$5,$6::jsonb)`, run, o.batch, o.snapshot, o.ownerMapSHA, o.reviewer, string(body)).Scan(&changed); err != nil {
-		log.Fatal("joined writer retirement refused; transaction rolls back")
+	// The interruptible joined-row work runs between the exclusive fence and the
+	// final OFF validation, so the retirement's own locks and writes are all
+	// behind the switch check that authorizes them.
+	if err = r2JoinedApplyFenceThenIdle(ctx, applyTx, func() error {
+		return applyTx.QueryRow(ctx, `SELECT r2_retire_dead_joined_batch($1,$2,$3,$4,$5,$6::jsonb)`, run, o.batch, o.snapshot, o.ownerMapSHA, o.reviewer, string(body)).Scan(&changed)
+	}); err != nil {
+		log.Fatal(err)
 	}
 	if changed != len(snapshot.Items) {
 		log.Fatal("joined writer audit/update count differs; transaction rolls back")
@@ -451,23 +453,40 @@ func runR2JoinedWriterCancel(ctx context.Context, cfg config.Config, args []stri
 // retirement, and a flip that committed first is seen here. Reading the master
 // through the pool would take the lock on another connection and hold nothing.
 func r2JoinedApplyIdleFence(ctx context.Context, tx pgx.Tx) error {
+	return r2JoinedApplyFenceThenIdle(ctx, tx, func() error { return nil })
+}
+
+// r2JoinedApplyFenceThenIdle is the ordered form: exclusive public fence, then
+// the potentially blocking joined-row work, and only then the authoritative
+// master read as the last statement before the caller commits. The exclusive
+// fence makes the cleanup window stable across the whole of that work, and the
+// OFF is validated after the last blocking step, so an OFF that committed during
+// it is still seen and the retirement rolls back.
+func r2JoinedApplyFenceThenIdle(ctx context.Context, tx pgx.Tx, blocking func() error) error {
 	// The public fence every cleanup path honours; exclusive here so no lease,
 	// observation, enable or advance can interleave with the idle probe.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7343226011101)`); err != nil {
 		return errors.New("joined writer retirement requires the cleanup public fence")
-	}
-	var masterHeld bool
-	if err := tx.QueryRow(ctx, `SELECT enabled FROM nas_cleanup_master FOR SHARE`).Scan(&masterHeld); err != nil {
-		return errors.New("joined writer retirement requires the cleanup master OFF (locked for this transaction)")
-	}
-	if masterHeld {
-		return errors.New("joined writer retirement requires the cleanup master OFF (locked for this transaction)")
 	}
 	// Under the exclusive fence the window is stable, so this reading stays true
 	// through the retirement writes.
 	var idle bool
 	if err := tx.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM nas_cleanup_plans WHERE mode='enabled') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE state IN ('leased','delete_issued'))`).Scan(&idle); err != nil || !idle {
 		return errors.New("joined writer retirement requires controller global-idle window")
+	}
+	if blocking != nil {
+		if err := blocking(); err != nil {
+			return err
+		}
+	}
+	// Authoritative read, last: every fence and every blocking write is done, and
+	// the FOR SHARE row lock is held through the caller's commit.
+	var masterHeld bool
+	if err := tx.QueryRow(ctx, `SELECT enabled FROM nas_cleanup_master FOR SHARE`).Scan(&masterHeld); err != nil {
+		return errors.New("joined writer retirement requires the cleanup master OFF (locked for this transaction)")
+	}
+	if masterHeld {
+		return errors.New("joined writer retirement requires the cleanup master OFF (locked for this transaction)")
 	}
 	return nil
 }

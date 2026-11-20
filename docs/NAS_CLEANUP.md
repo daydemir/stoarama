@@ -90,11 +90,12 @@ stoaramactl nas-cleanup master off --reason "batch 12 finished"
 idempotent: repeating the current state changes nothing. Every change appends
 an immutable `nas_cleanup_master_history` row (time, the authenticated
 server-side actor, the operator's `claimed_by` name, old and new state, reason);
-history and control rows cannot be deleted, truncated or edited outside that
-path, only the recorder function may append history, and the triggers are
-`ENABLE ALWAYS`. Treat that as protection against a *runtime* path that skips
-the control, not against the table owner or a superuser, who can still alter the
-triggers (see the migration notes below).
+the guarded path is the only supported one: deletes, truncates and off-path
+edits are refused for the API's own role, only the recorder function appends
+history, and the triggers are `ENABLE ALWAYS`. That is protection against a
+*runtime* code path that skips the control — not against the table owner or a
+superuser, who can still drop and recreate the triggers or edit rows directly
+(see the migration notes below).
 
 Operationally, `master off` is retroactive only for *decisions*: once the flip
 commits, no new API admission can mint a permit, lease, enable or advance,
@@ -220,8 +221,12 @@ Be precise about what the separation buys, because it is easy to overclaim:
 
 - **The writer role is trigger separation, not a second trust domain.** It keeps
   the recorder's own identity distinct from whatever role inserts/updates master
-  rows, so the recorder cannot be reached except through the master trigger and
-  a plain application insert cannot forge an audit row.
+  rows, so the recorder is not reachable except through the master trigger and an
+  off-path application insert is refused. It does not stop a role that can write
+  `nas_cleanup_master` directly from choosing the `actor` value it supplies:
+  `actor` is whatever the calling code passes, and the server passes its
+  authenticated principal. Anyone with direct table write access can supply
+  their own.
 - **Under `AUTO_MIGRATE` the runtime role is the migrator, so it typically owns
   the master and history tables** (it migrates at startup with its own
   credentials). The recorder stays owned by `nas_cleanup_master_writer`; the
@@ -229,8 +234,9 @@ Be precise about what the separation buys, because it is easy to overclaim:
 - **This is not tamper resistance against that owner or a superuser.** Whoever
   owns the tables can drop or alter the triggers and edit or delete rows
   directly, and nothing in this design prevents it. Treat the history as an
-  audit trail a compromised *runtime* cannot forge, not as evidence against the
-  database owner.
+  audit trail an off-path *runtime* write cannot append to — not as evidence
+  against the database owner, and not as a claim that individual rows are
+  immutable to them.
 
 If the migration fails on the recorder role, grant the dedicated role and
 re-run the deploy:

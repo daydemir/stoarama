@@ -296,13 +296,20 @@ func TestNASCleanupMasterMigrationStatesItsPostgresFloor(t *testing.T) {
 	}
 }
 
-// The production-shaped path: the migration must create the dedicated writer
-// itself and leave the recorder owned by it with no effective CREATE. The role is
-// cluster-wide, so this runs in its own throwaway database under the package lock
-// and skips honestly when another package already created the role: with the role
-// present the fresh-creation statement is not exercised, and claiming otherwise
-// would be a false pass.
-func TestNASCleanupMasterMigrationCreatesFreshWriterAsSchemaOwner(t *testing.T) {
+// The production-shaped path on a fresh database: the roles do not exist yet,
+// the migrator is a non-superuser schema owner with CREATEROLE, and the API's
+// runtime role is a separate non-superuser login that owns nothing. This proves
+// both halves the reviewers asked for:
+//
+//   - the migration creates the dedicated writer itself (the CREATE ROLE branch),
+//     leaves the recorder owned by it and revokes its effective CREATE;
+//   - a non-superuser post-migration *operating* role can flip the switch and gets
+//     exactly one history row appended by the recorder on its behalf, while it
+//     cannot append history directly.
+//
+// It needs the cluster-wide writer role to be creatable, so it skips with the
+// exact reason when a sibling fixture already owns it.
+func TestNASCleanupMasterMigrationCreatesFreshWriterAndServesARuntimeRole(t *testing.T) {
 	defer lockCleanupMasterRole(t)()
 	dsn := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
 	if dsn == "" {
@@ -315,22 +322,28 @@ func TestNASCleanupMasterMigrationCreatesFreshWriterAsSchemaOwner(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer admin.Close()
-	// The role is cluster-wide. Run only when it is absent, or when it exists but
-	// owns nothing (a leftover from an earlier run of this package): then dropping
-	// it here cannot disturb another package's objects, and the migration's own
-	// CREATE ROLE statement is genuinely exercised.
+	// If the writer role exists and owns objects anywhere, dropping it would
+	// disturb another package's fixtures. State that precisely and skip; the
+	// runtime-role half would not be affected but cannot run without this one.
 	var owners int
 	if err := admin.QueryRow(ctx, `SELECT count(*) FROM pg_shdepend d JOIN pg_roles r ON r.oid=d.refobjid WHERE r.rolname='nas_cleanup_master_writer' AND d.deptype='o'`).Scan(&owners); err != nil {
 		t.Fatal(err)
 	}
 	if owners != 0 {
-		t.Skip("nas_cleanup_master_writer owns objects created by another test; the fresh-creation statement cannot be isolated without disturbing them")
+		t.Skipf("skipped fresh CREATE ROLE verification: nas_cleanup_master_writer already owns %d object(s) from another test package, so it cannot be dropped here", owners)
 	}
 	if _, err := admin.Exec(ctx, `DROP ROLE IF EXISTS nas_cleanup_master_writer`); err != nil {
 		t.Fatalf("cannot isolate the writer role: %v", err)
 	}
-	owner := fmt.Sprintf("nas_mig_fresh_owner_%d", time.Now().UnixNano())
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	owner := "nas_mig_fresh_owner_" + suffix
+	runtime := "nas_mig_fresh_runtime_" + suffix
 	if _, err := admin.Exec(ctx, `CREATE ROLE `+owner+` NOLOGIN CREATEROLE`); err != nil {
+		t.Fatal(err)
+	}
+	// The operating role: ordinary login, no superuser, no CREATEROLE, owns
+	// nothing. This is what the API runs as.
+	if _, err := admin.Exec(ctx, `CREATE ROLE `+runtime+` LOGIN`); err != nil {
 		t.Fatal(err)
 	}
 	dbName := fmt.Sprintf("stoarama_fresh_%d", time.Now().UnixNano())
@@ -341,10 +354,11 @@ func TestNASCleanupMasterMigrationCreatesFreshWriterAsSchemaOwner(t *testing.T) 
 		t.Fatalf("create isolated database: %v", err)
 	}
 	defer func() {
-		// Order matters: dropping the database first removes the schema and its
-		// dependent recorder, which is what lets the roles go.
+		// Dropping the database first removes the schema and its dependent
+		// recorder, which is what lets the roles go.
 		_, _ = admin.Exec(context.Background(), `DROP DATABASE IF EXISTS `+dbName)
 		_, _ = admin.Exec(context.Background(), `DROP ROLE IF EXISTS nas_cleanup_master_writer`)
+		_, _ = admin.Exec(context.Background(), `DROP ROLE IF EXISTS `+runtime)
 		_, _ = admin.Exec(context.Background(), `DROP ROLE IF EXISTS `+owner)
 	}()
 	schema := "fresh"
@@ -353,8 +367,6 @@ func TestNASCleanupMasterMigrationCreatesFreshWriterAsSchemaOwner(t *testing.T) 
 		t.Fatal(err)
 	}
 	dbCfg.Database = dbName
-	// The migrated objects live in this schema; make it the session default so
-	// the recorder's trigger can resolve them the way the API does.
 	dbCfg.RuntimeParams["search_path"] = schema
 	conn, err := pgx.ConnectConfig(ctx, dbCfg)
 	if err != nil {
@@ -362,6 +374,9 @@ func TestNASCleanupMasterMigrationCreatesFreshWriterAsSchemaOwner(t *testing.T) 
 	}
 	defer conn.Close(context.Background())
 	if _, err := conn.Exec(ctx, `CREATE SCHEMA `+schema+` AUTHORIZATION `+owner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `GRANT CONNECT ON DATABASE `+dbName+` TO `+runtime); err != nil {
 		t.Fatal(err)
 	}
 	if err := applyCleanupMasterMigration(t, conn, ctx, schema, owner); err != nil {
@@ -381,16 +396,48 @@ func TestNASCleanupMasterMigrationCreatesFreshWriterAsSchemaOwner(t *testing.T) 
 	if canCreate {
 		t.Fatal("freshly created writer retained CREATE")
 	}
-	// The recorder works end to end under the fresh owner: a master flip appends
-	// exactly one new history row on top of the migration's initial one.
-	if _, err := conn.Exec(ctx, `UPDATE nas_cleanup_master SET enabled=true,actor='t',reason='r'`); err != nil {
-		t.Fatalf("recorder did not append under the fresh owner: %v", err)
+	// The minimal runtime grants: exactly what the API needs to flip the switch.
+	if _, err := conn.Exec(ctx, `GRANT USAGE ON SCHEMA `+schema+` TO `+runtime+`;
+		GRANT SELECT, INSERT, UPDATE ON `+schema+`.nas_cleanup_master TO `+runtime+`;
+		GRANT SELECT ON `+schema+`.nas_cleanup_master_history TO `+runtime+`;`); err != nil {
+		t.Fatal(err)
+	}
+	// Run as the operating role for the rest of the test.
+	runtimeCfg := dbCfg.Copy()
+	runtimeCfg.User = runtime
+	runtimeConn, err := pgx.ConnectConfig(ctx, runtimeCfg)
+	if err != nil {
+		t.Fatalf("operating role could not connect: %v", err)
+	}
+	defer runtimeConn.Close(context.Background())
+	var super bool
+	if err := runtimeConn.QueryRow(ctx, `SELECT rolsuper FROM pg_roles WHERE rolname=current_user`).Scan(&super); err != nil {
+		t.Fatal(err)
+	}
+	if super {
+		t.Fatal("the operating role is a superuser; this would not prove the real path")
+	}
+	// A non-superuser operating role flips the switch; the recorder appends
+	// exactly one history row on its behalf.
+	if _, err := runtimeConn.Exec(ctx, `UPDATE nas_cleanup_master SET enabled=true,actor='nas-cleanup-controller',claimed_by='ops@host',reason='runtime flip'`); err != nil {
+		t.Fatalf("operating role could not flip the master: %v", err)
 	}
 	var rows int
-	if err := conn.QueryRow(ctx, `SELECT count(*) FROM nas_cleanup_master_history`).Scan(&rows); err != nil {
+	if err := runtimeConn.QueryRow(ctx, `SELECT count(*) FROM nas_cleanup_master_history`).Scan(&rows); err != nil {
 		t.Fatal(err)
 	}
 	if rows != 2 {
 		t.Fatalf("history rows after one flip: %d", rows)
+	}
+	var actor string
+	if err := runtimeConn.QueryRow(ctx, `SELECT actor FROM nas_cleanup_master_history WHERE new_enabled`).Scan(&actor); err != nil {
+		t.Fatal(err)
+	}
+	if actor != "nas-cleanup-controller" {
+		t.Fatalf("history actor %q", actor)
+	}
+	// And it still cannot append history off-path: the guard refuses it.
+	if _, err := runtimeConn.Exec(ctx, `INSERT INTO nas_cleanup_master_history(changed_at,actor,claimed_by,old_enabled,new_enabled,reason) VALUES(now(),'forged','',false,true,'forged')`); err == nil {
+		t.Fatal("the operating role appended history directly")
 	}
 }

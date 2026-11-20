@@ -633,3 +633,96 @@ func TestNASCleanupObservationDoesNoSQLOrLockingAfterTheMasterRead(t *testing.T)
 		t.Fatalf("SQL after the master read: %q", sql)
 	}
 }
+
+// The post-OFF cleanup an advance performs must be scoped to the exact batch it
+// was advancing. It runs after the advance's own locks are released, so without
+// that scope it could pause a successor batch or act outside this batch's roster.
+// Each unsafe shape gets its own fixture because batch identity is immutable.
+func TestNASCleanupPostOffBatchCloseIsScopedToTheExactBatch(t *testing.T) {
+	// newAdvancingBatch returns a fixture with one enabled batch covering one
+	// plan whose items are all complete, plus the ids the helper needs.
+	newAdvancingBatch := func(t *testing.T) (*cleanupFixture, int64, int64, []int64, context.Context, context.CancelFunc) {
+		t.Helper()
+		f := newCleanupFixture(t, 24)
+		plan, sha, _ := f.admit("post-off-scope", syntheticFiles(100, 2, 10))
+		f.dryRun()
+		setCleanupMaster(t, f.s, true)
+		if code, body := f.enableBatch([]int64{plan}, []string{sha}, 2); code != 200 {
+			t.Fatalf("batch enable: %d %s", code, body)
+		}
+		ctx, cancel := context.WithTimeout(f.ctx, 60*time.Second)
+		if _, err := f.pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='keep' WHERE plan_id=$1`, plan); err != nil {
+			t.Fatal(err)
+		}
+		var batchID int64
+		if err := f.pool.QueryRow(ctx, `SELECT id FROM nas_cleanup_batches WHERE mode='enabled'`).Scan(&batchID); err != nil {
+			t.Fatal(err)
+		}
+		return f, plan, batchID, []int64{plan}, ctx, cancel
+	}
+
+	t.Run("successor batch", func(t *testing.T) {
+		f, plan, batchID, roster, ctx, cancel := newAdvancingBatch(t)
+		defer cancel()
+		setCleanupMaster(t, f.s, false)
+		// Our batch is superseded: it is no longer the enabled one, and a different
+		// batch is. The helper must act on neither.
+		if _, err := f.pool.Exec(ctx, `UPDATE nas_cleanup_batches SET mode='paused' WHERE id=$1`, batchID); err != nil {
+			t.Fatal(err)
+		}
+		var successor int64
+		if err := f.pool.QueryRow(ctx, `INSERT INTO nas_cleanup_batches(account_id,connection_id,batch_sha256,report_sha256,plan_ids,plan_sha256s,mode,approval_reason,approved_until)
+			VALUES(47,13,repeat('c',64),$1,$2,ARRAY[$3],'enabled','successor',now()+interval '1 hour') RETURNING id`, cleanupPolicySHA, roster, strings.Repeat("d", 64)).Scan(&successor); err != nil {
+			t.Fatal(err)
+		}
+		f.s.cleanupPauseBatchAfterOff(ctx, batchID, roster, "master switch is off")
+		var successorMode string
+		if err := f.pool.QueryRow(ctx, `SELECT mode FROM nas_cleanup_batches WHERE id=$1`, successor).Scan(&successorMode); err != nil {
+			t.Fatal(err)
+		}
+		if successorMode != "enabled" {
+			t.Fatalf("the scoped close paused a successor batch: %s", successorMode)
+		}
+		if mode, _ := f.planMode(plan); mode != "enabled" {
+			t.Fatalf("the scoped close touched a plan owned by a successor batch: %s", mode)
+		}
+	})
+
+	t.Run("off then on", func(t *testing.T) {
+		f, plan, batchID, roster, ctx, cancel := newAdvancingBatch(t)
+		defer cancel()
+		setCleanupMaster(t, f.s, true)
+		f.s.cleanupPauseBatchAfterOff(ctx, batchID, roster, "master switch is off")
+		if mode, _ := f.batchMode(); mode != "enabled" {
+			t.Fatalf("the scoped close paused a batch after OFF->ON: %s", mode)
+		}
+		if mode, _ := f.planMode(plan); mode != "enabled" {
+			t.Fatalf("the scoped close closed a plan after OFF->ON: %s", mode)
+		}
+	})
+
+	t.Run("plan outside the roster", func(t *testing.T) {
+		f, plan, batchID, _, ctx, cancel := newAdvancingBatch(t)
+		defer cancel()
+		setCleanupMaster(t, f.s, false)
+		// The batch is still the enabled one, but this advance's roster does not
+		// include the completed plan: closing it would reach outside the batch.
+		f.s.cleanupPauseBatchAfterOff(ctx, batchID, []int64{plan + 1}, "master switch is off")
+		if mode, _ := f.planMode(plan); mode != "enabled" {
+			t.Fatalf("the scoped close paused a completed plan outside its roster: %s", mode)
+		}
+	})
+
+	t.Run("still off", func(t *testing.T) {
+		f, plan, batchID, roster, ctx, cancel := newAdvancingBatch(t)
+		defer cancel()
+		setCleanupMaster(t, f.s, false)
+		f.s.cleanupPauseBatchAfterOff(ctx, batchID, roster, "master switch is off")
+		if mode, reason := f.batchMode(); mode != "paused" || !strings.Contains(reason, "master switch is off") {
+			t.Fatalf("scoped close did not pause its own batch: %s %q", mode, reason)
+		}
+		if mode, _ := f.planMode(plan); mode != "paused" {
+			t.Fatalf("scoped close did not close its own completed plan: %s", mode)
+		}
+	})
+}
