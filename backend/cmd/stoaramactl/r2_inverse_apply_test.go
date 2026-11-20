@@ -1915,9 +1915,9 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			// Throttled past every try: the read stops cleanly, the one DELETE
 			// already sent is never resent, and the key stays held.
 			{"throttled_forever_stops_cleanly", "", []string{"429", "429", "429", "429"}, 4, "after 4 attempts"},
-			// A Retry-After past the cap stops cleanly: the retry is never sent
-			// early, and the key stays held as an exhausted read.
-			{"retry_after_past_the_cap_stops_cleanly", "", []string{"429-retry-after"}, 1, "retry cap"},
+			// A Retry-After past the cap fences the job's reads: the retry is
+			// never sent early, and the already issued key stays held.
+			{"retry_after_past_the_cap_fences_reads", "", []string{"429-retry-after"}, 1, "reads fenced"},
 			{"persistent_timeouts_hold_the_key", "", []string{"slow", "slow", "slow", "slow"}, 4, "after 4 attempts"},
 			{"redirect_to_404_never_confirms", "kept", []string{"redirect"}, 1, "after 1 attempts"},
 			{"object_remains_is_never_retried", "kept", nil, 1, "object remains after DELETE"},
@@ -1970,9 +1970,6 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				}
 				if heads.Load() != c.sent || elapsed > 22*time.Second+5*time.Second {
 					t.Fatalf("%d confirming HEADs in %v, want %d within 22s", heads.Load(), elapsed, c.sent)
-				}
-				if c.name == "retry_after_never_stretches_backoff" && elapsed > 2*time.Second+3*time.Second {
-					t.Fatalf("retry-after stretched the backoff: %v", elapsed)
 				}
 				if c.err == "" {
 					if err != nil || result.Deleted != 2 {

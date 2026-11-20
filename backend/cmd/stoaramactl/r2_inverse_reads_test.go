@@ -383,7 +383,7 @@ func TestR2InverseReadGateRechecksExtensionOnTimerWake(t *testing.T) {
 		gate.pause(80 * time.Millisecond)
 	}
 	wg.Wait()
-	final, _ := gate.untilNow()
+	final, _, _ := gate.untilNow()
 	mu.Lock()
 	defer mu.Unlock()
 	if len(left) != readers {
@@ -446,8 +446,8 @@ func TestR2InverseTerminalThrottleStillFencesNewReads(t *testing.T) {
 	if err := store.read(context.Background(), inverseReadPolicy{attempts: 1, maxBackoff: 400 * time.Millisecond, maxRetryAfter: inverseReadMaxRetryAfter}, "head a", failing); err == nil {
 		t.Fatal("a throttled read succeeded")
 	}
-	if remaining := store.readGate().remaining(); remaining < 100*time.Millisecond {
-		t.Fatalf("a terminal 429 left only %v of cooldown: the next read is unfenced", remaining)
+	if remaining, closed := store.readGate().remaining(); closed || remaining < 100*time.Millisecond {
+		t.Fatalf("a terminal 429 left %v of cooldown (closed=%v): the next read is unfenced", remaining, closed)
 	}
 	// The fence is real: the next new read waits it out and never reaches the
 	// provider before it ends.
@@ -464,19 +464,29 @@ func TestR2InverseTerminalThrottleStillFencesNewReads(t *testing.T) {
 	}
 }
 
-// A Retry-After past the cap also fences the job for the cap, not for nothing,
-// even though the reader itself stops.
-func TestR2InverseOverCapRetryAfterStillFences(t *testing.T) {
+// A Retry-After past the cap latches the job's reads shut instead of releasing
+// workers at the cap, where a long read would just meet the same throttle again.
+func TestR2InverseOverCapRetryAfterLatchesReadsShut(t *testing.T) {
 	store := newReadScriptStore(t, &readScriptServer{})
-	policy := inverseReadPolicy{attempts: 1, maxBackoff: inverseReadMaxBackoff, maxRetryAfter: time.Second}
+	policy := inverseReadPolicy{attempts: 4, maxBackoff: inverseReadMaxBackoff, maxRetryAfter: time.Second}
+	var sends atomic.Int64
 	err := store.read(context.Background(), policy, "head a", func(context.Context) error {
+		sends.Add(1)
 		return readResponseError(http.Header{"Retry-After": []string{"3600"}})
 	})
-	if err == nil || !strings.Contains(err.Error(), "retry cap") {
+	if err == nil || !strings.Contains(err.Error(), "reads fenced") {
 		t.Fatalf("over-cap Retry-After: %v", err)
 	}
-	if remaining := store.readGate().remaining(); remaining < 500*time.Millisecond {
-		t.Fatalf("over-cap Retry-After left %v of cooldown", remaining)
+	if _, closed := store.readGate().remaining(); !closed {
+		t.Fatal("a floor past the cap left the job's reads open")
+	}
+	// The latch is the point: no sibling read is released at the cap, and the
+	// reader itself stops after exactly the one attempt that saw the floor.
+	if err := store.read(context.Background(), inverseHeadReadPolicy, "head b", func(context.Context) error { return nil }); err == nil || !strings.Contains(err.Error(), "fenced") {
+		t.Fatalf("a read after the latch: %v", err)
+	}
+	if sends.Load() != 1 {
+		t.Fatalf("%d provider sends, want exactly 1", sends.Load())
 	}
 }
 
@@ -594,4 +604,61 @@ func freshReadFence(store *inverseSDKStore) {
 	store.readsMu.Lock()
 	defer store.readsMu.Unlock()
 	store.reads = newInverseReadGate()
+}
+
+// A 503 with no Retry-After still retries under the bounded jitter, one request
+// per attempt, and finds the object once the provider recovers.
+func TestR2Inverse503WithoutRetryAfterRetriesBounded(t *testing.T) {
+	script := &readScriptServer{answer: func(kind, marker string, attempt int) (int, http.Header) {
+		if attempt == 1 {
+			return http.StatusServiceUnavailable, nil
+		}
+		return http.StatusOK, nil
+	}}
+	store := newReadScriptStore(t, script)
+	started := time.Now()
+	head, err := store.Head(context.Background(), "managed/a.mp4")
+	if err != nil || head.ETag != "etag" {
+		t.Fatalf("503 then 200: %+v %v", head, err)
+	}
+	if n := script.attempts("head", "managed/a.mp4"); n != 2 {
+		t.Fatalf("%d HEADs, want one retry", n)
+	}
+	if elapsed := time.Since(started); elapsed > inverseReadMaxBackoff+2*inverseReadHerdJitter {
+		t.Fatalf("503 retry waited %v, past the bounded jitter", elapsed)
+	}
+}
+
+// A 429 with a small Retry-After still uses bounded jitter for its own retry and
+// publishes a shared cooldown that holds another reader for its real floor.
+func TestR2InverseSmallRetryAfterKeepsBoundedJitterAndCooldown(t *testing.T) {
+	script := &readScriptServer{answer: func(kind, marker string, attempt int) (int, http.Header) {
+		if attempt == 1 {
+			return http.StatusTooManyRequests, http.Header{"Retry-After": []string{"1"}}
+		}
+		return http.StatusOK, nil
+	}}
+	store := newReadScriptStore(t, script)
+	// Another worker's read starts while the HEAD's floor is in force.
+	sibling := make(chan time.Duration, 1)
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		begin := time.Now()
+		store.read(context.Background(), inverseListReadPolicy, "sibling", func(context.Context) error { return nil })
+		sibling <- time.Since(begin)
+	}()
+	started := time.Now()
+	if _, err := store.Head(context.Background(), "managed/a.mp4"); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(started)
+	if elapsed < 750*time.Millisecond {
+		t.Fatalf("a one-second floor retried after %v: the floor was not honored", elapsed)
+	}
+	if elapsed > inverseReadMaxRetryAfter {
+		t.Fatalf("a one-second floor waited %v", elapsed)
+	}
+	if waited := <-sibling; waited < 400*time.Millisecond {
+		t.Fatalf("a sibling read left after %v, inside the shared cooldown", waited)
+	}
 }

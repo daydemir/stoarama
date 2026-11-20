@@ -93,41 +93,50 @@ the pre-DELETE identity HEAD and the confirming HEAD each retry in the executor'
 own loop rather than the SDK's (which is disabled on these paths, so the caps are
 real). Each gets at most 4 tries with jittered backoff of at most 2 seconds
 between them, and each honors the provider's own floor: `Retry-After` as delta
-seconds or an HTTP date, and R2's millisecond `X-Amz-Retry-After`. A suggestion
-past the 30-second cap, or past what is left of that read's budget, stops the read
-cleanly instead — the retry is never sent early. A header value is clamped, so a
-hostile duration cannot overflow. The confirming HEAD keeps its reviewed
-22-second deadline inside the key's network deadline (and, for keep-28, custody
-end); the pre-DELETE HEAD keeps the existing 30-second network bound it already
-had; a LIST or multipart page attempt is finite on its own (60 seconds) even when
-the command has no deadline — that bounds one page, never the whole bucket
-listing — and a retried page keeps its `ContinuationToken`/markers, so it never
-relists from the first page. The LIST loop and multipart eligibility and
-continuation validation are the existing `r2.Client` code, reached through narrow
-read options. Each confirming attempt is one request on its own fresh HTTP/1.1
-connection with keep-alives off, so neither the transport nor the SDK can turn one
-attempt into two. Only timeouts, connection errors, 429, every 5xx (including a
-proxy's 520-599) and throttling retry. The confirming HEAD follows no redirect: a
-404 from anywhere but the key cannot confirm it. A 200 means the object remains:
-it fails at once. When every attempt fails, the job stops and the key stays held,
-as a lost response does. Anything read before the DELETE was issued stays held and
-unpublished; no read failure ever retries the DELETE.
+seconds or an HTTP date, and R2's millisecond `X-Amz-Retry-After`. A floor past
+what is left of that read's budget stops that read cleanly — the retry is never
+sent early — while still publishing the provider's real floor on the shared gate.
+A floor past the 30-second retry cap does not degrade to 30 seconds: it latches
+the job's reads shut, because releasing a worker that is deep in a LIST or a long
+read at the cap would walk it back into the same throttle. A header value is
+clamped to 24 hours, so a hostile duration cannot overflow. The confirming HEAD
+keeps its reviewed 22-second deadline inside the key's network deadline (and, for
+keep-28, custody end); the pre-DELETE HEAD keeps the existing 30-second network
+bound it already had; a LIST or multipart page attempt is finite on its own
+(60 seconds) even when the command has no deadline — that bounds one page, never
+the whole bucket listing — and a retried page keeps its
+`ContinuationToken`/markers, so it never relists from the first page. The LIST
+loop and the multipart eligibility and continuation validation are the existing
+`r2.Client` code, reached through a required page function. Every read attempt
+carries an explicit deadline and runs on its own fresh HTTP/1.1 connection with
+keep-alives off and HTTP/2 refused, and no read follows a redirect, so the
+attempt count is the physical request count and a published cooldown never
+finishes with a stray hop. Only timeouts, connection errors, 429, every 5xx
+(including a proxy's 520-599) and throttling retry; a bare 503 with no
+`Retry-After` retries under the same bounded jitter. The confirming HEAD follows
+no redirect: a 404 from anywhere but the key cannot confirm it. A 200 means the
+object remains: it fails at once. A pre-DELETE read failure issues no DELETE
+attempt at all. A final confirming failure keeps a key whose DELETE was already
+issued unconfirmed and held — never absent, and never resent; the job stops
+through its existing clean abort path.
 
 One rate limiter belongs to the job's single store and is shared by every worker
 and every read type. A 429 — or any transient status carrying `Retry-After` — sets
 a job-wide cooldown, so every reader waits for the same instant and the job does
-not re-create the herd that caused the throttle. The cooldown is published on the
-store, never while holding a database lock. A reader that waited re-reads the gate
-on every wake, so an extension published while it slept extends its wait; readers
-the cooldown releases leave staggered inside one jitter window. A throttle on the
-final permitted try, or a `Retry-After` past the cap or past the read's own
-budget, still sets the cooldown before that reader stops, so the job's subsequent
-new reads stay fenced. The cooldown ends early when the job's context is
-cancelled. The pre-DELETE HEAD is the one read that runs while the key's shared
-protection locks are held; that is deliberate, because it is the exact identity
-and `LastModified` authority for the DELETE. It adds no new bound: it lives inside
-the wire transaction's existing network budget and holds only shared locks, so the
-tradeoff is bounded sharing, not extended custody.
+not re-create the herd that caused the throttle. A reader that waited re-reads the
+gate on every wake, so an extension published while it slept extends its wait;
+readers the cooldown releases leave staggered inside one jitter window. A throttle
+on the final permitted try still sets the cooldown before that reader stops, so the
+job's subsequent new reads stay fenced. The cooldown ends early when the job's
+context is cancelled.
+
+Both the pre-DELETE identity HEAD and the multipart inventory run inside the
+guarded wire transaction, so the cooldown wait on that path happens while the
+key's shared protection locks are held. That is deliberate: the HEAD is the exact
+identity and `LastModified` authority for the DELETE, and the inventory is the
+provider-side veto that must be observed under the same guarded snapshot. It adds
+no new bound — both live inside the wire transaction's existing network budget and
+hold only shared locks — so the tradeoff is bounded sharing, not extended custody.
 
 A publication step whose parent context ended first — the job cancelled or its
 deadline passed before the step's own 2-minute bound — stops the job and holds

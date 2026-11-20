@@ -209,9 +209,10 @@ type inverseSDKStore struct {
 	*r2.Client
 	sdk       *s3.Client
 	transport http.RoundTripper
-	// readClient carries the job's LIST pages and identity HEADs through the
-	// bounded read path; confirm carries the confirming HEAD's fresh per-attempt
-	// connections.
+	// readClient carries the job's LIST pages, multipart inventory and identity
+	// HEADs through the bounded read path; confirm carries the confirming HEAD's
+	// fresh per-attempt connections. Both refuse redirects and send one request
+	// per attempt.
 	readClient *http.Client
 	confirm    *http.Client
 	// reads is the one rate limiter every worker and every read type shares.
@@ -301,7 +302,7 @@ func newInverseSDKStore(ctx context.Context, cfg r2.Config) (*inverseSDKStore, e
 		o.BaseEndpoint = aws.String(cfg.Endpoint)
 		o.Retryer = aws.NopRetryer{}
 	})
-	return &inverseSDKStore{Client: reader, sdk: sdk, transport: transport, readClient: newInverseReadClient(), confirm: newInverseConfirmClient(inverseConfirmAttemptTimeout), reads: newInverseReadGate()}, nil
+	return &inverseSDKStore{Client: reader, sdk: sdk, transport: transport, readClient: newInverseReadClient(inverseReadPageTimeout), confirm: newInverseConfirmClient(inverseConfirmAttemptTimeout), reads: newInverseReadGate()}, nil
 }
 
 // confirmAbsent HEADs the key after its answered DELETE: nil only on 404. It is

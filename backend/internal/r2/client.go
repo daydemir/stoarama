@@ -554,14 +554,7 @@ func objectHead(out *s3.HeadObjectOutput) ObjectHead {
 }
 
 func (c *Client) Head(ctx context.Context, key string) (ObjectHead, error) {
-	out, err := c.s3.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(c.bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		return ObjectHead{}, fmt.Errorf("head object %s: %w", key, err)
-	}
-	return objectHead(out), nil
+	return c.HeadWithOptions(ctx, key, ReadOptions{})
 }
 
 // HeadExact resolves one immutable generation and refuses a changed ETag.
@@ -660,15 +653,8 @@ func (c *Client) Open(ctx context.Context, key string) (io.ReadCloser, error) {
 }
 
 func (c *Client) ListPrefix(ctx context.Context, prefix string, limit int, fn func(ObjectInfo) error) error {
-	return c.ListPrefixWithOptions(ctx, prefix, limit, ReadOptions{}, fn)
-}
-
-// ListPrefixWithOptions paginates the bucket under the caller's read options.
-// Each page is one request; a caller that caps attempts disables the SDK retryer
-// and passes its own HTTP client.
-func (c *Client) ListPrefixWithOptions(ctx context.Context, prefix string, limit int, read ReadOptions, fn func(ObjectInfo) error) error {
 	return c.ListPrefixWithPage(ctx, prefix, limit, func(ctx context.Context, in *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error) {
-		return c.ListObjectsPage(ctx, in, read)
+		return c.ListObjectsPage(ctx, in, ReadOptions{})
 	}, fn)
 }
 

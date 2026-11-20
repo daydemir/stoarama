@@ -92,11 +92,31 @@ var inverseHeadReadPolicy = inverseReadPolicy{
 type inverseReadGate struct {
 	mu      sync.Mutex
 	until   time.Time
+	closed  bool
 	changed chan struct{}
 }
 
 func newInverseReadGate() *inverseReadGate {
 	return &inverseReadGate{changed: make(chan struct{})}
+}
+
+// errInverseReadFenced reports a read refused because the job fenced its reads
+// for longer than any retry this process could usefully wait. Nothing was sent.
+var errInverseReadFenced = errors.New("inverse reads fenced: provider asked for a cooldown past the retry cap")
+
+// close latches the gate shut. A provider asking for a cooldown past the retry
+// cap is not a 30-second problem: releasing a worker that is deep in a LIST or a
+// long read at the cap would walk it straight back into the throttle, so the job
+// stops issuing reads instead. A new process builds a new gate.
+func (g *inverseReadGate) close() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return
+	}
+	g.closed = true
+	close(g.changed)
+	g.changed = make(chan struct{})
 }
 
 // pause holds every new read until d from now, extending an existing cooldown
@@ -116,29 +136,33 @@ func (g *inverseReadGate) pause(d time.Duration) {
 	g.changed = make(chan struct{})
 }
 
-// untilNow returns the current cooldown and the channel that closes when it
-// changes.
-func (g *inverseReadGate) untilNow() (time.Time, chan struct{}) {
+// untilNow returns the current cooldown, whether the gate is latched shut, and
+// the channel that closes when either changes.
+func (g *inverseReadGate) untilNow() (time.Time, bool, chan struct{}) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.until, g.changed
+	return g.until, g.closed, g.changed
 }
 
-// remaining reports how long every new read must still wait.
-func (g *inverseReadGate) remaining() time.Duration {
-	until, _ := g.untilNow()
-	return time.Until(until)
+// remaining reports how long every new read must still wait, and whether the
+// gate is latched shut.
+func (g *inverseReadGate) remaining() (time.Duration, bool) {
+	until, closed, _ := g.untilNow()
+	return time.Until(until), closed
 }
 
-// wait blocks until the shared cooldown has passed, or the context ends. Every
-// reader calls it before every attempt, so a 429 seen by one key stops the rest.
-// A reader that waited on a cooldown leaves staggered, and every wake re-reads
-// the gate: a sibling that extends the cooldown during this wait extends this
-// wait too, whatever a ready timer suggested.
+// wait blocks until the shared cooldown has passed, or the context ends, or the
+// gate latches shut. Every reader calls it before every attempt, so a 429 seen by
+// one key stops the rest. A reader that waited on a cooldown leaves staggered, and
+// every wake re-reads the gate: a sibling that extends the cooldown during this
+// wait extends this wait too, whatever a ready timer suggested.
 func (g *inverseReadGate) wait(ctx context.Context) error {
 	waited, staggered := false, false
 	for {
-		remaining := g.remaining()
+		remaining, closed := g.remaining()
+		if closed {
+			return errInverseReadFenced
+		}
 		if remaining <= 0 {
 			if !waited || staggered {
 				return nil
@@ -158,7 +182,7 @@ func (g *inverseReadGate) wait(ctx context.Context) error {
 		waited, staggered = true, false
 		// Nap in short slices and wake on any extension, then loop and read the
 		// gate again rather than trusting this timer.
-		_, changed := g.untilNow()
+		_, _, changed := g.untilNow()
 		nap := min(remaining, inverseReadHerdJitter) + rand.N(inverseReadHerdJitter)
 		timer := time.NewTimer(nap)
 		select {
@@ -186,21 +210,12 @@ func (s *inverseSDKStore) readGate() *inverseReadGate {
 // read runs one safe read under the shared limiter. It retries only what the
 // confirming HEAD already classifies as transient, caps the tries, honors a
 // provider's Retry-After (delta seconds or an HTTP date, and R2's
-// millisecond X-Amz-Retry-After), and never retries earlier than that: a
-// suggestion past the cap, or past what is left of this read's budget, stops the
-// read cleanly instead. Every throttle fences the job, including one on the final
-// try or one whose duration stops this reader: the next new read waits it out.
-// A clean stop is an ordinary error, so the job takes its existing abort path.
+// millisecond X-Amz-Retry-After), and never retries earlier than that: a floor
+// past what is left of this read's budget stops this read cleanly, and a floor
+// past the retry cap fences the whole job. A clean stop is an ordinary error, so
+// the job takes its existing abort path.
 func (s *inverseSDKStore) read(ctx context.Context, p inverseReadPolicy, what string, op func(context.Context) error) error {
 	gate := s.readGate()
-	// One read attempt of its own bound: a command with no deadline still gets a
-	// finite attempt, never a finite listing.
-	attempt := func() (context.Context, context.CancelFunc) {
-		if p.attemptTimeout > 0 {
-			return context.WithTimeout(ctx, p.attemptTimeout)
-		}
-		return ctx, func() {}
-	}
 	if p.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, p.timeout)
@@ -213,7 +228,12 @@ func (s *inverseSDKStore) read(ctx context.Context, p inverseReadPolicy, what st
 		if err := gate.wait(ctx); err != nil {
 			return fail(tries, err)
 		}
-		attemptCtx, cancel := attempt()
+		// Every attempt carries its own deadline, so no attempt outlives the
+		// policy even when the command has no deadline of its own.
+		attemptCtx, cancel := ctx, context.CancelFunc(func() {})
+		if p.attemptTimeout > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, p.attemptTimeout)
+		}
 		err := op(attemptCtx)
 		ownTimeout := attemptCtx.Err() != nil && ctx.Err() == nil
 		cancel()
@@ -224,11 +244,13 @@ func (s *inverseSDKStore) read(ctx context.Context, p inverseReadPolicy, what st
 		if !terminal && inverseConfirmRetryable.IsErrorRetryable(err) != aws.TrueTernary && !ownTimeout {
 			return fail(tries, err)
 		}
-		wait, throttle, stop := inverseReadWait(ctx, p, err)
+		wait, fence, latch, stop := inverseReadWait(ctx, p, err)
 		// A throttle fences the job even when this reader stops here, so a
-		// terminal 429 or an over-long Retry-After cannot leave the next read
-		// free to hit the same wall.
-		if throttle {
+		// terminal 429 or a long floor cannot leave the next read unfenced.
+		switch {
+		case latch:
+			gate.close()
+		case fence:
 			gate.pause(wait)
 		}
 		if stop != nil {
@@ -237,7 +259,7 @@ func (s *inverseSDKStore) read(ctx context.Context, p inverseReadPolicy, what st
 		if terminal {
 			return fail(tries, err)
 		}
-		if !throttle {
+		if !fence {
 			// Any other transient read failure waits only for its own key.
 			select {
 			case <-ctx.Done():
@@ -248,12 +270,14 @@ func (s *inverseSDKStore) read(ctx context.Context, p inverseReadPolicy, what st
 	}
 }
 
-// inverseReadWait decides how long a failed read waits, whether that wait is a
-// job-wide throttle, and why it must stop instead. A Retry-After is clamped to
-// no more than 24h so a hostile header cannot overflow a Duration; a value past
-// the cap or past what is left of this read's budget stops the read cleanly, and
-// still reports its clamped wait so the job fences every later read.
-func inverseReadWait(ctx context.Context, p inverseReadPolicy, err error) (time.Duration, bool, error) {
+// inverseReadWait decides how long a failed read waits, whether that wait fences
+// the job, and why it must stop instead. A Retry-After is clamped to no more than
+// 24h so a hostile header cannot overflow a Duration. A floor past the retry cap
+// does not degrade to the cap — a worker deep in a LIST would be released into
+// the same throttle — it latches the gate shut, so the job issues no further
+// reads. A floor past what is left of this read's budget still fences the job for
+// the provider's real ask and stops only this read.
+func inverseReadWait(ctx context.Context, p inverseReadPolicy, err error) (time.Duration, bool, bool, error) {
 	throttle := inverseReadStatus(err) == http.StatusTooManyRequests
 	// A throttle always fences the job for a real interval, even without a
 	// header and even when a reader stops: half to full backoff.
@@ -263,18 +287,20 @@ func inverseReadWait(ctx context.Context, p inverseReadPolicy, err error) (time.
 	}
 	retryAfter, ok := inverseReadRetryAfter(err)
 	if !ok {
-		return wait, throttle, nil
+		return wait, throttle, false, nil
 	}
 	switch {
 	case retryAfter > p.maxRetryAfter:
-		return p.maxRetryAfter, true, fmt.Errorf("%w: provider asked for %v, past the %v retry cap", err, retryAfter, p.maxRetryAfter)
+		// Latch, never release at the cap: the provider's floor is longer than
+		// any worker can usefully wait here.
+		return 0, true, true, fmt.Errorf("%w: provider asked for %v, past the %v retry cap; reads fenced", err, retryAfter, p.maxRetryAfter)
 	case retryAfter <= 0:
-		return wait, true, nil
+		return wait, true, false, nil
 	}
 	if deadline, ok := ctx.Deadline(); ok && retryAfter >= time.Until(deadline) {
-		return retryAfter, true, fmt.Errorf("%w: provider asked for %v, past the %v left in this read's budget", err, retryAfter, time.Until(deadline).Round(time.Millisecond))
+		return retryAfter, true, false, fmt.Errorf("%w: provider asked for %v, past the %v left in this read's budget", err, retryAfter, time.Until(deadline).Round(time.Millisecond))
 	}
-	return retryAfter, true, nil
+	return retryAfter, true, false, nil
 }
 
 // inverseReadStatus reports an HTTP status carried by a read error, or 0.
@@ -338,10 +364,12 @@ func (s *inverseSDKStore) readOptions() r2.ReadOptions {
 }
 
 // newInverseReadClient is the read transport for the job's own LIST pages,
-// multipart inventory and identity HEAD: one request per attempt on its own
-// fresh HTTP/1.1 connection, so an attempt count is a request count, and only
-// same-authority HTTPS redirects are followed, as r2.Client already does.
-func newInverseReadClient() *http.Client {
+// multipart inventory and identity HEAD. It is the confirming HEAD's client with
+// the same guarantees: one request per attempt on its own fresh HTTP/1.1
+// connection, keep-alives off, HTTP/2 refused, and every redirect refused, so a
+// read is exactly the physical attempts the policy counts and a published
+// cooldown is never followed by a stray extra request.
+func newInverseReadClient(attempt time.Duration) *http.Client {
 	transport := awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
 		t.ForceAttemptHTTP2 = false
 		t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
@@ -351,20 +379,7 @@ func newInverseReadClient() *http.Client {
 		t.TLSClientConfig.NextProtos = []string{"http/1.1"}
 		t.DisableKeepAlives = true
 	}).GetTransport()
-	return &http.Client{Transport: transport, CheckRedirect: inverseReadRedirect}
-}
-
-// inverseReadRedirect follows only same-authority HTTPS redirects, as r2.Client
-// does, so a LIST or identity HEAD cannot be steered to another host.
-func inverseReadRedirect(req *http.Request, via []*http.Request) error {
-	if len(via) == 0 || len(via) >= 10 {
-		return http.ErrUseLastResponse
-	}
-	origin := via[0].URL
-	if !strings.EqualFold(req.URL.Scheme, "https") || !strings.EqualFold(req.URL.Host, origin.Host) {
-		return http.ErrUseLastResponse
-	}
-	return nil
+	return &http.Client{Transport: transport, Timeout: attempt, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
 // Head reads one key's exact provider identity through the bounded read path,
@@ -408,7 +423,7 @@ func (s *inverseSDKStore) listPrefix(ctx context.Context, p inverseReadPolicy, p
 // under the job's read policy and limiter.
 func (s *inverseSDKStore) RequireNoMultipartOutsideStitchStaging(ctx context.Context, known func(context.Context, string, string) (bool, error)) error {
 	page := 0
-	return s.Client.RequireNoMultipartOutsideStitchStagingPages(ctx, s.readOptions(), func(ctx context.Context, in *s3.ListMultipartUploadsInput) (*s3.ListMultipartUploadsOutput, error) {
+	return s.Client.RequireNoMultipartOutsideStitchStagingPages(ctx, func(ctx context.Context, in *s3.ListMultipartUploadsInput) (*s3.ListMultipartUploadsOutput, error) {
 		page++
 		var out *s3.ListMultipartUploadsOutput
 		err := s.read(ctx, inverseListReadPolicy, fmt.Sprintf("multipart inventory page %d", page), func(ctx context.Context) error {
