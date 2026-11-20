@@ -423,8 +423,18 @@ retire as `collated`. Receipts carry `owner_delivery_page_<class>`.
    the wrong class. A candidate roster the validator refuses is not approved
    again with a widened query: report the difference to Deniz.
 2. Record the owner's approval for the validated digest as its own step, under
-   exactly one class: `stoaramactl r2-inverse approve --class CLASS
-   --roster-sha256 HEX --decision TEXT`. Seeding never creates an approval.
+   exactly one class, giving it the roster and picks it should validate:
+
+   ```
+   stoaramactl r2-inverse approve --class CLASS --roster FILE \
+     --expected-roster-sha256 HEX --picks docs/records/r2-picks-20261118.json \
+     --expected-picks-sha256 HEX --decision TEXT
+   ```
+
+   Approval is not a procedural trust: it re-runs the validator's decision on
+   the exact roster bytes in the approval's own transaction and refuses to record
+   a digest the classifier would reject or a digest without its bytes. Seeding
+   never creates an approval.
 3. Seed the class from the pinned roster:
    `stoaramactl r2-inverse exempt --class CLASS --roster FILE
    --expected-roster-sha256 HEX --picks docs/records/r2-picks-20261118.json
@@ -436,41 +446,71 @@ retire as `collated`. Receipts carry `owner_delivery_page_<class>`.
    `stoaramactl r2-inverse job-collated ...`.
 5. Handoff (a) and (b): the in-window videos are copied and certified on the
    NAS and the static CSV+JSON manifest of old links to NAS paths is published.
-6. Handoff (c), in this order, with the provider drain assumption stated:
+6. Handoff (c): arm, record cutover authority, let the derived deadline pass,
+   then retire. The gate is SQL, not this prose.
 
    a. **Arm.** `stoaramactl r2-inverse page-quiesce --reason TEXT` (once). From
       this commit every public delivery route refuses a NEW request with 503 and
-      admits no reader, ticket or publication; the readers already admitted
-      finish their response under their own lease. No exemption class opens yet
-      and the page is not retired. This is the point of no return.
-   b. **Let the last untracked five-minute URL drain with a verifiable
-      timestamp.** Every capability the page handed out is a
-      `r2_delivery_download_tickets` row with `expires_at` (the provider's
-      capability TTL, 5 minutes) and `last_byte_by` (capability + a 2-minute
-      in-flight transfer bound, since a provider does not cut a transfer that
-      already started). Record the database clock and the latest
-      `last_byte_by`:
+      admits no reader, ticket or publication; readers already admitted finish
+      under their lease. No exemption class opens and the page is not retired.
+      This is the point of no return.
+
+   b. **Record the reviewed cutover authority.**
+      `stoaramactl r2-inverse page-cutover --evidence FILE
+      --expected-evidence-sha256 HEX`. The evidence is the facts the API cannot
+      see, and its canonical bytes are pinned by `--expected-evidence-sha256`:
+      the serving `generation`, the **last legacy five-minute grant** time and
+      its grant-list digest, the **legacy origin removal** time and its off-host
+      evidence digest, the **cache-expired** time and its evidence digest, the
+      **non-serving rollback routing** digest, and the **verified end of every
+      active transfer** (`transfer_bound_at`), direct-from-R2 included. SQL
+      derives `deadline_at` as the greatest of those plus the five-minute legacy
+      grant window; the command cannot supply it.
+
+      If you cannot prove a bound — no authoritative byte clock for a direct R2
+      transfer, an origin whose cache cannot be shown expired — do not write a
+      plausible number. Stop: without this row retirement is refused, and with
+      it `confident_repair`, `in_window` and every derivative release stay
+      closed. That is the correct outcome when the drain is unproven.
+
+   c. **Wait for the derived deadline.** Query the row, not a wall clock from
+      this document:
 
       ```sql
-      SELECT clock_timestamp() AS now, max(last_byte_by) AS last_byte_by,
-             count(*) FILTER (WHERE last_byte_by > clock_timestamp()) AS still_transferring
-      FROM r2_delivery_download_tickets;
+      SELECT clock_timestamp() AS now, deadline_at,
+             count(*) FILTER (WHERE deadline_at > clock_timestamp()) AS not_yet
+      FROM r2_delivery_cutover_authority WHERE singleton;
       ```
 
-      Wait until `still_transferring` is 0 and `now` is after the latest
-      `last_byte_by` by the record's own margin. A URL a recipient saved before
-      arming still works until its provider expiry: it cannot be revoked, only
-      drained, and this is the only evidence that it has.
+      `not_yet` must be 0 before the next step. The same query shows the tracked
+      capability drain:
 
-   c. **Retire.** `stoaramactl r2-inverse page-retired --generation HEX32
-      --decision TEXT` (once). The row is proved **in SQL** under the exclusive
-      public lock: 0225's trigger refuses it unless the quiesce row exists, no
-      admitted reader lease is unexpired and no capability's `last_byte_by` is
-      unexpired. A hand-written INSERT, an older binary or a second process is
-      refused for the same reasons, so there is no split-brain CLI-only check.
+      ```sql
+      SELECT clock_timestamp() AS now, count(*) AS live,
+             coalesce(max(expires_at),'-infinity') AS latest_expiry
+      FROM r2_delivery_download_tickets WHERE expires_at > clock_timestamp();
+      ```
+
+      `live` must be 0. Note the explicit limit: a URL a recipient saved before
+      arming cannot be revoked, only drained, and the tracked ledger may be
+      empty while an untracked legacy URL is still live. That is exactly why the
+      authority's `legacy_grant_boundary_at` and `transfer_bound_at` are required
+      independently of the ledger.
+
+   d. **Retire.** `stoaramactl r2-inverse page-retired --generation HEX32
+      --decision TEXT` (once). 0225's trigger refuses it — under the exclusive
+      public lock — unless the quiesce row exists, a cutover authority for THIS
+      generation exists, its `deadline_at` is already past by the database
+      clock, no admitted reader lease is unexpired, no tracked capability is
+      unexpired and no page key has a pending derivative retirement. A
+      hand-written INSERT, an older binary or a second process is refused for the
+      same reasons, so there is no split-brain CLI-only check.
       `r2_delivery_page_retired()` reads exactly that row, and every public
       delivery route refuses 410 from then on for the current and every pinned
       generation. This opens `confident_repair`.
+
+   e. **Confirm.** `SELECT r2_delivery_page_retired(),
+      r2_delivery_public_serving();` must read `t, f`.
 
 7. Seed `confident_repair` and run the collated job. Seed `in_window` once the
    0224 follow-up certifies the copies; until then it stays held.
@@ -479,40 +519,48 @@ retire as `collated`. Receipts carry `owner_delivery_page_<class>`.
 
 - **Readers.** Each public response holds one `r2_delivery_public_readers` row
   from just before its first registry read to after its last socket write. The
-  row is a lease with a 2-minute expiry, longer than the API's 60s write
-  timeout, so a live slow response never loses it and a crashed one delays
-  retirement by at most 2 minutes. The API holds no database connection and no
-  lock while streaming.
+  lease expires in 2 minutes — longer than the API's 60s write timeout, so a live
+  slow response never loses it and a crashed one delays retirement by at most 2
+  minutes. The API holds no database connection and no lock while streaming.
 - **Tickets.** Each capability is one `r2_delivery_download_tickets` row, written
-  in the same statement as the capability under the shared public lock, and
-  never past `last_byte_by`.
-- **The lock.** `r2_delivery_public_lock()` is one advisory key: shared for
-  reader admission, ticket minting and registry publication, exclusive for arming
-  and retirement. It is never held across a socket and never held while waiting
-  for a pool connection another reader needs, so there is no nested-lookup
-  deadlock: the lease row, not the lock, spans the transfer.
+  in the same statement as the capability under the shared public lock. It
+  records only the provider's `expires_at`. It records **no** transfer bound: a
+  bound the server invented would be a guess, and the authoritative end of a
+  started transfer is the cutover authority's `transfer_bound_at`.
+- **The lock and the pool.** `r2_delivery_public_lock()` is one advisory key:
+  shared for reader admission, ticket minting and registry publication, exclusive
+  for arming and the retirement proof. A cold registry load validates its keep
+  snapshot on the SAME transaction that holds the lock — never a second pool
+  acquire — and the registry mutex is held only for pointer reads and the final
+  publish, never across the network read or the fence. So with a two-connection
+  pool, two concurrent cold loads still each need only one connection and a
+  quiesce behind them always finds one free. `TestDeliveryRegistryColdLoadAndQuiesceDoNotDeadlock`
+  is that regression.
 - **Failure bounds.** A reader that cannot prove the page is serving refuses
-  (fail closed: 503). A retirement that cannot prove the drain refuses. Nothing
-  here is cached: the quiesce and retirement rows are read live on every public
-  request.
+  (503). A retirement that cannot prove the cutover and the drains refuses.
+  Nothing is cached: the quiesce, cutover and retirement rows are read live.
 
 #### Remaining provider drain assumptions (stated, not hidden)
 
 - A presigned URL already returned to a recipient is not revocable. The drain
-  above relies on the provider refusing it after `expires_at` and on
-  `last_byte_by` covering a transfer that started just before expiry. It assumes
-  the provider honours presign expiry within its documented skew and applies no
-  longer cache to the signed URL.
+  relies on the provider refusing it after `expires_at` and on the operator's
+  `transfer_bound_at` covering a transfer that started just before expiry. It
+  assumes the provider honours presign expiry within its documented skew and
+  applies no longer cache to the signed URL. There is no provider byte clock in
+  this system; if one is unavailable, `transfer_bound_at` cannot be proved and
+  retirement stays closed.
 - An origin removed in step 0 keeps its own caches for as long as that owner
   configures. Removing the route is necessary; it is not proof that an edge cache
-  has purged. The retired R2 objects remain readable to anyone holding a
-  still-valid presign until `last_byte_by`, which is why the drain is verified and
-  recorded rather than assumed.
-- The API's own review counts every request that reaches it. A legacy origin that
-  keeps serving the OLD static page from its own cache never reaches the API and
-  is outside this mechanism; step 0 is the only control for it.
+  has purged. `cache_expired_at` and its evidence digest are the record that the
+  caches are known expired.
+- A legacy origin that keeps serving the OLD static page from its own cache never
+  reaches the API and is outside this mechanism; step 0 plus
+  `legacy_origin_removed_at` and its evidence are the only control for it.
+- `r2_delivery_nas_certified` is still a hardcoded false stub in this branch
+  (#574's follow-up binds it): `in_window` cannot open here, regardless of the
+  cutover authority.
 
-### Read-only roster queries
+### Read-only roster queries### Read-only roster queries
 
 The in-window roster at `records/delivery-inwindow-roster-20261119/` (SHA-256
 `da4a4a7f4c98409ad0927878ad9995327f2a749d717e1e47b276e19cec06e8ca`) is already

@@ -28,6 +28,7 @@ CREATE TABLE recording_clips(id bigint PRIMARY KEY,bucket text,object_key text,r
 CREATE TABLE nas_cleanup_incident_roster(bucket text,object_key text);
 CREATE TABLE nas_cleanup_incident_sources(clip_id bigint);
 CREATE TABLE nas_cleanup_reserved_files(kind text,source_id bigint);
+CREATE VIEW nas_cleanup_r2_reserved_files AS SELECT kind,source_id FROM nas_cleanup_reserved_files;
 CREATE TABLE nas_cleanup_plans(id bigint PRIMARY KEY,mode text NOT NULL,approved_until timestamptz);
 CREATE TABLE nas_cleanup_items(plan_id bigint,delete_ever_issued boolean,state text,updated_at timestamptz);
 CREATE TABLE nas_cleanup_source_holds(plan_id bigint,clip_id bigint);
@@ -208,27 +209,27 @@ func TestDeliveryPageRetirementIsTheServingState(t *testing.T) {
 			t.Fatalf("quiesced page: %s served %d, want 503", r.name, w.Code)
 		}
 	}
-	// The capabilities the serving loop minted are still live, so retirement is
-	// refused until they drain. That refusal is the point: age them past their
-	// transfer bound (test-only) and retirement may proceed.
+	// The serving loop minted recorded capabilities, and there is no cutover
+	// authority at all, so retirement is refused on BOTH counts. An empty tracked
+	// ledger would not be enough: the authority is what proves the untracked
+	// legacy grant and the last real byte.
 	var liveTickets int64
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_delivery_download_tickets WHERE last_byte_by>clock_timestamp()`).Scan(&liveTickets); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_delivery_download_tickets WHERE expires_at>clock_timestamp()`).Scan(&liveTickets); err != nil {
 		t.Fatal(err)
 	}
 	if liveTickets == 0 {
 		t.Fatal("the serving loop minted no recorded capability")
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
- VALUES(repeat('c',32),'test: retire before drain')`); err == nil || !strings.Contains(err.Error(), "transferring") {
-		t.Fatalf("retirement with live capabilities was not refused in SQL: %v", err)
+ VALUES(repeat('c',32),'test: retire before drain')`); err == nil || !strings.Contains(err.Error(), "cutover authority") {
+		t.Fatalf("retirement without cutover authority was not refused in SQL: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
- VALUES(repeat('f',32),'test: retire with a live reader')`); err == nil || !strings.Contains(err.Error(), "transferring") {
-		t.Fatalf("live capability retirement was not refused: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE r2_delivery_download_tickets SET expires_at=clock_timestamp()-interval '1 minute',last_byte_by=clock_timestamp()-interval '1 second'`); err != nil {
+	// Drain the recorded capabilities, then write reviewed cutover authority for
+	// this exact generation whose derived deadline has already passed.
+	if _, err := pool.Exec(ctx, `UPDATE r2_delivery_download_tickets SET expires_at=clock_timestamp()-interval '1 second'`); err != nil {
 		t.Fatal(err)
 	}
+	writeCutoverAuthority(t, pool, repeatHex('c', 32))
 	// Take the page down: the one committed serving state, then the live function
 	// and the confident_repair gate must agree in the same breath.
 	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
@@ -272,6 +273,34 @@ func TestDeliveryPageRetirementIsTheServingState(t *testing.T) {
 	}
 }
 
+// repeatHex is a hex literal of length n, for a generation id.
+func repeatHex(c byte, n int) string { return strings.Repeat(string(c), n) }
+
+// writeCutoverAuthority records the reviewed external cutover evidence for one
+// generation, exactly as the page-cutover CLI does after the operator proves the
+// legacy origins are gone, the caches expired and the transfers ended. The
+// derived deadline is the latest bound plus the five-minute legacy grant window,
+// so a bound older than that already yields a passed deadline and a newer one
+// yields a future deadline. The row is append-only, so a test picks its bound at
+// write time; nothing here can revise it afterwards.
+func writeCutoverAuthorityWithin(t *testing.T, pool *pgxpool.Pool, generation string, bound time.Time) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `INSERT INTO r2_delivery_cutover_authority(
+ generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
+ legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,transfer_bound_at,approved_sha256)
+ VALUES($1,'test: cutover',$2,$3,$2,$3,$2,$3,$3,$2,$3)`,
+		generation, bound, strings.Repeat("a", 64)); err != nil {
+		t.Fatalf("write cutover authority: %v", err)
+	}
+}
+
+// writeCutoverAuthority writes evidence whose derived deadline has already
+// passed: every bound is ten minutes old and the window is five.
+func writeCutoverAuthority(t *testing.T, pool *pgxpool.Pool, generation string) {
+	t.Helper()
+	writeCutoverAuthorityWithin(t, pool, generation, time.Now().Add(-10*time.Minute))
+}
+
 // TestDeliveryPageRetirementPausesAdmittedReader is the serialization regression:
 // a real public file response is paused mid-body by its object store, retirement
 // is attempted while it is provably admitted and streaming, and the same INSERT
@@ -308,7 +337,10 @@ func TestDeliveryPageRetirementPausesAdmittedReader(t *testing.T) {
  VALUES('ffffffffffffffffffffffffffffffff',clock_timestamp()+interval '1 minute')`); err == nil {
 		t.Fatal("a new reader was admitted after quiesce")
 	}
-	// Retirement is refused while the paused response holds its lease.
+	// Retirement is refused while the paused response holds its lease. The cutover
+	// authority exists and its deadline has passed, so the ONLY remaining hold is
+	// the admitted reader.
+	writeCutoverAuthority(t, pool, repeatHex('a', 32))
 	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
  VALUES(repeat('a',32),'test: retire during a streaming response')`); err == nil || !strings.Contains(err.Error(), "admitted public readers") {
 		t.Fatalf("retirement during a streaming response was not refused: %v", err)
@@ -329,7 +361,11 @@ func TestDeliveryPageRetirementPausesAdmittedReader(t *testing.T) {
 	if live := store.leaseCount(t, pool); live != 0 {
 		t.Fatalf("the response did not release its lease: %d", live)
 	}
-	// The same statement that was refused now commits.
+	// The recorded capabilities must also drain, and the reviewed cutover
+	// authority must exist, before the same statement commits.
+	if _, err := pool.Exec(ctx, `UPDATE r2_delivery_download_tickets SET expires_at=clock_timestamp()-interval '1 second'`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
  VALUES(repeat('a',32),'test: retire after the last byte')`); err != nil {
 		t.Fatalf("retirement after the drain was refused: %v", err)
@@ -340,57 +376,119 @@ func TestDeliveryPageRetirementPausesAdmittedReader(t *testing.T) {
 	}
 }
 
-// TestDeliveryPageRetirementTicketBoundary is the capability boundary proof: a
-// ticket whose capability has expired but whose in-flight transfer bound has not
-// still refuses retirement, and retirement commits only after last_byte_by.
+// TestDeliveryPageRetirementRequiresAuthorityAndDerivedDeadline is the P1 fix for
+// the "empty ledger or a hardcoded two minutes is proof" hole:
+//
+//   - quiesce alone, with an EMPTY recorded ledger, is not retirement authority;
+//   - the authority row may not be written before quiesce;
+//   - the authority row may not claim a future transfer bound;
+//   - even with an empty ledger, retirement is refused until the DERIVED deadline
+//     (last legacy grant, removed origin, expired caches and verified transfer
+//     bound, plus the legacy grant window) is in the past by the database clock.
+//
+// It then commits, which proves the gate is a proof and not a wall.
+func TestDeliveryPageRetirementRequiresAuthorityAndDerivedDeadline(t *testing.T) {
+	pool := deliveryExemptionTestPool(t)
+	ctx := context.Background()
+	generation := repeatHex('d', 32)
+
+	// Authority before quiesce proves nothing about the cutover, so it is refused.
+	authority := func(transferBound string) error {
+		_, err := pool.Exec(ctx, `INSERT INTO r2_delivery_cutover_authority(
+ generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
+ legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,transfer_bound_at,approved_sha256)
+ VALUES($1,'test',clock_timestamp()-interval '10 minutes',repeat('a',64),clock_timestamp()-interval '10 minutes',
+   repeat('a',64),clock_timestamp()-interval '10 minutes',repeat('a',64),repeat('a',64),clock_timestamp()+$2::interval,repeat('a',64))`,
+			generation, transferBound)
+		return err
+	}
+	if err := authority("-1 second"); err == nil || !strings.Contains(err.Error(), "quiesce") {
+		t.Fatalf("cutover authority before quiesce was accepted: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: authority')`); err != nil {
+		t.Fatal(err)
+	}
+	// With an EMPTY recorded ledger and no authority, retirement is refused. This
+	// is the exact state a fabricated "no tickets, so it is drained" claim would
+	// see, and it must not be proof.
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,'test: empty ledger')`, generation); err == nil || !strings.Contains(err.Error(), "cutover authority") {
+		t.Fatalf("an empty ledger without authority retired the page: %v", err)
+	}
+	// A future transfer bound is not verified evidence.
+	if err := authority("10 minutes"); err == nil || !strings.Contains(err.Error(), "future") {
+		t.Fatalf("a future transfer bound was accepted as verified: %v", err)
+	}
+	// A bound one minute ago is admitted, and its DERIVED deadline (one minute ago
+	// plus the five-minute legacy grant window) is still in the future, so
+	// retirement is refused even with an empty ledger.
+	if err := authority("-1 minute"); err != nil {
+		t.Fatalf("a past verified bound was refused: %v", err)
+	}
+	var deadlineRemaining bool
+	if err := pool.QueryRow(ctx, `SELECT deadline_at>clock_timestamp() FROM r2_delivery_cutover_authority WHERE singleton`).Scan(&deadlineRemaining); err != nil || !deadlineRemaining {
+		t.Fatalf("derived deadline is not in the future: %v %v", deadlineRemaining, err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,'test: derived deadline')`, generation); err == nil || !strings.Contains(err.Error(), "deadline") {
+		t.Fatalf("retirement before the derived deadline retired the page: %v", err)
+	}
+	// The authority is bound to one generation: a different one is refused.
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,'test: other generation')`, repeatHex('e', 32)); err == nil || !strings.Contains(err.Error(), "generation") {
+		t.Fatalf("retirement for a generation other than the authority's was accepted: %v", err)
+	}
+}
+
+// TestDeliveryPageRetirementCommitsAfterDerivedDeadline proves the other side of
+// the same gate, in its own schema because the authority row is immutable and
+// singleton: an authority whose derived deadline is already past (its latest
+// bound ten minutes old) lets the same statement commit.
+func TestDeliveryPageRetirementCommitsAfterDerivedDeadline(t *testing.T) {
+	pool := deliveryExemptionTestPool(t)
+	ctx := context.Background()
+	generation := repeatHex('d', 32)
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: committed')`); err != nil {
+		t.Fatal(err)
+	}
+	writeCutoverAuthority(t, pool, generation)
+	var deadlineRemaining bool
+	if err := pool.QueryRow(ctx, `SELECT deadline_at>clock_timestamp() FROM r2_delivery_cutover_authority WHERE singleton`).Scan(&deadlineRemaining); err != nil || deadlineRemaining {
+		t.Fatalf("derived deadline should be in the past: %v %v", deadlineRemaining, err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,'test: committed')`, generation); err != nil {
+		t.Fatalf("retirement after the derived deadline was refused: %v", err)
+	}
+}
+
+// TestDeliveryPageRetirementTicketBoundary is the recorded-capability boundary:
+// while any tracked capability is unexpired, retirement is refused; once every
+// tracked capability has expired AND the authority's derived deadline has passed,
+// retirement commits. The transfer bound itself lives only in the authority:
+// there is no per-ticket fabrication.
 func TestDeliveryPageRetirementTicketBoundary(t *testing.T) {
 	pool := deliveryExemptionTestPool(t)
 	ctx := context.Background()
-	insert := func(label string, expires, lastByte string) error {
-		_, err := pool.Exec(ctx, `INSERT INTO r2_delivery_download_tickets(bucket,object_key,etag,size_bytes,object_path_sha256,expires_at,last_byte_by)
- VALUES('stoarama','original/x.mp4','e',5,repeat('a',64),clock_timestamp()+$1::interval,clock_timestamp()+$2::interval)`, expires, lastByte)
-		return err
-	}
-	// Capability expired, transfer bound still open (t1), and one whose whole
-	// capability is live (t2). Both are minted while the page still serves.
-	if err := insert("t1", "-30 seconds", "30 seconds"); err != nil {
+	generation := repeatHex('b', 32)
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_download_tickets(bucket,object_key,etag,size_bytes,object_path_sha256,expires_at)
+ VALUES('stoarama','original/x.mp4','e',5,repeat('a',64),clock_timestamp()+interval '5 minutes')`); err != nil {
 		t.Fatal(err)
 	}
-	if err := insert("t2", "5 minutes", "7 minutes"); err != nil {
-		t.Fatal(err)
-	}
-	// Arm retirement only after the capabilities exist, as the runbook does.
 	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: ticket boundary')`); err != nil {
 		t.Fatal(err)
 	}
 	// A capability minted after quiesce is refused by SQL itself.
-	if err := insert("t0", "5 minutes", "7 minutes"); err == nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_download_tickets(bucket,object_key,etag,size_bytes,object_path_sha256,expires_at)
+ VALUES('stoarama','original/y.mp4','e',5,repeat('a',64),clock_timestamp()+interval '5 minutes')`); err == nil {
 		t.Fatal("a capability was minted after quiesce")
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
- VALUES(repeat('b',32),'test: expired capability, live transfer')`); err == nil || !strings.Contains(err.Error(), "transferring") {
-		t.Fatalf("retirement ignored a live transfer bound: %v", err)
+	writeCutoverAuthority(t, pool, generation)
+	// Deadline passed, but a tracked capability is still live: refuse.
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,'test: live capability')`, generation); err == nil || !strings.Contains(err.Error(), "unexpired") {
+		t.Fatalf("retirement ignored a live recorded capability: %v", err)
 	}
-	// Age t1 out entirely (the expired-capability/expired-transfer case) and keep
-	// t2 fully live, so the refusal below is the live capability's alone.
-	if _, err := pool.Exec(ctx, `UPDATE r2_delivery_download_tickets SET expires_at=clock_timestamp()-interval '1 second',last_byte_by=clock_timestamp()-interval '1 second'
- WHERE id=(SELECT min(id) FROM r2_delivery_download_tickets)`); err != nil {
+	// Drain the recorded capability; the same statement now commits.
+	if _, err := pool.Exec(ctx, `UPDATE r2_delivery_download_tickets SET expires_at=clock_timestamp()-interval '1 second'`); err != nil {
 		t.Fatal(err)
 	}
-	var liveTransfer int64
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_delivery_download_tickets WHERE last_byte_by>clock_timestamp()`).Scan(&liveTransfer); err != nil || liveTransfer != 1 {
-		t.Fatalf("expected exactly the live t2 capability, got %d: %v", liveTransfer, err)
-	}
-	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
- VALUES(repeat('b',32),'test: live capability')`); err == nil || !strings.Contains(err.Error(), "transferring") {
-		t.Fatalf("retirement ignored a live capability: %v", err)
-	}
-	// Now drain everything and retire.
-	if _, err := pool.Exec(ctx, `UPDATE r2_delivery_download_tickets SET expires_at=clock_timestamp()-interval '1 second',last_byte_by=clock_timestamp()-interval '1 second'`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision)
- VALUES(repeat('b',32),'test: drained')`); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,'test: drained')`, generation); err != nil {
 		t.Fatalf("retirement after the capability drain was refused: %v", err)
 	}
 }

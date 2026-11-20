@@ -144,25 +144,24 @@ const deliveryPublicLock int64 = 7343226011104
 // deliveryTicketTTL is the capability lifetime the page has always handed out.
 const deliveryTicketTTL = 5 * time.Minute
 
-// deliveryTicketTransferTTL is how long after a capability's own expiry a
-// transfer it authorised may still be reading bytes. A provider does not cut a
-// transfer that has already started, so retirement waits for this too. It is
-// recorded per ticket as last_byte_by, and the retirement trigger refuses while
-// any is unexpired, measured on the database clock.
-const deliveryTicketTransferTTL = 2 * time.Minute
-
 // RecordPublicDeliveryTicket writes the capability row in one statement. 0225's
 // admission trigger takes the shared public lock and requires the page to be
 // serving, so the row and the capability it describes cannot be separated from
 // retirement: either the row commits before retirement's exclusive lock, and
 // retirement drains it, or retirement wins and this statement raises instead.
+//
+// It records only the capability's own expiry. It deliberately records NO
+// transfer bound: a provider does not cut an already-started transfer at presign
+// expiry, and a bound the server invented would be a guess, not evidence. The
+// authoritative end of any such transfer is the operator's cutover authority,
+// which retirement requires separately.
 func (p poolDeliveryGate) RecordPublicDeliveryTicket(ctx context.Context, object globalDeliveryObject, pathSHA string, ttl time.Duration) (bool, error) {
 	var id int64
-	err := p.pool.QueryRow(ctx, `INSERT INTO r2_delivery_download_tickets(bucket,object_key,etag,size_bytes,object_path_sha256,expires_at,last_byte_by)
- SELECT $1,$2,$3,$4,$5,clock_timestamp()+$6::interval,clock_timestamp()+$7::interval
+	err := p.pool.QueryRow(ctx, `INSERT INTO r2_delivery_download_tickets(bucket,object_key,etag,size_bytes,object_path_sha256,expires_at)
+ SELECT $1,$2,$3,$4,$5,clock_timestamp()+$6::interval
  WHERE r2_delivery_public_serving() RETURNING id`,
 		"stoarama", object.Key, strings.Trim(object.ETag, `"`), object.SizeBytes, pathSHA,
-		ttl.String(), (ttl + deliveryTicketTransferTTL).String()).Scan(&id)
+		ttl.String()).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -322,41 +321,57 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 	// any object read, so retirement cannot be bypassed by a warm cache or by
 	// pinning the generation that was serving.
 	if public {
-		retired, err := s.deliveryPageRetired(ctx)
+		gate, err := s.deliveryGate()
+		if err != nil {
+			return nil, err
+		}
+		retired, serving, err := gate.DeliveryServing(ctx)
 		if err != nil {
 			return nil, err
 		}
 		if retired {
 			return nil, errDeliveryPageRetired
 		}
-		gate, err := s.deliveryGate()
-		if err != nil {
-			return nil, err
-		}
-		_, serving, err := gate.DeliveryServing(ctx)
-		if err != nil {
-			return nil, err
-		}
 		if !serving {
 			return nil, errDeliveryPageNotServing
 		}
 	}
-	// While cleanup permits can be outstanding, serve the immutable reviewed
-	// public generation. A direct registry publication cannot introduce a new
-	// protected source midway through a separately approved deletion batch.
+	// Serve a warm cache entry without touching the pool at all.
+	if hit, found := s.cachedDeliveryRegistry(public, generation); found {
+		return hit, nil
+	}
+	// ONE transaction carries the cleanup fence, the public lock, the serving
+	// recheck under that lock, the object read AND the keep validation. The
+	// registry mutex is NOT held here and is NOT held across any of it, so a
+	// quiesce or retirement never waits behind a network read or a second pool
+	// connection this handler would otherwise need. It is taken only for the
+	// short publish and cache-read windows below.
+	var fence pgx.Tx
 	if public && s.pool != nil {
-		fence, err := s.pool.Begin(ctx)
-		if err != nil {
+		var err error
+		if fence, err = s.pool.Begin(ctx); err != nil {
 			return nil, errors.New("public cleanup fence unavailable")
 		}
-		defer fence.Rollback(ctx)
-		// Publication is one more shared public read: it takes the same public
-		// lock every reader and ticket takes, so arming and retirement serialize
-		// against it and cannot commit while a publication is between its
-		// serving check and its hold write.
+		defer fence.Rollback(context.Background())
 		if _, err = fence.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, deliveryPublicLock); err != nil {
 			return nil, errors.New("public publication fence unavailable")
 		}
+		// Recheck the serving state UNDER the shared lock: a quiesce or
+		// retirement that committed between the preflight above and this lock is
+		// seen now, so a cold load cannot begin serving after arming.
+		var retired, serving bool
+		if err = fence.QueryRow(ctx, `SELECT r2_delivery_page_retired(),r2_delivery_public_serving()`).Scan(&retired, &serving); err != nil {
+			return nil, errors.New("public delivery serving state unavailable")
+		}
+		if retired {
+			return nil, errDeliveryPageRetired
+		}
+		if !serving {
+			return nil, errDeliveryPageNotServing
+		}
+		// While cleanup permits can be outstanding, serve the immutable reviewed
+		// public generation. A direct registry publication cannot introduce a new
+		// protected source midway through a separately approved deletion batch.
 		if _, err = fence.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011101)`); err != nil {
 			return nil, errors.New("public cleanup fence unavailable")
 		}
@@ -373,19 +388,11 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 			generation = reviewed
 		}
 	}
-	s.globalDeliveryMu.Lock()
-	defer s.globalDeliveryMu.Unlock()
-	if public && generation != "" && s.publicGlobalDeliveryRegistry != nil && s.publicGlobalDeliveryRegistry.Generation == generation {
-		return s.publicGlobalDeliveryRegistry, nil
-	}
-	if public && generation != "" && s.publicPinnedDeliveryRegistry != nil && s.publicPinnedDeliveryRegistry.Generation == generation {
-		return s.publicPinnedDeliveryRegistry, nil
-	}
-	if public && generation == "" && s.publicGlobalDeliveryRegistry != nil && time.Since(s.publicGlobalDeliveryRegistryAt) < 15*time.Second {
-		return s.publicGlobalDeliveryRegistry, nil
-	}
-	if !public && s.globalDeliveryRegistry != nil && time.Since(s.globalDeliveryRegistryAt) < 15*time.Second {
-		return s.globalDeliveryRegistry, nil
+	// The cleanup fence may have substituted the reviewed generation, so check the
+	// warm cache once more for THAT generation before any object read. A pinned
+	// registry already loaded for the reviewed generation is served from memory.
+	if hit, found := s.cachedDeliveryRegistry(public, generation); found {
+		return hit, nil
 	}
 	store := s.globalDeliveryObjectStore()
 	if store == nil {
@@ -410,17 +417,19 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 	if err != nil {
 		return nil, errors.New("dataset registry changed")
 	}
-	defer body.Close()
-	bytes, err := io.ReadAll(io.LimitReader(body, head.SizeBytes+1))
-	if err != nil || int64(len(bytes)) != head.SizeBytes {
-		return nil, errors.New("dataset registry length differs")
-	}
-	bytes, err = decodeGlobalDeliveryRegistry(bytes)
+	bodyBytes, err := func() ([]byte, error) {
+		defer body.Close()
+		raw, err := io.ReadAll(io.LimitReader(body, head.SizeBytes+1))
+		if err != nil || int64(len(raw)) != head.SizeBytes {
+			return nil, errors.New("dataset registry length differs")
+		}
+		return decodeGlobalDeliveryRegistry(raw)
+	}()
 	if err != nil {
 		return nil, err
 	}
 	var result globalDeliveryRegistry
-	if err = json.Unmarshal(bytes, &result); err != nil {
+	if err = json.Unmarshal(bodyBytes, &result); err != nil {
 		return nil, errors.New("dataset registry unreadable")
 	}
 	if err = validateGlobalDeliveryRegistry(&result); err != nil {
@@ -446,23 +455,74 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 				return nil, err
 			}
 		}
-		if s.pool != nil {
-			if err := RequireDeliveryKeep(ctx, s.pool, keep); err != nil {
+		if fence != nil {
+			// Validate on the SAME transaction that holds the locks and the
+			// reader's place, never on a second pool acquire.
+			if err = RequireDeliveryKeep(ctx, fence, keep); err != nil {
+				return nil, err
+			}
+		} else if s.pool != nil {
+			if err = RequireDeliveryKeep(ctx, s.pool, keep); err != nil {
 				return nil, err
 			}
 		}
-		if generation != "" {
-			s.publicPinnedDeliveryRegistry = &result
-		} else {
-			s.publicGlobalDeliveryRegistry = &result
-			s.publicGlobalDeliveryRegistryAt = time.Now()
+		if fence != nil {
+			if err = fence.Commit(ctx); err != nil {
+				return nil, errors.New("public publication fence unavailable")
+			}
 		}
-	} else {
-		s.globalDeliveryRegistry = &result
-		s.globalDeliveryRegistryAt = time.Now()
 	}
+	// Publish under the mutex, which is taken only for these few assignments.
+	s.publishDeliveryRegistry(public, generation, &result)
 	return &result, nil
 }
+
+// cachedDeliveryRegistry returns a warm cache entry, holding the mutex only for
+// the pointer reads. A 15s current entry and every pinned generation are exact
+// and immutable, so they need no pool round trip.
+func (s *Server) cachedDeliveryRegistry(public bool, generation string) (*globalDeliveryRegistry, bool) {
+	s.globalDeliveryMu.Lock()
+	defer s.globalDeliveryMu.Unlock()
+	if public && generation != "" {
+		if r := s.publicGlobalDeliveryRegistry; r != nil && r.Generation == generation {
+			return r, true
+		}
+		if r := s.publicPinnedDeliveryRegistry; r != nil && r.Generation == generation {
+			return r, true
+		}
+		return nil, false
+	}
+	if public && generation == "" {
+		if r := s.publicGlobalDeliveryRegistry; r != nil && time.Since(s.publicGlobalDeliveryRegistryAt) < 15*time.Second {
+			return r, true
+		}
+		return nil, false
+	}
+	if !public {
+		if r := s.globalDeliveryRegistry; r != nil && time.Since(s.globalDeliveryRegistryAt) < 15*time.Second {
+			return r, true
+		}
+	}
+	return nil, false
+}
+
+// publishDeliveryRegistry stores a freshly loaded registry under the mutex.
+func (s *Server) publishDeliveryRegistry(public bool, generation string, result *globalDeliveryRegistry) {
+	s.globalDeliveryMu.Lock()
+	defer s.globalDeliveryMu.Unlock()
+	if !public {
+		s.globalDeliveryRegistry = result
+		s.globalDeliveryRegistryAt = time.Now()
+		return
+	}
+	if generation != "" {
+		s.publicPinnedDeliveryRegistry = result
+		return
+	}
+	s.publicGlobalDeliveryRegistry = result
+	s.publicGlobalDeliveryRegistryAt = time.Now()
+}
+
 func (s *Server) handleGlobalDeliveryPage(w http.ResponseWriter, r *http.Request) {
 	// Every public delivery response admits exactly one reader lease and holds it
 	// until its last socket write, so retirement cannot commit mid-response.

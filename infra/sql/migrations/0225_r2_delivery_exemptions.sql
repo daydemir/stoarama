@@ -50,10 +50,66 @@ CREATE TABLE r2_delivery_page_retirement (
 -- separate, non-destructive fact: the page is not retired yet, no exemption
 -- class is open, and the rollback window is documented as closed in
 -- docs/r2-inverse.md. The retirement trigger refuses to run without it.
+--
+-- A reason string proves nothing about the world outside this database, so the
+-- quiesce row itself carries no authority. It names the reviewed cutover
+-- evidence row below; that row, not this text, is what the retirement proof
+-- reads. Both are required, and neither can substitute for the other.
 CREATE TABLE r2_delivery_page_quiesce (
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
  reason text NOT NULL CHECK(reason<>''),
  armed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+-- The reviewed, immutable cutover evidence: the ONE place the facts the API
+-- cannot observe are recorded, and the only thing that lets a retirement be
+-- proved at all. Every field is a fact an operator established outside this
+-- database and pinned by digest; none of them is inferred from the API's own
+-- request traffic.
+--
+--   * generation is the exact serving registry generation being retired, so the
+--     authority is bound to one generation and cannot be reused for another;
+--   * legacy_grant_boundary_at is the LAST INSTANT a legacy origin could have
+--     handed out a five-minute signed URL. It is the exact expiry of the last
+--     grant the operator can still prove, and it must already be in the past;
+--   * legacy_signed_grant_sha256 pins the list of those grants;
+--   * legacy_origin_removed_at plus legacy_origin_evidence_sha256 pin that every
+--     legacy origin is out of traffic (off-host check, recorded);
+--   * cache_expired_at plus cache_evidence_sha256 pin that every edge/origin
+--     cache that could still answer for the retired page is known expired;
+--   * rollback_routing_sha256 pins the non-serving rollback routing, so there is
+--     no route back to a legacy origin after arming;
+--   * transfer_bound_at is the authoritatively verified end of every active
+--     transfer the operator can observe, direct-from-R2 included. When a bound
+--     is unproven this row simply cannot be written with a sound value, and the
+--     retirement gate stays closed. That is the intended outcome, not a bug:
+--     there is no provider-side byte clock here to fabricate one from.
+--
+-- approved_sha256 is the digest the operator reviews before the row exists: it
+-- covers every field above plus the generation, so the approval names the exact
+-- bytes of the evidence and not a paraphrase of them.
+CREATE TABLE r2_delivery_cutover_authority (
+ singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
+ generation text NOT NULL CHECK(generation ~ '^[a-f0-9]{32}$'),
+ decision text NOT NULL CHECK(decision<>''),
+ legacy_grant_boundary_at timestamptz NOT NULL,
+ legacy_signed_grant_sha256 text NOT NULL CHECK(legacy_signed_grant_sha256 ~ '^[a-f0-9]{64}$'),
+ legacy_origin_removed_at timestamptz NOT NULL,
+ legacy_origin_evidence_sha256 text NOT NULL CHECK(legacy_origin_evidence_sha256 ~ '^[a-f0-9]{64}$'),
+ cache_expired_at timestamptz NOT NULL,
+ cache_evidence_sha256 text NOT NULL CHECK(cache_evidence_sha256 ~ '^[a-f0-9]{64}$'),
+ rollback_routing_sha256 text NOT NULL CHECK(rollback_routing_sha256 ~ '^[a-f0-9]{64}$'),
+ transfer_bound_at timestamptz NOT NULL,
+ approved_sha256 text NOT NULL CHECK(approved_sha256 ~ '^[a-f0-9]{64}$'),
+ recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+ -- The derived retirement deadline is the latest instant any legacy grant or
+ -- verified active transfer can still be alive. It is computed here, once, from
+ -- those exact fields with a database-clock margin, and never from a constant in
+ -- the server: a hardcoded transfer bound would be a guess, and this table
+ -- refuses to hold one.
+ -- Computed ONCE by the admission trigger below from exactly those four facts, so
+ -- it cannot drift after the row exists and cannot be supplied by a caller.
+ deadline_at timestamptz NOT NULL
 );
 -- One admitted public response, from before its first byte to after its last
 -- socket write. A response records itself here before it reads a registry, a
@@ -75,11 +131,15 @@ CREATE INDEX r2_delivery_public_readers_live ON r2_delivery_public_readers(expir
 -- them instead of leaving presigned URLs live. A row is written in the same
 -- transaction, under the same lock, as the capability it describes, so a
 -- capability can never outlive its record. expires_at is the provider's own
--- capability expiry; last_byte_by adds the maximum in-flight transfer bound,
--- because a provider does not cut a transfer that already started when the
--- capability expires. Retirement refuses until last_byte_by has passed, measured
--- on the database clock, so it can never retire while a transfer may still be
--- reading bytes.
+-- capability expiry, and it is the ONLY bound this table asserts.
+--
+-- It deliberately does not invent a transfer bound. A provider does not cut a
+-- transfer that already started when the presign expires, so "expires_at plus
+-- two minutes" would be a guess, and a guess is not proof of a last byte. The
+-- authoritative end of any transfer that may still be reading is
+-- r2_delivery_cutover_authority.transfer_bound_at, established by the operator
+-- outside this database; retirement requires BOTH every capability here to be
+-- expired AND that verified bound to have passed.
 CREATE TABLE r2_delivery_download_tickets (
  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
  bucket text NOT NULL,
@@ -88,12 +148,9 @@ CREATE TABLE r2_delivery_download_tickets (
  size_bytes bigint NOT NULL CHECK(size_bytes>0),
  object_path_sha256 text NOT NULL CHECK(object_path_sha256 ~ '^[a-f0-9]{64}$'),
  issued_at timestamptz NOT NULL DEFAULT clock_timestamp(),
- expires_at timestamptz NOT NULL,
- last_byte_by timestamptz NOT NULL,
- CHECK(last_byte_by >= expires_at)
+ expires_at timestamptz NOT NULL
 );
 CREATE INDEX r2_delivery_download_tickets_live ON r2_delivery_download_tickets(expires_at);
-CREATE INDEX r2_delivery_download_tickets_transferring ON r2_delivery_download_tickets(last_byte_by);
 
 -- The owner approval each roster was approved for: one append-only row per
 -- ROSTER DIGEST, recorded by its own command step before any seeding. The digest
@@ -131,7 +188,7 @@ BEGIN
  RAISE EXCEPTION 'R2 delivery exemptions, approvals, the quiesce state and the page retirement state are append-only';
 END $$;
 DO $$ DECLARE t text; BEGIN
- FOREACH t IN ARRAY ARRAY['r2_delivery_exemptions','r2_delivery_exemption_approvals','r2_delivery_page_quiesce','r2_delivery_page_retirement'] LOOP
+ FOREACH t IN ARRAY ARRAY['r2_delivery_exemptions','r2_delivery_exemption_approvals','r2_delivery_page_quiesce','r2_delivery_page_retirement','r2_delivery_cutover_authority'] LOOP
   EXECUTE format('CREATE TRIGGER %s_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_exemption_immutable()',t,t);
   EXECUTE format('CREATE TRIGGER %s_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_delivery_exemption_immutable()',t,t);
   EXECUTE format('ALTER TABLE %I ENABLE ALWAYS TRIGGER %s_immutable',t,t);
@@ -272,16 +329,30 @@ CREATE TRIGGER r2_delivery_download_ticket_admission BEFORE INSERT ON r2_deliver
 ALTER TABLE r2_delivery_download_tickets ENABLE ALWAYS TRIGGER r2_delivery_download_ticket_admission;
 
 -- Retirement is the destructive predicate and it is proved HERE, in SQL, under
--- the exclusive public lock, never by a caller's claim:
---   1. the page must be quiesced (the staging fact committed first);
---   2. no admitted public reader lease may be unexpired (every response that was
---      streaming has finished, judged on the database clock);
---   3. no download capability may still be transferring (its last_byte_by has
---      passed), so a presigned URL cannot outlive the page.
--- The INSERT itself is refused otherwise, so a stale, older or hand-run binary
--- cannot retire the page early. Retiring twice is refused by the singleton key.
+-- the exclusive public lock, never by a caller's claim. It needs ALL of:
+--
+--   1. the staging quiesce row, so the destructive step is always a second,
+--      deliberate step after arming;
+--   2. a cutover authority row for the generation being retired, whose derived
+--      deadline_at (later than the last possible legacy grant, the removed
+--      legacy origin, the expired caches and the verified transfer bound, each
+--      plus a margin) is already in the past by the DATABASE clock. This holds
+--      even when every ledger below is empty: an untracked legacy five-minute
+--      URL is exactly the case an empty grant ledger would hide;
+--   3. zero unexpired admitted public reader leases;
+--   4. zero unexpired recorded download capabilities;
+--   5. zero pending R2 retirement reservations or nonraw intents whose object is
+--      a page key, so a derivative release cannot outrun this gate;
+--   6. the cutover authority's generation equals the generation being retired.
+--
+-- A missing authority row means the operator has NOT established the external
+-- facts (legacy grants drained, origins removed, caches expired, transfers
+-- ended). The gate then refuses, which deliberately leaves confident_repair,
+-- in_window and every derivative release closed. That is the correct outcome
+-- when authoritative drain cannot be proved, not a condition to route around.
 CREATE FUNCTION guard_r2_delivery_page_retirement() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE live_readers bigint; live_capabilities bigint; armed boolean;
+ a r2_delivery_cutover_authority; page_derivatives bigint;
 BEGIN
  IF current_setting('transaction_isolation')<>'read committed' THEN
   RAISE EXCEPTION 'page retirement requires READ COMMITTED' USING ERRCODE='55000';
@@ -290,21 +361,80 @@ BEGIN
  SELECT EXISTS(SELECT 1 FROM r2_delivery_page_quiesce) INTO armed;
  IF NOT armed THEN
   RAISE EXCEPTION 'page retirement requires the committed quiesce state'
-   USING ERRCODE='55000', HINT='run r2-inverse page-quiesce first and let admitted readers drain';
+   USING ERRCODE='55000', HINT='run r2-inverse page-quiesce first';
+ END IF;
+ SELECT * INTO a FROM r2_delivery_cutover_authority WHERE singleton;
+ IF NOT FOUND THEN
+  RAISE EXCEPTION 'page retirement requires reviewed cutover authority'
+   USING ERRCODE='55000', HINT='no authority row: legacy grants, origins, caches and transfers are unproven, so retirement (and every derivative release) stays closed';
+ END IF;
+ IF a.generation<>NEW.generation THEN
+  RAISE EXCEPTION 'cutover authority names generation %, not the retired %', a.generation, NEW.generation
+   USING ERRCODE='55000';
+ END IF;
+ -- The derived deadline, on the database clock, with no server-side constant.
+ IF clock_timestamp()<=a.deadline_at THEN
+  RAISE EXCEPTION 'refusing page retirement: the verified drain deadline % has not passed', a.deadline_at;
  END IF;
  SELECT count(*) INTO live_readers FROM r2_delivery_public_readers WHERE expires_at>clock_timestamp();
  IF live_readers<>0 THEN
   RAISE EXCEPTION 'refusing page retirement: % admitted public readers are still unexpired', live_readers;
  END IF;
- SELECT count(*) INTO live_capabilities FROM r2_delivery_download_tickets WHERE last_byte_by>clock_timestamp();
+ SELECT count(*) INTO live_capabilities FROM r2_delivery_download_tickets WHERE expires_at>clock_timestamp();
  IF live_capabilities<>0 THEN
-  RAISE EXCEPTION 'refusing page retirement: % download capabilities may still be transferring', live_capabilities;
+  RAISE EXCEPTION 'refusing page retirement: % download capabilities are still unexpired', live_capabilities;
+ END IF;
+ -- A pending retirement of a page key is a release this gate must not outrun.
+ SELECT count(*) INTO page_derivatives FROM (
+  SELECT 1 FROM r2_retirement_reservations r
+   WHERE NOT EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.bucket=r.bucket AND x.object_key=r.object_key)
+   AND EXISTS(SELECT 1 FROM delivery_keep_holds h WHERE h.bucket=r.bucket AND h.object_key=r.object_key)
+  UNION ALL
+  SELECT 1 FROM r2_nonraw_intents i
+   WHERE NOT EXISTS(SELECT 1 FROM r2_nonraw_events e WHERE e.bucket=i.bucket AND e.object_key=i.object_key AND e.event='absent')
+   AND EXISTS(SELECT 1 FROM delivery_keep_holds h WHERE h.bucket=i.bucket AND h.object_key=i.object_key)
+ ) pending;
+ IF page_derivatives<>0 THEN
+  RAISE EXCEPTION 'refusing page retirement: % page keys have a pending derivative retirement', page_derivatives;
  END IF;
  RETURN NEW;
 END $$;
 CREATE TRIGGER r2_delivery_page_retirement_proof BEFORE INSERT ON r2_delivery_page_retirement
  FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_page_retirement();
 ALTER TABLE r2_delivery_page_retirement ENABLE ALWAYS TRIGGER r2_delivery_page_retirement_proof;
+
+-- The authority row is admitted only in the quiesced state, and only with
+-- self-consistent evidence. It cannot name a generation other than the one the
+-- public page is serving (the quiesce row does not carry it, so this checks the
+-- one serving registry generation the operator already removed), and its
+-- transfer_bound_at may not be after recorded_at: the verified end of a transfer
+-- cannot be a time in the future when the evidence is written. Both refusals are
+-- SQL, so a caller's paraphrase cannot satisfy them.
+CREATE FUNCTION guard_r2_delivery_cutover_authority() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'cutover authority requires READ COMMITTED' USING ERRCODE='55000';
+ END IF;
+ PERFORM pg_advisory_xact_lock(r2_delivery_public_lock());
+ IF NOT EXISTS(SELECT 1 FROM r2_delivery_page_quiesce) THEN
+  RAISE EXCEPTION 'cutover authority requires the committed quiesce state'
+   USING ERRCODE='55000', HINT='arm the page first; authority recorded before arming proves nothing about the cutover';
+ END IF;
+ IF NEW.transfer_bound_at > clock_timestamp() THEN
+  RAISE EXCEPTION 'verified transfer bound % is in the future; it is not verified evidence', NEW.transfer_bound_at;
+ END IF;
+ IF NEW.legacy_origin_removed_at > clock_timestamp() OR NEW.cache_expired_at > clock_timestamp() THEN
+  RAISE EXCEPTION 'legacy origin removal and cache expiry must already have happened';
+ END IF;
+ -- Derived here, once, from the four on-record facts plus the five-minute legacy
+ -- grant window. A caller-supplied deadline is overwritten, never trusted.
+ NEW.deadline_at := greatest(NEW.legacy_grant_boundary_at, NEW.legacy_origin_removed_at,
+  NEW.cache_expired_at, NEW.transfer_bound_at) + interval '5 minutes';
+ RETURN NEW;
+END $$;
+CREATE TRIGGER r2_delivery_cutover_authority_admission BEFORE INSERT ON r2_delivery_cutover_authority
+ FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_cutover_authority();
+ALTER TABLE r2_delivery_cutover_authority ENABLE ALWAYS TRIGGER r2_delivery_cutover_authority_admission;
 
 -- True only for an exempt exact page key whose class gate is open now. A class
 -- without a gate branch yields NULL and stays held.
@@ -363,12 +493,31 @@ CREATE OR REPLACE FUNCTION guard_r2_nonraw_output_identity() RETURNS trigger LAN
  IF TG_OP='DELETE' THEN RETURN OLD; END IF; RETURN NEW;
 END $$;
 
--- The key-level live veto every nonraw kind shares: an incident, a page key
--- that is not exempt now, a receipt, an unverified or blocked COPY, or another
--- retirement of the same key.
-CREATE FUNCTION r2_nonraw_key_held(p_bucket text, p_key text, p_kind text, p_id bigint) RETURNS boolean LANGUAGE sql STABLE AS $$
+-- The key-level live veto every nonraw kind shares. It is deliberately its own
+-- function rather than a wider predicate in the batch statement, so the page
+-- hold can be lifted by exactly one review-approved exemption while every other
+-- protection stays.
+--
+-- Two families are named separately:
+--   * the PAGE hold on the exact key (delivery_keep_holds), which only an open
+--     exemption whose class gate is open lifts;
+--   * every OTHER protection: incident roster, receipts, an unverified or
+--     blocked COPY, another lane's intent, another retirement, a stitch input
+--     hold and the owner keep prefix.
+-- Plus the collated output's OWN NAS reservation and its own pending cleanup
+-- hold or incident source. The reserved-file view and incident-source view are
+-- keyed by the OUTPUT id for a collated row, not only by its RAW source ids, so a
+-- pending NAS retirement of this exact output refuses it here rather than only in
+-- the batch statement.
+-- Every protection EXCEPT the page hold. This is the one place a page hold may be
+-- lifted, and only because the seed is deciding whether to exempt exactly that
+-- key; every other term is byte-for-byte the same function, so the seed can
+-- never see a weaker answer than the wire for a non-page reason. In particular
+-- the output's own NAS reservation, pending cleanup hold and incident source
+-- stay, and a reserved output is refused at validate and at approve.
+CREATE FUNCTION r2_nonraw_key_other_held(p_bucket text, p_key text, p_kind text, p_id bigint) RETURNS boolean LANGUAGE sql STABLE AS $$
  SELECT EXISTS(SELECT 1 FROM nas_cleanup_incident_roster i WHERE i.bucket=p_bucket AND i.object_key=p_key)
-  OR EXISTS(SELECT 1 FROM delivery_keep_holds k WHERE k.bucket=p_bucket AND k.object_key=p_key AND NOT r2_delivery_exempt(p_bucket,p_key))
+  OR (p_kind='collated' AND EXISTS(SELECT 1 FROM nas_cleanup_incident_sources s WHERE s.clip_id=p_id))
   OR EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.bucket=p_bucket AND x.object_key=p_key)
   OR EXISTS(SELECT 1 FROM nas_r2_copy_items ci WHERE (ci.state<>'verified' OR ci.blocked_reason<>'')
     AND ci.item->>'bucket'=p_bucket AND ci.item->>'object_key'=p_key)
@@ -378,22 +527,16 @@ CREATE FUNCTION r2_nonraw_key_held(p_bucket text, p_key text, p_kind text, p_id 
   OR EXISTS(SELECT 1 FROM r2_retirement_reservations rv WHERE rv.bucket=p_bucket AND rv.object_key=p_key AND NOT (rv.kind=p_kind AND rv.source_id=p_id))
   OR EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds sh WHERE sh.bucket=p_bucket AND sh.object_key=p_key AND sh.released_at IS NULL)
   OR r2_owner_keep_held(p_bucket,p_key)
+  OR (p_kind='collated' AND EXISTS(SELECT 1 FROM nas_cleanup_r2_reserved_files f
+    WHERE f.kind='collated' AND f.source_id=p_id))
+$$;
+CREATE FUNCTION r2_nonraw_key_held_except_page(p_bucket text, p_key text, p_kind text, p_id bigint) RETURNS boolean LANGUAGE sql STABLE AS $$
+ SELECT r2_nonraw_key_other_held(p_bucket,p_key,p_kind,p_id)
 $$;
 
--- The same veto without its page-key term, for the seed's own decision about a
--- key it is about to exempt. Every OTHER hold is unchanged, so the seed can never
--- admit a key the execution-time classifier would refuse for a non-page reason.
-CREATE FUNCTION r2_nonraw_key_held_except_page(p_bucket text, p_key text, p_kind text, p_id bigint) RETURNS boolean LANGUAGE sql STABLE AS $$
- SELECT EXISTS(SELECT 1 FROM nas_cleanup_incident_roster i WHERE i.bucket=p_bucket AND i.object_key=p_key)
-  OR EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.bucket=p_bucket AND x.object_key=p_key)
-  OR EXISTS(SELECT 1 FROM nas_r2_copy_items ci WHERE (ci.state<>'verified' OR ci.blocked_reason<>'')
-    AND ci.item->>'bucket'=p_bucket AND ci.item->>'object_key'=p_key)
-  OR EXISTS(SELECT 1 FROM r2_nonraw_intents ni WHERE ni.bucket=p_bucket AND ni.object_key=p_key AND NOT (ni.kind=p_kind AND ni.source_id=p_id))
-  OR EXISTS(SELECT 1 FROM r2_inverse_intents ri WHERE ri.bucket=p_bucket AND ri.object_key=p_key)
-  OR EXISTS(SELECT 1 FROM r2_keep28_intents ki WHERE ki.bucket=p_bucket AND ki.object_key=p_key)
-  OR EXISTS(SELECT 1 FROM r2_retirement_reservations rv WHERE rv.bucket=p_bucket AND rv.object_key=p_key AND NOT (rv.kind=p_kind AND rv.source_id=p_id))
-  OR EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds sh WHERE sh.bucket=p_bucket AND sh.object_key=p_key AND sh.released_at IS NULL)
-  OR r2_owner_keep_held(p_bucket,p_key)
+CREATE FUNCTION r2_nonraw_key_held(p_bucket text, p_key text, p_kind text, p_id bigint) RETURNS boolean LANGUAGE sql STABLE AS $$
+ SELECT EXISTS(SELECT 1 FROM delivery_keep_holds k WHERE k.bucket=p_bucket AND k.object_key=p_key AND NOT r2_delivery_exempt(p_bucket,p_key))
+  OR r2_nonraw_key_other_held(p_bucket,p_key,p_kind,p_id)
 $$;
 
 -- 0211's nonraw ledger predates the owner keep (0220) and stitch input (0217)

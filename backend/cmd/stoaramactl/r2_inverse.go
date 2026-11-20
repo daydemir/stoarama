@@ -664,6 +664,10 @@ func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 		runR2InverseApprove(ctx, cfg, args[1:])
 		return
 	}
+	if len(args) > 0 && args[0] == "page-cutover" {
+		runR2InversePageCutover(ctx, cfg, args[1:])
+		return
+	}
 	if len(args) > 0 && args[0] == "page-quiesce" {
 		runR2InversePageQuiesce(ctx, cfg, args[1:])
 		return

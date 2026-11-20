@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/api"
 	"github.com/daydemir/stoarama/backend/internal/config"
@@ -222,7 +223,17 @@ type deliveryExemptionApproval struct {
 // recordDeliveryExemptionApproval records the owner's approval for one roster
 // digest under exactly one class. It is a separate step from seeding: seeding
 // consumes an approval, it never creates one.
-func recordDeliveryExemptionApproval(ctx context.Context, pool *pgxpool.Pool, class deliveryExemptionClass, rosterSHA, decision string) (deliveryExemptionApproval, error) {
+//
+// It does NOT trust the caller that the roster already passed validation. When
+// the roster content is supplied, the approval re-runs the SAME decision seeding
+// runs, in the approval's own transaction, and only then inserts the digest. That
+// makes "validated by the same exact class and roster bytes against the same
+// catalog identities, atomically with the approval" true by construction: there
+// is no window in which the catalog may have changed between a procedural check
+// and the recorded digest, and no way to record an approval for a roster the
+// classifier would refuse. A digest-only approval is refused: a digest is not
+// evidence, only its bytes are.
+func recordDeliveryExemptionApproval(ctx context.Context, pool *pgxpool.Pool, class deliveryExemptionClass, rosterSHA, decision string, rows []deliveryExemptionRow, picks r2RetirePicks) (deliveryExemptionApproval, error) {
 	var out deliveryExemptionApproval
 	out.Class, out.RosterSHA, out.Decision = class, rosterSHA, decision
 	if _, ok := deliveryExemptionDecisions[class]; !ok {
@@ -234,12 +245,26 @@ func recordDeliveryExemptionApproval(ctx context.Context, pool *pgxpool.Pool, cl
 	if strings.TrimSpace(decision) == "" {
 		return out, errors.New("an approval needs the owner's decision text")
 	}
-	err := pool.QueryRow(ctx, `INSERT INTO r2_delivery_exemption_approvals(class,roster_sha256,decision)
+	if len(rows) == 0 {
+		return out, errors.New("an approval needs the exact roster bytes; a digest alone is not evidence")
+	}
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return out, err
+	}
+	defer tx.Rollback(context.Background())
+	// The approval and the proof share one transaction: the catalog identities
+	// validated are the ones the digest is recorded against, and a refusal here
+	// records nothing.
+	if _, _, _, _, err = checkDeliveryExemptionRoster(ctx, tx, class, rows, picks); err != nil {
+		return out, fmt.Errorf("roster digest %s does not pass its own class validation, so it is not approved: %w", rosterSHA, err)
+	}
+	err = tx.QueryRow(ctx, `INSERT INTO r2_delivery_exemption_approvals(class,roster_sha256,decision)
  VALUES($1::r2_delivery_exemption_class,$2,$3) RETURNING id,created_at::text`, string(class), rosterSHA, decision).Scan(&out.ID, &out.CreatedAt)
 	if err != nil {
 		return out, fmt.Errorf("roster digest %s cannot be approved for %s: %w", rosterSHA, class, err)
 	}
-	return out, nil
+	return out, tx.Commit(ctx)
 }
 
 // seedDeliveryExemptions admits one class from a pinned roster in a single READ
@@ -404,22 +429,45 @@ func validateDeliveryExemptions(ctx context.Context, pool *pgxpool.Pool, class d
 	return len(rows), tx.Rollback(ctx)
 }
 
-// runR2InverseApprove records the owner's approval for one roster digest, under
-// exactly one class, before seeding. It is deliberately its own step: an approval
+// runR2InverseApprove records the owner's approval for one roster, under exactly
+// one class, before seeding. It is deliberately its own step: an approval
 // carries the owner's decision text and is written by a human decision, whereas
 // seeding may only consume it.
+//
+// It re-validates the exact roster bytes it is given against the same class and
+// catalog identities in the approval's own transaction. It cannot record a digest
+// for a roster the validator would refuse, and it cannot record a digest without
+// its bytes, so a procedural "I validated it earlier" claim is not authority.
 func runR2InverseApprove(ctx context.Context, cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("r2-inverse approve", flag.ExitOnError)
 	className := fs.String("class", "", "outside_window, confident_repair or in_window")
-	rosterSHA := fs.String("roster-sha256", "", "the exact roster digest being approved")
+	roster := fs.String("roster", "", "pinned JSONL roster whose bytes are approved")
+	rosterSHA := fs.String("expected-roster-sha256", "", "the exact roster digest being approved")
+	picksPath := fs.String("picks", "", "owner picks")
+	picksSHA := fs.String("expected-picks-sha256", "", "approved owner picks digest")
 	decision := fs.String("decision", "", "the owner's decision text for this roster")
-	const usage = "usage: stoaramactl r2-inverse approve --class CLASS --roster-sha256 HEX --decision TEXT"
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *decision == "" {
+	const usage = "usage: stoaramactl r2-inverse approve --class CLASS --roster FILE --expected-roster-sha256 HEX --picks FILE --expected-picks-sha256 HEX --decision TEXT"
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *roster == "" || *picksPath == "" || *decision == "" {
 		log.Fatal(usage)
+	}
+	class := deliveryExemptionClass(*className)
+	if _, ok := deliveryExemptionDecisions[class]; !ok {
+		log.Fatal(usage)
+	}
+	rows, err := readDeliveryExemptionRoster(*roster, *rosterSHA)
+	if err != nil {
+		log.Fatal(err)
+	}
+	picks, err := loadR2RetirePicks(*picksPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if picks.SHA256 != *picksSHA {
+		log.Fatal("owner picks differ from the approved digest")
 	}
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
-	approval, err := recordDeliveryExemptionApproval(ctx, pool, deliveryExemptionClass(*className), *rosterSHA, *decision)
+	approval, err := recordDeliveryExemptionApproval(ctx, pool, class, *rosterSHA, *decision, rows, picks)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -521,22 +569,33 @@ func retireDeliveryPage(ctx context.Context, tx pgx.Tx, generation, decision str
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(r2_delivery_public_lock())`); err != nil {
 		return "", err
 	}
-	// Evidence for the operator: the SQL trigger is the authority, but its refusal
-	// is clearer when the counts are reported first. Neither count can retire.
-	var armed, liveReaders, liveTickets int64
+	// Read the same proof the SQL trigger reads, so the operator sees WHY before
+	// the trigger's exception. These counts are diagnostics, never authority: the
+	// trigger alone decides, and it requires the cutover authority and its derived
+	// deadline even when every count below is zero.
+	var armed, liveReaders, liveTickets, hasAuthority, deadlinePassed int64
 	if err := tx.QueryRow(ctx, `SELECT (SELECT count(*) FROM r2_delivery_page_quiesce),
  (SELECT count(*) FROM r2_delivery_public_readers WHERE expires_at>clock_timestamp()),
- (SELECT count(*) FROM r2_delivery_download_tickets WHERE last_byte_by>clock_timestamp())`).Scan(&armed, &liveReaders, &liveTickets); err != nil {
+ (SELECT count(*) FROM r2_delivery_download_tickets WHERE expires_at>clock_timestamp()),
+ (SELECT count(*) FROM r2_delivery_cutover_authority WHERE singleton),
+ (SELECT count(*) FROM r2_delivery_cutover_authority WHERE singleton AND clock_timestamp()>deadline_at)`).
+		Scan(&armed, &liveReaders, &liveTickets, &hasAuthority, &deadlinePassed); err != nil {
 		return "", err
 	}
 	if armed == 0 {
-		return "", errors.New("refusing to retire the page: it is not quiesced; run r2-inverse page-quiesce and let admitted readers drain")
+		return "", errors.New("refusing to retire the page: it is not quiesced; run r2-inverse page-quiesce first")
+	}
+	if hasAuthority == 0 {
+		return "", errors.New("refusing to retire the page: no reviewed cutover authority; run r2-inverse page-cutover after proving the legacy origins gone, the caches expired and the transfers ended")
+	}
+	if deadlinePassed == 0 {
+		return "", errors.New("refusing to retire the page: the cutover authority's verified drain deadline has not passed yet")
 	}
 	if liveReaders != 0 {
 		return "", fmt.Errorf("refusing to retire the page while %d admitted public readers are still unexpired; retry after their leases expire", liveReaders)
 	}
 	if liveTickets != 0 {
-		return "", fmt.Errorf("refusing to retire the page while %d download capabilities may still be transferring; retry after their last-byte bound", liveTickets)
+		return "", fmt.Errorf("refusing to retire the page while %d download capabilities are still unexpired; retry after their expiry", liveTickets)
 	}
 	var at string
 	if err := tx.QueryRow(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,$2) RETURNING retired_at::text`,
@@ -573,6 +632,111 @@ func quiesceDeliveryPage(ctx context.Context, tx pgx.Tx, reason string) (string,
 		return "", errors.New("the quiesce row did not take effect; refusing to report the page armed")
 	}
 	return at, nil
+}
+
+// deliveryCutoverEvidence is the reviewed external cutover record an operator
+// establishes outside this database. Every field is a fact, not a claim derived
+// from the API's own traffic, and the whole record is pinned by approved_sha256
+// so the approval names exact bytes.
+type deliveryCutoverEvidence struct {
+	Generation              string    `json:"generation"`
+	Decision                string    `json:"decision"`
+	LegacyGrantBoundaryAt   time.Time `json:"legacy_grant_boundary_at"`
+	LegacySignedGrantSHA256 string    `json:"legacy_signed_grant_sha256"`
+	LegacyOriginRemovedAt   time.Time `json:"legacy_origin_removed_at"`
+	LegacyOriginEvidenceSHA string    `json:"legacy_origin_evidence_sha256"`
+	CacheExpiredAt          time.Time `json:"cache_expired_at"`
+	CacheEvidenceSHA256     string    `json:"cache_evidence_sha256"`
+	RollbackRoutingSHA256   string    `json:"rollback_routing_sha256"`
+	TransferBoundAt         time.Time `json:"transfer_bound_at"`
+}
+
+// canonical is the exact byte sequence approved_sha256 covers: sorted keys,
+// RFC3339 UTC timestamps. It is what the operator reviews and pins.
+func (e deliveryCutoverEvidence) canonical() ([]byte, error) {
+	type doc struct {
+		Generation              string `json:"generation"`
+		Decision                string `json:"decision"`
+		LegacyGrantBoundaryAt   string `json:"legacy_grant_boundary_at"`
+		LegacySignedGrantSHA256 string `json:"legacy_signed_grant_sha256"`
+		LegacyOriginRemovedAt   string `json:"legacy_origin_removed_at"`
+		LegacyOriginEvidenceSHA string `json:"legacy_origin_evidence_sha256"`
+		CacheExpiredAt          string `json:"cache_expired_at"`
+		CacheEvidenceSHA256     string `json:"cache_evidence_sha256"`
+		RollbackRoutingSHA256   string `json:"rollback_routing_sha256"`
+		TransferBoundAt         string `json:"transfer_bound_at"`
+	}
+	return json.Marshal(doc{e.Generation, e.Decision,
+		e.LegacyGrantBoundaryAt.UTC().Format(time.RFC3339), e.LegacySignedGrantSHA256,
+		e.LegacyOriginRemovedAt.UTC().Format(time.RFC3339), e.LegacyOriginEvidenceSHA,
+		e.CacheExpiredAt.UTC().Format(time.RFC3339), e.CacheEvidenceSHA256,
+		e.RollbackRoutingSHA256, e.TransferBoundAt.UTC().Format(time.RFC3339)})
+}
+
+// recordDeliveryCutover writes the reviewed cutover authority for one generation,
+// with its digest checked against the approval. It refuses an incomplete record,
+// a future bound (a transfer cannot have ended after the evidence was written),
+// or any field whose digest does not match the approved bytes. The derived
+// deadline is computed by SQL, not here.
+func recordDeliveryCutover(ctx context.Context, pool *pgxpool.Pool, e deliveryCutoverEvidence, approvedSHA string) (map[string]any, error) {
+	if !r2RetireLowerHex32(e.Generation) || strings.TrimSpace(e.Decision) == "" {
+		return nil, errors.New("cutover authority needs the serving generation and the owner decision")
+	}
+	for _, h := range []string{e.LegacySignedGrantSHA256, e.LegacyOriginEvidenceSHA, e.CacheEvidenceSHA256, e.RollbackRoutingSHA256} {
+		if !r2RetireLowerHex64(h) {
+			return nil, errors.New("cutover authority needs a 64-hex digest for every evidence field")
+		}
+	}
+	canonical, err := e.canonical()
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(canonical)
+	if !r2RetireLowerHex64(approvedSHA) || hex.EncodeToString(sum[:]) != approvedSHA {
+		return nil, errors.New("cutover evidence differs from its approved digest; pin the exact bytes the operator reviewed")
+	}
+	if e.TransferBoundAt.After(time.Now().UTC()) || e.LegacyOriginRemovedAt.After(time.Now().UTC()) || e.CacheExpiredAt.After(time.Now().UTC()) {
+		return nil, errors.New("legacy grant, origin, cache and transfer facts must already be in the past")
+	}
+	var at, deadline string
+	err = pool.QueryRow(ctx, `INSERT INTO r2_delivery_cutover_authority(
+ generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
+ legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,transfer_bound_at,approved_sha256,deadline_at)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'1970-01-01T00:00:00Z')
+ RETURNING recorded_at::text,deadline_at::text`,
+		e.Generation, e.Decision, e.LegacyGrantBoundaryAt, e.LegacySignedGrantSHA256,
+		e.LegacyOriginRemovedAt, e.LegacyOriginEvidenceSHA, e.CacheExpiredAt,
+		e.CacheEvidenceSHA256, e.RollbackRoutingSHA256, e.TransferBoundAt, approvedSHA).Scan(&at, &deadline)
+	if err != nil {
+		return nil, fmt.Errorf("cutover authority refused: %w", err)
+	}
+	return map[string]any{"recorded_at": at, "deadline_at": deadline, "approved_sha256": approvedSHA, "generation": e.Generation}, nil
+}
+
+func runR2InversePageCutover(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("r2-inverse page-cutover", flag.ExitOnError)
+	evidencePath := fs.String("evidence", "", "reviewed cutover evidence JSON")
+	evidenceSHA := fs.String("expected-evidence-sha256", "", "the approved canonical evidence digest")
+	const usage = "usage: stoaramactl r2-inverse page-cutover --evidence FILE --expected-evidence-sha256 HEX (record reviewed cutover authority; run after page-quiesce)"
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *evidencePath == "" || !r2RetireLowerHex64(*evidenceSHA) {
+		log.Fatal(usage)
+	}
+	raw, err := os.ReadFile(*evidencePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var e deliveryCutoverEvidence
+	if err = json.Unmarshal(raw, &e); err != nil {
+		log.Fatal(err)
+	}
+	pool := mustOpenPool(ctx, cfg)
+	defer pool.Close()
+	out, err := recordDeliveryCutover(ctx, pool, e, *evidenceSHA)
+	if err != nil {
+		log.Fatal(err)
+	}
+	data, _ := json.Marshal(out)
+	fmt.Println(string(data))
 }
 
 // runR2InversePageQuiesce arms retirement. It is a separate, deliberate step so
