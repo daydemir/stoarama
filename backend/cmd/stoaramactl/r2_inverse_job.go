@@ -85,8 +85,10 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane
 // inverseJobApplyOptions binds the job's apply steps to the digest the
 // partition step returned, never one re-derived from disk: the existing
 // apply-time hash check then rejects a partition file changed in between.
+// Batches of one job also share the skip set, so a key skipped for a live
+// stitch hold is not reselected by every later batch.
 func inverseJobApplyOptions(f inverseJobFlags, lane inverseLane, partition, digest string) (inverseApplyOptions, error) {
-	o := inverseApplyOptions{Lane: lane, Manifest: filepath.Join(partition, "partition.jsonl"), Summary: filepath.Join(partition, "summary.json"), Picks: f.picks, Ledger: filepath.Join(f.work, "ledger.jsonl"), Workers: f.workers, MaxItems: f.items, MaxBytes: f.maxBytes, Budget24h: f.budget24h, ManifestSHA: digest}
+	o := inverseApplyOptions{Lane: lane, Manifest: filepath.Join(partition, "partition.jsonl"), Summary: filepath.Join(partition, "summary.json"), Picks: f.picks, Ledger: filepath.Join(f.work, "ledger.jsonl"), Workers: f.workers, MaxItems: f.items, MaxBytes: f.maxBytes, Budget24h: f.budget24h, ManifestSHA: digest, skipped: &inverseSkipSet{}}
 	var err error
 	if o.SummarySHA, err = inverseFileSHA(o.Summary); err != nil {
 		return o, err
@@ -136,6 +138,7 @@ func (t *inverseApplySummary) addBatch(r inverseApplySummary) {
 	t.Selected += r.Selected
 	t.Deleted += r.Deleted
 	t.Bytes += r.Bytes
+	t.StitchSkipped += r.StitchSkipped
 	t.CustodyShort.Objects += r.CustodyShort.Objects
 	t.CustodyShort.Bytes += r.CustodyShort.Bytes
 	t.WireAmbiguous = append(t.WireAmbiguous, r.WireAmbiguous...)

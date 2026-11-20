@@ -651,7 +651,7 @@ func TestR2NonrawExemptionNeverReleasesDerivedRAW(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = a.authorize(f.ctx, tx, raw, &inverseSendGate{})
+	_, err = a.authorize(f.ctx, f.ctx, tx, raw, &inverseSendGate{})
 	_ = tx.Rollback(f.ctx)
 	if err == nil || !strings.Contains(err.Error(), "live key protection veto") {
 		t.Fatalf("live authorize did not veto the derived-held RAW source: %v", err)

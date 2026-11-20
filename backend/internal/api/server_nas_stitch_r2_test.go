@@ -34,10 +34,11 @@ func TestR2StitchDurhamHoldReleasedOnlyByCommittedNASCertificate(t *testing.T) {
 	sha := cleanupSHA(media)
 	const abortGeneration = "f5238abd-6063-4441-a712-a9647d10b986"
 	abortKey := "stitch-staging/" + abortGeneration + "/" + sha + ".mp4"
-	var abort durhamStageAbortProbe
+	abort := durhamStageAbortProbe{deleteEntered: make(chan struct{}), deleteRelease: make(chan struct{})}
 	var stageHeadResponse atomic.Int32
 	provider := durhamStageTestProvider(t, media, sha, abortKey, &abort, &stageHeadResponse)
 	defer provider.Close()
+	defer abort.release()
 	admin, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -53,11 +54,16 @@ func TestR2StitchDurhamHoldReleasedOnlyByCommittedNASCertificate(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	// The lock contention helpers hold several sessions open at once; pgxpool's
+	// default (NumCPU, 4 on CI) starves the code under test.
+	cfg.MaxConns = 16
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pool.Close()
+	// Pool close runs last: the deferred handlers release above must free their
+	// held DELETE and session lock first, or Close waits on a checked-out conn.
+	t.Cleanup(pool.Close)
 	if err := db.MigrateUp(ctx, pool, findMigrationsDir(t)); err != nil {
 		t.Fatal(err)
 	}
@@ -93,6 +99,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
  'source-2-etag',$2,$3,$3,$4,'fixture/raw2.mp4')`, provider.URL, sha, end, end.Add(time.Minute))
 	exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at)
  VALUES(13,902,30,'fixture/raw2.mp4',100,$1,'present',now(),now())`, sha)
+	extra := addDurhamHours(t, pool, hour, provider.URL, sha)
 
 	exec(`INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until)
  VALUES(1,3,$1,$1::timestamptz+interval '6 hours','test',clock_timestamp()+interval '1 hour')`, hour)
@@ -512,38 +519,18 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	exec(`UPDATE recording_clips SET clip_end_at=$1 WHERE id=901`, end)
 
 	exec(`DELETE FROM nas_inventory_files WHERE connection_id=13 AND clip_id=902`)
-	lockClip, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lockClip.Rollback(ctx)
-	var lockPID int32
-	if err := lockClip.QueryRow(ctx, `SELECT pg_backend_pid() FROM recording_clips WHERE id=901 FOR UPDATE`).Scan(&lockPID); err != nil {
-		t.Fatal(err)
-	}
-	posted := make(chan int, 1)
-	go func() { posted <- post(47, request) }()
-	for deadline := time.Now().Add(time.Second); ; {
-		var waiting bool
-		err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))`, lockPID).Scan(&waiting)
-		if err != nil || time.Now().After(deadline) {
-			t.Fatalf("certificate did not wait at its inventory pair lock: %v", err)
-		}
-		if waiting {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+	if got := post(47, request); got != http.StatusConflict {
+		t.Fatalf("certificate accepted a missing NAS input custody pair: %d", got)
 	}
 	exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at)
  VALUES(13,902,30,'fixture/raw2.mp4',100,$1,'present',now(),now())`, sha)
-	if err := lockClip.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if got := <-posted; got != http.StatusConflict {
-		t.Fatalf("certificate accepted an inventory row inserted after its lock snapshot: %d", got)
-	}
-	if got := post(47, request); got != http.StatusOK {
-		t.Fatalf("connection 13 certificate rejected: %d", got)
+	exec(`UPDATE nas_r2_copy_items SET lease_expires_at=clock_timestamp()+interval '2 minutes' WHERE id=$1`, copyID)
+	testStitchReceiptNeverWaits(t, pool, func() int { return post(47, request) }, copyID, id, sourceKey, "managed/durham-fixture-2.mp4")
+	testStitchReceiptLockBound(t, pool, func() int { return post(47, request) }, copyID)
+	if err := testStitchCertKeyContention(t, pool, func(tx pgx.Tx) error {
+		return finishNASR2StitchCopy(ctx, tx, nasR2CopyTask{ID: copyID, Item: item}, request)
+	}, sourceKey, "managed/keep-ranking.mp4", extra); err != nil {
+		t.Fatalf("connection 13 certificate rejected: %v", err)
 	}
 	if got := post(47, request); got != http.StatusOK {
 		t.Fatalf("exact result replay rejected: %d", got)
@@ -602,10 +589,35 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		initialIntents != 0 {
 		t.Fatal("could not establish an old snapshot before staging DELETE", err)
 	}
-	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil ||
-		!strings.Contains(err.Error(), "outcome unconfirmed") {
+	// Two real invocations race across the separately committed one-shot
+	// reservation while a RAW batch owns the executors' outer lock. The second
+	// cannot send while the first is on the wire.
+	release := holdSessionLock(t, pool, "7343226011173")
+	// Registered before any assertion: a failure above must release the session
+	// lock, the held DELETE and the staging-race transaction instead of leaving
+	// them checked out for pool.Close.
+	defer release()
+	defer func() {
+		abort.holdDelete.Store(false)
+		abort.release()
+	}()
+	abort.holdDelete.Store(true)
+	racing := make(chan error, 1)
+	go func() { racing <- store.RetireStitchStage(ctx, 123, sha, proofExpiry, false) }()
+	within(t, abort.deleteEntered, "first staging DELETE")
+	var reserved bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_r2_stage_retirements WHERE object_id=123)`).Scan(&reserved); err != nil || !reserved {
+		t.Fatal("first invocation reached the wire before its one-shot reservation committed", err)
+	}
+	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil || !strings.Contains(err.Error(), "stitch stage retirement busy") {
+		t.Fatal("a concurrent staging retirement invocation was admitted", err)
+	}
+	abort.holdDelete.Store(false)
+	abort.release()
+	if err := within(t, racing, "first staging retirement"); err == nil || !strings.Contains(err.Error(), "outcome unconfirmed") {
 		t.Fatalf("expected the provider to lose the DELETE result after both grants drained: %v", err)
 	}
+	release()
 	var stagingAbsent bool
 	if err := pool.QueryRow(ctx, `SELECT nas_cleanup_certified_stitch_staging_absent(certificate)
  FROM nas_stitch_r2_certified_raw WHERE clip_id=901`).Scan(&stagingAbsent); err != nil || stagingAbsent {
@@ -629,6 +641,9 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	if err := store.RetireStitchStage(ctx, 123, sha, proofExpiry, false); err == nil ||
 		!strings.Contains(err.Error(), "reconciliation") {
 		t.Fatal("ambiguous staging delete allowed a second wire attempt", err)
+	}
+	if got := abort.deletes.Load(); got != 1 {
+		t.Fatalf("staging retirement sent %d DELETEs", got)
 	}
 	tx, err = pool.Begin(ctx)
 	if err != nil {
@@ -660,11 +675,14 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 				}
 			}
 			abort.response.Store(3)
+			// Another staged object's retirement never fences this one.
+			release := holdSessionLock(t, pool, stitchStageGuard(123))
 			for range 2 {
 				if err := store.RetireStitchStage(ctx, 122, sha, time.Time{}, true); err != nil {
 					t.Fatalf("clean aborted stage absence or exact replay refused: %v", err)
 				}
 			}
+			release()
 			var receipt, deletionIntent bool
 			if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_r2_aborted_absences WHERE object_id=122),
  EXISTS(SELECT 1 FROM nas_stitch_r2_stage_retirements WHERE object_id=122)`).Scan(&receipt, &deletionIntent); err != nil || !receipt || deletionIntent {
@@ -706,7 +724,17 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 
 type durhamStageAbortProbe struct {
 	response, lists, heads atomic.Int32
+	// Object DELETEs are counted. While holdDelete is set they wait for
+	// release; the first closes deleteEntered.
+	deletes                      atomic.Int32
+	holdDelete                   atomic.Bool
+	deleteEntered, deleteRelease chan struct{}
+	entered, released            sync.Once
 }
+
+// release frees every held DELETE; the test defers it ahead of the server's
+// Close so a regression fails instead of hanging.
+func (p *durhamStageAbortProbe) release() { p.released.Do(func() { close(p.deleteRelease) }) }
 
 func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, abort *durhamStageAbortProbe, stageHeadResponse *atomic.Int32) *httptest.Server {
 	t.Helper()
@@ -716,6 +744,13 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, a
 	sum := sha256.Sum256(media)
 	checksum := base64.StdEncoding.EncodeToString(sum[:])
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && !r.URL.Query().Has("uploadId") {
+			abort.deletes.Add(1)
+			if abort.holdDelete.Load() {
+				abort.entered.Do(func() { close(abort.deleteEntered) })
+				<-abort.deleteRelease
+			}
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		query := r.URL.Query()
