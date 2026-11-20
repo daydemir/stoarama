@@ -7,7 +7,7 @@ Local scratch database only; never point this at production:
 
 The holder is a real second session whose marker arrives only after
 pg_advisory_lock returns, so no startup polling is needed and there is no window
-to race. Closing its stdin ends the session and releases the key.
+to race. The holder confirms it unlocked the key before the next receipt.
 
 CI runs this file without a database, so it skips when
 STOARAMA_TEST_DATABASE_URL is unset. With a database provided, a missing psql is
@@ -90,7 +90,10 @@ class RawDrainLockTests(unittest.TestCase):
             self.assertTrue(
                 line.startswith("ready|") and line.split("|")[1],
                 "holder never signalled for key %d: %r" % (key, line))
-            yield proc
+            yield
+            proc.stdin.write("SELECT pg_advisory_unlock(%d);\n" % key)
+            proc.stdin.flush()
+            self.assertEqual(self.marker_line(proc), "t")
         finally:
             if proc.poll() is None and proc.stdin is not None and not proc.stdin.closed:
                 proc.stdin.close()
