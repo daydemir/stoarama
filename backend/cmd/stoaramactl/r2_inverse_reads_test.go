@@ -3,11 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +21,8 @@ import (
 
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 )
 
@@ -541,28 +547,30 @@ func TestR2InverseListPageAttemptIsFiniteWithoutParentDeadline(t *testing.T) {
 // with the same markers, and the existing eligibility checks still decide.
 func TestR2InverseMultipartInventoryRetriesOnePage(t *testing.T) {
 	const key = "stitch-staging/a/one.mp4"
-	var calls atomic.Int64
+	var calls, continuationAttempts atomic.Int64
 	var mu sync.Mutex
 	markers := []string{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		n := calls.Add(1)
+		calls.Add(1)
 		w.Header().Set("Content-Type", "application/xml")
 		keyMarker := req.URL.Query().Get("key-marker")
 		uploadMarker := req.URL.Query().Get("upload-id-marker")
 		mu.Lock()
 		markers = append(markers, keyMarker+"|"+uploadMarker)
 		mu.Unlock()
-		if n == 1 {
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
-		}
 		if keyMarker == "" {
+			// The first page advertises a populated continuation pair.
 			fmt.Fprintf(w, `<ListMultipartUploadsResult><Upload><Key>%s</Key><UploadId>a</UploadId></Upload><IsTruncated>true</IsTruncated><NextKeyMarker>%s</NextKeyMarker><NextUploadIdMarker>a</NextUploadIdMarker></ListMultipartUploadsResult>`, key, key)
 			return
 		}
-		// The retried page and the advancing page both carry the exact markers.
+		// The populated continuation page itself is throttled once, so the
+		// retried page must carry the very same non-empty pair.
+		if continuationAttempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
 		if keyMarker != key || uploadMarker != "a" {
-			t.Errorf("page %d markers %q/%q, want %q/a", n, keyMarker, uploadMarker, key)
+			t.Errorf("continuation markers %q/%q, want %q/a", keyMarker, uploadMarker, key)
 		}
 		fmt.Fprint(w, `<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>`)
 	}))
@@ -579,12 +587,15 @@ func TestR2InverseMultipartInventoryRetriesOnePage(t *testing.T) {
 		t.Fatal(err)
 	}
 	if calls.Load() != 3 || seen.Load() != 1 {
-		t.Fatalf("%d inventory requests, %d identity checks: want a retried first page then page two", calls.Load(), seen.Load())
+		t.Fatalf("%d inventory requests, %d identity checks: want the first page, a throttled continuation, then its retry", calls.Load(), seen.Load())
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(markers) != 3 || markers[0] != "|" || markers[1] != "|" || markers[2] != key+"|a" {
-		t.Fatalf("markers %v: the retried page or the continuation lost its marker", markers)
+	// The throttled continuation and its retry carry the identical populated
+	// key + upload marker pair.
+	want := []string{"|", key + "|a", key + "|a"}
+	if !slices.Equal(markers, want) {
+		t.Fatalf("markers %v, want %v: the continuation pair was not preserved through the retry", markers, want)
 	}
 }
 
@@ -706,45 +717,102 @@ func TestR2InverseSmallRetryAfterKeepsBoundedJitterAndCooldown(t *testing.T) {
 }
 
 // A bare 503 with no Retry-After publishes the shared minimum cooldown, so a
-// distinct sibling read type is held after both an early and a terminal 503.
+// distinct sibling read type is held by it. The sibling is launched as soon as
+// the first observed 503 has published that floor, while the early case's
+// reader is still provably in flight: its second try waits on an explicit
+// channel, so the read cannot reach a terminal try before the sibling is in.
 func TestR2InverseBare503PublishesSharedCooldown(t *testing.T) {
-	for name, attempts := range map[string]int{"early": 4, "terminal": 1} {
-		t.Run(name, func(t *testing.T) {
-			store := newReadScriptStore(t, &readScriptServer{})
-			// A short, deterministic minimum: half to full of maxBackoff.
-			policy := inverseReadPolicy{attempts: attempts, maxBackoff: 400 * time.Millisecond, maxRetryAfter: inverseReadMaxRetryAfter}
-			sends := atomic.Int64{}
-			headErr := store.read(context.Background(), policy, "head a", func(context.Context) error {
+	// awaitCooldown blocks until a floor is published, so the sibling is never
+	// launched against an empty gate.
+	awaitCooldown := func(t *testing.T, store *inverseSDKStore) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for store.readGate().publishedCooldown() <= 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("the first 503 published no shared cooldown")
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	// siblings are held by the published floor and report how long they waited.
+	launchSibling := func(t *testing.T, store *inverseSDKStore) <-chan time.Duration {
+		t.Helper()
+		waited := make(chan time.Duration, 1)
+		go func() {
+			begin := time.Now()
+			_ = store.read(context.Background(), inverseListReadPolicy, "sibling list", func(context.Context) error { return nil })
+			waited <- time.Since(begin)
+		}()
+		return waited
+	}
+
+	t.Run("early", func(t *testing.T) {
+		store := newReadScriptStore(t, &readScriptServer{})
+		// The second try waits on this channel, so the reader is still on a
+		// non-terminal try when the sibling starts.
+		release := make(chan struct{})
+		policy := inverseReadPolicy{attempts: 4, maxBackoff: 600 * time.Millisecond, maxRetryAfter: inverseReadMaxRetryAfter}
+		sends := atomic.Int64{}
+		finished := make(chan error, 1)
+		go func() {
+			finished <- store.read(context.Background(), policy, "head a", func(context.Context) error {
+				if sends.Add(1) == 1 {
+					return readStatusError(http.StatusServiceUnavailable, http.Header{})
+				}
+				<-release
+				return readStatusError(http.StatusServiceUnavailable, http.Header{})
+			})
+		}()
+		awaitCooldown(t, store)
+		// The reader has one try left before terminal and is blocked here.
+		if sends.Load() != 1 {
+			t.Fatalf("%d sends before the sibling launched, want the reader still on try 1", sends.Load())
+		}
+		waited := launchSibling(t, store)
+		select {
+		case d := <-waited:
+			if d < 100*time.Millisecond {
+				t.Fatalf("an early bare 503 did not hold a sibling: it left after %v", d)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("sibling read never finished")
+		}
+		close(release)
+		if err := <-finished; err == nil {
+			t.Fatal("a bare 503 read succeeded")
+		}
+	})
+
+	t.Run("terminal", func(t *testing.T) {
+		store := newReadScriptStore(t, &readScriptServer{})
+		policy := inverseReadPolicy{attempts: 1, maxBackoff: 600 * time.Millisecond, maxRetryAfter: inverseReadMaxRetryAfter}
+		sends := atomic.Int64{}
+		finished := make(chan error, 1)
+		go func() {
+			finished <- store.read(context.Background(), policy, "head a", func(context.Context) error {
 				sends.Add(1)
 				return readStatusError(http.StatusServiceUnavailable, http.Header{})
 			})
-			if headErr == nil {
-				t.Fatal("a bare 503 read succeeded")
+		}()
+		awaitCooldown(t, store)
+		// The read is terminal at this single try; the floor it published still
+		// holds a sibling.
+		waited := launchSibling(t, store)
+		select {
+		case d := <-waited:
+			if d < 100*time.Millisecond {
+				t.Fatalf("a terminal bare 503 did not hold a sibling: it left after %v", d)
 			}
-			if sends.Load() != int64(attempts) {
-				t.Fatalf("%d bare-503 sends, want exactly %d", sends.Load(), attempts)
-			}
-			// The 503 published a floor even though this reader stopped.
-			if got := store.readGate().publishedCooldown(); got < 150*time.Millisecond {
-				t.Fatalf("%s 503 published only %v of cooldown", name, got)
-			}
-			// A distinct sibling read type is held by it before it can run.
-			waited := make(chan time.Duration, 1)
-			go func() {
-				begin := time.Now()
-				_ = store.read(context.Background(), inverseListReadPolicy, "sibling list", func(context.Context) error { return nil })
-				waited <- time.Since(begin)
-			}()
-			select {
-			case d := <-waited:
-				if d < 100*time.Millisecond {
-					t.Fatalf("%s 503 did not hold a sibling: it left after %v", name, d)
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatal("sibling read never finished")
-			}
-		})
-	}
+		case <-time.After(5 * time.Second):
+			t.Fatal("sibling read never finished")
+		}
+		if err := <-finished; err == nil {
+			t.Fatal("a bare 503 read succeeded")
+		}
+		if sends.Load() != 1 {
+			t.Fatalf("%d terminal sends, want exactly 1", sends.Load())
+		}
+	})
 }
 
 // An overflowing positive decimal is a real, very long floor, not an absent
@@ -819,25 +887,32 @@ func TestR2InverseRetryAfterChoosesLongestFloor(t *testing.T) {
 // returned error, not the context.
 func TestR2InverseDefinitiveAnswerIsNeverRetried(t *testing.T) {
 	store := newReadScriptStore(t, &readScriptServer{})
-	policy := inverseReadPolicy{attempts: 4, maxBackoff: 10 * time.Millisecond, maxRetryAfter: inverseReadMaxRetryAfter}
-	sends := atomic.Int64{}
-	// A 200 from the confirming HEAD is "object remains": definitive, not
-	// transient. A deadline on the attempt must not change that.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	err := store.read(ctx, policy, "confirming head managed/a.mp4", func(attemptCtx context.Context) error {
-		sends.Add(1)
-		// Let the attempt's own deadline pass, then answer definitively.
-		if deadline, ok := attemptCtx.Deadline(); ok {
-			time.Sleep(time.Until(deadline) + 5*time.Millisecond)
-		}
-		return errors.New("object remains after DELETE")
+	// A short attempt deadline, so the attempt really expires before the
+	// definitive answer is returned; the parent stays healthy throughout.
+	policy := inverseReadPolicy{attempts: 4, attemptTimeout: 100 * time.Millisecond, maxBackoff: 10 * time.Millisecond, maxRetryAfter: inverseReadMaxRetryAfter}
+	parent, cancelParent := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelParent()
+	callbacks := atomic.Int64{}
+	parentLive := atomic.Bool{}
+	err := store.read(parent, policy, "confirming head managed/a.mp4", func(attemptCtx context.Context) error {
+		callbacks.Add(1)
+		// Wait for this attempt's own deadline to fire.
+		<-attemptCtx.Done()
+		// The parent must still be independently live: this is the attempt's
+		// expiry, never the job ending.
+		parentLive.Store(parent.Err() == nil)
+		// The provider answered: the object is still there. A definitive answer
+		// returned after its attempt deadline must not become a retry.
+		return inverseAbsence(nil)
 	})
-	if err == nil || !strings.Contains(err.Error(), "object remains") {
+	if err == nil || !strings.Contains(err.Error(), "object remains after DELETE") {
 		t.Fatalf("definitive answer lost: %v", err)
 	}
-	if sends.Load() != 1 {
-		t.Fatalf("%d invocation(s) for a definitive answer, want exactly 1", sends.Load())
+	if !parentLive.Load() {
+		t.Fatal("the parent context was not live; the case did not test an attempt-local deadline")
+	}
+	if callbacks.Load() != 1 {
+		t.Fatalf("%d callback invocation(s) for a definitive answer, want exactly 1", callbacks.Load())
 	}
 }
 
@@ -855,29 +930,114 @@ func TestR2InverseGateFailureReportsInvokedOperations(t *testing.T) {
 	}
 }
 
-// The standalone partition dispatch reads through the bounded inverse store:
-// a throttled continuation page retries in place and the listing still covers
-// the bucket once.
+// The real standalone dispatch reads through the bounded inverse store, under
+// its own archived bucket and endpoint rather than the ordinary ones: a 429 on a
+// continuation page retries in place with the same token, and every request
+// carries the archived target.
 func TestR2InversePartitionDispatchUsesBoundedReader(t *testing.T) {
-	script := &readScriptServer{answer: func(kind, marker string, attempt int) (int, http.Header) {
-		if attempt == 1 && kind == "list" {
-			return http.StatusTooManyRequests, http.Header{"Retry-After": []string{"0"}}
+	dsn := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if dsn == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL")
+	}
+	ctx := context.Background()
+	pool := joinedPurgeTestPool(t, "inverse_partition_dispatch")
+	if err := db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir()); err != nil {
+		t.Fatal(err)
+	}
+	// The archived target differs from every ordinary bucket/endpoint setting,
+	// so a request to the wrong one is unmistakable.
+	const archivedBucket = "archived-inverse-bucket"
+	var mu sync.Mutex
+	type request struct{ path, token, method string }
+	requests := []request{}
+	var listCalls, continuationAttempts atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		lister := req.Method == http.MethodGet && req.URL.Query().Has("list-type")
+		mu.Lock()
+		requests = append(requests, request{path: req.URL.Path, token: req.URL.Query().Get("continuation-token"), method: req.Method})
+		mu.Unlock()
+		if !lister {
+			// The multipart inventory is not part of a partition read; refuse it
+			// so a wrong path is visible rather than silently tolerated.
+			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
-		return http.StatusOK, nil
-	}}
-	store := newReadScriptStore(t, script)
-	// The same seam writeInversePartition now uses: a store that is an
-	// inverseLister, into the existing directory entry point.
-	var out bytes.Buffer
-	sum, err := partitionInverse(context.Background(), store, inverseTestProtection(), "policy", &out)
+		w.Header().Set("Content-Type", "application/xml")
+		listCalls.Add(1)
+		token := req.URL.Query().Get("continuation-token")
+		pageTwo := 0
+		if token == "page-two" {
+			pageTwo = int(continuationAttempts.Add(1))
+		}
+		switch {
+		case token == "":
+			fmt.Fprint(w, `<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>page-two</NextContinuationToken>`+
+				`<Contents><Key>managed/a.mp4</Key><ETag>"e1"</ETag><Size>10</Size><LastModified>2026-01-01T00:00:00.000Z</LastModified></Contents></ListBucketResult>`)
+		case token == "page-two" && pageTwo <= 3:
+			// Three throttled tries at the continuation page outlast the SDK's own
+			// three-attempt default, so only the inverse bounded read (four tries)
+			// can finish this partition. Every retry must carry the same token.
+			w.WriteHeader(http.StatusTooManyRequests)
+		case token == "page-two":
+			fmt.Fprint(w, `<ListBucketResult><IsTruncated>false</IsTruncated>`+
+				`<Contents><Key>managed/b.mp4</Key><ETag>"e2"</ETag><Size>20</Size><LastModified>2026-01-01T00:00:00.000Z</LastModified></Contents></ListBucketResult>`)
+		default:
+			t.Errorf("unexpected continuation token %q", token)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	picksPath := filepath.Join(t.TempDir(), "picks.json")
+	picksData, _ := json.Marshal(map[string]any{"choices": map[string]any{}})
+	if err := os.WriteFile(picksPath, picksData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// The command opens its own pool from the connection string.
+	scoped := dsn
+	if strings.Contains(dsn, "?") {
+		scoped += "&options=-c%20search_path%3D" + pool.Config().ConnConfig.RuntimeParams["search_path"]
+	} else {
+		scoped += "?options=-c%20search_path%3D" + pool.Config().ConnConfig.RuntimeParams["search_path"]
+	}
+	out := filepath.Join(t.TempDir(), "report")
+	cfg := config.Config{
+		DatabaseURL:       scoped,
+		R2AccountID:       "archived-account",
+		R2AccessKeyID:     "archived-key",
+		R2SecretAccessKey: "archived-secret",
+		R2Bucket:          archivedBucket,
+		R2Region:          "auto",
+		R2Endpoint:        server.URL,
+	}
+	sum, err := writeInversePartition(ctx, cfg, picksPath, out)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if sum.Bucket != archivedBucket || sum.EndpointSHA256 == "" {
+		t.Fatalf("partition summary names %q, not the archived bucket", sum.Bucket)
 	}
 	if sum.Total.Objects != 2 || sum.Total.Bytes != 30 {
 		t.Fatalf("partition %+v", sum.Total)
 	}
-	if script.attempts("list", "page1") != 2 || script.attempts("list", "page2") != 2 {
-		t.Fatalf("page attempts %d/%d, want one retry each", script.attempts("list", "page1"), script.attempts("list", "page2"))
+	mu.Lock()
+	defer mu.Unlock()
+	var tokens []string
+	for _, r := range requests {
+		if r.path != "/"+archivedBucket {
+			t.Fatalf("request %s %s, want the archived bucket %q", r.method, r.path, archivedBucket)
+		}
+		if r.method == http.MethodGet {
+			tokens = append(tokens, r.token)
+		}
+	}
+	// The first page, then three throttled tries at the continuation page and the
+	// fourth try that succeeds, all four carrying the identical token.
+	want := []string{"", "page-two", "page-two", "page-two", "page-two"}
+	if !slices.Equal(tokens, want) {
+		t.Fatalf("continuation-token sequence %v, want %v", tokens, want)
+	}
+	if continuationAttempts.Load() != 4 {
+		t.Fatalf("%d continuation attempts, want exactly 4", continuationAttempts.Load())
 	}
 }
 

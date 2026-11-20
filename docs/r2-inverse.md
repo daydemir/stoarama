@@ -73,15 +73,19 @@ ledger. The network phase's lock order, which an operator should read as the
 runbook, is: the KE epoch row `FOR SHARE` first as the barrier, then the global
 protection advisory locks in **shared** mode (137/1 and the two protection keys),
 then the **exclusive** per-key COPY advisory lock for this object, then the clip
-row `FOR UPDATE`. Wire preparation (the identity HEAD, multipart inventory,
-target load and guards) runs under that order, prepared with its own database
-step budget before the existing 30-second network budget starts. The wire
-transaction commits, and rolls back, separately from the reservation that came
-before it and from publication that follows. Keys hold only shared global locks,
-so independent keys still run concurrently; only the per-key COPY advisory and
-that key's clip row are exclusive. The startup multipart inventory is the one
-read outside the protection transaction, and it runs under the apply session's
-advisory lock, before any key reserves. A common live delivery predicate includes content/path aliases
+row `FOR UPDATE` (that shared clip row is the recording-clip lock a concurrent
+COPY or hold admission also takes, so neither can interleave with this key).
+Every lock is acquired, and the target data and keep-28 custody are read, under
+the database step budget first; only then does the 30-second network deadline
+start, and it covers the identity HEAD, the multipart inventory and the final
+guard. The wire transaction commits, and rolls back, separately from the
+reservation that came before it and from publication that follows. Keys hold only
+shared global locks, so independent keys still run concurrently; only the per-key
+COPY advisory and that key's clip row are exclusive. The startup multipart
+inventory and the restart reconciliation HEAD are the two reads that run outside
+the protection transaction: startup under the apply session's advisory lock before
+any key reserves, reconciliation while held intents are read back and before any
+new work. A common live delivery predicate includes content/path aliases
 and current collated-output dependencies without relying on a refreshed source
 cache; admission of those protections and output membership changes is fenced. It exercises the installed purge guards before DELETE, rolls
 that probe back, HEAD-checks listing/catalog ETag, size and the fixed pre-fence LastModified cutoff, and
@@ -175,6 +179,14 @@ retry fails, the key is held exactly like a lost response: issued, unresolved,
 reported in `unpublished`, never resent, and the batch's readback must name it
 among the unresolved keys. Every failing key logs its step (`reserve`, `wire`,
 `head`, `commit` or `publish`) and key.
+
+A read error's `after N attempts` count is the number of SDK callback
+invocations, not a wire count. A failure that never reaches the SDK — a gate that
+is already latched, or a command that ended first — reports the operations it
+actually invoked, so it says `after 0 attempts` and is not a physical request.
+A callback that does run can still fail before its request reaches the wire (a
+refused dial, a failed TLS handshake, a redirect refusal), so the logged count is
+an upper bound on physical requests, never a lower one.
 
 A batch whose only failures held keys continues the job even if it published
 nothing, as when a lock convoy catches every in-flight key at once. Three such
