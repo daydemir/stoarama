@@ -52,11 +52,12 @@ func storeInversePartition(ctx context.Context, pool *pgxpool.Pool, dir string) 
 }
 
 // reuseInversePartition restores the stored partition with this exact digest
-// into a new directory, for a restart. It requires the same bucket, endpoint,
-// policy and approved picks, the 24h freshness every batch also requires, and
-// unchanged classification inputs: the stored holds digest must equal one read
-// now. The partition only proposes candidates; it never authorizes a DELETE.
-func reuseInversePartition(ctx context.Context, pool *pgxpool.Pool, store inverseLister, picksPath, digest, dir string) (inverseSummary, error) {
+// into a new directory, for a restart. It requires the same bucket, endpoint
+// and policy, picks equal to the independently approved digest, the 24h
+// freshness every batch also requires, and unchanged external classification
+// inputs: the stored holds digest must equal one read now. The partition only
+// proposes candidates; it never authorizes a DELETE.
+func reuseInversePartition(ctx context.Context, pool *pgxpool.Pool, store inverseLister, picksPath, approvedPicks, digest, dir string) (inverseSummary, error) {
 	var sum inverseSummary
 	var summary, packed []byte
 	if err := pool.QueryRow(ctx, `SELECT summary,partition_gzip FROM r2_inverse_partitions WHERE bucket=$1 AND endpoint_sha256=$2 AND partition_sha256=$3`,
@@ -77,7 +78,10 @@ func reuseInversePartition(ctx context.Context, pool *pgxpool.Pool, store invers
 	if err != nil {
 		return sum, err
 	}
-	if err = sum.matches(store, policy, picks.SHA256); err != nil {
+	if picks.SHA256 != approvedPicks {
+		return sum, errors.New("owner picks differ from the approved digest")
+	}
+	if err = sum.matches(store, policy, approvedPicks); err != nil {
 		return sum, err
 	}
 	tx, err := beginInversePartitionTx(ctx, pool)

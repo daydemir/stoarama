@@ -955,6 +955,60 @@ func TestKeep28DeletePathComposesParentAndCustodyDeadlines(t *testing.T) {
 	}
 }
 
+// confirmDeadlineSpy records the deadline the executor gives the confirming HEAD.
+type confirmDeadlineSpy struct {
+	*inverseSDKStore
+	called, deadline time.Time
+}
+
+func (s *confirmDeadlineSpy) confirmAbsent(ctx context.Context, key string) error {
+	s.called = time.Now()
+	s.deadline, _ = ctx.Deadline()
+	return s.inverseSDKStore.confirmAbsent(ctx, key)
+}
+
+// Through the production delete path, the confirming HEAD ends at custody end
+// when custody is tighter than both the network deadline and the HEAD's own
+// 22s bound: the authorization clock sample is delayed 10s, as a database
+// clock step would leave it, so custody ends about 11s after the HEAD starts.
+func TestKeep28ConfirmingHEADEndsAtCustody(t *testing.T) {
+	f := newKeep28Fixture(t)
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '24 hours'+interval '34 seconds',server_received_at=clock_timestamp()`); err != nil {
+		t.Fatal(err)
+	}
+	config := f.pool.Config()
+	config.ConnConfig.Tracer = &slowSampleTracer{nth: 2, delay: 10 * time.Second}
+	pool, err := pgxpool.NewWithConfig(f.ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	a := f.applier(t)
+	a.pool = pool
+	spy := &confirmDeadlineSpy{inverseSDKStore: f.sdk}
+	a.store = spy
+	var wire atomic.Value
+	template := newInverseDeleteHTTPTransport()
+	dial := template.DialContext
+	template.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return deadlineSpyConn{Conn: conn, set: &wire}, nil
+	}
+	original := f.sdk.transport
+	f.sdk.transport = template
+	defer func() { f.sdk.transport = original }()
+	if ok, err := a.delete(f.ctx, f.ctx, &inverseSendGate{}, f.entry(t)); err != nil || !ok {
+		t.Fatalf("delete: %v %v", ok, err)
+	}
+	custodyEnd, _ := wire.Load().(time.Time)
+	if spy.deadline.IsZero() || spy.deadline.After(custodyEnd) || !spy.deadline.Before(spy.called.Add(inverseConfirmTimeout)) {
+		t.Fatalf("confirming HEAD deadline %v, custody end %v, own bound %v", spy.deadline, custodyEnd, spy.called.Add(inverseConfirmTimeout))
+	}
+}
+
 // slowClockTx delays one armed DB clock read after its local observation, as a
 // slow network or scheduler would, which makes that sample the tightest.
 type slowClockTx struct {

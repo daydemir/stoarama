@@ -49,6 +49,9 @@ type inverseIdentity struct {
 type inverseProtection struct {
 	Identities     map[string][]inverseIdentity
 	Held, Delivery map[string]bool
+	// Retiring holds keys with a retirement reservation or receipt: retirement
+	// progress, this job's own included, not an external protection input.
+	Retiring map[string]bool
 	// OwnerKeepPrefixes are durable owner keep holds on whole key prefixes. A
 	// key under one is kept whatever its catalog status.
 	OwnerKeepPrefixes []string
@@ -63,10 +66,13 @@ type inverseProtection struct {
 	KEEpoch int64
 }
 
-// holdsSHA256 digests every classification input outside the catalog rows and
-// the picks and policy the summary pins: the KE epoch, which versions those
-// rows, and the exact owner keep, KE folder, hold, delivery and joined release
-// sets. Equal digests mean those inputs are unchanged.
+// holdsSHA256 digests every external classification input outside the catalog
+// rows and the picks and policy the summary pins: the KE epoch, which versions
+// identity changes to those rows, and the exact owner keep, KE folder, hold,
+// delivery and joined release sets. It leaves out Retiring, so a job's own
+// reservations and receipts never invalidate its restart partition; the live
+// gate refuses every reserved or retired key anyway. Equal digests mean those
+// inputs are unchanged.
 func (p inverseProtection) holdsSHA256() (string, error) {
 	data, err := json.Marshal([]any{p.KEEpoch, p.OwnerKeepPrefixes, p.KEFolders, p.Held, p.Delivery, p.JoinedReleased})
 	if err != nil {
@@ -126,6 +132,9 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 	}
 	if p.Held[o.Key] {
 		return inverseHeld, "live_hold"
+	}
+	if p.Retiring[o.Key] {
+		return inverseHeld, "retirement_recorded"
 	}
 	if p.Delivery[o.Key] {
 		return inverseDelivery, "delivery_hold_pending_owner"
@@ -215,8 +224,6 @@ WITH held_sources AS (
  WHERE p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND (i.delete_ever_issued OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed')))
 ), held_keys AS (
  SELECT bucket,object_key FROM nas_cleanup_incident_roster
- UNION SELECT bucket,object_key FROM r2_retirement_reservations
- UNION SELECT bucket,object_key FROM r2_object_retirements
  UNION SELECT c.bucket,c.object_key FROM held_sources h JOIN recording_clips c ON h.kind='raw' AND c.id=h.source_id
  UNION SELECT $1,o.object_key FROM held_sources h JOIN recording_collation_outputs o ON h.kind='collated' AND o.id=h.source_id
  UNION SELECT $1,o.object_key FROM recording_collation_outputs o WHERE EXISTS(SELECT 1 FROM nas_cleanup_incident_sources i WHERE i.clip_id=ANY(o.source_clip_ids))
@@ -232,6 +239,8 @@ WITH held_sources AS (
  UNION SELECT item->>'bucket',item->>'object_key' FROM nas_r2_copy_items WHERE state<>'verified' OR blocked_reason<>''
  UNION SELECT bucket,object_key FROM nas_stitch_r2_input_holds WHERE released_at IS NULL
 ) SELECT object_key FROM held_keys WHERE bucket=$1`
+const inverseRetiringSQL = `SELECT object_key FROM r2_retirement_reservations WHERE bucket=$1
+UNION SELECT object_key FROM r2_object_retirements WHERE bucket=$1`
 const inverseJoinedReleasedSQL = `SELECT DISTINCT c.object_key FROM recording_joined_source_snapshots s JOIN recording_clips c ON c.id=s.clip_id
 WHERE c.bucket=$1 AND r2_joined_source_released(c.id)`
 const inverseDeliverySQL = `
@@ -284,7 +293,7 @@ func loadInverseProtection(ctx context.Context, q r2RetireQuerier, bucket string
 // loadInverseHolds loads every classification input except the catalog rows,
 // which the KE epoch versions. It is cheap next to the catalog and listing.
 func loadInverseHolds(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks, windows map[int64]api.Keep28Window) (inverseProtection, error) {
-	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, JoinedReleased: map[string]bool{}, Windows: windows, Picks: picks}
+	p := inverseProtection{Identities: map[string][]inverseIdentity{}, Held: map[string]bool{}, Delivery: map[string]bool{}, Retiring: map[string]bool{}, JoinedReleased: map[string]bool{}, Windows: windows, Picks: picks}
 	err := q.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch`).Scan(&p.KEEpoch)
 	if err != nil {
 		return p, err
@@ -298,7 +307,7 @@ func loadInverseHolds(ctx context.Context, q r2RetireQuerier, bucket string, pic
 	for _, set := range []struct {
 		sql  string
 		keys map[string]bool
-	}{{inverseHeldSQL, p.Held}, {inverseDeliverySQL, p.Delivery}, {inverseJoinedReleasedSQL, p.JoinedReleased}} {
+	}{{inverseHeldSQL, p.Held}, {inverseDeliverySQL, p.Delivery}, {inverseRetiringSQL, p.Retiring}, {inverseJoinedReleasedSQL, p.JoinedReleased}} {
 		rows, err := q.Query(ctx, set.sql, bucket)
 		if err != nil {
 			return p, err

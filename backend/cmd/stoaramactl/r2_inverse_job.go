@@ -63,20 +63,42 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane
 	if o.SummarySHA, err = inverseFileSHA(o.Summary); err != nil {
 		log.Fatal(err)
 	}
+	if err = runInverseJobBatches(ctx, pool, store, o, f.owner, f.work, f.batches); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// inverseJobStalledBatches caps consecutive batches that held keys and
+// published nothing, so a persistent outage stops the job instead of spinning.
+const inverseJobStalledBatches = 3
+
+// runInverseJobBatches runs up to batches apply batches until one selects
+// nothing. A batch whose only failures held keys continues the job, even with
+// nothing published, up to inverseJobStalledBatches in a row.
+func runInverseJobBatches(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteStore, o inverseApplyOptions, owner, work string, batches int) error {
 	total := inverseApplySummary{}
-	for n := 1; n <= f.batches; n++ {
-		done, result, err := runInverseJobBatch(ctx, pool, store, o, f.owner, filepath.Join(f.work, fmt.Sprintf("evidence-%03d.json", n)))
+	stalled := 0
+	for n := 1; n <= batches; n++ {
+		done, result, err := runInverseJobBatch(ctx, pool, store, o, owner, filepath.Join(work, fmt.Sprintf("evidence-%03d.json", n)))
 		total.addBatch(result)
 		printInverseJob(map[string]any{"step": "batch", "batch": n, "result": result, "total": total, "error": errorText(err)})
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		if done {
 			printInverseJob(map[string]any{"step": "done", "total": total})
-			return
+			return nil
+		}
+		stalled++
+		if result.Deleted > 0 || len(result.WireAmbiguous)+len(result.Unpublished) == 0 {
+			stalled = 0
+		}
+		if stalled == inverseJobStalledBatches {
+			return fmt.Errorf("%d consecutive batches held keys and published nothing", stalled)
 		}
 	}
 	printInverseJob(map[string]any{"step": "batch_limit", "total": total})
+	return nil
 }
 
 // addBatch folds one batch into the job total. Selected, deleted, byte and
@@ -98,7 +120,7 @@ func (t *inverseApplySummary) addBatch(r inverseApplySummary) {
 // stored one f.reuse names, and returns its summary and digest.
 func inverseJobPartition(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, store inverseLister, f inverseJobFlags, dir string) (inverseSummary, string, error) {
 	if f.reuse != "" {
-		sum, err := reuseInversePartition(ctx, pool, store, f.picks, f.reuse, dir)
+		sum, err := reuseInversePartition(ctx, pool, store, f.picks, f.picksSHA, f.reuse, dir)
 		return sum, f.reuse, err
 	}
 	sum, err := writeInversePartition(ctx, cfg, f.picks, dir)
@@ -157,9 +179,10 @@ func parseInverseJobFlags(args []string, lane inverseLane) (inverseJobFlags, err
 // runInverseJobBatch runs one bounded apply batch. It reports done when a clean
 // batch selected nothing. Unresolved intents from earlier batches stay held;
 // the executor's startup stops if one that never reached the wire is gone. A
-// batch whose only failures are lost DELETE responses returns no error once its
-// readback proves exactly those keys are unresolved, as long as it also deleted
-// something; a batch that deletes nothing stops the job.
+// batch whose only failures held keys (lost DELETE responses, unpublished
+// confirmed absences) returns no error once its readback proves exactly those
+// keys are unresolved; runInverseJobBatches caps how many such batches in a
+// row may publish nothing.
 func runInverseJobBatch(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteStore, o inverseApplyOptions, owner, evidencePath string) (bool, inverseApplySummary, error) {
 	var err error
 	if o.DrainSHA, err = writeInverseOwnerEvidence(ctx, pool, store, o, owner, evidencePath); err != nil {
@@ -204,9 +227,6 @@ func (r inverseBatchReadback) settle(result inverseApplySummary, applyErr error)
 		return false, fmt.Errorf("database batch evidence differs: intents %d absent %d bytes %d attempts %d unresolved %v", r.Intents, r.Absent, r.AbsentBytes, r.Attempts, r.Unresolved)
 	}
 	if held {
-		if result.Deleted == 0 {
-			return false, applyErr
-		}
 		printInverseJob(map[string]any{"step": "held", "held": r.Unresolved, "error": applyErr.Error()})
 		return false, nil
 	}

@@ -451,8 +451,8 @@ func (g *inverseWireGuard) check(ctx context.Context, binding inverseDeleteBindi
 // single DELETE, the confirming HEAD and its retries) share
 // inverseNetworkTimeout from when the wire transaction holds its locks;
 // keep-28 also ends them at custody end. Each database step (reservation, wire
-// preparation, the wire commit, each publication attempt) gets
-// inverseDBTimeout: it may queue behind sibling protection locks.
+// connection, wire preparation, the wire commit, each publication attempt) gets
+// a fresh inverseDBTimeout: it may queue behind sibling protection locks.
 const (
 	inverseNetworkTimeout = 30 * time.Second
 	inverseDBTimeout      = 2 * time.Minute
@@ -491,18 +491,24 @@ func inverseKeyHeld(err error) bool {
 	return errors.Is(err, errInverseWireAmbiguous) || errors.Is(err, errInverseUnpublished)
 }
 
-// inverseDBTransient reports a database timeout or lock contention, never a
-// refusal or an inconsistent publication.
-func inverseDBTransient(err error) bool {
+// SQLSTATEs of lock contention a database step can retry.
+const (
+	pgLockNotAvailable     = "55P03"
+	pgDeadlockDetected     = "40P01"
+	pgSerializationFailure = "40001"
+)
+
+// inverseDBTransient reports a database step that ran out of its own bound
+// (waiting for a pool connection, a lock or a statement), or lost to lock
+// contention. An explicit cancel (57014: publication disables the role's
+// statement_timeout, so only a cancel raises it), a refusal or an inconsistent
+// publication is never transient.
+func inverseDBTransient(step context.Context, err error) bool {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		switch pgErr.Code {
-		case "55P03", "40P01", "40001", "57014": // lock_not_available, deadlock, serialization, statement timeout
-			return true
-		}
-		return false
+		return pgErr.Code == pgLockNotAvailable || pgErr.Code == pgDeadlockDetected || pgErr.Code == pgSerializationFailure
 	}
-	return pgconn.Timeout(err)
+	return errors.Is(step.Err(), context.DeadlineExceeded) && errors.Is(err, context.DeadlineExceeded)
 }
 
 // errKeep28CustodyShort skips a keep-28 key whose custody ends within one
@@ -543,7 +549,11 @@ func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGat
 	if err = a.record(e, inverseIntent, a.opts.ManifestSHA); err != nil {
 		return fail(inverseStepReserve, err)
 	}
-	tx, err := a.pool.BeginTx(db, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	// The wire step gets fresh bounds: acquiring its connection here, and
+	// preparing its locks inside authorize, never spend the reservation's.
+	wiring, cancelWiring := context.WithTimeout(ctx, inverseDBTimeout)
+	defer cancelWiring()
+	tx, err := a.pool.BeginTx(wiring, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return fail(inverseStepWire, err)
 	}
@@ -575,10 +585,9 @@ func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGat
 	// The key is gone; what follows is bookkeeping. The wire transaction holds
 	// only locks, and publication must wait for it to release them.
 	committing, cancel := context.WithTimeout(ctx, inverseDBTimeout)
-	err = tx.Commit(committing)
-	cancel()
-	if err != nil {
-		return fail(inverseStepCommit, inverseHoldUnpublished(err))
+	defer cancel()
+	if err = tx.Commit(committing); err != nil {
+		return fail(inverseStepCommit, inverseHoldUnpublished(committing, err))
 	}
 	if err = a.publishConfirmed(ctx, e); err != nil {
 		return fail(inverseStepPublish, err)
@@ -588,27 +597,29 @@ func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGat
 
 // inverseHoldUnpublished turns a transient database failure after a confirmed
 // DELETE into errInverseUnpublished; any other failure stays a hard one.
-func inverseHoldUnpublished(err error) error {
-	if inverseDBTransient(err) {
+func inverseHoldUnpublished(step context.Context, err error) error {
+	if inverseDBTransient(step, err) {
 		return fmt.Errorf("%w: %w", errInverseUnpublished, err)
 	}
 	return err
 }
 
-// publishConfirmed publishes a confirmed absence, retrying a database timeout
-// or lock contention, each attempt under its own inverseDBTimeout.
-// publishAbsent is idempotent, so a retry after an unacknowledged commit is safe.
+// publishConfirmed publishes a confirmed absence, retrying a database step
+// that ran out of its own inverseDBTimeout or lost to lock contention. Every
+// such failure happens before its COMMIT is sent; a failed COMMIT has an
+// unknown outcome and stops the job instead.
 func (a *inverseApplier) publishConfirmed(ctx context.Context, e inverseEntry) error {
 	for attempt := 1; ; attempt++ {
 		db, cancel := context.WithTimeout(ctx, inverseDBTimeout)
 		err := a.publishAbsent(db, e, a.opts.ManifestSHA)
+		held := inverseHoldUnpublished(db, err)
 		cancel()
-		if err == nil || !inverseDBTransient(err) || attempt == inversePublishAttempts {
-			return inverseHoldUnpublished(err)
+		if !errors.Is(held, errInverseUnpublished) || attempt == inversePublishAttempts {
+			return held
 		}
 		select {
 		case <-ctx.Done():
-			return inverseHoldUnpublished(err)
+			return held
 		case <-time.After(time.Duration(attempt) * time.Second):
 		}
 	}
@@ -619,6 +630,11 @@ func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, mani
 		return err
 	}
 	defer tx.Rollback(context.Background())
+	// The step's own bound replaces the role's statement_timeout, whose 57014
+	// would be indistinguishable from an explicit cancel.
+	if _, err = tx.Exec(ctx, `SET LOCAL statement_timeout = 0`); err != nil {
+		return err
+	}
 	if a.opts.Lane == inverseNASKeep28 {
 		if err = inverseProtectionBarrier(ctx, tx); err != nil {
 			return err
@@ -666,7 +682,9 @@ func (a *inverseApplier) publishAbsent(ctx context.Context, e inverseEntry, mani
 		return err
 	}
 	if err = tx.Commit(ctx); err != nil {
-		return err
+		// Sent but unacknowledged: it may yet take effect, so this failure is
+		// never classified as transient, retried or held.
+		return fmt.Errorf("absence publication COMMIT outcome unknown: %v", err)
 	}
 	return a.record(e, inverseAbsent, manifest)
 }

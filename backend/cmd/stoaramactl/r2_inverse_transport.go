@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -203,21 +205,31 @@ type inverseSDKStore struct {
 	*r2.Client
 	sdk       *s3.Client
 	transport http.RoundTripper
-	// confirm bounds each confirming HEAD attempt by its own timeout.
-	confirm aws.HTTPClient
+	// confirm sends each confirming HEAD attempt under its own timeout and
+	// never follows a redirect.
+	confirm *http.Client
 }
 
-// The confirming HEAD after an answered DELETE is a read, so it retries
-// transient outcomes in the SDK's standard mode: timeouts, connection errors,
-// 5xx and throttling. A 404 or 200 is an answer and never retried. The caller's
-// context still bounds every attempt: the key's network deadline and, for
-// keep-28, custody end. 4 attempts of 4s with backoff of at most 2s between
-// them take at most 22s.
+// The confirming HEAD after an answered DELETE is a read, so it alone retries:
+// at most 4 attempts of at most 4s each, with full-jitter backoff of at most
+// 2s between them, under its own 22s deadline inside the caller's network and
+// custody bounds. Only timeouts, connection errors, 429, 5xx and throttling
+// retry, and a provider's retry-after never stretches the backoff. Only a 404
+// for the exact key confirms: a redirect is refused, and a 200 fails at once.
 const (
 	inverseConfirmAttempts       = 4
 	inverseConfirmAttemptTimeout = 4 * time.Second
 	inverseConfirmMaxBackoff     = 2 * time.Second
+	inverseConfirmTimeout        = inverseConfirmAttempts*inverseConfirmAttemptTimeout + (inverseConfirmAttempts-1)*inverseConfirmMaxBackoff
 )
+
+// inverseConfirmRetryable is the SDK's default retry classification plus a
+// bare 429, which carries no throttling error code on a HEAD.
+var inverseConfirmRetryable = retry.IsErrorRetryables(append(slices.Clone(retry.DefaultRetryables), retry.RetryableHTTPStatusCode{Codes: map[int]struct{}{http.StatusTooManyRequests: {}}}))
+
+func newInverseConfirmClient(attempt time.Duration) *http.Client {
+	return &http.Client{Transport: awshttp.NewBuildableClient().GetTransport(), Timeout: attempt, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+}
 
 // newInverseDeleteHTTPTransport carries every DELETE over its own fresh HTTP/1.1
 // connection. HTTP/2 is neither offered nor negotiated: Go's HTTP/2 client
@@ -250,21 +262,30 @@ func newInverseSDKStore(ctx context.Context, cfg r2.Config) (*inverseSDKStore, e
 		o.BaseEndpoint = aws.String(cfg.Endpoint)
 		o.Retryer = aws.NopRetryer{}
 	})
-	return &inverseSDKStore{reader, sdk, transport, awshttp.NewBuildableClient().WithTimeout(inverseConfirmAttemptTimeout)}, nil
+	return &inverseSDKStore{reader, sdk, transport, newInverseConfirmClient(inverseConfirmAttemptTimeout)}, nil
 }
 
 func (s *inverseSDKStore) confirmAbsent(ctx context.Context, key string) error {
-	_, err := s.sdk.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.Bucket()), Key: aws.String(key)}, func(o *s3.Options) {
-		o.HTTPClient = s.confirm
-		o.Retryer = retry.NewStandard(func(o *retry.StandardOptions) {
-			o.MaxAttempts = inverseConfirmAttempts
-			o.MaxBackoff = inverseConfirmMaxBackoff
+	ctx, cancel := context.WithTimeout(ctx, inverseConfirmTimeout)
+	defer cancel()
+	for attempt := 1; ; attempt++ {
+		_, err := s.sdk.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.Bucket()), Key: aws.String(key)}, func(o *s3.Options) {
+			o.HTTPClient = s.confirm
+			o.Retryer = aws.NopRetryer{}
 		})
-	})
-	if err = inverseAbsence(err); err != nil {
-		return fmt.Errorf("confirming head %s: %w", key, err)
+		err = inverseAbsence(err)
+		if err == nil {
+			return nil
+		}
+		if attempt == inverseConfirmAttempts || inverseConfirmRetryable.IsErrorRetryable(err) != aws.TrueTernary {
+			return fmt.Errorf("confirming head %s after %d attempts: %w", key, attempt, err)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("confirming head %s after %d attempts: %w", key, attempt, err)
+		case <-time.After(rand.N(inverseConfirmMaxBackoff)):
+		}
 	}
-	return nil
 }
 func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDeleteAuthority) error {
 	if err := authority.requireWire(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
