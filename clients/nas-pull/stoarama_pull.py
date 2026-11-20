@@ -24190,17 +24190,6 @@ def recoverable_collated_candidate(part, item, mount):
             and part.st_size == item["size_bytes"] and part.st_nlink == 1)
 
 
-def collated_name_is_descriptor(directory_fd, name, descriptor):
-    """True only while `name` still refers to the inode held by `descriptor`."""
-    try:
-        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return False
-    opened = os.fstat(descriptor)
-    return (stat_module.S_ISREG(current.st_mode)
-            and (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino))
-
-
 def retained_collated_identity(descriptor, directory_fd, part_name, identity):
     """Require the retained descriptor and its current name to be recorded identity.
 
@@ -24239,7 +24228,9 @@ def link_collated_descriptor(item, directory_fd, name, descriptor, part_name, st
     try:
         # AT_SYMLINK_FOLLOW on the descriptor path binds the destination to the
         # exact inode that was verified, so a staged name swapped after readback
-        # can neither publish unverified bytes nor be overwritten by them.
+        # can neither publish unverified bytes nor be overwritten by them. The
+        # kernel resolves it only while that inode still has a name, so losing
+        # the last one fails here instead of publishing anything.
         os.link("/proc/self/fd/%d" % descriptor, name, dst_dir_fd=directory_fd, follow_symlinks=True)
     except FileExistsError:
         size, digest, _ = hash_collated_entry(directory_fd, name, stop_event, mount=mount)
@@ -24247,8 +24238,9 @@ def link_collated_descriptor(item, directory_fd, name, descriptor, part_name, st
             raise ExistingFileMismatch("collated final appeared with different bytes: %s" % item["nas_relative_path"])
     except FileNotFoundError:
         raise ExistingFileMismatch("collated handoff candidate was already unlinked; deferring its publication")
-    if collated_name_is_descriptor(directory_fd, part_name, descriptor):
-        os.unlink(part_name, dir_fd=directory_fd)
+    # The verified partial keeps its hidden name on purpose: it is a hard link
+    # to the published final and shares the same data blocks, so unlinking it
+    # would add the only non-atomic pathname deletion to this publication.
     os.fsync(directory_fd)
 
 
@@ -24325,10 +24317,13 @@ def download_collated_item(cfg, item, limiter, stop_event, *, mount=None, reserv
             size, digest, _ = hash_collated_entry(directory_fd, name, stop_event, mount=mount)
             if size != item["size_bytes"] or digest != item["sha256"]:
                 raise ExistingFileMismatch("existing collated file differs; it is never overwritten: %s" % relative)
-            part = collated_entry_stat(directory_fd, part_name)
-            if part is not None:
-                os.unlink(part_name, dir_fd=directory_fd)
-                os.fsync(directory_fd)
+            # A handoff readback leaves any .part exactly as found: a recovered
+            # partial is a hard link to this final and shares its data blocks.
+            if not item["handoff_readback"]:
+                part = collated_entry_stat(directory_fd, part_name)
+                if part is not None:
+                    os.unlink(part_name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
             return False
         if reserved_payload == 0:
             # Only a handoff candidate that already holds every approved byte

@@ -358,7 +358,11 @@ class CollatedDownloadTests(unittest.TestCase):
         self.assertEqual(reserved, [0])
         self.assertEqual(self.requests, [])
         self.assertEqual(self.final.read_bytes(), self.body)
-        self.assertFalse(self.part.exists())
+        # The recovered partial keeps its hidden name: it is a hard link to the
+        # published final and shares the same data blocks.
+        self.assertEqual(self.part.read_bytes(), self.body)
+        self.assertEqual(self.part.stat().st_ino, self.final.stat().st_ino)
+        self.assertEqual(self.final.stat().st_nlink, 2)
         self.assertEqual(self.runtime.capacity_reserved_bytes, 0)
         self.assert_ack_matches_final()
 
@@ -444,9 +448,13 @@ class CollatedDownloadTests(unittest.TestCase):
         replacement = b"r" * size
         actual_link = os.link
         staged = str(self.part)
+        aside = self.part.with_name("verified-aside")
 
         def swap(src, dst, **kwargs):
+            # The verified inode keeps a name, so the real linkat can resolve
+            # it, while its staged name is handed to a different inode.
             if src.startswith("/proc/self/fd/"):
+                os.replace(staged, aside)
                 alternate = self.part.with_name("swapped")
                 alternate.write_bytes(replacement)
                 os.replace(alternate, staged)
@@ -455,12 +463,24 @@ class CollatedDownloadTests(unittest.TestCase):
         with mock.patch.object(pull.os, "link", side_effect=swap):
             self.assertTrue(self.drain(free=self.handoff_floor() + size - 1))
         self.assertEqual(self.requests, [])
+        # The verified bytes are published, while the substitute keeps its own
+        # staged name and inode.
         self.assertEqual(self.final.read_bytes(), self.body)
-        self.assertEqual(self.final.stat().st_nlink, 1)
-        # The replacement keeps its staged name and its own inode.
         self.assertEqual(self.part.read_bytes(), replacement)
         self.assertNotEqual(self.part.stat().st_ino, self.final.stat().st_ino)
+        self.assertEqual(self.final.stat().st_ino, aside.stat().st_ino)
         self.assert_ack_matches_final()
+
+        # A second handoff readback of the existing final leaves that .part
+        # exactly as it is and reports the same final identity.
+        self.assertTrue(self.drain(free=self.handoff_floor() + size - 1))
+        self.assertEqual(self.requests, [])
+        self.assertEqual(len(self.acks), 2)
+        self.assertEqual(self.part.read_bytes(), replacement)
+        stat = self.final.stat()
+        self.assertEqual(self.acks[1]["handoff_readback"],
+                         [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino, stat.st_dev])
+        self.assertEqual(self.acks[1]["handoff_readback_round"], 0)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "recovered handoff partials publish through Linux linkat")
     def test_handoff_defers_when_the_verified_inode_was_already_unlinked(self):
@@ -468,22 +488,25 @@ class CollatedDownloadTests(unittest.TestCase):
         size = len(self.body)
         self.part.parent.mkdir(parents=True)
         self.part.write_bytes(self.body)
+        replacement = b"r" * size
         actual_link = os.link
         staged = str(self.part)
 
-        # The verified inode is already unlinked when publication starts, so
-        # linkat has no name to follow: defer with no final and no bytes lost.
-        def refuse_descriptor_link(src, dst, **kwargs):
+        # Replacing the staged name drops the verified inode's only name, so the
+        # real linkat has nothing to follow: defer with no final and no fetch.
+        def replace_then_link(src, dst, **kwargs):
             if src.startswith("/proc/self/fd/"):
-                os.unlink(staged)
-                raise FileNotFoundError(2, "No such file or directory", src)
+                alternate = self.part.with_name("swapped")
+                alternate.write_bytes(replacement)
+                os.replace(alternate, staged)
             return actual_link(src, dst, **kwargs)
 
-        with mock.patch.object(pull.os, "link", side_effect=refuse_descriptor_link):
+        with mock.patch.object(pull.os, "link", side_effect=replace_then_link):
             self.assertFalse(self.drain(free=self.handoff_floor() + size - 1))
+        self.assertEqual(self.requests, [])
         self.assertEqual(self.acks, [])
         self.assertFalse(self.final.exists())
-        self.assertFalse(self.part.exists())
+        self.assertEqual(self.part.read_bytes(), replacement)
         self.assertIn("already unlinked", self.errors[0]["error"])
         self.assertEqual(self.runtime.capacity_reserved_bytes, 0)
 
