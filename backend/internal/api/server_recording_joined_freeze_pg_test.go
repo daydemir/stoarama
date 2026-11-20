@@ -36,6 +36,8 @@ func requireJoinedTestReplicationRole(t *testing.T, pool *pgxpool.Pool) {
 }
 
 var joinedMigrationNames = []string{
+	// Delivery page exemptions guard the deferred delivery, nonraw and owner keep tables.
+	"0225_r2_delivery_exemptions.sql",
 	"0222_nas_stitch_durham_toolchain.sql",
 	// Owner keep holds guard the deferred retirement reservation table.
 	"0220_r2_owner_keep_prefixes.sql",
