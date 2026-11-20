@@ -471,6 +471,132 @@ class StitchIntegrationTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256((self.cfg.output_dir / output["relative_path"]).read_bytes()).hexdigest(),
                          output["readback_sha256"])
 
+    def test_durham_aac_proof_joins_two_distinct_clips_into_one_exact_output(self):
+        provenance = {"architecture": "linux-arm64", "audio_proof": pull.STITCH_AUDIO_PROOF}
+        self.cfg.durham_checkpoint = mock.Mock()
+        self.cfg.durham_v85r = mock.Mock()
+        self.cfg.durham_v85r.verify.return_value = (self.cfg.state_dir, provenance)
+        # Two 48 kHz H.264 + AAC-LC clips with distinguishable tones, so a
+        # swapped or dropped audio track cannot satisfy the exact PCM chains.
+        common = ("-c:v", "libx264", "-g", "32", "-bf", "0", "-pix_fmt", "yuv420p",
+                  "-c:a", "aac", "-aac_pns", "0", "-movie_timescale", "48000")
+        for clip, tone in zip(self.clips[:2], (450, 990)):
+            path = self.cfg.output_dir / clip["relative_path"]
+            subprocess.run([self.tools["ffmpeg"], "-nostdin", "-v", "error", "-y",
+                            "-f", "lavfi", "-i", "testsrc2=s=64x64:r=25:d=1.28",
+                            "-f", "lavfi", "-i", "sine=f=%d:r=48000:d=1.28" % tone,
+                            "-map", "0:v", "-map", "1:a", *common, str(path)], check=True)
+            clip.update(size_bytes=path.stat().st_size,
+                        sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+            sidecar = Path(str(path) + ".stoarama.json")
+            doc = json.loads(sidecar.read_text())
+            doc.update(size_bytes=clip["size_bytes"], sha256=clip["sha256"])
+            sidecar.write_text(json.dumps(doc))
+        self.task["plan"].update(clips=self.clips[:2], joins=[True], eligible=[True, True],
+                                 feature_inputs=[{}, {}])
+        score = dict(policy="v85r", join=True, nomination=True, decision="join",
+                     status="APPROVED85_nomination_requires_runtime_native_join_checks")
+        with mock.patch.object(pull.os.path, "ismount", return_value=False), \
+                mock.patch.object(pull, "stitch_v85r_measure", return_value=score) as measure:
+            result = pull.stitch_build(self.cfg, self.inventory, self.task, self.stop, self.tools,
+                                       kind=pull.StitchRunKind.DURHAM_R2)
+        # The frozen V85r join decision survives: one seam, one joined run.
+        self.assertEqual(len(result["seams"]), 1)
+        self.assertEqual(result["seams"][0]["decision"], "join")
+        self.assertEqual(measure.call_count, 1)
+        self.assertEqual(result["left_out"], [])
+        self.assertEqual(len(result["outputs"]), 1)
+        output, = result["outputs"]
+        self.assertEqual([proof["clip_id"] for proof in output["inputs"]], [1, 2])
+        self.assertFalse(output["original_sources_no_audio"])
+        self.assertTrue(all(output[key] for key in
+                            ("full_decode", "seam_decode", "native_audit", "packet_chain")))
+        audio = [proof["audio_proof"] for proof in output["inputs"]]
+        self.assertEqual([row["rule"] for row in audio], ["standalone_exact", "seam_primed"])
+        self.assertEqual([row["primer_packets"] for row in audio], [0, 1])
+        self.assertEqual([row["sample_rate"] for row in audio], [48000, 48000])
+        for row, proof in zip(audio, output["inputs"]):
+            self.assertEqual((row["sample_count"], row["packets"]), (61440, 61))
+            self.assertRegex(row["packet_chain_sha256"], "^[0-9a-f]{64}$")
+            self.assertRegex(row["pcm_chain_sha256"], "^[0-9a-f]{64}$")
+            self.assertEqual(len(proof), 9)
+        # The two tones are distinguishable, so the PCM chains must differ.
+        self.assertNotEqual(audio[0]["pcm_chain_sha256"], audio[1]["pcm_chain_sha256"])
+        published = self.cfg.output_dir / output["relative_path"]
+        self.assertEqual(hashlib.sha256(published.read_bytes()).hexdigest(), output["sha256"])
+        self.assertEqual(published.stat().st_size, output["size_bytes"])
+        self.assertEqual(output["readback_sha256"], output["sha256"])
+        # Exactly one output, no leftovers in the private scratch namespace.
+        self.assertEqual(sorted(p.name for p in published.parent.glob("run-*.mp4")),
+                         [published.name])
+        self.assertEqual(list(published.parent.glob(".stitch-*-pending-*")), [])
+        self.assertEqual([p.name for p in published.parent.iterdir() if p.name.startswith(".durham-aac-")], [])
+
+    def test_video_only_durham_provenance_keeps_the_original_audit(self):
+        provenance = {"architecture": "linux-arm64"}
+        self.cfg.durham_checkpoint = mock.Mock()
+        self.cfg.durham_v85r = mock.Mock()
+        self.cfg.durham_v85r.verify.return_value = (self.cfg.state_dir, provenance)
+        self.task["plan"].update(clips=self.clips[:2], joins=[True], eligible=[True, True],
+                                 feature_inputs=[{}, {}])
+        score = dict(policy="v85r", join=True, nomination=True, decision="join",
+                     status="APPROVED85_nomination_requires_runtime_native_join_checks")
+        with mock.patch.object(pull.os.path, "ismount", return_value=False), \
+                mock.patch.object(pull, "stitch_v85r_measure", return_value=score):
+            result = pull.stitch_build(self.cfg, self.inventory, self.task, self.stop, self.tools,
+                                       kind=pull.StitchRunKind.DURHAM_R2)
+        output, = result["outputs"]
+        self.assertTrue(output["original_sources_no_audio"])
+        self.assertTrue(all("audio_proof" not in proof for proof in output["inputs"]))
+        self.assertEqual([proof["clip_id"] for proof in output["inputs"]], [1, 2])
+
+    def test_avc3_video_only_durham_keeps_the_original_audit_under_capable_provenance(self):
+        # An ordinary Durham clip is re-tagged avc3 by the camera remux. The
+        # AAC-capable provenance must not reclassify such a video-only source.
+        for clip in self.clips[:2]:
+            path = self.cfg.output_dir / clip["relative_path"]
+            remuxed = path.with_suffix(".avc3.mp4")
+            subprocess.run([self.tools["ffmpeg"], "-nostdin", "-v", "error", "-y", "-i", str(path),
+                            "-map", "0", "-c", "copy", "-tag:v", "avc3", str(remuxed)], check=True)
+            probe = json.loads(subprocess.check_output(
+                [self.tools["ffprobe"], "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_tag_string", "-of", "json", str(remuxed)]))
+            self.assertEqual(probe["streams"][0]["codec_tag_string"], "avc3")
+            remuxed.replace(path)
+            clip.update(size_bytes=path.stat().st_size, sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+            sidecar = Path(str(path) + ".stoarama.json")
+            doc = json.loads(sidecar.read_text())
+            doc.update(size_bytes=clip["size_bytes"], sha256=clip["sha256"])
+            sidecar.write_text(json.dumps(doc))
+        self.task["plan"].update(clips=self.clips[:2], joins=[True], eligible=[True, True],
+                                 feature_inputs=[{}, {}])
+        score = dict(policy="v85r", join=True, nomination=True, decision="join",
+                     status="APPROVED85_nomination_requires_runtime_native_join_checks")
+        self.cfg.durham_checkpoint = mock.Mock()
+        self.cfg.durham_v85r = mock.Mock()
+        results = []
+        for stamp, capability in (("00-00-00Z", None), ("01-00-00Z", pull.STITCH_AUDIO_PROOF)):
+            provenance = {"architecture": "linux-arm64"}
+            if capability:
+                provenance["audio_proof"] = capability
+            self.cfg.durham_v85r.verify.return_value = (self.cfg.state_dir, provenance)
+            self.task["plan"]["output_folder"] = "stream_V85r_keep28/22/2026-09-01T" + stamp
+            with mock.patch.object(pull.os.path, "ismount", return_value=False), \
+                    mock.patch.object(pull, "stitch_v85r_measure", return_value=score):
+                results.append(pull.stitch_build(self.cfg, self.inventory, self.task, self.stop,
+                                                 self.tools, kind=pull.StitchRunKind.DURHAM_R2))
+        current, capable = results
+        # Both runs keep the established video-only audit and identical evidence.
+        for result in results:
+            output, = result["outputs"]
+            self.assertTrue(output["original_sources_no_audio"])
+            self.assertTrue(all(output[key] for key in
+                                ("full_decode", "seam_decode", "native_audit", "packet_chain")))
+            self.assertTrue(all("audio_proof" not in proof for proof in output["inputs"]))
+            self.assertEqual([proof["clip_id"] for proof in output["inputs"]], [1, 2])
+        self.assertEqual(current["outputs"][0]["inputs"], capable["outputs"][0]["inputs"])
+        self.assertEqual(current["outputs"][0]["sha256"], capable["outputs"][0]["sha256"])
+
     def cleanup_task(self,result,index=0):
         proof=result['outputs'][0]['inputs'][index]
         item=dict(self.clips[index],object_key='test/stitch/%d' % index,permit_reason='stitched_included',stitch_task_id=7,

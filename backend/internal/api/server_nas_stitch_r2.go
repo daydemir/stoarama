@@ -19,12 +19,20 @@ import (
 
 const nasDurhamParallelHours = 4
 
+// nasDurhamSourceProtocol is the exact Durham source protocol the reviewed AAC
+// worker sends. A predecessor that only speaks an earlier revision is refused
+// before it can claim, stage or report.
+const nasDurhamSourceProtocol = "r2-v3"
+
+// nasDurhamManifestSHA (nas_v85r_durham_pin.go) is now the AAC package digest
+// that nas_stitch_r2_aac_profile() pins. The 0222 predecessor digest stays the
+// expected profile only for evidence already stamped under it.
 func requireDurhamProfile(w http.ResponseWriter, r *http.Request, caller nasStitchCaller) bool {
 	if !caller.dedicated {
 		util.WriteError(w, http.StatusForbidden, "dedicated Durham key required")
 		return false
 	}
-	if r.Header.Get("X-Stoarama-Stitch-Source") != "r2-v2" ||
+	if r.Header.Get("X-Stoarama-Stitch-Source") != nasDurhamSourceProtocol ||
 		r.Header.Get("X-Stoarama-Stitch-Toolchain") != nasDurhamManifestSHA {
 		util.WriteError(w, http.StatusConflict, "reviewed native Durham toolchain required")
 		return false

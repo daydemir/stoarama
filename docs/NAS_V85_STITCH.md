@@ -88,8 +88,11 @@ without admitting incomplete source coverage. Other ready units may proceed.
 For each supported source/output, software verification checks:
 
 1. Whole input SHA/size and a fresh exact physical raw/sidecar proof.
-2. H.264 codec/extradata/timebase identity and positively **no source audio**.
-   Audio-bearing, unknown-layout and unsupported packet/frame cases retain raw.
+2. H.264 codec/extradata/timebase identity and either positively **no source
+   audio** or, on the capable Durham profile only, one exact AAC-LC track whose
+   typed per-input proof matches. The NAS-local lane stays audio-absent.
+   Audio-bearing sources that are not that exact admitted AAC-LC shape,
+   unknown-layout and unsupported packet/frame cases retain raw.
 3. Strict source/output decode through EOF with `-xerror -err_detect explode`;
    cryptographic decoded frame hashes/counts/raw presentation PTS conservation.
 4. Every video packet payload/size/duration/flags in source order, constant
@@ -264,8 +267,8 @@ uses one decoder thread, and nice19/idle yields to NAS activity. Budget roughly
 strict verified throughput. This is an estimate, not a new NAS benchmark.
 
 Deferred work: full-corpus reproduction of missing original features; review
-new current-negative bundle revisions; audio-bearing
-native runs; unsupported B-frame/edit-list layouts; and automatic import/reuse
+new current-negative bundle revisions; unsupported B-frame/edit-list layouts;
+and automatic import/reuse
 of the ~1,103 complete historical V85 hours. Existing R2 V85 presence/ETag and
 old publication receipts are not fresh NAS-native verification or deletion
 permission. This worker reuses its own exact verified local outputs after a
@@ -359,6 +362,35 @@ lease attempt. The worker checks that identity on lease, at resume and
 before processing. PostgreSQL requires matching output provenance when
 issuing a certificate, including when the API is rolled back.
 
+### Protocol and native AAC proof
+
+Durham workers now speak source protocol `r2-v3` with the exact toolchain
+manifest pinned in
+[`v85r/durham-arm64.json`](../clients/nas-pull/v85r/durham-arm64.json)
+(`manifest_sha256`; regenerate the pin and the SQL native-profile function
+together). That manifest binds the native ARM64 evaluator, both native media
+tools, the `aac-lc-primed-pcm-v1` audio rule and the SHA-256 of all four
+reviewed worker scripts. The API admits only the pair (`r2-v3`, that manifest)
+on the ordinary lease, checkpoint, result and readiness POSTs. The predecessor
+pin `7d6e12320e3a1ac48a2a390d4d9842b7a9d68116d235e49dae5ad9c82288ce51` is
+rejected under `r2-v3`, and `r2-v2` is rejected with the new pin: a mixed pair
+is always a 409, never a silent downgrade.
+
+The new provenance carries `audio_proof: aac-lc-primed-pcm-v1`, so the same
+Durham profile may now attest two-track AAC outputs as well as ordinary
+video-only hours. The worker classifies each eligible input from headers only,
+requires identical exact track configuration and time bases, then stream-copies
+both tracks into one run. Every AAC input must carry the typed per-input proof:
+exact packet and PCM chains, sample rate and visible sample count, plus
+`primer_packets`. The first input has rule `standalone_exact` with zero primed
+packets; each later input has `seam_primed` with exactly one. A missing,
+short, reordered, doubled or rate-inconsistent proof is a rejection, and an
+audio-absent output may never carry input audio proof. NAS-local provenance
+still cannot attest audio at all. Historical Durham results keep the exact
+provenance they were staged under, and the SQL certificate functions honor
+that predecessor profile so already staged and certified custody is preserved;
+only new writes take the new pin and rule.
+
 Build the native bundle with Go 1.26.5 and the exact signed-index Debian
 `ffmpeg_7.1.5-0+deb13u1_arm64.deb`:
 
@@ -367,25 +399,33 @@ python3 -B clients/nas-pull/v85r/build_durham.py \
   --ffmpeg-deb "$DEB" --out "$RELEASE/durham-arm64.tar.gz"
 ```
 
-Merge using `[skip render]`. The R2 controller owns API deployment and
-migration 0222. Pause the Durham queue and turn off API stitching before
-upgrading or rolling back. Record the serving API revision and migration set
-and reconcile expired attempts, stage grants and unresolved multipart
-operations before opening a window. Drain leased NAS output copies before
-rollback. An issued copy lease can still renew and certify after the API stitch
-switch is off. Preserve legacy staged results and their
-input holds.
+Merge using `[skip render]`. The R2 controller owns API deployment and the
+Durham schema migrations (0222, then 0233). Pause the Durham queue and turn off
+API stitching before upgrading or rolling back; start and rollback both happen
+with the queue paused and the switches off. Record the serving API revision and
+migration set and reconcile expired attempts, stage grants and unresolved
+multipart operations before opening a window. Drain leased NAS output copies
+before rollback. An issued copy lease can still renew and certify after the API
+stitch switch is off. Preserve legacy staged results and their input holds;
+0233 keeps their exact predecessor provenance valid rather than rewriting it.
 
 On the existing Debian ARM64 guest, install the signed
-`ffmpeg=7:7.1.5-0+deb13u1` package with the reviewed dependencies. Install the
-reviewed `stoarama_pull.py`, `durham_stitch.py`, and systemd unit. Put the
-profile JSON and generated bundle in the root-owned
+`ffmpeg=7:7.1.5-0+deb13u1` package with the reviewed dependencies. Install all
+four reviewed worker scripts, each exactly as pinned: `stoarama_pull.py`,
+`durham_stitch.py`, `durham_aac.py` and `delivery_coverage.py`, plus the systemd
+unit. A missing, symlinked or byte-mismatched one of those approved files stops
+the worker; unrelated extra files in the directory are not rejected (the pin
+covers exactly the four approved names). Put
+the profile JSON and generated bundle in the root-owned
 `/opt/stoarama-stitch/v85r/`. Keep the private systemd credential, service user,
-direct API and R2 origins, and macOS boot cron. The unit clears QEMU and
-dynamic-loader overrides and reserves 512 MiB of available guest memory.
-Check startup and pin verification with the queue off. Open work only after
-the matching API and schema are serving. The NAS-local client and proof
-replay use the October profile.
+direct API and R2 origins, and macOS boot cron. The unit runs
+`python3 -E -s -B`, clears QEMU and dynamic-loader overrides, and reserves
+512 MiB of available guest memory. Check startup and pin verification with the
+queue off. Open work only after the matching API and schema are serving. The
+new API rejects `r2-v2`, so the old worker must not be left running after the
+API upgrade; deploy the guest worker first or in the same window, with the
+queue paused and switches off throughout. The NAS-local client and proof replay
+use the October profile.
 
 The API grants staged output leases to connection 13 on
 `r2-copy-v7-certified-stitch` while both `NAS_STITCH_ENABLED` and

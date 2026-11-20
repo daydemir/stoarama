@@ -13,16 +13,19 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from contextlib import ExitStack
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
 from stoarama_pull import (
+    InventoryScanStopped,
     MediaCertificationError,
+    StitchHold,
+    ToolProcessError,
     cancellable_tool_output,
     certification_identity,
-    StitchHold,
     stitch_editlist_metadata,
     stitch_proof_json,
 )
@@ -44,15 +47,77 @@ TIMEOUT = 1800
 METADATA_LIMIT = 128 * 1024 * 1024
 MANIFEST_LIMIT = 8 * 1024 * 1024
 PACKET_LIMIT = 500_000
+# ashowinfo emits one line per verified PCM frame; the bound is finite and
+# follows the already verified frame count, so hour-scale AAC still fits.
+ASHOWINFO_BASE = 64 * 1024
+ASHOWINFO_PER_BLOCK = 1024
 
 
 class CoverageError(ValueError):
     """The available evidence cannot prove coverage."""
 
 
+class ProofStopped(RuntimeError):
+    """The attempt was cancelled or its absolute deadline expired.
+
+    This is never a per-source verdict: it aborts the whole proof attempt and
+    intentionally escapes the per-source verdict catch.
+    """
+
+
 def require(condition, reason):
     if not condition:
         raise CoverageError(reason)
+
+
+class Run:
+    """One attempt's explicit cancel object and absolute monotonic deadline.
+
+    Instances are accepted anywhere ``stoarama_pull`` expects a cancel event
+    (``is_set``/``wait``); the deadline rides along as bounded per-tool time.
+    """
+
+    def __init__(self, cancel=None, deadline=None):
+        self.cancel = cancel if cancel is not None else threading.Event()
+        self.deadline = deadline
+
+    @property
+    def reason(self):
+        """The stop string, or ``None`` while the attempt may continue.
+
+        This is deliberately a string property: ``stoarama_pull.stitch_check``
+        reads ``stop.reason`` directly to label the hold it raises, so a bound
+        method would leak into every native-hold message.
+        """
+        if self.cancel.is_set():
+            return "proof cancelled"
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            return "proof deadline exceeded"
+        return None
+
+    def is_set(self):
+        return self.reason is not None
+
+    def wait(self, timeout):
+        if self.deadline is not None:
+            timeout = min(timeout, max(self.deadline - time.monotonic(), 0))
+        return self.cancel.wait(timeout)
+
+    def check(self):
+        reason = self.reason
+        if reason is not None:
+            raise ProofStopped(reason)
+
+    def budget(self):
+        """Exact per-tool timeout: the remaining attempt budget, else TIMEOUT.
+
+        This is only ever the tool's own time limit. Whole-attempt expiry stays
+        with ``check``/``reason`` so a verdict is never built from it.
+        """
+        self.check()
+        if self.deadline is None:
+            return TIMEOUT
+        return min(TIMEOUT, self.deadline - time.monotonic())
 
 
 def sha256(data):
@@ -75,11 +140,27 @@ def fields(row, names):
 
 
 class Input:
-    def __init__(self, stack, path, expected=None):
-        self.file = stack.enter_context(os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb"))
+    def __init__(self, stack, path=None, expected=None, *, run=None, descriptor=None):
+        # Either an explicit no-follow path open or a borrowed integer
+        # descriptor, duplicated first so the caller keeps ownership.
+        self.run = run if run is not None else Run()
+        if (path is None) == (descriptor is None):
+            raise TypeError("supply exactly one of path or descriptor")
+        if descriptor is not None:
+            require(isinstance(descriptor, int) and not isinstance(descriptor, bool) and descriptor >= 0,
+                    "borrowed input descriptor is invalid")
+            self.file = stack.enter_context(os.fdopen(os.dup(descriptor), "rb"))
+        else:
+            self.file = stack.enter_context(os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb"))
         self.fd = self.file.fileno()
         before = os.fstat(self.fd)
         require(stat.S_ISREG(before.st_mode) and before.st_size > 0, "input is not a nonempty regular file")
+        if descriptor is not None:
+            # The dup shares the caller's file description, so this reads the
+            # shared offset now and restores it in an exit callback that runs
+            # while the duplicate is still open (callbacks unwind LIFO, before
+            # the fdopen context that owns the duplicate closes it).
+            stack.callback(os.lseek, self.fd, os.lseek(self.fd, 0, os.SEEK_CUR), os.SEEK_SET)
         self.identity = certification_identity(before)
         self.size = before.st_size
         self.path = "/dev/fd/" + str(self.fd)
@@ -92,6 +173,7 @@ class Input:
         digest = hashlib.sha256()
         offset = 0
         while offset < self.size:
+            self.run.check()
             block = os.pread(self.fd, min(1024 * 1024, self.size - offset), offset)
             require(block, "input truncated during SHA-256 readback")
             digest.update(block)
@@ -103,6 +185,7 @@ class Input:
         require(self.identity == certification_identity(os.fstat(self.fd)), "input changed during proof")
 
     def payload(self, packet):
+        self.run.check()
         data = os.pread(self.fd, packet.size, packet.position)
         require(sha256(data) == packet.digest, "packet payload differs from probe hash")
         return data
@@ -157,14 +240,27 @@ class Track:
     track_id: int
 
 
-def tool_output(command, fd, limit=METADATA_LIMIT, *, stdout_file=None):
-    return cancellable_tool_output(command, threading.Event(), TIMEOUT, stdout_limit=limit,
-                                   pass_fds=(fd,), reject_stderr=True, stdout_file=stdout_file)
+def tool_output(command, fd, limit=METADATA_LIMIT, *, stdout_file=None, stderr_file=None, run=None,
+                stderr_limit=None):
+    """Run one bounded tool; the attempt budget, not a verdict, owns expiry."""
+    run = run if run is not None else Run()
+    options = {} if stderr_limit is None else {"stderr_limit": stderr_limit}
+    try:
+        return cancellable_tool_output(command, run, run.budget(), stdout_limit=limit,
+                                       pass_fds=(fd,), reject_stderr=stderr_file is None,
+                                       stdout_file=stdout_file, stderr_file=stderr_file, **options)
+    except InventoryScanStopped as error:
+        raise ProofStopped(run.reason or "proof cancelled") from error
+    except MediaCertificationError:
+        # A tool that spent the attempt's remaining budget must abort the
+        # attempt; the per-tool TIMEOUT keeps its own verdict otherwise.
+        run.check()
+        raise
 
 
 def probe(ffprobe, source, *args):
     raw = tool_output([ffprobe, "-v", "error", "-err_detect", "explode", *MOV_INPUT,
-                       *args, "-of", "json", source.path], source.fd)
+                       *args, "-of", "json", source.path], source.fd, run=source.run)
     return json.loads(raw)
 
 
@@ -173,9 +269,10 @@ def read_packet_rows(ffprobe, source):
         tool_output([ffprobe, "-v", "error", *MOV_INPUT, "-ignore_editlist", "1",
                      "-show_packets", "-show_data_hash", "sha256", "-show_entries",
                      "packet=stream_index,pts,dts,duration,size,pos,flags,data_hash:packet_side_data",
-                     "-of", "compact=p=0", source.path], source.fd, stdout_file=rows)
+                     "-of", "compact=p=0", source.path], source.fd, stdout_file=rows, run=source.run)
         rows.seek(0)
         for count, line in enumerate(rows, 1):
+            source.run.check()
             require(count <= PACKET_LIMIT and len(line) <= 1024, "packet metadata exceeds bound")
             pairs = [entry.split("=", 1) for entry in line.decode("ascii").strip().split("|")]
             require(len(pairs) == 8 and all(len(pair) == 2 for pair in pairs),
@@ -186,11 +283,15 @@ def read_packet_rows(ffprobe, source):
             yield fields
 
 
-def read_tracks(ffprobe, source):
-    data = probe(ffprobe, source, "-ignore_editlist", "1", "-show_streams", "-show_data_hash", "sha256")
+def track_headers(streams):
+    """Validate one stream probe and return its clocked tracks and index.
+
+    This is the single track-layout validation used by the full packet proof
+    and by header-only classification, which keeps no packet inventory.
+    """
     tracks = {}
     by_index = {}
-    for stream in data["streams"]:
+    for stream in streams:
         kind = stream["codec_type"]
         require(kind in ("video", "audio") and kind not in tracks, "unsupported track layout")
         require(not stream.get("side_data_list")
@@ -218,7 +319,14 @@ def read_tracks(ffprobe, source):
         require(index not in by_index, "duplicate stream index")
         by_index[index] = track
     require("video" in tracks, "input has no video track")
+    return tracks, by_index
+
+
+def read_tracks(ffprobe, source):
+    data = probe(ffprobe, source, "-ignore_editlist", "1", "-show_streams", "-show_data_hash", "sha256")
+    tracks, by_index = track_headers(data["streams"])
     for row in read_packet_rows(ffprobe, source):
+        source.run.check()
         track = by_index[int(row["stream_index"])]
         packet = Packet.parse(row, source.size)
         require(packet.position not in track.positions
@@ -227,6 +335,22 @@ def read_tracks(ffprobe, source):
         track.positions[packet.position] = len(track.packets)
         track.packets.append(packet)
     require(all(track.packets for track in tracks.values()), "track has no packets")
+    return tracks
+
+
+def probe_headers(ffprobe, source):
+    """Header-only readback for classification: no packet inventory is kept.
+
+    The two-track validation below is only about AAC dispatch, so an inventory
+    with no audio stream maps to an empty result and the caller keeps its
+    established video-only audit. Audio absence is read from the fully parsed
+    streams, never inferred from a probe that failed.
+    """
+    data = probe(ffprobe, source, "-ignore_editlist", "1", "-show_streams", "-show_data_hash", "sha256")
+    streams = data["streams"]
+    if not any(stream.get("codec_type") == "audio" for stream in streams):
+        return {}
+    tracks, _ = track_headers(streams)
     return tracks
 
 
@@ -245,7 +369,16 @@ def media_edits(source, tracks):
         return struct.unpack_from(">Q" if wide and duration else ">I", header, offset + 8 * wide)[0]
 
     edits = {}
-    for header in stitch_editlist_metadata(source.path, threading.Event(), all_tracks=True):
+    # A stop inside the shared MP4 reader surfaces as StitchHold, whose reason
+    # is the stop string. run.check() turns a real stop into the documented
+    # ProofStopped; an ordinary hold keeps its normal verdict meaning.
+    try:
+        headers = stitch_editlist_metadata(source.path, source.run, all_tracks=True)
+    except StitchHold:
+        source.run.check()
+        raise
+    for header in headers:
+        source.run.check()
         media = bytes.fromhex(header["media_header"])
         tkhd = bytes.fromhex(header["track_header"])
         mvhd = bytes.fromhex(header["movie_header"])
@@ -318,6 +451,7 @@ def video_frames(ffmpeg, ffprobe, source, track, edit):
     frames = []
     seen = set()
     for row in data["frames"]:
+        source.run.check()
         packet = track.positions[int(row["pkt_pos"])]
         duration = int(row.get("duration", row.get("pkt_duration", 0)))
         require(packet not in seen and duration > 0 and all(row[key] == track.config[key]
@@ -328,10 +462,11 @@ def video_frames(ffmpeg, ffprobe, source, track, edit):
                           "-i", source.path, "-map", "0:v:0", "-fps_mode", "passthrough",
                           "-enc_time_base", f"{track.time_base.numerator}:{track.time_base.denominator}", "-pix_fmt", "+" + track.config["pix_fmt"],
                           "-c:v", "rawvideo", "-threads:v", "1", "-f", "framehash",
-                          "-hash", "sha256", "-"], source.fd)
+                          "-hash", "sha256", "-"], source.fd, run=source.run)
     time_base = None
     decoded = []
     for line in hashes.decode("ascii").splitlines():
+        source.run.check()
         if line.startswith("#tb 0:"):
             time_base = Fraction(line.split(":", 1)[1].strip())
         if line and not line.startswith("#"):
@@ -343,6 +478,7 @@ def video_frames(ffmpeg, ffprobe, source, track, edit):
     previous_pts = None
     result = {}
     for index, (frame, (pts, digest)) in enumerate(zip(frames, decoded)):
+        source.run.check()
         require(pts == frame.pts and (previous_pts is None or pts > previous_pts),
                 "video presentation order is ambiguous")
         previous_pts = pts
@@ -367,6 +503,7 @@ def audio_blocks(ffprobe, source, track, edit):
     blocks = {}
     offset = 0
     for row in data["packets_and_frames"]:
+        source.run.check()
         if row["type"] == "packet":
             index = track.positions[int(row["pos"])]
             side_data = row.get("side_data_list", [])
@@ -399,6 +536,7 @@ def audio_blocks(ffprobe, source, track, edit):
     require(blocks and list(blocks) == sorted(blocks), "audio presentation order is ambiguous")
     previous_end = None
     for block in blocks.values():
+        source.run.check()
         require(previous_end is None or block.pts >= previous_end, "visible audio samples overlap")
         previous_end = block.pts + block.samples
     return blocks, offset
@@ -409,18 +547,27 @@ def audio_pcm(stack, ffmpeg, ffprobe, source, track, edit):
     frame_size = int(track.config["channels"]) * 4
     expected = samples * frame_size
     pcm = stack.enter_context(tempfile.TemporaryFile())
-    os.lseek(source.fd, 0, os.SEEK_SET)
     command = [ffmpeg, *DECODE, "-hide_banner", "-v", "info", "-copyts", *MOV_INPUT,
                "-c:a", "aac_fixed", "-i", source.path, "-map", "0:a:0", "-af", "ashowinfo",
                "-c:a", "pcm_s32le", "-fs", str(expected + 1), "-f", "s32le", "-"]
     # Bind PCM byte offsets to the exact integer decoder's own frame geometry.
+    # The ashowinfo lines land in a bounded temporary sink, never in memory,
+    # and the bound follows the verified frame count so hour-scale AAC fits.
+    limit = ASHOWINFO_BASE + ASHOWINFO_PER_BLOCK * len(blocks)
     with tempfile.TemporaryFile() as log:
-        process = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=pcm, stderr=log,
-                                 env={"PATH": os.defpath}, pass_fds=(source.fd,), timeout=TIMEOUT, check=False)
-        require(process.returncode == 0, "strict integer AAC decode failed")
+        try:
+            tool_output(command, source.fd, expected + 1, stdout_file=pcm,
+                        stderr_file=log, stderr_limit=limit, run=source.run)
+        except ToolProcessError as error:
+            source.run.check()
+            raise CoverageError("strict integer AAC decode failed") from error
+        # The helper has joined its drains, so the sinks hold every byte.
+        pcm.flush()
+        log.flush()
         log.seek(0)
         reported = (line for line in log if b"Parsed_ashowinfo_" in line)
         for block in blocks.values():
+            source.run.check()
             line = next(reported, b"")
             row = dict(re.findall(rb"([a-z_]+):([^ ]+)", line))
             require(row.get(b"pts") == str(block.pts).encode("ascii")
@@ -444,7 +591,8 @@ def adts_packet(payload, config):
                   (length >> 3) & 255, ((length & 7) << 5) | 31, 252)) + payload
 
 
-def prime_aac(ffmpeg, config, prior, current, frame_size):
+def prime_aac(ffmpeg, config, prior, current, frame_size, run=None):
+    run = run if run is not None else Run()
     # ADTS can express default AAC-LC only. The full audio config is already
     # byte-identical. Check that the actual configuration is representable too.
     expected = (2 << 11) | (AAC_SAMPLE_RATES.index(int(config["sample_rate"])) << 7) | (
@@ -459,7 +607,7 @@ def prime_aac(ffmpeg, config, prior, current, frame_size):
         data = tool_output([ffmpeg, *DECODE, "-protocol_whitelist", "file,pipe", "-f", "aac",
                             "-c:a", "aac_fixed", "-i", "/dev/fd/" + str(reference.fileno()),
                             "-map", "0:a:0", "-c:a", "pcm_s32le", "-f", "s32le", "-"],
-                           reference.fileno(), AAC_FRAME_SAMPLES * frame_size * 2)
+                           reference.fileno(), AAC_FRAME_SAMPLES * frame_size * 2, run=run)
     stride = AAC_FRAME_SAMPLES * frame_size
     require(len(data) == stride * 2, "AAC seam reference must decode two full frames")
     return data[stride:]
@@ -486,10 +634,12 @@ def packet_mapping(source, output, start):
     return end, delta, extension
 
 
-def prove_video(source, output, start, count, source_base, output_base):
+def prove_video(source, output, start, count, source_base, output_base, run=None):
+    run = run if run is not None else Run()
     delta = None
     pairs = []
     for index, (pts, duration, digest) in source.items():
+        run.check()
         require(start + index in output, "a visible source video frame is absent")
         target_pts, target_duration, target_digest = output[start + index]
         shift = target_pts * output_base - pts * source_base
@@ -509,20 +659,23 @@ def prove_video(source, output, start, count, source_base, output_base):
 def prove_audio(ffmpeg, source_file, output_file, source_track, output_track, source, output, start):
     source_fd, source_blocks, frame_size = source
     output_fd, output_blocks, target_frame_size = output
+    run = source_file.run
     require(frame_size == target_frame_size, "AAC output channel geometry differs")
     seam = None
     if start:
         seam = prime_aac(ffmpeg, source_track.config,
                          output_file.payload(output_track.packets[start - 1]),
-                         source_file.payload(source_track.packets[0]), frame_size)
+                         source_file.payload(source_track.packets[0]), frame_size, run)
         first = output_blocks.get(start)
         require(first is not None, "first AAC packet after the seam is absent from delivery")
+        run.check()
         actual = os.pread(output_fd, first.decoded_samples * frame_size, first.offset * frame_size)
         require(actual == seam[first.skip * frame_size:(first.skip + first.decoded_samples) * frame_size],
                 "first AAC frame differs from the primed seam reference")
     delta = None
     rows = []
     for index, block in source_blocks.items():
+        run.check()
         target = output_blocks.get(start + index)
         require(target is not None and target.skip <= block.skip
                 and target.skip + target.samples >= block.skip + block.samples,
@@ -533,10 +686,12 @@ def prove_audio(ffmpeg, source_file, output_file, source_track, output_track, so
             delta = shift
         require(shift == delta, "output audio sample mapping is not constant")
         sample_bytes = block.samples * frame_size
+        run.check()
         written = os.pread(output_fd, sample_bytes, (target.offset + skip_difference) * frame_size)
         if index == 0 and seam is not None:
             wanted = seam[block.skip * frame_size:(block.skip + block.samples) * frame_size]
         else:
+            run.check()
             wanted = os.pread(source_fd, sample_bytes, block.offset * frame_size)
         require(len(written) == sample_bytes and written == wanted, "visible audio samples differ")
         rows.append((index, block.pts, block.samples, sha256(written)))
@@ -584,18 +739,20 @@ def manifest_part(manifest, part):
 
 def prove_source(stack, ffmpeg, ffprobe, source, tracks, mapping, output, target_tracks,
                  target_edits, target_video, target_audio):
+    source.run.check()
     edits = media_edits(source, tracks)
     require(edits["video"].display_size == target_edits["video"].display_size,
             "output MP4 video display geometry differs")
     require(first_video_idr(source, tracks["video"]), "source does not start at an H.264 IDR")
     result = {}
     for kind, track in tracks.items():
+        source.run.check()
         target_track = target_tracks[kind]
         start, packet_delta, packet_extension = mapping[kind]
         if kind == "video":
             visible = video_frames(ffmpeg, ffprobe, source, track, edits[kind])
             delta, facts = prove_video(visible, target_video, start, len(track.packets),
-                                       track.time_base, target_track.time_base)
+                                       track.time_base, target_track.time_base, source.run)
         else:
             pcm = audio_pcm(stack, ffmpeg, ffprobe, source, track, edits[kind])
             delta, facts = prove_audio(ffmpeg, source, output, track, target_track, pcm, target_audio, start)
@@ -613,11 +770,25 @@ def prove_source(stack, ffmpeg, ffprobe, source, tracks, mapping, output, target
     return result
 
 
-def prove_part(manifest, part, paths, ffmpeg, ffprobe):
-    target, candidates = manifest_part(manifest, part)
-    require(len(paths) == len(candidates) + 1, "supply the output followed by every source in manifest order")
+def prove_ordered(target, candidates, inputs, ffmpeg, ffprobe, *, cancel=None, deadline=None):
+    """Prove one output part against its sources in manifest order.
+
+    ``inputs`` are the already-open output followed by every source, in order,
+    accepting either no-follow paths or borrowed integer descriptors (duplicated
+    per use, never closed). The returned verdict rows are identical for both.
+    Cancellation or deadline expiry aborts the whole attempt as ``ProofStopped``.
+    """
+    run = Run(cancel, deadline)
+    require(len(inputs) == len(candidates) + 1, "supply the output followed by every source in manifest order")
+    run.check()
     with ExitStack() as stack:
-        output = Input(stack, paths[0], target)
+        def opened(item, expected=None):
+            run.check()
+            if isinstance(item, int) and not isinstance(item, bool):
+                return Input(stack, expected=expected, run=run, descriptor=item)
+            return Input(stack, item, expected, run=run)
+
+        output = opened(inputs[0], target)
         target_tracks = read_tracks(ffprobe, output)
         target_edits = media_edits(output, target_tracks)
         target_audio = (audio_pcm(stack, ffmpeg, ffprobe, output, target_tracks["audio"], target_edits["audio"])
@@ -625,12 +796,13 @@ def prove_part(manifest, part, paths, ffmpeg, ffprobe):
         target_video = video_frames(ffmpeg, ffprobe, output, target_tracks["video"], target_edits["video"])
         starts = dict.fromkeys(target_tracks, 0)
         mapped = []
-        for path, candidate in zip(paths[1:], candidates):
-            source = Input(stack, path, candidate)
+        for item, candidate in zip(inputs[1:], candidates):
+            source = opened(item, candidate)
             tracks = read_tracks(ffprobe, source)
             require(tracks.keys() == target_tracks.keys(), "source and output have different track layouts")
             mapping = {}
             for kind, track in tracks.items():
+                run.check()
                 start = starts[kind]
                 end, packet_delta, packet_extension = packet_mapping(track, target_tracks[kind], start)
                 mapping[kind] = (start, packet_delta, packet_extension)
@@ -641,19 +813,29 @@ def prove_part(manifest, part, paths, ffmpeg, ffprobe):
 
         result = []
         for ordinal, (candidate, source, tracks, mapping) in enumerate(mapped, 1):
+            run.check()
             row = {"source": candidate, "ordinal": ordinal}
             try:
                 with ExitStack() as raw_stack:
                     facts = prove_source(raw_stack, ffmpeg, ffprobe, source, tracks, mapping,
                                          output, target_tracks, target_edits, target_video, target_audio)
             except (CoverageError, MediaCertificationError, StitchHold, KeyError, struct.error) as error:
+                run.check()
                 row.update(verdict="not_proven", reason=str(error))
             else:
                 row.update(verdict="proven", tracks=facts)
             source.check()
             result.append(row)
         output.check()
-    return target, result
+        # A stop that lands after the last identity readback must still abort:
+        # a final source computing just before the stop is never a verdict.
+        run.check()
+    return result
+
+
+def prove_part(manifest, part, paths, ffmpeg, ffprobe):
+    target, candidates = manifest_part(manifest, part)
+    return target, prove_ordered(target, candidates, paths, ffmpeg, ffprobe)
 
 
 def main():
@@ -697,7 +879,7 @@ def main():
             "verifier_support_sha256": sha256(Path(__file__).with_name("stoarama_pull.py").read_bytes()),
             "sources": rows,
         }, sort_keys=True, separators=(",", ":")))
-    except (MediaCertificationError, StitchHold, OSError, ValueError, TypeError, KeyError,
+    except (MediaCertificationError, StitchHold, ProofStopped, OSError, ValueError, TypeError, KeyError,
             IndexError, struct.error, subprocess.SubprocessError) as error:
         print(f"delivery coverage unproven: {error}", file=sys.stderr)
         return 1

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -185,6 +186,16 @@ func TestNASStitchCheckpointAndLeasePauseUnderCleanupFreeze(t *testing.T) {
 }
 
 func TestR2StitchDurhamRequiresBidirectionalProfileProtocol(t *testing.T) {
+	// The predecessor package is a known exact pin. It must never be admitted
+	// under the current protocol, and the current generated package must never
+	// be admitted under the predecessor protocol. The generated pin's literal
+	// identity is owned by nas_v85r_durham_pin.go, the profile JSON and the SQL
+	// native-profile function, so this gate only requires that a regeneration
+	// produced a different manifest.
+	const predecessorManifest = "7d6e12320e3a1ac48a2a390d4d9842b7a9d68116d235e49dae5ad9c82288ce51"
+	if nasDurhamManifestSHA == predecessorManifest || !stitchSHA(nasDurhamManifestSHA) {
+		t.Fatalf("reviewed Durham pin did not change from the predecessor: %s", nasDurhamManifestSHA)
+	}
 	for _, test := range []struct {
 		source, manifest string
 		dedicated        bool
@@ -193,8 +204,13 @@ func TestR2StitchDurhamRequiresBidirectionalProfileProtocol(t *testing.T) {
 		{"r2-v1", nasDurhamManifestSHA, true, http.StatusConflict},
 		{"r2-v2", "", true, http.StatusConflict},
 		{"r2-v2", nasStitchManifestSHA, true, http.StatusConflict},
-		{"r2-v2", nasDurhamManifestSHA, false, http.StatusForbidden},
-		{"r2-v2", nasDurhamManifestSHA, true, http.StatusOK},
+		{"r2-v2", predecessorManifest, true, http.StatusConflict},
+		{"r2-v2", nasDurhamManifestSHA, true, http.StatusConflict},
+		{"r2-v3", "", true, http.StatusConflict},
+		{"r2-v3", nasStitchManifestSHA, true, http.StatusConflict},
+		{"r2-v3", predecessorManifest, true, http.StatusConflict},
+		{"r2-v3", nasDurhamManifestSHA, false, http.StatusForbidden},
+		{"r2-v3", nasDurhamManifestSHA, true, http.StatusOK},
 	} {
 		w := httptest.NewRecorder()
 		r := httptest.NewRequest(http.MethodPost, "/account/connections/stitch/lease", nil)
@@ -231,6 +247,9 @@ func TestDurhamProofRequiresOneNativeToolchain(t *testing.T) {
 		func(p *nasStitchProvenance) { p.FFmpegSHA = p.FFprobeSHA },
 		func(p *nasStitchProvenance) { p.FFprobeSHA = p.FFmpegSHA },
 		func(p *nasStitchProvenance) { p.FFprobeVersion = "unreviewed" },
+		// The historical capability-absent profile is not the current one.
+		func(p *nasStitchProvenance) { p.AudioProof = "" },
+		func(p *nasStitchProvenance) { p.AudioProof = "aac-lc-primed-pcm-v2" },
 	} {
 		mixed := native
 		change(&mixed)
@@ -256,6 +275,211 @@ func TestNASStitchRejectsInventedCorpusAndOffLeavesQueueUntouched(t *testing.T) 
 	var count int
 	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM nas_stitch_tasks`).Scan(&count); err != nil || count != 0 {
 		t.Fatal("master off changed queue")
+	}
+}
+
+func stitchPrimer(n int64) *int64 { return &n }
+
+func stitchAudioProofFixture() []nasStitchInputProof {
+	first := nasStitchAudioProof{Packets: 40, PacketChain: strings.Repeat("1", 64), SampleRate: 48000, SampleCount: 40 * 1024, PCMChain: strings.Repeat("2", 64), Rule: "standalone_exact", PrimerPackets: stitchPrimer(0)}
+	second := nasStitchAudioProof{Packets: 37, PacketChain: strings.Repeat("3", 64), SampleRate: 48000, SampleCount: 37 * 1024, PCMChain: strings.Repeat("4", 64), Rule: "seam_primed", PrimerPackets: stitchPrimer(1)}
+	return []nasStitchInputProof{{ID: 1, AudioProof: &first}, {ID: 2, AudioProof: &second}}
+}
+
+func TestNASStitchAudioProofAdmitsOnlyExactPrimedPCM(t *testing.T) {
+	inputs := stitchAudioProofFixture()
+	proof := nasStitchOutput{Provenance: nasStitchProvenance{AudioProof: nasStitchAudioProofRule}, Inputs: inputs}
+	if err := validateNASStitchAudioProof(proof, nasStitchOnDurham); err != nil {
+		t.Fatalf("exact AAC proof: %v", err)
+	}
+	// The reviewed Durham package now advertises exactly the primed-PCM rule,
+	// so the current profile can attest AAC.
+	if reviewedDurhamProvenance().AudioProof != nasStitchAudioProofRule {
+		t.Fatalf("reviewed provenance lost its AAC capability: %q", reviewedDurhamProvenance().AudioProof)
+	}
+	legacy := proof
+	legacy.Provenance = reviewedDurhamProvenance()
+	if err := validateNASStitchAudioProof(legacy, nasStitchOnDurham); err != nil {
+		t.Fatalf("reviewed profile refused exact AAC: %v", err)
+	}
+	// A historical profile that omitted the capability stays video-only.
+	predecessor := reviewedDurhamProvenance()
+	predecessor.AudioProof = ""
+	legacy.Provenance = predecessor
+	if err := validateNASStitchAudioProof(legacy, nasStitchOnDurham); err == nil {
+		t.Fatal("capability-absent profile activated AAC")
+	}
+	tests := map[string]func(*nasStitchOutput, *nasStitchProofOrigin){
+		"nas local origin": func(o *nasStitchOutput, origin *nasStitchProofOrigin) { *origin = nasStitchOnNAS },
+		"legacy rule label": func(o *nasStitchOutput, _ *nasStitchProofOrigin) {
+			o.Provenance.AudioProof = "aac-lc-primed-pcm"
+		},
+		"missing provenance": func(o *nasStitchOutput, _ *nasStitchProofOrigin) { o.Provenance.AudioProof = "" },
+		"no inputs":          func(o *nasStitchOutput, _ *nasStitchProofOrigin) { o.Inputs = nil },
+		"absent input proof": func(o *nasStitchOutput, _ *nasStitchProofOrigin) { o.Inputs[0].AudioProof = nil },
+		"packet chain":       func(o *nasStitchOutput, _ *nasStitchProofOrigin) { o.Inputs[0].AudioProof.PacketChain = "" },
+		"pcm chain": func(o *nasStitchOutput, _ *nasStitchProofOrigin) {
+			o.Inputs[1].AudioProof.PCMChain = strings.Repeat("A", 64)
+		},
+		"short chain":         func(o *nasStitchOutput, _ *nasStitchProofOrigin) { o.Inputs[0].AudioProof.PCMChain = "abcd" },
+		"zero packets":        func(o *nasStitchOutput, _ *nasStitchProofOrigin) { o.Inputs[0].AudioProof.Packets = 0 },
+		"unbounded packets":   func(o *nasStitchOutput, _ *nasStitchProofOrigin) { o.Inputs[0].AudioProof.Packets = 500001 },
+		"zero visible count":  func(o *nasStitchOutput, _ *nasStitchProofOrigin) { o.Inputs[0].AudioProof.SampleCount = 0 },
+		"oversampled visible": func(o *nasStitchOutput, _ *nasStitchProofOrigin) { o.Inputs[0].AudioProof.SampleCount = 40*1024 + 1 },
+		"unsupported rate": func(o *nasStitchOutput, _ *nasStitchProofOrigin) {
+			o.Inputs[0].AudioProof.SampleRate, o.Inputs[1].AudioProof.SampleRate = 12345, 12345
+		},
+		"inconsistent rate":    func(o *nasStitchOutput, _ *nasStitchProofOrigin) { o.Inputs[1].AudioProof.SampleRate = 44100 },
+		"first not standalone": func(o *nasStitchOutput, _ *nasStitchProofOrigin) { o.Inputs[0].AudioProof.Rule = "seam_primed" },
+		"first primed": func(o *nasStitchOutput, _ *nasStitchProofOrigin) {
+			o.Inputs[0].AudioProof.PrimerPackets = stitchPrimer(1)
+		},
+		"later standalone": func(o *nasStitchOutput, _ *nasStitchProofOrigin) { o.Inputs[1].AudioProof.Rule = "standalone_exact" },
+		"later unprimed": func(o *nasStitchOutput, _ *nasStitchProofOrigin) {
+			o.Inputs[1].AudioProof.PrimerPackets = stitchPrimer(0)
+		},
+		"later double primed": func(o *nasStitchOutput, _ *nasStitchProofOrigin) {
+			o.Inputs[1].AudioProof.PrimerPackets = stitchPrimer(2)
+		},
+		// An absent primer_packets key is never read as an attested zero.
+		"absent first primer": func(o *nasStitchOutput, _ *nasStitchProofOrigin) { o.Inputs[0].AudioProof.PrimerPackets = nil },
+		"absent later primer": func(o *nasStitchOutput, _ *nasStitchProofOrigin) { o.Inputs[1].AudioProof.PrimerPackets = nil },
+		"reordered ordinals": func(o *nasStitchOutput, _ *nasStitchProofOrigin) {
+			o.Inputs[0].AudioProof, o.Inputs[1].AudioProof = o.Inputs[1].AudioProof, o.Inputs[0].AudioProof
+		},
+	}
+	for name, change := range tests {
+		t.Run(name, func(t *testing.T) {
+			origin := nasStitchOnDurham
+			inputs := stitchAudioProofFixture()
+			o := nasStitchOutput{Provenance: nasStitchProvenance{AudioProof: nasStitchAudioProofRule}, Inputs: inputs}
+			change(&o, &origin)
+			if err := validateNASStitchAudioProof(o, origin); err == nil {
+				t.Fatal("inexact AAC contract admitted")
+			}
+		})
+	}
+	// A capable profile still emits ordinary video-only outputs for some hours.
+	videoOnly := nasStitchOutput{NoAudio: true, Provenance: nasStitchProvenance{AudioProof: nasStitchAudioProofRule}, Inputs: []nasStitchInputProof{{ID: 1}}}
+	if err := validateNASStitchAudioProof(videoOnly, nasStitchOnDurham); err != nil {
+		t.Fatalf("video-only output on a capable profile: %v", err)
+	}
+	videoOnly.Inputs[0].AudioProof = inputs[0].AudioProof
+	if err := validateNASStitchAudioProof(videoOnly, nasStitchOnDurham); err == nil {
+		t.Fatal("audio-absent output carried input audio proof")
+	}
+	// The NAS-local lane keeps the legacy video-only shape and no capability.
+	nasLegacy := nasStitchOutput{NoAudio: true, Inputs: []nasStitchInputProof{{ID: 1}}}
+	if err := validateNASStitchAudioProof(nasLegacy, nasStitchOnNAS); err != nil {
+		t.Fatalf("legacy audio-absent output: %v", err)
+	}
+	nasLegacy.Provenance.AudioProof = nasStitchAudioProofRule
+	if err := validateNASStitchAudioProof(nasLegacy, nasStitchOnNAS); err == nil {
+		t.Fatal("NAS-local provenance claimed an audio capability")
+	}
+	// The Python adapter's exact field names must round-trip into the typed proof.
+	var wire nasStitchInputProof
+	if err := json.Unmarshal([]byte(`{"clip_id":1,"sha256":"`+strings.Repeat("a", 64)+`","size_bytes":3,"packet_chain_sha256":"`+strings.Repeat("c", 64)+`","packets":10,"frames":10,"repaired":false,"retirement_held":true,"audio_proof":{"packets":40,"packet_chain_sha256":"`+strings.Repeat("1", 64)+`","sample_rate":48000,"sample_count":40960,"pcm_chain_sha256":"`+strings.Repeat("2", 64)+`","rule":"standalone_exact","primer_packets":0}}`), &wire); err != nil || wire.AudioProof == nil || !reflect.DeepEqual(wire.AudioProof, inputs[0].AudioProof) || *wire.AudioProof.PrimerPackets != 0 {
+		t.Fatalf("adapter audio fields differ: %v %+v", err, wire.AudioProof)
+	}
+	// Decoding the same object without the key must leave a nil primer.
+	var missing nasStitchInputProof
+	if err := json.Unmarshal([]byte(`{"audio_proof":{"packets":40,"packet_chain_sha256":"`+strings.Repeat("1", 64)+`","sample_rate":48000,"sample_count":40960,"pcm_chain_sha256":"`+strings.Repeat("2", 64)+`","rule":"standalone_exact"}}`), &missing); err != nil || missing.AudioProof == nil || missing.AudioProof.PrimerPackets != nil {
+		t.Fatalf("absent primer_packets decoded as attested: %v %+v", err, missing.AudioProof)
+	}
+}
+
+func TestNASStitchDurhamExactAACAndVideoOnlyProof(t *testing.T) {
+	p, q := stitchUnitFixture()
+	// A Durham result omits raw physical custody and always holds retirement.
+	durham := func() nasStitchResult {
+		d := q
+		d.Outputs = append([]nasStitchOutput(nil), q.Outputs...)
+		o := &d.Outputs[0]
+		o.Provenance = reviewedDurhamProvenance()
+		o.Inputs = append([]nasStitchInputProof(nil), q.Outputs[0].Inputs...)
+		for n := range o.Inputs {
+			o.Inputs[n].RawProof = nil
+			o.Inputs[n].RetirementHeld = true
+		}
+		return d
+	}
+	// Exact two-input AAC join: the typed per-input proof on both inputs.
+	aac := durham()
+	aac.Outputs[0].NoAudio = false
+	for n, proof := range stitchAudioProofFixture() {
+		aac.Outputs[0].Inputs[n].AudioProof = proof.AudioProof
+	}
+	if _, err := validateNASStitchProof(p, aac, nasStitchOnDurham); err != nil {
+		t.Fatalf("exact Durham AAC proof: %v", err)
+	}
+	for name, change := range map[string]func(*nasStitchOutput){
+		"dropped later proof": func(o *nasStitchOutput) { o.Inputs[1].AudioProof = nil },
+		"silent second input": func(o *nasStitchOutput) {
+			o.Inputs[1].AudioProof.Rule, o.Inputs[1].AudioProof.PrimerPackets = "standalone_exact", stitchPrimer(0)
+		},
+		"carried raw custody": func(o *nasStitchOutput) { o.Inputs[0].RawProof = []byte(`{}`) },
+		"audio proof unheld": func(o *nasStitchOutput) {
+			o.Inputs[1].RetirementHeld = false
+		},
+	} {
+		t.Run("reject "+name, func(t *testing.T) {
+			broken := durham()
+			broken.Outputs[0].NoAudio = false
+			for n, proof := range stitchAudioProofFixture() {
+				broken.Outputs[0].Inputs[n].AudioProof = proof.AudioProof
+			}
+			change(&broken.Outputs[0])
+			if _, err := validateNASStitchProof(p, broken, nasStitchOnDurham); err == nil {
+				t.Fatal("inexact Durham AAC proof admitted")
+			}
+		})
+	}
+	// The same capable profile also emits ordinary video-only hours.
+	videoOnly := durham()
+	if !videoOnly.Outputs[0].NoAudio || videoOnly.Outputs[0].Provenance.AudioProof != nasStitchAudioProofRule {
+		t.Fatal("fixture is not the capable video-only shape")
+	}
+	if _, err := validateNASStitchProof(p, videoOnly, nasStitchOnDurham); err != nil {
+		t.Fatalf("capable video-only proof: %v", err)
+	}
+	videoOnly.Outputs[0].Inputs[0].AudioProof = stitchAudioProofFixture()[0].AudioProof
+	if _, err := validateNASStitchProof(p, videoOnly, nasStitchOnDurham); err == nil {
+		t.Fatal("audio-absent output carried typed AAC proof")
+	}
+}
+
+func TestNASStitchProofStillRequiresAudioAbsenceOrReview(t *testing.T) {
+	p, q := stitchUnitFixture()
+	// Same custody, video and NAS-local provenance evidence, plus AAC fields.
+	audio := stitchAudioProofFixture()
+	q.Outputs[0].NoAudio = false
+	for n := range q.Outputs[0].Inputs {
+		q.Outputs[0].Inputs[n].AudioProof = audio[n].AudioProof
+	}
+	// Exact base evidence, but the reviewed NAS-local package cannot attest audio.
+	if _, err := validateNASStitchResult(p, q); err == nil || err.Error() != "AAC output requires the reviewed Durham primed-PCM capability" {
+		t.Fatalf("NAS lane admitted AAC output: %v", err)
+	}
+	q.Outputs[0].Provenance.AudioProof = nasStitchAudioProofRule
+	// NAS-local provenance rejects the capability before the audio gate runs.
+	if _, err := validateNASStitchResult(p, q); err == nil || err.Error() != "complete durable native output verification required" {
+		t.Fatalf("NAS-local provenance claimed the capability: %v", err)
+	}
+	// An unreviewed Durham package leaves base durable verification first.
+	durham := q
+	durham.Outputs = append([]nasStitchOutput(nil), q.Outputs...)
+	durham.Outputs[0].Provenance = nasStitchProvenance{AudioProof: nasStitchAudioProofRule}
+	if _, err := validateNASStitchProof(p, durham, nasStitchOnDurham); err == nil || err.Error() != "complete durable native output verification required" {
+		t.Fatalf("unreviewed Durham package reached the AAC gate: %v", err)
+	}
+	q.Outputs[0].NoAudio = true
+	q.Outputs[0].Provenance.AudioProof = ""
+	for n := range q.Outputs[0].Inputs {
+		q.Outputs[0].Inputs[n].AudioProof = nil
+	}
+	if _, err := validateNASStitchResult(p, q); err != nil {
+		t.Fatalf("legacy audio-absent proof regressed: %v", err)
 	}
 }
 

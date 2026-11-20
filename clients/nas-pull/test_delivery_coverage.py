@@ -6,10 +6,13 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 import delivery_coverage as verifier
 
@@ -23,7 +26,7 @@ def sha(data):
 
 
 @unittest.skipUnless(FFMPEG and FFPROBE, "media tools are unavailable")
-class DeliveryCoverageTest(unittest.TestCase):
+class CoverageFixture(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         scratch = tempfile.TemporaryDirectory()
@@ -47,7 +50,7 @@ class DeliveryCoverageTest(unittest.TestCase):
         subprocess.run([FFMPEG, "-nostdin", "-v", "error", "-y", *args], cwd=cls.root,
                        check=True, capture_output=True, timeout=30)
 
-    def verify(self, delivered, *sources, manifest_digest=None, members=("one", "two"), manifest_path=None):
+    def manifest(self, delivered, *sources, members=("one", "two")):
         def identity(name):
             path = self.root / (name + ".mp4")
             return {"object_key": f"{name}.mp4", "size_bytes": path.stat().st_size, "sha256": sha(path.read_bytes())}
@@ -60,9 +63,12 @@ class DeliveryCoverageTest(unittest.TestCase):
                           start_utc=f"2026-11-19T00:00:0{second}Z", end_utc=f"2026-11-19T00:00:0{second + 2}Z")}
             for name, clip_id, second in zip(members, (110, 120), (0, 2))
         ]
-        manifest = json.dumps(dict(schema_version=1, policy_version="collation-v2", generation=2, status="collated",
-                                   recording_id=9, batch_id="fixture", hour_id="fixture-hour",
-                                   outputs=[output], clips=clips)).encode()
+        return dict(schema_version=1, policy_version="collation-v2", generation=2, status="collated",
+                    recording_id=9, batch_id="fixture", hour_id="fixture-hour",
+                    outputs=[output], clips=clips)
+
+    def verify(self, delivered, *sources, manifest_digest=None, members=("one", "two"), manifest_path=None):
+        manifest = json.dumps(self.manifest(delivered, *sources, members=members)).encode()
         path = manifest_path or self.root / "manifest.json"
         if manifest_path is None:
             path.write_bytes(manifest)
@@ -72,6 +78,8 @@ class DeliveryCoverageTest(unittest.TestCase):
                                *(f"{source}.mp4" for source in sources)], cwd=self.root,
                               capture_output=True, text=True, timeout=30)
 
+
+class DeliveryCoverageTest(CoverageFixture):
     def test_proves_visible_video_and_integer_aac_through_seam(self):
         result = self.verify("delivery", "one", "two")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -229,6 +237,137 @@ class DeliveryCoverageTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("manifest differs from the pinned SHA-256", result.stderr)
         self.assertEqual(result.stdout, "")
+
+
+@unittest.skipUnless(FFMPEG and FFPROBE, "media tools are unavailable")
+class ReusableVerifierTest(CoverageFixture):
+    """prove_ordered is the reusable slice behind prove_part and the CLI."""
+
+    def ordered(self, delivered, *sources, **options):
+        manifest = self.manifest(delivered, *sources)
+        target, candidates = verifier.manifest_part(manifest, 1)
+        paths = [self.root / f"{delivered}.mp4", *(self.root / f"{source}.mp4" for source in sources)]
+        return target, verifier.prove_ordered(target, candidates, paths, FFMPEG, FFPROBE, **options)
+
+    def test_ordered_paths_match_the_cli_verdict_rows(self):
+        result = self.verify("delivery", "one", "two")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        _, rows = self.ordered("delivery", "one", "two")
+        self.assertEqual(rows, json.loads(result.stdout)["sources"])
+
+    def test_borrowed_descriptors_match_paths_and_keep_ownership(self):
+        descriptors = []
+        try:
+            for name in ("delivery", "one", "two"):
+                descriptors.append(os.open(self.root / f"{name}.mp4", os.O_RDONLY | os.O_NOFOLLOW))
+            _, borrowed = self.ordered("delivery", "one", "two")
+            # Same inputs as integer descriptors: identical verdict rows.
+            manifest = self.manifest("delivery", "one", "two")
+            target, candidates = verifier.manifest_part(manifest, 1)
+            _, from_fds = (target, verifier.prove_ordered(target, candidates, descriptors, FFMPEG, FFPROBE))
+            self.assertEqual(from_fds, borrowed)
+            for descriptor, name in zip(descriptors, ("delivery", "one", "two")):
+                self.assertEqual(os.fstat(descriptor).st_size, (self.root / f"{name}.mp4").stat().st_size)
+                # Ownership retained: the original descriptor is still open,
+                # still at its original offset, and still readable.
+                self.assertEqual(os.lseek(descriptor, 0, os.SEEK_CUR), 0)
+                self.assertTrue(os.pread(descriptor, 1, 0))
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+
+    def test_pre_cancelled_attempt_stops_before_any_source_verdict(self):
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaisesRegex(verifier.ProofStopped, "cancelled"):
+            self.ordered("delivery", "one", "two", cancel=cancel)
+
+    def test_expired_deadline_stops_the_whole_attempt(self):
+        with self.assertRaisesRegex(verifier.ProofStopped, "deadline"):
+            self.ordered("delivery", "one", "two", deadline=time.monotonic() - 1)
+
+    def test_cancellation_escapes_the_per_source_verdict_catch(self):
+        original = verifier.prove_source
+        for label, stop_after, expected in (("first", 1, 1), ("final", 2, 2)):
+            with self.subTest(cancelled_after=label):
+                cancel = threading.Event()
+                results = []
+
+                def prove_then_cancel(*args, **kwargs):
+                    results.append(original(*args, **kwargs))
+                    if len(results) == stop_after:
+                        cancel.set()
+                    return results[-1]
+
+                with mock.patch.object(verifier, "prove_source", side_effect=prove_then_cancel):
+                    with self.assertRaisesRegex(verifier.ProofStopped, "cancelled"):
+                        self.ordered("delivery", "one", "two", cancel=cancel)
+                # The abort is never a verdict row, even when the cancel lands
+                # after the final source computed and its readback finished.
+                self.assertEqual(len(results), expected)
+
+    def test_deadline_aborts_mid_decode_instead_of_a_verdict(self):
+        calls = {"count": 0}
+        cancel = threading.Event()
+
+        def budget_then_expire(run):
+            calls["count"] += 1
+            if calls["count"] > 2:
+                run.deadline = time.monotonic() - 1
+
+        original = verifier.Run.budget
+
+        def budget(run):
+            remaining = original(run)
+            budget_then_expire(run)
+            return remaining
+
+        with mock.patch.object(verifier.Run, "budget", autospec=True, side_effect=budget):
+            with self.assertRaisesRegex(verifier.ProofStopped, "deadline"):
+                self.ordered("delivery", "one", "two", cancel=cancel, deadline=time.monotonic() + 600)
+
+    def test_cancel_while_parsing_the_output_edit_is_ProofStopped(self):
+        cancel = threading.Event()
+        calls = []
+
+        def stop_while_reading_output(source, stop, **kwargs):
+            calls.append(stop)
+            cancel.set()
+            # The shared MP4 reader labels its hold with stop.reason; that is
+            # the same string Run.check() turns into ProofStopped.
+            raise verifier.StitchHold(stop.reason)
+
+        with mock.patch.object(verifier, "stitch_editlist_metadata", side_effect=stop_while_reading_output):
+            with self.assertRaisesRegex(verifier.ProofStopped, "^proof cancelled$"):
+                self.ordered("delivery", "one", "two", cancel=cancel)
+        # The output edit is parsed before any source verdict exists.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].reason, "proof cancelled")
+
+    def test_uncancelled_edit_hold_keeps_its_ordinary_meaning(self):
+        original = verifier.stitch_editlist_metadata
+        calls = []
+
+        def hold_on_the_first_source(source, stop, **kwargs):
+            calls.append(source)
+            if len(calls) == 2:  # the output edit parses first, then source one
+                raise verifier.StitchHold("invalid or excessive MP4 boxes")
+            return original(source, stop, **kwargs)
+
+        with mock.patch.object(verifier, "stitch_editlist_metadata", side_effect=hold_on_the_first_source):
+            _, rows = self.ordered("delivery", "one", "two")
+        # No stop was requested, so the hold stays a per-source verdict.
+        self.assertEqual([row["verdict"] for row in rows], ["not_proven", "proven"])
+        self.assertEqual(rows[0]["reason"], "invalid or excessive MP4 boxes")
+
+    def test_aac_pcm_stderr_sink_keeps_the_ashowinfo_parser_working(self):
+        with ExitStack() as stack:
+            item = verifier.Input(stack, self.root / "one.mp4")
+            track = verifier.read_tracks(FFPROBE, item)["audio"]
+            edit = verifier.media_edits(item, verifier.read_tracks(FFPROBE, item))["audio"]
+            fd, blocks, frame_size = verifier.audio_pcm(stack, FFMPEG, FFPROBE, item, track, edit)
+            self.assertEqual(os.fstat(fd).st_size, sum(block.decoded_samples for block in blocks.values()) * frame_size)
+            self.assertTrue(blocks)
 
 
 if __name__ == "__main__":
