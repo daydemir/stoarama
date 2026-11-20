@@ -24391,40 +24391,61 @@ def fetch_collated_handoff_check(cfg):
     return response["check"]
 
 
+def collated_handoff_binding(check):
+    if not isinstance(check, dict) or not {"id", "manifest_sha256", "mount"} <= check.keys():
+        raise ValueError("invalid NAS handoff check identity")
+    check_id, mount_pin = check["id"], check["mount"]
+    digest = valid_sha256(check["manifest_sha256"], "NAS handoff path check")
+    if (type(check_id) is not int or check_id <= 0 or not isinstance(mount_pin, list) or len(mount_pin) != 2
+            or any(type(value) is not int or value < 0 for value in mount_pin) or mount_pin[1] == 0):
+        raise ValueError("invalid NAS handoff check identity")
+    return {"id": check_id, "manifest_sha256": digest, "mount": mount_pin}
+
+
+def persist_collated_handoff(cfg, binding):
+    # The pinned bootstrap rolls back only "running" and "self_update". Mark
+    # this drained state durably before a journal could block a predecessor.
+    runtime = read_json(cfg.runtime_file, {})
+    runtime["exit"] = "delivery_handoff_check"
+    atomic_write(cfg.runtime_file, json.dumps(runtime, separators=(",", ":")).encode("utf-8"))
+    atomic_write(collated_handoff_pending(cfg), json.dumps(binding, separators=(",", ":")).encode("utf-8"))
+
+
 def check_collated_handoff_paths(cfg, stop_event):
     target = "/account/collated/handoff-check"
     pending = collated_handoff_pending(cfg)
     recovering = os.path.lexists(pending)
+    previous = None
     if recovering:
         fd = os.open(pending, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as journal:
             if not stat_module.S_ISREG(os.fstat(journal.fileno()).st_mode):
                 raise ValueError("NAS handoff journal is not a regular file")
-            raw = journal.read((8 << 20) + 4097)
-        if len(raw) > (8 << 20) + 4096:
-            raise ValueError("NAS handoff pending check exceeds its bound")
-        check = json.loads(raw)
-    else:
-        check = fetch_collated_handoff_check(cfg)
+            raw = journal.read(4097)
+        if len(raw) > 4096:
+            raise ValueError("NAS handoff pending identity exceeds its bound")
+        binding = collated_handoff_binding(json.loads(raw))
+        decision = request_json(cfg, "GET", "%s?check_id=%d" % (target, binding["id"]), read_limit=4096)
+        if decision == {"status": "pending"}:
+            previous = binding
+        elif decision not in ({"status": "accepted"}, {"status": "superseded"}, {"status": "cancelled"}):
+            raise RuntimeError("NAS handoff check acceptance is unresolved")
+    check = fetch_collated_handoff_check(cfg)
     if check is None:
+        if previous is not None:
+            raise RuntimeError("NAS handoff check is pending without an active challenge")
+        if recovering:
+            pending.unlink()
+            fsync_dir(pending.parent)
         return
     if not isinstance(check, dict) or set(check) != {"id", "manifest_sha256", "mount", "files"}:
         raise ValueError("invalid NAS handoff path check")
-    check_id, mount_pin, files = check["id"], check["mount"], check["files"]
-    digest = valid_sha256(check["manifest_sha256"], "NAS handoff path check")
-    if (type(check_id) is not int or check_id <= 0 or not isinstance(mount_pin, list) or len(mount_pin) != 2
-            or any(type(value) is not int or value < 0 for value in mount_pin) or mount_pin[1] == 0
-            or not isinstance(files, list) or not 1 <= len(files) <= 20000):
+    binding = collated_handoff_binding(check)
+    if previous is not None and previous != binding:
+        raise RuntimeError("NAS handoff pending challenge changed")
+    check_id, mount_pin, files = binding["id"], binding["mount"], check["files"]
+    if not isinstance(files, list) or not 1 <= len(files) <= 20000:
         raise ValueError("invalid NAS handoff path check bounds")
-    if recovering:
-        decision = request_json(cfg, "GET", "%s?check_id=%d" % (target, check_id), read_limit=4096)
-        if decision in ({"status": "accepted"}, {"status": "superseded"}):
-            pending.unlink()
-            fsync_dir(pending.parent)
-            log("INFO", "NAS handoff path check %d %s" % (check_id, decision["status"]))
-            return
-        if decision != {"status": "pending"}:
-            raise RuntimeError("NAS handoff check acceptance is unresolved")
     paths = []
     previous = 0
     for row in files:
@@ -24491,14 +24512,14 @@ def check_collated_handoff_paths(cfg, stop_event):
             watch.require_unchanged()
         if stop_event.is_set():
             raise CollatedDownloadStopped("NAS handoff path check stopped")
-        report = {"id": check_id, "manifest_sha256": digest, "mount": mount_pin}
+        report = dict(binding)
         if failed is not None:
             report["failed_output_id"] = failed
         # Keep the process writer lock through the authoritative outcome. The
         # durable journal blocks all normal writer starts if the outcome is lost.
-        atomic_write(pending, json.dumps(check, separators=(",", ":")).encode("utf-8"))
+        persist_collated_handoff(cfg, binding)
         reply = request_json(cfg, "POST", target, body=report)
-        if reply != {"ok": True}:
+        if not isinstance(reply, dict) or set(reply) != {"ok"} or reply["ok"] is not True:
             raise RuntimeError("NAS handoff check acceptance is unresolved")
         outcome = "complete" if failed is None else "withheld output %d" % failed
         pending.unlink()
@@ -24533,13 +24554,8 @@ def drain_collated(cfg, runtime, stop_event):
         raise RuntimeError("collated response is invalid")
     policy = valid_collated_policy(page["policy"])
     if policy["handoff_check"]:
-        check = fetch_collated_handoff_check(cfg)
-        if check is not None:
-            # Persist the challenge before draining. Confirmation itself only
-            # runs on the next process start, before any media writer starts.
-            atomic_write(collated_handoff_pending(cfg), json.dumps(check, separators=(",", ":")).encode("utf-8"))
-            runtime.handoff_final_check_requested.set()
-            return False
+        runtime.handoff_final_check_requested.set()
+        return False
     next_id = page["next_after_id"]
     if type(next_id) is not int or next_id < 0 or (next_id != 0 and next_id <= runtime.collated_after_id):
         raise RuntimeError("collated cursor is invalid")
@@ -52654,7 +52670,11 @@ def run(cfg):
         elif not joined_stuck:
             inventory.close()
         if not joined_stuck:
-            lock_handle.close()
+            try:
+                if runtime.handoff_final_check_requested.is_set():
+                    check_collated_handoff_paths(cfg, threading.Event())
+            finally:
+                lock_handle.close()
         else:
             raise RuntimeError("joined delivery worker did not stop")
     return 0

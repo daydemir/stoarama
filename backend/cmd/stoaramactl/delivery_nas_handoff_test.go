@@ -173,6 +173,37 @@ INSERT INTO delivery_keep_holds SELECT 'stoarama',object_key,
 	if err := writeDeliveryNASFileList(dest, list); err == nil {
 		t.Fatal("file list overwrote a published artifact")
 	}
+	tx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := requestDeliveryNASFinalCheck(ctx, tx, summary); err != nil {
+		tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pauseDeliveryNASHandoff(ctx, tx); err != nil {
+		tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var accepted, cancelled int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FILTER(WHERE checked_at IS NOT NULL),
+ count(*) FILTER(WHERE cancelled_at IS NOT NULL) FROM delivery_nas_handoff_checks`).Scan(&accepted, &cancelled); err != nil ||
+		accepted != 1 || cancelled != 1 {
+		t.Fatalf("pause did not resolve the unanswered check: accepted=%d cancelled=%d err=%v", accepted, cancelled, err)
+	}
+	if _, err := deliveryNASCollectFileList(ctx, pool, summary, keep); err == nil {
+		t.Fatal("file list exported using a cancelled latest check")
+	}
 	if _, err := pool.Exec(ctx, "UPDATE delivery_keep_holds SET etag='changed' WHERE object_key LIKE '%/1.mp4'"); err != nil {
 		t.Fatal(err)
 	}

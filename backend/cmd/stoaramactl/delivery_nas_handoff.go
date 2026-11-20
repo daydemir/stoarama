@@ -296,6 +296,9 @@ func startDeliveryNASFinalRecheck(ctx context.Context, tx pgx.Tx, summary delive
 }
 
 func requestDeliveryNASFinalCheck(ctx context.Context, tx pgx.Tx, summary deliveryNASManifestSummary) (int64, error) {
+	if _, err := tx.Exec(ctx, `SELECT id FROM connections WHERE id=13 FOR SHARE`); err != nil {
+		return 0, err
+	}
 	var round int64
 	err := tx.QueryRow(ctx, deliveryNASCompleteRoundSQL+`,
  ready AS (
@@ -310,17 +313,27 @@ func requestDeliveryNASFinalCheck(ctx context.Context, tx pgx.Tx, summary delive
  ), requested AS (
   INSERT INTO delivery_nas_handoff_checks(roster_sha256,round,manifest,manifest_sha256)
   SELECT $1,round,manifest,encode(sha256(convert_to(manifest::text,'UTF8')),'hex') FROM ready
-  ON CONFLICT(roster_sha256,round) WHERE checked_at IS NULL DO NOTHING RETURNING round
+  ON CONFLICT(roster_sha256,round) WHERE checked_at IS NULL AND cancelled_at IS NULL DO NOTHING RETURNING round
  )
  SELECT round FROM requested
  UNION ALL SELECT ready.round FROM ready JOIN delivery_nas_handoff_checks existing
   ON existing.roster_sha256=$1 AND existing.round=ready.round AND existing.manifest=ready.manifest
-   AND existing.checked_at IS NULL
+   AND existing.checked_at IS NULL AND existing.cancelled_at IS NULL
  `, summary.RosterSHA, summary.PicksSHA, summary.Rows, summary.Bytes).Scan(&round)
 	if errors.Is(err, pgx.ErrNoRows) {
 		err = errors.New("the complete final NAS readback round is required before requesting the path check")
 	}
 	return round, err
+}
+
+func pauseDeliveryNASHandoff(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, "UPDATE connections SET delivery_nas_handoff_enabled=false WHERE id=13"); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `UPDATE delivery_nas_handoff_checks SET cancelled_at=clock_timestamp()
+ WHERE checked_at IS NULL AND cancelled_at IS NULL AND roster_sha256=(
+ SELECT delivery_nas_handoff_roster_sha256 FROM connections WHERE id=13)`)
+	return err
 }
 
 func runDeliveryNASHandoff(ctx context.Context, cfg config.Config, args []string) {
@@ -330,7 +343,15 @@ func runDeliveryNASHandoff(ctx context.Context, cfg config.Config, args []string
 			log.Fatal(err)
 		}
 		defer pool.Close()
-		if _, err := pool.Exec(ctx, "UPDATE connections SET delivery_nas_handoff_enabled=false WHERE id=13"); err != nil {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		if err := pauseDeliveryNASHandoff(ctx, tx); err != nil {
+			log.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
 			log.Fatal(err)
 		}
 		fmt.Println("NAS delivery handoff copy paused")

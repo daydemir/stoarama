@@ -127,17 +127,20 @@ CREATE TABLE delivery_nas_handoff_checks (
  manifest_sha256 text NOT NULL CHECK(manifest_sha256=encode(sha256(convert_to(manifest::text,'UTF8')),'hex')),
  requested_at timestamptz NOT NULL DEFAULT clock_timestamp(),
  checked_at timestamptz,
+ cancelled_at timestamptz,
  failed_output_id bigint REFERENCES delivery_nas_handoff_outputs(output_id) ON DELETE RESTRICT,
  FOREIGN KEY(roster_sha256,round) REFERENCES delivery_nas_handoff_rounds(roster_sha256,round) ON DELETE RESTRICT,
  CHECK (failed_output_id IS NULL OR checked_at IS NOT NULL),
- CHECK (checked_at IS NULL OR checked_at>=requested_at)
+ CHECK (checked_at IS NULL OR checked_at>=requested_at),
+ CHECK (cancelled_at IS NULL OR (cancelled_at>=requested_at AND checked_at IS NULL))
 );
 CREATE UNIQUE INDEX delivery_nas_handoff_checks_pending
- ON delivery_nas_handoff_checks(roster_sha256,round) WHERE checked_at IS NULL;
+ ON delivery_nas_handoff_checks(roster_sha256,round) WHERE checked_at IS NULL AND cancelled_at IS NULL;
 CREATE INDEX delivery_nas_handoff_checks_latest ON delivery_nas_handoff_checks(roster_sha256,round,id DESC);
 CREATE FUNCTION guard_delivery_nas_handoff_check() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
- IF TG_OP='DELETE' OR OLD.checked_at IS NOT NULL OR NEW.checked_at IS NULL
+ IF TG_OP='DELETE' OR OLD.checked_at IS NOT NULL OR OLD.cancelled_at IS NOT NULL
+    OR (NEW.checked_at IS NULL AND NEW.cancelled_at IS NULL)
     OR ROW(OLD.id,OLD.roster_sha256,OLD.round,OLD.manifest,OLD.manifest_sha256,OLD.requested_at)
        IS DISTINCT FROM ROW(NEW.id,NEW.roster_sha256,NEW.round,NEW.manifest,NEW.manifest_sha256,NEW.requested_at) THEN
   RAISE EXCEPTION 'delivery NAS handoff metadata check is immutable';

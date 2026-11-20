@@ -25,7 +25,7 @@ const deliveryNASHandoffActiveCheckSQL = `
  JOIN connections c ON c.id=13 AND c.delivery_nas_handoff_enabled
   AND c.delivery_nas_handoff_roster_sha256=q.roster_sha256
  JOIN delivery_nas_handoff_mounts m ON m.roster_sha256=q.roster_sha256
- WHERE NOT (` + deliveryNASHandoffCheckSupersededSQL + `)`
+ WHERE q.cancelled_at IS NULL AND NOT (` + deliveryNASHandoffCheckSupersededSQL + `)`
 
 type deliveryNASHandoffCheckResult struct {
 	ID           int64    `json:"id"`
@@ -53,7 +53,8 @@ func (s *Server) handleAccountDeliveryNASHandoffCheck(w http.ResponseWriter, r *
 			}
 			var status string
 			err = s.pool.QueryRow(ctx, `SELECT CASE WHEN `+deliveryNASHandoffCheckSupersededSQL+`
- THEN 'superseded' WHEN q.checked_at IS NOT NULL THEN 'accepted' ELSE 'pending' END
+ THEN 'superseded' WHEN q.cancelled_at IS NOT NULL THEN 'cancelled'
+ WHEN q.checked_at IS NOT NULL THEN 'accepted' ELSE 'pending' END
  FROM delivery_nas_handoff_checks q WHERE q.id=$1`, id).Scan(&status)
 			if errors.Is(err, pgx.ErrNoRows) {
 				util.WriteError(w, http.StatusNotFound, "NAS handoff check not found")
@@ -99,7 +100,7 @@ func (s *Server) handleAccountDeliveryNASHandoffCheck(w http.ResponseWriter, r *
      WHERE p.output_id=$5 AND p.roster_sha256=q.roster_sha256))
  )
  UPDATE delivery_nas_handoff_checks q SET checked_at=clock_timestamp(),failed_output_id=nullif($5,0)
- FROM active WHERE q.id=active.id AND q.checked_at IS NULL`,
+ FROM active WHERE q.id=active.id AND q.checked_at IS NULL AND q.cancelled_at IS NULL`,
 		req.ID, req.ManifestSHA, req.Mount[0], req.Mount[1], req.FailedOutput)
 	if err != nil {
 		util.WriteError(w, http.StatusServiceUnavailable, "record NAS handoff path check")

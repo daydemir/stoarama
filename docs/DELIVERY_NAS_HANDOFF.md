@@ -57,9 +57,10 @@ missing file can be copied and a conflicting final file is preserved for
 reconciliation. Receipts from preceding rounds remain as history.
 
 When the final recheck completes, rerun the preview with
-`--request-final-check`. The verified NAS client saves the request and drains
-its writers. Its existing service restart takes the NAS client process lock
-and checks every approved path before starting writers again. The finalizer
+`--request-final-check`. The verified NAS client drains
+its writers and checks every approved path while holding the NAS client
+process lock. Its existing service restart starts the normal writers again
+after the check resolves. The finalizer
 can also be run with `delivery-handoff-check` in the same NAS client environment
 when the normal process is stopped.
 
@@ -68,8 +69,10 @@ SHA-256 readback round. It holds a Linux read lease on each file, watches
 the approved path components with inotify, and verifies the pinned mount.
 The process lock stays held through the API's acceptance. If the response is
 lost, the saved request blocks other client writers until the server confirms
-acceptance or a newer check or readback round supersedes it. Use the matching
-client release throughout recovery.
+acceptance, cancellation or supersession, and it checks for a successor
+request before admitting writers. Use the matching client release throughout
+recovery. Pausing the handoff cancels its unanswered final check and lets the
+normal client restart.
 
 The controller confirms that the NAS client owns mutations to the approved
 paths and their ancestors. Other users and jobs can read those paths during
