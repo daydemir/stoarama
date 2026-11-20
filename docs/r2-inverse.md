@@ -156,12 +156,14 @@ job's subsequent new reads stay fenced. The cooldown ends early when the job's
 context is cancelled.
 
 Both the pre-DELETE identity HEAD and the multipart inventory run inside the
-guarded wire transaction, so the cooldown wait on that path happens while the
-key's shared protection locks are held. That is deliberate: the HEAD is the exact
-identity and `LastModified` authority for the DELETE, and the inventory is the
-provider-side veto that must be observed under the same guarded snapshot. It adds
-no new bound — both live inside the wire transaction's existing network budget and
-hold only shared locks — so the tradeoff is bounded sharing, not extended custody.
+guarded wire transaction, so the cooldown wait on that path happens while this
+key's locks are held: the global protection and recording locks shared, its own
+COPY advisory exclusive and its clip row `FOR UPDATE`. That is deliberate: the HEAD
+is the exact identity and `LastModified` authority for the DELETE, and the
+inventory is the provider-side veto that must be observed under the same guarded
+snapshot. It adds no new bound — both live inside the wire transaction's existing
+network budget — so the tradeoff is one key's locks held for that budget, not
+extended custody or global exclusivity.
 
 A publication step whose parent context ended first — the job cancelled or its
 deadline passed before the step's own 2-minute bound — stops the job and holds
