@@ -44,8 +44,13 @@ type inverseFakeStore struct {
 	// onDelete runs on the server for every DELETE before it answers, and
 	// onAnswered after the answer (or the dropped connection) is sent.
 	onDelete, onAnswered func(string)
-	beforeHead           func(context.Context, string) error
-	beforeDelete         func(string) error
+	// onHead picks how the loopback server answers a HEAD: "slow" never
+	// answers in time, "503" and "429" fail it, "429-retry-after" asks for a
+	// ten-minute wait, "redirect" sends it to a missing key, anything else
+	// answers normally.
+	onHead       func(string) string
+	beforeHead   func(context.Context, string) error
+	beforeDelete func(string) error
 	// headWithoutSHA omits the optional SHA-256 metadata from loopback HEADs.
 	headWithoutSHA bool
 }
@@ -82,6 +87,10 @@ func (s *inverseFakeStore) Head(ctx context.Context, key string) (r2.ObjectHead,
 	}
 	// Like R2, HEAD reports Last-Modified as an HTTP date in whole seconds.
 	return r2.ObjectHead{ETag: o.ETag, SizeBytes: o.SizeBytes, LastModified: o.LastModified.Truncate(time.Second)}, nil
+}
+func (s *inverseFakeStore) confirmAbsent(ctx context.Context, key string) error {
+	_, err := s.Head(ctx, key)
+	return inverseAbsence(err)
 }
 func (s *inverseFakeStore) deleteOnce(ctx context.Context, authority *inverseDeleteAuthority) error {
 	key := authority.binding.Key
@@ -550,14 +559,15 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		if err == nil || errors.Is(err, errInverseWireAmbiguous) {
 			t.Fatalf("pre-wire veto: %v", err)
 		}
-		// A lost response in a batch that deleted nothing.
+		// A lost response in a batch that deleted nothing holds its key and
+		// continues; runInverseJobBatches caps how many such batches in a row.
 		b, entries := build(1)
 		b.ledger.close()
 		setWire(map[string]string{entries[0].Key: "eof"}, nil)
-		_, _, err = runInverseJobBatch(ctx, pool, sdk, b.opts, owner, filepath.Join(dir, "evidence-empty.json"))
+		_, result, err := runInverseJobBatch(ctx, pool, sdk, b.opts, owner, filepath.Join(dir, "evidence-empty.json"))
 		setWire(nil, nil)
-		if !errors.Is(err, errInverseWireAmbiguous) {
-			t.Fatalf("lost response with no deletes continued: %v", err)
+		if err != nil || result.Deleted != 0 || !slices.Equal(result.WireAmbiguous, []string{entries[0].Key}) {
+			t.Fatalf("lost response with no deletes: %+v %v", result, err)
 		}
 	})
 	t.Run("lost_response_with_a_sibling_403_stops_the_job", func(t *testing.T) {
@@ -589,6 +599,237 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		setWire(nil, nil)
 		if !errors.Is(err, errInverseWireAmbiguous) {
 			t.Fatalf("response timeout: %v", err)
+		}
+	})
+	t.Run("deadline_bound_DELETE_without_reply_is_ambiguous", func(t *testing.T) {
+		// The DELETE's own network deadline, not a cancelled parent, ends a
+		// fully written request that never got an answer: the key is held.
+		a, entries := build(1)
+		defer a.ledger.close()
+		e := entries[0]
+		a.store = sdk
+		if _, err := a.reserve(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		authority, err := a.authorize(ctx, ctx, tx, e, &inverseSendGate{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer authority.cancel()
+		if deadline, ok := authority.ctx.Deadline(); !ok || time.Until(deadline) > inverseNetworkTimeout {
+			t.Fatal("DELETE is not bound by the network deadline")
+		}
+		// As if the network budget were nearly spent.
+		near, cancel := context.WithTimeout(authority.ctx, time.Second)
+		defer cancel()
+		authority.ctx = near
+		setWire(map[string]string{e.Key: "slow"}, nil)
+		before := providerDeletes()
+		err = sdk.deleteOnce(near, authority)
+		setWire(nil, nil)
+		if !errors.Is(err, errInverseWireAmbiguous) || !errors.Is(near.Err(), context.DeadlineExceeded) || providerDeletes()-before != 1 {
+			t.Fatalf("deadline-bound DELETE: %v (context %v)", err, near.Err())
+		}
+	})
+	t.Run("publication_outlasts_a_shared_lock_holder", func(t *testing.T) {
+		// Production shape (full-004): a sibling holds 7343226011101 shared
+		// past the old 30s key budget after this key's DELETE is confirmed.
+		// Publication waits for its exclusive lock under its own database
+		// bound and succeeds once the holder releases; the batch goes on.
+		a, _ := build(2)
+		a.ledger.close()
+		a.opts.Workers = 1
+		holder, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer holder.Rollback(ctx)
+		released := make(chan struct{})
+		var once sync.Once
+		setWire(nil, func(string) {
+			once.Do(func() {
+				if _, err := holder.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011101)`); err != nil {
+					t.Error(err)
+				}
+				go func() {
+					time.Sleep(inverseNetworkTimeout + 5*time.Second)
+					holder.Rollback(ctx)
+					close(released)
+				}()
+			})
+		})
+		before := providerDeletes()
+		result, err := applyInverse(ctx, pool, sdk, a.opts)
+		setWire(nil, nil)
+		select {
+		case <-released:
+		default:
+			t.Fatal("batch finished while the holder still held its lock")
+		}
+		if err != nil || result.Deleted != 2 || providerDeletes()-before != 2 || len(unresolved(t, a.opts.ManifestSHA)) != 0 {
+			t.Fatalf("publication behind a long shared holder: %+v %v", result, err)
+		}
+	})
+	// failPublication makes publishing an absence event for keys fail with
+	// lock contention, raised at INSERT or, deferred, at COMMIT. The returned
+	// func removes it and reports how many publications it refused.
+	failPublication := func(t *testing.T, timing string, keys ...string) func() int {
+		t.Helper()
+		exec(fmt.Sprintf(`CREATE SEQUENCE inverse_publish_busy;
+ CREATE FUNCTION inverse_publish_busy() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN
+  IF NEW.object_key=ANY($k$%s$k$::text[]) THEN PERFORM nextval('inverse_publish_busy'); RAISE EXCEPTION 'test lock contention' USING ERRCODE='55P03'; END IF;
+  RETURN NEW;
+ END $f$;
+ CREATE CONSTRAINT TRIGGER inverse_publish_busy AFTER INSERT ON r2_inverse_events %s FOR EACH ROW EXECUTE FUNCTION inverse_publish_busy();`, "{"+strings.Join(keys, ",")+"}", timing))
+		return func() int {
+			exec(`DROP TRIGGER inverse_publish_busy ON r2_inverse_events; DROP FUNCTION inverse_publish_busy()`)
+			var tries int
+			if err := pool.QueryRow(ctx, `SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM inverse_publish_busy`).Scan(&tries); err != nil {
+				t.Fatal(err)
+			}
+			exec(`DROP SEQUENCE inverse_publish_busy`)
+			return tries
+		}
+	}
+	t.Run("failed_evidence_measures_nothing", func(t *testing.T) {
+		a, _ := build(1)
+		a.ledger.close()
+		dir := t.TempDir()
+		_, read, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(dir, "evidence-1.json"))
+		if err != nil || !read.partitionRead {
+			t.Fatalf("completed batch did not measure: %+v %v", read, err)
+		}
+		_, failed, err := runInverseJobBatch(ctx, pool, sdk, a.opts, filepath.Join(dir, "missing-owner-decision.md"), filepath.Join(dir, "evidence-2.json"))
+		if err == nil || failed.partitionRead {
+			t.Fatalf("refused evidence measured: %+v %v", failed, err)
+		}
+		total := inverseApplySummary{}
+		read.LastModifiedHeld = r2RetireStat{Objects: 1, Bytes: 100}
+		total.addBatch(read)
+		total.addBatch(failed)
+		if total.LastModifiedHeld != read.LastModifiedHeld {
+			t.Fatalf("failed batch erased the measurement: %+v", total.LastModifiedHeld)
+		}
+	})
+	t.Run("indeterminate_publication_COMMIT_stops_the_job", func(t *testing.T) {
+		// The error arrives only after COMMIT is sent: its outcome is not
+		// knowable in general, so it is never retried or held.
+		a, entries := build(1)
+		a.ledger.close()
+		done := failPublication(t, "DEFERRABLE INITIALLY DEFERRED", entries[0].Key)
+		_, _, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(t.TempDir(), "evidence.json"))
+		if tries := done(); err == nil || inverseKeyHeld(err) || !strings.Contains(err.Error(), "COMMIT outcome unknown") || tries != 1 {
+			t.Fatalf("indeterminate COMMIT: %v after %d", err, tries)
+		}
+	})
+	t.Run("held_only_batches_continue_up_to_the_stall_cap", func(t *testing.T) {
+		// One worker: the first key's publication fails, so batch 1 publishes
+		// nothing, yet the job goes on and batch 2 publishes the next key.
+		a, entries := build(2)
+		a.ledger.close()
+		a.opts.Workers = 1
+		done := failPublication(t, "", entries[0].Key)
+		err := runInverseJobBatches(ctx, pool, sdk, a.opts, owner, t.TempDir(), 5)
+		done()
+		if err != nil || !slices.Equal(unresolved(t, a.opts.ManifestSHA), []string{entries[0].Key}) {
+			t.Fatalf("held-only batch stopped the job: %v", err)
+		}
+		// A persistent outage: every batch holds its one key and publishes
+		// nothing, so the job stops at the cap with the rest never sent.
+		b, entries := build(inverseJobStalledBatches + 1)
+		b.ledger.close()
+		b.opts.Workers = 1
+		keys := make([]string, len(entries))
+		for i, e := range entries {
+			keys[i] = e.Key
+		}
+		done = failPublication(t, "", keys...)
+		before := providerDeletes()
+		err = runInverseJobBatches(ctx, pool, sdk, b.opts, owner, t.TempDir(), 10)
+		done()
+		if err == nil || !strings.Contains(err.Error(), "3 consecutive batches") || providerDeletes()-before != 3 || len(unresolved(t, b.opts.ManifestSHA)) != 3 {
+			t.Fatalf("stalled job: %v after %d DELETEs", err, providerDeletes()-before)
+		}
+	})
+	t.Run("publication_failures_classify_precisely", func(t *testing.T) {
+		step := func() (context.Context, context.CancelFunc) { return context.WithTimeout(ctx, 300*time.Millisecond) }
+		t.Run("pool_exhaustion_is_transient", func(t *testing.T) {
+			config := pool.Config()
+			config.MaxConns, config.MinConns = 1, 0
+			one, err := pgxpool.NewWithConfig(ctx, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer one.Close()
+			held, err := one.Acquire(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer held.Release()
+			waiting, cancel := step()
+			defer cancel()
+			if _, err = one.Acquire(waiting); err == nil || !inverseDBTransient(ctx, waiting, err) {
+				t.Fatalf("pool acquisition deadline: %v", err)
+			}
+		})
+		t.Run("statement_past_its_step_bound_is_transient", func(t *testing.T) {
+			running, cancel := step()
+			defer cancel()
+			if _, err := pool.Exec(running, `SELECT pg_sleep(5)`); err == nil || !inverseDBTransient(ctx, running, err) {
+				t.Fatalf("statement past its step bound: %v", err)
+			}
+		})
+		t.Run("explicit_cancel_stops", func(t *testing.T) {
+			conn, err := pool.Acquire(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Release()
+			var pid int
+			if err = conn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			go func() {
+				time.Sleep(200 * time.Millisecond)
+				pool.Exec(ctx, `SELECT pg_cancel_backend($1)`, pid)
+			}()
+			if _, err = conn.Exec(ctx, `SELECT pg_sleep(5)`); err == nil || inverseDBTransient(ctx, ctx, err) {
+				t.Fatalf("operator cancel: %v", err)
+			}
+		})
+		t.Run("integrity_refusal_stops_without_retry", func(t *testing.T) {
+			a, entries := build(1)
+			defer a.ledger.close()
+			started := time.Now()
+			err := a.publishConfirmed(ctx, entries[0])
+			if err == nil || inverseKeyHeld(err) || !strings.Contains(err.Error(), "requires exact source") || time.Since(started) > time.Second {
+				t.Fatalf("integrity refusal: %v after %v", err, time.Since(started))
+			}
+		})
+	})
+	t.Run("persistent_publication_failure_holds_only_its_key", func(t *testing.T) {
+		a, entries := build(2)
+		a.ledger.close()
+		busy := entries[0].Key
+		done := failPublication(t, "", busy)
+		before := providerDeletes()
+		finished, result, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(t.TempDir(), "evidence.json"))
+		tries := done()
+		if err != nil || finished || result.Deleted != 1 || !slices.Equal(result.Unpublished, []string{busy}) || len(result.WireAmbiguous) != 0 || providerDeletes()-before != 2 || tries != inversePublishAttempts {
+			t.Fatalf("unpublished batch: done %v %+v %v after %d publications", finished, result, err, tries)
+		}
+		if got := unresolved(t, a.opts.ManifestSHA); !slices.Equal(got, []string{busy}) {
+			t.Fatalf("unpublished key not held: %v", got)
+		}
+		// Held for good: a restart reports it and never sends it again.
+		restart, err := applyInverse(ctx, pool, sdk, a.opts)
+		if err != nil || !slices.Contains(restart.HeldAbsent, busy) || providerDeletes()-before != 2 || !slices.Equal(unresolved(t, a.opts.ManifestSHA), []string{busy}) {
+			t.Fatalf("restart %+v %v", restart, err)
 		}
 	})
 	t.Run("closed_admission_aborts_a_key_waiting_on_its_reservation", func(t *testing.T) {
@@ -655,6 +896,319 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatalf("send gate: err %v deletes %d intents %d attempts %d", err, store.calls-before, intents, attempts)
 		}
 	})
+	t.Run("stitch_hold_admission_conflicts_only_on_its_key", func(t *testing.T) {
+		// Another executor's outer lock never fences stitch hold admission.
+		batch, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer batch.Release()
+		if _, err = batch.Exec(ctx, `SELECT pg_advisory_lock($1)`, r2RetireAdvisoryLockKey); err != nil {
+			t.Fatal(err)
+		}
+		defer batch.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, r2RetireAdvisoryLockKey)
+		a, entries := build(10)
+		defer a.ledger.close()
+		held, free, attempted, wired, other, unrelated, behind, recorded, fenced, ledgered := entries[0], entries[1], entries[2], entries[3], entries[4], entries[5], entries[6], entries[7], entries[8], entries[9]
+		var hourID int64
+		exec(`INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until) VALUES(70,3,'2026-06-01','2026-06-02','key locks',now()+interval '1 day')`)
+		if err = pool.QueryRow(ctx, `INSERT INTO nas_stitch_r2_hours(scope_id,recording_id,hour_at,plan,plan_sha256,input_bytes) VALUES(70,30,'2026-06-01','{}',repeat('f',64),100) RETURNING id`).Scan(&hourID); err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at)
+ SELECT 13,id,30,display_path,100,repeat('b',64),'present',now(),now() FROM recording_clips WHERE object_key=$1`, e.Key)
+		}
+		admit := func(ctx context.Context, tx pgx.Tx, e inverseEntry) error {
+			_, err := tx.Exec(ctx, `INSERT INTO nas_stitch_r2_input_holds(hour_id,bucket,object_key,catalog_clip_id,sha256,size_bytes,etag)
+ SELECT $1,bucket,object_key,id,repeat('b',64),100,etag FROM recording_clips WHERE object_key=$2`, hourID, e.Key)
+			return err
+		}
+		admitAlone := func(e inverseEntry) error {
+			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if err = admit(ctx, tx, e); err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		}
+		// Executors older than any Go-side key lock only write the ledgers.
+		stale := []string{
+			`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
+ SELECT 'raw',id,bucket,object_key,100,repeat('b',64),repeat('a',64) FROM recording_clips WHERE object_key=$1`,
+			`INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256)
+ SELECT 'raw',id,3,bucket,object_key,100,repeat('b',64),'outside_keep28_no_nas_copy','none',repeat('a',64),repeat('a',64) FROM recording_clips WHERE object_key=$1`,
+		}
+		prompt := func() (context.Context, context.CancelFunc) { return context.WithTimeout(ctx, 5*time.Second) }
+
+		// A committed reservation and pre-wire attempt veto later admission.
+		if _, err = a.reserve(ctx, attempted); err != nil {
+			t.Fatal(err)
+		}
+		wire, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The attempt commits on a second connection while this wire owns the
+		// copy key; a ledger trigger that waited for that key would hang here.
+		waitless, cancel := prompt()
+		if _, err = a.authorize(waitless, waitless, wire, attempted, &inverseSendGate{}); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		wire.Rollback(ctx)
+		if err = admitAlone(attempted); err == nil || !strings.Contains(err.Error(), "already has R2 retirement history") {
+			t.Fatalf("committed pre-wire attempt did not veto hold admission: %v", err)
+		}
+
+		// An open RAW wire owns its key and row; admission elsewhere never waits.
+		if _, err = a.reserve(ctx, wired); err != nil {
+			t.Fatal(err)
+		}
+		wire, err = pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = a.prepareWireTarget(ctx, wire, wired); err != nil {
+			t.Fatal(err)
+		}
+		importing, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer importing.Rollback(ctx)
+		waitless, cancel = prompt()
+		if err = admit(waitless, importing, other); err != nil {
+			t.Fatalf("hold admission waited on an unrelated open wire: %v", err)
+		}
+		cancel()
+		if err = importing.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err = admitAlone(wired); err == nil || !strings.Contains(err.Error(), "already has R2 retirement history") {
+			t.Fatalf("hold admitted a key with an open wire: %v", err)
+		}
+		wire.Rollback(ctx)
+
+		// An open import fences only its own key. Same-key reserve never waits
+		// on it while owning the wide protection locks: it rolls back and skips.
+		durable := func(e inverseEntry) int {
+			var n int
+			if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM r2_retirement_reservations WHERE object_key=$1)+(SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1)`, e.Key).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			return n
+		}
+		importing, err = pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer importing.Rollback(ctx)
+		if err = admit(ctx, importing, held); err != nil {
+			t.Fatal(err)
+		}
+		waitless, cancel = prompt()
+		if _, err = a.reserve(waitless, held); !errors.Is(err, errInverseStitchConflict) || !strings.Contains(err.Error(), "hold admission in progress") || durable(held) != 0 {
+			t.Fatalf("same-key RAW reserve did not skip an open import: %v", err)
+		}
+		for _, query := range stale {
+			if _, err = pool.Exec(waitless, query, held.Key); err == nil || !strings.Contains(err.Error(), "hold admission is busy") {
+				t.Fatalf("stale ledger INSERT crossed an open import: %v", err)
+			}
+		}
+		cancel()
+		before := store.calls
+		waitless, cancel = prompt()
+		if ok, err := a.delete(waitless, waitless, &inverseSendGate{}, free); !ok || err != nil || store.calls-before != 1 {
+			t.Fatalf("unrelated RAW reserve and wire waited on an open import: %v %v", ok, err)
+		}
+		cancel()
+		if err = importing.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = a.reserve(ctx, held); !errors.Is(err, errInverseStitchConflict) || !strings.Contains(err.Error(), "committed hold") || durable(held) != 0 {
+			t.Fatalf("RAW did not skip a committed hold: %v", err)
+		}
+		for _, query := range stale {
+			if _, err = pool.Exec(ctx, query, held.Key); err == nil || !strings.Contains(err.Error(), "active R2 stitch input hold") {
+				t.Fatalf("stale ledger INSERT crossed a committed hold: %v", err)
+			}
+		}
+
+		// An admission that owns the key's hold lock before its row surfaces only
+		// at the ledger insert; exactly that identity is skipped.
+		admitting, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer admitting.Rollback(ctx)
+		if _, err = admitting.Exec(ctx, `SELECT pg_advisory_xact_lock(nas_stitch_r2_hold_lock('stoarama',$1))`, ledgered.Key); err != nil {
+			t.Fatal(err)
+		}
+		waitless, cancel = prompt()
+		if _, err = a.reserve(waitless, ledgered); !errors.Is(err, errInverseStitchConflict) ||
+			err.Error() != errInverseStitchConflict.Error()+": stitch input hold admission is busy" || durable(ledgered) != 0 {
+			t.Fatalf("ledger-time hold admission was not skipped by its exact identity: %v", err)
+		}
+		cancel()
+		admitting.Rollback(ctx)
+
+		// A certificate owns its held inputs' copy keys and rows. Same-key
+		// reserve skips at once; an unrelated key proceeds meanwhile.
+		certifying, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer certifying.Rollback(ctx)
+		if _, err = certifying.Exec(ctx, `SELECT lock_nas_r2_copy_key('stoarama',$1),(SELECT count(*) FROM (SELECT 1 FROM recording_clips WHERE object_key=$1 FOR SHARE) c)`, held.Key); err != nil {
+			t.Fatal(err)
+		}
+		waitless, cancel = prompt()
+		if _, err = a.reserve(waitless, held); !errors.Is(err, errInverseStitchConflict) || !strings.Contains(err.Error(), "committed hold") {
+			t.Fatalf("same-key RAW reserve did not skip an open certificate: %v", err)
+		}
+		before = store.calls
+		if ok, err := a.delete(waitless, waitless, &inverseSendGate{}, unrelated); !ok || err != nil || store.calls-before != 1 {
+			t.Fatalf("unrelated RAW key waited on an open certificate: %v %v", ok, err)
+		}
+		cancel()
+		certifying.Rollback(ctx)
+
+		// Any other owner of an unheld key is awaited with no protection lock
+		// held: an unrelated reserve started behind that wait proceeds.
+		busy, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer busy.Rollback(ctx)
+		if _, err = busy.Exec(ctx, `SELECT 1 FROM recording_clips WHERE object_key=$1 FOR UPDATE`, other.Key); err != nil {
+			t.Fatal(err)
+		}
+		awaited := make(chan error, 1)
+		go func() { _, err := a.reserve(ctx, other); awaited <- err }()
+		waitBlockedBy(t, pool, stitchBackendPID(t, busy), "same-key reserve behind another row owner")
+		// 7343226011103 and 7343226011101 are advisory (classid 1709, objid
+		// 3126902239 and 3126902237).
+		var wide bool
+		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND objsubid=1 AND classid=1709 AND objid IN (3126902239,3126902237))`).Scan(&wide); err != nil || wide {
+			t.Fatalf("waiting reserve kept its protection locks: %v %v", wide, err)
+		}
+		waitless, cancel = prompt()
+		if _, err = a.reserve(waitless, behind); err != nil || durable(behind) != 2 {
+			t.Fatalf("unrelated reserve queued behind a same-key wait: %v", err)
+		}
+		cancel()
+		busy.Rollback(ctx)
+		if err = within(t, awaited, "awaited reserve"); err != nil || durable(other) != 2 {
+			t.Fatalf("awaited reserve did not complete: %v", err)
+		}
+
+		// A busy parent recording row is not a reserve lock at all.
+		parent, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer parent.Rollback(ctx)
+		if _, err = parent.Exec(ctx, `SELECT 1 FROM recordings WHERE id=30 FOR UPDATE`); err != nil {
+			t.Fatal(err)
+		}
+		waitless, cancel = prompt()
+		if _, err = a.reserve(waitless, recorded); err != nil || durable(recorded) != 2 {
+			t.Fatalf("reserve waited on its parent recording row: %v", err)
+		}
+		cancel()
+		parent.Rollback(ctx)
+
+		// Every other busy lock after the barrier is awaited with no protection
+		// lock held, so a mutator needing one exclusively is never queued.
+		mutatorProceeds := func(what string) {
+			t.Helper()
+			mutator, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mutator.Rollback(ctx)
+			waitless, cancel := prompt()
+			defer cancel()
+			if _, err = mutator.Exec(waitless, `SELECT pg_advisory_xact_lock(7343226011103)`); err != nil {
+				t.Fatalf("legacy mutator queued behind %s: %v", what, err)
+			}
+		}
+		listing, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listing.Rollback(ctx)
+		// NAS listing evidence (0183) holds the final fence shared.
+		if _, err = listing.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011101)`); err != nil {
+			t.Fatal(err)
+		}
+		go func() { _, err := a.reserve(ctx, fenced); awaited <- err }()
+		waitBlockedBy(t, pool, stitchBackendPID(t, listing), "reserve behind NAS listing evidence")
+		mutatorProceeds("a reserve awaiting the final fence")
+		listing.Rollback(ctx)
+		if err = within(t, awaited, "reserve behind NAS listing evidence"); err != nil || durable(fenced) != 2 {
+			t.Fatalf("reserve behind NAS listing evidence did not complete: %v", err)
+		}
+
+		keyOwner, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer keyOwner.Rollback(ctx)
+		if _, err = keyOwner.Exec(ctx, `SELECT lock_nas_r2_copy_key('stoarama',$1)`, fenced.Key); err != nil {
+			t.Fatal(err)
+		}
+		type authorized struct {
+			tx  pgx.Tx
+			err error
+		}
+		// A failed assertion must stop the goroutine and roll its transaction
+		// back, so neither holds a connection when the pool closes.
+		wireCtx, wireStop := context.WithCancel(ctx)
+		wiring := make(chan authorized, 1)
+		go func() {
+			tx, _, err := admitWire(wireCtx, pool, func(ctx context.Context, tx pgx.Tx) (*inverseDeleteAuthority, error) {
+				return a.authorize(ctx, wireCtx, tx, fenced, &inverseSendGate{})
+			})
+			wiring <- authorized{tx, err}
+		}()
+		collected := false
+		var wiredTx pgx.Tx
+		t.Cleanup(func() {
+			wireStop()
+			if !collected {
+				select {
+				case w := <-wiring:
+					if w.tx != nil {
+						_ = w.tx.Rollback(context.Background())
+					}
+				case <-time.After(30 * time.Second):
+				}
+				return
+			}
+			if wiredTx != nil {
+				_ = wiredTx.Rollback(context.Background())
+			}
+		})
+		waitBlockedBy(t, pool, stitchBackendPID(t, keyOwner), "wire behind another key owner")
+		mutatorProceeds("a wire awaiting its copy key")
+		keyOwner.Rollback(ctx)
+		w := within(t, wiring, "wire behind another key owner")
+		collected, wiredTx = true, w.tx
+		if w.err != nil {
+			t.Fatalf("wire behind another key owner did not authorize: %v", w.err)
+		}
+		if err = wiredTx.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+		wiredTx = nil
+	})
 	t.Run("send_gate_closed_after_authorize_stops_the_first_write", func(t *testing.T) {
 		// The gate closes while this DELETE is past every check and dialing:
 		// its first request byte is refused, so nothing reaches the provider.
@@ -671,7 +1225,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 		defer tx.Rollback(ctx)
 		gate := &inverseSendGate{}
-		authority, err := a.authorize(ctx, tx, e, gate)
+		authority, err := a.authorize(ctx, ctx, tx, e, gate)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -970,19 +1524,11 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				}
 				done := make(chan error, 1)
 				go func() { _, err := a.delete(ctx, ctx, &inverseSendGate{}, e); done <- err }()
-				deadline := time.Now().Add(3 * time.Second)
-				for {
-					var held bool
-					if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND locktype='advisory' AND objsubid=1 AND classid::bigint::numeric*4294967296+objid::bigint::numeric=7343226011103 AND granted AND pid<>pg_backend_pid())`).Scan(&held); err != nil {
-						t.Fatal(err)
-					}
-					if held {
-						break
-					}
-					if time.Now().After(deadline) {
-						t.Fatal("B1 never reached legacy public fence")
-					}
-					time.Sleep(10 * time.Millisecond)
+				// B1 awaits the legacy public fence holding no admission lock.
+				waitBlockedBy(t, pool, stitchBackendPID(t, legacy), "B1 at the legacy public fence")
+				var held bool
+				if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND objsubid=1 AND classid=1709 AND objid=3126902239 AND granted AND pid<>pg_backend_pid())`).Scan(&held); err != nil || held {
+					t.Fatal("B1 held its admission lock while awaiting the legacy fence", held, err)
 				}
 				progressCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 				defer cancel()
@@ -994,7 +1540,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					t.Fatal("legacy plan mutation upgraded locks", err)
 				}
 				var upgraded bool
-				if err = legacy.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND locktype='advisory' AND pid=pg_backend_pid() AND objsubid=1 AND classid::bigint::numeric*4294967296+objid::bigint::numeric=7343226011103)`).Scan(&upgraded); err != nil || upgraded {
+				if err = legacy.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid() AND objsubid=1 AND classid=1709 AND objid=3126902239)`).Scan(&upgraded); err != nil || upgraded {
 					t.Fatal("cleanup acquired admission lock", upgraded, err)
 				}
 				if err = legacy.Commit(ctx); err != nil {
@@ -1067,7 +1613,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 		var held bool
-		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND locktype='advisory' AND granted AND ((objsubid=1 AND (classid::bigint::numeric*4294967296+objid::bigint::numeric)=ANY(ARRAY[7343226011103,7343226011101]::numeric[])) OR(classid=137 AND objid=1 AND objsubid=2)))`).Scan(&held); err != nil || held {
+		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND ((objsubid=1 AND classid=1709 AND objid IN (3126902239,3126902237)) OR(classid=137 AND objid=1 AND objsubid=2)))`).Scan(&held); err != nil || held {
 			t.Fatal("waiting B1 owns later locks", held, err)
 		}
 		admissionCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -1410,6 +1956,85 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatalf("unlimited budget did not resume: %+v %v", result, err)
 		}
 	})
+	t.Run("raw_selection_excludes_held_and_skipped_keys", func(t *testing.T) {
+		// MaxItems=1 and a first key whose hold admission is busy: reserve skips
+		// it before any durable write, and the next batch must spend its only
+		// slot on the key behind it instead of reselecting the skipped one.
+		a, entries := build(2)
+		a.ledger.close()
+		first, second := entries[0], entries[1]
+		a.opts.MaxItems = 1
+		a.opts.skipped = &inverseSkipSet{}
+		admission, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer admission.Release()
+		defer admission.Exec(context.Background(), `SELECT pg_advisory_unlock_all()`)
+		if _, err = admission.Exec(ctx, `SELECT pg_advisory_lock(nas_stitch_r2_hold_lock('stoarama',$1))`, first.Key); err != nil {
+			t.Fatal(err)
+		}
+		dir := t.TempDir()
+		done, firstBatch, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(dir, "evidence-1.json"))
+		if err != nil || done || firstBatch.Selected != 1 || firstBatch.Deleted != 0 || firstBatch.StitchSkipped != 1 {
+			t.Fatalf("first batch spent its slot on a busy hold: done %v %+v %v", done, firstBatch, err)
+		}
+		before := providerDeletes()
+		done, secondBatch, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(dir, "evidence-2.json"))
+		store.mu.Lock()
+		_, firstPresent := store.objects[first.Key]
+		_, secondPresent := store.objects[second.Key]
+		store.mu.Unlock()
+		if err != nil || secondBatch.Deleted != 1 || providerDeletes()-before != 1 || !firstPresent || secondPresent {
+			t.Fatalf("second batch did not delete the key behind a skipped one: done %v %+v %v deletes %d first %v second %v",
+				done, secondBatch, err, providerDeletes()-before, firstPresent, secondPresent)
+		}
+	})
+	t.Run("raw_selection_drops_a_committed_hold_before_MaxItems", func(t *testing.T) {
+		// A committed Durham hold, not a skip this job remembered, must be left
+		// out at selection: otherwise it spends the batch's whole item allowance
+		// every batch and the keys behind it never run.
+		a, entries := build(2)
+		a.ledger.close()
+		first, second := entries[0], entries[1]
+		a.opts.MaxItems, a.opts.skipped = 1, &inverseSkipSet{}
+		// Earlier subtests in this table own recording 30's 2026-06-01 hour, so
+		// this moves the two keys it just built to a clean hour of their own.
+		exec(`UPDATE recording_clips SET fire_at='2026-06-03',clip_start_at='2026-06-03',clip_end_at='2026-06-03 00:01:00' WHERE object_key=$1 OR object_key=$2`, first.Key, second.Key)
+		exec(`INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until) VALUES(71,3,'2026-06-03','2026-06-04','committed hold',now()+interval '1 day')`)
+		var hourID int64
+		if err := pool.QueryRow(ctx, `INSERT INTO nas_stitch_r2_hours(scope_id,recording_id,hour_at,plan,plan_sha256,input_bytes) VALUES(71,30,'2026-06-03','{}',repeat('f',64),100) RETURNING id`).Scan(&hourID); err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at)
+ SELECT 13,id,30,display_path,100,repeat('b',64),'present',now(),now() FROM recording_clips WHERE object_key=$1`, e.Key)
+		}
+		hold, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = hold.Exec(ctx, `INSERT INTO nas_stitch_r2_input_holds(hour_id,bucket,object_key,catalog_clip_id,sha256,size_bytes,etag)
+ SELECT $1,bucket,object_key,id,repeat('b',64),100,etag FROM recording_clips WHERE object_key=$2`, hourID, first.Key); err != nil {
+			t.Fatal(err)
+		}
+		if err = hold.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		result, err := applyInverse(ctx, pool, store, a.opts)
+		store.mu.Lock()
+		_, firstPresent := store.objects[first.Key]
+		_, secondPresent := store.objects[second.Key]
+		store.mu.Unlock()
+		if err != nil || result.Selected != 1 || result.Deleted != 1 || result.StitchSkipped != 0 || !firstPresent || secondPresent {
+			t.Fatalf("committed hold spent the item allowance: %+v %v first %v second %v", result, err, firstPresent, secondPresent)
+		}
+		var durable int
+		if err = pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM r2_retirement_reservations WHERE object_key=$1)
+ +(SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1)+(SELECT count(*) FROM r2_inverse_attempts WHERE object_key=$1)`, first.Key).Scan(&durable); err != nil || durable != 0 {
+			t.Fatalf("a committed hold wrote durable retirement state: %d %v", durable, err)
+		}
+	})
 	t.Run("private_authority_cannot_replay_or_remint", func(t *testing.T) {
 		for _, lost := range []bool{false, true} {
 			t.Run(strconv.FormatBool(lost), func(t *testing.T) {
@@ -1425,11 +2050,11 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer tx.Rollback(ctx)
-				authority, err := a.authorize(ctx, tx, e, &inverseSendGate{})
+				authority, err := a.authorize(ctx, ctx, tx, e, &inverseSendGate{})
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err = a.authorize(ctx, tx, e, &inverseSendGate{}); err == nil {
+				if _, err = a.authorize(ctx, ctx, tx, e, &inverseSendGate{}); err == nil {
 					t.Fatal("durable authority reminted")
 				}
 				before := providerDeletes()
@@ -1540,6 +2165,229 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			}
 		}
 	})
+	t.Run("restart_reuses_only_a_fresh_unchanged_partition", func(t *testing.T) {
+		// seal stores build(n)'s partition as the job does, with the holds
+		// digest read now in its summary.
+		seal := func(n int, created time.Time) (inverseApplyOptions, []inverseEntry) {
+			t.Helper()
+			a, entries := build(n)
+			a.ledger.close()
+			p, err := loadInverseHolds(ctx, pool, "stoarama", picks, windows)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a.summary.CreatedAt = created
+			if a.summary.ProtectionSHA256, err = p.holdsSHA256(); err != nil {
+				t.Fatal(err)
+			}
+			data, _ := json.Marshal(a.summary)
+			if err = os.WriteFile(a.opts.Summary, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if a.opts.SummarySHA, err = inverseFileSHA(a.opts.Summary); err != nil {
+				t.Fatal(err)
+			}
+			digest, err := storeInversePartition(ctx, pool, filepath.Dir(a.opts.Manifest))
+			if err != nil || digest != a.opts.ManifestSHA {
+				t.Fatal("stored", digest, err)
+			}
+			return a.opts, entries
+		}
+		reuse := func(digest string) (string, error) {
+			dir := filepath.Join(t.TempDir(), "partition")
+			_, err := reuseInversePartition(ctx, pool, store, picksPath, picks.SHA256, digest, dir)
+			return dir, err
+		}
+		t.Run("own_progress_keeps_the_partition_reusable", func(t *testing.T) {
+			// The job's own reservation and receipt are progress, not a
+			// protection change: a restart after them still reuses.
+			o, _ := seal(1, time.Now().UTC())
+			dir, err := reuse(o.ManifestSHA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			o.Manifest, o.Summary = filepath.Join(dir, "partition.jsonl"), filepath.Join(dir, "summary.json")
+			if result, err := applyInverse(ctx, pool, sdk, o); err != nil || result.Deleted != 1 {
+				t.Fatalf("reused run %+v %v", result, err)
+			}
+			if _, err = reuse(o.ManifestSHA); err != nil {
+				t.Fatal("restart after own progress refused:", err)
+			}
+		})
+		t.Run("unapproved_picks", func(t *testing.T) {
+			// The stored picks match the current file, not the approved digest.
+			o, _ := seal(1, time.Now().UTC())
+			_, err := reuseInversePartition(ctx, pool, store, picksPath, strings.Repeat("e", 64), o.ManifestSHA, filepath.Join(t.TempDir(), "partition"))
+			if err == nil || !strings.Contains(err.Error(), "approved digest") {
+				t.Fatal("reused picks other than the approved digest", err)
+			}
+		})
+		t.Run("fresh_unchanged_reuse_still_meets_the_live_gate", func(t *testing.T) {
+			o, entries := seal(2, time.Now().UTC())
+			dir, err := reuse(o.ManifestSHA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			o.Manifest, o.Summary = filepath.Join(dir, "partition.jsonl"), filepath.Join(dir, "summary.json")
+			if got, _ := inverseFileSHA(o.Summary); got != o.SummarySHA {
+				t.Fatal("restored summary differs")
+			}
+			// A hold that arrives after the reuse check is still a live veto.
+			held := entries[1].Key
+			exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',100,'metadata')`, held)
+			o.Workers = 1
+			before := providerDeletes()
+			result, err := applyInverse(ctx, pool, sdk, o)
+			store.mu.Lock()
+			_, present := store.objects[held]
+			store.mu.Unlock()
+			if err == nil || !strings.Contains(err.Error(), "live key protection veto") || result.Deleted != 1 || providerDeletes()-before != 1 || !present {
+				t.Fatalf("reused run %+v %v, held key present %v", result, err, present)
+			}
+		})
+		t.Run("digest_mismatch", func(t *testing.T) {
+			o, _ := seal(1, time.Now().UTC())
+			if _, err := reuse(strings.Repeat("0", 64)); err == nil {
+				t.Fatal("reused an unknown digest")
+			}
+			exec(`UPDATE r2_inverse_partitions SET partition_sha256=repeat('f',64) WHERE partition_sha256=$1`, o.ManifestSHA)
+			if _, err := reuse(strings.Repeat("f", 64)); err == nil || !strings.Contains(err.Error(), "differs from its digest") {
+				t.Fatal("reused a partition other than its digest", err)
+			}
+		})
+		t.Run("stale", func(t *testing.T) {
+			o, _ := seal(1, time.Now().UTC().Add(-25*time.Hour))
+			if _, err := reuse(o.ManifestSHA); err == nil || !strings.Contains(err.Error(), "stale") {
+				t.Fatal("reused a stale partition", err)
+			}
+		})
+		for name, change := range map[string]string{
+			"KE_epoch":      `UPDATE r2_inverse_ke_epoch SET epoch=epoch+1`,
+			"owner_keep":    `INSERT INTO r2_owner_keep_prefixes(bucket,prefix,decision) VALUES('stoarama','reuse-test/','test')`,
+			"delivery_hold": `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama','unrelated/reuse.mp4','hold',100,'metadata')`,
+		} {
+			t.Run("changed_"+name, func(t *testing.T) {
+				o, _ := seal(1, time.Now().UTC())
+				exec(change)
+				if _, err := reuse(o.ManifestSHA); err == nil || !strings.Contains(err.Error(), "protection inputs changed") {
+					t.Fatal("reused after a protection change", err)
+				}
+			})
+		}
+	})
+	t.Run("confirming_HEAD_retries_transient_reads_only", func(t *testing.T) {
+		// The production bounds, asserted literally: these tests run at them.
+		if inverseConfirmAttempts != 4 || inverseConfirmAttemptTimeout != 4*time.Second || inverseConfirmMaxBackoff != 2*time.Second || inverseConfirmTimeout != 22*time.Second || sdk.confirm.Timeout != 4*time.Second || sdk.confirm.CheckRedirect == nil {
+			t.Fatal("confirming HEAD bounds differ from 4 attempts of 4s, 2s backoff, 22s total, no redirects")
+		}
+		t.Setenv("AWS_NEW_RETRIES_2026", "true") // retry-after must not stretch the backoff either way
+		for _, c := range []struct {
+			name  string
+			wire  string
+			heads []string
+			sent  int64 // HEADs the confirmation sends
+			err   string
+		}{
+			{"timeouts_then_404", "", []string{"slow", "slow"}, 3, ""},
+			{"5xx_then_404", "", []string{"503"}, 2, ""},
+			{"cloudflare_520_then_404", "", []string{"520"}, 2, ""},
+			{"every_5xx_retries", "", []string{"501", "599"}, 3, ""},
+			{"bare_429_then_404", "", []string{"429"}, 2, ""},
+			// A throttle that clears but whose object is present keeps the key
+			// held: the 429 is retried, and the answer still decides.
+			{"throttled_then_present_stays_held", "kept", []string{"429"}, 2, "object remains after DELETE"},
+			// Throttled past every try: the read stops cleanly, the one DELETE
+			// already sent is never resent, and the key stays held.
+			{"throttled_forever_stops_cleanly", "", []string{"429", "429", "429", "429"}, 4, "after 4 attempts"},
+			// A Retry-After past the cap fences the job's reads: the retry is
+			// never sent early, and the already issued key stays held.
+			{"retry_after_past_the_cap_fences_reads", "", []string{"429-retry-after"}, 1, "reads fenced"},
+			{"persistent_timeouts_hold_the_key", "", []string{"slow", "slow", "slow", "slow"}, 4, "after 4 attempts"},
+			{"redirect_to_404_never_confirms", "kept", []string{"redirect"}, 1, "after 1 attempts"},
+			{"object_remains_is_never_retried", "kept", nil, 1, "object remains after DELETE"},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				// Each case observes its own run's wire behavior, without the
+				// previous case's cooldown.
+				freshReadFence(sdk)
+				// A confirmed key lets the batch go on to the next one.
+				n := 1
+				if c.err == "" {
+					n = 2
+				}
+				a, entries := build(n)
+				a.ledger.close()
+				e := entries[0]
+				var sent atomic.Bool
+				var heads atomic.Int64
+				store.mu.Lock()
+				store.wire = map[string]string{e.Key: c.wire}
+				// The latch is monotone: eight workers call this concurrently, so
+				// a read-modify-write store would let another key's DELETE store
+				// false after the key under test stored true.
+				store.onDelete = func(key string) {
+					if key == e.Key {
+						sent.Store(true)
+					}
+				}
+				store.onHead = func(key string) string {
+					if key != e.Key || !sent.Load() {
+						return ""
+					}
+					if n := int(heads.Add(1)); n <= len(c.heads) {
+						return c.heads[n-1]
+					}
+					return ""
+				}
+				store.mu.Unlock()
+				defer func() {
+					store.mu.Lock()
+					store.wire, store.onDelete, store.onHead = nil, nil, nil
+					store.mu.Unlock()
+				}()
+				before := providerDeletes()
+				started := time.Now()
+				result, err := applyInverse(ctx, pool, sdk, a.opts)
+				elapsed := time.Since(started)
+				if providerDeletes()-before != int64(n) {
+					t.Fatal("DELETEs sent", providerDeletes()-before, "for keys", n)
+				}
+				if heads.Load() != c.sent || elapsed > 22*time.Second+5*time.Second {
+					t.Fatalf("%d confirming HEADs in %v, want %d within 22s", heads.Load(), elapsed, c.sent)
+				}
+				if c.err == "" {
+					if err != nil || result.Deleted != 2 {
+						t.Fatalf("confirmed %+v %v", result, err)
+					}
+					return
+				}
+				if err == nil || !strings.Contains(err.Error(), c.err) || !strings.Contains(err.Error(), "head "+e.Key) || result.Deleted != 0 {
+					t.Fatalf("unconfirmed %+v %v", result, err)
+				}
+				var held bool
+				if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_attempts WHERE bucket='stoarama' AND object_key=$1) AND NOT EXISTS(SELECT 1 FROM r2_inverse_events WHERE bucket='stoarama' AND object_key=$1)`, e.Key).Scan(&held); err != nil || !held {
+					t.Fatal("unconfirmed key not held", held, err)
+				}
+				if c.wire != "" {
+					// The DELETE left the object; nothing claims it is gone.
+					store.mu.Lock()
+					_, present := store.objects[e.Key]
+					store.mu.Unlock()
+					if !present {
+						t.Fatal("kept object vanished")
+					}
+					return
+				}
+				// A restart is a new process: its read fence starts empty instead
+				// of inheriting the cooldown this run ended under.
+				freshReadFence(sdk)
+				result, err = applyInverse(ctx, pool, sdk, a.opts)
+				if err != nil || !slices.Contains(result.HeldAbsent, e.Key) || providerDeletes()-before != 1 {
+					t.Fatalf("restart %+v %v", result, err)
+				}
+			})
+		}
+	})
 	t.Run("worker_pool_rate_with_durable_DB_and_ledger", func(t *testing.T) {
 		a, _ := build(1024)
 		a.ledger.close()
@@ -1555,7 +2403,74 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatalf("rate %.2f below8", s.ObjectsPerSecond)
 		}
 	})
+	// These run last: each leaves durable rows of its own, which the shared
+	// fixture's earlier count assertions must not see.
+	t.Run("pre_delete_HEAD_retries_transient_reads_without_extra_DELETE", func(t *testing.T) {
+		for name, mode := range map[string]string{"429_then_200": "429", "503_then_200": "503"} {
+			t.Run(name, func(t *testing.T) {
+				a, entries := build(1)
+				a.ledger.close()
+				e := entries[0]
+				var heads atomic.Int64
+				store.mu.Lock()
+				store.onHead = func(key string) string {
+					if key != e.Key || heads.Add(1) != 1 {
+						return ""
+					}
+					return mode
+				}
+				store.mu.Unlock()
+				defer func() {
+					store.mu.Lock()
+					store.onHead = nil
+					store.mu.Unlock()
+				}()
+				before := providerDeletes()
+				result, err := applyInverse(ctx, pool, sdk, a.opts)
+				if err != nil || result.Deleted != 1 || providerDeletes()-before != 1 {
+					t.Fatalf("read retry %+v err %v deletes %d", result, err, providerDeletes()-before)
+				}
+				// One throttled identity HEAD, its retry, and the confirming HEAD.
+				if heads.Load() != 3 {
+					t.Fatalf("%d HEADs, want 3 (retry, then the confirming read)", heads.Load())
+				}
+			})
+		}
+	})
+	t.Run("pre_delete_HEAD_throttled_forever_stops_before_DELETE", func(t *testing.T) {
+		a, entries := build(1)
+		a.ledger.close()
+		e := entries[0]
+		var heads atomic.Int64
+		store.mu.Lock()
+		store.onHead = func(key string) string {
+			if key != e.Key {
+				return ""
+			}
+			heads.Add(1)
+			return "429"
+		}
+		store.mu.Unlock()
+		defer func() {
+			store.mu.Lock()
+			store.onHead = nil
+			store.mu.Unlock()
+		}()
+		before := providerDeletes()
+		result, err := applyInverse(ctx, pool, sdk, a.opts)
+		if err == nil || !strings.Contains(err.Error(), "after 4 attempts") || result.Deleted != 0 {
+			t.Fatalf("throttled identity HEAD: %+v %v", result, err)
+		}
+		if heads.Load() != inverseReadAttempts || providerDeletes()-before != 0 {
+			t.Fatalf("%d HEAD attempts and %d DELETEs, want 4 and none", heads.Load(), providerDeletes()-before)
+		}
+		var issued bool
+		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_attempts WHERE bucket='stoarama' AND object_key=$1)`, e.Key).Scan(&issued); err != nil || issued {
+			t.Fatalf("an exhausted identity read still issued wire authority: %v", err)
+		}
+	})
 }
+
 func TestR2InverseLedgerRestartAndPartialTail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ledger")
 	l, err := openInverseLedger(path)
@@ -1635,6 +2550,30 @@ func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*inverseSDKStor
 				w.WriteHeader(204)
 			}
 			return
+		}
+		store.mu.Lock()
+		onHead := store.onHead
+		store.mu.Unlock()
+		if req.Method == http.MethodHead && onHead != nil {
+			switch mode := onHead(key); mode {
+			case "":
+			case "slow":
+				<-req.Context().Done()
+				return
+			case "429-retry-after":
+				w.Header().Set("X-Amz-Retry-After", "600000")
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			case "redirect":
+				http.Redirect(w, req, "/stoarama/elsewhere/"+key, http.StatusTemporaryRedirect)
+				return
+			default:
+				// Any explicit status, so a proxy's 520 can be tested too.
+				if status, err := strconv.Atoi(mode); err == nil && status >= 100 && status <= 599 {
+					w.WriteHeader(status)
+					return
+				}
+			}
 		}
 		store.mu.Lock()
 		defer store.mu.Unlock()
@@ -1780,6 +2719,17 @@ func TestR2InverseJobReadbackComparesHeldKeys(t *testing.T) {
 	if _, err := readback.settle(result, lost); err == nil || !strings.Contains(err.Error(), "evidence differs") {
 		t.Fatalf("different held key continued the job: %v", err)
 	}
+	// An unpublished absence is held exactly like a lost response.
+	unpublished := fmt.Errorf("%w: test", errInverseUnpublished)
+	result.Unpublished = []string{"managed/0"}
+	readback = inverseBatchReadback{Intents: 3, Absent: 1, AbsentBytes: 100, Attempts: 3, Unresolved: []string{"managed/0", "managed/a"}}
+	if done, err := readback.settle(result, unpublished); err != nil || done {
+		t.Fatalf("matching unpublished readback: %v %v", done, err)
+	}
+	readback.Unresolved = []string{"managed/a"}
+	if _, err := readback.settle(result, unpublished); err == nil || !strings.Contains(err.Error(), "evidence differs") {
+		t.Fatalf("unpublished key missing from readback continued the job: %v", err)
+	}
 	// Done means nothing new was selected: a batch whose selected keys were all
 	// skipped for short custody, deleting none, is not done.
 	if done, err := (inverseBatchReadback{Unresolved: []string{}}).settle(inverseApplySummary{Selected: 1, CustodyShort: r2RetireStat{Objects: 1, Bytes: 100}, WireAmbiguous: []string{}}, nil); err != nil || done {
@@ -1793,10 +2743,13 @@ func TestR2InverseJobReadbackComparesHeldKeys(t *testing.T) {
 // Job totals sum every batch's counts; held keys are the latest snapshot.
 func TestR2InverseJobTotalsAddBatches(t *testing.T) {
 	total := inverseApplySummary{}
-	total.addBatch(inverseApplySummary{Selected: 3, Deleted: 2, Bytes: 200, CustodyShort: r2RetireStat{Objects: 1, Bytes: 100}, WireAmbiguous: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}})
-	total.addBatch(inverseApplySummary{Selected: 1, Deleted: 1, Bytes: 100, AmbiguousHeld: 1, HeldAbsent: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}})
+	total.addBatch(inverseApplySummary{Selected: 3, StitchSkipped: 1, Deleted: 2, Bytes: 200, CustodyShort: r2RetireStat{Objects: 1, Bytes: 100}, WireAmbiguous: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}, partitionRead: true})
+	total.addBatch(inverseApplySummary{Selected: 1, StitchSkipped: 2, Deleted: 1, Bytes: 100, AmbiguousHeld: 1, HeldAbsent: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}, partitionRead: true})
+	// A batch that failed before reading its partition (its evidence was
+	// refused) measured nothing: the last measurement stands.
+	total.addBatch(inverseApplySummary{})
 	// last_modified_held comes from the partition every batch rereads: a snapshot.
-	if total.Selected != 4 || total.Deleted != 3 || total.Bytes != 300 || total.CustodyShort != (r2RetireStat{Objects: 1, Bytes: 100}) || total.LastModifiedHeld != (r2RetireStat{Objects: 2, Bytes: 200}) || !slices.Equal(total.WireAmbiguous, []string{"managed/a"}) || total.AmbiguousHeld != 1 || !slices.Equal(total.HeldAbsent, []string{"managed/a"}) {
+	if total.Selected != 4 || total.StitchSkipped != 3 || total.Deleted != 3 || total.Bytes != 300 || total.CustodyShort != (r2RetireStat{Objects: 1, Bytes: 100}) || total.LastModifiedHeld != (r2RetireStat{Objects: 2, Bytes: 200}) || !slices.Equal(total.WireAmbiguous, []string{"managed/a"}) || total.AmbiguousHeld != 1 || !slices.Equal(total.HeldAbsent, []string{"managed/a"}) {
 		t.Fatalf("job totals: %+v", total)
 	}
 }

@@ -76,6 +76,12 @@ func (c *Client) admitWrite(ctx context.Context, ttl time.Duration) (func(), fun
 	return release, complete, nil
 }
 
+// ListMultipartUploadsPage reads exactly one multipart inventory page under the
+// caller's read options.
+func (c *Client) ListMultipartUploadsPage(ctx context.Context, in *s3.ListMultipartUploadsInput, read ReadOptions) (*s3.ListMultipartUploadsOutput, error) {
+	return c.s3.ListMultipartUploads(ctx, in, read.apply)
+}
+
 // RequireNoMultipartUploads inventories real provider state, including uploads
 // whose parts are complete but whose final completion can still replace a key.
 // Zero for the entire bucket is deliberately stronger than manifest overlap.
@@ -95,12 +101,31 @@ func (c *Client) RequireNoMultipartUploads(ctx context.Context) error {
 func (c *Client) RequireNoMultipartOutsideStitchStaging(
 	ctx context.Context, known func(context.Context, string, string) (bool, error),
 ) error {
+	return c.RequireNoMultipartOutsideStitchStagingPages(ctx, func(ctx context.Context, in *s3.ListMultipartUploadsInput) (*s3.ListMultipartUploadsOutput, error) {
+		return c.ListMultipartUploadsPage(ctx, in, ReadOptions{})
+	}, known)
+}
+
+// RequireNoMultipartOutsideStitchStagingPages is the form the inverse executor
+// uses: pageRequest runs one page attempt and may retry it in place. It must
+// return the page the SDK decoded for that attempt, so this loop alone decides
+// what a complete inventory is.
+func (c *Client) RequireNoMultipartOutsideStitchStagingPages(
+	ctx context.Context,
+	pageRequest func(context.Context, *s3.ListMultipartUploadsInput) (*s3.ListMultipartUploadsOutput, error),
+	known func(context.Context, string, string) (bool, error),
+) error {
 	request := &s3.ListMultipartUploadsInput{Bucket: aws.String(c.bucket), MaxUploads: aws.Int32(1000)}
 	type marker struct{ key, upload string }
 	seen := map[marker]bool{}
 	for {
-		page, err := c.s3.ListMultipartUploads(ctx, request)
-		if err != nil || page.IsTruncated == nil {
+		page, err := pageRequest(ctx, request)
+		if err != nil {
+			// Keep the page's own error, wrapped: it carries the status the
+			// read policy classified, and the inventory still fails closed.
+			return fmt.Errorf("R2 multipart inventory unavailable or incomplete: %w", err)
+		}
+		if page == nil || page.IsTruncated == nil {
 			return errors.New("R2 multipart inventory unavailable or incomplete")
 		}
 		for _, object := range page.Uploads {

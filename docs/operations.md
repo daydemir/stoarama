@@ -327,6 +327,8 @@ and an independent postrun artifact digest. See
 [R2 stitching prerequisite](R2_STITCH_PREREQUISITE.md) for the owner wording,
 read-only verification command, immutable replay and recovery contract.
 
+RAW drain = [this helper](../ops/jelly/r2-retire/raw-drain-lock.sql) plus a terminal job, never classid=0.
+
 Legacy `survey delete-stream-captures`, `joined-source-purge --apply` and
 `nas-verified-purge --apply` refuse before catalog or object mutations. Keep the
 NAS purge cron suspended and its enable flag false. Probe/restore requests issue

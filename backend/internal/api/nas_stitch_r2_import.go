@@ -32,15 +32,32 @@ type DurhamStitchInput struct {
 	Size   int64  `json:"size_bytes"`
 }
 
-func ImportDurhamStitchHoldSet(ctx context.Context, tx pgx.Tx, set DurhamStitchHoldSet) (int, error) {
-	if set.Bucket == "" || !stitchSHA(set.EndpointSHA) || len(set.Hours) < 1 || len(set.Hours) > 20000 {
-		return 0, errors.New("bounded exact Durham hold set required")
+// One import holds one advisory lock per input until commit. Production has
+// 64 locks per transaction x 103 connections, about 6,592 shared lock slots
+// with ~550 in use. 1,000 inputs (about 16 hours of 60 clips) leaves most of
+// the table to everyone else; plan larger sets in parts.
+const durhamStitchMaxImportInputs = 1000
+
+func durhamStitchHoldSetBounded(set DurhamStitchHoldSet) error {
+	inputs := 0
+	for _, hour := range set.Hours {
+		inputs += len(hour.Inputs)
 	}
-	for _, lock := range []int64{7343226011173, 7343226011189} {
-		var owns bool
-		if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1)`, lock).Scan(&owns); err != nil || !owns {
-			return 0, errors.New("retirement or another stitch import is active")
-		}
+	if set.Bucket == "" || !stitchSHA(set.EndpointSHA) || len(set.Hours) < 1 || inputs > durhamStitchMaxImportInputs {
+		return errors.New("bounded exact Durham hold set required")
+	}
+	return nil
+}
+
+func ImportDurhamStitchHoldSet(ctx context.Context, tx pgx.Tx, set DurhamStitchHoldSet) (int, error) {
+	if err := durhamStitchHoldSetBounded(set); err != nil {
+		return 0, err
+	}
+	// Each hold keeps its own key lock until commit. Imports serialize on 1189;
+	// retirement of other keys proceeds.
+	var owns bool
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(7343226011189)`).Scan(&owns); err != nil || !owns {
+		return 0, errors.New("another stitch import is active")
 	}
 	var safe bool
 	if err := tx.QueryRow(ctx, `SELECT NOT c.enabled AND EXISTS(SELECT 1 FROM r2_retirement_writer_fences f

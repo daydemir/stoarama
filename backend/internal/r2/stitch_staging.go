@@ -300,11 +300,14 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 		return err
 	}
 	defer conn.Release()
+	// One wire admission per staged object. This session guard spans the
+	// separately committed one-shot reservation; other objects proceed.
+	const stageLock = `hashtextextended($1::bigint::text,7343226011222)`
 	var owned bool
-	if err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(7343226011173)`).Scan(&owned); err != nil || !owned {
-		return errors.New("R2 retirement lane busy")
+	if err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(`+stageLock+`)`, objectID).Scan(&owned); err != nil || !owned {
+		return errors.New("stitch stage retirement busy")
 	}
-	defer conn.Exec(context.Background(), `SELECT pg_advisory_unlock(7343226011173)`)
+	defer conn.Exec(context.Background(), `SELECT pg_advisory_unlock(`+stageLock+`)`, objectID)
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return err

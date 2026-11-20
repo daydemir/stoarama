@@ -403,7 +403,7 @@ func TestKeep28RejectsChangedProofWithSameExpiry(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer tx.Rollback(f.ctx)
-			auth, err := a.authorize(f.ctx, tx, e, &inverseSendGate{})
+			auth, err := a.authorize(f.ctx, f.ctx, tx, e, &inverseSendGate{})
 			if err == nil {
 				auth.cancel()
 				t.Fatal("changed proof accepted")
@@ -459,9 +459,9 @@ func (c deadlineSpyConn) SetWriteDeadline(d time.Time) error {
 
 // Neither the authority's deadline nor the wire's first-byte and socket
 // deadline lies past custody expiry, measured against the database clock
-// reaching that expiry. Without a parent deadline, the authority's timer is
-// custody end exactly. A pause separates its clock sample from the
-// transport's, which must also land exactly on the earliest custody end.
+// reaching that expiry. The authority's timer is the earlier of the network
+// timeout and custody end. A pause separates its clock sample from the
+// transport's, which must land exactly on the earliest custody end.
 func TestKeep28DeadlinesNeverOutliveCustody(t *testing.T) {
 	f := newKeep28Fixture(t)
 	_, auth := f.keep28Authorized(t, f.applier(t), &inverseSendGate{})
@@ -476,7 +476,7 @@ func TestKeep28DeadlinesNeverOutliveCustody(t *testing.T) {
 		return time.Now().Add(auth.custody.Expiry.Sub(now))
 	}
 	authorized, _ := auth.ctx.Deadline()
-	if !authorized.Equal(auth.custodyEnd) || authorized.After(expiry().Add(-2*time.Second)) {
+	if authorized.After(auth.custodyEnd) || time.Until(authorized) > inverseNetworkTimeout || authorized.After(expiry().Add(-2*time.Second)) {
 		t.Fatalf("authority outlives custody: deadline %v, custody end %v", authorized, auth.custodyEnd)
 	}
 	time.Sleep(300 * time.Millisecond)
@@ -520,7 +520,7 @@ func TestKeep28AuthorityCopiesCannotReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(f.ctx)
-	auth, err := a.authorize(f.ctx, tx, e, &inverseSendGate{})
+	auth, err := a.authorize(f.ctx, f.ctx, tx, e, &inverseSendGate{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -756,7 +756,10 @@ func TestKeep28QueuedKeyCustodyOutcome(t *testing.T) {
 		// Another valid digest: the sidecar selection observed was replaced.
 		"sidecar_digest":      `UPDATE nas_inventory_files SET sidecar_sha256=repeat('d',64) WHERE clip_id=9000001`,
 		"sidecar_digest_aged": `UPDATE nas_inventory_files SET sidecar_sha256=repeat('d',64),verified_at=clock_timestamp()-interval '24 hours 1 second' WHERE clip_id=9000001`,
-		// The key now names clip 3: same size, ETag and digests, its own valid custody.
+		// The key now names clip 3, which already carries clip 1's catalog,
+		// custody and sidecar paths: same size, ETag, paths and digests, its own
+		// valid custody. Only the source ID differs, and moving object keys
+		// leaves the KE epoch alone, so only the identity comparison can halt it.
 		"reassigned_clip": `UPDATE recording_clips SET object_key='managed/acct-47/keep28/moved.mp4' WHERE id=9000001; UPDATE recording_clips SET object_key='managed/acct-47/keep28/1.mp4' WHERE id=9000003`,
 		// The same clip's media SHA changes in catalog and inventory alike.
 		"media_sha": `UPDATE recording_clips SET sha256=repeat('e',64) WHERE id=9000001; UPDATE nas_inventory_files SET sha256=repeat('e',64) WHERE clip_id=9000001`,
@@ -768,6 +771,13 @@ func TestKeep28QueuedKeyCustodyOutcome(t *testing.T) {
 			f := newKeep28FixtureCount(t, 3)
 			f.writeManifest(t, 2)
 			f.store.headWithoutSHA = true
+			if change == "reassigned_clip" {
+				// Before the batch reads its KE epoch, which a path change advances.
+				if _, err := f.pool.Exec(f.ctx, `UPDATE recording_clips SET display_path='keep28/1.mp4' WHERE id=9000003;
+ UPDATE nas_inventory_files SET relative_path='keep28/1.mp4',sidecar_relative_path='keep28/1.mp4.stoarama.json' WHERE clip_id=9000003`); err != nil {
+					t.Fatal(err)
+				}
+			}
 			// The change waits for the epoch row behind key 2's network
 			// transaction, so it commits after key 2 and before key 1 reserves:
 			// protection metadata changes cannot commit while a DELETE holds it.
@@ -886,13 +896,22 @@ func (*slowSampleTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQuer
 // Through the production delete path, with its 30-second parent deadline, the
 // socket deadline is the earlier of the parent deadline and custody end less
 // the margin. Custody wins when the authorization clock sample is delayed 4s,
-// as a database clock step would leave it; otherwise the parent wins.
+// as a database clock step would leave it. Otherwise an explicit, much earlier
+// parent deadline wins, so the outcome never depends on setup time.
 func TestKeep28DeletePathComposesParentAndCustodyDeadlines(t *testing.T) {
 	const delay = 4 * time.Second
 	for _, custodyWins := range []bool{true, false} {
 		t.Run(map[bool]string{true: "custody_wins", false: "parent_wins"}[custodyWins], func(t *testing.T) {
 			f := newKeep28Fixture(t)
-			if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '24 hours'+interval '34 seconds',server_received_at=clock_timestamp()`); err != nil {
+			// Parent-wins needs custody ample enough that no setup delay can
+			// turn reserve into a custody-short skip: only the explicit parent
+			// deadline decides that case. Custody-wins keeps custody near, as it
+			// must beat the later parent deadline.
+			custody := "interval '24 hours'+interval '34 seconds'"
+			if !custodyWins {
+				custody = "interval '24 hours'+interval '300 seconds'"
+			}
+			if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-`+custody+`,server_received_at=clock_timestamp()`); err != nil {
 				t.Fatal(err)
 			}
 			tracer := &slowSampleTracer{}
@@ -923,7 +942,11 @@ func TestKeep28DeletePathComposesParentAndCustodyDeadlines(t *testing.T) {
 			f.sdk.transport = template
 			defer func() { f.sdk.transport = original }()
 			called := time.Now()
-			if ok, err := a.delete(f.ctx, f.ctx, &inverseSendGate{}, f.entry(t)); err != nil || !ok {
+			// The parent deadline is explicit in both cases, far from custody
+			// end (about 32s away), so the outcome never depends on setup time.
+			parent, cancelParent := context.WithDeadline(f.ctx, called.Add(keep28ParentLead[custodyWins]))
+			defer cancelParent()
+			if ok, err := a.delete(parent, parent, &inverseSendGate{}, f.entry(t)); err != nil || !ok {
 				t.Fatalf("delete: %v %v", ok, err)
 			}
 			deadline, _ := wire.Load().(time.Time)
@@ -940,7 +963,7 @@ func TestKeep28DeletePathComposesParentAndCustodyDeadlines(t *testing.T) {
 				t.Fatal(err)
 			}
 			custodyLow, custodyHigh := before.Add(expiry.Sub(dbNow)-2*time.Second), after.Add(expiry.Sub(dbNow)-2*time.Second)
-			parentLow, parentHigh := called.Add(inverseNetworkTimeout), time.Now().Add(inverseNetworkTimeout)
+			parentLow, parentHigh := called.Add(keep28ParentLead[custodyWins]), time.Now().Add(keep28ParentLead[custodyWins])
 			if custodyWins {
 				// The delayed sample places custody end up to the delay early.
 				if deadline.After(custodyHigh.Add(-delay)) || deadline.Before(custodyLow.Add(-delay-time.Second)) || !deadline.Before(parentLow) {
@@ -952,6 +975,65 @@ func TestKeep28DeletePathComposesParentAndCustodyDeadlines(t *testing.T) {
 				t.Fatalf("parent should bound the wire: %v, parent %v..%v, custody end from %v", deadline, parentLow, parentHigh, custodyLow)
 			}
 		})
+	}
+}
+
+// keep28ParentLead is each case's explicit parent deadline from its own start:
+// 20s before custody end, which is about 32s away, when the parent must win, and
+// 20s after it when custody must.
+var keep28ParentLead = map[bool]time.Duration{true: 50 * time.Second, false: 10 * time.Second}
+
+// confirmDeadlineSpy records the deadline the executor gives the confirming HEAD.
+type confirmDeadlineSpy struct {
+	*inverseSDKStore
+	called, deadline time.Time
+}
+
+func (s *confirmDeadlineSpy) confirmAbsent(ctx context.Context, key string) error {
+	s.called = time.Now()
+	s.deadline, _ = ctx.Deadline()
+	return s.inverseSDKStore.confirmAbsent(ctx, key)
+}
+
+// Through the production delete path, the confirming HEAD ends at custody end
+// when custody is tighter than both the network deadline and the HEAD's own
+// 22s bound: the authorization clock sample is delayed 10s, as a database
+// clock step would leave it, so custody ends about 11s after the HEAD starts.
+func TestKeep28ConfirmingHEADEndsAtCustody(t *testing.T) {
+	f := newKeep28Fixture(t)
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '24 hours'+interval '34 seconds',server_received_at=clock_timestamp()`); err != nil {
+		t.Fatal(err)
+	}
+	config := f.pool.Config()
+	config.ConnConfig.Tracer = &slowSampleTracer{nth: 2, delay: 10 * time.Second}
+	pool, err := pgxpool.NewWithConfig(f.ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	a := f.applier(t)
+	a.pool = pool
+	spy := &confirmDeadlineSpy{inverseSDKStore: f.sdk}
+	a.store = spy
+	var wire atomic.Value
+	template := newInverseDeleteHTTPTransport()
+	dial := template.DialContext
+	template.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return deadlineSpyConn{Conn: conn, set: &wire}, nil
+	}
+	original := f.sdk.transport
+	f.sdk.transport = template
+	defer func() { f.sdk.transport = original }()
+	if ok, err := a.delete(f.ctx, f.ctx, &inverseSendGate{}, f.entry(t)); err != nil || !ok {
+		t.Fatalf("delete: %v %v", ok, err)
+	}
+	custodyEnd, _ := wire.Load().(time.Time)
+	if spy.deadline.IsZero() || spy.deadline.After(custodyEnd) || !spy.deadline.Before(spy.called.Add(inverseConfirmTimeout)) {
+		t.Fatalf("confirming HEAD deadline %v, custody end %v, own bound %v", spy.deadline, custodyEnd, spy.called.Add(inverseConfirmTimeout))
 	}
 }
 
@@ -1026,7 +1108,7 @@ func (f keep28Fixture) keep28Authorized(t *testing.T, a *inverseApplier, gate *i
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { tx.Rollback(f.ctx) })
-	auth, err := a.authorize(f.ctx, tx, e, gate)
+	auth, err := a.authorize(f.ctx, f.ctx, tx, e, gate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1314,6 +1396,12 @@ func TestKeep28JobCLIDispatchAndLimits(t *testing.T) {
 	raw, err := parseInverseJobFlags([]string{"--picks", "p", "--expected-picks-sha256", strings.Repeat("a", 64), "--owner-decision", "o", "--work", "w"}, inverseOutsideKeep28)
 	if err != nil || raw.items != 5000 || raw.maxBytes != 1<<40 || raw.budget24h != 0 {
 		t.Fatalf("RAW job defaults changed: %+v %v", raw, err)
+	}
+	for reuse, ok := range map[string]bool{strings.Repeat("b", 64): true, "B" + strings.Repeat("b", 63): false, "bb": false} {
+		f, err := parseInverseJobFlags([]string{"--picks", "p", "--expected-picks-sha256", strings.Repeat("a", 64), "--owner-decision", "o", "--work", "w", "--reuse-partition", reuse}, inverseOutsideKeep28)
+		if (err == nil) != ok || ok && f.reuse != reuse {
+			t.Fatalf("--reuse-partition %q: %+v %v", reuse, f, err)
+		}
 	}
 	dir := t.TempDir()
 	picks := filepath.Join(dir, "picks.json")
