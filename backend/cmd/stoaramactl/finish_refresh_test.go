@@ -186,7 +186,7 @@ func TestFinishRefreshAndB2ReservationRaceBothOrders(t *testing.T) {
 			f := newKeep28Fixture(t)
 			opts := seedRefreshCandidates(t, f, []int64{100})
 			a := f.applier(t)
-			entry := f.entry()
+			entry := f.entry(t)
 			gate, err := f.pool.Begin(f.ctx)
 			if err != nil {
 				t.Fatal(err)

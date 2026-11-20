@@ -62,6 +62,8 @@ type inverseEntry struct {
 	r2.ObjectInfo
 	Class  inverseClass `json:"class"`
 	Reason string       `json:"reason"`
+	// Sidecar is the NAS sidecar keep-28 selection observed; never serialized.
+	Sidecar keep28Sidecar `json:"-"`
 }
 type inverseSummary struct {
 	Version              int                           `json:"version"`
@@ -309,7 +311,7 @@ func partitionInverse(ctx context.Context, store inverseLister, p inverseProtect
 		seen[identity] = struct{}{}
 		previous = o.Key
 		class, reason := p.classify(o)
-		if err := encoder.Encode(inverseEntry{o, class, reason}); err != nil {
+		if err := encoder.Encode(inverseEntry{ObjectInfo: o, Class: class, Reason: reason}); err != nil {
 			return err
 		}
 		stat := sum.Classes[class]

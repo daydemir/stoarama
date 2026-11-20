@@ -1786,6 +1786,16 @@ func TestR2InverseJobReadbackComparesHeldKeys(t *testing.T) {
 	}
 }
 
+// Job totals sum every batch's counts; held keys are the latest snapshot.
+func TestR2InverseJobTotalsAddBatches(t *testing.T) {
+	total := inverseApplySummary{}
+	total.addBatch(inverseApplySummary{Selected: 3, Deleted: 2, Bytes: 200, CustodyShort: r2RetireStat{Objects: 1, Bytes: 100}, WireAmbiguous: []string{"managed/a"}})
+	total.addBatch(inverseApplySummary{Selected: 1, Deleted: 1, Bytes: 100, AmbiguousHeld: 1, HeldAbsent: []string{"managed/a"}})
+	if total.Selected != 4 || total.Deleted != 3 || total.Bytes != 300 || total.CustodyShort != (r2RetireStat{Objects: 1, Bytes: 100}) || !slices.Equal(total.WireAmbiguous, []string{"managed/a"}) || total.AmbiguousHeld != 1 || !slices.Equal(total.HeldAbsent, []string{"managed/a"}) {
+		t.Fatalf("job totals: %+v", total)
+	}
+}
+
 type blockingWriteConn struct {
 	net.Conn
 	release chan struct{}

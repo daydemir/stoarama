@@ -331,12 +331,18 @@ func (a *inverseApplier) reserve(ctx context.Context, e inverseEntry) (inverseRa
 	var custody *keep28Custody
 	if a.opts.Lane == inverseNASKeep28 {
 		c, err := a.lockKeep28Custody(ctx, tx, t)
-		if errors.Is(err, errR2RetireNASProofAged) {
+		aged := errors.Is(err, errR2RetireNASProofAged)
+		if err != nil && !aged {
+			return t, err
+		}
+		// The sidecar selection observed must still be the locked one, whatever
+		// the proof's age: a replaced sidecar is a hard veto, never a skip.
+		if (keep28Sidecar{SHA: c.SidecarSHA, Size: c.SidecarSize}) != e.Sidecar {
+			return t, errors.New("NAS sidecar changed since selection")
+		}
+		if aged {
 			// Exact custody that aged out while the key waited is no failure.
 			return t, errKeep28CustodyShort
-		}
-		if err != nil {
-			return t, err
 		}
 		// Admit only a key that can finish inside custody: one network timeout
 		// must fit before the margin-early custody end. Nothing is written yet.

@@ -107,7 +107,7 @@ func TestKeep28LastModifiedCutoffReportsHeldBytes(t *testing.T) {
 	for _, modified := range []time.Time{{}, inverseRetirementCutoff(), inverseRetirementCutoff().Add(time.Second), time.Now().Add(time.Hour)} {
 		t.Run(modified.Format(time.RFC3339Nano), func(t *testing.T) {
 			f := newKeep28Fixture(t)
-			e := f.entry()
+			e := f.entry(t)
 			e.LastModified = modified
 			data, err := json.Marshal(e)
 			if err != nil {
@@ -368,10 +368,18 @@ func (f keep28Fixture) applier(t *testing.T) *inverseApplier {
 	}
 	return &inverseApplier{pool: f.pool, store: f.sdk, opts: f.options, summary: sum, protection: p, ledger: ledger, keEpoch: epoch}
 }
-func (f keep28Fixture) entry() inverseEntry {
+
+// entry is the fixture key as selection would queue it, with the sidecar it
+// observes now.
+func (f keep28Fixture) entry(t *testing.T) inverseEntry {
+	t.Helper()
 	f.store.mu.Lock()
-	defer f.store.mu.Unlock()
-	return inverseEntry{ObjectInfo: f.store.objects[f.key], Class: inverseKeep28}
+	e := inverseEntry{ObjectInfo: f.store.objects[f.key], Class: inverseKeep28}
+	f.store.mu.Unlock()
+	if err := f.pool.QueryRow(f.ctx, `SELECT sidecar_sha256,sidecar_size_bytes FROM nas_inventory_files WHERE clip_id=9000001`).Scan(&e.Sidecar.SHA, &e.Sidecar.Size); err != nil {
+		t.Fatal(err)
+	}
+	return e
 }
 
 func TestKeep28RejectsChangedProofWithSameExpiry(t *testing.T) {
@@ -379,7 +387,7 @@ func TestKeep28RejectsChangedProofWithSameExpiry(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := newKeep28Fixture(t)
 			a := f.applier(t)
-			e := f.entry()
+			e := f.entry(t)
 			if _, err := a.reserve(f.ctx, e); err != nil {
 				t.Fatal(err)
 			}
@@ -499,7 +507,7 @@ func TestKeep28DeadlinesNeverOutliveCustody(t *testing.T) {
 func TestKeep28AuthorityCopiesCannotReplay(t *testing.T) {
 	f := newKeep28Fixture(t)
 	a := f.applier(t)
-	e := f.entry()
+	e := f.entry(t)
 	if _, err := a.reserve(f.ctx, e); err != nil {
 		t.Fatal(err)
 	}
@@ -699,7 +707,7 @@ func TestKeep28ShortCustodySkipsBeforeAnyWrite(t *testing.T) {
 				t.Fatalf("short custody selected: %+v %v", result, err)
 			}
 			a := f.applier(t)
-			if _, err = a.reserve(f.ctx, f.entry()); !errors.Is(err, errKeep28CustodyShort) || f.durableWrites(t) != 0 || len(a.ledger.seen) != 0 {
+			if _, err = a.reserve(f.ctx, f.entry(t)); !errors.Is(err, errKeep28CustodyShort) || f.durableWrites(t) != 0 || len(a.ledger.seen) != 0 {
 				t.Fatalf("short custody reserved: %v, %d durable writes", err, f.durableWrites(t))
 			}
 			a.ledger.close()
@@ -723,25 +731,29 @@ func TestKeep28AgedCustodyIsSkippedChangedIdentityIsNot(t *testing.T) {
 	}
 	time.Sleep(1100 * time.Millisecond)
 	a := f.applier(t)
-	if _, err := a.reserve(f.ctx, f.entry()); !errors.Is(err, errKeep28CustodyShort) || f.durableWrites(t) != 0 {
+	if _, err := a.reserve(f.ctx, f.entry(t)); !errors.Is(err, errKeep28CustodyShort) || f.durableWrites(t) != 0 {
 		t.Fatalf("aged custody: %v, %d durable writes", err, f.durableWrites(t))
 	}
 	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '1 hour',sidecar_relative_path='other.mp4.stoarama.json'`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.reserve(f.ctx, f.entry()); err == nil || errors.Is(err, errKeep28CustodyShort) || f.durableWrites(t) != 0 {
+	if _, err := a.reserve(f.ctx, f.entry(t)); err == nil || errors.Is(err, errKeep28CustodyShort) || f.durableWrites(t) != 0 {
 		t.Fatalf("changed sidecar: %v, %d durable writes", err, f.durableWrites(t))
 	}
 }
 
 // While one key's DELETE is on the wire, a queued key's custody ages out: that
 // key is skipped and the batch finishes. If its sidecar or identity changes
-// instead, the batch halts.
+// instead, even to another valid digest and even with aged custody, the batch
+// halts before that key's DELETE and nothing counts as custody_short.
 func TestKeep28QueuedKeyCustodyOutcome(t *testing.T) {
 	for change, sql := range map[string]string{
 		"aged":     `UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '24 hours 1 second' WHERE clip_id=9000001`,
 		"sidecar":  `UPDATE nas_inventory_files SET sidecar_relative_path='other.mp4.stoarama.json' WHERE clip_id=9000001`,
 		"identity": `UPDATE nas_inventory_files SET sha256=repeat('a',64) WHERE clip_id=9000001`,
+		// Another valid digest: the sidecar selection observed was replaced.
+		"sidecar_digest":      `UPDATE nas_inventory_files SET sidecar_sha256=repeat('d',64) WHERE clip_id=9000001`,
+		"sidecar_digest_aged": `UPDATE nas_inventory_files SET sidecar_sha256=repeat('d',64),verified_at=clock_timestamp()-interval '24 hours 1 second' WHERE clip_id=9000001`,
 	} {
 		t.Run(change, func(t *testing.T) {
 			// Selection order: the older key 2 first, then key 1 waits queued.
@@ -850,7 +862,7 @@ func TestKeep28DeletePathComposesParentAndCustodyDeadlines(t *testing.T) {
 			f.sdk.transport = template
 			defer func() { f.sdk.transport = original }()
 			called := time.Now()
-			if ok, err := a.delete(f.ctx, f.ctx, &inverseSendGate{}, f.entry()); err != nil || !ok {
+			if ok, err := a.delete(f.ctx, f.ctx, &inverseSendGate{}, f.entry(t)); err != nil || !ok {
 				t.Fatalf("delete: %v %v", ok, err)
 			}
 			deadline, _ := wire.Load().(time.Time)
@@ -944,7 +956,7 @@ func TestKeep28HandoffsKeepTheTightestSample(t *testing.T) {
 // fresh network transaction.
 func (f keep28Fixture) keep28Authorized(t *testing.T, a *inverseApplier, gate *inverseSendGate) (pgx.Tx, *inverseDeleteAuthority) {
 	t.Helper()
-	e := f.entry()
+	e := f.entry(t)
 	if _, err := a.reserve(f.ctx, e); err != nil {
 		t.Fatal(err)
 	}
@@ -1041,7 +1053,7 @@ func TestKeep28DeleteNeverSpeaksHTTP2(t *testing.T) {
 func TestKeep28UnissuedAbsentIntentStopsStartup(t *testing.T) {
 	f := newKeep28Fixture(t)
 	a := f.applier(t)
-	if _, err := a.reserve(f.ctx, f.entry()); err != nil {
+	if _, err := a.reserve(f.ctx, f.entry(t)); err != nil {
 		t.Fatal(err)
 	}
 	a.ledger.close()
@@ -1197,7 +1209,7 @@ func TestKeep28ResponseRacingCancellationIsAHardFailure(t *testing.T) {
 func TestKeep28PublishAbsentRefusesChangedParentStream(t *testing.T) {
 	f := newKeep28Fixture(t)
 	a := f.applier(t)
-	e := f.entry()
+	e := f.entry(t)
 	if _, err := a.reserve(f.ctx, e); err != nil {
 		t.Fatal(err)
 	}

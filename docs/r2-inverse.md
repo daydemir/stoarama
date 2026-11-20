@@ -174,9 +174,10 @@ outlasts one network timeout plus the margin, so a key custody would skip uses
 no item or byte allowance. Reservation repeats that check under lock: a key
 whose custody shortened or aged out after selection is counted as
 `custody_short` and skipped before any reservation, intent, budget charge or
-ledger record, and fresh custody retries it. A changed identity, sidecar or
-state still stops the batch. A job is done only when a clean batch selected
-nothing.
+ledger record, and fresh custody retries it. A changed identity or state, or a
+sidecar whose path, digest or size differs from what selection observed,
+still stops the batch; reservation compares the sidecar before it considers
+custody age. A job is done only when a clean batch selected nothing.
 
 Custody is a 24-hour freshness policy on an existing, verified NAS copy, not a
 physical deadline. The requirement is that custody is valid at the last

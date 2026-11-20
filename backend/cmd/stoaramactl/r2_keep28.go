@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -43,12 +44,22 @@ type keep28Custody struct {
 	VerifiedAt, ReceivedAt, Expiry            time.Time
 }
 
+// keep28Sidecar is the sidecar proof selection observed for a key. Reserve
+// requires the locked custody to carry the very same one.
+type keep28Sidecar struct {
+	SHA  string
+	Size int64
+}
+
+// lockKeep28Custody locks and reads the exact custody proof. An aged proof is
+// still read in full and returned with errR2RetireNASProofAged, so callers can
+// compare it before treating it as aged.
 func (a *inverseApplier) lockKeep28Custody(ctx context.Context, tx pgx.Tx, t inverseRawTarget) (keep28Custody, error) {
 	c := keep28Custody{ConnectionID: 13, SourceID: t.ID, SizeBytes: t.Size, Path: t.Path, SHA: t.SHA}
 	item := r2RetireItem{r2RetireCandidate: r2RetireCandidate{Kind: "raw", SourceID: t.ID, SizeBytes: t.Size, SHA256: t.SHA, RelativePath: t.Path}}
-	expiry, err := r2RetireLockNASIdentity(ctx, tx, item, c.ConnectionID)
+	expiry, fresh, err := r2RetireLockNASProof(ctx, tx, item, c.ConnectionID)
 	if err != nil {
-		return c, err
+		return c, fmt.Errorf("exact present NAS identity no longer lockable: %w", err)
 	}
 	// The row is already FOR SHARE locked; capture the entire proof in a locked
 	// read too. A changed sidecar/timestamp cannot hide behind an unchanged expiry.
@@ -56,6 +67,9 @@ func (a *inverseApplier) lockKeep28Custody(ctx context.Context, tx pgx.Tx, t inv
 	c.VerifiedAt = c.VerifiedAt.UTC()
 	c.ReceivedAt = c.ReceivedAt.UTC()
 	c.Expiry = expiry.UTC()
+	if err == nil && !fresh {
+		err = fmt.Errorf("exact present NAS identity no longer lockable: %w", errR2RetireNASProofAged)
+	}
 	return c, err
 }
 
@@ -67,7 +81,7 @@ const keep28AdmissionCustody = keep28CustodyMargin + inverseNetworkTimeout
 // Selection trails fresh custody in verified_at order. A report is never wire
 // authority; every identity and proof is subsequently reloaded under locks.
 func (a *inverseApplier) selectKeep28(ctx context.Context, entries map[string]inverseEntry) ([]inverseEntry, error) {
-	rows, err := a.pool.Query(ctx, `SELECT c.object_key`+r2RetireRawExactSQL+`
+	rows, err := a.pool.Query(ctx, `SELECT c.object_key,n.sidecar_sha256,n.sidecar_size_bytes`+r2RetireRawExactSQL+`
  FROM recording_clips c JOIN nas_inventory_files n ON n.connection_id=$2 AND n.clip_id=c.id
  JOIN recordings r ON r.id=c.recording_id
  WHERE c.bucket=$1 AND c.purged_at IS NULL AND r.account_id=47
@@ -82,11 +96,13 @@ func (a *inverseApplier) selectKeep28(ctx context.Context, entries map[string]in
 	var bytes int64
 	for rows.Next() {
 		var key, path string
+		var sidecar keep28Sidecar
 		var exact bool
-		if err = rows.Scan(&key, &exact, &path); err != nil {
+		if err = rows.Scan(&key, &sidecar.SHA, &sidecar.Size, &exact, &path); err != nil {
 			return nil, err
 		}
 		e, ok := entries[key]
+		e.Sidecar = sidecar
 		if !ok || !exact || e.SizeBytes <= 0 {
 			continue
 		}

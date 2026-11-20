@@ -67,10 +67,7 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane
 	total := inverseApplySummary{}
 	for n := 1; n <= f.batches; n++ {
 		done, result, err := runInverseJobBatch(ctx, pool, store, o, f.owner, filepath.Join(f.work, fmt.Sprintf("evidence-%03d.json", n)))
-		total.Deleted += result.Deleted
-		total.Bytes += result.Bytes
-		total.WireAmbiguous = append(total.WireAmbiguous, result.WireAmbiguous...)
-		total.AmbiguousHeld, total.HeldAbsent = result.AmbiguousHeld, result.HeldAbsent
+		total.addBatch(result)
 		printInverseJob(map[string]any{"step": "batch", "batch": n, "result": result, "total": total, "error": errorText(err)})
 		if err != nil {
 			log.Fatal(err)
@@ -81,6 +78,18 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane
 		}
 	}
 	printInverseJob(map[string]any{"step": "batch_limit", "total": total})
+}
+
+// addBatch folds one batch into the job total. Held keys are the latest
+// startup's snapshot, not a sum.
+func (t *inverseApplySummary) addBatch(r inverseApplySummary) {
+	t.Selected += r.Selected
+	t.Deleted += r.Deleted
+	t.Bytes += r.Bytes
+	t.CustodyShort.Objects += r.CustodyShort.Objects
+	t.CustodyShort.Bytes += r.CustodyShort.Bytes
+	t.WireAmbiguous = append(t.WireAmbiguous, r.WireAmbiguous...)
+	t.AmbiguousHeld, t.HeldAbsent = r.AmbiguousHeld, r.HeldAbsent
 }
 
 type inverseJobFlags struct {

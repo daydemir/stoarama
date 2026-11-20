@@ -312,12 +312,24 @@ func r2RetireDecideForScope(c r2RetireCandidate, scope r2RetireScope, windows ma
 var errR2RetireNASProofAged = errors.New("NAS proof aged out of its 24-hour window")
 
 func r2RetireLockNASIdentity(ctx context.Context, q r2RetireQuerier, it r2RetireItem, connectionID int64) (time.Time, error) {
-	// The supported apply path is RAW only. Lock the same exact identity and
-	// sidecar proof used by selection, and carry its expiry to the wire boundary.
-	// The row is locked whatever its age, so an aged proof is told apart from a
-	// changed one; either way it is not lockable custody.
+	expiry, fresh, err := r2RetireLockNASProof(ctx, q, it, connectionID)
+	if err == nil && !fresh {
+		err = errR2RetireNASProofAged
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("exact present NAS identity no longer lockable: %w", err)
+	}
+	return expiry, nil
+}
+
+// r2RetireLockNASProof locks the same exact identity and sidecar proof used by
+// selection whatever its age, and reports its expiry and whether it is still
+// fresh, so a caller can compare the proof before classifying its age. A changed
+// identity, sidecar path or state, or a future verification, locks no row.
+func r2RetireLockNASProof(ctx context.Context, q r2RetireQuerier, it r2RetireItem, connectionID int64) (time.Time, bool, error) {
+	// The supported apply path is RAW only.
 	if it.Kind != "raw" {
-		return time.Time{}, errors.New("NAS custody lock requires RAW identity")
+		return time.Time{}, false, errors.New("NAS custody lock requires RAW identity")
 	}
 	var expiry time.Time
 	var fresh bool
@@ -328,13 +340,7 @@ func r2RetireLockNASIdentity(ctx context.Context, q r2RetireQuerier, it r2Retire
  AND n.verified_at<=clock_timestamp()+interval '5 minutes'
  AND n.sidecar_relative_path=$5||'.stoarama.json' AND n.sidecar_size_bytes>0 AND n.sidecar_sha256 ~ '^[a-f0-9]{64}$'
  FOR SHARE`, connectionID, it.SHA256, it.SizeBytes, it.SourceID, it.RelativePath).Scan(&expiry, &fresh)
-	if err == nil && !fresh {
-		err = errR2RetireNASProofAged
-	}
-	if err != nil {
-		return time.Time{}, fmt.Errorf("exact present NAS identity no longer lockable: %w", err)
-	}
-	return expiry, nil
+	return expiry, fresh, err
 }
 
 func (a *r2RetireApplier) reserve(ctx context.Context, it r2RetireItem) error {
