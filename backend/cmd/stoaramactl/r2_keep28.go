@@ -223,7 +223,7 @@ func (a *inverseDeleteAuthority) custodyDeadline(ctx context.Context) (time.Time
 
 // bound ends network work at custody end; the parent context keeps the key's
 // network deadline. RAW carries no custody and is bounded by the parent alone.
-func (a *inverseDeleteAuthority) bounded(ctx context.Context) (context.Context, context.CancelFunc, error) {
+func (a *inverseDeleteAuthority) bound(ctx context.Context) (context.Context, context.CancelFunc, error) {
 	if a.guard.a.opts.Lane != inverseNASKeep28 {
 		return ctx, func() {}, nil
 	}

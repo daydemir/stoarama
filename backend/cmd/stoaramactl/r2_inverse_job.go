@@ -20,10 +20,14 @@ import (
 // r2-inverse job (RAW), job-keep28 and job-collated run one inverse lane next to
 // the database and bucket, as a provider one-off job. The executor serializes
 // reserves and spends one round trip per statement, so it must not run across a
-// slow home link. The job takes a fresh read-only partition, then runs bounded
+// slow home link. The job takes a fresh read-only partition and stores it as the
+// bucket's reusable one, or with --reuse-partition restores that stored partition
+// while it is fresh and its protection inputs are unchanged. It then runs bounded
 // apply batches. Each batch gets fresh owner-fence evidence and an exact
-// readback of the lane's own tables. A DELETE that lost its response holds only
-// its own key, permanently. Any other failure stops the job; nothing is retried.
+// readback of the lane's own tables. A DELETE that lost its response holds
+// only its own key, permanently, and so does a confirmed DELETE whose absence
+// could not be published. Any other failure stops the job. Only reads and
+// bookkeeping retry: the confirming HEAD and publication of a confirmed absence.
 func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane inverseLane) {
 	f, err := parseInverseJobFlags(args, lane)
 	if err != nil {
@@ -43,25 +47,24 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane
 	if err = os.Mkdir(f.work, 0700); err != nil {
 		log.Fatal(err)
 	}
-	partition := filepath.Join(f.work, "partition")
-	// The job always runs under owner-fence evidence, so every lane partitions in
-	// the reviewed owner scope: RAW delivery keys and mapped collated footage.
-	sum, err := writeInversePartition(ctx, cfg, f.picks, partition, true)
-	if err != nil {
-		log.Fatal(err)
-	}
-	// Bind the approved digest to the bytes the partition actually read; every
-	// apply re-reads the picks file and must match this summary digest.
-	if sum.PicksSHA256 != f.picksSHA {
-		log.Fatal("partition read owner picks other than the approved digest")
-	}
-	printInverseJob(map[string]any{"step": "partition", "summary": sum})
 	store, err := newInverseSDKStore(ctx, archiveR2Config(cfg, pool))
 	if err != nil {
 		log.Fatal(err)
 	}
+	partition := filepath.Join(f.work, "partition")
+	// The job always runs under owner-fence evidence, so every lane partitions in
+	// the reviewed owner scope: RAW delivery keys and mapped collated footage. The
+	// collated lane additionally requires collated mapping, which the stored
+	// partition's own scope digest proves before it can be reused.
+	reviewed := true
+	sum, digest, err := inverseJobPartition(ctx, cfg, pool, store, f, partition, reviewed)
+	if err != nil {
+		log.Fatal(err)
+	}
+	printInverseJob(map[string]any{"step": "partition", "partition_sha256": digest, "reused": f.reuse != "", "summary": sum})
 	// Deniz, 2026-11-12: keep up only the links on the public delivery page.
-	// Before any delete, no candidate this job can select may be one of them.
+	// Before any delete, no candidate this job can select may still be one of
+	// them; only an exempt key whose class gate is open now is not.
 	candidates, pageKeep, overlap, err := inverseJobPageKeepOverlap(ctx, pool, store.Bucket(), filepath.Join(partition, "partition.jsonl"), lane)
 	if err != nil {
 		log.Fatal(err)
@@ -70,33 +73,65 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane
 	if overlap != 0 {
 		log.Fatal("partition candidates include public delivery page keys")
 	}
-	o := inverseApplyOptions{Lane: lane, Manifest: filepath.Join(partition, "partition.jsonl"), Summary: filepath.Join(partition, "summary.json"), Picks: f.picks, Ledger: filepath.Join(f.work, "ledger.jsonl"), Workers: f.workers, MaxItems: f.items, MaxBytes: f.maxBytes, Budget24h: f.budget24h}
-	if o.ManifestSHA, err = inverseFileSHA(o.Manifest); err != nil {
+	o, err := inverseJobApplyOptions(f, lane, partition, digest)
+	if err != nil {
 		log.Fatal(err)
 	}
+	if err = runInverseJobBatches(ctx, pool, store, o, f.owner, f.work, f.batches); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// inverseJobApplyOptions binds the job's apply steps to the digest the
+// partition step returned, never one re-derived from disk: the existing
+// apply-time hash check then rejects a partition file changed in between.
+func inverseJobApplyOptions(f inverseJobFlags, lane inverseLane, partition, digest string) (inverseApplyOptions, error) {
+	o := inverseApplyOptions{Lane: lane, Manifest: filepath.Join(partition, "partition.jsonl"), Summary: filepath.Join(partition, "summary.json"), Picks: f.picks, Ledger: filepath.Join(f.work, "ledger.jsonl"), Workers: f.workers, MaxItems: f.items, MaxBytes: f.maxBytes, Budget24h: f.budget24h, ManifestSHA: digest}
+	var err error
 	if o.SummarySHA, err = inverseFileSHA(o.Summary); err != nil {
-		log.Fatal(err)
+		return o, err
 	}
+	return o, nil
+}
+
+// inverseJobStalledBatches caps consecutive batches that held keys and
+// published nothing, so a persistent outage stops the job instead of spinning.
+const inverseJobStalledBatches = 3
+
+// runInverseJobBatches runs up to batches apply batches until one selects
+// nothing. A batch whose only failures held keys continues the job, even with
+// nothing published, up to inverseJobStalledBatches in a row.
+func runInverseJobBatches(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteStore, o inverseApplyOptions, owner, work string, batches int) error {
 	total := inverseApplySummary{}
-	for n := 1; n <= f.batches; n++ {
-		done, result, err := runInverseJobBatch(ctx, pool, store, o, f.owner, filepath.Join(f.work, fmt.Sprintf("evidence-%03d.json", n)))
+	stalled := 0
+	for n := 1; n <= batches; n++ {
+		done, result, err := runInverseJobBatch(ctx, pool, store, o, owner, filepath.Join(work, fmt.Sprintf("evidence-%03d.json", n)))
 		total.addBatch(result)
 		printInverseJob(map[string]any{"step": "batch", "batch": n, "result": result, "total": total, "error": errorText(err)})
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		if done {
 			printInverseJob(map[string]any{"step": "done", "total": total})
-			return
+			return nil
+		}
+		stalled++
+		if result.Deleted > 0 || len(result.WireAmbiguous)+len(result.Unpublished) == 0 {
+			stalled = 0
+		}
+		if stalled == inverseJobStalledBatches {
+			return fmt.Errorf("%d consecutive batches held keys and published nothing", stalled)
 		}
 	}
 	printInverseJob(map[string]any{"step": "batch_limit", "total": total})
+	return nil
 }
 
 // addBatch folds one batch into the job total. Selected, deleted, byte and
 // custody_short counts are per batch and sum. Held keys and last_modified_held
-// are snapshots of the latest batch: every batch rereads the same held intents
-// and the same partition, so summing would count them again.
+// are snapshots of the latest batch that read its partition: every batch
+// rereads the same held intents and the same partition, so summing would count
+// them again, and a batch that failed before reading keeps the last measurement.
 func (t *inverseApplySummary) addBatch(r inverseApplySummary) {
 	t.Selected += r.Selected
 	t.Deleted += r.Deleted
@@ -104,16 +139,40 @@ func (t *inverseApplySummary) addBatch(r inverseApplySummary) {
 	t.CustodyShort.Objects += r.CustodyShort.Objects
 	t.CustodyShort.Bytes += r.CustodyShort.Bytes
 	t.WireAmbiguous = append(t.WireAmbiguous, r.WireAmbiguous...)
-	t.AmbiguousHeld, t.HeldAbsent, t.LastModifiedHeld = r.AmbiguousHeld, r.HeldAbsent, r.LastModifiedHeld
+	t.Unpublished = append(t.Unpublished, r.Unpublished...)
+	if r.partitionRead {
+		t.AmbiguousHeld, t.HeldAbsent, t.LastModifiedHeld = r.AmbiguousHeld, r.HeldAbsent, r.LastModifiedHeld
+	}
+}
+
+// inverseJobPartition stores a fresh partition, or restores the stored one
+// f.reuse names, and returns its summary and digest. Either way it requires the
+// picks its listing was classified with to be the approved digest, and the
+// partition to have been classified in this lane's scope.
+func inverseJobPartition(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, store inverseLister, f inverseJobFlags, dir string, reviewed bool) (inverseSummary, string, error) {
+	if f.reuse != "" {
+		sum, err := reuseInversePartition(ctx, pool, store, f.picks, f.picksSHA, f.reuse, dir, reviewed)
+		return sum, f.reuse, err
+	}
+	p, policy, err := inversePartitionProtection(ctx, cfg, pool, f.picks, reviewed)
+	if err != nil {
+		return inverseSummary{}, "", err
+	}
+	sum, err := inverseFreshPartition(ctx, store, p, policy, f.picksSHA, dir)
+	if err != nil {
+		return sum, "", err
+	}
+	digest, err := storeInversePartition(ctx, pool, dir)
+	return sum, digest, err
 }
 
 type inverseJobFlags struct {
-	picks, picksSHA, owner, work string
-	workers, items, batches      int
-	maxBytes, budget24h          int64
+	picks, picksSHA, owner, work, reuse string
+	workers, items, batches             int
+	maxBytes, budget24h                 int64
 }
 
-const inverseJobUsage = "usage: stoaramactl r2-inverse job|job-keep28 --picks FILE --expected-picks-sha256 HEX --owner-decision FILE --work DIR [--workers N --max-items N --max-bytes N --budget-24h-bytes N --batches N]; job-keep28 requires --max-bytes and --budget-24h-bytes"
+const inverseJobUsage = "usage: stoaramactl r2-inverse job|job-keep28 --picks FILE --expected-picks-sha256 HEX --owner-decision FILE --work DIR [--reuse-partition HEX --workers N --max-items N --max-bytes N --budget-24h-bytes N --batches N]; job-keep28 requires --max-bytes and --budget-24h-bytes"
 
 // parseInverseJobFlags reads job flags; --help prints them with their lane's
 // defaults and exits 0. RAW keeps its large batches and no rolling budget.
@@ -130,6 +189,7 @@ func parseInverseJobFlags(args []string, lane inverseLane) (inverseJobFlags, err
 	fs.StringVar(&f.picksSHA, "expected-picks-sha256", "", "independently approved owner picks digest")
 	fs.StringVar(&f.owner, "owner-decision", "", "owner decision record pinned by the executor")
 	fs.StringVar(&f.work, "work", "", "new working directory")
+	fs.StringVar(&f.reuse, "reuse-partition", "", "partition_sha256 of the stored partition to reuse instead of relisting the bucket")
 	fs.IntVar(&f.workers, "workers", 16, "concurrent keys per batch (1..64, at least two DB connections remain reserved)")
 	fs.IntVar(&f.items, "max-items", items, "maximum new objects per batch")
 	fs.Int64Var(&f.maxBytes, "max-bytes", maxBytes, "maximum new intent bytes per batch (required for job-keep28)")
@@ -140,7 +200,7 @@ func parseInverseJobFlags(args []string, lane inverseLane) (inverseJobFlags, err
 	}
 	budgetSet := false
 	fs.Visit(func(fl *flag.Flag) { budgetSet = budgetSet || fl.Name == "budget-24h-bytes" })
-	if fs.NArg() != 0 || f.picks == "" || !r2RetireLowerHex64(f.picksSHA) || f.owner == "" || f.work == "" || f.workers < 1 || f.workers > 64 || f.items < 1 || f.maxBytes <= 0 || f.budget24h < 0 || f.batches < 1 || (lane == inverseNASKeep28 && !budgetSet) {
+	if fs.NArg() != 0 || f.picks == "" || !r2RetireLowerHex64(f.picksSHA) || f.owner == "" || f.work == "" || (f.reuse != "" && !r2RetireLowerHex64(f.reuse)) || f.workers < 1 || f.workers > 64 || f.items < 1 || f.maxBytes <= 0 || f.budget24h < 0 || f.batches < 1 || (lane == inverseNASKeep28 && !budgetSet) {
 		return f, errors.New(inverseJobUsage)
 	}
 	return f, nil
@@ -149,9 +209,10 @@ func parseInverseJobFlags(args []string, lane inverseLane) (inverseJobFlags, err
 // runInverseJobBatch runs one bounded apply batch. It reports done when a clean
 // batch selected nothing. Unresolved intents from earlier batches stay held;
 // the executor's startup stops if one that never reached the wire is gone. A
-// batch whose only failures are lost DELETE responses returns no error once its
-// readback proves exactly those keys are unresolved, as long as it also deleted
-// something; a batch that deletes nothing stops the job.
+// batch whose only failures held keys (lost DELETE responses, unpublished
+// confirmed absences) returns no error once its readback proves exactly those
+// keys are unresolved; runInverseJobBatches caps how many such batches in a
+// row may publish nothing.
 func runInverseJobBatch(ctx context.Context, pool *pgxpool.Pool, store inverseDeleteStore, o inverseApplyOptions, owner, evidencePath string) (bool, inverseApplySummary, error) {
 	var err error
 	if o.DrainSHA, err = writeInverseOwnerEvidence(ctx, pool, store, o, owner, evidencePath); err != nil {
@@ -185,20 +246,18 @@ type inverseBatchReadback struct {
 
 // settle accepts a batch only when the database proves exactly what the
 // executor reports: every absence and byte, an attempt per intent, and the very
-// keys it holds as lost responses, not just as many of them.
+// keys it holds as lost responses or unpublished absences, not just as many.
 func (r inverseBatchReadback) settle(result inverseApplySummary, applyErr error) (bool, error) {
-	wire := errors.Is(applyErr, errInverseWireAmbiguous)
-	if applyErr != nil && !wire {
+	held := inverseKeyHeld(applyErr)
+	if applyErr != nil && !held {
 		return false, applyErr
 	}
-	if r.Absent != result.Deleted || r.AbsentBytes != result.Bytes || r.Attempts != r.Intents || !slices.Equal(r.Unresolved, result.WireAmbiguous) {
+	unresolved := slices.Sorted(slices.Values(slices.Concat(result.WireAmbiguous, result.Unpublished)))
+	if r.Absent != result.Deleted || r.AbsentBytes != result.Bytes || r.Attempts != r.Intents || !slices.Equal(r.Unresolved, unresolved) {
 		return false, fmt.Errorf("database batch evidence differs: intents %d absent %d bytes %d attempts %d unresolved %v", r.Intents, r.Absent, r.AbsentBytes, r.Attempts, r.Unresolved)
 	}
-	if wire {
-		if result.Deleted == 0 {
-			return false, applyErr
-		}
-		printInverseJob(map[string]any{"step": "wire_ambiguous", "held": r.Unresolved, "error": applyErr.Error()})
+	if held {
+		printInverseJob(map[string]any{"step": "held", "held": r.Unresolved, "error": applyErr.Error()})
 		return false, nil
 	}
 	// Done only when nothing new was eligible: a batch whose keys were all

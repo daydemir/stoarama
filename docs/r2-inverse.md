@@ -78,15 +78,57 @@ rechecks live protections, controller drain evidence and migration 0198 at the
 wire. The private concrete executor verifier issues authority only after these checks
 and independently commits a permanent one-issuance row. No exported approval
 callback or generic R2 delete API is added. Repeated verification cannot remint
-authority. The entire per-key network phase has a 30-second deadline, including
-HEAD, multipart inspection and confirming HEAD; timeout retains the intent for
-reconciliation. There is one DELETE attempt, no SDK replay or redirects. Success requires
-a confirming 404. Receipt and raw purged_at publication happens separately with
-exclusive admission locks, without upgrading a network transaction's locks.
+authority. Each key's network calls and database steps have separate bounds, so
+waiting on a sibling's protection locks never spends the network budget. The
+network phase (identity HEAD, multipart inspection, the DELETE and the confirming
+HEAD) has a 30-second deadline from when the wire transaction holds its locks.
+Each database step (reservation, wire connection, wire preparation, the wire commit, each
+publication attempt) gets its own 2 minutes. A timeout retains the intent for
+reconciliation. There is one DELETE attempt, no SDK replay or redirects. A DELETE
+whose request was fully written but which got no answer by its deadline is a lost
+response: only its key is held. Success requires
+a confirming 404 for the exact key. The confirming HEAD is a read, so it alone
+retries, in the executor's own loop rather than the SDK's: at most 4 attempts of
+at most 4 seconds each, with full-jitter backoff of at most 2 seconds between
+them, under its own 22-second deadline inside the key's network deadline (and,
+for keep-28, custody end). Each attempt is one request on its own fresh HTTP/1.1
+connection with keep-alives off, so neither the transport nor the SDK can turn
+one attempt into two: four attempts send exactly four HEADs. Only timeouts,
+connection errors, 429, every 5xx (including a proxy's 520-599) and throttling
+retry, and a provider's `X-Amz-Retry-After` never stretches the
+backoff. It follows no redirect: a 404 from anywhere but the key cannot confirm
+it. A 200 means the object remains: it fails at once. When every attempt fails,
+the job stops and the key stays held, as a lost response does.
+
+A publication step whose parent context ended first — the job cancelled or its
+deadline passed before the step's own 2-minute bound — stops the job and holds
+nothing; it is not an unpublished key. Only the step's own bound expiring, or
+lock contention inside it, holds the key as `unpublished`.
+
+Receipt and raw purged_at publication happens separately with exclusive admission
+locks, without upgrading a network transaction's locks. It is bookkeeping for a
+key a 404 already confirmed gone, so it retries up to 3 times when a step ran out
+of its own 2-minute bound (waiting for a pool connection, a lock or a statement)
+or lost to lock contention (55P03, 40P01, 40001). It disables the role's
+`statement_timeout`, so a 57014 there can only be an explicit cancel, which stops
+the job, as does any refusal or inconsistency. A failed publication COMMIT has an
+unknown outcome, so it stops the job instead of being retried or held. If every
+retry fails, the key is held exactly like a lost response: issued, unresolved,
+reported in `unpublished`, never resent, and the batch's readback must name it
+among the unresolved keys. Every failing key logs its step (`reserve`, `wire`,
+`head`, `commit` or `publish`) and key.
+
+A batch whose only failures held keys continues the job even if it published
+nothing, as when a lock convoy catches every in-flight key at once. Three such
+batches in a row (`inverseJobStalledBatches`) stop the job, so a persistent outage
+cannot spin.
 
 An existing intent is never retransmitted, including a crash before wire. On
-restart, a 404 reconciles its receipt and ledger; a present object stays held as
-`ambiguous_held` while unrelated fresh keys can proceed. Preserve the ledger and
+restart, an issued key whose object now answers 404 is reported as
+`held_absent` and stays unresolved: the executor never reconciles it into a
+receipt or a ledger absence, because an attempt row cannot prove which actor
+removed the object. A present object stays held as `ambiguous_held` while
+unrelated fresh keys can proceed. Preserve the ledger and
 DB records. There is no automated intent expiry, removal, or ambiguous retry.
 A damaged/partial local ledger fails closed; it is never truncated or repaired.
 
@@ -181,7 +223,8 @@ selection observed (source ID, catalog path, size, media SHA, sidecar digest
 and size) before it considers custody age; any difference, or a changed
 state, stops the batch. A job is done only when a clean batch selected
 nothing. Job totals sum per-batch counts; held keys and `last_modified_held`
-are snapshots of the latest batch.
+are snapshots of the latest batch that read its partition; a batch that failed
+before reading it keeps the last measurement.
 
 Custody is a 24-hour freshness policy on an existing, verified NAS copy, not a
 physical deadline. The requirement is that custody is valid at the last
@@ -215,6 +258,45 @@ the B2 tables, as `r2-inverse job` does for B1. Its batches default to the
 100-object canary size, and it refuses to start without explicit `--max-bytes`
 and `--budget-24h-bytes` (0 = unlimited). Both jobs refuse more workers than the
 database pool allows before writing any partition or evidence.
+
+## Job restart
+
+A job's `--work` directory is lost with its one-off Render container. So after
+writing and sealing a fresh partition, `job` and `job-keep28` store it, gzipped,
+as the bucket endpoint's one reusable partition in `r2_inverse_partitions`
+(migration 0226), replacing the previous one, and print its `partition_sha256` in
+the `partition` step. It lives in PostgreSQL, not R2: under the writer fence every
+new R2 write is refused, and an ungated operator PUT would break the drain the
+executor relies on.
+
+To restart without relisting the bucket, pass that digest as
+`--reuse-partition HEX`. The job then restores the stored partition into its new
+`--work` directory and stops unless all of these hold:
+
+- the restored `partition.jsonl` has exactly that digest;
+- its summary names the same bucket, endpoint and Keep-28 policy, and picks
+  equal to the independently approved `--expected-picks-sha256`;
+- it is fresh by the same 24-hour rule every batch applies ("partition is stale
+  or future-dated", by database time);
+- its external classification inputs are unchanged. The summary's
+  `protection_sha256` digests the KE epoch and the exact owner keep prefixes, KE
+  folders, external hold set, delivery holds and joined releases, read with the
+  partition's own SQL. The job reads them again and requires an equal digest.
+  Retirement reservations and receipts, the job's own progress, are left out:
+  they would otherwise invalidate the partition after its first key, and the
+  live gate refuses every reserved or retired key anyway.
+
+The digest cannot prove the whole partition still classifies the same way. Catalog
+fields the KE epoch does not version, such as clip spans and timezones, can change
+without it. So the per-key live reclassification is load-bearing for safety:
+each candidate's identity is reloaded and reclassified under lock at reserve and
+again at the wire, and a key that is no longer eligible is refused. The reverse is
+a completeness gap, not a safety one: a reused listing can omit a key that became
+eligible after it, and the next fresh partition picks that key up. The reused
+partition only proposes candidates: reserve's database checks, live holds,
+custody and the wire HEAD identity check still run for every key, so a key held
+after the reuse check is still refused.
+On any refusal, run the job without `--reuse-partition` to take a fresh partition.
 
 Deniz's November 17 order to delete group 3 that is on the NAS supersedes the
 stitch-proof prerequisite **only for this keep28 RAW lane**. This new command

@@ -6,13 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -109,11 +112,12 @@ func (a *inverseDeleteAuthority) check(ctx context.Context, bucket, endpoint str
 
 // protectionEnvelope is the ONE wire protection envelope shared by the RAW and
 // collated paths: the metadata barrier, ordered shared protection locks, the
-// exact COPY key latch, a locked live reload and a fresh KE-epoch plus controller
-// evidence check. load is the only per-lane part (typed RAW or typed collated);
-// everything that guards the DELETE is common, so the collated path cannot drift
-// into a weaker copy. The reservation commits before wire, so this envelope is
-// the only thing standing between a stale protection change and the DELETE.
+// exact COPY key latch, the KE-epoch check and a locked live reload, then fresh
+// controller evidence immediately before the DELETE. load is the only per-lane
+// part (typed RAW or typed collated); everything that guards the DELETE is
+// common, so the collated path cannot drift into a weaker copy. The reservation
+// commits before wire, so this envelope is the only thing standing between a
+// stale protection change and the DELETE.
 func (a *inverseApplier) protectionEnvelope(ctx context.Context, tx pgx.Tx, e inverseEntry, load func(context.Context, pgx.Tx, inverseEntry) error) error {
 	if err := inverseProtectionBarrier(ctx, tx); err != nil {
 		return err
@@ -142,6 +146,11 @@ func (a *inverseApplier) protectionEnvelope(ctx context.Context, tx pgx.Tx, e in
 }
 
 func (a *inverseApplier) prepareWireTarget(ctx context.Context, tx pgx.Tx, e inverseEntry) (inverseRawTarget, error) {
+	// The step's own bound replaces the role's statement_timeout, whose 57014
+	// would end a lock wait publication also takes; only a cancel then stops it.
+	if _, err := tx.Exec(ctx, `SET LOCAL statement_timeout = 0`); err != nil {
+		return inverseRawTarget{}, err
+	}
 	var target inverseRawTarget
 	err := a.protectionEnvelope(ctx, tx, e, func(ctx context.Context, tx pgx.Tx, e inverseEntry) error {
 		t, err := a.loadTarget(ctx, tx, e)
@@ -185,24 +194,28 @@ func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverse
 
 // authorize issues one key's single-use DELETE authority on the applier's lane.
 // Keep-28 adds its NAS custody proof and bounds the authority by its expiry.
+// Preparing the wire transaction waits on protection locks under its own
+// inverseDBTimeout; the key's network budget starts once it holds them.
 func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntry, gate *inverseSendGate) (*inverseDeleteAuthority, error) {
-	target, err := a.prepareWireTarget(ctx, tx, e)
+	db, cancelDB := context.WithTimeout(ctx, inverseDBTimeout)
+	defer cancelDB()
+	target, err := a.prepareWireTarget(db, tx, e)
 	if err != nil {
 		return nil, err
 	}
-	// The parent carries the key's network deadline; keep-28 also ends at
-	// custody end, an absolute instant fixed when sampled.
+	// Keep-28 also ends at custody end, an absolute instant fixed when sampled.
 	var custody keep28Custody
 	var custodyEnd time.Time
-	var cancel context.CancelFunc
 	if a.opts.Lane == inverseNASKeep28 {
-		if custody, custodyEnd, err = a.proveKeep28(ctx, tx, e, target); err != nil {
+		if custody, custodyEnd, err = a.proveKeep28(db, tx, e, target); err != nil {
 			return nil, err
 		}
-		ctx, cancel = context.WithDeadline(ctx, custodyEnd)
-	} else {
-		ctx, cancel = context.WithCancel(ctx)
 	}
+	deadline := time.Now().Add(inverseNetworkTimeout)
+	if a.opts.Lane == inverseNASKeep28 && custodyEnd.Before(deadline) {
+		deadline = custodyEnd
+	}
+	ctx, cancel := context.WithDeadline(ctx, deadline)
 	fail := func(err error) (*inverseDeleteAuthority, error) { cancel(); return nil, err }
 	if err = a.checkWireHead(ctx, tx, e, target); err != nil {
 		return fail(err)
@@ -228,6 +241,60 @@ type inverseSDKStore struct {
 	*r2.Client
 	sdk       *s3.Client
 	transport http.RoundTripper
+	// confirm sends each confirming HEAD attempt under its own timeout and
+	// never follows a redirect.
+	confirm *http.Client
+}
+
+// The confirming HEAD after an answered DELETE is a read, so it alone retries:
+// at most 4 attempts of at most 4s each, with full-jitter backoff of at most
+// 2s between them, under its own 22s deadline inside the caller's network and
+// custody bounds. Only timeouts, connection errors, 429, every 5xx and
+// throttling retry, and a provider's retry-after never stretches the backoff.
+// Each attempt is one request on its own fresh connection, so neither the
+// transport nor the SDK can turn one attempt into two. Only a 404 for the exact
+// key confirms: a redirect is refused, and a 200 fails at once.
+const (
+	inverseConfirmAttempts       = 4
+	inverseConfirmAttemptTimeout = 4 * time.Second
+	inverseConfirmMaxBackoff     = 2 * time.Second
+	inverseConfirmTimeout        = inverseConfirmAttempts*inverseConfirmAttemptTimeout + (inverseConfirmAttempts-1)*inverseConfirmMaxBackoff
+)
+
+// inverseConfirmRetryable is the SDK's default retry classification widened to
+// every 5xx, plus a bare 429, which carries no throttling error code on a HEAD.
+// A Cloudflare-fronted provider answers a transient failure as 520-599, and the
+// SDK's default set covers only 500/502/503/504.
+var inverseConfirmRetryable = retry.IsErrorRetryables(append(
+	slices.Clone(retry.DefaultRetryables),
+	retry.RetryableHTTPStatusCode{Codes: inverseTransientHTTPStatus()},
+))
+
+// inverseTransientHTTPStatus is every server-side status, 500 through 599, plus
+// 429: a confirming HEAD may retry those, and nothing else.
+func inverseTransientHTTPStatus() map[int]struct{} {
+	codes := map[int]struct{}{http.StatusTooManyRequests: {}}
+	for status := 500; status <= 599; status++ {
+		codes[status] = struct{}{}
+	}
+	return codes
+}
+
+// The confirming HEAD sends exactly one request per attempt, so its client
+// carries the attempt's own deadline on a fresh HTTP/1.1 connection: no
+// keep-alive means no pooled connection can be reused, and a reused connection
+// closing under a request is the only case Go's HTTP transport replays.
+func newInverseConfirmClient(attempt time.Duration) *http.Client {
+	transport := awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
+		t.ForceAttemptHTTP2 = false
+		t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+		t.Protocols = new(http.Protocols)
+		t.Protocols.SetHTTP1(true)
+		t.TLSClientConfig = t.TLSClientConfig.Clone()
+		t.TLSClientConfig.NextProtos = []string{"http/1.1"}
+		t.DisableKeepAlives = true
+	}).GetTransport()
+	return &http.Client{Transport: transport, Timeout: attempt, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
 // newInverseDeleteHTTPTransport carries every DELETE over its own fresh HTTP/1.1
@@ -261,7 +328,30 @@ func newInverseSDKStore(ctx context.Context, cfg r2.Config) (*inverseSDKStore, e
 		o.BaseEndpoint = aws.String(cfg.Endpoint)
 		o.Retryer = aws.NopRetryer{}
 	})
-	return &inverseSDKStore{reader, sdk, transport}, nil
+	return &inverseSDKStore{reader, sdk, transport, newInverseConfirmClient(inverseConfirmAttemptTimeout)}, nil
+}
+
+func (s *inverseSDKStore) confirmAbsent(ctx context.Context, key string) error {
+	ctx, cancel := context.WithTimeout(ctx, inverseConfirmTimeout)
+	defer cancel()
+	for attempt := 1; ; attempt++ {
+		_, err := s.sdk.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.Bucket()), Key: aws.String(key)}, func(o *s3.Options) {
+			o.HTTPClient = s.confirm
+			o.Retryer = aws.NopRetryer{}
+		})
+		err = inverseAbsence(err)
+		if err == nil {
+			return nil
+		}
+		if attempt == inverseConfirmAttempts || inverseConfirmRetryable.IsErrorRetryable(err) != aws.TrueTernary {
+			return fmt.Errorf("confirming head %s after %d attempts: %w", key, attempt, err)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("confirming head %s after %d attempts: %w", key, attempt, err)
+		case <-time.After(rand.N(inverseConfirmMaxBackoff)):
+		}
+	}
 }
 func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDeleteAuthority) error {
 	if err := authority.requireWire(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
@@ -440,7 +530,7 @@ type inverseWireAuthority interface {
 	check(context.Context, string, string) error
 	sendGate() *inverseSendGate
 	wireKey() string
-	bounded(context.Context) (context.Context, context.CancelFunc, error)
+	bound(context.Context) (context.Context, context.CancelFunc, error)
 }
 
 func (a *inverseDeleteAuthority) sendGate() *inverseSendGate { return a.gate }
@@ -451,7 +541,7 @@ func (a *inverseDeleteAuthority) wireKey() string            { return a.binding.
 // nonraw key has no NAS custody to end at.
 func (a *inverseNonrawAuthority) sendGate() *inverseSendGate { return a.gate }
 func (a *inverseNonrawAuthority) wireKey() string            { return a.binding.Key }
-func (a *inverseNonrawAuthority) bounded(ctx context.Context) (context.Context, context.CancelFunc, error) {
+func (a *inverseNonrawAuthority) bound(ctx context.Context) (context.Context, context.CancelFunc, error) {
 	return ctx, func() {}, nil
 }
 
@@ -470,7 +560,7 @@ func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, e
 	if err := t.authority.check(req.Context(), t.bucket, t.endpoint); err != nil {
 		return nil, err
 	}
-	bounded, cancel, err := t.authority.bounded(req.Context())
+	bounded, cancel, err := t.authority.bound(req.Context())
 	if err != nil {
 		return nil, err
 	}
