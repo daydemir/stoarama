@@ -49,14 +49,22 @@ CREATE TRIGGER nas_cleanup_master_no_truncate BEFORE TRUNCATE ON nas_cleanup_mas
 -- caller's search_path nor a later CREATE in another schema can redirect the
 -- write. The guard rejects every insert that does not come from the recorder.
 --
--- What the separation actually buys: the API runtime role can only reach history
--- through this trigger, and a plain application write cannot forge an audit row.
--- It is NOT tamper resistance against the table owner or a superuser. The
--- migration usually runs as that owner (AUTO_MIGRATE runs it as the runtime
--- role), and whoever owns the master and history tables can drop or alter the
--- triggers and edit rows directly. Treat the history as an audit trail that a
--- compromised *runtime* cannot forge, not as evidence against the database
--- owner.
+-- Audit boundary, stated plainly so nobody over-reads it:
+--
+--   * What it buys: the API runtime role can only reach history through this
+--     trigger, and an off-path application write is refused. That is all.
+--   * Who the actor is: `actor` is whatever the calling statement supplies. The
+--     server supplies its authenticated controller principal, but a role with
+--     direct write access to nas_cleanup_master can supply any value it likes.
+--   * Who can defeat it: whoever owns nas_cleanup_master and
+--     nas_cleanup_master_history can drop or recreate the triggers, or edit and
+--     delete rows directly. Under AUTO_MIGRATE the runtime role is the migrator,
+--     so it typically IS that owner; an operator-run migration makes the operator
+--     the owner. Neither is prevented by this design.
+--
+-- Treat history as an audit trail an off-path *runtime* write cannot append to --
+-- not as tamper resistance against the database owner, and not as proof of who
+-- really performed a change.
 --
 -- Provenance is still load-bearing: if the dedicated role cannot be created or
 -- assumed, this migration FAILS rather than falling back to the migrating role.

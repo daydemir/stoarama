@@ -352,10 +352,10 @@ func TestNASCleanupPermitIsRefusedWhenDeadlinesExpireBehindTheMasterLock(t *test
 }
 
 // Within one pass, only a permit that actually commits its item savepoint may
-// debit the in-memory issued total. The remaining budget fits exactly one item:
-// the first observation is rejected without a write (its savepoint is rolled back
-// and it earns no permit), and the second must still be permitted. A debit applied
-// before the savepoint commit would starve it.
+// debit the in-memory issued total. The remaining budget fits exactly one item.
+// Item A passes the budget test (it is genuinely permitted, with a charge), then
+// its savepoint is rolled back; item B in the same pass must still be permitted.
+// A debit applied inside the budget test would poison B.
 func TestNASCleanupRolledBackItemDoesNotDebitTheBudget(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	f.useClientVersion(nasCleanupGroupClientVersion)
@@ -365,11 +365,12 @@ func TestNASCleanupRolledBackItemDoesNotDebitTheBudget(t *testing.T) {
 	if code, body := f.enableBatch([]int64{plan}, []string{sha}, 2); code != 200 {
 		t.Fatalf("batch enable: %d %s", code, body)
 	}
-	requestID := strings.Repeat("e", 32)
+	ctx, cancel := context.WithTimeout(f.ctx, 90*time.Second)
+	defer cancel()
 	la := cleanupCall(t, f.s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{
 		"client_version": f.version, "protocol": 2, "reconciliation_protocol": nasCleanupReconciliationProtocol,
 		"limit": 8, "execution_files": 2, "execution_bytes": int64(1) << 40,
-		"request_id": requestID, "execution_batch": true}, "fixture-boot "+f.version)
+		"request_id": strings.Repeat("e", 32), "execution_batch": true}, "fixture-boot "+f.version)
 	if la.Code != 200 {
 		t.Fatalf("group lease: %d %s", la.Code, la.Body.String())
 	}
@@ -384,48 +385,271 @@ func TestNASCleanupRolledBackItemDoesNotDebitTheBudget(t *testing.T) {
 	for _, task := range leased.Tasks {
 		roster = append(roster, task.ItemID)
 	}
-	// Room for exactly one more permit under the fixed 5 TB cap.
-	var baseline int64
-	if err := f.pool.QueryRow(f.ctx, cleanupIssuedBytes24hSQL).Scan(&baseline); err != nil {
+
+	// Exactly one item's worth of remaining budget.
+	base := nasCleanupMaxIssuedBytes24h - second.Item.SizeBytes
+	env := &cleanupObserveEnv{
+		session:        cleanupClientSession{boot: "fixture-boot", version: f.version},
+		executionGroup: roster,
+		budgetHeld:     true,
+		issued:         base,
+		authority:      cleanupAuthorityTentative,
+		freshRequests:  map[int64]bool{first.ItemID: true, second.ItemID: true},
+		prefetched:     f.s.cleanupPrefetchRecovery(ctx, 13, map[int64]string{first.ItemID: "", second.ItemID: ""}),
+	}
+	tx, err := f.pool.Begin(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.pool.Exec(f.ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode)
-		VALUES(900001,47,13,'budget-seed',$1,'[]',repeat('a',64),'paused')`, cleanupPolicySHA); err != nil {
+	defer tx.Rollback(context.Background())
+	if err = cleanupLockItems(ctx, tx, 13, roster); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.pool.Exec(f.ctx, `INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state,delete_ever_issued,size_bytes,updated_at)
-		VALUES(900001,900001,1,'deleted',true,$1,now())`, nasCleanupMaxIssuedBytes24h-baseline-second.Item.SizeBytes); err != nil {
+	env.scopeLocked = true
+
+	match := func(task cleanupTask) cleanupObserve {
+		return cleanupObserve{
+			ReconciliationProtocol: nasCleanupReconciliationProtocol,
+			Attempt:                task.Attempt,
+			PlanSHA:                task.PlanSHA,
+			Outcome:                "match",
+			Proof:                  fixtureProof(task.Item),
+			ClientVersion:          f.version,
+		}
+	}
+
+	// Item A passes the budget test: it earns a permit carrying a charge.
+	spA, err := tx.Begin(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	// One batch request: the conflict first, then the honest match.
-	// The group-v1 client sends the whole batch and no explicit roster: the
-	// handler derives the group from the observed items themselves.
-	_ = roster
-	w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{
-		"client_version": f.version, "execution_batch": true,
-		"observations": []map[string]any{
-			// A deliberately stale attempt: refused 409 with no write, so its
-			// savepoint rolls back and it must debit nothing.
-			{"item_id": first.ItemID, "attempt": first.Attempt + 99, "plan_sha256": first.PlanSHA,
-				"reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match",
-				"proof": fixtureProof(first.Item), "error": "", "client_version": f.version},
-			{"item_id": second.ItemID, "attempt": second.Attempt, "plan_sha256": second.PlanSHA,
-				"reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match",
-				"proof": fixtureProof(second.Item), "error": "", "client_version": f.version},
-		}}, "fixture-boot "+f.version)
-	if w.Code != 200 {
-		t.Fatalf("two-item batch: %d %s", w.Code, w.Body.String())
+	a := f.s.cleanupObserveOne(ctx, spA, 13, first.ItemID, match(first), env)
+	if a.body["delete"] != true {
+		t.Fatalf("item A did not pass the budget test: %+v", a)
 	}
-	var r struct {
-		Results []batchResult `json:"results"`
+	if a.budgetCharge <= 0 {
+		t.Fatalf("item A was permitted without a charge: %+v", a)
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &r); err != nil || len(r.Results) != 2 {
-		t.Fatalf("results %v %s", err, w.Body.String())
+	// The charge must not have been applied yet: it belongs to the caller, after
+	// this item's savepoint commits.
+	if env.issued != base {
+		t.Fatalf("the budget was debited before the item committed: %d -> %d", base, env.issued)
 	}
-	if r.Results[0].Delete || r.Results[0].Status == 200 {
-		t.Fatalf("the rejected item was not a non-writing rollback: %+v", r.Results[0])
+	// A failure after the budget decision rolls the item back.
+	if err = spA.Rollback(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if !r.Results[1].Delete {
-		t.Fatalf("a phantom debit from the rolled-back item starved the next permit: %+v", r.Results[1])
+
+	// Item B must still fit: the rolled-back item debited nothing.
+	spB, err := tx.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := f.s.cleanupObserveOne(ctx, spB, 13, second.ItemID, match(second), env)
+	if b.body["delete"] != true {
+		t.Fatalf("a phantom debit from the rolled-back item starved the next permit: %+v", b)
+	}
+	if err = spB.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Only now, for the item that actually committed, does the caller debit.
+	env.issued += b.budgetCharge
+	if env.issued != nasCleanupMaxIssuedBytes24h {
+		t.Fatalf("committed permit not accounted exactly: %d", env.issued)
+	}
+}
+
+// A grouped lease can buffer one approved task and then set allowExecution=false
+// on the next item's cap check. The final master gate must depend on the buffered
+// task, not that flag, or the approved task commits with no master read at all.
+//
+// The interleaving is made deterministic: a holder takes the master row FOR
+// UPDATE while the committed value is still ON, the OFF flip queues behind it,
+// and only then does the lease run. The lease's unlocked peek reads the committed
+// ON (it takes no lock), buffers its approved task, and its final FOR SHARE queues
+// behind the OFF. Releasing the holder lets OFF land first, so the lease's own
+// locked read must see it.
+func TestNASCleanupGroupedLeaseOverflowStillGatedByFinalMaster(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	f.useClientVersion(nasCleanupGroupClientVersion)
+	plan, sha, _ := f.admit("group-overflow", syntheticFiles(100, 4, 10))
+	f.dryRun()
+	setCleanupMaster(t, f.s, true)
+	if code, body := f.enableBatch([]int64{plan}, []string{sha}, 2); code != 200 {
+		t.Fatalf("batch enable: %d %s", code, body)
+	}
+	ctx, cancel := context.WithTimeout(f.ctx, 90*time.Second)
+	defer cancel()
+	var oneItem int64
+	if err := f.pool.QueryRow(ctx, `SELECT min(size_bytes) FROM nas_cleanup_items WHERE plan_id=$1`, plan).Scan(&oneItem); err != nil {
+		t.Fatal(err)
+	}
+	requestID := strings.Repeat("f", 32)
+	lease := func() *httptest.ResponseRecorder {
+		return cleanupCall(t, f.s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{
+			"client_version": f.version, "protocol": 2, "reconciliation_protocol": nasCleanupReconciliationProtocol,
+			"limit": 8, "execution_files": 8, "execution_bytes": oneItem,
+			"request_id": requestID, "execution_batch": true}, "fixture-boot "+f.version)
+	}
+	// Control with the switch ON: the overflow shape must yield exactly one
+	// approved task, otherwise this test is not exercising the divergence.
+	control := lease()
+	if control.Code != 200 {
+		t.Fatalf("control lease: %d %s", control.Code, control.Body.String())
+	}
+	var controlTasks struct {
+		Tasks []cleanupTask `json:"tasks"`
+	}
+	if err := json.Unmarshal(control.Body.Bytes(), &controlTasks); err != nil {
+		t.Fatal(err)
+	}
+	approved := 0
+	for _, task := range controlTasks.Tasks {
+		if task.ApprovedProof != nil {
+			approved++
+		}
+	}
+	if approved != 1 {
+		t.Fatalf("control lease approved %d tasks, want exactly 1: %s", approved, control.Body.String())
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='pending',lease_expires_at=NULL,lease_request_id=NULL,lease_connection_id=NULL WHERE plan_id=$1`, plan); err != nil {
+		t.Fatal(err)
+	}
+
+	holder, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(context.Background())
+	if _, err = holder.Exec(ctx, `SELECT enabled FROM nas_cleanup_master FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	// The OFF queues behind the holder while the committed value is still ON.
+	offDone := make(chan int, 1)
+	go func() {
+		offDone <- cleanupMasterCall(f.s, map[string]any{"enabled": false, "claimed_by": "test", "reason": "overflow off"}).Code
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiting bool
+		if err := f.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND $1::integer=ANY(pg_blocking_pids(pid)))`, holder.Conn().PgConn().PID()).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the OFF flip never queued on the master row")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Now the lease: its unlocked peek still reads the committed ON, it buffers
+	// one approved task, and its final FOR SHARE queues behind the OFF.
+	leaseDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { leaseDone <- lease() }()
+	// Give it time to reach the gate, then let the queued OFF commit first.
+	time.Sleep(300 * time.Millisecond)
+	if err = holder.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-offDone:
+		if code != 200 {
+			t.Fatalf("emergency OFF: %d", code)
+		}
+	case <-ctx.Done():
+		t.Fatal("OFF did not complete")
+	}
+	select {
+	case w := <-leaseDone:
+		if w.Code != 200 {
+			t.Fatalf("lease after OFF: %d %s", w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "approved_proof") {
+			t.Fatalf("an approved group task was handed out after OFF: %s", w.Body.String())
+		}
+	case <-ctx.Done():
+		t.Fatal("lease did not finish")
+	}
+	// Nothing was written: the denied lease rolled its own indentations back.
+	var leased int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM nas_cleanup_items WHERE plan_id=$1 AND state='leased'`, plan).Scan(&leased); err != nil {
+		t.Fatal(err)
+	}
+	if leased != 0 {
+		t.Fatalf("a denied lease left %d leased items behind", leased)
+	}
+}
+
+// Replays carry their own approval deadline too. This makes the plan approval
+// expire while a replay waits on the master row, and requires no approved task to
+// be returned and no write committed.
+func TestNASCleanupLeaseReplayExpiredPlanIsNotHandedBack(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	f.useClientVersion(nasCleanupGroupClientVersion)
+	plan, sha, _ := f.admit("replay-expiry", syntheticFiles(100, 4, 10))
+	f.dryRun()
+	setCleanupMaster(t, f.s, true)
+	if code, body := f.enableBatch([]int64{plan}, []string{sha}, 2); code != 200 {
+		t.Fatalf("batch enable: %d %s", code, body)
+	}
+	ctx, cancel := context.WithTimeout(f.ctx, 90*time.Second)
+	defer cancel()
+	requestID := strings.Repeat("a", 32)
+	lease := func() *httptest.ResponseRecorder {
+		return cleanupCall(t, f.s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{
+			"client_version": f.version, "protocol": 2, "reconciliation_protocol": nasCleanupReconciliationProtocol,
+			"limit": 8, "execution_files": 8, "execution_bytes": int64(1) << 40,
+			"request_id": requestID, "execution_batch": true}, "fixture-boot "+f.version)
+	}
+	first := lease()
+	if first.Code != 200 || !strings.Contains(first.Body.String(), "approved_proof") {
+		t.Fatalf("initial lease: %d %s", first.Code, first.Body.String())
+	}
+	// A lease takes the plan rows before its advisory fence, so the approval must
+	// be short before the replay starts: after it queues, the rows are locked and
+	// any later UPDATE would block behind the very transaction under test.
+	if _, err := f.pool.Exec(ctx, `UPDATE nas_cleanup_plans SET approved_until=now()+interval '2 seconds' WHERE id=$1`, plan); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(context.Background())
+	if _, err = holder.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupLeaseLock); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- lease() }()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiting bool
+		if err := f.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND $1::integer=ANY(pg_blocking_pids(pid)))`, holder.Conn().PgConn().PID()).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("replay never queued on its blocking fence")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Let the short approval lapse for real while the replay is still queued.
+	time.Sleep(2500 * time.Millisecond)
+	if err = holder.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case w := <-done:
+		if w.Code != 200 {
+			t.Fatalf("replay after approval expiry: %d %s", w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "approved_proof") {
+			t.Fatalf("a replay handed back an approved task after its plan approval expired: %s", w.Body.String())
+		}
+	case <-ctx.Done():
+		t.Fatal("replay did not finish")
 	}
 }

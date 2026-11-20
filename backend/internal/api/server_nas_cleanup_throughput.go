@@ -884,8 +884,16 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 			matches = append(matches, o)
 		}
 	}
+	// The same single explicit initial posture the single-item path uses: one
+	// unlocked read, taken before any evidence prefetch, so the two paths cannot
+	// disagree or read the switch twice. When it is denied the batch still records
+	// the ordinary non-deleting observations and pause, but skips the
+	// issuance-only aborted-stage preflight instead of guessing evidence.
+	posture := cleanupInitialPosture(ctx, s.pool)
 	env := &cleanupObserveEnv{session: cleanupAdmissionSession(r, req.ClientVersion), dryRunOnly: dryRunOnly, freshRequests: freshRequests, prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
-	s.cleanupPrefetchAbortedStitchAbsences(ctx, cid, matches, env)
+	if posture == cleanupAuthorityTentative {
+		s.cleanupPrefetchAbortedStitchAbsences(ctx, cid, matches, env)
+	}
 	if cleanupObservationExpired(ctx) {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
 		return
@@ -1081,7 +1089,10 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		return out, true, true
 	}
 
-	authority := cleanupAuthorityTentative
+	// Start from the explicit initial posture. A pass may only ever descend from
+	// it: a tentative pass that reads OFF re-runs as denied, and a request that
+	// started denied never becomes tentative.
+	authority := posture
 	for pass := 0; pass < 2; pass++ {
 		out, authorized, ok := runPass(authority)
 		if !ok {
@@ -1372,76 +1383,99 @@ func (s *Server) cleanupAdvanceBatchIfIdle(ctx context.Context) {
 }
 
 // cleanupPauseBatchAfterOff records, in its own transaction, the non-authority
-// transitions an OFF advance had to discard with its rollback: closing the
+// transitions the OFF advance had to discard with its rollback: closing the
 // completed plans of the exact batch that was advancing, then pausing that same
 // batch.
 //
-// It is deliberately narrow, because it runs after the advance's own locks were
-// released. It therefore:
-//   - takes the shared cleanup public fence, so it serializes with the exclusive
-//     fence that batch enable and batch advance take (a successor enable cannot
-//     interleave), and it never queues an emergency OFF, which takes no fence;
-//   - locks and re-reads that one batch row, and acts only while it is still
-//     enabled with the exact plan roster the advance started from, so a newer
-//     batch is never touched;
-//   - re-reads the switch without a lock (an OFF must not wait on this) and
-//     stands down if it has been turned back ON, since pausing then would undo an
-//     operator's deliberate restart rather than finish a rolled-back OFF.
+// It reuses the ordinary control-path fences rather than inventing a shortcut:
 //
-// completed: plan ids of this batch that already finished cleanly, so only plans
-// this advance was entitled to close are closed.
-func (s *Server) cleanupPauseBatchAfterOff(ctx context.Context, batchID int64, planIDs []int64, why string) {
-	if s.pool == nil || batchID <= 0 || len(planIDs) == 0 {
-		return
+//   - cleanupLockPlans takes the shared public fence plus the ascending plan and
+//     batch rows, exactly as plan control and advance do, so it serializes with a
+//     successor enable/advance and never queues an emergency OFF, which takes no
+//     fence;
+//   - the batch row is re-read under that lock, and the helper acts only while it
+//     is still enabled with the exact plan roster the advance started from, so a
+//     newer batch is never touched;
+//   - both writes (plan close, batch pause) are blocking work done *before* the
+//     final OFF revalidation, which is then a locked read and the last statement
+//     before commit. An ON committed while those writes ran is therefore seen and
+//     the whole transaction rolls back, so an operator restart is never undone.
+//
+// Errors are returned, not swallowed, so a database failure cannot silently leave
+// a rolled-back OFF half applied.
+func (s *Server) cleanupPauseBatchAfterOff(ctx context.Context, batchID int64, planIDs []int64, why string) error {
+	if batchID <= 0 || len(planIDs) == 0 {
+		return nil
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		log.Printf("nas cleanup batch pause deferred: %v", err)
-		return
+		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, nasCleanupPublicFence); err != nil {
-		log.Printf("nas cleanup batch pause deferred: %v", err)
-		return
+	// The same fence order as plan control and advance: public fence, then the
+	// plan rows this batch owns, then the batch row itself.
+	if err = cleanupLockPlans(ctx, tx, planIDs); err != nil {
+		return err
 	}
 	var current []int64
 	var mode string
 	if err = tx.QueryRow(ctx, `SELECT plan_ids,mode FROM nas_cleanup_batches WHERE id=$1 AND account_id=47 AND connection_id=13 FOR UPDATE`, batchID).Scan(&current, &mode); err != nil {
-		// The batch is gone: nothing of ours to finish.
-		return
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil // the batch is gone: nothing of ours to finish
+		}
+		return err
 	}
 	if mode != "enabled" || !cleanupSamePlanRoster(current, planIDs) {
 		// A successor replaced or paused it, or its identity changed. Never act on
 		// a batch this advance did not start from.
-		return
+		return nil
 	}
-	// The switch is read without a lock so this can never delay an OFF, and in its
-	// own savepoint so an unreadable control cannot abort this transaction. An OFF
-	// or an unreadable control both mean "cleanup is not authorised" here: the
-	// ordinary advance-time behaviour is to pause, and recording that pause is a
-	// non-authority transition. Only a readable, enabled switch means an operator
-	// deliberately restarted and this must stand down.
-	if !cleanupMasterMaybeOn(ctx, tx) {
-		// OFF or unreadable: record the ordinary pause below.
-	} else {
-		return
-	}
-	// Close only this batch's own completed plans, in its own roster order.
+	// Blocking writes first, so the locked master revalidation below is genuinely
+	// the last statement before commit.
 	if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,
  approval_reason=left('batch-completed: batch '||$2::text||' plan finished cleanly',500)
  WHERE id=ANY($1) AND mode='enabled'
   AND EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=nas_cleanup_plans.id)
   AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=nas_cleanup_plans.id AND i.state NOT IN ('deleted','keep'))`, current, strconv.FormatInt(batchID, 10)); err != nil {
-		log.Printf("nas cleanup batch pause deferred: %v", err)
-		return
+		return err
 	}
 	if _, err = tx.Exec(ctx, cleanupBatchAutoPauseSQL, batchID, why); err != nil {
-		log.Printf("nas cleanup batch pause deferred: %v", err)
-		return
+		return err
+	}
+	// Final decision, locked and last. It stands down only on a readable, enabled
+	// switch, because pausing then would undo a deliberate restart. An OFF keeps
+	// the ordinary pause this helper exists to record, and so does an unreadable
+	// control: that is the same fail-closed "not authorised" reading the advance
+	// itself uses, and dropping the bookkeeping would leave a rolled-back OFF half
+	// applied. The read error itself is surfaced so callers see the anomaly.
+	// A missing control must not abort these writes, and the read cannot simply be
+	// dropped: it has to be the last statement. It therefore runs in one nested
+	// scope of its own — released only after both writes are already applied — so
+	// an unreadable control degrades to "not authorised" while a readable ON still
+	// discards everything above.
+	on, readErr := cleanupMasterProbeLocked(ctx, tx)
+	if readErr == nil && on {
+		// A deliberate restart happened during the writes: discard them.
+		return nil
 	}
 	if err = tx.Commit(ctx); err != nil {
-		log.Printf("nas cleanup batch pause deferred: %v", err)
+		return err
 	}
+	return readErr
+}
+
+// isCleanupMasterUnavailable reports whether the error is the control being
+// missing or unreadable, as opposed to a failure to write.
+func isCleanupMasterUnavailable(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	switch pgErr.Code {
+	case "42P01", "42501", "3F000": // undefined table, insufficient privilege, invalid schema
+		return true
+	}
+	return false
 }
 
 // cleanupSamePlanRoster reports whether two ordered plan rosters are identical.
@@ -1584,7 +1618,21 @@ func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
 	if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='pending',lease_expires_at=NULL WHERE plan_id=$1`, current); err != nil {
 		return err
 	}
-	if !cleanupMasterOn(ctx, tx) {
+	on, readErr := cleanupMasterProbeLocked(ctx, tx)
+	if readErr != nil {
+		// The control is missing or unreadable. That is the same fail-closed "not
+		// authorised" reading used everywhere else, so the advance must not commit:
+		// roll back, then record the ordinary pause in its own fenced transaction.
+		if err = tx.Rollback(ctx); err != nil {
+			return err
+		}
+		pauseErr := s.cleanupPauseBatchAfterOff(ctx, batchID, ids, "master switch is off")
+		if pauseErr != nil && !isCleanupMasterUnavailable(pauseErr) {
+			return pauseErr
+		}
+		return nil
+	}
+	if !on {
 		// The read just taken is the last statement this transaction runs: the
 		// advance it was guarding is rolled back whole. Recording the pause needs
 		// its own statement, so it runs in a separate transaction afterwards,
@@ -1592,7 +1640,18 @@ func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
 		if err = tx.Rollback(ctx); err != nil {
 			return err
 		}
-		s.cleanupPauseBatchAfterOff(ctx, batchID, ids, "master switch is off")
+		// The advance is already rolled back; finish the non-authority bookkeeping
+		// in its own fenced transaction. A database failure is surfaced; an
+		// unreadable control is not a failure to record the pause (the writes land
+		// and the helper reports the read error separately), so it is logged and
+		// the advance is still considered handled.
+		pauseErr := s.cleanupPauseBatchAfterOff(ctx, batchID, ids, "master switch is off")
+		if pauseErr != nil && !isCleanupMasterUnavailable(pauseErr) {
+			return pauseErr
+		}
+		if pauseErr != nil {
+			log.Printf("nas cleanup batch pause recorded with unavailable master control: %v", pauseErr)
+		}
 		return nil
 	}
 	return tx.Commit(ctx)
@@ -1689,7 +1748,12 @@ func (s *Server) handleAdminNASCleanupBatchEnable(w http.ResponseWriter, r *http
 		return
 	}
 	// Authoritative read, last: every fence and gate above is already done.
-	if !cleanupMasterOn(ctx, tx) {
+	on, err := cleanupMasterRequired(ctx, tx)
+	if err != nil {
+		util.WriteError(w, 503, "cleanup master control unavailable")
+		return
+	}
+	if !on {
 		util.WriteError(w, 409, "NAS deletion master switch is off")
 		return
 	}

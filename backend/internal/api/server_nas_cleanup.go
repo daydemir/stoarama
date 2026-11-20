@@ -536,9 +536,16 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 	// enabled: return and let the deferred Rollback discard every freeze, gate,
 	// lock and the transition written above. A pause needs no authority and takes
 	// no master row lock, so it cannot delay an OFF.
-	if req.Mode == "enabled" && !cleanupMasterOn(ctx, tx) {
-		util.WriteError(w, 409, "NAS deletion master switch is off")
-		return
+	if req.Mode == "enabled" {
+		on, err := cleanupMasterRequired(ctx, tx)
+		if err != nil {
+			util.WriteError(w, 503, "cleanup master control unavailable")
+			return
+		}
+		if !on {
+			util.WriteError(w, 409, "NAS deletion master switch is off")
+			return
+		}
 	}
 	if tx.Commit(ctx) != nil {
 		util.WriteError(w, 500, "cleanup control failed")
@@ -683,6 +690,9 @@ type cleanupTask struct {
 	Item           nasCleanupItem  `json:"item"`
 	ApprovedProof  json.RawMessage `json:"approved_proof,omitempty"`
 	ExecutionBatch bool            `json:"execution_batch,omitempty"`
+	// approvalDeadline is the earliest plan approval, session or lease deadline
+	// this approval rests on; rechecked after the final locked master read.
+	approvalDeadline time.Time
 }
 type cleanupObserve struct {
 	ReconciliationProtocol int                `json:"reconciliation_protocol,omitempty"`
@@ -708,7 +718,7 @@ type cleanupObserve struct {
 // Plans are ordered without sorting/locking the entire pending file backlog.
 // The lateral probe uses nas_cleanup_pending and skips locked rows before the
 // outer LIMIT; it can keep looking in the next eligible plan if one is busy.
-const cleanupLeaseLoadSQL = `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode
+const cleanupLeaseLoadSQL = `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode,p.approved_until
 FROM nas_cleanup_plans p
 JOIN LATERAL (
  SELECT candidate.* FROM nas_cleanup_items candidate
@@ -782,10 +792,15 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	if !ok {
 		return
 	}
-	// A batch whose current plan finished (or stopped) advances or pauses
-	// before work is leased; it never runs inside the lease transaction.
+	// A batch whose current plan finished (or stopped) advances or pauses before
+	// work is leased; it never runs inside the lease transaction. Only a request
+	// that can actually execute may trigger that: an advance takes the exclusive
+	// public fence and the master row lock, so a zero-execution-file or dry-only
+	// lease must not start it and thereby delay an emergency OFF.
 	s.cleanupExpireApprovals(ctx)
-	s.cleanupAdvanceBatchIfIdle(ctx)
+	if req.Protocol == 1 || *req.ExecutionFiles > 0 {
+		s.cleanupAdvanceBatchIfIdle(ctx)
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		util.WriteError(w, 500, "cleanup lease transaction failed")
@@ -868,7 +883,8 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		var task cleanupTask
 		var raw, approved []byte
 		var mode string
-		err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, allowExecution, cleanupPolicySHA, plans, groupIDs, req.ClientVersion == nasCleanupCertifiedStitchVersion).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode)
+		var planUntil *time.Time
+		err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, allowExecution, cleanupPolicySHA, plans, groupIDs, req.ClientVersion == nasCleanupCertifiedStitchVersion).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode, &planUntil)
 		if errors.Is(err, pgx.ErrNoRows) {
 			break
 		}
@@ -921,6 +937,9 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 			}
 			task.ApprovedProof = approved
 			task.ExecutionBatch = group
+			// Every deadline this approval depends on, retained so the final gate
+			// can recheck them against the real clock after its locked read.
+			task.approvalDeadline = earliestDeadline(planUntil, &sessionDeadline, &task.ExpiresAt)
 		}
 		var requestID any
 		if req.RequestID != "" {
@@ -946,14 +965,14 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		}
 	}
 	// Every fence, expiry update, replay row lock and tentative item write above
-	// is finished. Only now, if this request could hand out execution authority,
-	// the switch is read authoritatively as the last statement before commit.
-	// Dry-run-only leases never reach it: they mint no deletion authority, so they
-	// take no master row lock and cannot delay an OFF. Absence of execution
-	// authority is safe under OFF — a
-	// dry-run lease only reads catalog state, and an execution lease is withheld
-	// entirely.
-	if allowExecution {
+	// is finished. The final gate depends on what is actually buffered, never on
+	// the mutable allowExecution flag: a later cap or session check can set that
+	// false while an approved task is already in tasks (a group whose first item
+	// fit and whose second overflowed, or a replay). Gating on the flag would then
+	// commit that task with no master read at all. Dry-run-only leases carry no
+	// approved proof, so they still take no master row lock and cannot delay an
+	// OFF; that is the only scope claimed here.
+	if cleanupHasExecutionTasks(tasks) {
 		if err = s.cleanupLeaseAuthorize(ctx, tx, true, tasks, sessionDeadline); err != nil {
 			if !errors.Is(err, errCleanupLeaseDenied) {
 				util.WriteError(w, 500, "cleanup lease save failed")
@@ -1004,6 +1023,9 @@ func (s *Server) cleanupLeaseAuthorize(ctx context.Context, tx pgx.Tx, required 
 	if !on {
 		return errCleanupLeaseDenied
 	}
+	// The locked read can itself have waited. Recheck the real clock against every
+	// deadline each buffered approval depends on, using only values in memory: no
+	// further SQL and no further lock, so an emergency OFF is never behind this.
 	now := time.Now()
 	if !sessionDeadline.After(now) {
 		return errCleanupLeaseDenied
@@ -1012,11 +1034,22 @@ func (s *Server) cleanupLeaseAuthorize(ctx context.Context, tx pgx.Tx, required 
 		if task.ApprovedProof == nil {
 			continue
 		}
-		if !task.ExpiresAt.After(now) {
+		if !task.ExpiresAt.After(now) || !cleanupAuthorityLive(task.approvalDeadline, now) {
 			return errCleanupLeaseDenied
 		}
 	}
 	return nil
+}
+
+// cleanupHasExecutionTasks reports whether any buffered lease could hand the
+// client deletion authority, i.e. whether the final master gate is required.
+func cleanupHasExecutionTasks(tasks []cleanupTask) bool {
+	for _, task := range tasks {
+		if task.ApprovedProof != nil {
+			return true
+		}
+	}
+	return false
 }
 
 var errCleanupLeaseDenied = errors.New("cleanup lease authority denied")
@@ -1025,7 +1058,7 @@ var errCleanupLeaseDenied = errors.New("cleanup lease authority denied")
 // identical lease request (its response was lost), with the same attempt and
 // expiry. Nothing is leased again and no lease is extended.
 func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID string, executionCapable bool, boot, version string, sessionDeadline time.Time, plans []int64, group bool) ([]cleanupTask, error) {
-	rows, err := tx.Query(ctx, `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode,i.lease_expires_at FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.lease_request_id=$1 AND p.id=ANY($7) AND i.state='leased' AND i.lease_expires_at>now() AND p.connection_id=$2 AND p.report_sha256=$3 AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $4 AND i.lease_connection_id=$2 AND i.lease_client_boot_id=$5 AND i.lease_client_version=$6 AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.id<>i.id AND busy.state IN ('leased','delete_issued') AND NOT coalesce(($8 AND busy.lease_request_id=$1 AND busy.lease_client_boot_id=$5 AND busy.lease_client_version=$6),false)))) ORDER BY i.id FOR UPDATE OF i`, requestID, cid, cleanupPolicySHA, executionCapable, boot, version, plans, group)
+	rows, err := tx.Query(ctx, `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode,i.lease_expires_at,p.approved_until FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.lease_request_id=$1 AND p.id=ANY($7) AND i.state='leased' AND i.lease_expires_at>now() AND p.connection_id=$2 AND p.report_sha256=$3 AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $4 AND i.lease_connection_id=$2 AND i.lease_client_boot_id=$5 AND i.lease_client_version=$6 AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.id<>i.id AND busy.state IN ('leased','delete_issued') AND NOT coalesce(($8 AND busy.lease_request_id=$1 AND busy.lease_client_boot_id=$5 AND busy.lease_client_version=$6),false)))) ORDER BY i.id FOR UPDATE OF i`, requestID, cid, cleanupPolicySHA, executionCapable, boot, version, plans, group)
 	if err != nil {
 		return nil, err
 	}
@@ -1035,7 +1068,8 @@ func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID str
 		var task cleanupTask
 		var raw, approved []byte
 		var mode string
-		if err = rows.Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode, &task.ExpiresAt); err != nil {
+		var planUntil *time.Time
+		if err = rows.Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode, &task.ExpiresAt, &planUntil); err != nil {
 			return nil, err
 		}
 		if err = json.Unmarshal(raw, &task.Item); err != nil {
@@ -1044,16 +1078,18 @@ func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID str
 		if task.Item.PermitReason == nasCleanupCertifiedStitchReason && version != nasCleanupCertifiedStitchVersion {
 			continue
 		}
+		task.ExpiresAt = task.ExpiresAt.UTC()
 		if mode == "enabled" {
 			if !sessionDeadline.After(time.Now()) {
 				continue
 			}
 			task.ApprovedProof = approved
 			task.ExecutionBatch = group
+			// A replayed approval must satisfy the same final gate as a fresh one.
+			task.approvalDeadline = earliestDeadline(planUntil, &sessionDeadline, &task.ExpiresAt)
 		} else if mode != "dry_run" {
 			continue
 		}
-		task.ExpiresAt = task.ExpiresAt.UTC()
 		tasks = append(tasks, task)
 	}
 	return tasks, rows.Err()
@@ -1248,14 +1284,15 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 	}
 	// R2 work happens before the transaction (no locks held across it).
 	env := &cleanupObserveEnv{session: cleanupAdmissionSession(r, req.ClientVersion), dryRunOnly: dryRunOnly, freshRequests: map[int64]bool{id: fresh}}
-	// Cheap, unlocked initial read. It takes no lock, so it cannot delay an OFF.
-	// Its only job is to pick the posture: when the switch already reads OFF (or
-	// cannot be read), skip issuance-only preflight — the aborted-stage R2 lookup
-	// exists to prepare a permit — and go straight to the ordinary denied
-	// observation/auto-pause. This read never promotes anything: the final pass
-	// still reads the switch authoritatively, last, and an OFF there releases no
-	// buffered affirmative answer.
-	presumedDenied := !cleanupMasterMaybeRead(ctx, s.pool)
+	// One explicit initial posture, read once and unlocked so it cannot delay an
+	// OFF. Its only job is to choose the starting posture: when the switch already
+	// reads OFF (or cannot be read), skip issuance-only preflight — the
+	// aborted-stage R2 lookup exists to prepare a permit — and go straight to the
+	// ordinary denied observation/auto-pause. It never promotes anything: the final
+	// positive pass still reads the switch authoritatively, last, and an OFF there
+	// releases no buffered affirmative answer.
+	posture := cleanupInitialPosture(ctx, s.pool)
+	presumedDenied := posture == cleanupAuthorityDenied
 	if req.Outcome == "match" {
 		// Recovery evidence is needed either way: a denied observation still records
 		// the exact recovery it proved before declining to permit.

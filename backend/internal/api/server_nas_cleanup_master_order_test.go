@@ -675,7 +675,9 @@ func TestNASCleanupPostOffBatchCloseIsScopedToTheExactBatch(t *testing.T) {
 			VALUES(47,13,repeat('c',64),$1,$2,ARRAY[$3],'enabled','successor',now()+interval '1 hour') RETURNING id`, cleanupPolicySHA, roster, strings.Repeat("d", 64)).Scan(&successor); err != nil {
 			t.Fatal(err)
 		}
-		f.s.cleanupPauseBatchAfterOff(ctx, batchID, roster, "master switch is off")
+		if err := f.s.cleanupPauseBatchAfterOff(ctx, batchID, roster, "master switch is off"); err != nil {
+			t.Fatalf("pause after OFF: %v", err)
+		}
 		var successorMode string
 		if err := f.pool.QueryRow(ctx, `SELECT mode FROM nas_cleanup_batches WHERE id=$1`, successor).Scan(&successorMode); err != nil {
 			t.Fatal(err)
@@ -692,7 +694,9 @@ func TestNASCleanupPostOffBatchCloseIsScopedToTheExactBatch(t *testing.T) {
 		f, plan, batchID, roster, ctx, cancel := newAdvancingBatch(t)
 		defer cancel()
 		setCleanupMaster(t, f.s, true)
-		f.s.cleanupPauseBatchAfterOff(ctx, batchID, roster, "master switch is off")
+		if err := f.s.cleanupPauseBatchAfterOff(ctx, batchID, roster, "master switch is off"); err != nil {
+			t.Fatalf("pause after OFF: %v", err)
+		}
 		if mode, _ := f.batchMode(); mode != "enabled" {
 			t.Fatalf("the scoped close paused a batch after OFF->ON: %s", mode)
 		}
@@ -707,7 +711,9 @@ func TestNASCleanupPostOffBatchCloseIsScopedToTheExactBatch(t *testing.T) {
 		setCleanupMaster(t, f.s, false)
 		// The batch is still the enabled one, but this advance's roster does not
 		// include the completed plan: closing it would reach outside the batch.
-		f.s.cleanupPauseBatchAfterOff(ctx, batchID, []int64{plan + 1}, "master switch is off")
+		if err := f.s.cleanupPauseBatchAfterOff(ctx, batchID, []int64{plan + 1}, "master switch is off"); err != nil {
+			t.Fatalf("pause after OFF: %v", err)
+		}
 		if mode, _ := f.planMode(plan); mode != "enabled" {
 			t.Fatalf("the scoped close paused a completed plan outside its roster: %s", mode)
 		}
@@ -717,7 +723,9 @@ func TestNASCleanupPostOffBatchCloseIsScopedToTheExactBatch(t *testing.T) {
 		f, plan, batchID, roster, ctx, cancel := newAdvancingBatch(t)
 		defer cancel()
 		setCleanupMaster(t, f.s, false)
-		f.s.cleanupPauseBatchAfterOff(ctx, batchID, roster, "master switch is off")
+		if err := f.s.cleanupPauseBatchAfterOff(ctx, batchID, roster, "master switch is off"); err != nil {
+			t.Fatalf("pause after OFF: %v", err)
+		}
 		if mode, reason := f.batchMode(); mode != "paused" || !strings.Contains(reason, "master switch is off") {
 			t.Fatalf("scoped close did not pause its own batch: %s %q", mode, reason)
 		}
@@ -725,4 +733,132 @@ func TestNASCleanupPostOffBatchCloseIsScopedToTheExactBatch(t *testing.T) {
 			t.Fatalf("scoped close did not close its own completed plan: %s", mode)
 		}
 	})
+}
+
+// The post-OFF bookkeeping does its blocking writes and only then revalidates OFF
+// under a locked read. An ON committed in that window must win: the writes are
+// discarded so a deliberate restart is never undone. This drives the real
+// interleaving without holding the master row across the blocking work.
+func TestNASCleanupPostOffStandDownWhenOnCommitsDuringWrites(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	plan, sha, _ := f.admit("post-off-race", syntheticFiles(100, 2, 10))
+	f.dryRun()
+	setCleanupMaster(t, f.s, true)
+	if code, body := f.enableBatch([]int64{plan}, []string{sha}, 2); code != 200 {
+		t.Fatalf("batch enable: %d %s", code, body)
+	}
+	ctx, cancel := context.WithTimeout(f.ctx, 90*time.Second)
+	defer cancel()
+	if _, err := f.pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='keep' WHERE plan_id=$1`, plan); err != nil {
+		t.Fatal(err)
+	}
+	var batchID int64
+	if err := f.pool.QueryRow(ctx, `SELECT id FROM nas_cleanup_batches WHERE mode='enabled'`).Scan(&batchID); err != nil {
+		t.Fatal(err)
+	}
+	setCleanupMaster(t, f.s, false)
+
+	// Hold a shared public fence so the helper's plan lock queues, and commit the
+	// ON while it waits. The helper then does its writes and must see ON at its
+	// final locked read.
+	holder, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(context.Background())
+	if _, err = holder.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, nasCleanupPublicFence); err != nil {
+		t.Fatal(err)
+	}
+	// An exclusive plan lock blocks the helper's ascending plan row locks.
+	if _, err = holder.Exec(ctx, `SELECT id FROM nas_cleanup_plans WHERE id=$1 FOR UPDATE`, plan); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- f.s.cleanupPauseBatchAfterOff(ctx, batchID, []int64{plan}, "master switch is off") }()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiting bool
+		if err := f.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND $1::integer=ANY(pg_blocking_pids(pid)))`, holder.Conn().PgConn().PID()).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the post-OFF bookkeeping never queued on its plan fence")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// ON commits while the helper is still queued, before its blocking writes.
+	setCleanupMaster(t, f.s, true)
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("bookkeeping: %v", err)
+	}
+	if mode, _ := f.batchMode(); mode != "enabled" {
+		t.Fatalf("an ON committed before the writes was undone: batch %s", mode)
+	}
+	if mode, _ := f.planMode(plan); mode != "enabled" {
+		t.Fatalf("an ON committed before the writes had its plan closed: %s", mode)
+	}
+}
+
+// The positive control paths must end with the real locked master read and then
+// only COMMIT: no RELEASE SAVEPOINT, no plain read, no further locking statement.
+// A savepoint-wrapped read would leave RELEASE as the final statement, which is
+// the shape this boundary forbids.
+func TestNASCleanupEnablePathsEndWithTheRealLockedRead(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	setCleanupMaster(t, f.s, true)
+	p1, sha1, _ := f.admit("final-read-enable", syntheticFiles(100, 2, 10))
+	f.dryRun()
+	ctx, cancel := context.WithTimeout(f.ctx, 60*time.Second)
+	defer cancel()
+	order := &cleanupQueryOrder{}
+	cfg := f.pool.Config()
+	cfg.ConnConfig.Tracer = order
+	traced, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer traced.Close()
+	s := &Server{pool: traced, r2: f.s.r2, cfg: f.s.cfg, nasCleanupReportCache: f.s.nasCleanupReportCache}
+	w := cleanupCall(t, s.handleAdminNASCleanupControl, 0, 0, "id", strconv.FormatInt(p1, 10),
+		map[string]any{"plan_sha256": sha1, "mode": "enabled", "reason": "final read"})
+	if w.Code != 200 {
+		t.Fatalf("plan enable: %d %s", w.Code, w.Body.String())
+	}
+	assertLockedReadThenCommitOnly(t, order)
+}
+
+func assertLockedReadThenCommitOnly(t *testing.T, order *cleanupQueryOrder) {
+	t.Helper()
+	master := -1
+	// The LAST authoritative read, not an earlier advisory peek.
+	for i, sql := range order.sql {
+		if strings.Contains(sql, cleanupMasterReadSQL) {
+			master = i
+		}
+	}
+	if master < 0 {
+		t.Fatalf("no authoritative master read: %v", order.sql)
+	}
+	// Only statements inside the deciding transaction matter. The first
+	// COMMIT/ROLLBACK after the read ends it; anything later (the best-effort
+	// freeze release callback, which opens its own transaction after commit) is
+	// post-commit housekeeping, not part of this decision.
+	var after []string
+	for _, sql := range order.since(master) {
+		trimmed := strings.TrimSpace(sql)
+		upper := strings.ToUpper(trimmed)
+		if strings.HasPrefix(upper, "COMMIT") || strings.HasPrefix(upper, "ROLLBACK") {
+			break
+		}
+		after = append(after, trimmed)
+	}
+	if len(after) != 0 {
+		t.Fatalf("statements after the locked read before COMMIT/ROLLBACK: %q", after)
+	}
 }

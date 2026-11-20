@@ -322,18 +322,16 @@ func TestNASCleanupMasterMigrationCreatesFreshWriterAndServesARuntimeRole(t *tes
 		t.Fatal(err)
 	}
 	defer admin.Close()
-	// If the writer role exists and owns objects anywhere, dropping it would
-	// disturb another package's fixtures. State that precisely and skip; the
-	// runtime-role half would not be affected but cannot run without this one.
-	var owners int
-	if err := admin.QueryRow(ctx, `SELECT count(*) FROM pg_shdepend d JOIN pg_roles r ON r.oid=d.refobjid WHERE r.rolname='nas_cleanup_master_writer' AND d.deptype='o'`).Scan(&owners); err != nil {
+	// The writer role is cluster-wide and may belong to another package's fixture.
+	// This test only runs where it can prove the role is its own: absent entirely.
+	// Owning no objects is NOT enough evidence to drop it — a sibling fixture may
+	// still hold a reference we cannot see — so any pre-existing role skips.
+	var exists bool
+	if err := admin.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='nas_cleanup_master_writer')`).Scan(&exists); err != nil {
 		t.Fatal(err)
 	}
-	if owners != 0 {
-		t.Skipf("skipped fresh CREATE ROLE verification: nas_cleanup_master_writer already owns %d object(s) from another test package, so it cannot be dropped here", owners)
-	}
-	if _, err := admin.Exec(ctx, `DROP ROLE IF EXISTS nas_cleanup_master_writer`); err != nil {
-		t.Fatalf("cannot isolate the writer role: %v", err)
+	if exists {
+		t.Skip("skipped fresh CREATE ROLE verification: nas_cleanup_master_writer already exists and is not provably this fixture's, so it is never dropped")
 	}
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
 	owner := "nas_mig_fresh_owner_" + suffix

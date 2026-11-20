@@ -59,6 +59,37 @@ func cleanupMasterOn(ctx context.Context, q queryRower) bool {
 	return q.QueryRow(ctx, `SELECT enabled FROM nas_cleanup_master FOR SHARE`).Scan(&on) == nil && on
 }
 
+// cleanupMasterRequiredSQL is the direct, non-savepoint authoritative read used by
+// the decision paths that hold the switch's row lock to commit. Wrapping it in a
+// savepoint would make RELEASE SAVEPOINT the last statement before commit, which
+// is exactly the shape this transaction boundary forbids.
+func cleanupMasterRequired(ctx context.Context, tx pgx.Tx) (bool, error) {
+	var on bool
+	err := tx.QueryRow(ctx, cleanupMasterReadSQL).Scan(&on)
+	return on, err
+}
+
+// cleanupMasterProbeLocked is the locked read used where a missing or unreadable
+// control must not abort writes that are already prepared. It takes the FOR SHARE
+// row lock on the caller's transaction, so a readable result is authoritative and
+// its lock lasts to commit; a failed read is contained in a nested scope and
+// reported as an error, which callers treat as "not authorised".
+func cleanupMasterProbeLocked(ctx context.Context, tx pgx.Tx) (bool, error) {
+	save, err := tx.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	var on bool
+	if err = save.QueryRow(ctx, cleanupMasterReadSQL).Scan(&on); err != nil {
+		_ = save.Rollback(ctx)
+		return false, err
+	}
+	if err = save.Commit(ctx); err != nil {
+		return false, err
+	}
+	return on, nil
+}
+
 // cleanupMasterOnTx reads the master switch inside a savepoint. A read error
 // (or a missing row) rolls back only that savepoint, so the caller's
 // transaction is never left aborted: read-only dry-run work and batch
@@ -101,6 +132,20 @@ func cleanupAffirmative(body map[string]any) bool {
 func cleanupMasterMaybeRead(ctx context.Context, q queryRower) bool {
 	var on bool
 	return q.QueryRow(ctx, `SELECT enabled FROM nas_cleanup_master`).Scan(&on) == nil && on
+}
+
+// cleanupInitialPosture is the one explicit posture both observation paths start
+// from. It is read once, unlocked, before any evidence prefetch, so the single and
+// batched endpoints cannot disagree about the switch or read it twice. An OFF or
+// unreadable answer means "assume denied": the request still records the ordinary
+// non-deleting observation and pause, but skips the issuance-only aborted-stage
+// preflight and never guesses evidence a permit would need. It grants nothing —
+// the final positive pass reads the switch authoritatively, last.
+func cleanupInitialPosture(ctx context.Context, q queryRower) cleanupAuthority {
+	if cleanupMasterMaybeRead(ctx, q) {
+		return cleanupAuthorityTentative
+	}
+	return cleanupAuthorityDenied
 }
 
 // cleanupMasterMaybeOn is the cheap, non-blocking pre-check: it reads the
