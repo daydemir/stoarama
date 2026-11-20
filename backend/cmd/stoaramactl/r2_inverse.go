@@ -454,7 +454,8 @@ func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 }
 
 // writeInversePartition writes a read-only full-bucket partition and its
-// summary into a new directory.
+// summary into a new directory, through the job's bounded read path so a
+// throttled page retries in place here exactly as it does for a job.
 func writeInversePartition(ctx context.Context, cfg config.Config, picksPath, out string) (inverseSummary, error) {
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
@@ -462,7 +463,13 @@ func writeInversePartition(ctx context.Context, cfg config.Config, picksPath, ou
 	if err != nil {
 		return inverseSummary{}, err
 	}
-	return partitionInverseDir(ctx, mustArchiveR2Client(ctx, cfg, pool), p, policy, out)
+	// Same archived bucket, endpoint and environment config the plain client
+	// used; only the read transport and retry policy differ.
+	store, err := newInverseSDKStore(ctx, archiveR2Config(cfg, pool))
+	if err != nil {
+		return inverseSummary{}, err
+	}
+	return partitionInverseDir(ctx, store, p, policy, out)
 }
 
 // inversePartitionProtection reads the picks file and the policy, then loads the

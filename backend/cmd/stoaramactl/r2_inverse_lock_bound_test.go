@@ -44,6 +44,64 @@ func wideLocksFreeWithin(t *testing.T, pool *pgxpool.Pool, limit time.Duration) 
 	return tryWideLocks(t, pool)
 }
 
+// Batch initialization loads the KE path set and the owner keeps once, under
+// both wide cleanup locks. Before its own bound, a session holding
+// r2_owner_keep_prefixes ACCESS EXCLUSIVE made that read queue with the wide
+// locks still held, so no other writer could take them for as long as the
+// holder lived. The transaction-local bound turns that into SQLSTATE 55P03, so
+// admission rolls back, awaits outside, and retries.
+func TestR2InverseApplyInitializationBoundsProtectionReads(t *testing.T) {
+	f := newKeep28Fixture(t)
+	picks, err := loadR2RetirePicks(f.options.Picks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, windows, err := api.Keep28Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := releaseOnce(func() { holder.Rollback(context.Background()) })
+	defer release()
+	// The owner-keep read is one of the two sets initialization loads.
+	if _, err = holder.Exec(f.ctx, `LOCK TABLE r2_owner_keep_prefixes IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	type admitted struct {
+		protection inverseProtection
+		epoch      int64
+		err        error
+	}
+	done := make(chan admitted, 1)
+	go func() {
+		var epoch int64
+		p, err := loadInverseApplyAdmission(f.ctx, f.pool, f.sdk, picks, windows, &epoch)
+		done <- admitted{p, epoch, err}
+	}()
+	// The held table keeps initialization from finishing: it retries outside
+	// the wide locks instead of queueing behind the holder.
+	time.Sleep(4 * inverseLockTimeout)
+	select {
+	case got := <-done:
+		t.Fatalf("initialization finished under a held owner-keep table: %+v", got)
+	default:
+	}
+	if !wideLocksFreeWithin(t, f.pool, time.Second) {
+		t.Fatal("no writer could take 7343226011103/7343226011101 within 1s while initialization retried behind its table lock")
+	}
+	release()
+	got := within(t, done, "initialization after its holder released")
+	if got.err != nil {
+		t.Fatalf("initialization did not succeed after its holder released: %v", got.err)
+	}
+	if got.epoch <= 0 || got.protection.Picks.SHA256 == "" {
+		t.Fatalf("initialization returned no usable protection: epoch %d", got.epoch)
+	}
+}
+
 // releaseOnce makes a holder release safe to call twice: the deferred release
 // and the explicit one the bounded case needs.
 func releaseOnce(release func()) func() {
@@ -95,14 +153,6 @@ func unboundedSameStatement(t *testing.T, ctx context.Context, pool *pgxpool.Poo
 	if err != nil {
 		t.Fatal(err)
 	}
-	runCtx, cancel := context.WithCancel(ctx)
-	var once sync.Once
-	stop = func() {
-		once.Do(func() {
-			cancel()
-			tx.Rollback(context.Background())
-		})
-	}
 	mode := ""
 	if shared {
 		mode = "_shared"
@@ -114,20 +164,38 @@ func unboundedSameStatement(t *testing.T, ctx context.Context, pool *pgxpool.Poo
 		`SELECT pg_advisory_xact_lock` + mode + `(7343226011101)`,
 	} {
 		if _, err = tx.Exec(ctx, step); err != nil {
-			stop()
+			tx.Rollback(context.Background())
 			t.Fatal(err)
 		}
 	}
-	done := make(chan error, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	// done is closed exactly once by the worker after it has rolled its own
+	// transaction back, so a caller may wait on it any number of times. The
+	// worker alone touches its transaction once the statement is in flight: no
+	// second goroutine ever rolls back underneath an in-flight Exec.
+	done := make(chan struct{})
+	var result error
 	go func() {
-		_, err := tx.Exec(runCtx, stmt, args...)
-		done <- err
+		_, result = tx.Exec(runCtx, stmt, args...)
+		tx.Rollback(context.Background())
+		close(done)
 	}()
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Error("the unbound statement never returned after its cancel")
+			}
+		})
+	}
 	select {
-	case err := <-done:
+	case <-done:
 		stop()
-		if err != nil {
-			t.Fatalf("the unbound statement failed instead of waiting: %v", err)
+		if result != nil {
+			t.Fatalf("the unbound statement failed instead of waiting: %v", result)
 		}
 		return false, func() {}
 	case <-time.After(3 * inverseLockTimeout):
@@ -167,7 +235,8 @@ type lockBoundFixture struct {
 // proves all three: another writer can take the wide locks within one second
 // while the operation retries, the operation finishes once the holder releases,
 // and the same statement reached without the bound waits while it holds them.
-func TestR2AdmissionLockBoundNeverWaitsUnderWideLocks(t *testing.T) {
+// R2Inverse keeps this witness inside the CI job's existing selection.
+func TestR2InverseAdmissionLockBoundNeverWaitsUnderWideLocks(t *testing.T) {
 	for _, op := range []lockBoundOperation{
 		{
 			// A session holding the clip table ACCESS EXCLUSIVE refuses even the
@@ -302,21 +371,35 @@ func TestR2AdmissionLockBoundNeverWaitsUnderWideLocks(t *testing.T) {
 			t.Run("bounded", func(t *testing.T) {
 				site := op.setup(t)
 				defer site.release()
-				done := make(chan error, 1)
-				go func() { done <- site.run() }()
+				// The worker stores its result and closes done exactly once, so
+				// the early readiness check below can look without consuming it.
+				type outcome struct {
+					err error
+				}
+				finished := make(chan struct{})
+				var got outcome
+				go func() {
+					got.err = site.run()
+					close(finished)
+				}()
 				// The held lock keeps the operation from finishing; it retries.
 				time.Sleep(4 * inverseLockTimeout)
 				select {
-				case err := <-done:
-					t.Fatalf("the operation finished under a held lock, so the case never reproduced: %v", err)
+				case <-finished:
+					t.Fatalf("the operation finished under a held lock, so the case never reproduced: %v", got.err)
 				default:
 				}
 				if !wideLocksFreeWithin(t, site.pool, time.Second) {
 					t.Fatal("no writer could take 7343226011103/7343226011101 within 1s while the operation retried behind its lock")
 				}
 				site.release()
-				if err := within(t, done, op.name); err != nil {
-					t.Fatalf("the operation did not succeed after its holder released: %v", err)
+				select {
+				case <-finished:
+				case <-time.After(15 * time.Second):
+					t.Fatal("the operation did not finish after its holder released")
+				}
+				if got.err != nil {
+					t.Fatalf("the operation did not succeed after its holder released: %v", got.err)
 				}
 			})
 			t.Run("without_the_bound", func(t *testing.T) {

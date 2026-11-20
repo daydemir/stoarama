@@ -132,7 +132,7 @@ func runDurhamStageRetirement(ctx context.Context, cfg config.Config, args []str
 	id := fs.Int64("object-id", 0, "exact Durham staging object ID")
 	digest := fs.String("sha256", "", "staging object SHA-256")
 	apply := fs.Bool("apply", false, "authorize one stage-only wire attempt")
-	reconcile := fs.Bool("reconcile", false, "record absence of an already issued staging target or drained abort")
+	reconcile := fs.Bool("reconcile", false, "replay a prior confirmed absence, or record a drained abort's proven absence; never publish an unconfirmed DELETE")
 	evidence := fs.String("evidence", "", "reviewed exact per-stage retirement evidence")
 	evidenceSHA := fs.String("expected-evidence-sha256", "", "expected SHA-256 of that reviewed evidence")
 	picksPath := fs.String("picks", "", "reviewed owner picks (r2-picks.json)")

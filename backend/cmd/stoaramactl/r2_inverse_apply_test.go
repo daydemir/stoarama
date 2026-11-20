@@ -2293,12 +2293,23 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			{"cloudflare_520_then_404", "", []string{"520"}, 2, ""},
 			{"every_5xx_retries", "", []string{"501", "599"}, 3, ""},
 			{"bare_429_then_404", "", []string{"429"}, 2, ""},
-			{"retry_after_never_stretches_backoff", "", []string{"429-retry-after"}, 2, ""},
+			// A throttle that clears but whose object is present keeps the key
+			// held: the 429 is retried, and the answer still decides.
+			{"throttled_then_present_stays_held", "kept", []string{"429"}, 2, "object remains after DELETE"},
+			// Throttled past every try: the read stops cleanly, the one DELETE
+			// already sent is never resent, and the key stays held.
+			{"throttled_forever_stops_cleanly", "", []string{"429", "429", "429", "429"}, 4, "after 4 attempts"},
+			// A Retry-After past the cap fences the job's reads: the retry is
+			// never sent early, and the already issued key stays held.
+			{"retry_after_past_the_cap_fences_reads", "", []string{"429-retry-after"}, 1, "reads fenced"},
 			{"persistent_timeouts_hold_the_key", "", []string{"slow", "slow", "slow", "slow"}, 4, "after 4 attempts"},
 			{"redirect_to_404_never_confirms", "kept", []string{"redirect"}, 1, "after 1 attempts"},
 			{"object_remains_is_never_retried", "kept", nil, 1, "object remains after DELETE"},
 		} {
 			t.Run(c.name, func(t *testing.T) {
+				// Each case observes its own run's wire behavior, without the
+				// previous case's cooldown.
+				freshReadFence(sdk)
 				// A confirmed key lets the batch go on to the next one.
 				n := 1
 				if c.err == "" {
@@ -2344,9 +2355,6 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				if heads.Load() != c.sent || elapsed > 22*time.Second+5*time.Second {
 					t.Fatalf("%d confirming HEADs in %v, want %d within 22s", heads.Load(), elapsed, c.sent)
 				}
-				if c.name == "retry_after_never_stretches_backoff" && elapsed > 2*time.Second+3*time.Second {
-					t.Fatalf("retry-after stretched the backoff: %v", elapsed)
-				}
 				if c.err == "" {
 					if err != nil || result.Deleted != 2 {
 						t.Fatalf("confirmed %+v %v", result, err)
@@ -2370,6 +2378,9 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					}
 					return
 				}
+				// A restart is a new process: its read fence starts empty instead
+				// of inheriting the cooldown this run ended under.
+				freshReadFence(sdk)
 				result, err = applyInverse(ctx, pool, sdk, a.opts)
 				if err != nil || !slices.Contains(result.HeldAbsent, e.Key) || providerDeletes()-before != 1 {
 					t.Fatalf("restart %+v %v", result, err)
@@ -2392,7 +2403,74 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatalf("rate %.2f below8", s.ObjectsPerSecond)
 		}
 	})
+	// These run last: each leaves durable rows of its own, which the shared
+	// fixture's earlier count assertions must not see.
+	t.Run("pre_delete_HEAD_retries_transient_reads_without_extra_DELETE", func(t *testing.T) {
+		for name, mode := range map[string]string{"429_then_200": "429", "503_then_200": "503"} {
+			t.Run(name, func(t *testing.T) {
+				a, entries := build(1)
+				a.ledger.close()
+				e := entries[0]
+				var heads atomic.Int64
+				store.mu.Lock()
+				store.onHead = func(key string) string {
+					if key != e.Key || heads.Add(1) != 1 {
+						return ""
+					}
+					return mode
+				}
+				store.mu.Unlock()
+				defer func() {
+					store.mu.Lock()
+					store.onHead = nil
+					store.mu.Unlock()
+				}()
+				before := providerDeletes()
+				result, err := applyInverse(ctx, pool, sdk, a.opts)
+				if err != nil || result.Deleted != 1 || providerDeletes()-before != 1 {
+					t.Fatalf("read retry %+v err %v deletes %d", result, err, providerDeletes()-before)
+				}
+				// One throttled identity HEAD, its retry, and the confirming HEAD.
+				if heads.Load() != 3 {
+					t.Fatalf("%d HEADs, want 3 (retry, then the confirming read)", heads.Load())
+				}
+			})
+		}
+	})
+	t.Run("pre_delete_HEAD_throttled_forever_stops_before_DELETE", func(t *testing.T) {
+		a, entries := build(1)
+		a.ledger.close()
+		e := entries[0]
+		var heads atomic.Int64
+		store.mu.Lock()
+		store.onHead = func(key string) string {
+			if key != e.Key {
+				return ""
+			}
+			heads.Add(1)
+			return "429"
+		}
+		store.mu.Unlock()
+		defer func() {
+			store.mu.Lock()
+			store.onHead = nil
+			store.mu.Unlock()
+		}()
+		before := providerDeletes()
+		result, err := applyInverse(ctx, pool, sdk, a.opts)
+		if err == nil || !strings.Contains(err.Error(), "after 4 attempts") || result.Deleted != 0 {
+			t.Fatalf("throttled identity HEAD: %+v %v", result, err)
+		}
+		if heads.Load() != inverseReadAttempts || providerDeletes()-before != 0 {
+			t.Fatalf("%d HEAD attempts and %d DELETEs, want 4 and none", heads.Load(), providerDeletes()-before)
+		}
+		var issued bool
+		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_attempts WHERE bucket='stoarama' AND object_key=$1)`, e.Key).Scan(&issued); err != nil || issued {
+			t.Fatalf("an exhausted identity read still issued wire authority: %v", err)
+		}
+	})
 }
+
 func TestR2InverseLedgerRestartAndPartialTail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ledger")
 	l, err := openInverseLedger(path)

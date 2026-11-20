@@ -132,7 +132,7 @@ func (w *durhamStageWire) boundTarget(t r2.StitchStageTarget) error {
 	return nil
 }
 
-// ConfirmAbsent reuses the shared strict 404-only ladder on the same client.
-func (w *durhamStageWire) ConfirmAbsent(ctx context.Context, key string) error {
-	return confirmInverseAbsent(ctx, w.store.sdk, w.store.confirm, w.store.Bucket(), key)
-}
+// ConfirmAbsent is deliberately absent: the stage package owns the stricter
+// absence readback (exact bucket/prefix echo, empty multipart inventory and the
+// stage-specific 404 header check), so this wire exposes no second, weaker
+// confirming ladder that a caller could reach by mistake.

@@ -468,7 +468,7 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	var attempt int
 	var planSHA, manifestSHA string
 	var streamID int64
-	var issued, strictAbsent bool
+	var issued, strictAbsent, absencePublished bool
 	// FOR SHARE, never FOR UPDATE: the durable intent commits on another
 	// connection and its foreign key needs KEY SHARE on this row, which a
 	// FOR UPDATE lock would block. The endpoint is selected from the committed
@@ -476,7 +476,8 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	// the one certification recorded for this exact generation.
 	err = tx.QueryRow(ctx, `SELECT o.object_key,o.etag,coalesce(o.version_id,''),o.size_bytes,o.last_modified,o.sha256,
  o.endpoint_sha256,h.id,h.attempt,h.plan_sha256,h.staged_manifest_sha256,r.stream_id,
- d.issued_at IS NOT NULL,d.strict_absence_observed_at IS NOT NULL
+ d.issued_at IS NOT NULL,d.strict_absence_observed_at IS NOT NULL,
+ d.absence_observed_at IS NOT NULL
  FROM nas_stitch_r2_stage_objects o
  JOIN nas_stitch_r2_hours h ON h.id=o.hour_id AND h.attempt=o.attempt
  JOIN nas_stitch_r2_certificates cert ON cert.hour_id=h.id AND cert.attempt=h.attempt
@@ -505,7 +506,8 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
  FOR SHARE OF o,h,cert,q`,
 		objectID, sha, c.bucket).
 		Scan(&t.Key, &t.ETag, &t.VersionID, &t.SizeBytes, &t.LastModified, &t.SHA256,
-			&t.EndpointSHA256, &hourID, &attempt, &planSHA, &manifestSHA, &streamID, &issued, &strictAbsent)
+			&t.EndpointSHA256, &hourID, &attempt, &planSHA, &manifestSHA, &streamID, &issued, &strictAbsent,
+			&absencePublished)
 	if err != nil {
 		return errors.New("stitch stage lacks exact NAS custody, drain or dependency clearance")
 	}
@@ -525,11 +527,24 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	if strictAbsent {
 		return nil
 	}
+	// A strict absence that a prior invocation proved is terminal for this one:
+	// the trigger permits no further update, and the release gate already
+	// accepts the row.
 	if issued != reconcile {
 		return errors.New("stitch stage retirement state differs; issued targets require reconciliation")
 	}
+	// An issued intent whose strict absence is not published is an unresolved,
+	// possibly-ambiguous DELETE. A later read-only observation must never publish
+	// it: absence now proves neither that this DELETE caused it nor that an
+	// ungoverned writer cannot recreate the key, and this command never edits or
+	// re-derives what a prior invocation recorded. Such a target stays held, and
+	// the only path that publishes absence is the invocation that saw its own
+	// DELETE succeed and then strictly re-confirmed the exact key.
 	if reconcile {
-		return c.confirmStitchStageRetirement(ctx, tx, objectID, t.Key)
+		if absencePublished {
+			return errors.New("stitch stage delete remains unresolved; a prior absence observation is held and is never confirmed by a later read")
+		}
+		return errors.New("stitch stage delete remains unresolved; only its own successful DELETE with a strict absence proof can publish absence")
 	}
 	// The reviewed evidence must name this exact generation and hour, the
 	// reviewed picks, and the live fence it was reviewed against. The stream
@@ -763,7 +778,16 @@ func (c *Client) stitchStageWireRecheck(ctx context.Context, tx pgx.Tx, t Stitch
 	return nil
 }
 
+// confirmStitchStageRetirement publishes a strict absence proof for one exact
+// stage key. It is reached only from an invocation that either saw its own
+// DELETE answered and then re-read the exact key, or (separately) an aborted
+// object's own drained proof. It re-checks the exact-key multipart inventory
+// here, so publication can never be recorded while an upload for the same key
+// could still complete and recreate the object.
 func (c *Client) confirmStitchStageRetirement(ctx context.Context, tx pgx.Tx, objectID int64, key string) error {
+	if err := c.stitchStageNoMultipart(ctx, key); err != nil {
+		return fmt.Errorf("stitch stage absence unconfirmed: %w", err)
+	}
 	if err := c.requireStitchStageAbsent(ctx, key); err != nil {
 		return fmt.Errorf("stitch stage delete absence unconfirmed; reconcile only: %w", err)
 	}

@@ -436,9 +436,13 @@ single-attempt transport unchanged:
   deadline, over its own HTTP/1.1 connection with no keep-alive, so neither Go's
   HTTP/2 client nor a pooled connection can turn one attempt into two;
 - a lost or unknown answer is `ambiguous`: the one-shot intent is kept, nothing
-  is retried, edited or reissued, and only observed absence reconciles it;
+  is retried, edited or reissued, and only this invocation's own answered DELETE
+  followed by a strict absence proof can publish absence;
 - only a strict `404` with no delete marker and no conflicting provider error
-  header confirms absence, and a `200` fails at once.
+  header confirms absence, and a `200` fails at once;
+- publication also requires a complete, exact-key multipart inventory that is
+  empty. A `404` alone is never enough: an unfinished upload for the same key
+  could still recreate the object after the observation.
 
 One provider endpoint, taken from the committed stage row. That row's
 `endpoint_sha256` is the authority, not whatever the operator's process config
@@ -486,11 +490,22 @@ stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --apply \
 stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --reconcile
 ```
 
+A settled intent never becomes absence through a later read. `--reconcile`
+only *replays* the confirmation of an absence that a prior invocation's own
+answered DELETE already published; it never manufactures one from a stale or
+newer observation, and it never edits what an earlier invocation recorded. An
+issued target whose DELETE was unconfirmed, including one that now reads `404`,
+stays held: a later `404` proves neither that this DELETE caused it nor that an
+ungoverned writer cannot recreate the key. Such a row is never confirmed,
+reissued or updated here and blocks fence removal and conflicting dependencies.
+
 The same reconcile command can record absence for an aborted stage, including
-one from an earlier attempt. It requires the exact stage identity, writer
-drain, an empty multipart listing for the key, and HTTP 404 from HEAD. An
-abort after possible multipart completion remains held because that request
-can still have an unresolved outcome.
+one from an earlier attempt. That is a separate, safe proof: the object reached
+the terminal `aborted` state without a possible completion, its writer drain
+and multipart outcome are both settled, and the exact-key multipart listing is
+empty and the key reads `404`. An abort after a possible multipart completion
+remains held because that request can still have an unresolved outcome, and no
+other hold is released by this path.
 
 ### Stable stage evidence (reviewed, not generated)
 

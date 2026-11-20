@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"slices"
@@ -55,7 +54,8 @@ type inverseDeleteAuthority struct {
 // wireKey is the one exact key this authority may delete.
 func (a *inverseDeleteAuthority) wireKey() string { return a.binding.Key }
 
-// sendGate is the batch gate the RAW executor gave this authority.
+// sendGate is the batch gate the RAW executor gave this authority. A
+// single-attempt target supplies its own open gate instead.
 func (a *inverseDeleteAuthority) sendGate() *inverseSendGate { return a.gate }
 
 // inverseSendGate closes when a batch hits a hard failure. A DELETE whose first
@@ -179,8 +179,27 @@ func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverse
 // outlives admission, so the returned authority is never bound by, or
 // cancelled with, the admission attempt. Keep-28 adds its NAS custody proof and
 // bounds both by its expiry.
+//
+// The network budget starts once per authorization, at this call, and every
+// admitted retry calls authorize again. A retry after contention therefore gets
+// a fresh inverseNetworkTimeout measured from its own start, but never more
+// than the caller's wireCtx: wireCtx is a single parent per key, so the parent's
+// absolute deadline caps the total across retries. Pre-issuance no longer
+// stretches the returned authority's life, because the authority's deadline is
+// computed from this call's start, not from when the attempt committed.
 func (a *inverseApplier) authorize(admitCtx, wireCtx context.Context, tx pgx.Tx, e inverseEntry, gate *inverseSendGate) (*inverseDeleteAuthority, error) {
-	target, err := a.prepareWireTarget(admitCtx, tx, e)
+	// The key's own network budget starts here, before its locks are prepared.
+	// Every pre-issuance step holds the wide cleanup locks, so preflight that
+	// outlived the wire deadline could never issue: bound each one by the
+	// earliest of admission, the parent's deadline and the network timeout.
+	// Keep-28 tightens the same bound to custody end once it is proven.
+	deadline := time.Now().Add(inverseNetworkTimeout)
+	if parent, ok := wireCtx.Deadline(); ok && parent.Before(deadline) {
+		deadline = parent
+	}
+	preIssue, stopPreIssue := context.WithDeadline(admitCtx, deadline)
+	defer stopPreIssue()
+	target, err := a.prepareWireTarget(preIssue, tx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -188,30 +207,23 @@ func (a *inverseApplier) authorize(admitCtx, wireCtx context.Context, tx pgx.Tx,
 	var custody keep28Custody
 	var custodyEnd time.Time
 	if a.opts.Lane == inverseNASKeep28 {
-		if custody, custodyEnd, err = a.proveKeep28(admitCtx, tx, e, target); err != nil {
+		if custody, custodyEnd, err = a.proveKeep28(preIssue, tx, e, target); err != nil {
 			return nil, err
 		}
+		tightened, stop := context.WithDeadline(preIssue, custodyEnd)
+		defer stop()
+		preIssue = tightened
+		if custodyEnd.Before(deadline) {
+			deadline = custodyEnd
+		}
 	}
-	// The key's own network budget starts once its locks are held, and ends at
-	// custody end when that is tighter. wireCtx carries the job's parent
-	// deadline, so an earlier parent bound still wins.
-	deadline := time.Now().Add(inverseNetworkTimeout)
-	if a.opts.Lane == inverseNASKeep28 && custodyEnd.Before(deadline) {
-		deadline = custodyEnd
-	}
+	// The returned authority carries wireCtx, which outlives admission and is
+	// never cancelled with it; an earlier parent bound still wins.
 	ctx, cancel := context.WithDeadline(wireCtx, deadline)
 	fail := func(err error) (*inverseDeleteAuthority, error) { cancel(); return nil, err }
 	// Every check before issuance and the attempt insert itself are admission
-	// work: they run under the admission deadline, so none of them can outlive
-	// it while the wire transaction holds the wide cleanup locks. Keep-28 also
-	// stops them at custody end. Only the returned authority carries the wire
-	// context, bounded by the network deadline and by custody.
-	preIssue := admitCtx
-	if a.opts.Lane == inverseNASKeep28 {
-		var stop context.CancelFunc
-		preIssue, stop = context.WithDeadline(admitCtx, custodyEnd)
-		defer stop()
-	}
+	// work under the pre-issuance bound: none of them can outlive the wire
+	// deadline while the wire transaction holds the wide cleanup locks.
 	if err = a.checkWireHead(preIssue, tx, e, target); err != nil {
 		return fail(err)
 	}
@@ -220,16 +232,56 @@ func (a *inverseApplier) authorize(admitCtx, wireCtx context.Context, tx pgx.Tx,
 	if err = guard.check(preIssue, binding); err != nil {
 		return fail(err)
 	}
+	// Nothing is minted once the wire deadline has passed: authority that can
+	// never send must not exist, so this fails before the attempt insert.
+	if err = inversePreIssuanceExpired(preIssue); err != nil {
+		return fail(fmt.Errorf("pre-issuance ended before wire authority could be issued: %w", err))
+	}
 	// Independent commit precedes capability issuance. Even another verifier or
 	// process cannot remint authority after any ambiguous/crashed wire attempt.
 	issued, err := a.issueAttempt(preIssue, binding)
 	if err != nil {
 		return fail(err)
 	}
+	// The attempt COMMIT is a separate connection and can acknowledge after the
+	// pre-issuance bound expired while wire and custody were still live. That
+	// durable attempt stays held: it is never retried, and no DELETE may mint
+	// from authority that outlived its bound. Only an *acknowledged* commit
+	// reaches this check; an ambiguous one already failed above and is held.
+	if err = inversePreIssuanceExpired(preIssue); err != nil {
+		return fail(fmt.Errorf("%w: %w", errInverseLateAttemptCommit, err))
+	}
 	if issued != 1 {
 		return fail(errors.New("inverse wire authority was already issued; reconcile only"))
 	}
 	return &inverseDeleteAuthority{binding: binding, guard: guard, used: &atomic.Bool{}, gate: gate, ctx: ctx, cancel: cancel, custody: custody, custodyEnd: custodyEnd}, nil
+}
+
+// errInverseLateAttemptCommit reports a wire attempt COMMIT its server
+// acknowledged after the pre-issuance bound had already passed. It wraps
+// whatever ended the bound, so an expired bound keeps context.DeadlineExceeded
+// while an explicit cancellation keeps context.Canceled and is never mistaken
+// for a timeout. It is deliberately distinct from an ambiguous COMMIT: that one
+// never reaches this check, because an unknown outcome is held before any
+// authority could exist.
+var errInverseLateAttemptCommit = errors.New("wire attempt committed after its pre-issuance bound")
+
+// inversePreIssuanceExpired reports whether the effective pre-issuance bound has
+// passed. A context timer can be delivered late, so Err() alone stays nil for a
+// while after the deadline; comparing the monotonic wall clock against the
+// context's own deadline closes that window instead of re-enabling the wire.
+func inversePreIssuanceExpired(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return nil
+	}
+	if !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 // issueAttempt records the wire attempt in its own transaction, so it commits
@@ -259,9 +311,15 @@ type inverseSDKStore struct {
 	*r2.Client
 	sdk       *s3.Client
 	transport http.RoundTripper
-	// confirm sends each confirming HEAD attempt under its own timeout and
-	// never follows a redirect.
-	confirm *http.Client
+	// readClient carries the job's LIST pages, multipart inventory and identity
+	// HEADs through the bounded read path; confirm carries the confirming HEAD's
+	// fresh per-attempt connections. Both refuse redirects and send one request
+	// per attempt.
+	readClient *http.Client
+	confirm    *http.Client
+	// reads is the one rate limiter every worker and every read type shares.
+	reads   *inverseReadGate
+	readsMu sync.Mutex
 }
 
 // The confirming HEAD after an answered DELETE is a read, so it alone retries:
@@ -346,38 +404,21 @@ func newInverseSDKStore(ctx context.Context, cfg r2.Config) (*inverseSDKStore, e
 		o.BaseEndpoint = aws.String(cfg.Endpoint)
 		o.Retryer = aws.NopRetryer{}
 	})
-	return &inverseSDKStore{reader, sdk, transport, newInverseConfirmClient(inverseConfirmAttemptTimeout)}, nil
+	return &inverseSDKStore{Client: reader, sdk: sdk, transport: transport, readClient: newInverseReadClient(inverseReadPageTimeout), confirm: newInverseConfirmClient(inverseConfirmAttemptTimeout), reads: newInverseReadGate()}, nil
 }
 
+// confirmAbsent HEADs the key after its answered DELETE: nil only on 404. It is
+// a read, so it shares the job's bounded read policy and its rate limiter; it
+// keeps its reviewed 22s bound, 4 attempts of 4s and fresh connection per
+// attempt.
 func (s *inverseSDKStore) confirmAbsent(ctx context.Context, key string) error {
-	return confirmInverseAbsent(ctx, s.sdk, s.confirm, s.Bucket(), key)
-}
-
-// confirmInverseAbsent is the strict confirming-HEAD ladder: only a 404 for the
-// exact key confirms, each attempt is one request on its own fresh connection
-// under its own timeout, only transient provider failures retry, and a redirect
-// or a 200 stops at once. The stage retirement reuses exactly this ladder.
-func confirmInverseAbsent(ctx context.Context, sdk *s3.Client, confirm *http.Client, bucket, key string) error {
-	ctx, cancel := context.WithTimeout(ctx, inverseConfirmTimeout)
-	defer cancel()
-	for attempt := 1; ; attempt++ {
-		_, err := sdk.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)}, func(o *s3.Options) {
-			o.HTTPClient = confirm
+	return s.read(ctx, inverseConfirmReadPolicy, "confirming head "+key, func(ctx context.Context) error {
+		_, err := s.sdk.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.Bucket()), Key: aws.String(key)}, func(o *s3.Options) {
+			o.HTTPClient = s.confirm
 			o.Retryer = aws.NopRetryer{}
 		})
-		err = inverseAbsence(err)
-		if err == nil {
-			return nil
-		}
-		if attempt == inverseConfirmAttempts || inverseConfirmRetryable.IsErrorRetryable(err) != aws.TrueTernary {
-			return fmt.Errorf("confirming head %s after %d attempts: %w", key, attempt, err)
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("confirming head %s after %d attempts: %w", key, attempt, err)
-		case <-time.After(rand.N(inverseConfirmMaxBackoff)):
-		}
-	}
+		return inverseAbsence(err)
+	})
 }
 func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDeleteAuthority) error {
 	return s.deleteOneWire(ctx, authority, authority.binding.Key)
@@ -385,7 +426,8 @@ func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDele
 
 // deleteOneWire sends exactly one DELETE for one already-validated target over
 // the audited HTTP/1.1 single-connection transport. A lost answer is reported
-// as ambiguous, never retried. The stage retirement reaches the wire only here.
+// as ambiguous, never retried. The Durham stage retirement reaches the wire
+// only here, so it reuses the RAW lanes' transport unchanged.
 func (s *inverseSDKStore) deleteOneWire(ctx context.Context, authority inverseWireTarget, key string) error {
 	if err := authority.requireWire(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
 		return err
@@ -556,9 +598,10 @@ func (c *inverseWireConn) Read(p []byte) (int, error) {
 }
 
 // inverseWireTarget is the minimum a single DELETE needs: one exact key, one
-// consumption state, one revalidation against the still-held locks, and one
-// deadline bound. The RAW executor issues it for both lanes; the Durham stage
-// retirement issues its own for one stage object. Nothing else is shared.
+// consumption state, one revalidation against the still-held locks, one
+// deadline bound and one send gate. The RAW executor issues it for both lanes;
+// the Durham stage retirement issues its own for one stage object. Nothing else
+// is shared.
 type inverseWireTarget interface {
 	requireWire(context.Context, string, string) error
 	check(context.Context, string, string) error

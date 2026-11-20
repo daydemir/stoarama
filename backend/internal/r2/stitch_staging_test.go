@@ -184,3 +184,58 @@ func TestStitchStageMultipartInventoryMustBeEmptyAndExact(t *testing.T) {
 		})
 	}
 }
+
+// Publication is the only step that can make a held stage eligible for NAS
+// release, so it must refuse when the exact key could still be recreated by an
+// unfinished upload, even though the object itself is already absent. A HEAD
+// that answers 404 is not enough: a live or truncated multipart inventory for
+// the same exact key keeps the row held.
+func TestStitchStageAbsenceIsNotPublishedWhileTheExactKeyCanStillAppear(t *testing.T) {
+	key := "stitch-staging/00000000-0000-0000-0000-000000000001/" + strings.Repeat("a", 64) + ".mp4"
+	for _, tc := range []struct {
+		name    string
+		listing string
+		want    bool
+	}{
+		{"empty inventory publishes", "<ListMultipartUploadsResult><Bucket>bucket</Bucket><Prefix>" + key + "</Prefix><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>", true},
+		{"live upload withholds", "<ListMultipartUploadsResult><Bucket>bucket</Bucket><Prefix>" + key + "</Prefix><IsTruncated>false</IsTruncated><Upload><Key>" + key + "</Key><UploadId>live</UploadId></Upload></ListMultipartUploadsResult>", false},
+		{"truncated listing withholds", "<ListMultipartUploadsResult><Bucket>bucket</Bucket><Prefix>" + key + "</Prefix><IsTruncated>true</IsTruncated></ListMultipartUploadsResult>", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			heads := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					w.Header().Set("Content-Type", "application/xml")
+					fmt.Fprint(w, tc.listing)
+				case http.MethodHead:
+					// The object is genuinely absent at the provider.
+					heads++
+					w.WriteHeader(http.StatusNotFound)
+				default:
+					t.Errorf("publication sent an unexpected %s", r.Method)
+					w.WriteHeader(http.StatusBadRequest)
+				}
+			}))
+			defer server.Close()
+			client, err := New(context.Background(), Config{Bucket: "bucket", Endpoint: server.URL, AccessKey: "fake", SecretKey: "fake"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Exercise the publication guard exactly as the retirement does.
+			err = client.stitchStageNoMultipart(context.Background(), key)
+			if err == nil {
+				err = client.requireStitchStageAbsent(context.Background(), key)
+			}
+			if (err == nil) != tc.want {
+				t.Fatalf("publication = %v, want published %v", err, tc.want)
+			}
+			if tc.want && heads != 1 {
+				t.Fatalf("a published absence did not read the exact key: %d heads", heads)
+			}
+			if !tc.want && heads != 0 {
+				t.Fatalf("a withheld absence still read the key: %d heads", heads)
+			}
+		})
+	}
+}

@@ -871,15 +871,33 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 				t.Fatalf("legacy staged receipt without strict confirmation cleared NAS gate: %v %v", stagingAbsent, err)
 			}
 			stageHeadResponse.Store(0)
-			if err := store.RetireStitchStage(ctx, 123, sha, r2.StitchStageEvidence{}, r2.StitchStagePicks{}, nil, true); err != nil {
-				t.Fatalf("staging retirement could not reconcile exact absence: %v", err)
+			// The exact key is now unreadable at the provider, but this object's
+			// own DELETE answered 503 and was never confirmed. Standing policy:
+			// a later observation must never publish absence for an unresolved
+			// intent. Reconcile stays refused and the row stays held.
+			if err := store.RetireStitchStage(ctx, 123, sha, r2.StitchStageEvidence{}, r2.StitchStagePicks{}, nil, true); err == nil ||
+				!strings.Contains(err.Error(), "remains unresolved") {
+				t.Fatalf("a later absence observation published an unconfirmed intent: %v", err)
 			}
-			var originalPreserved bool
-			if err := pool.QueryRow(ctx, `SELECT absence_observed_at=$1 AND strict_absence_observed_at>=absence_observed_at
- FROM nas_stitch_r2_stage_retirements WHERE object_id=123`, legacyObservedAt).
-				Scan(&originalPreserved); err != nil || !originalPreserved {
-				t.Fatalf("strict staging reconciliation changed the legacy observation: %v %v", originalPreserved, err)
+			var stillHeld bool
+			if err := pool.QueryRow(ctx, `SELECT absence_observed_at=$1 AND strict_absence_observed_at IS NULL
+ FROM nas_stitch_r2_stage_retirements WHERE object_id=123`, legacyObservedAt).Scan(&stillHeld); err != nil || !stillHeld {
+				t.Fatalf("an unconfirmed intent was edited by a later observation: %v %v", stillHeld, err)
 			}
+			// The gate below is hour-wide, so opening it requires this object to
+			// be strictly absent. Model that as a *legacy truly confirmed row*:
+			// a prior invocation's own successful DELETE recorded both the
+			// original observation and its strict confirmation. This fixture
+			// writes it directly to set up the gate; it is never something this
+			// command may do from an unresolved intent, which is asserted above.
+			exec := func(sql string, args ...any) {
+				t.Helper()
+				if _, err := pool.Exec(ctx, sql, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			exec(`UPDATE nas_stitch_r2_stage_retirements
+ SET strict_absence_observed_at=clock_timestamp() WHERE object_id=123 AND strict_absence_observed_at IS NULL`)
 		})
 	})
 	for _, change := range []string{
@@ -896,6 +914,10 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 
 type durhamStageAbortProbe struct {
 	response, lists, heads atomic.Int32
+	// deleteConfirmed answers a stage DELETE with 204 instead of the default
+	// 503, so a fixture can model the one path that may publish absence: this
+	// invocation's own answered DELETE followed by a strict absence read.
+	deleteConfirmed atomic.Bool
 	// Object DELETEs are counted. While holdDelete is set they wait for
 	// release; the first closes deleteEntered.
 	deletes                      atomic.Int32
@@ -1001,6 +1023,10 @@ func durhamStageTestProvider(t *testing.T, media []byte, sha, abortKey string, a
 			fmt.Fprint(w, "<CompleteMultipartUploadResult><ETag>&#34;stage-etag&#34;</ETag></CompleteMultipartUploadResult>")
 		case r.Method == http.MethodDelete && completed && !deleted && r.Header.Get("If-Match") == "" && r.URL.Query().Get("x-id") == "DeleteObject":
 			deleted = true
+			if abort.deleteConfirmed.Load() {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
 			w.WriteHeader(http.StatusServiceUnavailable)
 		case r.Method == http.MethodHead && deleted:
 			switch stageHeadResponse.Load() {
