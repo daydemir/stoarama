@@ -531,20 +531,43 @@ retire as `collated`. Receipts carry `owner_delivery_page_<class>`.
    b. **Record the reviewed cutover authority.**
       `stoaramactl r2-inverse page-cutover --evidence FILE
       --expected-evidence-sha256 HEX`. The evidence is the facts the API cannot
-      see, and its canonical bytes are pinned by `--expected-evidence-sha256`:
-      the serving `generation`, the **last legacy five-minute grant** time and
-      its grant-list digest, the **legacy origin removal** time and its off-host
-      evidence digest, the **cache-expired** time and its evidence digest, the
-      **non-serving rollback routing** digest, and the **verified end of every
-      active transfer** (`transfer_bound_at`), direct-from-R2 included. SQL
-      derives `deadline_at` as the greatest of those plus the five-minute legacy
-      grant window; the command cannot supply it.
+      see. Each is an ARTIFACT with its own digest, and the canonical bytes are
+      pinned by `--expected-evidence-sha256`:
 
-      If you cannot prove a bound — no authoritative byte clock for a direct R2
-      transfer, an origin whose cache cannot be shown expired — do not write a
-      plausible number. Stop: without this row retirement is refused, and with
-      it `confident_repair`, `in_window` and every derivative release stay
-      closed. That is the correct outcome when the drain is unproven.
+      | Fact | Instant | Artifact digest |
+      | --- | --- | --- |
+      | serving generation | (bound to the live registry row) | — |
+      | last legacy five-minute grant | `legacy_grant_boundary_at` | `legacy_signed_grant_sha256` |
+      | legacy origin removal | `legacy_origin_removed_at` | `legacy_origin_evidence_sha256` |
+      | cache expiry | `cache_expired_at` | `cache_evidence_sha256` |
+      | non-serving rollback routing | — | `rollback_routing_sha256` |
+      | verified transfer end | `transfer_bound_at` | `transfer_evidence_sha256` |
+
+      SQL derives `deadline_at` as the greatest instant plus the five-minute
+      legacy grant window; the command cannot supply it. Constraints refuse one
+      artifact reused for two facts, and refuse the approval digest equalling any
+      evidence digest. Timestamps are canonicalized as RFC3339Nano, so the
+      approval covers the exact instants the row stores (no truncation).
+
+      The authority is bound to the generation the page was actually serving:
+      the admission trigger requires it to equal the live pinned generation row,
+      and retirement compares against that one row, so it is one bound fact, not
+      two caller strings agreeing.
+
+      **Provenance, stated plainly.** This row records that an operator produced
+      and pinned evidence in the reviewed sequence below. PostgreSQL does not
+      verify production routing or a completed download, and a DBA who can format
+      hex can write any row. An approval digest is not one of the evidence
+      artifacts. The gate is only as strong as that reviewed sequence: if it was
+      not actually performed, the honest state is that `confident_repair` and
+      every derivative release stay closed. Nothing here sends an external
+      request to "verify" production.
+
+      If you cannot produce a transfer artifact — no authoritative byte clock for
+      a direct R2 transfer, an origin cache not shown expired — do not write a
+      plausible number. Stop: without this row retirement is refused, and with it
+      `confident_repair`, `in_window` and every derivative release stay closed.
+      That is the correct outcome when the drain is unproven.
 
    c. **Wait for the derived deadline.** Query the row, not a wall clock from
       this document:
@@ -617,11 +640,12 @@ retire as `collated`. Receipts carry `owner_delivery_page_<class>`.
 
 - A presigned URL already returned to a recipient is not revocable. The drain
   relies on the provider refusing it after `expires_at` and on the operator's
-  `transfer_bound_at` covering a transfer that started just before expiry. It
-  assumes the provider honours presign expiry within its documented skew and
-  applies no longer cache to the signed URL. There is no provider byte clock in
-  this system; if one is unavailable, `transfer_bound_at` cannot be proved and
-  retirement stays closed.
+  `transfer_bound_at`, read from the pinned `transfer_evidence_sha256` artifact,
+  covering a transfer that started just before expiry. It assumes the provider
+  honours presign expiry within its documented skew and applies no longer cache
+  to the signed URL. There is no provider byte clock in this system; if an
+  artifact establishing the true end of a direct transfer is unavailable,
+  `transfer_bound_at` cannot be proved and retirement stays closed.
 - An origin removed in step 0 keeps its own caches for as long as that owner
   configures. Removing the route is necessary; it is not proof that an edge cache
   has purged. `cache_expired_at` and its evidence digest are the record that the

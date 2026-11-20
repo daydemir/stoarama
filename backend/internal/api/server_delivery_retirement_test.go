@@ -285,12 +285,29 @@ func repeatHex(c byte, n int) string { return strings.Repeat(string(c), n) }
 // write time; nothing here can revise it afterwards.
 func writeCutoverAuthorityWithin(t *testing.T, pool *pgxpool.Pool, generation string, bound time.Time) {
 	t.Helper()
+	// The authority must be bound to the live serving generation, so record the
+	// pinned generation row it is admitted against.
+	seedServingGeneration(t, pool, generation)
 	if _, err := pool.Exec(context.Background(), `INSERT INTO r2_delivery_cutover_authority(
  generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
- legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,transfer_bound_at,approved_sha256)
- VALUES($1,'test: cutover',$2,$3,$2,$3,$2,$3,$3,$2,$3)`,
-		generation, bound, strings.Repeat("a", 64)); err != nil {
+ legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,
+ transfer_bound_at,transfer_evidence_sha256,approval_sha256)
+ VALUES($1,'test: cutover',$2,$3,$2,$4,$2,$5,$6,$2,$7,$8)`,
+		generation, bound, strings.Repeat("a", 64), strings.Repeat("b", 64),
+		strings.Repeat("c", 64), strings.Repeat("d", 64), strings.Repeat("e", 64),
+		strings.Repeat("f", 64)); err != nil {
 		t.Fatalf("write cutover authority: %v", err)
+	}
+}
+
+// seedServingGeneration records the pinned generation row the authority is
+// admitted against.
+func seedServingGeneration(t *testing.T, pool *pgxpool.Pool, generation string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,sha256)
+ VALUES('stoarama',$1,'gen-etag',1,'registry',repeat('0',64)) ON CONFLICT(bucket,object_key) DO NOTHING`,
+		globalDeliveryPrefix+"public/generations/"+generation+".json"); err != nil {
+		t.Fatalf("seed serving generation: %v", err)
 	}
 }
 
@@ -392,13 +409,15 @@ func TestDeliveryPageRetirementRequiresAuthorityAndDerivedDeadline(t *testing.T)
 	ctx := context.Background()
 	generation := repeatHex('d', 32)
 
+	seedServingGeneration(t, pool, generation)
 	// Authority before quiesce proves nothing about the cutover, so it is refused.
 	authority := func(transferBound string) error {
 		_, err := pool.Exec(ctx, `INSERT INTO r2_delivery_cutover_authority(
  generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
- legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,transfer_bound_at,approved_sha256)
+ legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,
+ transfer_bound_at,transfer_evidence_sha256,approval_sha256)
  VALUES($1,'test',clock_timestamp()-interval '10 minutes',repeat('a',64),clock_timestamp()-interval '10 minutes',
-   repeat('a',64),clock_timestamp()-interval '10 minutes',repeat('a',64),repeat('a',64),clock_timestamp()+$2::interval,repeat('a',64))`,
+   repeat('b',64),clock_timestamp()-interval '10 minutes',repeat('c',64),repeat('d',64),clock_timestamp()+$2::interval,repeat('e',64),repeat('f',64))`,
 			generation, transferBound)
 		return err
 	}
@@ -553,5 +572,49 @@ func TestDeliveryPublicLockMatchesSQL(t *testing.T) {
 	}
 	if sqlLock != deliveryPublicLock {
 		t.Fatalf("Go deliveryPublicLock %d != SQL r2_delivery_public_lock() %d", deliveryPublicLock, sqlLock)
+	}
+}
+
+// TestDeliveryPageRetirementAuthorityBindsServingGeneration: the authority row is
+// bound to the live serving registry generation, not to a second string the
+// caller picks, and one artifact cannot stand in for several facts.
+func TestDeliveryPageRetirementAuthorityBindsServingGeneration(t *testing.T) {
+	pool := deliveryExemptionTestPool(t)
+	ctx := context.Background()
+	serving := repeatHex('a', 32)
+	other := repeatHex('9', 32)
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: generation binding')`); err != nil {
+		t.Fatal(err)
+	}
+	insert := func(generation string, grant, origin, cache, rollback, transfer, approval string) error {
+		_, err := pool.Exec(ctx, `INSERT INTO r2_delivery_cutover_authority(
+ generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
+ legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,
+ transfer_bound_at,transfer_evidence_sha256,approval_sha256)
+ VALUES($1,'test',clock_timestamp()-interval '10 minutes',$2,clock_timestamp()-interval '10 minutes',$3,
+  clock_timestamp()-interval '10 minutes',$4,$5,clock_timestamp()-interval '10 minutes',$6,$7)`,
+			generation, grant, origin, cache, rollback, transfer, approval)
+		return err
+	}
+	// No live serving generation row: the authority cannot be bound, so it is refused.
+	if err := insert(serving, repeatHex('1', 64), repeatHex('2', 64), repeatHex('3', 64), repeatHex('4', 64), repeatHex('5', 64), repeatHex('6', 64)); err == nil || !strings.Contains(err.Error(), "live serving registry generation") {
+		t.Fatalf("authority with no live serving generation was accepted: %v", err)
+	}
+	seedServingGeneration(t, pool, serving)
+	// A generation other than the live serving one is refused.
+	if err := insert(other, repeatHex('1', 64), repeatHex('2', 64), repeatHex('3', 64), repeatHex('4', 64), repeatHex('5', 64), repeatHex('6', 64)); err == nil || !strings.Contains(err.Error(), "not the live serving generation") {
+		t.Fatalf("authority for a non-serving generation was accepted: %v", err)
+	}
+	// One artifact reused for several facts is refused.
+	if err := insert(serving, repeatHex('1', 64), repeatHex('1', 64), repeatHex('3', 64), repeatHex('4', 64), repeatHex('5', 64), repeatHex('6', 64)); err == nil {
+		t.Fatal("authority reused one evidence digest for two facts")
+	}
+	// The approval digest may not equal an evidence digest.
+	if err := insert(serving, repeatHex('1', 64), repeatHex('2', 64), repeatHex('3', 64), repeatHex('4', 64), repeatHex('5', 64), repeatHex('1', 64)); err == nil {
+		t.Fatal("authority reused an evidence digest as the approval digest")
+	}
+	// A complete, distinct, correctly bound record is admitted.
+	if err := insert(serving, repeatHex('1', 64), repeatHex('2', 64), repeatHex('3', 64), repeatHex('4', 64), repeatHex('5', 64), repeatHex('6', 64)); err != nil {
+		t.Fatalf("a complete bound authority was refused: %v", err)
 	}
 }

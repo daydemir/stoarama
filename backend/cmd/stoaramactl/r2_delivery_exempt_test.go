@@ -145,19 +145,36 @@ func (f *nonrawFixture) exempt(t *testing.T, key string) bool {
 // when the page is taken down, recorded for the record on the retirement row.
 const pageGeneration = "0123456789abcdef0123456789abcdef"
 
+// seedServingGeneration records the pinned serving registry row the authority
+// admission trigger binds to, so a fixture's generation is the live one.
+func (f *nonrawFixture) seedServingGeneration(generation string) {
+	f.exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,recording_id,kind,sha256,relative_path)
+ VALUES('stoarama',$1,'gen-etag',1,0,'registry',repeat('0',64),'') ON CONFLICT(bucket,object_key) DO NOTHING`,
+		"datasets/global-street-scores-delivery/47/public/generations/"+generation+".json")
+}
+
+// writeCutoverEvidence inserts reviewed cutover authority with distinct per-fact
+// artifacts and a derived deadline already in the past, for the fixture's
+// generation. It models the operator's reviewed record, not an API observation.
+func (f *nonrawFixture) writeCutoverEvidence(generation string) {
+	f.exec(`INSERT INTO r2_delivery_cutover_authority(
+ generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
+ legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,
+ transfer_bound_at,transfer_evidence_sha256,approval_sha256,deadline_at)
+ VALUES($1,'test: cutover',clock_timestamp()-interval '10 minutes',repeat('a',64),clock_timestamp()-interval '10 minutes',
+  repeat('b',64),clock_timestamp()-interval '10 minutes',repeat('c',64),repeat('d',64),
+  clock_timestamp()-interval '10 minutes',repeat('e',64),repeat('f',64),clock_timestamp()-interval '1 second')`, generation)
+}
+
 // retirePage arms, records reviewed cutover authority whose derived deadline has
 // already passed, and commits the one serving state: exactly the staged path
 // r2-inverse page-quiesce, page-cutover, page-retired runs. The fixture has no
 // readers or capabilities, so the reader/capability drain is already complete;
 // the authority is still required, because an empty ledger is not proof.
 func (f *nonrawFixture) retirePage() {
+	f.seedServingGeneration(pageGeneration)
 	f.exec(`INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: arming the old page down')`)
-	f.exec(`INSERT INTO r2_delivery_cutover_authority(
- generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
- legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,transfer_bound_at,approved_sha256,deadline_at)
- VALUES($1,'test: cutover',clock_timestamp()-interval '10 minutes',repeat('a',64),clock_timestamp()-interval '10 minutes',
-  repeat('a',64),clock_timestamp()-interval '10 minutes',repeat('a',64),repeat('a',64),clock_timestamp()-interval '10 minutes',
-  repeat('a',64),clock_timestamp()-interval '1 second')`, pageGeneration)
+	f.writeCutoverEvidence(pageGeneration)
 	f.exec(`INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,'test: the old page is down')`, pageGeneration)
 }
 
@@ -981,13 +998,9 @@ func TestR2NonrawPageRetiredRefusesLiveTickets(t *testing.T) {
 	if _, err := retire(); err == nil || !strings.Contains(err.Error(), "cutover authority") {
 		t.Fatalf("retirement without cutover authority was not refused: %v", err)
 	}
-	// Reviewed authority whose derived deadline is already past.
-	f.exec(`INSERT INTO r2_delivery_cutover_authority(
- generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
- legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,transfer_bound_at,approved_sha256,deadline_at)
- VALUES($1,'test: cutover',clock_timestamp()-interval '10 minutes',repeat('a',64),clock_timestamp()-interval '10 minutes',
-  repeat('a',64),clock_timestamp()-interval '10 minutes',repeat('a',64),repeat('a',64),clock_timestamp()-interval '10 minutes',
-  repeat('a',64),clock_timestamp()-interval '1 second')`, pageGeneration)
+	// Reviewed authority bound to the live serving generation, deadline already past.
+	f.seedServingGeneration(pageGeneration)
+	f.writeCutoverEvidence(pageGeneration)
 	var retired bool
 	if _, err := retire(); err == nil || !strings.Contains(err.Error(), "unexpired") {
 		t.Fatalf("retirement ignored a live recorded capability: %v", err)
@@ -1290,14 +1303,11 @@ func TestR2NonrawPageRetirementStagedProof(t *testing.T) {
 	f.exec(`INSERT INTO r2_delivery_public_readers(reader_id,expires_at) VALUES(repeat('a',32),clock_timestamp()+interval '2 minutes')`)
 	f.exec(`INSERT INTO r2_delivery_download_tickets(bucket,object_key,etag,size_bytes,object_path_sha256,expires_at) VALUES('stoarama','x','e',1,repeat('a',64),clock_timestamp()+interval '2 minutes')`)
 	f.exec(`INSERT INTO r2_delivery_page_quiesce(reason) VALUES('test: staged proof')`)
-	// Reviewed cutover authority whose derived deadline already passed, so the
-	// only remaining holds are the live reader and the live capability.
-	f.exec(`INSERT INTO r2_delivery_cutover_authority(
- generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
- legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,transfer_bound_at,approved_sha256,deadline_at)
- VALUES($1,'test: cutover',clock_timestamp()-interval '10 minutes',repeat('a',64),clock_timestamp()-interval '10 minutes',
-  repeat('a',64),clock_timestamp()-interval '10 minutes',repeat('a',64),repeat('a',64),clock_timestamp()-interval '10 minutes',
-  repeat('a',64),clock_timestamp()-interval '1 second')`, pageGeneration)
+	// Reviewed cutover authority bound to the live serving generation, deadline
+	// already past, so the only remaining holds are the live reader and the live
+	// capability.
+	f.seedServingGeneration(pageGeneration)
+	f.writeCutoverEvidence(pageGeneration)
 	if _, err := retire(); err == nil || !strings.Contains(err.Error(), "admitted public readers") {
 		t.Fatalf("retirement with a live reader was not refused: %v", err)
 	}
@@ -1405,5 +1415,48 @@ func TestR2NonrawExemptionSizeDriftRefusedAtValidate(t *testing.T) {
 	drifted := []deliveryExemptionRow{{Bucket: "stoarama", ObjectKey: f.key, ETag: "collated-etag", SizeBytes: 901}}
 	if n, vErr := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptOutsideWindow, drifted, picks); vErr == nil || n != 0 {
 		t.Fatalf("a size-drifted roster validated: %d %v", n, vErr)
+	}
+}
+
+// TestDeliveryCutoverCanonicalPreservesSubsecondAndDistinctEvidence: the approval
+// digest covers the exact instants the row stores (RFC3339Nano, no truncation),
+// and the record requires a distinct artifact per fact including the transfer.
+func TestDeliveryCutoverCanonicalPreservesSubsecondAndDistinctEvidence(t *testing.T) {
+	f := newNonrawFixture(t, "exempt_cutover_canonical")
+	base := time.Date(2026, 11, 20, 1, 2, 3, 456789000, time.UTC)
+	e := deliveryCutoverEvidence{
+		Generation:              pageGeneration,
+		Decision:                "test: canonical",
+		LegacyGrantBoundaryAt:   base,
+		LegacySignedGrantSHA256: strings.Repeat("a", 64),
+		LegacyOriginRemovedAt:   base.Add(time.Second),
+		LegacyOriginEvidenceSHA: strings.Repeat("b", 64),
+		CacheExpiredAt:          base.Add(2 * time.Second),
+		CacheEvidenceSHA256:     strings.Repeat("c", 64),
+		RollbackRoutingSHA256:   strings.Repeat("d", 64),
+		TransferBoundAt:         base.Add(3 * time.Second),
+		TransferEvidenceSHA256:  strings.Repeat("e", 64),
+	}
+	canonical, err := e.canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The canonical bytes carry full subsecond precision, so the approval digest
+	// names the same instant the row stores.
+	if !strings.Contains(string(canonical), "2026-11-20T01:02:03.456789Z") {
+		t.Fatalf("canonical bytes truncated the instant: %s", canonical)
+	}
+	sum := sha256.Sum256(canonical)
+	approved := hex.EncodeToString(sum[:])
+	// A reused evidence digest is refused before any insert.
+	e.CacheEvidenceSHA256 = e.TransferEvidenceSHA256
+	if _, err := recordDeliveryCutover(f.ctx, f.pool, e, approved); err == nil || !strings.Contains(err.Error(), "reused") {
+		t.Fatalf("a reused evidence digest was accepted: %v", err)
+	}
+	// Restore it; a distinct record is still refused here only because the
+	// authority must follow arming, proving the command cannot precede quiesce.
+	e.CacheEvidenceSHA256 = strings.Repeat("c", 64)
+	if _, err := recordDeliveryCutover(f.ctx, f.pool, e, approved); err == nil || !strings.Contains(err.Error(), "quiesce") {
+		t.Fatalf("authority before quiesce was accepted: %v", err)
 	}
 }

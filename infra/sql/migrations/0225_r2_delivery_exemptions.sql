@@ -63,31 +63,39 @@ CREATE TABLE r2_delivery_page_quiesce (
 
 -- The reviewed, immutable cutover evidence: the ONE place the facts the API
 -- cannot observe are recorded, and the only thing that lets a retirement be
--- proved at all. Every field is a fact an operator established outside this
--- database and pinned by digest; none of them is inferred from the API's own
--- request traffic.
+-- proved at all. Every field is an artifact the operator produced outside this
+-- database, pinned by its own digest; none is inferred from the API's traffic,
+-- and no timestamp stands in for an artifact.
 --
---   * generation is the exact serving registry generation being retired, so the
---     authority is bound to one generation and cannot be reused for another;
+-- Provenance, stated plainly: this table records that an operator produced and
+-- pinned reviewed evidence. It does not verify production routing or a completed
+-- download from inside PostgreSQL, and a DBA who can format hex can write any
+-- row. The gate below is therefore only as strong as the reviewed sequence that
+-- wrote this row, documented in docs/r2-inverse.md; if that sequence was not
+-- actually performed, the honest state is that confident_repair and every
+-- derivative release stay closed.
+--
+--   * generation is the exact serving registry generation being retired. The
+--     admission trigger requires it to equal the live public registry's own
+--     generation while the page still serves, so it cannot be a second string the
+--     caller asserts. Retirement then compares against this same row;
 --   * legacy_grant_boundary_at is the LAST INSTANT a legacy origin could have
---     handed out a five-minute signed URL. It is the exact expiry of the last
---     grant the operator can still prove, and it must already be in the past;
---   * legacy_signed_grant_sha256 pins the list of those grants;
---   * legacy_origin_removed_at plus legacy_origin_evidence_sha256 pin that every
---     legacy origin is out of traffic (off-host check, recorded);
---   * cache_expired_at plus cache_evidence_sha256 pin that every edge/origin
---     cache that could still answer for the retired page is known expired;
---   * rollback_routing_sha256 pins the non-serving rollback routing, so there is
---     no route back to a legacy origin after arming;
---   * transfer_bound_at is the authoritatively verified end of every active
---     transfer the operator can observe, direct-from-R2 included. When a bound
---     is unproven this row simply cannot be written with a sound value, and the
---     retirement gate stays closed. That is the intended outcome, not a bug:
---     there is no provider-side byte clock here to fabricate one from.
+--     handed out a five-minute signed URL, and legacy_signed_grant_sha256 pins
+--     the grant-list artifact it was derived from;
+--   * legacy_origin_removed_at plus legacy_origin_evidence_sha256 pin the off-host
+--     evidence artifact that every legacy origin is out of traffic;
+--   * cache_expired_at plus cache_evidence_sha256 pin the cache-purge artifact;
+--   * rollback_routing_sha256 pins the non-serving rollback routing artifact;
+--   * transfer_evidence_sha256 pins the artifact that establishes the end of
+--     every active transfer, direct-from-R2 included, and transfer_bound_at is
+--     the instant read from THAT artifact. A bare timestamp with no artifact is
+--     refused: a timestamp is not evidence.
 --
--- approved_sha256 is the digest the operator reviews before the row exists: it
--- covers every field above plus the generation, so the approval names the exact
--- bytes of the evidence and not a paraphrase of them.
+-- approval_sha256 is the second, distinct digest: it is over the canonical bytes
+-- of the whole evidence record as the operator reviewed them, so the operator's
+-- approval names exact bytes. It is NOT one of the per-fact evidence digests,
+-- and holding it proves nothing about production; it only proves the operator
+-- approved exactly these fields.
 CREATE TABLE r2_delivery_cutover_authority (
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
  generation text NOT NULL CHECK(generation ~ '^[a-f0-9]{32}$'),
@@ -100,17 +108,32 @@ CREATE TABLE r2_delivery_cutover_authority (
  cache_evidence_sha256 text NOT NULL CHECK(cache_evidence_sha256 ~ '^[a-f0-9]{64}$'),
  rollback_routing_sha256 text NOT NULL CHECK(rollback_routing_sha256 ~ '^[a-f0-9]{64}$'),
  transfer_bound_at timestamptz NOT NULL,
- approved_sha256 text NOT NULL CHECK(approved_sha256 ~ '^[a-f0-9]{64}$'),
+ transfer_evidence_sha256 text NOT NULL CHECK(transfer_evidence_sha256 ~ '^[a-f0-9]{64}$'),
+ approval_sha256 text NOT NULL CHECK(approval_sha256 ~ '^[a-f0-9]{64}$'),
+ -- Every per-fact digest must be distinct from the approval digest and from each
+ -- other: one artifact cannot stand in for four different facts, and an approval
+ -- is not an evidence artifact.
+ CHECK (legacy_signed_grant_sha256 <> legacy_origin_evidence_sha256
+   AND legacy_signed_grant_sha256 <> cache_evidence_sha256
+   AND legacy_signed_grant_sha256 <> rollback_routing_sha256
+   AND legacy_signed_grant_sha256 <> transfer_evidence_sha256
+   AND legacy_origin_evidence_sha256 <> cache_evidence_sha256
+   AND legacy_origin_evidence_sha256 <> rollback_routing_sha256
+   AND legacy_origin_evidence_sha256 <> transfer_evidence_sha256
+   AND cache_evidence_sha256 <> rollback_routing_sha256
+   AND cache_evidence_sha256 <> transfer_evidence_sha256
+   AND rollback_routing_sha256 <> transfer_evidence_sha256
+   AND approval_sha256 <> legacy_signed_grant_sha256
+   AND approval_sha256 <> legacy_origin_evidence_sha256
+   AND approval_sha256 <> cache_evidence_sha256
+   AND approval_sha256 <> rollback_routing_sha256
+   AND approval_sha256 <> transfer_evidence_sha256),
  recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
- -- The derived retirement deadline is the latest instant any legacy grant or
- -- verified active transfer can still be alive. It is computed here, once, from
- -- those exact fields with a database-clock margin, and never from a constant in
- -- the server: a hardcoded transfer bound would be a guess, and this table
- -- refuses to hold one.
- -- Computed ONCE by the admission trigger below from exactly those four facts, so
- -- it cannot drift after the row exists and cannot be supplied by a caller.
+ -- Computed ONCE by the admission trigger from exactly the four evidenced facts,
+ -- so it cannot drift after the row exists and cannot be supplied by a caller.
  deadline_at timestamptz NOT NULL
 );
+
 -- One admitted public response, from before its first byte to after its last
 -- socket write. A response records itself here before it reads a registry, a
 -- metadata asset, a ticket or a file, and deletes the row after its body is
@@ -368,6 +391,9 @@ BEGIN
   RAISE EXCEPTION 'page retirement requires reviewed cutover authority'
    USING ERRCODE='55000', HINT='no authority row: legacy grants, origins, caches and transfers are unproven, so retirement (and every derivative release) stays closed';
  END IF;
+ -- The retired generation must be the authority's, and the authority is only
+ -- admitted when it equals the live serving registry generation, so this is one
+ -- bound fact rather than two caller strings agreeing.
  IF a.generation<>NEW.generation THEN
   RAISE EXCEPTION 'cutover authority names generation %, not the retired %', a.generation, NEW.generation
    USING ERRCODE='55000';
@@ -411,6 +437,7 @@ ALTER TABLE r2_delivery_page_retirement ENABLE ALWAYS TRIGGER r2_delivery_page_r
 -- cannot be a time in the future when the evidence is written. Both refusals are
 -- SQL, so a caller's paraphrase cannot satisfy them.
 CREATE FUNCTION guard_r2_delivery_cutover_authority() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE serving text;
 BEGIN
  IF current_setting('transaction_isolation')<>'read committed' THEN
   RAISE EXCEPTION 'cutover authority requires READ COMMITTED' USING ERRCODE='55000';
@@ -420,13 +447,29 @@ BEGIN
   RAISE EXCEPTION 'cutover authority requires the committed quiesce state'
    USING ERRCODE='55000', HINT='arm the page first; authority recorded before arming proves nothing about the cutover';
  END IF;
+ -- Bind the authority to the generation the public page was actually serving, not
+ -- to a second string the caller asserts. The row is admitted only while it still
+ -- equals the live registry generation recorded by the last successful load (the
+ -- delivery_keep_holds registry row), so a mismatched or invented generation is
+ -- refused here rather than surfacing later as a caller-string comparison.
+ SELECT h.object_key INTO serving FROM delivery_keep_holds h
+  WHERE h.bucket='stoarama' AND h.object_key LIKE 'datasets/global-street-scores-delivery/47/public/generations/%'
+  ORDER BY h.imported_at DESC LIMIT 1;
+ IF serving IS NULL THEN
+  RAISE EXCEPTION 'cutover authority requires a live serving registry generation'
+   USING ERRCODE='55000', HINT='no pinned generation row was loaded; retiring cannot be bound to a serving generation';
+ END IF;
+ IF NEW.generation <> substring(serving from '([a-f0-9]{32})') THEN
+  RAISE EXCEPTION 'cutover authority generation % is not the live serving generation', NEW.generation
+   USING ERRCODE='55000';
+ END IF;
  IF NEW.transfer_bound_at > clock_timestamp() THEN
   RAISE EXCEPTION 'verified transfer bound % is in the future; it is not verified evidence', NEW.transfer_bound_at;
  END IF;
  IF NEW.legacy_origin_removed_at > clock_timestamp() OR NEW.cache_expired_at > clock_timestamp() THEN
   RAISE EXCEPTION 'legacy origin removal and cache expiry must already have happened';
  END IF;
- -- Derived here, once, from the four on-record facts plus the five-minute legacy
+ -- Derived here, once, from the four evidenced facts plus the five-minute legacy
  -- grant window. A caller-supplied deadline is overwritten, never trusted.
  NEW.deadline_at := greatest(NEW.legacy_grant_boundary_at, NEW.legacy_origin_removed_at,
   NEW.cache_expired_at, NEW.transfer_bound_at) + interval '5 minutes';

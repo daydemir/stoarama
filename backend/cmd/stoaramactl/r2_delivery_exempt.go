@@ -649,10 +649,22 @@ type deliveryCutoverEvidence struct {
 	CacheEvidenceSHA256     string    `json:"cache_evidence_sha256"`
 	RollbackRoutingSHA256   string    `json:"rollback_routing_sha256"`
 	TransferBoundAt         time.Time `json:"transfer_bound_at"`
+	// TransferEvidenceSHA256 pins the artifact the bound instant was read from.
+	// A timestamp with no artifact is not evidence, so this is required.
+	TransferEvidenceSHA256 string `json:"transfer_evidence_sha256"`
 }
 
-// canonical is the exact byte sequence approved_sha256 covers: sorted keys,
-// RFC3339 UTC timestamps. It is what the operator reviews and pins.
+// canonicalInstant is the ONE timestamp rendering the approval digest and the
+// SQL row share. RFC3339Nano preserves subsecond precision, so canonicalizing
+// here never truncates an instant the database then stores at full precision:
+// the bytes the operator approved and the row the gate reads are the same.
+func canonicalInstant(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+
+// canonical is the exact byte sequence approval_sha256 covers: fixed field order,
+// canonical instants, and every per-fact evidence digest plus the transfer
+// evidence digest. It is what the operator reviews and pins, and it is computed
+// from the same values recordDeliveryCutover inserts, so approval and row can
+// never disagree.
 func (e deliveryCutoverEvidence) canonical() ([]byte, error) {
 	type doc struct {
 		Generation              string `json:"generation"`
@@ -665,12 +677,13 @@ func (e deliveryCutoverEvidence) canonical() ([]byte, error) {
 		CacheEvidenceSHA256     string `json:"cache_evidence_sha256"`
 		RollbackRoutingSHA256   string `json:"rollback_routing_sha256"`
 		TransferBoundAt         string `json:"transfer_bound_at"`
+		TransferEvidenceSHA256  string `json:"transfer_evidence_sha256"`
 	}
 	return json.Marshal(doc{e.Generation, e.Decision,
-		e.LegacyGrantBoundaryAt.UTC().Format(time.RFC3339), e.LegacySignedGrantSHA256,
-		e.LegacyOriginRemovedAt.UTC().Format(time.RFC3339), e.LegacyOriginEvidenceSHA,
-		e.CacheExpiredAt.UTC().Format(time.RFC3339), e.CacheEvidenceSHA256,
-		e.RollbackRoutingSHA256, e.TransferBoundAt.UTC().Format(time.RFC3339)})
+		canonicalInstant(e.LegacyGrantBoundaryAt), e.LegacySignedGrantSHA256,
+		canonicalInstant(e.LegacyOriginRemovedAt), e.LegacyOriginEvidenceSHA,
+		canonicalInstant(e.CacheExpiredAt), e.CacheEvidenceSHA256,
+		e.RollbackRoutingSHA256, canonicalInstant(e.TransferBoundAt), e.TransferEvidenceSHA256})
 }
 
 // recordDeliveryCutover writes the reviewed cutover authority for one generation,
@@ -682,10 +695,24 @@ func recordDeliveryCutover(ctx context.Context, pool *pgxpool.Pool, e deliveryCu
 	if !r2RetireLowerHex32(e.Generation) || strings.TrimSpace(e.Decision) == "" {
 		return nil, errors.New("cutover authority needs the serving generation and the owner decision")
 	}
-	for _, h := range []string{e.LegacySignedGrantSHA256, e.LegacyOriginEvidenceSHA, e.CacheEvidenceSHA256, e.RollbackRoutingSHA256} {
+	for _, h := range []string{e.LegacySignedGrantSHA256, e.LegacyOriginEvidenceSHA, e.CacheEvidenceSHA256, e.RollbackRoutingSHA256, e.TransferEvidenceSHA256} {
 		if !r2RetireLowerHex64(h) {
-			return nil, errors.New("cutover authority needs a 64-hex digest for every evidence field")
+			return nil, errors.New("cutover authority needs a 64-hex digest for every evidence field, including the transfer artifact")
 		}
+	}
+	// Distinct artifacts, not one digest reused for several facts.
+	seen := map[string]string{}
+	for name, h := range map[string]string{
+		"legacy_signed_grant": e.LegacySignedGrantSHA256,
+		"legacy_origin":       e.LegacyOriginEvidenceSHA,
+		"cache":               e.CacheEvidenceSHA256,
+		"rollback_routing":    e.RollbackRoutingSHA256,
+		"transfer":            e.TransferEvidenceSHA256,
+	} {
+		if prev, dup := seen[h]; dup {
+			return nil, fmt.Errorf("evidence digest %s is reused for %s and %s; each fact needs its own artifact", h, prev, name)
+		}
+		seen[h] = name
 	}
 	canonical, err := e.canonical()
 	if err != nil {
@@ -698,15 +725,18 @@ func recordDeliveryCutover(ctx context.Context, pool *pgxpool.Pool, e deliveryCu
 	if e.TransferBoundAt.After(time.Now().UTC()) || e.LegacyOriginRemovedAt.After(time.Now().UTC()) || e.CacheExpiredAt.After(time.Now().UTC()) {
 		return nil, errors.New("legacy grant, origin, cache and transfer facts must already be in the past")
 	}
+	// Insert the EXACT canonical instants the approval covered, at full precision,
+	// so the row and the approved bytes name the same instant.
 	var at, deadline string
 	err = pool.QueryRow(ctx, `INSERT INTO r2_delivery_cutover_authority(
  generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
- legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,transfer_bound_at,approved_sha256,deadline_at)
- VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'1970-01-01T00:00:00Z')
+ legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,transfer_bound_at,transfer_evidence_sha256,approval_sha256,deadline_at)
+ VALUES($1,$2,$3::timestamptz,$4,$5::timestamptz,$6,$7::timestamptz,$8,$9,$10::timestamptz,$11,$12,'1970-01-01T00:00:00Z')
  RETURNING recorded_at::text,deadline_at::text`,
-		e.Generation, e.Decision, e.LegacyGrantBoundaryAt, e.LegacySignedGrantSHA256,
-		e.LegacyOriginRemovedAt, e.LegacyOriginEvidenceSHA, e.CacheExpiredAt,
-		e.CacheEvidenceSHA256, e.RollbackRoutingSHA256, e.TransferBoundAt, approvedSHA).Scan(&at, &deadline)
+		e.Generation, e.Decision, canonicalInstant(e.LegacyGrantBoundaryAt), e.LegacySignedGrantSHA256,
+		canonicalInstant(e.LegacyOriginRemovedAt), e.LegacyOriginEvidenceSHA, canonicalInstant(e.CacheExpiredAt),
+		e.CacheEvidenceSHA256, e.RollbackRoutingSHA256, canonicalInstant(e.TransferBoundAt),
+		e.TransferEvidenceSHA256, approvedSHA).Scan(&at, &deadline)
 	if err != nil {
 		return nil, fmt.Errorf("cutover authority refused: %w", err)
 	}
