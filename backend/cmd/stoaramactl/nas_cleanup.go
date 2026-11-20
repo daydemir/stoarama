@@ -26,6 +26,10 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 		runNASCleanupVerifyRecovery(ctx, cfg, args[1:])
 		return
 	}
+	if args[0] == "master" {
+		runNASCleanupMaster(ctx, cfg, args[1:])
+		return
+	}
 	fs := flag.NewFlagSet("nas-cleanup "+args[0], flag.ExitOnError)
 	input := fs.String("input", "", "JSON {label,items:[{kind,source_id}]}; prepare only")
 	id := fs.Int64("plan-id", 0, "exact plan id")
@@ -169,7 +173,7 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 	}
 }
 
-const nasCleanupUsage = "usage: nas-cleanup prepare|report|verify-recovery|pause|enable|resume-dry-run|recheck|close|retire-superseded|enable-batch|pause-batch|batch-report"
+const nasCleanupUsage = "usage: nas-cleanup master|prepare|report|verify-recovery|pause|enable|resume-dry-run|recheck|close|retire-superseded|enable-batch|pause-batch|batch-report"
 
 // nasCleanupBatchManifest validates a batch manifest and recomputes its
 // digest exactly as the backend does (cleanupBatchDigest): sha256 over

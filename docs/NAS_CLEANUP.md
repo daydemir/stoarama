@@ -63,12 +63,41 @@ does not satisfy enable: every item must finish a fresh, permitting dry run.
 
 Two independent gates remain OFF during preparation:
 
-1. Backend `NAS_CLEANUP_DELETION_ENABLED` defaults false.
+1. The backend deletion master switch defaults OFF (below).
 2. A plan defaults `dry_run`. Explicit `nas-cleanup enable` requires its exact
    `--expected-plan-sha256`, `--reason`, a complete matching dry run less than 24 hours
    old, and full R2 recovery (with ETag evidence) for every item. Approval
    expires after `--approval-hours` (default 2; 1..24, above 4 only with
    `--allow-long-approval`), or approve a whole batch of plans at once (below).
+
+### Deletion master switch
+
+The master switch is the durable DB control `nas_cleanup_master` (migration
+0229), not configuration. Deploys and restarts never change it, so a cleanup
+plan and backend deploys can interleave. The former Render env var
+`NAS_CLEANUP_DELETION_ENABLED` is inert. Only the controller flips it, through
+the service-token CLI:
+
+```sh
+stoaramactl nas-cleanup master status
+stoaramactl nas-cleanup master on --reason "run batch 12"
+stoaramactl nas-cleanup master off --reason "batch 12 finished"
+```
+
+`on`/`off` require a reason, print the before and after state, and are
+idempotent: repeating the current state changes nothing. Every change appends
+an immutable `nas_cleanup_master_history` row (time, actor `user@host`, old and
+new state, reason); history and control rows cannot be deleted, truncated or
+edited outside that path, and the triggers are `ENABLE ALWAYS`.
+
+The API reads the switch live, inside the same transaction as each decision it
+guards (plan and batch enable, batch advance, execution lease, permit issue and
+permit replay), and never caches it. It reads `FOR SHARE`, so turning it off
+waits for any in-flight decision that already read ON; once `master off`
+returns, no further lease or permit is issued. A missing or unreadable control
+reads as OFF. Plan and batch reports keep `master_deletion_enabled`. Turning it
+on bypasses nothing: plan approval, batch digests, the 5 TB/day cap and per-file
+permits are unchanged.
 
 ### Belt-and-braces safeguards (safety council, 2026-11)
 

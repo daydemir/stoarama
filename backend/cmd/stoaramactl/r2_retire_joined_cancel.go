@@ -385,11 +385,8 @@ func runR2JoinedWriterCancel(ctx context.Context, cfg config.Config, args []stri
 		if live != 1 {
 			return errors.New("live deployment identity ambiguous")
 		}
-		status, b, e = r2JoinedProviderRead(ctx, "https://api.render.com/v1/services/srv-d6usqn94tr6s73d94cd0/env-vars/NAS_CLEANUP_DELETION_ENABLED", renderKey)
-		var env struct {
-			Value string `json:"value"`
-		}
-		if e != nil || status != 200 || json.Unmarshal(b, &env) != nil || env.Value != "false" {
+		var masterOn bool
+		if e = pool.QueryRow(ctx, `SELECT enabled FROM nas_cleanup_master`).Scan(&masterOn); e != nil || masterOn {
 			return errors.New("configured cleanup master is not OFF")
 		}
 		var latest int64

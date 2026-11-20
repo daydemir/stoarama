@@ -16,7 +16,7 @@ func TestNASCleanupContradictoryRefusalBecomesUncertain(t *testing.T) {
 				f := newCleanupFixture(t, 24)
 				pid, sha, _ := f.admit("contradictory-refusal", syntheticFiles(100, 2, 2))
 				f.dryRun()
-				f.s.cfg.NASCleanupDeletionEnabled = true
+				setCleanupMaster(t, f.s, true)
 				if code, body := f.enableBatch([]int64{pid}, []string{sha}, 2); code != 200 {
 					t.Fatalf("enable: %d %s", code, body)
 				}
@@ -94,7 +94,7 @@ func TestNASCleanupRefusalsAreTerminal(t *testing.T) {
 					f := newCleanupFixture(t, 24)
 					pid, sha, _ := f.admit("terminal-refusal", syntheticFiles(100, 2, 2))
 					f.dryRun()
-					f.s.cfg.NASCleanupDeletionEnabled = true
+					setCleanupMaster(t, f.s, true)
 					if batchPlan {
 						if code, body := f.enableBatch([]int64{pid}, []string{sha}, 2); code != 200 {
 							t.Fatalf("enable: %d %s", code, body)
@@ -172,7 +172,7 @@ func TestNASCleanupLateRefusalContradictionStopsAdvancedBatch(t *testing.T) {
 			p1, sha1, _ := f.admit("refused", syntheticFiles(100, 1, 2))
 			p2, sha2, _ := f.admit("successor", syntheticFiles(200, 1, 2))
 			f.dryRun()
-			f.s.cfg.NASCleanupDeletionEnabled = true
+			setCleanupMaster(t, f.s, true)
 			if code, body := f.enableBatch([]int64{p1, p2}, []string{sha1, sha2}, 2); code != 200 {
 				t.Fatalf("enable: %d %s", code, body)
 			}
@@ -219,7 +219,7 @@ func TestNASCleanupDurableRefusalsDoNotPause(t *testing.T) {
 				f := newCleanupFixture(t, 24)
 				id, sha, _ := f.admit("refusal", syntheticFiles(100, 2, 2))
 				f.dryRun()
-				f.s.cfg.NASCleanupDeletionEnabled = true
+				setCleanupMaster(t, f.s, true)
 				if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 					t.Fatalf("enable: %d %s", code, body)
 				}

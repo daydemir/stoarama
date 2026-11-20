@@ -163,7 +163,7 @@ func TestNASCleanupSupersededPlansAreInertAndRetire(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
 	s := &Server{pool: pool}
-	s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, s, true)
 	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');
  INSERT INTO nas_cleanup_frozen_streams(plan_id,stream_id,validated) VALUES(5,3,true);
  INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode,approved_until,approval_reason) VALUES

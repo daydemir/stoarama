@@ -357,7 +357,7 @@ func (s *Server) handleAdminNASCleanupStatus(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, 404, "cleanup plan unavailable")
 		return
 	}
-	util.WriteJSON(w, 200, map[string]any{"id": id, "label": label, "plan_sha256": sha, "policy_sha256": binding, "policy_current": binding == cleanupPolicySHA, "mode": mode, "allow_nas_only": allow, "approval_reason": reason, "approved_until": until, "priority": priority, "items": json.RawMessage(manifest), "states": json.RawMessage(jsonStates), "master_deletion_enabled": s.cfg.NASCleanupDeletionEnabled, "results": json.RawMessage(results)})
+	util.WriteJSON(w, 200, map[string]any{"id": id, "label": label, "plan_sha256": sha, "policy_sha256": binding, "policy_current": binding == cleanupPolicySHA, "mode": mode, "allow_nas_only": allow, "approval_reason": reason, "approved_until": until, "priority": priority, "items": json.RawMessage(manifest), "states": json.RawMessage(jsonStates), "master_deletion_enabled": cleanupMasterOn(r.Context(), s.pool), "results": json.RawMessage(results)})
 }
 
 // Arming is deliberately not automatic. It requires the exact digest and a
@@ -402,12 +402,6 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 			return
 		}
 	}
-	// Backend independent master switch defaults OFF even if an operator arms a
-	// batch. Setting it is a separate explicit deployment/configuration action.
-	if req.Mode == "enabled" && !s.cfg.NASCleanupDeletionEnabled {
-		util.WriteError(w, 409, "NAS deletion master switch is off")
-		return
-	}
 	ctx := r.Context()
 	tx, err := s.pool.BeginTx(ctx, nasCleanupAdmissionOptions)
 	if err != nil {
@@ -422,6 +416,12 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 		}
 	}()
 	if req.Mode == "enabled" {
+		// The independent master switch defaults OFF even if an operator arms a
+		// plan. Changing it is a separate audited `nas-cleanup master` action.
+		if !cleanupMasterOn(ctx, tx) {
+			util.WriteError(w, 409, "NAS deletion master switch is off")
+			return
+		}
 		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
 			util.WriteError(w, 500, "public cleanup fence failed")
 			return
@@ -773,7 +773,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, 500, "cleanup client identity unavailable")
 		return
 	}
-	allowExecution := sessionDeadline.After(time.Now()) && s.cfg.NASCleanupDeletionEnabled && (req.Protocol == 1 || *req.ExecutionFiles > 0)
+	allowExecution := sessionDeadline.After(time.Now()) && cleanupMasterOn(ctx, tx) && (req.Protocol == 1 || *req.ExecutionFiles > 0)
 	// An execution lease that expires without a report is an execution
 	// anomaly: its enabled plan (and its batch) is paused in the same statement.
 	_, err = tx.Exec(ctx, cleanupExpireLeasesSQL, cid, "execution lease expired without a report", plans)
@@ -1130,6 +1130,7 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 		return
 	}
 	defer tx.Rollback(ctx)
+	env.master = cleanupMasterOn(ctx, tx)
 	result := s.cleanupObserveOne(ctx, tx, cid, id, req, env)
 	if cleanupObservationExpired(ctx) {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
@@ -1241,7 +1242,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		// unexpired and the master switch is on; otherwise the caller gets the
 		// non-deleting reconcile answer below.
 		if state == "delete_issued" && req.RequestID != "" && req.Outcome == "match" && permitUntil != nil && permitUntil.After(time.Now()) && nasSpaceAuditJSONEqual(oldOutcome, retryBody) &&
-			mode == "enabled" && until != nil && until.After(time.Now()) && s.stitchDeletionMaster(item) &&
+			mode == "enabled" && until != nil && until.After(time.Now()) && stitchDeletionMaster(env.master, item) &&
 			(!certified || oldRecovery == nasCleanupCertifiedStitchRecovery && cleanupCheckCertifiedStitch(ctx, tx, item, true) == nil &&
 				env.certifiedStitchAbortsAbsent(ctx, tx, item)) {
 			now := time.Now()
@@ -1368,7 +1369,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 					recoveryAnomaly = true
 					policyReason = "R2 MD5/ETag match disagreed with the full SHA-256 audit"
 				}
-				if lease.After(time.Now()) && cleanupMayIssue(mode, s.stitchDeletionMaster(item), until, cleanupSameFileProof(oldProof, req.Proof), recovery) {
+				if lease.After(time.Now()) && cleanupMayIssue(mode, stitchDeletionMaster(env.master, item), until, cleanupSameFileProof(oldProof, req.Proof), recovery) {
 					if certified && !env.certifiedStitchAbortsAbsent(ctx, tx, item) {
 						return cleanupObserveResult{status: 503, body: map[string]any{"error": "aborted staging absence could not be verified", "retryable": true}}
 					}

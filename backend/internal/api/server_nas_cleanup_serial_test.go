@@ -96,7 +96,7 @@ func testNASCleanupSerialClientServer(t *testing.T, joinedSeconds int, grouped b
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			key := int64(5)
 			r = r.WithContext(context.WithValue(r.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: 47, APIKeyID: &key}))
-			if f.s.cfg.NASCleanupDeletionEnabled && (strings.HasSuffix(r.URL.Path, "/observe") || strings.HasSuffix(r.URL.Path, "/observe-batch")) {
+			if cleanupMasterOn(context.Background(), f.s.pool) && (strings.HasSuffix(r.URL.Path, "/observe") || strings.HasSuffix(r.URL.Path, "/observe-batch")) {
 				n := active.Add(1)
 				defer active.Add(-1)
 				for old := peak.Load(); n > old; old = peak.Load() {
@@ -133,7 +133,7 @@ func testNASCleanupSerialClientServer(t *testing.T, joinedSeconds int, grouped b
 		if concurrent {
 			args = append(args, "--simultaneous-tasks", "16", "--max-seconds", "90")
 		}
-		if slowJoined && f.s.cfg.NASCleanupDeletionEnabled {
+		if slowJoined && cleanupMasterOn(context.Background(), f.s.pool) {
 			args = append(args, "--slow-joined-seconds", fmt.Sprint(joinedSeconds))
 			if drainRecovery {
 				args = append(args, "--drain-timeout-recovery", "--max-seconds", "90")
@@ -158,7 +158,7 @@ func testNASCleanupSerialClientServer(t *testing.T, joinedSeconds int, grouped b
 	if dry := run(false); dry.Unlinks != 0 || len(dry.Errors) != 0 {
 		t.Fatalf("dry run: %+v", dry)
 	}
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}

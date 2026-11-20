@@ -686,6 +686,8 @@ func (s *Server) router() http.Handler {
 			service.Post("/service/nas-stitch/readback/validate", s.handleAdminNASStitchReadbackValidate)
 			service.Get("/service/nas-stitch/readback/status", s.handleAdminNASStitchReadbackStatus)
 			service.Post("/service/nas-stitch/corpus", s.handleAdminNASStitchCorpus)
+			service.Get("/service/nas-cleanup/master", s.handleAdminNASCleanupMasterStatus)
+			service.Post("/service/nas-cleanup/master", s.handleAdminNASCleanupMasterSet)
 			service.Post("/service/nas-cleanup/plans", s.handleAdminNASCleanupCreate)
 			service.Get("/service/nas-cleanup/plans/{id}", s.handleAdminNASCleanupStatus)
 			service.Post("/service/nas-cleanup/plans/{id}/control", s.handleAdminNASCleanupControl)

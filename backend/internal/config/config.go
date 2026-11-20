@@ -46,7 +46,6 @@ type Config struct {
 	NASUploadProbeStreams            int
 	NASUploadProbeInterval           time.Duration
 	NASBenchmarkEnabled              bool
-	NASCleanupDeletionEnabled        bool
 	NASR2CopyEnabled                 bool
 	NASStitchProofTaskID             int
 	NASStitchProofActivationID       string
@@ -243,7 +242,6 @@ func Load() (Config, error) {
 		NASUploadProbeStreams:            intEnv("NAS_UPLOAD_PROBE_STREAMS", 4),
 		NASUploadProbeInterval:           durEnv("NAS_UPLOAD_PROBE_INTERVAL", 6*time.Hour),
 		NASBenchmarkEnabled:              boolEnv("NAS_BENCHMARK_ENABLED", true),
-		NASCleanupDeletionEnabled:        boolEnv("NAS_CLEANUP_DELETION_ENABLED", false),
 		NASR2CopyEnabled:                 boolEnv("NAS_R2_COPY_ENABLED", false),
 		NASStitchProofTaskID:             intEnv("NAS_STITCH_PROOF_TASK_ID", 0),
 		NASStitchProofActivationID:       os.Getenv("NAS_STITCH_PROOF_ACTIVATION_ID"),

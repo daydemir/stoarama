@@ -27,7 +27,7 @@ func TestNASCleanupExecutionDeadlineIncludesAuthentication(t *testing.T) {
 			f := newCleanupFixture(t, 24)
 			id, sha, _ := f.admit("auth-budget", syntheticFiles(100, 1, 1))
 			f.dryRun()
-			f.s.cfg.NASCleanupDeletionEnabled = true
+			setCleanupMaster(t, f.s, true)
 			if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 				t.Fatalf("enable: %d %s", code, body)
 			}
@@ -135,7 +135,7 @@ func TestNASCleanupExecutionDeadlineClientServer(t *testing.T) {
 					return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						key := int64(5)
 						r = r.WithContext(context.WithValue(r.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: 47, APIKeyID: &key}))
-						if scenario == "lost-response" && f.s.cfg.NASCleanupDeletionEnabled && strings.HasSuffix(r.URL.Path, "/observe") && !lost.Swap(true) {
+						if scenario == "lost-response" && cleanupMasterOn(context.Background(), f.s.pool) && strings.HasSuffix(r.URL.Path, "/observe") && !lost.Swap(true) {
 							next.ServeHTTP(httptest.NewRecorder(), r)
 							http.Error(w, "lost permit response", 502)
 							return
@@ -177,7 +177,7 @@ func TestNASCleanupExecutionDeadlineClientServer(t *testing.T) {
 				if dry.Unlinks != 0 || len(dry.Errors) != 0 {
 					t.Fatalf("dry run: %+v", dry)
 				}
-				f.s.cfg.NASCleanupDeletionEnabled = true
+				setCleanupMaster(t, f.s, true)
 				if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 					t.Fatalf("enable: %d %s", code, body)
 				}
@@ -254,7 +254,7 @@ func TestNASCleanupExecutionDeadlineIncludesBatchAndLockWait(t *testing.T) {
 				f := newCleanupFixture(t, 24)
 				id, sha, _ := f.admit("bounded", syntheticFiles(100, 1, 1))
 				f.dryRun()
-				f.s.cfg.NASCleanupDeletionEnabled = true
+				setCleanupMaster(t, f.s, true)
 				if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 					t.Fatalf("enable: %d %s", code, body)
 				}
@@ -302,7 +302,7 @@ func TestNASCleanupNeverAttemptedReceiptPreservesSafetyAndDiagnostics(t *testing
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("refused", syntheticFiles(100, 1, 1))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}
@@ -344,7 +344,7 @@ func TestNASCleanupDryRunKeepsRecoveryBudgetAndRefusesEnableRace(t *testing.T) {
 	if r := f.observe(tasks, nil)[0]; r.Status != 200 || r.Action != "would_delete" {
 		t.Fatalf("dry-run budget shortened: %+v", r)
 	}
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}
@@ -354,7 +354,7 @@ func TestNASCleanupDryRunKeepsRecoveryBudgetAndRefusesEnableRace(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(f.ctx)
-	result := f.s.cleanupObserveOne(f.ctx, tx, 13, task.ItemID, cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: task.Attempt, PlanSHA: task.PlanSHA, Outcome: "match", Proof: fixtureProof(task.Item)}, &cleanupObserveEnv{dryRunOnly: true})
+	result := f.s.cleanupObserveOne(f.ctx, tx, 13, task.ItemID, cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: task.Attempt, PlanSHA: task.PlanSHA, Outcome: "match", Proof: fixtureProof(task.Item)}, &cleanupObserveEnv{master: cleanupMasterOn(f.ctx, tx), dryRunOnly: true})
 	if result.status != 503 || result.body["retryable"] != true || result.write {
 		t.Fatalf("issued under dry-run context: %+v", result)
 	}

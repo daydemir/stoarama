@@ -102,7 +102,7 @@ func cleanupObservationFailure(w http.ResponseWriter, ctx context.Context, statu
 }
 
 // cleanupObserveEnv carries per-transaction caches for a batch of
-// observations. The zero value (single-item endpoint) caches nothing.
+// observations, for the single-item and batched endpoints.
 type cleanupObserveEnv struct {
 	executionGroup []int64
 	scopeLocked    bool
@@ -116,6 +116,9 @@ type cleanupObserveEnv struct {
 	// can issue a permit meanwhile.
 	budgetHeld bool
 	issued     int64
+	// master is the deletion master switch, read FOR SHARE in the top-level
+	// transaction (never a savepoint) before any permit decision.
+	master     bool
 	prefetched map[int64]cleanupPrefetchedRecovery
 	// Only exact aborted stages verified by R2 in this observation request.
 	abortedStitchAbsences map[cleanupAbortedStitchTarget]bool
@@ -939,7 +942,8 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		util.WriteJSON(w, 503, map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true})
 		return
 	}
-	if anyEnabled && s.cfg.NASCleanupDeletionEnabled {
+	env.master = cleanupMasterOn(ctx, tx)
+	if anyEnabled && env.master {
 		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupBudgetLock); err == nil {
 			err = tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&env.issued)
 		}
@@ -1344,7 +1348,7 @@ func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
 		}
 		return tx.Commit(ctx)
 	}
-	if !s.cfg.NASCleanupDeletionEnabled {
+	if !cleanupMasterOn(ctx, tx) {
 		return pause("master switch is off")
 	}
 	if until == nil || !until.After(time.Now().Add(time.Minute)) {
@@ -1397,10 +1401,6 @@ func (s *Server) handleAdminNASCleanupBatchEnable(w http.ResponseWriter, r *http
 		}
 		seen[id] = true
 	}
-	if !s.cfg.NASCleanupDeletionEnabled {
-		util.WriteError(w, 409, "NAS deletion master switch is off")
-		return
-	}
 	ctx := r.Context()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1408,6 +1408,10 @@ func (s *Server) handleAdminNASCleanupBatchEnable(w http.ResponseWriter, r *http
 		return
 	}
 	defer tx.Rollback(ctx)
+	if !cleanupMasterOn(ctx, tx) {
+		util.WriteError(w, 409, "NAS deletion master switch is off")
+		return
+	}
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
 		util.WriteError(w, 500, "public cleanup fence failed")
 		return
@@ -1529,5 +1533,5 @@ func (s *Server) handleAdminNASCleanupBatchStatus(w http.ResponseWriter, r *http
 		util.WriteError(w, 404, "cleanup batch unavailable")
 		return
 	}
-	util.WriteJSON(w, 200, map[string]any{"id": id, "batch_sha256": sha, "mode": mode, "approval_reason": reason, "approved_until": until, "master_deletion_enabled": s.cfg.NASCleanupDeletionEnabled, "plans": json.RawMessage(plans)})
+	util.WriteJSON(w, 200, map[string]any{"id": id, "batch_sha256": sha, "mode": mode, "approval_reason": reason, "approved_until": until, "master_deletion_enabled": cleanupMasterOn(r.Context(), s.pool), "plans": json.RawMessage(plans)})
 }

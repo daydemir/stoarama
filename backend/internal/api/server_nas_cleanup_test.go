@@ -88,7 +88,7 @@ CREATE TABLE streams(id bigint PRIMARY KEY,local_timezone text);CREATE TABLE rec
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"0167_nas_cleanup_dryruns.sql", "0168_nas_cleanup_stage_timings.sql", "0169_nas_cleanup_queue_priority.sql", "0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql", "0172_nas_cleanup_safeguards_validate.sql", "0173_nas_cleanup_throughput.sql", "0175_nas_cleanup_client_status.sql", "0176_nas_cleanup_recheck.sql", "0177_nas_cleanup_reserved_files.sql", "0206_nas_cleanup_manifest_keys.sql", "0207_nas_cleanup_reservation_lookup.sql", "0178_nas_cleanup_reconciliation.sql", "0180_nas_cleanup_source_freeze.sql", "0181_nas_cleanup_freeze_recovery.sql", "0189_delivery_keep_holds.sql"} {
+	for _, name := range []string{"0167_nas_cleanup_dryruns.sql", "0168_nas_cleanup_stage_timings.sql", "0169_nas_cleanup_queue_priority.sql", "0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql", "0172_nas_cleanup_safeguards_validate.sql", "0173_nas_cleanup_throughput.sql", "0175_nas_cleanup_client_status.sql", "0176_nas_cleanup_recheck.sql", "0177_nas_cleanup_reserved_files.sql", "0206_nas_cleanup_manifest_keys.sql", "0207_nas_cleanup_reservation_lookup.sql", "0178_nas_cleanup_reconciliation.sql", "0180_nas_cleanup_source_freeze.sql", "0181_nas_cleanup_freeze_recovery.sql", "0229_nas_cleanup_master.sql", "0189_delivery_keep_holds.sql"} {
 		migration, err := os.ReadFile("../../../infra/sql/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
@@ -200,7 +200,7 @@ func TestNASCleanupLeaseRetriesAndMasterOff(t *testing.T) {
 	if w.Code != 409 || !strings.Contains(w.Body.String(), "master switch") {
 		t.Fatal("master OFF allowed arming")
 	}
-	s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, s, true)
 	if _, err = pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='would_delete',proof='{}',recovery='unchecked' WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func TestNASCleanupLeaseRetriesAndMasterOff(t *testing.T) {
 	if w.Code != 409 {
 		t.Fatal("enable accepted unchecked recovery")
 	}
-	s.cfg.NASCleanupDeletionEnabled = false
+	setCleanupMaster(t, s, false)
 	if _, err = pool.Exec(ctx, `UPDATE nas_cleanup_plans SET manifest='[]' WHERE id=1`); err == nil {
 		t.Fatal("immutable plan was editable")
 	}
@@ -430,7 +430,7 @@ func TestNASCleanupReferenceAdmissionSerializesWithArmingButNotPermanentRecovery
 		t.Fatalf("dry run blocked new stitching: %v", err)
 	}
 	s := &Server{pool: pool}
-	s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, s, true)
 	done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		done <- cleanupCall(t, s.handleAdminNASCleanupControl, 47, 5, "id", "1", map[string]any{"plan_sha256": strings.Repeat("b", 64), "mode": "enabled", "reason": "disposable concurrency fixture"})

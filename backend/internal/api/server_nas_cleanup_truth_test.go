@@ -15,7 +15,7 @@ func TestNASCleanupItemTruthReplaysMixedResultsAfterPause(t *testing.T) {
 	if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, version); err != nil {
 		t.Fatal(err)
 	}
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}

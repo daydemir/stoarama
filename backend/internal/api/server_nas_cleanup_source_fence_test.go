@@ -107,7 +107,7 @@ func cleanupFenceFixture(t *testing.T, miss bool) (*cleanupFixture, int64, []cle
 	}
 	id, sha, _ := f.admit("source-fence", syntheticFiles(100, 1, 10))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}
@@ -230,7 +230,7 @@ func TestNASCleanupSourceFreezeDrainsWriterBeforeEnableReplay(t *testing.T) {
 				}
 				id, sha, _ := f.admit("enable-race", syntheticFiles(100, 1, 10))
 				f.dryRun()
-				f.s.cfg.NASCleanupDeletionEnabled = true
+				setCleanupMaster(t, f.s, true)
 				writer, err := f.pool.Begin(f.ctx)
 				if err != nil {
 					t.Fatal(err)
@@ -334,7 +334,7 @@ func TestNASCleanupSourceFreezeRejectsOldTransactionSnapshots(t *testing.T) {
 	}
 	id, sha, _ := f.admit("old-snapshot", syntheticFiles(100, 1, 10))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}
