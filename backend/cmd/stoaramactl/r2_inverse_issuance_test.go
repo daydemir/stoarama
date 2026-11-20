@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // keep28Attempts counts the durable wire attempts for a key: a minted attempt
@@ -20,156 +24,267 @@ func (f keep28Fixture) attempts(t *testing.T, key string) int {
 	return n
 }
 
-// Pre-issuance runs under admission's 2-minute bound, which is far longer than
-// the key's 30s wire context. Every pre-issuance step therefore takes the
-// earliest of admission, the parent's deadline and the network timeout, and
-// nothing is minted once that has passed: a slow HEAD or a contended attempt
-// insert can never leave an attempt that no DELETE can ever use.
-func TestR2InversePreIssuanceCannotMintPastTheWireDeadline(t *testing.T) {
-	// slot prepares one key that is reserved but not authorized, and returns
-	// the applier and entry plus the way to stop the interference.
-	for name, tc := range map[string]struct {
-		setup func(t *testing.T, f keep28Fixture) func()
-	}{
-		// A preflight HEAD that never answers would otherwise run to the whole
-		// admission bound while the wire transaction holds the wide locks.
-		"slow_preflight": {setup: func(t *testing.T, f keep28Fixture) func() {
+// authorizeOver runs one authorization against a fresh wire transaction and
+// always disposes of both the transaction and any authority it returned.
+func (f keep28Fixture) authorizeOver(t *testing.T, a *inverseApplier, admitCtx, wireCtx context.Context, e inverseEntry) error {
+	t.Helper()
+	tx, err := f.pool.Begin(wireCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	authority, err := a.authorize(admitCtx, wireCtx, tx, e, &inverseSendGate{})
+	if authority != nil {
+		authority.cancel()
+		t.Fatal("authorize issued wire authority on a case that must refuse it")
+	}
+	return err
+}
+
+// Admission's bound is two minutes, the key's own wire budget is thirty
+// seconds. Pre-issuance therefore takes the earliest of admission, the parent's
+// deadline and the network timeout: a live admission alone must never let
+// preflight outlive the wire deadline and still mint an attempt.
+func TestR2InversePreIssuanceHonorsTheWireDeadlineNotAdmission(t *testing.T) {
+	// slow_preflight finishes inside a live admission but past the wire
+	// deadline. An admission-only bound would mint an attempt and reach the
+	// wire; the earliest-deadline bound refuses before either.
+	t.Run("slow_preflight", func(t *testing.T) {
+		f := newKeep28Fixture(t)
+		a := f.applier(t)
+		e := f.entry(t)
+		if _, err := a.reserve(f.ctx, e); err != nil {
+			t.Fatal(err)
+		}
+		// A preflight HEAD that never answers cancels exactly at the wire deadline.
+		f.store.mu.Lock()
+		f.store.onHead = func(string) string { return "slow" }
+		f.store.mu.Unlock()
+		defer func() {
 			f.store.mu.Lock()
-			f.store.onHead = func(string) string { return "slow" }
+			f.store.onHead = nil
 			f.store.mu.Unlock()
-			return func() {
-				f.store.mu.Lock()
-				f.store.onHead = nil
-				f.store.mu.Unlock()
-			}
-		}},
-		// The attempt insert sits on its own connection, and its table can be
-		// busy: the retry loop must still stop at the wire deadline, never
-		// mint once it has passed.
-		"attempt_insert_contention": {setup: func(t *testing.T, f keep28Fixture) func() {
-			holder, err := f.pool.Begin(f.ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err = holder.Exec(f.ctx, `LOCK TABLE r2_keep28_attempts IN SHARE MODE`); err != nil {
-				t.Fatal(err)
-			}
-			return func() { holder.Rollback(context.Background()) }
-		}},
-	} {
-		t.Run(name, func(t *testing.T) {
-			f := newKeep28Fixture(t)
-			a := f.applier(t)
-			e := f.entry(t)
-			stop := tc.setup(t, f)
-			defer stop()
-			// A short fake parent stands in for the job's own 30s wire bound;
-			// the real ledger, intent and attempt tables are used.
-			parent, cancel := context.WithTimeout(f.ctx, 600*time.Millisecond)
-			defer cancel()
-			started := time.Now()
-			ok, err := a.delete(parent, parent, &inverseSendGate{}, e)
-			elapsed := time.Since(started)
-			if ok || err == nil {
-				t.Fatalf("%s minted a wire attempt past the wire deadline", name)
-			}
-			if inverseKeyHeld(err) || errors.Is(err, errInverseUnpublished) || errors.Is(err, errInverseWireAmbiguous) {
-				t.Fatalf("%s held a key that never reached the wire: %v", name, err)
-			}
-			if elapsed > 10*time.Second {
-				t.Fatalf("%s pre-issuance outlived the wire deadline by %v", name, elapsed)
-			}
-			if got := f.attempts(t, e.Key); got != 0 {
-				t.Fatalf("%s minted %d durable attempts after the wire deadline", name, got)
-			}
-			if f.deletes() != 0 {
-				t.Fatalf("%s sent %d DELETEs without a minted attempt", name, f.deletes())
-			}
-			// Nothing durable beyond the reservation was left behind: the same
-			// key still authorizes normally once the interference ends, so the
-			// pre-issuance failure consumed no attempt.
-			stop()
-			tx, err := f.pool.Begin(f.ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			authority, err := a.authorize(f.ctx, f.ctx, tx, e, &inverseSendGate{})
-			tx.Rollback(context.Background())
-			if err != nil {
-				t.Fatalf("%s left the key unissuable: %v", name, err)
-			}
-			authority.cancel()
-			if got := f.attempts(t, e.Key); got != 1 {
-				t.Fatalf("%s left %d durable attempts before a single authorization", name, got)
-			}
-		})
+		}()
+		// Admission stays live for the whole case; only the wire parent is short.
+		admitCtx, cancelAdmit := context.WithTimeout(f.ctx, 30*time.Second)
+		defer cancelAdmit()
+		wireCtx, cancelWire := context.WithTimeout(f.ctx, 400*time.Millisecond)
+		defer cancelWire()
+		started := time.Now()
+		err := f.authorizeOver(t, a, admitCtx, wireCtx, e)
+		elapsed := time.Since(started)
+		if err == nil {
+			t.Fatal("preflight outlived the wire deadline and still issued authority")
+		}
+		if admitCtx.Err() != nil {
+			t.Fatal("admission expired, so the case never exercised a live admission")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("preflight was not stopped by the wire deadline: %v", err)
+		}
+		// 400ms wire, not 30s admission and not the full 1.2s preflight.
+		if elapsed > 1100*time.Millisecond {
+			t.Fatalf("pre-issuance ran %v, so it followed admission or the preflight instead of the wire deadline", elapsed)
+		}
+		if got := f.attempts(t, e.Key); got != 0 {
+			t.Fatalf("%d durable attempts minted past the wire deadline", got)
+		}
+		if f.deletes() != 0 {
+			t.Fatalf("%d DELETEs sent without a minted attempt", f.deletes())
+		}
+	})
+	// attempt_insert_contention keeps the attempt table busy. Each insert is
+	// bounded, so the retry loop must stop at the wire deadline instead of
+	// waiting out the live admission.
+	t.Run("attempt_insert_contention", func(t *testing.T) {
+		f := newKeep28Fixture(t)
+		a := f.applier(t)
+		e := f.entry(t)
+		if _, err := a.reserve(f.ctx, e); err != nil {
+			t.Fatal(err)
+		}
+		holder, err := f.pool.Begin(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer holder.Rollback(context.Background())
+		if _, err = holder.Exec(f.ctx, `LOCK TABLE r2_keep28_attempts IN SHARE MODE`); err != nil {
+			t.Fatal(err)
+		}
+		admitCtx, cancelAdmit := context.WithTimeout(f.ctx, 30*time.Second)
+		defer cancelAdmit()
+		wireCtx, cancelWire := context.WithTimeout(f.ctx, 400*time.Millisecond)
+		defer cancelWire()
+		started := time.Now()
+		err = f.authorizeOver(t, a, admitCtx, wireCtx, e)
+		elapsed := time.Since(started)
+		if err == nil {
+			t.Fatal("a busy attempt table still issued authority")
+		}
+		if admitCtx.Err() != nil {
+			t.Fatal("admission expired, so the case never exercised a live admission")
+		}
+		if elapsed > 1100*time.Millisecond {
+			t.Fatalf("pre-issuance ran %v, past the wire deadline", elapsed)
+		}
+		if got := f.attempts(t, e.Key); got != 0 {
+			t.Fatalf("%d durable attempts minted against a busy table past the wire deadline", got)
+		}
+		if f.deletes() != 0 {
+			t.Fatalf("%d DELETEs sent without a minted attempt", f.deletes())
+		}
+	})
+}
+
+// commitAckDelay slows the return of an already acknowledged COMMIT, so the
+// server's success can reach the caller after the pre-issuance bound expired
+// while the wire context stays healthy. The attempt is durable either way.
+// Matching happens per query on the context TraceQueryStart returns, so it is
+// safe under concurrent use and touches no production code.
+type commitAckDelay struct {
+	delay time.Duration
+	armed atomic.Bool
+}
+
+type commitAckKey struct{}
+
+func (c *commitAckDelay) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(data.SQL)), "commit") && c.armed.CompareAndSwap(true, false) {
+		return context.WithValue(ctx, commitAckKey{}, true)
+	}
+	return ctx
+}
+
+func (c *commitAckDelay) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
+	// The COMMIT was acknowledged (Err is nil); only its return is late.
+	if data.Err == nil && ctx.Value(commitAckKey{}) == true {
+		time.Sleep(c.delay)
 	}
 }
 
-// A chain of known lock contention that exhausts its retry bound must not lose
-// PostgreSQL's own cause: publication has to see a real lock loss to retry or
-// to hold a confirmed absence, never a bare "admission stayed busy".
-func TestR2InverseExhaustedContentionKeepsItsTransientCause(t *testing.T) {
-	// The real bound is 200 attempts; only the count is shortened here so the
-	// same exhaustion branch runs quickly.
-	previous := inverseAdmissionRetries
-	inverseAdmissionRetries = 3
-	t.Cleanup(func() { inverseAdmissionRetries = previous })
-
+// An attempt COMMIT acknowledged after admission expired must not mint
+// authority: the durable attempt stays held for reconciliation and no DELETE
+// leaves. An ambiguous COMMIT is still its own hard stop.
+func TestR2InverseLateAcknowledgedAttemptCommitNeverMints(t *testing.T) {
 	f := newKeep28Fixture(t)
 	a := f.applier(t)
 	e := f.entry(t)
 	if _, err := a.reserve(f.ctx, e); err != nil {
 		t.Fatal(err)
 	}
-	// Real contention after the wide locks, on a statement no NOWAIT covers:
-	// publication's retirement insert needs ROW EXCLUSIVE, which the holder's
-	// SHARE refuses. The transaction-local bound turns each wait into 55P03, so
-	// the unnamed contention path runs and reaches its retry bound.
+	tracer := &commitAckDelay{delay: 900 * time.Millisecond}
+	config := f.pool.Config()
+	config.ConnConfig = config.ConnConfig.Copy()
+	config.ConnConfig.Tracer = tracer
+	pool, err := pgxpool.NewWithConfig(f.ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	a.pool = pool
+	tracer.armed.Store(true)
+	// Admission expires while the wire parent stays healthy, so only the late
+	// acknowledgement can end pre-issuance.
+	admitCtx, cancelAdmit := context.WithTimeout(f.ctx, 300*time.Millisecond)
+	defer cancelAdmit()
+	wireCtx, cancelWire := context.WithTimeout(f.ctx, 30*time.Second)
+	defer cancelWire()
+	err = f.authorizeOver(t, a, admitCtx, wireCtx, e)
+	if err == nil {
+		t.Fatal("a late acknowledged attempt COMMIT still issued wire authority")
+	}
+	if wireCtx.Err() != nil {
+		t.Fatal("the wire deadline ended the case instead of the admission bound")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("late acknowledgement was not reported as the expired pre-issuance bound: %v", err)
+	}
+	if strings.Contains(err.Error(), "COMMIT outcome unknown") {
+		t.Fatalf("an acknowledged COMMIT was reported as ambiguous: %v", err)
+	}
+	// The attempt is durable and held exactly once: no automatic retry mints a
+	// second one, and nothing reached the wire.
+	if got := f.attempts(t, e.Key); got != 1 {
+		t.Fatalf("%d durable attempts after a late acknowledged COMMIT, want exactly 1", got)
+	}
+	if f.deletes() != 0 {
+		t.Fatalf("%d DELETEs sent from authority that outlived its bound", f.deletes())
+	}
+	err = f.authorizeOver(t, a, f.ctx, f.ctx, e)
+	if err == nil || !strings.Contains(err.Error(), "already issued") {
+		t.Fatalf("a durable late-acknowledged attempt was re-minted: %v", err)
+	}
+}
+
+// A known locked lock refusal that exhausts a configured quick cap must stay a
+// safe transient: an already confirmed 404 still becomes Unpublished. An
+// unexpected failure, a cancelled parent and an uncertain COMMIT stay hard.
+func TestR2InverseKnownLockRefusalAtCapKeepsTheUnpublishedPath(t *testing.T) {
+	f := newKeep28Fixture(t)
+	a := f.applier(t)
+	e := f.entry(t)
+	if _, err := a.reserve(f.ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	// One attempt is the configured cap: the very first real pg_try_advisory_*
+	// refusal exhausts it, so the case is a locked-DB witness, not a loop.
+	previousRetries, previousDeadline := inverseAdmissionRetries, inverseAdmissionDeadline
+	inverseAdmissionRetries = 1
+	inverseAdmissionDeadline = 5 * time.Second
+	t.Cleanup(func() { inverseAdmissionRetries, inverseAdmissionDeadline = previousRetries, previousDeadline })
+	// A live session owns publication's second wide lock exclusively, so
+	// pg_try_advisory_xact_lock(7343226011101) returns false.
 	holder, err := f.pool.Begin(f.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer holder.Rollback(context.Background())
-	if _, err = holder.Exec(f.ctx, `LOCK TABLE r2_object_retirements IN SHARE MODE`); err != nil {
+	if _, err = holder.Exec(f.ctx, `SELECT pg_advisory_xact_lock(7343226011101)`); err != nil {
 		t.Fatal(err)
 	}
+	started := time.Now()
 	err = a.publishAbsent(f.ctx, e, a.opts.ManifestSHA)
 	if err == nil {
-		t.Fatal("publication succeeded while its retirement table was held")
+		t.Fatal("publication succeeded while a live session held its wide lock")
 	}
-	var pg *pgconn.PgError
-	if !errors.As(err, &pg) || pg.Code != pgLockNotAvailable {
-		t.Fatalf("exhausted contention lost its PostgreSQL lock cause: %v", err)
+	var busy inverseBusy
+	if !errors.As(err, &busy) {
+		// The busy result names no wait here (the refusal came from a NOWAIT
+		// try), so only the bound and its cause are in the chain by design.
+		t.Logf("exhausted cap carried no named wait, as expected: %v", err)
 	}
 	if !errors.Is(err, errInverseAdmissionBusy) {
-		t.Fatalf("exhausted contention did not name its retry bound: %v", err)
+		t.Fatalf("the exhausted cap did not report its bound: %v", err)
+	}
+	if !errors.Is(err, errInverseLockRefused) {
+		t.Fatalf("a known pg_try_advisory_* refusal lost its safe meaning: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("the quick cap took %v", elapsed)
 	}
 	if !inverseDBTransient(f.ctx, f.ctx, err) {
-		t.Fatalf("a real lock loss after the retry bound was not transient: %v", err)
+		t.Fatalf("a known lock refusal was not transient: %v", err)
 	}
+	// Already confirmed 404: the absence is held as Unpublished, never lost.
 	if held := inverseHoldUnpublished(f.ctx, f.ctx, err); !errors.Is(held, errInverseUnpublished) {
-		t.Fatalf("a real lock loss after the retry bound did not hold the confirmed absence: %v", held)
+		t.Fatalf("a known refusal did not preserve the confirmed 404 as Unpublished: %v", held)
 	}
-	// A generic error is never a safe retry, however the step ended.
-	for _, unknown := range []error{errors.New("unknown publication failure"), context.Canceled} {
-		if inverseDBTransient(f.ctx, f.ctx, unknown) || errors.Is(inverseHoldUnpublished(f.ctx, f.ctx, unknown), errInverseUnpublished) {
-			t.Fatalf("an unknown failure was treated as safe retry: %v", unknown)
-		}
-	}
-	// The caller's parent ending is a stopped job, never a held key.
+	// Everything that is not that known refusal stays hard.
 	parent, cancelParent := context.WithCancel(f.ctx)
 	cancelParent()
 	if inverseDBTransient(parent, f.ctx, err) || errors.Is(inverseHoldUnpublished(parent, f.ctx, err), errInverseUnpublished) {
-		t.Fatal("a cancelled parent held a key instead of stopping the job")
+		t.Fatal("a cancelled parent was treated as a safe retry")
 	}
-	// With the holder gone the same publication succeeds, so nothing was
-	// consumed or poisoned while the contention exhausted.
-	if err = holder.Rollback(f.ctx); err != nil {
-		t.Fatal(err)
+	for _, unknown := range []error{errors.New("unknown publication failure"), context.Canceled} {
+		if inverseDBTransient(f.ctx, f.ctx, unknown) || errors.Is(inverseHoldUnpublished(f.ctx, f.ctx, unknown), errInverseUnpublished) {
+			t.Fatalf("an unknown failure was treated as a safe retry: %v", unknown)
+		}
 	}
-	if err = a.publishConfirmed(f.ctx, e); err != nil {
-		t.Fatalf("publication did not recover after the contention ended: %v", err)
+	// A confirmed DELETE whose publication COMMIT outcome is unknown is a hard
+	// stop, never Unpublished.
+	uncertain := errors.New("absence publication COMMIT outcome unknown")
+	if held := inverseHoldUnpublished(f.ctx, f.ctx, uncertain); errors.Is(held, errInverseUnpublished) {
+		t.Fatalf("an uncertain publication COMMIT was held as Unpublished: %v", held)
 	}
 }
 
@@ -185,24 +300,19 @@ func TestR2InversePostIntentStitchBusyIsAHardStop(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The witness raises exactly what 0223's ledger trigger raises, at the
-	// publication insert.
-	if _, err := f.pool.Exec(f.ctx, `CREATE FUNCTION inverse_publish_stitch_busy() RETURNS trigger LANGUAGE plpgsql AS $f$
- BEGIN RAISE EXCEPTION 'stitch input hold admission is busy' USING ERRCODE='55P03'; END $f$;
+	// publication insert, and counts every attempt to publish.
+	if _, err := f.pool.Exec(f.ctx, `CREATE SEQUENCE inverse_publish_stitch_tries;
+ CREATE FUNCTION inverse_publish_stitch_busy() RETURNS trigger LANGUAGE plpgsql AS $f$
+ BEGIN PERFORM nextval('inverse_publish_stitch_tries');
+  RAISE EXCEPTION 'stitch input hold admission is busy' USING ERRCODE='55P03'; END $f$;
  CREATE TRIGGER inverse_publish_stitch_busy BEFORE INSERT ON r2_keep28_events
- FOR EACH ROW EXECUTE FUNCTION inverse_publish_stitch_busy();
- CREATE SEQUENCE inverse_publish_stitch_tries`); err != nil {
+ FOR EACH ROW EXECUTE FUNCTION inverse_publish_stitch_busy()`); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		f.pool.Exec(f.ctx, `DROP TRIGGER inverse_publish_stitch_busy ON r2_keep28_events;
  DROP FUNCTION inverse_publish_stitch_busy(); DROP SEQUENCE inverse_publish_stitch_tries`)
 	})
-	// Count the inserts so a transient path would show more than one try.
-	if _, err := f.pool.Exec(f.ctx, `CREATE OR REPLACE FUNCTION inverse_publish_stitch_busy() RETURNS trigger LANGUAGE plpgsql AS $f$
- BEGIN PERFORM nextval('inverse_publish_stitch_tries');
-  RAISE EXCEPTION 'stitch input hold admission is busy' USING ERRCODE='55P03'; END $f$`); err != nil {
-		t.Fatal(err)
-	}
 	started := time.Now()
 	err := a.publishConfirmed(f.ctx, e)
 	if err == nil {

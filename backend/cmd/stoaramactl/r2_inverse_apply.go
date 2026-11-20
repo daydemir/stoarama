@@ -270,6 +270,13 @@ type inverseBusy []inverseWait
 
 func (inverseBusy) Error() string { return "R2 retirement admission lock busy" }
 
+// errInverseLockRefused is PostgreSQL's own answer that a live session owns the
+// lock: a NOWAIT try that returned false, or a bound wait that ended in SQLSTATE
+// 55P03. It is a known refusal, never an unknown failure, so a caller that
+// exhausts its retry bound can still tell it from an unexpected statement error,
+// a cancelled parent or an uncertain COMMIT.
+var errInverseLockRefused = errors.New("R2 retirement lock is held by a live session")
+
 // inverseBusyCause is a lock refusal that named no lock: a bound statement
 // lost its wait, so admission backs off outside the wide locks instead. It
 // still keeps PostgreSQL's own cause, so a caller that runs past the retry
@@ -290,11 +297,19 @@ func (e *inverseBusyCause) As(target any) bool {
 	return false
 }
 
-// inverseBusyCauseOf returns the lock refusal a busy admission carried.
+// inverseBusyCauseOf returns the known refusal a busy admission carried, or nil
+// when the busy result came from anything else (an unexpected wait or statement
+// error), which callers must treat as hard.
 func inverseBusyCauseOf(err error) error {
 	var caused *inverseBusyCause
 	if errors.As(err, &caused) {
 		return caused.cause
+	}
+	var busy inverseBusy
+	if errors.As(err, &busy) {
+		// A plain inverseBusy is only ever produced by a pg_try_advisory_*
+		// that returned false: the lock is known to be held right now.
+		return errInverseLockRefused
 	}
 	return nil
 }
@@ -947,6 +962,9 @@ func inverseDBTransient(parent, step context.Context, err error) bool {
 	}
 	if inverseStitchRefusal(err) {
 		return false
+	}
+	if errors.Is(err, errInverseLockRefused) {
+		return true
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {

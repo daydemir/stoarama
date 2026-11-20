@@ -173,6 +173,14 @@ func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverse
 // outlives admission, so the returned authority is never bound by, or
 // cancelled with, the admission attempt. Keep-28 adds its NAS custody proof and
 // bounds both by its expiry.
+//
+// The network budget starts once per authorization, at this call, and every
+// admitted retry calls authorize again. A retry after contention therefore gets
+// a fresh inverseNetworkTimeout measured from its own start, but never more
+// than the caller's wireCtx: wireCtx is a single parent per key, so the parent's
+// absolute deadline caps the total across retries. Pre-issuance no longer
+// stretches the returned authority's life, because the authority's deadline is
+// computed from this call's start, not from when the attempt committed.
 func (a *inverseApplier) authorize(admitCtx, wireCtx context.Context, tx pgx.Tx, e inverseEntry, gate *inverseSendGate) (*inverseDeleteAuthority, error) {
 	// The key's own network budget starts here, before its locks are prepared.
 	// Every pre-issuance step holds the wide cleanup locks, so preflight that
@@ -228,6 +236,14 @@ func (a *inverseApplier) authorize(admitCtx, wireCtx context.Context, tx pgx.Tx,
 	issued, err := a.issueAttempt(preIssue, binding)
 	if err != nil {
 		return fail(err)
+	}
+	// The attempt COMMIT is a separate connection and can acknowledge after the
+	// pre-issuance bound expired while wire and custody were still live. That
+	// durable attempt stays held: it is never retried, and no DELETE may mint
+	// from authority that outlived its bound. Only an *acknowledged* commit
+	// reaches this check; an ambiguous one already failed above and is held.
+	if err = preIssue.Err(); err != nil {
+		return fail(fmt.Errorf("wire authority outlived its pre-issuance bound: %w", err))
 	}
 	if issued != 1 {
 		return fail(errors.New("inverse wire authority was already issued; reconcile only"))
