@@ -19612,7 +19612,7 @@ def stable_native_signature_v1(probe_streams, format_name):
 
 
 def cancellable_tool_output(command, cancel, timeout, stdout_limit=1024 * 1024, stderr_limit=64 * 1024,
-                            pass_fds=(), *, reject_stderr=False, stdout_file=None):
+                            pass_fds=(), *, reject_stderr=False, stdout_file=None, stderr_file=None):
     """Bounded child group: cancellation cannot strand ffmpeg descendants."""
     if stdout_limit < 0 or stderr_limit < 0:
         raise MediaCertificationError("media verification output bound is invalid")
@@ -19625,8 +19625,10 @@ def cancellable_tool_output(command, cancel, timeout, stdout_limit=1024 * 1024, 
     exceeded = threading.Event()
     stdout = bytearray()
     stderr = bytearray()
+    streamed_stderr = 0
 
-    def drain(stream, destination, limit, file=None):
+    def drain(stream, destination, limit, file=None, *, stderr_channel=False):
+        nonlocal streamed_stderr
         count = 0
         try:
             while True:
@@ -19644,10 +19646,14 @@ def cancellable_tool_output(command, cancel, timeout, stdout_limit=1024 * 1024, 
             exceeded.set()
         finally:
             stream.close()
+            if stderr_channel:
+                # Streamed evidence still counts when reject_stderr is set.
+                streamed_stderr = count
 
     readers = [
         threading.Thread(target=drain, args=(process.stdout, stdout, stdout_limit, stdout_file), name="native-stitch-stdout", daemon=True),
-        threading.Thread(target=drain, args=(process.stderr, stderr, stderr_limit), name="native-stitch-stderr", daemon=True),
+        threading.Thread(target=drain, args=(process.stderr, stderr, stderr_limit, stderr_file),
+                         kwargs={"stderr_channel": True}, name="native-stitch-stderr", daemon=True),
     ]
     for reader in readers:
         reader.start()
@@ -19696,7 +19702,7 @@ def cancellable_tool_output(command, cancel, timeout, stdout_limit=1024 * 1024, 
         failure = MediaCertificationError("media verification output exceeded its bound")
     if failure is not None:
         raise failure
-    if process.returncode or (reject_stderr and stderr):
+    if process.returncode or (reject_stderr and (stderr or streamed_stderr)):
         raise ToolProcessError(process.returncode, bytes(stderr))
     return bytes(stdout)
 
