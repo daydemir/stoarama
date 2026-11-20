@@ -114,6 +114,25 @@ var joinedMigrationNames = []string{
 	"0215_r2_collation_output_key_index.sql",
 }
 
+// The initial fixture seeds historical rows into a schema predating the
+// deferred joined tables. Later migrations can depend on those tables.
+// Apply them with the deferred set after seeding, in normal migration order.
+func joinedDeferredMigrations(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(findMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deferred := append([]string(nil), joinedMigrationNames...)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() && strings.HasSuffix(name, ".sql") && name >= "0223_" {
+			deferred = append(deferred, name)
+		}
+	}
+	return deferred
+}
+
 type joinedFixtureMigrationPhase uint8
 
 const (
@@ -161,7 +180,8 @@ func testJoinedServerBeforeMigrationPhase(t *testing.T, phase joinedFixtureMigra
 	if _, err := pool.Exec(ctx, `CREATE TABLE schema_migrations(version TEXT PRIMARY KEY,applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
 		t.Fatal(err)
 	}
-	for _, migration := range joinedMigrationNames {
+	deferred := joinedDeferredMigrations(t)
+	for _, migration := range deferred {
 		if _, err := pool.Exec(ctx, `INSERT INTO schema_migrations(version) VALUES($1)`, migration); err != nil {
 			t.Fatal(err)
 		}
@@ -179,7 +199,7 @@ func testJoinedServerBeforeMigrationPhase(t *testing.T, phase joinedFixtureMigra
 	s := &Server{pool: pool}
 	applyMigration := func() {
 		t.Helper()
-		for _, migration := range joinedMigrationNames {
+		for _, migration := range deferred {
 			if phase == joinedFixtureBeforeWriterRetirement && migration == "0195_r2_joined_writer_retirement.sql" {
 				continue
 			}
