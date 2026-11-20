@@ -40,13 +40,50 @@ func (f *nonrawFixture) withPageKeys() {
 	f.store.objects[exemptRepairKey] = r2.ObjectInfo{Key: exemptRepairKey, ETag: "repair-etag", SizeBytes: 700, LastModified: inverseRetirementCutoff().Add(-time.Second)}
 }
 
+// approvalDigest is the roster digest each fixture class is approved under. A
+// digest binds to exactly one class, so each class names its own.
+func approvalDigest(class deliveryExemptionClass) string {
+	sum := sha256.Sum256([]byte("fixture-roster:" + string(class)))
+	return hex.EncodeToString(sum[:])
+}
+
+// ensureApproval records the owner approval for a class's fixture roster once.
+// Seeding never creates one; this stands in for the separate approve step.
+func (f *nonrawFixture) ensureApproval(t *testing.T, class deliveryExemptionClass) string {
+	t.Helper()
+	digest := approvalDigest(class)
+	var exists bool
+	if err := f.pool.QueryRow(f.ctx, `SELECT EXISTS(SELECT 1 FROM r2_delivery_exemption_approvals WHERE roster_sha256=$1)`, digest).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		return digest
+	}
+	if _, err := recordDeliveryExemptionApproval(f.ctx, f.pool, class, digest, deliveryExemptionDecisions[class]); err != nil {
+		t.Fatal(err)
+	}
+	return digest
+}
+
 func (f *nonrawFixture) seed(t *testing.T, class deliveryExemptionClass, rows ...deliveryExemptionRow) error {
 	t.Helper()
 	picks, err := loadR2RetirePicks(f.picks)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = seedDeliveryExemptions(f.ctx, f.pool, class, rows, strings.Repeat("a", 64), picks)
+	_, err = seedDeliveryExemptions(f.ctx, f.pool, class, rows, f.ensureApproval(t, class), picks)
+	return err
+}
+
+// seedUnapproved seeds with a digest that was never recorded as an approval.
+func (f *nonrawFixture) seedUnapproved(t *testing.T, class deliveryExemptionClass, rows ...deliveryExemptionRow) error {
+	t.Helper()
+	picks, err := loadR2RetirePicks(f.picks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte("unapproved:" + string(class)))
+	_, err = seedDeliveryExemptions(f.ctx, f.pool, class, rows, hex.EncodeToString(sum[:]), picks)
 	return err
 }
 
@@ -66,19 +103,13 @@ func (f *nonrawFixture) exempt(t *testing.T, key string) bool {
 	return open
 }
 
-// pageGeneration is the synthetic serving registry generation the fixtures
-// retire. The marker alone is inert; the registry state record is what makes the
-// page actually down.
+// pageGeneration is the synthetic serving registry generation the fixtures name
+// when the page is taken down, recorded for the record on the retirement row.
 const pageGeneration = "0123456789abcdef0123456789abcdef"
 
-// registryState records the live serving state of the page's own generation, the
-// fact r2_delivery_page_retired() reads. Without it the marker is inert.
-func (f *nonrawFixture) registryState(state string) {
-	f.exec(`INSERT INTO r2_delivery_page_registry_events(generation,state,decision) VALUES($1,$2::r2_delivery_page_registry_state,'test: registry state')`, pageGeneration, state)
-}
-
+// retirePage sets the one committed serving state, exactly what
+// r2-inverse page-retired writes and what every public handler reads live.
 func (f *nonrawFixture) retirePage() {
-	f.registryState("disabled")
 	f.exec(`INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,'test: the old page is down')`, pageGeneration)
 }
 
@@ -152,22 +183,16 @@ func TestR2NonrawExemptionClassGates(t *testing.T) {
 	if f.exempt(t, exemptRepairKey) || f.exempt(t, inWindow) {
 		t.Fatal("a page-retirement class opened while the page is up")
 	}
-	// The marker alone is never enough: the serving registry generation must also
-	// be recorded disabled or retired. A generation still recorded as serving
-	// leaves every page-retirement gate closed.
-	f.registryState("serving")
-	f.exec(`INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,'test: premature marker')`, pageGeneration)
+	// There is exactly one retirement state, and it is the same row the serving
+	// routes refuse on. Until it exists no gate opens; once it exists the function
+	// and the gate agree immediately.
 	var retired bool
 	if err := f.pool.QueryRow(f.ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil || retired {
-		t.Fatalf("marker alone retired the page: %v %v", retired, err)
+		t.Fatalf("a serving page reported retired: %v %v", retired, err)
 	}
-	if f.exempt(t, exemptRepairKey) || f.exempt(t, inWindow) {
-		t.Fatal("a marker over a still-serving generation opened a gate")
-	}
-	// Record the page's real disarm and the gate opens.
-	f.registryState("disabled")
+	f.retirePage()
 	if err := f.pool.QueryRow(f.ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil || !retired {
-		t.Fatalf("disabled registry did not retire the page: %v %v", retired, err)
+		t.Fatalf("the committed retirement state did not retire the page: %v %v", retired, err)
 	}
 	if !f.exempt(t, exemptRepairKey) {
 		t.Fatal("confident_repair stayed closed after the page came down")
@@ -324,6 +349,12 @@ func TestR2NonrawExemptionSeedCommand(t *testing.T) {
 	stale.ETag = "stale"
 	if err = f.seed(t, deliveryExemptOutsideWindow, stale); err == nil {
 		t.Fatal("stale ETag seeded")
+	}
+	// Seeding never creates its own approval: without the separate approve step
+	// the whole class refuses and writes nothing.
+	unapproved := f.seedUnapproved(t, deliveryExemptOutsideWindow, collatedRow(f))
+	if unapproved == nil || !strings.Contains(unapproved.Error(), "no recorded owner approval") {
+		t.Fatalf("seeding without a pre-recorded approval was allowed: %v", unapproved)
 	}
 	var n int
 	if err = f.pool.QueryRow(f.ctx, `SELECT count(*) FROM r2_delivery_exemptions`).Scan(&n); err != nil || n != 0 {
@@ -611,7 +642,9 @@ func TestR2NonrawExemptionClassMustMatchLiveClassifier(t *testing.T) {
 	if qErr := f.pool.QueryRow(f.ctx, `SELECT (SELECT count(*) FROM r2_delivery_exemptions),(SELECT count(*) FROM r2_delivery_exemption_approvals)`).Scan(&exemptions, &approvals); qErr != nil {
 		t.Fatal(qErr)
 	}
-	if exemptions != 0 || approvals != 0 {
+	// The approval exists (the fixture recorded it before seeding); the refused
+	// seed wrote no exemption at all.
+	if exemptions != 0 || approvals != 1 {
 		t.Fatalf("refused seed wrote %d exemptions and %d approvals", exemptions, approvals)
 	}
 	// The same roster under its real class is accepted.
@@ -790,15 +823,47 @@ func TestR2NonrawOffPageDependencyFollowsOwnerScopeButPendingCopyHolds(t *testin
 			fmt.Sprintf(`{"bucket":"stoarama","object_key":%q,"size_bytes":900}`, f.key), state, blocked)
 		_ = reason
 	}
-	// Off-page and its NAS copy still waiting to be transferred: held.
+	// The collated lane's copy veto is r2_nonraw_key_held. Assert it directly, and
+	// separately assert the classifier answers "held / live_hold", so the pending
+	// copy is provably the veto in play rather than a page keep, a keep28 overlap
+	// or a missing exemption. Either assertion alone can be masked by the other,
+	// which is exactly the trap this test exists to close.
+	guards := func(name string, want bool) {
+		t.Helper()
+		var sqlHeld bool
+		if err := f.pool.QueryRow(f.ctx, `SELECT r2_nonraw_key_held('stoarama',$1,'collated',$2)`, f.key, f.outputID).Scan(&sqlHeld); err != nil {
+			t.Fatal(err)
+		}
+		if sqlHeld != want {
+			t.Fatalf("%s: r2_nonraw_key_held=%v, want %v", name, sqlHeld, want)
+		}
+		picks, err := loadR2RetirePicks(f.picks)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, err := loadInverseProtectionMode(f.ctx, f.pool, "stoarama", picks, f.windows, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		class, reason := p.classify(f.store.objects[f.key])
+		if got := class == inverseHeld && reason == "live_hold"; got != want {
+			t.Fatalf("%s: classifier %s (%s), want held/live_hold=%v", name, class, reason, want)
+		}
+	}
 	copyItem("pending", "", "waiting to be transferred")
+	guards("pending", true)
 	if _, err := f.runBatch(t, "pending_copy", inverseNonrawCollated, f.collatedEntry()); !errors.Is(err, errInverseNonrawIneligible) || f.deletes() != 0 {
 		t.Fatalf("pending NAS copy did not hold the output: %v deletes=%d", err, f.deletes())
 	}
 	copyItem("blocked", "checksum_mismatch", "blocked")
+	guards("blocked", true)
 	if _, err := f.runBatch(t, "blocked_copy", inverseNonrawCollated, f.collatedEntry()); !errors.Is(err, errInverseNonrawIneligible) || f.deletes() != 0 {
 		t.Fatalf("blocked NAS copy did not hold the output: %v deletes=%d", err, f.deletes())
 	}
+	// With the copy verified the guard is released, so this cannot pass by always
+	// holding.
+	copyItem("verified", "", "verified")
+	guards("verified", false)
 	// Verified copy: the off-page dependency then follows the owner scope.
 	copyItem("verified", "", "verified")
 	if _, err := f.runBatch(t, "verified_copy", inverseNonrawCollated, f.collatedEntry()); err != nil || f.deletes() != 1 {
@@ -833,36 +898,169 @@ func TestR2NonrawPartitionComparesExemptIdentity(t *testing.T) {
 	}
 }
 
-// TestR2NonrawPageRetiredMarkerRequiresDisabledRegistry: the CLI refuses to write
-// the marker unless the named serving generation is already disabled or retired.
-func TestR2NonrawPageRetiredMarkerRequiresDisabledRegistry(t *testing.T) {
+// TestR2NonrawPageRetiredRefusesLiveTickets: taking the page down refuses while
+// an issued download capability is still unexpired, so retirement drains the
+// outstanding tickets instead of leaving them live behind a retired page. Exactly
+// one committed state is written, and only then does the gate read retired.
+func TestR2NonrawPageRetiredRefusesLiveTickets(t *testing.T) {
 	f := newNonrawFixture(t, "exempt_page_cli")
-	// A generation still serving: the marker write must leave no marker behind.
-	if _, err := f.pool.Exec(f.ctx, `SELECT 1`); err != nil {
-		t.Fatal(err)
-	}
+	f.exec(`INSERT INTO r2_delivery_download_tickets(bucket,object_key,etag,size_bytes,object_path_sha256,expires_at)
+ VALUES('stoarama','joined/x.mp4','e',1,repeat('a',64),clock_timestamp()+interval '5 minutes')`)
+	// Deferred from the start: a failing assertion must release the connection,
+	// or the fixture's pool cleanup hangs waiting for it.
 	tx, err := f.pool.Begin(f.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = tx.Exec(f.ctx, `INSERT INTO r2_delivery_page_registry_events(generation,state,decision) VALUES($1,'serving','test: still serving')`, pageGeneration); err != nil {
-		t.Fatal(err)
+	defer tx.Rollback(f.ctx)
+	if _, err = retireDeliveryPage(f.ctx, tx, pageGeneration, "test: the old page is down"); err == nil || !strings.Contains(err.Error(), "unexpired") {
+		t.Fatalf("retirement ignored a live ticket: %v", err)
 	}
-	if _, err = tx.Exec(f.ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,'test: premature')`, pageGeneration); err != nil {
+	if err = tx.Rollback(f.ctx); err != nil {
 		t.Fatal(err)
 	}
 	var retired bool
-	if err = tx.QueryRow(f.ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil || retired {
-		t.Fatalf("serving generation retired the page: %v %v", retired, err)
+	if err = f.pool.QueryRow(f.ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil || retired {
+		t.Fatalf("a refused retirement retired the page: %v %v", retired, err)
 	}
-	tx.Rollback(f.ctx)
-	var markers int
-	if err = f.pool.QueryRow(f.ctx, `SELECT count(*) FROM r2_delivery_page_retirement`).Scan(&markers); err != nil || markers != 0 {
-		t.Fatalf("a still-serving generation left %d markers", markers)
+	// Expired tickets are already dead at the provider, so the page can come down.
+	f.fixture(`UPDATE r2_delivery_download_tickets SET expires_at=clock_timestamp()-interval '1 second'`)
+	tx, err = f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// Disabled first, then the marker; the function agrees and the CLI's check passes.
-	f.retirePage()
+	defer tx.Rollback(f.ctx)
+	if _, err = retireDeliveryPage(f.ctx, tx, pageGeneration, "test: the old page is down"); err != nil {
+		t.Fatalf("retirement refused with only expired tickets: %v", err)
+	}
+	if err = tx.Commit(f.ctx); err != nil {
+		t.Fatal(err)
+	}
 	if err = f.pool.QueryRow(f.ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil || !retired {
-		t.Fatalf("disabled generation did not retire the page: %v %v", retired, err)
+		t.Fatalf("the committed retirement did not take effect: %v %v", retired, err)
+	}
+	// One committed state, append-only and unrepeatable.
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,'again')`, pageGeneration); err == nil {
+		t.Fatal("a second page retirement state landed")
+	}
+	if _, err := f.pool.Exec(f.ctx, `DELETE FROM r2_delivery_page_retirement`); err == nil {
+		t.Fatal("the page retirement state was removed")
+	}
+}
+
+// TestR2NonrawExemptionApprovalBindsOneClassPerDigest: a roster digest approved
+// for one class is refused under any other, in SQL as well as in the seed.
+func TestR2NonrawExemptionApprovalBindsOneClassPerDigest(t *testing.T) {
+	f := newNonrawFixture(t, "exempt_approval_class")
+	f.withPageKeys()
+	digest := f.ensureApproval(t, deliveryExemptOutsideWindow)
+	if _, err := recordDeliveryExemptionApproval(f.ctx, f.pool, deliveryExemptConfidentRepair, digest, deliveryExemptionDecisions[deliveryExemptConfidentRepair]); err == nil {
+		t.Fatal("one roster digest was approved for a second class")
+	}
+	if _, err := recordDeliveryExemptionApproval(f.ctx, f.pool, deliveryExemptOutsideWindow, digest, deliveryExemptionDecisions[deliveryExemptOutsideWindow]); err == nil {
+		t.Fatal("one roster digest was approved twice")
+	}
+	// The SQL trigger is what refuses it, not merely the helper: write it directly.
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(f.ctx)
+	_, err = tx.Exec(f.ctx, `INSERT INTO r2_delivery_exemption_approvals(class,roster_sha256,decision) VALUES('confident_repair',$1,'other')`, digest)
+	if err == nil || !strings.Contains(err.Error(), "already approved") {
+		t.Fatalf("the approval trigger did not bind the digest to one class: %v", err)
+	}
+	// Seeding under the other class with the same digest refuses too.
+	picks, pickErr := loadR2RetirePicks(f.picks)
+	if pickErr != nil {
+		t.Fatal(pickErr)
+	}
+	if _, err = seedDeliveryExemptions(f.ctx, f.pool, deliveryExemptConfidentRepair, []deliveryExemptionRow{repairRow()}, digest, picks); err == nil {
+		t.Fatal("a digest approved for outside_window seeded confident_repair")
+	}
+	if err := f.seed(t, deliveryExemptOutsideWindow, collatedRow(f)); err != nil || !f.exempt(t, f.key) {
+		t.Fatalf("outside_window seeding broke: %v", err)
+	}
+	if f.exempt(t, exemptRepairKey) {
+		t.Fatal("the refused class opened anyway")
+	}
+}
+
+// TestR2NonrawSeedKeepsSourceHolds: the seed suppresses ONLY the candidate's own
+// page veto. A joined dry-run scope over a source, or a duplicate source closure,
+// still refuses the row exactly as the wire would.
+func TestR2NonrawSeedKeepsSourceHolds(t *testing.T) {
+	f := newNonrawFixture(t, "exempt_seed_sources")
+	f.withPageKeys()
+	f.ensureApproval(t, deliveryExemptOutsideWindow)
+	// A joined dry-run scope covering the output's only source.
+	var recordingJob int64
+	if err := f.pool.QueryRow(f.ctx, `INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,completed_at)
+ VALUES(30,'2026-06-01','2026-06-01',60,'done','exempt-seed-scope','2026-06-02') RETURNING id`).Scan(&recordingJob); err != nil {
+		t.Fatal(err)
+	}
+	f.fixture(`UPDATE recording_clips SET recording_job_id=$1 WHERE id=$2`, recordingJob, f.clipID)
+	f.fixture(`INSERT INTO recording_joined_dry_run_scopes(dry_run_id,recording_id,priority_ordinal,local_date,date_ordinal,recording_job_id,high_water_clip_id)
+ VALUES('00000000-0000-0000-0000-000000000001',30,1,'2026-06-01',1,$1,$2)`, recordingJob, f.clipID)
+	if err := f.seed(t, deliveryExemptOutsideWindow, collatedRow(f)); err == nil {
+		t.Fatal("a source under a joined dry-run scope was seeded")
+	}
+	if f.exempt(t, f.key) {
+		t.Fatal("a source-held key opened")
+	}
+	// Duplicate source IDs never resolve into seeding authority either.
+	f.fixture(`UPDATE recording_collation_outputs SET source_clip_ids=ARRAY[7000001,7000001]::bigint[] WHERE id=$1`, f.outputID)
+	if err := f.seed(t, deliveryExemptOutsideWindow, collatedRow(f)); err == nil || !strings.Contains(err.Error(), "collated_sources_empty_duplicate_or_unresolved") {
+		t.Fatalf("a duplicate source closure was seeded: %v", err)
+	}
+	var n int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM r2_delivery_exemptions`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("refused seeds left %d exemptions (%v)", n, err)
+	}
+}
+
+// TestR2NonrawSeedDecisionBindsThePageStream: the positive, window-bound decision
+// must cover the stream the page recording actually names, including when that
+// stream differs from the output's own stream.
+func TestR2NonrawSeedDecisionBindsThePageStream(t *testing.T) {
+	f := newNonrawFixture(t, "exempt_seed_page_stream")
+	f.withPageKeys()
+	f.ensureApproval(t, deliveryExemptOutsideWindow)
+	// The page recording moves to a second, decided stream; the catalog output
+	// keeps stream 3.
+	const pageStream = 78
+	f.fixture(`INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
+ VALUES(78,'test','78','pageside','pageside','https://test.invalid','off','UTC','hls','video_manifest','video_live','continuous_video',30)`)
+	f.fixture(`INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
+ VALUES(31,47,1,'pageside','https://test.invalid','* * * * *','UTC','paused',78,now())`)
+	f.fixture(`UPDATE delivery_keep_holds SET recording_id=31 WHERE bucket='stoarama' AND object_key=$1`, f.key)
+	pageWindow, ok := f.windows[pageStream]
+	if !ok || pageWindow.Start.Equal(f.windows[3].Start) {
+		t.Fatalf("stream %d has no distinct pinned window", pageStream)
+	}
+	decided := func(window api.Keep28Window) r2RetirePick {
+		return r2RetirePick{Choice: "none", KeepStartUTC: window.Start.Format(time.RFC3339), KeepEndUTC: window.End.Format(time.RFC3339)}
+	}
+	// Stream 4's pick is made against another window: never authority.
+	data, _ := json.Marshal(map[string]any{"choices": map[string]any{
+		"3":                    decided(f.windows[3]),
+		fmt.Sprint(pageStream): r2RetirePick{Choice: "none", KeepStartUTC: "2020-01-01T00:00:00Z", KeepEndUTC: "2020-01-02T00:00:00Z"},
+	}})
+	if err := os.WriteFile(f.picks, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.seed(t, deliveryExemptOutsideWindow, collatedRow(f)); err == nil {
+		t.Fatal("seeded without a window-bound decision for the page stream")
+	}
+	// The page stream's own exact window is the decision that unlocks it.
+	data, _ = json.Marshal(map[string]any{"choices": map[string]any{"3": decided(f.windows[3]), fmt.Sprint(pageStream): decided(pageWindow)}})
+	if err := os.WriteFile(f.picks, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.seed(t, deliveryExemptOutsideWindow, collatedRow(f)); err != nil {
+		t.Fatalf("the page stream's own window-bound decision was refused: %v", err)
+	}
+	if !f.exempt(t, f.key) {
+		t.Fatal("outside_window did not open")
 	}
 }

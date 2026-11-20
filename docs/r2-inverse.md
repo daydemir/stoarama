@@ -257,15 +257,19 @@ this lane.
 | Class | Page rows | Gate |
 | --- | --- | --- |
 | `outside_window` | `video_collated` under `joined/goodplus-*` or `joined/nightly-collation-v2/`, outside every keep window (4,348, 0.582 TB) | open once seeded |
-| `confident_repair` | `video_assembly` under `experimental/stitching-confident-repairs/`, no catalog row (9,232, 3.377 TB) | the page is really down (`r2_delivery_page_retired()`) |
-| `in_window` | `video_collated` inside a keep window (10,893, 2.347 TB) | the page is really down **and** the exact output is NAS-certified (`r2_delivery_nas_certified`) |
+| `confident_repair` | `video_assembly` under `experimental/stitching-confident-repairs/`, no catalog row (9,232, 3.377 TB) | the page is retired (`r2_delivery_page_retired()`) |
+| `in_window` | `video_collated` inside a keep window (10,893, 2.347 TB) | the page is retired **and** the exact output is NAS-certified (`r2_delivery_nas_certified`) |
 
 An exemption binds the exact `(bucket, object_key, etag, size_bytes)` of the
 live page row, the class's verbatim owner decision and the roster SHA-256, and it
 references the append-only owner approval for **that class and roster digest**
-(`r2_delivery_exemption_approvals`). A roster digest approved for one class can
-never be replayed under another, and the seed recomputes each row's class with
-the collated executor's own live classifier (inside vs outside the stream's keep
+(`r2_delivery_exemption_approvals`). `roster_sha256` is UNIQUE across the whole
+table and a SQL trigger refuses a second approval for the same digest, so a
+roster digest approved for one class can never be replayed under another. The
+approval is recorded first, by its own command with the owner's decision text;
+seeding only consumes it and refuses a roster with no approval for its exact
+class, digest and decision. The seed also recomputes each row's class with the
+collated executor's own live classifier (inside vs outside the stream's keep
 window, or a confident repair) and refuses the whole roster on any disagree. It
 is append-only. If the page row's identity ever drifts, the key is held again;
 the partition compares the listing's ETag and size against the exempt identity
@@ -298,23 +302,30 @@ retire as `collated`. Receipts carry `owner_delivery_page_<class>`.
 
 ### Controller order
 
-1. Build a class roster read-only (below), pin its SHA-256, then seed it:
+1. Build a class roster read-only (below) and pin its SHA-256. Record the
+   owner's approval for that digest as its own step, under exactly one class:
+   `stoaramactl r2-inverse approve --class CLASS --roster-sha256 HEX
+   --decision TEXT`. Seeding never creates an approval.
+2. Seed the class from the pinned roster:
    `stoaramactl r2-inverse exempt --class CLASS --roster FILE
    --expected-roster-sha256 HEX --picks docs/records/r2-picks-20261118.json
    --expected-picks-sha256 HEX`. The whole roster is admitted in one
-   transaction, or nothing is.
-2. `outside_window` can be seeded and retired now:
-   `stoaramactl r2-inverse job --lane collated ...`.
-3. Handoff (a) and (b): the in-window videos are copied and certified on the
+   transaction, or nothing is, and every row references the approval recorded
+   above for that class and digest.
+3. `outside_window` can be seeded and retired now:
+   `stoaramactl r2-inverse job-collated ...`.
+4. Handoff (a) and (b): the in-window videos are copied and certified on the
    NAS and the static CSV+JSON manifest of old links to NAS paths is published.
-4. Handoff (c): take the old page down, then run
-   `stoaramactl r2-inverse page-retired --generation HEX32 --registry-state
-   disabled|retired` once. The marker is inert on its own: `r2_delivery_page_retired()`
-   is true only when the marker exists **and** the exact serving generation it
-   names is recorded disabled or retired in `r2_delivery_page_registry_events`.
-   The command records that state and refuses to write the marker unless the
-   function already returns true. This opens `confident_repair`.
-5. Seed `confident_repair` and run the collated job. Seed `in_window` once the
+5. Handoff (c): take the old page down, then run
+   `stoaramactl r2-inverse page-retired --generation HEX32 --decision TEXT`
+   once. Every public delivery route reads that one committed row live, so the
+   command *is* the page going down: the page, its metadata, download tickets
+   and file responses all refuse from then on, for the current and for every
+   pinned generation. It refuses while any issued download ticket is still
+   unexpired, so the outstanding capabilities drain first.
+   `r2_delivery_page_retired()` reads exactly that row. This opens
+   `confident_repair`.
+6. Seed `confident_repair` and run the collated job. Seed `in_window` once the
    0224 follow-up certifies the copies; until then it stays held.
 
 ### Read-only roster queries

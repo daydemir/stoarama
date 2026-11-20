@@ -555,6 +555,10 @@ func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 		runR2InverseExempt(ctx, cfg, args[1:])
 		return
 	}
+	if len(args) > 0 && args[0] == "approve" {
+		runR2InverseApprove(ctx, cfg, args[1:])
+		return
+	}
 	if len(args) > 0 && args[0] == "page-retired" {
 		runR2InversePageRetired(ctx, cfg, args[1:])
 		return

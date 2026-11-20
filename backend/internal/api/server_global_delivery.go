@@ -22,7 +22,14 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/util"
 	webassets "github.com/daydemir/stoarama/backend/web"
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// errDeliveryPageRetired is the one answer every public delivery route gives once
+// the page is retired: page, metadata, ticket and file, for the current and for
+// every pinned generation.
+var errDeliveryPageRetired = errors.New("the public delivery page is retired")
 
 const globalDeliveryPrefix = "datasets/global-street-scores-delivery/47/"
 const publicGlobalDeliveryAPI = "/api/v1/global-street-scores-delivery"
@@ -56,6 +63,83 @@ type globalDeliveryObjectStore interface {
 	OpenExact(context.Context, string, string, string) (io.ReadCloser, error)
 	OpenExactRange(context.Context, string, string, string, int64, int64) (io.ReadCloser, error)
 	PresignGetExactDownloadRequest(context.Context, string, string, string, string, time.Duration) (r2.PresignedRequest, error)
+}
+
+// deliveryRetirementReader answers the one question the public serving path
+// asks: is the old delivery page retired right now? The pool implementation reads
+// r2_delivery_page_retired() live on every call; there is no cache.
+type deliveryRetirementReader interface {
+	DeliveryPageRetired(context.Context) (bool, error)
+}
+
+type poolDeliveryRetirement struct{ q deliveryKeepQuerier }
+
+func (p poolDeliveryRetirement) DeliveryPageRetired(ctx context.Context) (bool, error) {
+	var retired bool
+	if err := p.q.QueryRow(ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil {
+		return false, errors.New("delivery retirement state unavailable")
+	}
+	return retired, nil
+}
+
+// deliveryTicketLedger records a public download capability under the same lock
+// retirement takes, so a capability can never outlive the page that issued it.
+type deliveryTicketLedger interface {
+	RecordPublicDeliveryTicket(context.Context, globalDeliveryObject, string, time.Duration) (bool, error)
+}
+
+type poolDeliveryTickets struct{ pool *pgxpool.Pool }
+
+func (p poolDeliveryTickets) RecordPublicDeliveryTicket(ctx context.Context, object globalDeliveryObject, pathSHA string, ttl time.Duration) (bool, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return false, errors.New("delivery ticket ledger unavailable")
+	}
+	defer tx.Rollback(context.Background())
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, deliveryTicketLock); err != nil {
+		return false, err
+	}
+	var id int64
+	err = tx.QueryRow(ctx, `INSERT INTO r2_delivery_download_tickets(bucket,object_key,etag,size_bytes,object_path_sha256,expires_at)
+ SELECT $1,$2,$3,$4,$5,clock_timestamp()+$6::interval
+ WHERE NOT r2_delivery_page_retired() RETURNING id`,
+		"stoarama", object.Key, strings.Trim(object.ETag, `"`), object.SizeBytes, pathSHA, ttl.String()).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, tx.Commit(ctx)
+}
+
+// deliveryPageRetired reads the committed serving state live, on every call.
+// There is no cache and no bypass: retirement is a serving fact, not a claim.
+func (s *Server) deliveryPageRetired(ctx context.Context) (bool, error) {
+	if s.deliveryRetirement != nil {
+		return s.deliveryRetirement.DeliveryPageRetired(ctx)
+	}
+	if s.pool == nil {
+		return false, errors.New("delivery retirement state unavailable")
+	}
+	return poolDeliveryRetirement{s.pool}.DeliveryPageRetired(ctx)
+}
+
+// refuseRetiredPublicDelivery refuses a public delivery request while the page is
+// retired, before any HTML, registry, ticket or file byte is produced. A reader
+// that cannot answer refuses too: a serving path that cannot prove the page is up
+// must not serve it.
+func (s *Server) refuseRetiredPublicDelivery(w http.ResponseWriter, r *http.Request) bool {
+	retired, err := s.deliveryPageRetired(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "Delivery availability is unavailable. Reload to retry.")
+		return true
+	}
+	if retired {
+		util.WriteError(w, http.StatusGone, "This dataset has been retired. See the published file list for NAS paths.")
+		return true
+	}
+	return false
 }
 
 func (s *Server) globalDeliveryObjectStore() globalDeliveryObjectStore {
@@ -111,6 +195,19 @@ func (s *Server) loadGlobalDeliveryRegistry(ctx context.Context) (*globalDeliver
 	return s.loadGlobalDeliveryRegistryScope(ctx, false, "")
 }
 func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public bool, generation string) (*globalDeliveryRegistry, error) {
+	// A retired page serves nothing at all: no registry, for any generation. This
+	// check runs before the cleanup fence, before the cached current and pinned
+	// registries, and before any object read, so retirement cannot be bypassed by
+	// a warm cache or by pinning the generation that was serving.
+	if public {
+		retired, err := s.deliveryPageRetired(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if retired {
+			return nil, errDeliveryPageRetired
+		}
+	}
 	// While cleanup permits can be outstanding, serve the immutable reviewed
 	// public generation. A direct registry publication cannot introduce a new
 	// protected source midway through a separately approved deletion batch.
@@ -227,6 +324,9 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 	return &result, nil
 }
 func (s *Server) handleGlobalDeliveryPage(w http.ResponseWriter, r *http.Request) {
+	if s.refuseRetiredPublicDelivery(w, r) {
+		return
+	}
 	pageName := "global-delivery/index.html"
 	if r.URL.Path == "/global-street-scores-delivery/files" {
 		pageName = "global-delivery/files.html"
@@ -240,6 +340,9 @@ func (s *Server) handleGlobalDeliveryPage(w http.ResponseWriter, r *http.Request
 	writeHTML(w, body)
 }
 func (s *Server) handleGlobalDeliveryStatic(w http.ResponseWriter, r *http.Request) {
+	if s.refuseRetiredPublicDelivery(w, r) {
+		return
+	}
 	name := chi.URLParam(r, "*")
 	if name == "" || strings.Contains(name, "..") || strings.HasPrefix(name, "/") {
 		http.NotFound(w, r)
@@ -266,6 +369,10 @@ func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Reques
 	}
 	registry, err := s.loadGlobalDeliveryRegistryScope(r.Context(), public, r.URL.Query().Get("generation"))
 	if err != nil {
+		if errors.Is(err, errDeliveryPageRetired) {
+			util.WriteError(w, http.StatusGone, "This dataset has been retired. See the published file list for NAS paths.")
+			return
+		}
 		util.WriteError(w, http.StatusServiceUnavailable, "Verified dataset metadata is temporarily unavailable. Reload to retry.")
 		return
 	}
@@ -334,6 +441,10 @@ func (s *Server) globalDeliveryFile(w http.ResponseWriter, r *http.Request) (glo
 	}
 	registry, err := s.loadGlobalDeliveryRegistryScope(r.Context(), public, r.URL.Query().Get("generation"))
 	if err != nil {
+		if errors.Is(err, errDeliveryPageRetired) {
+			util.WriteError(w, http.StatusGone, "This dataset has been retired. See the published file list for NAS paths.")
+			return globalDeliveryObject{}, false
+		}
 		util.WriteError(w, http.StatusServiceUnavailable, "Verified file registry unavailable.")
 		return globalDeliveryObject{}, false
 	}
@@ -360,6 +471,28 @@ func (s *Server) globalDeliveryFile(w http.ResponseWriter, r *http.Request) (glo
 	}
 	return object, true
 }
+
+// deliveryTicketLock serializes minting a public download capability against page
+// retirement. A ticket minted under the shared lock commits before retirement can
+// check its drain; retirement under the exclusive lock makes every later mint see
+// the retired row and refuse. Neither side can leave a live capability unrecorded.
+const deliveryTicketLock int64 = 7343226011104
+
+// deliveryTicketTTL is the capability lifetime the page has always handed out.
+const deliveryTicketTTL = 5 * time.Minute
+
+// deliveryTicketLedger opens the transaction that records a public download
+// capability. The pool is the ledger in production; tests provide a stub.
+func (s *Server) recordPublicTickets(ctx context.Context, object globalDeliveryObject, pathSHA string) (bool, error) {
+	if s.deliveryTickets != nil {
+		return s.deliveryTickets.RecordPublicDeliveryTicket(ctx, object, pathSHA, deliveryTicketTTL)
+	}
+	if s.pool == nil {
+		return false, errors.New("delivery ticket ledger unavailable")
+	}
+	return poolDeliveryTickets{s.pool}.RecordPublicDeliveryTicket(ctx, object, pathSHA, deliveryTicketTTL)
+}
+
 func (s *Server) handleGlobalDeliveryTicket(w http.ResponseWriter, r *http.Request) {
 	object, ok := s.globalDeliveryFile(w, r)
 	if !ok {
@@ -369,7 +502,7 @@ func (s *Server) handleGlobalDeliveryTicket(w http.ResponseWriter, r *http.Reque
 		util.WriteError(w, http.StatusBadRequest, "Expected SHA-256 is required.")
 		return
 	}
-	capability, err := s.globalDeliveryObjectStore().PresignGetExactDownloadRequest(r.Context(), object.Key, object.ETag, object.VersionID, path.Base(object.Path), 5*time.Minute)
+	capability, err := s.globalDeliveryObjectStore().PresignGetExactDownloadRequest(r.Context(), object.Key, object.ETag, object.VersionID, path.Base(object.Path), deliveryTicketTTL)
 	if err != nil {
 		util.WriteError(w, http.StatusServiceUnavailable, "Download capability unavailable.")
 		return
@@ -380,6 +513,19 @@ func (s *Server) handleGlobalDeliveryTicket(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	pathSHA := sha256.Sum256([]byte(storageURL.EscapedPath()))
+	// A public capability is recorded before it is handed out, so a retirement
+	// that follows is guaranteed to see and drain it.
+	if strings.HasPrefix(r.URL.Path, publicGlobalDeliveryAPI+"/") {
+		minted, err := s.recordPublicTickets(r.Context(), object, hex.EncodeToString(pathSHA[:]))
+		if err != nil {
+			util.WriteError(w, http.StatusServiceUnavailable, "Download capability unavailable.")
+			return
+		}
+		if !minted {
+			util.WriteError(w, http.StatusGone, "This dataset has been retired. See the published file list for NAS paths.")
+			return
+		}
+	}
 	headers := map[string]string{}
 	for k, v := range capability.Headers {
 		if strings.EqualFold(k, "If-Match") && len(v) > 0 {
@@ -387,7 +533,7 @@ func (s *Server) handleGlobalDeliveryTicket(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	w.Header().Set("Cache-Control", "private, no-store")
-	util.WriteJSON(w, http.StatusOK, map[string]any{"transport": "r2-direct", "url": capability.URL, "storage_host": storageURL.Hostname(), "object_path_sha256": hex.EncodeToString(pathSHA[:]), "expires_at": time.Now().Add(5 * time.Minute).Unix(), "required_headers": headers, "etag": `"` + strings.Trim(object.ETag, `"`) + `"`, "sha256": object.SHA256, "size_bytes": object.SizeBytes, "filename": path.Base(object.Path), "ttl_seconds": 300})
+	util.WriteJSON(w, http.StatusOK, map[string]any{"transport": "r2-direct", "url": capability.URL, "storage_host": storageURL.Hostname(), "object_path_sha256": hex.EncodeToString(pathSHA[:]), "expires_at": time.Now().Add(deliveryTicketTTL).Unix(), "required_headers": headers, "etag": `"` + strings.Trim(object.ETag, `"`) + `"`, "sha256": object.SHA256, "size_bytes": object.SizeBytes, "filename": path.Base(object.Path), "ttl_seconds": int(deliveryTicketTTL.Seconds())})
 }
 func (s *Server) handleGlobalDeliveryFile(w http.ResponseWriter, r *http.Request) {
 	object, ok := s.globalDeliveryFile(w, r)

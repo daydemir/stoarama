@@ -139,10 +139,18 @@ type deliveryKeepQuerier interface {
 
 // RequireDeliveryKeep checks all exact identities in one statement. Missing
 // schema/rows, or any identity drift, revoke every retirement class. It is
-// also the publication gate: links cannot be served before their holds exist.
+// also the publication gate: links cannot be served before their holds exist,
+// and nothing may be republished once the page is retired.
 func RequireDeliveryKeep(ctx context.Context, q deliveryKeepQuerier, s DeliveryKeepSnapshot) error {
 	if len(s.Objects) == 0 {
 		return errors.New("delivery keep snapshot missing")
+	}
+	var retired bool
+	if err := q.QueryRow(ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil {
+		return errors.New("delivery page retirement state unavailable")
+	}
+	if retired {
+		return errors.New("the public delivery page is retired; publication is refused")
 	}
 	rows := make([]DeliveryKeepIdentity, 0, len(s.Objects))
 	for _, o := range s.Objects {

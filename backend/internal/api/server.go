@@ -53,6 +53,13 @@ type Server struct {
 	publicPinnedDeliveryRegistry   *globalDeliveryRegistry
 	publicGlobalDeliveryRegistry   *globalDeliveryRegistry
 	publicGlobalDeliveryRegistryAt time.Time
+	// deliveryRetirement overrides the live retirement reader in tests. Production
+	// leaves it nil and reads r2_delivery_page_retired() from the pool on every
+	// public delivery request.
+	deliveryRetirement deliveryRetirementReader
+	// deliveryTickets is the ticket ledger in tests. Production leaves it nil and
+	// records public capabilities on the pool.
+	deliveryTickets deliveryTicketLedger
 
 	cfg                      config.Config
 	pool                     *pgxpool.Pool

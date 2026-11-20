@@ -39,7 +39,7 @@ var deliveryExemptionDecisions = map[deliveryExemptionClass]string{
 	deliveryExemptInWindow:        `Deniz 2026-11-19: "File list only": copy and certify the 2.35 TB of in-window videos on the NAS, publish a static CSV+JSON manifest mapping each old link to its NAS path, take the old page down, then delete the in-window R2 copies.`,
 }
 
-// deliveryPageRetiredDecision is the owner decision the page retirement marker
+// deliveryPageRetiredDecision is the owner decision the page retirement row
 // records. The controller sets it once, after the old page is taken down.
 const deliveryPageRetiredDecision = `Deniz 2026-11-19: "File list only": the old delivery page is taken down and its R2 registry retired once the in-window videos are certified on the NAS and the static CSV+JSON manifest of old links to NAS paths is published.`
 
@@ -137,21 +137,25 @@ func deliveryExemptionClassOf(x inverseCollatedAssessment, ok bool) (deliveryExe
 // is deciding whether to exempt this exact page key, so its own page hold cannot
 // be the veto; every other hold still refuses the row.
 const inverseSeedHeldSQL = `SELECT
- EXISTS(SELECT 1 FROM nas_cleanup_incident_roster i WHERE i.bucket=$1 AND i.object_key=$2)
- OR EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.bucket=$1 AND x.object_key=$2)
- OR EXISTS(SELECT 1 FROM nas_r2_copy_items ci WHERE (ci.state<>'verified' OR ci.blocked_reason<>'')
-   AND ci.item->>'bucket'=$1 AND ci.item->>'object_key'=$2)
- OR EXISTS(SELECT 1 FROM r2_nonraw_intents ni WHERE ni.bucket=$1 AND ni.object_key=$2)
- OR EXISTS(SELECT 1 FROM r2_inverse_intents ri WHERE ri.bucket=$1 AND ri.object_key=$2)
- OR EXISTS(SELECT 1 FROM r2_keep28_intents ki WHERE ki.bucket=$1 AND ki.object_key=$2)
- OR EXISTS(SELECT 1 FROM r2_retirement_reservations rv WHERE rv.bucket=$1 AND rv.object_key=$2)
- OR EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds sh WHERE sh.bucket=$1 AND sh.object_key=$2 AND sh.released_at IS NULL)
- OR r2_owner_keep_held($1,$2)`
+ r2_nonraw_key_held_except_page($1,$2,'collated',0)`
 
-// loadSeedAssessment loads one roster key's live assessment with its own page
-// veto removed and no exemption consulted, so the seed sees exactly the class the
-// collated executor would compute once the exemption exists. Every other rule
-// (KE, sources, uncertainty, owner decision, pinned window) is the executor's.
+// inverseSeedBatchSQL is the collated executor's own batch statement with only
+// its page-key hold term replaced by the page-free one. Everything else the
+// classifier reads — source reservations, incidents, restores, joined snapshot
+// and dry-run scopes, unresolved or duplicate sources, KE and pinned windows — is
+// exactly the executor's, so a seed can never see a weaker answer than the wire.
+var inverseSeedBatchSQL = strings.Replace(
+	inverseNonrawBatchSQL,
+	"r2_nonraw_key_held($1,o.object_key,'collated',o.id)",
+	"r2_nonraw_key_held_except_page($1,o.object_key,'collated',o.id)",
+	1,
+)
+
+// loadSeedAssessment loads one roster key's live assessment with ONLY its own page
+// veto suppressed and no exemption consulted, so the seed sees exactly the class
+// the collated executor would compute once the exemption exists. No other rule is
+// dropped and no reason is cleared: a source-level hold or an unresolved source
+// closure refuses the row here just as it would at the wire.
 func loadSeedAssessment(ctx context.Context, q r2RetireQuerier, bucket, key string, p inverseProtection) (inverseCollatedAssessment, error) {
 	kind, known := inverseNonrawKindOf(key)
 	if !known {
@@ -176,7 +180,7 @@ func loadSeedAssessment(ctx context.Context, q r2RetireQuerier, bucket, key stri
 		}
 		return assessRepair(p, x), nil
 	}
-	rows, err := q.Query(ctx, inverseNonrawBatchSQL+` WHERE o.object_key=$2`, bucket, key)
+	rows, err := q.Query(ctx, inverseSeedBatchSQL+` WHERE o.object_key=$2`, bucket, key)
 	if err != nil {
 		return x, err
 	}
@@ -193,12 +197,8 @@ func loadSeedAssessment(ctx context.Context, q r2RetireQuerier, bucket, key stri
 	if err != nil || n != 1 {
 		return x, errInverseNonrawIneligible
 	}
-	// Replace the page-inclusive hold with the page-free one, then re-assess with
-	// the executor's own function so no other liveness check is skipped.
-	if x.Held, err = scanSeedHeld(ctx, q, bucket, key); err != nil {
-		return x, err
-	}
-	x.Reason = ""
+	// Re-assess with the executor's own function. scanCollated's own reasons (an
+	// empty, duplicate or unresolved source closure) are never cleared.
 	return assessCollated(p, x), nil
 }
 
@@ -208,6 +208,40 @@ func scanSeedHeld(ctx context.Context, q r2RetireQuerier, bucket, key string) (b
 	return held, err
 }
 
+// deliveryExemptionApproval is one pre-recorded owner approval for a roster.
+// Approvals are written by their own command step, with the decision text, BEFORE
+// any seeding, so a seed can only ever consume authority the owner already gave.
+type deliveryExemptionApproval struct {
+	ID        int64                  `json:"id"`
+	Class     deliveryExemptionClass `json:"class"`
+	RosterSHA string                 `json:"roster_sha256"`
+	Decision  string                 `json:"decision"`
+	CreatedAt string                 `json:"created_at"`
+}
+
+// recordDeliveryExemptionApproval records the owner's approval for one roster
+// digest under exactly one class. It is a separate step from seeding: seeding
+// consumes an approval, it never creates one.
+func recordDeliveryExemptionApproval(ctx context.Context, pool *pgxpool.Pool, class deliveryExemptionClass, rosterSHA, decision string) (deliveryExemptionApproval, error) {
+	var out deliveryExemptionApproval
+	out.Class, out.RosterSHA, out.Decision = class, rosterSHA, decision
+	if _, ok := deliveryExemptionDecisions[class]; !ok {
+		return out, fmt.Errorf("unknown exemption class %q", class)
+	}
+	if !r2RetireLowerHex64(rosterSHA) {
+		return out, errors.New("invalid roster SHA256")
+	}
+	if strings.TrimSpace(decision) == "" {
+		return out, errors.New("an approval needs the owner's decision text")
+	}
+	err := pool.QueryRow(ctx, `INSERT INTO r2_delivery_exemption_approvals(class,roster_sha256,decision)
+ VALUES($1::r2_delivery_exemption_class,$2,$3) RETURNING id,created_at::text`, string(class), rosterSHA, decision).Scan(&out.ID, &out.CreatedAt)
+	if err != nil {
+		return out, fmt.Errorf("roster digest %s cannot be approved for %s: %w", rosterSHA, class, err)
+	}
+	return out, nil
+}
+
 // seedDeliveryExemptions admits one class from a pinned roster in a single READ
 // COMMITTED transaction: all rows or none. Every row's class is recomputed with
 // the same live classifier the collated executor uses, and it must equal the
@@ -215,7 +249,7 @@ func scanSeedHeld(ctx context.Context, q r2RetireQuerier, bucket, key string) (b
 // decision. 0225's admission trigger checks each row's exact live page identity,
 // its class shape and its own class/roster approval.
 func seedDeliveryExemptions(ctx context.Context, pool *pgxpool.Pool, class deliveryExemptionClass, rows []deliveryExemptionRow, rosterSHA string, picks r2RetirePicks) (int64, error) {
-	decision, ok := deliveryExemptionDecisions[class]
+	_, ok := deliveryExemptionDecisions[class]
 	if !ok {
 		return 0, fmt.Errorf("unknown exemption class %q", class)
 	}
@@ -291,21 +325,24 @@ func seedDeliveryExemptions(ctx context.Context, pool *pgxpool.Pool, class deliv
 			return 0, fmt.Errorf("roster key %s is %s under the live classifier, not %s", row.ObjectKey, computed, class)
 		}
 	}
-	var approvalID int64
-	if err = tx.QueryRow(ctx, `INSERT INTO r2_delivery_exemption_approvals(class,roster_sha256,decision)
- VALUES($1::r2_delivery_exemption_class,$2,$3) ON CONFLICT(class,roster_sha256) DO NOTHING RETURNING id`, string(class), rosterSHA, decision).Scan(&approvalID); err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return 0, err
+	// Seeding CONSUMES the owner's approval; it never creates one. The approval
+	// must already exist for exactly this class and roster digest, and its own
+	// recorded decision text is what the rows carry.
+	var approval deliveryExemptionApproval
+	if err = tx.QueryRow(ctx, `SELECT id,class::text,decision FROM r2_delivery_exemption_approvals WHERE roster_sha256=$1`, rosterSHA).
+		Scan(&approval.ID, &approval.Class, &approval.Decision); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, fmt.Errorf("roster digest %s has no recorded owner approval; record it first with r2-inverse approve", rosterSHA)
 		}
-		if err = tx.QueryRow(ctx, `SELECT id FROM r2_delivery_exemption_approvals WHERE class=$1::r2_delivery_exemption_class AND roster_sha256=$2 AND decision=$3`,
-			string(class), rosterSHA, decision).Scan(&approvalID); err != nil {
-			return 0, fmt.Errorf("approved roster digest %s was recorded for another class or decision: %w", rosterSHA, err)
-		}
+		return 0, err
+	}
+	if approval.Class != class {
+		return 0, fmt.Errorf("roster digest %s is approved for %s, not %s; an approved roster can never be replayed", rosterSHA, approval.Class, class)
 	}
 	tag, err := tx.Exec(ctx, `INSERT INTO r2_delivery_exemptions(bucket,object_key,etag,size_bytes,class,approval_id,decision,roster_sha256)
  SELECT r.bucket,r.object_key,r.etag,r.size_bytes,$5::r2_delivery_exemption_class,$6,$7,$8
  FROM unnest($1::text[],$2::text[],$3::text[],$4::bigint[]) r(bucket,object_key,etag,size_bytes)`,
-		buckets, keys, etags, sizes, string(class), approvalID, decision, rosterSHA)
+		buckets, keys, etags, sizes, string(class), approval.ID, approval.Decision, rosterSHA)
 	if err != nil {
 		return 0, err
 	}
@@ -313,6 +350,29 @@ func seedDeliveryExemptions(ctx context.Context, pool *pgxpool.Pool, class deliv
 		return 0, fmt.Errorf("seeded %d of %d roster rows", tag.RowsAffected(), len(rows))
 	}
 	return tag.RowsAffected(), tx.Commit(ctx)
+}
+
+// runR2InverseApprove records the owner's approval for one roster digest, under
+// exactly one class, before seeding. It is deliberately its own step: an approval
+// carries the owner's decision text and is written by a human decision, whereas
+// seeding may only consume it.
+func runR2InverseApprove(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("r2-inverse approve", flag.ExitOnError)
+	className := fs.String("class", "", "outside_window, confident_repair or in_window")
+	rosterSHA := fs.String("roster-sha256", "", "the exact roster digest being approved")
+	decision := fs.String("decision", "", "the owner's decision text for this roster")
+	const usage = "usage: stoaramactl r2-inverse approve --class CLASS --roster-sha256 HEX --decision TEXT"
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *decision == "" {
+		log.Fatal(usage)
+	}
+	pool := mustOpenPool(ctx, cfg)
+	defer pool.Close()
+	approval, err := recordDeliveryExemptionApproval(ctx, pool, deliveryExemptionClass(*className), *rosterSHA, *decision)
+	if err != nil {
+		log.Fatal(err)
+	}
+	data, _ := json.Marshal(approval)
+	fmt.Println(string(data))
 }
 
 func runR2InverseExempt(ctx context.Context, cfg config.Config, args []string) {
@@ -351,17 +411,48 @@ func runR2InverseExempt(ctx context.Context, cfg config.Config, args []string) {
 	fmt.Println(string(data))
 }
 
-// runR2InversePageRetired records that the old delivery page is down. The marker
-// is inert until the serving generation it names is recorded disabled or
-// retired, and this command refuses to write it unless that is already true: a
-// marker can never be what makes the page down. It opens the confident_repair
-// gate and half of the in_window gate, once, for good.
+// retireDeliveryPage sets the committed serving state inside tx, then proves with
+// the same live function every serving route and every gate reads that the page is
+// down. It refuses while any issued download capability is still unexpired, so the
+// outstanding tickets are drained rather than left live behind a retired page.
+func retireDeliveryPage(ctx context.Context, tx pgx.Tx, generation, decision string) (string, error) {
+	if !r2RetireLowerHex32(generation) || strings.TrimSpace(decision) == "" {
+		return "", errors.New("a retirement needs its serving generation and the owner's decision")
+	}
+	// Serialize against ticket minting: after this exclusive lock, no new public
+	// capability can be recorded, so the drain below is complete.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, 7343226011104); err != nil {
+		return "", err
+	}
+	var live int64
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM r2_delivery_download_tickets WHERE expires_at>clock_timestamp()`).Scan(&live); err != nil {
+		return "", err
+	}
+	if live != 0 {
+		return "", fmt.Errorf("refusing to retire the page while %d issued download tickets are still unexpired; wait for them to expire", live)
+	}
+	var at string
+	if err := tx.QueryRow(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,$2) RETURNING retired_at::text`,
+		generation, decision).Scan(&at); err != nil {
+		return "", err
+	}
+	var retired bool
+	if err := tx.QueryRow(ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil || !retired {
+		return "", errors.New("the retirement row did not take effect; refusing to report the page down")
+	}
+	return at, nil
+}
+
+// runR2InversePageRetired sets the committed serving state that takes the old
+// public delivery page down. Every public delivery route reads that state live,
+// so this command is the page going down, not a claim about it.
 func runR2InversePageRetired(ctx context.Context, cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("r2-inverse page-retired", flag.ExitOnError)
-	generation := fs.String("generation", "", "the retired serving registry generation (32 hex)")
-	registryState := fs.String("registry-state", "", "disabled or retired: the generation's live serving state")
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || !r2RetireLowerHex32(*generation) || (*registryState != "disabled" && *registryState != "retired") {
-		log.Fatal("usage: stoaramactl r2-inverse page-retired --generation HEX32 --registry-state disabled|retired (run once, after the old delivery page is taken down)")
+	generation := fs.String("generation", "", "the serving registry generation being retired (32 hex)")
+	decision := fs.String("decision", "", "the owner's decision text taking the page down")
+	const usage = "usage: stoaramactl r2-inverse page-retired --generation HEX32 --decision TEXT (run once, after the old delivery page is taken down)"
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || !r2RetireLowerHex32(*generation) || strings.TrimSpace(*decision) == "" {
+		log.Fatal(usage)
 	}
 	pool := mustOpenPool(ctx, cfg)
 	defer pool.Close()
@@ -370,27 +461,14 @@ func runR2InversePageRetired(ctx context.Context, cfg config.Config, args []stri
 		log.Fatal(err)
 	}
 	defer tx.Rollback(context.Background())
-	// Record the live serving state first, so the marker always names a
-	// generation whose disarm is already durable and append-only.
-	if _, err = tx.Exec(ctx, `INSERT INTO r2_delivery_page_registry_events(generation,state,decision) VALUES($1,$2::r2_delivery_page_registry_state,$3)`,
-		*generation, *registryState, deliveryPageRetiredDecision); err != nil {
-		log.Fatal(fmt.Errorf("record the serving registry state first: %w", err))
-	}
-	var at string
-	if err = tx.QueryRow(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,$2) RETURNING retired_at::text`,
-		*generation, deliveryPageRetiredDecision).Scan(&at); err != nil {
+	at, err := retireDeliveryPage(ctx, tx, *generation, *decision)
+	if err != nil {
 		log.Fatal(err)
-	}
-	// The same live function every gate reads: refuse to leave a marker that the
-	// page is still serving under.
-	var retired bool
-	if err = tx.QueryRow(ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil || !retired {
-		log.Fatal("the serving registry generation is not disabled; refusing the retirement marker")
 	}
 	if err = tx.Commit(ctx); err != nil {
 		log.Fatal(err)
 	}
-	data, _ := json.Marshal(map[string]any{"page_retired_at": at, "generation": *generation, "registry_state": *registryState})
+	data, _ := json.Marshal(map[string]any{"page_retired_at": at, "generation": *generation, "decision": *decision})
 	fmt.Println(string(data))
 }
 

@@ -111,6 +111,15 @@ CREATE TABLE streams(id bigint PRIMARY KEY,local_timezone text);CREATE TABLE rec
 		t.Fatal(err)
 	}
 	installDeliveryFenceTestSchema(t, pool)
+	// RequireDeliveryKeep now refuses to publish while the page is retired, so this
+	// fixture needs the one serving state. It starts serving (no row).
+	if _, err := pool.Exec(ctx, `CREATE TABLE r2_delivery_page_retirement(
+ singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),generation text NOT NULL,decision text NOT NULL,
+ retired_at timestamptz NOT NULL DEFAULT clock_timestamp());
+ CREATE FUNCTION r2_delivery_page_retired() RETURNS boolean LANGUAGE sql STABLE AS $$
+  SELECT EXISTS(SELECT 1 FROM r2_delivery_page_retirement) $$`); err != nil {
+		t.Fatal(err)
+	}
 	return pool
 }
 func cleanupCall(t *testing.T, h http.HandlerFunc, account, key int64, idParam, id string, body any, session ...string) *httptest.ResponseRecorder {
