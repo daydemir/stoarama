@@ -773,14 +773,14 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			defer held.Release()
 			waiting, cancel := step()
 			defer cancel()
-			if _, err = one.Acquire(waiting); err == nil || !inverseDBTransient(waiting, err) {
+			if _, err = one.Acquire(waiting); err == nil || !inverseDBTransient(ctx, waiting, err) {
 				t.Fatalf("pool acquisition deadline: %v", err)
 			}
 		})
 		t.Run("statement_past_its_step_bound_is_transient", func(t *testing.T) {
 			running, cancel := step()
 			defer cancel()
-			if _, err := pool.Exec(running, `SELECT pg_sleep(5)`); err == nil || !inverseDBTransient(running, err) {
+			if _, err := pool.Exec(running, `SELECT pg_sleep(5)`); err == nil || !inverseDBTransient(ctx, running, err) {
 				t.Fatalf("statement past its step bound: %v", err)
 			}
 		})
@@ -798,7 +798,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				time.Sleep(200 * time.Millisecond)
 				pool.Exec(ctx, `SELECT pg_cancel_backend($1)`, pid)
 			}()
-			if _, err = conn.Exec(ctx, `SELECT pg_sleep(5)`); err == nil || inverseDBTransient(ctx, err) {
+			if _, err = conn.Exec(ctx, `SELECT pg_sleep(5)`); err == nil || inverseDBTransient(ctx, ctx, err) {
 				t.Fatalf("operator cancel: %v", err)
 			}
 		})
@@ -1906,6 +1906,8 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}{
 			{"timeouts_then_404", "", []string{"slow", "slow"}, 3, ""},
 			{"5xx_then_404", "", []string{"503"}, 2, ""},
+			{"cloudflare_520_then_404", "", []string{"520"}, 2, ""},
+			{"every_5xx_retries", "", []string{"501", "599"}, 3, ""},
 			{"bare_429_then_404", "", []string{"429"}, 2, ""},
 			{"retry_after_never_stretches_backoff", "", []string{"429-retry-after"}, 2, ""},
 			{"persistent_timeouts_hold_the_key", "", []string{"slow", "slow", "slow", "slow"}, 4, "after 4 attempts"},
@@ -2084,15 +2086,10 @@ func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*inverseSDKStor
 		onHead := store.onHead
 		store.mu.Unlock()
 		if req.Method == http.MethodHead && onHead != nil {
-			switch onHead(key) {
+			switch mode := onHead(key); mode {
+			case "":
 			case "slow":
 				<-req.Context().Done()
-				return
-			case "503":
-				w.WriteHeader(503)
-				return
-			case "429":
-				w.WriteHeader(http.StatusTooManyRequests)
 				return
 			case "429-retry-after":
 				w.Header().Set("X-Amz-Retry-After", "600000")
@@ -2101,6 +2098,12 @@ func inverseSDKTestStore(t *testing.T, store *inverseFakeStore) (*inverseSDKStor
 			case "redirect":
 				http.Redirect(w, req, "/stoarama/elsewhere/"+key, http.StatusTemporaryRedirect)
 				return
+			default:
+				// Any explicit status, so a proxy's 520 can be tested too.
+				if status, err := strconv.Atoi(mode); err == nil && status >= 100 && status <= 599 {
+					w.WriteHeader(status)
+					return
+				}
 			}
 		}
 		store.mu.Lock()

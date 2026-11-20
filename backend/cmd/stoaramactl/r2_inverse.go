@@ -456,38 +456,54 @@ func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 // writeInversePartition writes a read-only full-bucket partition and its
 // summary into a new directory.
 func writeInversePartition(ctx context.Context, cfg config.Config, picksPath, out string) (inverseSummary, error) {
-	picks, err := loadR2RetirePicks(picksPath)
+	pool := mustOpenPool(ctx, cfg)
+	defer pool.Close()
+	p, policy, err := inversePartitionProtection(ctx, cfg, pool, picksPath)
 	if err != nil {
 		return inverseSummary{}, err
+	}
+	return partitionInverseDir(ctx, mustArchiveR2Client(ctx, cfg, pool), p, policy, out)
+}
+
+// inversePartitionProtection reads the picks file and the policy, then loads the
+// protection inputs a full-bucket partition classifies against, in one
+// read-only catalog snapshot.
+func inversePartitionProtection(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, picksPath string) (inverseProtection, string, error) {
+	picks, err := loadR2RetirePicks(picksPath)
+	if err != nil {
+		return inverseProtection{}, "", err
 	}
 	policy, windows, err := api.Keep28Policy()
 	if err != nil {
-		return inverseSummary{}, err
+		return inverseProtection{}, "", err
 	}
-	pool := mustOpenPool(ctx, cfg)
-	defer pool.Close()
 	// Enforced read-only at PostgreSQL, independently of CLI control flow.
 	tx, err := beginInversePartitionTx(ctx, pool)
 	if err != nil {
-		return inverseSummary{}, err
+		return inverseProtection{}, "", err
 	}
 	defer tx.Rollback(ctx)
 	protection, err := loadInverseProtection(ctx, tx, cfg.R2Bucket, picks, windows)
 	if err != nil {
-		return inverseSummary{}, err
+		return inverseProtection{}, "", err
 	}
 	if err = tx.Commit(ctx); err != nil {
-		return inverseSummary{}, err
+		return inverseProtection{}, "", err
 	}
-	store := mustArchiveR2Client(ctx, cfg, pool)
-	if err = os.Mkdir(out, 0700); err != nil {
+	return protection, policy, nil
+}
+
+// partitionInverseDir lists the whole bucket into a new directory, classified
+// against p, and writes its partition.jsonl and summary.json.
+func partitionInverseDir(ctx context.Context, store inverseLister, p inverseProtection, policy, out string) (inverseSummary, error) {
+	if err := os.Mkdir(out, 0700); err != nil {
 		return inverseSummary{}, err
 	}
 	f, err := os.OpenFile(filepath.Join(out, "partition.jsonl"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return inverseSummary{}, err
 	}
-	sum, err := partitionInverse(ctx, store, protection, policy, f)
+	sum, err := partitionInverse(ctx, store, p, policy, f)
 	if err == nil {
 		err = f.Sync()
 	}
@@ -503,6 +519,21 @@ func writeInversePartition(ctx context.Context, cfg config.Config, picksPath, ou
 		err = os.WriteFile(filepath.Join(out, "summary.json"), append(data, '\n'), 0600)
 	}
 	return sum, err
+}
+
+// inverseFreshPartition writes a fresh partition and requires the picks its
+// listing was classified with to be the independently approved ones: the
+// summary records the digest actually read, so a swapped picks file cannot ride
+// along on the approved digest of the file the partition replaced.
+func inverseFreshPartition(ctx context.Context, store inverseLister, p inverseProtection, policy, approvedPicks, out string) (inverseSummary, error) {
+	sum, err := partitionInverseDir(ctx, store, p, policy, out)
+	if err != nil {
+		return sum, err
+	}
+	if sum.PicksSHA256 != approvedPicks {
+		return sum, errors.New("partition read owner picks other than the approved digest")
+	}
+	return sum, nil
 }
 
 // Both full partition and bounded apply use the same KE path normalization and

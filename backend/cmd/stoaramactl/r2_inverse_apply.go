@@ -504,10 +504,15 @@ const (
 
 // inverseDBTransient reports a database step that ran out of its own bound
 // (waiting for a pool connection, a lock or a statement), or lost to lock
-// contention. An explicit cancel (57014: publication disables the role's
-// statement_timeout, so only a cancel raises it), a refusal or an inconsistent
-// publication is never transient.
-func inverseDBTransient(step context.Context, err error) bool {
+// contention. A step whose parent already ended never got its own bound: a
+// parent cancel or deadline stops the job and holds nothing, because the 404
+// that confirmed the DELETE is not this step's failure. An explicit cancel
+// (57014: publication disables the role's statement_timeout, so only a cancel
+// raises it), a refusal or an inconsistent publication is never transient.
+func inverseDBTransient(parent, step context.Context, err error) bool {
+	if parent.Err() != nil {
+		return false
+	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		return pgErr.Code == pgLockNotAvailable || pgErr.Code == pgDeadlockDetected || pgErr.Code == pgSerializationFailure
@@ -591,7 +596,7 @@ func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGat
 	committing, cancel := context.WithTimeout(ctx, inverseDBTimeout)
 	defer cancel()
 	if err = tx.Commit(committing); err != nil {
-		return fail(inverseStepCommit, inverseHoldUnpublished(committing, err))
+		return fail(inverseStepCommit, inverseHoldUnpublished(ctx, committing, err))
 	}
 	if err = a.publishConfirmed(ctx, e); err != nil {
 		return fail(inverseStepPublish, err)
@@ -600,9 +605,11 @@ func (a *inverseApplier) delete(ctx, admit context.Context, send *inverseSendGat
 }
 
 // inverseHoldUnpublished turns a transient database failure after a confirmed
-// DELETE into errInverseUnpublished; any other failure stays a hard one.
-func inverseHoldUnpublished(step context.Context, err error) error {
-	if inverseDBTransient(step, err) {
+// DELETE into errInverseUnpublished; any other failure stays a hard one. A
+// parent that already ended stops the job instead: nothing about the confirmed
+// absence is in doubt, only this run stopped.
+func inverseHoldUnpublished(parent, step context.Context, err error) error {
+	if inverseDBTransient(parent, step, err) {
 		return fmt.Errorf("%w: %w", errInverseUnpublished, err)
 	}
 	return err
@@ -616,14 +623,15 @@ func (a *inverseApplier) publishConfirmed(ctx context.Context, e inverseEntry) e
 	for attempt := 1; ; attempt++ {
 		db, cancel := context.WithTimeout(ctx, inverseDBTimeout)
 		err := a.publishAbsent(db, e, a.opts.ManifestSHA)
-		held := inverseHoldUnpublished(db, err)
+		held := inverseHoldUnpublished(ctx, db, err)
 		cancel()
 		if !errors.Is(held, errInverseUnpublished) || attempt == inversePublishAttempts {
 			return held
 		}
 		select {
 		case <-ctx.Done():
-			return held
+			// The parent ended mid-retry: this is a stopped job, not a held key.
+			return err
 		case <-time.After(time.Duration(attempt) * time.Second):
 		}
 	}

@@ -213,9 +213,11 @@ type inverseSDKStore struct {
 // The confirming HEAD after an answered DELETE is a read, so it alone retries:
 // at most 4 attempts of at most 4s each, with full-jitter backoff of at most
 // 2s between them, under its own 22s deadline inside the caller's network and
-// custody bounds. Only timeouts, connection errors, 429, 5xx and throttling
-// retry, and a provider's retry-after never stretches the backoff. Only a 404
-// for the exact key confirms: a redirect is refused, and a 200 fails at once.
+// custody bounds. Only timeouts, connection errors, 429, every 5xx and
+// throttling retry, and a provider's retry-after never stretches the backoff.
+// Each attempt is one request on its own fresh connection, so neither the
+// transport nor the SDK can turn one attempt into two. Only a 404 for the exact
+// key confirms: a redirect is refused, and a 200 fails at once.
 const (
 	inverseConfirmAttempts       = 4
 	inverseConfirmAttemptTimeout = 4 * time.Second
@@ -223,12 +225,40 @@ const (
 	inverseConfirmTimeout        = inverseConfirmAttempts*inverseConfirmAttemptTimeout + (inverseConfirmAttempts-1)*inverseConfirmMaxBackoff
 )
 
-// inverseConfirmRetryable is the SDK's default retry classification plus a
-// bare 429, which carries no throttling error code on a HEAD.
-var inverseConfirmRetryable = retry.IsErrorRetryables(append(slices.Clone(retry.DefaultRetryables), retry.RetryableHTTPStatusCode{Codes: map[int]struct{}{http.StatusTooManyRequests: {}}}))
+// inverseConfirmRetryable is the SDK's default retry classification widened to
+// every 5xx, plus a bare 429, which carries no throttling error code on a HEAD.
+// A Cloudflare-fronted provider answers a transient failure as 520-599, and the
+// SDK's default set covers only 500/502/503/504.
+var inverseConfirmRetryable = retry.IsErrorRetryables(append(
+	slices.Clone(retry.DefaultRetryables),
+	retry.RetryableHTTPStatusCode{Codes: inverseTransientHTTPStatus()},
+))
 
+// inverseTransientHTTPStatus is every server-side status, 500 through 599, plus
+// 429: a confirming HEAD may retry those, and nothing else.
+func inverseTransientHTTPStatus() map[int]struct{} {
+	codes := map[int]struct{}{http.StatusTooManyRequests: {}}
+	for status := 500; status <= 599; status++ {
+		codes[status] = struct{}{}
+	}
+	return codes
+}
+
+// The confirming HEAD sends exactly one request per attempt, so its client
+// carries the attempt's own deadline on a fresh HTTP/1.1 connection: no
+// keep-alive means no pooled connection can be reused, and a reused connection
+// closing under a request is the only case Go's HTTP transport replays.
 func newInverseConfirmClient(attempt time.Duration) *http.Client {
-	return &http.Client{Transport: awshttp.NewBuildableClient().GetTransport(), Timeout: attempt, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	transport := awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
+		t.ForceAttemptHTTP2 = false
+		t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+		t.Protocols = new(http.Protocols)
+		t.Protocols.SetHTTP1(true)
+		t.TLSClientConfig = t.TLSClientConfig.Clone()
+		t.TLSClientConfig.NextProtos = []string{"http/1.1"}
+		t.DisableKeepAlives = true
+	}).GetTransport()
+	return &http.Client{Transport: transport, Timeout: attempt, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
 // newInverseDeleteHTTPTransport carries every DELETE over its own fresh HTTP/1.1

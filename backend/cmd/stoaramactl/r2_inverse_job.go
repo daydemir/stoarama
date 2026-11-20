@@ -119,24 +119,37 @@ func (t *inverseApplySummary) addBatch(r inverseApplySummary) {
 	}
 }
 
-// inverseJobPartition writes and stores a fresh partition, or restores the
-// stored one f.reuse names, and returns its summary and digest.
+// inverseJobPartition stores a fresh partition, or restores the stored one
+// f.reuse names, and returns its summary and digest. Either way it requires the
+// picks its listing was classified with to be the approved digest.
 func inverseJobPartition(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, store inverseLister, f inverseJobFlags, dir string) (inverseSummary, string, error) {
 	if f.reuse != "" {
 		sum, err := reuseInversePartition(ctx, pool, store, f.picks, f.picksSHA, f.reuse, dir)
 		return sum, f.reuse, err
 	}
-	sum, err := writeInversePartition(ctx, cfg, f.picks, dir)
+	p, policy, err := inversePartitionProtection(ctx, cfg, pool, f.picks)
+	if err != nil {
+		return inverseSummary{}, "", err
+	}
+	sum, err := inverseFreshPartition(ctx, store, p, policy, f.picksSHA, dir)
 	if err != nil {
 		return sum, "", err
 	}
-	// Bind the approved digest to the bytes the partition actually read; every
-	// apply re-reads the picks file and must match this summary digest.
-	if sum.PicksSHA256 != f.picksSHA {
-		return sum, "", errors.New("partition read owner picks other than the approved digest")
-	}
 	digest, err := storeInversePartition(ctx, pool, dir)
 	return sum, digest, err
+}
+
+// approvedInversePicks requires the on-disk picks file to be the independently
+// approved digest before anything is read from it.
+func approvedInversePicks(picks, approved string) error {
+	digest, err := inverseFileSHA(picks)
+	if err != nil {
+		return err
+	}
+	if digest != approved {
+		return errors.New("owner picks differ from the approved digest")
+	}
+	return nil
 }
 
 type inverseJobFlags struct {

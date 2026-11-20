@@ -91,11 +91,19 @@ a confirming 404 for the exact key. The confirming HEAD is a read, so it alone
 retries, in the executor's own loop rather than the SDK's: at most 4 attempts of
 at most 4 seconds each, with full-jitter backoff of at most 2 seconds between
 them, under its own 22-second deadline inside the key's network deadline (and,
-for keep-28, custody end). Only timeouts, connection errors, 429, 5xx and
-throttling retry, and a provider's `X-Amz-Retry-After` never stretches the
+for keep-28, custody end). Each attempt is one request on its own fresh HTTP/1.1
+connection with keep-alives off, so neither the transport nor the SDK can turn
+one attempt into two: four attempts send exactly four HEADs. Only timeouts,
+connection errors, 429, every 5xx (including a proxy's 520-599) and throttling
+retry, and a provider's `X-Amz-Retry-After` never stretches the
 backoff. It follows no redirect: a 404 from anywhere but the key cannot confirm
 it. A 200 means the object remains: it fails at once. When every attempt fails,
 the job stops and the key stays held, as a lost response does.
+
+A publication step whose parent context ended first — the job cancelled or its
+deadline passed before the step's own 2-minute bound — stops the job and holds
+nothing; it is not an unpublished key. Only the step's own bound expiring, or
+lock contention inside it, holds the key as `unpublished`.
 
 Receipt and raw purged_at publication happens separately with exclusive admission
 locks, without upgrading a network transaction's locks. It is bookkeeping for a
@@ -116,8 +124,11 @@ batches in a row (`inverseJobStalledBatches`) stop the job, so a persistent outa
 cannot spin.
 
 An existing intent is never retransmitted, including a crash before wire. On
-restart, a 404 reconciles its receipt and ledger; a present object stays held as
-`ambiguous_held` while unrelated fresh keys can proceed. Preserve the ledger and
+restart, an issued key whose object now answers 404 is reported as
+`held_absent` and stays unresolved: the executor never reconciles it into a
+receipt or a ledger absence, because an attempt row cannot prove which actor
+removed the object. A present object stays held as `ambiguous_held` while
+unrelated fresh keys can proceed. Preserve the ledger and
 DB records. There is no automated intent expiry, removal, or ambiguous retry.
 A damaged/partial local ledger fails closed; it is never truncated or repaired.
 

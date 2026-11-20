@@ -896,7 +896,8 @@ func (*slowSampleTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQuer
 // Through the production delete path, with its 30-second parent deadline, the
 // socket deadline is the earlier of the parent deadline and custody end less
 // the margin. Custody wins when the authorization clock sample is delayed 4s,
-// as a database clock step would leave it; otherwise the parent wins.
+// as a database clock step would leave it. Otherwise an explicit, much earlier
+// parent deadline wins, so the outcome never depends on setup time.
 func TestKeep28DeletePathComposesParentAndCustodyDeadlines(t *testing.T) {
 	const delay = 4 * time.Second
 	for _, custodyWins := range []bool{true, false} {
@@ -933,7 +934,11 @@ func TestKeep28DeletePathComposesParentAndCustodyDeadlines(t *testing.T) {
 			f.sdk.transport = template
 			defer func() { f.sdk.transport = original }()
 			called := time.Now()
-			if ok, err := a.delete(f.ctx, f.ctx, &inverseSendGate{}, f.entry(t)); err != nil || !ok {
+			// The parent deadline is explicit in both cases, far from custody
+			// end (about 32s away), so the outcome never depends on setup time.
+			parent, cancelParent := context.WithDeadline(f.ctx, called.Add(keep28ParentLead[custodyWins]))
+			defer cancelParent()
+			if ok, err := a.delete(parent, parent, &inverseSendGate{}, f.entry(t)); err != nil || !ok {
 				t.Fatalf("delete: %v %v", ok, err)
 			}
 			deadline, _ := wire.Load().(time.Time)
@@ -950,7 +955,7 @@ func TestKeep28DeletePathComposesParentAndCustodyDeadlines(t *testing.T) {
 				t.Fatal(err)
 			}
 			custodyLow, custodyHigh := before.Add(expiry.Sub(dbNow)-2*time.Second), after.Add(expiry.Sub(dbNow)-2*time.Second)
-			parentLow, parentHigh := called.Add(inverseNetworkTimeout), time.Now().Add(inverseNetworkTimeout)
+			parentLow, parentHigh := called.Add(keep28ParentLead[custodyWins]), time.Now().Add(keep28ParentLead[custodyWins])
 			if custodyWins {
 				// The delayed sample places custody end up to the delay early.
 				if deadline.After(custodyHigh.Add(-delay)) || deadline.Before(custodyLow.Add(-delay-time.Second)) || !deadline.Before(parentLow) {
@@ -964,6 +969,11 @@ func TestKeep28DeletePathComposesParentAndCustodyDeadlines(t *testing.T) {
 		})
 	}
 }
+
+// keep28ParentLead is each case's explicit parent deadline from its own start:
+// 20s before custody end, which is about 32s away, when the parent must win, and
+// 20s after it when custody must.
+var keep28ParentLead = map[bool]time.Duration{true: 50 * time.Second, false: 10 * time.Second}
 
 // confirmDeadlineSpy records the deadline the executor gives the confirming HEAD.
 type confirmDeadlineSpy struct {
