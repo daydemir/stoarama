@@ -16,6 +16,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/util"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const (
@@ -25,6 +26,30 @@ const (
 	NASR2CopyMaxFile    int64 = 64 << 30
 	nasR2CopyLock       int64 = 7343226011192
 )
+
+// nasR2CopyRowLockTimeout bounds every lock wait once a completion request holds
+// its copy row. That row is the request's custody claim while it runs the whole
+// receipt, so a table or row wait there would hold the claim while cleanup needs
+// it. With the bound any such wait ends at once as SQLSTATE 55P03, which the
+// receipt reports as busy and the client retries.
+//
+// Only the completion path bounds its locks. Checkpoint and range keep their own
+// contract: they are short renewals that must be able to wait a moment for their
+// own row rather than turn a live renewal into a refusal.
+const nasR2CopyRowLockTimeout = 100 * time.Millisecond
+
+// boundNASR2CopyRowLocks stops the request from waiting on any lock from this
+// point, so a busy table or row refuses it instead of holding its copy row.
+func boundNASR2CopyRowLocks(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `SELECT set_config('lock_timeout',$1,true)`, nasR2CopyRowLockTimeout.String())
+	return err
+}
+
+// nasR2CopyLockBusy reports a lock wait PostgreSQL refused by its lock bound.
+func nasR2CopyLockBusy(err error) bool {
+	var pg *pgconn.PgError
+	return errors.As(err, &pg) && pg.Code == "55P03"
+}
 
 type NASR2CopyMode string
 
@@ -514,6 +539,21 @@ func (s *Server) nasR2CopyActive(w http.ResponseWriter, r *http.Request, purpose
 		util.WriteError(w, 503, "copy admission busy")
 		return nil, t, version, req, false
 	}
+	// The completion/receipt call owns its copy row for everything that follows:
+	// the row read, the table preflight and the whole receipt. Bound every lock
+	// wait here, before that row is taken, so a busy table or row refuses the
+	// receipt at once instead of queueing behind the claim cleanup needs.
+	//
+	// Checkpoint and range are short renewals and keep their own contract: they
+	// still wait a bounded moment for their own row rather than turn a live
+	// renewal into an immediate refusal.
+	if allowStitchReplay {
+		if err = boundNASR2CopyRowLocks(ctx, tx); err != nil {
+			fail()
+			util.WriteError(w, 503, "copy lease busy; retryable")
+			return nil, t, version, req, false
+		}
+	}
 
 	if err = nasR2CopyReady(ctx, tx); err != nil {
 		fail()
@@ -525,6 +565,10 @@ func (s *Server) nasR2CopyActive(w http.ResponseWriter, r *http.Request, purpose
 
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		fail()
+		if allowStitchReplay && nasR2CopyLockBusy(err) {
+			util.WriteError(w, 409, "copy lease busy; retryable")
+			return nil, t, version, req, false
+		}
 		util.WriteError(w, 503, "copy lease lookup unavailable; retryable")
 		return nil, t, version, req, false
 	}

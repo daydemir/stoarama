@@ -9,6 +9,7 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type nasR2StitchReceipt struct {
@@ -80,12 +81,32 @@ func finishNASR2StitchCopy(ctx context.Context, tx pgx.Tx, task nasR2CopyTask, r
 	if err != nil {
 		return err
 	}
-	var outer bool
-	if err = tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(7343226011173)`).Scan(&outer); err != nil || !outer {
-		return errors.New("retirement holds are busy")
-	}
-	if _, err = tx.Exec(ctx, `SELECT id FROM nas_stitch_r2_hours WHERE id=$1 FOR UPDATE`, staged.hourID); err != nil {
+	// This transaction owns the copy row, so it never waits. It first takes the
+	// table locks its own UPDATE, the certificate INSERT and its release trigger
+	// need, without waiting: nas_r2_copy_items carries the row this call updates,
+	// so another session's SHARE on it must refuse the receipt now rather than
+	// queue its UPDATE behind that lock while holding the copy row.
+	if _, err = tx.Exec(ctx, `LOCK TABLE nas_r2_copy_items,nas_stitch_r2_certificates,nas_stitch_r2_hours,nas_stitch_r2_input_holds IN ROW EXCLUSIVE MODE NOWAIT`); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
+			return errors.New("retirement holds are busy")
+		}
 		return err
+	}
+	// It then takes every other lock the certificate needs (epoch, input keys in
+	// hash order, input pairs, hour, connection 13's key, the holds it releases)
+	// without waiting, all or nothing, and the client retries.
+	var locked bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM r2_inverse_ke_epoch FOR SHARE SKIP LOCKED)
+ AND (SELECT lock_nas_r2_copy_keys(array_agg(bucket),array_agg(object_key),false)
+  FROM nas_stitch_r2_input_holds WHERE hour_id=$1 AND released_at IS NULL)
+ AND lock_nas_stitch_r2_inputs($1,false)
+ AND EXISTS(SELECT 1 FROM nas_stitch_r2_hours WHERE id=$1 FOR UPDATE SKIP LOCKED)
+ AND EXISTS(SELECT 1 FROM connections WHERE id=13 FOR KEY SHARE SKIP LOCKED)
+ AND (SELECT count(*) FROM (SELECT 1 FROM nas_stitch_r2_input_holds WHERE hour_id=$1 AND released_at IS NULL
+  FOR NO KEY UPDATE SKIP LOCKED) h)=(SELECT count(*) FROM nas_stitch_r2_input_holds WHERE hour_id=$1 AND released_at IS NULL)`,
+		staged.hourID).Scan(&locked); err != nil || !locked {
+		return errors.New("retirement holds are busy")
 	}
 	body, _ := json.Marshal(receipt)
 	tag, err := tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',verified_at=clock_timestamp(),
@@ -101,6 +122,8 @@ func finishNASR2StitchCopy(ctx context.Context, tx pgx.Tx, task nasR2CopyTask, r
 	if err != nil || !exact {
 		return errors.New("NAS copy receipt differs from the exact staged generation")
 	}
+	// The certificate INSERT and its release trigger write the certificate,
+	// hour and input-hold tables. Their locks were already taken above.
 	var accepted bool
 	err = tx.QueryRow(ctx, `WITH proof AS MATERIALIZED (
  SELECT nas_stitch_r2_certificate_receipt($1,$2,$3,$4) AS receipt

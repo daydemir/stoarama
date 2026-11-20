@@ -35,7 +35,7 @@ func TestJoinedAdditiveMigrationDoesNotDependOnSessionTimezone(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer nonUTC.Close()
-	for _, migration := range joinedMigrationNames {
+	for _, migration := range joinedDeferredMigrations(t) {
 		if _, err := nonUTC.Exec(ctx, `DELETE FROM schema_migrations WHERE version=$1`, migration); err != nil {
 			t.Fatal(err)
 		}

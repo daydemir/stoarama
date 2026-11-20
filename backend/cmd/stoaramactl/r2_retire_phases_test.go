@@ -143,13 +143,13 @@ func TestR2RetireAdvancingCustodyAndLockedCatalogETagPostgres(t *testing.T) {
 		t.Fatal("stale custody selected as exact", exact, err)
 	}
 	it := r2RetireItem{r2RetireCandidate: r2RetireCandidate{Kind: "raw", SourceID: 1, RelativePath: "p/1.mp4", SHA256: strings.Repeat("a", 64), SizeBytes: 10, ETag: "original"}}
-	if _, err := r2RetireLockNASIdentity(ctx, tx, it, 13); err == nil {
+	if _, err := r2RetireLockNASIdentity(ctx, tx, it, 13, r2RetireShare); err == nil {
 		t.Fatal("expired custody locked using transaction start time")
 	}
 	if _, err := tx.Exec(ctx, `UPDATE nas_inventory_files SET verified_at=clock_timestamp(),server_received_at=clock_timestamp()-interval '23 hours'`); err != nil {
 		t.Fatal(err)
 	}
-	expiry, err := r2RetireLockNASIdentity(ctx, tx, it, 13)
+	expiry, err := r2RetireLockNASIdentity(ctx, tx, it, 13, r2RetireShare)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestR2RetireAdvancingCustodyAndLockedCatalogETagPostgres(t *testing.T) {
 	if _, err := tx.Exec(ctx, `UPDATE nas_inventory_files SET sidecar_sha256=''`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r2RetireLockNASIdentity(ctx, tx, it, 13); err == nil {
+	if _, err := r2RetireLockNASIdentity(ctx, tx, it, 13, r2RetireShare); err == nil {
 		t.Fatal("lock omitted required sidecar proof")
 	}
 	// Preflight saw original; the generation changed before the apply row lock.

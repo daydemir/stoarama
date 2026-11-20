@@ -121,7 +121,12 @@ func (a *inverseApplier) prepareWireTarget(ctx context.Context, tx pgx.Tx, e inv
 	if err := inverseProtectionLocks(ctx, tx, true); err != nil {
 		return inverseRawTarget{}, err
 	}
-	if _, err := tx.Exec(ctx, `SELECT lock_nas_r2_copy_key($1,$2)`, a.store.Bucket(), e.Key); err != nil {
+	// The wire transaction holds the wide cleanup locks shared from here on, so
+	// every later table or row wait fails at once; admission awaits it outside.
+	if err := boundInverseLocks(ctx, tx); err != nil {
+		return inverseRawTarget{}, err
+	}
+	if err := lockInverseCopyKey(ctx, tx, a.store.Bucket(), e.Key); err != nil {
 		return inverseRawTarget{}, err
 	}
 	target, err := a.loadTarget(ctx, tx, e)
@@ -161,13 +166,33 @@ func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverse
 }
 
 // authorize issues one key's single-use DELETE authority on the applier's lane.
-// Keep-28 adds its NAS custody proof and bounds the authority by its expiry.
-// Preparing the wire transaction waits on protection locks under its own
-// inverseDBTimeout; the key's network budget starts once it holds them.
-func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntry, gate *inverseSendGate) (*inverseDeleteAuthority, error) {
-	db, cancelDB := context.WithTimeout(ctx, inverseDBTimeout)
-	defer cancelDB()
-	target, err := a.prepareWireTarget(db, tx, e)
+// admitCtx is a database-only bound: it covers preparing the wire transaction,
+// the keep-28 custody proof, every pre-issuance check and the attempt insert,
+// and ends with admission. wireCtx is the key's own network deadline and
+// outlives admission, so the returned authority is never bound by, or
+// cancelled with, the admission attempt. Keep-28 adds its NAS custody proof and
+// bounds both by its expiry.
+//
+// The network budget starts once per authorization, at this call, and every
+// admitted retry calls authorize again. A retry after contention therefore gets
+// a fresh inverseNetworkTimeout measured from its own start, but never more
+// than the caller's wireCtx: wireCtx is a single parent per key, so the parent's
+// absolute deadline caps the total across retries. Pre-issuance no longer
+// stretches the returned authority's life, because the authority's deadline is
+// computed from this call's start, not from when the attempt committed.
+func (a *inverseApplier) authorize(admitCtx, wireCtx context.Context, tx pgx.Tx, e inverseEntry, gate *inverseSendGate) (*inverseDeleteAuthority, error) {
+	// The key's own network budget starts here, before its locks are prepared.
+	// Every pre-issuance step holds the wide cleanup locks, so preflight that
+	// outlived the wire deadline could never issue: bound each one by the
+	// earliest of admission, the parent's deadline and the network timeout.
+	// Keep-28 tightens the same bound to custody end once it is proven.
+	deadline := time.Now().Add(inverseNetworkTimeout)
+	if parent, ok := wireCtx.Deadline(); ok && parent.Before(deadline) {
+		deadline = parent
+	}
+	preIssue, stopPreIssue := context.WithDeadline(admitCtx, deadline)
+	defer stopPreIssue()
+	target, err := a.prepareWireTarget(preIssue, tx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -175,34 +200,104 @@ func (a *inverseApplier) authorize(ctx context.Context, tx pgx.Tx, e inverseEntr
 	var custody keep28Custody
 	var custodyEnd time.Time
 	if a.opts.Lane == inverseNASKeep28 {
-		if custody, custodyEnd, err = a.proveKeep28(db, tx, e, target); err != nil {
+		if custody, custodyEnd, err = a.proveKeep28(preIssue, tx, e, target); err != nil {
 			return nil, err
 		}
+		tightened, stop := context.WithDeadline(preIssue, custodyEnd)
+		defer stop()
+		preIssue = tightened
+		if custodyEnd.Before(deadline) {
+			deadline = custodyEnd
+		}
 	}
-	deadline := time.Now().Add(inverseNetworkTimeout)
-	if a.opts.Lane == inverseNASKeep28 && custodyEnd.Before(deadline) {
-		deadline = custodyEnd
-	}
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+	// The returned authority carries wireCtx, which outlives admission and is
+	// never cancelled with it; an earlier parent bound still wins.
+	ctx, cancel := context.WithDeadline(wireCtx, deadline)
 	fail := func(err error) (*inverseDeleteAuthority, error) { cancel(); return nil, err }
-	if err = a.checkWireHead(ctx, tx, e, target); err != nil {
+	// Every check before issuance and the attempt insert itself are admission
+	// work under the pre-issuance bound: none of them can outlive the wire
+	// deadline while the wire transaction holds the wide cleanup locks.
+	if err = a.checkWireHead(preIssue, tx, e, target); err != nil {
 		return fail(err)
 	}
 	guard := &inverseWireGuard{a, tx, target, e}
 	binding := guard.binding()
-	if err = guard.check(ctx, binding); err != nil {
+	if err = guard.check(preIssue, binding); err != nil {
 		return fail(err)
+	}
+	// Nothing is minted once the wire deadline has passed: authority that can
+	// never send must not exist, so this fails before the attempt insert.
+	if err = inversePreIssuanceExpired(preIssue); err != nil {
+		return fail(fmt.Errorf("pre-issuance ended before wire authority could be issued: %w", err))
 	}
 	// Independent commit precedes capability issuance. Even another verifier or
 	// process cannot remint authority after any ambiguous/crashed wire attempt.
-	tag, err := a.pool.Exec(ctx, `INSERT INTO `+a.opts.Lane.attemptTable()+`(bucket,object_key) VALUES($1,$2) ON CONFLICT DO NOTHING`, binding.Bucket, binding.Key)
+	issued, err := a.issueAttempt(preIssue, binding)
 	if err != nil {
 		return fail(err)
 	}
-	if tag.RowsAffected() != 1 {
+	// The attempt COMMIT is a separate connection and can acknowledge after the
+	// pre-issuance bound expired while wire and custody were still live. That
+	// durable attempt stays held: it is never retried, and no DELETE may mint
+	// from authority that outlived its bound. Only an *acknowledged* commit
+	// reaches this check; an ambiguous one already failed above and is held.
+	if err = inversePreIssuanceExpired(preIssue); err != nil {
+		return fail(fmt.Errorf("%w: %w", errInverseLateAttemptCommit, err))
+	}
+	if issued != 1 {
 		return fail(errors.New("inverse wire authority was already issued; reconcile only"))
 	}
 	return &inverseDeleteAuthority{binding: binding, guard: guard, used: &atomic.Bool{}, gate: gate, ctx: ctx, cancel: cancel, custody: custody, custodyEnd: custodyEnd}, nil
+}
+
+// errInverseLateAttemptCommit reports a wire attempt COMMIT its server
+// acknowledged after the pre-issuance bound had already passed. It wraps
+// whatever ended the bound, so an expired bound keeps context.DeadlineExceeded
+// while an explicit cancellation keeps context.Canceled and is never mistaken
+// for a timeout. It is deliberately distinct from an ambiguous COMMIT: that one
+// never reaches this check, because an unknown outcome is held before any
+// authority could exist.
+var errInverseLateAttemptCommit = errors.New("wire attempt committed after its pre-issuance bound")
+
+// inversePreIssuanceExpired reports whether the effective pre-issuance bound has
+// passed. A context timer can be delivered late, so Err() alone stays nil for a
+// while after the deadline; comparing the monotonic wall clock against the
+// context's own deadline closes that window instead of re-enabling the wire.
+func inversePreIssuanceExpired(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return nil
+	}
+	if !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// issueAttempt records the wire attempt in its own transaction, so it commits
+// independently of the wire transaction. That transaction also takes the lock
+// bound: a busy attempt table is contention here, never a wait of the wire
+// transaction that still holds the wide cleanup locks.
+func (a *inverseApplier) issueAttempt(ctx context.Context, binding inverseDeleteBinding) (int64, error) {
+	tx, err := a.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(context.Background())
+	if err = boundInverseLocks(ctx, tx); err != nil {
+		return 0, err
+	}
+	tag, err := tx.Exec(ctx, `INSERT INTO `+a.opts.Lane.attemptTable()+`(bucket,object_key) VALUES($1,$2) ON CONFLICT DO NOTHING`, binding.Bucket, binding.Key)
+	if err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 type inverseSDKStore struct {

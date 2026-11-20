@@ -616,7 +616,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer tx.Rollback(ctx)
-		authority, err := a.authorize(ctx, tx, e, &inverseSendGate{})
+		authority, err := a.authorize(ctx, ctx, tx, e, &inverseSendGate{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -896,6 +896,319 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatalf("send gate: err %v deletes %d intents %d attempts %d", err, store.calls-before, intents, attempts)
 		}
 	})
+	t.Run("stitch_hold_admission_conflicts_only_on_its_key", func(t *testing.T) {
+		// Another executor's outer lock never fences stitch hold admission.
+		batch, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer batch.Release()
+		if _, err = batch.Exec(ctx, `SELECT pg_advisory_lock($1)`, r2RetireAdvisoryLockKey); err != nil {
+			t.Fatal(err)
+		}
+		defer batch.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, r2RetireAdvisoryLockKey)
+		a, entries := build(10)
+		defer a.ledger.close()
+		held, free, attempted, wired, other, unrelated, behind, recorded, fenced, ledgered := entries[0], entries[1], entries[2], entries[3], entries[4], entries[5], entries[6], entries[7], entries[8], entries[9]
+		var hourID int64
+		exec(`INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until) VALUES(70,3,'2026-06-01','2026-06-02','key locks',now()+interval '1 day')`)
+		if err = pool.QueryRow(ctx, `INSERT INTO nas_stitch_r2_hours(scope_id,recording_id,hour_at,plan,plan_sha256,input_bytes) VALUES(70,30,'2026-06-01','{}',repeat('f',64),100) RETURNING id`).Scan(&hourID); err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at)
+ SELECT 13,id,30,display_path,100,repeat('b',64),'present',now(),now() FROM recording_clips WHERE object_key=$1`, e.Key)
+		}
+		admit := func(ctx context.Context, tx pgx.Tx, e inverseEntry) error {
+			_, err := tx.Exec(ctx, `INSERT INTO nas_stitch_r2_input_holds(hour_id,bucket,object_key,catalog_clip_id,sha256,size_bytes,etag)
+ SELECT $1,bucket,object_key,id,repeat('b',64),100,etag FROM recording_clips WHERE object_key=$2`, hourID, e.Key)
+			return err
+		}
+		admitAlone := func(e inverseEntry) error {
+			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if err = admit(ctx, tx, e); err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		}
+		// Executors older than any Go-side key lock only write the ledgers.
+		stale := []string{
+			`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
+ SELECT 'raw',id,bucket,object_key,100,repeat('b',64),repeat('a',64) FROM recording_clips WHERE object_key=$1`,
+			`INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256)
+ SELECT 'raw',id,3,bucket,object_key,100,repeat('b',64),'outside_keep28_no_nas_copy','none',repeat('a',64),repeat('a',64) FROM recording_clips WHERE object_key=$1`,
+		}
+		prompt := func() (context.Context, context.CancelFunc) { return context.WithTimeout(ctx, 5*time.Second) }
+
+		// A committed reservation and pre-wire attempt veto later admission.
+		if _, err = a.reserve(ctx, attempted); err != nil {
+			t.Fatal(err)
+		}
+		wire, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The attempt commits on a second connection while this wire owns the
+		// copy key; a ledger trigger that waited for that key would hang here.
+		waitless, cancel := prompt()
+		if _, err = a.authorize(waitless, waitless, wire, attempted, &inverseSendGate{}); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		wire.Rollback(ctx)
+		if err = admitAlone(attempted); err == nil || !strings.Contains(err.Error(), "already has R2 retirement history") {
+			t.Fatalf("committed pre-wire attempt did not veto hold admission: %v", err)
+		}
+
+		// An open RAW wire owns its key and row; admission elsewhere never waits.
+		if _, err = a.reserve(ctx, wired); err != nil {
+			t.Fatal(err)
+		}
+		wire, err = pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = a.prepareWireTarget(ctx, wire, wired); err != nil {
+			t.Fatal(err)
+		}
+		importing, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer importing.Rollback(ctx)
+		waitless, cancel = prompt()
+		if err = admit(waitless, importing, other); err != nil {
+			t.Fatalf("hold admission waited on an unrelated open wire: %v", err)
+		}
+		cancel()
+		if err = importing.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err = admitAlone(wired); err == nil || !strings.Contains(err.Error(), "already has R2 retirement history") {
+			t.Fatalf("hold admitted a key with an open wire: %v", err)
+		}
+		wire.Rollback(ctx)
+
+		// An open import fences only its own key. Same-key reserve never waits
+		// on it while owning the wide protection locks: it rolls back and skips.
+		durable := func(e inverseEntry) int {
+			var n int
+			if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM r2_retirement_reservations WHERE object_key=$1)+(SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1)`, e.Key).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			return n
+		}
+		importing, err = pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer importing.Rollback(ctx)
+		if err = admit(ctx, importing, held); err != nil {
+			t.Fatal(err)
+		}
+		waitless, cancel = prompt()
+		if _, err = a.reserve(waitless, held); !errors.Is(err, errInverseStitchConflict) || !strings.Contains(err.Error(), "hold admission in progress") || durable(held) != 0 {
+			t.Fatalf("same-key RAW reserve did not skip an open import: %v", err)
+		}
+		for _, query := range stale {
+			if _, err = pool.Exec(waitless, query, held.Key); err == nil || !strings.Contains(err.Error(), "hold admission is busy") {
+				t.Fatalf("stale ledger INSERT crossed an open import: %v", err)
+			}
+		}
+		cancel()
+		before := store.calls
+		waitless, cancel = prompt()
+		if ok, err := a.delete(waitless, waitless, &inverseSendGate{}, free); !ok || err != nil || store.calls-before != 1 {
+			t.Fatalf("unrelated RAW reserve and wire waited on an open import: %v %v", ok, err)
+		}
+		cancel()
+		if err = importing.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = a.reserve(ctx, held); !errors.Is(err, errInverseStitchConflict) || !strings.Contains(err.Error(), "committed hold") || durable(held) != 0 {
+			t.Fatalf("RAW did not skip a committed hold: %v", err)
+		}
+		for _, query := range stale {
+			if _, err = pool.Exec(ctx, query, held.Key); err == nil || !strings.Contains(err.Error(), "active R2 stitch input hold") {
+				t.Fatalf("stale ledger INSERT crossed a committed hold: %v", err)
+			}
+		}
+
+		// An admission that owns the key's hold lock before its row surfaces only
+		// at the ledger insert; exactly that identity is skipped.
+		admitting, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer admitting.Rollback(ctx)
+		if _, err = admitting.Exec(ctx, `SELECT pg_advisory_xact_lock(nas_stitch_r2_hold_lock('stoarama',$1))`, ledgered.Key); err != nil {
+			t.Fatal(err)
+		}
+		waitless, cancel = prompt()
+		if _, err = a.reserve(waitless, ledgered); !errors.Is(err, errInverseStitchConflict) ||
+			err.Error() != errInverseStitchConflict.Error()+": stitch input hold admission is busy" || durable(ledgered) != 0 {
+			t.Fatalf("ledger-time hold admission was not skipped by its exact identity: %v", err)
+		}
+		cancel()
+		admitting.Rollback(ctx)
+
+		// A certificate owns its held inputs' copy keys and rows. Same-key
+		// reserve skips at once; an unrelated key proceeds meanwhile.
+		certifying, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer certifying.Rollback(ctx)
+		if _, err = certifying.Exec(ctx, `SELECT lock_nas_r2_copy_key('stoarama',$1),(SELECT count(*) FROM (SELECT 1 FROM recording_clips WHERE object_key=$1 FOR SHARE) c)`, held.Key); err != nil {
+			t.Fatal(err)
+		}
+		waitless, cancel = prompt()
+		if _, err = a.reserve(waitless, held); !errors.Is(err, errInverseStitchConflict) || !strings.Contains(err.Error(), "committed hold") {
+			t.Fatalf("same-key RAW reserve did not skip an open certificate: %v", err)
+		}
+		before = store.calls
+		if ok, err := a.delete(waitless, waitless, &inverseSendGate{}, unrelated); !ok || err != nil || store.calls-before != 1 {
+			t.Fatalf("unrelated RAW key waited on an open certificate: %v %v", ok, err)
+		}
+		cancel()
+		certifying.Rollback(ctx)
+
+		// Any other owner of an unheld key is awaited with no protection lock
+		// held: an unrelated reserve started behind that wait proceeds.
+		busy, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer busy.Rollback(ctx)
+		if _, err = busy.Exec(ctx, `SELECT 1 FROM recording_clips WHERE object_key=$1 FOR UPDATE`, other.Key); err != nil {
+			t.Fatal(err)
+		}
+		awaited := make(chan error, 1)
+		go func() { _, err := a.reserve(ctx, other); awaited <- err }()
+		waitBlockedBy(t, pool, stitchBackendPID(t, busy), "same-key reserve behind another row owner")
+		// 7343226011103 and 7343226011101 are advisory (classid 1709, objid
+		// 3126902239 and 3126902237).
+		var wide bool
+		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND objsubid=1 AND classid=1709 AND objid IN (3126902239,3126902237))`).Scan(&wide); err != nil || wide {
+			t.Fatalf("waiting reserve kept its protection locks: %v %v", wide, err)
+		}
+		waitless, cancel = prompt()
+		if _, err = a.reserve(waitless, behind); err != nil || durable(behind) != 2 {
+			t.Fatalf("unrelated reserve queued behind a same-key wait: %v", err)
+		}
+		cancel()
+		busy.Rollback(ctx)
+		if err = within(t, awaited, "awaited reserve"); err != nil || durable(other) != 2 {
+			t.Fatalf("awaited reserve did not complete: %v", err)
+		}
+
+		// A busy parent recording row is not a reserve lock at all.
+		parent, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer parent.Rollback(ctx)
+		if _, err = parent.Exec(ctx, `SELECT 1 FROM recordings WHERE id=30 FOR UPDATE`); err != nil {
+			t.Fatal(err)
+		}
+		waitless, cancel = prompt()
+		if _, err = a.reserve(waitless, recorded); err != nil || durable(recorded) != 2 {
+			t.Fatalf("reserve waited on its parent recording row: %v", err)
+		}
+		cancel()
+		parent.Rollback(ctx)
+
+		// Every other busy lock after the barrier is awaited with no protection
+		// lock held, so a mutator needing one exclusively is never queued.
+		mutatorProceeds := func(what string) {
+			t.Helper()
+			mutator, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mutator.Rollback(ctx)
+			waitless, cancel := prompt()
+			defer cancel()
+			if _, err = mutator.Exec(waitless, `SELECT pg_advisory_xact_lock(7343226011103)`); err != nil {
+				t.Fatalf("legacy mutator queued behind %s: %v", what, err)
+			}
+		}
+		listing, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listing.Rollback(ctx)
+		// NAS listing evidence (0183) holds the final fence shared.
+		if _, err = listing.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011101)`); err != nil {
+			t.Fatal(err)
+		}
+		go func() { _, err := a.reserve(ctx, fenced); awaited <- err }()
+		waitBlockedBy(t, pool, stitchBackendPID(t, listing), "reserve behind NAS listing evidence")
+		mutatorProceeds("a reserve awaiting the final fence")
+		listing.Rollback(ctx)
+		if err = within(t, awaited, "reserve behind NAS listing evidence"); err != nil || durable(fenced) != 2 {
+			t.Fatalf("reserve behind NAS listing evidence did not complete: %v", err)
+		}
+
+		keyOwner, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer keyOwner.Rollback(ctx)
+		if _, err = keyOwner.Exec(ctx, `SELECT lock_nas_r2_copy_key('stoarama',$1)`, fenced.Key); err != nil {
+			t.Fatal(err)
+		}
+		type authorized struct {
+			tx  pgx.Tx
+			err error
+		}
+		// A failed assertion must stop the goroutine and roll its transaction
+		// back, so neither holds a connection when the pool closes.
+		wireCtx, wireStop := context.WithCancel(ctx)
+		wiring := make(chan authorized, 1)
+		go func() {
+			tx, _, err := admitWire(wireCtx, pool, func(ctx context.Context, tx pgx.Tx) (*inverseDeleteAuthority, error) {
+				return a.authorize(ctx, wireCtx, tx, fenced, &inverseSendGate{})
+			})
+			wiring <- authorized{tx, err}
+		}()
+		collected := false
+		var wiredTx pgx.Tx
+		t.Cleanup(func() {
+			wireStop()
+			if !collected {
+				select {
+				case w := <-wiring:
+					if w.tx != nil {
+						_ = w.tx.Rollback(context.Background())
+					}
+				case <-time.After(30 * time.Second):
+				}
+				return
+			}
+			if wiredTx != nil {
+				_ = wiredTx.Rollback(context.Background())
+			}
+		})
+		waitBlockedBy(t, pool, stitchBackendPID(t, keyOwner), "wire behind another key owner")
+		mutatorProceeds("a wire awaiting its copy key")
+		keyOwner.Rollback(ctx)
+		w := within(t, wiring, "wire behind another key owner")
+		collected, wiredTx = true, w.tx
+		if w.err != nil {
+			t.Fatalf("wire behind another key owner did not authorize: %v", w.err)
+		}
+		if err = wiredTx.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+		wiredTx = nil
+	})
 	t.Run("send_gate_closed_after_authorize_stops_the_first_write", func(t *testing.T) {
 		// The gate closes while this DELETE is past every check and dialing:
 		// its first request byte is refused, so nothing reaches the provider.
@@ -912,7 +1225,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 		defer tx.Rollback(ctx)
 		gate := &inverseSendGate{}
-		authority, err := a.authorize(ctx, tx, e, gate)
+		authority, err := a.authorize(ctx, ctx, tx, e, gate)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1211,19 +1524,11 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				}
 				done := make(chan error, 1)
 				go func() { _, err := a.delete(ctx, ctx, &inverseSendGate{}, e); done <- err }()
-				deadline := time.Now().Add(3 * time.Second)
-				for {
-					var held bool
-					if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND locktype='advisory' AND objsubid=1 AND classid::bigint::numeric*4294967296+objid::bigint::numeric=7343226011103 AND granted AND pid<>pg_backend_pid())`).Scan(&held); err != nil {
-						t.Fatal(err)
-					}
-					if held {
-						break
-					}
-					if time.Now().After(deadline) {
-						t.Fatal("B1 never reached legacy public fence")
-					}
-					time.Sleep(10 * time.Millisecond)
+				// B1 awaits the legacy public fence holding no admission lock.
+				waitBlockedBy(t, pool, stitchBackendPID(t, legacy), "B1 at the legacy public fence")
+				var held bool
+				if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND objsubid=1 AND classid=1709 AND objid=3126902239 AND granted AND pid<>pg_backend_pid())`).Scan(&held); err != nil || held {
+					t.Fatal("B1 held its admission lock while awaiting the legacy fence", held, err)
 				}
 				progressCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 				defer cancel()
@@ -1235,7 +1540,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					t.Fatal("legacy plan mutation upgraded locks", err)
 				}
 				var upgraded bool
-				if err = legacy.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND locktype='advisory' AND pid=pg_backend_pid() AND objsubid=1 AND classid::bigint::numeric*4294967296+objid::bigint::numeric=7343226011103)`).Scan(&upgraded); err != nil || upgraded {
+				if err = legacy.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid() AND objsubid=1 AND classid=1709 AND objid=3126902239)`).Scan(&upgraded); err != nil || upgraded {
 					t.Fatal("cleanup acquired admission lock", upgraded, err)
 				}
 				if err = legacy.Commit(ctx); err != nil {
@@ -1308,7 +1613,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 		var held bool
-		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND locktype='advisory' AND granted AND ((objsubid=1 AND (classid::bigint::numeric*4294967296+objid::bigint::numeric)=ANY(ARRAY[7343226011103,7343226011101]::numeric[])) OR(classid=137 AND objid=1 AND objsubid=2)))`).Scan(&held); err != nil || held {
+		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND ((objsubid=1 AND classid=1709 AND objid IN (3126902239,3126902237)) OR(classid=137 AND objid=1 AND objsubid=2)))`).Scan(&held); err != nil || held {
 			t.Fatal("waiting B1 owns later locks", held, err)
 		}
 		admissionCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -1651,6 +1956,85 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatalf("unlimited budget did not resume: %+v %v", result, err)
 		}
 	})
+	t.Run("raw_selection_excludes_held_and_skipped_keys", func(t *testing.T) {
+		// MaxItems=1 and a first key whose hold admission is busy: reserve skips
+		// it before any durable write, and the next batch must spend its only
+		// slot on the key behind it instead of reselecting the skipped one.
+		a, entries := build(2)
+		a.ledger.close()
+		first, second := entries[0], entries[1]
+		a.opts.MaxItems = 1
+		a.opts.skipped = &inverseSkipSet{}
+		admission, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer admission.Release()
+		defer admission.Exec(context.Background(), `SELECT pg_advisory_unlock_all()`)
+		if _, err = admission.Exec(ctx, `SELECT pg_advisory_lock(nas_stitch_r2_hold_lock('stoarama',$1))`, first.Key); err != nil {
+			t.Fatal(err)
+		}
+		dir := t.TempDir()
+		done, firstBatch, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(dir, "evidence-1.json"))
+		if err != nil || done || firstBatch.Selected != 1 || firstBatch.Deleted != 0 || firstBatch.StitchSkipped != 1 {
+			t.Fatalf("first batch spent its slot on a busy hold: done %v %+v %v", done, firstBatch, err)
+		}
+		before := providerDeletes()
+		done, secondBatch, err := runInverseJobBatch(ctx, pool, sdk, a.opts, owner, filepath.Join(dir, "evidence-2.json"))
+		store.mu.Lock()
+		_, firstPresent := store.objects[first.Key]
+		_, secondPresent := store.objects[second.Key]
+		store.mu.Unlock()
+		if err != nil || secondBatch.Deleted != 1 || providerDeletes()-before != 1 || !firstPresent || secondPresent {
+			t.Fatalf("second batch did not delete the key behind a skipped one: done %v %+v %v deletes %d first %v second %v",
+				done, secondBatch, err, providerDeletes()-before, firstPresent, secondPresent)
+		}
+	})
+	t.Run("raw_selection_drops_a_committed_hold_before_MaxItems", func(t *testing.T) {
+		// A committed Durham hold, not a skip this job remembered, must be left
+		// out at selection: otherwise it spends the batch's whole item allowance
+		// every batch and the keys behind it never run.
+		a, entries := build(2)
+		a.ledger.close()
+		first, second := entries[0], entries[1]
+		a.opts.MaxItems, a.opts.skipped = 1, &inverseSkipSet{}
+		// Earlier subtests in this table own recording 30's 2026-06-01 hour, so
+		// this moves the two keys it just built to a clean hour of their own.
+		exec(`UPDATE recording_clips SET fire_at='2026-06-03',clip_start_at='2026-06-03',clip_end_at='2026-06-03 00:01:00' WHERE object_key=$1 OR object_key=$2`, first.Key, second.Key)
+		exec(`INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until) VALUES(71,3,'2026-06-03','2026-06-04','committed hold',now()+interval '1 day')`)
+		var hourID int64
+		if err := pool.QueryRow(ctx, `INSERT INTO nas_stitch_r2_hours(scope_id,recording_id,hour_at,plan,plan_sha256,input_bytes) VALUES(71,30,'2026-06-03','{}',repeat('f',64),100) RETURNING id`).Scan(&hourID); err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at)
+ SELECT 13,id,30,display_path,100,repeat('b',64),'present',now(),now() FROM recording_clips WHERE object_key=$1`, e.Key)
+		}
+		hold, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = hold.Exec(ctx, `INSERT INTO nas_stitch_r2_input_holds(hour_id,bucket,object_key,catalog_clip_id,sha256,size_bytes,etag)
+ SELECT $1,bucket,object_key,id,repeat('b',64),100,etag FROM recording_clips WHERE object_key=$2`, hourID, first.Key); err != nil {
+			t.Fatal(err)
+		}
+		if err = hold.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		result, err := applyInverse(ctx, pool, store, a.opts)
+		store.mu.Lock()
+		_, firstPresent := store.objects[first.Key]
+		_, secondPresent := store.objects[second.Key]
+		store.mu.Unlock()
+		if err != nil || result.Selected != 1 || result.Deleted != 1 || result.StitchSkipped != 0 || !firstPresent || secondPresent {
+			t.Fatalf("committed hold spent the item allowance: %+v %v first %v second %v", result, err, firstPresent, secondPresent)
+		}
+		var durable int
+		if err = pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM r2_retirement_reservations WHERE object_key=$1)
+ +(SELECT count(*) FROM r2_inverse_intents WHERE object_key=$1)+(SELECT count(*) FROM r2_inverse_attempts WHERE object_key=$1)`, first.Key).Scan(&durable); err != nil || durable != 0 {
+			t.Fatalf("a committed hold wrote durable retirement state: %d %v", durable, err)
+		}
+	})
 	t.Run("private_authority_cannot_replay_or_remint", func(t *testing.T) {
 		for _, lost := range []bool{false, true} {
 			t.Run(strconv.FormatBool(lost), func(t *testing.T) {
@@ -1666,11 +2050,11 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer tx.Rollback(ctx)
-				authority, err := a.authorize(ctx, tx, e, &inverseSendGate{})
+				authority, err := a.authorize(ctx, ctx, tx, e, &inverseSendGate{})
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err = a.authorize(ctx, tx, e, &inverseSendGate{}); err == nil {
+				if _, err = a.authorize(ctx, ctx, tx, e, &inverseSendGate{}); err == nil {
 					t.Fatal("durable authority reminted")
 				}
 				before := providerDeletes()
@@ -2359,13 +2743,13 @@ func TestR2InverseJobReadbackComparesHeldKeys(t *testing.T) {
 // Job totals sum every batch's counts; held keys are the latest snapshot.
 func TestR2InverseJobTotalsAddBatches(t *testing.T) {
 	total := inverseApplySummary{}
-	total.addBatch(inverseApplySummary{Selected: 3, Deleted: 2, Bytes: 200, CustodyShort: r2RetireStat{Objects: 1, Bytes: 100}, WireAmbiguous: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}, partitionRead: true})
-	total.addBatch(inverseApplySummary{Selected: 1, Deleted: 1, Bytes: 100, AmbiguousHeld: 1, HeldAbsent: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}, partitionRead: true})
+	total.addBatch(inverseApplySummary{Selected: 3, StitchSkipped: 1, Deleted: 2, Bytes: 200, CustodyShort: r2RetireStat{Objects: 1, Bytes: 100}, WireAmbiguous: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}, partitionRead: true})
+	total.addBatch(inverseApplySummary{Selected: 1, StitchSkipped: 2, Deleted: 1, Bytes: 100, AmbiguousHeld: 1, HeldAbsent: []string{"managed/a"}, LastModifiedHeld: r2RetireStat{Objects: 2, Bytes: 200}, partitionRead: true})
 	// A batch that failed before reading its partition (its evidence was
 	// refused) measured nothing: the last measurement stands.
 	total.addBatch(inverseApplySummary{})
 	// last_modified_held comes from the partition every batch rereads: a snapshot.
-	if total.Selected != 4 || total.Deleted != 3 || total.Bytes != 300 || total.CustodyShort != (r2RetireStat{Objects: 1, Bytes: 100}) || total.LastModifiedHeld != (r2RetireStat{Objects: 2, Bytes: 200}) || !slices.Equal(total.WireAmbiguous, []string{"managed/a"}) || total.AmbiguousHeld != 1 || !slices.Equal(total.HeldAbsent, []string{"managed/a"}) {
+	if total.Selected != 4 || total.StitchSkipped != 3 || total.Deleted != 3 || total.Bytes != 300 || total.CustodyShort != (r2RetireStat{Objects: 1, Bytes: 100}) || total.LastModifiedHeld != (r2RetireStat{Objects: 2, Bytes: 200}) || !slices.Equal(total.WireAmbiguous, []string{"managed/a"}) || total.AmbiguousHeld != 1 || !slices.Equal(total.HeldAbsent, []string{"managed/a"}) {
 		t.Fatalf("job totals: %+v", total)
 	}
 }

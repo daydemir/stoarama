@@ -185,18 +185,42 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 	if api.ValidateNASR2CopyItem(i) != nil {
 		return false, nil
 	}
-	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	// Busy locks are awaited with the same bounds as admission itself.
+	begin := func(ctx context.Context) (pgx.Tx, error) {
+		tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			return nil, err
+		}
+		if _, err = tx.Exec(ctx, `SET LOCAL statement_timeout='10s'; SET LOCAL lock_timeout='2s'; SET LOCAL work_mem='16MB'`); err != nil {
+			rollbackFinishCandidateTx(tx)
+			return nil, err
+		}
+		return tx, nil
+	}
+	ok, err := admitInverse(ctx, begin, func(ctx context.Context) (bool, error) {
+		ok, err := queueKeep28RefreshOnce(ctx, begin, o, p, epoch, i, etag, policy, status)
+		// A lock the attempt lost after the wide cleanup locks is contention:
+		// it rolled back, so admission waits outside them and retries.
+		return ok, inverseContention(err)
+	})
+	return ok, finishDBError(finishRefreshAdmission, 0, err)
+}
+func queueKeep28RefreshOnce(ctx context.Context, begin func(context.Context) (pgx.Tx, error), o finishRefreshOptions, p inverseProtection, epoch int64, i api.NASR2CopyItem, etag, policy string, status *finishStatus) (bool, error) {
+	tx, err := begin(ctx)
 	if err != nil {
 		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	defer rollbackFinishCandidateTx(tx)
-	if _, err = tx.Exec(ctx, `SET LOCAL statement_timeout='10s'; SET LOCAL lock_timeout='2s'; SET LOCAL work_mem='16MB'`); err != nil {
-		return false, finishDBError(finishRefreshAdmission, 0, err)
-	}
 	if err = inverseProtectionBarrier(ctx, tx); err != nil {
 		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	if err = inverseProtectionLocks(ctx, tx, false); err != nil {
+		return false, finishDBError(finishRefreshAdmission, 0, err)
+	}
+	// Refresh holds the wide cleanup locks from here on. The table lock its own
+	// copy-row update needs, and every row it touches after, must fail at once
+	// instead of queueing behind a session that needs those same wide locks.
+	if err = boundInverseLocks(ctx, tx); err != nil {
 		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	var current int64
@@ -206,7 +230,7 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 	if current != epoch {
 		return false, errors.New("refresh catalog changed; retry with fresh picks/catalog")
 	}
-	if _, err = tx.Exec(ctx, `SELECT lock_nas_r2_copy_key($1,$2)`, i.Bucket, i.ObjectKey); err != nil {
+	if err = lockInverseCopyKey(ctx, tx, i.Bucket, i.ObjectKey); err != nil {
 		return false, finishDBError(finishRefreshAdmission, 0, err)
 	}
 	e := inverseEntry{ObjectInfo: r2.ObjectInfo{Key: i.ObjectKey, ETag: etag, SizeBytes: i.SizeBytes}, Class: inverseKeep28}
@@ -234,12 +258,13 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 	}
 	data, _ := json.Marshal(i)
 	var id int64
-	err = tx.QueryRow(ctx, `SELECT id FROM nas_r2_copy_items WHERE connection_id=13 AND kind='raw' AND source_id=$1 AND item=$2::jsonb AND state='verified' AND blocked_reason='' AND policy_sha256=$3 FOR UPDATE`, i.SourceID, data, policy).Scan(&id)
+	const copyRow = `SELECT id FROM nas_r2_copy_items WHERE connection_id=13 AND kind='raw' AND source_id=$1 AND item=$2::jsonb AND state='verified' AND blocked_reason='' AND policy_sha256=$3 FOR UPDATE`
+	err = tx.QueryRow(ctx, copyRow+` NOWAIT`, i.SourceID, data, policy).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
-		return false, finishDBError(finishRefreshAdmission, 0, err)
+		return false, finishDBError(finishRefreshAdmission, 0, inverseRowBusy(err, inverseWait{copyRow, []any{i.SourceID, data, policy}}))
 	}
 	var total, refresh int
 	if err = tx.QueryRow(ctx, `SELECT count(*),count(*) FILTER(WHERE state IN ('refresh_pending','refresh_leased')) FROM nas_r2_copy_items WHERE connection_id=13 AND state IN ('pending','leased','refresh_pending','refresh_leased')`).Scan(&total, &refresh); err != nil {
@@ -272,9 +297,15 @@ func queueKeep28Refresh(ctx context.Context, pool *pgxpool.Pool, o finishRefresh
 		status.RefreshHold = finishLateBudgetHeld
 		return false, nil
 	}
+	// This row is read after the wide locks and the copy row, so it only tries:
+	// admission awaits a busy control row here, holding nothing, and retries.
 	var enabled bool
-	if err = tx.QueryRow(ctx, `SELECT enabled FROM r2_keep28_refresh_control FOR SHARE`).Scan(&enabled); err != nil || !enabled {
-		return false, finishDBError(finishRefreshAdmission, 0, err)
+	const controlRow = `SELECT enabled FROM r2_keep28_refresh_control FOR SHARE`
+	if err = tx.QueryRow(ctx, controlRow+` NOWAIT`).Scan(&enabled); err != nil {
+		return false, finishDBError(finishRefreshAdmission, 0, inverseRowBusy(err, inverseWait{controlRow, nil}))
+	}
+	if !enabled {
+		return false, nil
 	}
 	picks, err := loadR2RetirePicks(o.Picks)
 	if err != nil {

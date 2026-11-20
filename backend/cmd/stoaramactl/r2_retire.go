@@ -1033,7 +1033,7 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 		return "ineligible", "pick_changed", nil
 	}
 	if reason == r2RetireNASReason {
-		expiry, err := r2RetireLockNASIdentity(ctx, tx, it, a.scope.ConnectionID)
+		expiry, err := r2RetireLockNASIdentity(ctx, tx, it, a.scope.ConnectionID, r2RetireShare)
 		if err != nil {
 			return "", "", err
 		}
