@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -13,14 +14,35 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// The cap is enforced by the import entry itself, before any hold lock.
 func TestR2StitchImportBoundsHeldInputs(t *testing.T) {
-	for inputs, ok := range map[int]bool{1000: true, 1001: false} {
+	dsn := os.Getenv("STOARAMA_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	for inputs, admitted := range map[int]bool{1000: true, 1001: false} {
 		set := DurhamStitchHoldSet{Bucket: "stoarama", EndpointSHA: strings.Repeat("a", 64)}
 		for left := inputs; left > 0; left -= 200 {
 			set.Hours = append(set.Hours, DurhamStitchHour{Inputs: make([]DurhamStitchInput, min(left, 200))})
 		}
-		if err := durhamStitchHoldSetBounded(set); (err == nil) != ok {
-			t.Fatalf("import bound at %d inputs: %v", inputs, err)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// An empty schema: a set within the cap fails later, at the queue control row.
+		if _, err = tx.Exec(ctx, `SET LOCAL search_path TO pg_temp`); err != nil {
+			t.Fatal(err)
+		}
+		_, err = ImportDurhamStitchHoldSet(ctx, tx, set)
+		tx.Rollback(ctx)
+		if err == nil || strings.Contains(err.Error(), "bounded") == admitted {
+			t.Fatalf("import cap at %d inputs: %v", inputs, err)
 		}
 	}
 }

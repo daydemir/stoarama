@@ -666,9 +666,9 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer batch.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, r2RetireAdvisoryLockKey)
-		a, entries := build(9)
+		a, entries := build(10)
 		defer a.ledger.close()
-		held, free, attempted, wired, other, unrelated, behind, recorded, fenced := entries[0], entries[1], entries[2], entries[3], entries[4], entries[5], entries[6], entries[7], entries[8]
+		held, free, attempted, wired, other, unrelated, behind, recorded, fenced, ledgered := entries[0], entries[1], entries[2], entries[3], entries[4], entries[5], entries[6], entries[7], entries[8], entries[9]
 		var hourID int64
 		exec(`INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until) VALUES(70,3,'2026-06-01','2026-06-02','key locks',now()+interval '1 day')`)
 		if err = pool.QueryRow(ctx, `INSERT INTO nas_stitch_r2_hours(scope_id,recording_id,hour_at,plan,plan_sha256,input_bytes) VALUES(70,30,'2026-06-01','{}',repeat('f',64),100) RETURNING id`).Scan(&hourID); err != nil {
@@ -799,6 +799,24 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			}
 		}
 
+		// An admission that owns the key's hold lock before its row surfaces only
+		// at the ledger insert; exactly that identity is skipped.
+		admitting, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer admitting.Rollback(ctx)
+		if _, err = admitting.Exec(ctx, `SELECT pg_advisory_xact_lock(nas_stitch_r2_hold_lock('stoarama',$1))`, ledgered.Key); err != nil {
+			t.Fatal(err)
+		}
+		waitless, cancel = prompt()
+		if _, err = a.reserve(waitless, ledgered); !errors.Is(err, errInverseStitchConflict) ||
+			err.Error() != errInverseStitchConflict.Error()+": stitch input hold admission is busy" || durable(ledgered) != 0 {
+			t.Fatalf("ledger-time hold admission was not skipped by its exact identity: %v", err)
+		}
+		cancel()
+		admitting.Rollback(ctx)
+
 		// A certificate owns its held inputs' copy keys and rows. Same-key
 		// reserve skips at once; an unrelated key proceeds meanwhile.
 		certifying, err := pool.Begin(ctx)
@@ -833,8 +851,10 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		awaited := make(chan error, 1)
 		go func() { _, err := a.reserve(ctx, other); awaited <- err }()
 		waitBlockedBy(t, pool, stitchBackendPID(t, busy), "same-key reserve behind another row owner")
+		// 7343226011103 and 7343226011101 are advisory (classid 1709, objid
+		// 3126902239 and 3126902237).
 		var wide bool
-		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND objsubid=1 AND classid::bigint::numeric*4294967296+objid::bigint::numeric=ANY(ARRAY[7343226011103,7343226011101]))`).Scan(&wide); err != nil || wide {
+		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND objsubid=1 AND classid=1709 AND objid IN (3126902239,3126902237))`).Scan(&wide); err != nil || wide {
 			t.Fatalf("waiting reserve kept its protection locks: %v %v", wide, err)
 		}
 		waitless, cancel = prompt()
@@ -1241,7 +1261,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 				// B1 awaits the legacy public fence holding no admission lock.
 				waitBlockedBy(t, pool, stitchBackendPID(t, legacy), "B1 at the legacy public fence")
 				var held bool
-				if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND objsubid=1 AND classid::bigint::numeric*4294967296+objid::bigint::numeric=7343226011103 AND granted AND pid<>pg_backend_pid())`).Scan(&held); err != nil || held {
+				if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND objsubid=1 AND classid=1709 AND objid=3126902239 AND granted AND pid<>pg_backend_pid())`).Scan(&held); err != nil || held {
 					t.Fatal("B1 held its admission lock while awaiting the legacy fence", held, err)
 				}
 				progressCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -1254,7 +1274,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 					t.Fatal("legacy plan mutation upgraded locks", err)
 				}
 				var upgraded bool
-				if err = legacy.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid() AND objsubid=1 AND classid::bigint::numeric*4294967296+objid::bigint::numeric=7343226011103)`).Scan(&upgraded); err != nil || upgraded {
+				if err = legacy.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid() AND objsubid=1 AND classid=1709 AND objid=3126902239)`).Scan(&upgraded); err != nil || upgraded {
 					t.Fatal("cleanup acquired admission lock", upgraded, err)
 				}
 				if err = legacy.Commit(ctx); err != nil {
@@ -1327,7 +1347,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 		var held bool
-		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND ((objsubid=1 AND classid::bigint::numeric*4294967296+objid::bigint::numeric=ANY(ARRAY[7343226011103,7343226011101])) OR(classid=137 AND objid=1 AND objsubid=2)))`).Scan(&held); err != nil || held {
+		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND ((objsubid=1 AND classid=1709 AND objid IN (3126902239,3126902237)) OR(classid=137 AND objid=1 AND objsubid=2)))`).Scan(&held); err != nil || held {
 			t.Fatal("waiting B1 owns later locks", held, err)
 		}
 		admissionCtx, cancel := context.WithTimeout(ctx, 2*time.Second)

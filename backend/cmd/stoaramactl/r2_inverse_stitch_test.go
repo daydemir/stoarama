@@ -13,6 +13,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -305,5 +306,44 @@ func TestKeep28ReserveAwaitsCustodyWithoutProtectionLocks(t *testing.T) {
 	publication.Rollback(f.ctx)
 	if err = within(t, reserved, "keep-28 reserve behind its custody row"); err != nil || keep28Durable(t, f, f.key) != 2 {
 		t.Fatalf("keep-28 reserve did not complete after custody freed: %v", err)
+	}
+}
+
+// Only 0223's exact stitch outcomes skip a key; another error with the same
+// SQLSTATE stops the batch.
+func TestR2InverseStitchLedgerIdentityIsExact(t *testing.T) {
+	for _, c := range []struct {
+		err  pgconn.PgError
+		skip bool
+	}{
+		{pgconn.PgError{Code: "55P03", Message: "stitch input hold admission is busy"}, true},
+		{pgconn.PgError{Code: "55000", Message: "active R2 stitch input hold"}, true},
+		{pgconn.PgError{Code: "55P03", Message: "canceling statement due to lock timeout"}, false},
+		{pgconn.PgError{Code: "55000", Message: "R2 retirement ledger requires READ COMMITTED"}, false},
+		{pgconn.PgError{Code: "55000", Message: "stitch input hold admission is busy"}, false},
+	} {
+		if got := errors.Is(inverseStitchLedgerError(&c.err), errInverseStitchConflict); got != c.skip {
+			t.Fatalf("%s %q skipped=%v", c.err.Code, c.err.Message, got)
+		}
+	}
+}
+
+// Keep-28 reserve takes no lock on the parent recording: a busy recording row
+// neither stops nor delays it.
+func TestKeep28ReserveIgnoresBusyParentRecording(t *testing.T) {
+	f := newKeep28Fixture(t)
+	a := f.applier(t)
+	parent, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Rollback(f.ctx)
+	if _, err = parent.Exec(f.ctx, `SELECT 1 FROM recordings WHERE id=30 FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	prompt, cancel := context.WithTimeout(f.ctx, 5*time.Second)
+	defer cancel()
+	if _, err = a.reserve(prompt, f.entry()); err != nil || keep28Durable(t, f, f.key) != 2 {
+		t.Fatalf("keep-28 reserve waited on or refused its busy parent recording: %v", err)
 	}
 }
