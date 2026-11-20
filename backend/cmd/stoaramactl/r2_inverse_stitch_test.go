@@ -343,7 +343,7 @@ func TestKeep28ReserveIgnoresBusyParentRecording(t *testing.T) {
 	}
 	prompt, cancel := context.WithTimeout(f.ctx, 5*time.Second)
 	defer cancel()
-	if _, err = a.reserve(prompt, f.entry()); err != nil || keep28Durable(t, f, f.key) != 2 {
+	if _, err = a.reserve(prompt, f.entry(t)); err != nil || keep28Durable(t, f, f.key) != 2 {
 		t.Fatalf("keep-28 reserve waited on or refused its busy parent recording: %v", err)
 	}
 }
