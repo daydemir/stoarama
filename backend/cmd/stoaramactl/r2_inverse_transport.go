@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -50,6 +51,13 @@ type inverseDeleteAuthority struct {
 	custody    keep28Custody
 	custodyEnd time.Time
 }
+
+// wireKey is the one exact key this authority may delete.
+func (a *inverseDeleteAuthority) wireKey() string { return a.binding.Key }
+
+// sendGate is the batch gate the RAW executor gave this authority. A
+// single-attempt target supplies its own open gate instead.
+func (a *inverseDeleteAuthority) sendGate() *inverseSendGate { return a.gate }
 
 // inverseSendGate closes when a batch hits a hard failure. A DELETE whose first
 // request byte is not yet written never sends after that; closing waits for a
@@ -414,16 +422,39 @@ func (s *inverseSDKStore) confirmAbsent(ctx context.Context, key string) error {
 	})
 }
 func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDeleteAuthority) error {
+	return s.deleteOneWire(ctx, authority)
+}
+
+// deleteOneWire sends exactly one DELETE for one already-validated target over
+// the audited HTTP/1.1 single-connection transport. A lost answer is reported
+// as ambiguous, never retried. The Durham stage retirement reaches the wire
+// only here, so it reuses the RAW lanes' transport unchanged.
+//
+// The authority already names its one exact key, so the DELETE takes its key
+// from the same value the transport's path guard compares. A separate argument
+// could disagree with it and send, or refuse, a different key than the one the
+// binding, the attempt ledger and the provider path all name.
+func (s *inverseSDKStore) deleteOneWire(ctx context.Context, authority inverseWireTarget) error {
+	// Admission runs before anything on the authority is read. requireWire is
+	// the one call every target must answer without a live receiver, so it
+	// refuses an absent, typed-nil or already-consumed authority before
+	// wireKey dereferences it. A typed nil is not == nil, which is exactly the
+	// shape the RAW role passes when it has no authority to spend; reading the
+	// key first would panic on that nil receiver instead of refusing it.
+	if !liveWireTarget(authority) {
+		return errors.New("inverse DELETE needs a wire authority")
+	}
 	if err := authority.requireWire(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
 		return err
 	}
+	key := authority.wireKey()
 	template, ok := s.transport.(*http.Transport)
 	if !ok {
 		return errors.New("inverse DELETE needs the HTTP/1.1 transport template")
 	}
-	wire := &inverseWire{gate: authority.gate}
+	wire := &inverseWire{gate: authority.sendGate()}
 	transport := &inverseDeleteTransport{base: wire.transport(template), authority: authority, bucket: s.Bucket(), endpoint: s.EndpointSHA256(), wire: wire}
-	_, err := s.sdk.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.Bucket()), Key: aws.String(authority.binding.Key)}, func(o *s3.Options) {
+	_, err := s.sdk.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.Bucket()), Key: aws.String(key)}, func(o *s3.Options) {
 		o.Retryer = aws.NopRetryer{}
 		o.HTTPClient = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	})
@@ -582,16 +613,50 @@ func (c *inverseWireConn) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// inverseWireTarget is the minimum a single DELETE needs: one exact key, one
+// consumption state, one revalidation against the still-held locks, one
+// deadline bound and one send gate. The RAW executor issues it for both lanes;
+// the Durham stage retirement issues its own for one stage object. Nothing else
+// is shared.
+type inverseWireTarget interface {
+	requireWire(context.Context, string, string) error
+	check(context.Context, string, string) error
+	bound(context.Context) (context.Context, context.CancelFunc, error)
+	wireKey() string
+	// sendGate stops a batch's unsent keys; a single-attempt target owns its own
+	// open gate and never closes one.
+	sendGate() *inverseSendGate
+}
+
 type inverseDeleteTransport struct {
 	base             http.RoundTripper
-	authority        *inverseDeleteAuthority
+	authority        inverseWireTarget
 	bucket, endpoint string
 	attempted        atomic.Bool
 	wire             *inverseWire
 }
 
+// liveWireTarget reports whether authority is a usable target rather than an
+// absent one. A raw interface holding a nil *inverseDeleteAuthority is non-nil
+// as an interface, so `authority == nil` alone would let it through and the
+// first wireKey() call would dereference that nil receiver. This reports on the
+// concrete value instead, so every caller refuses before reading the key.
+func liveWireTarget(authority inverseWireTarget) bool {
+	if authority == nil {
+		return false
+	}
+	switch value := reflect.ValueOf(authority); value.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		return !value.IsNil()
+	}
+	return true
+}
+
 func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.Method != http.MethodDelete || req.URL.Path != "/"+t.bucket+"/"+t.authority.binding.Key || req.URL.RawQuery != "x-id=DeleteObject" || !t.attempted.CompareAndSwap(false, true) {
+	if !liveWireTarget(t.authority) {
+		return nil, errors.New("inverse transport permits one exact DELETE")
+	}
+	if req.Method != http.MethodDelete || req.URL.Path != "/"+t.bucket+"/"+t.authority.wireKey() || req.URL.RawQuery != "x-id=DeleteObject" || !t.attempted.CompareAndSwap(false, true) {
 		return nil, errors.New("inverse transport permits one exact DELETE")
 	}
 	if err := t.authority.check(req.Context(), t.bucket, t.endpoint); err != nil {

@@ -412,24 +412,203 @@ authorization exempts only registered bucket, key and provider upload IDs.
 Keep the custody lane gated during rollback and until both executors enforce
 holds. Retire staged outputs through the separate controller command after
 certification, read and write grant drain, a live drained writer fence,
-a fresh exact-bucket conditional DELETE proof, and dependency checks.
-The current provider proof applies to unversioned objects. An ambiguous
-delete retains its one-shot intent and blocks fence removal and conflicting
-dependencies until the controller observes absence. For NAS raw cleanup,
-reconcile legacy staged absence receipts once with the current command to
-record a strict HEAD confirmation alongside the original observation.
+exact evidence, and dependency checks. An ambiguous delete retains its
+one-shot intent permanently: it is never reissued, edited or re-derived, it
+blocks fence removal and conflicting dependencies, and a later read-only
+observation of absence never publishes it. Only an invocation whose own DELETE
+was answered may publish a strict absence. A stage absence recorded by an
+older controller — a bare 404, or a strict HEAD recorded by a *later*
+reconciliation pass — cannot prove a same-invocation DELETE and is never
+upgraded, reconciled or reissued. Such an intent is preserved exactly as
+recorded and stays held, so it keeps blocking fence removal, dependency
+admission, the certified NAS cleanup gate and any owner keep hold over its
+prefix. There is deliberately no operator command that clears it; the stage
+needs a fresh, separately reviewed retirement instead.
 
-The same reconcile command can record absence for an aborted stage, including
-one from an earlier attempt. It requires the exact stage identity, writer
-drain, an empty multipart listing for the key, and HTTP 404 from HEAD. An
-abort after possible multipart completion remains held because that request
-can still have an unresolved outcome.
+### Stage retirement premise
+
+The provider does not implement conditional `DeleteObject`: the reviewed
+receipt `58f60cbb660865e6912c0580129ed4191a7a7dcc7bb8f10893fe5dccea82c96c`
+(2026-11-19T19:05:06Z) recorded `conditional_delete_unsupported=true` with
+`wrong_etag_delete_succeeded=true`. That is a **design premise, not an
+affirmative safety result**. A stage retirement therefore does not rely on
+`If-Match`, and no proof of it is regenerated: `If-Match` on a DELETE is a
+header the provider ignores.
+
+`retire-durham-stage --apply` instead reuses the RAW lanes' audited
+single-attempt transport unchanged:
+
+- one direct, no-redirect, non-retrying HEAD of the exact generation, then
+  exactly one DELETE whose first request byte is refused at or after the wire
+  deadline, over its own HTTP/1.1 connection with no keep-alive, so neither Go's
+  HTTP/2 client nor a pooled connection can turn one attempt into two;
+- a lost or unknown answer is `ambiguous`: the one-shot intent is kept, nothing
+  is retried, edited or reissued, and only this invocation's own answered DELETE
+  followed by a strict absence proof can publish absence;
+- only a strict `404` with no delete marker and no conflicting provider error
+  header confirms absence, and a `200` fails at once;
+- publication also requires a complete, exact-key multipart inventory that is
+  empty. A `404` alone is never enough: an unfinished upload for the same key
+  could still recreate the object after the observation.
+
+One earliest bound governs every step that can issue. The 30-second wire
+deadline is fixed before the first pre-issuance read, and the exact-key
+multipart inventory, the fence read and the independently committed attempt
+all run under it, so a slow check or a late commit can never consume an
+authority that has already expired. The gate compares the wall clock against
+the bound itself rather than trusting a delayed context timer, before the
+attempt commit and again after an acknowledged one. A late or unknown commit
+leaves the intent held and sends zero DELETEs; an unknown commit is held the
+same way. The confirmation budget after an answered DELETE stays independent
+of that wire deadline, and no DELETE is ever retried.
+
+The live fence is bound by its exact stamps. `activated_at` and
+`drain_not_before` are compared without truncation: both come from the same
+`timestamptz` row, whose microsecond precision survives the round trip, and
+the reviewed evidence must name that row's own values, so a subsecond drift is
+a different fence rather than a rounded match.
+
+One provider endpoint, taken from the committed stage row. That row's
+`endpoint_sha256` is the authority, not whatever the operator's process config
+currently names: the retirement loads it from the row, refuses a client built
+for any other endpoint, refuses a wire whose own credential names any other
+endpoint, and re-verifies the same bucket and endpoint at the exact HEAD and at
+the DELETE. A stage on the same bucket name at a different endpoint is refused
+rather than split across two providers, and no check compares a value with
+itself.
+
+The DB side takes its locks in one fixed order, and every one of them is held
+for the whole retirement, from the source-provenance clearance through the
+DELETE and the confirming readback: the per-object session lock, then shared
+writer admission `7343226011187`, then the protection epoch, then shared
+protection admission `7343226011103` and `7343226011101` (the order every
+admission and the 0220 owner-keep admission take them), then the stage row and
+its certified hour, certificate and connection-13 copy receipt `FOR SHARE`
+(never `FOR UPDATE`: the separately committed intent needs `KEY SHARE` on that
+same row), then shared `7343226011220` *after* the intent commits, so an owner
+keep hold cannot be admitted under the key while the wire and absence proof
+run. `7343226011220` is deliberately taken last: the intent's own insert
+trigger takes it shared, and a shared request queued behind a pending exclusive
+owner-keep admission would otherwise starve the insert that must commit first.
+Every lock wait is bounded and fails closed rather than queueing.
+
+The command deletes only `stitch-staging/<uuid>/<sha256>.mp4` for the exact
+object ID and certified attempt. It refuses any other key shape, so RAW,
+keep-28, delivery and every other prefix are unreachable rather than merely
+filtered. It requires the exact stage identity, the certified hour and
+manifest, a verified connection-13 copy receipt with its identity, no live
+stage or COPY grant or lease or range, an empty exact-key multipart inventory,
+the protected-dependency checks, and `NOT r2_owner_keep_held` on the stage key
+itself. `stitch-staging/` is never its own owner exemption.
+
+Source provenance is authoritative and fails closed. The hour's stream must be
+decided in the reviewed owner picks and must not be a keep-everything stream.
+The command derives the decided and keep-everything sets itself from the one
+pinned picks file (`--picks` with `--expected-picks-sha256`) using the existing
+selection parser and effective-choice rule, and requires the reviewed evidence
+to equal that derivation exactly. The evidence never supplies the sets that are
+used: its `decided_stream_ids` and `ke_stream_ids` are only compared, so a
+hand-written array cannot name a stream the owner never decided. A pick made
+against a different policy window stays undecided, and any missing, incomplete
+or unknown provenance refuses the stage. Every plan clip must have its exact
+committed hold and matching catalog identity; and no source may be under a 0220
+owner keep prefix (the thesis streams and folders), a pinned keep-everything
+folder, or permanent incident evidence.
 
 ```sh
 stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --apply \
-  --conditional-delete-proof PROOF.json --expected-delete-proof-sha256 PROOF_SHA
+  --evidence STAGE.json --expected-evidence-sha256 EVIDENCE_SHA \
+  --picks r2-picks.json --expected-picks-sha256 PICKS_SHA
 stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --reconcile
 ```
+
+A settled intent never becomes absence through a later read. `--reconcile`
+only *replays* the confirmation of an absence that a prior invocation's own
+answered DELETE already published; it never manufactures one from a stale or
+newer observation, and it never edits what an earlier invocation recorded. That
+published confirmation is one durable stamp in three columns
+(`absence_observed_at`, `strict_absence_observed_at` and `wire_absence_observed_at`,
+all equal), written by the single statement that follows an answered DELETE and
+an empty-inventory strict `404`. A row carrying only a legacy stamp — a bare
+`404` from 0217, or a strict HEAD recorded by a later reconciliation pass under
+0219 — is *not* resolved by it. An issued target whose DELETE was unconfirmed,
+including one that now reads `404`, stays held: a later `404` proves neither
+that this DELETE caused it nor that an ungoverned writer cannot recreate the
+key. Such a row is never confirmed, reissued or updated here, and it keeps
+blocking fence removal, conflicting dependencies, the certified NAS cleanup
+gate and any owner keep hold over its prefix.
+
+The same reconcile command can record absence for an aborted stage, including
+one from an earlier attempt. That is a separate, safe proof: the object reached
+the terminal `aborted` state without a possible completion, its writer drain
+and multipart outcome are both settled, and the exact-key multipart listing is
+empty and the key reads `404`. An abort after a possible multipart completion
+remains held because that request can still have an unresolved outcome, and no
+other hold is released by this path.
+
+### Stable stage evidence (reviewed, not generated)
+
+One reviewed file per stage object. It binds one key and its hour, so it can
+never authorize a second target. There is no expiry and no fresh probe: the
+premise above is historical.
+
+```json
+{
+  "version": 1,
+  "bucket": "stoarama",
+  "endpoint_sha256": "<sha256 of the provider endpoint>",
+  "object_id": 123,
+  "object_key": "stitch-staging/<generation>/<sha256>.mp4",
+  "sha256": "<stage object sha256>",
+  "size_bytes": 123456,
+  "hour_id": 45,
+  "attempt": 2,
+  "plan_sha256": "<certified plan>",
+  "manifest_sha256": "<certified staged manifest>",
+  "fence_activated_at": "2026-11-12T14:28:47Z",
+  "drain_not_before": "<live fence drain_not_before>",
+  "deployed_writer_coverage_evidence": "<controller reference: which deployed writers this drain covers>",
+  "external_writer_race": "external_writer_race_not_proven_v1",
+  "picks_sha256": "<sha256 of the reviewed owner picks>",
+  "decided_stream_ids": [3],
+  "ke_stream_ids": []
+}
+```
+
+`external_writer_race` is a fixed identifier, not free text and not an
+acceptance. It records that an ungoverned holder of the account R2 credential
+can still write this key between the final HEAD and the DELETE acknowledgement.
+The RAW lane's owner acceptance of that residue is RAW-only and does not extend
+here; an operator-supplied freeform flag is not authorization.
+
+`picks_sha256` must equal the digest of the file passed as `--picks`, and that
+digest must equal the independently approved `--expected-picks-sha256`. A
+swapped picks file cannot ride along on an approved digest for other bytes.
+`decided_stream_ids` and `ke_stream_ids` are recorded so a reviewer can read the
+decision, but the command re-derives both sets from the pinned file and refuses
+a document that differs, so they are evidence of the derivation rather than its
+source.
+
+### Rollout prerequisites for stage retirement
+
+Nothing below is authorized by merging this change; all of it is controller
+evidence reviewed separately, and `retire-durham-stage` stays unusable until it
+exists:
+
+1. `deployed_writer_coverage_evidence` naming every deployed component that
+   holds the account R2 credential and the drain that covers each one. A
+   rolled-back API, a Render job or an operator script with its own client makes
+   the fence a claim rather than a proof.
+2. A written decision on the residual external-writer race for stage keys,
+   identifying who accepted it and why it is narrower than for RAW footage.
+3. A live, drained writer fence whose activation matches the evidence, and the
+   exact per-stage evidence above reviewed and pinned by digest.
+4. The Durham queue paused with zero live leases and no unresolved stage intent
+   or retirement before the first invocation.
+
+The stage generation itself is only ever retired after certification and a
+drained connection-13 copy; no step here releases an input hold or a delivery
+hold, and no unresolved intent is ever cleared by this command.
 
 ### Release certified raw on the NAS
 
