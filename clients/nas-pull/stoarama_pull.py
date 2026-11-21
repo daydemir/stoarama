@@ -46,6 +46,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 CLIENT_VERSION = "development"
 CLEANUP_CERTIFIED_STITCH_VERSION = "r2-copy-v7-certified-stitch"
+LOW_MEMORY_COPY_CLIENT_VERSION = "r2-copy-v8-low-memory"
 CLEANUP_CERTIFIED_STITCH_REASON = "durham_stitch_certified"
 CLEANUP_CERTIFIED_STITCH_RECOVERY = "nas_stitch_certified"
 CLEANUP_RECONCILIATION_PROTOCOL = 1
@@ -680,7 +681,8 @@ class StitchProofSwitch(NamedTuple):
 class StitchSwitches:
     """Heartbeat authority; an OFF latches cancellation for the current job."""
     def __init__(self):
-        self.local_enabled = env_str("STOARAMA_V85_STITCH_ENABLED", "true").lower() == "true"
+        self.local_enabled = (CLIENT_VERSION != LOW_MEMORY_COPY_CLIENT_VERSION and
+                              env_str("STOARAMA_V85_STITCH_ENABLED", "true").lower() == "true")
         self.local_deletion_enabled = env_str("STOARAMA_V85_STITCH_DELETION_ENABLED", "true").lower() == "true"
         cancel = threading.Event()
         cancel.set()

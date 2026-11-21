@@ -551,7 +551,11 @@ func (s *Server) nasR2CopyActive(w http.ResponseWriter, r *http.Request, purpose
 		return nil, t, version, req, false
 	}
 	var data []byte
-	err = tx.QueryRow(ctx, `SELECT id,item,policy_sha256,etag,coalesce(version_id,''),work_mode FROM nas_r2_copy_items WHERE id=$1 AND connection_id=13 AND state IN ('leased','refresh_leased') AND lease_token=$2 AND lease_expires_at>clock_timestamp() FOR UPDATE`, id, req.Token).Scan(&t.ID, &data, &t.PolicySHA256, &t.ETag, &version, &t.WorkMode)
+	var clientVersion string
+	err = tx.QueryRow(ctx, `SELECT id,item,policy_sha256,etag,coalesce(version_id,''),work_mode,
+ (SELECT client_version FROM connections WHERE id=13) FROM nas_r2_copy_items
+ WHERE id=$1 AND connection_id=13 AND state IN ('leased','refresh_leased') AND lease_token=$2 AND lease_expires_at>clock_timestamp() FOR UPDATE`,
+		id, req.Token).Scan(&t.ID, &data, &t.PolicySHA256, &t.ETag, &version, &t.WorkMode, &clientVersion)
 
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		fail()
@@ -588,6 +592,11 @@ func (s *Server) nasR2CopyActive(w http.ResponseWriter, r *http.Request, purpose
 	if err != nil || json.Unmarshal(data, &t.Item) != nil || policy != t.PolicySHA256 {
 		fail()
 		util.WriteError(w, 409, "copy lease or policy expired")
+		return nil, t, version, req, false
+	}
+	if t.Item.Kind != NASR2CopyRaw && clientVersion == nasLowMemoryCopyClientVersion {
+		fail()
+		util.WriteError(w, 409, "low-memory client requires a raw copy lease")
 		return nil, t, version, req, false
 	}
 	if t.Clip, err = LoadNASR2CopySource(ctx, tx, t.Item); err != nil {
