@@ -53,28 +53,48 @@ func within[T any](t *testing.T, ch <-chan T, what string) T {
 	}
 }
 
+// stitchCutover is one schema parked exactly at the 0223 boundary: the pool and
+// a migration directory holding only 0223, the cutover the subtest is about.
+type stitchCutover struct {
+	pool *pgxpool.Pool
+	dir  string
+}
+
 // stitchCutoverFixture migrates to just before 0223 and stores one held-able
-// RAW source. It returns the pool and the full migration directory.
-func stitchCutoverFixture(t *testing.T) *pgxpool.Pool {
+// RAW source. The cutover runs only 0223: each subtest keeps an in-flight
+// transaction written under the old 0217 trigger, and 0225 would take ACCESS
+// EXCLUSIVE on r2_retirement_reservations to rewrite a constraint, waiting out
+// migrationLock against that open ledger row for a change these witnesses do
+// not test. 0223 only replaces trigger functions and takes a SHARE lock on
+// nas_stitch_r2_input_holds, so it applies under the same in-flight writer and
+// leaves both old/new trigger witnesses real.
+func stitchCutoverFixture(t *testing.T) stitchCutover {
 	t.Helper()
 	ctx := context.Background()
 	pool := joinedPurgeTestPool(t, "stitch_cutover")
 	full := joinedPurgeMigrationsDir()
-	before := t.TempDir()
+	before, cutover := t.TempDir(), t.TempDir()
 	entries, err := os.ReadDir(full)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, entry := range entries {
-		if !strings.HasSuffix(entry.Name(), ".sql") || entry.Name() >= stitchKeyLockMigration {
+		if !strings.HasSuffix(entry.Name(), ".sql") {
 			continue
 		}
 		body, err := os.ReadFile(filepath.Join(full, entry.Name()))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err = os.WriteFile(filepath.Join(before, entry.Name()), body, 0600); err != nil {
-			t.Fatal(err)
+		if entry.Name() < stitchKeyLockMigration {
+			if err = os.WriteFile(filepath.Join(before, entry.Name()), body, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if entry.Name() == stitchKeyLockMigration {
+			if err = os.WriteFile(filepath.Join(cutover, entry.Name()), body, 0600); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	if err = db.MigrateUp(ctx, pool, before); err != nil {
@@ -92,7 +112,7 @@ func stitchCutoverFixture(t *testing.T) *pgxpool.Pool {
  INSERT INTO nas_stitch_r2_hours(scope_id,recording_id,hour_at,plan,plan_sha256,input_bytes) VALUES(70,30,'2026-06-01','{}',repeat('f',64),100)`); err != nil {
 		t.Fatal(err)
 	}
-	return pool
+	return stitchCutover{pool: pool, dir: cutover}
 }
 
 const (
@@ -107,7 +127,8 @@ const (
 func TestR2StitchKeyLockCutoverKeepsHoldsOrdered(t *testing.T) {
 	ctx := context.Background()
 	t.Run("hold_written_by_the_old_trigger", func(t *testing.T) {
-		pool := stitchCutoverFixture(t)
+		f := stitchCutoverFixture(t)
+		pool := f.pool
 		hold, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 		if err != nil {
 			t.Fatal(err)
@@ -117,7 +138,7 @@ func TestR2StitchKeyLockCutoverKeepsHoldsOrdered(t *testing.T) {
 			t.Fatal(err)
 		}
 		migrated := make(chan error, 1)
-		go func() { migrated <- db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir()) }()
+		go func() { migrated <- db.MigrateUp(ctx, pool, f.dir) }()
 		waitBlockedBy(t, pool, stitchBackendPID(t, hold), "0223 behind an in-flight old hold")
 		if err = hold.Commit(ctx); err != nil {
 			t.Fatal(err)
@@ -130,7 +151,8 @@ func TestR2StitchKeyLockCutoverKeepsHoldsOrdered(t *testing.T) {
 		}
 	})
 	t.Run("ledger_written_by_the_old_trigger", func(t *testing.T) {
-		pool := stitchCutoverFixture(t)
+		f := stitchCutoverFixture(t)
+		pool := f.pool
 		ledger, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 		if err != nil {
 			t.Fatal(err)
@@ -139,7 +161,7 @@ func TestR2StitchKeyLockCutoverKeepsHoldsOrdered(t *testing.T) {
 		if _, err = ledger.Exec(ctx, stitchCutoverReservation); err != nil {
 			t.Fatal(err)
 		}
-		if err = db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir()); err != nil {
+		if err = db.MigrateUp(ctx, pool, f.dir); err != nil {
 			t.Fatal(err)
 		}
 		admitted := make(chan error, 1)
