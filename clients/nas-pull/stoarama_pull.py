@@ -53325,9 +53325,13 @@ def copy_r2_manifest(cfg, filename, expected_sha, max_bytes):
 # Server-issued R2 keep28 copies. This worker is intentionally independent of
 # the raw delivery cursor: it neither releases clips nor retires R2 objects.
 R2_COPY_FLOOR = 2_000_000_000_000
-R2_COPY_WORKERS = 4
-R2_COPY_RANGE = 16 * 1024 * 1024
-R2_COPY_SPACE_GUARD = 2 * R2_COPY_WORKERS * R2_COPY_RANGE
+# Each signed range is buffered for identity validation before it reaches disk.
+# One worker may own a control child and a short-lived range child at once.
+R2_COPY_RANGE = 1024 * 1024
+R2_COPY_MEMORY_MARGIN = 200 * 1024 * 1024
+R2_COPY_CHILD_MEMORY_BUDGET = 64 * 1024 * 1024
+R2_COPY_MIN_MEMORY = R2_COPY_MEMORY_MARGIN + R2_COPY_CHILD_MEMORY_BUDGET + 4 * R2_COPY_RANGE
+R2_COPY_SPACE_GUARD = 128 * 1024 * 1024
 R2_COPY_CHUNK = 256 * 1024
 R2_COPY_TIMEOUT = 2
 R2_COPY_STARTUP_TIMEOUT = 15
@@ -53821,7 +53825,7 @@ class R2CopyControl:
                  sent, first - sent if first >= 0 and sent >= 0 else -1, elapsed, status))
 
 
-def r2_copy_resources(cfg, runtime, needed=R2_COPY_RANGE, workers=1):
+def r2_copy_resources(cfg, runtime, needed=R2_COPY_RANGE):
     if not os.path.ismount(str(cfg.output_dir)):
         raise R2CopyHold("NAS output root is not mounted")
     _, available = meminfo_bytes(_read_text("/proc/meminfo"))
@@ -53833,7 +53837,7 @@ def r2_copy_resources(cfg, runtime, needed=R2_COPY_RANGE, workers=1):
         if used is None:
             raise R2CopyHold("copy cgroup memory telemetry unavailable")
         available = min(available, limit - int(used))
-    if available < 512 * 1024 * 1024 + 4 * workers * R2_COPY_RANGE:
+    if available < R2_COPY_MIN_MEMORY:
         raise R2CopyHold("copy memory headroom")
     status = storage_status(cfg)
     with runtime.lock:
@@ -53841,23 +53845,6 @@ def r2_copy_resources(cfg, runtime, needed=R2_COPY_RANGE, workers=1):
     if not status.get("available") or free < max(R2_COPY_FLOOR, cfg.min_free_bytes) + needed:
         raise R2CopyHold("copy free-space floor")
     return free
-
-
-class R2CopyAdmission:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.workers = 0
-
-    @contextmanager
-    def claim(self, cfg, runtime):
-        with self.lock:
-            free = r2_copy_resources(cfg, runtime, workers=self.workers + 1)
-            self.workers += 1
-        try:
-            yield free
-        finally:
-            with self.lock:
-                self.workers -= 1
 
 
 class R2CopyGuard:
@@ -54229,23 +54216,39 @@ def _execute_r2_copy(cfg, runtime, inventory, stop, task, control):
         os.close(parent)
 
 
-def r2_copy_worker(cfg, runtime, inventory, stop, worker, admission):
+def r2_copy_worker(cfg, runtime, inventory, stop, worker):
+    import resource
+    first_lease = True
     with R2CopyControl(cfg, stop, worker) as control:
         wait = 0
         while not stop.wait(wait):
             wait = 60
             try:
-                with admission.claim(cfg, runtime) as free:
-                    # The API uses the admitted client version for Durham.
-                    request = {"free_bytes": free, "verify_existing": True}
-                    response = control.request_json(R2CopyControlOperation.LEASE, "/account/connections/r2-copy/lease",
-                                                    body=request)
-                    if response.get("blocked") is True:
-                        log("ERROR", "R2 copy server blocked id=%s reason=%s; key protected" % (response.get("id"), response.get("reason")))
-                        wait = 0
-                    elif response.get("task") is not None:
+                free = r2_copy_resources(cfg, runtime)
+                request = {"free_bytes": free, "verify_existing": True}
+                response = control.request_json(R2CopyControlOperation.LEASE, "/account/connections/r2-copy/lease",
+                                                body=request)
+                if response.get("blocked") is True:
+                    log("ERROR", "R2 copy server blocked id=%s reason=%s; key protected" % (response.get("id"), response.get("reason")))
+                    wait = 0
+                elif response.get("task") is not None:
+                    try:
                         execute_r2_copy(cfg, runtime, inventory, stop, response["task"], control)
-                        wait = 0
+                    finally:
+                        if first_lease:
+                            first_lease = False
+                            unit = 1 if sys.platform == "darwin" else 1024
+                            control_rss = None
+                            if sys.platform == "linux" and control.process is not None:
+                                status = _read_text("/proc/%d/status" % control.process.pid) or ""
+                                peak = re.search(r"^VmHWM:\s+(\d+) kB$", status, re.MULTILINE)
+                                if peak:
+                                    control_rss = int(peak[1]) * 1024
+                            log("INFO", "R2 copy first lease process_peak_rss_bytes=%d reaped_child_peak_rss_bytes=%d control_peak_rss_bytes=%s" % (
+                                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit,
+                                resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * unit,
+                                control_rss if control_rss is not None else "unavailable"))
+                    wait = 0
             except urllib.error.HTTPError as exc:
                 R2_COPY_TELEMETRY.hold("http_%d" % exc.code)
                 log("WARN", "R2 copy control HTTP %d; holding" % exc.code)
@@ -54258,13 +54261,8 @@ def r2_copy_worker(cfg, runtime, inventory, stop, worker, admission):
 
 
 def r2_copy_loop(cfg, runtime, inventory, stop):
-    # The supervisor stays alive until EVERY file/transport drains, so the
-    # existing updater/shutdown gate also covers this complete bounded pool.
-    admission = R2CopyAdmission()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=R2_COPY_WORKERS, thread_name_prefix="r2-copy") as pool:
-        futures = [pool.submit(r2_copy_worker, cfg, runtime, inventory, stop, worker, admission) for worker in range(R2_COPY_WORKERS)]
-        for future in futures:
-            future.result()
+    # The caller owns this thread and waits for its lease and transport to drain.
+    r2_copy_worker(cfg, runtime, inventory, stop, 0)
 
 
 def main(argv=None):
