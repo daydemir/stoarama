@@ -44,6 +44,7 @@ type liveStageProvider struct {
 	// liveInventoryAfterDelete keeps a live upload listed for this exact key
 	// after the DELETE, so publication must refuse although the object is gone.
 	liveInventoryAfterDelete atomic.Bool
+	deleteMarkerAfterDelete  atomic.Bool
 	holdDelete               chan struct{}
 	entered                  sync.Once
 	deleteEntered            chan struct{}
@@ -81,6 +82,9 @@ func newLiveStageProvider(t *testing.T, key, sha string, size int64) *liveStageP
 			if p.deleted.Load() {
 				if p.postDeleteEmptyLists.Load() > 0 {
 					p.postDeleteNotFoundAfterEmpty.Add(1)
+				}
+				if p.deleteMarkerAfterDelete.Load() {
+					w.Header().Set("X-Amz-Delete-Marker", "true")
 				}
 				w.WriteHeader(http.StatusNotFound)
 				return
@@ -389,21 +393,36 @@ func TestR2StitchStageSameInvocationWritesEveryStamp(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "absence unconfirmed") {
 		t.Fatalf("a live exact-key upload published an absence: %v", err)
 	}
-	rows, resolved, absence, strict, wire = blocked.provenance(t)
+	blocked.assertHeldAfterWire(t)
+}
+
+func TestR2StitchStageDeleteMarkerDoesNotPublishAbsence(t *testing.T) {
+	s := certifyLiveStage(t, "live_delete_marker")
+	s.provider.deleteMarkerAfterDelete.Store(true)
+	if err := s.retire(t, s.client(t)); err == nil || !strings.Contains(err.Error(), "absence remains unconfirmed") {
+		t.Fatalf("a delete-marker 404 published an absence: %v", err)
+	}
+	s.assertSingleWire(t)
+	s.assertHeldAfterWire(t)
+}
+
+func (s *liveStage) assertHeldAfterWire(t *testing.T) {
+	t.Helper()
+	rows, resolved, absence, strict, wire := s.provenance(t)
 	if rows != 1 || resolved || absence != nil || strict != nil || wire != nil {
 		t.Fatalf("withheld absence wrote provenance: rows=%d resolved=%v %v/%v/%v",
 			rows, resolved, absence, strict, wire)
 	}
 	var issued bool
-	if err := blocked.fixture.pool.QueryRow(blocked.fixture.ctx, `SELECT issued_at IS NOT NULL
- FROM nas_stitch_r2_stage_retirements WHERE object_id=$1`, blocked.objectID).Scan(&issued); err != nil || !issued {
+	if err := s.fixture.pool.QueryRow(s.fixture.ctx, `SELECT issued_at IS NOT NULL
+ FROM nas_stitch_r2_stage_retirements WHERE object_id=$1`, s.objectID).Scan(&issued); err != nil || !issued {
 		t.Fatalf("a withheld absence lost its one-shot intent: %v %v", issued, err)
 	}
-	if got := blocked.provider.deletes.Load(); got != 1 {
+	if got := s.provider.deletes.Load(); got != 1 {
 		t.Fatalf("the withheld retirement sent %d DELETEs", got)
 	}
-	if blocked.nasGate(t) {
-		t.Fatal("a withheld exact-key inventory cleared the certified NAS gate")
+	if s.nasGate(t) {
+		t.Fatal("unconfirmed absence cleared the certified NAS gate")
 	}
 }
 
