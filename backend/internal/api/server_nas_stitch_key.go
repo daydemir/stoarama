@@ -233,6 +233,17 @@ func (s *Server) ordinaryNASStitchCaller(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return nasStitchCaller{}, false
 	}
+	if cid == 13 {
+		var version string
+		if err := s.pool.QueryRow(r.Context(), `SELECT client_version FROM connections WHERE id=$1`, cid).Scan(&version); err != nil {
+			util.WriteError(w, 503, "stitch client version unavailable")
+			return nasStitchCaller{}, false
+		}
+		if version == nasLowMemoryCopyClientVersion {
+			util.WriteError(w, 409, "low-memory client is copy-only")
+			return nasStitchCaller{}, false
+		}
+	}
 	caller.connectionID = cid
 	return caller, true
 }
