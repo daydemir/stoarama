@@ -38,11 +38,12 @@ type liveStageProvider struct {
 	size           int64
 	modified       time.Time
 
-	deletes, heads, lists atomic.Int32
+	deletes                      atomic.Int32
+	postDeleteEmptyLists         atomic.Int32
+	postDeleteNotFoundAfterEmpty atomic.Int32
 	// liveInventoryAfterDelete keeps a live upload listed for this exact key
 	// after the DELETE, so publication must refuse although the object is gone.
 	liveInventoryAfterDelete atomic.Bool
-	absent                   atomic.Bool
 	holdDelete               chan struct{}
 	entered                  sync.Once
 	deleteEntered            chan struct{}
@@ -56,20 +57,31 @@ func newLiveStageProvider(t *testing.T, key, sha string, size int64) *liveStageP
 		modified: time.Date(2026, 11, 19, 10, 0, 0, 0, time.UTC), deleteEntered: make(chan struct{})}
 	p.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml")
+		if r.Method != http.MethodGet && r.URL.Path != "/stoarama/"+p.key {
+			t.Errorf("%s asked for %q, want %q", r.Method, r.URL.Path, "/stoarama/"+p.key)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 		switch r.Method {
 		case http.MethodGet:
-			p.lists.Add(1)
 			if prefix := r.URL.Query().Get("prefix"); prefix != p.key {
 				t.Errorf("multipart inventory asked for %q, want %q", prefix, p.key)
-			}
-			if p.deleted.Load() && p.liveInventoryAfterDelete.Load() {
-				fmt.Fprintf(w, "<ListMultipartUploadsResult><Bucket>stoarama</Bucket><Prefix>%s</Prefix><IsTruncated>false</IsTruncated><Upload><Key>%s</Key><UploadId>still-live</UploadId></Upload></ListMultipartUploadsResult>", p.key, p.key)
+				w.WriteHeader(http.StatusBadRequest)
 				return
+			}
+			if p.deleted.Load() {
+				if p.liveInventoryAfterDelete.Load() {
+					fmt.Fprintf(w, "<ListMultipartUploadsResult><Bucket>stoarama</Bucket><Prefix>%s</Prefix><IsTruncated>false</IsTruncated><Upload><Key>%s</Key><UploadId>still-live</UploadId></Upload></ListMultipartUploadsResult>", p.key, p.key)
+					return
+				}
+				p.postDeleteEmptyLists.Add(1)
 			}
 			fmt.Fprintf(w, "<ListMultipartUploadsResult><Bucket>stoarama</Bucket><Prefix>%s</Prefix><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>", p.key)
 		case http.MethodHead:
-			p.heads.Add(1)
-			if p.absent.Load() {
+			if p.deleted.Load() {
+				if p.postDeleteEmptyLists.Load() > 0 {
+					p.postDeleteNotFoundAfterEmpty.Add(1)
+				}
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
@@ -88,7 +100,6 @@ func newLiveStageProvider(t *testing.T, key, sha string, size int64) *liveStageP
 				}
 			}
 			p.deleted.Store(true)
-			p.absent.Store(true)
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			t.Errorf("stage provider saw an unexpected %s", r.Method)
@@ -204,8 +215,19 @@ func certifyLiveStage(t *testing.T, name string) *liveStage {
 	const hourID, objectID, attempt, size = int64(500), int64(601), 2, int64(100)
 	sha := fmt.Sprintf("%064d", objectID)
 	f.seedHour(t, hourID)
-	// The certified hour keeps its plan but a certificate resolved its state.
-	f.insert(`UPDATE nas_stitch_r2_hours SET state='certified' WHERE id=$1`, hourID)
+	const clipID, sourceKey, sourceSize = int64(701), "managed/acct-47/stitch-raw.mp4", int64(200)
+	sourceSHA := fmt.Sprintf("%064d", clipID)
+	f.insert(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,
+ size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path)
+ SELECT $2,recording_id,1,'https://storage.example.test','stoarama',$3,$4,'source-etag',$5,
+ hour_at,hour_at,hour_at+interval '1 minute','stitch/source.mp4'
+ FROM nas_stitch_r2_hours WHERE id=$1`, hourID, clipID, sourceKey, sourceSize, sourceSHA)
+	f.insert(`INSERT INTO nas_stitch_r2_input_holds(hour_id,bucket,object_key,catalog_clip_id,sha256,size_bytes,etag,released_at)
+ VALUES($1,'stoarama',$2,$3,$4,$5,'source-etag',clock_timestamp())`, hourID, sourceKey, clipID, sourceSHA, sourceSize)
+	f.insert(`UPDATE nas_stitch_r2_hours SET state='certified',input_bytes=$4,
+ plan=jsonb_set(plan,'{clips}',jsonb_build_array(jsonb_build_object(
+  'source_id',$2::bigint,'bucket','stoarama','object_key',$3::text,'size_bytes',$4::bigint,'sha256',$5::text,'etag','source-etag')))
+ WHERE id=$1`, hourID, clipID, sourceKey, sourceSize, sourceSHA)
 
 	// The generation is fixed here, so the generated key is known before the
 	// provider exists and the row can be seeded once with that provider's own
@@ -332,11 +354,8 @@ func (s *liveStage) assertSingleWire(t *testing.T) {
 	if got := s.provider.deletes.Load(); got != 1 {
 		t.Fatalf("retirement sent %d DELETEs", got)
 	}
-	if !s.provider.absent.Load() || s.provider.heads.Load() == 0 {
-		t.Fatal("retirement did not verify the exact key absent")
-	}
-	if s.provider.lists.Load() == 0 {
-		t.Fatal("retirement never read the exact-key multipart inventory")
+	if lists, heads := s.provider.postDeleteEmptyLists.Load(), s.provider.postDeleteNotFoundAfterEmpty.Load(); lists != 1 || heads != 1 {
+		t.Fatalf("post-DELETE proof: %d empty inventories and %d exact 404 HEADs after the empty inventory", lists, heads)
 	}
 }
 
@@ -479,7 +498,7 @@ func TestR2StitchStageRetirementRacesOwnerPrefixAdmission(t *testing.T) {
 		}
 		defer admission.Rollback(context.Background())
 		if _, err = admission.Exec(s.fixture.ctx, `INSERT INTO r2_owner_keep_prefixes(bucket,prefix,decision)
- VALUES('stoarama','stitch-staging/','fixture hold before retirement')`); err != nil {
+ VALUES('stoarama','raw/stream/3/','fixture source hold before retirement')`); err != nil {
 			t.Fatal(err)
 		}
 		admissionPID := stageBackendPID(t, admission)
@@ -497,8 +516,8 @@ func TestR2StitchStageRetirementRacesOwnerPrefixAdmission(t *testing.T) {
 		if err = admission.Commit(s.fixture.ctx); err != nil {
 			t.Fatal(err)
 		}
-		if err = <-retired; err == nil {
-			t.Fatal("a retirement proceeded under an owner keep hold")
+		if err = <-retired; err == nil || !strings.Contains(err.Error(), "stitch stage source provenance is protected") {
+			t.Fatalf("retirement did not refuse the source owner hold: %v", err)
 		}
 		if got := s.provider.deletes.Load(); got != 0 {
 			t.Fatalf("a hold-covered stage key was deleted: %d", got)
@@ -546,7 +565,7 @@ func TestR2StitchStageRetirementRacesOwnerPrefixAdmission(t *testing.T) {
 		admitted := make(chan error, 1)
 		go func() {
 			_, err := admission.Exec(context.Background(), `INSERT INTO r2_owner_keep_prefixes(bucket,prefix,decision)
- VALUES('stoarama','stitch-staging/','fixture hold after retirement')`)
+ VALUES('stoarama','raw/stream/3/','fixture source hold after retirement')`)
 			admitted <- err
 		}()
 		stageWaitsForLock(t, s.fixture.pool, admissionPID, stageLiveEndpointFence, "ExclusiveLock")
@@ -559,6 +578,9 @@ func TestR2StitchStageRetirementRacesOwnerPrefixAdmission(t *testing.T) {
 		}
 		if err = <-admitted; err != nil {
 			t.Fatalf("the admission did not proceed after the retirement committed: %v", err)
+		}
+		if err = admission.Commit(s.fixture.ctx); err != nil {
+			t.Fatalf("commit source hold after retirement: %v", err)
 		}
 		rows, resolved, absence, strict, wire := s.provenance(t)
 		if rows != 1 || !resolved || absence == nil || strict == nil || wire == nil ||

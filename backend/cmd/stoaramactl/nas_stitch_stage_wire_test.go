@@ -207,7 +207,7 @@ func TestDurhamStageTransportRefusesAnotherKey(t *testing.T) {
 // with an empty key. Both the absent interface and a typed nil — a nil
 // *inverseDeleteAuthority inside the interface, which is the shape the RAW role
 // produces when it has nothing to spend — are refused without a panic.
-func TestDurhamStageTransportRefusesANilAuthority(t *testing.T) {
+func TestR2StitchStageTransportRefusesANilAuthority(t *testing.T) {
 	f := newStageWireFixture(t)
 	store, err := newInverseSDKStore(context.Background(), r2ConfigFor(t, f.srv.URL))
 	if err != nil {
