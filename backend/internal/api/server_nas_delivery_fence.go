@@ -85,7 +85,15 @@ func (s *Server) fenceNASDelivery(next http.Handler) http.Handler {
 			util.WriteError(w, 503, "delivery admission unavailable")
 			return
 		}
-		capability := strings.HasSuffix(r.URL.Path, "/download") || strings.HasSuffix(r.URL.Path, "/redownload") || strings.HasSuffix(r.URL.Path, "/nas-restore/lease")
+		mediaCapability := strings.HasSuffix(r.URL.Path, "/download") || strings.HasSuffix(r.URL.Path, "/redownload")
+		var workEpoch bool
+		if mediaCapability {
+			if err = tx.QueryRow(ctx, `SELECT nas_delivery_work_epoch($1)`, cid).Scan(&workEpoch); err != nil {
+				util.WriteError(w, 503, "delivery work window unavailable")
+				return
+			}
+		}
+		capability := mediaCapability || strings.HasSuffix(r.URL.Path, "/nas-restore/lease")
 		if capability {
 			_, err = tx.Exec(r.Context(), `INSERT INTO nas_delivery_download_leases(connection_id,expires_at) SELECT 13,clock_timestamp()+interval '7 days 2 minutes' WHERE NOT EXISTS(SELECT 1 FROM nas_delivery_retirement_fences WHERE connection_id=13)`)
 			if err != nil {
@@ -102,6 +110,24 @@ func (s *Server) fenceNASDelivery(next http.Handler) http.Handler {
 		if ctx.Err() != nil && !(nasR2CopyControlRequest(r) && nasR2CopyCommittedResponse(response.status)) {
 			util.WriteError(w, 503, "delivery admission expired")
 			return
+		}
+		if mediaCapability && response.status >= 200 && response.status < 400 {
+			// The handler uses its own connections. Reacquire after it exits
+			// so an epoch switch cannot expose a capability it validated under
+			// the prior window. Already-issued capabilities still need a drain.
+			publish, err := s.pool.Begin(ctx)
+			if err != nil {
+				util.WriteError(w, 503, "delivery publication unavailable")
+				return
+			}
+			defer publish.Rollback(ctx)
+			var current bool
+			if _, err = publish.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, NASDeliveryFenceLock); err != nil ||
+				publish.QueryRow(ctx, `SELECT nas_delivery_work_epoch($1)`, cid).Scan(&current) != nil ||
+				current != workEpoch {
+				util.WriteError(w, 503, "delivery work window changed; retryable")
+				return
+			}
 		}
 
 		for key, values := range response.header {

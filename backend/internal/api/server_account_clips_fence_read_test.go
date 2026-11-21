@@ -109,7 +109,9 @@ func TestNASKeep20SwitchChangesWorkWithoutChangingHistoricalFence(t *testing.T) 
 	ctx := context.Background()
 	activateFeedFence(t, pool)
 	for _, ddl := range []string{
-		`CREATE TABLE nas_cleanup_plans(mode text); CREATE TABLE nas_cleanup_batches(mode text);
+		`ALTER TABLE connections ADD COLUMN delivery_nas_handoff_enabled boolean NOT NULL DEFAULT false;
+CREATE TABLE nas_stitch_r2_stage_objects(state text,grants_drain_at timestamptz);
+CREATE TABLE nas_cleanup_plans(mode text); CREATE TABLE nas_cleanup_batches(mode text);
 CREATE TABLE nas_cleanup_items(state text); CREATE TABLE nas_cleanup_maintenance(active boolean)`,
 		`CREATE TABLE nas_r2_copy_items(connection_id bigint,state text,item jsonb,lease_expires_at timestamptz);
 CREATE TABLE nas_stitch_r2_hours(state text,lease_expires_at timestamptz,scope_id bigint,plan jsonb);
@@ -149,8 +151,20 @@ CREATE TABLE nas_stitch_scopes(id bigint GENERATED ALWAYS AS IDENTITY,stream_id 
 	if _, err = pool.Exec(ctx, pending, keptStart); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = pool.Exec(ctx, `INSERT INTO nas_stitch_r2_stage_objects(state) VALUES('completing')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, activate); err == nil {
+		t.Fatal("activation crossed unresolved staging completion")
+	}
+	if _, err = pool.Exec(ctx, `DELETE FROM nas_stitch_r2_stage_objects`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = pool.Exec(ctx, activate); err != nil {
 		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE connections SET delivery_nas_handoff_enabled=true WHERE id=13`); err == nil {
+		t.Fatal("legacy handoff re-enabled after activation")
 	}
 	var legacy int
 	var allowed, kept bool

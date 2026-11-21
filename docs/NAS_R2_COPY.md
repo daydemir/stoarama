@@ -282,13 +282,17 @@ streams marked. The existing delivery fence and historical plan hashes stay
 available for recovery. Installing the migration leaves the work epoch unset.
 
 After verifying that the entire deployment reads the new work view, attest the
-current NAS reader and writer drain, keep the cleanup runner stopped and its
-master off, and activate the epoch with
+NAS reader and writer drain. Keep the legacy delivery handoff disabled.
+Confirm Durham staging grants and multipart operations have drained, and
+preserve any paused or uncertain work. Keep the cleanup runner stopped and
+its master off, then activate the epoch with
 `stoaramactl nas-r2-copy activate-keep20 --sha256 BOUND_POLICY_SHA --apply`.
 The policy SHA is the SHA-256 of `nas_media_keep20_manifest()` in the reviewed
 migration. A single insert switches the ordinary feed, new copy admission and
 stitch scopes. It refuses live leases and pending work outside the new window.
 Copy and stitch receipts retain the existing transport and evidence digests.
+Keep the historical finish tick and refresh feeders paused at this boundary.
+Queue independently pinned 20-day manifests through the existing copy command.
 
 ## Copy-v3 upgrade (controller only)
 

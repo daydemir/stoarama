@@ -5,6 +5,10 @@ CREATE TABLE nas_media_keep20_epoch (
  activated_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
+CREATE OR REPLACE FUNCTION nas_delivery_work_epoch(connection bigint) RETURNS boolean LANGUAGE sql STABLE AS $$
+ SELECT EXISTS(SELECT 1 FROM nas_media_keep20_epoch WHERE connection_id=connection)
+$$;
+
 CREATE FUNCTION nas_media_keep20_manifest() RETURNS text LANGUAGE sql IMMUTABLE AS $$
  SELECT $policy$[
  {"end_at": "2026-10-05T15:00:00+00:00", "keep_everything": false, "start_at": "2026-09-15T15:00:00+00:00", "stream_id": 3, "timezone": "Asia/Tokyo"},
@@ -177,6 +181,9 @@ BEGIN
  PERFORM pg_advisory_xact_lock(7343226011192); -- copy lease fence, before cleanup
  PERFORM pg_advisory_xact_lock(7343226011101); -- cleanup public fence
  PERFORM pg_advisory_xact_lock(7343226011185); -- ordinary delivery
+ IF NOT pg_try_advisory_xact_lock(7343226011187) THEN
+  RAISE EXCEPTION 'R2 stitch staging admission is busy' USING ERRCODE='55P03';
+ END IF;
  IF NOT EXISTS(SELECT 1 FROM nas_delivery_retirement_fences WHERE connection_id=13
      AND policy_sha256='060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811')
   OR (SELECT count(*) FROM nas_media_keep20_windows)<>109
@@ -190,6 +197,9 @@ BEGIN
   OR EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled')
   OR EXISTS(SELECT 1 FROM nas_cleanup_items WHERE state='leased')
   OR EXISTS(SELECT 1 FROM nas_cleanup_maintenance WHERE active)
+  OR EXISTS(SELECT 1 FROM connections WHERE id=13 AND delivery_nas_handoff_enabled)
+  OR EXISTS(SELECT 1 FROM nas_stitch_r2_stage_objects
+      WHERE state IN ('starting','uploading','completing') OR grants_drain_at>=clock_timestamp())
   OR EXISTS(SELECT 1 FROM nas_r2_copy_items WHERE connection_id=13
      AND (state IN ('leased','refresh_leased') AND lease_expires_at>clock_timestamp()
        OR state IN ('pending','refresh_pending','leased','refresh_leased') AND NOT nas_media_keep20_copy_item(item)))
@@ -214,6 +224,21 @@ BEGIN
 END $$;
 CREATE TRIGGER nas_media_keep20_activate BEFORE INSERT ON nas_media_keep20_epoch
  FOR EACH ROW EXECUTE FUNCTION nas_media_keep20_activate_guard();
+
+CREATE FUNCTION nas_media_keep20_guard_handoff() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF NEW.id=13 AND NEW.delivery_nas_handoff_enabled THEN
+  IF NOT pg_try_advisory_xact_lock_shared(7343226011185) THEN
+   RAISE EXCEPTION 'NAS media work window busy' USING ERRCODE='55P03';
+  END IF;
+  IF EXISTS(SELECT 1 FROM nas_media_keep20_epoch) THEN
+   RAISE EXCEPTION 'legacy NAS handoff is outside the active 20-day protocol';
+  END IF;
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER nas_media_keep20_legacy_handoff BEFORE UPDATE OF delivery_nas_handoff_enabled ON connections
+ FOR EACH ROW EXECUTE FUNCTION nas_media_keep20_guard_handoff();
 
 CREATE FUNCTION nas_media_keep20_guard_copy() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
