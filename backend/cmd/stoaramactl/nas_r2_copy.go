@@ -351,7 +351,7 @@ func queueNASR2Copy(ctx context.Context, pool nasCopyDB, h nasCopyHeader, manife
 
 func runNASR2Copy(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) == 0 {
-		log.Fatal("nas-r2-copy plan|queue|status")
+		log.Fatal("nas-r2-copy plan|queue|status|activate-keep20")
 	}
 	fs := flag.NewFlagSet("nas-r2-copy", flag.ExitOnError)
 	input := fs.String("input", "", "source copy.jsonl[.gz] or batch")
@@ -380,6 +380,20 @@ func runNASR2Copy(ctx context.Context, cfg config.Config, args []string) {
 		log.Fatal("copy database unavailable")
 	}
 	defer pool.Close()
+	if args[0] == "activate-keep20" {
+		if !*apply || !r2RetireLowerHex64(*sha) {
+			log.Fatal("activate-keep20 requires --apply and the reviewed policy --sha256")
+		}
+		var activated time.Time
+		err := pool.QueryRow(ctx, `INSERT INTO nas_media_keep20_epoch(connection_id)
+ SELECT 13 WHERE encode(sha256(convert_to(nas_media_keep20_manifest(),'UTF8')),'hex')=$1
+ RETURNING activated_at`, *sha).Scan(&activated)
+		if err != nil {
+			log.Fatal("20-day NAS work activation refused: ", err)
+		}
+		fmt.Printf("nas_keep20_active_at=%s policy_sha256=%s\n", activated.UTC().Format(time.RFC3339Nano), *sha)
+		return
+	}
 	if args[0] == "status" {
 		if *jsonOutput {
 			status, err := loadNASCopyStatus(ctx, pool)
@@ -411,7 +425,7 @@ func runNASR2Copy(ctx context.Context, cfg config.Config, args []string) {
 		return
 	}
 	if args[0] != "queue" {
-		log.Fatal("nas-r2-copy plan|queue|status")
+		log.Fatal("nas-r2-copy plan|queue|status|activate-keep20")
 	}
 	h, items, err := readNASCopyBatch(*input, *sha)
 	if err != nil {

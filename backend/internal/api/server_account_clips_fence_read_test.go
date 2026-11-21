@@ -104,6 +104,81 @@ func compareFeedQueries(t *testing.T, pool *pgxpool.Pool, account, after int64, 
 	return afterRows
 }
 
+func TestNASKeep20SwitchChangesWorkWithoutChangingHistoricalFence(t *testing.T) {
+	pool, oldWindow := feedFenceFixture(t)
+	ctx := context.Background()
+	activateFeedFence(t, pool)
+	for _, ddl := range []string{
+		`CREATE TABLE nas_cleanup_plans(mode text); CREATE TABLE nas_cleanup_batches(mode text);
+CREATE TABLE nas_cleanup_items(state text); CREATE TABLE nas_cleanup_maintenance(active boolean)`,
+		`CREATE TABLE nas_r2_copy_items(connection_id bigint,state text,item jsonb,lease_expires_at timestamptz);
+CREATE TABLE nas_stitch_r2_hours(state text,lease_expires_at timestamptz,scope_id bigint,plan jsonb);
+CREATE TABLE nas_stitch_tasks(state text,lease_expires_at timestamptz,scope_id bigint,plan jsonb,cleanup_plan_id bigint,registration_abandoned_at timestamptz);
+CREATE TABLE nas_stitch_scopes(id bigint GENERATED ALWAYS AS IDENTITY,stream_id bigint,start_at timestamptz,end_at timestamptz,paused boolean,approved_until timestamptz)`,
+	} {
+		if _, err := pool.Exec(ctx, ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sql, err := os.ReadFile("../../../infra/sql/migrations/0236_nas_media_work_keep20.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, string(sql)); err != nil {
+		t.Fatal(err)
+	}
+	var keptStart time.Time
+	if err = pool.QueryRow(ctx, `SELECT start_at FROM nas_media_keep20_windows WHERE stream_id=3`).Scan(&keptStart); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,size_bytes,clip_start_at,clip_end_at,display_path)
+ VALUES(901,1,10,$1,$1::timestamptz+interval '1 minute','drop'),(902,1,10,$2,$2::timestamptz+interval '1 minute','keep')`, oldWindow.Start, keptStart); err != nil {
+		t.Fatal(err)
+	}
+	pending := `INSERT INTO nas_r2_copy_items VALUES(13,'pending',jsonb_build_object('stream_id',3,'start_at',$1::timestamptz,'end_at',$1::timestamptz+interval '1 minute'),NULL)`
+	if _, err = pool.Exec(ctx, pending, oldWindow.Start); err != nil {
+		t.Fatal(err)
+	}
+	activate := `INSERT INTO nas_media_keep20_epoch(connection_id) VALUES(13)`
+	if _, err = pool.Exec(ctx, activate); err == nil {
+		t.Fatal("activation accepted a pending job outside the new window")
+	}
+	if _, err = pool.Exec(ctx, `DELETE FROM nas_r2_copy_items`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, pending, keptStart); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, activate); err != nil {
+		t.Fatal(err)
+	}
+	var legacy int
+	var allowed, kept bool
+	if err = pool.QueryRow(ctx, `SELECT nas_delivery_object_span('raw',901),nas_delivery_allowed(13,'raw',901),nas_delivery_allowed(13,'raw',902)`).Scan(&legacy, &allowed, &kept); err != nil ||
+		legacy != 1 || allowed || !kept {
+		t.Fatalf("legacy=%d old-day-work=%t kept-work=%t: %v", legacy, allowed, kept, err)
+	}
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if rows := clipQueryRows(t, tx, accountClipsCursorSQL, 47, 0, 20); len(rows) != 1 {
+		t.Fatalf("the scoped RAW page returned %d clips", len(rows))
+	}
+	if _, err = pool.Exec(ctx, pending, oldWindow.Start); err == nil {
+		t.Fatal("old-day COPY admitted after activation")
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO nas_stitch_scopes(stream_id,start_at,end_at,paused,approved_until)
+ VALUES(3,$1,$1::timestamptz+interval '1 minute',false,now()+interval '1 hour')`, oldWindow.Start); err == nil {
+		t.Fatal("old-day stitch scope admitted after activation")
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO nas_stitch_r2_hours(state,plan) VALUES('pending',
+ jsonb_build_object('stream_id',3,'clips',jsonb_build_array(jsonb_build_object('start_at',$1::timestamptz,'end_at',$1::timestamptz+interval '1 minute'))))`, oldWindow.Start); err == nil {
+		t.Fatal("old-day stitch plan admitted after activation")
+	}
+}
+
 func TestAccountClipsCursorFencePredicateEquivalent(t *testing.T) {
 	pool, w := feedFenceFixture(t)
 	ctx := context.Background()

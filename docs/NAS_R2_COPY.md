@@ -275,6 +275,21 @@ C=6.465899440735 TB conservative raw copy-or-verify ceiling, and R=2 TB floor:
    reviewed retirement flow must reprove fresh custody before any R2 deletion.
    This copy change has no R2 deletion capability.
 
+### Connection 13 20-day work window
+
+Migration 0236 installs the 109 pinned windows with the Keep Everything
+streams marked. The existing delivery fence and historical plan hashes stay
+available for recovery. Installing the migration leaves the work epoch unset.
+
+After verifying that the entire deployment reads the new work view, attest the
+current NAS reader and writer drain, keep the cleanup runner stopped and its
+master off, and activate the epoch with
+`stoaramactl nas-r2-copy activate-keep20 --sha256 BOUND_POLICY_SHA --apply`.
+The policy SHA is the SHA-256 of `nas_media_keep20_manifest()` in the reviewed
+migration. A single insert switches the ordinary feed, new copy admission and
+stitch scopes. It refuses live leases and pending work outside the new window.
+Copy and stitch receipts retain the existing transport and evidence digests.
+
 ## Copy-v3 upgrade (controller only)
 
 The exact r2-copy-v3 label supports bulk/grouped cleanup, execution-only polling,

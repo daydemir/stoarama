@@ -21,6 +21,10 @@ func installDeliveryFenceTestSchema(t *testing.T, pool *pgxpool.Pool) {
 	if _, err = pool.Exec(context.Background(), string(body)); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = pool.Exec(context.Background(), `CREATE VIEW nas_delivery_work_windows AS
+ SELECT connection_id,stream_id,timezone,start_at,end_at FROM nas_delivery_retirement_windows`); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestNASDeliveryFenceRefusesOutsideAndDrains(t *testing.T) {
