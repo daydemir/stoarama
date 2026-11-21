@@ -88,8 +88,13 @@ func (s *Server) fenceNASDelivery(next http.Handler) http.Handler {
 		mediaCapability := strings.HasSuffix(r.URL.Path, "/download") || strings.HasSuffix(r.URL.Path, "/redownload")
 		var workEpoch bool
 		if mediaCapability {
-			if err = tx.QueryRow(ctx, `SELECT nas_delivery_work_epoch($1)`, cid).Scan(&workEpoch); err != nil {
+			var open bool
+			if err = tx.QueryRow(ctx, `SELECT nas_delivery_work_epoch($1),nas_delivery_media_publication_open()`, cid).Scan(&workEpoch, &open); err != nil {
 				util.WriteError(w, 503, "delivery work window unavailable")
+				return
+			}
+			if !open {
+				util.WriteError(w, 409, "NAS media download held for maintenance")
 				return
 			}
 		}
@@ -121,10 +126,10 @@ func (s *Server) fenceNASDelivery(next http.Handler) http.Handler {
 				return
 			}
 			defer publish.Rollback(ctx)
-			var current bool
+			var current, open bool
 			if _, err = publish.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, NASDeliveryFenceLock); err != nil ||
-				publish.QueryRow(ctx, `SELECT nas_delivery_work_epoch($1)`, cid).Scan(&current) != nil ||
-				current != workEpoch {
+				publish.QueryRow(ctx, `SELECT nas_delivery_work_epoch($1),nas_delivery_media_publication_open()`, cid).Scan(&current, &open) != nil ||
+				current != workEpoch || !open {
 				util.WriteError(w, 503, "delivery work window changed; retryable")
 				return
 			}

@@ -23,17 +23,28 @@ func installDeliveryFenceTestSchema(t *testing.T, pool *pgxpool.Pool) {
 	}
 	if _, err = pool.Exec(context.Background(), `CREATE VIEW nas_delivery_work_windows AS
  SELECT connection_id,stream_id,timezone,start_at,end_at FROM nas_delivery_retirement_windows;
- CREATE FUNCTION nas_delivery_work_epoch(connection bigint) RETURNS boolean LANGUAGE sql STABLE AS $$SELECT false$$`); err != nil {
+ CREATE FUNCTION nas_delivery_work_epoch(connection bigint) RETURNS boolean LANGUAGE sql STABLE AS $$SELECT false$$;
+ CREATE FUNCTION nas_delivery_media_publication_open() RETURNS boolean LANGUAGE sql VOLATILE AS $$SELECT true$$`); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestNASDeliveryDropsCapabilityFromPriorWorkEpoch(t *testing.T) {
+	t.Run("epoch", func(t *testing.T) { testNASDeliveryPublicationChange(t, `UPDATE work_epoch_test SET active=true`) })
+	t.Run("maintenance", func(t *testing.T) {
+		testNASDeliveryPublicationChange(t, `UPDATE nas_cleanup_maintenance SET active=true WHERE singleton`)
+	})
+}
+
+func testNASDeliveryPublicationChange(t *testing.T, change string) {
+	t.Helper()
 	f := newCleanupFixture(t, 1)
 	if _, err := f.pool.Exec(f.ctx, `CREATE TABLE work_epoch_test(active boolean);
  INSERT INTO work_epoch_test VALUES(false);
  CREATE OR REPLACE FUNCTION nas_delivery_work_epoch(connection bigint) RETURNS boolean LANGUAGE sql STABLE AS
- $$SELECT active FROM work_epoch_test$$`); err != nil {
+ $$SELECT active FROM work_epoch_test$$;
+ CREATE OR REPLACE FUNCTION nas_delivery_media_publication_open() RETURNS boolean LANGUAGE sql VOLATILE AS
+ $$SELECT NOT active FROM nas_cleanup_maintenance WHERE singleton FOR SHARE$$`); err != nil {
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest("GET", "/api/v1/account/recordings/2/clips/901/download", nil)
@@ -63,7 +74,7 @@ func TestNASDeliveryDropsCapabilityFromPriorWorkEpoch(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for the prior-epoch response")
 	}
-	_, err := f.pool.Exec(f.ctx, `UPDATE work_epoch_test SET active=true`)
+	_, err := f.pool.Exec(f.ctx, change)
 	close(release)
 	released = true
 	<-done

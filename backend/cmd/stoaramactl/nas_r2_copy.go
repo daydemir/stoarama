@@ -359,6 +359,7 @@ func runNASR2Copy(ctx context.Context, cfg config.Config, args []string) {
 	out := fs.String("out", "", "new output directory")
 	jsonOutput := fs.Bool("json", false, "machine-readable status")
 	apply := fs.Bool("apply", false, "queue validated raw work; default read-only")
+	maintenanceReason := fs.String("maintenance-reason", "", "activate-keep20 only: release the matching maintenance fence during activation")
 	_ = fs.Parse(args[1:])
 	if fs.NArg() != 0 {
 		log.Fatal("unexpected arguments")
@@ -385,9 +386,7 @@ func runNASR2Copy(ctx context.Context, cfg config.Config, args []string) {
 			log.Fatal("activate-keep20 requires --apply and the reviewed policy --sha256")
 		}
 		var activated time.Time
-		err := pool.QueryRow(ctx, `INSERT INTO nas_media_keep20_epoch(connection_id)
- SELECT 13 WHERE encode(sha256(convert_to(nas_media_keep20_manifest(),'UTF8')),'hex')=$1
- RETURNING activated_at`, *sha).Scan(&activated)
+		err := pool.QueryRow(ctx, `SELECT activate_nas_media_keep20($1,$2)`, *sha, *maintenanceReason).Scan(&activated)
 		if err != nil {
 			log.Fatal("20-day NAS work activation refused: ", err)
 		}

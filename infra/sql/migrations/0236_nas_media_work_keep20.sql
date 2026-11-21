@@ -9,6 +9,10 @@ CREATE OR REPLACE FUNCTION nas_delivery_work_epoch(connection bigint) RETURNS bo
  SELECT EXISTS(SELECT 1 FROM nas_media_keep20_epoch WHERE connection_id=connection)
 $$;
 
+CREATE OR REPLACE FUNCTION nas_delivery_media_publication_open() RETURNS boolean LANGUAGE sql VOLATILE AS $$
+ SELECT NOT active FROM nas_cleanup_maintenance WHERE singleton FOR SHARE
+$$;
+
 CREATE FUNCTION nas_media_keep20_manifest() RETURNS text LANGUAGE sql IMMUTABLE AS $$
  SELECT $policy$[
  {"end_at": "2026-10-05T15:00:00+00:00", "keep_everything": false, "start_at": "2026-09-15T15:00:00+00:00", "stream_id": 3, "timezone": "Asia/Tokyo"},
@@ -175,7 +179,7 @@ CREATE FUNCTION nas_media_keep20_stitch_plan(p jsonb) RETURNS boolean LANGUAGE s
    (c->>'start_at')::timestamptz,(c->>'end_at')::timestamptz)),false)
 $$;
 
-CREATE FUNCTION nas_media_keep20_activate_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION lock_nas_media_keep20_activation() RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
  IF current_setting('transaction_isolation')<>'read committed' THEN
   RAISE EXCEPTION 'NAS media activation requires READ COMMITTED' USING ERRCODE='55000';
@@ -187,6 +191,11 @@ BEGIN
  IF NOT pg_try_advisory_xact_lock(7343226011187) THEN
   RAISE EXCEPTION 'R2 stitch staging admission is busy' USING ERRCODE='55P03';
  END IF;
+END $$;
+
+CREATE FUNCTION nas_media_keep20_activate_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ PERFORM lock_nas_media_keep20_activation();
  IF NOT EXISTS(SELECT 1 FROM nas_delivery_retirement_fences WHERE connection_id=13
      AND policy_sha256='060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811')
   OR (SELECT count(*) FROM nas_media_keep20_windows)<>109
@@ -232,6 +241,23 @@ BEGIN
 END $$;
 CREATE TRIGGER nas_media_keep20_activate BEFORE INSERT ON nas_media_keep20_epoch
  FOR EACH ROW EXECUTE FUNCTION nas_media_keep20_activate_guard();
+
+CREATE FUNCTION activate_nas_media_keep20(expected_sha text,owned_maintenance_reason text)
+RETURNS timestamptz LANGUAGE plpgsql AS $$
+DECLARE activated timestamptz;
+BEGIN
+ IF expected_sha IS DISTINCT FROM encode(sha256(convert_to(nas_media_keep20_manifest(),'UTF8')),'hex') THEN
+  RAISE EXCEPTION 'NAS 20-day activation digest differs from reviewed pin';
+ END IF;
+ PERFORM lock_nas_media_keep20_activation();
+ IF owned_maintenance_reason<>'' THEN
+  UPDATE nas_cleanup_maintenance SET active=false,reason='',started_at=NULL
+   WHERE singleton AND active AND reason=owned_maintenance_reason;
+  IF NOT FOUND THEN RAISE EXCEPTION 'owned NAS maintenance reason changed'; END IF;
+ END IF;
+ INSERT INTO nas_media_keep20_epoch(connection_id) VALUES(13) RETURNING activated_at INTO activated;
+ RETURN activated;
+END $$;
 
 CREATE FUNCTION nas_media_keep20_guard_handoff() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
