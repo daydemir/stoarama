@@ -115,7 +115,7 @@ func (w *durhamStageWire) DeleteOnce(ctx context.Context, t r2.StitchStageTarget
 	authority := &durhamStageAuthority{
 		store: w.store, target: t, recheck: recheck, used: &atomic.Bool{}, gate: &inverseSendGate{},
 	}
-	return w.store.deleteOneWire(ctx, authority, t.Key)
+	return w.store.deleteOneWire(ctx, authority)
 }
 
 // boundTarget refuses a target that is not this exact stage generation at this

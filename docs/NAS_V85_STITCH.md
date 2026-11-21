@@ -416,9 +416,14 @@ exact evidence, and dependency checks. An ambiguous delete retains its
 one-shot intent permanently: it is never reissued, edited or re-derived, it
 blocks fence removal and conflicting dependencies, and a later read-only
 observation of absence never publishes it. Only an invocation whose own DELETE
-was answered may publish a strict absence. For NAS raw cleanup, reconcile legacy
-staged absence receipts once with the current command to record a strict HEAD
-confirmation alongside the original observation.
+was answered may publish a strict absence. A stage absence recorded by an
+older controller — a bare 404, or a strict HEAD recorded by a *later*
+reconciliation pass — cannot prove a same-invocation DELETE and is never
+upgraded, reconciled or reissued. Such an intent is preserved exactly as
+recorded and stays held, so it keeps blocking fence removal, dependency
+admission, the certified NAS cleanup gate and any owner keep hold over its
+prefix. There is deliberately no operator command that clears it; the stage
+needs a fresh, separately reviewed retirement instead.
 
 ### Stage retirement premise
 
@@ -472,12 +477,20 @@ the DELETE. A stage on the same bucket name at a different endpoint is refused
 rather than split across two providers, and no check compares a value with
 itself.
 
-The DB side is unchanged from the migration's guards and takes its locks in the
-same order as admission: the per-object session lock, then shared writer
-admission `7343226011187`, then the protection epoch, then the stage row and
+The DB side takes its locks in one fixed order, and every one of them is held
+for the whole retirement, from the source-provenance clearance through the
+DELETE and the confirming readback: the per-object session lock, then shared
+writer admission `7343226011187`, then the protection epoch, then shared
+protection admission `7343226011103` and `7343226011101` (the order every
+admission and the 0220 owner-keep admission take them), then the stage row and
 its certified hour, certificate and connection-13 copy receipt `FOR SHARE`
 (never `FOR UPDATE`: the separately committed intent needs `KEY SHARE` on that
-same row). Every lock wait is bounded and fails closed rather than queueing.
+same row), then shared `7343226011220` *after* the intent commits, so an owner
+keep hold cannot be admitted under the key while the wire and absence proof
+run. `7343226011220` is deliberately taken last: the intent's own insert
+trigger takes it shared, and a shared request queued behind a pending exclusive
+owner-keep admission would otherwise starve the insert that must commit first.
+Every lock wait is bounded and fails closed rather than queueing.
 
 The command deletes only `stitch-staging/<uuid>/<sha256>.mp4` for the exact
 object ID and certified attempt. It refuses any other key shape, so RAW,
@@ -512,11 +525,18 @@ stoaramactl nas-stitch retire-durham-stage --object-id ID --sha256 SHA --reconci
 A settled intent never becomes absence through a later read. `--reconcile`
 only *replays* the confirmation of an absence that a prior invocation's own
 answered DELETE already published; it never manufactures one from a stale or
-newer observation, and it never edits what an earlier invocation recorded. An
-issued target whose DELETE was unconfirmed, including one that now reads `404`,
-stays held: a later `404` proves neither that this DELETE caused it nor that an
-ungoverned writer cannot recreate the key. Such a row is never confirmed,
-reissued or updated here and blocks fence removal and conflicting dependencies.
+newer observation, and it never edits what an earlier invocation recorded. That
+published confirmation is one durable stamp in three columns
+(`absence_observed_at`, `strict_absence_observed_at` and `wire_absence_observed_at`,
+all equal), written by the single statement that follows an answered DELETE and
+an empty-inventory strict `404`. A row carrying only a legacy stamp — a bare
+`404` from 0217, or a strict HEAD recorded by a later reconciliation pass under
+0219 — is *not* resolved by it. An issued target whose DELETE was unconfirmed,
+including one that now reads `404`, stays held: a later `404` proves neither
+that this DELETE caused it nor that an ungoverned writer cannot recreate the
+key. Such a row is never confirmed, reissued or updated here, and it keeps
+blocking fence removal, conflicting dependencies, the certified NAS cleanup
+gate and any owner keep hold over its prefix.
 
 The same reconcile command can record absence for an aborted stage, including
 one from an earlier attempt. That is a separate, safe proof: the object reached

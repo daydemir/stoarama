@@ -178,8 +178,11 @@ func TestDurhamStageWireNeverRetriesAProviderError(t *testing.T) {
 	}
 }
 
-// The stage wire must never send a DELETE for anything but its exact key: the
-// shared transport refuses a different path or a second attempt in-process.
+// The DELETE's key is the authority's own exact key, never a second argument
+// that could disagree with it. A target the wire refuses still sends nothing,
+// and a hand-built authority whose target names a non-stage key cannot smuggle
+// that key onto the wire: the transport's path guard and the request path both
+// come from the same authority value.
 func TestDurhamStageTransportRefusesAnotherKey(t *testing.T) {
 	f := newStageWireFixture(t)
 	store, err := newInverseSDKStore(context.Background(), r2ConfigFor(t, f.srv.URL))
@@ -188,16 +191,31 @@ func TestDurhamStageTransportRefusesAnotherKey(t *testing.T) {
 	}
 	target := f.target()
 	target.EndpointSHA256 = store.EndpointSHA256()
-	authority := &durhamStageAuthority{store: store, target: target,
-		recheck: func(context.Context) error { return nil },
-		used:    &atomic.Bool{}, gate: &inverseSendGate{}}
-	authority.target.Key = "managed/acct-47/raw.mp4"
-	authority.target.SHA256 = strings.Repeat("a", 64)
-	if err := (&durhamStageWire{store: store}).DeleteOnce(context.Background(), authority.target,
+	target.Key = "managed/acct-47/raw.mp4"
+	target.SHA256 = strings.Repeat("a", 64)
+	if err := (&durhamStageWire{store: store}).DeleteOnce(context.Background(), target,
 		time.Now().Add(10*time.Second), func(context.Context) error { return nil }); err == nil {
-		t.Fatal("stage wire sent a DELETE outside its staging key")
+		t.Fatal("stage wire accepted a target outside its staging key")
 	}
 	if got := f.deletes.Load(); got != 0 {
 		t.Fatalf("stage wire reached the provider for a non-stage key: %d", got)
+	}
+}
+
+// A nil authority carries no key to read and no one-shot state to consume, so
+// it is refused before anything is dereferenced rather than reaching the SDK
+// with an empty key.
+func TestDurhamStageTransportRefusesANilAuthority(t *testing.T) {
+	f := newStageWireFixture(t)
+	store, err := newInverseSDKStore(context.Background(), r2ConfigFor(t, f.srv.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = store.deleteOneWire(context.Background(), nil)
+	if err == nil || !strings.Contains(err.Error(), "wire authority") {
+		t.Fatalf("nil authority: %v", err)
+	}
+	if got := f.deletes.Load(); got != 0 {
+		t.Fatalf("nil authority reached the provider: %d", got)
 	}
 }

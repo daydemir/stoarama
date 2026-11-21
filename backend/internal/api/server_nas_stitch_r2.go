@@ -271,7 +271,7 @@ func (s *Server) durhamStitchCheckpoint(ctx context.Context, caller nasStitchCal
  SELECT $1,$2,$3,$4,$5,$6,$7,$8 FROM nas_stitch_r2_control c
  WHERE c.max_staging_bytes >= $8::bigint + (SELECT COALESCE(sum(o.size_bytes),0) FROM nas_stitch_r2_stage_objects o
   WHERE o.state<>'aborted' AND NOT EXISTS(SELECT 1 FROM nas_stitch_r2_stage_retirements d
-   WHERE d.object_id=o.id AND d.absence_observed_at IS NOT NULL))
+   WHERE d.object_id=o.id AND nas_stitch_r2_stage_retirement_resolved(d.absence_observed_at,d.strict_absence_observed_at,d.wire_absence_observed_at)))
   AND (SELECT count(*) FROM nas_stitch_r2_stage_objects WHERE hour_id=$1 AND attempt=$2)<200
  RETURNING id`, lease.HourID, lease.Attempt, caller.keyID, s.r2.Bucket(), s.r2.EndpointSHA256(),
 				req.Path, req.SHA, req.Bytes).Scan(&id)

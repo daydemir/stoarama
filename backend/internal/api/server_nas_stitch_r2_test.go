@@ -827,22 +827,41 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
+	// A later invocation cannot stamp a legacy absence onto an already-issued
+	// intent at all: 0230's guard refuses every stamp but the one atomic
+	// three-column proof its own answered DELETE produces. The row therefore
+	// keeps exactly what it recorded and stays held.
 	if _, err := tx.Exec(ctx, `UPDATE nas_stitch_r2_stage_retirements
- SET absence_observed_at=statement_timestamp(),strict_absence_observed_at=statement_timestamp() WHERE object_id=123`); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.QueryRow(ctx, `SELECT nas_cleanup_certified_stitch_staging_absent(certificate)
- FROM nas_stitch_r2_certified_raw WHERE clip_id=901`).Scan(&stagingAbsent); err != nil || stagingAbsent {
-		t.Fatalf("unresolved abort on the earlier attempt cleared staging: %v %v", stagingAbsent, err)
+ SET absence_observed_at=statement_timestamp(),strict_absence_observed_at=statement_timestamp() WHERE object_id=123`); err == nil ||
+		!strings.Contains(err.Error(), "one-shot") {
+		t.Fatalf("a later invocation wrote a legacy absence onto a held intent: %v", err)
 	}
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
 	t.Run("certified NAS cleanup waits for exact R2 retirement", func(t *testing.T) {
+		// This row's intent was issued by the invocation whose DELETE answered
+		// 503. Model a *legacy* stamp on it — what a deployed pre-0230 binary
+		// recorded — by writing it with the 0230 guard disabled, exactly as the
+		// old function would have. Nothing the current command does can produce
+		// this shape, which is asserted above and again below.
 		var legacyObservedAt time.Time
+		exec := func(sql string, args ...any) {
+			t.Helper()
+			if _, err := pool.Exec(ctx, sql, args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+		exec(`ALTER TABLE nas_stitch_r2_stage_retirements DISABLE TRIGGER nas_stitch_r2_stage_retirement_guard`)
 		if err := pool.QueryRow(ctx, `UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=clock_timestamp()
  WHERE object_id=123 RETURNING absence_observed_at`).Scan(&legacyObservedAt); err != nil {
 			t.Fatal(err)
+		}
+		exec(`ALTER TABLE nas_stitch_r2_stage_retirements ENABLE TRIGGER nas_stitch_r2_stage_retirement_guard`)
+		// A legacy stamp is not resolution: the certified NAS gate stays closed.
+		if err := pool.QueryRow(ctx, `SELECT nas_cleanup_certified_stitch_staging_absent(certificate)
+ FROM nas_stitch_r2_certified_raw WHERE clip_id=901`).Scan(&stagingAbsent); err != nil || stagingAbsent {
+			t.Fatalf("legacy absence evidence cleared the NAS gate: %v %v", stagingAbsent, err)
 		}
 		testCertifiedStitchNASCleanup(t, s, id, sourceKey, &abort, func() {
 			for _, mode := range []int32{0, 1, 2, 4, 5, 6, 7, 8, 9} {
@@ -867,42 +886,48 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 			}
 			for _, mode := range []int32{1, 2} {
 				stageHeadResponse.Store(mode)
-				if err := store.RetireStitchStage(ctx, 123, sha, r2.StitchStageEvidence{}, r2.StitchStagePicks{}, nil, true); err == nil {
-					t.Fatalf("ambiguous staged HEAD supplemented a legacy receipt in provider case %d", mode)
+				if err := store.RetireStitchStage(ctx, 123, sha, r2.StitchStageEvidence{}, r2.StitchStagePicks{}, nil, true); err != nil &&
+					!strings.Contains(err.Error(), "legacy absence evidence") {
+					t.Fatalf("legacy intent refusal in provider case %d: %v", mode, err)
 				}
 			}
-			if err := pool.QueryRow(ctx, `SELECT nas_cleanup_certified_stitch_staging_absent(certificate)
- FROM nas_stitch_r2_certified_raw WHERE clip_id=901`).Scan(&stagingAbsent); err != nil || stagingAbsent {
-				t.Fatalf("legacy staged receipt without strict confirmation cleared NAS gate: %v %v", stagingAbsent, err)
-			}
 			stageHeadResponse.Store(0)
-			// The exact key is now unreadable at the provider, but this object's
-			// own DELETE answered 503 and was never confirmed. Standing policy:
-			// a later observation must never publish absence for an unresolved
-			// intent. Reconcile stays refused and the row stays held.
+			// The exact key now reads 404 at the provider, but that proves
+			// nothing about which invocation's DELETE produced it. Reconcile
+			// stays refused and every legacy stamp stays exactly as recorded.
 			if err := store.RetireStitchStage(ctx, 123, sha, r2.StitchStageEvidence{}, r2.StitchStagePicks{}, nil, true); err == nil ||
-				!strings.Contains(err.Error(), "remains unresolved") {
-				t.Fatalf("a later absence observation published an unconfirmed intent: %v", err)
+				!strings.Contains(err.Error(), "legacy absence evidence") {
+				t.Fatalf("a later read published a legacy-held intent: %v", err)
 			}
 			var stillHeld bool
 			if err := pool.QueryRow(ctx, `SELECT absence_observed_at=$1 AND strict_absence_observed_at IS NULL
+ AND wire_absence_observed_at IS NULL
  FROM nas_stitch_r2_stage_retirements WHERE object_id=123`, legacyObservedAt).Scan(&stillHeld); err != nil || !stillHeld {
-				t.Fatalf("an unconfirmed intent was edited by a later observation: %v %v", stillHeld, err)
+				t.Fatalf("a held legacy intent was edited by a later observation: %v %v", stillHeld, err)
 			}
-			// The gate below is hour-wide, so opening it requires this object to
-			// be strictly absent. Model that as a *legacy truly confirmed row*:
-			// a prior invocation's own successful DELETE recorded both the
-			// original observation and its strict confirmation. This fixture
-			// writes it directly to set up the gate; it is never something this
-			// command may do from an unresolved intent, which is asserted above.
-			exec := func(sql string, args ...any) {
-				t.Helper()
-				if _, err := pool.Exec(ctx, sql, args...); err != nil {
-					t.Fatal(err)
+			// Neither the new command nor a hand-written statement may upgrade
+			// that legacy stamp: only the atomic three-column proof is allowed,
+			// and only on a row that carried none of them.
+			for _, upgrade := range []string{
+				`UPDATE nas_stitch_r2_stage_retirements SET strict_absence_observed_at=absence_observed_at WHERE object_id=123`,
+				`UPDATE nas_stitch_r2_stage_retirements SET wire_absence_observed_at=absence_observed_at,
+				  strict_absence_observed_at=absence_observed_at WHERE object_id=123`,
+				`UPDATE nas_stitch_r2_stage_retirements SET wire_absence_observed_at=clock_timestamp() WHERE object_id=123`,
+			} {
+				if _, err := pool.Exec(ctx, upgrade); err == nil || !strings.Contains(err.Error(), "one-shot") {
+					t.Fatalf("legacy evidence was upgraded to the new provenance: %v", err)
 				}
 			}
-			exec(`UPDATE nas_stitch_r2_stage_retirements
- SET strict_absence_observed_at=clock_timestamp() WHERE object_id=123 AND strict_absence_observed_at IS NULL`)
+			// The gate below is hour-wide, so opening it requires a genuinely
+			// resolved object. Model a *fresh same-invocation proof* — the shape
+			// the current command writes — with the guard temporarily disabled,
+			// because this fixture's invocation was deliberately answered 503.
+			exec(`ALTER TABLE nas_stitch_r2_stage_retirements DISABLE TRIGGER nas_stitch_r2_stage_retirement_guard`)
+			exec(`WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS at)
+ UPDATE nas_stitch_r2_stage_retirements SET strict_absence_observed_at=observed.at,
+  wire_absence_observed_at=observed.at,absence_observed_at=observed.at
+ FROM observed WHERE object_id=123`)
+			exec(`ALTER TABLE nas_stitch_r2_stage_retirements ENABLE TRIGGER nas_stitch_r2_stage_retirement_guard`)
 		})
 	})
 	for _, change := range []string{
@@ -910,6 +935,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		`UPDATE nas_stitch_r2_stage_retirements SET object_id=456 WHERE object_id=123`,
 		`UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=NULL WHERE object_id=123`,
 		`UPDATE nas_stitch_r2_stage_retirements SET strict_absence_observed_at=NULL WHERE object_id=123`,
+		`UPDATE nas_stitch_r2_stage_retirements SET wire_absence_observed_at=NULL WHERE object_id=123`,
 	} {
 		if _, err := pool.Exec(ctx, change); err == nil || !strings.Contains(err.Error(), "one-shot") {
 			t.Fatal("staging retirement reservation history could be erased or reassigned", err)

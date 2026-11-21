@@ -94,7 +94,8 @@ func testCertifiedStitchSplitOutput(t *testing.T, tx pgx.Tx, hourID, firstCopyID
 	}
 	exec(`INSERT INTO nas_stitch_r2_stage_retirements(object_id) VALUES(123),(124);
  WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS at)
- UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=observed.at,strict_absence_observed_at=observed.at
+ UPDATE nas_stitch_r2_stage_retirements SET absence_observed_at=observed.at,
+  strict_absence_observed_at=observed.at,wire_absence_observed_at=observed.at
  FROM observed WHERE object_id IN (123,124);
  INSERT INTO nas_stitch_r2_aborted_absences(object_id) VALUES(122)`)
 	var observable bool

@@ -421,14 +421,25 @@ func (s *inverseSDKStore) confirmAbsent(ctx context.Context, key string) error {
 	})
 }
 func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDeleteAuthority) error {
-	return s.deleteOneWire(ctx, authority, authority.binding.Key)
+	return s.deleteOneWire(ctx, authority)
 }
 
 // deleteOneWire sends exactly one DELETE for one already-validated target over
 // the audited HTTP/1.1 single-connection transport. A lost answer is reported
 // as ambiguous, never retried. The Durham stage retirement reaches the wire
 // only here, so it reuses the RAW lanes' transport unchanged.
-func (s *inverseSDKStore) deleteOneWire(ctx context.Context, authority inverseWireTarget, key string) error {
+//
+// The authority already names its one exact key, so the DELETE takes its key
+// from the same value the transport's path guard compares. A separate argument
+// could disagree with it and send, or refuse, a different key than the one the
+// binding, the attempt ledger and the provider path all name.
+func (s *inverseSDKStore) deleteOneWire(ctx context.Context, authority inverseWireTarget) error {
+	// An absent interface has no wireKey() to read and no consumption state to
+	// check, so it is refused before anything is dereferenced.
+	if authority == nil {
+		return errors.New("inverse DELETE needs a wire authority")
+	}
+	key := authority.wireKey()
 	if err := authority.requireWire(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
 		return err
 	}

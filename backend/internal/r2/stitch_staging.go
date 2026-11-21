@@ -463,12 +463,29 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	if _, err = tx.Exec(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`); err != nil {
 		return err
 	}
+	// Owner keep and cleanup admission are frozen for the whole retirement, in
+	// the same order every admission takes them: 7343226011103, then
+	// 7343226011101. A new 0220 owner hold takes all three exclusively, so
+	// holding these shared means a hold cannot be admitted between the source
+	// provenance clearance below and the DELETE, whatever the provenance keys.
+	// 7343226011220 is taken shared later, after this invocation's one-shot
+	// intent commits: its insert trigger takes that same lock shared, and a
+	// shared request queued behind an admission's exclusive one would starve
+	// behind the very hold it must observe.
+	for _, lock := range []string{
+		`SELECT pg_advisory_xact_lock_shared(7343226011103)`,
+		`SELECT pg_advisory_xact_lock_shared(7343226011101)`,
+	} {
+		if _, err = tx.Exec(ctx, lock); err != nil {
+			return errors.New("stitch stage retirement requires quiescent R2 protection admission")
+		}
+	}
 	var t StitchStageTarget
 	var hourID int64
 	var attempt int
 	var planSHA, manifestSHA string
 	var streamID int64
-	var issued, strictAbsent, absencePublished bool
+	var issued, strictAbsent, absencePublished, wirePublished bool
 	// FOR SHARE, never FOR UPDATE: the durable intent commits on another
 	// connection and its foreign key needs KEY SHARE on this row, which a
 	// FOR UPDATE lock would block. The endpoint is selected from the committed
@@ -477,7 +494,8 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	err = tx.QueryRow(ctx, `SELECT o.object_key,o.etag,coalesce(o.version_id,''),o.size_bytes,o.last_modified,o.sha256,
  o.endpoint_sha256,h.id,h.attempt,h.plan_sha256,h.staged_manifest_sha256,r.stream_id,
  d.issued_at IS NOT NULL,d.strict_absence_observed_at IS NOT NULL,
- d.absence_observed_at IS NOT NULL
+ d.absence_observed_at IS NOT NULL,
+ d.wire_absence_observed_at IS NOT NULL
  FROM nas_stitch_r2_stage_objects o
  JOIN nas_stitch_r2_hours h ON h.id=o.hour_id AND h.attempt=o.attempt
  JOIN nas_stitch_r2_certificates cert ON cert.hour_id=h.id AND cert.attempt=h.attempt
@@ -507,7 +525,7 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 		objectID, sha, c.bucket).
 		Scan(&t.Key, &t.ETag, &t.VersionID, &t.SizeBytes, &t.LastModified, &t.SHA256,
 			&t.EndpointSHA256, &hourID, &attempt, &planSHA, &manifestSHA, &streamID, &issued, &strictAbsent,
-			&absencePublished)
+			&absencePublished, &wirePublished)
 	if err != nil {
 		return errors.New("stitch stage lacks exact NAS custody, drain or dependency clearance")
 	}
@@ -524,26 +542,34 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	if !reconcile && wire.EndpointSHA256() != t.EndpointSHA256 {
 		return errors.New("stitch stage wire endpoint differs from the committed stage endpoint")
 	}
-	if strictAbsent {
+	if wirePublished {
 		return nil
 	}
-	// A strict absence that a prior invocation proved is terminal for this one:
-	// the trigger permits no further update, and the release gate already
-	// accepts the row.
+	// Legacy evidence is not resolution. An intent stamped by an older binary —
+	// a bare `absence_observed_at` from 0217 or a later-invocation
+	// `strict_absence_observed_at` from 0219 — proved neither this
+	// invocation's own answered DELETE nor a same-invocation strict readback.
+	// It is preserved exactly, never edited, never reissued, and never judged
+	// resolved here, so the fence, dependency, owner-keep and NAS-cleanup
+	// guards keep holding it. Only 0230's `wire_absence_observed_at`, written
+	// atomically with both legacy stamps by the invocation that saw its own
+	// DELETE answered, may end the intent.
+	if strictAbsent || absencePublished {
+		return errors.New("stitch stage carries legacy absence evidence that cannot prove a same-invocation DELETE; it is held and never edited or reissued")
+	}
+	// A resolved absence is terminal for this invocation in either mode: 0230
+	// refuses any further stamp, and the release gate already accepts the row.
 	if issued != reconcile {
 		return errors.New("stitch stage retirement state differs; issued targets require reconciliation")
 	}
-	// An issued intent whose strict absence is not published is an unresolved,
-	// possibly-ambiguous DELETE. A later read-only observation must never publish
-	// it: absence now proves neither that this DELETE caused it nor that an
-	// ungoverned writer cannot recreate the key, and this command never edits or
-	// re-derives what a prior invocation recorded. Such a target stays held, and
-	// the only path that publishes absence is the invocation that saw its own
-	// DELETE succeed and then strictly re-confirmed the exact key.
+	// An issued intent whose wire absence is not published is an unresolved,
+	// possibly-ambiguous DELETE. A later read-only observation must never
+	// publish it: absence now proves neither that this DELETE caused it nor
+	// that an ungoverned writer cannot recreate the key, and this command never
+	// edits or re-derives what a prior invocation recorded. Such a target stays
+	// held, and the only path that publishes absence is the invocation that saw
+	// its own DELETE succeed and then strictly re-confirmed the exact key.
 	if reconcile {
-		if absencePublished {
-			return errors.New("stitch stage delete remains unresolved; a prior absence observation is held and is never confirmed by a later read")
-		}
 		return errors.New("stitch stage delete remains unresolved; only its own successful DELETE with a strict absence proof can publish absence")
 	}
 	// The reviewed evidence must name this exact generation and hour, the
@@ -630,6 +656,16 @@ func (c *Client) RetireStitchStage(ctx context.Context, objectID int64, sha stri
 	// failed above and is held the same way.
 	if err := stitchStagePreIssuanceExpired(preIssue); err != nil {
 		return fmt.Errorf("stitch stage delete intent is held after a late attempt commit and is never reissued: %w", err)
+	}
+	// 7343226011220 is now taken shared, after that independent commit. The
+	// intent's own insert trigger takes it shared as well, so requesting it
+	// before the insert would queue a shared request behind a pending exclusive
+	// owner-keep admission and stall the very insert that must finish first.
+	// Taken here, with the intent already durable, this session still holds it
+	// through the DELETE and the confirming readback, so an owner hold cannot
+	// be admitted under the key while the wire and the absence proof run.
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011220)`); err != nil {
+		return errors.New("stitch stage retirement requires quiescent R2 owner keep admission")
 	}
 	recheck := func(ctx context.Context) error { return c.stitchStageWireRecheck(ctx, tx, t, ev) }
 	if err := wire.DeleteOnce(ctx, t, deadline, recheck); err != nil {
@@ -826,12 +862,17 @@ func (c *Client) stitchStageWireRecheck(ctx context.Context, tx pgx.Tx, t Stitch
 	return nil
 }
 
-// confirmStitchStageRetirement publishes a strict absence proof for one exact
-// stage key. It is reached only from an invocation that either saw its own
-// DELETE answered and then re-read the exact key, or (separately) an aborted
-// object's own drained proof. It re-checks the exact-key multipart inventory
-// here, so publication can never be recorded while an upload for the same key
-// could still complete and recreate the object.
+// confirmStitchStageRetirement publishes the one durable absence proof that
+// ends a stage intent. It is reached only from an invocation that either saw
+// its own DELETE answered and then re-read the exact key, or (separately) an
+// aborted object's own drained proof. It re-checks the exact-key multipart
+// inventory here, so publication can never be recorded while an upload for the
+// same key could still complete and recreate the object.
+//
+// The single statement writes one stamp into all three columns. That makes the
+// new wire provenance atomic with the readback it came from: no reader can see
+// a partially stamped row, and the 0230 guard refuses any row that already
+// carried any stamp, so a legacy receipt can never be upgraded into this one.
 func (c *Client) confirmStitchStageRetirement(ctx context.Context, tx pgx.Tx, objectID int64, key string) error {
 	if err := c.stitchStageNoMultipart(ctx, key); err != nil {
 		return fmt.Errorf("stitch stage absence unconfirmed: %w", err)
@@ -840,8 +881,10 @@ func (c *Client) confirmStitchStageRetirement(ctx context.Context, tx pgx.Tx, ob
 		return fmt.Errorf("stitch stage delete absence unconfirmed; the held intent is never reissued: %w", err)
 	}
 	tag, err := tx.Exec(ctx, `WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS at)
- UPDATE nas_stitch_r2_stage_retirements d SET absence_observed_at=coalesce(d.absence_observed_at,observed.at),
- strict_absence_observed_at=observed.at FROM observed WHERE d.object_id=$1 AND d.strict_absence_observed_at IS NULL`, objectID)
+ UPDATE nas_stitch_r2_stage_retirements d SET absence_observed_at=observed.at,
+ strict_absence_observed_at=observed.at,wire_absence_observed_at=observed.at
+ FROM observed WHERE d.object_id=$1 AND d.absence_observed_at IS NULL
+  AND d.strict_absence_observed_at IS NULL AND d.wire_absence_observed_at IS NULL`, objectID)
 	if err != nil {
 		return err
 	}
