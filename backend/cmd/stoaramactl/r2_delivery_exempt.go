@@ -40,10 +40,6 @@ var deliveryExemptionDecisions = map[deliveryExemptionClass]string{
 	deliveryExemptInWindow:        `Deniz 2026-11-19: "File list only": copy and certify the 2.35 TB of in-window videos on the NAS, publish a static CSV+JSON manifest mapping each old link to its NAS path, take the old page down, then delete the in-window R2 copies.`,
 }
 
-// deliveryPageRetiredDecision is the owner decision the page retirement row
-// records. The controller sets it once, after the old page is taken down.
-const deliveryPageRetiredDecision = `Deniz 2026-11-19: "File list only": the old delivery page is taken down and its R2 registry retired once the in-window videos are certified on the NAS and the static CSV+JSON manifest of old links to NAS paths is published.`
-
 // receiptReason is the r2_object_retirements reason an exempt key retires under.
 func (c deliveryExemptionClass) receiptReason() string {
 	return "owner_delivery_page_" + string(c)
@@ -331,18 +327,57 @@ func deliveryClassHardClosed(class deliveryExemptionClass) error {
 	return nil
 }
 
+// deliveryPageCollatedFamily reports whether key is in one of the two reviewed
+// collated families that may carry a page exemption. joined/best14-20261021/ is
+// eligible footage for the 2026-11-18 owner scope, but it is not a page family:
+// no page row under it may take a page exemption, and the classification of a
+// best14 output can never be evidence that its page key lost page protection.
+func deliveryPageCollatedFamily(key string) bool {
+	return strings.HasPrefix(key, "joined/goodplus-") ||
+		strings.HasPrefix(key, "joined/nightly-collation-v2/")
+}
+
 // deliveryPageKindFits is the exact page kind and key family each exemption class
 // covers, the same shape 0225's admission trigger enforces. A repair is a
 // video_assembly under the confident-repair prefix; both window classes are a
-// video_collated under the reviewed collated families.
+// video_collated under exactly the two reviewed page families.
 func deliveryPageKindFits(kind string, class deliveryExemptionClass, key string) bool {
 	switch class {
 	case deliveryExemptConfidentRepair:
 		return kind == "video_assembly" && strings.HasPrefix(key, inverseConfidentRepairPrefix)
 	case deliveryExemptOutsideWindow, deliveryExemptInWindow:
-		return kind == "video_collated" && inverseCollatedPrefixAllowed(key)
+		return kind == "video_collated" && deliveryPageCollatedFamily(key)
 	}
 	return false
+}
+
+// deliveryPageWindowOutside proves an outside_window candidate is outside the
+// pinned window of the PAGE RECORDING's own stream, not only the output's.
+//
+// The owner decision is "outside every window". A key that is outside its
+// catalog output's stream window but inside the page stream's window is exactly
+// the ambiguous case that decision does not cover, so it is refused rather than
+// approved as outside_window. A page row whose stream has no pinned window, or
+// no positive decision for it, cannot establish the class at all: the answer is
+// fail-closed, never "assume outside".
+func deliveryPageWindowOutside(picks r2RetirePicks, windows map[int64]api.Keep28Window, stream int64, start, end time.Time) error {
+	if stream <= 0 {
+		return errors.New("page recording names no stream")
+	}
+	w, ok := windows[stream]
+	if !ok {
+		return fmt.Errorf("page stream %d has no pinned keep window, so outside_window is unprovable", stream)
+	}
+	if !r2RetireValidSpan(w.Start, w.End) {
+		return fmt.Errorf("page stream %d has an invalid pinned keep window", stream)
+	}
+	if !deliveryPageStreamDecided(picks, windows, stream) {
+		return fmt.Errorf("page stream %d has no positive non-keep-everything decision", stream)
+	}
+	if start.Before(w.End) && end.After(w.Start) {
+		return fmt.Errorf("output overlaps the page stream %d pinned window", stream)
+	}
+	return nil
 }
 
 // checkDeliveryExemptionRoster is the ONE roster decision, shared by seeding and
@@ -379,26 +414,31 @@ func checkDeliveryExemptionRoster(ctx context.Context, tx pgx.Tx, class delivery
 	// row is written. The page stream is read live, not from the roster.
 	pageStreams := map[string]int64{}
 	pageIdentities := map[string]inversePageIdentity{}
+	// The page row's own sha256 is the content the reservation guard compares.
+	// An exemption whose page row cannot state it would open a gate the wire then
+	// refuses, so it is read here and required to equal the catalog's.
+	pageSHA := map[string]string{}
 	// The exact page kind and key family each roster key must be is a catalog
 	// fact, read live here so a repair cannot be admitted as a collated video or
 	// the reverse by naming the other class.
 	pageKinds := map[string]string{}
-	streamRows, err := tx.Query(ctx, `SELECT h.object_key,coalesce(rec.stream_id,0),h.etag,h.size_bytes,h.kind FROM delivery_keep_holds h
+	streamRows, err := tx.Query(ctx, `SELECT h.object_key,coalesce(rec.stream_id,0),h.etag,h.size_bytes,h.kind,h.sha256 FROM delivery_keep_holds h
  LEFT JOIN recordings rec ON rec.id=h.recording_id WHERE h.bucket=$1 AND h.object_key=ANY($2::text[])`, rows[0].Bucket, keys)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
 	for streamRows.Next() {
-		var key string
+		var key, sha string
 		var stream, size int64
 		var etag, kind string
-		if err = streamRows.Scan(&key, &stream, &etag, &size, &kind); err != nil {
+		if err = streamRows.Scan(&key, &stream, &etag, &size, &kind, &sha); err != nil {
 			streamRows.Close()
 			return nil, nil, nil, nil, err
 		}
 		pageStreams[key] = stream
 		pageIdentities[key] = inversePageIdentity{ETag: strings.Trim(etag, `"`), SizeBytes: size}
 		pageKinds[key] = kind
+		pageSHA[key] = strings.ToLower(sha)
 	}
 	err = streamRows.Err()
 	streamRows.Close()
@@ -446,11 +486,38 @@ func checkDeliveryExemptionRoster(ctx context.Context, tx pgx.Tx, class delivery
 		if x.Reason != "" {
 			return nil, nil, nil, nil, fmt.Errorf("roster key %s is held by the live classifier (%s)", row.ObjectKey, x.Reason)
 		}
+		// Content identity parity with the guard that will admit the receipt.
+		// guard_delivery_r2_retirement requires the page row's sha256 to equal the
+		// receipt's, and the collated lane writes the catalog output's sha256. A
+		// page row with no sha256, or one that names a different object, is not
+		// authority for this key: it would pass this seed and then be refused at
+		// the wire, or worse, be read as covering content it does not name.
+		if x.Kind == inverseNonrawKindCollated {
+			if !r2RetireLowerHex64(x.SHA) {
+				return nil, nil, nil, nil, fmt.Errorf("roster key %s has no exact catalog sha256", row.ObjectKey)
+			}
+			if pageSHA[row.ObjectKey] != strings.ToLower(x.SHA) {
+				return nil, nil, nil, nil, fmt.Errorf("roster key %s page sha256 does not name its catalog content", row.ObjectKey)
+			}
+		}
 		if x.StreamID > 0 && !deliveryPageStreamDecided(picks, windows, x.StreamID) {
 			return nil, nil, nil, nil, fmt.Errorf("roster key %s has no positive non-keep-everything decision for its own stream", row.ObjectKey)
 		}
 		if computed != class {
 			return nil, nil, nil, nil, fmt.Errorf("roster key %s is %s under the live classifier, not %s", row.ObjectKey, computed, class)
+		}
+		// The owner decision is "outside every window". A key outside its own
+		// output stream's window but inside the PAGE stream's window is exactly
+		// the ambiguity that decision does not cover, so it is refused rather
+		// than approved under outside_window. A page stream with no pinned
+		// window fails closed instead of being treated as outside.
+		if class == deliveryExemptOutsideWindow && x.Kind == inverseNonrawKindCollated {
+			if x.Start == nil || x.End == nil {
+				return nil, nil, nil, nil, fmt.Errorf("roster key %s has no catalog interval, so outside_window is unprovable", row.ObjectKey)
+			}
+			if err := deliveryPageWindowOutside(picks, windows, pageStreams[row.ObjectKey], *x.Start, *x.End); err != nil {
+				return nil, nil, nil, nil, fmt.Errorf("roster key %s is not provably outside: %w", row.ObjectKey, err)
+			}
 		}
 	}
 	return buckets, keys, etags, sizes, nil
@@ -606,290 +673,4 @@ func runR2InverseValidate(ctx context.Context, cfg config.Config, args []string)
 	}
 	data, _ := json.Marshal(map[string]any{"class": class, "roster_sha256": *rosterSHA, "validated": validated, "read_only": true, "approval_recorded": false})
 	fmt.Println(string(data))
-}
-
-// retireDeliveryPage commits the ONE destructive predicate inside tx, after the
-// SQL trigger has independently proved quiesce, reader drain and capability
-// drain. It takes the exclusive public lock first, so no ticket, no admission and
-// no registry publication can interleave between the proofs and the row, then
-// proves with the same live function every serving route and every gate reads
-// that the page is down.
-func retireDeliveryPage(ctx context.Context, tx pgx.Tx, generation, decision string) (string, error) {
-	if !r2RetireLowerHex32(generation) || strings.TrimSpace(decision) == "" {
-		return "", errors.New("a retirement needs its serving generation and the owner's decision")
-	}
-	// Serialize against ticket minting, reader admission, publication and this
-	// same command. After this exclusive lock no new public capability can be
-	// recorded and no new reader admitted, so the proof below is complete.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(r2_delivery_public_lock())`); err != nil {
-		return "", err
-	}
-	// Read the same proof the SQL trigger reads, so the operator sees WHY before
-	// the trigger's exception. These counts are diagnostics, never authority: the
-	// trigger alone decides, and it requires the cutover authority and its derived
-	// deadline even when every count below is zero.
-	var armed, liveReaders, liveTickets, hasAuthority, deadlinePassed int64
-	if err := tx.QueryRow(ctx, `SELECT (SELECT count(*) FROM r2_delivery_page_quiesce),
- (SELECT count(*) FROM r2_delivery_public_readers WHERE expires_at>clock_timestamp()),
- (SELECT count(*) FROM r2_delivery_download_tickets WHERE expires_at>clock_timestamp()),
- (SELECT count(*) FROM r2_delivery_cutover_authority WHERE singleton),
- (SELECT count(*) FROM r2_delivery_cutover_authority WHERE singleton AND clock_timestamp()>deadline_at)`).
-		Scan(&armed, &liveReaders, &liveTickets, &hasAuthority, &deadlinePassed); err != nil {
-		return "", err
-	}
-	if armed == 0 {
-		return "", errors.New("refusing to retire the page: it is not quiesced; run r2-inverse page-quiesce first")
-	}
-	if hasAuthority == 0 {
-		return "", errors.New("refusing to retire the page: no reviewed cutover authority; run r2-inverse page-cutover after proving the legacy origins gone, the caches expired and the transfers ended")
-	}
-	if deadlinePassed == 0 {
-		return "", errors.New("refusing to retire the page: the cutover authority's verified drain deadline has not passed yet")
-	}
-	if liveReaders != 0 {
-		return "", fmt.Errorf("refusing to retire the page while %d admitted public readers are still unexpired; retry after their leases expire", liveReaders)
-	}
-	if liveTickets != 0 {
-		return "", fmt.Errorf("refusing to retire the page while %d download capabilities are still unexpired; retry after their expiry", liveTickets)
-	}
-	var at string
-	if err := tx.QueryRow(ctx, `INSERT INTO r2_delivery_page_retirement(generation,decision) VALUES($1,$2) RETURNING retired_at::text`,
-		generation, decision).Scan(&at); err != nil {
-		return "", err
-	}
-	var retired bool
-	if err := tx.QueryRow(ctx, `SELECT r2_delivery_page_retired()`).Scan(&retired); err != nil || !retired {
-		return "", errors.New("the retirement row did not take effect; refusing to report the page down")
-	}
-	return at, nil
-}
-
-// quiesceDeliveryPage commits the staging state that stops every NEW public
-// reader. It is not the page going down: no exemption class opens, the page row
-// is untouched, and the only effect is that new public requests are refused with
-// 503 while the readers already admitted finish. It is the point of no return for
-// rollback, so the runbook treats it as arming.
-func quiesceDeliveryPage(ctx context.Context, tx pgx.Tx, reason string) (string, error) {
-	if strings.TrimSpace(reason) == "" {
-		return "", errors.New("quiescing the page needs its reason and owner decision")
-	}
-	// The exclusive lock makes arming atomic against admission and tickets, so
-	// no reader or capability can slip in after the state commits.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(r2_delivery_public_lock())`); err != nil {
-		return "", err
-	}
-	var at string
-	if err := tx.QueryRow(ctx, `INSERT INTO r2_delivery_page_quiesce(reason) VALUES($1) RETURNING armed_at::text`, reason).Scan(&at); err != nil {
-		return "", err
-	}
-	var serving bool
-	if err := tx.QueryRow(ctx, `SELECT r2_delivery_public_serving()`).Scan(&serving); err != nil || serving {
-		return "", errors.New("the quiesce row did not take effect; refusing to report the page armed")
-	}
-	return at, nil
-}
-
-// deliveryCutoverEvidence is the reviewed external cutover record an operator
-// establishes outside this database. Every field is a fact, not a claim derived
-// from the API's own traffic, and the whole record is pinned by approved_sha256
-// so the approval names exact bytes.
-type deliveryCutoverEvidence struct {
-	Generation              string    `json:"generation"`
-	Decision                string    `json:"decision"`
-	LegacyGrantBoundaryAt   time.Time `json:"legacy_grant_boundary_at"`
-	LegacySignedGrantSHA256 string    `json:"legacy_signed_grant_sha256"`
-	LegacyOriginRemovedAt   time.Time `json:"legacy_origin_removed_at"`
-	LegacyOriginEvidenceSHA string    `json:"legacy_origin_evidence_sha256"`
-	CacheExpiredAt          time.Time `json:"cache_expired_at"`
-	CacheEvidenceSHA256     string    `json:"cache_evidence_sha256"`
-	RollbackRoutingSHA256   string    `json:"rollback_routing_sha256"`
-	TransferBoundAt         time.Time `json:"transfer_bound_at"`
-	// TransferEvidenceSHA256 pins the artifact the bound instant was read from.
-	// A timestamp with no artifact is not evidence, so this is required.
-	TransferEvidenceSHA256 string `json:"transfer_evidence_sha256"`
-}
-
-// canonicalInstant is the ONE timestamp rendering the approval digest and the
-// SQL row share. RFC3339Nano preserves subsecond precision, so canonicalizing
-// here never truncates an instant the database then stores at full precision:
-// the bytes the operator approved and the row the gate reads are the same.
-func canonicalInstant(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
-
-// canonical is the exact byte sequence approval_sha256 covers: fixed field order,
-// canonical instants, and every per-fact evidence digest plus the transfer
-// evidence digest. It is what the operator reviews and pins, and it is computed
-// from the same values recordDeliveryCutover inserts, so approval and row can
-// never disagree.
-func (e deliveryCutoverEvidence) canonical() ([]byte, error) {
-	type doc struct {
-		Generation              string `json:"generation"`
-		Decision                string `json:"decision"`
-		LegacyGrantBoundaryAt   string `json:"legacy_grant_boundary_at"`
-		LegacySignedGrantSHA256 string `json:"legacy_signed_grant_sha256"`
-		LegacyOriginRemovedAt   string `json:"legacy_origin_removed_at"`
-		LegacyOriginEvidenceSHA string `json:"legacy_origin_evidence_sha256"`
-		CacheExpiredAt          string `json:"cache_expired_at"`
-		CacheEvidenceSHA256     string `json:"cache_evidence_sha256"`
-		RollbackRoutingSHA256   string `json:"rollback_routing_sha256"`
-		TransferBoundAt         string `json:"transfer_bound_at"`
-		TransferEvidenceSHA256  string `json:"transfer_evidence_sha256"`
-	}
-	return json.Marshal(doc{e.Generation, e.Decision,
-		canonicalInstant(e.LegacyGrantBoundaryAt), e.LegacySignedGrantSHA256,
-		canonicalInstant(e.LegacyOriginRemovedAt), e.LegacyOriginEvidenceSHA,
-		canonicalInstant(e.CacheExpiredAt), e.CacheEvidenceSHA256,
-		e.RollbackRoutingSHA256, canonicalInstant(e.TransferBoundAt), e.TransferEvidenceSHA256})
-}
-
-// recordDeliveryCutover writes the reviewed cutover authority for one generation,
-// with its digest checked against the approval. It refuses an incomplete record,
-// a future bound (a transfer cannot have ended after the evidence was written),
-// or any field whose digest does not match the approved bytes. The derived
-// deadline is computed by SQL, not here.
-func recordDeliveryCutover(ctx context.Context, pool *pgxpool.Pool, e deliveryCutoverEvidence, approvedSHA string) (map[string]any, error) {
-	if !r2RetireLowerHex32(e.Generation) || strings.TrimSpace(e.Decision) == "" {
-		return nil, errors.New("cutover authority needs the serving generation and the owner decision")
-	}
-	for _, h := range []string{e.LegacySignedGrantSHA256, e.LegacyOriginEvidenceSHA, e.CacheEvidenceSHA256, e.RollbackRoutingSHA256, e.TransferEvidenceSHA256} {
-		if !r2RetireLowerHex64(h) {
-			return nil, errors.New("cutover authority needs a 64-hex digest for every evidence field, including the transfer artifact")
-		}
-	}
-	// Distinct artifacts, not one digest reused for several facts.
-	seen := map[string]string{}
-	for name, h := range map[string]string{
-		"legacy_signed_grant": e.LegacySignedGrantSHA256,
-		"legacy_origin":       e.LegacyOriginEvidenceSHA,
-		"cache":               e.CacheEvidenceSHA256,
-		"rollback_routing":    e.RollbackRoutingSHA256,
-		"transfer":            e.TransferEvidenceSHA256,
-	} {
-		if prev, dup := seen[h]; dup {
-			return nil, fmt.Errorf("evidence digest %s is reused for %s and %s; each fact needs its own artifact", h, prev, name)
-		}
-		seen[h] = name
-	}
-	canonical, err := e.canonical()
-	if err != nil {
-		return nil, err
-	}
-	sum := sha256.Sum256(canonical)
-	if !r2RetireLowerHex64(approvedSHA) || hex.EncodeToString(sum[:]) != approvedSHA {
-		return nil, errors.New("cutover evidence differs from its approved digest; pin the exact bytes the operator reviewed")
-	}
-	if e.TransferBoundAt.After(time.Now().UTC()) || e.LegacyOriginRemovedAt.After(time.Now().UTC()) || e.CacheExpiredAt.After(time.Now().UTC()) {
-		return nil, errors.New("legacy grant, origin, cache and transfer facts must already be in the past")
-	}
-	// Insert the EXACT canonical instants the approval covered, at full precision,
-	// so the row and the approved bytes name the same instant.
-	var at, deadline string
-	err = pool.QueryRow(ctx, `INSERT INTO r2_delivery_cutover_authority(
- generation,decision,legacy_grant_boundary_at,legacy_signed_grant_sha256,legacy_origin_removed_at,
- legacy_origin_evidence_sha256,cache_expired_at,cache_evidence_sha256,rollback_routing_sha256,transfer_bound_at,transfer_evidence_sha256,approval_sha256,deadline_at)
- VALUES($1,$2,$3::timestamptz,$4,$5::timestamptz,$6,$7::timestamptz,$8,$9,$10::timestamptz,$11,$12,'1970-01-01T00:00:00Z')
- RETURNING recorded_at::text,deadline_at::text`,
-		e.Generation, e.Decision, canonicalInstant(e.LegacyGrantBoundaryAt), e.LegacySignedGrantSHA256,
-		canonicalInstant(e.LegacyOriginRemovedAt), e.LegacyOriginEvidenceSHA, canonicalInstant(e.CacheExpiredAt),
-		e.CacheEvidenceSHA256, e.RollbackRoutingSHA256, canonicalInstant(e.TransferBoundAt),
-		e.TransferEvidenceSHA256, approvedSHA).Scan(&at, &deadline)
-	if err != nil {
-		return nil, fmt.Errorf("cutover authority refused: %w", err)
-	}
-	return map[string]any{"recorded_at": at, "deadline_at": deadline, "approved_sha256": approvedSHA, "generation": e.Generation}, nil
-}
-
-func runR2InversePageCutover(ctx context.Context, cfg config.Config, args []string) {
-	fs := flag.NewFlagSet("r2-inverse page-cutover", flag.ExitOnError)
-	evidencePath := fs.String("evidence", "", "reviewed cutover evidence JSON")
-	evidenceSHA := fs.String("expected-evidence-sha256", "", "the approved canonical evidence digest")
-	const usage = "usage: stoaramactl r2-inverse page-cutover --evidence FILE --expected-evidence-sha256 HEX (record reviewed cutover authority; run after page-quiesce)"
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *evidencePath == "" || !r2RetireLowerHex64(*evidenceSHA) {
-		log.Fatal(usage)
-	}
-	raw, err := os.ReadFile(*evidencePath)
-	if err != nil {
-		log.Fatal(err)
-	}
-	var e deliveryCutoverEvidence
-	if err = json.Unmarshal(raw, &e); err != nil {
-		log.Fatal(err)
-	}
-	pool := mustOpenPool(ctx, cfg)
-	defer pool.Close()
-	out, err := recordDeliveryCutover(ctx, pool, e, *evidenceSHA)
-	if err != nil {
-		log.Fatal(err)
-	}
-	data, _ := json.Marshal(out)
-	fmt.Println(string(data))
-}
-
-// runR2InversePageQuiesce arms retirement. It is a separate, deliberate step so
-// the runbook can prove the legacy origins are gone and the last five-minute URL
-// has drained before the destructive row can exist at all.
-func runR2InversePageQuiesce(ctx context.Context, cfg config.Config, args []string) {
-	fs := flag.NewFlagSet("r2-inverse page-quiesce", flag.ExitOnError)
-	reason := fs.String("reason", "", "why the page is being armed for retirement, and the owner decision")
-	const usage = "usage: stoaramactl r2-inverse page-quiesce --reason TEXT (arm retirement; stop admitting new public readers; not reversible)"
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || strings.TrimSpace(*reason) == "" {
-		log.Fatal(usage)
-	}
-	pool := mustOpenPool(ctx, cfg)
-	defer pool.Close()
-	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer tx.Rollback(context.Background())
-	at, err := quiesceDeliveryPage(ctx, tx, *reason)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err = tx.Commit(ctx); err != nil {
-		log.Fatal(err)
-	}
-	data, _ := json.Marshal(map[string]any{"page_quiesced_at": at, "reason": *reason})
-	fmt.Println(string(data))
-}
-
-// runR2InversePageRetired sets the committed serving state that takes the old
-// public delivery page down. Every public delivery route reads that state live,
-// so this command is the page going down, not a claim about it.
-func runR2InversePageRetired(ctx context.Context, cfg config.Config, args []string) {
-	fs := flag.NewFlagSet("r2-inverse page-retired", flag.ExitOnError)
-	generation := fs.String("generation", "", "the serving registry generation being retired (32 hex)")
-	decision := fs.String("decision", "", "the owner's decision text taking the page down")
-	const usage = "usage: stoaramactl r2-inverse page-retired --generation HEX32 --decision TEXT (run once, after the old delivery page is taken down)"
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || !r2RetireLowerHex32(*generation) || strings.TrimSpace(*decision) == "" {
-		log.Fatal(usage)
-	}
-	pool := mustOpenPool(ctx, cfg)
-	defer pool.Close()
-	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer tx.Rollback(context.Background())
-	at, err := retireDeliveryPage(ctx, tx, *generation, *decision)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err = tx.Commit(ctx); err != nil {
-		log.Fatal(err)
-	}
-	data, _ := json.Marshal(map[string]any{"page_retired_at": at, "generation": *generation, "decision": *decision})
-	fmt.Println(string(data))
-}
-
-// r2RetireLowerHex32 accepts a lower-case 32-character hex generation id.
-func r2RetireLowerHex32(s string) bool {
-	if len(s) != 32 {
-		return false
-	}
-	for _, c := range s {
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
-			return false
-		}
-	}
-	return true
 }

@@ -6,18 +6,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5"
 )
 
 func globalDeliveryTestRegistry() *globalDeliveryRegistry {
@@ -35,64 +32,9 @@ func globalDeliveryTestRegistry() *globalDeliveryRegistry {
 	return &globalDeliveryRegistry{SchemaVersion: 1, AccountID: 47, RecordingIDs: ids, Assets: map[string]globalDeliveryObject{"/fixture.txt": o}, Files: map[string]globalDeliveryObject{"1": f}}
 }
 
-// globalDeliveryTestStore counts every storage touch. The counters are atomic
-// because the public serving path calls them from concurrent handler goroutines
-// in the pool and retirement tests; a plain int here is a real data race, not
-// just a test artifact.
 type globalDeliveryTestStore struct {
 	body              []byte
-	opened, presigned atomic.Int64
-}
-
-// deliveryPublicFixture stands in for the live public delivery gate in unit
-// tests. Production reads the committed serving state from the pool on every
-// request, records one lease per response and records capabilities.
-//
-// It reproduces the SQL contract, so the unit tests exercise the same
-// shared/exclusive semantics: retired and quiesced both stop new readers,
-// admission and capability records are refused while either is set, and it
-// exposes the reader set so a test can prove retirement observed it.
-type deliveryPublicFixture struct {
-	retired, quiesced bool
-	minted            int
-	// readers is the live lease set; a test may pin one to hold retirement.
-	readers map[string]bool
-	// hold, when set, makes AdmitPublicReader block until it is closed, so a
-	// test can prove a retirement attempt waits for an admitted reader instead
-	// of racing it.
-	hold chan struct{}
-}
-
-func newDeliveryPublicFixture() *deliveryPublicFixture {
-	return &deliveryPublicFixture{readers: map[string]bool{}}
-}
-
-func (f *deliveryPublicFixture) DeliveryServing(context.Context) (bool, bool, error) {
-	return f.retired, !f.retired && !f.quiesced, nil
-}
-
-func (f *deliveryPublicFixture) AdmitPublicReader(_ context.Context, id string) error {
-	if f.hold != nil {
-		<-f.hold
-	}
-	if f.retired || f.quiesced {
-		return errors.New("the public delivery page is not serving")
-	}
-	f.readers[id] = true
-	return nil
-}
-
-func (f *deliveryPublicFixture) ReleasePublicReader(_ context.Context, id string) error {
-	delete(f.readers, id)
-	return nil
-}
-
-func (f *deliveryPublicFixture) RecordPublicDeliveryTicket(context.Context, globalDeliveryObject, string, time.Duration) (bool, error) {
-	if f.retired || f.quiesced {
-		return false, nil
-	}
-	f.minted++
-	return true, nil
+	opened, presigned int
 }
 
 func (m *globalDeliveryTestStore) Head(context.Context, string) (r2.ObjectHead, error) {
@@ -103,15 +45,15 @@ func (m *globalDeliveryTestStore) HeadExact(context.Context, string, string, str
 }
 func (m *globalDeliveryTestStore) Get(context.Context, string) ([]byte, error) { return m.body, nil }
 func (m *globalDeliveryTestStore) OpenExact(context.Context, string, string, string) (io.ReadCloser, error) {
-	m.opened.Add(1)
+	m.opened++
 	return io.NopCloser(bytes.NewReader(m.body)), nil
 }
 func (m *globalDeliveryTestStore) OpenExactRange(_ context.Context, _ string, _ string, _ string, a, b int64) (io.ReadCloser, error) {
-	m.opened.Add(1)
+	m.opened++
 	return io.NopCloser(bytes.NewReader(m.body[a : b+1])), nil
 }
 func (m *globalDeliveryTestStore) PresignGetExactDownloadRequest(context.Context, string, string, string, string, time.Duration) (r2.PresignedRequest, error) {
-	m.presigned.Add(1)
+	m.presigned++
 	return r2.PresignedRequest{URL: "https://test.r2.cloudflarestorage.com/bucket/a%20b.mp4?X-Amz-Expires=300", Method: "GET", Headers: http.Header{"If-Match": {`"etag"`}, "Host": {"test.r2.cloudflarestorage.com"}}}, nil
 }
 func globalDeliveryTestRequest(method, target, id string, p *accountPrincipal) *http.Request {
@@ -192,10 +134,10 @@ func TestGlobalDeliveryAssetSHAGuardAndExactLookup(t *testing.T) {
 	if w.Code != 409 {
 		t.Fatalf("changed payload %d", w.Code)
 	}
-	before := m.opened.Load()
+	before := m.opened
 	w = httptest.NewRecorder()
 	s.handleGlobalDeliveryAsset(w, globalDeliveryTestRequest("GET", "/?path=../secrets.env", "", p))
-	if w.Code != 404 || m.opened.Load() != before {
+	if w.Code != 404 || m.opened != before {
 		t.Fatal("unregistered path reached storage")
 	}
 }
@@ -211,7 +153,7 @@ func TestGlobalDeliveryTicketExpectedSHAAndScopedCapability(t *testing.T) {
 			t.Fatalf("invalid claim %d", w.Code)
 		}
 	}
-	if m.presigned.Load() != 0 {
+	if m.presigned != 0 {
 		t.Fatal("bad claim minted access")
 	}
 	w := httptest.NewRecorder()
@@ -242,10 +184,10 @@ func TestGlobalDeliveryRangeAndHEADPreserveGeneration(t *testing.T) {
 	if w.Code != 206 || w.Body.String() != "ell" || w.Header().Get("Content-Range") != "bytes 1-3/5" {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
-	before := m.opened.Load()
+	before := m.opened
 	w = httptest.NewRecorder()
 	s.handleGlobalDeliveryFile(w, globalDeliveryTestRequest("HEAD", "/", "1", p))
-	if w.Code != 200 || w.Body.Len() != 0 || m.opened.Load() != before {
+	if w.Code != 200 || w.Body.Len() != 0 || m.opened != before {
 		t.Fatal("HEAD opened payload")
 	}
 }
@@ -271,8 +213,7 @@ func TestPublicGlobalDeliveryScopedAnonymousAndPresentation(t *testing.T) {
 	reg.Assets["/public/catalog.json"] = reg.Assets["/fixture.txt"]
 	delete(reg.Assets, "/fixture.txt")
 	m := &globalDeliveryTestStore{body: []byte("hello")}
-	s := &Server{globalDeliveryStore: m, publicGlobalDeliveryRegistry: reg, publicGlobalDeliveryRegistryAt: time.Now(),
-		deliveryPublic: newDeliveryPublicFixture()}
+	s := &Server{globalDeliveryStore: m, publicGlobalDeliveryRegistry: reg, publicGlobalDeliveryRegistryAt: time.Now()}
 	w := httptest.NewRecorder()
 	s.handleGlobalDeliveryAsset(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/metadata?path=/public/catalog.json", "", nil))
 	if w.Code != 200 {
@@ -290,7 +231,7 @@ func TestPublicGlobalDeliveryScopedAnonymousAndPresentation(t *testing.T) {
 	}
 	w = httptest.NewRecorder()
 	s.handleGlobalDeliveryTicket(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/ticket/1?sha256="+reg.Files["1"].SHA256+"&path=other.mp4", "1", nil))
-	if w.Code != 409 || m.presigned.Load() != 0 {
+	if w.Code != 409 || m.presigned != 0 {
 		t.Fatal("arbitrary presentation accepted", w.Code)
 	}
 	w = httptest.NewRecorder()
@@ -318,8 +259,7 @@ func TestPublicGlobalDeliveryEncodedFileIDThroughRouter(t *testing.T) {
 	delete(reg.Files, "1")
 	reg.Files["sha256:"+file.SHA256] = file
 	store := &globalDeliveryTestStore{body: []byte("hello")}
-	s := &Server{globalDeliveryStore: store, publicGlobalDeliveryRegistry: reg, publicGlobalDeliveryRegistryAt: time.Now(),
-		deliveryPublic: newDeliveryPublicFixture()}
+	s := &Server{globalDeliveryStore: store, publicGlobalDeliveryRegistry: reg, publicGlobalDeliveryRegistryAt: time.Now()}
 	router := chi.NewRouter()
 	router.Get(publicGlobalDeliveryAPI+"/ticket/{fileID}", s.handleGlobalDeliveryTicket)
 	for _, tc := range []struct {
@@ -338,145 +278,5 @@ func TestPublicGlobalDeliveryEncodedFileIDThroughRouter(t *testing.T) {
 				t.Fatalf("ticket status = %d, want %d", w.Code, tc.status)
 			}
 		})
-	}
-}
-
-// publicDeliveryRouter mounts exactly the public delivery routes server.go mounts,
-// so a retirement assertion covers every one of them.
-func publicDeliveryRouter(s *Server) http.Handler {
-	router := chi.NewRouter()
-	router.Get("/global-street-scores-delivery", s.handleGlobalDeliveryPage)
-	router.Get("/global-street-scores-delivery/files", s.handleGlobalDeliveryPage)
-	router.Get("/global-street-scores-delivery/static/*", s.handleGlobalDeliveryStatic)
-	router.Get(publicGlobalDeliveryAPI+"/asset", s.handleGlobalDeliveryAsset)
-	router.Get(publicGlobalDeliveryAPI+"/metadata", s.handleGlobalDeliveryAsset)
-	router.Get(publicGlobalDeliveryAPI+"/ticket/{fileID}", s.handleGlobalDeliveryTicket)
-	router.Get(publicGlobalDeliveryAPI+"/file/{fileID}", s.handleGlobalDeliveryFile)
-	router.Head(publicGlobalDeliveryAPI+"/file/{fileID}", s.handleGlobalDeliveryFile)
-	return router
-}
-
-func publicDeliveryRegistryFixture() *globalDeliveryRegistry {
-	reg := globalDeliveryTestRegistry()
-	reg.PublicDelivery = true
-	reg.SelectionScope = "available"
-	reg.Generation = strings.Repeat("a", 32)
-	reg.Assets["/public/catalog.json"] = reg.Assets["/fixture.txt"]
-	delete(reg.Assets, "/fixture.txt")
-	return reg
-}
-
-// TestPublicDeliveryRetirementRefusesEveryRoute is the P1 regression: with both
-// the current and the pinned registry warm in cache, taking the page down must
-// make the page, every metadata asset, download tickets and file responses
-// refuse, for the current and for every pinned generation.
-func TestPublicDeliveryRetirementRefusesEveryRoute(t *testing.T) {
-	reg := publicDeliveryRegistryFixture()
-	store := &globalDeliveryTestStore{body: []byte("hello")}
-	retirement := newDeliveryPublicFixture()
-	s := &Server{globalDeliveryStore: store, publicGlobalDeliveryRegistry: reg, publicGlobalDeliveryRegistryAt: time.Now(),
-		publicPinnedDeliveryRegistry: reg, deliveryPublic: retirement}
-	router := publicDeliveryRouter(s)
-	file := reg.Files["1"]
-
-	requests := []struct{ name, method, target string }{
-		{"page", "GET", "/global-street-scores-delivery"},
-		{"file_list_page", "GET", "/global-street-scores-delivery/files"},
-		{"static", "GET", "/global-street-scores-delivery/static/app.js"},
-		{"metadata", "GET", publicGlobalDeliveryAPI + "/metadata?path=/public/catalog.json"},
-		{"metadata_pinned", "GET", publicGlobalDeliveryAPI + "/metadata?path=/public/catalog.json&generation=" + reg.Generation},
-		{"ticket", "GET", publicGlobalDeliveryAPI + "/ticket/1?sha256=" + file.SHA256},
-		{"ticket_pinned", "GET", publicGlobalDeliveryAPI + "/ticket/1?sha256=" + file.SHA256 + "&generation=" + reg.Generation},
-		{"file", "GET", publicGlobalDeliveryAPI + "/file/1?sha256=" + file.SHA256},
-		{"file_pinned", "GET", publicGlobalDeliveryAPI + "/file/1?sha256=" + file.SHA256 + "&generation=" + reg.Generation},
-		{"file_head", "HEAD", publicGlobalDeliveryAPI + "/file/1?sha256=" + file.SHA256},
-	}
-	// While serving, every route works, so the refusal below is retirement's.
-	for _, r := range requests {
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, httptest.NewRequest(r.method, r.target, nil))
-		if w.Code >= 400 {
-			t.Fatalf("serving page: %s refused with %d: %s", r.name, w.Code, w.Body.String())
-		}
-	}
-	// Prewarm BOTH caches: the current registry and the pinned generation.
-	if _, err := s.loadGlobalDeliveryRegistryScope(context.Background(), true, ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.loadGlobalDeliveryRegistryScope(context.Background(), true, reg.Generation); err != nil {
-		t.Fatal(err)
-	}
-	before, presignedBefore := store.opened.Load(), store.presigned.Load()
-	retirement.retired = true
-	for _, r := range requests {
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, httptest.NewRequest(r.method, r.target, nil))
-		if w.Code != http.StatusGone {
-			t.Fatalf("retired page: %s served %d: %s", r.name, w.Code, w.Body.String())
-		}
-	}
-	// A retired page never reaches storage, and mints no capability.
-	if got := store.opened.Load(); got != before {
-		t.Fatalf("retired page opened %d storage objects", got-before)
-	}
-	if got := store.presigned.Load(); got != presignedBefore {
-		t.Fatalf("retired page minted %d capabilities", got-presignedBefore)
-	}
-	// Republication is refused while retired.
-	broadcast := DeliveryKeepSnapshot{Objects: map[string]DeliveryKeepIdentity{"dataset": {Key: "dataset", ETag: "e", Size: 1, Kind: "asset"}}}
-	if err := RequireDeliveryKeep(context.Background(), retiredKeepQuerier{}, broadcast); err == nil || !strings.Contains(err.Error(), "retired") {
-		t.Fatalf("retired page accepted republication: %v", err)
-	}
-	// An armed page refuses republication too, and says so as arming, not
-	// retirement: the page has not gone down yet.
-	if err := RequireDeliveryKeep(context.Background(), quiescedKeepQuerier{}, broadcast); err == nil || !strings.Contains(err.Error(), "quiesced") {
-		t.Fatalf("quiesced page accepted republication: %v", err)
-	}
-}
-
-// retiredKeepQuerier answers the publication gate the way a retired page does.
-type retiredKeepQuerier struct{}
-
-func (retiredKeepQuerier) QueryRow(context.Context, string, ...any) pgx.Row {
-	return deliveryKeepRow{retired: true, serving: false}
-}
-
-// quiescedKeepQuerier answers it the way an armed but not yet retired page does:
-// publication is refused, and the refusal is not retirement.
-type quiescedKeepQuerier struct{}
-
-func (quiescedKeepQuerier) QueryRow(context.Context, string, ...any) pgx.Row {
-	return deliveryKeepRow{retired: false, serving: false}
-}
-
-// deliveryKeepRow answers the two-bool serving-state row (retired, serving).
-type deliveryKeepRow struct{ retired, serving bool }
-
-func (r deliveryKeepRow) Scan(dest ...any) error {
-	if len(dest) != 2 {
-		return errors.New("unexpected scan arity")
-	}
-	for i, d := range dest {
-		v, ok := d.(*bool)
-		if !ok {
-			return errors.New("unexpected scan destination")
-		}
-		if i == 0 {
-			*v = r.retired
-		} else {
-			*v = r.serving
-		}
-	}
-	return nil
-}
-
-// TestPublicDeliveryRetirementFailsClosedWithoutAReader: a serving path that
-// cannot prove the page is up must not serve it.
-func TestPublicDeliveryRetirementFailsClosedWithoutAReader(t *testing.T) {
-	s := &Server{globalDeliveryStore: &globalDeliveryTestStore{body: []byte("hello")}}
-	w := httptest.NewRecorder()
-	s.handleGlobalDeliveryPage(w, httptest.NewRequest("GET", "/global-street-scores-delivery", nil))
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("unreadable retirement state served the page: %d", w.Code)
 	}
 }

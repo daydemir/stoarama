@@ -20,211 +20,14 @@
 --    path, the page comes down, then the in-window R2 copies go.
 -- The keep-everything delivery videos (1.0 TB) stay in R2; the seed command
 -- refuses any key whose stream is keep-everything.
+--
+-- This migration deliberately contains NO page quiesce, page retirement, origin
+-- cutover, registry, cache or reader-ticket machinery. Taking the public page
+-- down is an operator/origin act handled outside this schema, and nothing here
+-- can arm, suppress or retire it: `r2_delivery_page_retired()` is a constant
+-- false contract kept only so a downstream caller reads a defined answer.
 
 CREATE TYPE r2_delivery_exemption_class AS ENUM ('outside_window','confident_repair','in_window');
-
--- The ONE committed retirement state of the old public delivery page, set once
--- when the page is taken down (handoff step c). It lives here, in PostgreSQL, and
--- the public handlers read it live on every request: the page, its metadata, its
--- download tickets and its file responses all refuse while this row exists, for
--- the current and for every pinned generation. Retirement is therefore a serving
--- fact the server enforces, never a claim recorded from CLI arguments. The row
--- names the generation that was serving when it was written, for the record.
---
--- This row is the DESTRUCTIVE PREDICATE. It cannot exist until the proof is
--- committed, and the proof is enforced in SQL by guard_r2_delivery_page_retirement
--- below, not by the CLI: a quiesce row, zero unexpired public reader leases, and
--- zero download capabilities that could still be transferring. r2_delivery_page_retired()
--- reads only this row, so no exemption class opens a moment early.
-CREATE TABLE r2_delivery_page_retirement (
- singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
- generation text NOT NULL CHECK(generation ~ '^[a-f0-9]{32}$'),
- decision text NOT NULL CHECK(decision<>''),
- retired_at timestamptz NOT NULL DEFAULT clock_timestamp()
-);
-
--- The staging state that arms retirement. Committing this row is the point of
--- no return: from then on every public delivery route refuses a NEW request
--- (503, reload later), because r2_delivery_public_serving() is false, while the
--- readers admitted before it finish their response. It is deliberately a
--- separate, non-destructive fact: the page is not retired yet, no exemption
--- class is open, and the rollback window is documented as closed in
--- docs/r2-inverse.md. The retirement trigger refuses to run without it.
---
--- A reason string proves nothing about the world outside this database, so the
--- quiesce row itself carries no authority. It names the reviewed cutover
--- evidence row below; that row, not this text, is what the retirement proof
--- reads. Both are required, and neither can substitute for the other.
-CREATE TABLE r2_delivery_page_quiesce (
- singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
- reason text NOT NULL CHECK(reason<>''),
- armed_at timestamptz NOT NULL DEFAULT clock_timestamp()
-);
-
--- Arming takes the EXCLUSIVE public fence and requires READ COMMITTED, so a
--- hand-run INSERT, an old binary or a second process serializes against reader
--- admission, ticket minting and publication exactly as the CLI does. Without this
--- a direct INSERT could arm while a reader was mid-admission.
-CREATE FUNCTION guard_r2_delivery_page_quiesce() RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
- IF current_setting('transaction_isolation')<>'read committed' THEN
-  RAISE EXCEPTION 'arming the page requires READ COMMITTED' USING ERRCODE='55000';
- END IF;
- PERFORM pg_advisory_xact_lock(r2_delivery_public_lock());
- RETURN NEW;
-END $$;
-CREATE TRIGGER r2_delivery_page_quiesce_arm BEFORE INSERT ON r2_delivery_page_quiesce
- FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_page_quiesce();
-ALTER TABLE r2_delivery_page_quiesce ENABLE ALWAYS TRIGGER r2_delivery_page_quiesce_arm;
-
--- The ONE row that records which public registry generation the serving API
--- actually loaded and served. It is written by the API's own successful
--- `public/current.json` load, the same object and validator the request path
--- uses, under the shared public lock, and only for the unpinned CURRENT
--- generation. A pinned-generation read never writes it, and no import or hold
--- order can move it. Retirement's cutover authority is bound to this row, so the
--- generation is the one the serving binary observed as the pointer, not a guess
--- from whichever hold row was imported last.
---
--- This is an observation of the pointer's content by the serving path. It is not
--- a claim that the R2 object is unchanged now: that object remains the pointer,
--- and a separate writer could replace it. What it removes is the false "latest
--- imported hold" inference.
-CREATE TABLE r2_delivery_serving_generation (
- singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
- generation text NOT NULL CHECK(generation ~ '^[a-f0-9]{32}$'),
- observed_at timestamptz NOT NULL DEFAULT clock_timestamp()
-);
-CREATE FUNCTION guard_r2_delivery_serving_generation() RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
- IF current_setting('transaction_isolation')<>'read committed' THEN
-  RAISE EXCEPTION 'serving generation observation requires READ COMMITTED' USING ERRCODE='55000';
- END IF;
- PERFORM pg_advisory_xact_lock_shared(r2_delivery_public_lock());
- IF NOT r2_delivery_public_serving() THEN
-  RAISE EXCEPTION 'the public delivery page is not serving'
-   USING ERRCODE='55000', HINT='no serving generation may be observed after quiesce';
- END IF;
- NEW.observed_at := clock_timestamp();
- RETURN NEW;
-END $$;
-CREATE TRIGGER r2_delivery_serving_generation_write BEFORE INSERT OR UPDATE ON r2_delivery_serving_generation
- FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_serving_generation();
-ALTER TABLE r2_delivery_serving_generation ENABLE ALWAYS TRIGGER r2_delivery_serving_generation_write;
-
--- The reviewed, immutable cutover evidence: the ONE place the facts the API
--- cannot observe are recorded, and the only thing that lets a retirement be
--- proved at all. Every field is an artifact the operator produced outside this
--- database, pinned by its own digest; none is inferred from the API's traffic,
--- and no timestamp stands in for an artifact.
---
--- Provenance, stated plainly: this table records that an operator produced and
--- pinned reviewed evidence. It does not verify production routing or a completed
--- download from inside PostgreSQL, and a DBA who can format hex can write any
--- row. The gate below is therefore only as strong as the reviewed sequence that
--- wrote this row, documented in docs/r2-inverse.md; if that sequence was not
--- actually performed, the honest state is that confident_repair and every
--- derivative release stay closed.
---
---   * generation is the exact serving registry generation being retired. The
---     admission trigger requires it to equal the live public registry's own
---     generation while the page still serves, so it cannot be a second string the
---     caller asserts. Retirement then compares against this same row;
---   * legacy_grant_boundary_at is the LAST INSTANT a legacy origin could have
---     handed out a five-minute signed URL, and legacy_signed_grant_sha256 pins
---     the grant-list artifact it was derived from;
---   * legacy_origin_removed_at plus legacy_origin_evidence_sha256 pin the off-host
---     evidence artifact that every legacy origin is out of traffic;
---   * cache_expired_at plus cache_evidence_sha256 pin the cache-purge artifact;
---   * rollback_routing_sha256 pins the non-serving rollback routing artifact;
---   * transfer_evidence_sha256 pins the artifact that establishes the end of
---     every active transfer, direct-from-R2 included, and transfer_bound_at is
---     the instant read from THAT artifact. A bare timestamp with no artifact is
---     refused: a timestamp is not evidence.
---
--- approval_sha256 is the second, distinct digest: it is over the canonical bytes
--- of the whole evidence record as the operator reviewed them, so the operator's
--- approval names exact bytes. It is NOT one of the per-fact evidence digests,
--- and holding it proves nothing about production; it only proves the operator
--- approved exactly these fields.
-CREATE TABLE r2_delivery_cutover_authority (
- singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
- generation text NOT NULL CHECK(generation ~ '^[a-f0-9]{32}$'),
- decision text NOT NULL CHECK(decision<>''),
- legacy_grant_boundary_at timestamptz NOT NULL,
- legacy_signed_grant_sha256 text NOT NULL CHECK(legacy_signed_grant_sha256 ~ '^[a-f0-9]{64}$'),
- legacy_origin_removed_at timestamptz NOT NULL,
- legacy_origin_evidence_sha256 text NOT NULL CHECK(legacy_origin_evidence_sha256 ~ '^[a-f0-9]{64}$'),
- cache_expired_at timestamptz NOT NULL,
- cache_evidence_sha256 text NOT NULL CHECK(cache_evidence_sha256 ~ '^[a-f0-9]{64}$'),
- rollback_routing_sha256 text NOT NULL CHECK(rollback_routing_sha256 ~ '^[a-f0-9]{64}$'),
- transfer_bound_at timestamptz NOT NULL,
- transfer_evidence_sha256 text NOT NULL CHECK(transfer_evidence_sha256 ~ '^[a-f0-9]{64}$'),
- approval_sha256 text NOT NULL CHECK(approval_sha256 ~ '^[a-f0-9]{64}$'),
- -- Every per-fact digest must be distinct from the approval digest and from each
- -- other: one artifact cannot stand in for four different facts, and an approval
- -- is not an evidence artifact.
- CHECK (legacy_signed_grant_sha256 <> legacy_origin_evidence_sha256
-   AND legacy_signed_grant_sha256 <> cache_evidence_sha256
-   AND legacy_signed_grant_sha256 <> rollback_routing_sha256
-   AND legacy_signed_grant_sha256 <> transfer_evidence_sha256
-   AND legacy_origin_evidence_sha256 <> cache_evidence_sha256
-   AND legacy_origin_evidence_sha256 <> rollback_routing_sha256
-   AND legacy_origin_evidence_sha256 <> transfer_evidence_sha256
-   AND cache_evidence_sha256 <> rollback_routing_sha256
-   AND cache_evidence_sha256 <> transfer_evidence_sha256
-   AND rollback_routing_sha256 <> transfer_evidence_sha256
-   AND approval_sha256 <> legacy_signed_grant_sha256
-   AND approval_sha256 <> legacy_origin_evidence_sha256
-   AND approval_sha256 <> cache_evidence_sha256
-   AND approval_sha256 <> rollback_routing_sha256
-   AND approval_sha256 <> transfer_evidence_sha256),
- recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
- -- Computed ONCE by the admission trigger from exactly the four evidenced facts,
- -- so it cannot drift after the row exists and cannot be supplied by a caller.
- deadline_at timestamptz NOT NULL
-);
-
--- One admitted public response, from before its first byte to after its last
--- socket write. A response records itself here before it reads a registry, a
--- metadata asset, a ticket or a file, and deletes the row after its body is
--- written. The row is a LEASE with a hard expiry, so a crashed or abandoned
--- response delays retirement by at most that lease and never wedges it. The
--- retirement trigger refuses while any lease is unexpired, so retirement cannot
--- commit in the middle of a response; the API never holds a database connection
--- or a lock while streaming, only this row.
-CREATE TABLE r2_delivery_public_readers (
- reader_id text PRIMARY KEY CHECK(reader_id ~ '^[a-f0-9]{32}$'),
- admitted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
- expires_at timestamptz NOT NULL,
- CHECK(expires_at > admitted_at)
-);
-CREATE INDEX r2_delivery_public_readers_live ON r2_delivery_public_readers(expires_at);
-
--- Every download capability the public page hands out, so retirement can drain
--- them instead of leaving presigned URLs live. A row is written in the same
--- transaction, under the same lock, as the capability it describes, so a
--- capability can never outlive its record. expires_at is the provider's own
--- capability expiry, and it is the ONLY bound this table asserts.
---
--- It deliberately does not invent a transfer bound. A provider does not cut a
--- transfer that already started when the presign expires, so "expires_at plus
--- two minutes" would be a guess, and a guess is not proof of a last byte. The
--- authoritative end of any transfer that may still be reading is
--- r2_delivery_cutover_authority.transfer_bound_at, established by the operator
--- outside this database; retirement requires BOTH every capability here to be
--- expired AND that verified bound to have passed.
-CREATE TABLE r2_delivery_download_tickets (
- id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
- bucket text NOT NULL,
- object_key text NOT NULL,
- etag text NOT NULL CHECK(etag<>''),
- size_bytes bigint NOT NULL CHECK(size_bytes>0),
- object_path_sha256 text NOT NULL CHECK(object_path_sha256 ~ '^[a-f0-9]{64}$'),
- issued_at timestamptz NOT NULL DEFAULT clock_timestamp(),
- expires_at timestamptz NOT NULL
-);
-CREATE INDEX r2_delivery_download_tickets_live ON r2_delivery_download_tickets(expires_at);
 
 -- The owner approval each roster was approved for: one append-only row per
 -- ROSTER DIGEST, recorded by its own command step before any seeding. The digest
@@ -259,15 +62,11 @@ CREATE TABLE r2_delivery_exemptions (
 
 CREATE FUNCTION guard_r2_delivery_exemption_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
- RAISE EXCEPTION 'R2 delivery exemptions, approvals, the quiesce state and the page retirement state are append-only';
+ RAISE EXCEPTION 'R2 delivery exemptions and approvals are append-only';
 END $$;
--- Never removed or rewritten wholesale: the observed pointer is not a cache.
-CREATE TRIGGER r2_delivery_serving_generation_keep BEFORE DELETE OR TRUNCATE ON r2_delivery_serving_generation
- FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_delivery_exemption_immutable();
-ALTER TABLE r2_delivery_serving_generation ENABLE ALWAYS TRIGGER r2_delivery_serving_generation_keep;
 
 DO $$ DECLARE t text; BEGIN
- FOREACH t IN ARRAY ARRAY['r2_delivery_exemptions','r2_delivery_exemption_approvals','r2_delivery_page_quiesce','r2_delivery_page_retirement','r2_delivery_cutover_authority'] LOOP
+ FOREACH t IN ARRAY ARRAY['r2_delivery_exemptions','r2_delivery_exemption_approvals'] LOOP
   EXECUTE format('CREATE TRIGGER %s_immutable BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_exemption_immutable()',t,t);
   EXECUTE format('CREATE TRIGGER %s_no_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION guard_r2_delivery_exemption_immutable()',t,t);
   EXECUTE format('ALTER TABLE %I ENABLE ALWAYS TRIGGER %s_immutable',t,t);
@@ -280,8 +79,18 @@ END $$;
 -- every row must reference the owner approval for THAT class and roster digest:
 -- the referenced approval's class, digest and decision must equal the row's, in
 -- SQL, so no writer can bind a row to an approval for another class.
+--
+-- The collated family is exactly the two families reviewed for this scope.
+-- joined/best14-20261021/ is eligible footage for the 2026-11-18 owner scope but
+-- it is NOT a page-key exemption family: no row under it may take a page
+-- exemption, so it can never lose a page hold through this table.
+--
+-- Exact content identity is required wherever the reservation guard requires it:
+-- the page row must carry a nonempty sha256 and it must be the catalog output's
+-- own lowercase sha256, because guard_delivery_r2_retirement compares exactly
+-- that pair and a row that could not satisfy it must never be admitted here.
 CREATE FUNCTION guard_r2_delivery_exemption_admission() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE h delivery_keep_holds;
+DECLARE h delivery_keep_holds; matches bigint; size bigint; catalog_sha256 text;
 BEGIN
  IF current_setting('transaction_isolation')<>'read committed' THEN
   RAISE EXCEPTION 'R2 delivery exemption admission requires READ COMMITTED' USING ERRCODE='55000';
@@ -294,13 +103,29 @@ BEGIN
     AND a.class=NEW.class AND a.roster_sha256=NEW.roster_sha256 AND a.decision=NEW.decision) THEN
   RAISE EXCEPTION 'R2 delivery exemption % must name its own class/roster approval', NEW.object_key;
  END IF;
- IF NOT ((NEW.class='confident_repair' AND h.kind='video_assembly'
-    AND starts_with(NEW.object_key,'experimental/stitching-confident-repairs/'))
-  OR (NEW.class IN ('outside_window','in_window') AND h.kind='video_collated'
-    AND (starts_with(NEW.object_key,'joined/goodplus-') OR starts_with(NEW.object_key,'joined/nightly-collation-v2/')))) THEN
-  RAISE EXCEPTION 'R2 delivery exemption class % does not cover % (%)', NEW.class, NEW.object_key, h.kind;
+ IF NEW.class='confident_repair' AND h.kind='video_assembly'
+    AND starts_with(NEW.object_key,'experimental/stitching-confident-repairs/') THEN
+  RETURN NEW;
  END IF;
- RETURN NEW;
+ IF NEW.class IN ('outside_window','in_window') AND h.kind='video_collated'
+    AND (starts_with(NEW.object_key,'joined/goodplus-') OR starts_with(NEW.object_key,'joined/nightly-collation-v2/')) THEN
+  SELECT count(*),coalesce(min(o.size_bytes),0),coalesce(min(lower(o.sha256)),'')
+   INTO matches,size,catalog_sha256
+   FROM recording_collation_outputs o WHERE o.object_key=NEW.object_key;
+  IF matches<>1 OR size<>NEW.size_bytes OR catalog_sha256 !~ '^[a-f0-9]{64}$' THEN
+   RAISE EXCEPTION 'R2 delivery exemption % needs exactly one exact catalog output identity', NEW.object_key;
+  END IF;
+  -- guard_delivery_r2_retirement admits a receipt only when the page row's own
+  -- sha256 equals the receipt's, and the collated lane writes lower(o.sha256).
+  -- An exemption whose page row cannot state that exact content would be
+  -- unreachable authority, so it is refused here instead of opening a gate the
+  -- wire then fails to use.
+  IF lower(h.sha256)<>catalog_sha256 THEN
+   RAISE EXCEPTION 'R2 delivery exemption % needs the page row to carry the catalog sha256', NEW.object_key;
+  END IF;
+  RETURN NEW;
+ END IF;
+ RAISE EXCEPTION 'R2 delivery exemption class % does not cover % (%)', NEW.class, NEW.object_key, h.kind;
 END $$;
 CREATE TRIGGER r2_delivery_exemption_admission BEFORE INSERT ON r2_delivery_exemptions
  FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_exemption_admission();
@@ -335,228 +160,15 @@ ALTER TABLE r2_delivery_exemption_approvals ENABLE ALWAYS TRIGGER r2_delivery_ap
 CREATE FUNCTION r2_delivery_nas_certified(p_output_id bigint, p_bucket text, p_key text, p_etag text, p_size bigint, p_sha256 text)
 RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT false $$;
 
--- True only when the public delivery page is retired, checked live on every
--- call. It reads EXACTLY the one committed serving state above, the same row the
--- public handlers refuse on, so the gate and the page can never disagree: no
--- second fact, no CLI-asserted state.
-CREATE FUNCTION r2_delivery_page_retired() RETURNS boolean LANGUAGE sql STABLE AS $$
- SELECT EXISTS(SELECT 1 FROM r2_delivery_page_retirement)
-$$;
-
--- True while the page may serve a NEW request. It is false from the moment the
--- staging quiesce row commits and stays false once the page is retired. The API
--- reads it live before admitting a reader, so neither the quiesce state nor the
--- retired state can be bypassed by a warm cache, a pinned generation or a
--- direct storage read. It is also the SQL-side arm gate: the retirement trigger
--- requires this to be false, so retirement is impossible without a committed
--- quiesce.
-CREATE FUNCTION r2_delivery_public_serving() RETURNS boolean LANGUAGE sql STABLE AS $$
- SELECT NOT EXISTS(SELECT 1 FROM r2_delivery_page_quiesce)
-    AND NOT EXISTS(SELECT 1 FROM r2_delivery_page_retirement)
-$$;
-
--- The exclusive side of the shared/exclusive public admission this migration
--- implements. Every admitted public response holds ONE short shared transaction
--- (pg_advisory_xact_lock_shared) for the registry/metadata/ticket decision, and
--- releases it before streaming; its r2_delivery_public_readers lease row is what
--- spans the byte transfer. Retirement takes this same lock exclusively, so it
--- serializes against registry publication, ticket minting and admission without
--- ever waiting on a socket. A plain SELECT keeps it in one place, so the server
--- and the CLI cannot disagree about the key.
-CREATE FUNCTION r2_delivery_public_lock() RETURNS bigint LANGUAGE sql IMMUTABLE AS $$ SELECT 7343226011104::bigint $$;
-
--- A public reader lease is admitted only while the page may serve, in the same
--- statement that writes it. READ COMMITTED is required so an earlier snapshot
--- cannot admit a reader after a quiesce committed.
-CREATE FUNCTION guard_r2_delivery_public_reader() RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
- IF current_setting('transaction_isolation')<>'read committed' THEN
-  RAISE EXCEPTION 'a public delivery reader lease requires READ COMMITTED' USING ERRCODE='55000';
- END IF;
- PERFORM pg_advisory_xact_lock_shared(r2_delivery_public_lock());
- IF NOT r2_delivery_public_serving() THEN
-  RAISE EXCEPTION 'the public delivery page is not serving'
-   USING ERRCODE='55000', HINT='retire/quiesce is in progress; no new public reader is admitted';
- END IF;
- IF NEW.expires_at<=clock_timestamp() OR NEW.expires_at>clock_timestamp()+interval '10 minutes' THEN
-  RAISE EXCEPTION 'public reader lease must expire within ten minutes';
- END IF;
- RETURN NEW;
-END $$;
-CREATE TRIGGER r2_delivery_public_reader_admission BEFORE INSERT ON r2_delivery_public_readers
- FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_public_reader();
-ALTER TABLE r2_delivery_public_readers ENABLE ALWAYS TRIGGER r2_delivery_public_reader_admission;
-
--- A ticket row is written in the same transaction as its capability, while the
--- page serves, under the shared public lock: retirement's exclusive lock then
--- cannot commit between the page check and the row, and no ticket can be minted
--- after retirement armed. last_byte_by is at least the capability expiry.
-CREATE FUNCTION guard_r2_delivery_download_ticket() RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
- IF current_setting('transaction_isolation')<>'read committed' THEN
-  RAISE EXCEPTION 'a public delivery ticket requires READ COMMITTED' USING ERRCODE='55000';
- END IF;
- PERFORM pg_advisory_xact_lock_shared(r2_delivery_public_lock());
- IF NOT r2_delivery_public_serving() THEN
-  RAISE EXCEPTION 'the public delivery page is not serving'
-   USING ERRCODE='55000', HINT='no download capability may be minted after quiesce or retirement';
- END IF;
- RETURN NEW;
-END $$;
-CREATE TRIGGER r2_delivery_download_ticket_admission BEFORE INSERT ON r2_delivery_download_tickets
- FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_download_ticket();
-ALTER TABLE r2_delivery_download_tickets ENABLE ALWAYS TRIGGER r2_delivery_download_ticket_admission;
-
--- Retirement is the destructive predicate and it is proved HERE, in SQL, under
--- the exclusive public lock, never by a caller's claim. It needs ALL of:
---
---   1. the staging quiesce row, so the destructive step is always a second,
---      deliberate step after arming;
---   2. a cutover authority row for the generation being retired, whose derived
---      deadline_at (later than the last possible legacy grant, the removed
---      legacy origin, the expired caches and the verified transfer bound, each
---      plus a margin) is already in the past by the DATABASE clock. This holds
---      even when every ledger below is empty: an untracked legacy five-minute
---      URL is exactly the case an empty grant ledger would hide;
---   3. zero unexpired admitted public reader leases;
---   4. zero unexpired recorded download capabilities;
---   5. zero pending R2 retirement reservations or nonraw intents whose object is
---      a page key, so a derivative release cannot outrun this gate;
---   6. the cutover authority's generation equals the generation being retired.
---
--- A missing authority row means the operator has NOT established the external
--- facts (legacy grants drained, origins removed, caches expired, transfers
--- ended). The gate then refuses, which deliberately leaves confident_repair,
--- in_window and every derivative release closed. That is the correct outcome
--- when authoritative drain cannot be proved, not a condition to route around.
-CREATE FUNCTION guard_r2_delivery_page_retirement() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE live_readers bigint; live_capabilities bigint; armed boolean; own_xact boolean;
- a r2_delivery_cutover_authority; page_derivatives bigint;
-BEGIN
- IF current_setting('transaction_isolation')<>'read committed' THEN
-  RAISE EXCEPTION 'page retirement requires READ COMMITTED' USING ERRCODE='55000';
- END IF;
- PERFORM pg_advisory_xact_lock(r2_delivery_public_lock());
- -- The arm must be a DIFFERENT, separately committed transaction. Seeing our
- -- own uncommitted arm here would let one transaction arm and retire in a single
- -- step, defeating the staged order. xmin of the arm row must not be ours.
- SELECT true, q.xmin::text = pg_current_xact_id()::text INTO armed, own_xact
-  FROM r2_delivery_page_quiesce q WHERE q.singleton;
- IF armed IS NULL THEN
-  RAISE EXCEPTION 'page retirement requires the committed quiesce state'
-   USING ERRCODE='55000', HINT='run r2-inverse page-quiesce first';
- END IF;
- IF own_xact THEN
-  RAISE EXCEPTION 'page retirement requires the quiesce state to be committed by a SEPARATE transaction'
-   USING ERRCODE='55000', HINT='commit page-quiesce first; do not arm and retire in one transaction';
- END IF;
- SELECT * INTO a FROM r2_delivery_cutover_authority WHERE singleton;
- IF NOT FOUND THEN
-  RAISE EXCEPTION 'page retirement requires reviewed cutover authority'
-   USING ERRCODE='55000', HINT='no authority row: legacy grants, origins, caches and transfers are unproven, so retirement (and every derivative release) stays closed';
- END IF;
- -- The retired generation must be the authority's, and the authority is only
- -- admitted when it equals the live serving registry generation, so this is one
- -- bound fact rather than two caller strings agreeing.
- IF a.generation<>NEW.generation THEN
-  RAISE EXCEPTION 'cutover authority names generation %, not the retired %', a.generation, NEW.generation
-   USING ERRCODE='55000';
- END IF;
- -- The derived deadline, on the database clock, with no server-side constant.
- IF clock_timestamp()<=a.deadline_at THEN
-  RAISE EXCEPTION 'refusing page retirement: the verified drain deadline % has not passed', a.deadline_at;
- END IF;
- SELECT count(*) INTO live_readers FROM r2_delivery_public_readers WHERE expires_at>clock_timestamp();
- IF live_readers<>0 THEN
-  RAISE EXCEPTION 'refusing page retirement: % admitted public readers are still unexpired', live_readers;
- END IF;
- SELECT count(*) INTO live_capabilities FROM r2_delivery_download_tickets WHERE expires_at>clock_timestamp();
- IF live_capabilities<>0 THEN
-  RAISE EXCEPTION 'refusing page retirement: % download capabilities are still unexpired', live_capabilities;
- END IF;
- -- A pending retirement of a page key is a release this gate must not outrun.
- SELECT count(*) INTO page_derivatives FROM (
-  SELECT 1 FROM r2_retirement_reservations r
-   WHERE NOT EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.bucket=r.bucket AND x.object_key=r.object_key)
-   AND EXISTS(SELECT 1 FROM delivery_keep_holds h WHERE h.bucket=r.bucket AND h.object_key=r.object_key)
-  UNION ALL
-  SELECT 1 FROM r2_nonraw_intents i
-   WHERE NOT EXISTS(SELECT 1 FROM r2_nonraw_events e WHERE e.bucket=i.bucket AND e.object_key=i.object_key AND e.event='absent')
-   AND EXISTS(SELECT 1 FROM delivery_keep_holds h WHERE h.bucket=i.bucket AND h.object_key=i.object_key)
- ) pending;
- IF page_derivatives<>0 THEN
-  RAISE EXCEPTION 'refusing page retirement: % page keys have a pending derivative retirement', page_derivatives;
- END IF;
- RETURN NEW;
-END $$;
-CREATE TRIGGER r2_delivery_page_retirement_proof BEFORE INSERT ON r2_delivery_page_retirement
- FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_page_retirement();
-ALTER TABLE r2_delivery_page_retirement ENABLE ALWAYS TRIGGER r2_delivery_page_retirement_proof;
-
--- The authority row is admitted only in the quiesced state, and only with
--- self-consistent evidence. It cannot name a generation other than the one the
--- public page is serving (the quiesce row does not carry it, so this checks the
--- one serving registry generation the operator already removed), and its
--- transfer_bound_at may not be after recorded_at: the verified end of a transfer
--- cannot be a time in the future when the evidence is written. Both refusals are
--- SQL, so a caller's paraphrase cannot satisfy them.
-CREATE FUNCTION guard_r2_delivery_cutover_authority() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE serving text; arm_xact text; arm_own boolean;
-BEGIN
- IF current_setting('transaction_isolation')<>'read committed' THEN
-  RAISE EXCEPTION 'cutover authority requires READ COMMITTED' USING ERRCODE='55000';
- END IF;
- PERFORM pg_advisory_xact_lock(r2_delivery_public_lock());
- -- The arm must be committed by a SEPARATE transaction: seeing an uncommitted arm
- -- from this same transaction would let one transaction arm and record authority.
- SELECT q.xmin::text = pg_current_xact_id()::text INTO arm_own FROM r2_delivery_page_quiesce q WHERE q.singleton;
- IF arm_own IS NULL THEN
-  RAISE EXCEPTION 'cutover authority requires the committed quiesce state'
-   USING ERRCODE='55000', HINT='arm the page first; authority recorded before arming proves nothing about the cutover';
- END IF;
- IF arm_own THEN
-  RAISE EXCEPTION 'cutover authority requires the quiesce state to be committed by a SEPARATE transaction'
-   USING ERRCODE='55000', HINT='commit page-quiesce first; do not arm and record authority in one transaction';
- END IF;
- -- Bind the authority to the generation the serving API actually loaded as the
- -- unpinned current registry (r2_delivery_serving_generation), never to an import
- -- order over holds. If the serving path never recorded a generation, there is
- -- nothing to bind to and the authority is refused.
- SELECT g.generation INTO serving FROM r2_delivery_serving_generation g WHERE g.singleton;
- IF serving IS NULL THEN
-  RAISE EXCEPTION 'cutover authority requires an observed serving generation'
-   USING ERRCODE='55000', HINT='the serving API has not recorded a public/current.json generation; retirement cannot be bound to one';
- END IF;
- IF NEW.generation <> serving THEN
-  RAISE EXCEPTION 'cutover authority generation % is not the observed serving generation', NEW.generation
-   USING ERRCODE='55000';
- END IF;
- -- Every instant must be a real, already-past instant. A missing or zeroed
- -- timestamp is a missing fact, not evidence, so it is refused rather than
- -- silently contributing a harmless value to the derived deadline.
- IF NEW.legacy_grant_boundary_at <= '1970-01-01' OR NEW.transfer_bound_at <= '1970-01-01'
-  OR NEW.legacy_origin_removed_at <= '1970-01-01' OR NEW.cache_expired_at <= '1970-01-01' THEN
-  RAISE EXCEPTION 'cutover authority timestamps must be real, non-zero instants';
- END IF;
- IF NEW.transfer_bound_at > clock_timestamp() THEN
-  RAISE EXCEPTION 'verified transfer bound % is in the future; it is not verified evidence', NEW.transfer_bound_at;
- END IF;
- IF NEW.legacy_origin_removed_at > clock_timestamp() OR NEW.cache_expired_at > clock_timestamp() THEN
-  RAISE EXCEPTION 'legacy origin removal and cache expiry must already have happened';
- END IF;
- -- Derived here, once, from the four evidenced facts plus the five-minute legacy
- -- grant window. A caller-supplied deadline is overwritten, never trusted.
- NEW.deadline_at := greatest(NEW.legacy_grant_boundary_at, NEW.legacy_origin_removed_at,
-  NEW.cache_expired_at, NEW.transfer_bound_at) + interval '5 minutes';
- RETURN NEW;
-END $$;
-CREATE TRIGGER r2_delivery_cutover_authority_admission BEFORE INSERT ON r2_delivery_cutover_authority
- FOR EACH ROW EXECUTE FUNCTION guard_r2_delivery_cutover_authority();
-ALTER TABLE r2_delivery_cutover_authority ENABLE ALWAYS TRIGGER r2_delivery_cutover_authority_admission;
+-- The retired-page contract, kept for callers that ask. This release has no
+-- mechanism that can make it true: there is no page quiesce row, no retirement
+-- row, no cutover authority and no registry/reader state in this schema, so the
+-- answer is a constant. Nothing in this migration or the CLI can arm, suppress
+-- or retire the public page.
+CREATE FUNCTION r2_delivery_page_retired() RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT false $$;
 
 -- True only for an exempt exact page key whose class gate is open now. A class
 -- without a gate branch yields NULL and stays held.
--- True only for an exact page key whose class gate is open now.
 --
 -- outside_window opens once its row is seeded and approved; it needs no external
 -- fact, so it is already fully gated by its own exact approval plus the mandatory
@@ -634,19 +246,13 @@ END $$;
 --     blocked COPY, another lane's intent, another retirement, a stitch input
 --     hold and the owner keep prefix.
 -- Plus the collated output's OWN NAS reservation and its own pending cleanup
--- hold or incident source. The reserved-file view and incident-source view are
--- keyed by the OUTPUT id for a collated row, not only by its RAW source ids, so a
--- pending NAS retirement of this exact output refuses it here rather than only in
--- the batch statement.
--- Every protection EXCEPT the page hold. This is the one place a page hold may be
--- lifted, and only because the seed is deciding whether to exempt exactly that
--- key; every other term is byte-for-byte the same function, so the seed can
--- never see a weaker answer than the wire for a non-page reason. In particular
--- the output's own NAS reservation, pending cleanup hold and incident source
--- stay, and a reserved output is refused at validate and at approve.
+-- hold or incident source. Both the reserved-file view and the incident view are
+-- keyed by the OUTPUT id in their own typed namespace for a collated row, never
+-- by its RAW source ids, so a RAW clip id that happens to equal this output's id
+-- cannot hold it and a pending typed collision cannot be missed.
 CREATE FUNCTION r2_nonraw_key_other_held(p_bucket text, p_key text, p_kind text, p_id bigint) RETURNS boolean LANGUAGE sql STABLE AS $$
  SELECT EXISTS(SELECT 1 FROM nas_cleanup_incident_roster i WHERE i.bucket=p_bucket AND i.object_key=p_key)
-  OR (p_kind='collated' AND EXISTS(SELECT 1 FROM nas_cleanup_incident_sources s WHERE s.clip_id=p_id))
+  OR (p_kind='collated' AND EXISTS(SELECT 1 FROM nas_cleanup_incident_files f WHERE f.kind='collated' AND f.source_id=p_id))
   OR EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.bucket=p_bucket AND x.object_key=p_key)
   OR EXISTS(SELECT 1 FROM nas_r2_copy_items ci WHERE (ci.state<>'verified' OR ci.blocked_reason<>'')
     AND ci.item->>'bucket'=p_bucket AND ci.item->>'object_key'=p_key)

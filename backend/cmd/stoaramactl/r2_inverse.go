@@ -664,18 +664,6 @@ func runR2Inverse(ctx context.Context, cfg config.Config, args []string) {
 		runR2InverseApprove(ctx, cfg, args[1:])
 		return
 	}
-	if len(args) > 0 && args[0] == "page-cutover" {
-		runR2InversePageCutover(ctx, cfg, args[1:])
-		return
-	}
-	if len(args) > 0 && args[0] == "page-quiesce" {
-		runR2InversePageQuiesce(ctx, cfg, args[1:])
-		return
-	}
-	if len(args) > 0 && args[0] == "page-retired" {
-		runR2InversePageRetired(ctx, cfg, args[1:])
-		return
-	}
 	const usage = "usage: stoaramactl r2-inverse partition --picks FILE --out DIR [--owner-footage-scope] (read-only full bucket partition)"
 	if len(args) == 0 || args[0] != "partition" {
 		log.Fatal(usage)

@@ -53,10 +53,6 @@ type Server struct {
 	publicPinnedDeliveryRegistry   *globalDeliveryRegistry
 	publicGlobalDeliveryRegistry   *globalDeliveryRegistry
 	publicGlobalDeliveryRegistryAt time.Time
-	// deliveryPublic overrides the live public delivery gate in tests.
-	// Production leaves it nil and reads the serving state, records reader
-	// leases and records capabilities on the pool.
-	deliveryPublic deliveryPublicGate
 
 	cfg                      config.Config
 	pool                     *pgxpool.Pool

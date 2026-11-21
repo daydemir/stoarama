@@ -411,18 +411,25 @@ this lane.
 
 | Class | Page rows | Gate |
 | --- | --- | --- |
-| `outside_window` | `video_collated` under `joined/goodplus-*` or `joined/nightly-collation-v2/`, outside every keep window (4,348, 0.582 TB) | open once seeded and approved; independent of the cutover authority |
-| `confident_repair` | `video_assembly` under `experimental/stitching-confident-repairs/`, no catalog row (9,232, 3.377 TB) | **HARD-CLOSED in code** |
-| `in_window` | `video_collated` inside a keep window (10,893, 2.347 TB) | **HARD-CLOSED in code** |
+| `outside_window` | `video_collated` under `joined/goodplus-*` or `joined/nightly-collation-v2/` only, outside every keep window | open once seeded and approved |
+| `confident_repair` | `video_assembly` under `experimental/stitching-confident-repairs/`, no catalog row | **HARD-CLOSED in code** |
+| `in_window` | `video_collated` inside a keep window | **HARD-CLOSED in code** |
 
-`confident_repair` and `in_window` are closed by `r2_delivery_class_open()` returning
-true only for `outside_window`, and by `validate`, `approve` and `seed` refusing
-those classes outright. This is deliberate: no authoritative evidence format or
-issuer exists in this repo to prove the serving pointer was not replaced or that a
-direct-from-R2 transfer actually ended, and `r2_delivery_nas_certified` is a false
-stub. Rather than trust a caller not to pass a digest-shaped claim, the classes
-cannot open at all. The same applies to page retirement and 0231. Opening either
-requires an authoritative evidence issuer that does not yet exist.
+`joined/best14-20261021/` is eligible footage for the separate 2026-11-18 owner
+scope, but it is not a page family: no row under it may take a page exemption,
+and the exemption admission trigger and the validator both refuse it.
+
+`confident_repair` and `in_window` are closed by `r2_delivery_class_open()`
+returning true only for `outside_window`, and by `validate`, `approve` and `seed`
+refusing those classes outright. This is deliberate: no authoritative evidence
+format or issuer exists in this repo to prove the pointer was not replaced or
+that a direct-from-R2 transfer actually ended, and `r2_delivery_nas_certified`
+is a false stub. Rather than trust a caller not to pass a digest-shaped claim,
+the classes cannot open at all. 0231 stays false. 0225 contains no page quiesce,
+page retirement, origin cutover, registry, cache or reader-ticket machinery, so
+nothing in this release can arm, suppress or retire the public page:
+`r2_delivery_page_retired()` is a constant false contract kept for callers, not
+authority.
 
 An exemption binds the exact `(bucket, object_key, etag, size_bytes)` of the
 live page row, the class's verbatim owner decision and the roster SHA-256, and it
@@ -437,20 +444,31 @@ collated executor's own live classifier (inside vs outside the stream's keep
 window, or a confident repair) and refuses the whole roster on any disagree. The
 read-only `r2-inverse validate` step runs that SAME decision before any approval
 exists, so the owner only ever approves a digest the wire would accept; the
-documented roster SQL is candidate generation, never validation. Exemptions,
-approvals, the quiesce row and the retirement row are append-only. If the page
-row's identity ever drifts, the key is held again; the partition compares the
-listing's ETag and size against the exempt identity before reporting a
-candidate.
+documented roster SQL is candidate generation, never validation. Exemptions and
+approvals are append-only. If the page row's identity ever drifts, the key is
+held again; the partition compares the listing's ETag and size against the
+exempt identity before reporting a candidate.
+
+Identity and content parity are required at every layer the receipt crosses. The
+exemption binds the page row's exact ETag, size **and** sha256; the page row's
+sha256 must be nonempty and equal the catalog output's own lowercase sha256,
+because `guard_delivery_r2_retirement` compares exactly that pair. A page row
+that cannot state the content is refused at admission instead of opening a gate
+the wire then fails to use, and the validator refuses the same mismatch.
 
 Seeding requires a positive, window-bound, non-keep-everything owner decision
 for the page recording's stream *and* for the output's own stream; a missing
-pick is refused. At deletion time the page recording's stream is rechecked live,
-so a page row on a keep-everything or undecided stream holds the key even when
-the catalog output names a decided one. Dependency-only collated outputs that
-are not page keys follow the 2026-11-18 owner scope, but anything whose NAS copy
-is still pending or blocked ("waiting to be transferred") stays held. Footage
-already verified on the NAS is not excluded by that rule.
+pick is refused. `outside_window` additionally requires the output to be outside
+the **page recording's own** pinned window, not only its catalog output stream's
+one. A page stream with no pinned window, or an output whose interval is absent,
+fails closed with a refusal rather than being assumed outside. At deletion time
+the page recording's stream is rechecked live, so a page row on a keep-everything
+or undecided stream holds the key even when the catalog output names a decided
+one. Dependency-only collated outputs that are not page keys follow the
+2026-11-18 owner scope, but anything whose NAS copy is still pending or blocked
+("waiting to be transferred") stays held. Footage already verified on the NAS is
+not excluded by that rule.
+
 Keep-everything delivery videos (1.0 TB) are never exempted: the seed command
 refuses any key whose stream is `all` in the pinned picks, and the lane refuses
 it again. `r2_delivery_nas_certified(output_id, bucket, key, etag,
@@ -470,22 +488,10 @@ retire as `collated`. Receipts carry `owner_delivery_page_<class>`.
 
 ### Controller order
 
-0. Take the old public page's **legacy origins** out of traffic first. Nothing in
-   this section can make an origin that is still in front of the page stop
-   serving: the API enforces the retirement state on its own routes, and any
-   handled origin must be removed by whoever owns it. Prove the removal, not a
-   promise:
-
-   - every legacy hostname/CDN route/redirect/custom domain that resolves to the
-     delivery page or its R2 keys is removed or returns nothing, checked with
-     `dig`/`curl -sSI` from off-host and recorded with the timestamp;
-   - the R2 bucket has no public bucket-level domain, no worker route and no
-     lifecycle rule that republishes the delivery prefix;
-   - `public/current.json` still names the generation this run retires, so the
-     retired generation and the removed origin are the same object.
-
-   **No rollback to a legacy origin after arming.** `page-quiesce` is the point
-   of no return: the numbers below describe the only safe path forward.
+This section describes a **code merge only**. It grants no delete authority: no
+`outside_window` key may be deleted until every condition below is independently
+true in the live database and on the live NAS, and the merge itself deletes
+nothing.
 
 1. Build a class roster read-only (below) and pin its SHA-256. The roster SQL
    only GENERATES candidates. Before the owner sees a digest, run the read-only
@@ -493,7 +499,7 @@ retire as `collated`. Receipts carry `owner_delivery_page_<class>`.
    writes nothing:
 
    ```
-   stoaramactl r2-inverse validate --class CLASS --roster FILE \
+   stoaramactl r2-inverse validate --class outside_window --roster FILE \
      --expected-roster-sha256 HEX --picks docs/records/r2-picks-20261118.json \
      --expected-picks-sha256 HEX
    ```
@@ -501,14 +507,15 @@ retire as `collated`. Receipts carry `owner_delivery_page_<class>`.
    It refuses the whole roster on the first candidate the classifier holds, so a
    mixed-source window (any source in the pinned window makes the output
    `in_window`), a keep-everything page or output stream, a KE folder component
-   in the stored path, an identity drift or any other hold cannot be approved as
-   the wrong class. A candidate roster the validator refuses is not approved
+   in the stored path, an identity drift, a page/catalog sha256 mismatch, a
+   best14 key, or an output that overlaps the page stream's own pinned window
+   cannot be approved. A candidate roster the validator refuses is not approved
    again with a widened query: report the difference to Deniz.
 2. Record the owner's approval for the validated digest as its own step, under
-   exactly one class, giving it the roster and picks it should validate:
+   `outside_window`, giving it the roster and picks it should validate:
 
    ```
-   stoaramactl r2-inverse approve --class CLASS --roster FILE \
+   stoaramactl r2-inverse approve --class outside_window --roster FILE \
      --expected-roster-sha256 HEX --picks docs/records/r2-picks-20261118.json \
      --expected-picks-sha256 HEX --decision TEXT
    ```
@@ -518,164 +525,38 @@ retire as `collated`. Receipts carry `owner_delivery_page_<class>`.
    a digest the classifier would reject or a digest without its bytes. Seeding
    never creates an approval.
 3. Seed the class from the pinned roster:
-   `stoaramactl r2-inverse exempt --class CLASS --roster FILE
+   `stoaramactl r2-inverse exempt --class outside_window --roster FILE
    --expected-roster-sha256 HEX --picks docs/records/r2-picks-20261118.json
    --expected-picks-sha256 HEX`. The whole roster is admitted in one
    transaction, or nothing is, and every row references the approval recorded
    above for that class and digest. It re-runs the same decision the validator
    ran, so a roster that changed after validation is refused.
-4. `outside_window` can be seeded and retired now:
+4. **Before any delete**, require BOTH of the following for every key in the
+   batch, independently of the exemption row:
+   - the exact bound roster is the one this deployment approved, re-reading the
+     live page row and the live catalog identity and refusing on any drift; and
+   - the key is positively verified **now** on the NAS: a current, exact
+     custody record for this output (path, inode/device, size and sha256), not a
+     historical hold, not a pending or blocked COPY and not an inferred copy.
+   A key that lacks either fact stays held. Nothing in this branch builds that
+   global collated custody check; it is being built separately, and until it
+   exists `outside_window` deletes do not run.
+5. Confirm **no off-page spill** for the batch: the derived RAW delivery closure
+   must still hold every RAW source of every output in it, and no other page
+   row, incident, reservation, restore, stitch input hold or owner keep prefix
+   may be released by running the batch. Any overlap refuses the whole batch.
+6. Only then run the reviewed collated lane:
    `stoaramactl r2-inverse job-collated ...`.
-5. Handoff (a) and (b): the in-window videos are copied and certified on the
-   NAS and the static CSV+JSON manifest of old links to NAS paths is published.
-6. Handoff (c): arm, record cutover authority, let the derived deadline pass,
-   then retire. The gate is SQL, not this prose.
 
-   a. **Arm.** `stoaramactl r2-inverse page-quiesce --reason TEXT` (once). From
-      this commit every public delivery route refuses a NEW request with 503 and
-      admits no reader, ticket or publication; readers already admitted finish
-      under their lease. No exemption class opens and the page is not retired.
-      This is the point of no return.
+Taking the old public delivery page down is an operator and origin act outside
+this schema, in this order: remove or re-point every legacy hostname, CDN route,
+redirect and custom domain; publish the static CSV+JSON file list mapping each
+old delivery link to its NAS path; then remove the page itself and its R2
+registry. Record each step's timestamp and artifact. No command in this branch
+performs, arms or suppresses any of it, and no exemption class opens because of
+it.
 
-   b. **Record the reviewed cutover authority.**
-      `stoaramactl r2-inverse page-cutover --evidence FILE
-      --expected-evidence-sha256 HEX`. The evidence is the facts the API cannot
-      see. Each is an ARTIFACT with its own digest, and the canonical bytes are
-      pinned by `--expected-evidence-sha256`:
-
-      | Fact | Instant | Artifact digest |
-      | --- | --- | --- |
-      | serving generation | (bound to the live registry row) | — |
-      | last legacy five-minute grant | `legacy_grant_boundary_at` | `legacy_signed_grant_sha256` |
-      | legacy origin removal | `legacy_origin_removed_at` | `legacy_origin_evidence_sha256` |
-      | cache expiry | `cache_expired_at` | `cache_evidence_sha256` |
-      | non-serving rollback routing | — | `rollback_routing_sha256` |
-      | verified transfer end | `transfer_bound_at` | `transfer_evidence_sha256` |
-
-      SQL derives `deadline_at` as the greatest instant plus the five-minute
-      legacy grant window; the command cannot supply it. Constraints refuse one
-      artifact reused for two facts, and refuse the approval digest equalling any
-      evidence digest. Timestamps are canonicalized as RFC3339Nano, so the
-      approval covers the exact instants the row stores (no truncation).
-
-      The authority is bound to the generation the SERVING API observed as the
-      unpinned current pointer. A successful `public/current.json` load writes
-      `r2_delivery_serving_generation` under the shared public lock; a pinned read
-      never writes it, and no import or hold order can move it. The admission
-      trigger requires the authority's generation to equal that observed row, and
-      retirement compares against the one admitted row, so it is one bound fact,
-      not two caller strings agreeing and not whichever hold was imported last.
-
-      What that binding does and does not prove: it proves the serving binary
-      loaded that generation from `public/current.json`. It does not prove the R2
-      object still names it now — the object remains the pointer and a separate
-      writer could replace it — and it cannot be recorded once the page is
-      quiesced, so it cannot be moved after arming.
-
-      **Provenance, stated plainly.** This row records that an operator produced
-      and pinned evidence in the reviewed sequence below. PostgreSQL does not
-      verify production routing or a completed download, and a DBA who can format
-      hex can write any row. An approval digest is not one of the evidence
-      artifacts. The gate is only as strong as that reviewed sequence: if it was
-      not actually performed, the honest state is that `confident_repair` and
-      every derivative release stay closed. Nothing here sends an external
-      request to "verify" production.
-
-      If you cannot produce a transfer artifact — no authoritative byte clock for
-      a direct R2 transfer, an origin cache not shown expired — do not write a
-      plausible number. Stop: without this row retirement is refused, and with it
-      `confident_repair`, `in_window` and every derivative release stay closed.
-      That is the correct outcome when the drain is unproven.
-
-   c. **Wait for the derived deadline.** Query the row, not a wall clock from
-      this document:
-
-      ```sql
-      SELECT clock_timestamp() AS now, deadline_at,
-             count(*) FILTER (WHERE deadline_at > clock_timestamp()) AS not_yet
-      FROM r2_delivery_cutover_authority WHERE singleton;
-      ```
-
-      `not_yet` must be 0 before the next step. The same query shows the tracked
-      capability drain:
-
-      ```sql
-      SELECT clock_timestamp() AS now, count(*) AS live,
-             coalesce(max(expires_at),'-infinity') AS latest_expiry
-      FROM r2_delivery_download_tickets WHERE expires_at > clock_timestamp();
-      ```
-
-      `live` must be 0. Note the explicit limit: a URL a recipient saved before
-      arming cannot be revoked, only drained, and the tracked ledger may be
-      empty while an untracked legacy URL is still live. That is exactly why the
-      authority's `legacy_grant_boundary_at` and `transfer_bound_at` are required
-      independently of the ledger.
-
-   d. **Retire.** `stoaramactl r2-inverse page-retired --generation HEX32
-      --decision TEXT` (once). 0225's trigger refuses it — under the exclusive
-      public lock — unless the quiesce row exists, a cutover authority for THIS
-      generation exists, its `deadline_at` is already past by the database
-      clock, no admitted reader lease is unexpired, no tracked capability is
-      unexpired and no page key has a pending derivative retirement. A
-      hand-written INSERT, an older binary or a second process is refused for the
-      same reasons, so there is no split-brain CLI-only check.
-      `r2_delivery_page_retired()` reads exactly that row, and every public
-      delivery route refuses 410 from then on for the current and every pinned
-      generation. This opens `confident_repair`.
-
-   e. **Confirm.** `SELECT r2_delivery_page_retired(),
-      r2_delivery_public_serving();` must read `t, f`.
-
-7. Seed `confident_repair` and run the collated job. Seed `in_window` once the
-   0224 follow-up certifies the copies; until then it stays held.
-
-#### Lifetime and bounds of the admission
-
-- **Readers.** Each public response holds one `r2_delivery_public_readers` row
-  from just before its first registry read to after its last socket write. The
-  lease expires in 2 minutes — longer than the API's 60s write timeout, so a live
-  slow response never loses it and a crashed one delays retirement by at most 2
-  minutes. The API holds no database connection and no lock while streaming.
-- **Tickets.** Each capability is one `r2_delivery_download_tickets` row, written
-  in the same statement as the capability under the shared public lock. It
-  records only the provider's `expires_at`. It records **no** transfer bound: a
-  bound the server invented would be a guess, and the authoritative end of a
-  started transfer is the cutover authority's `transfer_bound_at`.
-- **The lock and the pool.** `r2_delivery_public_lock()` is one advisory key:
-  shared for reader admission, ticket minting and registry publication, exclusive
-  for arming and the retirement proof. A cold registry load validates its keep
-  snapshot on the SAME transaction that holds the lock — never a second pool
-  acquire — and the registry mutex is held only for pointer reads and the final
-  publish, never across the network read or the fence. So with a two-connection
-  pool, two concurrent cold loads still each need only one connection and a
-  quiesce behind them always finds one free. `TestDeliveryRegistryColdLoadAndQuiesceDoNotDeadlock`
-  is that regression.
-- **Failure bounds.** A reader that cannot prove the page is serving refuses
-  (503). A retirement that cannot prove the cutover and the drains refuses.
-  Nothing is cached: the quiesce, cutover and retirement rows are read live.
-
-#### Remaining provider drain assumptions (stated, not hidden)
-
-- A presigned URL already returned to a recipient is not revocable. The drain
-  relies on the provider refusing it after `expires_at` and on the operator's
-  `transfer_bound_at`, read from the pinned `transfer_evidence_sha256` artifact,
-  covering a transfer that started just before expiry. It assumes the provider
-  honours presign expiry within its documented skew and applies no longer cache
-  to the signed URL. There is no provider byte clock in this system; if an
-  artifact establishing the true end of a direct transfer is unavailable,
-  `transfer_bound_at` cannot be proved and retirement stays closed.
-- An origin removed in step 0 keeps its own caches for as long as that owner
-  configures. Removing the route is necessary; it is not proof that an edge cache
-  has purged. `cache_expired_at` and its evidence digest are the record that the
-  caches are known expired.
-- A legacy origin that keeps serving the OLD static page from its own cache never
-  reaches the API and is outside this mechanism; step 0 plus
-  `legacy_origin_removed_at` and its evidence are the only control for it.
-- `r2_delivery_nas_certified` is still a hardcoded false stub in this branch
-  (#574's follow-up binds it): `in_window` cannot open here, regardless of the
-  cutover authority.
-
-### Read-only roster queries### Read-only roster queries
+### Read-only roster queries
 
 The in-window roster at `records/delivery-inwindow-roster-20261119/` (SHA-256
 `da4a4a7f4c98409ad0927878ad9995327f2a749d717e1e47b276e19cec06e8ca`) is already
@@ -712,6 +593,8 @@ R2. Report the difference to Deniz rather than widening a query.
 see a source closure that straddles the stream's window: it tests the output's
 own interval, while the classifier marks the output `in_window` when ANY source
 overlaps. It also cannot see a KE folder component in the stored path, a page
-stream decided `all`, or any live hold. Every candidate must therefore pass
-`r2-inverse validate` before its digest is approved; a row the validator refuses
-is not a shortfall to widen around, it is a key that stays on the page.
+stream decided `all`, a page/catalog sha256 mismatch, or any live hold, and it
+does not test the PAGE recording stream's own window at all. Every candidate must
+therefore pass `r2-inverse validate` before its digest is approved; a row the
+validator refuses is not a shortfall to widen around, it is a key that stays on
+the page.
