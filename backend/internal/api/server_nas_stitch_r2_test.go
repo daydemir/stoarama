@@ -108,6 +108,65 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
  fire_at,clip_start_at,clip_end_at,display_path) VALUES(30,1,$1,'stoarama','managed/keep-ranking.mp4',100,
  'test-etag',repeat('c',64),$2,$2,$3,'fixture/keep-ranking.mp4')`, provider.URL, bestStart, bestStart.AddDate(0, 0, 14))
 	endpoint := cleanupSHA([]byte(provider.URL))
+
+	t.Run("whole clips stay in their UTC start hour", func(t *testing.T) {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		// Use a non-UTC session and one transaction so the regular handoff
+		// fixture does not see these temporary catalog and hold rows.
+		if _, err := tx.Exec(ctx, "SET LOCAL TIME ZONE 'Asia/Kathmandu'"); err != nil {
+			t.Fatal(err)
+		}
+		for _, clip := range []struct {
+			id      int64
+			startAt time.Time
+			endAt   time.Time
+		}{
+			{991, hour.Add(119 * time.Minute), hour.Add(121 * time.Minute)},
+			{992, hour.Add(121 * time.Minute), hour.Add(122 * time.Minute)},
+			{993, hour.Add(359 * time.Minute), hour.Add(361 * time.Minute)},
+			{994, hour.Add(358 * time.Minute), hour.Add(359 * time.Minute)},
+		} {
+			path := fmt.Sprintf("fixture/utc-%d.mp4", clip.id)
+			if _, err := tx.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,
+ fire_at,clip_start_at,clip_end_at,display_path)
+ VALUES($1,30,1,$2,'stoarama',$3,100,'source-etag',$4,$5,$5,$6,$7)`,
+				clip.id, provider.URL, "managed/"+path, sha, clip.startAt, clip.endAt, path); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at)
+ VALUES(13,$1,30,$2,100,$3,'present',now(),now())`, clip.id, path, sha); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, endpoint); err != nil {
+			t.Fatal(err)
+		}
+		planned, err := PlanDurhamStitchHoldSet(ctx, tx, []int64{1}, "stoarama", provider.URL, 10)
+		if err != nil || len(planned.Hours) != 3 {
+			t.Fatalf("expected ordinary and two crossing-adjacent hours, with the partial scope hour withheld: %+v %v", planned.Hours, err)
+		}
+		for i, clipID := range []int64{991, 992} {
+			group := planned.Hours[i+1]
+			if !group.Hour.Equal(hour.Add(time.Duration(i+1)*time.Hour)) || len(group.Inputs) != 1 || group.Inputs[0].ClipID != clipID {
+				t.Fatalf("clip %d assigned to the wrong UTC hour or repeated: %+v", clipID, group)
+			}
+		}
+		var crossing nasStitchPlan
+		if err := json.Unmarshal(planned.Hours[1].Plan, &crossing); err != nil {
+			t.Fatal(err)
+		}
+		if len(crossing.Clips) != 1 || !crossing.Clips[0].EndAt.Equal(hour.Add(121*time.Minute)) {
+			t.Fatalf("crossing clip lost its original end: %+v", crossing.Clips)
+		}
+		if n, err := ImportDurhamStitchHoldSet(ctx, tx, planned); err != nil || n != 4 {
+			t.Fatalf("expected four exact holds across three complete groups: %d %v", n, err)
+		}
+	})
+
 	exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',$1)`, endpoint)
 	store, err := r2.New(ctx, r2.Config{Bucket: "stoarama", Endpoint: provider.URL,
 		AccessKey: "test", SecretKey: "test", WriterDB: pool})
