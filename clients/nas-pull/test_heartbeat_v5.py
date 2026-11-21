@@ -64,7 +64,8 @@ class HostPressureTests(unittest.TestCase):
                      mock.patch.object(pull, 'nas_pressure_snapshot', return_value={'proc_stat':{'procs_blocked':7}}), mock.patch.object(pull, 'log') as log:
                     pull.r2_copy_worker(None, None, None, stop, 0)
                 self.assertEqual(telemetry.holds, {reason:1})
-                self.assertEqual(stop.wait.call_args_list, [mock.call(0), mock.call(60)])
+                retry = 5 if reason == "copy memory headroom" else 60
+                self.assertEqual(stop.wait.call_args_list, [mock.call(0), mock.call(retry)])
                 self.assertEqual(json.loads(log.call_args.args[1].split(' memory_diagnostics=')[1]), {'proc_stat':{'procs_blocked':7}})
 
 
