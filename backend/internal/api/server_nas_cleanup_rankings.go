@@ -25,13 +25,14 @@ type nasCleanupRankingsFlight struct {
 func (s *Server) cleanupRankings(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, stream int64, dryRun bool) ([]byte, time.Time, error) {
-	started := time.Now().UTC()
 	if !dryRun {
+		started := time.Now().UTC()
 		var raw []byte
 		err := q.QueryRow(ctx, cleanupCurrentRankingsSQL, stream).Scan(&raw)
 		return raw, started, err
 	}
 	s.nasCleanupMu.Lock()
+	started := time.Now().UTC()
 	entry, ok := s.nasCleanupRankingCache[stream]
 	age := started.Sub(entry.At)
 	if ok && age >= 0 && age < cleanupDryRunRankingTTL {
