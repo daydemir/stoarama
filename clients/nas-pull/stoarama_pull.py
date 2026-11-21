@@ -54025,7 +54025,8 @@ def r2_copy_range(cfg, task, offset, length, guard, fd, digest):
 
 
 def r2_copy_sidecar(parent, name, clip, guard):
-    payload = (json.dumps(stitch_provenance(clip), sort_keys=True, separators=(",", ":")) + "\n").encode()
+    provenance = stitch_provenance(clip)
+    payload = (json.dumps(provenance, sort_keys=True, separators=(",", ":")) + "\n").encode()
     sidecar = name + ".stoarama.json"
     try:
         fd = os.open(sidecar, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
@@ -54051,8 +54052,22 @@ def r2_copy_sidecar(parent, name, clip, guard):
         os.fsync(parent)
     else:
         try:
-            if not stat_module.S_ISREG(os.fstat(fd).st_mode) or os.read(fd, len(payload) + 1) != payload:
+            # The PostgreSQL and account-feed encodings spell the same UTC
+            # timestamps differently. Compare whole payloads and attest the
+            # bytes already on disk, including for legacy COPY sidecars.
+            for field in ("clip_start_at", "clip_end_at"):
+                stamp = provenance[field]
+                if isinstance(stamp, str) and stamp.endswith("Z"):
+                    provenance[field] = stamp[:-1] + "+00:00"
+                elif isinstance(stamp, str) and stamp.endswith("+00:00"):
+                    provenance[field] = stamp[:-6] + "Z"
+            alternate = (json.dumps(provenance, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            if not stat_module.S_ISREG(os.fstat(fd).st_mode):
                 raise R2CopyBlocked(R2CopyBlockReason.SIDECAR)
+            actual = os.read(fd, max(len(payload), len(alternate)) + 1)
+            if actual not in (payload, alternate):
+                raise R2CopyBlocked(R2CopyBlockReason.SIDECAR)
+            payload = actual
         finally:
             os.close(fd)
     r2_copy_remove_private(parent, ".%s.r2-copy-sidecar-%d.part" % (name, clip["clip_id"]), sidecar, guard)
