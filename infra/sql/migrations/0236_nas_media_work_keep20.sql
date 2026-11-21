@@ -177,6 +177,9 @@ $$;
 
 CREATE FUNCTION nas_media_keep20_activate_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION 'NAS media activation requires READ COMMITTED' USING ERRCODE='55000';
+ END IF;
  PERFORM pg_advisory_xact_lock(7343226011110); -- stitch lease fence
  PERFORM pg_advisory_xact_lock(7343226011192); -- copy lease fence, before cleanup
  PERFORM pg_advisory_xact_lock(7343226011101); -- cleanup public fence
@@ -219,6 +222,11 @@ BEGIN
      AND NOT nas_media_keep20_scope(stream_id,start_at,end_at)) THEN
   RAISE EXCEPTION 'NAS 20-day switch requires drained work and in-scope pending rows';
  END IF;
+ -- Legacy handoff validates under REPEATABLE READ. Touch the exact row it
+ -- updates so a snapshot predating the epoch cannot enable it after commit.
+ UPDATE connections SET delivery_nas_handoff_enabled=false
+  WHERE id=13 AND NOT delivery_nas_handoff_enabled;
+ IF NOT FOUND THEN RAISE EXCEPTION 'legacy NAS handoff is active'; END IF;
  NEW.activated_at := clock_timestamp();
  RETURN NEW;
 END $$;
@@ -243,6 +251,9 @@ CREATE TRIGGER nas_media_keep20_legacy_handoff BEFORE UPDATE OF delivery_nas_han
 CREATE FUNCTION nas_media_keep20_guard_copy() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
  IF NEW.connection_id=13 AND NEW.state IN ('pending','leased','refresh_pending','refresh_leased') THEN
+  IF current_setting('transaction_isolation')<>'read committed' THEN
+   RAISE EXCEPTION 'NAS copy admission requires READ COMMITTED' USING ERRCODE='55000';
+  END IF;
   IF NOT pg_try_advisory_xact_lock_shared(7343226011192) THEN
    RAISE EXCEPTION 'NAS copy work window busy' USING ERRCODE='55P03';
   END IF;
@@ -258,6 +269,9 @@ CREATE TRIGGER nas_media_keep20_copy BEFORE INSERT OR UPDATE OF state,item ON na
 CREATE FUNCTION nas_media_keep20_guard_scope() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
  IF NOT NEW.paused THEN
+  IF current_setting('transaction_isolation')<>'read committed' THEN
+   RAISE EXCEPTION 'NAS stitch scope admission requires READ COMMITTED' USING ERRCODE='55000';
+  END IF;
   IF NOT pg_try_advisory_xact_lock_shared(7343226011110) THEN
    RAISE EXCEPTION 'NAS stitch work window busy' USING ERRCODE='55P03';
   END IF;
@@ -274,6 +288,9 @@ CREATE TRIGGER nas_media_keep20_stitch_scope BEFORE INSERT OR UPDATE ON nas_stit
 CREATE FUNCTION nas_media_keep20_guard_stitch_plan() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
  IF NEW.state IN ('pending','leased') THEN
+  IF current_setting('transaction_isolation')<>'read committed' THEN
+   RAISE EXCEPTION 'NAS stitch plan admission requires READ COMMITTED' USING ERRCODE='55000';
+  END IF;
   IF NOT pg_try_advisory_xact_lock_shared(7343226011110) THEN
    RAISE EXCEPTION 'NAS stitch work window busy' USING ERRCODE='55P03';
   END IF;

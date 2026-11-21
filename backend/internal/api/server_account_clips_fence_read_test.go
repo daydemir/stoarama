@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -160,8 +162,20 @@ CREATE TABLE nas_stitch_scopes(id bigint GENERATED ALWAYS AS IDENTITY,stream_id 
 	if _, err = pool.Exec(ctx, `DELETE FROM nas_stitch_r2_stage_objects`); err != nil {
 		t.Fatal(err)
 	}
+	legacyHandoff, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacyHandoff.Rollback(ctx)
+	if _, err = legacyHandoff.Exec(ctx, `SELECT id FROM connections WHERE id=13`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = pool.Exec(ctx, activate); err != nil {
 		t.Fatal(err)
+	}
+	var conflict *pgconn.PgError
+	if _, err = legacyHandoff.Exec(ctx, `UPDATE connections SET delivery_nas_handoff_enabled=true WHERE id=13`); !errors.As(err, &conflict) || conflict.Code != "40001" {
+		t.Fatalf("stale legacy handoff was not rejected by serialization: %v", err)
 	}
 	if _, err = pool.Exec(ctx, `UPDATE connections SET delivery_nas_handoff_enabled=true WHERE id=13`); err == nil {
 		t.Fatal("legacy handoff re-enabled after activation")
