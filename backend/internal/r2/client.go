@@ -54,6 +54,7 @@ type Config struct {
 	Region        string
 	Bucket        string
 	Endpoint      string
+	UserAgent     string
 }
 
 type ObjectHead struct {
@@ -84,6 +85,9 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		cfg.Region = "auto"
 	}
 	httpClient := newHTTPSRedirectClient()
+	if cfg.UserAgent != "" {
+		httpClient.Transport = userAgentTransport{transport: httpClient.Transport, agent: cfg.UserAgent}
+	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(
 		ctx,
 		awsconfig.WithRegion(cfg.Region),
@@ -107,6 +111,17 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		presigner:       s3.NewPresignClient(client),
 		deleteTransport: httpClient.Transport,
 	}, nil
+}
+
+type userAgentTransport struct {
+	transport http.RoundTripper
+	agent     string
+}
+
+func (t userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	request := req.Clone(req.Context())
+	request.Header.Set("User-Agent", t.agent)
+	return t.transport.RoundTrip(request)
 }
 
 func newHTTPSRedirectClient() *http.Client {
