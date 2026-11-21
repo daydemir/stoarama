@@ -42,6 +42,7 @@ type summary struct {
 	Bucket         string                      `json:"bucket"`
 	Inputs         map[string]string           `json:"inputs_sha256"`
 	RecentFrom     string                      `json:"recent_from"`
+	Release        string                      `json:"release"`
 	Listed         tally                       `json:"listed"`
 	Delete         tally                       `json:"delete"`
 	Protected      tally                       `json:"protected"`
@@ -67,7 +68,7 @@ func runPlan(args []string) error {
 	if err := os.Mkdir(*out, 0o700); err != nil {
 		return err
 	}
-	sum := summary{Bucket: r.Bucket, RecentFrom: files.recentFrom, ByClass: map[class]*tally{}, ByReason: map[class]map[string]*tally{}}
+	sum := summary{Bucket: r.Bucket, RecentFrom: files.recentFrom, Release: files.release, ByClass: map[class]*tally{}, ByReason: map[class]map[string]*tally{}}
 	if sum.Inputs, err = files.digests(); err != nil {
 		return err
 	}

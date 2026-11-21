@@ -313,3 +313,55 @@ func TestListPlanDeleteAgainstFakeS3(t *testing.T) {
 		t.Error("outside-window RAW key survived")
 	}
 }
+
+func TestReleaseWindowOnLiveEvidence(t *testing.T) {
+	files, _ := fixture(t)
+	dir := t.TempDir()
+	out := w0 - 30*day
+	files.derived = writeFile(t, dir, "derived.tsv", strings.Join([]string{
+		fmt.Sprintf("dup\tjoined/best14-20261021/dup.mp4\t10\t0\t0\t50\tf\t0\t\tpage_dup"),
+		fmt.Sprintf("dup\tjoined/best14-20261021/kedup.mp4\t20\t0\t0\t51\tf\t0\t\tpage_dup"),
+		fmt.Sprintf("col\tjoined/best14-20261021/old.mp4\t10\t%d\t%d\t52\tf\t0\t\tbest14", out, out+60),
+	}, "\n")+"\n")
+	ev := func(key string, match bool, verified, nasMTime int64) string {
+		return fmt.Sprintf("raw\t%s\t%s\t%d\t%d\t0", key, map[bool]string{true: "t", false: "f"}[match], verified, nasMTime)
+	}
+	files.nasEvidence = writeFile(t, dir, "evidence.tsv", strings.Join([]string{
+		ev("managed/acct-47/a_folder/innas.mp4", true, w0+2*day, w0+day), // fresh, stitched: delete
+		ev("managed/acct-47/a_folder/in.mp4", true, w0+2*day, w0+3*day),  // NAS file changed after verify
+		ev("managed/acct-47/a_folder/edge2.mp4", true, w0+2*day, 0),      // fresh but never stitched
+	}, "\n")+"\n")
+	if _, err := files.load(); err == nil {
+		t.Fatal("evidence without --release nas_keep_20 must refuse")
+	}
+	files.release = "nas_keep_20,unresolved_best14_delivery_identity"
+	f, _ := os.OpenFile(files.identities, os.O_APPEND|os.O_WRONLY, 0)
+	fmt.Fprintf(f, "raw\tmanaged/acct-47/a_folder/edge2.mp4\t10\t%d\t%d\t110\tt\t0\ta_folder\t1\n", w0+day, w0+day+60)
+	f.Close()
+	c, _ := os.OpenFile(files.closure, os.O_APPEND|os.O_WRONLY, 0)
+	c.WriteString("window_output_input\tmanaged/acct-47/a_folder/innas.mp4\n")
+	c.Close()
+	r, err := files.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]class{
+		"managed/acct-47/a_folder/innas.mp4": deleteWindowOnNAS,
+		"managed/acct-47/a_folder/in.mp4":    protectWindowStale,
+		"managed/acct-47/a_folder/edge2.mp4": protectWindowUnjoined,
+		"joined/best14-20261021/dup.mp4":     deleteDuplicateOfPageLink,
+		"joined/best14-20261021/kedup.mp4":   protectKeepEverything,
+		"joined/best14-20261021/old.mp4":     deleteCollatedOutsideWindow,
+		"joined/best14-20261021/z.mp4":       protectUnclassified, // released prefix, still no identity
+	} {
+		size := map[string]int64{"managed/acct-47/a_folder/innas.mp4": 102, "managed/acct-47/a_folder/in.mp4": 101,
+			"managed/acct-47/a_folder/edge2.mp4": 110, "joined/best14-20261021/dup.mp4": 50, "joined/best14-20261021/kedup.mp4": 51,
+			"joined/best14-20261021/old.mp4": 52, "joined/best14-20261021/z.mp4": 300}[key]
+		if got, reason := r.decide(object{Key: key, Size: size, MTime: w0}); got != want {
+			t.Errorf("%s: got %s (%s), want %s", key, got, reason, want)
+		}
+	}
+	if got, _ := r.decide(object{Key: "managed/acct-47/a_folder/innas.mp4", Size: 102, MTime: w0 + 3*day}); got != protectWindowStale {
+		t.Errorf("R2 object changed after verify: got %s", got)
+	}
+}

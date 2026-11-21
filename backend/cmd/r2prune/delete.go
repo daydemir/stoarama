@@ -70,6 +70,7 @@ type runHeader struct {
 	ManifestSHA256 string            `json:"manifest_sha256"`
 	Inputs         map[string]string `json:"inputs_sha256"`
 	RecentFrom     string            `json:"recent_from"`
+	Release        string            `json:"release"`
 	Limit          int               `json:"limit"`
 	StartedAt      string            `json:"started_at"`
 }
@@ -99,12 +100,24 @@ func verifyReviewedInputs(manifest, summaryPath, expected string, files ruleFile
 	if run.Inputs, err = files.digests(); err != nil {
 		return run, err
 	}
-	for name, got := range run.Inputs {
-		if got != sum.Inputs[name] {
-			return run, fmt.Errorf("%s SHA-256 %s is not the reviewed %s", name, got, sum.Inputs[name])
+	if files.release != sum.Release {
+		return run, fmt.Errorf("--release %q is not the plan's %q", files.release, sum.Release)
+	}
+	reviewed := map[string]string{}
+	for name, digest := range sum.Inputs {
+		if name != "snapshot" {
+			reviewed[name] = digest
 		}
 	}
-	run.RecentFrom = sum.RecentFrom
+	if len(run.Inputs) != len(reviewed) {
+		return run, fmt.Errorf("rule inputs %v are not the reviewed set %v", sortedKeysOf(run.Inputs), sortedKeysOf(reviewed))
+	}
+	for name, got := range run.Inputs {
+		if got != reviewed[name] {
+			return run, fmt.Errorf("%s SHA-256 %s is not the reviewed %s", name, got, reviewed[name])
+		}
+	}
+	run.RecentFrom, run.Release = sum.RecentFrom, sum.Release
 	return run, nil
 }
 
@@ -218,4 +231,12 @@ func deleteBatchOnce(ctx context.Context, st store, rows []manifestRow, record f
 		result = append(result, ledgerRow{Key: k, Size: size, Outcome: outcomeFailed, Detail: "absent from DeleteObjects response"})
 	}
 	return record(result)
+}
+
+func sortedKeysOf(m map[string]string) []string {
+	keys := map[string]bool{}
+	for k := range m {
+		keys[k] = true
+	}
+	return sortedKeys(keys)
 }

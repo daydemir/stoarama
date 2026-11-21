@@ -7,37 +7,64 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// class is the one decision recorded for a key. Only the two delete classes
-// ever enter a delete manifest.
+// class is the one decision recorded for a key. Only delete classes ever
+// enter a delete manifest.
 type class string
 
 const (
 	deleteRawOutsideWindow      class = "delete_raw_outside_window"
 	deleteCollatedOutsideWindow class = "delete_collated_outside_window"
+	deleteWindowOnNAS           class = "delete_window_20d_on_nas"
+	deleteDuplicateOfPageLink   class = "delete_duplicate_of_page_link"
 
 	protectKeepEverything class = "protect_keep_everything"
 	protectLiveSite       class = "protect_live_site"
 	protectWindowOnNAS    class = "protect_window_20d_on_nas"
 	protectWindowNotOnNAS class = "protect_window_20d_not_on_nas"
+	protectWindowStale    class = "protect_window_20d_nas_evidence_stale"
+	protectWindowUnjoined class = "protect_window_20d_not_yet_stitched"
 	protectStitchClosure  class = "protect_window_stitch_closure"
 	protectNASPipeline    class = "protect_nas_pipeline"
 	protectRecentWrite    class = "protect_recent_write"
 	protectUnclassified   class = "protect_unclassified"
 )
 
-func (c class) deletes() bool { return c == deleteRawOutsideWindow || c == deleteCollatedOutsideWindow }
+func (c class) deletes() bool {
+	switch c {
+	case deleteRawOutsideWindow, deleteCollatedOutsideWindow, deleteWindowOnNAS, deleteDuplicateOfPageLink:
+		return true
+	}
+	return false
+}
 
 type kind string
 
 const (
 	kindRaw      kind = "raw"
 	kindCollated kind = "col"
+	// kindDuplicate names a key whose bytes equal a live page key's (same
+	// SHA-256 and size); Stream is the page row's, for the keep-everything check.
+	kindDuplicate kind = "dup"
 )
+
+// releasable are the controller protections a later pass may lift, each only
+// by name. nas_keep_20 is the controller's whole-window hold; lifting it
+// requires live NAS evidence, so a window key goes only on fresh exact custody.
+var releasable = map[string]bool{"nas_keep_20": true, "unresolved_best14_delivery_identity": true,
+	"delivery_repairs_and_unresolved_stitch_provenance": true}
+
+// evidence is the live NAS custody of one key: exact SHA-256/size match, when
+// it was verified and when the NAS file last changed (0 when not reported).
+type evidence struct {
+	Match              bool
+	Verified, NASMTime int64
+}
 
 // identity is one catalog row naming a key: a RAW clip or a collated output.
 type identity struct {
@@ -74,11 +101,13 @@ type rules struct {
 	Closure    map[string]bool
 	Identities map[string][]identity
 	RecentFrom int64 // objects modified at or after this instant are protected
+	Released   map[string]bool
+	Evidence   map[string]evidence // nil unless nas_keep_20 is released
 }
 
 type ruleFiles struct {
 	identities, dbProtect, closure, controller, picks string
-	recentFrom                                        string
+	derived, nasEvidence, release, recentFrom         string
 }
 
 func (f *ruleFiles) register(fs *flag.FlagSet) {
@@ -88,13 +117,28 @@ func (f *ruleFiles) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.controller, "controller-protect", "", "controller protect-for-nas-20day.jsonl")
 	fs.StringVar(&f.picks, "picks", "", "owner r2-picks.json")
 	fs.StringVar(&f.recentFrom, "recent-from", "", "RFC3339: objects modified at or after this stay")
+	fs.StringVar(&f.derived, "derived-identities", "", "optional identities derived for keys with no catalog row")
+	fs.StringVar(&f.nasEvidence, "nas-evidence", "", "live NAS custody TSV for window keys; required with --release nas_keep_20")
+	fs.StringVar(&f.release, "release", "", "comma-separated controller protections to lift: "+strings.Join(sortedKeys(releasable), ","))
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // digests are the SHA-256 of every rule file, keyed as summary.json records them.
 func (f ruleFiles) digests() (map[string]string, error) {
 	out := map[string]string{}
 	for name, p := range map[string]string{"identities": f.identities, "db_protect": f.dbProtect, "closure": f.closure,
-		"controller_protect": f.controller, "picks": f.picks} {
+		"controller_protect": f.controller, "picks": f.picks, "derived_identities": f.derived, "nas_evidence": f.nasEvidence} {
+		if p == "" {
+			continue
+		}
 		sum, err := fileSHA256(p)
 		if err != nil {
 			return nil, err
@@ -115,7 +159,25 @@ func (f ruleFiles) load() (*rules, error) {
 		return nil, fmt.Errorf("--recent-from: %w", err)
 	}
 	r := &rules{Windows: map[int64]window{}, KE: map[int64]bool{}, KEFolders: map[string]bool{}, Keys: map[string]keyRule{},
-		Closure: map[string]bool{}, Identities: map[string][]identity{}, RecentFrom: recent.Unix()}
+		Closure: map[string]bool{}, Identities: map[string][]identity{}, RecentFrom: recent.Unix(), Released: map[string]bool{}}
+	for _, name := range strings.Split(f.release, ",") {
+		if name == "" {
+			continue
+		}
+		if !releasable[name] {
+			return nil, fmt.Errorf("--release %q is not a releasable controller protection", name)
+		}
+		r.Released[name] = true
+	}
+	if r.Released["nas_keep_20"] != (f.nasEvidence != "") {
+		return nil, errors.New("--release nas_keep_20 and --nas-evidence go together")
+	}
+	if f.nasEvidence != "" {
+		r.Evidence = map[string]evidence{}
+		if err := r.loadEvidence(f.nasEvidence); err != nil {
+			return nil, err
+		}
+	}
 	if err := r.loadController(f.controller); err != nil {
 		return nil, err
 	}
@@ -128,7 +190,7 @@ func (f ruleFiles) load() (*rules, error) {
 	if err := eachTSV(f.closure, 2, func(c []string) error { r.Closure[c[1]] = true; return nil }); err != nil {
 		return nil, err
 	}
-	if err := r.loadIdentities(f.identities); err != nil {
+	if err := r.loadIdentities(f.identities, f.derived); err != nil {
 		return nil, err
 	}
 	if len(r.Windows) == 0 || len(r.KE) == 0 || len(r.Identities) == 0 {
@@ -201,6 +263,9 @@ func (r *rules) loadController(path string) error {
 			if err != nil {
 				return err
 			}
+			if len(row.Reasons) == 1 && r.Released[row.Reasons[0]] {
+				return nil
+			}
 			if row.Type == "key" {
 				r.Keys[row.Key] = keyRule{c, "controller:" + row.Reasons[0]}
 			} else {
@@ -262,11 +327,56 @@ func (r *rules) loadDBProtect(path string) error {
 	})
 }
 
-func (r *rules) loadIdentities(path string) error {
-	err := eachTSV(path, 10, func(c []string) error {
+func (r *rules) loadEvidence(path string) error {
+	return eachTSV(path, 6, func(c []string) error {
+		var e evidence
+		switch c[2] {
+		case "t":
+			e.Match = true
+		case "f":
+		default:
+			return fmt.Errorf("bad evidence flag %q", c[2])
+		}
+		var err error
+		if e.Verified, err = strconv.ParseInt(c[3], 10, 64); err != nil {
+			return err
+		}
+		if e.NASMTime, err = strconv.ParseInt(c[4], 10, 64); err != nil {
+			return err
+		}
+		if prior, seen := r.Evidence[c[1]]; seen { // every row for a key must hold
+			e.Match = e.Match && prior.Match
+			e.Verified, e.NASMTime = min(e.Verified, prior.Verified), max(e.NASMTime, prior.NASMTime)
+		}
+		r.Evidence[c[1]] = e
+		return nil
+	})
+}
+
+func (r *rules) loadIdentities(paths ...string) error {
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if err := r.loadIdentityFile(path); err != nil {
+			return err
+		}
+	}
+	for _, ids := range r.Identities {
+		for _, id := range ids {
+			if r.KE[id.Stream] && id.Folder != "" && id.Folder != genericFolder {
+				r.KEFolders[id.Folder] = true
+			}
+		}
+	}
+	return nil
+}
+
+func (r *rules) loadIdentityFile(path string) error {
+	return eachTSV(path, 10, func(c []string) error {
 		var id identity
 		switch kind(c[0]) {
-		case kindRaw, kindCollated:
+		case kindRaw, kindCollated, kindDuplicate:
 			id.Kind = kind(c[0])
 		default:
 			return fmt.Errorf("unknown identity kind %q", c[0])
@@ -294,17 +404,6 @@ func (r *rules) loadIdentities(path string) error {
 		r.Identities[c[1]] = append(r.Identities[c[1]], id)
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	for _, ids := range r.Identities {
-		for _, id := range ids {
-			if r.KE[id.Stream] && id.Folder != "" && id.Folder != genericFolder {
-				r.KEFolders[id.Folder] = true
-			}
-		}
-	}
-	return nil
 }
 
 // decide classifies one listed object. The order fixes the reported reason;
@@ -333,10 +432,24 @@ func (r *rules) decide(o object) (class, string) {
 	if len(ids) == 0 {
 		return protectUnclassified, "no_catalog_identity:" + topPrefix(o.Key)
 	}
+	if ids[0].Kind == kindDuplicate {
+		for _, id := range ids {
+			if id.Kind != kindDuplicate || id.Size != o.Size {
+				return protectUnclassified, "duplicate_identity_mismatch"
+			}
+		}
+		if k, ok := r.Keys[o.Key]; ok {
+			return k.Class, k.Reason
+		}
+		if o.MTime >= r.RecentFrom {
+			return protectRecentWrite, string(kindDuplicate)
+		}
+		return deleteDuplicateOfPageLink, "same_sha256_and_size_as_page_key:" + topPrefix(o.Key)
+	}
 	inWindow, allOnNAS := false, true
 	for _, id := range ids {
 		if id.Kind != ids[0].Kind {
-			return protectUnclassified, "mixed_raw_and_collated_identity"
+			return protectUnclassified, "mixed_identity_kinds"
 		}
 		w, ok := r.Windows[id.Stream]
 		if !ok {
@@ -352,6 +465,9 @@ func (r *rules) decide(o object) (class, string) {
 			inWindow = true
 			allOnNAS = allOnNAS && id.OnNAS
 		}
+	}
+	if inWindow && r.Evidence != nil {
+		return r.decideWindowOnEvidence(o, ids[0].Kind, allOnNAS)
 	}
 	if inWindow && allOnNAS {
 		return protectWindowOnNAS, string(ids[0].Kind)
@@ -369,9 +485,36 @@ func (r *rules) decide(o object) (class, string) {
 		return protectRecentWrite, string(ids[0].Kind)
 	}
 	if ids[0].Kind == kindRaw {
-		return deleteRawOutsideWindow, "outside_20d_window"
+		return deleteRawOutsideWindow, "outside_20d_window:" + topPrefix(o.Key)
 	}
-	return deleteCollatedOutsideWindow, "outside_20d_window"
+	return deleteCollatedOutsideWindow, "outside_20d_window:" + topPrefix(o.Key)
+}
+
+// decideWindowOnEvidence judges a 20-day key once the controller's window
+// hold is lifted: it goes only on live exact NAS custody verified after both
+// the NAS file and the R2 object last changed, and a RAW clip only once it is
+// already a source of a stitched output (otherwise it may still need stitching).
+func (r *rules) decideWindowOnEvidence(o object, k kind, catalogOnNAS bool) (class, string) {
+	e, ok := r.Evidence[o.Key]
+	switch {
+	case (!ok || !e.Match) && catalogOnNAS:
+		return protectWindowStale, "nas_evidence_missing"
+	case !ok || !e.Match:
+		return protectWindowNotOnNAS, string(k)
+	case e.Verified < e.NASMTime:
+		return protectWindowStale, "nas_file_changed_after_verify"
+	case e.Verified < o.MTime:
+		return protectWindowStale, "r2_object_changed_after_verify"
+	case k == kindRaw && !r.Closure[o.Key]:
+		return protectWindowUnjoined, string(k)
+	}
+	if rule, ok := r.Keys[o.Key]; ok {
+		return rule.Class, rule.Reason
+	}
+	if o.MTime >= r.RecentFrom {
+		return protectRecentWrite, string(k)
+	}
+	return deleteWindowOnNAS, string(k) + ":" + topPrefix(o.Key)
 }
 
 const genericFolder = "recordings"
