@@ -114,6 +114,29 @@ func TestKeep28SelectedCustodyConsumesExactMatch(t *testing.T) {
 	if _, err = tx.Exec(f.ctx, `SELECT lock_r2_keep28_selected_source(9000001)`); err != nil {
 		t.Fatal(err)
 	}
+	var lockCount int
+	if err = tx.QueryRow(f.ctx, `SELECT count(*) FROM generate_series(1,10000) AS source(id)
+ WHERE try_lock_r2_keep28_selected_source(source.id)`).Scan(&lockCount); err != nil || lockCount != 10000 {
+		t.Fatalf("exercise locks for 10000 sources: %d %v", lockCount, err)
+	}
+	if err = tx.QueryRow(f.ctx, `SELECT count(*) FROM pg_locks
+ WHERE pid=pg_backend_pid() AND locktype='advisory' AND classid=7343226`).Scan(&lockCount); err != nil || lockCount != 64 {
+		t.Fatalf("source lock footprint exceeded its bound: %d %v", lockCount, err)
+	}
+	reader, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Rollback(f.ctx)
+	a := &inverseApplier{store: f.sdk, opts: inverseApplyOptions{SelectedPlan: keep28SelectedPlan{ID: 21, SHA: digest}}}
+	_, err = a.lockSelectedKeep28Custody(f.ctx, reader, inverseRawTarget{ID: 9000001}, f.key)
+	var busy inverseBusy
+	if !errors.As(err, &busy) {
+		t.Fatalf("selected proof contention must retry through ordinary admission: %v", err)
+	}
+	if err = reader.Rollback(f.ctx); err != nil {
+		t.Fatal(err)
+	}
 	for _, query := range []string{
 		`UPDATE nas_inventory_files SET state='missing' WHERE connection_id=13 AND clip_id=9000001`,
 		`UPDATE nas_selected_verify_items SET state='conflict' WHERE id=37`,
@@ -125,6 +148,32 @@ func TestKeep28SelectedCustodyConsumesExactMatch(t *testing.T) {
 		}
 	}
 	if err = tx.Rollback(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	observation, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observation.Rollback(f.ctx)
+	if _, err = observation.Exec(f.ctx, `UPDATE nas_inventory_files SET state='missing',
+ server_received_at=now()-interval '1 hour',client_updated_at=now()-interval '1 hour'
+ WHERE connection_id=13 AND clip_id=9000001`); err != nil {
+		t.Fatal(err)
+	}
+	var eligible bool
+	if err = observation.QueryRow(f.ctx, `SELECT EXISTS(SELECT 1 FROM r2_keep28_selected_custody WHERE verify_item_id=37)`).Scan(&eligible); err != nil || eligible {
+		t.Fatalf("late contradictory inventory publication left custody eligible: %t %v", eligible, err)
+	}
+	if _, err = observation.Exec(f.ctx, `UPDATE nas_selected_verify_items SET state='leased',completed_at=NULL,
+ lease_expires_at=now()+interval '1 minute' WHERE id=37`); err != nil {
+		t.Fatal(err)
+	}
+	var stamped bool
+	if err = observation.QueryRow(f.ctx, `UPDATE nas_selected_verify_items SET state='match',lease_expires_at=NULL,
+ completed_at=now()-interval '1 hour' WHERE id=37 RETURNING completed_at>=transaction_timestamp()`).Scan(&stamped); err != nil || !stamped {
+		t.Fatalf("selected verification did not stamp the accepted result: %t %v", stamped, err)
+	}
+	if err = observation.Rollback(f.ctx); err != nil {
 		t.Fatal(err)
 	}
 	manifest, err := json.Marshal(inverseEntry{ObjectInfo: f.store.objects[f.key], Class: inverseHeld, Reason: "live_hold"})

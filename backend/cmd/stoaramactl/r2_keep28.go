@@ -92,8 +92,12 @@ func (a *inverseApplier) lockSelectedKeep28Custody(ctx context.Context, tx pgx.T
 		ConnectionID: 13, SourceID: t.ID, SizeBytes: t.Size, Path: t.Path, SHA: t.SHA, State: "present",
 		VerifyPlanID: p.ID, VerifyPlanSHA: p.SHA,
 	}
-	if _, err := tx.Exec(ctx, `SELECT lock_r2_keep28_selected_source($1)`, t.ID); err != nil {
+	var locked bool
+	if err := tx.QueryRow(ctx, `SELECT try_lock_r2_keep28_selected_source($1)`, t.ID).Scan(&locked); err != nil {
 		return c, err
+	}
+	if !locked {
+		return c, inverseBusy{}
 	}
 	var fresh bool
 	err := tx.QueryRow(ctx, `SELECT v.verify_item_id,v.completed_at,v.completed_at+interval '24 hours',

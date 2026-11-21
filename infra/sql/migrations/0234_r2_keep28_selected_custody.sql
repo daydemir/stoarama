@@ -1,24 +1,34 @@
 -- A selected verifier hashes an exact NAS file in place. Bind its authenticated
 -- result to the catalog when the B2 executor consumes it. Historical COPY block
 -- rows remain immutable.
+-- An inventory completion can touch many rows in one transaction. Use a
+-- bounded set of locks so the scan cannot exhaust PostgreSQL's lock table.
+CREATE FUNCTION try_lock_r2_keep28_selected_source(p_source bigint)
+RETURNS boolean LANGUAGE sql VOLATILE AS $$
+ SELECT pg_try_advisory_xact_lock(7343226,hashint8(p_source) & 63)
+$$;
+
 CREATE FUNCTION lock_r2_keep28_selected_source(p_source bigint)
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
- IF NOT pg_try_advisory_xact_lock(hashtextextended(p_source::text,7343226011234)) THEN
+ IF NOT try_lock_r2_keep28_selected_source(p_source) THEN
   RAISE EXCEPTION 'selected NAS custody source busy' USING ERRCODE='55P03';
  END IF;
 END $$;
 
 -- A new NAS observation can invalidate the retained result. Both publishers
--- and the wire reader take the exact source lock. A publisher never waits
--- while it owns a row lock; it can retry after the wire transaction ends.
+-- and the wire reader take the same lock for a source. A publisher never
+-- waits while it owns a row lock. Stamp observations after taking that lock
+-- so a transaction that started earlier cannot conceal a later publication.
 CREATE FUNCTION fence_r2_keep28_inventory_observation() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
- IF TG_OP<>'INSERT' AND OLD.connection_id=13 THEN
+ IF TG_OP<>'INSERT' AND OLD.connection_id=13
+ AND (TG_OP='DELETE' OR (OLD.connection_id,OLD.clip_id) IS DISTINCT FROM (NEW.connection_id,NEW.clip_id)) THEN
   PERFORM lock_r2_keep28_selected_source(OLD.clip_id);
  END IF;
  IF TG_OP<>'DELETE' AND NEW.connection_id=13 THEN
   PERFORM lock_r2_keep28_selected_source(NEW.clip_id);
+  NEW.server_received_at=clock_timestamp();
  END IF;
  IF TG_OP='DELETE' THEN RETURN OLD; END IF;
  RETURN NEW;
@@ -32,12 +42,18 @@ BEGIN
  IF NEW.kind='raw' AND NEW.state IN ('match','missing','conflict','unverified')
  AND EXISTS(SELECT 1 FROM nas_selected_verify_plans p WHERE p.id=NEW.plan_id AND p.account_id=47 AND p.connection_id=13) THEN
   PERFORM lock_r2_keep28_selected_source(NEW.source_id);
+  IF TG_OP='UPDATE' AND OLD.state='leased' THEN
+   NEW.completed_at=clock_timestamp();
+  END IF;
  END IF;
  RETURN NEW;
 END $$;
 
 CREATE TRIGGER r2_keep28_selected_observation_fence BEFORE INSERT OR UPDATE ON nas_selected_verify_items
  FOR EACH ROW EXECUTE FUNCTION fence_r2_keep28_selected_observation();
+
+CREATE INDEX r2_keep28_selected_observations_by_source
+ ON nas_selected_verify_items(source_id,completed_at) WHERE kind='raw' AND completed_at IS NOT NULL;
 
 CREATE VIEW r2_keep28_selected_custody AS
  SELECT i.id AS verify_item_id,p.id AS verify_plan_id,p.plan_sha256,
