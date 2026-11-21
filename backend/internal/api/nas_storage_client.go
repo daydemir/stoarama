@@ -12,10 +12,10 @@ const NASStorageBudgetClientVersion = "r2-copy-v5"
 const NASStorageBudgetMaxAge time.Duration = 180 * time.Second
 
 // SupportsNASStorageBudget is shared with every finish-controller admission
-// gate. Both immutable releases bind the exact same sample/nonce contract.
+// gate. Each immutable release binds the same sample/nonce contract.
 func SupportsNASStorageBudget(version string) bool {
 	switch version {
-	case NASStorageBudgetClientVersion, NASR2CopyPagedClientVersion, nasCleanupCertifiedStitchVersion:
+	case NASStorageBudgetClientVersion, NASR2CopyPagedClientVersion, nasCleanupCertifiedStitchVersion, nasLowMemoryCopyClientVersion:
 		return true
 	default:
 		return false

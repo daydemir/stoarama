@@ -305,7 +305,7 @@ type nasR2CopyTask struct {
 
 // Preparation holds only short database row locks. It commits before HEAD;
 // admission and maintenance must revalidate everything that can change.
-func (s *Server) nasR2CopyPrepare(w http.ResponseWriter, r *http.Request, cid int64, verify, stitch bool) (nasR2CopyTask, []byte, NASR2CopyBlockReason, bool) {
+func (s *Server) nasR2CopyPrepare(w http.ResponseWriter, r *http.Request, cid int64, verify, stitch bool, leaseLimit int) (nasR2CopyTask, []byte, NASR2CopyBlockReason, bool) {
 	var task nasR2CopyTask
 	var data []byte
 	ctx := r.Context()
@@ -324,7 +324,7 @@ func (s *Server) nasR2CopyPrepare(w http.ResponseWriter, r *http.Request, cid in
 		util.WriteError(w, 503, "copy lease unavailable")
 		return task, nil, "", false
 	}
-	if active >= NASR2CopyWorkers {
+	if active >= leaseLimit {
 		return task, nil, "", true
 	}
 	copyKind := "q.kind='raw'"
@@ -373,18 +373,22 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 	}
 	version, _ := nasRequestWorkVersion(r, nasConnectionCopy)
 	stitch := s.nasR2StitchCopyEnabled(version)
+	leaseLimit := NASR2CopyWorkers
+	if version == nasLowMemoryCopyClientVersion {
+		leaseLimit = 1
+	}
 	// A concurrent grant can consume the prepared row. Retry a bounded number
 	// of candidates without making the client hold for a normal admission race.
 	for attempt := 0; attempt < NASR2CopyWorkers; attempt++ {
-		if !s.nasR2CopyLeaseAttempt(w, r, cid, req.VerifyExisting, stitch) {
+		if !s.nasR2CopyLeaseAttempt(w, r, cid, req.VerifyExisting, stitch, leaseLimit) {
 			return
 		}
 	}
 	util.WriteError(w, 409, "copy queue changed during preparation; retryable")
 }
 
-func (s *Server) nasR2CopyLeaseAttempt(w http.ResponseWriter, r *http.Request, cid int64, verify, stitch bool) bool {
-	task, data, reason, ok := s.nasR2CopyPrepare(w, r, cid, verify, stitch)
+func (s *Server) nasR2CopyLeaseAttempt(w http.ResponseWriter, r *http.Request, cid int64, verify, stitch bool, leaseLimit int) bool {
+	task, data, reason, ok := s.nasR2CopyPrepare(w, r, cid, verify, stitch, leaseLimit)
 	if !ok {
 		return false
 	}
@@ -422,7 +426,7 @@ func (s *Server) nasR2CopyLeaseAttempt(w http.ResponseWriter, r *http.Request, c
 		return false
 	}
 	defer tx.Rollback(ctx)
-	// EXCLUSIVE is also the four-live-lease cap, not just a maintenance fence:
+	// EXCLUSIVE also enforces the live-lease cap:
 	// admission must recount only after concurrent renewals have committed.
 	// Keep it solely across database revalidation and grant/block commit.
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasR2CopyLock); err != nil {
@@ -438,7 +442,7 @@ func (s *Server) nasR2CopyLeaseAttempt(w http.ResponseWriter, r *http.Request, c
 		util.WriteError(w, 503, "copy lease unavailable")
 		return false
 	}
-	if active >= NASR2CopyWorkers {
+	if active >= leaseLimit {
 		util.WriteJSON(w, 200, map[string]any{"task": nil})
 		return false
 	}
