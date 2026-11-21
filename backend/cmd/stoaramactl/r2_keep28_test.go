@@ -11,6 +11,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"net"
 	"net/http"
@@ -104,6 +105,27 @@ func TestKeep28SelectedCustodyConsumesExactMatch(t *testing.T) {
 	if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,selected_verify_item_id)
  VALUES('raw',9000001,'stoarama',$1,100,repeat('b',64),$2,37)`, f.key, digest); err == nil {
 		t.Fatal("selected proof allowed a reservation without a matching B2 intent")
+	}
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(f.ctx)
+	if _, err = tx.Exec(f.ctx, `SELECT lock_r2_keep28_selected_source(9000001)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		`UPDATE nas_inventory_files SET state='missing' WHERE connection_id=13 AND clip_id=9000001`,
+		`UPDATE nas_selected_verify_items SET state='conflict' WHERE id=37`,
+	} {
+		_, err = f.pool.Exec(f.ctx, query)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+			t.Fatalf("NAS observation did not respect the selected proof lock: %v", err)
+		}
+	}
+	if err = tx.Rollback(f.ctx); err != nil {
+		t.Fatal(err)
 	}
 	manifest, err := json.Marshal(inverseEntry{ObjectInfo: f.store.objects[f.key], Class: inverseHeld, Reason: "live_hold"})
 	if err != nil {

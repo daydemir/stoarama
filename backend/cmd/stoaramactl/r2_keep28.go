@@ -92,6 +92,9 @@ func (a *inverseApplier) lockSelectedKeep28Custody(ctx context.Context, tx pgx.T
 		ConnectionID: 13, SourceID: t.ID, SizeBytes: t.Size, Path: t.Path, SHA: t.SHA, State: "present",
 		VerifyPlanID: p.ID, VerifyPlanSHA: p.SHA,
 	}
+	if _, err := tx.Exec(ctx, `SELECT lock_r2_keep28_selected_source($1)`, t.ID); err != nil {
+		return c, err
+	}
 	var fresh bool
 	err := tx.QueryRow(ctx, `SELECT v.verify_item_id,v.completed_at,v.completed_at+interval '24 hours',
  v.completed_at>=clock_timestamp()-interval '24 hours'
