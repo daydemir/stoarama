@@ -224,3 +224,69 @@ func TestR2InverseJobPageKeepOverlap(t *testing.T) {
 	check(inverseNonrawCollated, 2, base+2, 1)
 	check(inverseOutsideKeep28, 1, base+2, 0)
 }
+
+// TestR2NonrawOwnerKeepStreamProtectsCollatedFootage: the owner's thesis/keep
+// holds name RAW key prefixes (raw/stream/854/ etc.). A collated output's key is
+// joined/... and its sources are managed/..., so no prefix can ever match them:
+// without a stream-level check, thesis footage could leave R2 inside a collated
+// output. The page, output and source decisions must each refuse the stream.
+func TestR2NonrawOwnerKeepStreamProtectsCollatedFootage(t *testing.T) {
+	start := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	end := start.Add(28 * 24 * time.Hour)
+	outside := start.Add(-30 * 24 * time.Hour)
+	outsideEnd := outside.Add(time.Minute)
+	key := "joined/nightly-collation-v2/objects/" + nonrawOutputSHA + ".mp4"
+	x := inverseCollatedAssessment{ID: 7, Key: key, Path: "nightly/video.mp4", SHA: nonrawOutputSHA, SizeBytes: 900, VerifiedAt: start,
+		StreamID: 3, Start: &outside, End: &outsideEnd, Timezone: "Asia/Tokyo",
+		Sources: []inverseCollatedSource{{ID: 1, StreamID: 3, Key: "managed/acct-47/thesis/a.mp4", Path: "s/a.mp4", Start: &outside, End: &outsideEnd, Timezone: "Asia/Tokyo"}}}
+	p := inverseProtection{ReviewedCollated: true, KEFolders: map[string]bool{},
+		Windows: map[int64]api.Keep28Window{3: {StreamID: 3, Timezone: "Asia/Tokyo", Start: start, End: end}},
+		Picks:   r2RetirePicks{Choices: map[int64]r2RetirePick{3: {Choice: "none", KeepStartUTC: start.Format(time.RFC3339), KeepEndUTC: end.Format(time.RFC3339)}}}}
+	// Control: with no stream hold the output is an ordinary outside-window
+	// candidate, so the refusals below cannot pass by always holding.
+	if got := assessCollated(p, x); got.Reason != "" {
+		t.Fatalf("control held: %q", got.Reason)
+	}
+	// The output's own stream is a thesis hold.
+	p.OwnerKeepStreams = map[int64]bool{3: true}
+	if got := assessCollated(p, x); got.Reason != "owner_keep_stream" {
+		t.Fatalf("output stream hold: %q", got.Reason)
+	}
+	// The output is on a decided stream, but a SOURCE is thesis footage.
+	p.OwnerKeepStreams = map[int64]bool{}
+	x.Sources[0].StreamID = 78
+	p.OwnerKeepStreams[78] = true
+	if got := assessCollated(p, x); got.Reason != "owner_keep_source_stream" {
+		t.Fatalf("source stream hold: %q", got.Reason)
+	}
+	// The classifier's own path refuses it too, so the partition never lists it.
+	p.OwnerKeepStreams = map[int64]bool{}
+	p.Collated = map[string]inverseCollatedAssessment{key: x}
+	if class, reason := p.classify(r2.ObjectInfo{Key: key, SizeBytes: 900}); class != inverseCollated {
+		t.Fatalf("control classified %s (%s)", class, reason)
+	}
+	x.Sources[0].StreamID = 3
+	p.OwnerKeepStreams = map[int64]bool{3: true}
+	p.Collated[key] = x
+	if class, reason := p.classify(r2.ObjectInfo{Key: key, SizeBytes: 900}); class != inverseKE || reason != "owner_keep_stream" {
+		t.Fatalf("thesis stream classified %s (%s)", class, reason)
+	}
+	// A confident repair on a thesis stream is refused on the same rule.
+	r := inverseCollatedAssessment{Kind: inverseNonrawKindRepair, ID: 9, StreamID: 78,
+		Key: inverseConfidentRepairPrefix + "20261009/78/a.mp4", Path: "repair/a.mp4", SHA: nonrawOutputSHA, SizeBytes: 700}
+	p.OwnerKeepStreams = map[int64]bool{78: true}
+	if got := assessRepair(p, r); got.Reason != "owner_keep_stream" {
+		t.Fatalf("repair stream hold: %q", got.Reason)
+	}
+	// The prefix parser lifts ONLY the reviewed RAW stream namespace, so an
+	// unrelated or malformed hold never becomes a wider stream veto.
+	for prefix, want := range map[string]int64{
+		"raw/stream/854/": 854, "raw/stream/537/": 537, "raw/stream/78/": 78, "raw/stream/415/": 415,
+		"raw/stream/": 0, "raw/stream/x/": 0, "managed/": 0, "raw/stream/854": 0, "raw/stream/0/": 0,
+	} {
+		got, ok := ownerKeepStreamID(prefix)
+		if want == 0 && ok || want != 0 && (!ok || got != want) {
+			t.Fatalf("%q lifted to %d (%v), want %d", prefix, got, ok, want)
+		}
+	}
+}

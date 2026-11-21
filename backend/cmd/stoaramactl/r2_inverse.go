@@ -12,6 +12,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -74,6 +76,12 @@ type inverseProtection struct {
 	// OwnerKeepPrefixes are durable owner keep holds on whole key prefixes. A
 	// key under one is kept whatever its catalog status.
 	OwnerKeepPrefixes []string
+	// OwnerKeepStreams are the stream ids those prefixes protect. A collated
+	// output's key is compiled: joined/... and its sources are managed/..., so
+	// no key can ever start with raw/stream/<id>/. The prefix rule therefore
+	// cannot see thesis footage that leaves R2 as part of a collated output, so
+	// the page, output and source decisions all check the stream id itself.
+	OwnerKeepStreams map[int64]bool
 	// JoinedReleased holds clips whose every joined snapshot belongs to a batch
 	// the owner released to the RAW lane. Only their outside-window part leaves.
 	JoinedReleased map[string]bool
@@ -177,7 +185,7 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 		if _, exempt := p.Exempt[o.Key]; !exempt {
 			return inverseDelivery, "delivery_page_keep"
 		}
-		if id, bound := p.ExemptIdentity[o.Key]; bound && (strings.Trim(o.ETag, `"`) != id.ETag || o.SizeBytes != id.SizeBytes) {
+		if id, bound := p.ExemptIdentity[o.Key]; bound && (!inverseETagMatches(o.ETag, id.ETag) || o.SizeBytes != id.SizeBytes) {
 			return inverseDelivery, "delivery_exemption_identity_drift"
 		}
 	}
@@ -266,6 +274,9 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 // sourceIdentityUncertain is the collated-source view of the same predicate, so a
 // collated source and a RAW clip are judged by one rule and cannot drift.
 func (p inverseProtection) sourceIdentityUncertain(s inverseCollatedSource) bool {
+	if p.OwnerKeepStreams[s.StreamID] {
+		return true
+	}
 	return p.identityUncertain(inverseIdentity{StreamID: s.StreamID, Path: s.Path, Start: s.Start, End: s.End, Timezone: s.Timezone, Kind: "source"})
 }
 
@@ -465,6 +476,10 @@ func loadInverseHolds(ctx context.Context, q r2RetireQuerier, bucket string, pic
 	if p.OwnerKeepPrefixes, err = loadInverseOwnerKeepPrefixes(ctx, q, bucket); err != nil {
 		return p, err
 	}
+	// A prefix hold names a RAW key prefix (raw/stream/<id>/); a collated output's
+	// key and sources are never under one, so the stream ids those prefixes name
+	// are lifted to the stream decision too and checked there.
+	p.OwnerKeepStreams = ownerKeepStreamIDs(p.OwnerKeepPrefixes)
 	if p.Exempt, p.ExemptIdentity, err = loadInverseExempt(ctx, q, bucket); err != nil {
 		return p, err
 	}
@@ -516,7 +531,11 @@ func loadInverseExempt(ctx context.Context, q r2RetireQuerier, bucket string) (m
 			return nil, nil, err
 		}
 		out[key] = deliveryExemptionClass(class)
-		identities[key] = inversePageIdentity{ETag: strings.Trim(etag, `"`), SizeBytes: size}
+		// The bound identity is the page row's exact stored ETag. It is never
+		// normalized: a stored quoted or padded value is a different identity
+		// from every canonical listing, so the key stays held rather than being
+		// trimmed into a match.
+		identities[key] = inversePageIdentity{ETag: etag, SizeBytes: size}
 	}
 	return out, identities, rows.Err()
 }
@@ -822,4 +841,32 @@ func loadInverseOwnerKeepPrefixes(ctx context.Context, q r2RetireQuerier, bucket
 		prefixes = append(prefixes, prefix)
 	}
 	return prefixes, rows.Err()
+}
+
+// ownerKeepPrefixStreamRE matches the one prefix shape a stream hold can take:
+// the RAW key namespace for exactly one stream. Any other prefix stays a pure
+// key-prefix hold, so this never widens a hold beyond what its text names.
+var ownerKeepPrefixStreamRE = regexp.MustCompile(`^raw/stream/([1-9][0-9]*)/$`)
+
+func ownerKeepStreamIDs(prefixes []string) map[int64]bool {
+	streams := make(map[int64]bool)
+	for _, prefix := range prefixes {
+		if id, ok := ownerKeepStreamID(prefix); ok {
+			streams[id] = true
+		}
+	}
+	return streams
+}
+
+// ownerKeepStreamID is the stream a RAW owner-keep prefix names, if any.
+func ownerKeepStreamID(prefix string) (int64, bool) {
+	m := ownerKeepPrefixStreamRE.FindStringSubmatch(prefix)
+	if m == nil {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil || id <= 0 {
+		return 0, false
+	}
+	return id, true
 }

@@ -451,20 +451,42 @@ exempt identity before reporting a candidate.
 
 Identity and content parity are required at every layer the receipt crosses. The
 exemption binds the page row's exact ETag, size **and** sha256; the page row's
-sha256 must be nonempty and equal the catalog output's own lowercase sha256,
-because `guard_delivery_r2_retirement` compares exactly that pair. A page row
-that cannot state the content is refused at admission instead of opening a gate
-the wire then fails to use, and the validator refuses the same mismatch.
+sha256 must be nonempty and be the catalog output's own lowercase sha256
+verbatim, because `guard_delivery_r2_retirement` compares exactly that pair. A
+page row that cannot state the content is refused at admission instead of
+opening a gate the wire then fails to use, and the validator refuses the same
+mismatch.
+
+Representations are strict everywhere a SQL guard compares them. A case-folded
+sha256 is not authority: `lower(o.sha256)` is what the SQL predicates compare,
+so an upper-case page value that would only match after folding is refused
+rather than normalized. An ETag is compared as the provider's canonical
+(unquoted) identity on both sides; a quoted or padded value is a different string
+from the one SQL stores and compares in `r2_delivery_exempt`, so it is refused
+rather than trimmed into a match. This applies at validate, approve and seed, in
+the page-authority predicate at reservation and final wire, and in the
+partition's exempt-identity comparison.
 
 Seeding requires a positive, window-bound, non-keep-everything owner decision
 for the page recording's stream *and* for the output's own stream; a missing
-pick is refused. `outside_window` additionally requires the output to be outside
+pick is refused. The roster decision reads the classifier's own live `Held` and
+`Retiring` sets, not the seed statement's narrower view: an effective R2 cleanup
+release clears `nas_cleanup_r2_reserved_files` while the wider
+`nas_cleanup_reserved_files` and its source holds still apply, so a key held
+there is refused rather than approved and then held at the wire. Only the
+candidate's own page hold is ever exempted, by the exemption being decided. `outside_window` additionally requires the output to be outside
 the **page recording's own** pinned window, not only its catalog output stream's
 one. A page stream with no pinned window, or an output whose interval is absent,
 fails closed with a refusal rather than being assumed outside. At deletion time
 the page recording's stream is rechecked live, so a page row on a keep-everything
-or undecided stream holds the key even when the catalog output names a decided
-one. Dependency-only collated outputs that are not page keys follow the
+or undecided stream — or on one of the thesis keep streams 854, 537, 78 or 415 —
+holds the key even when the catalog output names a decided one. The reservation
+and the final wire re-evaluate that whole page authority through one shared
+typed predicate, not only the page stream's decision: a page recording
+reassigned to another valid, decided stream whose window contains the output, or
+an output interval that drifts into a distinct page stream's window after the
+seed, is refused with the listing ETag and size unchanged. Dependency-only
+collated outputs that are not page keys follow the
 2026-11-18 owner scope, but anything whose NAS copy is still pending or blocked
 ("waiting to be transferred") stays held. Footage already verified on the NAS is
 not excluded by that rule.
@@ -531,22 +553,61 @@ nothing.
    transaction, or nothing is, and every row references the approval recorded
    above for that class and digest. It re-runs the same decision the validator
    ran, so a roster that changed after validation is refused.
-4. **Before any delete**, require BOTH of the following for every key in the
-   batch, independently of the exemption row:
-   - the exact bound roster is the one this deployment approved, re-reading the
-     live page row and the live catalog identity and refusing on any drift; and
-   - the key is positively verified **now** on the NAS: a current, exact
-     custody record for this output (path, inode/device, size and sha256), not a
-     historical hold, not a pending or blocked COPY and not an inferred copy.
-   A key that lacks either fact stays held. Nothing in this branch builds that
-   global collated custody check; it is being built separately, and until it
-   exists `outside_window` deletes do not run.
+4. **Before any delete**, require the exact bound roster to be the one this
+   deployment approved, re-reading the live page row and the live catalog
+   identity and refusing on any drift, and require the class's own closure:
+   - `outside_window` covers **Group 2** footage outside the pinned windows,
+     excluding Keep Everything. The owner authorized that group without a
+     NAS custody condition. Pending NAS feed work and other live holds still apply.
+   - Keep28 RAW (`apply-keep28`) requires current NAS custody. The
+     `confident_repair` and `in_window` exemption gates are closed in this release.
+   A key that lacks its class's own facts stays held.
 5. Confirm **no off-page spill** for the batch: the derived RAW delivery closure
    must still hold every RAW source of every output in it, and no other page
    row, incident, reservation, restore, stitch input hold or owner keep prefix
    may be released by running the batch. Any overlap refuses the whole batch.
-6. Only then run the reviewed collated lane:
-   `stoaramactl r2-inverse job-collated ...`.
+   The thesis/owner keep streams (854, 537, 78, 415) are protected on the page,
+   the output and every source decision, so no collated output built from that
+   footage can be admitted.
+6. Only then run the existing bounded collated executor,
+   `stoaramactl r2-inverse apply-collated`, over a **freshly sealed
+   exact-roster manifest intersection**. This is the only execution shape this
+   release documents. A `job-collated` lane runner exists in the binary, but it
+   is deliberately **not** instructed here and this section does not bless it:
+   the reviewed path is the bounded apply below. Required, each independently
+   pinned:
+   - the manifest of the exact-roster intersection and its
+     `--expected-sha256`, built fresh for this run;
+   - a matching `--summary` and its independent
+     `--expected-summary-sha256`, pinned separately from the manifest so neither
+     can drift with the other;
+   - `--picks`, with its approved SHA-256 checked before launch and bound
+     to the pinned summary by the executor;
+   - `--drain-evidence` and its independent
+     `--expected-drain-evidence-sha256`, freshly observed after the real drain
+     deadline and bound to the exact bucket, endpoint and fence;
+   - an active NAS reader / pending-feed hold and its drain check, so capture is
+     not feeding the keys while the run proceeds;
+   - explicit bounds: `--max-items`, `--max-bytes` (both required, so a run can
+     never be unbounded), `--budget-24h-bytes` and `--workers` within pool
+     capacity minus two;
+   - a private append-only `--ledger`, preserved across runs and never
+     truncated.
+
+   Every existing guard still applies on top of those arguments: the owner-fence
+   evidence and its own proof shape, KE epoch, decided stream choice, live
+   holds, the exact page authority above, the derived RAW delivery closure, and
+   the thesis-stream holds.
+
+   Readback after the run must be exact and match by key set: the DB intent rows,
+   the attempt rows, the absence events and the off-roster remainder, each read
+   for this run's evidence digest. A key that is absent in the provider without
+   an exact intent, attempt and absence event is not a success; it is
+   unresolved and stays held.
+
+**Write execution stays held.** Everything above is the procedure a separate
+review must approve before a single collated DELETE. This document, the merge it
+describes, and the roster digests below authorize nothing on their own.
 
 Taking the old public delivery page down is an operator and origin act outside
 this schema, in this order: remove or re-point every legacy hostname, CDN route,
@@ -585,7 +646,24 @@ non-KE stream, with no overlap with that stream's keep window.
 \copy (WITH picks(stream_id,choice,ws,we) AS (VALUES PICKS) SELECT jsonb_build_object('bucket',h.bucket,'object_key',h.object_key,'size_bytes',h.size_bytes,'etag',h.etag,'sha256',h.sha256,'recording_id',h.recording_id,'stream_id',r.stream_id)::text FROM delivery_keep_holds h JOIN recordings r ON r.id=h.recording_id JOIN picks p ON p.stream_id=r.stream_id WHERE h.bucket='stoarama' AND h.kind='video_assembly' AND h.object_key LIKE 'experimental/stitching-confident-repairs/%' AND p.choice IN ('none','st','keep') ORDER BY h.object_key) TO 'confident-repair-roster.jsonl'
 ```
 
-Expect 4,348 rows / 0.582 TB and 9,232 rows / 3.377 TB. A shortfall means some
+The owner's read-only exact `outside_window` roster is 4,023 rows /
+562,681,810,928 B, SHA-256
+`0b00b89969eef4110c020be7fed2d84894b1d9077a5465ca93a796f480c05578`. It is the
+whole class preview. The 3,085 rows whose inputs are protected by Gen1
+source snapshots stay outside the proposed run. The derived RAW delivery
+guard applies independently.
+
+The scoped canary is a separate, smaller set: 938 exact keys /
+295,592,809,940 B, digest
+`87226151649e396cd93e1ab69d99275ca00e7bd15bc5df5c1cf2e219dc153dba`. Pinning this
+digest is not authority to run; it is the intersection any bounded attempt must
+seal against.
+
+325 older roster rows on streams 78 and 415 remain thesis-held. The owner keep
+holds cover streams 854, 537, 78 and 415, and the page, output and source
+decisions each enforce them, so a page row, catalog output or collated source on
+those streams is refused. A shortfall against the historical 4,348 / 9,232
+counts means some
 keys are on a keep-everything or undecided stream; they stay on the page and in
 R2. Report the difference to Deniz rather than widening a query.
 

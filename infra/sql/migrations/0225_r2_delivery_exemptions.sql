@@ -50,7 +50,7 @@ CREATE TABLE r2_delivery_exemptions (
  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
  bucket text NOT NULL,
  object_key text NOT NULL,
- etag text NOT NULL CHECK(etag<>''),
+ etag text NOT NULL CHECK(etag<>'' AND etag !~ '^[[:space:]"]|[[:space:]"]$'),
  size_bytes bigint NOT NULL CHECK(size_bytes>0),
  class r2_delivery_exemption_class NOT NULL,
  approval_id bigint NOT NULL REFERENCES r2_delivery_exemption_approvals(id),
@@ -120,7 +120,7 @@ BEGIN
   -- An exemption whose page row cannot state that exact content would be
   -- unreachable authority, so it is refused here instead of opening a gate the
   -- wire then fails to use.
-  IF lower(h.sha256)<>catalog_sha256 THEN
+  IF h.sha256<>catalog_sha256 THEN
    RAISE EXCEPTION 'R2 delivery exemption % needs the page row to carry the catalog sha256', NEW.object_key;
   END IF;
   RETURN NEW;

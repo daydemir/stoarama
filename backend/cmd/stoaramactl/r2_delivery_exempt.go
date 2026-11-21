@@ -92,6 +92,120 @@ func readDeliveryExemptionRoster(path, digest string) ([]deliveryExemptionRow, e
 	return rows, nil
 }
 
+// inverseCanonicalETag accepts ONLY the provider's canonical ETag
+// representation: nonempty and unchanged by quote or whitespace trimming. A
+// quoted or padded variant is a different string from the one SQL stores and
+// compares in r2_delivery_exempt, so it is refused instead of being normalized
+// into a match SQL would never make. The r2 client already delivers the
+// canonical (unquoted) provider identity, so this preserves that identity.
+func inverseCanonicalETag(v string) (string, bool) {
+	if v == "" || strings.TrimSpace(v) != v || strings.Trim(v, `"`) != v {
+		return "", false
+	}
+	return v, true
+}
+
+// inverseETagMatches compares two provider ETag identities WITHOUT normalizing
+// either side: both must already be canonical and must be the same exact string.
+// The r2 client strips the provider's quotes, so a quoted or padded stored value
+// is a different identity from every listing and must never be trimmed into a
+// match the SQL guards would not make themselves.
+func inverseETagMatches(listing, bound string) bool {
+	a, ok := inverseCanonicalETag(listing)
+	if !ok {
+		return false
+	}
+	b, ok := inverseCanonicalETag(bound)
+	return ok && a == b
+}
+
+// inversePageAuthority is one delivery page key's LIVE state: the recording's
+// own stream, the exact identity an exemption binds, the page kind, and the page
+// row's own content hash. It is the single typed value every page guard
+// evaluates, so the read-only validate/approve/seed decisions and the reserve and
+// final-wire reload cannot drift apart.
+type inversePageAuthority struct {
+	Key       string
+	Found     bool
+	StreamID  int64
+	ETag      string
+	SizeBytes int64
+	Kind      string
+	SHA256    string
+}
+
+// scanInversePageAuthority reads the exact columns inversePageAuthoritySQL
+// selects, from either a single row or a batch scan.
+func scanInversePageAuthority(row interface{ Scan(...any) error }) (inversePageAuthority, error) {
+	var p inversePageAuthority
+	if err := row.Scan(&p.Key, &p.StreamID, &p.ETag, &p.SizeBytes, &p.Kind, &p.SHA256); err != nil {
+		return p, err
+	}
+	p.Found = true
+	return p, nil
+}
+
+// deliveryPageAuthorityError is the ONE page-authority decision, shared by
+// validate, approve, seed, the reservation and the final wire. It answers, for
+// one exact delivery page key under one exemption class, whether the page
+// recording's OWN stream and the exact catalog content still authorize that
+// class.
+//
+// The class is a claim about the page stream's window, not only the output's:
+// "outside every window" must hold against the page stream's window too, using
+// the exact catalog interval. Every caller supplies the same live page authority
+// and the same assessment, so a page reassignment or an interval drift into a
+// distinct page stream window is refused at the reservation and at the final
+// wire exactly as it is refused before approval.
+func (p inverseProtection) deliveryPageAuthorityError(class deliveryExemptionClass, page inversePageAuthority, x inverseCollatedAssessment, etag string, size int64) error {
+	if !page.Found {
+		return errors.New("the key has no live delivery page row")
+	}
+	pageETag, ok := inverseCanonicalETag(page.ETag)
+	if !ok {
+		return errors.New("the live page row does not carry a canonical ETag")
+	}
+	candidateETag, ok := inverseCanonicalETag(etag)
+	if !ok || candidateETag != pageETag {
+		return errors.New("the object does not name the page row's exact canonical ETag")
+	}
+	// The object, its page row and its catalog content are ONE size. A drifted
+	// page or catalog row is not the identity the exemption names.
+	if size <= 0 || size != page.SizeBytes || size != x.SizeBytes {
+		return fmt.Errorf("the object size %d differs from its page row %d or its catalog content %d", size, page.SizeBytes, x.SizeBytes)
+	}
+	if !deliveryPageKindFits(page.Kind, class, page.Key) {
+		return fmt.Errorf("page kind %q does not fit class %s", page.Kind, class)
+	}
+	// guard_delivery_r2_retirement compares the page row's sha256 with the
+	// receipt's verbatim, and the collated lane writes the catalog output's
+	// lower(o.sha256). Both must BE the same exact lower-case value; a page row
+	// that only matches after case folding would open a gate the receipt fails.
+	if !r2RetireLowerHex64(page.SHA256) || page.SHA256 != x.SHA {
+		return errors.New("the page row does not carry the catalog's exact lowercase sha256")
+	}
+	// The page recording's OWN stream must carry a positive, window-bound,
+	// non-keep-everything decision for EVERY class: a page row reassigned to a
+	// keep-everything or undecided stream is never authority, whatever the class
+	// claims about windows. A thesis/owner keep stream is protected the same way.
+	if p.OwnerKeepStreams[page.StreamID] {
+		return fmt.Errorf("page recording stream %d is an owner keep stream", page.StreamID)
+	}
+	if !deliveryPageStreamDecided(p.Picks, p.Windows, page.StreamID) {
+		return fmt.Errorf("page recording stream %d has no positive non-keep-everything decision", page.StreamID)
+	}
+	// outside_window is a claim about the PAGE stream's window as well as the
+	// output's. The exact catalog interval decides it; a page stream with no
+	// pinned window fails closed, never "assume outside".
+	if class == deliveryExemptOutsideWindow && x.Kind == inverseNonrawKindCollated {
+		if x.Start == nil || x.End == nil {
+			return errors.New("the catalog content has no interval, so outside_window is unprovable")
+		}
+		return deliveryPageWindowOutside(p.Picks, p.Windows, page.StreamID, *x.Start, *x.End)
+	}
+	return nil
+}
+
 // deliveryPageStreamDecided reports whether the owner made a positive,
 // window-bound, non-keep-everything decision for the stream. A missing pick, a
 // pick made against another window, or "all" is never exemption authority.
@@ -409,36 +523,21 @@ func checkDeliveryExemptionRoster(ctx context.Context, tx pgx.Tx, class delivery
 	for n, row := range rows {
 		buckets[n], keys[n], etags[n], sizes[n] = row.Bucket, row.ObjectKey, row.ETag, row.SizeBytes
 	}
-	// The page recording's stream and the output's own stream must both be
-	// decided, so a keep-everything or undecided stream is refused before any
-	// row is written. The page stream is read live, not from the roster.
-	pageStreams := map[string]int64{}
-	pageIdentities := map[string]inversePageIdentity{}
-	// The page row's own sha256 is the content the reservation guard compares.
-	// An exemption whose page row cannot state it would open a gate the wire then
-	// refuses, so it is read here and required to equal the catalog's.
-	pageSHA := map[string]string{}
-	// The exact page kind and key family each roster key must be is a catalog
-	// fact, read live here so a repair cannot be admitted as a collated video or
-	// the reverse by naming the other class.
-	pageKinds := map[string]string{}
-	streamRows, err := tx.Query(ctx, `SELECT h.object_key,coalesce(rec.stream_id,0),h.etag,h.size_bytes,h.kind,h.sha256 FROM delivery_keep_holds h
- LEFT JOIN recordings rec ON rec.id=h.recording_id WHERE h.bucket=$1 AND h.object_key=ANY($2::text[])`, rows[0].Bucket, keys)
+	// The page recording's live state — its own stream, the exact identity an
+	// exemption binds, its kind and its content hash — is read ONCE here and fed
+	// to the same typed predicate the reservation and the final wire evaluate.
+	pages := map[string]inversePageAuthority{}
+	streamRows, err := tx.Query(ctx, inversePageAuthoritySQL+` AND h.object_key=ANY($2::text[])`, rows[0].Bucket, keys)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
 	for streamRows.Next() {
-		var key, sha string
-		var stream, size int64
-		var etag, kind string
-		if err = streamRows.Scan(&key, &stream, &etag, &size, &kind, &sha); err != nil {
+		page, err := scanInversePageAuthority(streamRows)
+		if err != nil {
 			streamRows.Close()
 			return nil, nil, nil, nil, err
 		}
-		pageStreams[key] = stream
-		pageIdentities[key] = inversePageIdentity{ETag: strings.Trim(etag, `"`), SizeBytes: size}
-		pageKinds[key] = kind
-		pageSHA[key] = strings.ToLower(sha)
+		pages[page.Key] = page
 	}
 	err = streamRows.Err()
 	streamRows.Close()
@@ -453,11 +552,11 @@ func checkDeliveryExemptionRoster(ctx context.Context, tx pgx.Tx, class delivery
 		if row.Bucket != rows[0].Bucket {
 			return nil, nil, nil, nil, errors.New("a class roster must name exactly one bucket")
 		}
-		page, pageKnown := pageIdentities[row.ObjectKey]
-		if !pageKnown || page.ETag != strings.Trim(row.ETag, `"`) || page.SizeBytes != row.SizeBytes {
+		page := pages[row.ObjectKey]
+		if !page.Found || page.ETag != row.ETag || page.SizeBytes != row.SizeBytes {
 			return nil, nil, nil, nil, fmt.Errorf("roster key %s does not name its exact live page identity", row.ObjectKey)
 		}
-		if !deliveryPageStreamDecided(picks, windows, pageStreams[row.ObjectKey]) {
+		if !deliveryPageStreamDecided(picks, windows, page.StreamID) {
 			return nil, nil, nil, nil, fmt.Errorf("roster key %s has no positive non-keep-everything page stream decision", row.ObjectKey)
 		}
 		x, err := loadSeedAssessment(ctx, tx, rows[0].Bucket, row.ObjectKey, protection)
@@ -468,16 +567,6 @@ func checkDeliveryExemptionRoster(ctx context.Context, tx pgx.Tx, class delivery
 		if !known {
 			return nil, nil, nil, nil, fmt.Errorf("roster key %s has no live collated or repair assessment", row.ObjectKey)
 		}
-		// The page row's exact kind and key family must match the requested class,
-		// in SQL shape as well as in the classifier's answer.
-		if !deliveryPageKindFits(pageKinds[row.ObjectKey], class, row.ObjectKey) {
-			return nil, nil, nil, nil, fmt.Errorf("roster key %s is page kind %q, which does not fit class %s", row.ObjectKey, pageKinds[row.ObjectKey], class)
-		}
-		// The catalog size must equal the page size and the roster size: a roster
-		// or page that drifted from the catalog identity is not authority.
-		if x.SizeBytes != page.SizeBytes || x.SizeBytes != row.SizeBytes {
-			return nil, nil, nil, nil, fmt.Errorf("roster key %s catalog size %d differs from its page/roster size", row.ObjectKey, x.SizeBytes)
-		}
 		// A KE folder component in the output's own stored path protects it, the
 		// same rule execution applies before the wire.
 		if protection.keepEverythingPathComponent(x.Path) || protection.keepEverythingPathComponent(row.ObjectKey) {
@@ -486,19 +575,20 @@ func checkDeliveryExemptionRoster(ctx context.Context, tx pgx.Tx, class delivery
 		if x.Reason != "" {
 			return nil, nil, nil, nil, fmt.Errorf("roster key %s is held by the live classifier (%s)", row.ObjectKey, x.Reason)
 		}
-		// Content identity parity with the guard that will admit the receipt.
-		// guard_delivery_r2_retirement requires the page row's sha256 to equal the
-		// receipt's, and the collated lane writes the catalog output's sha256. A
-		// page row with no sha256, or one that names a different object, is not
-		// authority for this key: it would pass this seed and then be refused at
-		// the wire, or worse, be read as covering content it does not name.
-		if x.Kind == inverseNonrawKindCollated {
-			if !r2RetireLowerHex64(x.SHA) {
-				return nil, nil, nil, nil, fmt.Errorf("roster key %s has no exact catalog sha256", row.ObjectKey)
-			}
-			if pageSHA[row.ObjectKey] != strings.ToLower(x.SHA) {
-				return nil, nil, nil, nil, fmt.Errorf("roster key %s page sha256 does not name its catalog content", row.ObjectKey)
-			}
+		// The seed's own statement suppresses exactly ONE term — this key's page
+		// hold, which the exemption being decided is meant to lift. Every other
+		// live hold still applies, and the classifier's Held and Retiring sets are
+		// what execution actually reads. They are NOT the same view: an effective
+		// R2 cleanup release clears nas_cleanup_r2_reserved_files while the wider
+		// nas_cleanup_reserved_files still holds the source, so a seed that only
+		// consulted its own statement would approve a row the wire then refuses.
+		// No hold is exempted here; a held or retiring key is simply not a
+		// candidate.
+		if protection.Held[row.ObjectKey] {
+			return nil, nil, nil, nil, fmt.Errorf("roster key %s is held by the live classifier", row.ObjectKey)
+		}
+		if protection.Retiring[row.ObjectKey] {
+			return nil, nil, nil, nil, fmt.Errorf("roster key %s already has a retirement reservation or receipt", row.ObjectKey)
 		}
 		if x.StreamID > 0 && !deliveryPageStreamDecided(picks, windows, x.StreamID) {
 			return nil, nil, nil, nil, fmt.Errorf("roster key %s has no positive non-keep-everything decision for its own stream", row.ObjectKey)
@@ -506,18 +596,12 @@ func checkDeliveryExemptionRoster(ctx context.Context, tx pgx.Tx, class delivery
 		if computed != class {
 			return nil, nil, nil, nil, fmt.Errorf("roster key %s is %s under the live classifier, not %s", row.ObjectKey, computed, class)
 		}
-		// The owner decision is "outside every window". A key outside its own
-		// output stream's window but inside the PAGE stream's window is exactly
-		// the ambiguity that decision does not cover, so it is refused rather
-		// than approved under outside_window. A page stream with no pinned
-		// window fails closed instead of being treated as outside.
-		if class == deliveryExemptOutsideWindow && x.Kind == inverseNonrawKindCollated {
-			if x.Start == nil || x.End == nil {
-				return nil, nil, nil, nil, fmt.Errorf("roster key %s has no catalog interval, so outside_window is unprovable", row.ObjectKey)
-			}
-			if err := deliveryPageWindowOutside(picks, windows, pageStreams[row.ObjectKey], *x.Start, *x.End); err != nil {
-				return nil, nil, nil, nil, fmt.Errorf("roster key %s is not provably outside: %w", row.ObjectKey, err)
-			}
+		// The ONE page-authority predicate: exact canonical identity, kind,
+		// verbatim lower-case content, page stream decision and — for
+		// outside_window — the exact catalog interval against the page stream's
+		// own window. Reservation and final wire run the same call.
+		if err := protection.deliveryPageAuthorityError(class, page, x, row.ETag, row.SizeBytes); err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("roster key %s is not authorized: %w", row.ObjectKey, err)
 		}
 	}
 	return buckets, keys, etags, sizes, nil

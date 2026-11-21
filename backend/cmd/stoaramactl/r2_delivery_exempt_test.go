@@ -1006,11 +1006,11 @@ func TestR2NonrawSeedDecisionBindsThePageStream(t *testing.T) {
 	f.ensureApproval(t, deliveryExemptOutsideWindow, []deliveryExemptionRow{collatedRow(f)})
 	// The page recording moves to a second, decided stream; the catalog output
 	// keeps stream 3.
-	const pageStream = 78
+	const pageStream = 158
 	f.fixture(`INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
- VALUES(78,'test','78','pageside','pageside','https://test.invalid','off','UTC','hls','video_manifest','video_live','continuous_video',30)`)
+ VALUES(158,'test','158','pageside','pageside','https://test.invalid','off','Asia/Seoul','hls','video_manifest','video_live','continuous_video',30)`)
 	f.fixture(`INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
- VALUES(31,47,1,'pageside','https://test.invalid','* * * * *','UTC','paused',78,now())`)
+ VALUES(31,47,1,'pageside','https://test.invalid','* * * * *','Asia/Seoul','paused',158,now())`)
 	f.fixture(`UPDATE delivery_keep_holds SET recording_id=31 WHERE bucket='stoarama' AND object_key=$1`, f.key)
 	pageWindow, ok := f.windows[pageStream]
 	if !ok || pageWindow.Start.Equal(f.windows[3].Start) {
@@ -1418,12 +1418,14 @@ func TestR2NonrawExemptionRefusesPageContentMismatch(t *testing.T) {
 func TestR2NonrawExemptionRefusesAmbiguousPageWindow(t *testing.T) {
 	f := newNonrawFixture(t, "exempt_page_window")
 	f.withPageKeys()
-	const pageStream = 78
-	// Stream 78's pinned window (2026-08-19..2026-09-16) differs from stream 3's.
+	// Stream 94's pinned window (2026-10-11..2026-11-08) is DISJOINT from stream
+	// 3's, so moving the output inside 94's window keeps it outside stream 3's,
+	// and 94 is not one of the owner's thesis keep streams (854/537/78/415).
+	const pageStream = 94
 	f.fixture(`INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
- VALUES(78,'test','78','pageside','pageside','https://test.invalid','off','UTC','hls','video_manifest','video_live','continuous_video',30)`)
+ VALUES(94,'test','94','pageside','pageside','https://test.invalid','off','America/Los_Angeles','hls','video_manifest','video_live','continuous_video',30)`)
 	f.fixture(`INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
- VALUES(31,47,1,'pageside','https://test.invalid','* * * * *','UTC','paused',78,now())`)
+ VALUES(31,47,1,'pageside','https://test.invalid','* * * * *','America/Los_Angeles','paused',94,now())`)
 	f.fixture(`UPDATE delivery_keep_holds SET recording_id=31 WHERE bucket='stoarama' AND object_key=$1`, f.key)
 	pageWindow, ok := f.windows[pageStream]
 	if !ok || pageWindow.Start.Equal(f.windows[3].Start) {
@@ -1459,5 +1461,305 @@ func TestR2NonrawExemptionRefusesAmbiguousPageWindow(t *testing.T) {
 	}
 	if err := f.seed(t, deliveryExemptOutsideWindow, collatedRow(f)); err == nil || !strings.Contains(err.Error(), "page stream") {
 		t.Fatalf("a page stream with no pinned window seeded as outside_window: %v", err)
+	}
+}
+
+// pageStreamFixture gives the page row its OWN recording on a decided stream, so
+// the page stream and the catalog output's stream are different live facts. The
+// catalog output keeps stream 3 and the interval the caller names.
+func (f *nonrawFixture) pageStreamFixture(t *testing.T, pageStream int64, start, end string) {
+	t.Helper()
+	f.fixture(`INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
+  VALUES(158,'test','158','pageside','pageside','https://test.invalid','off','Asia/Seoul','hls','video_manifest','video_live','continuous_video',30)`)
+	f.fixture(`INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
+  VALUES(31,47,1,'pageside','https://test.invalid','* * * * *','Asia/Seoul','paused',$1,now())`, pageStream)
+	f.fixture(`UPDATE delivery_keep_holds SET recording_id=31 WHERE bucket='stoarama' AND object_key=$1`, f.key)
+	f.fixture(`UPDATE recording_collation_outputs SET start_at=$1,end_at=$2 WHERE id=$3`, start, end, f.outputID)
+	if err := os.WriteFile(f.picks, mustPickJSON(t, f.windows[3], map[string]r2RetirePick{fmt.Sprint(pageStream): {
+		Choice: "none", KeepStartUTC: f.windows[pageStream].Start.Format(time.RFC3339), KeepEndUTC: f.windows[pageStream].End.Format(time.RFC3339)}}), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// countNonrawWrites is every durable row a refused reservation or wire must not
+// leave behind for this key.
+func (f *nonrawFixture) countNonrawWrites(t *testing.T) [4]int64 {
+	t.Helper()
+	var out [4]int64
+	if err := f.pool.QueryRow(f.ctx, `SELECT (SELECT count(*) FROM r2_nonraw_intents WHERE object_key=$1),
+ (SELECT count(*) FROM r2_retirement_reservations WHERE object_key=$1),
+ (SELECT count(*) FROM r2_nonraw_attempts WHERE object_key=$1),
+ (SELECT count(*) FROM r2_object_retirements WHERE object_key=$1)`, f.key).Scan(&out[0], &out[1], &out[2], &out[3]); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestR2NonrawPageAuthorityRefusedAtReserve: the reservation evaluates the SAME
+// page authority the roster does, over the LIVE page stream and the exact catalog
+// interval. A page recording that moves to another valid, decided stream whose
+// window contains the output — or an interval that drifts into the distinct page
+// stream's window after the seed — refuses even with an unchanged ETag and size.
+func TestR2NonrawPageAuthorityRefusedAtReserve(t *testing.T) {
+	for _, tc := range []struct {
+		name                        string
+		pageStream                  int64
+		start, end, drift, driftEnd string
+	}{
+		// Seeded outside stream 3's window, then the page recording is reassigned
+		// to stream 94, whose window (2026-10-11..2026-11-08) contains the output:
+		// same ETag, same size, same interval.
+		{"page_reassigned_to_decided_stream", 3, "2026-10-20T00:00:00Z", "2026-10-20T00:01:00Z", "", ""},
+		// Page stream is 158 from the start; the seed's interval is outside its
+		// window, then the interval drifts into 158's window (2026-09-30..2026-10-28)
+		// with the page row unchanged.
+		{"interval_drifts_into_page_stream_window", 158, "2026-06-01T00:00:00Z", "2026-06-01T00:01:00Z", "2026-10-20T00:00:00Z", "2026-10-20T00:01:00Z"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newNonrawFixture(t, "exempt_page_authority")
+			f.withPageKeys()
+			f.pageStreamFixture(t, tc.pageStream, tc.start, tc.end)
+			f.mustSeed(t, deliveryExemptOutsideWindow, collatedRow(f))
+			if !f.exempt(t, f.key) {
+				t.Fatal("control: the row did not seed outside_window")
+			}
+			if tc.drift != "" {
+				f.fixture(`UPDATE recording_collation_outputs SET start_at=$1,end_at=$2 WHERE id=$3`, tc.drift, tc.driftEnd, f.outputID)
+			} else {
+				// Reassign the page recording to stream 94, whose pinned window
+				// contains the seeded interval. The listing identity never moves.
+				f.fixture(`INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
+  VALUES(94,'test','94','reassign','reassign','https://test.invalid','off','America/Los_Angeles','hls','video_manifest','video_live','continuous_video',30)`)
+				f.exec(`UPDATE recordings SET stream_id=94 WHERE id=31`)
+			}
+			a := f.applier(t, "reserve")
+			defer a.ledger.close()
+			_, err := a.reserveNonraw(f.ctx, f.collatedEntry())
+			if !errors.Is(err, errInverseNonrawIneligible) || !strings.Contains(err.Error(), "page") {
+				t.Fatalf("reservation adopted a drifted page authority: %v", err)
+			}
+			if wrote := f.countNonrawWrites(t); wrote != [4]int64{} || f.deletes() != 0 {
+				t.Fatalf("refused reservation wrote %v", wrote)
+			}
+		})
+	}
+}
+
+// TestR2NonrawPageAuthorityRefusedAtFinalWire: a reservation that was valid when
+// it committed cannot be spent after the page recording is reassigned to another
+// valid, decided stream whose window contains the output. The final wire reload
+// refuses with the unchanged listing ETag and size, and no DELETE is sent.
+func TestR2NonrawPageAuthorityRefusedAtFinalWire(t *testing.T) {
+	f := newNonrawFixture(t, "exempt_page_wire")
+	f.withPageKeys()
+	f.pageStreamFixture(t, 3, "2026-08-20T00:00:00Z", "2026-08-20T00:01:00Z")
+	f.mustSeed(t, deliveryExemptOutsideWindow, collatedRow(f))
+	entry := f.collatedEntry()
+	reserve := f.applier(t, "reserve")
+	if _, err := reserve.reserveNonraw(f.ctx, entry); err != nil {
+		t.Fatalf("control: the exact page identity did not reserve: %v", err)
+	}
+	reserve.ledger.close()
+	if wrote := f.countNonrawWrites(t); wrote != [4]int64{1, 1, 0, 0} {
+		t.Fatalf("control wrote %v", wrote)
+	}
+	// Same ETag, same size, same interval: only the page recording's stream moves,
+	// to another stream with a positive window-bound decision that contains it.
+	f.exec(`UPDATE recordings SET stream_id=158 WHERE id=31`)
+	a := f.applier(t, "wire")
+	defer a.ledger.close()
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(f.ctx)
+	if _, err = a.authorizeNonraw(f.ctx, tx, entry, &inverseSendGate{}); !errors.Is(err, errInverseNonrawIneligible) || !strings.Contains(err.Error(), "page authority") {
+		t.Fatalf("final wire adopted a reassigned page recording: %v", err)
+	}
+	if wrote := f.countNonrawWrites(t); wrote != [4]int64{1, 1, 0, 0} || f.deletes() != 0 {
+		t.Fatalf("refused wire wrote %v or deleted %d", wrote, f.deletes())
+	}
+}
+
+func TestR2NonrawOwnerKeepStreamAddedAfterBatchAdmission(t *testing.T) {
+	f := newNonrawFixture(t, "late_owner_keep_stream")
+	f.withPageKeys()
+	f.mustSeed(t, deliveryExemptOutsideWindow, collatedRow(f))
+	entry := f.collatedEntry()
+	a := f.applier(t, "late_owner_keep_stream")
+	defer a.ledger.close()
+	if a.protection.OwnerKeepStreams[3] {
+		t.Fatal("control started with an owner hold for stream 3")
+	}
+	if _, err := a.reserveNonraw(f.ctx, entry); err != nil {
+		t.Fatalf("control reservation: %v", err)
+	}
+	f.exec(`INSERT INTO r2_owner_keep_prefixes(bucket,prefix,decision)
+ VALUES('stoarama','raw/stream/3/','keep stream 3')`)
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(f.ctx)
+	if _, err = a.authorizeNonraw(f.ctx, tx, entry, &inverseSendGate{}); !errors.Is(err, errInverseNonrawIneligible) || !strings.Contains(err.Error(), "owner_keep_stream") {
+		t.Fatalf("wire did not see the live owner hold: %v", err)
+	}
+	if wrote := f.countNonrawWrites(t); wrote != [4]int64{1, 1, 0, 0} || f.deletes() != 0 {
+		t.Fatalf("owner hold allowed writes %v or %d deletes", wrote, f.deletes())
+	}
+}
+
+// TestR2NonrawExemptionStrictIdentityRepresentations: the guard points demand the
+// SAME exact representations the SQL compares and CHECKs. A case-folded sha256 or
+// a quote-trimmed ETag that SQL would refuse is refused here instead of being
+// normalized into authority; the canonical provider identity is unaffected.
+func TestR2NonrawExemptionStrictIdentityRepresentations(t *testing.T) {
+	f := newNonrawFixture(t, "exempt_strict_identity")
+	f.withPageKeys()
+	picks, err := loadR2RetirePicks(f.picks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []deliveryExemptionRow{collatedRow(f)}
+	f.fixture(`INSERT INTO r2_delivery_exemption_approvals(class,roster_sha256,decision) VALUES('outside_window',repeat('6',64),'x')`)
+	insertExemption := func(etag string) error {
+		tx, err := f.pool.Begin(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(f.ctx)
+		_, err = tx.Exec(f.ctx, `INSERT INTO r2_delivery_exemptions(bucket,object_key,etag,size_bytes,class,approval_id,decision,roster_sha256)
+  SELECT 'stoarama',$1,$2,900,'outside_window',id,'x',repeat('6',64) FROM r2_delivery_exemption_approvals WHERE roster_sha256=repeat('6',64)`, f.key, etag)
+		return err
+	}
+	// SQL's own ledger CHECK refuses an upper-case sha256, so no exemption may
+	// open a gate whose receipt could never be written.
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
+  VALUES('collated',$1,'stoarama',$2,900,upper($3),$4)`, f.outputID, f.key, nonrawOutputSHA, strings.Repeat("d", 64)); err == nil {
+		t.Fatal("SQL admitted an upper-case sha256 reservation")
+	}
+	// The page row's sha256 is upper-case: the folded comparison would have
+	// matched the catalog, so validate, approve and seed must each refuse.
+	f.fixture(`UPDATE delivery_keep_holds SET sha256=upper($2) WHERE bucket='stoarama' AND object_key=$1`, f.key, nonrawOutputSHA)
+	if err := insertExemption(rows[0].ETag); err == nil || !strings.Contains(err.Error(), "carry the catalog sha256") {
+		t.Fatalf("SQL admission accepted an upper-case page sha256: %v", err)
+	}
+	if n, vErr := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptOutsideWindow, rows, picks); vErr == nil || n != 0 {
+		t.Fatalf("an upper-case page sha256 validated: %d %v", n, vErr)
+	}
+	if _, aErr := recordDeliveryExemptionApproval(f.ctx, f.pool, deliveryExemptOutsideWindow, approvalDigest(deliveryExemptOutsideWindow, rows), deliveryExemptionDecisions[deliveryExemptOutsideWindow], rows, picks); aErr == nil {
+		t.Fatal("an upper-case page sha256 was approved")
+	}
+	if sErr := f.seed(t, deliveryExemptOutsideWindow, rows...); sErr == nil {
+		t.Fatal("an upper-case page sha256 seeded")
+	}
+	// Restore the content hash and quote the page ETag. The exemption admission
+	// trigger compares h.etag verbatim, so a quoted stored value is not the page
+	// identity the SQL binds.
+	f.fixture(`UPDATE delivery_keep_holds SET sha256=$2,etag='"'||etag||'"' WHERE bucket='stoarama' AND object_key=$1`, f.key, nonrawOutputSHA)
+	quoted := rows[0]
+	quoted.ETag = `"collated-etag"`
+	if n, vErr := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptOutsideWindow, []deliveryExemptionRow{quoted}, picks); vErr == nil || n != 0 {
+		t.Fatalf("a quote-trimmed page ETag validated: %d %v", n, vErr)
+	}
+	if sErr := f.seed(t, deliveryExemptOutsideWindow, quoted); sErr == nil {
+		t.Fatal("a quote-trimmed page ETag seeded")
+	}
+	// And the SQL admission trigger refuses the canonical exemption against a
+	// quoted page row: SQL compares h.etag and NEW.etag verbatim, so the provider's
+	// canonical identity can never match a quote-padded stored value.
+	if err := insertExemption(rows[0].ETag); err == nil || !strings.Contains(err.Error(), "exact live page identity") {
+		t.Fatalf("SQL admission accepted a canonical ETag against a quoted page row: %v", err)
+	}
+	if err := insertExemption(quoted.ETag); err == nil || !strings.Contains(err.Error(), "r2_delivery_exemptions_etag_check") {
+		t.Fatalf("SQL admission accepted a matching quoted ETag: %v", err)
+	}
+	// The canonical identity is still exactly what the guards accept.
+	f.fixture(`UPDATE delivery_keep_holds SET etag=$2 WHERE bucket='stoarama' AND object_key=$1`, f.key, "collated-etag")
+	if n, vErr := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptOutsideWindow, rows, picks); vErr != nil || n != 1 {
+		t.Fatalf("the canonical identity was refused: %d %v", n, vErr)
+	}
+	f.mustSeed(t, deliveryExemptOutsideWindow, rows...)
+	entry := f.collatedEntry()
+	entry.ETag = `"collated-etag"`
+	a := f.applier(t, "quoted")
+	defer a.ledger.close()
+	if _, err := a.reserveNonraw(f.ctx, entry); !errors.Is(err, errInverseNonrawIneligible) {
+		t.Fatalf("a quoted listing ETag reserved: %v", err)
+	}
+	if wrote := f.countNonrawWrites(t); wrote != [4]int64{} || f.deletes() != 0 {
+		t.Fatalf("the quoted listing ETag wrote %v", wrote)
+	}
+}
+
+// TestR2NonrawExemptionRosterReadsClassifierHolds: the roster decision reads the
+// classifier's OWN Held and Retiring sets, which are not the seed statement's
+// view. An effective R2 cleanup release clears nas_cleanup_r2_reserved_files while
+// the wider nas_cleanup_reserved_files still holds the source, so the seed must
+// refuse rather than approve a row the wire then holds.
+func TestR2NonrawExemptionRosterReadsClassifierHolds(t *testing.T) {
+	f := newNonrawFixture(t, "exempt_classifier_holds")
+	f.withPageKeys()
+	picks, err := loadR2RetirePicks(f.picks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []deliveryExemptionRow{collatedRow(f)}
+	// A cleanup plan reserves this exact collated output and is released by an
+	// effective R2 release, so only the wider view still lists it.
+	f.fixture(`INSERT INTO nas_cleanup_plans(id,account_id,connection_id,mode,label,report_sha256,manifest,plan_sha256)
+  VALUES(91,47,13,'paused','released-output',repeat('c',64),
+   jsonb_build_array(jsonb_build_object('kind','collated','source_id',$1::bigint,'relative_path','nightly/video.mp4')),repeat('b',64))`, f.outputID)
+	f.fixture(`INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state,delete_ever_issued,recovery,outcome)
+  VALUES(9101,91,1,'deleted',true,'r2_sha_verified','{"outcome":"deleted"}')`)
+	f.fixture(`INSERT INTO nas_cleanup_r2_releases(item_id,manifest_sha256,picks_sha256,policy_sha256,reason,authority)
+  SELECT 9101,repeat('a',64),repeat('b',64),repeat('c',64),'fixture',jsonb_build_object('recovery',i.recovery,
+   'receipt_sha256',encode(sha256(convert_to(i.outcome::text,'UTF8')),'hex'),
+   'recovery_sha256',encode(sha256(convert_to(coalesce(i.recovery_evidence::text,''),'UTF8')),'hex'))
+  FROM nas_cleanup_items i WHERE i.id=9101`)
+	var r2View, wideView bool
+	if err := f.pool.QueryRow(f.ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_r2_reserved_files WHERE kind='collated' AND source_id=$1),
+  EXISTS(SELECT 1 FROM nas_cleanup_reserved_files WHERE kind='collated' AND source_id=$1)`, f.outputID).Scan(&r2View, &wideView); err != nil {
+		t.Fatal(err)
+	}
+	if r2View || !wideView {
+		t.Fatalf("fixture: r2 view=%v wide view=%v, want false/true", r2View, wideView)
+	}
+	// The seed statement's own hold predicate therefore clears the key...
+	var seedHeld bool
+	if err := f.pool.QueryRow(f.ctx, `SELECT r2_nonraw_key_held_except_page('stoarama',$1,'collated',$2)`, f.key, f.outputID).Scan(&seedHeld); err != nil || seedHeld {
+		t.Fatalf("seed statement held=%v (%v)", seedHeld, err)
+	}
+	// ...but the classifier the executor reads still holds it.
+	p, err := loadInverseProtectionMode(f.ctx, f.pool, "stoarama", picks, f.windows, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.Held[f.key] {
+		t.Fatal("the live classifier did not hold the key")
+	}
+	if n, vErr := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptOutsideWindow, rows, picks); vErr == nil || n != 0 {
+		t.Fatalf("a classifier-held row validated: %d %v", n, vErr)
+	}
+	if _, aErr := recordDeliveryExemptionApproval(f.ctx, f.pool, deliveryExemptOutsideWindow, approvalDigest(deliveryExemptOutsideWindow, rows), deliveryExemptionDecisions[deliveryExemptOutsideWindow], rows, picks); aErr == nil {
+		t.Fatal("a classifier-held row was approved")
+	}
+	if sErr := f.seed(t, deliveryExemptOutsideWindow, rows...); sErr == nil || !strings.Contains(sErr.Error(), "held by the live classifier") {
+		t.Fatalf("a classifier-held row seeded: %v", sErr)
+	}
+	if f.exempt(t, f.key) {
+		t.Fatal("a classifier-held row became exempt")
+	}
+	// A key with a committed retirement is refused by the same roster decision
+	// rather than re-staged: the exemption opens the page hold, and the exact
+	// reservation is then admitted, after which a second roster pass must refuse.
+	g := newNonrawFixture(t, "exempt_retiring")
+	g.withPageKeys()
+	g.mustSeed(t, deliveryExemptOutsideWindow, collatedRow(g))
+	g.exec(`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
+  VALUES('collated',$1,'stoarama',$2,900,$3,$4)`, g.outputID, g.key, nonrawOutputSHA, strings.Repeat("d", 64))
+	gRows := []deliveryExemptionRow{collatedRow(g)}
+	if err := g.seed(t, deliveryExemptOutsideWindow, gRows...); err == nil || !strings.Contains(err.Error(), "retirement reservation or receipt") {
+		t.Fatalf("a retiring key was re-staged: %v", err)
 	}
 }

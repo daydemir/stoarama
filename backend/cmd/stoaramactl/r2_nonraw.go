@@ -212,6 +212,12 @@ func (p inverseProtection) classifyCollated(o r2.ObjectInfo, x inverseCollatedAs
 	if x.StreamID > 0 && p.Picks.Choices[x.StreamID].Choice == "all" {
 		return inverseKE, "keep_everything_stream"
 	}
+	// A thesis/owner keep stream protects its footage wherever it lives. A
+	// collated output's key is joined/... and its sources are managed/..., so no
+	// key prefix can ever see them: the stream id itself is the hold.
+	if p.OwnerKeepStreams[x.StreamID] {
+		return inverseKE, "owner_keep_stream"
+	}
 	// A KE folder alias on the output's own stored path protects it. These are
 	// catalog facts, so they are read here rather than trusted from the batch,
 	// and assessRepair applies the same rule to a confident repair's stored path
@@ -287,6 +293,8 @@ func assessRepair(p inverseProtection, x inverseCollatedAssessment) inverseColla
 		x.Reason = "key_also_raw_identity"
 	case x.Held:
 		x.Reason = "live_hold"
+	case p.OwnerKeepStreams[x.StreamID]:
+		x.Reason = "owner_keep_stream"
 	case x.StreamID <= 0 || !r2RetireLowerHex64(x.SHA) || x.Path == "":
 		x.Reason = "repair_identity_incomplete"
 	case choice != "all" && choice != "none" && choice != "st" && choice != "keep":
@@ -358,6 +366,10 @@ func assessCollated(p inverseProtection, x inverseCollatedAssessment) inverseCol
 		x.Reason = "keep_everything_stream"
 		return x
 	}
+	if p.OwnerKeepStreams[x.StreamID] {
+		x.Reason = "owner_keep_stream"
+		return x
+	}
 	if w := p.Windows[x.StreamID]; x.Start.Before(w.End) && x.End.After(w.Start) {
 		x.Keep28 = true
 	}
@@ -368,6 +380,13 @@ func assessCollated(p inverseProtection, x inverseCollatedAssessment) inverseCol
 		}
 	}
 	for _, s := range x.Sources {
+		// A thesis/owner keep stream protects its footage even when it leaves R2
+		// inside a collated output. The source's key is managed/..., never under
+		// the RAW prefix hold, so the stream id is what decides it.
+		if p.OwnerKeepStreams[s.StreamID] {
+			x.Reason = "owner_keep_source_stream"
+			return x
+		}
 		// The RAW classifier protects a KE folder in either the R2 key or the
 		// catalog path; a source must be protected the same way.
 		for _, component := range strings.Split(s.Key, "/") {
@@ -461,28 +480,42 @@ func (a *inverseApplier) loadNonrawTarget(ctx context.Context, tx pgx.Tx, e inve
 	if err != nil {
 		return t, err
 	}
-	t = loader.assess(a.protection, t)
+	// The existing protection locks serialize this lookup with owner keep
+	// admission. A new stream hold can cover a joined key indirectly even
+	// when neither the key nor its sources match the held RAW prefix.
+	protection := a.protection
+	prefixes, err := loadInverseOwnerKeepPrefixes(ctx, tx, a.store.Bucket())
+	if err != nil {
+		return t, err
+	}
+	protection.OwnerKeepStreams = ownerKeepStreamIDs(prefixes)
+	t = loader.assess(protection, t)
 	if n != 1 || t.ID <= 0 || t.SizeBytes <= 0 || t.SizeBytes != e.SizeBytes || t.Reason != "" || t.keep28Held() {
 		return t, fmt.Errorf("%w: %s identity absent, protected, unresolved or changed (%s)", errInverseNonrawIneligible, kind, t.Reason)
 	}
 	// An exemption binds the exact page object; the listed object must be it.
-	if t.Exemption != "" && strings.Trim(e.ETag, `"`) != t.ExemptETag {
-		return t, fmt.Errorf("%w: listed ETag differs from the exempt page identity", errInverseNonrawIneligible)
+	// Both sides are compared canonically, and a non-canonical listing ETag is
+	// refused rather than trimmed into a match.
+	if t.Exemption != "" {
+		if !inverseETagMatches(e.ETag, t.ExemptETag) {
+			return t, fmt.Errorf("%w: listed ETag differs from the exempt page identity", errInverseNonrawIneligible)
+		}
 	}
 	t.Choice = a.protection.Picks.Choices[t.StreamID].Choice
 	if t.Choice == "all" {
 		return t, fmt.Errorf("%w: keep-everything stream", errInverseNonrawIneligible)
 	}
-	// For an exempt delivery page key, the PAGE RECORDING's own stream must be
-	// decided too, not only the catalog output's: a page row can name a
-	// keep-everything or undecided stream while the output names a decided one.
+	// An exempt delivery page key is judged by the SAME typed page-authority
+	// predicate the roster decision uses, over the live page row and the exact
+	// catalog interval. An overlap can arise from page reassignment or interval
+	// drift after seeding, even when the listing ETag and size are unchanged.
 	if t.Exemption != "" {
-		pageStream, found, err := a.pageRecordingStream(ctx, tx, e.Key)
+		page, err := loadInversePageAuthority(ctx, tx, a.store.Bucket(), e.Key)
 		if err != nil {
 			return t, err
 		}
-		if !found || !deliveryPageStreamDecided(a.protection.Picks, a.protection.Windows, pageStream) {
-			return t, fmt.Errorf("%w: page recording stream %d has no positive non-keep-everything decision", errInverseNonrawIneligible, pageStream)
+		if err := protection.deliveryPageAuthorityError(t.Exemption, page, t, e.ETag, e.SizeBytes); err != nil {
+			return t, fmt.Errorf("%w: live page authority refused: %w", errInverseNonrawIneligible, err)
 		}
 	}
 	if class, reason := a.protection.classify(e.ObjectInfo); class != inverseCollated {
@@ -491,15 +524,21 @@ func (a *inverseApplier) loadNonrawTarget(ctx context.Context, tx pgx.Tx, e inve
 	return t, nil
 }
 
-// pageRecordingStream reads the live stream the delivery page recording row
-// names for an exact page key. found is false when the key has no page row.
-func (a *inverseApplier) pageRecordingStream(ctx context.Context, q r2RetireQuerier, key string) (stream int64, found bool, err error) {
-	err = q.QueryRow(ctx, `SELECT coalesce(rec.stream_id,0) FROM delivery_keep_holds h
- LEFT JOIN recordings rec ON rec.id=h.recording_id WHERE h.bucket=$1 AND h.object_key=$2`, a.store.Bucket(), key).Scan(&stream)
+// inversePageAuthoritySQL is the ONE live read of a delivery page key's state:
+// the recording's own stream, the identity an exemption binds, the page kind and
+// the page row's own verbatim content hash. The read-only roster decision and the
+// reserve/final-wire reload both evaluate deliveryPageAuthorityError over it, so
+// no guard can see a different page row than another.
+const inversePageAuthoritySQL = `SELECT h.object_key,coalesce(rec.stream_id,0),h.etag,h.size_bytes,h.kind,h.sha256
+FROM delivery_keep_holds h LEFT JOIN recordings rec ON rec.id=h.recording_id WHERE h.bucket=$1`
+
+// loadInversePageAuthority reads the live page authority for one exact key.
+func loadInversePageAuthority(ctx context.Context, q r2RetireQuerier, bucket, key string) (inversePageAuthority, error) {
+	p, err := scanInversePageAuthority(q.QueryRow(ctx, inversePageAuthoritySQL+` AND h.object_key=$2`, bucket, key))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, false, nil
+		return inversePageAuthority{}, nil
 	}
-	return stream, err == nil, err
+	return p, err
 }
 
 var errInverseNonrawIneligible = errors.New("collated target ineligible")
