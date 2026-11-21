@@ -103,6 +103,7 @@ type rules struct {
 	RecentFrom int64 // objects modified at or after this instant are protected
 	Released   map[string]bool
 	Evidence   map[string]evidence // nil unless nas_keep_20 is released
+	Fresh      map[string]object   // delete only: the listing taken right before the run
 }
 
 type ruleFiles struct {

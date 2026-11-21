@@ -25,6 +25,7 @@ const (
 	outcomeDeleted          outcome = "deleted"
 	outcomeFailed           outcome = "failed"
 	outcomeSkippedProtected outcome = "skipped_protected"
+	outcomeSkippedChanged   outcome = "skipped_changed"
 )
 
 type ledgerRow struct {
@@ -41,13 +42,14 @@ func runDelete(ctx context.Context, args []string) error {
 	files.register(fs)
 	manifest := fs.String("manifest", "", "delete-manifest.jsonl from plan")
 	summaryPath := fs.String("summary", "", "summary.json the reviewed plan wrote beside the manifest")
+	freshPath := fs.String("fresh-listing", "", "listing taken right before this run; a key whose ETag, size or mtime changed since the plan is skipped")
 	expected := fs.String("expected-sha256", "", "reviewed SHA-256 of the manifest")
 	ledger := fs.String("ledger", "", "new ledger JSONL path")
 	workers := fs.Int("workers", 16, "parallel DeleteObjects requests")
 	limit := fs.Int("limit", 0, "delete at most this many keys (0: all), for a canary")
 	fs.Parse(args)
-	if *manifest == "" || *expected == "" || *ledger == "" || *summaryPath == "" {
-		return errors.New("--manifest, --summary, --expected-sha256 and --ledger are required")
+	if *manifest == "" || *expected == "" || *ledger == "" || *summaryPath == "" || *freshPath == "" {
+		return errors.New("--manifest, --summary, --fresh-listing, --expected-sha256 and --ledger are required")
 	}
 	run, err := verifyReviewedInputs(*manifest, *summaryPath, *expected, files)
 	if err != nil {
@@ -61,6 +63,12 @@ func runDelete(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	if run.FreshListingSHA256, err = fileSHA256(*freshPath); err != nil {
+		return err
+	}
+	if r.Fresh, err = loadFresh(*freshPath, *manifest); err != nil {
+		return err
+	}
 	return deleteManifest(ctx, st, r, run, *manifest, *ledger, *workers, *limit)
 }
 
@@ -71,8 +79,10 @@ type runHeader struct {
 	Inputs         map[string]string `json:"inputs_sha256"`
 	RecentFrom     string            `json:"recent_from"`
 	Release        string            `json:"release"`
-	Limit          int               `json:"limit"`
-	StartedAt      string            `json:"started_at"`
+	// FreshListingSHA256 pins the listing each key's identity was re-checked against.
+	FreshListingSHA256 string `json:"fresh_listing_sha256"`
+	Limit              int    `json:"limit"`
+	StartedAt          string `json:"started_at"`
 }
 
 // verifyReviewedInputs refuses unless the manifest and every rule file the
@@ -151,7 +161,7 @@ func deleteManifest(ctx context.Context, st store, r *rules, run runHeader, mani
 				deleted++
 			case outcomeFailed:
 				failed++
-			case outcomeSkippedProtected:
+			case outcomeSkippedProtected, outcomeSkippedChanged:
 				skipped++
 			}
 			if err := enc.Encode(row); err != nil {
@@ -179,7 +189,15 @@ func deleteManifest(ctx context.Context, st store, r *rules, run runHeader, mani
 			return nil
 		}
 		n++
-		if c, reason := r.decide(object{Key: row.Key, Size: row.Size, ETag: row.ETag, MTime: row.MTime}); c != row.Class || !c.deletes() {
+		planned := object{Key: row.Key, Size: row.Size, ETag: row.ETag, MTime: row.MTime}
+		if now, ok := r.Fresh[row.Key]; !ok || now != planned {
+			detail := "absent_from_fresh_listing"
+			if ok {
+				detail = fmt.Sprintf("now size=%d etag=%s mtime=%d", now.Size, now.ETag, now.MTime)
+			}
+			return record([]ledgerRow{{Key: row.Key, Size: row.Size, Outcome: outcomeSkippedChanged, Detail: detail}})
+		}
+		if c, reason := r.decide(planned); c != row.Class || !c.deletes() {
 			return record([]ledgerRow{{Key: row.Key, Size: row.Size, Outcome: outcomeSkippedProtected, Detail: string(c) + ":" + reason}})
 		}
 		batch = append(batch, row)
@@ -194,7 +212,7 @@ func deleteManifest(ctx context.Context, st store, r *rules, run runHeader, mani
 	if werr := g.Wait(); err == nil {
 		err = werr
 	}
-	fmt.Fprintf(os.Stderr, "deleted %d, failed %d, skipped as protected %d\n", deleted, failed, skipped)
+	fmt.Fprintf(os.Stderr, "deleted %d, failed %d, skipped (protected or changed) %d\n", deleted, failed, skipped)
 	if err == nil && failed > 0 {
 		err = fmt.Errorf("%d keys failed; see the ledger", failed)
 	}
@@ -239,4 +257,27 @@ func sortedKeysOf(m map[string]string) []string {
 		keys[k] = true
 	}
 	return sortedKeys(keys)
+}
+
+// loadFresh reads the fresh listing rows for the manifest's keys only.
+func loadFresh(listing, manifest string) (map[string]object, error) {
+	want := map[string]bool{}
+	if err := eachLine(manifest, func(line string) error {
+		var row manifestRow
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			return err
+		}
+		want[row.Key] = true
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	fresh := make(map[string]object, len(want))
+	err := eachSnapshot(listing, func(o object) error {
+		if want[o.Key] {
+			fresh[o.Key] = o
+		}
+		return nil
+	})
+	return fresh, err
 }

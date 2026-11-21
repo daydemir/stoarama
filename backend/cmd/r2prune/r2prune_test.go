@@ -280,6 +280,19 @@ func TestListPlanDeleteAgainstFakeS3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The fresh listing is the fake bucket as it is now, with one key rewritten.
+	fresh := filepath.Join(dir, "fresh.tsv")
+	ff, _ := os.Create(fresh)
+	if _, _, err := listBucket(context.Background(), st, 4, 3, ff); err != nil {
+		t.Fatal(err)
+	}
+	ff.Close()
+	if r.Fresh, err = loadFresh(fresh, manifest); err != nil {
+		t.Fatal(err)
+	}
+	rewritten := r.Fresh["managed/acct-47/a_folder/bulk/0007.mp4"]
+	rewritten.ETag = "changed"
+	r.Fresh["managed/acct-47/a_folder/bulk/0007.mp4"] = rewritten
 	if err := deleteManifest(context.Background(), st, r, run, manifest, ledger, 4, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +310,7 @@ func TestListPlanDeleteAgainstFakeS3(t *testing.T) {
 		outcomes[row.Outcome]++
 	}
 	lf.Close()
-	if outcomes[outcomeDeleted] != 2503 || outcomes[outcomeSkippedProtected] != 1 || outcomes[outcomeFailed] != 0 {
+	if outcomes[outcomeDeleted] != 2502 || outcomes[outcomeSkippedProtected] != 1 || outcomes[outcomeSkippedChanged] != 1 || outcomes[outcomeFailed] != 0 {
 		t.Fatalf("outcomes %v", outcomes)
 	}
 	if fake.deletes != 3 {
@@ -308,6 +321,9 @@ func TestListPlanDeleteAgainstFakeS3(t *testing.T) {
 		if _, ok := fake.objects[kept]; !ok {
 			t.Errorf("protected key %s was deleted", kept)
 		}
+	}
+	if _, ok := fake.objects["managed/acct-47/a_folder/bulk/0007.mp4"]; !ok {
+		t.Error("a key changed since the plan was deleted")
 	}
 	if _, ok := fake.objects["managed/acct-47/a_folder/old.mp4"]; ok {
 		t.Error("outside-window RAW key survived")
