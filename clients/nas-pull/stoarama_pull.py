@@ -785,7 +785,7 @@ class Config:
             raise SystemExit("STOARAMA_DOWNLOAD_WORKERS must be between 1 and %d" % MAX_DOWNLOAD_WORKERS)
         if self.restore_workers < 1 or self.restore_workers > MAX_RESTORE_WORKERS:
             raise SystemExit("STOARAMA_RESTORE_WORKERS must be between 1 and %d" % MAX_RESTORE_WORKERS)
-        if self.inventory_scan_interval_sec < 300 or self.inventory_scan_delay_ms < 0 or self.inventory_hash_mbps < 1 or self.inventory_hash_mbps > 1000:
+        if self.inventory_scan_interval_sec < 300 or self.inventory_scan_delay_ms < 0 or self.inventory_hash_mbps < 0 or self.inventory_hash_mbps > 1000:
             raise SystemExit("invalid NAS inventory scan cadence")
         if self.min_free_bytes < 1:
             raise SystemExit("STOARAMA_MIN_FREE_BYTES must be positive")
@@ -19314,9 +19314,10 @@ def sha256_file_throttled(path, megabytes_per_sec, stop_event):
                 break
             digest.update(chunk)
             size += len(chunk)
-            delay = len(chunk) / target_bytes_per_sec - (time.monotonic() - started)
-            if delay > 0 and stop_event.wait(delay):
-                raise InventoryScanStopped("inventory scan stopped")
+            if target_bytes_per_sec:
+                delay = len(chunk) / target_bytes_per_sec - (time.monotonic() - started)
+                if delay > 0 and stop_event.wait(delay):
+                    raise InventoryScanStopped("inventory scan stopped")
     return size, digest.hexdigest()
 
 
@@ -53820,8 +53821,9 @@ class R2CopyControl:
                  sent, first - sent if first >= 0 and sent >= 0 else -1, elapsed, status))
 
 
-def r2_copy_resources(cfg, runtime, needed=R2_COPY_RANGE):
-    stitch_resources(cfg)  # mounted root, host/cgroup headroom and load
+def r2_copy_resources(cfg, runtime, needed=R2_COPY_RANGE, workers=1):
+    if not os.path.ismount(str(cfg.output_dir)):
+        raise R2CopyHold("NAS output root is not mounted")
     _, available = meminfo_bytes(_read_text("/proc/meminfo"))
     limit = cgroup_memory_limit()
     if limit is not None:
@@ -53831,7 +53833,7 @@ def r2_copy_resources(cfg, runtime, needed=R2_COPY_RANGE):
         if used is None:
             raise R2CopyHold("copy cgroup memory telemetry unavailable")
         available = min(available, limit - int(used))
-    if available < 512 * 1024 * 1024 + 4 * R2_COPY_WORKERS * R2_COPY_RANGE:
+    if available < 512 * 1024 * 1024 + 4 * workers * R2_COPY_RANGE:
         raise R2CopyHold("copy memory headroom")
     status = storage_status(cfg)
     with runtime.lock:
@@ -53839,6 +53841,23 @@ def r2_copy_resources(cfg, runtime, needed=R2_COPY_RANGE):
     if not status.get("available") or free < max(R2_COPY_FLOOR, cfg.min_free_bytes) + needed:
         raise R2CopyHold("copy free-space floor")
     return free
+
+
+class R2CopyAdmission:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.workers = 0
+
+    @contextmanager
+    def claim(self, cfg, runtime):
+        with self.lock:
+            free = r2_copy_resources(cfg, runtime, workers=self.workers + 1)
+            self.workers += 1
+        try:
+            yield free
+        finally:
+            with self.lock:
+                self.workers -= 1
 
 
 class R2CopyGuard:
@@ -54210,29 +54229,30 @@ def _execute_r2_copy(cfg, runtime, inventory, stop, task, control):
         os.close(parent)
 
 
-def r2_copy_worker(cfg, runtime, inventory, stop, worker):
+def r2_copy_worker(cfg, runtime, inventory, stop, worker, admission):
     with R2CopyControl(cfg, stop, worker) as control:
         wait = 0
         while not stop.wait(wait):
             wait = 60
             try:
-                free = r2_copy_resources(cfg, runtime)
-                # The API uses the admitted client version for Durham. Leaving
-                # the old opt-in absent also keeps staged leases off on rollback.
-                request = {"free_bytes": free, "verify_existing": True}
-                response = control.request_json(R2CopyControlOperation.LEASE, "/account/connections/r2-copy/lease",
-                                                body=request)
-                if response.get("blocked") is True:
-                    log("ERROR", "R2 copy server blocked id=%s reason=%s; key protected" % (response.get("id"), response.get("reason")))
-                    wait = 0
-                elif response.get("task") is not None:
-                    execute_r2_copy(cfg, runtime, inventory, stop, response["task"], control)
-                    wait = 0
+                with admission.claim(cfg, runtime) as free:
+                    # The API uses the admitted client version for Durham.
+                    request = {"free_bytes": free, "verify_existing": True}
+                    response = control.request_json(R2CopyControlOperation.LEASE, "/account/connections/r2-copy/lease",
+                                                    body=request)
+                    if response.get("blocked") is True:
+                        log("ERROR", "R2 copy server blocked id=%s reason=%s; key protected" % (response.get("id"), response.get("reason")))
+                        wait = 0
+                    elif response.get("task") is not None:
+                        execute_r2_copy(cfg, runtime, inventory, stop, response["task"], control)
+                        wait = 0
             except urllib.error.HTTPError as exc:
                 R2_COPY_TELEMETRY.hold("http_%d" % exc.code)
                 log("WARN", "R2 copy control HTTP %d; holding" % exc.code)
             except Exception as exc:
                 reason = str(exc) if isinstance(exc, (R2CopyHold, StitchHold)) else type(exc).__name__
+                if reason == "copy memory headroom":
+                    wait = 5
                 R2_COPY_TELEMETRY.hold(reason)
                 log("WARN", "R2 copy held: %s%s" % (reason, memory_hold_diagnostics(reason)))
 
@@ -54240,8 +54260,9 @@ def r2_copy_worker(cfg, runtime, inventory, stop, worker):
 def r2_copy_loop(cfg, runtime, inventory, stop):
     # The supervisor stays alive until EVERY file/transport drains, so the
     # existing updater/shutdown gate also covers this complete bounded pool.
+    admission = R2CopyAdmission()
     with concurrent.futures.ThreadPoolExecutor(max_workers=R2_COPY_WORKERS, thread_name_prefix="r2-copy") as pool:
-        futures = [pool.submit(r2_copy_worker, cfg, runtime, inventory, stop, worker) for worker in range(R2_COPY_WORKERS)]
+        futures = [pool.submit(r2_copy_worker, cfg, runtime, inventory, stop, worker, admission) for worker in range(R2_COPY_WORKERS)]
         for future in futures:
             future.result()
 

@@ -33,6 +33,7 @@ class R2CopyWorkerTests(unittest.TestCase):
         self.stop = threading.Event()
         self.calls = []
         self.control_client = SimpleNamespace(request_json=self.control)
+        self.real_copy_resources = pull.r2_copy_resources
         for patch in (
             mock.patch.object(pull, "R2_COPY_TELEMETRY", pull.R2CopyTelemetry()),
             mock.patch.object(pull, "NAS_MEDIA_FENCE", pull.NASMediaFence()),
@@ -179,6 +180,27 @@ class R2CopyWorkerTests(unittest.TestCase):
         result = next(kw["body"] for path, kw in self.calls if path.endswith("/result"))
         self.assertEqual((result["completion"], result["downloaded_bytes"], result["committed_bytes"]), ("downloaded", len(self.body), len(self.body)))
 
+    def test_copy_claims_fit_available_memory_and_release_their_share(self):
+        admission = pull.R2CopyAdmission()
+        with mock.patch.object(pull, "r2_copy_resources", self.real_copy_resources), \
+                mock.patch.object(pull, "_read_text", return_value=""), \
+                mock.patch.object(pull, "meminfo_bytes", return_value=(2 << 30, 600 << 20)), \
+                mock.patch.object(pull, "cgroup_memory_limit", return_value=None), \
+                mock.patch.object(pull.os.path, "ismount", return_value=True):
+            with admission.claim(self.cfg, self.runtime):
+                with self.assertRaisesRegex(pull.R2CopyHold, "copy memory headroom"):
+                    with admission.claim(self.cfg, self.runtime):
+                        self.fail("second copy outgrew the memory budget")
+            with admission.claim(self.cfg, self.runtime):
+                self.assertEqual(admission.workers, 1)
+        self.assertEqual(admission.workers, 0)
+
+    def test_unthrottled_hash_keeps_the_exact_digest(self):
+        source = Path(self.tmp.name) / "sample"
+        source.write_bytes(self.body)
+        size, digest, _ = pull.sha256_file_throttled_stable(source, 0, self.stop)
+        self.assertEqual((size, digest), (len(self.body), self.item["sha256"]))
+
     def test_worker_immediately_moves_past_acknowledged_block_and_logs_http_holds(self):
         waits = []
         class Stop:
@@ -190,7 +212,7 @@ class R2CopyWorkerTests(unittest.TestCase):
         control.request_json.side_effect = [{"blocked": True, "id": 1, "reason": "r2_identity"},
                                            urllib.error.HTTPError("/lease", 409, "hold", {}, None)]
         with mock.patch.object(pull, "R2CopyControl", return_value=control), mock.patch.object(pull, "log") as logged:
-            pull.r2_copy_worker(self.cfg, self.runtime, self.inventory, Stop(), 0)
+            pull.r2_copy_worker(self.cfg, self.runtime, self.inventory, Stop(), 0, pull.R2CopyAdmission())
         self.assertEqual(waits, [0, 0, 60])
         logged.assert_any_call("WARN", "R2 copy control HTTP 409; holding")
 
@@ -206,7 +228,7 @@ class R2CopyWorkerTests(unittest.TestCase):
                         mock.patch.object(pull, "r2_copy_resources", return_value=10), \
                         mock.patch.object(pull, "CLIENT_VERSION", version), \
                         mock.patch.dict(os.environ, {"STOARAMA_R2_COPY_STITCH_OUTPUT_ENABLED": "true"}):
-                    pull.r2_copy_worker(self.cfg, self.runtime, self.inventory, stop, 0)
+                    pull.r2_copy_worker(self.cfg, self.runtime, self.inventory, stop, 0, pull.R2CopyAdmission())
                 request = control.request_json.call_args.kwargs["body"]
                 self.assertNotIn("accept_stitch_output", request)
 
