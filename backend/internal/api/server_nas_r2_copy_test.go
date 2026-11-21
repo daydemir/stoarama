@@ -97,6 +97,16 @@ func TestNASR2CopyDefaultOffAndInventory(t *testing.T) {
 		t.Fatal("floor ignored")
 	}
 	task := copyLease(t, f)
+	var clip struct {
+		Start string `json:"clip_start_at"`
+		End   string `json:"clip_end_at"`
+	}
+	if err := json.Unmarshal(task.Clip, &clip); err != nil {
+		t.Fatal(err)
+	}
+	if clip.Start != i.StartAt.UTC().Format(time.RFC3339Nano) || clip.End != i.EndAt.UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("copy sidecar timestamps must use the ordinary feed's exact UTC strings: got %q and %q", clip.Start, clip.End)
+	}
 	req := nasR2CopyControl{Token: task.Token, FreeBytes: NASR2CopyFloor + 1e9, Length: i.SizeBytes}
 	second := copyCall(f, "lease", 0, req)
 	if second.Code != 200 || !strings.Contains(second.Body.String(), `"task":null`) {

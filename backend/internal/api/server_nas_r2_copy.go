@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -195,13 +194,7 @@ func LoadNASR2CopySource(ctx context.Context, tx pgx.Tx, i NASR2CopyItem) (json.
 	if i.Kind != NASR2CopyRaw {
 		return nil, fmt.Errorf("%w: %s", errNASR2CopySourceIdentity, "collated custody requires follow-up support")
 	}
-	var stream, size int64
-	var bucket, key, sha, tz, path string
-	var start, end time.Time
-	var purged, held bool
-	var payload []byte
-	var token *string
-	err := tx.QueryRow(ctx, nasRedownloadSQL, i.SourceID, int64(47)).Scan(&stream, &bucket, &key, &sha, &size, &path, &start, &end, &tz, &purged, &held, &payload, &token)
+	source, err := loadNASRedownloadSource(ctx, tx.QueryRow, i.SourceID, 47)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("%w: copy source unavailable", errNASR2CopySourceIdentity)
@@ -212,8 +205,9 @@ func LoadNASR2CopySource(ctx context.Context, tx pgx.Tx, i NASR2CopyItem) (json.
 	if err != nil {
 		return nil, err
 	}
-	if stream != i.StreamID || bucket != i.Bucket || key != i.ObjectKey || sha != i.SHA256 || size != i.SizeBytes || path != i.RelativePath ||
-		!start.Equal(i.StartAt) || !end.Equal(i.EndAt) || tz != windows[stream].Timezone || purged || held {
+	if source.streamID != i.StreamID || source.bucket != i.Bucket || source.key != i.ObjectKey || source.sha != i.SHA256 ||
+		source.size != i.SizeBytes || source.path != i.RelativePath || !source.start.Equal(i.StartAt) ||
+		!source.end.Equal(i.EndAt) || source.timezone != windows[source.streamID].Timezone || source.purged || source.held {
 		return nil, fmt.Errorf("%w: %s", errNASR2CopySourceIdentity, "copy source changed, held, retired or outside policy")
 	}
 	// Raw and collated namespaces are disjoint (joined/ is refused above).
@@ -226,21 +220,13 @@ func LoadNASR2CopySource(ctx context.Context, tx pgx.Tx, i NASR2CopyItem) (json.
 	if alias {
 		return nil, fmt.Errorf("%w: %s", errNASR2CopySourceIdentity, "copy path has another catalog identity")
 	}
-	var clip map[string]json.RawMessage
 	var identity struct {
 		RecordingID int64 `json:"recording_id"`
 	}
-	if json.Unmarshal(payload, &clip) != nil || json.Unmarshal(payload, &identity) != nil || identity.RecordingID != i.RecordingID {
+	if json.Unmarshal(source.payload, &identity) != nil || identity.RecordingID != i.RecordingID {
 		return nil, fmt.Errorf("%w: %s", errNASR2CopySourceIdentity, "copy recording changed")
 	}
-	// Match the normal downloader's provenance representation.
-	clip["capture_generation"] = json.RawMessage("null")
-	if token != nil {
-		sum := sha256.Sum256([]byte(*token))
-		clip["capture_generation"], _ = json.Marshal(fmt.Sprintf("sha256:%x", sum[:]))
-	}
-	out, err := json.Marshal(clip)
-	return out, err
+	return source.clipPayload()
 }
 
 // Copy transactions have hard query/memory caps even with an operator DB URL.
