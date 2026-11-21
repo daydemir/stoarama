@@ -335,6 +335,30 @@ class R2CopyWorkerTests(unittest.TestCase):
         self.assertEqual(self.calls[-1][1]["body"]["reason"], "checksum_mismatch")
         self.assertEqual(partial.read_bytes(), b"x" * len(self.body))
 
+    def test_copy_attests_both_exact_utc_sidecar_encodings_in_place(self):
+        final = self.cfg.output_dir / self.item["relative_path"]
+        final.parent.mkdir()
+        final.write_bytes(self.body)
+        sidecar = Path(str(final) + ".stoarama.json")
+        self.task["work_mode"] = "verify_existing"
+        clip_as_feed = self.clip.copy()
+        for server_suffix, existing_suffix in (("Z", "+00:00"), ("+00:00", "Z")):
+            with self.subTest(server_suffix=server_suffix):
+                existing_clip = clip_as_feed.copy()
+                for field in ("clip_start_at", "clip_end_at"):
+                    self.clip[field] = clip_as_feed[field][:-1] + server_suffix
+                    existing_clip[field] = clip_as_feed[field][:-1] + existing_suffix
+                pull.write_stitch_sidecar(final, existing_clip)
+                original = sidecar.read_bytes()
+                self.calls.clear()
+                with mock.patch.object(pull, "r2_copy_range", side_effect=AssertionError("download")):
+                    self.run_copy()
+                self.assertEqual(sidecar.read_bytes(), original)
+                row = self.inventory._reports(self.inventory._rows("clip_id=?", (self.clip["clip_id"],), 1))[0]
+                self.assertEqual(row["sidecar_sha256"], hashlib.sha256(original).hexdigest())
+                self.assertEqual(row["sidecar_size_bytes"], len(original))
+                self.assertTrue(any(path.endswith("/result") for path, _ in self.calls))
+
     def test_mismatch_latch_survives_failed_report_restart_and_reassigned_token(self):
         final = self.cfg.output_dir / self.item["relative_path"]
         final.parent.mkdir()

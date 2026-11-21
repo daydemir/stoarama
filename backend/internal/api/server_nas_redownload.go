@@ -45,6 +45,31 @@ func (source nasRedownloadSource) eligible(req nasRedownloadRequest, windows map
 		validNASRelativePath(source.path) && !source.purged && !source.held
 }
 
+func (source nasRedownloadSource) clipPayload() (json.RawMessage, error) {
+	var clip map[string]json.RawMessage
+	if err := json.Unmarshal(source.payload, &clip); err != nil {
+		return nil, err
+	}
+	var generation *string
+	if source.token != nil {
+		sum := sha256.Sum256([]byte(*source.token))
+		value := fmt.Sprintf("sha256:%x", sum[:])
+		generation = &value
+	}
+	// The NAS sidecar is shared with the account clip feed, which serializes
+	// UTC time.Time values. PostgreSQL JSON timestamps use a numeric offset.
+	for field, value := range map[string]any{
+		"clip_start_at": source.start.UTC(), "clip_end_at": source.end.UTC(), "capture_generation": generation,
+	} {
+		data, err := json.Marshal(value)
+		if err != nil {
+			return nil, err
+		}
+		clip[field] = data
+	}
+	return json.Marshal(clip)
+}
+
 // Read-only, connection-13-only recovery download. Unlike the public browser
 // download this permits released clips, but never purged/reserved/held clips.
 // The caller supplies identity, never a bucket/key or download destination.
@@ -124,15 +149,10 @@ func (s *Server) handleAccountConnectionRedownload(w http.ResponseWriter, r *htt
 		util.WriteError(w, 503, "copy capability unavailable")
 		return
 	}
-	var clip map[string]any
-	if json.Unmarshal(current.payload, &clip) != nil {
+	clip, err := current.clipPayload()
+	if err != nil {
 		util.WriteError(w, 503, "copy metadata unavailable")
 		return
-	}
-	clip["capture_generation"] = nil
-	if current.token != nil {
-		sum := sha256.Sum256([]byte(*current.token))
-		clip["capture_generation"] = fmt.Sprintf("sha256:%x", sum[:])
 	}
 	util.WriteJSON(w, 200, map[string]any{"policy_sha256": policy, "clip": clip, "url": cap.URL, "headers": cap.Headers, "expires_at": time.Now().UTC().Add(15 * time.Minute)})
 }
