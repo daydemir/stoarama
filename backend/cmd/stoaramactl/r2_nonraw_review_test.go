@@ -209,7 +209,7 @@ func TestR2InverseJobPageKeepOverlap(t *testing.T) {
 	out.Close()
 	check := func(lane inverseLane, candidates int, held, overlap int64) {
 		t.Helper()
-		c, h, o, err := inverseJobPageKeepOverlap(f.ctx, f.pool, "stoarama", manifest, lane)
+		c, h, o, err := inverseJobPageKeepOverlap(f.ctx, f.pool, "stoarama", manifest, lane, keep28SelectedPlan{})
 		if err != nil || c != candidates || h != held || o != overlap {
 			t.Fatalf("lane %d: candidates %d held %d overlap %d err %v", lane, c, h, o, err)
 		}

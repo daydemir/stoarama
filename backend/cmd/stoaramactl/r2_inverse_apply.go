@@ -89,6 +89,7 @@ type inverseApplyOptions struct {
 	MaxItems                                                                           int
 	MaxBytes, Budget24h                                                                int64
 	Workers                                                                            int
+	SelectedPlan                                                                       keep28SelectedPlan
 	// skipped remembers keys a later batch must not reselect. A key skipped for a
 	// live stitch hold wrote nothing durable, so only this run can tell the next
 	// batch, in the same job, that it was already passed over. Batches of one job
@@ -739,7 +740,7 @@ func loadInverseRawTarget(ctx context.Context, tx pgx.Tx, bucket string, protect
 	return t, nil
 }
 
-const inverseRawHeldSQL = `SELECT
+const inverseRawHeldPrefix = `SELECT
  nas_cleanup_file_reserved('raw',$1)
  OR EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id WHERE h.clip_id=$1 AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND (i.delete_ever_issued OR i.state IN ('delete_issued','unverified','media_deleted_sidecar_failed')))))
  OR EXISTS(SELECT 1 FROM nas_cleanup_incident_sources WHERE clip_id=$1)
@@ -747,13 +748,21 @@ const inverseRawHeldSQL = `SELECT
  OR EXISTS(SELECT 1 FROM r2_retirement_reservations WHERE bucket=$2 AND object_key=$3 AND NOT (kind='raw' AND source_id=$1 AND manifest_sha256=$4))
  OR EXISTS(SELECT 1 FROM r2_object_retirements WHERE bucket=$2 AND object_key=$3)
  OR EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds WHERE bucket=$2 AND object_key=$3 AND released_at IS NULL)
- OR EXISTS(SELECT 1 FROM nas_r2_copy_items WHERE (state<>'verified' OR blocked_reason<>'') AND item->>'bucket'=$2 AND item->>'object_key'=$3)
+`
+const inverseRawHeldSuffix = `
  OR r2_inverse_delivery_held($1,$2,$3,$5,$6,$7)
  OR r2_owner_keep_held($2,$3)
  OR EXISTS(SELECT 1 FROM nas_restore_requests WHERE clip_id=$1 AND state IN ('pending','leased'))
  OR (EXISTS(SELECT 1 FROM recording_joined_source_snapshots WHERE clip_id=$1) AND NOT ($8 AND r2_joined_source_released($1)))
  OR EXISTS(SELECT 1 FROM recording_joined_snapshot_scopes s JOIN recording_joined_batches b ON b.id=s.batch_record_id AND b.state='snapshotting' JOIN recording_clips c ON c.id=$1 WHERE s.recording_id=c.recording_id AND s.recording_job_id=c.recording_job_id AND c.id<=s.high_water_clip_id)
  OR (EXISTS(SELECT 1 FROM recording_joined_dry_run_scopes s JOIN recording_clips c ON c.id=$1 WHERE s.recording_id=c.recording_id AND s.recording_job_id=c.recording_job_id AND c.id<=s.high_water_clip_id) AND NOT ($8 AND r2_joined_source_released($1)))`
+
+const inverseRawHeldSQL = inverseRawHeldPrefix +
+	` OR EXISTS(SELECT 1 FROM nas_r2_copy_items WHERE (state<>'verified' OR blocked_reason<>'') AND item->>'bucket'=$2 AND item->>'object_key'=$3)` +
+	inverseRawHeldSuffix
+
+const inverseSelectedRawHeldSQL = inverseRawHeldPrefix +
+	` OR r2_keep28_copy_blocks($2,$3,$9)` + inverseRawHeldSuffix
 
 // probeInversePurge exercises every installed purge trigger before wire
 // deletion; all effects are rolled back. The source row is already locked.
@@ -787,7 +796,13 @@ func (a *inverseApplier) checkTarget(ctx context.Context, tx pgx.Tx, t inverseRa
 	var held bool
 	// A released joined batch frees its snapshots for the RAW lane only; the
 	// keep-28 lane keeps every snapshot as a hold.
-	if err := tx.QueryRow(ctx, inverseRawHeldSQL, t.ID, a.store.Bucket(), e.Key, a.opts.ManifestSHA, t.Path, t.SHA, t.Size, a.opts.Lane == inverseOutsideKeep28).Scan(&held); err != nil {
+	query := inverseRawHeldSQL
+	args := []any{t.ID, a.store.Bucket(), e.Key, a.opts.ManifestSHA, t.Path, t.SHA, t.Size, a.opts.Lane == inverseOutsideKeep28}
+	if a.opts.SelectedPlan.ID != 0 {
+		query = inverseSelectedRawHeldSQL
+		args = append(args, e.Selected.VerifyItemID)
+	}
+	if err := tx.QueryRow(ctx, query, args...).Scan(&held); err != nil {
 		return err
 	}
 	if held {
@@ -849,7 +864,7 @@ func (a *inverseApplier) reserveOnce(ctx context.Context, e inverseEntry) (inver
 	}
 	var custody *keep28Custody
 	if a.opts.Lane == inverseNASKeep28 {
-		c, err := a.lockKeep28Custody(ctx, tx, t)
+		c, err := a.lockKeep28Proof(ctx, tx, t, e.Key)
 		aged := errors.Is(err, errR2RetireNASProofAged)
 		if err != nil && !aged {
 			return t, err
@@ -885,9 +900,12 @@ func (a *inverseApplier) reserveOnce(ctx context.Context, e inverseEntry) (inver
 	}
 	// Independent committed transaction. Never use an outer network transaction's
 	// connection or assume its rollback can discard this source reservation.
-	_, err = tx.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) VALUES('raw',$1,$2,$3,$4,$5,$6)`, t.ID, a.store.Bucket(), e.Key, e.SizeBytes, t.SHA, a.opts.ManifestSHA)
-	if err != nil {
-		return t, inverseStitchLedgerError(err)
+	selected := custody != nil && custody.VerifyItemID > 0
+	if !selected {
+		_, err = tx.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) VALUES('raw',$1,$2,$3,$4,$5,$6)`, t.ID, a.store.Bucket(), e.Key, e.SizeBytes, t.SHA, a.opts.ManifestSHA)
+		if err != nil {
+			return t, inverseStitchLedgerError(err)
+		}
 	}
 	intentSQL := `INSERT INTO ` + a.opts.Lane.intentTable() + `(bucket,object_key,source_id,size_bytes,etag,last_modified,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice,endpoint_sha256,stream_id`
 	intentArgs := []any{a.store.Bucket(), e.Key, t.ID, e.SizeBytes, e.ETag, e.LastModified, a.opts.ManifestSHA, a.summary.PolicySHA256, a.summary.PicksSHA256, a.opts.DrainSHA, a.protection.Picks.Choices[t.StreamID].Choice, a.store.EndpointSHA256(), t.StreamID}
@@ -907,6 +925,15 @@ func (a *inverseApplier) reserveOnce(ctx context.Context, e inverseEntry) (inver
 	_, err = tx.Exec(ctx, intentSQL, intentArgs...)
 	if err != nil {
 		return t, inverseStitchLedgerError(err)
+	}
+	if selected {
+		// The COPY trigger binds this receipt to its B2 intent. Both rows
+		// commit together under the same key lock.
+		_, err = tx.Exec(ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,selected_verify_item_id)
+ VALUES('raw',$1,$2,$3,$4,$5,$6,$7)`, t.ID, a.store.Bucket(), e.Key, e.SizeBytes, t.SHA, a.opts.ManifestSHA, custody.VerifyItemID)
+		if err != nil {
+			return t, inverseStitchLedgerError(err)
+		}
 	}
 	if err = probeInversePurge(ctx, tx, t.ID); err != nil {
 		return t, err
@@ -1247,7 +1274,8 @@ func runR2InverseLane(ctx context.Context, cfg config.Config, args []string, lan
 	fs.IntVar(&o.MaxItems, "max-items", 100, "maximum new objects")
 	fs.Int64Var(&o.MaxBytes, "max-bytes", 0, "maximum new intent bytes this run")
 	fs.Int64Var(&o.Budget24h, "budget-24h-bytes", 0, "maximum charged bytes in previous24h (0 = unlimited; per-run bounds still apply)")
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || o.MaxItems < 1 || o.Workers < 1 || o.Workers > 64 || o.MaxBytes <= 0 || o.Budget24h < 0 || o.Ledger == "" {
+	o.SelectedPlan.flags(fs)
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || o.MaxItems < 1 || o.Workers < 1 || o.Workers > 64 || o.MaxBytes <= 0 || o.Budget24h < 0 || o.Ledger == "" || !o.SelectedPlan.validFor(lane) {
 		log.Fatal("invalid bounded r2-inverse apply options")
 	}
 	pool := mustOpenPool(ctx, cfg)
@@ -1293,7 +1321,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 			return result, errors.New("collated nonraw transport required")
 		}
 	}
-	if o.Workers < 1 || o.Workers > 64 || o.MaxItems < 1 || o.MaxBytes <= 0 || o.Budget24h < 0 {
+	if o.Workers < 1 || o.Workers > 64 || o.MaxItems < 1 || o.MaxBytes <= 0 || o.Budget24h < 0 || !o.SelectedPlan.validFor(o.Lane) {
 		return result, errors.New("invalid bounded apply options")
 	}
 	if err := inverseWorkersFit(pool, o.Workers); err != nil {
@@ -1456,7 +1484,8 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		}
 		// Collated candidates carry their own typed class; they are never the RAW
 		// deletable class and never reach loadInverseRawTarget.
-		if e.Class != o.Lane.class() || existing[e.Key] {
+		selectedCandidate := o.SelectedPlan.ID != 0 && e.Class == inverseHeld && e.Reason == "live_hold"
+		if (e.Class != o.Lane.class() && !selectedCandidate) || existing[e.Key] {
 			continue
 		}
 		// A nonpositive size can never reserve; selecting it would abort the batch.
