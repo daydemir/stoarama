@@ -293,8 +293,7 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
 	if code := control("enabled"); code != http.StatusConflict {
 		t.Fatalf("master OFF did not block stage cleanup: %d", code)
 	}
-	s.cfg.NASCleanupDeletionEnabled = true
-	defer func() { s.cfg.NASCleanupDeletionEnabled = false }()
+	setCleanupMaster(t, s, true)
 	if code := control("enabled"); code != http.StatusConflict {
 		t.Fatalf("unconfirmed staging absence allowed enable: %d", code)
 	}
@@ -388,7 +387,7 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
 	batch(request, "reconcile", false, http.StatusOK)
 	abort.response.Store(3)
 	batch(request, "delete_issued", true, http.StatusOK)
-	s.cfg.NASCleanupDeletionEnabled = false
+	setCleanupMaster(t, s, false)
 	lists, heads = abort.lists.Load(), abort.heads.Load()
 	observe(request, "reconcile", false)
 	if abort.lists.Load() != lists || abort.heads.Load() != heads {

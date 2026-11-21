@@ -35,7 +35,7 @@ func TestNASStitchHeldInputsCompleteWithoutRetirementAndReleaseTheLane(t *testin
 	f, p, q := newNASStitchTaskFixture(t)
 	f.s.cfg.NASStitchEnabled = true
 	f.s.cfg.NASStitchDeletionEnabled = true
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if len(q.Outputs[0].Inputs) != len(p.Clips)-1 {
 		t.Fatalf("fixture no longer covers every included input: %d", len(q.Outputs[0].Inputs))
 	}
@@ -113,7 +113,7 @@ func TestNASStitchLegacyResultStaysLocalWithDeletionSwitchesOn(t *testing.T) {
 	f, _, q := newNASStitchTaskFixture(t)
 	f.s.cfg.NASStitchEnabled = true
 	f.s.cfg.NASStitchDeletionEnabled = true
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if q.Outputs[0].Inputs[0].RetirementHeld {
 		t.Fatal("fixture must carry legacy unheld evidence")
 	}

@@ -112,6 +112,10 @@ services:
         sync: false
       - key: SERVICE_TOKEN
         sync: false
+      # Controller-only credential for `stoaramactl nas-cleanup master on|off`.
+      # The runner's SERVICE_TOKEN must never be able to flip deletion authority.
+      - key: NAS_CLEANUP_CONTROLLER_TOKEN
+        sync: false
       - key: EMAIL_PROVIDER
         value: resend
       - key: MAGIC_LINK_TTL

@@ -124,7 +124,7 @@ func TestNASCleanupClientServerThroughput(t *testing.T) {
 				// response. Their non-destructive reconciliation is covered
 				// by TestNASCleanupExecutionDeadlineClientServer; this
 				// throughput scenario measures retries of the other calls.
-				if f.s.cfg.NASCleanupDeletionEnabled && strings.HasSuffix(r.URL.Path, "/observe") {
+				if cleanupMasterOn(context.Background(), f.s.pool) && strings.HasSuffix(r.URL.Path, "/observe") {
 					next.ServeHTTP(w, r)
 					return
 				}
@@ -203,7 +203,7 @@ func TestNASCleanupClientServerThroughput(t *testing.T) {
 			t.Fatal(err)
 		}
 		report["after_dry_run_md5_matched"] = md5Matched
-		f.s.cfg.NASCleanupDeletionEnabled = true
+		setCleanupMaster(t, f.s, true)
 		if code, body := f.enableBatch(plans, shas, 24); code != 200 {
 			t.Fatalf("batch enable: %d %s", code, body)
 		}
@@ -235,7 +235,7 @@ func TestNASCleanupClientServerThroughput(t *testing.T) {
 		id, sha, _ := f.admit("bench-faults", files)
 		api := serve(f, 0.03)
 		run(api, root, state, 2)
-		f.s.cfg.NASCleanupDeletionEnabled = true
+		setCleanupMaster(t, f.s, true)
 		if code, body := f.enableBatch([]int64{id}, []string{sha}, 24); code != 200 {
 			t.Fatalf("batch enable: %d %s", code, body)
 		}
@@ -268,7 +268,7 @@ func TestNASCleanupClientServerThroughput(t *testing.T) {
 		dryStarted := time.Now()
 		run(api, root, state, 1)
 		report["before_dry_run_protocol1_files_per_sec"] = float64(beforeFiles) / time.Since(dryStarted).Seconds()
-		f.s.cfg.NASCleanupDeletionEnabled = true
+		setCleanupMaster(t, f.s, true)
 		if code, body := safeguardControl(t, f.s, id, "enabled", map[string]any{"approval_hours": 24, "allow_long_approval": true, "plan_sha256": sha}); code != 200 {
 			t.Fatalf("enable: %d %s", code, body)
 		}

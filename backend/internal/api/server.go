@@ -678,6 +678,14 @@ func (s *Server) router() http.Handler {
 			joinedOperator.Put("/recording/joined/gap-only/frozen-authorization", s.handleJoinedGapOnlyFrozenAuthorization)
 		})
 
+		// The master switch is controller-only: deletion authority must not be
+		// reachable with the runner's service token.
+		api.Group(func(controller chi.Router) {
+			controller.Use(s.requireCleanupControllerAuth)
+			controller.Get("/service/nas-cleanup/master", s.handleAdminNASCleanupMasterStatus)
+			controller.Post("/service/nas-cleanup/master", s.handleAdminNASCleanupMasterSet)
+		})
+
 		api.Group(func(service chi.Router) {
 			service.Use(s.requireServiceAuth)
 			service.Post("/service/nas-stitch/scopes", s.handleAdminNASStitchScope)

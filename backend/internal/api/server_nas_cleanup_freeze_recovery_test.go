@@ -80,7 +80,7 @@ func TestNASCleanupSourceFreezeRecoversAbandonedActivation(t *testing.T) {
 			if _, err = f.pool.Exec(f.ctx, `INSERT INTO nas_cleanup_frozen_streams(plan_id,stream_id) VALUES(999999,4)`); err != nil {
 				t.Fatal(err)
 			}
-			f.s.cfg.NASCleanupDeletionEnabled = true
+			setCleanupMaster(t, f.s, true)
 			code, body := 0, ""
 			if recovery == "next-single-enable" {
 				code, body = safeguardControl(t, f.s, id, "enabled", map[string]any{"plan_sha256": sha})
@@ -184,7 +184,7 @@ func TestNASCleanupMaintenanceBlocksEnableAndPermits(t *testing.T) {
 			f := newCleanupFixture(t, 24)
 			id, sha, _ := f.admit("maintenance", syntheticFiles(100, 1, 10))
 			f.dryRun()
-			f.s.cfg.NASCleanupDeletionEnabled = true
+			setCleanupMaster(t, f.s, true)
 			var tasks []cleanupTask
 			if enabled {
 				if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
@@ -250,7 +250,7 @@ func TestNASCleanupMaintenanceWaitsForActivation(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("maintenance-activation", syntheticFiles(100, 1, 10))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	tr := cleanupFenceTrace(t, f, cleanupFreezeDrainSQL, false)
 	done := make(chan int, 1)
 	go func() {

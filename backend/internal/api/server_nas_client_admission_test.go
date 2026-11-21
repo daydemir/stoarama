@@ -258,7 +258,7 @@ func TestNASClientAdmissionCleanupBlocksLeaseAndPermitReplay(t *testing.T) {
 		t.Fatalf("denied dry lease changed attempts: %d %v", attempts, err)
 	}
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 1); code != http.StatusOK {
 		t.Fatalf("enable: %d %s", code, body)
 	}
@@ -349,6 +349,7 @@ func seedLegacyBatchPermit(t *testing.T, f *cleanupFixture, task cleanupTask, ob
 	}
 	defer tx.Rollback(f.ctx)
 	result := f.s.cleanupObserveOne(f.ctx, tx, 13, task.ItemID, observation, &cleanupObserveEnv{
+		authority:     cleanupAuthorityTentative,
 		session:       cleanupClientSession{boot: "fixture-boot", version: f.version},
 		freshRequests: map[int64]bool{task.ItemID: true}, prefetched: prefetched,
 	})
@@ -372,7 +373,7 @@ func TestNASClientAdmissionBatchChildVersion(t *testing.T) {
 				id, sha, _ := f.admit("nested-admission", syntheticFiles(920, count, 1))
 				if mode != "mixed" {
 					f.dryRun()
-					f.s.cfg.NASCleanupDeletionEnabled = true
+					setCleanupMaster(t, f.s, true)
 					if code, body := f.enableBatch([]int64{id}, []string{sha}, 1); code != http.StatusOK {
 						t.Fatalf("enable: %d %s", code, body)
 					}

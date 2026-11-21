@@ -23,6 +23,7 @@ type Config struct {
 	DatabaseURL                      string
 	APIToken                         string
 	ServiceToken                     string
+	NASCleanupControllerToken        string
 	JoinedWorkerBootstrapToken       string
 	JoinedWorkerBootstrapHashes      string
 	JoinedWorkerSigningKey           string
@@ -46,7 +47,6 @@ type Config struct {
 	NASUploadProbeStreams            int
 	NASUploadProbeInterval           time.Duration
 	NASBenchmarkEnabled              bool
-	NASCleanupDeletionEnabled        bool
 	NASR2CopyEnabled                 bool
 	NASStitchProofTaskID             int
 	NASStitchProofActivationID       string
@@ -220,6 +220,7 @@ func Load() (Config, error) {
 		DatabaseURL:                      os.Getenv("DATABASE_URL"),
 		APIToken:                         firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
 		ServiceToken:                     firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
+		NASCleanupControllerToken:        strings.TrimSpace(os.Getenv("NAS_CLEANUP_CONTROLLER_TOKEN")),
 		JoinedWorkerBootstrapToken:       strings.TrimSpace(os.Getenv("JOINED_WORKER_BOOTSTRAP_TOKEN")),
 		JoinedWorkerBootstrapHashes:      os.Getenv("JOINED_WORKER_BOOTSTRAP_TOKEN_SHA256_ALLOWLIST"),
 		JoinedWorkerSigningKey:           strings.TrimSpace(os.Getenv("JOINED_WORKER_SIGNING_KEY")),
@@ -243,7 +244,6 @@ func Load() (Config, error) {
 		NASUploadProbeStreams:            intEnv("NAS_UPLOAD_PROBE_STREAMS", 4),
 		NASUploadProbeInterval:           durEnv("NAS_UPLOAD_PROBE_INTERVAL", 6*time.Hour),
 		NASBenchmarkEnabled:              boolEnv("NAS_BENCHMARK_ENABLED", true),
-		NASCleanupDeletionEnabled:        boolEnv("NAS_CLEANUP_DELETION_ENABLED", false),
 		NASR2CopyEnabled:                 boolEnv("NAS_R2_COPY_ENABLED", false),
 		NASStitchProofTaskID:             intEnv("NAS_STITCH_PROOF_TASK_ID", 0),
 		NASStitchProofActivationID:       os.Getenv("NAS_STITCH_PROOF_ACTIVATION_ID"),
@@ -520,7 +520,7 @@ func (c Config) ValidateJoined() error {
 				return fmt.Errorf("joined worker credentials must differ from service, database, and storage credentials")
 			}
 		}
-		hashProtected := append(append([]string(nil), protected...), bootstrap, signing, operator, strings.TrimSpace(c.JoinedRecordingWorkerToken))
+		hashProtected := append(append([]string(nil), protected...), bootstrap, signing, operator, strings.TrimSpace(c.JoinedRecordingWorkerToken), strings.TrimSpace(c.NASCleanupControllerToken))
 		for _, digest := range bootstrapSHA256s {
 			for _, credential := range hashProtected {
 				credential = strings.TrimSpace(credential)
@@ -541,6 +541,19 @@ func (c Config) ValidateJoined() error {
 		for _, protected := range append(protected, bootstrap, signing, strings.TrimSpace(c.JoinedRecordingWorkerToken)) {
 			if operator == strings.TrimSpace(protected) {
 				return fmt.Errorf("joined operator credential must differ from service, database, storage, backend, and worker credentials")
+			}
+		}
+	}
+	// The cleanup controller credential is the only way to flip NAS deletion
+	// authority. It must be distinct from every runner credential: a service
+	// token that could also flip the master would defeat the separation.
+	if controller := strings.TrimSpace(c.NASCleanupControllerToken); controller != "" {
+		if len(controller) < 32 {
+			return fmt.Errorf("NAS_CLEANUP_CONTROLLER_TOKEN must be at least 32 bytes when configured")
+		}
+		for _, other := range append(append([]string(nil), protected...), bootstrap, signing, operator, strings.TrimSpace(c.JoinedRecordingWorkerToken), strings.TrimSpace(c.JoinedArchiveWorkerToken), strings.TrimSpace(c.JoinedArchiveCapabilityKey)) {
+			if controller == strings.TrimSpace(other) {
+				return fmt.Errorf("NAS_CLEANUP_CONTROLLER_TOKEN must differ from every other configured credential")
 			}
 		}
 	}

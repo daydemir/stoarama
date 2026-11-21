@@ -19,7 +19,7 @@ func testNASCleanupReviewedReleaseGates(t *testing.T, version string) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("serial-release", syntheticFiles(100, 2, 10))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}
@@ -67,7 +67,7 @@ func TestNASCleanupExecutionCapabilityAndConcurrentLeaseLimit(t *testing.T) {
 	if code, body := safeguardControl(t, f.s, dryID, "paused", map[string]any{"plan_sha256": drySHA}); code != 200 {
 		t.Fatalf("pause dry fixture: %d %s", code, body)
 	}
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}
@@ -166,7 +166,7 @@ func TestNASCleanupOldProtocolReplayCannotMintFirstPermit(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("old-replay", syntheticFiles(100, 1, 1))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}
@@ -199,7 +199,7 @@ func TestNASCleanupRolledBackCheckpointNeverMintsFirstPermit(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("rollback-checkpoint", syntheticFiles(100, 1, 1))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}
@@ -215,7 +215,7 @@ func TestNASCleanupRolledBackCheckpointNeverMintsFirstPermit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(f.ctx)
-	result := f.s.cleanupObserveOne(f.ctx, tx, 13, task.ItemID, req, &cleanupObserveEnv{session: cleanupClientSession{boot: "fixture-boot", version: nasCleanupExecutionClientVersion}, freshRequests: map[int64]bool{task.ItemID: true}, prefetched: prefetched})
+	result := f.s.cleanupObserveOne(f.ctx, tx, 13, task.ItemID, req, &cleanupObserveEnv{authority: cleanupAuthorityTentative, session: cleanupClientSession{boot: "fixture-boot", version: nasCleanupExecutionClientVersion}, freshRequests: map[int64]bool{task.ItemID: true}, prefetched: prefetched})
 	if result.status != 200 || result.body["delete"] != true {
 		t.Fatalf("original observation: %+v", result)
 	}
@@ -280,7 +280,7 @@ func TestNASCleanupBootChangeMidLeaseCannotMintPermit(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("boot-change", syntheticFiles(100, 1, 1))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}
@@ -313,7 +313,7 @@ func TestNASCleanupLiveSessionRequiredBeforeRollbackHeartbeat(t *testing.T) {
 			id, sha, _ := f.admit("live-session", syntheticFiles(100, 2, 1))
 			f.dryRun()
 			f.admit("old-client-dry-run", syntheticFiles(200, 1, 1))
-			f.s.cfg.NASCleanupDeletionEnabled = true
+			setCleanupMaster(t, f.s, true)
 			if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 				t.Fatalf("enable: %d %s", code, body)
 			}
@@ -390,7 +390,7 @@ func TestNASCleanupMatchingHeartbeatCannotReplaceLeaseSession(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("lease-session", syntheticFiles(100, 1, 1))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}
@@ -449,7 +449,7 @@ func TestNASCleanupHeartbeatExpiresDuringPolicyWork(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("heartbeat-deadline", syntheticFiles(100, 1, 1))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}

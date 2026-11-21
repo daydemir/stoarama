@@ -10,7 +10,11 @@ Historical approval (Deniz, 2026-11-11), retained verbatim:
 
 The ownership release changes the between-batch mechanism to owned-plan OFF:
 exact-digest pause, receipt drain and real recovery. The global runtime master is
-controller-owned and must already be ON. Fresh ops review and an explicit
+controller-owned and must already be ON. It is the durable DB control flipped only
+by `stoaramactl nas-cleanup master on|off --reason` (see
+[NAS_CLEANUP.md](../../../docs/NAS_CLEANUP.md)); deploys no longer change it, so
+a deploy mid-plan leaves it ON. The runner only reads `master_deletion_enabled`
+from the API and never sets it. Fresh ops review and an explicit
 controller GO must approve this changed policy before activation. Merging this
 preparation grants no production authority. See [ownership handoff](../finish/OWNERSHIP.md).
 

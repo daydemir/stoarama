@@ -100,7 +100,7 @@ func TestNASCleanupNASOnlyRejectedEverywhere(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
 	s := &Server{pool: pool}
-	s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, s, true)
 	safeguardPlan(t, ctx, s, 1, "dry_run", 10)
 	if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_items SET recovery='nas_only_at_check' WHERE plan_id=1`); err != nil {
 		t.Fatal(err)
@@ -123,7 +123,7 @@ func TestNASCleanupOneEnabledPlanAndPlanByteCap(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
 	s := &Server{pool: pool}
-	s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, s, true)
 	safeguardPlan(t, ctx, s, 1, "dry_run", 10, 20)
 	safeguardPlan(t, ctx, s, 2, "dry_run", 10)
 	safeguardPlan(t, ctx, s, 3, "dry_run", nasCleanupMaxPlanBytes-1, 2)
@@ -215,7 +215,7 @@ func TestNASCleanupExecutionAnomaliesAutoPause(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
 	s := &Server{pool: pool}
-	s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, s, true)
 	mode := func(id int64) (string, string) {
 		t.Helper()
 		var m, reason string
@@ -319,7 +319,7 @@ func TestNASCleanupConcurrentAutoPauseDoesNotDeadlock(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	s := &Server{pool: pool}
-	s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, s, true)
 	observe := func(item int64) *httptest.ResponseRecorder {
 		return cleanupCall(t, s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(item), cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: 1, PlanSHA: strings.Repeat("b", 64), Outcome: "conflict", Error: "fixture", ClientVersion: nasCleanupExecutionClientVersion})
 	}

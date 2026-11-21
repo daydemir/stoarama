@@ -63,12 +63,222 @@ does not satisfy enable: every item must finish a fresh, permitting dry run.
 
 Two independent gates remain OFF during preparation:
 
-1. Backend `NAS_CLEANUP_DELETION_ENABLED` defaults false.
+1. The backend deletion master switch defaults OFF (below).
 2. A plan defaults `dry_run`. Explicit `nas-cleanup enable` requires its exact
    `--expected-plan-sha256`, `--reason`, a complete matching dry run less than 24 hours
    old, and full R2 recovery (with ETag evidence) for every item. Approval
    expires after `--approval-hours` (default 2; 1..24, above 4 only with
    `--allow-long-approval`), or approve a whole batch of plans at once (below).
+
+### Deletion master switch
+
+The master switch is the durable DB control `nas_cleanup_master` (migration
+0229), not configuration. Deploys and restarts never change it, so a cleanup
+plan and backend deploys can interleave. The former Render env var
+`NAS_CLEANUP_DELETION_ENABLED` is inert. Only the controller flips it, through
+a separate controller credential (`NAS_CLEANUP_CONTROLLER_TOKEN`) that the
+runner's service token cannot satisfy; the master route fails closed when that
+credential is unset or aliases another credential:
+
+```sh
+stoaramactl nas-cleanup master status
+stoaramactl nas-cleanup master on --reason "run batch 12"
+stoaramactl nas-cleanup master off --reason "batch 12 finished"
+```
+
+`on`/`off` require a non-blank reason, print the before and after state, and are
+idempotent: repeating the current state changes nothing. Every change appends
+an immutable `nas_cleanup_master_history` row (time, the authenticated
+server-side actor, the operator's `claimed_by` name, old and new state, reason);
+the guarded path is the only supported one: deletes, truncates and off-path
+edits are refused for the API's own role, only the recorder function appends
+history, and the triggers are `ENABLE ALWAYS`. That is protection against a
+*runtime* code path that skips the control — not against the table owner or a
+superuser, who can still drop and recreate the triggers or edit rows directly
+(see the migration notes below).
+
+Operationally, `master off` is retroactive only for *decisions*: once the flip
+commits, no new API admission can mint a permit, lease, enable or advance,
+because each of those takes the master row lock and reads it before writing
+authority. Permits issued before the flip are not recalled — a valid, unexpired
+permit may still finish its unlink, and one that is never used simply expires
+(30 s for the permit, or with its 30-minute lease). It is therefore not a kill
+switch for in-flight filesystem work: to guarantee no deletion continues, pause
+the plan or batch first and drain, then flip OFF. The same ordering applies when
+migrating: run with the legacy gate OFF, drain outstanding permits and leases,
+apply the migration, cut over, and turn the new switch ON only if cleanup should
+continue.
+
+The controller credential is read only from `NAS_CLEANUP_CONTROLLER_TOKEN`;
+there is no token flag, so it never lands in shell history or a process listing.
+Its origin is only `--backend-api-url` or the documented `BACKEND_API_URL`: the
+generic CLI default also consults `INFERCTL_API_URL`, which is not a documented
+origin for this credential and is never used here. The URL must be a bare HTTPS
+origin — the CLI refuses plaintext, credentials in the URL, a path, a query or a
+fragment. Every argument is validated before the credential is resolved or
+anything is sent: any flag parse error (`--help` included), an unknown or
+trailing argument, an unrecognised action, or a flag-shaped `--reason` value
+such as `--reason --help` stops the command. The request itself refuses every
+redirect, so the bearer credential can never be replayed to another origin or
+path, and a failure reports only the HTTP status, never a response body that
+might echo operator text.
+
+`on`/`off` succeed only when the typed reply's authoritative `after.enabled`
+matches the requested setting; a 2xx without that state is an error. An
+idempotent repeat (already ON, asking for ON) reports the unchanged state.
+
+The API reads the switch live, inside the same transaction as each decision it
+guards (plan and batch enable, batch advance, execution lease, permit issue and
+permit replay). It reads `FOR SHARE` last — only after every fence and row lock
+that transaction needs, immediately before the guarded write — so turning it off
+waits for in-flight decisions that already read ON without waiting on fences,
+item rows or pool checkouts. A path that can never mint deletion authority never
+locks the control at all: read-only dry-run observations and leases that offer no
+execution files do not take the master row lock, and the batch observation takes
+its budget advisory lock before the master. Once `master off` returns, no further
+lease or permit is issued. A missing or unreadable control is OFF for decisions,
+while plan and batch reports return an error instead of a false OFF and
+otherwise keep `master_deletion_enabled`. Turning it on bypasses nothing: plan
+approval, batch digests, the 5 TB/day cap and per-file permits are unchanged.
+
+Three consequences are load-bearing and easy to get wrong:
+
+- **Authority is decided at a transaction boundary, not cached in Go.** Nothing
+  in the process remembers an earlier ON. A request does all potentially
+  blocking work first — the scoped item/plan fences, the best-14 rank replay and
+  cache writes, aborted-stage lookup, the per-item savepoints and their tentative
+  item mutations, and the budget advisory lock taken explicitly in the outer
+  transaction before any per-item savepoint — and only then runs the single
+  authoritative `SELECT enabled FROM nas_cleanup_master FOR SHARE` as the last
+  statement except the commit. That row lock is held through the commit.
+- **An OFF preliminary read means nothing tentative escapes.** If the
+  authoritative read is OFF, the whole pass is rolled back: no buffered
+  affirmative replay, no tentative permit, no pause it claimed, is committed.
+  The request is then re-run under a denied posture, which produces exactly the
+  ordinary OFF answers (a recorded would-delete that auto-pauses an enabled plan,
+  and `reconcile` for an affirmative replay) through the same code path as any
+  other OFF. Buffered work — including an exact affirmative replay that arrived
+  inside a savepoint whose rollback would have released the lock — therefore
+  cannot outlive the authority that justified it. The budget counter only moves
+  for a pass that commits, so a discarded pass never skews the rolling cap.
+- **Nothing may wait on a row after the master lock is taken.** Enabling a plan
+  resets all of its items to `pending`, and batch advance does the same to the
+  next plan. Both fence those item rows (`SELECT … FOR UPDATE`, ascending) and
+  finish all blocking freeze/replay work *before* the authoritative master read.
+  If the switch is OFF the handler returns and the transaction rolls back every
+  freeze, gate and lock it took. An unprelocked reset after the master read would
+  make an emergency OFF queue behind an item waiter.
+
+`stoaramactl nas-cleanup r2-retire cancel-joined-writers` uses the same
+discipline. Its apply transaction takes the cleanup public fence **exclusively**
+— every enable and batch advance takes that fence exclusively, and every lease
+and observation takes it shared — so the retirement serializes against dry-run
+leases as well as against authority minting. It then reads the master `FOR
+SHARE` and only then probes the global-idle window. The window cannot change
+while the exclusive fence is held, so a plan enabled, or work leased, during the
+wait can never be retired as if it were idle.
+
+#### Migration 0229 privileges
+
+`0229_nas_cleanup_master.sql` establishes the history provenance chain, so it
+refuses to run when it cannot bind the recorder to a dedicated owner. It states
+and verifies its requirements instead of assuming them, and it fails closed
+rather than widening an ACL to make itself apply. In one transaction the
+migrator needs:
+
+- **PostgreSQL 16 or newer.** `pg_auth_members.set_option`, and the rule that a
+  `CREATEROLE` role is not automatically able to `SET ROLE` to a role it created,
+  both start at 16. The migration asserts the version; on an older server it
+  cannot distinguish a usable membership from an unusable one.
+- **Authority to grant on the schema it migrates**, not ordinary `CREATE` on
+  it. `CREATE` lets a role add objects but never lets it hand `CREATE` or object
+  ownership to another role, so the recorder transfer needs the schema owner, a
+  role that can assume the owner, a holder of `CREATE WITH GRANT OPTION` on the
+  schema, or a superuser. A migrator with only `CREATE` is refused with
+  `cannot transfer schema authority`. (On a default PostgreSQL 16+/17 cluster the
+  `public` schema is owned by `pg_database_owner`, which the database owner can
+  assume, so a normal owner-migrator passes.)
+- **`CREATEROLE`, or a pre-existing `nas_cleanup_master_writer` role granted to
+  it `WITH SET TRUE`.** Membership alone is not enough: a role granted
+  `WITH SET FALSE` cannot be assumed, and the migration fails instead of falling
+  back to the migrator as the recorder owner.
+
+The migration grants `USAGE`/`CREATE` on the schema and `INSERT` on the history
+table to the recorder for the ownership transfer, revokes `CREATE` and every
+`PUBLIC` privilege in the same transaction, and then **verifies the effective
+result**: the recorder is owned by `nas_cleanup_master_writer`, that role holds
+no effective `CREATE` (including `WITH GRANT OPTION`) on the schema — a grant it
+inherits from another role counts and fails the migration — and it holds no
+`UPDATE`, `DELETE` or `TRUNCATE` on history. A failure rolls the whole migration
+back, leaving no tables behind.
+
+No superuser is required, and the API's runtime role needs none of this
+*beyond what `AUTO_MIGRATE` implies*: it only inserts/updates
+`nas_cleanup_master` and the `SECURITY DEFINER` recorder appends history on its
+behalf. Startup depends on nothing in this migration beyond the applied schema.
+
+Be precise about what the separation buys, because it is easy to overclaim:
+
+- **The writer role is trigger separation, not a second trust domain.** It keeps
+  the recorder's own identity distinct from whatever role inserts/updates master
+  rows, so the recorder is not reachable except through the master trigger and an
+  off-path application insert is refused. It does not stop a role that can write
+  `nas_cleanup_master` directly from choosing the `actor` value it supplies:
+  `actor` is whatever the calling code passes, and the server passes its
+  authenticated principal. Anyone with direct table write access can supply
+  their own.
+- **Under `AUTO_MIGRATE` the runtime role is the migrator, so it typically owns
+  the master and history tables** (it migrates at startup with its own
+  credentials). The recorder stays owned by `nas_cleanup_master_writer`; the
+  tables do not. An operator-run migration makes the operator the table owner.
+- **This is not tamper resistance against that owner or a superuser.** Whoever
+  owns the tables can drop or alter the triggers and edit or delete rows
+  directly, and nothing in this design prevents it. Treat the history as an
+  audit trail an off-path *runtime* write cannot append to — not as evidence
+  against the database owner, and not as a claim that individual rows are
+  immutable to them.
+
+If the migration fails on the recorder role, grant the dedicated role and
+re-run the deploy:
+
+```sql
+CREATE ROLE nas_cleanup_master_writer NOLOGIN;   -- once per cluster
+GRANT nas_cleanup_master_writer TO <migrator> WITH SET TRUE;
+```
+
+#### Production sequence for 0229
+
+This switch is a data-authority change, so it ships behind an explicit ordered
+cutover rather than a rolling deploy. The steps are performed by an operator;
+nothing here is executed by CI or by this repository's code.
+
+1. **Legacy gate OFF and permits drained, between plans.** With the old
+   env-var gate still in force, confirm it is OFF and let every outstanding
+   permit and lease drain: `master off` (or its legacy equivalent) is not enough
+   while a permit is live, so wait for no `leased` or `delete_issued` item, no
+   enabled plan and no enabled batch. Cut over only between plans.
+2. **0229 pending, exact bytes.** Do not deploy the new server before the
+   migration is present in the release being cut over. The migration must be
+   applied from the exact reviewed bytes (`0229_nas_cleanup_master.sql`) in the
+   image that will run — not a hand-applied variant, and not a partially applied
+   one. `schema_migrations` must not contain `0229_nas_cleanup_master.sql`
+   before that deploy starts.
+3. **Cut over, then verify every old instance is gone.** The new server rejects
+   or ignores the old env var, so a surviving old instance would still honour it.
+   After the deploy, confirm the running instance count and that no pre-cutover
+   instance remains serving (old instances were stopped, not just superseded),
+   before any deletion authority can exist.
+4. **Audit readback.** Read the control and its history back
+   (`nas-cleanup master status` plus the history rows) and confirm the migration
+   inserted exactly one `initial state: OFF` row, the actor is `migration 0229`,
+   and the switch is OFF. Any unexpected row, actor or state stops the cutover.
+5. **Explicit ON, only after reviewed credential provisioning.** Turn the switch
+   on with `nas-cleanup master on --reason "..."` only once the controller
+   credential (`NAS_CLEANUP_CONTROLLER_TOKEN`) has been provisioned and reviewed
+   as distinct from the runner's service token and the other credentials. The
+   route fails closed when it is unset or aliases another credential. Turning it
+   on is the last step, never a side effect of the deploy.
+
 
 ### Belt-and-braces safeguards (safety council, 2026-11)
 

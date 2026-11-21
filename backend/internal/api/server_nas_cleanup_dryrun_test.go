@@ -101,14 +101,14 @@ func TestNASCleanupDryRunMD5ETagRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := h.s.cleanupObserveOne(h.ctx, tx, 13, ht[0].ItemID, cleanupObserve{Attempt: ht[0].Attempt, PlanSHA: ht[0].PlanSHA, Outcome: "match", Proof: fixtureProof(ht[0].Item)}, &cleanupObserveEnv{})
+	r := h.s.cleanupObserveOne(h.ctx, tx, 13, ht[0].ItemID, cleanupObserve{Attempt: ht[0].Attempt, PlanSHA: ht[0].PlanSHA, Outcome: "match", Proof: fixtureProof(ht[0].Item)}, &cleanupObserveEnv{authority: cleanupAuthorityTentative})
 	tx.Rollback(h.ctx)
 	if r.status != 200 || r.body["recovery"] != "unchecked" {
 		t.Fatalf("no recovery store: %d %v", r.status, r.body)
 	}
 	// MD5-matched items are enable-eligible and execute via the bound HEAD
 	// (the multipart-style item stays bound to the ETag it was verified at).
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{p1}, []string{sha1}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}
@@ -173,7 +173,7 @@ func TestNASCleanupDryRunRecoveryIsParallelBoundedAndOutsideLocks(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := g.s.cleanupObserveOne(g.ctx, tx, 13, tasks[0].ItemID, cleanupObserve{Attempt: tasks[0].Attempt, PlanSHA: tasks[0].PlanSHA, Outcome: "match", Proof: fixtureProof(tasks[0].Item)}, &cleanupObserveEnv{})
+	r := g.s.cleanupObserveOne(g.ctx, tx, 13, tasks[0].ItemID, cleanupObserve{Attempt: tasks[0].Attempt, PlanSHA: tasks[0].PlanSHA, Outcome: "match", Proof: fixtureProof(tasks[0].Item)}, &cleanupObserveEnv{authority: cleanupAuthorityTentative})
 	tx.Rollback(context.Background())
 	if gets, heads := g.bucket.counts(); r.status != 503 || gets != 0 || heads != 0 {
 		t.Fatalf("observation without prefetch: %d gets %d heads %d", r.status, gets, heads)
@@ -251,7 +251,7 @@ func TestNASCleanupConflictingDuplicatesAreRefused(t *testing.T) {
 	}
 
 	s := f.s
-	s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, s, true)
 	safeguardPlan(t, f.ctx, s, 70, "enabled", 10, 10)
 	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET state='delete_issued',delete_ever_issued=true,attempt=1,proof_sha256=repeat('c',64) WHERE plan_id=70`); err != nil {
 		t.Fatal(err)
@@ -427,6 +427,7 @@ func TestNASCleanupDryRunRecoveryRecheckFencesChanges(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			env.authority = cleanupAuthorityTentative
 			result := f.s.cleanupObserveOne(f.ctx, tx, 13, id, req, env)
 			if result.write || result.body["delete"] == true {
 				t.Fatalf("changed evidence used: %+v", result)

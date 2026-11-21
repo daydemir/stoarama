@@ -99,7 +99,7 @@ func TestNASCleanupBatchApprovalExecutesPlansWithoutRedownload(t *testing.T) {
 	if code, body := f.enableBatch([]int64{p1, p2}, []string{sha1, sha2}, 6); code != 409 || !strings.Contains(body, "master switch") {
 		t.Fatalf("batch enabled with master off: %d %s", code, body)
 	}
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	w := cleanupCall(t, f.s.handleAdminNASCleanupBatchEnable, 47, 5, "", "", map[string]any{"plan_ids": []int64{p1, p2}, "batch_sha256": strings.Repeat("a", 64), "reason": "x", "approval_hours": 6, "allow_long_approval": true})
 	if w.Code != 409 || !strings.Contains(w.Body.String(), cleanupBatchDigest(cleanupPolicySHA, []int64{p1, p2}, []string{sha1, sha2})) {
 		t.Fatalf("wrong batch digest accepted: %d %s", w.Code, w.Body.String())
@@ -250,7 +250,7 @@ func TestNASCleanupBatchAnomaliesPauseAndFallBackToFullChecks(t *testing.T) {
 	p2, sha2, _ := f.admit("anomaly-2", syntheticFiles(200, 2, 10))
 	p3, sha3, _ := f.admit("anomaly-3", syntheticFiles(300, 2, 10))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{p1, p2}, []string{sha1, sha2}, 2); code != 200 {
 		t.Fatalf("batch enable: %d %s", code, body)
 	}
@@ -317,7 +317,7 @@ func TestNASCleanupBatchAdvanceRegatesNextPlan(t *testing.T) {
 	p1, sha1, _ := f.admit("advance-1", syntheticFiles(100, 1, 10))
 	p2, sha2, _ := f.admit("advance-2", syntheticFiles(200, 1, 10))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{p1, p2}, []string{sha1, sha2}, 1); code != 200 {
 		t.Fatalf("batch enable: %d %s", code, body)
 	}
@@ -340,7 +340,7 @@ func TestNASCleanupBatchAdvanceRegatesNextPlan(t *testing.T) {
 	q1, s1, _ := g.admit("expiry-1", syntheticFiles(100, 1, 10))
 	q2, s2, _ := g.admit("expiry-2", syntheticFiles(200, 1, 10))
 	g.dryRun()
-	g.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, g.s, true)
 	if code, body := g.enableBatch([]int64{q1, q2}, []string{s1, s2}, 1); code != 200 {
 		t.Fatalf("batch enable: %d %s", code, body)
 	}
@@ -367,7 +367,7 @@ func TestNASCleanupLeaseV2BudgetAndIsolation(t *testing.T) {
 	p1, sha1, _ := f.admit("budget-1", syntheticFiles(100, 2, 10))
 	f.dryRun()
 	f.admit("budget-dry", syntheticFiles(300, 2, 10))
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{p1}, []string{sha1}, 1); code != 200 {
 		t.Fatalf("batch enable: %d %s", code, body)
 	}
@@ -429,7 +429,7 @@ func TestNASCleanupCouncilFollowUps(t *testing.T) {
 	p1, sha1, _ := f.admit("council-1", syntheticFiles(100, 4, 10))
 	p2, sha2, _ := f.admit("council-2", syntheticFiles(200, 1, 10))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 
 	// Enable refuses an item without dry-run ETag evidence.
 	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET recovery_evidence=NULL WHERE id=(SELECT min(id) FROM nas_cleanup_items WHERE plan_id=$1)`, p2); err != nil {
@@ -452,11 +452,11 @@ func TestNASCleanupCouncilFollowUps(t *testing.T) {
 		t.Fatalf("permits %+v", results)
 	}
 	// Master switch off: the identical retry no longer returns the permit.
-	f.s.cfg.NASCleanupDeletionEnabled = false
+	setCleanupMaster(t, f.s, false)
 	if r := f.observe(tasks[:1], ids); r[0].Delete || r[0].Action != "reconcile" {
 		t.Fatalf("replay with master off returned a permit: %+v", r[0])
 	}
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	// Approval expired: neither the replay nor any new lease executes, and the
 	// next lease pauses the plan and its batch.
 	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_plans SET approved_until=now()-interval '1 second' WHERE id=$1`, p1); err != nil {
@@ -493,7 +493,7 @@ func TestNASCleanupBatchAndSingleObservationsShareLockOrder(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	p1, sha1, _ := f.admit("locks-1", syntheticFiles(100, 40, 10))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{p1}, []string{sha1}, 2); code != 200 {
 		t.Fatalf("batch enable: %d %s", code, body)
 	}

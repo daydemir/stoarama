@@ -385,11 +385,8 @@ func runR2JoinedWriterCancel(ctx context.Context, cfg config.Config, args []stri
 		if live != 1 {
 			return errors.New("live deployment identity ambiguous")
 		}
-		status, b, e = r2JoinedProviderRead(ctx, "https://api.render.com/v1/services/srv-d6usqn94tr6s73d94cd0/env-vars/NAS_CLEANUP_DELETION_ENABLED", renderKey)
-		var env struct {
-			Value string `json:"value"`
-		}
-		if e != nil || status != 200 || json.Unmarshal(b, &env) != nil || env.Value != "false" {
+		var masterOn bool
+		if e = pool.QueryRow(ctx, `SELECT enabled FROM nas_cleanup_master`).Scan(&masterOn); e != nil || masterOn {
 			return errors.New("configured cleanup master is not OFF")
 		}
 		var latest int64
@@ -417,17 +414,18 @@ func runR2JoinedWriterCancel(ctx context.Context, cfg config.Config, args []stri
 	if _, err = applyTx.Exec(ctx, `SET LOCAL statement_timeout='30s';SET LOCAL lock_timeout='5s';SET LOCAL work_mem='16MB';SET LOCAL timezone='UTC'`); err != nil {
 		log.Fatal("joined writer apply configuration failed")
 	}
-	var idle bool
-	if err = applyTx.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM nas_cleanup_plans WHERE mode='enabled') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE state IN ('leased','delete_issued'))`).Scan(&idle); err != nil || !idle {
-		log.Fatal("joined writer retirement requires controller global-idle window")
-	}
 	body, err := json.Marshal(evidence)
 	if err != nil {
 		log.Fatal("owner evidence encoding failed")
 	}
 	var changed int
-	if err = applyTx.QueryRow(ctx, `SELECT r2_retire_dead_joined_batch($1,$2,$3,$4,$5,$6::jsonb)`, run, o.batch, o.snapshot, o.ownerMapSHA, o.reviewer, string(body)).Scan(&changed); err != nil {
-		log.Fatal("joined writer retirement refused; transaction rolls back")
+	// The interruptible joined-row work runs between the exclusive fence and the
+	// final OFF validation, so the retirement's own locks and writes are all
+	// behind the switch check that authorizes them.
+	if err = r2JoinedApplyFenceThenIdle(ctx, applyTx, func() error {
+		return applyTx.QueryRow(ctx, `SELECT r2_retire_dead_joined_batch($1,$2,$3,$4,$5,$6::jsonb)`, run, o.batch, o.snapshot, o.ownerMapSHA, o.reviewer, string(body)).Scan(&changed)
+	}); err != nil {
+		log.Fatal(err)
 	}
 	if changed != len(snapshot.Items) {
 		log.Fatal("joined writer audit/update count differs; transaction rolls back")
@@ -443,4 +441,52 @@ func runR2JoinedWriterCancel(ctx context.Context, cfg config.Config, args []stri
 		log.Fatal("joined writer commit recorded in database; local receipt failed, inspect run ", run)
 	}
 	log.Printf("joined writer run %s committed %d audited terminal transitions; other writer gates unchanged", run, changed)
+}
+
+// r2JoinedApplyIdleFence is the apply transaction's authority gate. It takes the
+// *exclusive* cleanup public fence before probing global idle, so the window it
+// observes cannot change underneath it: enable and batch advance take that same
+// fence exclusively, and every cleanup lease/observation takes it shared, so the
+// retirement serializes against dry-run leases as well as against authority
+// minting. Only then is the master read `FOR SHARE`, on this transaction and this
+// connection, so its row lock holds until commit: an emergency OFF waits for this
+// retirement, and a flip that committed first is seen here. Reading the master
+// through the pool would take the lock on another connection and hold nothing.
+func r2JoinedApplyIdleFence(ctx context.Context, tx pgx.Tx) error {
+	return r2JoinedApplyFenceThenIdle(ctx, tx, func() error { return nil })
+}
+
+// r2JoinedApplyFenceThenIdle is the ordered form: exclusive public fence, then
+// the potentially blocking joined-row work, and only then the authoritative
+// master read as the last statement before the caller commits. The exclusive
+// fence makes the cleanup window stable across the whole of that work, and the
+// OFF is validated after the last blocking step, so an OFF that committed during
+// it is still seen and the retirement rolls back.
+func r2JoinedApplyFenceThenIdle(ctx context.Context, tx pgx.Tx, blocking func() error) error {
+	// The public fence every cleanup path honours; exclusive here so no lease,
+	// observation, enable or advance can interleave with the idle probe.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7343226011101)`); err != nil {
+		return errors.New("joined writer retirement requires the cleanup public fence")
+	}
+	// Under the exclusive fence the window is stable, so this reading stays true
+	// through the retirement writes.
+	var idle bool
+	if err := tx.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM nas_cleanup_plans WHERE mode='enabled') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE state IN ('leased','delete_issued'))`).Scan(&idle); err != nil || !idle {
+		return errors.New("joined writer retirement requires controller global-idle window")
+	}
+	if blocking != nil {
+		if err := blocking(); err != nil {
+			return err
+		}
+	}
+	// Authoritative read, last: every fence and every blocking write is done, and
+	// the FOR SHARE row lock is held through the caller's commit.
+	var masterHeld bool
+	if err := tx.QueryRow(ctx, `SELECT enabled FROM nas_cleanup_master FOR SHARE`).Scan(&masterHeld); err != nil {
+		return errors.New("joined writer retirement requires the cleanup master OFF (locked for this transaction)")
+	}
+	if masterHeld {
+		return errors.New("joined writer retirement requires the cleanup master OFF (locked for this transaction)")
+	}
+	return nil
 }

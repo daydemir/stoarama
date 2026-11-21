@@ -467,9 +467,12 @@ stoaramactl r2-retire cancel-joined-writers --batch-record-id 5 \
   --out /absolute/new-apply-evidence.jsonl --apply
 ```
 
-The command independently confirms configured/runtime master OFF, the exact
+The command independently confirms the DB master control and the live API both
+report master OFF, the exact
 live backend with no concurrent deployment, and no enabled cleanup work or
-outstanding cleanup authority. Provider HTTP reads finish before the database
+outstanding cleanup authority. The authoritative master read happens `FOR SHARE`
+inside the apply transaction and holds to commit, so a flip to ON cannot
+interleave. Provider HTTP reads finish before the database
 transaction; the controller must hold that whole window. SQL takes the existing
 writer/freeze locks, rechecks the exact complete snapshot, requires 15 minutes
 without writes/heartbeats and no live leases, and requires a fresh exact owner
