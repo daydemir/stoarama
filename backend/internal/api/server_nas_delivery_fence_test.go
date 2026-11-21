@@ -21,6 +21,69 @@ func installDeliveryFenceTestSchema(t *testing.T, pool *pgxpool.Pool) {
 	if _, err = pool.Exec(context.Background(), string(body)); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = pool.Exec(context.Background(), `CREATE VIEW nas_delivery_work_windows AS
+ SELECT connection_id,stream_id,timezone,start_at,end_at FROM nas_delivery_retirement_windows;
+ CREATE FUNCTION nas_delivery_work_epoch(connection bigint) RETURNS boolean LANGUAGE sql STABLE AS $$SELECT false$$;
+ CREATE FUNCTION nas_delivery_media_publication_open() RETURNS boolean LANGUAGE sql VOLATILE AS $$SELECT true$$`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNASDeliveryDropsCapabilityFromPriorWorkEpoch(t *testing.T) {
+	t.Run("epoch", func(t *testing.T) { testNASDeliveryPublicationChange(t, `UPDATE work_epoch_test SET active=true`) })
+	t.Run("maintenance", func(t *testing.T) {
+		testNASDeliveryPublicationChange(t, `UPDATE nas_cleanup_maintenance SET active=true WHERE singleton`)
+	})
+}
+
+func testNASDeliveryPublicationChange(t *testing.T, change string) {
+	t.Helper()
+	f := newCleanupFixture(t, 1)
+	if _, err := f.pool.Exec(f.ctx, `CREATE TABLE work_epoch_test(active boolean);
+ INSERT INTO work_epoch_test VALUES(false);
+ CREATE OR REPLACE FUNCTION nas_delivery_work_epoch(connection bigint) RETURNS boolean LANGUAGE sql STABLE AS
+ $$SELECT active FROM work_epoch_test$$;
+ CREATE OR REPLACE FUNCTION nas_delivery_media_publication_open() RETURNS boolean LANGUAGE sql VOLATILE AS
+ $$SELECT NOT active FROM nas_cleanup_maintenance WHERE singleton FOR SHARE$$`); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("GET", "/api/v1/account/recordings/2/clips/901/download", nil)
+	req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey,
+		accountPrincipal{AccountID: 47, APIKeyID: ptrInt64(5)}))
+	prepared, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	out := httptest.NewRecorder()
+	go func() {
+		defer close(done)
+		f.s.fenceNASDelivery(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte("old capability"))
+			close(prepared)
+			<-release
+		})).ServeHTTP(out, req)
+	}()
+	select {
+	case <-prepared:
+	case <-done:
+		t.Fatal("handler never prepared the prior-epoch response")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the prior-epoch response")
+	}
+	_, err := f.pool.Exec(f.ctx, change)
+	close(release)
+	released = true
+	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Code != 503 {
+		t.Fatalf("old capability published after epoch change: %d %s", out.Code, out.Body)
+	}
 }
 
 func TestNASDeliveryFenceRefusesOutsideAndDrains(t *testing.T) {

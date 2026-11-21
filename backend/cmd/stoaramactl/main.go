@@ -271,6 +271,7 @@ func usage() {
 	  stoaramactl finish tick --safety FILE --copy-status FILE --status FILE
   stoaramactl nas-r2-copy plan --input copy.jsonl.gz --sha256 SHA --out DIR
   stoaramactl nas-r2-copy queue --input raw-NNNN.jsonl --sha256 SHA [--apply] | status
+  stoaramactl nas-r2-copy activate-keep20 --sha256 SHA --apply
   stoaramactl nas-restore request (--clip-ids 1,2 | --hour-record-id N | --recording-id N --from TIME --to TIME) [--test-prefix --label L --max-bytes N --limit N --dry-run --json]
 	  stoaramactl nas-restore status [--label L --json] | cancel --label L
 	  stoaramactl nas-stitch status|approve|pause|import-corpus|backlog|mint-durham-key

@@ -144,6 +144,15 @@ func (s *Server) handleAccountConnectionRedownload(w http.ResponseWriter, r *htt
 		util.WriteError(w, 503, "copy identity unavailable")
 		return
 	}
+	var allowed bool
+	if err = tx.QueryRow(r.Context(), `SELECT nas_delivery_allowed($1,'raw',$2)`, cid, req.ClipID).Scan(&allowed); err != nil {
+		util.WriteError(w, 503, "copy work window unavailable")
+		return
+	}
+	if !allowed {
+		util.WriteError(w, 409, "copy source outside active work window")
+		return
+	}
 	cap, err := s.r2.PresignGetExactRequest(r.Context(), current.key, head.ETag, head.VersionID, 15*time.Minute)
 	if err != nil {
 		util.WriteError(w, 503, "copy capability unavailable")

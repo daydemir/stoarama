@@ -18,7 +18,7 @@ const accountClipsScopeSQL = `WITH delivery_fence AS MATERIALIZED (
  SELECT r.id AS recording_id,w.start_at,w.end_at
  FROM recordings r CROSS JOIN delivery_fence fence
  LEFT JOIN streams s ON s.id=r.stream_id
- JOIN nas_delivery_retirement_windows w ON w.connection_id=13 AND w.stream_id=r.stream_id
+ JOIN nas_delivery_work_windows w ON w.connection_id=13 AND w.stream_id=r.stream_id
  WHERE fence.active AND r.account_id=$1 AND r.account_id=47 AND r.delivery='nas_pull'
   AND w.timezone=coalesce(nullif(s.local_timezone,''),r.cron_timezone)
 )
