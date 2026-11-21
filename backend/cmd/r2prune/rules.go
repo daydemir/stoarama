@@ -90,6 +90,20 @@ func (f *ruleFiles) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.recentFrom, "recent-from", "", "RFC3339: objects modified at or after this stay")
 }
 
+// digests are the SHA-256 of every rule file, keyed as summary.json records them.
+func (f ruleFiles) digests() (map[string]string, error) {
+	out := map[string]string{}
+	for name, p := range map[string]string{"identities": f.identities, "db_protect": f.dbProtect, "closure": f.closure,
+		"controller_protect": f.controller, "picks": f.picks} {
+		sum, err := fileSHA256(p)
+		if err != nil {
+			return nil, err
+		}
+		out[name] = sum
+	}
+	return out, nil
+}
+
 func (f ruleFiles) load() (*rules, error) {
 	for name, v := range map[string]string{"identities": f.identities, "db-protect": f.dbProtect, "closure": f.closure, "controller-protect": f.controller, "picks": f.picks, "recent-from": f.recentFrom} {
 		if v == "" {

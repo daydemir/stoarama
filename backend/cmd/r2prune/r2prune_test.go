@@ -253,24 +253,44 @@ func TestListPlanDeleteAgainstFakeS3(t *testing.T) {
 		t.Fatal("summary does not pin the manifest digest")
 	}
 
-	// A key protected after the plan is re-checked and skipped at delete time.
+	summaryPath := filepath.Join(out, "summary.json")
+	run, err := verifyReviewedInputs(manifest, summaryPath, sum.ManifestSHA256, files)
+	if err != nil || run.Inputs["controller_protect"] == "" || run.RecentFrom != files.recentFrom {
+		t.Fatalf("reviewed inputs must verify: %v %+v", err, run)
+	}
+	if _, err := verifyReviewedInputs(manifest, summaryPath, strings.Repeat("0", 64), files); err == nil {
+		t.Fatal("wrong manifest digest must refuse")
+	}
+	other := files
+	other.recentFrom = "2026-11-19T00:00:00Z"
+	if _, err := verifyReviewedInputs(manifest, summaryPath, sum.ManifestSHA256, other); err == nil {
+		t.Fatal("a recent-from other than the plan's must refuse")
+	}
+
+	// A key protected after the plan: the changed input refuses the run, and
+	// the per-key re-check skips it even when called directly.
 	f, _ := os.OpenFile(files.dbProtect, os.O_APPEND|os.O_WRONLY, 0)
 	f.WriteString("nas_copy_pending\tmanaged/acct-47/a_folder/late.mp4\n")
 	f.Close()
-	if err := runDelete(context.Background(), []string{"--manifest", manifest, "--expected-sha256", strings.Repeat("0", 64), "--ledger", filepath.Join(dir, "x")}); err == nil {
-		t.Fatal("wrong manifest digest must refuse")
+	if _, err := verifyReviewedInputs(manifest, summaryPath, sum.ManifestSHA256, files); err == nil {
+		t.Fatal("a changed protect input must refuse")
 	}
 	ledger := filepath.Join(dir, "ledger.jsonl")
 	r, err := files.load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := deleteManifest(context.Background(), st, r, manifest, ledger, 4, 0); err != nil {
+	if err := deleteManifest(context.Background(), st, r, run, manifest, ledger, 4, 0); err != nil {
 		t.Fatal(err)
 	}
 	outcomes := map[outcome]int{}
 	lf, _ := os.Open(ledger)
 	sc := bufio.NewScanner(lf)
+	sc.Scan()
+	var header runHeader
+	if json.Unmarshal(sc.Bytes(), &header); header.Type != "run" || header.ManifestSHA256 != sum.ManifestSHA256 || header.RecentFrom != files.recentFrom {
+		t.Fatalf("ledger header %+v", header)
+	}
 	for sc.Scan() {
 		var row ledgerRow
 		json.Unmarshal(sc.Bytes(), &row)

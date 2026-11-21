@@ -40,20 +40,18 @@ func runDelete(ctx context.Context, args []string) error {
 	var files ruleFiles
 	files.register(fs)
 	manifest := fs.String("manifest", "", "delete-manifest.jsonl from plan")
+	summaryPath := fs.String("summary", "", "summary.json the reviewed plan wrote beside the manifest")
 	expected := fs.String("expected-sha256", "", "reviewed SHA-256 of the manifest")
 	ledger := fs.String("ledger", "", "new ledger JSONL path")
 	workers := fs.Int("workers", 16, "parallel DeleteObjects requests")
 	limit := fs.Int("limit", 0, "delete at most this many keys (0: all), for a canary")
 	fs.Parse(args)
-	if *manifest == "" || *expected == "" || *ledger == "" {
-		return errors.New("--manifest, --expected-sha256 and --ledger are required")
+	if *manifest == "" || *expected == "" || *ledger == "" || *summaryPath == "" {
+		return errors.New("--manifest, --summary, --expected-sha256 and --ledger are required")
 	}
-	got, err := fileSHA256(*manifest)
+	run, err := verifyReviewedInputs(*manifest, *summaryPath, *expected, files)
 	if err != nil {
 		return err
-	}
-	if got != *expected {
-		return fmt.Errorf("manifest SHA-256 %s is not the reviewed %s", got, *expected)
 	}
 	st, err := storeFromEnv()
 	if err != nil {
@@ -63,13 +61,57 @@ func runDelete(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return deleteManifest(ctx, st, r, *manifest, *ledger, *workers, *limit)
+	return deleteManifest(ctx, st, r, run, *manifest, *ledger, *workers, *limit)
+}
+
+// runHeader is the ledger's first line: exactly what this run was proven against.
+type runHeader struct {
+	Type           string            `json:"type"`
+	ManifestSHA256 string            `json:"manifest_sha256"`
+	Inputs         map[string]string `json:"inputs_sha256"`
+	RecentFrom     string            `json:"recent_from"`
+	Limit          int               `json:"limit"`
+	StartedAt      string            `json:"started_at"`
+}
+
+// verifyReviewedInputs refuses unless the manifest and every rule file the
+// re-check reads are byte-identical to the reviewed plan's, and recent-from
+// is the one that plan used.
+func verifyReviewedInputs(manifest, summaryPath, expected string, files ruleFiles) (runHeader, error) {
+	run := runHeader{Type: "run"}
+	raw, err := os.ReadFile(summaryPath)
+	if err != nil {
+		return run, err
+	}
+	var sum summary
+	if err := json.Unmarshal(raw, &sum); err != nil {
+		return run, err
+	}
+	if run.ManifestSHA256, err = fileSHA256(manifest); err != nil {
+		return run, err
+	}
+	if run.ManifestSHA256 != expected || sum.ManifestSHA256 != expected {
+		return run, fmt.Errorf("manifest SHA-256 %s, summary %s, reviewed %s must all match", run.ManifestSHA256, sum.ManifestSHA256, expected)
+	}
+	if files.recentFrom != sum.RecentFrom {
+		return run, fmt.Errorf("--recent-from %q is not the plan's %q", files.recentFrom, sum.RecentFrom)
+	}
+	if run.Inputs, err = files.digests(); err != nil {
+		return run, err
+	}
+	for name, got := range run.Inputs {
+		if got != sum.Inputs[name] {
+			return run, fmt.Errorf("%s SHA-256 %s is not the reviewed %s", name, got, sum.Inputs[name])
+		}
+	}
+	run.RecentFrom = sum.RecentFrom
+	return run, nil
 }
 
 // deleteManifest re-decides every key against freshly loaded rules right
 // before the wire; a key that no longer decides to the same delete class is
 // skipped and recorded, never deleted.
-func deleteManifest(ctx context.Context, st store, r *rules, manifest, ledgerPath string, workers, limit int) error {
+func deleteManifest(ctx context.Context, st store, r *rules, run runHeader, manifest, ledgerPath string, workers, limit int) error {
 	if st.bucket != r.Bucket {
 		return fmt.Errorf("R2_BUCKET %q is not the protect file's bucket %q", st.bucket, r.Bucket)
 	}
@@ -81,6 +123,10 @@ func deleteManifest(ctx context.Context, st store, r *rules, manifest, ledgerPat
 	var mu sync.Mutex
 	lw := bufio.NewWriter(lf)
 	enc := json.NewEncoder(lw)
+	run.Limit, run.StartedAt = limit, time.Now().UTC().Format(time.RFC3339Nano)
+	if err := enc.Encode(run); err != nil {
+		return err
+	}
 	var deleted, failed, skipped int64
 	record := func(rows []ledgerRow) error {
 		mu.Lock()

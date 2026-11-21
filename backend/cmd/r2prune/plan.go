@@ -41,6 +41,7 @@ func (t *tally) add(size int64) {
 type summary struct {
 	Bucket         string                      `json:"bucket"`
 	Inputs         map[string]string           `json:"inputs_sha256"`
+	RecentFrom     string                      `json:"recent_from"`
 	Listed         tally                       `json:"listed"`
 	Delete         tally                       `json:"delete"`
 	Protected      tally                       `json:"protected"`
@@ -66,12 +67,12 @@ func runPlan(args []string) error {
 	if err := os.Mkdir(*out, 0o700); err != nil {
 		return err
 	}
-	sum := summary{Bucket: r.Bucket, Inputs: map[string]string{}, ByClass: map[class]*tally{}, ByReason: map[class]map[string]*tally{}}
-	for name, p := range map[string]string{"snapshot": *snapshot, "identities": files.identities, "db_protect": files.dbProtect,
-		"closure": files.closure, "controller_protect": files.controller, "picks": files.picks} {
-		if sum.Inputs[name], err = fileSHA256(p); err != nil {
-			return err
-		}
+	sum := summary{Bucket: r.Bucket, RecentFrom: files.recentFrom, ByClass: map[class]*tally{}, ByReason: map[class]map[string]*tally{}}
+	if sum.Inputs, err = files.digests(); err != nil {
+		return err
+	}
+	if sum.Inputs["snapshot"], err = fileSHA256(*snapshot); err != nil {
+		return err
 	}
 	classified, err := os.OpenFile(filepath.Join(*out, "classified.tsv"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
