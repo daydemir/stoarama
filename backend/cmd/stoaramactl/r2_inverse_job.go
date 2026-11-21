@@ -65,7 +65,7 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane
 	// Deniz, 2026-11-12: keep up only the links on the public delivery page.
 	// Before any delete, no candidate this job can select may still be one of
 	// them; only an exempt key whose class gate is open now is not.
-	candidates, pageKeep, overlap, err := inverseJobPageKeepOverlap(ctx, pool, store.Bucket(), filepath.Join(partition, "partition.jsonl"), lane)
+	candidates, pageKeep, overlap, err := inverseJobPageKeepOverlap(ctx, pool, store.Bucket(), filepath.Join(partition, "partition.jsonl"), lane, f.selectedPlan)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -89,6 +89,7 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane
 // stitch hold is not reselected by every later batch.
 func inverseJobApplyOptions(f inverseJobFlags, lane inverseLane, partition, digest string) (inverseApplyOptions, error) {
 	o := inverseApplyOptions{Lane: lane, Manifest: filepath.Join(partition, "partition.jsonl"), Summary: filepath.Join(partition, "summary.json"), Picks: f.picks, Ledger: filepath.Join(f.work, "ledger.jsonl"), Workers: f.workers, MaxItems: f.items, MaxBytes: f.maxBytes, Budget24h: f.budget24h, ManifestSHA: digest, skipped: &inverseSkipSet{}}
+	o.SelectedPlan = f.selectedPlan
 	var err error
 	if o.SummarySHA, err = inverseFileSHA(o.Summary); err != nil {
 		return o, err
@@ -173,6 +174,7 @@ type inverseJobFlags struct {
 	picks, picksSHA, owner, work, reuse string
 	workers, items, batches             int
 	maxBytes, budget24h                 int64
+	selectedPlan                        keep28SelectedPlan
 }
 
 const inverseJobUsage = "usage: stoaramactl r2-inverse job|job-keep28 --picks FILE --expected-picks-sha256 HEX --owner-decision FILE --work DIR [--reuse-partition HEX --workers N --max-items N --max-bytes N --budget-24h-bytes N --batches N]; job-keep28 requires --max-bytes and --budget-24h-bytes"
@@ -198,12 +200,13 @@ func parseInverseJobFlags(args []string, lane inverseLane) (inverseJobFlags, err
 	fs.Int64Var(&f.maxBytes, "max-bytes", maxBytes, "maximum new intent bytes per batch (required for job-keep28)")
 	fs.Int64Var(&f.budget24h, "budget-24h-bytes", 0, "maximum charged bytes in previous 24h, 0 = unlimited (required for job-keep28)")
 	fs.IntVar(&f.batches, "batches", 1, "maximum batches")
+	f.selectedPlan.flags(fs)
 	if err := fs.Parse(args); err != nil {
 		return f, err
 	}
 	budgetSet := false
 	fs.Visit(func(fl *flag.Flag) { budgetSet = budgetSet || fl.Name == "budget-24h-bytes" })
-	if fs.NArg() != 0 || f.picks == "" || !r2RetireLowerHex64(f.picksSHA) || f.owner == "" || f.work == "" || (f.reuse != "" && !r2RetireLowerHex64(f.reuse)) || f.workers < 1 || f.workers > 64 || f.items < 1 || f.maxBytes <= 0 || f.budget24h < 0 || f.batches < 1 || (lane == inverseNASKeep28 && !budgetSet) {
+	if fs.NArg() != 0 || f.picks == "" || !r2RetireLowerHex64(f.picksSHA) || f.owner == "" || f.work == "" || (f.reuse != "" && !r2RetireLowerHex64(f.reuse)) || f.workers < 1 || f.workers > 64 || f.items < 1 || f.maxBytes <= 0 || f.budget24h < 0 || f.batches < 1 || (lane == inverseNASKeep28 && !budgetSet) || !f.selectedPlan.validFor(lane) {
 		return f, errors.New(inverseJobUsage)
 	}
 	return f, nil
@@ -319,7 +322,7 @@ func errorText(err error) string {
 
 // inverseJobPageKeepOverlap counts the lane's partition candidates, the exact
 // protected public delivery page keys, and the candidates that are such keys.
-func inverseJobPageKeepOverlap(ctx context.Context, pool *pgxpool.Pool, bucket, manifest string, lane inverseLane) (int, int64, int64, error) {
+func inverseJobPageKeepOverlap(ctx context.Context, pool *pgxpool.Pool, bucket, manifest string, lane inverseLane, selectedPlan keep28SelectedPlan) (int, int64, int64, error) {
 	f, err := os.Open(manifest)
 	if err != nil {
 		return 0, 0, 0, err
@@ -327,13 +330,26 @@ func inverseJobPageKeepOverlap(ctx context.Context, pool *pgxpool.Pool, bucket, 
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	verified := map[string]bool{}
+	if selectedPlan.ID != 0 {
+		var keys []string
+		err = pool.QueryRow(ctx, `SELECT coalesce(array_agg(object_key),'{}') FROM r2_keep28_selected_custody
+ WHERE verify_plan_id=$1 AND plan_sha256=$2 AND bucket=$3`,
+			selectedPlan.ID, selectedPlan.SHA, bucket).Scan(&keys)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		for _, key := range keys {
+			verified[key] = true
+		}
+	}
 	var keys []string
 	for scanner.Scan() {
 		var e inverseEntry
 		if err = json.Unmarshal(scanner.Bytes(), &e); err != nil {
 			return 0, 0, 0, err
 		}
-		if e.Class == lane.class() {
+		if e.Class == lane.class() || e.Class == inverseHeld && e.Reason == "live_hold" && verified[e.Key] {
 			keys = append(keys, e.Key)
 		}
 	}

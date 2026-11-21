@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"time"
 
@@ -54,6 +55,9 @@ type keep28Custody struct {
 	Path, SHA, State, SidecarPath, SidecarSHA string
 	SidecarSize                               int64
 	VerifiedAt, ReceivedAt, Expiry            time.Time
+	VerifyItemID                              int64  `json:",omitempty"`
+	VerifyPlanID                              int64  `json:",omitempty"`
+	VerifyPlanSHA                             string `json:",omitempty"`
 }
 
 // keep28Identity is the source and custody identity selection observed for a
@@ -61,10 +65,57 @@ type keep28Custody struct {
 type keep28Identity struct {
 	SourceID, SizeBytes, SidecarSize int64
 	Path, SHA, SidecarSHA            string
+	VerifyItemID                     int64 `json:",omitempty"`
 }
 
 func (c keep28Custody) identity() keep28Identity {
-	return keep28Identity{SourceID: c.SourceID, SizeBytes: c.SizeBytes, SidecarSize: c.SidecarSize, Path: c.Path, SHA: c.SHA, SidecarSHA: c.SidecarSHA}
+	return keep28Identity{SourceID: c.SourceID, SizeBytes: c.SizeBytes, SidecarSize: c.SidecarSize, Path: c.Path, SHA: c.SHA, SidecarSHA: c.SidecarSHA, VerifyItemID: c.VerifyItemID}
+}
+
+type keep28SelectedPlan struct {
+	ID  int64
+	SHA string
+}
+
+func (p *keep28SelectedPlan) flags(fs *flag.FlagSet) {
+	fs.Int64Var(&p.ID, "selected-verify-plan", 0, "immutable NAS selected verifier plan ID (keep-28 only)")
+	fs.StringVar(&p.SHA, "selected-verify-plan-sha256", "", "approved NAS selected verifier plan digest")
+}
+
+func (p keep28SelectedPlan) validFor(l inverseLane) bool {
+	return p == (keep28SelectedPlan{}) || l == inverseNASKeep28 && p.ID > 0 && r2RetireLowerHex64(p.SHA)
+}
+
+func (a *inverseApplier) lockSelectedKeep28Custody(ctx context.Context, tx pgx.Tx, t inverseRawTarget, key string) (keep28Custody, error) {
+	p := a.opts.SelectedPlan
+	c := keep28Custody{
+		ConnectionID: 13, SourceID: t.ID, SizeBytes: t.Size, Path: t.Path, SHA: t.SHA, State: "present",
+		VerifyPlanID: p.ID, VerifyPlanSHA: p.SHA,
+	}
+	var fresh bool
+	err := tx.QueryRow(ctx, `SELECT v.verify_item_id,v.completed_at,v.completed_at+interval '24 hours',
+ v.completed_at>=clock_timestamp()-interval '24 hours'
+ FROM r2_keep28_selected_custody v JOIN nas_selected_verify_items i ON i.id=v.verify_item_id
+ WHERE v.verify_plan_id=$1 AND v.plan_sha256=$2 AND v.bucket=$3 AND v.object_key=$4
+ AND v.source_id=$5 AND v.relative_path=$6 AND v.size_bytes=$7 AND v.sha256=$8
+ FOR SHARE OF i NOWAIT`, p.ID, p.SHA, a.store.Bucket(), key, t.ID, t.Path, t.Size, t.SHA).
+		Scan(&c.VerifyItemID, &c.VerifiedAt, &c.Expiry, &fresh)
+	if err != nil {
+		return c, err
+	}
+	c.VerifiedAt, c.Expiry = c.VerifiedAt.UTC(), c.Expiry.UTC()
+	c.ReceivedAt = c.VerifiedAt
+	if !fresh {
+		return c, errR2RetireNASProofAged
+	}
+	return c, nil
+}
+
+func (a *inverseApplier) lockKeep28Proof(ctx context.Context, tx pgx.Tx, t inverseRawTarget, key string) (keep28Custody, error) {
+	if a.opts.SelectedPlan.ID != 0 {
+		return a.lockSelectedKeep28Custody(ctx, tx, t, key)
+	}
+	return a.lockKeep28Custody(ctx, tx, t)
 }
 
 // lockKeep28Custody locks and reads the exact custody proof. An aged proof is
@@ -104,7 +155,7 @@ const keep28AdmissionCustody = keep28CustodyMargin + inverseNetworkTimeout
 // and reserve requires the identity observed here. Committed stitch input holds
 // are left out so they never fill a batch.
 func (a *inverseApplier) selectKeep28(ctx context.Context, entries map[string]inverseEntry) ([]inverseEntry, error) {
-	rows, err := a.pool.Query(ctx, `SELECT c.object_key,c.id,c.size_bytes,c.display_path,lower(c.sha256),n.sidecar_size_bytes,n.sidecar_sha256
+	query := `SELECT c.object_key,c.id,c.size_bytes,c.display_path,lower(c.sha256),n.sidecar_size_bytes,n.sidecar_sha256,0::bigint
  FROM recording_clips c JOIN nas_inventory_files n ON n.connection_id=$2 AND n.clip_id=c.id
  JOIN recordings r ON r.id=c.recording_id
  WHERE c.bucket=$1 AND c.purged_at IS NULL AND r.account_id=47
@@ -113,7 +164,19 @@ func (a *inverseApplier) selectKeep28(ctx context.Context, entries map[string]in
  AND n.sidecar_relative_path=c.display_path||'.stoarama.json' AND n.sidecar_size_bytes>0 AND n.sidecar_sha256 ~ '^[a-f0-9]{64}$'
  AND LEAST(n.verified_at,n.server_received_at)>clock_timestamp()-interval '24 hours'+make_interval(secs=>$3)
  AND NOT EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds h WHERE h.bucket=c.bucket AND h.object_key=c.object_key AND h.released_at IS NULL)
- ORDER BY n.verified_at,c.id`, a.store.Bucket(), int64(13), keep28AdmissionCustody.Seconds())
+ ORDER BY n.verified_at,c.id`
+	args := []any{a.store.Bucket(), int64(13), keep28AdmissionCustody.Seconds()}
+	if p := a.opts.SelectedPlan; p.ID != 0 {
+		query = `SELECT v.object_key,v.source_id,v.size_bytes,v.relative_path,v.sha256,0::bigint,''::text,v.verify_item_id
+ FROM r2_keep28_selected_custody v WHERE v.bucket=$1 AND v.verify_plan_id=$2 AND v.plan_sha256=$4
+ AND v.completed_at>clock_timestamp()-interval '24 hours'+make_interval(secs=>$3)
+ AND NOT r2_keep28_copy_blocks(v.bucket,v.object_key,v.verify_item_id)
+ AND NOT EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds h WHERE h.bucket=v.bucket AND h.object_key=v.object_key AND h.released_at IS NULL)
+ ORDER BY v.completed_at,v.source_id`
+		args[1] = p.ID
+		args = append(args, p.SHA)
+	}
+	rows, err := a.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +186,7 @@ func (a *inverseApplier) selectKeep28(ctx context.Context, entries map[string]in
 	for rows.Next() {
 		var key string
 		var id keep28Identity
-		if err = rows.Scan(&key, &id.SourceID, &id.SizeBytes, &id.Path, &id.SHA, &id.SidecarSize, &id.SidecarSHA); err != nil {
+		if err = rows.Scan(&key, &id.SourceID, &id.SizeBytes, &id.Path, &id.SHA, &id.SidecarSize, &id.SidecarSHA, &id.VerifyItemID); err != nil {
 			return nil, err
 		}
 		e, ok := entries[key]
@@ -171,7 +234,7 @@ func (c keep28DBClock) deadline(expiry time.Time) time.Time {
 // to equal the proof persisted with that intent. It returns the local instant
 // custody ends, which must still be ahead.
 func (a *inverseApplier) proveKeep28(ctx context.Context, tx pgx.Tx, e inverseEntry, target inverseRawTarget) (keep28Custody, time.Time, error) {
-	custody, err := a.lockKeep28Custody(ctx, tx, target)
+	custody, err := a.lockKeep28Proof(ctx, tx, target, e.Key)
 	if err != nil {
 		return custody, time.Time{}, err
 	}
@@ -200,7 +263,7 @@ func (a *inverseApplier) proveKeep28(ctx context.Context, tx pgx.Tx, e inverseEn
 // checkCustody runs at the transport, under the network transaction: the locked
 // custody row must still equal the intent's proof, with lifetime left.
 func (a *inverseDeleteAuthority) checkCustody(ctx context.Context) error {
-	c, err := a.guard.a.lockKeep28Custody(ctx, a.guard.tx, a.guard.t)
+	c, err := a.guard.a.lockKeep28Proof(ctx, a.guard.tx, a.guard.t, a.binding.Key)
 	if err != nil {
 		return err
 	}
