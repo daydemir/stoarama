@@ -2195,7 +2195,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		}
 		reuse := func(digest string) (string, error) {
 			dir := filepath.Join(t.TempDir(), "partition")
-			_, err := reuseInversePartition(ctx, pool, store, picksPath, picks.SHA256, digest, dir)
+			_, err := reuseInversePartition(ctx, pool, store, picksPath, picks.SHA256, digest, dir, false)
 			return dir, err
 		}
 		t.Run("own_progress_keeps_the_partition_reusable", func(t *testing.T) {
@@ -2217,7 +2217,7 @@ func TestR2InverseExecutorLifecycle(t *testing.T) {
 		t.Run("unapproved_picks", func(t *testing.T) {
 			// The stored picks match the current file, not the approved digest.
 			o, _ := seal(1, time.Now().UTC())
-			_, err := reuseInversePartition(ctx, pool, store, picksPath, strings.Repeat("e", 64), o.ManifestSHA, filepath.Join(t.TempDir(), "partition"))
+			_, err := reuseInversePartition(ctx, pool, store, picksPath, strings.Repeat("e", 64), o.ManifestSHA, filepath.Join(t.TempDir(), "partition"), false)
 			if err == nil || !strings.Contains(err.Error(), "approved digest") {
 				t.Fatal("reused picks other than the approved digest", err)
 			}

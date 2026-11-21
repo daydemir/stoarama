@@ -13,26 +13,38 @@ import (
 // Closed table selection: no operator-supplied identifier enters SQL. B1 stays
 // in its existing namespace; ordinary reservations and byte charges are shared.
 func (l inverseLane) intentTable() string {
-	if l == inverseNASKeep28 {
+	switch l {
+	case inverseNASKeep28:
 		return "r2_keep28_intents"
+	case inverseNonrawCollated:
+		return "r2_nonraw_intents"
 	}
 	return "r2_inverse_intents"
 }
 func (l inverseLane) eventTable() string {
-	if l == inverseNASKeep28 {
+	switch l {
+	case inverseNASKeep28:
 		return "r2_keep28_events"
+	case inverseNonrawCollated:
+		return "r2_nonraw_events"
 	}
 	return "r2_inverse_events"
 }
 func (l inverseLane) attemptTable() string {
-	if l == inverseNASKeep28 {
+	switch l {
+	case inverseNASKeep28:
 		return "r2_keep28_attempts"
+	case inverseNonrawCollated:
+		return "r2_nonraw_attempts"
 	}
 	return "r2_inverse_attempts"
 }
 func (l inverseLane) retirementReason() string {
-	if l == inverseNASKeep28 {
+	switch l {
+	case inverseNASKeep28:
 		return "keep28_exact_nas"
+	case inverseNonrawCollated:
+		return inverseNonrawReason
 	}
 	return "inverse_non_keep28"
 }

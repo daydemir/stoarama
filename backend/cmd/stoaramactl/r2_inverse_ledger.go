@@ -22,6 +22,7 @@ type inverseLedgerLane string
 const (
 	inverseLegacyLedger inverseLedgerLane = ""
 	inverseKeep28Ledger inverseLedgerLane = "keep28_raw_v1"
+	inverseNonrawLedger inverseLedgerLane = "nonraw_collated_v1"
 )
 
 type inverseLedgerRecord struct {
@@ -46,6 +47,9 @@ func openInverseLedger(path string) (*inverseLedger, error) {
 }
 func openKeep28Ledger(path string) (*inverseLedger, error) {
 	return openInverseLaneLedger(path, inverseKeep28Ledger)
+}
+func openNonrawLedger(path string) (*inverseLedger, error) {
+	return openInverseLaneLedger(path, inverseNonrawLedger)
 }
 func openInverseLaneLedger(path string, lane inverseLedgerLane) (*inverseLedger, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND|syscall.O_NOFOLLOW, 0600)

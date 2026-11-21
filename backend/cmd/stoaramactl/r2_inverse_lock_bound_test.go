@@ -78,7 +78,7 @@ func TestR2InverseApplyInitializationBoundsProtectionReads(t *testing.T) {
 	done := make(chan admitted, 1)
 	go func() {
 		var epoch int64
-		p, err := loadInverseApplyAdmission(f.ctx, f.pool, f.sdk, picks, windows, &epoch)
+		p, err := loadInverseApplyAdmission(f.ctx, f.pool, f.sdk, picks, windows, &epoch, false)
 		done <- admitted{p, epoch, err}
 	}()
 	// The held table keeps initialization from finishing: it retries outside

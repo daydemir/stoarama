@@ -1009,7 +1009,7 @@ func TestR2InversePartitionDispatchUsesBoundedReader(t *testing.T) {
 		R2Region:          "auto",
 		R2Endpoint:        server.URL,
 	}
-	sum, err := writeInversePartition(ctx, cfg, picksPath, out)
+	sum, err := writeInversePartition(ctx, cfg, picksPath, out, false)
 	if err != nil {
 		t.Fatal(err)
 	}

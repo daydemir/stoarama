@@ -36,6 +36,9 @@ func requireJoinedTestReplicationRole(t *testing.T, pool *pgxpool.Pool) {
 }
 
 var joinedMigrationNames = []string{
+	// 0223 and every later migration (including 0225's delivery exemptions) are
+	// auto-added by joinedDeferredMigrations from the >=0223 rule; listing any of
+	// them here as well would apply it twice and fail schema_migrations_pkey.
 	"0222_nas_stitch_durham_toolchain.sql",
 	// Owner keep holds guard the deferred retirement reservation table.
 	"0220_r2_owner_keep_prefixes.sql",
@@ -46,6 +49,8 @@ var joinedMigrationNames = []string{
 	// The R2 stitch handoff depends on the deferred stitch and writer-fence tables.
 	"0217_nas_stitch_r2_handoff.sql",
 	// Defer with 0167; the final MigrateUp applies both in dependency order.
+	"0212_r2_classifier_input_epoch.sql",
+	"0211_r2_nonraw_retirement.sql",
 	"0215_nas_stitch_lease_key.sql",
 	// Replaces the reservation guard over the deferred cleanup tables.
 	"0216_r2_reservation_guard_index.sql",

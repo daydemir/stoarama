@@ -57,7 +57,7 @@ func storeInversePartition(ctx context.Context, pool *pgxpool.Pool, dir string) 
 // freshness every batch also requires, and unchanged external classification
 // inputs: the stored holds digest must equal one read now. The partition only
 // proposes candidates; it never authorizes a DELETE.
-func reuseInversePartition(ctx context.Context, pool *pgxpool.Pool, store inverseLister, picksPath, approvedPicks, digest, dir string) (inverseSummary, error) {
+func reuseInversePartition(ctx context.Context, pool *pgxpool.Pool, store inverseLister, picksPath, approvedPicks, digest, dir string, reviewed bool) (inverseSummary, error) {
 	var sum inverseSummary
 	var summary, packed []byte
 	if err := pool.QueryRow(ctx, `SELECT summary,partition_gzip FROM r2_inverse_partitions WHERE bucket=$1 AND endpoint_sha256=$2 AND partition_sha256=$3`,
@@ -100,6 +100,11 @@ func reuseInversePartition(ctx context.Context, pool *pgxpool.Pool, store invers
 	if err != nil {
 		return sum, err
 	}
+	// A stored partition is reused only in the scope it was classified in: the
+	// page-exemption and collated-mapping inputs are part of the holds digest, so
+	// a RAW-scope partition can never carry a reviewed-scope decision, or the
+	// reverse.
+	p.ReviewedCollated = reviewed
 	holds, err := p.holdsSHA256()
 	if err != nil {
 		return sum, err

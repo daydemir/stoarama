@@ -67,7 +67,21 @@ type inverseLane uint8
 const (
 	inverseOutsideKeep28 inverseLane = iota
 	inverseNASKeep28
+	// Reviewed collated lane. Explicitly distinct so a collated candidate can
+	// never fall into the RAW deletable path or loadInverseRawTarget.
+	inverseNonrawCollated
 )
+
+// class is the partition class a lane deletes.
+func (l inverseLane) class() inverseClass {
+	switch l {
+	case inverseNASKeep28:
+		return inverseKeep28
+	case inverseNonrawCollated:
+		return inverseCollated
+	}
+	return inverseDeletable
+}
 
 type inverseApplyOptions struct {
 	Lane                                                                               inverseLane
@@ -129,6 +143,8 @@ type inverseApplySummary struct {
 	// CustodyShort counts keep-28 keys skipped before any write because their
 	// custody could end before a DELETE finishes; fresh custody retries them.
 	CustodyShort     r2RetireStat `json:"custody_short"`
+	RawBytes         int64        `json:"raw_bytes"`
+	NonrawBytes      int64        `json:"nonraw_bytes"`
 	Bytes            int64        `json:"bytes"`
 	ElapsedSeconds   float64      `json:"elapsed_seconds"`
 	ObjectsPerSecond float64      `json:"objects_per_second"`
@@ -150,6 +166,7 @@ type inverseApplier struct {
 	opts       inverseApplyOptions
 	summary    inverseSummary
 	protection inverseProtection
+	collated   map[string]inverseCollatedAssessment
 	ledger     *inverseLedger
 }
 
@@ -248,6 +265,11 @@ func (a *inverseApplier) checkEvidenceLock(ctx context.Context, q r2RetireQuerie
 	}
 	if err = e.validateProof(a.opts); err != nil {
 		return err
+	}
+	// The collated lane waives exact delivery holds under the reviewed owner
+	// scope only; legacy PUT-completion proof never authorizes it.
+	if a.opts.Lane == inverseNonrawCollated && e.Proof != inverseOwnerFenceProof {
+		return errors.New("collated lane requires the owner fence policy proof")
 	}
 	return a.summary.fresh(now)
 }
@@ -545,6 +567,41 @@ const inverseRawTargetSQL = `SELECT c.id,coalesce(r.stream_id,0),c.size_bytes,lo
  coalesce(nullif(s.local_timezone,''),r.cron_timezone,'') FROM recording_clips c JOIN recordings r ON r.id=c.recording_id
  LEFT JOIN streams s ON s.id=r.stream_id WHERE c.bucket=$1 AND c.object_key=$2 AND c.purged_at IS NULL AND NOT EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.object_key=c.object_key) FOR UPDATE OF c NOWAIT`
 
+// lockInverseRawSourceClosure takes the SAME RAW row lock the single-key RAW path
+// takes (FOR UPDATE on recording_clips), in ascending id order, over every RAW
+// source a collated output depends on. Ordinary cleanup admission locks those
+// rows FOR KEY SHARE and purge writes purged_at, both of which conflict with this
+// lock, so the closure stays frozen from here through the wire DELETE. One lock
+// order (id ascending), one code path, no collated-only variant.
+func lockInverseRawSourceClosure(ctx context.Context, tx pgx.Tx, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	rows, err := tx.Query(ctx, `SELECT c.id FROM recording_clips c WHERE c.id=ANY($1::bigint[]) ORDER BY c.id FOR UPDATE`, ids)
+	if err != nil {
+		return err
+	}
+	locked := 0
+	for rows.Next() {
+		var id int64
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		locked++
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	if locked != len(ids) {
+		// A missing source is uncertainty; never proceed on a partial closure.
+		return fmt.Errorf("%w: source closure identity changed", errInverseNonrawIneligible)
+	}
+	return nil
+}
+
 var errInverseRawIneligible = errors.New("raw target ineligible")
 
 // errInverseStitchConflict reports a key that a Durham stitch hold owns or is
@@ -636,6 +693,7 @@ func (a *inverseApplier) keyContention(ctx context.Context, tx pgx.Tx, key strin
 func (a *inverseApplier) loadTarget(ctx context.Context, tx pgx.Tx, e inverseEntry) (inverseRawTarget, error) {
 	return loadInverseRawTarget(ctx, tx, a.store.Bucket(), a.protection, a.opts.Lane, e)
 }
+
 func loadInverseRawTarget(ctx context.Context, tx pgx.Tx, bucket string, protection inverseProtection, lane inverseLane, e inverseEntry) (inverseRawTarget, error) {
 	t := inverseRawTarget{}
 	clip := inverseWait{`SELECT 1 FROM recording_clips WHERE bucket=$1 AND object_key=$2 FOR UPDATE`, []any{bucket, e.Key}}
@@ -665,11 +723,7 @@ func loadInverseRawTarget(ctx context.Context, tx pgx.Tx, bucket string, protect
 	p.Identities = map[string][]inverseIdentity{e.Key: {t.Identity}}
 	p.Held = map[string]bool{}
 	p.Delivery = map[string]bool{}
-	want := inverseDeletable
-	if lane == inverseNASKeep28 {
-		want = inverseKeep28
-	}
-	if class, _ := p.classify(e.ObjectInfo); class != want {
+	if class, _ := p.classify(e.ObjectInfo); class != lane.class() {
 		return t, fmt.Errorf("%w: target is no longer in the requested raw lane", errInverseRawIneligible)
 	}
 	if lane == inverseNASKeep28 {
@@ -1228,11 +1282,16 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	if o.skipped == nil {
 		o.skipped = &inverseSkipSet{}
 	}
-	if o.Lane != inverseOutsideKeep28 && o.Lane != inverseNASKeep28 {
+	if o.Lane != inverseOutsideKeep28 && o.Lane != inverseNASKeep28 && o.Lane != inverseNonrawCollated {
 		return result, errors.New("unknown inverse lane")
 	}
 	if _, ok := store.(inverseDeleteStore); !ok {
 		return result, errors.New("inverse DELETE transport required")
+	}
+	if o.Lane == inverseNonrawCollated {
+		if _, ok := store.(inverseNonrawStore); !ok {
+			return result, errors.New("collated nonraw transport required")
+		}
 	}
 	if o.Workers < 1 || o.Workers > 64 || o.MaxItems < 1 || o.MaxBytes <= 0 || o.Budget24h < 0 {
 		return result, errors.New("invalid bounded apply options")
@@ -1275,6 +1334,8 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	var ledger *inverseLedger
 	if o.Lane == inverseNASKeep28 {
 		ledger, err = openKeep28Ledger(o.Ledger)
+	} else if o.Lane == inverseNonrawCollated {
+		ledger, err = openNonrawLedger(o.Ledger)
 	} else {
 		ledger, err = openInverseLedger(o.Ledger)
 	}
@@ -1283,7 +1344,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	}
 	defer ledger.close()
 	var keEpoch int64
-	protection, err := loadInverseApplyAdmission(ctx, pool, store, picks, windows, &keEpoch)
+	protection, err := loadInverseApplyAdmission(ctx, pool, store, picks, windows, &keEpoch, o.Lane == inverseNonrawCollated)
 	if err != nil {
 		return result, err
 	}
@@ -1393,11 +1454,9 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		if err = json.Unmarshal(scanner.Bytes(), &e); err != nil {
 			return result, err
 		}
-		want := inverseDeletable
-		if o.Lane == inverseNASKeep28 {
-			want = inverseKeep28
-		}
-		if e.Class != want || existing[e.Key] {
+		// Collated candidates carry their own typed class; they are never the RAW
+		// deletable class and never reach loadInverseRawTarget.
+		if e.Class != o.Lane.class() || existing[e.Key] {
 			continue
 		}
 		// A nonpositive size can never reserve; selecting it would abort the batch.
@@ -1411,6 +1470,19 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		if o.Lane == inverseNASKeep28 {
 			if _, dup := candidates[e.Key]; dup {
 				return result, errors.New("duplicate keep28 partition key")
+			}
+			if heldKeys[e.Key] || o.skipped.has(e.Key) {
+				continue
+			}
+			candidates[e.Key] = e
+			continue
+		}
+		if o.Lane == inverseNonrawCollated {
+			if _, dup := candidates[e.Key]; dup {
+				return result, errors.New("duplicate collated partition key")
+			}
+			if _, ok := inverseNonrawKindOf(e.Key); !ok {
+				continue
 			}
 			if heldKeys[e.Key] || o.skipped.has(e.Key) {
 				continue
@@ -1443,6 +1515,17 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 			return result, err
 		}
 	}
+	if o.Lane == inverseNonrawCollated {
+		// Collated selection follows the same live catalog reload the wire uses.
+		// Nothing is chosen from the stored assessment alone.
+		for _, e := range candidates {
+			if len(jobs) >= o.MaxItems || e.SizeBytes > o.MaxBytes-planned {
+				continue
+			}
+			jobs = append(jobs, e)
+			planned += e.SizeBytes
+		}
+	}
 	// Any failure closes admission to new reservations. A hard failure also
 	// closes the send gate, so no reserved key sends its first DELETE after it.
 	// Deletes already sent finish under their own deadline; cancelling them
@@ -1454,7 +1537,7 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 	var wg sync.WaitGroup
 	var first error
 	var mu sync.Mutex
-	var deleted, bytes atomic.Int64
+	var deleted, bytes, rawBytes, nonrawBytes atomic.Int64
 	var wireAmbiguous, unpublished []string
 	var modifiedHeld, modifiedBytes, stitchSkipped atomic.Int64
 	var custodyShort r2RetireStat
@@ -1463,10 +1546,21 @@ func applyInverse(ctx context.Context, pool *pgxpool.Pool, store inverseReader, 
 		go func() {
 			defer wg.Done()
 			for e := range queue {
-				ok, err := a.delete(ctx, stop, send, e)
+				var ok bool
+				var err error
+				if o.Lane == inverseNonrawCollated {
+					ok, err = a.deleteNonraw(ctx, stop, send, e)
+				} else {
+					ok, err = a.delete(ctx, stop, send, e)
+				}
 				if ok {
 					deleted.Add(1)
 					bytes.Add(e.SizeBytes)
+					if o.Lane == inverseNonrawCollated {
+						nonrawBytes.Add(e.SizeBytes)
+					} else {
+						rawBytes.Add(e.SizeBytes)
+					}
 				}
 				if errors.Is(err, errInverseAdmissionClosed) {
 					return
@@ -1533,6 +1627,8 @@ send:
 	sort.Strings(unpublished)
 	result.Unpublished = unpublished
 	result.Bytes = bytes.Load()
+	result.RawBytes = rawBytes.Load()
+	result.NonrawBytes = nonrawBytes.Load()
 	result.LastModifiedHeld.Objects += modifiedHeld.Load()
 	result.LastModifiedHeld.Bytes += modifiedBytes.Load()
 	result.CustodyShort = custodyShort
@@ -1547,7 +1643,7 @@ send:
 // with the transaction-local lock bound, so a busy table becomes SQLSTATE 55P03
 // and admission rolls back, awaits it outside, then retries. keEpoch receives
 // the catalog epoch the loaded protection was read at.
-func loadInverseApplyAdmission(ctx context.Context, pool *pgxpool.Pool, store inverseReader, picks r2RetirePicks, windows map[int64]api.Keep28Window, keEpoch *int64) (inverseProtection, error) {
+func loadInverseApplyAdmission(ctx context.Context, pool *pgxpool.Pool, store inverseReader, picks r2RetirePicks, windows map[int64]api.Keep28Window, keEpoch *int64, reviewed bool) (inverseProtection, error) {
 	return admitInverse(ctx, inverseBegin(pool), func(ctx context.Context) (inverseProtection, error) {
 		initTx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 		if err != nil {
@@ -1569,7 +1665,21 @@ func loadInverseApplyAdmission(ctx context.Context, pool *pgxpool.Pool, store in
 		if err = initTx.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`).Scan(keEpoch); err != nil {
 			return inverseProtection{}, inverseContention(err)
 		}
-		protection, err := loadInverseApplyProtection(ctx, initTx, store.Bucket(), picks, windows)
+		var protection inverseProtection
+		if reviewed {
+			// Collated selection needs live catalog mapping facts, not just KE
+			// paths. That load reads the whole catalog, so it gets the same
+			// statement budget the read-only partition uses; the role's 10s default
+			// would time out and, worse, hold the epoch row FOR SHARE while failing.
+			// It stays one transaction on one connection, inside the bounded
+			// admission every lane now shares.
+			if _, err = initTx.Exec(ctx, "SET LOCAL statement_timeout = '"+r2InversePartitionStatementTimeout+"'"); err != nil {
+				return inverseProtection{}, inverseContention(err)
+			}
+			protection, err = loadInverseProtectionMode(ctx, initTx, store.Bucket(), picks, windows, true)
+		} else {
+			protection, err = loadInverseApplyProtection(ctx, initTx, store.Bucket(), picks, windows)
+		}
 		if err != nil {
 			// Only PostgreSQL's own lock refusal is contention; the attempt is
 			// rolled back by the deferred rollback before admission awaits.

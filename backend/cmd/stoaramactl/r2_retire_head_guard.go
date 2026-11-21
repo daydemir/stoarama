@@ -107,6 +107,25 @@ func r2RetireRequireCatalogETag(ctx context.Context, q r2RetireQuerier, it r2Ret
 	return etag, nil
 }
 
+// r2RetireValidateCollatedGuardIdentity is the collated HEAD contract. A collated
+// output has NO catalog ETag column, so there is no catalog ETag argument and no
+// comparison that could be silently satisfied by a stand-in. The binding is the
+// listing ETag (which the partition pinned) against the live HEAD, plus size, plus
+// HEAD SHA metadata when the provider reports it. The caller separately binds the
+// content-addressed key to the catalog sha256.
+func r2RetireValidateCollatedGuardIdentity(h r2.ObjectHead, listingETag string, sizeBytes int64, catalogSHA string) error {
+	if !inverseETagMatches(listingETag, h.ETag) {
+		return errors.New("collated HEAD ETag differs from the listing ETag or is missing")
+	}
+	if h.SizeBytes != sizeBytes {
+		return errors.New("collated HEAD size differs from the listing size")
+	}
+	if h.SHA256Metadata != "" && !strings.EqualFold(h.SHA256Metadata, catalogSHA) {
+		return errors.New("collated HEAD SHA metadata differs from the catalog SHA")
+	}
+	return nil
+}
+
 func (a *r2RetireApplier) checkProviderProof() error {
 	now, err := a.authority.CurrentUTC()
 	if err != nil {

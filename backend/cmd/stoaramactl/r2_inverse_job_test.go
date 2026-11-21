@@ -91,7 +91,7 @@ func TestR2InverseJobPartitionRequiresTheApprovedPicks(t *testing.T) {
 	}
 	f := inverseJobFlags{picks: path, picksSHA: approved, owner: "owner.md", work: t.TempDir(), workers: 1, items: 1, maxBytes: 1, batches: 1}
 	store := inverseTestListing{{Key: "managed/acct-47/x.mp4", SizeBytes: 10}}
-	if _, _, err = inverseJobPartition(ctx, config.Config{R2Bucket: "bucket"}, pool, store, f, filepath.Join(f.work, "partition")); err == nil || !strings.Contains(err.Error(), "approved digest") {
+	if _, _, err = inverseJobPartition(ctx, config.Config{R2Bucket: "bucket"}, pool, store, f, filepath.Join(f.work, "partition"), false); err == nil || !strings.Contains(err.Error(), "approved digest") {
 		t.Fatalf("job sealed a partition from picks the owner did not approve: %v", err)
 	}
 }

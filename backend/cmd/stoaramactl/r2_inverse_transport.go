@@ -115,28 +115,60 @@ func (a *inverseApplier) prepareWireTarget(ctx context.Context, tx pgx.Tx, e inv
 	if _, err := tx.Exec(ctx, `SET LOCAL statement_timeout = 0`); err != nil {
 		return inverseRawTarget{}, err
 	}
+	var target inverseRawTarget
+	err := a.protectionEnvelope(ctx, tx, e, func(ctx context.Context, tx pgx.Tx, e inverseEntry) error {
+		t, err := a.loadTarget(ctx, tx, e)
+		if err != nil {
+			return err
+		}
+		if err = a.checkTarget(ctx, tx, t, e, true); err != nil {
+			return err
+		}
+		target = t
+		return nil
+	})
+	return target, err
+}
+
+// protectionEnvelope is the ONE wire protection envelope shared by the RAW and
+// collated paths: the metadata barrier, ordered shared protection locks, the
+// bounded wide-cleanup lock posture, the NOWAIT COPY key latch (as a bounded row
+// wait), a locked live reload, a fresh KE-epoch check and controller evidence
+// immediately before the DELETE. load is the only per-lane part (typed RAW or
+// typed collated); everything that guards the DELETE is common, so the collated
+// path cannot drift into a weaker copy or an unbounded wait. The reservation
+// commits before wire, so this envelope is the only thing standing between a
+// stale protection change and the DELETE.
+func (a *inverseApplier) protectionEnvelope(ctx context.Context, tx pgx.Tx, e inverseEntry, load func(context.Context, pgx.Tx, inverseEntry) error) error {
 	if err := inverseProtectionBarrier(ctx, tx); err != nil {
-		return inverseRawTarget{}, err
+		return err
 	}
 	if err := inverseProtectionLocks(ctx, tx, true); err != nil {
-		return inverseRawTarget{}, err
+		return err
 	}
 	// The wire transaction holds the wide cleanup locks shared from here on, so
 	// every later table or row wait fails at once; admission awaits it outside.
 	if err := boundInverseLocks(ctx, tx); err != nil {
-		return inverseRawTarget{}, err
+		return err
 	}
 	if err := lockInverseCopyKey(ctx, tx, a.store.Bucket(), e.Key); err != nil {
-		return inverseRawTarget{}, err
+		return err
 	}
-	target, err := a.loadTarget(ctx, tx, e)
-	if err != nil {
-		return inverseRawTarget{}, err
+	if err := load(ctx, tx, e); err != nil {
+		return err
 	}
-	if err = a.checkTarget(ctx, tx, target, e, true); err != nil {
-		return inverseRawTarget{}, err
+	// KE folder membership, picks and pinned windows are cached per batch. A
+	// catalog identity change must not survive into wire authority.
+	var epoch int64
+	if err := tx.QueryRow(ctx, `SELECT epoch FROM r2_inverse_ke_epoch FOR SHARE`).Scan(&epoch); err != nil {
+		return err
 	}
-	return target, nil
+	if epoch != a.keEpoch {
+		return errors.New("KE catalog identity changed; refresh partition before further wire attempts")
+	}
+	// Fresh controller evidence and live writer categories immediately before the
+	// DELETE, not just at batch start.
+	return a.checkEvidence(ctx, tx)
 }
 func (a *inverseApplier) checkWireHead(ctx context.Context, tx pgx.Tx, e inverseEntry, target inverseRawTarget) error {
 	head, err := a.store.Head(ctx, e.Key)
@@ -582,16 +614,39 @@ func (c *inverseWireConn) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// inverseWireAuthority is what one DELETE's transport may check: the live
+// binding check and the send gate. Both the RAW/keep-28 authority and the
+// collated authority implement it, so every lane sends over the ONE audited
+// transport rather than a weaker copy.
+type inverseWireAuthority interface {
+	check(context.Context, string, string) error
+	sendGate() *inverseSendGate
+	wireKey() string
+	bound(context.Context) (context.Context, context.CancelFunc, error)
+}
+
+func (a *inverseDeleteAuthority) sendGate() *inverseSendGate { return a.gate }
+func (a *inverseDeleteAuthority) wireKey() string            { return a.binding.Key }
+
+// inverseNonrawAuthority denies the deadline boundary outright: the collated
+// lane's parent context already carries the key's network deadline, and a
+// nonraw key has no NAS custody to end at.
+func (a *inverseNonrawAuthority) sendGate() *inverseSendGate { return a.gate }
+func (a *inverseNonrawAuthority) wireKey() string            { return a.binding.Key }
+func (a *inverseNonrawAuthority) bound(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	return ctx, func() {}, nil
+}
+
 type inverseDeleteTransport struct {
 	base             http.RoundTripper
-	authority        *inverseDeleteAuthority
+	authority        inverseWireAuthority
 	bucket, endpoint string
 	attempted        atomic.Bool
 	wire             *inverseWire
 }
 
 func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.Method != http.MethodDelete || req.URL.Path != "/"+t.bucket+"/"+t.authority.binding.Key || req.URL.RawQuery != "x-id=DeleteObject" || !t.attempted.CompareAndSwap(false, true) {
+	if req.Method != http.MethodDelete || req.URL.Path != "/"+t.bucket+"/"+t.authority.wireKey() || req.URL.RawQuery != "x-id=DeleteObject" || !t.attempted.CompareAndSwap(false, true) {
 		return nil, errors.New("inverse transport permits one exact DELETE")
 	}
 	if err := t.authority.check(req.Context(), t.bucket, t.endpoint); err != nil {

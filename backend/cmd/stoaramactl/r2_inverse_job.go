@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,12 +17,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// r2-inverse job (RAW) and job-keep28 run one inverse lane next to the database
-// and bucket, as a provider one-off job. The executor serializes reserves and
-// spends one round trip per statement, so it must not run across a slow home
-// link. The job takes a fresh read-only partition and stores it as the bucket's
-// reusable one, or with --reuse-partition restores that stored partition while
-// it is fresh and its protection inputs are unchanged. It then runs bounded
+// r2-inverse job (RAW), job-keep28 and job-collated run one inverse lane next to
+// the database and bucket, as a provider one-off job. The executor serializes
+// reserves and spends one round trip per statement, so it must not run across a
+// slow home link. The job takes a fresh read-only partition and stores it as the
+// bucket's reusable one, or with --reuse-partition restores that stored partition
+// while it is fresh and its protection inputs are unchanged. It then runs bounded
 // apply batches. Each batch gets fresh owner-fence evidence and an exact
 // readback of the lane's own tables. A DELETE that lost its response holds
 // only its own key, permanently, and so does a confirmed DELETE whose absence
@@ -51,11 +52,27 @@ func runR2InverseJob(ctx context.Context, cfg config.Config, args []string, lane
 		log.Fatal(err)
 	}
 	partition := filepath.Join(f.work, "partition")
-	sum, digest, err := inverseJobPartition(ctx, cfg, pool, store, f, partition)
+	// The job always runs under owner-fence evidence, so every lane partitions in
+	// the reviewed owner scope: RAW delivery keys and mapped collated footage. The
+	// collated lane additionally requires collated mapping, which the stored
+	// partition's own scope digest proves before it can be reused.
+	reviewed := true
+	sum, digest, err := inverseJobPartition(ctx, cfg, pool, store, f, partition, reviewed)
 	if err != nil {
 		log.Fatal(err)
 	}
 	printInverseJob(map[string]any{"step": "partition", "partition_sha256": digest, "reused": f.reuse != "", "summary": sum})
+	// Deniz, 2026-11-12: keep up only the links on the public delivery page.
+	// Before any delete, no candidate this job can select may still be one of
+	// them; only an exempt key whose class gate is open now is not.
+	candidates, pageKeep, overlap, err := inverseJobPageKeepOverlap(ctx, pool, store.Bucket(), filepath.Join(partition, "partition.jsonl"), lane)
+	if err != nil {
+		log.Fatal(err)
+	}
+	printInverseJob(map[string]any{"step": "page_keep_check", "candidates": candidates, "page_keep_holds": pageKeep, "overlap": overlap})
+	if overlap != 0 {
+		log.Fatal("partition candidates include public delivery page keys")
+	}
 	o, err := inverseJobApplyOptions(f, lane, partition, digest)
 	if err != nil {
 		log.Fatal(err)
@@ -133,13 +150,14 @@ func (t *inverseApplySummary) addBatch(r inverseApplySummary) {
 
 // inverseJobPartition stores a fresh partition, or restores the stored one
 // f.reuse names, and returns its summary and digest. Either way it requires the
-// picks its listing was classified with to be the approved digest.
-func inverseJobPartition(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, store inverseLister, f inverseJobFlags, dir string) (inverseSummary, string, error) {
+// picks its listing was classified with to be the approved digest, and the
+// partition to have been classified in this lane's scope.
+func inverseJobPartition(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, store inverseLister, f inverseJobFlags, dir string, reviewed bool) (inverseSummary, string, error) {
 	if f.reuse != "" {
-		sum, err := reuseInversePartition(ctx, pool, store, f.picks, f.picksSHA, f.reuse, dir)
+		sum, err := reuseInversePartition(ctx, pool, store, f.picks, f.picksSHA, f.reuse, dir, reviewed)
 		return sum, f.reuse, err
 	}
-	p, policy, err := inversePartitionProtection(ctx, cfg, pool, f.picks)
+	p, policy, err := inversePartitionProtection(ctx, cfg, pool, f.picks, reviewed)
 	if err != nil {
 		return inverseSummary{}, "", err
 	}
@@ -297,4 +315,33 @@ func errorText(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// inverseJobPageKeepOverlap counts the lane's partition candidates, the exact
+// protected public delivery page keys, and the candidates that are such keys.
+func inverseJobPageKeepOverlap(ctx context.Context, pool *pgxpool.Pool, bucket, manifest string, lane inverseLane) (int, int64, int64, error) {
+	f, err := os.Open(manifest)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	var keys []string
+	for scanner.Scan() {
+		var e inverseEntry
+		if err = json.Unmarshal(scanner.Bytes(), &e); err != nil {
+			return 0, 0, 0, err
+		}
+		if e.Class == lane.class() {
+			keys = append(keys, e.Key)
+		}
+	}
+	if err = scanner.Err(); err != nil {
+		return 0, 0, 0, err
+	}
+	var held, overlap int64
+	// An exempt key whose class gate is open is no longer a protected page key.
+	err = pool.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE object_key=ANY($2::text[])) FROM delivery_keep_holds WHERE bucket=$1 AND NOT r2_delivery_exempt(bucket,object_key)`, bucket, keys).Scan(&held, &overlap)
+	return len(keys), held, overlap, err
 }

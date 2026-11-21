@@ -56,6 +56,14 @@ func TestR2InversePartitionAllClassesAndReconciliation(t *testing.T) {
 		t.Fatal(sum)
 	}
 	for _, class := range inverseClasses {
+		// The collated class exists only under the explicit reviewed owner
+		// footage scope; default classification keeps collated keys deferred.
+		if class == inverseCollated {
+			if sum.Classes[class].Objects != 0 {
+				t.Fatalf("default partition emitted collated class: %+v", sum.Classes)
+			}
+			continue
+		}
 		if sum.Classes[class].Objects != 1 {
 			t.Fatalf("class %s: %+v", class, sum.Classes)
 		}
@@ -193,12 +201,14 @@ func TestR2InverseLiveHoldTables(t *testing.T) {
    AND NOT EXISTS(SELECT 1 FROM recording_joined_source_snapshots s WHERE s.clip_id=p_clip_id
     AND NOT EXISTS(SELECT 1 FROM r2_joined_batch_releases r WHERE r.batch_record_id=s.batch_record_id)) $f$;
  CREATE TABLE r2_owner_keep_prefixes(bucket text,prefix text);
+ CREATE TABLE r2_delivery_exemptions(bucket text,object_key text,class text);
+ CREATE FUNCTION r2_delivery_exempt(text,text) RETURNS boolean LANGUAGE sql AS $f$ SELECT false $f$;
  CREATE TABLE r2_inverse_ke_epoch(epoch bigint); INSERT INTO r2_inverse_ke_epoch VALUES(0);
  CREATE TABLE recording_joined_snapshot_scopes(recording_id bigint,recording_job_id bigint,high_water_clip_id bigint,batch_record_id bigint);
  CREATE TABLE recording_joined_batches(id bigint,state text);
  CREATE TABLE recording_joined_dry_run_scopes(recording_id bigint,recording_job_id bigint,high_water_clip_id bigint);
  CREATE TABLE nas_r2_copy_items(item jsonb,state text,blocked_reason text);
- CREATE TABLE delivery_keep_holds(bucket text,object_key text,relative_path text DEFAULT '',sha256 text DEFAULT '',size_bytes bigint DEFAULT 1);
+ CREATE TABLE delivery_keep_holds(bucket text,object_key text,relative_path text DEFAULT '',sha256 text DEFAULT '',size_bytes bigint DEFAULT 1,etag text DEFAULT 'etag');
  CREATE TABLE delivery_nas_source_holds(clip_id bigint);
  CREATE TABLE delivery_keep_output_dependencies(output_id bigint,recording_id bigint);
  CREATE TABLE nas_cleanup_incident_files(kind text,source_id bigint);
@@ -295,13 +305,21 @@ func TestR2InverseCatalogPathBoundsAndDeferredCollated(t *testing.T) {
 	b := w.Start.Add(-24 * time.Hour)
 	identity := inverseIdentity{StreamID: 3, Path: "KEFolder/footage.mp4", Timezone: "UTC", Start: &a, End: &b, Kind: "collated"}
 	p.Identities["joined/hash.mp4"] = []inverseIdentity{identity}
-	if got, _ := p.classify(r2.ObjectInfo{Key: "joined/hash.mp4"}); got != inverseKE {
+	// Unreviewed default: a collated key is deferred regardless of its identity.
+	if got, _ := p.classify(r2.ObjectInfo{Key: "joined/hash.mp4"}); got != inverseHeld {
 		t.Fatal(got)
+	}
+	// Under the reviewed collated scope, a KE path alias on the output protects it.
+	p.ReviewedCollated = true
+	p.Collated = map[string]inverseCollatedAssessment{"joined/hash.mp4": {Key: "joined/hash.mp4", Path: "KEFolder/footage.mp4", StreamID: 3, Start: &a, End: &b, Timezone: "UTC", SHA: "x"}}
+	if got, _ := p.classify(r2.ObjectInfo{Key: "joined/hash.mp4"}); got != inverseKE {
+		t.Fatalf("KE path alias not protected: %s", got)
 	}
 	identity.Path = "ordinary/file.mp4"
 	p.Identities["joined/hash.mp4"] = []inverseIdentity{identity}
-	if got, _ := p.classify(r2.ObjectInfo{Key: "joined/hash.mp4"}); got != inverseHeld {
-		t.Fatal(got)
+	p.Collated["joined/hash.mp4"] = inverseCollatedAssessment{Key: "joined/hash.mp4", Path: "ordinary/file.mp4", StreamID: 3, Start: &a, End: &b, Timezone: "UTC", SHA: "x"}
+	if got, _ := p.classify(r2.ObjectInfo{Key: "joined/hash.mp4"}); got == inverseCollated || got == inverseDeletable {
+		t.Fatalf("unmapped collated key became eligible: %s", got)
 	}
 	for _, year := range []int{1, 1970, 2019, 2028, 2099} {
 		for _, kind := range []string{"raw", "source"} {
