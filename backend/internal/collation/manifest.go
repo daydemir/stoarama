@@ -141,7 +141,7 @@ type HourManifest struct {
 // registered: every clip once, parts contiguous, every seam inside a part a
 // join and every seam between parts a split.
 func (m HourManifest) Validate() error {
-	if m.SchemaVersion != 1 || m.PolicyVersion != PolicyVersion || m.Generation != Generation {
+	if m.SchemaVersion != 1 || (m.PolicyVersion != PolicyVersion && m.PolicyVersion != "collation-v2") || m.Generation != Generation {
 		return fmt.Errorf("manifest version differs")
 	}
 	want, err := HourIDFor(m.BatchID, m.RecordingID, m.LocalDate, m.DeliveryHour)
