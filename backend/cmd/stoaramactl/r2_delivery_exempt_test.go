@@ -18,6 +18,7 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/api"
 	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // The fixture's confident repair: a delivery page video_assembly object with no
@@ -1609,6 +1610,91 @@ func TestR2NonrawOwnerKeepStreamAddedAfterBatchAdmission(t *testing.T) {
 	}
 }
 
+func TestR2NonrawPageAuthorityLocksRowsThroughWire(t *testing.T) {
+	f := newNonrawFixture(t, "exempt_page_row_locks")
+	f.withPageKeys()
+	f.pageStreamFixture(t, 158, "2026-06-01T00:00:00Z", "2026-06-01T00:01:00Z")
+	f.mustSeed(t, deliveryExemptOutsideWindow, collatedRow(f))
+	entry := f.collatedEntry()
+	a := f.applier(t, "wire")
+	defer a.ledger.close()
+	if _, err := a.reserveNonraw(f.ctx, entry); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(f.ctx)
+	authority, err := a.authorizeNonraw(f.ctx, tx, entry, &inverseSendGate{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := authority.check(f.ctx, a.store.Bucket(), a.store.EndpointSHA256()); err != nil {
+		t.Fatalf("control pre-send check: %v", err)
+	}
+	assertLocked := func(err error) {
+		t.Helper()
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+			t.Fatalf("page authority row was not locked: %v", err)
+		}
+	}
+	var key string
+	assertLocked(f.pool.QueryRow(f.ctx, `SELECT object_key FROM delivery_keep_holds
+ WHERE bucket='stoarama' AND object_key=$1 FOR UPDATE NOWAIT`, f.key).Scan(&key))
+	probeDelete := func() error {
+		writer, err := f.pool.Begin(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer writer.Rollback(f.ctx)
+		if _, err := writer.Exec(f.ctx, `SET LOCAL lock_timeout='150ms'`); err != nil {
+			t.Fatal(err)
+		}
+		_, err = writer.Exec(f.ctx, `DELETE FROM recordings WHERE id=31`)
+		return err
+	}
+	assertLocked(probeDelete())
+	if err := tx.Rollback(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := probeDelete(); err != nil {
+		t.Fatalf("control could not remove the page recording after wire exit: %v", err)
+	}
+}
+
+func TestR2NonrawNoncanonicalHeadCannotIssue(t *testing.T) {
+	f := newNonrawFixture(t, "nonraw_noncanonical_head")
+	f.withPageKeys()
+	f.mustSeed(t, deliveryExemptOutsideWindow, collatedRow(f))
+	entry := f.collatedEntry()
+	a := f.applier(t, "head")
+	defer a.ledger.close()
+	if _, err := a.reserveNonraw(f.ctx, entry); err != nil {
+		t.Fatal(err)
+	}
+	// Inject the value at the decoded HEAD boundary. The SDK normally
+	// removes the HTTP header's framing quotes before returning it.
+	a.store = f.store
+	f.store.mu.Lock()
+	head := f.store.objects[f.key]
+	head.ETag = `"collated-etag"`
+	f.store.objects[f.key] = head
+	f.store.mu.Unlock()
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(f.ctx)
+	if _, err := a.authorizeNonraw(f.ctx, tx, entry, &inverseSendGate{}); err == nil || !strings.Contains(err.Error(), "collated HEAD ETag") {
+		t.Fatalf("wire accepted the noncanonical HEAD: %v", err)
+	}
+	if wrote := f.countNonrawWrites(t); wrote != [4]int64{1, 1, 0, 0} || f.deletes() != 0 {
+		t.Fatalf("noncanonical HEAD allowed writes %v or %d deletes", wrote, f.deletes())
+	}
+}
+
 // TestR2NonrawExemptionStrictIdentityRepresentations: the guard points demand the
 // SAME exact representations the SQL compares and CHECKs. A case-folded sha256 or
 // a quote-trimmed ETag that SQL would refuse is refused here instead of being
@@ -1674,6 +1760,15 @@ func TestR2NonrawExemptionStrictIdentityRepresentations(t *testing.T) {
 	if err := insertExemption(quoted.ETag); err == nil || !strings.Contains(err.Error(), "r2_delivery_exemptions_etag_check") {
 		t.Fatalf("SQL admission accepted a matching quoted ETag: %v", err)
 	}
+	padded := rows[0]
+	padded.ETag += "\u00a0"
+	f.fixture(`UPDATE delivery_keep_holds SET etag=$2 WHERE bucket='stoarama' AND object_key=$1`, f.key, padded.ETag)
+	if n, err := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptOutsideWindow, []deliveryExemptionRow{padded}, picks); err == nil || n != 0 {
+		t.Fatalf("Go admission accepted a matching Unicode-padded ETag: %d %v", n, err)
+	}
+	if err := insertExemption(padded.ETag); err == nil || !strings.Contains(err.Error(), "r2_delivery_exemptions_etag_check") {
+		t.Fatalf("SQL admission accepted a matching Unicode-padded ETag: %v", err)
+	}
 	// The canonical identity is still exactly what the guards accept.
 	f.fixture(`UPDATE delivery_keep_holds SET etag=$2 WHERE bucket='stoarama' AND object_key=$1`, f.key, "collated-etag")
 	if n, vErr := validateDeliveryExemptions(f.ctx, f.pool, deliveryExemptOutsideWindow, rows, picks); vErr != nil || n != 1 {
@@ -1692,19 +1787,8 @@ func TestR2NonrawExemptionStrictIdentityRepresentations(t *testing.T) {
 	}
 }
 
-// TestR2NonrawExemptionRosterReadsClassifierHolds: the roster decision reads the
-// classifier's OWN Held and Retiring sets, which are not the seed statement's
-// view. An effective R2 cleanup release clears nas_cleanup_r2_reserved_files while
-// the wider nas_cleanup_reserved_files still holds the source, so the seed must
-// refuse rather than approve a row the wire then holds.
-func TestR2NonrawExemptionRosterReadsClassifierHolds(t *testing.T) {
-	f := newNonrawFixture(t, "exempt_classifier_holds")
-	f.withPageKeys()
-	picks, err := loadR2RetirePicks(f.picks)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rows := []deliveryExemptionRow{collatedRow(f)}
+func (f *nonrawFixture) addReleasedOutputHold(t *testing.T) {
+	t.Helper()
 	// A cleanup plan reserves this exact collated output and is released by an
 	// effective R2 release, so only the wider view still lists it.
 	f.fixture(`INSERT INTO nas_cleanup_plans(id,account_id,connection_id,mode,label,report_sha256,manifest,plan_sha256)
@@ -1725,12 +1809,21 @@ func TestR2NonrawExemptionRosterReadsClassifierHolds(t *testing.T) {
 	if r2View || !wideView {
 		t.Fatalf("fixture: r2 view=%v wide view=%v, want false/true", r2View, wideView)
 	}
-	// The seed statement's own hold predicate therefore clears the key...
+}
+
+func TestR2NonrawExemptionRosterReadsClassifierHolds(t *testing.T) {
+	f := newNonrawFixture(t, "exempt_classifier_holds")
+	f.withPageKeys()
+	picks, err := loadR2RetirePicks(f.picks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []deliveryExemptionRow{collatedRow(f)}
+	f.addReleasedOutputHold(t)
 	var seedHeld bool
-	if err := f.pool.QueryRow(f.ctx, `SELECT r2_nonraw_key_held_except_page('stoarama',$1,'collated',$2)`, f.key, f.outputID).Scan(&seedHeld); err != nil || seedHeld {
+	if err := f.pool.QueryRow(f.ctx, `SELECT r2_nonraw_key_held_except_page('stoarama',$1,'collated',$2)`, f.key, f.outputID).Scan(&seedHeld); err != nil || !seedHeld {
 		t.Fatalf("seed statement held=%v (%v)", seedHeld, err)
 	}
-	// ...but the classifier the executor reads still holds it.
 	p, err := loadInverseProtectionMode(f.ctx, f.pool, "stoarama", picks, f.windows, true)
 	if err != nil {
 		t.Fatal(err)
@@ -1761,5 +1854,46 @@ func TestR2NonrawExemptionRosterReadsClassifierHolds(t *testing.T) {
 	gRows := []deliveryExemptionRow{collatedRow(g)}
 	if err := g.seed(t, deliveryExemptOutsideWindow, gRows...); err == nil || !strings.Contains(err.Error(), "retirement reservation or receipt") {
 		t.Fatalf("a retiring key was re-staged: %v", err)
+	}
+}
+
+func TestR2NonrawLiveOutputHoldVetoesStaleBatch(t *testing.T) {
+	for _, reserved := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reserved=%v", reserved), func(t *testing.T) {
+			f := newNonrawFixture(t, "exempt_late_cleanup_hold")
+			f.withPageKeys()
+			f.mustSeed(t, deliveryExemptOutsideWindow, collatedRow(f))
+			entry := f.collatedEntry()
+			a := f.applier(t, "stale")
+			defer a.ledger.close()
+			if a.protection.Held[f.key] {
+				t.Fatal("control started with a cleanup hold")
+			}
+			var want [4]int64
+			if reserved {
+				if _, err := a.reserveNonraw(f.ctx, entry); err != nil {
+					t.Fatal(err)
+				}
+				want = [4]int64{1, 1, 0, 0}
+			}
+			f.addReleasedOutputHold(t)
+			var err error
+			if !reserved {
+				_, err = a.reserveNonraw(f.ctx, entry)
+			} else {
+				tx, beginErr := f.pool.Begin(f.ctx)
+				if beginErr != nil {
+					t.Fatal(beginErr)
+				}
+				defer tx.Rollback(f.ctx)
+				_, err = a.authorizeNonraw(f.ctx, tx, entry, &inverseSendGate{})
+			}
+			if !errors.Is(err, errInverseNonrawIneligible) || !strings.Contains(err.Error(), "live_hold") {
+				t.Fatalf("stale batch admitted a live output hold: %v", err)
+			}
+			if wrote := f.countNonrawWrites(t); wrote != want || f.deletes() != 0 {
+				t.Fatalf("live output hold allowed writes %v or %d deletes", wrote, f.deletes())
+			}
+		})
 	}
 }

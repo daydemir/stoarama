@@ -530,11 +530,12 @@ func (a *inverseApplier) loadNonrawTarget(ctx context.Context, tx pgx.Tx, e inve
 // reserve/final-wire reload both evaluate deliveryPageAuthorityError over it, so
 // no guard can see a different page row than another.
 const inversePageAuthoritySQL = `SELECT h.object_key,coalesce(rec.stream_id,0),h.etag,h.size_bytes,h.kind,h.sha256
-FROM delivery_keep_holds h LEFT JOIN recordings rec ON rec.id=h.recording_id WHERE h.bucket=$1`
+FROM delivery_keep_holds h JOIN recordings rec ON rec.id=h.recording_id WHERE h.bucket=$1`
 
-// loadInversePageAuthority reads the live page authority for one exact key.
+// The page row has no recording FK. Keep both rows locked through the wire.
 func loadInversePageAuthority(ctx context.Context, q r2RetireQuerier, bucket, key string) (inversePageAuthority, error) {
-	p, err := scanInversePageAuthority(q.QueryRow(ctx, inversePageAuthoritySQL+` AND h.object_key=$2`, bucket, key))
+	p, err := scanInversePageAuthority(q.QueryRow(ctx, inversePageAuthoritySQL+
+		` AND h.object_key=$2 FOR SHARE OF h,rec NOWAIT`, bucket, key))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return inversePageAuthority{}, nil
 	}

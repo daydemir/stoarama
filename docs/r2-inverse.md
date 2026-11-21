@@ -457,35 +457,28 @@ page row that cannot state the content is refused at admission instead of
 opening a gate the wire then fails to use, and the validator refuses the same
 mismatch.
 
-Representations are strict everywhere a SQL guard compares them. A case-folded
-sha256 is not authority: `lower(o.sha256)` is what the SQL predicates compare,
-so an upper-case page value that would only match after folding is refused
-rather than normalized. An ETag is compared as the provider's canonical
-(unquoted) identity on both sides; a quoted or padded value is a different string
-from the one SQL stores and compares in `r2_delivery_exempt`, so it is refused
-rather than trimmed into a match. This applies at validate, approve and seed, in
-the page-authority predicate at reservation and final wire, and in the
-partition's exempt-identity comparison.
+SQL and the executor compare the page SHA-256 verbatim against the catalog's
+lowercase SHA-256. ETags use nonempty printable ASCII without spaces or quotes.
+The validator, SQL admission, partition, reservation, and final HEAD all
+require the same canonical ETag.
 
 Seeding requires a positive, window-bound, non-keep-everything owner decision
 for the page recording's stream *and* for the output's own stream; a missing
-pick is refused. The roster decision reads the classifier's own live `Held` and
-`Retiring` sets, not the seed statement's narrower view: an effective R2 cleanup
-release clears `nas_cleanup_r2_reserved_files` while the wider
-`nas_cleanup_reserved_files` and its source holds still apply, so a key held
-there is refused rather than approved and then held at the wire. Only the
-candidate's own page hold is ever exempted, by the exemption being decided. `outside_window` additionally requires the output to be outside
+pick is refused. The roster checks the live `Held` and `Retiring` sets.
+The locked reload checks the output's ordinary NAS cleanup reservation, even if
+an effective release has cleared its R2 recovery reservation. The exemption
+applies to the candidate's own page hold. `outside_window` also requires the output to be outside
 the **page recording's own** pinned window, not only its catalog output stream's
 one. A page stream with no pinned window, or an output whose interval is absent,
 fails closed with a refusal rather than being assumed outside. At deletion time
 the page recording's stream is rechecked live, so a page row on a keep-everything
 or undecided stream — or on one of the thesis keep streams 854, 537, 78 or 415 —
 holds the key even when the catalog output names a decided one. The reservation
-and the final wire re-evaluate that whole page authority through one shared
-typed predicate, not only the page stream's decision: a page recording
-reassigned to another valid, decided stream whose window contains the output, or
-an output interval that drifts into a distinct page stream's window after the
-seed, is refused with the listing ETag and size unchanged. Dependency-only
+and the final wire re-evaluate the same page authority without relying on the
+seeded decision. Reassignment or interval drift into the page stream's
+window holds the key even when the listing ETag and size stay the same.
+The wire transaction locks the page row and its recording through the send.
+Dependency-only
 collated outputs that are not page keys follow the
 2026-11-18 owner scope, but anything whose NAS copy is still pending or blocked
 ("waiting to be transferred") stays held. Footage already verified on the NAS is

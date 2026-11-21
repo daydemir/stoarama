@@ -114,8 +114,7 @@ func r2RetireRequireCatalogETag(ctx context.Context, q r2RetireQuerier, it r2Ret
 // HEAD SHA metadata when the provider reports it. The caller separately binds the
 // content-addressed key to the catalog sha256.
 func r2RetireValidateCollatedGuardIdentity(h r2.ObjectHead, listingETag string, sizeBytes int64, catalogSHA string) error {
-	expected := strings.Trim(listingETag, `"`)
-	if expected == "" || strings.Trim(h.ETag, `"`) != expected {
+	if !inverseETagMatches(listingETag, h.ETag) {
 		return errors.New("collated HEAD ETag differs from the listing ETag or is missing")
 	}
 	if h.SizeBytes != sizeBytes {

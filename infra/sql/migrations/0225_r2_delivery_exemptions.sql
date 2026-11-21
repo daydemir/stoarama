@@ -50,7 +50,7 @@ CREATE TABLE r2_delivery_exemptions (
  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
  bucket text NOT NULL,
  object_key text NOT NULL,
- etag text NOT NULL CHECK(etag<>'' AND etag !~ '^[[:space:]"]|[[:space:]"]$'),
+ etag text NOT NULL CHECK(etag COLLATE "C" ~ '^[!-~]+$' AND strpos(etag,'"')=0),
  size_bytes bigint NOT NULL CHECK(size_bytes>0),
  class r2_delivery_exemption_class NOT NULL,
  approval_id bigint NOT NULL REFERENCES r2_delivery_exemption_approvals(id),
@@ -262,8 +262,7 @@ CREATE FUNCTION r2_nonraw_key_other_held(p_bucket text, p_key text, p_kind text,
   OR EXISTS(SELECT 1 FROM r2_retirement_reservations rv WHERE rv.bucket=p_bucket AND rv.object_key=p_key AND NOT (rv.kind=p_kind AND rv.source_id=p_id))
   OR EXISTS(SELECT 1 FROM nas_stitch_r2_input_holds sh WHERE sh.bucket=p_bucket AND sh.object_key=p_key AND sh.released_at IS NULL)
   OR r2_owner_keep_held(p_bucket,p_key)
-  OR (p_kind='collated' AND EXISTS(SELECT 1 FROM nas_cleanup_r2_reserved_files f
-    WHERE f.kind='collated' AND f.source_id=p_id))
+  OR (p_kind='collated' AND nas_cleanup_file_reserved('collated',p_id))
 $$;
 CREATE FUNCTION r2_nonraw_key_held_except_page(p_bucket text, p_key text, p_kind text, p_id bigint) RETURNS boolean LANGUAGE sql STABLE AS $$
  SELECT r2_nonraw_key_other_held(p_bucket,p_key,p_kind,p_id)

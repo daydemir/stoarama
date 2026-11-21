@@ -92,31 +92,18 @@ func readDeliveryExemptionRoster(path, digest string) ([]deliveryExemptionRow, e
 	return rows, nil
 }
 
-// inverseCanonicalETag accepts ONLY the provider's canonical ETag
-// representation: nonempty and unchanged by quote or whitespace trimming. A
-// quoted or padded variant is a different string from the one SQL stores and
-// compares in r2_delivery_exempt, so it is refused instead of being normalized
-// into a match SQL would never make. The r2 client already delivers the
-// canonical (unquoted) provider identity, so this preserves that identity.
-func inverseCanonicalETag(v string) (string, bool) {
-	if v == "" || strings.TrimSpace(v) != v || strings.Trim(v, `"`) != v {
-		return "", false
+// Match the printable, unquoted ASCII identity checked by the SQL ledger.
+func inverseCanonicalETag(v string) bool {
+	for i := 0; i < len(v); i++ {
+		if v[i] < '!' || v[i] > '~' || v[i] == '"' {
+			return false
+		}
 	}
-	return v, true
+	return v != ""
 }
 
-// inverseETagMatches compares two provider ETag identities WITHOUT normalizing
-// either side: both must already be canonical and must be the same exact string.
-// The r2 client strips the provider's quotes, so a quoted or padded stored value
-// is a different identity from every listing and must never be trimmed into a
-// match the SQL guards would not make themselves.
 func inverseETagMatches(listing, bound string) bool {
-	a, ok := inverseCanonicalETag(listing)
-	if !ok {
-		return false
-	}
-	b, ok := inverseCanonicalETag(bound)
-	return ok && a == b
+	return listing == bound && inverseCanonicalETag(listing)
 }
 
 // inversePageAuthority is one delivery page key's LIVE state: the recording's
@@ -161,12 +148,10 @@ func (p inverseProtection) deliveryPageAuthorityError(class deliveryExemptionCla
 	if !page.Found {
 		return errors.New("the key has no live delivery page row")
 	}
-	pageETag, ok := inverseCanonicalETag(page.ETag)
-	if !ok {
+	if !inverseCanonicalETag(page.ETag) {
 		return errors.New("the live page row does not carry a canonical ETag")
 	}
-	candidateETag, ok := inverseCanonicalETag(etag)
-	if !ok || candidateETag != pageETag {
+	if etag != page.ETag {
 		return errors.New("the object does not name the page row's exact canonical ETag")
 	}
 	// The object, its page row and its catalog content are ONE size. A drifted
