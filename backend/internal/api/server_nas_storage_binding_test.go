@@ -247,6 +247,25 @@ func TestConnectionHeartbeatStorageV6UsesSameNonceContract(t *testing.T) {
 	}
 }
 
+func TestConnectionHeartbeatStorageV8UsesSameNonceContract(t *testing.T) {
+	s, pool := storageHeartbeatFixture(t)
+	body, err := os.ReadFile("../../../infra/sql/migrations/0235_nas_storage_v8_binding.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(context.Background(), string(body)); err != nil {
+		t.Fatal(err)
+	}
+	nonce := storageHeartbeat(t, s, nasLowMemoryCopyClientVersion, storageSample(""))
+	issued := storageObservation(t, pool).issued
+	storageHeartbeat(t, s, nasLowMemoryCopyClientVersion, storageSample(nonce))
+	observation := storageObservation(t, pool)
+	if issued == nil || observation.version != nasLowMemoryCopyClientVersion ||
+		observation.budget == nil || !observation.budget.Equal(*issued) {
+		t.Fatal("v8 proof did not bind the preceding challenge", observation)
+	}
+}
+
 func TestNASStorageBindingV6MigrationPreservesEvidence(t *testing.T) {
 	pool, cleanup := testAccountClipsPool(t)
 	defer cleanup()

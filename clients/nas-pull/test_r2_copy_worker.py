@@ -33,6 +33,7 @@ class R2CopyWorkerTests(unittest.TestCase):
         self.stop = threading.Event()
         self.calls = []
         self.control_client = SimpleNamespace(request_json=self.control)
+        self.real_copy_resources = pull.r2_copy_resources
         for patch in (
             mock.patch.object(pull, "R2_COPY_TELEMETRY", pull.R2CopyTelemetry()),
             mock.patch.object(pull, "NAS_MEDIA_FENCE", pull.NASMediaFence()),
@@ -178,6 +179,23 @@ class R2CopyWorkerTests(unittest.TestCase):
             self.run_copy()
         result = next(kw["body"] for path, kw in self.calls if path.endswith("/result"))
         self.assertEqual((result["completion"], result["downloaded_bytes"], result["committed_bytes"]), ("downloaded", len(self.body), len(self.body)))
+
+    def test_copy_memory_floor_leaves_room_for_the_bounded_range(self):
+        with mock.patch.object(pull, "r2_copy_resources", self.real_copy_resources), \
+                mock.patch.object(pull, "_read_text", return_value=""), \
+                mock.patch.object(pull, "meminfo_bytes", return_value=(2 << 30, 390 << 20)) as memory, \
+                mock.patch.object(pull, "cgroup_memory_limit", return_value=None), \
+                mock.patch.object(pull.os.path, "ismount", return_value=True):
+            self.assertGreater(pull.r2_copy_resources(self.cfg, self.runtime), pull.R2_COPY_FLOOR)
+            memory.return_value = (2 << 30, pull.R2_COPY_MIN_MEMORY - 1)
+            with self.assertRaisesRegex(pull.R2CopyHold, "copy memory headroom"):
+                pull.r2_copy_resources(self.cfg, self.runtime)
+
+    def test_unthrottled_hash_keeps_the_exact_digest(self):
+        source = Path(self.tmp.name) / "sample"
+        source.write_bytes(self.body)
+        size, digest, _ = pull.sha256_file_throttled_stable(source, 0, self.stop)
+        self.assertEqual((size, digest), (len(self.body), self.item["sha256"]))
 
     def test_worker_immediately_moves_past_acknowledged_block_and_logs_http_holds(self):
         waits = []
@@ -506,14 +524,14 @@ class R2CopyWorkerTests(unittest.TestCase):
         timer.join(1)
         self.assertEqual(pull.NAS_COPY_PATHS.priority, 0)
 
-    def test_copy_pool_drains_every_worker_before_supervisor_finishes(self):
-        started = threading.Barrier(pull.R2_COPY_WORKERS + 1)
+    def test_copy_thread_runs_one_worker_and_waits_for_it_to_drain(self):
+        started = threading.Barrier(2)
         drain = threading.Event()
         def worker(*args):
             started.wait(2)
             self.stop.wait(2)
             drain.wait(2)
-        with mock.patch.object(pull, "r2_copy_worker", side_effect=worker):
+        with mock.patch.object(pull, "r2_copy_worker", side_effect=worker) as run:
             supervisor = threading.Thread(target=pull.r2_copy_loop, args=(self.cfg, self.runtime, self.inventory, self.stop))
             supervisor.start()
             started.wait(2)
@@ -523,6 +541,7 @@ class R2CopyWorkerTests(unittest.TestCase):
             drain.set()
             supervisor.join(2)
             self.assertFalse(supervisor.is_alive())
+            run.assert_called_once_with(self.cfg, self.runtime, self.inventory, self.stop, 0)
 
     def test_total_deadline_bounds_stalled_and_trickling_io_and_reaps_child(self):
         for mode in ("stall", "body", "headers"):
