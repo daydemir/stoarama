@@ -204,18 +204,41 @@ func TestDurhamStageTransportRefusesAnotherKey(t *testing.T) {
 
 // A nil authority carries no key to read and no one-shot state to consume, so
 // it is refused before anything is dereferenced rather than reaching the SDK
-// with an empty key.
+// with an empty key. Both the absent interface and a typed nil — a nil
+// *inverseDeleteAuthority inside the interface, which is the shape the RAW role
+// produces when it has nothing to spend — are refused without a panic.
 func TestDurhamStageTransportRefusesANilAuthority(t *testing.T) {
 	f := newStageWireFixture(t)
 	store, err := newInverseSDKStore(context.Background(), r2ConfigFor(t, f.srv.URL))
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = store.deleteOneWire(context.Background(), nil)
-	if err == nil || !strings.Contains(err.Error(), "wire authority") {
-		t.Fatalf("nil authority: %v", err)
+	var typedNil *inverseDeleteAuthority
+	var stageNil *durhamStageAuthority
+	for _, authority := range []inverseWireTarget{nil, typedNil, stageNil} {
+		err = store.deleteOneWire(context.Background(), authority)
+		if err == nil || !strings.Contains(err.Error(), "wire authority") {
+			t.Fatalf("%T authority: %v", authority, err)
+		}
+	}
+	// The actual RAW adapter is the same path: its deleteOnce takes a typed
+	// pointer, so an absent authority arrives here as a typed nil, which must be
+	// refused rather than dereferenced.
+	if err = store.deleteOnce(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "wire authority") {
+		t.Fatalf("RAW adapter accepted an absent authority: %v", err)
+	}
+	// The path guard on the transport itself refuses a nil receiver too, so no
+	// request can reach the provider even if one were constructed directly.
+	transport := &inverseDeleteTransport{base: http.DefaultTransport, bucket: "stoarama", endpoint: sha256HexOf(f.srv.URL), wire: &inverseWire{}}
+	transport.authority = typedNil
+	req, err := http.NewRequest(http.MethodDelete, "https://storage.example.test/stoarama/stitch-staging/x.mp4?x-id=DeleteObject", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transport.RoundTrip(req); err == nil {
+		t.Fatal("transport accepted a typed-nil authority")
 	}
 	if got := f.deletes.Load(); got != 0 {
-		t.Fatalf("nil authority reached the provider: %d", got)
+		t.Fatalf("a refused authority reached the provider: %d", got)
 	}
 }

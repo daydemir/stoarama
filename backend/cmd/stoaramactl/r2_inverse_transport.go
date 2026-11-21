@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -434,15 +435,19 @@ func (s *inverseSDKStore) deleteOnce(ctx context.Context, authority *inverseDele
 // could disagree with it and send, or refuse, a different key than the one the
 // binding, the attempt ledger and the provider path all name.
 func (s *inverseSDKStore) deleteOneWire(ctx context.Context, authority inverseWireTarget) error {
-	// An absent interface has no wireKey() to read and no consumption state to
-	// check, so it is refused before anything is dereferenced.
-	if authority == nil {
+	// Admission runs before anything on the authority is read. requireWire is
+	// the one call every target must answer without a live receiver, so it
+	// refuses an absent, typed-nil or already-consumed authority before
+	// wireKey dereferences it. A typed nil is not == nil, which is exactly the
+	// shape the RAW role passes when it has no authority to spend; reading the
+	// key first would panic on that nil receiver instead of refusing it.
+	if !liveWireTarget(authority) {
 		return errors.New("inverse DELETE needs a wire authority")
 	}
-	key := authority.wireKey()
 	if err := authority.requireWire(ctx, s.Bucket(), s.EndpointSHA256()); err != nil {
 		return err
 	}
+	key := authority.wireKey()
 	template, ok := s.transport.(*http.Transport)
 	if !ok {
 		return errors.New("inverse DELETE needs the HTTP/1.1 transport template")
@@ -631,7 +636,26 @@ type inverseDeleteTransport struct {
 	wire             *inverseWire
 }
 
+// liveWireTarget reports whether authority is a usable target rather than an
+// absent one. A raw interface holding a nil *inverseDeleteAuthority is non-nil
+// as an interface, so `authority == nil` alone would let it through and the
+// first wireKey() call would dereference that nil receiver. This reports on the
+// concrete value instead, so every caller refuses before reading the key.
+func liveWireTarget(authority inverseWireTarget) bool {
+	if authority == nil {
+		return false
+	}
+	switch value := reflect.ValueOf(authority); value.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		return !value.IsNil()
+	}
+	return true
+}
+
 func (t *inverseDeleteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !liveWireTarget(t.authority) {
+		return nil, errors.New("inverse transport permits one exact DELETE")
+	}
 	if req.Method != http.MethodDelete || req.URL.Path != "/"+t.bucket+"/"+t.authority.wireKey() || req.URL.RawQuery != "x-id=DeleteObject" || !t.attempted.CompareAndSwap(false, true) {
 		return nil, errors.New("inverse transport permits one exact DELETE")
 	}
