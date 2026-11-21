@@ -46,7 +46,8 @@ def load_contract():
              "StitchEvidenceSnapshot", "StitchNativeEvidenceStage", "stitch_evidence_index",
              "StitchEvidenceLedger", "StitchEvidenceDispatch", "StitchEvidenceProgress",
              "stitch_evidence_task", "parse_certification_timestamp", "MediaCertificationError"}
-    constants = {"STITCH_READBACK_SCHEMA_SHA", "STITCH_READBACK_SCHEMA_JSON",
+    constants = {"CLIENT_VERSION", "LOW_MEMORY_COPY_CLIENT_VERSION",
+                 "STITCH_READBACK_SCHEMA_SHA", "STITCH_READBACK_SCHEMA_JSON",
                  "STITCH_PROOF_SCHEMA_SHA", "STITCH_PROOF_SCHEMA_JSON", "V85R_MANIFEST_SHA",
                  "STITCH_POLICY", "STITCH_REVISION", "STITCH_CORPUS_SHA", "STITCH_PROOF_SOURCE_SHA",
                  "STITCH_PROOF_KIND", "CLEANUP_KEEP28_POLICY_SHA256", "STITCH_PROOF_MAX_BYTES",
@@ -164,7 +165,7 @@ def synthetic_native():
     """Load only the existing explicit synthetic fixture, never the NAS app."""
     tree=ast.parse((ROOT/"test_stitch_proof.py").read_bytes())
     fixture=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=="synthetic_receipt")
-    namespace=dict(pull=SimpleNamespace(**CORE,CLIENT_VERSION="v85r-nas-proof-v2"),
+    namespace=dict(pull=SimpleNamespace(**dict(CORE,CLIENT_VERSION="v85r-nas-proof-v2")),
                    struct=struct,json=json,hashlib=hashlib)
     exec(compile(ast.Module(body=[fixture],type_ignores=[]),"<synthetic native fixture>","exec"),namespace)
     return namespace["synthetic_receipt"]()
