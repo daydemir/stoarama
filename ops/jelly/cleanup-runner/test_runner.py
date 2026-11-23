@@ -158,8 +158,8 @@ class DecisionTests(unittest.TestCase):
         self.assertTrue(r.outside(3, '2026-09-21T00:00:00Z', '2026-09-21T01:00:00Z', WINDOWS))
         self.assertFalse(r.outside(3, '2026-08-31T23:00:00Z', '2026-09-01T00:00:01Z', WINDOWS))
 
-    def test_verifier_passes_both_recovery_proofs(self):
-        for recovery in r.RECOVERY:
+    def test_verifier_passes_dry_run_recovery_proofs(self):
+        for recovery in ('r2_sha_verified', 'r2_md5_etag_matched', 'r2_name_size_matched'):
             p, cat = fixture()
             p['results'][0]['recovery'] = recovery
             self.assertEqual(r.verify(p, cat, WINDOWS, NOW), 100)
@@ -171,6 +171,7 @@ class DecisionTests(unittest.TestCase):
             lambda p,c: p['results'][0].update(ordinal=2),
             lambda p,c: p['results'][0].update(delete_ever_issued=True),
             lambda p,c: p['results'][0].update(recovery='r2_etag_bound'),
+            lambda p,c: p['results'][0].update(recovery='r2_name_size_etag_bound'),
             lambda p,c: p['results'][0].update(updated_at=(NOW-timedelta(hours=20)).isoformat()),
             lambda p,c: p['results'][0].update(updated_at=(NOW+timedelta(seconds=1)).isoformat()),
             lambda p,c: p.update(policy_current=False),

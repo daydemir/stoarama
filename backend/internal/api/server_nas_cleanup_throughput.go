@@ -121,16 +121,16 @@ type cleanupObserveEnv struct {
 	abortedStitchAbsences map[cleanupAbortedStitchTarget]bool
 }
 
-// cleanupRecoveryPermits: a permit needs a full streamed-SHA verification
-// (r2_sha_verified) or, during execution only, the conditional HEAD bound to
-// the exact generation the dry run proved (r2_etag_bound). The dry run proved
-// it either by a full download + SHA-256 (r2_sha_verified) or by a single-part
-// ETag equal to both the catalogued upload ETag and the NAS client's MD5
-// (r2_md5_etag_matched); enable accepts either. Certified Durham raws carry
-// their own exact NAS replacement proof, after durable R2 absence.
+const (
+	cleanupRecoveryNameSizeMatched = "r2_name_size_matched"
+	// Keep name/size permits and receipts distinct from byte-verified
+	// receipts, which can authorize release of the R2 recovery hold.
+	cleanupRecoveryNameSizeBound = "r2_name_size_etag_bound"
+)
+
 func cleanupRecoveryPermits(mode, recovery string) bool {
 	return recovery == "r2_sha_verified" ||
-		(mode == "enabled" && (recovery == "r2_etag_bound" || recovery == nasCleanupCertifiedStitchRecovery))
+		(mode == "enabled" && (recovery == "r2_etag_bound" || recovery == cleanupRecoveryNameSizeBound || recovery == nasCleanupCertifiedStitchRecovery))
 }
 
 // cleanupExpireLeasesSQL returns expired leases of a connection to pending
@@ -457,9 +457,11 @@ func cleanupEnableGates(ctx context.Context, tx pgx.Tx, id int64) (int, map[stri
   CASE WHEN i.item->>'permit_reason'=$2 THEN
    recovery<>$3 OR proof->'stitch_replacement' IS NULL
     OR proof->'stitch_replacement' IS DISTINCT FROM i.item->'stitch_certificate'->'output'
-  ELSE recovery NOT IN ('r2_sha_verified','r2_md5_etag_matched') OR coalesce(recovery_evidence->>'etag','')='' END),
+  ELSE (recovery NOT IN ('r2_sha_verified','r2_md5_etag_matched') AND NOT coalesce(
+   recovery=$4 AND outcome->>'client_version'=$5 AND recovery_evidence->>'client_version'=$5,false))
+   OR coalesce(recovery_evidence->>'etag','')='' END),
  count(*) FILTER (WHERE i.item->>'permit_reason'=$2) FROM nas_cleanup_items i WHERE plan_id=$1`,
-		id, nasCleanupCertifiedStitchReason, nasCleanupCertifiedStitchRecovery).Scan(&bad, &certified)
+		id, nasCleanupCertifiedStitchReason, nasCleanupCertifiedStitchRecovery, cleanupRecoveryNameSizeMatched, nasFastCopyClientVersion).Scan(&bad, &certified)
 	if err != nil || bad != 0 {
 		if certified != 0 {
 			return 409, map[string]any{"error": "fresh complete dry run with exact certified NAS replacement for every item required"}
@@ -494,14 +496,16 @@ func cleanupEnableGates(ctx context.Context, tx pgx.Tx, id int64) (int, map[stri
 	return 0, nil
 }
 
-// cleanupRecoveryEvidence identifies the exact R2 object generation whose
-// streamed bytes hashed to the catalog SHA during a dry run.
+// cleanupRecoveryEvidence identifies the exact R2 generation matched during
+// a dry run. Name/size evidence carries the observing release instead of a
+// verified content SHA.
 type cleanupRecoveryEvidence struct {
-	ObjectKey string `json:"object_key"`
-	ETag      string `json:"etag"`
-	VersionID string `json:"version_id,omitempty"`
-	SizeBytes int64  `json:"size_bytes"`
-	SHA256    string `json:"sha256"`
+	ObjectKey     string `json:"object_key"`
+	ETag          string `json:"etag"`
+	VersionID     string `json:"version_id,omitempty"`
+	SizeBytes     int64  `json:"size_bytes"`
+	SHA256        string `json:"sha256,omitempty"`
+	ClientVersion string `json:"client_version,omitempty"`
 	// MD5 is set when the copy was matched by its single-part ETag against
 	// the MD5 the NAS client computed together with the SHA-256.
 	MD5        string    `json:"md5,omitempty"`
@@ -530,19 +534,9 @@ func (s *Server) cleanupRecoveryFullOnce(ctx context.Context, i nasCleanupItem) 
 	if s.r2 == nil {
 		return "unchecked", nil
 	}
-	head, err := s.r2.Head(ctx, i.ObjectKey)
-	if err != nil {
-		// Only a proven 404 is NAS-only. Authorization/timeouts never prove absence.
-		if r2.IsNotFound(err) {
-			return "nas_only_at_check", nil
-		}
-		return "unchecked", nil
-	}
-	if head.SizeBytes != i.SizeBytes {
-		return "conflict", nil
-	}
-	if head.ETag == "" {
-		return "r2_present_unverified", nil
+	head, failure := s.cleanupRecoveryHead(ctx, i)
+	if failure != "" {
+		return failure, nil
 	}
 	weight := cleanupRecoveryReadWeight(i.SizeBytes)
 	if err := nasCleanupRecoveryReads.Acquire(ctx, weight); err != nil {
@@ -570,8 +564,37 @@ func (s *Server) cleanupRecoveryFullOnce(ctx context.Context, i nasCleanupItem) 
 	return "r2_sha_verified", &cleanupRecoveryEvidence{ObjectKey: i.ObjectKey, ETag: head.ETag, VersionID: head.VersionID, SizeBytes: i.SizeBytes, SHA256: i.SHA256, VerifiedAt: time.Now().UTC()}
 }
 
+func (s *Server) cleanupRecoveryHead(ctx context.Context, i nasCleanupItem) (r2.ObjectHead, string) {
+	head, err := s.r2.Head(ctx, i.ObjectKey)
+	if err != nil {
+		// Only a proven 404 is NAS-only. Authorization/timeouts never prove absence.
+		if r2.IsNotFound(err) {
+			return head, "nas_only_at_check"
+		}
+		return head, "unchecked"
+	}
+	if head.SizeBytes != i.SizeBytes {
+		return head, "conflict"
+	}
+	if head.ETag == "" {
+		return head, "r2_present_unverified"
+	}
+	return head, ""
+}
+
+func (s *Server) cleanupRecoveryNameSize(ctx context.Context, i nasCleanupItem) (string, *cleanupRecoveryEvidence) {
+	head, failure := s.cleanupRecoveryHead(ctx, i)
+	if failure != "" {
+		return failure, nil
+	}
+	if i.SHA256 != "" && head.SHA256Metadata != "" && !strings.EqualFold(head.SHA256Metadata, i.SHA256) {
+		return "conflict", nil
+	}
+	return cleanupRecoveryNameSizeMatched, &cleanupRecoveryEvidence{ObjectKey: i.ObjectKey, ETag: head.ETag, VersionID: head.VersionID, SizeBytes: i.SizeBytes, ClientVersion: nasFastCopyClientVersion, VerifiedAt: time.Now().UTC()}
+}
+
 // cleanupRecoveryBound re-proves, without re-downloading, that the object is
-// still the exact generation the dry run byte-verified: a conditional HEAD
+// still the exact generation the dry run matched: a conditional HEAD
 // (If-Match on the verified ETag, plus the version id when known) must
 // succeed with the same size, ETag and version, and any object-recorded
 // sha256 must equal the catalog SHA. ETags are content-derived (MD5 or the
@@ -605,17 +628,23 @@ func (s *Server) cleanupRecoveryBound(ctx context.Context, i nasCleanupItem, ev 
 	if head.SHA256Metadata != "" && strings.ToLower(head.SHA256Metadata) != i.SHA256 {
 		return "conflict"
 	}
+	if ev.ClientVersion == nasFastCopyClientVersion {
+		return cleanupRecoveryNameSizeBound
+	}
 	return "r2_etag_bound"
 }
 
-// usableEvidence returns the dry-run evidence only when it binds exactly
-// this catalog item (key, size and SHA) to a non-empty ETag.
-func usableEvidence(raw []byte, i nasCleanupItem) (cleanupRecoveryEvidence, bool) {
+// usableEvidence binds the catalog item to a non-empty ETag. Only fast-copy
+// can use its own name/size evidence.
+func usableEvidence(raw []byte, i nasCleanupItem, nameSize bool) (cleanupRecoveryEvidence, bool) {
 	var ev cleanupRecoveryEvidence
-	if len(raw) == 0 || json.Unmarshal(raw, &ev) != nil {
+	if len(raw) == 0 || json.Unmarshal(raw, &ev) != nil || ev.ETag == "" || ev.ObjectKey != i.ObjectKey || ev.SizeBytes != i.SizeBytes {
 		return ev, false
 	}
-	return ev, ev.ETag != "" && ev.ObjectKey == i.ObjectKey && ev.SizeBytes == i.SizeBytes && ev.SHA256 == i.SHA256
+	if ev.ClientVersion == nasFastCopyClientVersion {
+		return ev, nameSize
+	}
+	return ev, ev.SHA256 == i.SHA256
 }
 
 type cleanupPrefetchedRecovery struct {
@@ -626,6 +655,7 @@ type cleanupPrefetchedRecovery struct {
 	evidence  []byte
 	md5       string
 	catalog   string
+	nameSize  bool
 	recovery  string
 	out       *cleanupRecoveryEvidence
 	method    string
@@ -685,19 +715,29 @@ func (s *Server) cleanupRecoveryMD5(ctx context.Context, i nasCleanupItem, md5, 
 // cleanupRecoveryCompute decides the recovery state for one item:
 //   - execution: the conditional HEAD bound to the dry run's evidence, else a
 //     full download;
-//   - dry run: the MD5/ETag match when the client sent an MD5 (with a stable
+//   - fast-copy dry run: exact key and size, via HEAD;
+//   - other dry runs: the MD5/ETag match when the client sent an MD5 (with a stable
 //     ~1% full-SHA audit sample), else the full download + SHA-256.
-func (s *Server) cleanupRecoveryCompute(ctx context.Context, i nasCleanupItem, mode string, evidence []byte, md5, catalogETag string) cleanupPrefetchedRecovery {
-	result := cleanupPrefetchedRecovery{mode: mode, objectKey: i.ObjectKey, sizeBytes: i.SizeBytes, sha256: i.SHA256, evidence: evidence, md5: md5, catalog: catalogETag}
+func (s *Server) cleanupRecoveryCompute(ctx context.Context, i nasCleanupItem, mode string, evidence []byte, md5, catalogETag string, nameSize bool) cleanupPrefetchedRecovery {
+	result := cleanupPrefetchedRecovery{mode: mode, objectKey: i.ObjectKey, sizeBytes: i.SizeBytes, sha256: i.SHA256, evidence: evidence, md5: md5, catalog: catalogETag, nameSize: nameSize}
 	if s.r2 == nil {
 		result.recovery, result.method = "unchecked", "none"
 		return result
 	}
 	if mode == "enabled" {
-		if ev, ok := usableEvidence(evidence, i); ok {
+		if ev, ok := usableEvidence(evidence, i, nameSize); ok {
 			result.recovery, result.method = s.cleanupRecoveryBound(ctx, i, ev), "etag_bound"
 			return result
 		}
+		if nameSize {
+			result.recovery, result.method = "unchecked", "none"
+			return result
+		}
+	}
+	if nameSize {
+		result.recovery, result.out = s.cleanupRecoveryNameSize(ctx, i)
+		result.method = "name_size"
+		return result
 	}
 	if mode == "dry_run" && md5 != "" {
 		if recovery, ev, ok := s.cleanupRecoveryMD5(ctx, i, md5, catalogETag); ok {
@@ -728,7 +768,7 @@ func (s *Server) cleanupRecoveryCompute(ctx context.Context, i nasCleanupItem, m
 // transaction for exactly this (mode, object, evidence, MD5). R2 I/O never
 // runs while observation locks are held: without a matching result the
 // caller answers 503 and the client resends.
-func (s *Server) cleanupRecoveryFor(id int64, i nasCleanupItem, mode string, evidence []byte, md5 string, env *cleanupObserveEnv) (cleanupPrefetchedRecovery, bool) {
+func (s *Server) cleanupRecoveryFor(id int64, i nasCleanupItem, mode string, evidence []byte, req cleanupObserve, env *cleanupObserveEnv) (cleanupPrefetchedRecovery, bool) {
 	if s.r2 == nil {
 		// No recovery store configured: the historical "unchecked" outcome
 		// (never a permit), not an endless retry.
@@ -738,7 +778,7 @@ func (s *Server) cleanupRecoveryFor(id int64, i nasCleanupItem, mode string, evi
 		return cleanupPrefetchedRecovery{}, false
 	}
 	p, ok := env.prefetched[id]
-	return p, ok && p.mode == mode && p.objectKey == i.ObjectKey && p.sizeBytes == i.SizeBytes && p.sha256 == i.SHA256 && string(p.evidence) == string(evidence) && p.md5 == md5
+	return p, ok && p.mode == mode && p.objectKey == i.ObjectKey && p.sizeBytes == i.SizeBytes && p.sha256 == i.SHA256 && string(p.evidence) == string(evidence) && p.md5 == req.MD5 && p.nameSize == (req.ClientVersion == nasFastCopyClientVersion)
 }
 
 // cleanupBatchDigest binds an ordered batch of plans to the cleanup policy.
@@ -855,7 +895,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 			matches = append(matches, o)
 		}
 	}
-	env := &cleanupObserveEnv{session: cleanupAdmissionSession(r, req.ClientVersion), dryRunOnly: dryRunOnly, freshRequests: freshRequests, prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
+	env := &cleanupObserveEnv{session: cleanupAdmissionSession(r, req.ClientVersion), dryRunOnly: dryRunOnly, freshRequests: freshRequests, prefetched: s.cleanupPrefetchRecovery(ctx, cid, req.ClientVersion, md5s)}
 	s.cleanupPrefetchAbortedStitchAbsences(ctx, cid, matches, env)
 	if cleanupObservationExpired(ctx) {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
@@ -1001,7 +1041,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 // need from R2 and computes it with bounded parallelism under a wall-clock
 // budget, before any observation transaction starts. Observations recheck
 // mode, object, evidence and MD5 under lock and use only an exact match.
-func (s *Server) cleanupPrefetchRecovery(ctx context.Context, cid int64, md5s map[int64]string) map[int64]cleanupPrefetchedRecovery {
+func (s *Server) cleanupPrefetchRecovery(ctx context.Context, cid int64, clientVersion string, md5s map[int64]string) map[int64]cleanupPrefetchedRecovery {
 	out := map[int64]cleanupPrefetchedRecovery{}
 	if s.r2 == nil || len(md5s) == 0 {
 		return out
@@ -1011,7 +1051,7 @@ func (s *Server) cleanupPrefetchRecovery(ctx context.Context, cid int64, md5s ma
 		ids = append(ids, id)
 	}
 	// The catalogued upload ETag exists for raw clips only (recording_clips.etag);
-	// collated outputs have none and always take the full download.
+	// collated outputs have none.
 	rows, err := s.pool.Query(ctx, `SELECT i.id,m.item,p.mode,i.recovery_evidence,i.state='would_delete',
  CASE WHEN m.item->>'kind'='raw' THEN coalesce((SELECT lower(btrim(btrim(c.etag),'"')) FROM recording_clips c WHERE c.id=(m.item->>'source_id')::bigint),'') ELSE '' END
  FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id CROSS JOIN LATERAL (SELECT coalesce(i.item,p.manifest->(i.ordinal-1)) item) m
@@ -1057,14 +1097,15 @@ func (s *Server) cleanupPrefetchRecovery(ctx context.Context, cid int64, md5s ma
 			}
 			defer func() { <-slots }()
 			var result cleanupPrefetchedRecovery
-			if j.reverify {
+			nameSize := clientVersion == nasFastCopyClientVersion
+			if j.reverify && !nameSize {
 				// Historical failed audits must finish SHA verification, even if
 				// this object is outside today's deterministic audit sample.
 				result = cleanupPrefetchedRecovery{mode: j.mode, objectKey: j.item.ObjectKey, sizeBytes: j.item.SizeBytes, sha256: j.item.SHA256, evidence: j.evidence, md5: md5s[j.id]}
 				result.recovery, result.out = s.cleanupRecoveryFull(budget, j.item)
 				result.method = "full_sha_recheck"
 			} else {
-				result = s.cleanupRecoveryCompute(budget, j.item, j.mode, j.evidence, md5s[j.id], j.catalog)
+				result = s.cleanupRecoveryCompute(budget, j.item, j.mode, j.evidence, md5s[j.id], j.catalog, nameSize)
 			}
 			if budget.Err() != nil {
 				return // cut short: no verdict either way

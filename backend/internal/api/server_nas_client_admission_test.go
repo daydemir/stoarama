@@ -350,7 +350,7 @@ func seedLegacyBatchPermit(t *testing.T, f *cleanupFixture, task cleanupTask, ob
 	if err != nil || !fresh {
 		t.Fatalf("legacy history fixture: %t %v", fresh, err)
 	}
-	prefetched := f.s.cleanupPrefetchRecovery(f.ctx, 13, map[int64]string{task.ItemID: ""})
+	prefetched := f.s.cleanupPrefetchRecovery(f.ctx, 13, "", map[int64]string{task.ItemID: ""})
 	tx, err := f.pool.Begin(f.ctx)
 	if err != nil {
 		t.Fatal(err)

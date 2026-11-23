@@ -953,6 +953,10 @@ func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID str
 }
 
 func validCleanupProof(raw []byte, i nasCleanupItem) bool {
+	return validCleanupObservationProof(raw, i, false)
+}
+
+func validCleanupObservationProof(raw []byte, i nasCleanupItem, nameSize bool) bool {
 	var p struct {
 		Root          [2]int64   `json:"root"`
 		Ancestors     [][2]int64 `json:"ancestors"`
@@ -967,10 +971,17 @@ func validCleanupProof(raw []byte, i nasCleanupItem) bool {
 
 		Replacement *nasCleanupStitchOutput `json:"stitch_replacement"`
 	}
-	if len(raw) > 16384 || json.Unmarshal(raw, &p) != nil || p.Root[0] <= 0 || p.Root[1] <= 0 || len(p.Ancestors) != len(strings.Split(i.RelativePath, "/"))-1 || p.Identity[4] != p.Root[0] || p.SHA != i.SHA256 || len(p.ParentMembers) != 64 || !lowerHex(p.ParentMembers) {
+	if len(raw) > 16384 || json.Unmarshal(raw, &p) != nil || p.Root[0] <= 0 || p.Root[1] <= 0 || len(p.Ancestors) != len(strings.Split(i.RelativePath, "/"))-1 || p.Identity[4] != p.Root[0] || len(p.ParentMembers) != 64 || !lowerHex(p.ParentMembers) {
 		return false
 	}
 	certified := i.PermitReason == nasCleanupCertifiedStitchReason
+	if nameSize && !certified {
+		if p.Identity[0] != i.SizeBytes || (p.SHA != "" && p.SHA != i.SHA256) {
+			return false
+		}
+	} else if p.SHA != i.SHA256 {
+		return false
+	}
 	if certified {
 		if i.StitchCertificate == nil || i.StitchRawSidecar == nil || !i.SidecarRequired ||
 			p.Identity[0] != i.SizeBytes || p.Identity[1] <= 0 || p.Identity[2] <= 0 || p.Identity[3] <= 0 ||
@@ -1135,7 +1146,7 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 	// R2 work happens before the transaction (no locks held across it).
 	env := &cleanupObserveEnv{session: cleanupAdmissionSession(r, req.ClientVersion), dryRunOnly: dryRunOnly, freshRequests: map[int64]bool{id: fresh}}
 	if req.Outcome == "match" {
-		env.prefetched = s.cleanupPrefetchRecovery(ctx, cid, map[int64]string{id: req.MD5})
+		env.prefetched = s.cleanupPrefetchRecovery(ctx, cid, req.ClientVersion, map[int64]string{id: req.MD5})
 		s.cleanupPrefetchAbortedStitchAbsences(ctx, cid, []cleanupBatchObservation{{ItemID: id, cleanupObserve: req}}, env)
 	}
 	if cleanupObservationExpired(ctx) {
@@ -1235,6 +1246,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		return cleanupObserveError(500, "invalid cleanup manifest")
 	}
 	certified := item.PermitReason == nasCleanupCertifiedStitchReason
+	nameSize := req.ClientVersion == nasFastCopyClientVersion
 	if certified && (cid != 13 || env.session.version != nasCleanupCertifiedStitchVersion) {
 		return cleanupObserveError(409, "reviewed certified stitch cleanup client required")
 	}
@@ -1269,23 +1281,31 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		}
 		if state != "delete_issued" && state != "deleted" && nasSpaceAuditJSONEqual(oldOutcome, retryBody) {
 			if mode == "dry_run" && state == "would_delete" && oldRecovery == "r2_present_unverified" {
-				pre, ok := s.cleanupRecoveryFor(id, item, mode, evidence, req.MD5, env)
-				if !ok || pre.recovery != "r2_sha_verified" || pre.out == nil || pre.method != "full_sha_recheck" {
+				pre, ok := s.cleanupRecoveryFor(id, item, mode, evidence, req, env)
+				verified := pre.recovery == "r2_sha_verified" && pre.method == "full_sha_recheck"
+				if nameSize {
+					verified = pre.recovery == cleanupRecoveryNameSizeMatched && pre.method == "name_size"
+				}
+				if !ok || !verified || pre.out == nil {
 					return cleanupObserveResult{status: 503, body: map[string]any{"error": "recovery recheck not verified; retry or request a fresh dry run", "retryable": true}}
 				}
-				verified, _ := json.Marshal(pre.out)
+				rechecked, _ := json.Marshal(pre.out)
 				// The plan/item locks above fence mode, attempt, manifest and
 				// outcome after prefetch. Keep the NAS proof's original freshness:
 				// recovery-only I/O cannot renew updated_at or issue a permit.
 				updated, err := tx.Exec(ctx, `UPDATE nas_cleanup_items SET recovery=$2,recovery_evidence=$3::jsonb,
- stage_timings=jsonb_set(stage_timings,'{recovery_mode}','"full_sha_recheck"')
- WHERE id=$1 AND NOT delete_ever_issued`, id, pre.recovery, string(verified))
+ stage_timings=jsonb_set(stage_timings,'{recovery_mode}',to_jsonb($4::text))
+ WHERE id=$1 AND NOT delete_ever_issued`, id, pre.recovery, string(rechecked), pre.method)
 				if err != nil || updated.RowsAffected() != 1 {
 					return cleanupObserveError(503, "recovery recheck save failed")
 				}
 				return cleanupObserveResult{status: 200, write: true, body: map[string]any{"action": state, "delete": false, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": pre.recovery}}
 			}
-			return cleanupObserveResult{status: 200, body: map[string]any{"action": state, "delete": false, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof)}}
+			result := map[string]any{"action": state, "delete": false, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof)}
+			if nameSize && state == "would_delete" && oldRecovery == cleanupRecoveryNameSizeMatched {
+				result["recovery"] = oldRecovery
+			}
+			return cleanupObserveResult{status: 200, body: result}
 		}
 		if state == "delete_issued" && req.Outcome == "match" && nasSpaceAuditJSONEqual(oldProof, req.Proof) {
 			return cleanupObserveReconcile(id, attempt, sha, req.Proof)
@@ -1323,7 +1343,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		action = "keep"
 		policyReason = "DELIVERY KEEP HOLD: NAS file/dependency must remain"
 	} else if req.Outcome == "match" {
-		if !validCleanupProof(req.Proof, item) {
+		if !validCleanupObservationProof(req.Proof, item, nameSize) {
 			return cleanupObserveError(400, "complete exact physical cleanup proof required")
 		}
 		var bucket string
@@ -1364,7 +1384,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 			} else {
 				pre, ok := cleanupPrefetchedRecovery{recovery: nasCleanupCertifiedStitchRecovery, method: "nas_replacement_readback"}, true
 				if !certified {
-					pre, ok = s.cleanupRecoveryFor(id, item, mode, evidence, req.MD5, env)
+					pre, ok = s.cleanupRecoveryFor(id, item, mode, evidence, req, env)
 				}
 				if !ok {
 					// Never do R2 I/O while holding observation locks.

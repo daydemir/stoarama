@@ -26,6 +26,86 @@ func (f *cleanupFixture) recoveryOf(id int64) (string, string, string) {
 	return recovery, mode, md5
 }
 
+func TestNASCleanupFastCopyNameSizeRecovery(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	f.useClientVersion(nasFastCopyClientVersion)
+	files := syntheticFiles(100, 2, 10)
+	id, sha, _ := f.admit("fast-copy", files)
+	tasks := f.leaseV2(2, 0, 0, "")
+	if len(tasks) != 2 {
+		t.Fatalf("lease: %d tasks", len(tasks))
+	}
+	for _, r := range f.observe(tasks, nil) {
+		if r.Status != 200 || r.Action != "would_delete" || r.Delete || r.Recovery != cleanupRecoveryNameSizeMatched {
+			t.Fatalf("dry run %+v", r)
+		}
+	}
+	if gets, heads := f.bucket.counts(); gets != 0 || heads != 2 {
+		t.Fatalf("dry run: GET %d, HEAD %d", gets, heads)
+	}
+	f.s.cfg.NASCleanupDeletionEnabled = true
+	if code, body := f.enableBatch([]int64{id}, []string{sha}, 1); code != 200 {
+		t.Fatalf("enable: %d %s", code, body)
+	}
+	exec := f.leaseV2(2, 2, 1<<30, "")
+	if len(exec) != 1 || validCleanupProof(exec[0].ApprovedProof, exec[0].Item) {
+		t.Fatalf("expected one execution lease whose proof old clients cannot use: %+v", exec)
+	}
+	r := f.observe(exec, nil)[0]
+	if r.Status != 200 || !r.Delete || r.Recovery != cleanupRecoveryNameSizeBound {
+		t.Fatalf("execution %+v", r)
+	}
+	f.receipts(exec, []batchResult{r}, "deleted")
+	exec = f.leaseV2(2, 2, 1<<30, "")
+	if len(exec) != 1 {
+		t.Fatalf("expected next execution lease, got %d", len(exec))
+	}
+	// Replace the second object with different bytes of the same size after
+	// the dry run. The permit must still be conditional on the observed ETag.
+	f.bucket.put(exec[0].Item.ObjectKey, []byte(strings.Repeat("x", int(exec[0].Item.SizeBytes))))
+	if r := f.observe(exec, nil)[0]; r.Status != 200 || r.Delete || r.Recovery != "conflict" || !r.Paused {
+		t.Fatalf("changed R2 object %+v", r)
+	}
+	if gets, heads := f.bucket.counts(); gets != 0 || heads != 4 {
+		t.Fatalf("total: GET %d, HEAD %d", gets, heads)
+	}
+}
+
+func TestNASCleanupFastCopyNameSizeRefusesMissingWrongSizeAndInWindow(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	f.useClientVersion(nasFastCopyClientVersion)
+	files := syntheticFiles(100, 3, 10)
+	policy, err := cleanupEmbeddedPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	files[2].StartAt = policy.Streams[3].start
+	files[2].EndAt = files[2].StartAt.Add(time.Minute)
+	id, sha, _ := f.admit("fast-copy-refusals", files)
+	tasks := f.leaseV2(3, 0, 0, "")
+	if len(tasks) != 3 {
+		t.Fatalf("lease: %d tasks", len(tasks))
+	}
+	f.bucket.mu.Lock()
+	delete(f.bucket.objects, tasks[0].Item.ObjectKey)
+	f.bucket.mu.Unlock()
+	f.bucket.put(tasks[1].Item.ObjectKey, []byte("too short"))
+	recoveries := []string{"nas_only_at_check", "conflict", "unchecked"}
+	actions := []string{"would_delete", "conflict", "keep"}
+	for n, r := range f.observe(tasks, nil) {
+		if r.Status != 200 || r.Delete || r.Recovery != recoveries[n] || r.Action != actions[n] {
+			t.Fatalf("dry run %d: %+v", n, r)
+		}
+	}
+	f.s.cfg.NASCleanupDeletionEnabled = true
+	if code, body := f.enableBatch([]int64{id}, []string{sha}, 1); code != 409 {
+		t.Fatalf("enable should refuse: %d %s", code, body)
+	}
+	if gets, heads := f.bucket.counts(); gets != 0 || heads != 3 {
+		t.Fatalf("dry run: GET %d, HEAD %d", gets, heads)
+	}
+}
+
 // The NAS client's MD5 (from the same read as its SHA-256) matched against
 // R2's single-part ETag proves R2 bytes == NAS bytes without a download;
 // multipart ETags, mismatches or a missing MD5 fall back to the full SHA.
@@ -404,7 +484,7 @@ func TestNASCleanupDryRunRecoveryRecheckFencesChanges(t *testing.T) {
 			if change == "conflict" {
 				f.bucket.put(tasks[0].Item.ObjectKey, []byte(strings.Repeat("x", int(tasks[0].Item.SizeBytes))))
 			}
-			env := &cleanupObserveEnv{prefetched: f.s.cleanupPrefetchRecovery(f.ctx, 13, md5s)}
+			env := &cleanupObserveEnv{prefetched: f.s.cleanupPrefetchRecovery(f.ctx, 13, "", md5s)}
 			var req cleanupObserve
 			var raw []byte
 			if err := f.pool.QueryRow(f.ctx, `SELECT outcome FROM nas_cleanup_items WHERE id=$1`, id).Scan(&raw); err != nil {

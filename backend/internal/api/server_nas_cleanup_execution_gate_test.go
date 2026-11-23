@@ -209,7 +209,7 @@ func TestNASCleanupRolledBackCheckpointNeverMintsFirstPermit(t *testing.T) {
 	if err != nil || !fresh {
 		t.Fatalf("register: %t %v", fresh, err)
 	}
-	prefetched := f.s.cleanupPrefetchRecovery(f.ctx, 13, map[int64]string{task.ItemID: ""})
+	prefetched := f.s.cleanupPrefetchRecovery(f.ctx, 13, "", map[int64]string{task.ItemID: ""})
 	tx, err := f.pool.Begin(f.ctx)
 	if err != nil {
 		t.Fatal(err)

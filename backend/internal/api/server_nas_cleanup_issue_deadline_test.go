@@ -28,7 +28,7 @@ func (*cleanupLateIssueTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.Tra
 func TestNASCleanupDatabaseClockRefusesLatePermitWrite(t *testing.T) {
 	f, _, tasks := cleanupFenceFixture(t, false)
 	task := tasks[0]
-	prefetched := f.s.cleanupPrefetchRecovery(f.ctx, 13, map[int64]string{task.ItemID: ""})
+	prefetched := f.s.cleanupPrefetchRecovery(f.ctx, 13, "", map[int64]string{task.ItemID: ""})
 	cfg := f.pool.Config()
 	tracer := &cleanupLateIssueTracer{}
 	cfg.ConnConfig.Tracer = tracer

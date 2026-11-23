@@ -56,6 +56,7 @@ FAST_COPY_CLIENT_VERSION = "r2-copy-v8-fast-copy"
 LOW_MEMORY_CLEANUP_VERSIONS = frozenset((LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, FAST_COPY_CLIENT_VERSION))
 CLEANUP_CERTIFIED_STITCH_REASON = "durham_stitch_certified"
 CLEANUP_CERTIFIED_STITCH_RECOVERY = "nas_stitch_certified"
+CLEANUP_NAME_SIZE_RECOVERY = "r2_name_size_matched"
 CLEANUP_RECONCILIATION_PROTOCOL = 1
 CLEANUP_REFUSAL_PROTOCOL = 1
 CANDIDATE_UPDATE_LOCK = threading.Lock()
@@ -2830,14 +2831,19 @@ class CleanupFile:
         if self.replacement is not None:
             self.replacement.check_paths()
 
-    def proof(self):
+    def proof(self, *, stitch_readback=False):
+        hash_media = stitch_readback or CLIENT_VERSION != FAST_COPY_CLIENT_VERSION
+        if not hash_media and self.files[0][2][0] != self.item["size_bytes"]:
+            raise RuntimeError("cleanup media size differs from catalog")
         started = time.monotonic()
         before_names, before_seq = self.parent_snapshot()
         before_members = cleanup_namespace_sha256(before_names)
         hash_started = time.monotonic()
-        hashes = []
+        hashes = [None] * len(self.files)
         sidecar_bytes = b""
         for n, (_, fd, _) in enumerate(self.files):
+            if n == 0 and not hash_media:
+                continue
             os.lseek(fd, 0, os.SEEK_SET)
             digest = hashlib.sha256()
             md5 = hashlib.md5() if n == 0 else None
@@ -2854,17 +2860,19 @@ class CleanupFile:
                     if len(sidecar_bytes) > 1024 * 1024:
                         self.check_paths()
                         raise CleanupSourceDataError("cleanup sidecar exceeds bound")
-            hashes.append(digest.hexdigest())
+            hashes[n] = digest.hexdigest()
             if md5 is not None:
                 self.media_md5 = md5.hexdigest()
         self.stage_timings["hash_ms"] = (time.monotonic() - hash_started) * 1000
         self.check_paths()
         after_names, _ = self.parent_snapshot()
-        if hashes[0] != self.item["sha256"] or not self.namespace_unchanged(before_names, before_seq, after_names):
+        if (hash_media and hashes[0] != self.item["sha256"]) or not self.namespace_unchanged(before_names, before_seq, after_names):
             raise RuntimeError("cleanup content or directory changed")
         self.proof_names, self.proof_seq = before_names, before_seq
-        proof = {"root": self.root_identity, "ancestors": self.ancestors, "identity": self.files[0][2],
-                 "sha256": hashes[0], "parent_members_sha256": before_members}
+        proof = {"root": self.root_identity, "ancestors": self.ancestors, "identity": self.files[0][2]}
+        if hash_media:
+            proof["sha256"] = hashes[0]
+        proof["parent_members_sha256"] = before_members
         if self.item["sidecar_required"]:
             try:
                 sidecar = json.loads(sidecar_bytes)
@@ -18013,13 +18021,14 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
 
 
 def cleanup_verified_ack(task, proof, decision):
-    """Only a fresh, exact, nonexecuting full proof can qualify this boot."""
+    """Only a fresh, exact dry-run recovery proof can qualify this boot."""
     return (
         task.get("approved_proof") is None
         and isinstance(decision, dict)
         and decision.get("delete") is False
         and decision.get("action") == "would_delete"
         and (decision.get("recovery") in ("r2_sha_verified", "r2_md5_etag_matched")
+             or (CLIENT_VERSION == FAST_COPY_CLIENT_VERSION and decision.get("recovery") == CLEANUP_NAME_SIZE_RECOVERY)
              or (decision.get("recovery") == CLEANUP_CERTIFIED_STITCH_RECOVERY
                  and task.get("item", {}).get("permit_reason") == CLEANUP_CERTIFIED_STITCH_REASON
                  and certified_cleanup_replacement(task["item"], proof)))
@@ -18243,7 +18252,7 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner, timings,
                     ledger = {"item_id": item_id, "attempt": attempt, "plan_id": task.get("plan_id"), "plan_sha256": task["plan_sha256"],
                               "proof_sha256": receipt["proof_sha256"], "relative_path": item["relative_path"],
                               "sidecar_relative_path": item["relative_path"] + ".stoarama.json" if item.get("sidecar_required") else None,
-                              "size_bytes": item.get("size_bytes"), "sha256": proof["sha256"], "kind": item.get("kind"),
+                              "size_bytes": item.get("size_bytes"), "sha256": proof.get("sha256"), "kind": item.get("kind"),
                               "stream_id": item.get("stream_id"), "client_version": CLIENT_VERSION}
                     cleanup_timed(timings, "ledger_intent_ms", cleanup_ledger_append, cfg, dict(ledger, event="intent", at=utc_now_precise()))
                     cleanup_timed(timings, "delete_ms", current.delete_exact, proof)
@@ -19030,7 +19039,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
                 "plan_sha256": task["plan_sha256"], "proof_sha256": proof_sha,
                 "relative_path": item["relative_path"],
                 "sidecar_relative_path": item["relative_path"] + ".stoarama.json" if item["sidecar_required"] else None,
-                "size_bytes": item["size_bytes"], "sha256": proof["sha256"], "kind": item["kind"],
+                "size_bytes": item["size_bytes"], "sha256": proof.get("sha256"), "kind": item["kind"],
                 "stream_id": item["stream_id"], "client_version": CLIENT_VERSION})
         stage = CleanupStage.LEDGER_INTENT
         cleanup_timed(shared, "ledger_intent_ms", cleanup_ledger_append_many, cfg,
@@ -19225,7 +19234,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
                         ledger = {"item_id": task["item_id"], "attempt": task["attempt"], "plan_sha256": task["plan_sha256"],
                             "proof_sha256": decision["proof_sha256"], "relative_path": item["relative_path"],
                             "sidecar_relative_path": item["relative_path"] + ".stoarama.json" if item["sidecar_required"] else None,
-                            "size_bytes": item["size_bytes"], "sha256": proof["sha256"], "kind": item["kind"],
+                            "size_bytes": item["size_bytes"], "sha256": proof.get("sha256"), "kind": item["kind"],
                             "stream_id": item["stream_id"], "client_version": CLIENT_VERSION}
                         stage = CleanupStage.LEDGER_INTENT
                         cleanup_timed(timing, "ledger_intent_ms", cleanup_ledger_append_many, cfg, [dict(ledger, event="intent", at=utc_now_precise())])
@@ -49719,7 +49728,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
                     stitch_hash(cfg, clip["relative_path"], clip["size_bytes"], clip["sha256"], stop)
                 else:
                     with CleanupFile(cfg, clip, stop, deadline) as current:
-                        evidence["raw_proof"] = current.proof()
+                        evidence["raw_proof"] = current.proof(stitch_readback=True)
                 proof["inputs"].append(evidence)
             if kind is StitchRunKind.PROOF:
                 proof["media_seconds"] = float(cumulative)
