@@ -77,6 +77,60 @@ func TestR2OwnerKeepPrefixes(t *testing.T) {
 	}
 }
 
+func TestR2OwnerKeepCatalogStream(t *testing.T) {
+	f := newKeep28Fixture(t)
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := f.pool.Exec(f.ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var held bool
+	if err := f.pool.QueryRow(f.ctx, `SELECT r2_owner_keep_held('stoarama',$1)`, f.key).Scan(&held); err != nil || held {
+		t.Fatalf("ordinary stream held=%v: %v", held, err)
+	}
+	p := inverseTestProtection()
+	loaded, err := loadInverseApplyProtection(f.ctx, f.pool, "stoarama", p.Picks, p.Windows)
+	if err != nil || !loaded.OwnerKeepStreams[415] || !loaded.OwnerKeepStreams[17318] || loaded.OwnerKeepStreams[3] {
+		t.Fatalf("wrong pinned stream protection %v: %v", loaded.OwnerKeepStreams, err)
+	}
+	loaded.Identities[f.key] = []inverseIdentity{{Kind: "raw", StreamID: 415}}
+	if class, reason := loaded.classify(r2.ObjectInfo{Key: f.key, SizeBytes: 100}); class != inverseKE || reason != "owner_keep_stream" {
+		t.Fatalf("managed key classified %s (%s)", class, reason)
+	}
+	// Seed a historical derivative under the fixture's existing writer fence.
+	exec(`SET LOCAL session_replication_role=replica;
+ INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
+ SELECT 415,provider,'415','owner-ke','owner-ke',source_url,recording_state,'Asia/Seoul',capture_type,source_family,execution_class,capture_family,expected_fps FROM streams WHERE id=3;
+ UPDATE recordings SET stream_id=415 WHERE id=30;
+ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
+ SELECT 31,account_id,storage_destination_id,'ordinary',stream_url,cron_expr,cron_timezone,status,3,paused_at FROM recordings WHERE id=30;
+ INSERT INTO recording_collation_hours(id,hour_id,batch_id,generation,recording_id,local_date,delivery_hour,status,manifest_object_key,manifest_sha256,manifest,source_clip_count,included_clip_count,excluded_clip_count,join_count,split_count)
+ VALUES(1,'test__recording-31__date-2026-09-01__hour-01__generation-2','test',2,31,'2026-09-01',1,'collated','test-manifest',repeat('c',64),'{}',1,1,0,0,0);
+ INSERT INTO recording_collation_outputs(collation_hour_id,part,parts,object_key,nas_relative_path,size_bytes,sha256,start_at,end_at,source_clip_ids,r2_verified_at)
+ VALUES(1,1,1,'joined/test/objects/'||repeat('d',64)||'.mp4','test/joined.mp4',100,repeat('d',64),'2026-09-01','2026-09-02',ARRAY[9000001::bigint],now())`)
+	joinedKey := "joined/test/objects/" + strings.Repeat("d", 64) + ".mp4"
+	for _, key := range []string{f.key, joinedKey} {
+		var otherBucket bool
+		if err := f.pool.QueryRow(f.ctx, `SELECT r2_owner_keep_held('stoarama',$1), r2_owner_keep_held('other',$1)`, key).Scan(&held, &otherBucket); err != nil || !held || otherBucket {
+			t.Fatalf("catalog keep for %s: held=%v other bucket=%v: %v", key, held, otherBucket, err)
+		}
+	}
+	for _, entry := range []struct{ table, key string }{
+		{"r2_inverse_attempts", f.key}, {"r2_keep28_attempts", f.key}, {"r2_nonraw_attempts", joinedKey},
+	} {
+		if _, err := f.pool.Exec(f.ctx, `INSERT INTO `+entry.table+`(bucket,object_key) VALUES('stoarama',$1)`, entry.key); err == nil || !strings.Contains(err.Error(), "OWNER KEEP HOLD") {
+			t.Fatalf("%s accepted a protected key: %v", entry.table, err)
+		}
+	}
+	if _, err := f.pool.Exec(f.ctx, `UPDATE recording_clips SET purged_at=now() WHERE object_key=$1`, f.key); err == nil || !strings.Contains(err.Error(), "OWNER KEEP HOLD") {
+		t.Fatalf("catalog purge accepted a protected key: %v", err)
+	}
+	if _, err := applyInverse(f.ctx, f.pool, f.sdk, f.options); err == nil || f.deletes() != 0 {
+		t.Fatalf("protected key reached apply: err=%v deletes=%d", err, f.deletes())
+	}
+}
+
 // TestR2OwnerKeepStopsTheExecutor drives the real apply path: a hold that
 // already covers a key stops the run before any DELETE, and a hold cannot be
 // added over a key whose retirement is pending.

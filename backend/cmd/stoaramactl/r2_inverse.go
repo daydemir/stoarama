@@ -76,11 +76,8 @@ type inverseProtection struct {
 	// OwnerKeepPrefixes are durable owner keep holds on whole key prefixes. A
 	// key under one is kept whatever its catalog status.
 	OwnerKeepPrefixes []string
-	// OwnerKeepStreams are the stream ids those prefixes protect. A collated
-	// output's key is compiled: joined/... and its sources are managed/..., so
-	// no key can ever start with raw/stream/<id>/. The prefix rule therefore
-	// cannot see thesis footage that leaves R2 as part of a collated output, so
-	// the page, output and source decisions all check the stream id itself.
+	// OwnerKeepStreams protects the pinned Keep Everything streams and streams
+	// named by owner RAW prefixes, including footage whose key has no stream ID.
 	OwnerKeepStreams map[int64]bool
 	// JoinedReleased holds clips whose every joined snapshot belongs to a batch
 	// the owner released to the RAW lane. Only their outside-window part leaves.
@@ -224,6 +221,9 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 		return p.classifyCollated(o, x, mapped)
 	}
 	for _, id := range identities {
+		if p.OwnerKeepStreams[id.StreamID] {
+			return inverseKE, "owner_keep_stream"
+		}
 		for _, component := range strings.Split(id.Path, "/") {
 			if p.KEFolders[component] {
 				return inverseKE, "keep_everything_catalog_path"
@@ -476,10 +476,9 @@ func loadInverseHolds(ctx context.Context, q r2RetireQuerier, bucket string, pic
 	if p.OwnerKeepPrefixes, err = loadInverseOwnerKeepPrefixes(ctx, q, bucket); err != nil {
 		return p, err
 	}
-	// A prefix hold names a RAW key prefix (raw/stream/<id>/); a collated output's
-	// key and sources are never under one, so the stream ids those prefixes name
-	// are lifted to the stream decision too and checked there.
-	p.OwnerKeepStreams = ownerKeepStreamIDs(p.OwnerKeepPrefixes)
+	if p.OwnerKeepStreams, err = loadInverseOwnerKeepStreams(ctx, q, bucket, p.OwnerKeepPrefixes); err != nil {
+		return p, err
+	}
 	if p.Exempt, p.ExemptIdentity, err = loadInverseExempt(ctx, q, bucket); err != nil {
 		return p, err
 	}
@@ -856,6 +855,26 @@ func ownerKeepStreamIDs(prefixes []string) map[int64]bool {
 		}
 	}
 	return streams
+}
+
+func loadInverseOwnerKeepStreams(ctx context.Context, q r2RetireQuerier, bucket string, prefixes []string) (map[int64]bool, error) {
+	streams := ownerKeepStreamIDs(prefixes)
+	if bucket != "stoarama" {
+		return streams, nil
+	}
+	rows, err := q.Query(ctx, `SELECT stream_id FROM nas_media_keep20_windows WHERE keep_everything`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		streams[id] = true
+	}
+	return streams, rows.Err()
 }
 
 // ownerKeepStreamID is the stream a RAW owner-keep prefix names, if any.

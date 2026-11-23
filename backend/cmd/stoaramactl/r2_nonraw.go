@@ -488,7 +488,10 @@ func (a *inverseApplier) loadNonrawTarget(ctx context.Context, tx pgx.Tx, e inve
 	if err != nil {
 		return t, err
 	}
-	protection.OwnerKeepStreams = ownerKeepStreamIDs(prefixes)
+	protection.OwnerKeepStreams, err = loadInverseOwnerKeepStreams(ctx, tx, a.store.Bucket(), prefixes)
+	if err != nil {
+		return t, err
+	}
 	t = loader.assess(protection, t)
 	if n != 1 || t.ID <= 0 || t.SizeBytes <= 0 || t.SizeBytes != e.SizeBytes || t.Reason != "" || t.keep28Held() {
 		return t, fmt.Errorf("%w: %s identity absent, protected, unresolved or changed (%s)", errInverseNonrawIneligible, kind, t.Reason)
