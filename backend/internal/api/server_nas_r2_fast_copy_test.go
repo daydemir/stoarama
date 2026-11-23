@@ -309,3 +309,21 @@ func TestNASStorageBindingV8FastCopyMigration(t *testing.T) {
 		t.Fatalf("fast copy did not persist the exact storage binding: %+v", obs)
 	}
 }
+
+// An object too large to finish within one lease is never fast-leased; it stays
+// pending (visible), instead of restarting from zero on every lease.
+func TestNASR2CopyV8FastSkipsObjectsLargerThanOneLease(t *testing.T) {
+	f, item := copyTestFixture(t)
+	useFastCopyFixture(t, f)
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_r2_copy_items SET item=jsonb_set(item,'{size_bytes}',to_jsonb($2::bigint)) WHERE source_id=$1`,
+		item.SourceID, nasR2FastCopyMaxFile+1); err != nil {
+		t.Fatal(err)
+	}
+	if reply := fastCopyLease(t, f); len(reply.Tasks) != 0 {
+		t.Fatalf("leased an object larger than one lease: %+v", reply.Tasks)
+	}
+	var state string
+	if err := f.pool.QueryRow(f.ctx, `SELECT state FROM nas_r2_copy_items WHERE source_id=$1`, item.SourceID).Scan(&state); err != nil || state != "pending" {
+		t.Fatalf("state=%q err=%v", state, err)
+	}
+}

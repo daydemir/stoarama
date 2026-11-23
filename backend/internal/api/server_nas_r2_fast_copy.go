@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,10 @@ const (
 	nasR2FastCopyLeaseTTL  = time.Hour
 	nasR2FastCopyBatchMax  = 64
 	nasR2FastCopyBatchSize = 32
+	// A fast-copy object must finish within one lease even at a slow 0.6 MB/s;
+	// a partial transfer restarts from zero, so larger objects would never land.
+	// Raw clips are tens of MB; anything larger stays pending and visible.
+	nasR2FastCopyMaxFile int64 = 2 << 30
 )
 
 type nasR2FastCopyTask struct {
@@ -36,7 +41,7 @@ type nasR2FastCopyCandidate struct {
 	reason    NASR2CopyBlockReason
 }
 
-const nasR2FastCopyEligible = `q.connection_id=$1 AND q.kind='raw' AND
+var nasR2FastCopyEligible = `q.connection_id=$1 AND q.kind='raw' AND (q.item->>'size_bytes')::bigint <= ` + strconv.FormatInt(nasR2FastCopyMaxFile, 10) + ` AND
  (q.state='pending' OR (q.state='leased' AND q.lease_expires_at<clock_timestamp())
  OR ($2 AND control.enabled AND (q.state='refresh_pending' OR (q.state='refresh_leased' AND q.lease_expires_at<clock_timestamp()))))`
 
