@@ -73,3 +73,7 @@ class R2CopyV5FreshPermitTests(CleanupFreshPermitTests):
 
 class LowMemoryCleanupFreshPermitTests(CleanupFreshPermitTests):
     version = "r2-copy-v8-low-memory-cleanup"
+
+
+class Keep20CleanupFreshPermitTests(CleanupFreshPermitTests):
+    version = "r2-copy-v8-keep20-cleanup"

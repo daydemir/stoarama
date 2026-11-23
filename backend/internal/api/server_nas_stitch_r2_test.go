@@ -454,7 +454,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		}
 	})
 	startRange := nasR2CopyControl{Token: request.Token, FreeBytes: request.FreeBytes, Length: item.SizeBytes}
-	for _, lowMemory := range []string{nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion} {
+	for _, lowMemory := range []string{nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion} {
 		exec(`UPDATE connections SET client_version=$1 WHERE id=13`, lowMemory)
 		if w := cleanupCall(t, s.handleAccountNASStitchLease, 47, 47, "", "", nil); w.Code != http.StatusConflict ||
 			!strings.Contains(w.Body.String(), "low-memory client is copy-only") {
