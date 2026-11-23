@@ -339,11 +339,6 @@ class LowMemoryGroupPathTests(unittest.TestCase):
         self.assertEqual(bodies[-1]['dry_run_limit'], 2)
         self.assertIs(bodies[-1]['execution_batch'], True)
 
-
-if __name__ == '__main__':
-    unittest.main()
-
-
 class Keep20ReleaseGuardTests(unittest.TestCase):
     """The keep20 release guards with the real embedded 20-day pin, not keep28."""
 
@@ -363,3 +358,7 @@ class Keep20ReleaseGuardTests(unittest.TestCase):
         # legacy keep28 window was [2026-07-09T07Z, 2026-08-06T07Z).
         self.assertIsNone(self.refusal('2026-07-10T12:00:00+00:00', '2026-07-10T12:01:00+00:00'))
         self.assertIn('overlaps', self.refusal('2026-07-20T12:00:00+00:00', '2026-07-20T12:01:00+00:00'))
+
+
+if __name__ == '__main__':
+    unittest.main()

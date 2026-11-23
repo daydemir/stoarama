@@ -50,9 +50,15 @@ func nasR2StitchCopyEnabledForVersion(version string) bool {
 // Master OFF must leave the new release dry-run only: no permits, no execution
 // lease, no batch approval, and no deletion authority for the items.
 func TestNASCleanupLowMemoryCleanupReleaseMasterOffIsDryOnly(t *testing.T) {
+	for _, v := range []string{nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion} {
+		t.Run(v, func(t *testing.T) { testNASCleanupReleaseMasterOffIsDryOnly(t, v) })
+	}
+}
+
+func testNASCleanupReleaseMasterOffIsDryOnly(t *testing.T, v string) {
 	f := newCleanupFixture(t, 24)
 	plan, sha, _ := f.admit("low-memory-cleanup-dry", syntheticFiles(100, 8, 4))
-	f.useClientVersion(nasLowMemoryCleanupClientVersion)
+	f.useClientVersion(v)
 	if f.s.cfg.NASCleanupDeletionEnabled {
 		t.Fatal("fixture started with the master switch on")
 	}
