@@ -35,7 +35,8 @@ inside the period can be admitted, observed as `would_delete`, or deleted.
   rehash and exact proof; R2 byte-verified recovery copy (NAS-only deletion was removed; see
   NAS_CLEANUP.md safeguards); path confinement; per-plan enable with the
   expected plan SHA, a complete dry run fresher than 24 h and a 1-hour approval;
-  and the backend `NAS_CLEANUP_DELETION_ENABLED` master switch (default off).
+  and the backend deletion master switch (durable DB control, default off; see
+  NAS_CLEANUP.md).
 - **Plan binding.** New plans store the keep28 policy SHA in
   `nas_cleanup_plans.report_sha256`. Plans bound to any other policy are never
   leased, are observed only as `keep`, and can only be paused or retired.

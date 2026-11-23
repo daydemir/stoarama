@@ -168,7 +168,7 @@ func TestNASCleanupRecheckLeasesNewAttemptAndRefreshesEnableEvidence(t *testing.
 	id, sha, ids := f.admit("recheck", syntheticFiles(100, 2, 10))
 	old := f.leaseV2(64, 0, 0, "")
 	f.observe(old, nil)
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	// One transient recovery failure and one otherwise good, expired proof.
 	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET recovery='r2_present_unverified' WHERE id=$1;`, ids[0]); err != nil {
 		t.Fatal(err)

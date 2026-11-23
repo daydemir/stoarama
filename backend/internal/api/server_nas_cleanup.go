@@ -357,7 +357,13 @@ func (s *Server) handleAdminNASCleanupStatus(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, 404, "cleanup plan unavailable")
 		return
 	}
-	util.WriteJSON(w, 200, map[string]any{"id": id, "label": label, "plan_sha256": sha, "policy_sha256": binding, "policy_current": binding == cleanupPolicySHA, "mode": mode, "allow_nas_only": allow, "approval_reason": reason, "approved_until": until, "priority": priority, "items": json.RawMessage(manifest), "states": json.RawMessage(jsonStates), "master_deletion_enabled": s.cfg.NASCleanupDeletionEnabled, "results": json.RawMessage(results)})
+	var master bool
+	master, err = cleanupMasterEnabled(r.Context(), s.pool)
+	if err != nil {
+		util.WriteError(w, 500, "cleanup master control unavailable")
+		return
+	}
+	util.WriteJSON(w, 200, map[string]any{"id": id, "label": label, "plan_sha256": sha, "policy_sha256": binding, "policy_current": binding == cleanupPolicySHA, "mode": mode, "allow_nas_only": allow, "approval_reason": reason, "approved_until": until, "priority": priority, "items": json.RawMessage(manifest), "states": json.RawMessage(jsonStates), "master_deletion_enabled": master, "results": json.RawMessage(results)})
 }
 
 // Arming is deliberately not automatic. It requires the exact digest and a
@@ -377,7 +383,7 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 		ApprovalHours     *int `json:"approval_hours,omitempty"`
 		AllowLongApproval bool `json:"allow_long_approval,omitempty"`
 	}
-	if util.DecodeJSON(r, &req) != nil || len(req.PlanSHA) != 64 || !lowerHex(req.PlanSHA) || (req.Mode != "enabled" && req.Mode != "paused" && req.Mode != "dry_run") || len(req.Reason) < 1 || len(req.Reason) > 500 {
+	if util.DecodeJSON(r, &req) != nil || len(req.PlanSHA) != 64 || !lowerHex(req.PlanSHA) || (req.Mode != "enabled" && req.Mode != "paused" && req.Mode != "dry_run") || strings.TrimSpace(req.Reason) == "" || len(req.Reason) > 500 {
 		util.WriteError(w, 400, "exact plan digest,mode and reason required")
 		return
 	}
@@ -402,12 +408,6 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 			return
 		}
 	}
-	// Backend independent master switch defaults OFF even if an operator arms a
-	// batch. Setting it is a separate explicit deployment/configuration action.
-	if req.Mode == "enabled" && !s.cfg.NASCleanupDeletionEnabled {
-		util.WriteError(w, 409, "NAS deletion master switch is off")
-		return
-	}
 	ctx := r.Context()
 	tx, err := s.pool.BeginTx(ctx, nasCleanupAdmissionOptions)
 	if err != nil {
@@ -421,7 +421,19 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 			releaseFreeze()
 		}
 	}()
+	// Cheap advisory look before the expensive fences: a master that is already
+	// OFF refuses here. This read takes no row lock, so it cannot delay OFF.
+	if req.Mode == "enabled" && !cleanupMasterMaybeOn(ctx, tx) {
+		util.WriteError(w, 409, "NAS deletion master switch is off")
+		return
+	}
 	if req.Mode == "enabled" {
+		// The independent master switch defaults OFF even if an operator arms a
+		// plan. Changing it is a separate audited `nas-cleanup master` action.
+		// Order matters for an emergency OFF: every fence and row lock this
+		// transaction needs is taken first, and the master is read FOR SHARE
+		// only at the guarded write below. Reading it before the fences would
+		// make OFF wait for a transaction that is still waiting on the fence.
 		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
 			util.WriteError(w, 500, "public cleanup fence failed")
 			return
@@ -493,7 +505,20 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 			util.WriteError(w, 409, "cleanup freeze/replay failed: "+err.Error())
 			return
 		}
+		// Reset every item to pending as a *fence* before the master read: the
+		// rows are locked here, so the guarded write below cannot block on an
+		// unprelocked item row while this transaction already holds the master
+		// row lock. All waiting must be over before that read.
+		if err = cleanupLockPlanItems(ctx, tx, id); err != nil {
+			util.WriteError(w, 500, "cleanup item fence failed")
+			return
+		}
 	}
+	// The mode transition is written here, before the master read, so that read
+	// is genuinely the last statement: the guarded write no longer follows it and
+	// an emergency OFF waits only for decisions already past their fences. The
+	// activation above needs its own pool connections, so holding the master lock
+	// across it would stall OFF behind a pool checkout.
 	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode=$2,allow_nas_only=false,approval_reason=$3,approved_until=CASE WHEN $2='enabled' THEN now()+$5::bigint*interval '1 second' END,priority=coalesce($4,priority) WHERE id=$1`, id, req.Mode, req.Reason, req.Priority, int64(approval/time.Second))
 	if err == nil && req.Mode == "enabled" {
 		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='pending',lease_expires_at=NULL WHERE plan_id=$1`, id)
@@ -503,7 +528,26 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 		// that contains it; a batch never re-enables a plan an operator stopped.
 		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_batches SET mode='paused',approved_until=NULL,approval_reason=left('paused with plan '||$3::text||': '||$2::text,500) WHERE mode='enabled' AND $1=ANY(plan_ids)`, id, req.Reason, strconv.FormatInt(id, 10))
 	}
-	if err != nil || tx.Commit(ctx) != nil {
+	if err != nil {
+		util.WriteError(w, 500, "cleanup control failed")
+		return
+	}
+	// Authoritative read, last on an enable. A plan whose master is OFF is not
+	// enabled: return and let the deferred Rollback discard every freeze, gate,
+	// lock and the transition written above. A pause needs no authority and takes
+	// no master row lock, so it cannot delay an OFF.
+	if req.Mode == "enabled" {
+		on, err := cleanupMasterRequired(ctx, tx)
+		if err != nil {
+			util.WriteError(w, 503, "cleanup master control unavailable")
+			return
+		}
+		if !on {
+			util.WriteError(w, 409, "NAS deletion master switch is off")
+			return
+		}
+	}
+	if tx.Commit(ctx) != nil {
 		util.WriteError(w, 500, "cleanup control failed")
 		return
 	}
@@ -521,7 +565,7 @@ func (s *Server) handleAdminNASCleanupRetireSuperseded(w http.ResponseWriter, r 
 		Reason        string `json:"reason"`
 		ExpectedPlans *int   `json:"expected_plans,omitempty"`
 	}
-	if util.DecodeJSON(r, &req) != nil || len(req.Reason) < 1 || len(req.Reason) > 500 || (req.ExpectedPlans != nil && *req.ExpectedPlans < 1) {
+	if util.DecodeJSON(r, &req) != nil || strings.TrimSpace(req.Reason) == "" || len(req.Reason) > 500 || (req.ExpectedPlans != nil && *req.ExpectedPlans < 1) {
 		util.WriteError(w, 400, "reason and optional positive expected_plans required")
 		return
 	}
@@ -646,6 +690,9 @@ type cleanupTask struct {
 	Item           nasCleanupItem  `json:"item"`
 	ApprovedProof  json.RawMessage `json:"approved_proof,omitempty"`
 	ExecutionBatch bool            `json:"execution_batch,omitempty"`
+	// approvalDeadline is the earliest plan approval, session or lease deadline
+	// this approval rests on; rechecked after the final locked master read.
+	approvalDeadline time.Time
 }
 type cleanupObserve struct {
 	ReconciliationProtocol int                `json:"reconciliation_protocol,omitempty"`
@@ -671,7 +718,7 @@ type cleanupObserve struct {
 // Plans are ordered without sorting/locking the entire pending file backlog.
 // The lateral probe uses nas_cleanup_pending and skips locked rows before the
 // outer LIMIT; it can keep looking in the next eligible plan if one is busy.
-const cleanupLeaseLoadSQL = `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode
+const cleanupLeaseLoadSQL = `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode,p.approved_until
 FROM nas_cleanup_plans p
 JOIN LATERAL (
  SELECT candidate.* FROM nas_cleanup_items candidate
@@ -745,10 +792,21 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	if !ok {
 		return
 	}
-	// A batch whose current plan finished (or stopped) advances or pauses
-	// before work is leased; it never runs inside the lease transaction.
+	// A batch whose current plan finished (or stopped) advances or pauses before
+	// work is leased; it never runs inside the lease transaction. Only a request
+	// that can actually execute may trigger that: an advance takes the exclusive
+	// public fence and the master row lock, so a zero-execution-file or dry-only
+	// lease must not start it and thereby delay an emergency OFF.
 	s.cleanupExpireApprovals(ctx)
-	s.cleanupAdvanceBatchIfIdle(ctx)
+	// Only a request that could actually execute may trigger an advance: advancing
+	// takes the exclusive public fence and the master row lock, so a request that
+	// cannot lease execution work must not start it and delay an emergency OFF.
+	// "Could execute" means a reviewed execution session AND nonzero execution
+	// files AND bytes — not merely the protocol field or a file cap with zero
+	// bytes, which leases nothing.
+	if cleanupLeaseRequestCanExecute(req.Protocol, req.ExecutionFiles, req.ExecutionBytes, cleanupRequestSession(r)) {
+		s.cleanupAdvanceBatchIfIdle(ctx)
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		util.WriteError(w, 500, "cleanup lease transaction failed")
@@ -773,7 +831,13 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, 500, "cleanup client identity unavailable")
 		return
 	}
-	allowExecution := sessionDeadline.After(time.Now()) && s.cfg.NASCleanupDeletionEnabled && (req.Protocol == 1 || *req.ExecutionFiles > 0)
+	// Only an execution-capable request can lease deletion work, so a request
+	// offering no execution files never touches the master switch at all. The
+	// peek here takes no row lock; the authoritative FOR SHARE read is deferred
+	// until authority is actually handed out, after every fence, expiry update
+	// and replay row lock, so an emergency OFF is never queued behind them.
+	executionCapable := req.Protocol == 1 || *req.ExecutionFiles > 0
+	allowExecution := sessionDeadline.After(time.Now()) && executionCapable && cleanupMasterMaybeOn(ctx, tx)
 	// An execution lease that expires without a report is an execution
 	// anomaly: its enabled plan (and its batch) is paused in the same statement.
 	_, err = tx.Exec(ctx, cleanupExpireLeasesSQL, cid, "execution lease expired without a report", plans)
@@ -788,12 +852,37 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 			util.WriteError(w, 500, "cleanup lease load failed")
 			return
 		}
+		// The replay SQL runs first so its row locks are taken before the one
+		// authoritative master read at the end of this transaction. When the
+		// durable switch turns out OFF the whole lease rolls back, so no approved
+		// task is handed back under authority that no longer exists.
 		if len(replayed) != 0 {
 			for _, task := range replayed {
 				if req.ExecutionOnly && task.ApprovedProof == nil {
 					util.WriteError(w, 409, "lease replay role differs")
 					return
 				}
+			}
+			// The final read is required because the replay carries a real buffered
+			// approval, exactly as a fresh group does — not because a mutable flag
+			// happens to still be set.
+			if err = s.cleanupLeaseAuthorize(ctx, tx, cleanupHasExecutionTasks(replayed), replayed, sessionDeadline); err != nil {
+				if !errors.Is(err, errCleanupLeaseDenied) {
+					util.WriteError(w, 500, "cleanup lease save failed")
+					return
+				}
+				// No authority: roll back so no lease, attempt or expiry commits,
+				// and hand back an ordinary empty lease.
+				if err = tx.Rollback(ctx); err != nil {
+					util.WriteError(w, 500, "cleanup lease save failed")
+					return
+				}
+				util.WriteJSON(w, 200, map[string]any{"tasks": []cleanupTask{}, "retry_after_sec": 120, "recovery_md5": cleanupLeaseAdvertisesMD5})
+				return
+			}
+			if err = tx.Commit(ctx); err != nil {
+				util.WriteError(w, 500, "cleanup lease save failed")
+				return
 			}
 			util.WriteJSON(w, 200, map[string]any{"tasks": replayed, "retry_after_sec": 0, "replayed": true, "recovery_md5": cleanupLeaseAdvertisesMD5})
 			return
@@ -803,7 +892,8 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		var task cleanupTask
 		var raw, approved []byte
 		var mode string
-		err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, allowExecution, cleanupPolicySHA, plans, groupIDs, req.ClientVersion == nasCleanupCertifiedStitchVersion).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode)
+		var planUntil *time.Time
+		err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, allowExecution, cleanupPolicySHA, plans, groupIDs, req.ClientVersion == nasCleanupCertifiedStitchVersion).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode, &planUntil)
 		if errors.Is(err, pgx.ErrNoRows) {
 			break
 		}
@@ -856,6 +946,9 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 			}
 			task.ApprovedProof = approved
 			task.ExecutionBatch = group
+			// Every deadline this approval depends on, retained so the final gate
+			// can recheck them against the real clock after its locked read.
+			task.approvalDeadline = earliestDeadline(planUntil, &sessionDeadline, &task.ExpiresAt)
 		}
 		var requestID any
 		if req.RequestID != "" {
@@ -880,6 +973,30 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 			}
 		}
 	}
+	// Every fence, expiry update, replay row lock and tentative item write above
+	// is finished. The final gate depends on what is actually buffered, never on
+	// the mutable allowExecution flag: a later cap or session check can set that
+	// false while an approved task is already in tasks (a group whose first item
+	// fit and whose second overflowed, or a replay). Gating on the flag would then
+	// commit that task with no master read at all. Dry-run-only leases carry no
+	// approved proof, so they still take no master row lock and cannot delay an
+	// OFF; that is the only scope claimed here.
+	if cleanupHasExecutionTasks(tasks) {
+		if err = s.cleanupLeaseAuthorize(ctx, tx, true, tasks, sessionDeadline); err != nil {
+			if !errors.Is(err, errCleanupLeaseDenied) {
+				util.WriteError(w, 500, "cleanup lease save failed")
+				return
+			}
+			// No authority: roll back every fence, expiry and tentative lease, then
+			// answer with an ordinary empty lease instead of the approved tasks.
+			if err = tx.Rollback(ctx); err != nil {
+				util.WriteError(w, 500, "cleanup lease save failed")
+				return
+			}
+			util.WriteJSON(w, 200, map[string]any{"tasks": []cleanupTask{}, "retry_after_sec": 120})
+			return
+		}
+	}
 	if err = tx.Commit(ctx); err != nil {
 		util.WriteError(w, 500, "cleanup lease save failed")
 		return
@@ -896,11 +1013,76 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	util.WriteJSON(w, 200, body)
 }
 
+// cleanupLeaseAuthorize is the lease path's transaction-bound authority check.
+// It runs after every potentially blocking step of the lease and is the last
+// statement before the caller commits: nothing follows it but COMMIT (or the
+// rollback the caller performs on the returned error). It verifies the switch
+// once, authoritatively, and rechecks each leased task's own deadlines against
+// the clock without another SQL statement. On OFF or expiry the caller rolls the
+// whole transaction back, so no task, attempt bump, lease or expiry is committed
+// and no approved proof is handed out.
+func (s *Server) cleanupLeaseAuthorize(ctx context.Context, tx pgx.Tx, required bool, tasks []cleanupTask, sessionDeadline time.Time) error {
+	if !required {
+		return nil
+	}
+	var on bool
+	if err := tx.QueryRow(ctx, cleanupMasterReadSQL).Scan(&on); err != nil {
+		return err
+	}
+	if !on {
+		return errCleanupLeaseDenied
+	}
+	// The locked read can itself have waited. Recheck the real clock against every
+	// deadline each buffered approval depends on, using only values in memory: no
+	// further SQL and no further lock, so an emergency OFF is never behind this.
+	now := time.Now()
+	if !sessionDeadline.After(now) {
+		return errCleanupLeaseDenied
+	}
+	for _, task := range tasks {
+		if task.ApprovedProof == nil {
+			continue
+		}
+		if !task.ExpiresAt.After(now) || !cleanupAuthorityLive(task.approvalDeadline, now) {
+			return errCleanupLeaseDenied
+		}
+	}
+	return nil
+}
+
+// cleanupHasExecutionTasks reports whether any buffered lease could hand the
+// client deletion authority, i.e. whether the final master gate is required.
+func cleanupHasExecutionTasks(tasks []cleanupTask) bool {
+	for _, task := range tasks {
+		if task.ApprovedProof != nil {
+			return true
+		}
+	}
+	return false
+}
+
+var errCleanupLeaseDenied = errors.New("cleanup lease authority denied")
+
+// cleanupLeaseRequestCanExecute reports whether a lease request can hand out
+// deletion authority at all. It requires a reviewed execution session, non-nil
+// execution caps, at least one execution file and a positive byte budget: an
+// execution-files cap with zero bytes leases nothing, so it must not trigger the
+// fencing, master-locking advance either.
+func cleanupLeaseRequestCanExecute(protocol int, files *int, bytes *int64, session cleanupClientSession) bool {
+	if protocol == 1 {
+		return nasCleanupSupportsExecution(session.version)
+	}
+	if files == nil || bytes == nil {
+		return false
+	}
+	return *files > 0 && *bytes > 0 && nasCleanupSupportsExecution(session.version)
+}
+
 // cleanupLeaseReplay returns the still-leased, unexpired tasks of an earlier
 // identical lease request (its response was lost), with the same attempt and
 // expiry. Nothing is leased again and no lease is extended.
 func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID string, executionCapable bool, boot, version string, sessionDeadline time.Time, plans []int64, group bool) ([]cleanupTask, error) {
-	rows, err := tx.Query(ctx, `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode,i.lease_expires_at FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.lease_request_id=$1 AND p.id=ANY($7) AND i.state='leased' AND i.lease_expires_at>now() AND p.connection_id=$2 AND p.report_sha256=$3 AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $4 AND i.lease_connection_id=$2 AND i.lease_client_boot_id=$5 AND i.lease_client_version=$6 AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.id<>i.id AND busy.state IN ('leased','delete_issued') AND NOT coalesce(($8 AND busy.lease_request_id=$1 AND busy.lease_client_boot_id=$5 AND busy.lease_client_version=$6),false)))) ORDER BY i.id FOR UPDATE OF i`, requestID, cid, cleanupPolicySHA, executionCapable, boot, version, plans, group)
+	rows, err := tx.Query(ctx, `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode,i.lease_expires_at,p.approved_until FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.lease_request_id=$1 AND p.id=ANY($7) AND i.state='leased' AND i.lease_expires_at>now() AND p.connection_id=$2 AND p.report_sha256=$3 AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $4 AND i.lease_connection_id=$2 AND i.lease_client_boot_id=$5 AND i.lease_client_version=$6 AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.id<>i.id AND busy.state IN ('leased','delete_issued') AND NOT coalesce(($8 AND busy.lease_request_id=$1 AND busy.lease_client_boot_id=$5 AND busy.lease_client_version=$6),false)))) ORDER BY i.id FOR UPDATE OF i`, requestID, cid, cleanupPolicySHA, executionCapable, boot, version, plans, group)
 	if err != nil {
 		return nil, err
 	}
@@ -910,7 +1092,8 @@ func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID str
 		var task cleanupTask
 		var raw, approved []byte
 		var mode string
-		if err = rows.Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode, &task.ExpiresAt); err != nil {
+		var planUntil *time.Time
+		if err = rows.Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode, &task.ExpiresAt, &planUntil); err != nil {
 			return nil, err
 		}
 		if err = json.Unmarshal(raw, &task.Item); err != nil {
@@ -919,16 +1102,18 @@ func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID str
 		if task.Item.PermitReason == nasCleanupCertifiedStitchReason && version != nasCleanupCertifiedStitchVersion {
 			continue
 		}
+		task.ExpiresAt = task.ExpiresAt.UTC()
 		if mode == "enabled" {
 			if !sessionDeadline.After(time.Now()) {
 				continue
 			}
 			task.ApprovedProof = approved
 			task.ExecutionBatch = group
+			// A replayed approval must satisfy the same final gate as a fresh one.
+			task.approvalDeadline = earliestDeadline(planUntil, &sessionDeadline, &task.ExpiresAt)
 		} else if mode != "dry_run" {
 			continue
 		}
-		task.ExpiresAt = task.ExpiresAt.UTC()
 		tasks = append(tasks, task)
 	}
 	return tasks, rows.Err()
@@ -1007,7 +1192,14 @@ func validCleanupProof(raw []byte, i nasCleanupItem) bool {
 // A permit requires an enabled, unexpired plan, the master switch, the same
 // physical file from the dry run, and the recovery proof for that item class.
 func cleanupMayIssue(mode string, master bool, until *time.Time, sameFile bool, recovery string) bool {
-	return mode == "enabled" && master && until != nil && until.After(time.Now()) && sameFile && cleanupRecoveryPermits(mode, recovery)
+	return master && cleanupPermitShape(mode, until, sameFile, recovery)
+}
+
+// cleanupPermitShape is every permit condition except the master switch. The
+// master is read separately and last, after the blocking fences, row locks and
+// the budget advisory lock, so an emergency OFF never queues behind them.
+func cleanupPermitShape(mode string, until *time.Time, sameFile bool, recovery string) bool {
+	return mode == "enabled" && until != nil && until.After(time.Now()) && sameFile && cleanupRecoveryPermits(mode, recovery)
 }
 
 // Media bytes of every item whose deletion permit was issued in the last 24h.
@@ -1116,37 +1308,120 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 	}
 	// R2 work happens before the transaction (no locks held across it).
 	env := &cleanupObserveEnv{session: cleanupAdmissionSession(r, req.ClientVersion), dryRunOnly: dryRunOnly, freshRequests: map[int64]bool{id: fresh}}
+	// One explicit initial posture, read once and unlocked so it cannot delay an
+	// OFF. Its only job is to choose the starting posture: when the switch already
+	// reads OFF (or cannot be read), skip issuance-only preflight — the
+	// aborted-stage R2 lookup exists to prepare a permit — and go straight to the
+	// ordinary denied observation/auto-pause. It never promotes anything: the final
+	// positive pass still reads the switch authoritatively, last, and an OFF there
+	// releases no buffered affirmative answer.
+	posture := cleanupInitialPosture(ctx, s.pool)
+	presumedDenied := posture == cleanupAuthorityDenied
+	// Carry the one posture on the env so the provider prefetch reads it instead of
+	// issuing a second master read.
+	env.authority = posture
 	if req.Outcome == "match" {
+		// Recovery evidence is needed either way: a denied observation still records
+		// the exact recovery it proved before declining to permit.
 		env.prefetched = s.cleanupPrefetchRecovery(ctx, cid, map[int64]string{id: req.MD5})
+		// The aborted-stage R2 lookup exists only to prepare a permit; the prefetch
+		// itself stands down on a denied posture, using the posture it was given.
 		s.cleanupPrefetchAbortedStitchAbsences(ctx, cid, []cleanupBatchObservation{{ItemID: id, cleanupObserve: req}}, env)
 	}
 	if cleanupObservationExpired(ctx) {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
 		return
 	}
+	// Two passes at most: the tentative pass does all blocking work and may
+	// buffer a permit; the authoritative master read is last, and if it is OFF
+	// that pass is rolled back whole and the request is re-run under the denied
+	// posture, which produces exactly the ordinary OFF answers (recorded
+	// would-delete, pause, reconcile) through the same code path.
+	authority := cleanupAuthorityTentative
+	if presumedDenied {
+		authority = cleanupAuthorityDenied
+	}
+	for pass := 0; pass < 2; pass++ {
+		result, ok := s.cleanupObserveRequest(ctx, w, cid, id, req, env, authority)
+		if !ok {
+			return
+		}
+		if result == nil {
+			// The authoritative read found OFF: nothing was committed. Re-run the
+			// same request once under the denied posture.
+			authority = cleanupAuthorityDenied
+			continue
+		}
+		if cleanupObservationExpired(ctx) {
+			cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
+			return
+		}
+		if result.status == 503 {
+			w.Header().Set("Retry-After", "1")
+		}
+		util.WriteJSON(w, result.status, result.body)
+		return
+	}
+	// Both passes saw OFF through a path that still produced no answer; fail
+	// closed rather than serve a tentative result.
+	util.WriteError(w, 503, "cleanup observation authority unavailable")
+}
+
+// cleanupObserveRequest runs one whole observation transaction. It returns
+// ok=false after it has already written the response, and (nil, true) when the
+// authoritative read found OFF so the caller must retry under the denied
+// posture.
+func (s *Server) cleanupObserveRequest(ctx context.Context, w http.ResponseWriter, cid, id int64, req cleanupObserve, env *cleanupObserveEnv, authority cleanupAuthority) (*cleanupObserveResult, bool) {
+	env.authority = authority
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		cleanupObservationFailure(w, ctx, 500, "cleanup observation begin failed")
-		return
+		return nil, false
 	}
 	defer tx.Rollback(ctx)
+	// All blocking work — the item/plan fences, the freeze replay, the catalog
+	// and policy checks, the budget advisory lock and the tentative item write —
+	// completes before the authoritative master read. The read is the last
+	// statement this transaction runs apart from COMMIT, and its row lock is held
+	// through that commit, so an emergency OFF waits only for a decision that has
+	// already committed to minting authority.
 	result := s.cleanupObserveOne(ctx, tx, cid, id, req, env)
 	if cleanupObservationExpired(ctx) {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
-		return
+		return nil, false
 	}
-	if result.status == 200 && result.write && tx.Commit(ctx) != nil {
-		cleanupObservationFailure(w, ctx, 500, "cleanup observation save failed")
-		return
+	if authority == cleanupAuthorityTentative && result.status == 200 && cleanupAffirmative(result.body) {
+		var on bool
+		if err = tx.QueryRow(ctx, cleanupMasterReadSQL).Scan(&on); err != nil {
+			cleanupObservationFailure(w, ctx, 503, "cleanup master control unavailable")
+			return nil, false
+		}
+		// The master read can itself have waited. Every deadline the grant
+		// depends on is rechecked against the clock now, from values already in
+		// memory: no SQL, no lock, nothing that could queue an OFF behind this.
+		if !on || !cleanupAuthorityLive(result.authorityDeadline, time.Now()) {
+			// No authority, or the grant expired while we waited: discard the
+			// tentative permit and every write with it.
+			if err = tx.Rollback(ctx); err != nil {
+				cleanupObservationFailure(w, ctx, 500, "cleanup observation save failed")
+				return nil, false
+			}
+			// The request ID was registered, so a denied retry is not a fresh
+			// submission; the retry keeps the same env and request identity.
+			return nil, true
+		}
 	}
-	if cleanupObservationExpired(ctx) {
-		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
-		return
+	// An affirmative answer — a newly issued permit or an exact replay of one —
+	// must COMMIT so its FOR SHARE row lock is held to the end of the
+	// transaction that justified it. Returning through the deferred rollback
+	// would release that lock while the client was still told "delete".
+	if result.status == 200 && (result.write || cleanupAffirmative(result.body)) {
+		if err = tx.Commit(ctx); err != nil {
+			cleanupObservationFailure(w, ctx, 500, "cleanup observation save failed")
+			return nil, false
+		}
 	}
-	if result.status == 503 {
-		w.Header().Set("Retry-After", "1")
-	}
-	util.WriteJSON(w, result.status, result.body)
+	return &result, true
 }
 
 type cleanupObserveResult struct {
@@ -1154,6 +1429,52 @@ type cleanupObserveResult struct {
 	body   map[string]any
 	// write is true when the observation changed state and must be committed.
 	write bool
+	// authorityDeadline is the earliest instant at which the affirmative answer
+	// this result carries stops being safe: the plan approval, the permit, the
+	// item lease, the client session/heartbeat and the request deadline. It is
+	// captured when the grant is tentatively made and rechecked against the clock
+	// after the final master lock, immediately before the commit that makes it
+	// real. Zero means "no affirmative answer".
+	authorityDeadline time.Time
+	// budgetCharge is the media bytes this result would issue. The caller applies
+	// it to the request's in-memory issued total only after the item's savepoint
+	// commits, so a rolled-back, reconciled or failed item never debits.
+	budgetCharge int64
+}
+
+// cleanupAuthorityLive reports whether an affirmative answer may still be made
+// real at now. It runs after the authoritative master read and before the
+// commit, so it uses only values already in memory: no SQL, no lock, nothing
+// that could queue an emergency OFF behind this decision.
+func cleanupAuthorityLive(deadline time.Time, now time.Time) bool {
+	return !deadline.IsZero() && deadline.After(now)
+}
+
+// passAuthorityLive reports whether every buffered affirmative result in one
+// pass may still be made real at now. One expired grant discards the whole pass,
+// because the pass commits as a unit.
+func passAuthorityLive(deadlines []time.Time, now time.Time) bool {
+	for _, deadline := range deadlines {
+		if !cleanupAuthorityLive(deadline, now) {
+			return false
+		}
+	}
+	return len(deadlines) > 0
+}
+
+// earliestDeadline returns the smallest non-zero instant, so one grant bound by
+// several deadlines is checked against the tightest one.
+func earliestDeadline(values ...*time.Time) time.Time {
+	var out time.Time
+	for _, v := range values {
+		if v == nil || v.IsZero() {
+			continue
+		}
+		if out.IsZero() || v.Before(out) {
+			out = *v
+		}
+	}
+	return out
 }
 
 func cleanupObserveError(status int, msg string) cleanupObserveResult {
@@ -1241,12 +1562,20 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		// unexpired and the master switch is on; otherwise the caller gets the
 		// non-deleting reconcile answer below.
 		if state == "delete_issued" && req.RequestID != "" && req.Outcome == "match" && permitUntil != nil && permitUntil.After(time.Now()) && nasSpaceAuditJSONEqual(oldOutcome, retryBody) &&
-			mode == "enabled" && until != nil && until.After(time.Now()) && s.stitchDeletionMaster(item) &&
+			mode == "enabled" && until != nil && until.After(time.Now()) &&
 			(!certified || oldRecovery == nasCleanupCertifiedStitchRecovery && cleanupCheckCertifiedStitch(ctx, tx, item, true) == nil &&
 				env.certifiedStitchAbortsAbsent(ctx, tx, item)) {
 			now := time.Now()
-			if permitUntil.After(now) && until.After(now) && sessionDeadline.After(now) {
-				return cleanupObserveResult{status: 200, body: map[string]any{"delivery_keep_checked": true, "action": "delete_issued", "delete": true, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": oldRecovery, "expires_at": permitUntil.UTC(), "plan_paused": false, "replayed": true}}
+			// Authority is the posture the caller decided at its transaction
+			// boundary; this function never reads or locks the master switch, so
+			// an affirmative replay is exactly as durable as the caller's ON.
+			if permitUntil.After(now) && until.After(now) && sessionDeadline.After(now) && stitchDeletionMaster(env.authority == cleanupAuthorityTentative, item) {
+				ctxDeadline, _ := ctx.Deadline()
+				return cleanupObserveResult{
+					status:            200,
+					body:              map[string]any{"delivery_keep_checked": true, "action": "delete_issued", "delete": true, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": oldRecovery, "expires_at": permitUntil.UTC(), "plan_paused": false, "replayed": true},
+					authorityDeadline: earliestDeadline(permitUntil, until, &sessionDeadline, &ctxDeadline, lease),
+				}
 			}
 		}
 		if state != "delete_issued" && state != "deleted" && nasSpaceAuditJSONEqual(oldOutcome, retryBody) {
@@ -1368,7 +1697,8 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 					recoveryAnomaly = true
 					policyReason = "R2 MD5/ETag match disagreed with the full SHA-256 audit"
 				}
-				if lease.After(time.Now()) && cleanupMayIssue(mode, s.stitchDeletionMaster(item), until, cleanupSameFileProof(oldProof, req.Proof), recovery) {
+				if lease.After(time.Now()) && cleanupPermitShape(mode, until, cleanupSameFileProof(oldProof, req.Proof), recovery) &&
+					stitchDeletionMaster(env.authority == cleanupAuthorityTentative, item) {
 					if certified && !env.certifiedStitchAbortsAbsent(ctx, tx, item) {
 						return cleanupObserveResult{status: 503, body: map[string]any{"error": "aborted staging absence could not be verified", "retryable": true}}
 					}
@@ -1405,6 +1735,14 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	}
 	if deletion && !lease.After(time.Now()) {
 		return cleanupObserveError(409, "cleanup lease expired")
+	}
+	// The instant this permit stops being safe. It is rechecked after the final
+	// master lock, before the commit that makes the permit real, without another
+	// SQL statement.
+	var authorityDeadline time.Time
+	if deletion {
+		ctxDeadline, _ := ctx.Deadline()
+		authorityDeadline = earliestDeadline(lease, until, &sessionDeadline, &permitDeadline, &ctxDeadline)
 	}
 	expires := time.Now().UTC().Add(30 * time.Second).Truncate(time.Microsecond)
 	observed, _ := json.Marshal(req)
@@ -1446,7 +1784,11 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	if err != nil {
 		return cleanupObserveError(500, "cleanup observation save failed")
 	}
-	return cleanupObserveResult{status: 200, write: true, body: map[string]any{"delivery_keep_checked": true, "action": action, "delete": deletion, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": recovery, "expires_at": expires, "plan_paused": paused}}
+	var budgetCharge int64
+	if deletion {
+		budgetCharge = item.SizeBytes
+	}
+	return cleanupObserveResult{status: 200, write: true, body: map[string]any{"delivery_keep_checked": true, "action": action, "delete": deletion, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": recovery, "expires_at": expires, "plan_paused": paused}, authorityDeadline: authorityDeadline, budgetCharge: budgetCharge}
 }
 
 const nasCleanupRefusalProtocol = 1

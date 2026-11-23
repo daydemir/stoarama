@@ -83,8 +83,17 @@ const cleanupAbortedStitchTargetTables = ` FROM nas_stitch_r2_stage_objects o
  LEFT JOIN nas_stitch_r2_aborted_absences a ON a.object_id=o.id`
 
 func (s *Server) cleanupPrefetchAbortedStitchAbsences(ctx context.Context, cid int64, observations []cleanupBatchObservation, env *cleanupObserveEnv) {
-	if s.r2 == nil || !s.cfg.NASCleanupDeletionEnabled || cid != 13 || env.dryRunOnly ||
+	// Prefetch is outside every transaction and holds no locks, so it must never
+	// take the master row lock ahead of an emergency OFF. It also must not read
+	// the switch again: the endpoint already took one explicit initial posture
+	// before calling this, and that single posture is what both endpoints carry
+	// through the provider prefetch. Re-reading here let the two reads disagree
+	// across a race and made the "one initial posture" claim untrue.
+	if s.r2 == nil || cid != 13 || env.dryRunOnly ||
 		env.session.version != nasCleanupCertifiedStitchVersion || len(observations) == 0 {
+		return
+	}
+	if env.authority == cleanupAuthorityDenied {
 		return
 	}
 	requested, err := json.Marshal(observations)

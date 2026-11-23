@@ -101,8 +101,27 @@ func cleanupObservationFailure(w http.ResponseWriter, ctx context.Context, statu
 	cleanupBatchError(w, status, msg)
 }
 
-// cleanupObserveEnv carries per-transaction caches for a batch of
-// observations. The zero value (single-item endpoint) caches nothing.
+// cleanupAuthority is the master-switch posture a single observation runs under.
+// The value is decided once, outside cleanupObserveOne, by the caller that holds
+// the authoritative `FOR SHARE` read: an observation never reads the switch
+// itself, so it can neither cache an answer across a savepoint rollback nor take
+// that row lock before its own fences.
+type cleanupAuthority int
+
+const (
+	// cleanupAuthorityTentative permits a deletion decision. The caller runs the
+	// whole observation inside a savepoint and only commits it after the real
+	// `SELECT enabled ... FOR SHARE` returns ON, so a permit written under this
+	// posture is never durable unless authority was actually valid.
+	cleanupAuthorityTentative cleanupAuthority = iota
+	// cleanupAuthorityDenied forbids deletion authority and yields exactly the
+	// ordinary "master switch is off" outcome: a recorded would-delete that
+	// pauses an enabled plan, and a reconcile answer for an affirmative replay.
+	cleanupAuthorityDenied
+)
+
+// cleanupObserveEnv carries per-request state for a batch of observations, for
+// the single-item and batched endpoints.
 type cleanupObserveEnv struct {
 	executionGroup []int64
 	scopeLocked    bool
@@ -110,12 +129,17 @@ type cleanupObserveEnv struct {
 	// Refuse an enable racing the initial mode lookup under the dry-run context.
 	dryRunOnly    bool
 	freshRequests map[int64]bool
-	// budgetHeld is set only when the budget advisory lock was taken in the
-	// top-level transaction (never in a savepoint, whose rollback could release
-	// it); issued then stays exact until commit because no other transaction
-	// can issue a permit meanwhile.
+	// authority is the posture the caller decided for this whole request. It is
+	// never consulted to *acquire* the master row lock: the caller takes that
+	// once, last, on its own transaction.
+	authority cleanupAuthority
+	// budgetHeld means the running-deletion-budget advisory lock is taken in the
+	// caller's top-level transaction, outside every per-item savepoint, so a
+	// per-item rollback can neither release it nor leave issued stale.
 	budgetHeld bool
 	issued     int64
+	// prefetched is R2 work computed before the transaction; it is used only for
+	// the exact (mode, object, evidence) it was computed for.
 	prefetched map[int64]cleanupPrefetchedRecovery
 	// Only exact aborted stages verified by R2 in this observation request.
 	abortedStitchAbsences map[cleanupAbortedStitchTarget]bool
@@ -271,6 +295,11 @@ UPDATE nas_cleanup_batches SET mode='paused',approved_until=NULL,approval_reason
 	}
 }
 
+// budgetAllows reports whether one more permit of size bytes stays within the
+// rolling cap. It never mutates the request's issued total: the caller applies
+// the charge (cleanupObserveResult.budgetCharge) only once the item's savepoint
+// commits, so a rolled-back, reconciled or failed item cannot skew a later
+// decision in the same pass.
 func (e *cleanupObserveEnv) budgetAllows(ctx context.Context, tx pgx.Tx, size int64) (bool, error) {
 	if e == nil || !e.budgetHeld {
 		return cleanupBudgetAllows(ctx, tx, size)
@@ -278,7 +307,6 @@ func (e *cleanupObserveEnv) budgetAllows(ctx context.Context, tx pgx.Tx, size in
 	if size <= 0 || e.issued+size > nasCleanupMaxIssuedBytes24h {
 		return false, nil
 	}
-	e.issued += size
 	return true, nil
 }
 
@@ -835,7 +863,8 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		return
 	}
 	s.cleanupHousekeeping(ctx, cid)
-	results := make([]map[string]any, len(req.Observations))
+	var results []map[string]any
+	resultsInvalid := make(map[int]map[string]any, len(req.Observations))
 	valid := make([]bool, len(req.Observations))
 	ids := []int64{}
 	md5s := map[int64]string{}
@@ -845,7 +874,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 			continue
 		}
 		if msg := cleanupObserveRequestError(o.cleanupObserve); msg != "" {
-			results[n] = map[string]any{"item_id": o.ItemID, "status": 400, "error": msg}
+			resultsInvalid[n] = map[string]any{"item_id": o.ItemID, "status": 400, "error": msg}
 			continue
 		}
 		valid[n] = true
@@ -855,18 +884,20 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 			matches = append(matches, o)
 		}
 	}
-	env := &cleanupObserveEnv{session: cleanupAdmissionSession(r, req.ClientVersion), dryRunOnly: dryRunOnly, freshRequests: freshRequests, prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
+	// The same single explicit initial posture the single-item path uses: one
+	// unlocked read, taken before any evidence prefetch, so the two paths cannot
+	// disagree or read the switch twice. When it is denied the batch still records
+	// the ordinary non-deleting observations and pause, but skips the
+	// issuance-only aborted-stage preflight instead of guessing evidence.
+	posture := cleanupInitialPosture(ctx, s.pool)
+	// The posture is carried on the env, so the provider prefetch reads it rather
+	// than issuing a second master read of its own.
+	env := &cleanupObserveEnv{session: cleanupAdmissionSession(r, req.ClientVersion), dryRunOnly: dryRunOnly, freshRequests: freshRequests, authority: posture, prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
 	s.cleanupPrefetchAbortedStitchAbsences(ctx, cid, matches, env)
 	if cleanupObservationExpired(ctx) {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
 		return
 	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		cleanupObservationFailure(w, ctx, 500, "cleanup observation begin failed")
-		return
-	}
-	defer tx.Rollback(ctx)
 	itemIDs := make([]int64, 0, len(req.Observations))
 	for n, o := range req.Observations {
 		if valid[n] {
@@ -901,19 +932,48 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		cleanupObservationFailure(w, ctx, 409, "serial group client required for lease roster")
 		return
 	}
-	if err = cleanupLockItems(ctx, tx, cid, groupIDs); err != nil {
-		cleanupObservationFailure(w, ctx, 503, "cleanup observation fence unavailable")
-		return
-	}
 	if req.ExecutionBatch {
-		// Exempt only the complete group issued by ONE lease request, with the
-		// live reviewed session. Unrelated/uncertain work always blocks it.
 		if env.session.version != req.ClientVersion || (!serial && !bulk && req.ClientVersion != nasCleanupGroupClientVersion) || len(itemIDs) != len(req.Observations) || len(groupIDs) > nasCleanupExecutionGroupMax {
 			cleanupObservationFailure(w, ctx, 409, "invalid cleanup execution group")
 			return
 		}
-		var complete bool
-		err = tx.QueryRow(ctx, `SELECT count(*)=$3 AND count(DISTINCT i.plan_id)=1 AND count(DISTINCT i.lease_request_id)=1
+	}
+
+	// runPass executes the whole batch in one transaction under one authority
+	// posture. All blocking work — scope locks, the budget advisory lock taken in
+	// this outer transaction, every per-item savepoint and its tentative item
+	// write — happens first. Only then, if the pass could mint authority, the
+	// master is read authoritatively as the last statement; the pass reports
+	// `authorized=false` when it read OFF so the caller discards everything and
+	// re-runs under the denied posture.
+	runPass := func(authority cleanupAuthority) (out []map[string]any, authorized bool, ok bool) {
+		env.authority = authority
+		// Budget accounting belongs to successful issuance only: start each pass
+		// from the caller's baseline, then keep the increments only if this pass
+		// commits.
+		env.budgetHeld = false
+		env.scopeLocked = false
+		env.executionGroup = nil
+		tx, err := s.pool.Begin(ctx)
+		if err != nil {
+			cleanupObservationFailure(w, ctx, 500, "cleanup observation begin failed")
+			return nil, false, false
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				tx.Rollback(ctx)
+			}
+		}()
+		if err = cleanupLockItems(ctx, tx, cid, groupIDs); err != nil {
+			cleanupObservationFailure(w, ctx, 503, "cleanup observation fence unavailable")
+			return nil, false, false
+		}
+		if req.ExecutionBatch {
+			// Exempt only the complete group issued by ONE lease request, with the
+			// live reviewed session. Unrelated/uncertain work always blocks it.
+			var complete bool
+			err = tx.QueryRow(ctx, `SELECT count(*)=$3 AND count(DISTINCT i.plan_id)=1 AND count(DISTINCT i.lease_request_id)=1
           AND bool_and(i.lease_request_id IS NOT NULL AND i.lease_client_boot_id=$4 AND i.lease_client_version=$5
             AND (i.state='leased' OR ($6 AND i.state='delete_issued')) AND p.mode='enabled')
           AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items member WHERE ($6 OR $8)
@@ -922,64 +982,139 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
             AND NOT (member.id=ANY($1)))
           AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id IN (SELECT plan_id FROM nas_cleanup_items WHERE id=ANY($1)) AND busy.state IN ('leased','delete_issued') AND NOT (busy.id=ANY($1)))
           FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2`, groupIDs, cid, len(groupIDs), env.session.boot, env.session.version, serial, itemIDs[0], bulk).Scan(&complete)
-		if err != nil || !complete {
-			cleanupObservationFailure(w, ctx, 409, "cleanup execution group differs or is incomplete")
-			return
+			if err != nil || !complete {
+				cleanupObservationFailure(w, ctx, 409, "cleanup execution group differs or is incomplete")
+				return nil, false, false
+			}
+			env.executionGroup = groupIDs
 		}
-		env.executionGroup = groupIDs
-	}
-	env.scopeLocked = true
-	var anyEnabled bool
-	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2 AND p.mode='enabled')`, ids, cid).Scan(&anyEnabled); err != nil {
-		cleanupObservationFailure(w, ctx, 500, "cleanup observation begin failed")
-		return
-	}
-	if anyEnabled && dryRunOnly {
-		w.Header().Set("Retry-After", "1")
-		util.WriteJSON(w, 503, map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true})
-		return
-	}
-	if anyEnabled && s.cfg.NASCleanupDeletionEnabled {
-		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupBudgetLock); err == nil {
-			err = tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&env.issued)
+		env.scopeLocked = true
+		var anyEnabled bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2 AND p.mode='enabled')`, ids, cid).Scan(&anyEnabled); err != nil {
+			cleanupObservationFailure(w, ctx, 500, "cleanup observation begin failed")
+			return nil, false, false
 		}
-		if err != nil {
-			cleanupObservationFailure(w, ctx, 500, "cleanup deletion budget unavailable")
-			return
+		if anyEnabled && dryRunOnly {
+			w.Header().Set("Retry-After", "1")
+			util.WriteJSON(w, 503, map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true})
+			return nil, false, false
 		}
-		env.budgetHeld = true
-	}
-	for n, o := range req.Observations {
-		if !valid[n] {
-			continue
+		// A batch with no enabled item never mints authority, so it never locks
+		// the control and can never delay an OFF. On the execution path the budget
+		// advisory lock is a blocking fence: it is taken explicitly here, in the
+		// outer transaction and before every per-item savepoint, so no per-item
+		// rollback can release it or leave the issued total stale.
+		if anyEnabled && !dryRunOnly {
+			if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupBudgetLock); err != nil {
+				cleanupObservationFailure(w, ctx, 500, "cleanup deletion budget unavailable")
+				return nil, false, false
+			}
+			if err = tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&env.issued); err != nil {
+				cleanupObservationFailure(w, ctx, 500, "cleanup deletion budget unavailable")
+				return nil, false, false
+			}
+			env.budgetHeld = true
 		}
-		sp, err := tx.Begin(ctx)
-		if err != nil {
+		out = make([]map[string]any, len(req.Observations))
+		for n := range req.Observations {
+			if !valid[n] {
+				// A rejected entry keeps its 400 in every pass.
+				out[n] = resultsInvalid[n]
+			}
+		}
+		affirmative := false
+		var deadlines []time.Time
+		for n, o := range req.Observations {
+			if !valid[n] {
+				continue
+			}
+			sp, err := tx.Begin(ctx)
+			if err != nil {
+				cleanupObservationFailure(w, ctx, 500, "cleanup observation save failed")
+				return nil, false, false
+			}
+			result := s.cleanupObserveOne(ctx, sp, cid, o.ItemID, o.cleanupObserve, env)
+			committedItem := result.status == 200 && result.write
+			if committedItem {
+				err = sp.Commit(ctx)
+			} else {
+				err = sp.Rollback(ctx)
+			}
+			if err != nil {
+				cleanupObservationFailure(w, ctx, 500, "cleanup observation save failed")
+				return nil, false, false
+			}
+			// Debit the in-memory issued total only for a permit this item really
+			// committed. A rolled-back, reconciled or failed item charged nothing.
+			if committedItem && result.budgetCharge > 0 {
+				env.issued += result.budgetCharge
+			}
+			body := map[string]any{"item_id": o.ItemID, "status": result.status}
+			for k, v := range result.body {
+				body[k] = v
+			}
+			out[n] = body
+			if cleanupAffirmative(body) {
+				affirmative = true
+				deadlines = append(deadlines, result.authorityDeadline)
+			}
+		}
+		if cleanupObservationExpired(ctx) {
+			cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
+			return nil, false, false
+		}
+		if authority == cleanupAuthorityTentative && !dryRunOnly && affirmative {
+			// Authoritative read, last: every fence, freeze replay, observation and
+			// tentative item write above is already done, and its row lock is held
+			// through the commit below.
+			var on bool
+			if err = tx.QueryRow(ctx, cleanupMasterReadSQL).Scan(&on); err != nil {
+				cleanupObservationFailure(w, ctx, 503, "cleanup master control unavailable")
+				return nil, false, false
+			}
+			// The read can itself have waited, so every deadline the buffered
+			// grant depends on is rechecked against the clock from memory: no SQL,
+			// no lock. An expired grant is treated exactly like an OFF one.
+			if !on || !passAuthorityLive(deadlines, time.Now()) {
+				// No authority: discard every tentative permit, and with it the
+				// whole pass. The caller re-runs under the denied posture.
+				return nil, false, true
+			}
+		}
+		if err = tx.Commit(ctx); err != nil {
 			cleanupObservationFailure(w, ctx, 500, "cleanup observation save failed")
+			return nil, false, false
+		}
+		committed = true
+		return out, true, true
+	}
+
+	// Start from the explicit initial posture. A pass may only ever descend from
+	// it: a tentative pass that reads OFF re-runs as denied, and a request that
+	// started denied never becomes tentative.
+	authority := posture
+	for pass := 0; pass < 2; pass++ {
+		out, authorized, ok := runPass(authority)
+		if !ok {
 			return
 		}
-		result := s.cleanupObserveOne(ctx, sp, cid, o.ItemID, o.cleanupObserve, env)
-		if result.status == 200 && result.write {
-			err = sp.Commit(ctx)
-		} else {
-			err = sp.Rollback(ctx)
+		if authorized {
+			results = out
+			break
 		}
-		if err != nil {
-			cleanupObservationFailure(w, ctx, 500, "cleanup observation save failed")
-			return
-		}
-		body := map[string]any{"item_id": o.ItemID, "status": result.status}
-		for k, v := range result.body {
-			body[k] = v
-		}
-		results[n] = body
+		// The authoritative read found OFF. Nothing was committed, so no
+		// affirmative answer escaped; re-run the same request once under the
+		// denied posture, which produces exactly the ordinary OFF behaviour.
+		// Budget increments belonged to the discarded pass.
+		authority = cleanupAuthorityDenied
+		env.budgetHeld = false
+		env.issued = 0
+		results = nil
 	}
-	if cleanupObservationExpired(ctx) {
-		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
-		return
-	}
-	if err = tx.Commit(ctx); err != nil {
-		cleanupObservationFailure(w, ctx, 500, "cleanup observation save failed")
+	if results == nil {
+		// No answer survived either posture: fail closed rather than serve a
+		// tentative result.
+		util.WriteError(w, 503, "cleanup observation authority unavailable")
 		return
 	}
 	if cleanupObservationExpired(ctx) {
@@ -1228,7 +1363,7 @@ func (s *Server) cleanupAdvanceBatchAfter(ctx context.Context, planID int64) {
 		return
 	}
 	if err := s.cleanupAdvanceBatch(ctx); err != nil {
-		log.Printf("nas cleanup batch advance deferred: %v", err)
+		s.cleanupHandleAdvanceError(ctx, err)
 	}
 }
 
@@ -1243,8 +1378,170 @@ func (s *Server) cleanupAdvanceBatchIfIdle(ctx context.Context) {
 		return
 	}
 	if err := s.cleanupAdvanceBatch(ctx); err != nil {
-		log.Printf("nas cleanup batch advance deferred: %v", err)
+		s.cleanupHandleAdvanceError(ctx, err)
 	}
+}
+
+// cleanupHandleAdvanceError is the separate negative path an advance takes when it
+// could not complete its authoritative decision. Only a truly unavailable control
+// is handled here, by recording the ordinary durable pause in its own fenced
+// transaction. Every other error — a lock failure, a write failure, a failed
+// commit — is a real fault and is surfaced, never suppressed.
+func (s *Server) cleanupHandleAdvanceError(ctx context.Context, err error) {
+	var unavailable *cleanupMasterUnavailable
+	if !errors.As(err, &unavailable) {
+		log.Printf("nas cleanup batch advance deferred: %v", err)
+		return
+	}
+	if pauseErr := s.cleanupPauseBatchUnavailable(ctx, "master switch is off"); pauseErr != nil {
+		log.Printf("nas cleanup batch pause after an unavailable master failed: %v", pauseErr)
+	}
+}
+
+// cleanupMasterUnavailable marks a decision that could not be taken because the
+// control itself was missing or unreadable. It is deliberately distinct from an
+// OFF, from a lock error and from a write/commit failure.
+type cleanupMasterUnavailable struct{ err error }
+
+func (e *cleanupMasterUnavailable) Error() string {
+	return "cleanup master control unavailable: " + e.err.Error()
+}
+func (e *cleanupMasterUnavailable) Unwrap() error { return e.err }
+
+// cleanupPauseBatchUnavailable records the durable pause when the control cannot
+// be read at all, so a rolled-back advance still leaves the batch paused. It
+// reuses the ordinary plan-then-batch fence and roster checks, and deliberately
+// does not revalidate the switch it already knows it cannot read.
+func (s *Server) cleanupPauseBatchUnavailable(ctx context.Context, why string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, nasCleanupPublicFence); err != nil {
+		return err
+	}
+	var batchID int64
+	var ids []int64
+	if err = tx.QueryRow(ctx, `SELECT id,plan_ids FROM nas_cleanup_batches WHERE mode='enabled' AND account_id=47 AND connection_id=13 FOR UPDATE`).Scan(&batchID, &ids); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if err = cleanupLockPlans(ctx, tx, ids); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,
+ approval_reason=left('batch-completed: batch '||$2::text||' plan finished cleanly',500)
+ WHERE id=ANY($1) AND mode='enabled'
+  AND EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=nas_cleanup_plans.id)
+  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=nas_cleanup_plans.id AND i.state NOT IN ('deleted','keep'))`, ids, strconv.FormatInt(batchID, 10)); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, cleanupBatchAutoPauseSQL, batchID, why); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// cleanupPauseBatchAfterOff records, in its own transaction, the non-authority
+// transitions the OFF advance had to discard with its rollback: closing the
+// completed plans of the exact batch that was advancing, then pausing that same
+// batch.
+//
+// It reuses the ordinary control-path fences rather than inventing a shortcut:
+//
+//   - cleanupLockPlans takes the shared public fence plus the ascending plan and
+//     batch rows, exactly as plan control and advance do, so it serializes with a
+//     successor enable/advance and never queues an emergency OFF, which takes no
+//     fence;
+//   - the batch row is re-read under that lock, and the helper acts only while it
+//     is still enabled with the exact plan roster the advance started from, so a
+//     newer batch is never touched;
+//   - both writes (plan close, batch pause) are blocking work done *before* the
+//     final OFF revalidation, which is then a locked read and the last statement
+//     before commit. An ON committed while those writes ran is therefore seen and
+//     the whole transaction rolls back, so an operator restart is never undone.
+//
+// Errors are returned, not swallowed, so a database failure cannot silently leave
+// a rolled-back OFF half applied.
+func (s *Server) cleanupPauseBatchAfterOff(ctx context.Context, batchID int64, planIDs []int64, why string) error {
+	if batchID <= 0 || len(planIDs) == 0 {
+		return nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	// The same fence order as plan control and advance: public fence, then the
+	// plan rows this batch owns, then the batch row itself.
+	if err = cleanupLockPlans(ctx, tx, planIDs); err != nil {
+		return err
+	}
+	var current []int64
+	var mode string
+	if err = tx.QueryRow(ctx, `SELECT plan_ids,mode FROM nas_cleanup_batches WHERE id=$1 AND account_id=47 AND connection_id=13 FOR UPDATE`, batchID).Scan(&current, &mode); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil // the batch is gone: nothing of ours to finish
+		}
+		return err
+	}
+	if mode != "enabled" || !cleanupSamePlanRoster(current, planIDs) {
+		// A successor replaced or paused it, or its identity changed. Never act on
+		// a batch this advance did not start from.
+		return nil
+	}
+	// Blocking writes first, so the locked master revalidation below is genuinely
+	// the last statement before commit.
+	if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,
+ approval_reason=left('batch-completed: batch '||$2::text||' plan finished cleanly',500)
+ WHERE id=ANY($1) AND mode='enabled'
+  AND EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=nas_cleanup_plans.id)
+  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=nas_cleanup_plans.id AND i.state NOT IN ('deleted','keep'))`, current, strconv.FormatInt(batchID, 10)); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, cleanupBatchAutoPauseSQL, batchID, why); err != nil {
+		return err
+	}
+	// Final decision, locked and last. It stands down only on a readable, enabled
+	// switch, because pausing then would undo a deliberate restart. An OFF keeps
+	// the ordinary pause this helper exists to record, and so does an unreadable
+	// control: that is the same fail-closed "not authorised" reading the advance
+	// itself uses, and dropping the bookkeeping would leave a rolled-back OFF half
+	// applied. The read error itself is surfaced so callers see the anomaly.
+	// One direct locked read, last, with only COMMIT/ROLLBACK after it. A readable
+	// ON discards the writes above (a deliberate restart). A read error is not an
+	// OFF either: it means this revalidation could not be completed, so the writes
+	// are discarded and the caller decides what durable state is still required.
+	on, readErr := cleanupMasterRequired(ctx, tx)
+	if readErr != nil {
+		if rbErr := tx.Rollback(ctx); rbErr != nil {
+			return rbErr
+		}
+		return &cleanupMasterUnavailable{err: readErr}
+	}
+	if on {
+		return nil // rollback discards the writes
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// cleanupSamePlanRoster reports whether two ordered plan rosters are identical.
+func cleanupSamePlanRoster(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 const cleanupBatchAutoPauseSQL = `UPDATE nas_cleanup_batches SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$2::text,500) WHERE id=$1 AND mode='enabled'`
@@ -1344,9 +1641,6 @@ func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
 		}
 		return tx.Commit(ctx)
 	}
-	if !s.cfg.NASCleanupDeletionEnabled {
-		return pause("master switch is off")
-	}
 	if until == nil || !until.After(time.Now().Add(time.Minute)) {
 		return pause("approval expired")
 	}
@@ -1354,15 +1648,50 @@ func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
 		why, _ := body["error"].(string)
 		return pause("plan " + strconv.FormatInt(current, 10) + " not enableable: " + why)
 	}
+	// The master is read FOR SHARE only after the activation below: activation
+	// checks out its own pool connections, and holding the master lock across
+	// that would let an emergency OFF wait on pool capacity.
 	releaseFreeze, err = s.cleanupActivateRankings(ctx, tx, current)
 	if err != nil {
 		return pause("source freeze/replay failed: " + err.Error())
 	}
+	// Fence the new plan's item rows before the master read: the pending reset
+	// below must not be the statement that waits on an unprelocked row while
+	// this transaction holds the master row lock.
+	if err = cleanupLockPlanItems(ctx, tx, current); err != nil {
+		return pause("item fence failed: " + err.Error())
+	}
+	// Write the advance before the master read so that read is the last statement
+	// this transaction runs apart from COMMIT. If the switch is OFF the caller
+	// rolls the whole advance back, so no plan is enabled and no item reset
+	// commits.
 	if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='enabled',allow_nas_only=false,approved_until=$2,approval_reason=left('batch '||$3::text||': '||$4::text,500) WHERE id=$1`, current, *until, strconv.FormatInt(batchID, 10), reason); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='pending',lease_expires_at=NULL WHERE plan_id=$1`, current); err != nil {
 		return err
+	}
+	// One direct locked read, and nothing but COMMIT/ROLLBACK after it. A read
+	// error is NOT the same thing as an OFF: it means the decision could not be
+	// taken, so the caller must not treat the advance as handled by a pause whose
+	// own revalidation would fail the same way. That negative case is returned as
+	// a distinguishable error for the caller to record durably.
+	on, readErr := cleanupMasterRequired(ctx, tx)
+	if readErr != nil {
+		if rbErr := tx.Rollback(ctx); rbErr != nil {
+			return rbErr
+		}
+		return &cleanupMasterUnavailable{err: readErr}
+	}
+	if !on {
+		// The read just taken is the last statement this transaction runs: the
+		// advance it was guarding is rolled back whole. Recording the pause needs
+		// its own statement, so it runs in a separate transaction afterwards,
+		// where it cannot sit between this decision and an emergency OFF's lock.
+		if err = tx.Rollback(ctx); err != nil {
+			return err
+		}
+		return s.cleanupPauseBatchAfterOff(ctx, batchID, ids, "master switch is off")
 	}
 	return tx.Commit(ctx)
 }
@@ -1380,7 +1709,7 @@ func (s *Server) handleAdminNASCleanupBatchEnable(w http.ResponseWriter, r *http
 		ApprovalHours     int     `json:"approval_hours"`
 		AllowLongApproval bool    `json:"allow_long_approval,omitempty"`
 	}
-	if util.DecodeJSON(r, &req) != nil || len(req.BatchSHA) != 64 || !lowerHex(req.BatchSHA) || len(req.Reason) < 1 || len(req.Reason) > 500 || len(req.PlanIDs) < 1 || len(req.PlanIDs) > nasCleanupMaxBatchPlans {
+	if util.DecodeJSON(r, &req) != nil || len(req.BatchSHA) != 64 || !lowerHex(req.BatchSHA) || strings.TrimSpace(req.Reason) == "" || len(req.Reason) > 500 || len(req.PlanIDs) < 1 || len(req.PlanIDs) > nasCleanupMaxBatchPlans {
 		util.WriteError(w, 400, "1 to 500 plan ids, the exact batch digest and a reason required")
 		return
 	}
@@ -1397,10 +1726,6 @@ func (s *Server) handleAdminNASCleanupBatchEnable(w http.ResponseWriter, r *http
 		}
 		seen[id] = true
 	}
-	if !s.cfg.NASCleanupDeletionEnabled {
-		util.WriteError(w, 409, "NAS deletion master switch is off")
-		return
-	}
 	ctx := r.Context()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1408,6 +1733,12 @@ func (s *Server) handleAdminNASCleanupBatchEnable(w http.ResponseWriter, r *http
 		return
 	}
 	defer tx.Rollback(ctx)
+	// Cheap advisory look before the expensive fences: a master that is already
+	// OFF refuses here. This read takes no row lock, so it cannot delay OFF.
+	if !cleanupMasterMaybeOn(ctx, tx) {
+		util.WriteError(w, 409, "NAS deletion master switch is off")
+		return
+	}
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
 		util.WriteError(w, 500, "public cleanup fence failed")
 		return
@@ -1447,9 +1778,22 @@ func (s *Server) handleAdminNASCleanupBatchEnable(w http.ResponseWriter, r *http
 		util.WriteJSON(w, 409, map[string]any{"error": "batch identity differs", "batch_sha256": digest})
 		return
 	}
+	// Insert the batch before the master read, so that read is the last
+	// statement apart from COMMIT and OFF never waits on a write this
+	// transaction still has to do. OFF rolls the insertion back whole.
 	var id int64
 	if err = tx.QueryRow(ctx, `INSERT INTO nas_cleanup_batches(account_id,connection_id,batch_sha256,report_sha256,plan_ids,plan_sha256s,mode,approval_reason,approved_until) VALUES(47,13,$1,$2,$3,$4,'enabled',$5,now()+$6::bigint*interval '1 second') RETURNING id`, req.BatchSHA, cleanupPolicySHA, req.PlanIDs, shas, req.Reason, int64(approval/time.Second)).Scan(&id); err != nil {
 		util.WriteError(w, 500, "cleanup batch save failed")
+		return
+	}
+	// Authoritative read, last: every fence and gate above is already done.
+	on, err := cleanupMasterRequired(ctx, tx)
+	if err != nil {
+		util.WriteError(w, 503, "cleanup master control unavailable")
+		return
+	}
+	if !on {
+		util.WriteError(w, 409, "NAS deletion master switch is off")
 		return
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -1458,8 +1802,12 @@ func (s *Server) handleAdminNASCleanupBatchEnable(w http.ResponseWriter, r *http
 	}
 	// Enabling the first plan is the ordinary advance step (fresh gates).
 	if err = s.cleanupAdvanceBatch(ctx); err != nil {
-		util.WriteJSON(w, 500, map[string]any{"error": "cleanup batch first plan enable failed; the batch stays enabled and advance is retried on the next lease", "detail": err.Error()})
-		return
+		var unavailable *cleanupMasterUnavailable
+		if !errors.As(err, &unavailable) {
+			util.WriteJSON(w, 500, map[string]any{"error": "cleanup batch first plan enable failed; the batch stays enabled and advance is retried on the next lease", "detail": err.Error()})
+			return
+		}
+		s.cleanupHandleAdvanceError(ctx, err)
 	}
 	var mode, why string
 	if err = s.pool.QueryRow(ctx, `SELECT mode,approval_reason FROM nas_cleanup_batches WHERE id=$1`, id).Scan(&mode, &why); err != nil || mode != "enabled" {
@@ -1481,7 +1829,7 @@ func (s *Server) handleAdminNASCleanupBatchControl(w http.ResponseWriter, r *htt
 		Mode     string `json:"mode"`
 		Reason   string `json:"reason"`
 	}
-	if util.DecodeJSON(r, &req) != nil || len(req.BatchSHA) != 64 || req.Mode != "paused" || len(req.Reason) < 1 || len(req.Reason) > 500 {
+	if util.DecodeJSON(r, &req) != nil || len(req.BatchSHA) != 64 || req.Mode != "paused" || strings.TrimSpace(req.Reason) == "" || len(req.Reason) > 500 {
 		util.WriteError(w, 400, "exact batch digest, mode paused and reason required")
 		return
 	}
@@ -1529,5 +1877,10 @@ func (s *Server) handleAdminNASCleanupBatchStatus(w http.ResponseWriter, r *http
 		util.WriteError(w, 404, "cleanup batch unavailable")
 		return
 	}
-	util.WriteJSON(w, 200, map[string]any{"id": id, "batch_sha256": sha, "mode": mode, "approval_reason": reason, "approved_until": until, "master_deletion_enabled": s.cfg.NASCleanupDeletionEnabled, "plans": json.RawMessage(plans)})
+	master, err := cleanupMasterEnabled(r.Context(), s.pool)
+	if err != nil {
+		util.WriteError(w, 500, "cleanup master control unavailable")
+		return
+	}
+	util.WriteJSON(w, 200, map[string]any{"id": id, "batch_sha256": sha, "mode": mode, "approval_reason": reason, "approved_until": until, "master_deletion_enabled": master, "plans": json.RawMessage(plans)})
 }

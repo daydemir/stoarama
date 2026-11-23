@@ -57,7 +57,7 @@ func TestNASCleanupReceiptLockOrder(t *testing.T) {
 				refusal := cleanupReceipt{Attempt: 1, PlanSHA: sha, ProofSHA: proof, Outcome: "unverified", UnlinkAttempted: new(bool), RefusalProtocol: 1, RefusalReason: "local_guard"}
 				raw, _ := json.Marshal(refusal)
 				f.dryRun()
-				f.s.cfg.NASCleanupDeletionEnabled = true
+				setCleanupMaster(t, f.s, true)
 				if code, body := f.enableBatch([]int64{pid}, []string{sha}, 2); code != 200 {
 					t.Fatalf("enable: %d %s", code, body)
 				}

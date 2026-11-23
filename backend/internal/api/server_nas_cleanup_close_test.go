@@ -60,7 +60,7 @@ func TestNASCleanupCloseRetainsRecoveryAndReplansOnlyNeverIssued(t *testing.T) {
 		}
 	}
 	// Master ON proves terminality is the gate, rather than configuration.
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	for _, mode := range []string{"enabled", "dry_run", "paused"} {
 		w := cleanupCall(t, f.s.handleAdminNASCleanupControl, 47, 5, "id", fmt.Sprint(id), map[string]any{"plan_sha256": sha, "reason": "must refuse", "mode": mode})
 		if w.Code != 409 {

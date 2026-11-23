@@ -917,21 +917,9 @@ func TestValidateNASUploadProbeBounds(t *testing.T) {
 	}
 }
 
-func TestNASCleanupDeletionDefaultsOff(t *testing.T) {
-	t.Setenv("NAS_CLEANUP_DELETION_ENABLED", "")
-	cfg, err := Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.NASCleanupDeletionEnabled {
-		t.Fatal("NAS cleanup deletion must ship disabled")
-	}
-}
-
 func TestNASStitchDefaultsOffAndIndependent(t *testing.T) {
 	t.Setenv("NAS_STITCH_ENABLED", "")
 	t.Setenv("NAS_STITCH_DELETION_ENABLED", "")
-	t.Setenv("NAS_CLEANUP_DELETION_ENABLED", "true")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -943,7 +931,6 @@ func TestNASStitchDefaultsOffAndIndependent(t *testing.T) {
 
 func TestNASR2CopyDefaultsOffAndIndependent(t *testing.T) {
 	t.Setenv("NAS_R2_COPY_ENABLED", "")
-	t.Setenv("NAS_CLEANUP_DELETION_ENABLED", "true")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -955,5 +942,52 @@ func TestNASR2CopyDefaultsOffAndIndependent(t *testing.T) {
 	cfg, err = Load()
 	if err != nil || !cfg.NASR2CopyEnabled {
 		t.Fatal("copy switch not independently configurable")
+	}
+}
+
+// The cleanup controller credential must be a real distinct secret: too short
+// or aliasing any other credential fails startup rather than silently leaving
+// the master switch reachable with a runner token.
+func TestNASCleanupControllerCredentialIsDistinct(t *testing.T) {
+	const controller = "nas-cleanup-controller-credential-32-byte"
+	if err := (Config{NASCleanupControllerToken: controller}).ValidateJoined(); err != nil {
+		t.Fatalf("distinct controller credential rejected: %v", err)
+	}
+	const service = "runner-service-credential-32-bytes-long"
+	for _, cfg := range []Config{
+		{NASCleanupControllerToken: service, ServiceToken: service},
+		{NASCleanupControllerToken: service, APIToken: service},
+		{NASCleanupControllerToken: controller[:31]},
+		{NASCleanupControllerToken: "joined-operator-credential-32-bytes-long", JoinedOperatorToken: "joined-operator-credential-32-bytes-long"},
+	} {
+		if err := cfg.ValidateJoined(); err == nil {
+			t.Fatalf("unsafe controller credential accepted: %+v", cfg)
+		}
+	}
+}
+
+// The bootstrap-token digest allowlist must also reject the cleanup controller
+// credential: a hashed runner credential that aliases the only route to
+// deletion authority would let the runner reach the master switch.
+func TestJoinedWorkerBootstrapHashesRejectCleanupControllerCredential(t *testing.T) {
+	const bootstrap = "joined-bootstrap-credential-32-bytes"
+	const signing = "joined-signing-credential-32-bytes-ok"
+	const controller = "nas-cleanup-controller-credential-32-byte"
+	digest := sha256.Sum256([]byte(controller))
+	cfg := Config{
+		JoinedWorkerBootstrapToken:  bootstrap,
+		JoinedWorkerBootstrapHashes: hex.EncodeToString(digest[:]),
+		JoinedWorkerSigningKey:      signing,
+		NASCleanupControllerToken:   controller,
+	}
+	if err := cfg.ValidateJoined(); err == nil {
+		t.Fatal("controller credential accepted as a hashed bootstrap token")
+	}
+	// The same digest for an unrelated credential stays valid: the rule is
+	// aliasing, not a blanket ban on the allowlist.
+	other := sha256.Sum256([]byte("some-unrelated-runner-credential-32b"))
+	cfg.JoinedWorkerBootstrapHashes = hex.EncodeToString(other[:])
+	if err := cfg.ValidateJoined(); err != nil {
+		t.Fatalf("unrelated hashed bootstrap token rejected: %v", err)
 	}
 }

@@ -187,7 +187,7 @@ func TestDeliveryKeepOldDryRunClassifiesHeldMemberAndReplays(t *testing.T) {
 	if err := f.pool.QueryRow(f.ctx, `SELECT state='keep' AND NOT delete_ever_issued AND policy_reason LIKE 'DELIVERY KEEP HOLD:%' FROM nas_cleanup_items WHERE id=$1`, ids[1]).Scan(&held); err != nil || !held {
 		t.Fatal("hold classification lost", held, err)
 	}
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	var sha string
 	if err := f.pool.QueryRow(f.ctx, `SELECT plan_sha256 FROM nas_cleanup_plans WHERE id=$1`, pid).Scan(&sha); err != nil {
 		t.Fatal(err)
@@ -218,7 +218,7 @@ func TestDeliveryKeepIssuedObservationReconcilesWithoutChangingEvidence(t *testi
 	f := newCleanupFixture(t, 24)
 	pid, sha, _ := f.admit("issued-before-hold", syntheticFiles(901, 1, 10))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := safeguardControl(t, f.s, pid, "enabled", map[string]any{"plan_sha256": sha}); code != 200 {
 		t.Fatal(code, body)
 	}

@@ -72,17 +72,10 @@ func TestNASStitchResultRequiresCompleteExactInclusion(t *testing.T) {
 			}
 		})
 	}
-	s := &Server{}
-	if s.stitchDeletionMaster(items[0]) {
-		t.Fatal("default deletion enabled")
+	if stitchDeletionMaster(false, items[0]) || stitchDeletionMaster(false, nasCleanupItem{}) {
+		t.Fatal("master OFF granted deletion")
 	}
-	s.cfg.NASCleanupDeletionEnabled = true
-	if !s.stitchDeletionMaster(nasCleanupItem{}) || s.stitchDeletionMaster(items[0]) {
-		t.Fatal("independent switches not enforced")
-	}
-	s.cfg.NASStitchEnabled = true
-	s.cfg.NASStitchDeletionEnabled = true
-	if s.stitchDeletionMaster(items[0]) {
+	if !stitchDeletionMaster(true, nasCleanupItem{}) || stitchDeletionMaster(true, items[0]) {
 		t.Fatal("legacy stitched item gained deletion authority")
 	}
 }

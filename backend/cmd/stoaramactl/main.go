@@ -277,6 +277,7 @@ func usage() {
 	  stoaramactl nas-stitch status|approve|pause|import-corpus|backlog|mint-durham-key
   stoaramactl nas-cleanup prepare --input PLAN.json | report --plan-id ID | verify-recovery --plan-id ID | pause|enable|close --plan-id ID --expected-plan-sha256 SHA --reason TEXT | retire-superseded --reason TEXT [--expected-plans N] | enable-batch --batch-input BATCH.json --expected-batch-sha256 SHA --reason TEXT --approval-hours H | pause-batch|batch-report --batch-id ID
 	  stoaramactl nas-cleanup recheck --plan-id ID --expected-plan-sha256 SHA --reason TEXT [--all]
+	  stoaramactl nas-cleanup master status | master on|off --reason TEXT
 	  stoaramactl nas-client logs --connection-id ID [--since 1h] [--grep TEXT] [--limit N]
   stoaramactl nas-client release-quarantine --connection-id ID
   stoaramactl nas-selected-verify request [--clip-ids IDS] [--collated-ids IDS] [--joined-ids IDS] --label L [--dry-run | --expected-plan-sha256 SHA] [--json]

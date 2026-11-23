@@ -57,7 +57,7 @@ func TestNASCleanupBatchLeaseBoundAndExecutionIsolation(t *testing.T) {
 		}
 		seen[task.ItemID] = true
 	}
-	s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, s, true)
 	for _, id := range []int64{11, 12} {
 		tasks := lease(8)
 		if len(tasks) != 1 || tasks[0].ItemID != id || len(tasks[0].ApprovedProof) == 0 {

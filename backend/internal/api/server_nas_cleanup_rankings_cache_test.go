@@ -9,7 +9,7 @@ func TestNASCleanupRankingCacheUsesFrozenVerdictAcrossLongGaps(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("cache-invalidation", syntheticFiles(100, 5, 10))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}
@@ -78,7 +78,7 @@ func TestNASCleanupRankingCacheRollsBackWithObservation(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("cache-rollback", syntheticFiles(100, 2, 10))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}

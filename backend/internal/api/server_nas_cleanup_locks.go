@@ -77,6 +77,16 @@ func cleanupLockItems(ctx context.Context, tx pgx.Tx, cid int64, ids []int64) er
 	return cleanupDrainLocks(ctx, tx, `SELECT i.id FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2 ORDER BY i.id FOR UPDATE OF i`, ids, cid)
 }
 
+// cleanupLockPlanItems fences every item row of one plan, in id order, before
+// the caller reads the deletion master switch and takes its row lock. Enabling
+// a plan resets all of its items to pending, so the reset must not be the first
+// statement that touches those rows: an unprelocked update would wait on
+// another session's item lock while this transaction already held the master,
+// which is exactly the delay an emergency OFF must never inherit.
+func cleanupLockPlanItems(ctx context.Context, tx pgx.Tx, planID int64) error {
+	return cleanupDrainLocks(ctx, tx, `SELECT id FROM nas_cleanup_items WHERE plan_id=$1 ORDER BY id FOR UPDATE`, planID)
+}
+
 func cleanupDrainLocks(ctx context.Context, tx pgx.Tx, query string, args ...any) error {
 	rows, err := tx.Query(ctx, query, args...)
 	if err != nil {

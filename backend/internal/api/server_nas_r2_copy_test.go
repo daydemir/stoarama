@@ -218,7 +218,7 @@ func TestNASR2CopyNoDailyCapWithActiveCleanup(t *testing.T) {
 	}
 	id, sha, _ := f.admit("parallel-copy", syntheticFiles(100, 2, 2))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable %d %s", code, body)
 	}

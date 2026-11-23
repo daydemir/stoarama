@@ -109,7 +109,7 @@ func testNASCleanupPipelineClientServer(t *testing.T, grouped bool, groupVersion
 					time.Sleep(apiDelay)
 					key := int64(5)
 					r = r.WithContext(context.WithValue(r.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: 47, APIKeyID: &key}))
-					if strings.HasSuffix(r.URL.Path, "/observe") && f.s.cfg.NASCleanupDeletionEnabled {
+					if strings.HasSuffix(r.URL.Path, "/observe") && cleanupMasterOn(context.Background(), f.s.pool) {
 						n := active.Add(1)
 						defer active.Add(-1)
 						for old := peak.Load(); n > old; old = peak.Load() {
@@ -118,7 +118,7 @@ func testNASCleanupPipelineClientServer(t *testing.T, grouped bool, groupVersion
 							}
 						}
 					}
-					if strings.HasSuffix(r.URL.Path, "/observe-batch") && f.s.cfg.NASCleanupDeletionEnabled {
+					if strings.HasSuffix(r.URL.Path, "/observe-batch") && cleanupMasterOn(context.Background(), f.s.pool) {
 						var executing bool
 						if err := f.pool.QueryRow(r.Context(), `SELECT mode='enabled' FROM nas_cleanup_plans WHERE id=$1`, current).Scan(&executing); err != nil {
 							t.Error(err)
@@ -168,7 +168,7 @@ func testNASCleanupPipelineClientServer(t *testing.T, grouped bool, groupVersion
 			run(false) // Real NAS proof, journal and R2 evidence for the current plan.
 			successor, _, _ := f.admit("pipeline-next", files[count:])
 			f.bucket.headDelay = headDelay
-			f.s.cfg.NASCleanupDeletionEnabled = true
+			setCleanupMaster(t, f.s, true)
 			if code, body := safeguardControl(t, f.s, current, "enabled", map[string]any{"plan_sha256": sha}); code != 200 {
 				t.Fatalf("enable: %d %s", code, body)
 			}

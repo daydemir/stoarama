@@ -106,7 +106,7 @@ func TestNASCleanupHistoryScopeStillPausesExpiredExecutionBatch(t *testing.T) {
 	first, sha, ids := f.admit("expiry-current", syntheticFiles(100, 1, 2))
 	next, nextSHA, _ := f.admit("expiry-next", syntheticFiles(200, 1, 2))
 	f.dryRun()
-	f.s.cfg.NASCleanupDeletionEnabled = true
+	setCleanupMaster(t, f.s, true)
 	if code, body := f.enableBatch([]int64{first, next}, []string{sha, nextSHA}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}
