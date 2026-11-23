@@ -192,7 +192,9 @@ class Keep28PlanTests(unittest.TestCase):
         ):
             tampered = copy.deepcopy(rows)
             mutate(tampered)
-            path = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory())) / 'p.json'
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            path = pathlib.Path(tmp.name) / 'p.json'
             path.write_bytes(json.dumps(tampered).encode())
             with self.assertRaises(SystemExit):
                 k.load_policy(path)
