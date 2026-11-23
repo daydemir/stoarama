@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -90,27 +91,47 @@ func TestR2OwnerKeepCatalogStream(t *testing.T) {
 		t.Fatalf("ordinary stream held=%v: %v", held, err)
 	}
 	p := inverseTestProtection()
+	w := p.Windows[3]
+	w.StreamID, w.Timezone = 17318, "Europe/Prague"
+	p.Windows[17318] = w
+	p.Picks.Choices[17318] = p.Picks.Choices[3]
 	loaded, err := loadInverseApplyProtection(f.ctx, f.pool, "stoarama", p.Picks, p.Windows)
 	if err != nil || !loaded.OwnerKeepStreams[415] || !loaded.OwnerKeepStreams[17318] || loaded.OwnerKeepStreams[3] {
 		t.Fatalf("wrong pinned stream protection %v: %v", loaded.OwnerKeepStreams, err)
 	}
-	loaded.Identities[f.key] = []inverseIdentity{{Kind: "raw", StreamID: 415}}
-	if class, reason := loaded.classify(r2.ObjectInfo{Key: f.key, SizeBytes: 100}); class != inverseKE || reason != "owner_keep_stream" {
-		t.Fatalf("managed key classified %s (%s)", class, reason)
+	stale := loaded
+	stale.OwnerKeepStreams = ownerKeepStreamIDs(loaded.OwnerKeepPrefixes)
+	liveSHA, err := loaded.holdsSHA256()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staleSHA, err := stale.holdsSHA256(); err != nil || staleSHA == liveSHA {
+		t.Fatalf("stale partition protection digest %q, live %q: %v", staleSHA, liveSHA, err)
 	}
 	// Seed a historical derivative under the fixture's existing writer fence.
 	exec(`SET LOCAL session_replication_role=replica;
  INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
- SELECT 415,provider,'415','owner-ke','owner-ke',source_url,recording_state,'Asia/Seoul',capture_type,source_family,execution_class,capture_family,expected_fps FROM streams WHERE id=3;
- UPDATE recordings SET stream_id=415 WHERE id=30;
+ SELECT 17318,provider,'17318','owner-ke','owner-ke',source_url,recording_state,'Europe/Prague',capture_type,source_family,execution_class,capture_family,expected_fps FROM streams WHERE id=3;
+ UPDATE recordings SET stream_id=17318 WHERE id=30;
+ UPDATE recording_clips SET clip_start_at='2026-06-01T00:00:00Z',clip_end_at='2026-06-01T00:01:00Z' WHERE id=9000001;
  INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
  SELECT 31,account_id,storage_destination_id,'ordinary',stream_url,cron_expr,cron_timezone,status,3,paused_at FROM recordings WHERE id=30;
  INSERT INTO recording_collation_hours(id,hour_id,batch_id,generation,recording_id,local_date,delivery_hour,status,manifest_object_key,manifest_sha256,manifest,source_clip_count,included_clip_count,excluded_clip_count,join_count,split_count)
  VALUES(1,'test__recording-31__date-2026-09-01__hour-01__generation-2','test',2,31,'2026-09-01',1,'collated','test-manifest',repeat('c',64),'{}',1,1,0,0,0);
  INSERT INTO recording_collation_outputs(collation_hour_id,part,parts,object_key,nas_relative_path,size_bytes,sha256,start_at,end_at,source_clip_ids,r2_verified_at)
- VALUES(1,1,1,'joined/test/objects/'||repeat('d',64)||'.mp4','test/joined.mp4',100,repeat('d',64),'2026-09-01','2026-09-02',ARRAY[9000001::bigint],now())`)
+ VALUES(1,1,1,'joined/test/objects/'||repeat('d',64)||'.mp4','test/joined.mp4',100,repeat('d',64),'2026-09-01','2026-09-02',ARRAY[9000001::bigint],now());
+ INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until)
+ VALUES(1,17318,'2026-09-01','2026-09-02','fixture','2026-09-02');
+ INSERT INTO nas_stitch_r2_hours(scope_id,recording_id,hour_at,plan,plan_sha256,input_bytes)
+ VALUES(1,30,'2026-09-01','{}',repeat('f',64),100);
+ INSERT INTO nas_stitch_r2_stage_objects(hour_id,attempt,api_key_id,bucket,endpoint_sha256,relative_path,sha256,size_bytes)
+ VALUES(1,1,1,'stoarama',repeat('a',64),'test/staged.mp4',repeat('e',64),100)`)
 	joinedKey := "joined/test/objects/" + strings.Repeat("d", 64) + ".mp4"
-	for _, key := range []string{f.key, joinedKey} {
+	var stageKey string
+	if err := f.pool.QueryRow(f.ctx, `SELECT object_key FROM nas_stitch_r2_stage_objects WHERE relative_path='test/staged.mp4'`).Scan(&stageKey); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{f.key, joinedKey, stageKey} {
 		var otherBucket bool
 		if err := f.pool.QueryRow(f.ctx, `SELECT r2_owner_keep_held('stoarama',$1), r2_owner_keep_held('other',$1)`, key).Scan(&held, &otherBucket); err != nil || !held || otherBucket {
 			t.Fatalf("catalog keep for %s: held=%v other bucket=%v: %v", key, held, otherBucket, err)
@@ -126,8 +147,20 @@ func TestR2OwnerKeepCatalogStream(t *testing.T) {
 	if _, err := f.pool.Exec(f.ctx, `UPDATE recording_clips SET purged_at=now() WHERE object_key=$1`, f.key); err == nil || !strings.Contains(err.Error(), "OWNER KEEP HOLD") {
 		t.Fatalf("catalog purge accepted a protected key: %v", err)
 	}
-	if _, err := applyInverse(f.ctx, f.pool, f.sdk, f.options); err == nil || f.deletes() != 0 {
-		t.Fatalf("protected key reached apply: err=%v deletes=%d", err, f.deletes())
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO nas_stitch_r2_stage_retirements(object_id) SELECT id FROM nas_stitch_r2_stage_objects WHERE object_key=$1`, stageKey); err == nil || !strings.Contains(err.Error(), "OWNER KEEP HOLD") {
+		t.Fatalf("stage reservation accepted a protected key: %v", err)
+	}
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(f.ctx)
+	entry := inverseEntry{ObjectInfo: f.store.objects[f.key]}
+	if _, err := loadInverseRawTarget(f.ctx, tx, "stoarama", stale, inverseOutsideKeep28, entry); err != nil {
+		t.Fatalf("control target should be eligible without the pinned stream hold: %v", err)
+	}
+	if _, err := loadInverseRawTarget(f.ctx, tx, "stoarama", loaded, inverseOutsideKeep28, entry); !errors.Is(err, errInverseRawIneligible) {
+		t.Fatalf("target with pinned stream hold: %v", err)
 	}
 }
 

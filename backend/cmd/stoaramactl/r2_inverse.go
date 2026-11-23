@@ -108,7 +108,7 @@ func (p inverseProtection) holdsSHA256() (string, error) {
 	// closure: a restart must not reuse a partition classified under a different
 	// exemption state. ReviewedCollated is included so a RAW-scope partition can
 	// never be reused by the reviewed collated scope, or the reverse.
-	data, err := json.Marshal([]any{p.KEEpoch, p.OwnerKeepPrefixes, p.KEFolders, p.Held, p.Delivery,
+	data, err := json.Marshal([]any{p.KEEpoch, p.OwnerKeepPrefixes, p.OwnerKeepStreams, p.KEFolders, p.Held, p.Delivery,
 		p.JoinedReleased, p.PageKeep, p.Exempt, p.ExemptIdentity, p.ReviewedCollated})
 	if err != nil {
 		return "", err
