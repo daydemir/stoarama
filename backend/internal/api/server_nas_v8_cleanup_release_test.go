@@ -9,7 +9,12 @@ import (
 // The cleanup release is one exact immutable literal: it inherits reviewed
 // bulk/group execution and the raw-copy raw-only lease, and nothing else.
 func TestNASCleanupLowMemoryCleanupReleaseCapabilityIsExact(t *testing.T) {
-	v := nasLowMemoryCleanupClientVersion
+	for _, v := range []string{nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion} {
+		testNASCleanupLowMemoryCleanupReleaseCapability(t, v)
+	}
+}
+
+func testNASCleanupLowMemoryCleanupReleaseCapability(t *testing.T, v string) {
 	if !nasCleanupSupportsBulk(v) || !nasCleanupSupportsGroupedExecution(v) || nasCleanupSupportsV6(v) {
 		t.Fatal("cleanup literal lost bulk/group admission or gained legacy V6 semantics")
 	}
@@ -29,7 +34,7 @@ func TestNASCleanupLowMemoryCleanupReleaseCapabilityIsExact(t *testing.T) {
 	if nasCleanupSupportsBulk(nasLowMemoryCopyClientVersion) || nasCleanupSupportsGroupedExecution(nasLowMemoryCopyClientVersion) || nasCleanupSupportsExecution(nasLowMemoryCopyClientVersion) {
 		t.Fatal("deployed v8 copy release gained cleanup admission")
 	}
-	for _, unknown := range []string{v + "-extra", "r2-copy-v8", "r2-copy-v8-low-memory-", "r2-copy-v8-low-memory-cleanup2", "R2-copy-v8-low-memory-cleanup"} {
+	for _, unknown := range []string{v + "-extra", "r2-copy-v8", "r2-copy-v8-low-memory-", "r2-copy-v8-low-memory-cleanup2", "R2-copy-v8-low-memory-cleanup", "r2-copy-v8-keep20", "r2-copy-v8-keep20-cleanup2"} {
 		if nasCleanupSupportsBulk(unknown) || nasCleanupSupportsGroupedExecution(unknown) || nasCopySupportsVersion(unknown) || SupportsNASStorageBudget(unknown) {
 			t.Fatalf("prefix/unknown release admitted: %q", unknown)
 		}
@@ -122,5 +127,42 @@ func TestNASStorageBindingV8CleanupMigrationPreservesEvidence(t *testing.T) {
 	observation := storageObservation(t, pool)
 	if issued == nil || observation.version != nasLowMemoryCleanupClientVersion || observation.budget == nil || !observation.budget.Equal(*issued) {
 		t.Fatalf("cleanup literal storage proof did not bind the preceding challenge: %+v", observation)
+	}
+}
+
+// 0238 only adds the keep20 cleanup literal on top of 0237: every earlier
+// value stays valid, suffixed values are refused, and the literal binds a
+// nonce-bound storage budget like the release it mirrors.
+func TestNASStorageBindingV8Keep20CleanupMigration(t *testing.T) {
+	s, pool := storageHeartbeatFixture(t)
+	ctx := context.Background()
+	for _, name := range []string{"0237_nas_storage_v8_cleanup_binding.sql", "0238_nas_storage_v8_keep20_cleanup_binding.sql"} {
+		body, err := os.ReadFile("../../../infra/sql/migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = pool.Exec(ctx, string(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, kept := range []string{"r2-copy-v6", "r2-copy-v7-certified-stitch", "r2-copy-v8-low-memory", nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion} {
+		if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version=$1,nas_storage_budget_at=now() WHERE id=13`, kept); err != nil {
+			t.Fatalf("0238 refused %q: %v", kept, err)
+		}
+	}
+	for _, bad := range []string{nasKeep20CleanupClientVersion + "-extra", "r2-copy-v8-keep20", "r2-copy-v8-keep20-cleanup2"} {
+		if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version=$1,nas_storage_budget_at=now() WHERE id=13`, bad); err == nil {
+			t.Fatalf("unknown literal %q passed the 0238 check", bad)
+		}
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version='',nas_storage_budget_at=NULL,client_version='be17fd73' WHERE id=13`); err != nil {
+		t.Fatal(err)
+	}
+	nonce := storageHeartbeat(t, s, nasKeep20CleanupClientVersion, storageSample(""))
+	issued := storageObservation(t, pool).issued
+	storageHeartbeat(t, s, nasKeep20CleanupClientVersion, storageSample(nonce))
+	observation := storageObservation(t, pool)
+	if issued == nil || observation.version != nasKeep20CleanupClientVersion || observation.budget == nil || !observation.budget.Equal(*issued) {
+		t.Fatalf("keep20 literal storage proof did not bind the preceding challenge: %+v", observation)
 	}
 }

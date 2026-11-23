@@ -7,7 +7,7 @@ import (
 )
 
 func TestNASCleanupExecutionPollingDoesNotQueueDryWork(t *testing.T) {
-	for _, v := range []string{nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion, nasLowMemoryCleanupClientVersion} {
+	for _, v := range []string{nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion} {
 		t.Run(v, func(t *testing.T) { testTestNASCleanupExecutionPollingDoesNotQueueDryWork(t, v) })
 	}
 }
@@ -45,7 +45,7 @@ func testTestNASCleanupExecutionPollingDoesNotQueueDryWork(t *testing.T, version
 }
 
 func TestNASCleanupDryLimitDoesNotShrinkExecutionGroup(t *testing.T) {
-	for _, v := range []string{nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion, nasLowMemoryCleanupClientVersion} {
+	for _, v := range []string{nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion} {
 		t.Run(v, func(t *testing.T) { testTestNASCleanupDryLimitDoesNotShrinkExecutionGroup(t, v) })
 	}
 }

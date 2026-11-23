@@ -342,3 +342,24 @@ class LowMemoryGroupPathTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Keep20ReleaseGuardTests(unittest.TestCase):
+    """The keep20 release guards with the real embedded 20-day pin, not keep28."""
+
+    def refusal(self, start, end):
+        item = dict(kind='raw', stream_id=2718, relative_path='recordings/326/continuous/1.mp4',
+                    object_key='keep20-release-fixture', sidecar_required=True)
+        proof = dict(sidecar=dict(binding=dict(clip_start_at=start, clip_end_at=end)))
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.KEEP20_CLEANUP_CLIENT_VERSION):
+            return pull.cleanup_guard_refusal(dict(item=item), proof)
+
+    def test_keep20_literal_shares_low_memory_cleanup_behavior(self):
+        self.assertIn(pull.KEEP20_CLEANUP_CLIENT_VERSION, pull.LOW_MEMORY_CLEANUP_VERSIONS)
+        self.assertIn(pull.KEEP20_CLEANUP_CLIENT_VERSION, pull.CLEANUP_BULK_VERSIONS)
+
+    def test_guard_uses_the_20_day_window(self):
+        # Stream 2718 keeps [2026-07-13T07Z, 2026-08-02T07Z) under keep20; the
+        # legacy keep28 window was [2026-07-09T07Z, 2026-08-06T07Z).
+        self.assertIsNone(self.refusal('2026-07-10T12:00:00+00:00', '2026-07-10T12:01:00+00:00'))
+        self.assertIn('overlaps', self.refusal('2026-07-20T12:00:00+00:00', '2026-07-20T12:01:00+00:00'))

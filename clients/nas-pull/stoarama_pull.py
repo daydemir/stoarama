@@ -50,7 +50,9 @@ LOW_MEMORY_COPY_CLIENT_VERSION = "r2-copy-v8-low-memory"
 # The cleanup release is the same low-memory artifact line plus the reviewed
 # cleanup-batch-v8 protocol. Both literals stay copy-only for stitching.
 LOW_MEMORY_CLEANUP_CLIENT_VERSION = "r2-copy-v8-low-memory-cleanup"
-LOW_MEMORY_CLEANUP_VERSIONS = frozenset((LOW_MEMORY_CLEANUP_CLIENT_VERSION,))
+# Same artifact line built with the 20-day cleanup pin; identical behavior.
+KEEP20_CLEANUP_CLIENT_VERSION = "r2-copy-v8-keep20-cleanup"
+LOW_MEMORY_CLEANUP_VERSIONS = frozenset((LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION))
 CLEANUP_CERTIFIED_STITCH_REASON = "durham_stitch_certified"
 CLEANUP_CERTIFIED_STITCH_RECOVERY = "nas_stitch_certified"
 CLEANUP_RECONCILIATION_PROTOCOL = 1
@@ -687,7 +689,7 @@ class StitchSwitches:
     def __init__(self):
         # Both low-memory literals are copy-only; the tuple keeps this class
         # loadable as an isolated contract fixture.
-        self.local_enabled = (CLIENT_VERSION not in (LOW_MEMORY_COPY_CLIENT_VERSION, LOW_MEMORY_CLEANUP_CLIENT_VERSION) and
+        self.local_enabled = (CLIENT_VERSION not in (LOW_MEMORY_COPY_CLIENT_VERSION, LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION) and
                               env_str("STOARAMA_V85_STITCH_ENABLED", "true").lower() == "true")
         self.local_deletion_enabled = env_str("STOARAMA_V85_STITCH_DELETION_ENABLED", "true").lower() == "true"
         cancel = threading.Event()
@@ -18451,7 +18453,7 @@ CLEANUP_V6_VERSIONS: frozenset[str] = frozenset((CLEANUP_GROUP_VERSION, "r2-copy
 CLEANUP_BULK_VERSION = "cleanup-batch-v7"
 CLEANUP_TRUTH_VERSION = "cleanup-batch-v8"
 CLEANUP_FRESH_PERMIT_VERSION = "v85r-nas-proof-v2.2"
-CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, CLEANUP_CERTIFIED_STITCH_VERSION, LOW_MEMORY_CLEANUP_CLIENT_VERSION, "r2-copy-v2", "r2-copy-v3", "r2-copy-v4", "r2-copy-v5", "r2-copy-v6", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
+CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, CLEANUP_CERTIFIED_STITCH_VERSION, LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, "r2-copy-v2", "r2-copy-v3", "r2-copy-v4", "r2-copy-v5", "r2-copy-v6", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
 CLEANUP_GROUP_VERSIONS: frozenset[str] = CLEANUP_V6_VERSIONS | CLEANUP_BULK_VERSIONS
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
@@ -18488,7 +18490,7 @@ def cleanup_lookahead_workers():
 def cleanup_execution_group_size():
     # One lease/permit clock per file. NAS syscall latency must never consume
     # another file's short authority window. Historical releases retain v7.
-    return 1 if CLIENT_VERSION in (CLEANUP_FRESH_PERMIT_VERSION, CLEANUP_CERTIFIED_STITCH_VERSION, LOW_MEMORY_CLEANUP_CLIENT_VERSION, "r2-copy-v4", "r2-copy-v5", "r2-copy-v6") else CLEANUP_EXECUTION_GROUP
+    return 1 if CLIENT_VERSION in (CLEANUP_FRESH_PERMIT_VERSION, CLEANUP_CERTIFIED_STITCH_VERSION, LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, "r2-copy-v4", "r2-copy-v5", "r2-copy-v6") else CLEANUP_EXECUTION_GROUP
 
 
 class CleanupProtocolUnsupported(RuntimeError):

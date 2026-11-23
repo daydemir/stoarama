@@ -429,7 +429,7 @@ func TestNASR2CopyConcurrentLeaseSlotsAndExpiredOwner(t *testing.T) {
 }
 
 func TestNASR2CopyLowMemoryClientGetsOneLiveLease(t *testing.T) {
-	for _, version := range []string{nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion} {
+	for _, version := range []string{nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion} {
 		t.Run(version, func(t *testing.T) {
 			f, item := copyTestFixture(t)
 			f.useClientVersion(version)

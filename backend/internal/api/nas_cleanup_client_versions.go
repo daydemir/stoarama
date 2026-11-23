@@ -55,7 +55,7 @@ func nasClientSupportsStitchProof(version string) bool {
 
 func nasCleanupSupportsBulk(version string) bool {
 	switch version {
-	case nasCleanupCertifiedStitchVersion, NASR2CopyPagedClientVersion, nasCleanupR2CopyDiagnosticsClientVersion, nasCleanupR2CopyProgressClientVersion, nasCleanupBulkDurabilityClientVersion, nasCleanupItemTruthClientVersion, nasCleanupR2CopyClientVersion, nasCleanupR2CopyControlClientVersion, "v85r-nas-proof-v1", nasCleanupProofClientVersion, nasCleanupPermitTransportClientVersion, nasCleanupFreshPermitClientVersion, nasLowMemoryCleanupClientVersion:
+	case nasCleanupCertifiedStitchVersion, NASR2CopyPagedClientVersion, nasCleanupR2CopyDiagnosticsClientVersion, nasCleanupR2CopyProgressClientVersion, nasCleanupBulkDurabilityClientVersion, nasCleanupItemTruthClientVersion, nasCleanupR2CopyClientVersion, nasCleanupR2CopyControlClientVersion, "v85r-nas-proof-v1", nasCleanupProofClientVersion, nasCleanupPermitTransportClientVersion, nasCleanupFreshPermitClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion:
 		return true
 	default:
 		return false
