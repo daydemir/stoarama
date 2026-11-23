@@ -62,6 +62,15 @@ class OwnershipTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.collect(parts)
 
+    def test_low_memory_cleanup_client_retains_ordinary_finish_ownership(self):
+        for version in ('r2-copy-v8-low-memory', 'r2-copy-v8-low-memory-cleanup'):
+            parts = fixture()
+            parts[5]['version'] = version
+            self.assertEqual(self.collect(parts)['known_enabled_plans'], [1441])
+            parts[5]['version'] += '-extra'
+            with self.assertRaises(ValueError):
+                self.collect(parts)
+
     def test_dry_run_enable_pause_retire_transitions(self):
         for mode in ('dry_run', 'enabled', 'paused', 'retired'):
             parts = fixture()

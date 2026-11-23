@@ -450,14 +450,16 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 		}
 	})
 	startRange := nasR2CopyControl{Token: request.Token, FreeBytes: request.FreeBytes, Length: item.SizeBytes}
-	exec(`UPDATE connections SET client_version=$1 WHERE id=13`, nasLowMemoryCopyClientVersion)
-	if w := cleanupCall(t, s.handleAccountNASStitchLease, 47, 47, "", "", nil); w.Code != http.StatusConflict ||
-		!strings.Contains(w.Body.String(), "low-memory client is copy-only") {
-		t.Fatalf("low-memory client reached ordinary stitching: %d %s", w.Code, w.Body.String())
-	}
-	if w := cleanupCall(t, s.handleNASR2CopyRange, 47, 47, "id", fmt.Sprint(copyID), startRange, "fixture-boot "+nasLowMemoryCopyClientVersion); w.Code != http.StatusConflict ||
-		!strings.Contains(w.Body.String(), "low-memory client requires a raw copy lease") {
-		t.Fatalf("low-memory client inherited a stitch lease: %d %s", w.Code, w.Body.String())
+	for _, lowMemory := range []string{nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion} {
+		exec(`UPDATE connections SET client_version=$1 WHERE id=13`, lowMemory)
+		if w := cleanupCall(t, s.handleAccountNASStitchLease, 47, 47, "", "", nil); w.Code != http.StatusConflict ||
+			!strings.Contains(w.Body.String(), "low-memory client is copy-only") {
+			t.Fatalf("%s reached ordinary stitching: %d %s", lowMemory, w.Code, w.Body.String())
+		}
+		if w := cleanupCall(t, s.handleNASR2CopyRange, 47, 47, "id", fmt.Sprint(copyID), startRange, "fixture-boot "+lowMemory); w.Code != http.StatusConflict ||
+			!strings.Contains(w.Body.String(), "low-memory client requires a raw copy lease") {
+			t.Fatalf("%s inherited a stitch lease: %d %s", lowMemory, w.Code, w.Body.String())
+		}
 	}
 	exec(`UPDATE connections SET client_version=$1 WHERE id=13`, NASR2CopyPagedClientVersion)
 	rangeResponse := cleanupCall(t, s.handleNASR2CopyRange, 47, 47, "id", fmt.Sprint(copyID), startRange, "fixture-boot "+NASR2CopyPagedClientVersion)
