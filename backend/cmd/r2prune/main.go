@@ -84,8 +84,10 @@ func storeFromEnv() (store, error) {
 	return store{s3: client, bucket: bucket}, nil
 }
 
-// newRetryer backs off on R2's 429 "Reduce your concurrent request rate",
-// which the SDK does not treat as retryable by default. A 429 is a refusal
+// newRetryer backs off on R2's 429 "Reduce your concurrent request rate"
+// (code ServiceUnavailable), which the SDK does not treat as retryable by
+// default; SlowDown and 5xx already are. Backoff is the SDK's capped
+// exponential with jitter. A 429 is a refusal
 // before execution, so retrying it is safe for list, head and delete alike.
 // Attempts stay bounded; a persistent refusal still fails the run closed.
 func newRetryer() aws.Retryer {
@@ -93,6 +95,9 @@ func newRetryer() aws.Retryer {
 		o.MaxAttempts = 10
 		o.MaxBackoff = 30 * time.Second
 		o.RateLimiter = ratelimit.None
-		o.Retryables = append([]retry.IsErrorRetryable{retry.RetryableHTTPStatusCode{Codes: map[int]struct{}{429: {}}}}, o.Retryables...)
+		o.Retryables = append([]retry.IsErrorRetryable{
+			retry.RetryableHTTPStatusCode{Codes: map[int]struct{}{429: {}}},
+			retry.RetryableErrorCode{Codes: map[string]struct{}{"ServiceUnavailable": {}}},
+		}, o.Retryables...)
 	})
 }
