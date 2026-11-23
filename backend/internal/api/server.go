@@ -232,9 +232,21 @@ func (s *Server) router() http.Handler {
 	r := chi.NewRouter()
 
 	r.Get("/healthz", s.handleHealth)
-	r.Get("/global-street-scores-delivery", s.handleGlobalDeliveryPage)
-	r.Get("/global-street-scores-delivery/files", s.handleGlobalDeliveryPage)
-	r.Get("/global-street-scores-delivery/static/*", s.handleGlobalDeliveryStatic)
+	for _, route := range []string{
+		"/global-street-scores-delivery",
+		"/global-street-scores-delivery/files",
+		"/global-street-scores-delivery/static/*",
+	} {
+		r.Get(route, handleRetiredGlobalDelivery)
+		r.Head(route, handleRetiredGlobalDelivery)
+	}
+	// Keep both retired API prefixes outside the authenticated account subrouter.
+	for _, prefix := range []string{publicGlobalDeliveryAPI, globalDeliveryAPI} {
+		for _, route := range []string{"/asset", "/metadata", "/ticket/{fileID}", "/file/{fileID}"} {
+			r.Get(prefix+route, handleRetiredGlobalDelivery)
+			r.Head(prefix+route, handleRetiredGlobalDelivery)
+		}
+	}
 	r.Get("/static/{asset}", s.handleDashboardStatic)
 	r.Get("/", s.handleStreamsApp)
 	r.Get("/streams", s.handleStreamsApp)
@@ -290,11 +302,6 @@ func (s *Server) router() http.Handler {
 				read.Get("/recordings/{id}/clips/{clipId}/download", s.handleSharedRecordingClipDownload)
 			})
 		})
-		api.Get("/global-street-scores-delivery/asset", s.handleGlobalDeliveryAsset)
-		api.Get("/global-street-scores-delivery/metadata", s.handleGlobalDeliveryAsset)
-		api.Get("/global-street-scores-delivery/ticket/{fileID}", s.handleGlobalDeliveryTicket)
-		api.Get("/global-street-scores-delivery/file/{fileID}", s.handleGlobalDeliveryFile)
-		api.Head("/global-street-scores-delivery/file/{fileID}", s.handleGlobalDeliveryFile)
 		api.Post("/auth/request-link", s.handleAccountAuthRequestLink)
 		api.Post("/nodes/enroll", s.handleNodeEnroll)
 		api.Route("/account", func(account chi.Router) {
@@ -307,11 +314,6 @@ func (s *Server) router() http.Handler {
 			account.Use(s.confineAccountScope)
 			account.Use(s.fenceNASDelivery)
 			account.Get("/me", s.handleAccountMe)
-			account.Get("/global-street-scores-delivery/asset", s.handleGlobalDeliveryAsset)
-			account.Get("/global-street-scores-delivery/metadata", s.handleGlobalDeliveryAsset)
-			account.Get("/global-street-scores-delivery/ticket/{fileID}", s.handleGlobalDeliveryTicket)
-			account.Get("/global-street-scores-delivery/file/{fileID}", s.handleGlobalDeliveryFile)
-			account.Head("/global-street-scores-delivery/file/{fileID}", s.handleGlobalDeliveryFile)
 			account.Post("/logout", s.handleAccountLogout)
 			account.Get("/api-keys", s.handleAccountAPIKeysList)
 			account.Post("/api-keys", s.handleAccountAPIKeysCreate)
@@ -740,6 +742,14 @@ func (s *Server) router() http.Handler {
 	})
 
 	return r
+}
+
+func handleRetiredGlobalDelivery(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusGone)
+	if r.Method != http.MethodHead {
+		_, _ = io.WriteString(w, "Global Street Scores delivery has been retired.")
+	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
