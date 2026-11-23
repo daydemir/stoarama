@@ -98,6 +98,10 @@ type prefixRule struct {
 type keyRule struct {
 	Class  class
 	Reason string
+	// WindowOnly marks a DB protection that holds a key only inside its
+	// stream's 20-day window, or on a Keep Everything stream: a NAS copy, a
+	// page link or a NAS incident copy. Outside the window these do not hold.
+	WindowOnly bool
 }
 
 // rules is every protection input. plan and delete load it from the same
@@ -293,7 +297,7 @@ func (r *rules) loadController(path string) error {
 				return nil
 			}
 			if row.Type == "key" {
-				r.Keys[row.Key] = keyRule{c, "controller:" + row.Reasons[0]}
+				r.addKey(row.Key, keyRule{c, "controller:" + row.Reasons[0], false})
 			} else {
 				r.Prefixes = append(r.Prefixes, prefixRule{row.Prefix, c, "controller:" + row.Reasons[0]})
 			}
@@ -333,13 +337,30 @@ func (r *rules) loadPicks(path string) error {
 	return nil
 }
 
+// windowOnlyReasons are the DB sets whose hold is only about a NAS copy, a
+// page link or an incident copy: they protect a key only while it is Keep
+// Everything or inside its stream's 20-day window.
+var windowOnlyReasons = map[string]bool{"page_link": true, "nas_copy_pending": true, "nas_incident": true}
+
+// addKey records one protection for a key. A key may carry several reasons;
+// any reason that holds outside the window keeps it protected, and its class
+// and reason are the ones reported.
+func (r *rules) addKey(key string, k keyRule) {
+	if prev, ok := r.Keys[key]; ok && !prev.WindowOnly && k.WindowOnly {
+		return
+	}
+	r.Keys[key] = k
+}
+
 func (r *rules) loadDBProtect(path string) error {
 	return eachTSV(path, 2, func(c []string) error {
 		switch c[0] {
-		case "page_link":
-			r.Keys[c[1]] = keyRule{protectLiveSite, "db:" + c[0]}
-		case "stitch_input_hold", "nas_copy_pending", "nas_restore_pending", "nas_incident":
-			r.Keys[c[1]] = keyRule{protectNASPipeline, "db:" + c[0]}
+		case "page_link", "stitch_input_hold", "nas_copy_pending", "nas_restore_pending", "nas_incident":
+			cl := protectNASPipeline
+			if c[0] == "page_link" {
+				cl = protectLiveSite
+			}
+			r.addKey(c[1], keyRule{cl, "db:" + c[0], windowOnlyReasons[c[0]]})
 		case "owner_keep_prefix":
 			r.Prefixes = append(r.Prefixes, prefixRule{c[1], protectKeepEverything, "db:" + c[0]})
 		case "nas_cleanup_hold", "page_exempt":
@@ -519,6 +540,50 @@ func (r *rules) keCovered(o object) string {
 	return ""
 }
 
+// keyProtection reports the class and reason a key row (DB protect or
+// controller) gives this object. A window-only row - a NAS copy, a page link or
+// a NAS incident copy - holds only a Keep Everything key or one that overlaps
+// its stream's 20-day window; outside both, the owner's rule deletes.
+func (r *rules) keyProtection(o object, ids []identity) (class, string, bool) {
+	k, ok := r.Keys[o.Key]
+	if !ok {
+		return "", "", false
+	}
+	if !k.WindowOnly || len(ids) == 0 || r.keepEverything(o.Key, ids) != "" || r.overlapsWindow(ids) {
+		// A key with no catalog identity keeps today's behaviour: there is no
+		// window to judge it against, so the row still protects it.
+		return k.Class, k.Reason, true
+	}
+	return "", "", false
+}
+
+// overlapsWindow reports whether a catalog identity of the key overlaps its
+// stream's 20-day window.
+func (r *rules) overlapsWindow(ids []identity) bool {
+	for _, id := range ids {
+		if w, ok := r.Windows[id.Stream]; ok && id.Start > 0 && id.End > id.Start && id.Start < w.End && id.End > w.Start {
+			return true
+		}
+	}
+	return false
+}
+
+// keepEverything names why a key is Keep Everything, "" when it is not.
+func (r *rules) keepEverything(key string, ids []identity) string {
+	if r.KEFolders[plazaFolder(key)] {
+		return "keep_everything_folder_in_key"
+	}
+	for _, id := range ids {
+		if r.KE[id.Stream] {
+			return "keep_everything_stream"
+		}
+		if r.KEFolders[id.Folder] {
+			return "keep_everything_folder"
+		}
+	}
+	return ""
+}
+
 // decide classifies one listed object. The order fixes the reported reason;
 // any protection wins over deletion.
 func (r *rules) decide(o object) (class, string) {
@@ -527,26 +592,13 @@ func (r *rules) decide(o object) (class, string) {
 			return p.Class, p.Reason
 		}
 	}
-	if k, ok := r.Keys[o.Key]; ok && k.Class == protectLiveSite {
-		return k.Class, k.Reason
-	}
 	ids := r.Identities[o.Key]
-	keReason := ""
-	switch {
-	case r.KEFolders[plazaFolder(o.Key)]:
-		keReason = "keep_everything_folder_in_key"
-	default:
-		for _, id := range ids {
-			if r.KE[id.Stream] {
-				keReason = "keep_everything_stream"
-				break
-			}
-			if r.KEFolders[id.Folder] {
-				keReason = "keep_everything_folder"
-				break
-			}
+	if k, ok := r.Keys[o.Key]; ok && k.Class == protectLiveSite {
+		if c, reason, held := r.keyProtection(o, ids); held {
+			return c, reason
 		}
 	}
+	keReason := r.keepEverything(o.Key, ids)
 	if keReason != "" {
 		if out, ok := r.keCoveredDelete(o, ids); ok {
 			return deleteKeRawStitched, "covered_by:" + topPrefix(out)
@@ -602,8 +654,8 @@ func (r *rules) decide(o object) (class, string) {
 	if r.Closure[o.Key] {
 		return protectStitchClosure, string(ids[0].Kind)
 	}
-	if k, ok := r.Keys[o.Key]; ok {
-		return k.Class, k.Reason
+	if c, reason, held := r.keyProtection(o, ids); held {
+		return c, reason
 	}
 	if o.MTime >= r.RecentFrom {
 		return protectRecentWrite, string(ids[0].Kind)

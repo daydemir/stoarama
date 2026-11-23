@@ -188,7 +188,7 @@ func TestDecide(t *testing.T) {
 		"managed/acct-47/recordings/1/ke.mp4":              protectKeepEverything,
 		"managed/acct-47/recordings/2/old.mp4":             deleteRawOutsideWindow,
 		"joined/nightly-collation-v2/objects/old.mp4":      deleteCollatedOutsideWindow,
-		"joined/nightly-collation-v2/objects/page.mp4":     protectLiveSite,
+		"joined/nightly-collation-v2/objects/page.mp4":     deleteCollatedOutsideWindow, // page_link holds only inside the window
 		"joined/best14-20261021/z.mp4":                     protectUnclassified,
 		"datasets/global-street-scores-delivery/47/r.json": protectLiveSite,
 		"app/state.json":                                   protectUnclassified,
@@ -245,7 +245,7 @@ func TestListPlanDeleteAgainstFakeS3(t *testing.T) {
 	if err := json.Unmarshal(raw, &sum); err != nil {
 		t.Fatal(err)
 	}
-	if sum.Delete.Objects != 2500+4 || sum.Listed.Objects != int64(len(objects)) {
+	if sum.Delete.Objects != 2500+5 || sum.Listed.Objects != int64(len(objects)) {
 		t.Fatalf("delete %d listed %d", sum.Delete.Objects, sum.Listed.Objects)
 	}
 	manifest := filepath.Join(out, "delete-manifest.jsonl")
@@ -267,10 +267,11 @@ func TestListPlanDeleteAgainstFakeS3(t *testing.T) {
 		t.Fatal("a recent-from other than the plan's must refuse")
 	}
 
-	// A key protected after the plan: the changed input refuses the run, and
-	// the per-key re-check skips it even when called directly.
+	// A key protected by a reason that holds outside the window after the plan:
+	// the changed input refuses the run, and the per-key re-check skips it even
+	// when called directly.
 	f, _ := os.OpenFile(files.dbProtect, os.O_APPEND|os.O_WRONLY, 0)
-	f.WriteString("nas_copy_pending\tmanaged/acct-47/a_folder/late.mp4\n")
+	f.WriteString("stitch_input_hold\tmanaged/acct-47/a_folder/late.mp4\n")
 	f.Close()
 	if _, err := verifyReviewedInputs(manifest, summaryPath, sum.ManifestSHA256, files); err == nil {
 		t.Fatal("a changed protect input must refuse")
@@ -310,17 +311,20 @@ func TestListPlanDeleteAgainstFakeS3(t *testing.T) {
 		outcomes[row.Outcome]++
 	}
 	lf.Close()
-	if outcomes[outcomeDeleted] != 2502 || outcomes[outcomeSkippedProtected] != 1 || outcomes[outcomeSkippedChanged] != 1 || outcomes[outcomeFailed] != 0 {
+	if outcomes[outcomeDeleted] != 2503 || outcomes[outcomeSkippedProtected] != 1 || outcomes[outcomeSkippedChanged] != 1 || outcomes[outcomeFailed] != 0 {
 		t.Fatalf("outcomes %v", outcomes)
 	}
 	if fake.deletes != 3 {
 		t.Fatalf("want 3 DeleteObjects batches, got %d", fake.deletes)
 	}
 	for _, kept := range []string{"managed/acct-47/a_folder/late.mp4", "managed/acct-47/a_folder/in.mp4", "managed/acct-47/a_folder/innas.mp4",
-		"managed/acct-47/ke_folder/x.mp4", "managed/acct-47/recordings/1/ke.mp4", "joined/nightly-collation-v2/objects/page.mp4", "joined/best14-20261021/z.mp4", "app/state.json"} {
+		"managed/acct-47/ke_folder/x.mp4", "managed/acct-47/recordings/1/ke.mp4", "joined/best14-20261021/z.mp4", "app/state.json"} {
 		if _, ok := fake.objects[kept]; !ok {
 			t.Errorf("protected key %s was deleted", kept)
 		}
+	}
+	if _, ok := fake.objects["joined/nightly-collation-v2/objects/page.mp4"]; ok {
+		t.Error("an outside-window page link survived")
 	}
 	if _, ok := fake.objects["managed/acct-47/a_folder/bulk/0007.mp4"]; !ok {
 		t.Error("a key changed since the plan was deleted")
@@ -490,6 +494,82 @@ func TestKECoveragePlanAndDecide(t *testing.T) {
 	}
 	if got, _ := r.decide(object{Key: "managed/acct-47/ke_folder/recent.mp4", Size: 125, MTime: time.Now().Unix()}); got != protectKeepEverything {
 		t.Errorf("recent write: got %s", got)
+	}
+}
+
+// windowOnlyFixture adds a non-KE outside-window RAW key, the same key inside
+// the window, and a KE raw key, each with the DB protects the test asks for.
+func windowOnlyFixture(t *testing.T, protects string) (*rules, map[string]int64) {
+	t.Helper()
+	files, _ := fixture(t)
+	out := w0 - 30*day
+	extra := &strings.Builder{}
+	row := func(key string, stream, start, end, size int64) {
+		fmt.Fprintf(extra, "raw\t%s\t%d\t%d\t%d\t%d\tf\t0\ta_folder\t1\n", key, stream, start, end, size)
+	}
+	row("managed/acct-47/a_folder/oldpage.mp4", 10, out, out+60, 130)
+	row("managed/acct-47/a_folder/inpage.mp4", 10, w0+day, w0+day+60, 131)
+	row("managed/acct-47/ke_folder/kepage.mp4", 20, out, out+60, 132)
+	f, _ := os.OpenFile(files.identities, os.O_APPEND|os.O_WRONLY, 0)
+	f.WriteString(extra.String())
+	f.Close()
+	p, _ := os.OpenFile(files.dbProtect, os.O_APPEND|os.O_WRONLY, 0)
+	p.WriteString(protects)
+	p.Close()
+	r, err := files.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r, map[string]int64{"oldpage": 130, "inpage": 131, "kepage": 132}
+}
+
+func TestWindowOnlyDBProtectsHoldOnlyInsideWindow(t *testing.T) {
+	const (
+		old  = "managed/acct-47/a_folder/oldpage.mp4"
+		in   = "managed/acct-47/a_folder/inpage.mp4"
+		keep = "managed/acct-47/ke_folder/kepage.mp4"
+	)
+	// Each window-only reason alone: the outside-window key deletes, the
+	// in-window and Keep Everything keys stay protected.
+	for _, tc := range []struct {
+		reason string
+		outter class
+	}{
+		{"page_link", deleteRawOutsideWindow},
+		{"nas_incident", deleteRawOutsideWindow},
+		{"nas_copy_pending", deleteRawOutsideWindow},
+	} {
+		r, sizes := windowOnlyFixture(t, fmt.Sprintf("%s\t%s\n%s\t%s\n%s\t%s\n", tc.reason, old, tc.reason, in, tc.reason, keep))
+		if got, reason := r.decide(object{Key: old, Size: sizes["oldpage"], MTime: w0}); got != tc.outter {
+			t.Errorf("%s outside window: got %s (%s), want %s", tc.reason, got, reason, tc.outter)
+		}
+		if got, reason := r.decide(object{Key: in, Size: sizes["inpage"], MTime: w0}); got.deletes() {
+			t.Errorf("%s inside window: got %s (%s), want protected", tc.reason, got, reason)
+		}
+		if got, reason := r.decide(object{Key: keep, Size: sizes["kepage"], MTime: w0}); got.deletes() {
+			t.Errorf("%s on Keep Everything: got %s (%s), want protected", tc.reason, got, reason)
+		}
+	}
+	// A key carrying a reason that holds outside the window too stays protected.
+	r, sizes := windowOnlyFixture(t, fmt.Sprintf("page_link\t%s\nstitch_input_hold\t%s\n", old, old))
+	if got, reason := r.decide(object{Key: old, Size: sizes["oldpage"], MTime: w0}); got != protectNASPipeline {
+		t.Errorf("page_link plus stitch_input_hold: got %s (%s), want %s", got, reason, protectNASPipeline)
+	}
+	r, sizes = windowOnlyFixture(t, fmt.Sprintf("stitch_input_hold\t%s\npage_link\t%s\n", old, old))
+	if got, reason := r.decide(object{Key: old, Size: sizes["oldpage"], MTime: w0}); got != protectNASPipeline {
+		t.Errorf("stitch_input_hold plus page_link: got %s (%s), want %s", got, reason, protectNASPipeline)
+	}
+	// A key with no catalog identity has no window to judge: page_link holds.
+	files, _ := fixture(t)
+	p, _ := os.OpenFile(files.dbProtect, os.O_APPEND|os.O_WRONLY, 0)
+	p.WriteString("page_link\tapp/state.json\n")
+	p.Close()
+	plain, err := files.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, reason := plain.decide(object{Key: "app/state.json", Size: 6, MTime: w0}); got != protectLiveSite {
+		t.Errorf("no identity, page_link: got %s (%s), want %s", got, reason, protectLiveSite)
 	}
 }
 
