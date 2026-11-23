@@ -46,7 +46,7 @@ def load_contract():
              "StitchEvidenceSnapshot", "StitchNativeEvidenceStage", "stitch_evidence_index",
              "StitchEvidenceLedger", "StitchEvidenceDispatch", "StitchEvidenceProgress",
              "stitch_evidence_task", "parse_certification_timestamp", "MediaCertificationError"}
-    constants = {"CLIENT_VERSION", "LOW_MEMORY_COPY_CLIENT_VERSION",
+    constants = {"CLIENT_VERSION", "LOW_MEMORY_COPY_CLIENT_VERSION", "LOW_MEMORY_CLEANUP_CLIENT_VERSION",
                  "STITCH_READBACK_SCHEMA_SHA", "STITCH_READBACK_SCHEMA_JSON",
                  "STITCH_PROOF_SCHEMA_SHA", "STITCH_PROOF_SCHEMA_JSON", "V85R_MANIFEST_SHA",
                  "STITCH_POLICY", "STITCH_REVISION", "STITCH_CORPUS_SHA", "STITCH_PROOF_SOURCE_SHA",

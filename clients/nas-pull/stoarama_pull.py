@@ -47,6 +47,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 CLIENT_VERSION = "development"
 CLEANUP_CERTIFIED_STITCH_VERSION = "r2-copy-v7-certified-stitch"
 LOW_MEMORY_COPY_CLIENT_VERSION = "r2-copy-v8-low-memory"
+# The cleanup release is the same low-memory artifact line plus the reviewed
+# cleanup-batch-v8 protocol. Both literals stay copy-only for stitching.
+LOW_MEMORY_CLEANUP_CLIENT_VERSION = "r2-copy-v8-low-memory-cleanup"
+LOW_MEMORY_CLEANUP_VERSIONS = frozenset((LOW_MEMORY_CLEANUP_CLIENT_VERSION,))
 CLEANUP_CERTIFIED_STITCH_REASON = "durham_stitch_certified"
 CLEANUP_CERTIFIED_STITCH_RECOVERY = "nas_stitch_certified"
 CLEANUP_RECONCILIATION_PROTOCOL = 1
@@ -681,7 +685,9 @@ class StitchProofSwitch(NamedTuple):
 class StitchSwitches:
     """Heartbeat authority; an OFF latches cancellation for the current job."""
     def __init__(self):
-        self.local_enabled = (CLIENT_VERSION != LOW_MEMORY_COPY_CLIENT_VERSION and
+        # Both low-memory literals are copy-only; the tuple keeps this class
+        # loadable as an isolated contract fixture.
+        self.local_enabled = (CLIENT_VERSION not in (LOW_MEMORY_COPY_CLIENT_VERSION, LOW_MEMORY_CLEANUP_CLIENT_VERSION) and
                               env_str("STOARAMA_V85_STITCH_ENABLED", "true").lower() == "true")
         self.local_deletion_enabled = env_str("STOARAMA_V85_STITCH_DELETION_ENABLED", "true").lower() == "true"
         cancel = threading.Event()
@@ -2738,16 +2744,40 @@ class CleanupFile:
     def list_parent(self):
         started = time.monotonic()
         before = os.fstat(self.fds[-1])
-        entries = []
         # Entry names define the namespace. Unlisted sibling contents are never
-        # deletion authority. Target/sidecar hash and identity checks stay exact.
-        for name in os.listdir(self.fds[-1]):
-            self.check_active()
-            entries.append(os.fsencode(name).hex())
+        # deletion authority. Target/sidecar hash and identity checks stay exact,
+        # so the digest below is identical whichever enumeration ran.
+        if CLIENT_VERSION in LOW_MEMORY_CLEANUP_VERSIONS:
+            entries = self.scan_parent()
+        else:
+            entries = []
+            for name in os.listdir(self.fds[-1]):
+                self.check_active()
+                entries.append(os.fsencode(name).hex())
         after = os.fstat(self.fds[-1])
         if cleanup_identity(before) != cleanup_identity(after):
             raise RuntimeError("cleanup directory changed during enumeration")
         self.stage_timings["namespace_ms"] = self.stage_timings.get("namespace_ms", 0) + (time.monotonic() - started) * 1000
+        return entries
+
+    def scan_parent(self):
+        """Bounded fd enumeration for the low-memory release.
+
+        os.listdir materializes the whole namespace and every encoded name at
+        once. scandir streams entries from the already-open parent descriptor,
+        checks the lease/permit deadline per entry, and refuses a namespace
+        larger than the fixed entry and encoded-byte caps instead of growing
+        without limit. Names, encoding and the namespace digest are unchanged.
+        """
+        entries, encoded = [], 0
+        with os.scandir(self.fds[-1]) as scanned:
+            for entry in scanned:
+                self.check_active()
+                name = os.fsencode(entry.name).hex()
+                encoded += len(name)
+                if len(entries) >= CLEANUP_NAMESPACE_MAX_ENTRIES or encoded > CLEANUP_NAMESPACE_MAX_ENCODED_BYTES:
+                    raise CleanupSourceDataError("cleanup directory namespace exceeds bound")
+                entries.append(name)
         return entries
 
     def parent_snapshot(self):
@@ -18184,7 +18214,19 @@ def cleanup_lease(cfg, limit=1):
     return lease
 
 
+def cleanup_require_v2():
+    """The low-memory cleanup release fails closed on protocol mismatch.
+
+    Its bound is two dry hashes in the primary lane and one-file execution
+    groups, each with its own fresh permit. Protocol 1 has an eight-worker rolling window with a
+    lease larger than either bound, so this release never uses it. This guard
+    is defence in depth: the loop also refuses to enter the protocol-1 path."""
+    if CLIENT_VERSION in LOW_MEMORY_CLEANUP_VERSIONS:
+        raise CleanupProtocolUnsupported("low-memory cleanup release requires protocol 2")
+
+
 def cleanup_once(cfg, inventory, stop_event):
+    cleanup_require_v2()
     cleanup_replay_receipts(cfg, inventory)
     lease = cleanup_lease(cfg)
     for task in lease["tasks"]:
@@ -18193,7 +18235,10 @@ def cleanup_once(cfg, inventory, stop_event):
 
 
 def cleanup_batch(cfg, inventory, stop_event, executor,
-                  workers=CLEANUP_PREFLIGHT_WORKERS, task_limit=CLEANUP_PREFLIGHT_TASKS, verified_event=None):
+                  workers=None, task_limit=CLEANUP_PREFLIGHT_TASKS, verified_event=None):
+    cleanup_require_v2()
+    if workers is None:
+        workers = min(cleanup_dry_workers(), CLEANUP_PREFLIGHT_WORKERS)
     if type(workers) is not int or not 1 <= workers <= CLEANUP_PREFLIGHT_WORKERS:
         raise ValueError("invalid cleanup worker bound")
     if type(task_limit) is not int or not 1 <= task_limit <= CLEANUP_PREFLIGHT_TASKS:
@@ -18269,12 +18314,26 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
 # protocol 2 reject it with HTTP 400 and the client keeps using protocol 1.
 CLEANUP_V2_LEASE = 64          # tasks per lease request (server maximum)
 CLEANUP_V2_WORKERS = 16        # concurrent dry-run file workers
+# The cleanup-capable low-memory release keeps at most two dry hashes in the
+# primary lane. Its lookahead lane leases one; the group executor proves
+# one file per permit. dry_run_limit alone cannot bound a later lease.
+CLEANUP_LOW_MEMORY_INFLIGHT = 2
+CLEANUP_LOW_MEMORY_WORKERS = 2
+# The lookahead lane may overlap one sequential execution proof. One lookahead
+# hash plus that proof keeps the total at two, the same bound as the primary
+# dry lane, with no third hash anywhere.
+CLEANUP_LOW_MEMORY_LOOKAHEAD = 1
+# One directory listing is refused above these caps. A recording's continuous
+# folder holds every clip and sidecar (about 43k entries, 1.5 MB of hex at the
+# largest on Nov 23), so the caps sit above that and still bound the snapshot.
+CLEANUP_NAMESPACE_MAX_ENTRIES = 65536
+CLEANUP_NAMESPACE_MAX_ENCODED_BYTES = 4 * 1024 * 1024
 CLEANUP_GROUP_VERSION = "cleanup-batch-v6.1"
 CLEANUP_V6_VERSIONS: frozenset[str] = frozenset((CLEANUP_GROUP_VERSION, "r2-copy-v1"))
 CLEANUP_BULK_VERSION = "cleanup-batch-v7"
 CLEANUP_TRUTH_VERSION = "cleanup-batch-v8"
 CLEANUP_FRESH_PERMIT_VERSION = "v85r-nas-proof-v2.2"
-CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, CLEANUP_CERTIFIED_STITCH_VERSION, "r2-copy-v2", "r2-copy-v3", "r2-copy-v4", "r2-copy-v5", "r2-copy-v6", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
+CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, CLEANUP_CERTIFIED_STITCH_VERSION, LOW_MEMORY_CLEANUP_CLIENT_VERSION, "r2-copy-v2", "r2-copy-v3", "r2-copy-v4", "r2-copy-v5", "r2-copy-v6", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
 CLEANUP_GROUP_VERSIONS: frozenset[str] = CLEANUP_V6_VERSIONS | CLEANUP_BULK_VERSIONS
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
@@ -18289,10 +18348,29 @@ CLEANUP_DRAIN_RETRY_SEC = 2
 CLEANUP_RETRYABLE_ATTEMPTS = 8
 
 
+def cleanup_inflight():
+    """Dry-run lease/worker window for this release.
+
+    The new low-memory release is bounded to two local dry hashes. Passing
+    dry_run_limit=2 to one lease does not stop the next lease from filling a
+    larger queue, so the client-side window itself must be small."""
+    return CLEANUP_LOW_MEMORY_INFLIGHT if CLIENT_VERSION in LOW_MEMORY_CLEANUP_VERSIONS else CLEANUP_V2_INFLIGHT
+
+
+def cleanup_dry_workers():
+    """Coordinator executor size for the release's dry-run window."""
+    return CLEANUP_LOW_MEMORY_WORKERS if CLIENT_VERSION in LOW_MEMORY_CLEANUP_VERSIONS else CLEANUP_V2_WORKERS
+
+
+def cleanup_lookahead_workers():
+    """Pipeline lane width. Its hash can overlap one group proof."""
+    return CLEANUP_LOW_MEMORY_LOOKAHEAD if CLIENT_VERSION in LOW_MEMORY_CLEANUP_VERSIONS else 2
+
+
 def cleanup_execution_group_size():
     # One lease/permit clock per file. NAS syscall latency must never consume
     # another file's short authority window. Historical releases retain v7.
-    return 1 if CLIENT_VERSION in (CLEANUP_FRESH_PERMIT_VERSION, CLEANUP_CERTIFIED_STITCH_VERSION, "r2-copy-v4", "r2-copy-v5", "r2-copy-v6") else CLEANUP_EXECUTION_GROUP
+    return 1 if CLIENT_VERSION in (CLEANUP_FRESH_PERMIT_VERSION, CLEANUP_CERTIFIED_STITCH_VERSION, LOW_MEMORY_CLEANUP_CLIENT_VERSION, "r2-copy-v4", "r2-copy-v5", "r2-copy-v6") else CLEANUP_EXECUTION_GROUP
 
 
 class CleanupProtocolUnsupported(RuntimeError):
@@ -18555,7 +18633,7 @@ def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes, execution_onl
 
 
 def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=None,
-                     inflight=CLEANUP_V2_INFLIGHT, task_limit=CLEANUP_V2_CYCLE_TASKS,
+                     inflight=None, task_limit=CLEANUP_V2_CYCLE_TASKS,
                      preflight=None, dry_run_only=False, active=None):
     """Protocol 2 coordinator: rolling window of leased tasks on the executor.
 
@@ -18566,6 +18644,8 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
     Replay is bounded (CLEANUP_REPLAY_BUDGET_SEC) and its failures never stop
     new work from being leased; a leased task whose item still has a journal
     or quarantine entry is left unprocessed (its lease simply expires)."""
+    if inflight is None:
+        inflight = cleanup_inflight()
     if preflight is not None:
         preflight.pause()  # No worker may own a checkpoint while replay starts.
     replay = (dict(failed=0) if dry_run_only else
@@ -19167,10 +19247,11 @@ class CleanupPreflight:
     def run(self):
         api = CleanupBatchAPI(self.cfg)
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="cleanup-dry") as executor:
+            workers = cleanup_lookahead_workers()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cleanup-dry") as executor:
                 while self.active.is_set() and not self.stop_event.is_set():
                     retry = cleanup_batch_v2(self.cfg, self.inventory, self.stop_event, executor, api,
-                        inflight=2, task_limit=128, dry_run_only=True, active=self.active)
+                        inflight=workers, task_limit=128, dry_run_only=True, active=self.active)
                     if retry:
                         # Poll the active flag promptly; never keep pause() in
                         # the normal empty-queue two-minute sleep.
@@ -19192,7 +19273,9 @@ def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
     v2_after = 0.0
     api = None
     preflight = CleanupPreflight(cfg, inventory, stop_event)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(CLEANUP_PREFLIGHT_WORKERS, CLEANUP_V2_WORKERS), thread_name_prefix="nas-cleanup") as executor:
+    # The shared dry-run executor is sized by release policy as well as the
+    # lease window, so a wide pool cannot be refilled past the low-memory bound.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=cleanup_dry_workers(), thread_name_prefix="nas-cleanup") as executor:
         try:
             while not stop_event.wait(wait):
                 v2 = time.monotonic() >= v2_after
@@ -19204,6 +19287,15 @@ def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
                         try:
                             retry = cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=verified_event, preflight=preflight)
                         except CleanupProtocolUnsupported as exc:
+                            if CLIENT_VERSION in LOW_MEMORY_CLEANUP_VERSIONS:
+                                # The low-memory release is admitted only for the
+                                # bounded protocol-2 group path. Never fall back to
+                                # the wider protocol-1 loop; stay closed and retry
+                                # on the slow fallback cadence, not the error loop.
+                                log("ERROR", "low-memory cleanup requires protocol 2: %s" % exc)
+                                CLEANUP_STATUS.fail("protocol: %s" % exc)
+                                wait = restore_wait(CLEANUP_V2_FALLBACK_SEC)
+                                continue
                             log("INFO", "NAS cleanup using protocol 1: %s" % exc)
                             v2_after, v2 = time.monotonic() + CLEANUP_V2_FALLBACK_SEC, False
                     if retry is None:

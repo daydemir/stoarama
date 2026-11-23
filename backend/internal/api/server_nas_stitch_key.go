@@ -239,7 +239,7 @@ func (s *Server) ordinaryNASStitchCaller(w http.ResponseWriter, r *http.Request)
 			util.WriteError(w, 503, "stitch client version unavailable")
 			return nasStitchCaller{}, false
 		}
-		if version == nasLowMemoryCopyClientVersion {
+		if nasLowMemoryRawCopyOnly(version) {
 			util.WriteError(w, 409, "low-memory client is copy-only")
 			return nasStitchCaller{}, false
 		}

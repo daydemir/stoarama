@@ -429,17 +429,21 @@ func TestNASR2CopyConcurrentLeaseSlotsAndExpiredOwner(t *testing.T) {
 }
 
 func TestNASR2CopyLowMemoryClientGetsOneLiveLease(t *testing.T) {
-	f, item := copyTestFixture(t)
-	f.useClientVersion(nasLowMemoryCopyClientVersion)
-	f.s.cfg.NASR2CopyEnabled = true
-	queueCopySources(t, f, item)
-	copyLease(t, f)
-	out := copyCall(f, "lease", 0, nasR2CopyControl{FreeBytes: NASR2CopyFloor + 1e9})
-	var result struct {
-		Task *nasR2CopyTask `json:"task"`
-	}
-	if err := json.Unmarshal(out.Body.Bytes(), &result); err != nil || out.Code != 200 || result.Task != nil {
-		t.Fatalf("second lease admitted: %d %s", out.Code, out.Body)
+	for _, version := range []string{nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion} {
+		t.Run(version, func(t *testing.T) {
+			f, item := copyTestFixture(t)
+			f.useClientVersion(version)
+			f.s.cfg.NASR2CopyEnabled = true
+			queueCopySources(t, f, item)
+			copyLease(t, f)
+			out := copyCall(f, "lease", 0, nasR2CopyControl{FreeBytes: NASR2CopyFloor + 1e9})
+			var result struct {
+				Task *nasR2CopyTask `json:"task"`
+			}
+			if err := json.Unmarshal(out.Body.Bytes(), &result); err != nil || out.Code != 200 || result.Task != nil {
+				t.Fatalf("second lease admitted: %d %s", out.Code, out.Body)
+			}
+		})
 	}
 }
 

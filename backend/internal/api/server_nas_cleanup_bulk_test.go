@@ -7,13 +7,13 @@ import (
 )
 
 func TestNASCleanupBulkDurabilitySessionGates(t *testing.T) {
-	for _, v := range []string{nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion, nasCleanupR2CopyControlClientVersion, nasCleanupItemTruthClientVersion} {
+	for _, v := range []string{nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion, nasCleanupR2CopyControlClientVersion, nasCleanupItemTruthClientVersion, nasLowMemoryCleanupClientVersion} {
 		t.Run(v, func(t *testing.T) { testNASCleanupReviewedReleaseGates(t, v) })
 	}
 }
 
 func TestNASCleanupBulkDurabilityRequiresCompleteFreshLease(t *testing.T) {
-	for _, v := range []string{nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion, nasCleanupR2CopyControlClientVersion, nasCleanupItemTruthClientVersion} {
+	for _, v := range []string{nasCleanupBulkDurabilityClientVersion, nasCleanupR2CopyClientVersion, nasCleanupR2CopyControlClientVersion, nasCleanupItemTruthClientVersion, nasLowMemoryCleanupClientVersion} {
 		t.Run(v, func(t *testing.T) { testNASCleanupBulkDurabilityRequiresCompleteFreshLease(t, v) })
 	}
 }

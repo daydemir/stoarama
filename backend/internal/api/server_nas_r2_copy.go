@@ -374,7 +374,7 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 	version, _ := nasRequestWorkVersion(r, nasConnectionCopy)
 	stitch := s.nasR2StitchCopyEnabled(version)
 	leaseLimit := NASR2CopyWorkers
-	if version == nasLowMemoryCopyClientVersion {
+	if nasLowMemoryRawCopyOnly(version) {
 		leaseLimit = 1
 	}
 	// A concurrent grant can consume the prepared row. Retry a bounded number
@@ -594,7 +594,7 @@ func (s *Server) nasR2CopyActive(w http.ResponseWriter, r *http.Request, purpose
 		util.WriteError(w, 409, "copy lease or policy expired")
 		return nil, t, version, req, false
 	}
-	if t.Item.Kind != NASR2CopyRaw && clientVersion == nasLowMemoryCopyClientVersion {
+	if t.Item.Kind != NASR2CopyRaw && nasLowMemoryRawCopyOnly(clientVersion) {
 		fail()
 		util.WriteError(w, 409, "low-memory client requires a raw copy lease")
 		return nil, t, version, req, false

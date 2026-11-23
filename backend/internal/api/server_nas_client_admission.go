@@ -38,13 +38,24 @@ func nasCleanupSupportsExecution(version string) bool {
 
 const nasLowMemoryCopyClientVersion = "r2-copy-v8-low-memory"
 
+// The cleanup release is the same low-memory artifact line plus the reviewed
+// cleanup-batch-v8 protocol. It is a separate immutable literal: copy-only
+// admission for the older release stays exactly as deployed.
+const nasLowMemoryCleanupClientVersion = "r2-copy-v8-low-memory-cleanup"
+
+// Both low-memory literals keep the same raw-copy-only lease behavior and
+// never acquire native-proof, stitch, or ordinary-stitch authority.
+func nasLowMemoryRawCopyOnly(version string) bool {
+	return version == nasLowMemoryCopyClientVersion || version == nasLowMemoryCleanupClientVersion
+}
+
 // These literals name releases with the current raw-copy contract. A version
 // prefix or a source checkout's default label never qualifies for media work.
 func nasCopySupportsVersion(version string) bool {
 	switch version {
 	case nasCleanupCertifiedStitchVersion, NASR2CopyPagedClientVersion, nasCleanupR2CopyDiagnosticsClientVersion, nasCleanupR2CopyProgressClientVersion, nasCleanupR2CopyClientVersion, "v85r-nas-proof-v1", nasCleanupProofClientVersion,
 		nasCleanupR2CopyControlClientVersion, nasCleanupItemTruthClientVersion, nasCleanupFreshPermitClientVersion,
-		nasLowMemoryCopyClientVersion:
+		nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion:
 		return true
 	default:
 		return false
