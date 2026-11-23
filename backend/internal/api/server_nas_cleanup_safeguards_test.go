@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const safeguardPolicy = "060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811"
+const safeguardPolicy = "bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393"
 
 // Safeguard 1: only a streamed-SHA-verified R2 recovery copy can ever yield a
 // deletion permit; nas_only_at_check never does.

@@ -1,23 +1,35 @@
 # Exact NAS cleanup safety contract
 
-## Current policy: keep28 (one 28-day period per stream)
+## Current policy: window 20 (one 20-day period per stream)
 
-Approved by Deniz (2026-11). Each of the 109 streams keeps exactly ONE period:
-its best 14 local days ±7 days, i.e. `[best_start-7d, best_start+21d)` in the
-stream's canonical local timezone (28 local days). Every NAS file outside that
-period is cleanup-eligible, including raw clips and stitched outputs behind
-published deliveries, collation manifests or joined-source snapshots. Nothing
-inside the period can be admitted, observed as `would_delete`, or deleted.
+Approved by Deniz (2026-11, verbatim: "lets do window 20, just ekep cleaning
+and reducing"). Each of the 109 streams keeps exactly ONE period: its best 14 local
+days shifted to 20 local days, i.e. `[best_start-3d, best_start+17d)` in the
+stream's canonical local timezone. Streams whose pinned manifest sets
+`keep_everything` (23 of 109) stay whole in R2; their NAS copies use the same
+20-day window and leave only against a live, verified R2 copy (SHA-256, or a
+bound MD5/ETag match) (never by the
+certified-stitch or any NAS-only path). Every NAS file outside the 20-day period is cleanup-eligible,
+including raw clips and stitched outputs behind published deliveries, collation
+manifests or joined-source snapshots. Nothing inside the period can be
+admitted, observed as `would_delete`, or deleted.
 
-- **Policy source.** `backend/internal/api/nas_cleanup_keep28_policy.json` is
-  `~/stoarama-r2-select/selection.json` byte-for-byte (SHA-256
-  `060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811`), generated
-  by `select.py`: per local day, the union of seconds covered by clips not in
-  the collation-quarantine set (R2 availability not required); best 14-day sum;
-  ties go to the earliest start. It is embedded with `go:embed`; the server
-  refuses every cleanup decision unless the bytes hash to the pinned SHA, there
-  are exactly 109 distinct streams, and each window is exactly 28 local days
-  centred on `best_start` with UTC bounds equal to local midnights.
+- **Policy source.** `backend/internal/api/nas_cleanup_keep20_policy.json` is
+  the exact `$policy$` manifest that migration
+  `0236_nas_media_work_keep20.sql` freezes (SHA-256
+  `bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393`, 109
+  windows, 23 keep-everything). The legacy selection
+  (`nas_cleanup_keep28_policy.json`, SHA
+  `060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811`) is
+  retained byte-for-byte as provenance and for the lanes that keep a 28-day
+  binding. Both are embedded with `go:embed`; the server refuses every cleanup
+  decision unless the active bytes hash to the pinned SHA, there are exactly 109
+  distinct streams, and every window is exactly 20 local days centred on the
+  legacy `best_start` (`[best-3d, best+17d)`), lands on local midnights, and is
+  contained in the legacy window. Any drift keeps everything.
+- **DST.** Window length is 20 *local* days. Two windows (streams 94 and 17337)
+  cross a fall-back transition and span 481 UTC hours; nothing may assume a
+  fixed 480 hours.
 - **Per-file KEEP decision** (every dry-run and enabled observation): the file's
   directory is a reviewed folder owned only by the file's stream; the file and
   every source clip are valid, nonempty intervals that do not intersect the
@@ -36,20 +48,27 @@ inside the period can be admitted, observed as `would_delete`, or deleted.
   NAS_CLEANUP.md safeguards); path confinement; per-plan enable with the
   expected plan SHA, a complete dry run fresher than 24 h and a 1-hour approval;
   and the backend `NAS_CLEANUP_DELETION_ENABLED` master switch (default off).
-- **Plan binding.** New plans store the keep28 policy SHA in
-  `nas_cleanup_plans.report_sha256`. Plans bound to any other policy are never
-  leased, are observed only as `keep`, and can only be paused or retired.
+- **Plan binding.** New plans (prepare, lease, observe, control, ranking,
+  plan digest, report, batch) all store and check the active 20-day policy SHA
+  in `nas_cleanup_plans.report_sha256`. Plans bound to any other policy
+  (including every keep28 plan) are never leased, are observed only as `keep`,
+  refuse new leases/control/permits/rechecks/batches, and can only be paused or
+  retired. Honest old receipts and item evidence are preserved verbatim.
 
 ### Retiring plans built for the old policy
 
 Migration `0170_nas_cleanup_retired_plans.sql` adds the terminal `retired` mode.
 Retired plans keep every row (plans, items, holds); their holds stop blocking R2
 purges exactly like paused holds. Plans that are enabled or ever issued a
-deletion are never retired.
+deletion are never retired. `retire-superseded` never sweeps a bulk set: a plan
+is retirable only when it holds no unresolved item (`leased`, `delete_issued`,
+`unverified`, `conflict`, `missing`), never issued a deletion, names no
+incident-roster identity and holds no delivery-kept file or dependency.
+Everything else is reported as `not_retirable` and must be reconciled.
 
 ```sh
-stoaramactl nas-cleanup retire-superseded --reason "keep28 policy supersedes 2026-11-02 plans"            # preview, no change
-stoaramactl nas-cleanup retire-superseded --reason "keep28 policy supersedes 2026-11-02 plans" --expected-plans N
+stoaramactl nas-cleanup retire-superseded --reason "window 20 supersedes keep28 plans"            # preview, no change
+stoaramactl nas-cleanup retire-superseded --reason "window 20 supersedes keep28 plans" --expected-plans N
 ```
 
 ### Preparing plans and a pilot
@@ -66,12 +85,14 @@ replanning. Issued identities remain excluded forever and the existing
 plan-wide R2 recovery holds remain. Use a new label prefix and complete a fresh
 dry run and owner approval; see [the close/reconciliation runbook](NAS_CLEANUP.md).
 
-`backend/scripts/nas-cleanup/prepare_keep28_plans.py` lists every outside-window
-raw clip present on the NAS (`nas_inventory_files`) and every collated output
-acknowledged on the NAS (`recording_collation_output_acks`) whose sources are
-all outside, in a read-only DB transaction; it batches them per stream, kind and
-recovery class (`-nasonly` for R2-purged sources) into plans of at most 500
-items. Without `--submit` it only writes the plan inputs and a summary.
+`backend/scripts/nas-cleanup/prepare_keep28_plans.py` (name is historical) lists
+every outside-window raw clip present on the NAS (`nas_inventory_files`) and
+every collated output acknowledged on the NAS
+(`recording_collation_output_acks`) whose sources are all outside the active
+20-day window, in a read-only DB transaction, keep-everything streams included
+(their items still need live R2 verification). It batches them per stream, kind and recovery class (`-nasonly` for
+R2-purged sources) into plans of at most 500 items. Without `--submit` it only
+writes the plan inputs and a summary.
 
 ```sh
 # Pilot: one stream, one plan of at most ~5 GB, read-only dry run only.

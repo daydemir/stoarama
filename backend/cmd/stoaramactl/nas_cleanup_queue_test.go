@@ -55,17 +55,35 @@ func TestNASCleanupCLIRetireSupersededPreviewThenExactCount(t *testing.T) {
 
 // The same vector is pinned in internal/api (cleanupBatchDigest) and in
 // backend/scripts/nas-cleanup/test_prepare_keep28_plans.py (batch_digest).
+// The digest algorithm is version-free; both the legacy keep28 pin and the
+// active 20-day pin stay exact cross-repo regression vectors.
 const batchDigestVector = "f2e8d37dca0fcb75e902fc2a1e4271022dc8cc23b5f6f1d4cbca53b9be8e3328"
+const keep20BatchDigestVector = "a98f3220d7f8cf754d824b2e01bd9d96406fe470f568798519a2b47c68e2f1df"
 
 func batchVectorManifest(digest string) []byte {
-	b, _ := json.Marshal(map[string]any{"policy_sha256": "060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811", "batch_sha256": digest,
+	return batchVectorManifestFor(keep28PolicySHA, digest)
+}
+
+func batchVectorManifestFor(policy, digest string) []byte {
+	b, _ := json.Marshal(map[string]any{"policy_sha256": policy, "batch_sha256": digest,
 		"plans": []map[string]any{{"id": 1388, "plan_sha256": "a4a8bc7137d732ec9bf68df6e823b7ce4527e7cb4a13afdd05b87bc544601ccc"}, {"id": 1389, "plan_sha256": strings.Repeat("b", 64)}}})
 	return b
 }
 
+const keep28PolicySHA = "060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811"
+const keep20PolicySHA = "bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393"
+
 func TestNASCleanupCLIEnableBatchSendsExactApprovedDigest(t *testing.T) {
 	if _, _, err := nasCleanupBatchManifest(batchVectorManifest(strings.Repeat("0", 64))); err == nil {
 		t.Fatal("manifest with a wrong digest field accepted")
+	}
+	// The active 20-day pin has its own exact vector; a keep28 digest under it
+	// never matches, so an old manifest cannot arm a batch.
+	if _, got, err := nasCleanupBatchManifest(batchVectorManifestFor(keep20PolicySHA, keep20BatchDigestVector)); err != nil || got != keep20BatchDigestVector {
+		t.Fatalf("keep20 batch vector differs: %q %v", got, err)
+	}
+	if _, _, err := nasCleanupBatchManifest(batchVectorManifestFor(keep20PolicySHA, batchDigestVector)); err == nil {
+		t.Fatal("legacy digest under the 20-day pin accepted")
 	}
 	ids, digest, err := nasCleanupBatchManifest(batchVectorManifest(batchDigestVector))
 	if err != nil || digest != batchDigestVector || len(ids) != 2 || ids[0] != 1388 {

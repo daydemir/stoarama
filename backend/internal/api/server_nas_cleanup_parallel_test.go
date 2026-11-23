@@ -10,7 +10,7 @@ import (
 func TestNASCleanupConcurrentObservationStillFencesControl(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
-	_, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'parallel','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[]',repeat('b',64));INSERT INTO nas_cleanup_items(id,plan_id,ordinal)VALUES(1,1,1),(2,1,2)`)
+	_, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'parallel','bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393','[]',repeat('b',64));INSERT INTO nas_cleanup_items(id,plan_id,ordinal)VALUES(1,1,1),(2,1,2)`)
 	if err != nil {
 		t.Fatal(err)
 	}

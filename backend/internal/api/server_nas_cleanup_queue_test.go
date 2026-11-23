@@ -17,11 +17,11 @@ func TestNASCleanupPriorityAndReadOnlyResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode,approved_until,approval_reason,priority) VALUES
- (1,47,13,'bulk','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":1},{"kind":"raw","source_id":2}]',repeat('b',64),'dry_run',NULL,'',0),
- (2,47,13,'pilot','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":3}]',repeat('b',64),'dry_run',NULL,'',0),
- (3,47,13,'paused','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":4}]',repeat('b',64),'paused',NULL,'',100),
- (4,47,13,'master-fenced','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":5,"stream_id":3}]',repeat('b',64),'enabled',now()+interval '1 hour','fixture',100),
- (5,48,14,'foreign','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":6}]',repeat('b',64),'dry_run',NULL,'',100);
+ (1,47,13,'bulk','bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393','[{"kind":"raw","source_id":1},{"kind":"raw","source_id":2}]',repeat('b',64),'dry_run',NULL,'',0),
+ (2,47,13,'pilot','bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393','[{"kind":"raw","source_id":3}]',repeat('b',64),'dry_run',NULL,'',0),
+ (3,47,13,'paused','bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393','[{"kind":"raw","source_id":4}]',repeat('b',64),'paused',NULL,'',100),
+ (4,47,13,'master-fenced','bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393','[{"kind":"raw","source_id":5,"stream_id":3}]',repeat('b',64),'enabled',now()+interval '1 hour','fixture',100),
+ (5,48,14,'foreign','bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393','[{"kind":"raw","source_id":6}]',repeat('b',64),'dry_run',NULL,'',100);
  INSERT INTO nas_cleanup_items(id,plan_id,ordinal) VALUES(1,1,1),(2,1,2),(100,2,1),(200,3,1),(300,4,1),(400,5,1);`)
 	if err != nil {
 		t.Fatal(err)
@@ -133,8 +133,8 @@ func TestNASCleanupPriorityProbeSkipsLockedPlan(t *testing.T) {
 	ctx := context.Background()
 	s := &Server{pool: pool}
 	_, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,priority) VALUES
- (1,47,13,'old','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":1}]',repeat('b',64),0),
- (2,47,13,'new','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":2}]',repeat('b',64),100);
+ (1,47,13,'old','bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393','[{"kind":"raw","source_id":1}]',repeat('b',64),0),
+ (2,47,13,'new','bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393','[{"kind":"raw","source_id":2}]',repeat('b',64),100);
  INSERT INTO nas_cleanup_items(id,plan_id,ordinal) VALUES(1,1,1),(2,2,1);`)
 	if err != nil {
 		t.Fatal(err)
@@ -169,7 +169,7 @@ func TestNASCleanupSupersededPlansAreInertAndRetire(t *testing.T) {
  INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode,approved_until,approval_reason) VALUES
  (1,47,13,'old-dry',repeat('a',64),'[{"kind":"raw","source_id":1,"stream_id":3}]',repeat('b',64),'dry_run',NULL,''),
  (2,47,13,'old-paused',repeat('a',64),'[{"kind":"raw","source_id":2}]',repeat('b',64),'paused',NULL,''),
- (3,47,13,'current','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":3}]',repeat('b',64),'dry_run',NULL,''),
+ (3,47,13,'current','bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393','[{"kind":"raw","source_id":3}]',repeat('b',64),'dry_run',NULL,''),
  (4,47,13,'old-issued',repeat('a',64),'[{"kind":"raw","source_id":4}]',repeat('b',64),'paused',NULL,''),
  (5,47,13,'old-enabled',repeat('a',64),'[{"kind":"raw","source_id":5,"stream_id":3}]',repeat('b',64),'enabled',now()+interval '1 hour','fixture');
  INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state) VALUES(1,1,1,'pending'),(2,2,1,'would_delete'),(3,3,1,'pending'),(5,5,1,'pending');
@@ -242,5 +242,65 @@ func TestNASCleanupSupersededPlansAreInertAndRetire(t *testing.T) {
 	}
 	if control(1, "paused") != 409 {
 		t.Fatal("retired plan controllable")
+	}
+}
+
+// Activating the 20-day policy supersedes every keep28 plan at once, so
+// retirement must stay a narrow, one-plan-at-a-time statement: an unresolved
+// lease, uncertain receipt, incident identity or delivery hold is never
+// bulk-retired, and nothing is released automatically.
+func TestNASCleanupRetireSupersededNeverSweepsUnresolvedPlans(t *testing.T) {
+	pool := cleanupTestPool(t)
+	ctx := context.Background()
+	s := &Server{pool: pool}
+	// 901 is an incident raw identity in the fixture roster view.
+	_, err := pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,purged_at,object_key,sha256,size_bytes,display_path,clip_start_at,clip_end_at,bucket) VALUES
+ (1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket'),
+ (2,2,NULL,'object',repeat('a',64),3,'a/c.mp4','2026-09-01','2026-09-01 00:01:00','bucket'),
+ (901,2,NULL,'object',repeat('a',64),3,'a/i.mp4','2026-09-01','2026-09-01 00:01:00','bucket');
+ INSERT INTO nas_cleanup_incident_roster(kind,source_id,bucket,object_key,raw_source_ids) VALUES('raw',901,'','',ARRAY[901::bigint]);
+ INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode) VALUES
+ (1,47,13,'resolved','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811',('[{"kind":"raw","source_id":1,"relative_path":"a/b.mp4","sha256":"'||repeat('a',64)||'","size_bytes":3}]')::jsonb,repeat('b',64),'dry_run'),
+ (2,47,13,'leased','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811',('[{"kind":"raw","source_id":2,"relative_path":"a/c.mp4","sha256":"'||repeat('a',64)||'","size_bytes":3}]')::jsonb,repeat('c',64),'paused'),
+ (3,47,13,'incident','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811',('[{"kind":"raw","source_id":901,"relative_path":"a/i.mp4","sha256":"'||repeat('a',64)||'","size_bytes":3}]')::jsonb,repeat('d',64),'dry_run');
+ INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state) VALUES(1,1,1,'would_delete'),(2,2,1,'leased'),(3,3,1,'would_delete');`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retire := func(body map[string]any) (int, map[string]any) {
+		w := cleanupCall(t, s.handleAdminNASCleanupRetireSuperseded, 47, 5, "", "", body)
+		var out map[string]any
+		json.Unmarshal(w.Body.Bytes(), &out)
+		return w.Code, out
+	}
+	code, preview := retire(map[string]any{"reason": "20-day supersedes keep28"})
+	if code != 200 || preview["preview"] != true || preview["plans"] != float64(1) || preview["not_retirable"] != float64(2) {
+		t.Fatalf("retire scope: %d %v", code, preview)
+	}
+	if ids, ok := preview["plan_ids"].([]any); !ok || len(ids) != 1 || ids[0] != float64(1) {
+		t.Fatalf("wrong retirable plan set: %v", preview["plan_ids"])
+	}
+	// A wrong expected count changes nothing.
+	if code, _ = retire(map[string]any{"reason": "20-day supersedes keep28", "expected_plans": 3}); code != 409 {
+		t.Fatal("retirement ignored the expected count")
+	}
+	if code, _ = retire(map[string]any{"reason": "20-day supersedes keep28", "expected_plans": 1}); code != 200 {
+		t.Fatal("resolved plan was not retired")
+	}
+	var modes string
+	if err = pool.QueryRow(ctx, `SELECT string_agg(mode,',' ORDER BY id) FROM nas_cleanup_plans`).Scan(&modes); err != nil || modes != "retired,paused,dry_run" {
+		t.Fatalf("unresolved or incident plans were swept: %s %v", modes, err)
+	}
+	var leaked bool
+	if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_plans WHERE mode='retired' AND id<>1)`).Scan(&leaked); err != nil || leaked {
+		t.Fatal("retirement reached beyond the resolved plan")
+	}
+	// The expected-count gate is the only way to retire; a plan that later
+	// becomes unresolved is simply not retirable.
+	if _, err = pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='conflict' WHERE id=3`); err != nil {
+		t.Fatal(err)
+	}
+	if code, preview = retire(map[string]any{"reason": "20-day supersedes keep28"}); code != 200 || preview["plans"] != float64(0) {
+		t.Fatalf("conflict plan became retirable: %d %v", code, preview)
 	}
 }

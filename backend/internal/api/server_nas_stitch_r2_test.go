@@ -85,7 +85,11 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
  VALUES(30,47,1,'test','https://storage.example.test','* * * * *','Asia/Tokyo','paused',3,now());
 INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b',decode('00','hex'));`)
 	_, windows, _ := Keep28Policy()
-	hour := windows[3].Start.Truncate(time.Hour).UTC()
+	// Certified cleanup retires sources inside the ACTIVE 20-day cleanup
+	// window, which is narrower than (and contained in) the retained 28-day
+	// stitch window. The fixture hour therefore comes from the active window.
+	_, active, _ := CleanupWindowPolicy()
+	hour := active[3].Start.Truncate(time.Hour).UTC()
 	end := hour.Add(time.Minute)
 	const sourceKey = "managed/durham-fixture.mp4"
 	const captureLease = "00000000-0000-0000-0000-000000000099"
@@ -307,7 +311,7 @@ INSERT INTO nas_stitch_corpus(sha256,body) VALUES('5b2765ecb4f6483c8e48b5a6c958c
 	if err := pool.QueryRow(ctx, `INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,
  policy_sha256,item,state,lease_token,lease_expires_at,etag)
  VALUES(13,'stitch_output',123,$1,$2,$3,'leased',$4,clock_timestamp()+interval '2 minutes','stage-etag')
- RETURNING id`, manifest, cleanupPolicySHA, string(data), request.Token).Scan(&copyID); err != nil {
+ RETURNING id`, manifest, cleanupLegacyKeep28SHA, string(data), request.Token).Scan(&copyID); err != nil {
 		t.Fatal(err)
 	}
 	t.Run("split outputs certify together and cover their own clips", func(t *testing.T) {

@@ -72,7 +72,7 @@ func testCertifiedStitchSplitOutput(t *testing.T, tx pgx.Tx, hourID, firstCopyID
 	if err := tx.QueryRow(ctx, `INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,
  policy_sha256,item,state,lease_token,lease_expires_at,etag)
  VALUES(13,'stitch_output',124,$1,$2,$3,'leased',$4,clock_timestamp()+interval '2 minutes','second-etag')
- RETURNING id`, sha, cleanupPolicySHA, string(secondItem), secondRequest.Token).Scan(&secondCopyID); err != nil {
+ RETURNING id`, sha, cleanupLegacyKeep28SHA, string(secondItem), secondRequest.Token).Scan(&secondCopyID); err != nil {
 		t.Fatal(err)
 	}
 	if err := finishNASR2StitchCopy(ctx, tx, nasR2CopyTask{ID: firstCopyID, Item: first}, firstRequest); err != nil {
@@ -134,7 +134,7 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
   repeat('a',64),$2,repeat('b',64),repeat('b',64),'st',jsonb_build_object(
    'ConnectionID',13,'SourceID',c.clip_id,'Path',c.relative_path,'SizeBytes',c.size_bytes,'SHA',c.sha256,
    'SidecarPath',c.relative_path||'.stoarama.json','SidecarSize',50,'SidecarSHA',repeat('f',64))
- FROM nas_stitch_r2_certified_raw c WHERE c.hour_id=$1 AND c.clip_id=901`, hourID, cleanupPolicySHA)
+ FROM nas_stitch_r2_certified_raw c WHERE c.hour_id=$1 AND c.clip_id=901`, hourID, cleanupLegacyKeep28SHA)
 	exec(`INSERT INTO r2_keep28_attempts(bucket,object_key) VALUES('stoarama',$1)`, key)
 	count(ready, 0)
 	const retirement = `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256,already_absent)
@@ -146,7 +146,7 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, retirement, hourID, cleanupPolicySHA, true); err != nil {
+	if _, err := tx.Exec(ctx, retirement, hourID, cleanupLegacyKeep28SHA, true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE recording_clips SET purged_at=clock_timestamp() WHERE id=901`); err != nil {
@@ -162,7 +162,7 @@ func testCertifiedStitchNASCleanup(t *testing.T, s *Server, hourID int64, key st
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
-	exec(retirement, hourID, cleanupPolicySHA, false)
+	exec(retirement, hourID, cleanupLegacyKeep28SHA, false)
 	exec(`UPDATE recording_clips SET purged_at=clock_timestamp() WHERE id=901`)
 	count(ready, 0)
 	exec(absent, key)

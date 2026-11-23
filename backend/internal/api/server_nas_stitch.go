@@ -258,7 +258,7 @@ func (s *Server) handleAdminNASStitchScope(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, 400, "invalid scope")
 		return
 	}
-	policy, err := cleanupEmbeddedPolicy()
+	policy, err := cleanupEmbeddedKeep28Policy()
 	if err != nil {
 		util.WriteError(w, 409, "keep policy unavailable")
 		return
@@ -551,7 +551,7 @@ func (s *Server) stitchPlanNext(ctx context.Context, tx pgx.Tx) (nasStitchTask, 
 }
 
 func buildNASStitchPlan(ctx context.Context, tx pgx.Tx, t nasStitchTask, start, end, hour time.Time, bucket string, origin nasStitchProofOrigin, lockCatalog bool) (nasStitchTask, error) {
-	policy, err := cleanupEmbeddedPolicy()
+	policy, err := cleanupEmbeddedKeep28Policy()
 	if err != nil {
 		return t, err
 	}
@@ -635,7 +635,7 @@ func buildNASStitchPlan(ctx context.Context, tx pgx.Tx, t nasStitchTask, start, 
 	t.Plan.Policy = nasStitchPolicy
 	t.Plan.Revision = nasStitchRevision
 	t.Plan.CorpusSHA = nasStitchCorpusSHA
-	t.Plan.KeepSHA = cleanupPolicySHA
+	t.Plan.KeepSHA = cleanupLegacyKeep28SHA
 	// New versioned sibling tree; never replace raw or previous joined output.
 	first := strings.Split(t.Plan.Clips[0].RelativePath, "/")[0]
 	t.Plan.OutputFolder = first + "_V85r_keep28/" + strconv.FormatInt(t.Plan.RecordingID, 10) + "/" + hour.UTC().Format("2006-01-02T15-04-05Z")

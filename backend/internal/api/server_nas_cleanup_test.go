@@ -146,7 +146,7 @@ func TestNASCleanupLeaseRetriesAndMasterOff(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
 	s := &Server{pool: pool}
-	_, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":1}]',repeat('b',64));INSERT INTO nas_cleanup_items(id,plan_id,ordinal) VALUES(1,1,1);`)
+	_, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393','[{"kind":"raw","source_id":1}]',repeat('b',64));INSERT INTO nas_cleanup_items(id,plan_id,ordinal) VALUES(1,1,1);`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func TestNASCleanupLeaseRetriesAndMasterOff(t *testing.T) {
 func TestNASCleanupRecoveryHoldFencesOldPurgeAndMetadata(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
-	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":1,"stream_id":3}]',repeat('b',64));INSERT INTO nas_cleanup_items(id,plan_id,ordinal) VALUES(1,1,1);INSERT INTO nas_cleanup_source_holds VALUES(1,1);`)
+	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393','[{"kind":"raw","source_id":1,"stream_id":3}]',repeat('b',64));INSERT INTO nas_cleanup_items(id,plan_id,ordinal) VALUES(1,1,1);INSERT INTO nas_cleanup_source_holds VALUES(1,1);`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,7 +335,7 @@ func TestNASCleanupHoldClosesConcurrentOldPurgeAdmissionRace(t *testing.T) {
 	if !waiting {
 		t.Fatal("old purge did not reach the expected row-lock fence")
 	}
-	if _, err = admission.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[]',repeat('b',64));INSERT INTO nas_cleanup_source_holds VALUES(1,1)`); err != nil {
+	if _, err = admission.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393','[]',repeat('b',64));INSERT INTO nas_cleanup_source_holds VALUES(1,1)`); err != nil {
 		t.Fatal(err)
 	}
 	if err = admission.Commit(ctx); err != nil {
@@ -349,7 +349,7 @@ func TestNASCleanupHoldClosesConcurrentOldPurgeAdmissionRace(t *testing.T) {
 func TestNASCleanupNewReferencesAndPublicGenerationAreFenced(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
-	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode,approved_until,approval_reason) VALUES(1,47,13,'fixture','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[]',repeat('b',64),'enabled',now()+interval '1 hour','fixture');INSERT INTO nas_cleanup_source_holds VALUES(1,1);`)
+	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode,approved_until,approval_reason) VALUES(1,47,13,'fixture','bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393','[]',repeat('b',64),'enabled',now()+interval '1 hour','fixture');INSERT INTO nas_cleanup_source_holds VALUES(1,1);`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +400,7 @@ func TestNASCleanupOperatorRoutesRequireServiceCredential(t *testing.T) {
 func TestNASCleanupCollatedHoldAllowsNonIdentityBookkeeping(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
-	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO recording_collation_hours VALUES(1,2,0,'{"clips":[{"clip":{"clip_id":1}}]}');INSERT INTO recording_collation_outputs(id,collation_hour_id,nas_relative_path,object_key,sha256,size_bytes,start_at,end_at,source_clip_ids) VALUES(9,1,'a/b.mp4','joined/object',repeat('a',64),3,'2026-09-01','2026-09-01 00:01:00',ARRAY[1::bigint]);INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"collated","source_id":9}]',repeat('b',64));INSERT INTO nas_cleanup_source_holds VALUES(1,1);`)
+	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO recording_collation_hours VALUES(1,2,0,'{"clips":[{"clip":{"clip_id":1}}]}');INSERT INTO recording_collation_outputs(id,collation_hour_id,nas_relative_path,object_key,sha256,size_bytes,start_at,end_at,source_clip_ids) VALUES(9,1,'a/b.mp4','joined/object',repeat('a',64),3,'2026-09-01','2026-09-01 00:01:00',ARRAY[1::bigint]);INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393','[{"kind":"collated","source_id":9}]',repeat('b',64));INSERT INTO nas_cleanup_source_holds VALUES(1,1);`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +417,7 @@ func TestNASCleanupReferenceAdmissionSerializesWithArmingButNotPermanentRecovery
 	seedCleanupPinnedRankings(t, pool)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":1,"stream_id":3}]',repeat('b',64));INSERT INTO nas_cleanup_source_holds VALUES(1,1);INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state,proof,recovery,recovery_evidence) VALUES(1,1,1,'would_delete','{}','r2_sha_verified','{"etag":"fixture"}');`)
+	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393','[{"kind":"raw","source_id":1,"stream_id":3}]',repeat('b',64));INSERT INTO nas_cleanup_source_holds VALUES(1,1);INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state,proof,recovery,recovery_evidence) VALUES(1,1,1,'would_delete','{}','r2_sha_verified','{"etag":"fixture"}');`)
 	if err != nil {
 		t.Fatal(err)
 	}

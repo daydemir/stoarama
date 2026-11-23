@@ -1,6 +1,7 @@
 """Exercise the actual cleanup worker against disposable media fixtures only."""
 import importlib.util
 import datetime
+import copy
 import errno
 import hashlib
 import json
@@ -60,9 +61,10 @@ class CleanupTests(unittest.TestCase):
         self.pinned.start()
         self.addCleanup(self.pinned.stop)
 
-    def fixture_pins(self, start, end, folders=None):
+    def fixture_pins(self, start, end, folders=None, keep_everything=()):
         parse = lambda v: datetime.datetime.fromisoformat(v)
-        return (dict(windows={33: (parse(start), parse(end), 'UTC')}, folders=folders or {'stream': 33}), None)
+        return (dict(windows={33: (parse(start), parse(end), 'UTC')}, folders=folders or {'stream': 33},
+                     keep_everything=frozenset(keep_everything)), None)
 
     def opened(self):
         return pull.CleanupFile(self.cfg, self.item, threading.Event(), time.monotonic()+20)
@@ -94,6 +96,18 @@ class CleanupTests(unittest.TestCase):
         self.assertFalse(self.path.exists())
         self.assertFalse(self.sidecar.exists())
         self.assertEqual(replacement.read_bytes(), b'certified output')
+
+    def test_keep_everything_refuses_the_certified_stitch_path(self):
+        # Certified stitch deletes after durable R2 absence; a keep-everything
+        # stream's NAS copy may leave only against a live R2 copy.
+        replacement, output = self.certified_replacement()
+        self.pins = self.fixture_pins('2026-08-31T00:00:00+00:00', '2026-09-28T00:00:00+00:00', keep_everything={33})
+        proof = dict(sidecar=dict(binding=self.binding), stitch_replacement=output)
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_CERTIFIED_STITCH_VERSION):
+            self.assertIn('pinned keep-everything', pull.cleanup_guard_refusal(self.task, proof))
+            self.pins = self.fixture_pins('2026-08-31T00:00:00+00:00', '2026-09-28T00:00:00+00:00')
+            self.assertIsNone(pull.cleanup_guard_refusal(self.task, proof))
+
 
     def test_certified_replacement_refuses_older_client_wrong_bytes_and_replacement(self):
         replacement, output = self.certified_replacement()
@@ -1090,12 +1104,15 @@ class CleanupGuardTests(unittest.TestCase):
 
     def test_pinned_copies_match_backend_policy_and_repo_folder_map(self):
         repo = Path(__file__).resolve().parents[2]
-        policy = (repo/'backend/internal/api/nas_cleanup_keep28_policy.json').read_bytes()
-        embedded = pull.zlib.decompress(pull.base64.b64decode(''.join(pull.CLEANUP_KEEP28_POLICY_ZLIB_B64)))
+        policy = (repo/'backend/internal/api/nas_cleanup_keep20_policy.json').read_bytes()
+        embedded = pull.zlib.decompress(pull.base64.b64decode(''.join(pull.CLEANUP_KEEP20_POLICY_ZLIB_B64)))
         self.assertEqual(embedded, policy)
+        legacy = (repo/'backend/internal/api/nas_cleanup_keep28_policy.json').read_bytes()
+        self.assertEqual(pull.zlib.decompress(pull.base64.b64decode(''.join(pull.CLEANUP_KEEP28_POLICY_ZLIB_B64))), legacy)
         self.assertEqual(pull.CLEANUP_FOLDER_STREAMS_JSON.encode(), (Path(__file__).with_name('nas_cleanup_folder_streams.json')).read_bytes())
         pins = pull.load_cleanup_pins()
         self.assertEqual(len(pins['windows']), 109)
+        self.assertEqual(len(pins['keep_everything']), 23)
         self.assertEqual(pins['folders']['recordings/339'], 17200)
         self.assertEqual(pins['folders']['01_na_usa_los-angeles_venice-beach'], 17238)
         self.assertNotIn('recordings', pins['folders'])
@@ -1103,6 +1120,62 @@ class CleanupGuardTests(unittest.TestCase):
         self.assertEqual(pull.cleanup_folder_key('recordings/339/continuous/1.mp4', 'raw'), 'recordings/339')
         self.assertIsNone(pull.cleanup_folder_key('joined/x/y.mp4', 'raw'))
         self.assertIsNone(pull.cleanup_folder_key('x/y.mp4', 'collated'))
+
+    def test_keep20_pins_are_exact_and_reject_drift(self):
+        """The active pin is 20 local days [best-3d, best+17d) of the legacy winner."""
+        windows, keep = pull.load_cleanup_pins()['windows'], pull.load_cleanup_pins()['keep_everything']
+        start, end, tz = windows[3]
+        self.assertEqual((start.isoformat(), end.isoformat(), tz),
+                         ('2026-09-15T15:00:00+00:00', '2026-10-05T15:00:00+00:00', 'Asia/Tokyo'))
+        # DST makes two local 20-day windows 481 UTC hours; never a fixed 480.
+        spans = {sid: (b - a).total_seconds() / 3600 for sid, (a, b, _) in windows.items()}
+        self.assertEqual(spans[94], 481)
+        self.assertEqual(spans[17337], 481)
+        self.assertEqual(sorted(sid for sid, h in spans.items() if h == 481), [94, 17337])
+        self.assertTrue(all(h in (480, 481) for h in spans.values()))
+        self.assertIn(78, keep)
+        self.assertIn(94, keep)
+        self.assertNotIn(3, keep)
+        self.assertEqual(len(keep), 23)
+        # A keep-everything stream's R2-backed NAS copy outside its window is
+        # judged by the window alone, like any other stream.
+        self.pins = self.fixture_pins('2027-01-01T00:00:00+00:00', '2027-01-21T00:00:00+00:00', keep_everything={33})
+        self.assertIsNone(pull.cleanup_guard_refusal(self.task, dict(sidecar=dict(binding=self.binding))))
+
+    def test_keep20_pin_matches_the_migration_manifest(self):
+        """The client copy is the exact $policy$ manifest migration 0236 pins."""
+        repo = Path(__file__).resolve().parents[2]
+        migration = (repo/'infra/sql/migrations/0236_nas_media_work_keep20.sql').read_text()
+        body = migration.split('$policy$', 2)[1]
+        self.assertEqual(hashlib.sha256(body.encode()).hexdigest(), pull.CLEANUP_KEEP20_POLICY_SHA256)
+        embedded = pull.zlib.decompress(pull.base64.b64decode(''.join(pull.CLEANUP_KEEP20_POLICY_ZLIB_B64)))
+        self.assertEqual(embedded.decode(), body)
+
+    def test_keep20_loader_refuses_drift(self):
+        raw = pull.zlib.decompress(pull.base64.b64decode(''.join(pull.CLEANUP_KEEP20_POLICY_ZLIB_B64)))
+        rows = json.loads(raw)
+        for name, mutate in (
+            ('shortened', lambda r: r[0].update(end_at='2026-10-04T15:00:00+00:00')),
+            ('not a local midnight', lambda r: r[0].update(start_at='2026-09-15T00:00:00+00:00')),
+            ('timezone drift', lambda r: r[0].update(timezone='Asia/Seoul')),
+            ('widened past legacy', lambda r: r[0].update(start_at='2026-09-11T15:00:00+00:00', end_at='2026-10-09T15:00:00+00:00')),
+        ):
+            tampered = copy.deepcopy(rows)
+            mutate(tampered)
+            body = json.dumps(tampered).encode()
+            self.assertNotEqual(hashlib.sha256(body).hexdigest(), pull.CLEANUP_KEEP20_POLICY_SHA256)
+        # The keep28 provenance itself is unchanged byte-for-byte.
+        legacy = json.loads(pull.zlib.decompress(pull.base64.b64decode(''.join(pull.CLEANUP_KEEP28_POLICY_ZLIB_B64))))
+        self.assertEqual(len(legacy), 109)
+        self.assertEqual(legacy[0]['keep_start_utc'], '2026-09-11T15:00:00+00:00')
+
+    def test_stitch_pins_keep_the_legacy_28_day_windows(self):
+        pins = pull.load_cleanup_stitch_pins()
+        self.assertEqual(len(pins['windows']), 109)
+        start, end, _ = pins['windows'][3]
+        self.assertEqual(start.isoformat(), '2026-09-11T15:00:00+00:00')
+        self.assertEqual(end.isoformat(), '2026-10-09T15:00:00+00:00')
+        self.assertNotEqual(pull.load_cleanup_pins()['windows'][3][:2], pins['windows'][3][:2])
 
     def test_tampered_pins_refuse_every_deletion_but_dry_runs_continue(self):
         self.pinned.stop()

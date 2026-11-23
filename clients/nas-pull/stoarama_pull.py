@@ -2964,19 +2964,47 @@ class CleanupFile:
 # reads the clip interval from the physical sidecar binding (raw) or the
 # output's bounds cross-checked against the dated collated path (collated;
 # unknown -> refuse), and refuses when the interval overlaps that stream's
-# pinned keep28 window or the server's stream_id disagrees. It also enforces
+# pinned 20-day keep window or the server's stream_id disagrees. It also enforces
 # hard local 24h caps and writes an append-only, fsynced deletion ledger. A
 # client whose pinned files fail their SHA check refuses every deletion and
 # keeps doing all non-delete work. Refusal never unlinks; it is reported to the
 # server as a non-delete outcome (conflict observation or unverified receipt).
 #
-# CLEANUP_KEEP28_POLICY is backend/internal/api/nas_cleanup_keep28_policy.json
-# byte-for-byte (zlib+base64; the tests compare them). CLEANUP_FOLDER_STREAMS
-# is clients/nas-pull/nas_cleanup_folder_streams.json byte-for-byte, derived
-# read-only from production: every NAS folder prefix seen in
-# nas_inventory_files.relative_path, recording_collation_outputs.nas_relative_path
+# CLEANUP_KEEP20_POLICY is backend/internal/api/nas_cleanup_keep20_policy.json
+# byte-for-byte (zlib+base64; the tests compare them): the active 20-day cleanup
+# window, the exact $policy$ manifest pinned by migration 0236. The cleanup
+# deletion guard and every new cleanup target must use it. The superseded
+# 28-day selection stays pinned byte-for-byte below for the lanes that retain
+# their historical binding (native stitch, R2 copy/keep28 retention), so
+# CLEANUP_KEEP28_POLICY_SHA256 keeps its original meaning and value.
+# CLEANUP_FOLDER_STREAMS is clients/nas-pull/nas_cleanup_folder_streams.json
+# byte-for-byte, derived read-only from production: every NAS folder prefix seen
+# in nas_inventory_files.relative_path, recording_collation_outputs.nas_relative_path
 # and recording_clips.display_path (account 47) that maps to exactly one stream;
 # the prefix is the first path component, or "recordings/<id>" for that layout.
+CLEANUP_KEEP20_POLICY_SHA256 = "bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393"
+CLEANUP_KEEP20_POLICY_STREAMS = 109
+CLEANUP_KEEP20_POLICY_ZLIB_B64 = (
+    "eNrVm02P2zYQhu/5FQtfG2P5JVLMzUZ6KZoi6BooiqIw2JjxKralhSRvkBb976WdS2OTIsXByhPAWGBhLfHonQ"
+    "/ODLl/vLr7Z2brzdr0szd3M0aYnFMyJ8WKFm8IcZ8fzj9nr+9mO2uf1vbZtl/6x6reuuc/mn1n3Tddb9r+/0sQ"
+    "Pae+Jbq+teawrjbuSe5+76uD/bup7ekPF11l7lfN7ksz+/e1B+u0JkvC6tujn6qcMx6hUqUP68E2x70fi9I5ES"
+    "tS5mM5vZ1YRA1haXGJdbBt9cHc/9x060W9tXvbBfjInAmYNU8OISK60WKscM4aVALdTM2ZioGpYizY2dGu7TEG"
+    "7Oxpwyal166WatPJCHU2oXIfIKFzPBUjLBmEEJrlZDzL0VKOTSguHVBw+mU0BqaRxgXTHHlcsGvpxhG+9CYmaD"
+    "E+GROocmpOY8oJmZ9RJiIsFXJCJqXEHiBS4ldRCfyIBX5E/L6ovgNfLNEjlgQ/IkWPCKhtJkJUBNSWcHhEiygi"
+    "xa8iVfgR0ScdxQh+RAnoQFkBRiRFFFHgV1HgD5cCPaKWHD8i+pJWK/zzB1UgR+SESOSGdogKvYq0RI/IKH5Ehh"
+    "+xQB8uXKNHFBpoaA43NB+curteP+SMS/NYmSAdgdPROJ0K+uH7Y92b9aK1tQlLyMoVo4DZtntN3wrfMArnib7p"
+    "9uJwMHVYPrkisKn76TBq+ERFiPAcpzqY8HEPXzEGUo35VviWrSiu5p0fz2g/NY+mrm3317HdDiJS4IkUj1pWXR"
+    "/nfWV8a9q17dYPZm/M4cZnop4TvRFJ5hQhDBwhw7Z2bfNlx/fjsW2e7P3StvuqDiZp146mwA0JSIoEutJP9741"
+    "26MNbyElkM5tITpOR6Wf7jfTduZzmE7B6RIsS3UWnQsNKF08xyjGuZ/u1+YQtqszCgWWBpx4lrhkE75dY2nq7a"
+    "7ZheHoikpAvDrdmGeFSzbvee07U1d7E0Yj8Nsz0VsCjk1lXOyh4GqPsWgmZhwywUyUb8iyKerpsdfcSvj1j69O"
+    "F0O7HgsmoGmwYV2sRg0rKPqrUUwwiPO5ABHwABExxtAo6xf7ef170w7nPXgER5OyUOOT8nQWLr8DL9SQi6EEfM"
+    "+Mk3iiKej4K3BToQm8aBItmsRrUJlxDZkB+29X/MdrY050Rm08DRoNtIsPffNh99jsD7fmo1kN4zTtLKcsoJ5p"
+    "zSf73NxavEBPtjh0vW03ZsC4BNw0cpoAKELDiv22NZvb27fw870zm9Y9E6LzvvrIgW2KejKDTvuXHncLmSXAqf"
+    "GBO9FA1MHljKGSlRss7FKkC2wXy+PGPNmuh4oXG9XG+BjJGkRNFLOMjqc7acfg2iXYlrE87ThcuxTL8jztJvI7"
+    "kTcAlfABqEqgK/Isq+GW1Ql0OaNt7X/xcWcWKdIp1G5Xok4o+iXphvbZBDhOXjLbAatjTtF2ZTywSyxb01fd3j"
+    "ybWwPyvLZsGjiBGa54adNCiwAuMyp3eq7NOOxfzb079SWdwpyNeZmX8ATcsiKBTmMuPgXmzULQvGsVJVy6MoEu"
+    "0lW8+vM/7tzfqw=="
+)
 CLEANUP_KEEP28_POLICY_SHA256 = "060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811"
 CLEANUP_KEEP28_POLICY_STREAMS = 109
 CLEANUP_KEEP28_POLICY_ZLIB_B64 = (
@@ -3198,19 +3226,18 @@ CLEANUP_COLLATED_V1_DATED_RE = re.compile(
     r"^recordings/[1-9][0-9]*/joined/([0-9]{4})-([0-9]{2})-([0-9]{2})/[^/]*_hour_([01][0-9]|2[0-3])[^/]*$")
 
 
-def load_cleanup_pins(policy_raw=None, folders_raw=None):
-    """Parse and SHA-check the pinned keep windows and folder map; raise on any defect."""
-    if policy_raw is None:
-        policy_raw = zlib.decompress(base64.b64decode("".join(CLEANUP_KEEP28_POLICY_ZLIB_B64)))
-    if folders_raw is None:
-        folders_raw = CLEANUP_FOLDER_STREAMS_JSON.encode("utf-8")
-    if hashlib.sha256(policy_raw).hexdigest() != CLEANUP_KEEP28_POLICY_SHA256:
-        raise RuntimeError("pinned keep28 policy SHA mismatch")
-    if hashlib.sha256(folders_raw).hexdigest() != CLEANUP_FOLDER_STREAMS_SHA256:
-        raise RuntimeError("pinned folder map SHA mismatch")
-    rows = json.loads(policy_raw)
-    if not isinstance(rows, list) or len(rows) != CLEANUP_KEEP28_POLICY_STREAMS:
-        raise RuntimeError("pinned keep28 policy is incomplete")
+def _cleanup_policy_rows(raw, sha, streams, label):
+    """Exact bytes, exact stream count; raise on any defect."""
+    if hashlib.sha256(raw).hexdigest() != sha:
+        raise RuntimeError("pinned %s policy SHA mismatch" % label)
+    rows = json.loads(raw)
+    if not isinstance(rows, list) or len(rows) != streams:
+        raise RuntimeError("pinned %s policy is incomplete" % label)
+    return rows
+
+
+def _cleanup_keep28_windows(rows):
+    """The superseded 28-day windows, exact as historically pinned."""
     windows = {}
     for row in rows:
         stream = row.get("stream_id") if isinstance(row, dict) else None
@@ -3221,15 +3248,92 @@ def load_cleanup_pins(policy_raw=None, folders_raw=None):
         if not end > start:
             raise RuntimeError("pinned keep28 window is empty")
         windows[stream] = (start, end, row["tz"])
+    return windows
+
+
+def _cleanup_keep20_windows(rows, legacy):
+    """The active 20-day windows, derived and validated from the legacy selection.
+
+    The manifest carries only UTC bounds, timezone and keep_everything. Each
+    stream must keep its legacy identity and timezone, sit on local midnights,
+    span exactly 20 local days, and equal [best-3d, best+17d) locally, where
+    best is the winning local date of the reviewed legacy 28-day window
+    ([best-7d, best+21d)). It must also stay inside that legacy window. Any
+    drift raises, and the caller refuses every deletion. DST makes two of the
+    windows 481 UTC hours long, so the span is checked in local days, never as
+    a fixed 480 hours.
+    """
+    windows, keep_everything = {}, set()
+    for row in rows:
+        stream = row.get("stream_id") if isinstance(row, dict) else None
+        tz = row.get("timezone") if isinstance(row, dict) else None
+        keep = row.get("keep_everything") if isinstance(row, dict) else None
+        if type(stream) is not int or stream <= 0 or stream in windows or not isinstance(tz, str) or not tz or type(keep) is not bool:
+            raise RuntimeError("pinned keep20 policy has an invalid stream")
+        if stream not in legacy or legacy[stream][2] != tz:
+            raise RuntimeError("pinned keep20 stream %d identity or timezone differs" % stream)
+        start = parse_certification_timestamp(row.get("start_at"), "start_at")
+        end = parse_certification_timestamp(row.get("end_at"), "end_at")
+        if not end > start:
+            raise RuntimeError("pinned keep20 window is empty")
+        zone = ZoneInfo(tz)
+        local_start, local_end = start.astimezone(zone), end.astimezone(zone)
+        if any(local_start.timetuple()[3:6]) or any(local_end.timetuple()[3:6]):
+            raise RuntimeError("pinned keep20 bounds are not local midnights")
+        legacy_start, legacy_end, _ = legacy[stream]
+        best = legacy_start.astimezone(zone).date() + datetime.timedelta(days=7)
+        if local_start.date() != best - datetime.timedelta(days=3) or local_end.date() != best + datetime.timedelta(days=17):
+            raise RuntimeError("pinned keep20 window is not [best-3d, best+17d)")
+        if (local_end.date() - local_start.date()).days != 20:
+            raise RuntimeError("pinned keep20 window is not 20 local days")
+        if start < legacy_start or end > legacy_end:
+            raise RuntimeError("pinned keep20 window exceeds the legacy window")
+        windows[stream] = (start, end, tz)
+        if keep:
+            keep_everything.add(stream)
+    if len(windows) != len(legacy):
+        raise RuntimeError("pinned keep20 policy dropped a legacy stream")
+    return windows, keep_everything
+
+
+def load_cleanup_pins(policy_raw=None, folders_raw=None):
+    """Parse and SHA-check the active 20-day windows and folder map; raise on any defect."""
+    if policy_raw is None:
+        policy_raw = zlib.decompress(base64.b64decode("".join(CLEANUP_KEEP20_POLICY_ZLIB_B64)))
+    if folders_raw is None:
+        folders_raw = CLEANUP_FOLDER_STREAMS_JSON.encode("utf-8")
+    rows = _cleanup_policy_rows(policy_raw, CLEANUP_KEEP20_POLICY_SHA256, CLEANUP_KEEP20_POLICY_STREAMS, "keep20")
+    legacy_rows = _cleanup_policy_rows(
+        zlib.decompress(base64.b64decode("".join(CLEANUP_KEEP28_POLICY_ZLIB_B64))),
+        CLEANUP_KEEP28_POLICY_SHA256, CLEANUP_KEEP28_POLICY_STREAMS, "keep28")
+    if hashlib.sha256(folders_raw).hexdigest() != CLEANUP_FOLDER_STREAMS_SHA256:
+        raise RuntimeError("pinned folder map SHA mismatch")
+    windows, keep_everything = _cleanup_keep20_windows(rows, _cleanup_keep28_windows(legacy_rows))
     folders = json.loads(folders_raw)
     if not isinstance(folders, dict) or not folders or any(
             not isinstance(k, str) or not k or type(v) is not int or v <= 0 or v not in windows for k, v in folders.items()):
         raise RuntimeError("pinned folder map is invalid")
-    return {"windows": windows, "folders": folders}
+    return {"windows": windows, "folders": folders, "keep_everything": frozenset(keep_everything)}
+
+
+def load_cleanup_stitch_pins():
+    """The retained 28-day windows native stitch plans are bound to."""
+    legacy_rows = _cleanup_policy_rows(
+        zlib.decompress(base64.b64decode("".join(CLEANUP_KEEP28_POLICY_ZLIB_B64))),
+        CLEANUP_KEEP28_POLICY_SHA256, CLEANUP_KEEP28_POLICY_STREAMS, "keep28")
+    folders = json.loads(CLEANUP_FOLDER_STREAMS_JSON)
+    if hashlib.sha256(CLEANUP_FOLDER_STREAMS_JSON.encode("utf-8")).hexdigest() != CLEANUP_FOLDER_STREAMS_SHA256:
+        raise RuntimeError("pinned folder map SHA mismatch")
+    windows = _cleanup_keep28_windows(legacy_rows)
+    if not isinstance(folders, dict) or not folders or any(
+            not isinstance(k, str) or not k or type(v) is not int or v <= 0 or v not in windows for k, v in folders.items()):
+        raise RuntimeError("pinned folder map is invalid")
+    return {"windows": windows, "folders": folders, "keep_everything": frozenset()}
 
 
 _CLEANUP_PINS_LOCK = threading.Lock()
 _CLEANUP_PINS = None
+_CLEANUP_STITCH_PINS = None
 
 
 def cleanup_pins():
@@ -3242,6 +3346,18 @@ def cleanup_pins():
             except Exception as exc:
                 _CLEANUP_PINS = (None, str(exc)[:200] or type(exc).__name__)
         return _CLEANUP_PINS
+
+
+def cleanup_stitch_pins():
+    """Return (pins, None) or (None, error) for the retained keep28 lanes."""
+    global _CLEANUP_STITCH_PINS
+    with _CLEANUP_PINS_LOCK:
+        if _CLEANUP_STITCH_PINS is None:
+            try:
+                _CLEANUP_STITCH_PINS = (load_cleanup_stitch_pins(), None)
+            except Exception as exc:
+                _CLEANUP_STITCH_PINS = (None, str(exc)[:200] or type(exc).__name__)
+        return _CLEANUP_STITCH_PINS
 
 
 def cleanup_folder_key(relative_path, kind):
@@ -17340,6 +17456,8 @@ def cleanup_guard_refusal(task, proof):
             return "NAS folder %r has no pinned stream" % key
         if type(item.get("stream_id")) is not int or item["stream_id"] != stream:
             return "server stream_id %r disagrees with pinned stream %d" % (item.get("stream_id"), stream)
+        if certified and stream in pins["keep_everything"]:
+            return "stream %d is pinned keep-everything; only an R2-backed copy may leave the NAS" % stream
         keep_start, keep_end, timezone = pins["windows"][stream]
         if kind == "raw":
             sidecar = proof.get("sidecar") if isinstance(proof, dict) else None
@@ -49431,7 +49549,9 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None, kind=St
         if proof_stop is None or proof_stop.task is not task or proof_stop.deadline is None:
             raise StitchHold("proof requires its original attempt deadline")
     plan = task["plan"]
-    pins, pin_error = cleanup_pins()
+    # Native stitch plans keep the retained 28-day binding they were planned
+    # under; the active 20-day cleanup window never widens stitch scope.
+    pins, pin_error = cleanup_stitch_pins()
     if pin_error:
         raise StitchResourceHold("stitch policy pins unavailable")
     if (plan.get("policy") != STITCH_POLICY or plan.get("revision") != STITCH_REVISION
@@ -51504,7 +51624,7 @@ def stitch_once(cfg, inventory, stop_event):
             # An uncommitted expired lease needs its new token below. An
             # already committed result always answers idempotently first.
     stitch_resources(cfg)
-    _, pin_error = cleanup_pins()
+    _, pin_error = cleanup_stitch_pins()
     if pin_error:
         raise StitchResourceHold("stitch policy pins unavailable")
     if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):

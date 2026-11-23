@@ -11,7 +11,11 @@ import urllib.request
 
 from collector import timestamp, fresh, count, require, PLAN, PLAN_SHA, CLOSE_SHA, NAS_CLIENT_VERSIONS
 
-POLICY_SHA = '060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811'
+# The active cleanup plan binding. The owner manifest, its baseline plan and
+# every live plan it names must carry this digest; a keep28-bound owner is
+# refused because no keep28 plan can be enabled any longer. Re-initialize the
+# owner manifest at the cutover boundary.
+POLICY_SHA = 'bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393'
 
 
 def digest(raw):
