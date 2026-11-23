@@ -18323,10 +18323,11 @@ CLEANUP_LOW_MEMORY_WORKERS = 2
 # hash plus that proof keeps the total at two, the same bound as the primary
 # dry lane, with no third hash anywhere.
 CLEANUP_LOW_MEMORY_LOOKAHEAD = 1
-# One directory listing is refused above these practical caps. Both are far
-# beyond a day folder and keep the retained namespace snapshot bounded.
-CLEANUP_NAMESPACE_MAX_ENTRIES = 8192
-CLEANUP_NAMESPACE_MAX_ENCODED_BYTES = 1024 * 1024
+# One directory listing is refused above these caps. A recording's continuous
+# folder holds every clip and sidecar (about 43k entries, 1.5 MB of hex at the
+# largest on Nov 23), so the caps sit above that and still bound the snapshot.
+CLEANUP_NAMESPACE_MAX_ENTRIES = 65536
+CLEANUP_NAMESPACE_MAX_ENCODED_BYTES = 4 * 1024 * 1024
 CLEANUP_GROUP_VERSION = "cleanup-batch-v6.1"
 CLEANUP_V6_VERSIONS: frozenset[str] = frozenset((CLEANUP_GROUP_VERSION, "r2-copy-v1"))
 CLEANUP_BULK_VERSION = "cleanup-batch-v7"

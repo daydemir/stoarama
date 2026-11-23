@@ -249,12 +249,12 @@ class LowMemoryGroupPathTests(unittest.TestCase):
         # The coordinator also sizes its shared executor by the same workers,
         # so a wide pool cannot be refilled past the lease window.
         self.assertLessEqual(workers, primary)
-        # A one-file group retains one namespace snapshot, capped at 8192
-        # entries and 1 MiB of hex-encoded names; the lookahead adds at most one
-        # more, so retained name bytes never exceed 2 * 1 MiB at any moment.
-        self.assertEqual(pull.CLEANUP_NAMESPACE_MAX_ENCODED_BYTES, 1024 * 1024)
-        self.assertEqual(pull.CLEANUP_NAMESPACE_MAX_ENTRIES, 8192)
-        self.assertLessEqual(2 * pull.CLEANUP_NAMESPACE_MAX_ENCODED_BYTES, 2 * 1024 * 1024)
+        # A one-file group retains one namespace snapshot, capped at 65536
+        # entries and 4 MiB of hex-encoded names (the largest live continuous
+        # folder had about 43k entries and 1.5 MB of hex on Nov 23); the
+        # lookahead adds at most one more, so retained name bytes stay <= 8 MiB.
+        self.assertEqual(pull.CLEANUP_NAMESPACE_MAX_ENCODED_BYTES, 4 * 1024 * 1024)
+        self.assertEqual(pull.CLEANUP_NAMESPACE_MAX_ENTRIES, 65536)
 
     def test_lookahead_lane_hashes_one_file_at_a_time(self):
         """The real lookahead lane never runs two hashes at once."""
