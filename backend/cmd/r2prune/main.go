@@ -20,8 +20,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
@@ -69,14 +72,27 @@ func storeFromEnv() (store, error) {
 		return store{}, errors.New("R2_ENDPOINT or R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and R2_BUCKET are required")
 	}
 	client := s3.New(s3.Options{
-		Region:           "auto",
-		BaseEndpoint:     aws.String(endpoint),
-		UsePathStyle:     true,
-		Credentials:      credentials.NewStaticCredentialsProvider(key, secret, ""),
-		RetryMaxAttempts: 8,
+		Region:       "auto",
+		BaseEndpoint: aws.String(endpoint),
+		UsePathStyle: true,
+		Credentials:  credentials.NewStaticCredentialsProvider(key, secret, ""),
+		Retryer:      newRetryer(),
 		// R2 accepts the checksums S3 requires; it rejects optional defaults.
 		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
 		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
 	})
 	return store{s3: client, bucket: bucket}, nil
+}
+
+// newRetryer backs off on R2's 429 "Reduce your concurrent request rate",
+// which the SDK does not treat as retryable by default. A 429 is a refusal
+// before execution, so retrying it is safe for list, head and delete alike.
+// Attempts stay bounded; a persistent refusal still fails the run closed.
+func newRetryer() aws.Retryer {
+	return retry.NewStandard(func(o *retry.StandardOptions) {
+		o.MaxAttempts = 10
+		o.MaxBackoff = 30 * time.Second
+		o.RateLimiter = ratelimit.None
+		o.Retryables = append([]retry.IsErrorRetryable{retry.RetryableHTTPStatusCode{Codes: map[int]struct{}{429: {}}}}, o.Retryables...)
+	})
 }
