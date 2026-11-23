@@ -18315,7 +18315,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
 CLEANUP_V2_LEASE = 64          # tasks per lease request (server maximum)
 CLEANUP_V2_WORKERS = 16        # concurrent dry-run file workers
 # The cleanup-capable low-memory release keeps at most two dry hashes in the
-# primary lane. Its lookahead lane already leases two; the group executor proves
+# primary lane. Its lookahead lane leases one; the group executor proves
 # one file per permit. dry_run_limit alone cannot bound a later lease.
 CLEANUP_LOW_MEMORY_INFLIGHT = 2
 CLEANUP_LOW_MEMORY_WORKERS = 2

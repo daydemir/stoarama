@@ -22,6 +22,7 @@ import statistics
 import threading
 import time
 import tracemalloc
+from unittest import mock
 from pathlib import Path
 
 import test_cleanup_bulk as bulk_fixtures
@@ -84,7 +85,8 @@ def one_run(args):
         baseline = resident_bytes()
         tracemalloc.start()
         started = time.monotonic()
-        case.run_group(tasks)
+        for task in tasks:
+            case.run_group([task])
         elapsed = time.monotonic() - started
         python_peak, _ = tracemalloc.get_traced_memory()
         tracemalloc.stop()
@@ -95,6 +97,11 @@ def one_run(args):
                     rss_growth_bytes=growth, files=len(tasks), siblings=args.siblings)
     finally:
         case.doCleanups()
+
+
+def release_group_size():
+    with mock.patch.object(pull, 'CLIENT_VERSION', pull.LOW_MEMORY_CLEANUP_CLIENT_VERSION):
+        return pull.cleanup_execution_group_size()
 
 
 def main():
@@ -117,7 +124,7 @@ def main():
         client_bounds=dict(dry_inflight=pull.CLEANUP_LOW_MEMORY_INFLIGHT,
                            dry_workers=pull.CLEANUP_LOW_MEMORY_WORKERS,
                            lookahead=pull.CLEANUP_LOW_MEMORY_LOOKAHEAD,
-                           group=pull.CLEANUP_EXECUTION_GROUP,
+                           group=release_group_size(),
                            namespace_entries=pull.CLEANUP_NAMESPACE_MAX_ENTRIES,
                            namespace_encoded_bytes=pull.CLEANUP_NAMESPACE_MAX_ENCODED_BYTES,
                            stream_block_bytes=CHUNK,

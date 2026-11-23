@@ -252,7 +252,8 @@ class LowMemoryGroupPathTests(unittest.TestCase):
         # A one-file group retains one namespace snapshot, capped at 65536
         # entries and 4 MiB of hex-encoded names (the largest live continuous
         # folder had about 43k entries and 1.5 MB of hex on Nov 23); the
-        # lookahead adds at most one more, so retained name bytes stay <= 8 MiB.
+        # lookahead adds at most one more. Measured on Python 3.9 at the caps:
+        # about 15 MiB retained and 21 MiB peak per proof, 35 MiB peak for two.
         self.assertEqual(pull.CLEANUP_NAMESPACE_MAX_ENCODED_BYTES, 4 * 1024 * 1024)
         self.assertEqual(pull.CLEANUP_NAMESPACE_MAX_ENTRIES, 65536)
 
