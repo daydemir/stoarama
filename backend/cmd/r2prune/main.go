@@ -87,13 +87,13 @@ func storeFromEnv() (store, error) {
 // newRetryer backs off on R2's 429 "Reduce your concurrent request rate"
 // (code ServiceUnavailable), which the SDK does not treat as retryable by
 // default; SlowDown and 5xx already are. Backoff is the SDK's capped
-// exponential with jitter. A 429 is a refusal
-// before execution, so retrying it is safe for list, head and delete alike.
+// exponential with jitter. Retrying is safe: list pages reuse their
+// continuation token and DeleteObjects is idempotent for the same key set.
 // Attempts stay bounded; a persistent refusal still fails the run closed.
 func newRetryer() aws.Retryer {
 	return retry.NewStandard(func(o *retry.StandardOptions) {
 		o.MaxAttempts = 10
-		o.MaxBackoff = 30 * time.Second
+		o.MaxBackoff = 20 * time.Second
 		o.RateLimiter = ratelimit.None
 		o.Retryables = append([]retry.IsErrorRetryable{
 			retry.RetryableHTTPStatusCode{Codes: map[int]struct{}{429: {}}},
