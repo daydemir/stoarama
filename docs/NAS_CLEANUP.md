@@ -92,7 +92,7 @@ All are code constants (raising one is a reviewed code change) and fail closed:
   native stitch and R2 copy/keep28 retention. Before each unlink the client
   maps the folder to a stream, reads the interval from the physical sidecar
   (raw) or the output bounds confirmed by the dated path (collated), and
-  refuses on a keep-everything stream, keep-window overlap, unknown
+  refuses a certified-stitch item on a keep-everything stream, keep-window overlap, unknown
   folder/bounds or a disagreeing server `stream_id`. Hard local caps: 400,000
   files / 5 TB per rolling 24 h (bytes bind first; raised from 50,000 / 3 TB
   by owner decision, 2026-11). Every unlink is bracketed by fsynced intent and

@@ -171,13 +171,15 @@ class Keep28PlanTests(unittest.TestCase):
         self.assertEqual(policy[3]['keep_start_utc'], '2026-09-15T15:00:00+00:00')
         self.assertEqual(policy[3]['keep_end_utc'], '2026-10-05T15:00:00+00:00')
 
-    def test_keep_everything_streams_are_never_listed(self):
+    def test_keep_everything_streams_are_listed_against_their_window(self):
+        # Their NAS copies outside the window leave against a live R2 copy, so
+        # the preparer lists them like any other stream.
         policy = k.load_policy(k.POLICY_PATH)
         self.assertTrue(policy[78]['keep_everything'])
-        # No SQL is issued for a keep-everything stream.
-        with patch.object(k, 'stream_candidates', side_effect=AssertionError('listed a kept stream')), \
+        with patch.object(k, 'stream_candidates', return_value=[]) as listed, \
                 patch.object(k, 'admissible_candidates', return_value=[]):
-            self.assertEqual(k.candidates(policy, {78}, 'stoarama', 'psql'), [])
+            k.candidates(policy, {78}, 'stoarama', 'psql')
+        listed.assert_called_once_with(policy[78], 'stoarama', 'psql')
 
     def test_policy_loader_rejects_drift_from_the_legacy_selection(self):
         raw = k.POLICY_PATH.read_bytes()

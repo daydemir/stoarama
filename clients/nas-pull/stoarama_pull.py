@@ -17456,8 +17456,8 @@ def cleanup_guard_refusal(task, proof):
             return "NAS folder %r has no pinned stream" % key
         if type(item.get("stream_id")) is not int or item["stream_id"] != stream:
             return "server stream_id %r disagrees with pinned stream %d" % (item.get("stream_id"), stream)
-        if stream in pins["keep_everything"]:
-            return "stream %d is pinned keep-everything" % stream
+        if certified and stream in pins["keep_everything"]:
+            return "stream %d is pinned keep-everything; only an R2-backed copy may leave the NAS" % stream
         keep_start, keep_end, timezone = pins["windows"][stream]
         if kind == "raw":
             sidecar = proof.get("sidecar") if isinstance(proof, dict) else None

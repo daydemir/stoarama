@@ -260,9 +260,11 @@ func TestNASCleanupProtectedIntervalsAreHalfOpen(t *testing.T) {
 	}
 }
 
-// Pinning a stream keep-everything makes every interval KEEP, including
-// intervals far outside its window.
-func TestNASCleanupKeepEverythingIsNeverEligible(t *testing.T) {
+// A keep-everything stream stays whole in R2. Its NAS copies use the same
+// 20-day window, but leave only against a live R2 copy: the certified-stitch
+// path (which deletes after durable R2 absence) never applies to it, and the
+// ordinary path still needs a verified R2 recovery for every permit.
+func TestNASCleanupKeepEverythingLeavesNASOnlyAgainstR2(t *testing.T) {
 	p, err := cleanupEmbeddedPolicy()
 	if err != nil {
 		t.Fatal(err)
@@ -273,11 +275,22 @@ func TestNASCleanupKeepEverythingIsNeverEligible(t *testing.T) {
 		t.Fatalf("stream 78 is not pinned keep-everything: %+v", w)
 	}
 	far := w.start.AddDate(-1, 0, 0)
-	if p.outside(78, far, far.Add(time.Hour)) {
-		t.Fatal("keep-everything stream was cleanup-eligible")
+	item := nasCleanupItem{Kind: "raw", StreamID: 78, Timezone: w.Timezone, RelativePath: "x/y.mp4", Bucket: "bucket", SourceIDs: []int64{1}}
+	if !p.permitsCleanup(item, far, far.Add(time.Hour)) {
+		t.Fatal("keep-everything NAS copy outside the window lost R2-backed eligibility")
 	}
-	if p.outside(3, far, far.Add(time.Hour)) != true {
-		t.Fatal("ordinary stream lost eligibility outside its window")
+	if p.permitsCleanup(item, w.start, w.start.Add(time.Hour)) {
+		t.Fatal("keep-everything file inside its window was eligible")
+	}
+	for _, recovery := range []string{"unchecked", "r2_present_unverified", "r2_absent", nasCleanupCertifiedStitchRecovery} {
+		if cleanupRecoveryPermits("dry_run", recovery) {
+			t.Fatalf("dry-run recovery %q permitted a deletion without a verified R2 copy", recovery)
+		}
+	}
+	item.PermitReason = nasCleanupCertifiedStitchReason
+	item.StitchCertificate = &nasCleanupStitchCertificate{}
+	if p.permitsCleanup(item, w.start, w.start.Add(time.Hour)) {
+		t.Fatal("keep-everything file gained certified-stitch eligibility")
 	}
 	// Stream 94 is keep-everything and DST-spanned at the same time.
 	if w94 := p.Streams[94]; !w94.KeepEverything || w94.end.Sub(w94.start) != 481*time.Hour {

@@ -4,8 +4,9 @@
 The active policy keeps exactly one period per stream: the best 14 local days
 shifted to 20 local days, [best-3d, best+17d), the exact manifest pinned by
 migration 0236 and embedded in
-backend/internal/api/nas_cleanup_keep20_policy.json. Every stream pinned
-keep-everything is skipped entirely. This
+backend/internal/api/nas_cleanup_keep20_policy.json. A keep-everything stream
+stays whole in R2; its NAS copies outside the window are listed like any other
+and leave only after the server's live R2 SHA verification. This
 script lists every NAS file that lies entirely outside its stream's window:
 
   * raw clips present on the NAS (nas_inventory_files matching the catalog
@@ -208,13 +209,9 @@ def query(sql, psql):
 
 
 def candidates(policy, streams, bucket, psql, scope_cache=None):
-    # One bounded read-only query per stream keeps each transaction short. A
-    # keep-everything stream has no eligible file at all, so it is never listed.
+    # One bounded read-only query per stream keeps each transaction short.
     rows = []
     for sid in sorted(streams or policy):
-        if policy[sid].get('keep_everything'):
-            print(json.dumps({'phase': 'kept_stream', 'stream_id': sid, 'files': 0, 'bytes': 0}), file=sys.stderr, flush=True)
-            continue
         part = stream_candidates(policy[sid], bucket, psql)
         rows += part
         print(json.dumps({'phase': 'listed_stream', 'stream_id': sid, 'files': len(part), 'bytes': sum(r['size_bytes'] for r in part)}), file=sys.stderr, flush=True)

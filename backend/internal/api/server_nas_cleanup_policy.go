@@ -211,7 +211,7 @@ func (p *nasCleanupPolicy) outside(stream int64, a, b time.Time) bool {
 		return false
 	}
 	w, ok := p.Streams[stream]
-	if !ok || w.KeepEverything {
+	if !ok {
 		return false
 	}
 	return !(a.Before(w.end) && b.After(w.start))
@@ -326,10 +326,6 @@ func (s *Server) cleanupCurrentPolicyCheck(ctx context.Context, q interface {
 	window, ok := policy.Streams[i.StreamID]
 	if !ok {
 		return errors.New("stream has no pinned keep window; KEEP")
-	}
-	// A keep-everything stream is never eligible, for any file.
-	if window.KeepEverything {
-		return errors.New("stream is pinned keep-everything; KEEP")
 	}
 	if window.Timezone != i.Timezone {
 		return errors.New("canonical timezone changed")

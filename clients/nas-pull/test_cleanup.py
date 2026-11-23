@@ -97,6 +97,18 @@ class CleanupTests(unittest.TestCase):
         self.assertFalse(self.sidecar.exists())
         self.assertEqual(replacement.read_bytes(), b'certified output')
 
+    def test_keep_everything_refuses_the_certified_stitch_path(self):
+        # Certified stitch deletes after durable R2 absence; a keep-everything
+        # stream's NAS copy may leave only against a live R2 copy.
+        replacement, output = self.certified_replacement()
+        self.pins = self.fixture_pins('2026-08-31T00:00:00+00:00', '2026-09-28T00:00:00+00:00', keep_everything={33})
+        proof = dict(sidecar=dict(binding=self.binding), stitch_replacement=output)
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_CERTIFIED_STITCH_VERSION):
+            self.assertIn('pinned keep-everything', pull.cleanup_guard_refusal(self.task, proof))
+            self.pins = self.fixture_pins('2026-08-31T00:00:00+00:00', '2026-09-28T00:00:00+00:00')
+            self.assertIsNone(pull.cleanup_guard_refusal(self.task, proof))
+
+
     def test_certified_replacement_refuses_older_client_wrong_bytes_and_replacement(self):
         replacement, output = self.certified_replacement()
         with self.assertRaisesRegex(RuntimeError, 'reviewed certified stitch'):
@@ -1125,9 +1137,10 @@ class CleanupGuardTests(unittest.TestCase):
         self.assertIn(94, keep)
         self.assertNotIn(3, keep)
         self.assertEqual(len(keep), 23)
-        # A keep-everything stream refuses every interval, near or far.
+        # A keep-everything stream's R2-backed NAS copy outside its window is
+        # judged by the window alone, like any other stream.
         self.pins = self.fixture_pins('2027-01-01T00:00:00+00:00', '2027-01-21T00:00:00+00:00', keep_everything={33})
-        self.assertIn('pinned keep-everything', pull.cleanup_guard_refusal(self.task, {}))
+        self.assertIsNone(pull.cleanup_guard_refusal(self.task, dict(sidecar=dict(binding=self.binding))))
 
     def test_keep20_pin_matches_the_migration_manifest(self):
         """The client copy is the exact $policy$ manifest migration 0236 pins."""

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
-	"time"
 )
 
 // The 20-day policy is a new plan binding. A keep28 plan is inert: it is never
@@ -97,28 +96,5 @@ func TestNASCleanupKeep28PlansAreInertUnderThe20DayPin(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT outcome::text FROM nas_cleanup_items WHERE id=3`).Scan(&outcome); err != nil ||
 		outcome != `{"outcome": "deleted", "unlink_attempted": true}` {
 		t.Fatalf("old receipt evidence rewritten: %q %v", outcome, err)
-	}
-}
-
-// Even a keep-everything stream is fully pinned: a file far outside its window
-// cannot be admitted, observed as would_delete, or turned into a permit.
-func TestNASCleanupKeepEverythingStreamIsFullyPinned(t *testing.T) {
-	p, err := cleanupEmbeddedPolicy()
-	if err != nil {
-		t.Fatal(err)
-	}
-	w, ok := p.Streams[78]
-	if !ok || !w.KeepEverything {
-		t.Fatalf("stream 78 is not keep-everything: %+v", w)
-	}
-	item := nasCleanupItem{Kind: "raw", StreamID: 78, Timezone: w.Timezone, RelativePath: "x/y.mp4", Bucket: "bucket", SourceIDs: []int64{1}}
-	far := w.start.AddDate(-2, 0, 0)
-	if p.permitsCleanup(item, far, far.Add(time.Hour)) {
-		t.Fatal("keep-everything file was cleanup-eligible")
-	}
-	item.PermitReason = nasCleanupCertifiedStitchReason
-	item.StitchCertificate = &nasCleanupStitchCertificate{}
-	if p.permitsCleanup(item, w.start, w.start.Add(time.Hour)) {
-		t.Fatal("keep-everything file gained certified-stitch eligibility")
 	}
 }

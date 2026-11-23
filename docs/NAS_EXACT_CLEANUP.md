@@ -2,12 +2,13 @@
 
 ## Current policy: window 20 (one 20-day period per stream)
 
-Approved by Deniz (2026-11: "lets do window 20, just keep cleaning and
-reducing"). Each of the 109 streams keeps exactly ONE period: its best 14 local
+Approved by Deniz (2026-11, verbatim: "lets do window 20, just ekep cleaning
+and reducing"). Each of the 109 streams keeps exactly ONE period: its best 14 local
 days shifted to 20 local days, i.e. `[best_start-3d, best_start+17d)` in the
 stream's canonical local timezone. Streams whose pinned manifest sets
-`keep_everything` (23 of 109) keep the whole stream: nothing of them is ever
-eligible. Every other NAS file outside the 20-day period is cleanup-eligible,
+`keep_everything` (23 of 109) stay whole in R2; their NAS copies use the same
+20-day window and leave only against a live, SHA-verified R2 copy (never by the
+certified-stitch or any NAS-only path). Every NAS file outside the 20-day period is cleanup-eligible,
 including raw clips and stitched outputs behind published deliveries, collation
 manifests or joined-source snapshots. Nothing inside the period can be
 admitted, observed as `would_delete`, or deleted.
@@ -87,8 +88,8 @@ dry run and owner approval; see [the close/reconciliation runbook](NAS_CLEANUP.m
 every outside-window raw clip present on the NAS (`nas_inventory_files`) and
 every collated output acknowledged on the NAS
 (`recording_collation_output_acks`) whose sources are all outside the active
-20-day window, in a read-only DB transaction, skipping keep-everything streams
-entirely. It batches them per stream, kind and recovery class (`-nasonly` for
+20-day window, in a read-only DB transaction, keep-everything streams included
+(their items still need live R2 verification). It batches them per stream, kind and recovery class (`-nasonly` for
 R2-purged sources) into plans of at most 500 items. Without `--submit` it only
 writes the plan inputs and a summary.
 

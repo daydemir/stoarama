@@ -74,18 +74,16 @@ class Keep20PolicyTests(unittest.TestCase):
         self.assertEqual(r.POLICY_SHA, 'bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393')
         self.assertIn('window 20', r.REASON)
 
-    def test_load_policy_excludes_keep_everything_streams(self):
+    def test_load_policy_keeps_every_stream_window(self):
         repo = Path(__file__).resolve().parents[3]
         raw = (repo / r.POLICY).read_bytes()
         job = r.Runner(Path('.'), Path(tempfile.mkdtemp()))
         self.addCleanup(shutil.rmtree, job.root)
         with patch.object(r, 'command', return_value=raw):
             job.load_policy()
-        self.assertEqual(len(job.windows) + len(job.keep_everything), 109)
-        self.assertEqual(len(job.keep_everything), 23)
-        self.assertIn(78, job.keep_everything)
-        self.assertNotIn(78, job.windows)
-        self.assertNotIn(3, job.keep_everything)
+        self.assertEqual(len(job.windows), 109)
+        # 78 is keep-everything: its NAS copies keep the same 20-day window.
+        self.assertEqual(job.windows[78][0].isoformat(), '2026-08-23T15:00:00+00:00')
         self.assertEqual(job.windows[3][0].isoformat(), '2026-09-15T15:00:00+00:00')
         self.assertEqual(job.windows[3][1].isoformat(), '2026-10-05T15:00:00+00:00')
 

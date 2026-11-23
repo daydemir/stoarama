@@ -340,7 +340,6 @@ class Runner:
         self.ownership_unreadable = False
         self.owner_validated = False
         self.windows = {}
-        self.keep_everything = frozenset()
         self.status = {'current_plan': None, 'last_error': None}
 
     def start(self):
@@ -403,12 +402,10 @@ class Runner:
         require(hashlib.sha256(raw).hexdigest() == POLICY_SHA, 'origin/main keep20 policy differs')
         rows = json.loads(raw)
         require(len(rows) == 109, 'incomplete pinned policy')
-        # keep_everything streams are excluded from every sweep rather than
-        # treated as empty windows, so nothing of them is ever eligible.
-        self.windows = {r['stream_id']: (timestamp(r['start_at']), timestamp(r['end_at']))
-                        for r in rows if not r['keep_everything']}
-        self.keep_everything = frozenset(r['stream_id'] for r in rows if r['keep_everything'])
-        require(len(self.windows) + len(self.keep_everything) == 109, 'incomplete pinned policy')
+        # Keep-everything streams stay whole in R2; their NAS copies use the same
+        # window and, like every file here, leave only with a verified R2 copy.
+        self.windows = {r['stream_id']: (timestamp(r['start_at']), timestamp(r['end_at'])) for r in rows}
+        require(len(self.windows) == 109, 'incomplete pinned policy')
         require((repo / POLICY).read_bytes() == raw, 'checkout keep20 policy differs from origin/main')
 
     def save(self, phase, **values):

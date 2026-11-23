@@ -13,7 +13,8 @@ type Keep28Window struct {
 	BestStart string
 	Start     time.Time
 	End       time.Time
-	// KeepEverything pins the whole stream as KEEP; it is never eligible.
+	// KeepEverything: the stream stays whole in R2. Its NAS copies may leave only
+	// against a live R2 copy, never via certified stitch or any NAS-only path.
 	KeepEverything bool
 }
 

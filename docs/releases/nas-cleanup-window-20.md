@@ -13,7 +13,8 @@ release and activates no NAS epoch.
   `bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393`. Each
   window is `[best_start-3d, best_start+17d)` in the stream's canonical local
   timezone, lands on local midnights, and is contained in the reviewed 28-day
-  window. `keep_everything` streams are never eligible.
+  window. `keep_everything` streams stay whole in R2; their NAS copies are eligible
+  only with live R2 SHA verification, never via the certified-stitch path.
 - **DST.** Window length is 20 *local* days. Streams 94 and 17337 cross a
   fall-back transition, so their windows span 481 UTC hours. No code path may
   assume a fixed 480 hours; the Go parser and the Python loader both validate
@@ -31,7 +32,7 @@ release and activates no NAS epoch.
   ever-issued plan, an incident-roster identity or a delivery-held file. Those
   are reported as `not_retirable`.
 - **Client.** The independent deletion guard reads the 20-day pin for new
-  cleanup targets and refuses keep-everything streams. Native stitch and R2
+  cleanup targets and refuses keep-everything streams on the certified-stitch path. Native stitch and R2
   copy/keep28 retention keep their exact 28-day binding through a separate
   pinned loader.
 
