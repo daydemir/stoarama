@@ -14,7 +14,8 @@ release and activates no NAS epoch.
   window is `[best_start-3d, best_start+17d)` in the stream's canonical local
   timezone, lands on local midnights, and is contained in the reviewed 28-day
   window. `keep_everything` streams stay whole in R2; their NAS copies are eligible
-  only with live R2 SHA verification, never via the certified-stitch path.
+  only against a live, verified R2 copy (SHA-256, or a bound MD5/ETag match),
+  never via the certified-stitch path.
 - **DST.** Window length is 20 *local* days. Streams 94 and 17337 cross a
   fall-back transition, so their windows span 481 UTC hours. No code path may
   assume a fixed 480 hours; the Go parser and the Python loader both validate
@@ -50,8 +51,19 @@ release and activates no NAS epoch.
 
 ## Deploy order
 
-Backend first (both policy files and the inert-plan binding), then the plan
-preparer and cleanup runner pick up the 20-day pin, then the client artifact.
-The 0236 `nas_media_keep20_epoch` activation remains a separate, drained,
-operator-run step; this change neither activates it nor touches its `$policy$`
-bytes.
+1. Backend (both policy files and the inert-plan binding). Every keep28 plan
+   becomes inert at once. The deployed `r2-copy-v8-low-memory-cleanup` client
+   still guards with the 28-day windows, which contain the 20-day ones, so it
+   is stricter: files in the 8-day margin get a conflict observation and are
+   never deleted.
+2. Client artifact built with the 20-day pin (its own version literal and
+   admitting migration).
+3. Re-initialize the runner owner manifest (`ownership.py` pins the 20-day
+   SHA and refuses the old one), then let the runner pick up the 20-day pin.
+   Until step 2 is live, hold the runner: a v8 client would report the margin
+   as conflicts and the runner would stop. That stop is expected, not an
+   incident.
+
+The 0236 `nas_media_keep20_epoch` activation is a separate, drained,
+operator-run step; this change neither activates it nor touches its
+`$policy$` bytes.

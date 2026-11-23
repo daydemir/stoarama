@@ -7,7 +7,8 @@ and reducing"). Each of the 109 streams keeps exactly ONE period: its best 14 lo
 days shifted to 20 local days, i.e. `[best_start-3d, best_start+17d)` in the
 stream's canonical local timezone. Streams whose pinned manifest sets
 `keep_everything` (23 of 109) stay whole in R2; their NAS copies use the same
-20-day window and leave only against a live, SHA-verified R2 copy (never by the
+20-day window and leave only against a live, verified R2 copy (SHA-256, or a
+bound MD5/ETag match) (never by the
 certified-stitch or any NAS-only path). Every NAS file outside the 20-day period is cleanup-eligible,
 including raw clips and stitched outputs behind published deliveries, collation
 manifests or joined-source snapshots. Nothing inside the period can be

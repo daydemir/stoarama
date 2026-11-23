@@ -589,7 +589,7 @@ func (s *Server) handleAdminNASCleanupRetireSuperseded(w http.ResponseWriter, r 
 		util.WriteJSON(w, 409, map[string]any{"error": "superseded plan count differs from expected_plans", "plans": len(ids)})
 		return
 	}
-	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='keep',lease_expires_at=NULL,policy_reason='retired: superseded cleanup policy',updated_at=now() WHERE plan_id=ANY($1) AND state IN ('pending','leased')`, ids)
+	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='keep',lease_expires_at=NULL,policy_reason='retired: superseded cleanup policy',updated_at=now() WHERE plan_id=ANY($1) AND state='pending'`, ids)
 	if err == nil {
 		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='retired',allow_nas_only=false,approved_until=NULL,approval_reason=$2 WHERE id=ANY($1)`, ids, req.Reason)
 	}
