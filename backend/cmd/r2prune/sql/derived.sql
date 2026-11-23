@@ -16,6 +16,4 @@ COPY (SELECT 'gen1', a.object_key, a.artifact_kind, coalesce(h.recording_id,0), 
 COPY (SELECT 'colpart', o.object_key, 'collated', h.recording_id, o.size_bytes, coalesce(extract(epoch FROM o.start_at)::bigint,0), coalesce(extract(epoch FROM o.end_at)::bigint,0), false, false, 0, regexp_replace(o.nas_relative_path,'^.*/','')
  FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id WHERE h.recording_id IN (SELECT DISTINCT recording_id FROM delivery_keep_holds WHERE bucket='stoarama' AND recording_id IS NOT NULL)) TO STDOUT;
 COPY (SELECT 'page', object_key, kind, coalesce(recording_id,0), size_bytes, 0, 0, false, false, 0, coalesce(sha256,'')||'|'||regexp_replace(coalesce(relative_path,''),'^.*/','') FROM delivery_keep_holds WHERE bucket='stoarama') TO STDOUT;
-COPY (SELECT 'rec', id::text, coalesce(account_id::text,''), coalesce(stream_id,0), 0, 0, 0, false, false, 0, '',
- coalesce(nullif(s.local_timezone,''),r.cron_timezone,'')
- FROM recordings r LEFT JOIN streams s ON s.id=r.stream_id) TO STDOUT;
+COPY (SELECT 'rec', id::text, coalesce(account_id::text,''), coalesce(stream_id,0), 0, 0, 0, false, false, 0, '' FROM recordings) TO STDOUT;

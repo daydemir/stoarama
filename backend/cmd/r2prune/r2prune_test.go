@@ -536,7 +536,7 @@ func TestWindowOnlyDBProtectsHoldOnlyInsideWindow(t *testing.T) {
 		outter class
 	}{
 		{"page_link", deleteRawOutsideWindow},
-		{"nas_incident", deleteRawOutsideWindow},
+		{"nas_incident", protectNASPipeline},
 		{"nas_copy_pending", deleteRawOutsideWindow},
 	} {
 		r, sizes := windowOnlyFixture(t, fmt.Sprintf("%s\t%s\n%s\t%s\n%s\t%s\n", tc.reason, old, tc.reason, in, tc.reason, keep))

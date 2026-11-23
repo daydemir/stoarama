@@ -2,8 +2,7 @@
 Inputs: snapshot, base identities, derived-db.tsv, best14-sources.tsv.
 Writes derived-identities.tsv (identities format, column 10 = provenance tag)
 and appends Gen1 acknowledgements to nas-evidence-derived.tsv."""
-import sys, re, collections, datetime
-from zoneinfo import ZoneInfo
+import sys, re, collections
 snap, ids_path, ddb, b14 = sys.argv[1:5]
 listed = {}
 for l in open(snap):
@@ -15,11 +14,9 @@ for l in open(ids_path):
     if c[0] == 'raw':
         clip[c[9]] = (int(c[2]), int(c[3]), int(c[4])); raw[c[1]] = clip[c[9]]
 rec2stream = {}; gen1 = []; parts = collections.defaultdict(list); page = {}
-recTZ = {}   # recording id -> the timezone its collated hours are frozen in
 for l in open(ddb):
     c = l.rstrip('\n').split('\t')
-    if c[0] == 'rec':
-        rec2stream[c[1]] = int(c[3]); recTZ[c[1]] = c[11] if len(c) > 11 else ''
+    if c[0] == 'rec': rec2stream[c[1]] = int(c[3])
     elif c[0] == 'gen1': gen1.append(c)
     elif c[0] == 'colpart': parts[(c[3], c[10])].append((int(c[5]), int(c[6])))
     elif c[0] == 'page': page[c[1]] = c
@@ -62,25 +59,6 @@ pagesha = {}
 for k, c in page.items():
     sha, base = c[10].split('|', 1)
     if k.startswith('experimental/stitching-confident-repairs/') and sha: pagesha[sha] = (c[3], base, int(c[4]), k)
-# A repair name carries the collated hour it stitches: its delivery date and hour
-# in the recording's own timezone. The week-and-weekday form names exactly one
-# local date, and the hour is the collated delivery hour (1..12 = 08:00..19:00
-# local). Either part must be unambiguous, else the key keeps no identity.
-repairre = re.compile(r'^\d+_.+?_(\d{4})_([A-Z][a-z]+)_W(\d)_([A-Z][a-z]+)_hour_(\d\d)_parts_(\d\d)_(\d\d)(?:_[^/]+)?\.mp4$')
-def repairspan(name, tz):
-    m = repairre.fullmatch(name)
-    if not m or not tz: return None
-    year, month, week, weekday, hour = int(m.group(1)), m.group(2), int(m.group(3)), m.group(4), int(m.group(5))
-    if not 1 <= hour <= 12: return None
-    try: first = datetime.date(year, datetime.datetime.strptime(month, '%B').month, 1)
-    except ValueError: return None
-    days = [first + datetime.timedelta(days=k) for k in range(31)]
-    days = [d for d in days if d.month == first.month and ((d.day - 1) // 7) + 1 == week and d.strftime('%A') == weekday]
-    if len(days) != 1: return None
-    try: loc = ZoneInfo(tz)
-    except Exception: return None
-    start = datetime.datetime(days[0].year, days[0].month, days[0].day, 7 + hour, tzinfo=loc)
-    return int(start.timestamp()), int((start + datetime.timedelta(hours=1)).timestamp())
 for k in listed:
     if not k.startswith('experimental/stitching-confident-repairs/') or k in page: continue
     p = k.split('/')
@@ -89,8 +67,7 @@ for k in listed:
         if size == listed[k] and pkey in listed and rec in rec2stream:   # same bytes as a live page key
             out.write(f"dup\t{k}\t{rec2stream[rec]}\t0\t0\t{size}\tf\t0\t\tpage_duplicate:{pkey}\n"); tags['repair_page_duplicate'] += 1
         continue
-    if len(p) != 6 or p[0] != 'experimental' or p[1] != 'stitching-confident-repairs' or p[3] not in rec2stream: continue
-    span = repairspan(p[5], recTZ.get(p[3], ''))
-    if span: row('col', k, rec2stream[p[3]], span[0], span[1], False, 'repair_hour_from_name')
-    # An unparsed name keeps no identity, so the key stays protected.
+    # Other repairs: names use the delivery page's July/August week-and-weekday hour
+    # numbering, which matches no catalog part, and filename dates do not establish
+    # intervals. Left without identity: they stay protected.
 print(dict(tags))

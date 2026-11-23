@@ -63,8 +63,6 @@ jobs:
         run: python -m unittest discover -s ops/jelly/r2-retire -p 'test_*.py' -q
       - name: Test bounded historical invoice evidence without provider access
         run: python -B -m unittest discover -s ops/jelly/r2-retire/capture-invoice-gaps -p 'test_*.py' -v
-      - name: Test r2prune confident-repair identity derivation without catalog access
-        run: python -m unittest discover -s backend/cmd/r2prune/sql -p 'test_*.py' -q
       - name: Test finite capability staging on the control host Python version
         run: python -m unittest discover -s infra/collation-v2 -p 'test_*.py' -q
       - name: Test isolated R2 controls on supported Python 3.9

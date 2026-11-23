@@ -99,8 +99,8 @@ type keyRule struct {
 	Class  class
 	Reason string
 	// WindowOnly marks a DB protection that holds a key only inside its
-	// stream's 20-day window, or on a Keep Everything stream: a NAS copy, a
-	// page link or a NAS incident copy. Outside the window these do not hold.
+	// stream's 20-day window, or on a Keep Everything stream: a NAS copy or a
+	// page link. Outside the window these do not hold.
 	WindowOnly bool
 }
 
@@ -337,10 +337,10 @@ func (r *rules) loadPicks(path string) error {
 	return nil
 }
 
-// windowOnlyReasons are the DB sets whose hold is only about a NAS copy, a
-// page link or an incident copy: they protect a key only while it is Keep
-// Everything or inside its stream's 20-day window.
-var windowOnlyReasons = map[string]bool{"page_link": true, "nas_copy_pending": true, "nas_incident": true}
+// windowOnlyReasons are the DB sets whose hold is only about a NAS copy or a
+// page link: they protect a key only while it is Keep Everything or inside its
+// stream's 20-day window. nas_incident also pins R2 retirement, so it always holds.
+var windowOnlyReasons = map[string]bool{"page_link": true, "nas_copy_pending": true}
 
 // addKey records one protection for a key. A key may carry several reasons;
 // any reason that holds outside the window keeps it protected, and its class
@@ -541,8 +541,8 @@ func (r *rules) keCovered(o object) string {
 }
 
 // keyProtection reports the class and reason a key row (DB protect or
-// controller) gives this object. A window-only row - a NAS copy, a page link or
-// a NAS incident copy - holds only a Keep Everything key or one that overlaps
+// controller) gives this object. A window-only row - a NAS copy or a page link -
+// holds only a Keep Everything key or one that overlaps
 // its stream's 20-day window; outside both, the owner's rule deletes.
 func (r *rules) keyProtection(o object, ids []identity) (class, string, bool) {
 	k, ok := r.Keys[o.Key]
