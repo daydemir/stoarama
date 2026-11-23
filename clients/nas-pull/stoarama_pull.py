@@ -18217,8 +18217,8 @@ def cleanup_lease(cfg, limit=1):
 def cleanup_require_v2():
     """The low-memory cleanup release fails closed on protocol mismatch.
 
-    Its bound is two dry hashes in the primary lane and a sequential eight-file
-    execution group. Protocol 1 has an eight-worker rolling window with a
+    Its bound is two dry hashes in the primary lane and one-file execution
+    groups, each with its own fresh permit. Protocol 1 has an eight-worker rolling window with a
     lease larger than either bound, so this release never uses it. This guard
     is defence in depth: the loop also refuses to enter the protocol-1 path."""
     if CLIENT_VERSION in LOW_MEMORY_CLEANUP_VERSIONS:
@@ -18316,7 +18316,7 @@ CLEANUP_V2_LEASE = 64          # tasks per lease request (server maximum)
 CLEANUP_V2_WORKERS = 16        # concurrent dry-run file workers
 # The cleanup-capable low-memory release keeps at most two dry hashes in the
 # primary lane. Its lookahead lane already leases two; the group executor proves
-# its eight files sequentially. dry_run_limit alone cannot bound a later lease.
+# one file per permit. dry_run_limit alone cannot bound a later lease.
 CLEANUP_LOW_MEMORY_INFLIGHT = 2
 CLEANUP_LOW_MEMORY_WORKERS = 2
 # The lookahead lane may overlap one sequential execution proof. One lookahead
@@ -18369,7 +18369,7 @@ def cleanup_lookahead_workers():
 def cleanup_execution_group_size():
     # One lease/permit clock per file. NAS syscall latency must never consume
     # another file's short authority window. Historical releases retain v7.
-    return 1 if CLIENT_VERSION in (CLEANUP_FRESH_PERMIT_VERSION, CLEANUP_CERTIFIED_STITCH_VERSION, "r2-copy-v4", "r2-copy-v5", "r2-copy-v6") else CLEANUP_EXECUTION_GROUP
+    return 1 if CLIENT_VERSION in (CLEANUP_FRESH_PERMIT_VERSION, CLEANUP_CERTIFIED_STITCH_VERSION, LOW_MEMORY_CLEANUP_CLIENT_VERSION, "r2-copy-v4", "r2-copy-v5", "r2-copy-v6") else CLEANUP_EXECUTION_GROUP
 
 
 class CleanupProtocolUnsupported(RuntimeError):

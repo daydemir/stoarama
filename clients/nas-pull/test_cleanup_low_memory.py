@@ -1,8 +1,8 @@
 """Low-memory cleanup release: exact admission, two-hash bound, bounded listing.
 
 Real disposable files and FULL-WAL SQLite only; no NAS, API or credentials.
-The group suite is the same reviewed eight-file bulk path the other bulk
-releases use, run under the new immutable literal.
+Execution uses the reviewed one-file fresh-permit group, like every release
+since v85r-nas-proof-v2.2, run under the new immutable literal.
 """
 import ast
 import hashlib
@@ -33,8 +33,7 @@ class LowMemoryReleaseTests(unittest.TestCase):
             self.assertNotIn(unknown, pull.CLEANUP_GROUP_VERSIONS)
             self.assertNotIn(unknown, pull.CLEANUP_BULK_VERSIONS)
         with mock.patch.object(pull, 'CLIENT_VERSION', VERSION):
-            self.assertEqual(pull.cleanup_execution_group_size(), pull.CLEANUP_EXECUTION_GROUP)
-            self.assertEqual(pull.cleanup_execution_group_size(), 8)
+            self.assertEqual(pull.cleanup_execution_group_size(), 1)
             self.assertEqual(pull.cleanup_inflight(), 2)
             self.assertEqual(pull.cleanup_dry_workers(), 2)
         # The deployed copy-only release still has no cleanup lane at all.
@@ -197,14 +196,21 @@ class LowMemoryListingTests(unittest.TestCase):
         self.assertTrue(self.sidecar.exists())
 
 
-class LowMemoryGroupPathTests(bulk_fixtures.CleanupBulkTests):
-    """The full reviewed eight-file bulk group runs under the new literal."""
+class LowMemoryGroupPathTests(unittest.TestCase):
+    """The reviewed one-file fresh-permit group runs under the new literal."""
 
+    setUp = bulk_fixtures.CleanupBulkTests.setUp
+    group = bulk_fixtures.CleanupBulkTests.group
+    fixture_pins = bulk_fixtures.CleanupBulkTests.fixture_pins
+    api = bulk_fixtures.CleanupBulkTests.api
+    run_group = bulk_fixtures.CleanupBulkTests.run_group
+    phases = bulk_fixtures.CleanupBulkTests.phases
     version = VERSION
 
-    def test_new_literal_keeps_eight_file_bulk_group_and_two_dry_queue(self):
+    def test_new_literal_deletes_each_file_under_its_own_permit(self):
         tasks = self.group(8)
-        self.run_group(tasks)
+        for task in tasks:
+            self.run_group([task])
         self.assertFalse(self.phases())
         self.assertTrue(all(not (self.cfg.output_dir / task['item']['relative_path']).exists() for task in tasks))
 
@@ -222,14 +228,15 @@ class LowMemoryGroupPathTests(bulk_fixtures.CleanupBulkTests):
                 with lock:
                     active[0] -= 1
         with mock.patch.object(pull.CleanupFile, 'proof', proof):
-            self.run_group(tasks)
+            for task in tasks:
+                self.run_group([task])
         self.assertEqual(peak[0], 1, 'group proof parallelism changed')
 
     def test_total_concurrent_hashes_stay_at_two(self):
         """Every lane's hash width, and the resulting total.
 
         The primary dry lane is two. The lookahead lane is one, and it may
-        overlap exactly one file of the sequential eight-file group proof, so
+        overlap exactly one one-file group proof, so
         group(1) + lookahead(1) = 2 as well. No lane, and no overlap of lanes,
         can produce a third concurrent hash."""
         with mock.patch.object(pull, 'CLIENT_VERSION', VERSION):
@@ -237,14 +244,14 @@ class LowMemoryGroupPathTests(bulk_fixtures.CleanupBulkTests):
             workers = pull.cleanup_dry_workers()
             lookahead = pull.cleanup_lookahead_workers()
             group = pull.cleanup_execution_group_size()
-        self.assertEqual((primary, workers, lookahead, group), (2, 2, 1, 8))
+        self.assertEqual((primary, workers, lookahead, group), (2, 2, 1, 1))
         self.assertEqual(max(primary, lookahead + 1), 2)
         # The coordinator also sizes its shared executor by the same workers,
         # so a wide pool cannot be refilled past the lease window.
         self.assertLessEqual(workers, primary)
-        # A day-folder namespace snapshot stays inside the byte bound too:
-        # 8192 entries is the hard cap and 1 MiB of hex-encoded names is the
-        # second, so retained name bytes never exceed 2 * 1 MiB at any moment.
+        # A one-file group retains one namespace snapshot, capped at 8192
+        # entries and 1 MiB of hex-encoded names; the lookahead adds at most one
+        # more, so retained name bytes never exceed 2 * 1 MiB at any moment.
         self.assertEqual(pull.CLEANUP_NAMESPACE_MAX_ENCODED_BYTES, 1024 * 1024)
         self.assertEqual(pull.CLEANUP_NAMESPACE_MAX_ENTRIES, 8192)
         self.assertLessEqual(2 * pull.CLEANUP_NAMESPACE_MAX_ENCODED_BYTES, 2 * 1024 * 1024)
