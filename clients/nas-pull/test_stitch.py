@@ -434,7 +434,7 @@ class StitchIntegrationTests(unittest.TestCase):
             self.clips.append(clip)
         parse = datetime.datetime.fromisoformat
         pins = (dict(folders={'stream':33}, windows={33:(parse('2026-09-01T00:00:00+00:00'),parse('2026-09-29T00:00:00+00:00'),'UTC')}),None)
-        for patch in [mock.patch.object(pull,'cleanup_pins',return_value=pins), mock.patch.object(pull.os.path,'ismount',return_value=True),
+        for patch in [mock.patch.object(pull,'cleanup_stitch_pins',return_value=pins), mock.patch.object(pull.os.path,'ismount',return_value=True),
                       mock.patch.object(pull,'stitch_resources'), mock.patch.object(pull,'stitch_checkpoint'), mock.patch.object(pull,'stitch_v85r_provenance', return_value=dict(policy='v85r',manifest_sha256=pull.V85R_MANIFEST_SHA,ffmpeg_version='fixture',ffprobe_version='fixture'))]:
             patch.start();self.addCleanup(patch.stop)
         self.task = dict(id=7, lease_token='f'*64, plan_sha256='a'*64,
@@ -935,7 +935,7 @@ class StitchTaskDataHoldTests(unittest.TestCase):
 
     def test_invalid_policy_pins_leave_the_task_queue_untouched(self):
         self.patch_common(AssertionError("build should not run"))
-        with mock.patch.object(pull, 'cleanup_pins', return_value=(None, "fixture pin error")):
+        with mock.patch.object(pull, 'cleanup_stitch_pins', return_value=(None, "fixture pin error")):
             with self.assertRaises(pull.StitchResourceHold):
                 pull.stitch_once(self.cfg, self.inventory, self.stop)
         self.assertEqual(self.calls, [])

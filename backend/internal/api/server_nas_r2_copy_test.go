@@ -241,7 +241,7 @@ func TestNASR2CopyNoDailyCapWithActiveCleanup(t *testing.T) {
 
 func TestNASR2CopyWindowIsDisjointFromCleanup(t *testing.T) {
 	_, i := copyTestFixture(t)
-	p, err := cleanupEmbeddedPolicy()
+	p, err := cleanupEmbeddedKeep28Policy()
 	if err != nil {
 		t.Fatal(err)
 	}

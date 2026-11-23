@@ -16,7 +16,7 @@ import (
 
 func stitchUnitFixture() (nasStitchPlan, nasStitchResult) {
 	a := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
-	p := nasStitchPlan{Policy: nasStitchPolicy, Revision: nasStitchRevision, CorpusSHA: nasStitchCorpusSHA, KeepSHA: cleanupPolicySHA, StreamID: 3, RecordingID: 2, OutputFolder: "stream_V85r_keep28/2/2026-09-20T00-00-00Z", Frozen: []json.RawMessage{nil, nil}, Joins: []bool{true, false}, Eligible: []bool{true, true, false}}
+	p := nasStitchPlan{Policy: nasStitchPolicy, Revision: nasStitchRevision, CorpusSHA: nasStitchCorpusSHA, KeepSHA: cleanupLegacyKeep28SHA, StreamID: 3, RecordingID: 2, OutputFolder: "stream_V85r_keep28/2/2026-09-20T00-00-00Z", Frozen: []json.RawMessage{nil, nil}, Joins: []bool{true, false}, Eligible: []bool{true, true, false}}
 	for n := int64(1); n <= 3; n++ {
 		p.Clips = append(p.Clips, nasCleanupItem{Kind: "raw", SourceID: n, SourceIDs: []int64{n}, RecordingID: 2, StreamID: 3, RelativePath: fmt.Sprintf("stream/day/%d.mp4", n), SizeBytes: 3, SHA256: strings.Repeat("a", 64), SidecarRequired: true, Frozen: [5]int64{3, 1, 2, n, 77}, FrozenSidecar: [5]int64{300, 1, 2, n + 100, 77}, StartAt: a.Add(time.Duration(n-1) * time.Minute), EndAt: a.Add(time.Duration(n) * time.Minute)})
 	}

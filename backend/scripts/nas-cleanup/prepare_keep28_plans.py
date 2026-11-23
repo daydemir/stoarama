@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Prepare read-only NAS cleanup dry-run plans for the keep28 policy.
+"""Prepare read-only NAS cleanup dry-run plans for the active 20-day policy.
 
-keep28 keeps exactly one period per stream (best 14 local days +/-7 days, the
-policy embedded in backend/internal/api/nas_cleanup_keep28_policy.json). This
+The active policy keeps exactly one period per stream: the best 14 local days
+shifted to 20 local days, [best-3d, best+17d), the exact manifest pinned by
+migration 0236 and embedded in
+backend/internal/api/nas_cleanup_keep20_policy.json. Every stream pinned
+keep-everything is skipped entirely. This
 script lists every NAS file that lies entirely outside its stream's window:
 
   * raw clips present on the NAS (nas_inventory_files matching the catalog
@@ -35,7 +38,7 @@ and plan inputs are written to --out for review. --submit admits each plan via
 the service API (POST /api/v1/service/nas-cleanup/plans). Admission only creates
 a dry-run plan: it never arms or enables deletion. The server re-derives every
 identity and re-checks folder ownership, the frozen NAS identity index and the
-keep28 window; a 409 batch is bisected and single rejected items are reported.
+keep window; a 409 batch is bisected and single rejected items are reported.
 
 Batch (two streams, one approval per stream):
   prepare_keep28_plans.py --stream 3 --stream 4 --out k28 --submit
@@ -48,6 +51,7 @@ Environment: DATABASE_URL (read-only use) and, for --submit, SERVICE_TOKEN.
 """
 import argparse
 import base64
+import datetime
 import hashlib
 import json
 import os
@@ -60,11 +64,17 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import zoneinfo
 
 from reviewed_scope import ReadFailed, admissible_candidates
 
-POLICY_SHA = '060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811'
-POLICY_PATH = pathlib.Path(__file__).resolve().parents[2] / 'internal/api/nas_cleanup_keep28_policy.json'
+# The active 20-day cleanup window, the exact manifest migration 0236 pins.
+POLICY_SHA = 'bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393'
+POLICY_PATH = pathlib.Path(__file__).resolve().parents[2] / 'internal/api/nas_cleanup_keep20_policy.json'
+# The superseded 28-day selection stays readable as provenance for the derived
+# window; it never admits a new plan.
+LEGACY_POLICY_SHA = '060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811'
+LEGACY_POLICY_PATH = pathlib.Path(__file__).resolve().parents[2] / 'internal/api/nas_cleanup_keep28_policy.json'
 LABEL = re.compile(r'^[a-z0-9][a-z0-9._-]{0,79}$')
 MAX_PLAN_ITEMS = 10000
 MAX_PLAN_BYTES = 100_000_000_000  # backend nasCleanupMaxPlanBytes
@@ -108,15 +118,54 @@ def batch_manifests(receipts, prefix, by):
     return out
 
 
-def load_policy(path):
-    raw = pathlib.Path(path).read_bytes()
-    if hashlib.sha256(raw).hexdigest() != POLICY_SHA:
-        raise SystemExit('keep28 policy SHA differs from the pinned policy')
+def load_legacy_policy(path=None):
+    """The retained 28-day selection the active window is derived from."""
+    raw = pathlib.Path(path or LEGACY_POLICY_PATH).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != LEGACY_POLICY_SHA:
+        raise SystemExit('keep28 policy SHA differs from the retained policy')
     rows = json.loads(raw)
     ids = [r['stream_id'] for r in rows]
     if len(rows) != 109 or len(set(ids)) != 109:
         raise SystemExit('keep28 policy must hold exactly one window for each of 109 streams')
     return {r['stream_id']: r for r in rows}
+
+
+def load_policy(path, legacy=None):
+    """Validate the active 20-day manifest against the retained 28-day one.
+
+    Each stream keeps its identity and canonical timezone, sits on local
+    midnights, spans exactly 20 local days [best-3d, best+17d), and stays inside
+    the reviewed 28-day window. Returns the same row shape the candidate query
+    consumes (`tz`, `keep_start_utc`, `keep_end_utc`) plus the keep-everything
+    pin. DST windows are 481 UTC hours, so the span is checked in local days.
+    """
+    raw = pathlib.Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != POLICY_SHA:
+        raise SystemExit('keep20 policy SHA differs from the pinned policy')
+    rows = json.loads(raw)
+    ids = [r['stream_id'] for r in rows]
+    if len(rows) != 109 or len(set(ids)) != 109:
+        raise SystemExit('keep20 policy must hold exactly one window for each of 109 streams')
+    legacy = legacy if legacy is not None else load_legacy_policy()
+    out = {}
+    for row in rows:
+        sid, tz = row['stream_id'], row['timezone']
+        if sid not in legacy or legacy[sid]['tz'] != tz:
+            raise SystemExit('keep20 stream %d identity or timezone differs' % sid)
+        start = datetime.datetime.fromisoformat(row['start_at']).astimezone(zoneinfo.ZoneInfo(tz))
+        end = datetime.datetime.fromisoformat(row['end_at']).astimezone(zoneinfo.ZoneInfo(tz))
+        if start.time() != datetime.time(0) or end.time() != datetime.time(0):
+            raise SystemExit('keep20 stream %d bounds are not local midnights' % sid)
+        best = datetime.date.fromisoformat(legacy[sid]['best_start'])
+        if start.date() != best - datetime.timedelta(days=3) or end.date() != best + datetime.timedelta(days=17):
+            raise SystemExit('keep20 stream %d window is not [best-3d, best+17d)' % sid)
+        if (end.date() - start.date()).days != 20:
+            raise SystemExit('keep20 stream %d window is not 20 local days' % sid)
+        if row['start_at'] < legacy[sid]['keep_start_utc'] or row['end_at'] > legacy[sid]['keep_end_utc']:
+            raise SystemExit('keep20 stream %d window exceeds the legacy window' % sid)
+        out[sid] = dict(row, tz=tz, keep_start_utc=row['start_at'], keep_end_utc=row['end_at'],
+                        keep_everything=bool(row['keep_everything']))
+    return out
 
 
 def pg_env():
@@ -159,9 +208,13 @@ def query(sql, psql):
 
 
 def candidates(policy, streams, bucket, psql, scope_cache=None):
-    # One bounded read-only query per stream keeps each transaction short.
+    # One bounded read-only query per stream keeps each transaction short. A
+    # keep-everything stream has no eligible file at all, so it is never listed.
     rows = []
     for sid in sorted(streams or policy):
+        if policy[sid].get('keep_everything'):
+            print(json.dumps({'phase': 'kept_stream', 'stream_id': sid, 'files': 0, 'bytes': 0}), file=sys.stderr, flush=True)
+            continue
         part = stream_candidates(policy[sid], bucket, psql)
         rows += part
         print(json.dumps({'phase': 'listed_stream', 'stream_id': sid, 'files': len(part), 'bytes': sum(r['size_bytes'] for r in part)}), file=sys.stderr, flush=True)
@@ -327,7 +380,7 @@ def main():
     policy = load_policy(a.policy)
     unknown = set(a.stream) - set(policy)
     if unknown:
-        raise SystemExit(f'streams without a keep28 window: {sorted(unknown)}')
+        raise SystemExit(f'streams without a keep20 window: {sorted(unknown)}')
     rows = candidates(policy, set(a.stream), a.bucket, a.psql, a.scope_cache)
     plans = [] if a.summary_only else batches(rows, a.label_prefix, a.max_items, int(a.max_bytes))
     if a.max_plans:

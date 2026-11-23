@@ -1,7 +1,9 @@
+import copy
 import unittest
 import tempfile
 import json
 from pathlib import Path
+import pathlib
 import urllib.error
 import io
 import sys
@@ -162,7 +164,40 @@ class Keep28PlanTests(unittest.TestCase):
     def test_policy_is_pinned_and_complete(self):
         policy = k.load_policy(k.POLICY_PATH)
         self.assertEqual(len(policy), 109)
-        self.assertEqual(policy[3]['best_start'], '2026-09-19')
+        self.assertEqual(k.POLICY_SHA, 'bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393')
+        self.assertEqual(sum(1 for v in policy.values() if v['keep_everything']), 23)
+        # Stream 3 is best14 2026-09-19 in Asia/Tokyo; the active window is
+        # [best-3d, best+17d) = [2026-09-15T15:00Z, 2026-10-05T15:00Z).
+        self.assertEqual(policy[3]['keep_start_utc'], '2026-09-15T15:00:00+00:00')
+        self.assertEqual(policy[3]['keep_end_utc'], '2026-10-05T15:00:00+00:00')
+
+    def test_keep_everything_streams_are_never_listed(self):
+        policy = k.load_policy(k.POLICY_PATH)
+        self.assertTrue(policy[78]['keep_everything'])
+        # No SQL is issued for a keep-everything stream.
+        with patch.object(k, 'stream_candidates', side_effect=AssertionError('listed a kept stream')), \
+                patch.object(k, 'admissible_candidates', return_value=[]):
+            self.assertEqual(k.candidates(policy, {78}, 'stoarama', 'psql'), [])
+
+    def test_policy_loader_rejects_drift_from_the_legacy_selection(self):
+        raw = k.POLICY_PATH.read_bytes()
+        rows = json.loads(raw)
+        for name, mutate in (
+            ('shorter window', lambda r: r[0].update(end_at='2026-10-04T15:00:00+00:00')),
+            ('not a local midnight', lambda r: r[0].update(start_at='2026-09-15T00:00:00+00:00')),
+            ('timezone drift', lambda r: r[0].update(timezone='Asia/Seoul')),
+            ('widened past legacy', lambda r: r[0].update(start_at='2026-09-11T15:00:00+00:00', end_at='2026-10-09T15:00:00+00:00')),
+        ):
+            tampered = copy.deepcopy(rows)
+            mutate(tampered)
+            path = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory())) / 'p.json'
+            path.write_bytes(json.dumps(tampered).encode())
+            with self.assertRaises(SystemExit):
+                k.load_policy(path)
+
+    def test_batch_digest_matches_the_active_20_day_vector(self):
+        plans = [{'id': 1388, 'plan_sha256': 'a4a8bc7137d732ec9bf68df6e823b7ce4527e7cb4a13afdd05b87bc544601ccc'}, {'id': 1389, 'plan_sha256': 'b' * 64}]
+        self.assertEqual(k.batch_digest(k.POLICY_SHA, plans), 'a98f3220d7f8cf754d824b2e01bd9d96406fe470f568798519a2b47c68e2f1df')
 
     def test_batches_never_mix_streams_kinds_or_recovery_and_cap_items(self):
         rows = [row(3, 'raw', n) for n in range(1, 1202)] + [row(3, 'collated', 5000), row(3, 'raw', 6000, purged=True), row(4, 'raw', 7000)]
@@ -181,9 +216,11 @@ class Keep28PlanTests(unittest.TestCase):
         plans = k.batches([row(3, 'raw', n, size=1) for n in range(1, 10002)], 'k28', k.MAX_PLAN_ITEMS, k.MAX_PLAN_BYTES)
         self.assertEqual([len(i) for _, i in plans], [10000, 1])
 
-    def test_batch_digest_matches_backend_vector(self):
+    def test_batch_digest_keeps_the_legacy_vector(self):
+        # The digest algorithm is unchanged; the historic keep28 vector stays
+        # exact as a cross-repo regression pin.
         plans = [{'id': 1388, 'plan_sha256': 'a4a8bc7137d732ec9bf68df6e823b7ce4527e7cb4a13afdd05b87bc544601ccc'}, {'id': 1389, 'plan_sha256': 'b' * 64}]
-        self.assertEqual(k.batch_digest(k.POLICY_SHA, plans), 'f2e8d37dca0fcb75e902fc2a1e4271022dc8cc23b5f6f1d4cbca53b9be8e3328')
+        self.assertEqual(k.batch_digest(k.LEGACY_POLICY_SHA, plans), 'f2e8d37dca0fcb75e902fc2a1e4271022dc8cc23b5f6f1d4cbca53b9be8e3328')
 
     def test_batch_manifests_group_by_stream_and_skip_nas_only(self):
         receipts = [{'id': n, 'label': 'k28-s%d-raw-%04d' % (s, n), 'stream_id': s, 'plan_sha256': '%064x' % n, 'items': 10, 'bytes': 100} for n, s in ((1, 3), (2, 3), (3, 4))]

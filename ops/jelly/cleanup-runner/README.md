@@ -1,4 +1,4 @@
-# Supervised keep28 cleanup runner
+# Supervised 20-day cleanup runner
 
 Installation and production operations belong only to the sole controller.
 Python 3.9.6 stdlib, psql, Git and the existing recovery CLI are required.
@@ -6,7 +6,7 @@ No R2 delete capability, Render API/configuration access or deployment capabilit
 
 Historical approval (Deniz, 2026-11-11), retained verbatim:
 
-> delete everything on the NAS outside each stream's pinned keep28 period (raw clips and old stitched files), without asking per batch, provided every batch passes: (1) the server's dry run AND an independent check that every file is outside its stream's kept period; (2) a verified R2 copy for every file (R2 copies stay); (3) no protected or uncertain files; (4) the 5 TB/day cap, one plan at a time; deletion master switch OFF between batches; fixes deployed only between batches (never pause an enabled plan to deploy); a short daily progress note; any failed check stops the run and goes to the owner.
+> delete everything on the NAS outside each stream's pinned 20-day window, skipping keep-everything streams (raw clips and old stitched files), without asking per batch, provided every batch passes: (1) the server's dry run AND an independent check that every file is outside its stream's kept period; (2) a verified R2 copy for every file (R2 copies stay); (3) no protected or uncertain files; (4) the 5 TB/day cap, one plan at a time; deletion master switch OFF between batches; fixes deployed only between batches (never pause an enabled plan to deploy); a short daily progress note; any failed check stops the run and goes to the owner.
 
 The ownership release changes the between-batch mechanism to owned-plan OFF:
 exact-digest pause, receipt drain and real recovery. The global runtime master is
@@ -28,7 +28,7 @@ poll and before enable. Problems, identity mismatch, stale/missing evidence or a
 admission failure stops cleanup as well as COPY. No success can clear a failure.
 
 Every plan still requires complete fresh server dry-run, independent catalog and
-109-window pinned keep28 verification, exact source identities, verified R2
+109-window pinned 20-day verification, exact source identities, verified R2
 recovery, no protected/uncertain overlap, <=100GB/one stream, <=5TB/24h, and no
 other enabled plan/batch. Per-file fresh permits and custody checks are unchanged.
 Plans rank by bytes per operation. Ranking caches are hints only, expire after

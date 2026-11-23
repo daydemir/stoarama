@@ -32,7 +32,7 @@ func boundedNASStitchProof(p nasStitchPlan, sourceSHA string) (nasStitchProof, e
 	if sourceSHA != nasStitchProofSourceSHA || p.Policy != nasStitchPolicy || p.Revision != nasStitchRevision || p.CorpusSHA != nasStitchCorpusSHA || p.StreamID != 17208 || p.RecordingID != 444 || len(p.Clips) != 60 || len(p.FeatureInputs) != 60 || len(p.Frozen) != 59 || len(p.Joins) != 59 || len(p.Eligible) != 60 || !p.Joins[0] || !p.Eligible[0] || !p.Eligible[1] {
 		return nasStitchProof{}, errors.New("reviewed proof source plan differs")
 	}
-	policy, err := cleanupEmbeddedPolicy()
+	policy, err := cleanupEmbeddedKeep28Policy()
 	if err != nil || p.KeepSHA != policy.SHA {
 		return nasStitchProof{}, errors.New("proof keep policy differs")
 	}

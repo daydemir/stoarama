@@ -516,6 +516,14 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 // plans stop blocking R2 purges exactly as paused holds do. Enabled plans and
 // plans that ever issued a deletion are never retired here. Without
 // expected_plans the call is a read-only preview.
+//
+// Activating the 20-day policy supersedes every keep28 plan, so this path must
+// never become a bulk sweep. A plan is selectable only when it holds no
+// unresolved item (leased, delete_issued, unverified, conflict or missing) and
+// ever issued no deletion, no manifest identity is on the incident roster, and
+// no file or dependency is delivery-held. Everything else is counted as
+// not_retirable and left exactly as it is; an operator must reconcile it.
+// Retirement still grants no authority: unfinished items become 'keep'.
 func (s *Server) handleAdminNASCleanupRetireSuperseded(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Reason        string `json:"reason"`
@@ -536,7 +544,17 @@ func (s *Server) handleAdminNASCleanupRetireSuperseded(w http.ResponseWriter, r 
 		util.WriteError(w, 500, "cleanup retirement fence failed")
 		return
 	}
-	rows, err := tx.Query(ctx, `SELECT id FROM nas_cleanup_plans p WHERE account_id=47 AND connection_id=13 AND report_sha256<>$1 AND mode IN ('dry_run','paused') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued) ORDER BY id FOR UPDATE`, cleanupPolicySHA)
+	rows, err := tx.Query(ctx, `SELECT id FROM nas_cleanup_plans p
+ WHERE account_id=47 AND connection_id=13 AND report_sha256<>$1 AND mode IN ('dry_run','paused')
+ AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id
+   AND (i.delete_ever_issued OR i.state IN ('leased','delete_issued','unverified','conflict','missing')))
+ AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(p.manifest) e
+   WHERE (e->>'kind'='raw' AND EXISTS(SELECT 1 FROM nas_cleanup_incident_sources s WHERE s.clip_id=(e->>'source_id')::bigint))
+    OR (e->>'kind'='collated' AND EXISTS(SELECT 1 FROM recording_collation_outputs o
+        JOIN nas_cleanup_incident_sources s ON s.clip_id=ANY(o.source_clip_ids) WHERE o.id=(e->>'source_id')::bigint))
+    OR coalesce(delivery_nas_held(e->>'kind',(e->>'source_id')::bigint,
+        coalesce(e->>'relative_path',''),coalesce(e->>'sha256',''),coalesce((e->>'size_bytes')::bigint,0)),true))
+ ORDER BY id FOR UPDATE`, cleanupPolicySHA)
 	if err != nil {
 		util.WriteError(w, 500, "superseded cleanup plans unavailable")
 		return

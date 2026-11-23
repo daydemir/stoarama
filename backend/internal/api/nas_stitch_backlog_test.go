@@ -150,7 +150,7 @@ func TestNASStitchBacklogFallsBackToPinnedKeep28Windows(t *testing.T) {
 	stitchMigration(t, f)
 	backlogFixtureSchema(t, f)
 	sha, windows, err := Keep28Policy()
-	if err != nil || len(windows) != cleanupPolicyStreams || sha != cleanupPolicySHA {
+	if err != nil || len(windows) != cleanupPolicyStreams || sha != cleanupLegacyKeep28SHA {
 		t.Fatalf("policy unavailable: %v %d", err, len(windows))
 	}
 	report, err := NASStitchBacklog(f.ctx, backlogQuerier{f.pool})

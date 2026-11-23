@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Supervise the 2026-11-11 keep28 standing approval. No third-party Python packages."""
+"""Supervise the standing NAS cleanup approval on the active 20-day policy.
+
+No third-party Python packages. The owner widened the approval from keep28 to
+the reviewed 20-day window ("lets do window 20, just keep cleaning and
+reducing"); every sweep re-reads the pinned 20-day manifest from origin/main.
+"""
 import argparse
 import base64
 import fcntl
@@ -27,12 +32,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cli_binding import bound_launcher, ContractError as CLIBindingError
 
 API = 'https://stoarama-api.onrender.com'
-POLICY = 'backend/internal/api/nas_cleanup_keep28_policy.json'
-POLICY_SHA = '060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811'
+POLICY = 'backend/internal/api/nas_cleanup_keep20_policy.json'
+POLICY_SHA = 'bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393'
 DAY_CAP = 5_000_000_000_000
 PLAN_CAP = 100_000_000_000
 RECOVERY = {'r2_sha_verified', 'r2_md5_etag_matched'}
-REASON = ('Deniz standing approval 2026-11-11: NAS files outside pinned keep28 only; '
+REASON = ('Deniz standing approval (window 20): NAS files outside the pinned 20-day window only; '
           'server dry run + independent verification PASS; verified R2 copies retained; '
           '5 TB/24h; one owned plan; controller-managed global master.')
 
@@ -142,7 +147,7 @@ def verify(plan, catalog, windows, now):
                 and item['object_key'] and item['bucket'], 'incomplete file identity')
         sid = item['stream_id']
         streams.add(sid)
-        require(outside(sid, current['start_at'], current['end_at'], windows), 'file intersects keep28')
+        require(outside(sid, current['start_at'], current['end_at'], windows), 'file intersects the pinned keep window')
         sources = current['sources']
         expected = set(item['source_ids']) | set(current['source_ids'])
         resolved = [c['source_id'] for c in sources or []]
@@ -151,7 +156,7 @@ def verify(plan, catalog, windows, now):
                 'source catalog incomplete or duplicated')
         for clip in sources:
             require(clip['stream_id'] == sid and clip['bucket'] == item['bucket']
-                    and outside(sid, clip['start_at'], clip['end_at'], windows), 'source intersects keep28 or is uncertain')
+                    and outside(sid, clip['start_at'], clip['end_at'], windows), 'source intersects the pinned keep window or is uncertain')
         require(0 <= (now - timestamp(row['updated_at'])).total_seconds() < 20 * 3600,
                 'observation is stale or in the future')
     size = sum(i['size_bytes'] for i in plan['items'])
@@ -298,7 +303,7 @@ def request(url, token, method='GET', body=None):
 
 SHORT_READ_RETRY_DELAYS = (5, 10, 20, 30, 30, 25, None)  # 120 s
 COMMAND_TIMEOUT_SEC = 360
-PREPARE_TIMEOUT_SEC = 1800  # keep28 preparation on large streams exceeds six minutes
+PREPARE_TIMEOUT_SEC = 1800  # keep-window preparation on large streams exceeds six minutes
 STREAM_SUMMARY_TTL_SEC = 7 * 24 * 3600  # Ranking hints only; refreshes run with master OFF.
 PREPARER = 'backend/scripts/nas-cleanup/prepare_keep28_plans.py'
 COMMAND_FAILURE_LOG = Path.home() / 'stoarama-cleanup-runner' / 'command-failures.log'
@@ -334,6 +339,8 @@ class Runner:
         self.lock = None
         self.ownership_unreadable = False
         self.owner_validated = False
+        self.windows = {}
+        self.keep_everything = frozenset()
         self.status = {'current_plan': None, 'last_error': None}
 
     def start(self):
@@ -393,10 +400,16 @@ class Runner:
     def load_policy(self):
         repo = self.repo
         raw = command(['git', '-C', str(repo), 'show', 'origin/main:' + POLICY])
-        require(hashlib.sha256(raw).hexdigest() == POLICY_SHA, 'origin/main keep28 policy differs')
-        self.windows = {r['stream_id']: (timestamp(r['keep_start_utc']), timestamp(r['keep_end_utc'])) for r in json.loads(raw)}
-        require(len(self.windows) == 109, 'incomplete pinned policy')
-        require((repo / POLICY).read_bytes() == raw, 'checkout keep28 policy differs from origin/main')
+        require(hashlib.sha256(raw).hexdigest() == POLICY_SHA, 'origin/main keep20 policy differs')
+        rows = json.loads(raw)
+        require(len(rows) == 109, 'incomplete pinned policy')
+        # keep_everything streams are excluded from every sweep rather than
+        # treated as empty windows, so nothing of them is ever eligible.
+        self.windows = {r['stream_id']: (timestamp(r['start_at']), timestamp(r['end_at']))
+                        for r in rows if not r['keep_everything']}
+        self.keep_everything = frozenset(r['stream_id'] for r in rows if r['keep_everything'])
+        require(len(self.windows) + len(self.keep_everything) == 109, 'incomplete pinned policy')
+        require((repo / POLICY).read_bytes() == raw, 'checkout keep20 policy differs from origin/main')
 
     def save(self, phase, **values):
         require(not self.ownership_unreadable, 'unreadable ownership record must be preserved')

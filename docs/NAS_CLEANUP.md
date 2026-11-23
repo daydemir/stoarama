@@ -85,12 +85,14 @@ All are code constants (raising one is a reviewed code change) and fail closed:
   (unverified, conflict, missing, client error, policy/recovery mismatch,
   budget), an expired execution lease, or any receipt other than `deleted`
   pauses the plan.
-- **NAS client guard** (independent of the server): pinned copy of the keep28
-  selection and of `clients/nas-pull/nas_cleanup_folder_streams.json`, both
-  SHA-checked at startup (a failed check refuses every deletion; other work
-  continues). Before each unlink the client maps the folder to a stream, reads
-  the interval from the physical sidecar (raw) or the output bounds confirmed
-  by the dated path (collated), and refuses on keep-window overlap, unknown
+- **NAS client guard** (independent of the server): pinned copy of the active
+  20-day selection and of `clients/nas-pull/nas_cleanup_folder_streams.json`,
+  both SHA-checked at startup (a failed check refuses every deletion; other
+  work continues). The retained 28-day selection stays pinned separately for
+  native stitch and R2 copy/keep28 retention. Before each unlink the client
+  maps the folder to a stream, reads the interval from the physical sidecar
+  (raw) or the output bounds confirmed by the dated path (collated), and
+  refuses on a keep-everything stream, keep-window overlap, unknown
   folder/bounds or a disagreeing server `stream_id`. Hard local caps: 400,000
   files / 5 TB per rolling 24 h (bytes bind first; raised from 50,000 / 3 TB
   by owner decision, 2026-11). Every unlink is bracketed by fsynced intent and

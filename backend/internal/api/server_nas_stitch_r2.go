@@ -393,7 +393,7 @@ func (s *Server) queueDurhamStitchCopies(
 		}
 		body, _ := json.Marshal(item)
 		if _, err := tx.Exec(ctx, `INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item)
- VALUES(13,'stitch_output',$1,$2,$3,$4)`, item.SourceID, digest, cleanupPolicySHA, string(body)); err != nil {
+ VALUES(13,'stitch_output',$1,$2,$3,$4)`, item.SourceID, digest, cleanupLegacyKeep28SHA, string(body)); err != nil {
 			return err
 		}
 	}

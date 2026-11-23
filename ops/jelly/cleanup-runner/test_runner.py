@@ -26,7 +26,8 @@ FINISH_ADMISSION = importlib.util.module_from_spec(_admission_spec)
 _admission_spec.loader.exec_module(FINISH_ADMISSION)
 NOW = r.timestamp('2026-11-11T12:00:00+00:00')
 PREPARER = r.Runner(Path(__file__).resolve().parents[3], Path('.')).preparer()
-WINDOWS = {3: (r.timestamp('2026-09-01T00:00:00+00:00'), r.timestamp('2026-09-29T00:00:00+00:00'))}
+# The active 20-day window shape: 20 local days, not the legacy 28.
+WINDOWS = {3: (r.timestamp('2026-09-01T00:00:00+00:00'), r.timestamp('2026-09-21T00:00:00+00:00'))}
 
 _bound_cli_fixture = patch.object(r, 'bound_launcher', return_value=Path('/fixture/stoaramactl.bin'))
 
@@ -65,6 +66,28 @@ def plan_with_refusals(plan, total, ordinals):
     plan['results'] = [dict(copy.deepcopy(row), ordinal=n, state='deleted', delete_ever_issued=True, outcome={})
                        for n in range(1, total+1)]
     for n in ordinals: refused(plan['results'][n-1])
+
+
+class Keep20PolicyTests(unittest.TestCase):
+    def test_policy_path_and_digest_are_the_active_20_day_pin(self):
+        self.assertEqual(r.POLICY, 'backend/internal/api/nas_cleanup_keep20_policy.json')
+        self.assertEqual(r.POLICY_SHA, 'bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393')
+        self.assertIn('window 20', r.REASON)
+
+    def test_load_policy_excludes_keep_everything_streams(self):
+        repo = Path(__file__).resolve().parents[3]
+        raw = (repo / r.POLICY).read_bytes()
+        job = r.Runner(Path('.'), Path(tempfile.mkdtemp()))
+        self.addCleanup(shutil.rmtree, job.root)
+        with patch.object(r, 'command', return_value=raw):
+            job.load_policy()
+        self.assertEqual(len(job.windows) + len(job.keep_everything), 109)
+        self.assertEqual(len(job.keep_everything), 23)
+        self.assertIn(78, job.keep_everything)
+        self.assertNotIn(78, job.windows)
+        self.assertNotIn(3, job.keep_everything)
+        self.assertEqual(job.windows[3][0].isoformat(), '2026-09-15T15:00:00+00:00')
+        self.assertEqual(job.windows[3][1].isoformat(), '2026-10-05T15:00:00+00:00')
 
 
 class DecisionTests(unittest.TestCase):
@@ -134,7 +157,7 @@ class DecisionTests(unittest.TestCase):
 
     def test_boundary_is_outside_but_overlap_is_kept(self):
         self.assertTrue(r.outside(3, '2026-08-31T23:00:00Z', '2026-09-01T00:00:00Z', WINDOWS))
-        self.assertTrue(r.outside(3, '2026-09-29T00:00:00Z', '2026-09-29T01:00:00Z', WINDOWS))
+        self.assertTrue(r.outside(3, '2026-09-21T00:00:00Z', '2026-09-21T01:00:00Z', WINDOWS))
         self.assertFalse(r.outside(3, '2026-08-31T23:00:00Z', '2026-09-01T00:00:01Z', WINDOWS))
 
     def test_verifier_passes_both_recovery_proofs(self):

@@ -23,7 +23,7 @@ func ActivateNASDeliveryFence(ctx context.Context, tx pgx.Tx) error {
 		return err
 	}
 	_, err := tx.Exec(ctx, `INSERT INTO nas_delivery_retirement_fences(connection_id,policy_bytes,policy_sha256,effective_at,legacy_expires_at)
- SELECT id,$1,$2,t,t+interval '7 days' FROM connections CROSS JOIN (SELECT clock_timestamp() t) stamp WHERE id=13 AND account_id=47 AND kind='nas_pull'`, cleanupKeep28PolicyJSON, cleanupPolicySHA)
+ SELECT id,$1,$2,t,t+interval '7 days' FROM connections CROSS JOIN (SELECT clock_timestamp() t) stamp WHERE id=13 AND account_id=47 AND kind='nas_pull'`, cleanupKeep28PolicyJSON, cleanupLegacyKeep28SHA)
 	if err != nil {
 		return err
 	}

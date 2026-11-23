@@ -66,7 +66,7 @@ func ImportDurhamStitchHoldSet(ctx context.Context, tx pgx.Tx, set DurhamStitchH
 		Scan(&safe); err != nil || !safe {
 		return 0, errors.New("Durham hold import requires the frozen R2 fence and corpus with the queue disabled")
 	}
-	policy, err := cleanupEmbeddedPolicy()
+	policy, err := cleanupEmbeddedKeep28Policy()
 	if err != nil {
 		return 0, err
 	}

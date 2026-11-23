@@ -77,7 +77,7 @@ func nasStitchReadbackUUID(value string) bool {
 }
 
 func nasStitchReadbackPolicy() (stitchproof.Policy, error) {
-	policy, err := cleanupEmbeddedPolicy()
+	policy, err := cleanupEmbeddedKeep28Policy()
 	if err != nil {
 		return stitchproof.Policy{}, err
 	}
