@@ -2964,7 +2964,7 @@ class CleanupFile:
 # reads the clip interval from the physical sidecar binding (raw) or the
 # output's bounds cross-checked against the dated collated path (collated;
 # unknown -> refuse), and refuses when the interval overlaps that stream's
-# pinned keep28 window or the server's stream_id disagrees. It also enforces
+# pinned 20-day keep window or the server's stream_id disagrees. It also enforces
 # hard local 24h caps and writes an append-only, fsynced deletion ledger. A
 # client whose pinned files fail their SHA check refuses every deletion and
 # keeps doing all non-delete work. Refusal never unlinks; it is reported to the

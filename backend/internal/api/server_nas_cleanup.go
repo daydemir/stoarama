@@ -295,7 +295,7 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 		// Early admission filter only; every observation rechecks the file and
 		// all of its sources against the window and the live best14 replay.
 		if e != nil || !report.permits(i) || seen[i.RelativePath] || !policy.permitsCleanup(i, i.StartAt, i.EndAt) {
-			util.WriteError(w, 409, "source identity is unknown, duplicated, outside its stream's folders or inside the keep28 window")
+			util.WriteError(w, 409, "source identity is unknown, duplicated, outside its stream's folders or inside the keep window")
 			return
 		}
 		seen[i.RelativePath] = true

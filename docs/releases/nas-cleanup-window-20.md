@@ -1,6 +1,6 @@
 # NAS cleanup: window 20
 
-Owner decision (2026-11): "lets do window 20, just keep cleaning and reducing".
+Owner decision (2026-11, verbatim): "lets do window 20, just ekep cleaning and reducing".
 The NAS cleanup period narrows from 28 to **20 local days** per stream. This is
 the policy/window change only; it makes no production operation, publishes no
 release and activates no NAS epoch.

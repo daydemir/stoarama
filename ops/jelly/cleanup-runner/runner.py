@@ -2,8 +2,8 @@
 """Supervise the standing NAS cleanup approval on the active 20-day policy.
 
 No third-party Python packages. The owner widened the approval from keep28 to
-the reviewed 20-day window ("lets do window 20, just keep cleaning and
-reducing"); every sweep re-reads the pinned 20-day manifest from origin/main.
+the reviewed 20-day window (verbatim: "lets do window 20, just ekep cleaning
+and reducing"); every sweep re-reads the pinned 20-day manifest from origin/main.
 """
 import argparse
 import base64

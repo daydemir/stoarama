@@ -12,14 +12,15 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// The active cleanup policy (owner-approved window change: "lets do window 20,
-// just keep cleaning and reducing") keeps exactly ONE period per stream: the
+// The active cleanup policy (owner-approved window change, verbatim: "lets do
+// window 20, just ekep cleaning and reducing") keeps exactly ONE period per stream: the
 // stream's best 14 local days shifted to 20 local days, [best-3d, best+17d).
 // Every NAS file whose bounds, and all of whose source clips' bounds, lie
 // entirely outside that period is cleanup-eligible, except held delivery files
 // and their dependencies. Nothing inside the period can be admitted, observed
-// as would_delete, or deleted. Streams pinned keep-everything are never
-// eligible at all.
+// as would_delete, or deleted. Streams pinned keep-everything stay whole in R2;
+// their NAS copies use the same window but leave only with a verified R2
+// recovery (cleanupRecoveryPermits), never via the certified-stitch path.
 //
 // The bytes are the exact $policy$ manifest frozen by migration 0236
 // (nas_media_keep20_manifest) and embedded verbatim; the binary refuses any
@@ -202,8 +203,9 @@ func (s *Server) cleanupPolicy(context.Context) (*nasCleanupPolicy, error) {
 }
 
 // outside is true only for a valid, nonempty media interval of a stream that
-// has a pinned window, is not pinned keep-everything, and does not intersect
-// [keep_start, keep_end). Unknown streams and invalid bounds are always KEEP.
+// has a pinned window and does not intersect [keep_start, keep_end). It does
+// not read KeepEverything on purpose: those NAS copies leave against a verified
+// R2 recovery, enforced by cleanupRecoveryPermits and permitsCleanup. Unknown streams and invalid bounds are always KEEP.
 // The decision is window-agnostic: it is exact for whichever pinned selection
 // the caller holds (the active 20-day one, or the retained 28-day one).
 func (p *nasCleanupPolicy) outside(stream int64, a, b time.Time) bool {
