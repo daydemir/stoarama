@@ -69,6 +69,63 @@ class CleanupTests(unittest.TestCase):
     def opened(self):
         return pull.CleanupFile(self.cfg, self.item, threading.Event(), time.monotonic()+20)
 
+    def test_fast_copy_proof_skips_media_hash_and_checks_sidecar(self):
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.FAST_COPY_CLIENT_VERSION), self.opened() as current:
+            media_fd = current.files[0][1]
+            read = os.read
+
+            def read_sidecar_only(fd, count):
+                self.assertNotEqual(fd, media_fd, 'cleanup must never read the media')
+                return read(fd, count)
+
+            with mock.patch.object(pull.os, 'read', side_effect=read_sidecar_only), mock.patch.object(pull.hashlib, 'md5') as media_hash:
+                proof = current.proof()
+            media_hash.assert_not_called()
+            self.assertNotIn('sha256', proof)
+            self.assertEqual(proof['identity'], self.item['frozen_identity'])
+            self.assertEqual(proof['sidecar']['identity'], self.item['frozen_sidecar_identity'])
+            self.assertEqual(proof['sidecar']['binding'], self.binding)
+            ack = fixture_ack(dict(self.task, proof=proof), action='would_delete', delete=False, recovery='r2_name_size_matched')
+            self.assertTrue(pull.cleanup_verified_ack(self.task, proof, ack))
+            self.pins = self.fixture_pins('2026-08-20T00:00:00+00:00', '2026-09-09T00:00:00+00:00')
+            self.assertIn('overlaps', pull.cleanup_guard_refusal(self.task, proof))
+            os.utime(self.sidecar, ns=(0, self.sidecar.stat().st_mtime_ns - 1_000_000_000))
+            with self.assertRaisesRegex(RuntimeError, 'cleanup file identity changed'):
+                current.delete_exact(proof)
+
+    def test_fast_copy_rejects_catalog_size_mismatch_even_with_matching_stat(self):
+        self.item['size_bytes'] += 1
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.FAST_COPY_CLIENT_VERSION), self.opened() as current:
+            with self.assertRaisesRegex(RuntimeError, 'media size differs'):
+                current.proof()
+
+    def test_fast_copy_rechecks_inode_and_mtime_at_unlink(self):
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.FAST_COPY_CLIENT_VERSION):
+            for change in ('inode', 'mtime'):
+                with self.subTest(change=change), self.opened() as current:
+                    proof = current.proof()
+
+                    def replace_before_unlink():
+                        if change == 'inode':
+                            replacement = self.path.with_suffix('.replacement')
+                            replacement.write_bytes(self.path.read_bytes())
+                            os.replace(replacement, self.path)
+                        else:
+                            os.utime(self.path, ns=(0, self.path.stat().st_mtime_ns - 1_000_000_000))
+
+                    current.before_unlink = replace_before_unlink
+                    with self.assertRaisesRegex(RuntimeError, 'cleanup file identity changed'):
+                        current.delete_exact(proof)
+                    self.assertTrue(self.path.exists())
+                    self.assertTrue(self.sidecar.exists())
+                    self.item['frozen_identity'] = pull.cleanup_identity(self.path.stat())
+
+    def test_keep20_client_still_hashes_media(self):
+        with mock.patch.object(pull, 'CLIENT_VERSION', pull.KEEP20_CLEANUP_CLIENT_VERSION), self.opened() as current:
+            with mock.patch.object(pull.hashlib, 'md5', wraps=hashlib.md5) as media_hash:
+                self.assertEqual(current.proof()['sha256'], self.item['sha256'])
+            media_hash.assert_called_once()
+
     def certified_replacement(self):
         self.pins = self.fixture_pins('2026-08-31T00:00:00+00:00', '2026-09-28T00:00:00+00:00')
         replacement = self.cfg.output_dir / 'stitched-output.mp4'

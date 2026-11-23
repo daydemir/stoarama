@@ -267,7 +267,9 @@ func (s *Server) nasR2StitchCopyEnabled(version string) bool {
 // Ordinary cleanup is outside the same pinned window that copy intersects.
 // Maintenance remains exclusive; per-source holds below also veto special
 // stitched-source retirement. No global plan/lease/permit veto is necessary.
-func nasR2CopyReady(ctx context.Context, tx pgx.Tx) error {
+func nasR2CopyReady(ctx context.Context, tx interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}) error {
 	var busy bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_maintenance WHERE active)`).Scan(&busy); err != nil {
 		return err
@@ -372,6 +374,10 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	version, _ := nasRequestWorkVersion(r, nasConnectionCopy)
+	if version == nasFastCopyClientVersion {
+		s.handleNASR2FastCopyLease(w, r, cid, req.VerifyExisting)
+		return
+	}
 	stitch := s.nasR2StitchCopyEnabled(version)
 	leaseLimit := NASR2CopyWorkers
 	if nasLowMemoryRawCopyOnly(version) {
@@ -594,6 +600,11 @@ func (s *Server) nasR2CopyActive(w http.ResponseWriter, r *http.Request, purpose
 		util.WriteError(w, 409, "copy lease or policy expired")
 		return nil, t, version, req, false
 	}
+	if !allowStitchReplay && clientVersion == nasFastCopyClientVersion {
+		fail()
+		util.WriteError(w, 409, "fast copy uses whole-object leases")
+		return nil, t, version, req, false
+	}
 	if t.Item.Kind != NASR2CopyRaw && nasLowMemoryRawCopyOnly(clientVersion) {
 		fail()
 		util.WriteError(w, 409, "low-memory client requires a raw copy lease")
@@ -716,21 +727,32 @@ func (s *Server) handleNASR2CopyResult(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, 400, "stitch receipt supplied for raw copy")
 		return
 	}
-	// Existing inventory publication is the custody proof, never a result claim.
-	var exact bool
-	err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM nas_inventory_files WHERE connection_id=13 AND clip_id=$1 AND relative_path=$2 AND sha256=$3 AND size_bytes=$4 AND state='present' AND verified_at BETWEEN now()-interval '5 minutes' AND now()+interval '5 minutes' AND server_received_at>=now()-interval '5 minutes' AND sidecar_relative_path=$2||'.stoarama.json' AND sidecar_size_bytes>0 AND sidecar_sha256 ~ '^[a-f0-9]{64}$')`, t.Item.SourceID, t.Item.RelativePath, t.Item.SHA256, t.Item.SizeBytes).Scan(&exact)
-	if err != nil || !exact {
+	ok, err := nasR2CopyExactInventory(r.Context(), tx, t.Item)
+	if err != nil || !ok {
 		util.WriteError(w, 409, "copy requires exact NAS inventory proof")
 		return
 	}
-	if t.WorkMode == NASR2VerifyExisting {
-		_, err = tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET state='verified',lease_token=NULL,lease_expires_at=NULL,custody_refreshed_at=clock_timestamp(),refresh_count=refresh_count+1,updated_at=clock_timestamp() WHERE id=$1`, t.ID)
-	} else {
-		_, err = tx.Exec(r.Context(), `UPDATE nas_r2_copy_items SET state='verified',verified_at=now(),lease_token=NULL,lease_expires_at=NULL,completion=$2,committed_bytes=$3,updated_at=clock_timestamp() WHERE id=$1`, t.ID, req.Completion, req.CommittedBytes)
-	}
+	err = finishNASR2RawCopy(r.Context(), tx, t, req, false)
 	if err != nil || tx.Commit(r.Context()) != nil {
 		util.WriteError(w, 503, "copy result commit failed")
 		return
 	}
 	util.WriteJSON(w, 200, map[string]any{"verified": true})
+}
+
+// Existing inventory publication is the custody proof.
+func nasR2CopyExactInventory(ctx context.Context, tx pgx.Tx, item NASR2CopyItem) (bool, error) {
+	var exact bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_inventory_files WHERE connection_id=13 AND clip_id=$1 AND relative_path=$2 AND sha256=$3 AND size_bytes=$4 AND state='present' AND verified_at BETWEEN now()-interval '5 minutes' AND now()+interval '5 minutes' AND server_received_at>=now()-interval '5 minutes' AND sidecar_relative_path=$2||'.stoarama.json' AND sidecar_size_bytes>0 AND sidecar_sha256 ~ '^[a-f0-9]{64}$')`, item.SourceID, item.RelativePath, item.SHA256, item.SizeBytes).Scan(&exact)
+	return exact, err
+}
+
+func finishNASR2RawCopy(ctx context.Context, tx pgx.Tx, t nasR2CopyTask, req nasR2CopyControl, streamed bool) error {
+	if t.WorkMode == NASR2VerifyExisting {
+		_, err := tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',lease_token=NULL,lease_expires_at=NULL,custody_refreshed_at=clock_timestamp(),refresh_count=refresh_count+1,updated_at=clock_timestamp() WHERE id=$1`, t.ID)
+		return err
+	}
+	_, err := tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state='verified',verified_at=now(),lease_token=NULL,lease_expires_at=NULL,completion=$2,committed_bytes=$3,
+ downloaded_bytes=downloaded_bytes+CASE WHEN $4 THEN $5::bigint ELSE 0 END,updated_at=clock_timestamp() WHERE id=$1`, t.ID, req.Completion, req.CommittedBytes, streamed, req.DownloadedBytes)
+	return err
 }

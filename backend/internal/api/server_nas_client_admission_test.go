@@ -56,6 +56,8 @@ func TestNASClientAdmissionExactVersions(t *testing.T) {
 		{nasLowMemoryCleanupClientVersion, true, true, false},
 		{nasLowMemoryCleanupClientVersion + "-extra", false, false, false},
 		{nasKeep20CleanupClientVersion, true, true, false},
+		{nasFastCopyClientVersion, true, true, false},
+		{nasFastCopyClientVersion + "-extra", false, false, false},
 		{nasKeep20CleanupClientVersion + "-extra", false, false, false},
 		{"r2-copy-v5-extra", false, false, false},
 		{"r2-copy-v4-extra", false, false, false},
@@ -348,7 +350,7 @@ func seedLegacyBatchPermit(t *testing.T, f *cleanupFixture, task cleanupTask, ob
 	if err != nil || !fresh {
 		t.Fatalf("legacy history fixture: %t %v", fresh, err)
 	}
-	prefetched := f.s.cleanupPrefetchRecovery(f.ctx, 13, map[int64]string{task.ItemID: ""})
+	prefetched := f.s.cleanupPrefetchRecovery(f.ctx, 13, "", map[int64]string{task.ItemID: ""})
 	tx, err := f.pool.Begin(f.ctx)
 	if err != nil {
 		t.Fatal(err)

@@ -58,8 +58,8 @@ func (copyDeadlineRecorder) SetReadDeadline(time.Time) error { return nil }
 func copyCall(f *cleanupFixture, action string, id int64, body any) *httptest.ResponseRecorder {
 	data, _ := json.Marshal(body)
 	path := fmt.Sprintf("/api/v1/account/connections/r2-copy/%d/%s", id, action)
-	if action == "lease" {
-		path = "/api/v1/account/connections/r2-copy/lease"
+	if action == "lease" || action == "result-batch" {
+		path = "/api/v1/account/connections/r2-copy/" + action
 	}
 	req := httptest.NewRequest("POST", path, strings.NewReader(string(data)))
 	req.Header.Set("User-Agent", "stoarama-nas-pull/"+f.version)
@@ -69,7 +69,7 @@ func copyCall(f *cleanupFixture, action string, id int64, body any) *httptest.Re
 	ctx = context.WithValue(ctx, chi.RouteCtxKey, route)
 	req = req.WithContext(ctx)
 	out := httptest.NewRecorder()
-	handlers := map[string]http.HandlerFunc{"lease": f.s.handleNASR2CopyLease, "checkpoint": f.s.handleNASR2CopyCheckpoint, "range": f.s.handleNASR2CopyRange, "result": f.s.handleNASR2CopyResult, "block": f.s.handleNASR2CopyBlock}
+	handlers := map[string]http.HandlerFunc{"result-batch": f.s.handleNASR2FastCopyResults, "lease": f.s.handleNASR2CopyLease, "checkpoint": f.s.handleNASR2CopyCheckpoint, "range": f.s.handleNASR2CopyRange, "result": f.s.handleNASR2CopyResult, "block": f.s.handleNASR2CopyBlock}
 	nasDeliveryRequestDeadline(f.s.confineAccountScope(f.s.fenceNASDelivery(handlers[action]))).ServeHTTP(copyDeadlineRecorder{out}, req)
 	return out
 }

@@ -36,7 +36,7 @@ POLICY = 'backend/internal/api/nas_cleanup_keep20_policy.json'
 POLICY_SHA = 'bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393'
 DAY_CAP = 5_000_000_000_000
 PLAN_CAP = 100_000_000_000
-RECOVERY = {'r2_sha_verified', 'r2_md5_etag_matched'}
+RECOVERY = {'r2_sha_verified', 'r2_md5_etag_matched', 'r2_name_size_matched'}
 REASON = ('Deniz standing approval (window 20): NAS files outside the pinned 20-day window only; '
           'server dry run + independent verification PASS; verified R2 copies retained; '
           '5 TB/24h; one owned plan; controller-managed global master.')

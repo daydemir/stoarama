@@ -201,7 +201,7 @@ func TestNASCleanupRecoveryReadsRetainProgressAcrossContendedRequests(t *testing
 	maps := make(chan map[int64]cleanupPrefetchedRecovery, 2)
 	for n := 0; n < 2; n++ {
 		part := map[int64]string{ids[n*2]: "", ids[n*2+1]: ""}
-		go func() { maps <- f.s.cleanupPrefetchRecovery(f.ctx, 13, part) }()
+		go func() { maps <- f.s.cleanupPrefetchRecovery(f.ctx, 13, "", part) }()
 	}
 	verified := map[int64]bool{}
 	for n := 0; n < 2; n++ {
@@ -220,7 +220,7 @@ func TestNASCleanupRecoveryReadsRetainProgressAcrossContendedRequests(t *testing
 			remaining[id] = ""
 		}
 	}
-	for id, result := range f.s.cleanupPrefetchRecovery(f.ctx, 13, remaining) {
+	for id, result := range f.s.cleanupPrefetchRecovery(f.ctx, 13, "", remaining) {
 		if result.recovery == "r2_sha_verified" {
 			verified[id] = true
 		}

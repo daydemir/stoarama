@@ -363,6 +363,7 @@ func (s *Server) router() http.Handler {
 			account.Post("/connections/upload-probe", s.handleAccountConnectionUploadProbe)
 			account.Post("/connections/upload-probe/{probeId}/result", s.handleAccountConnectionUploadProbeResult)
 			account.Post("/connections/r2-copy/lease", s.handleNASR2CopyLease)
+			account.Post("/connections/r2-copy/result-batch", s.handleNASR2FastCopyResults)
 			account.Post("/connections/r2-copy/{id}/checkpoint", s.handleNASR2CopyCheckpoint)
 			account.Post("/connections/r2-copy/{id}/range", s.handleNASR2CopyRange)
 			account.Post("/connections/r2-copy/{id}/result", s.handleNASR2CopyResult)

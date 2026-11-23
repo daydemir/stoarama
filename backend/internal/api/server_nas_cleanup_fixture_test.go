@@ -344,7 +344,16 @@ func (f *cleanupFixture) observeMD5(tasks []cleanupTask, requestIDs map[int64]st
 	f.t.Helper()
 	observations := []map[string]any{}
 	for _, task := range tasks {
-		o := map[string]any{"item_id": task.ItemID, "attempt": task.Attempt, "plan_sha256": task.PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(task.Item), "error": "", "client_version": f.version}
+		proof := fixtureProof(task.Item)
+		if f.version == nasFastCopyClientVersion {
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(proof, &fields); err != nil {
+				f.t.Fatal(err)
+			}
+			delete(fields, "sha256")
+			proof, _ = json.Marshal(fields)
+		}
+		o := map[string]any{"item_id": task.ItemID, "attempt": task.Attempt, "plan_sha256": task.PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": proof, "error": "", "client_version": f.version}
 		if id := requestIDs[task.ItemID]; id != "" {
 			o["request_id"] = id
 		}
