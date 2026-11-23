@@ -22,6 +22,7 @@ const (
 	deleteCollatedOutsideWindow class = "delete_collated_outside_window"
 	deleteWindowOnNAS           class = "delete_window_20d_on_nas"
 	deleteDuplicateOfPageLink   class = "delete_duplicate_of_page_link"
+	deleteKeRawStitched         class = "delete_ke_raw_stitched"
 
 	protectKeepEverything class = "protect_keep_everything"
 	protectLiveSite       class = "protect_live_site"
@@ -37,7 +38,7 @@ const (
 
 func (c class) deletes() bool {
 	switch c {
-	case deleteRawOutsideWindow, deleteCollatedOutsideWindow, deleteWindowOnNAS, deleteDuplicateOfPageLink:
+	case deleteRawOutsideWindow, deleteCollatedOutsideWindow, deleteWindowOnNAS, deleteDuplicateOfPageLink, deleteKeRawStitched:
 		return true
 	}
 	return false
@@ -78,6 +79,16 @@ type identity struct {
 
 type window struct{ Start, End int64 } // [Start, End) unix seconds
 
+// keManifestPrefix holds collation manifests, which this class never touches.
+const keManifestPrefix = "joined/nightly-collation-v2/manifests"
+
+// keCoverage is one owner row saying a raw key's bytes are inside a stitched
+// output already stored in R2.
+type keCoverage struct {
+	OutputKey           string
+	RawSize, OutputSize int64
+}
+
 type prefixRule struct {
 	Prefix string
 	Class  class
@@ -103,12 +114,20 @@ type rules struct {
 	RecentFrom int64 // objects modified at or after this instant are protected
 	Released   map[string]bool
 	Evidence   map[string]evidence // nil unless nas_keep_20 is released
-	Fresh      map[string]object   // delete only: the listing taken right before the run
+	// KECoverage is the owner's --ke-coverage rows per raw key, and OutputKeys
+	// every stitched output they name. Outputs is the size each of those
+	// outputs has in the listing being decided: the plan snapshot, or delete's
+	// fresh listing.
+	KECoverage map[string][]keCoverage
+	OutputKeys map[string]bool
+	Outputs    map[string]int64
+	Fresh      map[string]object // delete only: the listing taken right before the run
 }
 
 type ruleFiles struct {
 	identities, dbProtect, closure, controller, picks string
 	derived, nasEvidence, release, recentFrom         string
+	keCoverage                                        string
 }
 
 func (f *ruleFiles) register(fs *flag.FlagSet) {
@@ -121,6 +140,7 @@ func (f *ruleFiles) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.derived, "derived-identities", "", "optional identities derived for keys with no catalog row")
 	fs.StringVar(&f.nasEvidence, "nas-evidence", "", "live NAS custody TSV for window keys; required with --release nas_keep_20")
 	fs.StringVar(&f.release, "release", "", "comma-separated controller protections to lift: "+strings.Join(sortedKeys(releasable), ","))
+	fs.StringVar(&f.keCoverage, "ke-coverage", "", "optional TSV: raw_key,raw_size,output_key,output_size for KE raw already inside a stitched R2 output")
 }
 
 func sortedKeys(m map[string]bool) []string {
@@ -136,7 +156,7 @@ func sortedKeys(m map[string]bool) []string {
 func (f ruleFiles) digests() (map[string]string, error) {
 	out := map[string]string{}
 	for name, p := range map[string]string{"identities": f.identities, "db_protect": f.dbProtect, "closure": f.closure,
-		"controller_protect": f.controller, "picks": f.picks, "derived_identities": f.derived, "nas_evidence": f.nasEvidence} {
+		"controller_protect": f.controller, "picks": f.picks, "derived_identities": f.derived, "nas_evidence": f.nasEvidence, "ke_coverage": f.keCoverage} {
 		if p == "" {
 			continue
 		}
@@ -193,6 +213,11 @@ func (f ruleFiles) load() (*rules, error) {
 	}
 	if err := r.loadIdentities(f.identities, f.derived); err != nil {
 		return nil, err
+	}
+	if f.keCoverage != "" {
+		if err := r.loadKECoverage(f.keCoverage); err != nil {
+			return nil, err
+		}
 	}
 	if len(r.Windows) == 0 || len(r.KE) == 0 || len(r.Identities) == 0 {
 		return nil, errors.New("rules are empty: windows, keep-everything streams and identities are all required")
@@ -407,6 +432,93 @@ func (r *rules) loadIdentityFile(path string) error {
 	})
 }
 
+// keCoveredDelete reports the covering output when a Keep Everything key may
+// instead go: --ke-coverage was given, every identity is a raw clip, the
+// listed size matches a coverage row, one such output is in this same listing
+// at the recorded size, nothing protects the key, and it is not recent.
+func (r *rules) keCoveredDelete(o object, ids []identity) (string, bool) {
+	if len(r.KECoverage) == 0 || len(ids) == 0 || strings.HasPrefix(o.Key, keManifestPrefix) || r.OutputKeys[o.Key] {
+		return "", false
+	}
+	for _, id := range ids {
+		if id.Kind != kindRaw {
+			return "", false
+		}
+	}
+	if _, ok := r.Keys[o.Key]; ok {
+		return "", false
+	}
+	for _, p := range r.Prefixes {
+		if strings.HasPrefix(o.Key, p.Prefix) {
+			return "", false
+		}
+	}
+	if o.MTime >= r.RecentFrom {
+		return "", false
+	}
+	if out := r.keCovered(o); out != "" {
+		return out, true
+	}
+	return "", false
+}
+
+// loadKECoverage reads the owner's raw_key,raw_size,output_key,output_size
+// TSV. It is strict: a malformed row, an empty key, a non-positive size, an
+// output also listed as raw, or a duplicate (raw, output) pair refuses the run.
+func (r *rules) loadKECoverage(path string) error {
+	r.KECoverage, r.OutputKeys, r.Outputs = map[string][]keCoverage{}, map[string]bool{}, map[string]int64{}
+	seen := map[[2]string]bool{}
+	if err := eachTSV(path, 4, func(c []string) error {
+		if c[0] == "" || c[2] == "" {
+			return errors.New("empty raw or output key")
+		}
+		rawSize, err := strconv.ParseInt(c[1], 10, 64)
+		if err != nil {
+			return fmt.Errorf("raw_size: %w", err)
+		}
+		outSize, err := strconv.ParseInt(c[3], 10, 64)
+		if err != nil {
+			return fmt.Errorf("output_size: %w", err)
+		}
+		if rawSize <= 0 || outSize <= 0 {
+			return fmt.Errorf("non-positive size %d,%d", rawSize, outSize)
+		}
+		if strings.HasPrefix(c[2], keManifestPrefix) || strings.HasPrefix(c[0], keManifestPrefix) {
+			return fmt.Errorf("manifest key %q never covers or is covered", c[0])
+		}
+		pair := [2]string{c[0], c[2]}
+		if seen[pair] {
+			return fmt.Errorf("duplicate coverage row %s -> %s", c[0], c[2])
+		}
+		seen[pair] = true
+		if r.OutputKeys[c[0]] {
+			return fmt.Errorf("raw key %q is itself a coverage output", c[0])
+		}
+		r.OutputKeys[c[2]] = true
+		r.KECoverage[c[0]] = append(r.KECoverage[c[0]], keCoverage{c[2], rawSize, outSize})
+		return nil
+	}); err != nil {
+		return err
+	}
+	for raw := range r.KECoverage {
+		if r.OutputKeys[raw] {
+			return fmt.Errorf("raw key %q is itself a coverage output", raw)
+		}
+	}
+	return nil
+}
+
+// keCovered reports the first covering row whose output the listing being
+// decided really holds at the recorded size, "" when none does.
+func (r *rules) keCovered(o object) string {
+	for _, c := range r.KECoverage[o.Key] {
+		if c.RawSize == o.Size && r.Outputs[c.OutputKey] == c.OutputSize {
+			return c.OutputKey
+		}
+	}
+	return ""
+}
+
 // decide classifies one listed object. The order fixes the reported reason;
 // any protection wins over deletion.
 func (r *rules) decide(o object) (class, string) {
@@ -419,16 +531,27 @@ func (r *rules) decide(o object) (class, string) {
 		return k.Class, k.Reason
 	}
 	ids := r.Identities[o.Key]
-	if r.KEFolders[plazaFolder(o.Key)] {
-		return protectKeepEverything, "keep_everything_folder_in_key"
+	keReason := ""
+	switch {
+	case r.KEFolders[plazaFolder(o.Key)]:
+		keReason = "keep_everything_folder_in_key"
+	default:
+		for _, id := range ids {
+			if r.KE[id.Stream] {
+				keReason = "keep_everything_stream"
+				break
+			}
+			if r.KEFolders[id.Folder] {
+				keReason = "keep_everything_folder"
+				break
+			}
+		}
 	}
-	for _, id := range ids {
-		if r.KE[id.Stream] {
-			return protectKeepEverything, "keep_everything_stream"
+	if keReason != "" {
+		if out, ok := r.keCoveredDelete(o, ids); ok {
+			return deleteKeRawStitched, "covered_by:" + topPrefix(out)
 		}
-		if r.KEFolders[id.Folder] {
-			return protectKeepEverything, "keep_everything_folder"
-		}
+		return protectKeepEverything, keReason
 	}
 	if len(ids) == 0 {
 		return protectUnclassified, "no_catalog_identity:" + topPrefix(o.Key)

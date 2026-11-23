@@ -75,6 +75,9 @@ func runPlan(args []string) error {
 	if sum.Inputs["snapshot"], err = fileSHA256(*snapshot); err != nil {
 		return err
 	}
+	if r.Outputs, err = scanOutputSizes(*snapshot, r.OutputKeys); err != nil {
+		return err
+	}
 	classified, err := os.OpenFile(filepath.Join(*out, "classified.tsv"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
@@ -156,6 +159,22 @@ func eachSnapshot(path string, fn func(object) error) error {
 		seen[c[0]] = true
 		return fn(object{Key: c[0], Size: size, ETag: c[2], MTime: mtime})
 	})
+}
+
+// scanOutputSizes records the listed size of every coverage output key found
+// in the listing being decided: plan's snapshot, or delete's fresh listing.
+func scanOutputSizes(path string, want map[string]bool) (map[string]int64, error) {
+	out := map[string]int64{}
+	if len(want) == 0 {
+		return out, nil
+	}
+	err := eachSnapshot(path, func(o object) error {
+		if want[o.Key] {
+			out[o.Key] = o.Size
+		}
+		return nil
+	})
+	return out, err
 }
 
 func fileSHA256(path string) (string, error) {

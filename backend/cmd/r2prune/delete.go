@@ -69,6 +69,11 @@ func runDelete(ctx context.Context, args []string) error {
 	if r.Fresh, err = loadFresh(*freshPath, *manifest); err != nil {
 		return err
 	}
+	// Coverage outputs are judged against the same fresh listing, never the
+	// plan-time snapshot.
+	if r.Outputs, err = scanOutputSizes(*freshPath, r.OutputKeys); err != nil {
+		return err
+	}
 	return deleteManifest(ctx, st, r, run, *manifest, *ledger, *workers, *limit)
 }
 

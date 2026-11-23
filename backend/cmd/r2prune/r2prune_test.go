@@ -381,3 +381,191 @@ func TestReleaseWindowOnLiveEvidence(t *testing.T) {
 		t.Errorf("R2 object changed after verify: got %s", got)
 	}
 }
+
+// keFixture extends the shared fixture with a KE raw clip whose bytes are in a
+// stitched output, plus the coverage TSV naming it.
+func keFixture(t *testing.T) (ruleFiles, *strings.Builder) {
+	t.Helper()
+	files, _ := fixture(t)
+	extra := &strings.Builder{}
+	out := w0 - 30*day
+	row := func(k kind, key string, stream, size int64, folder string) {
+		fmt.Fprintf(extra, "%s\t%s\t%d\t%d\t%d\t%d\tf\t0\t%s\t1\n", k, key, stream, out, out+60, size, folder)
+	}
+	row(kindRaw, "managed/acct-47/ke_folder/cov.mp4", 20, 120, "ke_folder")     // covered KE raw
+	row(kindRaw, "managed/acct-47/recordings/1/ke2.mp4", 20, 124, "recordings") // covered raw, output absent
+	row(kindRaw, "managed/acct-47/ke_folder/recent.mp4", 20, 125, "ke_folder")  // covered KE raw, recent write
+	row(kindRaw, "managed/acct-47/ke_folder/page.mp4", 20, 126, "ke_folder")    // covered KE raw, page_link
+	row(kindCollated, "joined/nightly-collation-v2/objects/kecol.mp4", 20, 122, "ke_folder")
+	f, _ := os.OpenFile(files.identities, os.O_APPEND|os.O_WRONLY, 0)
+	f.WriteString(extra.String())
+	f.Close()
+	p, _ := os.OpenFile(files.dbProtect, os.O_APPEND|os.O_WRONLY, 0)
+	p.WriteString("page_link\tmanaged/acct-47/ke_folder/page.mp4\n")
+	p.Close()
+	dir := t.TempDir()
+	files.keCoverage = writeFile(t, dir, "coverage.tsv", strings.Join([]string{
+		"managed/acct-47/ke_folder/cov.mp4\t120\tjoined/nightly-collation-v2/objects/out.mp4\t500",
+		"managed/acct-47/recordings/1/ke2.mp4\t124\tjoined/nightly-collation-v2/objects/absent.mp4\t600",
+		"managed/acct-47/ke_folder/recent.mp4\t125\tjoined/nightly-collation-v2/objects/out.mp4\t500",
+		"managed/acct-47/ke_folder/page.mp4\t126\tjoined/nightly-collation-v2/objects/out.mp4\t500",
+		"joined/nightly-collation-v2/objects/kecol.mp4\t122\tjoined/nightly-collation-v2/objects/out.mp4\t500",
+	}, "\n")+"\n")
+	return files, extra
+}
+
+func TestKECoveragePlanAndDecide(t *testing.T) {
+	files, _ := keFixture(t)
+	dir := t.TempDir()
+	snapshot := writeFile(t, dir, "snapshot.tsv", strings.Join([]string{
+		"managed/acct-47/ke_folder/cov.mp4\t120\te\t" + strconv.FormatInt(w0, 10),
+		"managed/acct-47/recordings/1/ke2.mp4\t124\te\t" + strconv.FormatInt(w0, 10),
+		"managed/acct-47/ke_folder/x.mp4\t106\te\t" + strconv.FormatInt(w0, 10),
+		"joined/nightly-collation-v2/objects/out.mp4\t500\te\t" + strconv.FormatInt(w0, 10),
+	}, "\n")+"\n")
+	out := filepath.Join(dir, "plan")
+	args := []string{"--snapshot", snapshot, "--out", out, "--identities", files.identities, "--db-protect", files.dbProtect,
+		"--closure", files.closure, "--controller-protect", files.controller, "--picks", files.picks,
+		"--recent-from", files.recentFrom, "--ke-coverage", files.keCoverage}
+	if err := runPlan(args); err != nil {
+		t.Fatal(err)
+	}
+	var sum summary
+	raw, _ := os.ReadFile(filepath.Join(out, "summary.json"))
+	if err := json.Unmarshal(raw, &sum); err != nil {
+		t.Fatal(err)
+	}
+	if sum.Inputs["ke_coverage"] == "" {
+		t.Fatal("plan must pin the coverage file digest")
+	}
+	if got := sum.ByClass[deleteKeRawStitched]; got == nil || got.Objects != 1 {
+		t.Fatalf("covered KE raw must be one delete, got %v", got)
+	}
+	if got := sum.ByClass[protectKeepEverything]; got == nil || got.Objects != 2 {
+		t.Fatalf("x.mp4 and the absent-output key stay protected, got %v", got)
+	}
+	var rows []manifestRow
+	lf, _ := os.Open(filepath.Join(out, "delete-manifest.jsonl"))
+	sc := bufio.NewScanner(lf)
+	for sc.Scan() {
+		var row manifestRow
+		if err := json.Unmarshal(sc.Bytes(), &row); err != nil {
+			t.Fatal(err)
+		}
+		rows = append(rows, row)
+	}
+	lf.Close()
+	if len(rows) != 1 || rows[0].Key != "managed/acct-47/ke_folder/cov.mp4" || rows[0].Class != deleteKeRawStitched ||
+		rows[0].Reason != "covered_by:joined/nightly-collation-v2" {
+		t.Fatalf("manifest rows %+v", rows)
+	}
+
+	r, err := files.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Outputs = map[string]int64{"joined/nightly-collation-v2/objects/out.mp4": 500}
+	for key, want := range map[string]class{
+		"managed/acct-47/ke_folder/cov.mp4":             deleteKeRawStitched,
+		"managed/acct-47/recordings/1/ke2.mp4":          protectKeepEverything, // output absent
+		"joined/nightly-collation-v2/objects/kecol.mp4": protectKeepEverything, // collated KE
+		"managed/acct-47/ke_folder/page.mp4":            protectLiveSite,       // page_link
+		"managed/acct-47/recordings/1/ke.mp4":           protectKeepEverything, // no coverage row
+	} {
+		size := map[string]int64{"managed/acct-47/ke_folder/cov.mp4": 120, "managed/acct-47/recordings/1/ke2.mp4": 124,
+			"joined/nightly-collation-v2/objects/kecol.mp4": 122, "managed/acct-47/ke_folder/page.mp4": 126,
+			"managed/acct-47/recordings/1/ke.mp4": 108}[key]
+		if got, reason := r.decide(object{Key: key, Size: size, MTime: w0}); got != want {
+			t.Errorf("%s: got %s (%s), want %s", key, got, reason, want)
+		}
+	}
+	// Output present at a different size, then the raw size differs.
+	r.Outputs["joined/nightly-collation-v2/objects/out.mp4"] = 499
+	if got, _ := r.decide(object{Key: "managed/acct-47/ke_folder/cov.mp4", Size: 120, MTime: w0}); got != protectKeepEverything {
+		t.Errorf("output size differs: got %s", got)
+	}
+	r.Outputs["joined/nightly-collation-v2/objects/out.mp4"] = 500
+	if got, _ := r.decide(object{Key: "managed/acct-47/ke_folder/cov.mp4", Size: 121, MTime: w0}); got != protectKeepEverything {
+		t.Errorf("raw size differs: got %s", got)
+	}
+	if got, _ := r.decide(object{Key: "managed/acct-47/ke_folder/recent.mp4", Size: 125, MTime: time.Now().Unix()}); got != protectKeepEverything {
+		t.Errorf("recent write: got %s", got)
+	}
+}
+
+func TestKECoverageOffLeavesKeepEverythingAlone(t *testing.T) {
+	files, _ := keFixture(t)
+	files.keCoverage = ""
+	r, err := files.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Outputs = map[string]int64{"joined/nightly-collation-v2/objects/out.mp4": 500}
+	if got, reason := r.decide(object{Key: "managed/acct-47/ke_folder/cov.mp4", Size: 120, MTime: w0}); got != protectKeepEverything || reason != "keep_everything_folder_in_key" {
+		t.Fatalf("without --ke-coverage: got %s (%s)", got, reason)
+	}
+}
+
+func TestKECoverageRefusesBadRows(t *testing.T) {
+	files, _ := keFixture(t)
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"malformed":     "a\t1\tb\n",
+		"zero raw size": "a\t0\tb\t2\n",
+		"zero output":   "a\t1\tb\t0\n",
+		"empty raw":     "\t1\tb\t2\n",
+		"empty output":  "a\t1\t\t2\n",
+		"duplicate":     "a\t1\tb\t2\na\t1\tb\t2\n",
+		"output as raw": "a\t1\tb\t2\nb\t1\tc\t2\n",
+		"manifest out":  "a\t1\tjoined/nightly-collation-v2/manifests/m.json\t2\n",
+	} {
+		bad := files
+		bad.keCoverage = writeFile(t, dir, strings.ReplaceAll(name, " ", "_")+".tsv", body)
+		if _, err := bad.load(); err == nil {
+			t.Errorf("%s: must refuse", name)
+		}
+	}
+}
+
+func TestDeleteSkipsKECoveredKeyWhenOutputLeavesFreshListing(t *testing.T) {
+	files, _ := keFixture(t)
+	dir := t.TempDir()
+	manifest := filepath.Join(dir, "manifest.jsonl")
+	row := manifestRow{Key: "managed/acct-47/ke_folder/cov.mp4", Size: 120, ETag: "e", MTime: w0, Class: deleteKeRawStitched,
+		Reason: "covered_by:joined/nightly-collation-v2"}
+	f, err := os.Create(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewEncoder(f).Encode(row); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	r, err := files.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fresh listing still has the raw key but no longer its output.
+	r.Fresh = map[string]object{row.Key: {Key: row.Key, Size: row.Size, ETag: row.ETag, MTime: row.MTime}}
+	if r.Outputs, err = scanOutputSizes(writeFile(t, dir, "fresh.tsv",
+		fmt.Sprintf("%s\t120\te\t%d\n", row.Key, w0)), r.OutputKeys); err != nil {
+		t.Fatal(err)
+	}
+	ledger := filepath.Join(dir, "ledger.jsonl")
+	if err := deleteManifest(context.Background(), store{bucket: "stoarama"}, r, runHeader{}, manifest, ledger, 2, 0); err != nil {
+		t.Fatal(err)
+	}
+	lf, _ := os.Open(ledger)
+	sc := bufio.NewScanner(lf)
+	sc.Scan() // run header
+	outcomes := map[outcome]int{}
+	for sc.Scan() {
+		var got ledgerRow
+		json.Unmarshal(sc.Bytes(), &got)
+		outcomes[got.Outcome]++
+	}
+	lf.Close()
+	if outcomes[outcomeSkippedProtected] != 1 || outcomes[outcomeDeleted] != 0 {
+		t.Fatalf("output gone from fresh listing must skip: %v", outcomes)
+	}
+}
