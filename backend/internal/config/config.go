@@ -48,6 +48,7 @@ type Config struct {
 	NASBenchmarkEnabled              bool
 	NASCleanupDeletionEnabled        bool
 	NASR2CopyEnabled                 bool
+	NASR2FastCopyBatchSize           int
 	NASStitchProofTaskID             int
 	NASStitchProofActivationID       string
 	NASStitchEnabled                 bool
@@ -245,6 +246,7 @@ func Load() (Config, error) {
 		NASBenchmarkEnabled:              boolEnv("NAS_BENCHMARK_ENABLED", true),
 		NASCleanupDeletionEnabled:        boolEnv("NAS_CLEANUP_DELETION_ENABLED", false),
 		NASR2CopyEnabled:                 boolEnv("NAS_R2_COPY_ENABLED", false),
+		NASR2FastCopyBatchSize:           intEnv("NAS_R2_FAST_COPY_BATCH_SIZE", 32),
 		NASStitchProofTaskID:             intEnv("NAS_STITCH_PROOF_TASK_ID", 0),
 		NASStitchProofActivationID:       os.Getenv("NAS_STITCH_PROOF_ACTIVATION_ID"),
 		NASStitchEnabled:                 boolEnv("NAS_STITCH_ENABLED", false),

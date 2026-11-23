@@ -15,7 +15,7 @@ const NASStorageBudgetMaxAge time.Duration = 180 * time.Second
 // gate. Each immutable release binds the same sample/nonce contract.
 func SupportsNASStorageBudget(version string) bool {
 	switch version {
-	case NASStorageBudgetClientVersion, NASR2CopyPagedClientVersion, nasCleanupCertifiedStitchVersion, nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion:
+	case NASStorageBudgetClientVersion, NASR2CopyPagedClientVersion, nasCleanupCertifiedStitchVersion, nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion:
 		return true
 	default:
 		return false

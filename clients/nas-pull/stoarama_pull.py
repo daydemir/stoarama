@@ -52,7 +52,8 @@ LOW_MEMORY_COPY_CLIENT_VERSION = "r2-copy-v8-low-memory"
 LOW_MEMORY_CLEANUP_CLIENT_VERSION = "r2-copy-v8-low-memory-cleanup"
 # Same artifact line built with the 20-day cleanup pin; identical behavior.
 KEEP20_CLEANUP_CLIENT_VERSION = "r2-copy-v8-keep20-cleanup"
-LOW_MEMORY_CLEANUP_VERSIONS = frozenset((LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION))
+FAST_COPY_CLIENT_VERSION = "r2-copy-v8-fast-copy"
+LOW_MEMORY_CLEANUP_VERSIONS = frozenset((LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, FAST_COPY_CLIENT_VERSION))
 CLEANUP_CERTIFIED_STITCH_REASON = "durham_stitch_certified"
 CLEANUP_CERTIFIED_STITCH_RECOVERY = "nas_stitch_certified"
 CLEANUP_RECONCILIATION_PROTOCOL = 1
@@ -270,7 +271,7 @@ DIAGNOSTIC_MAX_DEPTH = 32
 DIAGNOSTIC_TRUNCATED = " [TRUNCATED]"
 CLIENT_LOG_UPLOAD_SEC = 300
 CLIENT_LOG_LEVELS = ("WARN", "WARNING", "ERROR", "CRITICAL")
-CLIENT_LOG_TOPICS = re.compile(r"cleanup|replay|lease|quarantin|V85|stitch", re.IGNORECASE)
+CLIENT_LOG_TOPICS = re.compile(r"cleanup|replay|lease|quarantin|V85|stitch|R2 fast copy", re.IGNORECASE)
 # Keep normalization and redaction rules in sync with server_nas_client_logs.go;
 # both suites load testdata/nas_diagnostic_redaction.json.
 # Scan each name token only from its start. The marker lookahead and the
@@ -689,7 +690,7 @@ class StitchSwitches:
     def __init__(self):
         # Both low-memory literals are copy-only; the tuple keeps this class
         # loadable as an isolated contract fixture.
-        self.local_enabled = (CLIENT_VERSION not in (LOW_MEMORY_COPY_CLIENT_VERSION, LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION) and
+        self.local_enabled = (CLIENT_VERSION not in (LOW_MEMORY_COPY_CLIENT_VERSION, LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, FAST_COPY_CLIENT_VERSION) and
                               env_str("STOARAMA_V85_STITCH_ENABLED", "true").lower() == "true")
         self.local_deletion_enabled = env_str("STOARAMA_V85_STITCH_DELETION_ENABLED", "true").lower() == "true"
         cancel = threading.Event()
@@ -767,6 +768,9 @@ class Config:
         self.poll_interval_sec = env_int("STOARAMA_POLL_INTERVAL_SEC", 60)
         self.download_workers = env_int("STOARAMA_DOWNLOAD_WORKERS", DEFAULT_DOWNLOAD_WORKERS)
         self.restore_workers = env_int("STOARAMA_RESTORE_WORKERS", DEFAULT_RESTORE_WORKERS)
+        if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION:
+            self.fast_copy_workers = env_int("STOARAMA_R2_FAST_COPY_WORKERS", 8)
+            self.fast_copy_reread = env_str("STOARAMA_R2_FAST_COPY_REREAD", "false").lower() == "true"
         self.inventory_scan_interval_sec = env_int("STOARAMA_INVENTORY_SCAN_INTERVAL_SEC", INVENTORY_SCAN_INTERVAL_SEC)
         # Hash throughput already bounds disk pressure. An additional per-file
         # sleep makes a 100k+ first scan spend hours idle on small clips.
@@ -795,6 +799,8 @@ class Config:
             raise SystemExit("STOARAMA_DOWNLOAD_WORKERS must be between 1 and %d" % MAX_DOWNLOAD_WORKERS)
         if self.restore_workers < 1 or self.restore_workers > MAX_RESTORE_WORKERS:
             raise SystemExit("STOARAMA_RESTORE_WORKERS must be between 1 and %d" % MAX_RESTORE_WORKERS)
+        if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION and not 1 <= self.fast_copy_workers <= 32:
+            raise SystemExit("STOARAMA_R2_FAST_COPY_WORKERS must be between 1 and 32")
         if self.inventory_scan_interval_sec < 300 or self.inventory_scan_delay_ms < 0 or self.inventory_hash_mbps < 0 or self.inventory_hash_mbps > 1000:
             raise SystemExit("invalid NAS inventory scan cadence")
         if self.min_free_bytes < 1:
@@ -18335,12 +18341,10 @@ def cleanup_lease(cfg, limit=1):
 
 
 def cleanup_require_v2():
-    """The low-memory cleanup release fails closed on protocol mismatch.
+    """The low-memory cleanup releases fail closed on protocol mismatch.
 
-    Its bound is two dry hashes in the primary lane and one-file execution
-    groups, each with its own fresh permit. Protocol 1 has an eight-worker rolling window with a
-    lease larger than either bound, so this release never uses it. This guard
-    is defence in depth: the loop also refuses to enter the protocol-1 path."""
+    Protocol 1 has a wider dry-run lease/worker window than these releases
+    support. The coordinator also refuses to enter the protocol-1 path."""
     if CLIENT_VERSION in LOW_MEMORY_CLEANUP_VERSIONS:
         raise CleanupProtocolUnsupported("low-memory cleanup release requires protocol 2")
 
@@ -18453,7 +18457,7 @@ CLEANUP_V6_VERSIONS: frozenset[str] = frozenset((CLEANUP_GROUP_VERSION, "r2-copy
 CLEANUP_BULK_VERSION = "cleanup-batch-v7"
 CLEANUP_TRUTH_VERSION = "cleanup-batch-v8"
 CLEANUP_FRESH_PERMIT_VERSION = "v85r-nas-proof-v2.2"
-CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, CLEANUP_CERTIFIED_STITCH_VERSION, LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, "r2-copy-v2", "r2-copy-v3", "r2-copy-v4", "r2-copy-v5", "r2-copy-v6", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
+CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP_TRUTH_VERSION, CLEANUP_FRESH_PERMIT_VERSION, CLEANUP_CERTIFIED_STITCH_VERSION, LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, FAST_COPY_CLIENT_VERSION, "r2-copy-v2", "r2-copy-v3", "r2-copy-v4", "r2-copy-v5", "r2-copy-v6", "v85r-nas-proof-v1", "v85r-nas-proof-v2", "v85r-nas-proof-v2.1"))
 CLEANUP_GROUP_VERSIONS: frozenset[str] = CLEANUP_V6_VERSIONS | CLEANUP_BULK_VERSIONS
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
@@ -18792,6 +18796,10 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                 files_left = min(files_left, cleanup_execution_group_size() if CLIENT_VERSION in CLEANUP_GROUP_VERSIONS else CLEANUP_EXECUTION_INFLIGHT)
                 if pins_error is not None:
                     files_left = bytes_left = 0  # every deletion would be refused
+                if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION and not dry_run_only:
+                    # The wire dry_run_limit still keeps the two-item dry
+                    # window. Let execution use the available group slots.
+                    room = min(max(room, files_left), task_limit - leased)
                 lease = (cleanup_lease_v2(cfg, room, files_left, bytes_left, execution_only=True)
                          if execution_poll else cleanup_lease_v2(cfg, room, files_left, bytes_left))
                 retry = lease.get("retry_after_sec", 120)
@@ -18988,6 +18996,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
     opened, observations, receipts, timings = [], [], [], []
     reservations = []
     returned = set()
+    permit_ms = None
     shared = {"lease_ms": max(t.get("_lease_elapsed_ms", 0) for t in tasks)}
     # One deadline for ALL proofs, including queued/fence time. Leave one
     # bounded parallel reconciliation round before the earliest lease expiry.
@@ -19010,7 +19019,7 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
         # Arm every possible attempt durably BEFORE starting the permit clock.
         # The nested JSON string preserves proof insertion order across the
         # intent journal's canonical sorting. It grants no deletion authority.
-        nonlocal stage
+        nonlocal stage, permit_ms
         ledgers = []
         for task, body, (current, proof) in zip(tasks, observations, opened):
             proof_sha = hashlib.sha256(json.dumps(proof).encode()).hexdigest()
@@ -19044,10 +19053,13 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
         for task, timing in zip(tasks, timings):
             progress("permit_start", task, timing)
         permit_started = time.monotonic()
-        response = restore_api(cfg, "/account/connections/cleanup/observe-batch",
-            {"client_version": CLIENT_VERSION, "execution_batch": True,
-             "observations": [dict(body, item_id=task["item_id"]) for task, body in zip(tasks, observations)]},
-            timeout=CLEANUP_EXECUTION_OBSERVE_SEC)
+        try:
+            response = restore_api(cfg, "/account/connections/cleanup/observe-batch",
+                {"client_version": CLIENT_VERSION, "execution_batch": True,
+                 "observations": [dict(body, item_id=task["item_id"]) for task, body in zip(tasks, observations)]},
+                timeout=CLEANUP_EXECUTION_OBSERVE_SEC)
+        finally:
+            permit_ms = round((time.monotonic() - permit_started) * 1000)
         decisions = cleanup_group_response(response, tasks)
         for task, body, (current, proof), timing, receipt in zip(tasks, observations, opened, timings, receipts):
             timing["observe_ms"] = round((time.monotonic() - permit_started) * 1000)
@@ -19325,6 +19337,13 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
                         execution_elapsed_ms=round((time.monotonic() - started) * 1000),
                         unlink_attempted=bool(current and current.unlink_attempted),
                         media_unlinked=bool(current and current.media_unlinked), sidecar_unlinked=bool(current and current.sidecar_unlinked))
+                    if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION:
+                        outcome["group_files"] = len(tasks)
+                        stages = outcome["stage_timings"]
+                        if permit_ms is not None:
+                            stages["permit_ms"] = permit_ms
+                        if "delete_ms" in stages:
+                            stages["unlink_ms"] = stages["delete_ms"]
                     if error:
                         outcome["group_error"] = error
                     outcomes.append((task["item_id"], task["attempt"], outcome))
@@ -53743,6 +53762,7 @@ class R2CopyControlOperation(Enum):
     INVENTORY = 4
     RESULT = 5
     BLOCK = 6
+    RESULT_BATCH = 7
 
 
 class R2CopyControlFrame(Enum):
@@ -53811,10 +53831,10 @@ def request(p):
     sys.stdout.buffer.write(data);sys.stdout.buffer.flush()
 emit(1)
 while True:
-    line=sys.stdin.buffer.readline(32769)
+    line=sys.stdin.buffer.readline(262145)
     if not line:break
     try:
-        if len(line)>32768 or not line.endswith(b"\n"):raise OSError("input exceeds bound")
+        if len(line)>262144 or not line.endswith(b"\n"):raise OSError("input exceeds bound")
         p=json.loads(line)
         if p.get("prepare") is True:prepare(p)
         else:request(p)
@@ -53976,7 +53996,8 @@ class R2CopyControl:
                                "Content-Type": "application/json",
                                **({"X-Stoarama-Copy-Control": "inventory"} if operation is R2CopyControlOperation.INVENTORY else {})},
                    "body": base64.b64encode(json.dumps(body).encode()).decode() if body is not None else None}) + "\n").encode()
-        if len(message) > 32768:
+        limit = 262144 if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION and operation is R2CopyControlOperation.INVENTORY else 32768
+        if len(message) > limit:
             raise R2CopyHold("copy HTTP input exceeds bound")
         started = time.monotonic()
         deadline = started + timeout
@@ -54041,7 +54062,7 @@ class R2CopyControl:
                  sent, first - sent if first >= 0 and sent >= 0 else -1, elapsed, status))
 
 
-def r2_copy_resources(cfg, runtime, needed=R2_COPY_RANGE):
+def r2_copy_resources(cfg, runtime, needed=R2_COPY_RANGE, *, subtract_reservations=True):
     if not os.path.ismount(str(cfg.output_dir)):
         raise R2CopyHold("NAS output root is not mounted")
     _, available = meminfo_bytes(_read_text("/proc/meminfo"))
@@ -54057,7 +54078,9 @@ def r2_copy_resources(cfg, runtime, needed=R2_COPY_RANGE):
         raise R2CopyHold("copy memory headroom")
     status = storage_status(cfg)
     with runtime.lock:
-        free = int(status.get("free_bytes", 0)) - runtime.capacity_reserved_bytes
+        free = int(status.get("free_bytes", 0))
+        if subtract_reservations:
+            free -= runtime.capacity_reserved_bytes
     if not status.get("available") or free < max(R2_COPY_FLOOR, cfg.min_free_bytes) + needed:
         raise R2CopyHold("copy free-space floor")
     return free
@@ -54103,7 +54126,7 @@ def r2_copy_namespace(parent, guard, mutate):
         return mutate()
 
 
-def r2_copy_remove_private(parent, private, final, guard):
+def r2_copy_remove_private(parent, private, final, guard, *, sync_parent=True):
     try:
         os.stat(private, dir_fd=parent, follow_symlinks=False)
     except FileNotFoundError:
@@ -54116,8 +54139,9 @@ def r2_copy_remove_private(parent, private, final, guard):
             raise R2CopyBlocked(R2CopyBlockReason.PARTIAL)
         os.unlink(private, dir_fd=parent)
     r2_copy_namespace(parent, guard, remove)
-    guard.disk()
-    os.fsync(parent)
+    if sync_parent:
+        guard.disk()
+        os.fsync(parent)
 
 
 def valid_r2_copy_task(task):
@@ -54246,7 +54270,7 @@ def r2_copy_range(cfg, task, offset, length, guard, fd, digest):
                  timeout=R2_COPY_TIMEOUT)
 
 
-def r2_copy_sidecar(parent, name, clip, guard):
+def r2_copy_sidecar(parent, name, clip, guard, *, sync_parent=True):
     provenance = stitch_provenance(clip)
     payload = (json.dumps(provenance, sort_keys=True, separators=(",", ":")) + "\n").encode()
     sidecar = name + ".stoarama.json"
@@ -54270,8 +54294,9 @@ def r2_copy_sidecar(parent, name, clip, guard):
             os.close(fd)
         # Crash-safe, no-overwrite publication of the fully fsynced metadata.
         r2_copy_namespace(parent, guard, lambda: os.link(temporary, sidecar, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False))
-        guard.disk()
-        os.fsync(parent)
+        if sync_parent:
+            guard.disk()
+            os.fsync(parent)
     else:
         try:
             # The PostgreSQL and account-feed encodings spell the same UTC
@@ -54292,7 +54317,7 @@ def r2_copy_sidecar(parent, name, clip, guard):
             payload = actual
         finally:
             os.close(fd)
-    r2_copy_remove_private(parent, ".%s.r2-copy-sidecar-%d.part" % (name, clip["clip_id"]), sidecar, guard)
+    r2_copy_remove_private(parent, ".%s.r2-copy-sidecar-%d.part" % (name, clip["clip_id"]), sidecar, guard, sync_parent=sync_parent)
     return payload
 
 
@@ -54476,9 +54501,317 @@ def r2_copy_worker(cfg, runtime, inventory, stop, worker):
                 log("WARN", "R2 copy held: %s%s" % (reason, memory_hold_diagnostics(reason)))
 
 
+class R2FastCopyGuard(R2CopyGuard):
+    def __init__(self, cfg, runtime, stop, deadline):
+        self.cfg, self.runtime, self.stop, self.deadline = cfg, runtime, stop, deadline
+        self.checked = 0.0
+
+    def check(self):
+        now = time.monotonic()
+        if self.stop.is_set() or STITCH_ACTIVE.is_set() or now >= self.deadline:
+            raise R2CopyHold("copy stopped or lease expired")
+        if now - self.checked >= 2:
+            # The object already owns its reservation. Check actual disk and
+            # memory headroom without charging its unwritten bytes again.
+            r2_copy_resources(self.cfg, self.runtime, subtract_reservations=False)
+            self.checked = now
+
+
+class R2FastCopyNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def r2_fast_copy_stream(task, fd, guard, timings):
+    item = task["item"]
+    etag = normalized_etag(task["etag"])
+    url = urllib.parse.urlsplit(task["url"])
+    headers = task["headers"]
+    if (url.scheme != "https" or not url.hostname or url.username or url.fragment or
+            headers.get("If-Match") != ['"%s"' % etag] or
+            any(key not in ("If-Match", "Host") for key in headers) or
+            headers.get("Host", [url.netloc]) != [url.netloc]):
+        raise R2CopyHold("invalid copy capability")
+    request = urllib.request.Request(task["url"], method="GET",
+                                     headers={"User-Agent": USER_AGENT, "If-Match": headers["If-Match"][0]})
+    digest = hashlib.sha256()
+    written, hash_sec, first_byte = 0, 0.0, None
+    started = time.monotonic()
+    try:
+        # Open exactly once. The coordinator returns failures by lease token
+        # so the next attempt always receives a fresh signed capability.
+        opener = urllib.request.build_opener(R2FastCopyNoRedirect())
+        with opener.open(request, timeout=10) as response:
+            if response.status != 200 or normalized_etag(response.headers.get("ETag")) != etag:
+                raise R2CopyHold("copy GET identity changed")
+            if response.headers.get("Content-Length") != str(item["size_bytes"]):
+                raise R2CopyBlocked(R2CopyBlockReason.CHECKSUM)
+            while True:
+                guard.check()
+                block = response.read1(R2_COPY_RANGE)
+                if first_byte is None:
+                    first_byte = time.monotonic()
+                if not block:
+                    break
+                written += len(block)
+                if written > item["size_bytes"]:
+                    raise R2CopyBlocked(R2CopyBlockReason.CHECKSUM)
+                guard.disk()
+                remaining = memoryview(block)
+                while remaining:
+                    remaining = remaining[os.write(fd, remaining):]
+                hash_started = time.monotonic()
+                digest.update(block)
+                hash_sec += time.monotonic() - hash_started
+                del remaining, block
+    except urllib.error.HTTPError as exc:
+        if exc.fp is not None:
+            exc.close()
+        raise R2CopyHold("copy GET HTTP %d" % exc.code) from None
+    finally:
+        timings["get_first_byte_ms"] = round((first_byte - started) * 1000) if first_byte is not None else None
+        timings["transfer_ms"] = round((time.monotonic() - first_byte) * 1000) if first_byte is not None else None
+        timings["hash_ms"] = round(hash_sec * 1000, 3)
+        timings["transferred_bytes"] = written
+        with R2_COPY_TELEMETRY.lock:
+            R2_COPY_TELEMETRY.downloaded += written
+    info = os.fstat(fd)
+    if written != item["size_bytes"]:
+        raise R2CopyHold("copy GET truncated")
+    if info.st_size != written or digest.hexdigest() != item["sha256"]:
+        raise R2CopyBlocked(R2CopyBlockReason.CHECKSUM)
+    return info
+
+
+def r2_fast_copy_local(cfg, runtime, stop, deadline, task, reread):
+    item = task["item"]
+    verify_only = r2_copy_work_mode(task) is R2CopyWorkMode.VERIFY_EXISTING
+    guard = R2FastCopyGuard(cfg, runtime, stop, deadline)
+    timings = {"id": task["id"], "size_bytes": item["size_bytes"]}
+    started = time.monotonic()
+    try:
+        guard.check()
+        with ExitStack() as resources:
+            parent = r2_copy_parent(cfg, item["relative_path"], guard, create=not verify_only)
+            resources.callback(os.close, parent)
+            name = item["relative_path"].split("/")[-1]
+            partial = ".%s.r2-copy-%d.part" % (name, item["source_id"])
+            flags = os.O_NOFOLLOW | os.O_NONBLOCK
+            committed = 0
+            try:
+                fd = os.open(name, os.O_RDONLY | flags, dir_fd=parent)
+            except FileNotFoundError:
+                if verify_only:
+                    raise R2CopyBlocked(R2CopyBlockReason.VERIFY_MISSING)
+                fd = r2_copy_namespace(parent, guard, lambda: os.open(
+                    partial, os.O_RDWR | os.O_CREAT | flags, 0o644, dir_fd=parent))
+                resources.callback(os.close, fd)
+                opened = os.fstat(fd)
+                if not stat_module.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or opened.st_size > item["size_bytes"]:
+                    raise R2CopyBlocked(R2CopyBlockReason.PARTIAL)
+                guard.disk()
+                os.ftruncate(fd, 0)
+                needed = item["size_bytes"]
+                storage = storage_status(cfg)
+                with runtime.lock:
+                    if (not storage.get("available") or int(storage["free_bytes"]) - runtime.capacity_reserved_bytes
+                            < max(R2_COPY_FLOOR, cfg.min_free_bytes) + needed + R2_COPY_SPACE_GUARD):
+                        raise R2CopyHold("copy free-space reserve")
+                    runtime.capacity_reserved_bytes += needed
+                resources.callback(runtime.release_storage_reservation, needed)
+                info = r2_fast_copy_stream(task, fd, guard, timings)
+                if reread:
+                    size, digest, info = cleanup_timed(timings, "reread_ms", r2_copy_hash, fd, guard)
+                    if size != needed or digest.hexdigest() != item["sha256"]:
+                        raise R2CopyBlocked(R2CopyBlockReason.CHECKSUM)
+            else:
+                resources.callback(os.close, fd)
+                size, digest, info = cleanup_timed(timings, "hash_ms", r2_copy_hash, fd, guard)
+                if size != item["size_bytes"] or digest.hexdigest() != item["sha256"]:
+                    raise R2CopyBlocked(R2CopyBlockReason.FINAL)
+                if not verify_only:
+                    r2_copy_remove_private(parent, partial, name, guard, sync_parent=False)
+            guard.disk()
+            cleanup_timed(timings, "file_fsync_ms", os.fsync, fd)
+            if "transferred_bytes" in timings:
+                def publish():
+                    local = os.stat(partial, dir_fd=parent, follow_symlinks=False)
+                    if cleanup_identity(local) != cleanup_identity(info) or local.st_nlink != 1:
+                        raise R2CopyBlocked(R2CopyBlockReason.PARTIAL)
+                    os.link(partial, name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+                    os.unlink(partial, dir_fd=parent)
+                cleanup_timed(timings, "publish_ms", r2_copy_namespace, parent, guard, publish)
+                committed = item["size_bytes"]
+                with R2_COPY_TELEMETRY.lock:
+                    R2_COPY_TELEMETRY.committed += committed
+            payload = cleanup_timed(timings, "sidecar_ms", r2_copy_sidecar,
+                                    parent, name, task["clip"], guard, sync_parent=False)
+            guard.disk()
+            cleanup_timed(timings, "directory_fsync_ms", os.fsync, parent)
+            # Link/unlink can change ctime. Size, mtime and inode must remain
+            # those of the verified descriptor across publication.
+            current = os.fstat(fd)
+            if (current.st_size, current.st_mtime_ns, current.st_ino, current.st_dev) != (
+                    info.st_size, info.st_mtime_ns, info.st_ino, info.st_dev):
+                raise R2CopyBlocked(R2CopyBlockReason.PATH)
+            return current, payload, committed
+    finally:
+        timings["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+        log("INFO", "R2 fast copy item " + json.dumps(timings, sort_keys=True))
+
+
+def r2_fast_copy_batch(cfg, runtime, inventory, stop, control, pool, response, reread):
+    tasks = [valid_r2_copy_task(task) for task in response["tasks"]]
+    if (len(tasks) > 64 or any(task["item"]["kind"] != "raw" for task in tasks) or
+            len({task["id"] for task in tasks}) != len(tasks)):
+        raise R2CopyHold("invalid copy batch")
+    expiry = parse_certification_timestamp(response["lease_expires_at"], "copy lease")
+    deadline = time.monotonic() + expiry.timestamp() - time.time() - 5
+    stats = {"tasks": len(tasks), "verified": 0}
+    retry = False
+
+    with ExitStack() as owned:
+        pending, results, completed = {}, [], {}
+        owned.enter_context(CLIENT_LOG_RING.scoped_secrets(
+            value for task in tasks for value in (task["token"], task.get("url"))))
+        def report_block(task, reason):
+            nonlocal retry
+            try:
+                r2_copy_report_block(inventory, control, task, reason)
+            except (R2CopyHold, OSError):
+                retry = True
+                results.append({"id": task["id"], "token": task["token"]})
+
+        try:
+            for task in tasks:
+                with inventory.lock:
+                    latch = inventory.db.execute("SELECT reason FROM r2_copy_blocks WHERE item_id=?", (task["id"],)).fetchone()
+                if latch:
+                    report_block(task, R2CopyBlockReason(latch[0]))
+                    continue
+                try:
+                    owned.enter_context(NAS_COPY_PATHS.own(task["item"]["relative_path"]))
+                except R2CopyHold:
+                    results.append({"id": task["id"], "token": task["token"]})
+                    retry = True
+                    continue
+                pending[pool.submit(r2_fast_copy_local, cfg, runtime, stop, deadline, task, reread)] = task
+        finally:
+            # No lease can be returned while its worker owns a descriptor.
+            concurrent.futures.wait(pending)
+        try:
+            for future, task in pending.items():
+                item = task["item"]
+                result = {"id": task["id"], "token": task["token"]}
+                try:
+                    info, payload, committed = future.result()
+                    _, current = confined_regular_file(cfg.output_dir, item["relative_path"])
+                    if cleanup_identity(current) != cleanup_identity(info):
+                        raise R2CopyBlocked(R2CopyBlockReason.PATH)
+                    inventory._upsert(task["clip"], "present", utc_now_precise(), info.st_mtime_ns,
+                                      file_identity=(info.st_ctime_ns, info.st_ino, info.st_dev),
+                                      sidecar_evidence=(item["relative_path"] + ".stoarama.json", len(payload), hashlib.sha256(payload).hexdigest()))
+                except R2CopyBlocked as exc:
+                    report_block(task, exc.reason)
+                    continue
+                except Exception as exc:
+                    if isinstance(exc, OSError) and exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EISDIR, errno.EEXIST):
+                        report_block(task, R2CopyBlockReason.PATH)
+                        continue
+                    reason = str(exc) if isinstance(exc, R2CopyHold) else type(exc).__name__
+                    R2_COPY_TELEMETRY.hold(reason)
+                    log("WARN", "R2 fast copy held id=%d reason=%s" % (task["id"], reason))
+                    retry = True
+                else:
+                    result.update(completion="downloaded" if committed else "verified_in_place",
+                                  downloaded_bytes=committed, committed_bytes=committed)
+                    completed[task["id"]] = task
+                results.append(result)
+
+            free = 0
+            if completed:
+                try:
+                    free = r2_copy_resources(cfg, runtime, needed=16 * R2_COPY_RANGE)
+                    ids = tuple(task["item"]["source_id"] for task in completed.values())
+                    rows = inventory._rows("clip_id IN (%s)" % ",".join("?" for _ in ids), ids, len(ids))
+                    cleanup_timed(stats, "inventory_ms", control.request_json,
+                                  R2CopyControlOperation.INVENTORY, "/account/connections/inventory",
+                                  body={"generation": "live", "dataset_schema": INVENTORY_DATASET_SCHEMA,
+                                        "root_exclusions": list(INVENTORY_ROOT_EXCLUSIONS), "complete": False,
+                                        "files": inventory._reports(rows)})
+                    inventory._mark_clean(rows)
+                except Exception:
+                    # The durable files can be verified in place under the next
+                    # lease. Return their tokens even if inventory transport failed.
+                    retry = True
+                    completed.clear()
+                    results = [{"id": result["id"], "token": result["token"]} for result in results]
+            if results:
+                for attempt in range(3):
+                    try:
+                        reply = cleanup_timed(stats, "result_ms", control.request_json,
+                                              R2CopyControlOperation.RESULT_BATCH, "/account/connections/r2-copy/result-batch",
+                                              body={"free_bytes": free, "results": results})
+                        break
+                    except (R2CopyHold, OSError):
+                        if attempt == 2 or stop.wait(r2_fast_copy_backoff(attempt + 1)):
+                            raise
+                verified = set(reply["verified"])
+                stats["verified"] = len(verified)
+                retry |= verified != completed.keys()
+                with R2_COPY_TELEMETRY.lock:
+                    for result in results:
+                        if result["id"] not in verified or result["completion"] != "verified_in_place":
+                            continue
+                        task = completed[result["id"]]
+                        if r2_copy_work_mode(task) is R2CopyWorkMode.VERIFY_EXISTING:
+                            R2_COPY_TELEMETRY.refreshed += 1
+                            R2_COPY_TELEMETRY.refreshed_bytes += task["item"]["size_bytes"]
+                        else:
+                            R2_COPY_TELEMETRY.present += 1
+                            R2_COPY_TELEMETRY.present_bytes += task["item"]["size_bytes"]
+        finally:
+            log("INFO", "R2 fast copy batch " + json.dumps(stats, sort_keys=True))
+    return retry
+
+
+def r2_fast_copy_backoff(failures):
+    base = min(30, 2 ** min(failures, 5))
+    return random.uniform(min(base, 20), min(30, 1.5 * base))
+
+
+def r2_fast_copy_worker(cfg, runtime, inventory, stop):
+    wait = failures = 0
+    with R2CopyControl(cfg, stop, 0) as control, concurrent.futures.ThreadPoolExecutor(
+            max_workers=cfg.fast_copy_workers, thread_name_prefix="nas-r2-stream") as pool:
+        while not stop.wait(wait):
+            try:
+                free = r2_copy_resources(cfg, runtime)
+                timing = {}
+                try:
+                    response = cleanup_timed(timing, "lease_ms", control.request_json,
+                                             R2CopyControlOperation.LEASE, "/account/connections/r2-copy/lease",
+                                             body={"free_bytes": free, "verify_existing": True})
+                finally:
+                    log("INFO", "R2 fast copy lease " + json.dumps(timing, sort_keys=True))
+                if response["tasks"] and not r2_fast_copy_batch(
+                        cfg, runtime, inventory, stop, control, pool, response, cfg.fast_copy_reread):
+                    wait = failures = 0
+                    continue
+            except Exception as exc:
+                reason = str(exc) if isinstance(exc, R2CopyHold) else type(exc).__name__
+                R2_COPY_TELEMETRY.hold(reason)
+                log("WARN", "R2 fast copy held: %s%s" % (reason, memory_hold_diagnostics(reason)))
+            failures = min(failures + 1, 5)
+            wait = r2_fast_copy_backoff(failures)
+
+
 def r2_copy_loop(cfg, runtime, inventory, stop):
     # The caller owns this thread and waits for its lease and transport to drain.
-    r2_copy_worker(cfg, runtime, inventory, stop, 0)
+    if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION:
+        r2_fast_copy_worker(cfg, runtime, inventory, stop)
+    else:
+        r2_copy_worker(cfg, runtime, inventory, stop, 0)
 
 
 def main(argv=None):
