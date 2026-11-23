@@ -649,3 +649,18 @@ func TestDeleteSkipsKECoveredKeyWhenOutputLeavesFreshListing(t *testing.T) {
 		t.Fatalf("output gone from fresh listing must skip: %v", outcomes)
 	}
 }
+
+// A derived identity (no direct catalog row) never lifts a window-only hold.
+func TestWindowOnlyHoldStaysForDerivedOnlyKey(t *testing.T) {
+	const page = "joined/goodplus-gen1/page-only.mp4"
+	r, _ := windowOnlyFixture(t, "page_link\t"+page+"\n")
+	out := w0 - 30*day
+	r.Identities[page] = []identity{{Kind: kindCollated, Stream: 10, Start: out, End: out + 60, Size: 140, Derived: true}}
+	if got, reason := r.decide(object{Key: page, Size: 140, MTime: w0}); got.deletes() {
+		t.Fatalf("derived-only page key outside window: got %s (%s), want protected", got, reason)
+	}
+	r.Identities[page][0].Derived = false
+	if got, _ := r.decide(object{Key: page, Size: 140, MTime: w0}); got != deleteCollatedOutsideWindow {
+		t.Fatalf("catalogued page key outside window: got %s, want %s", got, deleteCollatedOutsideWindow)
+	}
+}

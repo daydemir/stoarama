@@ -75,6 +75,7 @@ type identity struct {
 	Size       int64
 	OnNAS      bool // exact path, size and SHA-256 match on NAS connection 13
 	Folder     string
+	Derived    bool // from --derived-identities, not a direct catalog row
 }
 
 type window struct{ Start, End int64 } // [Start, End) unix seconds
@@ -400,12 +401,15 @@ func (r *rules) loadEvidence(path string) error {
 	})
 }
 
-func (r *rules) loadIdentities(paths ...string) error {
-	for _, path := range paths {
-		if path == "" {
+func (r *rules) loadIdentities(catalog, derived string) error {
+	for _, f := range []struct {
+		path    string
+		derived bool
+	}{{catalog, false}, {derived, true}} {
+		if f.path == "" {
 			continue
 		}
-		if err := r.loadIdentityFile(path); err != nil {
+		if err := r.loadIdentityFile(f.path, f.derived); err != nil {
 			return err
 		}
 	}
@@ -419,9 +423,9 @@ func (r *rules) loadIdentities(paths ...string) error {
 	return nil
 }
 
-func (r *rules) loadIdentityFile(path string) error {
+func (r *rules) loadIdentityFile(path string, derived bool) error {
 	return eachTSV(path, 10, func(c []string) error {
-		var id identity
+		id := identity{Derived: derived}
 		switch kind(c[0]) {
 		case kindRaw, kindCollated, kindDuplicate:
 			id.Kind = kind(c[0])
@@ -549,12 +553,23 @@ func (r *rules) keyProtection(o object, ids []identity) (class, string, bool) {
 	if !ok {
 		return "", "", false
 	}
-	if !k.WindowOnly || len(ids) == 0 || r.keepEverything(o.Key, ids) != "" || r.overlapsWindow(ids) {
-		// A key with no catalog identity keeps today's behaviour: there is no
-		// window to judge it against, so the row still protects it.
+	if !k.WindowOnly || len(ids) == 0 || derivedOnly(ids) || r.keepEverything(o.Key, ids) != "" || r.overlapsWindow(ids) {
+		// A key with no direct catalog identity keeps today's behaviour: a
+		// derived identity never lifts a hold, so the row still protects it.
 		return k.Class, k.Reason, true
 	}
 	return "", "", false
+}
+
+// derivedOnly reports whether any identity of the key is derived rather than
+// a direct catalog row.
+func derivedOnly(ids []identity) bool {
+	for _, id := range ids {
+		if id.Derived {
+			return true
+		}
+	}
+	return false
 }
 
 // overlapsWindow reports whether a catalog identity of the key overlaps its
