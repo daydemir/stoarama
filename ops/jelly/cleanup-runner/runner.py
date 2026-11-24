@@ -1195,7 +1195,7 @@ class Runner:
                 break
             # Recheck before enable; observations must still be fresh.
             p = self.plan(pid)
-            require(verify(p, self.catalog(p), self.windows, utcnow()) > 0, 'plan size changed before enable')
+            require(verify(p, self.catalog(p), self.windows, utcnow()) == size, 'plan size changed before enable')
             self.idle()
             self.save('enabling', current_plan=pid, started_plan_sha256=p['plan_sha256'])
             if self.stopped():
