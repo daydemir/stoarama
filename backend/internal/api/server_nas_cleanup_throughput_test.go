@@ -359,38 +359,33 @@ func TestNASCleanupBatchAdvanceRegatesNextPlan(t *testing.T) {
 	}
 }
 
-// The lease never hands out execution work the rolling budget could not
-// permit (which would only auto-pause), and protocol 2 never mixes dry-run
+// The lease never hands out execution work the client's own local bounds
+// refuse (which would only auto-pause), and protocol 2 never mixes dry-run
 // and execution work in one response.
-func TestNASCleanupLeaseV2BudgetAndIsolation(t *testing.T) {
+func TestNASCleanupLeaseV2ExecutionIsolation(t *testing.T) {
 	f := newCleanupFixture(t, 24)
-	p1, sha1, _ := f.admit("budget-1", syntheticFiles(100, 2, 10))
+	p1, sha1, _ := f.admit("exec-1", syntheticFiles(100, 2, 10))
 	f.dryRun()
-	f.admit("budget-dry", syntheticFiles(300, 2, 10))
+	f.admit("exec-dry", syntheticFiles(300, 2, 10))
 	f.s.cfg.NASCleanupDeletionEnabled = true
 	if code, body := f.enableBatch([]int64{p1}, []string{sha1}, 1); code != 200 {
 		t.Fatalf("batch enable: %d %s", code, body)
 	}
-	safeguardPlan(t, f.ctx, f.s, 50, "paused", nasCleanupMaxIssuedBytes24h-10)
-	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET state='deleted',delete_ever_issued=true,updated_at=now() WHERE plan_id=50`); err != nil {
-		t.Fatal(err)
-	}
-	tasks := f.leaseV2(64, 64, 1<<40, "")
+	// The client's own remaining execution bounds still gate the lease: with no
+	// file allowance only dry-run work flows, and the plan is not paused.
+	tasks := f.leaseV2(64, 0, 0, "")
 	for _, task := range tasks {
 		if len(task.ApprovedProof) != 0 {
-			t.Fatalf("execution leased beyond the budget: %+v", task)
+			t.Fatalf("execution leased beyond the client's local bounds: %+v", task)
 		}
 	}
 	if len(tasks) != 2 {
 		t.Fatalf("dry-run work should still flow: %d", len(tasks))
 	}
 	if m, _ := f.planMode(p1); m != "enabled" {
-		t.Fatal("budget precheck paused the plan")
+		t.Fatal("lease precheck paused the plan")
 	}
-	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET updated_at=now()-interval '25 hours' WHERE plan_id=50`); err != nil {
-		t.Fatal(err)
-	}
-	// Leftover dry-run tasks are leased; then execution tasks come alone.
+	// The leftover dry-run tasks are leased first; then execution comes alone.
 	tasks = f.leaseV2(64, 64, 1<<40, "")
 	if len(tasks) != 1 || len(tasks[0].ApprovedProof) == 0 {
 		t.Fatalf("execution lease %+v", tasks)

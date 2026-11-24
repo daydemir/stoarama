@@ -11,8 +11,8 @@ import (
 // authority, shared otherwise), ascending plan advisory fences, ascending plan
 // rows, ascending batch rows, then item rows. Take the strongest required plan
 // lock up front: an item writer must never upgrade a shared parent lock.
-// Lease/budget advisory locks follow plan/batch scope locks; no later path
-// may acquire a new parent scope while holding them.
+// Lease advisory locks follow plan/batch scope locks; no later path may
+// acquire a new parent scope while holding them.
 // Resolve immutable membership without row locks, then lock the entire scope
 // before re-reading mutable mode/approval/receipt evidence in a new statement.
 // Batch insertion requires the exclusive public fence; its membership cannot

@@ -34,12 +34,12 @@ from cli_binding import bound_launcher, ContractError as CLIBindingError
 API = 'https://stoarama-api.onrender.com'
 POLICY = 'backend/internal/api/nas_cleanup_keep20_policy.json'
 POLICY_SHA = 'bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393'
-DAY_CAP = 5_000_000_000_000
-PLAN_CAP = 100_000_000_000
+# Mirrors the server's nasCleanupMaxPlanBytes; the server re-checks every plan.
+PLAN_CAP = 2_000_000_000_000
 RECOVERY = {'r2_sha_verified', 'r2_md5_etag_matched', 'r2_name_size_matched'}
 REASON = ('Deniz standing approval (window 20): NAS files outside the pinned 20-day window only; '
           'server dry run + independent verification PASS; verified R2 copies retained; '
-          '5 TB/24h; one owned plan; controller-managed global master.')
+          'one owned plan; controller-managed global master.')
 
 
 class Halt(Exception):
@@ -96,10 +96,6 @@ def outside(sid, start, end, windows):
     ws, we = windows[sid]
     require(2020 <= a.year and b.year < 2028 and b > a, 'uncertain media interval')
     return b <= ws or a >= we
-
-
-def budget_permits(recent, proposed):
-    return 0 <= recent and 0 < proposed <= PLAN_CAP and recent + proposed <= DAY_CAP
 
 
 def results(plan):
@@ -160,7 +156,7 @@ def verify(plan, catalog, windows, now):
         require(0 <= (now - timestamp(row['updated_at'])).total_seconds() < 20 * 3600,
                 'observation is stale or in the future')
     size = sum(i['size_bytes'] for i in plan['items'])
-    require(len(streams) == 1 and 0 < size <= PLAN_CAP, 'plan must be <=100 GB and one stream')
+    require(len(streams) == 1 and 0 < size <= PLAN_CAP, 'plan must be <=2 TB and one stream')
     return size
 
 
@@ -224,7 +220,6 @@ def render_email(status, reason, now):
         'enabling': 'starting batch ' + plan,
         'master_true': 'deletion switch enabled',
         'master_true_requested': 'preparing the deletion switch',
-        'waiting_for_budget': 'waiting for the daily deletion allowance',
         'batch_complete': 'batch finished',
         'recovery_verified': 'R2 recovery copies verified',
         'complete': 'cleanup complete', 'stopped': 'cleanup stopped',
@@ -286,7 +281,9 @@ def request(url, token, method='GET', body=None):
             'Content-Type': 'application/json'})
     try:
         with urllib.request.build_opener(NoRedirect()).open(req, timeout=120) as response:
-            raw = response.read(32 << 20)
+            # One plan-status payload is ~2.8 KB per completed item; the
+            # server caps a plan at 20000 items, so 64 MiB covers the worst case.
+            raw = response.read(64 << 20)
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as exc:
         retry = exc.code in {408, 429, 500, 502, 503, 504}
@@ -826,18 +823,6 @@ class Runner:
         except Exception:
             pass
 
-    def recent_bytes(self):
-        # Count ever-issued permits, including uncertain receipts: stricter than deleted bytes.
-        return self.query("""WITH receipts AS MATERIALIZED (
-          SELECT plan_id,ordinal FROM nas_cleanup_items
-          WHERE delete_ever_issued AND updated_at>now()-interval '24 hours'),
-          facts AS MATERIALIZED (
-          SELECT p.id,m.ordinal,(m.item->>'size_bytes')::bigint size_bytes
-          FROM (SELECT DISTINCT plan_id FROM receipts) r JOIN nas_cleanup_plans p ON p.id=r.plan_id
-          CROSS JOIN LATERAL jsonb_array_elements(p.manifest) WITH ORDINALITY m(item,ordinal))
-          SELECT coalesce(sum(f.size_bytes),0) FROM receipts i
-          JOIN facts f ON f.id=i.plan_id AND f.ordinal=i.ordinal""", 'daily permit bytes query')
-
     def catalog(self, plan):
         encoded = base64.b64encode(json.dumps(plan['items']).encode()).decode()
         pid = int(plan['id'])
@@ -1187,11 +1172,6 @@ class Runner:
             size = verify(p, self.catalog(p), self.windows, utcnow())
             if self.excluded_plan(p):
                 continue
-            if not budget_permits(self.recent_bytes(), size):
-                self.save('waiting_for_budget')
-                self.progress()
-                time.sleep(60)
-                continue
             if self.dry_run:
                 self.save('dry_run_pass', proposed_bytes=size)
                 return
@@ -1215,8 +1195,7 @@ class Runner:
                 break
             # Recheck before enable; observations must still be fresh.
             p = self.plan(pid)
-            verify(p, self.catalog(p), self.windows, utcnow())
-            require(budget_permits(self.recent_bytes(), size), 'budget changed before enable')
+            require(verify(p, self.catalog(p), self.windows, utcnow()) == size, 'plan size changed before enable')
             self.idle()
             self.save('enabling', current_plan=pid, started_plan_sha256=p['plan_sha256'])
             if self.stopped():

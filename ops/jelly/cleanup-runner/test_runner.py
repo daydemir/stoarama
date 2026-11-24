@@ -148,10 +148,18 @@ class DecisionTests(unittest.TestCase):
             with self.assertRaises(r.Halt):
                 job.stream_order()
 
-    def test_budget_boundaries_and_invalid_values(self):
-        self.assertTrue(r.budget_permits(r.DAY_CAP - r.PLAN_CAP, r.PLAN_CAP))
-        for recent, proposed in [(r.DAY_CAP-99, 100), (-1, 100), (0, 0), (0, r.PLAN_CAP+1)]:
-            self.assertFalse(r.budget_permits(recent, proposed))
+    def test_plan_cap_is_the_server_per_plan_bound(self):
+        # The rolling 24h deletion cap is gone; only the per-plan size bound
+        # remains, matching the server's nasCleanupMaxPlanBytes.
+        self.assertEqual(r.PLAN_CAP, 2_000_000_000_000)
+        self.assertFalse(hasattr(r, 'DAY_CAP'))
+        self.assertFalse(hasattr(r, 'budget_permits'))
+        p, cat = fixture()
+        self.assertTrue(r.verify(p, cat, WINDOWS, NOW) > 0)
+        for size in (0, r.PLAN_CAP + 1):
+            oversized = dict(p, items=[dict(p['items'][0], size_bytes=size)])
+            with self.assertRaises(r.Halt):
+                r.verify(oversized, cat, WINDOWS, NOW)
 
     def test_boundary_is_outside_but_overlap_is_kept(self):
         self.assertTrue(r.outside(3, '2026-08-31T23:00:00Z', '2026-09-01T00:00:00Z', WINDOWS))
@@ -321,7 +329,6 @@ class FakeRunner(r.Runner):
         return {'plans': [self.p['id']] if self.p['mode'] == 'enabled' else [], 'batches': 0}
     def idle(self): self.events.append('idle')
     def progress(self): pass
-    def recent_bytes(self): return 0
     def catalog(self, plan): return self.cat
     def plan(self, pid): return self.p
     def pick(self, lookahead=False): return self.picks.pop(0) if self.picks else None
@@ -871,14 +878,6 @@ class LoopTests(unittest.TestCase):
             self.assertEqual(job.status['last_error'], 'protected identity overlap')
             self.assertIn('notify', job.events)
             with self.assertRaises(r.Halt): job.run()
-
-    def test_budget_wait_does_not_enable(self):
-        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
-            job = FakeRunner(root)
-            job.recent_bytes = lambda: r.DAY_CAP
-            with patch.object(r.time, 'sleep', side_effect=lambda _: setattr(job, 'stopping', True)):
-                job.run()
-            self.assertNotIn('ON', job.events)
 
     def test_failed_recovery_does_not_close(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1447,7 +1446,7 @@ class SummaryQueryTests(unittest.TestCase):
             job.query = query
             self.assertEqual(r.Runner.pick(job, lookahead=True), 2)
 
-    def test_actual_sql_keeps_receipt_scope_budget_and_legacy_manifest_facts(self):
+    def test_actual_sql_keeps_receipt_scope_and_legacy_manifest_facts(self):
         psql=shutil.which('psql') or '/opt/homebrew/opt/postgresql@17/bin/psql'
         setup="""BEGIN;
         CREATE TEMP TABLE nas_cleanup_plans(id bigint,account_id bigint,connection_id bigint,manifest jsonb);
@@ -1473,6 +1472,5 @@ class SummaryQueryTests(unittest.TestCase):
             self.assertEqual(job.status['deleted_bytes'],400)
             self.assertEqual(job.status['deleted_24h_files'],1)
             self.assertEqual(job.status['deleted_24h_bytes'],100)
-            self.assertEqual(job.recent_bytes(),700)  # Includes uncertain issued receipts and other accounts, as before.
 
 if __name__ == '__main__': unittest.main()

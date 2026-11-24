@@ -212,13 +212,21 @@ class Keep28PlanTests(unittest.TestCase):
             self.assertEqual(len({(r['stream_id'], r['kind'], r['r2_purged']) for r in items}), 1)
         self.assertEqual(sum(len(i) for _, i in plans), len(rows))
 
-    def test_default_plans_fill_up_to_10000_items_and_100_gb(self):
-        rows = [row(3, 'raw', n, size=17_000_000) for n in range(1, 12001)]
+    def test_default_plans_fill_up_to_20000_items_and_2_tb(self):
+        # The item cap (20000) is what the plan-status payload can serve; the
+        # byte cap is the server's 2 TB per-plan bound.
+        self.assertEqual((k.MAX_PLAN_ITEMS, k.MAX_PLAN_BYTES), (20000, 2_000_000_000_000))
+        plans = k.batches([row(3, 'raw', n, size=1) for n in range(1, 20002)], 'k28', k.MAX_PLAN_ITEMS, k.MAX_PLAN_BYTES)
+        self.assertEqual([len(i) for _, i in plans], [20000, 1])
+        # At 17 MB per clip 20000 items is only ~340 GB, so items bind first;
+        # the 2 TB byte cap only binds for very large files (>=100 MB each).
+        rows = [row(3, 'raw', n, size=17_000_000) for n in range(1, 20002)]
         plans = k.batches(rows, 'k28', k.MAX_PLAN_ITEMS, k.MAX_PLAN_BYTES)
-        self.assertEqual([len(i) for _, i in plans], [5882, 5882, 236])
+        self.assertEqual([len(i) for _, i in plans], [20000, 1])
+        plans = k.batches([row(3, 'raw', n, size=500_000_000) for n in range(1, 4003)], 'k28', k.MAX_PLAN_ITEMS, k.MAX_PLAN_BYTES)
+        self.assertEqual([len(i) for _, i in plans], [4000, 2])
         self.assertTrue(all(sum(r['size_bytes'] for r in i) <= k.MAX_PLAN_BYTES for _, i in plans))
-        plans = k.batches([row(3, 'raw', n, size=1) for n in range(1, 10002)], 'k28', k.MAX_PLAN_ITEMS, k.MAX_PLAN_BYTES)
-        self.assertEqual([len(i) for _, i in plans], [10000, 1])
+        self.assertTrue(all(len(i) <= k.MAX_PLAN_ITEMS for _, i in plans))
 
     def test_batch_digest_keeps_the_legacy_vector(self):
         # The digest algorithm is unchanged; the historic keep28 vector stays

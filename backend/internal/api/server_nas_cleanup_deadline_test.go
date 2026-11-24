@@ -265,7 +265,8 @@ func TestNASCleanupExecutionDeadlineIncludesBatchAndLockWait(t *testing.T) {
 						t.Fatal(err)
 					}
 					defer tx.Rollback(f.ctx)
-					if _, err = tx.Exec(f.ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupBudgetLock); err != nil {
+					// The observation's own plan fence is held elsewhere.
+					if _, err = tx.Exec(f.ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPlanLockBase+id); err != nil {
 						t.Fatal(err)
 					}
 				} else {

@@ -37,14 +37,7 @@ const (
 	// under the public cleanup fence when a plan is enabled.
 	nasCleanupMaxEnabledPlans = 1
 	// A plan whose manifest exceeds this many media bytes cannot be enabled.
-	nasCleanupMaxPlanBytes int64 = 100_000_000_000 // 100 GB
-	// Rolling 24h deletion budget across all plans, counted from issued
-	// deletion permits (delete_ever_issued). No permit is issued beyond it.
-	// Raised from 3 TB to 5 TB by owner decision (2026-11, PR #436); the NAS
-	// client's local byte cap (CLEANUP_MAX_BYTES_24H) is the same value.
-	nasCleanupMaxIssuedBytes24h int64 = 5_000_000_000_000 // 5 TB
-	// Serializes the budget check-and-issue step across observations.
-	nasCleanupBudgetLock int64 = 7343226011102
+	nasCleanupMaxPlanBytes int64 = 2_000_000_000_000 // 2 TB
 	// Per-plan lock base (key = base + plan id). All cleanup writers take
 	// the canonical scope fences before row locks; see cleanupLockPlans.
 	nasCleanupPlanLockBase int64 = 7343226100000000
@@ -83,8 +76,11 @@ const (
 	nasCleanupInventoryClientVersion          = "cleanup-batch-v6.1"
 	nasCleanupExecutionGroupMax               = 8
 	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
-	// item limit only keeps one admission request bounded.
-	nasCleanupMaxPlanItems = 10000
+	// item limit only keeps one admission request bounded (200000 items is
+	// ~7 MB of JSON, inside util.DecodeJSON's 10 MiB limit). Both ops readers
+	// fetch the whole plan-status payload at ~2.8 KB per completed item, so
+	// 20000 items is the largest cap that stays inside their 64 MiB read.
+	nasCleanupMaxPlanItems = 20000
 	// Default and maximum approval window of an enabled plan or batch.
 	nasCleanupDefaultApproval = 2 * time.Hour
 	nasCleanupMaxApproval     = 24 * time.Hour
@@ -242,7 +238,7 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 		} `json:"items"`
 	}
 	if util.DecodeJSON(r, &req) != nil || !relayArtifactName.MatchString(req.Label) || len(req.Label) > 80 || len(req.Items) < 1 || len(req.Items) > nasCleanupMaxPlanItems {
-		util.WriteError(w, 400, "label and 1 to 10000 exact source identities required")
+		util.WriteError(w, 400, "label and 1 to 20000 exact source identities required")
 		return
 	}
 	ctx := r.Context()
@@ -702,15 +698,11 @@ WHERE p.connection_id=$1 AND p.report_sha256=$3 AND p.id=ANY($4)
  AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.state IN ('leased','delete_issued') AND NOT (busy.id=ANY($5::bigint[])))))
 ORDER BY (p.mode='enabled') DESC,i.attempt,p.priority DESC,p.id LIMIT 1`
 
-// Bytes of execution work already leased but not yet observed. Counted with
-// the issued bytes so a lease never hands out work the budget cannot permit.
-const cleanupLeasedExecutionBytesSQL = `SELECT coalesce(sum(coalesce(i.size_bytes,(p.manifest->(i.ordinal-1)->>'size_bytes')::bigint)),0) FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE p.mode='enabled' AND i.state='leased'`
-
 const (
 	// Protocol 1: at most 8 dry-run tasks. Execution requires the replay capability.
 	nasCleanupLeaseMaxV1 = 8
 	// Protocol 2: up to 64 dry-run tasks. Execution is one outstanding item
-	// per plan, also bounded by client caps and the server budget.
+	// per plan, also bounded by the client's own local limits.
 	nasCleanupLeaseMaxV2 = 64
 )
 
@@ -785,7 +777,6 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	session := cleanupRequestSession(r)
 	group := req.ExecutionBatch && (session.version == nasCleanupGroupClientVersion || session.version == nasCleanupSerialGroupClientVersion || session.version == nasCleanupDurableGroupClientVersion || session.version == nasCleanupBatchedCapsClientVersion || session.version == nasCleanupDeliveryHoldClientVersion || nasCleanupSupportsGroupedExecution(session.version))
 	groupIDs := []int64{}
-	var budgetLeft *int64
 	sessionDeadline, err := cleanupSessionDeadline(ctx, tx, cid, session)
 	if err != nil {
 		util.WriteError(w, 500, "cleanup client identity unavailable")
@@ -840,25 +831,11 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 			if len(tasks) != 0 && (!group || tasks[0].ApprovedProof == nil) {
 				break
 			}
-			if budgetLeft == nil {
-				var issued, leased int64
-				if err = tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&issued); err == nil {
-					err = tx.QueryRow(ctx, cleanupLeasedExecutionBytesSQL).Scan(&leased)
-				}
-				if err != nil {
-					util.WriteError(w, 500, "cleanup deletion budget unavailable")
-					return
-				}
-				left := nasCleanupMaxIssuedBytes24h - issued - leased
-				budgetLeft = &left
-			}
-			// Never lease execution work the rolling budget (or, protocol 2, the
-			// client's own remaining local caps) could not permit: it would only
-			// turn into a budget refusal that auto-pauses the plan.
-			// (An invalid size is still leased and then refused, and auto-paused,
-			// by the permit check itself.)
-			if (task.Item.SizeBytes > 0 && task.Item.SizeBytes > *budgetLeft) ||
-				(req.Protocol == 2 && (*req.ExecutionFiles < 1 || task.Item.SizeBytes > *req.ExecutionBytes)) {
+			// Never lease execution work the client's own remaining local limits
+			// could not permit: it would only turn into a refusal that
+			// auto-pauses the plan. (An invalid size is still leased and then
+			// refused, and auto-paused, by the permit check itself.)
+			if req.Protocol == 2 && (*req.ExecutionFiles < 1 || task.Item.SizeBytes > *req.ExecutionBytes) {
 				allowExecution = false
 				continue
 			}
@@ -890,7 +867,6 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 				break
 			}
 			groupIDs = append(groupIDs, task.ItemID)
-			*budgetLeft -= task.Item.SizeBytes
 			*req.ExecutionFiles--
 			*req.ExecutionBytes -= task.Item.SizeBytes
 			if len(groupIDs) >= nasCleanupExecutionGroupMax || *req.ExecutionFiles <= 0 {
@@ -1037,26 +1013,6 @@ func validCleanupObservationProof(raw []byte, i nasCleanupItem, nameSize bool) b
 // physical file from the dry run, and the recovery proof for that item class.
 func cleanupMayIssue(mode string, master bool, until *time.Time, sameFile bool, recovery string) bool {
 	return mode == "enabled" && master && until != nil && until.After(time.Now()) && sameFile && cleanupRecoveryPermits(mode, recovery)
-}
-
-// Media bytes of every item whose deletion permit was issued in the last 24h.
-// updated_at only moves forward, so later receipts can only keep an item in
-// the window longer (fail closed).
-// The write-once item size avoids detoasting the plan manifest per issued
-// item; legacy rows (NULL) still read it from the manifest.
-const cleanupIssuedBytes24hSQL = `SELECT coalesce(sum(coalesce(i.size_bytes,(p.manifest->(i.ordinal-1)->>'size_bytes')::bigint)),0) FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.delete_ever_issued AND i.updated_at>now()-interval '24 hours'`
-
-// cleanupBudgetAllows takes the budget lock for the rest of tx and reports
-// whether issuing one more permit of size bytes stays within the rolling cap.
-func cleanupBudgetAllows(ctx context.Context, tx pgx.Tx, size int64) (bool, error) {
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupBudgetLock); err != nil {
-		return false, err
-	}
-	var issued int64
-	if err := tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&issued); err != nil {
-		return false, err
-	}
-	return size > 0 && issued+size <= nasCleanupMaxIssuedBytes24h, nil
 }
 
 // Auto-pause uses the same state transition as an operator pause.
@@ -1410,16 +1366,8 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 					if certified && !env.certifiedStitchAbortsAbsent(ctx, tx, item) {
 						return cleanupObserveResult{status: 503, body: map[string]any{"error": "aborted staging absence could not be verified", "retryable": true}}
 					}
-					allowed, e := env.budgetAllows(ctx, tx, item.SizeBytes)
-					if e != nil {
-						return cleanupObserveError(500, "cleanup deletion budget unavailable")
-					}
-					if allowed {
-						action = "delete_issued"
-						deletion = true
-					} else {
-						policyReason = "rolling 24h deletion budget reached; KEEP"
-					}
+					action = "delete_issued"
+					deletion = true
 				}
 			}
 		}
@@ -1460,7 +1408,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	}
 	// During execution every healthy observation becomes a permit. Anything
 	// else (unverified, conflict, missing, client error, policy or recovery
-	// mismatch, budget) pauses the whole plan in the same transaction.
+	// mismatch) pauses the whole plan in the same transaction.
 	paused := false
 	if err == nil && mode == "enabled" && action != "delete_issued" {
 		reason := "item " + strconv.FormatInt(id, 10) + " observed " + action

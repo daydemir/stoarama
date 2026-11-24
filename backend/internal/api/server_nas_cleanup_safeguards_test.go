@@ -118,7 +118,7 @@ func TestNASCleanupNASOnlyRejectedEverywhere(t *testing.T) {
 	}
 }
 
-// Safeguard 2: one enabled plan at a time and a 100 GB per-plan byte cap.
+// Safeguard 2: one enabled plan at a time and a 2 TB per-plan byte cap.
 func TestNASCleanupOneEnabledPlanAndPlanByteCap(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
@@ -151,62 +151,14 @@ func TestNASCleanupOneEnabledPlanAndPlanByteCap(t *testing.T) {
 		t.Fatal("pause 2")
 	}
 	if code, body := safeguardControl(t, s, 3, "enabled", nil); code != 409 || !strings.Contains(body, "per-plan deletion cap") {
-		t.Fatalf("plan above 100 GB enabled: %d %s", code, body)
+		t.Fatalf("plan above 2 TB enabled: %d %s", code, body)
 	}
 	if code, body := safeguardControl(t, s, 4, "enabled", nil); code != 200 {
-		t.Fatalf("plan at exactly 100 GB refused: %d %s", code, body)
+		t.Fatalf("plan at exactly 2 TB refused: %d %s", code, body)
 	}
 	var enabled int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM nas_cleanup_plans WHERE mode='enabled'`).Scan(&enabled); err != nil || enabled != 1 {
 		t.Fatalf("enabled plans %d %v", enabled, err)
-	}
-}
-
-// Safeguard 2: rolling 24h budget of issued deletion bytes across all plans.
-func TestNASCleanupRollingDeletionBudget(t *testing.T) {
-	pool := cleanupTestPool(t)
-	ctx := context.Background()
-	s := &Server{pool: pool}
-	if nasCleanupMaxIssuedBytes24h != 5_000_000_000_000 {
-		t.Fatal("the 24h deletion budget is a reviewed constant (5 TB)")
-	}
-	safeguardPlan(t, ctx, s, 1, "paused", nasCleanupMaxIssuedBytes24h-100_000_000_000, 50_000_000_000)
-	safeguardPlan(t, ctx, s, 2, "paused", 40_000_000_000)
-	if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='deleted',delete_ever_issued=true,updated_at=now()-interval '1 hour' WHERE id=1000;
-UPDATE nas_cleanup_items SET state='deleted',delete_ever_issued=true,updated_at=now()-interval '25 hours' WHERE id=1001;`); err != nil {
-		t.Fatal(err)
-	}
-	allows := func(size int64) bool {
-		t.Helper()
-		tx, err := pool.Begin(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer tx.Rollback(ctx)
-		ok, err := cleanupBudgetAllows(ctx, tx, size)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return ok
-	}
-	if !allows(100_000_000_000) {
-		t.Fatal("permit within the 24h budget refused")
-	}
-	if allows(100_000_000_001) || allows(0) {
-		t.Fatal("permit beyond the 24h budget (or empty) issued")
-	}
-	// A not-yet-receipted issued delete counts too, from any plan.
-	if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='delete_issued',delete_ever_issued=true WHERE id=2000`); err != nil {
-		t.Fatal(err)
-	}
-	if allows(60_000_000_001) || !allows(60_000_000_000) {
-		t.Fatal("issued delete of another plan not counted")
-	}
-	if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_items SET updated_at=now()-interval '25 hours' WHERE id IN (1000,2000)`); err != nil {
-		t.Fatal(err)
-	}
-	if !allows(nasCleanupMaxIssuedBytes24h) {
-		t.Fatal("budget did not roll after 24h")
 	}
 }
 

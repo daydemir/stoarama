@@ -6,8 +6,8 @@ service control APIs. Account and NAS pull keys cannot create or enable plans.
 The NAS app polls the backend over its existing authenticated outbound channel.
 No SSH or new service is required. Preparing a plan never enables deletion.
 
-`stoaramactl nas-cleanup prepare --input plan.json` accepts a label and up to 10,000
-explicit `{kind,source_id}` pairs (and at most 100 GB of media). Supported media kinds are raw and collated;
+`stoaramactl nas-cleanup prepare --input plan.json` accepts a label and up to 20,000
+explicit `{kind,source_id}` pairs (and at most 2 TB of media). Supported media kinds are raw and collated;
 unknown/legacy joined artifacts remain retained. The backend derives identities
 from account 47/connection 13 catalog rows, requires their exact observed paths and
 fingerprints in the complete audit, and checks the independently reviewed folder
@@ -78,13 +78,16 @@ All are code constants (raising one is a reviewed code change) and fail closed:
   `nas_cleanup_plans_no_nas_only`); a permit is issued only for an item whose R2
   copy was streamed and SHA-verified. Re-introducing NAS-only deletion needs its
   own reviewed change.
-- **One enabled plan** at a time; a plan above **100 GB** cannot be enabled; no
-  permit is issued beyond a rolling **5 TB / 24 h** of issued deletions
-  (raised from 3 TB by owner decision, 2026-11).
+- **One enabled plan** at a time; a plan above **2 TB** (or above 20,000
+  items) cannot be enabled. The item cap is the plan-status payload limit:
+  a completed item is ~2.8 KB, so 20,000 items is ~54 MiB, inside the ops
+  readers' 64 MiB response read; 200,000 would need >500 MiB. The rolling
+  24 h issued-bytes cap was lifted by
+  owner decision (Deniz, 2026-11, verbatim: "lift nas cleanup dialy limit
+  please"); the digest-bound per-plan lock and one-plan-at-a-time rule remain.
 - **Auto-pause.** During execution any observation that is not a permit
-  (unverified, conflict, missing, client error, policy/recovery mismatch,
-  budget), an expired execution lease, or any receipt other than `deleted`
-  pauses the plan.
+  (unverified, conflict, missing, client error, policy/recovery mismatch), an
+  expired execution lease, or any receipt other than `deleted` pauses the plan.
 - **NAS client guard** (independent of the server): pinned copy of the active
   20-day selection and of `clients/nas-pull/nas_cleanup_folder_streams.json`,
   both SHA-checked at startup (a failed check refuses every deletion; other
@@ -93,9 +96,11 @@ All are code constants (raising one is a reviewed code change) and fail closed:
   maps the folder to a stream, reads the interval from the physical sidecar
   (raw) or the output bounds confirmed by the dated path (collated), and
   refuses a certified-stitch item on a keep-everything stream, keep-window overlap, unknown
-  folder/bounds or a disagreeing server `stream_id`. Hard local caps: 400,000
-  files / 5 TB per rolling 24 h (bytes bind first; raised from 50,000 / 3 TB
-  by owner decision, 2026-11). Every unlink is bracketed by fsynced intent and
+  folder/bounds or a disagreeing server `stream_id`. The server's rolling 24 h
+  budget is gone; the client's local rolling 24 h caps (400,000 files / 5 TB)
+  remain until the next NAS client release removes them. After that, the
+  server's per-plan bound and one-plan-at-a-time rule are the only size limits. Every unlink is bracketed
+  by fsynced intent and
   result lines in `/state/cleanup-deletions.jsonl` (append-only). A media unlink
   whose sidecar step failed is receipted `media_deleted_sidecar_failed`.
 - **R2 purge fence.** `nas-verified-purge` refuses to run (dry run included)
@@ -276,10 +281,10 @@ The pilot (plan 1388) ran at ~156 files/hour: per file a full best-14 replay
 dominating, ~60 s client back-off after each transient API error. None of the
 gates above changed; the work each gate costs and the approval granularity did.
 
-- **Plans** hold up to 10,000 items (still at most 100 GB). Each item row keeps
+- **Plans** hold up to 20,000 items (still at most 2 TB). Each item row keeps
   a write-once copy of its manifest entry and size (derived in SQL from the
-  stored manifest at admission), so leases, observations and the 24 h budget no
-  longer detoast a multi-MB manifest per item.
+  stored manifest at admission), so leases and observations no longer detoast a
+  multi-MB manifest per item.
 - **Best-14 replay once per plan.** Enabling a plan runs the full live replay
   per stream and stores the winner together with a SHA-256 fingerprint of the
   replay's exact input rows (every valid clip interval, timezone and
@@ -322,8 +327,8 @@ gates above changed; the work each gate costs and the approval granularity did.
 - **Protocol 2** (`lease` with `protocol: 2`, `observe-batch`, `result-batch`):
   up to 64 tasks per lease, observations and receipts batched up to 64 per
   request. Execution work is leased only within the client's remaining local
-  24 h caps (sent with the lease) and the server's remaining 24 h budget
-  (issued + already leased); a lease never mixes dry-run and execution tasks.
+  24 h caps when the client still sends them; the server has no 24 h budget.
+  A lease never mixes dry-run and execution tasks.
   Every request is retry-safe: a lease `request_id` returns the same leased
   tasks; an observation `request_id` returns the recorded decision, or for an
   identical request the one permit already issued with its original expiry
@@ -346,7 +351,7 @@ gates above changed; the work each gate costs and the approval granularity did.
   An execution mutex also serializes already-leased tasks and direct callers
   before opening files or starting the permit clock. Dry runs retain sixteen
   workers and up to 64 in-flight leases. Writer fences, confined descriptors,
-  fresh proofs, namespace checks, local caps and ledger lines still apply.
+  fresh proofs, namespace checks and ledger lines still apply.
 - **Batch approval.** `prepare_keep28_plans.py --submit` writes
   `batch-<prefix>-s<stream>.json` (ordered plan ids/digests and
   `batch_sha256 = sha256("stoarama-nas-cleanup-batch-v1\npolicy <sha>\n" +
@@ -361,16 +366,15 @@ gates above changed; the work each gate costs and the approval granularity did.
   gates now. It enables only the first plan. When a plan finishes cleanly
   (every item `deleted`) it is closed (`paused`, reason `batch-completed`, holds
   kept) and the next plan is enabled only after passing every per-plan gate
-  again (fresh <=24 h dry run, verified R2 copies, <=100 GB, one enabled plan,
+  again (fresh <=24 h dry run, verified R2 copies, <=2 TB, one enabled plan,
   master switch, approval not expiring within a minute). Any anomaly that
   pauses a plan also pauses its batch; a batch never re-enables a plan that
   stopped, and a paused batch cannot be re-enabled (approve the remainder as a
   new batch). `pause-batch --batch-id ID --expected-batch-sha256 SHA --reason`
   stops it; `batch-report --batch-id ID` shows per-plan states.
-- The 24 h limits are code constants: server budget 5 TB, client 5 TB and
-  400,000 files. At ~17 MB per raw clip 5 TB is ~290,000 files, so bytes bind
-  first: about 4 hours at 20 files/s, then the pipeline waits for the window
-  to roll (~16 TB total takes about 3.3 days).
+- The per-plan limits are code constants: server and client/ops copies of the
+  2 TB byte cap, plus the server's 20,000 items. There is no rolling daily
+  cap, so a run no longer idles waiting for a 24 h window to roll.
 
 Rollout: apply migration 0173 (additive; NOT VALID checks; one small partial
 index), deploy the API while no item is `leased`, then stage/promote the NAS
@@ -513,8 +517,8 @@ to the existing exact-binding checks; this change does not rewrite them.
 
 The eight-file lease and batched receipt acknowledgement remain, but each file
 gets a separate permit immediately before its own critical section. All proofs
-and the observation journal precede authority; one provisional local cap charge
-also precedes that file's permit. Each request carries the complete lease roster.
+and the observation journal precede authority. Each request carries the complete
+lease roster.
 The server locks and verifies the entire roster: one plan, one lease request,
 the live reviewed session, no unrelated outstanding work, and no uncertain member.
 Only the requested file receives authority. The existing 15-second client check,
@@ -530,10 +534,9 @@ unlink failure stops further grants. Crashes between unlink and a durable result
 retain an uncertain intent; replay never upgrades that intent into a refusal.
 Result replay is idempotent even after the lease and permit expire.
 
-Only one provisional local cap charge is held at a time. Every live exit before
-an unlink attempt releases its exact row ID. Attempted operations retain their
-charge once; crash-abandoned charges age out of the existing rolling 24-hour
-window. No abandoned charge can permanently starve execution.
+The former local rolling cap ledger (and its SQLite totals table/triggers) is
+removed with the cap; deletions still go through the fsynced intent/result
+ledger.
 
 Every group member emits a redacted `cleanup execution` client-log line with its
 item/attempt, actual media/sidecar flags, durable journal phase, outcome, error

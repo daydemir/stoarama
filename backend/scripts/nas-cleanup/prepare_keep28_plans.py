@@ -19,8 +19,8 @@ skipped, regardless of policy. Closing a paused plan releases only never-issued
 files for a fresh plan; use a new --label-prefix (labels are immutable). Items are
 grouped per stream, then per kind and recovery class (R2 copy present vs. R2
 purged; NAS-only deletion was removed, so those plans can never be enabled), ordered by
-descending bytes per file, and cut into plans of at most --max-items (<=10000) items and --max-bytes
-(<=100 GB, the backend's per-plan cap). Labels are deterministic:
+descending bytes per file, and cut into plans of at most --max-items (<=20000) items and --max-bytes
+(<=2 TB, the backend's per-plan cap). Labels are deterministic:
 <prefix>-s<stream>-<raw|col>[-nasonly]-<n>.
 R2-present plans precede NAS-only plans; within each class, plans with more
 bytes per file run first. Labels remain bound to their stream/kind/chunk.
@@ -77,8 +77,8 @@ POLICY_PATH = pathlib.Path(__file__).resolve().parents[2] / 'internal/api/nas_cl
 LEGACY_POLICY_SHA = '060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811'
 LEGACY_POLICY_PATH = pathlib.Path(__file__).resolve().parents[2] / 'internal/api/nas_cleanup_keep28_policy.json'
 LABEL = re.compile(r'^[a-z0-9][a-z0-9._-]{0,79}$')
-MAX_PLAN_ITEMS = 10000
-MAX_PLAN_BYTES = 100_000_000_000  # backend nasCleanupMaxPlanBytes
+MAX_PLAN_ITEMS = 20000
+MAX_PLAN_BYTES = 2_000_000_000_000  # backend nasCleanupMaxPlanBytes
 MAX_BATCH_PLANS = 500
 # A read failed before any submission: nothing was admitted and the runner may
 # retry this stream later. Every other failure stops the runner.
@@ -296,7 +296,9 @@ def service(api, method, path, body=None):
                                  data=None if body is None else json.dumps(body).encode(),
                                  headers={'Authorization': 'Bearer ' + os.environ['SERVICE_TOKEN'], 'User-Agent': 'stoarama-operator/1', 'Content-Type': 'application/json'})
     with urllib.request.build_opener(NoRedirect()).open(req, timeout=300) as response:
-        return json.loads(response.read(16 << 20))
+        # Plan status is ~2.8 KB per completed item; 64 MiB covers the
+        # server's 20000-item plan cap.
+        return json.loads(response.read(64 << 20))
 
 
 def submit(api, label, rows, receipts, rejected, atomic=False):
@@ -352,8 +354,8 @@ def validate_admission(result, detail, label, rows):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--stream', type=int, action='append', default=[], help='limit to stream id (repeatable)')
-    ap.add_argument('--max-items', type=int, default=MAX_PLAN_ITEMS, help='items per plan (1..10000)')
-    ap.add_argument('--max-bytes', type=float, default=MAX_PLAN_BYTES, help='byte cap per plan (<=1e11, the backend cap; e.g. 5e9 for a pilot)')
+    ap.add_argument('--max-items', type=int, default=MAX_PLAN_ITEMS, help='items per plan (1..20000)')
+    ap.add_argument('--max-bytes', type=float, default=MAX_PLAN_BYTES, help='byte cap per plan (<=2e12, the backend cap; e.g. 5e9 for a pilot)')
     ap.add_argument('--batch-by', choices=('stream', 'all'), default='stream', help='--submit: group admitted plans into batch manifests')
     ap.add_argument('--i-understand-large-batch', action='store_true', help='required with --batch-by all (one approval spanning every stream)')
     ap.add_argument('--max-plans', type=int, default=0, help='stop after N plans (0 = all)')
