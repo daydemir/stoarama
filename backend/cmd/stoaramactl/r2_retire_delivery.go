@@ -59,6 +59,9 @@ func r2RetireDeliveryHeld(ctx context.Context, q r2RetireQuerier, bucket, key st
 	return nil
 }
 func r2RetireDeliveryDecide(c r2RetireCandidate, scope r2RetireScope, windows map[int64]api.Keep28Window, picks map[int64]r2RetirePick) (string, string, bool) {
+	if r2RetireKeepEverything(c.StreamID) {
+		return "keep_everything", "all", false
+	}
 	pick, known := picks[c.StreamID]
 	if pick.Choice == "all" {
 		return "pick_all", "all", false

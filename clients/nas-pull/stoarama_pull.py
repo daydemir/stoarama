@@ -54,9 +54,9 @@ LOW_MEMORY_CLEANUP_CLIENT_VERSION = "r2-copy-v8-low-memory-cleanup"
 # Same artifact line built with the 20-day cleanup pin; identical behavior.
 KEEP20_CLEANUP_CLIENT_VERSION = "r2-copy-v8-keep20-cleanup"
 # Fast-copy line; the API supplies the stream count with every lease. The
-# tunable-modes release deletes day directories without the app-writer fence,
-# from day permits in names or dir mode.
-FAST_COPY_CLIENT_VERSION = "r2-copy-v8-tunable-modes"
+# ke-day release deletes day directories without the app-writer fence, from
+# day permits in names or dir mode, and Keep Everything days in names mode.
+FAST_COPY_CLIENT_VERSION = "r2-copy-v8-ke-day"
 LOW_MEMORY_CLEANUP_VERSIONS = frozenset((LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, FAST_COPY_CLIENT_VERSION))
 CLEANUP_CERTIFIED_STITCH_REASON = "durham_stitch_certified"
 CLEANUP_CERTIFIED_STITCH_RECOVERY = "nas_stitch_certified"
@@ -19311,8 +19311,9 @@ class CleanupPreflight:
 # only needs to be checked if its in the keep 20? otherwise it can be deleted
 # right?"; "yes, delete". The server permits one stream-day of raw footage in
 # one directory. Before unlinking anything this client re-checks, from its own
-# pins only: folder -> stream, the stream is not Keep Everything, and the whole
-# local day lies outside the pinned 20-day window with a one-day guard band.
+# pins only: folder -> stream, the permit mode the layout and Keep Everything
+# pin call for, and the whole local day lies outside the pinned 20-day window
+# with a one-day guard band.
 # It then deletes that day's media and sidecars in one pass under one durable
 # intent and reports one receipt. There is no R2 check and no local daily cap.
 #
@@ -19322,6 +19323,11 @@ class CleanupPreflight:
 # the rest. dir (a plaza <Month>/<DD-Weekday> dir of one stream-day): every
 # media file and sidecar of that date, catalogued or not; any other visible
 # entry keeps the whole directory. Hidden partials always stay.
+#
+# Keep Everything (Deniz: "nas shoul dnot have any of the keep everything
+# (except the keep 20)"): a KE stream's day always comes in names mode, listing
+# only files the server found with a live R2 counterpart of the same size; any
+# other file of the day stays.
 
 CLEANUP_DAY_PERMIT_PATH = "/account/connections/cleanup/day-permit"
 CLEANUP_DAY_RECEIPT_PATH = "/account/connections/cleanup/day-receipt"
@@ -19383,13 +19389,12 @@ def cleanup_day_refusal(permit, pins, now):
             return "invalid NAS directory"
         if not (CLEANUP_DAY_PLAZA_DIR_RE.fullmatch(directory) or CLEANUP_DAY_FLAT_DIR_RE.fullmatch(directory)):
             return "directory is not a dated raw NAS layout"
-        if (permit["mode"] == CleanupDayMode.DIR) != bool(CLEANUP_DAY_PLAZA_DIR_RE.fullmatch(directory)):
-            return "dir mode is for plaza day directories only"
         pinned = pins["folders"].get(cleanup_folder_key(directory + "/media", "raw"))
         if pinned is None or type(stream) is not int or pinned != stream:
             return "pinned folder map does not assign %r to stream %r" % (directory, stream)
-        if stream in pins["keep_everything"]:
-            return "stream %d is pinned Keep Everything" % stream
+        dir_mode = CLEANUP_DAY_PLAZA_DIR_RE.fullmatch(directory) and stream not in pins["keep_everything"]
+        if permit["mode"] != (CleanupDayMode.DIR if dir_mode else CleanupDayMode.NAMES):
+            return "dir mode is for non-Keep-Everything plaza day directories only"
         keep_start, keep_end, timezone = pins["windows"][stream]
         if permit.get("timezone") != timezone:
             return "permit timezone differs from the pinned window"
@@ -19581,7 +19586,7 @@ def cleanup_day_run(cfg, inventory, stop_event, permit, timings):
         # day unit unlinks only the names it selected at list time and accounts
         # each by absence: a file landing after the listing survives, and fast
         # copy links new names without overwriting. Everything selected is
-        # out-of-window non-KE media of the permitted date.
+        # out-of-window media of the permitted date (for KE, listed names only).
         if descriptor is not None:
             unlinked, started = 0, time.monotonic()
             for name, _, _ in files:
