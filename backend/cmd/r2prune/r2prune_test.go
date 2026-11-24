@@ -228,10 +228,22 @@ func TestListPlanDeleteAgainstFakeS3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, _, err := listBucket(context.Background(), st, 8, 3, snap)
+	n, _, err := listBucket(context.Background(), st, 8, 3, []string{""}, snap)
 	snap.Close()
 	if err != nil || n != int64(len(objects)) {
 		t.Fatalf("listed %d of %d: %v", n, len(objects), err)
+	}
+	// Root prefixes list exactly the keys under them.
+	roots := []string{"managed/acct-47/a_folder/", "joined/"}
+	want := 0
+	for key := range objects {
+		if strings.HasPrefix(key, roots[0]) || strings.HasPrefix(key, roots[1]) {
+			want++
+		}
+	}
+	var scoped strings.Builder
+	if got, _, err := listBucket(context.Background(), st, 8, 3, roots, &scoped); err != nil || got != int64(want) || want == 0 {
+		t.Fatalf("scoped listing %d of %d: %v", got, want, err)
 	}
 
 	out := filepath.Join(dir, "plan")
@@ -284,7 +296,7 @@ func TestListPlanDeleteAgainstFakeS3(t *testing.T) {
 	// The fresh listing is the fake bucket as it is now, with one key rewritten.
 	fresh := filepath.Join(dir, "fresh.tsv")
 	ff, _ := os.Create(fresh)
-	if _, _, err := listBucket(context.Background(), st, 4, 3, ff); err != nil {
+	if _, _, err := listBucket(context.Background(), st, 4, 3, []string{""}, ff); err != nil {
 		t.Fatal(err)
 	}
 	ff.Close()

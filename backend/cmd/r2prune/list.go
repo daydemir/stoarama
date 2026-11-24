@@ -30,7 +30,25 @@ func runList(ctx context.Context, args []string) error {
 	out := fs.String("out", "-", "snapshot TSV path, - for stdout")
 	workers := fs.Int("workers", 32, "parallel ListObjectsV2 requests")
 	depth := fs.Int("split-depth", 5, "delimiter levels crawled before flat listing")
+	var prefixes []string
+	fs.Func("prefix", "list only keys under this prefix (repeatable; default the whole bucket)", func(v string) error {
+		if v == "" {
+			return fmt.Errorf("empty --prefix")
+		}
+		prefixes = append(prefixes, v)
+		return nil
+	})
 	fs.Parse(args)
+	if len(prefixes) == 0 {
+		prefixes = []string{""}
+	}
+	for i, a := range prefixes {
+		for j, b := range prefixes {
+			if i != j && strings.HasPrefix(a, b) {
+				return fmt.Errorf("--prefix %q overlaps %q", a, b)
+			}
+		}
+	}
 	st, err := storeFromEnv()
 	if err != nil {
 		return err
@@ -45,7 +63,7 @@ func runList(ctx context.Context, args []string) error {
 		w = f
 	}
 	bw := bufio.NewWriterSize(w, 1<<20)
-	n, bytes, err := listBucket(ctx, st, *workers, *depth, bw)
+	n, bytes, err := listBucket(ctx, st, *workers, *depth, prefixes, bw)
 	if err != nil {
 		return err
 	}
@@ -56,10 +74,10 @@ func runList(ctx context.Context, args []string) error {
 	return nil
 }
 
-// listBucket crawls prefixes with "/" as delimiter down to depth, then lists
-// each deeper prefix flat. Every delimiter page returns both its objects and
-// its sub-prefixes, so the union is the complete bucket.
-func listBucket(ctx context.Context, st store, workers, depth int, w io.Writer) (int64, int64, error) {
+// listBucket crawls each root prefix with "/" as delimiter down to depth, then
+// lists each deeper prefix flat. Every delimiter page returns both its objects
+// and its sub-prefixes, so the union is every key under the roots.
+func listBucket(ctx context.Context, st store, workers, depth int, roots []string, w io.Writer) (int64, int64, error) {
 	var mu sync.Mutex
 	var n, total int64
 	emit := func(objs []object) error {
@@ -95,7 +113,9 @@ func listBucket(ctx context.Context, st store, workers, depth int, w io.Writer) 
 			return nil
 		})
 	}
-	walk("", 0)
+	for _, root := range roots {
+		walk(root, 0)
+	}
 	return n, total, g.Wait()
 }
 
