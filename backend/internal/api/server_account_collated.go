@@ -23,8 +23,11 @@ import (
 // server-set rate, beside (never yielding to) raw delivery.
 
 const (
-	collatedFeedBudget       = 3 * time.Second
-	collatedFeedFenceLimit   = 10
+	collatedFeedBudget     = 3 * time.Second
+	collatedFeedFenceLimit = 50
+	// Candidates examined per feed request. In-window outputs sit in id runs with
+	// 20k-id gaps; one request must cross a gap. Production worst case ~0.7s of the 2s budget.
+	collatedFeedScanLimit    = 20000
 	collatedFeedMaxLimit     = 200
 	collatedFeedDefaultLimit = 50
 	collatedDownloadTTL      = time.Hour
@@ -140,7 +143,7 @@ var collatedFeedSQL = `WITH page AS MATERIALIZED (
  JOIN recordings r ON r.id=h.recording_id
  JOIN connections conn ON conn.id=$1 AND conn.kind='nas_pull' AND conn.account_id=r.account_id
  WHERE r.delivery='nas_pull' AND (conn.collated_delivery_enabled OR ($2::boolean AND conn.delivery_nas_handoff_enabled)) AND o.id>$3
- ORDER BY o.id LIMIT 1000
+ ORDER BY o.id LIMIT ` + strconv.Itoa(collatedFeedScanLimit) + `
 ), eligible AS MATERIALIZED (
  SELECT o.id,o.nas_relative_path,o.size_bytes,o.sha256,handoff.round AS handoff_readback_round,
         CASE WHEN handoff.output_id IS NOT NULL THEN ARRAY[handoff.device,handoff.inode] END AS handoff_mount FROM page

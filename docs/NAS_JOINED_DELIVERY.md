@@ -78,8 +78,8 @@ Collation v2 records each part in `recording_collation_outputs`
 pulls those rows directly:
 
 1. `GET /api/v1/account/collated?after_id=0&limit=50` returns `policy`, `items`,
-   and `next_after_id`. Each request examines at most 1,000 account-scoped
-   candidates in output-ID order and applies the delivery fence to at most 10 held outputs, under a two-second PostgreSQL statement and three-second request budget. Eligibility
+   and `next_after_id`. Each request examines at most 20,000 account-scoped
+   candidates in output-ID order and applies the delivery fence to at most 50 eligible outputs, under a two-second PostgreSQL statement and three-second request budget. Eligibility
    and backoff can produce an empty page with a nonzero cursor. Advance that
    cursor even on empty pages; zero means exhausted. Start a fresh scan at zero
    after exhaustion, so expired backoff and late old-hour publications are retried.

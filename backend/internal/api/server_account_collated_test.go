@@ -500,12 +500,13 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 
 	// A prefix longer than the scan page is withheld, but the cursor must reach
 	// the later deliverable output. Duplicated sources cannot duplicate outputs.
+	prefixEnd := int64(1000 + collatedFeedScanLimit)
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_collation_outputs
  SELECT g,12,1,'object-'||g,'invalid-'||g,1000,repeat('a',64),ARRAY[5000::bigint]
- FROM generate_series(1000,2000)g`); err != nil {
+ FROM generate_series(1000,$1::bigint)g`, prefixEnd); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO recording_collation_outputs VALUES(2001,12,1,'object-2001',$1,1000,repeat('a',64),ARRAY[101,101]::bigint[])`, dir+"18_180001-190001.mp4"); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_collation_outputs VALUES($2,12,1,'object-deliverable',$1,1000,repeat('a',64),ARRAY[101,101]::bigint[])`, dir+"18_180001-190001.mp4", prefixEnd+1); err != nil {
 		t.Fatal(err)
 	}
 	// Preserve the pre-rewrite ANY predicate as a result-set oracle; compare all
@@ -532,7 +533,7 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	var got []int64
 	after := int64(0)
 	emptyAdvanced := false
-	for n := 0; n < 10; n++ {
+	for n := 0; n < 20; n++ {
 		code, page := do(s.handleAccountCollated, http.MethodGet, fmt.Sprintf("/api/v1/account/collated?limit=1&after_id=%d", after), nil, nil)
 		if code != 200 {
 			t.Fatalf("page %d: %v", code, page)
@@ -558,22 +559,26 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 
 	// A complete expensive-stage batch rejected by the fence must advance only
 	// to that batch's end; later held outputs within the candidate page survive.
+	fenceStart, fenceLimit := prefixEnd+1000, int64(collatedFeedFenceLimit)
+	lastHeld := fenceStart + 2*fenceLimit
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_collation_outputs
  SELECT g,12,1,'held-object-'||g,'held-'||g,1000,repeat('a',64),ARRAY[101::bigint]
- FROM generate_series(3000,3020)g;
- CREATE OR REPLACE FUNCTION nas_delivery_allowed(connection bigint,kind text,source bigint) RETURNS boolean LANGUAGE sql STABLE AS $$SELECT source=3020$$;`); err != nil {
+ FROM generate_series($1::bigint,$2::bigint)g`, fenceStart, lastHeld); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE recording_collation_outputs SET nas_relative_path=$1 WHERE id=3020`, dir+"19_190001-200001.mp4"); err != nil {
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`CREATE OR REPLACE FUNCTION nas_delivery_allowed(connection bigint,kind text,source bigint) RETURNS boolean LANGUAGE sql STABLE AS $$SELECT source=%d$$`, lastHeld)); err != nil {
 		t.Fatal(err)
 	}
-	after = 2999
-	for _, wantNext := range []int64{3009, 3019, 3020} {
+	if _, err := pool.Exec(ctx, `UPDATE recording_collation_outputs SET nas_relative_path=$1 WHERE id=$2`, dir+"19_190001-200001.mp4", lastHeld); err != nil {
+		t.Fatal(err)
+	}
+	after = fenceStart - 1
+	for _, wantNext := range []int64{fenceStart - 1 + fenceLimit, fenceStart - 1 + 2*fenceLimit, lastHeld} {
 		code, page := do(s.handleAccountCollated, http.MethodGet, fmt.Sprintf("/api/v1/account/collated?after_id=%d", after), nil, nil)
 		if code != 200 || int64(page["next_after_id"].(float64)) != wantNext {
 			t.Fatalf("fence page=%v status=%d", page, code)
 		}
-		if wantNext == 3020 && len(page["items"].([]any)) != 1 {
+		if wantNext == lastHeld && len(page["items"].([]any)) != 1 {
 			t.Fatalf("later fenced-page output lost: %v", page)
 		}
 		after = wantNext
