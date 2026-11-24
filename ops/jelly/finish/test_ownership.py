@@ -176,6 +176,15 @@ class OwnershipTests(unittest.TestCase):
         parts[5]['plans']['1441'].update(mode='paused', issued=0)
         with self.assertRaises(ValueError): self.collect(parts, running=False)
 
+    def test_finished_day_run_is_an_idle_boundary(self):
+        parts = fixture()
+        parts[0]['phase'] = 'day_complete'
+        parts[5]['enabled_plans'] = []
+        parts[5]['plans']['1441'].update(mode='dry_run', issued=0)
+        self.collect(parts, running=False)
+        parts[0]['phase'] = 'day_running'
+        with self.assertRaises(ValueError): self.collect(parts, running=False)
+
     def test_dead_owner_cannot_allow_enabled_plan(self):
         with self.assertRaises(ValueError): self.collect(fixture(), running=False)
 
