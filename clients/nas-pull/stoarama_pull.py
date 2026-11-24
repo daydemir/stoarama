@@ -1023,7 +1023,6 @@ class Inventory:
             self.db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS r2_copy_blocks(item_id INTEGER PRIMARY KEY, token TEXT NOT NULL, reason TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS cleanup_local_deletions(id INTEGER PRIMARY KEY AUTOINCREMENT,item_id INTEGER NOT NULL,plan_sha256 TEXT NOT NULL,relative_path TEXT NOT NULL,size_bytes INTEGER NOT NULL,at_epoch REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS files (
                     clip_id INTEGER PRIMARY KEY,
                     recording_id INTEGER NOT NULL,
@@ -3227,10 +3226,9 @@ CLEANUP_FOLDER_STREAMS_JSON = """{
  "recordings/July": 17216
 }
 """
-# Owner decision (2026-11, PR #436): 5 TB per rolling 24 h, equal to the
-# server budget, with a file cap high enough that bytes are the binding limit.
-CLEANUP_MAX_FILES_24H = 400_000
-CLEANUP_MAX_BYTES_24H = 5_000_000_000_000  # 5 TB
+# Owner decision (2026-11): the NAS cleanup rolling daily limits were lifted
+# ("lift nas cleanup dialy limit please"). The server's per-plan bound is the
+# only size limit; deletions are still recorded in the fsynced ledger.
 CLEANUP_MAX_COLLATED_SECONDS = 7200
 CLEANUP_LEDGER_NAME = "cleanup-deletions.jsonl"
 CLEANUP_MONTHS = ("January", "February", "March", "April", "May", "June", "July",
@@ -17505,50 +17503,6 @@ def cleanup_guard_refusal(task, proof):
         return "keep-window check failed: %s" % str(exc)[:200]
 
 
-def cleanup_cap_totals(inventory):
-    """Exact rolling totals; caller holds lock and an IMMEDIATE transaction.
-
-    Only rows crossing the cutoff are visited. Retain all history so a wall
-    clock rollback reintroduces exactly the rows the original predicate did.
-    Ledger triggers keep reservations/releases atomic with the cached totals.
-    """
-    cutoff, files, total = inventory.db.execute(
-        "SELECT cutoff,files,bytes FROM cleanup_cap_totals WHERE id=1").fetchone()
-    next_cutoff = time.time() - 86400
-    if next_cutoff != cutoff:
-        crossed_files, crossed_bytes = inventory.db.execute(
-            "SELECT count(*),coalesce(sum(size_bytes),0) FROM cleanup_local_deletions WHERE at_epoch>? AND at_epoch<=?",
-            (min(cutoff, next_cutoff), max(cutoff, next_cutoff))).fetchone()
-        if crossed_files:
-            direction = -1 if next_cutoff > cutoff else 1
-            files += direction * crossed_files
-            total += direction * crossed_bytes
-            inventory.db.execute("UPDATE cleanup_cap_totals SET cutoff=?,files=?,bytes=? WHERE id=1",
-                                 (next_cutoff, files, total))
-    return files, total
-
-
-def cleanup_local_caps(inventory, size_bytes, reserve=None):
-    """Refuse beyond the hard local rolling-24h caps; optionally reserve one deletion."""
-    if type(size_bytes) is not int or size_bytes <= 0:
-        return "invalid deletion size"
-    with inventory.lock:
-        try:
-            inventory.db.execute("BEGIN IMMEDIATE")
-            files, total = cleanup_cap_totals(inventory)
-            if files + 1 > CLEANUP_MAX_FILES_24H or total + size_bytes > CLEANUP_MAX_BYTES_24H:
-                inventory.db.commit()
-                return "local 24h deletion cap reached (%d files, %d bytes)" % (files, total)
-            if reserve is not None:
-                inventory.db.execute("INSERT INTO cleanup_local_deletions(item_id,plan_sha256,relative_path,size_bytes,at_epoch) VALUES(?,?,?,?,?)",
-                                     (reserve["item_id"], reserve["plan_sha256"], reserve["relative_path"], size_bytes, time.time()))
-            inventory.db.commit()
-        except BaseException:
-            inventory.db.rollback()
-            raise
-    return None
-
-
 _CLEANUP_LEDGER_LOCK = threading.Lock()
 
 
@@ -17597,7 +17551,6 @@ class CleanupStage(str, Enum):
     PROOF = "proof"
     GUARD = "guard"
     OBSERVE_JOURNAL = "observe_journal"
-    CAPS = "caps"
     PERMIT = "permit"
     LEDGER_INTENT = "ledger_intent"
     PERMIT_CHECK = "permit_check"
@@ -17731,21 +17684,6 @@ def cleanup_initialize(inventory):
             cleanup_quarantine_tables(inventory)
             inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_rejected_receipts(item_id INTEGER,phase TEXT,body TEXT,rejected_at TEXT)")
             inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_execution_outcomes(id INTEGER PRIMARY KEY,item_id INTEGER NOT NULL,attempt INTEGER NOT NULL,at TEXT NOT NULL,body TEXT NOT NULL)")
-            inventory.db.execute("CREATE INDEX IF NOT EXISTS cleanup_local_deletions_window ON cleanup_local_deletions(at_epoch,size_bytes)")
-            inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_cap_totals(id INTEGER PRIMARY KEY CHECK(id=1),cutoff REAL NOT NULL,files INTEGER NOT NULL CHECK(files>=0),bytes INTEGER NOT NULL CHECK(bytes>=0))")
-            if inventory.db.execute("SELECT 1 FROM cleanup_cap_totals WHERE id=1").fetchone() is None:
-                cutoff = time.time() - 86400
-                inventory.db.execute("INSERT INTO cleanup_cap_totals SELECT 1,?,count(*),coalesce(sum(size_bytes),0) FROM cleanup_local_deletions WHERE at_epoch>?", (cutoff, cutoff))
-            inventory.db.execute("""CREATE TRIGGER IF NOT EXISTS cleanup_cap_insert AFTER INSERT ON cleanup_local_deletions BEGIN
-                UPDATE cleanup_cap_totals SET files=files+(NEW.at_epoch>cutoff),
-                bytes=bytes+CASE WHEN NEW.at_epoch>cutoff THEN NEW.size_bytes ELSE 0 END WHERE id=1; END""")
-            inventory.db.execute("""CREATE TRIGGER IF NOT EXISTS cleanup_cap_delete AFTER DELETE ON cleanup_local_deletions BEGIN
-                UPDATE cleanup_cap_totals SET files=files-(OLD.at_epoch>cutoff),
-                bytes=bytes-CASE WHEN OLD.at_epoch>cutoff THEN OLD.size_bytes ELSE 0 END WHERE id=1; END""")
-            inventory.db.execute("""CREATE TRIGGER IF NOT EXISTS cleanup_cap_update AFTER UPDATE ON cleanup_local_deletions BEGIN
-                UPDATE cleanup_cap_totals SET files=files-(OLD.at_epoch>cutoff)+(NEW.at_epoch>cutoff),
-                bytes=bytes-CASE WHEN OLD.at_epoch>cutoff THEN OLD.size_bytes ELSE 0 END
-                           +CASE WHEN NEW.at_epoch>cutoff THEN NEW.size_bytes ELSE 0 END WHERE id=1; END""")
             inventory.db.commit()
         except BaseException:
             inventory.db.rollback()
@@ -18212,10 +18150,8 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner, timings,
             # Independent client guard, in dry runs too: a refused item is
             # reported as a conflict observation (an outcome every server
             # accepts), never would_delete, so enabling its plan fails up front
-            # instead of pausing mid-run. Local caps apply to execution only.
+            # instead of pausing mid-run.
             refusal = cleanup_timed(timings, "guard_ms", cleanup_guard_refusal, task, proof)
-            if refusal is None and task.get("approved_proof") is not None:
-                refusal = cleanup_timed(timings, "caps_ms", cleanup_local_caps, inventory, task["item"].get("size_bytes"))
             if refusal:
                 raise RuntimeError("client deletion guard refused; KEEP: " + refusal)
             body.update(outcome="match", proof=proof, timings=dict(current.stage_timings))
@@ -18242,11 +18178,10 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner, timings,
                     current.permit_started, current.permit_expiry = permit_request_started, permit_expiry
                     current.deadline = min(current.deadline, permit_request_started + CLEANUP_PERMIT_MAX_AGE_SEC, time.monotonic() + max(0, wall_remaining))
                     item = task["item"]
-                    # Re-check immediately before unlink, reserve one deletion
-                    # against the local caps, then write the durable intent line.
-                    # Any failure here leaves the files untouched.
-                    refusal = cleanup_timed(timings, "guard_ms", cleanup_guard_refusal, task, proof) or cleanup_timed(
-                        timings, "caps_ms", cleanup_local_caps, inventory, item.get("size_bytes"), {"item_id": item_id, "plan_sha256": task["plan_sha256"], "relative_path": item["relative_path"]})
+                    # Re-check the live file immediately before unlink, then
+                    # write the durable intent line. Any failure here leaves
+                    # the files untouched.
+                    refusal = cleanup_timed(timings, "guard_ms", cleanup_guard_refusal, task, proof)
                     if refusal:
                         raise CleanupPermitRefused("local_guard", "client deletion guard refused; not unlinked: " + refusal)
                     ledger = {"item_id": item_id, "attempt": attempt, "plan_id": task.get("plan_id"), "plan_sha256": task["plan_sha256"],
@@ -18470,6 +18405,7 @@ CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP
 CLEANUP_GROUP_VERSIONS: frozenset[str] = CLEANUP_V6_VERSIONS | CLEANUP_BULK_VERSIONS
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
+CLEANUP_EXECUTION_BYTES = 1 << 40  # wire bound on one lease; no item reaches it
 CLEANUP_V2_INFLIGHT = 64       # leased tasks held locally (running + queued)
 CLEANUP_V2_CYCLE_TASKS = 2048  # tasks per drain/replay cycle
 CLEANUP_BATCH_MAX = 64         # observations or receipts per request
@@ -18708,17 +18644,14 @@ class CleanupBatchAPI:
         self.replay_pool.shutdown(wait=False)
 
 
-def cleanup_local_headroom(inventory):
-    """Files and bytes still allowed by the local rolling-24h caps."""
-    with inventory.lock:
-        try:
-            inventory.db.execute("BEGIN IMMEDIATE")
-            files, total = cleanup_cap_totals(inventory)
-            inventory.db.commit()
-        except BaseException:
-            inventory.db.rollback()
-            raise
-    return CLEANUP_MAX_FILES_24H - files, CLEANUP_MAX_BYTES_24H - total
+def cleanup_execution_allowance():
+    """Files and bytes a lease may claim for execution.
+
+    No daily limit exists: the allowance is one bounded group and a wire byte
+    bound no single item can reach (the server caps an item identity at
+    32 GiB), so the lease advertises availability rather than a deletion cap."""
+    files = cleanup_execution_group_size() if CLIENT_VERSION in CLEANUP_GROUP_VERSIONS else CLEANUP_EXECUTION_INFLIGHT
+    return files, CLEANUP_EXECUTION_BYTES
 
 
 def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes, execution_only=False):
@@ -18801,8 +18734,7 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                 lane.before_lease()
                 execution_poll = bool(pending) and not dry_run_only and CLIENT_VERSION in CLEANUP_BULK_VERSIONS
                 room = min(cleanup_execution_group_size() if execution_poll else min(CLEANUP_V2_LEASE, inflight - len(pending)), task_limit - leased)
-                files_left, bytes_left = (0, 0) if dry_run_only else cleanup_local_headroom(inventory)
-                files_left = min(files_left, cleanup_execution_group_size() if CLIENT_VERSION in CLEANUP_GROUP_VERSIONS else CLEANUP_EXECUTION_INFLIGHT)
+                files_left, bytes_left = (0, 0) if dry_run_only else cleanup_execution_allowance()
                 if pins_error is not None:
                     files_left = bytes_left = 0  # every deletion would be refused
                 if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION and not dry_run_only:
@@ -18920,41 +18852,6 @@ def cleanup_journal_group(inventory, entries):
             raise
 
 
-def cleanup_reserve_group_caps(inventory, tasks):
-    with inventory.lock:
-        try:
-            inventory.db.execute("BEGIN IMMEDIATE")
-            files, total = cleanup_cap_totals(inventory)
-            sizes = [task["item"]["size_bytes"] for task in tasks]
-            if (any(type(size) is not int or size <= 0 for size in sizes)
-                    or files + len(tasks) > CLEANUP_MAX_FILES_24H or total + sum(sizes) > CLEANUP_MAX_BYTES_24H):
-                raise CleanupPermitRefused("local_guard", "local 24h deletion cap reached")
-            reservations = [inventory.db.execute(
-                "INSERT INTO cleanup_local_deletions(item_id,plan_sha256,relative_path,size_bytes,at_epoch) VALUES(?,?,?,?,?)",
-                (task["item_id"], task["plan_sha256"], task["item"]["relative_path"], task["item"]["size_bytes"], time.time())).lastrowid for task in tasks]
-            inventory.db.commit()
-            return reservations
-        except BaseException:
-            inventory.db.rollback()
-            raise
-
-
-def cleanup_release_caps(inventory, reservations):
-    """Release only live-owned, never-attempted reservations, by exact row ID.
-
-    A crash cannot release a possible unlink's charge: like actual deletions,
-    abandoned reservations age out of the rolling 24h window. Execution's
-    process lock allows at most one bounded group of provisional reservations.
-    """
-    with inventory.lock:
-        try:
-            inventory.db.executemany("DELETE FROM cleanup_local_deletions WHERE id=?", [(n,) for n in reservations])
-            inventory.db.commit()
-        except BaseException:
-            inventory.db.rollback()
-            raise
-
-
 def cleanup_group_response(response, tasks):
     results = response.get("results") if isinstance(response, dict) else None
     ids = {task["item_id"] for task in tasks}
@@ -19003,7 +18900,6 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
     owned = cleanup_own_group(inventory, tasks) if release_owned else owned
     started = time.monotonic()
     opened, observations, receipts, timings = [], [], [], []
-    reservations = []
     returned = set()
     permit_ms = None
     shared = {"lease_ms": max(t.get("_lease_elapsed_ms", 0) for t in tasks)}
@@ -19201,8 +19097,6 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
                 stage = CleanupStage.OBSERVE_JOURNAL
                 cleanup_timed(shared, "observe_journal_ms", cleanup_journal_group, inventory,
                     [(t, o, "observe", b) for (t, o), b in zip(owned, observations)])
-                stage = CleanupStage.CAPS
-                reservations = cleanup_timed(shared, "caps_ms", cleanup_reserve_group_caps, inventory, tasks)
                 if CLIENT_VERSION in CLEANUP_BULK_VERSIONS:
                     bulk_delete()
                 else:
@@ -19321,17 +19215,8 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
             raise
         finally:
             try:
-                # Include later members never reached after a permit/ledger failure.
-                # Never release an attempted member, or a historical charge for the
-                # same item: reservations are the exact inserted row IDs.
-                try:
-                    unused_caps = [row_id for row_id, (current, _) in zip(reservations, opened)
-                                   if not current.unlink_attempted]
-                    if unused_caps:
-                        cleanup_release_caps(inventory, unused_caps)
-                finally:
-                    if fenced:
-                        NAS_MEDIA_FENCE.release_cleanup()
+                if fenced:
+                    NAS_MEDIA_FENCE.release_cleanup()
                 try:
                     phases = {row[0]: row[1] for row in cleanup_journal(inventory)}
                 except Exception:
