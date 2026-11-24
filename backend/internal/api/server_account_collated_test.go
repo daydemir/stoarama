@@ -509,6 +509,11 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_collation_outputs VALUES($2,12,1,'object-deliverable',$1,1000,repeat('a',64),ARRAY[101,101]::bigint[])`, dir+"18_180001-190001.mp4", prefixEnd+1); err != nil {
 		t.Fatal(err)
 	}
+	// Production statistics are current; a fresh 20k-row insert without them
+	// lets the planner pick a scan that overruns the feed's 2 s budget on slow CI.
+	if _, err := pool.Exec(ctx, `ANALYZE recording_collation_outputs`); err != nil {
+		t.Fatal(err)
+	}
 	// Preserve the pre-rewrite ANY predicate as a result-set oracle; compare all
 	// pages at limit=1 so advancing to the candidate maximum would lose items.
 	oracleSQL := strings.Replace(collatedEligibleSQL,
