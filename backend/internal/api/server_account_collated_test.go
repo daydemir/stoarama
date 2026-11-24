@@ -137,6 +137,11 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 		t.Fatalf("apply 0224: %v", err)
 	}
 	installDeliveryFenceTestSchema(t, pool)
+	// The connection-wide gate starts open; closing it is exercised below.
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`CREATE OR REPLACE FUNCTION nas_delivery_work_epoch(connection bigint) RETURNS boolean LANGUAGE sql STABLE AS $$SELECT true$$;
+ UPDATE connections SET nas_storage_free_bytes=%d,nas_storage_reported_at=now()`, collatedKeep20FreeBytes)); err != nil {
+		t.Fatal(err)
+	}
 	sha := strings.Repeat("a", 64)
 	dir := "f/July/26-Sunday/01_P_2026_July_W4_Sunday_hour_"
 	for _, o := range []struct {
@@ -461,10 +466,12 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	}
 	withWindow := strings.Replace(baseline, "]", " 107]", 1)
 	for _, step := range []struct{ sql, want string }{
-		{`UPDATE connections SET nas_storage_free_bytes=$1::bigint,nas_storage_reported_at=now() WHERE id=13`, baseline}, // no epoch
+		// A closed connection-wide gate offers nothing (not even holds) and
+		// resets the cursor, so withheld window outputs are never skipped.
+		{`CREATE OR REPLACE FUNCTION nas_delivery_work_epoch(connection bigint) RETURNS boolean LANGUAGE sql STABLE AS $$SELECT false$$`, "[]"},
 		{`CREATE OR REPLACE FUNCTION nas_delivery_work_epoch(connection bigint) RETURNS boolean LANGUAGE sql STABLE AS $$SELECT true$$`, withWindow},
-		{`UPDATE connections SET nas_storage_free_bytes=$1::bigint-1 WHERE id=13`, baseline},
-		{`UPDATE connections SET nas_storage_free_bytes=$1::bigint,nas_storage_reported_at=now()-interval '6 minutes' WHERE id=13`, baseline},
+		{`UPDATE connections SET nas_storage_free_bytes=$1::bigint-1 WHERE id=13`, "[]"},
+		{`UPDATE connections SET nas_storage_free_bytes=$1::bigint,nas_storage_reported_at=now()-interval '6 minutes' WHERE id=13`, "[]"},
 		{`UPDATE connections SET nas_storage_reported_at=now() WHERE id=13`, withWindow},
 	} {
 		args := []any{}
@@ -476,6 +483,11 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 		}
 		if ids := fmt.Sprint(feedIDs()); ids != step.want {
 			t.Fatalf("after %q feed=%s want %s", step.sql, ids, step.want)
+		}
+		if step.want == "[]" {
+			if code, page := do(s.handleAccountCollated, http.MethodGet, "/api/v1/account/collated?after_id=50&handoff_readback=1", nil, nil); code != 200 || page["next_after_id"] != float64(0) {
+				t.Fatalf("closed gate advanced the cursor: %d %v", code, page)
+			}
 		}
 	}
 	// The ACK is the R2 lane's NAS evidence: exact contract path and size.
@@ -490,9 +502,6 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	}
 	if ids := fmt.Sprint(feedIDs()); ids != baseline {
 		t.Fatalf("acknowledged window output still offered: %s", ids)
-	}
-	if _, err := pool.Exec(ctx, `CREATE OR REPLACE FUNCTION nas_delivery_work_epoch(connection bigint) RETURNS boolean LANGUAGE sql STABLE AS $$SELECT false$$`); err != nil {
-		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `DELETE FROM recording_collation_outputs WHERE id=108`); err != nil {
 		t.Fatal(err)

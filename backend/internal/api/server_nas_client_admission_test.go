@@ -62,6 +62,8 @@ func TestNASClientAdmissionExactVersions(t *testing.T) {
 		{nasTunableCopyClientVersion + "-extra", false, false, false},
 		{nasTunableDayClientVersion, true, true, false},
 		{nasTunableDayClientVersion + "-extra", false, false, false},
+		{nasCleanupDayModesClientVersion, true, true, false},
+		{nasCleanupDayModesClientVersion + "-extra", false, false, false},
 		{nasKeep20CleanupClientVersion + "-extra", false, false, false},
 		{"r2-copy-v5-extra", false, false, false},
 		{"r2-copy-v4-extra", false, false, false},

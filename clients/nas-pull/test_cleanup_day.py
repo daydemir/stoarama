@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,8 @@ spec.loader.exec_module(pull)
 UTC = datetime.timezone.utc
 DAY = datetime.date(2026, 9, 12)  # Saturday
 DIR = 'shinjuku/September/12-Saturday'
+FLAT = 'recordings/366/continuous'
+TOKYO = ZoneInfo('Asia/Tokyo')
 
 
 def plaza(date, hhmmss):
@@ -63,7 +66,8 @@ class DayCleanupTests(unittest.TestCase):
     def permit(self, **fields):
         permit = dict(unit_id=7, plan_id=2, plan_sha256='b' * 64, attempt=1, permit_token='c' * 64,
                       permit_expires_at=(datetime.datetime.now(UTC) + datetime.timedelta(minutes=10)).isoformat(),
-                      relative_dir=DIR, local_date=DAY.isoformat(), stream_id=3, timezone='Asia/Tokyo', files=2, bytes=7)
+                      relative_dir=DIR, local_date=DAY.isoformat(), stream_id=3, timezone='Asia/Tokyo', files=2, bytes=7,
+                      mode='dir')
         permit.update(fields)
         return permit
 
@@ -92,8 +96,7 @@ class DayCleanupTests(unittest.TestCase):
         media = [self.write(plaza(DAY, '103000'), b'abc'), self.write(plaza(DAY, '113000'), b'defg')]
         sidecars = [self.write(m.name + '.stoarama.json', b'{}') for m in media]
         orphan = self.write(plaza(DAY, '123000') + '.stoarama.json', b'{}')
-        kept = [self.write(plaza(datetime.date(2020, 9, 12), '103000')), self.write('notes.txt'),
-                self.write('.' + plaza(DAY, '133000') + '.partial')]
+        kept = [self.write('.' + plaza(DAY, '133000') + '.partial')]
         self.next_permit = self.permit()
         self.assertTrue(pull.cleanup_day_cycle(self.cfg, self.inventory, threading.Event()))
         self.assertFalse(any(p.exists() for p in media + sidecars + [orphan]))
@@ -150,17 +153,96 @@ class DayCleanupTests(unittest.TestCase):
                 self.assertTrue(receipt['refusal'])
                 self.assertTrue(media.exists())
 
-    def test_media_beyond_the_permit_refuses_the_whole_directory(self):
-        for name, fields in {'files': dict(files=1, bytes=100), 'bytes': dict(files=2, bytes=5)}.items():
+    def test_dir_mode_deletes_uncatalogued_media_of_the_day(self):
+        # Stream 17241's day dirs held 516 files against 145 inventoried: the
+        # whole day is outside the keep window, so the extras go too.
+        media = [self.write(plaza(DAY, '%02d' % hour), b'abc') for hour in range(24)]
+        self.next_permit = self.permit(files=1, bytes=3)
+        pull.cleanup_day_cycle(self.cfg, self.inventory, threading.Event())
+        [receipt] = self.receipts()
+        self.assertEqual((receipt['outcome'], receipt['media_files'], receipt['media_bytes']), ('deleted', 24, 72))
+        self.assertFalse(any(m.exists() for m in media))
+
+    def test_dir_mode_refuses_a_foreign_entry(self):
+        cases = {
+            'foreign file': lambda: self.write('notes.txt'),
+            'another date': lambda: self.write(plaza(datetime.date(2020, 9, 12), '103000')),
+            'another layout': lambda: self.write('1789227000.mp4'),
+            'directory': lambda: (self.dir / 'sub').mkdir(),
+            'symlink': lambda: (self.dir / plaza(DAY, '113000')).symlink_to(self.dir / plaza(DAY, '103000')),
+        }
+        for name, make in cases.items():
             with self.subTest(name):
                 self.sent.clear()
-                media = [self.write(plaza(DAY, '103000'), b'abc'), self.write(plaza(DAY, '113000'), b'defg')]
-                self.next_permit = self.permit(**fields)
+                media = self.write(plaza(DAY, '103000'))
+                make()
+                self.next_permit = self.permit()
                 pull.cleanup_day_cycle(self.cfg, self.inventory, threading.Event())
                 [receipt] = self.receipts()
                 self.assertEqual((receipt['outcome'], receipt['media_files']), ('refused', 0))
-                self.assertIn('beyond the permitted', receipt['refusal'])
-                self.assertTrue(all(m.exists() for m in media))
+                self.assertTrue(media.exists())
+                for path in list(self.dir.iterdir()):
+                    path.rmdir() if path.is_dir() and not path.is_symlink() else path.unlink()
+
+    def flat(self, at):
+        return '%d.mp4' % at.timestamp()
+
+    def names_permit(self, entries, **fields):
+        return self.permit(**dict(dict(relative_dir=FLAT, mode='names', files=len(entries), bytes=1,
+                                       entries=[dict(name=n, size_bytes=z, sidecar=n.endswith('.stoarama.json')) for n, z in entries]), **fields))
+
+    def test_names_mode_unlinks_only_listed_entries_quickly(self):
+        flat = self.cfg.output_dir / FLAT
+        flat.mkdir(parents=True)
+        start = datetime.datetime(2026, 9, 1, tzinfo=TOKYO)
+        names = [self.flat(start + datetime.timedelta(minutes=2 * n)) for n in range(14000)]  # ~19.4 days
+        for name in names:
+            (flat / name).write_bytes(b'abc')
+            (flat / (name + '.stoarama.json')).write_bytes(b'{}')
+        day = [n for n in names if datetime.datetime.fromtimestamp(int(n[:-4]), TOKYO).date() == DAY]
+        self.assertEqual(len(day), 720)
+        entries = [(n, 3) for n in day[1:]] + [(n + '.stoarama.json', 2) for n in day[1:]] + [(self.flat(datetime.datetime(2026, 9, 12, 23, 59, 1, tzinfo=TOKYO)), 3)]
+        entries[0] = (entries[0][0], 4)  # Inventory size differs: that file stays.
+        self.next_permit = self.names_permit(entries, local_date=DAY.isoformat())
+        started = time.monotonic()
+        with mock.patch.object(pull.os, 'stat', wraps=os.stat) as stat:
+            self.assertTrue(pull.cleanup_day_cycle(self.cfg, self.inventory, threading.Event()))
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertLessEqual(stat.call_count, 2 * len(entries))  # Listed names only (select + account), never all 28k.
+        [receipt] = self.receipts()
+        # One listed name is already gone (counted); one has another size (kept).
+        self.assertEqual((receipt['outcome'], receipt['media_files'], receipt['sidecar_files'], receipt['remaining_files']),
+                         ('deleted', 719, 719, 0))
+        self.assertTrue((flat / day[0]).exists() and (flat / (day[0] + '.stoarama.json')).exists())  # Unlisted.
+        self.assertTrue((flat / day[1]).exists())  # Size mismatch.
+        self.assertFalse(any((flat / n).exists() for n in day[2:]))
+        self.assertEqual(len(os.listdir(flat)), 2 * 14000 - 718 - 719)
+
+    def test_names_mode_refuses_a_listed_name_of_another_date(self):
+        flat = self.cfg.output_dir / FLAT
+        flat.mkdir(parents=True)
+        other = self.flat(datetime.datetime(2026, 9, 11, 12, tzinfo=TOKYO))
+        (flat / other).write_bytes(b'abc')
+        self.next_permit = self.names_permit([(other, 3)], local_date=DAY.isoformat())
+        pull.cleanup_day_cycle(self.cfg, self.inventory, threading.Event())
+        self.assertEqual(self.receipts()[0]['outcome'], 'refused')
+        self.assertTrue((flat / other).exists())
+
+    def test_invalid_permit_scope_is_rejected(self):
+        name = self.flat(datetime.datetime(2026, 9, 12, 12, tzinfo=TOKYO))
+        for bad in ('../' + name, 'sub/' + name, '.' + name, 'notes.txt', name + '.stoarama.json.bak'):
+            with self.subTest(bad):
+                self.next_permit = self.names_permit([(bad, 3)])
+                with self.assertRaises(pull.CleanupResponseError):
+                    pull.cleanup_day_cycle(self.cfg, self.inventory, threading.Event())
+        for fields in (dict(mode='dir', entries=[]), dict(mode='names'), dict(mode=None)):
+            with self.subTest(fields):
+                self.next_permit = self.permit(**fields)
+                with self.assertRaises(pull.CleanupResponseError):
+                    pull.cleanup_day_cycle(self.cfg, self.inventory, threading.Event())
+        self.next_permit = self.names_permit([(name, 3)], relative_dir=DIR)  # names mode on a plaza dir
+        pull.cleanup_day_cycle(self.cfg, self.inventory, threading.Event())
+        self.assertIn('dir mode', self.receipts()[-1]['refusal'])
 
     def test_unparseable_media_refuses_the_whole_directory(self):
         media = self.write(plaza(DAY, '103000'))
@@ -192,7 +274,7 @@ class DayCleanupTests(unittest.TestCase):
     def test_day_release_is_on_the_cleanup_line(self):
         self.assertIn(pull.FAST_COPY_CLIENT_VERSION, pull.LOW_MEMORY_CLEANUP_VERSIONS)
         self.assertIn(pull.FAST_COPY_CLIENT_VERSION, pull.CLEANUP_BULK_VERSIONS)
-        self.assertEqual(pull.FAST_COPY_CLIENT_VERSION, 'r2-copy-v8-tunable-day')
+        self.assertEqual(pull.FAST_COPY_CLIENT_VERSION, 'r2-copy-v8-tunable-modes')
 
 
 if __name__ == '__main__':

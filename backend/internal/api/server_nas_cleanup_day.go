@@ -238,35 +238,77 @@ type cleanupDayQuerier interface {
 // holds every day of the recording, and evaluating it per directory clip made
 // a 13-unit enable take ~130 s.
 const cleanupDayUnitSQL = `SELECT c.id,c.display_path,c.clip_start_at,c.clip_end_at,r.stream_id,
- coalesce((SELECT f.size_bytes FROM nas_inventory_files f WHERE f.connection_id=13 AND f.clip_id=c.id
-  AND f.state='present' AND f.relative_path=c.display_path),-1)
+ coalesce(f.size_bytes,-1),f.sidecar_relative_path,f.sidecar_size_bytes
  FROM recordings r JOIN recording_clips c ON c.recording_id=r.id
- WHERE r.account_id=47 AND c.display_path LIKE $2 AND strpos(substr(c.display_path,length($1)+2),'/')=0`
+ LEFT JOIN nas_inventory_files f ON f.connection_id=13 AND f.clip_id=c.id AND f.state='present' AND f.relative_path=c.display_path
+ WHERE r.account_id=47 AND c.display_path LIKE $2 AND strpos(substr(c.display_path,length($1)+2),'/')=0
+ ORDER BY c.display_path`
 
 // cleanupDayDirPattern is the left-anchored LIKE pattern for the directory's
 // entries, sargable on recording_clips_display_path_pattern (0248).
 var cleanupDayDirPattern = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
-// cleanupDayCheck returns the unit's catalogued NAS files and bytes, or why
-// the whole directory-day must stay.
-func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUnit) (int64, int64, error) {
+// nasCleanupDayMode is how a permit names what the NAS client may unlink.
+type nasCleanupDayMode string
+
+const (
+	// nasCleanupDayNames: a flat recordings/<id>/{continuous,<job>} directory
+	// holds every day of its recording, so the permit lists the exact inventory
+	// entries (name and size) and the client unlinks only those.
+	nasCleanupDayNames nasCleanupDayMode = "names"
+	// nasCleanupDayDir: a plaza <folder>/<Month>/<DD-Weekday> directory holds
+	// one day of one stream, so the permit covers every media file and sidecar
+	// of that date in it, catalogued or not ("the nas keeps all keep 20
+	// footage"; this day is outside it).
+	nasCleanupDayDir nasCleanupDayMode = "dir"
+)
+
+func cleanupDayModeOf(dir string) nasCleanupDayMode {
+	if cleanupDayPlazaDir.MatchString(dir) {
+		return nasCleanupDayDir
+	}
+	return nasCleanupDayNames
+}
+
+// nasCleanupDayEntry is one inventoried file of the unit: a media file or the
+// sidecar beside it, by its name in the directory and exact size.
+type nasCleanupDayEntry struct {
+	Name      string `json:"name"`
+	SizeBytes int64  `json:"size_bytes"`
+	Sidecar   bool   `json:"sidecar"`
+}
+
+// cleanupDayMedia totals the media (not sidecar) entries.
+func cleanupDayMedia(entries []nasCleanupDayEntry) (files, bytes int64) {
+	for _, e := range entries {
+		if !e.Sidecar {
+			files++
+			bytes += e.SizeBytes
+		}
+	}
+	return files, bytes
+}
+
+// cleanupDayCheck returns the unit's inventoried NAS media and sidecars, or
+// why the whole directory-day must stay.
+func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUnit) ([]nasCleanupDayEntry, error) {
 	w, day, loc, err := cleanupDayStatic(u)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	var held bool
 	if err := q.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM nas_media_keep20_epoch WHERE connection_id=13) OR nas_cleanup_day_dir_held($1)`, u.RelativeDir).Scan(&held); err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	if held {
-		return 0, 0, errors.New("keep20 epoch inactive or delivery path hold in directory")
+		return nil, errors.New("keep20 epoch inactive or delivery path hold in directory")
 	}
 	rows, err := q.Query(ctx, cleanupDayUnitSQL, u.RelativeDir, cleanupDayDirPattern.Replace(u.RelativeDir)+"/%")
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	defer rows.Close()
-	var files, bytes int64
+	var entries []nasCleanupDayEntry
 	var dated []int64
 	for rows.Next() {
 		var id int64
@@ -274,41 +316,45 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 		var a, b *time.Time
 		var stream *int64
 		var size int64
-		if err := rows.Scan(&id, &p, &a, &b, &stream, &size); err != nil {
-			return 0, 0, err
+		var sidecarPath *string
+		var sidecarSize *int64
+		if err := rows.Scan(&id, &p, &a, &b, &stream, &size, &sidecarPath, &sidecarSize); err != nil {
+			return nil, err
 		}
 		if stream == nil || *stream != u.StreamID {
-			return 0, 0, errors.New("catalogued clip in the directory belongs to another stream")
+			return nil, errors.New("catalogued clip in the directory belongs to another stream")
 		}
 		named, ok := cleanupDayFileDate(u.RelativeDir, path.Base(p), loc)
 		if !ok {
-			return 0, 0, errors.New("catalogued clip name does not name a local date")
+			return nil, errors.New("catalogued clip name does not name a local date")
 		}
 		if !named.Equal(day) {
 			continue
 		}
 		if a == nil || b == nil || !b.After(*a) || a.Before(w.end) && b.After(w.start) {
-			return 0, 0, errors.New("catalogued clip intersects the pinned keep window")
+			return nil, errors.New("catalogued clip intersects the pinned keep window")
 		}
 		dated = append(dated, id)
 		if size >= 0 {
-			files++
-			bytes += size
+			entries = append(entries, nasCleanupDayEntry{Name: path.Base(p), SizeBytes: size})
+			if sidecarPath != nil && sidecarSize != nil && *sidecarPath == p+".stoarama.json" {
+				entries = append(entries, nasCleanupDayEntry{Name: path.Base(*sidecarPath), SizeBytes: *sidecarSize, Sidecar: true})
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return 0, 0, err
+		return nil, err
 	}
-	if files == 0 {
-		return 0, 0, errors.New("no catalogued NAS media in the directory-day")
+	if len(entries) == 0 {
+		return nil, errors.New("no catalogued NAS media in the directory-day")
 	}
 	if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM unnest($1::bigint[]) id WHERE nas_cleanup_day_clip_held(id))`, dated).Scan(&held); err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	if held {
-		return 0, 0, errors.New("catalogued clip is held")
+		return nil, errors.New("catalogued clip is held")
 	}
-	return files, bytes, nil
+	return entries, nil
 }
 
 var cleanupDayLabel = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,79}$`)
@@ -351,8 +397,8 @@ func (s *Server) handleServiceNASCleanupDayCreate(w http.ResponseWriter, r *http
 	}
 	defer tx.Rollback(ctx)
 	for n, u := range req.Units {
-		gotFiles, gotBytes, err := cleanupDayCheck(ctx, tx, u)
-		if err == nil && (gotFiles != u.Files || gotBytes != u.Bytes) {
+		entries, err := cleanupDayCheck(ctx, tx, u)
+		if gotFiles, gotBytes := cleanupDayMedia(entries); err == nil && (gotFiles != u.Files || gotBytes != u.Bytes) {
 			err = fmt.Errorf("catalogued NAS media is %d files, %d bytes", gotFiles, gotBytes)
 		}
 		if err != nil {
@@ -508,7 +554,7 @@ func (s *Server) cleanupDayEnable(ctx context.Context, tx pgx.Tx, id int64, mode
 	}
 	eligible := 0
 	for _, p := range units {
-		if _, _, err := cleanupDayCheck(ctx, tx, p.unit); err != nil {
+		if _, err := cleanupDayCheck(ctx, tx, p.unit); err != nil {
 			if _, err := tx.Exec(ctx, `UPDATE nas_cleanup_day_units SET state='refused',refusal=$2,updated_at=now() WHERE id=$1`, p.id, err.Error()); err != nil {
 				return err
 			}
@@ -579,6 +625,10 @@ type nasCleanupDayPermit struct {
 	Timezone    string    `json:"timezone"`
 	Files       int64     `json:"files"`
 	Bytes       int64     `json:"bytes"`
+	// Mode and Entries go only to nasCleanupDayModesClientVersion; Entries
+	// only in names mode.
+	Mode    nasCleanupDayMode    `json:"mode,omitempty"`
+	Entries []nasCleanupDayEntry `json:"entries,omitempty"`
 }
 
 // cleanupDayConnection admits only nasCleanupDayVersions; older literals never
@@ -641,7 +691,8 @@ func (s *Server) handleAccountNASCleanupDayPermit(w http.ResponseWriter, r *http
 			return
 		}
 		unit := nasCleanupDayUnit{RelativeDir: permit.RelativeDir, LocalDate: permit.LocalDate, StreamID: permit.StreamID, Files: permit.Files, Bytes: permit.Bytes}
-		if _, _, err = cleanupDayCheck(ctx, tx, unit); err != nil {
+		entries, err := cleanupDayCheck(ctx, tx, unit)
+		if err != nil {
 			if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_day_units SET state='refused',refusal=$2,updated_at=now() WHERE id=$1`, unitID, err.Error()); err != nil {
 				util.WriteError(w, 500, "day cleanup refusal failed")
 				return
@@ -655,11 +706,18 @@ func (s *Server) handleAccountNASCleanupDayPermit(w http.ResponseWriter, r *http
 		}
 		permit.UnitID, permit.Token = unitID, hex.EncodeToString(secret)
 		permit.Timezone = cleanupEmbeddedPolicyWindow(permit.StreamID).Timezone
-		expires := time.Now().Add(nasCleanupDayPermitTTL)
-		for _, bound := range []time.Time{until, deadline} {
-			if bound.Before(expires) {
-				expires = bound
+		if req.ClientVersion == nasCleanupDayModesClientVersion {
+			permit.Mode = cleanupDayModeOf(permit.RelativeDir)
+			if permit.Mode == nasCleanupDayNames {
+				permit.Entries = entries
 			}
+		}
+		// A fresh session is required to receive the permit, but its expiry is
+		// not tied to that heartbeat: the unlink pass runs inside the permit
+		// even when the next heartbeat lands later than five minutes.
+		expires := time.Now().Add(nasCleanupDayPermitTTL)
+		if until.Before(expires) {
+			expires = until
 		}
 		if err = tx.QueryRow(ctx, `UPDATE nas_cleanup_day_units SET state='permitted',attempt=attempt+1,permit_token_sha256=$2,
  permit_expires_at=$3,updated_at=now() WHERE id=$1 RETURNING attempt,permit_expires_at`, unitID, cleanupSHA([]byte(permit.Token)), expires).Scan(&permit.Attempt, &permit.ExpiresAt); err != nil {
