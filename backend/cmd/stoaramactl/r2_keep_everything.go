@@ -23,6 +23,12 @@ var r2KeepEverything = sync.OnceValues(func() (map[int64]bool, error) {
 	return ke, nil
 })
 
+// keepEverythingStream: the stream is Keep Everything by the keep20 policy or
+// the owner's pick "all".
+func (p inverseProtection) keepEverythingStream(stream int64) bool {
+	return p.Picks.Choices[stream].Choice == "all" || r2RetireKeepEverything(stream)
+}
+
 // r2RetireKeepEverything is true when the stream is Keep Everything or the
 // policy cannot be read (fail closed).
 func r2RetireKeepEverything(stream int64) bool {

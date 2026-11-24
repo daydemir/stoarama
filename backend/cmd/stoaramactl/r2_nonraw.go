@@ -209,7 +209,7 @@ func (p inverseProtection) classifyCollated(o r2.ObjectInfo, x inverseCollatedAs
 	if !p.ReviewedCollated || !mapped {
 		return inverseHeld, "collated_deferred"
 	}
-	if x.StreamID > 0 && p.Picks.Choices[x.StreamID].Choice == "all" {
+	if x.StreamID > 0 && p.keepEverythingStream(x.StreamID) {
 		return inverseKE, "keep_everything_stream"
 	}
 	// A thesis/owner keep stream protects its footage wherever it lives. A
@@ -362,7 +362,7 @@ func assessCollated(p inverseProtection, x inverseCollatedAssessment) inverseCol
 		x.Reason = "collated_output_interval_uncertain"
 		return x
 	}
-	if x.StreamID > 0 && p.Picks.Choices[x.StreamID].Choice == "all" {
+	if x.StreamID > 0 && p.keepEverythingStream(x.StreamID) {
 		x.Reason = "keep_everything_stream"
 		return x
 	}
@@ -401,7 +401,7 @@ func assessCollated(p inverseProtection, x inverseCollatedAssessment) inverseCol
 				return x
 			}
 		}
-		if p.Picks.Choices[s.StreamID].Choice == "all" {
+		if p.keepEverythingStream(s.StreamID) {
 			x.Reason = "keep_everything_stream"
 			return x
 		}
@@ -502,7 +502,7 @@ func (a *inverseApplier) loadNonrawTarget(ctx context.Context, tx pgx.Tx, e inve
 		}
 	}
 	t.Choice = a.protection.Picks.Choices[t.StreamID].Choice
-	if t.Choice == "all" {
+	if a.protection.keepEverythingStream(t.StreamID) {
 		return t, fmt.Errorf("%w: keep-everything stream", errInverseNonrawIneligible)
 	}
 	// An exempt delivery page key is judged by the SAME typed page-authority
