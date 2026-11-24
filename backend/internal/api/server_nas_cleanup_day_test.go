@@ -272,6 +272,44 @@ else:
 	if err := json.Unmarshal(prepared, &preparedUnits); err != nil || fmt.Sprint(preparedUnits) != fmt.Sprint(units) {
 		t.Fatalf("preparer units %s differ from %v (%v)", prepared, units, err)
 	}
+	// The runner's independent catalog query runs read-only on the real schema.
+	runnerCatalog := func() string {
+		t.Helper()
+		plan, _ := json.Marshal(map[string]any{"units": []map[string]any{
+			{"relative_dir": units[0].RelativeDir, "local_date": units[0].LocalDate, "stream_id": 3},
+			{"relative_dir": unit("2026-09-20", 1, 1).RelativeDir, "local_date": "2026-09-20", "stream_id": 3}}})
+		sql, err := osexec.Command(python, "-B", "-c", `import json, sys
+from pathlib import Path
+sys.path.insert(0, "../../../ops/jelly/cleanup-runner")
+import runner as r
+job = r.Runner(Path("."), Path("."))
+job.windows = {3: (r.timestamp("2026-09-15T15:00:00+00:00"), r.timestamp("2026-10-05T15:00:00+00:00"))}
+job.timezones = {3: "Asia/Tokyo"}
+job.query = lambda sql, step=None: print(sql)
+job.day_catalog(json.loads(sys.argv[1]))`, string(plan)).Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		readTx, err := pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer readTx.Rollback(ctx)
+		var raw []byte
+		if err := readTx.QueryRow(ctx, string(sql)).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+	if got := runnerCatalog(); !strings.Contains(got, `"local_date" : "2026-09-12", "held" : 0, "overlap" : 0, "dir_held" : false`) ||
+		!strings.Contains(got, `"local_date" : "2026-09-20", "held" : 0, "overlap" : 1`) {
+		t.Fatalf("runner catalog: %s", got)
+	}
+	exec(`BEGIN; SET LOCAL session_replication_role=replica; INSERT INTO delivery_nas_source_holds(clip_id) VALUES(2); COMMIT`)
+	if got := runnerCatalog(); !strings.Contains(got, `"local_date" : "2026-09-12", "held" : 1`) {
+		t.Fatalf("runner catalog missed a held clip: %s", got)
+	}
+	exec(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM delivery_nas_source_holds; COMMIT`)
 	s := &Server{pool: pool, cfg: config.Config{NASCleanupDeletionEnabled: true}}
 	sha := cleanupDayDigest(units)
 	create := map[string]any{"label": "kday-s3-0001", "policy_sha256": cleanupPolicySHA, "plan_sha256": sha, "files": 3, "bytes": 800, "units": units}
