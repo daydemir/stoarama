@@ -562,6 +562,8 @@ func (s *Server) router() http.Handler {
 			admin.Get("/recordings/nas-delivery-mode", s.handleAdminRecordingNASDeliveryStatus)
 			admin.Get("/connections/{id}/collated-delivery", s.handleAdminConnectionCollatedDelivery)
 			admin.Post("/connections/{id}/collated-delivery", s.handleAdminConnectionCollatedDelivery)
+			admin.Get("/connections/{id}/r2-fast-copy", s.handleAdminConnectionR2FastCopy)
+			admin.Post("/connections/{id}/r2-fast-copy", s.handleAdminConnectionR2FastCopy)
 			admin.Post("/pipelines/sync", s.handlePipelinesSync)
 			admin.Post("/pipeline-versions/sync", s.handlePipelineVersionsSync)
 			admin.Post("/pipeline-runs", s.handlePipelineRunsCreate)

@@ -25,20 +25,16 @@ type fastCopyLeaseReply struct {
 
 func useFastCopyFixture(t *testing.T, f *cleanupFixture) {
 	t.Helper()
-	migration, err := os.ReadFile("../../../infra/sql/migrations/0247_nas_r2_tunable_copy_lease_cap.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = f.pool.Exec(f.ctx, string(migration)); err != nil {
-		t.Fatal(err)
-	}
+	applyMigrations(t, f, "0251_nas_r2_tunable_day_lease_cap.sql", "0252_nas_r2_fast_copy_workers.sql")
 	sum := md5.Sum([]byte("verified kept R2 footage"))
-	if _, err = f.pool.Exec(f.ctx, `UPDATE recording_clips SET etag=$1 WHERE id>=901 AND id<906`, hex.EncodeToString(sum[:])); err != nil {
+	if _, err := f.pool.Exec(f.ctx, `UPDATE recording_clips SET etag=$1 WHERE id>=901 AND id<906`, hex.EncodeToString(sum[:])); err != nil {
 		t.Fatal(err)
 	}
-	f.useClientVersion(nasTunableCopyClientVersion)
+	f.useClientVersion(nasTunableDayClientVersion)
 	f.s.cfg.NASR2CopyEnabled = true
-	f.s.cfg.NASR2FastCopyWorkers = 2
+	if w := adminFastCopyWorkers(t, f.s, http.MethodPost, map[string]any{"workers": 2}); w.Code != 200 || !strings.Contains(w.Body.String(), `"workers":2`) {
+		t.Fatalf("set workers: %d %s", w.Code, w.Body)
+	}
 }
 
 func fastCopyLease(t *testing.T, f *cleanupFixture) fastCopyLeaseReply {
@@ -280,7 +276,7 @@ try:
             assert not pull.r2_fast_copy_batch(cfg, pull.Runtime(cfg), inventory, stop, control, batch, False)
 finally:
     inventory.close()
-`, api.URL, root, nasTunableCopyClientVersion)
+`, api.URL, root, nasTunableDayClientVersion)
 	cmd.Dir = "../../../clients/nas-pull"
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -305,7 +301,7 @@ finally:
 func TestNASStorageBindingV8FastCopyMigration(t *testing.T) {
 	s, pool := storageHeartbeatFixture(t)
 	ctx := context.Background()
-	for _, name := range []string{"0237_nas_storage_v8_cleanup_binding.sql", "0238_nas_storage_v8_keep20_cleanup_binding.sql", "0239_nas_storage_v8_fast_copy_binding.sql", "0246_nas_storage_v8_tunable_copy_binding.sql"} {
+	for _, name := range []string{"0237_nas_storage_v8_cleanup_binding.sql", "0238_nas_storage_v8_keep20_cleanup_binding.sql", "0239_nas_storage_v8_fast_copy_binding.sql", "0246_nas_storage_v8_tunable_copy_binding.sql", "0250_nas_storage_v8_tunable_day_binding.sql"} {
 		body, err := os.ReadFile("../../../infra/sql/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
@@ -315,19 +311,19 @@ func TestNASStorageBindingV8FastCopyMigration(t *testing.T) {
 		}
 	}
 	for _, version := range []string{"r2-copy-v5", NASR2CopyPagedClientVersion, nasCleanupCertifiedStitchVersion,
-		nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion, nasTunableCopyClientVersion} {
+		nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion} {
 		if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version=$1,nas_storage_budget_at=now() WHERE id=13`, version); err != nil {
 			t.Fatalf("binding refused %q: %v", version, err)
 		}
 	}
-	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version=$1 WHERE id=13`, nasTunableCopyClientVersion+"-extra"); err == nil {
+	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version=$1 WHERE id=13`, nasTunableDayClientVersion+"-extra"); err == nil {
 		t.Fatal("binding accepted an unreviewed literal")
 	}
-	nonce := storageHeartbeat(t, s, nasTunableCopyClientVersion, storageSample(""))
+	nonce := storageHeartbeat(t, s, nasTunableDayClientVersion, storageSample(""))
 	issued := storageObservation(t, pool).issued
-	storageHeartbeat(t, s, nasTunableCopyClientVersion, storageSample(nonce))
+	storageHeartbeat(t, s, nasTunableDayClientVersion, storageSample(nonce))
 	obs := storageObservation(t, pool)
-	if issued == nil || obs.version != nasTunableCopyClientVersion || obs.budget == nil || !obs.budget.Equal(*issued) {
+	if issued == nil || obs.version != nasTunableDayClientVersion || obs.budget == nil || !obs.budget.Equal(*issued) {
 		t.Fatalf("fast copy did not persist the exact storage binding: %+v", obs)
 	}
 }
@@ -347,5 +343,50 @@ func TestNASR2CopyV8FastSkipsObjectsLargerThanOneLease(t *testing.T) {
 	var state string
 	if err := f.pool.QueryRow(f.ctx, `SELECT state FROM nas_r2_copy_items WHERE source_id=$1`, item.SourceID).Scan(&state); err != nil || state != "pending" {
 		t.Fatalf("state=%q err=%v", state, err)
+	}
+}
+
+func adminFastCopyWorkers(t *testing.T, s *Server, method string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	payload, _ := json.Marshal(body)
+	req := httptest.NewRequest(method, "/x", strings.NewReader(string(payload)))
+	route := chi.NewRouteContext()
+	route.URLParams.Add("id", "13")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, route))
+	w := httptest.NewRecorder()
+	s.handleAdminConnectionR2FastCopy(w, req)
+	return w
+}
+
+// The stream count is a per-connection DB setting (default 16), never an env.
+func TestNASR2FastCopyWorkersAdmin(t *testing.T) {
+	f := newCleanupFixture(t, 4)
+	applyMigrations(t, f, "0252_nas_r2_fast_copy_workers.sql")
+	if w := adminFastCopyWorkers(t, f.s, http.MethodGet, nil); w.Code != 200 || !strings.Contains(w.Body.String(), `"workers":16`) {
+		t.Fatalf("default: %d %s", w.Code, w.Body)
+	}
+	for _, bad := range []any{map[string]any{"workers": 0}, map[string]any{"workers": 33}, map[string]any{}, map[string]any{"workers": 4, "x": 1}} {
+		if w := adminFastCopyWorkers(t, f.s, http.MethodPost, bad); w.Code != 400 {
+			t.Fatalf("accepted %v: %d", bad, w.Code)
+		}
+	}
+	if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET r2_fast_copy_workers=33 WHERE id=13`); err == nil {
+		t.Fatal("column accepted 33 workers")
+	}
+	if w := adminFastCopyWorkers(t, f.s, http.MethodPost, map[string]any{"workers": 32}); w.Code != 200 || !strings.Contains(w.Body.String(), `"workers":32`) {
+		t.Fatalf("set: %d %s", w.Code, w.Body)
+	}
+}
+
+func applyMigrations(t *testing.T, f *cleanupFixture, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		migration, err := os.ReadFile("../../../infra/sql/migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = f.pool.Exec(f.ctx, string(migration)); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
 	}
 }

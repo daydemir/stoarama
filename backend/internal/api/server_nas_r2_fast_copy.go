@@ -18,10 +18,11 @@ import (
 )
 
 const (
-	nasR2FastCopyURLTTL    = 15 * time.Minute
-	nasR2FastCopyLeaseTTL  = time.Hour
-	nasR2FastCopyBatchMax  = 64
-	nasR2FastCopyBatchSize = 32
+	nasR2FastCopyURLTTL     = 15 * time.Minute
+	nasR2FastCopyLeaseTTL   = time.Hour
+	nasR2FastCopyBatchMax   = 64
+	nasR2FastCopyBatchSize  = 32
+	nasR2FastCopyMaxWorkers = 32
 	// A fast-copy object must finish within one lease even at a slow 0.6 MB/s;
 	// a partial transfer restarts from zero, so larger objects would never land.
 	// Raw clips are tens of MB; anything larger stays pending and visible.
@@ -157,8 +158,9 @@ func (s *Server) handleNASR2FastCopyLease(w http.ResponseWriter, r *http.Request
 	}
 	var version string
 	var expires time.Time
-	if err = tx.QueryRow(ctx, `SELECT client_version,clock_timestamp()+$2::integer*interval '1 second'
- FROM connections WHERE id=$1`, cid, int(nasR2FastCopyLeaseTTL/time.Second)).Scan(&version, &expires); err != nil || !nasFastCopyLine(version) {
+	var workers int
+	if err = tx.QueryRow(ctx, `SELECT client_version,clock_timestamp()+$2::integer*interval '1 second',r2_fast_copy_workers
+ FROM connections WHERE id=$1`, cid, int(nasR2FastCopyLeaseTTL/time.Second)).Scan(&version, &expires, &workers); err != nil || !nasFastCopyLine(version) {
 		util.WriteError(w, 409, "copy session changed during admission")
 		return
 	}
@@ -217,7 +219,7 @@ func (s *Server) handleNASR2FastCopyLease(w http.ResponseWriter, r *http.Request
 		util.WriteError(w, 503, "copy R2 capability unavailable; retryable")
 		return
 	}
-	util.WriteJSON(w, 200, map[string]any{"tasks": tasks, "lease_expires_at": expires, "floor_bytes": NASR2CopyFloor, "workers": s.cfg.NASR2FastCopyWorkers})
+	util.WriteJSON(w, 200, map[string]any{"tasks": tasks, "lease_expires_at": expires, "floor_bytes": NASR2CopyFloor, "workers": workers})
 }
 
 type nasR2FastCopyResult struct {
@@ -323,4 +325,45 @@ func (s *Server) handleNASR2FastCopyResults(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	util.WriteJSON(w, 200, map[string]any{"verified": verified})
+}
+
+// handleAdminConnectionR2FastCopy reads (GET) or sets (POST) one NAS
+// connection's fast-copy stream count; the client applies it to its next batch.
+func (s *Server) handleAdminConnectionR2FastCopy(w http.ResponseWriter, r *http.Request) {
+	connectionID, ok := parseInt64Path(w, r, "id")
+	if !ok {
+		return
+	}
+	var out struct {
+		ConnectionID int64 `json:"connection_id"`
+		Workers      int   `json:"workers"`
+	}
+	out.ConnectionID = connectionID
+	query := `SELECT r2_fast_copy_workers FROM connections WHERE id=$1 AND kind='nas_pull'`
+	args := []any{connectionID}
+	if r.Method == http.MethodPost {
+		var req struct {
+			Workers int `json:"workers"`
+		}
+		if err := util.DecodeJSON(r, &req); err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if req.Workers < 1 || req.Workers > nasR2FastCopyMaxWorkers {
+			util.WriteError(w, http.StatusBadRequest, "workers must be between 1 and 32")
+			return
+		}
+		query = `UPDATE connections SET r2_fast_copy_workers=$2 WHERE id=$1 AND kind='nas_pull' RETURNING r2_fast_copy_workers`
+		args = append(args, req.Workers)
+	}
+	err := s.pool.QueryRow(r.Context(), query, args...).Scan(&out.Workers)
+	if errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusNotFound, "NAS connection not found")
+		return
+	}
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "fast copy workers")
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, out)
 }
