@@ -133,7 +133,7 @@ class DayCleanupTests(unittest.TestCase):
     def test_client_refuses_independently_before_any_unlink(self):
         media = self.write(plaza(DAY, '103000'))
         cases = {
-            'keep everything': dict(relative_dir='seoul/September/12-Saturday', stream_id=78),
+            'keep everything in dir mode': dict(relative_dir='seoul/September/12-Saturday', stream_id=78),
             'folder map disagrees': dict(stream_id=78),
             'boundary day before': dict(relative_dir='shinjuku/September/15-Tuesday', local_date='2026-09-15'),
             'in window': dict(relative_dir='shinjuku/September/20-Sunday', local_date='2026-09-20'),
@@ -244,6 +244,29 @@ class DayCleanupTests(unittest.TestCase):
         pull.cleanup_day_cycle(self.cfg, self.inventory, threading.Event())
         self.assertIn('dir mode', self.receipts()[-1]['refusal'])
 
+    def test_keep_everything_day_leaves_only_listed_names(self):
+        # Deniz: "nas shoul dnot have any of the keep everything (except the keep 20)".
+        seoul = self.cfg.output_dir / 'seoul/September/12-Saturday'
+        seoul.mkdir(parents=True)
+        listed, unlisted = plaza(DAY, '103000'), plaza(DAY, '113000')
+        for name in (listed, unlisted):
+            (seoul / name).write_bytes(b'abc')
+        (seoul / (listed + '.stoarama.json')).write_bytes(b'{}')
+        ke = dict(relative_dir='seoul/September/12-Saturday', stream_id=78)
+        self.next_permit = self.names_permit([(listed, 3), (listed + '.stoarama.json', 2)], **ke)
+        self.assertTrue(pull.cleanup_day_cycle(self.cfg, self.inventory, threading.Event()))
+        [receipt] = self.receipts()
+        self.assertEqual((receipt['outcome'], receipt['media_files'], receipt['sidecar_files']), ('deleted', 1, 1))
+        self.assertEqual(sorted(os.listdir(seoul)), [unlisted])  # No R2 counterpart listed: it stays.
+        for day in (datetime.date(2026, 9, 15), datetime.date(2026, 9, 20), datetime.date(2026, 10, 6)):
+            with self.subTest(day=day):
+                self.sent.clear()
+                directory = 'seoul/%s/%02d-%s' % (pull.CLEANUP_MONTHS[day.month - 1], day.day, pull.CLEANUP_DAY_WEEKDAYS[day.weekday()])
+                self.next_permit = self.names_permit([(plaza(day, '103000'), 3)], relative_dir=directory, stream_id=78,
+                                                     local_date=day.isoformat())
+                pull.cleanup_day_cycle(self.cfg, self.inventory, threading.Event())
+                self.assertIn('inside or adjacent', self.receipts()[0]['refusal'])
+
     def test_unparseable_media_refuses_the_whole_directory(self):
         media = self.write(plaza(DAY, '103000'))
         self.write('renamed.mp4')
@@ -274,7 +297,7 @@ class DayCleanupTests(unittest.TestCase):
     def test_day_release_is_on_the_cleanup_line(self):
         self.assertIn(pull.FAST_COPY_CLIENT_VERSION, pull.LOW_MEMORY_CLEANUP_VERSIONS)
         self.assertIn(pull.FAST_COPY_CLIENT_VERSION, pull.CLEANUP_BULK_VERSIONS)
-        self.assertEqual(pull.FAST_COPY_CLIENT_VERSION, 'r2-copy-v8-tunable-modes')
+        self.assertEqual(pull.FAST_COPY_CLIENT_VERSION, 'r2-copy-v8-ke-day')
 
 
 if __name__ == '__main__':

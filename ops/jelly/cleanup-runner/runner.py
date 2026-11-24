@@ -46,9 +46,13 @@ RECOVERY = {'r2_sha_verified', 'r2_md5_etag_matched', 'r2_name_size_matched'}
 # "if its outside of keep everything, then a nas copy only needs to be checked
 # if its in the keep 20? otherwise it can be deleted right?"; "lift nas cleanup
 # dialy limit please".
-DAY_REASON = ('Deniz approval (verbatim: "yes, delete"): NAS raw day directories of non-Keep-Everything streams '
-              'outside the pinned 20-day window; server and independent folder/window/hold check PASS; '
-              'no R2 copy check; no daily cap; one owned plan.')
+# Keep Everything (verbatim: "nas shoul dnot have any of the keep everything
+# (except the keep 20)"): KE streams come after the others, and a KE unit names
+# only media whose R2 counterpart is live and listed with the same size.
+DAY_REASON = ('Deniz approval (verbatim: "yes, delete"; "nas shoul dnot have any of the keep everything (except the keep 20)"): '
+              'NAS raw day directories outside the pinned 20-day window; server and independent folder/window/hold check PASS; '
+              'Keep Everything days name only media with a live same-size R2 counterpart; no daily cap; one owned plan.')
+R2PRUNE = Path.home() / 'stoarama-r2prune-lane' / 'r2prune'
 FOLDERS = 'backend/internal/api/nas_cleanup_folder_streams.json'
 FOLDERS_SHA = '94efc6fe9f0b83db55be31d4c2fad7f47cff781fd01d88bc33c4c90cae0e7ab8'
 DAY_MAX_UNITS = 1000
@@ -227,8 +231,9 @@ def execution_state(plan):
 def day_digest(units):
     """The backend's cleanupDayDigest, computed here independently."""
     text = 'stoarama-nas-cleanup-day-v1\npolicy %s\n' % POLICY_SHA
-    text += ''.join('unit %d %s %d %d %s\n' % (u['stream_id'], u['local_date'], u['files'], u['bytes'], u['relative_dir'])
-                    for u in units)
+    for u in units:
+        text += 'unit %d %s %d %d %s\n' % (u['stream_id'], u['local_date'], u['files'], u['bytes'], u['relative_dir'])
+        text += ''.join('name %d %s\n' % (n['size_bytes'], n['name']) for n in u.get('names') or ())
     return hashlib.sha256(text.encode()).hexdigest()
 
 
@@ -261,7 +266,13 @@ def day_verify(plan, windows, timezones, keep_everything, folders, catalog):
     for u in units:
         require(u['state'] == 'pending' and u['attempt'] == 0 and u['receipts'] == [], 'day unit already started')
         sid, directory = u['stream_id'], u['relative_dir']
-        require(sid in windows and sid not in keep_everything, 'day unit stream is Keep Everything or unpinned')
+        require(sid in windows, 'day unit stream is unpinned')
+        names = u.get('names') or []
+        require((sid in keep_everything) == bool(names), 'a Keep Everything unit names its media; any other unit names none')
+        require(all(type(n['size_bytes']) is int and n['size_bytes'] > 0 for n in names)
+                and [n['name'] for n in names] == sorted({n['name'] for n in names})
+                and (not names or (len(names), sum(n['size_bytes'] for n in names)) == (u['files'], u['bytes'])),
+                'Keep Everything names are not distinct ascending media totalling the unit')
         require(folders.get(day_folder_key(directory)) == sid, 'reviewed folder map does not assign the directory')
         day = date.fromisoformat(u['local_date'])
         plaza = DAY_PLAZA_DIR.fullmatch(directory)
@@ -272,6 +283,7 @@ def day_verify(plan, windows, timezones, keep_everything, folders, catalog):
         row = rows.get((directory, u['local_date']))
         require(row is not None and row['held'] == 0 and row['overlap'] == 0 and row['dir_held'] is False,
                 'directory-day has a held or in-window catalogued clip')
+        require(row['unlive'] == 0, 'a Keep Everything name lacks a live same-size R2 counterpart in the catalogue')
     require(len({u['stream_id'] for u in units}) == 1, 'day plan must be one stream')
     return plan['bytes']
 
@@ -1366,11 +1378,14 @@ class Runner:
     def day_catalog(self, plan):
         """Read-only per directory-day: held and in-window catalogued clips, delivery path holds."""
         rows = [{'dir': u['relative_dir'], 'd': u['local_date'], 'sid': u['stream_id'], 'tz': self.timezones[u['stream_id']],
-                 'ws': self.windows[u['stream_id']][0].isoformat(), 'we': self.windows[u['stream_id']][1].isoformat()}
-                for u in plan['units']]
+                 'ws': self.windows[u['stream_id']][0].isoformat(), 'we': self.windows[u['stream_id']][1].isoformat(),
+                 'names': u.get('names') or []} for u in plan['units']]
         encoded = base64.b64encode(json.dumps(rows).encode()).decode()
+        prepare = self.preparer()
+        # unlive: Keep Everything names whose catalogued clip of the stream is missing, has another size,
+        # or has no live R2 counterpart (the preparer's and server's rule).
         return self.query("""WITH u AS (SELECT x->>'dir' dir,(x->>'d')::date d,(x->>'sid')::bigint sid,x->>'tz' tz,
-            (x->>'ws')::timestamptz ws,(x->>'we')::timestamptz we
+            (x->>'ws')::timestamptz ws,(x->>'we')::timestamptz we,x->'names' names
           FROM jsonb_array_elements(convert_from(decode('""" + encoded + """','base64'),'UTF8')::jsonb) x),
           c AS (SELECT u.dir,u.d,c.id,(c.clip_start_at<u.we AND c.clip_end_at>u.ws) inside FROM u
             JOIN recordings r ON r.account_id=47 AND r.stream_id=u.sid JOIN recording_clips c ON c.recording_id=r.id
@@ -1379,21 +1394,38 @@ class Runner:
           SELECT coalesce(json_agg(json_build_object('relative_dir',u.dir,'local_date',u.d::text,
             'held',(SELECT count(*) FROM c WHERE c.dir=u.dir AND c.d=u.d AND nas_cleanup_day_clip_held(c.id)),
             'overlap',(SELECT count(*) FROM c WHERE c.dir=u.dir AND c.d=u.d AND c.inside),
-            'dir_held',nas_cleanup_day_dir_held(u.dir))),'[]') FROM u""", 'day catalog query')
+            'dir_held',nas_cleanup_day_dir_held(u.dir),
+            'unlive',(SELECT count(*) FROM jsonb_array_elements(u.names) n WHERE NOT EXISTS(SELECT 1 FROM recording_clips c
+              JOIN recordings r ON r.id=c.recording_id AND r.account_id=47 AND r.stream_id=u.sid
+              WHERE c.display_path=u.dir||'/'||(n->>'name') AND c.size_bytes=(n->>'size_bytes')::bigint AND (""" + prepare.r2_live_raw('c', prepare.R2_BUCKET) + """
+               OR EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.source_clip_ids @> ARRAY[c.id] AND """ + prepare.R2_LIVE_OUTPUT + """)))))),'[]') FROM u""", 'day catalog query')
+
+    def day_checked(self, p):
+        """day_verify's bytes, or None after closing a never-started plan whose Keep Everything name
+        lost its live R2 counterpart; its directory-days are replanned without that name."""
+        catalog = self.day_catalog(p)
+        if not self.dry_run and p['mode'] == 'dry_run' and any(c.get('unlive') for c in catalog):
+            closed = self.day_control(p['id'], 'close', {'plan_sha256': p['plan_sha256'],
+                                      'reason': 'Keep Everything name lost its live R2 counterpart; replanning.'}, 'retired')
+            require(closed['id'] == p['id'] and closed['mode'] == 'retired', 'day close was not confirmed')
+            self.save('day_replan', current_day_plan=None)
+            return None
+        return day_verify(p, self.windows, self.timezones, self.keep_everything, self.folders, catalog)
 
     def day_pick(self):
         ids = self.query("SELECT coalesce(json_agg(id ORDER BY id),'[]') FROM nas_cleanup_day_plans WHERE account_id=47 "
                          "AND connection_id=13 AND mode='dry_run' AND policy_sha256='" + POLICY_SHA + "'", 'day plan query')
         if ids:
             return ids[0]
-        for sid in sorted(set(self.windows) - self.keep_everything):
+        for sid in sorted(self.windows, key=lambda sid: (sid in self.keep_everything, sid)):
             if self.stopped():
                 return None
             if not self.stream_ready(sid):
                 continue
             prefix = 'kday-' + utcnow().strftime('%Y%m%d-%H%M%S')
             out = self.root / 'day-plans' / (prefix + '-s' + str(sid))
-            if not self.prepare_stream(sid, ['--day-plans', '--max-plans', '1', '--label-prefix', prefix,
+            lister = ['--r2prune', str(R2PRUNE)] if sid in self.keep_everything else []
+            if not self.prepare_stream(sid, ['--day-plans', '--max-plans', '1', '--label-prefix', prefix, *lister,
                                              '--out', str(out), '--api', API, '--submit', '--atomic-admission']):
                 continue
             receipts = json.loads((out / 'summary.json').read_text())['receipts']
@@ -1471,7 +1503,9 @@ class Runner:
                 return
             self.save('day_dry_run', current_day_plan=pid)
             p = self.day_plan(pid)
-            size = day_verify(p, self.windows, self.timezones, self.keep_everything, self.folders, self.day_catalog(p))
+            size = self.day_checked(p)
+            if size is None:
+                continue
             if self.dry_run:
                 self.save('day_dry_run_pass', proposed_bytes=size)
                 return
@@ -1480,7 +1514,8 @@ class Runner:
             if self.stopped():
                 break
             p = self.day_plan(pid)
-            day_verify(p, self.windows, self.timezones, self.keep_everything, self.folders, self.day_catalog(p))
+            if self.day_checked(p) is None:
+                continue
             self.idle()
             self.save('day_enabling', started_day_plan_sha256=p['plan_sha256'])
             if self.stopped() or not self.enable(p, day=True):

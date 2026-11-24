@@ -33,8 +33,17 @@ import (
 // the reviewed folder map the NAS client pins, its date from the path. The
 // server issues one permit per unit after checking the whole local day lies
 // outside the stream's pinned 20-day window (with a one-day guard band on
-// each side), the stream is not Keep Everything, and no catalogued clip of the
-// unit is held. There is no R2 copy check and no daily cap.
+// each side), and no catalogued clip of the unit is held. A
+// non-Keep-Everything unit has no R2 copy check. There is no daily cap.
+//
+// Keep Everything (Deniz, verbatim: "nas shoul dnot have any of the keep
+// everything (except the keep 20)"; "if its the same size and same file name or
+// whatever checks we have already?"): a KE unit names its exact media files
+// (name and size), always goes in names mode, and the server permits a named
+// file only while its R2 counterpart is live in the catalogue: the clip's own
+// raw object (not purged or retired) or a stitched output listing the clip
+// (not retired or reserved for retirement), with the NAS size equal to the
+// catalogued clip size. KE stays in R2, so the counterpart persists.
 
 //go:embed nas_cleanup_folder_streams.json
 var cleanupFolderStreamsJSON []byte
@@ -44,6 +53,7 @@ const cleanupFolderStreamsSHA = "94efc6fe9f0b83db55be31d4c2fad7f47cff781fd01d88b
 
 const (
 	nasCleanupDayMaxUnits  = 1000
+	nasCleanupDayMaxNames  = 100000
 	nasCleanupDayPermitTTL = 10 * time.Minute
 	nasCleanupDayDigestTag = "stoarama-nas-cleanup-day-v1"
 )
@@ -177,17 +187,48 @@ type nasCleanupDayUnit struct {
 	StreamID    int64  `json:"stream_id"`
 	Files       int64  `json:"files"`
 	Bytes       int64  `json:"bytes"`
+	// Names lists a Keep Everything unit's media files, ascending by name; any
+	// other unit lists none.
+	Names []nasCleanupDayName `json:"names,omitempty"`
+}
+
+// nasCleanupDayName is one media file of a Keep Everything unit, chosen by the
+// preparer because R2 lists its counterpart with the catalogued size.
+type nasCleanupDayName struct {
+	Name      string `json:"name"`
+	SizeBytes int64  `json:"size_bytes"`
 }
 
 // cleanupDayDigest binds the ordered units to the policy. The preparer and
-// runner compute the same line format (paths never contain a newline).
+// runner compute the same line format (paths never contain a newline). A KE
+// unit's names follow its unit line; other units keep their earlier digest.
 func cleanupDayDigest(units []nasCleanupDayUnit) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\npolicy %s\n", nasCleanupDayDigestTag, cleanupPolicySHA)
 	for _, u := range units {
 		fmt.Fprintf(&b, "unit %d %s %d %d %s\n", u.StreamID, u.LocalDate, u.Files, u.Bytes, u.RelativeDir)
+		for _, n := range u.Names {
+			fmt.Fprintf(&b, "name %d %s\n", n.SizeBytes, n.Name)
+		}
 	}
 	return cleanupSHA([]byte(b.String()))
+}
+
+// cleanupDayNamesValid: a KE unit's names are distinct media of the unit's date
+// in ascending order, totalling the unit.
+func cleanupDayNamesValid(u nasCleanupDayUnit, day time.Time, loc *time.Location) error {
+	var bytes int64
+	for i, n := range u.Names {
+		if named, ok := cleanupDayFileDate(u.RelativeDir, n.Name, loc); !ok || !named.Equal(day) || n.SizeBytes <= 0 ||
+			(i > 0 && n.Name <= u.Names[i-1].Name) {
+			return errors.New("Keep Everything names must be ascending media of the unit's date with sizes")
+		}
+		bytes += n.SizeBytes
+	}
+	if int64(len(u.Names)) != u.Files || bytes != u.Bytes {
+		return errors.New("Keep Everything names differ from the unit totals")
+	}
+	return nil
 }
 
 // cleanupDayStatic checks everything a unit's own identity decides.
@@ -207,8 +248,11 @@ func cleanupDayStatic(u nasCleanupDayUnit) (cleanupKeepWindow, time.Time, *time.
 		return cleanupKeepWindow{}, time.Time{}, nil, errors.New("reviewed folder map does not assign this directory to the stream")
 	}
 	w, ok := policy.Streams[u.StreamID]
-	if !ok || w.KeepEverything {
-		return cleanupKeepWindow{}, time.Time{}, nil, errors.New("stream is Keep Everything or has no pinned window")
+	if !ok {
+		return cleanupKeepWindow{}, time.Time{}, nil, errors.New("stream has no pinned window")
+	}
+	if w.KeepEverything != (len(u.Names) > 0) {
+		return cleanupKeepWindow{}, time.Time{}, nil, errors.New("a Keep Everything unit names its exact media; any other unit names none")
 	}
 	day, err := time.Parse(time.DateOnly, u.LocalDate)
 	if err != nil || day.Year() < 2020 || day.Year() >= 2028 {
@@ -223,6 +267,9 @@ func cleanupDayStatic(u nasCleanupDayUnit) (cleanupKeepWindow, time.Time, *time.
 		return cleanupKeepWindow{}, time.Time{}, nil, errors.New("day is inside or adjacent to the pinned keep window")
 	}
 	loc, err := time.LoadLocation(w.Timezone)
+	if err == nil && w.KeepEverything {
+		err = cleanupDayNamesValid(u, day, loc)
+	}
 	return w, day, loc, err
 }
 
@@ -238,7 +285,7 @@ type cleanupDayQuerier interface {
 // holds every day of the recording, and evaluating it per directory clip made
 // a 13-unit enable take ~130 s.
 const cleanupDayUnitSQL = `SELECT c.id,c.display_path,c.clip_start_at,c.clip_end_at,r.stream_id,
- coalesce(f.size_bytes,-1),f.sidecar_relative_path,f.sidecar_size_bytes
+ coalesce(f.size_bytes,-1),f.sidecar_relative_path,f.sidecar_size_bytes,c.size_bytes
  FROM recordings r JOIN recording_clips c ON c.recording_id=r.id
  LEFT JOIN nas_inventory_files f ON f.connection_id=13 AND f.clip_id=c.id AND f.state='present' AND f.relative_path=c.display_path
  WHERE r.account_id=47 AND c.display_path LIKE $2 AND strpos(substr(c.display_path,length($1)+2),'/')=0
@@ -263,12 +310,29 @@ const (
 	nasCleanupDayDir nasCleanupDayMode = "dir"
 )
 
-func cleanupDayModeOf(dir string) nasCleanupDayMode {
-	if cleanupDayPlazaDir.MatchString(dir) {
+// cleanupDayModeOf: a Keep Everything unit (the only kind with names) always
+// goes in names mode, so a plaza directory's unnamed files stay.
+func cleanupDayModeOf(u nasCleanupDayUnit) nasCleanupDayMode {
+	if len(u.Names) == 0 && cleanupDayPlazaDir.MatchString(u.RelativeDir) {
 		return nasCleanupDayDir
 	}
 	return nasCleanupDayNames
 }
+
+// cleanupDayR2LiveSQL returns the clips ($1) with a live R2 counterpart in the
+// catalogue: the raw object in bucket $2, neither purged nor retired, or a
+// stitched output listing the clip that is neither retired nor reserved for
+// retirement. The r2prune lane records collated deletes only in
+// r2_object_retirements. A reserved raw object is already a held clip. The
+// clip rows are share-locked so a concurrent purged_at write waits for this
+// permit's commit; R2 purges then skip clips a live KE unit names.
+const cleanupDayR2LiveSQL = `SELECT coalesce(array_agg(id),'{}') FROM (SELECT c.id FROM recording_clips c WHERE c.id=ANY($1::bigint[]) AND (
+ (c.bucket=$2 AND c.purged_at IS NULL AND c.object_key<>''
+  AND NOT EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.kind='raw' AND x.source_id=c.id))
+ OR c.id IN (SELECT unnest(o.source_clip_ids) FROM recording_collation_outputs o WHERE o.source_clip_ids && $1::bigint[]
+  AND NOT EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.kind='collated' AND x.source_id=o.id)
+  AND NOT EXISTS(SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='collated' AND x.source_id=o.id)))
+ FOR SHARE OF c) live`
 
 // nasCleanupDayEntry is one inventoried file of the unit: a media file or the
 // sidecar beside it, by its name in the directory and exact size.
@@ -290,8 +354,10 @@ func cleanupDayMedia(entries []nasCleanupDayEntry) (files, bytes int64) {
 }
 
 // cleanupDayCheck returns the unit's inventoried NAS media and sidecars, or
-// why the whole directory-day must stay.
-func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUnit) ([]nasCleanupDayEntry, error) {
+// why the whole directory-day must stay. A Keep Everything unit returns only
+// its named files whose NAS size is the catalogued size and whose R2
+// counterpart is live; its other files stay on the NAS.
+func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUnit, bucket string) ([]nasCleanupDayEntry, error) {
 	w, day, loc, err := cleanupDayStatic(u)
 	if err != nil {
 		return nil, err
@@ -308,17 +374,23 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 		return nil, err
 	}
 	defer rows.Close()
-	var entries []nasCleanupDayEntry
+	type present struct {
+		id         int64
+		media      nasCleanupDayEntry
+		catalogued int64
+		sidecar    *nasCleanupDayEntry
+	}
+	var files []present
 	var dated []int64
 	for rows.Next() {
 		var id int64
 		var p string
 		var a, b *time.Time
 		var stream *int64
-		var size int64
+		var size, catalogued int64
 		var sidecarPath *string
 		var sidecarSize *int64
-		if err := rows.Scan(&id, &p, &a, &b, &stream, &size, &sidecarPath, &sidecarSize); err != nil {
+		if err := rows.Scan(&id, &p, &a, &b, &stream, &size, &sidecarPath, &sidecarSize, &catalogued); err != nil {
 			return nil, err
 		}
 		if stream == nil || *stream != u.StreamID {
@@ -336,16 +408,17 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 		}
 		dated = append(dated, id)
 		if size >= 0 {
-			entries = append(entries, nasCleanupDayEntry{Name: path.Base(p), SizeBytes: size})
+			f := present{id: id, media: nasCleanupDayEntry{Name: path.Base(p), SizeBytes: size}, catalogued: catalogued}
 			if sidecarPath != nil && sidecarSize != nil && *sidecarPath == p+".stoarama.json" {
-				entries = append(entries, nasCleanupDayEntry{Name: path.Base(*sidecarPath), SizeBytes: *sidecarSize, Sidecar: true})
+				f.sidecar = &nasCleanupDayEntry{Name: path.Base(*sidecarPath), SizeBytes: *sidecarSize, Sidecar: true}
 			}
+			files = append(files, f)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if len(entries) == 0 {
+	if len(files) == 0 {
 		return nil, errors.New("no catalogued NAS media in the directory-day")
 	}
 	if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM unnest($1::bigint[]) id WHERE nas_cleanup_day_clip_held(id))`, dated).Scan(&held); err != nil {
@@ -353,6 +426,37 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 	}
 	if held {
 		return nil, errors.New("catalogued clip is held")
+	}
+	keep := func(present) bool { return true }
+	if w.KeepEverything {
+		var ids []int64
+		if err := q.QueryRow(ctx, cleanupDayR2LiveSQL, dated, bucket).Scan(&ids); err != nil {
+			return nil, err
+		}
+		live := map[int64]bool{}
+		for _, id := range ids {
+			live[id] = true
+		}
+		named := map[string]int64{}
+		for _, n := range u.Names {
+			named[n.Name] = n.SizeBytes
+		}
+		keep = func(f present) bool {
+			size, ok := named[f.media.Name]
+			return ok && size == f.media.SizeBytes && f.catalogued == size && live[f.id]
+		}
+	}
+	var entries []nasCleanupDayEntry
+	for _, f := range files {
+		if keep(f) {
+			entries = append(entries, f.media)
+			if f.sidecar != nil {
+				entries = append(entries, *f.sidecar)
+			}
+		}
+	}
+	if len(entries) == 0 {
+		return nil, errors.New("no named NAS media with a live R2 counterpart in the directory-day")
 	}
 	return entries, nil
 }
@@ -374,7 +478,7 @@ func (s *Server) handleServiceNASCleanupDayCreate(w http.ResponseWriter, r *http
 		return
 	}
 	seen := map[[2]string]bool{}
-	var files, bytes int64
+	var files, bytes, names int64
 	for _, u := range req.Units {
 		key := [2]string{u.RelativeDir, u.LocalDate}
 		if seen[key] || u.Files <= 0 || u.Bytes <= 0 {
@@ -384,6 +488,11 @@ func (s *Server) handleServiceNASCleanupDayCreate(w http.ResponseWriter, r *http
 		seen[key] = true
 		files += u.Files
 		bytes += u.Bytes
+		names += int64(len(u.Names))
+	}
+	if names > nasCleanupDayMaxNames {
+		util.WriteError(w, 400, "at most 100000 Keep Everything names per plan")
+		return
 	}
 	if files != req.Files || bytes != req.Bytes {
 		util.WriteError(w, 400, "unit totals differ from the plan totals")
@@ -397,7 +506,7 @@ func (s *Server) handleServiceNASCleanupDayCreate(w http.ResponseWriter, r *http
 	}
 	defer tx.Rollback(ctx)
 	for n, u := range req.Units {
-		entries, err := cleanupDayCheck(ctx, tx, u)
+		entries, err := cleanupDayCheck(ctx, tx, u, s.cfg.R2Bucket)
 		if gotFiles, gotBytes := cleanupDayMedia(entries); err == nil && (gotFiles != u.Files || gotBytes != u.Bytes) {
 			err = fmt.Errorf("catalogued NAS media is %d files, %d bytes", gotFiles, gotBytes)
 		}
@@ -413,8 +522,8 @@ func (s *Server) handleServiceNASCleanupDayCreate(w http.ResponseWriter, r *http
 		return
 	}
 	units, _ := json.Marshal(req.Units)
-	if _, err = tx.Exec(ctx, `INSERT INTO nas_cleanup_day_units(plan_id,ordinal,stream_id,relative_dir,local_date,files,bytes)
- SELECT $1,n,(u->>'stream_id')::bigint,u->>'relative_dir',(u->>'local_date')::date,(u->>'files')::bigint,(u->>'bytes')::bigint
+	if _, err = tx.Exec(ctx, `INSERT INTO nas_cleanup_day_units(plan_id,ordinal,stream_id,relative_dir,local_date,files,bytes,names)
+ SELECT $1,n,(u->>'stream_id')::bigint,u->>'relative_dir',(u->>'local_date')::date,(u->>'files')::bigint,(u->>'bytes')::bigint,u->'names'
  FROM jsonb_array_elements($2::jsonb) WITH ORDINALITY x(u,n)`, id, string(units)); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -442,7 +551,7 @@ func (s *Server) handleServiceNASCleanupDayStatus(w http.ResponseWriter, r *http
  'plan_sha256',p.plan_sha256,'mode',p.mode,'approval_reason',p.approval_reason,'approved_until',p.approved_until,
  'files',p.files,'bytes',p.bytes,
  'units',(SELECT coalesce(jsonb_agg(jsonb_build_object('unit_id',u.id,'ordinal',u.ordinal,'stream_id',u.stream_id,
-   'relative_dir',u.relative_dir,'local_date',u.local_date::text,'files',u.files,'bytes',u.bytes,'state',u.state,
+   'relative_dir',u.relative_dir,'local_date',u.local_date::text,'files',u.files,'bytes',u.bytes,'names',u.names,'state',u.state,
    'attempt',u.attempt,'permit_live',u.state='permitted' AND u.permit_expires_at>clock_timestamp(),
    'refusal',u.refusal,'receipts',u.receipts) ORDER BY u.ordinal),'[]') FROM nas_cleanup_day_units u WHERE u.plan_id=p.id),
  'deleted_media_files',(SELECT coalesce(sum((e->>'media_files')::bigint),0) FROM nas_cleanup_day_units u
@@ -530,7 +639,7 @@ func (s *Server) cleanupDayEnable(ctx context.Context, tx pgx.Tx, id int64, mode
  OR EXISTS(SELECT 1 FROM nas_cleanup_day_plans WHERE mode='enabled')`).Scan(&busy); err != nil || busy {
 		return errors.New("another cleanup plan is enabled")
 	}
-	rows, err := tx.Query(ctx, `SELECT id,stream_id,relative_dir,local_date::text,files,bytes FROM nas_cleanup_day_units
+	rows, err := tx.Query(ctx, `SELECT id,stream_id,relative_dir,local_date::text,files,bytes,names FROM nas_cleanup_day_units
  WHERE plan_id=$1 AND state='pending' ORDER BY ordinal FOR UPDATE`, id)
 	if err != nil {
 		return err
@@ -542,7 +651,7 @@ func (s *Server) cleanupDayEnable(ctx context.Context, tx pgx.Tx, id int64, mode
 	var units []pending
 	for rows.Next() {
 		var p pending
-		if err := rows.Scan(&p.id, &p.unit.StreamID, &p.unit.RelativeDir, &p.unit.LocalDate, &p.unit.Files, &p.unit.Bytes); err != nil {
+		if err := rows.Scan(&p.id, &p.unit.StreamID, &p.unit.RelativeDir, &p.unit.LocalDate, &p.unit.Files, &p.unit.Bytes, &p.unit.Names); err != nil {
 			rows.Close()
 			return err
 		}
@@ -554,7 +663,7 @@ func (s *Server) cleanupDayEnable(ctx context.Context, tx pgx.Tx, id int64, mode
 	}
 	eligible := 0
 	for _, p := range units {
-		if _, err := cleanupDayCheck(ctx, tx, p.unit); err != nil {
+		if _, err := cleanupDayCheck(ctx, tx, p.unit, s.cfg.R2Bucket); err != nil {
 			if _, err := tx.Exec(ctx, `UPDATE nas_cleanup_day_units SET state='refused',refusal=$2,updated_at=now() WHERE id=$1`, p.id, err.Error()); err != nil {
 				return err
 			}
@@ -625,8 +734,8 @@ type nasCleanupDayPermit struct {
 	Timezone    string    `json:"timezone"`
 	Files       int64     `json:"files"`
 	Bytes       int64     `json:"bytes"`
-	// Mode and Entries go only to nasCleanupDayModesClientVersion; Entries
-	// only in names mode.
+	// Mode and Entries go only to nasCleanupDayModeVersions; Entries only in
+	// names mode.
 	Mode    nasCleanupDayMode    `json:"mode,omitempty"`
 	Entries []nasCleanupDayEntry `json:"entries,omitempty"`
 }
@@ -677,12 +786,14 @@ func (s *Server) handleAccountNASCleanupDayPermit(w http.ResponseWriter, r *http
 		var unitID int64
 		var permit nasCleanupDayPermit
 		var until time.Time
-		err = tx.QueryRow(ctx, `SELECT u.id,u.plan_id,p.plan_sha256,u.stream_id,u.relative_dir,u.local_date::text,u.files,u.bytes,p.approved_until
+		var names []nasCleanupDayName
+		// A Keep Everything unit goes only to a release that accepts it.
+		err = tx.QueryRow(ctx, `SELECT u.id,u.plan_id,p.plan_sha256,u.stream_id,u.relative_dir,u.local_date::text,u.files,u.bytes,u.names,p.approved_until
  FROM nas_cleanup_day_units u JOIN nas_cleanup_day_plans p ON p.id=u.plan_id
  WHERE p.mode='enabled' AND p.approved_until>clock_timestamp()+interval '1 minute' AND p.connection_id=$1
-  AND (u.state='pending' OR (u.state='permitted' AND u.permit_expires_at<=clock_timestamp()))
- ORDER BY u.plan_id,u.ordinal LIMIT 1 FOR UPDATE OF u SKIP LOCKED FOR SHARE OF p`, cid).Scan(&unitID, &permit.PlanID, &permit.PlanSHA,
-			&permit.StreamID, &permit.RelativeDir, &permit.LocalDate, &permit.Files, &permit.Bytes, &until)
+  AND (u.state='pending' OR (u.state='permitted' AND u.permit_expires_at<=clock_timestamp())) AND (u.names IS NULL OR $2)
+ ORDER BY u.plan_id,u.ordinal LIMIT 1 FOR UPDATE OF u SKIP LOCKED FOR SHARE OF p`, cid, req.ClientVersion == nasCleanupDayKEClientVersion).Scan(&unitID, &permit.PlanID, &permit.PlanSHA,
+			&permit.StreamID, &permit.RelativeDir, &permit.LocalDate, &permit.Files, &permit.Bytes, &names, &until)
 		if errors.Is(err, pgx.ErrNoRows) {
 			break
 		}
@@ -690,8 +801,8 @@ func (s *Server) handleAccountNASCleanupDayPermit(w http.ResponseWriter, r *http
 			util.WriteError(w, 500, "day cleanup unit unavailable")
 			return
 		}
-		unit := nasCleanupDayUnit{RelativeDir: permit.RelativeDir, LocalDate: permit.LocalDate, StreamID: permit.StreamID, Files: permit.Files, Bytes: permit.Bytes}
-		entries, err := cleanupDayCheck(ctx, tx, unit)
+		unit := nasCleanupDayUnit{RelativeDir: permit.RelativeDir, LocalDate: permit.LocalDate, StreamID: permit.StreamID, Files: permit.Files, Bytes: permit.Bytes, Names: names}
+		entries, err := cleanupDayCheck(ctx, tx, unit, s.cfg.R2Bucket)
 		if err != nil {
 			if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_day_units SET state='refused',refusal=$2,updated_at=now() WHERE id=$1`, unitID, err.Error()); err != nil {
 				util.WriteError(w, 500, "day cleanup refusal failed")
@@ -706,8 +817,8 @@ func (s *Server) handleAccountNASCleanupDayPermit(w http.ResponseWriter, r *http
 		}
 		permit.UnitID, permit.Token = unitID, hex.EncodeToString(secret)
 		permit.Timezone = cleanupEmbeddedPolicyWindow(permit.StreamID).Timezone
-		if req.ClientVersion == nasCleanupDayModesClientVersion {
-			permit.Mode = cleanupDayModeOf(permit.RelativeDir)
+		if slices.Contains(nasCleanupDayModeVersions, req.ClientVersion) {
+			permit.Mode = cleanupDayModeOf(unit)
 			if permit.Mode == nasCleanupDayNames {
 				permit.Entries = entries
 			}
