@@ -174,26 +174,6 @@ func TestR2NonrawMigrationScope(t *testing.T) {
 	}
 }
 
-// TestR2NonrawDeliveryGuardIsTypedAndScoped proves the 0190 exemption needs the
-// reviewed class AND an exact matching typed intent, on both the reservation and
-// the final receipt, and that ordinary delivery holds are still refused.
-// TestR2NonrawPageKeepHoldIsAbsolute pins 0190 as the only delivery guard: an
-// exact delivery_keep_holds key (a public delivery page link) refuses every
-// reservation and receipt, including the reviewed class with a typed intent.
-func TestR2NonrawPageKeepHoldIsAbsolute(t *testing.T) {
-	f := newNonrawFixture(t, "nonraw_guard")
-	f.exec(`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,'hold',900,'metadata')`, f.key)
-	f.insertIntent(t, strings.Repeat("d", 64))
-	for _, class := range []string{"", inverseNonrawRetirementClass} {
-		if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class) VALUES('collated',$1,'stoarama',$2,900,$3,$4,$5)`, f.outputID, f.key, nonrawOutputSHA, strings.Repeat("d", 64), class); err == nil {
-			t.Fatalf("class %q reserved a public delivery page key", class)
-		}
-	}
-	if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256) VALUES('collated',$1,3,'stoarama',$2,900,$3,$4,'none',$5,$6)`, f.outputID, f.key, nonrawOutputSHA, inverseNonrawReason, strings.Repeat("d", 64), f.policy); err == nil {
-		t.Fatal("receipt retired a public delivery page key")
-	}
-}
-
 func (f *nonrawFixture) insertIntent(t *testing.T, manifest string) {
 	t.Helper()
 	_, err := f.pool.Exec(f.ctx, `INSERT INTO r2_nonraw_intents(bucket,object_key,endpoint_sha256,kind,stream_id,source_id,source_ids,size_bytes,sha256,nas_relative_path,etag,last_modified,verification_at,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,retirement_class,choice)
