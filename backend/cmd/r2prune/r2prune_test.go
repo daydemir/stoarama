@@ -349,7 +349,7 @@ func TestReleaseWindowOnLiveEvidence(t *testing.T) {
 	files.nasEvidence = writeFile(t, dir, "evidence.tsv", strings.Join([]string{
 		ev("managed/acct-47/a_folder/innas.mp4", true, w0+2*day, w0+day), // fresh, stitched: delete
 		ev("managed/acct-47/a_folder/in.mp4", true, w0+2*day, w0+3*day),  // NAS file changed after verify
-		ev("managed/acct-47/a_folder/edge2.mp4", true, w0+2*day, 0),      // fresh but never stitched
+		ev("managed/acct-47/a_folder/edge2.mp4", true, w0+2*day, 0),      // fresh, never stitched: still deletable
 	}, "\n")+"\n")
 	if _, err := files.load(); err == nil {
 		t.Fatal("evidence without --release nas_keep_20 must refuse")
@@ -368,7 +368,7 @@ func TestReleaseWindowOnLiveEvidence(t *testing.T) {
 	for key, want := range map[string]class{
 		"managed/acct-47/a_folder/innas.mp4": deleteWindowOnNAS,
 		"managed/acct-47/a_folder/in.mp4":    protectWindowStale,
-		"managed/acct-47/a_folder/edge2.mp4": protectWindowUnjoined,
+		"managed/acct-47/a_folder/edge2.mp4": deleteWindowOnNAS,
 		"joined/best14-20261021/dup.mp4":     deleteDuplicateOfPageLink,
 		"joined/best14-20261021/kedup.mp4":   protectKeepEverything,
 		"joined/best14-20261021/old.mp4":     deleteCollatedOutsideWindow,

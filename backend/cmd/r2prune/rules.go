@@ -29,7 +29,6 @@ const (
 	protectWindowOnNAS    class = "protect_window_20d_on_nas"
 	protectWindowNotOnNAS class = "protect_window_20d_not_on_nas"
 	protectWindowStale    class = "protect_window_20d_nas_evidence_stale"
-	protectWindowUnjoined class = "protect_window_20d_not_yet_stitched"
 	protectStitchClosure  class = "protect_window_stitch_closure"
 	protectNASPipeline    class = "protect_nas_pipeline"
 	protectRecentWrite    class = "protect_recent_write"
@@ -683,8 +682,8 @@ func (r *rules) decide(o object) (class, string) {
 
 // decideWindowOnEvidence judges a 20-day key once the controller's window
 // hold is lifted: it goes only on live exact NAS custody verified after both
-// the NAS file and the R2 object last changed, and a RAW clip only once it is
-// already a source of a stitched output (otherwise it may still need stitching).
+// the NAS file and the R2 object last changed. Keep-20 stitching runs from the
+// NAS copy, so no stitch condition holds the R2 copy.
 func (r *rules) decideWindowOnEvidence(o object, k kind, catalogOnNAS bool) (class, string) {
 	e, ok := r.Evidence[o.Key]
 	switch {
@@ -696,8 +695,6 @@ func (r *rules) decideWindowOnEvidence(o object, k kind, catalogOnNAS bool) (cla
 		return protectWindowStale, "nas_file_changed_after_verify"
 	case e.Verified < o.MTime:
 		return protectWindowStale, "r2_object_changed_after_verify"
-	case k == kindRaw && !r.Closure[o.Key]:
-		return protectWindowUnjoined, string(k)
 	}
 	if rule, ok := r.Keys[o.Key]; ok {
 		return rule.Class, rule.Reason
