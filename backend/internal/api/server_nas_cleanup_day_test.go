@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	osexec "os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -238,8 +239,40 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 	}
 	exec(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM delivery_nas_source_holds; COMMIT`)
 
-	s := &Server{pool: pool, cfg: config.Config{NASCleanupDeletionEnabled: true}}
 	units := []nasCleanupDayUnit{unit("2026-09-12", 2, 300), unit("2026-10-10", 1, 500)}
+	// The preparer's shipping query and unit rule select exactly these units.
+	python := os.Getenv("STOARAMA_TEST_PYTHON")
+	if python == "" {
+		python = "python3"
+	}
+	script := `import json, sys
+sys.path.insert(0, "../../scripts/nas-cleanup")
+import prepare_keep28_plans as k
+w = k.load_policy(k.POLICY_PATH)[3]
+if sys.argv[1] == "sql":
+    k.query = lambda sql, psql: print(sql)
+    k.day_stream_rows(w, "psql")
+else:
+    print(json.dumps(k.day_units(w, k.load_folders(), json.load(sys.stdin))))`
+	sql, err := osexec.Command(python, "-B", "-c", script, "sql").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var facts []byte
+	if err := pool.QueryRow(ctx, string(sql)).Scan(&facts); err != nil {
+		t.Fatal(err)
+	}
+	prepare := osexec.Command(python, "-B", "-c", script, "units")
+	prepare.Stdin = bytes.NewReader(facts)
+	prepared, err := prepare.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var preparedUnits []nasCleanupDayUnit
+	if err := json.Unmarshal(prepared, &preparedUnits); err != nil || fmt.Sprint(preparedUnits) != fmt.Sprint(units) {
+		t.Fatalf("preparer units %s differ from %v (%v)", prepared, units, err)
+	}
+	s := &Server{pool: pool, cfg: config.Config{NASCleanupDeletionEnabled: true}}
 	sha := cleanupDayDigest(units)
 	create := map[string]any{"label": "kday-s3-0001", "policy_sha256": cleanupPolicySHA, "plan_sha256": sha, "files": 3, "bytes": 800, "units": units}
 	if w := dayCall(s.handleServiceNASCleanupDayCreate, "", map[string]any{"label": "kday-s3-bad", "policy_sha256": cleanupPolicySHA,
