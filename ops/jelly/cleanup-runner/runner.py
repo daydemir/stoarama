@@ -431,7 +431,6 @@ class Runner:
         self.windows = {}
         self.status = {'current_plan': None, 'last_error': None}
         self.abort_base = None
-        self.day_done = set()  # Streams whose day proposal repeats a retired plan; this run only.
 
     def start(self):
         # Collection sees either the old idle state or the new flock+PID, never
@@ -583,11 +582,6 @@ class Runner:
                         and isinstance(evidence['label'], str) and evidence['label'].startswith(prefix)
                         and isinstance(evidence['reason'], str) and len(evidence['reason']) <= 2048,
                         'invalid atomic admission rejection evidence')
-                if '--day-plans' in args and self.day_digest_retired(out / (evidence['label'] + '.json')):
-                    # Re-proposing a stream whose plan already completed repeats its digest.
-                    self.day_done.add(sid)
-                    self.note('day_stream_done', stream_id=sid)
-                    return False
                 excluded = dict(self.status.get('excluded_streams') or {})
                 excluded[str(sid)] = evidence
                 self.save(self.status.get('phase', 'dry_run'), excluded_streams=excluded)
@@ -597,13 +591,7 @@ class Runner:
         return True
 
     def stream_ready(self, sid):
-        return str(sid) not in (self.status.get('excluded_streams') or {}) and sid not in self.day_done
-
-    def day_digest_retired(self, proposal):
-        digest = json.loads(proposal.read_text())['plan_sha256']
-        require(re.fullmatch('[a-f0-9]{64}', digest), 'invalid day proposal digest')
-        return self.query("SELECT coalesce(bool_and(mode='retired'),false) FROM nas_cleanup_day_plans WHERE account_id=47 "
-                          "AND connection_id=13 AND plan_sha256='" + digest + "'", 'day plan query')
+        return str(sid) not in (self.status.get('excluded_streams') or {})
 
     def query(self, sql, step='catalog query'):
         self.preparer()
@@ -643,8 +631,7 @@ class Runner:
             try:
                 return self.api('POST', 'day-plans/%d/%s' % (pid, action), body)
             except (MutationUnconfirmed, RequestConflict) as exc:
-                refused = isinstance(exc, RequestConflict)
-                self.step_failed('day plan ' + action + ' unconfirmed', str(exc))
+                refused, error = isinstance(exc, RequestConflict), str(exc)
             try:
                 p = self.call('GET', 'day-plans/%d' % pid)
             except ReadFailure:
@@ -652,6 +639,7 @@ class Runner:
             if p and p['id'] == pid and p['plan_sha256'] == body['plan_sha256'] and p['mode'] == target:
                 return p
             if refused or delay is None:
+                self.step_failed('day plan ' + action + ' unconfirmed', error)
                 raise Halt('day plan ' + action + ' not confirmed')
             time.sleep(delay)
 
@@ -680,12 +668,9 @@ class Runner:
     def step_failed(self, step, reason=None):
         # Callers supply fixed step names, never URLs, SQL, or exception text.
         critical('STEP FAILED: ' + step)
-        self.note('step_failed', step=step, **({'reason': reason} if reason else {}))
-
-    def note(self, phase, **values):
         try:
             with (self.root / 'runner.jsonl').open('a') as f:
-                f.write(json.dumps({'at': utcnow().isoformat(), 'phase': phase, **values}) + '\n')
+                f.write(json.dumps({'at': utcnow().isoformat(), 'phase': 'step_failed', 'step': step, **({'reason': reason} if reason else {})}) + '\n')
         except Exception:
             pass  # Diagnostics must never block shutdown, even before initialize().
 

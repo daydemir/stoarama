@@ -320,7 +320,6 @@ class FakeRunner(r.Runner):
         self.finish_state.mkdir()
         self.picks = [42, None]
         self.owner_validated = True
-        self.day_done = set()
 
     def finish_admission(self): return FINISH_ADMISSION
     def _finish_health(self, admission): return {'active': {}}
@@ -1753,35 +1752,6 @@ class DayReconcileTests(unittest.TestCase):
             job.run_day()
             self.assertEqual(job.events, ['idle', 'idle', 'day-plans/77/control', 'day-plans/77/control', 'day-plans/77/close'])
             self.assertEqual((job.day['mode'], job.status['phase']), ('retired', 'day_complete'))
-
-    def test_repeat_of_a_retired_day_plan_marks_the_stream_done_without_failure(self):
-        for retired in (True, False):
-            with self.subTest(retired=retired), tempfile.TemporaryDirectory() as root, patch.object(r.sys, 'stderr', new=io.StringIO()) as err:
-                job = FakeDayRunner(root)
-                job.repo = Path(__file__).resolve().parents[3]
-                job.windows = dict.fromkeys([3, 4])
-                digest = 'e' * 64
-                job.query = lambda sql, *a: retired if digest in sql else []
-                admitted = []
-                def prepare(args, **kwargs):
-                    sid = args[args.index('--stream') + 1]
-                    out = Path(args[args.index('--out') + 1]); out.mkdir(parents=True)
-                    label = args[args.index('--label-prefix') + 1] + '-s' + sid + '-day-0001'
-                    if sid == '4':
-                        admitted.append(sid)
-                        (out / 'summary.json').write_text(json.dumps(dict(receipts=[dict(id=12, label=label)])))
-                        return
-                    (out / (label + '.json')).write_text(json.dumps(dict(label=label, plan_sha256=digest)))
-                    (out / 'admission-rejected.json').write_text(json.dumps(dict(http_status=409, stream_id=3, label=label,
-                        reason='{"error":"day cleanup plan label or digest already admitted"}', rejected_at_epoch=1)))
-                    raise r.CommandFailed(5)
-                with patch.object(r, 'command', side_effect=prepare):
-                    self.assertEqual(r.Runner.day_pick(job), 12)
-                self.assertEqual(admitted, ['4'])
-                self.assertFalse(job.stream_ready(3))
-                self.assertEqual(job.day_done == {3}, retired)
-                self.assertEqual('3' in job.status.get('excluded_streams', {}), not retired)
-                self.assertEqual('STEP FAILED' in err.getvalue(), not retired)
 
 
 if __name__ == '__main__': unittest.main()

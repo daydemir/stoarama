@@ -589,3 +589,35 @@ func TestNASCleanupDayFlatDirectoryHoldsOnlyItsNamedDay(t *testing.T) {
 		t.Fatalf("undated name in the flat directory escaped: %v", err)
 	}
 }
+
+// Close retires never-permitted units, so a retired plan's digest must not
+// block admitting the same directory-days again; a live plan's still does.
+func TestNASCleanupDayRetiredDigestIsAdmissibleAgain(t *testing.T) {
+	pool, _, clip := dayFixture(t)
+	clip(1, "2026-09-12", "103000", 100, dayAt("2026-09-12", "103000"), dayAt("2026-09-12", "103100"))
+	units := []nasCleanupDayUnit{{RelativeDir: dayPlazaDir(dayFixtureFolder, dayDate("2026-09-12")), LocalDate: "2026-09-12", StreamID: 3, Files: 1, Bytes: 100}}
+	sha := cleanupDayDigest(units)
+	s := &Server{pool: pool, cfg: config.Config{NASCleanupDeletionEnabled: true}}
+	create := func(label string) *httptest.ResponseRecorder {
+		return dayCall(s.handleServiceNASCleanupDayCreate, "", map[string]any{"label": label, "policy_sha256": cleanupPolicySHA,
+			"plan_sha256": sha, "files": 1, "bytes": 100, "units": units})
+	}
+	w := create("kday-a")
+	if w.Code != 200 {
+		t.Fatalf("admission: %d %s", w.Code, w.Body)
+	}
+	var first struct{ ID int64 }
+	json.Unmarshal(w.Body.Bytes(), &first)
+	if w := create("kday-b"); w.Code != 409 {
+		t.Fatalf("live digest admitted twice: %d %s", w.Code, w.Body)
+	}
+	if w := dayCall(s.handleServiceNASCleanupDayClose, fmt.Sprint(first.ID), map[string]any{"plan_sha256": sha, "reason": "fixture"}); w.Code != 200 {
+		t.Fatalf("close: %d %s", w.Code, w.Body)
+	}
+	if w := create("kday-c"); w.Code != 200 {
+		t.Fatalf("retired digest blocked re-admission: %d %s", w.Code, w.Body)
+	}
+	if w := create("kday-c"); w.Code != 409 {
+		t.Fatalf("label admitted twice: %d %s", w.Code, w.Body)
+	}
+}

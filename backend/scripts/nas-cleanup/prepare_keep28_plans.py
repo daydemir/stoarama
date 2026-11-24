@@ -382,8 +382,8 @@ def day_stream_rows(w, psql):
    AND f.state='present' AND f.relative_path=c.display_path),-1))),'[]')
   FROM recordings r JOIN recording_clips c ON c.recording_id=r.id
   WHERE r.account_id=47 AND r.stream_id=""" + str(sid) + """ AND c.display_path<>''),
- 'live',(SELECT coalesce(json_agg(json_build_array(u.relative_dir,u.local_date::text)),'[]') FROM nas_cleanup_day_units u
-  WHERE u.stream_id=""" + str(sid) + """ AND u.state IN ('pending','permitted')),
+ 'claimed',(SELECT coalesce(json_agg(json_build_array(u.relative_dir,u.local_date::text)),'[]') FROM nas_cleanup_day_units u
+  WHERE u.stream_id=""" + str(sid) + """ AND u.state IN ('pending','permitted','deleted')),
  'held_dirs',(SELECT coalesce(json_agg(DISTINCT regexp_replace(h.relative_path,'/[^/]*$','')),'[]')
   FROM delivery_keep_holds h WHERE h.relative_path<>''),
  'keep20_active',EXISTS(SELECT 1 FROM nas_media_keep20_epoch WHERE connection_id=13))""", psql)
@@ -397,7 +397,8 @@ def day_units(w, folders, facts):
     zone = zoneinfo.ZoneInfo(w['tz'])
     start = datetime.datetime.fromisoformat(w['keep_start_utc'])
     end = datetime.datetime.fromisoformat(w['keep_end_utc'])
-    live = {tuple(x) for x in facts['live']}
+    # Live units, and deleted ones: the inventory lists deleted files as present until the next NAS rescan.
+    claimed = {tuple(x) for x in facts['claimed']}
     held_dirs = set(facts['held_dirs'])
     groups, refused = defaultdict(list), set()
     for path, a, b, held, size in facts['clips']:
@@ -412,7 +413,7 @@ def day_units(w, folders, facts):
     units = []
     for (directory, date), clips in sorted(groups.items(), key=lambda g: (g[0][1], g[0][0])):
         present = [size for _, _, _, size in clips if size >= 0]
-        if (directory in refused or directory in held_dirs or (directory, date.isoformat()) in live or not present
+        if (directory in refused or directory in held_dirs or (directory, date.isoformat()) in claimed or not present
                 or not day_outside(w, date) or any(held or not (b > a) or (a < end and b > start) for a, b, held, _ in clips)):
             continue
         units.append({'relative_dir': directory, 'local_date': date.isoformat(), 'stream_id': sid,

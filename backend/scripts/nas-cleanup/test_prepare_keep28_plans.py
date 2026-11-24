@@ -298,8 +298,8 @@ class DayPlanTests(unittest.TestCase):
         self.folders = k.load_folders()
         self.d = k.datetime.date
 
-    def facts(self, *clips, live=(), held_dirs=()):
-        return dict(clips=list(clips), live=[list(x) for x in live], held_dirs=list(held_dirs), keep20_active=True)
+    def facts(self, *clips, claimed=(), held_dirs=()):
+        return dict(clips=list(clips), claimed=[list(x) for x in claimed], held_dirs=list(held_dirs), keep20_active=True)
 
     def test_units_are_outside_unheld_non_keep_everything_directory_days(self):
         out = self.d(2026, 9, 12)
@@ -309,7 +309,7 @@ class DayPlanTests(unittest.TestCase):
         units = k.day_units(self.policy[3], self.folders, facts)
         self.assertEqual([(u['local_date'], u['files'], u['bytes']) for u in units], [('2026-09-12', 2, 30), ('2026-10-07', 1, 5)])
         self.assertEqual(units[0]['relative_dir'], '99991_asia_japan_tokyo_shinjuku9/September/12-Saturday')
-        self.assertEqual(k.day_units(self.policy[3], self.folders, self.facts(clip(out), live=[(units[0]['relative_dir'], '2026-09-12')])), [])
+        self.assertEqual(k.day_units(self.policy[3], self.folders, self.facts(clip(out), claimed=[(units[0]['relative_dir'], '2026-09-12')])), [])
         self.assertEqual(k.day_units(self.policy[3], self.folders, self.facts(clip(out), held_dirs=[units[0]['relative_dir']])), [])
         self.assertEqual(k.day_units(self.policy[3], self.folders, dict(self.facts(clip(out)), keep20_active=False)), [])
 
