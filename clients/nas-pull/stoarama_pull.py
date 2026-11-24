@@ -3230,6 +3230,8 @@ CLEANUP_FOLDER_STREAMS_JSON = """{
 # server budget, with a file cap high enough that bytes are the binding limit.
 CLEANUP_MAX_FILES_24H = 400_000
 CLEANUP_MAX_BYTES_24H = 5_000_000_000_000  # 5 TB
+# Deniz lifted the daily NAS cleanup limit for the bulk NAS-only release
+# (cleanup_cap_exceeded). Deletions are still recorded for accounting.
 CLEANUP_MAX_COLLATED_SECONDS = 7200
 CLEANUP_LEDGER_NAME = "cleanup-deletions.jsonl"
 CLEANUP_MONTHS = ("January", "February", "March", "April", "May", "June", "July",
@@ -17527,6 +17529,10 @@ def cleanup_cap_totals(inventory):
     return files, total
 
 
+def cleanup_cap_exceeded(files, total):
+    return CLIENT_VERSION != FAST_COPY_CLIENT_VERSION and (files > CLEANUP_MAX_FILES_24H or total > CLEANUP_MAX_BYTES_24H)
+
+
 def cleanup_local_caps(inventory, size_bytes, reserve=None):
     """Refuse beyond the hard local rolling-24h caps; optionally reserve one deletion."""
     if type(size_bytes) is not int or size_bytes <= 0:
@@ -17535,7 +17541,7 @@ def cleanup_local_caps(inventory, size_bytes, reserve=None):
         try:
             inventory.db.execute("BEGIN IMMEDIATE")
             files, total = cleanup_cap_totals(inventory)
-            if files + 1 > CLEANUP_MAX_FILES_24H or total + size_bytes > CLEANUP_MAX_BYTES_24H:
+            if cleanup_cap_exceeded(files + 1, total + size_bytes):
                 inventory.db.commit()
                 return "local 24h deletion cap reached (%d files, %d bytes)" % (files, total)
             if reserve is not None:
@@ -18717,6 +18723,8 @@ def cleanup_local_headroom(inventory):
         except BaseException:
             inventory.db.rollback()
             raise
+    if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION:
+        return CLEANUP_V2_LEASE, 1 << 62
     return CLEANUP_MAX_FILES_24H - files, CLEANUP_MAX_BYTES_24H - total
 
 
@@ -18926,7 +18934,7 @@ def cleanup_reserve_group_caps(inventory, tasks):
             files, total = cleanup_cap_totals(inventory)
             sizes = [task["item"]["size_bytes"] for task in tasks]
             if (any(type(size) is not int or size <= 0 for size in sizes)
-                    or files + len(tasks) > CLEANUP_MAX_FILES_24H or total + sum(sizes) > CLEANUP_MAX_BYTES_24H):
+                    or cleanup_cap_exceeded(files + len(tasks), total + sum(sizes))):
                 raise CleanupPermitRefused("local_guard", "local 24h deletion cap reached")
             reservations = [inventory.db.execute(
                 "INSERT INTO cleanup_local_deletions(item_id,plan_sha256,relative_path,size_bytes,at_epoch) VALUES(?,?,?,?,?)",
@@ -19415,6 +19423,272 @@ class CleanupPreflight:
             self.pool.shutdown(wait=True)
 
 
+# ---------------------------------------------------------------------------
+# Bulk NAS-only day-directory cleanup (the fast-copy release only).
+#
+# Owner (Deniz), verbatim: "if its outside of keep everything, then a nas copy
+# only needs to be checked if its in the keep 20? otherwise it can be deleted
+# right?"; "yes, delete". The server permits one stream-day of raw footage in
+# one directory. Before unlinking anything this client re-checks, from its own
+# pins only: folder -> stream, the stream is not Keep Everything, and the whole
+# local day lies outside the pinned 20-day window with a one-day guard band.
+# It then deletes that day's media and sidecars in one pass under one durable
+# intent and reports one receipt. There is no R2 check and no local daily cap.
+
+CLEANUP_DAY_PERMIT_PATH = "/account/connections/cleanup/day-permit"
+CLEANUP_DAY_RECEIPT_PATH = "/account/connections/cleanup/day-receipt"
+CLEANUP_DAY_PERMIT_MARGIN_SEC = 30
+CLEANUP_DAY_SIDECAR = ".stoarama.json"
+CLEANUP_DAY_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+CLEANUP_DAY_PLAZA_DIR_RE = re.compile(r"(?:[^/]+/)+(%s)/(0[1-9]|[12][0-9]|3[01])-(%s)" % (
+    "|".join(CLEANUP_MONTHS), "|".join(CLEANUP_DAY_WEEKDAYS)))
+CLEANUP_DAY_FLAT_DIR_RE = re.compile(r"(?:[^/]+/)+[1-9][0-9]*/(continuous|[1-9][0-9]*)")
+CLEANUP_DAY_PLAZA_FILE_RE = re.compile(r"[^/]*_(20[0-9]{2})_(%s)_W([1-6])_(%s)_hour_(?:[0-9]{2}|[0-9]{6})\.mp4" % (
+    "|".join(CLEANUP_MONTHS), "|".join(CLEANUP_DAY_WEEKDAYS)))
+CLEANUP_DAY_SECONDS_RE = re.compile(r"([1-9][0-9]{9})\.mp4")
+CLEANUP_DAY_MILLIS_RE = re.compile(r"([1-9][0-9]{12})\.mp4")
+
+
+class CleanupDayOutcome(str, Enum):
+    DELETED = "deleted"
+    PARTIAL = "partial"
+    REFUSED = "refused"
+
+
+def cleanup_day_file_date(directory, name, zone):
+    """Local date a raw media name in directory names, or None (server and preparer share the rule)."""
+    plaza = CLEANUP_DAY_PLAZA_DIR_RE.fullmatch(directory)
+    if plaza:
+        named = CLEANUP_DAY_PLAZA_FILE_RE.fullmatch(name)
+        if not named or named.group(2) != plaza.group(1) or named.group(4) != plaza.group(3):
+            return None
+        day = int(plaza.group(2))
+        try:
+            date = datetime.date(int(named.group(1)), CLEANUP_MONTHS.index(plaza.group(1)) + 1, day)
+        except ValueError:
+            return None
+        if CLEANUP_DAY_WEEKDAYS[date.weekday()] != plaza.group(3) or (day - 1) // 7 + 1 != int(named.group(3)):
+            return None
+        return date
+    flat = CLEANUP_DAY_FLAT_DIR_RE.fullmatch(directory)
+    if not flat:
+        return None
+    named = (CLEANUP_DAY_SECONDS_RE if flat.group(1) == "continuous" else CLEANUP_DAY_MILLIS_RE).fullmatch(name)
+    if not named:
+        return None
+    seconds = int(named.group(1)) / (1 if flat.group(1) == "continuous" else 1000)
+    return datetime.datetime.fromtimestamp(seconds, zone).date()
+
+
+def cleanup_day_refusal(permit, pins, now):
+    """None when this client independently confirms the directory-day may leave the NAS."""
+    try:
+        directory, stream = permit["relative_dir"], permit["stream_id"]
+        parts = directory.split("/") if isinstance(directory, str) else []
+        if (not parts or parts[0] == JOINED_ROOT or "\\" in directory or "\x00" in directory
+                or any(part in ("", ".", "..") for part in parts)):
+            return "invalid NAS directory"
+        if not (CLEANUP_DAY_PLAZA_DIR_RE.fullmatch(directory) or CLEANUP_DAY_FLAT_DIR_RE.fullmatch(directory)):
+            return "directory is not a dated raw NAS layout"
+        pinned = pins["folders"].get(cleanup_folder_key(directory + "/media", "raw"))
+        if pinned is None or type(stream) is not int or pinned != stream:
+            return "pinned folder map does not assign %r to stream %r" % (directory, stream)
+        if stream in pins["keep_everything"]:
+            return "stream %d is pinned Keep Everything" % stream
+        keep_start, keep_end, timezone = pins["windows"][stream]
+        if permit.get("timezone") != timezone:
+            return "permit timezone differs from the pinned window"
+        zone = ZoneInfo(timezone)
+        day = datetime.date.fromisoformat(permit["local_date"])
+        plaza = CLEANUP_DAY_PLAZA_DIR_RE.fullmatch(directory)
+        if plaza and (CLEANUP_MONTHS[day.month - 1] != plaza.group(1) or day.day != int(plaza.group(2))
+                      or CLEANUP_DAY_WEEKDAYS[day.weekday()] != plaza.group(3)):
+            return "directory does not name the permitted date"
+        first, last = keep_start.astimezone(zone).date(), keep_end.astimezone(zone).date()
+        if first - datetime.timedelta(days=2) < day < last + datetime.timedelta(days=1):
+            return "day %s is inside or adjacent to stream %d keep window %s..%s" % (day, stream, first, last)
+        expires = parse_certification_timestamp(permit["permit_expires_at"], "day permit expiry")
+        if (expires - now).total_seconds() <= CLEANUP_DAY_PERMIT_MARGIN_SEC:
+            return "day permit expires too soon"
+        return None
+    except Exception as exc:
+        return "day permit check failed: %s" % str(exc)[:200]
+
+
+def cleanup_day_open(root, directory):
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(str(root), flags)
+    try:
+        for part in directory.split("/"):
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def cleanup_day_select(descriptor, permit):
+    """(files, None) for the permitted day's media and sidecars, or (None, refusal)."""
+    zone = ZoneInfo(permit["timezone"])
+    day = datetime.date.fromisoformat(permit["local_date"])
+    files = []
+    with os.scandir(descriptor) as entries:
+        for entry in entries:
+            name = entry.name
+            media = name[:-len(CLEANUP_DAY_SIDECAR)] if name.endswith(".mp4" + CLEANUP_DAY_SIDECAR) else name
+            if name.startswith(".") or not media.endswith(".mp4"):
+                continue  # Hidden partials and unrelated files stay.
+            info = entry.stat(follow_symlinks=False)
+            if not stat_module.S_ISREG(info.st_mode):
+                return None, "non-regular media entry %r" % name
+            named = cleanup_day_file_date(permit["relative_dir"], media, zone)
+            if named is None:
+                return None, "media name %r does not name a local date" % name
+            if named == day:
+                files.append([name, info.st_size, name != media])
+    return sorted(files), None
+
+
+def cleanup_day_receipt(descriptor, intent, outcome=None, refusal=""):
+    """Account the intent's files: those now absent were unlinked under the permit."""
+    receipt = dict(unit_id=intent["unit_id"], attempt=intent["attempt"], permit_token=intent["permit_token"],
+                   client_version=CLIENT_VERSION, media_files=0, media_bytes=0, sidecar_files=0, sidecar_bytes=0,
+                   remaining_files=0, refusal=refusal)
+    for name, size, sidecar in intent.get("files", ()):
+        try:
+            os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            receipt["remaining_files"] += 1
+        except FileNotFoundError:
+            kind = "sidecar" if sidecar else "media"
+            receipt[kind + "_files"] += 1
+            receipt[kind + "_bytes"] += size
+    receipt["outcome"] = (outcome or (CleanupDayOutcome.PARTIAL if receipt["remaining_files"] else CleanupDayOutcome.DELETED)).value
+    return receipt
+
+
+def cleanup_day_journal(inventory, unit_id, phase=None, body=None):
+    with inventory.lock:
+        try:
+            inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_day_receipts(unit_id INTEGER PRIMARY KEY,phase TEXT NOT NULL,body TEXT NOT NULL)")
+            if unit_id is None:
+                rows = inventory.db.execute("SELECT unit_id,phase,body FROM cleanup_day_receipts ORDER BY unit_id").fetchall()
+            elif phase is None:
+                inventory.db.execute("DELETE FROM cleanup_day_receipts WHERE unit_id=?", (unit_id,))
+            else:
+                inventory.db.execute("INSERT INTO cleanup_day_receipts VALUES(?,?,?) ON CONFLICT(unit_id) DO UPDATE SET phase=excluded.phase,body=excluded.body",
+                                     (unit_id, phase, cleanup_json_bytes(body).decode()))
+            inventory.db.commit()
+        except BaseException:
+            inventory.db.rollback()
+            raise
+    return rows if unit_id is None else None
+
+
+def cleanup_day_finish(cfg, inventory, receipt):
+    """Journal, ledger and send one receipt; the journal clears only on an acknowledgment."""
+    cleanup_day_journal(inventory, receipt["unit_id"], "receipt", receipt)
+    cleanup_ledger_append(cfg, dict({k: v for k, v in receipt.items() if k != "permit_token"},
+                                    event="day_receipt", at=utc_now_precise()))
+    try:
+        cleanup_api_retry(cfg, CLEANUP_DAY_RECEIPT_PATH, receipt)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (408, 429) or exc.code >= 500:
+            raise
+        # A definite rejection is evidence for the operator, never retried.
+        cleanup_ledger_append(cfg, dict(unit_id=receipt["unit_id"], attempt=receipt["attempt"], http_status=exc.code,
+                                        event="day_receipt_rejected", at=utc_now_precise()))
+    cleanup_day_journal(inventory, receipt["unit_id"])
+    CLEANUP_STATUS.add("day_" + receipt["outcome"])
+
+
+def cleanup_day_replay(cfg, inventory):
+    """Resend unacknowledged receipts; an interrupted pass is accounted from disk."""
+    for unit_id, phase, body in cleanup_day_journal(inventory, None):
+        record = json.loads(body)
+        if phase == "intent":
+            try:
+                descriptor = cleanup_day_open(cfg.output_dir, record["relative_dir"])
+            except FileNotFoundError:
+                record = dict(record, files=[])  # Whole directory gone: nothing remains.
+                descriptor = None
+            try:
+                record = cleanup_day_receipt(descriptor, record)
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+        cleanup_day_finish(cfg, inventory, record)
+
+
+def cleanup_day_run(cfg, inventory, stop_event, permit):
+    """Delete one permitted directory-day in a single pass, or refuse it."""
+    base = dict(unit_id=permit["unit_id"], attempt=permit["attempt"], permit_token=permit["permit_token"])
+    pins, error = cleanup_pins()
+    refusal = ("pinned keep-window files failed verification: %s" % error if error is not None else
+               cleanup_day_refusal(permit, pins, datetime.datetime.now(datetime.timezone.utc)))
+    descriptor = None
+    try:
+        if refusal is None:
+            try:
+                descriptor = cleanup_day_open(cfg.output_dir, permit["relative_dir"])
+            except FileNotFoundError:
+                descriptor = None
+            except OSError as exc:
+                refusal = "directory unavailable: %s" % type(exc).__name__
+        files = []
+        if refusal is None and descriptor is not None:
+            files, refusal = cleanup_day_select(descriptor, permit)
+        if refusal is not None:
+            cleanup_day_finish(cfg, inventory, cleanup_day_receipt(None, base, CleanupDayOutcome.REFUSED, refusal[:500]))
+            return
+        intent = dict(base, plan_id=permit["plan_id"], plan_sha256=permit["plan_sha256"], relative_dir=permit["relative_dir"],
+                      local_date=permit["local_date"], stream_id=permit["stream_id"], files=files, client_version=CLIENT_VERSION)
+        cleanup_ledger_append(cfg, dict({k: v for k, v in intent.items() if k != "permit_token"}, event="day_intent",
+                                        file_count=len(files), bytes=sum(size for _, size, _ in files), at=utc_now_precise()))
+        cleanup_day_journal(inventory, permit["unit_id"], "intent", intent)
+        expires = parse_certification_timestamp(permit["permit_expires_at"], "day permit expiry")
+
+        def unlink_pass():
+            for name, _, _ in files:
+                if (expires - datetime.datetime.now(datetime.timezone.utc)).total_seconds() <= CLEANUP_DAY_PERMIT_MARGIN_SEC:
+                    break  # Never unlink past the permit; the rest is a partial receipt.
+                try:
+                    os.unlink(name, dir_fd=descriptor)
+                except FileNotFoundError:
+                    pass
+            os.fsync(descriptor)
+
+        if descriptor is not None:
+            lane = CleanupExecutionLane(stop_event)
+            try:
+                lane.run(unlink_pass)
+            finally:
+                lane.close()
+        cleanup_day_finish(cfg, inventory, cleanup_day_receipt(descriptor, intent))
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def cleanup_day_cycle(cfg, inventory, stop_event):
+    """Replay day receipts, then run at most one day permit. True when a unit ran."""
+    cleanup_day_replay(cfg, inventory)
+    if cfg.dry_run or stop_event.is_set():
+        return False
+    response = cleanup_api_retry(cfg, CLEANUP_DAY_PERMIT_PATH, {"client_version": CLIENT_VERSION})
+    permit = response.get("unit") if isinstance(response, dict) else None
+    if permit is None:
+        return False
+    if (not isinstance(permit, dict) or any(type(permit.get(key)) is not int or permit[key] <= 0
+                                            for key in ("unit_id", "plan_id", "attempt", "stream_id"))
+            or not re.fullmatch(r"[a-f0-9]{64}", str(permit.get("permit_token"))) or not isinstance(permit.get("relative_dir"), str)
+            or not isinstance(permit.get("local_date"), str) or not isinstance(permit.get("permit_expires_at"), str)):
+        raise CleanupResponseError("invalid day cleanup permit")
+    cleanup_day_run(cfg, inventory, stop_event, permit)
+    return True
+
+
 def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
     wait = 15
     v2_after = 0.0
@@ -19426,6 +19700,14 @@ def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
         try:
             while not stop_event.wait(wait):
                 v2 = time.monotonic() >= v2_after
+                if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION:
+                    try:
+                        if cleanup_day_cycle(cfg, inventory, stop_event):
+                            wait = 0
+                            continue
+                    except Exception as exc:
+                        log("WARN", "NAS day cleanup deferred: %s" % exc)
+                        CLEANUP_STATUS.fail("day: %s: %s" % (type(exc).__name__, exc))
                 try:
                     retry = None
                     if v2:
