@@ -78,8 +78,8 @@ Collation v2 records each part in `recording_collation_outputs`
 pulls those rows directly:
 
 1. `GET /api/v1/account/collated?after_id=0&limit=50` returns `policy`, `items`,
-   and `next_after_id`. Each request examines at most 1,000 account-scoped
-   candidates in output-ID order and applies the delivery fence to at most 10 held outputs, under a two-second PostgreSQL statement and three-second request budget. Eligibility
+   and `next_after_id`. Each request examines at most 20,000 account-scoped
+   candidates in output-ID order and applies the delivery fence to at most 50 eligible outputs, under a two-second PostgreSQL statement and three-second request budget. Eligibility
    and backoff can produce an empty page with a nonzero cursor. Advance that
    cursor even on empty pages; zero means exhausted. Start a fresh scan at zero
    after exhaustion, so expired backoff and late old-hour publications are retried.
@@ -91,10 +91,15 @@ pulls those rows directly:
    size and SHA-256, fsyncs, links it into place without overwriting, and
    `POST /api/v1/account/collated/ack` records the exact identity.
 
-Scope: only outputs collated from clips held for collated-only delivery
+Scope: outputs collated from clips held for collated-only delivery
 (storage contract mode `nas_collated_hold`, see docs/NAS_COLLATED_DELIVERY.md)
-are offered. Outputs of raw-delivered footage, such as the good+ backfill,
-stay in R2 because the NAS already has their raw clips.
+are offered. Under the 20-day NAS epoch, connection 13 is also offered every
+output that overlaps its stream's pinned window (Keep Everything included,
+migration 0245), so the NAS reuses what is already stitched instead of
+re-stitching it; the ACK is the R2 lane's name+size evidence. These in-window
+offers pause while the NAS's last free-space report (at most five minutes old)
+is below the R2->NAS copy floor plus 64 GiB, so collated never starves raw copy.
+Other outputs of raw-delivered footage stay in R2.
 
 The policy (per connection, server-controlled): enabled, bytes/s budget,
 parallel downloads. It runs concurrently with raw delivery, so neither lane can

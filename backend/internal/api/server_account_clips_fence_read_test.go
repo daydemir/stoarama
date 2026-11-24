@@ -226,6 +226,60 @@ CREATE TABLE nas_stitch_scopes(id bigint GENERATED ALWAYS AS IDENTITY,stream_id 
  jsonb_build_object('stream_id',3,'clips',jsonb_build_array(jsonb_build_object('start_at',$1::timestamptz,'end_at',$1::timestamptz+interval '1 minute'))))`, oldWindow.Start); err == nil {
 		t.Fatal("old-day stitch plan admitted after activation")
 	}
+
+	// 0245: Keep Everything windows are pinned too. Their in-window collated
+	// outputs and copy items become NAS work; raw delivery stays as 0236 left it.
+	var keStart, keEnd time.Time
+	if err = pool.QueryRow(ctx, `SELECT start_at,end_at FROM nas_media_keep20_windows WHERE stream_id=94 AND keep_everything AND timezone='America/Los_Angeles'`).Scan(&keStart, &keEnd); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO streams(id,local_timezone) VALUES(94,'America/Los_Angeles');
+ INSERT INTO recordings(id,account_id,name,delivery,stream_id,cron_timezone) VALUES(9,47,'keep-everything','nas_pull',94,'America/Los_Angeles');
+ CREATE TABLE recording_collation_hours(id bigint PRIMARY KEY,recording_id bigint);
+ CREATE TABLE recording_collation_outputs(id bigint PRIMARY KEY,collation_hour_id bigint,start_at timestamptz,end_at timestamptz,source_clip_ids bigint[]);
+ INSERT INTO recording_collation_hours VALUES(20,9)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,size_bytes,clip_start_at,clip_end_at)
+ VALUES(903,9,10,$1,$1::timestamptz+interval '1 minute')`, keStart); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO recording_collation_outputs VALUES
+ (1,20,$1,$1::timestamptz+interval '1 hour','{903}'),(2,20,$1,$1::timestamptz+interval '1 hour','{903,905}'),
+ (3,20,$2,$2::timestamptz+interval '1 hour','{903}')`, keStart, keEnd); err != nil {
+		t.Fatal(err)
+	}
+	keCopy := `INSERT INTO nas_r2_copy_items VALUES(13,'pending',jsonb_build_object('stream_id',94,'start_at',$1::timestamptz,'end_at',$1::timestamptz+interval '1 minute'),NULL)`
+	if _, err = pool.Exec(ctx, keCopy, keStart); err == nil {
+		t.Fatal("0236 admitted a Keep Everything copy item")
+	}
+	keepEverything := `SELECT nas_delivery_allowed(13,'collated',1),nas_delivery_allowed(13,'collated',2),nas_delivery_allowed(13,'collated',3),nas_delivery_allowed(13,'raw',903)`
+	var inWindow, strayedSource, outside, raw bool
+	if err = pool.QueryRow(ctx, keepEverything).Scan(&inWindow, &strayedSource, &outside, &raw); err != nil || inWindow {
+		t.Fatalf("0236 admitted Keep Everything collated=%t: %v", inWindow, err)
+	}
+	if sql, err = os.ReadFile("../../../infra/sql/migrations/0245_nas_keep20_keep_everything_admission.sql"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, string(sql)); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, keepEverything).Scan(&inWindow, &strayedSource, &outside, &raw); err != nil ||
+		!inWindow || strayedSource || outside || raw {
+		t.Fatalf("Keep Everything collated in=%t stray-source=%t outside=%t raw=%t: %v", inWindow, strayedSource, outside, raw, err)
+	}
+	if _, err = pool.Exec(ctx, keCopy, keStart); err != nil {
+		t.Fatalf("Keep Everything copy item refused: %v", err)
+	}
+	if _, err = pool.Exec(ctx, keCopy, keEnd); err == nil {
+		t.Fatal("copy item after the Keep Everything window admitted")
+	}
+	if _, err = pool.Exec(ctx, pending, oldWindow.Start); err == nil {
+		t.Fatal("0245 admitted old-day COPY")
+	}
+	if err = pool.QueryRow(ctx, `SELECT nas_delivery_allowed(13,'raw',901),nas_delivery_allowed(13,'raw',902)`).Scan(&allowed, &kept); err != nil || allowed || !kept {
+		t.Fatalf("0245 changed raw work old-day=%t kept=%t: %v", allowed, kept, err)
+	}
 }
 
 func TestAccountClipsCursorFencePredicateEquivalent(t *testing.T) {

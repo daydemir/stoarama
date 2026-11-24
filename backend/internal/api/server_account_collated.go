@@ -23,8 +23,11 @@ import (
 // server-set rate, beside (never yielding to) raw delivery.
 
 const (
-	collatedFeedBudget       = 3 * time.Second
-	collatedFeedFenceLimit   = 10
+	collatedFeedBudget     = 3 * time.Second
+	collatedFeedFenceLimit = 50
+	// Candidates examined per feed request. In-window outputs sit in id runs with
+	// 20k-id gaps; one request must cross a gap. Production worst case ~0.7s of the 2s budget.
+	collatedFeedScanLimit    = 20000
 	collatedFeedMaxLimit     = 200
 	collatedFeedDefaultLimit = 50
 	collatedDownloadTTL      = time.Hour
@@ -84,11 +87,18 @@ type collatedItem struct {
 	HandoffMount    *[2]int64 `json:"handoff_mount,omitempty"`
 }
 
+// collatedKeep20FreeBytes stops in-window collated delivery at the R2->NAS copy
+// floor, plus room for one in-flight feed page, so collated never starves raw copy.
+const collatedKeep20FreeBytes = NASR2CopyFloor + 64<<30
+
 // collatedEligibleSQL selects outputs this connection still needs: newest
 // generation of each recording hour, nas_pull recordings of the connection's
 // account, R2-verified, not yet acknowledged by this connection, and not
-// retired from R2 (r2-retire). $1=connection.
-const collatedEligibilitySQL = `
+// retired from R2 (r2-retire). An output qualifies by a collated-only hold or,
+// under the 20-day NAS epoch, by overlapping its stream's pinned window (the
+// NAS reuses those outputs instead of re-stitching; nas_delivery_allowed
+// applies the exact window rule). $1=connection.
+var collatedEligibilitySQL = `
 	JOIN recording_collation_hours h ON h.id=o.collation_hour_id
 	JOIN recordings r ON r.id=h.recording_id
 	JOIN connections conn ON conn.id=$1 AND conn.kind='nas_pull' AND r.account_id=conn.account_id
@@ -100,8 +110,13 @@ const collatedEligibilitySQL = `
 	  AND (
 	   handoff.output_id IS NOT NULL OR (
 	     conn.collated_delivery_enabled
-	     AND EXISTS (SELECT 1 FROM clip_storage_billing_contracts hold
+	     AND (EXISTS (SELECT 1 FROM clip_storage_billing_contracts hold
 	      JOIN unnest(o.source_clip_ids) source_id ON source_id=hold.clip_id WHERE hold.mode='` + nasdelivery.HoldContractMode + `')
+	      OR (nas_delivery_work_epoch(conn.id)
+	       AND conn.nas_storage_free_bytes>=` + strconv.FormatInt(collatedKeep20FreeBytes, 10) + `
+	       AND conn.nas_storage_reported_at>now()-interval '5 minutes'
+	       AND EXISTS (SELECT 1 FROM nas_media_keep20_windows w
+	        WHERE w.stream_id=r.stream_id AND o.start_at<w.end_at AND o.end_at>w.start_at)))
 	     AND NOT EXISTS (SELECT 1 FROM recording_collation_hours newer
 	      WHERE newer.recording_id=h.recording_id AND newer.local_date=h.local_date
 	       AND newer.delivery_hour=h.delivery_hour AND newer.generation>h.generation)
@@ -116,19 +131,19 @@ const collatedEligibilitySQL = `
 	  AND NOT EXISTS (SELECT 1 FROM r2_object_retirements retired
 	    WHERE retired.kind='collated' AND retired.source_id=o.id)`
 
-const collatedEligibleSQL = `FROM recording_collation_outputs o ` + collatedEligibilitySQL + ` AND nas_delivery_allowed(conn.id,'collated',o.id)`
+var collatedEligibleSQL = `FROM recording_collation_outputs o ` + collatedEligibilitySQL + ` AND nas_delivery_allowed(conn.id,'collated',o.id)`
 
 // Bound expensive source and fence checks to one PK-ordered candidate page.
 // Materialization keeps the planner from running the fence on the full catalog.
 // The cursor covers candidates, including withheld outputs, so an ineligible
 // prefix can never starve later deliverable outputs. Downloads recheck eligibility.
-const collatedFeedSQL = `WITH page AS MATERIALIZED (
+var collatedFeedSQL = `WITH page AS MATERIALIZED (
  SELECT o.id FROM recording_collation_outputs o
  JOIN recording_collation_hours h ON h.id=o.collation_hour_id
  JOIN recordings r ON r.id=h.recording_id
  JOIN connections conn ON conn.id=$1 AND conn.kind='nas_pull' AND conn.account_id=r.account_id
  WHERE r.delivery='nas_pull' AND (conn.collated_delivery_enabled OR ($2::boolean AND conn.delivery_nas_handoff_enabled)) AND o.id>$3
- ORDER BY o.id LIMIT 1000
+ ORDER BY o.id LIMIT ` + strconv.Itoa(collatedFeedScanLimit) + `
 ), eligible AS MATERIALIZED (
  SELECT o.id,o.nas_relative_path,o.size_bytes,o.sha256,handoff.round AS handoff_readback_round,
         CASE WHEN handoff.output_id IS NOT NULL THEN ARRAY[handoff.device,handoff.inode] END AS handoff_mount FROM page

@@ -249,85 +249,39 @@ func TestR2NonrawExemptionClassGates(t *testing.T) {
 	}
 }
 
-// TestR2NonrawExemptionHeldKeysRefuseStaleLedgerWrites: a binary that knows
-// nothing of exemptions still cannot reserve or retire a page key unless it is
-// exempt now and the row names the page's exact size and content.
-func TestR2NonrawExemptionHeldKeysRefuseStaleLedgerWrites(t *testing.T) {
-	f := newNonrawFixture(t, "exempt_stale")
+// TestR2DeliveryPageKeysReachLedger: Deniz, 2026-11-24, "just drop the
+// recordings its fine, we'll fix the links whenever". A delivery page key,
+// exempt or not, is no longer refused at the reservation or the receipt.
+func TestR2DeliveryPageKeysReachLedger(t *testing.T) {
+	f := newNonrawFixture(t, "page_ledger")
 	f.withPageKeys()
-	// receipt attempts ONLY the final receipt, so the reservation guard cannot
-	// mask a hole in the receipt guard.
-	receipt := func(kind, key string, id, size int64, sha string) error {
+	// receipt writes ONLY the final receipt; ledger writes reservation then receipt.
+	write := func(withReservation bool, kind, key string, id, size int64) error {
 		tx, err := f.pool.Begin(f.ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer tx.Rollback(f.ctx)
-		_, err = tx.Exec(f.ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256) VALUES($1,$2,3,'stoarama',$3,$4,$5,'t','none',$6,$7)`,
-			kind, id, key, size, sha, strings.Repeat("d", 64), f.policy)
-		return err
-	}
-	ledger := func(kind, key string, id, size int64, sha string) error {
-		tx, err := f.pool.Begin(f.ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer tx.Rollback(f.ctx)
-		if _, err = tx.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) VALUES($1,$2,'stoarama',$3,$4,$5,$6)`,
-			kind, id, key, size, sha, strings.Repeat("d", 64)); err != nil {
-			return err
+		if withReservation {
+			if _, err = tx.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) VALUES($1,$2,'stoarama',$3,$4,$5,$6)`,
+				kind, id, key, size, nonrawOutputSHA, strings.Repeat("d", 64)); err != nil {
+				return err
+			}
 		}
 		_, err = tx.Exec(f.ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256) VALUES($1,$2,3,'stoarama',$3,$4,$5,'t','none',$6,$7)`,
-			kind, id, key, size, sha, strings.Repeat("d", 64), f.policy)
+			kind, id, key, size, nonrawOutputSHA, strings.Repeat("d", 64), f.policy)
 		return err
 	}
-	refused := func(err error) bool { return err != nil && strings.Contains(err.Error(), "DELIVERY KEEP HOLD") }
-	held := func(key string) bool {
-		var h bool
-		if err := f.pool.QueryRow(f.ctx, `SELECT r2_inverse_delivery_held(0,'stoarama',$1,'',$2,1)`, key, strings.Repeat("0", 64)).Scan(&h); err != nil {
-			t.Fatal(err)
+	for _, withReservation := range []bool{false, true} {
+		if err := write(withReservation, "collated", f.key, f.outputID, 900); err != nil {
+			t.Fatalf("collated page key refused (reservation=%t): %v", withReservation, err)
 		}
-		return h
+		if err := write(withReservation, "delivery_repair", exemptRepairKey, 1, 700); err != nil {
+			t.Fatalf("repair page key refused (reservation=%t): %v", withReservation, err)
+		}
 	}
-	if !refused(ledger("collated", f.key, f.outputID, 900, nonrawOutputSHA)) || !refused(ledger("delivery_repair", exemptRepairKey, 1, 700, nonrawOutputSHA)) {
-		t.Fatal("a non-exempt page key reached the ledger")
-	}
-	// The final receipt is guarded on its own, without a reservation in front.
-	if !refused(receipt("collated", f.key, f.outputID, 900, nonrawOutputSHA)) || !refused(receipt("delivery_repair", exemptRepairKey, 1, 700, nonrawOutputSHA)) {
-		t.Fatal("a non-exempt page key reached the receipt")
-	}
-	if !held(f.key) || !held(exemptRepairKey) {
-		t.Fatal("RAW delivery closure released a non-exempt page key")
-	}
-	f.mustSeed(t, deliveryExemptOutsideWindow, collatedRow(f))
-	// confident_repair is hard-closed, so it cannot even be seeded; write its row
-	// directly to prove the SQL gate still refuses it at the ledger.
-	f.fixture(`INSERT INTO r2_delivery_exemption_approvals(class,roster_sha256,decision) VALUES('confident_repair',repeat('7',64),'x')`)
-	f.fixture(`INSERT INTO r2_delivery_exemptions(bucket,object_key,etag,size_bytes,class,approval_id,decision,roster_sha256)
- SELECT 'stoarama',$1,'repair-etag',700,'confident_repair',id,'x',repeat('7',64) FROM r2_delivery_exemption_approvals WHERE roster_sha256=repeat('7',64)`, exemptRepairKey)
-	if !refused(ledger("delivery_repair", exemptRepairKey, 1, 700, nonrawOutputSHA)) {
-		t.Fatal("a confident repair reached the ledger while the page is up")
-	}
-	if !refused(ledger("collated", f.key, f.outputID, 899, nonrawOutputSHA)) || !refused(ledger("collated", f.key, f.outputID, 900, strings.Repeat("c", 64))) {
-		t.Fatal("an exempt key reached the ledger under another size or content")
-	}
-	if !refused(receipt("collated", f.key, f.outputID, 899, nonrawOutputSHA)) || !refused(receipt("collated", f.key, f.outputID, 900, strings.Repeat("c", 64))) {
-		t.Fatal("an exempt key reached the receipt under another size or content")
-	}
-	if err := ledger("collated", f.key, f.outputID, 900, nonrawOutputSHA); err != nil {
-		t.Fatalf("exact exempt key refused: %v", err)
-	}
-	// The derived RAW delivery guard never reads exemptions.
-	if !held(f.key) {
-		t.Fatal("RAW delivery closure released an exempt key")
-	}
-	f.requirePageRetiredIsTheConstantContract(t)
-	// The hard-closed repair class stays refused at the ledger.
-	if !refused(ledger("delivery_repair", exemptRepairKey, 1, 700, nonrawOutputSHA)) {
-		t.Fatal("a hard-closed confident repair reached the ledger")
-	}
-	// A repair retires only under its own key family.
-	if err := ledger("delivery_repair", f.key, 2, 900, nonrawOutputSHA); err == nil || !strings.Contains(err.Error(), "kind_prefix") {
+	// A repair still retires only under its own key family.
+	if err := write(true, "delivery_repair", f.key, 2, 900); err == nil || !strings.Contains(err.Error(), "kind_prefix") {
 		t.Fatal("delivery_repair receipt accepted a collated key")
 	}
 }
@@ -1371,9 +1325,8 @@ func TestR2NonrawExemptionRefusesBest14PageFamily(t *testing.T) {
 
 // TestR2NonrawExemptionRefusesPageContentMismatch: the exemption must bind the
 // page row's exact content. A page row whose sha256 is empty or names a
-// different object than the catalog output is refused at validate, approve, seed
-// and in SQL, because guard_delivery_r2_retirement would otherwise admit a
-// receipt the page never covered.
+// different object than the catalog output is refused at validate, approve and
+// seed.
 func TestR2NonrawExemptionRefusesPageContentMismatch(t *testing.T) {
 	for name, pageSHA := range map[string]string{
 		"empty":   "",
@@ -1397,16 +1350,6 @@ func TestR2NonrawExemptionRefusesPageContentMismatch(t *testing.T) {
 			}
 			if sErr := f.seed(t, deliveryExemptOutsideWindow, rows...); sErr == nil {
 				t.Fatalf("a %s page content seeded", name)
-			}
-			// The reception guard itself refuses the receipt under that page row.
-			tx, err := f.pool.Begin(f.ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer tx.Rollback(f.ctx)
-			if _, err := tx.Exec(f.ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256)
- VALUES('collated',$1,3,'stoarama',$2,900,$3,'t','none',$4,$5)`, f.outputID, f.key, nonrawOutputSHA, strings.Repeat("d", 64), f.policy); err == nil {
-				t.Fatalf("a %s page content admitted a receipt", name)
 			}
 		})
 	}
