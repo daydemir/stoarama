@@ -131,6 +131,18 @@ class DayCleanupTests(unittest.TestCase):
                 self.assertTrue(receipt['refusal'])
                 self.assertTrue(media.exists())
 
+    def test_media_beyond_the_permit_refuses_the_whole_directory(self):
+        for name, fields in {'files': dict(files=1, bytes=100), 'bytes': dict(files=2, bytes=5)}.items():
+            with self.subTest(name):
+                self.sent.clear()
+                media = [self.write(plaza(DAY, '103000'), b'abc'), self.write(plaza(DAY, '113000'), b'defg')]
+                self.next_permit = self.permit(**fields)
+                pull.cleanup_day_cycle(self.cfg, self.inventory, threading.Event())
+                [receipt] = self.receipts()
+                self.assertEqual((receipt['outcome'], receipt['media_files']), ('refused', 0))
+                self.assertIn('beyond the permitted', receipt['refusal'])
+                self.assertTrue(all(m.exists() for m in media))
+
     def test_unparseable_media_refuses_the_whole_directory(self):
         media = self.write(plaza(DAY, '103000'))
         self.write('renamed.mp4')

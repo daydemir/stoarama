@@ -236,10 +236,10 @@ def day_folder_key(directory):
 
 
 def day_outside(window, tz, day):
-    """Whole local day outside the pinned window, not adjacent to it."""
+    """Whole local day outside the pinned window, a full guard day from it each side."""
     zone = ZoneInfo(tz)
-    first, last = window[0].astimezone(zone).date(), window[1].astimezone(zone).date()
-    return day <= first - timedelta(days=2) or day >= last + timedelta(days=1)
+    first, last = window[0].astimezone(zone).date(), (window[1] - timedelta(microseconds=1)).astimezone(zone).date()
+    return day <= first - timedelta(days=2) or day >= last + timedelta(days=2)
 
 
 def day_verify(plan, windows, timezones, keep_everything, folders, catalog):

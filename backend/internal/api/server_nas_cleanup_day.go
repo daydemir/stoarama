@@ -155,17 +155,19 @@ func cleanupDayFileDate(dir, name string, loc *time.Location) (time.Time, bool) 
 }
 
 // cleanupDayOutside is true when the whole local day lies outside the window
-// and is not adjacent to it. The guard band covers a clip that starts on the
-// previous day and any difference between naming and canonical timezones.
+// with a full guard day between them on either side. The guard band covers a
+// clip that crosses midnight and any difference between naming and canonical
+// timezones. first and last are the local dates of the window's first and
+// final instants.
 func cleanupDayOutside(w cleanupKeepWindow, day time.Time) bool {
 	loc, err := time.LoadLocation(w.Timezone)
 	if err != nil {
 		return false
 	}
-	start, end := w.start.In(loc), w.end.In(loc)
+	start, end := w.start.In(loc), w.end.Add(-time.Microsecond).In(loc)
 	first := time.Date(start.Year(), start.Month(), start.Day(), 0, 0, 0, 0, time.UTC)
 	last := time.Date(end.Year(), end.Month(), end.Day(), 0, 0, 0, 0, time.UTC)
-	return !day.After(first.AddDate(0, 0, -2)) || !day.Before(last.AddDate(0, 0, 1))
+	return !day.After(first.AddDate(0, 0, -2)) || !day.Before(last.AddDate(0, 0, 2))
 }
 
 type nasCleanupDayUnit struct {
@@ -228,14 +230,14 @@ type cleanupDayQuerier interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-// Candidate clips: the stream's clips in this directory starting within a day
-// of the unit; Go keeps exactly those whose path names the unit's date.
-const cleanupDayUnitSQL = `SELECT c.display_path,c.clip_start_at,c.clip_end_at,nas_cleanup_day_clip_held(c.id),
+// Every catalogued clip directly in the directory, of any stream and at any
+// time: Go refuses another stream's clip and checks exactly those whose name
+// names the unit's date, whatever their catalogued times.
+const cleanupDayUnitSQL = `SELECT c.display_path,c.clip_start_at,c.clip_end_at,r.stream_id,nas_cleanup_day_clip_held(c.id),
  coalesce((SELECT f.size_bytes FROM nas_inventory_files f WHERE f.connection_id=13 AND f.clip_id=c.id
   AND f.state='present' AND f.relative_path=c.display_path),-1)
  FROM recordings r JOIN recording_clips c ON c.recording_id=r.id
- WHERE r.account_id=47 AND r.stream_id=$1 AND c.clip_start_at>=$2 AND c.clip_start_at<$3
-  AND left(c.display_path,length($4)+1)=$4||'/' AND strpos(substr(c.display_path,length($4)+2),'/')=0`
+ WHERE r.account_id=47 AND left(c.display_path,length($1)+1)=$1||'/' AND strpos(substr(c.display_path,length($1)+2),'/')=0`
 
 // cleanupDayCheck returns the unit's catalogued NAS files and bytes, or why
 // the whole directory-day must stay.
@@ -251,8 +253,7 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 	if held {
 		return 0, 0, errors.New("keep20 epoch inactive or delivery path hold in directory")
 	}
-	local := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, loc)
-	rows, err := q.Query(ctx, cleanupDayUnitSQL, u.StreamID, local.AddDate(0, 0, -1), local.AddDate(0, 0, 2), u.RelativeDir)
+	rows, err := q.Query(ctx, cleanupDayUnitSQL, u.RelativeDir)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -260,11 +261,15 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 	var files, bytes int64
 	for rows.Next() {
 		var p string
-		var a, b time.Time
+		var a, b *time.Time
+		var stream *int64
 		var clipHeld bool
 		var size int64
-		if err := rows.Scan(&p, &a, &b, &clipHeld, &size); err != nil {
+		if err := rows.Scan(&p, &a, &b, &stream, &clipHeld, &size); err != nil {
 			return 0, 0, err
+		}
+		if stream == nil || *stream != u.StreamID {
+			return 0, 0, errors.New("catalogued clip in the directory belongs to another stream")
 		}
 		named, ok := cleanupDayFileDate(u.RelativeDir, path.Base(p), loc)
 		if !ok {
@@ -273,7 +278,7 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 		if !named.Equal(day) {
 			continue
 		}
-		if a.IsZero() || !b.After(a) || a.Before(w.end) && b.After(w.start) {
+		if a == nil || b == nil || !b.After(*a) || a.Before(w.end) && b.After(w.start) {
 			return 0, 0, errors.New("catalogued clip intersects the pinned keep window")
 		}
 		if clipHeld {

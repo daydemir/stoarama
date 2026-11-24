@@ -19381,8 +19381,9 @@ def cleanup_day_refusal(permit, pins, now):
         if plaza and (CLEANUP_MONTHS[day.month - 1] != plaza.group(1) or day.day != int(plaza.group(2))
                       or CLEANUP_DAY_WEEKDAYS[day.weekday()] != plaza.group(3)):
             return "directory does not name the permitted date"
-        first, last = keep_start.astimezone(zone).date(), keep_end.astimezone(zone).date()
-        if first - datetime.timedelta(days=2) < day < last + datetime.timedelta(days=1):
+        first = keep_start.astimezone(zone).date()
+        last = (keep_end - datetime.timedelta(microseconds=1)).astimezone(zone).date()
+        if first - datetime.timedelta(days=2) < day < last + datetime.timedelta(days=2):
             return "day %s is inside or adjacent to stream %d keep window %s..%s" % (day, stream, first, last)
         expires = parse_certification_timestamp(permit["permit_expires_at"], "day permit expiry")
         if (expires - now).total_seconds() <= CLEANUP_DAY_PERMIT_MARGIN_SEC:
@@ -19425,6 +19426,12 @@ def cleanup_day_select(descriptor, permit):
                 return None, "media name %r does not name a local date" % name
             if named == day:
                 files.append([name, info.st_size, name != media])
+    # Tripwire: the server permitted its catalogued media; more on disk than
+    # that (count, or bytes beyond 1%) means the catalogue missed something.
+    media_files = [size for _, size, sidecar in files if not sidecar]
+    if len(media_files) > permit["files"] or sum(media_files) > permit["bytes"] + permit["bytes"] // 100:
+        return None, "directory-day holds %d media files / %d bytes beyond the permitted %d / %d" % (
+            len(media_files), sum(media_files), permit["files"], permit["bytes"])
     return sorted(files), None
 
 
@@ -19558,7 +19565,7 @@ def cleanup_day_cycle(cfg, inventory, stop_event):
     if permit is None:
         return False
     if (not isinstance(permit, dict) or any(type(permit.get(key)) is not int or permit[key] <= 0
-                                            for key in ("unit_id", "plan_id", "attempt", "stream_id"))
+                                            for key in ("unit_id", "plan_id", "attempt", "stream_id", "files", "bytes"))
             or not re.fullmatch(r"[a-f0-9]{64}", str(permit.get("permit_token"))) or not isinstance(permit.get("relative_dir"), str)
             or not isinstance(permit.get("local_date"), str) or not isinstance(permit.get("permit_expires_at"), str)):
         raise CleanupResponseError("invalid day cleanup permit")

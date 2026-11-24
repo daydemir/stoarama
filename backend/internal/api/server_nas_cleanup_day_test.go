@@ -229,9 +229,8 @@ func dayAt(day, hhmmss string) time.Time {
 }
 
 // Owner rule (Mooney/Deniz: "the nas keeps all keep 20 footage"): a bulk
-// unit is a whole stream-day lying entirely outside the pinned window (a guard
-// day before it, so a clip starting the previous evening stays); boundary days
-// stay per-file.
+// unit is a whole stream-day lying entirely outside the pinned window with a
+// full guard day each side; boundary days stay per-file.
 func TestNASCleanupDayNeverBulkDeletesBoundaryDay(t *testing.T) {
 	policy, err := cleanupEmbeddedPolicy()
 	if err != nil {
@@ -249,9 +248,10 @@ func TestNASCleanupDayNeverBulkDeletesBoundaryDay(t *testing.T) {
 		day := time.Date(first.Year(), first.Month(), first.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -5)
 		for ; !day.After(w.end.AddDate(0, 0, 5)); day = day.AddDate(0, 0, 1) {
 			local := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, loc)
-			clear := !local.AddDate(0, 0, 2).After(w.start) || !local.Before(w.end)
+			// The local day widened by a guard day each side must miss [start, end).
+			clear := !local.AddDate(0, 0, 2).After(w.start) || !local.AddDate(0, 0, -1).Before(w.end)
 			if cleanupDayOutside(w, day) && !clear {
-				t.Errorf("stream %d: %s eligible but not entirely outside its window", id, day.Format(time.DateOnly))
+				t.Errorf("stream %d: %s eligible within a day of its window", id, day.Format(time.DateOnly))
 			}
 		}
 	}
@@ -279,6 +279,37 @@ func TestNASCleanupDayNeverBulkDeletesBoundaryDay(t *testing.T) {
 	clip(4, "2026-09-14", "235000", 100, dayAt("2026-09-14", "235000"), dayAt("2026-09-16", "000100"))
 	if _, _, err := cleanupDayCheck(ctx, pool, unit("2026-09-14")); err == nil || !strings.Contains(err.Error(), "intersects the pinned keep window") {
 		t.Fatalf("clip reaching into the window did not refuse its day: %v", err)
+	}
+	// A clip named for eligible day 2026-09-13 but catalogued days later,
+	// inside the window, is still checked and refuses its day.
+	clip(5, "2026-09-13", "103000", 100, dayAt("2026-09-25", "103000"), dayAt("2026-09-25", "103100"))
+	if _, _, err := cleanupDayCheck(ctx, pool, unit("2026-09-13")); err == nil || !strings.Contains(err.Error(), "intersects the pinned keep window") {
+		t.Fatalf("clip whose name and time disagree escaped the window check: %v", err)
+	}
+}
+
+// Another stream's catalogued clip in the directory refuses every unit there,
+// whatever its date: its own window and Keep Everything are never assumed.
+func TestNASCleanupDayRefusesAnotherStreamsClip(t *testing.T) {
+	pool, exec, clip := dayFixture(t)
+	ctx := context.Background()
+	unit := nasCleanupDayUnit{RelativeDir: dayPlazaDir(dayFixtureFolder, dayDate("2026-09-12")), LocalDate: "2026-09-12", StreamID: 3, Files: 1, Bytes: 1}
+	clip(1, "2026-09-12", "103000", 100, dayAt("2026-09-12", "103000"), dayAt("2026-09-12", "103100"))
+	if files, _, err := cleanupDayCheck(ctx, pool, unit); err != nil || files != 1 {
+		t.Fatalf("own-stream directory-day: %d files %v", files, err)
+	}
+	exec(`INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
+ VALUES(78,'test','78','ke','ke','https://storage.example.test','off','Asia/Tokyo','hls','video_manifest','video_live','continuous_video',30);
+INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
+ VALUES(31,47,1,'ke','https://storage.example.test','* * * * *','Asia/Tokyo','paused',78,now())`)
+	// Same date and name shape as stream 3's own clip: only the stream differs.
+	d := dayDate("2026-09-12")
+	at := dayAt("2026-09-12", "113000")
+	exec(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,
+ fire_at,clip_start_at,clip_end_at,display_path,purged_at) VALUES(2,31,1,'https://storage.example.test','fixture','obj-2',100,'etag',repeat('a',64),$1,$1,$2,$3,now())`,
+		at, at.Add(time.Minute), unit.RelativeDir+"/"+dayPlazaName(d, "113000"))
+	if _, _, err := cleanupDayCheck(ctx, pool, unit); err == nil || !strings.Contains(err.Error(), "another stream") {
+		t.Fatalf("another stream's clip did not refuse the directory-day: %v", err)
 	}
 }
 

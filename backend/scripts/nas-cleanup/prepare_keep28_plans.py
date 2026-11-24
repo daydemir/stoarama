@@ -356,11 +356,11 @@ def pg_timestamp(value):
 
 
 def day_outside(window, date):
-    """The whole local day lies outside the window with a one-day guard band."""
+    """The whole local day lies outside the window with a full guard day each side."""
     zone = zoneinfo.ZoneInfo(window['tz'])
     first = datetime.datetime.fromisoformat(window['keep_start_utc']).astimezone(zone).date()
-    last = datetime.datetime.fromisoformat(window['keep_end_utc']).astimezone(zone).date()
-    return date <= first - datetime.timedelta(days=2) or date >= last + datetime.timedelta(days=1)
+    last = (datetime.datetime.fromisoformat(window['keep_end_utc']) - datetime.timedelta(microseconds=1)).astimezone(zone).date()
+    return date <= first - datetime.timedelta(days=2) or date >= last + datetime.timedelta(days=2)
 
 
 def day_digest(units):
