@@ -91,10 +91,15 @@ pulls those rows directly:
    size and SHA-256, fsyncs, links it into place without overwriting, and
    `POST /api/v1/account/collated/ack` records the exact identity.
 
-Scope: only outputs collated from clips held for collated-only delivery
+Scope: outputs collated from clips held for collated-only delivery
 (storage contract mode `nas_collated_hold`, see docs/NAS_COLLATED_DELIVERY.md)
-are offered. Outputs of raw-delivered footage, such as the good+ backfill,
-stay in R2 because the NAS already has their raw clips.
+are offered. Under the 20-day NAS epoch, connection 13 is also offered every
+output that overlaps its stream's pinned window (Keep Everything included,
+migration 0245), so the NAS reuses what is already stitched instead of
+re-stitching it; the ACK is the R2 lane's name+size evidence. These in-window
+offers pause while the NAS's last free-space report (at most five minutes old)
+is below the R2->NAS copy floor plus 64 GiB, so collated never starves raw copy.
+Other outputs of raw-delivered footage stay in R2.
 
 The policy (per connection, server-controlled): enabled, bytes/s budget,
 parallel downloads. It runs concurrently with raw delivery, so neither lane can
