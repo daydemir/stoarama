@@ -51,7 +51,7 @@ func TestNASLowMemoryCleanupFreshPermitClientServer(t *testing.T) {
 }
 
 func TestNASR2CopyV8FastCleanupPipelineClientServer(t *testing.T) {
-	testNASCleanupPipelineClientServer(t, true, nasTunableDayClientVersion)
+	testNASCleanupPipelineClientServer(t, true, nasCleanupDayModesClientVersion)
 }
 
 func TestNASCleanupPermitTransportClientServer(t *testing.T) {

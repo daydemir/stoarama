@@ -276,7 +276,7 @@ try:
             assert not pull.r2_fast_copy_batch(cfg, pull.Runtime(cfg), inventory, stop, control, batch, False)
 finally:
     inventory.close()
-`, api.URL, root, nasTunableDayClientVersion)
+`, api.URL, root, nasCleanupDayModesClientVersion)
 	cmd.Dir = "../../../clients/nas-pull"
 	out, err := cmd.CombinedOutput()
 	if err != nil {
