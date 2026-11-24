@@ -110,13 +110,7 @@ type cleanupObserveEnv struct {
 	// Refuse an enable racing the initial mode lookup under the dry-run context.
 	dryRunOnly    bool
 	freshRequests map[int64]bool
-	// budgetHeld is set only when the budget advisory lock was taken in the
-	// top-level transaction (never in a savepoint, whose rollback could release
-	// it); issued then stays exact until commit because no other transaction
-	// can issue a permit meanwhile.
-	budgetHeld bool
-	issued     int64
-	prefetched map[int64]cleanupPrefetchedRecovery
+	prefetched    map[int64]cleanupPrefetchedRecovery
 	// Only exact aborted stages verified by R2 in this observation request.
 	abortedStitchAbsences map[cleanupAbortedStitchTarget]bool
 }
@@ -269,17 +263,6 @@ UPDATE nas_cleanup_batches SET mode='paused',approved_until=NULL,approval_reason
 	if err != nil {
 		log.Printf("nas cleanup approval expiry deferred: %v", err)
 	}
-}
-
-func (e *cleanupObserveEnv) budgetAllows(ctx context.Context, tx pgx.Tx, size int64) (bool, error) {
-	if e == nil || !e.budgetHeld {
-		return cleanupBudgetAllows(ctx, tx, size)
-	}
-	if size <= 0 || e.issued+size > nasCleanupMaxIssuedBytes24h {
-		return false, nil
-	}
-	e.issued += size
-	return true, nil
 }
 
 type cleanupExecutionRanking struct {
@@ -978,16 +961,6 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		w.Header().Set("Retry-After", "1")
 		util.WriteJSON(w, 503, map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true})
 		return
-	}
-	if anyEnabled && s.cfg.NASCleanupDeletionEnabled {
-		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupBudgetLock); err == nil {
-			err = tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&env.issued)
-		}
-		if err != nil {
-			cleanupObservationFailure(w, ctx, 500, "cleanup deletion budget unavailable")
-			return
-		}
-		env.budgetHeld = true
 	}
 	for n, o := range req.Observations {
 		if !valid[n] {

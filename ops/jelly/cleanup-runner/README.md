@@ -8,6 +8,11 @@ Historical approval (Deniz, 2026-11-11), retained verbatim:
 
 > delete everything on the NAS outside each stream's pinned keep28 period (raw clips and old stitched files), without asking per batch, provided every batch passes: (1) the server's dry run AND an independent check that every file is outside its stream's kept period; (2) a verified R2 copy for every file (R2 copies stay); (3) no protected or uncertain files; (4) the 5 TB/day cap, one plan at a time; deletion master switch OFF between batches; fixes deployed only between batches (never pause an enabled plan to deploy); a short daily progress note; any failed check stops the run and goes to the owner.
 
+The rolling 5 TB/day cap in that approval was lifted (Deniz, 2026-11, verbatim:
+"lift nas cleanup dialy limit please"). The per-plan byte cap is now the
+server's 2 TB, and one plan at a time is unchanged. The server's digest-bound
+per-plan lock still fences each batch.
+
 Owner widening to the 20-day window (Deniz, 2026-11, verbatim): "lets do window 20, just ekep cleaning and reducing". Keep Everything streams stay whole in R2; their NAS copies outside the window leave only against a verified live R2 copy, like every other file here.
 
 The ownership release changes the between-batch mechanism to owned-plan OFF:
@@ -31,7 +36,7 @@ admission failure stops cleanup as well as COPY. No success can clear a failure.
 
 Every plan still requires complete fresh server dry-run, independent catalog and
 109-window pinned 20-day verification, exact source identities, verified R2
-recovery, no protected/uncertain overlap, <=100GB/one stream, <=5TB/24h, and no
+recovery, no protected/uncertain overlap, <=2TB/one stream, and no
 other enabled plan/batch. Per-file fresh permits and custody checks are unchanged.
 Plans rank by bytes per operation. Ranking caches are hints only, expire after
 seven days and are invalidated after admission. Only an evidenced atomic409 may
