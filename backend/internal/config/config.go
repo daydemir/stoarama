@@ -49,7 +49,6 @@ type Config struct {
 	NASCleanupDeletionEnabled        bool
 	NASR2CopyEnabled                 bool
 	NASR2FastCopyBatchSize           int
-	NASR2FastCopyWorkers             int
 	NASStitchProofTaskID             int
 	NASStitchProofActivationID       string
 	NASStitchEnabled                 bool
@@ -248,7 +247,6 @@ func Load() (Config, error) {
 		NASCleanupDeletionEnabled:        boolEnv("NAS_CLEANUP_DELETION_ENABLED", false),
 		NASR2CopyEnabled:                 boolEnv("NAS_R2_COPY_ENABLED", false),
 		NASR2FastCopyBatchSize:           intEnv("NAS_R2_FAST_COPY_BATCH_SIZE", 32),
-		NASR2FastCopyWorkers:             intEnv("NAS_R2_FAST_COPY_WORKERS", 8),
 		NASStitchProofTaskID:             intEnv("NAS_STITCH_PROOF_TASK_ID", 0),
 		NASStitchProofActivationID:       os.Getenv("NAS_STITCH_PROOF_ACTIVATION_ID"),
 		NASStitchEnabled:                 boolEnv("NAS_STITCH_ENABLED", false),
@@ -385,9 +383,6 @@ func Load() (Config, error) {
 	}
 	if cfg.R2Endpoint == "" && cfg.R2AccountID != "" {
 		cfg.R2Endpoint = fmt.Sprintf("https://%s.r2.cloudflarestorage.com", cfg.R2AccountID)
-	}
-	if cfg.NASR2FastCopyWorkers < 1 || cfg.NASR2FastCopyWorkers > 32 {
-		return Config{}, fmt.Errorf("NAS_R2_FAST_COPY_WORKERS must be between 1 and 32")
 	}
 	if cfg.MagicLinkTTL <= 0 {
 		return Config{}, fmt.Errorf("invalid MAGIC_LINK_TTL")

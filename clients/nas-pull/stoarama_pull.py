@@ -53,8 +53,9 @@ LOW_MEMORY_COPY_CLIENT_VERSION = "r2-copy-v8-low-memory"
 LOW_MEMORY_CLEANUP_CLIENT_VERSION = "r2-copy-v8-low-memory-cleanup"
 # Same artifact line built with the 20-day cleanup pin; identical behavior.
 KEEP20_CLEANUP_CLIENT_VERSION = "r2-copy-v8-keep20-cleanup"
-# Fast-copy line; the API supplies the stream count with every lease.
-FAST_COPY_CLIENT_VERSION = "r2-copy-v8-tunable-copy"
+# Fast-copy line; the API supplies the stream count with every lease. The
+# tunable-day release deletes day directories without the app-writer fence.
+FAST_COPY_CLIENT_VERSION = "r2-copy-v8-tunable-day"
 LOW_MEMORY_CLEANUP_VERSIONS = frozenset((LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, FAST_COPY_CLIENT_VERSION))
 CLEANUP_CERTIFIED_STITCH_REASON = "durham_stitch_certified"
 CLEANUP_CERTIFIED_STITCH_RECOVERY = "nas_stitch_certified"
@@ -19470,21 +19471,26 @@ def cleanup_day_journal(inventory, unit_id, phase=None, body=None):
     return rows if unit_id is None else None
 
 
-def cleanup_day_finish(cfg, inventory, receipt):
-    """Journal, ledger and send one receipt; the journal clears only on an acknowledgment."""
-    cleanup_day_journal(inventory, receipt["unit_id"], "receipt", receipt)
-    cleanup_ledger_append(cfg, dict({k: v for k, v in receipt.items() if k != "permit_token"},
-                                    event="day_receipt", at=utc_now_precise()))
+def cleanup_day_finish(cfg, inventory, receipt, timings):
+    """Journal, ledger and send one receipt; the journal clears only on an acknowledgment.
+
+    timings (phase -> ms) reach the ledger and one INFO line, never the wire receipt."""
+    cleanup_timed(timings, "receipt_journal_ms", cleanup_day_journal, inventory, receipt["unit_id"], "receipt", receipt)
+    cleanup_timed(timings, "receipt_ledger_ms", cleanup_ledger_append, cfg, dict(
+        {k: v for k, v in receipt.items() if k != "permit_token"}, event="day_receipt", timings=dict(timings), at=utc_now_precise()))
     try:
-        cleanup_api_retry(cfg, CLEANUP_DAY_RECEIPT_PATH, receipt)
+        cleanup_timed(timings, "receipt_post_ms", cleanup_api_retry, cfg, CLEANUP_DAY_RECEIPT_PATH, receipt)
     except urllib.error.HTTPError as exc:
         if exc.code in (408, 429) or exc.code >= 500:
             raise
         # A definite rejection is evidence for the operator, never retried.
         cleanup_ledger_append(cfg, dict(unit_id=receipt["unit_id"], attempt=receipt["attempt"], http_status=exc.code,
                                         event="day_receipt_rejected", at=utc_now_precise()))
-    cleanup_day_journal(inventory, receipt["unit_id"])
+    cleanup_timed(timings, "receipt_clear_ms", cleanup_day_journal, inventory, receipt["unit_id"])
     CLEANUP_STATUS.add("day_" + receipt["outcome"])
+    log("INFO", "NAS day unit %d attempt %d %s: %d media files, %d bytes, %d remaining; ms %s" % (
+        receipt["unit_id"], receipt["attempt"], receipt["outcome"], receipt["media_files"], receipt["media_bytes"],
+        receipt["remaining_files"], " ".join("%s=%s" % item for item in sorted(timings.items()))))
 
 
 def cleanup_day_replay(cfg, inventory):
@@ -19502,17 +19508,18 @@ def cleanup_day_replay(cfg, inventory):
             finally:
                 if descriptor is not None:
                     os.close(descriptor)
-        cleanup_day_finish(cfg, inventory, record)
+        cleanup_day_finish(cfg, inventory, record, {})
 
 
-def cleanup_day_run(cfg, inventory, stop_event, permit):
+def cleanup_day_run(cfg, inventory, stop_event, permit, timings):
     """Delete one permitted directory-day in a single pass, or refuse it."""
     base = dict(unit_id=permit["unit_id"], attempt=permit["attempt"], permit_token=permit["permit_token"])
-    pins, error = cleanup_pins()
+    pins, error = cleanup_timed(timings, "pins_ms", cleanup_pins)
     refusal = ("pinned keep-window files failed verification: %s" % error if error is not None else
                cleanup_day_refusal(permit, pins, datetime.datetime.now(datetime.timezone.utc)))
     descriptor = None
     try:
+        listed = time.monotonic()
         if refusal is None:
             try:
                 descriptor = cleanup_day_open(cfg.output_dir, permit["relative_dir"])
@@ -19523,33 +19530,41 @@ def cleanup_day_run(cfg, inventory, stop_event, permit):
         files = []
         if refusal is None and descriptor is not None:
             files, refusal = cleanup_day_select(descriptor, permit)
+        timings["select_ms"] = round((time.monotonic() - listed) * 1000)
         if refusal is not None:
-            cleanup_day_finish(cfg, inventory, cleanup_day_receipt(None, base, CleanupDayOutcome.REFUSED, refusal[:500]))
+            cleanup_day_finish(cfg, inventory, cleanup_day_receipt(None, base, CleanupDayOutcome.REFUSED, refusal[:500]), timings)
             return
         intent = dict(base, plan_id=permit["plan_id"], plan_sha256=permit["plan_sha256"], relative_dir=permit["relative_dir"],
                       local_date=permit["local_date"], stream_id=permit["stream_id"], files=files, client_version=CLIENT_VERSION)
-        cleanup_ledger_append(cfg, dict({k: v for k, v in intent.items() if k != "permit_token"}, event="day_intent",
-                                        file_count=len(files), bytes=sum(size for _, size, _ in files), at=utc_now_precise()))
-        cleanup_day_journal(inventory, permit["unit_id"], "intent", intent)
+        cleanup_timed(timings, "intent_ledger_ms", cleanup_ledger_append, cfg, dict(
+            {k: v for k, v in intent.items() if k != "permit_token"}, event="day_intent",
+            file_count=len(files), bytes=sum(size for _, size, _ in files), at=utc_now_precise()))
+        cleanup_timed(timings, "intent_journal_ms", cleanup_day_journal, inventory, permit["unit_id"], "intent", intent)
         expires = parse_certification_timestamp(permit["permit_expires_at"], "day permit expiry")
 
-        def unlink_pass():
+        # No app-writer fence: that fence keeps per-file cleanup's exact parent
+        # namespace proof valid, and it never covered the list-to-unlink gap. A
+        # day unit unlinks only the names it selected at list time and accounts
+        # each by absence: a file landing after the listing survives, one landing
+        # before it trips the files/bytes check, and fast copy links new names
+        # without overwriting. Everything selected is out-of-window non-KE media.
+        if descriptor is not None:
+            unlinked, started = 0, time.monotonic()
             for name, _, _ in files:
-                if (expires - datetime.datetime.now(datetime.timezone.utc)).total_seconds() <= CLEANUP_DAY_PERMIT_MARGIN_SEC:
+                if (stop_event.is_set() or (expires - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+                        <= CLEANUP_DAY_PERMIT_MARGIN_SEC):
                     break  # Never unlink past the permit; the rest is a partial receipt.
                 try:
                     os.unlink(name, dir_fd=descriptor)
                 except FileNotFoundError:
                     pass
-            os.fsync(descriptor)
-
-        if descriptor is not None:
-            lane = CleanupExecutionLane(stop_event)
-            try:
-                lane.run(unlink_pass)
-            finally:
-                lane.close()
-        cleanup_day_finish(cfg, inventory, cleanup_day_receipt(descriptor, intent))
+                unlinked += 1
+            elapsed = time.monotonic() - started
+            timings.update(unlink_ms=round(elapsed * 1000), unlink_files=unlinked,
+                           unlink_mean_ms=round(elapsed * 1000 / unlinked, 2) if unlinked else 0)
+            cleanup_timed(timings, "dir_fsync_ms", os.fsync, descriptor)
+        receipt = cleanup_timed(timings, "account_ms", cleanup_day_receipt, descriptor, intent)
+        cleanup_day_finish(cfg, inventory, receipt, timings)
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -19557,10 +19572,11 @@ def cleanup_day_run(cfg, inventory, stop_event, permit):
 
 def cleanup_day_cycle(cfg, inventory, stop_event):
     """Replay day receipts, then run at most one day permit. True when a unit ran."""
-    cleanup_day_replay(cfg, inventory)
+    timings = {}
+    cleanup_timed(timings, "replay_ms", cleanup_day_replay, cfg, inventory)
     if cfg.dry_run or stop_event.is_set():
         return False
-    response = cleanup_api_retry(cfg, CLEANUP_DAY_PERMIT_PATH, {"client_version": CLIENT_VERSION})
+    response = cleanup_timed(timings, "permit_ms", cleanup_api_retry, cfg, CLEANUP_DAY_PERMIT_PATH, {"client_version": CLIENT_VERSION})
     permit = response.get("unit") if isinstance(response, dict) else None
     if permit is None:
         return False
@@ -19569,7 +19585,7 @@ def cleanup_day_cycle(cfg, inventory, stop_event):
             or not re.fullmatch(r"[a-f0-9]{64}", str(permit.get("permit_token"))) or not isinstance(permit.get("relative_dir"), str)
             or not isinstance(permit.get("local_date"), str) or not isinstance(permit.get("permit_expires_at"), str)):
         raise CleanupResponseError("invalid day cleanup permit")
-    cleanup_day_run(cfg, inventory, stop_event, permit)
+    cleanup_day_run(cfg, inventory, stop_event, permit, timings)
     return True
 
 

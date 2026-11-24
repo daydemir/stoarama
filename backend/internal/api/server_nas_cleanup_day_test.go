@@ -42,10 +42,11 @@ func dayDate(s string) time.Time {
 }
 
 func TestNASCleanupDayClientVersion(t *testing.T) {
-	v := nasTunableCopyClientVersion
-	if !nasCleanupSupportsExecution(v) || !nasCleanupSupportsBulk(v) || !nasCopySupportsVersion(v) || !SupportsNASStorageBudget(v) ||
-		!nasLowMemoryRawCopyOnly(v) || nasClientSupportsStitchProof(v) || !nasFastCopyLine(v) || nasFastCopyLine(nasKeep20CleanupClientVersion) {
-		t.Fatal("the day-cleanup release must keep the fast-copy line capabilities")
+	for _, v := range nasCleanupDayVersions {
+		if !nasCleanupSupportsExecution(v) || !nasCleanupSupportsBulk(v) || !nasCopySupportsVersion(v) || !SupportsNASStorageBudget(v) ||
+			!nasLowMemoryRawCopyOnly(v) || nasClientSupportsStitchProof(v) || !nasFastCopyLine(v) || nasFastCopyLine(nasKeep20CleanupClientVersion) {
+			t.Fatalf("day-cleanup release %s must keep the fast-copy line capabilities", v)
+		}
 	}
 	if !pullPathAllowed("POST", "/api/v1/account/connections/cleanup/day-permit") || !pullPathAllowed("POST", "/api/v1/account/connections/cleanup/day-receipt") {
 		t.Fatal("NAS key cannot reach the day cleanup routes")
@@ -469,8 +470,11 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan)).Output()
 		json.Unmarshal(w.Body.Bytes(), &out)
 		return w.Code, out.Unit
 	}
-	if code, p := permit(nasTunableCopyClientVersion); code != 200 || p != nil {
-		t.Fatalf("dry-run plan issued a permit: %d %+v", code, p)
+	for _, version := range nasCleanupDayVersions {
+		exec(`UPDATE connections SET client_version=$1 WHERE id=13`, version)
+		if code, p := permit(version); code != 200 || p != nil {
+			t.Fatalf("dry-run plan issued %s a permit: %d %+v", version, code, p)
+		}
 	}
 	if w := dayCall(s.handleServiceNASCleanupDayControl, planID, map[string]any{"plan_sha256": sha, "mode": "enabled", "reason": "fixture", "approval_hours": 1}); w.Code != 200 {
 		t.Fatalf("enable: %d %s", w.Code, w.Body)
@@ -481,17 +485,17 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan)).Output()
 			t.Fatalf("%s received a day permit: %d", older, code)
 		}
 	}
-	exec(`UPDATE connections SET client_version=$1 WHERE id=13`, nasTunableCopyClientVersion)
+	exec(`UPDATE connections SET client_version=$1 WHERE id=13`, nasTunableDayClientVersion)
 	receipt := func(p *nasCleanupDayPermit, outcome nasCleanupDayOutcome, media, size, remaining int64) *httptest.ResponseRecorder {
-		body := map[string]any{"client_version": nasTunableCopyClientVersion, "unit_id": p.UnitID, "attempt": p.Attempt,
+		body := map[string]any{"client_version": nasTunableDayClientVersion, "unit_id": p.UnitID, "attempt": p.Attempt,
 			"permit_token": p.Token, "outcome": outcome, "media_files": media, "media_bytes": size, "sidecar_files": media,
 			"sidecar_bytes": media * 10, "remaining_files": remaining, "refusal": ""}
 		if outcome == nasCleanupDayRefused {
 			body["refusal"] = "client guard"
 		}
-		return cleanupCall(t, s.handleAccountNASCleanupDayReceipt, 47, 47, "", "", body, "fixture-boot "+nasTunableCopyClientVersion)
+		return cleanupCall(t, s.handleAccountNASCleanupDayReceipt, 47, 47, "", "", body, "fixture-boot "+nasTunableDayClientVersion)
 	}
-	code, first := permit(nasTunableCopyClientVersion)
+	code, first := permit(nasTunableDayClientVersion)
 	if code != 200 || first == nil || first.LocalDate != "2026-09-12" || first.Files != 2 || first.Timezone != "Asia/Tokyo" || first.Attempt != 1 {
 		t.Fatalf("first permit: %d %+v", code, first)
 	}
@@ -504,21 +508,21 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan)).Output()
 	if w := receipt(first, nasCleanupDayDeleted, 2, 300, 0); w.Code != 409 {
 		t.Fatalf("contradictory receipt accepted: %d", w.Code)
 	}
-	_, again := permit(nasTunableCopyClientVersion)
+	_, again := permit(nasTunableDayClientVersion)
 	if again == nil || again.UnitID != first.UnitID || again.Attempt != 2 {
 		t.Fatalf("partial unit was not re-permitted: %+v", again)
 	}
 	if w := receipt(again, nasCleanupDayDeleted, 1, 200, 0); w.Code != 200 {
 		t.Fatal(w.Body.String())
 	}
-	_, second := permit(nasTunableCopyClientVersion)
+	_, second := permit(nasTunableDayClientVersion)
 	if second == nil || second.LocalDate != "2026-10-10" {
 		t.Fatalf("second unit: %+v", second)
 	}
 	if w := receipt(second, nasCleanupDayRefused, 0, 0, 0); w.Code != 200 {
 		t.Fatal(w.Body.String())
 	}
-	if code, p := permit(nasTunableCopyClientVersion); code != 200 || p != nil {
+	if code, p := permit(nasTunableDayClientVersion); code != 200 || p != nil {
 		t.Fatalf("finished plan issued a permit: %+v", p)
 	}
 	w = dayCall(s.handleServiceNASCleanupDayStatus, planID, nil)

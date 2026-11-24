@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"path"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -572,10 +573,10 @@ type nasCleanupDayPermit struct {
 	Bytes       int64     `json:"bytes"`
 }
 
-// cleanupDayConnection admits only the r2-copy-v8-tunable-copy release; older literals
-// never receive a day permit.
+// cleanupDayConnection admits only nasCleanupDayVersions; older literals never
+// receive a day permit.
 func (s *Server) cleanupDayConnection(w http.ResponseWriter, r *http.Request, version string) (int64, bool) {
-	if version != nasTunableCopyClientVersion {
+	if !slices.Contains(nasCleanupDayVersions, version) {
 		util.WriteError(w, http.StatusConflict, "bulk NAS-only cleanup release required")
 		return 0, false
 	}

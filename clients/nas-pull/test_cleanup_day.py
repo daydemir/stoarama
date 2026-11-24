@@ -108,6 +108,25 @@ class DayCleanupTests(unittest.TestCase):
         self.assertNotIn('permit_token', events[0])
         self.assertEqual(pull.cleanup_day_journal(self.inventory, None), [])
 
+    def test_day_unit_completes_while_an_app_writer_is_active(self):
+        media = self.write(plaza(DAY, '103000'), b'abc')
+        self.next_permit = self.permit(files=1)
+        pull.NAS_MEDIA_FENCE.acquire_delivery()  # A long collated download, never drained.
+        self.addCleanup(pull.NAS_MEDIA_FENCE.release_delivery)
+        with mock.patch.object(pull, 'CLEANUP_EXECUTION_DRAIN_SEC', 0), mock.patch.object(pull, 'log') as logged:
+            self.assertTrue(pull.cleanup_day_cycle(self.cfg, self.inventory, threading.Event()))
+        timings = self.ledger()[-1]['timings']
+        self.assertEqual(set(timings), {'replay_ms', 'permit_ms', 'pins_ms', 'select_ms', 'intent_ledger_ms', 'intent_journal_ms', 'unlink_ms',
+                                        'unlink_files', 'unlink_mean_ms', 'dir_fsync_ms', 'account_ms', 'receipt_journal_ms'})
+        self.assertEqual(timings['unlink_files'], 1)
+        [line] = [c.args[1] for c in logged.call_args_list if c.args[1].startswith('NAS day unit 7')]
+        self.assertIn('receipt_post_ms=', line)
+        self.assertFalse(media.exists())
+        self.assertEqual([r['outcome'] for r in self.receipts()], ['deleted'])
+        fence = pull.NAS_MEDIA_FENCE
+        self.assertEqual((fence.writers, fence.cleaners, fence.execution_owner), (1, 0, None))
+        self.assertFalse(fence.execution_lock.locked())
+
     def test_client_refuses_independently_before_any_unlink(self):
         media = self.write(plaza(DAY, '103000'))
         cases = {
@@ -173,6 +192,7 @@ class DayCleanupTests(unittest.TestCase):
     def test_day_release_is_on_the_cleanup_line(self):
         self.assertIn(pull.FAST_COPY_CLIENT_VERSION, pull.LOW_MEMORY_CLEANUP_VERSIONS)
         self.assertIn(pull.FAST_COPY_CLIENT_VERSION, pull.CLEANUP_BULK_VERSIONS)
+        self.assertEqual(pull.FAST_COPY_CLIENT_VERSION, 'r2-copy-v8-tunable-day')
 
 
 if __name__ == '__main__':

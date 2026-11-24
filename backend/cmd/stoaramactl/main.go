@@ -115,6 +115,8 @@ func main() {
 		runNASUploadProbe(ctx, cfg, os.Args[2:])
 	case "nas-collated-delivery":
 		runNASCollatedDelivery(ctx, cfg, os.Args[2:])
+	case "nas-fast-copy":
+		runNASFastCopy(ctx, cfg, os.Args[2:])
 	case "nas-benchmark":
 		runNASBenchmark(ctx, cfg, os.Args[2:])
 	case "joined-source-purge":

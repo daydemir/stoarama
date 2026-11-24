@@ -520,8 +520,9 @@ until its one-hour TTL (2026-11-24: 32 items, 01:13 to 02:13); the next lease
 now recovers it.
 
 Each lease response carries `workers`, the number of parallel object streams,
-from the API env `NAS_R2_FAST_COPY_WORKERS` (default 8, 1..32; startup fails
-outside that range). Change it on the Render API service's environment; the
-client applies it to its next batch. The heartbeat's `cleanup.r2_copy` reports
+from `connections.r2_fast_copy_workers` (default 16, 1..32; migration 0252).
+Change it without a redeploy with `stoaramactl nas-fast-copy set
+--connection-id ID --workers N` (admin `POST /api/v1/connections/{id}/r2-fast-copy`);
+the client applies it to its next batch. The heartbeat's `cleanup.r2_copy` reports
 `workers` (the count in use) and `bytes_per_sec` (fast GET bytes over the last
 five minutes), stored in `connections.nas_cleanup_status`.
