@@ -136,7 +136,8 @@ INSERT INTO nas_cleanup_source_holds VALUES (1,170),(2,101),(4,171);
 CREATE TABLE nas_cleanup_day_plans(id bigint PRIMARY KEY, mode text NOT NULL);
 CREATE TABLE nas_cleanup_day_units(plan_id bigint NOT NULL, relative_dir text NOT NULL, state text NOT NULL, names jsonb);
 INSERT INTO nas_cleanup_day_plans VALUES (7,'paused'),(8,'enabled');
--- A live Keep Everything unit names 101; a deleted one names 102; plan 8 deletes non-KE days only.
+-- Keep Everything units name 101 (pending) and 102 (deleted: its NAS copy is gone, R2 is the
+-- only copy); both stay held whatever the unit state. Plan 8 deletes non-KE days only.
 INSERT INTO nas_cleanup_day_units VALUES (7,'r','pending','[{"name":"101.mp4","size_bytes":1}]'),(7,'r','deleted','[{"name":"102.mp4","size_bytes":1}]'),(8,'r','pending',NULL);
 `); err != nil {
 		t.Fatal(err)
@@ -269,10 +270,10 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 		"restore_recent": 1, "joined_scope": 1, "active_recording_recent": 1, "joined_snapshot": 9,
 		"excluded_clip": 1, "excluded_recording": 1,
 		"candidate_recording": 1, "cohort_window": 1, "unplayable_signature": 1, "collated_only_delivery": 1,
-		"nas_cleanup_plan": 3,
+		"nas_cleanup_plan": 4,
 	}
 	dry := run(base)
-	if dry.Mode != "dry_run" || dry.Eligible != 7 || dry.Purged != 0 || len(store.deleted) != 0 {
+	if dry.Mode != "dry_run" || dry.Eligible != 6 || dry.Purged != 0 || len(store.deleted) != 0 {
 		t.Fatalf("dry run summary %+v", dry)
 	}
 	for reason, n := range wantSkips {

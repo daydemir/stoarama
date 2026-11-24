@@ -7,6 +7,8 @@
 -- units keep names NULL.
 ALTER TABLE nas_cleanup_day_units ADD COLUMN names jsonb
  CHECK(names IS NULL OR (jsonb_typeof(names)='array' AND jsonb_array_length(names) BETWEEN 1 AND 100000));
+-- Named files the latest permit left out because their R2 counterpart is no longer live.
+ALTER TABLE nas_cleanup_day_units ADD COLUMN dropped_names integer NOT NULL DEFAULT 0 CHECK(dropped_names>=0);
 
 CREATE OR REPLACE FUNCTION guard_nas_cleanup_day_unit() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN

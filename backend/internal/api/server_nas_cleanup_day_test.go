@@ -925,13 +925,23 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan))
 	p := permit(nasCleanupDayKEClientVersion)
 	wantEntries := []nasCleanupDayEntry{{Name: name("100000"), SizeBytes: 100}, {Name: name("120000"), SizeBytes: 100},
 		{Name: name("120000") + ".stoarama.json", SizeBytes: 7, Sidecar: true}}
-	if p == nil || p.Mode != nasCleanupDayNames || fmt.Sprint(p.Entries) != fmt.Sprint(wantEntries) {
+	if p == nil || p.Mode != nasCleanupDayNames || fmt.Sprint(p.Entries) != fmt.Sprint(wantEntries) || p.DroppedNames != 0 {
 		t.Fatalf("KE plaza day must go in names mode with evidenced entries only: %+v", p)
 	}
 	// The raw object of clip 11 leaves R2 before the next attempt: its NAS copy stays.
 	exec(`UPDATE nas_cleanup_day_units SET permit_expires_at=now() WHERE id=$1`, p.UnitID)
 	exec(`UPDATE recording_clips SET purged_at=now() WHERE id=11`)
-	if again := permit(nasCleanupDayKEClientVersion); again == nil || fmt.Sprint(again.Entries) != fmt.Sprint(wantEntries[1:]) {
+	again := permit(nasCleanupDayKEClientVersion)
+	if again == nil || fmt.Sprint(again.Entries) != fmt.Sprint(wantEntries[1:]) || again.DroppedNames != 1 {
 		t.Fatalf("re-permit kept a file whose counterpart left R2: %+v", again)
+	}
+	var dropped struct {
+		Units []struct {
+			DroppedNames int64 `json:"dropped_names"`
+		}
+	}
+	if json.Unmarshal(dayCall(s.handleServiceNASCleanupDayStatus, fmt.Sprint(admitted.ID), nil).Body.Bytes(), &dropped) != nil ||
+		len(dropped.Units) != 1 || dropped.Units[0].DroppedNames != 1 {
+		t.Fatalf("status does not surface the dropped name: %+v", dropped)
 	}
 }

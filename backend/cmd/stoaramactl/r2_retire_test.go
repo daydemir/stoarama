@@ -1649,3 +1649,27 @@ func r2tDelivery() api.DeliveryKeepSnapshot {
 func (f *fakeR2RetireStore) OpenExact(context.Context, string, string, string) (io.ReadCloser, error) {
 	return nil, errors.New("test store has no public delivery registry")
 }
+
+// Owner rule: Keep Everything stays in R2. Every retirement decider refuses a
+// KE stream (78 in the keep20 policy) whatever its pick, scope or NAS proof.
+func TestR2RetireDecideRefusesKeepEverything(t *testing.T) {
+	w := r2tWindow(t, 78, "Asia/Seoul", "2026-08-24", "2026-09-21")
+	windows := map[int64]api.Keep28Window{78: w}
+	picks := map[int64]r2RetirePick{78: {Choice: "none", KeepStartUTC: w.Start.Format(time.RFC3339), KeepEndUTC: w.End.Format(time.RFC3339)}}
+	c := r2tCandidate("raw", 78, "Asia/Seoul", r2tUTC("2026-10-10T00:00:00Z"), r2tUTC("2026-10-10T00:01:00Z"))
+	c.Facts.NASAbsent = true
+	if got, _, ok := r2RetireDecideMode(c, "stoarama", windows, picks, true); ok || got != "keep_everything" {
+		t.Fatalf("NAS-backed decide: %s %t", got, ok)
+	}
+	for _, class := range []r2RetireClass{r2RetireDeliveryOnly, r2RetireOwnerAccepted} {
+		if got, _, ok := r2RetireDecideForScope(c, r2RetireScope{Class: class, Bucket: "stoarama", NASBacked: true}, windows, picks); ok || got != "keep_everything" {
+			t.Fatalf("scope %v: %s %t", class, got, ok)
+		}
+	}
+	if got, _, ok := r2RetireDeliveryDecide(c, r2RetireScope{Class: r2RetireDeliveryOnly}, windows, picks); ok || got != "keep_everything" {
+		t.Fatalf("delivery decide: %s %t", got, ok)
+	}
+	if !r2RetireKeepEverything(78) || r2RetireKeepEverything(3) {
+		t.Fatal("keep20 Keep Everything set differs")
+	}
+}

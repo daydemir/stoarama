@@ -226,7 +226,7 @@ const nasPurgeFactsSQL = `
   NOT EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans cp ON cp.id=h.plan_id
       WHERE h.clip_id=c.id AND (cp.mode<>'retired'
         OR EXISTS(SELECT 1 FROM nas_cleanup_items ci WHERE ci.plan_id=cp.id AND ci.delete_ever_issued)))
-  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_day_units du WHERE du.state IN ('pending','permitted') AND du.names IS NOT NULL
+  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_day_units du WHERE du.names IS NOT NULL
       AND left(c.display_path,length(du.relative_dir)+1)=du.relative_dir||'/'
       AND du.names @> jsonb_build_array(jsonb_build_object('name',substr(c.display_path,length(du.relative_dir)+2)))) AS no_cleanup_plan,
   NOT EXISTS(SELECT 1 FROM nas_cleanup_plans cp WHERE cp.mode='enabled')

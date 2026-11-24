@@ -1447,7 +1447,8 @@ class Runner:
             active = self.active()
             require(not active['plans'] and active['batches'] == 0 and active['day_plans'] in ([], [pid]),
                     'concurrent cleanup execution')
-            self.save('day_running', day_deleted_files=p['deleted_media_files'], day_deleted_bytes=p['deleted_media_bytes'])
+            self.save('day_running', day_deleted_files=p['deleted_media_files'], day_deleted_bytes=p['deleted_media_bytes'],
+                      day_dropped_names=sum(u.get('dropped_names', 0) for u in p['units']))
             time.sleep(60)
 
     def day_finish(self, p):

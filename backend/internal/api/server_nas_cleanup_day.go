@@ -551,7 +551,7 @@ func (s *Server) handleServiceNASCleanupDayStatus(w http.ResponseWriter, r *http
  'plan_sha256',p.plan_sha256,'mode',p.mode,'approval_reason',p.approval_reason,'approved_until',p.approved_until,
  'files',p.files,'bytes',p.bytes,
  'units',(SELECT coalesce(jsonb_agg(jsonb_build_object('unit_id',u.id,'ordinal',u.ordinal,'stream_id',u.stream_id,
-   'relative_dir',u.relative_dir,'local_date',u.local_date::text,'files',u.files,'bytes',u.bytes,'names',u.names,'state',u.state,
+   'relative_dir',u.relative_dir,'local_date',u.local_date::text,'files',u.files,'bytes',u.bytes,'names',u.names,'dropped_names',u.dropped_names,'state',u.state,
    'attempt',u.attempt,'permit_live',u.state='permitted' AND u.permit_expires_at>clock_timestamp(),
    'refusal',u.refusal,'receipts',u.receipts) ORDER BY u.ordinal),'[]') FROM nas_cleanup_day_units u WHERE u.plan_id=p.id),
  'deleted_media_files',(SELECT coalesce(sum((e->>'media_files')::bigint),0) FROM nas_cleanup_day_units u
@@ -738,6 +738,9 @@ type nasCleanupDayPermit struct {
 	// names mode.
 	Mode    nasCleanupDayMode    `json:"mode,omitempty"`
 	Entries []nasCleanupDayEntry `json:"entries,omitempty"`
+	// DroppedNames counts a Keep Everything unit's named files this permit
+	// leaves on the NAS because their R2 counterpart is no longer live.
+	DroppedNames int64 `json:"dropped_names"`
 }
 
 // cleanupDayConnection admits only nasCleanupDayVersions; older literals never
@@ -816,6 +819,10 @@ func (s *Server) handleAccountNASCleanupDayPermit(w http.ResponseWriter, r *http
 			return
 		}
 		permit.UnitID, permit.Token = unitID, hex.EncodeToString(secret)
+		if len(names) > 0 {
+			files, _ := cleanupDayMedia(entries)
+			permit.DroppedNames = int64(len(names)) - files
+		}
 		permit.Timezone = cleanupEmbeddedPolicyWindow(permit.StreamID).Timezone
 		if slices.Contains(nasCleanupDayModeVersions, req.ClientVersion) {
 			permit.Mode = cleanupDayModeOf(unit)
@@ -831,7 +838,7 @@ func (s *Server) handleAccountNASCleanupDayPermit(w http.ResponseWriter, r *http
 			expires = until
 		}
 		if err = tx.QueryRow(ctx, `UPDATE nas_cleanup_day_units SET state='permitted',attempt=attempt+1,permit_token_sha256=$2,
- permit_expires_at=$3,updated_at=now() WHERE id=$1 RETURNING attempt,permit_expires_at`, unitID, cleanupSHA([]byte(permit.Token)), expires).Scan(&permit.Attempt, &permit.ExpiresAt); err != nil {
+ permit_expires_at=$3,dropped_names=$4,updated_at=now() WHERE id=$1 RETURNING attempt,permit_expires_at`, unitID, cleanupSHA([]byte(permit.Token)), expires, permit.DroppedNames).Scan(&permit.Attempt, &permit.ExpiresAt); err != nil {
 			util.WriteError(w, 500, "day cleanup permit failed")
 			return
 		}
