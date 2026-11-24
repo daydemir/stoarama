@@ -60,10 +60,14 @@ const nasTunableCopyClientVersion = "r2-copy-v8-tunable-copy"
 // no longer waits for app writers to drain (2026-11-24).
 const nasTunableDayClientVersion = "r2-copy-v8-tunable-day"
 
-var nasFastCopyVersions = []string{nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion}
+// The tunable-modes release receives day permits in names or dir mode
+// (server_nas_cleanup_day.go) instead of filtering a listing by date.
+const nasCleanupDayModesClientVersion = "r2-copy-v8-tunable-modes"
+
+var nasFastCopyVersions = []string{nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion}
 
 // Only these releases receive day-directory permits.
-var nasCleanupDayVersions = []string{nasTunableCopyClientVersion, nasTunableDayClientVersion}
+var nasCleanupDayVersions = []string{nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion}
 
 func nasFastCopyLine(version string) bool {
 	return slices.Contains(nasFastCopyVersions, version)
@@ -72,7 +76,7 @@ func nasFastCopyLine(version string) bool {
 // These releases have raw-copy authority only.
 func nasLowMemoryRawCopyOnly(version string) bool {
 	switch version {
-	case nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion:
+	case nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion:
 		return true
 	default:
 		return false
@@ -85,7 +89,7 @@ func nasCopySupportsVersion(version string) bool {
 	switch version {
 	case nasCleanupCertifiedStitchVersion, NASR2CopyPagedClientVersion, nasCleanupR2CopyDiagnosticsClientVersion, nasCleanupR2CopyProgressClientVersion, nasCleanupR2CopyClientVersion, "v85r-nas-proof-v1", nasCleanupProofClientVersion,
 		nasCleanupR2CopyControlClientVersion, nasCleanupItemTruthClientVersion, nasCleanupFreshPermitClientVersion,
-		nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion:
+		nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion:
 		return true
 	default:
 		return false

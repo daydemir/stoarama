@@ -267,24 +267,24 @@ func TestNASCleanupDayNeverBulkDeletesBoundaryDay(t *testing.T) {
 	clip(1, "2026-09-15", "000500", 100, dayAt("2026-09-15", "000500"), dayAt("2026-09-15", "000600"))
 	clip(2, "2026-10-06", "120000", 100, dayAt("2026-10-06", "120000"), dayAt("2026-10-06", "120100"))
 	for _, day := range []string{"2026-09-15", "2026-10-06"} {
-		if _, _, err := cleanupDayCheck(ctx, pool, unit(day)); err == nil || !strings.Contains(err.Error(), "adjacent") {
+		if _, _, err := dayCheck(ctx, pool, unit(day)); err == nil || !strings.Contains(err.Error(), "adjacent") {
 			t.Errorf("boundary day %s: %v", day, err)
 		}
 	}
 	// Day 2026-09-14 passes the static rule; one catalogued clip running into
 	// the window refuses the whole directory-day.
 	clip(3, "2026-09-14", "103000", 100, dayAt("2026-09-14", "103000"), dayAt("2026-09-14", "103100"))
-	if files, _, err := cleanupDayCheck(ctx, pool, unit("2026-09-14")); err != nil || files != 1 {
+	if files, _, err := dayCheck(ctx, pool, unit("2026-09-14")); err != nil || files != 1 {
 		t.Fatalf("outside day: %d files %v", files, err)
 	}
 	clip(4, "2026-09-14", "235000", 100, dayAt("2026-09-14", "235000"), dayAt("2026-09-16", "000100"))
-	if _, _, err := cleanupDayCheck(ctx, pool, unit("2026-09-14")); err == nil || !strings.Contains(err.Error(), "intersects the pinned keep window") {
+	if _, _, err := dayCheck(ctx, pool, unit("2026-09-14")); err == nil || !strings.Contains(err.Error(), "intersects the pinned keep window") {
 		t.Fatalf("clip reaching into the window did not refuse its day: %v", err)
 	}
 	// A clip named for eligible day 2026-09-13 but catalogued days later,
 	// inside the window, is still checked and refuses its day.
 	clip(5, "2026-09-13", "103000", 100, dayAt("2026-09-25", "103000"), dayAt("2026-09-25", "103100"))
-	if _, _, err := cleanupDayCheck(ctx, pool, unit("2026-09-13")); err == nil || !strings.Contains(err.Error(), "intersects the pinned keep window") {
+	if _, _, err := dayCheck(ctx, pool, unit("2026-09-13")); err == nil || !strings.Contains(err.Error(), "intersects the pinned keep window") {
 		t.Fatalf("clip whose name and time disagree escaped the window check: %v", err)
 	}
 }
@@ -296,7 +296,7 @@ func TestNASCleanupDayRefusesAnotherStreamsClip(t *testing.T) {
 	ctx := context.Background()
 	unit := nasCleanupDayUnit{RelativeDir: dayPlazaDir(dayFixtureFolder, dayDate("2026-09-12")), LocalDate: "2026-09-12", StreamID: 3, Files: 1, Bytes: 1}
 	clip(1, "2026-09-12", "103000", 100, dayAt("2026-09-12", "103000"), dayAt("2026-09-12", "103100"))
-	if files, _, err := cleanupDayCheck(ctx, pool, unit); err != nil || files != 1 {
+	if files, _, err := dayCheck(ctx, pool, unit); err != nil || files != 1 {
 		t.Fatalf("own-stream directory-day: %d files %v", files, err)
 	}
 	exec(`INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
@@ -314,11 +314,11 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 	}
 	// A LIKE wildcard must not reach a lookalike directory ('_' is literal).
 	foreign(3, strings.Replace(unit.RelativeDir, "_", "x", 1))
-	if files, _, err := cleanupDayCheck(ctx, pool, unit); err != nil || files != 1 {
+	if files, _, err := dayCheck(ctx, pool, unit); err != nil || files != 1 {
 		t.Fatalf("lookalike directory leaked into the unit: %d files %v", files, err)
 	}
 	foreign(2, unit.RelativeDir)
-	if _, _, err := cleanupDayCheck(ctx, pool, unit); err == nil || !strings.Contains(err.Error(), "another stream") {
+	if _, _, err := dayCheck(ctx, pool, unit); err == nil || !strings.Contains(err.Error(), "another stream") {
 		t.Fatalf("another stream's clip did not refuse the directory-day: %v", err)
 	}
 	// The directory read is an index range scan on 0248's pattern index.
@@ -356,16 +356,16 @@ func TestNASCleanupDayPermitsDirectoriesAndAccountsReceipts(t *testing.T) {
 	unit := func(day string, files, bytes int64) nasCleanupDayUnit {
 		return nasCleanupDayUnit{RelativeDir: dayPlazaDir(dayFixtureFolder, dayDate(day)), LocalDate: day, StreamID: 3, Files: files, Bytes: bytes}
 	}
-	if files, size, err := cleanupDayCheck(ctx, pool, unit("2026-09-12", 0, 0)); err != nil || files != 2 || size != 300 {
+	if files, size, err := dayCheck(ctx, pool, unit("2026-09-12", 0, 0)); err != nil || files != 2 || size != 300 {
 		t.Fatalf("outside directory-day: %d files %d bytes %v", files, size, err)
 	}
 	for _, day := range []string{"2026-09-15", "2026-09-20"} {
-		if _, _, err := cleanupDayCheck(ctx, pool, unit(day, 1, 1)); err == nil {
+		if _, _, err := dayCheck(ctx, pool, unit(day, 1, 1)); err == nil {
 			t.Fatalf("%s qualified", day)
 		}
 	}
 	exec(`BEGIN; SET LOCAL session_replication_role=replica; INSERT INTO delivery_nas_source_holds(clip_id) VALUES(2); COMMIT`)
-	if _, _, err := cleanupDayCheck(ctx, pool, unit("2026-09-12", 2, 300)); err == nil || !strings.Contains(err.Error(), "held") {
+	if _, _, err := dayCheck(ctx, pool, unit("2026-09-12", 2, 300)); err == nil || !strings.Contains(err.Error(), "held") {
 		t.Fatalf("held file did not refuse its directory: %v", err)
 	}
 	exec(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM delivery_nas_source_holds; COMMIT`)
@@ -576,20 +576,20 @@ func TestNASCleanupDayFlatDirectoryHoldsOnlyItsNamedDay(t *testing.T) {
 	flat(3, "2026-09-10", "103000")
 	unit := nasCleanupDayUnit{RelativeDir: dir, LocalDate: "2026-09-12", StreamID: 3, Files: 2, Bytes: 200}
 	hold(3)
-	if files, size, err := cleanupDayCheck(ctx, pool, unit); err != nil || files != 2 || size != 200 {
+	if files, size, err := dayCheck(ctx, pool, unit); err != nil || files != 2 || size != 200 {
 		t.Fatalf("another day's hold refused the flat directory-day: %d files %d bytes %v", files, size, err)
 	}
-	if _, _, err := cleanupDayCheck(ctx, pool, nasCleanupDayUnit{RelativeDir: dir, LocalDate: "2026-09-10", StreamID: 3, Files: 1, Bytes: 100}); err == nil || !strings.Contains(err.Error(), "held") {
+	if _, _, err := dayCheck(ctx, pool, nasCleanupDayUnit{RelativeDir: dir, LocalDate: "2026-09-10", StreamID: 3, Files: 1, Bytes: 100}); err == nil || !strings.Contains(err.Error(), "held") {
 		t.Fatalf("held clip did not refuse its own day: %v", err)
 	}
 	hold(2)
-	if _, _, err := cleanupDayCheck(ctx, pool, unit); err == nil || !strings.Contains(err.Error(), "held") {
+	if _, _, err := dayCheck(ctx, pool, unit); err == nil || !strings.Contains(err.Error(), "held") {
 		t.Fatalf("held clip named for the day did not refuse it: %v", err)
 	}
 	// An undated name anywhere in the directory still refuses every unit there.
 	exec(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM delivery_nas_source_holds; COMMIT`)
 	exec(`UPDATE recording_clips SET display_path=$1 WHERE id=3`, dir+"/renamed.mp4")
-	if _, _, err := cleanupDayCheck(ctx, pool, unit); err == nil || !strings.Contains(err.Error(), "does not name a local date") {
+	if _, _, err := dayCheck(ctx, pool, unit); err == nil || !strings.Contains(err.Error(), "does not name a local date") {
 		t.Fatalf("undated name in the flat directory escaped: %v", err)
 	}
 }
@@ -623,5 +623,89 @@ func TestNASCleanupDayRetiredDigestIsAdmissibleAgain(t *testing.T) {
 	}
 	if w := create("kday-c"); w.Code != 409 {
 		t.Fatalf("label admitted twice: %d %s", w.Code, w.Body)
+	}
+}
+
+// dayCheck totals cleanupDayCheck's media entries.
+func dayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUnit) (int64, int64, error) {
+	entries, err := cleanupDayCheck(ctx, q, u)
+	files, bytes := cleanupDayMedia(entries)
+	return files, bytes, err
+}
+
+// The tunable-modes client receives names mode (exact inventory entries) for a
+// flat directory and dir mode for a plaza day directory; older clients get
+// today's permit. Expiry no longer follows the last heartbeat.
+func TestNASCleanupDayPermitModes(t *testing.T) {
+	pool, exec, insert := dayFixture(t)
+	ctx := context.Background()
+	flatDir := dayFixtureFolder + "/30/continuous"
+	flat := func(id int64, day, hhmmss string) string {
+		t.Helper()
+		at := dayAt(day, hhmmss)
+		name := fmt.Sprintf("%d.mp4", at.Unix())
+		exec(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,
+ fire_at,clip_start_at,clip_end_at,display_path,purged_at) VALUES($1,30,1,'https://storage.example.test','fixture',$2,100,'etag',repeat('a',64),$3,$3,$4,$5,now())`,
+			id, fmt.Sprintf("obj-%d", id), at, at.Add(time.Minute), flatDir+"/"+name)
+		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,client_updated_at)
+ VALUES(13,$1,30,$2,$3,repeat('a',64),'present',now())`, id, flatDir+"/"+name, 100+id)
+		return name
+	}
+	a := flat(1, "2026-09-12", "103000")
+	b := flat(2, "2026-09-12", "113000")
+	flat(3, "2026-09-11", "103000") // another day in the same directory
+	exec(`UPDATE nas_inventory_files SET file_ctime_ns=1,file_inode=1,file_device=1,sidecar_relative_path=relative_path||'.stoarama.json',
+ sidecar_size_bytes=50,sidecar_sha256=repeat('b',64) WHERE clip_id=1`)
+	at := dayAt("2026-10-10", "103000")
+	insert(4, "2026-10-10", "103000", 500, at, at.Add(time.Minute))
+	units := []nasCleanupDayUnit{
+		{RelativeDir: flatDir, LocalDate: "2026-09-12", StreamID: 3, Files: 2, Bytes: 203},
+		{RelativeDir: dayPlazaDir(dayFixtureFolder, dayDate("2026-10-10")), LocalDate: "2026-10-10", StreamID: 3, Files: 1, Bytes: 500},
+	}
+	s := &Server{pool: pool, cfg: config.Config{NASCleanupDeletionEnabled: true}}
+	sha := cleanupDayDigest(units)
+	if w := dayCall(s.handleServiceNASCleanupDayCreate, "", map[string]any{"label": "kday-modes", "policy_sha256": cleanupPolicySHA,
+		"plan_sha256": sha, "files": 3, "bytes": 703, "units": units}); w.Code != 200 {
+		t.Fatalf("admission: %d %s", w.Code, w.Body)
+	}
+	var planID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM nas_cleanup_day_plans WHERE label='kday-modes'`).Scan(&planID); err != nil {
+		t.Fatal(err)
+	}
+	if w := dayCall(s.handleServiceNASCleanupDayControl, fmt.Sprint(planID), map[string]any{"plan_sha256": sha, "mode": "enabled", "reason": "fixture", "approval_hours": 1}); w.Code != 200 {
+		t.Fatalf("enable: %d %s", w.Code, w.Body)
+	}
+	permit := func(version string) *nasCleanupDayPermit {
+		t.Helper()
+		// A heartbeat 3.5 minutes old used to cap the permit at 1.5 minutes.
+		exec(`UPDATE connections SET client_version=$1,client_boot_id='fixture-boot',last_seen_at=now()-interval '210 seconds' WHERE id=13`, version)
+		w := cleanupCall(t, s.handleAccountNASCleanupDayPermit, 47, 47, "", "", map[string]any{"client_version": version}, "fixture-boot "+version)
+		var out struct {
+			Unit *nasCleanupDayPermit `json:"unit"`
+		}
+		if json.Unmarshal(w.Body.Bytes(), &out) != nil || w.Code != 200 || out.Unit == nil {
+			t.Fatalf("%s permit: %d %s", version, w.Code, w.Body)
+		}
+		if out.Unit.ExpiresAt.Before(time.Now().Add(nasCleanupDayPermitTTL - time.Minute)) {
+			t.Fatalf("permit expiry follows the heartbeat: %v", out.Unit.ExpiresAt)
+		}
+		exec(`UPDATE nas_cleanup_day_units SET permit_expires_at=now() WHERE id=$1`, out.Unit.UnitID)
+		return out.Unit
+	}
+	if old := permit(nasTunableDayClientVersion); old.Mode != "" || old.Entries != nil || old.RelativeDir != flatDir {
+		t.Fatalf("tunable-day permit changed shape: %+v", old)
+	}
+	names := permit(nasCleanupDayModesClientVersion)
+	want := []nasCleanupDayEntry{{Name: a, SizeBytes: 101}, {Name: a + ".stoarama.json", SizeBytes: 50, Sidecar: true}, {Name: b, SizeBytes: 102}}
+	if names.Mode != nasCleanupDayNames || fmt.Sprint(names.Entries) != fmt.Sprint(want) {
+		t.Fatalf("names permit: %+v", names)
+	}
+	if w := cleanupCall(t, s.handleAccountNASCleanupDayReceipt, 47, 47, "", "", map[string]any{"client_version": nasCleanupDayModesClientVersion,
+		"unit_id": names.UnitID, "attempt": names.Attempt, "permit_token": names.Token, "outcome": nasCleanupDayDeleted, "media_files": 2,
+		"media_bytes": 203, "sidecar_files": 1, "sidecar_bytes": 50, "remaining_files": 0, "refusal": ""}, "fixture-boot "+nasCleanupDayModesClientVersion); w.Code != 200 {
+		t.Fatalf("names receipt: %d %s", w.Code, w.Body)
+	}
+	if dir := permit(nasCleanupDayModesClientVersion); dir.Mode != nasCleanupDayDir || dir.Entries != nil || dir.LocalDate != "2026-10-10" {
+		t.Fatalf("dir permit: %+v", dir)
 	}
 }

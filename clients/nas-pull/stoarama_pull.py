@@ -54,8 +54,9 @@ LOW_MEMORY_CLEANUP_CLIENT_VERSION = "r2-copy-v8-low-memory-cleanup"
 # Same artifact line built with the 20-day cleanup pin; identical behavior.
 KEEP20_CLEANUP_CLIENT_VERSION = "r2-copy-v8-keep20-cleanup"
 # Fast-copy line; the API supplies the stream count with every lease. The
-# tunable-day release deletes day directories without the app-writer fence.
-FAST_COPY_CLIENT_VERSION = "r2-copy-v8-tunable-day"
+# tunable-modes release deletes day directories without the app-writer fence,
+# from day permits in names or dir mode.
+FAST_COPY_CLIENT_VERSION = "r2-copy-v8-tunable-modes"
 LOW_MEMORY_CLEANUP_VERSIONS = frozenset((LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, FAST_COPY_CLIENT_VERSION))
 CLEANUP_CERTIFIED_STITCH_REASON = "durham_stitch_certified"
 CLEANUP_CERTIFIED_STITCH_RECOVERY = "nas_stitch_certified"
@@ -1904,6 +1905,8 @@ class Runtime:
         self.cursor_id = max(0, int(progress.get("after_id", 0)))
         self.collated_after_id = 0
         self.collated_next_poll = 0.0
+        # joined artifact id -> (consecutive failures, monotonic retry time)
+        self.joined_backoff = {}
         self.handoff_final_check_requested = threading.Event()
         self.clips_pulled = max(0, int(progress.get("clips_pulled", 0)))
         self.bytes_pulled = max(0, int(progress.get("bytes_pulled", 0)))
@@ -19312,6 +19315,13 @@ class CleanupPreflight:
 # local day lies outside the pinned 20-day window with a one-day guard band.
 # It then deletes that day's media and sidecars in one pass under one durable
 # intent and reports one receipt. There is no R2 check and no local daily cap.
+#
+# The permit's mode says what may go. names (a flat recordings/<id>/... dir
+# holding every day of a recording): exactly the listed inventory entries, each
+# only while it is a regular file of the listed size; one listdir, no stat of
+# the rest. dir (a plaza <Month>/<DD-Weekday> dir of one stream-day): every
+# media file and sidecar of that date, catalogued or not; any other visible
+# entry keeps the whole directory. Hidden partials always stay.
 
 CLEANUP_DAY_PERMIT_PATH = "/account/connections/cleanup/day-permit"
 CLEANUP_DAY_RECEIPT_PATH = "/account/connections/cleanup/day-receipt"
@@ -19325,6 +19335,11 @@ CLEANUP_DAY_PLAZA_FILE_RE = re.compile(r"[^/]*_(20[0-9]{2})_(%s)_W([1-6])_(%s)_h
     "|".join(CLEANUP_MONTHS), "|".join(CLEANUP_DAY_WEEKDAYS)))
 CLEANUP_DAY_SECONDS_RE = re.compile(r"([1-9][0-9]{9})\.mp4")
 CLEANUP_DAY_MILLIS_RE = re.compile(r"([1-9][0-9]{12})\.mp4")
+
+
+class CleanupDayMode(str, Enum):
+    NAMES = "names"
+    DIR = "dir"
 
 
 class CleanupDayOutcome(str, Enum):
@@ -19368,6 +19383,8 @@ def cleanup_day_refusal(permit, pins, now):
             return "invalid NAS directory"
         if not (CLEANUP_DAY_PLAZA_DIR_RE.fullmatch(directory) or CLEANUP_DAY_FLAT_DIR_RE.fullmatch(directory)):
             return "directory is not a dated raw NAS layout"
+        if (permit["mode"] == CleanupDayMode.DIR) != bool(CLEANUP_DAY_PLAZA_DIR_RE.fullmatch(directory)):
+            return "dir mode is for plaza day directories only"
         pinned = pins["folders"].get(cleanup_folder_key(directory + "/media", "raw"))
         if pinned is None or type(stream) is not int or pinned != stream:
             return "pinned folder map does not assign %r to stream %r" % (directory, stream)
@@ -19408,31 +19425,48 @@ def cleanup_day_open(root, directory):
     return descriptor
 
 
+def cleanup_day_media_name(name):
+    """(media name, is_sidecar) for a raw media or sidecar name."""
+    sidecar = name.endswith(".mp4" + CLEANUP_DAY_SIDECAR)
+    return (name[:-len(CLEANUP_DAY_SIDECAR)] if sidecar else name), sidecar
+
+
 def cleanup_day_select(descriptor, permit):
     """(files, None) for the permitted day's media and sidecars, or (None, refusal)."""
     zone = ZoneInfo(permit["timezone"])
     day = datetime.date.fromisoformat(permit["local_date"])
     files = []
+    if permit["mode"] == CleanupDayMode.NAMES:
+        for entry in permit["entries"]:
+            if cleanup_day_file_date(permit["relative_dir"], cleanup_day_media_name(entry["name"])[0], zone) != day:
+                return None, "permitted name %r does not name the permitted date" % entry["name"]
+        present, mismatched = set(os.listdir(descriptor)), 0
+        for entry in permit["entries"]:
+            name, size = entry["name"], entry["size_bytes"]
+            if name in present:
+                info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if not stat_module.S_ISREG(info.st_mode) or info.st_size != size:
+                    mismatched += 1
+                    continue  # Not the inventoried file: it stays.
+            files.append([name, size, entry["sidecar"]])  # Absent ones are already gone.
+        if mismatched:
+            log("WARN", "NAS day unit %d keeps %d permitted names that are not the inventoried regular file" % (permit["unit_id"], mismatched))
+        return sorted(files), None
     with os.scandir(descriptor) as entries:
         for entry in entries:
             name = entry.name
-            media = name[:-len(CLEANUP_DAY_SIDECAR)] if name.endswith(".mp4" + CLEANUP_DAY_SIDECAR) else name
-            if name.startswith(".") or not media.endswith(".mp4"):
-                continue  # Hidden partials and unrelated files stay.
+            if name.startswith("."):
+                continue  # Hidden partials stay.
             info = entry.stat(follow_symlinks=False)
             if not stat_module.S_ISREG(info.st_mode):
-                return None, "non-regular media entry %r" % name
+                return None, "non-regular entry %r" % name
+            media, sidecar = cleanup_day_media_name(name)
             named = cleanup_day_file_date(permit["relative_dir"], media, zone)
             if named is None:
-                return None, "media name %r does not name a local date" % name
-            if named == day:
-                files.append([name, info.st_size, name != media])
-    # Tripwire: the server permitted its catalogued media; more on disk than
-    # that (count, or bytes beyond 1%) means the catalogue missed something.
-    media_files = [size for _, size, sidecar in files if not sidecar]
-    if len(media_files) > permit["files"] or sum(media_files) > permit["bytes"] + permit["bytes"] // 100:
-        return None, "directory-day holds %d media files / %d bytes beyond the permitted %d / %d" % (
-            len(media_files), sum(media_files), permit["files"], permit["bytes"])
+                return None, "entry %r is not media of this directory's layout" % name
+            if named != day:
+                return None, "entry %r names %s" % (name, named)
+            files.append([name, info.st_size, sidecar])
     return sorted(files), None
 
 
@@ -19545,9 +19579,9 @@ def cleanup_day_run(cfg, inventory, stop_event, permit, timings):
         # No app-writer fence: that fence keeps per-file cleanup's exact parent
         # namespace proof valid, and it never covered the list-to-unlink gap. A
         # day unit unlinks only the names it selected at list time and accounts
-        # each by absence: a file landing after the listing survives, one landing
-        # before it trips the files/bytes check, and fast copy links new names
-        # without overwriting. Everything selected is out-of-window non-KE media.
+        # each by absence: a file landing after the listing survives, and fast
+        # copy links new names without overwriting. Everything selected is
+        # out-of-window non-KE media of the permitted date.
         if descriptor is not None:
             unlinked, started = 0, time.monotonic()
             for name, _, _ in files:
@@ -19570,6 +19604,24 @@ def cleanup_day_run(cfg, inventory, stop_event, permit, timings):
             os.close(descriptor)
 
 
+CLEANUP_DAY_ENTRY_NAME_RE = re.compile(r"[^./\\\x00][^/\\\x00]*\.mp4(?:%s)?" % re.escape(CLEANUP_DAY_SIDECAR))
+
+
+def cleanup_day_valid_entry(entry):
+    return (isinstance(entry, dict) and set(entry) == {"name", "size_bytes", "sidecar"} and isinstance(entry["name"], str)
+            and CLEANUP_DAY_ENTRY_NAME_RE.fullmatch(entry["name"]) is not None and type(entry["size_bytes"]) is int
+            and entry["size_bytes"] >= 0 and entry["sidecar"] is cleanup_day_media_name(entry["name"])[1])
+
+
+def cleanup_day_valid_scope(permit):
+    """dir mode carries no entries; names mode carries plain media/sidecar names with sizes."""
+    mode, entries = permit.get("mode"), permit.get("entries")
+    if mode == CleanupDayMode.DIR.value:
+        return entries is None
+    return (mode == CleanupDayMode.NAMES.value and isinstance(entries, list) and len(entries) > 0
+            and all(map(cleanup_day_valid_entry, entries)))
+
+
 def cleanup_day_cycle(cfg, inventory, stop_event):
     """Replay day receipts, then run at most one day permit. True when a unit ran."""
     timings = {}
@@ -19583,8 +19635,10 @@ def cleanup_day_cycle(cfg, inventory, stop_event):
     if (not isinstance(permit, dict) or any(type(permit.get(key)) is not int or permit[key] <= 0
                                             for key in ("unit_id", "plan_id", "attempt", "stream_id", "files", "bytes"))
             or not re.fullmatch(r"[a-f0-9]{64}", str(permit.get("permit_token"))) or not isinstance(permit.get("relative_dir"), str)
-            or not isinstance(permit.get("local_date"), str) or not isinstance(permit.get("permit_expires_at"), str)):
+            or not isinstance(permit.get("local_date"), str) or not isinstance(permit.get("permit_expires_at"), str)
+            or not cleanup_day_valid_scope(permit)):
         raise CleanupResponseError("invalid day cleanup permit")
+    permit = dict(permit, mode=CleanupDayMode(permit["mode"]))
     cleanup_day_run(cfg, inventory, stop_event, permit, timings)
     return True
 
@@ -24208,6 +24262,9 @@ def ensure_joined_dependency_ack(cfg, runtime, item, stop_event):
             raise JoinedDownloadYield("joined protocol was disabled")
 
 
+JOINED_RETRY_MAX_SEC = 3600
+
+
 def drain_joined(cfg, runtime, stop_event, report_phase=True):
     if not runtime.joined_protocol_enabled() or cfg.dry_run:
         return False
@@ -24220,6 +24277,9 @@ def drain_joined(cfg, runtime, stop_event, report_phase=True):
     if raw_item is None:
         return False
     item = valid_joined_item(raw_item)
+    failures, retry_at = runtime.joined_backoff.get(item["id"], (0, 0.0))
+    if time.monotonic() < retry_at:
+        return False  # This artifact failed recently; it retries on its own backoff.
     if report_phase:
         runtime.set_phase(Phase.DRAINING)
     try:
@@ -24231,13 +24291,15 @@ def drain_joined(cfg, runtime, stop_event, report_phase=True):
         log("INFO", "joined artifact_id=%d stopped at a safe boundary" % item["id"])
         return False
     except Exception as exc:
+        delay = min(min(getattr(cfg, "poll_interval_sec", 60), 10) * 2 ** failures, JOINED_RETRY_MAX_SEC)
+        runtime.joined_backoff[item["id"]] = (failures + 1, time.monotonic() + delay)
         runtime.set_joined_transfer_error(item["id"], exc)
         runtime.set_joined_delivery_error(
-            item["id"], classify_joined_delivery_error(exc), min(getattr(cfg, "poll_interval_sec", 60), 10),
-            "joined artifact_id=%d: %s" % (item["id"], exc),
+            item["id"], classify_joined_delivery_error(exc), delay, "joined artifact_id=%d: %s" % (item["id"], exc),
         )
-        log("ERROR", "joined artifact_id=%d failed: %s" % (item["id"], exc))
+        log("ERROR", "joined artifact_id=%d failed (retry in %ds): %s" % (item["id"], delay, exc))
         raise
+    runtime.joined_backoff.pop(item["id"], None)
     runtime.clear_joined_delivery_error()
     runtime.clear_joined_transfer()
     log(
@@ -24278,7 +24340,10 @@ def joined_errno_class(exc):
 
 
 def joined_loop(cfg, runtime, stop_event):
-    """Drain collated outputs and generation-1 joined artifacts beside the raw loop."""
+    """Drain collated outputs and generation-1 joined artifacts beside the raw loop.
+
+    A failing joined artifact backs off on its own (drain_joined) and never
+    paces collated draining."""
     while not stop_event.is_set():
         if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
             return
@@ -24294,7 +24359,6 @@ def joined_loop(cfg, runtime, stop_event):
                 progress = drain_joined(cfg, runtime, stop_event, report_phase=False) or progress
             except Exception as exc:
                 log("WARN", "joined delivery deferred: %s" % exc)
-                progress = False
         if not progress:
             stop_event.wait(min(cfg.poll_interval_sec, 10))
 
@@ -25125,15 +25189,8 @@ def finalize_collated_handoff(cfg):
         check_collated_handoff_paths(cfg, threading.Event())
 
 
-def drain_collated(cfg, runtime, stop_event):
-    """Deliver one page of collated outputs. Returns True when any output landed."""
-    if cfg.dry_run:
-        return False
-    now = time.monotonic()
-    if now < runtime.collated_next_poll:
-        return False
-    # This lane's idle/error pacing is independent of joined-download progress.
-    runtime.collated_next_poll = now + min(cfg.poll_interval_sec, 10)
+def collated_page(cfg, runtime):
+    """(policy, items) of the next feed page with the cursor advanced, or None when there is nothing to deliver."""
     page = request_json(cfg, "GET", "/account/collated?limit=%d&after_id=%d&handoff_readback=1" % (COLLATED_PAGE_LIMIT, runtime.collated_after_id))
     if not isinstance(page, dict) or set(page) != {"policy", "items", "next_after_id"} or not isinstance(page["items"], list):
         raise RuntimeError("collated response is invalid")
@@ -25141,7 +25198,7 @@ def drain_collated(cfg, runtime, stop_event):
     if policy["handoff_check"] and not cfg.is_candidate:
         require_collated_handoff_release(cfg)
         runtime.handoff_final_check_requested.set()
-        return False
+        return None
     next_id = page["next_after_id"]
     if type(next_id) is not int or next_id < 0 or (next_id != 0 and next_id <= runtime.collated_after_id):
         raise RuntimeError("collated cursor is invalid")
@@ -25150,7 +25207,31 @@ def drain_collated(cfg, runtime, stop_event):
         raise RuntimeError("collated item outside cursor page")
     runtime.collated_after_id = next_id
     if not policy["enabled"] or not items:
+        return None
+    return policy, items
+
+
+# Pages one continuous run may prefetch before the joined lane gets a turn.
+COLLATED_RUN_PAGES = 20
+
+
+def drain_collated(cfg, runtime, stop_event):
+    """Deliver collated outputs through one bounded queue of download_parallel
+    workers. The next page is fetched while downloads are in flight, so
+    throughput is never bounded by page waves; the run ends at an empty page,
+    a stop, a paused feed, or after COLLATED_RUN_PAGES pages. Returns True when
+    any output landed."""
+    if cfg.dry_run:
         return False
+    now = time.monotonic()
+    if now < runtime.collated_next_poll:
+        return False
+    # This lane's idle/error pacing is independent of joined-download progress.
+    runtime.collated_next_poll = now + min(cfg.poll_interval_sec, 10)
+    first = collated_page(cfg, runtime)
+    if first is None:
+        return False
+    policy, items = first
     limiter = ByteRateLimiter(policy["download_bytes_per_sec"])
     delivered = []
 
@@ -25188,18 +25269,35 @@ def drain_collated(cfg, runtime, stop_event):
             item["output_id"], item["size_bytes"], cfg.output_dir / JOINED_ROOT / item["nas_relative_path"],
             "" if fetched else " existing"))
 
+    stopped, failure, pages = None, None, 1
     with concurrent.futures.ThreadPoolExecutor(max_workers=policy["download_parallel"]) as executor:
-        futures = [executor.submit(deliver, item) for item in items]
-        stopped = None
-        for future in futures:
-            try:
-                future.result()
-            except CollatedDownloadStopped as exc:
-                stopped = exc
+        pending = {executor.submit(deliver, item) for item in items}
+        feeding = True
+        while pending:
+            # Refill while the queue holds at most one wave, so workers never idle on a page boundary.
+            if feeding and len(pending) <= policy["download_parallel"]:
+                try:
+                    page = None if pages >= COLLATED_RUN_PAGES or stop_event.is_set() else collated_page(cfg, runtime)
+                except Exception as exc:
+                    page, failure = None, exc
+                if page is None:
+                    feeding = False
+                else:
+                    pages += 1
+                    pending |= {executor.submit(deliver, item) for item in page[1]}
+                    continue
+            done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                try:
+                    future.result()
+                except CollatedDownloadStopped as exc:
+                    stopped, feeding = exc, False
     if stopped is not None and not delivered:
         log("INFO", "collated delivery paused: %s" % stopped)
-    if delivered:
+    if delivered and failure is None:
         runtime.collated_next_poll = 0.0
+    if failure is not None:
+        log("WARN", "collated feed deferred after %d delivered: %s" % (len(delivered), failure))
     return bool(delivered)
 
 

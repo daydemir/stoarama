@@ -142,6 +142,67 @@ class CollatedDownloadTests(unittest.TestCase):
         self.assertEqual(scans, [0, 1000, 2000])
         self.assertEqual([c.args[0] for c in wait.call_args_list], [10, 10])
 
+    def test_collated_queue_is_not_bounded_by_page_waves(self):
+        policy = {"enabled": True, "download_bytes_per_sec": 1 << 30, "download_parallel": 4}
+        def item(n):
+            return {"output_id": n, "nas_relative_path": REL, "size_bytes": 1, "sha256": "a" * 64,
+                    "download_path": "/api/v1/account/collated/%d/download" % n}
+        pages = [{"policy": policy, "items": [item(n) for n in range(1, 11)], "next_after_id": 10},
+                 {"policy": policy, "items": [item(n) for n in range(11, 21)], "next_after_id": 20},
+                 {"policy": policy, "items": [], "next_after_id": 0}]
+        second_page_started = threading.Event()
+        overlapped = []
+        def download(cfg, item, *args, **kwargs):
+            if item["output_id"] == 1:  # A slow first-page download.
+                overlapped.append(second_page_started.wait(5))
+            elif item["output_id"] > 10:
+                second_page_started.set()
+            return True
+        acked = []
+        self.runtime.reserve_joined_storage = lambda *a, **k: True
+        self.runtime.release_storage_reservation = lambda needed: None
+        with mock.patch.object(pull, "request_json", side_effect=pages) as request, \
+                mock.patch.object(pull, "collated_bytes_needed", return_value=0), \
+                mock.patch.object(pull, "storage_status", return_value={}), \
+                mock.patch.object(pull, "download_collated_item", side_effect=download), \
+                mock.patch.object(pull, "ack_collated_item", side_effect=lambda cfg, item, *a, **k: acked.append(item["output_id"])):
+            self.assertTrue(pull.drain_collated(self.cfg, self.runtime, threading.Event()))
+        # The next page's downloads ran while the first page's slow one was in flight.
+        self.assertEqual(overlapped, [True])
+        self.assertEqual(sorted(acked), list(range(1, 21)))
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(self.runtime.collated_after_id, 0)
+
+    def test_failing_joined_artifact_backs_off_per_artifact(self):
+        clock = [0.0]
+        self.runtime.joined_backoff = {}
+        self.runtime.joined_protocol_enabled = lambda: True
+        self.runtime.set_joined_transfer_error = lambda *a: None
+        self.runtime.set_joined_delivery_error = lambda *a: None
+        self.runtime.clear_joined_delivery_error = lambda: None
+        self.runtime.clear_joined_transfer = lambda: None
+        artifact = [13467]
+        downloads = []
+        def download(cfg, runtime, item, stop_event):
+            downloads.append((item["id"], clock[0]))
+            if item["id"] == 13467:
+                raise RuntimeError("joined JSON artifact is not canonical")
+            return True
+        with mock.patch.object(pull.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(pull, "request_json", side_effect=lambda *a, **k: {"item": {"id": artifact[0]}}), \
+                mock.patch.object(pull, "valid_joined_item", side_effect=lambda raw: dict(raw, size_bytes=1)), \
+                mock.patch.object(pull, "joined_output_path", return_value="x"), \
+                mock.patch.object(pull, "download_joined_item", side_effect=download), \
+                mock.patch.object(pull, "ack_joined_item"):
+            for clock[0] in (0, 5, 9, 10, 20, 29, 30, 70):
+                try:
+                    pull.drain_joined(self.cfg, self.runtime, threading.Event(), report_phase=False)
+                except RuntimeError:
+                    pass
+            artifact[0] = 13468  # Another artifact is not held back by 13467's backoff.
+            self.assertTrue(pull.drain_joined(self.cfg, self.runtime, threading.Event(), report_phase=False))
+        self.assertEqual(downloads, [(13467, 0), (13467, 10), (13467, 30), (13467, 70), (13468, 70)])
+
     def test_empty_collated_poll_has_own_clock_during_joined_progress(self):
         stop = threading.Event()
         clock = [0.0]

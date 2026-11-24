@@ -91,6 +91,15 @@ type collatedItem struct {
 // floor, plus room for one in-flight feed page, so collated never starves raw copy.
 const collatedKeep20FreeBytes = NASR2CopyFloor + 64<<30
 
+// collatedGateSQL is the connection-wide gate for in-window collated delivery:
+// the 20-day epoch is on, free space is above the floor and the storage report
+// is fresh. While it is closed the feed returns nothing and resets the cursor,
+// so outputs withheld by the gate are never skipped (a 15-minute heartbeat
+// outage once advanced the cursor past ~2.9 TB of them).
+var collatedGateSQL = `(nas_delivery_work_epoch(conn.id)
+	       AND conn.nas_storage_free_bytes>=` + strconv.FormatInt(collatedKeep20FreeBytes, 10) + `
+	       AND conn.nas_storage_reported_at>now()-interval '5 minutes')`
+
 // collatedEligibleSQL selects outputs this connection still needs: newest
 // generation of each recording hour, nas_pull recordings of the connection's
 // account, R2-verified, not yet acknowledged by this connection, and not
@@ -112,9 +121,7 @@ var collatedEligibilitySQL = `
 	     conn.collated_delivery_enabled
 	     AND (EXISTS (SELECT 1 FROM clip_storage_billing_contracts hold
 	      JOIN unnest(o.source_clip_ids) source_id ON source_id=hold.clip_id WHERE hold.mode='` + nasdelivery.HoldContractMode + `')
-	      OR (nas_delivery_work_epoch(conn.id)
-	       AND conn.nas_storage_free_bytes>=` + strconv.FormatInt(collatedKeep20FreeBytes, 10) + `
-	       AND conn.nas_storage_reported_at>now()-interval '5 minutes'
+	      OR (` + collatedGateSQL + `
 	       AND EXISTS (SELECT 1 FROM nas_media_keep20_windows w
 	        WHERE w.stream_id=r.stream_id AND o.start_at<w.end_at AND o.end_at>w.start_at)))
 	     AND NOT EXISTS (SELECT 1 FROM recording_collation_hours newer
@@ -203,16 +210,18 @@ func (s *Server) handleAccountCollated(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var policy collatedPolicy
+	var gateOpen bool
 	if err := s.pool.QueryRow(r.Context(), `SELECT collated_delivery_enabled OR ($2 AND delivery_nas_handoff_enabled),
         collated_download_bytes_per_sec,collated_download_parallel,
-        ($2 AND connections.id=13 AND EXISTS(SELECT 1 `+deliveryNASHandoffActiveCheckSQL+` AND q.checked_at IS NULL))
-		FROM connections WHERE id=$1`, connectionID, collatedHandoffClient(r)).Scan(&policy.Enabled, &policy.DownloadBytesPerSec, &policy.DownloadParallel, &policy.HandoffCheck); err != nil {
+        ($2 AND conn.id=13 AND EXISTS(SELECT 1 `+deliveryNASHandoffActiveCheckSQL+` AND q.checked_at IS NULL)),
+        coalesce(`+collatedGateSQL+`,false)
+		FROM connections conn WHERE id=$1`, connectionID, collatedHandoffClient(r)).Scan(&policy.Enabled, &policy.DownloadBytesPerSec, &policy.DownloadParallel, &policy.HandoffCheck, &gateOpen); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "load collated policy")
 		return
 	}
 	items := make([]collatedItem, 0, limit)
 	nextID := int64(0)
-	if policy.Enabled {
+	if policy.Enabled && gateOpen {
 		tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 		if err != nil {
 			util.WriteError(w, 503, "collated feed database unavailable; retryable")
