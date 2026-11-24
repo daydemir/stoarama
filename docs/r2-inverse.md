@@ -398,6 +398,12 @@ batches and measure startup/RSS before scaling.
 
 ## Delivery page exemptions (0225)
 
+Migration 0244 dropped the 0190 reservation/receipt guard
+(`guard_delivery_r2_retirement`). Deniz, 2026-11-24, verbatim: "just drop the
+recordings its fine, we'll fix the links whenever". The database no longer
+refuses an R2 reservation or receipt for a page key. The lane-side page checks
+below still apply until they are cut.
+
 Every link on the public delivery page is a `delivery_keep_holds` row, and no
 lane may retire one. Migration 0225 lets exactly the page keys Deniz later
 approved for deletion lose that protection, one class at a time, and only while
@@ -452,7 +458,7 @@ exempt identity before reporting a candidate.
 Identity and content parity are required at every layer the receipt crosses. The
 exemption binds the page row's exact ETag, size **and** sha256; the page row's
 sha256 must be nonempty and be the catalog output's own lowercase sha256
-verbatim, because `guard_delivery_r2_retirement` compares exactly that pair. A
+verbatim, because the 0190 guard (dropped in 0244) compared exactly that pair. A
 page row that cannot state the content is refused at admission instead of
 opening a gate the wire then fails to use, and the validator refuses the same
 mismatch.
