@@ -781,8 +781,8 @@ func TestR2RawReviewedDeliveryStaysHeld(t *testing.T) {
 }
 
 // TestR2RawDeliveryVetoesStayStrict is the negative case: without the reviewed
-// scope, with a mismatched identity, or with an untyped/legacy intent, the exact
-// delivery hold still wins and no DELETE happens.
+// scope or with a legacy intent, the lane's own delivery check still wins and no
+// DELETE happens. (0244 dropped the DB-level page hold on reservations/receipts.)
 func TestR2RawDeliveryVetoesStayStrict(t *testing.T) {
 	t.Run("exact_page_keep_key_vetoes_in_reviewed_scope", func(t *testing.T) {
 		key := "managed/acct-47/delivery/050.mp4"
@@ -803,16 +803,6 @@ func TestR2RawDeliveryVetoesStayStrict(t *testing.T) {
 		}
 	})
 
-	t.Run("reviewed_class_without_typed_intent_vetoes", func(t *testing.T) {
-		key := "managed/acct-47/delivery/200.mp4"
-		f := newRawDeliveryFixture(t, "raw_delivery_notyped", key)
-		// The reservation alone, with the reviewed class but no typed intent, must
-		// still be refused by 0190.
-		if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,retirement_class)
- SELECT 'raw',c.id,'stoarama',c.object_key,c.size_bytes,lower(c.sha256),repeat('d',64),$2 FROM recording_clips c WHERE c.object_key=$1`, key, inverseNonrawRetirementClass); err == nil {
-			t.Fatal("reviewed class without a typed intent bypassed the delivery hold")
-		}
-	})
 }
 
 // TestR2NonrawOutputIntervalReloadedAtWire proves blocker (1): the output's OWN
