@@ -2,6 +2,7 @@
 import datetime
 import importlib.util
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -141,10 +142,11 @@ class DayCleanupTests(unittest.TestCase):
     def test_interrupted_pass_is_accounted_from_disk_on_replay(self):
         first, second = self.write(plaza(DAY, '103000'), b'abc'), self.write(plaza(DAY, '113000'), b'defg')
         self.next_permit = self.permit()
+        unlink = os.unlink
         with mock.patch.object(pull, 'cleanup_day_finish', side_effect=RuntimeError('crash after intent')), \
                 mock.patch.object(pull.os, 'fsync'), \
                 mock.patch.object(pull.os, 'unlink', side_effect=lambda name, dir_fd: (_ for _ in ()).throw(RuntimeError('crash mid-pass'))
-                                  if name == second.name else Path(first).unlink()):
+                                  if name == second.name else unlink(name, dir_fd=dir_fd)):
             with self.assertRaises(RuntimeError):
                 pull.cleanup_day_cycle(self.cfg, self.inventory, threading.Event())
         self.assertEqual([phase for _, phase, _ in pull.cleanup_day_journal(self.inventory, None)], ['intent'])

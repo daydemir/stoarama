@@ -175,10 +175,15 @@ func must(b []byte, err error) []byte {
 	return b
 }
 
-func TestNASCleanupDayPermitsDirectoriesAndAccountsReceipts(t *testing.T) {
-	pool := dayTestPool(t)
+var dayTokyo, _ = time.LoadLocation("Asia/Tokyo")
+
+// dayFixture is a migrated schema with stream 3's NAS connection and an active
+// keep20 epoch. clip catalogues one NAS file in the directory named for day,
+// spanning [start, end).
+func dayFixture(t *testing.T) (pool *pgxpool.Pool, exec func(string, ...any), clip func(id int64, day, hhmmss string, size int64, start, end time.Time)) {
+	pool = dayTestPool(t)
 	ctx := context.Background()
-	exec := func(sql string, args ...any) {
+	exec = func(sql string, args ...any) {
 		t.Helper()
 		if _, err := pool.Exec(ctx, sql, args...); err != nil {
 			t.Fatal(err)
@@ -205,17 +210,85 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 		t.Fatal(err)
 	}
 	exec(`SELECT activate_nas_media_keep20($1,'')`, cleanupPolicySHA)
-	tokyo, _ := time.LoadLocation("Asia/Tokyo")
-	clip := func(id int64, day, hhmmss string, size int64) {
+	clip = func(id int64, day, hhmmss string, size int64, start, end time.Time) {
 		t.Helper()
 		d := dayDate(day)
-		at, _ := time.ParseInLocation("2006-01-02 150405", day+" "+hhmmss, tokyo)
 		p := dayPlazaDir(dayFixtureFolder, d) + "/" + dayPlazaName(d, hhmmss)
 		exec(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,
  fire_at,clip_start_at,clip_end_at,display_path,purged_at) VALUES($1,30,1,'https://storage.example.test','fixture',$2,$3,'etag',repeat('a',64),$4,$4,$5,$6,now())`,
-			id, fmt.Sprintf("obj-%d", id), size, at, at.Add(time.Minute), p)
+			id, fmt.Sprintf("obj-%d", id), size, start, end, p)
 		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,client_updated_at)
  VALUES(13,$1,30,$2,$3,repeat('a',64),'present',now())`, id, p, size)
+	}
+	return pool, exec, clip
+}
+
+func dayAt(day, hhmmss string) time.Time {
+	at, _ := time.ParseInLocation("2006-01-02 150405", day+" "+hhmmss, dayTokyo)
+	return at
+}
+
+// Owner rule (Mooney/Deniz: "the nas keeps all keep 20 footage"): a bulk
+// unit is a whole stream-day lying entirely outside the pinned window (a guard
+// day before it, so a clip starting the previous evening stays); boundary days
+// stay per-file.
+func TestNASCleanupDayNeverBulkDeletesBoundaryDay(t *testing.T) {
+	policy, err := cleanupEmbeddedPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, w := range policy.Streams {
+		if w.KeepEverything {
+			continue
+		}
+		loc, err := time.LoadLocation(w.Timezone)
+		if err != nil {
+			t.Fatal(err)
+		}
+		first := w.start.In(loc)
+		day := time.Date(first.Year(), first.Month(), first.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -5)
+		for ; !day.After(w.end.AddDate(0, 0, 5)); day = day.AddDate(0, 0, 1) {
+			local := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, loc)
+			clear := !local.AddDate(0, 0, 2).After(w.start) || !local.Before(w.end)
+			if cleanupDayOutside(w, day) && !clear {
+				t.Errorf("stream %d: %s eligible but not entirely outside its window", id, day.Format(time.DateOnly))
+			}
+		}
+	}
+
+	pool, _, clip := dayFixture(t)
+	ctx := context.Background()
+	unit := func(day string) nasCleanupDayUnit {
+		return nasCleanupDayUnit{RelativeDir: dayPlazaDir(dayFixtureFolder, dayDate(day)), LocalDate: day, StreamID: 3, Files: 1, Bytes: 1}
+	}
+	// Both edges of stream 3's local window [09-16, 10-06): the guard days
+	// are refused even with only outside-looking catalogued clips.
+	clip(1, "2026-09-15", "000500", 100, dayAt("2026-09-15", "000500"), dayAt("2026-09-15", "000600"))
+	clip(2, "2026-10-06", "120000", 100, dayAt("2026-10-06", "120000"), dayAt("2026-10-06", "120100"))
+	for _, day := range []string{"2026-09-15", "2026-10-06"} {
+		if _, _, err := cleanupDayCheck(ctx, pool, unit(day)); err == nil || !strings.Contains(err.Error(), "adjacent") {
+			t.Errorf("boundary day %s: %v", day, err)
+		}
+	}
+	// Day 2026-09-14 passes the static rule; one catalogued clip running into
+	// the window refuses the whole directory-day.
+	clip(3, "2026-09-14", "103000", 100, dayAt("2026-09-14", "103000"), dayAt("2026-09-14", "103100"))
+	if files, _, err := cleanupDayCheck(ctx, pool, unit("2026-09-14")); err != nil || files != 1 {
+		t.Fatalf("outside day: %d files %v", files, err)
+	}
+	clip(4, "2026-09-14", "235000", 100, dayAt("2026-09-14", "235000"), dayAt("2026-09-16", "000100"))
+	if _, _, err := cleanupDayCheck(ctx, pool, unit("2026-09-14")); err == nil || !strings.Contains(err.Error(), "intersects the pinned keep window") {
+		t.Fatalf("clip reaching into the window did not refuse its day: %v", err)
+	}
+}
+
+func TestNASCleanupDayPermitsDirectoriesAndAccountsReceipts(t *testing.T) {
+	pool, exec, insert := dayFixture(t)
+	ctx := context.Background()
+	clip := func(id int64, day, hhmmss string, size int64) {
+		t.Helper()
+		at := dayAt(day, hhmmss)
+		insert(id, day, hhmmss, size, at, at.Add(time.Minute))
 	}
 	clip(1, "2026-09-12", "103000", 100)
 	clip(2, "2026-09-12", "113000", 200)
