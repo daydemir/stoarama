@@ -83,6 +83,10 @@ class RequestConflict(Halt):
     """The server refused a mutation with HTTP 409."""
 
 
+class MutationUnconfirmed(Halt):
+    """A mutation's outcome is unknown (transport failure or HTTP 408/429/5xx): the server may have committed it."""
+
+
 class LockHeld(Exception):
     """Another runner owns the master switch; leave it alone."""
 
@@ -359,6 +363,9 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise Halt('HTTP redirect refused')
 
 
+TRANSIENT_HTTP = {408, 429, 500, 502, 503, 504}
+
+
 def request(url, token, method='GET', body=None):
     req = urllib.request.Request(url, method=method,
         data=None if body is None else json.dumps(body).encode(), headers={
@@ -371,12 +378,12 @@ def request(url, token, method='GET', body=None):
             raw = response.read(64 << 20)
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as exc:
-        retry = exc.code in {408, 429, 500, 502, 503, 504}
+        retry = exc.code in TRANSIENT_HTTP
         exc.close()
-        error = RequestConflict if exc.code == 409 else ReadFailure if retry and method == 'GET' else Halt
+        error = RequestConflict if exc.code == 409 else (ReadFailure if method == 'GET' else MutationUnconfirmed) if retry else Halt
         raise error('HTTP request failed (' + method + ')') from None
     except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead):
-        error = ReadFailure if method == 'GET' else Halt
+        error = ReadFailure if method == 'GET' else MutationUnconfirmed
         raise error('HTTP transport failed (' + method + ')') from None
     except Exception:
         # HTTP bodies, subprocess stderr and exception strings can contain credentials.
@@ -424,6 +431,7 @@ class Runner:
         self.windows = {}
         self.status = {'current_plan': None, 'last_error': None}
         self.abort_base = None
+        self.day_done = set()  # Streams whose day proposal repeats a retired plan; this run only.
 
     def start(self):
         # Collection sees either the old idle state or the new flock+PID, never
@@ -575,6 +583,11 @@ class Runner:
                         and isinstance(evidence['label'], str) and evidence['label'].startswith(prefix)
                         and isinstance(evidence['reason'], str) and len(evidence['reason']) <= 2048,
                         'invalid atomic admission rejection evidence')
+                if '--day-plans' in args and self.day_digest_retired(out / (evidence['label'] + '.json')):
+                    # Re-proposing a stream whose plan already completed repeats its digest.
+                    self.day_done.add(sid)
+                    self.note('day_stream_done', stream_id=sid)
+                    return False
                 excluded = dict(self.status.get('excluded_streams') or {})
                 excluded[str(sid)] = evidence
                 self.save(self.status.get('phase', 'dry_run'), excluded_streams=excluded)
@@ -584,7 +597,13 @@ class Runner:
         return True
 
     def stream_ready(self, sid):
-        return str(sid) not in (self.status.get('excluded_streams') or {})
+        return str(sid) not in (self.status.get('excluded_streams') or {}) and sid not in self.day_done
+
+    def day_digest_retired(self, proposal):
+        digest = json.loads(proposal.read_text())['plan_sha256']
+        require(re.fullmatch('[a-f0-9]{64}', digest), 'invalid day proposal digest')
+        return self.query("SELECT coalesce(bool_and(mode='retired'),false) FROM nas_cleanup_day_plans WHERE account_id=47 "
+                          "AND connection_id=13 AND plan_sha256='" + digest + "'", 'day plan query')
 
     def query(self, sql, step='catalog query'):
         self.preparer()
@@ -610,9 +629,31 @@ class Runner:
                 raise Halt(step + ': invalid database response') from None
         return self.read(step, execute)
 
+    def call(self, method, path, body=None):
+        return request(API + '/api/v1/service/nas-cleanup/' + path, os.environ['SERVICE_TOKEN'], method, body)
+
     def api(self, method, path, body=None):
-        action = lambda: request(API + '/api/v1/service/nas-cleanup/' + path, os.environ['SERVICE_TOKEN'], method, body)
-        return self.read('plan report GET', action) if method == 'GET' else action()
+        return self.read('plan report GET', lambda: self.call('GET', path)) if method == 'GET' else self.call(method, path, body)
+
+    def day_control(self, pid, action, body, target):
+        """POST a day-plan mutation. A 5xx or transport failure may follow a commit (a slow
+        request outlives the proxy), so before any retry or refusal decision read the plan back
+        and accept only the target mode under the same digest."""
+        for delay in SHORT_READ_RETRY_DELAYS:
+            try:
+                return self.api('POST', 'day-plans/%d/%s' % (pid, action), body)
+            except (MutationUnconfirmed, RequestConflict) as exc:
+                refused = isinstance(exc, RequestConflict)
+                self.step_failed('day plan ' + action + ' unconfirmed', str(exc))
+            try:
+                p = self.call('GET', 'day-plans/%d' % pid)
+            except ReadFailure:
+                p = None
+            if p and p['id'] == pid and p['plan_sha256'] == body['plan_sha256'] and p['mode'] == target:
+                return p
+            if refused or delay is None:
+                raise Halt('day plan ' + action + ' not confirmed')
+            time.sleep(delay)
 
     def plan(self, pid):
         p = self.api('GET', 'plans/' + str(int(pid)))
@@ -639,9 +680,12 @@ class Runner:
     def step_failed(self, step, reason=None):
         # Callers supply fixed step names, never URLs, SQL, or exception text.
         critical('STEP FAILED: ' + step)
+        self.note('step_failed', step=step, **({'reason': reason} if reason else {}))
+
+    def note(self, phase, **values):
         try:
             with (self.root / 'runner.jsonl').open('a') as f:
-                f.write(json.dumps({'at': utcnow().isoformat(), 'phase': 'step_failed', 'step': step, **({'reason': reason} if reason else {})}) + '\n')
+                f.write(json.dumps({'at': utcnow().isoformat(), 'phase': phase, **values}) + '\n')
         except Exception:
             pass  # Diagnostics must never block shutdown, even before initialize().
 
@@ -656,7 +700,7 @@ class Runner:
             except Exception as exc:
                 transient = isinstance(exc, (ReadFailure, TimeoutError, ConnectionError, urllib.error.URLError))
                 if isinstance(exc, urllib.error.HTTPError):
-                    transient = exc.code in {408, 429, 500, 502, 503, 504}
+                    transient = exc.code in TRANSIENT_HTTP
                 if not transient:
                     raise
                 if delay is None:
@@ -680,8 +724,8 @@ class Runner:
             p = self.day_plan(day)
             require(self.status.get('started_day_plan_sha256') == p['plan_sha256'], 'day execution ownership digest differs')
             if p['mode'] == 'enabled':
-                self.api('POST', 'day-plans/%d/control' % day, {'plan_sha256': p['plan_sha256'], 'mode': 'paused',
-                                                                 'reason': 'cleanup runner stopped; owner recovery required'})
+                self.day_control(day, 'control', {'plan_sha256': p['plan_sha256'], 'mode': 'paused',
+                                                  'reason': 'cleanup runner stopped; owner recovery required'}, 'paused')
                 require(self.day_plan(day)['mode'] == 'paused', 'owned day pause not confirmed')
         if enabled:
             self.finish_health()
@@ -733,8 +777,8 @@ class Runner:
                         if self.stopped():
                             return False
                         if day:
-                            self.api('POST', 'day-plans/' + str(plan['id']) + '/control', {'mode': 'enabled',
-                                'plan_sha256': plan['plan_sha256'], 'approval_hours': 24, 'reason': DAY_REASON})
+                            self.day_control(plan['id'], 'control', {'mode': 'enabled',
+                                'plan_sha256': plan['plan_sha256'], 'approval_hours': 24, 'reason': DAY_REASON}, 'enabled')
                         else:
                             self.api('POST', 'plans/' + str(plan['id']) + '/control', {'mode': 'enabled',
                                 'plan_sha256': plan['plan_sha256'], 'approval_hours': 24,
@@ -1393,8 +1437,8 @@ class Runner:
         """Pause, let live permits expire with their receipts, then close."""
         pid, state = p['id'], day_state(p, utcnow())
         if p['mode'] == 'enabled':
-            self.api('POST', 'day-plans/%d/control' % pid, {'plan_sha256': p['plan_sha256'], 'mode': 'paused',
-                     'reason': 'completed: all directory-days finished' if state == 'done' else 'day cleanup ' + state})
+            self.day_control(pid, 'control', {'plan_sha256': p['plan_sha256'], 'mode': 'paused',
+                             'reason': 'completed: all directory-days finished' if state == 'done' else 'day cleanup ' + state}, 'paused')
         deadline = time.monotonic() + 900
         while True:
             p = self.day_plan(pid)
@@ -1405,8 +1449,8 @@ class Runner:
         require(p['plan_sha256'] == self.status.get('started_day_plan_sha256', p['plan_sha256']), 'day plan digest differs')
         require(day_state(p, utcnow()) != 'anomaly', 'NAS client refused a permitted directory-day; owner review required')
         if p['mode'] != 'retired':
-            closed = self.api('POST', 'day-plans/%d/close' % pid, {'plan_sha256': p['plan_sha256'],
-                              'reason': 'Day cleanup %s; never-permitted directory-days are replanned.' % state})
+            closed = self.day_control(pid, 'close', {'plan_sha256': p['plan_sha256'],
+                                      'reason': 'Day cleanup %s; never-permitted directory-days are replanned.' % state}, 'retired')
             require(closed['id'] == pid and closed['mode'] == 'retired', 'day close was not confirmed')
         final = self.day_plan(pid)
         require(final['mode'] == 'retired' and day_state(final, utcnow()) == 'done', 'closed day plan differs; owner review required')

@@ -7,6 +7,7 @@ import pathlib
 import urllib.error
 import io
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'ops/jelly/finish'))
@@ -346,6 +347,65 @@ class DayPlanTests(unittest.TestCase):
         self.assertEqual(k.day_file_date('recordings/366/77', '1789227000000.mp4', tokyo), self.d(2026, 9, 13))
         self.assertIsNone(k.day_file_date('recordings/366/77', '1789227000.mp4', tokyo))
         self.assertEqual(k.pg_timestamp('2026-09-12T01:30:00.5+00:00').microsecond, 500000)
+
+
+
+class DayAdmissionReconcileTests(unittest.TestCase):
+    """A 5xx or transport failure can follow a committed admission; read the label back first."""
+    def setUp(self):
+        unit = {'relative_dir': 'recordings/386/continuous', 'local_date': '2026-09-22', 'stream_id': 293, 'files': 2, 'bytes': 300}
+        self.plan = k.day_plans([unit], 'kday-x', 1)[0]
+
+    def err(self, code, body=b'{"error":"refused"}'):
+        return urllib.error.HTTPError('/day-plans', code, 'x', {}, io.BytesIO(body))
+
+    def admit(self, posts, reads):
+        with patch.object(k, 'service', side_effect=posts) as post, patch.object(k, 'query', side_effect=reads) as read, \
+             patch.object(k.time, 'sleep') as sleep:
+            try:
+                return k.day_admit('https://example.invalid', self.plan, 'psql'), post.call_count, read.call_count, sleep.call_count
+            except RuntimeError as exc:
+                return exc, post.call_count, read.call_count, sleep.call_count
+
+    def test_committed_admission_behind_a_5xx_or_transport_failure_is_adopted(self):
+        for failure in (self.err(502), self.err(504), urllib.error.URLError('reset'), TimeoutError(), ConnectionResetError()):
+            with self.subTest(failure=failure):
+                self.assertEqual(self.admit([failure], [[[11, self.plan['plan_sha256']]]]), ((11, None), 1, 1, 0))
+
+    def test_uncommitted_admission_is_retried_with_backoff(self):
+        self.assertEqual(self.admit([self.err(502), self.err(503), {'id': 12}], [[], []]), ((12, None), 3, 2, 2))
+
+    def test_conflict_after_our_own_in_flight_commit_is_adopted_not_a_rejection(self):
+        self.assertEqual(self.admit([self.err(502), self.err(409)], [[], [[11, self.plan['plan_sha256']]]]), ((11, None), 2, 2, 1))
+
+    def test_real_refusals_and_identity_mismatches_fail_safe(self):
+        (pid, refusal), posts, reads, sleeps = self.admit([self.err(409)], [[]])
+        self.assertEqual((pid, refusal.code, posts, reads, sleeps), (None, 409, 1, 1, 0))
+        cases = {'refused for': ([self.err(400)], []), 'another digest': ([self.err(502)], [[[11, 'f' * 64]]]),
+                 'could not be read back': ([self.err(409)], [k.ReadFailed('timeout')])}
+        for message, (posts, reads) in cases.items():
+            with self.subTest(message):
+                exc, _, _, sleeps = self.admit(posts, reads)
+                self.assertIn(message, str(exc))
+                self.assertEqual(sleeps, 0)
+        n = len(k.ADMISSION_RETRY_DELAYS)
+        exc, posts, reads, sleeps = self.admit([self.err(502)] * n, [[]] * (n - 1) + [k.ReadFailed('timeout')])
+        self.assertIn('not confirmed', str(exc))
+        self.assertEqual((posts, reads, sleeps), (n, n, n - 1))
+
+    def test_day_main_adopts_and_records_the_receipt(self):
+        detail = dict(id=11, label=self.plan['label'], plan_sha256=self.plan['plan_sha256'], mode='dry_run', policy_sha256=k.POLICY_SHA,
+                      files=2, bytes=300, units=[dict(u, state='pending', receipts=[]) for u in self.plan['units']])
+        a = SimpleNamespace(max_units=1000, out=None, stream=[293], psql='psql', summary_only=False, max_plans=1,
+                            label_prefix='kday-x', submit=True, api='https://example.invalid')
+        with tempfile.TemporaryDirectory() as out, patch.object(k, 'load_folders', return_value={}), \
+             patch.object(k, 'day_stream_rows', return_value={}), patch.object(k, 'day_units', return_value=self.plan['units']), \
+             patch.object(k, 'service', side_effect=[self.err(502), detail]), \
+             patch.object(k, 'query', return_value=[[11, self.plan['plan_sha256']]]), patch('builtins.print'):
+            a.out = out
+            self.assertEqual(k.day_main(a, {293: {}}), 0)
+            summary = json.loads((Path(out) / 'summary.json').read_text())
+        self.assertEqual([x['id'] for x in summary['receipts']], [11])
 
 
 if __name__ == '__main__':

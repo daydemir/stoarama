@@ -320,6 +320,7 @@ class FakeRunner(r.Runner):
         self.finish_state.mkdir()
         self.picks = [42, None]
         self.owner_validated = True
+        self.day_done = set()
 
     def finish_admission(self): return FINISH_ADMISSION
     def _finish_health(self, admission): return {'active': {}}
@@ -1648,6 +1649,139 @@ class DayLoopTests(unittest.TestCase):
             job.status['current_day_plan'] = 77
             with self.assertRaisesRegex(r.Halt, 'day cleanup ownership'):
                 job.run()
+
+
+
+class DayReconcileTests(unittest.TestCase):
+    """A 5xx or transport failure on a day-plan mutation may follow a commit."""
+    def job(self, root, posts, reads):
+        job = FakeDayRunner(tempfile.mkdtemp(dir=root))
+        job.posts, job.reads = [], list(reads)
+        def api(method, path, body=None):
+            job.posts.append(path)
+            outcome = posts.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        def call(method, path, body=None):
+            self.assertEqual((method, path), ('GET', 'day-plans/77'))
+            outcome = job.reads.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        job.api, job.call = api, call
+        return job
+
+    def plan(self, job, **change):
+        return dict(copy.deepcopy(job.day), **change)
+
+    def body(self, job, mode='enabled'):
+        return {'plan_sha256': job.day['plan_sha256'], 'mode': mode, 'reason': 'x'}
+
+    def test_request_marks_only_transient_post_failures_unconfirmed(self):
+        cases = [(r.urllib.error.HTTPError('https://invalid', 502, 'bad', {}, io.BytesIO(b'')), r.MutationUnconfirmed),
+                 (r.urllib.error.URLError('reset'), r.MutationUnconfirmed),
+                 (TimeoutError(), r.MutationUnconfirmed),
+                 (r.urllib.error.HTTPError('https://invalid', 409, 'no', {}, io.BytesIO(b'')), r.RequestConflict),
+                 (r.urllib.error.HTTPError('https://invalid', 400, 'no', {}, io.BytesIO(b'')), r.Halt)]
+        for error, expected in cases:
+            with self.subTest(error=error):
+                opener = SimpleNamespace(open=unittest.mock.Mock(side_effect=error))
+                with patch.object(r.urllib.request, 'build_opener', return_value=opener):
+                    with self.assertRaises(r.Halt) as raised:
+                        r.request('https://invalid', 'fixture', 'POST', {})
+                self.assertIs(type(raised.exception), expected)
+
+    def test_unconfirmed_mutation_that_committed_is_accepted_without_replay(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
+            job = self.job(root, [r.MutationUnconfirmed('HTTP request failed (POST)')], [])
+            job.reads = [self.plan(job, mode='enabled')]
+            p = job.day_control(77, 'control', self.body(job), 'enabled')
+            self.assertEqual((p['mode'], len(job.posts)), ('enabled', 1))
+            sleep.assert_not_called()
+
+    def test_unconfirmed_mutation_that_did_not_commit_is_retried_after_reading_back(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
+            job = self.job(root, [r.MutationUnconfirmed('x'), r.MutationUnconfirmed('x'), {'id': 77, 'mode': 'paused'}],
+                           [r.ReadFailure('HTTP transport failed (GET)')])
+            job.reads.append(self.plan(job, mode='enabled'))
+            self.assertEqual(job.day_control(77, 'control', self.body(job, 'paused'), 'paused'), {'id': 77, 'mode': 'paused'})
+            self.assertEqual(len(job.posts), 3)
+            self.assertEqual([c.args[0] for c in sleep.call_args_list], [5, 10])
+
+    def test_refusal_is_accepted_only_when_the_plan_already_has_the_target(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
+            job = self.job(root, [r.RequestConflict('x')], [])
+            job.reads = [self.plan(job, mode='paused')]
+            self.assertEqual(job.day_control(77, 'control', self.body(job, 'paused'), 'paused')['mode'], 'paused')
+            for read in (self.plan(job, mode='dry_run'), self.plan(job, mode='enabled', plan_sha256='f' * 64),
+                         self.plan(job, mode='enabled', id=78), r.ReadFailure('x')):
+                with self.subTest(read=str(read)[:40]):
+                    job = self.job(root, [r.RequestConflict('x')], [read])
+                    with self.assertRaisesRegex(r.Halt, 'not confirmed'):
+                        job.day_control(77, 'control', self.body(job), 'enabled')
+                    self.assertEqual(len(job.posts), 1)
+            sleep.assert_not_called()
+
+    def test_retries_are_capped_and_real_refusals_still_halt(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
+            n = len(r.SHORT_READ_RETRY_DELAYS)
+            job = self.job(root, [r.MutationUnconfirmed('x')] * n, [])
+            job.reads = [self.plan(job)] * n
+            with self.assertRaisesRegex(r.Halt, 'close not confirmed'):
+                job.day_control(77, 'close', self.body(job), 'retired')
+            self.assertEqual((len(job.posts), sleep.call_count), (n, n - 1))
+            job = self.job(root, [r.Halt('HTTP request failed (POST)')], [])
+            with self.assertRaisesRegex(r.Halt, r'HTTP request failed \(POST\)'):
+                job.day_control(77, 'control', self.body(job), 'enabled')
+
+    def test_enable_pause_and_close_all_reconcile(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW), patch.object(r.time, 'sleep'), \
+             patch.object(r.sys, 'stderr', new=io.StringIO()):
+            job = FakeDayRunner(root)
+            original = job.api
+            def flaky(method, path, body=None):
+                original(method, path, body)  # The server commits, then the proxy answers 502.
+                raise r.MutationUnconfirmed('HTTP request failed (POST)')
+            job.api = flaky
+            job.call = lambda method, path, body=None: copy.deepcopy(job.day)
+            def deleted(pid):
+                for u in job.day['units']:
+                    u.update(state='deleted', receipts=[dict(attempt=1, outcome='deleted', media_files=2, media_bytes=200)])
+                r.Runner.day_monitor(job, pid)
+            job.day_monitor = deleted
+            job.run_day()
+            self.assertEqual(job.events, ['idle', 'idle', 'day-plans/77/control', 'day-plans/77/control', 'day-plans/77/close'])
+            self.assertEqual((job.day['mode'], job.status['phase']), ('retired', 'day_complete'))
+
+    def test_repeat_of_a_retired_day_plan_marks_the_stream_done_without_failure(self):
+        for retired in (True, False):
+            with self.subTest(retired=retired), tempfile.TemporaryDirectory() as root, patch.object(r.sys, 'stderr', new=io.StringIO()) as err:
+                job = FakeDayRunner(root)
+                job.repo = Path(__file__).resolve().parents[3]
+                job.windows = dict.fromkeys([3, 4])
+                digest = 'e' * 64
+                job.query = lambda sql, *a: retired if digest in sql else []
+                admitted = []
+                def prepare(args, **kwargs):
+                    sid = args[args.index('--stream') + 1]
+                    out = Path(args[args.index('--out') + 1]); out.mkdir(parents=True)
+                    label = args[args.index('--label-prefix') + 1] + '-s' + sid + '-day-0001'
+                    if sid == '4':
+                        admitted.append(sid)
+                        (out / 'summary.json').write_text(json.dumps(dict(receipts=[dict(id=12, label=label)])))
+                        return
+                    (out / (label + '.json')).write_text(json.dumps(dict(label=label, plan_sha256=digest)))
+                    (out / 'admission-rejected.json').write_text(json.dumps(dict(http_status=409, stream_id=3, label=label,
+                        reason='{"error":"day cleanup plan label or digest already admitted"}', rejected_at_epoch=1)))
+                    raise r.CommandFailed(5)
+                with patch.object(r, 'command', side_effect=prepare):
+                    self.assertEqual(r.Runner.day_pick(job), 12)
+                self.assertEqual(admitted, ['4'])
+                self.assertFalse(job.stream_ready(3))
+                self.assertEqual(job.day_done == {3}, retired)
+                self.assertEqual('3' in job.status.get('excluded_streams', {}), not retired)
+                self.assertEqual('STEP FAILED' in err.getvalue(), not retired)
 
 
 if __name__ == '__main__': unittest.main()

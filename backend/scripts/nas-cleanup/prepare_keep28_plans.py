@@ -65,6 +65,7 @@ import argparse
 import base64
 import datetime
 import hashlib
+import http.client
 import json
 import os
 import pathlib
@@ -108,6 +109,9 @@ MAX_BATCH_PLANS = 500
 # retry this stream later. Every other failure stops the runner.
 EXIT_READ_FAILED = 4
 EXIT_ADMISSION_REJECTED = 5
+# Mirrors the runner's SHORT_READ_RETRY_DELAYS (120 s) for an unconfirmed day admission.
+ADMISSION_RETRY_DELAYS = (5, 10, 20, 30, 30, 25, None)
+TRANSIENT_HTTP = {408, 429, 500, 502, 503, 504}
 
 
 class AdmissionRejected(RuntimeError):
@@ -443,6 +447,42 @@ def validate_day_admission(plan, result, detail):
         raise RuntimeError('admitted day plan contract differs; reconcile its label before retrying')
 
 
+def day_admitted(plan, psql):
+    """Read-only: the id of the day plan holding this proposal's label, or None."""
+    rows = query("SELECT coalesce(json_agg(json_build_array(id,plan_sha256)),'[]') FROM nas_cleanup_day_plans "
+                 "WHERE account_id=47 AND connection_id=13 AND label='%s'" % plan['label'], psql)
+    if rows and rows[0][1] != plan['plan_sha256']:
+        raise RuntimeError('day plan label %s holds another digest; reconcile before retrying' % plan['label'])
+    return rows[0][0] if rows else None
+
+
+def day_admit(api, plan, psql):
+    """Admit one day plan: its id, or (None, the HTTP 409) for a refusal. A 5xx or transport
+    failure can follow a commit (the request outlives the proxy), so before any retry or
+    refusal decision read the label back and adopt a plan already admitted under it."""
+    for delay in ADMISSION_RETRY_DELAYS:
+        refusal = None
+        try:
+            return service(api, 'POST', 'day-plans', plan)['id'], None
+        except urllib.error.HTTPError as exc:
+            if exc.code != 409 and exc.code not in TRANSIENT_HTTP:
+                raise RuntimeError('day plan admission refused for %s: HTTP %d' % (plan['label'], exc.code)) from None
+            refusal = exc if exc.code == 409 else None
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead):
+            pass
+        try:
+            pid = day_admitted(plan, psql)
+        except ReadFailed:
+            pid = None
+            if refusal:
+                raise RuntimeError('day plan admission refusal for %s could not be read back' % plan['label']) from None
+        if pid or refusal:
+            return pid, None if pid else refusal
+        if delay is None:
+            raise RuntimeError('day plan admission not confirmed for %s; inspect the label before retrying' % plan['label'])
+        time.sleep(delay)
+
+
 def day_main(a, policy):
     """Prepare (and with --submit admit) NAS-only day-directory plans."""
     if a.max_units < 1 or a.max_units > MAX_DAY_UNITS:
@@ -468,19 +508,18 @@ def day_main(a, policy):
                'plans': [{k: p[k] for k in ('label', 'plan_sha256', 'files', 'bytes')} | {'units': len(p['units']), 'stream_id': p['units'][0]['stream_id']}
                          for p in plans], 'receipts': [], 'deletion_enabled': False}
     for plan in plans if a.submit else ():
-        try:
-            result = service(a.api, 'POST', 'day-plans', plan)
-        except urllib.error.HTTPError as exc:
-            if exc.code != 409 or summary['receipts'] or len(plans) != 1 or len(a.stream) != 1:
-                raise RuntimeError('day plan admission not confirmed for %s: HTTP %d; inspect the label before retrying' % (plan['label'], exc.code))
+        pid, refusal = day_admit(a.api, plan, a.psql)
+        if refusal:
+            if summary['receipts'] or len(plans) != 1 or len(a.stream) != 1:
+                raise RuntimeError('day plan admission refused for %s: HTTP 409' % plan['label'])
             evidence = dict(stream_id=a.stream[0], label=plan['label'], http_status=409,
-                            reason=exc.read(2048).decode(errors='replace'), rejected_at_epoch=time.time())
+                            reason=refusal.read(2048).decode(errors='replace'), rejected_at_epoch=time.time())
             with (out / 'admission-rejected.json').open('x') as f:
                 json.dump(evidence, f); f.flush(); os.fsync(f.fileno())
             return EXIT_ADMISSION_REJECTED
-        detail = service(a.api, 'GET', 'day-plans/' + str(result['id']))
-        validate_day_admission(plan, result, detail)
-        summary['receipts'].append({'id': result['id'], 'label': plan['label'], 'stream_id': plan['units'][0]['stream_id'],
+        detail = service(a.api, 'GET', 'day-plans/' + str(pid))
+        validate_day_admission(plan, {'id': pid, 'plan_sha256': plan['plan_sha256']}, detail)
+        summary['receipts'].append({'id': pid, 'label': plan['label'], 'stream_id': plan['units'][0]['stream_id'],
                                     'plan_sha256': plan['plan_sha256'], 'units': len(plan['units']),
                                     'files': plan['files'], 'bytes': plan['bytes']})
         print(json.dumps({'phase': 'day_plan_admitted_dry_run', **summary['receipts'][-1]}), flush=True)

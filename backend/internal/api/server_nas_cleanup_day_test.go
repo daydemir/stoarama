@@ -546,3 +546,46 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan)).Output()
 		t.Fatalf("close: %d %s", w.Code, w.Body)
 	}
 }
+
+// A flat directory holds every day of its recording. Only the clips named for
+// the unit's date are held-checked, so another day's hold never refuses it,
+// while every clip of the directory still gets the stream and name checks.
+func TestNASCleanupDayFlatDirectoryHoldsOnlyItsNamedDay(t *testing.T) {
+	pool, exec, _ := dayFixture(t)
+	ctx := context.Background()
+	dir := dayFixtureFolder + "/30/continuous"
+	flat := func(id int64, day, hhmmss string) {
+		t.Helper()
+		at := dayAt(day, hhmmss)
+		p := fmt.Sprintf("%s/%d.mp4", dir, at.Unix())
+		exec(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,
+ fire_at,clip_start_at,clip_end_at,display_path,purged_at) VALUES($1,30,1,'https://storage.example.test','fixture',$2,100,'etag',repeat('a',64),$3,$3,$4,$5,now())`,
+			id, fmt.Sprintf("obj-%d", id), at, at.Add(time.Minute), p)
+		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,client_updated_at)
+ VALUES(13,$1,30,$2,100,repeat('a',64),'present',now())`, id, p)
+	}
+	hold := func(id int64) {
+		exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica; INSERT INTO delivery_nas_source_holds(clip_id) VALUES(%d); COMMIT`, id))
+	}
+	flat(1, "2026-09-12", "103000")
+	flat(2, "2026-09-12", "235900")
+	flat(3, "2026-09-10", "103000")
+	unit := nasCleanupDayUnit{RelativeDir: dir, LocalDate: "2026-09-12", StreamID: 3, Files: 2, Bytes: 200}
+	hold(3)
+	if files, size, err := cleanupDayCheck(ctx, pool, unit); err != nil || files != 2 || size != 200 {
+		t.Fatalf("another day's hold refused the flat directory-day: %d files %d bytes %v", files, size, err)
+	}
+	if _, _, err := cleanupDayCheck(ctx, pool, nasCleanupDayUnit{RelativeDir: dir, LocalDate: "2026-09-10", StreamID: 3, Files: 1, Bytes: 100}); err == nil || !strings.Contains(err.Error(), "held") {
+		t.Fatalf("held clip did not refuse its own day: %v", err)
+	}
+	hold(2)
+	if _, _, err := cleanupDayCheck(ctx, pool, unit); err == nil || !strings.Contains(err.Error(), "held") {
+		t.Fatalf("held clip named for the day did not refuse it: %v", err)
+	}
+	// An undated name anywhere in the directory still refuses every unit there.
+	exec(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM delivery_nas_source_holds; COMMIT`)
+	exec(`UPDATE recording_clips SET display_path=$1 WHERE id=3`, dir+"/renamed.mp4")
+	if _, _, err := cleanupDayCheck(ctx, pool, unit); err == nil || !strings.Contains(err.Error(), "does not name a local date") {
+		t.Fatalf("undated name in the flat directory escaped: %v", err)
+	}
+}
