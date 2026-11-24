@@ -34,7 +34,10 @@ import (
 // server issues one permit per unit after checking the whole local day lies
 // outside the stream's pinned 20-day window (with a one-day guard band on
 // each side), and no catalogued clip of the unit is held. A
-// non-Keep-Everything unit has no R2 copy check. There is no daily cap.
+// non-Keep-Everything unit has no R2 copy check, and only a live NAS cleanup
+// incident hold keeps it (0259; Deniz: "we need to remove whatever is making us
+// think thats a mistake"; "just drop the recordings its fine, we'll fix the
+// links whenever"). There is no daily cap.
 //
 // Keep Everything (Deniz, verbatim: "nas shoul dnot have any of the keep
 // everything (except the keep 20)"; "if its the same size and same file name or
@@ -363,11 +366,11 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 		return nil, err
 	}
 	var held bool
-	if err := q.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM nas_media_keep20_epoch WHERE connection_id=13) OR nas_cleanup_day_dir_held($1)`, u.RelativeDir).Scan(&held); err != nil {
+	if err := q.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM nas_media_keep20_epoch WHERE connection_id=13) OR nas_cleanup_day_dir_held($1,$2)`, u.RelativeDir, w.KeepEverything).Scan(&held); err != nil {
 		return nil, err
 	}
 	if held {
-		return nil, errors.New("keep20 epoch inactive or delivery path hold in directory")
+		return nil, errors.New("keep20 epoch inactive or delivery path hold in a Keep Everything directory")
 	}
 	rows, err := q.Query(ctx, cleanupDayUnitSQL, u.RelativeDir, cleanupDayDirPattern.Replace(u.RelativeDir)+"/%")
 	if err != nil {
@@ -421,7 +424,7 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 	if len(files) == 0 {
 		return nil, errors.New("no catalogued NAS media in the directory-day")
 	}
-	if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM unnest($1::bigint[]) id WHERE nas_cleanup_day_clip_held(id))`, dated).Scan(&held); err != nil {
+	if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM unnest($1::bigint[]) id WHERE nas_cleanup_day_clip_held(id,$2))`, dated, w.KeepEverything).Scan(&held); err != nil {
 		return nil, err
 	}
 	if held {

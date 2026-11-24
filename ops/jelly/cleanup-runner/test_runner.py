@@ -1573,12 +1573,46 @@ class DayVerifyTests(unittest.TestCase):
         j = self.job
         calls = []
         with patch.object(j, 'query', return_value=[]), \
-             patch.object(j, 'prepare_stream', side_effect=lambda sid, args: calls.append((sid, args)) or False):
+             patch.object(j, 'prepare_stream', side_effect=lambda sid, args, exclusions: calls.append((sid, args)) or False):
             self.assertIsNone(j.day_pick())
         sids = [sid for sid, _ in calls]
         ke = [sid for sid in sids if sid in j.keep_everything]
         self.assertTrue(ke and sids == sorted(set(sids) - j.keep_everything) + sorted(ke))
         self.assertTrue(all(('--r2prune' in args) == (sid in j.keep_everything) for sid, args in calls))
+
+    def test_day_pick_ignores_per_file_exclusions_and_keeps_its_own(self):
+        # Per-file exclusions came from per-file refusals (source holds); they never skip day plans.
+        j = self.job
+        evidence = lambda sid: dict(http_status=409, stream_id=sid, reason='source_hold', label='k28auto-x-s%d-raw-0001' % sid)
+        j.status.update(excluded_streams={'3': evidence(3)}, day_excluded_streams={'4': evidence(4)})
+        seen = []
+        with patch.object(j, 'query', return_value=[]), \
+             patch.object(j, 'prepare_stream', side_effect=lambda sid, args, exclusions: seen.append((sid, exclusions)) or False):
+            self.assertIsNone(j.day_pick())
+        self.assertIn((3, r.DAY_EXCLUSIONS), seen)
+        self.assertNotIn(4, [sid for sid, _ in seen])
+        self.assertTrue(all(exclusions == r.DAY_EXCLUSIONS for _, exclusions in seen))
+        self.assertFalse(j.stream_ready(3))  # Per-file mode still skips it.
+        self.assertTrue(j.stream_ready(4))
+
+    def test_day_admission_409_excludes_the_stream_from_day_plans_only(self):
+        j = self.job
+        j.status.update(current_plan=None, last_error=None)
+        j.step_failed = lambda *a, **kw: None
+        def prepare(argv, **kwargs):
+            out = Path(argv[argv.index('--out') + 1]); out.mkdir(parents=True)
+            label = argv[argv.index('--label-prefix') + 1] + '-s3-day-0001'
+            (out / 'admission-rejected.json').write_text(json.dumps(dict(http_status=409, stream_id=3, label=label,
+                                                                         reason='catalogued clip is held')))
+            raise r.CommandFailed(5)
+        out = j.root / 'day-plans' / 'kday-x-s3'
+        with patch.object(r, 'command', side_effect=prepare):
+            self.assertFalse(j.prepare_stream(3, ['--day-plans', '--label-prefix', 'kday-x', '--out', str(out),
+                                                  '--submit', '--atomic-admission'], r.DAY_EXCLUSIONS))
+        self.assertEqual(j.status['day_excluded_streams']['3']['reason'], 'catalogued clip is held')
+        self.assertNotIn('3', j.status.get('excluded_streams') or {})
+        self.assertFalse(j.stream_ready(3, r.DAY_EXCLUSIONS))
+        self.assertTrue(j.stream_ready(3))
 
     def test_held_overlap_totals_digest_and_started_units_stop(self):
         for mutate in (lambda p, c: c[0].update(held=1), lambda p, c: c[0].update(overlap=1),
