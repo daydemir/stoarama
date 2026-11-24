@@ -17,8 +17,8 @@ import (
 
 const releaseMigration = "0218_r2_joined_batch_release.sql"
 
-// migrateBefore applies every migration except 0218, so a test can create the
-// batches 0218's seed reads before running it for real.
+// migrateBefore applies the migrations before 0218, so a test can create the
+// batches 0218's seed reads before running it and every later migration for real.
 func migrateBefore(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	t.Helper()
 	src := joinedPurgeMigrationsDir()
@@ -28,7 +28,7 @@ func migrateBefore(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
-		if e.Name() == releaseMigration || !strings.HasSuffix(e.Name(), ".sql") {
+		if e.Name() >= releaseMigration || !strings.HasSuffix(e.Name(), ".sql") {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(src, e.Name()))
