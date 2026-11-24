@@ -233,8 +233,11 @@ type cleanupDayQuerier interface {
 
 // Every catalogued clip directly in the directory ($1; $2 its LIKE pattern),
 // of any stream and at any time: Go refuses another stream's clip and checks exactly those whose name
-// names the unit's date, whatever their catalogued times.
-const cleanupDayUnitSQL = `SELECT c.display_path,c.clip_start_at,c.clip_end_at,r.stream_id,nas_cleanup_day_clip_held(c.id),
+// names the unit's date, whatever their catalogued times. The held check runs
+// afterwards on those clips only: a flat recordings/<id>/continuous directory
+// holds every day of the recording, and evaluating it per directory clip made
+// a 13-unit enable take ~130 s.
+const cleanupDayUnitSQL = `SELECT c.id,c.display_path,c.clip_start_at,c.clip_end_at,r.stream_id,
  coalesce((SELECT f.size_bytes FROM nas_inventory_files f WHERE f.connection_id=13 AND f.clip_id=c.id
   AND f.state='present' AND f.relative_path=c.display_path),-1)
  FROM recordings r JOIN recording_clips c ON c.recording_id=r.id
@@ -264,13 +267,14 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 	}
 	defer rows.Close()
 	var files, bytes int64
+	var dated []int64
 	for rows.Next() {
+		var id int64
 		var p string
 		var a, b *time.Time
 		var stream *int64
-		var clipHeld bool
 		var size int64
-		if err := rows.Scan(&p, &a, &b, &stream, &clipHeld, &size); err != nil {
+		if err := rows.Scan(&id, &p, &a, &b, &stream, &size); err != nil {
 			return 0, 0, err
 		}
 		if stream == nil || *stream != u.StreamID {
@@ -286,9 +290,7 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 		if a == nil || b == nil || !b.After(*a) || a.Before(w.end) && b.After(w.start) {
 			return 0, 0, errors.New("catalogued clip intersects the pinned keep window")
 		}
-		if clipHeld {
-			return 0, 0, errors.New("catalogued clip is held")
-		}
+		dated = append(dated, id)
 		if size >= 0 {
 			files++
 			bytes += size
@@ -299,6 +301,12 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 	}
 	if files == 0 {
 		return 0, 0, errors.New("no catalogued NAS media in the directory-day")
+	}
+	if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM unnest($1::bigint[]) id WHERE nas_cleanup_day_clip_held(id))`, dated).Scan(&held); err != nil {
+		return 0, 0, err
+	}
+	if held {
+		return 0, 0, errors.New("catalogued clip is held")
 	}
 	return files, bytes, nil
 }
