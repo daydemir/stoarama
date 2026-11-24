@@ -230,14 +230,18 @@ type cleanupDayQuerier interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-// Every catalogued clip directly in the directory, of any stream and at any
-// time: Go refuses another stream's clip and checks exactly those whose name
+// Every catalogued clip directly in the directory ($1; $2 its LIKE pattern),
+// of any stream and at any time: Go refuses another stream's clip and checks exactly those whose name
 // names the unit's date, whatever their catalogued times.
 const cleanupDayUnitSQL = `SELECT c.display_path,c.clip_start_at,c.clip_end_at,r.stream_id,nas_cleanup_day_clip_held(c.id),
  coalesce((SELECT f.size_bytes FROM nas_inventory_files f WHERE f.connection_id=13 AND f.clip_id=c.id
   AND f.state='present' AND f.relative_path=c.display_path),-1)
  FROM recordings r JOIN recording_clips c ON c.recording_id=r.id
- WHERE r.account_id=47 AND left(c.display_path,length($1)+1)=$1||'/' AND strpos(substr(c.display_path,length($1)+2),'/')=0`
+ WHERE r.account_id=47 AND c.display_path LIKE $2 AND strpos(substr(c.display_path,length($1)+2),'/')=0`
+
+// cleanupDayDirPattern is the left-anchored LIKE pattern for the directory's
+// entries, sargable on recording_clips_display_path_pattern (0248).
+var cleanupDayDirPattern = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
 // cleanupDayCheck returns the unit's catalogued NAS files and bytes, or why
 // the whole directory-day must stay.
@@ -253,7 +257,7 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 	if held {
 		return 0, 0, errors.New("keep20 epoch inactive or delivery path hold in directory")
 	}
-	rows, err := q.Query(ctx, cleanupDayUnitSQL, u.RelativeDir)
+	rows, err := q.Query(ctx, cleanupDayUnitSQL, u.RelativeDir, cleanupDayDirPattern.Replace(u.RelativeDir)+"/%")
 	if err != nil {
 		return 0, 0, err
 	}

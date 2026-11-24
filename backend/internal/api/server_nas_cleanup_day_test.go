@@ -305,11 +305,37 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 	// Same date and name shape as stream 3's own clip: only the stream differs.
 	d := dayDate("2026-09-12")
 	at := dayAt("2026-09-12", "113000")
-	exec(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,
- fire_at,clip_start_at,clip_end_at,display_path,purged_at) VALUES(2,31,1,'https://storage.example.test','fixture','obj-2',100,'etag',repeat('a',64),$1,$1,$2,$3,now())`,
-		at, at.Add(time.Minute), unit.RelativeDir+"/"+dayPlazaName(d, "113000"))
+	foreign := func(id int64, dir string) {
+		t.Helper()
+		exec(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,
+ fire_at,clip_start_at,clip_end_at,display_path,purged_at) VALUES($1,31,1,'https://storage.example.test','fixture',$2,100,'etag',repeat('a',64),$3,$3,$4,$5,now())`,
+			id, fmt.Sprintf("obj-%d", id), at, at.Add(time.Minute), dir+"/"+dayPlazaName(d, "113000"))
+	}
+	// A LIKE wildcard must not reach a lookalike directory ('_' is literal).
+	foreign(3, strings.Replace(unit.RelativeDir, "_", "x", 1))
+	if files, _, err := cleanupDayCheck(ctx, pool, unit); err != nil || files != 1 {
+		t.Fatalf("lookalike directory leaked into the unit: %d files %v", files, err)
+	}
+	foreign(2, unit.RelativeDir)
 	if _, _, err := cleanupDayCheck(ctx, pool, unit); err == nil || !strings.Contains(err.Error(), "another stream") {
 		t.Fatalf("another stream's clip did not refuse the directory-day: %v", err)
+	}
+	// The directory read is an index range scan on 0248's pattern index.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SET LOCAL enable_seqscan=off`); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := tx.Query(ctx, "EXPLAIN "+cleanupDayUnitSQL, unit.RelativeDir, cleanupDayDirPattern.Replace(unit.RelativeDir)+"/%")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil || !strings.Contains(strings.Join(plan, "\n"), "recording_clips_display_path_pattern") {
+		t.Fatalf("directory read does not use the pattern index (%v):\n%s", err, strings.Join(plan, "\n"))
 	}
 }
 
