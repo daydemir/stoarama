@@ -97,12 +97,14 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	defer pool.Close()
 	// Subset of 0158_recording_collation_v2 plus the connection columns used here.
 	if _, err := pool.Exec(ctx, `
-		CREATE TABLE connections(id BIGINT PRIMARY KEY,account_id BIGINT NOT NULL,kind TEXT NOT NULL,api_key_id BIGINT,updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
-		CREATE TABLE recordings(id BIGINT PRIMARY KEY,account_id BIGINT NOT NULL,delivery TEXT NOT NULL);
+		CREATE TABLE connections(id BIGINT PRIMARY KEY,account_id BIGINT NOT NULL,kind TEXT NOT NULL,api_key_id BIGINT,updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		  nas_storage_free_bytes BIGINT,nas_storage_reported_at TIMESTAMPTZ);
+		CREATE TABLE recordings(id BIGINT PRIMARY KEY,account_id BIGINT NOT NULL,delivery TEXT NOT NULL,stream_id BIGINT);
+		CREATE TABLE nas_media_keep20_windows(stream_id BIGINT PRIMARY KEY,timezone TEXT NOT NULL,start_at TIMESTAMPTZ NOT NULL,end_at TIMESTAMPTZ NOT NULL,keep_everything BOOLEAN NOT NULL);
 		CREATE TABLE recording_collation_hours(id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,local_date DATE NOT NULL,delivery_hour SMALLINT NOT NULL,generation INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'collated');
 		CREATE TABLE recording_collation_outputs(id BIGINT PRIMARY KEY,collation_hour_id BIGINT NOT NULL REFERENCES recording_collation_hours(id),part INTEGER NOT NULL,
 		  object_key TEXT NOT NULL,nas_relative_path TEXT NOT NULL UNIQUE,size_bytes BIGINT NOT NULL,sha256 TEXT NOT NULL,
-		  source_clip_ids BIGINT[] NOT NULL);
+		  source_clip_ids BIGINT[] NOT NULL,start_at TIMESTAMPTZ,end_at TIMESTAMPTZ);
 		CREATE TABLE recording_clips(id bigint PRIMARY KEY,display_path text);
 		CREATE TABLE delivery_keep_holds(bucket text,object_key text,kind text,etag text,size_bytes bigint,sha256 text,PRIMARY KEY(bucket,object_key));
 		CREATE TABLE clip_storage_billing_contracts(clip_id BIGINT PRIMARY KEY,mode TEXT NOT NULL,authoritative BOOLEAN NOT NULL DEFAULT true);
@@ -443,6 +445,58 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	expectCheckStatus("superseded")
+
+	// Under the 20-day epoch an unheld output overlapping its stream's pinned
+	// window is offered while fresh NAS free space clears the copy floor.
+	baseline := fmt.Sprint(feedIDs())
+	if _, err := pool.Exec(ctx, `UPDATE recordings SET stream_id=7 WHERE id=1;
+ INSERT INTO nas_media_keep20_windows VALUES(7,'UTC','2026-07-26T00:00:00Z','2026-07-27T00:00:00Z',false)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_collation_outputs VALUES
+  (107,12,1,'joined/b/objects/107.mp4',$1,1000,$3,'{5000}','2026-07-26T20:00:01Z','2026-07-26T21:00:01Z'),
+  (108,12,1,'joined/b/objects/108.mp4',$2,1000,$3,'{5000}','2026-07-27T00:00:00Z','2026-07-27T01:00:00Z')`,
+		dir+"20_200001-210001.mp4", dir+"21_000000-010000.mp4", sha); err != nil {
+		t.Fatal(err)
+	}
+	withWindow := strings.Replace(baseline, "]", " 107]", 1)
+	for _, step := range []struct{ sql, want string }{
+		{`UPDATE connections SET nas_storage_free_bytes=$1::bigint,nas_storage_reported_at=now() WHERE id=13`, baseline}, // no epoch
+		{`CREATE OR REPLACE FUNCTION nas_delivery_work_epoch(connection bigint) RETURNS boolean LANGUAGE sql STABLE AS $$SELECT true$$`, withWindow},
+		{`UPDATE connections SET nas_storage_free_bytes=$1::bigint-1 WHERE id=13`, baseline},
+		{`UPDATE connections SET nas_storage_free_bytes=$1::bigint,nas_storage_reported_at=now()-interval '6 minutes' WHERE id=13`, baseline},
+		{`UPDATE connections SET nas_storage_reported_at=now() WHERE id=13`, withWindow},
+	} {
+		args := []any{}
+		if strings.Contains(step.sql, "$1") {
+			args = append(args, collatedKeep20FreeBytes)
+		}
+		if _, err := pool.Exec(ctx, step.sql, args...); err != nil {
+			t.Fatal(err)
+		}
+		if ids := fmt.Sprint(feedIDs()); ids != step.want {
+			t.Fatalf("after %q feed=%s want %s", step.sql, ids, step.want)
+		}
+	}
+	// The ACK is the R2 lane's NAS evidence: exact contract path and size.
+	windowAck := map[string]any{"output_id": 107, "nas_relative_path": dir + "20_200001-210001.mp4", "size_bytes": 1000, "sha256": sha}
+	if code, _ := do(s.handleAccountCollatedAck, http.MethodPost, "/x", windowAck, nil); code != 200 {
+		t.Fatalf("window ACK code=%d", code)
+	}
+	var acked bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_collation_output_acks a JOIN recording_collation_outputs o ON o.id=a.output_id
+ WHERE a.output_id=107 AND a.connection_id=13 AND a.nas_relative_path=o.nas_relative_path AND a.size_bytes=o.size_bytes)`).Scan(&acked); err != nil || !acked {
+		t.Fatalf("window ACK evidence=%t: %v", acked, err)
+	}
+	if ids := fmt.Sprint(feedIDs()); ids != baseline {
+		t.Fatalf("acknowledged window output still offered: %s", ids)
+	}
+	if _, err := pool.Exec(ctx, `CREATE OR REPLACE FUNCTION nas_delivery_work_epoch(connection bigint) RETURNS boolean LANGUAGE sql STABLE AS $$SELECT false$$`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM recording_collation_outputs WHERE id=108`); err != nil {
+		t.Fatal(err)
+	}
 
 	// A prefix longer than the scan page is withheld, but the cursor must reach
 	// the later deliverable output. Duplicated sources cannot duplicate outputs.
