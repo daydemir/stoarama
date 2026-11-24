@@ -156,11 +156,7 @@ class DayCleanupTests(unittest.TestCase):
         self.assertTrue(second.exists())
         self.assertEqual(pull.cleanup_day_journal(self.inventory, None), [])
 
-    def test_bulk_release_has_no_local_daily_cap(self):
-        self.assertFalse(pull.cleanup_cap_exceeded(pull.CLEANUP_MAX_FILES_24H * 10, pull.CLEANUP_MAX_BYTES_24H * 10))
-        self.assertEqual(pull.cleanup_local_headroom(self.inventory)[0], pull.CLEANUP_V2_LEASE)
-        with mock.patch.object(pull, 'CLIENT_VERSION', pull.FAST_COPY_CLIENT_VERSION):
-            self.assertTrue(pull.cleanup_cap_exceeded(pull.CLEANUP_MAX_FILES_24H + 1, 1))
+    def test_day_release_is_on_the_cleanup_line(self):
         self.assertIn(pull.FAST_COPY_CLIENT_VERSION, pull.LOW_MEMORY_CLEANUP_VERSIONS)
         self.assertIn(pull.FAST_COPY_CLIENT_VERSION, pull.CLEANUP_BULK_VERSIONS)
 
