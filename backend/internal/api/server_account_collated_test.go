@@ -73,11 +73,6 @@ func TestValidCollatedNASPathPinsContract(t *testing.T) {
 }
 
 func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
-	// Shared CI runners are far slower than production for this 20k-row scan;
-	// the production budgets are exercised by the timing in production, not here.
-	budget, timeout := collatedFeedBudget, collatedFeedStatementTimeout
-	collatedFeedBudget, collatedFeedStatementTimeout = 60*time.Second, "60s"
-	t.Cleanup(func() { collatedFeedBudget, collatedFeedStatementTimeout = budget, timeout })
 	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
 	if databaseURL == "" {
 		t.Skip("set STOARAMA_TEST_DATABASE_URL")
@@ -514,6 +509,12 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 
 	// A prefix longer than the scan page is withheld, but the cursor must reach
 	// the later deliverable output. Duplicated sources cannot duplicate outputs.
+	// Shared CI runners are far slower than production for this 20k-row prefix
+	// scan; widen the feed budgets for this section only. The slow-feed check
+	// below still runs against the production budgets.
+	budget, timeout := collatedFeedBudget, collatedFeedStatementTimeout
+	collatedFeedBudget, collatedFeedStatementTimeout = 60*time.Second, "60s"
+	t.Cleanup(func() { collatedFeedBudget, collatedFeedStatementTimeout = budget, timeout })
 	prefixEnd := int64(1000 + collatedFeedScanLimit)
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_collation_outputs
  SELECT g,12,1,'object-'||g,'invalid-'||g,1000,repeat('a',64),ARRAY[5000::bigint]
@@ -575,6 +576,7 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	if fmt.Sprint(got) != fmt.Sprint(want) || !emptyAdvanced {
 		t.Fatalf("paged=%v oracle=%v advanced empty=%t", got, want, emptyAdvanced)
 	}
+	collatedFeedBudget, collatedFeedStatementTimeout = budget, timeout
 
 	// A complete expensive-stage batch rejected by the fence must advance only
 	// to that batch's end; later held outputs within the candidate page survive.
