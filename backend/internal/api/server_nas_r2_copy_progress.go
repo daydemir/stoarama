@@ -57,7 +57,9 @@ func (s *Server) nasR2CopyBlockResponse(w http.ResponseWriter, r *http.Request, 
 // Failure reporting deliberately does not reload source identity, policy,
 // maintenance or resource gates: none may prevent persisting a custody conflict.
 // The exact owning token must still match; expired-but-unreassigned owners may
-// latch their evidence, while a reassigned token never can.
+// latch their evidence, while a reassigned token never can. A fast lease clears
+// earlier fast tokens at once; the client keeps its local latch and reports it
+// with the item's next token.
 func (s *Server) handleNASR2CopyBlock(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.nasR2CopyConnection(w, r, nasConnectionMetadata); !ok {
 		return

@@ -1202,7 +1202,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		return cleanupObserveError(500, "invalid cleanup manifest")
 	}
 	certified := item.PermitReason == nasCleanupCertifiedStitchReason
-	nameSize := req.ClientVersion == nasFastCopyClientVersion
+	nameSize := nasFastCopyLine(req.ClientVersion)
 	if certified && (cid != 13 || env.session.version != nasCleanupCertifiedStitchVersion) {
 		return cleanupObserveError(409, "reviewed certified stitch cleanup client required")
 	}

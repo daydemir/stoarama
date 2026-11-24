@@ -4,6 +4,7 @@
 import argparse
 import base64
 import binascii
+import collections
 import concurrent.futures
 from contextlib import contextmanager, ExitStack
 import datetime
@@ -52,7 +53,8 @@ LOW_MEMORY_COPY_CLIENT_VERSION = "r2-copy-v8-low-memory"
 LOW_MEMORY_CLEANUP_CLIENT_VERSION = "r2-copy-v8-low-memory-cleanup"
 # Same artifact line built with the 20-day cleanup pin; identical behavior.
 KEEP20_CLEANUP_CLIENT_VERSION = "r2-copy-v8-keep20-cleanup"
-FAST_COPY_CLIENT_VERSION = "r2-copy-v8-fast-copy"
+# Fast-copy line; the API supplies the stream count with every lease.
+FAST_COPY_CLIENT_VERSION = "r2-copy-v8-tunable-copy"
 LOW_MEMORY_CLEANUP_VERSIONS = frozenset((LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, FAST_COPY_CLIENT_VERSION))
 CLEANUP_CERTIFIED_STITCH_REASON = "durham_stitch_certified"
 CLEANUP_CERTIFIED_STITCH_RECOVERY = "nas_stitch_certified"
@@ -770,7 +772,6 @@ class Config:
         self.download_workers = env_int("STOARAMA_DOWNLOAD_WORKERS", DEFAULT_DOWNLOAD_WORKERS)
         self.restore_workers = env_int("STOARAMA_RESTORE_WORKERS", DEFAULT_RESTORE_WORKERS)
         if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION:
-            self.fast_copy_workers = env_int("STOARAMA_R2_FAST_COPY_WORKERS", 8)
             self.fast_copy_reread = env_str("STOARAMA_R2_FAST_COPY_REREAD", "false").lower() == "true"
         self.inventory_scan_interval_sec = env_int("STOARAMA_INVENTORY_SCAN_INTERVAL_SEC", INVENTORY_SCAN_INTERVAL_SEC)
         # Hash throughput already bounds disk pressure. An additional per-file
@@ -800,8 +801,6 @@ class Config:
             raise SystemExit("STOARAMA_DOWNLOAD_WORKERS must be between 1 and %d" % MAX_DOWNLOAD_WORKERS)
         if self.restore_workers < 1 or self.restore_workers > MAX_RESTORE_WORKERS:
             raise SystemExit("STOARAMA_RESTORE_WORKERS must be between 1 and %d" % MAX_RESTORE_WORKERS)
-        if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION and not 1 <= self.fast_copy_workers <= 32:
-            raise SystemExit("STOARAMA_R2_FAST_COPY_WORKERS must be between 1 and 32")
         if self.inventory_scan_interval_sec < 300 or self.inventory_scan_delay_ms < 0 or self.inventory_hash_mbps < 0 or self.inventory_hash_mbps > 1000:
             raise SystemExit("invalid NAS inventory scan cadence")
         if self.min_free_bytes < 1:
@@ -53614,12 +53613,29 @@ class R2CopyBlocked(R2CopyHold):
         super().__init__(reason.value)
 
 
+R2_COPY_RATE_WINDOW_SEC = 300
+
+
 class R2CopyTelemetry:
     def __init__(self):
         self.lock = threading.Lock()
         self.holds = {}
         self.downloaded = self.committed = self.present = self.present_bytes = 0
         self.refreshed = self.refreshed_bytes = 0
+        self.workers = 0
+        self.recent = collections.deque()
+
+    def transferred(self, size):
+        with self.lock:
+            self.downloaded += size
+            self.recent.append((time.monotonic(), size))
+
+    def bytes_per_sec(self):
+        # Caller holds the lock. Rolling rate of fast GET bytes over the window.
+        cutoff = time.monotonic() - R2_COPY_RATE_WINDOW_SEC
+        while self.recent and self.recent[0][0] < cutoff:
+            self.recent.popleft()
+        return round(sum(size for _, size in self.recent) / R2_COPY_RATE_WINDOW_SEC)
 
     def hold(self, reason):
         with self.lock:
@@ -53635,6 +53651,7 @@ def r2_copy_status(inventory):
     with R2_COPY_TELEMETRY.lock:
         return dict(holds_by_reason=dict(R2_COPY_TELEMETRY.holds), mismatch_latched=mismatches,
                     downloaded_bytes=R2_COPY_TELEMETRY.downloaded, committed_bytes=R2_COPY_TELEMETRY.committed,
+                    workers=R2_COPY_TELEMETRY.workers, bytes_per_sec=R2_COPY_TELEMETRY.bytes_per_sec(),
                     verified_in_place=dict(objects=R2_COPY_TELEMETRY.present, bytes=R2_COPY_TELEMETRY.present_bytes),
                     refresh_verified_in_place=dict(objects=R2_COPY_TELEMETRY.refreshed, bytes=R2_COPY_TELEMETRY.refreshed_bytes))
 
@@ -54582,8 +54599,7 @@ def r2_fast_copy_stream(task, fd, guard, timings):
         timings["transfer_ms"] = round((time.monotonic() - first_byte) * 1000) if first_byte is not None else None
         timings["hash_ms"] = round(hash_sec * 1000, 3)
         timings["transferred_bytes"] = written
-        with R2_COPY_TELEMETRY.lock:
-            R2_COPY_TELEMETRY.downloaded += written
+        R2_COPY_TELEMETRY.transferred(written)
     info = os.fstat(fd)
     if written != item["size_bytes"]:
         raise R2CopyHold("copy GET truncated")
@@ -54669,11 +54685,14 @@ def r2_fast_copy_local(cfg, runtime, stop, deadline, task, reread):
         log("INFO", "R2 fast copy item " + json.dumps(timings, sort_keys=True))
 
 
-def r2_fast_copy_batch(cfg, runtime, inventory, stop, control, pool, response, reread):
+def r2_fast_copy_batch(cfg, runtime, inventory, stop, control, response, reread):
     tasks = [valid_r2_copy_task(task) for task in response["tasks"]]
     if (len(tasks) > 64 or any(task["item"]["kind"] != "raw" for task in tasks) or
             len({task["id"] for task in tasks}) != len(tasks)):
         raise R2CopyHold("invalid copy batch")
+    workers = response["workers"]
+    if type(workers) is not int or not 1 <= workers <= 32:
+        raise R2CopyHold("invalid copy worker count")
     expiry = parse_certification_timestamp(response["lease_expires_at"], "copy lease")
     deadline = time.monotonic() + expiry.timestamp() - time.time() - 5
     stats = {"tasks": len(tasks), "verified": 0}
@@ -54683,6 +54702,10 @@ def r2_fast_copy_batch(cfg, runtime, inventory, stop, control, pool, response, r
         pending, results, completed = {}, [], {}
         owned.enter_context(CLIENT_LOG_RING.scoped_secrets(
             value for task in tasks for value in (task["token"], task.get("url"))))
+        pool = owned.enter_context(concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="nas-r2-stream"))
+        with R2_COPY_TELEMETRY.lock:
+            R2_COPY_TELEMETRY.workers = workers
         def report_block(task, reason):
             nonlocal retry
             try:
@@ -54791,8 +54814,7 @@ def r2_fast_copy_backoff(failures):
 
 def r2_fast_copy_worker(cfg, runtime, inventory, stop):
     wait = failures = 0
-    with R2CopyControl(cfg, stop, 0) as control, concurrent.futures.ThreadPoolExecutor(
-            max_workers=cfg.fast_copy_workers, thread_name_prefix="nas-r2-stream") as pool:
+    with R2CopyControl(cfg, stop, 0) as control:
         while not stop.wait(wait):
             try:
                 free = r2_copy_resources(cfg, runtime)
@@ -54804,7 +54826,7 @@ def r2_fast_copy_worker(cfg, runtime, inventory, stop):
                 finally:
                     log("INFO", "R2 fast copy lease " + json.dumps(timing, sort_keys=True))
                 if response["tasks"] and not r2_fast_copy_batch(
-                        cfg, runtime, inventory, stop, control, pool, response, cfg.fast_copy_reread):
+                        cfg, runtime, inventory, stop, control, response, cfg.fast_copy_reread):
                     wait = failures = 0
                     continue
             except Exception as exc:

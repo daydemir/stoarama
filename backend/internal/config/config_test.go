@@ -742,6 +742,23 @@ func TestDefaultMagicLinkTTLIsOneHour(t *testing.T) {
 	}
 }
 
+func TestNASR2FastCopyWorkersDefaultAndBounds(t *testing.T) {
+	t.Setenv("NAS_R2_FAST_COPY_WORKERS", "")
+	if cfg, err := Load(); err != nil || cfg.NASR2FastCopyWorkers != 8 {
+		t.Fatalf("default workers=%d err=%v", cfg.NASR2FastCopyWorkers, err)
+	}
+	t.Setenv("NAS_R2_FAST_COPY_WORKERS", "32")
+	if cfg, err := Load(); err != nil || cfg.NASR2FastCopyWorkers != 32 {
+		t.Fatalf("workers=%d err=%v", cfg.NASR2FastCopyWorkers, err)
+	}
+	for _, value := range []string{"0", "33"} {
+		t.Setenv("NAS_R2_FAST_COPY_WORKERS", value)
+		if _, err := Load(); err == nil {
+			t.Fatalf("accepted NAS_R2_FAST_COPY_WORKERS=%s", value)
+		}
+	}
+}
+
 func TestMITSharedRecordingsConfiguration(t *testing.T) {
 	t.Setenv("MIT_SCL_RECORDINGS_READ_ACCOUNT_ID", "47")
 	t.Setenv("MIT_SCL_RECORDINGS_READ_SLUG", "mit-scl")

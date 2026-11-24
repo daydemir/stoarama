@@ -329,6 +329,7 @@ class FakeRunner(r.Runner):
         return {'plans': [self.p['id']] if self.p['mode'] == 'enabled' else [], 'batches': 0}
     def idle(self): self.events.append('idle')
     def progress(self): pass
+    def client_aborts(self): return 0
     def catalog(self, plan): return self.cat
     def plan(self, pid): return self.p
     def pick(self, lookahead=False): return self.picks.pop(0) if self.picks else None
@@ -903,6 +904,25 @@ class LoopTests(unittest.TestCase):
             with patch.object(r.time, 'sleep', side_effect=complete):
                 r.Runner.monitor(job, 42)
             self.assertEqual(job.events, ['OFF', 'recovery', 'plans/42/close'])
+
+    def test_monitor_halts_after_repeated_aborts_without_progress(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            job.p.update(mode='enabled', master_deletion_enabled=True)
+            job.p['results'][0]['state'] = 'leased'
+            counts = iter([46, 47, 48, 3, 4, 5, 6, 7, 8])
+            job.client_aborts = lambda: next(counts)
+            ticks = []
+            def tick(_):
+                ticks.append(1)
+                if len(ticks) == 4:  # an item settles: progress resets the streak
+                    job.p['results'][0]['state'] = 'deleted'
+            with patch.object(r.time, 'sleep', side_effect=tick), \
+                    self.assertRaisesRegex(r.Halt, 'aborting without progress'):
+                r.Runner.monitor(job, 42)
+            # 46->48 stays under the limit; the client restart (48->3) and the
+            # settled item each reset the baseline; 4->7 then halts.
+            self.assertEqual(len(ticks), 7)
 
     def test_monitor_rechecks_auto_pause_between_report_and_active_query(self):
         for reason in ('auto-paused: approval expired', 'auto-paused: uncertain receipt'):

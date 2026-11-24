@@ -36,6 +36,10 @@ POLICY = 'backend/internal/api/nas_cleanup_keep20_policy.json'
 POLICY_SHA = 'bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393'
 # Mirrors the server's nasCleanupMaxPlanBytes; the server re-checks every plan.
 PLAN_CAP = 2_000_000_000_000
+# Client-aborted execution groups tolerated without a new settled item. A
+# deterministic abort (e.g. a proof shape the executing release cannot match)
+# otherwise re-leases and aborts the same files every minute until approval ends.
+ABORT_LIMIT = 3
 RECOVERY = {'r2_sha_verified', 'r2_md5_etag_matched', 'r2_name_size_matched'}
 REASON = ('Deniz standing approval (window 20): NAS files outside the pinned 20-day window only; '
           'server dry run + independent verification PASS; verified R2 copies retained; '
@@ -338,6 +342,7 @@ class Runner:
         self.owner_validated = False
         self.windows = {}
         self.status = {'current_plan': None, 'last_error': None}
+        self.abort_base = None
 
     def start(self):
         # Collection sees either the old idle state or the new flock+PID, never
@@ -1090,7 +1095,24 @@ class Runner:
         self.save('batch_complete', current_plan=None, started_plan_sha256=None)
         self.progress()
 
+    def client_aborts(self):
+        aborted = self.query("SELECT coalesce((nas_cleanup_status->>'aborted_groups')::bigint,0) FROM connections WHERE id=13",
+                             'cleanup abort query')
+        require(type(aborted) is int and aborted >= 0, 'invalid cleanup abort count')
+        return aborted
+
+    def check_aborts(self, plan):
+        # The client's counter is per process: a restart lowers it and resets
+        # the baseline, as does any item leaving pending/leased.
+        settled = sum(r['state'] not in {'pending', 'leased', 'would_delete'} for r in results(plan))
+        aborted = self.client_aborts()
+        if self.abort_base is None or self.abort_base[0] != settled or aborted < self.abort_base[1]:
+            self.abort_base = (settled, aborted)
+        require(aborted - self.abort_base[1] < ABORT_LIMIT,
+                'cleanup execution keeps aborting without progress; owner review required')
+
     def monitor(self, pid):
+        self.abort_base = None
         while True:
             require(not self.status.get('shutdown_or_recovery_failed') and not self.status.get('recovery_error'),
                     'live ownership failure requires shutdown')
@@ -1114,6 +1136,7 @@ class Runner:
                         'owned running plan missing from active execution')
                 self.finish(p)
                 return
+            self.check_aborts(p)
             if self.status.get('next_plan') is not None:
                 dry_state(self.plan(self.status['next_plan']))  # A failed lookahead stops and alerts too.
             # STOP/SIGTERM drains the active plan naturally; never pause it for deployment.

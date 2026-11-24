@@ -63,7 +63,7 @@ class OwnershipTests(unittest.TestCase):
             self.collect(parts)
 
     def test_low_memory_cleanup_client_retains_ordinary_finish_ownership(self):
-        for version in ('r2-copy-v8-low-memory', 'r2-copy-v8-low-memory-cleanup', 'r2-copy-v8-keep20-cleanup', 'r2-copy-v8-fast-copy'):
+        for version in ('r2-copy-v8-low-memory', 'r2-copy-v8-low-memory-cleanup', 'r2-copy-v8-keep20-cleanup', 'r2-copy-v8-fast-copy', 'r2-copy-v8-tunable-copy'):
             parts = fixture()
             parts[5]['version'] = version
             self.assertEqual(self.collect(parts)['known_enabled_plans'], [1441])
