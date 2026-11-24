@@ -63,6 +63,9 @@ func MigrateUp(ctx context.Context, pool *pgxpool.Pool, migrationDir string) err
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", path, err)
 		}
+		if strings.TrimSpace(string(body)) == "" {
+			return fmt.Errorf("migration %s is empty; refusing to record it as applied", path)
+		}
 		if err := applyWithLockRetry(ctx, pool, name, string(body)); err != nil {
 			return err
 		}
