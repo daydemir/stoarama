@@ -43,6 +43,9 @@ func TestNASCleanupFastCopyNameSizeRecovery(t *testing.T) {
 	if gets, heads := f.bucket.counts(); gets != 0 || heads != 2 {
 		t.Fatalf("dry run: GET %d, HEAD %d", gets, heads)
 	}
+	// A plan dry-run by the fast release stays executable after the NAS
+	// updates to the tunable release of the same line.
+	f.useClientVersion(nasTunableCopyClientVersion)
 	f.s.cfg.NASCleanupDeletionEnabled = true
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 1); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)

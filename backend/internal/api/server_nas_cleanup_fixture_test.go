@@ -345,7 +345,7 @@ func (f *cleanupFixture) observeMD5(tasks []cleanupTask, requestIDs map[int64]st
 	observations := []map[string]any{}
 	for _, task := range tasks {
 		proof := fixtureProof(task.Item)
-		if f.version == nasFastCopyClientVersion {
+		if nasFastCopyLine(f.version) {
 			var fields map[string]json.RawMessage
 			if err := json.Unmarshal(proof, &fields); err != nil {
 				f.t.Fatal(err)

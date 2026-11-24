@@ -279,5 +279,74 @@ class Keep28PlanTests(unittest.TestCase):
         self.assertIn('f.connection_id=13 AND f.clip_id=c.id OFFSET 0', sql)
 
 
+def plaza(date, hhmmss='103000', folder='99991_asia_japan_tokyo_shinjuku9'):
+    month, weekday = k.MONTHS[date.month - 1], k.WEEKDAYS[date.weekday()]
+    return '%s/%s/%02d-%s/p_x_%04d_%s_W%d_%s_hour_%s.mp4' % (
+        folder, month, date.day, weekday, date.year, month, (date.day - 1) // 7 + 1, weekday, hhmmss)
+
+
+def clip(date, size=10, held=False, hhmmss='103000', folder='99991_asia_japan_tokyo_shinjuku9'):
+    start = k.datetime.datetime.combine(date, k.datetime.time(10, 30), k.zoneinfo.ZoneInfo('Asia/Tokyo'))
+    end = start + k.datetime.timedelta(minutes=1)
+    return [plaza(date, hhmmss, folder), start.isoformat(), end.isoformat(), held, size]
+
+
+class DayPlanTests(unittest.TestCase):
+    def setUp(self):
+        self.policy = k.load_policy(k.POLICY_PATH)  # Stream 3 keeps Tokyo [2026-09-16, 2026-10-06).
+        self.folders = k.load_folders()
+        self.d = k.datetime.date
+
+    def facts(self, *clips, live=(), held_dirs=()):
+        return dict(clips=list(clips), live=[list(x) for x in live], held_dirs=list(held_dirs), keep20_active=True)
+
+    def test_units_are_outside_unheld_non_keep_everything_directory_days(self):
+        out = self.d(2026, 9, 12)
+        facts = self.facts(clip(out, 10), clip(out, 20, hhmmss='113000'), clip(out, -1, hhmmss='123000'),
+                           clip(self.d(2026, 9, 15)), clip(self.d(2026, 9, 20)), clip(self.d(2026, 10, 6)),
+                           clip(self.d(2026, 10, 7), 5), clip(self.d(2026, 10, 10), held=True))
+        units = k.day_units(self.policy[3], self.folders, facts)
+        self.assertEqual([(u['local_date'], u['files'], u['bytes']) for u in units], [('2026-09-12', 2, 30), ('2026-10-07', 1, 5)])
+        self.assertEqual(units[0]['relative_dir'], '99991_asia_japan_tokyo_shinjuku9/September/12-Saturday')
+        self.assertEqual(k.day_units(self.policy[3], self.folders, self.facts(clip(out), live=[(units[0]['relative_dir'], '2026-09-12')])), [])
+        self.assertEqual(k.day_units(self.policy[3], self.folders, self.facts(clip(out), held_dirs=[units[0]['relative_dir']])), [])
+        self.assertEqual(k.day_units(self.policy[3], self.folders, dict(self.facts(clip(out)), keep20_active=False)), [])
+
+    def test_keep_everything_and_foreign_folders_yield_nothing(self):
+        ke = self.policy[78]
+        self.assertTrue(ke['keep_everything'])
+        facts = self.facts(clip(self.d(2026, 10, 10), folder='04_Asia_South_Korea_Seoul_Daechi_Station_Intersection'))
+        self.assertEqual(k.day_units(ke, self.folders, facts), [])
+        self.assertEqual(k.day_units(self.policy[3], self.folders, facts), [])
+
+    def test_undated_catalogue_name_refuses_its_directory(self):
+        out = self.d(2026, 9, 12)
+        odd = clip(out)
+        odd[0] = odd[0].rsplit('/', 1)[0] + '/renamed.mp4'
+        self.assertEqual(k.day_units(self.policy[3], self.folders, self.facts(clip(out), odd)), [])
+
+    def test_plans_carry_checkable_totals_and_the_server_digest(self):
+        unit = {'relative_dir': 'a/September/12-Saturday', 'local_date': '2026-09-12', 'stream_id': 3, 'files': 2, 'bytes': 300}
+        # Golden digest shared with backend cleanupDayDigest.
+        self.assertEqual(k.day_digest([unit]), '9116c84bd7061b32fa4560b4d0eeafafb47928ed9482772d4ae6d6e2cca5feb3')
+        units = [dict(unit, local_date='2026-09-%02d' % n, files=n, bytes=10 * n) for n in range(1, 6)]
+        plans = k.day_plans(units, 'kday', 2)
+        self.assertEqual([p['label'] for p in plans], ['kday-s3-day-0001', 'kday-s3-day-0002', 'kday-s3-day-0003'])
+        self.assertEqual([(p['files'], p['bytes']) for p in plans], [(3, 30), (7, 70), (5, 50)])
+        self.assertTrue(all(p['plan_sha256'] == k.day_digest(p['units']) and p['policy_sha256'] == k.POLICY_SHA for p in plans))
+        detail = dict(id=9, label=plans[0]['label'], plan_sha256=plans[0]['plan_sha256'], mode='dry_run', policy_sha256=k.POLICY_SHA,
+                      files=3, bytes=30, units=[dict(u, state='pending', receipts=[]) for u in plans[0]['units']])
+        k.validate_day_admission(plans[0], dict(id=9, plan_sha256=plans[0]['plan_sha256']), detail)
+        with self.assertRaises(RuntimeError):
+            k.validate_day_admission(plans[0], dict(id=9, plan_sha256=plans[0]['plan_sha256']), dict(detail, files=4))
+
+    def test_day_dates_match_server_and_client(self):
+        tokyo = k.zoneinfo.ZoneInfo('Asia/Tokyo')
+        self.assertEqual(k.day_file_date('recordings/366/continuous', '1789227000.mp4', tokyo), self.d(2026, 9, 13))
+        self.assertEqual(k.day_file_date('recordings/366/77', '1789227000000.mp4', tokyo), self.d(2026, 9, 13))
+        self.assertIsNone(k.day_file_date('recordings/366/77', '1789227000.mp4', tokyo))
+        self.assertEqual(k.pg_timestamp('2026-09-12T01:30:00.5+00:00').microsecond, 500000)
+
+
 if __name__ == '__main__':
     unittest.main()

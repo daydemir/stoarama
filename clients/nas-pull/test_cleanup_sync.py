@@ -11,10 +11,11 @@ from pathlib import Path
 
 class CleanupSyncTests(unittest.TestCase):
     def test_eight_file_group_sync_budget(self):
-        self.measure('cleanup-batch-v6.1', commits=21, syncs=45)
+        # Removing the local cap reservation dropped one SQLite commit+fsync.
+        self.measure('cleanup-batch-v6.1', commits=20, syncs=44)
 
     def test_v7_eight_file_group_sync_budget(self):
-        self.measure('cleanup-batch-v7', commits=7, syncs=10)
+        self.measure('cleanup-batch-v7', commits=6, syncs=9)
 
     def measure(self, version, commits, syncs):
         source = Path(__file__).parent

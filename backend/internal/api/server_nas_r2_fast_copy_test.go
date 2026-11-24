@@ -25,7 +25,7 @@ type fastCopyLeaseReply struct {
 
 func useFastCopyFixture(t *testing.T, f *cleanupFixture) {
 	t.Helper()
-	migration, err := os.ReadFile("../../../infra/sql/migrations/0240_nas_r2_fast_copy_lease_cap.sql")
+	migration, err := os.ReadFile("../../../infra/sql/migrations/0247_nas_r2_tunable_copy_lease_cap.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,8 +36,9 @@ func useFastCopyFixture(t *testing.T, f *cleanupFixture) {
 	if _, err = f.pool.Exec(f.ctx, `UPDATE recording_clips SET etag=$1 WHERE id>=901 AND id<906`, hex.EncodeToString(sum[:])); err != nil {
 		t.Fatal(err)
 	}
-	f.useClientVersion(nasFastCopyClientVersion)
+	f.useClientVersion(nasTunableCopyClientVersion)
 	f.s.cfg.NASR2CopyEnabled = true
+	f.s.cfg.NASR2FastCopyWorkers = 2
 }
 
 func fastCopyLease(t *testing.T, f *cleanupFixture) fastCopyLeaseReply {
@@ -55,7 +56,8 @@ func TestNASR2CopyV8FastBatchLeaseCapAndExactGET(t *testing.T) {
 	queueCopySources(t, f, item)
 	useFastCopyFixture(t, f)
 	f.s.cfg.NASR2FastCopyBatchSize = 5
-	// Competing batch requests rely on the transaction's live-slot recount.
+	// Competing batch requests serialize on the admission lock; the later one
+	// supersedes the earlier, so only one batch's tokens stay live.
 	var wg sync.WaitGroup
 	batches := make(chan *httptest.ResponseRecorder, 2)
 	for range 2 {
@@ -64,6 +66,11 @@ func TestNASR2CopyV8FastBatchLeaseCapAndExactGET(t *testing.T) {
 		})
 	}
 	wg.Wait()
+	var live []string
+	if err := f.pool.QueryRow(f.ctx, `SELECT coalesce(array_agg(lease_token ORDER BY id),'{}') FROM nas_r2_copy_items
+ WHERE state='leased' AND lease_expires_at>now()`).Scan(&live); err != nil {
+		t.Fatal(err)
+	}
 	var batch fastCopyLeaseReply
 	for range 2 {
 		out := <-batches
@@ -71,12 +78,15 @@ func TestNASR2CopyV8FastBatchLeaseCapAndExactGET(t *testing.T) {
 		if err := json.Unmarshal(out.Body.Bytes(), &reply); err != nil || out.Code != 200 {
 			t.Fatalf("concurrent fast lease %d %s: %v", out.Code, out.Body, err)
 		}
-		if len(reply.Tasks) != 0 {
+		if len(reply.Tasks) != 0 && reply.Tasks[0].Token == live[0] {
 			if len(batch.Tasks) != 0 {
 				t.Fatal("the same queue admitted two live batches")
 			}
 			batch = reply
 		}
+	}
+	if len(live) != 5 {
+		t.Fatalf("live leases = %d, want one batch of 5", len(live))
 	}
 	if len(batch.Tasks) != 5 || batch.Expires.Before(time.Now().Add(15*time.Minute)) {
 		t.Fatalf("received %d tasks, lease expires %s", len(batch.Tasks), batch.Expires)
@@ -161,8 +171,20 @@ func TestNASR2CopyV8FastConfiguredCapAndLegacyAfterMigration(t *testing.T) {
 	queueCopySources(t, f, item)
 	useFastCopyFixture(t, f)
 	f.s.cfg.NASR2FastCopyBatchSize = 2
-	if first, second := fastCopyLease(t, f), fastCopyLease(t, f); len(first.Tasks) != 2 || len(second.Tasks) != 0 {
-		t.Fatalf("configured cap returned %d + %d tasks", len(first.Tasks), len(second.Tasks))
+	// A lost lease or result response must not strand items for the lease TTL:
+	// the next lease supersedes the unreported batch and re-grants its items.
+	first, second := fastCopyLease(t, f), fastCopyLease(t, f)
+	if len(first.Tasks) != 2 || len(second.Tasks) != 2 || first.Tasks[0].ID != second.Tasks[0].ID || first.Tasks[0].Token == second.Tasks[0].Token {
+		t.Fatalf("superseding lease returned %+v after %+v", second.Tasks, first.Tasks)
+	}
+	stale := map[string]any{"free_bytes": NASR2CopyFloor + 1e9, "results": []nasR2FastCopyResult{{ID: first.Tasks[0].ID, Token: first.Tasks[0].Token}}}
+	if out := copyCall(f, "result-batch", 0, stale); out.Code != 200 || !strings.Contains(out.Body.String(), `"verified":[]`) {
+		t.Fatalf("stale result %d %s", out.Code, out.Body)
+	}
+	var live int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM nas_r2_copy_items WHERE state='leased' AND lease_expires_at>now() AND lease_token=ANY($1)`,
+		[]string{second.Tasks[0].Token, second.Tasks[1].Token}).Scan(&live); err != nil || live != 2 {
+		t.Fatalf("superseding leases live=%d err=%v", live, err)
 	}
 	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_r2_copy_items SET lease_expires_at=now()-interval '1 second'`); err != nil {
 		t.Fatal(err)
@@ -221,7 +243,7 @@ func TestNASR2CopyV8FastClientServerPipeline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(f.ctx, 20*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, python, "-B", "-c", `
-import concurrent.futures, http.client, pathlib, sys, threading, urllib.request
+import http.client, pathlib, sys, threading, urllib.request
 from unittest import mock
 
 import test_stoarama_pull as support
@@ -245,20 +267,20 @@ build = urllib.request.build_opener
 stop = threading.Event()
 inventory = pull.Inventory(cfg)
 try:
-    with pull.R2CopyControl(cfg, stop, 0) as control, concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+    with pull.R2CopyControl(cfg, stop, 0) as control:
         batch = control.request_json(pull.R2CopyControlOperation.LEASE, "/account/connections/r2-copy/lease",
                                      body={"free_bytes": free, "verify_existing": True})
-        assert len(batch["tasks"]) == 5
+        assert len(batch["tasks"]) == 5 and batch["workers"] == 2
         for task in batch["tasks"]:
             assert task["url"].startswith("http://127.0.0.1:")
             task["url"] = task["url"].replace("http:", "https:", 1)
         with mock.patch.object(pull, "r2_copy_resources", return_value=free), \
                 mock.patch.object(pull, "storage_status", return_value={"available": True, "free_bytes": free}), \
                 mock.patch.object(urllib.request, "build_opener", side_effect=lambda *handlers: build(*handlers, LoopbackHTTP())):
-            assert not pull.r2_fast_copy_batch(cfg, pull.Runtime(cfg), inventory, stop, control, pool, batch, False)
+            assert not pull.r2_fast_copy_batch(cfg, pull.Runtime(cfg), inventory, stop, control, batch, False)
 finally:
     inventory.close()
-`, api.URL, root, nasFastCopyClientVersion)
+`, api.URL, root, nasTunableCopyClientVersion)
 	cmd.Dir = "../../../clients/nas-pull"
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -283,7 +305,7 @@ finally:
 func TestNASStorageBindingV8FastCopyMigration(t *testing.T) {
 	s, pool := storageHeartbeatFixture(t)
 	ctx := context.Background()
-	for _, name := range []string{"0237_nas_storage_v8_cleanup_binding.sql", "0238_nas_storage_v8_keep20_cleanup_binding.sql", "0239_nas_storage_v8_fast_copy_binding.sql"} {
+	for _, name := range []string{"0237_nas_storage_v8_cleanup_binding.sql", "0238_nas_storage_v8_keep20_cleanup_binding.sql", "0239_nas_storage_v8_fast_copy_binding.sql", "0246_nas_storage_v8_tunable_copy_binding.sql"} {
 		body, err := os.ReadFile("../../../infra/sql/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
@@ -293,19 +315,19 @@ func TestNASStorageBindingV8FastCopyMigration(t *testing.T) {
 		}
 	}
 	for _, version := range []string{"r2-copy-v5", NASR2CopyPagedClientVersion, nasCleanupCertifiedStitchVersion,
-		nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion} {
+		nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion, nasTunableCopyClientVersion} {
 		if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version=$1,nas_storage_budget_at=now() WHERE id=13`, version); err != nil {
 			t.Fatalf("binding refused %q: %v", version, err)
 		}
 	}
-	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version=$1 WHERE id=13`, nasFastCopyClientVersion+"-extra"); err == nil {
+	if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version=$1 WHERE id=13`, nasTunableCopyClientVersion+"-extra"); err == nil {
 		t.Fatal("binding accepted an unreviewed literal")
 	}
-	nonce := storageHeartbeat(t, s, nasFastCopyClientVersion, storageSample(""))
+	nonce := storageHeartbeat(t, s, nasTunableCopyClientVersion, storageSample(""))
 	issued := storageObservation(t, pool).issued
-	storageHeartbeat(t, s, nasFastCopyClientVersion, storageSample(nonce))
+	storageHeartbeat(t, s, nasTunableCopyClientVersion, storageSample(nonce))
 	obs := storageObservation(t, pool)
-	if issued == nil || obs.version != nasFastCopyClientVersion || obs.budget == nil || !obs.budget.Equal(*issued) {
+	if issued == nil || obs.version != nasTunableCopyClientVersion || obs.budget == nil || !obs.budget.Equal(*issued) {
 		t.Fatalf("fast copy did not persist the exact storage binding: %+v", obs)
 	}
 }

@@ -350,7 +350,6 @@ class CleanupBulkTests(unittest.TestCase):
         self.assertEqual(rows[0]['outcome'], 'deleted')
         self.assertTrue(rows[0]['unlink_attempted'])
         self.assertTrue(all(row['unlink_attempted'] is False and row['refusal_protocol'] == 1 for row in rows[1:]))
-        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 1)
 
     def test_directory_sync_failure_persists_uncertain_parent_results(self):
         tasks = self.group(3)

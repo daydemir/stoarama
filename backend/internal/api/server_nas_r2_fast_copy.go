@@ -41,9 +41,19 @@ type nasR2FastCopyCandidate struct {
 	reason    NASR2CopyBlockReason
 }
 
+// The fast client has one batch worker, and that worker asks for a lease only
+// after every future of its previous batch has returned. A new lease therefore
+// supersedes all earlier fast leases of the connection: a batch whose lease or
+// result response was lost frees its items now, not when its hour-long TTL ends.
+// A lease request the client already timed out can still commit after its
+// retry, so a superseded token may publish bytes the server never acknowledges.
+// That copy is ETag-bound and create-only; the next lease verifies it in place.
 var nasR2FastCopyEligible = `q.connection_id=$1 AND q.kind='raw' AND (q.item->>'size_bytes')::bigint <= ` + strconv.FormatInt(nasR2FastCopyMaxFile, 10) + ` AND
- (q.state='pending' OR (q.state='leased' AND q.lease_expires_at<clock_timestamp())
- OR ($2 AND control.enabled AND (q.state='refresh_pending' OR (q.state='refresh_leased' AND q.lease_expires_at<clock_timestamp()))))`
+ (q.state IN ('pending','leased') OR ($2 AND control.enabled AND q.state IN ('refresh_pending','refresh_leased')))`
+
+// A discarded capability returns its item to the queue; only a fresh lease may grant another GET.
+const nasR2FastCopyRelease = `UPDATE nas_r2_copy_items SET state=CASE WHEN work_mode='copy' THEN 'pending' ELSE 'refresh_pending' END,
+ lease_token=NULL,lease_expires_at=NULL,updated_at=clock_timestamp() WHERE `
 
 func (s *Server) handleNASR2FastCopyLease(w http.ResponseWriter, r *http.Request, cid int64, verify bool) {
 	ctx := r.Context()
@@ -63,8 +73,7 @@ func (s *Server) handleNASR2FastCopyLease(w http.ResponseWriter, r *http.Request
 	}
 	rows, err := s.pool.Query(ctx, `SELECT q.id,q.item,q.policy_sha256,q.work_mode,coalesce(c.etag,'')
  FROM nas_r2_copy_items q CROSS JOIN r2_keep28_refresh_control control LEFT JOIN recording_clips c ON c.id=q.source_id
- WHERE `+nasR2FastCopyEligible+` ORDER BY (q.work_mode=control.last_mode),CASE WHEN q.work_mode='verify_existing' THEN q.updated_at END,q.id LIMIT
- greatest(0,$3-(SELECT count(*) FROM nas_r2_copy_items WHERE connection_id=$1 AND state IN ('leased','refresh_leased') AND lease_expires_at>clock_timestamp()))`, cid, verify, limit)
+ WHERE `+nasR2FastCopyEligible+` ORDER BY (q.work_mode=control.last_mode),CASE WHEN q.work_mode='verify_existing' THEN q.updated_at END,q.id LIMIT $3`, cid, verify, limit)
 	if err != nil {
 		util.WriteError(w, 503, "copy queue unavailable")
 		return
@@ -146,18 +155,20 @@ func (s *Server) handleNASR2FastCopyLease(w http.ResponseWriter, r *http.Request
 		nasR2CopyReadyError(w, err)
 		return
 	}
-	var active int
 	var version string
 	var expires time.Time
-	if err = tx.QueryRow(ctx, `SELECT client_version,clock_timestamp()+$2::integer*interval '1 second',
- (SELECT count(*) FROM nas_r2_copy_items WHERE connection_id=$1 AND state IN ('leased','refresh_leased') AND lease_expires_at>clock_timestamp())
- FROM connections WHERE id=$1`, cid, int(nasR2FastCopyLeaseTTL/time.Second)).Scan(&version, &expires, &active); err != nil || version != nasFastCopyClientVersion {
+	if err = tx.QueryRow(ctx, `SELECT client_version,clock_timestamp()+$2::integer*interval '1 second'
+ FROM connections WHERE id=$1`, cid, int(nasR2FastCopyLeaseTTL/time.Second)).Scan(&version, &expires); err != nil || !nasFastCopyLine(version) {
 		util.WriteError(w, 409, "copy session changed during admission")
+		return
+	}
+	if _, err = tx.Exec(ctx, nasR2FastCopyRelease+`connection_id=$1 AND kind='raw' AND state IN ('leased','refresh_leased')`, cid); err != nil {
+		util.WriteError(w, 503, "copy lease supersede failed")
 		return
 	}
 	tasks := make([]nasR2FastCopyTask, 0, len(candidates))
 	for _, c := range candidates {
-		if active+len(tasks) >= limit {
+		if len(tasks) >= limit {
 			break
 		}
 		if c.Token == "" && c.reason == "" {
@@ -206,7 +217,7 @@ func (s *Server) handleNASR2FastCopyLease(w http.ResponseWriter, r *http.Request
 		util.WriteError(w, 503, "copy R2 capability unavailable; retryable")
 		return
 	}
-	util.WriteJSON(w, 200, map[string]any{"tasks": tasks, "lease_expires_at": expires, "floor_bytes": NASR2CopyFloor})
+	util.WriteJSON(w, 200, map[string]any{"tasks": tasks, "lease_expires_at": expires, "floor_bytes": NASR2CopyFloor, "workers": s.cfg.NASR2FastCopyWorkers})
 }
 
 type nasR2FastCopyResult struct {
@@ -222,7 +233,7 @@ func (s *Server) handleNASR2FastCopyResults(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	version, _ := nasRequestWorkVersion(r, nasConnectionCopy)
-	if version != nasFastCopyClientVersion {
+	if !nasFastCopyLine(version) {
 		util.WriteError(w, 409, "fast copy release required")
 		return
 	}
@@ -299,10 +310,8 @@ func (s *Server) handleNASR2FastCopyResults(w http.ResponseWriter, r *http.Reque
 			}, true)
 			verified = append(verified, task.ID)
 		} else if err == nil {
-			// A failed or unused capability is discarded. Only a fresh lease
-			// may grant another GET, and a stale owner cannot return its replacement.
-			_, err = tx.Exec(ctx, `UPDATE nas_r2_copy_items SET state=CASE WHEN work_mode='copy' THEN 'pending' ELSE 'refresh_pending' END,
- lease_token=NULL,lease_expires_at=NULL,updated_at=clock_timestamp() WHERE id=$1`, task.ID)
+			// A stale owner cannot return its replacement: the token matched above.
+			_, err = tx.Exec(ctx, nasR2FastCopyRelease+`id=$1`, task.ID)
 		}
 		if err != nil {
 			util.WriteError(w, 503, "copy result failed; retryable")

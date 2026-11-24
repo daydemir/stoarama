@@ -17,8 +17,8 @@ import (
 
 const releaseMigration = "0218_r2_joined_batch_release.sql"
 
-// migrateBefore applies every migration except 0218, so a test can create the
-// batches 0218's seed reads before running it for real.
+// migrateBefore applies the migrations before 0218, so a test can create the
+// batches 0218's seed reads before running it and every later migration for real.
 func migrateBefore(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	t.Helper()
 	src := joinedPurgeMigrationsDir()
@@ -28,7 +28,7 @@ func migrateBefore(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
-		if e.Name() == releaseMigration || !strings.HasSuffix(e.Name(), ".sql") {
+		if e.Name() >= releaseMigration || !strings.HasSuffix(e.Name(), ".sql") {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(src, e.Name()))
@@ -180,18 +180,13 @@ func TestR2JoinedBatchRelease(t *testing.T) {
 	if partitionHeld[keys[1]] || partitionHeld[keys[8]] || !partitionHeld[keys[2]] || !partitionHeld[keys[5]] || !partitionHeld[keys[6]] || len(partitionReleased) != 2 || !partitionReleased[keys[1]] || !partitionReleased[keys[8]] {
 		t.Fatalf("partition held %v released %v", partitionHeld, partitionReleased)
 	}
-	// The purge exemption belongs to the RAW lane's exact intent only.
-	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=1`); err == nil {
-		t.Fatal("bare purge of a released source was admitted")
-	}
 	intent := func(table, extraCols, extraVals string, id int64) {
 		replica(t, ctx, pool, `INSERT INTO `+table+`(bucket,object_key,source_id,size_bytes,etag,last_modified,manifest_sha256,policy_sha256,picks_sha256,drain_evidence_sha256,choice,endpoint_sha256,stream_id`+extraCols+`)
  VALUES('stoarama','`+keys[id]+`',`+string(rune('0'+id))+`,100,'etag','2026-11-01',repeat('a',64),'060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811',repeat('b',64),repeat('c',64),'none',repeat('e',64),3`+extraVals+`)`)
 	}
+	// 0243: a frozen batch's source may gain purged_at without a lane intent;
+	// TestJoinedSourcePurgeRelease covers what still refuses.
 	intent("r2_keep28_intents", ",custody", ",'{}'::jsonb", 8)
-	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=8`); err == nil {
-		t.Fatal("a keep-28 intent purged a released source")
-	}
 	// Production order: reserve writes the RAW intent, then probes the purge.
 	a, entry := releaseApplier(t, ctx, pool, keys[1])
 	if _, err = a.reserve(ctx, entry); err != nil {
@@ -226,9 +221,6 @@ func TestR2JoinedBatchRelease(t *testing.T) {
 		t.Fatalf("RAW purge of a released source refused: %v", err)
 	}
 	intent("r2_inverse_intents", "", "", 2)
-	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=2`); err == nil {
-		t.Fatal("a source the decoy batch still claims was purged")
-	}
 	if _, err = pool.Exec(ctx, `DELETE FROM recording_clips WHERE id=1`); err == nil {
 		t.Fatal("a released source was deleted outright")
 	}
