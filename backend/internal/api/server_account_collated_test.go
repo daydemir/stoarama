@@ -73,6 +73,11 @@ func TestValidCollatedNASPathPinsContract(t *testing.T) {
 }
 
 func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
+	// Shared CI runners are far slower than production for this 20k-row scan;
+	// the production budgets are exercised by the timing in production, not here.
+	budget, timeout := collatedFeedBudget, collatedFeedStatementTimeout
+	collatedFeedBudget, collatedFeedStatementTimeout = 60*time.Second, "60s"
+	t.Cleanup(func() { collatedFeedBudget, collatedFeedStatementTimeout = budget, timeout })
 	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
 	if databaseURL == "" {
 		t.Skip("set STOARAMA_TEST_DATABASE_URL")
