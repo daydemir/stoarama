@@ -346,9 +346,9 @@ func releaseApplier(t *testing.T, ctx context.Context, pool *pgxpool.Pool, key s
 	return &inverseApplier{pool: pool, store: store, opts: o, summary: sum, protection: p, ledger: ledger, keEpoch: epoch}, entry
 }
 
-// TestJoinedSourcePurgeRelease proves 0243: a frozen joined source may gain
-// purged_at, a source a batch is still snapshotting may not, and deletion
-// stays refused.
+// TestJoinedSourcePurgeRelease proves 0243/0249: a frozen joined source may gain
+// purged_at, a source a batch is still snapshotting or building may not, and
+// deletion stays refused.
 func TestJoinedSourcePurgeRelease(t *testing.T) {
 	ctx := context.Background()
 	pool := joinedPurgeTestPool(t, "joined_purge_release")
@@ -364,16 +364,20 @@ func TestJoinedSourcePurgeRelease(t *testing.T) {
 	}
 	replica(t, ctx, pool,
 		`INSERT INTO recording_clips(id,recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path)
- SELECT n,30,n,1,'https://test.invalid','stoarama','managed/acct-47/purge/'||n||'.mp4',100,'etag',repeat('b',64),'2026-06-01','2026-06-01','2026-06-01 00:01:00','purge/'||n FROM generate_series(1,2) n`,
-		`INSERT INTO recording_joined_batches(id,batch_id,generation,connection_id,state) VALUES(5,'frozen',1,13,'frozen'),(7,'live',1,13,'snapshotting')`,
+ SELECT n,30,n,1,'https://test.invalid','stoarama','managed/acct-47/purge/'||n||'.mp4',100,'etag',repeat('b',64),'2026-06-01','2026-06-01','2026-06-01 00:01:00','purge/'||n FROM generate_series(1,3) n`,
+		`INSERT INTO recording_joined_batches(id,batch_id,generation,connection_id,state) VALUES(5,'frozen',1,13,'frozen'),(7,'live',1,13,'snapshotting'),(8,'building',1,13,'building')`,
 		`INSERT INTO recording_joined_source_snapshots(id,batch_record_id,clip_id,recording_id,bucket,object_key,ingest_etag,size_bytes,sha256,start_at,end_at)
- SELECT c.id,5,c.id,c.recording_id,c.bucket,c.object_key,c.etag,c.size_bytes,c.sha256,c.clip_start_at,c.clip_end_at FROM recording_clips c`,
+ SELECT c.id,5,c.id,c.recording_id,c.bucket,c.object_key,c.etag,c.size_bytes,c.sha256,c.clip_start_at,c.clip_end_at FROM recording_clips c
+ UNION ALL SELECT 100+c.id,8,c.id,c.recording_id,c.bucket,c.object_key,c.etag,c.size_bytes,c.sha256,c.clip_start_at,c.clip_end_at FROM recording_clips c WHERE c.id=3`,
 		`INSERT INTO recording_joined_snapshot_scopes(batch_record_id,recording_id,recording_job_id,high_water_clip_id) VALUES(7,30,2,2)`)
 	if _, err := pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=1`); err != nil {
 		t.Fatalf("frozen source purge refused: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=2`); err == nil || !strings.Contains(err.Error(), "still being snapshotted") {
+	if _, err := pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=2`); err == nil || !strings.Contains(err.Error(), "still being snapshotted or built") {
 		t.Fatalf("snapshotting source purge: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=3`); err == nil || !strings.Contains(err.Error(), "still being snapshotted or built") {
+		t.Fatalf("building batch source purge: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `DELETE FROM recording_clips WHERE id=1`); err == nil || !strings.Contains(err.Error(), "retention protected") {
 		t.Fatalf("frozen source delete: %v", err)
