@@ -63,7 +63,6 @@ def main():
         try:
             tasks = case.group(8)
             # Warm lazy schema and ledger creation outside the timed steady group.
-            pull.cleanup_local_headroom(case.inventory)
             pull.cleanup_execution_outcome(case.inventory, 999, 1, {})
             pull.cleanup_journal(case.inventory)
             pull.cleanup_quarantine_tables(case.inventory)
