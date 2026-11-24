@@ -19543,9 +19543,11 @@ def cleanup_day_run(cfg, inventory, stop_event, permit, timings):
         expires = parse_certification_timestamp(permit["permit_expires_at"], "day permit expiry")
 
         # No app-writer fence: that fence keeps per-file cleanup's exact parent
-        # namespace proof valid. A day unit proves no namespace: it unlinks the
-        # names it selected and accounts each by absence. Writers land only
-        # in-window raw and joined/ paths, never a day this permit names.
+        # namespace proof valid, and it never covered the list-to-unlink gap. A
+        # day unit unlinks only the names it selected at list time and accounts
+        # each by absence: a file landing after the listing survives, one landing
+        # before it trips the files/bytes check, and fast copy links new names
+        # without overwriting. Everything selected is out-of-window non-KE media.
         if descriptor is not None:
             unlinked, started = 0, time.monotonic()
             for name, _, _ in files:
