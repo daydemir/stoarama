@@ -7,10 +7,10 @@
 -- generation-2 hour whose batch, recording and local date the controller
 -- listed in collation_v2_recovery_scope. It only adds, in exactly two ways:
 --  * Restore: `collation-v2 run --recovery-scope` puts a registered hour's
---    catalogued output or manifest back at its catalogued key, with the
---    catalogued sha256 and size, create-only, after a HEAD under the wire lock
---    finds it absent, and never while a retirement of that key is pending. It
---    writes no catalog row.
+--    catalogued output back at its catalogued key, with the catalogued sha256
+--    and size, create-only, after a HEAD under the wire lock finds it absent,
+--    and never while a retirement of that key is pending. It writes no catalog
+--    row. Restores cover outputs only: delivery reads outputs, never manifests.
 --  * New hour: in a fresh `recovery-` batch that no catalog row or writer
 --    intent named before its first scope row, `run` creates the hour's manifest
 --    and parts (each part keyed by its own sha256) and `collation-v2 register`
@@ -132,13 +132,17 @@ CREATE OR REPLACE FUNCTION r2_owner_keep_held(p_bucket text, p_key text) RETURNS
   OR collation_v2_recovery_held(p_key)
 $$;
 
--- A new hour row whose columns are exactly its own identity, in a scoped
--- recovery- batch.
-CREATE FUNCTION collation_v2_recovery_hour(h recording_collation_hours) RETURNS boolean LANGUAGE sql STABLE AS $$
- SELECT starts_with(h.batch_id,'recovery-')
-  AND h.hour_id=format('%s__recording-%s__date-%s__hour-%s__generation-%s', h.batch_id, h.recording_id,
+-- An hour row whose columns are exactly its own identity, so the scope read
+-- from its hour_id is the scope of its own batch, recording and date.
+CREATE FUNCTION collation_v2_recovery_identity(h recording_collation_hours) RETURNS boolean LANGUAGE sql STABLE AS $$
+ SELECT h.hour_id=format('%s__recording-%s__date-%s__hour-%s__generation-%s', h.batch_id, h.recording_id,
    to_char(h.local_date,'YYYY-MM-DD'), lpad(h.delivery_hour::text,2,'0'), h.generation)
   AND h.manifest_object_key='joined/'||h.batch_id||'/coverage/hours/'||h.hour_id||'.json'
+$$;
+
+-- A new hour row in a scoped recovery- batch.
+CREATE FUNCTION collation_v2_recovery_hour(h recording_collation_hours) RETURNS boolean LANGUAGE sql STABLE AS $$
+ SELECT starts_with(h.batch_id,'recovery-') AND collation_v2_recovery_identity(h)
   AND collation_v2_recovery_scope_of(h.hour_id, true)
 $$;
 
@@ -151,22 +155,26 @@ CREATE FUNCTION collation_v2_recovery_new_key(k text) RETURNS boolean LANGUAGE s
   AND NOT EXISTS(SELECT 1 FROM r2_nonraw_intents WHERE object_key=k)
 $$;
 
--- The keys `collation-v2 run` may PUT for one scoped hour, each named by the
--- exact bytes it carries:
---  * restore: a registered hour's catalogued manifest or output, with its
---    catalogued sha256 (and size), while no retirement of that key is pending;
---  * new hour: in a recovery- batch, the unregistered hour's manifest, or a
---    part whose key is its own sha256, neither held by any catalog row.
+-- The keys `collation-v2 run` may PUT for one scoped hour, in the fenced bucket
+-- while a fence is active, each named by the exact bytes it carries:
+--  * restore: a registered hour's catalogued output, with its catalogued sha256
+--    and size, while no retirement of that key is pending;
+--  * new hour: in a recovery- batch, for a recording, date and hour no
+--    generation-2 hour holds yet, the hour's manifest, or a part whose key is
+--    its own sha256, neither held by any catalog row.
 CREATE FUNCTION collation_v2_recovery_write(b text, hour text, k text, n bigint, sha text) RETURNS boolean LANGUAGE sql STABLE AS $$
- SELECT collation_v2_recovery_scope_of(hour, true) AND (
-  (EXISTS(SELECT 1 FROM recording_collation_hours h WHERE h.hour_id=hour AND (
-     (h.manifest_object_key=k AND h.manifest_sha256=sha)
-     OR EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.collation_hour_id=h.id AND o.object_key=k AND o.sha256=sha AND o.size_bytes=n)))
+ SELECT collation_v2_recovery_scope_of(hour, true)
+  AND NOT EXISTS(SELECT 1 FROM r2_retirement_writer_fences f WHERE f.bucket<>b) AND (
+  (EXISTS(SELECT 1 FROM recording_collation_hours h JOIN recording_collation_outputs o ON o.collation_hour_id=h.id
+     WHERE h.hour_id=hour AND collation_v2_recovery_identity(h) AND o.object_key=k AND o.sha256=sha AND o.size_bytes=n)
    AND NOT collation_v2_recovery_retirement_pending(k))
   OR (starts_with(hour,'recovery-')
    AND (k='joined/'||split_part(hour,'__',1)||'/coverage/hours/'||hour||'.json'
     OR k='joined/'||split_part(hour,'__',1)||'/objects/'||sha||'.mp4')
-   AND NOT EXISTS(SELECT 1 FROM recording_collation_hours WHERE hour_id=hour)
+   AND NOT EXISTS(SELECT 1 FROM recording_collation_hours h WHERE h.hour_id=hour
+    OR (h.generation=2 AND h.recording_id=substring(hour FROM '__recording-([0-9]+)__')::bigint
+     AND h.local_date=substring(hour FROM '__date-([0-9-]{10})__')::date
+     AND h.delivery_hour=substring(hour FROM '__hour-([0-9]{2})__')::smallint))
    AND collation_v2_recovery_new_key(k)))
 $$;
 
@@ -273,15 +281,26 @@ CREATE FUNCTION collation_v2_recovery_admit_wire(op bigint) RETURNS void LANGUAG
  PERFORM pg_advisory_xact_lock_shared(7343226011187);
 END $$;
 
--- Completes every unfinished recovery intent for one key, once its caller has
--- read that key's exact bytes back from R2: a late copy of any of those PUTs can
--- now only fail If-None-Match. A row whose PUT is still in flight is skipped.
-CREATE FUNCTION collation_v2_recovery_settle(b text, k text, n bigint, sha text) RETURNS integer LANGUAGE sql AS $$
+-- Completes every unfinished recovery intent for one held key whose PUT is no
+-- longer in flight (its row is not share-locked by a wire transaction). That is
+-- safe whatever the key holds now: the key is held from retirement for good,
+-- and a late copy of any of its PUTs is create-only and checksum-bound to the
+-- intent's own sha256.
+CREATE FUNCTION collation_v2_recovery_settle(b text, k text) RETURNS integer LANGUAGE sql AS $$
  WITH settled AS (
   UPDATE r2_retirement_writer_operations SET completed_at=clock_timestamp()
   WHERE id IN (SELECT id FROM r2_retirement_writer_operations
    WHERE completed_at IS NULL AND collation_recovery_hour_id IS NOT NULL
-    AND bucket=b AND object_key=k AND size_bytes=n AND sha256=sha FOR UPDATE SKIP LOCKED)
+    AND bucket=b AND object_key=k AND collation_v2_recovery_held(k) FOR UPDATE SKIP LOCKED)
   RETURNING 1)
  SELECT count(*)::integer FROM settled
 $$;
+
+-- Like 0220's holds, the scope and add-only guards also bind replica-mode
+-- sessions. The insert admissions stay as 0187 made them.
+ALTER TABLE collation_v2_recovery_scope ENABLE ALWAYS TRIGGER collation_v2_recovery_scope_guard;
+ALTER TABLE collation_v2_recovery_scope ENABLE ALWAYS TRIGGER collation_v2_recovery_scope_no_truncate;
+ALTER TABLE recording_collation_hours ENABLE ALWAYS TRIGGER collation_v2_recovery_immutable;
+ALTER TABLE recording_collation_hours ENABLE ALWAYS TRIGGER collation_v2_recovery_immutable_truncate;
+ALTER TABLE recording_collation_outputs ENABLE ALWAYS TRIGGER collation_v2_recovery_immutable;
+ALTER TABLE recording_collation_outputs ENABLE ALWAYS TRIGGER collation_v2_recovery_immutable_truncate;

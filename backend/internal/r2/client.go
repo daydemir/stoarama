@@ -466,11 +466,6 @@ func (c *Client) PutReaderIfAbsentVerified(ctx context.Context, key, contentType
 	if expectedSize <= 0 || expectedSize > MaxConditionalPutBytes || !isLowerHexSHA256(expectedSHA256) {
 		return ObjectHead{}, false, fmt.Errorf("invalid bounded immutable object identity")
 	}
-	release, complete, err := c.admitCreateOnlyWrite(ctx, key, expectedSize, expectedSHA256)
-	if err != nil {
-		return ObjectHead{}, false, err
-	}
-	defer release()
 	in := &s3.PutObjectInput{
 		Bucket:        aws.String(c.bucket),
 		Key:           aws.String(key),
@@ -481,9 +476,20 @@ func (c *Client) PutReaderIfAbsentVerified(ctx context.Context, key, contentType
 	if contentType != "" {
 		in.ContentType = aws.String(contentType)
 	}
-	created, err := c.putIfAbsent(ctx, in)
+	if c.collationRecoveryHourID != "" {
+		return c.putCollationRecovery(ctx, in, expectedSize, expectedSHA256)
+	}
+	release, complete, err := c.admitWrite(ctx, 0)
 	if err != nil {
 		return ObjectHead{}, false, err
+	}
+	defer release()
+	created := true
+	if _, err := c.s3.PutObject(ctx, in); err != nil {
+		if !isPreconditionFailed(err) {
+			return ObjectHead{}, false, fmt.Errorf("conditional put object %s: %w", key, err)
+		}
+		created = false
 	}
 	head, err := c.readBackExact(ctx, key, expectedSize, expectedSHA256)
 	if err != nil {

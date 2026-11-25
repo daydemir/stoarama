@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -21,13 +22,19 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/r2"
 )
 
-// recoveryBucket is a create-only fake R2: PUT honours If-None-Match, a key in
-// fail answers 500 (a lost wire write), and nothing is ever deleted.
+// recoveryBucket is a create-only fake R2: PUT honours If-None-Match and
+// refuses a body that differs from its x-amz-checksum-sha256 (400 BadDigest);
+// a key in fail answers 500 (a lost wire write), one in headFail answers HEAD
+// 500, one in race is absent to HEAD but lands its foreign bytes at the PUT
+// (412). Nothing is ever deleted.
 type recoveryBucket struct {
-	mu      sync.Mutex
-	objects map[string][]byte
-	fail    map[string]bool
-	puts    map[string]int
+	mu          sync.Mutex
+	objects     map[string][]byte
+	fail        map[string]bool
+	headFail    map[string]bool
+	race        map[string][]byte
+	puts        map[string]int
+	checksummed map[string]bool
 }
 
 func (f *recoveryBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -35,10 +42,35 @@ func (f *recoveryBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	etag := func(b []byte) string { s := sha256.Sum256(b); return `"` + hex.EncodeToString(s[:16]) + `"` }
 	key := strings.TrimPrefix(r.URL.Path, "/bucket/")
+	if r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2" {
+		prefix := r.URL.Query().Get("prefix")
+		var contents strings.Builder
+		for k, body := range f.objects {
+			if strings.HasPrefix(k, prefix) {
+				fmt.Fprintf(&contents, `<Contents><Key>%s</Key><Size>%d</Size><ETag>%s</ETag><LastModified>2026-11-25T00:00:00.000Z</LastModified></Contents>`, k, len(body), etag(body))
+			}
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		fmt.Fprintf(w, `<ListBucketResult><Name>bucket</Name><Prefix>%s</Prefix><IsTruncated>false</IsTruncated>%s</ListBucketResult>`, prefix, contents.String())
+		return
+	}
 	switch r.Method {
 	case http.MethodPut:
 		f.puts[key]++
 		body, _ := io.ReadAll(r.Body)
+		if sum := r.Header.Get("x-amz-checksum-sha256"); sum != "" {
+			digest := sha256.Sum256(body)
+			if sum != base64.StdEncoding.EncodeToString(digest[:]) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, `<Error><Code>BadDigest</Code></Error>`)
+				return
+			}
+			f.checksummed[key] = true
+		}
+		if foreign, ok := f.race[key]; ok {
+			delete(f.race, key)
+			f.objects[key] = foreign
+		}
 		if f.fail[key] {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -50,6 +82,10 @@ func (f *recoveryBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.objects[key] = body
 		w.Header().Set("ETag", etag(body))
 	case http.MethodHead, http.MethodGet:
+		if r.Method == http.MethodHead && f.headFail[key] {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		body, ok := f.objects[key]
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
@@ -154,6 +190,15 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 	if err := register(hourIn(oldBatch, 32, "2026-11-07", 1), unscopedOut); err != nil {
 		t.Fatal(err)
 	}
+	// A registered row whose columns disagree with its own hour_id: its hour_id
+	// names scoped recording 32, its recording_id is 31.
+	driftOut := newPart("drift", time.Date(2026, 11, 5, 9, 30, 0, 0, seoul))
+	driftOut.ObjectKey, _, _ = partIn(oldBatch, "drift")
+	driftHour := hourIn(oldBatch, 32, "2026-11-05", 2)
+	driftHour.RecordingID = 31
+	if err := register(driftHour, driftOut); err != nil {
+		t.Fatal(err)
+	}
 	exec(`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
 		SELECT 'collated',id,'bucket',object_key,size_bytes,sha256,repeat('b',64) FROM recording_collation_outputs WHERE object_key=$1`, pendingOut.ObjectKey)
 	matureR2WriterFence(t, pool, "bucket")
@@ -187,7 +232,8 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 		refused(name, "collation v2 recovery scope", err)
 	}
 
-	bucket := &recoveryBucket{objects: map[string][]byte{}, fail: map[string]bool{}, puts: map[string]int{}}
+	bucket := &recoveryBucket{objects: map[string][]byte{}, fail: map[string]bool{}, headFail: map[string]bool{},
+		race: map[string][]byte{}, puts: map[string]int{}, checksummed: map[string]bool{}}
 	server := httptest.NewServer(bucket)
 	defer server.Close()
 	client, err := r2.New(ctx, r2.Config{WriterDB: pool, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
@@ -239,6 +285,68 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 		if open, done := intents(key); open != 0 || done != 1 {
 			t.Fatalf("%s: recovery intent not durable and completed: open=%d done=%d", key, open, done)
 		}
+		bucket.mu.Lock()
+		bound := bucket.checksummed[key]
+		bucket.mu.Unlock()
+		if !bound {
+			t.Fatalf("%s: recovery PUT not bound to its admitted sha256", key)
+		}
+	}
+
+	// plan --recovery-batch LISTs an unscoped batch's prefix: any object there
+	// means the batch is not fresh. A scoped batch's objects are its own.
+	bucket.mu.Lock()
+	bucket.objects["joined/recovery-used/objects/x.mp4"] = []byte("older")
+	bucket.mu.Unlock()
+	refused("unscoped batch with R2 objects", "not fresh", requireFreshRecoveryBatch(ctx, pool, store, "recovery-used"))
+	for _, b := range []string{batch, "recovery-unused"} {
+		if err := requireFreshRecoveryBatch(ctx, pool, store, b); err != nil {
+			t.Fatalf("%s: %v", b, err)
+		}
+	}
+
+	// Every path that leaves no possible write behind completes its intent at
+	// once, so nothing blocks deletes for good.
+	noPut := func(name string, w collation.HourWork, key string, body []byte, sha string, want string) {
+		t.Helper()
+		_, _, err := client.ForCollationRecovery(w.HourID).PutReaderIfAbsentVerified(ctx, key, "video/mp4", bytes.NewReader(body), int64(len(body)), sha)
+		refused(name, want, err)
+		if open, done := intents(key); open != 0 || done != 1 {
+			t.Fatalf("%s: intent open=%d done=%d", name, open, done)
+		}
+	}
+	// A body that changed after admission (same length) never lands: R2
+	// refuses it against the admitted sha256 before committing anything.
+	tornKey, tornBody, tornSHA := part("torn")
+	torn := append([]byte(nil), tornBody...)
+	torn[0] ^= 0xff
+	noPut("changed body", hour(31, "2026-11-01", 5), tornKey, torn, tornSHA, "BadDigest")
+	if inBucket(tornKey) {
+		t.Fatal("a body other than the admitted bytes landed")
+	}
+	// Foreign bytes already at a new hour's manifest key: no PUT is sent.
+	foreignManifest := collation.ManifestKey(batch, hour(31, "2026-11-01", 6).HourID)
+	bucket.mu.Lock()
+	bucket.objects[foreignManifest] = []byte(`{"someone":"else"}`)
+	bucket.mu.Unlock()
+	noPut("foreign bytes at the key", hour(31, "2026-11-01", 6), foreignManifest, manifestBody, sha256Hex(manifestBody), "content mismatch")
+	// HEAD fails: no PUT is sent.
+	headKey, headBody, headSHA := part("head fails")
+	bucket.mu.Lock()
+	bucket.headFail[headKey] = true
+	bucket.mu.Unlock()
+	noPut("HEAD failure", hour(31, "2026-11-01", 7), headKey, headBody, headSHA, "collation recovery HEAD")
+	// Another run's bytes land between our HEAD and PUT: our PUT gets 412.
+	raceKey := collation.ManifestKey(batch, hour(31, "2026-11-01", 8).HourID)
+	bucket.mu.Lock()
+	bucket.race[raceKey] = []byte(`{"created_at":"another run"}`)
+	bucket.mu.Unlock()
+	noPut("412 over another run's bytes", hour(31, "2026-11-01", 8), raceKey, manifestBody, sha256Hex(manifestBody), "content mismatch")
+	bucket.mu.Lock()
+	sentNoPut := bucket.puts[foreignManifest] + bucket.puts[headKey]
+	bucket.mu.Unlock()
+	if sentNoPut != 0 {
+		t.Fatal("a PUT was sent over a present key or after a failed HEAD")
 	}
 	// Every key a scope row covers is an owner keep hold, which every R2
 	// retirement ledger refuses; keys outside it are not.
@@ -264,6 +372,14 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 	refused("restore of a key the hour never catalogued", "admission refused", putRestore(restorer, otherNew, []byte("stitched invented")))
 	refused("restore out of scope", "admission refused",
 		putRestore(client.ForCollationRecovery(hourIn(oldBatch, 32, "2026-11-07", 1).HourID), unscopedOut.ObjectKey, []byte("stitched unscoped restore")))
+	refused("restore of a row whose columns disagree with its hour_id", "admission refused",
+		putRestore(client.ForCollationRecovery(driftHour.HourID), driftOut.ObjectKey, []byte("stitched drift")))
+	otherBucket, err := r2.New(ctx, r2.Config{WriterDB: pool, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "other", Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused("restore into a bucket other than the fenced one", "admission refused",
+		putRestore(otherBucket.ForCollationRecovery(restoreHour.HourID), restoreOut.ObjectKey, restoreBody))
 	if err := putRestore(restorer, restoreOut.ObjectKey, restoreBody); err != nil {
 		t.Fatal("restore of an absent catalogued key refused:", err)
 	}
@@ -281,9 +397,17 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 		t.Fatalf("restore intents: open=%d done=%d", open, done)
 	}
 	var restoreRows int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_collation_hours WHERE batch_id=$1`, oldBatch).Scan(&restoreRows); err != nil || restoreRows != 3 {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_collation_hours WHERE batch_id=$1`, oldBatch).Scan(&restoreRows); err != nil || restoreRows != 4 {
 		t.Fatalf("restore changed the catalog: %d %v", restoreRows, err)
 	}
+	// A new recovery hour never shadows a recording, date and hour that another
+	// batch has already registered.
+	if err := scopeOf(batch, 32, "2026-11-05"); err != nil {
+		t.Fatal(err)
+	}
+	shadowKey, shadowBody, _ := part("shadow")
+	refused("new hour over a registered generation-2 hour", "admission refused",
+		putRestore(client.ForCollationRecovery(hour(32, "2026-11-05", 1).HourID), shadowKey, shadowBody))
 	refused("new hour in a restore-only batch", "fenced", register(hourIn(oldBatch, 32, "2026-11-05", 2), newPart("restore new", time.Date(2026, 11, 5, 9, 30, 0, 0, seoul))))
 
 	// The database itself refuses every create-only PUT outside the hour's own
@@ -339,6 +463,18 @@ CREATE TRIGGER test_withdraw_scope AFTER INSERT ON r2_retirement_writer_operatio
 		t.Fatalf("withdrawn write: open=%d done=%d sent=%v", open, done, inBucket(withdrawnKey))
 	}
 
+	// A verified PUT whose own intent does not complete fails fast.
+	stuckKey, stuckBody, stuckSHA := part("stuck")
+	exec(`CREATE FUNCTION test_skip_completion() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+CREATE TRIGGER test_skip_completion BEFORE UPDATE ON r2_retirement_writer_operations FOR EACH ROW WHEN (OLD.object_key='` + stuckKey + `') EXECUTE FUNCTION test_skip_completion()`)
+	_, _, err = client.ForCollationRecovery(hour(31, "2026-11-01", 9).HourID).PutReaderIfAbsentVerified(ctx, stuckKey, "video/mp4",
+		bytes.NewReader(stuckBody), int64(len(stuckBody)), stuckSHA)
+	refused("verified PUT whose intent did not complete", "did not complete", err)
+	exec(`DROP TRIGGER test_skip_completion ON r2_retirement_writer_operations; DROP FUNCTION test_skip_completion()`)
+	if report, err := client.SettleCollationRecoveryIntents(ctx, true); err != nil || report.Settled != 1 || len(report.Verified) != 1 {
+		t.Fatalf("settle the stuck intent: %+v %v", report, err)
+	}
+
 	// A lost recovery PUT keeps its durable intent: every R2 delete batch stays
 	// blocked behind it, exactly as for any other writer.
 	lostKey, lostBody, lostSHA := part("lost")
@@ -370,21 +506,19 @@ CREATE TRIGGER test_withdraw_scope AFTER INSERT ON r2_retirement_writer_operatio
 	if err := insertCollationHour(ctx, pool, scoped, manifest, manifestKey, manifestBody); err != nil {
 		t.Fatal("scoped register refused:", err)
 	}
-	// Once catalogued, the hour's keys are restores: present, they are read
-	// back and get no second PUT; other bytes at them are refused.
+	// Once catalogued, the hour's parts are restores: present, they are read
+	// back and get no second PUT. Restores cover outputs only: its manifest is
+	// never PUT again.
 	if err := publish(rs, partKey, partBody, partSHA); err != nil {
 		t.Fatal(err)
 	}
-	if err := rs.PutManifestIfAbsent(ctx, manifestKey, manifestBody); err != nil {
-		t.Fatal(err)
-	}
+	refused("registered manifest re-PUT", "admission", rs.PutManifestIfAbsent(ctx, manifestKey, manifestBody))
 	bucket.mu.Lock()
 	partPuts, manifestPuts := bucket.puts[partKey], bucket.puts[manifestKey]
 	bucket.mu.Unlock()
 	if partPuts != 1 || manifestPuts != 1 {
 		t.Fatalf("catalogued keys rewritten: part=%d manifest=%d PUTs", partPuts, manifestPuts)
 	}
-	refused("catalogued manifest with other bytes", "admission", rs.PutManifestIfAbsent(ctx, manifestKey, []byte(`{"other":true}`)))
 
 	refused("unscoped recording register", "fenced", register(hour(32, "2026-11-01", 1), newPart("r32", start)))
 	refused("unscoped date register", "fenced", register(hour(31, "2026-11-02", 1), newPart("d2", start.AddDate(0, 0, 1))))
@@ -424,56 +558,67 @@ CREATE TRIGGER test_withdraw_scope AFTER INSERT ON r2_retirement_writer_operatio
 		t.Fatalf("catalog changed: hours=%d outputs=%d %v", hours, outputs, err)
 	}
 
-	// settle-recovery: crashes left three unfinished intents. One key holds its
-	// exact bytes, one is missing, and one holds its bytes but its PUT is still
-	// in flight (its wire transaction share-locks the row).
-	seed := func(name string, present bool) (string, int64) {
+	// settle-recovery: crashes left four unfinished intents. One key holds its
+	// exact bytes, one is missing (its PUT was lost and its day then revoked),
+	// one holds foreign bytes, and one holds its bytes but its PUT is still in
+	// flight (its wire transaction share-locks the row). Every intent whose PUT
+	// is over settles, whatever its key holds: each key is held for good.
+	seed := func(name string, held []byte) (string, int64) {
 		key, body, sha := part(name)
-		if present {
+		if held != nil {
+			bucket.mu.Lock()
+			bucket.objects[key] = held
+			bucket.mu.Unlock()
+		} else if name != "missing" {
 			bucket.mu.Lock()
 			bucket.objects[key] = body
 			bucket.mu.Unlock()
 		}
 		injectR2WriterState(t, pool, fmt.Sprintf(`INSERT INTO r2_retirement_writer_operations(bucket,collation_recovery_hour_id,object_key,size_bytes,sha256)
-			VALUES('bucket','%s','%s',%d,'%s')`, hour(31, "2026-11-01", 4).HourID, key, len(body), sha))
+			VALUES('bucket','%s','%s',%d,'%s')`, hour(31, "2026-11-03", 4).HourID, key, len(body), sha))
 		var id int64
 		if err := pool.QueryRow(ctx, `SELECT id FROM r2_retirement_writer_operations WHERE object_key=$1`, key).Scan(&id); err != nil {
 			t.Fatal(err)
 		}
 		return key, id
 	}
-	crashedKey, _ := seed("crashed", true)
-	missingKey, _ := seed("missing", false)
-	liveKey, liveID := seed("in flight", true)
+	crashedKey, _ := seed("crashed", nil)
+	missingKey, _ := seed("missing", nil)
+	foreignKey, _ := seed("foreign", []byte("someone else's bytes"))
+	liveKey, liveID := seed("in flight", nil)
 	wire, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer wire.Rollback(context.Background())
 	if _, err := wire.Exec(ctx, `SELECT 1 FROM r2_retirement_writer_operations WHERE id=$1 FOR SHARE`, liveID); err != nil {
 		t.Fatal(err)
 	}
 	report, err := client.SettleCollationRecoveryIntents(ctx, false)
-	if err != nil || report.Keys != 3 || report.Settled != 0 || len(report.Held) != 1 || report.Held[0] != missingKey {
+	if err != nil || report.Keys != 4 || report.Settled != 0 || len(report.Verified) != 2 ||
+		len(report.Absent) != 1 || report.Absent[0] != missingKey || len(report.Foreign) != 1 || report.Foreign[0] != foreignKey {
 		t.Fatalf("dry run: %+v %v", report, err)
 	}
-	report, err = client.SettleCollationRecoveryIntents(ctx, true)
-	if err != nil || report.Settled != 1 {
+	refused("delete gate before settling", "have not drained", r2RetireCheckWriterFence(ctx, pool, "bucket", r2tSHA))
+	if report, err = client.SettleCollationRecoveryIntents(ctx, true); err != nil || report.Settled != 3 {
 		t.Fatalf("apply: %+v %v", report, err)
 	}
-	if open, _ := intents(crashedKey); open != 0 {
-		t.Fatal("verified crashed intent not settled")
+	for _, key := range []string{crashedKey, missingKey, foreignKey} {
+		if open, _ := intents(key); open != 0 {
+			t.Fatalf("%s: finished intent not settled", key)
+		}
 	}
 	if open, _ := intents(liveKey); open != 1 {
 		t.Fatal("settlement completed a PUT still in flight")
 	}
+	refused("delete gate behind a PUT in flight", "have not drained", r2RetireCheckWriterFence(ctx, pool, "bucket", r2tSHA))
 	_ = wire.Rollback(ctx)
 	if report, err = client.SettleCollationRecoveryIntents(ctx, true); err != nil || report.Settled != 1 {
 		t.Fatalf("apply after the PUT ended: %+v %v", report, err)
 	}
-	if open, _ := intents(missingKey); open != 1 {
-		t.Fatal("unverified intent settled")
+	if err := r2RetireCheckWriterFence(ctx, pool, "bucket", r2tSHA); err != nil {
+		t.Fatal("settled intents still block deletes:", err)
 	}
-	refused("delete gate behind an unverified intent", "have not drained", r2RetireCheckWriterFence(ctx, pool, "bucket", r2tSHA))
 }
 
 func sha256Hex(b []byte) string {

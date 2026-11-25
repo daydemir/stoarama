@@ -17,6 +17,10 @@ import (
 // from R2 and not yet restored). Deferred hours publish nothing.
 var ErrDeferred = errors.New("hour deferred: sources unavailable")
 
+// ErrRestoreDiffers marks a registered hour whose rebuild is not byte-identical
+// to its registered outputs. Nothing is published for it.
+var ErrRestoreDiffers = errors.New("restore differs from registered outputs")
+
 // Store is the object storage the hour pipeline reads sources from and
 // publishes verified outputs to.
 type Store interface {
@@ -62,6 +66,9 @@ func ProcessHour(ctx context.Context, env Env, w HourWork) (HourManifest, error)
 		if c.Purged {
 			return HourManifest{}, ErrDeferred
 		}
+	}
+	if w.Restore != nil && w.Restore.MediaTool != env.MediaTool {
+		return HourManifest{}, fmt.Errorf("%w: media tool %q, registered %q", ErrRestoreDiffers, env.MediaTool, w.Restore.MediaTool)
 	}
 	m := HourManifest{SchemaVersion: 1, PolicyVersion: PolicyVersion, Generation: Generation, BatchID: w.BatchID, HourID: w.HourID,
 		SupersedesHourID: w.SupersedesHourID, RecordingID: w.RecordingID, Timezone: w.Timezone, LocalDate: w.LocalDate,
@@ -373,6 +380,16 @@ func ProcessHour(ctx context.Context, env Env, w HourWork) (HourManifest, error)
 		}
 	}
 	m.Clips = disp
+	if w.Restore != nil {
+		if len(done) != len(w.Restore.Outputs) {
+			return m, fmt.Errorf("%w: %d parts, registered %d", ErrRestoreDiffers, len(done), len(w.Restore.Outputs))
+		}
+		for p, bp := range done {
+			if r := w.Restore.Outputs[p]; ObjectKey(w.BatchID, bp.built.SHA256) != r.ObjectKey || bp.built.SHA256 != r.SHA256 || bp.built.SizeBytes != r.SizeBytes {
+				return m, fmt.Errorf("%w: part %d sha256 %s size %d, registered %s size %d", ErrRestoreDiffers, p+1, bp.built.SHA256, bp.built.SizeBytes, r.SHA256, r.SizeBytes)
+			}
+		}
+	}
 
 	outputs := make([]Output, len(done))
 	pubErrs := make([]error, len(done))
@@ -419,6 +436,10 @@ func ProcessHour(ctx context.Context, env Env, w HourWork) (HourManifest, error)
 	m.CreatedAt = env.Now().UTC()
 	if err := m.Validate(); err != nil {
 		return m, fmt.Errorf("manifest invalid: %w", err)
+	}
+	if w.Restore != nil {
+		// The registered row and its published manifest stay authoritative.
+		return m, nil
 	}
 	body, err := MarshalManifest(m)
 	if err != nil {

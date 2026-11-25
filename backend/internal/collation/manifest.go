@@ -28,6 +28,23 @@ type HourWork struct {
 	SupersedesHourID       string `json:"supersedes_hour_id,omitempty"`
 	SupersedesHourRecordID int64  `json:"supersedes_hour_record_id,omitempty"`
 	Clips                  []Clip `json:"clips"`
+	// Restore is set only for an hour that is already registered: the run must
+	// rebuild exactly these registered outputs and republish only them. It never
+	// writes a manifest or a row for such an hour.
+	Restore *RestoreHour `json:"restore,omitempty"`
+}
+
+// RestoreHour is a registered hour's outputs, in part order, and the media
+// tool that built them.
+type RestoreHour struct {
+	MediaTool string          `json:"media_tool"`
+	Outputs   []RestoreOutput `json:"outputs"`
+}
+
+type RestoreOutput struct {
+	ObjectKey string `json:"object_key"`
+	SizeBytes int64  `json:"size_bytes"`
+	SHA256    string `json:"sha256"`
 }
 
 var safeBatch = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
