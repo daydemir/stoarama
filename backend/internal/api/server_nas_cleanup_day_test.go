@@ -361,6 +361,7 @@ func TestNASCleanupDayPermitsDirectoriesAndAccountsReceipts(t *testing.T) {
 	clip(3, "2026-09-15", "103000", 300) // boundary day
 	clip(4, "2026-09-20", "103000", 400) // inside the window
 	clip(5, "2026-10-10", "103000", 500)
+	clip(dayIncidentClip, "2026-10-12", "103000", 600) // a live NAS cleanup incident hold
 	unit := func(day string, files, bytes int64) nasCleanupDayUnit {
 		return nasCleanupDayUnit{RelativeDir: dayPlazaDir(dayFixtureFolder, dayDate(day)), LocalDate: day, StreamID: 3, Files: files, Bytes: bytes}
 	}
@@ -372,11 +373,16 @@ func TestNASCleanupDayPermitsDirectoriesAndAccountsReceipts(t *testing.T) {
 			t.Fatalf("%s qualified", day)
 		}
 	}
-	exec(`BEGIN; SET LOCAL session_replication_role=replica; INSERT INTO delivery_nas_source_holds(clip_id) VALUES(2); COMMIT`)
-	if _, _, err := dayCheck(ctx, pool, unit("2026-09-12", 2, 300)); err == nil || !strings.Contains(err.Error(), "held") {
-		t.Fatalf("held file did not refuse its directory: %v", err)
+	if _, _, err := dayCheck(ctx, pool, unit("2026-10-12", 1, 600)); err == nil || !strings.Contains(err.Error(), "held") {
+		t.Fatalf("incident-held clip did not refuse its directory: %v", err)
 	}
-	exec(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM delivery_nas_source_holds; COMMIT`)
+	// Outside Keep Everything only an incident hold protects a directory-day: the
+	// delivery, R2 retirement and per-file plan holds below stay for the rest of
+	// the test, through the preparer, runner, admission and permits.
+	dayOtherHolds(t, exec, 2, unit("2026-09-12", 0, 0).RelativeDir)
+	if files, size, err := dayCheck(ctx, pool, unit("2026-09-12", 0, 0)); err != nil || files != 2 || size != 300 {
+		t.Fatalf("non-incident holds kept a non-KE directory-day: %d files %d bytes %v", files, size, err)
+	}
 
 	units := []nasCleanupDayUnit{unit("2026-09-12", 2, 300), unit("2026-10-10", 1, 500)}
 	// The preparer's shipping query and unit rule select exactly these units.
@@ -416,7 +422,8 @@ else:
 		t.Helper()
 		plan, _ := json.Marshal(map[string]any{"units": []map[string]any{
 			{"relative_dir": units[0].RelativeDir, "local_date": units[0].LocalDate, "stream_id": 3},
-			{"relative_dir": unit("2026-09-20", 1, 1).RelativeDir, "local_date": "2026-09-20", "stream_id": 3}}})
+			{"relative_dir": unit("2026-09-20", 1, 1).RelativeDir, "local_date": "2026-09-20", "stream_id": 3},
+			{"relative_dir": unit("2026-10-12", 1, 1).RelativeDir, "local_date": "2026-10-12", "stream_id": 3}}})
 		sql, err := osexec.Command(python, "-B", "-c", `import json, sys
 from pathlib import Path
 sys.path.insert(0, "../../../ops/jelly/cleanup-runner")
@@ -424,6 +431,7 @@ import runner as r
 job = r.Runner(Path("../../.."), Path("."))
 job.windows = {3: (r.timestamp("2026-09-15T15:00:00+00:00"), r.timestamp("2026-10-05T15:00:00+00:00"))}
 job.timezones = {3: "Asia/Tokyo"}
+job.keep_everything = set()
 job.query = lambda sql, step=None: print(sql)
 job.day_catalog(json.loads(sys.argv[1]))`, string(plan)).Output()
 		if err != nil {
@@ -441,14 +449,10 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan)).Output()
 		return string(raw)
 	}
 	if got := runnerCatalog(); !strings.Contains(got, `"local_date" : "2026-09-12", "held" : 0, "overlap" : 0, "dir_held" : false, "unlive" : 0`) ||
-		!strings.Contains(got, `"local_date" : "2026-09-20", "held" : 0, "overlap" : 1`) {
+		!strings.Contains(got, `"local_date" : "2026-09-20", "held" : 0, "overlap" : 1`) ||
+		!strings.Contains(got, `"local_date" : "2026-10-12", "held" : 1`) {
 		t.Fatalf("runner catalog: %s", got)
 	}
-	exec(`BEGIN; SET LOCAL session_replication_role=replica; INSERT INTO delivery_nas_source_holds(clip_id) VALUES(2); COMMIT`)
-	if got := runnerCatalog(); !strings.Contains(got, `"local_date" : "2026-09-12", "held" : 1`) {
-		t.Fatalf("runner catalog missed a held clip: %s", got)
-	}
-	exec(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM delivery_nas_source_holds; COMMIT`)
 	s := &Server{pool: pool, cfg: config.Config{NASCleanupDeletionEnabled: true, R2Bucket: "fixture"}}
 	sha := cleanupDayDigest(units)
 	create := map[string]any{"label": "kday-s3-0001", "policy_sha256": cleanupPolicySHA, "plan_sha256": sha, "files": 3, "bytes": 800, "units": units}
@@ -576,27 +580,22 @@ func TestNASCleanupDayFlatDirectoryHoldsOnlyItsNamedDay(t *testing.T) {
 		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,client_updated_at)
  VALUES(13,$1,30,$2,100,repeat('a',64),'present',now())`, id, p)
 	}
-	hold := func(id int64) {
-		exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica; INSERT INTO delivery_nas_source_holds(clip_id) VALUES(%d); COMMIT`, id))
-	}
 	flat(1, "2026-09-12", "103000")
 	flat(2, "2026-09-12", "235900")
-	flat(3, "2026-09-10", "103000")
+	flat(dayIncidentClip, "2026-09-10", "103000")
 	unit := nasCleanupDayUnit{RelativeDir: dir, LocalDate: "2026-09-12", StreamID: 3, Files: 2, Bytes: 200}
-	hold(3)
 	if files, size, err := dayCheck(ctx, pool, unit); err != nil || files != 2 || size != 200 {
 		t.Fatalf("another day's hold refused the flat directory-day: %d files %d bytes %v", files, size, err)
 	}
 	if _, _, err := dayCheck(ctx, pool, nasCleanupDayUnit{RelativeDir: dir, LocalDate: "2026-09-10", StreamID: 3, Files: 1, Bytes: 100}); err == nil || !strings.Contains(err.Error(), "held") {
 		t.Fatalf("held clip did not refuse its own day: %v", err)
 	}
-	hold(2)
-	if _, _, err := dayCheck(ctx, pool, unit); err == nil || !strings.Contains(err.Error(), "held") {
-		t.Fatalf("held clip named for the day did not refuse it: %v", err)
+	dayOtherHolds(t, exec, 2, dir)
+	if files, size, err := dayCheck(ctx, pool, unit); err != nil || files != 2 || size != 200 {
+		t.Fatalf("non-incident holds kept a non-KE flat directory-day: %d files %d bytes %v", files, size, err)
 	}
 	// An undated name anywhere in the directory still refuses every unit there.
-	exec(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM delivery_nas_source_holds; COMMIT`)
-	exec(`UPDATE recording_clips SET display_path=$1 WHERE id=3`, dir+"/renamed.mp4")
+	exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica; UPDATE recording_clips SET display_path='%s/renamed.mp4' WHERE id=%d; COMMIT`, dir, dayIncidentClip))
 	if _, _, err := dayCheck(ctx, pool, unit); err == nil || !strings.Contains(err.Error(), "does not name a local date") {
 		t.Fatalf("undated name in the flat directory escaped: %v", err)
 	}
@@ -632,6 +631,25 @@ func TestNASCleanupDayRetiredDigestIsAdmissibleAgain(t *testing.T) {
 	if w := create("kday-c"); w.Code != 409 {
 		t.Fatalf("label admitted twice: %d %s", w.Code, w.Body)
 	}
+}
+
+// dayIncidentClip is a raw clip on the permanent NAS cleanup incident roster (0202).
+const dayIncidentClip = 296368
+
+// dayOtherHolds puts every non-incident hold 0241 counted on clip: a delivery
+// source hold, a delivery path hold in dir, an R2 retirement reservation and a
+// dry-run per-file cleanup plan's source hold.
+func dayOtherHolds(t *testing.T, exec func(string, ...any), clip int64, dir string) {
+	t.Helper()
+	exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica;
+INSERT INTO delivery_nas_source_holds(clip_id) VALUES(%[1]d);
+INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,relative_path) VALUES('fixture','delivery/%[1]d','etag',1,'raw','%[2]s/delivered.mp4');
+INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
+ SELECT 'raw',id,bucket,object_key,size_bytes,sha256,repeat('e',64) FROM recording_clips WHERE id=%[1]d;
+INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode)
+ VALUES(%[1]d,47,13,'perfile-%[1]d',repeat('d',64),'[]',repeat('e',64),'dry_run');
+INSERT INTO nas_cleanup_source_holds(plan_id,clip_id) VALUES(%[1]d,%[1]d);
+COMMIT`, clip, dir))
 }
 
 // dayCheck totals cleanupDayCheck's media entries.
@@ -801,6 +819,19 @@ COMMIT`)
 	if _, _, err := dayCheck(ctx, pool, unit(named(12))); err == nil || !strings.Contains(err.Error(), "live R2 counterpart") {
 		t.Fatalf("KE file without a counterpart qualified: %v", err)
 	}
+	// A KE unit keeps every 0241 hold: a delivery source hold or a delivery path
+	// hold in the directory still keeps it.
+	exec(`BEGIN; SET LOCAL session_replication_role=replica; INSERT INTO delivery_nas_source_holds(clip_id) VALUES(13); COMMIT`)
+	if _, _, err := dayCheck(ctx, pool, all); err == nil || !strings.Contains(err.Error(), "held") {
+		t.Fatalf("KE delivery-held clip qualified: %v", err)
+	}
+	exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM delivery_nas_source_holds;
+INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,relative_path) VALUES('fixture','delivery/ke','etag',1,'raw','%s/delivered.mp4');
+COMMIT`, dir))
+	if _, _, err := dayCheck(ctx, pool, all); err == nil || !strings.Contains(err.Error(), "delivery path hold") {
+		t.Fatalf("KE directory with a delivery path hold qualified: %v", err)
+	}
+	exec(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM delivery_keep_holds WHERE object_key='delivery/ke'; COMMIT`)
 
 	// The preparer, given an R2 listing of every counterpart at its catalogued
 	// size, names exactly the server-evidenced files; the runner finds them live.
@@ -856,6 +887,7 @@ import runner as r
 job = r.Runner(Path("../../.."), Path("."))
 job.windows = {78: (r.timestamp("2026-08-23T15:00:00+00:00"), r.timestamp("2026-09-12T15:00:00+00:00"))}
 job.timezones = {78: "Asia/Seoul"}
+job.keep_everything = {78}
 job.query = lambda sql, step=None: print(sql)
 job.day_catalog(json.loads(sys.argv[1]))`, string(plan))
 		cmd.Env = env
