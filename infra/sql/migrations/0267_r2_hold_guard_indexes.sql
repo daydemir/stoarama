@@ -27,7 +27,7 @@ BEGIN
   IF NOT EXISTS(SELECT 1 FROM pg_index i WHERE i.indexrelid=to_regclass(ix.name)
     AND i.indrelid=ix.tbl::regclass AND i.indisvalid AND i.indisready AND NOT i.indisunique
     AND i.indpred IS NULL AND split_part(pg_get_indexdef(i.indexrelid),' USING ',2)='btree '||ix.cols) THEN
-   RAISE EXCEPTION '% exists but is not the valid exact hold-guard index', ix.name;
+   RAISE EXCEPTION '% exists but is not the valid exact hold-guard index: DROP INDEX CONCURRENTLY %; then CREATE INDEX CONCURRENTLY % ON % % before migration', ix.name, ix.name, ix.name, ix.tbl, ix.cols;
   END IF;
  END LOOP;
 END $$;
