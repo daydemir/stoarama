@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -27,6 +28,13 @@ import (
 
 const collationV2Usage = `usage:
   stoaramactl collation-v2 plan --scope backfill|nightly --out worklist.jsonl [--broken-ids FILE] [--recordings 1,2] [--hour-ids FILE] [--date YYYY-MM-DD | --days N]
+  stoaramactl collation-v2 plan --scope days --day-list FILE --out worklist.jsonl [--broken-ids FILE]
+    FILE lines: recording_id,YYYY-MM-DD[,delivery_hour]; any recording status.
+    An hour already registered is planned as a restore of its exact registered
+    outputs (its batch, content-addressed keys); run republishes them only if
+    the rebuild is byte-identical (outcome restored), else reports differs and
+    publishes nothing, and register keeps the row (already_registered). An hour
+    with a purged source is reported unavailable and not planned.
   stoaramactl collation-v2 run --worklist FILE|r2:KEY|r2prefix:PREFIX --scratch DIR --results FILE [--hour-workers N --cpu N --net N --publish-dir DIR --keep-scratch]
   stoaramactl collation-v2 register --worklist FILE|r2:KEY|r2prefix:PREFIX [--dry-run]
   stoaramactl collation-v2 put-worklist --worklist FILE --key r2-key`
@@ -43,7 +51,8 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("collation-v2 "+args[0], flag.ExitOnError)
 	switch args[0] {
 	case "plan":
-		scope := fs.String("scope", "", "backfill|nightly")
+		scope := fs.String("scope", "", "backfill|nightly|days")
+		dayList := fs.String("day-list", "", "days: file of recording_id,YYYY-MM-DD[,delivery_hour] lines")
 		out := fs.String("out", "", "worklist output path")
 		broken := fs.String("broken-ids", "", "file of known-unplayable clip ids (one per line)")
 		recordings := fs.String("recordings", "", "optional comma-separated recording ids")
@@ -51,7 +60,8 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 		date := fs.String("date", "", "nightly: local date to plan (default: the last --days closed days in each recording's timezone)")
 		days := fs.Int("days", 2, "nightly: how many closed local days to (re)plan; published hours are skipped by run")
 		_ = fs.Parse(args[1:])
-		if *out == "" || (*scope != "backfill" && *scope != "nightly") {
+		if *out == "" || (*scope != "backfill" && *scope != "nightly" && *scope != "days") || (*scope == "days") != (*dayList != "") ||
+			(*scope == "days" && (*recordings != "" || *hourIDs != "" || *date != "")) {
 			log.Fatal(collationV2Usage)
 		}
 		pool := mustCollationPool(ctx, cfg)
@@ -67,15 +77,25 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 		if opts.hourIDs, err = readLineSet(*hourIDs); err != nil {
 			log.Fatal(err)
 		}
-		work, err := planCollation(ctx, pool, opts)
+		if opts.dayList, err = readDayList(*dayList); err != nil {
+			log.Fatal(err)
+		}
+		plan, err := planCollation(ctx, pool, opts)
 		if err != nil {
 			log.Fatal(err)
 		}
+		work := plan.work
 		if err := writeWorklist(*out, work); err != nil {
 			log.Fatal(err)
 		}
-		clips, purged, knownBroken := 0, 0, 0
+		for _, id := range plan.unavailable {
+			fmt.Printf("unavailable %s\n", id)
+		}
+		clips, purged, knownBroken, restore := 0, 0, 0, 0
 		for _, w := range work {
+			if w.Restore != nil {
+				restore++
+			}
 			clips += len(w.Clips)
 			for _, c := range w.Clips {
 				if c.Purged {
@@ -86,7 +106,8 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 				}
 			}
 		}
-		fmt.Printf("hours=%d clips=%d purged=%d known_broken=%d out=%s\n", len(work), clips, purged, knownBroken, *out)
+		fmt.Printf("hours=%d restore=%d unavailable=%d registered_without_outputs=%d clips=%d purged=%d known_broken=%d out=%s\n",
+			len(work), restore, len(plan.unavailable), plan.registeredEmpty, clips, purged, knownBroken, *out)
 	case "run":
 		worklist := fs.String("worklist", "", "worklist path or r2:KEY")
 		scratch := fs.String("scratch", "", "scratch directory")
@@ -304,7 +325,52 @@ func parseIDList(raw string) (map[int64]bool, error) {
 	return out, nil
 }
 
+// collationDayRequest is one requested local day (hour 0) or hour of a recording.
+type collationDayRequest struct {
+	recordingID int64
+	localDate   string
+	hour        int
+}
+
+func readDayList(path string) ([]collationDayRequest, error) {
+	if path == "" {
+		return nil, nil
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []collationDayRequest
+	for _, line := range strings.Split(string(body), "\n") {
+		if line = strings.TrimSpace(line); line == "" {
+			continue
+		}
+		parts := strings.Split(line, ",")
+		if len(parts) < 2 || len(parts) > 3 {
+			return nil, fmt.Errorf("bad day-list line %q", line)
+		}
+		r := collationDayRequest{localDate: strings.TrimSpace(parts[1])}
+		if r.recordingID, err = strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64); err != nil || r.recordingID <= 0 {
+			return nil, fmt.Errorf("bad day-list recording in %q", line)
+		}
+		if _, err := time.Parse("2006-01-02", r.localDate); err != nil {
+			return nil, fmt.Errorf("bad day-list date in %q", line)
+		}
+		if len(parts) == 3 {
+			if r.hour, err = strconv.Atoi(strings.TrimSpace(parts[2])); err != nil || r.hour < 1 || r.hour > 12 {
+				return nil, fmt.Errorf("bad day-list delivery hour in %q", line)
+			}
+		}
+		out = append(out, r)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s lists no days", path)
+	}
+	return out, nil
+}
+
 type collationPlanOptions struct {
+	dayList    []collationDayRequest
 	scope      string
 	date       string
 	days       int
@@ -319,6 +385,16 @@ type collationDay struct {
 	batchID     string
 	recordingID int64
 	localDate   string
+	hour        int // 0 = every delivery hour
+}
+
+// collationPlan is the planned worklist plus what the days scope left out.
+type collationPlan struct {
+	work []collation.HourWork
+	// unavailable lists hours with a purged source (days scope).
+	unavailable []string
+	// registeredEmpty counts registered hours with no outputs to restore.
+	registeredEmpty int
 }
 
 type collationRecording struct {
@@ -335,37 +411,43 @@ type collationRecording struct {
 // planCollation freezes the hours to (re)collate. Backfill = the approved
 // good+ qualification windows of both cohorts (33 via the tier-1 run, 9 via the
 // September cohort's first dates); nightly = the last closed local day of every
-// active continuous 08:00-20:00 recording.
-func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOptions) ([]collation.HourWork, error) {
+// active continuous 08:00-20:00 recording; days = exactly the listed days or
+// hours of any recording, restoring hours that are already registered.
+func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOptions) (collationPlan, error) {
+	var plan collationPlan
 	var days []collationDay
 	switch opts.scope {
+	case "days":
+		for _, r := range opts.dayList {
+			days = append(days, collationDay{batchID: NightlyBatchID, recordingID: r.recordingID, localDate: r.localDate, hour: r.hour})
+		}
 	case "backfill":
 		var runID int64
 		if err := pool.QueryRow(ctx, `SELECT qualification_run_id FROM recording_joined_batches WHERE batch_id=$1`, joinedrecording.Tier1BatchID).Scan(&runID); err != nil {
-			return nil, fmt.Errorf("tier-1 batch: %w", err)
+			return plan, fmt.Errorf("tier-1 batch: %w", err)
 		}
 		rows, err := pool.Query(ctx, `SELECT w.recording_id, to_char((w.window_start_at AT TIME ZONE r.cron_timezone)::date,'YYYY-MM-DD')
 			FROM recording_qualification_windows w JOIN recordings r ON r.id=w.recording_id WHERE w.run_id=$1 ORDER BY 1, 2`, runID)
 		if err != nil {
-			return nil, err
+			return plan, err
 		}
 		for rows.Next() {
 			d := collationDay{batchID: joinedrecording.Tier1BatchID}
 			if err := rows.Scan(&d.recordingID, &d.localDate); err != nil {
 				rows.Close()
-				return nil, err
+				return plan, err
 			}
 			days = append(days, d)
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
-			return nil, err
+			return plan, err
 		}
 		sep := joinedrecording.CohortForBatch(joinedrecording.SeptemberBatchID)
 		for i, id := range sep.RecordingIDs {
 			first, err := time.Parse("2006-01-02", sep.FirstDates[i])
 			if err != nil {
-				return nil, err
+				return plan, err
 			}
 			for k := 0; k < 14; k++ {
 				days = append(days, collationDay{batchID: joinedrecording.SeptemberBatchID, recordingID: id, localDate: first.AddDate(0, 0, k).Format("2006-01-02")})
@@ -375,19 +457,19 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 		rows, err := pool.Query(ctx, `SELECT id, cron_timezone FROM recordings WHERE status='active' AND mode='continuous'
 			AND delivery='nas_pull' AND daily_window_start='08:00'::time AND daily_window_end='20:00'::time ORDER BY id`)
 		if err != nil {
-			return nil, err
+			return plan, err
 		}
 		for rows.Next() {
 			var id int64
 			var tz string
 			if err := rows.Scan(&id, &tz); err != nil {
 				rows.Close()
-				return nil, err
+				return plan, err
 			}
 			loc, err := time.LoadLocation(tz)
 			if err != nil {
 				rows.Close()
-				return nil, err
+				return plan, err
 			}
 			if opts.date != "" {
 				days = append(days, collationDay{batchID: NightlyBatchID, recordingID: id, localDate: opts.date})
@@ -399,7 +481,7 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
-			return nil, err
+			return plan, err
 		}
 	}
 	byRecording := map[int64][]collationDay{}
@@ -413,53 +495,83 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 		}
 		byRecording[d.recordingID] = append(byRecording[d.recordingID], d)
 	}
-	var work []collation.HourWork
+	planned := map[string]bool{}
 	for _, recordingID := range order {
 		rec, err := loadCollationRecording(ctx, pool, recordingID)
 		if err != nil {
-			return nil, err
+			return plan, err
 		}
 		loc, err := time.LoadLocation(rec.timezone)
 		if err != nil {
-			return nil, err
+			return plan, err
 		}
 		gen1, err := loadGen1Hours(ctx, pool, recordingID)
 		if err != nil {
-			return nil, err
+			return plan, err
 		}
 		for _, d := range byRecording[recordingID] {
 			date, err := time.ParseInLocation("2006-01-02", d.localDate, loc)
 			if err != nil {
-				return nil, err
+				return plan, err
 			}
-			if opts.scope == "nightly" && (rec.windowStart != "08:00:00" || rec.windowEnd != "20:00:00") {
-				continue
+			if rec.windowStart != "08:00:00" || rec.windowEnd != "20:00:00" {
+				switch opts.scope {
+				case "nightly":
+					continue
+				case "days":
+					return plan, fmt.Errorf("recording %d window is %s-%s, not 08:00-20:00", recordingID, rec.windowStart, rec.windowEnd)
+				}
 			}
 			dayStart := time.Date(date.Year(), date.Month(), date.Day(), 8, 0, 0, 0, loc)
 			// A day that has not closed would freeze a partial clip set into a
 			// create-only manifest; never plan it.
 			if !opts.now.After(time.Date(date.Year(), date.Month(), date.Day(), 20, 0, 0, 0, loc).Add(15 * time.Minute)) {
-				if opts.scope == "nightly" {
-					return nil, fmt.Errorf("recording %d day %s is not closed yet", recordingID, d.localDate)
+				if opts.scope != "backfill" {
+					return plan, fmt.Errorf("recording %d day %s is not closed yet", recordingID, d.localDate)
 				}
 				log.Printf("collation-v2 plan: skipping open day recording=%d date=%s", recordingID, d.localDate)
 				continue
 			}
 			clips, err := loadCollationClips(ctx, pool, recordingID, dayStart, dayStart.Add(12*time.Hour), opts.broken, rec.clipSeconds)
 			if err != nil {
-				return nil, err
+				return plan, err
+			}
+			registered := map[int]collationRegisteredHour{}
+			if opts.scope == "days" {
+				if registered, err = loadRegisteredHours(ctx, pool, recordingID, d.localDate); err != nil {
+					return plan, err
+				}
 			}
 			for h := 1; h <= 12; h++ {
-				hourID, err := collation.HourIDFor(d.batchID, recordingID, d.localDate, h)
+				if d.hour != 0 && h != d.hour {
+					continue
+				}
+				reg, isRegistered := registered[h]
+				batchID := d.batchID
+				if isRegistered {
+					batchID = reg.batchID
+				}
+				hourID, err := collation.HourIDFor(batchID, recordingID, d.localDate, h)
 				if err != nil {
-					return nil, err
+					return plan, err
+				}
+				if isRegistered && hourID != reg.hourID {
+					return plan, fmt.Errorf("registered hour %s differs from %s", reg.hourID, hourID)
 				}
 				if opts.hourIDs != nil && !opts.hourIDs[hourID] {
 					continue
 				}
+				if planned[hourID] {
+					return plan, fmt.Errorf("hour %s listed twice", hourID)
+				}
+				planned[hourID] = true
+				if isRegistered && len(reg.restore.Outputs) == 0 {
+					plan.registeredEmpty++
+					continue
+				}
 				start := time.Date(date.Year(), date.Month(), date.Day(), 7+h, 0, 0, 0, loc)
 				end := time.Date(date.Year(), date.Month(), date.Day(), 8+h, 0, 0, 0, loc)
-				w := collation.HourWork{BatchID: d.batchID, HourID: hourID, RecordingID: recordingID, Timezone: rec.timezone, LocalDate: d.localDate,
+				w := collation.HourWork{BatchID: batchID, HourID: hourID, RecordingID: recordingID, Timezone: rec.timezone, LocalDate: d.localDate,
 					DeliveryHour: h, ScheduledStart: start.UTC(), ScheduledEnd: end.UTC(), NamingProfile: rec.namingProfile, FolderName: rec.folderName,
 					Metadata: rec.metadata, Clips: []collation.Clip{}}
 				for _, c := range clips {
@@ -467,15 +579,96 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 						w.Clips = append(w.Clips, c)
 					}
 				}
-				if gen1ID, ok := gen1[collationGen1Key{d.batchID, d.localDate, h}]; ok {
+				if isRegistered {
+					// A restore rebuilds the registered clip set exactly; only
+					// purge state comes from the current catalog.
+					if w.Clips, err = restoreClips(reg.clips, clips); err != nil {
+						return plan, fmt.Errorf("%s: %w", hourID, err)
+					}
+				}
+				if gen1ID, ok := gen1[collationGen1Key{batchID, d.localDate, h}]; ok {
 					w.SupersedesHourRecordID = gen1ID.id
 					w.SupersedesHourID = gen1ID.hourID
 				}
-				work = append(work, w)
+				if opts.scope == "days" && slices.ContainsFunc(w.Clips, func(c collation.Clip) bool { return c.Purged }) {
+					plan.unavailable = append(plan.unavailable, hourID)
+					continue
+				}
+				if isRegistered {
+					w.Restore = &reg.restore
+				}
+				plan.work = append(plan.work, w)
 			}
 		}
 	}
-	return work, nil
+	return plan, nil
+}
+
+type collationRegisteredHour struct {
+	batchID string
+	hourID  string
+	clips   []collation.Clip
+	restore collation.RestoreHour
+}
+
+// restoreClips is a registered hour's manifest clip set with each clip's
+// current purge state; a clip whose catalog row is gone or changed identity
+// fails the plan.
+func restoreClips(registered, catalog []collation.Clip) ([]collation.Clip, error) {
+	byID := make(map[int64]collation.Clip, len(catalog))
+	for _, c := range catalog {
+		byID[c.ClipID] = c
+	}
+	out := make([]collation.Clip, len(registered))
+	for i, c := range registered {
+		now, ok := byID[c.ClipID]
+		if !ok || now.Bucket != c.Bucket || now.ObjectKey != c.ObjectKey || now.SizeBytes != c.SizeBytes || now.SHA256 != c.SHA256 {
+			return nil, fmt.Errorf("registered clip %d differs from the catalog", c.ClipID)
+		}
+		c.Purged = now.Purged
+		out[i] = c
+	}
+	return out, nil
+}
+
+// loadRegisteredHours maps each registered generation-2 hour of one local day
+// to its batch, identity and outputs in part order.
+func loadRegisteredHours(ctx context.Context, pool *pgxpool.Pool, recordingID int64, localDate string) (map[int]collationRegisteredHour, error) {
+	rows, err := pool.Query(ctx, `SELECT h.delivery_hour, h.batch_id, h.hour_id, h.manifest->>'media_tool', h.manifest->'clips', o.object_key, o.size_bytes, o.sha256
+		FROM recording_collation_hours h LEFT JOIN recording_collation_outputs o ON o.collation_hour_id=h.id
+		WHERE h.recording_id=$1 AND h.local_date=$2::date AND h.generation=$3 ORDER BY h.delivery_hour, o.part`, recordingID, localDate, collation.Generation)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int]collationRegisteredHour{}
+	for rows.Next() {
+		var hour int
+		var r collationRegisteredHour
+		var key *string
+		var size *int64
+		var sha *string
+		var clipsRaw []byte
+		if err := rows.Scan(&hour, &r.batchID, &r.hourID, &r.restore.MediaTool, &clipsRaw, &key, &size, &sha); err != nil {
+			return nil, err
+		}
+		if prev, seen := out[hour]; seen {
+			r = prev
+		} else {
+			var disp []collation.ClipDisposition
+			if err := json.Unmarshal(clipsRaw, &disp); err != nil {
+				return nil, fmt.Errorf("%s manifest clips: %w", r.hourID, err)
+			}
+			for _, d := range disp {
+				r.clips = append(r.clips, d.Clip)
+			}
+		}
+		if key != nil {
+			r.restore.Outputs = append(r.restore.Outputs, collation.RestoreOutput{ObjectKey: *key, SizeBytes: *size, SHA256: *sha})
+		}
+		out[hour] = r
+	}
+	return out, rows.Err()
 }
 
 type collationGen1Key struct {
