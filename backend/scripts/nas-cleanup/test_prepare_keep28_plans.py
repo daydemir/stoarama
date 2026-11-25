@@ -397,8 +397,9 @@ class DayPlanTests(unittest.TestCase):
         self.assertEqual([p['label'] for p in plans], ['kday-s3-day-0001', 'kday-s3-day-0002', 'kday-s3-day-0003'])
         self.assertEqual([(p['files'], p['bytes']) for p in plans], [(3, 30), (7, 70), (5, 50)])
         self.assertTrue(all(p['plan_sha256'] == k.day_digest(p['units']) and p['policy_sha256'] == k.POLICY_SHA for p in plans))
+        # The server reports a non-Keep-Everything unit's names as JSON null.
         detail = dict(id=9, label=plans[0]['label'], plan_sha256=plans[0]['plan_sha256'], mode='dry_run', policy_sha256=k.POLICY_SHA,
-                      files=3, bytes=30, units=[dict(u, state='pending', receipts=[]) for u in plans[0]['units']])
+                      files=3, bytes=30, units=[dict(u, names=None, state='pending', receipts=[]) for u in plans[0]['units']])
         k.validate_day_admission(plans[0], dict(id=9, plan_sha256=plans[0]['plan_sha256']), detail)
         with self.assertRaises(RuntimeError):
             k.validate_day_admission(plans[0], dict(id=9, plan_sha256=plans[0]['plan_sha256']), dict(detail, files=4))
