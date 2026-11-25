@@ -17,27 +17,37 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
-// NAS -> R2 restore, for Keep Everything originals only.
+// NAS -> R2 restore, for Keep Everything originals and scoped stitched outputs.
 //
 // Deniz, verbatim: "nas shoul dnot have any of the keep everything (except the
 // keep 20)". R2 holds 100% of Keep Everything, so a Keep Everything clip whose
 // bytes exist only on the NAS goes back to its original R2 key before the NAS
-// copy can leave.
+// copy can leave. Deniz, verbatim: "serve the best 14 days of as many streams
+// as possible, fully stitched v85 ... via r2, through the nice web ui", so a
+// stitched output whose R2 object was deleted after the NAS acknowledged it goes
+// back to its own key too.
 //
 // stoaramactl nas-restore request queues rows in nas_restore_requests. A row
-// is restorable only when nas_restore_ke_original holds: target 'original', the
-// purged clip's own object key, and the clip's stream pinned keep_everything in
-// nas_media_keep20_windows (the manifest cleanupEmbeddedPolicy embeds). Every
-// other row stays as it is: never leased, requeued, verified or canceled here,
-// and its report is refused with 409 before any verification, unpurge or row
-// transition. Test restores stay retired. A clip under a NAS cleanup hold
+// is restorable only when nas_restore_admitted holds (migrations 0260, 0263):
+//   - target 'original': the purged clip's own object key, size, sha256 and
+//     NAS path, and the clip's stream pinned keep_everything in
+//     nas_media_keep20_windows (the manifest cleanupEmbeddedPolicy embeds);
+//   - target 'output': an output the controller put in
+//     nas_restore_output_scope, with its own key, size and sha256 and the
+//     joined/ path of this connection's acknowledged copy of those bytes. Only
+//     clients that declare output_restores lease these.
+// Every other row stays as it is: never leased, requeued, verified or canceled
+// here, and its report is refused with 409 before any verification, unpurge or
+// row transition. Test restores stay retired. A clip under a NAS cleanup hold
 // waits: its purged_at cannot change until the hold releases.
 //
 // The lease issues a presigned create-only PUT bound to the restore row: the
 // key, content type, exact length, sha256 checksum and If-None-Match: * are
 // signed. On report the API HEADs the object and re-hashes it in full; only
-// then is the row verified and the clip's purged_at cleared. R2 deletes are
-// retired, so a mismatched object is left in place and fails the row.
+// then is the row verified and, for an original, the clip's purged_at cleared.
+// A verified output changes no catalog or retirement row: the verified restore
+// row is the record. R2 deletes are retired, so a mismatched object is left in
+// place and fails the row.
 
 const (
 	nasRestoreLeaseTTL      = 30 * time.Minute
@@ -46,9 +56,10 @@ const (
 	nasRestoreBusyRetrySec  = 1
 	nasRestoreMaxError      = 500
 	nasRestoreMaxDuration   = 24 * time.Hour
-	// The API's WriteTimeout is 60s. Clips are at most ~85 MB, which R2 serves
-	// to the API in a few seconds; the verify and the write must both finish
-	// inside the one report request.
+	// The API's WriteTimeout is 60s. Clips are at most ~85 MB and a stitched
+	// hour is typically a few hundred MB, which R2 serves to the API in a few
+	// seconds; the verify and the write must both finish inside the one report
+	// request.
 	nasRestoreVerifyTimeout  = 40 * time.Second
 	nasRestoreRecordTimeout  = 10 * time.Second
 	nasRestoreMaxObjectBytes = r2.MaxConditionalPutBytes
@@ -63,6 +74,9 @@ var nasRestoreOutcomes = map[string]bool{
 type nasRestoreLeaseRequest struct {
 	ClientVersion string `json:"client_version"`
 	MaxTasks      int    `json:"max_tasks"`
+	// Clients that place stitched outputs under joined/ and read them back for
+	// 'output' tasks. Older clients reject those tasks, so they never get one.
+	OutputRestores bool `json:"output_restores"`
 }
 
 type nasRestoreSignedRequest struct {
@@ -74,7 +88,8 @@ type nasRestoreSignedRequest struct {
 type nasRestoreTask struct {
 	TaskID       int64                   `json:"task_id"`
 	Attempt      int                     `json:"attempt"`
-	ClipID       int64                   `json:"clip_id"`
+	ClipID       int64                   `json:"clip_id,omitempty"`
+	OutputID     int64                   `json:"output_id,omitempty"`
 	RelativePath string                  `json:"relative_path"`
 	SizeBytes    int64                   `json:"size_bytes"`
 	SHA256       string                  `json:"sha256"`
@@ -143,7 +158,7 @@ func (s *Server) nasRestoreConnection(ctx context.Context, w http.ResponseWriter
 }
 
 // handleAccountConnectionRestoreLease hands the NAS client up to max_tasks
-// pending Keep Everything original restores, each with its own create-only PUT.
+// pending admitted restores, each with its own create-only PUT.
 func (s *Server) handleAccountConnectionRestoreLease(w http.ResponseWriter, r *http.Request) {
 	var req nasRestoreLeaseRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
@@ -181,30 +196,30 @@ func (s *Server) handleAccountConnectionRestoreLease(w http.ResponseWriter, r *h
 		  state=CASE WHEN attempts>=max_attempts THEN 'failed' ELSE 'pending' END,
 		  completed_at=CASE WHEN attempts>=max_attempts THEN now() END,
 		  lease_expires_at=NULL, outcome='lease_expired', last_error='lease expired before a result was reported'
-		WHERE connection_id=$1 AND state='leased' AND lease_expires_at<now() AND nas_restore_ke_original(target,clip_id,object_key,size_bytes,sha256,relative_path)`, connectionID); err != nil {
+		WHERE connection_id=$1 AND state='leased' AND lease_expires_at<now() AND nas_restore_admitted(nas_restore_requests)`, connectionID); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "requeue expired restores failed")
 		return
 	}
 	rows, err := tx.Query(ctx, `
 		WITH picked AS (
 		  SELECT id FROM nas_restore_requests
-		  WHERE connection_id=$1 AND state='pending' AND nas_restore_ke_original(target,clip_id,object_key,size_bytes,sha256,relative_path)
-		    AND NOT nas_cleanup_clip_held(clip_id)
+		  WHERE connection_id=$1 AND state='pending' AND nas_restore_admitted(nas_restore_requests)
+		    AND (target<>'output' OR $5) AND NOT nas_cleanup_clip_held(clip_id)
 		  ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED)
 		UPDATE nas_restore_requests q SET state='leased', attempts=q.attempts+1, leased_at=now(),
 		  first_leased_at=COALESCE(q.first_leased_at, now()),
 		  lease_expires_at=now()+$3::bigint*interval '1 microsecond',
 		  client_version=CASE WHEN $4<>'' THEN $4 ELSE q.client_version END
 		FROM picked WHERE q.id=picked.id
-		RETURNING q.id, q.attempts, q.clip_id, q.relative_path, q.size_bytes, q.sha256, q.lease_expires_at`,
-		connectionID, req.MaxTasks, nasRestoreLeaseTTL.Microseconds(), req.ClientVersion)
+		RETURNING q.id, q.attempts, COALESCE(q.clip_id,0), COALESCE(q.output_id,0), q.relative_path, q.size_bytes, q.sha256, q.lease_expires_at`,
+		connectionID, req.MaxTasks, nasRestoreLeaseTTL.Microseconds(), req.ClientVersion, req.OutputRestores)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "lease restores failed")
 		return
 	}
 	tasks, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (nasRestoreTask, error) {
 		var t nasRestoreTask
-		err := row.Scan(&t.TaskID, &t.Attempt, &t.ClipID, &t.RelativePath, &t.SizeBytes, &t.SHA256, &t.ExpiresAt)
+		err := row.Scan(&t.TaskID, &t.Attempt, &t.ClipID, &t.OutputID, &t.RelativePath, &t.SizeBytes, &t.SHA256, &t.ExpiresAt)
 		return t, err
 	})
 	if err != nil {
@@ -270,8 +285,8 @@ func (s *Server) verifyNASRestoreObject(ctx context.Context, key string, size in
 	return head.ETag, false, nil
 }
 
-// handleAccountConnectionRestoreResult verifies and records one Keep
-// Everything original restore.
+// handleAccountConnectionRestoreResult verifies and records one admitted
+// restore.
 func (s *Server) handleAccountConnectionRestoreResult(w http.ResponseWriter, r *http.Request) {
 	taskID, ok := parseInt64Path(w, r, "taskId")
 	if !ok {
@@ -291,13 +306,13 @@ func (s *Server) handleAccountConnectionRestoreResult(w http.ResponseWriter, r *
 		return
 	}
 	var row nasRestoreRow
-	var keOriginal bool
+	var admitted bool
 	var now time.Time
 	err := s.pool.QueryRow(ctx, `
-		SELECT id,clip_id,object_key,size_bytes,sha256,state,attempts,max_attempts,nas_restore_ke_original(target,clip_id,object_key,size_bytes,sha256,relative_path),now()
+		SELECT id,COALESCE(clip_id,0),object_key,size_bytes,sha256,state,attempts,max_attempts,nas_restore_admitted(nas_restore_requests),now()
 		FROM nas_restore_requests WHERE id=$1 AND connection_id=$2`, taskID, connectionID).Scan(
 		&row.ID, &row.ClipID, &row.ObjectKey, &row.SizeBytes, &row.SHA256,
-		&row.State, &row.Attempts, &row.MaxAttempts, &keOriginal, &now)
+		&row.State, &row.Attempts, &row.MaxAttempts, &admitted, &now)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "restore not found")
 		return
@@ -306,8 +321,8 @@ func (s *Server) handleAccountConnectionRestoreResult(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusInternalServerError, "load restore failed")
 		return
 	}
-	if !keOriginal {
-		util.WriteError(w, http.StatusConflict, "only Keep Everything original restores are live; this request is preserved")
+	if !admitted {
+		util.WriteError(w, http.StatusConflict, "only Keep Everything original and scoped output restores are live; this request is preserved")
 		return
 	}
 	if err := validateNASRestoreResult(req, row.SizeBytes, now); err != nil {
@@ -372,7 +387,8 @@ func (s *Server) handleAccountConnectionRestoreResult(w http.ResponseWriter, r *
 		return
 	}
 	clipRestored := false
-	if next == "verified" {
+	// An output restore has no clip (ClipID 0) and changes no catalog row.
+	if next == "verified" && row.ClipID != 0 {
 		// The identity predicates make this a no-op if the clip row changed.
 		tag, err := tx.Exec(ctx, `
 			UPDATE recording_clips SET purged_at=NULL

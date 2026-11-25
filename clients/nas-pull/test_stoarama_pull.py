@@ -3838,6 +3838,28 @@ class RestoreTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 pull.valid_restore_task(self.task(**bad))
 
+    def test_valid_restore_task_reads_outputs_only_under_joined(self):
+        rel = "Rec/July/01-Wednesday/Rec_hour_05_050000-060000.mp4"
+        (self.root / "joined" / "Rec" / "July" / "01-Wednesday").mkdir(parents=True)
+        (self.root / "joined" / rel).write_bytes(self.body)
+        output = self.task(relative_path="joined/" + rel, output_id=99)
+        del output["clip_id"]
+        task = pull.valid_restore_task(output)
+        self.assertEqual((str(task["relative_path"]), task["output_id"], task["subject"]), ("joined/" + rel, 99, "output=99"))
+        received = self.serve(200)
+        self.assertEqual(pull.run_restore_task(self.cfg, task)["outcome"], "uploaded")
+        self.assertEqual(received[0][1], self.body)
+        for bad in (
+            {"output_id": 99, "clip_id": 42}, {"output_id": 0}, {"output_id": 99, "relative_path": rel},
+            {"output_id": 99, "relative_path": "joined/../" + rel}, {"output_id": 99, "relative_path": "joined/Rec/x.mp4"},
+            {"output_id": 99, "relative_path": "joined/joined/" + rel},
+        ):
+            raw = self.task(**bad)
+            if "clip_id" not in bad:
+                del raw["clip_id"]
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                pull.valid_restore_task(raw)
+
     def test_run_restore_task_uploads_exact_verified_bytes(self):
         received = self.serve(200)
         result = pull.run_restore_task(self.cfg, pull.valid_restore_task(self.task()))
@@ -3940,6 +3962,7 @@ class RestoreTests(unittest.TestCase):
             calls.append((method, path, body))
             if path.endswith("/lease"):
                 self.assertLessEqual(body["max_tasks"], 2)
+                self.assertIs(body["output_restores"], True)
                 if leases:
                     return {"retry_after_sec": 1, "tasks": leases.pop(0)}
                 return {"retry_after_sec": 120, "tasks": []}

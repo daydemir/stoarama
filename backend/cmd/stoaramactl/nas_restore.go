@@ -28,10 +28,14 @@ import (
 // own object key and is only allowed for purged clips; --test-prefix writes a
 // disposable copy under nas-restore-test/<label>/ that the API deletes once it
 // is verified, which measures restore throughput without touching live keys.
+// --output-ids-file queues 'output' restores of stitched outputs: each writes
+// the output's own key from the NAS copy the connection acknowledged, and is
+// leased only while the controller keeps the output in nas_restore_output_scope.
 
 const nasRestoreUsage = `usage:
-  stoaramactl nas-restore request (--clip-ids 1,2,3 | --hour-record-id N | --recording-id N --from TIME --to TIME)
+  stoaramactl nas-restore request (--clip-ids 1,2,3 | --hour-record-id N | --recording-id N --from TIME --to TIME | --output-ids-file FILE)
       [--test-prefix --label LABEL --max-bytes N --limit N --max-attempts 5 --dry-run --json]
+      FILE lists recording_collation_outputs ids, separated by whitespace or commas; --test-prefix does not apply.
   stoaramactl nas-restore status [--label LABEL --json]
   stoaramactl nas-restore cancel --label LABEL`
 
@@ -39,6 +43,7 @@ var nasRestoreLabelRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,79}$`)
 
 type nasRestoreRequestOptions struct {
 	clipIDs      []int64
+	outputIDs    []int64
 	hourRecordID int64
 	recordingID  int64
 	from, to     time.Time
@@ -68,6 +73,7 @@ func parseNASRestoreRequestArgs(args []string, now time.Time) (nasRestoreRequest
 	fs.SetOutput(io.Discard)
 	opts := nasRestoreRequestOptions{}
 	clipIDs := fs.String("clip-ids", "", "comma separated clip ids")
+	outputIDsFile := fs.String("output-ids-file", "", "stitched output ids to restore to their own keys")
 	fs.Int64Var(&opts.hourRecordID, "hour-record-id", 0, "every source clip of one joined hour")
 	fs.Int64Var(&opts.recordingID, "recording-id", 0, "clips of one recording between --from and --to (clip_start_at)")
 	from := fs.String("from", "", "inclusive start (RFC3339 or YYYY-MM-DD, UTC)")
@@ -94,8 +100,18 @@ func parseNASRestoreRequestArgs(args []string, now time.Time) (nasRestoreRequest
 			opts.clipIDs = append(opts.clipIDs, id)
 		}
 	}
+	if *outputIDsFile != "" {
+		ids, err := readNASRestoreOutputIDs(*outputIDsFile)
+		if err != nil {
+			return opts, err
+		}
+		opts.outputIDs = ids
+	}
 	selectors := 0
 	if len(opts.clipIDs) > 0 {
+		selectors++
+	}
+	if *outputIDsFile != "" {
 		selectors++
 	}
 	if opts.hourRecordID != 0 {
@@ -121,7 +137,9 @@ func parseNASRestoreRequestArgs(args []string, now time.Time) (nasRestoreRequest
 	}
 	switch {
 	case selectors != 1:
-		return opts, errors.New("exactly one of --clip-ids, --hour-record-id or --recording-id is required")
+		return opts, errors.New("exactly one of --clip-ids, --hour-record-id, --recording-id or --output-ids-file is required")
+	case opts.test && len(opts.outputIDs) > 0:
+		return opts, errors.New("--test-prefix does not apply to --output-ids-file")
 	case opts.hourRecordID < 0 || opts.recordingID < 0:
 		return opts, errors.New("ids must be positive")
 	case opts.maxBytes < 0 || opts.limit < 0:
@@ -136,6 +154,30 @@ func parseNASRestoreRequestArgs(args []string, now time.Time) (nasRestoreRequest
 		return opts, errors.New("--label must match " + nasRestoreLabelRE.String())
 	}
 	return opts, nil
+}
+
+func readNASRestoreOutputIDs(name string) ([]int64, error) {
+	raw, err := os.ReadFile(name)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[int64]bool{}
+	var ids []int64
+	for _, field := range strings.FieldsFunc(string(raw), func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r' }) {
+		id, err := strconv.ParseInt(field, 10, 64)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("invalid output id %q in %s", field, name)
+		}
+		if seen[id] {
+			return nil, fmt.Errorf("duplicate output id %d in %s", id, name)
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("%s lists no output ids", name)
+	}
+	return ids, nil
 }
 
 type nasRestoreCandidate struct {
@@ -233,12 +275,117 @@ func loadNASRestoreCandidates(ctx context.Context, q interface {
 	return out, rows.Err()
 }
 
+type nasRestoreOutputCandidate struct {
+	OutputID      int64
+	Known         bool
+	RecordingID   int64
+	ObjectKey     string
+	NASPath       string
+	SizeBytes     int64
+	SHA256        string
+	ConnectionID  int64
+	NASConnection int
+	NASAcked      bool
+	Scoped        bool
+}
+
+// classifyNASRestoreOutput returns "" when the output may be queued. The lease
+// gate (nas_restore_scoped_output) rechecks scope and identity on every use.
+func classifyNASRestoreOutput(c nasRestoreOutputCandidate) string {
+	switch {
+	case !c.Known:
+		return "unknown_output"
+	case c.NASConnection == 0:
+		return "no_nas_connection"
+	case c.NASConnection > 1:
+		return "ambiguous_nas_connection"
+	case c.SizeBytes > r2.MaxConditionalPutBytes:
+		return "too_large"
+	case !c.NASAcked:
+		return "nas_unacknowledged"
+	case !c.Scoped:
+		return "not_scoped"
+	}
+	return ""
+}
+
+// The NAS copy is the connection's ack of the output's exact bytes and path.
+const nasRestoreOutputCandidatesSQL = `
+SELECT ids.id, o.id IS NOT NULL, COALESCE(h.recording_id,0), COALESCE(o.object_key,''), COALESCE(o.nas_relative_path,''),
+       COALESCE(o.size_bytes,0), COALESCE(o.sha256,''), COALESCE(conn.id,0),
+       (SELECT count(*) FROM connections k WHERE k.account_id=rec.account_id AND k.kind='nas_pull'),
+       EXISTS(SELECT 1 FROM recording_collation_output_acks a WHERE a.output_id=o.id AND a.connection_id=conn.id
+              AND a.nas_relative_path=o.nas_relative_path AND a.size_bytes=o.size_bytes AND a.sha256=o.sha256),
+       EXISTS(SELECT 1 FROM nas_restore_output_scope s WHERE s.output_id=o.id)
+FROM unnest($1::bigint[]) WITH ORDINALITY ids(id,n)
+LEFT JOIN recording_collation_outputs o ON o.id=ids.id
+LEFT JOIN recording_collation_hours h ON h.id=o.collation_hour_id
+LEFT JOIN recordings rec ON rec.id=h.recording_id
+LEFT JOIN LATERAL (SELECT k.id FROM connections k WHERE k.account_id=rec.account_id AND k.kind='nas_pull' ORDER BY k.id LIMIT 1) conn ON true
+ORDER BY ids.n`
+
+func loadNASRestoreOutputs(ctx context.Context, q pgx.Tx, ids []int64) ([]nasRestoreOutputCandidate, error) {
+	rows, err := q.Query(ctx, nasRestoreOutputCandidatesSQL, ids)
+	if err != nil {
+		return nil, fmt.Errorf("load output restore candidates: %w", err)
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (nasRestoreOutputCandidate, error) {
+		var c nasRestoreOutputCandidate
+		err := row.Scan(&c.OutputID, &c.Known, &c.RecordingID, &c.ObjectKey, &c.NASPath, &c.SizeBytes, &c.SHA256,
+			&c.ConnectionID, &c.NASConnection, &c.NASAcked, &c.Scoped)
+		return c, err
+	})
+}
+
+// nasRestoreQueueRow is one nas_restore_requests insert, or why it is skipped.
+// A zero clip or output id is stored as NULL.
+type nasRestoreQueueRow struct {
+	skip                                string
+	what                                string
+	connectionID, clipID, outputID      int64
+	recordingID, sizeBytes              int64
+	key, sourceKey, relativePath, ctype string
+	sha256                              string
+}
+
+func nasRestoreQueueRows(ctx context.Context, tx pgx.Tx, bucket string, opts nasRestoreRequestOptions) ([]nasRestoreQueueRow, error) {
+	var out []nasRestoreQueueRow
+	if len(opts.outputIDs) > 0 {
+		outputs, err := loadNASRestoreOutputs(ctx, tx, opts.outputIDs)
+		if err != nil {
+			return nil, err
+		}
+		for _, o := range outputs {
+			out = append(out, nasRestoreQueueRow{skip: classifyNASRestoreOutput(o), what: fmt.Sprintf("output %d", o.OutputID),
+				connectionID: o.ConnectionID, outputID: o.OutputID, recordingID: o.RecordingID, sizeBytes: o.SizeBytes,
+				key: o.ObjectKey, sourceKey: o.ObjectKey, relativePath: "joined/" + o.NASPath, ctype: "video/mp4", sha256: o.SHA256})
+		}
+		return out, nil
+	}
+	clips, err := loadNASRestoreCandidates(ctx, tx, opts)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range clips {
+		key := c.ObjectKey
+		if opts.test {
+			key = nasRestoreTestKey(opts.label, c.ClipID, c.DisplayPath)
+		}
+		out = append(out, nasRestoreQueueRow{skip: classifyNASRestoreCandidate(c, bucket, opts.test), what: fmt.Sprintf("clip %d", c.ClipID),
+			connectionID: c.ConnectionID, clipID: c.ClipID, recordingID: c.RecordingID, sizeBytes: c.SizeBytes,
+			key: key, sourceKey: c.ObjectKey, relativePath: c.DisplayPath, ctype: c.ContentType, sha256: c.SHA256})
+	}
+	return out, nil
+}
+
 func requestNASRestores(ctx context.Context, pool *pgxpool.Pool, bucket string, opts nasRestoreRequestOptions) (nasRestoreRequestSummary, error) {
 	summary := nasRestoreRequestSummary{Label: opts.label, Target: "original", DryRun: opts.dryRun, Skipped: map[string]int64{}}
-	if opts.test {
+	switch {
+	case opts.test:
 		summary.Target = "test"
-	}
-	if !opts.test && strings.TrimSpace(bucket) == "" {
+	case len(opts.outputIDs) > 0:
+		summary.Target = "output"
+	case strings.TrimSpace(bucket) == "":
 		return summary, errors.New("R2_BUCKET is required for original restores")
 	}
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
@@ -246,45 +393,41 @@ func requestNASRestores(ctx context.Context, pool *pgxpool.Pool, bucket string, 
 		return summary, err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	candidates, err := loadNASRestoreCandidates(ctx, tx, opts)
+	rows, err := nasRestoreQueueRows(ctx, tx, bucket, opts)
 	if err != nil {
 		return summary, err
 	}
-	summary.Selected = len(candidates)
-	for _, c := range candidates {
-		if reason := classifyNASRestoreCandidate(c, bucket, opts.test); reason != "" {
-			summary.Skipped[reason]++
+	summary.Selected = len(rows)
+	for _, c := range rows {
+		if c.skip != "" {
+			summary.Skipped[c.skip]++
 			continue
 		}
-		if (opts.limit > 0 && summary.Queued >= opts.limit) || (opts.maxBytes > 0 && summary.QueuedBytes+c.SizeBytes > opts.maxBytes) {
+		if (opts.limit > 0 && summary.Queued >= opts.limit) || (opts.maxBytes > 0 && summary.QueuedBytes+c.sizeBytes > opts.maxBytes) {
 			summary.CapReached = true
 			break
 		}
-		key := c.ObjectKey
-		if opts.test {
-			key = nasRestoreTestKey(opts.label, c.ClipID, c.DisplayPath)
-		}
 		if opts.dryRun {
 			summary.Queued++
-			summary.QueuedBytes += c.SizeBytes
+			summary.QueuedBytes += c.sizeBytes
 			continue
 		}
 		tag, err := tx.Exec(ctx, `
-			INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,object_key,source_object_key,relative_path,
+			INSERT INTO nas_restore_requests(connection_id,clip_id,output_id,recording_id,target,object_key,source_object_key,relative_path,
 			  content_type,size_bytes,sha256,label,max_attempts)
-			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+			VALUES($1,NULLIF($2::bigint,0),NULLIF($3::bigint,0),$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
 			ON CONFLICT (object_key) WHERE state IN ('pending','leased') DO NOTHING`,
-			c.ConnectionID, c.ClipID, c.RecordingID, summary.Target, key, c.ObjectKey, c.DisplayPath,
-			c.ContentType, c.SizeBytes, c.SHA256, opts.label, opts.maxAttempts)
+			c.connectionID, c.clipID, c.outputID, c.recordingID, summary.Target, c.key, c.sourceKey, c.relativePath,
+			c.ctype, c.sizeBytes, c.sha256, opts.label, opts.maxAttempts)
 		if err != nil {
-			return summary, fmt.Errorf("queue clip %d: %w", c.ClipID, err)
+			return summary, fmt.Errorf("queue %s: %w", c.what, err)
 		}
 		if tag.RowsAffected() == 0 {
 			summary.AlreadyQueued++
 			continue
 		}
 		summary.Queued++
-		summary.QueuedBytes += c.SizeBytes
+		summary.QueuedBytes += c.sizeBytes
 	}
 	if opts.dryRun {
 		return summary, nil
@@ -457,15 +600,23 @@ func runNASRestore(ctx context.Context, cfg config.Config, args []string) {
 		}
 		pool := mustJoinedPurgePool(ctx, cfg)
 		defer pool.Close()
-		tag, err := pool.Exec(ctx, `UPDATE nas_restore_requests SET state='canceled', completed_at=now(), outcome='canceled'
-			WHERE label=$1 AND state='pending'`, *label)
+		canceled, err := cancelNASRestores(ctx, pool, *label)
 		if err != nil {
 			log.Fatal(err)
 		}
-		fmt.Printf("label=%s canceled_pending=%d (leased rows finish or expire)\n", *label, tag.RowsAffected())
+		fmt.Printf("label=%s canceled=%d (live leases finish or expire; cancel again after)\n", *label, canceled)
 	default:
 		log.Fatal(nasRestoreUsage)
 	}
+}
+
+// cancelNASRestores cancels a label's pending rows and its expired leases. An
+// expired lease's PUT capability has expired with it; the API requeues only
+// leases it still admits, so one whose scope was withdrawn ends only here.
+func cancelNASRestores(ctx context.Context, pool *pgxpool.Pool, label string) (int64, error) {
+	tag, err := pool.Exec(ctx, `UPDATE nas_restore_requests SET state='canceled', completed_at=now(), outcome='canceled', lease_expires_at=NULL
+		WHERE label=$1 AND (state='pending' OR (state='leased' AND lease_expires_at<now()))`, label)
+	return tag.RowsAffected(), err
 }
 
 func printCounts(prefix string, counts map[string]int64) {

@@ -420,3 +420,271 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 		t.Fatalf("non-KE-original rows or clips changed:\nbefore %s\nafter  %s", before, after)
 	}
 }
+
+// A stitched output whose R2 object is gone goes back to its own key from the
+// NAS copy the connection acknowledged, only while the controller scopes it and
+// only with the output's exact identity. Nothing else about the output changes.
+func TestNASRestoreScopedOutputLifecycle(t *testing.T) {
+	pool := dayTestPool(t)
+	ctx := context.Background()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`
+INSERT INTO accounts(id,email) VALUES(47,'nas-restore@example.invalid');
+INSERT INTO account_api_keys(id,account_id,key_prefix,secret_hash) VALUES(47,47,'fixture-key','fixture-key');
+INSERT INTO connections(id,account_id,kind,api_key_id) VALUES(13,47,'nas_pull',47);
+INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
+ VALUES(3,'test','3','test','test','https://storage.example.test','off','Asia/Tokyo','hls','video_manifest','video_live','continuous_video',30);
+INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc)
+ VALUES(1,47,'test','https://storage.example.test','auto','bucket','fixture',decode('00','hex'));
+INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
+ VALUES(30,47,1,'rec','https://storage.example.test','* * * * *','Asia/Tokyo','paused',3,now());
+BEGIN; SET LOCAL session_replication_role=replica;
+INSERT INTO recording_collation_hours(id,hour_id,batch_id,generation,recording_id,local_date,delivery_hour,status,manifest_object_key,manifest_sha256,
+ manifest,source_clip_count,included_clip_count,excluded_clip_count,join_count,split_count)
+ VALUES(1,'nightly-collation-v2__recording-30__date-2026-10-01__hour-05__generation-2','nightly-collation-v2',2,30,'2026-10-01',5,'collated','m/1',repeat('a',64),'{}',1,1,0,0,0);
+COMMIT`)
+
+	// Catalogue fixtures bypass the catalogue's own admission triggers.
+	replica := func(stmts ...[]any) {
+		t.Helper()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx, `SET LOCAL session_replication_role=replica`); err != nil {
+			t.Fatal(err)
+		}
+		for _, stmt := range stmts {
+			if _, err := tx.Exec(ctx, stmt[0].(string), stmt[1:]...); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	type output struct {
+		id   int64
+		key  string
+		path string
+		body []byte
+		sha  string
+	}
+	newOutput := func(id int64, scoped bool) output {
+		t.Helper()
+		o := output{id: id, body: []byte(fmt.Sprintf("stitched hour %d", id))}
+		sum := sha256.Sum256(o.body)
+		o.sha = hex.EncodeToString(sum[:])
+		o.key = "joined/nightly-collation-v2/objects/" + o.sha + ".mp4"
+		o.path = fmt.Sprintf("Rec/October/01-Wednesday/Rec_hour_05_part_%02d_050000-060000.mp4", id)
+		replica(
+			[]any{`INSERT INTO recording_collation_outputs(id,collation_hour_id,part,parts,object_key,nas_relative_path,size_bytes,sha256,start_at,end_at,source_clip_ids,r2_verified_at)
+ VALUES($1::bigint,1,$1::bigint::int,20,$2,$3,$4,$5,'2026-09-30T20:00:00Z','2026-09-30T21:00:00Z',ARRAY[1],now())`, o.id, o.key, o.path, len(o.body), o.sha},
+			[]any{`INSERT INTO recording_collation_output_acks(output_id,connection_id,nas_relative_path,size_bytes,sha256) VALUES($1,13,$2,$3,$4)`, o.id, o.path, len(o.body), o.sha},
+			[]any{`INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256)
+ VALUES('collated',$1,3,'bucket',$2,$3,$4,'fixture','none',repeat('e',64),repeat('e',64))`, o.id, o.key, len(o.body), o.sha})
+		if scoped {
+			exec(`INSERT INTO nas_restore_output_scope(output_id) VALUES($1)`, o.id)
+		}
+		return o
+	}
+	request := func(o output, mutate string) (int64, error) {
+		var id int64
+		err := pool.QueryRow(ctx, `INSERT INTO nas_restore_requests(connection_id,output_id,recording_id,target,object_key,source_object_key,relative_path,content_type,size_bytes,sha256,label)
+			VALUES(13,$1,30,'output',$2,$2,'joined/'||$3,'video/mp4',$4,$5,'o1') RETURNING id`, o.id, o.key, o.path, len(o.body), o.sha).Scan(&id)
+		if err == nil && mutate != "" {
+			_, err = pool.Exec(ctx, `UPDATE nas_restore_requests SET `+mutate+` WHERE id=$1`, id)
+		}
+		return id, err
+	}
+	mustRequest := func(o output, mutate string) int64 {
+		t.Helper()
+		id, err := request(o, mutate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+
+	// Queued before the fence. Unscoped and drifted rows must never move.
+	unscopedID := mustRequest(newOutput(1, false), "")
+	sizeDriftID := mustRequest(newOutput(2, true), "size_bytes=size_bytes+1")
+	shaDriftID := mustRequest(newOutput(3, true), "sha256=repeat('0',64)")
+	pathDriftID := mustRequest(newOutput(4, true), "relative_path='joined/Rec/October/01-Wednesday/Rec_hour_06_060000-070000.mp4'")
+	ackDrift := newOutput(5, true)
+	replica(
+		[]any{`DELETE FROM recording_collation_output_acks WHERE output_id=$1`, ackDrift.id},
+		[]any{`INSERT INTO recording_collation_output_acks(output_id,connection_id,nas_relative_path,size_bytes,sha256) VALUES($1,13,$2,$3,repeat('0',64))`, ackDrift.id, ackDrift.path, len(ackDrift.body)})
+	ackDriftID := mustRequest(ackDrift, "")
+	restored := newOutput(6, true)
+	restoredID := mustRequest(restored, "")
+	occupied := newOutput(7, true)
+	occupiedID := mustRequest(occupied, "")
+	unscopedLate, scopedLate := newOutput(8, false), newOutput(9, true)
+
+	exec(`INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',repeat('a',64))`)
+	if _, err := request(unscopedLate, ""); err == nil || !strings.Contains(err.Error(), "fenced") {
+		t.Fatalf("unscoped output queued past the writer fence: %v", err)
+	}
+	lateID := mustRequest(scopedLate, "")
+	// Past the fence, a scoped output row that drifted from its identity, or
+	// names another media type, is refused like any other fenced writer.
+	for _, drift := range []string{"$4+1,$5,'video/mp4'", "$4,repeat('0',64),'video/mp4'", "$4,$5,'text/html'"} {
+		_, err := pool.Exec(ctx, `INSERT INTO nas_restore_requests(connection_id,output_id,recording_id,target,object_key,source_object_key,relative_path,size_bytes,sha256,content_type,label)
+			VALUES(13,$1,30,'output',$2,$2,'joined/'||$3,`+drift+`,'o1')`, scopedLate.id, scopedLate.key, scopedLate.path, len(scopedLate.body), scopedLate.sha)
+		if err == nil || !strings.Contains(err.Error(), "fenced") {
+			t.Fatalf("drifted output row %s queued past the writer fence: %v", drift, err)
+		}
+	}
+
+	frozen := func() string {
+		t.Helper()
+		var raw string
+		if err := pool.QueryRow(ctx, `SELECT jsonb_build_array(
+			(SELECT jsonb_agg(to_jsonb(q) ORDER BY id) FROM nas_restore_requests q WHERE id=ANY($1)),
+			(SELECT jsonb_agg(to_jsonb(o) ORDER BY id) FROM recording_collation_outputs o),
+			(SELECT jsonb_agg(to_jsonb(a) ORDER BY output_id) FROM recording_collation_output_acks a),
+			(SELECT jsonb_agg(to_jsonb(r) ORDER BY id) FROM r2_object_retirements r))::text`,
+			[]int64{unscopedID, sizeDriftID, shaDriftID, pathDriftID, ackDriftID}).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	before := frozen()
+
+	bucket := &fakeRestoreBucket{objects: map[string][]byte{occupied.key: []byte("someone else's bytes")}}
+	server := httptest.NewServer(bucket)
+	defer server.Close()
+	client, err := r2.New(ctx, r2.Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool, r2: client}
+	router := chi.NewRouter()
+	router.Post("/lease", s.handleAccountConnectionRestoreLease)
+	router.Post("/result/{taskId}", s.handleAccountConnectionRestoreResult)
+	call := func(path, body string) (int, string) {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey,
+			accountPrincipal{AccountID: 47, APIKeyID: ptrInt64(47)}))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code, rec.Body.String()
+	}
+	lease := func(outputs bool) map[int64]nasRestoreTask {
+		t.Helper()
+		code, body := call("/lease", fmt.Sprintf(`{"client_version":"abc123","max_tasks":64,"output_restores":%t}`, outputs))
+		if code != http.StatusOK {
+			t.Fatalf("lease status=%d body=%s", code, body)
+		}
+		var resp nasRestoreLeaseResponse
+		if err := json.Unmarshal([]byte(body), &resp); err != nil {
+			t.Fatal(err)
+		}
+		out := map[int64]nasRestoreTask{}
+		for _, task := range resp.Tasks {
+			out[task.TaskID] = task
+		}
+		return out
+	}
+	put := func(task nasRestoreTask, body []byte) int {
+		t.Helper()
+		req, err := http.NewRequest(task.Put.Method, task.Put.URL, bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range task.Put.Headers {
+			req.Header.Set(k, v)
+		}
+		req.ContentLength = int64(len(body))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	report := func(id int64, outcome string) (int, string) {
+		return call(fmt.Sprintf("/result/%d", id), fmt.Sprintf(
+			`{"attempt":1,"outcome":%q,"bytes_uploaded":0,"duration_ms":7,"client_version":"abc123"}`, outcome))
+	}
+
+	// A client that cannot read joined/ back never gets an output task.
+	if tasks := lease(false); len(tasks) != 0 {
+		t.Fatalf("output tasks leased to a client without output_restores: %v", tasks)
+	}
+	tasks := lease(true)
+	var leased []int64
+	for id := range tasks {
+		leased = append(leased, id)
+	}
+	slices.Sort(leased)
+	if want := []int64{restoredID, occupiedID, lateID}; !slices.Equal(leased, want) {
+		t.Fatalf("leased %v, want only the scoped, exact outputs %v", leased, want)
+	}
+	var putCovers bool
+	var fencedCapabilities int
+	if err := pool.QueryRow(ctx, `SELECT bool_and(put_expires_at>lease_expires_at+interval '1 minute'),(SELECT count(*) FROM r2_retirement_writer_capabilities)
+		FROM nas_restore_requests WHERE state='leased'`).Scan(&putCovers, &fencedCapabilities); err != nil || !putCovers || fencedCapabilities != 0 {
+		t.Fatalf("put window covers=%v fenced capabilities=%d err=%v", putCovers, fencedCapabilities, err)
+	}
+	for _, id := range []int64{unscopedID, sizeDriftID, shaDriftID, pathDriftID, ackDriftID} {
+		if code, body := report(id, "uploaded"); code != http.StatusConflict {
+			t.Fatalf("report on unadmitted output restore %d status=%d body=%s", id, code, body)
+		}
+	}
+
+	task := tasks[restoredID]
+	if task.OutputID != restored.id || task.ClipID != 0 || task.RelativePath != "joined/"+restored.path || task.SHA256 != restored.sha ||
+		task.SizeBytes != int64(len(restored.body)) || !strings.Contains(task.Put.URL, "/bucket/"+restored.key) ||
+		!strings.Contains(task.Put.URL, "X-Amz-Checksum-Sha256=") || task.Put.Headers["If-None-Match"] != "*" {
+		t.Fatalf("output task=%+v", task)
+	}
+	if code := put(task, restored.body); code != http.StatusOK {
+		t.Fatalf("output put status=%d", code)
+	}
+	// Create-only: a second PUT at the restored key is refused by storage.
+	if code := put(task, []byte("other bytes, same len")); code != http.StatusPreconditionFailed {
+		t.Fatalf("repeat put status=%d", code)
+	}
+	if code, body := report(restoredID, "uploaded"); code != http.StatusOK || !strings.Contains(body, `"state":"verified"`) || !strings.Contains(body, `"clip_restored":false`) {
+		t.Fatalf("output report status=%d body=%s", code, body)
+	}
+	if b, _ := bucket.get(restored.key); !bytes.Equal(b, restored.body) {
+		t.Fatalf("restored object %q", b)
+	}
+
+	// An object already at the key with other bytes fails the row and stays.
+	if code := put(tasks[occupiedID], occupied.body); code != http.StatusPreconditionFailed {
+		t.Fatalf("occupied put status=%d", code)
+	}
+	if code, body := report(occupiedID, "exists"); code != http.StatusOK || !strings.Contains(body, `"state":"failed"`) {
+		t.Fatalf("occupied report status=%d body=%s", code, body)
+	}
+	var st, outcome string
+	if err := pool.QueryRow(ctx, `SELECT state,outcome FROM nas_restore_requests WHERE id=$1`, occupiedID).Scan(&st, &outcome); err != nil || st != "failed" || outcome != "r2_mismatch" {
+		t.Fatalf("occupied state=%s outcome=%s err=%v", st, outcome, err)
+	}
+	if b, _ := bucket.get(occupied.key); string(b) != "someone else's bytes" {
+		t.Fatal("occupied object was modified")
+	}
+
+	// Withdrawing the scope stops a leased restore before verification.
+	exec(`DELETE FROM nas_restore_output_scope WHERE output_id=$1`, scopedLate.id)
+	if code := put(tasks[lateID], scopedLate.body); code != http.StatusOK {
+		t.Fatalf("late put status=%d", code)
+	}
+	if code, body := report(lateID, "uploaded"); code != http.StatusConflict {
+		t.Fatalf("report after scope withdrawal status=%d body=%s", code, body)
+	}
+
+	if after := frozen(); after != before {
+		t.Fatalf("unadmitted rows, outputs, acks or retirements changed:\nbefore %s\nafter  %s", before, after)
+	}
+}

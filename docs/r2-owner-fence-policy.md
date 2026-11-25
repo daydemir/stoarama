@@ -61,3 +61,8 @@ NAS restore (`nas_restore_ke_original`), under the same shared wire lock as
 wait. A queued KE restore row also keeps `r2_retirement_writers_drained` false.
 An active fence therefore no longer means that no new R2 object can appear; a
 restore only creates the purged clip's own key, create-only, after the cutoff.
+Migration 0263 widens that one writer to `nas_restore_admitted`: also an
+'output' restore of a stitched output the controller put in
+`nas_restore_output_scope`, writing only that output's own key, create-only,
+with its catalogued size and sha256, from the connection's acked NAS copy. Same
+lock, same `put_expires_at` visibility.

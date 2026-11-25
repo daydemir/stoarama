@@ -253,14 +253,14 @@ func (c *Client) presignPutCreateOnly(ctx context.Context, key, contentType stri
 	return c.signCreateOnlyPut(ctx, in, ttl)
 }
 
-// PresignNASRestorePut signs the create-only PUT of one Keep Everything
-// original NAS restore. Its writer admission is the restore row itself: tx
-// must hold that row leased, which the r2_writer_restore trigger admits past
-// the writer fence only for nas_restore_ke_original (migration 0260). Like
-// admitWrite's capability record, put_expires_at is stamped before signing and
-// outlives the capability, so the R2 delete gate (r2_retirement_writes_blocked)
-// sees it. Key, media type, length and checksum come from that row, never from
-// the caller.
+// PresignNASRestorePut signs the create-only PUT of one admitted NAS restore:
+// a Keep Everything original or a scoped stitched output. Its writer admission
+// is the restore row itself: tx must hold that row leased, which the
+// r2_writer_restore trigger admits past the writer fence only for
+// nas_restore_admitted (migrations 0260, 0263). Like admitWrite's capability
+// record, put_expires_at is stamped before signing and outlives the capability,
+// so the R2 delete gate (r2_retirement_writes_blocked) sees it. Key, media type,
+// length and checksum come from that row, never from the caller.
 func (c *Client) PresignNASRestorePut(ctx context.Context, tx pgx.Tx, requestID int64, ttl time.Duration) (PresignedRequest, error) {
 	if c.writerDB == nil && !c.ungatedWriter {
 		return PresignedRequest{}, errors.New("R2 writes require database admission; unbound client is read-only")
@@ -270,20 +270,20 @@ func (c *Client) PresignNASRestorePut(ctx context.Context, tx pgx.Tx, requestID 
 	}
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	var key, contentType, sha, bucket string
+	var target, key, contentType, sha, clipBucket string
 	var size int64
 	if err := tx.QueryRow(ctx, `UPDATE nas_restore_requests q
 		SET put_expires_at=GREATEST(put_expires_at,clock_timestamp()+$2::bigint*interval '1 microsecond'+interval '2 minutes')
-		FROM recording_clips c
-		WHERE q.id=$1 AND q.state='leased' AND c.id=q.clip_id AND nas_restore_ke_original(q.target,q.clip_id,q.object_key,q.size_bytes,q.sha256,q.relative_path)
-		RETURNING q.object_key,q.content_type,q.size_bytes,q.sha256,c.bucket`,
-		requestID, ttl.Microseconds()).Scan(&key, &contentType, &size, &sha, &bucket); err != nil {
-		return PresignedRequest{}, fmt.Errorf("restore %d is not an admitted Keep Everything original lease: %w", requestID, err)
+		WHERE q.id=$1 AND q.state='leased' AND nas_restore_admitted(q)
+		RETURNING q.target,q.object_key,q.content_type,q.size_bytes,q.sha256,COALESCE((SELECT c.bucket FROM recording_clips c WHERE c.id=q.clip_id),'')`,
+		requestID, ttl.Microseconds()).Scan(&target, &key, &contentType, &size, &sha, &clipBucket); err != nil {
+		return PresignedRequest{}, fmt.Errorf("restore %d is not an admitted restore lease: %w", requestID, err)
 	}
-	// The key alone is not the clip's identity: its catalogued bucket must be the
-	// one this capability writes.
-	if bucket != c.bucket {
-		return PresignedRequest{}, fmt.Errorf("restore %d clip bucket %q is not the signing bucket", requestID, bucket)
+	// The key alone is not a clip's identity: its catalogued bucket must be the
+	// one this capability writes. Stitched outputs have no bucket column; the
+	// API's own bucket is the one their catalogue rows were verified in.
+	if target != "output" && clipBucket != c.bucket {
+		return PresignedRequest{}, fmt.Errorf("restore %d clip bucket %q is not the signing bucket", requestID, clipBucket)
 	}
 	in, err := createOnlyPutInput(c.bucket, key, contentType, size, sha, ttl, false)
 	if err != nil {
