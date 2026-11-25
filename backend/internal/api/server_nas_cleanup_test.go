@@ -84,6 +84,7 @@ CREATE TABLE streams(id bigint PRIMARY KEY,local_timezone text);CREATE TABLE rec
  CREATE TABLE recording_collation_hours(id bigint PRIMARY KEY,recording_id bigint,excluded_clip_count integer,manifest jsonb);
  CREATE TABLE recording_collation_outputs(id bigint PRIMARY KEY,collation_hour_id bigint,nas_relative_path text,object_key text,sha256 text,size_bytes bigint,start_at timestamptz,end_at timestamptz,source_clip_ids bigint[],created_at timestamptz DEFAULT now());
  CREATE TABLE recording_joined_source_snapshots(clip_id bigint);
+ CREATE TABLE nas_cleanup_day_plans(id bigserial PRIMARY KEY,mode text NOT NULL DEFAULT 'dry_run');
  INSERT INTO accounts VALUES(47),(48);INSERT INTO connections(id,account_id,kind,api_key_id) VALUES(13,47,'nas_pull',5),(14,48,'nas_pull',6);INSERT INTO streams VALUES(3,'UTC');INSERT INTO recordings VALUES(2,47,3,'UTC');`)
 	if err != nil {
 		t.Fatal(err)

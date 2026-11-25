@@ -434,6 +434,10 @@ func cleanupEnableGates(ctx context.Context, tx pgx.Tx, id int64) (int, map[stri
 	if err := cleanupMaintenanceCheck(ctx, tx); err != nil {
 		return 409, map[string]any{"error": "cleanup maintenance gate unavailable or active"}
 	}
+	var dayEnabled bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_day_plans WHERE mode='enabled')`).Scan(&dayEnabled); err != nil || dayEnabled {
+		return 409, map[string]any{"error": "another cleanup plan is enabled"}
+	}
 	var bad, certified int
 	err := tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE
   state<>'would_delete' OR proof IS NULL OR updated_at<now()-interval '24 hours' OR
