@@ -1170,6 +1170,167 @@ class SafetyRegressionTests(unittest.TestCase):
                 self.assertEqual((job.root / 'STOP').exists(), job.status.get('last_error') != 'prior failure')
 
 
+OWNER_ID = '00000000-0000-0000-0000-000000000001'
+LATCHED = dict(failed=True, recovery_required=True)
+CLEAN = dict(failed=False, recovery_required=False)
+
+
+class FinishHoldTests(unittest.TestCase):
+    """A startup finish-health refusal with no owned plan holds idle; it never latches the runner."""
+    def start(self, root, admission, checked_at=None, kick=None, **status):
+        state = Path(root) / 'finish'
+        state.mkdir(exist_ok=True)
+        (state / 'admission.json').write_text(json.dumps(dict(admission, active={})))
+        (state / 'recovery.json').write_text(json.dumps(dict(plan_id=42, plan_sha256='b'*64, problems=0, verified=1,
+            delete_ever_issued=1, checked_at=(checked_at or r.utcnow()).isoformat())))
+        path = Path(root) / 'status.json'
+        saved = json.loads(path.read_text()) if path.exists() else dict(current_plan=None, last_error=None, owner_id=OWNER_ID,
+            recovery_plan_id=42, recovery_history={'42': dict(sha256='b'*64, issued=1)}, phase='day_complete')
+        path.write_text(json.dumps(dict(saved, **status)))
+        job = r.Runner(Path('.'), Path(root))
+        job.events = []
+        def validate():
+            job.owner_validated, job.finish_state, job.admission = True, state, FINISH_ADMISSION
+        job.validate_owner = validate
+        job.notify = lambda subject: job.events.append(('alert', subject))
+        job.run_day = lambda: job.events.append('run_day')
+        job.master = lambda enabled, emergency=False: job.events.append('OFF')
+        job.drain = lambda pid: job.events.append('drain')
+        job.plan = lambda pid: {'id': pid}
+        job.recovery = lambda plan: job.events.append('recovery')
+        def command(argv, **kwargs):
+            job.events.append(tuple(argv))
+            if kick: raise r.CommandFailed(1)
+        with patch.object(r, 'Runner', return_value=job), patch.object(r, 'command', side_effect=command), \
+                patch.object(r.sys, 'argv', ['runner', '--day-plans']), patch.object(r.signal, 'signal'), \
+                patch.object(r.sys, 'stderr', new=io.StringIO()):
+            code = r.main()
+        return code, job, json.loads(path.read_text())
+
+    def stop(self, root):
+        return json.loads((Path(root) / 'STOP').read_bytes())
+
+    def kicks(self, job):
+        return [e for e in job.events if isinstance(e, tuple) and e[0] == '/bin/launchctl']
+
+    def alerts(self, job):
+        return [e for e in job.events if isinstance(e, tuple) and e[0] == 'alert']
+
+    def test_admission_latch_holds_idle_with_an_owner_stop_the_collector_accepts(self):
+        import ownership
+        with tempfile.TemporaryDirectory() as root:
+            code, job, status = self.start(root, LATCHED)
+            self.assertEqual(code, 0)
+            self.assertEqual(status['phase'], 'stopped')
+            self.assertIsNone(status['last_error'])
+            self.assertNotIn('recovery_error', status)
+            self.assertNotIn('shutdown_or_recovery_failed', status)
+            stop = self.stop(root)
+            self.assertEqual((stop['schema'], stop['owner_id'], stop['reason']),
+                             ('stoarama.cleanup-stop.v1', OWNER_ID, 'finish_admission_hold'))
+            ownership.validate_stop((Path(root) / 'STOP').read_bytes(), dict(owner_id=OWNER_ID), r.utcnow())
+            self.assertEqual(len(self.alerts(job)), 1)
+            self.assertEqual(self.kicks(job), [], 'first (boot-time) hold must not kick recovery')
+            self.assertNotIn('run_day', job.events)
+            self.assertNotIn('OFF', job.events)
+
+    def test_every_startup_finish_health_refusal_holds(self):
+        stale = r.utcnow() - timedelta(hours=8)
+        for admission, checked_at in ((dict(failed=False, recovery_required=True), None), (CLEAN, stale)):
+            with self.subTest(admission=admission), tempfile.TemporaryDirectory() as root:
+                code, _, status = self.start(root, admission, checked_at)
+                self.assertEqual((code, status['phase'], status['last_error']), (0, 'stopped', None))
+                self.assertEqual(self.stop(root)['reason'], 'finish_admission_hold')
+
+    def test_latched_rehold_is_quiet_and_never_kicks(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.start(root, LATCHED)
+            raw = (Path(root) / 'STOP').read_bytes()
+            for _ in range(2):
+                code, job, status = self.start(root, LATCHED)
+                self.assertEqual((code, status['phase'], status['last_error']), (0, 'stopped', None))
+                self.assertEqual((self.alerts(job), self.kicks(job)), ([], []))
+                self.assertEqual((Path(root) / 'STOP').read_bytes(), raw)
+                self.assertNotIn('run_day', job.events)
+
+    def test_unlatched_rehold_kicks_recovery_once_per_latch_episode(self):
+        reconciled = dict(failed=False, recovery_required=True)
+        with tempfile.TemporaryDirectory() as root:
+            self.start(root, LATCHED)
+            _, job, status = self.start(root, reconciled)
+            self.assertEqual(self.kicks(job), [('/bin/launchctl', 'kickstart', 'gui/%d/com.stoarama.finish-recovery' % os.getuid())])
+            self.assertEqual(self.alerts(job), [])
+            self.assertTrue(status['finish_recovery_kicked'])
+            _, job, _ = self.start(root, reconciled)
+            self.assertEqual(self.kicks(job), [])
+            # The kicked refresh failed and latched again; the next human reconcile is picked up once more.
+            _, job, status = self.start(root, LATCHED)
+            self.assertEqual((self.kicks(job), status['finish_recovery_kicked']), ([], False))
+            _, job, _ = self.start(root, reconciled)
+            self.assertEqual(len(self.kicks(job)), 1)
+
+    def test_kickstart_failure_alerts_and_keeps_the_hold(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.start(root, LATCHED)
+            code, job, status = self.start(root, dict(failed=False, recovery_required=True), kick='fail')
+            self.assertEqual((code, status['phase'], status['last_error']), (0, 'stopped', None))
+            self.assertEqual(len(self.kicks(job)), 1)
+            self.assertEqual(len(self.alerts(job)), 1)
+            self.assertEqual(self.stop(root)['reason'], 'finish_admission_hold')
+
+    def test_own_hold_releases_itself_once_finish_health_is_clean(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.start(root, LATCHED)
+            self.start(root, dict(failed=False, recovery_required=True))
+            code, job, status = self.start(root, CLEAN)
+            self.assertEqual(code, 0)
+            self.assertFalse((Path(root) / 'STOP').exists())
+            self.assertIn('run_day', job.events)
+            self.assertNotIn('finish_recovery_kicked', status)
+            self.assertEqual((self.alerts(job), self.kicks(job)), ([], []))
+
+    def test_natural_stop_holds_quietly_and_is_never_released(self):
+        natural = json.dumps(dict(schema='stoarama.cleanup-stop.v1', owner_id=OWNER_ID,
+                                  reason='natural_boundary', created_at=NOW.isoformat()))
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / 'STOP').write_text(natural)
+            code, job, status = self.start(root, LATCHED)
+            self.assertEqual((code, status['phase'], status['last_error']), (0, 'stopped', None))
+            self.assertEqual((self.alerts(job), self.kicks(job)), ([], []))
+            code, job, _ = self.start(root, CLEAN)
+            self.assertEqual(code, 0)
+            self.assertIn('run_day', job.events)
+            self.assertEqual((Path(root) / 'STOP').read_text(), natural)
+
+    def test_foreign_or_failure_stop_keeps_the_failure_path(self):
+        failure = json.dumps(dict(schema='stoarama.cleanup-stop.v1', owner_id=OWNER_ID,
+                                  reason='failure', created_at=NOW.isoformat()))
+        for raw in ('', 'foreign STOP', failure):
+            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as root:
+                (Path(root) / 'STOP').write_text(raw)
+                code, job, status = self.start(root, LATCHED)
+                self.assertEqual((code, status['phase']), (1, 'failed'))
+                self.assertTrue(status['last_error'])
+                self.assertEqual((Path(root) / 'STOP').read_text(), raw)
+
+    def test_owned_plan_keeps_containment_and_the_failure_stop(self):
+        for owned in (dict(current_day_plan=77), dict(current_plan=42)):
+            with self.subTest(owned=owned), tempfile.TemporaryDirectory() as root:
+                code, job, status = self.start(root, LATCHED, **owned)
+                self.assertEqual((code, status['phase']), (1, 'failed'))
+                self.assertEqual(status['last_error'], 'finish admission requires owner reconciliation')
+                self.assertEqual(self.stop(root)['reason'], 'failure')
+                self.assertEqual(job.events[0], 'OFF')
+                if 'current_plan' in owned:
+                    self.assertEqual(job.events[2:4], ['drain', 'recovery'])
+                self.assertEqual(self.kicks(job), [])
+
+    def test_stop_reasons_mirror_the_collector(self):
+        import ownership
+        self.assertEqual({x.name: x.value for x in r.StopReason}, {x.name: x.value for x in ownership.StopReason})
+        self.assertEqual({x.value for x in r.IDLE_STOPS}, {x.value for x in ownership.IDLE_STOPS})
+
+
 class StreamNameTests(unittest.TestCase):
     def test_name_lookup_failure_keeps_progress_rows(self):
         job = r.Runner(Path('.'), Path('.'))

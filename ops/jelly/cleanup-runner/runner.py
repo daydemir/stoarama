@@ -23,6 +23,7 @@ import time
 import threading
 import tempfile
 from contextlib import contextmanager
+from enum import Enum
 from fractions import Fraction
 from datetime import date, datetime, timedelta, timezone
 import urllib.error
@@ -66,6 +67,22 @@ _MONTHS = ('January', 'February', 'March', 'April', 'May', 'June', 'July',
 _WEEKDAYS = ('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')
 DAY_PLAZA_DIR = re.compile(r'(?:[^/]+/)+(%s)/(0[1-9]|[12][0-9]|3[01])-(%s)' % ('|'.join(_MONTHS), '|'.join(_WEEKDAYS)))
 DAY_FLAT_DIR = re.compile(r'(?:[^/]+/)+[1-9][0-9]*/(?:continuous|[1-9][0-9]*)')
+STOP_SCHEMA = 'stoarama.cleanup-stop.v1'
+# Read-only finish recovery, kicked once per unlatched hold, never on the first hold.
+RECOVERY_LABEL = 'com.stoarama.finish-recovery'
+
+
+class StopReason(str, Enum):
+    """Owner-bound STOP reasons; values mirror ops/jelly/finish/ownership.py."""
+    NATURAL_BOUNDARY = 'natural_boundary'
+    FAILURE = 'failure'
+    # Owner, verbatim: a refusal "latched only because recovery failed on the
+    # network" must "not write a failure STOP that blocks recovery; it should
+    # hold with a distinct reason the collector accepts".
+    FINISH_ADMISSION_HOLD = 'finish_admission_hold'
+
+
+IDLE_STOPS = frozenset((StopReason.NATURAL_BOUNDARY, StopReason.FINISH_ADMISSION_HOLD))
 REASON = ('Deniz standing approval (window 20): NAS files outside the pinned 20-day window only; '
           'server dry run + independent verification PASS; verified R2 copies retained; '
           'one owned plan; controller-managed global master.')
@@ -97,6 +114,14 @@ class MutationUnconfirmed(Halt):
 
 class LockHeld(Exception):
     """Another runner owns the master switch; leave it alone."""
+
+
+class FinishHold(Exception):
+    """Startup finish health refused with no owned plan: idle behind an owner STOP, exit 0."""
+
+    def __init__(self, alert, kick):
+        super().__init__('finish admission hold')
+        self.alert, self.kick = alert, kick
 
 
 def require(ok, message):
@@ -458,6 +483,7 @@ class Runner:
             self.initialize()
             self.check_restart()
             self.validate_owner()
+            self.admit_finish()
             self._save(self.status.get('phase', 'stopped'))
 
     def check_restart(self):
@@ -811,8 +837,63 @@ class Runner:
         self.finish_state = Path(owner['finish_state'])
         require(self.finish_state.is_absolute(), 'finish state must be explicit and absolute')
         self.owner_validated = True
-        self.finish_health()
         self.status['runner_pid'] = os.getpid()
+
+    def owned_stop(self):
+        """This owner's STOP reason, or None when STOP is absent, empty, foreign or invalid."""
+        try:
+            stop = json.loads((self.root / 'STOP').read_bytes())
+            require(stop['schema'] == STOP_SCHEMA and stop['owner_id'] == self.status['owner_id'], 'foreign STOP')
+            return StopReason(stop['reason'])
+        except (OSError, ValueError, KeyError, TypeError, Halt):
+            return None
+
+    def admit_finish(self):
+        """Startup finish health, under the snapshot lock. With no owned plan, any
+        refusal holds behind an idle owner STOP instead of latching; D's admission
+        latch remains the human gate. Only this runner's own hold is ever released."""
+        present = (self.root / 'STOP').exists()
+        stop = self.owned_stop() if present else None
+        try:
+            self.finish_health()
+        except Exception:
+            # An owned plan may be enabled: keep failure containment and drain.
+            if self.status['current_plan'] or self.status.get('current_day_plan') or present and stop not in IDLE_STOPS:
+                raise
+            raise self.hold(stop) from None
+        if stop is StopReason.FINISH_ADMISSION_HOLD:
+            (self.root / 'STOP').unlink()
+            self.status.pop('finish_recovery_kicked', None)
+
+    def hold(self, stop):
+        # Idempotent and cheap: launchd restarts a successful exit every hour.
+        alert = self.publish_stop(StopReason.FINISH_ADMISSION_HOLD)
+        kick = False
+        if stop is StopReason.FINISH_ADMISSION_HOLD:
+            # Never at the first (boot-time) hold: recovery's plan source needs DNS,
+            # API, DB and a fresh NAS report, and a failed refresh latches D.
+            # Once per unlatched episode, so a human reconcile is picked up.
+            if self.finish_latched():
+                self.status['finish_recovery_kicked'] = False
+            elif not self.status.get('finish_recovery_kicked'):
+                kick = self.status['finish_recovery_kicked'] = True
+        self._save('stopped')
+        return FinishHold(alert, kick)
+
+    def finish_latched(self):
+        try:
+            return self.finish_admission().load(self.finish_state)['failed'] is not False
+        except Exception:
+            return True
+
+    def held(self, hold):
+        if hold.alert:
+            self.alert('HELD: finish admission refused at startup; cleanup idle until finish recovery is clean')
+        if hold.kick:
+            try:
+                command(['/bin/launchctl', 'kickstart', 'gui/%d/%s' % (os.getuid(), RECOVERY_LABEL)], timeout=30)
+            except CommandFailed:
+                self.alert('Finish recovery kickstart failed; cleanup stays held')
 
     def finish_health(self):
         admission = self.finish_admission()
@@ -1563,28 +1644,33 @@ class Runner:
     def write_failure_stop(self):
         with (self.root / 'ownership.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            owner_id = self.status['owner_id']
-            require(isinstance(owner_id, str) and re.fullmatch('[a-f0-9-]{36}', owner_id),
-                    'failure STOP ownership is unavailable')
-            raw = (json.dumps(dict(schema='stoarama.cleanup-stop.v1', owner_id=owner_id,
-                                   reason='failure', created_at=utcnow().isoformat()), sort_keys=True) + '\n').encode()
-            fd, name = tempfile.mkstemp(prefix='.failure-stop-', dir=self.root)
+            self.publish_stop(StopReason.FAILURE)
+
+    def publish_stop(self, reason):
+        """Publish an owner-bound STOP; False when any STOP already exists. Caller holds the snapshot lock."""
+        owner_id = self.status['owner_id']
+        require(isinstance(owner_id, str) and re.fullmatch('[a-f0-9-]{36}', owner_id),
+                'STOP ownership is unavailable')
+        raw = (json.dumps(dict(schema=STOP_SCHEMA, owner_id=owner_id,
+                               reason=reason.value, created_at=utcnow().isoformat()), sort_keys=True) + '\n').encode()
+        fd, name = tempfile.mkstemp(prefix='.stop-', dir=self.root)
+        try:
+            with os.fdopen(fd, 'wb') as output:
+                output.write(raw); output.flush(); os.fsync(output.fileno())
+            # Exclusive publication preserves every existing STOP, even an
+            # empty/foreign file or a concurrent controller's stronger stop.
             try:
-                with os.fdopen(fd, 'wb') as output:
-                    output.write(raw); output.flush(); os.fsync(output.fileno())
-                # Exclusive publication preserves every existing STOP, even an
-                # empty/foreign file or a concurrent controller's stronger stop.
-                try:
-                    os.link(name, self.root / 'STOP')
-                except FileExistsError:
-                    return
-                directory = os.open(self.root, os.O_RDONLY)
-                try:
-                    os.fsync(directory)
-                finally:
-                    os.close(directory)
+                os.link(name, self.root / 'STOP')
+            except FileExistsError:
+                return False
+            directory = os.open(self.root, os.O_RDONLY)
+            try:
+                os.fsync(directory)
             finally:
-                os.unlink(name)
+                os.close(directory)
+            return True
+        finally:
+            os.unlink(name)
 
 
 def main():
@@ -1605,6 +1691,10 @@ def main():
         return 0
     except LockHeld:
         return 0  # Another process owns the lock; never touch its master switch.
+    except FinishHold as hold:
+        runner.lock.close()  # Recovery must see an idle owner, not a live runner.
+        runner.held(hold)
+        return 0
     except Exception as exc:
         message = str(exc) if isinstance(exc, Halt) else 'unexpected runner failure; inspect code privately'
         runner.fail(runner.status.get('last_error') or message)

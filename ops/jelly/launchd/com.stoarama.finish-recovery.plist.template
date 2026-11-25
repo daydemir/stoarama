@@ -11,7 +11,7 @@
   </array>
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>/Users/jelly/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
   <key>StartInterval</key><integer>21600</integer>
-  <key>RunAtLoad</key><true/>
+  <key>RunAtLoad</key><false/>
   <key>StandardOutPath</key><string>__STATE__/recovery.log</string>
   <key>StandardErrorPath</key><string>__STATE__/recovery.log</string>
 </dict></plist>

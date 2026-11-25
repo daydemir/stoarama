@@ -3,10 +3,12 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+import unittest.mock
 from unittest.mock import patch
 from datetime import datetime, timezone, timedelta
 import unittest
-from ownership import assemble_owned, parse_stop, validate_stop, POLICY_SHA
+import ownership
+from ownership import assemble_owned, parse_stop, validate_stop, POLICY_SHA, StopReason
 from collector import PLAN, PLAN_SHA, timestamp
 
 NOW = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
@@ -41,6 +43,55 @@ class OwnershipTests(unittest.TestCase):
         self.assertEqual(parse_stop(raw, owner, NOW)['reason'], 'failure')
         with self.assertRaises(ValueError):
             validate_stop(raw, owner, NOW)
+
+    def test_runner_finish_hold_is_an_idle_stop_but_failure_and_foreign_are_not(self):
+        _, owner, *_ = fixture()
+        stop = dict(schema='stoarama.cleanup-stop.v1', owner_id=owner['owner_id'],
+                    reason='finish_admission_hold', created_at=NOW.isoformat())
+        validate_stop(json.dumps(stop), owner, NOW)
+        self.assertIs(parse_stop(json.dumps(stop), owner, NOW)['reason'], StopReason.FINISH_ADMISSION_HOLD)
+        for change in (dict(owner_id='foreign'), dict(reason='failure'), dict(reason='finish_hold'),
+                       dict(schema='stoarama.cleanup-stop.v0'), dict(created_at=(NOW+timedelta(seconds=1)).isoformat())):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                validate_stop(json.dumps(dict(stop, **change)), owner, NOW)
+
+    def test_plan_source_collects_a_held_idle_runner_after_reconcile(self):
+        """refresh_recovery's plan source after a human reconcile: hold STOP, phase stopped, recovery_required."""
+        now = datetime.now(timezone.utc)
+        status, owner, *_ = fixture()
+        status.update(current_plan=None, next_plan=None, phase='stopped', recovery_plan_id=1441,
+                      recovery_history={'1440': {'sha256': PLAN_SHA, 'issued': 1860}, '1441': {'sha256': 'b'*64, 'issued': 8}})
+        plan = fixture()[5]['plans']['1441']
+        db = dict(fixture()[5], enabled_plans=[], cleanup_at=now.isoformat(),
+                  plans={'1441': dict(plan, mode='retired'), '1440': dict(plan, mode='retired', sha256=PLAN_SHA, issued=1860)})
+        api = json.dumps(dict(id=1441, plan_sha256='b'*64, master_deletion_enabled=True)).encode()
+        for reason, accepted in (('finish_admission_hold', True), ('natural_boundary', True), ('failure', False)):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as tmp:
+                root, state = Path(tmp) / 'runner', Path(tmp) / 'finish'
+                (root / 'incident-recovery-1440-20261117').mkdir(parents=True)
+                state.mkdir()
+                close = root / 'incident-recovery-1440-20261117/closed-verified.json'
+                close.write_bytes(b'closed')
+                raw = json.dumps(dict(owner, finish_state=str(state))).encode()
+                (root / 'cleanup-owner.json').write_bytes(raw)
+                (root / 'status.json').write_text(json.dumps(status))
+                (root / 'STOP').write_text(json.dumps(dict(schema='stoarama.cleanup-stop.v1', owner_id=owner['owner_id'],
+                                                          reason=reason, created_at=now.isoformat())))
+                (state / 'admission.json').write_text(json.dumps(dict(failed=False, recovery_required=True, active={})))
+                response = unittest.mock.MagicMock()
+                response.__enter__.return_value.read.return_value = api
+                psql = unittest.mock.Mock(returncode=0, stdout=json.dumps(db))
+                with patch.object(ownership, 'CLOSE_SHA', ownership.digest(b'closed')), \
+                        patch.object(ownership.urllib.request, 'urlopen', return_value=response), \
+                        patch.object(ownership.subprocess, 'run', return_value=psql), \
+                        patch.dict(sys.modules, prepare_keep28_plans=unittest.mock.Mock(pg_env=dict)), \
+                        patch.dict(ownership.os.environ, SERVICE_TOKEN='fixture'):
+                    collect = lambda: ownership.collect(root, Path(tmp), state / 'recovery.json',
+                                                        ownership.digest(raw), now, plan_source=True)
+                    if accepted:
+                        self.assertEqual(collect(), {'recovery_plan_id': 1441})
+                    else:
+                        with self.assertRaises(ValueError): collect()
 
     def collect(self, parts, running=True):
         return assemble_owned(*parts, now=NOW, running=running)

@@ -114,7 +114,10 @@ and hashes an explicit STOP JSON, retaining the actual owner UUID and timestamp:
 ```
 
 This prevents successor enablement while healthy active execution drains; D and
-monitoring continue. Empty STOPs, the retired initial STOP text, foreign UUIDs,
+monitoring continue. The runner's own `"reason":"finish_admission_hold"` STOP (same
+schema and owner) is the other idle boundary collection and plan selection accept:
+it marks a runner that refused startup finish health with no owned plan, never
+latched itself, and releases that STOP itself once health is clean. Empty STOPs, the retired initial STOP text, foreign UUIDs,
 other reasons and future timestamps fail closed. Failure STOPs never override D
 or runner latches. The original STOP is removed only by the initial reviewed
 handoff, not converted or reused. Controller journals preserve every actual byte.
