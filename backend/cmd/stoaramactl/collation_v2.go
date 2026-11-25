@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -40,6 +41,10 @@ const collationV2Usage = `usage:
   stoaramactl collation-v2 run --worklist FILE|r2:KEY|r2prefix:PREFIX --scratch DIR --results FILE [--hour-workers N --cpu N --net N --publish-dir DIR --keep-scratch --recovery-scope]
   stoaramactl collation-v2 register --worklist FILE|r2:KEY|r2prefix:PREFIX [--dry-run]
   stoaramactl collation-v2 settle-recovery [--apply]
+  stoaramactl collation-v2 approve-replacements --results FILE --recovery-batch recovery-NAME --reason TEXT
+    Approves each registered generation-2 hour the run results report differs
+    for replacement in that recovery batch; plan --scope days --recovery-batch
+    then stitches it fresh at generation 3, superseding the old hour.
   stoaramactl collation-v2 put-worklist --worklist FILE --key r2-key`
 
 // NightlyBatchID names the rolling generation-2 batch for closed local days.
@@ -201,6 +206,25 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 		if err != nil {
 			log.Fatal(err)
 		}
+	case "approve-replacements":
+		results := fs.String("results", "", "collation-v2 run results JSONL")
+		batch := fs.String("recovery-batch", "", "the fresh recovery- batch the replacements are stitched into")
+		reason := fs.String("reason", "", "why these hours are replaced")
+		_ = fs.Parse(args[1:])
+		if *results == "" || !collation.IsRecoveryBatch(*batch) || strings.TrimSpace(*reason) == "" {
+			log.Fatal(collationV2Usage)
+		}
+		differs, err := readDiffersHours(*results)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pool := mustCollationPool(ctx, cfg)
+		defer pool.Close()
+		approved, already, err := approveReplacements(ctx, pool, differs, *batch, *reason)
+		fmt.Printf("differs=%d approved=%d already_approved=%d batch=%s\n", len(differs), approved, already, *batch)
+		if err != nil {
+			log.Fatal(err)
+		}
 	case "put-worklist":
 		worklist := fs.String("worklist", "", "local worklist path")
 		key := fs.String("key", "", "R2 key")
@@ -245,6 +269,63 @@ func requireFreshRecoveryBatch(ctx context.Context, pool *pgxpool.Pool, store co
 		return fmt.Errorf("recovery batch %s is not fresh: R2 already holds %s", batch, found)
 	}
 	return nil
+}
+
+// readDiffersHours is every hour a collation-v2 run results log reports
+// differs (a restore whose rebuild is not byte-identical), once each.
+func readDiffersHours(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	seen := map[string]bool{}
+	var out []string
+	dec := json.NewDecoder(f)
+	for {
+		var r collation.HourResult
+		if err := dec.Decode(&r); errors.Is(err, io.EOF) {
+			return out, nil
+		} else if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		if r.Outcome == collation.OutcomeDiffers && !seen[r.HourID] {
+			seen[r.HourID] = true
+			out = append(out, r.HourID)
+		}
+	}
+}
+
+// approveReplacements approves each registered generation-2 hour for
+// replacement in batch, in one transaction. An hour already approved for the
+// same batch counts as already; any other approval, or a hour that is not a
+// registered generation-2 hour, fails the whole call.
+func approveReplacements(ctx context.Context, pool *pgxpool.Pool, hourIDs []string, batch, reason string) (approved, already int, err error) {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback(ctx)
+	for _, hourID := range hourIDs {
+		var id int64
+		var existing *string
+		if err := tx.QueryRow(ctx, `SELECT h.id, a.batch_id FROM recording_collation_hours h
+			LEFT JOIN collation_v2_recovery_replacements a ON a.collation_hour_id=h.id WHERE h.hour_id=$1 AND h.generation=2`, hourID).Scan(&id, &existing); err != nil {
+			return 0, 0, fmt.Errorf("%s is not a registered generation-2 hour: %w", hourID, err)
+		}
+		switch {
+		case existing == nil:
+			if _, err := tx.Exec(ctx, `INSERT INTO collation_v2_recovery_replacements(collation_hour_id,batch_id,reason) VALUES($1,$2,$3)`, id, batch, reason); err != nil {
+				return 0, 0, fmt.Errorf("%s: %w", hourID, err)
+			}
+			approved++
+		case *existing == batch:
+			already++
+		default:
+			return 0, 0, fmt.Errorf("%s is already approved for %s", hourID, *existing)
+		}
+	}
+	return approved, already, tx.Commit(ctx)
 }
 
 func mustCollationPool(ctx context.Context, cfg config.Config) *pgxpool.Pool {
@@ -537,6 +618,27 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 			return plan, err
 		}
 	}
+	// Registered generation-2 hours the controller approved for replacement in
+	// this recovery batch (collation_v2_recovery_replacements).
+	replacements := map[int64]bool{}
+	if opts.recoveryBatch != "" {
+		rows, err := pool.Query(ctx, `SELECT collation_hour_id FROM collation_v2_recovery_replacements WHERE batch_id=$1`, opts.recoveryBatch)
+		if err != nil {
+			return plan, err
+		}
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return plan, err
+			}
+			replacements[id] = true
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return plan, err
+		}
+	}
 	byRecording := map[int64][]collationDay{}
 	var order []int64
 	for _, d := range days {
@@ -602,19 +704,25 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 				// A registered hour is a restore in its own batch; only a new hour
 				// takes the recovery batch. Generation-1 supersession is still
 				// looked up in the day's own batch (d.batchID).
+				// A registered generation-2 hour the controller approved for
+				// replacement in this recovery batch (its restore reported differs)
+				// is stitched fresh there at generation 3 and supersedes it.
 				reg, isRegistered := registered[h]
-				batchID := d.batchID
+				replace := isRegistered && reg.generation == collation.Generation && replacements[reg.id]
+				batchID, generation := d.batchID, collation.Generation
 				switch {
+				case replace:
+					batchID, generation = opts.recoveryBatch, collation.ReplacementGeneration
 				case isRegistered:
-					batchID = reg.batchID
+					batchID, generation = reg.batchID, reg.generation
 				case opts.recoveryBatch != "":
 					batchID = opts.recoveryBatch
 				}
-				hourID, err := collation.HourIDFor(batchID, recordingID, d.localDate, h)
+				hourID, err := collation.HourIDForGeneration(batchID, recordingID, d.localDate, h, generation)
 				if err != nil {
 					return plan, err
 				}
-				if isRegistered && hourID != reg.hourID {
+				if isRegistered && !replace && hourID != reg.hourID {
 					return plan, fmt.Errorf("registered hour %s differs from %s", reg.hourID, hourID)
 				}
 				if opts.hourIDs != nil && !opts.hourIDs[hourID] {
@@ -645,7 +753,7 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 						return plan, fmt.Errorf("%s: %w", hourID, err)
 					}
 				}
-				if gen1ID, ok := gen1[collationGen1Key{d.batchID, d.localDate, h}]; ok {
+				if gen1ID, ok := gen1[collationGen1Key{d.batchID, d.localDate, h}]; ok && !replace {
 					w.SupersedesHourRecordID = gen1ID.id
 					w.SupersedesHourID = gen1ID.hourID
 				}
@@ -653,7 +761,10 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 					plan.unavailable = append(plan.unavailable, hourID)
 					continue
 				}
-				if isRegistered {
+				switch {
+				case replace:
+					w.Replaces = &collation.ReplacedHour{HourRecordID: reg.id, HourID: reg.hourID}
+				case isRegistered:
 					w.Restore = &reg.restore
 				}
 				plan.work = append(plan.work, w)
@@ -664,10 +775,12 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 }
 
 type collationRegisteredHour struct {
-	batchID string
-	hourID  string
-	clips   []collation.Clip
-	restore collation.RestoreHour
+	id         int64
+	generation int
+	batchID    string
+	hourID     string
+	clips      []collation.Clip
+	restore    collation.RestoreHour
 }
 
 // restoreClips is a registered hour's manifest clip set with each clip's
@@ -690,12 +803,14 @@ func restoreClips(registered, catalog []collation.Clip) ([]collation.Clip, error
 	return out, nil
 }
 
-// loadRegisteredHours maps each registered generation-2 hour of one local day
-// to its batch, identity and outputs in part order.
+// loadRegisteredHours maps each delivery hour of one local day to its newest
+// registered hour (a generation-3 replacement over the generation-2 hour it
+// supersedes): its batch, identity and outputs in part order.
 func loadRegisteredHours(ctx context.Context, pool *pgxpool.Pool, recordingID int64, localDate string) (map[int]collationRegisteredHour, error) {
-	rows, err := pool.Query(ctx, `SELECT h.delivery_hour, h.batch_id, h.hour_id, h.manifest->>'media_tool', h.manifest->'clips', o.object_key, o.size_bytes, o.sha256
+	rows, err := pool.Query(ctx, `SELECT h.id, h.generation, h.delivery_hour, h.batch_id, h.hour_id, h.manifest->>'media_tool', h.manifest->'clips', o.object_key, o.size_bytes, o.sha256
 		FROM recording_collation_hours h LEFT JOIN recording_collation_outputs o ON o.collation_hour_id=h.id
-		WHERE h.recording_id=$1 AND h.local_date=$2::date AND h.generation=$3 ORDER BY h.delivery_hour, o.part`, recordingID, localDate, collation.Generation)
+		WHERE h.recording_id=$1 AND h.local_date=$2::date AND h.generation IN ($3,$4) ORDER BY h.delivery_hour, h.generation, o.part`,
+		recordingID, localDate, collation.Generation, collation.ReplacementGeneration)
 	if err != nil {
 		return nil, err
 	}
@@ -708,10 +823,10 @@ func loadRegisteredHours(ctx context.Context, pool *pgxpool.Pool, recordingID in
 		var size *int64
 		var sha *string
 		var clipsRaw []byte
-		if err := rows.Scan(&hour, &r.batchID, &r.hourID, &r.restore.MediaTool, &clipsRaw, &key, &size, &sha); err != nil {
+		if err := rows.Scan(&r.id, &r.generation, &hour, &r.batchID, &r.hourID, &r.restore.MediaTool, &clipsRaw, &key, &size, &sha); err != nil {
 			return nil, err
 		}
-		if prev, seen := out[hour]; seen {
+		if prev, seen := out[hour]; seen && prev.id == r.id {
 			r = prev
 		} else {
 			var disp []collation.ClipDisposition
@@ -849,7 +964,7 @@ func registerCollation(ctx context.Context, pool *pgxpool.Pool, store collation.
 		if err := m.Validate(); err != nil {
 			return s, fmt.Errorf("%s: %w", key, err)
 		}
-		if m.HourID != w.HourID || m.SupersedesHourID != w.SupersedesHourID {
+		if m.HourID != w.HourID || m.SupersedesHourID != w.SupersedesHourID || m.ReplacesHourID != replacedHourID(w) {
 			return s, fmt.Errorf("%s: manifest differs from worklist", key)
 		}
 		for _, o := range m.Outputs {
@@ -898,6 +1013,14 @@ func fetchCollationManifest(ctx context.Context, key string, get func(context.Co
 	return nil, false, fmt.Errorf("%s: %w", key, retryErr)
 }
 
+// replacedHourID is the generation-2 hour a replacement supersedes ("" if none).
+func replacedHourID(w collation.HourWork) string {
+	if w.Replaces == nil {
+		return ""
+	}
+	return w.Replaces.HourID
+}
+
 func insertCollationHour(ctx context.Context, pool *pgxpool.Pool, w collation.HourWork, m collation.HourManifest, key string, body []byte) error {
 	joins, splits, included, quarantined := 0, 0, 0, 0
 	for _, seam := range m.Seams {
@@ -914,9 +1037,12 @@ func insertCollationHour(ctx context.Context, pool *pgxpool.Pool, w collation.Ho
 			quarantined++
 		}
 	}
-	var supersedes *int64
+	var supersedes, replaces *int64
 	if w.SupersedesHourRecordID > 0 {
 		supersedes = &w.SupersedesHourRecordID
+	}
+	if w.Replaces != nil {
+		replaces = &w.Replaces.HourRecordID
 	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -925,16 +1051,16 @@ func insertCollationHour(ctx context.Context, pool *pgxpool.Pool, w collation.Ho
 	defer tx.Rollback(ctx)
 	var hourRecordID int64
 	if err := tx.QueryRow(ctx, `INSERT INTO recording_collation_hours(hour_id,batch_id,generation,recording_id,local_date,delivery_hour,status,
-		supersedes_joined_hour_id,manifest_object_key,manifest_sha256,manifest,source_clip_count,included_clip_count,excluded_clip_count,join_count,split_count)
-		VALUES($1,$2,$3,$4,$5::date,$6,$7,$8,$9,encode(sha256($10::bytea),'hex'),convert_from($10::bytea,'UTF8')::jsonb,$11,$12,$13,$14,$15) RETURNING id`,
+		supersedes_joined_hour_id,supersedes_collation_hour_id,manifest_object_key,manifest_sha256,manifest,source_clip_count,included_clip_count,excluded_clip_count,join_count,split_count)
+		VALUES($1,$2,$3,$4,$5::date,$6,$7,$8,$16,$9,encode(sha256($10::bytea),'hex'),convert_from($10::bytea,'UTF8')::jsonb,$11,$12,$13,$14,$15) RETURNING id`,
 		m.HourID, m.BatchID, m.Generation, m.RecordingID, m.LocalDate, m.DeliveryHour, m.Status, supersedes, key, body,
-		len(m.Clips), included, quarantined, joins, splits).Scan(&hourRecordID); err != nil {
+		len(m.Clips), included, quarantined, joins, splits, replaces).Scan(&hourRecordID); err != nil {
 		return err
 	}
 	for _, o := range m.Outputs {
 		if _, err := tx.Exec(ctx, `INSERT INTO recording_collation_outputs(collation_hour_id,part,parts,object_key,nas_relative_path,size_bytes,sha256,
-			start_at,end_at,source_clip_ids,r2_verified_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-			hourRecordID, o.Part, o.Parts, o.ObjectKey, o.NASRelativePath, o.SizeBytes, o.SHA256, o.StartUTC, o.EndUTC, o.SourceClipIDs, o.R2VerifiedAt); err != nil {
+			start_at,end_at,source_clip_ids,r2_verified_at,generation) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+			hourRecordID, o.Part, o.Parts, o.ObjectKey, o.NASRelativePath, o.SizeBytes, o.SHA256, o.StartUTC, o.EndUTC, o.SourceClipIDs, o.R2VerifiedAt, m.Generation); err != nil {
 			return err
 		}
 	}

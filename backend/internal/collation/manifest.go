@@ -32,6 +32,24 @@ type HourWork struct {
 	// rebuild exactly these registered outputs and republish only them. It never
 	// writes a manifest or a row for such an hour.
 	Restore *RestoreHour `json:"restore,omitempty"`
+	// Replaces is set only for a recovery hour that supersedes a registered
+	// generation-2 hour: it is stitched fresh at ReplacementGeneration and
+	// registered beside the old hour, which is never changed.
+	Replaces *ReplacedHour `json:"replaces,omitempty"`
+}
+
+// ReplacedHour is the registered generation-2 hour a replacement supersedes.
+type ReplacedHour struct {
+	HourRecordID int64  `json:"hour_record_id"`
+	HourID       string `json:"hour_id"`
+}
+
+// Generation is the generation this hour is built at.
+func (w HourWork) Generation() int {
+	if w.Replaces != nil {
+		return ReplacementGeneration
+	}
+	return Generation
 }
 
 // RestoreHour is a registered hour's outputs, in part order, and the media
@@ -51,13 +69,21 @@ var safeBatch = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
 // HourIDFor matches the generation-1 canonical hour identity, with generation 2.
 func HourIDFor(batchID string, recordingID int64, localDate string, deliveryHour int) (string, error) {
+	return HourIDForGeneration(batchID, recordingID, localDate, deliveryHour, Generation)
+}
+
+// HourIDForGeneration is HourIDFor at generation 2 or ReplacementGeneration.
+func HourIDForGeneration(batchID string, recordingID int64, localDate string, deliveryHour, generation int) (string, error) {
+	if generation != Generation && generation != ReplacementGeneration {
+		return "", fmt.Errorf("invalid hour generation %d", generation)
+	}
 	if !safeBatch.MatchString(batchID) || recordingID <= 0 || deliveryHour < 1 || deliveryHour > 12 {
 		return "", fmt.Errorf("invalid hour identity")
 	}
 	if _, err := time.Parse("2006-01-02", localDate); err != nil {
 		return "", fmt.Errorf("invalid local date")
 	}
-	return fmt.Sprintf("%s__recording-%d__date-%s__hour-%02d__generation-%d", batchID, recordingID, localDate, deliveryHour, Generation), nil
+	return fmt.Sprintf("%s__recording-%d__date-%s__hour-%02d__generation-%d", batchID, recordingID, localDate, deliveryHour, generation), nil
 }
 
 // ManifestKey is today's joined coverage layout.
@@ -77,6 +103,10 @@ func ObjectKey(batchID, sha string) string {
 // hour, part and local HHMMSS range. The R2 prefix is never part of it.
 // Recordings without plaza naming (stoarama_v1) use
 // <folder>/<recording>/joined/<date>/<recording>_<date>_hour_<HH>[_part_NN]_<range>.mp4.
+//
+// The path never names the stitching tool, the batch or a replacement: Deniz,
+// verbatim, "keep the old file names agnostic to the stitching tool". A
+// replacement hour gets exactly the path its superseded hour had.
 func DeliveryPath(w HourWork, start, end time.Time, part, parts int) (string, error) {
 	switch w.NamingProfile {
 	case string(recordingnaming.ProfilePlazaHourlyV1):
@@ -133,35 +163,39 @@ const (
 )
 
 type HourManifest struct {
-	SchemaVersion    int               `json:"schema_version"`
-	PolicyVersion    string            `json:"policy_version"`
-	Generation       int               `json:"generation"`
-	Status           string            `json:"status"`
-	BatchID          string            `json:"batch_id"`
-	HourID           string            `json:"hour_id"`
-	SupersedesHourID string            `json:"supersedes_hour_id,omitempty"`
-	RecordingID      int64             `json:"recording_id"`
-	Timezone         string            `json:"timezone"`
-	LocalDate        string            `json:"local_date"`
-	DeliveryHour     int               `json:"delivery_hour"`
-	ScheduledStart   time.Time         `json:"scheduled_start_utc"`
-	ScheduledEnd     time.Time         `json:"scheduled_end_utc"`
-	SeamPolicy       SeamPolicy        `json:"seam_policy"`
-	MediaTool        string            `json:"media_tool"`
-	Clips            []ClipDisposition `json:"clips"`
-	Seams            []SeamDecision    `json:"seams"`
-	Outputs          []Output          `json:"outputs"`
-	CreatedAt        time.Time         `json:"created_at"`
+	SchemaVersion    int    `json:"schema_version"`
+	PolicyVersion    string `json:"policy_version"`
+	Generation       int    `json:"generation"`
+	Status           string `json:"status"`
+	BatchID          string `json:"batch_id"`
+	HourID           string `json:"hour_id"`
+	SupersedesHourID string `json:"supersedes_hour_id,omitempty"`
+	// ReplacesHourID is the registered generation-2 hour a generation-3
+	// replacement supersedes.
+	ReplacesHourID string            `json:"replaces_hour_id,omitempty"`
+	RecordingID    int64             `json:"recording_id"`
+	Timezone       string            `json:"timezone"`
+	LocalDate      string            `json:"local_date"`
+	DeliveryHour   int               `json:"delivery_hour"`
+	ScheduledStart time.Time         `json:"scheduled_start_utc"`
+	ScheduledEnd   time.Time         `json:"scheduled_end_utc"`
+	SeamPolicy     SeamPolicy        `json:"seam_policy"`
+	MediaTool      string            `json:"media_tool"`
+	Clips          []ClipDisposition `json:"clips"`
+	Seams          []SeamDecision    `json:"seams"`
+	Outputs        []Output          `json:"outputs"`
+	CreatedAt      time.Time         `json:"created_at"`
 }
 
 // Validate checks the manifest's internal accounting before it is published or
 // registered: every clip once, parts contiguous, every seam inside a part a
 // join and every seam between parts a split.
 func (m HourManifest) Validate() error {
-	if m.SchemaVersion != 1 || m.PolicyVersion != PolicyVersion || m.Generation != Generation {
+	replacement := m.Generation == ReplacementGeneration && m.ReplacesHourID != ""
+	if m.SchemaVersion != 1 || m.PolicyVersion != PolicyVersion || !(replacement || (m.Generation == Generation && m.ReplacesHourID == "")) {
 		return fmt.Errorf("manifest version differs")
 	}
-	want, err := HourIDFor(m.BatchID, m.RecordingID, m.LocalDate, m.DeliveryHour)
+	want, err := HourIDForGeneration(m.BatchID, m.RecordingID, m.LocalDate, m.DeliveryHour, m.Generation)
 	if err != nil || want != m.HourID {
 		return fmt.Errorf("manifest hour identity differs")
 	}

@@ -70,11 +70,17 @@ func ProcessHour(ctx context.Context, env Env, w HourWork) (HourManifest, error)
 	if w.Restore != nil && w.Restore.MediaTool != env.MediaTool {
 		return HourManifest{}, fmt.Errorf("%w: media tool %q, registered %q", ErrRestoreDiffers, env.MediaTool, w.Restore.MediaTool)
 	}
-	m := HourManifest{SchemaVersion: 1, PolicyVersion: PolicyVersion, Generation: Generation, BatchID: w.BatchID, HourID: w.HourID,
+	m := HourManifest{SchemaVersion: 1, PolicyVersion: PolicyVersion, Generation: w.Generation(), BatchID: w.BatchID, HourID: w.HourID,
 		SupersedesHourID: w.SupersedesHourID, RecordingID: w.RecordingID, Timezone: w.Timezone, LocalDate: w.LocalDate,
 		DeliveryHour: w.DeliveryHour, ScheduledStart: w.ScheduledStart, ScheduledEnd: w.ScheduledEnd, SeamPolicy: env.Policy,
 		MediaTool: env.MediaTool, Clips: []ClipDisposition{}, Seams: []SeamDecision{}, Outputs: []Output{}}
-	if want, err := HourIDFor(w.BatchID, w.RecordingID, w.LocalDate, w.DeliveryHour); err != nil || want != w.HourID {
+	if w.Replaces != nil {
+		if w.Restore != nil || w.SupersedesHourRecordID != 0 {
+			return m, fmt.Errorf("a replacement is neither a restore nor a generation-1 supersession")
+		}
+		m.ReplacesHourID = w.Replaces.HourID
+	}
+	if want, err := HourIDForGeneration(w.BatchID, w.RecordingID, w.LocalDate, w.DeliveryHour, w.Generation()); err != nil || want != w.HourID {
 		return m, fmt.Errorf("work hour identity differs")
 	}
 	root, err := filepath.Abs(env.ScratchRoot)

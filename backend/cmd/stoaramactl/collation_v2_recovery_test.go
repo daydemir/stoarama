@@ -625,3 +625,245 @@ func sha256Hex(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
+
+// A registered hour whose restore reported differs is stitched fresh at
+// generation 3 in a recovery batch and registered beside it, superseding it.
+// The old row, its outputs and its keys never change and stay held; nothing
+// else gains a generation-2 shadow.
+func TestR2WriterFenceCollationV2ReplacementSupersedesOnly(t *testing.T) {
+	ctx := context.Background()
+	pool := joinedPurgeTestPool(t, "collation_replace")
+	if err := db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir()); err != nil {
+		t.Fatal(err)
+	}
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refused := func(what, want string, err error) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("%s: want refusal %q, got %v", what, want, err)
+		}
+	}
+	exec(`
+INSERT INTO accounts(id,email) VALUES(47,'collation-replace@example.invalid');
+INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
+ VALUES(78,'test','78','scoped','scoped','https://storage.example.test','off','Asia/Seoul','hls','video_manifest','video_live','continuous_video',30);
+INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc)
+ VALUES(1,47,'test','https://storage.example.test','auto','bucket','fixture',decode('00','hex'));
+INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
+ VALUES(31,47,1,'scoped','https://storage.example.test','* * * * *','Asia/Seoul','paused',78,now()),
+       (32,47,1,'unscoped','https://storage.example.test','* * * * *','Asia/Seoul','paused',78,now())`)
+	const oldBatch, batch, date = "goodplus-20260821", "recovery-best14-20261125", "2026-11-05"
+	seoul, _ := time.LoadLocation("Asia/Seoul")
+	hourAt := func(b string, recording int64, h, generation int) collation.HourWork {
+		t.Helper()
+		id, err := collation.HourIDForGeneration(b, recording, date, h, generation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return collation.HourWork{BatchID: b, HourID: id, RecordingID: recording, LocalDate: date, DeliveryHour: h}
+	}
+	part := func(b, name string, h int) (collation.Output, []byte) {
+		body := []byte("stitched " + name)
+		start := time.Date(2026, 11, 5, 7+h, 30, 0, 0, seoul)
+		return collation.Output{Part: 1, Parts: 1, ObjectKey: collation.ObjectKey(b, sha256Hex(body)), NASRelativePath: "f/" + name + ".mp4",
+			SizeBytes: int64(len(body)), SHA256: sha256Hex(body), StartUTC: start.UTC(), EndUTC: start.Add(time.Minute).UTC(),
+			SourceClipIDs: []int64{900 + int64(h)}, R2VerifiedAt: time.Now()}, body
+	}
+	manifestOf := func(w collation.HourWork, out collation.Output) (collation.HourManifest, []byte) {
+		m := collation.HourManifest{Generation: w.Generation(), Status: collation.StatusCollated, BatchID: w.BatchID, HourID: w.HourID,
+			RecordingID: w.RecordingID, LocalDate: w.LocalDate, DeliveryHour: w.DeliveryHour, Clips: []collation.ClipDisposition{},
+			Outputs: []collation.Output{out}, ReplacesHourID: replacedHourID(w)}
+		body, _ := json.Marshal(m)
+		return m, body
+	}
+	register := func(w collation.HourWork, out collation.Output) error {
+		m, body := manifestOf(w, out)
+		return insertCollationHour(ctx, pool, w, m, collation.ManifestKey(w.BatchID, w.HourID), body)
+	}
+	hourRecord := func(hourID string) int64 {
+		t.Helper()
+		var id int64
+		if err := pool.QueryRow(ctx, `SELECT id FROM recording_collation_hours WHERE hour_id=$1`, hourID).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+
+	// Registered before the fence: A differs, B restored fine, C differs on an
+	// unscoped recording, D differs but a retirement of its part is pending.
+	type old struct {
+		w   collation.HourWork
+		out collation.Output
+	}
+	olds := map[string]old{}
+	for name, spec := range map[string]struct {
+		recording int64
+		h         int
+	}{"A": {31, 1}, "B": {31, 2}, "C": {32, 1}, "D": {31, 3}, "E": {31, 4}} {
+		w := hourAt(oldBatch, spec.recording, spec.h, collation.Generation)
+		out, _ := part(oldBatch, "old "+name, spec.h)
+		if err := register(w, out); err != nil {
+			t.Fatal(err)
+		}
+		olds[name] = old{w, out}
+	}
+	exec(`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
+		SELECT 'collated',id,'bucket',object_key,size_bytes,sha256,repeat('b',64) FROM recording_collation_outputs WHERE object_key=$1`, olds["D"].out.ObjectKey)
+	frozen := func() string {
+		t.Helper()
+		var raw string
+		if err := pool.QueryRow(ctx, `SELECT jsonb_build_array(
+			(SELECT jsonb_agg(to_jsonb(h) ORDER BY id) FROM recording_collation_hours h WHERE batch_id=$1),
+			(SELECT jsonb_agg(to_jsonb(o) ORDER BY o.id) FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id WHERE h.batch_id=$1))::text`,
+			oldBatch).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	before := frozen()
+	matureR2WriterFence(t, pool, "bucket")
+	exec(`INSERT INTO collation_v2_recovery_scope(batch_id,recording_id,local_date,reason) VALUES($1,31,$2,'best 14 recovery')`, batch, date)
+
+	// approve-replacements reads the run results: only differs hours.
+	results := t.TempDir() + "/results.jsonl"
+	var lines []string
+	for name, outcome := range map[string]string{"A": collation.OutcomeDiffers, "B": "restored", "C": collation.OutcomeDiffers, "E": collation.OutcomeDiffers} {
+		line, _ := json.Marshal(collation.HourResult{HourID: olds[name].w.HourID, Outcome: outcome})
+		lines = append(lines, string(line))
+	}
+	if err := os.WriteFile(results, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	differs, err := readDiffersHours(results)
+	if err != nil || len(differs) != 3 {
+		t.Fatalf("differs hours %v %v", differs, err)
+	}
+	if approved, already, err := approveReplacements(ctx, pool, differs, batch, "restore differs: FFmpeg nightly gone"); err != nil || approved != 3 || already != 0 {
+		t.Fatalf("approve: %d %d %v", approved, already, err)
+	}
+	if approved, already, err := approveReplacements(ctx, pool, differs, batch, "rerun"); err != nil || approved != 0 || already != 3 {
+		t.Fatalf("approve rerun: %d %d %v", approved, already, err)
+	}
+	_, _, err = approveReplacements(ctx, pool, differs[:1], "recovery-other", "other batch")
+	refused("approval for a second batch", "already approved", err)
+	_, _, err = approveReplacements(ctx, pool, []string{olds["D"].w.HourID}, batch, "pending")
+	refused("approval over a pending retirement", "pending R2 retirement", err)
+	_, err = pool.Exec(ctx, `DELETE FROM collation_v2_recovery_replacements`)
+	refused("approval delete", "insert-only", err)
+
+	bucket := &recoveryBucket{objects: map[string][]byte{}, fail: map[string]bool{}, headFail: map[string]bool{},
+		race: map[string][]byte{}, puts: map[string]int{}, checksummed: map[string]bool{}}
+	server := httptest.NewServer(bucket)
+	defer server.Close()
+	client, err := r2.New(ctx, r2.Config{WriterDB: pool, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(w collation.HourWork, key string, body []byte) error {
+		_, _, err := client.ForCollationRecovery(w.HourID).PutReaderIfAbsentVerified(ctx, key, "video/mp4", bytes.NewReader(body), int64(len(body)), sha256Hex(body))
+		return err
+	}
+	replacing := func(name string, recording int64, h int) collation.HourWork {
+		w := hourAt(batch, recording, h, collation.ReplacementGeneration)
+		w.Replaces = &collation.ReplacedHour{HourRecordID: hourRecord(olds[name].w.HourID), HourID: olds[name].w.HourID}
+		return w
+	}
+
+	// The approved, scoped replacement of A: new keys, then a new row, at the
+	// superseded hour's own tool-agnostic delivery path.
+	repA := replacing("A", 31, 1)
+	outA, bodyA := part(batch, "new A", 1)
+	outA.NASRelativePath = olds["A"].out.NASRelativePath
+	if err := put(repA, outA.ObjectKey, bodyA); err != nil {
+		t.Fatal("replacement part refused:", err)
+	}
+	mA, manifestA := manifestOf(repA, outA)
+	if err := put(repA, collation.ManifestKey(batch, repA.HourID), manifestA); err != nil {
+		t.Fatal("replacement manifest refused:", err)
+	}
+	if err := insertCollationHour(ctx, pool, repA, mA, collation.ManifestKey(batch, repA.HourID), manifestA); err != nil {
+		t.Fatal("replacement register refused:", err)
+	}
+	var supersedes int64
+	var generation int
+	if err := pool.QueryRow(ctx, `SELECT supersedes_collation_hour_id, generation FROM recording_collation_hours WHERE hour_id=$1`, repA.HourID).Scan(&supersedes, &generation); err != nil ||
+		supersedes != repA.Replaces.HourRecordID || generation != collation.ReplacementGeneration {
+		t.Fatalf("replacement row: supersedes=%d generation=%d %v", supersedes, generation, err)
+	}
+	var paths []string
+	if err := pool.QueryRow(ctx, `SELECT array_agg(o.nas_relative_path||':'||o.generation ORDER BY o.generation) FROM recording_collation_outputs o
+		WHERE o.collation_hour_id IN ($1,(SELECT id FROM recording_collation_hours WHERE hour_id=$2))`, repA.Replaces.HourRecordID, repA.HourID).Scan(&paths); err != nil ||
+		len(paths) != 2 || paths[0] != olds["A"].out.NASRelativePath+":2" || paths[1] != olds["A"].out.NASRelativePath+":3" {
+		t.Fatalf("replacement delivery path %v %v", paths, err)
+	}
+	// A replacement never takes another hour's delivery path.
+	repE := replacing("E", 31, 4)
+	outE, bodyE := part(batch, "new E", 4)
+	if err := put(repE, outE.ObjectKey, bodyE); err != nil {
+		t.Fatal(err)
+	}
+	outE.NASRelativePath = olds["B"].out.NASRelativePath
+	refused("replacement at another hour's delivery path", "belongs to another hour", register(repE, outE))
+	// The collated feed's newest-generation rule now prefers the replacement.
+	var newest string
+	if err := pool.QueryRow(ctx, `SELECT h.hour_id FROM recording_collation_hours h WHERE h.recording_id=31 AND h.local_date=$1 AND h.delivery_hour=1
+		AND NOT EXISTS (SELECT 1 FROM recording_collation_hours newer WHERE newer.recording_id=h.recording_id AND newer.local_date=h.local_date
+		 AND newer.delivery_hour=h.delivery_hour AND newer.generation>h.generation)`, date).Scan(&newest); err != nil || newest != repA.HourID {
+		t.Fatalf("newest hour %s %v", newest, err)
+	}
+
+	// Refused: a second replacement of A, B (never reported differs), C (its
+	// day is not scoped), and a plain generation-2 shadow of A's hour.
+	outA2, bodyA2 := part(batch, "new A again", 1)
+	refused("second replacement of A", "admission refused", put(replacing("A", 31, 1), outA2.ObjectKey, bodyA2))
+	repB := replacing("B", 31, 2)
+	outB, bodyB := part(batch, "new B", 2)
+	refused("replacement of an hour that did not differ", "admission refused", put(repB, outB.ObjectKey, bodyB))
+	refused("register a replacement of an hour that did not differ", "fenced", register(repB, outB))
+	repC := replacing("C", 32, 1)
+	outC, bodyC := part(batch, "new C", 1)
+	refused("replacement outside the scope", "admission refused", put(repC, outC.ObjectKey, bodyC))
+	refused("register a replacement outside the scope", "fenced", register(repC, outC))
+	shadow := hourAt(batch, 31, 1, collation.Generation)
+	outS, bodyS := part(batch, "shadow", 1)
+	refused("generation-2 shadow of a registered hour", "admission refused", put(shadow, outS.ObjectKey, bodyS))
+	// The catalog's own UNIQUE (recording, date, hour, generation) refuses it.
+	refused("register a generation-2 shadow", "unique constraint", register(shadow, outS))
+	// A generation-3 row that names some other hour than the one it replaces.
+	wrongTarget := replacing("A", 31, 1)
+	wrongTarget.HourID, _ = collation.HourIDForGeneration(batch, 31, date, 2, collation.ReplacementGeneration)
+	wrongTarget.DeliveryHour = 2
+	outW, _ := part(batch, "wrong target", 2)
+	refused("replacement pointing at another hour", "fenced", register(wrongTarget, outW))
+
+	// Supersede only: the old rows are byte-for-byte as before, add-only, and
+	// their keys stay held from every retirement lane.
+	if after := frozen(); after != before {
+		t.Fatalf("old rows changed:\nbefore %s\nafter  %s", before, after)
+	}
+	for name, sql := range map[string]string{
+		"old hour update":    `UPDATE recording_collation_hours SET status='gap_only' WHERE id=$1`,
+		"old hour delete":    `DELETE FROM recording_collation_hours WHERE id=$1`,
+		"old output delete":  `DELETE FROM recording_collation_outputs WHERE collation_hour_id=$1`,
+		"replacement delete": `DELETE FROM recording_collation_outputs WHERE collation_hour_id=(SELECT id FROM recording_collation_hours WHERE supersedes_collation_hour_id=$1)`,
+	} {
+		_, err := pool.Exec(ctx, sql, repA.Replaces.HourRecordID)
+		refused(name, "collation v2 recovery", err)
+	}
+	var held bool
+	if err := pool.QueryRow(ctx, `SELECT r2_owner_keep_held('bucket',$1) AND r2_owner_keep_held('bucket',$2) AND r2_owner_keep_held('bucket',$3)`,
+		olds["A"].out.ObjectKey, olds["C"].out.ObjectKey, outA.ObjectKey).Scan(&held); err != nil || !held {
+		t.Fatalf("old and new keys not held: %v %v", held, err)
+	}
+	bucket.mu.Lock()
+	_, oldTouched := bucket.puts[olds["A"].out.ObjectKey]
+	bucket.mu.Unlock()
+	if oldTouched {
+		t.Fatal("a replacement wrote to the old key")
+	}
+}

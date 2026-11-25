@@ -25,6 +25,7 @@ CREATE TABLE recordings(id bigint PRIMARY KEY,status text,cron_timezone text,nam
 CREATE TABLE recording_joined_hours(id bigint PRIMARY KEY,recording_id bigint,hour_id text,batch_id text,local_date date,delivery_hour int);
 CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint,recording_job_id bigint,capture_attempt_id uuid,capture_lease_token uuid,
  capture_sequence bigint,clip_start_at timestamptz,clip_end_at timestamptz,bucket text,object_key text,etag text,size_bytes bigint,sha256 text,purged_at timestamptz);
+CREATE TABLE collation_v2_recovery_replacements(collation_hour_id bigint PRIMARY KEY,batch_id text);
 CREATE TABLE recording_collation_hours(id bigint PRIMARY KEY,hour_id text UNIQUE,batch_id text,generation int,recording_id bigint,local_date date,
  delivery_hour int,status text,manifest jsonb);
 CREATE TABLE recording_collation_outputs(id bigint PRIMARY KEY,collation_hour_id bigint,part int,object_key text,size_bytes bigint,sha256 text);
@@ -114,6 +115,26 @@ INSERT INTO recording_clips(id,recording_id,recording_job_id,clip_start_at,clip_
 		t.Fatalf("new hour under --recovery-batch: %+v", f)
 	}
 
+	// An hour whose restore differs, once approved for this recovery batch,
+	// is stitched fresh there at generation 3 and supersedes the old hour; an
+	// approval for another batch changes nothing.
+	if _, err := pool.Exec(ctx, `INSERT INTO collation_v2_recovery_replacements VALUES (1,$1)`, recoveryBatch); err != nil {
+		t.Fatal(err)
+	}
+	other, err := planCollation(ctx, pool, collationPlanOptions{scope: "days", dayList: dayList("5,2026-10-01,1"), now: now, recoveryBatch: "recovery-other"})
+	if err != nil || len(other.work) != 1 || other.work[0].Restore == nil || other.work[0].Replaces != nil {
+		t.Fatalf("approval leaked to another batch: %+v %v", other, err)
+	}
+	replaced, err := planCollation(ctx, pool, collationPlanOptions{scope: "days", dayList: dayList("5,2026-10-01,1"), now: now, recoveryBatch: recoveryBatch})
+	wantReplacement, _ := collation.HourIDForGeneration(recoveryBatch, 5, "2026-10-01", 1, collation.ReplacementGeneration)
+	if err != nil || len(replaced.work) != 1 {
+		t.Fatalf("replacement plan %+v %v", replaced, err)
+	}
+	if r := replaced.work[0]; r.HourID != wantReplacement || r.BatchID != recoveryBatch || r.Restore != nil || r.Replaces == nil ||
+		r.Replaces.HourRecordID != 1 || r.Replaces.HourID != hour1 || r.SupersedesHourRecordID != 0 || len(r.Clips) != 2 || r.Generation() != collation.ReplacementGeneration {
+		t.Fatalf("replacement hour %+v", r)
+	}
+	// Without the recovery batch it stays a restore.
 	one, err := planCollation(ctx, pool, collationPlanOptions{scope: "days", dayList: dayList("5,2026-10-01,1"), now: now})
 	if err != nil || len(one.work) != 1 || one.work[0].HourID != hour1 {
 		t.Fatalf("single hour plan %+v %v", one, err)
