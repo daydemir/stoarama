@@ -77,6 +77,12 @@ enter logs. Delivery acknowledgment means provider acceptance, not human reading
 
 Use the final hashed deployment packet and OWNERSHIP.md for activation/rollback.
 Actual installed runner paths come from the loaded plist, not the template.
+launchd keeps the runner alive on clean exits only (`KeepAlive` `SuccessfulExit`,
+hourly throttle), so a power loss or natural end restarts it; a SIGTERM or
+kickstart also exits 0 and returns. A failure exits 1 and stays latched; STOP, the
+latch or `launchctl bootout` hold it. `ops/jelly/wait_dns.py` fronts the runner and
+finish recovery so a cold boot waits up to 10 minutes for DNS, then exits 75
+(not restarted) instead of latching on a transient.
 `--dry-run` can submit metadata and send progress; it is not an offline test.
 It never enables a plan and cannot adopt an enabled saved execution.
 No automatic rollback, stale status restore, hold removal, failure clear or item

@@ -1,12 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- launchd restarts the runner after any clean exit (natural end, STOP drain, power
+     loss), at most hourly. A failure exits 1 and latches, so it is never
+     restarted: STOP and the failure latch are the only holds. wait_dns.py keeps a
+     cold boot from starting before DNS. Install by adding these keys to the loaded
+     plist; its paths are the pinned runner checkout, not the ones below. -->
 <plist version="1.0"><dict>
  <key>Label</key><string>com.stoarama.cleanup-runner</string>
- <key>ProgramArguments</key><array><string>/usr/bin/caffeinate</string><string>-i</string><string>/bin/sh</string><string>/Users/jelly/Build/stoarama/ops/jelly/cleanup-runner/run.sh</string></array>
+ <key>ProgramArguments</key><array><string>/usr/bin/caffeinate</string><string>-i</string><string>/usr/bin/python3</string><string>-I</string><string>/Users/jelly/Build/stoarama/ops/jelly/wait_dns.py</string><string>/bin/sh</string><string>/Users/jelly/Build/stoarama/ops/jelly/cleanup-runner/run.sh</string><string>--day-plans</string></array>
  <key>WorkingDirectory</key><string>/Users/jelly/Build/stoarama</string>
- <key>RunAtLoad</key><true/>
+ <key>KeepAlive</key><dict><key>SuccessfulExit</key><true/></dict>
+ <key>ThrottleInterval</key><integer>3600</integer>
  <key>ExitTimeOut</key><integer>0</integer>
  <key>StandardOutPath</key><string>/Users/jelly/stoarama-cleanup-runner/launchd.log</string>
  <key>StandardErrorPath</key><string>/Users/jelly/stoarama-cleanup-runner/launchd.log</string>
- <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/opt/postgresql@17/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string><key>HOME</key><string>/Users/jelly</string></dict>
+ <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/opt/libpq/bin:/opt/homebrew/opt/postgresql@17/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string><key>HOME</key><string>/Users/jelly</string></dict>
 </dict></plist>
