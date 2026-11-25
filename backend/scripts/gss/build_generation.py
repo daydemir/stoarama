@@ -28,7 +28,8 @@ parent file whose manifest output has that recording_id and local_date;
 local_date is the stream-timezone date the manifests and timelines carry.
 
 --best14 is best14-days.tsv (recording_id, local_date, day_stitched; 14 rows per
-recording). day_stitched R means every captured hour is stitched in R2 and .
+recording). To publish only from the best-14 ledger, pass best14_ledger.py's
+best14-ledger-days.tsv as --best14 and best14-ledger-files.txt as --files. day_stitched R means every captured hour is stitched in R2 and .
 means no capture. A stream is "available" when all 14 days are R or . with at
 least one R, its
 base timeline covers exactly those days, and every captured hour keeps all its

@@ -388,7 +388,7 @@ jobs:
       - name: Test NAS storage dashboard coverage and evidence
         working-directory: .
         run: python3 -m unittest discover -s backend/scripts/nas-storage-dashboard -p 'test_*.py' -q
-      - name: Test GSS delivery generation builder against the serving validator
+      - name: Test GSS delivery generation builder and best-14 ledger against the serving validator
         working-directory: .
         run: python3 -m unittest discover -s backend/scripts/gss -p 'test_*.py' -v
       - name: Test NAS pull client
