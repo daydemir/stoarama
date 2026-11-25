@@ -64,12 +64,15 @@ class OwnershipTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 validate_stop(json.dumps(dict(stop, **change)), owner, NOW)
 
-    def plan_source(self, tmp, reason='finish_admission_hold', api=None, db=None, urlopen=None, run=None):
-        """refresh_recovery's plan source after a human reconcile: hold STOP, phase stopped, recovery_required."""
+    def plan_source(self, tmp, reason='finish_admission_hold', api=None, db=None, urlopen=None, run=None,
+                    status=None, recovery=None, runner=None, tick=False):
+        """refresh_recovery's plan source after a human reconcile: hold STOP, phase stopped, recovery_required.
+        With tick, the tick lane's collection with a clean D report for the settled checkpoint."""
         now = datetime.now(timezone.utc)
-        status, owner, *_ = fixture()
+        changes, (status, owner, *_) = status, fixture()
         status.update(current_plan=None, next_plan=None, phase='stopped', recovery_plan_id=1441, runner_pid=4242,
                       recovery_history={'1440': {'sha256': PLAN_SHA, 'issued': 1860}, '1441': {'sha256': 'b'*64, 'issued': 8}})
+        status.update(changes or {})
         plan = fixture()[5]['plans']['1441']
         db = dict(dict(fixture()[5], enabled_plans=[], cleanup_at=now.isoformat(),
                        plans={'1441': dict(plan, mode='retired'), '1440': dict(plan, mode='retired', sha256=PLAN_SHA, issued=1860)}),
@@ -84,7 +87,11 @@ class OwnershipTests(unittest.TestCase):
         (root / 'status.json').write_text(json.dumps(status))
         (root / 'STOP').write_text(json.dumps(dict(schema='stoarama.cleanup-stop.v1', owner_id=owner['owner_id'],
                                                   reason=reason, created_at=now.isoformat())))
-        (state / 'admission.json').write_text(json.dumps(dict(failed=False, recovery_required=True, active={})))
+        (state / 'admission.json').write_text(json.dumps(dict(failed=False, recovery_required=not tick, active={})))
+        report = dict(plan_id=1441, plan_sha256='b'*64, delete_ever_issued=8, verified=8, problems=0,
+                      checked_at=(now - timedelta(hours=1)).isoformat())
+        (state / 'recovery.json').write_text(json.dumps(dict(report, **(recovery or {}))))
+        (root / 'recovery-1441.json').write_text(json.dumps(dict(report, **(runner or {}))))
         response = unittest.mock.MagicMock()
         response.__enter__.return_value.read.return_value = api
         psql = unittest.mock.Mock(returncode=0, stdout=json.dumps(db), stderr='')
@@ -93,7 +100,7 @@ class OwnershipTests(unittest.TestCase):
                 patch.object(collector.subprocess, 'run', **({'side_effect': run} if run else {'return_value': psql})), \
                 patch.dict(sys.modules, prepare_keep28_plans=unittest.mock.Mock(pg_env=lambda: dict(PGHOST='db.invalid', PGPORT='5432'))), \
                 patch.dict(collector.os.environ, SERVICE_TOKEN='fixture'):
-            return ownership.collect(root, Path(tmp), state / 'recovery.json', ownership.digest(raw), now, plan_source=True)
+            return ownership.collect(root, Path(tmp), state / 'recovery.json', ownership.digest(raw), now, plan_source=not tick)
 
     def test_plan_source_collects_a_held_idle_runner_after_reconcile(self):
         for reason, accepted in (('finish_admission_hold', True), ('natural_boundary', True), ('failure', False)):
@@ -177,22 +184,26 @@ class OwnershipTests(unittest.TestCase):
             finally:
                 holder.close()
 
-    def legacy(self, tmp, api=None, run=None, tick=False):
-        """The default (legacy) collector's plan source, end to end."""
+    def legacy(self, tmp, api=None, run=None, tick=False, status=None, recovery=None, urlopen=None):
+        """The default (legacy) collector's plan source or tick collection, end to end."""
         home = Path(tmp)
         root = home / 'stoarama-cleanup-runner'
         (root / 'incident-recovery-1440-20261117').mkdir(parents=True)
         (root / 'incident-recovery-1440-20261117/closed-verified.json').write_bytes(b'closed')
         (root / 'STOP').write_text(collector.STOP)
-        (root / 'status.json').write_text(json.dumps(dict(current_plan=PLAN, next_plan=1441, recovery_error=None,
-                                                          shutdown_or_recovery_failed=False, last_error=None)))
+        (root / 'status.json').write_text(json.dumps(dict(dict(current_plan=PLAN, next_plan=1441, recovery_error=None,
+                                                               shutdown_or_recovery_failed=False, last_error=None), **(status or {}))))
+        (home / 'r.json').write_text(json.dumps(dict(dict(plan_id=PLAN, plan_sha256=PLAN_SHA, delete_ever_issued=1860,
+            verified=1860, problems=0, checked_at=datetime.now(timezone.utc).isoformat()), **(recovery or {}))))
         response = unittest.mock.MagicMock()
         response.__enter__.return_value.read.return_value = json.dumps(dict(dict(
             id=PLAN, plan_sha256=PLAN_SHA, mode='retired', master_deletion_enabled=False), **(api or {}))).encode()
-        db = dict(enabled_plans=[], enabled_batches=[], plan_sha256=PLAN_SHA, issued=1860)
+        db = dict(enabled_plans=[], enabled_batches=[], plan_sha256=PLAN_SHA, issued=1860, version='r2-copy-v6', boot='b',
+                  newest_issued_at='2026-11-17T00:00:00Z', cleanup_at=datetime.now(timezone.utc).isoformat(),
+                  r2_copy=dict(mismatch_latched=0, holds_by_reason={}))
         with patch.object(collector, 'CLOSE_SHA', ownership.digest(b'closed')), \
                 patch.object(collector.Path, 'home', return_value=home), \
-                patch.object(collector.urllib.request, 'urlopen', return_value=response), \
+                patch.object(collector.urllib.request, 'urlopen', **({'side_effect': urlopen} if urlopen else {'return_value': response})), \
                 patch.object(collector.subprocess, 'run', **({'side_effect': run} if run else
                              {'return_value': unittest.mock.Mock(returncode=0, stdout=json.dumps(db))})), \
                 patch.dict(sys.modules, prepare_keep28_plans=unittest.mock.Mock(pg_env=dict)), \
@@ -216,6 +227,56 @@ class OwnershipTests(unittest.TestCase):
             self.legacy(tmp, run=self.psql_timeout, tick=True)
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
             self.legacy(tmp, api=dict(master_deletion_enabled=True), run=self.psql_timeout, tick=True)
+
+    def test_a_network_failure_never_holds_over_local_evidence(self):
+        """Every local-only check runs before the first network call (review finding)."""
+        down = urllib.error.HTTPError('u', 503, 'x', {}, io.BytesIO())
+        stale = (datetime.now(timezone.utc) - timedelta(hours=8)).isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.plan_source(tmp, tick=True)['recovery_plan_id'], 1441)
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(TransientFailure):
+            self.plan_source(tmp, urlopen=down, tick=True)
+        owned = {
+            'plan source: runner contain failed': dict(status=dict(shutdown_or_recovery_failed=True)),
+            'plan source: runner last_error': dict(status=dict(last_error='owned execution stop')),
+            'plan source: runner recovery_error': dict(status=dict(recovery_error='x')),
+            'plan source: not idle': dict(status=dict(phase='enabling')),
+            'tick: contain failed': dict(status=dict(shutdown_or_recovery_failed=True), tick=True),
+            'tick: D problems': dict(recovery=dict(problems=3, verified=5), tick=True),
+            'tick: D verified below issued': dict(recovery=dict(verified=7), tick=True),
+            'tick: D refresh_error': dict(recovery=dict(refresh_error='x'), tick=True),
+            'tick: D report stale': dict(recovery=dict(checked_at=stale), tick=True),
+            'tick: runner report problems': dict(recovery=dict(plan_id=1440, plan_sha256=PLAN_SHA, delete_ever_issued=1860,
+                                                               verified=1860), runner=dict(problems=2, verified=6), tick=True),
+        }
+        for name, change in owned.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+                self.plan_source(tmp, urlopen=down, **change)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.legacy(tmp, tick=True)['recovery_problems'], 0)
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(TransientFailure):
+            self.legacy(tmp, urlopen=down, tick=True)
+        legacy = {
+            'legacy plan source: contain failed': dict(status=dict(shutdown_or_recovery_failed=True)),
+            'legacy plan source: unknown last_error': dict(status=dict(last_error='other')),
+            'legacy tick: contain failed': dict(status=dict(shutdown_or_recovery_failed=True), tick=True),
+            'legacy tick: recovery_error': dict(status=dict(recovery_error='x'), tick=True),
+            'legacy tick: D problems': dict(recovery=dict(problems=3), tick=True),
+            'legacy tick: D verified below issued': dict(recovery=dict(verified=1859), tick=True),
+            'legacy tick: D report stale': dict(recovery=dict(checked_at=stale), tick=True),
+        }
+        for name, change in legacy.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+                self.legacy(tmp, urlopen=down, **change)
+
+    def test_wedged_snapshot_lock_latches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / 'runner').mkdir()
+            with (Path(tmp) / 'runner/ownership.lock').open('a') as held, \
+                    patch.object(ownership, 'SNAPSHOT_WAIT_SECONDS', 0.2):
+                fcntl.flock(held, fcntl.LOCK_EX)
+                with self.assertRaises(ValueError):
+                    self.plan_source(tmp)
 
     def collect(self, parts, running=True):
         return assemble_owned(*parts, now=NOW, running=running)

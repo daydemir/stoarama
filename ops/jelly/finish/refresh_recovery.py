@@ -11,13 +11,16 @@ import re
 import time
 
 from tick import notify
-from admission import (TRANSIENT_EXIT, Attempt, Latched, Transient, TransientFailure,
-                       publish, transient_record)
+from admission import TRANSIENT_EXIT, Attempt, Latched, TransientFailure, publish, transient_record
 from cli_binding import bound_launcher
 
 FIELDS = ('plan_id', 'plan_sha256', 'delete_ever_issued', 'verified', 'problems', 'checked_at')
 # Three plan-source tries over about ten minutes inside one launchd run.
 RETRY_DELAYS = (120, 360)
+# Above the collector's own worst case (20 s snapshot wait, 5 s ps, 15 s API,
+# 25 s psql, 10 s probe). Running out latches: only the collector's own
+# classified exit-75 record holds.
+PLAN_SOURCE_TIMEOUT = 90
 
 
 def validate_checked_at(value):
@@ -35,10 +38,7 @@ def validate_checked_at(value):
 
 
 def select_plan(source):
-    try:
-        result = subprocess.run([str(source)], capture_output=True, timeout=30)
-    except subprocess.TimeoutExpired:
-        raise TransientFailure(Transient.TIMEOUT) from None
+    result = subprocess.run([str(source)], capture_output=True, timeout=PLAN_SOURCE_TIMEOUT)
     if result.returncode == TRANSIENT_EXIT:
         raise TransientFailure(transient_record(json.loads(result.stdout), 'transient'))
     result.check_returncode()
@@ -81,11 +81,8 @@ def main():
             # out of logs and the published record. The CLI owns checked_at.
             with (attempt.path / 'verifier.json').open('w+b') as output:
                 os.chmod(output.name, 0o600)
-                try:
-                    result = subprocess.run([str(args.cli), 'nas-cleanup', 'verify-recovery', '--plan-id', str(plan)],
-                                            stdout=output, stderr=subprocess.DEVNULL, timeout=1800)
-                except subprocess.TimeoutExpired:
-                    raise TransientFailure(Transient.TIMEOUT) from None
+                result = subprocess.run([str(args.cli), 'nas-cleanup', 'verify-recovery', '--plan-id', str(plan)],
+                                        stdout=output, stderr=subprocess.DEVNULL, timeout=1800)
                 output.seek(0)
                 raw = output.read(2 * 1024 * 1024 + 1)
             publish(attempt.path / 'result.json', {'returncode': result.returncode})

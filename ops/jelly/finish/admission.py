@@ -22,6 +22,8 @@ class Latched(Exception):
 # sysexits EX_TEMPFAIL: a collector or plan source obtained no data for a
 # pure network reason. It reports no finding.
 TRANSIENT_EXIT = 75
+# The tick lane's continuous-hold start. Reconciliation clears it.
+TICK_HOLD = 'tick-hold.json'
 
 
 class Transient(str, Enum):

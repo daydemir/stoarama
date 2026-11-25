@@ -138,15 +138,22 @@ class TransientRecoveryTest(unittest.TestCase):
                 self.assertEqual(self.invoke(transient(kind.value))[::3], (75, []))
                 self.assertFalse(self.admission()['failed'])
 
-    def test_plan_source_and_verifier_timeouts_hold(self):
+    def test_outer_plan_source_and_verifier_timeouts_latch(self):
+        """Only the collector's own classified record holds; a wall-clock timeout may hide a wedged runner."""
         def hang(command, **kwargs):
-            raise subprocess.TimeoutExpired(command, 30)
-        self.assertEqual(self.invoke(hang)[:3], (75, 3, [120, 360]))
-        self.assertEqual((self.state / 'recovery.json').read_text(), self.old)
-        self.setUp()
-        self.assertEqual(self.invoke(plan_ok, verify=hang)[:3], (75, 1, []))
-        self.assertFalse(self.admission()['failed'])
-        self.assertEqual((self.state / 'recovery.json').read_text(), self.old)
+            raise subprocess.TimeoutExpired(command, 90)
+        for sources, verify in (((hang,), report(REPORT)), ((plan_ok,), hang)):
+            with self.subTest(verify=verify):
+                self.setUp()
+                code, tries, sleeps, notes = self.invoke(*sources, verify=verify)
+                self.assertEqual((code, tries, sleeps), (1, 1, []))
+                self.assertTrue(self.admission()['failed'])
+                self.assertIn('refresh_error', self.recovery())
+                self.assertEqual(len(notes), 1)
+
+    def test_plan_source_budget_covers_the_collectors_own_worst_case(self):
+        import ownership
+        self.assertGreater(self.refresh.PLAN_SOURCE_TIMEOUT, ownership.SNAPSHOT_WAIT_SECONDS + 5 + 15 + 25 + 10)
 
     def test_transient_then_success_refreshes_and_reconciled_hold_stays_required(self):
         (self.state / 'admission.json').write_text(json.dumps({'failed': False, 'active': {}, 'recovery_required': True}))

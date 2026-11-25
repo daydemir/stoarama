@@ -99,12 +99,16 @@ class AdmissionTest(unittest.TestCase):
                                        'reconciled_attempts': list(journal['active'].values())}))
         argv = ['reconcile', '--state', str(self.state), '--expected-latch-sha256', 'f' * 64,
                 '--authority', str(authority), '--evidence', str(evidence)]
+        hold = self.state / admission.TICK_HOLD
+        hold.write_text('{"since":"2020-01-01T00:00:00+00:00"}')
         with patch.object(sys, 'argv', argv), patch.object(subprocess, 'run') as run:
             self.assertEqual(reconcile.main(), 1)
             self.assertTrue(admission.load(self.state)['failed'])
+            self.assertTrue(hold.exists(), 'a refused reconcile changes nothing')
             argv[4] = digest
             self.assertEqual(reconcile.main(), 0)
             run.assert_not_called()
+        self.assertFalse(hold.exists(), 'a pre-latch hold start must not expire the first new hold')
         receipt = json.loads(next((self.state / 'reconciliations').iterdir()).read_text())
         self.assertEqual(receipt['controller'], '886efa32')
         self.assertEqual(receipt['evidence_sha256'], hashlib.sha256(evidence.read_bytes()).hexdigest())

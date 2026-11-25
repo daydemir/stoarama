@@ -143,6 +143,14 @@ class TransientHoldTest(unittest.TestCase):
             self.assertIn('evidence_unavailable', (root / 'notification').read_text())
             self.assertFalse((state / 'tick-hold.json').exists(), 'the latch ends the episode')
 
+    def test_hold_started_in_the_future_latches(self):
+        from datetime import timedelta
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result, admission, state = self.tick(root, self.transient('dns'), since=-timedelta(minutes=5))
+            self.assertEqual((result.returncode, admission['failed']), (1, True))
+            self.assertFalse((state / 'tick-hold.json').exists())
+
     def test_collector_data_ends_the_hold_episode(self):
         from datetime import timedelta
         for body, code in (('echo "{}"\n', 0), ('exit 1\n', 1)):

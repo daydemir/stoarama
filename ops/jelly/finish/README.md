@@ -230,20 +230,25 @@ everything data-derived latches as before. A collector or plan source exits 75
 with stdout `{"transient":"<class>"}` for admission.py's `Transient` enum only:
 DNS, network (refused, reset, unreachable), timeout, HTTP 5xx/429, or
 `database_unavailable` (psql timed out, or exited 2 while a TCP probe of the server
-also fails). API-only contract checks run before psql, so a DB failure after a good
-API response still latches on an API mismatch (legacy mode also on master ON, which its
-CLI would stop on). NAS lag, master off, a SQL timeout
-after the query ran, every other failure, an unknown class or a malformed record
-latch. Wrappers must propagate exit 75 and stdout, or transients latch (fail closed).
+also fails). Every local-only check (status flags, runner heartbeat or idle phase,
+D and runner report counts and 7 h freshness) runs before the first network call,
+and API-only contract checks run before psql. Legacy mode additionally requires
+the evidence already read to be clean by its CLI's stops (status flags, report
+counts, master OFF) before a network failure may hold. Everything else latches,
+including an unknown class or malformed record, a snapshot-lock wait over 20 s
+(a wedged runner), and any outer wall-clock timeout of the plan source (90 s,
+above the collector's internal budget) or verifier. Wrappers must propagate exit 75
+and stdout, or transients latch (fail closed). urlopen's timeout does not bound
+DNS resolution; a resolver hang past the outer timeout latches.
 
-`refresh_recovery.py` tries the plan source three times over about ten minutes; a
-verifier timeout holds without retry. A hold publishes nothing: admission stays
-unlatched and the previous `recovery.json` keeps its own `checked_at`, so its
-7-hour limit still stops feeding and cleanup and alerts. It logs one line, sends
-no notification and exits 75; the next run retries. The tick holds the same way
-(exit 75, no feed, no notification, status left to age for the dead-man) and
-records the start in `tick-hold.json`; any collector outcome with data clears it,
-and a hold continuous for over 2 h latches as `evidence_unavailable`.
+`refresh_recovery.py` tries the plan source three times over about ten minutes.
+A hold publishes nothing: admission stays unlatched and the previous
+`recovery.json` keeps its own `checked_at`, so its 7-hour limit still stops feeding
+and cleanup and alerts. It logs one line, sends no notification and exits 75; the
+next run retries. The tick holds the same way (exit 75, no feed, no notification,
+status left to age for the dead-man) and records the start in `tick-hold.json`. Any
+collector outcome with data and every successful reconciliation clear it; a hold
+continuous for over 2 h, or starting in the future, latches as `evidence_unavailable`.
 
 ## Stops
 

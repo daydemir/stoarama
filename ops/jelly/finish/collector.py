@@ -127,21 +127,35 @@ def legacy_api(api):
     require(type(api['master_deletion_enabled']) is bool)
 
 
-def assemble(status, recovery, api, db, master_at, now):
+def legacy_local(status, recovery, now):
+    """Legacy checks on local evidence alone; they run before any network call."""
     require(status['current_plan'] == PLAN and status['next_plan'] == 1441)
-    legacy_api(api)
-    require(db['plan_sha256'] == PLAN_SHA and db['enabled_plans'] == [] and db['enabled_batches'] == [])
     require(type(status['shutdown_or_recovery_failed']) is bool)
     require(status['recovery_error'] is None or isinstance(status['recovery_error'], str))
     require(status['last_error'] is None or isinstance(status['last_error'], str))
-    require('refresh_error' not in recovery and recovery['plan_id'] == PLAN and recovery['plan_sha256'] == PLAN_SHA)
-    issued = count(recovery['delete_ever_issued'])
-    verified = count(recovery['verified'])
-    problems = count(recovery['problems'])
+    if recovery is not None:
+        require('refresh_error' not in recovery and recovery['plan_id'] == PLAN and recovery['plan_sha256'] == PLAN_SHA)
+        for key in ('delete_ever_issued', 'verified', 'problems'):
+            count(recovery[key])
+        fresh(recovery['checked_at'], now, 7 * 3600)
+
+
+def legacy_clean(status, recovery, api):
+    """Local and API evidence the CLI would not stop on: only then may a later
+    network failure hold instead of latching."""
+    require(status['recovery_error'] is None and status['shutdown_or_recovery_failed'] is False
+            and status['last_error'] in (None, HELD_ERROR))
+    require(recovery is None or (recovery['problems'] == 0 and recovery['verified'] == recovery['delete_ever_issued']))
+    require(api is None or api['master_deletion_enabled'] is False)
+
+
+def assemble(status, recovery, api, db, master_at, now):
+    legacy_local(status, recovery, now)
+    legacy_api(api)
+    require(db['plan_sha256'] == PLAN_SHA and db['enabled_plans'] == [] and db['enabled_batches'] == [])
+    issued, verified, problems = (recovery[key] for key in ('delete_ever_issued', 'verified', 'problems'))
     require(issued == db['issued'] == 1860)
-    checked = timestamp(recovery['checked_at'])
-    require(checked > timestamp(db['newest_issued_at']))
-    fresh(recovery['checked_at'], now, 7 * 3600)
+    require(timestamp(recovery['checked_at']) > timestamp(db['newest_issued_at']))
     require(db['version'] in NAS_CLIENT_VERSIONS and isinstance(db['boot'], str) and bool(db['boot']))
     fresh(db['cleanup_at'], now)
     local = db['r2_copy']
@@ -159,6 +173,22 @@ def assemble(status, recovery, api, db, master_at, now):
                 known_enabled_plans=[], known_enabled_batches=[],
                 master_deletion_enabled=api['master_deletion_enabled'], expected_deletion_enabled=False,
                 holds_by_reason=holds)
+
+
+QUERY = """BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY;
+SET LOCAL ROLE stoarama;
+SET LOCAL statement_timeout='10s';SET LOCAL lock_timeout='2s';SET LOCAL work_mem='16MB';
+SET LOCAL max_parallel_workers_per_gather=0;SET LOCAL jit=off;
+DO $$BEGIN IF session_user<>'stoarama_20260821' THEN RAISE EXCEPTION 'session identity';END IF;IF current_user<>'stoarama' THEN RAISE EXCEPTION 'role identity';END IF;IF current_database()<>'stoarama' THEN RAISE EXCEPTION 'database identity';END IF;END$$;
+SELECT jsonb_build_object(
+ 'enabled_plans',(SELECT coalesce(jsonb_agg(id ORDER BY id),'[]') FROM nas_cleanup_plans WHERE mode='enabled'),
+ 'enabled_batches',(SELECT coalesce(jsonb_agg(id ORDER BY id),'[]') FROM nas_cleanup_batches WHERE mode='enabled'),
+ 'plan_sha256',(SELECT plan_sha256 FROM nas_cleanup_plans WHERE id=1440 AND connection_id=13),
+ 'issued',(SELECT count(*) FROM nas_cleanup_items WHERE plan_id=1440 AND delete_ever_issued),
+ 'newest_issued_at',(SELECT max(updated_at) FROM nas_cleanup_items WHERE plan_id=1440 AND delete_ever_issued),
+ 'version',client_version,'boot',client_boot_id,'cleanup_at',nas_cleanup_status_at,
+ 'r2_copy',nas_cleanup_status->'r2_copy') FROM connections WHERE id=13;
+ROLLBACK;"""
 
 
 def main():
@@ -181,41 +211,28 @@ def main():
     require((root / 'STOP').read_text() == STOP)
     status_bytes = (root / 'status.json').read_bytes()
     status = json.loads(status_bytes)
+    recovery = None if args.plan_source else json.loads(args.recovery_report.read_bytes())
+    # Local evidence first, then the API-only contract: a later network failure
+    # must not mask either.
+    legacy_local(status, recovery, datetime.now(timezone.utc))
+    if args.plan_source:
+        legacy_clean(status, None, None)
     master_at = datetime.now(timezone.utc).isoformat()
-    api = api_get('plans/1440')
-    # API-only contract first: a later DB failure must not mask an API mismatch.
-    legacy_api(api)
-    require(not args.plan_source or api['master_deletion_enabled'] is False)
-    query = """BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY;
-SET LOCAL ROLE stoarama;
-SET LOCAL statement_timeout='10s';SET LOCAL lock_timeout='2s';SET LOCAL work_mem='16MB';
-SET LOCAL max_parallel_workers_per_gather=0;SET LOCAL jit=off;
-DO $$BEGIN IF session_user<>'stoarama_20260821' THEN RAISE EXCEPTION 'session identity';END IF;IF current_user<>'stoarama' THEN RAISE EXCEPTION 'role identity';END IF;IF current_database()<>'stoarama' THEN RAISE EXCEPTION 'database identity';END IF;END$$;
-SELECT jsonb_build_object(
- 'enabled_plans',(SELECT coalesce(jsonb_agg(id ORDER BY id),'[]') FROM nas_cleanup_plans WHERE mode='enabled'),
- 'enabled_batches',(SELECT coalesce(jsonb_agg(id ORDER BY id),'[]') FROM nas_cleanup_batches WHERE mode='enabled'),
- 'plan_sha256',(SELECT plan_sha256 FROM nas_cleanup_plans WHERE id=1440 AND connection_id=13),
- 'issued',(SELECT count(*) FROM nas_cleanup_items WHERE plan_id=1440 AND delete_ever_issued),
- 'newest_issued_at',(SELECT max(updated_at) FROM nas_cleanup_items WHERE plan_id=1440 AND delete_ever_issued),
- 'version',client_version,'boot',client_boot_id,'cleanup_at',nas_cleanup_status_at,
- 'r2_copy',nas_cleanup_status->'r2_copy') FROM connections WHERE id=13;
-ROLLBACK;"""
+    api = None
     try:
-        db = psql(repo, query)
+        api = api_get('plans/1440')
+        legacy_api(api)
+        require(not args.plan_source or api['master_deletion_enabled'] is False)
+        db = psql(repo, QUERY)
     except TransientFailure:
-        # The API answered: hold only if the CLI could not stop on it (legacy expects OFF).
-        require(api['master_deletion_enabled'] is False)
+        legacy_clean(status, recovery, api)
         raise
     require((root / 'status.json').read_bytes() == status_bytes and (root / 'STOP').read_text() == STOP)
     if args.plan_source:
-        require(status['current_plan'] == PLAN and status['next_plan'] == 1441)
         require(db['enabled_plans'] == [] and db['enabled_batches'] == [])
         require(db['plan_sha256'] == PLAN_SHA and db['issued'] == 1860)
-        require(status['recovery_error'] is None and status['shutdown_or_recovery_failed'] is False)
-        require(status['last_error'] in (None, HELD_ERROR))
         print(json.dumps({'plan_id': PLAN}))
         return
-    recovery = json.loads(args.recovery_report.read_bytes())
     record = assemble(status, recovery, api, db, master_at, datetime.now(timezone.utc))
     print(json.dumps(record, sort_keys=True))
 
