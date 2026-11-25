@@ -12,6 +12,9 @@ import (
 )
 
 func (c *Client) admitWrite(ctx context.Context, ttl time.Duration) (func(), func() error, error) {
+	if c.collationRecoveryHourID != "" {
+		return nil, nil, errors.New("collation recovery admission allows only create-only verified PUTs")
+	}
 	if ttl > 7*24*time.Hour {
 		return nil, nil, errors.New("R2 PUT capability exceeds seven days")
 	}
