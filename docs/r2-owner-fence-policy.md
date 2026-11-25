@@ -52,3 +52,12 @@ enabled trigger, `r2_retirement_writes_blocked('stoarama', endpoint)` and the
 separate `r2_retirement_writers_drained('stoarama')` diagnostic. Source merge is
 not production deployment. The retired legacy `r2-retire` age/default remains
 unchanged; the current inverse executors remain RAW-only.
+
+Migration 0260 admits one writer past the fence: a Keep Everything 'original'
+NAS restore (`nas_restore_ke_original`), under the same shared wire lock as
+`r2_retirement_admit_writer`. Its capability is recorded in
+`nas_restore_requests.put_expires_at` before signing, so
+`r2_retirement_writes_blocked` is false while one is live and delete batches
+wait. A queued KE restore row also keeps `r2_retirement_writers_drained` false.
+An active fence therefore no longer means that no new R2 object can appear; a
+restore only creates the purged clip's own key, create-only, after the cutoff.
