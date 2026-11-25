@@ -340,7 +340,25 @@ pinned `keep_everything` streams of `nas_media_keep20_windows`). Deniz, verbatim
 fence; their live `put_expires_at` holds `r2_retirement_writes_blocked` false,
 so R2 delete batches wait while a restore capability is live. Test restores and
 every other row stay untouched and refused; existing rows and objects remain
-preserved. New account and
+preserved. The fence admits one more writer, collation v2 recovery. Deniz,
+verbatim: "serve the best 14 days of as many streams as possible, fully
+stitched v85 (or whatever the latest version was we were using), via r2,
+through the nice web ui". Migration 0262 admits a generation-2 hour only when
+the controller has listed its recording and local date (the day in the
+recording's `cron_timezone`) in `collation_v2_recovery_scope`.
+`collation-v2 run --recovery-scope` PUTs that hour's manifest and parts
+create-only. Each PUT has its own `r2_retirement_writer_operations` intent
+naming the hour and key, so `r2_retirement_writes_blocked` and
+`r2_retirement_writers_drained` hold every R2 delete batch back until it
+completes. A lost recovery PUT's intent stays until a later PUT of the same key
+verifies its exact bytes, as `PublishVerified`'s own retries do. One that no
+retry verifies blocks deletes like any other lost writer intent. A recovery
+client makes no other kind of write or capability. `collation-v2 register`
+then catalogues the hour and its parts in one transaction. Only keys the catalog does not hold and no R2 retirement
+reserves are admitted, and a scoped hour or part can never be updated, deleted
+or truncated. The NAS cleanup source freeze (0180), the collation-reference
+hold (0167) and the R2 retirement key vetoes still apply: a stream frozen by an
+enabled cleanup plan waits for that plan. New account and
 admin S3 destination verification/provisioning is retired before writing probes
 or credentials. Existing managed destinations resolve by read-only lookup;
 missing managed storage is not implicitly created, billed or marked verified.

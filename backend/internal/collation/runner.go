@@ -23,6 +23,13 @@ import (
 // bucket as the joined layout.
 type R2Store struct{ Client *r2.Client }
 
+// CollationRecoveryStore publishes hour w's outputs and manifest as collation
+// v2 recovery writes, admitted past the writer fence only inside the
+// controller's collation_v2_recovery_scope (migration 0262).
+func (s R2Store) CollationRecoveryStore(w HourWork) Store {
+	return R2Store{Client: s.Client.ForCollationRecovery(w.HourID)}
+}
+
 func (s R2Store) Download(ctx context.Context, clip Clip, dst string) (int64, string, error) {
 	if clip.Bucket != s.Client.Bucket() {
 		return 0, "", fmt.Errorf("clip %d lives in bucket %q, not %q", clip.ClipID, clip.Bucket, s.Client.Bucket())
@@ -171,7 +178,11 @@ func RunWorklist(ctx context.Context, env Env, store ExistenceChecker, work []Ho
 				case exists:
 					res.Outcome = "skipped_existing"
 				default:
-					m, err := ProcessHour(ctx, env, w)
+					hourEnv := env
+					if env.HourStore != nil {
+						hourEnv.Store = env.HourStore(w)
+					}
+					m, err := ProcessHour(ctx, hourEnv, w)
 					switch {
 					case errors.Is(err, ErrDeferred):
 						res.Outcome = "deferred"

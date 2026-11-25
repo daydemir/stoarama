@@ -33,7 +33,10 @@ type Env struct {
 	Policy      SeamPolicy
 	ScratchRoot string
 	Store       Store
-	MediaTool   string
+	// HourStore, when set, gives each hour of RunWorklist its own Store: a
+	// collation v2 recovery run binds every R2 write to its hour's scope.
+	HourStore func(HourWork) Store
+	MediaTool string
 	// CPU bounds concurrent ffmpeg/ffprobe processes across all hours.
 	CPU chan struct{}
 	// KeepScratch keeps each hour's downloaded sources (canary review only).

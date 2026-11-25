@@ -41,6 +41,10 @@ type Client struct {
 	writerDB        *pgxpool.Pool
 	ungatedWriter   bool
 	deleteTransport http.RoundTripper
+	// collationRecoveryHourID binds every write to one hour of the controller's
+	// collation_v2_recovery_scope, the sole collation exception to the writer
+	// fence (migration 0262).
+	collationRecoveryHourID string
 }
 
 type Config struct {
@@ -462,7 +466,7 @@ func (c *Client) PutReaderIfAbsentVerified(ctx context.Context, key, contentType
 	if expectedSize <= 0 || expectedSize > MaxConditionalPutBytes || !isLowerHexSHA256(expectedSHA256) {
 		return ObjectHead{}, false, fmt.Errorf("invalid bounded immutable object identity")
 	}
-	release, complete, err := c.admitWrite(ctx, 0)
+	release, complete, err := c.admitCreateOnlyWrite(ctx, key)
 	if err != nil {
 		return ObjectHead{}, false, err
 	}
