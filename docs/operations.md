@@ -389,7 +389,7 @@ and the R2 retirement key vetoes still apply: a stream frozen by an enabled
 cleanup plan waits for that plan.
 
 When a restore reports `differs` (the original FFmpeg nightly cannot be
-rebuilt), migration 0263 allows one replacement, supersede-only. Approved
+rebuilt), migration 0265 allows one replacement, supersede-only. Approved
 fallback: "first priority is best 14 stitched"; researchers do not care which
 FFmpeg did the stream copy.
 
