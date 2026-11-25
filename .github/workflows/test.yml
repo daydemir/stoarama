@@ -142,7 +142,7 @@ jobs:
       - name: Test original NAS presentation witnesses first
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api ./cmd/stoaramactl ./internal/db -run '^Test(NASDeliveryFence|NASR2Copy|NASRedownload|NASListing|NASSelectedVerify|OriginalWitness|NASCleanup|NASStitch|NASClient|NASDiagnostics|NASHostPressure|ValidateNASHostFacts|HeartbeatDropsInvalidHostFactsKeepsTelemetry)' -count=1 -v
+        run: go test -p 1 -timeout 20m ./internal/api ./cmd/stoaramactl ./internal/db -run '^Test(NASDeliveryFence|NASR2Copy|NASRedownload|NASListing|NASSelectedVerify|OriginalWitness|NASCleanup|NASStitch|NASClient|NASDiagnostics|NASHostPressure|ValidateNASHostFacts|HeartbeatDropsInvalidHostFactsKeepsTelemetry)' -count=1 -v
       - name: Test delivery keep holds and unexecutable R2 previews
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
@@ -376,12 +376,17 @@ jobs:
         run: node --test web/recordings_resilience_test.mjs
       - name: Test current source-once delivery projection
         run: node --test web/global_delivery_current_parts_test.cjs
+      - name: Test best-14 availability filter
+        run: node --test web/global_delivery_availability_test.cjs
       - name: Test exact-commit worker artifact workflow
         working-directory: .
         run: python3 backend/scripts/test_worker_artifact_workflow.py
       - name: Test NAS storage dashboard coverage and evidence
         working-directory: .
         run: python3 -m unittest discover -s backend/scripts/nas-storage-dashboard -p 'test_*.py' -q
+      - name: Test GSS delivery generation builder against the serving validator
+        working-directory: .
+        run: python3 -m unittest discover -s backend/scripts/gss -p 'test_*.py' -v
       - name: Test NAS pull client
         working-directory: .
         run: python3 -m unittest -q clients/nas-pull/test_stoarama_pull.py
