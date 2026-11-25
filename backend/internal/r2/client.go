@@ -270,14 +270,20 @@ func (c *Client) PresignNASRestorePut(ctx context.Context, tx pgx.Tx, requestID 
 	}
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	var key, contentType, sha string
+	var key, contentType, sha, bucket string
 	var size int64
-	if err := tx.QueryRow(ctx, `UPDATE nas_restore_requests
+	if err := tx.QueryRow(ctx, `UPDATE nas_restore_requests q
 		SET put_expires_at=GREATEST(put_expires_at,clock_timestamp()+$2::bigint*interval '1 microsecond'+interval '2 minutes')
-		WHERE id=$1 AND state='leased' AND nas_restore_ke_original(target,clip_id,object_key)
-		RETURNING object_key,content_type,size_bytes,sha256`,
-		requestID, ttl.Microseconds()).Scan(&key, &contentType, &size, &sha); err != nil {
+		FROM recording_clips c
+		WHERE q.id=$1 AND q.state='leased' AND c.id=q.clip_id AND nas_restore_ke_original(q.target,q.clip_id,q.object_key,q.size_bytes,q.sha256,q.relative_path)
+		RETURNING q.object_key,q.content_type,q.size_bytes,q.sha256,c.bucket`,
+		requestID, ttl.Microseconds()).Scan(&key, &contentType, &size, &sha, &bucket); err != nil {
 		return PresignedRequest{}, fmt.Errorf("restore %d is not an admitted Keep Everything original lease: %w", requestID, err)
+	}
+	// The key alone is not the clip's identity: its catalogued bucket must be the
+	// one this capability writes.
+	if bucket != c.bucket {
+		return PresignedRequest{}, fmt.Errorf("restore %d clip bucket %q is not the signing bucket", requestID, bucket)
 	}
 	in, err := createOnlyPutInput(c.bucket, key, contentType, size, sha, ttl, false)
 	if err != nil {

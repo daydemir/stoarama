@@ -181,14 +181,14 @@ func (s *Server) handleAccountConnectionRestoreLease(w http.ResponseWriter, r *h
 		  state=CASE WHEN attempts>=max_attempts THEN 'failed' ELSE 'pending' END,
 		  completed_at=CASE WHEN attempts>=max_attempts THEN now() END,
 		  lease_expires_at=NULL, outcome='lease_expired', last_error='lease expired before a result was reported'
-		WHERE connection_id=$1 AND state='leased' AND lease_expires_at<now() AND nas_restore_ke_original(target,clip_id,object_key)`, connectionID); err != nil {
+		WHERE connection_id=$1 AND state='leased' AND lease_expires_at<now() AND nas_restore_ke_original(target,clip_id,object_key,size_bytes,sha256,relative_path)`, connectionID); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "requeue expired restores failed")
 		return
 	}
 	rows, err := tx.Query(ctx, `
 		WITH picked AS (
 		  SELECT id FROM nas_restore_requests
-		  WHERE connection_id=$1 AND state='pending' AND nas_restore_ke_original(target,clip_id,object_key)
+		  WHERE connection_id=$1 AND state='pending' AND nas_restore_ke_original(target,clip_id,object_key,size_bytes,sha256,relative_path)
 		    AND NOT nas_cleanup_clip_held(clip_id)
 		  ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED)
 		UPDATE nas_restore_requests q SET state='leased', attempts=q.attempts+1, leased_at=now(),
@@ -294,7 +294,7 @@ func (s *Server) handleAccountConnectionRestoreResult(w http.ResponseWriter, r *
 	var keOriginal bool
 	var now time.Time
 	err := s.pool.QueryRow(ctx, `
-		SELECT id,clip_id,object_key,size_bytes,sha256,state,attempts,max_attempts,nas_restore_ke_original(target,clip_id,object_key),now()
+		SELECT id,clip_id,object_key,size_bytes,sha256,state,attempts,max_attempts,nas_restore_ke_original(target,clip_id,object_key,size_bytes,sha256,relative_path),now()
 		FROM nas_restore_requests WHERE id=$1 AND connection_id=$2`, taskID, connectionID).Scan(
 		&row.ID, &row.ClipID, &row.ObjectKey, &row.SizeBytes, &row.SHA256,
 		&row.State, &row.Attempts, &row.MaxAttempts, &keOriginal, &now)

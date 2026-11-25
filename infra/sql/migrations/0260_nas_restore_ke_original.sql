@@ -10,17 +10,19 @@
 -- writer stay fenced exactly as before. The restore's capability stays visible
 -- to r2_retirement_writes_blocked through put_expires_at, stamped when signed.
 
--- Only the clip's own catalogued object key, and only while the clip is purged:
--- R2 must not already hold those bytes.
-CREATE FUNCTION nas_restore_ke_original(target text, clip bigint, key text) RETURNS boolean LANGUAGE sql STABLE AS $$
+-- Only the clip's own catalogued object key, size, sha256 and NAS path, and only
+-- while the clip is purged: R2 must not already hold those bytes, and a row that
+-- drifted from the catalog must never place other bytes at a Keep Everything key.
+CREATE FUNCTION nas_restore_ke_original(target text, clip bigint, key text, size bigint, sha text, path text) RETURNS boolean LANGUAGE sql STABLE AS $$
  SELECT target='original' AND EXISTS(SELECT 1 FROM recording_clips c JOIN recordings r ON r.id=c.recording_id
   JOIN nas_media_keep20_windows w ON w.stream_id=r.stream_id
-  WHERE c.id=clip AND c.object_key=key AND c.purged_at IS NOT NULL AND w.keep_everything)
+  WHERE c.id=clip AND c.object_key=key AND c.size_bytes=size AND lower(c.sha256)=sha AND c.display_path=path
+   AND c.purged_at IS NOT NULL AND w.keep_everything)
 $$;
 
 CREATE FUNCTION r2_retirement_guard_restore() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
  IF NEW.state IN ('pending','leased') THEN
-  IF nas_restore_ke_original(NEW.target,NEW.clip_id,NEW.object_key) THEN
+  IF nas_restore_ke_original(NEW.target,NEW.clip_id,NEW.object_key,NEW.size_bytes,NEW.sha256,NEW.relative_path) THEN
    -- The same shared wire lock as r2_retirement_admit_writer: no fence
    -- transition can interleave with this admission.
    PERFORM pg_advisory_xact_lock_shared(7343226011187);

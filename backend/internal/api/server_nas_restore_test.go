@@ -190,6 +190,9 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 	keTestID := mustRequest(newClip(keStream, "ke-sample"), "test")
 	otherLeasedID := mustRequest(newClip(otherStream, "other-leased"), "original")
 	exec(`UPDATE nas_restore_requests SET state='leased',attempts=1,lease_expires_at=now()-interval '1 hour' WHERE id=$1`, otherLeasedID)
+	// A KE original whose row drifted from the catalog bytes must never be signed.
+	driftedID := mustRequest(newClip(keStream, "ke-drifted"), "original")
+	exec(`UPDATE nas_restore_requests SET sha256=repeat('0',64) WHERE id=$1`, driftedID)
 	original := newClip(keStream, "ke-original")
 	originalID := mustRequest(original, "original")
 	occupied := newClip(keStream, "ke-occupied")
@@ -218,7 +221,7 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 		if err := pool.QueryRow(ctx, `SELECT jsonb_build_array(
 			(SELECT jsonb_agg(to_jsonb(q) ORDER BY id) FROM nas_restore_requests q WHERE id=ANY($1)),
 			(SELECT jsonb_agg(to_jsonb(c) ORDER BY id) FROM recording_clips c WHERE id IN (SELECT clip_id FROM nas_restore_requests WHERE id=ANY($1))))::text`,
-			[]int64{otherOriginalID, keTestID, otherLeasedID}).Scan(&raw); err != nil {
+			[]int64{otherOriginalID, keTestID, otherLeasedID, driftedID}).Scan(&raw); err != nil {
 			t.Fatal(err)
 		}
 		return raw
@@ -320,7 +323,7 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 
 	// Anything the lease gate would not issue is refused before verification
 	// or any state change.
-	for _, id := range []int64{otherOriginalID, keTestID, otherLeasedID} {
+	for _, id := range []int64{otherOriginalID, keTestID, otherLeasedID, driftedID} {
 		if code, body := report(id, 1, "uploaded", ""); code != http.StatusConflict {
 			t.Fatalf("report on non-KE-original %d status=%d body=%s", id, code, body)
 		}
