@@ -129,7 +129,8 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 			return nil, errors.New("public cleanup fence unavailable")
 		}
 		if fenced {
-			const reviewed = "c4049f6dc0f940be8b7eb8b9bef6f42f"
+			// Footage still present after the Nov 2026 wind-down (Deniz, Nov 25: "cna you bring back the global street scores delivery page up now with the streams that it still has now?").
+			const reviewed = "cb33e28ca1c6cbd3444fb937f4bbe233"
 			if generation != "" && generation != reviewed {
 				return nil, errors.New("public publication deferred during NAS cleanup")
 			}
