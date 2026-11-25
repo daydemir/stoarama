@@ -680,8 +680,8 @@ def regressions(live, new, days):
 
 
 def choose_windows(best14_hours, live_hours, live, is_assembly):
-    """{recording_id: Window}: best-14 once it serves at least the live window's complete
-    hours and assemblies, else the live window."""
+    """{recording_id: Window}: best-14 when every best-14 day is complete in R2, or when it
+    serves at least the live window's complete hours and assemblies; else the live window."""
     def totals(counts, hours):
         out = collections.defaultdict(lambda: [0, 0])
         for day in {h.slot[:2] for h in hours}:
@@ -689,7 +689,12 @@ def choose_windows(best14_hours, live_hours, live, is_assembly):
             out[day[0]][1] += counts[day][1]
         return out
     b14, old = totals(new_counts(best14_hours, is_assembly), best14_hours), totals(live, live_hours)
-    return {rid: Window.BEST14 if b14[rid][0] >= old[rid][0] and b14[rid][1] >= old[rid][1] else Window.ORIGINAL
+    captured = collections.defaultdict(list)
+    for h in best14_hours:
+        if h.captured:
+            captured[h.recording_id].append(h.ok)
+    complete = {rid for rid, oks in captured.items() if all(oks)}
+    return {rid: Window.BEST14 if rid in complete or (b14[rid][0] >= old[rid][0] and b14[rid][1] >= old[rid][1]) else Window.ORIGINAL
             for rid in sorted({h.recording_id for h in best14_hours})}
 
 

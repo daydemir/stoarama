@@ -469,12 +469,27 @@ class LedgerBuildTests(unittest.TestCase):
         self.assertEqual(store.load(f'/public/manifests/{rid}.json')['period'], [DAYS[1], new_day])
         self.assertEqual((md[rid]['window'], md[rid]['best14_dates']), ('best14', [DAYS[0], DAYS[-1]]))
 
-        # Option (c): the stream keeps its live window until its best-14 window serves as much.
+        # Option (c): an incomplete best-14 window waits until it serves as much as the live window.
         isa = lambda x: x.source in L.ASSEMBLY_SOURCES
+        w.hours[(rid, DAYS[3], 1)] = dataclasses.replace(w.hours[(rid, DAYS[3], 1)], in_r2=False)
         live_hours = LedgerWorld(self.fx).hour_list()
         live = b.live_counts(w.inputs(), self.store)
         windows = b.choose_windows(w.hour_list(), live_hours, live, isa)
         self.assertEqual((windows[rid], windows[RIDS[0]]), (b.Window.ORIGINAL, b.Window.BEST14))
+
+    def test_complete_best14_window_switches_with_fewer_assemblies(self):
+        # Streams 428 and 431: every best-14 hour complete, but the live window has more assemblies.
+        isa = lambda x: x.source in L.ASSEMBLY_SOURCES
+        live_world, w = LedgerWorld(self.fx), LedgerWorld(self.fx)
+        rid = RIDS[8]
+        h = w.hours[(rid, DAYS[0], 1)]
+        w.put(rid, DAYS[0], 1, h.record, tuple(L.Served(str(p.output_id), p.key, 1000, 'e', p.sha256, p.nas_path, L.Source.ORIGINAL,
+                                                        (str(p.output_id),)) for p in h.record.parts))
+        live = b.live_counts(w.inputs(), self.store)
+        self.assertEqual(b.choose_windows(w.hour_list(), live_world.hour_list(), live, isa)[rid], b.Window.BEST14)
+        # One incomplete best-14 hour brings back the assembly rule.
+        w.hours[(rid, DAYS[2], 2)] = dataclasses.replace(w.hours[(rid, DAYS[2], 2)], in_r2=False)
+        self.assertEqual(b.choose_windows(w.hour_list(), live_world.hour_list(), live, isa)[rid], b.Window.ORIGINAL)
 
     def test_cli_fails_closed_and_dry_runs(self):
         r = subprocess.run([sys.executable, '-I', os.path.join(BACKEND, 'scripts', 'gss', 'build_generation.py'), '--ledger',

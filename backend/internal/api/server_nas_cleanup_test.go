@@ -359,7 +359,7 @@ func TestNASCleanupNewReferencesAndPublicGenerationAreFenced(t *testing.T) {
 			t.Fatalf("source/recovery namespace fence bypass: %s", sql)
 		}
 	}
-	old := &globalDeliveryRegistry{Generation: "ae14e746468c5c6402cd6f8ca55aca6e"}
+	old := &globalDeliveryRegistry{Generation: "549402679c9d5f158cece1c4f77bad16"}
 	s := &Server{pool: pool, publicPinnedDeliveryRegistry: old}
 	got, err := s.loadGlobalDeliveryRegistryScope(ctx, true, "")
 	if err != nil || got != old {
