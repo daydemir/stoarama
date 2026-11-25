@@ -40,7 +40,8 @@ const collationV2Usage = `usage:
   stoaramactl collation-v2 run --worklist FILE|r2:KEY|r2prefix:PREFIX --scratch DIR --results FILE [--hour-workers N --cpu N --net N --publish-dir DIR --keep-scratch --recovery-scope]
   stoaramactl collation-v2 register --worklist FILE|r2:KEY|r2prefix:PREFIX [--dry-run]
   stoaramactl collation-v2 settle-recovery [--apply]
-  stoaramactl collation-v2 put-worklist --worklist FILE --key r2-key`
+  stoaramactl collation-v2 put-worklist --worklist FILE --key r2-key
+  stoaramactl collation-v2 clock-join|clock-read ... (run either without flags for its usage)`
 
 // NightlyBatchID names the rolling generation-2 batch for closed local days.
 const NightlyBatchID = "nightly-collation-v2"
@@ -51,6 +52,14 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 	}
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	switch args[0] {
+	case "clock-join":
+		runClockJoin(ctx, cfg, args[1:])
+		return
+	case "clock-read":
+		runClockRead(ctx, args[1:])
+		return
+	}
 	fs := flag.NewFlagSet("collation-v2 "+args[0], flag.ExitOnError)
 	switch args[0] {
 	case "plan":

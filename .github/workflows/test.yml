@@ -374,6 +374,10 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./cmd/stoaramactl -run TestMeterReportLedgerFailsClosedOnAmbiguousRetry -count=1
+      # internal/clockjoin's media tests read synthetic clocks with tesseract in
+      # the next step; under CI they fail rather than skip without it.
+      - name: Install tesseract for clock-join tests
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y tesseract-ocr
       - name: Test
         run: go test ./...
       - name: Test recordings detail browser resilience
