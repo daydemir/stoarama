@@ -11,38 +11,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-// ForCollationRecovery returns a client whose only write is
-// PutReaderIfAbsentVerified, admitted as hourID's collation v2 recovery PUT
-// (migration 0262): its durable intent names the hour and exact key, and the
-// writer fence admits it only inside the controller's
-// collation_v2_recovery_scope. Every other write and capability is refused.
-func (c *Client) ForCollationRecovery(hourID string) *Client {
-	bound := *c
-	bound.collationRecoveryHourID = hourID
-	return &bound
-}
-
 func (c *Client) admitWrite(ctx context.Context, ttl time.Duration) (func(), func() error, error) {
 	if c.collationRecoveryHourID != "" {
 		return nil, nil, errors.New("collation recovery admission allows only create-only verified PUTs")
 	}
-	return c.admit(ctx, ttl, "")
-}
-
-// admitCreateOnlyWrite admits PutReaderIfAbsentVerified, the one write a
-// collation recovery client may make.
-func (c *Client) admitCreateOnlyWrite(ctx context.Context, key string) (func(), func() error, error) {
-	if c.collationRecoveryHourID != "" && c.writerDB == nil {
-		return nil, nil, errors.New("collation recovery writes require database admission")
-	}
-	return c.admit(ctx, 0, key)
-}
-
-func (c *Client) admit(ctx context.Context, ttl time.Duration, key string) (func(), func() error, error) {
 	if ttl > 7*24*time.Hour {
 		return nil, nil, errors.New("R2 PUT capability exceeds seven days")
 	}
-	recovery := c.collationRecoveryHourID != ""
 	noop := func() {}
 	complete := func() error { return nil }
 	if c.writerDB == nil {
@@ -56,18 +31,12 @@ func (c *Client) admit(ctx context.Context, ttl time.Duration, key string) (func
 		return nil, nil, errors.New("R2 writer admission database unavailable")
 	}
 	release := func() { _ = tx.Rollback(context.Background()) }
-	// A recovery intent is admitted by its own insert trigger, never here.
-	if !recovery {
-		if _, err = tx.Exec(ctx, `SELECT r2_retirement_admit_writer()`); err != nil {
-			release()
-			return nil, nil, errors.New("R2 writer admission refused or unavailable")
-		}
+	if _, err = tx.Exec(ctx, `SELECT r2_retirement_admit_writer()`); err != nil {
+		release()
+		return nil, nil, errors.New("R2 writer admission refused or unavailable")
 	}
 	var operationID int64
-	if recovery {
-		err = tx.QueryRow(ctx, `INSERT INTO r2_retirement_writer_operations(bucket,collation_recovery_hour_id,object_key) VALUES($1,$2,$3) RETURNING id`,
-			c.bucket, c.collationRecoveryHourID, key).Scan(&operationID)
-	} else if ttl > 0 {
+	if ttl > 0 {
 		_, err = tx.Exec(ctx, `INSERT INTO r2_retirement_writer_capabilities(bucket,expires_at) VALUES($1,clock_timestamp()+$2::bigint*interval '1 microsecond'+interval '2 minutes')`, c.bucket, ttl.Microseconds())
 	} else {
 		// Commit intent BEFORE any network write. Connection/process loss must not
@@ -85,9 +54,7 @@ func (c *Client) admit(ctx context.Context, ttl time.Duration, key string) (func
 		return noop, complete, nil
 	}
 	tx, err = c.writerDB.Begin(ctx)
-	if err == nil && recovery {
-		_, err = tx.Exec(ctx, `SELECT collation_v2_recovery_admit_wire($1)`, operationID)
-	} else if err == nil {
+	if err == nil {
 		_, err = tx.Exec(ctx, `SELECT r2_retirement_admit_writer()`)
 	}
 	if err != nil {
@@ -101,17 +68,7 @@ func (c *Client) admit(ctx context.Context, ttl time.Duration, key string) (func
 		release()
 		finishCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
-		var err error
-		if recovery {
-			// The caller has just verified the key holds the expected bytes. Earlier
-			// lost recovery PUTs of that same create-only key can now only fail
-			// If-None-Match, so their intents complete with this one.
-			_, err = c.writerDB.Exec(finishCtx, `UPDATE r2_retirement_writer_operations SET completed_at=clock_timestamp()
-				WHERE completed_at IS NULL AND (id=$1 OR (collation_recovery_hour_id IS NOT NULL AND bucket=$2 AND object_key=$3 AND id<$1))`,
-				operationID, c.bucket, key)
-		} else {
-			_, err = c.writerDB.Exec(finishCtx, `UPDATE r2_retirement_writer_operations SET completed_at=clock_timestamp() WHERE id=$1 AND completed_at IS NULL`, operationID)
-		}
+		_, err := c.writerDB.Exec(finishCtx, `UPDATE r2_retirement_writer_operations SET completed_at=clock_timestamp() WHERE id=$1 AND completed_at IS NULL`, operationID)
 		if err != nil {
 			return errors.New("R2 writer completion not durable; intent retained")
 		}

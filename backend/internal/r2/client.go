@@ -466,7 +466,7 @@ func (c *Client) PutReaderIfAbsentVerified(ctx context.Context, key, contentType
 	if expectedSize <= 0 || expectedSize > MaxConditionalPutBytes || !isLowerHexSHA256(expectedSHA256) {
 		return ObjectHead{}, false, fmt.Errorf("invalid bounded immutable object identity")
 	}
-	release, complete, err := c.admitCreateOnlyWrite(ctx, key)
+	release, complete, err := c.admitCreateOnlyWrite(ctx, key, expectedSize, expectedSHA256)
 	if err != nil {
 		return ObjectHead{}, false, err
 	}
@@ -481,41 +481,49 @@ func (c *Client) PutReaderIfAbsentVerified(ctx context.Context, key, contentType
 	if contentType != "" {
 		in.ContentType = aws.String(contentType)
 	}
-	created := true
-	if _, err := c.s3.PutObject(ctx, in); err != nil {
-		if !isPreconditionFailed(err) {
-			return ObjectHead{}, false, fmt.Errorf("conditional put object %s: %w", key, err)
-		}
-		created = false
-	}
-	head, err := c.Head(ctx, key)
+	created, err := c.putIfAbsent(ctx, in)
 	if err != nil {
-		return ObjectHead{}, false, fmt.Errorf("verify immutable object %s: %w", key, err)
+		return ObjectHead{}, false, err
 	}
-	if head.ETag == "" || head.SizeBytes != expectedSize {
-		return ObjectHead{}, false, fmt.Errorf("immutable object %s size mismatch: got %d want %d", key, head.SizeBytes, expectedSize)
-	}
-	rc, err := c.OpenExact(ctx, key, head.ETag, head.VersionID)
+	head, err := c.readBackExact(ctx, key, expectedSize, expectedSHA256)
 	if err != nil {
-		return ObjectHead{}, false, fmt.Errorf("verify immutable object %s: %w", key, err)
-	}
-	h := sha256.New()
-	n, copyErr := io.Copy(h, rc)
-	closeErr := rc.Close()
-	if copyErr != nil {
-		return ObjectHead{}, false, fmt.Errorf("hash immutable object %s: %w", key, copyErr)
-	}
-	if closeErr != nil {
-		return ObjectHead{}, false, fmt.Errorf("close immutable object %s: %w", key, closeErr)
-	}
-	gotSHA := hex.EncodeToString(h.Sum(nil))
-	if n != expectedSize || gotSHA != expectedSHA256 {
-		return ObjectHead{}, false, fmt.Errorf("immutable object %s content mismatch", key)
+		return ObjectHead{}, false, err
 	}
 	if err := complete(); err != nil {
 		return ObjectHead{}, false, err
 	}
 	return head, created, nil
+}
+
+var errImmutableMismatch = errors.New("immutable object content mismatch")
+
+// readBackExact proves key's current generation holds exactly size bytes with
+// sha256 sha, by reading every byte of that generation.
+func (c *Client) readBackExact(ctx context.Context, key string, size int64, sha string) (ObjectHead, error) {
+	head, err := c.Head(ctx, key)
+	if err != nil {
+		return ObjectHead{}, fmt.Errorf("verify immutable object %s: %w", key, err)
+	}
+	if head.ETag == "" || head.SizeBytes != size {
+		return ObjectHead{}, fmt.Errorf("%w: %s size got %d want %d", errImmutableMismatch, key, head.SizeBytes, size)
+	}
+	rc, err := c.OpenExact(ctx, key, head.ETag, head.VersionID)
+	if err != nil {
+		return ObjectHead{}, fmt.Errorf("verify immutable object %s: %w", key, err)
+	}
+	h := sha256.New()
+	n, copyErr := io.Copy(h, rc)
+	closeErr := rc.Close()
+	if copyErr != nil {
+		return ObjectHead{}, fmt.Errorf("hash immutable object %s: %w", key, copyErr)
+	}
+	if closeErr != nil {
+		return ObjectHead{}, fmt.Errorf("close immutable object %s: %w", key, closeErr)
+	}
+	if n != size || hex.EncodeToString(h.Sum(nil)) != sha {
+		return ObjectHead{}, fmt.Errorf("%w: %s", errImmutableMismatch, key)
+	}
+	return head, nil
 }
 
 func isLowerHexSHA256(raw string) bool {

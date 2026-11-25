@@ -344,23 +344,43 @@ preserved. The fence admits one more writer, collation v2 recovery. Deniz,
 verbatim: "serve the best 14 days of as many streams as possible, fully
 stitched v85 (or whatever the latest version was we were using), via r2,
 through the nice web ui". Migration 0262 admits a generation-2 hour only when
-the controller has listed its recording and local date (the day in the
-recording's `cron_timezone`) in `collation_v2_recovery_scope`.
-`collation-v2 run --recovery-scope` PUTs that hour's manifest and parts
-create-only. Each PUT has its own `r2_retirement_writer_operations` intent
-naming the hour and key, so `r2_retirement_writes_blocked` and
-`r2_retirement_writers_drained` hold every R2 delete batch back until it
-completes. A lost recovery PUT's intent stays until a later PUT of the same key
-verifies its exact bytes, as `PublishVerified`'s own retries do. One that no
-retry verifies blocks deletes like any other lost writer intent. A recovery
-client makes no other kind of write or capability. `collation-v2 register`
-then catalogues the hour and its parts in one transaction. Only keys the catalog does not hold and no R2 retirement
-reserves are admitted, and a scoped hour or part can never be updated, deleted
-or truncated. The NAS cleanup source freeze (0180), the collation-reference
-hold (0167) and the R2 retirement key vetoes still apply: a stream frozen by an
-enabled cleanup plan waits for that plan. New account and
-admin S3 destination verification/provisioning is retired before writing probes
-or credentials. Existing managed destinations resolve by read-only lookup;
+the controller has listed its batch, recording and local date (the day in the
+recording's `cron_timezone`) in `collation_v2_recovery_scope`, in one of two
+ways:
+
+- **Restore.** `collation-v2 run --recovery-scope` puts a registered hour's
+  catalogued output or manifest back at its catalogued key with its catalogued
+  sha256 and size. It HEADs the key under the wire lock and sends no PUT when
+  the object is present. It is refused while any retirement of that key is
+  pending, and it writes no catalog row.
+- **New hour.** Only in a fresh `recovery-` batch (`plan --recovery-batch`),
+  which no catalog row or writer intent may name before its first scope row.
+  `run` creates the hour's manifest and its parts, each part keyed by its own
+  sha256. `collation-v2 register` then catalogues the hour and its parts in
+  one transaction.
+
+Every key a scope row covers is an owner keep hold (`r2_owner_keep_held`), so
+no R2 retirement lane can reserve, intend or record its deletion. A classic
+`r2-retire` plan that names one fails closed. Scope rows are revoked, never
+deleted, and no scope row lands over a pending retirement. A scoped hour or part
+can never be updated, deleted or truncated.
+
+Each recovery PUT is a durable `r2_retirement_writer_operations` intent naming
+the hour and the exact key, size and sha256. `r2_retirement_writes_blocked` and
+`r2_retirement_writers_drained` therefore hold every R2 delete batch back until
+it completes. A wire admission refused after the intent committed sends no PUT
+and completes the intent at once. An intent whose process died settles only
+once its key's exact bytes are read back, through `PublishVerified`'s retries
+or `collation-v2 settle-recovery --apply`. A PUT still in flight share-locks its
+intent, and settlement skips it. A recovery client makes no generic PUT and
+signs no capability. `PresignNASRestorePut`, stitch staging and
+`DeleteObjectOnce` are unaffected by the binding and stay gated by their own
+rows. The NAS cleanup source freeze (0180), the collation-reference hold (0167)
+and the R2 retirement key vetoes still apply: a stream frozen by an enabled
+cleanup plan waits for that plan.
+
+New account and admin S3 destination verification/provisioning is retired
+before writing probes or credentials. Existing managed destinations resolve by read-only lookup;
 missing managed storage is not implicitly created, billed or marked verified.
 Existing destination selection and separately transported WebDAV verification
 remain available. These backend changes require the production controller's

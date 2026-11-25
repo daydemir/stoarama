@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 
@@ -23,9 +24,18 @@ import (
 // bucket as the joined layout.
 type R2Store struct{ Client *r2.Client }
 
+// recoveryBatch is collation_v2_recovery_scope.batch_id's shape (migration
+// 0262): a batch no earlier writer used, whose joined/<batch>/ keys an R2 owner
+// keep hold protects.
+var recoveryBatch = regexp.MustCompile(`^recovery-[a-z0-9][a-z0-9-]{0,52}$`)
+
+// IsRecoveryBatch reports whether batchID names a collation v2 recovery batch.
+func IsRecoveryBatch(batchID string) bool { return recoveryBatch.MatchString(batchID) }
+
 // CollationRecoveryStore publishes hour w's outputs and manifest as collation
 // v2 recovery writes, admitted past the writer fence only inside the
-// controller's collation_v2_recovery_scope (migration 0262).
+// controller's collation_v2_recovery_scope (migration 0262): as a restore of a
+// registered hour's catalogued bytes, or as a new hour in a recovery- batch.
 func (s R2Store) CollationRecoveryStore(w HourWork) Store {
 	return R2Store{Client: s.Client.ForCollationRecovery(w.HourID)}
 }

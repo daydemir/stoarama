@@ -26,9 +26,10 @@ import (
 )
 
 const collationV2Usage = `usage:
-  stoaramactl collation-v2 plan --scope backfill|nightly --out worklist.jsonl [--broken-ids FILE] [--recordings 1,2] [--hour-ids FILE] [--date YYYY-MM-DD | --days N]
+  stoaramactl collation-v2 plan --scope backfill|nightly --out worklist.jsonl [--broken-ids FILE] [--recordings 1,2] [--hour-ids FILE] [--date YYYY-MM-DD | --days N] [--recovery-batch recovery-NAME]
   stoaramactl collation-v2 run --worklist FILE|r2:KEY|r2prefix:PREFIX --scratch DIR --results FILE [--hour-workers N --cpu N --net N --publish-dir DIR --keep-scratch --recovery-scope]
   stoaramactl collation-v2 register --worklist FILE|r2:KEY|r2prefix:PREFIX [--dry-run]
+  stoaramactl collation-v2 settle-recovery [--apply]
   stoaramactl collation-v2 put-worklist --worklist FILE --key r2-key`
 
 // NightlyBatchID names the rolling generation-2 batch for closed local days.
@@ -50,13 +51,14 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 		hourIDs := fs.String("hour-ids", "", "optional file of hour ids to keep")
 		date := fs.String("date", "", "nightly: local date to plan (default: the last --days closed days in each recording's timezone)")
 		days := fs.Int("days", 2, "nightly: how many closed local days to (re)plan; published hours are skipped by run")
+		recoveryBatch := fs.String("recovery-batch", "", "plan every hour into this fresh recovery- batch (collation_v2_recovery_scope)")
 		_ = fs.Parse(args[1:])
-		if *out == "" || (*scope != "backfill" && *scope != "nightly") {
+		if *out == "" || (*scope != "backfill" && *scope != "nightly") || (*recoveryBatch != "" && !collation.IsRecoveryBatch(*recoveryBatch)) {
 			log.Fatal(collationV2Usage)
 		}
 		pool := mustCollationPool(ctx, cfg)
 		defer pool.Close()
-		opts := collationPlanOptions{scope: *scope, date: *date, days: *days, now: time.Now()}
+		opts := collationPlanOptions{scope: *scope, date: *date, days: *days, now: time.Now(), recoveryBatch: *recoveryBatch}
 		var err error
 		if opts.broken, err = readIDSet(*broken); err != nil {
 			log.Fatal(err)
@@ -126,6 +128,8 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 			CPU: make(chan struct{}, *cpu), Net: make(chan struct{}, *net), Now: time.Now, KeepScratch: *keepScratch}
 		var existence collation.ExistenceChecker = store
 		if *recoveryScope {
+			// The database admits each hour's writes: restores of registered
+			// hours in their own batch, new hours only in a fresh recovery- batch.
 			env.HourStore = store.CollationRecoveryStore
 		}
 		if *publishDir != "" {
@@ -152,6 +156,17 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 			log.Fatal(err)
 		}
 		summary, err := registerCollation(ctx, pool, store, work, *dryRun)
+		out, _ := json.Marshal(summary)
+		fmt.Println(string(out))
+		if err != nil {
+			log.Fatal(err)
+		}
+	case "settle-recovery":
+		apply := fs.Bool("apply", false, "complete the intents whose exact bytes R2 holds (default: report only)")
+		_ = fs.Parse(args[1:])
+		pool := mustCollationPool(ctx, cfg)
+		defer pool.Close()
+		summary, err := mustArchiveR2Client(ctx, cfg, pool).SettleCollationRecoveryIntents(ctx, *apply)
 		out, _ := json.Marshal(summary)
 		fmt.Println(string(out))
 		if err != nil {
@@ -316,6 +331,9 @@ type collationPlanOptions struct {
 	broken     map[int64]bool
 	recordings map[int64]bool
 	hourIDs    map[string]bool
+	// recoveryBatch, when set, names every planned hour in that fresh batch;
+	// generation-1 supersession is still looked up in the day's own batch.
+	recoveryBatch string
 }
 
 // collationDay is one planned local day for one recording.
@@ -453,8 +471,12 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 			if err != nil {
 				return nil, err
 			}
+			batchID := d.batchID
+			if opts.recoveryBatch != "" {
+				batchID = opts.recoveryBatch
+			}
 			for h := 1; h <= 12; h++ {
-				hourID, err := collation.HourIDFor(d.batchID, recordingID, d.localDate, h)
+				hourID, err := collation.HourIDFor(batchID, recordingID, d.localDate, h)
 				if err != nil {
 					return nil, err
 				}
@@ -463,7 +485,7 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 				}
 				start := time.Date(date.Year(), date.Month(), date.Day(), 7+h, 0, 0, 0, loc)
 				end := time.Date(date.Year(), date.Month(), date.Day(), 8+h, 0, 0, 0, loc)
-				w := collation.HourWork{BatchID: d.batchID, HourID: hourID, RecordingID: recordingID, Timezone: rec.timezone, LocalDate: d.localDate,
+				w := collation.HourWork{BatchID: batchID, HourID: hourID, RecordingID: recordingID, Timezone: rec.timezone, LocalDate: d.localDate,
 					DeliveryHour: h, ScheduledStart: start.UTC(), ScheduledEnd: end.UTC(), NamingProfile: rec.namingProfile, FolderName: rec.folderName,
 					Metadata: rec.metadata, Clips: []collation.Clip{}}
 				for _, c := range clips {
