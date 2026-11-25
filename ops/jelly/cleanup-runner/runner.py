@@ -56,6 +56,10 @@ R2PRUNE = Path.home() / 'stoarama-r2prune-lane' / 'r2prune'
 FOLDERS = 'backend/internal/api/nas_cleanup_folder_streams.json'
 FOLDERS_SHA = '94efc6fe9f0b83db55be31d4c2fad7f47cff781fd01d88bc33c4c90cae0e7ab8'
 DAY_MAX_UNITS = 1000
+# Streams skipped after an evidenced atomic admission 409, kept per mode: a per-file
+# refusal (e.g. a source hold) never skips a stream's day plans, nor the reverse.
+FILE_EXCLUSIONS, DAY_EXCLUSIONS = 'excluded_streams', 'day_excluded_streams'
+EXCLUSIONS = (FILE_EXCLUSIONS, DAY_EXCLUSIONS)
 DAY_TERMINAL = {'deleted', 'refused', 'client_refused', 'retired'}
 _MONTHS = ('January', 'February', 'March', 'April', 'May', 'June', 'July',
            'August', 'September', 'October', 'November', 'December')
@@ -485,12 +489,13 @@ class Runner:
                     and (status.get('next_plan') is None or type(status['next_plan']) is int
                          and status['next_plan'] > 0 and status['next_plan'] != status['current_plan'])
                     and (status['last_error'] is None or isinstance(status['last_error'], str))
-                    and isinstance(status.get('excluded_streams', {}), dict)
-                    and all(re.fullmatch('[1-9][0-9]*', k) and isinstance(v, dict)
-                            and v.get('http_status') == 409 and v.get('stream_id') == int(k)
-                            and isinstance(v.get('reason'), str) and len(v['reason']) <= 2048
-                            and isinstance(v.get('label'), str)
-                            for k, v in status.get('excluded_streams', {}).items())
+                    and all(isinstance(status.get(key, {}), dict)
+                            and all(re.fullmatch('[1-9][0-9]*', k) and isinstance(v, dict)
+                                    and v.get('http_status') == 409 and v.get('stream_id') == int(k)
+                                    and isinstance(v.get('reason'), str) and len(v['reason']) <= 2048
+                                    and isinstance(v.get('label'), str)
+                                    for k, v in status.get(key, {}).items())
+                            for key in EXCLUSIONS)
                     and isinstance(status.get('deferred_streams', {}), dict),
                     'invalid ownership state')
         except Exception:
@@ -577,8 +582,8 @@ class Runner:
             self.prepare = module
         return self.prepare
 
-    def prepare_stream(self, sid, args):
-        """Only an evidenced atomic admission 409 may skip a stream."""
+    def prepare_stream(self, sid, args, exclusions=FILE_EXCLUSIONS):
+        """Only an evidenced atomic admission 409 may skip a stream, in its own mode's exclusions."""
         try:
             command([sys.executable, str(self.repo / PREPARER), '--stream', str(sid),
                      '--scope-cache', str(self.root / 'reviewed-scope-cache'), *args],
@@ -594,16 +599,16 @@ class Runner:
                         and isinstance(evidence['label'], str) and evidence['label'].startswith(prefix)
                         and isinstance(evidence['reason'], str) and len(evidence['reason']) <= 2048,
                         'invalid atomic admission rejection evidence')
-                excluded = dict(self.status.get('excluded_streams') or {})
+                excluded = dict(self.status.get(exclusions) or {})
                 excluded[str(sid)] = evidence
-                self.save(self.status.get('phase', 'dry_run'), excluded_streams=excluded)
+                self.save(self.status.get('phase', 'dry_run'), **{exclusions: excluded})
                 self.step_failed('stream excluded after atomic admission rejection', reason='stream ' + str(sid))
                 return False
             raise
         return True
 
-    def stream_ready(self, sid):
-        return str(sid) not in (self.status.get('excluded_streams') or {})
+    def stream_ready(self, sid, exclusions=FILE_EXCLUSIONS):
+        return str(sid) not in (self.status.get(exclusions) or {})
 
     def query(self, sql, step='catalog query'):
         self.preparer()
@@ -1379,22 +1384,22 @@ class Runner:
         """Read-only per directory-day: held and in-window catalogued clips, delivery path holds."""
         rows = [{'dir': u['relative_dir'], 'd': u['local_date'], 'sid': u['stream_id'], 'tz': self.timezones[u['stream_id']],
                  'ws': self.windows[u['stream_id']][0].isoformat(), 'we': self.windows[u['stream_id']][1].isoformat(),
-                 'names': u.get('names') or []} for u in plan['units']]
+                 'names': u.get('names') or [], 'ke': u['stream_id'] in self.keep_everything} for u in plan['units']]
         encoded = base64.b64encode(json.dumps(rows).encode()).decode()
         prepare = self.preparer()
         # unlive: Keep Everything names whose catalogued clip of the stream is missing, has another size,
         # or has no live R2 counterpart (the preparer's and server's rule).
         return self.query("""WITH u AS (SELECT x->>'dir' dir,(x->>'d')::date d,(x->>'sid')::bigint sid,x->>'tz' tz,
-            (x->>'ws')::timestamptz ws,(x->>'we')::timestamptz we,x->'names' names
+            (x->>'ws')::timestamptz ws,(x->>'we')::timestamptz we,x->'names' names,(x->>'ke')::boolean ke
           FROM jsonb_array_elements(convert_from(decode('""" + encoded + """','base64'),'UTF8')::jsonb) x),
           c AS (SELECT u.dir,u.d,c.id,(c.clip_start_at<u.we AND c.clip_end_at>u.ws) inside FROM u
             JOIN recordings r ON r.account_id=47 AND r.stream_id=u.sid JOIN recording_clips c ON c.recording_id=r.id
             WHERE c.clip_start_at>=u.d::timestamp AT TIME ZONE u.tz AND c.clip_start_at<(u.d+1)::timestamp AT TIME ZONE u.tz
               AND left(c.display_path,length(u.dir)+1)=u.dir||'/' AND strpos(substr(c.display_path,length(u.dir)+2),'/')=0)
           SELECT coalesce(json_agg(json_build_object('relative_dir',u.dir,'local_date',u.d::text,
-            'held',(SELECT count(*) FROM c WHERE c.dir=u.dir AND c.d=u.d AND nas_cleanup_day_clip_held(c.id)),
+            'held',(SELECT count(*) FROM c WHERE c.dir=u.dir AND c.d=u.d AND nas_cleanup_day_clip_held(c.id,u.ke)),
             'overlap',(SELECT count(*) FROM c WHERE c.dir=u.dir AND c.d=u.d AND c.inside),
-            'dir_held',nas_cleanup_day_dir_held(u.dir),
+            'dir_held',nas_cleanup_day_dir_held(u.dir,u.ke),
             'unlive',(SELECT count(*) FROM jsonb_array_elements(u.names) n WHERE NOT EXISTS(SELECT 1 FROM recording_clips c
               JOIN recordings r ON r.id=c.recording_id AND r.account_id=47 AND r.stream_id=u.sid
               WHERE c.display_path=u.dir||'/'||(n->>'name') AND c.size_bytes=(n->>'size_bytes')::bigint AND (""" + prepare.r2_live_raw('c', prepare.R2_BUCKET) + """
@@ -1420,13 +1425,14 @@ class Runner:
         for sid in sorted(self.windows, key=lambda sid: (sid in self.keep_everything, sid)):
             if self.stopped():
                 return None
-            if not self.stream_ready(sid):
+            if not self.stream_ready(sid, DAY_EXCLUSIONS):
                 continue
             prefix = 'kday-' + utcnow().strftime('%Y%m%d-%H%M%S')
             out = self.root / 'day-plans' / (prefix + '-s' + str(sid))
             lister = ['--r2prune', str(R2PRUNE)] if sid in self.keep_everything else []
             if not self.prepare_stream(sid, ['--day-plans', '--max-plans', '1', '--label-prefix', prefix, *lister,
-                                             '--out', str(out), '--api', API, '--submit', '--atomic-admission']):
+                                             '--out', str(out), '--api', API, '--submit', '--atomic-admission'],
+                                     DAY_EXCLUSIONS):
                 continue
             receipts = json.loads((out / 'summary.json').read_text())['receipts']
             if receipts:

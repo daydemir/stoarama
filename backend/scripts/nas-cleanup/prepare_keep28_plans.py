@@ -402,12 +402,12 @@ def day_stream_rows(w, psql, bucket=R2_BUCKET):
     """Every catalogued clip of one stream: path, bounds, held flag, present NAS size (-1 if absent), id,
     catalogued size, live raw R2 key (or null) and when the NAS last reported it; a Keep Everything stream
     also lists its live stitched outputs."""
-    sid = int(w['stream_id'])
+    sid, ke = int(w['stream_id']), 'true' if w['keep_everything'] else 'false'
     outputs = ("""(SELECT coalesce(json_agg(json_build_array(o.object_key,o.size_bytes,o.source_clip_ids)),'[]')
   FROM recordings r JOIN recording_collation_hours h ON h.recording_id=r.id JOIN recording_collation_outputs o ON o.collation_hour_id=h.id
   WHERE r.account_id=47 AND r.stream_id=""" + str(sid) + " AND " + R2_LIVE_OUTPUT + ")") if w['keep_everything'] else "'[]'::json"
     return query("""SELECT json_build_object('clips',(SELECT coalesce(json_agg(json_build_array(c.display_path,c.clip_start_at,c.clip_end_at,
-  nas_cleanup_day_clip_held(c.id),coalesce((SELECT f.size_bytes FROM nas_inventory_files f WHERE f.connection_id=13 AND f.clip_id=c.id
+  nas_cleanup_day_clip_held(c.id,""" + ke + """),coalesce((SELECT f.size_bytes FROM nas_inventory_files f WHERE f.connection_id=13 AND f.clip_id=c.id
    AND f.state='present' AND f.relative_path=c.display_path),-1),c.id,c.size_bytes,CASE WHEN """ + r2_live_raw('c', bucket) + """ THEN c.object_key END,
   (SELECT f.client_updated_at FROM nas_inventory_files f WHERE f.connection_id=13 AND f.clip_id=c.id AND f.relative_path=c.display_path))),'[]')
   FROM recordings r JOIN recording_clips c ON c.recording_id=r.id
@@ -416,7 +416,7 @@ def day_stream_rows(w, psql, bucket=R2_BUCKET):
  'claimed',(SELECT coalesce(json_agg(json_build_array(u.relative_dir,u.local_date::text,u.state,u.names,u.updated_at)),'[]') FROM nas_cleanup_day_units u
   WHERE u.stream_id=""" + str(sid) + """ AND u.state IN ('pending','permitted','deleted')),
  'held_dirs',(SELECT coalesce(json_agg(DISTINCT regexp_replace(h.relative_path,'/[^/]*$','')),'[]')
-  FROM delivery_keep_holds h WHERE h.relative_path<>''),
+  FROM delivery_keep_holds h WHERE """ + ke + """ AND h.relative_path<>''),
  'keep20_active',EXISTS(SELECT 1 FROM nas_media_keep20_epoch WHERE connection_id=13))""", psql)
 
 
