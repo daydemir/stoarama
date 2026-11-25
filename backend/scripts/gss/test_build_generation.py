@@ -17,7 +17,8 @@ BACKEND = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 PARENT_GEN = 'c4049f6dc0f940be8b7eb8b9bef6f42f'
 GEN = 'aa' * 16
 NOW = '2026-11-25T08:28:20.642065Z'
-DAYS = ('2026-07-23', '2026-07-24')
+DAYS = tuple(f'2026-07-{d:02d}' for d in range(10, 24))  # a 14-day window
+OUTPUTS = 4 * len(DAYS) - 1  # two originals x two hours a day, two replaced by one assembly
 RIDS = list(range(301, 350))  # 49 recordings, the validator's minimum
 
 
@@ -30,7 +31,7 @@ def hold_kind(path):
 
 
 class Fixture:
-    """A small, internally consistent parent generation: 49 recordings, 2 days x 2 hours,
+    """A small, internally consistent parent generation: 49 recordings, 14 days x 2 hours,
     two originals per hour, and one assembly replacing the first hour's originals."""
 
     def __init__(self, root):
@@ -46,7 +47,7 @@ class Fixture:
                     t0 = 1784786400.0 + (d * 2 + h) * 3600
                     parts = []
                     for k in range(2):
-                        oid = rid * 100 + d * 4 + h * 2 + k
+                        oid = rid * 1000 + d * 4 + h * 2 + k
                         dur = 1800.0 if k == 0 else 1700.0
                         parts.append([oid, k + 1, dur, k * 1800.0, k * 1800.0 + dur, dur, dur, 0, f'{oid}.mp4', 1, None])
                         ranges[str(oid)] = {'ranges': [[t0 + k * 1800.0, t0 + k * 1800.0 + dur]]}
@@ -55,7 +56,7 @@ class Fixture:
                         if not (d == 0 and h == 0):
                             outputs.append(self.output(rid, p[0], date))
                 days.append({'date': date, 'grade': 'A', 'hours': hours})
-            inputs = [rid * 100, rid * 100 + 1]
+            inputs = [rid * 1000, rid * 1000 + 1]
             asm = dict(self.output(rid, assembly_id(rid), DAYS[0]), replacement_inputs=inputs)
             outputs.insert(0, asm)
             repairs.append({'sha256': asm['sha256'], 'recording_id': rid, 'local_date': DAYS[0], 'seconds': 3500.0,
@@ -64,7 +65,7 @@ class Fixture:
                 files[str(o['id'])] = {'etag': '"e"', 'key': f'joined/g/objects/{o["sha256"]}.mp4', 'path': o['path'],
                                        'recording_id': rid, 'sha256': o['sha256'], 'size_bytes': o['size_bytes'], 'verified': True}
                 paths[str(o['id'])] = o['path']
-            man = {'schema': 2, 'recording_id': rid, 'original_count': 8, 'replaced_original_count': 2,
+            man = {'schema': 2, 'recording_id': rid, 'original_count': OUTPUTS + 1, 'replaced_original_count': 2,
                    'replacement_count': 1, 'outputs': outputs}
             stream = {'id': rid, 'days': days, 'current_download_generation': PARENT_GEN, 'current_download_paths': paths}
             rng = {'id': rid, 'by_output_id': ranges}
@@ -74,18 +75,19 @@ class Fixture:
             objects[f'/public/streams/{rid}.json.gz'] = stream
             objects[f'/public/ranges/{rid}.json'] = rng
             objects[f'/public/ranges/{rid}.json.gz'] = rng
-            md_streams.append({'id': rid, 'timezone': 'Europe/Warsaw', 'source_hours': 4.0, 'excluded_hours': 0.0,
-                               'captured_scheduled_seconds': 14400.0, 'registered_hours': 4, 'missing_registration_hours': 0,
-                               'state_counts': {'nas_parts': 0, 'registered': 4, 'parts': 8, 'multi': 4, 'collated': 4},
+            hours = 2 * len(DAYS)
+            md_streams.append({'id': rid, 'timezone': 'Europe/Warsaw', 'source_hours': float(hours), 'excluded_hours': 0.0,
+                               'captured_scheduled_seconds': hours * 3600.0, 'registered_hours': hours, 'missing_registration_hours': 0,
+                               'state_counts': {'nas_parts': 0, 'registered': hours, 'parts': 2 * hours, 'multi': hours, 'collated': hours},
                                'largest_gap_seconds': 100.0, 'current_download_generation': PARENT_GEN, 'sha256': ''})
-            readiness[str(rid)] = {'recording_id': rid, 'scheduled_slots': 4, 'manifest_present_slots': 4,
-                                   'captured_scheduled_seconds': 14400.0, 'length_thresholds': {},
+            readiness[str(rid)] = {'recording_id': rid, 'scheduled_slots': hours, 'manifest_present_slots': hours,
+                                   'captured_scheduled_seconds': hours * 3600.0, 'length_thresholds': {},
                                    'captured_without_registered_output_union_seconds': 0.0,
                                    'delivery_state': 'all_scheduled_manifests_present'}
-            counts[str(rid)] = {'files': 7}
+            counts[str(rid)] = {'files': OUTPUTS}
             cat_streams.append({'id': rid, 'available_start': DAYS[0],
-                                'weekly_exports': {'available': {'weeks': [{'number': 1, 'start': DAYS[0], 'end': DAYS[1]}]}}})
-        summary = {'scheduled_hours': 4 * len(RIDS), 'nas_receipted_parts': 0}
+                                'weekly_exports': {'available': {'weeks': [{'number': 1, 'start': DAYS[0], 'end': DAYS[-1]}]}}})
+        summary = {'scheduled_hours': 2 * len(DAYS) * len(RIDS), 'nas_receipted_parts': 0}
         objects['/public/metadata.json'] = {'streams': md_streams, 'summary': dict(summary)}
         objects['/public/readiness.json'] = {'by_recording_id': readiness, 'summary': dict(summary)}
         objects['/public/growth.json'] = {'repairs': repairs, 'current_stream_counts': counts, 'generation': PARENT_GEN,
@@ -131,16 +133,16 @@ class Fixture:
         body = b.dumps(o)
         return gzip.compress(body, mtime=0) if path.endswith('.gz') else body
 
-    def build(self, present, out):
-        store = b.AssetStore(self.parent['assets'], self.assets_dir)
-        return b.build(self.parent, store, present, self.holds, GEN, NOW, 'note', out)
+    def build(self, present, out, best14=None):
+        store = b.AssetStore(self.parent, self.assets_dir)
+        return b.build(self.parent, store, present, self.holds, GEN, NOW, 'note', out, best14)
 
 
 class SyntheticBuildTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.fx = Fixture(self.tmp)
-        self.store = b.AssetStore(self.fx.parent['assets'], self.fx.assets_dir)
+        self.store = b.AssetStore(self.fx.parent, self.fx.assets_dir)
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
@@ -174,17 +176,17 @@ class SyntheticBuildTests(unittest.TestCase):
         self.assertEqual(set(stream['current_download_paths']), {k for k in present if reg['files'][k]['recording_id'] == gone})
         man = self.object(out, reg, f'/public/manifests/{gone}.json')
         self.assertEqual(man, self.object(out, reg, f'/api/coverage-delivery/manifest?stream={gone}&scope=available'))
-        self.assertEqual((man['original_count'], man['replacement_count'], len(man['outputs'])), (6, 0, 6))
+        self.assertEqual((man['original_count'], man['replacement_count'], len(man['outputs'])), (OUTPUTS - 1, 0, OUTPUTS - 1))
 
         # A kept assembly keeps its replaced originals on the timeline.
         kept = self.object(out, reg, f'/public/streams/{RIDS[2]}.json')
         self.assertEqual(reg['assets'][f'/public/streams/{RIDS[2]}.json'], self.fx.parent['assets'][f'/public/streams/{RIDS[2]}.json'])
-        self.assertEqual([p[0] for p in kept['days'][0]['hours'][0][9]], [RIDS[2] * 100, RIDS[2] * 100 + 1])
+        self.assertEqual([p[0] for p in kept['days'][0]['hours'][0][9]], [RIDS[2] * 1000, RIDS[2] * 1000 + 1])
 
         # A zero-file recording uses the page's disabled state.
         md = {s['id']: s for s in self.object(out, reg, '/public/metadata.json')['streams']}
         rd = self.object(out, reg, '/public/readiness.json')['by_recording_id']
-        self.assertEqual((md[empty]['parts'], md[empty]['registered_hours'], md[empty]['missing_registration_hours']), (0, 0, 4))
+        self.assertEqual((md[empty]['parts'], md[empty]['registered_hours'], md[empty]['missing_registration_hours']), (0, 0, 2 * len(DAYS)))
         self.assertEqual(rd[str(empty)]['delivery_state'], 'awaiting_verified_outputs')
         self.assertEqual(rd[str(gone)]['delivery_state'], 'partial_registered_delivery')
         self.assertEqual(md[empty]['current_download_generation'], GEN)
@@ -202,9 +204,16 @@ class SyntheticBuildTests(unittest.TestCase):
             self.assertEqual(reg['assets'][p], self.fx.parent['assets'][p])
         self.check_objects(out, reg)
 
+        # Rebuilt from the same base as a child of that generation: every key is already published.
+        again = self.out('again')
+        b.build(reg, self.store, present, self.fx.holds, GEN, NOW, 'note', again)
+        self.assertEqual(b.read_registry(os.path.join(again, 'registry.json.gz'))['assets'], reg['assets'])
+        self.assertEqual(Path(again, 'uploads.tsv').read_text(), '\t'.join(b.UPLOAD_COLUMNS) + '\n')
+        self.assertEqual(Path(again, 'holds.tsv').read_text(), '\t'.join(b.HOLD_COLUMNS) + '\n')
+
     def check_objects(self, out, reg):
-        uploads = json.loads(Path(os.path.join(out, 'uploads.json')).read_text())
-        holds = json.loads(Path(os.path.join(out, 'holds.json')).read_text())
+        uploads = b.read_tsv(os.path.join(out, 'uploads.tsv'), b.UPLOAD_COLUMNS)
+        holds = b.read_tsv(os.path.join(out, 'holds.tsv'), b.HOLD_COLUMNS)
         parent_holds = {h['object_key']: h for h in self.fx.holds}
         by_key = {o['key']: (p, o) for p, o in reg['assets'].items()}
         self.assertEqual([u['key'] for u in uploads], [h['object_key'] for h in holds])
@@ -213,12 +222,13 @@ class SyntheticBuildTests(unittest.TestCase):
             body = Path(os.path.join(out, u['local_path'])).read_bytes()
             path, o = by_key[u['key']]
             self.assertEqual(u['key'], b.ASSET_PREFIX + hashlib.sha256(body).hexdigest() + '/' + u['key'].rsplit('/', 1)[1])
-            self.assertEqual((u['sha256'], u['size_bytes'], u['etag'], u['content_type']),
+            self.assertEqual((u['sha256'], int(u['size_bytes']), u['etag'], u['content_type']),
                              (o['sha256'], len(body), hashlib.md5(body).hexdigest(), self.fx.parent['assets'][path]['content_type']))
             self.assertEqual(o['etag'], '"' + u['etag'] + '"')
             old = parent_holds[self.fx.parent['assets'][path]['key']]
-            self.assertEqual(h, {'bucket': 'stoarama', 'object_key': u['key'], 'etag': u['etag'], 'size_bytes': len(body),
-                                 'recording_id': old['recording_id'], 'kind': old['kind'], 'sha256': u['sha256'],
+            self.assertEqual(h, {'bucket': 'stoarama', 'object_key': u['key'], 'etag': u['etag'], 'size_bytes': str(len(body)),
+                                 'recording_id': '\\N' if old['recording_id'] is None else str(old['recording_id']),
+                                 'kind': old['kind'], 'sha256': u['sha256'],
                                  'relative_path': old['relative_path']})
 
     def test_day_selection(self):
@@ -232,16 +242,42 @@ class SyntheticBuildTests(unittest.TestCase):
         self.assertEqual(self.fx.build(present, out)['changed_recordings'], [rid])
         reg = b.read_registry(os.path.join(out, 'registry.json.gz'))
         stream = self.object(out, reg, f'/public/streams/{rid}.json')
-        self.assertEqual([h[0] for h in stream['days'][0]['hours']], ['missing_output', 'missing_output'])
-        self.assertEqual([h[0] for h in stream['days'][1]['hours']], ['collated', 'collated'])
+        self.assertEqual([[h[0] for h in d['hours']] for d in stream['days']],
+                         [['collated'] * 2 if d == DAYS[1] else ['missing_output'] * 2 for d in DAYS])
         man = self.object(out, reg, f'/public/manifests/{rid}.json')
         self.assertEqual({o['local_date'] for o in man['outputs']}, {DAYS[1]})
         self.check_objects(out, reg)
 
         with self.assertRaisesRegex(SystemExit, 'not on its timeline'):
-            b.select_days(self.fx.parent, self.store, {(rid, '2026-08-01')})
+            b.select_days(self.fx.parent, self.store, {(rid, '2026-08-30')})
         with self.assertRaisesRegex(SystemExit, 'not in the parent registry'):
             b.select_days(self.fx.parent, self.store, {(999, DAYS[0])})
+
+    def test_best14_availability(self):
+        full, missing, unstitched, shifted, quiet = RIDS[:5]
+        best14 = {r: {(d, 'R') for d in DAYS} for r in RIDS}
+        best14[unstitched] = {(d, 'S' if i < 3 else 'R') for i, d in enumerate(DAYS)}
+        best14[shifted] = {(f'2026-07-{d:02d}', 'R') for d in range(11, 25)}
+        best14[quiet] = {(d, '.' if i == 5 else 'R') for i, d in enumerate(DAYS)}
+        drop = str(missing * 1000 + 9)
+        present = set(self.fx.parent['files']) - {drop}
+        summary = self.fx.build(present, self.out('best14'), best14)
+        self.assertEqual(summary['availability'], {'available': len(RIDS) - 3, 'partial': 3})
+        reg = b.read_registry(os.path.join(self.out('best14'), 'registry.json.gz'))
+        md = {s['id']: s for s in self.object(self.out('best14'), reg, '/public/metadata.json')['streams']}
+        pick = lambda s: (s['availability'], s['best14_start'], s['best14_end'], s['best14_days_ready'])  # noqa: E731
+        self.assertEqual(pick(md[full]), ('available', DAYS[0], DAYS[-1], 14))
+        self.assertEqual(pick(md[quiet]), ('available', DAYS[0], DAYS[-1], 14))
+        self.assertEqual(pick(md[missing]), ('partial', DAYS[0], DAYS[-1], 14))  # a part is gone from R2
+        self.assertEqual(pick(md[unstitched]), ('partial', DAYS[0], DAYS[-1], 11))
+        self.assertEqual(pick(md[shifted]), ('partial', '2026-07-11', '2026-07-24', 14))  # window is not the timeline
+        # Partial streams still serve every selected file.
+        self.assertEqual(set(reg['files']), present)
+        go_validate(self, os.path.join(self.out('best14'), 'registry.json.gz'))
+
+        best14[full] = set(list(best14[full])[:13])
+        with self.assertRaisesRegex(SystemExit, 'needs 14 days'):
+            self.fx.build(present, self.out('short'), best14)
 
     def test_fails_fast(self):
         with self.assertRaisesRegex(SystemExit, 'not in the parent registry'):
@@ -257,15 +293,22 @@ class SyntheticBuildTests(unittest.TestCase):
     def test_cli_and_server_validator(self):
         days = os.path.join(self.tmp, 'days.tsv')
         with open(days, 'w') as f:
-            f.write('recording_id\tstream_id\tlocal_date\n')
-            f.writelines(f'{r}\t1\t{DAYS[0]}\n' for r in RIDS[:-1])
+            f.write('recording_id\tstream_id\tlocal_date\tday_stitched\n')
+            f.writelines(f'{r}\t1\t{d}\tR\n' for r in RIDS for d in DAYS if r != RIDS[-1] or d == DAYS[0])
+        best14 = os.path.join(self.tmp, 'best14.tsv')
+        with open(best14, 'w') as f:
+            f.write('recording_id\tstream_id\tlocal_date\tday_stitched\n')
+            f.writelines(f'{r}\t1\t{d}\tR\n' for r in RIDS for d in DAYS)
         out = self.out('cli')
         subprocess.run([sys.executable, '-I', os.path.join(BACKEND, 'scripts', 'gss', 'build_generation.py'),
-                        '--parent', self.fx.registry_path, '--assets', self.fx.assets_dir, '--parent-holds', self.fx.holds_path,
+                        '--parent', self.fx.registry_path, '--base', self.fx.registry_path, '--assets', self.fx.assets_dir,
+                        '--base-holds', self.fx.holds_path, '--best14', best14,
                         '--days', days, '--note', 'cli', '--out', out], check=True, stdout=subprocess.DEVNULL)
         reg = b.read_registry(os.path.join(out, 'registry.json.gz'))
         self.assertEqual(len(bytes.fromhex(reg['generation'])), 16)
-        self.assertEqual({v['recording_id'] for v in reg['files'].values()}, set(RIDS[:-1]))
+        self.assertEqual({v['recording_id'] for v in reg['files'].values()}, set(RIDS))
+        md = {s['id']: s['availability'] for s in self.object(out, reg, '/public/metadata.json')['streams']}
+        self.assertEqual((md[RIDS[0]], md[RIDS[-1]]), ('available', 'partial'))
         self.check_objects(out, reg)
         go_validate(self, os.path.join(out, 'registry.json.gz'))
 
@@ -315,7 +358,7 @@ class RegressionTests(unittest.TestCase):
     def test_reproduces_live_generation_bytes(self):
         parent = b.read_registry(os.path.join(REGRESSION, 'gen.json.gz'))
         live = b.read_registry(os.path.join(REGRESSION, 'gen2.json.gz'))
-        store = b.AssetStore(parent['assets'], os.path.join(REGRESSION, 'assets'))
+        store = b.AssetStore(parent, os.path.join(REGRESSION, 'assets'))
         out = os.path.join(self.tmp, 'gen')
         b.build(parent, store, b.select_files(parent, list(parent['files'])), self.holds(parent),
                 live['generation'], live['created_at'], live['publication_note'], out)
@@ -336,7 +379,7 @@ class RegressionTests(unittest.TestCase):
     def test_full_file_set_rebuilds_parent(self):
         """With every file of c4049f6d and its own id, each recomputed field equals the published one."""
         parent = b.read_registry(os.path.join(REGRESSION, 'current.json'))
-        store = b.AssetStore(parent['assets'], os.path.join(REGRESSION, 'assets'))
+        store = b.AssetStore(parent, os.path.join(REGRESSION, 'assets'))
         gr = store.load('/public/growth.json')
         out, changed = b.rebuild(store, parent['recording_ids'], set(parent['files']), gr['generation'], gr['published_at'])
         self.assertEqual(changed, set())

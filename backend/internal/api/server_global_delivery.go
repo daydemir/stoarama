@@ -129,8 +129,11 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 			return nil, errors.New("public cleanup fence unavailable")
 		}
 		if fenced {
-			// Footage still present after the Nov 2026 wind-down (Deniz, Nov 25: "cna you bring back the global street scores delivery page up now with the streams that it still has now?").
-			const reviewed = "cb33e28ca1c6cbd3444fb937f4bbe233"
+			// Footage still present after the Nov 2026 wind-down, marked available or partial
+			// for each stream's best 14 days (Deniz, Nov 25: "let's make it so delivery page shows
+			// the 14 day periods right now where we have their best overall 14 day periods fully
+			// stitched and availble on r2"). Built by backend/scripts/gss/build_generation.py.
+			const reviewed = "ae14e746468c5c6402cd6f8ca55aca6e"
 			if generation != "" && generation != reviewed {
 				return nil, errors.New("public publication deferred during NAS cleanup")
 			}

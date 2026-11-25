@@ -1,27 +1,39 @@
-"""Build a Global Street Scores (GSS) public delivery generation from a parent one.
+"""Build a Global Street Scores (GSS) public delivery generation.
 
-Reads a parent public registry, its asset bodies (a local mirror laid out by R2
-key) and a file selection, then writes into a new, empty output directory:
+Rebuilds every page asset of a base generation for a file selection, marks each
+stream available or partial for its best 14 days, and writes into a new, empty
+output directory:
 
   registry.json.gz   the new public registry (gzip, deterministic)
   objects/<key>      every new content-addressed asset body, laid out by R2 key
-  uploads.json       [{key, local_path, sha256, size_bytes, content_type, etag}]
-  holds.json         delivery_keep_holds rows to insert before publication
+  uploads.tsv        key, local_path, sha256, size_bytes, content_type, etag
+  holds.tsv          delivery_keep_holds rows to insert (psql \\copy ... WITH (FORMAT text, HEADER))
   summary.json       counts plus the known-stale fields this build does not recompute
 
 It never uploads and never writes the database. The controller uploads each
-uploads.json entry create-only (If-None-Match: *) and checks the returned ETag
+uploads.tsv row create-only (If-None-Match: *) and checks the returned ETag
 equals the listed one (R2's single-part ETag is the body MD5), inserts
-holds.json, then publishes registry.json.gz as public/generations/<id>.json and
-public/current.json.
+holds.tsv, then publishes registry.json.gz as public/generations/<id>.json and
+public/current.json. A key already in the parent registry is neither uploaded
+nor held again.
+
+--parent is the generation being replaced: the new registry keeps its top-level
+fields and lists the selected subset of its files. --base is the generation
+whose asset bodies are rebuilt; its timelines and manifests must still list
+every file (for a plain filter of the live generation, pass it as both).
 
 Selection is either --files (one parent file id per line) or --days (a TSV
-whose header has recording_id and local_date columns, e.g. best14-days.tsv).
-A day selects every parent file whose manifest output has that recording_id and
-local_date; local_date is the stream-timezone date the manifests and stream
-timelines already carry.
+whose header has recording_id and local_date columns). A day selects every
+parent file whose manifest output has that recording_id and local_date;
+local_date is the stream-timezone date the manifests and timelines carry.
 
---parent-holds is the parent's asset holds, exported read-only:
+--best14 is best14-days.tsv (recording_id, local_date, day_stitched; 14 rows per
+recording). day_stitched R means every captured hour is stitched in R2 and .
+means no capture. A stream is "available" when all 14 days are R or ., its
+base timeline covers exactly those days, and every captured hour keeps all its
+base parts; otherwise it is "partial" and serves what is selected.
+
+--base-holds is the base asset holds, exported read-only:
   psql -At -c "SELECT json_agg(json_build_object('object_key',object_key,
     'kind',kind,'recording_id',recording_id,'relative_path',relative_path))
     FROM delivery_keep_holds WHERE bucket='stoarama'
@@ -31,6 +43,7 @@ import argparse
 import copy
 import csv
 import datetime
+import enum
 import gzip
 import hashlib
 import json
@@ -42,6 +55,16 @@ from pathlib import Path
 ASSET_PREFIX = 'datasets/global-street-scores-delivery/47/assets/'
 BUCKET = 'stoarama'
 MAX_ASSET_BYTES = 64 << 20
+
+READY_DAY_CODES = frozenset('R.')
+DAY_CODES = frozenset('RNSs.')
+NO_CAPTURE_STATES = frozenset({'gap_only', 'quarantine_only'})
+
+
+class Availability(str, enum.Enum):
+    AVAILABLE = 'available'
+    PARTIAL = 'partial'
+
 
 # Assets this builder carries over byte for byte: they do not list files.
 UNTOUCHED_ASSETS = ('/download-script.py', '/public/images.json', '/public/blue-observations.json')
@@ -74,8 +97,9 @@ KNOWN_STALE_FIELDS = (
 class AssetStore:
     """Parses parent asset bodies from a local mirror laid out by R2 key."""
 
-    def __init__(self, assets, assets_dir):
-        self.assets = assets
+    def __init__(self, registry, assets_dir):
+        self.assets = registry['assets']
+        self.recording_ids = registry['recording_ids']
         self.dir = assets_dir
 
     def raw(self, path):
@@ -325,10 +349,38 @@ def select_days(parent, store, days):
     return present
 
 
-def build(parent, store, present, holds, gen_id, now, note, out_dir):
-    """Write the generation into out_dir (must not exist). Returns the summary."""
+def annotate_availability(out, store, best14):
+    """Set availability, best14_start, best14_end and best14_days_ready on each metadata stream."""
+    counts = {a: 0 for a in Availability}
+    for s in out['/public/metadata.json']['streams']:
+        rid = s['id']
+        days = sorted(best14[rid])
+        if len(days) != 14:
+            raise SystemExit(f'recording {rid}: best14 needs 14 days, got {len(days)}')
+        dates = [d for d, _ in days]
+        ready = sum(code in READY_DAY_CODES for _, code in days)
+        base = store.load(f'/public/streams/{rid}.json')['days']
+        new = out[f'/public/streams/{rid}.json']['days']
+        served = [d['date'] for d in base] == dates and all(
+            h[1] == 0 or h[0] in NO_CAPTURE_STATES or (h[0] == 'collated' and n[9] == h[9])
+            for bd, nd in zip(base, new) for h, n in zip(bd['hours'], nd['hours']))
+        a = Availability.AVAILABLE if ready == 14 and served else Availability.PARTIAL
+        s.update(availability=a.value, best14_start=dates[0], best14_end=dates[-1], best14_days_ready=ready)
+        counts[a] += 1
+    return {a.value: n for a, n in counts.items()}
+
+
+def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None):
+    """Write the generation into out_dir (must not exist). Returns the summary.
+
+    store holds the base assets. best14=None skips availability (only to
+    reproduce generations built before it existed)."""
+    if store.recording_ids != parent['recording_ids']:
+        raise SystemExit('base and parent recordings differ')
     assets = store.assets
     out, changed = rebuild(store, parent['recording_ids'], present, gen_id, now)
+    availability = annotate_availability(out, store, best14) if best14 is not None else None
+    published = {o['key'] for o in parent['assets'].values()}
     hold_by_key = {h['object_key']: h for h in holds}
     new_assets = copy.deepcopy(assets)
     uploads = {}
@@ -351,9 +403,12 @@ def build(parent, store, present, holds, gen_id, now, note, out_dir):
         etag = hashlib.md5(body).hexdigest()
         name = 'manifest' if p.startswith('/api/') else p.rsplit('/', 1)[1]
         key = ASSET_PREFIX + sha + '/' + name
+        new_assets[p] = dict(assets[p], etag=f'"{etag}"', key=key, sha256=sha, size_bytes=len(body), verified=True)
+        if key in published:
+            continue
         replaced = hold_by_key.get(assets[p]['key'])
         if replaced is None:
-            raise SystemExit(f'no delivery_keep_holds row for the parent asset {p} ({assets[p]["key"]})')
+            raise SystemExit(f'no delivery_keep_holds row for the base asset {p} ({assets[p]["key"]})')
         hold = {'bucket': BUCKET, 'object_key': key, 'etag': etag, 'size_bytes': len(body),
                 'recording_id': replaced['recording_id'], 'kind': replaced['kind'], 'sha256': sha,
                 'relative_path': replaced['relative_path']}
@@ -363,7 +418,6 @@ def build(parent, store, present, holds, gen_id, now, note, out_dir):
         os.makedirs(os.path.dirname(local), exist_ok=True)
         with open(local, 'wb') as f:
             f.write(body)
-        new_assets[p] = dict(assets[p], etag=f'"{etag}"', key=key, sha256=sha, size_bytes=len(body), verified=True)
         uploads[key] = {'key': key, 'local_path': os.path.join('objects', key), 'sha256': sha,
                         'size_bytes': len(body), 'content_type': assets[p]['content_type'], 'etag': etag}
     files = {k: v for k, v in parent['files'].items() if k in present}
@@ -371,16 +425,41 @@ def build(parent, store, present, holds, gen_id, now, note, out_dir):
                     publication_note=note, assets=new_assets, files=files)
     with open(os.path.join(out_dir, 'registry.json.gz'), 'wb') as f:
         f.write(gzip.compress(dumps(registry), compresslevel=9, mtime=0))
-    write_json(os.path.join(out_dir, 'uploads.json'), sorted(uploads.values(), key=lambda u: u['key']))
-    write_json(os.path.join(out_dir, 'holds.json'), sorted(new_holds.values(), key=lambda h: h['object_key']))
+    write_tsv(os.path.join(out_dir, 'uploads.tsv'), UPLOAD_COLUMNS, [uploads[k] for k in sorted(uploads)])
+    write_tsv(os.path.join(out_dir, 'holds.tsv'), HOLD_COLUMNS, [new_holds[k] for k in sorted(new_holds)])
     summary = {
         'generation': gen_id, 'parent_generation': parent['generation'], 'created_at': now,
         'files': len(files), 'recordings_with_files': len({v['recording_id'] for v in files.values()}),
         'changed_recordings': sorted(changed), 'assets_replaced': sum(new_assets[p] != assets[p] for p in assets),
-        'objects': len(uploads), 'known_stale_fields': list(KNOWN_STALE_FIELDS),
+        'objects': len(uploads), 'availability': availability,
+        'bytes_served': sum(v['size_bytes'] for v in files.values()), 'known_stale_fields': list(KNOWN_STALE_FIELDS),
     }
     write_json(os.path.join(out_dir, 'summary.json'), summary)
     return summary
+
+
+UPLOAD_COLUMNS = ('key', 'local_path', 'sha256', 'size_bytes', 'content_type', 'etag')
+HOLD_COLUMNS = ('bucket', 'object_key', 'etag', 'size_bytes', 'recording_id', 'kind', 'sha256', 'relative_path')
+
+
+def write_tsv(path, columns, rows):
+    """PostgreSQL text-format COPY rows with a header; NULL is \\N."""
+    def cell(v):
+        v = '\\N' if v is None else str(v)
+        if any(c in v for c in '\t\n\r') or (v.count('\\') and v != '\\N'):
+            raise SystemExit(f'{path}: value needs COPY escaping: {v!r}')
+        return v
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\t'.join(columns) + '\n')
+        f.writelines('\t'.join(cell(r[c]) for c in columns) + '\n' for r in rows)
+
+
+def read_tsv(path, columns):
+    with open(path, newline='', encoding='utf-8') as f:
+        rows = list(csv.DictReader(f, delimiter='\t'))
+    if not rows or not set(columns) <= set(rows[0]):
+        raise SystemExit(f'{path}: need a TSV header with {", ".join(columns)}')
+    return rows
 
 
 def write_json(path, o):
@@ -396,14 +475,21 @@ def read_registry(path):
 
 
 def read_days(path):
-    with open(path, newline='', encoding='utf-8') as f:
-        rows = list(csv.DictReader(f, delimiter='\t'))
-    if not rows or not {'recording_id', 'local_date'} <= set(rows[0]):
-        raise SystemExit(f'{path}: need a TSV header with recording_id and local_date')
-    days = {(int(r['recording_id']), r['local_date']) for r in rows}
+    days = {(int(r['recording_id']), r['local_date']) for r in read_tsv(path, ('recording_id', 'local_date'))}
     for _, d in days:
         datetime.date.fromisoformat(d)
     return days
+
+
+def read_best14(path):
+    best14 = {}
+    for r in read_tsv(path, ('recording_id', 'local_date', 'day_stitched')):
+        code = r['day_stitched']
+        if code not in DAY_CODES:
+            raise SystemExit(f'{path}: unknown day_stitched {code!r}')
+        datetime.date.fromisoformat(r['local_date'])
+        best14.setdefault(int(r['recording_id']), set()).add((r['local_date'], code))
+    return best14
 
 
 def read_lines(path):
@@ -413,9 +499,11 @@ def read_lines(path):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--parent', required=True, help='parent public registry (.json or .json.gz)')
-    ap.add_argument('--assets', required=True, help='directory holding the parent asset bodies at their R2 keys')
-    ap.add_argument('--parent-holds', required=True, help='JSON array of the parent asset delivery_keep_holds rows')
+    ap.add_argument('--parent', required=True, help='public registry being replaced (.json or .json.gz)')
+    ap.add_argument('--base', required=True, help='registry whose assets are rebuilt (.json or .json.gz)')
+    ap.add_argument('--assets', required=True, help='directory holding the base asset bodies at their R2 keys')
+    ap.add_argument('--base-holds', required=True, help='JSON array of the base asset delivery_keep_holds rows')
+    ap.add_argument('--best14', required=True, help='best14-days.tsv')
     sel = ap.add_mutually_exclusive_group(required=True)
     sel.add_argument('--files', help='file with one selected parent file id per line')
     sel.add_argument('--days', help='TSV with recording_id and local_date columns')
@@ -423,12 +511,12 @@ def main(argv=None):
     ap.add_argument('--out', required=True, help='output directory (must not exist)')
     a = ap.parse_args(argv)
     parent = read_registry(a.parent)
-    store = AssetStore(parent['assets'], a.assets)
+    store = AssetStore(read_registry(a.base), a.assets)
     present = select_files(parent, read_lines(a.files)) if a.files else select_days(parent, store, read_days(a.days))
-    with open(a.parent_holds, encoding='utf-8') as f:
+    with open(a.base_holds, encoding='utf-8') as f:
         holds = json.load(f)
     now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-    summary = build(parent, store, present, holds, secrets.token_hex(16), now, a.note, a.out)
+    summary = build(parent, store, present, holds, secrets.token_hex(16), now, a.note, a.out, read_best14(a.best14))
     print(json.dumps({k: v for k, v in summary.items() if k != 'known_stale_fields'}, indent=1))
 
 
