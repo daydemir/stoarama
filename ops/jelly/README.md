@@ -118,3 +118,11 @@ do not write test picks into the owner's live file. On 2026-11-11 that file was
 absent, so preserve absence and use an isolated Jelly handler for the round-trip.
 
 R2 retirement on providers without conditional DELETE: see [HEAD-guard authority, writer inventory and residual race](r2-retire/HEAD-GUARD.md). Planning, probe evidence and writer drain must be reviewed separately; this runbook does not authorize production deletes.
+
+## Manual R2 prune deletes
+
+Never run `~/stoarama-r2prune-lane/r2prune delete` by hand. Run it through
+[`r2prune/manual_apply.py`](r2prune/README.md), which refuses keys without a
+catalog receipt identity, preflights the receipt path, and writes every
+acknowledged delete's `r2_object_retirements` receipt in the same invocation,
+failing closed if that write fails.
