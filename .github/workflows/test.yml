@@ -374,6 +374,13 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./cmd/stoaramactl -run TestMeterReportLedgerFailsClosedOnAmbiguousRetry -count=1
+      - name: Test clock-join OCR seams, kept audio and create-only outputs
+        env:
+          FFMPEG_BIN: ${{ github.workspace }}/backend/bin/ffmpeg
+          FFPROBE_BIN: ${{ github.workspace }}/backend/bin/ffprobe
+        run: |
+          sudo apt-get update && sudo apt-get install --no-install-recommends -y tesseract-ocr
+          go test ./internal/clockjoin -count=1 -v
       - name: Test
         run: go test ./...
       - name: Test recordings detail browser resilience

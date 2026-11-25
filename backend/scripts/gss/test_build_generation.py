@@ -133,9 +133,9 @@ class Fixture:
         body = b.dumps(o)
         return gzip.compress(body, mtime=0) if path.endswith('.gz') else body
 
-    def build(self, present, out, best14=None):
+    def build(self, present, out, best14=None, added=()):
         store = b.AssetStore(self.parent, self.assets_dir)
-        return b.build(self.parent, store, present, self.holds, GEN, NOW, 'note', out, best14)
+        return b.build(self.parent, store, present, self.holds, GEN, NOW, 'note', out, best14, added)
 
 
 class SyntheticBuildTests(unittest.TestCase):
@@ -295,6 +295,83 @@ class SyntheticBuildTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, 'listed by more than one file'):
             self.fx.build(set(self.fx.parent['files']), self.out('duppath'))
         self.assertFalse(os.path.exists(self.out('duppath')))
+
+    def clock_dir(self, name, rid, inputs, path, sha='c' * 64):
+        """A clock-join output directory holding one assembly over inputs."""
+        d = os.path.join(self.tmp, name)
+        video, proof = b'mp4' + sha.encode(), b'{"proof":1}'
+        key, proof_key = f'joined/clock-prestitch-20261126/objects/{sha}.mp4', f'joined/clock-prestitch-20261126/proofs/{sha}.json'
+        for k, body in ((key, video), (proof_key, proof)):
+            os.makedirs(os.path.dirname(os.path.join(d, k)), exist_ok=True)
+            Path(d, k).write_bytes(body)
+        ann = {'scope': 'boundary', 'method': 'CLOCK_20', 'status': 'verified', 'artifact_sha256': sha,
+               'proof_sha256': hashlib.sha256(proof).hexdigest(), 'source_input_ids': inputs[:2], 'maximum_relative_fps_error': 0.05}
+        a = {'sha256': sha, 'size_bytes': len(video), 'etag': hashlib.md5(video).hexdigest(), 'key': key, 'proof_key': proof_key,
+             'proof_sha256': hashlib.sha256(proof).hexdigest(), 'proof_size_bytes': len(proof), 'proof_etag': hashlib.md5(proof).hexdigest(),
+             'recording_id': rid, 'local_date': DAYS[1], 'hour': 1, 'seconds': 3500.0,
+             'media_seconds_measurement': 'verified_native_video_presentation_span', 'input_ids': inputs, 'input_parts': len(inputs),
+             'parts_reduced': len(inputs) - 1, 'path': path, 'kind': 'clock', 'production_version': 'clock-prestitched',
+             'clock_boundary_annotations': [ann], 'audio_packets': 10, 'original_source_audio_present': True,
+             'temporary_no_audio': False, 'audio_delivery_status': 'original_audio_stream_copied'}
+        os.makedirs(os.path.join(d, 'results'))
+        Path(d, 'results', 'h.json').write_text(json.dumps({'assemblies': [a]}))
+        return d
+
+    def test_clock_assemblies(self):
+        rid = RIDS[3]
+        inputs = [rid * 1000 + 4, rid * 1000 + 5]  # day 1, hour 0: both originals
+        path = self.fx.parent['files'][str(inputs[0])]['path']
+        added = b.read_clock_assemblies([self.clock_dir('clock-join', rid, inputs, path)])
+        out = self.out('clock')
+        summary = self.fx.build(set(self.fx.parent['files']), out, added=added)
+        self.assertEqual(summary['clock_assemblies'], 1)
+        reg = b.read_registry(os.path.join(out, 'registry.json.gz'))
+        aid = 'sha256:' + 'c' * 64
+        self.assertEqual(reg['files'][aid], {'etag': '"' + added[0]['etag'] + '"', 'key': added[0]['key'], 'path': path,
+                                             'recording_id': rid, 'sha256': 'c' * 64, 'size_bytes': added[0]['size_bytes'], 'verified': True})
+        self.assertFalse({str(i) for i in inputs} & set(reg['files']))
+        man = self.object(out, reg, f'/public/manifests/{rid}.json')
+        self.assertEqual([o['replacement_inputs'] for o in man['outputs'] if o['id'] == aid], [inputs])
+        self.assertEqual((man['replacement_count'], man['replaced_original_count']), (2, 4))
+        stream = self.object(out, reg, f'/public/streams/{rid}.json')
+        self.assertEqual([p[0] for p in stream['days'][1]['hours'][0][9]], inputs)  # inputs stay on the timeline
+        self.assertEqual(stream['current_download_paths'][aid], path)
+        gr = self.object(out, reg, '/public/growth.json')
+        rep = [r for r in gr['repairs'] if r['sha256'] == 'c' * 64]
+        self.assertEqual(len(rep), 1)
+        self.assertEqual((rep[0]['production_version'], rep[0]['input_ids'], rep[0]['file_url'], rep[0]['collections']),
+                         ('clock-prestitched', inputs, '/api/v1/global-street-scores-delivery/file/' + aid, ['available']))
+        self.assertEqual(gr['production_model_counts']['clock-prestitched'], 1)
+        self.assertEqual(gr['current_stream_counts'][str(rid)]['current_assemblies'], 2)
+        uploads = {u['key']: u for u in b.read_tsv(os.path.join(out, 'uploads.tsv'), b.UPLOAD_COLUMNS)}
+        holds = {h['object_key']: h for h in b.read_tsv(os.path.join(out, 'holds.tsv'), b.HOLD_COLUMNS)}
+        for key, kind, ctype in ((added[0]['key'], 'video_assembly', 'video/mp4'), (added[0]['proof_key'], 'clock_proof', 'application/json')):
+            body = Path(out, uploads[key]['local_path']).read_bytes()
+            self.assertEqual((uploads[key]['etag'], uploads[key]['content_type']), (hashlib.md5(body).hexdigest(), ctype))
+            self.assertEqual((holds[key]['kind'], holds[key]['etag'], holds[key]['recording_id']), (kind, uploads[key]['etag'], str(rid)))
+        self.assertEqual(holds[added[0]['key']]['relative_path'], path)
+        self.assertEqual(b.read_tsv(os.path.join(out, 'dependencies.tsv'), b.DEPENDENCY_COLUMNS),
+                         [{'output_id': str(i), 'recording_id': str(rid)} for i in inputs])
+        go_validate(self, os.path.join(out, 'registry.json.gz'))
+
+    def test_clock_assemblies_fail_fast(self):
+        rid = RIDS[3]
+        everything = set(self.fx.parent['files'])
+        replaced = [rid * 1000, rid * 1000 + 1]  # already replaced by the fixture's V85 assembly
+        added = b.read_clock_assemblies([self.clock_dir('taken', rid, replaced, 'x')])
+        with self.assertRaisesRegex(SystemExit, 'already replaced'):
+            self.fx.build(everything, self.out('taken-out'), added=added)
+        inputs = [rid * 1000 + 4, rid * 1000 + 5]
+        other = self.fx.parent['files'][str(rid * 1000 + 6)]['path']  # a file still delivered
+        added = b.read_clock_assemblies([self.clock_dir('dup', rid, inputs, other)])
+        with self.assertRaisesRegex(SystemExit, 'listed by more than one file'):
+            self.fx.build(everything, self.out('dup-out'), added=added)
+        added = b.read_clock_assemblies([self.clock_dir('unselected', rid, inputs, 'p')])
+        with self.assertRaisesRegex(SystemExit, 'not a selected file'):
+            self.fx.build(everything - {str(inputs[1])}, self.out('unselected-out'), added=added)
+        added = b.read_clock_assemblies([self.clock_dir('a', rid, inputs, 'p'), self.clock_dir('b', rid, inputs, 'q', sha='d' * 64)])
+        with self.assertRaisesRegex(SystemExit, 'inputs of two clock assemblies'):
+            self.fx.build(everything, self.out('twice-out'), added=added)
 
     def test_cli_and_server_validator(self):
         days = os.path.join(self.tmp, 'days.tsv')

@@ -8,6 +8,7 @@ output directory:
   objects/<key>      every new content-addressed asset body, laid out by R2 key
   uploads.tsv        key, local_path, sha256, size_bytes, content_type, etag
   holds.tsv          delivery_keep_holds rows to insert (psql \\copy ... WITH (FORMAT text, HEADER))
+  dependencies.tsv   delivery_keep_output_dependencies rows for added assemblies' inputs
   summary.json       counts plus the known-stale fields this build does not recompute
 
 It never uploads and never writes the database. The controller uploads each
@@ -33,6 +34,14 @@ means no capture. A stream is "available" when all 14 days are R or . with at
 least one R, its
 base timeline covers exactly those days, and every captured hour keeps all its
 base parts; otherwise it is "partial" and serves what is selected.
+
+--clock-assemblies adds the assemblies of one or more `stoaramactl collation-v2
+clock-join` output directories (their results/*.json). Each replaces its input
+files in the file list and manifest (its inputs stay on the timeline, as for
+every assembly), joins growth.json repairs as production_version
+clock-prestitched, and adds its video and proof to uploads.tsv (hard-linked
+into objects/), holds.tsv and dependencies.tsv. Every input must be a selected
+collated file that no other assembly replaces.
 
 --base-holds is the base asset holds, exported read-only:
   psql -At -c "SELECT json_agg(json_build_object('object_key',object_key,
@@ -134,7 +143,7 @@ def length(iv):
     return sum(b - a for a, b in merge(iv))
 
 
-def rebuild(store, recording_ids, present, gen_id, now):
+def rebuild(store, recording_ids, present, gen_id, now, added=()):
     """Return ({asset path without .gz: new object}, changed recording ids).
 
     Assembly rule: a present assembly (id sha256:...) keeps its replaced
@@ -148,11 +157,11 @@ def rebuild(store, recording_ids, present, gen_id, now):
     MS = {s['id']: s for s in md['streams']}; CS = {s['id']: s for s in cat['streams']}
     out = {}
     changed_streams = set()
-    kept_repairs = [r for r in gr['repairs'] if 'sha256:' + r['sha256'] in present]
+    kept_repairs = [r for r in gr['repairs'] if 'sha256:' + r['sha256'] in present] + [clock_repair(a) for a in added]
     for rid in recording_ids:
         man = load(f'/public/manifests/{rid}.json')
         assert man == load(f'/api/coverage-delivery/manifest?stream={rid}&scope=available'), rid
-        outputs = [o for o in man['outputs'] if str(o['id']) in present]
+        outputs = [o for o in man['outputs'] if str(o['id']) in present] + [clock_output(a) for a in added if a['recording_id'] == rid]
         assemblies = [o for o in outputs if str(o['id']).startswith('sha256:')]
         originals_current = {str(o['id']) for o in outputs if not str(o['id']).startswith('sha256:')}
         replaced = {str(i) for o in assemblies for i in o['replacement_inputs']}
@@ -309,6 +318,8 @@ def rebuild(store, recording_ids, present, gen_id, now):
     gr['verified_assembly_objects'] = len(kept_repairs)
     gr['current_file_count'] = len(present)
     pmc = gr['production_model_counts']
+    if added:
+        pmc.setdefault(CLOCK_VERSION, 0)
     for k in pmc:
         if k != 'prior_verified_assemblies':
             pmc[k] = sum(1 for r in kept_repairs if str(r.get('production_version')) == k)
@@ -320,6 +331,83 @@ def rebuild(store, recording_ids, present, gen_id, now):
     out['/public/metadata.json'] = md; out['/public/readiness.json'] = rd
     out['/public/growth.json'] = gr; out['/public/catalog.json'] = cat
     return out, changed_streams
+
+
+CLOCK_VERSION = 'clock-prestitched'
+FILE_URL = '/api/v1/global-street-scores-delivery/file/'
+# growth.json repair fields a clock-join assembly carries (Assembly in backend/internal/clockjoin).
+CLOCK_REPAIR_FIELDS = ('sha256', 'recording_id', 'local_date', 'hour', 'seconds', 'media_seconds_measurement', 'size_bytes',
+                       'input_ids', 'input_parts', 'parts_reduced', 'kind', 'production_version', 'path',
+                       'clock_boundary_annotations', 'temporary_no_audio', 'original_source_audio_present',
+                       'audio_delivery_status', 'proof_key', 'proof_sha256')
+
+
+def clock_id(a):
+    return 'sha256:' + a['sha256']
+
+
+def clock_repair(a):
+    return dict({k: a[k] for k in CLOCK_REPAIR_FIELDS}, collections=['available'], file_url=FILE_URL + clock_id(a))
+
+
+def clock_output(a):
+    return {'available': True, 'file_url': FILE_URL + clock_id(a), 'id': clock_id(a), 'local_date': a['local_date'],
+            'path': a['path'], 'recording_id': a['recording_id'], 'replacement_inputs': list(a['input_ids']),
+            'sha256': a['sha256'], 'size_bytes': a['size_bytes'], 'ticket_presentation_path': True}
+
+
+def read_clock_assemblies(dirs):
+    """Every assembly in the results/*.json of each clock-join output directory, with its local files."""
+    out = []
+    for d in dirs:
+        results = sorted(Path(d, 'results').glob('*.json'))
+        if not results:
+            raise SystemExit(f'{d}: no clock-join results')
+        for r in results:
+            for a in json.loads(r.read_text(encoding='utf-8'))['assemblies']:
+                if a['production_version'] != CLOCK_VERSION:
+                    raise SystemExit(f'{r}: assembly {a["sha256"]} is not {CLOCK_VERSION}')
+                for key, sha, size in ((a['key'], a['sha256'], a['size_bytes']), (a['proof_key'], a['proof_sha256'], a['proof_size_bytes'])):
+                    local = os.path.join(d, key)
+                    if os.path.getsize(local) != size:
+                        raise SystemExit(f'{local}: size differs from its clock-join result')
+                out.append(dict(a, local_dir=os.path.abspath(d)))
+    return out
+
+
+def add_clock_assemblies(parent, present, added):
+    """The file selection after added assemblies replace their inputs."""
+    ids = collections.Counter(i for a in added for i in a['input_ids'])
+    twice = sorted(i for i, n in ids.items() if n > 1)
+    if twice:
+        raise SystemExit(f'{len(twice)} files are inputs of two clock assemblies, e.g. {twice[:3]}')
+    for a in added:
+        if clock_id(a) in parent['files']:
+            raise SystemExit(f'{clock_id(a)} is already in the parent registry')
+        if a['recording_id'] not in parent['recording_ids']:
+            raise SystemExit(f'{clock_id(a)}: recording {a["recording_id"]} is not in the parent registry')
+        for i in a['input_ids']:
+            f = parent['files'].get(str(i))
+            if str(i) not in present or f is None or f['recording_id'] != a['recording_id']:
+                raise SystemExit(f'{clock_id(a)}: input {i} is not a selected file of recording {a["recording_id"]}')
+    return (present - {str(i) for i in ids}) | {clock_id(a) for a in added}
+
+
+def check_clock_inputs_unreplaced(store, recording_ids, added):
+    """No added assembly may take an input another assembly of the base already replaces."""
+    inputs = {str(i) for a in added for i in a['input_ids']}
+    for rid in recording_ids:
+        for o in store.load(f'/public/manifests/{rid}.json')['outputs']:
+            taken = inputs & {str(i) for i in o.get('replacement_inputs', ())}
+            if taken:
+                raise SystemExit(f'clock assembly inputs {sorted(taken)[:3]} are already replaced by {o["id"]}')
+
+
+def link_object(out_dir, src, key):
+    dst = os.path.join(out_dir, 'objects', key)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    os.link(src, dst)  # same filesystem as the clock-join output: no copy of the video
+    return os.path.join('objects', key)
 
 
 def rebuilt_asset(path):
@@ -373,19 +461,25 @@ def annotate_availability(out, store, best14):
     return {a.value: n for a, n in counts.items()}
 
 
-def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None):
+def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None, added=()):
     """Write the generation into out_dir (must not exist). Returns the summary.
 
     store holds the base assets. best14=None skips availability (only to
     reproduce generations built before it existed)."""
     if store.recording_ids != parent['recording_ids']:
         raise SystemExit('base and parent recordings differ')
+    if added:
+        check_clock_inputs_unreplaced(store, parent['recording_ids'], added)
+        present = add_clock_assemblies(parent, present, added)
     files = {k: v for k, v in parent['files'].items() if k in present}
+    for a in added:
+        files[clock_id(a)] = {'etag': f'"{a["etag"]}"', 'key': a['key'], 'path': a['path'], 'recording_id': a['recording_id'],
+                              'sha256': a['sha256'], 'size_bytes': a['size_bytes'], 'verified': True}
     dup = sorted(p for p, n in collections.Counter(v['path'] for v in files.values()).items() if n > 1)
     if dup:
         raise SystemExit(f'{len(dup)} delivery paths are listed by more than one file, e.g. {dup[:3]}')
     assets = store.assets
-    out, changed = rebuild(store, parent['recording_ids'], present, gen_id, now)
+    out, changed = rebuild(store, parent['recording_ids'], present, gen_id, now, added)
     availability = annotate_availability(out, store, best14) if best14 is not None else None
     published = {o['key'] for o in parent['assets'].values()}
     hold_by_key = {h['object_key']: h for h in holds}
@@ -427,17 +521,28 @@ def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None
             f.write(body)
         uploads[key] = {'key': key, 'local_path': os.path.join('objects', key), 'sha256': sha,
                         'size_bytes': len(body), 'content_type': assets[p]['content_type'], 'etag': etag}
+    dependencies = []
+    for a in added:
+        for key, sha, size, etag, ctype, kind, rel in (
+                (a['key'], a['sha256'], a['size_bytes'], a['etag'], 'video/mp4', 'video_assembly', a['path']),
+                (a['proof_key'], a['proof_sha256'], a['proof_size_bytes'], a['proof_etag'], 'application/json', 'clock_proof', '')):
+            uploads[key] = {'key': key, 'local_path': link_object(out_dir, os.path.join(a['local_dir'], key), key), 'sha256': sha,
+                            'size_bytes': size, 'content_type': ctype, 'etag': etag}
+            new_holds[key] = {'bucket': BUCKET, 'object_key': key, 'etag': etag, 'size_bytes': size,
+                              'recording_id': a['recording_id'], 'kind': kind, 'sha256': sha, 'relative_path': rel}
+        dependencies += [{'output_id': i, 'recording_id': a['recording_id']} for i in a['input_ids']]
     registry = dict(parent, generation=gen_id, parent_generation=parent['generation'], created_at=now,
                     publication_note=note, assets=new_assets, files=files)
     with open(os.path.join(out_dir, 'registry.json.gz'), 'wb') as f:
         f.write(gzip.compress(dumps(registry), compresslevel=9, mtime=0))
     write_tsv(os.path.join(out_dir, 'uploads.tsv'), UPLOAD_COLUMNS, [uploads[k] for k in sorted(uploads)])
     write_tsv(os.path.join(out_dir, 'holds.tsv'), HOLD_COLUMNS, [new_holds[k] for k in sorted(new_holds)])
+    write_tsv(os.path.join(out_dir, 'dependencies.tsv'), DEPENDENCY_COLUMNS, sorted(dependencies, key=lambda d: d['output_id']))
     summary = {
         'generation': gen_id, 'parent_generation': parent['generation'], 'created_at': now,
         'files': len(files), 'recordings_with_files': len({v['recording_id'] for v in files.values()}),
         'changed_recordings': sorted(changed), 'assets_replaced': sum(new_assets[p] != assets[p] for p in assets),
-        'objects': len(uploads), 'availability': availability,
+        'objects': len(uploads), 'availability': availability, 'clock_assemblies': len(added),
         'bytes_served': sum(v['size_bytes'] for v in files.values()), 'known_stale_fields': list(KNOWN_STALE_FIELDS),
     }
     write_json(os.path.join(out_dir, 'summary.json'), summary)
@@ -446,6 +551,7 @@ def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None
 
 UPLOAD_COLUMNS = ('key', 'local_path', 'sha256', 'size_bytes', 'content_type', 'etag')
 HOLD_COLUMNS = ('bucket', 'object_key', 'etag', 'size_bytes', 'recording_id', 'kind', 'sha256', 'relative_path')
+DEPENDENCY_COLUMNS = ('output_id', 'recording_id')
 
 
 def write_tsv(path, columns, rows):
@@ -513,6 +619,7 @@ def main(argv=None):
     sel = ap.add_mutually_exclusive_group(required=True)
     sel.add_argument('--files', help='file with one selected parent file id per line')
     sel.add_argument('--days', help='TSV with recording_id and local_date columns')
+    ap.add_argument('--clock-assemblies', nargs='+', default=[], help='clock-join output directories whose assemblies to add')
     ap.add_argument('--note', required=True, help='publication_note of the new generation')
     ap.add_argument('--out', required=True, help='output directory (must not exist)')
     a = ap.parse_args(argv)
@@ -522,7 +629,8 @@ def main(argv=None):
     with open(a.base_holds, encoding='utf-8') as f:
         holds = json.load(f)
     now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-    summary = build(parent, store, present, holds, secrets.token_hex(16), now, a.note, a.out, read_best14(a.best14))
+    summary = build(parent, store, present, holds, secrets.token_hex(16), now, a.note, a.out, read_best14(a.best14),
+                    read_clock_assemblies(a.clock_assemblies))
     print(json.dumps({k: v for k, v in summary.items() if k != 'known_stale_fields'}, indent=1))
 
 
