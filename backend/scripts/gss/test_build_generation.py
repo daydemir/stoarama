@@ -254,15 +254,16 @@ class SyntheticBuildTests(unittest.TestCase):
             b.select_days(self.fx.parent, self.store, {(999, DAYS[0])})
 
     def test_best14_availability(self):
-        full, missing, unstitched, shifted, quiet = RIDS[:5]
+        full, missing, unstitched, shifted, quiet, blank = RIDS[:6]
         best14 = {r: {(d, 'R') for d in DAYS} for r in RIDS}
         best14[unstitched] = {(d, 'S' if i < 3 else 'R') for i, d in enumerate(DAYS)}
         best14[shifted] = {(f'2026-07-{d:02d}', 'R') for d in range(11, 25)}
         best14[quiet] = {(d, '.' if i == 5 else 'R') for i, d in enumerate(DAYS)}
+        best14[blank] = {(d, '.') for d in DAYS}
         drop = str(missing * 1000 + 9)
         present = set(self.fx.parent['files']) - {drop}
         summary = self.fx.build(present, self.out('best14'), best14)
-        self.assertEqual(summary['availability'], {'available': len(RIDS) - 3, 'partial': 3})
+        self.assertEqual(summary['availability'], {'available': len(RIDS) - 4, 'partial': 4})
         reg = b.read_registry(os.path.join(self.out('best14'), 'registry.json.gz'))
         md = {s['id']: s for s in self.object(self.out('best14'), reg, '/public/metadata.json')['streams']}
         pick = lambda s: (s['availability'], s['best14_start'], s['best14_end'], s['best14_days_ready'])  # noqa: E731
@@ -270,6 +271,7 @@ class SyntheticBuildTests(unittest.TestCase):
         self.assertEqual(pick(md[quiet]), ('available', DAYS[0], DAYS[-1], 14))
         self.assertEqual(pick(md[missing]), ('partial', DAYS[0], DAYS[-1], 14))  # a part is gone from R2
         self.assertEqual(pick(md[unstitched]), ('partial', DAYS[0], DAYS[-1], 11))
+        self.assertEqual(pick(md[blank]), ('partial', DAYS[0], DAYS[-1], 14))  # no captured day
         self.assertEqual(pick(md[shifted]), ('partial', '2026-07-11', '2026-07-24', 14))  # window is not the timeline
         # Partial streams still serve every selected file.
         self.assertEqual(set(reg['files']), present)
@@ -289,6 +291,10 @@ class SyntheticBuildTests(unittest.TestCase):
         os.makedirs(self.out('exists'))
         with self.assertRaises(FileExistsError):
             self.fx.build(present, self.out('exists'))
+        self.fx.parent['files'][str(RIDS[1] * 1000 + 2)]['path'] = self.fx.parent['files'][str(RIDS[1] * 1000 + 3)]['path']
+        with self.assertRaisesRegex(SystemExit, 'listed by more than one file'):
+            self.fx.build(set(self.fx.parent['files']), self.out('duppath'))
+        self.assertFalse(os.path.exists(self.out('duppath')))
 
     def test_cli_and_server_validator(self):
         days = os.path.join(self.tmp, 'days.tsv')

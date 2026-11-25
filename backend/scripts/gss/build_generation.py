@@ -29,7 +29,8 @@ local_date is the stream-timezone date the manifests and timelines carry.
 
 --best14 is best14-days.tsv (recording_id, local_date, day_stitched; 14 rows per
 recording). day_stitched R means every captured hour is stitched in R2 and .
-means no capture. A stream is "available" when all 14 days are R or ., its
+means no capture. A stream is "available" when all 14 days are R or . with at
+least one R, its
 base timeline covers exactly those days, and every captured hour keeps all its
 base parts; otherwise it is "partial" and serves what is selected.
 
@@ -40,6 +41,7 @@ base parts; otherwise it is "partial" and serves what is selected.
     AND object_key LIKE 'datasets/global-street-scores-delivery/47/assets/%'"
 """
 import argparse
+import collections
 import copy
 import csv
 import datetime
@@ -359,12 +361,13 @@ def annotate_availability(out, store, best14):
             raise SystemExit(f'recording {rid}: best14 needs 14 days, got {len(days)}')
         dates = [d for d, _ in days]
         ready = sum(code in READY_DAY_CODES for _, code in days)
+        captured = any(code != '.' for _, code in days)
         base = store.load(f'/public/streams/{rid}.json')['days']
         new = out[f'/public/streams/{rid}.json']['days']
         served = [d['date'] for d in base] == dates and all(
             h[1] == 0 or h[0] in NO_CAPTURE_STATES or (h[0] == 'collated' and n[9] == h[9])
             for bd, nd in zip(base, new) for h, n in zip(bd['hours'], nd['hours']))
-        a = Availability.AVAILABLE if ready == 14 and served else Availability.PARTIAL
+        a = Availability.AVAILABLE if ready == 14 and captured and served else Availability.PARTIAL
         s.update(availability=a.value, best14_start=dates[0], best14_end=dates[-1], best14_days_ready=ready)
         counts[a] += 1
     return {a.value: n for a, n in counts.items()}
@@ -377,6 +380,10 @@ def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None
     reproduce generations built before it existed)."""
     if store.recording_ids != parent['recording_ids']:
         raise SystemExit('base and parent recordings differ')
+    files = {k: v for k, v in parent['files'].items() if k in present}
+    dup = sorted(p for p, n in collections.Counter(v['path'] for v in files.values()).items() if n > 1)
+    if dup:
+        raise SystemExit(f'{len(dup)} delivery paths are listed by more than one file, e.g. {dup[:3]}')
     assets = store.assets
     out, changed = rebuild(store, parent['recording_ids'], present, gen_id, now)
     availability = annotate_availability(out, store, best14) if best14 is not None else None
@@ -420,7 +427,6 @@ def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None
             f.write(body)
         uploads[key] = {'key': key, 'local_path': os.path.join('objects', key), 'sha256': sha,
                         'size_bytes': len(body), 'content_type': assets[p]['content_type'], 'etag': etag}
-    files = {k: v for k, v in parent['files'].items() if k in present}
     registry = dict(parent, generation=gen_id, parent_generation=parent['generation'], created_at=now,
                     publication_note=note, assets=new_assets, files=files)
     with open(os.path.join(out_dir, 'registry.json.gz'), 'wb') as f:

@@ -15,7 +15,7 @@ h1{font-size:27px;max-width:none;margin:0 0 8px}.method{display:none}.brand-nav{
 @media(max-width:700px){.stream-row[data-expanded=false] .stream-label .growth-summary{font-size:10px}}
 
 /* Best-14 availability: default view lists streams whose best 14 days are complete in R2. */
-.show-filter{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:12px 0 0;font-size:11px}.show-filter[hidden]{display:none}.show-filter>span{color:var(--mut);margin-right:2px}.show-filter button{min-height:32px;padding:5px 12px;font-size:11px;border:1px solid var(--line);background:none;color:var(--fg);border-radius:6px}.show-filter button[aria-pressed=true]{background:#0e7490;border-color:#0e7490;color:#fff}.show-filter small{color:var(--mut);font-size:11px;margin-left:6px}
+.show-filter{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:12px 0 0;font-size:11px}.show-filter[hidden]{display:none}.show-filter>span{color:var(--mut);margin-right:2px}.show-filter button{min-height:32px;padding:5px 12px;font-size:11px;border:1px solid var(--line);background:none;color:var(--fg);border-radius:6px}.show-filter button[aria-pressed=true]{background:#0e7490;border-color:#0e7490;color:#fff}#show-counts{font-size:14px;margin-left:8px}#show-counts strong{font-weight:600;color:var(--fg)}#show-counts a{font-size:12px}
 .availability-note{margin:4px 0 0;font-size:11px;color:#92400e}.stream-row[data-expanded=false] .availability-note{grid-column:2;font-size:10px;margin:0 0 6px}
 @media(prefers-color-scheme:dark){.show-filter button[aria-pressed=true]{background:#06b6d4;border-color:#06b6d4;color:#0f172a}.availability-note{color:#fcd34d}}
-@media(max-width:700px){.show-filter small{flex-basis:100%;margin:2px 0 0}.stream-row[data-expanded=false] .availability-note{grid-column:2/-1}}
+@media(max-width:700px){#show-counts{flex-basis:100%;margin:4px 0 0;font-size:13px}.stream-row[data-expanded=false] .availability-note{grid-column:2/-1}}
