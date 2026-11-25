@@ -64,7 +64,9 @@ active-set/digest reads before another attempt. Foreign plans are never mutated.
 Disk/email failure cannot skip containment. Shutdown/recovery latches remain.
 
 STOP/SIGTERM prevents successors and drains a healthy active plan naturally;
-it never pauses a plan to deploy. Do not force-kill a draining/containment runner.
+it never pauses a plan to deploy. Under launchd KeepAlive a SIGTERM drain exits 0
+and restarts (immediately after a run over an hour), so only STOP, the latch or
+`launchctl bootout` holds the runner. Do not force-kill a draining/containment runner.
 A process crash may leave its plan enabled until restart or backend expiry; local
 STOP is not a backend deletion switch.
 

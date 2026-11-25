@@ -839,13 +839,13 @@ class Runner:
         self.owner_validated = True
         self.status['runner_pid'] = os.getpid()
 
-    def owned_stop(self):
-        """This owner's STOP reason, or None when STOP is absent, empty, foreign or invalid."""
+    def owned_stop(self, raw):
+        """This owner's STOP reason, or None when STOP is empty, foreign or invalid."""
         try:
-            stop = json.loads((self.root / 'STOP').read_bytes())
+            stop = json.loads(raw)
             require(stop['schema'] == STOP_SCHEMA and stop['owner_id'] == self.status['owner_id'], 'foreign STOP')
             return StopReason(stop['reason'])
-        except (OSError, ValueError, KeyError, TypeError, Halt):
+        except (ValueError, KeyError, TypeError, Halt):
             return None
 
     def admit_finish(self):
@@ -853,7 +853,8 @@ class Runner:
         refusal holds behind an idle owner STOP instead of latching; D's admission
         latch remains the human gate. Only this runner's own hold is ever released."""
         present = (self.root / 'STOP').exists()
-        stop = self.owned_stop() if present else None
+        raw = (self.root / 'STOP').read_bytes() if present else None
+        stop = self.owned_stop(raw) if present else None
         try:
             self.finish_health()
         except Exception:
@@ -861,7 +862,9 @@ class Runner:
             if self.status['current_plan'] or self.status.get('current_day_plan') or present and stop not in IDLE_STOPS:
                 raise
             raise self.hold(stop) from None
-        if stop is StopReason.FINISH_ADMISSION_HOLD:
+        # finish_health can wait on D's gate; release only the exact hold read above,
+        # never a STOP someone wrote meanwhile.
+        if stop is StopReason.FINISH_ADMISSION_HOLD and (self.root / 'STOP').read_bytes() == raw:
             (self.root / 'STOP').unlink()
             self.status.pop('finish_recovery_kicked', None)
 

@@ -1177,7 +1177,7 @@ CLEAN = dict(failed=False, recovery_required=False)
 
 class FinishHoldTests(unittest.TestCase):
     """A startup finish-health refusal with no owned plan holds idle; it never latches the runner."""
-    def start(self, root, admission, checked_at=None, kick=None, **status):
+    def start(self, root, admission, checked_at=None, kick=None, during_health=None, **status):
         state = Path(root) / 'finish'
         state.mkdir(exist_ok=True)
         (state / 'admission.json').write_text(json.dumps(dict(admission, active={})))
@@ -1194,6 +1194,9 @@ class FinishHoldTests(unittest.TestCase):
         job.validate_owner = validate
         job.notify = lambda subject: job.events.append(('alert', subject))
         job.run_day = lambda: job.events.append('run_day')
+        if during_health:
+            health = job.finish_health
+            job.finish_health = lambda: (during_health(), health())
         job.master = lambda enabled, emergency=False: job.events.append('OFF')
         job.drain = lambda pid: job.events.append('drain')
         job.plan = lambda pid: {'id': pid}
@@ -1288,6 +1291,14 @@ class FinishHoldTests(unittest.TestCase):
             self.assertIn('run_day', job.events)
             self.assertNotIn('finish_recovery_kicked', status)
             self.assertEqual((self.alerts(job), self.kicks(job)), ([], []))
+
+    def test_release_keeps_a_stop_written_while_finish_health_ran(self):
+        natural = json.dumps(dict(schema='stoarama.cleanup-stop.v1', owner_id=OWNER_ID,
+                                  reason='natural_boundary', created_at=NOW.isoformat()))
+        with tempfile.TemporaryDirectory() as root:
+            self.start(root, LATCHED)
+            self.start(root, CLEAN, during_health=lambda: (Path(root) / 'STOP').write_text(natural))
+            self.assertEqual((Path(root) / 'STOP').read_text(), natural)
 
     def test_natural_stop_holds_quietly_and_is_never_released(self):
         natural = json.dumps(dict(schema='stoarama.cleanup-stop.v1', owner_id=OWNER_ID,
