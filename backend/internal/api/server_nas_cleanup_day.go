@@ -798,7 +798,7 @@ func (s *Server) handleAccountNASCleanupDayPermit(w http.ResponseWriter, r *http
  FROM nas_cleanup_day_units u JOIN nas_cleanup_day_plans p ON p.id=u.plan_id
  WHERE p.mode='enabled' AND p.approved_until>clock_timestamp()+interval '1 minute' AND p.connection_id=$1
   AND (u.state='pending' OR (u.state='permitted' AND u.permit_expires_at<=clock_timestamp())) AND (u.names IS NULL OR $2)
- ORDER BY u.plan_id,u.ordinal LIMIT 1 FOR UPDATE OF u SKIP LOCKED FOR SHARE OF p`, cid, req.ClientVersion == nasCleanupDayKEClientVersion).Scan(&unitID, &permit.PlanID, &permit.PlanSHA,
+ ORDER BY u.plan_id,u.ordinal LIMIT 1 FOR UPDATE OF u SKIP LOCKED FOR SHARE OF p`, cid, slices.Contains(nasCleanupDayKEVersions, req.ClientVersion)).Scan(&unitID, &permit.PlanID, &permit.PlanSHA,
 			&permit.StreamID, &permit.RelativeDir, &permit.LocalDate, &permit.Files, &permit.Bytes, &names, &until)
 		if errors.Is(err, pgx.ErrNoRows) {
 			break

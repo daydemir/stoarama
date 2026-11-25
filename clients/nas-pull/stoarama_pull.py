@@ -54,9 +54,10 @@ LOW_MEMORY_CLEANUP_CLIENT_VERSION = "r2-copy-v8-low-memory-cleanup"
 # Same artifact line built with the 20-day cleanup pin; identical behavior.
 KEEP20_CLEANUP_CLIENT_VERSION = "r2-copy-v8-keep20-cleanup"
 # Fast-copy line; the API supplies the stream count with every lease. The
-# ke-day release deletes day directories without the app-writer fence, from
-# day permits in names or dir mode, and Keep Everything days in names mode.
-FAST_COPY_CLIENT_VERSION = "r2-copy-v8-ke-day"
+# output-restore release deletes day directories without the app-writer fence,
+# from day permits in names or dir mode, and Keep Everything days in names mode,
+# and leases NAS-only stitched-output restores.
+FAST_COPY_CLIENT_VERSION = "r2-copy-v8-output-restore"
 LOW_MEMORY_CLEANUP_VERSIONS = frozenset((LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, FAST_COPY_CLIENT_VERSION))
 CLEANUP_CERTIFIED_STITCH_REASON = "durham_stitch_certified"
 CLEANUP_CERTIFIED_STITCH_RECOVERY = "nas_stitch_certified"
