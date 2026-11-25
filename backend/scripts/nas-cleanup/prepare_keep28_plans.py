@@ -383,7 +383,7 @@ def day_digest(units):
     text = '%s\npolicy %s\n' % (DAY_DIGEST_TAG, POLICY_SHA)
     for u in units:
         text += 'unit %d %s %d %d %s\n' % (u['stream_id'], u['local_date'], u['files'], u['bytes'], u['relative_dir'])
-        text += ''.join('name %d %s\n' % (n['size_bytes'], n['name']) for n in u.get('names', ()))
+        text += ''.join('name %d %s\n' % (n['size_bytes'], n['name']) for n in u.get('names') or ())
     return hashlib.sha256(text.encode()).hexdigest()
 
 
