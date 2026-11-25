@@ -191,3 +191,19 @@ func TestMigrateUpDoesNotRetryOtherErrors(t *testing.T) {
 		t.Fatal("a failed migration must not be recorded in schema_migrations")
 	}
 }
+
+func TestMigrateUpRefusesEmptyMigration(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	for _, body := range []string{"", " \n\t\n"} {
+		name := "9996_migrate_empty_probe_test.sql"
+		dir := writeMigration(t, name, body)
+		err := MigrateUp(ctx, pool, dir)
+		if err == nil || !strings.Contains(err.Error(), "is empty") {
+			t.Fatalf("body %q: want empty-migration refusal, got %v", body, err)
+		}
+		if applied, err := isApplied(ctx, pool, name); err != nil || applied {
+			t.Fatalf("body %q: an empty migration must never be recorded (applied=%v err=%v)", body, applied, err)
+		}
+	}
+}
