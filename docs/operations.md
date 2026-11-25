@@ -340,10 +340,57 @@ pinned `keep_everything` streams of `nas_media_keep20_windows`). Deniz, verbatim
 fence; their live `put_expires_at` holds `r2_retirement_writes_blocked` false,
 so R2 delete batches wait while a restore capability is live. Test restores and
 every other row stay untouched and refused; existing rows and objects remain
-preserved. New account and
-admin S3 destination verification/provisioning is retired before writing probes
-or credentials. Existing managed destinations resolve by read-only lookup;
-missing managed storage is not implicitly created, billed or marked verified.
+preserved. The fence admits one more writer, collation v2 recovery. Deniz,
+verbatim: "serve the best 14 days of as many streams as possible, fully
+stitched v85 (or whatever the latest version was we were using), via r2,
+through the nice web ui". Migration 0262 admits a generation-2 hour only when
+the controller has listed its batch, recording and local date (the day in the
+recording's `cron_timezone`) in `collation_v2_recovery_scope`, in one of two
+ways:
+
+- **Restore.** `collation-v2 plan --scope days` plans a registered hour as a
+  restore in its own batch, and `collation-v2 run --recovery-scope` puts its
+  catalogued outputs back at their catalogued keys with their catalogued
+  sha256 and size, in the fenced bucket. Restores cover outputs only: delivery
+  reads outputs, and a registered hour's manifest is never restored. It HEADs the key under the wire lock
+  and sends no PUT when the object is present. It is refused while any
+  retirement of that key is pending, and it writes no catalog row.
+- **New hour.** Only in a fresh `recovery-` batch, and only for a recording,
+  date and hour that no generation-2 hour holds yet (`plan --scope days
+  --recovery-batch` names only unregistered hours, and refuses an unscoped
+  batch whose `joined/<batch>/` prefix already holds an R2 object). No catalog row or writer
+  intent may name the batch before its first scope row. `run` creates the
+  hour's manifest and its parts, each part keyed by its own sha256.
+  `collation-v2 register` then catalogues the hour and its parts in one
+  transaction.
+
+Every key a scope row covers is an owner keep hold (`r2_owner_keep_held`), so
+no R2 retirement lane can reserve, intend or record its deletion. A classic
+`r2-retire` plan that names one fails closed. Scope rows are revoked, never
+deleted, and no scope row lands over a pending retirement. A scoped hour or part
+can never be updated, deleted or truncated.
+
+Each recovery PUT is a durable `r2_retirement_writer_operations` intent naming
+the hour and the exact key, size and sha256, and carries that sha256 as its
+`ChecksumSHA256`, so R2 refuses any other body. `r2_retirement_writes_blocked`
+and `r2_retirement_writers_drained` therefore hold every R2 delete batch back
+while it is open. An intent completes at once on every path that leaves no
+possible write: a refused wire admission, a present key, a failed HEAD, a 412 or
+any other definitive 4xx. Only an ambiguous PUT, or a failed read-back or
+completion after one, stays open. A PUT still in flight share-locks its intent.
+`collation-v2 settle-recovery --apply` completes every other open intent,
+whatever its key now holds, and reports each key as verified, absent (its hour
+needs another run) or foreign. That is safe because every recovery key is held
+for good, and a late copy of its PUT is create-only and checksum-bound. A
+recovery client makes no generic PUT and signs no capability.
+`PresignNASRestorePut`, stitch staging and `DeleteObjectOnce` are unaffected by
+the binding and stay gated by their own rows. The NAS cleanup source freeze (0180), the collation-reference hold (0167)
+and the R2 retirement key vetoes still apply: a stream frozen by an enabled
+cleanup plan waits for that plan.
+
+New account and admin S3 destination verification/provisioning is retired
+before writing probes or credentials. Existing managed destinations resolve by
+read-only lookup; missing managed storage is not implicitly created, billed or marked verified.
 Existing destination selection and separately transported WebDAV verification
 remain available. These backend changes require the production controller's
 reviewed between-batch deployment; merging does not deploy or authorize deletion.

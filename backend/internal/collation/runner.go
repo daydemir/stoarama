@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 
@@ -22,6 +23,22 @@ import (
 // R2Store implements Store on the joined bucket. Sources must live in the same
 // bucket as the joined layout.
 type R2Store struct{ Client *r2.Client }
+
+// recoveryBatch is collation_v2_recovery_scope.batch_id's shape (migration
+// 0262): a batch no earlier writer used, whose joined/<batch>/ keys an R2 owner
+// keep hold protects.
+var recoveryBatch = regexp.MustCompile(`^recovery-[a-z0-9][a-z0-9-]{0,52}$`)
+
+// IsRecoveryBatch reports whether batchID names a collation v2 recovery batch.
+func IsRecoveryBatch(batchID string) bool { return recoveryBatch.MatchString(batchID) }
+
+// CollationRecoveryStore publishes hour w's outputs and manifest as collation
+// v2 recovery writes, admitted past the writer fence only inside the
+// controller's collation_v2_recovery_scope (migration 0262): as a restore of a
+// registered hour's catalogued bytes, or as a new hour in a recovery- batch.
+func (s R2Store) CollationRecoveryStore(w HourWork) Store {
+	return R2Store{Client: s.Client.ForCollationRecovery(w.HourID)}
+}
 
 func (s R2Store) Download(ctx context.Context, clip Clip, dst string) (int64, string, error) {
 	if clip.Bucket != s.Client.Bucket() {
@@ -121,7 +138,7 @@ func ReadWorklist(r io.Reader) ([]HourWork, error) {
 type HourResult struct {
 	HourID       string         `json:"hour_id"`
 	RecordingID  int64          `json:"recording_id"`
-	Outcome      string         `json:"outcome"` // published | skipped_existing | deferred | failed
+	Outcome      string         `json:"outcome"` // published | restored | skipped_existing | deferred | differs | failed
 	Status       string         `json:"status,omitempty"`
 	Clips        int            `json:"clips"`
 	Parts        int            `json:"parts"`
@@ -136,12 +153,27 @@ type HourResult struct {
 	SplitReasons map[string]int `json:"split_reasons,omitempty"`
 }
 
-// RunWorklist processes hours with bounded parallelism, skipping hours whose
-// manifest is already published. It is safe to rerun after any interruption.
-// ExistenceChecker reports whether an hour's manifest is already published.
+// ExistenceChecker reports whether an object is already published.
 type ExistenceChecker interface {
 	Exists(ctx context.Context, key string) (bool, error)
 }
+
+// hourDone reports whether an hour needs no work: its manifest is published,
+// or, for a restore hour, every registered output object is present.
+func hourDone(ctx context.Context, store ExistenceChecker, w HourWork) (bool, error) {
+	if w.Restore == nil {
+		return store.Exists(ctx, ManifestKey(w.BatchID, w.HourID))
+	}
+	for _, o := range w.Restore.Outputs {
+		if ok, err := store.Exists(ctx, o.ObjectKey); err != nil || !ok {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// RunWorklist processes hours with bounded parallelism, skipping hours that
+// are already done. It is safe to rerun after any interruption.
 
 func RunWorklist(ctx context.Context, env Env, store ExistenceChecker, work []HourWork, hourWorkers int, results io.Writer) error {
 	if hourWorkers <= 0 {
@@ -164,21 +196,30 @@ func RunWorklist(ctx context.Context, env Env, store ExistenceChecker, work []Ho
 			for w := range jobs {
 				started := time.Now()
 				res := HourResult{HourID: w.HourID, RecordingID: w.RecordingID, Clips: len(w.Clips), ManifestKey: ManifestKey(w.BatchID, w.HourID)}
-				exists, err := store.Exists(ctx, res.ManifestKey)
+				exists, err := hourDone(ctx, store, w)
 				switch {
 				case err != nil:
 					res.Outcome, res.Error = "failed", err.Error()
 				case exists:
 					res.Outcome = "skipped_existing"
 				default:
-					m, err := ProcessHour(ctx, env, w)
+					hourEnv := env
+					if env.HourStore != nil {
+						hourEnv.Store = env.HourStore(w)
+					}
+					m, err := ProcessHour(ctx, hourEnv, w)
 					switch {
 					case errors.Is(err, ErrDeferred):
 						res.Outcome = "deferred"
+					case errors.Is(err, ErrRestoreDiffers):
+						res.Outcome, res.Error = "differs", err.Error()
 					case err != nil:
 						res.Outcome, res.Error = "failed", err.Error()
 					default:
 						res.Outcome, res.Status = "published", m.Status
+						if w.Restore != nil {
+							res.Outcome = "restored"
+						}
 						res.Parts = len(m.Outputs)
 						res.SplitReasons = map[string]int{}
 						for _, s := range m.Seams {
