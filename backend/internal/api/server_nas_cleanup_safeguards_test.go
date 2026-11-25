@@ -332,3 +332,25 @@ func TestNASCleanupConcurrentAutoPauseDoesNotDeadlock(t *testing.T) {
 		}
 	}
 }
+
+// A per-file plan cannot enable while a day plan is enabled (the day enable
+// gate already refuses the reverse).
+func TestNASCleanupPerFileEnableRefusedWhileDayPlanEnabled(t *testing.T) {
+	pool := cleanupTestPool(t)
+	ctx := context.Background()
+	s := &Server{pool: pool}
+	s.cfg.NASCleanupDeletionEnabled = true
+	safeguardPlan(t, ctx, s, 1, "dry_run", 10)
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_day_plans(mode) VALUES('enabled')`); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := safeguardControl(t, s, 1, "enabled", nil); code != 409 || !strings.Contains(body, "another cleanup plan is enabled") {
+		t.Fatalf("per-file enable with enabled day plan: %d %s", code, body)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_day_plans SET mode='paused'`); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := safeguardControl(t, s, 1, "enabled", nil); code != 200 {
+		t.Fatalf("per-file enable with paused day plan: %d %s", code, body)
+	}
+}
