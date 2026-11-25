@@ -376,9 +376,10 @@ func TestNASCleanupDayPermitsDirectoriesAndAccountsReceipts(t *testing.T) {
 	if _, _, err := dayCheck(ctx, pool, unit("2026-10-12", 1, 600)); err == nil || !strings.Contains(err.Error(), "held") {
 		t.Fatalf("incident-held clip did not refuse its directory: %v", err)
 	}
-	// Outside Keep Everything only an incident hold protects a directory-day: the
-	// delivery, R2 retirement and per-file plan holds below stay for the rest of
-	// the test, through the preparer, runner, admission and permits.
+	// Outside Keep Everything an incident or delivery hold protects a directory-day;
+	// the R2 retirement and per-file plan holds below do not, and stay for the rest
+	// of the test, through the preparer, runner, admission and permits.
+	dayDeliveryHoldsKeep(t, ctx, exec, pool, 2, unit("2026-09-12", 0, 0))
 	dayOtherHolds(t, exec, 2, unit("2026-09-12", 0, 0).RelativeDir)
 	if files, size, err := dayCheck(ctx, pool, unit("2026-09-12", 0, 0)); err != nil || files != 2 || size != 300 {
 		t.Fatalf("non-incident holds kept a non-KE directory-day: %d files %d bytes %v", files, size, err)
@@ -590,6 +591,7 @@ func TestNASCleanupDayFlatDirectoryHoldsOnlyItsNamedDay(t *testing.T) {
 	if _, _, err := dayCheck(ctx, pool, nasCleanupDayUnit{RelativeDir: dir, LocalDate: "2026-09-10", StreamID: 3, Files: 1, Bytes: 100}); err == nil || !strings.Contains(err.Error(), "held") {
 		t.Fatalf("held clip did not refuse its own day: %v", err)
 	}
+	dayDeliveryHoldsKeep(t, ctx, exec, pool, 2, unit)
 	dayOtherHolds(t, exec, 2, dir)
 	if files, size, err := dayCheck(ctx, pool, unit); err != nil || files != 2 || size != 200 {
 		t.Fatalf("non-incident holds kept a non-KE flat directory-day: %d files %d bytes %v", files, size, err)
@@ -636,14 +638,29 @@ func TestNASCleanupDayRetiredDigestIsAdmissibleAgain(t *testing.T) {
 // dayIncidentClip is a raw clip on the permanent NAS cleanup incident roster (0202).
 const dayIncidentClip = 296368
 
-// dayOtherHolds puts every non-incident hold 0241 counted on clip: a delivery
-// source hold, a delivery path hold in dir, an R2 retirement reservation and a
-// dry-run per-file cleanup plan's source hold.
+// dayDeliveryHoldsKeep checks that a delivery source hold on clip, and a delivery
+// path hold in dir, each keep a non-KE directory-day (0261, GSS delivery freeze),
+// then removes them.
+func dayDeliveryHoldsKeep(t *testing.T, ctx context.Context, exec func(string, ...any), q cleanupDayQuerier, clip int64, u nasCleanupDayUnit) {
+	t.Helper()
+	exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica; INSERT INTO delivery_nas_source_holds(clip_id) VALUES(%d); COMMIT`, clip))
+	if _, _, err := dayCheck(ctx, q, u); err == nil || !strings.Contains(err.Error(), "held") {
+		t.Fatalf("delivery source hold did not keep a non-KE directory-day: %v", err)
+	}
+	exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM delivery_nas_source_holds WHERE clip_id=%[1]d;
+INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,relative_path) VALUES('fixture','delivery/%[1]d','etag',1,'raw','%[2]s/delivered.mp4');
+COMMIT`, clip, u.RelativeDir))
+	if _, _, err := dayCheck(ctx, q, u); err == nil || !strings.Contains(err.Error(), "delivery path hold") {
+		t.Fatalf("delivery path hold did not keep a non-KE directory-day: %v", err)
+	}
+	exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM delivery_keep_holds WHERE object_key='delivery/%d'; COMMIT`, clip))
+}
+
+// dayOtherHolds puts the non-incident, non-delivery holds 0241 counted on clip:
+// an R2 retirement reservation and a dry-run per-file cleanup plan's source hold.
 func dayOtherHolds(t *testing.T, exec func(string, ...any), clip int64, dir string) {
 	t.Helper()
 	exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica;
-INSERT INTO delivery_nas_source_holds(clip_id) VALUES(%[1]d);
-INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,relative_path) VALUES('fixture','delivery/%[1]d','etag',1,'raw','%[2]s/delivered.mp4');
 INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
  SELECT 'raw',id,bucket,object_key,size_bytes,sha256,repeat('e',64) FROM recording_clips WHERE id=%[1]d;
 INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode)

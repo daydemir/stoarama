@@ -35,9 +35,9 @@ import (
 // outside the stream's pinned 20-day window (with a one-day guard band on
 // each side), and no catalogued clip of the unit is held. A
 // non-Keep-Everything unit has no R2 copy check, and only a live NAS cleanup
-// incident hold keeps it (0259; Deniz: "we need to remove whatever is making us
-// think thats a mistake"; "just drop the recordings its fine, we'll fix the
-// links whenever"). There is no daily cap.
+// incident hold or a GSS delivery hold keeps it (0259, 0261; Deniz: "we need to
+// remove whatever is making us think thats a mistake"; on the delivery, Nov 25:
+// "i wnat to save it if its not"). There is no daily cap.
 //
 // Keep Everything (Deniz, verbatim: "nas shoul dnot have any of the keep
 // everything (except the keep 20)"; "if its the same size and same file name or
@@ -370,7 +370,7 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 		return nil, err
 	}
 	if held {
-		return nil, errors.New("keep20 epoch inactive or delivery path hold in a Keep Everything directory")
+		return nil, errors.New("keep20 epoch inactive or delivery path hold in directory")
 	}
 	rows, err := q.Query(ctx, cleanupDayUnitSQL, u.RelativeDir, cleanupDayDirPattern.Replace(u.RelativeDir)+"/%")
 	if err != nil {
