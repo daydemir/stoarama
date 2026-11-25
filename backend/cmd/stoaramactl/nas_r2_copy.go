@@ -21,13 +21,22 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/api"
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 )
 
 // Manifest batches bound operator review/import size; they never limit transfer rate.
 const nasCopyBatchBytes int64 = 100_000_000_000
-const nasCopyQueueWorkers = 4
+
+// Each item costs ~6 database round trips; from Jelly that is ~0.5 s, so
+// queue throughput is latency-bound and scales with workers.
+const nasCopyQueueWorkers = 16
+
+// A lease holding a row an item touches refuses its insert with 55P03 after
+// the 2 s lock_timeout. Retry only that item; failing the manifest made every
+// rerun revalidate the items already committed.
+const nasCopyQueueLockAttempts = 8
 
 type nasCopyHeader struct {
 	Version      int    `json:"version"`
@@ -327,6 +336,21 @@ func queueNASR2CopyItem(ctx context.Context, pool nasCopyDB, h nasCopyHeader, ma
 	return finishDBError(finishImportCommit, 0, tx.Commit(ctx))
 }
 
+func queueNASR2CopyItemRetryingLocks(ctx context.Context, pool nasCopyDB, h nasCopyHeader, manifestSHA string, i api.NASR2CopyItem, apply bool) error {
+	for attempt := 1; ; attempt++ {
+		err := queueNASR2CopyItem(ctx, pool, h, manifestSHA, i, apply)
+		var pg *pgconn.PgError
+		if !errors.As(err, &pg) || pg.Code != "55P03" || attempt == nasCopyQueueLockAttempts {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Duration(attempt) * 250 * time.Millisecond):
+		}
+	}
+}
+
 func queueNASR2Copy(ctx context.Context, pool nasCopyDB, h nasCopyHeader, manifestSHA string, items []api.NASR2CopyItem, apply bool) error {
 	group, work := errgroup.WithContext(ctx)
 	var next atomic.Uint32
@@ -340,7 +364,7 @@ func queueNASR2Copy(ctx context.Context, pool nasCopyDB, h nasCopyHeader, manife
 				if n >= len(items) {
 					return nil
 				}
-				if err := queueNASR2CopyItem(work, pool, h, manifestSHA, items[n], apply); err != nil {
+				if err := queueNASR2CopyItemRetryingLocks(work, pool, h, manifestSHA, items[n], apply); err != nil {
 					return fmt.Errorf("copy source %d: %w", items[n].SourceID, err)
 				}
 			}

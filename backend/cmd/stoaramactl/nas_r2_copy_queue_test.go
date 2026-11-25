@@ -213,16 +213,16 @@ func TestNASR2CopyQueueBoundsAndReadOnlyDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	params := cfg.ConnConfig.RuntimeParams
-	if cfg.MaxConns != 4 || params["statement_timeout"] != "10s" || params["work_mem"] != "16MB" || params["default_transaction_read_only"] != "on" {
+	if cfg.MaxConns != nasCopyQueueWorkers || params["statement_timeout"] != "10s" || params["work_mem"] != "16MB" || params["default_transaction_read_only"] != "on" {
 		t.Fatal("operator URL bypassed fixed copy reader bounds")
 	}
-	pool, queue, h, items := nasCopyQueueFixture(t, 12, false)
-	gate := &nasCopyGatePool{Pool: queue, stage: nasCopyTestSetup, entered: make(chan struct{}, 4), release: make(chan struct{})}
+	pool, queue, h, items := nasCopyQueueFixture(t, 3*nasCopyQueueWorkers, false)
+	gate := &nasCopyGatePool{Pool: queue, stage: nasCopyTestSetup, entered: make(chan struct{}, nasCopyQueueWorkers), release: make(chan struct{})}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- queueNASR2Copy(ctx, gate, h, strings.Repeat("d", 64), items, false) }()
-	for range 4 {
+	for range nasCopyQueueWorkers {
 		select {
 		case <-gate.entered:
 		case <-ctx.Done():
@@ -233,7 +233,7 @@ func TestNASR2CopyQueueBoundsAndReadOnlyDefault(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if gate.maximum.Load() != 4 || gate.active.Load() != 0 || queue.Stat().AcquiredConns() != 0 {
+	if gate.maximum.Load() != nasCopyQueueWorkers || gate.active.Load() != 0 || queue.Stat().AcquiredConns() != 0 {
 		t.Fatal("copy workers serialized, exceeded four, or failed to drain")
 	}
 	var count int
@@ -251,13 +251,13 @@ func TestNASR2CopyQueueCancellationDrainsTransactions(t *testing.T) {
 		stage nasCopyTestStage
 	}{{"setup", nasCopyTestSetup}, {"source", nasCopyTestSource}, {"commit", nasCopyTestCommit}} {
 		t.Run(test.name, func(t *testing.T) {
-			pool, queue, h, items := nasCopyQueueFixture(t, 12, true)
-			gate := &nasCopyGatePool{Pool: queue, stage: test.stage, entered: make(chan struct{}, 4), release: make(chan struct{})}
+			pool, queue, h, items := nasCopyQueueFixture(t, 3*nasCopyQueueWorkers, true)
+			gate := &nasCopyGatePool{Pool: queue, stage: test.stage, entered: make(chan struct{}, nasCopyQueueWorkers), release: make(chan struct{})}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			done := make(chan error, 1)
 			go func() { done <- queueNASR2Copy(ctx, gate, h, strings.Repeat("d", 64), items, true) }()
-			for range 4 {
+			for range nasCopyQueueWorkers {
 				select {
 				case <-gate.entered:
 				case <-time.After(10 * time.Second):
@@ -273,7 +273,7 @@ func TestNASR2CopyQueueCancellationDrainsTransactions(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("canceled transactions did not drain")
 			}
-			if gate.begun.Load() != 4 || gate.active.Load() != 0 {
+			if gate.begun.Load() != nasCopyQueueWorkers || gate.active.Load() != 0 {
 				t.Fatalf("cancellation drain: begun=%d active=%d acquired=%d idle=%d total=%d", gate.begun.Load(), gate.active.Load(), queue.Stat().AcquiredConns(), queue.Stat().IdleConns(), queue.Stat().TotalConns())
 			}
 			// The CLI explicitly closes before log.Fatal, which skips defers.
@@ -306,20 +306,20 @@ func TestNASR2CopyQueueCancellationDrainsTransactions(t *testing.T) {
 }
 
 func TestNASR2CopyQueueFirstErrorCancelsAndDrainsOtherWorkers(t *testing.T) {
-	pool, queue, h, items := nasCopyQueueFixture(t, 12, true)
-	gate := &nasCopyGatePool{Pool: queue, stage: nasCopyTestSourceFailure, entered: make(chan struct{}, 4), release: make(chan struct{}), failureRelease: make(chan struct{})}
+	pool, queue, h, items := nasCopyQueueFixture(t, 3*nasCopyQueueWorkers, true)
+	gate := &nasCopyGatePool{Pool: queue, stage: nasCopyTestSourceFailure, entered: make(chan struct{}, nasCopyQueueWorkers), release: make(chan struct{}), failureRelease: make(chan struct{})}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- queueNASR2Copy(ctx, gate, h, strings.Repeat("d", 64), items, true) }()
-	for range 4 {
+	for range nasCopyQueueWorkers {
 		select {
 		case <-gate.entered:
 		case <-ctx.Done():
 			t.Fatal("workers did not reach source lookup")
 		}
 	}
-	close(gate.failureRelease) // The other three only unblock when work is canceled.
+	close(gate.failureRelease) // The other workers only unblock when work is canceled.
 	select {
 	case err := <-done:
 		var failure *finishDatabaseFailure
@@ -330,7 +330,7 @@ func TestNASR2CopyQueueFirstErrorCancelsAndDrainsOtherWorkers(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("first error did not cancel other workers")
 	}
-	if gate.begun.Load() != 4 || gate.active.Load() != 0 {
+	if gate.begun.Load() != nasCopyQueueWorkers || gate.active.Load() != 0 {
 		t.Fatal("failure dispatched more work or returned before rollback")
 	}
 	queue.Close()
@@ -480,5 +480,38 @@ func TestNASR2CopyRetirementIntentUsesIndependentConnection(t *testing.T) {
 				t.Fatalf("protected intent accepted: %v", err)
 			}
 		})
+	}
+}
+
+func TestNASR2CopyQueueRetriesOnlyTheLockedItem(t *testing.T) {
+	pool, queue, h, items := nasCopyQueueFixture(t, 2, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	manifest := strings.Repeat("e", 64)
+	if err := queueNASR2Copy(ctx, queue, h, manifest, items[:1], true); err != nil {
+		t.Fatal(err)
+	}
+	// A lease-like holder keeps the queued row locked past the 2 s lock_timeout.
+	holder, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = holder.Exec(ctx, `SELECT 1 FROM nas_r2_copy_items WHERE source_id=$1 FOR UPDATE`, items[0].SourceID); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(2500 * time.Millisecond)
+		_ = holder.Commit(context.Background())
+	}()
+	start := time.Now()
+	if err = queueNASR2Copy(ctx, queue, h, manifest, items, true); err != nil {
+		t.Fatalf("lock contention failed the manifest: %v", err)
+	}
+	if time.Since(start) < 2*time.Second {
+		t.Fatal("queue did not wait out the row lock")
+	}
+	var count int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM nas_r2_copy_items`).Scan(&count); err != nil || count != 2 {
+		t.Fatalf("queued=%d err=%v", count, err)
 	}
 }
