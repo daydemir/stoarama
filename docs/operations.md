@@ -388,6 +388,21 @@ the binding and stay gated by their own rows. The NAS cleanup source freeze (018
 and the R2 retirement key vetoes still apply: a stream frozen by an enabled
 cleanup plan waits for that plan.
 
+Keep Everything raw clips relayed as unfinalized MP4s (no `moov`) do not
+decode. Their decodable copies are at `repaired/<original key>`, catalogued
+only in the Jelly repair ledger (`~/stoarama-repair/ledger.sqlite`). Pass
+`collation-v2 plan --repair-ledger FILE` a TSV export of it:
+
+    sqlite3 -readonly -header -separator $'\t' "file:$HOME/stoarama-repair/ledger.sqlite?immutable=1" \
+      'SELECT clip_id,status,orig_sha256,repaired_key,repaired_size,repaired_sha256 FROM clips'
+
+A new hour then reads each repaired clip's copy, verified by that copy's size
+and sha256, and the repair must be of the clip's own catalogued sha256. A clip
+the ledger lists without a repaired copy fails the plan unless `--broken-ids`
+quarantines it. Restores keep their registered sources: registered hours were
+built from catalogued keys. Sources are reads: the 0262 admission and
+`repaired/`'s retirement protection are unchanged.
+
 New account and admin S3 destination verification/provisioning is retired
 before writing probes or credentials. Existing managed destinations resolve by
 read-only lookup; missing managed storage is not implicitly created, billed or marked verified.
