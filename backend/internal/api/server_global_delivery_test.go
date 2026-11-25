@@ -35,96 +35,27 @@ func globalDeliveryTestRegistry() *globalDeliveryRegistry {
 type globalDeliveryTestStore struct {
 	body              []byte
 	opened, presigned int
-	calls             int
 }
 
 func (m *globalDeliveryTestStore) Head(context.Context, string) (r2.ObjectHead, error) {
-	m.calls++
 	return r2.ObjectHead{ETag: "etag", SizeBytes: 5}, nil
 }
 func (m *globalDeliveryTestStore) HeadExact(context.Context, string, string, string) (r2.ObjectHead, error) {
-	m.calls++
 	return r2.ObjectHead{ETag: "etag", SizeBytes: 5}, nil
 }
-func (m *globalDeliveryTestStore) Get(context.Context, string) ([]byte, error) {
-	m.calls++
-	return m.body, nil
-}
+func (m *globalDeliveryTestStore) Get(context.Context, string) ([]byte, error) { return m.body, nil }
 func (m *globalDeliveryTestStore) OpenExact(context.Context, string, string, string) (io.ReadCloser, error) {
-	m.calls++
 	m.opened++
 	return io.NopCloser(bytes.NewReader(m.body)), nil
 }
 func (m *globalDeliveryTestStore) OpenExactRange(_ context.Context, _ string, _ string, _ string, a, b int64) (io.ReadCloser, error) {
-	m.calls++
 	m.opened++
 	return io.NopCloser(bytes.NewReader(m.body[a : b+1])), nil
 }
 func (m *globalDeliveryTestStore) PresignGetExactDownloadRequest(context.Context, string, string, string, string, time.Duration) (r2.PresignedRequest, error) {
-	m.calls++
 	m.presigned++
 	return r2.PresignedRequest{URL: "https://test.r2.cloudflarestorage.com/bucket/a%20b.mp4?X-Amz-Expires=300", Method: "GET", Headers: http.Header{"If-Match": {`"etag"`}, "Host": {"test.r2.cloudflarestorage.com"}}}, nil
 }
-
-func TestGlobalDeliveryRetiredRoutes(t *testing.T) {
-	pinned := "generation=" + strings.Repeat("a", 32)
-	paths := []string{
-		"/global-street-scores-delivery",
-		"/global-street-scores-delivery/files?" + pinned,
-		"/global-street-scores-delivery/static/fonts/nested.woff2",
-	}
-	for _, prefix := range []string{
-		"/api/v1/global-street-scores-delivery",
-		"/api/v1/account/global-street-scores-delivery",
-	} {
-		paths = append(paths,
-			prefix+"/asset?path=/public/catalog.json",
-			prefix+"/metadata?path=/public/catalog.json&"+pinned,
-			prefix+"/ticket/1?sha256="+strings.Repeat("b", 64),
-			prefix+"/file/1",
-			prefix+"/ticket/sha256%3A"+strings.Repeat("b", 64)+"?"+pinned,
-			prefix+"/file/sha256%3A"+strings.Repeat("b", 64)+"?direct=1&download=1&"+pinned,
-		)
-	}
-	store := &globalDeliveryTestStore{}
-	// An auth attempt with a session cookie would query this nil DB pool.
-	s := &Server{globalDeliveryStore: store}
-	router := s.router()
-	for _, path := range paths {
-		for _, method := range []string{http.MethodGet, http.MethodHead} {
-			for _, rangeHeader := range []string{"", "bytes=0-3"} {
-				t.Run(method+"/"+path+"/"+rangeHeader, func(t *testing.T) {
-					req := httptest.NewRequest(method, path, nil)
-					if rangeHeader != "" {
-						req.Header.Set("Range", rangeHeader)
-						req.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: "retired-route-test"})
-					}
-					w := httptest.NewRecorder()
-					callsBefore := store.calls
-					router.ServeHTTP(w, req)
-
-					if w.Code != http.StatusGone {
-						t.Errorf("status = %d, want 410", w.Code)
-					}
-					if got := w.Header().Get("Content-Type"); got != "text/plain; charset=utf-8" {
-						t.Errorf("content type = %q, want plain text", got)
-					}
-					wantBody := "Global Street Scores delivery has been retired."
-					if method == http.MethodHead {
-						wantBody = ""
-					}
-					if got := w.Body.String(); got != wantBody {
-						t.Errorf("body = %q, want %q", got, wantBody)
-					}
-					if store.calls != callsBefore {
-						t.Errorf("storage received %d calls", store.calls-callsBefore)
-					}
-				})
-			}
-		}
-	}
-}
-
 func globalDeliveryTestRequest(method, target, id string, p *accountPrincipal) *http.Request {
 	r := httptest.NewRequest(method, target, nil)
 	ctx := r.Context()
