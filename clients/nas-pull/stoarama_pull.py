@@ -128,8 +128,9 @@ UPLOAD_PROBE_ERROR_WAIT_SEC = 60 * 60
 UPLOAD_PROBE_JITTER = 0.1
 UPLOAD_PROBE_REPORT_ATTEMPTS = 3
 UPLOAD_PROBE_REPORT_BACKOFF_SEC = 10
-# NAS -> R2 restore: the server queues clips and signs one create-only PUT per
-# clip; the client proves its local bytes first and the server re-hashes the
+# NAS -> R2 restore: the server queues clips, or stitched outputs it leases only
+# to clients that declare output_restores, and signs one create-only PUT per
+# file; the client proves its local bytes first and the server re-hashes the
 # uploaded object before a restore counts.
 DEFAULT_RESTORE_WORKERS = 16
 MAX_RESTORE_WORKERS = 32
@@ -25688,8 +25689,11 @@ def run_selected_verify_task(cfg, task, stop_event=None, tool_installer=None):
 def valid_restore_task(task):
     if not isinstance(task, dict):
         raise ValueError("invalid restore task")
+    subjects = [name for name in ("clip_id", "output_id") if name in task]
+    if len(subjects) != 1:
+        raise ValueError("restore task needs exactly one of clip_id or output_id")
     out = {}
-    for name in ("task_id", "attempt", "clip_id", "size_bytes"):
+    for name in ("task_id", "attempt", subjects[0], "size_bytes"):
         value = task.get(name)
         if type(value) is not int or value <= 0:
             raise ValueError("invalid restore task %s" % name)
@@ -25700,7 +25704,17 @@ def valid_restore_task(task):
     if not isinstance(sha, str) or len(sha) != 64 or any(ch not in "0123456789abcdef" for ch in sha):
         raise ValueError("invalid restore task sha256")
     out["sha256"] = sha
-    out["relative_path"] = valid_relative_path({"clip_id": out["clip_id"], "relative_path": task.get("relative_path")})
+    if "clip_id" in out:
+        out["subject"] = "clip=%d" % out["clip_id"]
+        out["relative_path"] = valid_relative_path({"clip_id": out["clip_id"], "relative_path": task.get("relative_path")})
+    else:
+        # A stitched output is read back from where collated delivery placed it.
+        out["subject"] = "output=%d" % out["output_id"]
+        raw = task.get("relative_path")
+        prefix = JOINED_ROOT + "/"
+        if not isinstance(raw, str) or not raw.startswith(prefix):
+            raise ValueError("invalid restore task relative_path")
+        out["relative_path"] = Path(JOINED_ROOT, valid_collated_relative_path(raw[len(prefix):]))
     put = task.get("put")
     if not isinstance(put, dict):
         raise ValueError("invalid restore capability")
@@ -25948,8 +25962,8 @@ def restore_task_and_report(cfg, task):
         state = "unreported"
         log("WARN", "restore %d report failed: %s" % (task["task_id"], exc))
     if state != "verified":
-        log("WARN", "restore %d clip=%d outcome=%s state=%s %s" % (
-            task["task_id"], task["clip_id"], result["outcome"], state, result["error"]))
+        log("WARN", "restore %d %s outcome=%s state=%s %s" % (
+            task["task_id"], task["subject"], result["outcome"], state, result["error"]))
     return result, state
 
 
@@ -25957,7 +25971,8 @@ def lease_restores(cfg, max_tasks):
     """Lease up to max_tasks restores; returns (valid tasks, server retry_after)."""
     # Never replayed: a lease whose response was lost just expires.
     lease = restore_api(cfg, "/account/connections/nas-restore/lease",
-                        {"client_version": CLIENT_VERSION, "max_tasks": max(1, min(RESTORE_MAX_LEASE, max_tasks))})
+                        {"client_version": CLIENT_VERSION, "max_tasks": max(1, min(RESTORE_MAX_LEASE, max_tasks)),
+                         "output_restores": True})
     if not isinstance(lease, dict) or not isinstance(lease.get("tasks", []), list):
         raise RuntimeError("invalid restore lease response")
     tasks = []

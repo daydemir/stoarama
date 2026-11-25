@@ -395,6 +395,18 @@ Existing destination selection and separately transported WebDAV verification
 remain available. These backend changes require the production controller's
 reviewed between-batch deployment; merging does not deploy or authorize deletion.
 
+Migration 0263 adds a second restore kind, 'output': a stitched output whose R2
+object is gone goes back to its own key from the NAS. Deniz, verbatim: "serve
+the best 14 days of as many streams as possible, fully stitched v85 ... via r2,
+through the nice web ui". The controller approves outputs by inserting
+`nas_restore_output_scope(output_id)` (deleting a row withdraws it), then
+`stoaramactl nas-restore request --output-ids-file FILE` queues them. A row is
+leased, signed and admitted past the writer fence only while it is scoped and
+carries the output's key, size and sha256 and the path of the connection's acked
+NAS copy (`joined/<nas_relative_path>`); `nas_restore_admitted` is the one gate
+for both kinds. Only a NAS client that sends `output_restores` leases these. A
+verified output changes no catalog or retirement row.
+
 ## R2 writer readiness reconciliation
 
 Migration0198 separates the retirement consumer's `r2_retirement_writes_blocked`
