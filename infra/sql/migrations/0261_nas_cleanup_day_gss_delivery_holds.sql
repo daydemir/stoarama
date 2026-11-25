@@ -6,11 +6,17 @@
 -- source or delivery path hold. Incident holds stay; every other 0259 release
 -- (R2 reservations, stitch/joined state, per-file source holds) stands.
 
+-- Every source clip of every GSS delivery output (the R2 manifest and the public
+-- generation), loaded once by the controller; the manifest lives only in R2.
+-- Holds stay until Deniz decides ("i wnat to save it if its not").
+CREATE TABLE nas_cleanup_gss_source_holds (clip_id bigint PRIMARY KEY);
+
 CREATE OR REPLACE FUNCTION nas_cleanup_day_clip_held(clip bigint, keep_everything boolean) RETURNS boolean LANGUAGE sql STABLE AS $$
  SELECT CASE WHEN keep_everything THEN nas_cleanup_day_ke_clip_held(clip) ELSE
   EXISTS(SELECT 1 FROM nas_cleanup_incident_sources h WHERE h.clip_id=clip)
   OR EXISTS(SELECT 1 FROM nas_cleanup_incident_files h WHERE h.kind='raw' AND h.source_id=clip)
   OR EXISTS(SELECT 1 FROM delivery_nas_source_holds h WHERE h.clip_id=clip)
+  OR EXISTS(SELECT 1 FROM nas_cleanup_gss_source_holds h WHERE h.clip_id=clip)
   OR EXISTS(SELECT 1 FROM recording_clips c WHERE c.id=clip
    AND delivery_nas_held('raw',c.id,c.display_path,lower(c.sha256),c.size_bytes)) END
 $$;

@@ -638,16 +638,21 @@ func TestNASCleanupDayRetiredDigestIsAdmissibleAgain(t *testing.T) {
 // dayIncidentClip is a raw clip on the permanent NAS cleanup incident roster (0202).
 const dayIncidentClip = 296368
 
-// dayDeliveryHoldsKeep checks that a delivery source hold on clip, and a delivery
-// path hold in dir, each keep a non-KE directory-day (0261, GSS delivery freeze),
-// then removes them.
+// dayDeliveryHoldsKeep checks that a delivery source hold, a GSS source hold on
+// clip, and a delivery path hold in dir each keep a non-KE directory-day (0261,
+// GSS delivery freeze), then removes them.
 func dayDeliveryHoldsKeep(t *testing.T, ctx context.Context, exec func(string, ...any), q cleanupDayQuerier, clip int64, u nasCleanupDayUnit) {
 	t.Helper()
 	exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica; INSERT INTO delivery_nas_source_holds(clip_id) VALUES(%d); COMMIT`, clip))
 	if _, _, err := dayCheck(ctx, q, u); err == nil || !strings.Contains(err.Error(), "held") {
 		t.Fatalf("delivery source hold did not keep a non-KE directory-day: %v", err)
 	}
-	exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM delivery_nas_source_holds WHERE clip_id=%[1]d;
+	exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM delivery_nas_source_holds WHERE clip_id=%d;
+INSERT INTO nas_cleanup_gss_source_holds(clip_id) VALUES(%[1]d); COMMIT`, clip))
+	if _, _, err := dayCheck(ctx, q, u); err == nil || !strings.Contains(err.Error(), "held") {
+		t.Fatalf("GSS source hold did not keep a non-KE directory-day: %v", err)
+	}
+	exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM nas_cleanup_gss_source_holds WHERE clip_id=%[1]d;
 INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,relative_path) VALUES('fixture','delivery/%[1]d','etag',1,'raw','%[2]s/delivered.mp4');
 COMMIT`, clip, u.RelativeDir))
 	if _, _, err := dayCheck(ctx, q, u); err == nil || !strings.Contains(err.Error(), "delivery path hold") {
