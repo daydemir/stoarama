@@ -55,7 +55,7 @@ def assemble_owned(status, owner, recovery, runner_report, api, db, now, running
     if running:
         fresh(status['updated_at'], now)
     else:
-        require(status['phase'] in ('stopped', 'complete') and db['enabled_plans'] == [])
+        require(status['phase'] in ('stopped', 'complete', 'day_complete') and db['enabled_plans'] == [])
         if status['current_plan'] is not None:
             pending = db['plans'][str(status['current_plan'])]
             require(pending['mode'] == 'dry_run' and pending['issued'] == 0)
