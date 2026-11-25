@@ -535,11 +535,15 @@ COMMIT`)
 	lateID := mustRequest(scopedLate, "")
 	// Past the fence, a scoped output row that drifted from its identity, or
 	// names another media type, is refused like any other fenced writer.
-	for _, drift := range []string{"$4+1,$5,'video/mp4'", "$4,repeat('0',64),'video/mp4'", "$4,$5,'text/html'"} {
+	n := len(scopedLate.body)
+	for _, drift := range []struct {
+		size       int
+		sha, ctype string
+	}{{n + 1, scopedLate.sha, "video/mp4"}, {n, strings.Repeat("0", 64), "video/mp4"}, {n, scopedLate.sha, "text/html"}} {
 		_, err := pool.Exec(ctx, `INSERT INTO nas_restore_requests(connection_id,output_id,recording_id,target,object_key,source_object_key,relative_path,size_bytes,sha256,content_type,label)
-			VALUES(13,$1,30,'output',$2,$2,'joined/'||$3,`+drift+`,'o1')`, scopedLate.id, scopedLate.key, scopedLate.path, len(scopedLate.body), scopedLate.sha)
+			VALUES(13,$1,30,'output',$2,$2,'joined/'||$3,$4,$5,$6,'o1')`, scopedLate.id, scopedLate.key, scopedLate.path, drift.size, drift.sha, drift.ctype)
 		if err == nil || !strings.Contains(err.Error(), "fenced") {
-			t.Fatalf("drifted output row %s queued past the writer fence: %v", drift, err)
+			t.Fatalf("drifted output row %+v queued past the writer fence: %v", drift, err)
 		}
 	}
 
