@@ -134,6 +134,10 @@ func ReadWorklist(r io.Reader) ([]HourWork, error) {
 	return out, sc.Err()
 }
 
+// OutcomeDiffers is a restore whose rebuild is not byte-identical to the
+// registered outputs: the one outcome a replacement may be approved for.
+const OutcomeDiffers = "differs"
+
 // HourResult is one line of the runner's results log.
 type HourResult struct {
 	HourID       string         `json:"hour_id"`
@@ -212,7 +216,7 @@ func RunWorklist(ctx context.Context, env Env, store ExistenceChecker, work []Ho
 					case errors.Is(err, ErrDeferred):
 						res.Outcome = "deferred"
 					case errors.Is(err, ErrRestoreDiffers):
-						res.Outcome, res.Error = "differs", err.Error()
+						res.Outcome, res.Error = OutcomeDiffers, err.Error()
 					case err != nil:
 						res.Outcome, res.Error = "failed", err.Error()
 					default:

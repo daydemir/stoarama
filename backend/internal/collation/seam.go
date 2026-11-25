@@ -14,6 +14,9 @@ import (
 const (
 	PolicyVersion = "collation-v2"
 	Generation    = 2
+	// ReplacementGeneration is a recovery hour that supersedes a registered
+	// generation-2 hour whose byte-identical restore differs (migration 0266).
+	ReplacementGeneration = 3
 
 	DecisionJoin  = "join"
 	DecisionSplit = "split"

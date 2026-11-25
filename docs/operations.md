@@ -388,6 +388,35 @@ the binding and stay gated by their own rows. The NAS cleanup source freeze (018
 and the R2 retirement key vetoes still apply: a stream frozen by an enabled
 cleanup plan waits for that plan.
 
+When a restore reports `differs` (the original FFmpeg nightly cannot be
+rebuilt), migration 0266 allows one replacement, supersede-only. Approved
+fallback: "first priority is best 14 stitched"; researchers do not care which
+FFmpeg did the stream copy.
+
+1. `collation-v2 approve-replacements --results RESULTS.jsonl --recovery-batch
+   recovery-NAME --reason TEXT` approves exactly the hours a run reported
+   `differs` (`collation_v2_recovery_replacements`, insert-only). An approval
+   names one generation-2 hour and one recovery batch. Like a scope row, it
+   never lands over a pending retirement and holds the old hour's keys for good.
+2. `plan --scope days --recovery-batch recovery-NAME` then plans each approved
+   hour fresh with the current FFmpeg as a generation-3 hour in that batch.
+   The hour gets new content-addressed keys. Its delivery path keeps the
+   superseded hour's tool-agnostic format, which for the same clips is the
+   same path; FFmpeg's version lives only in the manifest and catalog. Deniz,
+   verbatim: "keep the old file names agnostic to the stitching tool but yes
+   it's fine just stitched so we know what was done but the files should just
+   be stitched and delivered". Delivery paths are unique per generation, and a
+   generation-3 part may reuse only its superseded hour's path.
+3. `run --recovery-scope` and `register` add it beside the old hour, with
+   `supersedes_collation_hour_id` pointing at it.
+
+The day must be scoped for the recovery batch. The old row, its outputs and its
+keys are never updated, deleted or overwritten. Nothing else may shadow a
+registered generation-2 hour. The collated NAS feed already serves only the
+newest generation of each recording hour, so it switches to the replacement.
+The GSS generation builder only filters the files of an existing registry, so a
+registry listing the replacement outputs must come from a new base generation.
+
 New account and admin S3 destination verification/provisioning is retired
 before writing probes or credentials. Existing managed destinations resolve by
 read-only lookup; missing managed storage is not implicitly created, billed or marked verified.
