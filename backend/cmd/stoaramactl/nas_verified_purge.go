@@ -225,8 +225,13 @@ const nasPurgeFactsSQL = `
       AND (q.state IN ('pending','leased') OR (q.target='original' AND q.state='verified' AND q.completed_at>now()-interval '30 days'))) AS no_restore,
   NOT EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans cp ON cp.id=h.plan_id
       WHERE h.clip_id=c.id AND (cp.mode<>'retired'
-        OR EXISTS(SELECT 1 FROM nas_cleanup_items ci WHERE ci.plan_id=cp.id AND ci.delete_ever_issued))) AS no_cleanup_plan,
-  NOT EXISTS(SELECT 1 FROM nas_cleanup_plans cp WHERE cp.mode='enabled') AS no_enabled_cleanup`
+        OR EXISTS(SELECT 1 FROM nas_cleanup_items ci WHERE ci.plan_id=cp.id AND ci.delete_ever_issued)))
+  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_day_units du WHERE du.names IS NOT NULL
+      AND left(c.display_path,length(du.relative_dir)+1)=du.relative_dir||'/'
+      AND du.names @> jsonb_build_array(jsonb_build_object('name',substr(c.display_path,length(du.relative_dir)+2)))) AS no_cleanup_plan,
+  NOT EXISTS(SELECT 1 FROM nas_cleanup_plans cp WHERE cp.mode='enabled')
+  AND NOT EXISTS(SELECT 1 FROM nas_cleanup_day_plans dp WHERE dp.mode='enabled'
+      AND EXISTS(SELECT 1 FROM nas_cleanup_day_units du WHERE du.plan_id=dp.id AND du.names IS NOT NULL)) AS no_enabled_cleanup`
 
 var nasPurgeFactNames = []string{
 	"identity_ok", "managed_ok", "nas_ok", "aged", "schedule_ok", "no_snapshot", "no_scope",
@@ -521,11 +526,15 @@ func resolveNASPurgeConnection(ctx context.Context, pool *pgxpool.Pool, id int64
 
 func refuseNASPurgeDuringCleanup(ctx context.Context, pool *pgxpool.Pool) error {
 	var enabled []int64
-	if err := pool.QueryRow(ctx, `SELECT coalesce(array_agg(id ORDER BY id),'{}') FROM nas_cleanup_plans WHERE mode='enabled'`).Scan(&enabled); err != nil {
+	// A Keep Everything day plan deletes NAS copies against their live R2
+	// counterpart, so it fences R2 purges like a per-file plan.
+	if err := pool.QueryRow(ctx, `SELECT coalesce(array_agg(id ORDER BY id),'{}') FROM (SELECT id FROM nas_cleanup_plans WHERE mode='enabled'
+ UNION ALL SELECT -dp.id FROM nas_cleanup_day_plans dp WHERE dp.mode='enabled'
+  AND EXISTS(SELECT 1 FROM nas_cleanup_day_units du WHERE du.plan_id=dp.id AND du.names IS NOT NULL)) x`).Scan(&enabled); err != nil {
 		return fmt.Errorf("check NAS cleanup plans: %w", err)
 	}
 	if len(enabled) > 0 {
-		return fmt.Errorf("refusing to run while NAS cleanup plan(s) %v are enabled; pause them first", enabled)
+		return fmt.Errorf("refusing to run while NAS cleanup plan(s) %v are enabled (negative: Keep Everything day plans); pause them first", enabled)
 	}
 	return nil
 }

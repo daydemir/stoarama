@@ -229,7 +229,7 @@ func (p inverseProtection) classify(o r2.ObjectInfo) (inverseClass, string) {
 				return inverseKE, "keep_everything_catalog_path"
 			}
 		}
-		if p.Picks.Choices[id.StreamID].Choice == "all" {
+		if p.keepEverythingStream(id.StreamID) {
 			return inverseKE, "keep_everything_stream"
 		}
 	}
@@ -799,9 +799,17 @@ func inverseFreshPartition(ctx context.Context, store inverseLister, p inversePr
 // discovery, including raw source paths behind content-addressed outputs.
 func loadInverseKEFolders(ctx context.Context, q r2RetireQuerier, bucket string, picks r2RetirePicks) (map[string]bool, error) {
 	folders := map[string]bool{}
+	// Keep Everything is the keep20 policy set together with any pick "all".
+	ke, err := r2KeepEverything()
+	if err != nil {
+		return nil, err
+	}
 	var streams []int64
+	for id := range ke {
+		streams = append(streams, id)
+	}
 	for id, pick := range picks.Choices {
-		if pick.Choice == "all" {
+		if pick.Choice == "all" && !ke[id] {
 			streams = append(streams, id)
 		}
 	}

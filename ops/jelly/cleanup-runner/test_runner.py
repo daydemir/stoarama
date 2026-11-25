@@ -1500,14 +1500,14 @@ def day_dir(folder, day):
     return '%s/%s/%02d-%s' % (folder, r._MONTHS[day.month - 1], day.day, r._WEEKDAYS[day.weekday()])
 
 
-def day_fixture(*days, folder='f', stream=3):
+def day_fixture(*days, folder='f', stream=3, names=None):
     units = [dict(ordinal=n, unit_id=100 + n, stream_id=stream, relative_dir=day_dir(folder, d), local_date=d.isoformat(),
-                  files=2, bytes=200, state='pending', attempt=0, permit_live=False, refusal='', receipts=[])
+                  files=2, bytes=200, names=names, state='pending', attempt=0, permit_live=False, refusal='', receipts=[])
              for n, d in enumerate(days, 1)]
     plan = dict(id=77, label='kday-s3-day-0001', policy_sha256=r.POLICY_SHA, plan_sha256=r.day_digest(units), mode='dry_run',
                 approval_reason='', approved_until=None, files=2 * len(units), bytes=200 * len(units), units=units,
                 deleted_media_files=0, deleted_media_bytes=0, master_deletion_enabled=True)
-    catalog = [dict(relative_dir=u['relative_dir'], local_date=u['local_date'], held=0, overlap=0, dir_held=False) for u in units]
+    catalog = [dict(relative_dir=u['relative_dir'], local_date=u['local_date'], held=0, overlap=0, dir_held=False, unlive=0) for u in units]
     return plan, catalog
 
 
@@ -1531,6 +1531,7 @@ class DayVerifyTests(unittest.TestCase):
         self.assertEqual(self.verify(plan, catalog), 400)
         unit = dict(relative_dir='a/September/12-Saturday', local_date='2026-09-12', stream_id=3, files=2, bytes=300)
         self.assertEqual(r.day_digest([unit]), '9116c84bd7061b32fa4560b4d0eeafafb47928ed9482772d4ae6d6e2cca5feb3')
+        self.assertEqual(r.day_digest([dict(relative_dir='a/September/12-Saturday', local_date='2026-09-12', stream_id=78, files=2, bytes=300, names=[dict(name='a.mp4', size_bytes=100), dict(name='b.mp4', size_bytes=200)])]), 'e49626b3909930c3726bae74feccaae438249f9a49dc43c9ada3a2877e8e98f9')
 
     def test_keep_everything_in_window_boundary_and_unmapped_days_stop(self):
         cases = {
@@ -1543,6 +1544,75 @@ class DayVerifyTests(unittest.TestCase):
         for name, (plan, catalog) in cases.items():
             with self.subTest(name), self.assertRaises(r.Halt):
                 self.verify(plan, catalog)
+
+    def test_keep_everything_units_pass_only_with_live_names_outside_the_window(self):
+        # Stream 78 keeps everything; its pinned window is Seoul [2026-08-24, 2026-09-13).
+        seoul = '04_Asia_South_Korea_Seoul_Daechi_Station_Intersection'
+        names = [dict(name='a.mp4', size_bytes=150), dict(name='b.mp4', size_bytes=50)]
+        plan, catalog = day_fixture(self.d(2026, 10, 10), folder=seoul, stream=78, names=names)
+        self.assertEqual(self.verify(plan, catalog), 200)
+        self.assertNotEqual(r.day_digest(plan['units']), r.day_digest([dict(plan['units'][0], names=None)]))
+        for name, mutate in {
+            'unlive name': lambda p, c: c[0].update(unlive=1),
+            'totals differ': lambda p, c: p['units'][0].update(names=names[:1]),
+            'unsorted names': lambda p, c: p['units'][0].update(names=names[::-1]),
+            'boundary day': lambda p, c: p['units'][0].update(local_date='2026-09-13', relative_dir=day_dir(seoul, self.d(2026, 9, 13))),
+            'inside day': lambda p, c: p['units'][0].update(local_date='2026-09-01', relative_dir=day_dir(seoul, self.d(2026, 9, 1))),
+        }.items():
+            plan, catalog = day_fixture(self.d(2026, 10, 10), folder=seoul, stream=78, names=copy.deepcopy(names))
+            mutate(plan, catalog)
+            plan['plan_sha256'] = r.day_digest(plan['units'])
+            catalog[0].update(relative_dir=plan['units'][0]['relative_dir'], local_date=plan['units'][0]['local_date'])
+            with self.subTest(name), self.assertRaises(r.Halt):
+                self.verify(plan, catalog)
+        plan, catalog = day_fixture(self.d(2026, 10, 10), folder='99991_asia_japan_tokyo_shinjuku9', names=names)
+        with self.assertRaises(r.Halt):
+            self.verify(plan, catalog)  # Names on a non-Keep-Everything unit.
+
+    def test_day_pick_prepares_keep_everything_streams_last_with_the_r2_lister(self):
+        j = self.job
+        calls = []
+        with patch.object(j, 'query', return_value=[]), \
+             patch.object(j, 'prepare_stream', side_effect=lambda sid, args, exclusions: calls.append((sid, args)) or False):
+            self.assertIsNone(j.day_pick())
+        sids = [sid for sid, _ in calls]
+        ke = [sid for sid in sids if sid in j.keep_everything]
+        self.assertTrue(ke and sids == sorted(set(sids) - j.keep_everything) + sorted(ke))
+        self.assertTrue(all(('--r2prune' in args) == (sid in j.keep_everything) for sid, args in calls))
+
+    def test_day_pick_ignores_per_file_exclusions_and_keeps_its_own(self):
+        # Per-file exclusions came from per-file refusals (source holds); they never skip day plans.
+        j = self.job
+        evidence = lambda sid: dict(http_status=409, stream_id=sid, reason='source_hold', label='k28auto-x-s%d-raw-0001' % sid)
+        j.status.update(excluded_streams={'3': evidence(3)}, day_excluded_streams={'4': evidence(4)})
+        seen = []
+        with patch.object(j, 'query', return_value=[]), \
+             patch.object(j, 'prepare_stream', side_effect=lambda sid, args, exclusions: seen.append((sid, exclusions)) or False):
+            self.assertIsNone(j.day_pick())
+        self.assertIn((3, r.DAY_EXCLUSIONS), seen)
+        self.assertNotIn(4, [sid for sid, _ in seen])
+        self.assertTrue(all(exclusions == r.DAY_EXCLUSIONS for _, exclusions in seen))
+        self.assertFalse(j.stream_ready(3))  # Per-file mode still skips it.
+        self.assertTrue(j.stream_ready(4))
+
+    def test_day_admission_409_excludes_the_stream_from_day_plans_only(self):
+        j = self.job
+        j.status.update(current_plan=None, last_error=None)
+        j.step_failed = lambda *a, **kw: None
+        def prepare(argv, **kwargs):
+            out = Path(argv[argv.index('--out') + 1]); out.mkdir(parents=True)
+            label = argv[argv.index('--label-prefix') + 1] + '-s3-day-0001'
+            (out / 'admission-rejected.json').write_text(json.dumps(dict(http_status=409, stream_id=3, label=label,
+                                                                         reason='catalogued clip is held')))
+            raise r.CommandFailed(5)
+        out = j.root / 'day-plans' / 'kday-x-s3'
+        with patch.object(r, 'command', side_effect=prepare):
+            self.assertFalse(j.prepare_stream(3, ['--day-plans', '--label-prefix', 'kday-x', '--out', str(out),
+                                                  '--submit', '--atomic-admission'], r.DAY_EXCLUSIONS))
+        self.assertEqual(j.status['day_excluded_streams']['3']['reason'], 'catalogued clip is held')
+        self.assertNotIn('3', j.status.get('excluded_streams') or {})
+        self.assertFalse(j.stream_ready(3, r.DAY_EXCLUSIONS))
+        self.assertTrue(j.stream_ready(3))
 
     def test_held_overlap_totals_digest_and_started_units_stop(self):
         for mutate in (lambda p, c: c[0].update(held=1), lambda p, c: c[0].update(overlap=1),
@@ -1588,6 +1658,21 @@ class FakeDayRunner(FakeRunner):
 
 
 class DayLoopTests(unittest.TestCase):
+    def test_a_lost_keep_everything_counterpart_closes_the_plan_for_replanning(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
+            job = FakeDayRunner(root)
+            job.day_cat[0]['unlive'] = 1
+            self.assertIsNone(job.day_checked(job.day))
+            self.assertEqual(job.day['mode'], 'retired')
+            self.assertIsNone(job.status['current_day_plan'])
+            job.day_cat[0]['unlive'], job.day['mode'] = 0, 'dry_run'
+            self.assertEqual(job.day_checked(job.day), 200)
+            (Path(root) / 'dry').mkdir()
+            dry = FakeDayRunner(Path(root) / 'dry', dry_run=True)
+            dry.day_cat[0]['unlive'] = 1
+            with self.assertRaises(r.Halt):
+                dry.day_checked(dry.day)
+
     def test_one_owned_day_plan_enables_through_the_gate_then_pauses_and_closes(self):
         with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW), patch.object(r.time, 'sleep'):
             job = FakeDayRunner(root)

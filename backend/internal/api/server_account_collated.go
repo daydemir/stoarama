@@ -22,8 +22,14 @@ import (
 // pulls recording_collation_outputs to /clips/joined/<nas_relative_path> at a
 // server-set rate, beside (never yielding to) raw delivery.
 
+// The feed's per-request budgets. Variables only so the slow-CI integration
+// test can widen them; production never changes them.
+var (
+	collatedFeedBudget           = 3 * time.Second
+	collatedFeedStatementTimeout = "2s"
+)
+
 const (
-	collatedFeedBudget     = 3 * time.Second
 	collatedFeedFenceLimit = 50
 	// Candidates examined per feed request. In-window outputs sit in id runs with
 	// 20k-id gaps; one request must cross a gap. Production worst case ~0.7s of the 2s budget.
@@ -228,7 +234,7 @@ func (s *Server) handleAccountCollated(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer tx.Rollback(ctx)
-		if _, err = tx.Exec(ctx, `SET LOCAL statement_timeout='2s'`); err != nil {
+		if _, err = tx.Exec(ctx, "SET LOCAL statement_timeout='"+collatedFeedStatementTimeout+"'"); err != nil {
 			util.WriteError(w, 503, "collated feed budget unavailable; retryable")
 			return
 		}

@@ -133,6 +133,12 @@ CREATE TABLE nas_cleanup_items(plan_id bigint NOT NULL, delete_ever_issued boole
 INSERT INTO nas_cleanup_plans VALUES (1,'paused'),(2,'retired'),(4,'retired');
 INSERT INTO nas_cleanup_items VALUES (2,false),(4,true);
 INSERT INTO nas_cleanup_source_holds VALUES (1,170),(2,101),(4,171);
+CREATE TABLE nas_cleanup_day_plans(id bigint PRIMARY KEY, mode text NOT NULL);
+CREATE TABLE nas_cleanup_day_units(plan_id bigint NOT NULL, relative_dir text NOT NULL, state text NOT NULL, names jsonb);
+INSERT INTO nas_cleanup_day_plans VALUES (7,'paused'),(8,'enabled');
+-- Keep Everything units name 101 (pending) and 102 (deleted: its NAS copy is gone, R2 is the
+-- only copy); both stay held whatever the unit state. Plan 8 deletes non-KE days only.
+INSERT INTO nas_cleanup_day_units VALUES (7,'r','pending','[{"name":"101.mp4","size_bytes":1}]'),(7,'r','deleted','[{"name":"102.mp4","size_bytes":1}]'),(8,'r','pending',NULL);
 `); err != nil {
 		t.Fatal(err)
 	}
@@ -264,10 +270,10 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 		"restore_recent": 1, "joined_scope": 1, "active_recording_recent": 1, "joined_snapshot": 9,
 		"excluded_clip": 1, "excluded_recording": 1,
 		"candidate_recording": 1, "cohort_window": 1, "unplayable_signature": 1, "collated_only_delivery": 1,
-		"nas_cleanup_plan": 2,
+		"nas_cleanup_plan": 4,
 	}
 	dry := run(base)
-	if dry.Mode != "dry_run" || dry.Eligible != 8 || dry.Purged != 0 || len(store.deleted) != 0 {
+	if dry.Mode != "dry_run" || dry.Eligible != 6 || dry.Purged != 0 || len(store.deleted) != 0 {
 		t.Fatalf("dry run summary %+v", dry)
 	}
 	for reason, n := range wantSkips {
@@ -303,6 +309,13 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 	}
 	if result, err := runNASVerifiedPurgePass(ctx, pool, store, base, nil); err == nil || result.Scanned != 0 {
 		t.Fatal("read-only preview ran during cleanup", result, err)
+	}
+	// An enabled Keep Everything day plan fences R2 purges like a per-file plan.
+	if _, err := pool.Exec(ctx, `DELETE FROM nas_cleanup_plans WHERE id=3; UPDATE nas_cleanup_day_plans SET mode='enabled' WHERE id=7`); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := runNASVerifiedPurgePass(ctx, pool, store, base, nil); err == nil || !strings.Contains(err.Error(), "[-7]") || result.Scanned != 0 {
+		t.Fatal("read-only preview ran during a Keep Everything day plan", result, err)
 	}
 }
 

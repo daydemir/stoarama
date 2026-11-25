@@ -256,6 +256,9 @@ func r2RetireDecide(c r2RetireCandidate, bucket string, windows map[int64]api.Ke
 }
 
 func r2RetireDecideMode(c r2RetireCandidate, bucket string, windows map[int64]api.Keep28Window, picks map[int64]r2RetirePick, nasBacked bool) (string, string, bool) {
+	if r2RetireKeepEverything(c.StreamID) {
+		return "keep_everything", "all", false
+	}
 	if c.Facts.DeliveryHeld {
 		return "delivery_keep_hold", "", false
 	}
