@@ -101,12 +101,17 @@ func (c *Client) admit(ctx context.Context, ttl time.Duration, key string) (func
 		release()
 		finishCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
-		// The caller has just verified the key holds the expected bytes. Earlier
-		// lost recovery PUTs of that same create-only key can now only fail
-		// If-None-Match, so their intents complete with this one.
-		_, err := c.writerDB.Exec(finishCtx, `UPDATE r2_retirement_writer_operations SET completed_at=clock_timestamp()
-			WHERE completed_at IS NULL AND (id=$1 OR ($2 AND collation_recovery_hour_id IS NOT NULL AND bucket=$3 AND object_key=$4 AND id<$1))`,
-			operationID, recovery, c.bucket, key)
+		var err error
+		if recovery {
+			// The caller has just verified the key holds the expected bytes. Earlier
+			// lost recovery PUTs of that same create-only key can now only fail
+			// If-None-Match, so their intents complete with this one.
+			_, err = c.writerDB.Exec(finishCtx, `UPDATE r2_retirement_writer_operations SET completed_at=clock_timestamp()
+				WHERE completed_at IS NULL AND (id=$1 OR (collation_recovery_hour_id IS NOT NULL AND bucket=$2 AND object_key=$3 AND id<$1))`,
+				operationID, c.bucket, key)
+		} else {
+			_, err = c.writerDB.Exec(finishCtx, `UPDATE r2_retirement_writer_operations SET completed_at=clock_timestamp() WHERE id=$1 AND completed_at IS NULL`, operationID)
+		}
 		if err != nil {
 			return errors.New("R2 writer completion not durable; intent retained")
 		}
