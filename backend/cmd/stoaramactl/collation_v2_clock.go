@@ -26,10 +26,11 @@ import (
 )
 
 const clockJoinUsage = `usage:
-  stoaramactl collation-v2 clock-join --hours FILE --source DIR|r2 --registry KEY --profiles FILE --batch clock-prestitch-YYYYMMDD --out DIR [--veto-clips FILE] [--veto-recordings 433,...]
+  stoaramactl collation-v2 clock-join --hours FILE (--source-dir DIR | --source-r2) --registry KEY --profiles FILE --veto-clips FILE --batch clock-prestitch-YYYYMMDD --out DIR [--veto-recordings 433,...]
     FILE (--hours) lines: joined/<batch>/coverage/hours/<hour_id>.json manifest keys.
-    --source DIR reads a tree laid out by R2 key (collation-v2 run --publish-dir);
-    --source r2 reads R2 with a client that has no write admission.
+    --source-dir reads a tree laid out by R2 key (collation-v2 run --publish-dir);
+    --source-r2 reads R2 with a client that has no write admission.
+    --veto-clips is the known-bad clip list (one id per line); it is required, and may be empty.
     --registry is the parent delivery generation's key (datasets/global-street-scores-delivery/47/public/generations/<id>.json);
     its growth.json is read from the key the registry lists, sha256-checked.
     Writes only under --out: joined/<batch>/objects|proofs/ and results/<hour_id>.json,
@@ -40,15 +41,16 @@ const clockJoinUsage = `usage:
 func runClockJoin(ctx context.Context, cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("collation-v2 clock-join", flag.ExitOnError)
 	hours := fs.String("hours", "", "file of hour manifest keys")
-	source := fs.String("source", "", "DIR or r2")
+	sourceDir := fs.String("source-dir", "", "local tree laid out by R2 key")
+	sourceR2 := fs.Bool("source-r2", false, "read R2 (no write admission)")
 	registryKey := fs.String("registry", "", "parent delivery generation registry key")
 	profilesPath := fs.String("profiles", "", "JSON array of clock profiles")
 	batch := fs.String("batch", "", "clock-prestitch-YYYYMMDD")
 	out := fs.String("out", "", "output directory")
-	vetoClips := fs.String("veto-clips", "", "file of known-bad clip ids (one per line)")
+	vetoClips := fs.String("veto-clips", "", "file of known-bad clip ids (one per line; required, may be empty)")
 	vetoRecordings := fs.String("veto-recordings", "", "comma-separated known-bad recording ids")
 	_ = fs.Parse(args)
-	if *hours == "" || *source == "" || *registryKey == "" || *profilesPath == "" || !clockjoin.ValidBatch(*batch) || *out == "" {
+	if *hours == "" || (*sourceDir == "") == !*sourceR2 || *vetoClips == "" || *registryKey == "" || *profilesPath == "" || !clockjoin.ValidBatch(*batch) || *out == "" {
 		log.Fatal(clockJoinUsage)
 	}
 	keys, err := readManifestKeys(*hours)
@@ -59,13 +61,16 @@ func runClockJoin(ctx context.Context, cfg config.Config, args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	var src clockjoin.Source = clockjoin.DirSource{Root: *source}
-	if *source == "r2" {
+	var src clockjoin.Source = clockjoin.DirSource{Root: *sourceDir}
+	if *sourceR2 {
 		src = readOnlyR2Source(ctx, cfg)
 	}
 	env, err := clockParentGeneration(ctx, src, *registryKey)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if _, err := os.Stat(*vetoClips); err != nil {
+		log.Fatal(err) // an absent list is not an empty one
 	}
 	if env.VetoClips, err = readIDSet(*vetoClips); err != nil {
 		log.Fatal(err)

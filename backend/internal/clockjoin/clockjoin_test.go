@@ -114,6 +114,10 @@ func TestAssemblyPath(t *testing.T) {
 	if _, err := AssemblyPath([]string{stem + "_part_02.mp4", strings.Replace(stem, "hour_03", "hour_04", 1) + "_part_01.mp4"}, false); err == nil {
 		t.Fatal("parts of two hours named as one")
 	}
+	dst := strings.Replace(stem, "hour_03", "hour_03_dst2", 1)
+	if got, _ := AssemblyPath([]string{dst + "_part_01.mp4", dst + "_part_02.mp4"}, true); got != dst+".mp4" {
+		t.Fatalf("DST repeat hour name %s", got)
+	}
 	for _, p := range []string{"x.mp4", stem + "_part_02_reviewed_union.mp4"} {
 		if _, err := AssemblyPath([]string{p, p}, false); err == nil {
 			t.Fatalf("%s accepted as a part name", p)
@@ -256,12 +260,22 @@ func newHour(t *testing.T, specs []spec, seamReason string) hourFixture {
 	return hourFixture{root: root, out: out, key: mk, env: env}
 }
 
+// missing skips a media test on a developer machine without the tools, and
+// fails it in CI, which installs them.
+func missing(t *testing.T, why string) {
+	t.Helper()
+	if os.Getenv("CI") != "" {
+		t.Fatal(why)
+	}
+	t.Skip(why)
+}
+
 func requireTools(t *testing.T) collation.Tools {
 	t.Helper()
 	tools := collation.ToolsFromEnv()
 	for _, bin := range []string{tools.FFmpeg, tools.FFprobe, "tesseract"} {
 		if _, err := exec.LookPath(bin); err != nil {
-			t.Skipf("%s not available", bin)
+			missing(t, bin+" not available")
 		}
 	}
 	return tools
@@ -300,7 +314,7 @@ func renderClock(t *testing.T, tools collation.Tools, dst string, s spec) {
 	cmd := exec.Command(tools.FFmpeg, args...)
 	cmd.Stdin = &frames
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Skipf("cannot synthesize clock media: %v %s", err, out)
+		missing(t, fmt.Sprintf("cannot synthesize clock media: %v %s", err, out))
 	}
 }
 

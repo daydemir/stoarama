@@ -148,6 +148,14 @@ const (
 	MatchDecodeFail = "seam_decode_failed"
 )
 
+// Split reasons the clock-join pass reads back from manifests.
+const (
+	ReasonDBGap             = "db_gap"
+	ReasonFrameMatchMissing = "frame_match_missing"
+	// ReasonFramePrefix + a MatchEvidence verdict is a frame-match split.
+	ReasonFramePrefix = "frame_"
+)
+
 type SeamDecision struct {
 	PrevClipID     int64          `json:"prev_clip_id"`
 	NextClipID     int64          `json:"next_clip_id"`
@@ -196,7 +204,7 @@ func MetadataGate(policy SeamPolicy, prev, next Clip, pm, nm ClipMedia) string {
 	}
 	gap := next.StartUTC.Sub(prev.EndUTC).Seconds()
 	if gap > policy.GapFrameSlack*frame {
-		return "db_gap"
+		return ReasonDBGap
 	}
 	if gap < -policy.GapFrameSlack*frame {
 		return "db_overlap"
@@ -224,11 +232,11 @@ func DecideSeam(policy SeamPolicy, prev, next Clip, pm, nm ClipMedia, match *Mat
 		return d
 	}
 	if match == nil {
-		d.Reason = "frame_match_missing"
+		d.Reason = ReasonFrameMatchMissing
 		return d
 	}
 	if match.Verdict != MatchContinuous {
-		d.Reason = "frame_" + match.Verdict
+		d.Reason = ReasonFramePrefix + match.Verdict
 		d.OverlapSeconds = match.OverlapSeconds
 		return d
 	}

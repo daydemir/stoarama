@@ -17,7 +17,7 @@ burned-in seconds clock and joins the parts only when all of these hold
 |---|---|
 | Parts | Both parts are collated files in the parent delivery generation, and no live assembly already replaces either. |
 | Seam | The manifest has the direct seam (last clip of part N → first clip of part N+1). Its split reason is visual or low-confidence: `frame_low_motion`, `frame_jump`, `frame_insufficient_frames`, `frame_match_missing`, or `db_gap` of at most 2 s. Every other split stays, e.g. a job or capture change, `packet_replay`, `frame_overlap`, a decode failure. |
-| Known bad | No source clip of either part is on `--veto-clips`, the recording is not on `--veto-recordings`, and no quarantined clip lies between the parts. |
+| Known bad | No source clip of either part is on `--veto-clips` (required: an absent file fails, an empty one states "none known"), the recording is not on `--veto-recordings`, and no quarantined clip lies between the parts. |
 | Media | Both parts have the same codec parameters, so stream copy is valid. |
 | Clock gap | The clock at N's last frame and N+1's first frame differ by 0–1 s. |
 | Frame count | For each part, N (collation-v2's verified video packets) is within ±20% of fps × clock span (fps from packet cadence, never from N). |
@@ -38,7 +38,7 @@ A run of joined seams becomes one assembly:
 - `results/<hour_id>.json`: every seam verdict and assembly for the hour. A rerun skips any hour that already has a result.
 
 **What the pass never does.** It writes nothing to R2 and nothing to the database.
-- `--source r2` reads through an `r2.Client` that has no writer database, so the client itself refuses every write.
+- `--source-r2` reads through an `r2.Client` that has no writer database, so the client itself refuses every write.
 - No hour or output rows are created. The assemblies' inputs stay registered collation-v2 outputs.
 
 ## Registration: the existing generation and keep-hold model
@@ -59,10 +59,16 @@ The builder refuses any of these:
 - an input claimed by two clock assemblies;
 - a delivery path that is already taken.
 
-**Writer fence.** This PR changes no fence. The uploads are create-only (`If-None-Match: *`, checked ETag), exactly like the generation builder's asset uploads.
-- The #620 exception (migration 0262) admits only collation-v2 recovery hours and their parts. It does **not** admit these keys.
-- So the upload step is the controller's existing generation-upload path, used under the same approval as a generation publish.
-- If that path is not available under the active fence, the pilot stops after local verification. Admitting these keys would then need a reviewed fence design.
+**Writer fence: publishing needs a decision from Deniz.** This PR changes no fence, and no existing fence exception admits these uploads.
+- The #620 exception (migration 0262) admits only collation-v2 recovery hours and their parts, through `r2.Client`. Clock assemblies are neither.
+- The generation builder's asset uploads (#618) are controller uploads outside `r2.Client`. No fence row admits them either.
+- So the pilot can run, verify and build its preview generation without any R2 write (steps 0–3). Step 4's uploads need Deniz to choose one of two routes:
+  - approve them as controller create-only uploads, as he did for the generation assets;
+  - ask for a reviewed fence design that admits `joined/clock-prestitch-*` keys.
+
+**Protection.** `delivery_keep_holds` gates publication (`RequireDeliveryKeep`). Since migration 0244 it no longer holds R2 objects from retirement.
+- Today the new prefix is outside every retirement lane's selection. `inverseCollatedPrefixAllowed` names only `joined/goodplus-`, `joined/nightly-collation-v2/` and `joined/best14-20261021/`, and the delivery exemptions cover only `experimental/stitching-confident-repairs/`.
+- That is incidental, so step 4 also adds the keys to the Jelly lane protect list, as best-14 plan step 0 does for the other delivery keys.
 
 ## Pilot: stream 435 (Kroměříž – Hanácké náměstí)
 
@@ -99,12 +105,18 @@ scp hours-435.txt root@167.71.91.3:/mnt/gss_best14_scratch/
 
 ### 2. Clock join (droplet; R2 reads only)
 
+The known-bad list is required.
+- October's known-bad flags are in `v85-local-plan.md:59-67`. For the named streams they excluded 433 (`CLOCK_present_knownbad_excluded`) and flagged no 435 clip.
+- The clips collation-v2 itself found broken are already quarantined in each manifest, and the pass vetoes any quarantined clip between two parts.
+- So for 435 the list is explicitly empty. For another stream, put the clip ids of any known-bad source in it.
+
 ```sh
+: > veto-clips-435.txt     # explicit: no known-bad 435 clips
 cd /mnt/gss_best14_scratch
 set -a; . /opt/collate/r2.env; set +a
 export FFMPEG_BIN=/opt/collate/bin/ffmpeg FFPROBE_BIN=/opt/collate/bin/ffprobe
 /opt/collate/bin/stoaramactl-clock collation-v2 clock-join \
-  --hours hours-435.txt --source r2 \
+  --hours hours-435.txt --source-r2 --veto-clips veto-clips-435.txt \
   --registry datasets/global-street-scores-delivery/47/public/generations/ae14e746468c5c6402cd6f8ca55aca6e.json \
   --profiles /opt/collate/bin/clock-profiles.json --veto-recordings 433 \
   --batch clock-prestitch-20261126 --out clock-435 2>&1 | tee clock-435.log
@@ -112,9 +124,12 @@ export FFMPEG_BIN=/opt/collate/bin/ffmpeg FFPROBE_BIN=/opt/collate/bin/ffprobe
 
 **Expected result:**
 - One log line per hour (`status=joined|no_join|single_part`).
-- A final JSON summary with `hours: 82` and `failed: 0`; `seams` should be about 224 or fewer.
-- `reasons` counts every verdict. `joins / seams` is the pilot's yield.
-- `already_assembled` counts seams that touch V79/V85 inputs.
+- A final JSON summary with `hours: 82` and `failed: 0`. Single-part hours count under `statuses.single_part`.
+- `seams` counts every adjacent pair of manifest parts, including the pairs vetoed before OCR. `reasons` breaks them down:
+  - `part_not_delivered` and `already_assembled`: parts that V79/V85 assemblies replace in `ae14e746`. This is the bulk, since 3,084 of 435's parts are replaced.
+  - `seam_not_eligible`: metadata or replay splits.
+  - The rest went to the clock, about 224 seams: `clock_continuous` (joined), or `clock_gap`, `clock_overlap`, `clock_unreadable`, `clock_inconsistent`, `frame_count_mismatch`.
+- The pilot's yield is `clock_continuous` divided by the seams that reached the clock.
 - A failed hour (a network error, for example) is retried by rerunning the same command. Hours that are done are skipped.
 
 **Verify on the droplet before registering:**
@@ -160,7 +175,15 @@ The output directory must be on the same filesystem as `clock-435`, because the 
 
 ### 4. Preview (controller, with go-ahead: R2 create-only uploads and DB inserts)
 
-1. Upload every `uploads.tsv` row create-only (`If-None-Match: *`) through the same path as `ae14e746`'s assets. Check that each returned ETag equals the listed one. See the writer-fence note above.
+1. **Only after Deniz approves the upload route** (see the writer-fence note), upload every `uploads.tsv` row create-only and check its ETag:
+   ```sh
+   tail -n +2 gen-clock-435/uploads.tsv | while IFS=$'\t' read key local sha size ctype etag; do
+     got=$(aws s3api put-object --bucket "$R2_BUCKET" --key "$key" --body "gen-clock-435/$local" --content-type "$ctype" \
+       --if-none-match '*' --endpoint-url "$R2_ENDPOINT" --query ETag --output text) || { echo "REFUSED $key"; break; }
+     [ "$got" = "\"$etag\"" ] || { echo "ETAG MISMATCH $key"; break; }
+   done
+   ```
+   A refused PUT on a key that already exists is fine only if HEAD shows the same ETag. Then add every new `joined/clock-prestitch-*` key to the Jelly lane protect list.
 2. Insert the holds and dependencies (psql via PG* env):
    ```sql
    \copy delivery_keep_holds(bucket,object_key,etag,size_bytes,recording_id,kind,sha256,relative_path) FROM 'holds.tsv' WITH (FORMAT text, HEADER)
@@ -174,13 +197,13 @@ The output directory must be on the same filesystem as `clock-435`, because the 
    - the "Clock-prestitched" assemblies appear with "CLOCK_20 · k boundaries verified";
    - an hour shows the assembly once, under its tool-agnostic name, in place of its parts;
    - Play shows the clock running through each seam, with sound;
-   - a downloaded file's sha256 equals its name.
+   - a downloaded file's sha256 equals its registry `sha256` (the R2 key is `<sha256>.mp4`; the download name is the tool-agnostic part name).
    While a NAS cleanup permit is live, the public page serves only the pinned generation and answers "public publication deferred during NAS cleanup". If so, preview once the cleanup window closes.
 
 ### 5. Swap (only on Deniz's go)
 
 Upload the same registry as `public/current.json` and move the pinned `reviewed` generation in `backend/internal/api/server_global_delivery.go`, in a PR, as #618 did.
 
-**Rollback** is the previous `current.json`. Every new key is create-only and held, and the old generation is untouched.
+**Rollback** is the previous `current.json`. Every new key is create-only, and the old generation is untouched.
 
 **Scale-out after the pilot.** Add the profile of each viable stream from `clock-readability.tsv` (tune it with `clock-read` on 3 parts; expect `status: ok` at both edges), then run on the hours that stream has finished.

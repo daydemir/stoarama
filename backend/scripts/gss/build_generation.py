@@ -369,10 +369,18 @@ def read_clock_assemblies(dirs):
                     raise SystemExit(f'{r}: assembly {a["sha256"]} is not {CLOCK_VERSION}')
                 for key, sha, size in ((a['key'], a['sha256'], a['size_bytes']), (a['proof_key'], a['proof_sha256'], a['proof_size_bytes'])):
                     local = os.path.join(d, key)
-                    if os.path.getsize(local) != size:
-                        raise SystemExit(f'{local}: size differs from its clock-join result')
+                    if os.path.getsize(local) != size or file_sha256(local) != sha:
+                        raise SystemExit(f'{local}: bytes differ from its clock-join result')
                 out.append(dict(a, local_dir=os.path.abspath(d)))
     return out
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def add_clock_assemblies(parent, present, added):

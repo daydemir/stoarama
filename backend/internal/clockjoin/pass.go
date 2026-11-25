@@ -39,11 +39,11 @@ const (
 // Collation-v2 split reasons the clock may overrule: visual or low-confidence
 // evidence, where the metadata gate passed. Every other split stays.
 var eligibleReasons = map[string]bool{
-	"frame_" + collation.MatchLowMotion: true,
-	"frame_" + collation.MatchJump:      true,
-	"frame_" + collation.MatchTooShort:  true,
-	"frame_match_missing":               true,
-	"db_gap":                            true,
+	collation.ReasonFramePrefix + collation.MatchLowMotion: true,
+	collation.ReasonFramePrefix + collation.MatchJump:      true,
+	collation.ReasonFramePrefix + collation.MatchTooShort:  true,
+	collation.ReasonFrameMatchMissing:                      true,
+	collation.ReasonDBGap:                                  true,
 }
 
 // Reason is why a seam was joined or kept split.
@@ -224,6 +224,12 @@ func DecideClock(v SeamVerdict, prev, next PartCheck) SeamVerdict {
 	}
 	return v
 }
+
+// The page counts an annotation only with exactly these values.
+const (
+	annotationScope  = "boundary"
+	annotationStatus = "verified"
+)
 
 // Annotation is the page's CLOCK_20 boundary evidence
 // (coverage-growth.js clockBoundaryLabel).
@@ -458,7 +464,7 @@ func vetoSeam(env Env, m collation.HourManifest, a, b *part, seamOf map[[2]int64
 		return NoDirectSeam
 	}
 	v.CollationReason = s.Reason
-	if s.Decision != collation.DecisionSplit || !eligibleReasons[s.Reason] || (s.Reason == "db_gap" && math.Abs(s.DBGapSeconds) > MaxDBGapSeconds) {
+	if s.Decision != collation.DecisionSplit || !eligibleReasons[s.Reason] || (s.Reason == collation.ReasonDBGap && math.Abs(s.DBGapSeconds) > MaxDBGapSeconds) {
 		return SeamNotEligible
 	}
 	for _, o := range []collation.Output{a.out, b.out} {
@@ -485,8 +491,9 @@ func vetoSeam(env Env, m collation.HourManifest, a, b *part, seamOf map[[2]int64
 	return ""
 }
 
-// partName is a collated delivery name: <stem>_hour_HH[_part_NN].mp4.
-var partName = regexp.MustCompile(`^(.*_hour_[0-9]{2})(_part_[0-9]{2,})?\.mp4$`)
+// partName is a collated delivery name: <stem>_hour_HH[_dst2][_part_NN].mp4
+// (recordingnaming.BuildCollatedPath; _dst2 is a DST repeat hour).
+var partName = regexp.MustCompile(`^(.*_hour_[0-9]{2}(?:_dst2)?)(_part_[0-9]{2,})?\.mp4$`)
 
 // AssemblyPath names an assembly in its parts' own delivery format: a run
 // covering the whole hour takes the hour's single-part name, any other run
@@ -513,14 +520,11 @@ func buildAssembly(ctx context.Context, env Env, m collation.HourManifest, parts
 	paths := make([]string, len(run))
 	ids := make([]int64, len(run))
 	own := map[string]bool{}
-	seconds, audio := 0.0, 0
+	seconds := 0.0
 	for i, p := range run {
 		locals[i], paths[i], ids[i] = *p.local, p.delivered.Path, p.delivered.ID
 		own[p.delivered.Path] = true
 		seconds += p.local.Probe.Media.ContentSeconds
-		if p.local.Probe.Audio != nil {
-			audio += len(p.local.Probe.Audio.Packets)
-		}
 	}
 	deliveryPath, err := AssemblyPath(paths, len(run) == len(parts))
 	if err != nil {
@@ -537,9 +541,8 @@ func buildAssembly(ctx context.Context, env Env, m collation.HourManifest, parts
 	if err := collation.VerifyFullDecode(ctx, env.Tools, tmp); err != nil {
 		return Assembly{}, fmt.Errorf("full decode: %w", err)
 	}
-	if built.Verification.AudioPackets != audio {
-		return Assembly{}, fmt.Errorf("assembly carries %d audio packets, parts %d", built.Verification.AudioPackets, audio)
-	}
+	// VerifyPart proved the assembly's audio is exactly the parts' audio packets.
+	audio := built.Verification.AudioPackets
 	if built.SizeBytes >= maxAssemblyBytes {
 		return Assembly{}, fmt.Errorf("assembly is %d bytes, over a single-part upload", built.SizeBytes)
 	}
@@ -585,7 +588,7 @@ func buildAssembly(ctx context.Context, env Env, m collation.HourManifest, parts
 		a.AudioDeliveryStatus = AudioCopied
 	}
 	for _, s := range seams {
-		a.ClockBoundaryAnnotations = append(a.ClockBoundaryAnnotations, Annotation{Scope: "boundary", Method: Method, Status: "verified",
+		a.ClockBoundaryAnnotations = append(a.ClockBoundaryAnnotations, Annotation{Scope: annotationScope, Method: Method, Status: annotationStatus,
 			ArtifactSHA256: built.SHA256, ProofSHA256: proofSHA, SourceInputIDs: [2]int64{s.PrevOutputID, s.NextOutputID},
 			MaxRelativeError: math.Max(s.Prev.RelativeFPSError, s.Next.RelativeFPSError)})
 	}
