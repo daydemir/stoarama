@@ -8,7 +8,7 @@ import re
 import threading
 from pathlib import Path
 import subprocess
-from admission import Attempt, Latched, publish
+from admission import TRANSIENT_EXIT, Attempt, Latched, TransientFailure, publish, transient_record
 from cli_binding import bound_launcher
 
 STOPS = {'evidence_unavailable', 'cleanup_recovery_problems', 'unknown_enabled_cleanup',
@@ -86,10 +86,12 @@ def main():
                                   ([str(args.cli), 'nas-r2-copy', 'status', '--json'], copy)):
                 with path.open('wb') as output:
                     os.chmod(path, 0o600)
-                    subprocess.run(command, stdout=output, stderr=subprocess.DEVNULL,
-                                   timeout=90, check=True)
+                    result = subprocess.run(command, stdout=output, stderr=subprocess.DEVNULL, timeout=90)
                 if path.stat().st_size > 1024 * 1024:
                     raise ValueError('oversize evidence')
+                if path == safety and result.returncode == TRANSIENT_EXIT:
+                    raise TransientFailure(transient_record(json.loads(safety.read_bytes()), 'transient'))
+                result.check_returncode()
             command = [str(args.cli), 'finish', 'tick', '--safety', str(safety),
                        '--copy-status', str(copy), '--status', str(status)]
             if args.refresh_picks is not None:
@@ -117,6 +119,17 @@ def main():
             reason = reason or 'evidence_unavailable'
             notify(args.notify_agent, reason)
             return 1
+        except TransientFailure as failure:
+            # No feed and no latch. Every 120 s, so no notification: the old
+            # status keeps aging for the dead-man and the runner's hold alerts.
+            try:
+                if attempt.finish('', {}, held=failure.kind):
+                    print('finish transient_hold ' + failure.kind.value, flush=True)
+                    return TRANSIENT_EXIT
+            except Latched:
+                notify(args.notify_agent, 'admission_publication_failed')
+                return 1
+            reason = 'evidence_unavailable'
         except Latched:
             if attempt is not None and attempt.abandoned:
                 notify(args.notify_agent, 'admission_publication_failed')

@@ -8,12 +8,16 @@ from pathlib import Path
 import subprocess
 from datetime import datetime
 import re
+import time
 
 from tick import notify
-from admission import Attempt, Latched, publish
+from admission import (REFRESH_HOLD, TRANSIENT_EXIT, Attempt, Latched, Transient, TransientFailure,
+                       publish, transient_record)
 from cli_binding import bound_launcher
 
 FIELDS = ('plan_id', 'plan_sha256', 'delete_ever_issued', 'verified', 'problems', 'checked_at')
+# Three plan-source tries over about ten minutes inside one launchd run.
+RETRY_DELAYS = (120, 360)
 
 
 def validate_checked_at(value):
@@ -28,6 +32,40 @@ def validate_checked_at(value):
     base, fraction, zone = match.groups()
     normalized = base + ('.' + fraction.ljust(6, '0')[:6] if fraction else '') + zone.replace('Z', '+00:00')
     datetime.fromisoformat(normalized)
+
+
+def select_plan(source):
+    try:
+        result = subprocess.run([str(source)], capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise TransientFailure(Transient.TIMEOUT) from None
+    if result.returncode == TRANSIENT_EXIT:
+        raise TransientFailure(transient_record(json.loads(result.stdout), 'transient'))
+    result.check_returncode()
+    record = json.loads(result.stdout)
+    if not isinstance(record, dict):
+        raise ValueError('invalid plan source')
+    plan = record['plan_id']
+    if type(plan) is not int or plan <= 0:
+        raise ValueError('invalid plan')
+    return plan
+
+
+def select_plan_retrying(source):
+    for delay in RETRY_DELAYS:
+        try:
+            return select_plan(source)
+        except TransientFailure:
+            time.sleep(delay)
+    return select_plan(source)
+
+
+def held_before(state):
+    """Whether the previous refresh already held, so this episode was notified."""
+    try:
+        return REFRESH_HOLD in json.loads((state / 'recovery.json').read_bytes())
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def main():
@@ -45,20 +83,17 @@ def main():
             args.state.mkdir(parents=True, exist_ok=True, mode=0o700)
             attempt = Attempt.start(args.state, 'recovery', stack)
             args.cli = bound_launcher(args.cli)
-            source = subprocess.run([str(args.plan_source)], capture_output=True, timeout=30, check=True)
-            source_record=json.loads(source.stdout)
-            if not isinstance(source_record,dict):
-                raise ValueError('invalid plan source')
-            plan = source_record['plan_id']
-            if type(plan) is not int or plan <= 0:
-                raise ValueError('invalid plan')
+            plan = select_plan_retrying(args.plan_source)
             publish(attempt.path / 'plan.json', {'plan_id': plan})
             # Keep potentially credential-bearing stderr and raw problem detail
             # out of logs and the published record. The CLI owns checked_at.
             with (attempt.path / 'verifier.json').open('w+b') as output:
                 os.chmod(output.name, 0o600)
-                result = subprocess.run([str(args.cli), 'nas-cleanup', 'verify-recovery', '--plan-id', str(plan)],
-                                        stdout=output, stderr=subprocess.DEVNULL, timeout=1800)
+                try:
+                    result = subprocess.run([str(args.cli), 'nas-cleanup', 'verify-recovery', '--plan-id', str(plan)],
+                                            stdout=output, stderr=subprocess.DEVNULL, timeout=1800)
+                except subprocess.TimeoutExpired:
+                    raise TransientFailure(Transient.TIMEOUT) from None
                 output.seek(0)
                 raw = output.read(2 * 1024 * 1024 + 1)
             publish(attempt.path / 'result.json', {'returncode': result.returncode})
@@ -85,6 +120,23 @@ def main():
             if attempt.finish(reason, record):
                 return 0
             notify(args.notify_agent, reason or 'recovery_refresh_failed')
+            return 1
+        except TransientFailure as failure:
+            # Hold without latching: admission stays unlatched, the old report is
+            # no longer consumable, and the next scheduled or kicked run retries.
+            line = 'recovery_transient_hold ' + failure.kind.value
+            first = not held_before(args.state)
+            try:
+                if attempt.finish('', {}, held=failure.kind):
+                    if first:
+                        notify(args.notify_agent, line)
+                    else:
+                        print('finish ' + line, flush=True)
+                    return TRANSIENT_EXIT
+            except Latched:
+                notify(args.notify_agent, 'admission_publication_failed')
+                return 1
+            notify(args.notify_agent, 'evidence_unavailable')
             return 1
         except Latched:
             if attempt is not None and attempt.abandoned:

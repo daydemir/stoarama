@@ -80,6 +80,38 @@ else:
                 self.assertIn('current_status_unavailable' if failure == 'status' else 'dependency_failed', notification)
 
 
+class TransientHoldTest(unittest.TestCase):
+    def test_transient_collector_holds_quietly_and_malformed_transient_latches(self):
+        wrapper = Path(__file__).with_name('tick.py')
+        old = '{"schema":"stoarama.finish-status.v1","updated_at":"2026-11-17T07:00:00Z"}'
+        for stdout, latched in (('{"transient":"recovery_held"}', False), ('{"transient":"dns"}', False),
+                                ('{"transient":"bogus"}', True), ('not json', True)):
+            with self.subTest(stdout=stdout), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                state = root / 'state'
+                state.mkdir()
+                (state / 'status.json').write_text(old)
+                collector = root / 'collector'
+                collector.write_text("#!/bin/sh\necho '" + stdout + "'\nexit 75\n")
+                cli = root / 'cli'
+                cli.write_text('#!/bin/sh\necho "{}"\n')
+                darma = root / 'darma'
+                darma.write_text('#!/bin/sh\necho "$*" > "' + str(root / 'notification') + '"\n')
+                for executable in (collector, cli, darma):
+                    executable.chmod(0o700)
+                result = subprocess.run([sys.executable, str(wrapper), '--cli', str(cli), '--state', str(state),
+                                         '--safety-collector', str(collector), '--notify-agent', 'deniz'],
+                                        env={**os.environ, **binding_environment(root, cli), 'PATH': str(root) + ':' + os.environ['PATH']}, capture_output=True)
+                admission = json.loads((state / 'admission.json').read_text())
+                self.assertEqual(result.returncode, 1 if latched else 75)
+                self.assertEqual(admission['failed'], latched)
+                self.assertEqual((root / 'notification').exists(), latched)
+                if not latched:
+                    self.assertEqual(admission['active'], {})
+                    self.assertEqual((state / 'status.json').read_text(), old, 'a hold never restamps status')
+                    self.assertEqual(result.stdout.decode().strip(), 'finish transient_hold ' + json.loads(stdout)['transient'])
+
+
 class StderrTailTest(unittest.TestCase):
     def setUp(self):
         sys.path.insert(0, str(Path(__file__).parent))

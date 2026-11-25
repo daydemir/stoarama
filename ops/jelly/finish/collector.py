@@ -2,14 +2,21 @@
 """Controller safety collector: strict held COPY mode or explicitly pinned cleanup ownership."""
 import argparse
 from datetime import datetime, timezone
+import errno
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import re
+import socket
+import ssl
 import subprocess
 import sys
+import urllib.error
 import urllib.request
+
+from admission import REFRESH_HOLD, TRANSIENT_EXIT, Transient, TransientFailure, transient_record
 
 PLAN = 1440
 PLAN_SHA = '78b86990e0a45715deb9383226cff6ff5f01e6159f3d8eaf8b6d41bb39e38697'
@@ -51,6 +58,92 @@ def fresh(value, now, age=300):
     require(-30 <= (now - timestamp(value)).total_seconds() <= age)
 
 
+NAS_LAG_SECONDS = 2 * 3600
+UNREACHABLE = frozenset((errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN, errno.EHOSTDOWN))
+# psql exit 3 (ON_ERROR_STOP) with only these SQLSTATEs: statement or lock timeout.
+TIMEOUT_SQLSTATES = frozenset(('57014', '55P03'))
+
+
+def nas_lagging(value, now):
+    """True for a NAS report older than 300 s but under 2 h; older or future stops."""
+    age = (now - timestamp(value)).total_seconds()
+    require(-30 <= age < NAS_LAG_SECONDS)
+    return age > 300
+
+
+def defer(kind):
+    # Data-derived transients are raised only after every substantive check passed.
+    if kind is not None:
+        raise TransientFailure(kind)
+
+
+def held_refresh(recovery):
+    return None if REFRESH_HOLD not in recovery else transient_record(recovery, REFRESH_HOLD)
+
+
+def network_kind(error):
+    """Transient class of a connection-level failure, else None. TLS failures stop."""
+    if isinstance(error, urllib.error.HTTPError):
+        return Transient.HTTP_UNAVAILABLE if error.code == 429 or 500 <= error.code <= 599 else None
+    if isinstance(error, urllib.error.URLError):
+        error = error.reason
+    if isinstance(error, ssl.SSLError):
+        return None
+    if isinstance(error, socket.gaierror):
+        return Transient.DNS
+    if isinstance(error, (socket.timeout, TimeoutError)):
+        return Transient.TIMEOUT
+    if isinstance(error, (ConnectionError, http.client.IncompleteRead)) or (
+            isinstance(error, OSError) and error.errno in UNREACHABLE):
+        return Transient.NETWORK
+    return None
+
+
+def api_get(path):
+    req = urllib.request.Request('https://stoarama-api.onrender.com/api/v1/service/nas-cleanup/' + path,
+                                 headers={'Authorization': 'Bearer ' + os.environ['SERVICE_TOKEN'],
+                                          'User-Agent': 'stoarama-operator/1'})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            raw = response.read(32 * 1024 * 1024 + 1)
+    except Exception as error:
+        kind = network_kind(error)
+        if kind is None:
+            raise
+        raise TransientFailure(kind) from None
+    require(len(raw) <= 32 * 1024 * 1024)
+    return json.loads(raw)
+
+
+def reachable(env):
+    try:
+        socket.create_connection((env['PGHOST'], int(env['PGPORT'])), timeout=10).close()
+    except OSError as error:
+        if network_kind(error) is not None:
+            return False
+        raise
+    return True
+
+
+def psql(repo, query):
+    sys.path.insert(0, str(repo / 'backend/scripts/nas-cleanup'))
+    from prepare_keep28_plans import pg_env
+    env = pg_env()
+    try:
+        result = subprocess.run(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=sqlstate'],
+                                input=query, env=env, capture_output=True, text=True, timeout=25)
+    except subprocess.TimeoutExpired:
+        raise TransientFailure(Transient.TIMEOUT) from None
+    codes = set(re.findall(r'^(?:psql:\S+ )?ERROR:\s+([0-9A-Z]{5})$', result.stderr, re.M))
+    # psql exit 2 is a bad connection; it is transient only while the server
+    # itself is unreachable, so a refused login (reachable server) still stops.
+    if (result.returncode == 2 and not reachable(env)) or (
+            result.returncode == 3 and codes and codes <= TIMEOUT_SQLSTATES):
+        raise TransientFailure(Transient.DATABASE_UNAVAILABLE)
+    require(result.returncode == 0)
+    return json.loads(result.stdout)
+
+
 def assemble(status, recovery, api, db, master_at, now):
     require(status['current_plan'] == PLAN and status['next_plan'] == 1441)
     require(api['id'] == PLAN and api['plan_sha256'] == PLAN_SHA and api['mode'] == 'retired')
@@ -59,21 +152,25 @@ def assemble(status, recovery, api, db, master_at, now):
     require(type(status['shutdown_or_recovery_failed']) is bool)
     require(status['recovery_error'] is None or isinstance(status['recovery_error'], str))
     require(status['last_error'] is None or isinstance(status['last_error'], str))
-    require('refresh_error' not in recovery and recovery['plan_id'] == PLAN and recovery['plan_sha256'] == PLAN_SHA)
-    issued = count(recovery['delete_ever_issued'])
-    verified = count(recovery['verified'])
-    problems = count(recovery['problems'])
-    require(issued == db['issued'] == 1860)
-    checked = timestamp(recovery['checked_at'])
-    require(checked > timestamp(db['newest_issued_at']))
-    fresh(recovery['checked_at'], now, 7 * 3600)
+    require(db['issued'] == 1860)
+    held = held_refresh(recovery)
+    if held is None:
+        require('refresh_error' not in recovery and recovery['plan_id'] == PLAN and recovery['plan_sha256'] == PLAN_SHA)
+        issued = count(recovery['delete_ever_issued'])
+        verified = count(recovery['verified'])
+        problems = count(recovery['problems'])
+        require(issued == db['issued'])
+        checked = timestamp(recovery['checked_at'])
+        require(checked > timestamp(db['newest_issued_at']))
+        fresh(recovery['checked_at'], now, 7 * 3600)
     require(db['version'] in NAS_CLIENT_VERSIONS and isinstance(db['boot'], str) and bool(db['boot']))
-    fresh(db['cleanup_at'], now)
+    lagging = nas_lagging(db['cleanup_at'], now)
     local = db['r2_copy']
     require(isinstance(local, dict) and isinstance(local['holds_by_reason'], dict))
     mismatch = count(local['mismatch_latched'])
     holds = local['holds_by_reason']
     require(all(isinstance(k, str) and type(v) is int and v >= 0 for k, v in holds.items()))
+    defer(Transient.RECOVERY_HELD if held else Transient.NAS_REPORT_LAGGING if lagging else None)
     return dict(updated_at=now.isoformat(), recovery_problems=problems,
                 recovery_checked_at=recovery['checked_at'], recovery_issued_items=issued,
                 recovery_verified_items=verified, recovery_plan_id=PLAN, recovery_plan_sha256=PLAN_SHA,
@@ -107,15 +204,7 @@ def main():
     status_bytes = (root / 'status.json').read_bytes()
     status = json.loads(status_bytes)
     master_at = datetime.now(timezone.utc).isoformat()
-    req = urllib.request.Request('https://stoarama-api.onrender.com/api/v1/service/nas-cleanup/plans/1440',
-                                 headers={'Authorization': 'Bearer ' + os.environ['SERVICE_TOKEN'],
-                                          'User-Agent': 'stoarama-operator/1'})
-    with urllib.request.urlopen(req, timeout=15) as response:
-        raw = response.read(32 * 1024 * 1024 + 1)
-    require(len(raw) <= 32 * 1024 * 1024)
-    api = json.loads(raw)
-    sys.path.insert(0, str(repo / 'backend/scripts/nas-cleanup'))
-    from prepare_keep28_plans import pg_env
+    api = api_get('plans/1440')
     query = """BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY;
 SET LOCAL ROLE stoarama;
 SET LOCAL statement_timeout='10s';SET LOCAL lock_timeout='2s';SET LOCAL work_mem='16MB';
@@ -130,10 +219,7 @@ SELECT jsonb_build_object(
  'version',client_version,'boot',client_boot_id,'cleanup_at',nas_cleanup_status_at,
  'r2_copy',nas_cleanup_status->'r2_copy') FROM connections WHERE id=13;
 ROLLBACK;"""
-    result = subprocess.run(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=sqlstate'],
-                            input=query, env=pg_env(), capture_output=True, text=True, timeout=25)
-    require(result.returncode == 0)
-    db = json.loads(result.stdout)
+    db = psql(repo, query)
     require((root / 'status.json').read_bytes() == status_bytes and (root / 'STOP').read_text() == STOP)
     if args.plan_source:
         require(status['current_plan'] == PLAN and status['next_plan'] == 1441)
@@ -149,9 +235,18 @@ ROLLBACK;"""
     print(json.dumps(record, sort_keys=True))
 
 
-if __name__ == '__main__':
+def entry():
     try:
         main()
+    except TransientFailure as failure:
+        # Only the class leaves: never a URL, host, credential or raw error.
+        print(json.dumps({'transient': failure.kind.value}))
+        return TRANSIENT_EXIT
     except Exception:
         print('finish safety evidence unavailable', file=sys.stderr)
-        raise SystemExit(1)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(entry())

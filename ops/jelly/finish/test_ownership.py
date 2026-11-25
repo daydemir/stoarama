@@ -1,5 +1,11 @@
 import copy
+import errno
+import fcntl
+import io
 import json
+import socket
+import ssl
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -7,7 +13,10 @@ import unittest.mock
 from unittest.mock import patch
 from datetime import datetime, timezone, timedelta
 import unittest
+import urllib.error
+import collector
 import ownership
+from admission import Transient, TransientFailure
 from ownership import assemble_owned, parse_stop, validate_stop, POLICY_SHA, StopReason
 from collector import PLAN, PLAN_SHA, timestamp
 
@@ -55,43 +64,121 @@ class OwnershipTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 validate_stop(json.dumps(dict(stop, **change)), owner, NOW)
 
-    def test_plan_source_collects_a_held_idle_runner_after_reconcile(self):
+    def plan_source(self, tmp, reason='finish_admission_hold', api=None, db=None, urlopen=None, run=None):
         """refresh_recovery's plan source after a human reconcile: hold STOP, phase stopped, recovery_required."""
         now = datetime.now(timezone.utc)
         status, owner, *_ = fixture()
-        status.update(current_plan=None, next_plan=None, phase='stopped', recovery_plan_id=1441,
+        status.update(current_plan=None, next_plan=None, phase='stopped', recovery_plan_id=1441, runner_pid=4242,
                       recovery_history={'1440': {'sha256': PLAN_SHA, 'issued': 1860}, '1441': {'sha256': 'b'*64, 'issued': 8}})
         plan = fixture()[5]['plans']['1441']
-        db = dict(fixture()[5], enabled_plans=[], cleanup_at=now.isoformat(),
-                  plans={'1441': dict(plan, mode='retired'), '1440': dict(plan, mode='retired', sha256=PLAN_SHA, issued=1860)})
-        api = json.dumps(dict(id=1441, plan_sha256='b'*64, master_deletion_enabled=True)).encode()
+        db = dict(dict(fixture()[5], enabled_plans=[], cleanup_at=now.isoformat(),
+                       plans={'1441': dict(plan, mode='retired'), '1440': dict(plan, mode='retired', sha256=PLAN_SHA, issued=1860)}),
+                  **(db or {}))
+        api = json.dumps(dict(dict(id=1441, plan_sha256='b'*64, master_deletion_enabled=True), **(api or {}))).encode()
+        root, state = Path(tmp) / 'runner', Path(tmp) / 'finish'
+        (root / 'incident-recovery-1440-20261117').mkdir(parents=True)
+        state.mkdir()
+        (root / 'incident-recovery-1440-20261117/closed-verified.json').write_bytes(b'closed')
+        raw = json.dumps(dict(owner, finish_state=str(state))).encode()
+        (root / 'cleanup-owner.json').write_bytes(raw)
+        (root / 'status.json').write_text(json.dumps(status))
+        (root / 'STOP').write_text(json.dumps(dict(schema='stoarama.cleanup-stop.v1', owner_id=owner['owner_id'],
+                                                  reason=reason, created_at=now.isoformat())))
+        (state / 'admission.json').write_text(json.dumps(dict(failed=False, recovery_required=True, active={})))
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.read.return_value = api
+        psql = unittest.mock.Mock(returncode=0, stdout=json.dumps(db), stderr='')
+        with patch.object(ownership, 'CLOSE_SHA', ownership.digest(b'closed')), \
+                patch.object(collector.urllib.request, 'urlopen', **({'side_effect': urlopen} if urlopen else {'return_value': response})), \
+                patch.object(collector.subprocess, 'run', **({'side_effect': run} if run else {'return_value': psql})), \
+                patch.dict(sys.modules, prepare_keep28_plans=unittest.mock.Mock(pg_env=lambda: dict(PGHOST='db.invalid', PGPORT='5432'))), \
+                patch.dict(collector.os.environ, SERVICE_TOKEN='fixture'):
+            return ownership.collect(root, Path(tmp), state / 'recovery.json', ownership.digest(raw), now, plan_source=True)
+
+    def test_plan_source_collects_a_held_idle_runner_after_reconcile(self):
         for reason, accepted in (('finish_admission_hold', True), ('natural_boundary', True), ('failure', False)):
             with self.subTest(reason=reason), tempfile.TemporaryDirectory() as tmp:
-                root, state = Path(tmp) / 'runner', Path(tmp) / 'finish'
-                (root / 'incident-recovery-1440-20261117').mkdir(parents=True)
-                state.mkdir()
-                close = root / 'incident-recovery-1440-20261117/closed-verified.json'
-                close.write_bytes(b'closed')
-                raw = json.dumps(dict(owner, finish_state=str(state))).encode()
-                (root / 'cleanup-owner.json').write_bytes(raw)
-                (root / 'status.json').write_text(json.dumps(status))
-                (root / 'STOP').write_text(json.dumps(dict(schema='stoarama.cleanup-stop.v1', owner_id=owner['owner_id'],
-                                                          reason=reason, created_at=now.isoformat())))
-                (state / 'admission.json').write_text(json.dumps(dict(failed=False, recovery_required=True, active={})))
-                response = unittest.mock.MagicMock()
-                response.__enter__.return_value.read.return_value = api
-                psql = unittest.mock.Mock(returncode=0, stdout=json.dumps(db))
-                with patch.object(ownership, 'CLOSE_SHA', ownership.digest(b'closed')), \
-                        patch.object(ownership.urllib.request, 'urlopen', return_value=response), \
-                        patch.object(ownership.subprocess, 'run', return_value=psql), \
-                        patch.dict(sys.modules, prepare_keep28_plans=unittest.mock.Mock(pg_env=dict)), \
-                        patch.dict(ownership.os.environ, SERVICE_TOKEN='fixture'):
-                    collect = lambda: ownership.collect(root, Path(tmp), state / 'recovery.json',
-                                                        ownership.digest(raw), now, plan_source=True)
-                    if accepted:
-                        self.assertEqual(collect(), {'recovery_plan_id': 1441})
-                    else:
-                        with self.assertRaises(ValueError): collect()
+                if accepted:
+                    self.assertEqual(self.plan_source(tmp, reason), {'recovery_plan_id': 1441})
+                else:
+                    with self.assertRaises(ValueError): self.plan_source(tmp, reason)
+
+    def psql_result(self, returncode, stderr=''):
+        return lambda *a, **k: subprocess.CompletedProcess(a[0], returncode, stdout='', stderr=stderr)
+
+    def unreachable(self, *a, **k):
+        raise ConnectionRefusedError()
+
+    def test_plan_source_transient_failures_hold_by_class(self):
+        lagging = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        cases = {
+            'dns': (Transient.DNS, dict(urlopen=urllib.error.URLError(socket.gaierror(8, 'x')))),
+            'refused': (Transient.NETWORK, dict(urlopen=urllib.error.URLError(ConnectionRefusedError()))),
+            'no route': (Transient.NETWORK, dict(urlopen=urllib.error.URLError(OSError(errno.ENETUNREACH, 'x')))),
+            'reset': (Transient.NETWORK, dict(urlopen=ConnectionResetError())),
+            'api timeout': (Transient.TIMEOUT, dict(urlopen=socket.timeout())),
+            'connect timeout': (Transient.TIMEOUT, dict(urlopen=urllib.error.URLError(socket.timeout()))),
+            '503': (Transient.HTTP_UNAVAILABLE, dict(urlopen=urllib.error.HTTPError('u', 503, 'x', {}, io.BytesIO()))),
+            '500': (Transient.HTTP_UNAVAILABLE, dict(urlopen=urllib.error.HTTPError('u', 500, 'x', {}, io.BytesIO()))),
+            '429': (Transient.HTTP_UNAVAILABLE, dict(urlopen=urllib.error.HTTPError('u', 429, 'x', {}, io.BytesIO()))),
+            'psql timeout': (Transient.TIMEOUT, dict(run=unittest.mock.Mock(side_effect=subprocess.TimeoutExpired('psql', 25)))),
+            'psql bad connection, server unreachable': (Transient.DATABASE_UNAVAILABLE, dict(run=self.psql_result(2))),
+            'statement timeout': (Transient.DATABASE_UNAVAILABLE, dict(run=self.psql_result(3, 'psql:<stdin>:7: ERROR:  57014\n'))),
+            'lock timeout': (Transient.DATABASE_UNAVAILABLE, dict(run=self.psql_result(3, 'ERROR:  55P03\n'))),
+            'nas report one hour old': (Transient.NAS_REPORT_LAGGING, dict(db=dict(cleanup_at=lagging))),
+            'master off': (Transient.MASTER_OFF, dict(api=dict(master_deletion_enabled=False))),
+        }
+        for name, (kind, change) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp, \
+                    patch.object(collector.socket, 'create_connection', side_effect=self.unreachable):
+                with self.assertRaises(TransientFailure) as raised:
+                    self.plan_source(tmp, **change)
+                self.assertIs(raised.exception.kind, kind)
+
+    def test_runner_exiting_between_lock_probe_and_ps_holds_but_a_live_foreign_holder_stops(self):
+        for released, expected in ((True, TransientFailure), (False, ValueError)):
+            with self.subTest(released=released), tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / 'runner').mkdir()
+                holder = (Path(tmp) / 'runner/lock').open('a')
+                fcntl.flock(holder, fcntl.LOCK_EX)
+                def ps(command, **kwargs):
+                    if released:
+                        holder.close()
+                    return subprocess.CompletedProcess(command, 1, stdout='', stderr='')
+                try:
+                    with self.assertRaises(expected) as raised:
+                        self.plan_source(tmp, run=ps)
+                    if released:
+                        self.assertIs(raised.exception.kind, Transient.RUNNER_TRANSITION)
+                finally:
+                    holder.close()
+
+    def test_plan_source_substantive_failures_still_latch(self):
+        future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        lagging = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        cases = {
+            '401': dict(urlopen=urllib.error.HTTPError('u', 401, 'x', {}, io.BytesIO())),
+            '404': dict(urlopen=urllib.error.HTTPError('u', 404, 'x', {}, io.BytesIO())),
+            'tls': dict(urlopen=urllib.error.URLError(ssl.SSLCertVerificationError())),
+            'unclassified os error': dict(urlopen=PermissionError()),
+            'psql bad connection, server reachable': dict(run=self.psql_result(2)),
+            'psql own error': dict(run=self.psql_result(1)),
+            'sql identity': dict(run=self.psql_result(3, 'ERROR:  P0001\n')),
+            'nas report over two hours': dict(db=dict(cleanup_at=(datetime.now(timezone.utc) - timedelta(hours=2, seconds=1)).isoformat())),
+            'nas report future': dict(db=dict(cleanup_at=future)),
+            'master unknown': dict(api=dict(master_deletion_enabled=None)),
+            'digest mismatch': dict(api=dict(plan_sha256='c'*64)),
+            'master off and unknown enabled plan': dict(api=dict(master_deletion_enabled=False), db=dict(enabled_plans=[9])),
+            'master off and enabled batch': dict(api=dict(master_deletion_enabled=False), db=dict(enabled_batches=[1])),
+            'lagging and data mismatch': dict(db=dict(cleanup_at=lagging, r2_copy=dict(mismatch_latched=1, holds_by_reason={}))),
+            'lagging and inventory mismatch': dict(db=dict(cleanup_at=lagging, inventory_mismatches=1)),
+        }
+        for name, change in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp, \
+                    patch.object(collector.socket, 'create_connection'):
+                with self.assertRaises(Exception) as raised:
+                    self.plan_source(tmp, **change)
+                self.assertNotIsInstance(raised.exception, (TransientFailure, TypeError))
 
     def collect(self, parts, running=True):
         return assemble_owned(*parts, now=NOW, running=running)
@@ -166,6 +253,51 @@ class OwnershipTests(unittest.TestCase):
                 parts = fixture(); mutation(parts)
                 with self.assertRaises((ValueError, KeyError)):
                     self.collect(parts)
+
+    def test_tick_holds_on_a_transient_refresh_hold_without_masking_findings(self):
+        parts = list(fixture())
+        parts[2] = {'refresh_hold': 'dns'}
+        with self.assertRaises(TransientFailure) as raised:
+            self.collect(parts)
+        self.assertIs(raised.exception.kind, Transient.RECOVERY_HELD)
+        for kind, mutation in ((Transient.MASTER_OFF, lambda p: p[4].update(master_deletion_enabled=False)),
+                               (Transient.NAS_REPORT_LAGGING, lambda p: p[5].update(cleanup_at=(NOW-timedelta(hours=1)).isoformat()))):
+            parts = fixture(); mutation(parts)
+            with self.subTest(kind=kind), self.assertRaises(TransientFailure) as raised:
+                self.collect(parts)
+            self.assertIs(raised.exception.kind, kind)
+        for mutation in (lambda p: p[2].update(problems=0), lambda p: p[2].update(refresh_hold='bogus'),
+                         lambda p: p[5].update(enabled_plans=[1442]), lambda p: p[5]['r2_copy'].update(mismatch_latched=1),
+                         lambda p: p[0].update(last_error='failure'), lambda p: p[3].update(problems=1),
+                         lambda p: p[3].update(verified=1859)):
+            parts = list(fixture()); parts[2] = {'refresh_hold': 'dns'}; mutation(parts)
+            with self.subTest(mutation=mutation), self.assertRaises((ValueError, KeyError)):
+                self.collect(parts)
+        for mutation in (lambda p: p[2].update(problems=1), lambda p: p[2].update(verified=1859),
+                         lambda p: p[5].update(enabled_batches=[1])):
+            parts = fixture(); parts[4]['master_deletion_enabled'] = False; mutation(parts)
+            with self.subTest(mutation=mutation), self.assertRaises((ValueError, KeyError)):
+                self.collect(parts)
+
+    def test_legacy_collector_holds_on_refresh_hold_and_nas_lag_only_after_its_checks(self):
+        status = dict(current_plan=PLAN, next_plan=1441, shutdown_or_recovery_failed=False, recovery_error=None, last_error=None)
+        api = dict(id=PLAN, plan_sha256=PLAN_SHA, mode='retired', master_deletion_enabled=False)
+        db = dict(plan_sha256=PLAN_SHA, enabled_plans=[], enabled_batches=[], issued=1860, version='r2-copy-v6', boot='b',
+                  newest_issued_at=(NOW-timedelta(hours=2)).isoformat(), cleanup_at=NOW.isoformat(),
+                  r2_copy=dict(mismatch_latched=0, holds_by_reason={}))
+        recovery = fixture()[2]
+        assemble = lambda r=recovery, **d: collector.assemble(status, r, api, dict(db, **d), NOW.isoformat(), NOW)
+        self.assertEqual(assemble()['recovery_problems'], 0)
+        for kind, run in ((Transient.RECOVERY_HELD, lambda: assemble({'refresh_hold': 'network'})),
+                          (Transient.NAS_REPORT_LAGGING, lambda: assemble(cleanup_at=(NOW-timedelta(hours=1)).isoformat()))):
+            with self.subTest(kind=kind), self.assertRaises(TransientFailure) as raised:
+                run()
+            self.assertIs(raised.exception.kind, kind)
+        for run in (lambda: assemble({'refresh_hold': 'network'}, enabled_plans=[1441]),
+                    lambda: assemble({'refresh_hold': 'network', 'problems': 0}),
+                    lambda: assemble(cleanup_at=(NOW-timedelta(hours=3)).isoformat())):
+            with self.assertRaises((ValueError, KeyError)):
+                run()
 
     def test_plan_selection_can_repair_report_without_admitting_feed(self):
         parts = fixture()

@@ -1,6 +1,7 @@
 """Durable admission journal shared by the feeder and recovery wrapper."""
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from enum import Enum
 import fcntl
 import hashlib
 import json
@@ -16,6 +17,39 @@ LANES = {'tick': 'lock', 'recovery': 'recovery.lock'}
 
 class Latched(Exception):
     pass
+
+
+# sysexits EX_TEMPFAIL: a collector or plan source could not observe its
+# evidence for a transient reason. It reports no finding and never latches.
+TRANSIENT_EXIT = 75
+# The recovery lane's non-latching hold record: never success, never a finding.
+REFRESH_HOLD = 'refresh_hold'
+
+
+class Transient(str, Enum):
+    """The only failures that hold without latching. Everything else latches."""
+    DNS = 'dns'
+    NETWORK = 'network'
+    TIMEOUT = 'timeout'
+    HTTP_UNAVAILABLE = 'http_unavailable'  # HTTP 5xx or 429
+    DATABASE_UNAVAILABLE = 'database_unavailable'
+    NAS_REPORT_LAGGING = 'nas_report_lagging'  # older than 300 s, under 2 h
+    MASTER_OFF = 'master_off'
+    RUNNER_TRANSITION = 'runner_transition'
+    RECOVERY_HELD = 'recovery_held'
+
+
+class TransientFailure(Exception):
+    def __init__(self, kind: Transient):
+        super().__init__(kind.value)
+        self.kind = kind
+
+
+def transient_record(record, key: str) -> Transient:
+    """The class from an exact one-key record; anything else is malformed."""
+    if not isinstance(record, dict) or set(record) != {key}:
+        raise ValueError('invalid transient record')
+    return Transient(record[key])
 
 
 def sync_dir(path: Path) -> None:
@@ -150,7 +184,9 @@ class Attempt:
         record['active'][lane] = self.path.name
         publish(journal, record)
 
-    def finish(self, reason: str, output: dict) -> bool:
+    def finish(self, reason: str, output: dict, held: Optional[Transient] = None) -> bool:
+        """Latch on reason, publish success, or with held close a transient
+        attempt: admission stays unlatched and recovery is not refreshed."""
         if self.abandoned:
             raise Latched()
         # Serialize success publication with failure latching. A sibling that
@@ -181,12 +217,16 @@ class Attempt:
                             stop_status(self.state, reason)
                     return False
                 publishing_success = True
-                if self.lane == 'tick':
+                if held is not None:
+                    # The tick keeps its old status aging for the dead-man. The
+                    # old recovery report must not stay consumable as fresh.
+                    if self.lane == 'recovery':
+                        publish(self.state / 'recovery.json', {REFRESH_HOLD: held.value})
+                elif self.lane == 'tick':
                     publish(self.state / 'status.json', output)
                 else:
                     publish(self.state / 'recovery.json', output)
                     publish(self.state / 'recovery-last-good.json', output)
-                if self.lane == 'recovery':
                     record['recovery_required'] = False
                 del record['active'][self.lane]
                 publish(self.state / 'admission.json', record)

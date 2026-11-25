@@ -4,13 +4,12 @@ from enum import Enum
 import fcntl
 import hashlib
 import json
-import os
-from pathlib import Path
 import re
 import subprocess
-import urllib.request
 
-from collector import timestamp, fresh, count, require, PLAN, PLAN_SHA, CLOSE_SHA, NAS_CLIENT_VERSIONS
+from admission import Transient, TransientFailure
+from collector import (timestamp, fresh, count, require, api_get, psql, nas_lagging, defer, held_refresh,
+                       PLAN, PLAN_SHA, CLOSE_SHA, NAS_CLIENT_VERSIONS)
 
 # The active cleanup plan binding. The owner manifest, its baseline plan and
 # every live plan it names must carry this digest; a keep28-bound owner is
@@ -76,8 +75,9 @@ def assemble_owned(status, owner, recovery, runner_report, api, db, now, running
     plan = db['plans'][str(pid)]
     checkpoint = status['recovery_plan_id']
     settled = db['plans'][str(checkpoint)]
+    master_off = api['master_deletion_enabled'] is False
     require(api['id'] == pid and api['plan_sha256'] == plan['sha256']
-            and api['master_deletion_enabled'] is True)
+            and (master_off or api['master_deletion_enabled'] is True))
     require(plan['connection_id'] == 13 and plan['account_id'] == 47
             and plan['policy_sha256'] == owner['policy_sha256'] and not plan['allow_nas_only'])
     if checkpoint == PLAN:
@@ -90,16 +90,22 @@ def assemble_owned(status, owner, recovery, runner_report, api, db, now, running
     require(plan['uncertain'] == 0 and db['inventory_mismatches'] == 0
             and db['replay_failed'] == 0 and db['replay_pending'] == 0)
     require(db['version'] in NAS_CLIENT_VERSIONS and db['boot'])
-    fresh(db['cleanup_at'], now)
+    lagging = nas_lagging(db['cleanup_at'], now)
     local = db['r2_copy']
     require(count(local['mismatch_latched']) == 0)
     require(all(isinstance(k, str) and count(v) == v for k, v in local['holds_by_reason'].items()))
-    if selecting:
+    transient = Transient.MASTER_OFF if master_off else Transient.NAS_REPORT_LAGGING if lagging else None
+    held = None if selecting else held_refresh(recovery)
+    if selecting or held:
         # Selection is not feeding evidence: after explicit D reconciliation it
         # identifies the DB-bound checkpoint so the real verifier can repair a
         # failed/missing/expired report. It never admits a tick or clears a latch.
+        # A held refresh has no D report; its tick still refuses a runner finding.
         require(settled['sha256'] == status['recovery_history'][str(checkpoint)]['sha256']
                 and settled['issued'] == status['recovery_history'][str(checkpoint)]['issued'])
+        require(not held or (runner_report['plan_id'] == checkpoint and runner_report['problems'] == 0
+                             and runner_report['verified'] == runner_report['delete_ever_issued']))
+        defer(transient or (Transient.RECOVERY_HELD if held else None))
         return {'recovery_plan_id': checkpoint}
     # A D failure must dominate even when the runner has a newer success.
     require('refresh_error' not in recovery and recovery['problems'] == 0
@@ -117,6 +123,7 @@ def assemble_owned(status, owner, recovery, runner_report, api, db, now, running
     require(checkpoint == status['recovery_plan_id'] and settled['mode'] in ('retired', 'paused', 'enabled'))
     require(timestamp(report['checked_at']) > timestamp(settled['newest_issued_at']))
     fresh(report['checked_at'], now, 7 * 3600)
+    defer(transient)
     return dict(updated_at=now.isoformat(), recovery_problems=0,
                 recovery_checked_at=report['checked_at'], recovery_issued_items=report['delete_ever_issued'],
                 recovery_verified_items=report['verified'], recovery_plan_id=checkpoint,
@@ -127,6 +134,16 @@ def assemble_owned(status, owner, recovery, runner_report, api, db, now, running
                 master_deletion_enabled=api['master_deletion_enabled'], expected_deletion_enabled=True,
                 cleanup_owner=dict(plan_id=pid, plan_sha256=plan['sha256']),
                 holds_by_reason=local['holds_by_reason'])
+
+
+def locked(path):
+    """Whether another process holds the runner's exclusive execution flock."""
+    with path.open('a') as execution:
+        try:
+            fcntl.flock(execution, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
 
 
 def collect(root, repo, recovery_path, owner_sha256, now, plan_source=False):
@@ -144,17 +161,16 @@ def collect(root, repo, recovery_path, owner_sha256, now, plan_source=False):
             stop = None
         if stop is not None:
             validate_stop(stop, owner, datetime.now(timezone.utc))
-        with (root / 'lock').open('a') as execution:
-            try:
-                fcntl.flock(execution, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                running = False
-            except BlockingIOError:
-                running = True
+        running = locked(root / 'lock')
         if running:
             require(type(status['runner_pid']) is int and status['runner_pid'] > 0)
             command = subprocess.run(['/bin/ps', '-p', str(status['runner_pid']), '-o', 'command='],
-                                     capture_output=True, text=True, timeout=5, check=True).stdout
-            require(str(repo / 'ops/jelly/cleanup-runner/runner.py') in command)
+                                     capture_output=True, text=True, timeout=5)
+            if command.returncode and not locked(root / 'lock'):
+                # The holder exited between the probe and ps (a peer collector's
+                # probe, or the runner stopping). A live foreign holder still stops.
+                raise TransientFailure(Transient.RUNNER_TRANSITION)
+            require(command.returncode == 0 and str(repo / 'ops/jelly/cleanup-runner/runner.py') in command.stdout)
         admission = json.loads((recovery_path.parent / 'admission.json').read_bytes())
         require(admission['failed'] is False and (plan_source or admission['recovery_required'] is False))
         recovery = None if plan_source else json.loads(recovery_path.read_bytes())
@@ -163,15 +179,7 @@ def collect(root, repo, recovery_path, owner_sha256, now, plan_source=False):
         pid = owner_plan(status, owner)
         ids = sorted(set([pid, checkpoint] + [int(k) for k in status['recovery_history']]))
         require(all(type(i) is int and i > 0 for i in ids))
-        req = urllib.request.Request('https://stoarama-api.onrender.com/api/v1/service/nas-cleanup/plans/' + str(pid),
-                headers={'Authorization': 'Bearer ' + os.environ['SERVICE_TOKEN'], 'User-Agent': 'stoarama-operator/1'})
-        with urllib.request.urlopen(req, timeout=15) as response:
-            raw = response.read(32 * 1024 * 1024 + 1)
-        require(len(raw) <= 32 * 1024 * 1024)
-        api = json.loads(raw)
-        import sys
-        sys.path.insert(0, str(repo / 'backend/scripts/nas-cleanup'))
-        from prepare_keep28_plans import pg_env
+        api = api_get('plans/' + str(pid))
         query = """BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY;
 SET LOCAL ROLE stoarama; SET LOCAL statement_timeout='10s'; SET LOCAL lock_timeout='2s';
 SET LOCAL work_mem='16MB'; SET LOCAL max_parallel_workers_per_gather=0; SET LOCAL jit=off;
@@ -191,10 +199,7 @@ SELECT jsonb_build_object(
  'inventory_mismatches',inventory_mismatches,'replay_failed',(nas_cleanup_status->>'replay_failed')::bigint,
  'replay_pending',(nas_cleanup_status->>'replay_pending')::bigint,'r2_copy',nas_cleanup_status->'r2_copy')
  FROM connections WHERE id=13; ROLLBACK;""".replace('PLAN_IDS', ','.join(str(i) for i in ids))
-        result = subprocess.run(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=sqlstate'],
-                                input=query, env=pg_env(), capture_output=True, text=True, timeout=25)
-        require(result.returncode == 0)
-        db = json.loads(result.stdout)
+        db = psql(repo, query)
         for old_id, old in status['recovery_history'].items():
             fact = db['plans'][old_id]
             require(fact['sha256'] == old['sha256'] and fact['issued'] == old['issued'])

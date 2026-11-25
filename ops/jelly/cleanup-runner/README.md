@@ -93,7 +93,7 @@ Startup finish hold (owner, verbatim: a runner refusal "latched only because rec
 failed on the network" must "not write a failure STOP that blocks recovery; it should
 hold with a distinct reason the collector accepts"; never auto-clear a latch). When
 startup finish health refuses for any reason (D latch, recovery_required, interrupted
-attempt, missing, failed or >7 h stale evidence) and status names no current plan or
+attempt, missing, failed, transient `refresh_hold` or >7 h stale evidence) and status names no current plan or
 day plan, the runner sets no last_error and makes no backend call: it publishes an
 owner-bound `finish_admission_hold` STOP (only when no STOP exists; it alerts once
 then), saves phase `stopped` and exits 0. launchd (`KeepAlive` SuccessfulExit,

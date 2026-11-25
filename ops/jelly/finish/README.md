@@ -223,6 +223,29 @@ time, then install D. A v4 observation packet is not late-budget eligible.
    `launchctl bootout gui/$(id -u)/com.stoarama.finish-tick`.
    To stop its independent refresh, boot out `com.stoarama.finish-recovery`.
 
+## Transient holds
+
+Owner, verbatim: transient plan-source failures "should retry with backoff and hold
+without latching. Latch only on substantive findings." The collector and plan source
+exit 75 with stdout `{"transient":"<class>"}` only for a class in admission.py's
+`Transient` enum: DNS, network (refused, reset, unreachable), timeout, HTTP 5xx/429,
+an unreachable database (psql exit 2 while a TCP probe also fails) or a SQL
+statement/lock timeout, a NAS report 300 s to 2 h old, master switch off, or the
+runner exiting between the lock probe and `ps`. Data-derived classes are raised only
+after every substantive check passes. Every other failure, including an unknown
+class or malformed record, latches as before. Wrappers must propagate exit 75 and
+stdout, or transients latch (fail closed).
+
+`refresh_recovery.py` tries the plan source three times over about ten minutes; a
+verifier timeout holds without retry. A hold leaves `admission.json` unlatched
+(`recovery_required` unchanged), replaces `recovery.json` with
+`{"refresh_hold":"<class>"}` so the old report is never consumed as fresh, logs one
+line, notifies once per episode and exits 75. The tick then holds too (exit 75,
+no feed, no notification, status left to age for the dead-man). The runner treats
+`refresh_hold` as a finish-health refusal: idle, it holds and kicks recovery once;
+with an owned plan it contains, as with any stale report. The next scheduled or
+kicked refresh retries. A CLI verifier failure without a report still latches.
+
 ## Stops
 
 | `stop_reason` | Meaning / controller action |
