@@ -109,8 +109,10 @@ class OwnershipTests(unittest.TestCase):
     def unreachable(self, *a, **k):
         raise ConnectionRefusedError()
 
-    def test_plan_source_transient_failures_hold_by_class(self):
-        lagging = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    def psql_timeout(self, *a, **k):
+        raise subprocess.TimeoutExpired('psql', 25)
+
+    def test_pure_network_failures_hold_by_class(self):
         cases = {
             'dns': (Transient.DNS, dict(urlopen=urllib.error.URLError(socket.gaierror(8, 'x')))),
             'refused': (Transient.NETWORK, dict(urlopen=urllib.error.URLError(ConnectionRefusedError()))),
@@ -121,12 +123,8 @@ class OwnershipTests(unittest.TestCase):
             '503': (Transient.HTTP_UNAVAILABLE, dict(urlopen=urllib.error.HTTPError('u', 503, 'x', {}, io.BytesIO()))),
             '500': (Transient.HTTP_UNAVAILABLE, dict(urlopen=urllib.error.HTTPError('u', 500, 'x', {}, io.BytesIO()))),
             '429': (Transient.HTTP_UNAVAILABLE, dict(urlopen=urllib.error.HTTPError('u', 429, 'x', {}, io.BytesIO()))),
-            'psql timeout': (Transient.TIMEOUT, dict(run=unittest.mock.Mock(side_effect=subprocess.TimeoutExpired('psql', 25)))),
+            'psql timeout': (Transient.DATABASE_UNAVAILABLE, dict(run=self.psql_timeout)),
             'psql bad connection, server unreachable': (Transient.DATABASE_UNAVAILABLE, dict(run=self.psql_result(2))),
-            'statement timeout': (Transient.DATABASE_UNAVAILABLE, dict(run=self.psql_result(3, 'psql:<stdin>:7: ERROR:  57014\n'))),
-            'lock timeout': (Transient.DATABASE_UNAVAILABLE, dict(run=self.psql_result(3, 'ERROR:  55P03\n'))),
-            'nas report one hour old': (Transient.NAS_REPORT_LAGGING, dict(db=dict(cleanup_at=lagging))),
-            'master off': (Transient.MASTER_OFF, dict(api=dict(master_deletion_enabled=False))),
         }
         for name, (kind, change) in cases.items():
             with self.subTest(name), tempfile.TemporaryDirectory() as tmp, \
@@ -135,26 +133,7 @@ class OwnershipTests(unittest.TestCase):
                     self.plan_source(tmp, **change)
                 self.assertIs(raised.exception.kind, kind)
 
-    def test_runner_exiting_between_lock_probe_and_ps_holds_but_a_live_foreign_holder_stops(self):
-        for released, expected in ((True, TransientFailure), (False, ValueError)):
-            with self.subTest(released=released), tempfile.TemporaryDirectory() as tmp:
-                (Path(tmp) / 'runner').mkdir()
-                holder = (Path(tmp) / 'runner/lock').open('a')
-                fcntl.flock(holder, fcntl.LOCK_EX)
-                def ps(command, **kwargs):
-                    if released:
-                        holder.close()
-                    return subprocess.CompletedProcess(command, 1, stdout='', stderr='')
-                try:
-                    with self.assertRaises(expected) as raised:
-                        self.plan_source(tmp, run=ps)
-                    if released:
-                        self.assertIs(raised.exception.kind, Transient.RUNNER_TRANSITION)
-                finally:
-                    holder.close()
-
-    def test_plan_source_substantive_failures_still_latch(self):
-        future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    def test_data_derived_and_unclassified_failures_latch(self):
         lagging = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         cases = {
             '401': dict(urlopen=urllib.error.HTTPError('u', 401, 'x', {}, io.BytesIO())),
@@ -163,15 +142,16 @@ class OwnershipTests(unittest.TestCase):
             'unclassified os error': dict(urlopen=PermissionError()),
             'psql bad connection, server reachable': dict(run=self.psql_result(2)),
             'psql own error': dict(run=self.psql_result(1)),
+            'sql statement timeout (data path ran)': dict(run=self.psql_result(3, 'ERROR:  57014\n')),
             'sql identity': dict(run=self.psql_result(3, 'ERROR:  P0001\n')),
-            'nas report over two hours': dict(db=dict(cleanup_at=(datetime.now(timezone.utc) - timedelta(hours=2, seconds=1)).isoformat())),
-            'nas report future': dict(db=dict(cleanup_at=future)),
+            'nas report lagging one hour': dict(db=dict(cleanup_at=lagging)),
+            'master off': dict(api=dict(master_deletion_enabled=False)),
             'master unknown': dict(api=dict(master_deletion_enabled=None)),
             'digest mismatch': dict(api=dict(plan_sha256='c'*64)),
-            'master off and unknown enabled plan': dict(api=dict(master_deletion_enabled=False), db=dict(enabled_plans=[9])),
-            'master off and enabled batch': dict(api=dict(master_deletion_enabled=False), db=dict(enabled_batches=[1])),
-            'lagging and data mismatch': dict(db=dict(cleanup_at=lagging, r2_copy=dict(mismatch_latched=1, holds_by_reason={}))),
-            'lagging and inventory mismatch': dict(db=dict(cleanup_at=lagging, inventory_mismatches=1)),
+            'unknown enabled plan': dict(db=dict(enabled_plans=[9])),
+            # A good API response is judged before psql: its mismatch wins over a DB timeout.
+            'api master off then psql timeout': dict(api=dict(master_deletion_enabled=False), run=self.psql_timeout),
+            'api wrong plan then psql timeout': dict(api=dict(id=1442), run=self.psql_timeout),
         }
         for name, change in cases.items():
             with self.subTest(name), tempfile.TemporaryDirectory() as tmp, \
@@ -179,6 +159,63 @@ class OwnershipTests(unittest.TestCase):
                 with self.assertRaises(Exception) as raised:
                     self.plan_source(tmp, **change)
                 self.assertNotIsInstance(raised.exception, (TransientFailure, TypeError))
+
+    def test_runner_exiting_between_lock_probe_and_ps_latches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / 'runner').mkdir()
+            holder = (Path(tmp) / 'runner/lock').open('a')
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            def ps(command, **kwargs):
+                holder.close()
+                if kwargs.get('check'):
+                    raise subprocess.CalledProcessError(1, command)
+                return subprocess.CompletedProcess(command, 1, stdout='', stderr='')
+            try:
+                with self.assertRaises(Exception) as raised:
+                    self.plan_source(tmp, run=ps)
+                self.assertNotIsInstance(raised.exception, TransientFailure)
+            finally:
+                holder.close()
+
+    def legacy(self, tmp, api=None, run=None, tick=False):
+        """The default (legacy) collector's plan source, end to end."""
+        home = Path(tmp)
+        root = home / 'stoarama-cleanup-runner'
+        (root / 'incident-recovery-1440-20261117').mkdir(parents=True)
+        (root / 'incident-recovery-1440-20261117/closed-verified.json').write_bytes(b'closed')
+        (root / 'STOP').write_text(collector.STOP)
+        (root / 'status.json').write_text(json.dumps(dict(current_plan=PLAN, next_plan=1441, recovery_error=None,
+                                                          shutdown_or_recovery_failed=False, last_error=None)))
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(dict(dict(
+            id=PLAN, plan_sha256=PLAN_SHA, mode='retired', master_deletion_enabled=False), **(api or {}))).encode()
+        db = dict(enabled_plans=[], enabled_batches=[], plan_sha256=PLAN_SHA, issued=1860)
+        with patch.object(collector, 'CLOSE_SHA', ownership.digest(b'closed')), \
+                patch.object(collector.Path, 'home', return_value=home), \
+                patch.object(collector.urllib.request, 'urlopen', return_value=response), \
+                patch.object(collector.subprocess, 'run', **({'side_effect': run} if run else
+                             {'return_value': unittest.mock.Mock(returncode=0, stdout=json.dumps(db))})), \
+                patch.dict(sys.modules, prepare_keep28_plans=unittest.mock.Mock(pg_env=dict)), \
+                patch.dict(collector.os.environ, SERVICE_TOKEN='fixture'), \
+                patch.object(sys, 'argv', ['collector'] + (['--recovery-report', str(home / 'r.json')] if tick else ['--plan-source'])), \
+                patch('sys.stdout', new=io.StringIO()) as stdout:
+            collector.main()
+        return json.loads(stdout.getvalue())
+
+    def test_legacy_plan_source_judges_the_api_before_psql(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.legacy(tmp), {'plan_id': PLAN})
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(TransientFailure):
+            self.legacy(tmp, run=self.psql_timeout)
+        for api in (dict(master_deletion_enabled=True), dict(plan_sha256='c'*64), dict(mode='enabled'),
+                    dict(master_deletion_enabled=None)):
+            with self.subTest(api=api), tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+                self.legacy(tmp, api=api, run=self.psql_timeout)
+        # Tick lane: the CLI would stop on master ON, so a DB failure cannot hold it.
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(TransientFailure):
+            self.legacy(tmp, run=self.psql_timeout, tick=True)
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+            self.legacy(tmp, api=dict(master_deletion_enabled=True), run=self.psql_timeout, tick=True)
 
     def collect(self, parts, running=True):
         return assemble_owned(*parts, now=NOW, running=running)
@@ -254,50 +291,14 @@ class OwnershipTests(unittest.TestCase):
                 with self.assertRaises((ValueError, KeyError)):
                     self.collect(parts)
 
-    def test_tick_holds_on_a_transient_refresh_hold_without_masking_findings(self):
-        parts = list(fixture())
-        parts[2] = {'refresh_hold': 'dns'}
-        with self.assertRaises(TransientFailure) as raised:
-            self.collect(parts)
-        self.assertIs(raised.exception.kind, Transient.RECOVERY_HELD)
-        for kind, mutation in ((Transient.MASTER_OFF, lambda p: p[4].update(master_deletion_enabled=False)),
-                               (Transient.NAS_REPORT_LAGGING, lambda p: p[5].update(cleanup_at=(NOW-timedelta(hours=1)).isoformat()))):
-            parts = fixture(); mutation(parts)
-            with self.subTest(kind=kind), self.assertRaises(TransientFailure) as raised:
-                self.collect(parts)
-            self.assertIs(raised.exception.kind, kind)
-        for mutation in (lambda p: p[2].update(problems=0), lambda p: p[2].update(refresh_hold='bogus'),
-                         lambda p: p[5].update(enabled_plans=[1442]), lambda p: p[5]['r2_copy'].update(mismatch_latched=1),
-                         lambda p: p[0].update(last_error='failure'), lambda p: p[3].update(problems=1),
-                         lambda p: p[3].update(verified=1859)):
-            parts = list(fixture()); parts[2] = {'refresh_hold': 'dns'}; mutation(parts)
+    def test_tick_latches_on_data_derived_refusals(self):
+        held = {'refresh_hold': 'dns'}
+        for mutation in (lambda p: p.__setitem__(2, held),
+                         lambda p: p[4].update(master_deletion_enabled=False),
+                         lambda p: p[5].update(cleanup_at=(NOW-timedelta(hours=1)).isoformat())):
+            parts = list(fixture()); mutation(parts)
             with self.subTest(mutation=mutation), self.assertRaises((ValueError, KeyError)):
                 self.collect(parts)
-        for mutation in (lambda p: p[2].update(problems=1), lambda p: p[2].update(verified=1859),
-                         lambda p: p[5].update(enabled_batches=[1])):
-            parts = fixture(); parts[4]['master_deletion_enabled'] = False; mutation(parts)
-            with self.subTest(mutation=mutation), self.assertRaises((ValueError, KeyError)):
-                self.collect(parts)
-
-    def test_legacy_collector_holds_on_refresh_hold_and_nas_lag_only_after_its_checks(self):
-        status = dict(current_plan=PLAN, next_plan=1441, shutdown_or_recovery_failed=False, recovery_error=None, last_error=None)
-        api = dict(id=PLAN, plan_sha256=PLAN_SHA, mode='retired', master_deletion_enabled=False)
-        db = dict(plan_sha256=PLAN_SHA, enabled_plans=[], enabled_batches=[], issued=1860, version='r2-copy-v6', boot='b',
-                  newest_issued_at=(NOW-timedelta(hours=2)).isoformat(), cleanup_at=NOW.isoformat(),
-                  r2_copy=dict(mismatch_latched=0, holds_by_reason={}))
-        recovery = fixture()[2]
-        assemble = lambda r=recovery, **d: collector.assemble(status, r, api, dict(db, **d), NOW.isoformat(), NOW)
-        self.assertEqual(assemble()['recovery_problems'], 0)
-        for kind, run in ((Transient.RECOVERY_HELD, lambda: assemble({'refresh_hold': 'network'})),
-                          (Transient.NAS_REPORT_LAGGING, lambda: assemble(cleanup_at=(NOW-timedelta(hours=1)).isoformat()))):
-            with self.subTest(kind=kind), self.assertRaises(TransientFailure) as raised:
-                run()
-            self.assertIs(raised.exception.kind, kind)
-        for run in (lambda: assemble({'refresh_hold': 'network'}, enabled_plans=[1441]),
-                    lambda: assemble({'refresh_hold': 'network', 'problems': 0}),
-                    lambda: assemble(cleanup_at=(NOW-timedelta(hours=3)).isoformat())):
-            with self.assertRaises((ValueError, KeyError)):
-                run()
 
     def test_plan_selection_can_repair_report_without_admitting_feed(self):
         parts = fixture()

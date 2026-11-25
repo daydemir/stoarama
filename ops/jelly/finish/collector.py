@@ -16,7 +16,7 @@ import sys
 import urllib.error
 import urllib.request
 
-from admission import REFRESH_HOLD, TRANSIENT_EXIT, Transient, TransientFailure, transient_record
+from admission import TRANSIENT_EXIT, Transient, TransientFailure
 
 PLAN = 1440
 PLAN_SHA = '78b86990e0a45715deb9383226cff6ff5f01e6159f3d8eaf8b6d41bb39e38697'
@@ -58,31 +58,11 @@ def fresh(value, now, age=300):
     require(-30 <= (now - timestamp(value)).total_seconds() <= age)
 
 
-NAS_LAG_SECONDS = 2 * 3600
 UNREACHABLE = frozenset((errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN, errno.EHOSTDOWN))
-# psql exit 3 (ON_ERROR_STOP) with only these SQLSTATEs: statement or lock timeout.
-TIMEOUT_SQLSTATES = frozenset(('57014', '55P03'))
-
-
-def nas_lagging(value, now):
-    """True for a NAS report older than 300 s but under 2 h; older or future stops."""
-    age = (now - timestamp(value)).total_seconds()
-    require(-30 <= age < NAS_LAG_SECONDS)
-    return age > 300
-
-
-def defer(kind):
-    # Data-derived transients are raised only after every substantive check passed.
-    if kind is not None:
-        raise TransientFailure(kind)
-
-
-def held_refresh(recovery):
-    return None if REFRESH_HOLD not in recovery else transient_record(recovery, REFRESH_HOLD)
 
 
 def network_kind(error):
-    """Transient class of a connection-level failure, else None. TLS failures stop."""
+    """Transient class of a failure that returned no data, else None. TLS failures stop."""
     if isinstance(error, urllib.error.HTTPError):
         return Transient.HTTP_UNAVAILABLE if error.code == 429 or 500 <= error.code <= 599 else None
     if isinstance(error, urllib.error.URLError):
@@ -133,44 +113,42 @@ def psql(repo, query):
         result = subprocess.run(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=sqlstate'],
                                 input=query, env=env, capture_output=True, text=True, timeout=25)
     except subprocess.TimeoutExpired:
-        raise TransientFailure(Transient.TIMEOUT) from None
-    codes = set(re.findall(r'^(?:psql:\S+ )?ERROR:\s+([0-9A-Z]{5})$', result.stderr, re.M))
-    # psql exit 2 is a bad connection; it is transient only while the server
-    # itself is unreachable, so a refused login (reachable server) still stops.
-    if (result.returncode == 2 and not reachable(env)) or (
-            result.returncode == 3 and codes and codes <= TIMEOUT_SQLSTATES):
+        raise TransientFailure(Transient.DATABASE_UNAVAILABLE) from None
+    # psql exit 2 is a bad connection; it returned no data. It is transient only
+    # while the server is unreachable, so a refused login still stops.
+    if result.returncode == 2 and not reachable(env):
         raise TransientFailure(Transient.DATABASE_UNAVAILABLE)
     require(result.returncode == 0)
     return json.loads(result.stdout)
 
 
-def assemble(status, recovery, api, db, master_at, now):
-    require(status['current_plan'] == PLAN and status['next_plan'] == 1441)
+def legacy_api(api):
     require(api['id'] == PLAN and api['plan_sha256'] == PLAN_SHA and api['mode'] == 'retired')
     require(type(api['master_deletion_enabled']) is bool)
+
+
+def assemble(status, recovery, api, db, master_at, now):
+    require(status['current_plan'] == PLAN and status['next_plan'] == 1441)
+    legacy_api(api)
     require(db['plan_sha256'] == PLAN_SHA and db['enabled_plans'] == [] and db['enabled_batches'] == [])
     require(type(status['shutdown_or_recovery_failed']) is bool)
     require(status['recovery_error'] is None or isinstance(status['recovery_error'], str))
     require(status['last_error'] is None or isinstance(status['last_error'], str))
-    require(db['issued'] == 1860)
-    held = held_refresh(recovery)
-    if held is None:
-        require('refresh_error' not in recovery and recovery['plan_id'] == PLAN and recovery['plan_sha256'] == PLAN_SHA)
-        issued = count(recovery['delete_ever_issued'])
-        verified = count(recovery['verified'])
-        problems = count(recovery['problems'])
-        require(issued == db['issued'])
-        checked = timestamp(recovery['checked_at'])
-        require(checked > timestamp(db['newest_issued_at']))
-        fresh(recovery['checked_at'], now, 7 * 3600)
+    require('refresh_error' not in recovery and recovery['plan_id'] == PLAN and recovery['plan_sha256'] == PLAN_SHA)
+    issued = count(recovery['delete_ever_issued'])
+    verified = count(recovery['verified'])
+    problems = count(recovery['problems'])
+    require(issued == db['issued'] == 1860)
+    checked = timestamp(recovery['checked_at'])
+    require(checked > timestamp(db['newest_issued_at']))
+    fresh(recovery['checked_at'], now, 7 * 3600)
     require(db['version'] in NAS_CLIENT_VERSIONS and isinstance(db['boot'], str) and bool(db['boot']))
-    lagging = nas_lagging(db['cleanup_at'], now)
+    fresh(db['cleanup_at'], now)
     local = db['r2_copy']
     require(isinstance(local, dict) and isinstance(local['holds_by_reason'], dict))
     mismatch = count(local['mismatch_latched'])
     holds = local['holds_by_reason']
     require(all(isinstance(k, str) and type(v) is int and v >= 0 for k, v in holds.items()))
-    defer(Transient.RECOVERY_HELD if held else Transient.NAS_REPORT_LAGGING if lagging else None)
     return dict(updated_at=now.isoformat(), recovery_problems=problems,
                 recovery_checked_at=recovery['checked_at'], recovery_issued_items=issued,
                 recovery_verified_items=verified, recovery_plan_id=PLAN, recovery_plan_sha256=PLAN_SHA,
@@ -205,6 +183,9 @@ def main():
     status = json.loads(status_bytes)
     master_at = datetime.now(timezone.utc).isoformat()
     api = api_get('plans/1440')
+    # API-only contract first: a later DB failure must not mask an API mismatch.
+    legacy_api(api)
+    require(not args.plan_source or api['master_deletion_enabled'] is False)
     query = """BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY;
 SET LOCAL ROLE stoarama;
 SET LOCAL statement_timeout='10s';SET LOCAL lock_timeout='2s';SET LOCAL work_mem='16MB';
@@ -219,12 +200,16 @@ SELECT jsonb_build_object(
  'version',client_version,'boot',client_boot_id,'cleanup_at',nas_cleanup_status_at,
  'r2_copy',nas_cleanup_status->'r2_copy') FROM connections WHERE id=13;
 ROLLBACK;"""
-    db = psql(repo, query)
+    try:
+        db = psql(repo, query)
+    except TransientFailure:
+        # The API answered: hold only if the CLI could not stop on it (legacy expects OFF).
+        require(api['master_deletion_enabled'] is False)
+        raise
     require((root / 'status.json').read_bytes() == status_bytes and (root / 'STOP').read_text() == STOP)
     if args.plan_source:
         require(status['current_plan'] == PLAN and status['next_plan'] == 1441)
-        require(api['id'] == PLAN and api['plan_sha256'] == PLAN_SHA and api['mode'] == 'retired')
-        require(api['master_deletion_enabled'] is False and db['enabled_plans'] == [] and db['enabled_batches'] == [])
+        require(db['enabled_plans'] == [] and db['enabled_batches'] == [])
         require(db['plan_sha256'] == PLAN_SHA and db['issued'] == 1860)
         require(status['recovery_error'] is None and status['shutdown_or_recovery_failed'] is False)
         require(status['last_error'] in (None, HELD_ERROR))

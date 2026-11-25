@@ -19,24 +19,19 @@ class Latched(Exception):
     pass
 
 
-# sysexits EX_TEMPFAIL: a collector or plan source could not observe its
-# evidence for a transient reason. It reports no finding and never latches.
+# sysexits EX_TEMPFAIL: a collector or plan source obtained no data for a
+# pure network reason. It reports no finding.
 TRANSIENT_EXIT = 75
-# The recovery lane's non-latching hold record: never success, never a finding.
-REFRESH_HOLD = 'refresh_hold'
 
 
 class Transient(str, Enum):
-    """The only failures that hold without latching. Everything else latches."""
+    """The only failures that may hold without latching: no data was obtained.
+    Every data-derived refusal and every other failure latches."""
     DNS = 'dns'
     NETWORK = 'network'
     TIMEOUT = 'timeout'
     HTTP_UNAVAILABLE = 'http_unavailable'  # HTTP 5xx or 429
-    DATABASE_UNAVAILABLE = 'database_unavailable'
-    NAS_REPORT_LAGGING = 'nas_report_lagging'  # older than 300 s, under 2 h
-    MASTER_OFF = 'master_off'
-    RUNNER_TRANSITION = 'runner_transition'
-    RECOVERY_HELD = 'recovery_held'
+    DATABASE_UNAVAILABLE = 'database_unavailable'  # psql timeout, or bad connection to an unreachable server
 
 
 class TransientFailure(Exception):
@@ -184,9 +179,10 @@ class Attempt:
         record['active'][lane] = self.path.name
         publish(journal, record)
 
-    def finish(self, reason: str, output: dict, held: Optional[Transient] = None) -> bool:
+    def finish(self, reason: str, output: dict, held: bool = False) -> bool:
         """Latch on reason, publish success, or with held close a transient
-        attempt: admission stays unlatched and recovery is not refreshed."""
+        attempt publishing nothing: admission stays unlatched, and the previous
+        status/report keeps its own timestamp and freshness limits."""
         if self.abandoned:
             raise Latched()
         # Serialize success publication with failure latching. A sibling that
@@ -216,18 +212,14 @@ class Attempt:
                         else:
                             stop_status(self.state, reason)
                     return False
-                publishing_success = True
-                if held is not None:
-                    # The tick keeps its old status aging for the dead-man. The
-                    # old recovery report must not stay consumable as fresh.
-                    if self.lane == 'recovery':
-                        publish(self.state / 'recovery.json', {REFRESH_HOLD: held.value})
-                elif self.lane == 'tick':
-                    publish(self.state / 'status.json', output)
-                else:
-                    publish(self.state / 'recovery.json', output)
-                    publish(self.state / 'recovery-last-good.json', output)
-                    record['recovery_required'] = False
+                if not held:
+                    publishing_success = True
+                    if self.lane == 'tick':
+                        publish(self.state / 'status.json', output)
+                    else:
+                        publish(self.state / 'recovery.json', output)
+                        publish(self.state / 'recovery-last-good.json', output)
+                        record['recovery_required'] = False
                 del record['active'][self.lane]
                 publish(self.state / 'admission.json', record)
                 # Scratch reclamation cannot reverse a committed success.

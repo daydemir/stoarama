@@ -11,7 +11,7 @@ import re
 import time
 
 from tick import notify
-from admission import (REFRESH_HOLD, TRANSIENT_EXIT, Attempt, Latched, Transient, TransientFailure,
+from admission import (TRANSIENT_EXIT, Attempt, Latched, Transient, TransientFailure,
                        publish, transient_record)
 from cli_binding import bound_launcher
 
@@ -58,14 +58,6 @@ def select_plan_retrying(source):
         except TransientFailure:
             time.sleep(delay)
     return select_plan(source)
-
-
-def held_before(state):
-    """Whether the previous refresh already held, so this episode was notified."""
-    try:
-        return REFRESH_HOLD in json.loads((state / 'recovery.json').read_bytes())
-    except (OSError, ValueError, TypeError):
-        return False
 
 
 def main():
@@ -122,16 +114,12 @@ def main():
             notify(args.notify_agent, reason or 'recovery_refresh_failed')
             return 1
         except TransientFailure as failure:
-            # Hold without latching: admission stays unlatched, the old report is
-            # no longer consumable, and the next scheduled or kicked run retries.
-            line = 'recovery_transient_hold ' + failure.kind.value
-            first = not held_before(args.state)
+            # No data, no finding: hold without latching or notifying. The old
+            # report is never restamped; its own 7 h limit still stops feeding
+            # and cleanup, and that stale stop alerts. The next run retries.
             try:
-                if attempt.finish('', {}, held=failure.kind):
-                    if first:
-                        notify(args.notify_agent, line)
-                    else:
-                        print('finish ' + line, flush=True)
+                if attempt.finish('', {}, held=True):
+                    print('finish recovery_transient_hold ' + failure.kind.value, flush=True)
                     return TRANSIENT_EXIT
             except Latched:
                 notify(args.notify_agent, 'admission_publication_failed')

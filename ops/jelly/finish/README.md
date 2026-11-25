@@ -225,26 +225,25 @@ time, then install D. A v4 observation packet is not late-budget eligible.
 
 ## Transient holds
 
-Owner, verbatim: transient plan-source failures "should retry with backoff and hold
-without latching. Latch only on substantive findings." The collector and plan source
-exit 75 with stdout `{"transient":"<class>"}` only for a class in admission.py's
-`Transient` enum: DNS, network (refused, reset, unreachable), timeout, HTTP 5xx/429,
-an unreachable database (psql exit 2 while a TCP probe also fails) or a SQL
-statement/lock timeout, a NAS report 300 s to 2 h old, master switch off, or the
-runner exiting between the lock probe and `ps`. Data-derived classes are raised only
-after every substantive check passes. Every other failure, including an unknown
-class or malformed record, latches as before. Wrappers must propagate exit 75 and
-stdout, or transients latch (fail closed).
+Lead decision (lean): only pure network failures that obtained no data hold;
+everything data-derived latches as before. A collector or plan source exits 75
+with stdout `{"transient":"<class>"}` for admission.py's `Transient` enum only:
+DNS, network (refused, reset, unreachable), timeout, HTTP 5xx/429, or
+`database_unavailable` (psql timed out, or exited 2 while a TCP probe of the server
+also fails). API-only contract checks run before psql, so a DB failure after a good
+API response still latches on an API mismatch (legacy mode also on master ON, which its
+CLI would stop on). NAS lag, master off, a SQL timeout
+after the query ran, every other failure, an unknown class or a malformed record
+latch. Wrappers must propagate exit 75 and stdout, or transients latch (fail closed).
 
 `refresh_recovery.py` tries the plan source three times over about ten minutes; a
-verifier timeout holds without retry. A hold leaves `admission.json` unlatched
-(`recovery_required` unchanged), replaces `recovery.json` with
-`{"refresh_hold":"<class>"}` so the old report is never consumed as fresh, logs one
-line, notifies once per episode and exits 75. The tick then holds too (exit 75,
-no feed, no notification, status left to age for the dead-man). The runner treats
-`refresh_hold` as a finish-health refusal: idle, it holds and kicks recovery once;
-with an owned plan it contains, as with any stale report. The next scheduled or
-kicked refresh retries. A CLI verifier failure without a report still latches.
+verifier timeout holds without retry. A hold publishes nothing: admission stays
+unlatched and the previous `recovery.json` keeps its own `checked_at`, so its
+7-hour limit still stops feeding and cleanup and alerts. It logs one line, sends
+no notification and exits 75; the next run retries. The tick holds the same way
+(exit 75, no feed, no notification, status left to age for the dead-man) and
+records the start in `tick-hold.json`; any collector outcome with data clears it,
+and a hold continuous for over 2 h latches as `evidence_unavailable`.
 
 ## Stops
 

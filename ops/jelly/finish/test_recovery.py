@@ -97,7 +97,8 @@ class TransientRecoveryTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.state = Path(self.temp.name)
-        (self.state / 'recovery.json').write_text(json.dumps(REPORT))  # an old success
+        self.old = json.dumps(dict(REPORT, checked_at='2026-11-17T01:00:00Z'))  # an old success
+        (self.state / 'recovery.json').write_text(self.old)
 
     def invoke(self, *sources, verify=report(REPORT)):
         from unittest.mock import patch
@@ -129,11 +130,11 @@ class TransientRecoveryTest(unittest.TestCase):
                 code, tries, sleeps, notes = self.invoke(transient(kind.value))
                 self.assertEqual((code, tries, sleeps), (75, 3, [120, 360]))
                 self.assertEqual(self.admission(), {'failed': False, 'active': {}})
-                self.assertEqual(self.recovery(), {'refresh_hold': kind.value}, 'old success must not stay fresh')
-                self.assertEqual(notes, ['recovery_transient_hold ' + kind.value])
+                self.assertEqual((self.state / 'recovery.json').read_text(), self.old,
+                                 'the old report keeps its own checked_at and 7 h limit; never restamped')
+                self.assertEqual(notes, [], 'no data, no finding: the eventual stale stop alerts')
                 self.assertEqual([p for p in self.state.iterdir() if p.is_dir()], [])
                 self.assertFalse((self.state / 'recovery-last-good.json').exists())
-                # The same episode does not notify again, and still never latches.
                 self.assertEqual(self.invoke(transient(kind.value))[::3], (75, []))
                 self.assertFalse(self.admission()['failed'])
 
@@ -141,10 +142,11 @@ class TransientRecoveryTest(unittest.TestCase):
         def hang(command, **kwargs):
             raise subprocess.TimeoutExpired(command, 30)
         self.assertEqual(self.invoke(hang)[:3], (75, 3, [120, 360]))
-        self.assertEqual(self.recovery(), {'refresh_hold': 'timeout'})
+        self.assertEqual((self.state / 'recovery.json').read_text(), self.old)
         self.setUp()
         self.assertEqual(self.invoke(plan_ok, verify=hang)[:3], (75, 1, []))
-        self.assertEqual((self.admission()['failed'], self.recovery()), (False, {'refresh_hold': 'timeout'}))
+        self.assertFalse(self.admission()['failed'])
+        self.assertEqual((self.state / 'recovery.json').read_text(), self.old)
 
     def test_transient_then_success_refreshes_and_reconciled_hold_stays_required(self):
         (self.state / 'admission.json').write_text(json.dumps({'failed': False, 'active': {}, 'recovery_required': True}))
@@ -159,12 +161,18 @@ class TransientRecoveryTest(unittest.TestCase):
             return subprocess.CompletedProcess(command, 1, stdout=b'')
         def denied(command, **kwargs):
             raise PermissionError()
+        def removed(kind):  # data-derived classes removed by the lean fallback
+            return lambda command, **kwargs: subprocess.CompletedProcess(command, 75, stdout=json.dumps({'transient': kind}).encode())
         def raw75(stdout):
             return lambda command, **kwargs: subprocess.CompletedProcess(command, 75, stdout=stdout)
         cases = {
             'plan source finding (exit 1)': ((failed,), report(REPORT), 'refresh_error'),
             'unclassified exception': ((denied,), report(REPORT), 'refresh_error'),
             'unknown transient class': ((raw75(b'{"transient":"bogus"}'),), report(REPORT), 'refresh_error'),
+            'nas_report_lagging class': ((removed('nas_report_lagging'),), report(REPORT), 'refresh_error'),
+            'master_off class': ((removed('master_off'),), report(REPORT), 'refresh_error'),
+            'recovery_held class': ((removed('recovery_held'),), report(REPORT), 'refresh_error'),
+            'runner_transition class': ((removed('runner_transition'),), report(REPORT), 'refresh_error'),
             'malformed transient record': ((raw75(b'{"transient":"dns","plan_id":1}'),), report(REPORT), 'refresh_error'),
             'empty transient record': ((raw75(b''),), report(REPORT), 'refresh_error'),
             'problems over 0': ((plan_ok,), report(dict(REPORT, problems=1, verified=1), 2), 'problems'),

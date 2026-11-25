@@ -1177,11 +1177,11 @@ CLEAN = dict(failed=False, recovery_required=False)
 
 class FinishHoldTests(unittest.TestCase):
     """A startup finish-health refusal with no owned plan holds idle; it never latches the runner."""
-    def start(self, root, admission, checked_at=None, kick=None, during_health=None, recovery=None, **status):
+    def start(self, root, admission, checked_at=None, kick=None, during_health=None, **status):
         state = Path(root) / 'finish'
         state.mkdir(exist_ok=True)
         (state / 'admission.json').write_text(json.dumps(dict(admission, active={})))
-        (state / 'recovery.json').write_text(json.dumps(recovery or dict(plan_id=42, plan_sha256='b'*64, problems=0, verified=1,
+        (state / 'recovery.json').write_text(json.dumps(dict(plan_id=42, plan_sha256='b'*64, problems=0, verified=1,
             delete_ever_issued=1, checked_at=(checked_at or r.utcnow()).isoformat())))
         path = Path(root) / 'status.json'
         saved = json.loads(path.read_text()) if path.exists() else dict(current_plan=None, last_error=None, owner_id=OWNER_ID,
@@ -1271,34 +1271,6 @@ class FinishHoldTests(unittest.TestCase):
             self.assertEqual((self.kicks(job), status['finish_recovery_kicked']), ([], False))
             _, job, _ = self.start(root, reconciled)
             self.assertEqual(len(self.kicks(job)), 1)
-
-    def test_transient_refresh_hold_is_an_unlatched_hold_that_kicks_recovery_once(self):
-        held = {FINISH_ADMISSION.REFRESH_HOLD: 'dns'}
-        with tempfile.TemporaryDirectory() as root:
-            code, job, status = self.start(root, CLEAN, recovery=held)
-            self.assertEqual((code, status['phase'], status['last_error']), (0, 'stopped', None))
-            self.assertEqual(self.stop(root)['reason'], 'finish_admission_hold')
-            self.assertEqual((len(self.alerts(job)), self.kicks(job)), (1, []))
-            self.assertNotIn('OFF', job.events)
-            _, job, status = self.start(root, CLEAN, recovery=held)
-            self.assertEqual(len(self.kicks(job)), 1)
-            self.assertTrue(status['finish_recovery_kicked'])
-            _, job, _ = self.start(root, CLEAN, recovery=held)
-            self.assertEqual((self.alerts(job), self.kicks(job)), ([], []))
-            code, job, _ = self.start(root, CLEAN)
-            self.assertEqual(code, 0)
-            self.assertFalse((Path(root) / 'STOP').exists())
-            self.assertIn('run_day', job.events)
-
-    def test_transient_refresh_hold_is_a_named_finish_health_refusal(self):
-        with tempfile.TemporaryDirectory() as root:
-            state = Path(root)
-            (state / 'admission.json').write_text(json.dumps(dict(CLEAN, active={})))
-            (state / 'recovery.json').write_text(json.dumps({FINISH_ADMISSION.REFRESH_HOLD: 'network'}))
-            job = r.Runner(Path('.'), state)
-            job.finish_state, job.status = state, dict(recovery_history={})
-            with self.assertRaisesRegex(r.Halt, 'transient'):
-                job._finish_health(FINISH_ADMISSION)
 
     def test_kickstart_failure_alerts_and_keeps_the_hold(self):
         with tempfile.TemporaryDirectory() as root:

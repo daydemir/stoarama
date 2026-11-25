@@ -910,9 +910,6 @@ class Runner:
         require(not admission.interrupted(self.finish_state, record, None),
                 'interrupted finish attempt requires reconciliation')
         report = json.loads((self.finish_state / 'recovery.json').read_bytes())
-        # D's transient refresh hold: no report and no latch. Startup holds and
-        # kicks recovery once per unlatched episode; active execution contains.
-        require(admission.REFRESH_HOLD not in report, 'finish recovery refresh held on a transient failure')
         require(all(type(report[key]) is int and report[key] >= 0 for key in ('plan_id', 'problems', 'verified', 'delete_ever_issued')),
                 'invalid finish recovery counts')
         prior = self.status['recovery_history'][str(report['plan_id'])]
