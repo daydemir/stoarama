@@ -22,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/daydemir/stoarama/backend/internal/stitchproof"
@@ -240,23 +241,70 @@ func (c *Client) PresignPutCreateOnlyMetadataRequest(ctx context.Context, key, c
 func (c *Client) presignPutCreateOnly(ctx context.Context, key, contentType string, sizeBytes int64, sha256Hex string, ttl time.Duration, metadata bool) (PresignedRequest, error) {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	if ttl <= 0 {
-		return PresignedRequest{}, errors.New("PUT capability requires positive TTL")
-	}
-	if sizeBytes <= 0 {
-		return PresignedRequest{}, errors.New("presign create-only put: size must be positive")
-	}
-	digest, err := hex.DecodeString(strings.ToLower(strings.TrimSpace(sha256Hex)))
-	if err != nil || len(digest) != 32 {
-		return PresignedRequest{}, errors.New("presign create-only put: sha256 must be 64 lowercase hex characters")
+	in, err := createOnlyPutInput(c.bucket, key, contentType, sizeBytes, sha256Hex, ttl, metadata)
+	if err != nil {
+		return PresignedRequest{}, err
 	}
 	release, _, err := c.admitWrite(ctx, ttl)
 	if err != nil {
 		return PresignedRequest{}, err
 	}
 	defer release()
+	return c.signCreateOnlyPut(ctx, in, ttl)
+}
+
+// PresignNASRestorePut signs the create-only PUT of one Keep Everything
+// original NAS restore. Its writer admission is the restore row itself: tx
+// must hold that row leased, which the r2_writer_restore trigger admits past
+// the writer fence only for nas_restore_ke_original (migration 0260). Like
+// admitWrite's capability record, put_expires_at is stamped before signing and
+// outlives the capability, so the R2 delete gate (r2_retirement_writes_blocked)
+// sees it. Key, media type, length and checksum come from that row, never from
+// the caller.
+func (c *Client) PresignNASRestorePut(ctx context.Context, tx pgx.Tx, requestID int64, ttl time.Duration) (PresignedRequest, error) {
+	if c.writerDB == nil && !c.ungatedWriter {
+		return PresignedRequest{}, errors.New("R2 writes require database admission; unbound client is read-only")
+	}
+	if ttl > 7*24*time.Hour {
+		return PresignedRequest{}, errors.New("R2 PUT capability exceeds seven days")
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	var key, contentType, sha, bucket string
+	var size int64
+	if err := tx.QueryRow(ctx, `UPDATE nas_restore_requests q
+		SET put_expires_at=GREATEST(put_expires_at,clock_timestamp()+$2::bigint*interval '1 microsecond'+interval '2 minutes')
+		FROM recording_clips c
+		WHERE q.id=$1 AND q.state='leased' AND c.id=q.clip_id AND nas_restore_ke_original(q.target,q.clip_id,q.object_key,q.size_bytes,q.sha256,q.relative_path)
+		RETURNING q.object_key,q.content_type,q.size_bytes,q.sha256,c.bucket`,
+		requestID, ttl.Microseconds()).Scan(&key, &contentType, &size, &sha, &bucket); err != nil {
+		return PresignedRequest{}, fmt.Errorf("restore %d is not an admitted Keep Everything original lease: %w", requestID, err)
+	}
+	// The key alone is not the clip's identity: its catalogued bucket must be the
+	// one this capability writes.
+	if bucket != c.bucket {
+		return PresignedRequest{}, fmt.Errorf("restore %d clip bucket %q is not the signing bucket", requestID, bucket)
+	}
+	in, err := createOnlyPutInput(c.bucket, key, contentType, size, sha, ttl, false)
+	if err != nil {
+		return PresignedRequest{}, err
+	}
+	return c.signCreateOnlyPut(ctx, in, ttl)
+}
+
+func createOnlyPutInput(bucket, key, contentType string, sizeBytes int64, sha256Hex string, ttl time.Duration, metadata bool) (*s3.PutObjectInput, error) {
+	if ttl <= 0 {
+		return nil, errors.New("PUT capability requires positive TTL")
+	}
+	if sizeBytes <= 0 {
+		return nil, errors.New("presign create-only put: size must be positive")
+	}
+	digest, err := hex.DecodeString(strings.ToLower(strings.TrimSpace(sha256Hex)))
+	if err != nil || len(digest) != 32 {
+		return nil, errors.New("presign create-only put: sha256 must be 64 lowercase hex characters")
+	}
 	in := &s3.PutObjectInput{
-		Bucket:         aws.String(c.bucket),
+		Bucket:         aws.String(bucket),
 		Key:            aws.String(key),
 		ContentLength:  aws.Int64(sizeBytes),
 		ContentType:    aws.String(contentType),
@@ -266,9 +314,13 @@ func (c *Client) presignPutCreateOnly(ctx context.Context, key, contentType stri
 	if metadata {
 		in.Metadata = map[string]string{"sha256": strings.ToLower(strings.TrimSpace(sha256Hex))}
 	}
+	return in, nil
+}
+
+func (c *Client) signCreateOnlyPut(ctx context.Context, in *s3.PutObjectInput, ttl time.Duration) (PresignedRequest, error) {
 	out, err := c.presigner.PresignPutObject(ctx, in, s3.WithPresignExpires(ttl))
 	if err != nil {
-		return PresignedRequest{}, fmt.Errorf("presign create-only put %s: %w", key, err)
+		return PresignedRequest{}, fmt.Errorf("presign create-only put %s: %w", aws.ToString(in.Key), err)
 	}
 	if ctx.Err() != nil {
 		return PresignedRequest{}, errors.New("PUT capability signing expired")

@@ -338,8 +338,9 @@ stoaramactl r2-retire delivery-fence --activate --all-api-instances-gated
 This records the effective timestamp, exact policy bytes and SHA
 `060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811`, and immutable
 per-stream UTC windows. Raw feeds/downloads, collated feeds/downloads, joined
-feeds/downloads, and NAS restore lease/result paths refuse outside-window or
-unknown media identities. Kept-window delivery and the reviewed kept-window
+feeds/downloads refuse outside-window or unknown media identities. NAS restore
+lease/result paths serve only Keep Everything 'original' rows, whatever their
+window, and refuse every other row. Kept-window delivery and the reviewed kept-window
 redownload remain available. The connection key is confined to the existing
 pull route allowlist even if its key scopes change; browser/global/producer
 capability routes cannot bypass the fence. NAS stitch tool downloads contain

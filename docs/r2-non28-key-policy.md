@@ -55,7 +55,7 @@ Paths are relative to the repository. Numbers below refer to that base.
 | Sized presign | `backend/internal/r2/client.go:282` | Signed size, no no-overwrite condition. No non-test call in this base. |
 | Joined publish/artifacts | `backend/internal/api/server_recording_joined.go:847` → `client.go:240` | Signed checksum/size and `If-None-Match: *`. |
 | Space-audit presign | `backend/internal/api/server_nas_space_audit.go:174` → `client.go:236` | Create-only signed metadata; excluded `nas-space-audits/`. |
-| NAS restore | `backend/internal/api/server_nas_restore.go:43` | Retired: lease returns no tasks/capabilities. Historical client uploader at `clients/nas-pull/stoarama_pull.py:51621`; historical capabilities still require TTL bound. |
+| NAS restore | `backend/internal/api/server_nas_restore.go` → `client.go` `PresignNASRestorePut` | Keep Everything 'original' rows only (migration 0260): row-bound signed checksum/size and `If-None-Match: *`, admitted by the restore row, visible to the delete gate through `put_expires_at`. Every other row is retired. |
 | Direct bytes | `client.go:357` | Ordinary PUT. Callers: `internal/inferencebox/manager.go:246`, `internal/survey/survey.go:270`, `internal/api/server_imports.go:242`, `server.go:3444`, `cmd/stoaramactl/main.go:3462,4021`, `collation_v2.go:170` (all under `backend/`). |
 | Direct reader | `client.go:381` | Ordinary PUT. `backend/internal/api/server.go:2680` ZIP. |
 | Direct multipart/small single PUT | `client.go:493` | Ordinary upload. `backend/internal/api/server_recording_export.go:676`, `server_day_zip.go:523`, `cmd/stoaramactl/recorder_transfer.go:279`. |

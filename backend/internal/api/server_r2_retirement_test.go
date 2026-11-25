@@ -87,8 +87,6 @@ func TestR2StitchRetiredNASHandlersPreserveDurableRows(t *testing.T) {
 	}{
 		{"probe request", s.handleAccountConnectionUploadProbe, http.StatusOK},
 		{"probe report", s.handleAccountConnectionUploadProbeResult, http.StatusConflict},
-		{"restore lease", s.handleAccountConnectionRestoreLease, http.StatusOK},
-		{"restore report", s.handleAccountConnectionRestoreResult, http.StatusConflict},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, key := range []*int64{nil, ptrInt64(999), ptrInt64(123)} {
@@ -106,12 +104,6 @@ func TestR2StitchRetiredNASHandlersPreserveDurableRows(t *testing.T) {
 				if key != nil && *key == 123 && tc.name == "probe request" {
 					var response nasUploadProbeResponse
 					if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil || response.Enabled || response.Due || response.RetryAfterSec != 3600 {
-						t.Fatalf("response=%s err=%v", rr.Body, err)
-					}
-				}
-				if key != nil && *key == 123 && tc.name == "restore lease" {
-					var response nasRestoreLeaseResponse
-					if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil || response.Tasks == nil || len(response.Tasks) != 0 || response.RetryAfterSec != 120 {
 						t.Fatalf("response=%s err=%v", rr.Body, err)
 					}
 				}

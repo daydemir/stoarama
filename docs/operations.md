@@ -331,8 +331,16 @@ RAW drain = [this helper](../ops/jelly/r2-retire/raw-drain-lock.sql) plus a term
 
 Legacy `survey delete-stream-captures`, `joined-source-purge --apply` and
 `nas-verified-purge --apply` refuse before catalog or object mutations. Keep the
-NAS purge cron suspended and its enable flag false. Probe/restore requests issue
-no new capabilities; existing rows and objects remain preserved. New account and
+NAS purge cron suspended and its enable flag false. Probe requests issue no new
+capabilities. Restore requests issue none either, with one exception: an
+'original' restore of a Keep Everything clip (`nas_restore_ke_original`, the
+pinned `keep_everything` streams of `nas_media_keep20_windows`). Deniz, verbatim:
+"nas shoul dnot have any of the keep everything (except the keep 20)"; R2 holds
+100% of Keep Everything. Migration 0260 admits only those rows past the writer
+fence; their live `put_expires_at` holds `r2_retirement_writes_blocked` false,
+so R2 delete batches wait while a restore capability is live. Test restores and
+every other row stay untouched and refused; existing rows and objects remain
+preserved. New account and
 admin S3 destination verification/provisioning is retired before writing probes
 or credentials. Existing managed destinations resolve by read-only lookup;
 missing managed storage is not implicitly created, billed or marked verified.
