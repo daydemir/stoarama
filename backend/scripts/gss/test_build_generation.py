@@ -1,3 +1,5 @@
+import dataclasses
+import datetime
 import gzip
 import hashlib
 import json
@@ -11,6 +13,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import best14_ledger as L  # noqa: E402
 import build_generation as b  # noqa: E402
 
 BACKEND = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -55,7 +58,7 @@ class Fixture:
                     for p in parts:
                         if not (d == 0 and h == 0):
                             outputs.append(self.output(rid, p[0], date))
-                days.append({'date': date, 'grade': 'A', 'hours': hours})
+                days.append({'date': date, 'grade': 'A', 'captured_scheduled_seconds': 7000.0, 'hours': hours})
             inputs = [rid * 1000, rid * 1000 + 1]
             asm = dict(self.output(rid, assembly_id(rid), DAYS[0]), replacement_inputs=inputs)
             outputs.insert(0, asm)
@@ -317,6 +320,159 @@ class SyntheticBuildTests(unittest.TestCase):
         self.assertEqual((md[RIDS[0]], md[RIDS[-1]]), ('available', 'partial'))
         self.check_objects(out, reg)
         go_validate(self, os.path.join(out, 'registry.json.gz'))
+
+
+def iso(t):
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).isoformat()
+
+
+class LedgerWorld:
+    """The Fixture's files as best-14 ledger hours: every hour complete in R2, its first
+    hour served by its assembly. new_part() and move_window() change what the ledger serves."""
+
+    def __init__(self, fx):
+        self.fx = fx
+        self.records, self.hours, self.listing = {}, {}, {}
+        files = fx.parent['files']
+        for rid in RIDS:
+            asm = files[assembly_id(rid)]
+            for d, date in enumerate(DAYS):
+                for h in range(2):
+                    t0 = 1784786400.0 + (d * 2 + h) * 3600
+                    parts = []
+                    for k in range(2):
+                        oid = rid * 1000 + d * 4 + h * 2 + k
+                        sha = hashlib.sha256(str(oid).encode()).hexdigest()
+                        parts.append(L.Part(oid, k + 1, 2, f'joined/g/objects/{sha}.mp4', 1000, sha, iso(t0 + k * 1800),
+                                            iso(t0 + k * 1800 + 1700), f'nas/{rid}/{oid}.mp4', L.Source.ORIGINAL))
+                    rec = L.Record(rid * 100 + d * 2 + h, f'h-{rid}-{date}-{h + 1}', 'goodplus', 'collated', 'r', tuple(parts), 4, 4)
+                    if d == 0 and h == 0:
+                        served = (L.Served(assembly_id(rid), asm['key'], 1000, 'e', asm['sha256'], asm['path'], L.Source.V85_ASSEMBLY,
+                                           tuple(str(p.output_id) for p in parts)),)
+                    else:
+                        served = tuple(L.Served(str(p.output_id), p.key, 1000, 'e', p.sha256, files[str(p.output_id)]['path'],
+                                                L.Source.ORIGINAL, (str(p.output_id),)) for p in parts)
+                    self.put(rid, date, h + 1, rec, served)
+
+    def put(self, rid, date, dh, rec, served):
+        self.records[(rid, date, dh)] = [rec]
+        self.hours[(rid, date, dh)] = L.Hour(rid, '1', date, dh, True, rec, served, True, True)
+        for x in served:
+            self.listing[x.key] = (x.size_bytes, x.etag)
+
+    def new_part(self, rid, date, dh, oid):
+        """A re-stitched one-part hour from a recovery batch, in place of the two originals."""
+        t0 = self.hours[(rid, date, dh)].record.parts[0]
+        sha = hashlib.sha256(b'new%d' % oid).hexdigest()
+        p = L.Part(oid, 1, 1, f'joined/recovery-x/objects/{sha}.mp4', 2000, sha, t0.start_at, t0.end_at,
+                   f'{rid}_Folder/July/11-Saturday/{rid}_x_hour_09_080000-085000.mp4', L.Source.NEW_STITCH)
+        rec = L.Record(oid, f'r-{oid}', 'recovery-x', 'collated', 'r2', (p,), 3, 3)
+        live = self.records[(rid, date, dh)]
+        self.put(rid, date, dh, rec, (L.Served(str(oid), p.key, 2000, 'f' * 32, sha, p.nas_path, L.Source.NEW_STITCH, (str(oid),)),))
+        self.records[(rid, date, dh)] = live + [rec]  # the extract still holds the live record
+        return p
+
+    def inputs(self):
+        return L.Inputs({}, self.records, [], self.listing, self.fx.parent, {})
+
+    def hour_list(self):
+        return [self.hours[k] for k in sorted(self.hours)]
+
+    def generation(self, store, grades=None):
+        isa = lambda x: x.source in L.ASSEMBLY_SOURCES
+        hours = self.hour_list()
+        overlay, present, added, file_holds = b.ledger_generation(self.inputs(), hours, store, grades or {}, isa)
+        best14 = {}
+        for d in L.day_rows(hours):
+            best14.setdefault(d['recording_id'], set()).add((d['local_date'], d['day_stitched']))
+        lost = b.regressions(self.inputs(), hours, store, present, isa)
+        return b.OverlayStore(store, overlay), present, added, file_holds, best14, lost
+
+
+class LedgerBuildTests(unittest.TestCase):
+    setUp, tearDown, out, object = SyntheticBuildTests.setUp, SyntheticBuildTests.tearDown, SyntheticBuildTests.out, SyntheticBuildTests.object
+
+    def build_ledger(self, world, name, grades=None):
+        store, present, added, file_holds, best14, lost = world.generation(self.store, grades)
+        out = self.out(name)
+        summary = b.build(self.fx.parent, store, present, self.fx.holds, GEN, NOW, 'note', out, best14, added, file_holds)
+        return out, b.read_registry(os.path.join(out, 'registry.json.gz')), summary, lost
+
+    def test_same_selection_republishes_the_parent(self):
+        out, reg, summary, lost = self.build_ledger(LedgerWorld(self.fx), 'same')
+        self.assertEqual((reg['files'], lost, summary['added_files'], summary['holds']), (self.fx.parent['files'], {}, 0, summary['objects']))
+        self.assertEqual(summary['availability'], {'available': len(RIDS), 'partial': 0})
+        go_validate(self, os.path.join(out, 'registry.json.gz'))
+
+    def test_new_part_is_added_with_its_hold(self):
+        w = LedgerWorld(self.fx)
+        rid = RIDS[4]
+        p = w.new_part(rid, DAYS[2], 2, 9_000_001)
+        out, reg, summary, lost = self.build_ledger(w, 'new')
+        self.assertEqual(lost, {})
+        f = reg['files']['9000001']
+        self.assertEqual((f['key'], f['path'], f['etag'], f['sha256'], f['size_bytes'], f['recording_id']),
+                         (p.key, p.nas_path, '"' + 'f' * 32 + '"', p.sha256, 2000, rid))
+        self.assertNotIn(str(rid * 1000 + 2 * 4 + 2), reg['files'])  # the originals it replaces are gone
+        holds = {h['object_key']: h for h in b.read_tsv(os.path.join(out, 'holds.tsv'), b.HOLD_COLUMNS)}
+        self.assertEqual(holds[p.key], {'bucket': 'stoarama', 'object_key': p.key, 'etag': 'f' * 32, 'size_bytes': '2000',
+                                        'recording_id': str(rid), 'kind': 'video_collated', 'sha256': p.sha256, 'relative_path': p.nas_path})
+        stream = self.object(out, reg, f'/public/streams/{rid}.json')
+        hour = stream['days'][2]['hours'][1]
+        self.assertEqual((hour[0], [q[0] for q in hour[9]], hour[9][0][8]), ('collated', [9000001], p.nas_path.rsplit('/', 1)[1]))
+        man = self.object(out, reg, f'/public/manifests/{rid}.json')
+        self.assertIn(9000001, [o['id'] for o in man['outputs']])
+        self.assertEqual(stream['current_download_paths']['9000001'], p.nas_path)
+        md = {s['id']: s for s in self.object(out, reg, '/public/metadata.json')['streams']}
+        self.assertEqual(md[rid]['availability'], 'available')  # every hour is complete in R2
+        go_validate(self, os.path.join(out, 'registry.json.gz'))
+
+    def test_dropping_an_assembly_is_a_regression(self):
+        w = LedgerWorld(self.fx)
+        rid = RIDS[5]
+        h = w.hours[(rid, DAYS[0], 1)]
+        w.put(rid, DAYS[0], 1, h.record, tuple(L.Served(str(p.output_id), p.key, 1000, 'e', p.sha256, p.nas_path, L.Source.ORIGINAL,
+                                                        (str(p.output_id),)) for p in h.record.parts))
+        *_, lost = w.generation(self.store)
+        self.assertEqual(lost, {(rid, DAYS[0]): ([2, 1], [2, 0])})
+
+    def test_fewer_complete_hours_is_a_regression(self):
+        w = LedgerWorld(self.fx)
+        rid = RIDS[6]
+        w.hours[(rid, DAYS[3], 2)] = dataclasses.replace(w.hours[(rid, DAYS[3], 2)], in_r2=False)
+        *_, lost = w.generation(self.store)
+        self.assertEqual(lost, {(rid, DAYS[3]): ([2, 0], [1, 0])})
+
+    def test_moving_the_window_drops_live_days(self):
+        w = LedgerWorld(self.fx)
+        rid = RIDS[7]
+        new_day = '2026-07-24'
+        for dh in (1, 2):
+            del w.hours[(rid, DAYS[-1], dh)]
+        for dh in (1, 2):
+            w.new_part(rid, DAYS[0], dh, 9_100_000 + dh)  # then moved to the new day
+            live, new = w.records[(rid, DAYS[0], dh)]
+            w.records[(rid, DAYS[0], dh)], w.records[(rid, new_day, dh)] = [live], [new]
+            w.hours[(rid, new_day, dh)] = dataclasses.replace(w.hours.pop((rid, DAYS[0], dh)), local_date=new_day)
+        store, present, added, file_holds, best14, lost = w.generation(self.store, {(rid, new_day): 'B'})
+        self.assertEqual(sorted(lost), [(rid, DAYS[0]), (rid, DAYS[-1])])
+        stream = store.load(f'/public/streams/{rid}.json')
+        self.assertEqual([d['date'] for d in stream['days']], list(DAYS[1:-1]) + [new_day])
+        day = stream['days'][-1]
+        self.assertEqual((day['grade'], [h[0] for h in day['hours']]), ('B', ['collated', 'collated']))
+        t0, t1 = b.hour_bounds('Europe/Warsaw', new_day, 1)
+        self.assertEqual((day['hours'][0][7], day['hours'][0][8], day['hours'][0][11]), (t0, t1, 1))
+        md = {s['id']: s for s in store.load('/public/metadata.json')['streams']}
+        self.assertEqual((md[rid]['start'], md[rid]['end'], md[rid]['grades']), (DAYS[1], new_day, 'A' * 12 + 'B'))
+        self.assertEqual(store.load(f'/public/manifests/{rid}.json')['period'], [DAYS[1], new_day])
+
+    def test_cli_fails_closed_and_dry_runs(self):
+        r = subprocess.run([sys.executable, '-I', os.path.join(BACKEND, 'scripts', 'gss', 'build_generation.py'), '--ledger',
+                            '--parent', 'x', '--assets', 'a', '--base-holds', 'h', '--best14', 'b', '--note', 'n', '--dry-run'],
+                           capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('--ledger takes --registry', r.stderr)
+
 
 
 def go_validate(test, registry):

@@ -3,28 +3,39 @@
 Deniz, Nov 25: "just make sure we're keeping a sane set and knowing we've
 stitched, and knowing we have full best 14 day periods". The ledger is the one
 source of truth per best-14 stream-day and delivery hour (1-12, local 08-19).
-It is read-only: it reads a DB extract, a live R2 listing and the public
-registry, and writes only local files.
+It is read-only: it reads a DB extract, the keep holds, a live R2 listing and
+the live public generation, and writes only local files. build_generation.py
+--ledger publishes from the same selection.
 
 Inputs:
   --best14     best14-days.tsv (recording_id, stream_id, local_date, hours_08_19;
                14 rows per recording). hours_08_19 decides capture only for an
                hour with no hour record: '.' is no capture.
-  --extract    the DB extract: run `best14_ledger.py extract-sql --best14 ...`
-               read-only (default_transaction_read_only=on) with psql -A -F TAB.
-  --listing    a live recursive listing of s3://<bucket>/joined/ (aws s3 ls --recursive).
-  --registry   the generation the builder will use as --parent (.json or .json.gz).
+  --registry, --assets  the live generation (current.json) and a mirror of its
+               asset bodies laid out by R2 key, as build_generation.py reads them.
+  --extract    `extract-sql` run read-only (default_transaction_read_only=on) with
+               psql -A -F TAB: every hour record and part on the best-14 days and
+               on the live generation's timeline days.
+  --holds      `holds-sql` run the same way: delivery_keep_holds key, etag, size.
+  --listing    live listings of joined/ and experimental/, one file each:
+               aws s3api list-objects-v2 --bucket B --prefix P
+                 --query 'Contents[].[Key,Size,ETag]' --output text
   --clock-proofs  optional directory of clock-join proof JSONs, copied read-only
-               from joined/clock-prestitch-*/proofs/. An assembly serves only while
-               its video key is in the listing.
+               from joined/clock-prestitch-*/proofs/.
 
-Per hour the serving set is one hour record: its parts 1..parts, where each
-in-R2 clock assembly replaces the consecutive parts it was built from. Among an
-hour's records the one complete in R2 serves, preferring a non-recovery record,
-then the earliest registered; `alternates` counts the other complete-in-R2 ones.
+An assembly serves in place of the consecutive parts it was built from (across
+an hour boundary, from the end of one hour into the start of the next): a live
+generation assembly when its key is in the listing at the registry's size and
+ETag and holds a matching keep hold, a clock-join assembly when its key is in
+the listing. It is listed on the hour of its first part. Per hour the serving
+set is one hour record with its assemblies. Among an hour's records the one
+complete in R2 serves, preferring a non-recovery record, then the earliest
+registered; `alternates` counts the other complete-in-R2 ones.
 
 Source of each served file:
-  clock_assembly  a key under joined/clock-prestitch-*/
+  v85_assembly, v79_assembly, v49_assembly, strict_assembly, reviewed_assembly
+                  a live generation assembly, by its growth.json repair kind
+  clock_assembly  a clock-prestitched assembly (live generation or clock-join)
   new_stitch      a part of an hour registered in a recovery- batch
   nas_upload      a part restored from the NAS (nas_restore_requests target
                   'output', state verified)
@@ -32,33 +43,22 @@ Source of each served file:
                   r2_retirement_writer_operations recovery intent on its key)
   original        any other registered part
 
-complete = every part 1..parts of the record is registered; in_r2 = every served
-key is in the listing at its catalogued size. A day is complete when every
-captured hour is complete and in R2; a stream is available when all 14 days are
-complete and at least one hour is captured.
+complete = every part 1..parts of the record is registered; in_r2 = every file
+serving the record's parts is in the listing at its catalogued size. A day is
+complete when every captured hour is complete and in R2; a stream is available
+when all 14 days are complete and at least one hour is captured.
 
 Rules, each a hard failure: no hour is served by two sets (one record per hour,
-no file serving two hours); an assembly replaces its parts and never duplicates
-them (its inputs are consecutive parts of its own record, taken by no other
-assembly and not served themselves); no two served files share a delivery path.
-A delivery path is the registry's path for a file the registry lists, else the
-catalogued NAS collated path; an assembly takes its parts' own name format.
+every file from a serving record); an assembly replaces its parts and never
+duplicates them (no part is served twice, directly or by two assemblies, and an
+assembly's parts are all in serving records); no two served files share a
+delivery path. A delivery path is the live generation's path for a file it
+lists, else the catalogued NAS collated path; a clock-join assembly takes its
+parts' own name format.
 
 Outputs, in --out-dir:
   best14-ledger.tsv          one row per (recording_id, local_date, delivery_hour)
   best14-ledger-streams.tsv  per stream: days complete of 14, available y/n
-  best14-ledger-days.tsv     build_generation.py --best14 input (day_stitched R,
-                             '.' for no capture, S otherwise)
-  best14-ledger-files.txt    build_generation.py --files input: the registry file
-                             ids serving every complete-in-R2 hour (a clock
-                             assembly contributes its inputs, which the builder's
-                             --clock-assemblies replaces)
-
-Publish only from the ledger: build_generation.py --parent <the --registry> \\
-  --best14 best14-ledger-days.tsv --files best14-ledger-files.txt. Served files
-the registry does not list (restores, NAS uploads, new stitches) are counted as
-`unpublishable` on the summary line: the builder can only select files its
-parent lists.
 """
 import argparse
 import collections
@@ -66,12 +66,14 @@ import csv
 import dataclasses
 import datetime
 import enum
-import gzip
 import json
 import os
 import re
 import sys
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import build_generation  # noqa: E402
 
 HOURS = range(1, 13)  # delivery hours 1-12 = local 08-19
 FIRST_LOCAL_HOUR = 8
@@ -89,7 +91,19 @@ class Source(str, enum.Enum):
     RESTORE = 'restore'
     NAS_UPLOAD = 'nas_upload'
     NEW_STITCH = 'new_stitch'
+    V85_ASSEMBLY = 'v85_assembly'
+    V79_ASSEMBLY = 'v79_assembly'
+    V49_ASSEMBLY = 'v49_assembly'
+    STRICT_ASSEMBLY = 'strict_assembly'
+    REVIEWED_ASSEMBLY = 'reviewed_assembly'
     CLOCK_ASSEMBLY = 'clock_assembly'
+
+
+# growth.json repair kind -> source of a live generation assembly.
+REPAIR_KINDS = {'model85': Source.V85_ASSEMBLY, 'model79': Source.V79_ASSEMBLY, 'model49': Source.V49_ASSEMBLY,
+                'strict': Source.STRICT_ASSEMBLY, 'reviewed': Source.REVIEWED_ASSEMBLY,
+                'modelclock-prestitched': Source.CLOCK_ASSEMBLY}
+ASSEMBLY_SOURCES = frozenset(REPAIR_KINDS.values())
 
 
 class LedgerError(Exception):
@@ -103,6 +117,9 @@ class Part:
     parts: int
     key: str
     size_bytes: int
+    sha256: str
+    start_at: str
+    end_at: str
     nas_path: str
     source: Source
 
@@ -115,6 +132,8 @@ class Record:
     status: str
     registered_at: str
     parts: tuple
+    source_clips: int = 0
+    included_clips: int = 0
 
     def complete(self):
         return bool(self.parts) and len({p.parts for p in self.parts}) == 1 and \
@@ -123,11 +142,14 @@ class Record:
 
 @dataclasses.dataclass(frozen=True)
 class Assembly:
-    sha256: str
+    file_id: str
     key: str
     size_bytes: int
-    hour_id: str
+    etag: str
+    sha256: str
     input_ids: tuple
+    source: Source
+    path: str  # None for a clock-join assembly: named from its parts
 
 
 @dataclasses.dataclass(frozen=True)
@@ -135,9 +157,11 @@ class Served:
     file_id: str
     key: str
     size_bytes: int
+    etag: str
+    sha256: str
     path: str
     source: Source
-    registry_ids: tuple  # the registry files this serves: itself, or an assembly's inputs
+    registry_ids: tuple  # the parts this file serves: itself, or an assembly's inputs
 
 
 @dataclasses.dataclass(frozen=True)
@@ -152,11 +176,26 @@ class Hour:
     complete: bool = False
     in_r2: bool = False
     alternates: int = 0
-    in_registry: bool = False
+    covered_by: tuple = ()  # assemblies listed on an earlier hour that serve this hour's first parts
 
     @property
     def ok(self):
         return self.complete and self.in_r2
+
+    @property
+    def slot(self):
+        return self.recording_id, self.local_date, self.delivery_hour
+
+
+@dataclasses.dataclass(frozen=True)
+class Inputs:
+    best14: dict
+    records: dict      # (recording_id, local_date, delivery_hour) -> [Record]
+    assemblies: list   # live Assembly
+    listing: dict      # key -> (size, etag)
+    registry: dict     # the live generation registry
+    holds: dict        # delivery_keep_holds key -> (etag, size)
+    unheld: int = 0    # live generation assemblies in R2 without a matching keep hold
 
 
 def yn(b):
@@ -165,10 +204,11 @@ def yn(b):
 
 # ---- inputs ---------------------------------------------------------------
 
-def read_tsv(path, columns):
+def read_tsv(path, columns, empty_ok=False):
     with open(path, newline='', encoding='utf-8') as f:
-        rows = list(csv.DictReader(f, delimiter='\t'))
-    if not rows or not set(columns) <= set(rows[0]):
+        reader = csv.DictReader(f, delimiter='\t')
+        rows = list(reader)
+    if (not rows and not empty_ok) or not set(columns) <= set(reader.fieldnames or ()):
         raise LedgerError(f'{path}: need a TSV header with {", ".join(columns)}')
     return rows
 
@@ -196,11 +236,17 @@ def read_best14(path):
     return out
 
 
-def extract_sql(best14):
-    values = ','.join(f"({rid},date '{d}')" for rid, (_, days) in sorted(best14.items()) for d, _ in days)
+def live_days(registry, store):
+    """Every (recording_id, local_date) on the live generation's timelines."""
+    return {(rid, d['date']) for rid in registry['recording_ids'] for d in store.load(f'/public/streams/{rid}.json')['days']}
+
+
+def extract_sql(days):
+    values = ','.join(f"({rid},date '{d}')" for rid, d in sorted(days))
     return f"""WITH d(recording_id, local_date) AS (VALUES {values})
 SELECT h.recording_id, h.local_date, h.delivery_hour, h.id AS hour_row_id, h.hour_id, h.batch_id, h.status, h.registered_at,
- o.id AS output_id, o.part, o.parts, o.object_key, o.nas_relative_path, o.size_bytes,
+ h.source_clip_count, h.included_clip_count,
+ o.id AS output_id, o.part, o.parts, o.object_key, o.nas_relative_path, o.size_bytes, o.sha256, o.start_at, o.end_at,
  EXISTS (SELECT 1 FROM nas_restore_requests n WHERE n.target='output' AND n.output_id=o.id AND n.state='verified') AS nas_restored,
  EXISTS (SELECT 1 FROM r2_retirement_writer_operations w WHERE w.collation_recovery_hour_id IS NOT NULL
    AND w.completed_at IS NOT NULL AND w.object_key=o.object_key) AS recovery_put
@@ -210,8 +256,10 @@ ORDER BY 1, 2, 3, 4, o.part;
 """
 
 
+HOLDS_SQL = "SELECT object_key, etag, size_bytes FROM delivery_keep_holds WHERE bucket='stoarama';\n"
 EXTRACT_COLUMNS = ('recording_id', 'local_date', 'delivery_hour', 'hour_row_id', 'hour_id', 'batch_id', 'status',
-                   'registered_at', 'output_id', 'part', 'parts', 'object_key', 'nas_relative_path', 'size_bytes',
+                   'registered_at', 'source_clip_count', 'included_clip_count', 'output_id', 'part', 'parts',
+                   'object_key', 'nas_relative_path', 'size_bytes', 'sha256', 'start_at', 'end_at',
                    'nas_restored', 'recovery_put')
 
 
@@ -239,61 +287,93 @@ def read_extract(path):
     meta = {}
     for r in read_tsv(path, EXTRACT_COLUMNS):
         slot = (int(r['recording_id']), r['local_date'], int(r['delivery_hour']))
-        if slot[2] not in HOURS:
-            raise LedgerError(f'{path}: delivery_hour {slot[2]} outside 1-12')
         row_id = int(r['hour_row_id'])
-        m = (slot, r['hour_id'], r['batch_id'], r['status'], r['registered_at'])
+        m = (slot, r['hour_id'], r['batch_id'], r['status'], r['registered_at'],
+             int(r['source_clip_count'] or 0), int(r['included_clip_count'] or 0))
         if meta.setdefault(row_id, m) != m:
             raise LedgerError(f'{path}: hour row {row_id} disagrees with itself')
         if r['output_id']:
             rows[row_id].append(Part(int(r['output_id']), int(r['part']), int(r['parts']), r['object_key'],
-                                     int(r['size_bytes']), r['nas_relative_path'],
+                                     int(r['size_bytes']), r['sha256'], r['start_at'], r['end_at'], r['nas_relative_path'],
                                      part_source(r['batch_id'], r['object_key'], flag(r['nas_restored']), flag(r['recovery_put']))))
     out = collections.defaultdict(list)
-    for row_id, (slot, hour_id, batch, status, registered_at) in meta.items():
+    for row_id, (slot, hour_id, batch, status, registered_at, clips, included) in meta.items():
         parts = tuple(sorted(rows[row_id], key=lambda p: p.part))
         if (status == COLLATED) != bool(parts) or status not in NO_CAPTURE_STATES | {COLLATED}:
             raise LedgerError(f'hour {hour_id}: status {status} with {len(parts)} outputs')
-        out[slot].append(Record(row_id, hour_id, batch, status, registered_at, parts))
-    return out
+        out[slot].append(Record(row_id, hour_id, batch, status, registered_at, parts, clips, included))
+    return dict(out)
 
 
-def read_listing(path):
-    """{key: size} from `aws s3 ls --recursive s3://<bucket>/joined/`."""
+def read_listing(paths):
+    """{key: (size, etag)} from `aws s3api list-objects-v2 ... --query 'Contents[].[Key,Size,ETag]' --output text`."""
     out = {}
-    with open(path, encoding='utf-8') as f:
-        for line in f:
-            if not line.strip():
-                continue
-            fields = line.split(None, 3)
-            if len(fields) != 4 or not fields[3].startswith('joined/'):
-                raise LedgerError(f'{path}: not a recursive listing of joined/: {line!r}')
-            key = fields[3].rstrip('\n')
-            if key in out:
-                raise LedgerError(f'{path}: {key} listed twice')
-            out[key] = int(fields[2])
+    for path in paths:
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                fields = line.rstrip('\n').split('\t')
+                if len(fields) != 3 or not fields[1].isdigit() or not fields[2].startswith('"'):
+                    raise LedgerError(f'{path}: not a key/size/ETag listing line: {line!r}')
+                if fields[0] in out:
+                    raise LedgerError(f'{path}: {fields[0]} listed twice')
+                out[fields[0]] = (int(fields[1]), fields[2].strip('"'))
     if not out:
-        raise LedgerError(f'{path}: empty listing')
+        raise LedgerError('empty listing')
     return out
 
 
-def read_registry(path):
-    raw = Path(path).read_bytes()
-    reg = json.loads(gzip.decompress(raw) if raw[:2] == b'\x1f\x8b' else raw)
-    return {k: v['path'] for k, v in reg['files'].items()}
+def read_holds(path):
+    out = {}
+    for r in read_tsv(path, ('object_key', 'etag', 'size_bytes'), empty_ok=True):
+        out[r['object_key']] = (r['etag'].strip('"'), int(r['size_bytes']))
+    return out
 
 
-def read_proofs(directory):
-    """Every clock-join proof (joined/<batch>/proofs/<sha256>.json) in a directory tree."""
+def registry_assemblies(registry, store, listing, holds):
+    """(live assemblies of the live generation, count in R2 without a matching keep hold)."""
+    repairs = {'sha256:' + x['sha256']: x for x in store.load('/public/growth.json')['repairs']}
+    live, unheld = [], 0
+    for fid, f in sorted(registry['files'].items()):
+        if not fid.startswith('sha256:'):
+            continue
+        rep = repairs.get(fid)
+        if rep is None or rep['kind'] not in REPAIR_KINDS:
+            raise LedgerError(f'assembly {fid}: no growth.json repair of a known kind')
+        etag = f['etag'].strip('"')
+        if not in_r2(listing, f['key'], f['size_bytes'], etag):
+            continue
+        if holds.get(f['key']) != (etag, f['size_bytes']):
+            unheld += 1
+            continue
+        live.append(Assembly(fid, f['key'], f['size_bytes'], etag, f['sha256'], tuple(int(i) for i in rep['input_ids']),
+                             REPAIR_KINDS[rep['kind']], f['path']))
+    return live, unheld
+
+
+def read_proofs(directory, listing):
+    """Every clock-join proof (joined/<batch>/proofs/<sha256>.json) whose video is in the listing."""
     out = []
     for p in sorted(Path(directory).rglob('*.json')):
         proof = json.loads(p.read_text(encoding='utf-8'))
         o = proof['output']
         if not o['key'].startswith(CLOCK_PREFIX):
             raise LedgerError(f'{p}: assembly key {o["key"]} is not under {CLOCK_PREFIX}*')
-        out.append(Assembly(o['sha256'], o['key'], int(o['size_bytes']), proof['hour_id'],
-                            tuple(int(i['output_id']) for i in proof['inputs'])))
+        if in_r2(listing, o['key'], int(o['size_bytes'])):
+            out.append(Assembly('sha256:' + o['sha256'], o['key'], int(o['size_bytes']), listing[o['key']][1], o['sha256'],
+                                tuple(int(i['output_id']) for i in proof['inputs']), Source.CLOCK_ASSEMBLY, None))
     return out
+
+
+def load(a):
+    """Inputs from parsed arguments."""
+    listing = read_listing(a.listing)
+    registry = build_generation.read_registry(a.registry)
+    store = build_generation.AssetStore(registry, a.assets)
+    holds = read_holds(a.holds)
+    live, unheld = registry_assemblies(registry, store, listing, holds)
+    if a.clock_proofs:
+        live += read_proofs(a.clock_proofs, listing)
+    return Inputs(read_best14(a.best14), read_extract(a.extract), live, listing, registry, holds, unheld), store
 
 
 # ---- selection -------------------------------------------------------------
@@ -310,43 +390,83 @@ def assembly_path(inputs, whole_hour):
     return m.group(1) + '.mp4' if whole_hour else inputs[0]
 
 
-def in_r2(listing, key, size):
+def in_r2(listing, key, size, etag=None):
     got = listing.get(key)
-    if got is not None and got != size:
-        raise LedgerError(f'{key}: R2 holds {got} bytes, catalogued {size}')
+    if got is not None and (got[0] != size or (etag is not None and got[1] != etag)):
+        raise LedgerError(f'{key}: R2 holds {got}, catalogued {(size, etag)}')
     return got is not None
 
 
-def serving_set(record, assemblies, listing, registry):
-    """The files serving record: each in-R2 assembly in place of its parts, then the rest."""
-    by_id = {p.output_id: p for p in record.parts}
-    path = lambda p: registry.get(str(p.output_id), p.nas_path)
-    live = [a for a in assemblies if in_r2(listing, a.key, a.size_bytes)]
-    check_assemblies(record, live)
-    replaced = {i for a in live for i in a.input_ids}
-    served = [Served('sha256:' + a.sha256, a.key, a.size_bytes,
-                     assembly_path([path(by_id[i]) for i in a.input_ids], len(a.input_ids) == len(record.parts)),
-                     Source.CLOCK_ASSEMBLY, tuple(str(i) for i in a.input_ids))
-              for a in live]
-    served += [Served(str(p.output_id), p.key, p.size_bytes, path(p), p.source, (str(p.output_id),))
-               for p in record.parts if p.output_id not in replaced]
-    return tuple(served)
+def check_assembly_run(a, records_of):
+    """An assembly's inputs are one run of parts: consecutive within each hour record,
+    from the end of one hour record into the start of the next."""
+    runs = []
+    for i in a.input_ids:
+        rec, part = records_of[i]
+        if runs and runs[-1][0] is rec:
+            runs[-1][1].append(part.part)
+        else:
+            runs.append((rec, [part.part]))
+    if len(a.input_ids) < 2 or len({id(r) for r, _ in runs}) != len(runs):
+        raise LedgerError(f'assembly {a.file_id}: inputs {list(a.input_ids)} are not one run of parts')
+    for k, (rec, ords) in enumerate(runs):
+        n = rec.parts[0].parts
+        if ords != list(range(ords[0], ords[0] + len(ords))) or (k > 0 and ords[0] != 1) or (k < len(runs) - 1 and ords[-1] != n):
+            raise LedgerError(f'assembly {a.file_id}: parts {ords} of {rec.hour_id} are not consecutive')
 
 
-def select(best14, records, assemblies, listing, registry):
+def serving_set(record, by_input, registry, listing):
+    """(files listed on record's hour, assemblies listed earlier that serve its first parts)."""
+    files = registry['files']
+    path = lambda p: files[str(p.output_id)]['path'] if str(p.output_id) in files else p.nas_path
+    ids = {p.output_id for p in record.parts}
+    served, carried, seen = [], [], set()
+    for p in record.parts:
+        a = by_input.get(p.output_id)
+        if a is None:
+            served.append(Served(str(p.output_id), p.key, p.size_bytes, listing.get(p.key, (0, None))[1], p.sha256, path(p), p.source, (str(p.output_id),)))
+        elif a.file_id not in seen:
+            seen.add(a.file_id)
+            if a.input_ids[0] not in ids:
+                carried.append(a.file_id)
+                continue
+            if a.path is None and not set(a.input_ids) <= ids:
+                raise LedgerError(f'clock-join assembly {a.file_id} crosses an hour')
+            by_id = {q.output_id: q for q in record.parts}
+            name = a.path or assembly_path([path(by_id[i]) for i in a.input_ids], set(a.input_ids) == ids)
+            served.append(Served(a.file_id, a.key, a.size_bytes, a.etag, a.sha256, name, a.source,
+                                 tuple(str(i) for i in a.input_ids)))
+    return tuple(served), tuple(carried)
+
+
+def assembly_index(inputs):
+    """{part output_id: live assembly} for assemblies touching a best-14 hour; checks each run."""
+    records_of = {p.output_id: (r, p) for rs in inputs.records.values() for r in rs for p in r.parts}
+    window = {(rid, d, h) for rid, (_, days) in inputs.best14.items() for d, _ in days for h in HOURS}
+    slot_of = {p.output_id: slot for slot, rs in inputs.records.items() for r in rs for p in r.parts}
+    by_input = {}
+    for a in inputs.assemblies:
+        inside = [i in slot_of and slot_of[i] in window for i in a.input_ids]
+        if not any(inside):
+            continue
+        if not all(inside):
+            raise LedgerError(f'assembly {a.file_id}: inputs {list(a.input_ids)} reach outside the best-14 hours')
+        check_assembly_run(a, records_of)
+        for i in a.input_ids:
+            if by_input.setdefault(i, a) is not a:
+                raise LedgerError(f'part {i} is an input of two assemblies: {by_input[i].file_id} and {a.file_id}')
+    return by_input
+
+
+def select(inputs):
     """One Hour per best-14 (recording_id, local_date, delivery_hour)."""
-    by_hour_id = collections.defaultdict(list)
-    for a in assemblies:
-        by_hour_id[a.hour_id].append(a)
-    known = {r.hour_id for rs in records.values() for r in rs}
-    orphan = sorted(set(by_hour_id) - known)
-    if orphan:
-        raise LedgerError(f'{len(orphan)} clock assemblies name hours outside the best-14 extract, e.g. {orphan[:3]}')
+    by_input = assembly_index(inputs)
+    listing = inputs.listing
     hours = []
-    for rid, (stream, days) in sorted(best14.items()):
+    for rid, (stream, days) in sorted(inputs.best14.items()):
         for date, codes in days:
             for dh in HOURS:
-                rs = records.get((rid, date, dh), [])
+                rs = inputs.records.get((rid, date, dh), [])
                 collated = [r for r in rs if r.status == COLLATED]
                 if rs and len(collated) not in (0, len(rs)):
                     raise LedgerError(f'recording {rid} {date} hour {dh}: collated and no-capture records together')
@@ -356,58 +476,49 @@ def select(best14, records, assemblies, listing, registry):
                     continue
                 cands = []
                 for r in collated:
-                    served = serving_set(r, by_hour_id[r.hour_id], listing, registry)
+                    served, carried = serving_set(r, by_input, inputs.registry, listing)
                     live = all(in_r2(listing, s.key, s.size_bytes) for s in served)
                     ok = r.complete() and live
-                    cands.append((not ok, r.batch_id.startswith(RECOVERY_BATCH_PREFIX), r.registered_at, r.row_id, r, served, live, ok))
+                    cands.append((not ok, r.batch_id.startswith(RECOVERY_BATCH_PREFIX), r.registered_at, r.row_id,
+                                  r, served, carried, live, ok))
                 cands.sort(key=lambda c: c[:4])
-                *_, r, served, live, _ = cands[0]
+                *_, r, served, carried, live, _ = cands[0]
                 hours.append(Hour(rid, stream, date, dh, True, r, served, r.complete(), live,
-                                  sum(c[-1] for c in cands[1:]),
-                                  all(i in registry for s in served for i in s.registry_ids)))
+                                  sum(c[-1] for c in cands[1:]), carried))
     check_rules(hours)
     return hours
 
 
 # ---- rules -----------------------------------------------------------------
 
-def check_assemblies(record, assemblies):
-    """An assembly replaces consecutive parts of its own record, and no part twice."""
-    by_id = {p.output_id: p for p in record.parts}
-    taken = collections.Counter(i for a in assemblies for i in a.input_ids)
-    twice = sorted(i for i, n in taken.items() if n > 1)
-    if twice:
-        raise LedgerError(f'hour {record.hour_id}: parts {twice} are inputs of two assemblies')
-    for a in assemblies:
-        if len(a.input_ids) < 2 or any(i not in by_id for i in a.input_ids):
-            raise LedgerError(f'assembly {a.sha256}: inputs {list(a.input_ids)} are not parts of hour {record.hour_id}')
-        ordinals = [by_id[i].part for i in a.input_ids]
-        if ordinals != list(range(ordinals[0], ordinals[0] + len(ordinals))):
-            raise LedgerError(f'assembly {a.sha256}: parts {ordinals} are not consecutive')
-
-
 def check_rules(hours):
     """Fail on an hour served by two sets, an assembly duplicating its parts, or a duplicate delivery path."""
-    serving = {}
-    records = {}
+    record_slot = {}
     for h in hours:
-        slot = (h.recording_id, h.local_date, h.delivery_hour)
-        if h.record is not None and records.setdefault(h.record.row_id, slot) != slot:
+        if h.record is not None and record_slot.setdefault(h.record.row_id, h.slot) != h.slot:
             raise LedgerError(f'hour record {h.record.hour_id} serves two hours')
-        if h.served and h.record is None:
-            raise LedgerError(f'{slot}: served without an hour record')
-        ids = {p.output_id for p in h.record.parts} if h.served else set()
+        if (h.served or h.covered_by) and h.record is None:
+            raise LedgerError(f'{h.slot}: served without an hour record')
+    part_slot = {str(p.output_id): h.slot for h in hours if h.record is not None for p in h.record.parts}
+    served_by = {}
+    seen = {}
+    for h in hours:
         for s in h.served:
-            if not {int(i) for i in s.registry_ids} <= ids:
-                raise LedgerError(f'{slot}: {s.file_id} is not from the serving record {h.record.hour_id}')
             for k in (s.file_id, s.key):
-                if serving.setdefault(k, slot) != slot:
-                    raise LedgerError(f'{k} serves two hours: {serving[k]} and {slot}')
-        files = [i for s in h.served for i in s.registry_ids]
-        replaced = {i for s in h.served if s.source is Source.CLOCK_ASSEMBLY for i in s.registry_ids}
-        dup = sorted(i for i, n in collections.Counter(files).items() if n > 1)
-        if dup or replaced & {s.file_id for s in h.served}:
-            raise LedgerError(f'{slot}: an assembly duplicates parts {dup or sorted(replaced & {s.file_id for s in h.served})}')
+                if seen.setdefault(k, h.slot) != h.slot:
+                    raise LedgerError(f'{k} serves two hours: {seen[k]} and {h.slot}')
+            if s.source not in ASSEMBLY_SOURCES and part_slot.get(s.file_id) != h.slot:
+                raise LedgerError(f'{h.slot}: {s.file_id} is not from the serving record {h.record.hour_id}')
+            for i in s.registry_ids:
+                if i not in part_slot:
+                    raise LedgerError(f'{h.slot}: {s.file_id} serves part {i} of a record that serves no hour')
+                if served_by.setdefault(i, s.file_id) != s.file_id:
+                    raise LedgerError(f'part {i} is served twice: by {served_by[i]} and {s.file_id} (an assembly duplicates its parts)')
+    for h in hours:
+        if h.served or h.covered_by:
+            missing = [p.output_id for p in h.record.parts if str(p.output_id) not in served_by]
+            if missing:
+                raise LedgerError(f'{h.slot}: parts {missing} are served by no file of a serving set')
     paths = collections.Counter(s.path for h in hours for s in h.served)
     dup = sorted(p for p, n in paths.items() if n > 1)
     if dup:
@@ -417,11 +528,10 @@ def check_rules(hours):
 # ---- outputs ---------------------------------------------------------------
 
 LEDGER_COLUMNS = ('recording_id', 'stream_id', 'local_date', 'delivery_hour', 'local_hour', 'captured', 'status',
-                  'hour_id', 'batch_id', 'parts', 'served', 'complete', 'in_r2', 'source', 'alternates', 'in_registry',
+                  'hour_id', 'batch_id', 'parts', 'served', 'complete', 'in_r2', 'source', 'alternates', 'covered_by',
                   'sources', 'file_ids', 'object_keys', 'delivery_paths')
 STREAM_COLUMNS = ('recording_id', 'stream_id', 'window_start', 'window_end', 'days_complete', 'days', 'captured_hours',
                   'hours_complete', 'hours_with_record', 'available')
-DAY_COLUMNS = ('recording_id', 'stream_id', 'local_date', 'day_stitched', 'captured_hours', 'hours_complete')
 
 
 def joined(values):
@@ -441,12 +551,14 @@ def ledger_row(h):
             'parts': r.parts[0].parts if r and r.parts else 0, 'served': len(h.served),
             'complete': yn(h.complete), 'in_r2': yn(h.in_r2),
             'source': '+'.join(s.value for s in Source if any(x.source is s for x in h.served)),
-            'alternates': h.alternates, 'in_registry': yn(h.in_registry),
+            'alternates': h.alternates, 'covered_by': joined(h.covered_by),
             'sources': joined(s.source.value for s in h.served), 'file_ids': joined(s.file_id for s in h.served),
             'object_keys': joined(s.key for s in h.served), 'delivery_paths': joined(s.path for s in h.served)}
 
 
 def day_rows(hours):
+    """Per (recording_id, stream_id, local_date): captured hours, complete hours, and the day code
+    R (complete), . (no capture) or S."""
     days = collections.defaultdict(list)
     for h in hours:
         days[(h.recording_id, h.stream_id, h.local_date)].append(h)
@@ -475,20 +587,15 @@ def stream_rows(hours, days):
     return out
 
 
-def builder_files(hours):
-    return sorted({i for h in hours if h.ok and h.in_registry for s in h.served for i in s.registry_ids})
-
-
-def summary_line(hours, streams):
+def summary_line(hours, streams, unheld):
     captured = [h for h in hours if h.captured]
     ok = [h for h in captured if h.ok]
     counts = collections.Counter(s.source for h in ok for s in h.served)
-    unpublishable = sum(1 for h in ok if not h.in_registry)
     return (f"streams_available={sum(s['available'] == 'y' for s in streams)}/{len(streams)} "
             f"days_complete={sum(s['days_complete'] for s in streams)}/{sum(s['days'] for s in streams)} "
             f"hours_complete={len(ok)}/{len(captured)} "
             + ' '.join(f'{s.value}={counts[s]}' for s in Source)
-            + f' alternates={sum(h.alternates > 0 for h in ok)} unpublishable_hours={unpublishable}')
+            + f' alternates={sum(h.alternates > 0 for h in ok)} unheld_assemblies={unheld}')
 
 
 def write_tsv(path, columns, rows):
@@ -498,16 +605,22 @@ def write_tsv(path, columns, rows):
         w.writerows(rows)
 
 
-def write(out_dir, hours):
+def write(out_dir, hours, unheld):
     os.makedirs(out_dir, exist_ok=True)
-    days = day_rows(hours)
-    streams = stream_rows(hours, days)
+    streams = stream_rows(hours, day_rows(hours))
     write_tsv(os.path.join(out_dir, 'best14-ledger.tsv'), LEDGER_COLUMNS, [ledger_row(h) for h in hours])
     write_tsv(os.path.join(out_dir, 'best14-ledger-streams.tsv'), STREAM_COLUMNS, streams)
-    write_tsv(os.path.join(out_dir, 'best14-ledger-days.tsv'), DAY_COLUMNS, days)
-    with open(os.path.join(out_dir, 'best14-ledger-files.txt'), 'w', encoding='utf-8') as f:
-        f.writelines(i + '\n' for i in builder_files(hours))
-    return summary_line(hours, streams)
+    return summary_line(hours, streams, unheld)
+
+
+def add_input_args(ap):
+    ap.add_argument('--best14', required=True, help='best14-days.tsv')
+    ap.add_argument('--registry', required=True, help='the live generation registry (current.json)')
+    ap.add_argument('--assets', required=True, help='its asset bodies laid out by R2 key')
+    ap.add_argument('--extract', required=True, help='extract-sql output')
+    ap.add_argument('--holds', required=True, help='holds-sql output')
+    ap.add_argument('--listing', required=True, nargs='+', help='key/size/ETag listings of joined/ and experimental/')
+    ap.add_argument('--clock-proofs', help='directory of clock-join proof JSONs')
 
 
 def main(argv=None):
@@ -515,22 +628,24 @@ def main(argv=None):
     sub = ap.add_subparsers(dest='cmd', required=True)
     q = sub.add_parser('extract-sql', help='print the read-only DB extract query')
     q.add_argument('--best14', required=True)
+    q.add_argument('--registry', required=True)
+    q.add_argument('--assets', required=True)
+    sub.add_parser('holds-sql', help='print the read-only keep-hold query')
     b = sub.add_parser('build', help='write the ledger')
-    b.add_argument('--best14', required=True)
-    b.add_argument('--extract', required=True)
-    b.add_argument('--listing', required=True)
-    b.add_argument('--registry', required=True)
-    b.add_argument('--clock-proofs')
+    add_input_args(b)
     b.add_argument('--out-dir', required=True)
     a = ap.parse_args(argv)
     try:
-        best14 = read_best14(a.best14)
-        if a.cmd == 'extract-sql':
-            sys.stdout.write(extract_sql(best14))
-            return
-        hours = select(best14, read_extract(a.extract), read_proofs(a.clock_proofs) if a.clock_proofs else [],
-                       read_listing(a.listing), read_registry(a.registry))
-        print(write(a.out_dir, hours))
+        if a.cmd == 'holds-sql':
+            sys.stdout.write(HOLDS_SQL)
+        elif a.cmd == 'extract-sql':
+            registry = build_generation.read_registry(a.registry)
+            best14 = read_best14(a.best14)
+            days = {(rid, d) for rid, (_, ds) in best14.items() for d, _ in ds}
+            sys.stdout.write(extract_sql(days | live_days(registry, build_generation.AssetStore(registry, a.assets))))
+        else:
+            inputs, _ = load(a)
+            print(write(a.out_dir, select(inputs), inputs.unheld))
     except LedgerError as e:
         raise SystemExit(f'best14 ledger: {e}')
 

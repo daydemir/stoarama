@@ -2,6 +2,7 @@ import csv
 import dataclasses
 import datetime
 import gzip
+import hashlib
 import json
 import os
 import subprocess
@@ -11,11 +12,11 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import best14_ledger as L  # noqa: E402
-import build_generation  # noqa: E402
 
 RID, STREAM = 401, '14478'
 DAYS = [(datetime.date(2026, 8, 19) + datetime.timedelta(days=i)).isoformat() for i in range(14)]
 CODES = 'RRRRRRRRRR..'  # hours 11 and 12 have no capture
+ETAG = '0' * 32
 
 
 def best14():
@@ -31,10 +32,11 @@ def path(date, dh, part=None):
 
 
 class World:
-    """One recording, 14 days, two-part hours 1-10, registered in goodplus and fully in R2."""
+    """One recording, 14 days, two-part hours 1-10, registered in goodplus, listed by the live
+    generation and fully in R2."""
 
     def __init__(self):
-        self.records, self.listing, self.registry = {}, {}, {}
+        self.records, self.listing, self.files, self.assemblies = {}, {}, {}, []
         row = 0
         for date in DAYS:
             for dh in range(1, 11):
@@ -46,26 +48,38 @@ class World:
         self.next_row = row + 1
 
     def add(self, row, date, dh, batch, parts, source=L.Source.ORIGINAL, registered='2026-09-01', in_registry=True):
-        ps = tuple(L.Part(row * 100 + p, p, parts, key(batch, row * 100 + p), 1000 + p, f'nas/{row}/{p}.mp4', source)
+        ps = tuple(L.Part(row * 100 + p, p, parts, key(batch, row * 100 + p), 1000 + p, f'{row * 100 + p:064x}',
+                          f'2026-08-19 0{p}:00:00+00', f'2026-08-19 0{p}:30:00+00', f'nas/{row}/{p}.mp4', source)
                    for p in range(1, parts + 1))
         rec = L.Record(row, f'h-{row}', batch, 'collated', registered, ps)
         self.records.setdefault((RID, date, dh), []).append(rec)
         for p in ps:
-            self.listing[p.key] = p.size_bytes
+            self.listing[p.key] = (p.size_bytes, ETAG)
             if in_registry:
-                self.registry[str(p.output_id)] = path(date, dh, p.part if parts > 1 else None)
+                self.files[str(p.output_id)] = {'path': path(date, dh, p.part if parts > 1 else None)}
         return rec
 
-    def select(self, assemblies=()):
-        return L.select(best14(), self.records, list(assemblies), self.listing, self.registry)
+    def inputs(self):
+        return L.Inputs(best14(), self.records, list(self.assemblies), self.listing, {'files': self.files}, {})
+
+    def select(self):
+        return L.select(self.inputs())
 
     def hour(self, hours, date, dh):
         return next(h for h in hours if (h.local_date, h.delivery_hour) == (date, dh))
 
+    def assembly(self, rec_or_ids, inputs=None, sha='ab', source=L.Source.CLOCK_ASSEMBLY, live=True, path=None):
+        ids = tuple(rec_or_ids.parts[i - 1].output_id for i in inputs) if inputs else tuple(rec_or_ids)
+        a = L.Assembly('sha256:' + sha * 32, f'joined/clock-prestitch-20261125/objects/{sha * 32}.mp4', 777, ETAG, sha * 32,
+                       ids, source, path)
+        if live:
+            self.listing[a.key] = (a.size_bytes, ETAG)
+            self.assemblies.append(a)
+        return a
 
-def assembly(rec, inputs, sha='ab'):
-    return L.Assembly(sha * 32, f'joined/clock-prestitch-20261125/objects/{sha * 32}.mp4', 777, rec.hour_id,
-                   tuple(rec.parts[i - 1].output_id for i in inputs))
+
+def summary(hours):
+    return L.summary_line(hours, L.stream_rows(hours, L.day_rows(hours)), 0)
 
 
 class SelectionTests(unittest.TestCase):
@@ -75,11 +89,8 @@ class SelectionTests(unittest.TestCase):
         days = L.day_rows(hours)
         streams = L.stream_rows(hours, days)
         self.assertEqual({d['day_stitched'] for d in days}, {'R'})
-        self.assertEqual(streams[0]['days_complete'], 14)
-        self.assertEqual(streams[0]['available'], 'y')
-        self.assertEqual(streams[0]['captured_hours'], 140)
-        self.assertEqual(len(L.builder_files(hours)), 14 * 10 * 2)
-        self.assertTrue(L.summary_line(hours, streams).startswith('streams_available=1/1 days_complete=14/14 hours_complete=140/140 original=280 '))
+        self.assertEqual((streams[0]['days_complete'], streams[0]['available'], streams[0]['captured_hours']), (14, 'y', 140))
+        self.assertTrue(summary(hours).startswith('streams_available=1/1 days_complete=14/14 hours_complete=140/140 original=280 '))
 
     def test_missing_key_and_unregistered_hour(self):
         w = World()
@@ -105,7 +116,8 @@ class SelectionTests(unittest.TestCase):
 
     def test_size_mismatch_fails(self):
         w = World()
-        w.listing[w.records[(RID, DAYS[0], 1)][0].parts[0].key] += 1
+        k = w.records[(RID, DAYS[0], 1)][0].parts[0].key
+        w.listing[k] = (w.listing[k][0] + 1, ETAG)
         with self.assertRaisesRegex(L.LedgerError, 'R2 holds'):
             w.select()
 
@@ -121,11 +133,10 @@ class SelectionTests(unittest.TestCase):
         w = World()
         del w.records[(RID, DAYS[2], 4)]
         w.add(w.next_row, DAYS[2], 4, 'recovery-best14-20261125', 3, L.Source.NEW_STITCH, in_registry=False)
-        hours = w.select()
-        h = w.hour(hours, DAYS[2], 4)
-        self.assertEqual((h.ok, h.in_registry, {s.source for s in h.served}), (True, False, {L.Source.NEW_STITCH}))
-        self.assertIn('unpublishable_hours=1', L.summary_line(hours, L.stream_rows(hours, L.day_rows(hours))))
-        self.assertFalse({s.file_id for s in h.served} & set(L.builder_files(hours)))
+        h = w.hour(w.select(), DAYS[2], 4)
+        self.assertEqual((h.ok, {s.source for s in h.served}), (True, {L.Source.NEW_STITCH}))
+        self.assertEqual([s.path for s in h.served], [f'nas/{w.next_row}/{p}.mp4' for p in (1, 2, 3)])
+        self.assertEqual({s.etag for s in h.served}, {ETAG})
 
     def test_one_record_serves_an_hour(self):
         w = World()
@@ -136,7 +147,7 @@ class SelectionTests(unittest.TestCase):
         h = w.hour(w.select(), DAYS[0], 1)
         self.assertEqual((h.record, h.alternates), (new, 0))
         for p in old.parts:
-            w.listing[p.key] = p.size_bytes  # the NAS upload lands too: the original lineage serves
+            w.listing[p.key] = (p.size_bytes, ETAG)  # the NAS upload lands too: the original lineage serves
         h = w.hour(w.select(), DAYS[0], 1)
         self.assertEqual((h.record, h.alternates), (old, 1))
         self.assertEqual({s.file_id for s in h.served}, {str(p.output_id) for p in old.parts})
@@ -145,71 +156,100 @@ class SelectionTests(unittest.TestCase):
 class AssemblyTests(unittest.TestCase):
     def setUp(self):
         self.w = World()
+        del self.w.records[(RID, DAYS[3], 5)]
         self.rec = self.w.add(self.w.next_row, DAYS[3], 5, 'nightly-collation-v2', 4)
-        del self.w.records[(RID, DAYS[3], 5)][0]
-
-    def live(self, a):
-        self.w.listing[a.key] = a.size_bytes
-        return a
 
     def test_assembly_replaces_its_parts(self):
-        a = self.live(assembly(self.rec, [2, 3]))
-        h = self.w.hour(self.w.select([a]), DAYS[3], 5)
+        a = self.w.assembly(self.rec, [2, 3])
+        h = self.w.hour(self.w.select(), DAYS[3], 5)
         ids = [p.output_id for p in self.rec.parts]
-        self.assertEqual([s.file_id for s in h.served], ['sha256:' + a.sha256, str(ids[0]), str(ids[3])])
-        self.assertEqual(h.served[0].path, path(DAYS[3], 5, 2))
-        self.assertEqual(h.served[0].source, L.Source.CLOCK_ASSEMBLY)
-        self.assertTrue(h.ok)
-        files = L.builder_files(self.w.select([a]))
-        self.assertTrue({str(i) for i in ids} <= set(files))  # the builder's --clock-assemblies replaces the inputs
-        self.assertNotIn('sha256:' + a.sha256, files)
+        self.assertEqual([s.file_id for s in h.served], [str(ids[0]), a.file_id, str(ids[3])])
+        self.assertEqual((h.served[1].path, h.served[1].source, h.ok), (path(DAYS[3], 5, 2), L.Source.CLOCK_ASSEMBLY, True))
+
+    def test_live_generation_assembly_keeps_its_path_and_source(self):
+        a = self.w.assembly(self.rec, [1, 2, 3, 4], source=L.Source.V85_ASSEMBLY, path='live/name.mp4')
+        h = self.w.hour(self.w.select(), DAYS[3], 5)
+        self.assertEqual([(s.file_id, s.path, s.source) for s in h.served], [(a.file_id, 'live/name.mp4', L.Source.V85_ASSEMBLY)])
+        self.assertIn('v85_assembly=1', summary(self.w.select()))
 
     def test_whole_hour_assembly_takes_the_hour_name(self):
-        a = self.live(assembly(self.rec, [1, 2, 3, 4]))
-        h = self.w.hour(self.w.select([a]), DAYS[3], 5)
+        self.w.assembly(self.rec, [1, 2, 3, 4])
+        h = self.w.hour(self.w.select(), DAYS[3], 5)
         self.assertEqual([s.path for s in h.served], [path(DAYS[3], 5)])
 
-    def test_assembly_outside_r2_does_not_serve(self):
-        a = assembly(self.rec, [1, 2])
-        h = self.w.hour(self.w.select([a]), DAYS[3], 5)
-        self.assertEqual(len(h.served), 4)
-
     def test_assembly_serves_while_a_replaced_part_is_gone(self):
-        a = self.live(assembly(self.rec, [1, 2]))
+        self.w.assembly(self.rec, [1, 2])
         del self.w.listing[self.rec.parts[0].key]
-        self.assertTrue(self.w.hour(self.w.select([a]), DAYS[3], 5).ok)
+        self.assertTrue(self.w.hour(self.w.select(), DAYS[3], 5).ok)
+
+    def test_assembly_across_an_hour_boundary(self):
+        nxt = self.w.records[(RID, DAYS[3], 6)][0]
+        a = self.w.assembly([self.rec.parts[2].output_id, self.rec.parts[3].output_id, nxt.parts[0].output_id],
+                            source=L.Source.V85_ASSEMBLY, path='cross.mp4')
+        hours = self.w.select()
+        h5, h6 = self.w.hour(hours, DAYS[3], 5), self.w.hour(hours, DAYS[3], 6)
+        self.assertEqual([s.file_id for s in h5.served][-1], a.file_id)
+        self.assertEqual(([s.file_id for s in h6.served], h6.covered_by), ([str(nxt.parts[1].output_id)], (a.file_id,)))
+        self.assertTrue(h5.ok and h6.ok)
 
     def test_parts_taken_twice_fail(self):
-        a = self.live(assembly(self.rec, [1, 2], 'aa'))
-        b = self.live(assembly(self.rec, [2, 3], 'bb'))
-        with self.assertRaisesRegex(L.LedgerError, 'inputs of two assemblies'):
-            self.w.select([a, b])
+        self.w.assembly(self.rec, [1, 2], 'aa')
+        self.w.assembly(self.rec, [2, 3], 'bb')
+        with self.assertRaisesRegex(L.LedgerError, 'input of two assemblies'):
+            self.w.select()
 
     def test_non_consecutive_parts_fail(self):
-        a = self.live(assembly(self.rec, [1, 3]))
+        self.w.assembly(self.rec, [1, 3])
         with self.assertRaisesRegex(L.LedgerError, 'not consecutive'):
-            self.w.select([a])
+            self.w.select()
 
-    def test_parts_of_another_record_fail(self):
-        other = self.w.records[(RID, DAYS[0], 1)][0]
-        a = self.live(dataclasses.replace(assembly(self.rec, [1, 2]), input_ids=(self.rec.parts[0].output_id, other.parts[0].output_id)))
-        with self.assertRaisesRegex(L.LedgerError, 'not parts of hour'):
-            self.w.select([a])
+    def test_run_must_cross_at_the_hour_edge(self):
+        nxt = self.w.records[(RID, DAYS[3], 6)][0]
+        self.w.assembly([self.rec.parts[1].output_id, nxt.parts[0].output_id])
+        with self.assertRaisesRegex(L.LedgerError, 'not consecutive'):
+            self.w.select()
+
+    def test_inputs_outside_the_window_fail(self):
+        self.w.records[(RID, '2026-01-01', 1)] = [L.Record(9999, 'h-out', 'g', 'collated', 'r', (dataclasses.replace(self.rec.parts[0], output_id=1),))]
+        self.w.assembly([self.rec.parts[0].output_id, 1])
+        with self.assertRaisesRegex(L.LedgerError, 'reach outside the best-14 hours'):
+            self.w.select()
+
+    def test_assembly_into_an_alternate_record_fails(self):
+        alt = self.w.add(self.w.next_row + 1, DAYS[3], 6, 'recovery-best14-20261125', 2, L.Source.NEW_STITCH, in_registry=False)
+        for p in alt.parts:
+            del self.w.listing[p.key]  # the original record serves hour 6
+        self.w.assembly([self.rec.parts[3].output_id, alt.parts[0].output_id], path='a.mp4')
+        with self.assertRaisesRegex(L.LedgerError, 'record that serves no hour'):
+            self.w.select()
+
+    def test_clock_join_assembly_across_hours_fails(self):
+        nxt = self.w.records[(RID, DAYS[3], 6)][0]
+        self.w.assembly([self.rec.parts[3].output_id, nxt.parts[0].output_id])
+        with self.assertRaisesRegex(L.LedgerError, 'crosses an hour'):
+            self.w.select()
+
+    def test_registry_assemblies_need_a_matching_hold(self):
+        a = self.w.assembly(self.rec, [1, 2], live=False)
+        registry = {'files': {a.file_id: {'key': a.key, 'size_bytes': a.size_bytes, 'etag': f'"{ETAG}"', 'sha256': a.sha256, 'path': 'p.mp4'}}}
+        store = type('S', (), {'load': lambda self, p: {'repairs': [{'sha256': a.sha256, 'kind': 'model79', 'input_ids': list(a.input_ids)}]}})()
+        listing = {a.key: (a.size_bytes, ETAG)}
+        self.assertEqual(L.registry_assemblies(registry, store, listing, {}), ([], 1))
+        live, unheld = L.registry_assemblies(registry, store, listing, {a.key: (ETAG, a.size_bytes)})
+        self.assertEqual(([(x.source, x.input_ids, x.path) for x in live], unheld), ([(L.Source.V79_ASSEMBLY, a.input_ids, 'p.mp4')], 0))
+        with self.assertRaisesRegex(L.LedgerError, 'R2 holds'):
+            L.registry_assemblies(registry, store, {a.key: (a.size_bytes, '1' * 32)}, {})
 
     def test_reads_clock_join_proofs(self):
-        a = assembly(self.rec, [2, 3])
+        a = self.w.assembly(self.rec, [2, 3], live=False)
         with tempfile.TemporaryDirectory() as d:
             proofs = os.path.join(d, 'joined', 'clock-prestitch-20261125', 'proofs')
             os.makedirs(proofs)
             with open(os.path.join(proofs, a.sha256 + '.json'), 'w') as f:
-                json.dump({'hour_id': a.hour_id, 'inputs': [{'output_id': i} for i in a.input_ids],
+                json.dump({'hour_id': self.rec.hour_id, 'inputs': [{'output_id': i} for i in a.input_ids],
                            'output': {'key': a.key, 'sha256': a.sha256, 'size_bytes': a.size_bytes}}, f)
-            self.assertEqual(L.read_proofs(d), [a])
-
-    def test_unknown_hour_fails(self):
-        a = dataclasses.replace(assembly(self.rec, [1, 2]), hour_id='h-unknown')
-        with self.assertRaisesRegex(L.LedgerError, 'outside the best-14 extract'):
-            self.w.select([a])
+            self.assertEqual(L.read_proofs(d, {}), [])
+            self.assertEqual(L.read_proofs(d, {a.key: (a.size_bytes, ETAG)}), [a])
 
 
 class RuleTests(unittest.TestCase):
@@ -234,18 +274,39 @@ class RuleTests(unittest.TestCase):
 
     def test_assembly_duplicating_a_part_fails(self):
         h = self.hours[0]
-        asm = L.Served('sha256:' + 'cd' * 32, 'joined/clock-prestitch-x/objects/cd.mp4', 1, 'p.mp4', L.Source.CLOCK_ASSEMBLY,
-                       tuple(s.file_id for s in h.served))
+        asm = L.Served('sha256:' + 'cd' * 32, 'joined/clock-prestitch-x/objects/cd.mp4', 1, ETAG, 'cd' * 32, 'p.mp4',
+                       L.Source.CLOCK_ASSEMBLY, tuple(s.file_id for s in h.served))
         hours = [dataclasses.replace(h, served=(asm,) + h.served)] + self.hours[1:]
-        with self.assertRaisesRegex(L.LedgerError, 'duplicates parts'):
+        with self.assertRaisesRegex(L.LedgerError, 'duplicates its parts'):
+            L.check_rules(hours)
+
+    def test_part_served_by_no_file_fails(self):
+        h = self.hours[0]
+        hours = [dataclasses.replace(h, served=h.served[:1])] + self.hours[1:]
+        with self.assertRaisesRegex(L.LedgerError, 'served by no file'):
             L.check_rules(hours)
 
     def test_duplicate_delivery_path_fails(self):
         a = self.w.records[(RID, DAYS[0], 1)][0].parts[0]
         b = self.w.records[(RID, DAYS[0], 2)][0].parts[0]
-        self.w.registry[str(b.output_id)] = self.w.registry[str(a.output_id)]
+        self.w.files[str(b.output_id)] = self.w.files[str(a.output_id)]
         with self.assertRaisesRegex(L.LedgerError, 'delivery paths are served twice'):
             self.w.select()
+
+
+def write_registry(d, objects, files):
+    """A live generation registry with the given asset objects, mirrored under d/assets."""
+    assets = {}
+    for p, o in objects.items():
+        body = json.dumps(o).encode()
+        sha = hashlib.sha256(body).hexdigest()
+        k = f'datasets/x/assets/{sha}/{p.rsplit("/", 1)[1]}'
+        os.makedirs(os.path.join(d, 'assets', os.path.dirname(k)), exist_ok=True)
+        with open(os.path.join(d, 'assets', k), 'wb') as f:
+            f.write(body)
+        assets[p] = {'key': k, 'sha256': sha, 'size_bytes': len(body)}
+    with open(os.path.join(d, 'registry.json.gz'), 'wb') as f:
+        f.write(gzip.compress(json.dumps({'recording_ids': [RID], 'assets': assets, 'files': files}).encode()))
 
 
 class CliTests(unittest.TestCase):
@@ -261,33 +322,36 @@ class CliTests(unittest.TestCase):
                 out.writerow(L.EXTRACT_COLUMNS)
                 for (rid, date, dh), recs in w.records.items():
                     for r in recs:
-                        head = [rid, date, dh, r.row_id, r.hour_id, r.batch_id, r.status, r.registered_at]
+                        head = [rid, date, dh, r.row_id, r.hour_id, r.batch_id, r.status, r.registered_at, 5, 5]
                         if not r.parts:
-                            out.writerow(head + [''] * 6 + ['f', 'f'])
+                            out.writerow(head + [''] * 9 + ['f', 'f'])
                         for q in r.parts:
-                            out.writerow(head + [q.output_id, q.part, q.parts, q.key, q.nas_path, q.size_bytes, 'f', 'f'])
+                            out.writerow(head + [q.output_id, q.part, q.parts, q.key, q.nas_path, q.size_bytes, q.sha256,
+                                                 q.start_at, q.end_at, 'f', 'f'])
             with open(p('listing.txt'), 'w') as f:
-                f.writelines(f'2026-11-25 10:00:00 {n:>10} {k}\n' for k, n in w.listing.items())
-            with open(p('registry.json.gz'), 'wb') as f:
-                f.write(gzip.compress(json.dumps({'files': {k: {'path': v} for k, v in w.registry.items()}}).encode()))
+                f.writelines(f'{k}\t{n}\t"{e}"\n' for k, (n, e) in w.listing.items())
+            with open(p('holds.tsv'), 'w') as f:
+                f.write('object_key\tetag\tsize_bytes\n')
+            write_registry(d, {'/public/growth.json': {'repairs': []},
+                               f'/public/streams/{RID}.json': {'days': [{'date': '2026-07-01'}]}}, w.files)
             tool = [sys.executable, '-I', L.__file__]
-            sql = subprocess.run(tool + ['extract-sql', '--best14', p('best14.tsv')], check=True, capture_output=True, text=True).stdout
+            inputs = ['--best14', p('best14.tsv'), '--registry', p('registry.json.gz'), '--assets', p('assets')]
+            sql = subprocess.run(tool + ['extract-sql'] + inputs, check=True, capture_output=True, text=True).stdout
             self.assertIn(f"({RID},date '{DAYS[0]}')", sql)
-            r = subprocess.run(tool + ['build', '--best14', p('best14.tsv'), '--extract', p('extract.tsv'), '--listing', p('listing.txt'),
-                                       '--registry', p('registry.json.gz'), '--out-dir', p('out')], check=True, capture_output=True, text=True)
+            self.assertIn(f"({RID},date '2026-07-01')", sql)  # the live generation's own days
+            self.assertIn('delivery_keep_holds', subprocess.run(tool + ['holds-sql'], check=True, capture_output=True, text=True).stdout)
+            build = tool + ['build'] + inputs + ['--extract', p('extract.tsv'), '--holds', p('holds.tsv'), '--listing', p('listing.txt')]
+            r = subprocess.run(build + ['--out-dir', p('out')], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
             self.assertTrue(r.stdout.startswith('streams_available=1/1 days_complete=14/14 hours_complete=140/140'))
             rows = L.read_tsv(p('out/best14-ledger.tsv'), L.LEDGER_COLUMNS)
             self.assertEqual(len(rows), 14 * 12)
             self.assertEqual(rows[0]['delivery_paths'].split(','), [path(DAYS[0], 1, 1), path(DAYS[0], 1, 2)])
-            # The builder takes the ledger's days and files as its --best14 and --files.
-            self.assertEqual(build_generation.read_best14(p('out/best14-ledger-days.tsv')), {RID: {(day, 'R') for day in DAYS}})
-            self.assertEqual(len(build_generation.read_lines(p('out/best14-ledger-files.txt'))), 280)
             with open(p('listing.txt'), 'a') as f:
-                f.write('2026-11-25 10:00:00 1 raw/x.mp4\n')
-            r = subprocess.run(tool + ['build', '--best14', p('best14.tsv'), '--extract', p('extract.tsv'), '--listing', p('listing.txt'),
-                                           '--registry', p('registry.json.gz'), '--out-dir', p('out2')], capture_output=True, text=True)
+                f.write('raw/x.mp4 1\n')
+            r = subprocess.run(build + ['--out-dir', p('out2')], capture_output=True, text=True)
             self.assertNotEqual(r.returncode, 0)
-            self.assertIn('not a recursive listing of joined/', r.stderr)
+            self.assertIn('not a key/size/ETag listing line', r.stderr)
 
 
 if __name__ == '__main__':
