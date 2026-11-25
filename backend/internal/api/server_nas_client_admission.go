@@ -69,13 +69,21 @@ const nasCleanupDayModesClientVersion = "r2-copy-v8-tunable-modes"
 // counterpart the server found live (server_nas_cleanup_day.go).
 const nasCleanupDayKEClientVersion = "r2-copy-v8-ke-day"
 
-// These releases receive day permits with a mode.
-var nasCleanupDayModeVersions = []string{nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion}
+// The output-restore release is the ke-day line that also leases NAS-only
+// stitched-output restores (it sends output_restores, server_nas_restore.go).
+// Its server capabilities are exactly ke-day's.
+const nasOutputRestoreClientVersion = "r2-copy-v8-output-restore"
 
-var nasFastCopyVersions = []string{nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion}
+// These releases receive day permits with a mode.
+var nasCleanupDayModeVersions = []string{nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion, nasOutputRestoreClientVersion}
+
+// Only these releases receive Keep Everything day permits (names mode).
+var nasCleanupDayKEVersions = []string{nasCleanupDayKEClientVersion, nasOutputRestoreClientVersion}
+
+var nasFastCopyVersions = []string{nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion, nasOutputRestoreClientVersion}
 
 // Only these releases receive day-directory permits.
-var nasCleanupDayVersions = []string{nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion}
+var nasCleanupDayVersions = []string{nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion, nasOutputRestoreClientVersion}
 
 func nasFastCopyLine(version string) bool {
 	return slices.Contains(nasFastCopyVersions, version)
@@ -84,7 +92,7 @@ func nasFastCopyLine(version string) bool {
 // These releases have raw-copy authority only.
 func nasLowMemoryRawCopyOnly(version string) bool {
 	switch version {
-	case nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion:
+	case nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion, nasOutputRestoreClientVersion:
 		return true
 	default:
 		return false
@@ -97,7 +105,7 @@ func nasCopySupportsVersion(version string) bool {
 	switch version {
 	case nasCleanupCertifiedStitchVersion, NASR2CopyPagedClientVersion, nasCleanupR2CopyDiagnosticsClientVersion, nasCleanupR2CopyProgressClientVersion, nasCleanupR2CopyClientVersion, "v85r-nas-proof-v1", nasCleanupProofClientVersion,
 		nasCleanupR2CopyControlClientVersion, nasCleanupItemTruthClientVersion, nasCleanupFreshPermitClientVersion,
-		nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion:
+		nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion, nasOutputRestoreClientVersion:
 		return true
 	default:
 		return false
