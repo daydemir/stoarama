@@ -373,7 +373,7 @@ class LedgerWorld:
         return p
 
     def inputs(self):
-        return L.Inputs({}, self.records, [], self.listing, self.fx.parent, {})
+        return L.Inputs({rid: ('1', [(d, 'R' * 12) for d in DAYS]) for rid in RIDS}, self.records, [], self.listing, self.fx.parent, {})
 
     def hour_list(self):
         return [self.hours[k] for k in sorted(self.hours)]
@@ -381,11 +381,13 @@ class LedgerWorld:
     def generation(self, store, grades=None):
         isa = lambda x: x.source in L.ASSEMBLY_SOURCES
         hours = self.hour_list()
-        overlay, present, added, file_holds = b.ledger_generation(self.inputs(), hours, store, grades or {}, isa)
+        windows = {rid: b.Window.BEST14 for rid in RIDS}
+        overlay, present, added, file_holds = b.ledger_generation(self.inputs(), hours, store, grades or {}, isa, windows)
         best14 = {}
         for d in L.day_rows(hours):
             best14.setdefault(d['recording_id'], set()).add((d['local_date'], d['day_stitched']))
-        lost = b.regressions(self.inputs(), hours, store, present, isa)
+        live = b.live_counts(self.inputs(), store)
+        lost = b.regressions(live, b.new_counts(hours, isa), set(live) | {h.slot[:2] for h in hours})
         return b.OverlayStore(store, overlay), present, added, file_holds, best14, lost
 
 
@@ -465,6 +467,14 @@ class LedgerBuildTests(unittest.TestCase):
         md = {s['id']: s for s in store.load('/public/metadata.json')['streams']}
         self.assertEqual((md[rid]['start'], md[rid]['end'], md[rid]['grades']), (DAYS[1], new_day, 'A' * 12 + 'B'))
         self.assertEqual(store.load(f'/public/manifests/{rid}.json')['period'], [DAYS[1], new_day])
+        self.assertEqual((md[rid]['window'], md[rid]['best14_dates']), ('best14', [DAYS[0], DAYS[-1]]))
+
+        # Option (c): the stream keeps its live window until its best-14 window serves as much.
+        isa = lambda x: x.source in L.ASSEMBLY_SOURCES
+        live_hours = LedgerWorld(self.fx).hour_list()
+        live = b.live_counts(w.inputs(), self.store)
+        windows = b.choose_windows(w.hour_list(), live_hours, live, isa)
+        self.assertEqual((windows[rid], windows[RIDS[0]]), (b.Window.ORIGINAL, b.Window.BEST14))
 
     def test_cli_fails_closed_and_dry_runs(self):
         r = subprocess.run([sys.executable, '-I', os.path.join(BACKEND, 'scripts', 'gss', 'build_generation.py'), '--ledger',

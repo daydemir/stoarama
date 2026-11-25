@@ -246,7 +246,9 @@ def extract_sql(days):
     return f"""WITH d(recording_id, local_date) AS (VALUES {values})
 SELECT h.recording_id, h.local_date, h.delivery_hour, h.id AS hour_row_id, h.hour_id, h.batch_id, h.status, h.registered_at,
  h.source_clip_count, h.included_clip_count,
- o.id AS output_id, o.part, o.parts, o.object_key, o.nas_relative_path, o.size_bytes, o.sha256, o.start_at, o.end_at,
+ o.id AS output_id, o.part, o.parts, o.object_key, o.nas_relative_path, o.size_bytes, o.sha256,
+ to_char(o.start_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"+00:00"') AS start_at,
+ to_char(o.end_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"+00:00"') AS end_at,
  EXISTS (SELECT 1 FROM nas_restore_requests n WHERE n.target='output' AND n.output_id=o.id AND n.state='verified') AS nas_restored,
  EXISTS (SELECT 1 FROM r2_retirement_writer_operations w WHERE w.collation_recovery_hour_id IS NOT NULL
    AND w.completed_at IS NOT NULL AND w.object_key=o.object_key) AS recovery_put

@@ -59,6 +59,7 @@ import argparse
 import collections
 import copy
 import csv
+import dataclasses
 import datetime
 import enum
 import gzip
@@ -510,7 +511,7 @@ def read_grades(path):
     return {(int(r['recording_id']), r['local_date']): r['grade'] for r in read_tsv(path, ('recording_id', 'local_date', 'grade'))}
 
 
-def ledger_generation(inputs, hours, store, grades, is_assembly):
+def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
     """(overlay of rebuilt base assets, present file ids, added registry files, new file holds).
 
     Every ledger file in R2 is published: a file the parent lists under its parent
@@ -609,6 +610,8 @@ def ledger_generation(inputs, hours, store, grades, is_assembly):
         hs_cap = [h for h in hs if h.captured]
         registered = sum(1 for h in hs_cap if h.record is not None and h.record.status == 'collated')
         s = MS[rid]
+        b14 = inputs.best14[rid][1]
+        s.update(window=windows[rid].value, best14_dates=[b14[0][0], b14[-1][0]])
         s.update(start=start, end=end, period_anchor=start, weekly_period_anchor=start, grades=''.join(d['grade'] for d in days),
                  captured_scheduled_seconds=sum(d['captured_scheduled_seconds'] for d in days),
                  registered_hours=registered, missing_registration_hours=len(hs_cap) - registered)
@@ -623,9 +626,29 @@ def ledger_generation(inputs, hours, store, grades, is_assembly):
     return overlay, present, added, file_holds
 
 
-def regressions(inputs, hours, store, present, is_assembly):
-    """Stream-days where the new generation serves fewer complete hours or fewer
-    assemblies than the live generation (the ledger's --registry)."""
+class Window(str, enum.Enum):
+    """The days a stream's timeline shows: the live generation's, or its best-14."""
+    ORIGINAL = 'original'
+    BEST14 = 'best14'
+
+
+LIVE_NO_CAPTURE = frozenset({'gap_only', 'gap_unregistered', 'quarantine_only'})
+
+
+def live_windows(registry, store, best14):
+    """Each stream's live timeline days as a ledger window (an hour the live timeline shows
+    without capture is '.')."""
+    out = {}
+    for rid in registry['recording_ids']:
+        days = store.load(f'/public/streams/{rid}.json')['days']
+        out[rid] = (best14[rid][0], [(d['date'], ''.join('.' if h[0] in LIVE_NO_CAPTURE else 'R' for h in d['hours'])) for d in days])
+    return out
+
+
+def live_counts(inputs, store):
+    """{(recording_id, local_date): [complete hours, assemblies]} the live generation serves.
+    An hour is complete when one of its records has every part listed, directly or as an
+    assembly input."""
     files = inputs.registry['files']
     inputs_of = {'sha256:' + r['sha256']: [str(i) for i in r['input_ids']] for r in store.load('/public/growth.json')['repairs']}
     slot_of = {str(p.output_id): slot for slot, rs in inputs.records.items() for r in rs for p in r.parts}
@@ -640,41 +663,72 @@ def regressions(inputs, hours, store, present, is_assembly):
     for f in files:
         if f.startswith('sha256:'):
             live[slot_of[inputs_of[f][0]][:2]][1] += 1
+    return live
+
+
+def new_counts(hours, is_assembly):
     new = collections.defaultdict(lambda: [0, 0])
     for h in hours:
         new[h.slot[:2]][0] += h.ok
-        new[h.slot[:2]][1] += sum(1 for x in h.served if is_assembly(x) and x.file_id in present)
-    return {day: (live[day], new[day]) for day in sorted(live) if new[day][0] < live[day][0] or new[day][1] < live[day][1]}
+        new[h.slot[:2]][1] += sum(1 for x in h.served if is_assembly(x))
+    return new
+
+
+def regressions(live, new, days):
+    """The days where the new generation serves fewer complete hours or fewer assemblies than live."""
+    return {d: (live[d], new[d]) for d in sorted(days) if new[d][0] < live[d][0] or new[d][1] < live[d][1]}
+
+
+def choose_windows(best14_hours, live_hours, live, is_assembly):
+    """{recording_id: Window}: best-14 once it serves at least the live window's complete
+    hours and assemblies, else the live window."""
+    def totals(counts, hours):
+        out = collections.defaultdict(lambda: [0, 0])
+        for day in {h.slot[:2] for h in hours}:
+            out[day[0]][0] += counts[day][0]
+            out[day[0]][1] += counts[day][1]
+        return out
+    b14, old = totals(new_counts(best14_hours, is_assembly), best14_hours), totals(live, live_hours)
+    return {rid: Window.BEST14 if b14[rid][0] >= old[rid][0] and b14[rid][1] >= old[rid][1] else Window.ORIGINAL
+            for rid in sorted({h.recording_id for h in best14_hours})}
 
 
 def main_ledger(a):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import best14_ledger
+    is_assembly = lambda x: x.source in best14_ledger.ASSEMBLY_SOURCES
     try:
         inputs, store = best14_ledger.load(a)
-        hours = best14_ledger.select(inputs)
+        best14_hours = best14_ledger.select(inputs)
+        live_hours = best14_ledger.select(dataclasses.replace(inputs, best14=live_windows(inputs.registry, store, inputs.best14)))
+        live = live_counts(inputs, store)
+        windows = choose_windows(best14_hours, live_hours, live, is_assembly)
+        chosen = [h for h in best14_hours if windows[h.recording_id] is Window.BEST14] + \
+                 [h for h in live_hours if windows[h.recording_id] is Window.ORIGINAL]
+        best14_ledger.check_rules(chosen)
     except best14_ledger.LedgerError as e:
         raise SystemExit(f'best14 ledger: {e}')
-    is_assembly = lambda x: x.source in best14_ledger.ASSEMBLY_SOURCES
-    overlay, present, added, file_holds = ledger_generation(inputs, hours, store, read_grades(a.grades), is_assembly)
-    lost = regressions(inputs, hours, store, present, is_assembly)
-    days = best14_ledger.day_rows(hours)
+    lost = regressions(live, new_counts(chosen, is_assembly), {h.slot[:2] for h in chosen})
+    report = {'windows': {w.value: sum(v is w for v in windows.values()) for w in Window},
+              'regressed_stream_days': len(lost),
+              'regressions_live_vs_new_[complete_hours,assemblies]': {f'{r} {d}': v for (r, d), v in lost.items()}}
+    if lost and not a.dry_run:
+        print(json.dumps(report, indent=1))
+        raise SystemExit(f'{len(lost)} stream-days would serve fewer complete hours or assemblies than the live generation')
+    overlay, present, added, file_holds = ledger_generation(inputs, chosen, store, read_grades(a.grades), is_assembly, windows)
     best14 = collections.defaultdict(set)
-    for d in days:
+    for d in best14_ledger.day_rows(best14_hours):
         best14[d['recording_id']].add((d['local_date'], d['day_stitched']))
     with open(a.base_holds, encoding='utf-8') as f:
         holds = json.load(f)
     now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-    report = {'regressed_stream_days': len(lost),
-              'regressed_streams': {str(rid): sum(1 for (r, _) in lost if r == rid) for rid in sorted({r for r, _ in lost})},
-              'regressions_live_vs_new_[complete_hours,assemblies]': {f'{r} {d}': v for (r, d), v in list(lost.items())[:20]}}
-    if lost and not a.dry_run:
-        print(json.dumps(report, indent=1))
-        raise SystemExit(f'{len(lost)} stream-days would serve fewer complete hours or assemblies than the live generation')
     summary = build(inputs.registry, OverlayStore(store, overlay), present, holds, secrets.token_hex(16), now, a.note,
                     None if a.dry_run else a.out, best14, added, file_holds)
-    summary.update(report, days_complete={str(rid): sum(c in READY_DAY_CODES for _, c in v) for rid, v in sorted(best14.items())},
+    summary.update(report, window={str(rid): w.value for rid, w in windows.items()},
+                   best14_days_ready={str(rid): sum(c in READY_DAY_CODES for _, c in v) for rid, v in sorted(best14.items())},
                    known_stale_fields=list(KNOWN_STALE_FIELDS) + list(LEDGER_STALE_FIELDS))
+    if a.out and not a.dry_run:
+        write_json(os.path.join(a.out, 'summary.json'), summary)
     return summary
 
 

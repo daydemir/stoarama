@@ -1,10 +1,11 @@
 /* Best-14 availability filter. ?show=all includes partial streams; the default lists available ones. */
 (function(root){'use strict';
-const STATES=['available','partial'];
+const STATES=['available','partial'],WINDOWS=['original','best14'];
 function annotated(streams){
  const marked=streams.filter(s=>s.availability!==undefined);
  if(marked.length&&marked.length!==streams.length)throw Error('Stream availability is incomplete');
  for(const s of marked)if(!STATES.includes(s.availability))throw Error('Unknown stream availability');
+ for(const s of marked)if(s.window!==undefined&&!WINDOWS.includes(s.window))throw Error('Unknown stream window');
  return marked.length>0;
 }
 const show=search=>new URLSearchParams(search).get('show')==='all'?'all':'available';
@@ -13,7 +14,12 @@ function counts(streams){return{available:streams.filter(s=>s.availability==='av
 const countLabel=c=>`${c.available} streams fully available now · ${c.partial} more partial`;
 const day=s=>new Date(s+'T12:00:00Z'),month=s=>day(s).toLocaleString('en-US',{timeZone:'UTC',month:'short'});
 function period(start,end){return month(start)===month(end)?`${month(start)} ${day(start).getUTCDate()}–${day(end).getUTCDate()}`:`${month(start)} ${day(start).getUTCDate()}–${month(end)} ${day(end).getUTCDate()}`}
-const reason=s=>s.availability==='partial'?`Best 14 days (${period(s.best14_start,s.best14_end)}) in progress: ${s.best14_days_ready} of 14 ready`:'';
+// A partial stream still on its original period names its best-14 window (best14_dates) beside it.
+function reason(s){
+ if(s.availability!=='partial')return '';
+ const original=s.window==='original',[start,end]=original?s.best14_dates:[s.best14_start,s.best14_end];
+ return `${original?'Showing original period; best':'Best'} 14 days (${period(start,end)}) in progress: ${s.best14_days_ready} of 14 ready`;
+}
 function label(s){const text=reason(s);return text?`<p class="availability-note">${text}</p>`:''}
 // A link to one partial stream (?stream=<id>) opens the full list so the stream is shown.
 function linkedSearch(streams,search){

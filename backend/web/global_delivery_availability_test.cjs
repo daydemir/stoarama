@@ -24,6 +24,14 @@ test('counts and the partial reason label',()=>{
  assert.match(a.label(streams[2]),/^<p class="availability-note">/);
 });
 
+test('a partial stream on its original period names its best-14 window',()=>{
+ const s={id:337,availability:'partial',window:'original',best14_dates:['2026-08-27','2026-09-09'],best14_start:'2026-08-27',best14_end:'2026-09-09',best14_days_ready:3};
+ assert.equal(a.reason(s),'Showing original period; best 14 days (Aug 27–Sep 9) in progress: 3 of 14 ready');
+ assert.equal(a.reason({...s,window:'best14'}),'Best 14 days (Aug 27–Sep 9) in progress: 3 of 14 ready');
+ assert.equal(a.annotated([s,{...streams[0],window:'best14'}]),true);
+ assert.throws(()=>a.annotated([{...s,window:'later'}]),/Unknown stream window/);
+});
+
 test('best-14 periods across months',()=>{
  assert.equal(a.reason(streams[1]),'Best 14 days (Sep 25–Oct 8) in progress: 0 of 14 ready');
 });
