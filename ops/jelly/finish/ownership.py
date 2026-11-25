@@ -1,5 +1,6 @@
 """Read-only ownership proof shared by collection, plan selection and monitoring."""
 from datetime import datetime, timezone
+from enum import Enum
 import fcntl
 import hashlib
 import json
@@ -18,6 +19,19 @@ from collector import timestamp, fresh, count, require, PLAN, PLAN_SHA, CLOSE_SH
 POLICY_SHA = 'bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393'
 
 
+class StopReason(str, Enum):
+    NATURAL_BOUNDARY = 'natural_boundary'
+    FAILURE = 'failure'
+    # The runner's own idle hold after a startup finish-health refusal with no
+    # owned plan. It sets no runner latch; the runner releases it itself once
+    # finish health is clean. D's admission latch stays the human gate.
+    FINISH_ADMISSION_HOLD = 'finish_admission_hold'
+
+
+# Idle, execution-free boundaries. Failure containment is never one.
+IDLE_STOPS = frozenset((StopReason.NATURAL_BOUNDARY, StopReason.FINISH_ADMISSION_HOLD))
+
+
 def digest(raw):
     return hashlib.sha256(raw).hexdigest()
 
@@ -26,14 +40,13 @@ def parse_stop(raw, owner, now):
     stop = json.loads(raw)
     require(stop['schema'] == 'stoarama.cleanup-stop.v1'
             and stop['owner_id'] == owner['owner_id']
-            and stop['reason'] in {'natural_boundary', 'failure'}
             and timestamp(stop['created_at']) <= now)
-    return stop
+    return dict(stop, reason=StopReason(stop['reason']))
 
 
 def validate_stop(raw, owner, now):
     # Failure containment is valid STOP syntax but never healthy feed evidence.
-    require(parse_stop(raw, owner, now)['reason'] == 'natural_boundary')
+    require(parse_stop(raw, owner, now)['reason'] in IDLE_STOPS)
 
 
 def owner_plan(status, owner):

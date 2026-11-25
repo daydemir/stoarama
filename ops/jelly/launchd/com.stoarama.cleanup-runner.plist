@@ -5,6 +5,8 @@
  <key>ProgramArguments</key><array><string>/usr/bin/caffeinate</string><string>-i</string><string>/bin/sh</string><string>/Users/jelly/Build/stoarama/ops/jelly/cleanup-runner/run.sh</string></array>
  <key>WorkingDirectory</key><string>/Users/jelly/Build/stoarama</string>
  <key>RunAtLoad</key><true/>
+ <key>KeepAlive</key><dict><key>SuccessfulExit</key><true/></dict>
+ <key>ThrottleInterval</key><integer>3600</integer>
  <key>ExitTimeOut</key><integer>0</integer>
  <key>StandardOutPath</key><string>/Users/jelly/stoarama-cleanup-runner/launchd.log</string>
  <key>StandardErrorPath</key><string>/Users/jelly/stoarama-cleanup-runner/launchd.log</string>

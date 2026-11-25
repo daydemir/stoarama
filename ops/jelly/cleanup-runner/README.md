@@ -64,7 +64,9 @@ active-set/digest reads before another attempt. Foreign plans are never mutated.
 Disk/email failure cannot skip containment. Shutdown/recovery latches remain.
 
 STOP/SIGTERM prevents successors and drains a healthy active plan naturally;
-it never pauses a plan to deploy. Do not force-kill a draining/containment runner.
+it never pauses a plan to deploy. Under launchd KeepAlive a SIGTERM drain exits 0
+and restarts (immediately after a run over an hour), so only STOP, the latch or
+`launchctl bootout` holds the runner. Do not force-kill a draining/containment runner.
 A process crash may leave its plan enabled until restart or backend expiry; local
 STOP is not a backend deletion switch.
 
@@ -86,6 +88,23 @@ Successor enablement waits on the existing D tick lock so D can consume its full
 safety snapshot before a new plan appears. A controller's natural STOP uses the
 owner-bound JSON in OWNERSHIP.md; it preserves active natural drain and D health.
 Foreign or empty STOP content is a safety failure, not a natural-boundary request.
+
+Startup finish hold (owner, verbatim: a runner refusal "latched only because recovery
+failed on the network" must "not write a failure STOP that blocks recovery; it should
+hold with a distinct reason the collector accepts"; never auto-clear a latch). When
+startup finish health refuses for any reason (D latch, recovery_required, interrupted
+attempt, missing, failed or >7 h stale evidence) and status names no current plan or
+day plan, the runner sets no last_error and makes no backend call: it publishes an
+owner-bound `finish_admission_hold` STOP (only when no STOP exists; it alerts once
+then), saves phase `stopped` and exits 0. launchd (`KeepAlive` SuccessfulExit,
+`ThrottleInterval` 3600) restarts it hourly. A restart that finds its own hold STOP
+and a still-refused health re-holds quietly. If D is not latched (`failed` false),
+it kickstarts `com.stoarama.finish-recovery` once per unlatched episode, never on
+the first (often boot-time) hold; a kickstart failure alerts and keeps the hold. Once health
+is clean it removes only its own hold STOP and continues. A natural STOP holds
+quietly and stays. A foreign, empty or failure STOP, or an owned current plan or day
+plan (which may be enabled and still deleting on server permits), keeps the failure
+path: containment, drain, latch and failure STOP.
 The runner reuses D's installed admission module to detect abandoned attempts and
 orphan directories under its admission gate, including before borrowing its tick
 lock. A live recovery can coexist. A stopped selected plan remains pending only
