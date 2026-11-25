@@ -47,16 +47,22 @@ binary is `~/stoarama-r2prune-lane/r2prune`. The wrapper does not change it.
    (sha256 `2e06ede3…a2d4`). It inserts the receipts and sets raw `purged_at` in
    500-row transactions, retries `55P03` lock contention, and resumes from the
    last committed batch.
-5. Writes `receipt-result.json` only after the apply verified its readback.
+5. Writes `receipt-result.json` only after the apply verified its readback. It is
+   `complete` only when every manifest key has a final ledger outcome; a key that
+   was never logged (lost reply, crash) or logged `failed` may still be gone from
+   R2, so it keeps the intent open.
 
-It fails closed: a failed receipt write exits non-zero and leaves the intent open
-with no `receipt-result.json`. Fix the cause and replay just the receipts:
+It fails closed: a failed receipt write exits non-zero and leaves no
+`receipt-result.json`. A full run (no `--limit`) that leaves keys without a final
+outcome also exits non-zero; rerun the same command with the same
+`--fresh-listing` so r2prune settles them. A canary leaves the intent open
+without failing. To replay just the receipts:
 
 ```sh
 /usr/bin/python3 -I ops/jelly/r2prune/manual_apply.py receipts WORKDIR
 ```
 
-A later `delete` in the same `WORKDIR` replays an open intent first. The wrapper
+A later `delete` in the same `WORKDIR` replays an open intent first, then preflights only the keys not yet deleted. The wrapper
 holds `~/stoarama-r2prune-lane/cycle.lock`, so it never runs beside a lane cycle.
 Credentials come only from `~/Build/stoarama/local/recording-supervisor.env`
 (catalog, as libpq `PG*` variables, never argv) and `render.env` (R2, passed to

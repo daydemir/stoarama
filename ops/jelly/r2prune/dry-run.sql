@@ -45,7 +45,7 @@ WITH b AS MATERIALIZED (
   LEFT JOIN recordings ro ON ro.id=h.recording_id
   LEFT JOIN r2_object_retirements x ON x.bucket='stoarama' AND x.object_key=b.object_key
 ), v AS (
-  SELECT s.*, (s.receipt_id IS NULL OR (s.kind='raw' AND s.purged_at IS NULL)) AS writes, array_remove(ARRAY[
+  SELECT s.*, array_remove(ARRAY[
     -- apply_ledger_backfill: source, timestamp or receipt drift
     CASE WHEN s.source_matches IS NOT TRUE THEN 'source_drift' END,
     CASE WHEN s.kind='raw' AND s.purged_at IS NOT NULL AND s.purged_at<>s.deleted_at THEN 'purged_at_differs' END,
@@ -118,7 +118,7 @@ WITH b AS MATERIALIZED (
   LEFT JOIN recordings ro ON ro.id=h.recording_id
   LEFT JOIN r2_object_retirements x ON x.bucket='stoarama' AND x.object_key=b.object_key
 ), v AS (
-  SELECT s.*, (s.receipt_id IS NULL OR (s.kind='raw' AND s.purged_at IS NULL)) AS writes, array_remove(ARRAY[
+  SELECT s.*, array_remove(ARRAY[
     -- apply_ledger_backfill: source, timestamp or receipt drift
     CASE WHEN s.source_matches IS NOT TRUE THEN 'source_drift' END,
     CASE WHEN s.kind='raw' AND s.purged_at IS NOT NULL AND s.purged_at<>s.deleted_at THEN 'purged_at_differs' END,
@@ -191,7 +191,7 @@ WITH b AS MATERIALIZED (
   LEFT JOIN recordings ro ON ro.id=h.recording_id
   LEFT JOIN r2_object_retirements x ON x.bucket='stoarama' AND x.object_key=b.object_key
 ), v AS (
-  SELECT s.*, (s.receipt_id IS NULL OR (s.kind='raw' AND s.purged_at IS NULL)) AS writes, array_remove(ARRAY[
+  SELECT s.*, array_remove(ARRAY[
     -- apply_ledger_backfill: source, timestamp or receipt drift
     CASE WHEN s.source_matches IS NOT TRUE THEN 'source_drift' END,
     CASE WHEN s.kind='raw' AND s.purged_at IS NOT NULL AND s.purged_at<>s.deleted_at THEN 'purged_at_differs' END,

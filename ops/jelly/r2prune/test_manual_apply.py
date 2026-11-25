@@ -57,7 +57,7 @@ at = open(S + '/r2prune.at').read().strip()
 with open(opt('--ledger'), 'w') as f:
     f.write(json.dumps({'type': 'run', 'manifest_sha256': opt('--expected-sha256'), 'inputs_sha256': {'picks': 'p'},
                         'recent_from': '2026-11-18T18:00:00Z', 'limit': limit, 'started_at': at}) + '\n')
-    for k in keys[:limit or None]:
+    for k in keys[:limit or None][:-1 if os.path.exists(S + '/r2prune.drop') else None]:
         f.write(json.dumps({'key': k['key'], 'size': k['size'], 'outcome': 'deleted', 'at': at}) + '\n')
 sys.exit(int(open(S + '/r2prune.rc').read()) if os.path.exists(S + '/r2prune.rc') else 0)
 '''
@@ -169,8 +169,27 @@ class ManualApply(unittest.TestCase):
         self.assertEqual(len(list(self.W.glob('ledger-*.jsonl'))), 2)
 
     def test_wrapper_owns_the_ledger(self):
-        with self.assertRaisesRegex(SystemExit, 'owns --ledger'):
-            self.delete('--ledger', 'x.jsonl')
+        for flag in (['--ledger', 'x.jsonl'], ['-ledger', 'x.jsonl'], ['-ledger=x.jsonl']):
+            with self.assertRaisesRegex(SystemExit, 'owns --ledger'):
+                self.delete(*flag)
+        with self.assertRaisesRegex(SystemExit, 'exactly once'):
+            self.delete('-manifest', str(self.manifest))
+        self.assertFalse(any('r2prune' in c for c in self.calls()))
+
+    def test_full_run_with_unlogged_keys_stays_open(self):
+        (self.d / 'r2prune.drop').write_text('')
+        with self.assertRaisesRegex(SystemExit, '1 planned keys have no final ledger outcome'):
+            self.delete()
+        result = json.loads((self.W / 'receipt-result.json').read_text())
+        self.assertEqual((result['complete'], result['deleted_receipts'], result['unresolved']), (False, 1, 1))
+        (self.d / 'r2prune.drop').unlink()
+        self.delete()
+        self.assertTrue(json.loads((self.W / 'receipt-result.json').read_text())['complete'])
+
+    def test_canary_leaves_the_intent_open_without_failing(self):
+        self.delete('--limit', '1')
+        result = json.loads((self.W / 'receipt-result.json').read_text())
+        self.assertEqual((result['complete'], result['unresolved']), (False, 1))
 
     def test_manifest_digest_must_match(self):
         self.digest = '0' * 64

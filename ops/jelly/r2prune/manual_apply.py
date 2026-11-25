@@ -31,6 +31,7 @@ DEFAULTS = {
 BUCKET = 'stoarama'
 COLLATED = ('joined/goodplus-', 'joined/nightly-collation-v2/', 'joined/best14-20261021/')
 OUTCOMES = {'deleted', 'failed', 'skipped_protected', 'skipped_changed'}
+FINAL = OUTCOMES - {'failed'}  # a failed DELETE may still have removed the object
 
 
 def sha(path):
@@ -177,8 +178,9 @@ def ts(s):
 
 
 def ledger_deletes(W, manifest, manifest_sha):
-    """Earliest acknowledged delete per key across every ledger in W, and the run policy digest."""
-    deleted, policies = {}, set()
+    """Earliest acknowledged delete per key across every ledger in W, the keys with a final
+    outcome, and the run policy digest."""
+    deleted, final, policies = {}, set(), set()
     for path in sorted(Path(W).glob('ledger-*.jsonl')):
         with open(path, 'rb') as f:
             os.fsync(f.fileno())
@@ -196,11 +198,13 @@ def ledger_deletes(W, manifest, manifest_sha):
                 row = json.loads(line)
                 if row['key'] not in manifest or row['size'] != manifest[row['key']]['size'] or row['outcome'] not in OUTCOMES:
                     raise SystemExit(f'{path}: unexpected ledger row for {row["key"]}')
+                if row['outcome'] in FINAL:
+                    final.add(row['key'])
                 if row['outcome'] == 'deleted' and (row['key'] not in deleted or ts(row['at']) < ts(deleted[row['key']])):
                     deleted[row['key']] = row['at']
     if len(policies) > 1:
         raise SystemExit(f'{W}: ledgers disagree on the run policy')
-    return deleted, policies.pop() if policies else None
+    return deleted, final, policies.pop() if policies else None
 
 
 def receipt_rows(deleted, manifest, sources, manifest_sha, policy_sha):
@@ -221,7 +225,7 @@ def preflight(cfg, W, manifest, sources, manifest_sha):
     """dry-run.sql's checks on every planned key not yet deleted from W, as if deleted now:
     any refusal stops before DELETE. Keys an earlier ledger in W deleted already have receipts."""
     now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-    done, _ = ledger_deletes(W, manifest, manifest_sha)
+    done, _, _ = ledger_deletes(W, manifest, manifest_sha)
     tsv = receipt_rows({k: now for k in manifest if k not in done}, manifest, sources, manifest_sha, '0' * 64)
     path = Path(W, 'preflight')
     path.mkdir(exist_ok=True)
@@ -252,36 +256,42 @@ def apply_receipts(cfg, W, total):
 
 
 def finish_receipts(cfg, W):
+    """Receipts for every acknowledged delete in W. The intent closes only when every
+    manifest key has a final ledger outcome; returns how many still lack one."""
     intent = json.loads(Path(W, 'delete-intent.json').read_text())
     if sha(intent['manifest']) != intent['manifest_sha256'] or sha(Path(W, 'receipt-sources.json')) != intent['sources_sha256']:
         raise SystemExit(f'{W}: manifest or receipt sources changed since the intent')
     manifest = read_manifest(intent['manifest'])
     sources = json.loads(Path(W, 'receipt-sources.json').read_text())
-    deleted, policy_sha = ledger_deletes(W, manifest, intent['manifest_sha256'])
+    deleted, final, policy_sha = ledger_deletes(W, manifest, intent['manifest_sha256'])
     durable_write(Path(W, 'receipt-backfill.tsv'), receipt_rows(deleted, manifest, sources, intent['manifest_sha256'], policy_sha))
     if deleted:
         apply_receipts(cfg, W, len(deleted))
+    unresolved = len(manifest.keys() - final)
     durable_write(Path(W, 'receipt-result.json'), json.dumps({
-        'complete': True, 'deleted_receipts': len(deleted), 'manifest_sha256': intent['manifest_sha256'],
-        'at': datetime.datetime.now(datetime.timezone.utc).isoformat()}) + '\n')
-    print(json.dumps({'workdir': str(W), 'deleted_receipts': len(deleted)}))
+        'complete': unresolved == 0, 'deleted_receipts': len(deleted), 'unresolved': unresolved,
+        'manifest_sha256': intent['manifest_sha256'], 'at': datetime.datetime.now(datetime.timezone.utc).isoformat()}) + '\n')
+    print(json.dumps({'workdir': str(W), 'deleted_receipts': len(deleted), 'unresolved': unresolved}))
+    return unresolved
 
 
-def option(args, name):
+def options(args, name):
+    """Every value Go's flag package would read for -name or --name."""
+    values = []
     for i, a in enumerate(args):
-        if a == name and i + 1 < len(args):
-            return args[i + 1]
-        if a.startswith(name + '='):
-            return a.split('=', 1)[1]
-    return None
+        flag, eq, value = a.partition('=')
+        if flag in ('-' + name, '--' + name):
+            values.append(value if eq else args[i + 1] if i + 1 < len(args) else '')
+    return values
 
 
 def delete(cfg, W, args, lock_fd):
-    manifest_path, expected = option(args, '--manifest'), option(args, '--expected-sha256')
-    if option(args, '--ledger') is not None:
+    if options(args, 'ledger'):
         raise SystemExit('the wrapper owns --ledger; do not pass it')
-    if not manifest_path or not expected:
-        raise SystemExit('--manifest and --expected-sha256 are required')
+    manifests, expecteds = options(args, 'manifest'), options(args, 'expected-sha256')
+    if len(manifests) != 1 or len(expecteds) != 1 or not manifests[0] or not expecteds[0]:
+        raise SystemExit('pass --manifest and --expected-sha256 exactly once')
+    manifest_path, expected = manifests[0], expecteds[0]
     manifest_path = str(Path(manifest_path).resolve())
     if sha(manifest_path) != expected:
         raise SystemExit('manifest digest differs from --expected-sha256')
@@ -291,7 +301,8 @@ def delete(cfg, W, args, lock_fd):
         intent = json.loads(intent_path.read_text())
         if intent['manifest_sha256'] != expected:
             raise SystemExit(f'{W} is bound to another manifest; use a new workdir')
-        if not Path(W, 'receipt-result.json').exists():
+        result = Path(W, 'receipt-result.json')
+        if not result.exists() or not json.loads(result.read_text())['complete']:
             finish_receipts(cfg, W)
         sources = json.loads(Path(W, 'receipt-sources.json').read_text())
         manifest = read_manifest(manifest_path)
@@ -306,9 +317,12 @@ def delete(cfg, W, args, lock_fd):
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     run = subprocess.run([cfg.r2prune, 'delete', '--ledger', str(Path(W, f'ledger-{stamp}.jsonl'))] + args,
                          env=env_file(cfg.r2_env), pass_fds=(lock_fd,))
-    finish_receipts(cfg, W)
+    unresolved = finish_receipts(cfg, W)
     if run.returncode:
         raise SystemExit(f'r2prune delete exited {run.returncode}; receipts for its acknowledged deletes are written')
+    if unresolved and options(args, 'limit') in ([], ['0']):
+        raise SystemExit(f'{unresolved} planned keys have no final ledger outcome (unlogged or failed); '
+                         'rerun the same command with the same --fresh-listing')
 
 
 def main(argv):
