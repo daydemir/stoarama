@@ -97,9 +97,9 @@ All are code constants (raising one is a reviewed code change) and fail closed:
   (raw) or the output bounds confirmed by the dated path (collated), and
   refuses a certified-stitch item on a keep-everything stream, keep-window overlap, unknown
   folder/bounds or a disagreeing server `stream_id`. The server's rolling 24 h
-  budget is gone; the client's local rolling 24 h caps (400,000 files / 5 TB)
-  remain until the next NAS client release removes them. After that, the
-  server's per-plan bound and one-plan-at-a-time rule are the only size limits. Every unlink is bracketed
+  budget is gone, and the `r2-copy-v8-tunable-copy` client release drops the
+  client's local rolling 24 h caps (400,000 files / 5 TB). The server's
+  per-plan bound and one-plan-at-a-time rule are the only size limits. Every unlink is bracketed
   by fsynced intent and
   result lines in `/state/cleanup-deletions.jsonl` (append-only). A media unlink
   whose sidecar step failed is receipted `media_deleted_sidecar_failed`.
@@ -326,8 +326,8 @@ gates above changed; the work each gate costs and the approval granularity did.
   single-item replays, each downloading inside its transaction.)
 - **Protocol 2** (`lease` with `protocol: 2`, `observe-batch`, `result-batch`):
   up to 64 tasks per lease, observations and receipts batched up to 64 per
-  request. Execution work is leased only within the client's remaining local
-  24 h caps when the client still sends them; the server has no 24 h budget.
+  request. Execution work is leased within the allowance the client sends (one
+  bounded group); neither side keeps a 24 h budget.
   A lease never mixes dry-run and execution tasks.
   Every request is retry-safe: a lease `request_id` returns the same leased
   tasks; an observation `request_id` returns the recorded decision, or for an

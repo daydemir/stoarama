@@ -7,6 +7,7 @@ import pathlib
 import urllib.error
 import io
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'ops/jelly/finish'))
@@ -277,6 +278,224 @@ class Keep28PlanTests(unittest.TestCase):
         self.assertIn('col AS MATERIALIZED', sql)
         self.assertIn('c.recording_id=r.id OFFSET 0', sql)
         self.assertIn('f.connection_id=13 AND f.clip_id=c.id OFFSET 0', sql)
+
+
+def plaza(date, hhmmss='103000', folder='99991_asia_japan_tokyo_shinjuku9'):
+    month, weekday = k.MONTHS[date.month - 1], k.WEEKDAYS[date.weekday()]
+    return '%s/%s/%02d-%s/p_x_%04d_%s_W%d_%s_hour_%s.mp4' % (
+        folder, month, date.day, weekday, date.year, month, (date.day - 1) // 7 + 1, weekday, hhmmss)
+
+
+def clip(date, size=10, held=False, hhmmss='103000', folder='99991_asia_japan_tokyo_shinjuku9', cid=0, catalogued=None, raw_key=None,
+         zone='Asia/Tokyo', seen='2026-11-01T00:00:00+00:00'):
+    start = k.datetime.datetime.combine(date, k.datetime.time(10, 30), k.zoneinfo.ZoneInfo(zone))
+    end = start + k.datetime.timedelta(minutes=1)
+    return [plaza(date, hhmmss, folder), start.isoformat(), end.isoformat(), held, size, cid,
+            size if catalogued is None else catalogued, raw_key, seen]
+
+
+SEOUL = '04_Asia_South_Korea_Seoul_Daechi_Station_Intersection'  # Stream 78, Keep Everything: Seoul [2026-08-24, 2026-09-13).
+
+
+def ke_clip(date, cid, size=10, hhmmss='103000', **kw):
+    return clip(date, size, hhmmss=hhmmss, folder=SEOUL, cid=cid, zone='Asia/Seoul', **kw)
+
+
+class DayPlanTests(unittest.TestCase):
+    def setUp(self):
+        self.policy = k.load_policy(k.POLICY_PATH)  # Stream 3 keeps Tokyo [2026-09-16, 2026-10-06).
+        self.folders = k.load_folders()
+        self.d = k.datetime.date
+
+    def facts(self, *clips, claimed=(), held_dirs=(), outputs=()):
+        return dict(clips=list(clips), outputs=[list(x) for x in outputs], claimed=[list(x) for x in claimed],
+                    held_dirs=list(held_dirs), keep20_active=True)
+
+    def units(self, w, facts, listed=None):
+        return k.day_units(w, self.folders, facts, listed)[0]
+
+    def test_units_are_outside_unheld_non_keep_everything_directory_days(self):
+        out = self.d(2026, 9, 12)
+        facts = self.facts(clip(out, 10), clip(out, 20, hhmmss='113000'), clip(out, -1, hhmmss='123000'),
+                           clip(self.d(2026, 9, 15)), clip(self.d(2026, 9, 20)), clip(self.d(2026, 10, 6)),
+                           clip(self.d(2026, 10, 7), 5), clip(self.d(2026, 10, 10), held=True))
+        units = self.units(self.policy[3], facts)
+        self.assertEqual([(u['local_date'], u['files'], u['bytes']) for u in units], [('2026-09-12', 2, 30), ('2026-10-07', 1, 5)])
+        self.assertEqual(units[0]['relative_dir'], '99991_asia_japan_tokyo_shinjuku9/September/12-Saturday')
+        self.assertNotIn('names', units[0])
+        for state in ('pending', 'permitted', 'deleted'):
+            self.assertEqual(self.units(self.policy[3], self.facts(clip(out), claimed=[(units[0]['relative_dir'], '2026-09-12', state, None, '2026-11-02T00:00:00Z')])), [])
+        self.assertEqual(self.units(self.policy[3], self.facts(clip(out), held_dirs=[units[0]['relative_dir']])), [])
+        self.assertEqual(self.units(self.policy[3], dict(self.facts(clip(out)), keep20_active=False)), [])
+
+    def test_foreign_folders_yield_nothing(self):
+        facts = self.facts(clip(self.d(2026, 10, 10), folder=SEOUL))
+        self.assertEqual(self.units(self.policy[3], facts), [])
+
+    def test_keep_everything_units_name_only_media_with_a_listed_r2_counterpart(self):
+        ke = self.policy[78]
+        self.assertTrue(ke['keep_everything'])
+        out = self.d(2026, 9, 20)
+        facts = self.facts(
+            ke_clip(out, 1, raw_key='managed/a/1.mp4'),                         # raw listed, same size: named
+            ke_clip(out, 2, hhmmss='113000'),                                   # no counterpart: stays
+            ke_clip(out, 3, hhmmss='123000', raw_key='managed/a/3.mp4'),        # raw listed with another size: stays
+            ke_clip(out, 4, hhmmss='133000', raw_key='managed/a/4.mp4'),        # raw not listed: stays
+            ke_clip(out, 5, hhmmss='143000'),                                   # stitched output listed: named
+            ke_clip(out, 6, hhmmss='153000', raw_key='managed/a/6.mp4', catalogued=11),  # NAS size differs from the clip
+            ke_clip(out, 7, hhmmss='163000', size=-1, raw_key='managed/a/7.mp4'),        # not on the NAS
+            outputs=[('joined/goodplus-x/objects/' + 'a' * 64 + '.mp4', 900, [5, 8]),
+                     ('joined/goodplus-x/objects/' + 'b' * 64 + '.mp4', 800, [3])])
+        listing = {'managed/a/1.mp4': 10, 'managed/a/3.mp4': 99, 'managed/a/6.mp4': 11,
+                   'joined/goodplus-x/objects/' + 'a' * 64 + '.mp4': 900, 'joined/goodplus-x/objects/' + 'b' * 64 + '.mp4': 1}
+        asked = []
+        units, excluded = k.day_units(ke, self.folders, facts, lambda keys: asked.append(keys) or {x: listing[x] for x in keys if x in listing})
+        [unit] = units
+        self.assertEqual([n['name'] for n in unit['names']], [plaza(out, h, SEOUL).rsplit('/', 1)[1] for h in ('103000', '143000')])
+        self.assertEqual((unit['files'], unit['bytes'], unit['names'][0]['size_bytes']), (2, 20, 10))
+        self.assertEqual(excluded, {'files': 4, 'bytes': 40})
+        self.assertEqual(len(asked), 1)
+        self.assertNotIn('managed/a/7.mp4', asked[0])
+        # A deleted KE unit's name stays out until the NAS reports the file again after the deletion
+        # (a kept size mismatch); its other names are planned again.
+        lister = lambda keys: {x: listing[x] for x in keys if x in listing}
+        deleted = lambda at: dict(facts, claimed=[[unit['relative_dir'], '2026-09-20', 'deleted', unit['names'][:1], at]])
+        again = self.units(ke, deleted('2026-11-02T00:00:00Z'), lister)
+        self.assertEqual([n['name'] for n in again[0]['names']], [unit['names'][1]['name']])
+        self.assertEqual(self.units(ke, deleted('2026-10-31T00:00:00Z'), lister), units)
+        self.assertEqual(self.units(ke, dict(facts, claimed=[[unit['relative_dir'], '2026-09-20', 'pending', unit['names'][:1],
+                                                             '2026-11-02T00:00:00Z']]), lister), [])
+
+    def test_keep_everything_window_and_boundary_days_are_never_planned(self):
+        ke, everything = self.policy[78], (lambda keys: {x: 10 for x in keys})
+        days = {self.d(2026, 8, 22): True, self.d(2026, 8, 23): False, self.d(2026, 8, 24): False, self.d(2026, 9, 1): False,
+                self.d(2026, 9, 12): False, self.d(2026, 9, 13): False, self.d(2026, 9, 14): True}
+        facts = self.facts(*[ke_clip(d, n, raw_key='managed/a/%d.mp4' % n) for n, d in enumerate(days)])
+        self.assertEqual(sorted(u['local_date'] for u in self.units(ke, facts, everything)),
+                         sorted(d.isoformat() for d, ok in days.items() if ok))
+
+    def test_keep_everything_plans_split_under_the_name_cap(self):
+        unit = {'relative_dir': SEOUL + '/September/20-Sunday', 'local_date': '2026-09-20', 'stream_id': 78, 'files': 2, 'bytes': 20,
+                'names': [{'name': 'a.mp4', 'size_bytes': 10}, {'name': 'b.mp4', 'size_bytes': 10}]}
+        with patch.object(k, 'MAX_DAY_NAMES', 3):
+            plans = k.day_plans([unit, dict(unit, local_date='2026-09-21'), dict(unit, local_date='2026-09-22')], 'kday', 1000)
+        self.assertEqual([len(p['units']) for p in plans], [1, 1, 1])
+
+    def test_undated_catalogue_name_refuses_its_directory(self):
+        out = self.d(2026, 9, 12)
+        odd = clip(out)
+        odd[0] = odd[0].rsplit('/', 1)[0] + '/renamed.mp4'
+        self.assertEqual(self.units(self.policy[3], self.facts(clip(out), odd)), [])
+
+    def test_plans_carry_checkable_totals_and_the_server_digest(self):
+        unit = {'relative_dir': 'a/September/12-Saturday', 'local_date': '2026-09-12', 'stream_id': 3, 'files': 2, 'bytes': 300}
+        # Golden digest shared with backend cleanupDayDigest.
+        self.assertEqual(k.day_digest([unit]), '9116c84bd7061b32fa4560b4d0eeafafb47928ed9482772d4ae6d6e2cca5feb3')
+        self.assertEqual(k.day_digest([dict(relative_dir='a/September/12-Saturday', local_date='2026-09-12', stream_id=78, files=2, bytes=300, names=[dict(name='a.mp4', size_bytes=100), dict(name='b.mp4', size_bytes=200)])]), 'e49626b3909930c3726bae74feccaae438249f9a49dc43c9ada3a2877e8e98f9')
+        units = [dict(unit, local_date='2026-09-%02d' % n, files=n, bytes=10 * n) for n in range(1, 6)]
+        plans = k.day_plans(units, 'kday', 2)
+        self.assertEqual([p['label'] for p in plans], ['kday-s3-day-0001', 'kday-s3-day-0002', 'kday-s3-day-0003'])
+        self.assertEqual([(p['files'], p['bytes']) for p in plans], [(3, 30), (7, 70), (5, 50)])
+        self.assertTrue(all(p['plan_sha256'] == k.day_digest(p['units']) and p['policy_sha256'] == k.POLICY_SHA for p in plans))
+        detail = dict(id=9, label=plans[0]['label'], plan_sha256=plans[0]['plan_sha256'], mode='dry_run', policy_sha256=k.POLICY_SHA,
+                      files=3, bytes=30, units=[dict(u, state='pending', receipts=[]) for u in plans[0]['units']])
+        k.validate_day_admission(plans[0], dict(id=9, plan_sha256=plans[0]['plan_sha256']), detail)
+        with self.assertRaises(RuntimeError):
+            k.validate_day_admission(plans[0], dict(id=9, plan_sha256=plans[0]['plan_sha256']), dict(detail, files=4))
+
+    def test_day_dates_match_server_and_client(self):
+        tokyo = k.zoneinfo.ZoneInfo('Asia/Tokyo')
+        self.assertEqual(k.day_file_date('recordings/366/continuous', '1789227000.mp4', tokyo), self.d(2026, 9, 13))
+        self.assertEqual(k.day_file_date('recordings/366/77', '1789227000000.mp4', tokyo), self.d(2026, 9, 13))
+        self.assertIsNone(k.day_file_date('recordings/366/77', '1789227000.mp4', tokyo))
+        self.assertEqual(k.pg_timestamp('2026-09-12T01:30:00.5+00:00').microsecond, 500000)
+
+
+
+class DayAdmissionReconcileTests(unittest.TestCase):
+    """A 5xx or transport failure can follow a committed admission; read the label back first."""
+    def setUp(self):
+        unit = {'relative_dir': 'recordings/386/continuous', 'local_date': '2026-09-22', 'stream_id': 293, 'files': 2, 'bytes': 300}
+        self.plan = k.day_plans([unit], 'kday-x', 1)[0]
+
+    def err(self, code, body=b'{"error":"refused"}'):
+        return urllib.error.HTTPError('/day-plans', code, 'x', {}, io.BytesIO(body))
+
+    def admit(self, posts, reads):
+        with patch.object(k, 'service', side_effect=posts) as post, patch.object(k, 'query', side_effect=reads) as read, \
+             patch.object(k.time, 'sleep') as sleep:
+            try:
+                return k.day_admit('https://example.invalid', self.plan, 'psql'), post.call_count, read.call_count, sleep.call_count
+            except RuntimeError as exc:
+                return exc, post.call_count, read.call_count, sleep.call_count
+
+    def test_committed_admission_behind_a_5xx_or_transport_failure_is_adopted(self):
+        for failure in (self.err(502), self.err(504), urllib.error.URLError('reset'), TimeoutError(), ConnectionResetError()):
+            with self.subTest(failure=failure):
+                self.assertEqual(self.admit([failure], [[[11, self.plan['plan_sha256']]]]), ((11, None), 1, 1, 0))
+
+    def test_uncommitted_admission_is_retried_with_backoff(self):
+        self.assertEqual(self.admit([self.err(502), self.err(503), {'id': 12}], [[], []]), ((12, None), 3, 2, 2))
+
+    def test_conflict_after_our_own_in_flight_commit_is_adopted_not_a_rejection(self):
+        self.assertEqual(self.admit([self.err(502), self.err(409)], [[], [[11, self.plan['plan_sha256']]]]), ((11, None), 2, 2, 1))
+
+    def test_real_refusals_and_identity_mismatches_fail_safe(self):
+        (pid, refusal), posts, reads, sleeps = self.admit([self.err(409)], [[]])
+        self.assertEqual((pid, refusal.code, posts, reads, sleeps), (None, 409, 1, 1, 0))
+        cases = {'refused for': ([self.err(400)], []), 'another digest': ([self.err(502)], [[[11, 'f' * 64]]]),
+                 'could not be read back': ([self.err(409)], [k.ReadFailed('timeout')])}
+        for message, (posts, reads) in cases.items():
+            with self.subTest(message):
+                exc, _, _, sleeps = self.admit(posts, reads)
+                self.assertIn(message, str(exc))
+                self.assertEqual(sleeps, 0)
+        n = len(k.ADMISSION_RETRY_DELAYS)
+        exc, posts, reads, sleeps = self.admit([self.err(502)] * n, [[]] * (n - 1) + [k.ReadFailed('timeout')])
+        self.assertIn('not confirmed', str(exc))
+        self.assertEqual((posts, reads, sleeps), (n, n, n - 1))
+
+    def test_day_main_adopts_and_records_the_receipt(self):
+        detail = dict(id=11, label=self.plan['label'], plan_sha256=self.plan['plan_sha256'], mode='dry_run', policy_sha256=k.POLICY_SHA,
+                      files=2, bytes=300, units=[dict(u, state='pending', receipts=[]) for u in self.plan['units']])
+        a = SimpleNamespace(max_units=1000, out=None, stream=[293], psql='psql', summary_only=False, max_plans=1,
+                            label_prefix='kday-x', submit=True, api='https://example.invalid', r2prune=None, bucket='stoarama')
+        with tempfile.TemporaryDirectory() as out, patch.object(k, 'load_folders', return_value={}), \
+             patch.object(k, 'day_stream_rows', return_value={}), \
+             patch.object(k, 'day_units', return_value=(self.plan['units'], {'files': 0, 'bytes': 0})), \
+             patch.object(k, 'service', side_effect=[self.err(502), detail]), \
+             patch.object(k, 'query', return_value=[[11, self.plan['plan_sha256']]]), patch('builtins.print'):
+            a.out = out
+            self.assertEqual(k.day_main(a, {293: {'keep_everything': False}}), 0)
+            summary = json.loads((Path(out) / 'summary.json').read_text())
+        self.assertEqual([x['id'] for x in summary['receipts']], [11])
+
+    def test_day_main_lists_keep_everything_last_and_needs_a_lister(self):
+        a = SimpleNamespace(max_units=1000, out=None, stream=[], psql='psql', summary_only=True, max_plans=0,
+                            label_prefix='kday-x', submit=False, r2prune=None, bucket='stoarama')
+        policy = {5: {'keep_everything': True}, 9: {'keep_everything': False}, 7: {'keep_everything': False}}
+        seen = []
+        with tempfile.TemporaryDirectory() as out, patch.object(k, 'load_folders', return_value={}), \
+             patch.object(k, 'day_stream_rows', return_value={}), patch('builtins.print'), \
+             patch.object(k, 'day_units', side_effect=lambda w, f, facts, listed: seen.append(listed) or ([], {'files': 0, 'bytes': 0})):
+            a.out = out
+            with self.assertRaises(SystemExit):
+                k.day_main(a, policy)
+            self.assertEqual(seen, [None, None])  # 7 and 9 ran before Keep Everything stream 5 refused.
+            a.r2prune = '/bin/false'
+            self.assertEqual(k.day_main(a, policy), 0)
+            self.assertTrue(callable(seen[-1]))
+
+    def test_r2_listing_lists_only_the_wanted_roots(self):
+        with tempfile.TemporaryDirectory() as out:
+            path = Path(out) / 'listing.tsv'
+            def run(argv, **kw):
+                self.assertEqual(argv[argv.index('--out') + 1], str(path))
+                self.assertEqual([argv[i + 1] for i, x in enumerate(argv) if x == '--prefix'], ['joined/g/objects/', 'managed/a/b/'])
+                path.write_text('managed/a/b/c/1.mp4\t10\t"e"\t1\nmanaged/a/b/c/2.mp4\t5\t"e"\t1\njoined/g/objects/x.mp4\t9\t"e"\t1\n')
+            with patch.object(k.subprocess, 'run', side_effect=run):
+                sizes = k.r2_listing('r2prune', path)({'managed/a/b/c/1.mp4', 'joined/g/objects/x.mp4'})
+        self.assertEqual(sizes, {'managed/a/b/c/1.mp4': 10, 'joined/g/objects/x.mp4': 9})
 
 
 if __name__ == '__main__':

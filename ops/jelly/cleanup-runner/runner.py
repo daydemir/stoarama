@@ -24,9 +24,10 @@ import threading
 import tempfile
 from contextlib import contextmanager
 from fractions import Fraction
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import urllib.error
 import urllib.request
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cli_binding import bound_launcher, ContractError as CLIBindingError
@@ -36,7 +37,35 @@ POLICY = 'backend/internal/api/nas_cleanup_keep20_policy.json'
 POLICY_SHA = 'bcc670a34024c2f8e2ba3df2566397f370d03e93ff33a7bb828c4b83eb123393'
 # Mirrors the server's nasCleanupMaxPlanBytes; the server re-checks every plan.
 PLAN_CAP = 2_000_000_000_000
+# Client-aborted execution groups tolerated without a new settled item. A
+# deterministic abort (e.g. a proof shape the executing release cannot match)
+# otherwise re-leases and aborts the same files every minute until approval ends.
+ABORT_LIMIT = 3
 RECOVERY = {'r2_sha_verified', 'r2_md5_etag_matched', 'r2_name_size_matched'}
+# Day-directory NAS-only cleanup (--day-plans). Owner, verbatim: "yes, delete";
+# "if its outside of keep everything, then a nas copy only needs to be checked
+# if its in the keep 20? otherwise it can be deleted right?"; "lift nas cleanup
+# dialy limit please".
+# Keep Everything (verbatim: "nas shoul dnot have any of the keep everything
+# (except the keep 20)"): KE streams come after the others, and a KE unit names
+# only media whose R2 counterpart is live and listed with the same size.
+DAY_REASON = ('Deniz approval (verbatim: "yes, delete"; "nas shoul dnot have any of the keep everything (except the keep 20)"): '
+              'NAS raw day directories outside the pinned 20-day window; server and independent folder/window/hold check PASS; '
+              'Keep Everything days name only media with a live same-size R2 counterpart; no daily cap; one owned plan.')
+R2PRUNE = Path.home() / 'stoarama-r2prune-lane' / 'r2prune'
+FOLDERS = 'backend/internal/api/nas_cleanup_folder_streams.json'
+FOLDERS_SHA = '94efc6fe9f0b83db55be31d4c2fad7f47cff781fd01d88bc33c4c90cae0e7ab8'
+DAY_MAX_UNITS = 1000
+# Streams skipped after an evidenced atomic admission 409, kept per mode: a per-file
+# refusal (e.g. a source hold) never skips a stream's day plans, nor the reverse.
+FILE_EXCLUSIONS, DAY_EXCLUSIONS = 'excluded_streams', 'day_excluded_streams'
+EXCLUSIONS = (FILE_EXCLUSIONS, DAY_EXCLUSIONS)
+DAY_TERMINAL = {'deleted', 'refused', 'client_refused', 'retired'}
+_MONTHS = ('January', 'February', 'March', 'April', 'May', 'June', 'July',
+           'August', 'September', 'October', 'November', 'December')
+_WEEKDAYS = ('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')
+DAY_PLAZA_DIR = re.compile(r'(?:[^/]+/)+(%s)/(0[1-9]|[12][0-9]|3[01])-(%s)' % ('|'.join(_MONTHS), '|'.join(_WEEKDAYS)))
+DAY_FLAT_DIR = re.compile(r'(?:[^/]+/)+[1-9][0-9]*/(?:continuous|[1-9][0-9]*)')
 REASON = ('Deniz standing approval (window 20): NAS files outside the pinned 20-day window only; '
           'server dry run + independent verification PASS; verified R2 copies retained; '
           'one owned plan; controller-managed global master.')
@@ -60,6 +89,10 @@ class CommandFailed(Halt):
 
 class RequestConflict(Halt):
     """The server refused a mutation with HTTP 409."""
+
+
+class MutationUnconfirmed(Halt):
+    """A mutation's outcome is unknown (transport failure or HTTP 408/429/5xx): the server may have committed it."""
 
 
 class LockHeld(Exception):
@@ -199,6 +232,78 @@ def execution_state(plan):
     return 'running'
 
 
+def day_digest(units):
+    """The backend's cleanupDayDigest, computed here independently."""
+    text = 'stoarama-nas-cleanup-day-v1\npolicy %s\n' % POLICY_SHA
+    for u in units:
+        text += 'unit %d %s %d %d %s\n' % (u['stream_id'], u['local_date'], u['files'], u['bytes'], u['relative_dir'])
+        text += ''.join('name %d %s\n' % (n['size_bytes'], n['name']) for n in u.get('names') or ())
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def day_folder_key(directory):
+    parts = directory.split('/')
+    if parts[0] == 'joined':
+        return None
+    return 'recordings/' + parts[1] if parts[0] == 'recordings' and len(parts) > 1 else parts[0]
+
+
+def day_outside(window, tz, day):
+    """Whole local day outside the pinned window, a full guard day from it each side."""
+    zone = ZoneInfo(tz)
+    first, last = window[0].astimezone(zone).date(), (window[1] - timedelta(microseconds=1)).astimezone(zone).date()
+    return day <= first - timedelta(days=2) or day >= last + timedelta(days=2)
+
+
+def day_verify(plan, windows, timezones, keep_everything, folders, catalog):
+    """Independent per-directory check of an admitted, never-started day plan."""
+    require(plan['mode'] == 'dry_run' and plan['policy_sha256'] == POLICY_SHA, 'day plan mode or policy differs')
+    units = plan['units']
+    require(0 < len(units) <= DAY_MAX_UNITS and [u['ordinal'] for u in units] == list(range(1, len(units) + 1)),
+            'day plan units incomplete')
+    require(day_digest(units) == plan['plan_sha256'], 'day plan digest differs')
+    require(all(type(u['files']) is int and u['files'] > 0 and type(u['bytes']) is int and u['bytes'] > 0 for u in units)
+            and sum(u['files'] for u in units) == plan['files'] and sum(u['bytes'] for u in units) == plan['bytes'],
+            'day plan totals differ from its units')
+    rows = {(c['relative_dir'], c['local_date']): c for c in catalog}
+    require(len(rows) == len(catalog) == len(units), 'day catalog row missing or duplicated')
+    for u in units:
+        require(u['state'] == 'pending' and u['attempt'] == 0 and u['receipts'] == [], 'day unit already started')
+        sid, directory = u['stream_id'], u['relative_dir']
+        require(sid in windows, 'day unit stream is unpinned')
+        names = u.get('names') or []
+        require((sid in keep_everything) == bool(names), 'a Keep Everything unit names its media; any other unit names none')
+        require(all(type(n['size_bytes']) is int and n['size_bytes'] > 0 for n in names)
+                and [n['name'] for n in names] == sorted({n['name'] for n in names})
+                and (not names or (len(names), sum(n['size_bytes'] for n in names)) == (u['files'], u['bytes'])),
+                'Keep Everything names are not distinct ascending media totalling the unit')
+        require(folders.get(day_folder_key(directory)) == sid, 'reviewed folder map does not assign the directory')
+        day = date.fromisoformat(u['local_date'])
+        plaza = DAY_PLAZA_DIR.fullmatch(directory)
+        require(bool(plaza) or bool(DAY_FLAT_DIR.fullmatch(directory)), 'directory is not a dated raw NAS layout')
+        require(not plaza or (plaza[1], int(plaza[2]), plaza[3]) == (_MONTHS[day.month - 1], day.day, _WEEKDAYS[day.weekday()]),
+                'directory does not name the local date')
+        require(day_outside(windows[sid], timezones[sid], day), 'directory-day is inside or adjacent to the pinned keep window')
+        row = rows.get((directory, u['local_date']))
+        require(row is not None and row['held'] == 0 and row['overlap'] == 0 and row['dir_held'] is False,
+                'directory-day has a held or in-window catalogued clip')
+        require(row['unlive'] == 0, 'a Keep Everything name lacks a live same-size R2 counterpart in the catalogue')
+    require(len({u['stream_id'] for u in units}) == 1, 'day plan must be one stream')
+    return plan['bytes']
+
+
+def day_state(plan, now):
+    units = plan['units']
+    if any(u['state'] == 'client_refused' for u in units):
+        return 'anomaly'  # The NAS client disagreed with a server permit.
+    if plan['mode'] == 'retired' or all(u['state'] in DAY_TERMINAL for u in units):
+        return 'done'
+    if plan['mode'] == 'paused':
+        return 'stopped'
+    require(plan['mode'] == 'enabled', 'day plan left enabled mode unexpectedly')
+    return 'expired' if timestamp(plan['approved_until']) <= now else 'running'
+
+
 def human_size(value):
     value = int(value or 0)
     return '{:,.1f} {}'.format(value / (10**12 if value >= 10**12 else 10**9),
@@ -274,6 +379,9 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise Halt('HTTP redirect refused')
 
 
+TRANSIENT_HTTP = {408, 429, 500, 502, 503, 504}
+
+
 def request(url, token, method='GET', body=None):
     req = urllib.request.Request(url, method=method,
         data=None if body is None else json.dumps(body).encode(), headers={
@@ -286,12 +394,12 @@ def request(url, token, method='GET', body=None):
             raw = response.read(64 << 20)
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as exc:
-        retry = exc.code in {408, 429, 500, 502, 503, 504}
+        retry = exc.code in TRANSIENT_HTTP
         exc.close()
-        error = RequestConflict if exc.code == 409 else ReadFailure if retry and method == 'GET' else Halt
+        error = RequestConflict if exc.code == 409 else (ReadFailure if method == 'GET' else MutationUnconfirmed) if retry else Halt
         raise error('HTTP request failed (' + method + ')') from None
     except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead):
-        error = ReadFailure if method == 'GET' else Halt
+        error = ReadFailure if method == 'GET' else MutationUnconfirmed
         raise error('HTTP transport failed (' + method + ')') from None
     except Exception:
         # HTTP bodies, subprocess stderr and exception strings can contain credentials.
@@ -338,6 +446,7 @@ class Runner:
         self.owner_validated = False
         self.windows = {}
         self.status = {'current_plan': None, 'last_error': None}
+        self.abort_base = None
 
     def start(self):
         # Collection sees either the old idle state or the new flock+PID, never
@@ -380,12 +489,13 @@ class Runner:
                     and (status.get('next_plan') is None or type(status['next_plan']) is int
                          and status['next_plan'] > 0 and status['next_plan'] != status['current_plan'])
                     and (status['last_error'] is None or isinstance(status['last_error'], str))
-                    and isinstance(status.get('excluded_streams', {}), dict)
-                    and all(re.fullmatch('[1-9][0-9]*', k) and isinstance(v, dict)
-                            and v.get('http_status') == 409 and v.get('stream_id') == int(k)
-                            and isinstance(v.get('reason'), str) and len(v['reason']) <= 2048
-                            and isinstance(v.get('label'), str)
-                            for k, v in status.get('excluded_streams', {}).items())
+                    and all(isinstance(status.get(key, {}), dict)
+                            and all(re.fullmatch('[1-9][0-9]*', k) and isinstance(v, dict)
+                                    and v.get('http_status') == 409 and v.get('stream_id') == int(k)
+                                    and isinstance(v.get('reason'), str) and len(v['reason']) <= 2048
+                                    and isinstance(v.get('label'), str)
+                                    for k, v in status.get(key, {}).items())
+                            for key in EXCLUSIONS)
                     and isinstance(status.get('deferred_streams', {}), dict),
                     'invalid ownership state')
         except Exception:
@@ -402,8 +512,13 @@ class Runner:
         # Keep-everything streams stay whole in R2; their NAS copies use the same
         # window and, like every file here, leave only with a verified R2 copy.
         self.windows = {r['stream_id']: (timestamp(r['start_at']), timestamp(r['end_at'])) for r in rows}
+        self.timezones = {r['stream_id']: r['timezone'] for r in rows}
+        self.keep_everything = {r['stream_id'] for r in rows if r['keep_everything'] is True}
         require(len(self.windows) == 109, 'incomplete pinned policy')
         require((repo / POLICY).read_bytes() == raw, 'checkout keep20 policy differs from origin/main')
+        folders = command(['git', '-C', str(repo), 'show', 'origin/main:' + FOLDERS])
+        require(hashlib.sha256(folders).hexdigest() == FOLDERS_SHA, 'origin/main reviewed folder map differs')
+        self.folders = json.loads(folders)
 
     def save(self, phase, **values):
         require(not self.ownership_unreadable, 'unreadable ownership record must be preserved')
@@ -467,8 +582,8 @@ class Runner:
             self.prepare = module
         return self.prepare
 
-    def prepare_stream(self, sid, args):
-        """Only an evidenced atomic admission 409 may skip a stream."""
+    def prepare_stream(self, sid, args, exclusions=FILE_EXCLUSIONS):
+        """Only an evidenced atomic admission 409 may skip a stream, in its own mode's exclusions."""
         try:
             command([sys.executable, str(self.repo / PREPARER), '--stream', str(sid),
                      '--scope-cache', str(self.root / 'reviewed-scope-cache'), *args],
@@ -484,16 +599,16 @@ class Runner:
                         and isinstance(evidence['label'], str) and evidence['label'].startswith(prefix)
                         and isinstance(evidence['reason'], str) and len(evidence['reason']) <= 2048,
                         'invalid atomic admission rejection evidence')
-                excluded = dict(self.status.get('excluded_streams') or {})
+                excluded = dict(self.status.get(exclusions) or {})
                 excluded[str(sid)] = evidence
-                self.save(self.status.get('phase', 'dry_run'), excluded_streams=excluded)
+                self.save(self.status.get('phase', 'dry_run'), **{exclusions: excluded})
                 self.step_failed('stream excluded after atomic admission rejection', reason='stream ' + str(sid))
                 return False
             raise
         return True
 
-    def stream_ready(self, sid):
-        return str(sid) not in (self.status.get('excluded_streams') or {})
+    def stream_ready(self, sid, exclusions=FILE_EXCLUSIONS):
+        return str(sid) not in (self.status.get(exclusions) or {})
 
     def query(self, sql, step='catalog query'):
         self.preparer()
@@ -519,9 +634,31 @@ class Runner:
                 raise Halt(step + ': invalid database response') from None
         return self.read(step, execute)
 
+    def call(self, method, path, body=None):
+        return request(API + '/api/v1/service/nas-cleanup/' + path, os.environ['SERVICE_TOKEN'], method, body)
+
     def api(self, method, path, body=None):
-        action = lambda: request(API + '/api/v1/service/nas-cleanup/' + path, os.environ['SERVICE_TOKEN'], method, body)
-        return self.read('plan report GET', action) if method == 'GET' else action()
+        return self.read('plan report GET', lambda: self.call('GET', path)) if method == 'GET' else self.call(method, path, body)
+
+    def day_control(self, pid, action, body, target):
+        """POST a day-plan mutation. A 5xx or transport failure may follow a commit (a slow
+        request outlives the proxy), so before any retry or refusal decision read the plan back
+        and accept only the target mode under the same digest."""
+        for delay in SHORT_READ_RETRY_DELAYS:
+            try:
+                return self.api('POST', 'day-plans/%d/%s' % (pid, action), body)
+            except (MutationUnconfirmed, RequestConflict) as exc:
+                refused, error = isinstance(exc, RequestConflict), str(exc)
+            try:
+                p = self.call('GET', 'day-plans/%d' % pid)
+            except ReadFailure:
+                p = None
+            if p and p['id'] == pid and p['plan_sha256'] == body['plan_sha256'] and p['mode'] == target:
+                return p
+            if refused or delay is None:
+                self.step_failed('day plan ' + action + ' unconfirmed', error)
+                raise Halt('day plan ' + action + ' not confirmed')
+            time.sleep(delay)
 
     def plan(self, pid):
         p = self.api('GET', 'plans/' + str(int(pid)))
@@ -530,11 +667,11 @@ class Runner:
         return p
 
     def active(self):
-        return self.query("SELECT json_build_object('plans', (SELECT coalesce(json_agg(id),'[]') FROM nas_cleanup_plans WHERE mode='enabled'), 'batches', (SELECT count(*) FROM nas_cleanup_batches WHERE mode='enabled'))", 'active execution query')
+        return self.query("SELECT json_build_object('plans', (SELECT coalesce(json_agg(id),'[]') FROM nas_cleanup_plans WHERE mode='enabled'), 'batches', (SELECT count(*) FROM nas_cleanup_batches WHERE mode='enabled'), 'day_plans', (SELECT coalesce(json_agg(id),'[]') FROM nas_cleanup_day_plans WHERE mode='enabled'))", 'active execution query')
 
     def idle(self):
         active = self.active()
-        require(not active['plans'] and active['batches'] == 0, 'another plan or batch is enabled')
+        require(not active['plans'] and active['batches'] == 0 and not active.get('day_plans'), 'another plan or batch is enabled')
 
     def alert(self, subject):
         # Must work even when state storage or email delivery is broken.
@@ -565,7 +702,7 @@ class Runner:
             except Exception as exc:
                 transient = isinstance(exc, (ReadFailure, TimeoutError, ConnectionError, urllib.error.URLError))
                 if isinstance(exc, urllib.error.HTTPError):
-                    transient = exc.code in {408, 429, 500, 502, 503, 504}
+                    transient = exc.code in TRANSIENT_HTTP
                 if not transient:
                     raise
                 if delay is None:
@@ -583,6 +720,15 @@ class Runner:
         active = self.active()
         require(active['batches'] == 0 and active['plans'] in ([], [pid]),
                 'unknown enabled plan or batch; owner review required')
+        day = self.status.get('current_day_plan')
+        require(active.get('day_plans', []) in ([], [day]), 'unknown enabled day plan; owner review required')
+        if not enabled and active.get('day_plans'):
+            p = self.day_plan(day)
+            require(self.status.get('started_day_plan_sha256') == p['plan_sha256'], 'day execution ownership digest differs')
+            if p['mode'] == 'enabled':
+                self.day_control(day, 'control', {'plan_sha256': p['plan_sha256'], 'mode': 'paused',
+                                                  'reason': 'cleanup runner stopped; owner recovery required'}, 'paused')
+                require(self.day_plan(day)['mode'] == 'paused', 'owned day pause not confirmed')
         if enabled:
             self.finish_health()
             require(not emergency and not active['plans'] and pid,
@@ -614,7 +760,7 @@ class Runner:
             self.admission = module
         return self.admission
 
-    def enable(self, plan):
+    def enable(self, plan, day=False):
         # D's existing gate orders attempt journals with lane-lock ownership.
         # Acquire the tick lock only after proving no abandoned attempt. Keep
         # the gate through the POST so a new D tick cannot mistake our lock for
@@ -632,9 +778,13 @@ class Runner:
                         require('tick' not in record['active'], 'interrupted finish tick requires reconciliation')
                         if self.stopped():
                             return False
-                        self.api('POST', 'plans/' + str(plan['id']) + '/control', {'mode': 'enabled',
-                            'plan_sha256': plan['plan_sha256'], 'approval_hours': 24,
-                            'allow_long_approval': True, 'reason': REASON})
+                        if day:
+                            self.day_control(plan['id'], 'control', {'mode': 'enabled',
+                                'plan_sha256': plan['plan_sha256'], 'approval_hours': 24, 'reason': DAY_REASON}, 'enabled')
+                        else:
+                            self.api('POST', 'plans/' + str(plan['id']) + '/control', {'mode': 'enabled',
+                                'plan_sha256': plan['plan_sha256'], 'approval_hours': 24,
+                                'allow_long_approval': True, 'reason': REASON})
                         return True
             # Wait outside the gate and snapshot lock, then revalidate before
             # acquiring it again. No active cleanup is waiting here.
@@ -1090,7 +1240,24 @@ class Runner:
         self.save('batch_complete', current_plan=None, started_plan_sha256=None)
         self.progress()
 
+    def client_aborts(self):
+        aborted = self.query("SELECT coalesce((nas_cleanup_status->>'aborted_groups')::bigint,0) FROM connections WHERE id=13",
+                             'cleanup abort query')
+        require(type(aborted) is int and aborted >= 0, 'invalid cleanup abort count')
+        return aborted
+
+    def check_aborts(self, plan):
+        # The client's counter is per process: a restart lowers it and resets
+        # the baseline, as does any item leaving pending/leased.
+        settled = sum(r['state'] not in {'pending', 'leased', 'would_delete'} for r in results(plan))
+        aborted = self.client_aborts()
+        if self.abort_base is None or self.abort_base[0] != settled or aborted < self.abort_base[1]:
+            self.abort_base = (settled, aborted)
+        require(aborted - self.abort_base[1] < ABORT_LIMIT,
+                'cleanup execution keeps aborting without progress; owner review required')
+
     def monitor(self, pid):
+        self.abort_base = None
         while True:
             require(not self.status.get('shutdown_or_recovery_failed') and not self.status.get('recovery_error'),
                     'live ownership failure requires shutdown')
@@ -1114,6 +1281,7 @@ class Runner:
                         'owned running plan missing from active execution')
                 self.finish(p)
                 return
+            self.check_aborts(p)
             if self.status.get('next_plan') is not None:
                 dry_state(self.plan(self.status['next_plan']))  # A failed lookahead stops and alerts too.
             # STOP/SIGTERM drains the active plan naturally; never pause it for deployment.
@@ -1143,6 +1311,7 @@ class Runner:
                     and p['master_deletion_enabled'] is True,
                     'saved enabled plan is unhealthy; owner review required')
         require(not self.status.get('last_error'), 'failure is latched; owner must review before restart')
+        require(not self.status.get('current_day_plan'), 'day cleanup ownership must close before per-file cleanup')
         require(not self.status.get('lookahead_pending'), 'lookahead admission interrupted; owner must reconcile its label before restart')
         self.load_policy()
         require(not self.status.get('deferred_streams'),
@@ -1204,6 +1373,161 @@ class Runner:
             if not self.enable(p):
                 break
             self.monitor(pid)
+        self.save('stopped')
+
+    def day_plan(self, pid):
+        p = self.api('GET', 'day-plans/' + str(int(pid)))
+        require(p['id'] == pid, 'day plan identity differs')
+        return p
+
+    def day_catalog(self, plan):
+        """Read-only per directory-day: held and in-window catalogued clips, delivery path holds."""
+        rows = [{'dir': u['relative_dir'], 'd': u['local_date'], 'sid': u['stream_id'], 'tz': self.timezones[u['stream_id']],
+                 'ws': self.windows[u['stream_id']][0].isoformat(), 'we': self.windows[u['stream_id']][1].isoformat(),
+                 'names': u.get('names') or [], 'ke': u['stream_id'] in self.keep_everything} for u in plan['units']]
+        encoded = base64.b64encode(json.dumps(rows).encode()).decode()
+        prepare = self.preparer()
+        # unlive: Keep Everything names whose catalogued clip of the stream is missing, has another size,
+        # or has no live R2 counterpart (the preparer's and server's rule).
+        return self.query("""WITH u AS (SELECT x->>'dir' dir,(x->>'d')::date d,(x->>'sid')::bigint sid,x->>'tz' tz,
+            (x->>'ws')::timestamptz ws,(x->>'we')::timestamptz we,x->'names' names,(x->>'ke')::boolean ke
+          FROM jsonb_array_elements(convert_from(decode('""" + encoded + """','base64'),'UTF8')::jsonb) x),
+          c AS (SELECT u.dir,u.d,c.id,(c.clip_start_at<u.we AND c.clip_end_at>u.ws) inside FROM u
+            JOIN recordings r ON r.account_id=47 AND r.stream_id=u.sid JOIN recording_clips c ON c.recording_id=r.id
+            WHERE c.clip_start_at>=u.d::timestamp AT TIME ZONE u.tz AND c.clip_start_at<(u.d+1)::timestamp AT TIME ZONE u.tz
+              AND left(c.display_path,length(u.dir)+1)=u.dir||'/' AND strpos(substr(c.display_path,length(u.dir)+2),'/')=0)
+          SELECT coalesce(json_agg(json_build_object('relative_dir',u.dir,'local_date',u.d::text,
+            'held',(SELECT count(*) FROM c WHERE c.dir=u.dir AND c.d=u.d AND nas_cleanup_day_clip_held(c.id,u.ke)),
+            'overlap',(SELECT count(*) FROM c WHERE c.dir=u.dir AND c.d=u.d AND c.inside),
+            'dir_held',nas_cleanup_day_dir_held(u.dir,u.ke),
+            'unlive',(SELECT count(*) FROM jsonb_array_elements(u.names) n WHERE NOT EXISTS(SELECT 1 FROM recording_clips c
+              JOIN recordings r ON r.id=c.recording_id AND r.account_id=47 AND r.stream_id=u.sid
+              WHERE c.display_path=u.dir||'/'||(n->>'name') AND c.size_bytes=(n->>'size_bytes')::bigint AND (""" + prepare.r2_live_raw('c', prepare.R2_BUCKET) + """
+               OR EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.source_clip_ids @> ARRAY[c.id] AND """ + prepare.R2_LIVE_OUTPUT + """)))))),'[]') FROM u""", 'day catalog query')
+
+    def day_checked(self, p):
+        """day_verify's bytes, or None after closing a never-started plan whose Keep Everything name
+        lost its live R2 counterpart; its directory-days are replanned without that name."""
+        catalog = self.day_catalog(p)
+        if not self.dry_run and p['mode'] == 'dry_run' and any(c.get('unlive') for c in catalog):
+            closed = self.day_control(p['id'], 'close', {'plan_sha256': p['plan_sha256'],
+                                      'reason': 'Keep Everything name lost its live R2 counterpart; replanning.'}, 'retired')
+            require(closed['id'] == p['id'] and closed['mode'] == 'retired', 'day close was not confirmed')
+            self.save('day_replan', current_day_plan=None)
+            return None
+        return day_verify(p, self.windows, self.timezones, self.keep_everything, self.folders, catalog)
+
+    def day_pick(self):
+        ids = self.query("SELECT coalesce(json_agg(id ORDER BY id),'[]') FROM nas_cleanup_day_plans WHERE account_id=47 "
+                         "AND connection_id=13 AND mode='dry_run' AND policy_sha256='" + POLICY_SHA + "'", 'day plan query')
+        if ids:
+            return ids[0]
+        for sid in sorted(self.windows, key=lambda sid: (sid in self.keep_everything, sid)):
+            if self.stopped():
+                return None
+            if not self.stream_ready(sid, DAY_EXCLUSIONS):
+                continue
+            prefix = 'kday-' + utcnow().strftime('%Y%m%d-%H%M%S')
+            out = self.root / 'day-plans' / (prefix + '-s' + str(sid))
+            lister = ['--r2prune', str(R2PRUNE)] if sid in self.keep_everything else []
+            if not self.prepare_stream(sid, ['--day-plans', '--max-plans', '1', '--label-prefix', prefix, *lister,
+                                             '--out', str(out), '--api', API, '--submit', '--atomic-admission'],
+                                     DAY_EXCLUSIONS):
+                continue
+            receipts = json.loads((out / 'summary.json').read_text())['receipts']
+            if receipts:
+                require(len(receipts) == 1, 'preparer admitted more than one day plan')
+                return receipts[0]['id']
+        return None
+
+    def day_monitor(self, pid):
+        while True:
+            require(not self.status.get('shutdown_or_recovery_failed') and not self.status.get('recovery_error'),
+                    'live ownership failure requires shutdown')
+            self.finish_health()
+            p = self.day_plan(pid)
+            if day_state(p, utcnow()) != 'running':
+                self.day_finish(p)
+                return
+            require(p['master_deletion_enabled'] is True, 'master switch mismatch during execution')
+            active = self.active()
+            require(not active['plans'] and active['batches'] == 0 and active['day_plans'] in ([], [pid]),
+                    'concurrent cleanup execution')
+            self.save('day_running', day_deleted_files=p['deleted_media_files'], day_deleted_bytes=p['deleted_media_bytes'],
+                      day_dropped_names=sum(u.get('dropped_names', 0) for u in p['units']))
+            time.sleep(60)
+
+    def day_finish(self, p):
+        """Pause, let live permits expire with their receipts, then close."""
+        pid, state = p['id'], day_state(p, utcnow())
+        if p['mode'] == 'enabled':
+            self.day_control(pid, 'control', {'plan_sha256': p['plan_sha256'], 'mode': 'paused',
+                             'reason': 'completed: all directory-days finished' if state == 'done' else 'day cleanup ' + state}, 'paused')
+        deadline = time.monotonic() + 900
+        while True:
+            p = self.day_plan(pid)
+            if not any(u['permit_live'] for u in p['units']):
+                break
+            require(time.monotonic() < deadline, 'day permits did not drain; owner reconciliation needed')
+            time.sleep(30)
+        require(p['plan_sha256'] == self.status.get('started_day_plan_sha256', p['plan_sha256']), 'day plan digest differs')
+        require(day_state(p, utcnow()) != 'anomaly', 'NAS client refused a permitted directory-day; owner review required')
+        if p['mode'] != 'retired':
+            closed = self.day_control(pid, 'close', {'plan_sha256': p['plan_sha256'],
+                                      'reason': 'Day cleanup %s; never-permitted directory-days are replanned.' % state}, 'retired')
+            require(closed['id'] == pid and closed['mode'] == 'retired', 'day close was not confirmed')
+        final = self.day_plan(pid)
+        require(final['mode'] == 'retired' and day_state(final, utcnow()) == 'done', 'closed day plan differs; owner review required')
+        self.save('day_batch_complete', current_day_plan=None, started_day_plan_sha256=None,
+                  day_deleted_files=final['deleted_media_files'], day_deleted_bytes=final['deleted_media_bytes'])
+
+    def run_day(self):
+        """One owned day plan at a time: admit, verify independently, enable, monitor, close."""
+        self.check_restart()
+        if not self.owner_validated:
+            self.validate_owner()
+        self.finish_health()
+        require(not self.status['current_plan'] and not self.status.get('next_plan'),
+                'per-file cleanup ownership must close before day cleanup')
+        self.load_policy()
+        active = self.active()
+        pid = self.status.get('current_day_plan')
+        require(not active['plans'] and active['batches'] == 0 and active['day_plans'] in ([], [pid]),
+                'unknown enabled plan or batch; owner review required')
+        if active['day_plans']:
+            require(not self.dry_run, 'enabled day plan cannot be resumed by a dry run')
+            p = self.day_plan(pid)
+            require(self.status.get('started_day_plan_sha256') == p['plan_sha256'] and p['master_deletion_enabled'] is True,
+                    'saved enabled day plan is unhealthy; owner review required')
+            self.day_monitor(pid)
+        elif pid and self.day_plan(pid)['mode'] == 'paused':
+            self.day_finish(self.day_plan(pid))
+        self.check_delivery()
+        while not self.stopped():
+            pid = self.status.get('current_day_plan') or self.day_pick()
+            if pid is None:
+                self.save('stopped' if self.stopped() else 'day_complete', current_day_plan=None)
+                return
+            self.save('day_dry_run', current_day_plan=pid)
+            p = self.day_plan(pid)
+            size = self.day_checked(p)
+            if size is None:
+                continue
+            if self.dry_run:
+                self.save('day_dry_run_pass', proposed_bytes=size)
+                return
+            self.idle()
+            require(p['master_deletion_enabled'] is True, 'controller must enable the runtime master before activation')
+            if self.stopped():
+                break
+            p = self.day_plan(pid)
+            if self.day_checked(p) is None:
+                continue
+            self.idle()
+            self.save('day_enabling', started_day_plan_sha256=p['plan_sha256'])
+            if self.stopped() or not self.enable(p, day=True):
+                break
+            self.day_monitor(pid)
         self.save('stopped')
 
     def fail(self, error):
@@ -1268,6 +1592,7 @@ def main():
     ap.add_argument('--repo', type=Path, default=Path.home() / 'Build/stoarama')
     ap.add_argument('--state', type=Path, default=Path.home() / 'stoarama-cleanup-runner')
     ap.add_argument('--dry-run', action='store_true', help='prepare/verify only; never enables a plan')
+    ap.add_argument('--day-plans', action='store_true', help='run NAS-only day-directory plans instead of per-file plans')
     args = ap.parse_args()
     os.umask(0o077)
     runner = Runner(args.repo, args.state, args.dry_run)
@@ -1276,7 +1601,7 @@ def main():
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: setattr(runner, 'stopping', True))
         with runner.heartbeat():
-            runner.run()
+            runner.run_day() if args.day_plans else runner.run()
         return 0
     except LockHeld:
         return 0  # Another process owns the lock; never touch its master switch.

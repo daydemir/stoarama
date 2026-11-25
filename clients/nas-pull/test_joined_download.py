@@ -2533,6 +2533,9 @@ class JoinedDownloadTests(unittest.TestCase):
                 pull.drain_joined(cfg, runtime, threading.Event())
             final = pull.joined_output_path(cfg, pull.valid_joined_item(raw_item)); before = final.read_bytes()
             with mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull, "open_joined_url") as download:
+                self.assertFalse(pull.drain_joined(cfg, runtime, threading.Event()))  # Inside the artifact's backoff.
+            runtime.joined_backoff = {k: (n, 0.0) for k, (n, _) in runtime.joined_backoff.items()}  # Backoff elapsed.
+            with mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull, "open_joined_url") as download:
                 self.assertTrue(pull.drain_joined(cfg, runtime, threading.Event()))
             download.assert_not_called(); self.assertEqual(final.read_bytes(), before); self.assertFalse(final.with_name(final.name + ".stoarama.json").exists())
 

@@ -51,7 +51,7 @@ func TestNASLowMemoryCleanupFreshPermitClientServer(t *testing.T) {
 }
 
 func TestNASR2CopyV8FastCleanupPipelineClientServer(t *testing.T) {
-	testNASCleanupPipelineClientServer(t, true, nasFastCopyClientVersion)
+	testNASCleanupPipelineClientServer(t, true, nasCleanupDayKEClientVersion)
 }
 
 func TestNASCleanupPermitTransportClientServer(t *testing.T) {
@@ -155,7 +155,7 @@ func testNASCleanupPipelineClientServer(t *testing.T, grouped bool, groupVersion
 				if err != nil {
 					t.Fatalf("client: %v\n%s", err, raw)
 				}
-				if version == nasFastCopyClientVersion && pipelined &&
+				if nasFastCopyLine(version) && pipelined &&
 					(!strings.Contains(string(raw), `"permit_ms":`) || !strings.Contains(string(raw), `"unlink_ms":`) ||
 						!strings.Contains(string(raw), `"receipt_ms":`) || !strings.Contains(string(raw), `"group_files":8`)) {
 					t.Fatalf("missing fast cleanup phases: %s", raw)

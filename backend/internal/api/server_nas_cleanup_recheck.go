@@ -72,7 +72,7 @@ func (s *Server) handleAdminNASCleanupRecheck(w http.ResponseWriter, r *http.Req
  policy_reason='',outcome=NULL,stage_timings='{}',updated_at=now()
  WHERE plan_id=$1 AND (state='unverified' OR (state='would_delete' AND ($2='all' OR (
  recovery NOT IN ('r2_sha_verified','r2_md5_etag_matched') AND NOT coalesce(
- recovery=$3 AND outcome->>'client_version'=$4 AND recovery_evidence->>'client_version'=$4,false)))))`, id, req.Scope, cleanupRecoveryNameSizeMatched, nasFastCopyClientVersion)
+ recovery=$3 AND outcome->>'client_version'=ANY($5) AND recovery_evidence->>'client_version'=$4,false)))))`, id, req.Scope, cleanupRecoveryNameSizeMatched, nasFastCopyClientVersion, nasFastCopyVersions)
 	if err != nil || tx.Commit(ctx) != nil {
 		util.WriteError(w, 500, "cleanup recheck failed")
 		return

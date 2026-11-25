@@ -57,7 +57,7 @@ class CleanupGroupTests(unittest.TestCase):
                      for _, message in self.logs if message.startswith('cleanup pre-permit ')]
             for observation in body['observations']:
                 stage = next(s for s in ready if s.get('item_id') == observation['item_id'] and s['stage'] == 'permit_start')
-                self.assertTrue({'lease_ms', 'open_ms', 'proof_ms', 'guard_ms', 'fence_ms', 'observe_journal_ms', 'caps_ms'} <= set(stage['stage_timings']))
+                self.assertTrue({'lease_ms', 'open_ms', 'proof_ms', 'guard_ms', 'fence_ms', 'observe_journal_ms'} <= set(stage['stage_timings']))
             rows = {n: phase for n, phase, _ in pull.cleanup_journal(self.inventory)}
             self.assertTrue(all(rows[b['item_id']] == 'observe' for b in body['observations']))
             return {'results': [fixture_ack(b, b['item_id'], status=200, delivery_keep_checked=True, action='delete_issued', delete=True,
@@ -450,12 +450,12 @@ class CleanupGroupTests(unittest.TestCase):
 
     def test_eight_slow_files_get_fresh_per_file_permits_and_one_receipt_batch(self):
         tasks = self.group(8)
-        clock, delete, caps = time.monotonic, pull.CleanupFile.delete_exact, pull.cleanup_reserve_group_caps
+        clock, delete, journal = time.monotonic, pull.CleanupFile.delete_exact, pull.cleanup_journal_group
         offset, observed, batches = [0], [], []
-        def slow_caps(*args):
-            reservations = caps(*args)
-            offset[0] += 20  # NAS durability before authority must not age a permit.
-            return reservations
+        def slow_journal(inventory, entries):
+            journal(inventory, entries)
+            if entries[0][2] == 'observe':
+                offset[0] += 20  # NAS durability before authority must not age a permit.
         def slow_delete(current, proof):
             offset[0] += 4  # Whole lease takes >30s; each permit remains fresh.
             return delete(current, proof)
@@ -470,7 +470,7 @@ class CleanupGroupTests(unittest.TestCase):
             return {'results': [fixture_ack(b, b['item_id'], status=200, ok=True) for b in body['receipts']]}
         with mock.patch.object(pull, 'CLIENT_VERSION', pull.CLEANUP_GROUP_VERSION), \
                 mock.patch.object(pull, 'restore_api', side_effect=api), \
-                mock.patch.object(pull, 'cleanup_reserve_group_caps', side_effect=slow_caps), \
+                mock.patch.object(pull, 'cleanup_journal_group', side_effect=slow_journal), \
                 mock.patch.object(pull.CleanupFile, 'delete_exact', slow_delete), \
                 mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock()+offset[0]):
             pull.cleanup_process_group(self.cfg, self.inventory, threading.Event(), tasks)
@@ -523,7 +523,6 @@ class CleanupGroupTests(unittest.TestCase):
                 pull.cleanup_process_group(self.cfg, self.inventory, threading.Event(), tasks)
         self.assertEqual(transport.call_count, 1)
         self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'observe'})
-        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 0)
 
     def test_partial_ledger_intent_write_preserves_observation_without_unlink(self):
         tasks = self.group()
@@ -696,8 +695,6 @@ class CleanupGroupTests(unittest.TestCase):
                     expected = 'observe' if cut == 'ledger_intent' else 'result' if cut == 'result' else 'intent'
                     self.assertEqual(rows[0][1], expected)
                     self.assertNotIn('refusal_protocol', json.loads(rows[0][2]))
-                    # SIGKILL runs no finally: all eight conservative cap charges survive.
-                    self.assertEqual(restarted.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 8)
                     replayed = []
                     def replay(cfg, path, body, **kwargs):
                         item_id = int(path.split('/')[-2])
@@ -728,54 +725,6 @@ class CleanupGroupTests(unittest.TestCase):
             with self.assertRaises(pull.CleanupResponseError): self.run_group(tasks)
         self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'observe'})
 
-    def test_local_cap_reserves_whole_group_or_stops_before_every_permit(self):
-        tasks = self.group()
-        with mock.patch.object(pull, 'CLEANUP_MAX_FILES_24H', 2), \
-                mock.patch.object(pull, 'restore_api', side_effect=AssertionError('no partial reservation')):
-            with self.assertRaises(pull.CleanupPermitRefused): self.run_group(tasks)
-        self.assertEqual([r[1] for r in pull.cleanup_journal(self.inventory)], ['observe']*3)
-        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 0)
-
-    def test_caps_and_diagnostics_each_commit_once_for_eight_members(self):
-        tasks = self.group(8)
-        statements = []
-        self.inventory.db.set_trace_callback(statements.append)
-        with mock.patch.object(pull, 'cleanup_reserve_group_caps', wraps=pull.cleanup_reserve_group_caps) as caps, \
-                mock.patch.object(pull, 'cleanup_execution_outcomes', wraps=pull.cleanup_execution_outcomes) as diagnostics:
-            self.run_group(tasks)
-        self.inventory.db.set_trace_callback(None)
-        self.assertEqual(caps.call_count, 1)
-        self.assertEqual(len(caps.call_args.args[1]), 8)
-        self.assertEqual(diagnostics.call_count, 1)
-        self.assertEqual(len(diagnostics.call_args.args[1]), 8)
-        # All cap INSERTs have the same enclosing transaction.
-        charge_positions = [n for n, sql in enumerate(statements) if sql.startswith('INSERT INTO cleanup_local_deletions')]
-        # SQLite's trace callback repeats the outer INSERT for trigger steps.
-        self.assertEqual(len({statements[n] for n in charge_positions}), 8)
-        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 8)
-        self.assertFalse(any(sql == 'COMMIT' for sql in statements[charge_positions[0]:charge_positions[-1]]))
-
-    def test_abort_releases_exact_unattempted_rows_including_unvisited_members(self):
-        tasks = self.group(8)
-        historic = pull.cleanup_reserve_group_caps(self.inventory, tasks)
-        api = self.api
-        def fail(cfg, path, body, **kwargs):
-            if path.endswith('/observe-batch') and body['observations'][0]['item_id'] == 3:
-                raise TimeoutError('third permit response lost')
-            return api(cfg, path, body, **kwargs)
-        with mock.patch.object(self, 'api', side_effect=fail):
-            with self.assertRaises(TimeoutError): self.run_group(tasks)
-        rows = self.inventory.db.execute('SELECT id,item_id FROM cleanup_local_deletions ORDER BY id').fetchall()
-        self.assertEqual([r[0] for r in rows[:8]], historic)
-        self.assertEqual([r[1] for r in rows[8:]], [1, 2])
-
-    def test_group_cap_insert_failure_rolls_back_every_charge(self):
-        tasks = self.group(8)
-        self.inventory.db.execute("CREATE TRIGGER reject_third_cap BEFORE INSERT ON cleanup_local_deletions WHEN new.item_id=3 BEGIN SELECT RAISE(ABORT,'injected cap failure'); END")
-        with self.assertRaisesRegex(Exception, 'injected cap failure'):
-            pull.cleanup_reserve_group_caps(self.inventory, tasks)
-        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 0)
-
     def test_slow_group_barriers_expire_before_unlink(self):
         tasks = self.group()
         real_append, clock = pull.cleanup_ledger_append_many, time.monotonic
@@ -787,17 +736,6 @@ class CleanupGroupTests(unittest.TestCase):
             self.run_group(tasks)
         outcomes = [json.loads(r[0]) for r in self.inventory.db.execute('SELECT body FROM cleanup_execution_outcomes')]
         self.assertTrue(all(r['refusal_reason']=='deadline_exceeded' and r['refusal_protocol']==1 for r in outcomes))
-        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 0)
-
-    def test_unused_cap_release_preserves_other_charges_and_crash_charge_expires(self):
-        tasks = self.group()
-        charged = pull.cleanup_reserve_group_caps(self.inventory, tasks[:1])
-        provisional = pull.cleanup_reserve_group_caps(self.inventory, tasks[1:2])
-        pull.cleanup_release_caps(self.inventory, provisional)
-        self.assertEqual([r[0] for r in self.inventory.db.execute('SELECT id FROM cleanup_local_deletions')], charged)
-        self.assertEqual(pull.cleanup_local_headroom(self.inventory)[0], pull.CLEANUP_MAX_FILES_24H-1)
-        with mock.patch.object(pull.time, 'time', return_value=time.time()+86401):
-            self.assertEqual(pull.cleanup_local_headroom(self.inventory)[0], pull.CLEANUP_MAX_FILES_24H)
 
     def test_external_namespace_change_is_not_a_group_unlink(self):
         tasks = self.group()
@@ -817,12 +755,12 @@ class CleanupGroupTests(unittest.TestCase):
 
     def test_abort_heartbeat_has_fixed_stage_reason_and_no_exception_contents(self):
         tasks = self.group(1)
-        with mock.patch.object(pull, 'cleanup_reserve_group_caps', side_effect=TimeoutError('private credential sentinel')):
+        with mock.patch.object(pull, 'cleanup_guard_refusal', side_effect=TimeoutError('private credential sentinel')):
             with self.assertRaises(TimeoutError):
                 self.run_group(tasks)
         status, _, _ = pull.CLEANUP_STATUS.snapshot()
         self.assertEqual(status['aborted_groups'], 1)
-        self.assertEqual((status['last_abort_stage'], status['last_abort_reason']), ('caps', 'transport_error'))
+        self.assertEqual((status['last_abort_stage'], status['last_abort_reason']), ('guard', 'transport_error'))
         self.assertEqual(status['last_abort_files'], 1)
         self.assertNotIn('private', json.dumps(status))
 
@@ -873,13 +811,12 @@ class CleanupGroupTests(unittest.TestCase):
             with self.assertRaises(pull.CleanupResponseError): self.run_group(tasks)
         self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'result'})
 
-    def test_lease_margin_prevents_another_permit_and_releases_reservation(self):
+    def test_lease_margin_prevents_another_permit(self):
         tasks = self.group()
         for task in tasks:
             task['expires_at'] = (datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=40)).isoformat()
         with mock.patch.object(pull, 'restore_api', side_effect=AssertionError('insufficient lease budget')):
             with self.assertRaises(pull.CleanupInterrupted): self.run_group(tasks)
-        self.assertEqual(pull.cleanup_local_headroom(self.inventory)[0], pull.CLEANUP_MAX_FILES_24H)
         self.assertEqual({r[1] for r in pull.cleanup_journal(self.inventory)}, {'observe'})
 
     def test_replaced_path_after_durable_marker_is_preserved(self):
@@ -931,7 +868,6 @@ class CleanupGroupTests(unittest.TestCase):
         rows = pull.cleanup_journal(self.inventory)
         self.assertEqual([row[1] for row in rows], ['intent', 'observe', 'observe'])
         self.assertNotIn('refusal_protocol', json.loads(rows[0][2]))
-        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 0)
 
     def test_per_file_outcomes_and_timings_survive_uploaded_log_redaction(self):
         tasks = self.group()

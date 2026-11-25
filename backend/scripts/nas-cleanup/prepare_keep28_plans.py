@@ -48,12 +48,33 @@ Pilot (one stream, a few GB):
   prepare_keep28_plans.py --stream 3 --max-bytes 5e9 --max-plans 1 --out pilot
   prepare_keep28_plans.py --stream 3 --max-bytes 5e9 --max-plans 1 --out pilot --submit
 
+--day-plans prepares NAS-only day-directory plans instead (owner, verbatim:
+"if its outside of keep everything, then a nas copy only needs to be checked
+if its in the keep 20? otherwise it can be deleted right?"; "yes, delete").
+A unit is one stream-day of raw NAS footage in one directory: the reviewed
+folder map names the stream, the path names the local day, the whole day lies
+outside the pinned window with a one-day guard band, and no catalogued clip of
+it is held. Its files and bytes are the present NAS inventory of that day; each
+plan carries those totals and the day digest, which the server recomputes
+before admitting it (dry run only). For a non-Keep-Everything stream no R2 copy
+is checked. Labels: <prefix>-s<stream>-day-<n>.
+
+Keep Everything streams (Deniz, verbatim: "nas shoul dnot have any of the keep
+everything (except the keep 20)"; "if its the same size and same file name or
+whatever checks we have already?") come after the others. A KE unit names its
+exact media files, and a file is named only when its NAS size is the
+catalogued clip size and its R2 counterpart is live in the catalogue (the raw
+object, or a stitched output listing the clip, neither retired) AND a fresh
+read-only R2 listing (`r2prune list`, --r2prune) shows that key with that
+size. Every other file stays on the NAS and is counted as excluded.
+
 Environment: DATABASE_URL (read-only use) and, for --submit, SERVICE_TOKEN.
 """
 import argparse
 import base64
 import datetime
 import hashlib
+import http.client
 import json
 import os
 import pathlib
@@ -66,6 +87,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zoneinfo
+from collections import defaultdict
 
 from reviewed_scope import ReadFailed, admissible_candidates
 
@@ -76,6 +98,20 @@ POLICY_PATH = pathlib.Path(__file__).resolve().parents[2] / 'internal/api/nas_cl
 # window; it never admits a new plan.
 LEGACY_POLICY_SHA = '060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811'
 LEGACY_POLICY_PATH = pathlib.Path(__file__).resolve().parents[2] / 'internal/api/nas_cleanup_keep28_policy.json'
+FOLDERS_SHA = '94efc6fe9f0b83db55be31d4c2fad7f47cff781fd01d88bc33c4c90cae0e7ab8'
+FOLDERS_PATH = pathlib.Path(__file__).resolve().parents[2] / 'internal/api/nas_cleanup_folder_streams.json'
+DAY_DIGEST_TAG = 'stoarama-nas-cleanup-day-v1'
+MAX_DAY_UNITS = 1000  # backend nasCleanupDayMaxUnits
+MAX_DAY_NAMES = 100000  # backend nasCleanupDayMaxNames
+R2_BUCKET = os.environ.get('R2_BUCKET', 'stoarama')
+MONTHS = ('January', 'February', 'March', 'April', 'May', 'June', 'July',
+          'August', 'September', 'October', 'November', 'December')
+WEEKDAYS = ('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')
+DAY_PLAZA_DIR = re.compile(r'(?:[^/]+/)+(%s)/(0[1-9]|[12][0-9]|3[01])-(%s)' % ('|'.join(MONTHS), '|'.join(WEEKDAYS)))
+DAY_FLAT_DIR = re.compile(r'(?:[^/]+/)+[1-9][0-9]*/(continuous|[1-9][0-9]*)')
+DAY_PLAZA_FILE = re.compile(r'[^/]*_(20[0-9]{2})_(%s)_W([1-6])_(%s)_hour_(?:[0-9]{2}|[0-9]{6})\.mp4' % ('|'.join(MONTHS), '|'.join(WEEKDAYS)))
+DAY_SECONDS = re.compile(r'([1-9][0-9]{9})\.mp4')
+DAY_MILLIS = re.compile(r'([1-9][0-9]{12})\.mp4')
 LABEL = re.compile(r'^[a-z0-9][a-z0-9._-]{0,79}$')
 MAX_PLAN_ITEMS = 20000
 MAX_PLAN_BYTES = 2_000_000_000_000  # backend nasCleanupMaxPlanBytes
@@ -84,6 +120,9 @@ MAX_BATCH_PLANS = 500
 # retry this stream later. Every other failure stops the runner.
 EXIT_READ_FAILED = 4
 EXIT_ADMISSION_REJECTED = 5
+# Mirrors the runner's SHORT_READ_RETRY_DELAYS (120 s) for an unconfirmed day admission.
+ADMISSION_RETRY_DELAYS = (5, 10, 20, 30, 30, 25, None)
+TRANSIENT_HTTP = {408, 429, 500, 502, 503, 504}
 
 
 class AdmissionRejected(RuntimeError):
@@ -286,6 +325,320 @@ def batches(rows, prefix, max_items, max_bytes):
                   -sum(r['size_bytes'] for r in p[1]) / len(p[1]), p[0]))
 
 
+def load_folders(path=None):
+    raw = pathlib.Path(path or FOLDERS_PATH).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != FOLDERS_SHA:
+        raise SystemExit('reviewed folder map SHA differs')
+    return json.loads(raw)
+
+
+def folder_key(directory):
+    """The NAS client's cleanup_folder_key for a raw directory."""
+    parts = directory.split('/')
+    if parts[0] == 'joined':
+        return None
+    if parts[0] == 'recordings':
+        return 'recordings/' + parts[1] if len(parts) > 1 else None
+    return parts[0]
+
+
+def day_file_date(directory, name, zone):
+    """Local date a raw media name in directory names, or None (server and client share the rule)."""
+    plaza = DAY_PLAZA_DIR.fullmatch(directory)
+    if plaza:
+        named = DAY_PLAZA_FILE.fullmatch(name)
+        if not named or named[2] != plaza[1] or named[4] != plaza[3]:
+            return None
+        day = int(plaza[2])
+        try:
+            date = datetime.date(int(named[1]), MONTHS.index(plaza[1]) + 1, day)
+        except ValueError:
+            return None
+        return date if WEEKDAYS[date.weekday()] == plaza[3] and (day - 1) // 7 + 1 == int(named[3]) else None
+    flat = DAY_FLAT_DIR.fullmatch(directory)
+    named = flat and (DAY_SECONDS if flat[1] == 'continuous' else DAY_MILLIS).fullmatch(name)
+    if not named:
+        return None
+    return datetime.datetime.fromtimestamp(int(named[1]) / (1 if flat[1] == 'continuous' else 1000), zone).date()
+
+
+def pg_timestamp(value):
+    """A PostgreSQL JSON timestamptz (any fraction width) for Python 3.9."""
+    match = re.fullmatch(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})', value)
+    if not match:
+        raise RuntimeError('invalid catalogue timestamp')
+    return datetime.datetime.fromisoformat(match[1] + '.' + (match[2] or '').ljust(6, '0')[:6] + match[3].replace('Z', '+00:00'))
+
+
+def day_outside(window, date):
+    """The whole local day lies outside the window with a full guard day each side."""
+    zone = zoneinfo.ZoneInfo(window['tz'])
+    first = datetime.datetime.fromisoformat(window['keep_start_utc']).astimezone(zone).date()
+    last = (datetime.datetime.fromisoformat(window['keep_end_utc']) - datetime.timedelta(microseconds=1)).astimezone(zone).date()
+    return date <= first - datetime.timedelta(days=2) or date >= last + datetime.timedelta(days=2)
+
+
+def day_digest(units):
+    """Same digest as the backend's cleanupDayDigest and the runner."""
+    text = '%s\npolicy %s\n' % (DAY_DIGEST_TAG, POLICY_SHA)
+    for u in units:
+        text += 'unit %d %s %d %d %s\n' % (u['stream_id'], u['local_date'], u['files'], u['bytes'], u['relative_dir'])
+        text += ''.join('name %d %s\n' % (n['size_bytes'], n['name']) for n in u.get('names', ()))
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def r2_live_raw(clip, bucket):
+    """SQL: the clip's raw R2 object is live in the catalogue (the server's cleanupDayR2LiveSQL raw branch)."""
+    return ("(%s.bucket=%s AND %s.purged_at IS NULL AND %s.object_key<>'' AND NOT EXISTS(SELECT 1 FROM r2_object_retirements x "
+            "WHERE x.kind='raw' AND x.source_id=%s.id))" % (clip, "'" + bucket.replace("'", "''") + "'", clip, clip, clip))
+
+
+# SQL: a stitched output is live in R2 (the server's cleanupDayR2LiveSQL stitched branch).
+R2_LIVE_OUTPUT = ("NOT EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.kind='collated' AND x.source_id=o.id) "
+                  "AND NOT EXISTS(SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='collated' AND x.source_id=o.id)")
+
+
+def day_stream_rows(w, psql, bucket=R2_BUCKET):
+    """Every catalogued clip of one stream: path, bounds, held flag, present NAS size (-1 if absent), id,
+    catalogued size, live raw R2 key (or null) and when the NAS last reported it; a Keep Everything stream
+    also lists its live stitched outputs."""
+    sid, ke = int(w['stream_id']), 'true' if w['keep_everything'] else 'false'
+    outputs = ("""(SELECT coalesce(json_agg(json_build_array(o.object_key,o.size_bytes,o.source_clip_ids)),'[]')
+  FROM recordings r JOIN recording_collation_hours h ON h.recording_id=r.id JOIN recording_collation_outputs o ON o.collation_hour_id=h.id
+  WHERE r.account_id=47 AND r.stream_id=""" + str(sid) + " AND " + R2_LIVE_OUTPUT + ")") if w['keep_everything'] else "'[]'::json"
+    return query("""SELECT json_build_object('clips',(SELECT coalesce(json_agg(json_build_array(c.display_path,c.clip_start_at,c.clip_end_at,
+  nas_cleanup_day_clip_held(c.id,""" + ke + """),coalesce((SELECT f.size_bytes FROM nas_inventory_files f WHERE f.connection_id=13 AND f.clip_id=c.id
+   AND f.state='present' AND f.relative_path=c.display_path),-1),c.id,c.size_bytes,CASE WHEN """ + r2_live_raw('c', bucket) + """ THEN c.object_key END,
+  (SELECT f.client_updated_at FROM nas_inventory_files f WHERE f.connection_id=13 AND f.clip_id=c.id AND f.relative_path=c.display_path))),'[]')
+  FROM recordings r JOIN recording_clips c ON c.recording_id=r.id
+  WHERE r.account_id=47 AND r.stream_id=""" + str(sid) + """ AND c.display_path<>''),
+ 'outputs',""" + outputs + """,
+ 'claimed',(SELECT coalesce(json_agg(json_build_array(u.relative_dir,u.local_date::text,u.state,u.names,u.updated_at)),'[]') FROM nas_cleanup_day_units u
+  WHERE u.stream_id=""" + str(sid) + """ AND u.state IN ('pending','permitted','deleted')),
+ 'held_dirs',(SELECT coalesce(json_agg(DISTINCT regexp_replace(h.relative_path,'/[^/]*$','')),'[]')
+  FROM delivery_keep_holds h WHERE """ + ke + """ AND h.relative_path<>''),
+ 'keep20_active',EXISTS(SELECT 1 FROM nas_media_keep20_epoch WHERE connection_id=13))""", psql)
+
+
+def list_roots(keys):
+    """The r2prune lane's listing roots: each key's folder three levels deep; nested roots collapse to the outer."""
+    roots = []
+    for d in sorted({'/'.join(k.split('/')[:3]) + '/' if k.count('/') >= 3 else k.rsplit('/', 1)[0] + '/' for k in keys}):
+        if not roots or not d.startswith(roots[-1]):
+            roots.append(d)
+    return roots
+
+
+def r2_listing(r2prune, out):
+    """A read-only R2 lister: {key: size} for the wanted keys, from `r2prune list` (lane TSV:
+    key, size, etag, mtime) over their roots, kept at `out`. R2 credentials come from the environment."""
+    def listed(keys):
+        if not keys:
+            return {}
+        args = [a for r in list_roots(keys) for a in ('--prefix', r)]
+        subprocess.run([r2prune, 'list', '--workers', '8', '--out', str(out)] + args, check=True, timeout=3600)
+        sizes = {}
+        with open(out) as f:
+            for line in f:
+                key, size, _etag, _mtime = line.rstrip('\n').split('\t')
+                if key in keys:
+                    sizes[key] = int(size)
+        return sizes
+    return listed
+
+
+def day_units(w, folders, facts, listed=None):
+    """Admissible units of one stream, the server's rule applied to the same catalogue, and the
+    Keep Everything media excluded for lacking a listed R2 counterpart: (units, {files, bytes})."""
+    sid, ke = w['stream_id'], w['keep_everything']
+    excluded = {'files': 0, 'bytes': 0}
+    if not facts['keep20_active']:
+        return [], excluded
+    zone = zoneinfo.ZoneInfo(w['tz'])
+    start = datetime.datetime.fromisoformat(w['keep_start_utc'])
+    end = datetime.datetime.fromisoformat(w['keep_end_utc'])
+    # Live units, and deleted ones: the inventory lists deleted files as present until the next NAS rescan.
+    # A KE directory-day is replanned once deleted: a deleted unit's name stays out only until the NAS
+    # reports that file again after the deletion (a kept size mismatch or a file restored later).
+    claimed = {(d, day) for d, day, state, _, _ in facts['claimed'] if not ke or state != 'deleted'}
+    deleted_names = {}
+    for d, _, state, names, at in facts['claimed']:
+        for n in names or ():
+            if state == 'deleted':
+                deleted_names[d, n['name']] = max(pg_timestamp(at), deleted_names.get((d, n['name']), pg_timestamp(at)))
+    held_dirs = set(facts['held_dirs'])
+    groups, refused = defaultdict(list), set()
+    for path, a, b, held, size, cid, catalogued, raw_key, seen in facts['clips']:
+        directory, name = path.rsplit('/', 1) if '/' in path else ('', path)
+        if not (DAY_PLAZA_DIR.fullmatch(directory) or DAY_FLAT_DIR.fullmatch(directory)) or folders.get(folder_key(directory)) != sid:
+            continue
+        date = day_file_date(directory, name, zone)
+        if date is None:
+            refused.add(directory)  # The server refuses a directory with an undated catalogued name.
+            continue
+        if seen is not None and (directory, name) in deleted_names and pg_timestamp(seen) <= deleted_names[directory, name]:
+            size = -1  # Unlinked by a deleted unit; the inventory has not rescanned it since.
+        groups[directory, date].append((pg_timestamp(a), pg_timestamp(b), held, size, cid, name, catalogued, raw_key))
+    eligible = [((directory, date), clips) for (directory, date), clips in sorted(groups.items(), key=lambda g: (g[0][1], g[0][0]))
+                if not (directory in refused or directory in held_dirs or (directory, date.isoformat()) in claimed
+                        or not any(c[3] >= 0 for c in clips) or not day_outside(w, date)
+                        or any(held or not (b > a) or (a < end and b > start) for a, b, held, *_ in clips))]
+    counterparts = defaultdict(list)  # clip id -> [(R2 key, size)]
+    if ke:
+        for key, size, sources in facts['outputs']:
+            for cid in sources:
+                counterparts[cid].append((key, size))
+        for _, clips in eligible:
+            for c in clips:
+                if c[7]:
+                    counterparts[c[4]].append((c[7], c[6]))
+        sizes = listed({k for _, clips in eligible for c in clips if c[3] >= 0 for k, _ in counterparts[c[4]]})
+    units = []
+    for (directory, date), clips in eligible:
+        present = [c for c in clips if c[3] >= 0]
+        names = present
+        if ke:
+            names = sorted((c for c in present if c[3] == c[6] and any(sizes.get(k) == z for k, z in counterparts[c[4]])),
+                           key=lambda c: c[5])
+            excluded['files'] += len(present) - len(names)
+            excluded['bytes'] += sum(c[3] for c in present) - sum(c[3] for c in names)
+        if not names:
+            continue
+        unit = {'relative_dir': directory, 'local_date': date.isoformat(), 'stream_id': sid,
+                'files': len(names), 'bytes': sum(c[3] for c in names)}
+        if ke:
+            unit['names'] = [{'name': c[5], 'size_bytes': c[3]} for c in names]
+        units.append(unit)
+    return units, excluded
+
+
+def day_plans(units, prefix, max_units):
+    """Plans of at most max_units units and MAX_DAY_NAMES Keep Everything names each."""
+    parts = []
+    for u in units:
+        if not parts or len(parts[-1]) >= max_units or sum(len(x.get('names', ())) for x in parts[-1]) + len(u.get('names', ())) > MAX_DAY_NAMES:
+            parts.append([])
+        parts[-1].append(u)
+    out = []
+    for n, part in enumerate(parts, 1):
+        label = '%s-s%d-day-%04d' % (prefix, part[0]['stream_id'], n)
+        assert LABEL.match(label), label
+        out.append({'label': label, 'policy_sha256': POLICY_SHA, 'plan_sha256': day_digest(part),
+                    'files': sum(u['files'] for u in part), 'bytes': sum(u['bytes'] for u in part), 'units': part})
+    return out
+
+
+def validate_day_admission(plan, result, detail):
+    try:
+        valid = (type(result['id']) is int and result['id'] > 0 and detail['id'] == result['id']
+                 and result['plan_sha256'] == detail['plan_sha256'] == plan['plan_sha256'] == day_digest(detail['units'])
+                 and detail['label'] == plan['label'] and detail['mode'] == 'dry_run' and detail['policy_sha256'] == POLICY_SHA
+                 and detail['files'] == plan['files'] == sum(u['files'] for u in detail['units'])
+                 and detail['bytes'] == plan['bytes'] == sum(u['bytes'] for u in detail['units'])
+                 and [(u['relative_dir'], u['local_date'], u['stream_id'], u['files'], u['bytes'], u.get('names')) for u in detail['units']]
+                 == [(u['relative_dir'], u['local_date'], u['stream_id'], u['files'], u['bytes'], u.get('names')) for u in plan['units']]
+                 and all(u['state'] == 'pending' and u['receipts'] == [] for u in detail['units']))
+    except (KeyError, TypeError):
+        valid = False
+    if not valid:
+        raise RuntimeError('admitted day plan contract differs; reconcile its label before retrying')
+
+
+def day_admitted(plan, psql):
+    """Read-only: the id of the day plan holding this proposal's label, or None."""
+    rows = query("SELECT coalesce(json_agg(json_build_array(id,plan_sha256)),'[]') FROM nas_cleanup_day_plans "
+                 "WHERE account_id=47 AND connection_id=13 AND label='%s'" % plan['label'], psql)
+    if rows and rows[0][1] != plan['plan_sha256']:
+        raise RuntimeError('day plan label %s holds another digest; reconcile before retrying' % plan['label'])
+    return rows[0][0] if rows else None
+
+
+def day_admit(api, plan, psql):
+    """Admit one day plan: its id, or (None, the HTTP 409) for a refusal. A 5xx or transport
+    failure can follow a commit (the request outlives the proxy), so before any retry or
+    refusal decision read the label back and adopt a plan already admitted under it."""
+    for delay in ADMISSION_RETRY_DELAYS:
+        refusal = None
+        try:
+            return service(api, 'POST', 'day-plans', plan)['id'], None
+        except urllib.error.HTTPError as exc:
+            if exc.code != 409 and exc.code not in TRANSIENT_HTTP:
+                raise RuntimeError('day plan admission refused for %s: HTTP %d' % (plan['label'], exc.code)) from None
+            refusal = exc if exc.code == 409 else None
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead):
+            pass
+        try:
+            pid = day_admitted(plan, psql)
+        except ReadFailed:
+            pid = None
+            if refusal:
+                raise RuntimeError('day plan admission refusal for %s could not be read back' % plan['label']) from None
+        if pid or refusal:
+            return pid, None if pid else refusal
+        if delay is None:
+            raise RuntimeError('day plan admission not confirmed for %s; inspect the label before retrying' % plan['label'])
+        time.sleep(delay)
+
+
+def day_main(a, policy):
+    """Prepare (and with --submit admit) NAS-only day-directory plans."""
+    if a.max_units < 1 or a.max_units > MAX_DAY_UNITS:
+        raise SystemExit('--max-units must be 1..%d' % MAX_DAY_UNITS)
+    folders = load_folders()
+    out = pathlib.Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    units, excluded = [], {'files': 0, 'bytes': 0}
+    # Keep Everything streams after the others.
+    streams = sorted(a.stream or policy, key=lambda sid: (policy[sid]['keep_everything'], sid))
+    for sid in streams:
+        ke = policy[sid]['keep_everything']
+        if ke and not a.r2prune:
+            raise SystemExit('Keep Everything day plans need --r2prune for the read-only R2 listing')
+        listed = r2_listing(a.r2prune, out / ('r2-listing-s%d.tsv' % sid)) if ke else None
+        part, missing = day_units(policy[sid], folders, day_stream_rows(policy[sid], a.psql, a.bucket), listed)
+        units += part
+        excluded = {k: excluded[k] + missing[k] for k in excluded}
+        print(json.dumps({'phase': 'listed_stream_days', 'stream_id': sid, 'keep_everything': ke, 'units': len(part),
+                          'files': sum(u['files'] for u in part), 'bytes': sum(u['bytes'] for u in part),
+                          'excluded_no_r2_files': missing['files'], 'excluded_no_r2_bytes': missing['bytes']}), file=sys.stderr, flush=True)
+    plans = []
+    for sid in streams:
+        plans += day_plans([u for u in units if u['stream_id'] == sid], a.label_prefix, a.max_units)
+    plans = [] if a.summary_only else plans[:a.max_plans or None]
+    for plan in plans:
+        (out / (plan['label'] + '.json')).write_text(json.dumps(plan))
+    summary = {'policy_sha256': POLICY_SHA, 'mode': 'day_plans', 'streams': sorted(a.stream or policy), 'observed_at_epoch': time.time(),
+               'candidate_units': len(units), 'candidate_files': sum(u['files'] for u in units),
+               'candidate_bytes': sum(u['bytes'] for u in units),
+               'excluded_no_r2_files': excluded['files'], 'excluded_no_r2_bytes': excluded['bytes'],
+               'plans': [{k: p[k] for k in ('label', 'plan_sha256', 'files', 'bytes')} | {'units': len(p['units']), 'stream_id': p['units'][0]['stream_id']}
+                         for p in plans], 'receipts': [], 'deletion_enabled': False}
+    for plan in plans if a.submit else ():
+        pid, refusal = day_admit(a.api, plan, a.psql)
+        if refusal:
+            if summary['receipts'] or len(plans) != 1 or len(a.stream) != 1:
+                raise RuntimeError('day plan admission refused for %s: HTTP 409' % plan['label'])
+            evidence = dict(stream_id=a.stream[0], label=plan['label'], http_status=409,
+                            reason=refusal.read(2048).decode(errors='replace'), rejected_at_epoch=time.time())
+            with (out / 'admission-rejected.json').open('x') as f:
+                json.dump(evidence, f); f.flush(); os.fsync(f.fileno())
+            return EXIT_ADMISSION_REJECTED
+        detail = service(a.api, 'GET', 'day-plans/' + str(pid))
+        validate_day_admission(plan, {'id': pid, 'plan_sha256': plan['plan_sha256']}, detail)
+        summary['receipts'].append({'id': pid, 'label': plan['label'], 'stream_id': plan['units'][0]['stream_id'],
+                                    'plan_sha256': plan['plan_sha256'], 'units': len(plan['units']),
+                                    'files': plan['files'], 'bytes': plan['bytes']})
+        print(json.dumps({'phase': 'day_plan_admitted_dry_run', **summary['receipts'][-1]}), flush=True)
+    temp = out / 'summary.tmp'
+    temp.write_text(json.dumps(summary, indent=1))
+    temp.replace(out / 'summary.json')
+    print(json.dumps({'phase': 'DAY_PLANS_SUBMITTED' if a.submit else 'DAY_PLANS_PREVIEW', 'candidate_units': summary['candidate_units'],
+                      'candidate_files': summary['candidate_files'], 'candidate_bytes': summary['candidate_bytes'],
+                      'excluded_no_r2_files': excluded['files'], 'excluded_no_r2_bytes': excluded['bytes'],
+                      'plans': len(plans), 'admitted': len(summary['receipts']), 'out': str(out), 'deletion_enabled': False}), flush=True)
+    return 0
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         raise RuntimeError('operator redirect refused')
@@ -360,7 +713,7 @@ def main():
     ap.add_argument('--i-understand-large-batch', action='store_true', help='required with --batch-by all (one approval spanning every stream)')
     ap.add_argument('--max-plans', type=int, default=0, help='stop after N plans (0 = all)')
     ap.add_argument('--label-prefix', default='k28')
-    ap.add_argument('--bucket', default=os.environ.get('R2_BUCKET', 'stoarama'))
+    ap.add_argument('--bucket', default=R2_BUCKET)
     ap.add_argument('--policy', default=str(POLICY_PATH))
     ap.add_argument('--psql', default='psql')
     ap.add_argument('--out', required=True, help='directory for plan inputs and the summary')
@@ -369,6 +722,9 @@ def main():
     ap.add_argument('--atomic-admission', action='store_true', help='stop on admission rejection; never split one proposal into several plans')
     ap.add_argument('--api', default='https://stoarama.com')
     ap.add_argument('--scope-cache', help='content-addressed cache of pinned reviewed-scope objects (re-verified on every read)')
+    ap.add_argument('--day-plans', action='store_true', help='prepare NAS-only day-directory plans (Keep Everything streams last, names only)')
+    ap.add_argument('--r2prune', help='--day-plans: r2prune binary for the read-only R2 listing Keep Everything streams need')
+    ap.add_argument('--max-units', type=int, default=500, help='--day-plans: directory-days per plan (1..1000)')
     a = ap.parse_args()
     if a.summary_only and (a.submit or len(a.stream) != 1):
         raise SystemExit('--summary-only requires exactly one stream and no --submit')
@@ -380,6 +736,8 @@ def main():
     unknown = set(a.stream) - set(policy)
     if unknown:
         raise SystemExit(f'streams without a keep20 window: {sorted(unknown)}')
+    if a.day_plans:
+        return day_main(a, policy)
     rows = candidates(policy, set(a.stream), a.bucket, a.psql, a.scope_cache)
     plans = [] if a.summary_only else batches(rows, a.label_prefix, a.max_items, int(a.max_bytes))
     if a.max_plans:

@@ -83,6 +83,9 @@ func pullPathAllowed(method, path string) bool {
 	// may already post one at a time; the NAS client uses them by default.
 	case method == http.MethodPost && (path == "/api/v1/account/connections/cleanup/observe-batch" || path == "/api/v1/account/connections/cleanup/result-batch"):
 		return true
+	// One permit and one receipt per NAS stream-day directory (bulk NAS-only release).
+	case method == http.MethodPost && (path == "/api/v1/account/connections/cleanup/day-permit" || path == "/api/v1/account/connections/cleanup/day-receipt"):
+		return true
 	// Admit only the NAS stitch protocol; handlers retain connection, scope,
 	// lease, source-freeze and independent deletion authorization checks.
 	case nasStitchKeyPathAllowed(method, path):

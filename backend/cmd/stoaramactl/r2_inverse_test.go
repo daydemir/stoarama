@@ -451,3 +451,27 @@ func TestR2InverseKEFoldersMatchPreJoinOracle(t *testing.T) {
 		}
 	}
 }
+
+// Owner rule: Keep Everything stays in R2. A stream the keep20 policy marks KE
+// (78) is protected by the inverse/keep28 and nonraw classifiers even when its
+// pick is "none" and the footage lies outside every window.
+func TestR2InverseKeepEverythingPolicyWinsOverPick(t *testing.T) {
+	p := inverseTestProtection()
+	at := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	end := at.Add(time.Minute)
+	p.Windows[78] = api.Keep28Window{StreamID: 78, Timezone: "UTC", Start: at.AddDate(0, -3, 0), End: at.AddDate(0, -2, 0)}
+	p.Picks.Choices[78] = r2RetirePick{Choice: "none"}
+	key := "managed/acct-47/78-raw.mp4"
+	p.Identities[key] = []inverseIdentity{{StreamID: 78, Path: "r/78-raw.mp4", Start: &at, End: &end, Timezone: "UTC", Kind: "raw"}}
+	if class, reason := p.classify(r2.ObjectInfo{Key: key, SizeBytes: 1}); class != inverseKE || reason != "keep_everything_stream" {
+		t.Fatalf("KE raw classified %v %s", class, reason)
+	}
+	p.ReviewedCollated = true
+	x := inverseCollatedAssessment{ID: 1, StreamID: 78, Key: "joined/goodplus-x/objects/" + strings.Repeat("a", 64) + ".mp4", Start: &at, End: &end, Timezone: "UTC"}
+	if class, reason := p.classifyCollated(r2.ObjectInfo{Key: x.Key, SizeBytes: 1}, x, true); class != inverseKE || reason != "keep_everything_stream" {
+		t.Fatalf("KE collated classified %v %s", class, reason)
+	}
+	if !p.keepEverythingStream(78) || !p.keepEverythingStream(4) || p.keepEverythingStream(3) {
+		t.Fatal("Keep Everything is the policy set together with pick all")
+	}
+}

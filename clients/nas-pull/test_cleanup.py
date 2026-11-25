@@ -1252,10 +1252,9 @@ class CleanupGuardTests(unittest.TestCase):
         calls = self.run_execution()
         self.assert_refused(calls, 'overlaps stream 33 keep window')
         self.assertIsNone(self.task.get('approved_proof'))
-        # Local caps never block a dry run.
+        # A cleared window observes normally; nothing local blocks a dry run.
         self.pins = self.fixture_pins('2027-01-01T00:00:00+00:00', '2027-01-29T00:00:00+00:00')
-        with mock.patch.object(pull, 'cleanup_local_caps', return_value='cap reached'):
-            calls = self.run_execution()
+        calls = self.run_execution()
         self.assertEqual([b['outcome'] for p, b in calls if p.endswith('/observe')], ['match'])
 
     def test_keep_window_overlap_refuses_without_asking_for_a_permit(self):
@@ -1316,23 +1315,20 @@ class CleanupGuardTests(unittest.TestCase):
         self.assertEqual(pull.cleanup_collated_path_hour('joined/recordings/339/joined/2026-08-25/339_2026-08-25_hour_18_184338-190038.mp4'),
                          (datetime.date(2026, 8, 25), 18))
 
-    def test_local_24h_caps_refuse_beyond_files_and_bytes(self):
-        # Reviewed constants: 5 TB (same as the server budget) and 400,000 files.
-        self.assertEqual((pull.CLEANUP_MAX_BYTES_24H, pull.CLEANUP_MAX_FILES_24H), (5_000_000_000_000, 400_000))
-        self.assertIsNone(pull.cleanup_local_caps(self.inventory, 10))
-        reserve = dict(item_id=1, plan_sha256='a'*64, relative_path='x')
-        self.assertIsNone(pull.cleanup_local_caps(self.inventory, pull.CLEANUP_MAX_BYTES_24H - 10, reserve))
-        self.assertIn('cap reached', pull.cleanup_local_caps(self.inventory, 11))
-        self.assertIsNone(pull.cleanup_local_caps(self.inventory, 10))
-        self.inventory.db.execute('DELETE FROM cleanup_local_deletions')
-        self.inventory.db.executemany('INSERT INTO cleanup_local_deletions(item_id,plan_sha256,relative_path,size_bytes,at_epoch) VALUES(?,?,?,?,?)',
-                                      [(n, 'a'*64, 'x', 1, time.time()) for n in range(pull.CLEANUP_MAX_FILES_24H)])
-        self.inventory.db.commit()
+    def test_local_daily_caps_are_gone_and_deletion_is_still_ledgered(self):
+        # Owner decision: "lift nas cleanup dialy limit please". There is no
+        # local rolling file/byte limit left to enforce or to wait on.
+        self.assertFalse(hasattr(pull, 'CLEANUP_MAX_FILES_24H'))
+        self.assertFalse(hasattr(pull, 'CLEANUP_MAX_BYTES_24H'))
+        self.assertFalse(hasattr(pull, 'cleanup_local_caps'))
+        self.assertFalse(hasattr(pull, 'cleanup_local_headroom'))
+        self.assertFalse(hasattr(pull, 'cleanup_reserve_group_caps'))
         self.approve()
-        self.assert_refused(self.run_execution(), 'local 24h deletion cap reached')
-        self.inventory.db.execute('UPDATE cleanup_local_deletions SET at_epoch=?', (time.time() - 86401,))
-        self.inventory.db.commit()
-        self.assertIsNone(pull.cleanup_local_caps(self.inventory, 10))
+        calls = self.run_execution()
+        self.assertEqual([b['outcome'] for p, b in calls if p.endswith('/result')], ['deleted'])
+        self.assertFalse(self.path.exists())
+        # The fsynced intent/result ledger itself stays.
+        self.assertEqual([r['event'] for r in self.ledger()], ['intent', 'result'])
 
     def test_append_only_ledger_records_intent_and_result_around_unlink(self):
         old = self.cfg.state_dir / pull.CLEANUP_LEDGER_NAME
@@ -1355,7 +1351,6 @@ class CleanupGuardTests(unittest.TestCase):
             self.assertIn(field, intent)
         self.assertEqual(intent['relative_path'], 'stream/day/a.mp4'); self.assertEqual(intent['sha256'], self.item['sha256'])
         self.assertEqual((result['outcome'], result['media_unlinked'], result['sidecar_unlinked']), ('deleted', True, True))
-        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 1)
 
     def test_ledger_write_failure_prevents_unlink(self):
         self.approve()
@@ -1542,8 +1537,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
         self.assertEqual(sorted(e['item_id'] for e in ledger if e['event'] == 'intent'), [t['item_id'] for t in tasks])
         self.assertEqual(sum(1 for e in ledger if e['event'] == 'result' and e['outcome'] == 'deleted'), 24)
         self.assertEqual(pull.cleanup_journal(self.inventory), [])
-        rows = self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0]
-        self.assertEqual(rows, 24)
+
 
     def test_execution_loop_refills_immediately_and_waits_only_after_empty_lease(self):
         tasks, paths = self.execution_tasks(3)
@@ -1738,7 +1732,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
             with self.assertRaises(pull.CleanupProtocolUnsupported):
                 pull.cleanup_lease_v2(self.cfg, 8, 8, 1 << 30)
 
-    def test_lease_beyond_local_caps_is_refused_before_any_work(self):
+    def test_lease_beyond_the_advertised_allowance_is_refused_before_any_work(self):
         tasks, paths = self.execution_tasks(3)
         with mock.patch.object(pull, 'restore_api', return_value=dict(tasks=tasks)):
             with self.assertRaises(RuntimeError):
@@ -1750,18 +1744,16 @@ class CleanupProtocol2Tests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     pull.cleanup_lease_v2(self.cfg, 8, 8, 1 << 30)
         self.assertTrue(all(p.exists() for p, _ in paths))
-        # The coordinator asks only for the remaining local headroom.
-        self.inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_local_deletions(id INTEGER PRIMARY KEY AUTOINCREMENT,item_id INTEGER NOT NULL,plan_sha256 TEXT NOT NULL,relative_path TEXT NOT NULL,size_bytes INTEGER NOT NULL,at_epoch REAL NOT NULL)")
-        self.inventory.db.executemany("INSERT INTO cleanup_local_deletions(item_id,plan_sha256,relative_path,size_bytes,at_epoch) VALUES(?,?,?,?,?)",
-                                      [(n, 'a'*64, 'x', 10, time.time()) for n in range(5)])
-        self.inventory.db.commit()
+        # No daily limit remains: the coordinator advertises the bounded group
+        # and a wire byte allowance no single server-capped item can exceed.
         seen = []
         def api(cfg, path, body, retry_stale=False, **kwargs):
             seen.append(body); return dict(tasks=[], retry_after_sec=120)
-        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull, 'CLEANUP_MAX_FILES_24H', 7):
+        with mock.patch.object(pull, 'restore_api', side_effect=api):
             self.run_v2(api)
+        self.assertGreater(pull.CLEANUP_EXECUTION_BYTES, 32 << 30)
         self.assertEqual(seen[0]['execution_files'], 1)
-        self.assertEqual(seen[0]['execution_bytes'], pull.CLEANUP_MAX_BYTES_24H - 50)
+        self.assertEqual(seen[0]['execution_bytes'], pull.CLEANUP_EXECUTION_BYTES)
 
     def test_dry_run_sends_md5_from_the_same_read_only_when_advertised(self):
         for advertised in (False, True):

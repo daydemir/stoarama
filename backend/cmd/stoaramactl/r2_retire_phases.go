@@ -283,6 +283,9 @@ func writeR2RetireListing(path, bucket string, prefixes []string, objects map[st
 // A planning manifest is not deletion authority. Every item is reselected under
 // the cleanup admission/public fences and matching inventory rows are locked.
 func r2RetireDecideForScope(c r2RetireCandidate, scope r2RetireScope, windows map[int64]api.Keep28Window, picks map[int64]r2RetirePick) (string, string, bool) {
+	if r2RetireKeepEverything(c.StreamID) {
+		return "keep_everything", "all", false
+	}
 	if scope.Class == r2RetireDeliveryOnly {
 		return r2RetireDeliveryDecide(c, scope, windows, picks)
 	}

@@ -66,11 +66,10 @@ class FastCopyTests(unittest.TestCase):
         return pull.r2_fast_copy_local(self.cfg, self.runtime, self.stop, time.monotonic() + 60, task, False)
 
     def run_batch(self, tasks, workers=2):
-        reply = {"tasks": tasks, "lease_expires_at": (datetime.datetime.now(datetime.timezone.utc)
-                                                      + datetime.timedelta(minutes=1)).isoformat()}
+        reply = {"tasks": tasks, "workers": workers, "lease_expires_at": (datetime.datetime.now(datetime.timezone.utc)
+                                                                          + datetime.timedelta(minutes=1)).isoformat()}
         control = SimpleNamespace(request_json=self.control)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            return pull.r2_fast_copy_batch(self.cfg, self.runtime, self.inventory, self.stop, control, pool, reply, False)
+        return pull.r2_fast_copy_batch(self.cfg, self.runtime, self.inventory, self.stop, control, reply, False)
 
     def control(self, operation, path, *, body):
         self.calls.append((operation, body))
@@ -135,6 +134,9 @@ class FastCopyTests(unittest.TestCase):
             with mock.patch.object(pull, "r2_copy_hash", side_effect=AssertionError("fresh transfer re-read")):
                 self.assertFalse(self.run_batch(tasks))
         self.assertEqual(peak, 2)
+        status = pull.r2_copy_status(self.inventory)
+        self.assertEqual(status["workers"], 2)
+        self.assertEqual(status["bytes_per_sec"], round(4 * len(self.body) / pull.R2_COPY_RATE_WINDOW_SEC))
         self.assertEqual([entry[0] for entry in self.calls],
                          [pull.R2CopyControlOperation.INVENTORY, pull.R2CopyControlOperation.RESULT_BATCH])
         reports = self.calls[0][1]["files"]
@@ -152,11 +154,28 @@ class FastCopyTests(unittest.TestCase):
                          "directory_fsync_ms", "publish_ms"} <= phases["item"].keys())
         self.assertIn("result_ms", phases["batch"])
 
+    def test_lease_supplies_stream_count(self):
+        for workers in (0, 33, "8", None):
+            with self.subTest(workers=workers), self.assertRaisesRegex(pull.R2CopyHold, "invalid copy worker count"):
+                self.run_batch([self.task()], workers)
+        self.assertFalse(self.path(self.task()).exists())
+        self.assertEqual(self.calls, [])
+
+    def test_rate_window_forgets_old_transfers(self):
+        telemetry = pull.R2CopyTelemetry()
+        with mock.patch.object(pull.time, "monotonic", return_value=1000.0):
+            telemetry.transferred(600)
+        with mock.patch.object(pull.time, "monotonic", return_value=1000.0 + pull.R2_COPY_RATE_WINDOW_SEC - 1):
+            telemetry.transferred(300)
+            self.assertEqual(telemetry.bytes_per_sec(), round(900 / pull.R2_COPY_RATE_WINDOW_SEC))
+        with mock.patch.object(pull.time, "monotonic", return_value=1001.0 + pull.R2_COPY_RATE_WINDOW_SEC):
+            self.assertEqual(telemetry.bytes_per_sec(), 1)
+        self.assertEqual(telemetry.downloaded, 900)
+
     def test_worker_configuration_and_lease_telemetry(self):
-        with mock.patch.dict(os.environ, {"STOARAMA_R2_FAST_COPY_WORKERS": "8",
-                                         "STOARAMA_R2_FAST_COPY_REREAD": "false"}):
+        with mock.patch.dict(os.environ, {"STOARAMA_R2_FAST_COPY_REREAD": "false"}):
             cfg = pull.Config()
-        self.assertEqual(cfg.fast_copy_workers, 8)
+        self.assertFalse(hasattr(cfg, "fast_copy_workers"))
         self.assertFalse(cfg.fast_copy_reread)
 
         def lease(operation, path, *, body):

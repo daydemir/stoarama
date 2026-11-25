@@ -441,10 +441,10 @@ func cleanupEnableGates(ctx context.Context, tx pgx.Tx, id int64) (int, map[stri
    recovery<>$3 OR proof->'stitch_replacement' IS NULL
     OR proof->'stitch_replacement' IS DISTINCT FROM i.item->'stitch_certificate'->'output'
   ELSE (recovery NOT IN ('r2_sha_verified','r2_md5_etag_matched') AND NOT coalesce(
-   recovery=$4 AND outcome->>'client_version'=$5 AND recovery_evidence->>'client_version'=$5,false))
+   recovery=$4 AND outcome->>'client_version'=ANY($6) AND recovery_evidence->>'client_version'=$5,false))
    OR coalesce(recovery_evidence->>'etag','')='' END),
  count(*) FILTER (WHERE i.item->>'permit_reason'=$2) FROM nas_cleanup_items i WHERE plan_id=$1`,
-		id, nasCleanupCertifiedStitchReason, nasCleanupCertifiedStitchRecovery, cleanupRecoveryNameSizeMatched, nasFastCopyClientVersion).Scan(&bad, &certified)
+		id, nasCleanupCertifiedStitchReason, nasCleanupCertifiedStitchRecovery, cleanupRecoveryNameSizeMatched, nasFastCopyClientVersion, nasFastCopyVersions).Scan(&bad, &certified)
 	if err != nil || bad != 0 {
 		if certified != 0 {
 			return 409, map[string]any{"error": "fresh complete dry run with exact certified NAS replacement for every item required"}
@@ -761,7 +761,7 @@ func (s *Server) cleanupRecoveryFor(id int64, i nasCleanupItem, mode string, evi
 		return cleanupPrefetchedRecovery{}, false
 	}
 	p, ok := env.prefetched[id]
-	return p, ok && p.mode == mode && p.objectKey == i.ObjectKey && p.sizeBytes == i.SizeBytes && p.sha256 == i.SHA256 && string(p.evidence) == string(evidence) && p.md5 == req.MD5 && p.nameSize == (req.ClientVersion == nasFastCopyClientVersion)
+	return p, ok && p.mode == mode && p.objectKey == i.ObjectKey && p.sizeBytes == i.SizeBytes && p.sha256 == i.SHA256 && string(p.evidence) == string(evidence) && p.md5 == req.MD5 && p.nameSize == nasFastCopyLine(req.ClientVersion)
 }
 
 // cleanupBatchDigest binds an ordered batch of plans to the cleanup policy.
@@ -1070,7 +1070,7 @@ func (s *Server) cleanupPrefetchRecovery(ctx context.Context, cid int64, clientV
 			}
 			defer func() { <-slots }()
 			var result cleanupPrefetchedRecovery
-			nameSize := clientVersion == nasFastCopyClientVersion
+			nameSize := nasFastCopyLine(clientVersion)
 			if j.reverify && !nameSize {
 				// Historical failed audits must finish SHA verification, even if
 				// this object is outside today's deterministic audit sample.

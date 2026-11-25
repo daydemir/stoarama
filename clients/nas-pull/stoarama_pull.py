@@ -4,6 +4,7 @@
 import argparse
 import base64
 import binascii
+import collections
 import concurrent.futures
 from contextlib import contextmanager, ExitStack
 import datetime
@@ -52,7 +53,10 @@ LOW_MEMORY_COPY_CLIENT_VERSION = "r2-copy-v8-low-memory"
 LOW_MEMORY_CLEANUP_CLIENT_VERSION = "r2-copy-v8-low-memory-cleanup"
 # Same artifact line built with the 20-day cleanup pin; identical behavior.
 KEEP20_CLEANUP_CLIENT_VERSION = "r2-copy-v8-keep20-cleanup"
-FAST_COPY_CLIENT_VERSION = "r2-copy-v8-fast-copy"
+# Fast-copy line; the API supplies the stream count with every lease. The
+# ke-day release deletes day directories without the app-writer fence, from
+# day permits in names or dir mode, and Keep Everything days in names mode.
+FAST_COPY_CLIENT_VERSION = "r2-copy-v8-ke-day"
 LOW_MEMORY_CLEANUP_VERSIONS = frozenset((LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, FAST_COPY_CLIENT_VERSION))
 CLEANUP_CERTIFIED_STITCH_REASON = "durham_stitch_certified"
 CLEANUP_CERTIFIED_STITCH_RECOVERY = "nas_stitch_certified"
@@ -770,7 +774,6 @@ class Config:
         self.download_workers = env_int("STOARAMA_DOWNLOAD_WORKERS", DEFAULT_DOWNLOAD_WORKERS)
         self.restore_workers = env_int("STOARAMA_RESTORE_WORKERS", DEFAULT_RESTORE_WORKERS)
         if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION:
-            self.fast_copy_workers = env_int("STOARAMA_R2_FAST_COPY_WORKERS", 8)
             self.fast_copy_reread = env_str("STOARAMA_R2_FAST_COPY_REREAD", "false").lower() == "true"
         self.inventory_scan_interval_sec = env_int("STOARAMA_INVENTORY_SCAN_INTERVAL_SEC", INVENTORY_SCAN_INTERVAL_SEC)
         # Hash throughput already bounds disk pressure. An additional per-file
@@ -800,8 +803,6 @@ class Config:
             raise SystemExit("STOARAMA_DOWNLOAD_WORKERS must be between 1 and %d" % MAX_DOWNLOAD_WORKERS)
         if self.restore_workers < 1 or self.restore_workers > MAX_RESTORE_WORKERS:
             raise SystemExit("STOARAMA_RESTORE_WORKERS must be between 1 and %d" % MAX_RESTORE_WORKERS)
-        if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION and not 1 <= self.fast_copy_workers <= 32:
-            raise SystemExit("STOARAMA_R2_FAST_COPY_WORKERS must be between 1 and 32")
         if self.inventory_scan_interval_sec < 300 or self.inventory_scan_delay_ms < 0 or self.inventory_hash_mbps < 0 or self.inventory_hash_mbps > 1000:
             raise SystemExit("invalid NAS inventory scan cadence")
         if self.min_free_bytes < 1:
@@ -1023,7 +1024,6 @@ class Inventory:
             self.db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS r2_copy_blocks(item_id INTEGER PRIMARY KEY, token TEXT NOT NULL, reason TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS cleanup_local_deletions(id INTEGER PRIMARY KEY AUTOINCREMENT,item_id INTEGER NOT NULL,plan_sha256 TEXT NOT NULL,relative_path TEXT NOT NULL,size_bytes INTEGER NOT NULL,at_epoch REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS files (
                     clip_id INTEGER PRIMARY KEY,
                     recording_id INTEGER NOT NULL,
@@ -1905,6 +1905,8 @@ class Runtime:
         self.cursor_id = max(0, int(progress.get("after_id", 0)))
         self.collated_after_id = 0
         self.collated_next_poll = 0.0
+        # joined artifact id -> (consecutive failures, monotonic retry time)
+        self.joined_backoff = {}
         self.handoff_final_check_requested = threading.Event()
         self.clips_pulled = max(0, int(progress.get("clips_pulled", 0)))
         self.bytes_pulled = max(0, int(progress.get("bytes_pulled", 0)))
@@ -3227,10 +3229,9 @@ CLEANUP_FOLDER_STREAMS_JSON = """{
  "recordings/July": 17216
 }
 """
-# Owner decision (2026-11, PR #436): 5 TB per rolling 24 h, equal to the
-# server budget, with a file cap high enough that bytes are the binding limit.
-CLEANUP_MAX_FILES_24H = 400_000
-CLEANUP_MAX_BYTES_24H = 5_000_000_000_000  # 5 TB
+# Owner decision (2026-11): the NAS cleanup rolling daily limits were lifted
+# ("lift nas cleanup dialy limit please"). The server's per-plan bound is the
+# only size limit; deletions are still recorded in the fsynced ledger.
 CLEANUP_MAX_COLLATED_SECONDS = 7200
 CLEANUP_LEDGER_NAME = "cleanup-deletions.jsonl"
 CLEANUP_MONTHS = ("January", "February", "March", "April", "May", "June", "July",
@@ -17505,50 +17506,6 @@ def cleanup_guard_refusal(task, proof):
         return "keep-window check failed: %s" % str(exc)[:200]
 
 
-def cleanup_cap_totals(inventory):
-    """Exact rolling totals; caller holds lock and an IMMEDIATE transaction.
-
-    Only rows crossing the cutoff are visited. Retain all history so a wall
-    clock rollback reintroduces exactly the rows the original predicate did.
-    Ledger triggers keep reservations/releases atomic with the cached totals.
-    """
-    cutoff, files, total = inventory.db.execute(
-        "SELECT cutoff,files,bytes FROM cleanup_cap_totals WHERE id=1").fetchone()
-    next_cutoff = time.time() - 86400
-    if next_cutoff != cutoff:
-        crossed_files, crossed_bytes = inventory.db.execute(
-            "SELECT count(*),coalesce(sum(size_bytes),0) FROM cleanup_local_deletions WHERE at_epoch>? AND at_epoch<=?",
-            (min(cutoff, next_cutoff), max(cutoff, next_cutoff))).fetchone()
-        if crossed_files:
-            direction = -1 if next_cutoff > cutoff else 1
-            files += direction * crossed_files
-            total += direction * crossed_bytes
-            inventory.db.execute("UPDATE cleanup_cap_totals SET cutoff=?,files=?,bytes=? WHERE id=1",
-                                 (next_cutoff, files, total))
-    return files, total
-
-
-def cleanup_local_caps(inventory, size_bytes, reserve=None):
-    """Refuse beyond the hard local rolling-24h caps; optionally reserve one deletion."""
-    if type(size_bytes) is not int or size_bytes <= 0:
-        return "invalid deletion size"
-    with inventory.lock:
-        try:
-            inventory.db.execute("BEGIN IMMEDIATE")
-            files, total = cleanup_cap_totals(inventory)
-            if files + 1 > CLEANUP_MAX_FILES_24H or total + size_bytes > CLEANUP_MAX_BYTES_24H:
-                inventory.db.commit()
-                return "local 24h deletion cap reached (%d files, %d bytes)" % (files, total)
-            if reserve is not None:
-                inventory.db.execute("INSERT INTO cleanup_local_deletions(item_id,plan_sha256,relative_path,size_bytes,at_epoch) VALUES(?,?,?,?,?)",
-                                     (reserve["item_id"], reserve["plan_sha256"], reserve["relative_path"], size_bytes, time.time()))
-            inventory.db.commit()
-        except BaseException:
-            inventory.db.rollback()
-            raise
-    return None
-
-
 _CLEANUP_LEDGER_LOCK = threading.Lock()
 
 
@@ -17597,7 +17554,6 @@ class CleanupStage(str, Enum):
     PROOF = "proof"
     GUARD = "guard"
     OBSERVE_JOURNAL = "observe_journal"
-    CAPS = "caps"
     PERMIT = "permit"
     LEDGER_INTENT = "ledger_intent"
     PERMIT_CHECK = "permit_check"
@@ -17731,21 +17687,6 @@ def cleanup_initialize(inventory):
             cleanup_quarantine_tables(inventory)
             inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_rejected_receipts(item_id INTEGER,phase TEXT,body TEXT,rejected_at TEXT)")
             inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_execution_outcomes(id INTEGER PRIMARY KEY,item_id INTEGER NOT NULL,attempt INTEGER NOT NULL,at TEXT NOT NULL,body TEXT NOT NULL)")
-            inventory.db.execute("CREATE INDEX IF NOT EXISTS cleanup_local_deletions_window ON cleanup_local_deletions(at_epoch,size_bytes)")
-            inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_cap_totals(id INTEGER PRIMARY KEY CHECK(id=1),cutoff REAL NOT NULL,files INTEGER NOT NULL CHECK(files>=0),bytes INTEGER NOT NULL CHECK(bytes>=0))")
-            if inventory.db.execute("SELECT 1 FROM cleanup_cap_totals WHERE id=1").fetchone() is None:
-                cutoff = time.time() - 86400
-                inventory.db.execute("INSERT INTO cleanup_cap_totals SELECT 1,?,count(*),coalesce(sum(size_bytes),0) FROM cleanup_local_deletions WHERE at_epoch>?", (cutoff, cutoff))
-            inventory.db.execute("""CREATE TRIGGER IF NOT EXISTS cleanup_cap_insert AFTER INSERT ON cleanup_local_deletions BEGIN
-                UPDATE cleanup_cap_totals SET files=files+(NEW.at_epoch>cutoff),
-                bytes=bytes+CASE WHEN NEW.at_epoch>cutoff THEN NEW.size_bytes ELSE 0 END WHERE id=1; END""")
-            inventory.db.execute("""CREATE TRIGGER IF NOT EXISTS cleanup_cap_delete AFTER DELETE ON cleanup_local_deletions BEGIN
-                UPDATE cleanup_cap_totals SET files=files-(OLD.at_epoch>cutoff),
-                bytes=bytes-CASE WHEN OLD.at_epoch>cutoff THEN OLD.size_bytes ELSE 0 END WHERE id=1; END""")
-            inventory.db.execute("""CREATE TRIGGER IF NOT EXISTS cleanup_cap_update AFTER UPDATE ON cleanup_local_deletions BEGIN
-                UPDATE cleanup_cap_totals SET files=files-(OLD.at_epoch>cutoff)+(NEW.at_epoch>cutoff),
-                bytes=bytes-CASE WHEN OLD.at_epoch>cutoff THEN OLD.size_bytes ELSE 0 END
-                           +CASE WHEN NEW.at_epoch>cutoff THEN NEW.size_bytes ELSE 0 END WHERE id=1; END""")
             inventory.db.commit()
         except BaseException:
             inventory.db.rollback()
@@ -18212,10 +18153,8 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner, timings,
             # Independent client guard, in dry runs too: a refused item is
             # reported as a conflict observation (an outcome every server
             # accepts), never would_delete, so enabling its plan fails up front
-            # instead of pausing mid-run. Local caps apply to execution only.
+            # instead of pausing mid-run.
             refusal = cleanup_timed(timings, "guard_ms", cleanup_guard_refusal, task, proof)
-            if refusal is None and task.get("approved_proof") is not None:
-                refusal = cleanup_timed(timings, "caps_ms", cleanup_local_caps, inventory, task["item"].get("size_bytes"))
             if refusal:
                 raise RuntimeError("client deletion guard refused; KEEP: " + refusal)
             body.update(outcome="match", proof=proof, timings=dict(current.stage_timings))
@@ -18242,11 +18181,10 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner, timings,
                     current.permit_started, current.permit_expiry = permit_request_started, permit_expiry
                     current.deadline = min(current.deadline, permit_request_started + CLEANUP_PERMIT_MAX_AGE_SEC, time.monotonic() + max(0, wall_remaining))
                     item = task["item"]
-                    # Re-check immediately before unlink, reserve one deletion
-                    # against the local caps, then write the durable intent line.
-                    # Any failure here leaves the files untouched.
-                    refusal = cleanup_timed(timings, "guard_ms", cleanup_guard_refusal, task, proof) or cleanup_timed(
-                        timings, "caps_ms", cleanup_local_caps, inventory, item.get("size_bytes"), {"item_id": item_id, "plan_sha256": task["plan_sha256"], "relative_path": item["relative_path"]})
+                    # Re-check the live file immediately before unlink, then
+                    # write the durable intent line. Any failure here leaves
+                    # the files untouched.
+                    refusal = cleanup_timed(timings, "guard_ms", cleanup_guard_refusal, task, proof)
                     if refusal:
                         raise CleanupPermitRefused("local_guard", "client deletion guard refused; not unlinked: " + refusal)
                     ledger = {"item_id": item_id, "attempt": attempt, "plan_id": task.get("plan_id"), "plan_sha256": task["plan_sha256"],
@@ -18470,6 +18408,7 @@ CLEANUP_BULK_VERSIONS: frozenset[str] = frozenset((CLEANUP_BULK_VERSION, CLEANUP
 CLEANUP_GROUP_VERSIONS: frozenset[str] = CLEANUP_V6_VERSIONS | CLEANUP_BULK_VERSIONS
 CLEANUP_EXECUTION_GROUP = 8
 CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
+CLEANUP_EXECUTION_BYTES = 1 << 40  # wire bound on one lease; no item reaches it
 CLEANUP_V2_INFLIGHT = 64       # leased tasks held locally (running + queued)
 CLEANUP_V2_CYCLE_TASKS = 2048  # tasks per drain/replay cycle
 CLEANUP_BATCH_MAX = 64         # observations or receipts per request
@@ -18708,17 +18647,14 @@ class CleanupBatchAPI:
         self.replay_pool.shutdown(wait=False)
 
 
-def cleanup_local_headroom(inventory):
-    """Files and bytes still allowed by the local rolling-24h caps."""
-    with inventory.lock:
-        try:
-            inventory.db.execute("BEGIN IMMEDIATE")
-            files, total = cleanup_cap_totals(inventory)
-            inventory.db.commit()
-        except BaseException:
-            inventory.db.rollback()
-            raise
-    return CLEANUP_MAX_FILES_24H - files, CLEANUP_MAX_BYTES_24H - total
+def cleanup_execution_allowance():
+    """Files and bytes a lease may claim for execution.
+
+    No daily limit exists: the allowance is one bounded group and a wire byte
+    bound no single item can reach (the server caps an item identity at
+    32 GiB), so the lease advertises availability rather than a deletion cap."""
+    files = cleanup_execution_group_size() if CLIENT_VERSION in CLEANUP_GROUP_VERSIONS else CLEANUP_EXECUTION_INFLIGHT
+    return files, CLEANUP_EXECUTION_BYTES
 
 
 def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes, execution_only=False):
@@ -18801,8 +18737,7 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                 lane.before_lease()
                 execution_poll = bool(pending) and not dry_run_only and CLIENT_VERSION in CLEANUP_BULK_VERSIONS
                 room = min(cleanup_execution_group_size() if execution_poll else min(CLEANUP_V2_LEASE, inflight - len(pending)), task_limit - leased)
-                files_left, bytes_left = (0, 0) if dry_run_only else cleanup_local_headroom(inventory)
-                files_left = min(files_left, cleanup_execution_group_size() if CLIENT_VERSION in CLEANUP_GROUP_VERSIONS else CLEANUP_EXECUTION_INFLIGHT)
+                files_left, bytes_left = (0, 0) if dry_run_only else cleanup_execution_allowance()
                 if pins_error is not None:
                     files_left = bytes_left = 0  # every deletion would be refused
                 if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION and not dry_run_only:
@@ -18920,41 +18855,6 @@ def cleanup_journal_group(inventory, entries):
             raise
 
 
-def cleanup_reserve_group_caps(inventory, tasks):
-    with inventory.lock:
-        try:
-            inventory.db.execute("BEGIN IMMEDIATE")
-            files, total = cleanup_cap_totals(inventory)
-            sizes = [task["item"]["size_bytes"] for task in tasks]
-            if (any(type(size) is not int or size <= 0 for size in sizes)
-                    or files + len(tasks) > CLEANUP_MAX_FILES_24H or total + sum(sizes) > CLEANUP_MAX_BYTES_24H):
-                raise CleanupPermitRefused("local_guard", "local 24h deletion cap reached")
-            reservations = [inventory.db.execute(
-                "INSERT INTO cleanup_local_deletions(item_id,plan_sha256,relative_path,size_bytes,at_epoch) VALUES(?,?,?,?,?)",
-                (task["item_id"], task["plan_sha256"], task["item"]["relative_path"], task["item"]["size_bytes"], time.time())).lastrowid for task in tasks]
-            inventory.db.commit()
-            return reservations
-        except BaseException:
-            inventory.db.rollback()
-            raise
-
-
-def cleanup_release_caps(inventory, reservations):
-    """Release only live-owned, never-attempted reservations, by exact row ID.
-
-    A crash cannot release a possible unlink's charge: like actual deletions,
-    abandoned reservations age out of the rolling 24h window. Execution's
-    process lock allows at most one bounded group of provisional reservations.
-    """
-    with inventory.lock:
-        try:
-            inventory.db.executemany("DELETE FROM cleanup_local_deletions WHERE id=?", [(n,) for n in reservations])
-            inventory.db.commit()
-        except BaseException:
-            inventory.db.rollback()
-            raise
-
-
 def cleanup_group_response(response, tasks):
     results = response.get("results") if isinstance(response, dict) else None
     ids = {task["item_id"] for task in tasks}
@@ -19003,7 +18903,6 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
     owned = cleanup_own_group(inventory, tasks) if release_owned else owned
     started = time.monotonic()
     opened, observations, receipts, timings = [], [], [], []
-    reservations = []
     returned = set()
     permit_ms = None
     shared = {"lease_ms": max(t.get("_lease_elapsed_ms", 0) for t in tasks)}
@@ -19201,8 +19100,6 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
                 stage = CleanupStage.OBSERVE_JOURNAL
                 cleanup_timed(shared, "observe_journal_ms", cleanup_journal_group, inventory,
                     [(t, o, "observe", b) for (t, o), b in zip(owned, observations)])
-                stage = CleanupStage.CAPS
-                reservations = cleanup_timed(shared, "caps_ms", cleanup_reserve_group_caps, inventory, tasks)
                 if CLIENT_VERSION in CLEANUP_BULK_VERSIONS:
                     bulk_delete()
                 else:
@@ -19321,17 +19218,8 @@ def cleanup_process_group(cfg, inventory, stop_event, tasks, lane=None, owned=No
             raise
         finally:
             try:
-                # Include later members never reached after a permit/ledger failure.
-                # Never release an attempted member, or a historical charge for the
-                # same item: reservations are the exact inserted row IDs.
-                try:
-                    unused_caps = [row_id for row_id, (current, _) in zip(reservations, opened)
-                                   if not current.unlink_attempted]
-                    if unused_caps:
-                        cleanup_release_caps(inventory, unused_caps)
-                finally:
-                    if fenced:
-                        NAS_MEDIA_FENCE.release_cleanup()
+                if fenced:
+                    NAS_MEDIA_FENCE.release_cleanup()
                 try:
                     phases = {row[0]: row[1] for row in cleanup_journal(inventory)}
                 except Exception:
@@ -19416,6 +19304,350 @@ class CleanupPreflight:
             self.pool.shutdown(wait=True)
 
 
+# ---------------------------------------------------------------------------
+# Bulk NAS-only day-directory cleanup (the fast-copy release only).
+#
+# Owner (Deniz), verbatim: "if its outside of keep everything, then a nas copy
+# only needs to be checked if its in the keep 20? otherwise it can be deleted
+# right?"; "yes, delete". The server permits one stream-day of raw footage in
+# one directory. Before unlinking anything this client re-checks, from its own
+# pins only: folder -> stream, the permit mode the layout and Keep Everything
+# pin call for, and the whole local day lies outside the pinned 20-day window
+# with a one-day guard band.
+# It then deletes that day's media and sidecars in one pass under one durable
+# intent and reports one receipt. There is no R2 check and no local daily cap.
+#
+# The permit's mode says what may go. names (a flat recordings/<id>/... dir
+# holding every day of a recording): exactly the listed inventory entries, each
+# only while it is a regular file of the listed size; one listdir, no stat of
+# the rest. dir (a plaza <Month>/<DD-Weekday> dir of one stream-day): every
+# media file and sidecar of that date, catalogued or not; any other visible
+# entry keeps the whole directory. Hidden partials always stay.
+#
+# Keep Everything (Deniz: "nas shoul dnot have any of the keep everything
+# (except the keep 20)"): a KE stream's day always comes in names mode, listing
+# only files the server found with a live R2 counterpart of the same size; any
+# other file of the day stays.
+
+CLEANUP_DAY_PERMIT_PATH = "/account/connections/cleanup/day-permit"
+CLEANUP_DAY_RECEIPT_PATH = "/account/connections/cleanup/day-receipt"
+CLEANUP_DAY_PERMIT_MARGIN_SEC = 30
+CLEANUP_DAY_SIDECAR = ".stoarama.json"
+CLEANUP_DAY_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+CLEANUP_DAY_PLAZA_DIR_RE = re.compile(r"(?:[^/]+/)+(%s)/(0[1-9]|[12][0-9]|3[01])-(%s)" % (
+    "|".join(CLEANUP_MONTHS), "|".join(CLEANUP_DAY_WEEKDAYS)))
+CLEANUP_DAY_FLAT_DIR_RE = re.compile(r"(?:[^/]+/)+[1-9][0-9]*/(continuous|[1-9][0-9]*)")
+CLEANUP_DAY_PLAZA_FILE_RE = re.compile(r"[^/]*_(20[0-9]{2})_(%s)_W([1-6])_(%s)_hour_(?:[0-9]{2}|[0-9]{6})\.mp4" % (
+    "|".join(CLEANUP_MONTHS), "|".join(CLEANUP_DAY_WEEKDAYS)))
+CLEANUP_DAY_SECONDS_RE = re.compile(r"([1-9][0-9]{9})\.mp4")
+CLEANUP_DAY_MILLIS_RE = re.compile(r"([1-9][0-9]{12})\.mp4")
+
+
+class CleanupDayMode(str, Enum):
+    NAMES = "names"
+    DIR = "dir"
+
+
+class CleanupDayOutcome(str, Enum):
+    DELETED = "deleted"
+    PARTIAL = "partial"
+    REFUSED = "refused"
+
+
+def cleanup_day_file_date(directory, name, zone):
+    """Local date a raw media name in directory names, or None (server and preparer share the rule)."""
+    plaza = CLEANUP_DAY_PLAZA_DIR_RE.fullmatch(directory)
+    if plaza:
+        named = CLEANUP_DAY_PLAZA_FILE_RE.fullmatch(name)
+        if not named or named.group(2) != plaza.group(1) or named.group(4) != plaza.group(3):
+            return None
+        day = int(plaza.group(2))
+        try:
+            date = datetime.date(int(named.group(1)), CLEANUP_MONTHS.index(plaza.group(1)) + 1, day)
+        except ValueError:
+            return None
+        if CLEANUP_DAY_WEEKDAYS[date.weekday()] != plaza.group(3) or (day - 1) // 7 + 1 != int(named.group(3)):
+            return None
+        return date
+    flat = CLEANUP_DAY_FLAT_DIR_RE.fullmatch(directory)
+    if not flat:
+        return None
+    named = (CLEANUP_DAY_SECONDS_RE if flat.group(1) == "continuous" else CLEANUP_DAY_MILLIS_RE).fullmatch(name)
+    if not named:
+        return None
+    seconds = int(named.group(1)) / (1 if flat.group(1) == "continuous" else 1000)
+    return datetime.datetime.fromtimestamp(seconds, zone).date()
+
+
+def cleanup_day_refusal(permit, pins, now):
+    """None when this client independently confirms the directory-day may leave the NAS."""
+    try:
+        directory, stream = permit["relative_dir"], permit["stream_id"]
+        parts = directory.split("/") if isinstance(directory, str) else []
+        if (not parts or parts[0] == JOINED_ROOT or "\\" in directory or "\x00" in directory
+                or any(part in ("", ".", "..") for part in parts)):
+            return "invalid NAS directory"
+        if not (CLEANUP_DAY_PLAZA_DIR_RE.fullmatch(directory) or CLEANUP_DAY_FLAT_DIR_RE.fullmatch(directory)):
+            return "directory is not a dated raw NAS layout"
+        pinned = pins["folders"].get(cleanup_folder_key(directory + "/media", "raw"))
+        if pinned is None or type(stream) is not int or pinned != stream:
+            return "pinned folder map does not assign %r to stream %r" % (directory, stream)
+        dir_mode = CLEANUP_DAY_PLAZA_DIR_RE.fullmatch(directory) and stream not in pins["keep_everything"]
+        if permit["mode"] != (CleanupDayMode.DIR if dir_mode else CleanupDayMode.NAMES):
+            return "dir mode is for non-Keep-Everything plaza day directories only"
+        keep_start, keep_end, timezone = pins["windows"][stream]
+        if permit.get("timezone") != timezone:
+            return "permit timezone differs from the pinned window"
+        zone = ZoneInfo(timezone)
+        day = datetime.date.fromisoformat(permit["local_date"])
+        plaza = CLEANUP_DAY_PLAZA_DIR_RE.fullmatch(directory)
+        if plaza and (CLEANUP_MONTHS[day.month - 1] != plaza.group(1) or day.day != int(plaza.group(2))
+                      or CLEANUP_DAY_WEEKDAYS[day.weekday()] != plaza.group(3)):
+            return "directory does not name the permitted date"
+        first = keep_start.astimezone(zone).date()
+        last = (keep_end - datetime.timedelta(microseconds=1)).astimezone(zone).date()
+        if first - datetime.timedelta(days=2) < day < last + datetime.timedelta(days=2):
+            return "day %s is inside or adjacent to stream %d keep window %s..%s" % (day, stream, first, last)
+        expires = parse_certification_timestamp(permit["permit_expires_at"], "day permit expiry")
+        if (expires - now).total_seconds() <= CLEANUP_DAY_PERMIT_MARGIN_SEC:
+            return "day permit expires too soon"
+        return None
+    except Exception as exc:
+        return "day permit check failed: %s" % str(exc)[:200]
+
+
+def cleanup_day_open(root, directory):
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(str(root), flags)
+    try:
+        for part in directory.split("/"):
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def cleanup_day_media_name(name):
+    """(media name, is_sidecar) for a raw media or sidecar name."""
+    sidecar = name.endswith(".mp4" + CLEANUP_DAY_SIDECAR)
+    return (name[:-len(CLEANUP_DAY_SIDECAR)] if sidecar else name), sidecar
+
+
+def cleanup_day_select(descriptor, permit):
+    """(files, None) for the permitted day's media and sidecars, or (None, refusal)."""
+    zone = ZoneInfo(permit["timezone"])
+    day = datetime.date.fromisoformat(permit["local_date"])
+    files = []
+    if permit["mode"] == CleanupDayMode.NAMES:
+        for entry in permit["entries"]:
+            if cleanup_day_file_date(permit["relative_dir"], cleanup_day_media_name(entry["name"])[0], zone) != day:
+                return None, "permitted name %r does not name the permitted date" % entry["name"]
+        present, mismatched = set(os.listdir(descriptor)), 0
+        for entry in permit["entries"]:
+            name, size = entry["name"], entry["size_bytes"]
+            if name in present:
+                info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if not stat_module.S_ISREG(info.st_mode) or info.st_size != size:
+                    mismatched += 1
+                    continue  # Not the inventoried file: it stays.
+            files.append([name, size, entry["sidecar"]])  # Absent ones are already gone.
+        if mismatched:
+            log("WARN", "NAS day unit %d keeps %d permitted names that are not the inventoried regular file" % (permit["unit_id"], mismatched))
+        return sorted(files), None
+    with os.scandir(descriptor) as entries:
+        for entry in entries:
+            name = entry.name
+            if name.startswith("."):
+                continue  # Hidden partials stay.
+            info = entry.stat(follow_symlinks=False)
+            if not stat_module.S_ISREG(info.st_mode):
+                return None, "non-regular entry %r" % name
+            media, sidecar = cleanup_day_media_name(name)
+            named = cleanup_day_file_date(permit["relative_dir"], media, zone)
+            if named is None:
+                return None, "entry %r is not media of this directory's layout" % name
+            if named != day:
+                return None, "entry %r names %s" % (name, named)
+            files.append([name, info.st_size, sidecar])
+    return sorted(files), None
+
+
+def cleanup_day_receipt(descriptor, intent, outcome=None, refusal=""):
+    """Account the intent's files: those now absent were unlinked under the permit."""
+    receipt = dict(unit_id=intent["unit_id"], attempt=intent["attempt"], permit_token=intent["permit_token"],
+                   client_version=CLIENT_VERSION, media_files=0, media_bytes=0, sidecar_files=0, sidecar_bytes=0,
+                   remaining_files=0, refusal=refusal)
+    for name, size, sidecar in intent.get("files", ()):
+        try:
+            os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            receipt["remaining_files"] += 1
+        except FileNotFoundError:
+            kind = "sidecar" if sidecar else "media"
+            receipt[kind + "_files"] += 1
+            receipt[kind + "_bytes"] += size
+    receipt["outcome"] = (outcome or (CleanupDayOutcome.PARTIAL if receipt["remaining_files"] else CleanupDayOutcome.DELETED)).value
+    return receipt
+
+
+def cleanup_day_journal(inventory, unit_id, phase=None, body=None):
+    with inventory.lock:
+        try:
+            inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_day_receipts(unit_id INTEGER PRIMARY KEY,phase TEXT NOT NULL,body TEXT NOT NULL)")
+            if unit_id is None:
+                rows = inventory.db.execute("SELECT unit_id,phase,body FROM cleanup_day_receipts ORDER BY unit_id").fetchall()
+            elif phase is None:
+                inventory.db.execute("DELETE FROM cleanup_day_receipts WHERE unit_id=?", (unit_id,))
+            else:
+                inventory.db.execute("INSERT INTO cleanup_day_receipts VALUES(?,?,?) ON CONFLICT(unit_id) DO UPDATE SET phase=excluded.phase,body=excluded.body",
+                                     (unit_id, phase, cleanup_json_bytes(body).decode()))
+            inventory.db.commit()
+        except BaseException:
+            inventory.db.rollback()
+            raise
+    return rows if unit_id is None else None
+
+
+def cleanup_day_finish(cfg, inventory, receipt, timings):
+    """Journal, ledger and send one receipt; the journal clears only on an acknowledgment.
+
+    timings (phase -> ms) reach the ledger and one INFO line, never the wire receipt."""
+    cleanup_timed(timings, "receipt_journal_ms", cleanup_day_journal, inventory, receipt["unit_id"], "receipt", receipt)
+    cleanup_timed(timings, "receipt_ledger_ms", cleanup_ledger_append, cfg, dict(
+        {k: v for k, v in receipt.items() if k != "permit_token"}, event="day_receipt", timings=dict(timings), at=utc_now_precise()))
+    try:
+        cleanup_timed(timings, "receipt_post_ms", cleanup_api_retry, cfg, CLEANUP_DAY_RECEIPT_PATH, receipt)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (408, 429) or exc.code >= 500:
+            raise
+        # A definite rejection is evidence for the operator, never retried.
+        cleanup_ledger_append(cfg, dict(unit_id=receipt["unit_id"], attempt=receipt["attempt"], http_status=exc.code,
+                                        event="day_receipt_rejected", at=utc_now_precise()))
+    cleanup_timed(timings, "receipt_clear_ms", cleanup_day_journal, inventory, receipt["unit_id"])
+    CLEANUP_STATUS.add("day_" + receipt["outcome"])
+    log("INFO", "NAS day unit %d attempt %d %s: %d media files, %d bytes, %d remaining; ms %s" % (
+        receipt["unit_id"], receipt["attempt"], receipt["outcome"], receipt["media_files"], receipt["media_bytes"],
+        receipt["remaining_files"], " ".join("%s=%s" % item for item in sorted(timings.items()))))
+
+
+def cleanup_day_replay(cfg, inventory):
+    """Resend unacknowledged receipts; an interrupted pass is accounted from disk."""
+    for unit_id, phase, body in cleanup_day_journal(inventory, None):
+        record = json.loads(body)
+        if phase == "intent":
+            try:
+                descriptor = cleanup_day_open(cfg.output_dir, record["relative_dir"])
+            except FileNotFoundError:
+                record = dict(record, files=[])  # Whole directory gone: nothing remains.
+                descriptor = None
+            try:
+                record = cleanup_day_receipt(descriptor, record)
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+        cleanup_day_finish(cfg, inventory, record, {})
+
+
+def cleanup_day_run(cfg, inventory, stop_event, permit, timings):
+    """Delete one permitted directory-day in a single pass, or refuse it."""
+    base = dict(unit_id=permit["unit_id"], attempt=permit["attempt"], permit_token=permit["permit_token"])
+    pins, error = cleanup_timed(timings, "pins_ms", cleanup_pins)
+    refusal = ("pinned keep-window files failed verification: %s" % error if error is not None else
+               cleanup_day_refusal(permit, pins, datetime.datetime.now(datetime.timezone.utc)))
+    descriptor = None
+    try:
+        listed = time.monotonic()
+        if refusal is None:
+            try:
+                descriptor = cleanup_day_open(cfg.output_dir, permit["relative_dir"])
+            except FileNotFoundError:
+                descriptor = None
+            except OSError as exc:
+                refusal = "directory unavailable: %s" % type(exc).__name__
+        files = []
+        if refusal is None and descriptor is not None:
+            files, refusal = cleanup_day_select(descriptor, permit)
+        timings["select_ms"] = round((time.monotonic() - listed) * 1000)
+        if refusal is not None:
+            cleanup_day_finish(cfg, inventory, cleanup_day_receipt(None, base, CleanupDayOutcome.REFUSED, refusal[:500]), timings)
+            return
+        intent = dict(base, plan_id=permit["plan_id"], plan_sha256=permit["plan_sha256"], relative_dir=permit["relative_dir"],
+                      local_date=permit["local_date"], stream_id=permit["stream_id"], files=files, client_version=CLIENT_VERSION)
+        cleanup_timed(timings, "intent_ledger_ms", cleanup_ledger_append, cfg, dict(
+            {k: v for k, v in intent.items() if k != "permit_token"}, event="day_intent",
+            file_count=len(files), bytes=sum(size for _, size, _ in files), at=utc_now_precise()))
+        cleanup_timed(timings, "intent_journal_ms", cleanup_day_journal, inventory, permit["unit_id"], "intent", intent)
+        expires = parse_certification_timestamp(permit["permit_expires_at"], "day permit expiry")
+
+        # No app-writer fence: that fence keeps per-file cleanup's exact parent
+        # namespace proof valid, and it never covered the list-to-unlink gap. A
+        # day unit unlinks only the names it selected at list time and accounts
+        # each by absence: a file landing after the listing survives, and fast
+        # copy links new names without overwriting. Everything selected is
+        # out-of-window media of the permitted date (for KE, listed names only).
+        if descriptor is not None:
+            unlinked, started = 0, time.monotonic()
+            for name, _, _ in files:
+                if (stop_event.is_set() or (expires - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+                        <= CLEANUP_DAY_PERMIT_MARGIN_SEC):
+                    break  # Never unlink past the permit; the rest is a partial receipt.
+                try:
+                    os.unlink(name, dir_fd=descriptor)
+                except FileNotFoundError:
+                    pass
+                unlinked += 1
+            elapsed = time.monotonic() - started
+            timings.update(unlink_ms=round(elapsed * 1000), unlink_files=unlinked,
+                           unlink_mean_ms=round(elapsed * 1000 / unlinked, 2) if unlinked else 0)
+            cleanup_timed(timings, "dir_fsync_ms", os.fsync, descriptor)
+        receipt = cleanup_timed(timings, "account_ms", cleanup_day_receipt, descriptor, intent)
+        cleanup_day_finish(cfg, inventory, receipt, timings)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+CLEANUP_DAY_ENTRY_NAME_RE = re.compile(r"[^./\\\x00][^/\\\x00]*\.mp4(?:%s)?" % re.escape(CLEANUP_DAY_SIDECAR))
+
+
+def cleanup_day_valid_entry(entry):
+    return (isinstance(entry, dict) and set(entry) == {"name", "size_bytes", "sidecar"} and isinstance(entry["name"], str)
+            and CLEANUP_DAY_ENTRY_NAME_RE.fullmatch(entry["name"]) is not None and type(entry["size_bytes"]) is int
+            and entry["size_bytes"] >= 0 and entry["sidecar"] is cleanup_day_media_name(entry["name"])[1])
+
+
+def cleanup_day_valid_scope(permit):
+    """dir mode carries no entries; names mode carries plain media/sidecar names with sizes."""
+    mode, entries = permit.get("mode"), permit.get("entries")
+    if mode == CleanupDayMode.DIR.value:
+        return entries is None
+    return (mode == CleanupDayMode.NAMES.value and isinstance(entries, list) and len(entries) > 0
+            and all(map(cleanup_day_valid_entry, entries)))
+
+
+def cleanup_day_cycle(cfg, inventory, stop_event):
+    """Replay day receipts, then run at most one day permit. True when a unit ran."""
+    timings = {}
+    cleanup_timed(timings, "replay_ms", cleanup_day_replay, cfg, inventory)
+    if cfg.dry_run or stop_event.is_set():
+        return False
+    response = cleanup_timed(timings, "permit_ms", cleanup_api_retry, cfg, CLEANUP_DAY_PERMIT_PATH, {"client_version": CLIENT_VERSION})
+    permit = response.get("unit") if isinstance(response, dict) else None
+    if permit is None:
+        return False
+    if (not isinstance(permit, dict) or any(type(permit.get(key)) is not int or permit[key] <= 0
+                                            for key in ("unit_id", "plan_id", "attempt", "stream_id", "files", "bytes"))
+            or not re.fullmatch(r"[a-f0-9]{64}", str(permit.get("permit_token"))) or not isinstance(permit.get("relative_dir"), str)
+            or not isinstance(permit.get("local_date"), str) or not isinstance(permit.get("permit_expires_at"), str)
+            or not cleanup_day_valid_scope(permit)):
+        raise CleanupResponseError("invalid day cleanup permit")
+    permit = dict(permit, mode=CleanupDayMode(permit["mode"]))
+    cleanup_day_run(cfg, inventory, stop_event, permit, timings)
+    return True
+
+
 def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
     wait = 15
     v2_after = 0.0
@@ -19427,6 +19659,14 @@ def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
         try:
             while not stop_event.wait(wait):
                 v2 = time.monotonic() >= v2_after
+                if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION:
+                    try:
+                        if cleanup_day_cycle(cfg, inventory, stop_event):
+                            wait = 0
+                            continue
+                    except Exception as exc:
+                        log("WARN", "NAS day cleanup deferred: %s" % exc)
+                        CLEANUP_STATUS.fail("day: %s: %s" % (type(exc).__name__, exc))
                 try:
                     retry = None
                     if v2:
@@ -24027,6 +24267,9 @@ def ensure_joined_dependency_ack(cfg, runtime, item, stop_event):
             raise JoinedDownloadYield("joined protocol was disabled")
 
 
+JOINED_RETRY_MAX_SEC = 3600
+
+
 def drain_joined(cfg, runtime, stop_event, report_phase=True):
     if not runtime.joined_protocol_enabled() or cfg.dry_run:
         return False
@@ -24039,6 +24282,9 @@ def drain_joined(cfg, runtime, stop_event, report_phase=True):
     if raw_item is None:
         return False
     item = valid_joined_item(raw_item)
+    failures, retry_at = runtime.joined_backoff.get(item["id"], (0, 0.0))
+    if time.monotonic() < retry_at:
+        return False  # This artifact failed recently; it retries on its own backoff.
     if report_phase:
         runtime.set_phase(Phase.DRAINING)
     try:
@@ -24050,13 +24296,15 @@ def drain_joined(cfg, runtime, stop_event, report_phase=True):
         log("INFO", "joined artifact_id=%d stopped at a safe boundary" % item["id"])
         return False
     except Exception as exc:
+        delay = min(min(getattr(cfg, "poll_interval_sec", 60), 10) * 2 ** failures, JOINED_RETRY_MAX_SEC)
+        runtime.joined_backoff[item["id"]] = (failures + 1, time.monotonic() + delay)
         runtime.set_joined_transfer_error(item["id"], exc)
         runtime.set_joined_delivery_error(
-            item["id"], classify_joined_delivery_error(exc), min(getattr(cfg, "poll_interval_sec", 60), 10),
-            "joined artifact_id=%d: %s" % (item["id"], exc),
+            item["id"], classify_joined_delivery_error(exc), delay, "joined artifact_id=%d: %s" % (item["id"], exc),
         )
-        log("ERROR", "joined artifact_id=%d failed: %s" % (item["id"], exc))
+        log("ERROR", "joined artifact_id=%d failed (retry in %ds): %s" % (item["id"], delay, exc))
         raise
+    runtime.joined_backoff.pop(item["id"], None)
     runtime.clear_joined_delivery_error()
     runtime.clear_joined_transfer()
     log(
@@ -24097,7 +24345,10 @@ def joined_errno_class(exc):
 
 
 def joined_loop(cfg, runtime, stop_event):
-    """Drain collated outputs and generation-1 joined artifacts beside the raw loop."""
+    """Drain collated outputs and generation-1 joined artifacts beside the raw loop.
+
+    A failing joined artifact backs off on its own (drain_joined) and never
+    paces collated draining."""
     while not stop_event.is_set():
         if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
             return
@@ -24113,7 +24364,6 @@ def joined_loop(cfg, runtime, stop_event):
                 progress = drain_joined(cfg, runtime, stop_event, report_phase=False) or progress
             except Exception as exc:
                 log("WARN", "joined delivery deferred: %s" % exc)
-                progress = False
         if not progress:
             stop_event.wait(min(cfg.poll_interval_sec, 10))
 
@@ -24944,15 +25194,8 @@ def finalize_collated_handoff(cfg):
         check_collated_handoff_paths(cfg, threading.Event())
 
 
-def drain_collated(cfg, runtime, stop_event):
-    """Deliver one page of collated outputs. Returns True when any output landed."""
-    if cfg.dry_run:
-        return False
-    now = time.monotonic()
-    if now < runtime.collated_next_poll:
-        return False
-    # This lane's idle/error pacing is independent of joined-download progress.
-    runtime.collated_next_poll = now + min(cfg.poll_interval_sec, 10)
+def collated_page(cfg, runtime):
+    """(policy, items) of the next feed page with the cursor advanced, or None when there is nothing to deliver."""
     page = request_json(cfg, "GET", "/account/collated?limit=%d&after_id=%d&handoff_readback=1" % (COLLATED_PAGE_LIMIT, runtime.collated_after_id))
     if not isinstance(page, dict) or set(page) != {"policy", "items", "next_after_id"} or not isinstance(page["items"], list):
         raise RuntimeError("collated response is invalid")
@@ -24960,7 +25203,7 @@ def drain_collated(cfg, runtime, stop_event):
     if policy["handoff_check"] and not cfg.is_candidate:
         require_collated_handoff_release(cfg)
         runtime.handoff_final_check_requested.set()
-        return False
+        return None
     next_id = page["next_after_id"]
     if type(next_id) is not int or next_id < 0 or (next_id != 0 and next_id <= runtime.collated_after_id):
         raise RuntimeError("collated cursor is invalid")
@@ -24969,7 +25212,31 @@ def drain_collated(cfg, runtime, stop_event):
         raise RuntimeError("collated item outside cursor page")
     runtime.collated_after_id = next_id
     if not policy["enabled"] or not items:
+        return None
+    return policy, items
+
+
+# Pages one continuous run may prefetch before the joined lane gets a turn.
+COLLATED_RUN_PAGES = 20
+
+
+def drain_collated(cfg, runtime, stop_event):
+    """Deliver collated outputs through one bounded queue of download_parallel
+    workers. The next page is fetched while downloads are in flight, so
+    throughput is never bounded by page waves; the run ends at an empty page,
+    a stop, a paused feed, or after COLLATED_RUN_PAGES pages. Returns True when
+    any output landed."""
+    if cfg.dry_run:
         return False
+    now = time.monotonic()
+    if now < runtime.collated_next_poll:
+        return False
+    # This lane's idle/error pacing is independent of joined-download progress.
+    runtime.collated_next_poll = now + min(cfg.poll_interval_sec, 10)
+    first = collated_page(cfg, runtime)
+    if first is None:
+        return False
+    policy, items = first
     limiter = ByteRateLimiter(policy["download_bytes_per_sec"])
     delivered = []
 
@@ -25007,18 +25274,35 @@ def drain_collated(cfg, runtime, stop_event):
             item["output_id"], item["size_bytes"], cfg.output_dir / JOINED_ROOT / item["nas_relative_path"],
             "" if fetched else " existing"))
 
+    stopped, failure, pages = None, None, 1
     with concurrent.futures.ThreadPoolExecutor(max_workers=policy["download_parallel"]) as executor:
-        futures = [executor.submit(deliver, item) for item in items]
-        stopped = None
-        for future in futures:
-            try:
-                future.result()
-            except CollatedDownloadStopped as exc:
-                stopped = exc
+        pending = {executor.submit(deliver, item) for item in items}
+        feeding = True
+        while pending:
+            # Refill while the queue holds at most one wave, so workers never idle on a page boundary.
+            if feeding and len(pending) <= policy["download_parallel"]:
+                try:
+                    page = None if pages >= COLLATED_RUN_PAGES or stop_event.is_set() else collated_page(cfg, runtime)
+                except Exception as exc:
+                    page, failure = None, exc
+                if page is None:
+                    feeding = False
+                else:
+                    pages += 1
+                    pending |= {executor.submit(deliver, item) for item in page[1]}
+                    continue
+            done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                try:
+                    future.result()
+                except CollatedDownloadStopped as exc:
+                    stopped, feeding = exc, False
     if stopped is not None and not delivered:
         log("INFO", "collated delivery paused: %s" % stopped)
-    if delivered:
+    if delivered and failure is None:
         runtime.collated_next_poll = 0.0
+    if failure is not None:
+        log("WARN", "collated feed deferred after %d delivered: %s" % (len(delivered), failure))
     return bool(delivered)
 
 
@@ -53614,12 +53898,29 @@ class R2CopyBlocked(R2CopyHold):
         super().__init__(reason.value)
 
 
+R2_COPY_RATE_WINDOW_SEC = 300
+
+
 class R2CopyTelemetry:
     def __init__(self):
         self.lock = threading.Lock()
         self.holds = {}
         self.downloaded = self.committed = self.present = self.present_bytes = 0
         self.refreshed = self.refreshed_bytes = 0
+        self.workers = 0
+        self.recent = collections.deque()
+
+    def transferred(self, size):
+        with self.lock:
+            self.downloaded += size
+            self.recent.append((time.monotonic(), size))
+
+    def bytes_per_sec(self):
+        # Caller holds the lock. Rolling rate of fast GET bytes over the window.
+        cutoff = time.monotonic() - R2_COPY_RATE_WINDOW_SEC
+        while self.recent and self.recent[0][0] < cutoff:
+            self.recent.popleft()
+        return round(sum(size for _, size in self.recent) / R2_COPY_RATE_WINDOW_SEC)
 
     def hold(self, reason):
         with self.lock:
@@ -53635,6 +53936,7 @@ def r2_copy_status(inventory):
     with R2_COPY_TELEMETRY.lock:
         return dict(holds_by_reason=dict(R2_COPY_TELEMETRY.holds), mismatch_latched=mismatches,
                     downloaded_bytes=R2_COPY_TELEMETRY.downloaded, committed_bytes=R2_COPY_TELEMETRY.committed,
+                    workers=R2_COPY_TELEMETRY.workers, bytes_per_sec=R2_COPY_TELEMETRY.bytes_per_sec(),
                     verified_in_place=dict(objects=R2_COPY_TELEMETRY.present, bytes=R2_COPY_TELEMETRY.present_bytes),
                     refresh_verified_in_place=dict(objects=R2_COPY_TELEMETRY.refreshed, bytes=R2_COPY_TELEMETRY.refreshed_bytes))
 
@@ -54582,8 +54884,7 @@ def r2_fast_copy_stream(task, fd, guard, timings):
         timings["transfer_ms"] = round((time.monotonic() - first_byte) * 1000) if first_byte is not None else None
         timings["hash_ms"] = round(hash_sec * 1000, 3)
         timings["transferred_bytes"] = written
-        with R2_COPY_TELEMETRY.lock:
-            R2_COPY_TELEMETRY.downloaded += written
+        R2_COPY_TELEMETRY.transferred(written)
     info = os.fstat(fd)
     if written != item["size_bytes"]:
         raise R2CopyHold("copy GET truncated")
@@ -54669,11 +54970,14 @@ def r2_fast_copy_local(cfg, runtime, stop, deadline, task, reread):
         log("INFO", "R2 fast copy item " + json.dumps(timings, sort_keys=True))
 
 
-def r2_fast_copy_batch(cfg, runtime, inventory, stop, control, pool, response, reread):
+def r2_fast_copy_batch(cfg, runtime, inventory, stop, control, response, reread):
     tasks = [valid_r2_copy_task(task) for task in response["tasks"]]
     if (len(tasks) > 64 or any(task["item"]["kind"] != "raw" for task in tasks) or
             len({task["id"] for task in tasks}) != len(tasks)):
         raise R2CopyHold("invalid copy batch")
+    workers = response["workers"]
+    if type(workers) is not int or not 1 <= workers <= 32:
+        raise R2CopyHold("invalid copy worker count")
     expiry = parse_certification_timestamp(response["lease_expires_at"], "copy lease")
     deadline = time.monotonic() + expiry.timestamp() - time.time() - 5
     stats = {"tasks": len(tasks), "verified": 0}
@@ -54683,6 +54987,10 @@ def r2_fast_copy_batch(cfg, runtime, inventory, stop, control, pool, response, r
         pending, results, completed = {}, [], {}
         owned.enter_context(CLIENT_LOG_RING.scoped_secrets(
             value for task in tasks for value in (task["token"], task.get("url"))))
+        pool = owned.enter_context(concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="nas-r2-stream"))
+        with R2_COPY_TELEMETRY.lock:
+            R2_COPY_TELEMETRY.workers = workers
         def report_block(task, reason):
             nonlocal retry
             try:
@@ -54791,8 +55099,7 @@ def r2_fast_copy_backoff(failures):
 
 def r2_fast_copy_worker(cfg, runtime, inventory, stop):
     wait = failures = 0
-    with R2CopyControl(cfg, stop, 0) as control, concurrent.futures.ThreadPoolExecutor(
-            max_workers=cfg.fast_copy_workers, thread_name_prefix="nas-r2-stream") as pool:
+    with R2CopyControl(cfg, stop, 0) as control:
         while not stop.wait(wait):
             try:
                 free = r2_copy_resources(cfg, runtime)
@@ -54804,7 +55111,7 @@ def r2_fast_copy_worker(cfg, runtime, inventory, stop):
                 finally:
                     log("INFO", "R2 fast copy lease " + json.dumps(timing, sort_keys=True))
                 if response["tasks"] and not r2_fast_copy_batch(
-                        cfg, runtime, inventory, stop, control, pool, response, cfg.fast_copy_reread):
+                        cfg, runtime, inventory, stop, control, response, cfg.fast_copy_reread):
                     wait = failures = 0
                     continue
             except Exception as exc:
