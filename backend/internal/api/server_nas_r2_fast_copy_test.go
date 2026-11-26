@@ -25,12 +25,12 @@ type fastCopyLeaseReply struct {
 
 func useFastCopyFixture(t *testing.T, f *cleanupFixture) {
 	t.Helper()
-	applyMigrations(t, f, "0265_nas_r2_output_restore_lease_cap.sql", "0252_nas_r2_fast_copy_workers.sql")
+	applyMigrations(t, f, "0271_nas_r2_inventory_lease_cap.sql", "0252_nas_r2_fast_copy_workers.sql")
 	sum := md5.Sum([]byte("verified kept R2 footage"))
 	if _, err := f.pool.Exec(f.ctx, `UPDATE recording_clips SET etag=$1 WHERE id>=901 AND id<906`, hex.EncodeToString(sum[:])); err != nil {
 		t.Fatal(err)
 	}
-	f.useClientVersion(nasOutputRestoreClientVersion)
+	f.useClientVersion(nasDayInventoryClientVersion)
 	f.s.cfg.NASR2CopyEnabled = true
 	if w := adminFastCopyWorkers(t, f.s, http.MethodPost, map[string]any{"workers": 2}); w.Code != 200 || !strings.Contains(w.Body.String(), `"workers":2`) {
 		t.Fatalf("set workers: %d %s", w.Code, w.Body)
@@ -276,7 +276,7 @@ try:
             assert not pull.r2_fast_copy_batch(cfg, pull.Runtime(cfg), inventory, stop, control, batch, False)
 finally:
     inventory.close()
-`, api.URL, root, nasOutputRestoreClientVersion)
+`, api.URL, root, nasDayInventoryClientVersion)
 	cmd.Dir = "../../../clients/nas-pull"
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -301,7 +301,7 @@ finally:
 func TestNASStorageBindingV8FastCopyMigration(t *testing.T) {
 	s, pool := storageHeartbeatFixture(t)
 	ctx := context.Background()
-	for _, name := range []string{"0237_nas_storage_v8_cleanup_binding.sql", "0238_nas_storage_v8_keep20_cleanup_binding.sql", "0239_nas_storage_v8_fast_copy_binding.sql", "0246_nas_storage_v8_tunable_copy_binding.sql", "0250_nas_storage_v8_tunable_day_binding.sql", "0254_nas_storage_v8_tunable_modes_binding.sql", "0257_nas_storage_v8_ke_day_binding.sql", "0264_nas_storage_v8_output_restore_binding.sql"} {
+	for _, name := range []string{"0237_nas_storage_v8_cleanup_binding.sql", "0238_nas_storage_v8_keep20_cleanup_binding.sql", "0239_nas_storage_v8_fast_copy_binding.sql", "0246_nas_storage_v8_tunable_copy_binding.sql", "0250_nas_storage_v8_tunable_day_binding.sql", "0254_nas_storage_v8_tunable_modes_binding.sql", "0257_nas_storage_v8_ke_day_binding.sql", "0264_nas_storage_v8_output_restore_binding.sql", "0270_nas_storage_v8_inventory_binding.sql"} {
 		body, err := os.ReadFile("../../../infra/sql/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
@@ -311,12 +311,12 @@ func TestNASStorageBindingV8FastCopyMigration(t *testing.T) {
 		}
 	}
 	for _, version := range []string{"r2-copy-v5", NASR2CopyPagedClientVersion, nasCleanupCertifiedStitchVersion,
-		nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion, nasOutputRestoreClientVersion} {
+		nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion, nasOutputRestoreClientVersion, nasDayInventoryClientVersion} {
 		if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version=$1,nas_storage_budget_at=now() WHERE id=13`, version); err != nil {
 			t.Fatalf("binding refused %q: %v", version, err)
 		}
 	}
-	for _, unreviewed := range []string{nasTunableDayClientVersion + "-extra", nasOutputRestoreClientVersion + "-extra"} {
+	for _, unreviewed := range []string{nasTunableDayClientVersion + "-extra", nasOutputRestoreClientVersion + "-extra", nasDayInventoryClientVersion + "-extra"} {
 		if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version=$1 WHERE id=13`, unreviewed); err == nil {
 			t.Fatalf("binding accepted an unreviewed literal %q", unreviewed)
 		}

@@ -985,7 +985,7 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan))
 	// The raw object of clip 11 leaves R2 before the next attempt: its NAS copy stays.
 	exec(`UPDATE nas_cleanup_day_units SET permit_expires_at=now() WHERE id=$1`, p.UnitID)
 	exec(`UPDATE recording_clips SET purged_at=now() WHERE id=11`)
-	again := permit(nasOutputRestoreClientVersion)
+	again := permit(nasDayInventoryClientVersion)
 	if again == nil || fmt.Sprint(again.Entries) != fmt.Sprint(wantEntries[1:]) || again.DroppedNames != 1 {
 		t.Fatalf("re-permit kept a file whose counterpart left R2: %+v", again)
 	}

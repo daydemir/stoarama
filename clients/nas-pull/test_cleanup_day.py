@@ -297,7 +297,7 @@ class DayCleanupTests(unittest.TestCase):
     def test_day_release_is_on_the_cleanup_line(self):
         self.assertIn(pull.FAST_COPY_CLIENT_VERSION, pull.LOW_MEMORY_CLEANUP_VERSIONS)
         self.assertIn(pull.FAST_COPY_CLIENT_VERSION, pull.CLEANUP_BULK_VERSIONS)
-        self.assertEqual(pull.FAST_COPY_CLIENT_VERSION, 'r2-copy-v8-output-restore')
+        self.assertEqual(pull.FAST_COPY_CLIENT_VERSION, 'r2-copy-v8-inventory')
 
 
 if __name__ == '__main__':

@@ -54,10 +54,11 @@ LOW_MEMORY_CLEANUP_CLIENT_VERSION = "r2-copy-v8-low-memory-cleanup"
 # Same artifact line built with the 20-day cleanup pin; identical behavior.
 KEEP20_CLEANUP_CLIENT_VERSION = "r2-copy-v8-keep20-cleanup"
 # Fast-copy line; the API supplies the stream count with every lease. The
-# output-restore release deletes day directories without the app-writer fence,
+# inventory release deletes day directories without the app-writer fence,
 # from day permits in names or dir mode, and Keep Everything days in names mode,
-# and leases NAS-only stitched-output restores.
-FAST_COPY_CLIENT_VERSION = "r2-copy-v8-output-restore"
+# leases NAS-only stitched-output restores, and leases read-only stream-day
+# inventories.
+FAST_COPY_CLIENT_VERSION = "r2-copy-v8-inventory"
 LOW_MEMORY_CLEANUP_VERSIONS = frozenset((LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, FAST_COPY_CLIENT_VERSION))
 CLEANUP_CERTIFIED_STITCH_REASON = "durham_stitch_certified"
 CLEANUP_CERTIFIED_STITCH_RECOVERY = "nas_stitch_certified"
@@ -26093,6 +26094,166 @@ def restore_loop(cfg, stop_event, rng=random):
             wait = restore_wait(restore_once(cfg, stop_event))
         except Exception as exc:
             log("WARN", "nas restore deferred: %s" % exc)
+            wait = RESTORE_ERROR_WAIT_SEC
+
+
+# ---------------------------------------------------------------------------
+# Read-only stream-day inventory (the inventory release only;
+# backend/internal/api/server_nas_day_inventory.go).
+#
+# The API leases one (recording, local date) unit at a time. This client lists
+# that stream's day directories in every layout it already handles, from its
+# pinned folder map, plus the directories of the catalog's clips for that day
+# the lease names: flat recordings/<id>/{continuous,<job>} (kept to the day by
+# the shared name->date rule), plaza <folder>/<Month>/<DD-Weekday>, and their
+# joined/ mirrors joined/<folder>/<Month>/<DD-Weekday> and
+# joined/recordings/<id>/joined/<YYYY-MM-DD>. It reports each regular media
+# file's path, size, mtime and the sha256 of the bytes it read. It opens
+# nothing for writing and keeps no state: an interrupted unit's lease expires.
+
+DAY_INVENTORY_LEASE_PATH = "/account/connections/day-inventory/lease"
+DAY_INVENTORY_RESULT_PATH = "/account/connections/day-inventory/%d/result"
+
+
+class DayInventoryKind(str, Enum):
+    RAW = "raw"
+    JOINED = "joined"
+
+
+def valid_day_inventory_dir(directory):
+    parts = directory.split("/") if isinstance(directory, str) else []
+    if (not parts or parts[0] in (JOINED_ROOT, "#recycle") or "\\" in directory or "\x00" in directory
+            or any(part in ("", ".", "..") for part in parts)):
+        raise ValueError("invalid inventory directory %r" % (directory,))
+    return directory
+
+
+def valid_day_inventory_unit(unit):
+    out = {}
+    for name in ("unit_id", "attempt", "recording_id", "stream_id"):
+        if type(unit.get(name)) is not int or unit[name] <= 0:
+            raise ValueError("invalid inventory unit %s" % name)
+        out[name] = unit[name]
+    out["local_date"] = datetime.date.fromisoformat(unit["local_date"])
+    out["timezone"] = unit["timezone"]
+    if not isinstance(unit.get("expected_dirs"), list):
+        raise ValueError("invalid inventory unit expected_dirs")
+    out["expected_dirs"] = [valid_day_inventory_dir(d) for d in unit["expected_dirs"]]
+    return out
+
+
+def day_inventory_dirs(root, unit, pins):
+    """Sorted (kind, relative dir) pairs this unit lists; raises unless the pins own the stream."""
+    stream, day = unit["stream_id"], unit["local_date"]
+    if pins["windows"][stream][2] != unit["timezone"]:
+        raise ValueError("unit timezone differs from the pinned window")
+    folders = sorted(valid_day_inventory_dir(folder) for folder, owner in pins["folders"].items() if owner == stream)
+    if not folders:
+        raise ValueError("pinned folder map has no folder for stream %d" % stream)
+    plaza = "%s/%02d-%s" % (CLEANUP_MONTHS[day.month - 1], day.day, CLEANUP_DAY_WEEKDAYS[day.weekday()])
+    dirs = {(DayInventoryKind.RAW, d) for d in unit["expected_dirs"]}
+    for folder in folders:
+        dirs.add((DayInventoryKind.RAW, "%s/%s" % (folder, plaza)))
+        dirs.add((DayInventoryKind.JOINED, "%s/%s/%s" % (JOINED_ROOT, folder, plaza)))
+        if folder.startswith("recordings/"):
+            dirs.add((DayInventoryKind.JOINED, "%s/%s/%s/%s" % (JOINED_ROOT, folder, JOINED_ROOT, day.isoformat())))
+            for sub in day_inventory_names(root, folder, directories=True):
+                if CLEANUP_DAY_FLAT_DIR_RE.fullmatch("%s/%s" % (folder, sub)):
+                    dirs.add((DayInventoryKind.RAW, "%s/%s" % (folder, sub)))
+    return sorted(dirs)
+
+
+def day_inventory_names(root, directory, directories=False):
+    """Visible regular .mp4 files (or subdirectories) of directory; none when it is absent.
+
+    A symlink anywhere on the way refuses the whole unit."""
+    try:
+        descriptor = cleanup_day_open(root, directory)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        # O_NOFOLLOW|O_DIRECTORY on a symlink is ELOOP or ENOTDIR by platform.
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise ValueError("inventory directory %r is a symlink or not a directory" % directory) from exc
+        raise
+    try:
+        with os.scandir(descriptor) as entries:
+            return sorted(entry.name for entry in entries if not entry.name.startswith(".") and (
+                entry.is_dir(follow_symlinks=False) if directories
+                else entry.name.endswith(".mp4") and entry.is_file(follow_symlinks=False)))
+    finally:
+        os.close(descriptor)
+
+
+def day_inventory_hash(root, directory, name, kind):
+    """One file's report, from the bytes read; raises if it changed while read."""
+    descriptor = cleanup_day_open(root, directory)
+    try:
+        fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), dir_fd=descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        before = os.fstat(fd)
+        if not stat_module.S_ISREG(before.st_mode):
+            raise ValueError("%s/%s is not a regular file" % (directory, name))
+        digest, read = hashlib.sha256(), 0
+        while True:
+            chunk = os.read(fd, RESTORE_BLOCK_BYTES)
+            if not chunk:
+                break
+            digest.update(chunk)
+            read += len(chunk)
+        if read != before.st_size or certification_identity(os.fstat(fd)) != certification_identity(before):
+            raise FileChangedDuringHash("%s/%s changed while it was read" % (directory, name))
+    finally:
+        os.close(fd)
+    return {"relative_path": "%s/%s" % (directory, name), "kind": kind.value, "size_bytes": before.st_size,
+            "mtime_ns": before.st_mtime_ns, "sha256": digest.hexdigest()}
+
+
+def day_inventory_scan(root, unit, pins):
+    zone = ZoneInfo(unit["timezone"])
+    files = []
+    for kind, directory in day_inventory_dirs(root, unit, pins):
+        flat = kind is DayInventoryKind.RAW and CLEANUP_DAY_FLAT_DIR_RE.fullmatch(directory)
+        for name in day_inventory_names(root, directory):
+            if flat and cleanup_day_file_date(directory, name, zone) != unit["local_date"]:
+                continue
+            files.append(day_inventory_hash(root, directory, name, kind))
+    return files
+
+
+def day_inventory_once(cfg):
+    """Run at most one leased unit; returns the wait before the next lease."""
+    lease = restore_api(cfg, DAY_INVENTORY_LEASE_PATH, {"client_version": CLIENT_VERSION})
+    raw = lease.get("unit")
+    if raw is None:
+        return lease["retry_after_sec"]
+    unit_id = raw["unit_id"]
+    body = {"attempt": raw["attempt"], "started_at": utc_now_precise(), "client_version": CLIENT_VERSION, "files": [], "error": ""}
+    started = time.monotonic()
+    try:
+        pins, pins_error = cleanup_pins()
+        if pins_error is not None:
+            raise RuntimeError("pins unavailable: %s" % pins_error)
+        body["files"] = day_inventory_scan(cfg.output_dir, valid_day_inventory_unit(raw), pins)
+    except Exception as exc:
+        body["files"], body["error"] = [], ("%s: %s" % (type(exc).__name__, exc)).encode("utf-8")[:500].decode("utf-8", "ignore")
+    reply = restore_api(cfg, DAY_INVENTORY_RESULT_PATH % unit_id, body, retry_stale=True)
+    log("INFO" if not body["error"] else "WARN", "NAS day inventory unit=%d files=%d seconds=%.1f state=%s %s" % (
+        unit_id, len(body["files"]), time.monotonic() - started, reply.get("state"), body["error"]))
+    return 0
+
+
+def day_inventory_loop(cfg, stop_event):
+    wait = 30
+    while not stop_event.wait(wait):
+        if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
+            return
+        try:
+            wait = restore_wait(day_inventory_once(cfg))
+        except Exception as exc:
+            log("WARN", "NAS day inventory deferred: %s" % exc)
             wait = RESTORE_ERROR_WAIT_SEC
 
 
@@ -53240,6 +53401,9 @@ def run(cfg):
         # Verify-only selected manifests are independent from the cursor feed and
         # never write media bytes.
         threading.Thread(target=selected_verify_loop, args=(cfg, stop_event), daemon=True).start()
+        if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION:
+            # Read-only stream-day inventories; the API leases them only to this release.
+            threading.Thread(target=day_inventory_loop, args=(cfg, stop_event), daemon=True).start()
     copy_worker = None
     if not cfg.dry_run:
         copy_worker = threading.Thread(target=r2_copy_loop, args=(cfg, runtime, inventory, inventory_stop_event), daemon=True, name="nas-r2-copy")
