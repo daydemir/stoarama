@@ -408,7 +408,7 @@ class Backfill(Base):
         self.assertEqual([len(c['tsv'].splitlines()) for c in dry], [5000, 5000, 2001])
         self.assertLess(max(len(c['tsv']) for c in dry), 5000 * 400)
         self.assertEqual(len(json.loads((self.W / 'receipt-sources.json').read_text())), n)
-        self.assertEqual(len(self.calls('receipt-apply.sql')[0]['tsv'].splitlines()), n)
+        self.assertEqual(len(self.calls('receipt-apply.sql')[0]['tsv'].splitlines()), n - n // 7)  # already applied rows are skipped
         chunked = (self.W / 'preflight' / 'dry-run.out').read_text()
         one_shot = self.d / 'one-shot'
         with unittest.mock.patch.object(ma, 'ROWS_PER_STATEMENT', 10 ** 9):
@@ -419,6 +419,40 @@ class Backfill(Base):
         self.assertEqual(chunked.splitlines()[:2], [f'already_applied|raw||{done}|{done * 100}|0',
                                                     f'insert|raw||{n - done}|{(n - done) * 100}|{n - done}'])
         self.assertEqual(chunked.splitlines()[2:], [f'{s}|already_applied||raw|{99 + s}|100' for s in range(7, n + 1, 7)])
+
+    def status(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            try:
+                ma.main(['status', str(self.root)])
+            except SystemExit as e:
+                return str(e), [json.loads(l) for l in out.getvalue().splitlines()]
+        return None, [json.loads(l) for l in out.getvalue().splitlines()]
+
+    def test_defer_blocked_applies_the_rest_and_a_rerun_closes_once_the_hold_lifts(self):
+        held = 'trigger_nas_cleanup_source_hold'
+        (self.d / 'dry-run.out').write_text(f'blocked|raw|{held}|1|100|1\ninsert|raw||1|100|1\n2|blocked|{held}|raw|12|100\n')
+        out = self.run_cli('backfill', str(self.W), '--manifest', str(self.manifest), '--ledger', str(self.ledger), '--defer-blocked')
+        self.assertEqual(set(self.applied()), {KE[0]})
+        self.assertEqual((self.W / 'deferred-blocked.tsv').read_text(), f'{KE[1]}\t100\t{held}\n')
+        self.assertEqual((self.result()['state'], self.result()['complete'], self.result()['deferred']), ('deferred', False, 1))
+        self.assertEqual((out[-1]['state'], out[-1]['applied_now'], out[-1]['deferred']), ('deferred', 1, 1))
+        self.assertEqual(self.status(), ('1 open delete intents', [{'workdir': str(self.W), 'mode': 'backfill', 'manifest_sha256': self.digest,
+                                                                    'state': 'deferred', 'unresolved': 0, 'deferred': 1}]))
+        with self.assertRaisesRegex(SystemExit, 'would refuse'):  # without the flag, a held key still refuses
+            self.backfill()
+        self.assertEqual(len(self.calls('receipt-apply.sql')), 1)
+        (self.d / 'dry-run.out').write_text('already_applied|raw||1|100|0\ninsert|raw||1|100|1\n1|already_applied||raw|11|100\n')
+        self.backfill()
+        self.assertEqual([c['tsv'].split('\t')[4] for c in self.calls('receipt-apply.sql')], [KE[0], KE[1]])
+        self.assertEqual(self.applied()[KE[1]], '2026-11-23T23:13:39.424677Z')
+        self.assertEqual((self.result()['state'], self.result()['complete'], self.result()['deferred']), ('complete', True, 0))
+        self.assertFalse((self.W / 'deferred-blocked.tsv').exists())
+        self.assertEqual(self.status(), (None, [{'open': 0}]))
+        intent = json.loads((self.W / 'delete-intent.json').read_text())
+        self.assertEqual((intent['manifest_sha256'], intent['ledger_sha256']), (self.digest, ma.sha(self.ledger)))
+        (self.d / 'dry-run.out').write_text('already_applied|raw||2|200|0\n1|already_applied||raw|11|100\n2|already_applied||raw|12|100\n')
+        self.assertEqual(self.backfill(), [{'workdir': str(self.W), 'already_applied': 2}])
 
     def test_ledger_for_another_manifest_is_refused(self):
         self.write_manifest([(KE[0], ma.KE_CLASS)])
