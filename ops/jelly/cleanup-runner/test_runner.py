@@ -1761,7 +1761,7 @@ class DayVerifyTests(unittest.TestCase):
             self.assertIsNone(j.day_pick())
         self.assertTrue(calls and not set(calls) & j.keep_everything)
         self.assertIn('NOT EXISTS(SELECT 1 FROM nas_cleanup_day_units u WHERE u.plan_id=p.id AND u.stream_id IN (', sql[0])
-        self.assertTrue(all(str(sid) in sql[0] for sid in j.keep_everything))
+        self.assertIn('u.stream_id IN (%s))' % ','.join(str(sid) for sid in sorted(j.keep_everything)), sql[0])
         (j.root / 'KE_HOLD').unlink()
         calls.clear(); sql.clear()
         with patch.object(j, 'query', side_effect=lambda q, *_: sql.append(q) or []), \
@@ -1862,6 +1862,24 @@ class DayLoopTests(unittest.TestCase):
             dry.day_cat[0]['unlive'] = 1
             with self.assertRaises(r.Halt):
                 dry.day_checked(dry.day)
+
+    def test_keep_everything_hold_closes_a_saved_dry_run_plan_and_finishes_an_enabled_one(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW), patch.object(r.time, 'sleep'):
+            job = FakeDayRunner(root)
+            sid = job.day['units'][0]['stream_id']
+            job.keep_everything = {sid}
+            (Path(root) / 'KE_HOLD').write_text('hold')
+            self.assertIsNone(job.day_checked(job.day))
+            self.assertEqual(job.day['mode'], 'retired')
+            self.assertIsNone(job.status['current_day_plan'])
+            job.day.update(mode='enabled', approved_until=(NOW + timedelta(hours=1)).isoformat())
+            finished = []
+            job.day_finish = lambda p: finished.append(p['id'])
+            job.day_monitor(77)
+            self.assertEqual(finished, [77])  # Paused, drained and closed, not left running.
+            job.keep_everything = set()
+            job.day.update(mode='dry_run')
+            self.assertEqual(job.day_checked(job.day), 200)  # Non-KE plans ignore the hold.
 
     def test_one_owned_day_plan_enables_through_the_gate_then_pauses_and_closes(self):
         with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW), patch.object(r.time, 'sleep'):
