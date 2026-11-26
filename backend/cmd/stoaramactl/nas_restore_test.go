@@ -49,7 +49,7 @@ func TestParseNASRestoreRequestArgs(t *testing.T) {
 
 func TestClassifyNASRestoreCandidate(t *testing.T) {
 	ok := nasRestoreCandidate{ClipID: 1, ObjectKey: "k", DisplayPath: "a/b.mp4", SizeBytes: 5, SHA256: strings.Repeat("a", 64),
-		Purged: true, Bucket: "stoarama", Managed: true, ConnectionID: 13, NASVerified: true, NASConnection: 1}
+		Purged: true, Bucket: "stoarama", Managed: true, ConnectionID: 13, NASVerified: true, NASConnection: 1, KEOriginal: true}
 	if got := classifyNASRestoreCandidate(ok, "stoarama", false); got != "" {
 		t.Fatalf("eligible classified %q", got)
 	}
@@ -61,6 +61,8 @@ func TestClassifyNASRestoreCandidate(t *testing.T) {
 		"nas_unverified":           func(c *nasRestoreCandidate) { c.NASVerified = false },
 		"not_managed_storage":      func(c *nasRestoreCandidate) { c.Bucket = "other" },
 		"not_purged":               func(c *nasRestoreCandidate) { c.Purged = false },
+		"not_admitted":             func(c *nasRestoreCandidate) { c.KEOriginal = false },
+		"retirement_pending":       func(c *nasRestoreCandidate) { c.KEOriginal, c.RetirementPending = false, true },
 	} {
 		c := ok
 		mutate(&c)
@@ -76,7 +78,7 @@ func TestClassifyNASRestoreCandidate(t *testing.T) {
 	// A stream-day inventory's exact match is verified for the restore, purged
 	// or not, and is read from where the inventory found it.
 	inventoried := ok
-	inventoried.NASVerified, inventoried.Purged, inventoried.InventoriedPath = false, false, "plaza/September/25-Friday/b.mp4"
+	inventoried.NASVerified, inventoried.Purged, inventoried.KEOriginal, inventoried.InventoriedPath = false, false, false, "plaza/September/25-Friday/b.mp4"
 	if got := classifyNASRestoreCandidate(inventoried, "stoarama", false); got != "" || inventoried.sourcePath() != "plaza/September/25-Friday/b.mp4" {
 		t.Fatalf("inventoried clip classified %q from %q", got, inventoried.sourcePath())
 	}
@@ -114,7 +116,10 @@ UPDATE recording_clips SET purged_at=now() WHERE id IN (1,2,7);`); err != nil {
 	// schema (see the output and stream-day inventory tests). Nothing here is inventoried.
 	if _, err := pool.Exec(ctx, `ALTER TABLE nas_restore_requests ADD COLUMN output_id bigint;
 CREATE TABLE nas_day_inventory_files(clip_id bigint, relative_path text);
-CREATE FUNCTION nas_restore_inventoried_original(text,bigint,bigint,text,bigint,text,text) RETURNS boolean LANGUAGE sql AS 'SELECT false'`); err != nil {
+CREATE FUNCTION nas_restore_inventoried_original(text,bigint,bigint,text,bigint,text,text) RETURNS boolean LANGUAGE sql AS 'SELECT false';
+-- Every clip here is treated as Keep Everything with no pending deletion.
+CREATE FUNCTION nas_restore_ke_original(text,bigint,text,bigint,text,text) RETURNS boolean LANGUAGE sql AS 'SELECT true';
+CREATE FUNCTION collation_v2_recovery_retirement_pending(text) RETURNS boolean LANGUAGE sql AS 'SELECT false'`); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now()

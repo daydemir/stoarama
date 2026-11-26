@@ -358,7 +358,7 @@ jobs:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: |
           go test ./internal/api -run '^Test(R2StitchRetiredNASHandlersPreserveDurableRows|PullPathAllowed|ValidateNASRestoreResult|NASRestoreKeepEverything.*|NASRestoreScopedOutputLifecycle|ValidateNASDayInventoryResult|NASDayInventoryLifecycleAndRestore)$' -count=1 -v
-          go test ./cmd/stoaramactl -run '^Test(ParseNASRestoreRequestArgs|ClassifyNASRestoreCandidate|RequestNASRestoresQueuesOnlyVerifiedClips|RequestNASRestoresQueuesOnlyScopedAcknowledgedOutputs|ReadNASDayInventoryDays|NASDayInventoryRequestStatusAndRestoreQueue|ParseNASPurgeArgsDefaultsToSafeDryRun|NASPurgeSkipReasonOrder|NASVerifiedPurgeEndToEnd|NASPurgeCohortWindowsCoverTheApprovedFourteenDays|NASPurgeBindProtectionsNumbersPlaceholders)$' -count=1 -v
+          go test ./cmd/stoaramactl -run '^Test(ParseNASRestoreRequestArgs|ClassifyNASRestoreCandidate|RequestNASRestoresQueuesOnlyVerifiedClips|RequestNASRestoresQueuesOnlyScopedAcknowledgedOutputs|ReadNASDayInventoryDays|NASDayInventoryRequestStatusAndRestoreQueue|NASRestoreRequestQueuesOnlyAdmittedOriginalsPastTheWriterFence|ParseNASPurgeArgsDefaultsToSafeDryRun|NASPurgeSkipReasonOrder|NASVerifiedPurgeEndToEnd|NASPurgeCohortWindowsCoverTheApprovedFourteenDays|NASPurgeBindProtectionsNumbersPlaceholders)$' -count=1 -v
           go test ./internal/r2 -run '^TestR2LegacyDeletesAndMissingStitchAuthorityNeverReachWire$' -count=1 -v
       - name: Test R2 retire selection and apply safety
         env:

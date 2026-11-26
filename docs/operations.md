@@ -443,7 +443,11 @@ whatever its stream's Keep Everything pin: `nas_restore_inventoried_original`
 admits an 'original' restore to the clip's own key from the path the unit read.
 The PUT is create-only, so an existing object is re-hashed and never overwritten.
 No restore is admitted while an R2 deletion of the key is pending
-(`collation_v2_recovery_retirement_pending`, 0262).
+(`collation_v2_recovery_retirement_pending`, 0262). `nas-restore request`
+queues an 'original' only when `nas_restore_admitted` will admit it, so the
+writer fence never refuses a queued row. It skips other clips as
+`retirement_pending` or `not_admitted` (neither inventoried in scope nor a
+purged Keep Everything clip).
 Matches are never written to `nas_inventory_files`. That ledger is the client's
 sidecar-backed evidence, which cleanup, retirement and the cleanup runner's
 final check read as exact-path proof. `cancel --label L` withdraws the scope.
