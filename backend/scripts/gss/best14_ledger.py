@@ -79,6 +79,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import build_generation  # noqa: E402
 
+BUCKET = build_generation.BUCKET
+
 HOURS = range(1, 13)  # delivery hours 1-12 = local 08-19
 FIRST_LOCAL_HOUR = 8
 CLOCK_PREFIX = 'joined/clock-prestitch-'
@@ -260,7 +262,11 @@ SELECT h.recording_id, h.local_date, h.delivery_hour, h.id AS hour_row_id, h.hou
    AND w.completed_at IS NOT NULL AND w.object_key=o.object_key) AS recovery_put,
  EXISTS (SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='collated' AND x.source_id=o.id) AS reserved_collated,
  EXISTS (SELECT 1 FROM r2_nonraw_intents i WHERE i.kind='collated' AND i.source_id=o.id) AS nonraw_intent_collated,
- EXISTS (SELECT 1 FROM r2_object_retirements x WHERE x.kind='collated' AND x.source_id=o.id) AS retired_collated,
+ EXISTS (SELECT 1 FROM r2_object_retirements x WHERE x.kind='collated' AND x.source_id=o.id
+   AND NOT EXISTS (SELECT 1 FROM nas_restore_requests q WHERE q.output_id=o.id AND q.target='output'
+     AND q.state='verified' AND q.completed_at>x.retired_at AND q.verified_etag<>''
+     AND q.object_key=o.object_key AND q.sha256=o.sha256 AND q.size_bytes=o.size_bytes
+     AND x.bucket='{BUCKET}' AND x.object_key=q.object_key AND x.sha256=q.sha256 AND x.size_bytes=q.size_bytes)) AS retired_collated,
  EXISTS (SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='raw' AND x.source_id=ANY(o.source_clip_ids)) AS reserved_raw_source,
  EXISTS (SELECT 1 FROM r2_inverse_intents i WHERE i.source_id=ANY(o.source_clip_ids)) AS inverse_intent_source
 FROM recording_collation_hours h JOIN d USING (recording_id, local_date)
@@ -269,8 +275,12 @@ ORDER BY 1, 2, 3, 4, o.part;
 """
 
 
-# The delivery hold guard's collated-source closure: any of these refuses a new
-# video_collated keep hold on the output, so an output not already held is not servable.
+# The delivery hold guard's collated-source closure (guard_r2_delivery_keys_admitted,
+# migrations 0267 and 0269): any of these refuses a new video_collated keep hold on the
+# output, so an output not already held is not servable. A collated retirement stops
+# blocking once a verified NAS output restore completed after it re-created the same
+# bytes; the builder's hold names the output's own key, sha256 and size, so the
+# guard's hold-side equalities reduce to the output's.
 CLOSURE_COLUMNS = ('reserved_collated', 'nonraw_intent_collated', 'retired_collated', 'reserved_raw_source', 'inverse_intent_source')
 HOLDS_SQL = "SELECT object_key, etag, size_bytes FROM delivery_keep_holds WHERE bucket='stoarama';\n"
 EXTRACT_COLUMNS = ('recording_id', 'local_date', 'delivery_hour', 'hour_row_id', 'hour_id', 'batch_id', 'status',

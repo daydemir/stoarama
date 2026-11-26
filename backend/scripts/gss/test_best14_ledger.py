@@ -367,5 +367,51 @@ class CliTests(unittest.TestCase):
             self.assertIn('not a key/size/ETag listing line', r.stderr)
 
 
+DATABASE_URL = os.environ.get('STOARAMA_TEST_DATABASE_URL')
+CLOSURE_SCHEMA = """
+CREATE TABLE recording_collation_hours(id bigint, hour_id text, batch_id text, status text, registered_at timestamptz,
+  recording_id bigint, local_date date, delivery_hour smallint, source_clip_count int, included_clip_count int);
+CREATE TABLE recording_collation_outputs(id bigint, collation_hour_id bigint, part int, parts int, object_key text,
+  nas_relative_path text, size_bytes bigint, sha256 text, start_at timestamptz, end_at timestamptz, source_clip_ids bigint[]);
+CREATE TABLE nas_restore_requests(output_id bigint, target text, state text, completed_at timestamptz, verified_etag text,
+  object_key text, sha256 text, size_bytes bigint);
+CREATE TABLE r2_retirement_writer_operations(collation_recovery_hour_id text, completed_at timestamptz, object_key text);
+CREATE TABLE r2_retirement_reservations(kind text, source_id bigint);
+CREATE TABLE r2_nonraw_intents(kind text, source_id bigint);
+CREATE TABLE r2_object_retirements(kind text, source_id bigint, retired_at timestamptz, bucket text, object_key text,
+  sha256 text, size_bytes bigint);
+CREATE TABLE r2_inverse_intents(source_id bigint);
+INSERT INTO recording_collation_hours VALUES (1, 'h', 'nightly-collation-v2', 'collated', '2026-09-01', 401, '2026-08-19', 1, 5, 5);
+INSERT INTO recording_collation_outputs SELECT i, 1, i, 9, 'joined/n/objects/' || i || '.mp4', 'p/' || i || '.mp4', 100 + i,
+  repeat(i::text, 64 / length(i::text)), '2026-08-19 06:00+00', '2026-08-19 06:30+00', ARRAY[i * 10] FROM generate_series(1, 9) i;
+INSERT INTO r2_object_retirements SELECT 'collated', id, '2026-11-01', 'stoarama', object_key, sha256, size_bytes
+  FROM recording_collation_outputs WHERE id BETWEEN 1 AND 6;
+-- 2: restored after the retirement, same bytes: no longer blocks (0269).
+-- 3: restored before the retirement; 4: different sha256; 5: not verified; 6: empty verified_etag.
+INSERT INTO nas_restore_requests SELECT id, 'output', s, c::timestamptz, e, object_key, sha, size_bytes FROM (VALUES
+  (2, 'verified', '2026-11-25', 'etag', NULL), (3, 'verified', '2026-10-01', 'etag', NULL), (4, 'verified', '2026-11-25', 'etag', 'f'),
+  (5, 'leased', '2026-11-25', 'etag', NULL), (6, 'verified', '2026-11-25', '', NULL)) v(i, s, c, e, bad)
+  JOIN recording_collation_outputs o ON o.id = v.i CROSS JOIN LATERAL (SELECT coalesce(repeat(v.bad, 64), o.sha256) sha) x;
+INSERT INTO r2_retirement_reservations VALUES ('collated', 7), ('raw', 80);
+INSERT INTO r2_nonraw_intents VALUES ('collated', 9);
+"""
+
+
+@unittest.skipUnless(DATABASE_URL, 'set STOARAMA_TEST_DATABASE_URL to run the extract SQL against PostgreSQL')
+class ExtractSqlTests(unittest.TestCase):
+    def test_closure_clauses(self):
+        schema = 'gss_ledger_%d' % os.getpid()
+        sql = (f'CREATE SCHEMA {schema}; SET search_path={schema};' + CLOSURE_SCHEMA + L.extract_sql({(RID, DAYS[0])})
+               + f'DROP SCHEMA {schema} CASCADE;')
+        r = subprocess.run(['psql', DATABASE_URL, '-XqA', '-F', '\t', '-P', 'footer=off', '-v', 'ON_ERROR_STOP=1', '-f', '-'],
+                           input=sql, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rows = {int(x['output_id']): x for x in csv.DictReader(r.stdout.splitlines(), delimiter='\t')}
+        closed = {i: [c for c in L.CLOSURE_COLUMNS if rows[i][c] == 't'] for i in rows}
+        self.assertEqual(closed, {1: ['retired_collated'], 2: [], 3: ['retired_collated'], 4: ['retired_collated'],
+                                  5: ['retired_collated'], 6: ['retired_collated'], 7: ['reserved_collated'],
+                                  8: ['reserved_raw_source'], 9: ['nonraw_intent_collated']})
+
+
 if __name__ == '__main__':
     unittest.main()
