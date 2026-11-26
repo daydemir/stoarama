@@ -28,6 +28,11 @@ const globalDeliveryPrefix = "datasets/global-street-scores-delivery/47/"
 const publicGlobalDeliveryAPI = "/api/v1/global-street-scores-delivery"
 const globalDeliveryAPI = "/api/v1/account/global-street-scores-delivery"
 
+// errGlobalDeliveryOutdatedGeneration refuses a copied command whose generation
+// the NAS cleanup fence does not serve. Pasted commands print only the HTTP
+// status, so it answers 410 Gone rather than a retryable 503.
+var errGlobalDeliveryOutdatedGeneration = errors.New("This download link is outdated; copy a fresh command from the page.")
+
 type globalDeliveryObject struct {
 	Key         string `json:"key"`
 	ETag        string `json:"etag"`
@@ -135,7 +140,7 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 				return nil, errors.New("public generation pin missing during NAS cleanup")
 			}
 			if generation != "" && generation != *pinned {
-				return nil, errors.New("public publication deferred during NAS cleanup")
+				return nil, errGlobalDeliveryOutdatedGeneration
 			}
 			generation = *pinned
 		}
@@ -230,6 +235,13 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 	}
 	return &result, nil
 }
+func writeGlobalDeliveryRegistryError(w http.ResponseWriter, err error, unavailable string) {
+	if errors.Is(err, errGlobalDeliveryOutdatedGeneration) {
+		util.WriteError(w, http.StatusGone, err.Error())
+		return
+	}
+	util.WriteError(w, http.StatusServiceUnavailable, unavailable)
+}
 func (s *Server) handleGlobalDeliveryPage(w http.ResponseWriter, r *http.Request) {
 	pageName := "global-delivery/index.html"
 	if r.URL.Path == "/global-street-scores-delivery/files" {
@@ -270,7 +282,7 @@ func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Reques
 	}
 	registry, err := s.loadGlobalDeliveryRegistryScope(r.Context(), public, r.URL.Query().Get("generation"))
 	if err != nil {
-		util.WriteError(w, http.StatusServiceUnavailable, "Verified dataset metadata is temporarily unavailable. Reload to retry.")
+		writeGlobalDeliveryRegistryError(w, err, "Verified dataset metadata is temporarily unavailable. Reload to retry.")
 		return
 	}
 	name := r.URL.Query().Get("path")
@@ -338,7 +350,7 @@ func (s *Server) globalDeliveryFile(w http.ResponseWriter, r *http.Request) (glo
 	}
 	registry, err := s.loadGlobalDeliveryRegistryScope(r.Context(), public, r.URL.Query().Get("generation"))
 	if err != nil {
-		util.WriteError(w, http.StatusServiceUnavailable, "Verified file registry unavailable.")
+		writeGlobalDeliveryRegistryError(w, err, "Verified file registry unavailable.")
 		return globalDeliveryObject{}, false
 	}
 	object, ok := registry.Files[globalDeliveryFileID(r)]
