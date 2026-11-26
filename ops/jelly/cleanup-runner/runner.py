@@ -1489,9 +1489,19 @@ class Runner:
               WHERE c.display_path=u.dir||'/'||(n->>'name') AND c.size_bytes=(n->>'size_bytes')::bigint AND (""" + prepare.r2_live_raw('c', prepare.R2_BUCKET) + """
                OR EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.source_clip_ids @> ARRAY[c.id] AND """ + prepare.R2_LIVE_OUTPUT + """)))))),'[]') FROM u""", 'day catalog query')
 
+    def ke_plan_held(self, p):
+        return self.ke_held() and any(u['stream_id'] in self.keep_everything for u in p['units'])
+
     def day_checked(self, p):
         """day_verify's bytes, or None after closing a never-started plan whose Keep Everything name
-        lost its live R2 counterpart; its directory-days are replanned without that name."""
+        lost its live R2 counterpart, or that the Keep Everything hold covers; its directory-days are replanned."""
+        if p['mode'] == 'dry_run' and self.ke_plan_held(p):
+            require(not self.dry_run, 'a held Keep Everything plan cannot be closed by a dry run')
+            closed = self.day_control(p['id'], 'close', {'plan_sha256': p['plan_sha256'],
+                                      'reason': 'Keep Everything hold: waiting for live R2 verification; replanning.'}, 'retired')
+            require(closed['id'] == p['id'] and closed['mode'] == 'retired', 'day close was not confirmed')
+            self.save('day_replan', current_day_plan=None)
+            return None
         catalog = self.day_catalog(p)
         if not self.dry_run and p['mode'] == 'dry_run' and any(c.get('unlive') for c in catalog):
             closed = self.day_control(p['id'], 'close', {'plan_sha256': p['plan_sha256'],
@@ -1501,14 +1511,24 @@ class Runner:
             return None
         return day_verify(p, self.windows, self.timezones, self.keep_everything, self.folders, catalog)
 
+    def ke_held(self):
+        # Owner hold (2026-11-26): Keep Everything day cleanup waits until permits verify R2 live.
+        return (self.root / 'KE_HOLD').exists()
+
     def day_pick(self):
-        ids = self.query("SELECT coalesce(json_agg(id ORDER BY id),'[]') FROM nas_cleanup_day_plans WHERE account_id=47 "
-                         "AND connection_id=13 AND mode='dry_run' AND policy_sha256='" + POLICY_SHA + "'", 'day plan query')
+        held = self.ke_held() and self.keep_everything
+        skip_ke = (" AND NOT EXISTS(SELECT 1 FROM nas_cleanup_day_units u WHERE u.plan_id=p.id AND u.stream_id IN (%s))"
+                   % ','.join(str(int(sid)) for sid in sorted(self.keep_everything))) if held else ''
+        ids = self.query("SELECT coalesce(json_agg(p.id ORDER BY p.id),'[]') FROM nas_cleanup_day_plans p WHERE p.account_id=47 "
+                         "AND p.connection_id=13 AND p.mode='dry_run' AND p.policy_sha256='" + POLICY_SHA + "'" + skip_ke,
+                         'day plan query')
         if ids:
             return ids[0]
         for sid in sorted(self.windows, key=lambda sid: (sid in self.keep_everything, sid)):
             if self.stopped():
                 return None
+            if held and sid in self.keep_everything:
+                continue
             if not self.stream_ready(sid, DAY_EXCLUSIONS):
                 continue
             prefix = 'kday-' + utcnow().strftime('%Y%m%d-%H%M%S')
@@ -1530,7 +1550,7 @@ class Runner:
                     'live ownership failure requires shutdown')
             self.finish_health()
             p = self.day_plan(pid)
-            if day_state(p, utcnow()) != 'running':
+            if day_state(p, utcnow()) != 'running' or self.ke_plan_held(p):
                 self.day_finish(p)
                 return
             require(p['master_deletion_enabled'] is True, 'master switch mismatch during execution')
