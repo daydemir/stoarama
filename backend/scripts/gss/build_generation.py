@@ -151,7 +151,7 @@ def length(iv):
     return sum(b - a for a, b in merge(iv))
 
 
-def rebuild(store, recording_ids, present, gen_id, now):
+def rebuild(store, recording_ids, present, gen_id, now, refresh_paths=False):
     """Return ({asset path without .gz: new object}, changed recording ids).
 
     Assembly rule: a present assembly (id sha256:...) keeps its replaced
@@ -192,7 +192,7 @@ def rebuild(store, recording_ids, present, gen_id, now):
                 h[9] = parts; h[2] = sum(p[5] for p in parts); h[5] = sum(p[6] for p in parts)
         all_ids = {str(p[0]) for h in hours for p in h[9]}
         assert all_ids == kept, rid  # every kept original appears once on the timeline
-        stream_changed = sp2 != sp or any(k not in present for k in sp.get('current_download_paths', {}))
+        stream_changed = refresh_paths or sp2 != sp or any(k not in present for k in sp.get('current_download_paths', {}))
         if stream_changed:
             changed_streams.add(rid)
             sp2['current_download_paths'] = {str(o['id']): o['path'] for o in outputs if o['available']}
@@ -389,7 +389,7 @@ def annotate_availability(out, store, best14):
     return {a.value: n for a, n in counts.items()}
 
 
-def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None, added=None, file_holds=()):
+def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None, added=None, file_holds=(), refresh_paths=False):
     """Write the generation into out_dir (must not exist; None is a dry run that
     writes nothing). Returns the summary.
 
@@ -407,7 +407,7 @@ def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None
     if dup:
         raise SystemExit(f'{len(dup)} delivery paths are listed by more than one file, e.g. {dup[:3]}')
     assets = store.assets
-    out, changed = rebuild(store, parent['recording_ids'], present, gen_id, now)
+    out, changed = rebuild(store, parent['recording_ids'], present, gen_id, now, refresh_paths)
     availability = annotate_availability(out, store, best14) if best14 is not None else None
     published = {o['key'] for o in parent['assets'].values()}
     hold_by_key = {h['object_key']: h for h in holds}
@@ -458,6 +458,7 @@ def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None
         'files': len(files), 'recordings_with_files': len({v['recording_id'] for v in files.values()}),
         'changed_recordings': sorted(changed), 'assets_replaced': sum(new_assets[p] != assets[p] for p in assets),
         'objects': len(uploads), 'holds': len(new_holds), 'added_files': len(added or {}), 'availability': availability,
+        'stream_availability': {str(s['id']): s.get('availability') for s in out['/public/metadata.json']['streams']},
         'bytes_served': sum(v['size_bytes'] for v in files.values()), 'known_stale_fields': list(KNOWN_STALE_FIELDS),
     }
     if out_dir is not None:
@@ -512,12 +513,16 @@ def read_grades(path):
 
 
 def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
-    """(overlay of rebuilt base assets, present file ids, added registry files, new file holds).
+    """(overlay of rebuilt base assets, present file ids, added or renamed registry files,
+    new file holds).
 
-    Every servable ledger file (in R2, and held or holdable) is published: a file the parent lists under its parent
-    entry and path, any other part under its catalogued key and NAS path. Each
-    stream's timeline becomes its best-14 window; a parent hour whose parts are
-    unchanged is kept as is."""
+    Every servable ledger file (in R2, and held or holdable) is published at its
+    delivery name (delivery_naming): a file the parent lists keeps its entry, renamed
+    when its parent path is not that name; any other part is added under its
+    catalogued key. Every published path must pass delivery_naming.check_paths. Each
+    stream's timeline becomes its chosen window; a parent hour whose parts are
+    unchanged keeps its accounting."""
+    from delivery_naming import check_paths, delivery_path
     reg = inputs.registry
     files = reg['files']
     md, rd, cat = (store.load(p) for p in ('/public/metadata.json', '/public/readiness.json', '/public/catalog.json'))
@@ -527,7 +532,7 @@ def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
     by_rid = collections.defaultdict(list)
     for h in hours:
         by_rid[h.recording_id].append(h)
-    overlay, present, added, file_holds = {}, set(), {}, []
+    overlay, present, added, file_holds, renamed, published = {}, set(), {}, [], {}, []
     for rid in reg['recording_ids']:
         hs = sorted(by_rid[rid], key=lambda h: h.slot)
         tz = MS[rid]['timezone']
@@ -538,17 +543,22 @@ def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
         base_parts = {str(p[0]): p for d in sp['days'] for h in d['hours'] for p in h[9]}
         part_of = {str(p.output_id): (h, p) for h in hs if h.record for p in h.record.parts}
         pub = [(h, x) for h in hs for x in h.served if x.live]
+        served_path = {x.file_id: x.path for h in hs for x in h.served}
         on_timeline = {i for _, x in pub for i in x.registry_ids}
         outputs = []
         for h, x in pub:
             present.add(x.file_id)
+            published.append((rid, h.local_date, x.path))
             if x.file_id in files:
                 f = files[x.file_id]
-                if (f['key'], f['size_bytes'], f['sha256'], f['path']) != (x.key, x.size_bytes, x.sha256, x.path):
+                if (f['key'], f['size_bytes'], f['sha256']) != (x.key, x.size_bytes, x.sha256):
                     raise SystemExit(f'ledger file {x.file_id} differs from its parent entry')
                 if x.file_id not in base_out:
                     raise SystemExit(f'parent file {x.file_id} is not in the manifest of recording {rid}')
-                outputs.append(base_out[x.file_id])
+                if f['path'] != x.path:
+                    added[x.file_id] = dict(f, path=x.path)
+                    renamed[x.file_id] = x.path
+                outputs.append(dict(base_out[x.file_id], path=x.path))
                 continue
             if is_assembly(x):
                 raise SystemExit(f'assembly {x.file_id} is not in the parent: publishing new assemblies needs the clock-join builder')
@@ -575,18 +585,21 @@ def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
                 ids = [str(p.output_id) for p in h.record.parts if str(p.output_id) in on_timeline] if h.record else []
                 state = 'collated' if ids else 'gap_only' if not h.captured else 'missing_output' if h.record else 'unregistered'
                 bh = bd['hours'][h.delivery_hour - 1] if bd else None
+                def name(i):
+                    _, p = part_of[i]
+                    return (served_path.get(i) or delivery_path(inputs.names, rid, h.local_date, h.delivery_hour, p.part, p.parts)).rsplit('/', 1)[-1]
                 if bh is not None and [str(q[0]) for q in bh[9]] == ids and (bh[0] == state or (not h.captured and bh[0] in NO_CAPTURE_STATES)):
-                    day_hours.append(bh)
+                    day_hours.append(bh[:9] + [[q[:8] + [name(str(q[0]))] + q[9:] for q in bh[9]]] + bh[10:])
                     continue
                 parts = []
                 for i in ids:
                     if i in base_parts:
-                        parts.append(base_parts[i])
+                        q = base_parts[i]
+                        parts.append(q[:8] + [name(i)] + q[9:])
                         continue
                     _, p = part_of[i]
                     a, b_ = epoch(p.start_at), epoch(p.end_at)
-                    name = (files[i]['path'] if i in files else p.nas_path).rsplit('/', 1)[-1]
-                    parts.append([p.output_id, p.part, b_ - a, a - t0, b_ - t0, b_ - a, 0, 0, name, 1, None])
+                    parts.append([p.output_id, p.part, b_ - a, a - t0, b_ - t0, b_ - a, 0, 0, name(i), 1, None])
                 span = sum(q[2] for q in parts)
                 rec = h.record
                 day_hours.append([state, span, span, 0.0, rec.source_clips if rec else 0, rec.included_clips if rec else 0, 0,
@@ -622,7 +635,15 @@ def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
         c.update(start=start, end=end, available_start=start, available_end=end)
         c['weekly_exports']['available'] = {'period': {'start': start, 'end': end},
                                             'weeks': [{'number': 1, 'start': start, 'end': w1end}, {'number': 2, 'start': w2, 'end': end}]}
+    problems = check_paths(inputs.names, published)
+    if problems:
+        raise SystemExit(f'{len(problems)} published paths break the delivery naming, e.g. {problems[:3]}')
+    gr = store.load('/public/growth.json')
+    for r in gr['repairs']:
+        if 'sha256:' + r['sha256'] in renamed:
+            r['path'] = renamed['sha256:' + r['sha256']]
     overlay['/public/metadata.json'], overlay['/public/readiness.json'], overlay['/public/catalog.json'] = md, rd, cat
+    overlay['/public/growth.json'] = gr
     return overlay, present, added, file_holds
 
 
@@ -710,7 +731,7 @@ def main_ledger(a):
         windows = choose_windows(best14_hours, live_hours, live, is_assembly)
         chosen = [h for h in best14_hours if windows[h.recording_id] is Window.BEST14] + \
                  [h for h in live_hours if windows[h.recording_id] is Window.ORIGINAL]
-        best14_ledger.check_rules(chosen)
+        best14_ledger.check_rules(chosen, inputs.names)
     except best14_ledger.LedgerError as e:
         raise SystemExit(f'best14 ledger: {e}')
     lost = regressions(live, new_counts(chosen, is_assembly), {h.slot[:2] for h in chosen})
@@ -728,12 +749,16 @@ def main_ledger(a):
         holds = json.load(f)
     now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
     summary = build(inputs.registry, OverlayStore(store, overlay), present, holds, secrets.token_hex(16), now, a.note,
-                    None if a.dry_run else a.out, best14, added, file_holds)
+                    None if a.dry_run else a.out, best14, added, file_holds, refresh_paths=True)
     summary.update(report, window={str(rid): w.value for rid, w in windows.items()},
                    best14_days_ready={str(rid): sum(c in READY_DAY_CODES for _, c in v) for rid, v in sorted(best14.items())},
                    known_stale_fields=list(KNOWN_STALE_FIELDS) + list(LEDGER_STALE_FIELDS))
     if a.out and not a.dry_run:
         write_json(os.path.join(a.out, 'summary.json'), summary)
+    if a.ledger_out and not a.dry_run:
+        pub = best14_ledger.Publication(summary['generation'], False, {rid: w.value for rid, w in windows.items()},
+                                        {int(k): v for k, v in summary['stream_availability'].items()})
+        summary['ledger'] = best14_ledger.write(a.ledger_out, best14_hours, inputs.unheld, pub)
     return summary
 
 
@@ -814,6 +839,7 @@ def main(argv=None):
     led.add_argument('--listing', nargs='+')
     led.add_argument('--clock-proofs')
     led.add_argument('--grades', help='best14-grades.tsv (recording_id, local_date, grade)')
+    led.add_argument('--ledger-out', help='write the ledger of the new generation here (best14-ledger*.tsv, summary)')
     ap.add_argument('--note', required=True, help='publication_note of the new generation')
     out = ap.add_mutually_exclusive_group(required=True)
     out.add_argument('--out', help='output directory (must not exist)')

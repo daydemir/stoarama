@@ -9,9 +9,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import best14_ledger as L  # noqa: E402
+import delivery_naming as N  # noqa: E402
 
 RID, STREAM = 401, '14478'
 DAYS = [(datetime.date(2026, 8, 19) + datetime.timedelta(days=i)).isoformat() for i in range(14)]
@@ -27,8 +29,11 @@ def key(batch, oid):
     return f'joined/{batch}/objects/{oid:064x}.mp4'
 
 
-def path(date, dh, part=None):
-    return f'{RID}_Cusco/{date}/{RID}_Cusco_hour_{dh:02d}' + (f'_part_{part:02d}' if part else '') + '.mp4'
+NAMES = {RID: (f'{RID}_South_America_Peru_Cusco_Plaza_Mayor', f'{RID}_Plaza_Mayor')}
+
+
+def path(date, dh, part=None, count=2):
+    return N.delivery_path(NAMES, RID, date, dh, part or 1, count if part else 1)
 
 
 class World:
@@ -56,11 +61,11 @@ class World:
         for p in ps:
             self.listing[p.key] = (p.size_bytes, ETAG)
             if in_registry:
-                self.files[str(p.output_id)] = {'path': path(date, dh, p.part if parts > 1 else None)}
+                self.files[str(p.output_id)] = {'path': path(date, dh, p.part if parts > 1 else None, parts)}
         return rec
 
     def inputs(self):
-        return L.Inputs(best14(), self.records, list(self.assemblies), self.listing, {'files': self.files}, {})
+        return L.Inputs(best14(), self.records, list(self.assemblies), self.listing, {'files': self.files}, {}, 0, NAMES)
 
     def select(self):
         return L.select(self.inputs())
@@ -78,8 +83,11 @@ class World:
         return a
 
 
+PUB = L.Publication('ab' * 16, False, {RID: 'best14'}, {RID: 'available'})
+
+
 def summary(hours):
-    return L.summary_line(hours, L.stream_rows(hours, L.day_rows(hours)), 0)
+    return L.summary_line(hours, L.stream_rows(hours, L.day_rows(hours)), 0, PUB)
 
 
 class SelectionTests(unittest.TestCase):
@@ -90,7 +98,8 @@ class SelectionTests(unittest.TestCase):
         streams = L.stream_rows(hours, days)
         self.assertEqual({d['day_stitched'] for d in days}, {'R'})
         self.assertEqual((streams[0]['days_complete'], streams[0]['available'], streams[0]['captured_hours']), (14, 'y', 140))
-        self.assertTrue(summary(hours).startswith('streams_available=1/1 days_complete=14/14 hours_complete=140/140 original=280 '))
+        self.assertIn(f'generation={"ab" * 16} published=n page_available=1 windows_best14=1 streams_available=1/1 '
+                      'days_complete=14/14 hours_complete=140/140 original=280 ', summary(hours))
 
     def test_missing_key_and_unregistered_hour(self):
         w = World()
@@ -148,7 +157,7 @@ class SelectionTests(unittest.TestCase):
         w.add(w.next_row, DAYS[2], 4, 'recovery-best14-20261125', 3, L.Source.NEW_STITCH, in_registry=False)
         h = w.hour(w.select(), DAYS[2], 4)
         self.assertEqual((h.ok, {s.source for s in h.served}), (True, {L.Source.NEW_STITCH}))
-        self.assertEqual([s.path for s in h.served], [f'nas/{w.next_row}/{p}.mp4' for p in (1, 2, 3)])
+        self.assertEqual([s.path for s in h.served], [path(DAYS[2], 4, p, 3) for p in (1, 2, 3)])
         self.assertEqual({s.etag for s in h.served}, {ETAG})
 
     def test_one_record_serves_an_hour(self):
@@ -179,10 +188,10 @@ class AssemblyTests(unittest.TestCase):
         self.assertEqual([s.file_id for s in h.served], [str(ids[0]), a.file_id, str(ids[3])])
         self.assertEqual((h.served[1].path, h.served[1].source, h.ok), (path(DAYS[3], 5, 2), L.Source.CLOCK_ASSEMBLY, True))
 
-    def test_live_generation_assembly_keeps_its_path_and_source(self):
-        a = self.w.assembly(self.rec, [1, 2, 3, 4], source=L.Source.V85_ASSEMBLY, path='live/name.mp4')
+    def test_live_generation_assembly_takes_its_delivery_name(self):
+        a = self.w.assembly(self.rec, [1, 2, 3, 4], source=L.Source.V85_ASSEMBLY, path='live/name_v85.mp4')
         h = self.w.hour(self.w.select(), DAYS[3], 5)
-        self.assertEqual([(s.file_id, s.path, s.source) for s in h.served], [(a.file_id, 'live/name.mp4', L.Source.V85_ASSEMBLY)])
+        self.assertEqual([(s.file_id, s.path, s.source) for s in h.served], [(a.file_id, path(DAYS[3], 5), L.Source.V85_ASSEMBLY)])
         self.assertIn('v85_assembly=1', summary(self.w.select()))
 
     def test_whole_hour_assembly_takes_the_hour_name(self):
@@ -271,19 +280,19 @@ class RuleTests(unittest.TestCase):
         self.hours = self.w.select()
 
     def test_rules_pass(self):
-        L.check_rules(self.hours)
+        L.check_rules(self.hours, NAMES)
 
     def test_record_serving_two_hours_fails(self):
         a, b = self.hours[0], self.hours[1]
         hours = [a, dataclasses.replace(b, record=a.record, served=a.served)] + self.hours[2:]
         with self.assertRaisesRegex(L.LedgerError, 'serves two hours'):
-            L.check_rules(hours)
+            L.check_rules(hours, NAMES)
 
     def test_file_from_another_set_fails(self):
         a, b = self.hours[0], self.hours[1]
         hours = [dataclasses.replace(a, served=a.served + b.served[:1])] + self.hours[1:]
         with self.assertRaisesRegex(L.LedgerError, 'not from the serving record'):
-            L.check_rules(hours)
+            L.check_rules(hours, NAMES)
 
     def test_assembly_duplicating_a_part_fails(self):
         h = self.hours[0]
@@ -291,20 +300,19 @@ class RuleTests(unittest.TestCase):
                        L.Source.CLOCK_ASSEMBLY, tuple(s.file_id for s in h.served))
         hours = [dataclasses.replace(h, served=(asm,) + h.served)] + self.hours[1:]
         with self.assertRaisesRegex(L.LedgerError, 'duplicates its parts'):
-            L.check_rules(hours)
+            L.check_rules(hours, NAMES)
 
     def test_part_served_by_no_file_fails(self):
         h = self.hours[0]
         hours = [dataclasses.replace(h, served=h.served[:1])] + self.hours[1:]
         with self.assertRaisesRegex(L.LedgerError, 'served by no file'):
-            L.check_rules(hours)
+            L.check_rules(hours, NAMES)
 
-    def test_duplicate_delivery_path_fails(self):
-        a = self.w.records[(RID, DAYS[0], 1)][0].parts[0]
-        b = self.w.records[(RID, DAYS[0], 2)][0].parts[0]
-        self.w.files[str(b.output_id)] = self.w.files[str(a.output_id)]
-        with self.assertRaisesRegex(L.LedgerError, 'delivery paths are served twice'):
-            self.w.select()
+    def test_paths_breaking_the_naming_fail(self):
+        h = self.hours[0]
+        hours = [dataclasses.replace(h, served=(dataclasses.replace(h.served[0], path='401_x/nas/part.mp4'),) + h.served[1:])] + self.hours[1:]
+        with self.assertRaisesRegex(L.LedgerError, 'break the delivery naming'):
+            L.check_rules(hours, NAMES)
 
 
 def write_registry(d, objects, files):
@@ -319,7 +327,7 @@ def write_registry(d, objects, files):
             f.write(body)
         assets[p] = {'key': k, 'sha256': sha, 'size_bytes': len(body)}
     with open(os.path.join(d, 'registry.json.gz'), 'wb') as f:
-        f.write(gzip.compress(json.dumps({'recording_ids': [RID], 'assets': assets, 'files': files}).encode()))
+        f.write(gzip.compress(json.dumps({'generation': 'cd' * 16, 'recording_ids': [RID], 'assets': assets, 'files': files}).encode()))
 
 
 class CliTests(unittest.TestCase):
@@ -345,8 +353,12 @@ class CliTests(unittest.TestCase):
                 f.writelines(f'{k}\t{n}\t"{e}"\n' for k, (n, e) in w.listing.items())
             with open(p('holds.tsv'), 'w') as f:
                 f.write('object_key\tetag\tsize_bytes\n')
-            write_registry(d, {'/public/growth.json': {'repairs': []},
-                               f'/public/streams/{RID}.json': {'days': [{'date': '2026-07-01'}]}}, w.files)
+            catalog = {'naming': N.NAMING_SPEC, 'streams': [{'id': RID, 'name': 'Cusco - Plaza Mayor', 'folder': NAMES[RID][0],
+                       'metadata': {'continent': 'South America', 'country': 'Peru', 'city': 'Cusco', 'plaza_name': 'Plaza Mayor'}}]}
+            write_registry(d, {'/public/growth.json': {'repairs': []}, '/public/catalog.json': catalog,
+                               f'/public/streams/{RID}.json': {'days': [{'date': '2026-07-01'}]},
+                               '/public/metadata.json': {'streams': [{'id': RID, 'start': DAYS[0], 'best14_start': DAYS[0],
+                                                                      'availability': 'available'}]}}, w.files)
             tool = [sys.executable, '-I', L.__file__]
             inputs = ['--best14', p('best14.tsv'), '--registry', p('registry.json.gz'), '--assets', p('assets')]
             sql = subprocess.run(tool + ['extract-sql'] + inputs, check=True, capture_output=True, text=True).stdout
@@ -356,7 +368,8 @@ class CliTests(unittest.TestCase):
             build = tool + ['build'] + inputs + ['--extract', p('extract.tsv'), '--holds', p('holds.tsv'), '--listing', p('listing.txt')]
             r = subprocess.run(build + ['--out-dir', p('out')], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertTrue(r.stdout.startswith('streams_available=1/1 days_complete=14/14 hours_complete=140/140'))
+            self.assertTrue(r.stdout.startswith('generation=' + 'cd' * 16 + ' published=y page_available=1 windows_best14=1 '
+                                                'streams_available=1/1 days_complete=14/14 hours_complete=140/140'), r.stdout)
             rows = L.read_tsv(p('out/best14-ledger.tsv'), L.LEDGER_COLUMNS)
             self.assertEqual(len(rows), 14 * 12)
             self.assertEqual(rows[0]['delivery_paths'].split(','), [path(DAYS[0], 1, 1), path(DAYS[0], 1, 2)])
@@ -365,6 +378,30 @@ class CliTests(unittest.TestCase):
             r = subprocess.run(build + ['--out-dir', p('out2')], capture_output=True, text=True)
             self.assertNotEqual(r.returncode, 0)
             self.assertIn('not a key/size/ETag listing line', r.stderr)
+
+
+class FakeLive:
+    def __init__(self, generation, streams):
+        self.objects = {'/public/growth.json': {'generation': generation}, '/public/metadata.json': {'streams': streams}}
+
+    def get(self, path, generation=None):
+        return self.objects[path]
+
+
+class LiveCheckTests(unittest.TestCase):
+    def test_live_check_marks_a_matching_ledger_published(self):
+        hours = World().select()
+        with tempfile.TemporaryDirectory() as d:
+            L.write(d, hours, 0, PUB)
+            live = [{'id': RID, 'start': DAYS[0], 'best14_start': DAYS[0], 'window': 'best14', 'availability': 'available'}]
+            self.assertEqual(L.live_check(d, FakeLive('ef' * 16, live)), [f"ledger generation ['{'ab' * 16}'] is not the live generation {'ef' * 16}"])
+            rolled = [dict(live[0], window='original', availability='partial')]
+            self.assertEqual(len(L.live_check(d, FakeLive('ab' * 16, rolled))), 1)
+            self.assertIn('published=n', Path(d, L.SUMMARY_FILE).read_text())
+            self.assertEqual(L.live_check(d, FakeLive('ab' * 16, live)), [])
+            self.assertIn(f'generation={"ab" * 16} published=y', Path(d, L.SUMMARY_FILE).read_text())
+            self.assertEqual({r['published'] for r in L.read_tsv(os.path.join(d, 'best14-ledger.tsv'), L.LEDGER_COLUMNS)}, {'y'})
+            self.assertEqual({r['published'] for r in L.read_tsv(os.path.join(d, 'best14-ledger-streams.tsv'), L.STREAM_COLUMNS)}, {'y'})
 
 
 DATABASE_URL = os.environ.get('STOARAMA_TEST_DATABASE_URL')

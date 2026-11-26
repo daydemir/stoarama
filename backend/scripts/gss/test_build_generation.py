@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import best14_ledger as L  # noqa: E402
+import delivery_naming as N  # noqa: E402
 import build_generation as b  # noqa: E402
 
 BACKEND = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -326,6 +327,9 @@ def iso(t):
     return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).isoformat()
 
 
+FX_NAMES = {rid: (f'{rid}_Europe_Poland_Warsaw_Plac_{rid}', f'{rid}_Plac_{rid}') for rid in RIDS}
+
+
 class LedgerWorld:
     """The Fixture's files as best-14 ledger hours: every hour complete in R2, its first
     hour served by its assembly. new_part() and move_window() change what the ledger serves."""
@@ -355,6 +359,8 @@ class LedgerWorld:
                     self.put(rid, date, h + 1, rec, served)
 
     def put(self, rid, date, dh, rec, served):
+        """Serve rec's hour with served, named as the ledger names them."""
+        served = tuple(dataclasses.replace(x, path=N.delivery_path(FX_NAMES, rid, date, dh, k, len(served))) for k, x in enumerate(served, 1))
         self.records[(rid, date, dh)] = [rec]
         self.hours[(rid, date, dh)] = L.Hour(rid, '1', date, dh, True, rec, served, True, True)
         for x in served:
@@ -373,7 +379,8 @@ class LedgerWorld:
         return p
 
     def inputs(self):
-        return L.Inputs({rid: ('1', [(d, 'R' * 12) for d in DAYS]) for rid in RIDS}, self.records, [], self.listing, self.fx.parent, {})
+        return L.Inputs({rid: ('1', [(d, 'R' * 12) for d in DAYS]) for rid in RIDS}, self.records, [], self.listing, self.fx.parent, {},
+                        0, FX_NAMES)
 
     def hour_list(self):
         return [self.hours[k] for k in sorted(self.hours)]
@@ -397,12 +404,22 @@ class LedgerBuildTests(unittest.TestCase):
     def build_ledger(self, world, name, grades=None):
         store, present, added, file_holds, best14, lost = world.generation(self.store, grades)
         out = self.out(name)
-        summary = b.build(self.fx.parent, store, present, self.fx.holds, GEN, NOW, 'note', out, best14, added, file_holds)
+        summary = b.build(self.fx.parent, store, present, self.fx.holds, GEN, NOW, 'note', out, best14, added, file_holds,
+                          refresh_paths=True)
         return out, b.read_registry(os.path.join(out, 'registry.json.gz')), summary, lost
 
     def test_same_selection_republishes_the_parent(self):
         out, reg, summary, lost = self.build_ledger(LedgerWorld(self.fx), 'same')
-        self.assertEqual((reg['files'], lost, summary['added_files'], summary['holds']), (self.fx.parent['files'], {}, 0, summary['objects']))
+        parent = self.fx.parent['files']
+        # Same files, renamed to their delivery names (the fixture's own paths are not delivery names).
+        self.assertEqual((set(reg['files']), lost, summary['added_files'], summary['holds']), (set(parent), {}, len(parent), summary['objects']))
+        self.assertEqual({k: dict(v, path=None) for k, v in reg['files'].items()}, {k: dict(v, path=None) for k, v in parent.items()})
+        self.assertEqual(reg['files'][str(RIDS[0] * 1000 + 2)]['path'], N.delivery_path(FX_NAMES, RIDS[0], DAYS[0], 2, 1, 2))
+        self.assertEqual(reg['files'][assembly_id(RIDS[0])]['path'], N.delivery_path(FX_NAMES, RIDS[0], DAYS[0], 1, 1, 1))
+        gr = self.object(out, reg, '/public/growth.json')
+        self.assertEqual({r['path'] for r in gr['repairs'] if r['recording_id'] == RIDS[0]}, {reg['files'][assembly_id(RIDS[0])]['path']})
+        stream = self.object(out, reg, f'/public/streams/{RIDS[1]}.json')
+        self.assertEqual((stream['current_download_generation'], len(stream['current_download_paths'])), (GEN, OUTPUTS))
         self.assertEqual(summary['availability'], {'available': len(RIDS), 'partial': 0})
         go_validate(self, os.path.join(out, 'registry.json.gz'))
 
@@ -410,21 +427,22 @@ class LedgerBuildTests(unittest.TestCase):
         w = LedgerWorld(self.fx)
         rid = RIDS[4]
         p = w.new_part(rid, DAYS[2], 2, 9_000_001)
+        name = N.delivery_path(FX_NAMES, rid, DAYS[2], 2, 1, 1)
         out, reg, summary, lost = self.build_ledger(w, 'new')
         self.assertEqual(lost, {})
         f = reg['files']['9000001']
         self.assertEqual((f['key'], f['path'], f['etag'], f['sha256'], f['size_bytes'], f['recording_id']),
-                         (p.key, p.nas_path, '"' + 'f' * 32 + '"', p.sha256, 2000, rid))
+                         (p.key, name, '"' + 'f' * 32 + '"', p.sha256, 2000, rid))
         self.assertNotIn(str(rid * 1000 + 2 * 4 + 2), reg['files'])  # the originals it replaces are gone
         holds = {h['object_key']: h for h in b.read_tsv(os.path.join(out, 'holds.tsv'), b.HOLD_COLUMNS)}
         self.assertEqual(holds[p.key], {'bucket': 'stoarama', 'object_key': p.key, 'etag': 'f' * 32, 'size_bytes': '2000',
-                                        'recording_id': str(rid), 'kind': 'video_collated', 'sha256': p.sha256, 'relative_path': p.nas_path})
+                                        'recording_id': str(rid), 'kind': 'video_collated', 'sha256': p.sha256, 'relative_path': name})
         stream = self.object(out, reg, f'/public/streams/{rid}.json')
         hour = stream['days'][2]['hours'][1]
-        self.assertEqual((hour[0], [q[0] for q in hour[9]], hour[9][0][8]), ('collated', [9000001], p.nas_path.rsplit('/', 1)[1]))
+        self.assertEqual((hour[0], [q[0] for q in hour[9]], hour[9][0][8]), ('collated', [9000001], name.rsplit('/', 1)[1]))
         man = self.object(out, reg, f'/public/manifests/{rid}.json')
         self.assertIn(9000001, [o['id'] for o in man['outputs']])
-        self.assertEqual(stream['current_download_paths']['9000001'], p.nas_path)
+        self.assertEqual(stream['current_download_paths']['9000001'], name)
         md = {s['id']: s for s in self.object(out, reg, '/public/metadata.json')['streams']}
         self.assertEqual(md[rid]['availability'], 'available')  # every hour is complete in R2
         go_validate(self, os.path.join(out, 'registry.json.gz'))
@@ -465,7 +483,8 @@ class LedgerBuildTests(unittest.TestCase):
             w.new_part(rid, DAYS[0], dh, 9_100_000 + dh)  # then moved to the new day
             live, new = w.records[(rid, DAYS[0], dh)]
             w.records[(rid, DAYS[0], dh)], w.records[(rid, new_day, dh)] = [live], [new]
-            w.hours[(rid, new_day, dh)] = dataclasses.replace(w.hours.pop((rid, DAYS[0], dh)), local_date=new_day)
+            h = w.hours.pop((rid, DAYS[0], dh))
+            w.put(rid, new_day, dh, h.record, h.served)
         store, present, added, file_holds, best14, lost = w.generation(self.store, {(rid, new_day): 'B'})
         self.assertEqual(sorted(lost), [(rid, DAYS[0]), (rid, DAYS[-1])])
         stream = store.load(f'/public/streams/{rid}.json')
