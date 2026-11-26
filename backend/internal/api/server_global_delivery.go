@@ -129,11 +129,12 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 			return nil, errors.New("public cleanup fence unavailable")
 		}
 		if fenced {
-			// Footage still present after the Nov 2026 wind-down, marked available or partial
-			// for each stream's best 14 days (Deniz, Nov 25: "let's make it so delivery page shows
-			// the 14 day periods right now where we have their best overall 14 day periods fully
-			// stitched and availble on r2"). Built by backend/scripts/gss/build_generation.py.
-			const reviewed = "ae14e746468c5c6402cd6f8ca55aca6e"
+			// Published from the best-14 delivery ledger (Deniz, Nov 25: "just make sure we're
+			// keeping a sane set and knowing we've stitched, and knowing we have full best 14 day
+			// periods"): each stream shows its best 14 days once they serve at least what the
+			// previous generation did, else its original period. Built from ae14e746 by
+			// backend/scripts/gss/republish.sh (build_generation.py --ledger).
+			const reviewed = "549402679c9d5f158cece1c4f77bad16"
 			if generation != "" && generation != reviewed {
 				return nil, errors.New("public publication deferred during NAS cleanup")
 			}

@@ -13,9 +13,10 @@ output directory:
 It never uploads and never writes the database. The controller uploads each
 uploads.tsv row create-only (If-None-Match: *) and checks the returned ETag
 equals the listed one (R2's single-part ETag is the body MD5), inserts
-holds.tsv, then publishes registry.json.gz as public/generations/<id>.json and
-public/current.json. A key already in the parent registry is neither uploaded
-nor held again.
+holds.tsv, then stages registry.json.gz create-only as
+public/generations/<id>.json. Moving public/current.json (preview, If-Match
+swap) is a separate, reviewed step. A key already in the parent registry is
+neither uploaded nor held again.
 
 --parent is the generation being replaced: the new registry keeps its top-level
 fields and lists the selected subset of its files. --base is the generation
@@ -30,8 +31,7 @@ local_date is the stream-timezone date the manifests and timelines carry.
 --best14 is best14-days.tsv (recording_id, local_date, day_stitched; 14 rows per
 recording). day_stitched R means every captured hour is stitched in R2 and .
 means no capture. A stream is "available" when all 14 days are R or . with at
-least one R, its
-base timeline covers exactly those days, and every captured hour keeps all its
+least one R, its base timeline covers exactly those days, and every captured hour keeps all its
 base parts; otherwise it is "partial" and serves what is selected.
 
 --base-holds is the base asset holds, exported read-only:
@@ -39,11 +39,27 @@ base parts; otherwise it is "partial" and serves what is selected.
     'kind',kind,'recording_id',recording_id,'relative_path',relative_path))
     FROM delivery_keep_holds WHERE bucket='stoarama'
     AND object_key LIKE 'datasets/global-street-scores-delivery/47/assets/%'"
+
+--ledger publishes from the best-14 ledger instead of a file selection. It takes
+best14_ledger.py's inputs (--registry, the live generation, is both parent and
+base) plus --grades (best14-grades.tsv), recomputes the ledger, and publishes
+every ledger file in R2: complete hours whole, other hours with what R2 holds.
+- A file the live generation lists keeps its entry and path; any other part is
+  added under its catalogued key, sha256, size and live ETag, at its NAS
+  relative path, with a video_collated delivery_keep_holds row unless an
+  identical hold exists (a differing hold fails).
+- Each stream's timeline, manifest, catalog weeks and metadata window become its
+  best-14 days; an hour whose parts are unchanged keeps its live hour as is.
+- Fails closed, before writing, when any stream-day of the live generation
+  would serve fewer complete hours or fewer assemblies (days outside the new
+  window serve none). --dry-run builds everything in memory, writes nothing and
+  prints the counts, including those regressions.
 """
 import argparse
 import collections
 import copy
 import csv
+import dataclasses
 import datetime
 import enum
 import gzip
@@ -52,6 +68,7 @@ import json
 import os
 import secrets
 import statistics
+import sys
 from pathlib import Path
 
 ASSET_PREFIX = 'datasets/global-street-scores-delivery/47/assets/'
@@ -178,7 +195,6 @@ def rebuild(store, recording_ids, present, gen_id, now):
         stream_changed = sp2 != sp or any(k not in present for k in sp.get('current_download_paths', {}))
         if stream_changed:
             changed_streams.add(rid)
-            assert f'/public/ranges/{rid}.json' in A, rid
             sp2['current_download_paths'] = {str(o['id']): o['path'] for o in outputs if o['available']}
             sp2['current_download_generation'] = gen_id
         out[f'/public/streams/{rid}.json'] = sp2
@@ -373,14 +389,20 @@ def annotate_availability(out, store, best14):
     return {a.value: n for a, n in counts.items()}
 
 
-def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None):
-    """Write the generation into out_dir (must not exist). Returns the summary.
+def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None, added=None, file_holds=()):
+    """Write the generation into out_dir (must not exist; None is a dry run that
+    writes nothing). Returns the summary.
 
     store holds the base assets. best14=None skips availability (only to
-    reproduce generations built before it existed)."""
+    reproduce generations built before it existed). added maps file ids the
+    parent does not list to their registry entries; file_holds are the
+    delivery_keep_holds rows those files still need."""
     if store.recording_ids != parent['recording_ids']:
         raise SystemExit('base and parent recordings differ')
     files = {k: v for k, v in parent['files'].items() if k in present}
+    files.update(added or {})
+    if set(files) != set(present):
+        raise SystemExit(f'selected files missing from the parent and the additions: {sorted(set(present) - set(files))[:3]}')
     dup = sorted(p for p, n in collections.Counter(v['path'] for v in files.values()).items() if n > 1)
     if dup:
         raise SystemExit(f'{len(dup)} delivery paths are listed by more than one file, e.g. {dup[:3]}')
@@ -391,8 +413,9 @@ def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None
     hold_by_key = {h['object_key']: h for h in holds}
     new_assets = copy.deepcopy(assets)
     uploads = {}
-    new_holds = {}
-    os.makedirs(out_dir)
+    new_holds = {h['object_key']: h for h in file_holds}
+    if out_dir is not None:
+        os.makedirs(out_dir)
     for p in assets:
         if not rebuilt_asset(p):
             continue
@@ -421,26 +444,296 @@ def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None
                 'relative_path': replaced['relative_path']}
         if new_holds.setdefault(key, hold) != hold:
             raise SystemExit(f'two assets map to {key} with different holds')
-        local = os.path.join(out_dir, 'objects', key)
-        os.makedirs(os.path.dirname(local), exist_ok=True)
-        with open(local, 'wb') as f:
-            f.write(body)
+        if out_dir is not None:
+            local = os.path.join(out_dir, 'objects', key)
+            os.makedirs(os.path.dirname(local), exist_ok=True)
+            with open(local, 'wb') as f:
+                f.write(body)
         uploads[key] = {'key': key, 'local_path': os.path.join('objects', key), 'sha256': sha,
                         'size_bytes': len(body), 'content_type': assets[p]['content_type'], 'etag': etag}
     registry = dict(parent, generation=gen_id, parent_generation=parent['generation'], created_at=now,
                     publication_note=note, assets=new_assets, files=files)
-    with open(os.path.join(out_dir, 'registry.json.gz'), 'wb') as f:
-        f.write(gzip.compress(dumps(registry), compresslevel=9, mtime=0))
-    write_tsv(os.path.join(out_dir, 'uploads.tsv'), UPLOAD_COLUMNS, [uploads[k] for k in sorted(uploads)])
-    write_tsv(os.path.join(out_dir, 'holds.tsv'), HOLD_COLUMNS, [new_holds[k] for k in sorted(new_holds)])
     summary = {
         'generation': gen_id, 'parent_generation': parent['generation'], 'created_at': now,
         'files': len(files), 'recordings_with_files': len({v['recording_id'] for v in files.values()}),
         'changed_recordings': sorted(changed), 'assets_replaced': sum(new_assets[p] != assets[p] for p in assets),
-        'objects': len(uploads), 'availability': availability,
+        'objects': len(uploads), 'holds': len(new_holds), 'added_files': len(added or {}), 'availability': availability,
         'bytes_served': sum(v['size_bytes'] for v in files.values()), 'known_stale_fields': list(KNOWN_STALE_FIELDS),
     }
-    write_json(os.path.join(out_dir, 'summary.json'), summary)
+    if out_dir is not None:
+        with open(os.path.join(out_dir, 'registry.json.gz'), 'wb') as f:
+            f.write(gzip.compress(dumps(registry), compresslevel=9, mtime=0))
+        write_tsv(os.path.join(out_dir, 'uploads.tsv'), UPLOAD_COLUMNS, [uploads[k] for k in sorted(uploads)])
+        write_tsv(os.path.join(out_dir, 'holds.tsv'), HOLD_COLUMNS, [new_holds[k] for k in sorted(new_holds)])
+        write_json(os.path.join(out_dir, 'summary.json'), summary)
+    return summary
+
+
+# ---- publishing from the best-14 ledger ---------------------------------------
+
+FILE_URL = '/api/v1/global-street-scores-delivery/file/'
+DAY_SCHEDULED_SECONDS = 12 * 3600
+FIRST_LOCAL_HOUR = 8
+COLLATED_HOLD_KIND = 'video_collated'
+
+# What publishing from the ledger rebuilds only approximately for a day the
+# parent timeline does not hold (no source accounting is extracted for it).
+LEDGER_STALE_FIELDS = (
+    'streams/<id>.json new-day hours: [1] captured and [2] represented are the sum of the hour\'s part spans, [3] excluded 0',
+    'streams/<id>.json new-day parts: [6] source clips 0',
+    'streams/<id>.json new days: captured_scheduled_seconds is the sum of its hours\' [1]',
+)
+
+
+class OverlayStore(AssetStore):
+    """The base assets, with some parsed bodies replaced (raw() still returns the base bytes)."""
+
+    def __init__(self, base, overlay):
+        self.__dict__.update(base.__dict__)
+        self.overlay = overlay
+
+    def load(self, path):
+        return copy.deepcopy(self.overlay[path]) if path in self.overlay else super().load(path)
+
+
+def epoch(ts):
+    return datetime.datetime.fromisoformat(ts).timestamp()
+
+
+def hour_bounds(tz, date, delivery_hour):
+    from zoneinfo import ZoneInfo
+    d = datetime.date.fromisoformat(date)
+    t0 = datetime.datetime(d.year, d.month, d.day, FIRST_LOCAL_HOUR + delivery_hour - 1, tzinfo=ZoneInfo(tz)).timestamp()
+    return t0, t0 + 3600
+
+
+def read_grades(path):
+    return {(int(r['recording_id']), r['local_date']): r['grade'] for r in read_tsv(path, ('recording_id', 'local_date', 'grade'))}
+
+
+def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
+    """(overlay of rebuilt base assets, present file ids, added registry files, new file holds).
+
+    Every ledger file in R2 is published: a file the parent lists under its parent
+    entry and path, any other part under its catalogued key and NAS path. Each
+    stream's timeline becomes its best-14 window; a parent hour whose parts are
+    unchanged is kept as is."""
+    reg, listing = inputs.registry, inputs.listing
+    files = reg['files']
+    md, rd, cat = (store.load(p) for p in ('/public/metadata.json', '/public/readiness.json', '/public/catalog.json'))
+    MS = {s['id']: s for s in md['streams']}
+    RS = rd['by_recording_id']
+    CS = {s['id']: s for s in cat['streams']}
+    by_rid = collections.defaultdict(list)
+    for h in hours:
+        by_rid[h.recording_id].append(h)
+    overlay, present, added, file_holds = {}, set(), {}, []
+    for rid in reg['recording_ids']:
+        hs = sorted(by_rid[rid], key=lambda h: h.slot)
+        tz = MS[rid]['timezone']
+        man = store.load(f'/public/manifests/{rid}.json')
+        base_out = {str(o['id']): o for o in man['outputs']}
+        sp = store.load(f'/public/streams/{rid}.json')
+        base_days = {d['date']: d for d in sp['days']}
+        base_parts = {str(p[0]): p for d in sp['days'] for h in d['hours'] for p in h[9]}
+        part_of = {str(p.output_id): (h, p) for h in hs if h.record for p in h.record.parts}
+        pub = [(h, x) for h in hs for x in h.served if x.key in listing]
+        on_timeline = {i for _, x in pub for i in x.registry_ids}
+        outputs = []
+        for h, x in pub:
+            present.add(x.file_id)
+            if x.file_id in files:
+                f = files[x.file_id]
+                if (f['key'], f['size_bytes'], f['sha256'], f['path']) != (x.key, x.size_bytes, x.sha256, x.path):
+                    raise SystemExit(f'ledger file {x.file_id} differs from its parent entry')
+                if x.file_id not in base_out:
+                    raise SystemExit(f'parent file {x.file_id} is not in the manifest of recording {rid}')
+                outputs.append(base_out[x.file_id])
+                continue
+            if is_assembly(x):
+                raise SystemExit(f'assembly {x.file_id} is not in the parent: publishing new assemblies needs the clock-join builder')
+            _, p = part_of[x.file_id]
+            added[x.file_id] = {'etag': f'"{x.etag}"', 'key': x.key, 'path': x.path, 'recording_id': rid,
+                                'sha256': x.sha256, 'size_bytes': x.size_bytes, 'verified': True}
+            held = inputs.holds.get(x.key)
+            if held is None:
+                file_holds.append({'bucket': BUCKET, 'object_key': x.key, 'etag': x.etag, 'size_bytes': x.size_bytes,
+                                   'recording_id': rid, 'kind': COLLATED_HOLD_KIND, 'sha256': x.sha256, 'relative_path': x.path})
+            elif held != (x.etag, x.size_bytes):
+                raise SystemExit(f'{x.key}: its keep hold {held} differs from R2 {(x.etag, x.size_bytes)}')
+            outputs.append({'id': p.output_id, 'size_bytes': x.size_bytes, 'sha256': x.sha256, 'part': p.part, 'parts': p.parts,
+                            'start_at': p.start_at, 'end_at': p.end_at, 'recording_id': rid, 'local_date': h.local_date,
+                            'delivery_hour': h.delivery_hour, 'available': True, 'scope': 'audited',
+                            'collections': ['audited', 'available'], 'path': x.path, 'file_url': FILE_URL + x.file_id})
+        days = []
+        window = sorted({h.local_date for h in hs})
+        for date in window:
+            bd = base_days.get(date)
+            day_hours = []
+            for h in (h for h in hs if h.local_date == date):
+                t0, t1 = hour_bounds(tz, date, h.delivery_hour)
+                ids = [str(p.output_id) for p in h.record.parts if str(p.output_id) in on_timeline] if h.record else []
+                state = 'collated' if ids else 'gap_only' if not h.captured else 'missing_output' if h.record else 'unregistered'
+                bh = bd['hours'][h.delivery_hour - 1] if bd else None
+                if bh is not None and [str(q[0]) for q in bh[9]] == ids and (bh[0] == state or (not h.captured and bh[0] in NO_CAPTURE_STATES)):
+                    day_hours.append(bh)
+                    continue
+                parts = []
+                for i in ids:
+                    if i in base_parts:
+                        parts.append(base_parts[i])
+                        continue
+                    _, p = part_of[i]
+                    a, b_ = epoch(p.start_at), epoch(p.end_at)
+                    name = (files[i]['path'] if i in files else p.nas_path).rsplit('/', 1)[-1]
+                    parts.append([p.output_id, p.part, b_ - a, a - t0, b_ - t0, b_ - a, 0, 0, name, 1, None])
+                span = sum(q[2] for q in parts)
+                rec = h.record
+                day_hours.append([state, span, span, 0.0, rec.source_clips if rec else 0, rec.included_clips if rec else 0, 0,
+                                  t0, t1, parts, [], h.delivery_hour])
+            captured = sum(x[1] for x in day_hours)
+            day = dict(bd) if bd else {'date': date, 'grade': grades[(rid, date)], 'captured_scheduled_seconds': captured,
+                                       'captured_scheduled_coverage_pct': 100 * captured / DAY_SCHEDULED_SECONDS}
+            days.append(dict(day, hours=day_hours))
+        start, end = window[0], window[-1]
+        man2 = dict(man, period=[start, end], outputs=outputs)
+        overlay[f'/public/manifests/{rid}.json'] = overlay[f'/api/coverage-delivery/manifest?stream={rid}&scope=available'] = man2
+        dirs = list(dict.fromkeys(o['path'].rsplit('/', 1)[0] for o in outputs))
+        overlay[f'/public/streams/{rid}.json'] = dict(sp, days=days, directories=dirs)
+        rp = f'/public/ranges/{rid}.json'
+        if rp in store.assets:
+            rg = store.load(rp)
+            for i in on_timeline - set(rg['by_output_id']):
+                _, p = part_of[i]
+                rg['by_output_id'][i] = {'sha256': p.sha256, 'ranges': [[epoch(p.start_at), epoch(p.end_at)]]}
+            overlay[rp] = rg
+        hs_cap = [h for h in hs if h.captured]
+        registered = sum(1 for h in hs_cap if h.record is not None and h.record.status == 'collated')
+        s = MS[rid]
+        b14 = inputs.best14[rid][1]
+        s.update(window=windows[rid].value, best14_dates=[b14[0][0], b14[-1][0]])
+        s.update(start=start, end=end, period_anchor=start, weekly_period_anchor=start, grades=''.join(d['grade'] for d in days),
+                 captured_scheduled_seconds=sum(d['captured_scheduled_seconds'] for d in days),
+                 registered_hours=registered, missing_registration_hours=len(hs_cap) - registered)
+        RS[str(rid)].update(start=start, end=end, captured_scheduled_seconds=s['captured_scheduled_seconds'])
+        w2 = (datetime.date.fromisoformat(start) + datetime.timedelta(days=7)).isoformat()
+        w1end = (datetime.date.fromisoformat(start) + datetime.timedelta(days=6)).isoformat()
+        c = CS[rid]
+        c.update(start=start, end=end, available_start=start, available_end=end)
+        c['weekly_exports']['available'] = {'period': {'start': start, 'end': end},
+                                            'weeks': [{'number': 1, 'start': start, 'end': w1end}, {'number': 2, 'start': w2, 'end': end}]}
+    overlay['/public/metadata.json'], overlay['/public/readiness.json'], overlay['/public/catalog.json'] = md, rd, cat
+    return overlay, present, added, file_holds
+
+
+class Window(str, enum.Enum):
+    """The days a stream's timeline shows: the live generation's, or its best-14."""
+    ORIGINAL = 'original'
+    BEST14 = 'best14'
+
+
+LIVE_NO_CAPTURE = frozenset({'gap_only', 'gap_unregistered', 'quarantine_only'})
+
+
+def live_windows(registry, store, best14):
+    """Each stream's live timeline days as a ledger window (an hour the live timeline shows
+    without capture is '.')."""
+    out = {}
+    for rid in registry['recording_ids']:
+        days = store.load(f'/public/streams/{rid}.json')['days']
+        out[rid] = (best14[rid][0], [(d['date'], ''.join('.' if h[0] in LIVE_NO_CAPTURE else 'R' for h in d['hours'])) for d in days])
+    return out
+
+
+def live_counts(inputs, store):
+    """{(recording_id, local_date): [complete hours, assemblies]} the live generation serves.
+    An hour is complete when one of its records has every part listed, directly or as an
+    assembly input."""
+    files = inputs.registry['files']
+    inputs_of = {'sha256:' + r['sha256']: [str(i) for i in r['input_ids']] for r in store.load('/public/growth.json')['repairs']}
+    slot_of = {str(p.output_id): slot for slot, rs in inputs.records.items() for r in rs for p in r.parts}
+    covered = {i for f in files for i in (inputs_of[f] if f.startswith('sha256:') else [f])}
+    unknown = sorted(i for i in covered if i not in slot_of)
+    if unknown:
+        raise SystemExit(f'{len(unknown)} live parts are not in the extract, e.g. {unknown[:3]}')
+    live = collections.defaultdict(lambda: [0, 0])
+    for slot, rs in inputs.records.items():
+        if any(r.complete() and all(str(p.output_id) in covered for p in r.parts) for r in rs):
+            live[slot[:2]][0] += 1
+    for f in files:
+        if f.startswith('sha256:'):
+            live[slot_of[inputs_of[f][0]][:2]][1] += 1
+    return live
+
+
+def new_counts(hours, is_assembly):
+    new = collections.defaultdict(lambda: [0, 0])
+    for h in hours:
+        new[h.slot[:2]][0] += h.ok
+        new[h.slot[:2]][1] += sum(1 for x in h.served if is_assembly(x))
+    return new
+
+
+def regressions(live, new, days):
+    """The days where the new generation serves fewer complete hours or fewer assemblies than live."""
+    return {d: (live[d], new[d]) for d in sorted(days) if new[d][0] < live[d][0] or new[d][1] < live[d][1]}
+
+
+def choose_windows(best14_hours, live_hours, live, is_assembly):
+    """{recording_id: Window}: best-14 when every best-14 day is complete in R2, or when it
+    serves at least the live window's complete hours and assemblies; else the live window."""
+    def totals(counts, hours):
+        out = collections.defaultdict(lambda: [0, 0])
+        for day in {h.slot[:2] for h in hours}:
+            out[day[0]][0] += counts[day][0]
+            out[day[0]][1] += counts[day][1]
+        return out
+    b14, old = totals(new_counts(best14_hours, is_assembly), best14_hours), totals(live, live_hours)
+    captured = collections.defaultdict(list)
+    for h in best14_hours:
+        if h.captured:
+            captured[h.recording_id].append(h.ok)
+    complete = {rid for rid, oks in captured.items() if all(oks)}
+    return {rid: Window.BEST14 if rid in complete or (b14[rid][0] >= old[rid][0] and b14[rid][1] >= old[rid][1]) else Window.ORIGINAL
+            for rid in sorted({h.recording_id for h in best14_hours})}
+
+
+def main_ledger(a):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import best14_ledger
+    is_assembly = lambda x: x.source in best14_ledger.ASSEMBLY_SOURCES
+    try:
+        inputs, store = best14_ledger.load(a)
+        best14_hours = best14_ledger.select(inputs)
+        live_hours = best14_ledger.select(dataclasses.replace(inputs, best14=live_windows(inputs.registry, store, inputs.best14)))
+        live = live_counts(inputs, store)
+        windows = choose_windows(best14_hours, live_hours, live, is_assembly)
+        chosen = [h for h in best14_hours if windows[h.recording_id] is Window.BEST14] + \
+                 [h for h in live_hours if windows[h.recording_id] is Window.ORIGINAL]
+        best14_ledger.check_rules(chosen)
+    except best14_ledger.LedgerError as e:
+        raise SystemExit(f'best14 ledger: {e}')
+    lost = regressions(live, new_counts(chosen, is_assembly), {h.slot[:2] for h in chosen})
+    report = {'windows': {w.value: sum(v is w for v in windows.values()) for w in Window},
+              'regressed_stream_days': len(lost),
+              'regressions_live_vs_new_[complete_hours,assemblies]': {f'{r} {d}': v for (r, d), v in lost.items()}}
+    if lost and not a.dry_run:
+        print(json.dumps(report, indent=1))
+        raise SystemExit(f'{len(lost)} stream-days would serve fewer complete hours or assemblies than the live generation')
+    overlay, present, added, file_holds = ledger_generation(inputs, chosen, store, read_grades(a.grades), is_assembly, windows)
+    best14 = collections.defaultdict(set)
+    for d in best14_ledger.day_rows(best14_hours):
+        best14[d['recording_id']].add((d['local_date'], d['day_stitched']))
+    with open(a.base_holds, encoding='utf-8') as f:
+        holds = json.load(f)
+    now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+    summary = build(inputs.registry, OverlayStore(store, overlay), present, holds, secrets.token_hex(16), now, a.note,
+                    None if a.dry_run else a.out, best14, added, file_holds)
+    summary.update(report, window={str(rid): w.value for rid, w in windows.items()},
+                   best14_days_ready={str(rid): sum(c in READY_DAY_CODES for _, c in v) for rid, v in sorted(best14.items())},
+                   known_stale_fields=list(KNOWN_STALE_FIELDS) + list(LEDGER_STALE_FIELDS))
+    if a.out and not a.dry_run:
+        write_json(os.path.join(a.out, 'summary.json'), summary)
     return summary
 
 
@@ -505,26 +798,43 @@ def read_lines(path):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--parent', required=True, help='public registry being replaced (.json or .json.gz)')
-    ap.add_argument('--base', required=True, help='registry whose assets are rebuilt (.json or .json.gz)')
+    ap.add_argument('--parent', help='public registry being replaced (.json or .json.gz)')
+    ap.add_argument('--base', help='registry whose assets are rebuilt (.json or .json.gz)')
     ap.add_argument('--assets', required=True, help='directory holding the base asset bodies at their R2 keys')
     ap.add_argument('--base-holds', required=True, help='JSON array of the base asset delivery_keep_holds rows')
     ap.add_argument('--best14', required=True, help='best14-days.tsv')
     sel = ap.add_mutually_exclusive_group(required=True)
     sel.add_argument('--files', help='file with one selected parent file id per line')
     sel.add_argument('--days', help='TSV with recording_id and local_date columns')
+    sel.add_argument('--ledger', action='store_true', help='publish every best-14 ledger file in R2 (best14_ledger.py inputs)')
+    led = ap.add_argument_group('--ledger inputs (see best14_ledger.py; --registry is the live generation, parent and base)')
+    led.add_argument('--registry')
+    led.add_argument('--extract')
+    led.add_argument('--holds')
+    led.add_argument('--listing', nargs='+')
+    led.add_argument('--clock-proofs')
+    led.add_argument('--grades', help='best14-grades.tsv (recording_id, local_date, grade)')
     ap.add_argument('--note', required=True, help='publication_note of the new generation')
-    ap.add_argument('--out', required=True, help='output directory (must not exist)')
+    out = ap.add_mutually_exclusive_group(required=True)
+    out.add_argument('--out', help='output directory (must not exist)')
+    out.add_argument('--dry-run', action='store_true', help='build in memory, write nothing, print the counts')
     a = ap.parse_args(argv)
-    parent = read_registry(a.parent)
-    store = AssetStore(read_registry(a.base), a.assets)
-    present = select_files(parent, read_lines(a.files)) if a.files else select_days(parent, store, read_days(a.days))
-    with open(a.base_holds, encoding='utf-8') as f:
-        holds = json.load(f)
-    now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-    summary = build(parent, store, present, holds, secrets.token_hex(16), now, a.note, a.out, read_best14(a.best14))
+    if a.ledger:
+        missing = [n for n in ('registry', 'extract', 'holds', 'listing', 'grades') if getattr(a, n) is None]
+        if missing or a.parent or a.base:
+            raise SystemExit(f'--ledger takes --registry (not --parent/--base) and needs --{", --".join(missing) or "registry"}')
+        summary = main_ledger(a)
+    else:
+        if not (a.parent and a.base) or a.dry_run:
+            raise SystemExit('--files/--days need --parent, --base and --out')
+        parent = read_registry(a.parent)
+        store = AssetStore(read_registry(a.base), a.assets)
+        present = select_files(parent, read_lines(a.files)) if a.files else select_days(parent, store, read_days(a.days))
+        with open(a.base_holds, encoding='utf-8') as f:
+            holds = json.load(f)
+        now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+        summary = build(parent, store, present, holds, secrets.token_hex(16), now, a.note, a.out, read_best14(a.best14))
     print(json.dumps({k: v for k, v in summary.items() if k != 'known_stale_fields'}, indent=1))
-
 
 if __name__ == '__main__':
     main()
