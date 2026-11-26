@@ -5,8 +5,8 @@
 #
 #   republish.sh BEST14_DAYS_TSV BEST14_GRADES_TSV OUT_DIR [--dry-run]
 #
-# OUT_DIR must not exist. It gets in/ (every input), ledger/ (best14-ledger*.tsv)
-# and generation/ (registry.json.gz, objects/, uploads.tsv, holds.tsv,
+# OUT_DIR must not exist. It gets in/ (every input), ledger/ (the new generation's
+# best14-ledger*.tsv and summary, published=n until best14_ledger.py live-check) and generation/ (registry.json.gz, objects/, uploads.tsv, holds.tsv,
 # summary.json), the directory a stager uploads create-only. Nothing here writes
 # R2 or the database, and current.json is only read.
 #
@@ -49,11 +49,13 @@ for p in joined experimental; do
 done
 
 LEDGER_IN="--best14 $BEST14 --registry $IN/current.json --assets $IN/assets --extract $IN/extract.tsv --holds $IN/holds.tsv --listing $IN/listing-joined.txt $IN/listing-experimental.txt"
-$PY "$HERE/best14_ledger.py" build $LEDGER_IN --out-dir "$OUT/ledger"
 if [ "$MODE" = --dry-run ]; then
   $PY "$HERE/build_generation.py" --ledger $LEDGER_IN --base-holds "$IN/base-holds.json" --grades "$GRADES" \
     --note "Best 14 days from the delivery ledger" --dry-run
 else
   $PY "$HERE/build_generation.py" --ledger $LEDGER_IN --base-holds "$IN/base-holds.json" --grades "$GRADES" \
-    --note "Best 14 days from the delivery ledger" --out "$OUT/generation"
+    --note "Best 14 days from the delivery ledger" --out "$OUT/generation" --ledger-out "$OUT/ledger"
+  cat "$OUT/ledger/best14-ledger-summary.txt"
+  $PY "$HERE/viewer_smoke.py" --registry "$OUT/generation/registry.json.gz" --assets "$OUT/generation/objects" "$IN/assets"
+  $PY "$HERE/download_smoke.py" --registry "$OUT/generation/registry.json.gz" --assets "$OUT/generation/objects" "$IN/assets"
 fi

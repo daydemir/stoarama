@@ -74,10 +74,12 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import build_generation  # noqa: E402
+import delivery_naming  # noqa: E402
 
 BUCKET = build_generation.BUCKET
 
@@ -88,8 +90,6 @@ RECOVERY_BATCH_PREFIX = 'recovery-'
 NO_CAPTURE_STATES = frozenset({'gap_only', 'quarantine_only'})
 COLLATED = 'collated'
 SEP = ','
-# A collated part's delivery name (clockjoin.AssemblyPath's partName).
-PART_NAME = re.compile(r'^(.*_hour_[0-9]{2}(?:_dst2)?)(_part_[0-9]{2,})?\.mp4$')
 
 
 class Source(str, enum.Enum):
@@ -204,6 +204,7 @@ class Inputs:
     registry: dict     # the live generation registry
     holds: dict        # delivery_keep_holds key -> (etag, size)
     unheld: int = 0    # live generation assemblies in R2 without a matching keep hold
+    names: dict = None  # recording_id -> (delivery folder, file stem), delivery_naming.catalog_names()
 
 
 def yn(b):
@@ -400,22 +401,11 @@ def load(a):
     live, unheld = registry_assemblies(registry, store, listing, holds)
     if a.clock_proofs:
         live += read_proofs(a.clock_proofs, listing)
-    return Inputs(read_best14(a.best14), read_extract(a.extract), live, listing, registry, holds, unheld), store
+    return Inputs(read_best14(a.best14), read_extract(a.extract), live, listing, registry, holds, unheld,
+                  delivery_naming.catalog_names(store.load('/public/catalog.json'))), store
 
 
 # ---- selection -------------------------------------------------------------
-
-def assembly_path(inputs, whole_hour):
-    """clockjoin.AssemblyPath: a whole-hour run takes the single-part name, else its first part's."""
-    m = PART_NAME.match(inputs[0])
-    if not m or not m.group(2):
-        raise LedgerError(f'assembly input {inputs[0]} is not a part name')
-    for p in inputs[1:]:
-        n = PART_NAME.match(p)
-        if not n or n.group(1) != m.group(1) or not n.group(2):
-            raise LedgerError(f'assembly inputs {inputs[0]} and {p} are not parts of one hour')
-    return m.group(1) + '.mp4' if whole_hour else inputs[0]
-
 
 def in_r2(listing, key, size, etag=None):
     got = listing.get(key)
@@ -442,10 +432,10 @@ def check_assembly_run(a, records_of):
             raise LedgerError(f'assembly {a.file_id}: parts {ords} of {rec.hour_id} are not consecutive')
 
 
-def serving_set(record, by_input, registry, listing, holds):
-    """(files listed on record's hour, assemblies listed earlier that serve its first parts)."""
-    files = registry['files']
-    path = lambda p: files[str(p.output_id)]['path'] if str(p.output_id) in files else p.nas_path
+def serving_set(record, slot, by_input, listing, holds, names):
+    """(files listed on record's hour, assemblies listed earlier that serve its first parts).
+    Every file takes the delivery name (delivery_naming) of its place among the hour's
+    files in source order, an assembly at its first part's place."""
     ids = {p.output_id for p in record.parts}
     served, carried, seen = [], [], set()
     for p in record.parts:
@@ -453,19 +443,19 @@ def serving_set(record, by_input, registry, listing, holds):
         if a is None:
             etag = listing.get(p.key, (0, None))[1]
             live = in_r2(listing, p.key, p.size_bytes) and (not p.closed or holds.get(p.key) == (etag, p.size_bytes))
-            served.append(Served(str(p.output_id), p.key, p.size_bytes, etag, p.sha256, path(p), p.source, (str(p.output_id),), live))
+            served.append(Served(str(p.output_id), p.key, p.size_bytes, etag, p.sha256, None, p.source, (str(p.output_id),), live))
         elif a.file_id not in seen:
             seen.add(a.file_id)
             if a.input_ids[0] not in ids:
                 carried.append(a.file_id)
                 continue
-            if a.path is None and not set(a.input_ids) <= ids:
+            if a.source is Source.CLOCK_ASSEMBLY and a.path is None and not set(a.input_ids) <= ids:
                 raise LedgerError(f'clock-join assembly {a.file_id} crosses an hour')
-            by_id = {q.output_id: q for q in record.parts}
-            name = a.path or assembly_path([path(by_id[i]) for i in a.input_ids], set(a.input_ids) == ids)
-            served.append(Served(a.file_id, a.key, a.size_bytes, a.etag, a.sha256, name, a.source,
+            served.append(Served(a.file_id, a.key, a.size_bytes, a.etag, a.sha256, None, a.source,
                                  tuple(str(i) for i in a.input_ids)))
-    return tuple(served), tuple(carried)
+    n = len(served)
+    return tuple(dataclasses.replace(x, path=delivery_naming.delivery_path(names, *slot, k, n))
+                 for k, x in enumerate(served, 1)), tuple(carried)
 
 
 def assembly_index(inputs):
@@ -505,7 +495,7 @@ def select(inputs):
                     continue
                 cands = []
                 for r in collated:
-                    served, carried = serving_set(r, by_input, inputs.registry, listing, inputs.holds)
+                    served, carried = serving_set(r, (rid, date, dh), by_input, listing, inputs.holds, inputs.names)
                     live = all(s.live for s in served)
                     ok = r.complete() and live
                     cands.append((not ok, r.batch_id.startswith(RECOVERY_BATCH_PREFIX), r.registered_at, r.row_id,
@@ -514,13 +504,13 @@ def select(inputs):
                 *_, r, served, carried, live, _ = cands[0]
                 hours.append(Hour(rid, stream, date, dh, True, r, served, r.complete(), live,
                                   sum(c[-1] for c in cands[1:]), carried))
-    check_rules(hours)
+    check_rules(hours, inputs.names)
     return hours
 
 
 # ---- rules -----------------------------------------------------------------
 
-def check_rules(hours):
+def check_rules(hours, names):
     """Fail on an hour served by two sets, an assembly duplicating its parts, or a duplicate delivery path."""
     record_slot = {}
     for h in hours:
@@ -548,19 +538,43 @@ def check_rules(hours):
             missing = [p.output_id for p in h.record.parts if str(p.output_id) not in served_by]
             if missing:
                 raise LedgerError(f'{h.slot}: parts {missing} are served by no file of a serving set')
-    paths = collections.Counter(s.path for h in hours for s in h.served)
-    dup = sorted(p for p, n in paths.items() if n > 1)
-    if dup:
-        raise LedgerError(f'{len(dup)} delivery paths are served twice, e.g. {dup[:3]}')
+    problems = delivery_naming.check_paths(names, [(h.recording_id, h.local_date, s.path) for h in hours for s in h.served])
+    if problems:
+        raise LedgerError(f'{len(problems)} served paths break the delivery naming, e.g. {problems[:3]}')
 
 
 # ---- outputs ---------------------------------------------------------------
 
 LEDGER_COLUMNS = ('recording_id', 'stream_id', 'local_date', 'delivery_hour', 'local_hour', 'captured', 'status',
                   'hour_id', 'batch_id', 'parts', 'served', 'complete', 'in_r2', 'source', 'alternates', 'covered_by',
-                  'sources', 'file_ids', 'object_keys', 'delivery_paths')
+                  'sources', 'file_ids', 'object_keys', 'delivery_paths', 'generation', 'published')
+# available: the best-14 window is complete. window and page_availability: what the
+# generation's page shows for the stream (metadata.json window and availability).
 STREAM_COLUMNS = ('recording_id', 'stream_id', 'window_start', 'window_end', 'days_complete', 'days', 'captured_hours',
-                  'hours_complete', 'hours_with_record', 'available')
+                  'hours_complete', 'hours_with_record', 'available', 'window', 'page_availability', 'generation', 'published')
+SUMMARY_FILE = 'best14-ledger-summary.txt'
+
+
+@dataclasses.dataclass(frozen=True)
+class Publication:
+    """The generation a ledger describes, whether it is the one the live page serves, and
+    what that generation's page shows per stream."""
+    generation: str
+    published: bool
+    window: dict        # recording_id -> 'original' | 'best14'
+    availability: dict  # recording_id -> 'available' | 'partial'
+
+
+def metadata_window(s):
+    """A metadata stream's window; generations before the window field show best-14 when
+    their period starts on the best-14 start."""
+    return s.get('window') or ('best14' if s['start'] == s.get('best14_start') else 'original')
+
+
+def publication_of(registry, store, published):
+    streams = store.load('/public/metadata.json')['streams']
+    return Publication(registry['generation'], published, {s['id']: metadata_window(s) for s in streams},
+                       {s['id']: s.get('availability') for s in streams})
 
 
 def joined(values):
@@ -620,11 +634,14 @@ def closed_keys(h):
     return {p.key for p in h.record.parts if p.closed} if h.record else set()
 
 
-def summary_line(hours, streams, unheld):
+def summary_line(hours, streams, unheld, pub):
     captured = [h for h in hours if h.captured]
     ok = [h for h in captured if h.ok]
     counts = collections.Counter(s.source for h in ok for s in h.served)
-    return (f"streams_available={sum(s['available'] == 'y' for s in streams)}/{len(streams)} "
+    return (f'generation={pub.generation} published={yn(pub.published)} '
+            f"page_available={sum(v == 'available' for v in pub.availability.values())} "
+            f"windows_best14={sum(v == 'best14' for v in pub.window.values())} "
+            f"streams_available={sum(s['available'] == 'y' for s in streams)}/{len(streams)} "
             f"days_complete={sum(s['days_complete'] for s in streams)}/{sum(s['days'] for s in streams)} "
             f"hours_complete={len(ok)}/{len(captured)} "
             + ' '.join(f'{s.value}={counts[s]}' for s in Source)
@@ -639,12 +656,40 @@ def write_tsv(path, columns, rows):
         w.writerows(rows)
 
 
-def write(out_dir, hours, unheld):
+def write(out_dir, hours, unheld, pub):
+    """Write the ledger of one generation (pub) and return its summary line."""
     os.makedirs(out_dir, exist_ok=True)
-    streams = stream_rows(hours, day_rows(hours))
-    write_tsv(os.path.join(out_dir, 'best14-ledger.tsv'), LEDGER_COLUMNS, [ledger_row(h) for h in hours])
+    stamp = {'generation': pub.generation, 'published': yn(pub.published)}
+    streams = [dict(s, window=pub.window[s['recording_id']], page_availability=pub.availability[s['recording_id']], **stamp)
+               for s in stream_rows(hours, day_rows(hours))]
+    write_tsv(os.path.join(out_dir, 'best14-ledger.tsv'), LEDGER_COLUMNS, [dict(ledger_row(h), **stamp) for h in hours])
     write_tsv(os.path.join(out_dir, 'best14-ledger-streams.tsv'), STREAM_COLUMNS, streams)
-    return summary_line(hours, streams, unheld)
+    line = summary_line(hours, streams, unheld, pub)
+    Path(out_dir, SUMMARY_FILE).write_text(line + '\n', encoding='utf-8')
+    return line
+
+
+def live_check(out_dir, src):
+    """Problems unless the ledger in out_dir describes the generation the live page serves,
+    with the same windows and availability. With none, marks the ledger published."""
+    rows = read_tsv(os.path.join(out_dir, 'best14-ledger-streams.tsv'), STREAM_COLUMNS)
+    gens = {r['generation'] for r in rows}
+    live = src.get('/public/growth.json')['generation']
+    problems = [] if gens == {live} else [f'ledger generation {sorted(gens)} is not the live generation {live}']
+    streams = {s['id']: s for s in src.get('/public/metadata.json')['streams']}
+    if sorted(streams) != sorted(int(r['recording_id']) for r in rows):
+        problems.append('ledger streams differ from the live streams')
+    for r in rows:
+        s = streams.get(int(r['recording_id']))
+        if s and (r['window'], r['page_availability']) != (metadata_window(s), s.get('availability')):
+            problems.append(f"recording {r['recording_id']}: ledger {r['window']}/{r['page_availability']}, "
+                            f"live {metadata_window(s)}/{s.get('availability')}")
+    if not problems:
+        for name in ('best14-ledger.tsv', 'best14-ledger-streams.tsv', SUMMARY_FILE):
+            p = Path(out_dir, name)
+            p.write_text(p.read_text(encoding='utf-8').replace(f'\t{live}\tn\n', f'\t{live}\ty\n')
+                         .replace(f'generation={live} published=n ', f'generation={live} published=y '), encoding='utf-8')
+    return problems
 
 
 def add_input_args(ap):
@@ -665,9 +710,13 @@ def main(argv=None):
     q.add_argument('--registry', required=True)
     q.add_argument('--assets', required=True)
     sub.add_parser('holds-sql', help='print the read-only keep-hold query')
-    b = sub.add_parser('build', help='write the ledger')
+    b = sub.add_parser('build', help='write the ledger of the live generation (--registry)')
     add_input_args(b)
     b.add_argument('--out-dir', required=True)
+    c = sub.add_parser('live-check', help='fail unless a ledger describes what the live page serves; then mark it published')
+    c.add_argument('--ledger-dir', required=True)
+    c.add_argument('--current', action='store_true', required=True, help='check against the live public API')
+    c.add_argument('--origin', default='https://stoarama.com')
     a = ap.parse_args(argv)
     try:
         if a.cmd == 'holds-sql':
@@ -677,9 +726,17 @@ def main(argv=None):
             best14 = read_best14(a.best14)
             days = {(rid, d) for rid, (_, ds) in best14.items() for d, _ in ds}
             sys.stdout.write(extract_sql(days | live_days(registry, build_generation.AssetStore(registry, a.assets))))
+        elif a.cmd == 'live-check':
+            from viewer_smoke import Live
+            problems = live_check(a.ledger_dir, Live(a.origin, None))
+            for p in problems:
+                print('MISMATCH ' + p)
+            print(f'ledger live-check: {"ok, marked published" if not problems else f"{len(problems)} mismatches"}')
+            if problems:
+                raise SystemExit(1)
         else:
-            inputs, _ = load(a)
-            print(write(a.out_dir, select(inputs), inputs.unheld))
+            inputs, store = load(a)
+            print(write(a.out_dir, select(inputs), inputs.unheld, publication_of(inputs.registry, store, True)))
     except LedgerError as e:
         raise SystemExit(f'best14 ledger: {e}')
 
