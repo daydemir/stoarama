@@ -111,9 +111,10 @@ func (s *Server) loadGlobalDeliveryRegistry(ctx context.Context) (*globalDeliver
 	return s.loadGlobalDeliveryRegistryScope(ctx, false, "")
 }
 func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public bool, generation string) (*globalDeliveryRegistry, error) {
-	// While cleanup permits can be outstanding, serve the immutable reviewed
-	// public generation. A direct registry publication cannot introduce a new
-	// protected source midway through a separately approved deletion batch.
+	// While cleanup permits can be outstanding, serve only the operator-pinned
+	// public generation (gss_public_generation_pin, 0268). A direct registry
+	// publication cannot introduce a new protected source midway through a
+	// separately approved deletion batch; a missing pin fails closed.
 	if public && s.pool != nil {
 		fence, err := s.pool.Begin(ctx)
 		if err != nil {
@@ -124,21 +125,19 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 			return nil, errors.New("public cleanup fence unavailable")
 		}
 		var fenced bool
-		err = fence.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_plans p WHERE p.mode='enabled' AND p.approved_until>now()) OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.delete_ever_issued AND i.updated_at>now()-interval '2 minutes')`).Scan(&fenced)
+		var pinned *string
+		err = fence.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_plans p WHERE p.mode='enabled' AND p.approved_until>now()) OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.delete_ever_issued AND i.updated_at>now()-interval '2 minutes'),(SELECT generation FROM gss_public_generation_pin)`).Scan(&fenced, &pinned)
 		if err != nil {
 			return nil, errors.New("public cleanup fence unavailable")
 		}
 		if fenced {
-			// Published from the best-14 delivery ledger (Deniz, Nov 25: "just make sure we're
-			// keeping a sane set and knowing we've stitched, and knowing we have full best 14 day
-			// periods"): each stream shows its best 14 days once they serve at least what the
-			// previous generation did, else its original period. Built from ae14e746 by
-			// backend/scripts/gss/republish.sh (build_generation.py --ledger).
-			const reviewed = "549402679c9d5f158cece1c4f77bad16"
-			if generation != "" && generation != reviewed {
+			if pinned == nil {
+				return nil, errors.New("public generation pin missing during NAS cleanup")
+			}
+			if generation != "" && generation != *pinned {
 				return nil, errors.New("public publication deferred during NAS cleanup")
 			}
-			generation = reviewed
+			generation = *pinned
 		}
 	}
 	s.globalDeliveryMu.Lock()
