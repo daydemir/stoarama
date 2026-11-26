@@ -85,12 +85,14 @@ right before its own `r2prune` call. A chunk is the previous chunks' unsettled r
 first, then up to `--chunk` (default 5000) raws not yet sent. For each, read-only:
 
 - **Raw:** R2 HEAD shows the planned size, ETag and mtime; its `recording_clips`
-  row has the planned size and `purged_at IS NULL`.
+  row has the planned size and `purged_at IS NULL`; the raw key has no owner keep.
 - **Every covering output** (each `--ke-coverage` row at the raw's size): R2 HEAD
   shows the coverage size; exactly one `recording_collation_outputs` row at that
   size; the raw's clip is still in its `source_clip_ids`; no
-  `r2_object_retirements` row, `r2_retirement_reservations` row, owner keep
-  (`r2_owner_keep_held`) or `r2_nonraw_intents` row for the output key; the output
+  `r2_object_retirements` row, `r2_retirement_reservations` row or
+  `r2_nonraw_intents` row for the output key (an owner keep on the output, such as
+  `collation_v2_recovery_held`, is the protection a sole copy must have and is
+  allowed); the output
   is in no other open intent's manifest (manual workdirs beside `WORKDIR` and lane
   cycles).
 
