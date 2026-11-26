@@ -547,11 +547,19 @@ def check_rules(hours, names):
 
 LEDGER_COLUMNS = ('recording_id', 'stream_id', 'local_date', 'delivery_hour', 'local_hour', 'captured', 'status',
                   'hour_id', 'batch_id', 'parts', 'served', 'complete', 'in_r2', 'source', 'alternates', 'covered_by',
-                  'sources', 'file_ids', 'object_keys', 'delivery_paths', 'generation', 'published')
-# available: the best-14 window is complete. window and page_availability: what the
-# generation's page shows for the stream (metadata.json window and availability).
-STREAM_COLUMNS = ('recording_id', 'stream_id', 'window_start', 'window_end', 'days_complete', 'days', 'captured_hours',
-                  'hours_complete', 'hours_with_record', 'available', 'window', 'page_availability', 'generation', 'published')
+                  'sources', 'file_ids', 'object_keys', 'delivery_paths', 'best14_target', 'generation', 'published')
+# best14-ledger.tsv has a row for every hour the generation's page shows and every hour of the
+# stream's best-14 window. served and the file columns are what the generation publishes for the
+# hour; complete and in_r2 describe its serving record; best14_target is the hour's best-14
+# status (complete, incomplete, no_capture, or empty outside the best-14 window).
+# In best14-ledger-streams.tsv the best14_* columns describe the best-14 target; window,
+# page_availability and served_files what the generation's page shows.
+STREAM_COLUMNS = ('recording_id', 'stream_id', 'best14_start', 'best14_end', 'best14_days_complete', 'best14_days',
+                  'best14_captured_hours', 'best14_hours_complete', 'best14_hours_with_record', 'best14_available',
+                  'window', 'page_availability', 'served_files', 'generation', 'published')
+TARGET = {'window_start': 'best14_start', 'window_end': 'best14_end', 'days_complete': 'best14_days_complete',
+          'days': 'best14_days', 'captured_hours': 'best14_captured_hours', 'hours_complete': 'best14_hours_complete',
+          'hours_with_record': 'best14_hours_with_record', 'available': 'best14_available'}
 SUMMARY_FILE = 'best14-ledger-summary.txt'
 
 
@@ -585,18 +593,23 @@ def joined(values):
     return SEP.join(values)
 
 
-def ledger_row(h):
+def target_status(h):
+    return 'no_capture' if not h.captured else 'complete' if h.ok else 'incomplete'
+
+
+def ledger_row(h, published):
     r = h.record
+    live = [s for s in h.served if s.file_id in published]
     return {'recording_id': h.recording_id, 'stream_id': h.stream_id, 'local_date': h.local_date,
             'delivery_hour': h.delivery_hour, 'local_hour': FIRST_LOCAL_HOUR + h.delivery_hour - 1,
             'captured': yn(h.captured), 'status': r.status if r else 'no_record',
             'hour_id': r.hour_id if r else '', 'batch_id': r.batch_id if r else '',
-            'parts': r.parts[0].parts if r and r.parts else 0, 'served': len(h.served),
+            'parts': r.parts[0].parts if r and r.parts else 0, 'served': len(live),
             'complete': yn(h.complete), 'in_r2': yn(h.in_r2),
-            'source': '+'.join(s.value for s in Source if any(x.source is s for x in h.served)),
+            'source': '+'.join(s.value for s in Source if any(x.source is s for x in live)),
             'alternates': h.alternates, 'covered_by': joined(h.covered_by),
-            'sources': joined(s.source.value for s in h.served), 'file_ids': joined(s.file_id for s in h.served),
-            'object_keys': joined(s.key for s in h.served), 'delivery_paths': joined(s.path for s in h.served)}
+            'sources': joined(s.source.value for s in live), 'file_ids': joined(s.file_id for s in live),
+            'object_keys': joined(s.key for s in live), 'delivery_paths': joined(s.path for s in live), 'best14_target': ''}
 
 
 def day_rows(hours):
@@ -656,15 +669,22 @@ def write_tsv(path, columns, rows):
         w.writerows(rows)
 
 
-def write(out_dir, hours, unheld, pub):
-    """Write the ledger of one generation (pub) and return its summary line."""
+def write(out_dir, page_hours, hours, unheld, pub, published):
+    """Write the ledger of one generation (pub) and return its summary line: page_hours are the
+    hours its page shows, hours the best-14 target, published its file ids."""
     os.makedirs(out_dir, exist_ok=True)
     stamp = {'generation': pub.generation, 'published': yn(pub.published)}
-    streams = [dict(s, window=pub.window[s['recording_id']], page_availability=pub.availability[s['recording_id']], **stamp)
-               for s in stream_rows(hours, day_rows(hours))]
-    write_tsv(os.path.join(out_dir, 'best14-ledger.tsv'), LEDGER_COLUMNS, [dict(ledger_row(h), **stamp) for h in hours])
-    write_tsv(os.path.join(out_dir, 'best14-ledger-streams.tsv'), STREAM_COLUMNS, streams)
-    line = summary_line(hours, streams, unheld, pub)
+    rows = {h.slot: ledger_row(h, published) for h in page_hours}
+    for h in hours:
+        rows.setdefault(h.slot, ledger_row(h, published))['best14_target'] = target_status(h)
+    streams = stream_rows(hours, day_rows(hours))
+    served = collections.Counter(int(r['recording_id']) for r in rows.values() for _ in filter(None, r['file_ids'].split(SEP)))
+    write_tsv(os.path.join(out_dir, 'best14-ledger.tsv'), LEDGER_COLUMNS, [dict(rows[k], **stamp) for k in sorted(rows)])
+    write_tsv(os.path.join(out_dir, 'best14-ledger-streams.tsv'), STREAM_COLUMNS,
+              [dict({TARGET.get(k, k): v for k, v in s.items()}, window=pub.window[s['recording_id']],
+                    page_availability=pub.availability[s['recording_id']], served_files=served[s['recording_id']], **stamp)
+               for s in streams])
+    line = summary_line(hours, streams, unheld, pub) + f' served_files={sum(served.values())}'
     Path(out_dir, SUMMARY_FILE).write_text(line + '\n', encoding='utf-8')
     return line
 
@@ -679,11 +699,21 @@ def live_check(out_dir, src):
     streams = {s['id']: s for s in src.get('/public/metadata.json')['streams']}
     if sorted(streams) != sorted(int(r['recording_id']) for r in rows):
         problems.append('ledger streams differ from the live streams')
+    served = collections.defaultdict(set)
+    for r in read_tsv(os.path.join(out_dir, 'best14-ledger.tsv'), LEDGER_COLUMNS):
+        served[int(r['recording_id'])] |= set(filter(None, r['file_ids'].split(SEP)))
     for r in rows:
-        s = streams.get(int(r['recording_id']))
+        rid = int(r['recording_id'])
+        s = streams.get(rid)
         if s and (r['window'], r['page_availability']) != (metadata_window(s), s.get('availability')):
-            problems.append(f"recording {r['recording_id']}: ledger {r['window']}/{r['page_availability']}, "
+            problems.append(f"recording {rid}: ledger {r['window']}/{r['page_availability']}, "
                             f"live {metadata_window(s)}/{s.get('availability')}")
+        if s:
+            man = src.get(f'/api/coverage-delivery/manifest?stream={rid}&scope=available', live)
+            files = {str(o['id']) for o in man['outputs'] if o.get('available')}
+            if served[rid] != files or int(r['served_files']) != len(files):
+                problems.append(f'recording {rid}: ledger serves {len(served[rid])} files, live {len(files)} '
+                                f'({len(served[rid] - files)} only in the ledger, {len(files - served[rid])} only live)')
     if not problems:
         for name in ('best14-ledger.tsv', 'best14-ledger-streams.tsv', SUMMARY_FILE):
             p = Path(out_dir, name)
@@ -736,7 +766,8 @@ def main(argv=None):
                 raise SystemExit(1)
         else:
             inputs, store = load(a)
-            print(write(a.out_dir, select(inputs), inputs.unheld, publication_of(inputs.registry, store, True)))
+            hours = select(inputs)
+            print(write(a.out_dir, hours, hours, inputs.unheld, publication_of(inputs.registry, store, True), set(inputs.registry['files'])))
     except LedgerError as e:
         raise SystemExit(f'best14 ledger: {e}')
 
