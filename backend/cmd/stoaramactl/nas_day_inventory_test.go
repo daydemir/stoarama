@@ -147,3 +147,81 @@ UPDATE nas_day_inventory_units SET state='canceled' WHERE label='gss'`); err != 
 		t.Fatalf("withdrawn scope still queued %+v err=%v", s, err)
 	}
 }
+
+// With the writer fence installed, as in production, a restore request queues
+// only rows nas_restore_admitted admits (an inventoried in-scope original or a
+// purged Keep Everything original) and skips every other clip with its reason,
+// instead of failing on the fence at the first insert.
+func TestNASRestoreRequestQueuesOnlyAdmittedOriginalsPastTheWriterFence(t *testing.T) {
+	ctx := context.Background()
+	pool := joinedPurgeTestPool(t, "nas_restore_fence")
+	if err := db.MigrateUp(ctx, pool, joinedPurgeMigrationsDir()); err != nil {
+		t.Fatal(err)
+	}
+	// Stream 17216 is not Keep Everything; stream 78 is.
+	if _, err := pool.Exec(ctx, `
+INSERT INTO accounts(id,email) VALUES(47,'nas-fence@example.invalid');
+INSERT INTO account_api_keys(id,account_id,key_prefix,secret_hash) VALUES(47,47,'fixture-key','fixture-key');
+INSERT INTO connections(id,account_id,kind,api_key_id) VALUES(13,47,'nas_pull',47);
+INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
+ VALUES(17216,'test','17216','brzeg','brzeg','https://storage.example.test','off','Europe/Warsaw','hls','video_manifest','video_live','continuous_video',30),
+       (78,'test','78','ke','ke','https://storage.example.test','off','Asia/Seoul','hls','video_manifest','video_live','continuous_video',30);
+INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc,managed)
+ VALUES(1,47,'test','https://storage.example.test','auto','stoarama','fixture',decode('00','hex'),true);
+INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
+ VALUES(379,47,1,'assisi','https://storage.example.test','* * * * *','Europe/Warsaw','paused',17216,now()),
+       (337,47,1,'ke','https://storage.example.test','* * * * *','Asia/Seoul','paused',78,now());
+-- 901 inventoried in scope; 902 inventoried in scope but its key has a pending R2 deletion;
+-- 903 purged, NAS-verified the old way, outside scope; 904 purged, NAS-verified, Keep Everything.
+INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,fire_at,clip_start_at,clip_end_at,display_path,purged_at)
+ SELECT id,rec,1,'https://storage.example.test','stoarama','managed/acct-47/c'||id||'.mp4',10,'etag',repeat(chr(96+id-900),64),
+  t,t,t+interval '2 minutes','recordings/'||rec||'/continuous/c'||id||'.mp4',purged
+ FROM (VALUES (901,379,'2026-07-27T08:00:00+02:00'::timestamptz,NULL::timestamptz),(902,379,'2026-07-27T08:02:00+02:00',NULL),
+              (903,379,'2026-07-26T08:00:00+02:00',now()),(904,337,'2026-07-27T08:00:00+09:00',now())) v(id,rec,t,purged);
+INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,client_updated_at)
+ SELECT 13,id,recording_id,display_path,size_bytes,sha256,'present',now(),now() FROM recording_clips WHERE id IN (903,904);
+INSERT INTO nas_restore_day_scope(recording_id,local_date,reason) VALUES(379,'2026-07-27','GSS best-14');
+INSERT INTO nas_day_inventory_units(connection_id,label,recording_id,local_date) VALUES(13,'gss',379,'2026-07-27');
+UPDATE nas_day_inventory_units SET state='completed', completed_at=now();
+INSERT INTO nas_day_inventory_files(unit_id,relative_path,kind,size_bytes,mtime_ns,sha256,clip_id)
+ SELECT u.id,'32_Assisi/July/27-Monday/c'||c.id||'.mp4','raw',10,1,c.sha256,c.id FROM nas_day_inventory_units u, recording_clips c WHERE c.id IN (901,902);
+INSERT INTO r2_retirement_writer_fences(bucket,endpoint_sha256) VALUES('stoarama',repeat('a',64));`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL session_replication_role=replica;
+INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
+ VALUES('raw',902,'stoarama','managed/acct-47/c902.mp4',10,repeat('b',64),repeat('c',64))`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range []string{"379", "337"} {
+		opts, err := parseNASRestoreRequestArgs([]string{"--recording-id", rec, "--from", "2026-07-25", "--to", "2026-07-29", "--label", "gss-raw-" + rec}, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err := requestNASRestores(ctx, pool, "stoarama", opts)
+		want := map[string]string{"379": "queued=1 skipped=map[not_admitted:1 retirement_pending:1]", "337": "queued=1 skipped=map[]"}[rec]
+		if got := fmt.Sprintf("queued=%d skipped=%v", s.Queued, s.Skipped); err != nil || got != want {
+			t.Fatalf("recording %s: %s err=%v, want %s", rec, got, err, want)
+		}
+	}
+	var queued string
+	if err := pool.QueryRow(ctx, `SELECT string_agg(clip_id||'@'||relative_path, ',' ORDER BY clip_id) FROM nas_restore_requests`).Scan(&queued); err != nil ||
+		queued != "901@32_Assisi/July/27-Monday/c901.mp4,904@recordings/337/continuous/c904.mp4" {
+		t.Fatalf("queued %s err=%v", queued, err)
+	}
+	// The gate itself is unchanged: the skipped clips stay fenced.
+	for _, id := range []int{902, 903} {
+		if _, err := pool.Exec(ctx, `INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,object_key,source_object_key,relative_path,content_type,size_bytes,sha256,label)
+ SELECT 13,id,recording_id,'original',object_key,object_key,display_path,'video/mp4',size_bytes,sha256,'by-hand' FROM recording_clips WHERE id=$1`, id); err == nil ||
+			!strings.Contains(err.Error(), "fenced") {
+			t.Fatalf("clip %d queued past the writer fence by hand: %v", id, err)
+		}
+	}
+}

@@ -201,6 +201,10 @@ type nasRestoreCandidate struct {
 	// clip's exact bytes (nas_restore_inventoried_original), or "". It counts
 	// as NAS verification for the restore only.
 	InventoriedPath string
+	// KEOriginal: 0260's gate admits the clip from its display path.
+	KEOriginal bool
+	// RetirementPending: an R2 deletion of the clip's key is pending (0262).
+	RetirementPending bool
 }
 
 // sourcePath is the NAS path the restore reads.
@@ -211,7 +215,10 @@ func (c nasRestoreCandidate) sourcePath() string {
 	return c.DisplayPath
 }
 
-// classifyNASRestoreCandidate returns "" when the clip may be queued.
+// classifyNASRestoreCandidate returns "" when the clip may be queued. An
+// original is queued only when nas_restore_admitted will admit it (an
+// inventoried in-scope clip or a purged Keep Everything clip), so the writer
+// fence never refuses a queued row; every other clip is skipped with its reason.
 func classifyNASRestoreCandidate(c nasRestoreCandidate, bucket string, test bool) string {
 	switch {
 	case c.NASConnection == 0:
@@ -222,12 +229,16 @@ func classifyNASRestoreCandidate(c nasRestoreCandidate, bucket string, test bool
 		return "clip_identity_incomplete"
 	case c.SizeBytes > r2.MaxConditionalPutBytes:
 		return "too_large"
+	case !test && c.InventoriedPath == "" && !c.KEOriginal && c.RetirementPending:
+		return "retirement_pending"
 	case !c.NASVerified && c.InventoriedPath == "":
 		return "nas_unverified"
 	case !test && (!c.Managed || c.Bucket != bucket):
 		return "not_managed_storage"
 	case !test && !c.Purged && c.InventoriedPath == "":
 		return "not_purged"
+	case !test && c.InventoriedPath == "" && !c.KEOriginal:
+		return "not_admitted"
 	}
 	return ""
 }
@@ -246,7 +257,9 @@ SELECT c.id, c.recording_id, COALESCE(c.object_key,''), COALESCE(c.display_path,
                 AND n.sha256=lower(c.sha256) AND n.size_bytes=c.size_bytes AND n.relative_path=c.display_path),
        (SELECT count(*) FROM connections k WHERE k.account_id=rec.account_id AND k.kind='nas_pull'),
        COALESCE((SELECT min(f.relative_path) FROM nas_day_inventory_files f WHERE f.clip_id=c.id
-                 AND nas_restore_inventoried_original('original',conn.id,c.id,c.object_key,c.size_bytes,lower(c.sha256),f.relative_path)),'')
+                 AND nas_restore_inventoried_original('original',conn.id,c.id,c.object_key,c.size_bytes,lower(c.sha256),f.relative_path)),''),
+       nas_restore_ke_original('original',c.id,c.object_key,c.size_bytes,lower(c.sha256),c.display_path),
+       collation_v2_recovery_retirement_pending(c.object_key)
 FROM recording_clips c
 JOIN recordings rec ON rec.id=c.recording_id
 LEFT JOIN storage_destinations sd ON sd.id=c.storage_destination_id
@@ -284,7 +297,7 @@ func loadNASRestoreCandidates(ctx context.Context, q interface {
 	for rows.Next() {
 		var c nasRestoreCandidate
 		if err := rows.Scan(&c.ClipID, &c.RecordingID, &c.ObjectKey, &c.DisplayPath, &c.ContentType, &c.SizeBytes, &c.SHA256,
-			&c.Purged, &c.Bucket, &c.Managed, &c.ConnectionID, &c.NASVerified, &c.NASConnection, &c.InventoriedPath); err != nil {
+			&c.Purged, &c.Bucket, &c.Managed, &c.ConnectionID, &c.NASVerified, &c.NASConnection, &c.InventoriedPath, &c.KEOriginal, &c.RetirementPending); err != nil {
 			return nil, fmt.Errorf("scan restore candidate: %w", err)
 		}
 		out = append(out, c)
