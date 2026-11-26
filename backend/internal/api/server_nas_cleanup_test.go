@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -365,8 +366,8 @@ func TestNASCleanupNewReferencesAndPublicGenerationAreFenced(t *testing.T) {
 	if err != nil || got != old {
 		t.Fatalf("existing public delivery was not preserved: %v", err)
 	}
-	if _, err = s.loadGlobalDeliveryRegistryScope(ctx, true, strings.Repeat("1", 32)); err == nil {
-		t.Fatal("new public generation bypassed cleanup fence")
+	if _, err = s.loadGlobalDeliveryRegistryScope(ctx, true, strings.Repeat("1", 32)); !errors.Is(err, errGlobalDeliveryOutdatedGeneration) {
+		t.Fatalf("new public generation bypassed cleanup fence: %v", err)
 	}
 	if _, err = pool.Exec(ctx, `INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state,delete_ever_issued) VALUES(1,1,1,'unverified',true);UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL WHERE id=1`); err != nil {
 		t.Fatal(err)
@@ -386,8 +387,15 @@ func TestNASCleanupNewReferencesAndPublicGenerationAreFenced(t *testing.T) {
 	if got, err = s.loadGlobalDeliveryRegistryScope(ctx, true, ""); err != nil || got != next {
 		t.Fatalf("moved pin was not served without a deploy: %v", err)
 	}
-	if _, err = s.loadGlobalDeliveryRegistryScope(ctx, true, old.Generation); err == nil {
-		t.Fatal("previous generation bypassed the moved pin")
+	if _, err = s.loadGlobalDeliveryRegistryScope(ctx, true, old.Generation); !errors.Is(err, errGlobalDeliveryOutdatedGeneration) {
+		t.Fatalf("previous generation bypassed the moved pin: %v", err)
+	}
+	for _, path := range []string{publicGlobalDeliveryAPI + "/metadata?path=%2Fdownload-script.py&generation=" + old.Generation, publicGlobalDeliveryAPI + "/ticket/1?sha256=" + strings.Repeat("a", 64) + "&generation=" + old.Generation} {
+		w := httptest.NewRecorder()
+		s.router().ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		if w.Code != http.StatusGone || !strings.Contains(w.Body.String(), "copy a fresh command from the page") {
+			t.Fatalf("outdated generation %s: got %d %s", path, w.Code, w.Body.String())
+		}
 	}
 	if _, err = pool.Exec(ctx, `DELETE FROM gss_public_generation_pin`); err != nil {
 		t.Fatal(err)
