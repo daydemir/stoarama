@@ -381,28 +381,48 @@ class CliTests(unittest.TestCase):
 
 
 class FakeLive:
-    def __init__(self, generation, streams):
-        self.objects = {'/public/growth.json': {'generation': generation}, '/public/metadata.json': {'streams': streams}}
+    def __init__(self, generation, streams, files):
+        self.objects = {'/public/growth.json': {'generation': generation}, '/public/metadata.json': {'streams': streams},
+                        f'/api/coverage-delivery/manifest?stream={RID}&scope=available':
+                            {'outputs': [{'id': int(i), 'available': True} for i in files]}}
 
     def get(self, path, generation=None):
         return self.objects[path]
 
 
+class LedgerFileTests(unittest.TestCase):
+    def test_served_is_what_the_generation_publishes(self):
+        w = World()
+        hours = w.select()
+        page = [h for h in hours if h.local_date != DAYS[0]]  # the page shows 13 of the best-14 days
+        published = {s.file_id for h in page for s in h.served} - {hours[13].served[0].file_id}
+        with tempfile.TemporaryDirectory() as d:
+            L.write(d, page, hours, 0, PUB, published)
+            rows = {(r['local_date'], int(r['delivery_hour'])): r for r in L.read_tsv(os.path.join(d, 'best14-ledger.tsv'), L.LEDGER_COLUMNS)}
+            self.assertEqual(len(rows), 14 * 12)
+            self.assertEqual((rows[(DAYS[0], 1)]['served'], rows[(DAYS[0], 1)]['best14_target']), ('0', 'complete'))
+            self.assertEqual((rows[(DAYS[1], 2)]['served'], rows[(DAYS[1], 2)]['complete']), ('1', 'y'))
+            self.assertEqual(rows[(DAYS[0], 12)]['best14_target'], 'no_capture')
+            st = L.read_tsv(os.path.join(d, 'best14-ledger-streams.tsv'), L.STREAM_COLUMNS)[0]
+            self.assertEqual((st['served_files'], st['best14_days_complete'], st['best14_available']), (str(len(published)), '14', 'y'))
+
+
 class LiveCheckTests(unittest.TestCase):
     def test_live_check_marks_a_matching_ledger_published(self):
         hours = World().select()
+        files = {s.file_id for h in hours for s in h.served}
         with tempfile.TemporaryDirectory() as d:
-            L.write(d, hours, 0, PUB)
+            L.write(d, hours, hours, 0, PUB, files)
             live = [{'id': RID, 'start': DAYS[0], 'best14_start': DAYS[0], 'window': 'best14', 'availability': 'available'}]
-            self.assertEqual(L.live_check(d, FakeLive('ef' * 16, live)), [f"ledger generation ['{'ab' * 16}'] is not the live generation {'ef' * 16}"])
+            self.assertEqual(L.live_check(d, FakeLive('ef' * 16, live, files)), [f"ledger generation ['{'ab' * 16}'] is not the live generation {'ef' * 16}"])
             rolled = [dict(live[0], window='original', availability='partial')]
-            self.assertEqual(len(L.live_check(d, FakeLive('ab' * 16, rolled))), 1)
+            self.assertEqual(len(L.live_check(d, FakeLive('ab' * 16, rolled, files))), 1)
+            self.assertEqual(len(L.live_check(d, FakeLive('ab' * 16, live, set(list(files)[1:])))), 1)
             self.assertIn('published=n', Path(d, L.SUMMARY_FILE).read_text())
-            self.assertEqual(L.live_check(d, FakeLive('ab' * 16, live)), [])
+            self.assertEqual(L.live_check(d, FakeLive('ab' * 16, live, files)), [])
             self.assertIn(f'generation={"ab" * 16} published=y', Path(d, L.SUMMARY_FILE).read_text())
             self.assertEqual({r['published'] for r in L.read_tsv(os.path.join(d, 'best14-ledger.tsv'), L.LEDGER_COLUMNS)}, {'y'})
             self.assertEqual({r['published'] for r in L.read_tsv(os.path.join(d, 'best14-ledger-streams.tsv'), L.STREAM_COLUMNS)}, {'y'})
-
 
 DATABASE_URL = os.environ.get('STOARAMA_TEST_DATABASE_URL')
 CLOSURE_SCHEMA = """

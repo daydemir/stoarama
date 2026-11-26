@@ -532,7 +532,7 @@ def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
     by_rid = collections.defaultdict(list)
     for h in hours:
         by_rid[h.recording_id].append(h)
-    overlay, present, added, file_holds, renamed, published = {}, set(), {}, [], {}, []
+    overlay, present, added, file_holds, renamed, published, periods = {}, set(), {}, [], {}, [], {}
     for rid in reg['recording_ids']:
         hs = sorted(by_rid[rid], key=lambda h: h.slot)
         tz = MS[rid]['timezone']
@@ -633,12 +633,17 @@ def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
         w1end = (datetime.date.fromisoformat(start) + datetime.timedelta(days=6)).isoformat()
         c = CS[rid]
         c.update(start=start, end=end, available_start=start, available_end=end)
+        if outputs:
+            c['folder'] = inputs.names[rid][0]  # the delivery folder of every path it serves
+        periods[rid] = [start, end]
         c['weekly_exports']['available'] = {'period': {'start': start, 'end': end},
                                             'weeks': [{'number': 1, 'start': start, 'end': w1end}, {'number': 2, 'start': w2, 'end': end}]}
     problems = check_paths(inputs.names, published)
     if problems:
         raise SystemExit(f'{len(problems)} published paths break the delivery naming, e.g. {problems[:3]}')
     gr = store.load('/public/growth.json')
+    for rid, period in periods.items():
+        gr['current_stream_counts'][str(rid)]['period'] = period  # coverage-growth.js registered() compares it
     for r in gr['repairs']:
         if 'sha256:' + r['sha256'] in renamed:
             r['path'] = renamed['sha256:' + r['sha256']]
@@ -758,7 +763,7 @@ def main_ledger(a):
     if a.ledger_out and not a.dry_run:
         pub = best14_ledger.Publication(summary['generation'], False, {rid: w.value for rid, w in windows.items()},
                                         {int(k): v for k, v in summary['stream_availability'].items()})
-        summary['ledger'] = best14_ledger.write(a.ledger_out, best14_hours, inputs.unheld, pub)
+        summary['ledger'] = best14_ledger.write(a.ledger_out, chosen, best14_hours, inputs.unheld, pub, present)
     return summary
 
 

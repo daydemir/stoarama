@@ -9,7 +9,11 @@ ensureDownloadPaths):
     generation, else the manifest (identity, period, generation, and every
     available output's path exactly as ensureDownloadPaths checks it);
   - every available manifest output has a download path (every file is reachable);
-  - every served path is a delivery name (delivery_naming.check_paths).
+  - every served path is a delivery name (delivery_naming.check_paths), under the
+    stream's catalog folder;
+  - growth.json current_stream_counts period is the stream's period (registered(), which
+    the viewer needs to list each assembly once), and every hour lists each served file
+    once, through current-parts.js's projection, with every served file on some hour.
 
   viewer_smoke.py --registry DIR/registry.json.gz --assets DIR/objects IN/assets   (a build, before staging)
   viewer_smoke.py --current [--origin https://stoarama.com] [--generation G]     (the live public API)
@@ -93,7 +97,34 @@ def path_problem(rid, output, seen):
     return None
 
 
-def check_stream(src, r, gen, names):
+def project(parts, assemblies, all_parts):
+    """current-parts.js: the files an hour lists, each assembly once in its first input's hour."""
+    originals = {str(p[0]): p for p in all_parts}
+    if len(originals) != len(all_parts):
+        raise ValueError('Duplicate original timeline identity')
+    hour_ids, by_input = {str(p[0]) for p in parts}, {}
+    for a in assemblies:
+        ids = [str(i) for i in a['input_ids']]
+        if any(i not in originals for i in ids):
+            continue
+        if len(set(ids)) != len(ids) or len(ids) < 2 or not a.get('seconds', 0) > 0:
+            raise ValueError('Invalid current assembly')
+        for i in ids:
+            if i in by_input:
+                raise ValueError('Overlapping current assemblies')
+            by_input[i] = a
+    seen, out = set(), []
+    for p in parts:
+        a = by_input.get(str(p[0]))
+        if a is None:
+            out.append(str(p[0]))
+        elif str(a['input_ids'][0]) in hour_ids and a['sha256'] not in seen:
+            seen.add(a['sha256'])
+            out.append('sha256:' + a['sha256'])
+    return out
+
+
+def check_stream(src, r, gen, names, growth, catalog, mode):
     rid = r['id']
     problems = []
     data = src.get(r['data'])
@@ -134,6 +165,34 @@ def check_stream(src, r, gen, names):
         problems.append(f'{len(missing)} available files have no download path, e.g. {missing[:3]}')
     served = sorted((rid, o['local_date'], paths[str(o['id'])]) for o in available if str(o['id']) in paths)
     problems += delivery_naming.check_paths(names, served)
+    folder = catalog[rid].get('folder')
+    if served and {p.split('/', 1)[0] for _, _, p in served} != {folder}:
+        problems.append(f'catalog folder {folder!r} is not the folder of every served path')
+    # coverage-growth.js registered(): without it the viewer lists each assembly once per input part.
+    counts = growth.get('current_stream_counts', {}).get(str(rid))
+    if counts is None or counts.get('period') != [r['start'], r['end']]:
+        problems.append(f'growth.json current_stream_counts period {counts and counts.get("period")} is not {[r["start"], r["end"]]}')
+        return problems
+    assemblies = [a for a in growth.get('repairs', ()) if a['recording_id'] == rid and r['start'] <= a['local_date'] <= r['end']
+                  and (not a.get('collections') or mode in a['collections'])]
+    listed = []
+    for day in data['days']:
+        all_parts = [p for h in day['hours'] for p in h[9]]
+        for i, h in enumerate(day['hours']):
+            ids = project(h[9], assemblies, all_parts)
+            dup = sorted({x for x in ids if ids.count(x) > 1})
+            if dup:
+                problems.append(f'{day["date"]} hour {i + 1:02d} lists {dup[:2]} more than once')
+            listed += [x for x in ids if x in paths]
+            unreachable = [x for x in ids if x not in paths]
+            if unreachable:
+                problems.append(f'{day["date"]} hour {i + 1:02d} lists files without a download path: {unreachable[:2]}')
+    twice = sorted({x for x in listed if listed.count(x) > 1}) if len(listed) != len(set(listed)) else []
+    if twice:
+        problems.append(f'{len(twice)} files are listed in more than one hour, e.g. {twice[:2]}')
+    unlisted = sorted(set(paths) - set(listed))
+    if unlisted:
+        problems.append(f'{len(unlisted)} served files are on no hour, e.g. {unlisted[:2]}')
     return problems
 
 
@@ -144,11 +203,14 @@ def smoke(src):
     broken = {}
     if gen is None or (src.generation is not None and gen != src.generation):
         return {0: [f'growth.json generation {gen} is not the registry generation {src.generation}']}, 0
-    streams = src.get('/public/metadata.json')['streams']
-    names = delivery_naming.catalog_names(src.get('/public/catalog.json'))
+    md = src.get('/public/metadata.json')
+    streams, mode = md['streams'], md.get('mode') or 'audited'
+    catalog = src.get('/public/catalog.json')
+    names = delivery_naming.catalog_names(catalog)
+    by_id = {c['id']: c for c in catalog['streams']}
     for r in streams:
         try:
-            p = check_stream(src, r, gen, names)
+            p = check_stream(src, r, gen, names, growth, by_id, mode)
         except (LookupError, OSError, ValueError, KeyError) as e:
             p = [f'{type(e).__name__}: {e}']
         if p:
