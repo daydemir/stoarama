@@ -408,7 +408,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 HTTP_TIMEOUT_SEC = 120
-PSQL_TIMEOUT_SEC = 330
+PSQL_TIMEOUT_SEC = 330  # subprocess.run's wall clock over the whole psql process, its DNS and connect included
 TRANSIENT_HTTP = {408, 429, 500, 502, 503, 504}
 UNREACHABLE = {errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN, errno.EHOSTDOWN}
 
@@ -427,6 +427,28 @@ def network_transient(error):
 
 
 def request(url, token, method='GET', body=None):
+    """One HTTP_TIMEOUT_SEC wall-clock deadline covers resolve, connect and the whole body:
+    urlopen's timeout bounds each socket operation, not DNS or a slowly dripping body.
+    An expired request is abandoned to its daemon thread and fails as transient."""
+    outcome = []
+
+    def run():
+        try:
+            outcome.append((True, _request(url, token, method, body)))
+        except BaseException as exc:
+            outcome.append((False, exc))
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(HTTP_TIMEOUT_SEC)
+    if not outcome:
+        raise (ReadFailure if method == 'GET' else MutationUnconfirmed)('HTTP request deadline exceeded (' + method + ')')
+    ok, value = outcome[0]
+    if ok:
+        return value
+    raise value
+
+
+def _request(url, token, method, body):
     req = urllib.request.Request(url, method=method,
         data=None if body is None else json.dumps(body).encode(), headers={
             'Authorization': 'Bearer ' + token, 'User-Agent': 'stoarama-operator/1',

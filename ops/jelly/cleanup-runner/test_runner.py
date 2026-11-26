@@ -11,6 +11,7 @@ import subprocess
 from types import SimpleNamespace
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -1513,7 +1514,7 @@ class ReadFailureTests(unittest.TestCase):
     def get(self, job, *outcomes):
         """job.plan(42) against an opener that raises or returns each outcome in turn."""
         opener = SimpleNamespace(open=unittest.mock.Mock(side_effect=[
-            o if isinstance(o, BaseException) else io.BytesIO(json.dumps(o).encode()) for o in outcomes]))
+            o if isinstance(o, (BaseException, io.IOBase)) else io.BytesIO(json.dumps(o).encode()) for o in outcomes]))
         with patch.dict(os.environ, SERVICE_TOKEN='fixture'), patch.object(r.urllib.request, 'build_opener', return_value=opener), \
              patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()) as stderr:
             try:
@@ -1578,6 +1579,62 @@ class ReadFailureTests(unittest.TestCase):
             self.assertEqual(opener.open.call_count, 2)
             self.assertEqual([c.args[0] for c in sleep.call_args_list], [15])  # Only the retry backoff; no poll sleep.
             active.assert_not_called(); progress.assert_not_called()
+
+    def test_a_stalled_body_expires_as_transient_and_the_read_retries(self):
+        release = threading.Event()
+        class Stalled(io.BytesIO):
+            def read(self, n=-1):
+                release.wait(5)
+                return b'{}'
+        plan = fixture()[0]
+        try:
+            with tempfile.TemporaryDirectory() as root, patch.object(r, 'HTTP_TIMEOUT_SEC', 0.2):
+                got, calls, sleep, _ = self.get(self.job(root), Stalled(), plan)
+            self.assertEqual((got['id'], calls), (42, 2))
+            self.assertEqual([c.args[0] for c in sleep.call_args_list], [15])
+        finally:
+            release.set()
+
+    def test_a_hung_resolver_expires_within_the_request_deadline(self):
+        release = threading.Event()
+        def hang(*args, **kwargs):
+            release.wait(5)
+            raise r.socket.gaierror(8, 'released')
+        try:
+            for method, expected in (('GET', r.ReadFailure), ('POST', r.MutationUnconfirmed)):
+                with self.subTest(method=method), patch.object(r, 'HTTP_TIMEOUT_SEC', 0.2), \
+                     patch.object(r.socket, 'getaddrinfo', side_effect=hang):
+                    started = r.time.monotonic()
+                    with self.assertRaises(r.Halt) as raised:
+                        r.request('https://stoarama-api.invalid/x', 'fixture', method, None if method == 'GET' else {})
+                    self.assertLess(r.time.monotonic() - started, 2)
+                    self.assertIs(type(raised.exception), expected)
+                    self.assertEqual(str(raised.exception), 'HTTP request deadline exceeded (' + method + ')')
+        finally:
+            release.set()
+
+    def test_an_expired_post_is_not_retried(self):
+        release = threading.Event()
+        class Stalled(io.BytesIO):
+            def read(self, n=-1):
+                release.wait(5)
+                return b'{}'
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                job = self.job(root)
+                opener = SimpleNamespace(open=unittest.mock.Mock(side_effect=[Stalled(), io.BytesIO(b'{}')]))
+                with patch.dict(os.environ, SERVICE_TOKEN='fixture'), patch.object(r, 'HTTP_TIMEOUT_SEC', 0.2), \
+                     patch.object(r.urllib.request, 'build_opener', return_value=opener), patch.object(r.time, 'sleep') as sleep:
+                    with self.assertRaises(r.MutationUnconfirmed): job.api('POST', 'plans/42/control', {})
+                self.assertEqual(opener.open.call_count, 1); sleep.assert_not_called()
+        finally:
+            release.set()
+
+    def test_psql_runs_under_one_wall_clock_timeout(self):
+        with tempfile.TemporaryDirectory() as root, \
+             patch.object(r.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=b'7')) as run:
+            self.assertEqual(self.job(root).query('SELECT 7', 'progress query'), 7)
+        self.assertEqual(run.call_args.kwargs['timeout'], r.PSQL_TIMEOUT_SEC)
 
     def test_4xx_tls_and_unclassified_get_failures_are_not_retried(self):
         for failure in [self.http(code) for code in (400, 401, 403, 404, 408, 409, 429)] + [
