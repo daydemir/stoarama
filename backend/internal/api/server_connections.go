@@ -30,6 +30,7 @@ var (
 	pullUploadProbeResultRe    = regexp.MustCompile(`^/api/v1/account/connections/upload-probe/\d+/result$`)
 	pullR2CopyTaskRe           = regexp.MustCompile(`^/api/v1/account/connections/r2-copy/\d+/(checkpoint|range|result|block)$`)
 	pullRestoreResultRe        = regexp.MustCompile(`^/api/v1/account/connections/nas-restore/\d+/result$`)
+	pullDayInventoryResultRe   = regexp.MustCompile(`^/api/v1/account/connections/day-inventory/\d+/result$`)
 	pullCleanupResultRe        = regexp.MustCompile(`^/api/v1/account/connections/cleanup/\d+/(observe|result|reconcile)$`)
 	pullSelectedVerifyResultRe = regexp.MustCompile(`^/api/v1/account/connections/selected-verify/\d+/result$`)
 	pullCollatedDownloadPathRe = regexp.MustCompile(`^/api/v1/account/collated/\d+/download$`)
@@ -76,6 +77,9 @@ func pullPathAllowed(method, path string) bool {
 	case method == http.MethodPost && path == "/api/v1/account/connections/nas-restore/lease":
 		return true
 	case method == http.MethodPost && pullRestoreResultRe.MatchString(path):
+		return true
+	// Read-only stream-day inventories; the handlers admit only the reviewed inventory release.
+	case method == http.MethodPost && (path == "/api/v1/account/connections/day-inventory/lease" || pullDayInventoryResultRe.MatchString(path)):
 		return true
 	case method == http.MethodPost && (path == "/api/v1/account/connections/cleanup/lease" || pullCleanupResultRe.MatchString(path)):
 		return true
