@@ -56,6 +56,13 @@ class Mode(enum.Enum):
     BACKFILL = 'backfill'  # receipts for a run made without the wrapper; never deletes
 
 
+class Result(enum.Enum):
+    """receipt-result.json's state. Only COMPLETE closes the intent."""
+    COMPLETE = 'complete'
+    OPEN = 'open'          # some manifest key has no final ledger outcome
+    DEFERRED = 'deferred'  # backfill --defer-blocked: some acknowledged deletes are held, unreceipted
+
+
 def sha(path):
     h = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -317,12 +324,13 @@ def receipt_rows(deleted, manifest, sources, manifest_sha, policy_sha):
     return ''.join(out)
 
 
-def dry_run(cfg, W, tsv):
+def dry_run(cfg, W, tsv, refuse=True):
     """dry-run.sql (plain read-only SELECTs) on receipt rows, ROWS_PER_STATEMENT rows per run;
-    any refusal stops. Every check is per row, so the merged output is the one-shot output:
-    the summary (action|kind|reasons|rows|bytes|raw_purged_at_updates) summed per group, then
-    every non-insert row (seq|action|reasons|kind|source_id|size) in seq order. Returns
-    {action: rows}."""
+    any refusal stops unless refuse is False. Every check is per row, so the merged output is
+    the one-shot output: the summary (action|kind|reasons|rows|bytes|raw_purged_at_updates)
+    summed per group, then every non-insert row (seq|action|reasons|kind|source_id|size) in seq
+    order. Returns ({action: rows}, {key: (action, reasons, size)} for every non-insert row)."""
+    by_seq = {int(f[0]): (f[4].replace('\\\\', '\\'), int(f[5])) for f in (l.split('\t') for l in tsv.splitlines())}
     path = Path(W, 'preflight')
     path.mkdir(exist_ok=True)
     summary, rows = {}, []
@@ -344,11 +352,17 @@ def dry_run(cfg, W, tsv):
     blocked = ['|'.join(k + tuple(map(str, v))) for k, v in sorted(summary.items()) if k[0] == 'blocked']
     if blocked:
         print('\n'.join(blocked), file=sys.stderr)
-        raise SystemExit('the receipt path would refuse planned keys; see preflight/dry-run.out and remove them from the plan')
+        if refuse:
+            raise SystemExit('the receipt path would refuse planned keys; see preflight/dry-run.out and remove them from the plan')
     actions = {}
     for (action, _, _), (n, _, _) in summary.items():
         actions[action] = actions.get(action, 0) + n
-    return actions
+    keys = {}
+    for seq, line in rows:
+        _, action, reasons = line.split('|')[:3]
+        key, size = by_seq[seq]
+        keys[key] = (action, reasons, size)
+    return actions, keys
 
 
 def preflight(cfg, W, keys, manifest, sources, manifest_sha):
@@ -386,24 +400,28 @@ def load_intent(W):
 
 def is_complete(W):
     result = Path(W, 'receipt-result.json')
-    return result.exists() and json.loads(result.read_text())['complete']
+    return result.exists() and json.loads(result.read_text())['complete']  # lane cycles write the same field
 
 
-def finish_receipts(cfg, W, only=None):
+def finish_receipts(cfg, W, only=None, skip=frozenset(), deferred=frozenset()):
     """Receipts for the acknowledged deletes in W (only those first acknowledged by ledger
-    `only`, when given). The intent closes only when every manifest key has a final ledger
-    outcome. Returns the folded State."""
+    `only`, when given; never those in skip, already applied, or deferred, held). The intent
+    closes only when every manifest key has a final ledger outcome and none is deferred.
+    Returns the folded State."""
     intent, manifest, sources = load_intent(W)
     st = State(W, intent, manifest)
-    deleted = {k: at for k, (at, ledger) in st.deleted.items() if only is None or ledger == only}
+    deleted = {k: at for k, (at, ledger) in st.deleted.items()
+               if (only is None or ledger == only) and k not in skip and k not in deferred}
+    state = Result.DEFERRED if deferred else Result.OPEN if st.unresolved else Result.COMPLETE
     durable_write(Path(W, 'receipt-backfill.tsv'), receipt_rows(deleted, manifest, sources, intent['manifest_sha256'], st.policy))
     if deleted:
         apply_receipts(cfg, W, len(deleted))
     durable_write(Path(W, 'receipt-result.json'), json.dumps({
-        'complete': not st.unresolved, 'deleted_receipts': len(st.deleted), 'unresolved': len(st.unresolved),
+        'complete': state is Result.COMPLETE, 'state': state.value, 'deleted_receipts': len(st.deleted) - len(deferred),
+        'deferred': len(deferred), 'unresolved': len(st.unresolved),
         'manifest_sha256': intent['manifest_sha256'], 'at': now_utc().isoformat()}) + '\n')
-    print(json.dumps({'workdir': str(W), 'deleted_receipts': len(st.deleted), 'applied_now': len(deleted),
-                      'unresolved': len(st.unresolved)}))
+    print(json.dumps({'workdir': str(W), 'state': state.value, 'deleted_receipts': len(st.deleted) - len(deferred),
+                      'applied_now': len(deleted), 'deferred': len(deferred), 'unresolved': len(st.unresolved)}))
     return st
 
 
@@ -648,7 +666,7 @@ def delete(cfg, W, args, lock_fd):
                              'rerun the same command to settle them first')
 
 
-def backfill(cfg, W, manifest_path, ledger_path):
+def backfill(cfg, W, manifest_path, ledger_path, defer_blocked):
     """Receipts for a run made without the wrapper, at its ledger's own times. Never deletes."""
     manifest_path, ledger_path = str(Path(manifest_path).resolve()), str(Path(ledger_path).resolve())
     manifest_sha = sha(manifest_path)
@@ -664,7 +682,7 @@ def backfill(cfg, W, manifest_path, ledger_path):
             raise SystemExit(f'{W} is bound to another backfill; use a new workdir')
         if is_complete(W):
             st = State(W, intent, manifest)
-            actions = dry_run(cfg, W, receipt_rows({k: at for k, (at, _) in st.deleted.items()}, manifest, sources,
+            actions, _ = dry_run(cfg, W, receipt_rows({k: at for k, (at, _) in st.deleted.items()}, manifest, sources,
                                                    manifest_sha, st.policy))
             if set(actions) - {'already_applied'}:
                 raise SystemExit(f'{W}: closed backfill no longer reads as applied: {actions}')
@@ -677,10 +695,20 @@ def backfill(cfg, W, manifest_path, ledger_path):
         intent = {'mode': Mode.BACKFILL.value, 'manifest': manifest_path, 'manifest_sha256': manifest_sha,
                   'sources_sha256': sha(Path(W, 'receipt-sources.json')), 'ledger': ledger_path,
                   'ledger_sha256': sha(ledger_path), 'fresh_listing_sha256': header.get('fresh_listing_sha256')}
-        st = State(W, intent, manifest)
-        dry_run(cfg, W, receipt_rows({k: at for k, (at, _) in st.deleted.items()}, manifest, sources, manifest_sha, st.policy))
+    # Every run dry-runs every acknowledged delete: already applied rows are skipped, and with
+    # --defer-blocked a held key is recorded in deferred-blocked.tsv and left unreceipted (its
+    # hold is never touched) while the rest apply. A later run applies whatever its hold released.
+    st = State(W, intent, manifest)
+    _, rows = dry_run(cfg, W, receipt_rows({k: at for k, (at, _) in st.deleted.items()}, manifest, sources, manifest_sha, st.policy),
+                      refuse=not defer_blocked)
+    deferred = {k: v for k, v in rows.items() if v[0] == 'blocked'}
+    if not intent_path.exists():
         durable_write(intent_path, json.dumps(intent) + '\n')
-    st = finish_receipts(cfg, W)
+    if deferred:
+        durable_write(Path(W, 'deferred-blocked.tsv'), ''.join(f'{k}\t{size}\t{reasons}\n' for k, (_, reasons, size) in sorted(deferred.items())))
+    else:
+        Path(W, 'deferred-blocked.tsv').unlink(missing_ok=True)
+    st = finish_receipts(cfg, W, skip={k for k, v in rows.items() if v[0] == 'already_applied'}, deferred=set(deferred))
     if st.unresolved:
         raise SystemExit(f'{len(st.unresolved)} manifest keys have no final outcome in {ledger_path}; '
                          'they may or may not be gone from R2 and need their own reconciliation')
@@ -692,8 +720,9 @@ def status(roots):
         n += 1
         intent = json.loads(Path(W, 'delete-intent.json').read_text())
         result = Path(W, 'receipt-result.json')
+        r = json.loads(result.read_text()) if result.exists() else {}
         print(json.dumps({'workdir': str(W), 'mode': intent.get('mode', 'lane'), 'manifest_sha256': intent['manifest_sha256'],
-                          'unresolved': json.loads(result.read_text())['unresolved'] if result.exists() else None}))
+                          'state': r.get('state', Result.OPEN.value), 'unresolved': r.get('unresolved'), 'deferred': r.get('deferred', 0)}))
     if n:
         raise SystemExit(f'{n} open delete intents')
     print(json.dumps({'open': 0}))
@@ -715,6 +744,8 @@ def main(argv):
     b.add_argument('workdir')
     b.add_argument('--manifest', required=True)
     b.add_argument('--ledger', required=True)
+    b.add_argument('--defer-blocked', action='store_true',
+                   help='apply every receipt the dry run admits; record held keys in deferred-blocked.tsv and keep the intent open')
     s = sub.add_parser('status', help='list open delete intents under each root; exits non-zero if any')
     s.add_argument('roots', nargs='+')
     cfg = p.parse_args(argv)
@@ -729,7 +760,7 @@ def main(argv):
         if cfg.cmd == 'receipts':
             finish_receipts(cfg, W)
         elif cfg.cmd == 'backfill':
-            backfill(cfg, W, cfg.manifest, cfg.ledger)
+            backfill(cfg, W, cfg.manifest, cfg.ledger, cfg.defer_blocked)
         else:
             delete(cfg, W, cfg.args[1:] if cfg.args[:1] == ['--'] else cfg.args, lock.fileno())
 

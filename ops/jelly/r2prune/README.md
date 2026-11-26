@@ -112,7 +112,7 @@ same command. `--chunks K` stops after K chunks (a canary) with the intent open.
 # replay the receipts of an open intent
 /usr/bin/python3 -I ops/jelly/r2prune/manual_apply.py receipts WORKDIR
 # receipts for a run made without the wrapper (never starts r2prune)
-/usr/bin/python3 -I ops/jelly/r2prune/manual_apply.py backfill WORKDIR --manifest M --ledger L
+/usr/bin/python3 -I ops/jelly/r2prune/manual_apply.py backfill WORKDIR --manifest M --ledger L [--defer-blocked]
 # list open intents; exits non-zero when any is open
 /usr/bin/python3 -I ops/jelly/r2prune/manual_apply.py status ROOT [ROOT ...]
 ```
@@ -123,6 +123,15 @@ stops before the intent), writes the intent (pinning the ledger's digest), then
 applies the receipts. A second run on a closed backfill re-runs the dry run and
 reports `already_applied`. Keys the ledger leaves without a final outcome keep the
 intent open and exit non-zero: they need their own reconciliation.
+
+Every `backfill` run dry-runs every acknowledged delete and applies only the rows
+still to insert. With `--defer-blocked`, a key the receipt path refuses (for example
+a NAS cleanup source hold added after the delete) gets no receipt and its hold is
+never touched: it is written to `WORKDIR/deferred-blocked.tsv` (key, size, reasons),
+every admitted key is receipted, and `receipt-result.json` reads `state: deferred`,
+so the intent stays open and `status` reports it. Rerun the same command once holds
+are released; it applies what they now admit and closes the intent when nothing is
+left deferred. Without the flag, any blocked key still refuses the whole run.
 
 A later `delete` in the same `WORKDIR` replays an open intent first and re-checks
 the manifest and `receipt-sources.json` against the intent's digests. The wrapper
