@@ -6,7 +6,7 @@ import (
 )
 
 // TestR2DeliveryKeyGuardBranches pins every RAISE of guard_r2_delivery_keys_admitted
-// (0211, re-planned by 0267) to its exact message, and pins the admitted rows,
+// (0211, re-planned by 0267, restored-output exception 0269) to its exact message, and pins the admitted rows,
 // including near misses the indexed path/content lookups must not over-match.
 func TestR2DeliveryKeyGuardBranches(t *testing.T) {
 	f := newNonrawFixture(t, "hold_guard_branches")
@@ -21,6 +21,19 @@ func TestR2DeliveryKeyGuardBranches(t *testing.T) {
 		upperClip    = `UPDATE recording_clips SET sha256=upper(sha256) WHERE id=7000001`
 		joinedIntent = `UPDATE r2_nonraw_intents SET nas_relative_path='joined/nightly/video.mp4'`
 		joinedOutput = `UPDATE recording_collation_outputs SET nas_relative_path='joined/nightly/video.mp4' WHERE id=10000001`
+	)
+	// The R2 lane deleted the output; a verified NAS output restore (0263) may
+	// have re-created those exact bytes at its key.
+	const (
+		retired = `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256)
+ VALUES('collated',10000001,3,'stoarama','joined/nightly-collation-v2/objects/'||repeat('b',64)||'.mp4',900,repeat('b',64),'test','none',repeat('d',64),repeat('e',64))`
+		restored = `INSERT INTO nas_restore_requests(connection_id,recording_id,target,output_id,object_key,source_object_key,relative_path,content_type,size_bytes,sha256,label,state,completed_at,verified_etag)
+ VALUES(13,30,'output',10000001,'joined/nightly-collation-v2/objects/'||repeat('b',64)||'.mp4','joined/nightly-collation-v2/objects/'||repeat('b',64)||'.mp4','joined/nightly/video.mp4','video/mp4',900,repeat('b',64),'test','verified',now(),'restored-etag')`
+		restoreFailed    = `UPDATE nas_restore_requests SET state='failed'`
+		restoreNoEtag    = `UPDATE nas_restore_requests SET verified_etag=''`
+		restoreOtherSHA  = `UPDATE nas_restore_requests SET sha256=repeat('a',64)`
+		restoreOtherSize = `UPDATE nas_restore_requests SET size_bytes=901`
+		restoreOtherKey  = `UPDATE nas_restore_requests SET object_key='joined/nightly-collation-v2/objects/other.mp4',source_object_key='joined/nightly-collation-v2/objects/other.mp4'`
 	)
 	const (
 		adoption = "R2 retirement reservation forbids delivery adoption"
@@ -56,6 +69,17 @@ func TestR2DeliveryKeyGuardBranches(t *testing.T) {
 		// joined/x, which the reserved joined/source/source.mp4 (-> source/...) is not.
 		{"admitted_double_joined_prefix", []string{reserveRaw, joinedClip}, "gss/a.json", "", 5, "joined/joined/source/source.mp4", ""},
 		{"admitted_output_without_retirement", nil, f.key, b64, 900, "nightly/video.mp4", ""},
+		{"closure_retired_without_restore", []string{retired}, f.key, b64, 900, "nightly/video.mp4", closure},
+		{"closure_retired_restore_failed", []string{retired, restored, restoreFailed}, f.key, b64, 900, "nightly/video.mp4", closure},
+		{"closure_retired_restore_without_etag", []string{retired, restored, restoreNoEtag}, f.key, b64, 900, "nightly/video.mp4", closure},
+		{"closure_retired_restore_other_sha", []string{retired, restored, restoreOtherSHA}, f.key, b64, 900, "nightly/video.mp4", closure},
+		{"closure_retired_restore_other_size", []string{retired, restored, restoreOtherSize}, f.key, b64, 900, "nightly/video.mp4", closure},
+		{"closure_retired_restore_other_key", []string{retired, restored, restoreOtherKey}, f.key, b64, 900, "nightly/video.mp4", closure},
+		{"closure_retired_restored_hold_other_key", []string{retired, restored}, "gss/a.json", b64, 900, "nightly/video.mp4", closure},
+		{"closure_retired_restored_hold_other_sha", []string{retired, restored}, f.key, strings.Repeat("a", 64), 900, "nightly/video.mp4", closure},
+		{"closure_retired_restored_hold_other_size", []string{retired, restored}, f.key, b64, 901, "nightly/video.mp4", closure},
+		{"closure_retired_restored_raw_reserved", []string{retired, restored, reserveRaw}, f.key, b64, 900, "nightly/video.mp4", closure},
+		{"admitted_retired_output_restored", []string{retired, restored}, f.key, b64, 900, "nightly/video.mp4", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tx, err := f.pool.Begin(f.ctx)
