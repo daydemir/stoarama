@@ -1,10 +1,13 @@
 -- A retired collated output stops blocking delivery holds once a verified NAS
 -- output restore (0263) re-created that exact object: the 'verified' restore row
--- (state set by handleNASRestoreResult only after a full R2 HEAD and re-hash,
--- which also stamps completed_at and verified_etag) carries the output's key,
--- sha256 and size, and the hold and the retirement row name those same bytes in
--- that bucket. Every other clause of guard_r2_delivery_keys_admitted() (0267)
--- is unchanged. q.output_id=o.id is served by nas_restore_requests_output_idx.
+-- (set by handleAccountConnectionRestoreResult only after a full R2 HEAD and
+-- re-hash, which also stamps completed_at and verified_etag) carries the
+-- output's key, sha256 and size, the hold and the retirement row name those same
+-- bytes in that bucket, and the restore completed after the retirement: a
+-- restore verified while the object was still in R2 (outcome 'exists') re-created
+-- nothing a later retirement deleted. Every other clause of
+-- guard_r2_delivery_keys_admitted() (0267) is unchanged. q.output_id=o.id is
+-- served by nas_restore_requests_output_idx.
 CREATE OR REPLACE FUNCTION guard_r2_delivery_keys_admitted() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE r record; n text; BEGIN
  FOR r IN SELECT * FROM new_rows LOOP
@@ -33,7 +36,7 @@ DECLARE r record; n text; BEGIN
        OR EXISTS(SELECT 1 FROM r2_nonraw_intents i WHERE i.kind='collated' AND i.source_id=o.id)
        OR EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.kind='collated' AND x.source_id=o.id
             AND NOT EXISTS(SELECT 1 FROM nas_restore_requests q WHERE q.output_id=o.id AND q.target='output'
-              AND q.state='verified' AND q.completed_at IS NOT NULL AND q.verified_etag<>''
+              AND q.state='verified' AND q.completed_at>x.retired_at AND q.verified_etag<>''
               AND q.object_key=o.object_key AND q.sha256=o.sha256 AND q.size_bytes=o.size_bytes
               AND q.object_key=r.object_key AND q.sha256=r.sha256 AND q.size_bytes=r.size_bytes
               AND x.bucket=r.bucket AND x.object_key=q.object_key AND x.sha256=q.sha256 AND x.size_bytes=q.size_bytes))

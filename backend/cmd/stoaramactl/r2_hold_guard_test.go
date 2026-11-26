@@ -25,15 +25,20 @@ func TestR2DeliveryKeyGuardBranches(t *testing.T) {
 	// The R2 lane deleted the output; a verified NAS output restore (0263) may
 	// have re-created those exact bytes at its key.
 	const (
-		retired = `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256)
- VALUES('collated',10000001,3,'stoarama','joined/nightly-collation-v2/objects/'||repeat('b',64)||'.mp4',900,repeat('b',64),'test','none',repeat('d',64),repeat('e',64))`
+		retired = `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256,retired_at)
+ VALUES('collated',10000001,3,'stoarama','joined/nightly-collation-v2/objects/'||repeat('b',64)||'.mp4',900,repeat('b',64),'test','none',repeat('d',64),repeat('e',64),now()-interval '1 day')`
 		restored = `INSERT INTO nas_restore_requests(connection_id,recording_id,target,output_id,object_key,source_object_key,relative_path,content_type,size_bytes,sha256,label,state,completed_at,verified_etag)
  VALUES(13,30,'output',10000001,'joined/nightly-collation-v2/objects/'||repeat('b',64)||'.mp4','joined/nightly-collation-v2/objects/'||repeat('b',64)||'.mp4','joined/nightly/video.mp4','video/mp4',900,repeat('b',64),'test','verified',now(),'restored-etag')`
-		restoreFailed    = `UPDATE nas_restore_requests SET state='failed'`
-		restoreNoEtag    = `UPDATE nas_restore_requests SET verified_etag=''`
-		restoreOtherSHA  = `UPDATE nas_restore_requests SET sha256=repeat('a',64)`
-		restoreOtherSize = `UPDATE nas_restore_requests SET size_bytes=901`
-		restoreOtherKey  = `UPDATE nas_restore_requests SET object_key='joined/nightly-collation-v2/objects/other.mp4',source_object_key='joined/nightly-collation-v2/objects/other.mp4'`
+		restoreFailed        = `UPDATE nas_restore_requests SET state='failed'`
+		restoreNoEtag        = `UPDATE nas_restore_requests SET verified_etag=''`
+		restoreOtherSHA      = `UPDATE nas_restore_requests SET sha256=repeat('a',64)`
+		restoreOtherSize     = `UPDATE nas_restore_requests SET size_bytes=901`
+		restoreOtherKey      = `UPDATE nas_restore_requests SET object_key='joined/nightly-collation-v2/objects/other.mp4',source_object_key='joined/nightly-collation-v2/objects/other.mp4'`
+		restoreBeforeRetired = `UPDATE nas_restore_requests SET completed_at=now()-interval '2 days'`
+		restoreOtherOutput   = `UPDATE nas_restore_requests SET output_id=10000002`
+		retiredOtherSHA      = `UPDATE r2_object_retirements SET sha256=repeat('a',64)`
+		retiredOtherKey      = `UPDATE r2_object_retirements SET object_key='joined/nightly-collation-v2/objects/other.mp4'`
+		retiredOtherBucket   = `UPDATE r2_object_retirements SET bucket='other'`
 	)
 	const (
 		adoption = "R2 retirement reservation forbids delivery adoption"
@@ -79,6 +84,12 @@ func TestR2DeliveryKeyGuardBranches(t *testing.T) {
 		{"closure_retired_restored_hold_other_sha", []string{retired, restored}, f.key, strings.Repeat("a", 64), 900, "nightly/video.mp4", closure},
 		{"closure_retired_restored_hold_other_size", []string{retired, restored}, f.key, b64, 901, "nightly/video.mp4", closure},
 		{"closure_retired_restored_raw_reserved", []string{retired, restored, reserveRaw}, f.key, b64, 900, "nightly/video.mp4", closure},
+		{"closure_retired_restore_before_retirement", []string{retired, restored, restoreBeforeRetired}, f.key, b64, 900, "nightly/video.mp4", closure},
+		{"closure_retired_restore_other_output", []string{retired, restored, restoreOtherOutput}, f.key, b64, 900, "nightly/video.mp4", closure},
+		{"closure_retired_restore_hold_and_retirement_other_sha", []string{retired, restored, restoreOtherSHA, retiredOtherSHA}, f.key, strings.Repeat("a", 64), 900, "nightly/video.mp4", closure},
+		{"closure_retired_other_sha", []string{retired, restored, retiredOtherSHA}, f.key, b64, 900, "nightly/video.mp4", closure},
+		{"closure_retired_other_key", []string{retired, restored, retiredOtherKey}, f.key, b64, 900, "nightly/video.mp4", closure},
+		{"closure_retired_other_bucket", []string{retired, restored, retiredOtherBucket}, f.key, b64, 900, "nightly/video.mp4", closure},
 		{"admitted_retired_output_restored", []string{retired, restored}, f.key, b64, 900, "nightly/video.mp4", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
