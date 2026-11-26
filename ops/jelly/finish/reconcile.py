@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import uuid
 
-from admission import LANES, attempt_paths, binding, gate, load, publish, sync_dir
+from admission import LANES, TICK_HOLD, attempt_paths, binding, gate, load, publish, sync_dir
 
 
 def main():
@@ -55,6 +55,8 @@ def main():
             publish(receipts / (uuid.uuid4().hex + '.json'), receipt)
             # No evidence/status is restored or deleted. A real recovery must
             # succeed before tick admission; tick cannot relatch during that step.
+            # A hold start from before the latch must not expire the first new hold.
+            (args.state / TICK_HOLD).unlink(missing_ok=True)
             publish(args.state / 'admission.json', {'failed': False, 'active': {}, 'recovery_required': True})
             retained = args.state / 'retained'
             retained.mkdir(mode=0o700, exist_ok=True)
