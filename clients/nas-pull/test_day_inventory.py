@@ -111,6 +111,34 @@ class DayInventoryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pull.valid_day_inventory_unit(unit(expected_dirs=[directory]))
 
+    def test_symlinked_directories_refuse_the_unit(self):
+        self.put('elsewhere/September/25-Friday/a.mp4')
+        (self.root / '03_Brzeg').mkdir()
+        # A symlinked component of a derived plaza directory, and a symlinked
+        # catalog directory named by the lease.
+        os.symlink(self.root / 'elsewhere/September', self.root / '03_Brzeg/September')
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            self.scan(unit())
+        os.unlink(self.root / '03_Brzeg/September')
+        os.symlink(self.root / 'elsewhere', self.root / 'legacy')
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            self.scan(unit(expected_dirs=['legacy/September/25-Friday']))
+        self.assertEqual(self.snapshot()['legacy'][0] & 0o170000, 0o120000)
+
+    def test_folder_map_escape_refuses_the_unit(self):
+        self.root.mkdir()
+        for folder in ('../outside', 'joined/x', '/abs', 'a/../b'):
+            pins = dict(PINS, folders={folder: 17216})
+            with self.assertRaises(ValueError):
+                pull.day_inventory_scan(self.root, pull.valid_day_inventory_unit(unit()), pins)
+
+    def test_a_non_regular_file_after_open_fails_the_scan(self):
+        self.put('03_Brzeg/September/25-Friday/a.mp4')
+        directory = os.stat(self.root)
+        with mock.patch.object(pull.os, 'fstat', return_value=directory):
+            with self.assertRaisesRegex(ValueError, 'not a regular file'):
+                self.scan(unit())
+
     def test_a_file_changing_while_read_fails_the_scan(self):
         path = self.put('03_Brzeg/September/25-Friday/grow.mp4')
         real, grown = os.read, []

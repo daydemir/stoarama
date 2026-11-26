@@ -28,6 +28,8 @@ import (
 // original, create-only, from the path the inventory read).
 
 const nasDayInventoryUsage = `usage:
+  stoaramactl nas-day-inventory scope --days-file TSV --reason TEXT [--recording-ids 1,2,3 --dry-run]
+      approves those days in nas_restore_day_scope (delete a row there to withdraw it)
   stoaramactl nas-day-inventory request --days-file TSV --label LABEL [--recording-ids 1,2,3 --max-attempts 3 --dry-run --json]
       TSV has a header row with recording_id and local_date (YYYY-MM-DD) columns; other columns are ignored.
   stoaramactl nas-day-inventory status --label LABEL [--json]
@@ -88,6 +90,29 @@ func readNASDayInventoryDays(r io.Reader, only []int64) ([]nasDayInventoryDay, e
 		return nil, errors.New("days file selects no day")
 	}
 	return days, nil
+}
+
+// scopeNASDayInventories approves every day or none; it returns how many rows
+// were new.
+func scopeNASDayInventories(ctx context.Context, pool *pgxpool.Pool, reason string, dryRun bool, days []nasDayInventoryDay) (int, error) {
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	approved := 0
+	for _, day := range days {
+		tag, err := tx.Exec(ctx, `INSERT INTO nas_restore_day_scope(recording_id,local_date,reason) VALUES($1,$2::date,$3) ON CONFLICT DO NOTHING`,
+			day.RecordingID, day.LocalDate, reason)
+		if err != nil {
+			return 0, fmt.Errorf("approve recording %d %s: %w", day.RecordingID, day.LocalDate, err)
+		}
+		approved += int(tag.RowsAffected())
+	}
+	if dryRun {
+		return approved, nil
+	}
+	return approved, tx.Commit(ctx)
 }
 
 type nasDayInventoryRequestSummary struct {
@@ -197,14 +222,17 @@ func runNASDayInventory(ctx context.Context, cfg config.Config, args []string) {
 	maxAttempts := fs.Int("max-attempts", 3, "scan attempts per day before it fails")
 	dryRun := fs.Bool("dry-run", false, "validate only; queue nothing")
 	asJSON := fs.Bool("json", false, "print JSON")
-	if err := fs.Parse(args[1:]); err != nil || len(fs.Args()) != 0 || !nasRestoreLabelRE.MatchString(*label) {
+	reason := fs.String("reason", "", "why these days are approved")
+	// scope takes no label; every other subcommand needs one.
+	labeled := args[0] != "scope"
+	if err := fs.Parse(args[1:]); err != nil || len(fs.Args()) != 0 || labeled != nasRestoreLabelRE.MatchString(*label) {
 		log.Fatal(nasDayInventoryUsage)
 	}
 	pool := mustJoinedPurgePool(ctx, cfg)
 	defer pool.Close()
 	switch args[0] {
-	case "request":
-		if *daysFile == "" || *maxAttempts < 1 || *maxAttempts > 10 {
+	case "scope", "request":
+		if *daysFile == "" || *maxAttempts < 1 || *maxAttempts > 10 || (args[0] == "scope") == (strings.TrimSpace(*reason) == "") {
 			log.Fatal(nasDayInventoryUsage)
 		}
 		var only []int64
@@ -223,6 +251,14 @@ func runNASDayInventory(ctx context.Context, cfg config.Config, args []string) {
 		file.Close()
 		if err != nil {
 			log.Fatalf("nas-day-inventory request: %v", err)
+		}
+		if args[0] == "scope" {
+			approved, err := scopeNASDayInventories(ctx, pool, *reason, *dryRun, days)
+			if err != nil {
+				log.Fatalf("nas-day-inventory scope: %v", err)
+			}
+			fmt.Printf("dry_run=%t approved=%d already_approved=%d\n", *dryRun, approved, len(days)-approved)
+			return
 		}
 		summary, err := requestNASDayInventories(ctx, pool, *label, *maxAttempts, *dryRun, days)
 		if err != nil {

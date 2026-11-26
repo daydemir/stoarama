@@ -141,7 +141,16 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 		return resp
 	}
 
+	// Only an approved day is ever queued.
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_day_inventory_units(connection_id,label,recording_id,local_date) VALUES(13,'gss-inv',335,'2026-09-25')`); err == nil ||
+		!strings.Contains(err.Error(), "nas_restore_day_scope") {
+		t.Fatalf("unapproved day queued: %v", err)
+	}
+	exec(`INSERT INTO nas_restore_day_scope(recording_id,local_date,reason) VALUES(335,'2026-09-25','GSS best-14')`)
 	exec(`INSERT INTO nas_day_inventory_units(connection_id,label,recording_id,local_date) VALUES(13,'gss-inv',335,'2026-09-25')`)
+	if _, err := pool.Exec(ctx, `UPDATE nas_restore_day_scope SET reason='x'`); err == nil {
+		t.Fatal("a scope row was rewritten")
+	}
 	if _, err := pool.Exec(ctx, `INSERT INTO nas_day_inventory_units(connection_id,label,recording_id,local_date) VALUES(13,'again',335,'2026-09-25')`); err == nil {
 		t.Fatal("a second live unit for the same stream-day was queued")
 	}
@@ -223,15 +232,28 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 			VALUES(13,$1,335,'original',$2,$2,$3,'video/mp4',$4,$5,'gss') RETURNING id`, c.id, c.key, path, c.size, sha).Scan(&id)
 		return id, err
 	}
-	for name, try := range map[string]func() (int64, error){
-		"other bytes":  func() (int64, error) { return queue(changed, plaza+changed.name, changed.sha) },
-		"catalog path": func() (int64, error) { return queue(moved, "recordings/335/continuous/"+moved.name, moved.sha) },
-		"unmatched":    func() (int64, error) { return queue(twice, plaza+twice.name, twice.sha) },
-	} {
-		if _, err := try(); err == nil || !strings.Contains(err.Error(), "fenced") {
+	fenced := func(name, sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err == nil || !strings.Contains(err.Error(), "fenced") {
 			t.Fatalf("%s restore queued past the writer fence: %v", name, err)
 		}
 	}
+	restoreRow := `INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,object_key,source_object_key,relative_path,content_type,size_bytes,sha256,label)
+			VALUES($1,$2,335,'original',$3,$3,$4,'video/mp4',$5,$6,'gss')`
+	movedPath, catalogPath := plaza+moved.name, "recordings/335/continuous/"+moved.name
+	fenced("other bytes", restoreRow, 13, changed.id, changed.key, plaza+changed.name, changed.size, changed.sha)
+	fenced("catalog path", restoreRow, 13, moved.id, moved.key, catalogPath, moved.size, moved.sha)
+	fenced("unmatched", restoreRow, 13, twice.id, twice.key, plaza+twice.name, twice.size, twice.sha)
+	fenced("other key", restoreRow, 13, moved.id, "managed/acct-47/other.mp4", movedPath, moved.size, moved.sha)
+	fenced("other connection", restoreRow, 14, moved.id, moved.key, movedPath, moved.size, moved.sha)
+	fenced("other size", restoreRow, 13, moved.id, moved.key, movedPath, moved.size+1, moved.sha)
+	// A unit that is not completed, and a day whose approval was withdrawn.
+	exec(`UPDATE nas_day_inventory_units SET state='failed' WHERE label='gss-inv'`)
+	fenced("failed unit", restoreRow, 13, moved.id, moved.key, movedPath, moved.size, moved.sha)
+	exec(`UPDATE nas_day_inventory_units SET state='completed' WHERE label='gss-inv'`)
+	exec(`DELETE FROM nas_restore_day_scope WHERE recording_id=335`)
+	fenced("unapproved day", restoreRow, 13, moved.id, moved.key, movedPath, moved.size, moved.sha)
+	exec(`INSERT INTO nas_restore_day_scope(recording_id,local_date,reason) VALUES(335,'2026-09-25','GSS best-14')`)
 	restoreID, err := queue(moved, plaza+moved.name, moved.sha)
 	if err != nil {
 		t.Fatal(err)
@@ -266,4 +288,23 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 	if code, body := call(47, "abc", "/restore/lease", map[string]any{"client_version": "abc", "max_tasks": 8}); code != http.StatusOK || strings.Contains(body, fmt.Sprintf(`"task_id":%d`, again)) {
 		t.Fatalf("withdrawn restore leased: %d %s", code, body)
 	}
+	exec(`UPDATE nas_day_inventory_units SET state='completed' WHERE label='gss-inv'`)
+
+	// A pending R2 deletion of the key refuses the restore (0262's predicate).
+	exec(`UPDATE nas_restore_requests SET state='canceled', completed_at=now() WHERE id=$1`, again)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{`SET LOCAL session_replication_role=replica`,
+		fmt.Sprintf(`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256) VALUES('raw',%d,'bucket','%s',%d,'%s',repeat('c',64))`,
+			moved.id, moved.key, moved.size, moved.sha)} {
+		if _, err := tx.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fenced("pending deletion", restoreRow, 13, moved.id, moved.key, movedPath, moved.size, moved.sha)
 }

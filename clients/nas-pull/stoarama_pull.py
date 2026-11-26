@@ -26147,7 +26147,7 @@ def day_inventory_dirs(root, unit, pins):
     stream, day = unit["stream_id"], unit["local_date"]
     if pins["windows"][stream][2] != unit["timezone"]:
         raise ValueError("unit timezone differs from the pinned window")
-    folders = sorted(folder for folder, owner in pins["folders"].items() if owner == stream)
+    folders = sorted(valid_day_inventory_dir(folder) for folder, owner in pins["folders"].items() if owner == stream)
     if not folders:
         raise ValueError("pinned folder map has no folder for stream %d" % stream)
     plaza = "%s/%02d-%s" % (CLEANUP_MONTHS[day.month - 1], day.day, CLEANUP_DAY_WEEKDAYS[day.weekday()])
@@ -26164,11 +26164,18 @@ def day_inventory_dirs(root, unit, pins):
 
 
 def day_inventory_names(root, directory, directories=False):
-    """Visible regular .mp4 files (or subdirectories) of directory; none when it is absent."""
+    """Visible regular .mp4 files (or subdirectories) of directory; none when it is absent.
+
+    A symlink anywhere on the way refuses the whole unit."""
     try:
         descriptor = cleanup_day_open(root, directory)
-    except (FileNotFoundError, NotADirectoryError):
+    except FileNotFoundError:
         return []
+    except OSError as exc:
+        # O_NOFOLLOW|O_DIRECTORY on a symlink is ELOOP or ENOTDIR by platform.
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise ValueError("inventory directory %r is a symlink or not a directory" % directory) from exc
+        raise
     try:
         with os.scandir(descriptor) as entries:
             return sorted(entry.name for entry in entries if not entry.name.startswith(".") and (
@@ -26187,6 +26194,8 @@ def day_inventory_hash(root, directory, name, kind):
         os.close(descriptor)
     try:
         before = os.fstat(fd)
+        if not stat_module.S_ISREG(before.st_mode):
+            raise ValueError("%s/%s is not a regular file" % (directory, name))
         digest, read = hashlib.sha256(), 0
         while True:
             chunk = os.read(fd, RESTORE_BLOCK_BYTES)

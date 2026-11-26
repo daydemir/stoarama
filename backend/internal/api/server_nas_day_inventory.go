@@ -14,8 +14,9 @@ import (
 
 // Read-only stream-day NAS inventory (migration 0272, r2-copy-v8-inventory only).
 //
-// stoaramactl nas-day-inventory request queues one unit per (recording, local
-// date). The client leases a unit, lists that stream's raw and joined day
+// stoaramactl nas-day-inventory scope approves (recording, local date) days in
+// nas_restore_day_scope; request queues one unit per approved day, and only an
+// approved day is leased. The client leases a unit, lists that stream's raw and joined day
 // directories read-only (its pinned folder map, plus the directories of the
 // catalog's clips for that day, which the lease sends), and reports every media
 // file with the sha256 of the bytes it read. The report lands in
@@ -147,7 +148,9 @@ func (s *Server) handleAccountConnectionDayInventoryLease(w http.ResponseWriter,
 	var unit nasDayInventoryUnit
 	err = tx.QueryRow(ctx, `UPDATE nas_day_inventory_units u SET state='leased', attempts=u.attempts+1, leased_at=now(),
   lease_expires_at=now()+$2::bigint*interval '1 microsecond', client_version=$3
- FROM (SELECT id FROM nas_day_inventory_units WHERE connection_id=$1 AND state='pending' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED) picked,
+ FROM (SELECT u.id FROM nas_day_inventory_units u WHERE u.connection_id=$1 AND u.state='pending'
+   AND EXISTS(SELECT 1 FROM nas_restore_day_scope s WHERE s.recording_id=u.recording_id AND s.local_date=u.local_date)
+   ORDER BY u.id LIMIT 1 FOR UPDATE SKIP LOCKED) picked,
   recordings r, nas_media_keep20_windows k
  WHERE u.id=picked.id AND r.id=u.recording_id AND k.stream_id=r.stream_id
  RETURNING u.id, u.attempts, u.recording_id, r.stream_id, u.local_date::text, k.timezone, u.lease_expires_at`,

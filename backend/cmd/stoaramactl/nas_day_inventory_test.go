@@ -65,6 +65,22 @@ INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,buck
 		t.Fatal(err)
 	}
 	days := []nasDayInventoryDay{{335, "2026-09-25"}, {335, "2026-09-26"}}
+	if _, err := requestNASDayInventories(ctx, pool, "gss", 3, false, days); err == nil || !strings.Contains(err.Error(), "nas_restore_day_scope") {
+		t.Fatalf("unapproved days queued: %v", err)
+	}
+	if n, err := scopeNASDayInventories(ctx, pool, "GSS best-14", true, days); err != nil || n != 2 {
+		t.Fatalf("scope dry run %d err=%v", n, err)
+	}
+	if n, err := scopeNASDayInventories(ctx, pool, "GSS best-14", false, days); err != nil || n != 2 {
+		t.Fatalf("scope %d err=%v", n, err)
+	}
+	if n, err := scopeNASDayInventories(ctx, pool, "GSS best-14", false, days); err != nil || n != 0 {
+		t.Fatalf("re-scope %d err=%v", n, err)
+	}
+	// One day outside the approved scope refuses the whole request.
+	if _, err := requestNASDayInventories(ctx, pool, "gss", 3, false, append(days, nasDayInventoryDay{335, "2026-09-27"})); err == nil || !strings.Contains(err.Error(), "nas_restore_day_scope") {
+		t.Fatalf("unapproved day queued: %v", err)
+	}
 	if _, err := requestNASDayInventories(ctx, pool, "gss", 3, false, append(days, nasDayInventoryDay{336, "2026-09-25"})); err == nil || !strings.Contains(err.Error(), "pinned window") {
 		t.Fatalf("unpinned stream queued: %v", err)
 	}

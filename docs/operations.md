@@ -423,9 +423,14 @@ for both kinds. Only a NAS client that sends `output_restores` leases these. A
 verified output changes no catalog or retirement row.
 
 Migration 0272 adds read-only stream-day NAS inventories and a third restore
-gate. `stoaramactl nas-day-inventory request --days-file TSV --label L
-[--recording-ids ...]` queues one unit per (recording_id, local_date) row,
-all or none. Only the `r2-copy-v8-inventory` client leases a unit. It lists that
+gate. The controller first approves the stream-days in `nas_restore_day_scope`
+(`stoaramactl nas-day-inventory scope --days-file TSV --reason TEXT
+[--recording-ids ...]`; delete a row to withdraw it). The database refuses a
+unit outside that scope, the lease skips one whose approval was withdrawn, and
+the restore gate refuses a clip outside it. A verified restore also clears
+`purged_at`, so no other day can be reached. `stoaramactl nas-day-inventory
+request --days-file TSV --label L [--recording-ids ...]` queues one unit per
+approved (recording_id, local_date) row, all or none. Only the `r2-copy-v8-inventory` client leases a unit. It lists that
 stream's day directories read-only: the folders its pinned folder map assigns
 the stream, in the flat, plaza and joined layouts, plus the directories of the
 catalog's clips for that day. It reports each media file's path, size, mtime and
@@ -437,6 +442,8 @@ sha256 counts as NAS-verified for `nas-restore request` only, purged or not and
 whatever its stream's Keep Everything pin: `nas_restore_inventoried_original`
 admits an 'original' restore to the clip's own key from the path the unit read.
 The PUT is create-only, so an existing object is re-hashed and never overwritten.
+No restore is admitted while an R2 deletion of the key is pending
+(`collation_v2_recovery_retirement_pending`, 0262).
 Matches are never written to `nas_inventory_files`. That ledger is the client's
 sidecar-backed evidence, which cleanup, retirement and the cleanup runner's
 final check read as exact-path proof. `cancel --label L` withdraws the scope.

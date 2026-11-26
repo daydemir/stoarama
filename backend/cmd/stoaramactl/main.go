@@ -278,6 +278,7 @@ func usage() {
   stoaramactl nas-r2-copy activate-keep20 --sha256 SHA --apply
   stoaramactl nas-restore request (--clip-ids 1,2 | --hour-record-id N | --recording-id N --from TIME --to TIME | --output-ids-file FILE) [--test-prefix --label L --max-bytes N --limit N --dry-run --json]
 	  stoaramactl nas-restore status [--label L --json] | cancel --label L
+	  stoaramactl nas-day-inventory scope --days-file TSV --reason TEXT [--recording-ids 1,2 --dry-run]
 	  stoaramactl nas-day-inventory request --days-file TSV --label L [--recording-ids 1,2 --dry-run --json] | status --label L [--json] | cancel --label L
 	  stoaramactl nas-stitch status|approve|pause|import-corpus|backlog|mint-durham-key
   stoaramactl nas-cleanup prepare --input PLAN.json | report --plan-id ID | verify-recovery --plan-id ID | pause|enable|close --plan-id ID --expected-plan-sha256 SHA --reason TEXT | retire-superseded --reason TEXT [--expected-plans N] | enable-batch --batch-input BATCH.json --expected-batch-sha256 SHA --reason TEXT --approval-hours H | pause-batch|batch-report --batch-id ID
