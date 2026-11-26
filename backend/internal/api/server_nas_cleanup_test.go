@@ -89,7 +89,7 @@ CREATE TABLE streams(id bigint PRIMARY KEY,local_timezone text);CREATE TABLE rec
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"0167_nas_cleanup_dryruns.sql", "0168_nas_cleanup_stage_timings.sql", "0169_nas_cleanup_queue_priority.sql", "0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql", "0172_nas_cleanup_safeguards_validate.sql", "0173_nas_cleanup_throughput.sql", "0175_nas_cleanup_client_status.sql", "0176_nas_cleanup_recheck.sql", "0177_nas_cleanup_reserved_files.sql", "0206_nas_cleanup_manifest_keys.sql", "0207_nas_cleanup_reservation_lookup.sql", "0178_nas_cleanup_reconciliation.sql", "0180_nas_cleanup_source_freeze.sql", "0181_nas_cleanup_freeze_recovery.sql", "0189_delivery_keep_holds.sql"} {
+	for _, name := range []string{"0167_nas_cleanup_dryruns.sql", "0168_nas_cleanup_stage_timings.sql", "0169_nas_cleanup_queue_priority.sql", "0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql", "0172_nas_cleanup_safeguards_validate.sql", "0173_nas_cleanup_throughput.sql", "0175_nas_cleanup_client_status.sql", "0176_nas_cleanup_recheck.sql", "0177_nas_cleanup_reserved_files.sql", "0206_nas_cleanup_manifest_keys.sql", "0207_nas_cleanup_reservation_lookup.sql", "0178_nas_cleanup_reconciliation.sql", "0180_nas_cleanup_source_freeze.sql", "0181_nas_cleanup_freeze_recovery.sql", "0189_delivery_keep_holds.sql", "0268_gss_public_generation_pin.sql"} {
 		migration, err := os.ReadFile("../../../infra/sql/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
@@ -374,6 +374,26 @@ func TestNASCleanupNewReferencesAndPublicGenerationAreFenced(t *testing.T) {
 	got, err = s.loadGlobalDeliveryRegistryScope(ctx, true, "")
 	if err != nil || got != old {
 		t.Fatal("in-flight grace fence disappeared on pause")
+	}
+	next := &globalDeliveryRegistry{Generation: strings.Repeat("2", 32)}
+	s.publicPinnedDeliveryRegistry = next
+	if _, err = s.loadGlobalDeliveryRegistryScope(ctx, true, ""); err == nil {
+		t.Fatal("unpinned generation served during cleanup")
+	}
+	if _, err = pool.Exec(ctx, `UPDATE gss_public_generation_pin SET generation=$1`, next.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = s.loadGlobalDeliveryRegistryScope(ctx, true, ""); err != nil || got != next {
+		t.Fatalf("moved pin was not served without a deploy: %v", err)
+	}
+	if _, err = s.loadGlobalDeliveryRegistryScope(ctx, true, old.Generation); err == nil {
+		t.Fatal("previous generation bypassed the moved pin")
+	}
+	if _, err = pool.Exec(ctx, `DELETE FROM gss_public_generation_pin`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.loadGlobalDeliveryRegistryScope(ctx, true, ""); err == nil || !strings.Contains(err.Error(), "pin missing") {
+		t.Fatalf("missing pin did not fail closed: %v", err)
 	}
 }
 
