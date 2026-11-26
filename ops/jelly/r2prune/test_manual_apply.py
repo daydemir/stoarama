@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('manual_apply', HERE / 'manual_apply.py')
@@ -39,14 +40,29 @@ f = args[args.index('-f') + 1] if '-f' in args else ''
 tsv = open('receipt-backfill.tsv').read() if f and os.path.exists('receipt-backfill.tsv') else None
 with open(S + '/calls.jsonl', 'a') as c:
     c.write(json.dumps({'psql': os.path.basename(f) or ('verify' if 'jsonb_to_recordset' in script else 'stdin'), 'args': args,
-                        'cwd': os.getcwd(), 'ro': os.environ['PGOPTIONS'].endswith('=on'), 'tsv': tsv}) + '\n')
+                        'cwd': os.getcwd(), 'ro': os.environ['PGOPTIONS'].endswith('=on'), 'tsv': tsv, 'script_bytes': len(script)}) + '\n')
 if f.endswith('receipt-apply.sql'):
     rc = int(open(S + '/apply.rc').read()) if os.path.exists(S + '/apply.rc') else 0
     if rc:
         sys.stderr.write('ERROR:  reservation or hold at TSV row 1\n')
     sys.exit(rc)
 if f.endswith('dry-run.sql'):
-    sys.stdout.write(open(S + '/dry-run.out').read() if os.path.exists(S + '/dry-run.out') else 'insert|raw||1|1|1\n')
+    if os.path.exists(S + '/dry-run.out'):
+        sys.stdout.write(open(S + '/dry-run.out').read())
+        sys.exit(0)
+    # Like dry-run.sql: the summary per (action, kind), then each non-insert row by seq;
+    # every seq divisible by 7 reads as already applied.
+    rows = [l.split('\t') for l in tsv.splitlines()]
+    act = lambda r: 'already_applied' if int(r[0]) % 7 == 0 else 'insert'
+    groups = {}
+    for r in rows:
+        g = groups.setdefault((act(r), r[1]), [0, 0, 0])
+        g[0] += 1; g[1] += int(r[5]); g[2] += r[1] == 'raw' and act(r) == 'insert'
+    for (a, k), (n, b, u) in sorted(groups.items()):
+        print(f'{a}|{k}||{n}|{b}|{u}')
+    for r in rows:
+        if act(r) != 'insert':
+            print(f'{r[0]}|{act(r)}||{r[1]}|{r[2]}|{r[5]}')
     sys.exit(0)
 if 'jsonb_to_recordset' in script:
     raws, pairs = [json.loads(p) for p in script.split('$k$')[1::2]]
@@ -59,8 +75,9 @@ if 'jsonb_to_recordset' in script:
     for p in pairs:
         print('\t'.join(['pair', p['raw'], p['output'], 'true' if p['raw'] in db['contains'].get(p['output'], []) else 'false', '', '', '', '']))
     sys.exit(0)
+wanted = set(json.loads(script.split('$k$')[1]))
 for key, s in json.load(open(S + '/sources.json')).items():
-    if key in script:
+    if key in wanted:
         print('\t'.join(map(str, (key, s['kind'], s['source_id'], s['stream_id'], s['size'], s['sha256'], s['etag'] or ''))))
 '''
 
@@ -371,9 +388,37 @@ class Backfill(Base):
         self.assertEqual((dry, self.applied()), (times, times))
         self.assertTrue(self.result()['complete'])
         self.assertEqual(json.loads((self.W / 'delete-intent.json').read_text())['mode'], 'backfill')
-        (self.d / 'dry-run.out').write_text('already_applied|raw||2|200|0\n')
+        (self.d / 'dry-run.out').write_text('already_applied|raw||2|200|0\n1|already_applied||raw|11|100\n2|already_applied||raw|12|100\n')
         self.assertEqual(self.backfill(), [{'workdir': str(self.W), 'already_applied': 2}])
         self.assertEqual(self.calls(), ['stdin', 'dry-run.sql', 'receipt-apply.sql', 'dry-run.sql'])
+
+    def test_a_large_backfill_runs_in_bounded_statements_with_one_shot_results(self):
+        n = 12001
+        keys = [f'managed/acct-47/ke/{i:06d}.mp4' for i in range(n)]
+        self.write_manifest([(k, ma.KE_CLASS) for k in keys])
+        self.sources({k: ('raw', 100 + i, 'e1') for i, k in enumerate(keys)})
+        self.ledger.write_text(''.join(json.dumps(r) + '\n' for r in [
+            {'type': 'run', 'manifest_sha256': self.digest, 'inputs_sha256': {}, 'recent_from': '2026-11-18T18:00:00Z', 'limit': 0}] + [
+            {'key': k, 'size': 100, 'outcome': 'deleted', 'at': '2026-11-23T23:13:39.424675Z'} for k in keys]))
+        self.backfill()
+        self.assertEqual(self.calls(), ['stdin'] * 3 + ['dry-run.sql'] * 3 + ['receipt-apply.sql'])
+        stdin = self.calls('stdin')
+        self.assertLess(max(c['script_bytes'] for c in stdin), 5000 * 64)
+        dry = self.calls('dry-run.sql')
+        self.assertEqual([len(c['tsv'].splitlines()) for c in dry], [5000, 5000, 2001])
+        self.assertLess(max(len(c['tsv']) for c in dry), 5000 * 400)
+        self.assertEqual(len(json.loads((self.W / 'receipt-sources.json').read_text())), n)
+        self.assertEqual(len(self.calls('receipt-apply.sql')[0]['tsv'].splitlines()), n)
+        chunked = (self.W / 'preflight' / 'dry-run.out').read_text()
+        one_shot = self.d / 'one-shot'
+        with unittest.mock.patch.object(ma, 'ROWS_PER_STATEMENT', 10 ** 9):
+            self.run_cli('backfill', str(one_shot), '--manifest', str(self.manifest), '--ledger', str(self.ledger))
+        self.assertEqual(len(self.calls('dry-run.sql')), 4)
+        self.assertEqual(chunked, (one_shot / 'preflight' / 'dry-run.out').read_text())
+        done = n // 7  # seq 7, 14, ... read as already applied
+        self.assertEqual(chunked.splitlines()[:2], [f'already_applied|raw||{done}|{done * 100}|0',
+                                                    f'insert|raw||{n - done}|{(n - done) * 100}|{n - done}'])
+        self.assertEqual(chunked.splitlines()[2:], [f'{s}|already_applied||raw|{99 + s}|100' for s in range(7, n + 1, 7)])
 
     def test_ledger_for_another_manifest_is_refused(self):
         self.write_manifest([(KE[0], ma.KE_CLASS)])

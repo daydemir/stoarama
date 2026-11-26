@@ -44,6 +44,10 @@ binary is `~/stoarama-r2prune-lane/r2prune`. The wrapper does not change it.
    keep, a reservation, a NAS restore, cleanup or incident hold, or a trigger the
    apply fires, such as `nas_cleanup_source_hold` on `purged_at`) stops the run
    before any DELETE. Output is kept in `WORKDIR/preflight/`.
+   The source lookup and the dry run each send at most 5,000 rows per statement
+   (`ROWS_PER_STATEMENT`): a single 293k-row literal dropped the production
+   connection. Every check is per row, so `dry-run.out` is the merged one-shot
+   output: summary groups summed, then the non-insert rows in seq order.
 3. Writes `delete-intent.json` (mode, manifest and sources digests, and in listing
    mode the `--fresh-listing` digest), then runs
    `r2prune delete --ledger WORKDIR/ledger-<stamp>.jsonl ...`.
