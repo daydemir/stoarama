@@ -216,7 +216,7 @@ func (s *Server) handleAccountNativeStitchClaim(w http.ResponseWriter, r *http.R
 			_, _ = tx.Exec(r.Context(), `UPDATE recording_native_stitch_tasks SET state='stale',last_reason_code='server_manifest_changed' WHERE id=$1`, candidate.out.TaskID)
 			continue
 		}
-		ready, proofErr := exactStitchNASProof(r.Context(), tx, connectionID, generation, candidate.raw, len(candidate.out.Clips))
+		ready, proofErr := exactStitchNASProof(r.Context(), tx, connectionID, generation, candidate.out.TaskID, len(candidate.out.Clips))
 		if proofErr != nil {
 			util.WriteError(w, 500, "check stitch NAS proof")
 			return
@@ -254,14 +254,16 @@ func (s *Server) handleAccountNativeStitchClaim(w http.ResponseWriter, r *http.R
 
 func exactStitchNASProof(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
-}, connectionID int64, generation string, raw []byte, want int) (bool, error) {
+}, connectionID int64, generation string, taskID int64, want int) (bool, error) {
+	// Join the task's own frozen manifest row; never round-trip it as a literal.
 	var proven int
 	err := q.QueryRow(ctx, `
-		SELECT count(*) FROM nas_inventory_files i
-		JOIN jsonb_to_recordset($3::jsonb) m(clip_id bigint,relative_path text,size_bytes bigint,sha256 text) ON m.clip_id=i.clip_id
-		WHERE i.connection_id=$1 AND i.seen_generation=$2 AND i.state='present' AND i.relative_path=m.relative_path AND i.size_bytes=m.size_bytes AND i.sha256=m.sha256
+		SELECT count(*) FROM recording_native_stitch_tasks t
+		CROSS JOIN LATERAL jsonb_to_recordset(t.clip_manifest) m(clip_id bigint,relative_path text,size_bytes bigint,sha256 text)
+		JOIN nas_inventory_files i ON i.clip_id=m.clip_id
+		WHERE t.id=$3 AND i.connection_id=$1 AND i.seen_generation=$2 AND i.state='present' AND i.relative_path=m.relative_path AND i.size_bytes=m.size_bytes AND i.sha256=m.sha256
 		  AND NOT EXISTS(SELECT 1 FROM nas_inventory_files x WHERE x.connection_id=i.connection_id AND x.relative_path=i.relative_path AND x.clip_id<>i.clip_id AND x.state IN('present','mismatch'))
-		  AND NOT EXISTS(SELECT 1 FROM nas_inventory_unmatched_files u WHERE u.connection_id=i.connection_id AND u.relative_path=i.relative_path AND u.state='present')`, connectionID, generation, raw).Scan(&proven)
+		  AND NOT EXISTS(SELECT 1 FROM nas_inventory_unmatched_files u WHERE u.connection_id=i.connection_id AND u.relative_path=i.relative_path AND u.state='present')`, connectionID, generation, taskID).Scan(&proven)
 	return proven == want, err
 }
 
@@ -570,7 +572,7 @@ func (s *Server) handleAccountNativeStitchComplete(w http.ResponseWriter, r *htt
 			util.WriteError(w, 409, "inventory generation changed")
 			return
 		}
-		ready, e := exactStitchNASProof(r.Context(), tx, connectionID, currentGeneration, frozenRaw, len(frozen))
+		ready, e := exactStitchNASProof(r.Context(), tx, connectionID, currentGeneration, report.TaskID, len(frozen))
 		if e != nil || !ready {
 			util.WriteError(w, 409, "exact NAS manifest proof changed")
 			return

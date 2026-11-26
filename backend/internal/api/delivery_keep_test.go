@@ -267,6 +267,40 @@ func TestDeliveryKeepLiveAgreementFailsClosed(t *testing.T) {
 	if err := RequireDeliveryKeep(ctx, pool, snapshot); err == nil {
 		t.Fatal("new linked object without hold accepted")
 	}
+	// A production-sized roster spans several bounded chunks; drift in the
+	// last chunk alone must still refuse.
+	if _, err := pool.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind)
+ SELECT 'stoarama',format('test/roster/%s',lpad(n::text,6,'0')),'etag',n,'asset' FROM generate_series(1,$1::int) n`, 2*boundedSetChunk+1); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := pool.Query(ctx, `SELECT object_key,etag,size_bytes FROM delivery_keep_holds WHERE bucket='stoarama'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Objects = map[string]DeliveryKeepIdentity{}
+	last := ""
+	for rows.Next() {
+		var x DeliveryKeepIdentity
+		if err := rows.Scan(&x.Key, &x.ETag, &x.Size); err != nil {
+			t.Fatal(err)
+		}
+		snapshot.Objects[x.Key] = x
+		if x.Key > last {
+			last = x.Key
+		}
+	}
+	if rows.Err() != nil || len(snapshot.Objects) <= 2*boundedSetChunk {
+		t.Fatal("roster does not span chunks", len(snapshot.Objects), rows.Err())
+	}
+	if err := RequireDeliveryKeep(ctx, pool, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	o = snapshot.Objects[last]
+	o.ETag = "drifted"
+	snapshot.Objects[last] = o
+	if err := RequireDeliveryKeep(ctx, pool, snapshot); err == nil {
+		t.Fatal("drift in the last chunk accepted")
+	}
 }
 
 func TestDeliveryKeepAssemblyDependenciesAreExactAndComplete(t *testing.T) {
