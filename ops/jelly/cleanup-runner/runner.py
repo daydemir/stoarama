@@ -1501,14 +1501,24 @@ class Runner:
             return None
         return day_verify(p, self.windows, self.timezones, self.keep_everything, self.folders, catalog)
 
+    def ke_held(self):
+        # Owner hold (2026-11-26): Keep Everything day cleanup waits until permits verify R2 live.
+        return (self.root / 'KE_HOLD').exists()
+
     def day_pick(self):
-        ids = self.query("SELECT coalesce(json_agg(id ORDER BY id),'[]') FROM nas_cleanup_day_plans WHERE account_id=47 "
-                         "AND connection_id=13 AND mode='dry_run' AND policy_sha256='" + POLICY_SHA + "'", 'day plan query')
+        held = self.ke_held() and self.keep_everything
+        skip_ke = (" AND NOT EXISTS(SELECT 1 FROM nas_cleanup_day_units u WHERE u.plan_id=p.id AND u.stream_id IN (%s))"
+                   % ','.join(str(int(sid)) for sid in sorted(self.keep_everything))) if held else ''
+        ids = self.query("SELECT coalesce(json_agg(p.id ORDER BY p.id),'[]') FROM nas_cleanup_day_plans p WHERE p.account_id=47 "
+                         "AND p.connection_id=13 AND p.mode='dry_run' AND p.policy_sha256='" + POLICY_SHA + "'" + skip_ke,
+                         'day plan query')
         if ids:
             return ids[0]
         for sid in sorted(self.windows, key=lambda sid: (sid in self.keep_everything, sid)):
             if self.stopped():
                 return None
+            if held and sid in self.keep_everything:
+                continue
             if not self.stream_ready(sid, DAY_EXCLUSIONS):
                 continue
             prefix = 'kday-' + utcnow().strftime('%Y%m%d-%H%M%S')

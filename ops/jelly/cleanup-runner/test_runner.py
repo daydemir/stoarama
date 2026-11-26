@@ -1752,6 +1752,24 @@ class DayVerifyTests(unittest.TestCase):
         self.assertTrue(ke and sids == sorted(set(sids) - j.keep_everything) + sorted(ke))
         self.assertTrue(all(('--r2prune' in args) == (sid in j.keep_everything) for sid, args in calls))
 
+    def test_day_pick_skips_keep_everything_streams_and_plans_while_held(self):
+        j = self.job
+        (j.root / 'KE_HOLD').write_text('hold')
+        calls, sql = [], []
+        with patch.object(j, 'query', side_effect=lambda q, *_: sql.append(q) or []), \
+             patch.object(j, 'prepare_stream', side_effect=lambda sid, args, exclusions: calls.append(sid) or False):
+            self.assertIsNone(j.day_pick())
+        self.assertTrue(calls and not set(calls) & j.keep_everything)
+        self.assertIn('NOT EXISTS(SELECT 1 FROM nas_cleanup_day_units u WHERE u.plan_id=p.id AND u.stream_id IN (', sql[0])
+        self.assertTrue(all(str(sid) in sql[0] for sid in j.keep_everything))
+        (j.root / 'KE_HOLD').unlink()
+        calls.clear(); sql.clear()
+        with patch.object(j, 'query', side_effect=lambda q, *_: sql.append(q) or []), \
+             patch.object(j, 'prepare_stream', side_effect=lambda sid, args, exclusions: calls.append(sid) or False):
+            self.assertIsNone(j.day_pick())
+        self.assertTrue(set(calls) & j.keep_everything)
+        self.assertNotIn('nas_cleanup_day_units', sql[0])
+
     def test_day_pick_ignores_per_file_exclusions_and_keeps_its_own(self):
         # Per-file exclusions came from per-file refusals (source holds); they never skip day plans.
         j = self.job
