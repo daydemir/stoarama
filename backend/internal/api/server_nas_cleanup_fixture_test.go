@@ -46,7 +46,7 @@ type fakeCleanupBucket struct {
 }
 
 func (b *fakeCleanupBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	key := strings.TrimPrefix(r.URL.Path, "/bucket/")
+	_, key, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/") // path-style /<bucket>/<key>
 	b.mu.Lock()
 	body, ok := b.objects[key]
 	delay := b.headDelay

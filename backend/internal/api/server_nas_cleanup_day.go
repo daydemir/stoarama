@@ -17,9 +17,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/util"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"golang.org/x/sync/errgroup"
 )
 
 // Day-directory NAS-only cleanup. Owner (Deniz), verbatim: "yes, delete"; "if
@@ -47,6 +49,13 @@ import (
 // raw object (not purged or retired) or a stitched output listing the clip
 // (not retired or reserved for retirement), with the NAS size equal to the
 // catalogued clip size. KE stays in R2, so the counterpart persists.
+//
+// The catalogue is known to drift from R2 (objects gone while purged_at is
+// null), so every admission, enable and permit also HEADs each catalogue-live
+// counterpart of every named file it would permit (Deniz: KE footage leaves the
+// NAS only when R2 actually has the same name and size). Each such file needs
+// at least one counterpart R2 holds at its catalogued size, or the unit is
+// refused; any R2 error refuses the unit.
 
 //go:embed nas_cleanup_folder_streams.json
 var cleanupFolderStreamsJSON []byte
@@ -59,6 +68,9 @@ const (
 	nasCleanupDayMaxNames  = 100000
 	nasCleanupDayPermitTTL = 10 * time.Minute
 	nasCleanupDayDigestTag = "stoarama-nas-cleanup-day-v1"
+	// nasCleanupDayHeads bounds the live R2 HEADs of one KE unit check.
+	nasCleanupDayHeads       = 32
+	nasCleanupDayHeadTimeout = 2 * time.Minute
 )
 
 type nasCleanupDayOutcome string
@@ -322,20 +334,62 @@ func cleanupDayModeOf(u nasCleanupDayUnit) nasCleanupDayMode {
 	return nasCleanupDayNames
 }
 
-// cleanupDayR2LiveSQL returns the clips ($1) with a live R2 counterpart in the
-// catalogue: the raw object in bucket $2, neither purged nor retired, or a
-// stitched output listing the clip that is neither retired nor reserved for
-// retirement. The r2prune lane records collated deletes only in
-// r2_object_retirements. A reserved raw object is already a held clip. The
-// clip rows are share-locked so a concurrent purged_at write waits for this
-// permit's commit; R2 purges then skip clips a live KE unit names.
-const cleanupDayR2LiveSQL = `SELECT coalesce(array_agg(id),'{}') FROM (SELECT c.id FROM recording_clips c WHERE c.id=ANY($1::bigint[]) AND (
- (c.bucket=$2 AND c.purged_at IS NULL AND c.object_key<>''
-  AND NOT EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.kind='raw' AND x.source_id=c.id))
- OR c.id IN (SELECT unnest(o.source_clip_ids) FROM recording_collation_outputs o WHERE o.source_clip_ids && $1::bigint[]
+// cleanupDayR2LiveSQL returns the catalogue-live R2 counterparts (clip, key,
+// catalogued size) of the clips ($1): the raw object in bucket $2, neither
+// purged nor retired, and every stitched output listing the clip that is
+// neither retired nor reserved for retirement. The r2prune lane records
+// collated deletes only in r2_object_retirements. A reserved raw object is
+// already a held clip. The clip rows are share-locked so a concurrent
+// purged_at write waits for this permit's commit; R2 purges then skip clips a
+// live KE unit names.
+const cleanupDayR2LiveSQL = `WITH c AS (SELECT id,bucket,object_key,size_bytes,purged_at FROM recording_clips WHERE id=ANY($1::bigint[]) FOR SHARE)
+ SELECT c.id,c.object_key,c.size_bytes FROM c WHERE c.bucket=$2 AND c.purged_at IS NULL AND c.object_key<>''
+  AND NOT EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.kind='raw' AND x.source_id=c.id)
+ UNION ALL
+ SELECT s.id,o.object_key,o.size_bytes FROM recording_collation_outputs o CROSS JOIN unnest(o.source_clip_ids) s(id)
+ WHERE o.source_clip_ids && $1::bigint[] AND s.id=ANY($1::bigint[])
   AND NOT EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.kind='collated' AND x.source_id=o.id)
-  AND NOT EXISTS(SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='collated' AND x.source_id=o.id)))
- FOR SHARE OF c) live`
+  AND NOT EXISTS(SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='collated' AND x.source_id=o.id)`
+
+// cleanupDayCounterpart is one R2 object a KE file relies on, by key and the
+// catalogued size R2 must hold.
+type cleanupDayCounterpart struct {
+	key  string
+	size int64
+}
+
+// cleanupDayR2Verify HEADs every counterpart with bounded concurrency and
+// returns why each one is not live ("" when R2 holds it at its catalogued
+// size). Any R2 error other than absence fails the whole check.
+func cleanupDayR2Verify(ctx context.Context, store *r2.Client, counterparts []cleanupDayCounterpart) (map[cleanupDayCounterpart]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, nasCleanupDayHeadTimeout)
+	defer cancel()
+	group, ctx := errgroup.WithContext(ctx)
+	group.SetLimit(nasCleanupDayHeads)
+	reasons := make([]string, len(counterparts))
+	for i, c := range counterparts {
+		group.Go(func() error {
+			head, err := store.Head(ctx, c.key)
+			switch {
+			case r2.IsNotFound(err):
+				reasons[i] = fmt.Sprintf("%s is missing", c.key)
+			case err != nil:
+				return fmt.Errorf("R2 counterpart %s unverified: %w", c.key, err)
+			case head.SizeBytes != c.size:
+				reasons[i] = fmt.Sprintf("%s is %d bytes, catalogued %d", c.key, head.SizeBytes, c.size)
+			}
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+	out := make(map[cleanupDayCounterpart]string, len(counterparts))
+	for i, c := range counterparts {
+		out[c] = reasons[i]
+	}
+	return out, nil
+}
 
 // nasCleanupDayEntry is one inventoried file of the unit: a media file or the
 // sidecar beside it, by its name in the directory and exact size.
@@ -359,8 +413,9 @@ func cleanupDayMedia(entries []nasCleanupDayEntry) (files, bytes int64) {
 // cleanupDayCheck returns the unit's inventoried NAS media and sidecars, or
 // why the whole directory-day must stay. A Keep Everything unit returns only
 // its named files whose NAS size is the catalogued size and whose R2
-// counterpart is live; its other files stay on the NAS.
-func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUnit, bucket string) ([]nasCleanupDayEntry, error) {
+// counterpart is live in the catalogue; its other files stay on the NAS. Each
+// returned file then needs one of those counterparts verified in R2 itself.
+func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUnit, store *r2.Client) ([]nasCleanupDayEntry, error) {
 	w, day, loc, err := cleanupDayStatic(u)
 	if err != nil {
 		return nil, err
@@ -431,14 +486,27 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 		return nil, errors.New("catalogued clip is held")
 	}
 	keep := func(present) bool { return true }
+	live := map[int64][]cleanupDayCounterpart{}
 	if w.KeepEverything {
-		var ids []int64
-		if err := q.QueryRow(ctx, cleanupDayR2LiveSQL, dated, bucket).Scan(&ids); err != nil {
+		if store == nil {
+			return nil, errors.New("R2 unavailable for the Keep Everything counterpart check")
+		}
+		rows, err := q.Query(ctx, cleanupDayR2LiveSQL, dated, store.Bucket())
+		if err != nil {
 			return nil, err
 		}
-		live := map[int64]bool{}
-		for _, id := range ids {
-			live[id] = true
+		for rows.Next() {
+			var id int64
+			var c cleanupDayCounterpart
+			if err := rows.Scan(&id, &c.key, &c.size); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			live[id] = append(live[id], c)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
 		}
 		named := map[string]int64{}
 		for _, n := range u.Names {
@@ -446,20 +514,47 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 		}
 		keep = func(f present) bool {
 			size, ok := named[f.media.Name]
-			return ok && size == f.media.SizeBytes && f.catalogued == size && live[f.id]
+			return ok && size == f.media.SizeBytes && f.catalogued == size && len(live[f.id]) > 0
 		}
 	}
 	var entries []nasCleanupDayEntry
+	var kept []present
+	seen := map[cleanupDayCounterpart]bool{}
+	var counterparts []cleanupDayCounterpart
 	for _, f := range files {
 		if keep(f) {
+			kept = append(kept, f)
 			entries = append(entries, f.media)
 			if f.sidecar != nil {
 				entries = append(entries, *f.sidecar)
+			}
+			for _, c := range live[f.id] {
+				if !seen[c] {
+					seen[c] = true
+					counterparts = append(counterparts, c)
+				}
 			}
 		}
 	}
 	if len(entries) == 0 {
 		return nil, errors.New("no named NAS media with a live R2 counterpart in the directory-day")
+	}
+	if !w.KeepEverything {
+		return entries, nil
+	}
+	// Each permitted file needs at least one counterpart R2 holds at its size.
+	reasons, err := cleanupDayR2Verify(ctx, store, counterparts)
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range kept {
+		var why []string
+		for _, c := range live[f.id] {
+			why = append(why, reasons[c])
+		}
+		if !slices.Contains(why, "") {
+			return nil, fmt.Errorf("no R2 counterpart of %s is live: %s", f.media.Name, strings.Join(why, "; "))
+		}
 	}
 	return entries, nil
 }
@@ -509,7 +604,7 @@ func (s *Server) handleServiceNASCleanupDayCreate(w http.ResponseWriter, r *http
 	}
 	defer tx.Rollback(ctx)
 	for n, u := range req.Units {
-		entries, err := cleanupDayCheck(ctx, tx, u, s.cfg.R2Bucket)
+		entries, err := cleanupDayCheck(ctx, tx, u, s.r2)
 		if gotFiles, gotBytes := cleanupDayMedia(entries); err == nil && (gotFiles != u.Files || gotBytes != u.Bytes) {
 			err = fmt.Errorf("catalogued NAS media is %d files, %d bytes", gotFiles, gotBytes)
 		}
@@ -666,7 +761,7 @@ func (s *Server) cleanupDayEnable(ctx context.Context, tx pgx.Tx, id int64, mode
 	}
 	eligible := 0
 	for _, p := range units {
-		if _, err := cleanupDayCheck(ctx, tx, p.unit, s.cfg.R2Bucket); err != nil {
+		if _, err := cleanupDayCheck(ctx, tx, p.unit, s.r2); err != nil {
 			if _, err := tx.Exec(ctx, `UPDATE nas_cleanup_day_units SET state='refused',refusal=$2,updated_at=now() WHERE id=$1`, p.id, err.Error()); err != nil {
 				return err
 			}
@@ -808,7 +903,7 @@ func (s *Server) handleAccountNASCleanupDayPermit(w http.ResponseWriter, r *http
 			return
 		}
 		unit := nasCleanupDayUnit{RelativeDir: permit.RelativeDir, LocalDate: permit.LocalDate, StreamID: permit.StreamID, Files: permit.Files, Bytes: permit.Bytes, Names: names}
-		entries, err := cleanupDayCheck(ctx, tx, unit, s.cfg.R2Bucket)
+		entries, err := cleanupDayCheck(ctx, tx, unit, s.r2)
 		if err != nil {
 			if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_day_units SET state='refused',refusal=$2,updated_at=now() WHERE id=$1`, unitID, err.Error()); err != nil {
 				util.WriteError(w, 500, "day cleanup refusal failed")

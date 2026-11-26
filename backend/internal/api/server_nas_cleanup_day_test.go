@@ -15,6 +15,7 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/db"
+	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -676,7 +677,7 @@ COMMIT`, clip, dir))
 
 // dayCheck totals cleanupDayCheck's media entries.
 func dayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUnit) (int64, int64, error) {
-	entries, err := cleanupDayCheck(ctx, q, u, "fixture")
+	entries, err := cleanupDayCheck(ctx, q, u, nil)
 	files, bytes := cleanupDayMedia(entries)
 	return files, bytes, err
 }
@@ -765,8 +766,20 @@ func TestNASCleanupDayPermitModes(t *testing.T) {
 // listing the clip that is not retired. The preparer and runner apply the
 // same rule to this schema.
 func TestNASCleanupDayKeepEverythingNeedsALiveR2Counterpart(t *testing.T) {
-	pool, exec, _ := dayFixture(t)
+	pool, exec, insert := dayFixture(t)
 	ctx := context.Background()
+	bucket := &fakeCleanupBucket{objects: map[string][]byte{}}
+	r2srv := httptest.NewServer(bucket)
+	t.Cleanup(r2srv.Close)
+	store, err := r2.New(ctx, r2.Config{UngatedWriter: true, AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "fixture", Endpoint: r2srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keCheck := func(u nasCleanupDayUnit) (int64, int64, error) {
+		entries, err := cleanupDayCheck(ctx, pool, u, store)
+		files, bytes := cleanupDayMedia(entries)
+		return files, bytes, err
+	}
 	exec(`INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
  VALUES(78,'test','78','ke','ke','https://storage.example.test','off','Asia/Seoul','hls','video_manifest','video_live','continuous_video',30);
 INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
@@ -835,22 +848,90 @@ COMMIT`)
 			t.Errorf("%s qualified", label)
 		}
 	}
-	if files, bytes, err := dayCheck(ctx, pool, all); err != nil || files != 2 || bytes != 200 {
+	raw11, out13 := "managed/ke/11.mp4", "joined/goodplus-x/objects/"+strings.Repeat("c", 64)+".mp4"
+	bucket.put(raw11, make([]byte, 100))
+	bucket.put(out13, make([]byte, 900))
+	if files, bytes, err := keCheck(all); err != nil || files != 2 || bytes != 200 {
 		t.Fatalf("KE evidence: %d files %d bytes %v", files, bytes, err)
 	}
-	if _, _, err := dayCheck(ctx, pool, unit(named(12))); err == nil || !strings.Contains(err.Error(), "live R2 counterpart") {
+	// The catalogue is not R2: each permitted file needs at least one
+	// catalogue-live counterpart R2 holds at its catalogued size, and any R2
+	// error refuses the whole unit. Clip 11 is also covered, clip-exactly, by a
+	// stitched output for these cases.
+	out11 := "joined/goodplus-x/objects/" + strings.Repeat("f", 64) + ".mp4"
+	exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica;
+INSERT INTO recording_collation_hours(id,hour_id,batch_id,generation,recording_id,local_date,delivery_hour,status,manifest_object_key,manifest_sha256,
+ manifest,source_clip_count,included_clip_count,excluded_clip_count,join_count,split_count)
+ VALUES(2,'goodplus-x__recording-31__date-2026-10-10__hour-09__generation-2','goodplus-x',2,31,'2026-10-10',9,'collated','m/2',repeat('a',64),'{}',1,1,0,0,0);
+INSERT INTO recording_collation_outputs(id,collation_hour_id,part,parts,object_key,nas_relative_path,size_bytes,sha256,start_at,end_at,source_clip_ids,r2_verified_at)
+ VALUES(3,2,1,1,'%s','x/3.mp4',700,repeat('f',64),'2026-10-10T00:00:00Z','2026-10-10T01:00:00Z',ARRAY[11],now());
+COMMIT`, out11))
+	bucket.put(out11, make([]byte, 700))
+	type object struct {
+		key  string
+		body []byte // nil: missing from R2
+	}
+	for label, c := range map[string]struct {
+		objects []object
+		fail    bool
+		want    string // "" permits both live files
+	}{
+		"all counterparts live":                     {},
+		"raw gone, stitched output live":            {objects: []object{{key: raw11}}},
+		"raw live, stitched output missing":         {objects: []object{{key: out11}}},
+		"raw of another size, stitched output live": {objects: []object{{key: raw11, body: make([]byte, 99)}}},
+		"raw and stitched output both gone": {objects: []object{{key: raw11}, {key: out11}},
+			want: "is live: " + raw11 + " is missing; " + out11 + " is missing"},
+		"only stitched output of another live size": {objects: []object{{key: out13, body: make([]byte, 901)}},
+			want: out13 + " is 901 bytes, catalogued 900"},
+		"only stitched output missing": {objects: []object{{key: out13}}, want: out13 + " is missing"},
+		"R2 error":                     {fail: true, want: "unverified"},
+	} {
+		saved := map[string][]byte{}
+		for _, o := range c.objects {
+			saved[o.key] = bucket.objects[o.key]
+			delete(bucket.objects, o.key)
+			if o.body != nil {
+				bucket.put(o.key, o.body)
+			}
+		}
+		bucket.headFailures = map[bool]int{true: 1}[c.fail]
+		files, _, err := keCheck(all)
+		if c.want == "" && (err != nil || files != 2) || c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)) {
+			t.Errorf("%s: %d files, %v", label, files, err)
+		}
+		bucket.headFailures = 0
+		for key, body := range saved {
+			bucket.put(key, body)
+		}
+	}
+	exec(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM recording_collation_outputs WHERE id=3;
+DELETE FROM recording_collation_hours WHERE id=2; COMMIT`)
+	delete(bucket.objects, out11)
+	// A non-KE unit never reads R2.
+	at := dayAt("2026-10-10", "103000")
+	insert(21, "2026-10-10", "103000", 500, at, at.Add(time.Minute))
+	_, heads := bucket.counts()
+	if entries, err := cleanupDayCheck(ctx, pool, nasCleanupDayUnit{RelativeDir: dayPlazaDir(dayFixtureFolder, day), LocalDate: "2026-10-10",
+		StreamID: 3, Files: 1, Bytes: 500}, store); err != nil || len(entries) != 1 {
+		t.Fatalf("non-KE unit: %v %v", entries, err)
+	}
+	if _, after := bucket.counts(); after != heads {
+		t.Fatalf("non-KE unit made %d R2 HEADs", after-heads)
+	}
+	if _, _, err := keCheck(unit(named(12))); err == nil || !strings.Contains(err.Error(), "live R2 counterpart") {
 		t.Fatalf("KE file without a counterpart qualified: %v", err)
 	}
 	// A KE unit keeps every 0241 hold: a delivery source hold or a delivery path
 	// hold in the directory still keeps it.
 	exec(`BEGIN; SET LOCAL session_replication_role=replica; INSERT INTO delivery_nas_source_holds(clip_id) VALUES(13); COMMIT`)
-	if _, _, err := dayCheck(ctx, pool, all); err == nil || !strings.Contains(err.Error(), "held") {
+	if _, _, err := keCheck(all); err == nil || !strings.Contains(err.Error(), "held") {
 		t.Fatalf("KE delivery-held clip qualified: %v", err)
 	}
 	exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM delivery_nas_source_holds;
 INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind,relative_path) VALUES('fixture','delivery/ke','etag',1,'raw','%s/delivered.mp4');
 COMMIT`, dir))
-	if _, _, err := dayCheck(ctx, pool, all); err == nil || !strings.Contains(err.Error(), "delivery path hold") {
+	if _, _, err := keCheck(all); err == nil || !strings.Contains(err.Error(), "delivery path hold") {
 		t.Fatalf("KE directory with a delivery path hold qualified: %v", err)
 	}
 	exec(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM delivery_keep_holds WHERE object_key='delivery/ke'; COMMIT`)
@@ -930,7 +1011,7 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan))
 		t.Fatalf("runner missed KE names without a live counterpart: %s", got)
 	}
 
-	s := &Server{pool: pool, cfg: config.Config{NASCleanupDeletionEnabled: true, R2Bucket: "fixture"}}
+	s := &Server{pool: pool, r2: store, cfg: config.Config{NASCleanupDeletionEnabled: true, R2Bucket: "fixture"}}
 	admit := func(label string, u nasCleanupDayUnit) *httptest.ResponseRecorder {
 		units := []nasCleanupDayUnit{u}
 		return dayCall(s.handleServiceNASCleanupDayCreate, "", map[string]any{"label": label, "policy_sha256": cleanupPolicySHA,
@@ -955,8 +1036,17 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan))
 		len(status.Units) != 1 || fmt.Sprint(status.Units[0].Names) != fmt.Sprint(want.Names) {
 		t.Fatalf("status names: %+v", status)
 	}
-	if w := dayCall(s.handleServiceNASCleanupDayControl, fmt.Sprint(admitted.ID), map[string]any{"plan_sha256": admitted.PlanSHA256,
-		"mode": "enabled", "reason": "fixture", "approval_hours": 1}); w.Code != 200 {
+	enable := func() *httptest.ResponseRecorder {
+		return dayCall(s.handleServiceNASCleanupDayControl, fmt.Sprint(admitted.ID), map[string]any{"plan_sha256": admitted.PlanSHA256,
+			"mode": "enabled", "reason": "fixture", "approval_hours": 1})
+	}
+	// Enable re-verifies R2 live: a counterpart gone since admission refuses it.
+	delete(bucket.objects, out13)
+	if w := enable(); w.Code != 409 || !strings.Contains(w.Body.String(), "no pending unit still qualifies") {
+		t.Fatalf("enable with a counterpart missing from R2: %d %s", w.Code, w.Body)
+	}
+	bucket.put(out13, make([]byte, 900))
+	if w := enable(); w.Code != 200 {
 		t.Fatalf("enable: %d %s", w.Code, w.Body)
 	}
 	permit := func(version string) *nasCleanupDayPermit {
@@ -997,5 +1087,17 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan))
 	if json.Unmarshal(dayCall(s.handleServiceNASCleanupDayStatus, fmt.Sprint(admitted.ID), nil).Body.Bytes(), &dropped) != nil ||
 		len(dropped.Units) != 1 || dropped.Units[0].DroppedNames != 1 {
 		t.Fatalf("status does not surface the dropped name: %+v", dropped)
+	}
+	// A permit re-verifies R2 live: the stitched output's live size differs from
+	// its catalogued size, so the unit is refused and reported, never permitted.
+	exec(`UPDATE nas_cleanup_day_units SET permit_expires_at=now() WHERE id=$1`, again.UnitID)
+	bucket.put(out13, make([]byte, 901))
+	if p := permit(nasCleanupDayKEClientVersion); p != nil {
+		t.Fatalf("permitted a unit whose stitched output differs in R2: %+v", p)
+	}
+	var state, refusal string
+	if err := pool.QueryRow(ctx, `SELECT state,refusal FROM nas_cleanup_day_units WHERE id=$1`, again.UnitID).Scan(&state, &refusal); err != nil ||
+		state != "refused" || !strings.Contains(refusal, out13+" is 901 bytes, catalogued 900") {
+		t.Fatalf("unit %s: %q %v", state, refusal, err)
 	}
 }
