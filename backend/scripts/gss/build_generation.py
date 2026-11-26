@@ -514,11 +514,11 @@ def read_grades(path):
 def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
     """(overlay of rebuilt base assets, present file ids, added registry files, new file holds).
 
-    Every ledger file in R2 is published: a file the parent lists under its parent
+    Every servable ledger file (in R2, and held or holdable) is published: a file the parent lists under its parent
     entry and path, any other part under its catalogued key and NAS path. Each
     stream's timeline becomes its best-14 window; a parent hour whose parts are
     unchanged is kept as is."""
-    reg, listing = inputs.registry, inputs.listing
+    reg = inputs.registry
     files = reg['files']
     md, rd, cat = (store.load(p) for p in ('/public/metadata.json', '/public/readiness.json', '/public/catalog.json'))
     MS = {s['id']: s for s in md['streams']}
@@ -537,7 +537,7 @@ def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
         base_days = {d['date']: d for d in sp['days']}
         base_parts = {str(p[0]): p for d in sp['days'] for h in d['hours'] for p in h[9]}
         part_of = {str(p.output_id): (h, p) for h in hs if h.record for p in h.record.parts}
-        pub = [(h, x) for h in hs for x in h.served if x.key in listing]
+        pub = [(h, x) for h in hs for x in h.served if x.live]
         on_timeline = {i for _, x in pub for i in x.registry_ids}
         outputs = []
         for h, x in pub:

@@ -114,6 +114,19 @@ class SelectionTests(unittest.TestCase):
         h = w.hour(w.select(), DAYS[0], 1)
         self.assertEqual((h.complete, h.in_r2), (False, True))
 
+    def test_closure_blocked_part_is_not_servable_unless_held(self):
+        w = World()
+        rec = w.records[(RID, DAYS[0], 1)][0]
+        blocked = dataclasses.replace(rec.parts[1], closed=True)
+        w.records[(RID, DAYS[0], 1)] = [dataclasses.replace(rec, parts=(rec.parts[0], blocked))]
+        hours = w.select()
+        h = w.hour(hours, DAYS[0], 1)
+        self.assertEqual((h.complete, h.in_r2, [s.live for s in h.served]), (True, False, [True, False]))
+        self.assertIn('closed_parts=1', summary(hours))
+        self.assertEqual(L.day_rows(hours)[0]['day_stitched'], 'S')
+        inputs = dataclasses.replace(w.inputs(), holds={blocked.key: (ETAG, blocked.size_bytes)})
+        self.assertTrue(w.hour(L.select(inputs), DAYS[0], 1).ok)  # already held: the guard does not apply
+
     def test_size_mismatch_fails(self):
         w = World()
         k = w.records[(RID, DAYS[0], 1)][0].parts[0].key
@@ -324,10 +337,10 @@ class CliTests(unittest.TestCase):
                     for r in recs:
                         head = [rid, date, dh, r.row_id, r.hour_id, r.batch_id, r.status, r.registered_at, 5, 5]
                         if not r.parts:
-                            out.writerow(head + [''] * 9 + ['f', 'f'])
+                            out.writerow(head + [''] * 9 + ['f'] * (2 + len(L.CLOSURE_COLUMNS)))
                         for q in r.parts:
                             out.writerow(head + [q.output_id, q.part, q.parts, q.key, q.nas_path, q.size_bytes, q.sha256,
-                                                 q.start_at, q.end_at, 'f', 'f'])
+                                                 q.start_at, q.end_at, 'f', 'f'] + ['f'] * len(L.CLOSURE_COLUMNS))
             with open(p('listing.txt'), 'w') as f:
                 f.writelines(f'{k}\t{n}\t"{e}"\n' for k, (n, e) in w.listing.items())
             with open(p('holds.tsv'), 'w') as f:
