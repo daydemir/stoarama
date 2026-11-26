@@ -67,6 +67,13 @@ func TestPullPathAllowed(t *testing.T) {
 		{http.MethodPost, "/api/v1/account/connections/cleanup/observe-batch/extra", false},
 		{http.MethodPost, "/api/v1/account/connections/cleanup/delete-batch", false},
 
+		{http.MethodPost, "/api/v1/account/connections/day-inventory/lease", true},
+		{http.MethodPost, "/api/v1/account/connections/day-inventory/7/result", true},
+		{http.MethodGet, "/api/v1/account/connections/day-inventory/lease", false},
+		{http.MethodPost, "/api/v1/account/connections/day-inventory/x/result", false},
+		{http.MethodPost, "/api/v1/account/connections/day-inventory/7/result/extra", false},
+		{http.MethodPost, "/api/v1/account/connections/day-inventory/scope", false},
+
 		// Wrong method on a pull path.
 		{http.MethodPost, "/api/v1/account/clips", false},
 		{http.MethodGet, "/api/v1/account/connections/heartbeat", false},
